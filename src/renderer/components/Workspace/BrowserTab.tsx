@@ -7,8 +7,9 @@ import Terminal from './Terminal';
 interface BrowserTabProps {
   tabId: string;
   url: string;
-  active: boolean;
+  active?: boolean;
   isActiveProject?: boolean;
+  ownerProjectId?: string;
   terminalId?: string;
   terminalName?: string;
   activeView?: 'browser' | 'terminal';
@@ -17,7 +18,7 @@ interface BrowserTabProps {
 
 const { ipcRenderer } = window.require('electron');
 
-function BrowserTab({ tabId, url, active, isActiveProject = true, terminalId, terminalName, activeView = 'browser', cwd }: BrowserTabProps) {
+function BrowserTab({ tabId, url, active: activeProp, isActiveProject: isActiveProjectProp, ownerProjectId, terminalId, terminalName, activeView = 'browser', cwd }: BrowserTabProps) {
   const webviewRef = useRef<any>(null);
   const initialUrl = url || 'http://localhost:3000';
   const [addressValue, setAddressValue] = useState(initialUrl);
@@ -27,6 +28,16 @@ function BrowserTab({ tabId, url, active, isActiveProject = true, terminalId, te
   const [hasProcess, setHasProcess] = useState(false);
   const updateTabUrl = useWorkspaceStore((s) => s.updateTabUrl);
   const setBrowserActiveView = useWorkspaceStore((s) => s.setBrowserActiveView);
+  const activeFromStore = useWorkspaceStore((state) => {
+    if (!ownerProjectId) return false;
+    const workspace = state.openProjects.get(ownerProjectId);
+    return !!workspace && state.activeProjectId === ownerProjectId && workspace.activeTabId === tabId;
+  });
+  const isActiveProjectFromStore = useWorkspaceStore((state) => {
+    return ownerProjectId ? state.activeProjectId === ownerProjectId : true;
+  });
+  const active = activeProp ?? activeFromStore;
+  const isActiveProject = isActiveProjectProp ?? isActiveProjectFromStore;
 
   // Track running process in embedded terminal (same IPC as TabBar uses)
   useEffect(() => {

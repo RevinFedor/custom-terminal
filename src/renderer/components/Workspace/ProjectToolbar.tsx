@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { Home, Minimize2, RotateCcw, Globe, PanelLeft, FileEdit } from 'lucide-react';
 import { VscVscode } from 'react-icons/vsc';
 import { useUIStore } from '../../store/useUIStore';
@@ -15,19 +15,46 @@ import ClaudeUsageButton from './ClaudeUsageButton';
 const { ipcRenderer } = window.require('electron');
 
 export default function ProjectToolbar() {
-  const { showToast } = useUIStore();
-  const { activeProjectId, openProjects, clearInterruptedState, setTabCommandType, createBrowserTab, setProjectView, getEffectiveTabId, getSidebarState, setSidebarOpen } = useWorkspaceStore();
-  const { projects } = useProjectsStore();
+  const showToast = useUIStore((state) => state.showToast);
+  const activeProjectId = useWorkspaceStore((state) => state.activeProjectId);
+  const currentView = useWorkspaceStore((state) => {
+    const projectId = state.activeProjectId;
+    if (!projectId) return 'terminal';
+    return state.openProjects.get(projectId)?.currentView || 'terminal';
+  });
+  const interruptedTabsKey = useWorkspaceStore((state) => {
+    const projectId = state.activeProjectId;
+    if (!projectId) return '';
+    const workspace = state.openProjects.get(projectId);
+    if (!workspace) return '';
+
+    const parts: string[] = [];
+    workspace.tabs.forEach((tab) => {
+      if (isTabInterrupted(tab)) {
+        parts.push(`${tab.id}:${tab.claudeSessionId || ''}:${tab.geminiSessionId || ''}:${tab.codexSessionId || ''}`);
+      }
+    });
+    return parts.join('|');
+  });
+  const clearInterruptedState = useWorkspaceStore((state) => state.clearInterruptedState);
+  const setTabCommandType = useWorkspaceStore((state) => state.setTabCommandType);
+  const createBrowserTab = useWorkspaceStore((state) => state.createBrowserTab);
+  const setProjectView = useWorkspaceStore((state) => state.setProjectView);
+  const getSidebarState = useWorkspaceStore((state) => state.getSidebarState);
+  const setSidebarOpen = useWorkspaceStore((state) => state.setSidebarOpen);
+  const currentProjectPath = useProjectsStore((state) => (
+    activeProjectId ? state.projects[activeProjectId]?.path : undefined
+  ));
 
   const [isCompressing, setIsCompressing] = useState(false);
 
-  const currentView = activeProjectId ? openProjects.get(activeProjectId)?.currentView || 'terminal' : 'terminal';
   const isHomeActive = currentView === 'home';
 
   // Get interrupted tabs for CURRENT project only
   const interruptedTabs = useMemo(() => {
     if (!activeProjectId) return [];
 
+    const { openProjects } = useWorkspaceStore.getState();
     const workspace = openProjects.get(activeProjectId);
     if (!workspace) return [];
 
@@ -35,6 +62,9 @@ export default function ProjectToolbar() {
       id: string;
       claudeSessionId?: string;
       geminiSessionId?: string;
+      codexSessionId?: string;
+      commandType?: string;
+      cwd?: string;
     }> = [];
 
     workspace.tabs.forEach((tab) => {
@@ -43,12 +73,15 @@ export default function ProjectToolbar() {
           id: tab.id,
           claudeSessionId: tab.claudeSessionId,
           geminiSessionId: tab.geminiSessionId,
+          codexSessionId: tab.codexSessionId,
+          commandType: tab.commandType,
+          cwd: tab.cwd,
         });
       }
     });
 
     return tabs;
-  }, [openProjects, activeProjectId]);
+  }, [interruptedTabsKey, activeProjectId]);
 
   // Resume all interrupted sessions
   const handleResumeAll = () => {
@@ -59,7 +92,15 @@ export default function ProjectToolbar() {
       clearInterruptedState(tab.id);
 
       // Send resume command based on session type
-      if (tab.claudeSessionId) {
+      if (tab.commandType === 'codex' && tab.codexSessionId) {
+        setTabCommandType(tab.id, 'codex');
+        ipcRenderer.send('codex:run-command', {
+          tabId: tab.id,
+          command: 'codex-c',
+          sessionId: tab.codexSessionId,
+          cwd: tab.cwd,
+        });
+      } else if (tab.claudeSessionId) {
         setTabCommandType(tab.id, 'claude');
         // Arm the per-tab stale-bridge guard before each resume write. Bulk-resume
         // has a higher blast radius (N tabs at once), so missing this let any stale
@@ -73,19 +114,31 @@ export default function ProjectToolbar() {
         const cmd = `gemini -s ${tab.geminiSessionId}\r`;
         ipcRenderer.send('terminal:input', tab.id, cmd);
         ipcRenderer.send('terminal:force-command-started', tab.id);
+      } else if (tab.codexSessionId) {
+        setTabCommandType(tab.id, 'codex');
+        ipcRenderer.send('codex:run-command', {
+          tabId: tab.id,
+          command: 'codex-c',
+          sessionId: tab.codexSessionId,
+          cwd: tab.cwd,
+        });
       }
     });
 
     showToast(`Resumed ${interruptedTabs.length} session(s)`, 'success');
   };
 
-  const handleOpenVSCode = () => {
+  const resolveProjectCwd = useCallback(() => {
     if (!activeProjectId) return;
-    const workspace = openProjects.get(activeProjectId);
-    const currentProject = projects[activeProjectId];
-    const effectiveId = getEffectiveTabId();
+    const state = useWorkspaceStore.getState();
+    const workspace = state.openProjects.get(activeProjectId);
+    const effectiveId = state.getEffectiveTabId();
     const currentTab = effectiveId && workspace ? workspace.tabs.get(effectiveId) : null;
-    const cwd = currentTab?.cwd || currentProject?.path;
+    return currentTab?.cwd || currentProjectPath;
+  }, [activeProjectId, currentProjectPath]);
+
+  const handleOpenVSCode = useCallback(() => {
+    const cwd = resolveProjectCwd();
     if (!cwd) {
       showToast('Не удалось определить директорию проекта', 'error');
       return;
@@ -96,19 +149,14 @@ export default function ProjectToolbar() {
         showToast('Не удалось открыть VS Code (нужен `code` в PATH)', 'error');
       }
     });
-  };
+  }, [resolveProjectCwd, showToast]);
 
   // Trampoline to GT Editor via custom `gteditor://open` URL scheme. macOS
   // LaunchServices routes to the already-running GT Editor.app (or cold-launches
   // it), and the receiving renderer adds the folder to its directory list if
   // missing — see gt-editor/docs/knowledge/fact-goto-modal.md.
-  const handleOpenGTEditor = () => {
-    if (!activeProjectId) return;
-    const workspace = openProjects.get(activeProjectId);
-    const currentProject = projects[activeProjectId];
-    const effectiveId = getEffectiveTabId();
-    const currentTab = effectiveId && workspace ? workspace.tabs.get(effectiveId) : null;
-    const cwd = currentTab?.cwd || currentProject?.path;
+  const handleOpenGTEditor = useCallback(() => {
+    const cwd = resolveProjectCwd();
     if (!cwd) {
       showToast('Не удалось определить директорию проекта', 'error');
       return;
@@ -117,7 +165,7 @@ export default function ProjectToolbar() {
     shell.openExternal(`gteditor://open?folder=${encodeURIComponent(cwd)}`).catch((err: Error) => {
       showToast(`GT Editor: ${err.message}`, 'error');
     });
-  };
+  }, [resolveProjectCwd, showToast]);
 
   // Cmd+G — глобальный хоткей для «Открыть в GT Editor». Используем `e.code`
   // ('KeyG'), а не `e.key`, чтобы хоткей работал в кириллической раскладке
@@ -140,7 +188,7 @@ export default function ProjectToolbar() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [activeProjectId, openProjects, projects]);
+  }, [handleOpenGTEditor]);
 
   const handleCompressLogs = async () => {
     if (isCompressing) return;

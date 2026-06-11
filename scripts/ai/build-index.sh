@@ -2,13 +2,15 @@
 # =============================================================================
 # Semantic Indexer — Phase 1 (Parallel)
 # Сканирует всю docs/ (knowledge/, methodology/, product/, meta/, ux-patterns/, и т.д.)
-# исключая tmp/ и _intro.md, отправляет в Haiku 4.5 через `claude -p`,
+# исключая tmp/ и _intro.md, отправляет в Claude Haiku через `claude -p`
+# или в Gemini через `--gemini-write`,
 # получает "семантический паспорт" и складывает в .semantic-index.json.
-# Haiku-роутер сам отфильтрует по симптомам — маркетинговые тексты не подтянутся
+# MCP-роутер сам отфильтрует по симптомам — маркетинговые тексты не подтянутся
 # при отладке кода и наоборот.
 #
 # Запуск: bash scripts/ai/build-index.sh
 # Опции: -g            — использовать Gemini 3 Flash (результат → clipboard, индекс не меняется)
+#         --gemini-write — использовать Gemini 3 Flash и записать .semantic-index.json
 #         --with-src    — также индексировать src/ (компоненты и сторы)
 #         --parallel N  — количество параллельных запросов (по умолчанию 10)
 #         --force / -f  — переиндексировать все файлы (игнорировать кеш хешей)
@@ -35,10 +37,12 @@ NC='\033[0m'
 # Парсим аргументы
 WITH_SRC=false
 USE_GEMINI=false
+GEMINI_WRITE=false
 FORCE_REINDEX=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -g|--gemini) USE_GEMINI=true; shift ;;
+    --gemini-write) USE_GEMINI=true; GEMINI_WRITE=true; shift ;;
     --with-src) WITH_SRC=true; shift ;;
     --force|-f) FORCE_REINDEX=true; shift ;;
     --parallel) MAX_PARALLEL="$2"; shift 2 ;;
@@ -53,9 +57,13 @@ if [ "$USE_GEMINI" = true ]; then
     echo "export GEMINI_API_KEY=your_key"
     exit 1
   fi
-  GEMINI_MODEL="gemini-3-flash-preview"
+  GEMINI_MODEL="${GEMINI_MODEL:-gemini-3.5-flash}"
   echo -e "${YELLOW}Mode: Gemini ($GEMINI_MODEL, thinking=HIGH)${NC}"
-  echo -e "${YELLOW}Dry-run: результат → clipboard, индекс не меняется${NC}"
+  if [ "$GEMINI_WRITE" = true ]; then
+    echo -e "${YELLOW}Write mode: результат → .semantic-index.json${NC}"
+  else
+    echo -e "${YELLOW}Dry-run: результат → clipboard, индекс не меняется${NC}"
+  fi
 fi
 
 echo "=== Indexer started: $(date) ===" > "$LOG_FILE"
@@ -64,7 +72,7 @@ log() {
   echo "$@" >> "$LOG_FILE"
 }
 
-if ! command -v claude &>/dev/null; then
+if [ "$USE_GEMINI" = false ] && ! command -v claude &>/dev/null; then
   echo -e "${RED}ERROR: claude CLI not found${NC}"
   exit 1
 fi
@@ -162,7 +170,7 @@ TOKENS_DIR=$(mktemp -d /tmp/indexer-tokens-XXXXXXXX)
 
 # Экспортируем для дочерних процессов
 export SYSTEM_PROMPT LOG_FILE RESULTS_DIR USE_GEMINI TOKENS_DIR
-export GEMINI_API_KEY GEMINI_MODEL 2>/dev/null || true
+export GEMINI_API_KEY GEMINI_MODEL GEMINI_WRITE 2>/dev/null || true
 
 echo -e "${BLUE}Scanning project: $PROJECT_DIR${NC}"
 
@@ -188,7 +196,11 @@ fi
 
 # ===== Инкрементальная индексация: загружаем существующие хеши =====
 HASH_MAP_FILE=""
-if [ "$FORCE_REINDEX" = false ] && [ -f "$INDEX_FILE" ] && [ "$USE_GEMINI" = false ]; then
+CAN_USE_CACHE=true
+if [ "$USE_GEMINI" = true ] && [ "$GEMINI_WRITE" = false ]; then
+  CAN_USE_CACHE=false
+fi
+if [ "$FORCE_REINDEX" = false ] && [ -f "$INDEX_FILE" ] && [ "$CAN_USE_CACHE" = true ]; then
   HASH_MAP_FILE=$(mktemp /tmp/indexer-hashmap-XXXXXXXX)
   jq -r '.[] | "\(.path)\t\(.hash // "")"' "$INDEX_FILE" > "$HASH_MAP_FILE" 2>/dev/null || true
   EXISTING_PATHS=$(mktemp /tmp/indexer-paths-XXXXXXXX)
@@ -455,7 +467,7 @@ done
 RESULTS="${RESULTS}]"
 
 # Записываем и форматируем
-if [ "$USE_GEMINI" = true ]; then
+if [ "$USE_GEMINI" = true ] && [ "$GEMINI_WRITE" = false ]; then
   echo "$RESULTS" | jq '.' 2>/dev/null | pbcopy
   echo -e "${GREEN}Result copied to clipboard (pbcopy)${NC}"
   echo "$RESULTS" | jq '.' > "$PROJECT_DIR/scripts/ai/gemini-index-preview.json" 2>/dev/null
@@ -469,8 +481,10 @@ ELAPSED=$((END_TIME - START_TIME))
 
 echo ""
 echo -e "${GREEN}========================================${NC}"
-if [ "$USE_GEMINI" = true ]; then
+if [ "$USE_GEMINI" = true ] && [ "$GEMINI_WRITE" = false ]; then
   echo -e "${GREEN}Gemini dry-run complete (index NOT modified)${NC}"
+elif [ "$USE_GEMINI" = true ]; then
+  echo -e "${GREEN}Gemini index built: $INDEX_FILE${NC}"
 else
   echo -e "${GREEN}Index built: $INDEX_FILE${NC}"
 fi

@@ -112,6 +112,28 @@ function findSessionFile(sessionId, cwd) {
   }
 }
 
+function readSessionCwdFromFile(filePath) {
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(64 * 1024);
+    const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    const head = buf.toString('utf-8', 0, bytesRead);
+    for (const line of head.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (entry && typeof entry.cwd === 'string' && entry.cwd.trim()) {
+          return entry.cwd;
+        }
+      } catch {}
+    }
+  } catch (e) {
+    console.warn('[Claude SessionCwd] failed to read head of', filePath, e.message);
+  }
+  return null;
+}
+
 // Tail-only cleanup of the just-injected `/effort` slash-command pair.
 //
 // Why tail-only:
@@ -1462,29 +1484,7 @@ function register({ projectManager, formatToolAction }) {
     try {
       const found = findSessionFile(sessionId, null);
       if (!found) return { success: false, error: 'Session file not found on disk' };
-      let sessionCwd = null;
-      try {
-        // Read just the head of the file (first non-empty line with a cwd field — usually
-        // the very first record). 64KB is generous: even Claude's hefty first entries are
-        // a few KB. No JSONL parser, just look at the first parseable line.
-        const fd = fs.openSync(found.filePath, 'r');
-        const buf = Buffer.alloc(64 * 1024);
-        const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
-        fs.closeSync(fd);
-        const head = buf.toString('utf-8', 0, bytesRead);
-        for (const line of head.split('\n')) {
-          if (!line.trim()) continue;
-          try {
-            const entry = JSON.parse(line);
-            if (entry && typeof entry.cwd === 'string' && entry.cwd.trim()) {
-              sessionCwd = entry.cwd;
-              break;
-            }
-          } catch {}
-        }
-      } catch (e) {
-        console.warn('[Claude ResolveCwd] failed to read head of', found.filePath, e.message);
-      }
+      const sessionCwd = readSessionCwdFromFile(found.filePath);
       return { success: true, filePath: found.filePath, projectDir: found.projectDir, sessionCwd };
     } catch (error) {
       console.error('[Claude ResolveCwd] Error:', error);
@@ -1518,8 +1518,14 @@ function register({ projectManager, formatToolAction }) {
       }
 
       const sourcePath = found.filePath;
-      const projectDir = found.projectDir;
+      const sessionCwd = readSessionCwdFromFile(sourcePath) || cwd;
+      const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+      const projectDir = sessionCwd
+        ? path.join(claudeProjectsDir, sessionCwd.replace(/\//g, '-'))
+        : found.projectDir;
       console.log('[Claude Fork] Source file:', sourcePath);
+      console.log('[Claude Fork] Session cwd:', sessionCwd || '(unknown)');
+      console.log('[Claude Fork] Destination project dir:', projectDir);
 
       // Check source file is not empty
       const stats = fs.statSync(sourcePath);
@@ -1532,6 +1538,9 @@ function register({ projectManager, formatToolAction }) {
       const newSessionId = crypto.randomUUID();
       console.log('[Claude Fork] New session ID:', newSessionId);
 
+      if (!fs.existsSync(projectDir)) {
+        fs.mkdirSync(projectDir, { recursive: true });
+      }
       const destPath = path.join(projectDir, `${newSessionId}.jsonl`);
 
       // Get Timeline UUIDs snapshot using Backtrace algorithm (same as Timeline UI)
@@ -1585,7 +1594,7 @@ function register({ projectManager, formatToolAction }) {
       // Wait for Claude to index the new file
       await new Promise(resolve => setTimeout(resolve, 500));
 
-      return { success: true, newSessionId, forkEntryCount: entryUuids.length };
+      return { success: true, newSessionId, forkEntryCount: entryUuids.length, sessionCwd, projectDir };
     } catch (error) {
       console.error('[Claude Fork] Error:', error);
       return { success: false, error: error.message };

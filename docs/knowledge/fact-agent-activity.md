@@ -1,12 +1,12 @@
 # Feature: Agent Activity Tracking (loader-on intervals)
 
-Records **how long an agent was actively working** in each tab — Claude PTY, Claude SDK, and Gemini — and aggregates it by day / project / tab for a graph in the Claude usage popover ("Activity" section). "Active" is defined as **the tab loader being on**, i.e. the exact same busy-state signal the UI consumes. No separate heuristic.
+Records **how long an agent was actively working** in each tab — Claude PTY, Claude SDK, Gemini, and Codex — and aggregates it by day / project / tab for a graph in the usage popovers ("Activity" section). "Active" is defined as **the tab loader being on**, i.e. the exact same busy-state signal the UI consumes. No separate heuristic.
 
 Backend capture: [`main.js`](../../src/main/main.js) `recordActivity`. Storage: `agent_activity_intervals` table in [`database.js`](../../src/main/database.js). Aggregation: [`ipc/claude-usage.js`](../../src/main/ipc/claude-usage.js) `computeActivityStats` + IPC `claude-usage:activity`. UI: `ActivityView` in [`ClaudeUsageButton.tsx`](../../src/renderer/components/Workspace/ClaudeUsageButton.tsx).
 
 ## Почему busy-state, а не отдельный детектор
 
-Юзер сформулировал «активность» как «loader загрузки» — буквально та полоска/пульс что горит пока агент думает. Этот сигнал уже детерминированно вычислен в main (`claude:busy-state` / `gemini:busy-state` / forwarded `claude-sdk:busy-state`). Строить второй параллельный детектор = расхождение (CLAUDE.md anti-pattern «Не дублируй детекцию событий»). Поэтому `recordActivity()` врезан **рядом** с каждым существующим busy-state send, не вместо и не как новый источник.
+Юзер сформулировал «активность» как «loader загрузки» — буквально та полоска/пульс что горит пока агент думает. Этот сигнал уже детерминированно вычислен в main (`claude:busy-state` / `gemini:busy-state` / forwarded `claude-sdk:busy-state`; для Codex — `codex:run-command` open и OSC `command-finished`/kill close). Строить второй параллельный детектор = расхождение (CLAUDE.md anti-pattern «Не дублируй детекцию событий»). Поэтому `recordActivity()` врезан **рядом** с каждым существующим busy/lifecycle send, не вместо и не как новый источник.
 
 ## recordActivity — единственный идемпотентный edge-triggered чокпоинт
 
@@ -23,13 +23,13 @@ recordActivity(tabId, busy, engine)  // busy:true → open, busy:false → close
 
 ## Identity snapshot на OPEN-time, денормализован в строку
 
-`resolveActivityIdentity(tabId, engine)` снимает `{projectId, projectPath, projectName, tabName, sessionId}` в момент **открытия** интервала — пока таб жив. Все поля копируются в строку (денормализация), чтобы запись пережила удаление таба/проекта позже. Резолв best-effort: PTY-табы через `terminalProjectIds` (live) → SQLite `tabs` fallback; SDK-табы через `sdkSessions` (cwd+sessionId, их нет в `terminalProjectIds`); имя проекта — прямой `SELECT name,path FROM projects WHERE id=?` (НЕ `getProjectById` — тот ещё гидрирует все табы + global commands, перебор на каждый turn-start).
+`resolveActivityIdentity(tabId, engine)` снимает `{projectId, projectPath, projectName, tabName, sessionId}` в момент **открытия** интервала — пока таб жив. Все поля копируются в строку (денормализация), чтобы запись пережила удаление таба/проекта позже. Резолв best-effort: PTY-табы через `terminalProjectIds` (live) → SQLite `tabs` fallback; SDK-табы через `sdkSessions` (cwd+sessionId, их нет в `terminalProjectIds`); для session id fallback читает `claude_session_id`, `gemini_session_id` или `codex_session_id` из строки таба. Имя проекта — прямой `SELECT name,path FROM projects WHERE id=?` (НЕ `getProjectById` — тот ещё гидрирует все табы + global commands, перебор на каждый turn-start).
 
 `engine` может быть известен только на close-time (например forwarder) — рекордер берёт engine с open, fallback на close-time hint.
 
 ## Закрытие на teardown — обязательно для обоих движков
 
-PTY-exit и terminal-kill cleanup вызывают **безусловный** `recordActivity(tabId, false)` (без engine — закроет что было открыто, claude или gemini). Watchdog, interrupt-watcher (JSONL marker), idle-probe и manual-stop тоже закрывают — иначе зависший/прерванный turn оставил бы интервал открытым навсегда (до следующего close или quit-flush). Shutdown: `flushOpenActivityIntervals()` в `before-quit` пишет все открытые интервалы, обрезанные на момент quit'а.
+PTY-exit и terminal-kill cleanup вызывают **безусловный** `recordActivity(tabId, false)` (без engine — закроет что было открыто, claude/gemini/codex). Watchdog, interrupt-watcher (JSONL marker), idle-probe, manual-stop и Codex command-finished тоже закрывают — иначе зависший/прерванный turn оставил бы интервал открытым навсегда (до следующего close или quit-flush). Shutdown: `flushOpenActivityIntervals()` в `before-quit` пишет все открытые интервалы, обрезанные на момент quit'а.
 
 ## Таблица
 
@@ -57,7 +57,7 @@ IPC `claude-usage:activity { days }` (default 14). Читает сырые ин�
 
 ## UI — Activity section в popover'е
 
-Collapsible-секция рядом с «By day» (та же механика expand/refresh/ephemeral-reset что у This-tab и By-day). Total active + per-day stacked bars (сегменты по engine-цвету: Claude `#DA7756`, Claude SDK `#C9826A`, Gemini `#4E86F8`) + by-project список + легенда. `dayLabel` теперь date-aware (today/yest от реального календаря, не от индекса массива) — у активности есть дырки (день без агентов = нет строки), индекс врал бы.
+Collapsible-секция рядом с «By day» (та же механика expand/refresh/ephemeral-reset что у This-tab и By-day). Total active + per-day stacked bars (сегменты по engine-цвету: Claude `#DA7756`, Claude SDK `#C9826A`, Gemini `#4E86F8`, Codex `#22c55e`) + by-project список + легенда. `dayLabel` теперь date-aware (today/yest от реального календаря, не от индекса массива) — у активности есть дырки (день без агентов = нет строки), индекс врал бы.
 
 ## Связи
 

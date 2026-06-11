@@ -15,6 +15,21 @@ const { ipcRenderer, clipboard } = window.require('electron');
 // SECTION: HELPERS — module-level pure functions, types, module state
 // ════════════════════════════════════════════════════════════
 
+function isTimelineTextSearchDiagEnabled(): boolean {
+  try {
+    return (window as any).__TIMELINE_TEXT_SEARCH_DIAG__ === true
+      || localStorage.getItem('noted-terminal-debug-timeline-text-search') === '1';
+  } catch {
+    return false;
+  }
+}
+
+function warnTimelineTextSearchDiag(message: string) {
+  if (isTimelineTextSearchDiagEnabled()) {
+    console.warn(message);
+  }
+}
+
 // True when an entry is NOT a regular user prompt — currently 'compact', 'continued',
 // 'docs_edit', 'docs_search'. Used widely to skip non-user entries in nav/copy/visibility.
 // If a new attribute-style entry type is ever added, update this ONE place.
@@ -22,6 +37,29 @@ function isAttributeEntry(entry: { type?: string }): boolean {
   return entry.type === 'compact' || entry.type === 'continued'
     || entry.type === 'docs_edit' || entry.type === 'docs_search';
 }
+
+const DOCS_TIMELINE_COLORS = {
+  edited: {
+    hover: '#22c55e',
+    visible: '#15803d',
+    dim: '#14532d',
+    glow: '34, 197, 94',
+    tooltip: 'rgba(34, 197, 94, 0.9)',
+    tooltipMuted: 'rgba(34, 197, 94, 0.82)',
+    borderClass: 'border-green-700/30',
+    hoverClass: 'hover:bg-green-700/10',
+  },
+  search: {
+    hover: '#bbf7d0',
+    visible: '#4ade80',
+    dim: '#22c55e',
+    glow: '134, 239, 172',
+    tooltip: 'rgba(134, 239, 172, 0.9)',
+    tooltipMuted: 'rgba(134, 239, 172, 0.82)',
+    borderClass: 'border-emerald-400/20',
+    hoverClass: 'hover:bg-emerald-400/10',
+  },
+} as const;
 
 // Portal for tooltip to escape overflow:hidden
 const TooltipPortal: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -67,6 +105,7 @@ interface TimelineEntry {
   timestamp: string;
   content: string;
   isCompactSummary?: boolean;
+  compactSummary?: string;
   preTokens?: number;
   hasImage?: boolean;
   sessionId?: string;
@@ -104,7 +143,7 @@ interface TimelineProps {
   isActive?: boolean; // Claude/Gemini is currently running
   isVisible?: boolean; // New prop to control visibility from parent
   isOpen?: boolean; // CMD+] toggle — controls slide in/out
-  toolType?: 'claude' | 'gemini'; // Which AI tool this timeline is for
+  toolType?: 'claude' | 'gemini' | 'codex'; // Which AI tool this timeline is for
 }
 
 // Truncate text for tooltip display
@@ -288,6 +327,9 @@ const SAVED_MAP_MAX = 20;
 // ════════════════════════════════════════════════════════════
 function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, isOpen = true, toolType = 'claude' }: TimelineProps) {
   const isGemini = toolType === 'gemini';
+  const isCodex = toolType === 'codex';
+  const usesTextSearchAnchors = isGemini || isCodex;
+  const supportsClaudeTimelineActions = !isGemini && !isCodex;
 
   // Slide animation (matches HistoryPanel pattern)
   const [slideIn, setSlideIn] = useState(isOpen);
@@ -303,6 +345,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   }, [isOpen]);
 
   const [entries, setEntries] = useState<TimelineEntry[]>([]);
+  const [compactSummaryCache, setCompactSummaryCache] = useState<Record<string, string | null>>({});
   const [forkMarkers, setForkMarkers] = useState<ForkMarker[]>([]);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [activeTooltipIndex, setActiveTooltipIndex] = useState<number | null>(null);
@@ -580,7 +623,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Fetch token breakdown for the active range. claude-only; Gemini falls back to the
   // legacy heuristic (sum of user.content lengths) since it has no copy-range backend.
   useEffect(() => {
-    if (!rangeActionMenu || isGemini || !sessionId) {
+    if (!rangeActionMenu || !supportsClaudeTimelineActions || !sessionId) {
       setTokenEstimate(null);
       setBreakdownOpen(false);
       return;
@@ -609,7 +652,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       }
     })();
     return () => { cancelled = true; };
-  }, [rangeActionMenu?.startUuid, rangeActionMenu?.endUuid, sessionId, cwd, isGemini]);
+  }, [rangeActionMenu?.startUuid, rangeActionMenu?.endUuid, sessionId, cwd, supportsClaudeTimelineActions]);
 
   // Position the breakdown popover: open downward by default, flip up if there's not
   // enough room below the action menu. Same flip pattern as note tooltip.
@@ -630,7 +673,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // network roundtrip when user moves mouse out and back in).
   const singleCachedUuidRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!singleTokenUuid || isGemini || !sessionId) {
+    if (!singleTokenUuid || !supportsClaudeTimelineActions || !sessionId) {
       setSingleTokenEstimate(null);
       return;
     }
@@ -658,7 +701,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       }
     })();
     return () => { cancelled = true; };
-  }, [singleTokenUuid, sessionId, cwd, isGemini]);
+  }, [singleTokenUuid, sessionId, cwd, supportsClaudeTimelineActions]);
 
   // Global mousemove guard for both breakdown popovers. Closing on chip.onMouseLeave
   // unmounts the popover wrapper before the cursor can cross the 4px gap into it —
@@ -982,6 +1025,47 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setTooltipCopied(false);
   }, [activeTooltipIndex]);
 
+  useEffect(() => {
+    setCompactSummaryCache({});
+  }, [sessionId]);
+
+  // Compact summaries are intentionally not carried by get-timeline: Codex
+  // replacement_history can be 100k+ chars and Timeline polls every 2s. Fetch
+  // the full-history payload only when the compact entry tooltip is actually opened.
+  useEffect(() => {
+    if (!sessionId || isGemini || activeTooltipIndex === null) return;
+    const entry = entries[activeTooltipIndex];
+    if (!entry || entry.type !== 'compact') return;
+    if (entry.compactSummary) return;
+    if (Object.prototype.hasOwnProperty.call(compactSummaryCache, entry.uuid)) return;
+
+    let cancelled = false;
+    const channel = isCodex ? 'codex:get-full-history' : 'claude:get-full-history';
+    (async () => {
+      try {
+        const result = await ipcRenderer.invoke(channel, { sessionId, cwd });
+        if (cancelled) return;
+        const fullEntry = Array.isArray(result?.entries)
+          ? result.entries.find((item: any) => item?.uuid === entry.uuid)
+          : null;
+        const summary = typeof fullEntry?.compactSummary === 'string' && fullEntry.compactSummary.trim()
+          ? fullEntry.compactSummary
+          : null;
+        setCompactSummaryCache(prev => (
+          Object.prototype.hasOwnProperty.call(prev, entry.uuid)
+            ? prev
+            : { ...prev, [entry.uuid]: summary }
+        ));
+      } catch (err) {
+        if (!cancelled) {
+          console.warn('[Timeline:CompactTooltip] failed to load compact summary:', err);
+          setCompactSummaryCache(prev => ({ ...prev, [entry.uuid]: null }));
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activeTooltipIndex, entries, sessionId, cwd, isGemini, isCodex, compactSummaryCache]);
+
   // ════════════════════════════════════════════════════════════
   // SECTION: POPUPRIGHTPX MEASUREMENT — derives CSS `right:` for every Timeline-anchored popup
   // ════════════════════════════════════════════════════════════
@@ -1159,6 +1243,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           setForkMarkers([]);
           setClaudeMemoryBoundaryUuid(null);
         }
+      } else if (isCodex) {
+        const timelineResult = await ipcRenderer.invoke('codex:get-timeline', { sessionId, cwd });
+        if (timelineResult.success) {
+          setEntries(timelineResult.entries);
+          setSessionBoundaries([]);
+          setForkMarkers([]);
+          setClaudeMemoryBoundaryUuid(null);
+        }
       } else {
         // Claude: load timeline entries and fork markers in parallel
         const [timelineResult, markersResult] = await Promise.all([
@@ -1260,7 +1352,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     } finally {
       setIsLoading(false);
     }
-  }, [sessionId, cwd, tabId, isGemini]);
+  }, [sessionId, cwd, tabId, isGemini, isCodex]);
 
   // effect: loadTimeline callback identity changes (sessionId/cwd/tabId/isGemini) → trigger initial timeline load
   useEffect(() => {
@@ -1455,7 +1547,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   // effect: entries/tabId/isGemini → terminalRegistry.bindEntryToPromptBoundary for each user entry (skips attribute entries; OSC 7777 markers anchor scrollToEntry; entries without markers fall back to SearchAddon)
   useEffect(() => {
-    if (isGemini || entries.length === 0) return;
+    if (usesTextSearchAnchors || entries.length === 0) return;
     const boundaryCount = terminalRegistry.getPromptBoundaryCount(tabId);
     if (boundaryCount === 0) return;
 
@@ -1472,7 +1564,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       }
       promptSeq++;
     }
-  }, [entries, tabId, isGemini]);
+  }, [entries, tabId, usesTextSearchAnchors]);
 
   // ════════════════════════════════════════════════════════════
   // SECTION: VISIBILITY + REACHABILITY — computePositions/checkVisibility/checkReachability tied to terminal viewport
@@ -1515,10 +1607,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     // Find the last compact/plan-mode boundary.
     // Entries before this index are cleared from terminal — always unreachable, never visible.
     // Note: 'continued' (fork) and sessionId changes do NOT clear terminal — only compact and plan-mode do.
-    // Gemini exception: compact does NOT clear the terminal buffer — history stays visible.
-    // Only Claude uses compact as a boundary. Plan-mode is Claude-only too.
+    // Gemini/Codex exception: compact does NOT mean the pre-compact history is
+    // inaccessible in our history layer. Only Claude uses compact as a terminal
+    // old-history boundary; Plan Mode is Claude-only too.
     let lastBoundaryIdx = -1;
-    if (!isGemini) {
+    if (!isGemini && !isCodex) {
       for (let i = 0; i < entries.length; i++) {
         const e = entries[i];
         if (e.type === 'compact' || e.isPlan) {
@@ -1539,8 +1632,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     const computePositions = (): number[] => {
       const pos = new Array(entries.length).fill(-1);
 
-      if (isGemini) {
-        // Gemini: single-pass anchored buffer scan
+      if (usesTextSearchAnchors) {
+        // Gemini/Codex: single-pass anchored buffer scan
         const searchData: { searchLines: string[]; entryIndex: number }[] = [];
         entries.forEach((entry, index) => {
           if (index <= lastBoundaryIdx) return;
@@ -1555,13 +1648,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           searchData.forEach((sd, i) => {
             pos[sd.entryIndex] = rows[i];
             if (rows[i] < 0) {
-              console.warn(`[Timeline:GeminiDiag] MISS entry#${sd.entryIndex} type=${entries[sd.entryIndex].type} searchLines=${JSON.stringify(sd.searchLines)}`);
+              warnTimelineTextSearchDiag(`[Timeline:TextSearchDiag] MISS tool=${toolType} entry#${sd.entryIndex} type=${entries[sd.entryIndex].type} searchLines=${JSON.stringify(sd.searchLines)}`);
             }
           });
           const found = rows.filter(r => r >= 0).length;
           const missed = rows.filter(r => r < 0).length;
           if (missed > 0) {
-            console.warn(`[Timeline:GeminiDiag] positions: ${found} found, ${missed} missed, total=${searchData.length}, lastBoundaryIdx=${lastBoundaryIdx}`);
+            warnTimelineTextSearchDiag(`[Timeline:TextSearchDiag] tool=${toolType} positions: ${found} found, ${missed} missed, total=${searchData.length}, lastBoundaryIdx=${lastBoundaryIdx}`);
           }
         }
       } else {
@@ -1698,11 +1791,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         }
       });
 
-      if (isGemini && newUnreachable.size > 0) {
-        console.warn(`[Timeline:GeminiDiag] unreachable=[${[...newUnreachable].join(',')}] terminal=${canDetermineReachability} lastBoundaryIdx=${lastBoundaryIdx} entries=${entries.length}`);
+      if (usesTextSearchAnchors && newUnreachable.size > 0) {
+        warnTimelineTextSearchDiag(`[Timeline:TextSearchDiag] tool=${toolType} unreachable=[${[...newUnreachable].join(',')}] terminal=${canDetermineReachability} lastBoundaryIdx=${lastBoundaryIdx} entries=${entries.length}`);
         [...newUnreachable].forEach(idx => {
           const e = entries[idx];
-          console.warn(`[Timeline:GeminiDiag]   #${idx} type=${e.type} isPlan=${e.isPlan} content=${JSON.stringify(e.content?.substring(0, 60))}`);
+          warnTimelineTextSearchDiag(`[Timeline:TextSearchDiag]   #${idx} type=${e.type} isPlan=${e.isPlan} content=${JSON.stringify(e.content?.substring(0, 60))}`);
         });
       }
 
@@ -1737,7 +1830,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       if (reachTimer) clearTimeout(reachTimer);
       terminalRegistry.offViewportChange(tabId);
     };
-  }, [tabId, entries, isVisible, isGemini, isHistoryOpen, isSdkTab, historyVisibleUuids]);
+  }, [tabId, entries, isVisible, isGemini, isCodex, usesTextSearchAnchors, isHistoryOpen, isSdkTab, historyVisibleUuids, toolType]);
 
   // Refs
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -1908,7 +2001,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
 
     const index = entries.findIndex(e => e.uuid === entry.uuid);
-    const clickIsOldHistory = lastBoundaryIndex >= 0 && index <= lastBoundaryIndex;
+    const clickIsOldHistory = !isCodex && lastBoundaryIndex >= 0 && index <= lastBoundaryIndex;
 
     // Cmd+Click (macOS) / Ctrl+Click (other) → принудительно открыть History Panel и
     // проскроллить к этой записи. Обычный клик скроллит в терминале. Mental model
@@ -1984,9 +2077,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
       let found = false;
 
-      if (isGemini) {
-        // Gemini: buffer-text search with multi-line matching.
-        // Gemini CLI (Ink TUI) doesn't use ❯/⏵ prompt markers,
+      if (usesTextSearchAnchors) {
+        // Gemini/Codex: buffer-text search with multi-line matching.
+        // These CLIs don't use Claude ❯/⏵ prompt markers,
         // so xterm search addon validation is useless. Instead we search
         // the full buffer text for consecutive lines matching the entry content.
         const searchLines = getSearchLines(entry.content);
@@ -2080,6 +2173,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   };
 
   const handleEntryDoubleClick = (entry: TimelineEntry) => {
+    if (isCodex) return;
     if (clickTimerRef.current) {
       clearTimeout(clickTimerRef.current);
       clickTimerRef.current = null;
@@ -2326,7 +2420,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // освобождается (claudeSessionId сбрасывается).
   const executeDeleteRange = async (range: { startIndex: number; endIndex: number }, startUuid: string, endUuid: string) => {
     if (!sessionId) return;
-    if (isGemini) return; // Gemini не поддерживается этим путём — JSON-формат другой
+    if (!supportsClaudeTimelineActions) return; // Gemini/Codex не поддерживаются этим путём — JSON-формат другой
 
     // Очистка selection и popup
     selectionStartIdRef.current = null;
@@ -2442,6 +2536,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setContextMenu(null);
     setRewindPostPromptMode(false);
     if (!sessionId) return;
+    if (isCodex) return;
 
     const entryIndex = entries.findIndex(e => e.uuid === entry.uuid);
     if (entryIndex === -1) return;
@@ -2622,6 +2717,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const handleCopySingleEntry = async (entry: TimelineEntry) => {
     if (!sessionId) return;
     setContextMenu(null);
+    if (isCodex) {
+      clipboard.writeText(entry.content || '');
+      useUIStore.getState().showToast('Скопировано', 'success', 1500);
+      return;
+    }
     const channel = isGemini ? 'gemini:copy-range' : 'claude:copy-range';
     try {
       const result = await ipcRenderer.invoke(channel, {
@@ -3267,7 +3367,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             // isResponseOnly = response visible but prompt above viewport (same as normal)
             const isPromptVisible = isInViewport && !isResponseOnly;
             // Old history = before last compact/plan boundary (not part of current dialog)
-            const isOldHistory = lastBoundaryIndex >= 0 && index <= lastBoundaryIndex;
+            const isOldHistory = !isCodex && lastBoundaryIndex >= 0 && index <= lastBoundaryIndex;
             // Chain-break zone: entries that are visually rendered but invisible
             // to Claude's own backtrace because a phantom parentUuid breaks the
             // chain somewhere along the way. claudeMemoryBoundaryIndex marks
@@ -3287,11 +3387,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               dotColor = isHovered ? '#f59e0b' : '#a67c1a';
               dotGlow = isHovered ? '0 0 10px rgba(245, 158, 11, 0.5)' : 'none';
             } else if (isDocsEdit) {
-              dotColor = isHovered ? '#4ade80' : (isPromptVisible ? '#3cc46e' : '#2a8a4e');
-              dotGlow = isHovered ? '0 0 10px rgba(74, 222, 128, 0.5)' : (isPromptVisible ? '0 0 6px rgba(74, 222, 128, 0.2)' : 'none');
+              dotColor = isHovered ? DOCS_TIMELINE_COLORS.edited.hover : (isPromptVisible ? DOCS_TIMELINE_COLORS.edited.visible : DOCS_TIMELINE_COLORS.edited.dim);
+              dotGlow = isHovered ? `0 0 10px rgba(${DOCS_TIMELINE_COLORS.edited.glow}, 0.5)` : (isPromptVisible ? `0 0 6px rgba(${DOCS_TIMELINE_COLORS.edited.glow}, 0.22)` : 'none');
             } else if (isDocsSearch) {
-              dotColor = isHovered ? '#bef264' : (isPromptVisible ? '#8cb82a' : '#6a8f1e');
-              dotGlow = isHovered ? '0 0 10px rgba(190, 242, 100, 0.5)' : (isPromptVisible ? '0 0 6px rgba(190, 242, 100, 0.2)' : 'none');
+              dotColor = isHovered ? DOCS_TIMELINE_COLORS.search.hover : (isPromptVisible ? DOCS_TIMELINE_COLORS.search.visible : DOCS_TIMELINE_COLORS.search.dim);
+              dotGlow = isHovered ? `0 0 10px rgba(${DOCS_TIMELINE_COLORS.search.glow}, 0.5)` : (isPromptVisible ? `0 0 6px rgba(${DOCS_TIMELINE_COLORS.search.glow}, 0.22)` : 'none');
             } else if (isPlan) {
               dotColor = isHovered ? '#5eada3' : '#3d7a72';
               dotGlow = isHovered ? '0 0 10px rgba(94, 173, 163, 0.5)' : 'none';
@@ -3308,12 +3408,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               // User turn that resulted in docs/CLAUDE.md edits — colour the user dot green
               // instead of emitting a separate docs_edit dot. Edit takes precedence over search:
               // editing is a "stronger" signal (file actually changed) than reading.
-              dotColor = isHovered ? '#4ade80' : (isPromptVisible ? '#3cc46e' : '#2a8a4e');
-              dotGlow = isHovered ? '0 0 10px rgba(74, 222, 128, 0.5)' : (isPromptVisible ? '0 0 6px rgba(74, 222, 128, 0.25)' : 'none');
+              dotColor = isHovered ? DOCS_TIMELINE_COLORS.edited.hover : (isPromptVisible ? DOCS_TIMELINE_COLORS.edited.visible : DOCS_TIMELINE_COLORS.edited.dim);
+              dotGlow = isHovered ? `0 0 10px rgba(${DOCS_TIMELINE_COLORS.edited.glow}, 0.5)` : (isPromptVisible ? `0 0 6px rgba(${DOCS_TIMELINE_COLORS.edited.glow}, 0.25)` : 'none');
             } else if (entry.docsSearchQueries && entry.docsSearchQueries.length > 0) {
-              // User turn that triggered docs_search but no edits — lime tone
-              dotColor = isHovered ? '#bef264' : (isPromptVisible ? '#8cb82a' : '#6a8f1e');
-              dotGlow = isHovered ? '0 0 10px rgba(190, 242, 100, 0.5)' : (isPromptVisible ? '0 0 6px rgba(190, 242, 100, 0.25)' : 'none');
+              // User turn that triggered docs_search but no edits — lighter green tone.
+              dotColor = isHovered ? DOCS_TIMELINE_COLORS.search.hover : (isPromptVisible ? DOCS_TIMELINE_COLORS.search.visible : DOCS_TIMELINE_COLORS.search.dim);
+              dotGlow = isHovered ? `0 0 10px rgba(${DOCS_TIMELINE_COLORS.search.glow}, 0.5)` : (isPromptVisible ? `0 0 6px rgba(${DOCS_TIMELINE_COLORS.search.glow}, 0.25)` : 'none');
             } else {
               dotColor = isHovered ? '#fff' : (isPromptVisible ? '#ccc' : '#999');
               dotGlow = isHovered ? '0 0 10px rgba(255, 255, 255, 0.5)' : (isPromptVisible ? '0 0 6px rgba(255, 255, 255, 0.15)' : 'none');
@@ -3485,12 +3585,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         //   in ALL views including HistoryPanel/SDK, because
                         //   even though the renderer can display them via
                         //   recovery, live Claude cannot see them.
-                        // - pre-compact old-history — suppressed when
-                        //   HistoryPanel open OR SDK tab (those render full
-                        //   chat themselves so it'd be redundant).
+                        // - pre-compact old-history — Claude-only. Suppressed
+                        //   when HistoryPanel open OR SDK tab (those render
+                        //   full chat themselves so it'd be redundant).
                         : (isChainBreakZone && !isGroupMeta && !isCompacted)
                           ? 'rgba(239, 68, 68, 0.06)'
-                          : (isOldHistory && !isGroupMeta && !isCompacted && !isHistoryOpen && !isSdkTab
+                          : (isOldHistory && !isGroupMeta && !isHistoryOpen && !isSdkTab
                               ? 'rgba(239, 68, 68, 0.06)'
                               : 'transparent'),
                     cursor: (isContinued || isDocsEdit || isDocsSearch || (isOldHistory && !isHistoryOpen && !isSdkTab)) ? 'default' : 'pointer',
@@ -4298,9 +4398,63 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     document.addEventListener('mouseup', onUp);
                   }}
                 />
-                {currentActiveEntry.type === 'compact' ? (
-                  <span className="text-amber-400 font-medium">History Compacted ({currentActiveEntry.preTokens ? `${Math.round(currentActiveEntry.preTokens/1000)}k` : '?'} tokens)</span>
-                ) : currentActiveEntry.type === 'continued' ? (
+                {currentActiveEntry.type === 'compact' ? (() => {
+                  const cached = compactSummaryCache[currentActiveEntry.uuid];
+                  const compactText = currentActiveEntry.compactSummary || cached || '';
+                  const isLoadingCompact = !currentActiveEntry.compactSummary && cached === undefined;
+                  const displayText = compactText || (isLoadingCompact ? 'Загружаю compact summary...' : 'Compact summary не найден');
+                  const canCopyCompact = !!compactText;
+                  return (
+                    <>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <div style={{ width: '12px', height: '3px', borderRadius: '1px', backgroundColor: '#f59e0b', flexShrink: 0 }} />
+                        <span className="text-amber-400 font-medium text-[11px]">
+                          History Compacted ({currentActiveEntry.preTokens ? `${Math.round(currentActiveEntry.preTokens / 1000)}k` : '?'} tokens)
+                        </span>
+                      </div>
+                      <div
+                        className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin"
+                        style={{
+                          maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px',
+                          overflowY: 'auto',
+                          overflowX: 'hidden',
+                          whiteSpace: 'pre-wrap',
+                        }}
+                      >
+                        {displayText}
+                      </div>
+                      <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
+                        <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
+                        <div className="flex-1" />
+                        <button
+                          disabled={!canCopyCompact}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (!canCopyCompact) return;
+                            clipboard.writeText(compactText);
+                            setTooltipCopied(true);
+                            setTimeout(() => setTooltipCopied(false), 1200);
+                          }}
+                          className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 text-[10px] transition-colors disabled:opacity-40 disabled:cursor-default cursor-pointer"
+                          style={{ color: tooltipCopied ? '#4ade80' : 'rgba(255,255,255,0.6)' }}
+                        >
+                          {tooltipCopied ? <Check size={12} /> : <Copy size={12} />}
+                          {tooltipCopied ? 'Скопировано' : isLoadingCompact ? 'Загрузка' : 'Копировать'}
+                        </button>
+                        {(displayText.length > 200 || isExpanded) && (
+                          <Tooltip content={isExpanded ? "Свернуть" : "Развернуть полностью"}>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); setIsExpanded(!isExpanded); }}
+                            className="p-1 rounded hover:bg-white/10 text-white/40 hover:text-white transition-colors cursor-pointer shrink-0 ml-1"
+                          >
+                            {isExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
+                          </button>
+                          </Tooltip>
+                        )}
+                      </div>
+                    </>
+                  );
+                })() : currentActiveEntry.type === 'continued' ? (
                   <>
                     <span className="text-amber-400 font-medium shrink-0">Context Overflow Recovery</span>
                     <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
@@ -4324,13 +4478,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 ) : currentActiveEntry.type === 'docs_edit' ? (
                   <>
                     <div className="flex items-center gap-2">
-                      <div style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: '#4ade80', flexShrink: 0 }} />
-                      <span style={{ color: '#4ade80' }} className="font-medium text-[11px]">Docs Updated</span>
+                      <div style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: DOCS_TIMELINE_COLORS.edited.visible, flexShrink: 0 }} />
+                      <span style={{ color: DOCS_TIMELINE_COLORS.edited.visible }} className="font-medium text-[11px]">Docs Updated</span>
                     </div>
                     <div className="text-white/70 leading-snug font-mono text-[11px]" style={{ whiteSpace: 'pre-wrap' }}>
                       {(currentActiveEntry.docsEdited || [currentActiveEntry.content]).map((f: string, i: number) => (
                         <div key={i} className="flex items-center gap-1.5 py-0.5">
-                          <Pencil size={10} className="shrink-0" style={{ color: 'rgba(74, 222, 128, 0.5)' }} />
+                          <Pencil size={10} className="shrink-0" style={{ color: DOCS_TIMELINE_COLORS.edited.tooltipMuted }} />
                           <span>{f}</span>
                         </div>
                       ))}
@@ -4340,13 +4494,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 ) : currentActiveEntry.type === 'docs_search' ? (
                   <>
                     <div className="flex items-center gap-2">
-                      <div style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: '#bef264', flexShrink: 0 }} />
-                      <span style={{ color: '#bef264' }} className="font-medium text-[11px]">Docs Search</span>
+                      <div style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: DOCS_TIMELINE_COLORS.search.visible, flexShrink: 0 }} />
+                      <span style={{ color: DOCS_TIMELINE_COLORS.search.visible }} className="font-medium text-[11px]">Docs Search</span>
                     </div>
                     <div className="text-white/70 leading-snug font-mono text-[11px]" style={{ whiteSpace: 'pre-wrap' }}>
                       {(currentActiveEntry.docsSearchQueries || [currentActiveEntry.content]).map((q: string, i: number) => (
                         <div key={i} className="flex items-center gap-1.5 py-0.5">
-                          <Search size={10} className="shrink-0" style={{ color: 'rgba(190, 242, 100, 0.5)' }} />
+                          <Search size={10} className="shrink-0" style={{ color: DOCS_TIMELINE_COLORS.search.tooltipMuted }} />
                           <span>{q}</span>
                         </div>
                       ))}
@@ -4380,15 +4534,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       <span
                         className="flex items-center gap-1 ml-2 text-[10px]"
                         onMouseEnter={(e) => {
-                          if (isGemini) return;
+                          if (!supportsClaudeTimelineActions) return;
                           setSingleChipEl(e.currentTarget);
                           setSingleTokenUuid(currentActiveEntry.uuid);
                           setSingleBreakdownOpen(true);
                         }}
                         style={{
                           color: '#e8a955',
-                          cursor: isGemini ? 'default' : 'help',
-                          textDecoration: isGemini ? 'none' : 'underline dotted rgba(232,169,85,0.4)',
+                          cursor: supportsClaudeTimelineActions ? 'help' : 'default',
+                          textDecoration: supportsClaudeTimelineActions ? 'underline dotted rgba(232,169,85,0.4)' : 'none',
                           textUnderlineOffset: '2px',
                         }}
                       >
@@ -4432,15 +4586,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       <span
                         className="flex items-center gap-1 ml-2 text-[10px]"
                         onMouseEnter={(e) => {
-                          if (isGemini) return;
+                          if (!supportsClaudeTimelineActions) return;
                           setSingleChipEl(e.currentTarget);
                           setSingleTokenUuid(currentActiveEntry.uuid);
                           setSingleBreakdownOpen(true);
                         }}
                         style={{
                           color: '#e8a955',
-                          cursor: isGemini ? 'default' : 'help',
-                          textDecoration: isGemini ? 'none' : 'underline dotted rgba(232,169,85,0.4)',
+                          cursor: supportsClaudeTimelineActions ? 'help' : 'default',
+                          textDecoration: supportsClaudeTimelineActions ? 'underline dotted rgba(232,169,85,0.4)' : 'none',
                           textUnderlineOffset: '2px',
                         }}
                       >
@@ -4518,7 +4672,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       const open = expandedDocsEdit.has(uuid);
                       const files = currentActiveEntry.docsEdited;
                       return (
-                        <div className="pb-1.5 mb-1.5 border-b border-green-500/15 shrink-0">
+                        <div className={`pb-1.5 mb-1.5 border-b ${DOCS_TIMELINE_COLORS.edited.borderClass} shrink-0`}>
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
@@ -4528,16 +4682,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                                 return next;
                               });
                             }}
-                            className="w-full text-left flex items-center gap-1.5 hover:bg-green-500/5 rounded px-0.5 py-0.5 cursor-pointer"
-                            style={{ color: 'rgba(74, 222, 128, 0.9)' }}
+                            className={`w-full text-left flex items-center gap-1.5 ${DOCS_TIMELINE_COLORS.edited.hoverClass} rounded px-0.5 py-0.5 cursor-pointer`}
+                            style={{ color: DOCS_TIMELINE_COLORS.edited.tooltip }}
                           >
-                            <Pencil size={10} className="shrink-0" style={{ color: '#4ade80' }} />
+                            <Pencil size={10} className="shrink-0" style={{ color: DOCS_TIMELINE_COLORS.edited.visible }} />
                             <span className="leading-snug font-mono text-[10px] flex-1 font-medium">
                               Docs updated ({files.length})
                             </span>
                           </button>
                           {open && (
-                            <div className="mt-1 ml-4 leading-snug font-mono text-[10px]" style={{ color: 'rgba(74, 222, 128, 0.85)' }}>
+                            <div className="mt-1 ml-4 leading-snug font-mono text-[10px]" style={{ color: DOCS_TIMELINE_COLORS.edited.tooltipMuted }}>
                               {files.map((f: string, i: number) => (
                                 <div key={i} className="break-all" style={{ opacity: 0.85 }}>{f}</div>
                               ))}
@@ -4551,7 +4705,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       const open = expandedDocsSearch.has(uuid);
                       const queries = currentActiveEntry.docsSearchQueries;
                       return (
-                        <div className="pb-1.5 mb-1.5 border-b border-lime-500/15 shrink-0">
+                        <div className={`pb-1.5 mb-1.5 border-b ${DOCS_TIMELINE_COLORS.search.borderClass} shrink-0`}>
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
@@ -4561,16 +4715,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                                 return next;
                               });
                             }}
-                            className="w-full text-left flex items-start gap-1.5 hover:bg-lime-500/5 rounded px-0.5 py-0.5 cursor-pointer"
-                            style={{ color: 'rgba(190, 242, 100, 0.9)' }}
+                            className={`w-full text-left flex items-start gap-1.5 ${DOCS_TIMELINE_COLORS.search.hoverClass} rounded px-0.5 py-0.5 cursor-pointer`}
+                            style={{ color: DOCS_TIMELINE_COLORS.search.tooltip }}
                           >
-                            <Search size={10} className="shrink-0 mt-0.5" style={{ color: '#bef264' }} />
+                            <Search size={10} className="shrink-0 mt-0.5" style={{ color: DOCS_TIMELINE_COLORS.search.visible }} />
                             <span className="leading-snug font-mono text-[10px] flex-1">
                               <span className="font-medium">Docs search ({queries.length})</span>
                             </span>
                           </button>
                           {open && (
-                            <div className="mt-1 ml-4 leading-snug font-mono text-[10px]" style={{ color: 'rgba(190, 242, 100, 0.85)' }}>
+                            <div className="mt-1 ml-4 leading-snug font-mono text-[10px]" style={{ color: DOCS_TIMELINE_COLORS.search.tooltipMuted }}>
                               {queries.map((q: string, i: number) => (
                                 <div key={i} className="break-words" style={{ opacity: 0.85 }}>«{q}»</div>
                               ))}
@@ -4587,15 +4741,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       <span
                         className="flex items-center gap-1 ml-2 text-[10px]"
                         onMouseEnter={(e) => {
-                          if (isGemini) return;
+                          if (!supportsClaudeTimelineActions) return;
                           setSingleChipEl(e.currentTarget);
                           setSingleTokenUuid(currentActiveEntry.uuid);
                           setSingleBreakdownOpen(true);
                         }}
                         style={{
                           color: '#e8a955',
-                          cursor: isGemini ? 'default' : 'help',
-                          textDecoration: isGemini ? 'none' : 'underline dotted rgba(232,169,85,0.4)',
+                          cursor: supportsClaudeTimelineActions ? 'help' : 'default',
+                          textDecoration: supportsClaudeTimelineActions ? 'underline dotted rgba(232,169,85,0.4)' : 'none',
                           textUnderlineOffset: '2px',
                         }}
                       >
@@ -4758,7 +4912,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   {/* Удалить запрос — только для Claude user-entries (не compact/continued).
                       Двухшаговый inline-confirm: первый клик переключает кнопку в красное
                       «Точно удалить?», второй — вызывает claude:delete-user-entry. */}
-                  {!isGemini && contextMenu.entry.type === 'user' && !contextMenu.entry.isCompactSummary && (
+                  {supportsClaudeTimelineActions && contextMenu.entry.type === 'user' && !contextMenu.entry.isCompactSummary && (
                     <>
                       <div className="border-t border-white/10 my-1" />
                       {!deleteEntryConfirmMode ? (
@@ -4788,8 +4942,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </>
                   )}
                   {/* Rewind — Claude & Gemini */}
-                  <div className="border-t border-white/10 my-1" />
-                  {!rewindPostPromptMode ? (
+                  {!isCodex && <div className="border-t border-white/10 my-1" />}
+                  {!isCodex && (!rewindPostPromptMode ? (
                     <div className="flex rounded overflow-hidden">
                       <button
                         className={`flex-1 text-left px-3 py-2 text-xs rounded-l transition-colors ${isActive && !rewindState ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
@@ -4868,7 +5022,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         </button>
                       </div>
                     </div>
-                  )}
+                  ))}
                 </>
               ) : (
                 <button
@@ -4891,7 +5045,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
         {/* ──── RANGE ACTION MENU PORTAL (Copy/Edit/Delete after range selection; inline delete-confirm + post-prompt textarea) ──── */}
         {/* Range Action Menu — appears after selecting range (double-click start + click end) */}
-        {isVisible && rangeActionMenu && (
+        {isVisible && rangeActionMenu && !isCodex && (
           <TooltipPortal>
             <div
               ref={rangeActionMenuRef}
@@ -4997,7 +5151,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     }
                     const upTotal = tokenEstimate?.total ?? upFallback;
                     const downTotal = tokenEstimate?.downTotal ?? downFallback;
-                    const haveBreakdown = !isGemini && tokenEstimate != null;
+                    const haveBreakdown = supportsClaudeTimelineActions && tokenEstimate != null;
                     return (upTotal > 0) ? (
                       <div
                         ref={tokenChipRef}
@@ -5024,7 +5178,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   >
                     Копировать ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
                   </button>
-                  {!isGemini && (
+                  {supportsClaudeTimelineActions && (
                     <div className="flex rounded overflow-hidden">
                       <button
                         className="flex-1 text-left px-3 py-2 text-xs text-pink-400 hover:bg-pink-600/20 transition-colors cursor-pointer"
@@ -5095,7 +5249,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       </Tooltip>
                     </div>
                   )}
-                  {!isGemini && (
+                  {supportsClaudeTimelineActions && (
                     <button
                       className="w-full text-left px-3 py-2 text-xs text-red-400 hover:bg-red-600/20 rounded transition-colors cursor-pointer flex items-center gap-2"
                       onClick={(e) => {

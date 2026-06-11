@@ -60,6 +60,10 @@ class ProjectManager {
     this.db.saveTabs(projectId, tabs, forceCleanup, preserveInterrupted);
   }
 
+  saveProjectTabGroups(projectId, groups) {
+    this.db.updateProjectTabGroups(projectId, groups);
+  }
+
   saveProjectMetadata(projectId, metadata) {
     this.db.updateProjectMetadata(projectId, metadata);
   }

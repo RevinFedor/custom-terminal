@@ -99,19 +99,20 @@ Raw SIGTERM/SIGKILL приходит kernel-side, **минуя Ink TUI event-loo
 Документировано прямо в коде: `[JsonlChainDiag:StopAI:SIGKILL] ... — JSONL flush GUARANTEED lost for in-flight write`.
 
 ### Решение: трёхступенчатый kill через все наши paths
-Каждый IPC handler, который убивает Claude CLI, теперь сначала шлёт `\x03` (Ctrl+C через PTY input → Ink ловит его как обычный keypress, дофлашивает state, выходит graceful), ждёт graceful exit через polling `process.kill(pid, 0)`, и только если жив — эскалирует.
+Каждый IPC handler, который убивает Claude CLI, теперь сначала шлёт `\x03` (Ctrl+C через PTY input → Ink ловит его как обычный keypress, дофлашивает state, выходит graceful), ждёт **реальный exit-сигнал** через polling `process.kill(pid, 0)` и только если процесс всё ещё жив к deadline — эскалирует. Числа `300ms` / `1200ms` ниже — это max deadline/fallback, не статический sleep и не источник истины.
 
 **`terminal:stop-ai-process`** (Stop button, PromptQueue Stop-after):
 1. `term.write('\x03')`
-2. Polling 300ms до exit
+2. Polling до exit, максимум 300ms
 3. Если жив — SIGTERM → 800ms grace → SIGKILL fallback
 4. Логи: `[StopAI] ... Ctrl+C → pid=N`, `[StopAI] ... exited gracefully via Ctrl+C`, `[StopAI] ... SIGTERM → pid=N (Ctrl+C ignored 300ms)`
 
 **`terminal:kill`** (закрытие вкладки ✕ / PromptQueue Close-after):
-1. lsof-like check через `bridgeKnownSessions.has(tabId)` — есть ли активный Claude
-2. Если есть → BFS ps lookup childPid → `\x03` → polling 1200ms до exit
-3. Только потом `term.kill()` (SIGHUP цепочкой)
-4. Логи: `[TerminalKill:GracefulCtrlC] tabId=... — \x03 → waiting for graceful exit`, либо `... exited cleanly in Xms`, либо `... did NOT exit in 1200ms, term.kill() will SIGHUP it`
+1. Проверка через `bridgeKnownSessions.has(tabId)` + `claudeTurnBusy===true` — есть ли активный Claude **и** реально ли идёт turn.
+2. Только если turn busy → BFS ps lookup childPid → `\x03` → polling до exit, максимум 1200ms.
+3. Если Claude уже стоит на idle prompt → **никакого Ctrl+C ожидания**; сразу fast-close через `term.kill()`.
+4. Логи busy-path: `[TerminalKill:GracefulCtrlC] tabId=... — \x03 → waiting for graceful exit`, либо `... exited cleanly in Xms`, либо `... did NOT exit in 1200ms, term.kill() will SIGHUP it`.
+5. Лог idle-path: `[TerminalKill:FastClose] ... — skip 1200ms Ctrl+C wait`.
 
 **`before-quit`** (app shutdown — ⌘Q, force-quit, `build:install` через `graceful-quit.sh`):
 1. **`event.preventDefault()` сразу на entry** — без него Electron не awaits async handler, продолжает teardown параллельно и убивает PTY раньше polling'а. Подтверждение из production.log: до фикса логи `[Shutdown:GracefulCtrlC] ... waiting for graceful exit` были, парных `exited cleanly` или `did NOT exit in 1200ms` — **ни одного**. Polling никогда не доходил до конца.
@@ -132,13 +133,17 @@ Raw SIGTERM/SIGKILL приходит kernel-side, **минуя Ink TUI event-loo
 | Stop button | SIGTERM → 800ms → SIGKILL | **Ctrl+C → 300ms** → SIGTERM → 800ms → SIGKILL |
 | Двойной Esc в TUI | Ctrl+C через PTY (нативно от юзера) | без изменений (наш код тут ни при чём) |
 | PromptQueue Stop-after | через `terminal:stop-ai-process` | автоматически покрыто Stop button fix |
-| Close tab (✕) | `term.kill()` сразу (SIGHUP) | **Ctrl+C → 1200ms** → `term.kill()` |
-| PromptQueue Close-after | через `terminal:kill` | автоматически покрыто Close tab fix |
+| Close tab (✕) | `term.kill()` сразу (SIGHUP) | **busy turn:** `Ctrl+C → 1200ms → term.kill()`; **idle prompt:** `term.kill()` сразу |
+| PromptQueue Close-after | через `terminal:kill` | наследует тот же busy-only wait |
 | `build:install` | `pkill` → `term.kill()` × N синхронно | **`graceful-quit.sh` → osascript quit → before-quit** (см. 3d) |
 | ⌘Q / force-quit | `before-quit` async, **не awaited** Electron'ом — Ctrl+C начинался, но прерывался teardown'ом | `event.preventDefault()` + concurrent fan-out + `app.quit()` re-trigger |
 
-### Почему 1200ms для close tab / shutdown, 300ms для Stop button
-Stop button — юзер активно ждёт ответа UI, дольше 300ms ждать визуально неприемлемо. Claude обычно дофлашивает за 50-200ms, 300ms запаса достаточно. Close tab и shutdown — юзер закрыл вкладку/окно, секундная пауза не больно. Claude в момент tool execution может писать большие assistant-blocks 500-1000ms, 1200ms покрывает.
+### Почему 1200ms только для busy close/shutdown, а не для каждого close tab
+Stop button — юзер активно ждёт ответа UI, дольше 300ms ждать визуально неприемлемо. Claude обычно дофлашивает за 50-200ms, 300ms запаса достаточно.
+
+Для close tab и shutdown секунда паузы допустима **только когда Claude реально пишет JSONL прямо сейчас**. На idle prompt один программный `Ctrl+C` не завершает Claude: он открывает danger-zone `Press Ctrl-C again to exit`. Старый close-path честно ждал 1200ms почти на каждом закрытии уже idle-Claude, но никакого flush-бенефита это не давало. Результат — "закрываю сессию, а приложение зависает на пару секунд" без реальной работы.
+
+Правило: graceful wait в close-path нужен не по самому факту `bridgeKnownSessions.has(tabId)`, а только по `claudeTurnBusy===true`. Иначе защитный flush-path сам превращается в UI lag.
 
 ## 3d. `build:install` через `graceful-quit.sh`, не голый `pkill`
 

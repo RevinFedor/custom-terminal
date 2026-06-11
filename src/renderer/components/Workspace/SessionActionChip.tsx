@@ -37,7 +37,7 @@ export default function SessionActionChip({
   mode = 'pty',
   onStart, onContinue, onStop,
 }: {
-  sessionType: 'claude' | 'gemini';
+  sessionType: 'claude' | 'gemini' | 'codex';
   isCommandRunning: boolean;
   hasAnySession: boolean;
   /** 'pty' = CLI в живой TUI (Start/Continue/Stop матрица).
@@ -48,9 +48,9 @@ export default function SessionActionChip({
   onStop: () => void;
 }) {
   const [hover, setHover] = React.useState(false);
-  const accent = sessionType === 'claude' ? '#DA7756' : '#4E86F8';
-  const accentBright = sessionType === 'claude' ? '#FF9466' : '#7BA3FF';
-  const defaultLabel = sessionType === 'claude' ? 'Claude' : 'Gemini';
+  const accent = sessionType === 'claude' ? '#DA7756' : sessionType === 'codex' ? '#10A37F' : '#4E86F8';
+  const accentBright = sessionType === 'claude' ? '#FF9466' : sessionType === 'codex' ? '#34d399' : '#7BA3FF';
+  const defaultLabel = sessionType === 'claude' ? 'Claude' : sessionType === 'codex' ? 'Codex' : 'Gemini';
 
   // PTY matrix: Continue появляется когда сессия есть, но процесс мёртв.
   // SDK matrix: Continue не существует — нечего возобновлять (нет процесса
@@ -79,13 +79,13 @@ export default function SessionActionChip({
       return;
     }
     // PTY-классика.
-    if (!hasAnySession) { onStart(); return; }
     if (isCommandRunning) onStop();
+    else if (!hasAnySession) onStart();
     else onContinue();
   };
 
-  const idleTint = sessionType === 'claude' ? 'rgba(218,119,86,0.12)' : 'rgba(78,134,248,0.12)';
-  const hoverTint = sessionType === 'claude' ? 'rgba(218,119,86,0.20)' : 'rgba(78,134,248,0.20)';
+  const idleTint = sessionType === 'claude' ? 'rgba(218,119,86,0.12)' : sessionType === 'codex' ? 'rgba(16,163,127,0.12)' : 'rgba(78,134,248,0.12)';
+  const hoverTint = sessionType === 'claude' ? 'rgba(218,119,86,0.20)' : sessionType === 'codex' ? 'rgba(16,163,127,0.20)' : 'rgba(78,134,248,0.20)';
   const bg = showStopOnHover
     ? 'rgba(239, 68, 68, 0.18)'
     : sessionIdle ? (hover ? hoverTint : idleTint)

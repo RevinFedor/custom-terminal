@@ -1,15 +1,20 @@
-# Feature: Claude Usage Chip
+# Feature: AI Usage Chips (Claude + Codex)
 
-Цветной chip в [`ProjectToolbar.tsx`](../../src/renderer/components/Workspace/ProjectToolbar.tsx) слева от `DictationHistoryButton`, реализация — [`ClaudeUsageButton.tsx`](../../src/renderer/components/Workspace/ClaudeUsageButton.tsx). Показывает **недельный % лимита** Anthropic Max-подписки и раскрывает popover с детальной разбивкой плюс per-tab cost'ом из JSONL на диске.
+Два цветных chip'а в [`ProjectToolbar.tsx`](../../src/renderer/components/Workspace/ProjectToolbar.tsx) слева от `DictationHistoryButton`, реализация — [`ClaudeUsageButton.tsx`](../../src/renderer/components/Workspace/ClaudeUsageButton.tsx). Claude-чип показывает **недельный % лимита** Anthropic Max-подписки и раскрывает popover с детальной разбивкой плюс per-tab cost'ом из JSONL на диске. Codex-чип показывает weekly/5-hour лимиты OpenAI Codex из rollout JSONL и отдельный popover без Claude-only token-cost секции.
 
-## Лицо чипа: gauge + % + reset countdown
+## Лицо чипов: иконка + % + reset countdown
 
-Чип несёт три элемента в одну строку (слева направо):
-1. **Вертикальный fill-gauge** — тонкая колонка (4×14px) заполняется снизу вверх по `weekly%` в том же severity-цвете что и текст. Читается как мини-батарейка: чип несёт ФОРМУ, не только цифру, виден боковым зрением без чтения числа.
-2. **`weekly%`** — в severity-цвете (пороги ниже).
-3. **Compact reset countdown** `1d 12h` / `12h 30m` / `45m` — `formatResetShort()`, всегда ≤2 единиц (header popover'а использует 3-юнитный `formatResetCountdown`). **Намеренно muted neutral** (`#6b7280`), НЕ severity-цвет: % уже владеет цветовым сигналом, второй цветной токен в крошечном чипе дрался бы с ним за внимание. Юзер спросил «каким цветом грамотно пометить» — ответ: никаким ярким, нейтральным.
+Чип несёт три элемента в одну строку: provider-иконка, `weekly%` в severity-цвете и compact reset countdown `1d 12h` / `12h 30m` / `45m` через `formatResetShort()`. Mini progress bar/gauge в компактном chip'е **не показывается** — процент уже является точным сигналом, а короткая полоска рядом с ним дублирует ту же семантику и добавляет визуальный шум. ProgressRow остаётся только внутри раскрытого popover'а, где есть место для подписи `Weekly` / `5-hour` и точной reset-даты.
+
+Codex-иконка в chip'е — inline SVG-глиф без белого tile-фона из скачанного ассета. Полный `codex-color.svg` включает белую app-плашку; в toolbar на тёмном фоне она читалась как рамка/broken image. В компактном usage-чипе нужен только внутренний градиентный знак, увеличенный относительно стандартной 12px иконки, чтобы занимать доступную площадь без фоновой коробки.
 
 Тикер countdown'а теперь **always-on** (60s), не только при открытом popover'е — чип показывает обратный отсчёт постоянно. 60s резолюция: грубейшая показанная единица — минуты.
+
+## Два provider-чипа, не общий переключатель
+
+Claude и Codex лимиты независимы по источнику, периоду reset'а и смыслу процента, поэтому показываются двумя sibling-чипами рядом, а не одним общим popover'ом с внутренним переключателем. Пользователь сравнивает бюджеты боковым зрением: `Claude 64% 5d 19h` рядом с `Codex 45% 6d 1h`. Если спрятать Codex внутрь Claude popover'а, второй бюджет станет discoverability-операцией, а не постоянным статусом.
+
+Каждый provider-чип сам открывает свой popover и сам refresh'ится. Общей остаётся только Activity-секция и shared визуальный язык: provider icon → weekly% → compact reset text. Подробности переносимого принципа — `methodology/переносимый-дизайн.md::Независимые provider quotas`.
 
 ## Зачем именно weekly%, а не 5h, на самом chip'е
 
@@ -37,6 +42,12 @@ Endpoint — `GET https://api.anthropic.com/api/oauth/usage` с заголовк
 ```
 
 `extra_usage` — overflow в pay-as-you-go USD-кредитах после исчерпания Max-плана. `used_credits` и `monthly_limit` в **центах**, не в долларах — делим на 100.
+
+## Источник данных Codex: rollout `token_count.rate_limits`
+
+Codex-чип не ходит в OpenAI usage endpoint. Backend `codex:get-usage` читает последние rollout JSONL в `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` и ищет самый свежий `event_msg` с `payload.type === "token_count"` и `payload.rate_limits`. `primary` маппится в `five_hour`, `secondary` — в `seven_day`; `resets_at` приходит epoch seconds и приводится к ISO для общего renderer-форматтера. Пока в сессии нет ни одного такого record'а, состояние «No Codex limit sample yet» корректно: лимит ещё не материализован в durable transcript.
+
+Не пересчитывать Codex лимит из `last_token_usage.total_tokens`. Это тот же anti-pattern что для Anthropic usage history: локальные токены не равны провайдерскому quota%, потому что provider применяет свою формулу и reset-бакеты. Конкретика Codex JSONL — [`fact-codex.md`](fact-codex.md).
 
 ## Источник данных per-tab tokens: JSONL агрегирование
 
@@ -134,9 +145,9 @@ Cold start с 429 даёт прочерк в чипе вместо реальн�
 
 **`lastAttemptAt` + flash при force-refresh.** Backend на каждом вызове `getUsage` (включая cooldown/cache-hit ветви) возвращает `lastAttemptAt` — timestamp последней попытки live fetch. Renderer показывает в банере ошибки `Last attempt 12s ago: HTTP 429…` и подсвечивает короткой `flash-fail` анимацией (450ms красноватый фон), когда `now - lastAttemptAt < 2000ms`. Это нужно, чтобы юзер видел: повторный клик refresh **реально** триггернул запрос, который вернулся той же ошибкой — без этого статичный текст «Last fetch failed» выглядел как «кнопка не работает». На force-refresh ещё держим spinner минимум 400ms, чтобы клик ощутимо мигнул даже на синхронном cache-hit. См. ClaudeUsageButton.tsx::refresh, ClaudeUsageButton.tsx::error-banner.
 
-## Header countdown в popover'е
+## Header reset в popover'е
 
-В шапке popover'а вместо статичного заголовка «Claude usage» отображается обратный отсчёт до недельного reset'а в формате `weekly resets in 6d 4h 12m`. Берётся `data.seven_day.resets_at`, тикер обновляет раз в 30 секунд **только** пока popover открыт. Юзер на чип смотрит «успею ли я допилить фичу до конца недели» — `Xd Yh Zm` отвечает на вопрос мгновенно, не требует mental math из ISO-timestamp'а в углу.
+В шапке popover'а вместо статичного заголовка «Claude usage» / «Codex usage» отображается точная локальная дата и время недельного reset'а: `weekly reset 17 июн., 09:34`. Относительное `in 5d 19h 59m` уже есть в компактном chip'е, поэтому в раскрытом popover'е оно дублировало бы то же число. Popover отвечает на другой вопрос: «когда именно обновится бакет», без mental math и без пересчёта countdown'а.
 
 ## Baseline дня = последний snapshot предыдущего дня
 
@@ -148,7 +159,7 @@ Local-date, не UTC: юзер думает о расходе «вчера vs с
 
 ## Связанные документы
 
-- [`fact-agent-activity.md`](fact-agent-activity.md) — «Activity» секция в этом же popover'е: сколько времени агенты реально работали (loader-on интервалы), агрегировано by day/project/tab. Хостится здесь, но capture-логика и таблица — отдельная подсистема.
+- [`fact-agent-activity.md`](fact-agent-activity.md) — «Activity» секция в этом же popover'е: сколько времени агенты реально работали (loader-on интервалы), агрегировано by day/project/tab. Хостится здесь для Claude и Codex popover'ов, но capture-логика и таблица — отдельная подсистема.
 - [`fact-status-bar.md`](fact-status-bar.md) — где живут другие toggle'ы. Лимитный chip намеренно вынесен оттуда: status bar = глобальные toggle'ы, не привязанные к табу; usage chip session-aware (читает `getEffectiveTabId`).
 - [`fact-claude-sdk-tab.md`](fact-claude-sdk-tab.md) — отдельный context-%-meter для SDK табов читает usage из live SSE stream'а, не из JSONL на диске. Это два разных потока: SDK-meter — мгновенный отклик на конкретное message_start, chip — устаканенное число для всех табов проекта.
 - [`methodology/сценарии-багов-design.md`](../methodology/сценарии-багов-design.md) секция 4 — click-outside ловушки.

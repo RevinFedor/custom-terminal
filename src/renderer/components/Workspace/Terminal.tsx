@@ -61,7 +61,7 @@ const handleLinkActivation = (event: MouseEvent, uri: string) => {
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { SearchAddon } from '@xterm/addon-search';
 import { useUIStore } from '../../store/useUIStore';
-import { useWorkspaceStore, type PendingAction } from '../../store/useWorkspaceStore';
+import { useWorkspaceStore, type AiLaunchSnapshot, type PendingAction } from '../../store/useWorkspaceStore';
 import { PromptQueueOverlay } from './PromptQueueOverlay';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { log } from '../../utils/logger';
@@ -184,6 +184,10 @@ const getClaudeSessionId = (tabId: string) => useWorkspaceStore.getState().getCl
 // Get Gemini session setter/getter outside of component
 const getSetGeminiSessionId = () => useWorkspaceStore.getState().setGeminiSessionId;
 const getGeminiSessionId = (tabId: string) => useWorkspaceStore.getState().getGeminiSessionId(tabId);
+
+// Get Codex session setter/getter outside of component
+const getSetCodexSessionId = () => useWorkspaceStore.getState().setCodexSessionId;
+const getCodexSessionId = (tabId: string) => useWorkspaceStore.getState().getCodexSessionId(tabId);
 
 // Claude Agent orchestration status setter
 const getSetClaudeAgentStatus = () => useWorkspaceStore.getState().setClaudeAgentStatus;
@@ -316,6 +320,41 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
       break;
     }
 
+    case 'codex-fork':
+      if (pendingAction.sessionId) {
+        getSetTabCommandType()(tabId, 'codex');
+        const cwd = getTabCwd(tabId);
+        console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex-f" }');
+        ipcRenderer.send('codex:run-command', {
+          tabId,
+          command: 'codex-f',
+          sessionId: pendingAction.sessionId,
+          cwd
+        });
+      }
+      break;
+
+    case 'codex-continue':
+      if (pendingAction.sessionId) {
+        getSetTabCommandType()(tabId, 'codex');
+        getSetCodexSessionId()(tabId, pendingAction.sessionId);
+        console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex-c" }');
+        ipcRenderer.send('codex:run-command', {
+          tabId,
+          command: 'codex-c',
+          sessionId: pendingAction.sessionId
+        });
+      }
+      break;
+
+    case 'codex-new': {
+      getSetTabCommandType()(tabId, 'codex');
+      const codexCwd = getTabCwd(tabId);
+      console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex" }');
+      ipcRenderer.send('codex:run-command', { tabId, command: 'codex', cwd: codexCwd });
+      break;
+    }
+
     case 'shell-command':
       console.log('[RESTORE] 12. shell-command — handled via initialCommand, nothing to do');
       break;
@@ -369,16 +408,111 @@ function getCurrentCommand(term: XTerminal): string {
 
 const { ipcRenderer } = window.require('electron');
 
+const terminalWarmQueue = new Map<string, () => void>();
+let terminalWarmScheduled: any = null;
+
+function scheduleTerminalWarmQueue() {
+  if (terminalWarmScheduled !== null) return;
+  const runNext = () => {
+    terminalWarmScheduled = null;
+    const next = terminalWarmQueue.entries().next();
+    if (next.done) return;
+    const [tabId, init] = next.value;
+    terminalWarmQueue.delete(tabId);
+    init();
+    if (terminalWarmQueue.size > 0) {
+      scheduleTerminalWarmQueue();
+    }
+  };
+  const win = window as any;
+  if (typeof win.requestIdleCallback === 'function') {
+    terminalWarmScheduled = win.requestIdleCallback(runNext, { timeout: 1000 });
+  } else {
+    terminalWarmScheduled = window.setTimeout(runNext, 80);
+  }
+}
+
+function scheduleTerminalWarmInit(tabId: string, init: () => void) {
+  terminalWarmQueue.set(tabId, init);
+  scheduleTerminalWarmQueue();
+}
+
+function cancelTerminalWarmInit(tabId: string) {
+  terminalWarmQueue.delete(tabId);
+}
+
+async function finalizeAiLaunchSnapshot(tabId: string) {
+  const store = useWorkspaceStore.getState();
+  const snapshot: AiLaunchSnapshot | null = store.getAiLaunchSnapshot(tabId);
+  if (!snapshot) return;
+
+  let tabInfo: { cwd?: string; sessionId?: string } | null = null;
+  for (const [, workspace] of store.openProjects) {
+    const tab = workspace.tabs.get(tabId);
+    if (!tab) continue;
+    tabInfo = {
+      cwd: tab.cwd,
+      sessionId: snapshot.sessionType === 'claude' ? tab.claudeSessionId : tab.codexSessionId,
+    };
+    break;
+  }
+
+  if (!tabInfo) {
+    store.clearAiLaunchSnapshot(tabId, 'tab-not-found-after-finish');
+    return;
+  }
+
+  if (!tabInfo.sessionId) {
+    console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=' + snapshot.sessionType + ' result=no-session-id → rollback');
+    store.rollbackUnmaterializedAiLaunch(tabId, 'no-session-id-after-finish');
+    return;
+  }
+
+  const channel = snapshot.sessionType === 'claude' ? 'claude:get-timeline' : 'codex:get-timeline';
+  try {
+    const result = await ipcRenderer.invoke(channel, { sessionId: tabInfo.sessionId, cwd: tabInfo.cwd });
+    const entries = Array.isArray(result?.entries) ? result.entries.length : -1;
+    console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=' + snapshot.sessionType + ' sid=' + tabInfo.sessionId.slice(0, 8) + ' success=' + !!result?.success + ' entries=' + entries + (result?.error ? ' error=' + result.error : ''));
+    if (result?.success && entries === 0) {
+      store.rollbackUnmaterializedAiLaunch(tabId, 'empty-timeline-after-finish');
+    } else {
+      store.clearAiLaunchSnapshot(tabId, 'timeline-entries=' + entries);
+    }
+  } catch (e: any) {
+    console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=' + snapshot.sessionType + ' check-failed=' + (e?.message || String(e)) + ' → keep');
+  }
+}
 
 interface TerminalProps {
   tabId: string;
   cwd: string;
-  active: boolean;
+  active?: boolean;
   isActiveProject?: boolean; // For lazy init optimization
+  ownerProjectId?: string;
   onLinkClick?: (url: string) => void; // Override link handler (used by BrowserTab)
 }
 
-function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: TerminalProps) {
+function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActiveProjectProp, ownerProjectId, onLinkClick }: TerminalProps) {
+  const activeFromStore = useWorkspaceStore((state) => {
+    if (!ownerProjectId) return false;
+    const workspace = state.openProjects.get(ownerProjectId);
+    if (!workspace || state.activeProjectId !== ownerProjectId) return false;
+
+    // MCP sub-agent viewport: show sub-agent instead of its parent Gemini tab.
+    if (workspace.viewingSubAgentTabId) {
+      const viewedTab = workspace.tabs.get(workspace.viewingSubAgentTabId);
+      if (viewedTab && viewedTab.parentTabId === workspace.activeTabId) {
+        return tabId === workspace.viewingSubAgentTabId;
+      }
+    }
+
+    return workspace.activeTabId === tabId;
+  });
+  const isActiveProjectFromStore = useWorkspaceStore((state) => {
+    return ownerProjectId ? state.activeProjectId === ownerProjectId : true;
+  });
+  const active = activeProp ?? activeFromStore;
+  const isActiveProject = isActiveProjectProp ?? isActiveProjectFromStore;
 
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<XTerminal | null>(null);
@@ -415,30 +549,34 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
   });
 
   // Prompt-queue overlay needs to know two things:
-  //  - is this a Claude tab? (so we only show overlay there)
-  //  - is Claude busy? (so the Run-queue UI can wait correctly).
+  //  - is this a supported AI tab? (Claude/Codex owners can receive queued prompts)
+  //  - is the agent busy? (so the Run-queue UI can pulse correctly).
   // Granular selectors per `fix-performance-lags.md` — never subscribe to whole openProjects Map.
-  const isClaudeTab = useWorkspaceStore((state) => {
+  const promptQueueAgent = useWorkspaceStore((state): 'claude' | 'codex' | null => {
     for (const [, workspace] of state.openProjects) {
       const tab = workspace.tabs.get(tabId);
-      if (tab) return tab.commandType === 'claude';
+      if (tab?.commandType === 'claude') return 'claude';
+      if (tab?.commandType === 'codex') return 'codex';
+    }
+    return null;
+  });
+  const agentBusy = useWorkspaceStore((state) => {
+    for (const [, workspace] of state.openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) return !!(tab.aiBusy || tab.claudeBusy);
     }
     return false;
   });
-  const claudeBusy = useWorkspaceStore((state) => {
-    for (const [, workspace] of state.openProjects) {
-      const tab = workspace.tabs.get(tabId);
-      if (tab) return !!tab.claudeBusy;
-    }
-    return false;
-  });
-  // Only show prompt-queue overlay when there's a real Claude session running in the tab.
+  // Only show prompt-queue overlay when there's a real AI session running in the tab.
   // sessionId alone isn't enough — it persists after Claude exits (we keep it for /resume).
   // Combine with live process status from OSC 133 command-started/finished events.
-  const hasClaudeSession = useWorkspaceStore((state) => {
+  const hasPromptQueueSession = useWorkspaceStore((state) => {
     for (const [, workspace] of state.openProjects) {
       const tab = workspace.tabs.get(tabId);
-      if (tab) return !!tab.claudeSessionId;
+      if (!tab) continue;
+      if (tab.commandType === 'codex') return !!tab.codexSessionId;
+      if (tab.commandType === 'claude') return !!tab.claudeSessionId;
+      return false;
     }
     return false;
   });
@@ -474,6 +612,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         // "claude process died, shell alive" signal. See
         // fact-claude-tui-control.md::Auto-inject /effort.
         _effortSentForTab.delete(tabId);
+        finalizeAiLaunchSnapshot(tabId);
       }
     };
     ipcRenderer.on('terminal:command-started', onStarted);
@@ -491,6 +630,9 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
 
   // Per-project currentView: find which project owns this tab and read its currentView
   const projectCurrentView = useWorkspaceStore((state) => {
+    if (ownerProjectId) {
+      return state.openProjects.get(ownerProjectId)?.currentView || 'terminal';
+    }
     for (const [, workspace] of state.openProjects) {
       if (workspace.tabs.has(tabId)) {
         return workspace.currentView || 'terminal';
@@ -524,20 +666,20 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     return () => window.removeEventListener('nt:window-refocus-active', onRefocus);
   }, [tabId, effectiveActive]);
 
-  // Diagnostic: log overlay-gate transitions for this Claude tab.
+  // Diagnostic: log overlay-gate transitions for this prompt-queue tab.
   // Fires ONLY on transitions (not every render) by tracking prev tuple in a ref.
-  // Order: effectiveActive, isClaudeTab, hasClaudeSession, claudeProcessAlive.
+  // Order: effectiveActive, agent, hasSession, processAlive.
   // When user reports "overlay disappeared" — grep for this tab's last [QueueGate:flip] line
   // to see which of the 4 flags flipped to false.
   const queueGatePrevRef = useRef<string>('');
   useEffect(() => {
-    if (!isClaudeTab) return; // only Claude tabs are eligible for overlay
-    const tuple = `act=${effectiveActive} cmd=${isClaudeTab} sess=${hasClaudeSession} alive=${claudeProcessAlive}`;
+    if (!promptQueueAgent) return;
+    const tuple = `act=${effectiveActive} agent=${promptQueueAgent} sess=${hasPromptQueueSession} alive=${claudeProcessAlive}`;
     if (queueGatePrevRef.current === tuple) return;
-    const all = effectiveActive && isClaudeTab && hasClaudeSession && claudeProcessAlive;
+    const all = effectiveActive && !!promptQueueAgent && hasPromptQueueSession && claudeProcessAlive;
     console.warn('[QueueGate:flip] tab=' + tabId.slice(-8) + ' ' + tuple + ' → overlay=' + (all ? 'SHOWN' : 'HIDDEN'));
     queueGatePrevRef.current = tuple;
-  }, [tabId, effectiveActive, isClaudeTab, hasClaudeSession, claudeProcessAlive]);
+  }, [tabId, effectiveActive, promptQueueAgent, hasPromptQueueSession, claudeProcessAlive]);
 
   // Check if terminal is scrolled up (not at bottom)
   // ALL callers go through rAF debounce — never call this synchronously during term.write()
@@ -963,6 +1105,22 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       getSetTabCommandType()(tabId, 'gemini');
     };
 
+    const handleCodexSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
+      if (data.tabId !== tabId) return;
+      console.log('[Terminal] Codex session detected:', data.sessionId);
+      getSetCodexSessionId()(tabId, data.sessionId);
+      getSetTabCommandType()(tabId, 'codex');
+      // Same reason as Claude bridge/session detection: Codex can be restored or
+      // launched through a path where the OSC command-started marker was missed.
+      // A fresh codex session id means this PTY is AI-owned and the queue overlay
+      // should be allowed to show immediately.
+      claudeProcessAliveRef.current = true;
+      setClaudeProcessAlive((prev) => {
+        if (!prev) console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' codex session-detected → alive=true (OSC B may have been missed)');
+        return true;
+      });
+    };
+
     // Claude Agent orchestration: status updates from main process
     const handleClaudeAgentStatus = (_: any, data: { tabId: string; status: string; sessionId?: string; error?: string }) => {
       if (data.tabId !== tabId) return;
@@ -987,6 +1145,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
     ipcRenderer.on('claude:tui-ready', handleTuiReady);
     ipcRenderer.on('claude:status-session-detected', handleStatusSessionDetected);
     ipcRenderer.on('gemini:session-detected', handleGeminiSessionDetected);
+    ipcRenderer.on('codex:session-detected', handleCodexSessionDetected);
     ipcRenderer.on('claude-agent:status', handleClaudeAgentStatus);
 
     // Resize observer with Guard Clause (prevents WebGL accordion effect)
@@ -1180,9 +1339,9 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         term.scrollToBottom();
         isReadyRef.current = true;
         setIsVisible(true); // Reveal after first fit to prevent jitter
-        if (active && !isExternalEditableFocused()) {
-          term.focus();
-        }
+      if (activeRef.current && !isExternalEditableFocused()) {
+        term.focus();
+      }
 
         // NOTE: Pending command execution moved to handleData
         // It now waits for first PTY output (= shell ready) instead of arbitrary timeout
@@ -1291,6 +1450,8 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         // Note: fullLine includes shell prompt, so don't use ^ anchor
         const devServerMatch = fullLine.match(/\b(npm|npx|yarn|pnpm|bun)\s+(run\s+)?(dev|start|serve|watch)\b/i);
         const geminiMatch = fullLine.match(/\bgemini(\s|$)/i);
+        const codexMatch = fullLine.match(/\bcodex(\s|$)/i);
+        const detectedCommandType = codexMatch ? 'codex' : geminiMatch ? 'gemini' : devServerMatch ? 'devServer' : null;
 
         // Suppress devServer/gemini auto-detection while a Claude process is
         // alive in this tab. When Claude holds the foreground, getCurrentCommand()
@@ -1299,17 +1460,19 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
         // commandType claude→devServer, killing the Run-after overlay + tab color.
         // claudeProcessAliveRef is the synchronous liveness signal. See fix #2.
         const claudeAliveNow = claudeProcessAliveRef.current;
-        if (devServerMatch || geminiMatch) {
+        if (detectedCommandType) {
           const claudeSess = getClaudeSessionId(tabId);
           const preview = fullLine.length > 80 ? fullLine.slice(0, 80) + '…' : fullLine;
-          console.warn('[CmdDetect:initTerminal] tab=' + tabId.slice(-8) + ' match=' + (devServerMatch ? 'devServer' : 'gemini') + ' bufType=' + term.buffer.active.type + ' claudeAlive=' + claudeAliveNow + ' claudeSess=' + (claudeSess ? claudeSess.slice(0, 8) : 'null') + ' fullLine="' + preview.replace(/"/g, '\\"') + '"');
+          console.warn('[CmdDetect:initTerminal] tab=' + tabId.slice(-8) + ' match=' + detectedCommandType + ' bufType=' + term.buffer.active.type + ' claudeAlive=' + claudeAliveNow + ' claudeSess=' + (claudeSess ? claudeSess.slice(0, 8) : 'null') + ' fullLine="' + preview.replace(/"/g, '\\"') + '"');
         }
 
         if (!claudeAliveNow) {
-          if (devServerMatch) {
-            getSetTabCommandType()(tabId, 'devServer');
-          } else if (geminiMatch) {
+          if (detectedCommandType === 'codex') {
+            getSetTabCommandType()(tabId, 'codex');
+          } else if (detectedCommandType === 'gemini') {
             getSetTabCommandType()(tabId, 'gemini');
+          } else if (detectedCommandType === 'devServer') {
+            getSetTabCommandType()(tabId, 'devServer');
           }
         }
 
@@ -1394,7 +1557,12 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
                                   getSetTabCommandType()(tabId, 'claude'); // Set commandType for Timeline visibility
                                   getSetClaudeSessionId()(tabId, result.newSessionId, 'fork');
                                   markPendingResume(tabId, result.newSessionId);
-                                  ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + result.newSessionId + '\r');
+                                  let cmdLine = 'claude --dangerously-skip-permissions --resume ' + result.newSessionId;
+                                  if (typeof result.sessionCwd === 'string' && result.sessionCwd.trim()) {
+                                    const safe = result.sessionCwd.replace(/'/g, "'\\''");
+                                    cmdLine = "cd '" + safe + "' && " + cmdLine;
+                                  }
+                                  ipcRenderer.send('terminal:input', tabId, cmdLine + '\r');
                                 } else {
                                   console.error('[Claude Intercept] Fork failed:', result.error);
                                   ipcRenderer.send('terminal:input', tabId, 'echo "❌ Fork failed: ' + result.error + '"\r');
@@ -1452,6 +1620,80 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           markPendingResume(tabId, sessionId);
           // Let the command pass through, but set commandType for Timeline
           // Don't preventDefault - let it run normally
+        }
+
+        // ========== CODEX INPUT INTERCEPTION ==========
+
+        // --- CASE: codex (new session) ---
+        if (fullLine.endsWith(' codex') || fullLine === 'codex') {
+          getSetTabCommandType()(tabId, 'codex');
+          event.preventDefault();
+
+          const existingCodexId = getCodexSessionId(tabId);
+          const existingClaudeId = getClaudeSessionId(tabId);
+          const existingGeminiId = getGeminiSessionId(tabId);
+          if (existingCodexId) {
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Codex сессия: ' + existingCodexId + '. Используйте codex-c"\r');
+            return false;
+          }
+          if (existingClaudeId || existingGeminiId) {
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ В этой вкладке уже есть AI сессия. Откройте новую вкладку для Codex."\r');
+            return false;
+          }
+
+          ipcRenderer.send('terminal:input', tabId, '\x15');
+          ipcRenderer.send('codex:run-command', { tabId, command: 'codex', cwd });
+          return false;
+        }
+
+        const codexResumeMatch = fullLine.match(/\bcodex\s+(?:.*\s)?resume\s+([a-z0-9-]{8,})\s*$/i);
+        if (codexResumeMatch) {
+          const resumeId = codexResumeMatch[1];
+          getSetTabCommandType()(tabId, 'codex');
+          event.preventDefault();
+          const existingId = getCodexSessionId(tabId);
+          if (existingId && existingId !== resumeId) {
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Codex сессия: ' + existingId + '"\r');
+            return false;
+          }
+          ipcRenderer.send('terminal:input', tabId, '\x15');
+          getSetCodexSessionId()(tabId, resumeId);
+          ipcRenderer.send('codex:run-command', { tabId, command: 'codex-c', sessionId: resumeId, cwd });
+          return false;
+        }
+
+        if (fullLine.endsWith(' codex-c') || fullLine === 'codex-c') {
+          getSetTabCommandType()(tabId, 'codex');
+          event.preventDefault();
+          const existingSessionId = getCodexSessionId(tabId);
+          if (existingSessionId) {
+            ipcRenderer.send('terminal:input', tabId, '\x15');
+            ipcRenderer.send('codex:run-command', { tabId, command: 'codex-c', sessionId: existingSessionId, cwd });
+          } else {
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ No Codex session saved for this tab"\r');
+          }
+          return false;
+        }
+
+        const codexForkMatch = fullLine.match(/\bcodex-f\s+([a-z0-9-]{8,})\s*$/i);
+        if (codexForkMatch) {
+          getSetTabCommandType()(tabId, 'codex');
+          event.preventDefault();
+          const sourceSessionId = codexForkMatch[1];
+          const existingId = getCodexSessionId(tabId);
+          if (existingId) {
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Codex сессия: ' + existingId + '. Откройте новый таб для codex-f"\r');
+            return false;
+          }
+          ipcRenderer.send('terminal:input', tabId, '\x15');
+          ipcRenderer.send('codex:run-command', { tabId, command: 'codex-f', sessionId: sourceSessionId, cwd });
+          return false;
+        }
+
+        if (fullLine.endsWith(' codex-f') || fullLine === 'codex-f') {
+          event.preventDefault();
+          ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Укажите ID: codex-f <session-id>"\r');
+          return false;
         }
 
         // ========== GEMINI INPUT INTERCEPTION ==========
@@ -1540,8 +1782,9 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       });
     };
 
-    // Lazy init: only create xterm when tab is active AND project is active
-    // This prevents creating xterm for background projects during restore
+    // Initialize the visible terminal immediately. Warm inactive terminals from
+    // the active project one-by-one in idle time, so switching back from Home or
+    // another tab does not pay the full xterm cold-start cost on click.
     if (active && isActiveProject) {
       // Lock: prevent double initialization
       if (isCreatingRef.current) {
@@ -1549,9 +1792,17 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       }
       isCreatingRef.current = true; // Set lock
       initTerminal();
+    } else if (isActiveProject) {
+      scheduleTerminalWarmInit(tabId, () => {
+        if (!isMounted.current || !terminalRef.current || xtermInstance.current || isCreatingRef.current) return;
+        console.warn(`[Terminal:WARM_INIT] tabId=${tabId} — idle warm init`);
+        isCreatingRef.current = true;
+        initTerminal();
+      });
     }
 
     return () => {
+      cancelTerminalWarmInit(tabId);
       isMounted.current = false;
       resizeObserver.disconnect();
       ipcRenderer.removeListener('terminal:data', handleData);
@@ -1561,9 +1812,11 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
       ipcRenderer.removeListener('claude:tui-ready', handleTuiReady);
       ipcRenderer.removeListener('claude:status-session-detected', handleStatusSessionDetected);
       ipcRenderer.removeListener('gemini:session-detected', handleGeminiSessionDetected);
+      ipcRenderer.removeListener('codex:session-detected', handleCodexSessionDetected);
       ipcRenderer.removeListener('claude-agent:status', handleClaudeAgentStatus);
-      // Close Gemini watcher if active for this tab
+      // Close AI file watchers if active for this tab
       ipcRenderer.send('gemini:close-watcher', { tabId });
+      ipcRenderer.send('codex:close-watcher', { tabId });
 
       // Serialize terminal buffer before unmount (for restoration after remount)
       const term = xtermInstance.current;
@@ -1811,24 +2064,29 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           // Note: fullLine includes shell prompt, so don't use ^ anchor
           const devServerMatch = fullLine.match(/\b(npm|npx|yarn|pnpm|bun)\s+(run\s+)?(dev|start|serve|watch)\b/i);
           const geminiMatch = fullLine.match(/\bgemini(\s|$)/i);
+          const codexMatch = fullLine.match(/\bcodex(\s|$)/i);
+          const detectedCommandType = codexMatch ? 'codex' : geminiMatch ? 'gemini' : devServerMatch ? 'devServer' : null;
 
           // Same guard as initTerminal block: don't let Claude's rendered
           // output (`⏺ Bash(npm run dev …)`) downgrade commandType while a
           // Claude process is alive. See fix #2 / fact-tabs.md.
           const claudeAliveNow = claudeProcessAliveRef.current;
-          if (devServerMatch || geminiMatch) {
+          if (detectedCommandType) {
             const claudeSess = getClaudeSessionId(tabId);
             const preview = fullLine.length > 80 ? fullLine.slice(0, 80) + '…' : fullLine;
-            console.warn('[CmdDetect:reattach] tab=' + tabId.slice(-8) + ' match=' + (devServerMatch ? 'devServer' : 'gemini') + ' bufType=' + term.buffer.active.type + ' claudeAlive=' + claudeAliveNow + ' claudeSess=' + (claudeSess ? claudeSess.slice(0, 8) : 'null') + ' fullLine="' + preview.replace(/"/g, '\\"') + '"');
+            console.warn('[CmdDetect:reattach] tab=' + tabId.slice(-8) + ' match=' + detectedCommandType + ' bufType=' + term.buffer.active.type + ' claudeAlive=' + claudeAliveNow + ' claudeSess=' + (claudeSess ? claudeSess.slice(0, 8) : 'null') + ' fullLine="' + preview.replace(/"/g, '\\"') + '"');
           }
 
           if (!claudeAliveNow) {
-            if (devServerMatch) {
-              log.commands('Detected devServer command, setting commandType');
-              getSetTabCommandType()(tabId, 'devServer');
-            } else if (geminiMatch) {
+            if (detectedCommandType === 'codex') {
+              log.commands('Detected codex command, setting commandType');
+              getSetTabCommandType()(tabId, 'codex');
+            } else if (detectedCommandType === 'gemini') {
               log.commands('Detected gemini command, setting commandType');
               getSetTabCommandType()(tabId, 'gemini');
+            } else if (detectedCommandType === 'devServer') {
+              log.commands('Detected devServer command, setting commandType');
+              getSetTabCommandType()(tabId, 'devServer');
             }
           }
 
@@ -1875,6 +2133,80 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
               const cwd2 = getTabCwd(tabId);
               ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd: cwd2, bareResume: true });
             }
+            return false;
+          }
+
+          // --- Codex interception (mirrors initTerminal logic) ---
+          if (fullLine.endsWith(' codex') || fullLine === 'codex') {
+            getSetTabCommandType()(tabId, 'codex');
+            event.preventDefault();
+            const existingCodexId = getCodexSessionId(tabId);
+            const existingClaudeId = getClaudeSessionId(tabId);
+            const existingGeminiId = getGeminiSessionId(tabId);
+            if (existingCodexId) {
+              ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Codex сессия: ' + existingCodexId + '. Используйте codex-c"\r');
+              return false;
+            }
+            if (existingClaudeId || existingGeminiId) {
+              ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ В этой вкладке уже есть AI сессия. Откройте новую вкладку для Codex."\r');
+              return false;
+            }
+            ipcRenderer.send('terminal:input', tabId, '\x15');
+            const cwd2 = getTabCwd(tabId);
+            ipcRenderer.send('codex:run-command', { tabId, command: 'codex', cwd: cwd2 });
+            return false;
+          }
+
+          const codexResumeMatch2 = fullLine.match(/\bcodex\s+(?:.*\s)?resume\s+([a-z0-9-]{8,})\s*$/i);
+          if (codexResumeMatch2) {
+            const resumeId = codexResumeMatch2[1];
+            getSetTabCommandType()(tabId, 'codex');
+            event.preventDefault();
+            const existingId = getCodexSessionId(tabId);
+            if (existingId && existingId !== resumeId) {
+              ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Codex сессия: ' + existingId + '"\r');
+              return false;
+            }
+            ipcRenderer.send('terminal:input', tabId, '\x15');
+            getSetCodexSessionId()(tabId, resumeId);
+            const cwd2 = getTabCwd(tabId);
+            ipcRenderer.send('codex:run-command', { tabId, command: 'codex-c', sessionId: resumeId, cwd: cwd2 });
+            return false;
+          }
+
+          if (fullLine.endsWith(' codex-c') || fullLine === 'codex-c') {
+            getSetTabCommandType()(tabId, 'codex');
+            event.preventDefault();
+            const existingSessionId = getCodexSessionId(tabId);
+            if (existingSessionId) {
+              ipcRenderer.send('terminal:input', tabId, '\x15');
+              const cwd2 = getTabCwd(tabId);
+              ipcRenderer.send('codex:run-command', { tabId, command: 'codex-c', sessionId: existingSessionId, cwd: cwd2 });
+            } else {
+              ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ No Codex session saved for this tab"\r');
+            }
+            return false;
+          }
+
+          const codexForkMatch2 = fullLine.match(/\bcodex-f\s+([a-z0-9-]{8,})\s*$/i);
+          if (codexForkMatch2) {
+            getSetTabCommandType()(tabId, 'codex');
+            event.preventDefault();
+            const sourceSessionId = codexForkMatch2[1];
+            const existingId = getCodexSessionId(tabId);
+            if (existingId) {
+              ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Codex сессия: ' + existingId + '. Откройте новый таб для codex-f"\r');
+              return false;
+            }
+            ipcRenderer.send('terminal:input', tabId, '\x15');
+            const cwd2 = getTabCwd(tabId);
+            ipcRenderer.send('codex:run-command', { tabId, command: 'codex-f', sessionId: sourceSessionId, cwd: cwd2 });
+            return false;
+          }
+
+          if (fullLine.endsWith(' codex-f') || fullLine === 'codex-f') {
+            event.preventDefault();
+            ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Укажите ID: codex-f <session-id>"\r');
             return false;
           }
 
@@ -1945,7 +2277,12 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
                 getSetTabCommandType()(tabId, 'claude'); // Set commandType for Timeline visibility
                 getSetClaudeSessionId()(tabId, result.newSessionId, 'fork');
                 markPendingResume(tabId, result.newSessionId);
-                ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + result.newSessionId + '\r');
+                let cmdLine = 'claude --dangerously-skip-permissions --resume ' + result.newSessionId;
+                if (typeof result.sessionCwd === 'string' && result.sessionCwd.trim()) {
+                  const safe = result.sessionCwd.replace(/'/g, "'\\''");
+                  cmdLine = "cd '" + safe + "' && " + cmdLine;
+                }
+                ipcRenderer.send('terminal:input', tabId, cmdLine + '\r');
               } else {
                 console.error('[Claude Intercept] Fork failed:', result.error);
                 ipcRenderer.send('terminal:input', tabId, 'echo "❌ Fork failed: ' + result.error + '"\r');
@@ -2003,7 +2340,7 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           setIsVisible(true);
           // Don't steal focus from an open tab-rename input (Cmd+T / new tab
           // auto-opens it in this same tick). See isExternalEditableFocused.
-          if (!isExternalEditableFocused()) {
+          if (activeRef.current && !isExternalEditableFocused()) {
             term.focus();
           }
 
@@ -2194,11 +2531,12 @@ function Terminal({ tabId, cwd, active, isActiveProject = true, onLinkClick }: T
           onContextMenu={handleContextMenu}
         />
 
-        {/* Prompt Queue overlay — only for Claude tabs with a live process.
-            hasClaudeSession (sessionId set) AND claudeProcessAlive (OSC 133 says Claude is
-            actually running). When Claude exits, process-finished fires → overlay disappears. */}
-        {effectiveActive && isClaudeTab && hasClaudeSession && claudeProcessAlive && (
-          <PromptQueueOverlay tabId={tabId} claudeBusy={claudeBusy} />
+        {/* Prompt Queue overlay — only for Claude/Codex tabs with a live process.
+            has sessionId AND processAlive (OSC 133 or provider session-detected says the
+            AI process is actually running). When it exits, process-finished fires
+            → overlay disappears. */}
+        {effectiveActive && promptQueueAgent && hasPromptQueueSession && claudeProcessAlive && (
+          <PromptQueueOverlay tabId={tabId} sessionType={promptQueueAgent} agentBusy={agentBusy} />
         )}
 
       </div>

@@ -199,35 +199,27 @@
 }
 
 /* Vertical tab sidebar — два РАЗНЫХ сигнала:
-   1) Process bar (узкая полоса 2px слева): мерцает пока PTY жив (npm run dev, claude CLI и т.п.).
-   2) AI shimmer (по всей ширине вкладки): диагональная волна свет→тень бежит слева направо,
-      пока AI-сессия думает/стримит. Подходит для SDK-табов где PTY нет.
+   1) Process bar (узкая полоса 2px слева/справа): статично горит пока PTY/SDK процесс жив.
+   2) AI shimmer внутри process bar: блик бежит сверху вниз пока AI-сессия думает/стримит.
    Оба — background-color change (не opacity) ради читаемости в видео-записях
    (H.264/JPEG съедают мелкие opacity-дельты). */
 /* Process bar — конфигурируется через Settings → Системные.
-   CSS-переменные --process-bar-color-a/b/duration выставляются из App.tsx
-   на корне (документ.documentElement) при изменении useUIStore.processBar.
-   Если юзер выключил pulse (enabled=false) — рендер подменяет класс на
-   .tab-process-bar-static, который просто красит фон без анимации. */
-@keyframes tab-process-bar-pulse {
-  0%   { background-color: var(--process-bar-color-a, #155E75); }
-  50%  { background-color: var(--process-bar-color-b, #0E7490); }
-  100% { background-color: var(--process-bar-color-a, #155E75); }
-}
+   CSS-переменные выставляются из App.tsx на documentElement:
+   --process-bar-color-a = базовая полоса, --process-bar-shimmer-rgb = цвет
+   блика, --process-bar-shimmer-spacing = расстояние между бликами,
+   --process-bar-shimmer-alpha = плотность центра блика. */
 .tab-process-bar-busy {
-  animation: tab-process-bar-pulse var(--process-bar-duration, 2.4s) ease-in-out infinite;
+  background-color: var(--process-bar-color-a, #155E75);
 }
 .tab-process-bar-static {
   background-color: var(--process-bar-color-a, #155E75);
 }
 
-/* AI-busy блик внутри полоски процесса — белёсая полупрозрачная просвечка
+/* AI-busy блик внутри полоски процесса — настраиваемая полупрозрачная просвечка
    ползёт сверху вниз поверх цветного фона полоски. Это сигнал «AI думает/
    стримит» (claude/gemini/sdk busy-state) перенесённый с фона таба на саму
-   полоску. Рендерится КАК ОВЕРЛЕЙ внутри полоски, а не вместо неё — pulse
-   цветом (PTY-alive) и блик (AI-busy) могут идти одновременно. Цвет блика
-   не настраивается — стандартная light-overlay метафора как у material
-   linear-progress, любой цвет полоски остаётся читаемым под ней.
+   полоску. Рендерится КАК ОВЕРЛЕЙ внутри полоски, а не вместо неё — базовая
+   process-alive полоса и AI-busy блик могут идти одновременно.
    Подход — `background-position-y` на full-bar overlay с **wrapping gradient**:
    pattern (1 tile = 100% bar height) содержит ОДИН пик яркости в центре, но
    яркая зона расширена до 60% pattern'а (10%-90% stops). Это значит на стыках
@@ -251,8 +243,8 @@
   position: absolute;
   inset: 0;
   pointer-events: none;
-  /* Seamless tile pattern. `background-size: 100% 50%` = одна полоска вмещает
-     ровно ДВА tile'а; `background-repeat: repeat-y` повторяет паттерн без
+  /* Seamless tile pattern. `--process-bar-shimmer-spacing` = высота tile'а;
+     `background-repeat: repeat-y` повторяет паттерн без
      ограничений (за пределами видимой зоны тоже tiles рендерятся, anim сдвигает
      через них). Pattern: пик яркости в центре tile, alpha=.12 на 0% и 100%
      этого tile — НЕ ноль, чтобы на стыках двух tile'ов яркость не падала в
@@ -262,11 +254,11 @@
      `0 100%` визуально идентична `0 0` благодаря repeat-y → loop seamless. */
   background-image: linear-gradient(
     to bottom,
-    rgba(255, 255, 255, 0.12)   0%,
-    rgba(255, 255, 255, 0.55)  50%,
-    rgba(255, 255, 255, 0.12) 100%
+    rgba(var(--process-bar-shimmer-rgb, 255, 255, 255), var(--process-bar-shimmer-edge-alpha, 0.12))   0%,
+    rgba(var(--process-bar-shimmer-rgb, 255, 255, 255), var(--process-bar-shimmer-alpha, 0.55))  50%,
+    rgba(var(--process-bar-shimmer-rgb, 255, 255, 255), var(--process-bar-shimmer-edge-alpha, 0.12)) 100%
   );
-  background-size: 100% 50%;
+  background-size: 100% var(--process-bar-shimmer-spacing, 50%);
   background-repeat: repeat-y;
   animation: tab-process-bar-ai-shimmer 1.2s linear infinite;
   will-change: background-position;

@@ -4,9 +4,9 @@ import { usePromptQueueStore } from '../../store/usePromptQueueStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 // Run-after picker SEEDS its busy map from this always-on snapshot on mount,
-// then keeps it live via the same claude:busy-state / gemini:busy-state IPC
+// then keeps it live via the same claude/gemini/codex busy-state IPC
 // TabBar uses (see RunAfterTabPicker). Seeding is required because the overlay
-// mounts with the active Claude tab and would otherwise miss the busy:true edge
+// mounts with the active AI tab and would otherwise miss the busy:true edge
 // that already fired on a background target tab.
 import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -18,10 +18,13 @@ const { ipcRenderer } = window.require('electron');
 const GRAB_ERROR_TOASTS: Record<string, string> = {
   no_terminal: 'No terminal for this tab',
   no_claude_session: 'No Claude session running in this tab',
+  no_codex_session: 'No Codex session running in this tab',
+  no_codex_pid: 'No Codex process found in this tab',
   claude_busy: 'Claude is busy — wait for the response to finish',
+  codex_ctrl_g_noop: 'Codex did not open the prompt editor — wait for the response to finish',
   already_in_progress: 'Grab already in progress',
-  wrong_editor: 'Restart Claude in this tab — grab needs our editor helper, current $EDITOR is wrong',
-  stale_pid: 'Claude was restarted outside our control — close & reopen this tab',
+  wrong_editor: 'Restart the agent in this tab — grab needs our editor helper, current $EDITOR is wrong',
+  stale_pid: 'The agent was restarted outside our control — close & reopen this tab',
   editor_not_wired: 'Helper never reported back — check ~/.claude/hooks/noted-code-grab.js',
   tab_cleared: 'Tab was closed before grab finished',
   timeout: 'Grab timed out',
@@ -79,13 +82,22 @@ function chipParts(text: string): { head: string; tail: string } {
   return { head: trimmedHead || '(empty)', tail: restLen > 0 ? `+${restLen}` : '' };
 }
 
-type Props = {
-  tabId: string;
-  // Existing per-tab Claude busy state from claude:busy-state. We hold the loader's truth.
-  claudeBusy: boolean;
+type QueueAgent = 'claude' | 'codex';
+
+const AGENT_LABEL: Record<QueueAgent, string> = {
+  claude: 'Claude',
+  codex: 'Codex',
 };
 
-export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
+type Props = {
+  tabId: string;
+  sessionType: QueueAgent;
+  // Existing per-tab AI busy state from provider busy-state. We hold the loader's truth.
+  agentBusy: boolean;
+};
+
+export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
+  const agentLabel = AGENT_LABEL[sessionType];
   const chipLineClamp = useUIStore((s) => s.promptQueueChipLineClamp);
   const queue = usePromptQueueStore((s) => s.queues.get(tabId));
   const items = queue?.items ?? [];
@@ -230,9 +242,9 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
   }, [firstChipArmedHint, tabId, consumeFirstChipHint]);
 
   // Auto-runner moved to hooks/usePromptQueueRunner.ts — mounted at App root.
-  // The runner subscribes to claude:busy-state IPC + queue store globally so
+  // The runner subscribes to provider busy-state IPC + queue store globally so
   // queued prompts auto-fire even when the user is on a different tab/project.
-  // claudeBusy prop here is still used for the Run pill's pulsing indicator.
+  // agentBusy prop here is still used for the Run pill's pulsing indicator.
 
   // ─── handlers ────────────────────────────────────────────────────────────
   // Editor open/close UX rule: every trigger that opens the editor is also a
@@ -356,9 +368,9 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
     requestAnimationFrame(() => terminalRegistry.get(tabId)?.focus());
   }, [tabId]);
 
-  // Replay handler — paste chip's text into Claude's current input WITHOUT
+  // Replay handler — paste chip's text into the agent's current input WITHOUT
   // touching stash and WITHOUT submitting. On success the chip is removed
-  // from the queue (the prompt has "moved" into Claude's input). On failure
+  // from the queue (the prompt has "moved" into the agent's input). On failure
   // chip stays so user can retry.
   const replayChip = useCallback(async (id: string, text: string) => {
     // Guard against double-click while the previous IPC roundtrip is still
@@ -371,14 +383,14 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
       return next;
     });
     try {
-      const res = await ipcRenderer.invoke('claude:append-input', tabId, text);
+      const res = await ipcRenderer.invoke(sessionType + ':append-input', tabId, text);
       if (!res || !res.success) {
         const err = res?.error || 'unknown';
         showToast('Replay failed: ' + err, 'error');
         console.warn('[PromptQueue] replay failed:', err);
         return;
       }
-      // Paste succeeded — chip has effectively moved into Claude input, drop
+      // Paste succeeded — chip has effectively moved into agent input, drop
       // it from the queue so it cannot be double-fired by Run after later.
       removePrompt(tabId, id);
       // Focus terminal so the user sees the appended text immediately + can
@@ -397,22 +409,22 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
         return next;
       });
     }
-  }, [tabId, showToast, focusActiveTerminal, removePrompt]);
+  }, [tabId, sessionType, showToast, focusActiveTerminal, removePrompt]);
 
   const grabCurrent = useCallback(async () => {
     try {
-      const res = await ipcRenderer.invoke('claude:grab-input', tabId);
+      const res = await ipcRenderer.invoke(sessionType + ':grab-input', tabId);
       if (res && res.success && typeof res.text === 'string') {
         const t = res.text.trim();
         if (!t) {
-          showToast('Claude input is empty', 'warning');
+          showToast(agentLabel + ' input is empty', 'warning');
           focusActiveTerminal();
           return;
         }
         addPrompt(tabId, t, res.images || 0, Array.isArray(res.imagePaths) ? res.imagePaths : undefined);
         // No success toast on queue-add — the new chip appearing in the overlay
         // is its own confirmation; the toast was redundant noise (user request).
-        // Refocus so Claude re-reads the (now empty) tempfile immediately — without
+        // Refocus so the agent re-reads the (now empty) tempfile immediately — without
         // this the input visually keeps the old text until user clicks the terminal.
         focusActiveTerminal();
       } else {
@@ -426,7 +438,7 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
       showToast(`Grab failed: ${m}`, 'error');
       console.error('[PromptQueue] grab-input error', e);
     }
-  }, [tabId, addPrompt, showToast, focusActiveTerminal]);
+  }, [tabId, sessionType, agentLabel, addPrompt, showToast, focusActiveTerminal]);
 
   // Copy moved to InfoPanel — see Copy prompt button next to Copy Session.
 
@@ -473,7 +485,7 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
   // ─── render ──────────────────────────────────────────────────────────────
   return (
     <>
-      {/* Main overlay — top-right, absolute over the Claude terminal area */}
+      {/* Main overlay — top-right, absolute over the AI terminal area */}
       <div
         ref={panelRef}
         style={{
@@ -525,7 +537,7 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
               armed → shows live remaining seconds, read-only.
             "Run after" toggles autoRun. Arming with delay > 0 starts the countdown.
             Disarming mid-countdown freezes the remaining seconds back into the input.
-            "Stop after" — SIGTERM claude after the next turn ends (independent). */}
+            "Stop after" — stop the agent after the next turn ends (independent). */}
         {/* Two-column header layout — both columns ~120px to match the user's
             spec ("колонки одинаковой ширины, узкие — как раньше Stop after").
             Old `grid 90px 1fr` made the right column 2-3x wider than the
@@ -606,14 +618,14 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
               style={{
                 width: 6, height: 6, borderRadius: '50%',
                 background: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED : '#555'),
-                animation: autoRun && claudeBusy ? 'pq-pulse 1.4s ease-in-out infinite' : 'none',
+                animation: autoRun && agentBusy ? 'pq-pulse 1.4s ease-in-out infinite' : 'none',
               }}
             />
             Run after
           </button>
 
           {/* Stop/Close split-button — TWO independent toggles under one frame:
-                Left zone  → stopAfter   (kill Claude after next turn ends).
+                Left zone  → stopAfter   (kill the agent after next turn ends).
                 Right zone → closeAfter  (also remove the tab from TabBar).
               closeAfter implies stopAfter (you can't close a tab without killing
               its process), so toggling closeAfter ON auto-arms stopAfter in the
@@ -678,7 +690,7 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
               <div style={{ display: 'flex', width: '100%' }}>
                 <button
                   onClick={() => setStopAfter(tabId, !stopAfter)}
-                  title="Stop Claude after the next turn ends (if queue is empty)"
+                  title={'Stop ' + agentLabel + ' after the next turn ends (if queue is empty)'}
                   onMouseEnter={(e) => {
                     // Hover policy (per user spec): when zone is INACTIVE,
                     // hover tints ONLY the label colour — no border or bg
@@ -714,7 +726,7 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
                 </button>
                 <button
                   onClick={() => setCloseAfter(tabId, !closeAfter)}
-                  title="Also close this tab after Claude stops"
+                  title={'Also close this tab after ' + agentLabel + ' stops'}
                   style={{
                     padding: '2px 6px',
                     background: rightBg,
@@ -892,7 +904,7 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
                   WebkitUserSelect: 'none',
                 }}
               >
-                {/* Replay (▶) — paste chip text into Claude input, no submit.
+                {/* Replay (▶) — paste chip text into agent input, no submit.
                     Sits where the ⋮⋮ drag-handle used to. Drag still works
                     from any point on the chip body — HTML5 draggable=true
                     captures the gesture regardless of click target as long
@@ -901,7 +913,7 @@ export function PromptQueueOverlay({ tabId, claudeBusy }: Props) {
                   data-chip-action="replay"
                   disabled={replayingIds.has(it.id)}
                   onClick={(e) => { e.stopPropagation(); replayChip(it.id, it.text); }}
-                  title={replayingIds.has(it.id) ? 'Replay in progress…' : 'Replay: paste into Claude input (no submit)'}
+                  title={replayingIds.has(it.id) ? 'Replay in progress…' : 'Replay: paste into ' + agentLabel + ' input (no submit)'}
                   style={{
                     background: replayingIds.has(it.id) ? `${TINT}26` : 'transparent',
                     border: 'none',
@@ -1227,11 +1239,12 @@ type RunAfterTabPickerProps = {
 // line 425 + fact-tabs.md "SDK claude — distinct hue from PTY claude").
 // User explicitly called out that PTY and SDK rows must be visually
 // distinguishable in the dropdown.
-type AiTabKind = 'claude-pty' | 'claude-sdk' | 'gemini';
+type AiTabKind = 'claude-pty' | 'claude-sdk' | 'gemini' | 'codex';
 const AI_KIND_COLOR: Record<AiTabKind, string> = {
   'claude-pty': '#DA7756', // saffron orange — PTY claude
   'claude-sdk': '#D28C5A', // terracotta — SDK claude
   'gemini':     '#4E86F8', // blue — Gemini
+  'codex':      '#10A37F', // green — Codex
 };
 
 // Trigger spans the entire left column (width:100% of parent grid cell).
@@ -1253,7 +1266,7 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
   // вернуть примитив. Возврат свежего `{projectId, activeTabId, tabs}` каждый
   // раз приводит к infinite loop через Object.is (Zustand сравнение).
   // Сейчас селектор фильтрует только AI-вкладки (Claude PTY с активной
-  // сессией, Gemini с активной сессией, любой SDK-таб) и собирает компактный
+  // сессией, Codex с активной сессией, Gemini с активной сессией, любой SDK-таб) и собирает компактный
   // fingerprint-string из id+name. Re-render только когда AI-инвентарь
   // проекта реально поменялся.
   //
@@ -1263,6 +1276,7 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
   //   PTY claude: commandType === 'claude' && claudeSessionId   (= CLI был
   //               запущен хотя бы раз — sessionId осталась даже после exit;
   //               это достаточный сигнал, что таб «AI-предназначения»).
+  //   PTY codex:  commandType === 'codex' && codexSessionId
   //   PTY gemini: commandType === 'gemini' && geminiSessionId
   //   SDK:        tabType === 'claude-sdk'                       (по
   //               определению AI-таб, sessionId может быть пуст до первой
@@ -1279,8 +1293,9 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
       if (t.parentTabId) continue;
       const isSDK = t.tabType === 'claude-sdk';
       const isClaudePTY = !isSDK && t.commandType === 'claude' && !!t.claudeSessionId;
+      const isCodex = !isSDK && t.commandType === 'codex' && !!t.codexSessionId;
       const isGemini = !isSDK && t.commandType === 'gemini' && !!t.geminiSessionId;
-      if (!isSDK && !isClaudePTY && !isGemini) continue;
+      if (!isSDK && !isClaudePTY && !isCodex && !isGemini) continue;
       parts.push(t.id + ':' + (t.name || ''));
     }
     return parts.join('|');
@@ -1303,10 +1318,12 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
       if (t.parentTabId) continue;
       const isSDK = t.tabType === 'claude-sdk';
       const isClaudePTY = !isSDK && t.commandType === 'claude' && !!t.claudeSessionId;
+      const isCodex = !isSDK && t.commandType === 'codex' && !!t.codexSessionId;
       const isGemini = !isSDK && t.commandType === 'gemini' && !!t.geminiSessionId;
       let kind: AiTabKind | null = null;
       if (isSDK) kind = 'claude-sdk';
       else if (isClaudePTY) kind = 'claude-pty';
+      else if (isCodex) kind = 'codex';
       else if (isGemini) kind = 'gemini';
       if (!kind) continue;
       out.push({ id: t.id, name: t.name || t.id.slice(-6), kind });
@@ -1315,7 +1332,7 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fingerprint, tabId]);
 
-  // Live per-tab busy map — mirrors TabBar's claudeBusyMap/geminiBusyMap. The
+  // Live per-tab busy map — mirrors TabBar's provider busy maps. The
   // status icon (spinner vs nothing) must update reactively for BACKGROUND
   // tabs (the waited-on tab is by definition never the focused one), so we
   // subscribe to the SAME focus-independent IPC broadcasts TabBar consumes
@@ -1340,11 +1357,14 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
       });
     const handleClaudeBusy = (_: any, { tabId: tid, busy }: { tabId: string; busy: boolean }) => apply(tid, busy);
     const handleGeminiBusy = (_: any, { tabId: tid, busy }: { tabId: string; busy: boolean }) => apply(tid, busy);
+    const handleCodexBusy = (_: any, { tabId: tid, busy }: { tabId: string; busy: boolean }) => apply(tid, busy);
     ipcRenderer.on('claude:busy-state', handleClaudeBusy);
     ipcRenderer.on('gemini:busy-state', handleGeminiBusy);
+    ipcRenderer.on('codex:busy-state', handleCodexBusy);
     return () => {
       ipcRenderer.removeListener('claude:busy-state', handleClaudeBusy);
       ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
+      ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
     };
   }, []);
 
@@ -1526,7 +1546,7 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
               {aiTabs.length === 0 && (
                 <div style={{ padding: '12px 8px', fontSize: 9, color: TEXT_DIM, textAlign: 'center', lineHeight: 1.4 }}>
                   no AI tabs in this project<br/>
-                  <span style={{ color: '#555' }}>(start Claude / Gemini in another tab to make it appear here)</span>
+                  <span style={{ color: '#555' }}>(start Claude / Codex / Gemini in another tab to make it appear here)</span>
                 </div>
               )}
               {aiTabs.map((t) => {

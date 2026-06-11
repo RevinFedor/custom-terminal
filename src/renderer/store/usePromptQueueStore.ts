@@ -302,26 +302,32 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         if (!cur) return state;
         const items = cur.items.filter((p) => p.id !== id);
         const next = new Map(state.queues);
-        // Manual drain (×-remove OR Replay ▶) emptied the queue. Stop after /
-        // Close after were waiting on this queue to finish — now that there's
-        // nothing left to wait for, they MUST disarm. Otherwise the user sees
-        // an active "Stop after" pill with zero context — and on the next
-        // turn-end the runner would SIGTERM Claude unexpectedly.
+        // Manual drain (×-remove OR Replay ▶) emptied the queue. Run after /
+        // Stop after / Close after were waiting on this queue to finish — now
+        // that there's nothing left to wait for, they MUST disarm. Otherwise
+        // the user sees an active "Run after" or "Stop after" pill with zero
+        // context — and on the next turn-end the runner would either send a
+        // future prompt unexpectedly or SIGTERM the agent unexpectedly.
         //
         // Carefully NOT applied in popNext: there the LAST chip just left the
-        // queue to be SENT to Claude — stopAfter SHOULD still be armed so the
-        // runner stops Claude after that prompt's turn finishes. popNext is
+        // queue to be SENT to the agent — stopAfter SHOULD still be armed so the
+        // runner stops the agent after that prompt's turn finishes. popNext is
         // the autoRun-drain path; this hook only covers manual user removals.
         const queueEmptied = cur.items.length > 0 && items.length === 0;
+        const autoRun = queueEmptied ? false : cur.autoRun;
         const stopAfter = queueEmptied ? false : cur.stopAfter;
         const closeAfter = queueEmptied ? false : cur.closeAfter;
         const stopBeforeCloseArm = queueEmptied ? false : cur.stopBeforeCloseArm;
+        const firstDelayCountdownAt = queueEmptied ? null : cur.firstDelayCountdownAt;
         next.set(tabId, {
           ...cur,
           items,
+          autoRun,
           stopAfter,
           closeAfter,
           stopBeforeCloseArm,
+          firstDelayCountdownAt,
+          firstChipHintActive: queueEmptied ? false : cur.firstChipHintActive,
           previewId: cur.previewId === id ? null : cur.previewId,
         });
         return { queues: next };

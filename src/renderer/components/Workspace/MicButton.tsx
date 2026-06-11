@@ -27,12 +27,16 @@ import { DictationHistoryPopover } from './DictationHistoryButton';
 
 const { ipcRenderer } = window.require('electron');
 
+export const DICTATION_STATE_EVENT = 'dictation:state';
+export const DICTATION_STOP_AND_DELIVER_EVENT = 'dictation:stop-and-deliver';
+export const DICTATION_DELIVERED_EVENT = 'dictation:delivered';
+
 interface Props {
   tabId: string;
-  sessionType: 'claude' | 'gemini';
+  sessionType: 'claude' | 'gemini' | 'codex';
 }
 
-type MicMode = 'sdk' | 'pty-claude' | 'terminal';
+type MicMode = 'sdk' | 'pty-claude' | 'pty-codex' | 'terminal';
 
 function useTargetMode(tabId: string): MicMode {
   const tabType = useWorkspaceStore((s) => {
@@ -51,6 +55,7 @@ function useTargetMode(tabId: string): MicMode {
   });
   if (tabType === 'claude-sdk') return 'sdk';
   if (commandType === 'claude') return 'pty-claude';
+  if (commandType === 'codex') return 'pty-codex';
   return 'terminal';
 }
 
@@ -70,13 +75,75 @@ export default function MicButton({ tabId }: Props) {
   // `history` chip is gone). Plain click toggles recording as before.
   const [historyOpen, setHistoryOpen] = useState(false);
   const sessionRef = useRef<DictationSession | null>(null);
+  const finalizedSessionRef = useRef<DictationSession | null>(null);
+  const pendingSubmitRequestsRef = useRef<string[]>([]);
+  const statusRef = useRef({ recording: false, stopping: false });
   const btnRef = useRef<HTMLButtonElement>(null);
+
+  const publishState = (next: { recording: boolean; stopping: boolean }) => {
+    statusRef.current = next;
+    window.dispatchEvent(new CustomEvent(DICTATION_STATE_EVENT, {
+      detail: { tabId, ...next, mode },
+    }));
+  };
+
+  useEffect(() => {
+    publishState({ recording, stopping });
+  }, [tabId, mode, recording, stopping]);
+
+  useEffect(() => {
+    return () => {
+      window.dispatchEvent(new CustomEvent(DICTATION_STATE_EVENT, {
+        detail: { tabId, recording: false, stopping: false, mode },
+      }));
+    };
+  }, [tabId, mode]);
+
+  const flushSubmitRequests = (payload: { success: boolean; delivered: boolean; hadText: boolean; error?: string }) => {
+    const requestIds = pendingSubmitRequestsRef.current.splice(0);
+    requestIds.forEach((requestId) => {
+      window.dispatchEvent(new CustomEvent(DICTATION_DELIVERED_EVENT, {
+        detail: { tabId, requestId, ...payload },
+      }));
+    });
+  };
+
+  const finalizeStop = async (session: DictationSession, source: string) => {
+    if (finalizedSessionRef.current === session) return;
+    finalizedSessionRef.current = session;
+    if (sessionRef.current === session) sessionRef.current = null;
+
+    ipcRenderer.send('log:renderer', '[MicButton] onStopped source=' + source);
+    const captured = (session.getText() || '').trim();
+    let success = true;
+    let delivered = false;
+    let error: string | undefined;
+    if (captured) {
+      appendDictationEntry(captured);
+      try {
+        const result = await deliverFinal(captured, mode, tabId);
+        success = result.success;
+        delivered = result.delivered;
+        error = result.error;
+      } catch (e: any) {
+        success = false;
+        error = e?.message || String(e);
+      }
+    }
+    if (!success && error) showToast('Dictation deliver: ' + error, 'error');
+    publishState({ recording: false, stopping: false });
+    setRecording(false);
+    setStopping(false);
+    flushSubmitRequests({ success, delivered, hadText: !!captured, error });
+  };
 
   const start = async () => {
     if (recording || stopping) return;
     ipcRenderer.send('log:renderer', '[MicButton] start mode=' + mode);
     setFinal('');
     setPartial('');
+    finalizedSessionRef.current = null;
+    publishState({ recording: true, stopping: false });
     // Flip UI to recording IMMEDIATELY so floating window appears in the same
     // frame as the click. Don't wait for getUserMedia.
     setRecording(true);
@@ -99,17 +166,7 @@ export default function MicButton({ tabId }: Props) {
         if (msg === 'socket error' && (stopping || !recording)) return;
         showToast('Dictation: ' + msg, 'error');
       },
-      onStopped: () => {
-        ipcRenderer.send('log:renderer', '[MicButton] onStopped');
-        const captured = (session.getText() || '').trim();
-        if (captured) {
-          appendDictationEntry(captured);
-          deliverFinal(captured, mode, tabId);
-        }
-        sessionRef.current = null;
-        setRecording(false);
-        setStopping(false);
-      },
+      onStopped: () => { void finalizeStop(session, 'onStopped'); },
       languageHints: ['en', 'ru'],
     });
     sessionRef.current = session;
@@ -121,23 +178,42 @@ export default function MicButton({ tabId }: Props) {
     const s = sessionRef.current;
     if (!s) {
       sessionRef.current = null;
+      publishState({ recording: false, stopping: false });
       setRecording(false);
       setStopping(false);
+      flushSubmitRequests({ success: true, delivered: false, hadText: false });
       return;
     }
     ipcRenderer.send('log:renderer', '[MicButton] stop');
+    publishState({ recording: true, stopping: true });
     setStopping(true);
     await s.stop();
     // Force reset if onStopped never fires.
     setTimeout(() => {
       if (sessionRef.current === s) {
         ipcRenderer.send('log:renderer', '[MicButton] onStopped never fired → force reset');
-        sessionRef.current = null;
-        setRecording(false);
-        setStopping(false);
+        void finalizeStop(s, 'fallback');
       }
     }, 4000);
   };
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { tabId: targetTabId, requestId } = (e as CustomEvent).detail || {};
+      if (targetTabId !== tabId || typeof requestId !== 'string') return;
+      if (!pendingSubmitRequestsRef.current.includes(requestId)) {
+        pendingSubmitRequestsRef.current.push(requestId);
+      }
+      const status = statusRef.current;
+      if (status.recording && !status.stopping) {
+        void stop();
+      } else if (!status.recording && !status.stopping) {
+        flushSubmitRequests({ success: true, delivered: false, hadText: false });
+      }
+    };
+    window.addEventListener(DICTATION_STOP_AND_DELIVER_EVENT, handler);
+    return () => window.removeEventListener(DICTATION_STOP_AND_DELIVER_EVENT, handler);
+  }, [tabId, recording, stopping]);
 
   const onClick = (e: React.MouseEvent) => {
     // Cmd/Ctrl+click → open dictation history instead of recording. (Meta on
@@ -240,19 +316,25 @@ export default function MicButton({ tabId }: Props) {
 }
 
 // Where the captured text lands when the user clicks Stop.
-function deliverFinal(text: string, mode: MicMode, tabId: string) {
-  if (mode === 'pty-claude') {
+async function deliverFinal(text: string, mode: MicMode, tabId: string): Promise<{ success: boolean; delivered: boolean; error?: string }> {
+  if (mode === 'pty-claude' || mode === 'pty-codex') {
     // safePasteAndSubmit with submit:false types into the TUI input without
     // pressing Enter. User can then edit / hit Enter themselves.
-    ipcRenderer.invoke('terminal:paste', { tabId, content: text, submit: false }).catch(() => {});
+    const result = await ipcRenderer.invoke('terminal:paste', { tabId, content: text, submit: false });
+    if (!result?.success) {
+      return { success: false, delivered: false, error: result?.error || 'terminal:paste failed' };
+    }
+    return { success: true, delivered: true };
   } else if (mode === 'sdk') {
     // ClaudeSDKTab listens for this event and writes via native setter to
     // bypass assistant-ui's controlled-input ping-pong.
     window.dispatchEvent(new CustomEvent('claude-sdk:dictation-deliver', {
       detail: { tabId, text },
     }));
+    return { success: true, delivered: true };
   }
   // terminal mode → history only; user copies from the dropdown.
+  return { success: true, delivered: false };
 }
 
 function MicIcon({ recording }: { recording: boolean }) {

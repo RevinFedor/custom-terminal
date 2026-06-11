@@ -59,14 +59,18 @@ function InterceptorBadge({ claudeTabId, interceptorState, busy }: {
   );
 }
 
-// Overlay for interrupted Claude sessions
-const InterruptedSessionOverlay = memo(({ tabId, sessionId, onContinue, onDismiss }: {
+type InterruptedEngine = 'claude' | 'codex';
+
+// Overlay for interrupted AI sessions
+const InterruptedSessionOverlay = memo(({ tabId, sessionId, engine, onContinue, onDismiss }: {
   tabId: string;
   sessionId: string;
+  engine: InterruptedEngine;
   onContinue: () => void;
   onDismiss: () => void;
 }) => {
   const [isLoading, setIsLoading] = useState(false);
+  const engineLabel = engine === 'codex' ? 'Codex' : 'Claude';
 
   // Handle backdrop click
   const handleBackdropClick = (e: React.MouseEvent) => {
@@ -142,7 +146,7 @@ const InterruptedSessionOverlay = memo(({ tabId, sessionId, onContinue, onDismis
 
         {/* Description */}
         <p className="text-[#888] text-sm text-center mb-4">
-          Приложение было закрыто во время активной Claude сессии
+          Приложение было закрыто во время активной {engineLabel} сессии
         </p>
 
         {/* Session ID */}
@@ -230,51 +234,71 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     return !!viewedTab && viewedTab.parentTabId === ws.activeTabId;
   });
 
-  console.warn(`[TerminalArea:RENDER #${renderCountRef.current}] projectId=${projectId} currentView=${currentView}`);
+  if ((window as any).__NOTED_RENDER_DIAG__ === true) {
+    console.warn(`[TerminalArea:RENDER #${renderCountRef.current}] projectId=${projectId} currentView=${currentView}`);
+  }
 
   // Get active tab info for interrupted session overlay (targeted selectors)
-  const activeTabWasInterrupted = useWorkspaceStore((s) => {
+  const activeTabInterruptedKey = useWorkspaceStore((s) => {
     const ws = s.openProjects.get(projectId);
-    if (!ws?.activeTabId) return false;
+    if (!ws?.activeTabId) return '';
     const tab = ws.tabs.get(ws.activeTabId);
     // SDK tabs handle resume via claude-sdk:send-message, not PTY overlay
-    if (tab?.tabType === 'claude-sdk') return false;
-    return !!tab?.wasInterrupted && !!tab?.claudeSessionId && !tab?.claudeActive;
+    if (!tab || tab.tabType === 'claude-sdk' || !tab.wasInterrupted || tab.overlayDismissed) return '';
+    if (tab.commandType === 'codex' && tab.codexSessionId) return `codex:${tab.codexSessionId}`;
+    if (tab.claudeSessionId && !tab.claudeActive) return `claude:${tab.claudeSessionId}`;
+    if (tab.codexSessionId) return `codex:${tab.codexSessionId}`;
+    return '';
   });
-  const activeTabSessionId = useWorkspaceStore((s) => {
-    const ws = s.openProjects.get(projectId);
-    if (!ws?.activeTabId) return null;
-    return ws.tabs.get(ws.activeTabId)?.claudeSessionId ?? null;
-  });
+  const [activeTabInterruptedEngine, activeTabSessionId] = useMemo(() => {
+    if (!activeTabInterruptedKey) return [null, null] as [InterruptedEngine | null, string | null];
+    const idx = activeTabInterruptedKey.indexOf(':');
+    if (idx < 0) return [null, null] as [InterruptedEngine | null, string | null];
+    return [
+      activeTabInterruptedKey.slice(0, idx) as InterruptedEngine,
+      activeTabInterruptedKey.slice(idx + 1),
+    ];
+  }, [activeTabInterruptedKey]);
   const activeTabIdForOverlay = activeTabId;
   const isRestoring = useWorkspaceStore((s) => s.isRestoring);
-  const showInterruptedOverlay = activeTabWasInterrupted && activeTabSessionId && currentView === 'terminal' && !isRestoring;
+  const showInterruptedOverlay = !!activeTabInterruptedEngine && !!activeTabSessionId && currentView === 'terminal' && !isRestoring;
 
   
-  // Handle continuing interrupted Claude session (use fresh state from getState)
-  const handleContinueSession = (sessionId?: string) => {
+  // Handle continuing interrupted AI session (use fresh state from getState)
+  const handleContinueSession = (sessionId?: string, engine?: InterruptedEngine | null) => {
     const tabId = activeTabId;
     const targetSessionId = sessionId || activeTabSessionId;
-    console.log('[TerminalArea] handleContinueSession called, activeTab:', tabId, 'sessionId:', targetSessionId);
+    const targetEngine = engine || activeTabInterruptedEngine;
+    console.log('[TerminalArea] handleContinueSession called, activeTab:', tabId, 'engine:', targetEngine, 'sessionId:', targetSessionId);
 
-    if (tabId && targetSessionId) {
+    if (tabId && targetSessionId && targetEngine) {
       console.log('[TerminalArea] Clearing interrupted state and sending command');
       clearInterruptedState(tabId);
 
       const setTabCommandType = useWorkspaceStore.getState().setTabCommandType;
-      setTabCommandType(tabId, 'claude');
+      setTabCommandType(tabId, targetEngine);
 
       terminalRegistry.get(tabId)?.scrollToBottom();
-      // Arm the 15s stale-bridge guard BEFORE the resume write (см.
-      // fix-bridge-stale-takeover.md layer 4/5) — иначе протухший bridge.json
-      // перезапишет sessionId таба в окне resume.
-      markPendingResume(tabId, targetSessionId);
-      const cmd = `claude --dangerously-skip-permissions --resume ${targetSessionId}\r`;
-      console.log('[TerminalArea] Sending terminal:input:', cmd);
-      ipcRenderer.send('terminal:input', tabId, cmd);
-      ipcRenderer.send('terminal:force-command-started', tabId);
+      terminalRegistry.get(tabId)?.focus();
+      requestAnimationFrame(() => terminalRegistry.get(tabId)?.focus());
+
+      if (targetEngine === 'codex') {
+        const ws = useWorkspaceStore.getState().openProjects.get(projectId);
+        const cwd = ws?.tabs.get(tabId)?.cwd;
+        console.log('[TerminalArea] Sending codex:run-command codex-c:', targetSessionId);
+        ipcRenderer.send('codex:run-command', { tabId, command: 'codex-c', sessionId: targetSessionId, cwd });
+      } else {
+        // Arm the 15s stale-bridge guard BEFORE the resume write (см.
+        // fix-bridge-stale-takeover.md layer 4/5) — иначе протухший bridge.json
+        // перезапишет sessionId таба в окне resume.
+        markPendingResume(tabId, targetSessionId);
+        const cmd = `claude --dangerously-skip-permissions --resume ${targetSessionId}\r`;
+        console.log('[TerminalArea] Sending terminal:input:', cmd);
+        ipcRenderer.send('terminal:input', tabId, cmd);
+        ipcRenderer.send('terminal:force-command-started', tabId);
+      }
     } else {
-      console.log('[TerminalArea] handleContinueSession: Missing activeTab or sessionId!');
+      console.log('[TerminalArea] handleContinueSession: Missing activeTab, engine or sessionId!');
     }
   };
 
@@ -288,13 +312,16 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     }
   };
 
-  // Stable string selector — re-renders only when tab structure OR any active tab changes.
-  // active/isActiveProject are passed down as props so all terminals receive the new
-  // visibility state in the SAME render frame (atomic), preventing z-index races.
+  // Stable string selector — re-renders only when tab structure changes.
+  // Active-tab state is local to Terminal/BrowserTab/ClaudeSDKTab; including
+  // activeTabId here recreates all persistent terminal layers on every tab click.
   const terminalFingerprint = useWorkspaceStore((s) => {
     const parts: string[] = [];
     s.openProjects.forEach((workspace, projId) => {
-      parts.push(`${projId}:${workspace.activeTabId}`);
+      const subAgentPart = projId === projectId && workspace.viewingSubAgentTabId
+        ? `:sub=${workspace.viewingSubAgentTabId}:host=${workspace.activeTabId || ''}`
+        : '';
+      parts.push(`${projId}${subAgentPart}`);
       workspace.tabs.forEach((tab) => {
         parts.push(`${tab.id}:${tab.tabType || 'terminal'}`);
       });
@@ -310,22 +337,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     let totalCount = 0;
 
     currentOpenProjects.forEach((workspace, projId) => {
-      const isActiveProject = projId === projectId;
-
       workspace.tabs.forEach((tab) => {
-        let isActive = isActiveProject && workspace.activeTabId === tab.id;
-        // MCP sub-agent viewport: show sub-agent instead of its parent Gemini tab.
-        if (isActiveProject && viewingSubAgentTabId) {
-          const viewedTab = workspace.tabs.get(viewingSubAgentTabId);
-          if (viewedTab && viewedTab.parentTabId === workspace.activeTabId) {
-            if (tab.id === viewingSubAgentTabId) {
-              isActive = true;
-            } else if (tab.id === workspace.activeTabId) {
-              isActive = false;
-            }
-          }
-        }
-
         if (tab.tabType === 'claude-sdk') {
           sdkCount++;
           totalCount++;
@@ -334,8 +346,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
               key={tab.id}
               tabId={tab.id}
               cwd={tab.cwd}
-              active={isActive}
-              isActiveProject={isActiveProject}
+              ownerProjectId={projId}
             />
           );
         } else if (tab.tabType === 'browser') {
@@ -344,8 +355,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
               key={tab.id}
               tabId={tab.id}
               url={tab.url || 'http://localhost:3000'}
-              active={isActive}
-              isActiveProject={isActiveProject}
+              ownerProjectId={projId}
               terminalId={tab.terminalId || tab.id}
               terminalName={tab.terminalName}
               activeView={tab.activeView || 'browser'}
@@ -359,8 +369,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
               key={tab.id}
               tabId={tab.id}
               cwd={tab.cwd}
-              active={isActive}
-              isActiveProject={isActiveProject}
+              ownerProjectId={projId}
             />
           );
         }
@@ -370,7 +379,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     const durMs = Date.now() - t0;
     console.warn(`[TerminalArea:useMemo] RECALCULATING projectId=${projectId.slice(-12)} total=${totalCount} sdk=${sdkCount} durMs=${durMs}`);
     return result;
-  }, [terminalFingerprint, projectId, viewingSubAgentTabId]);
+  }, [terminalFingerprint, projectId]);
 
   // Listen for Claude fork completion to create new tab with command
   useEffect(() => {
@@ -455,7 +464,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
           <InterruptedSessionOverlay
             tabId={activeTabId}
             sessionId={activeTabSessionId}
-            onContinue={() => handleContinueSession(activeTabSessionId)}
+            engine={activeTabInterruptedEngine || 'claude'}
+            onContinue={() => handleContinueSession(activeTabSessionId, activeTabInterruptedEngine)}
             onDismiss={handleDismissOverlay}
           />
         )}

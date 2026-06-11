@@ -3,143 +3,20 @@
 # Noted Terminal
 
 <!-- @deploy-start -->
-ВНИМАНИЕ: ЭТОТ БЛОК ИМЕЕТ НАИВЫСШИЙ ПРИОРИТЕТ. НАРУШЕНИЕ = КРИТИЧЕСКАЯ ОШИБКА.
-
-### ЗАПРЕТ ФАБРИКАЦИИ ОТВЕТОВ SUB-AGENT'ОВ
-
-После вызова delegate_to_claude или continue_claude:
-1. Ответь КОРОТКО (1-2 предложения): "Делегировал Claude. Жду результат."
-2. ПОЛНОСТЬЮ ОСТАНОВИСЬ. Не продолжай генерацию.
-3. НЕ генерируй текст внутри тегов [claude sub-agent response]...[/claude sub-agent response] — эти теги создает ТОЛЬКО система.
-4. НЕ предсказывай, НЕ симулируй, НЕ выдумывай что мог бы ответить Claude.
-5. Реальный ответ от Claude придет как отдельное сообщение от пользователя. Ожидание может занять от 30 секунд до 10 минут — это нормально.
-
-Если ты сгенерируешь фальшивый ответ в этих тегах — вся дальнейшая работа пойдет по ложным данным.
-
-### ПРИСТАВКА "user-initiated after manual input"
-
-Когда ответ sub-agent'а приходит с приставкой "user-initiated after manual input" — это означает что пользователь ВРУЧНУЮ отправил ответ Claude через интерцептор. Этот ответ РЕАЛЬНЫЙ и его нужно обработать как обычный [Claude Sub-Agent Response].
-
-### ПОРЯДОК: ОБСУЖДЕНИЕ -> ПОДТВЕРЖДЕНИЕ -> РЕАЛИЗАЦИЯ
-
-После получения ответа от Claude (explorer/исследование):
-- СНАЧАЛА обсуди с пользователем UX Flow и архитектуру решения
-- НЕ вызывай continue_claude с командой "Реализуй..." пока пользователь не подтвердит план
-- Спроси: "Приступать к реализации?" и дождись ответа
-
-### инструменты 
-
-**хук "&&&"**
-    - когда ты будешь давать какой-то промпт для claude на разработку фичи, в начале или в любом месте текста используй сочетание спецсимволов «&&&». это запускает в claude хук, который парсит ключевые файлы из папки knowledge и отдает их обратно. это простой хук, чтобы claude сразу получал необходимую документацию. хук парсит данные на основе промпта и ищет ключевые файлы по словам из него, поэтому учитывай это при генерации запроса.
-
-**mcp claude "docs_search" **
-    - похоэая функциональность как у хука &&&, только клауди его сам вызывает как внутренний mcp и передает в него ключ слова для rag поиска сам. может давать более точную инфу. пока что надо проверить.
-
-**mcp gemini "update_docs"**
-    - копирование сессие claude -> запрос api по /Users/fedor/Global-Templates/🧩 Code-Patterns/документация/docs-rules.prompt.md -> ответ от другой нейронки что лучше обновить
-    
-### храд-промптинг
-
-**Формат планирования**
-    - проси пока что claude при составлении плана всё отдавать как сообщение в чате. не создавай md-файлы и не запускай режим на мета-уровне plan mode, так как он изменяет ввод пользователя и mcp ломается.
-
-### flow оркестрации 
-**Делегирование и субагенты**
-    - когда вы вызываете delegate_to_claude или continue_claude, результат доставляется асинхронно на уровне терминала — не как ответ инструмента. после возврата управления инструментом claude продолжает работать в отдельной вкладке терминала. когда работа завершена, результат появляется в вашем терминале как пользовательское сообщение, обёрнутое в теги [claude sub-agent response]...[/claude sub-agent response]. это сообщение вводит не пользователь — его автоматически добавляет приложение noted terminal после получения завершённого результата. любое сообщение внутри этих тегов следует воспринимать как вывод делегированного вами агента claude. вы также можете использовать list_sub_agents, чтобы получить список существующих агентов (они сохраняются даже после перезапуска приложения), и continue_claude, чтобы отправлять дополнительные сообщения в ту же сессию агента.
-
-**Роль оркестратора**
-    - ты оркестратор. если я даю тебе фичу — сначала можешь просить claude запустить explorer по всему проекту, чтобы понять общую картину. можешь просить его запускать несколько explorer за один раз на твое усмотрение. самому тебе читать файлы проекта не надо, просто проси claude mcp предоставить отчет.
-
-**Управление контекстом**
-    - если в сессии после работы explorer и исследования архитектуры контекст заполнен менее чем на 30%, можешь выполнять задачу по реализации фичи прямо в этой сессии без создания новой.
-
-**Анализ после реализации**
-    - после реализации фичи нужно попросить claude запустить docs_search для выявления ключевых knoleges которые были доступны до реализаванной фичи и на основе них агент клауди проведет анализ, не поломали ли мы что-нибудь. если в сессии фичи контекст израсходован на 80% и более, можешь запустить нового агента claude и передать туда итоги задачи.
-
-**Распределение задач и верификация**
-    - не стоит скидывать в одну сессию claude все задачи разом, если их много. архитектура приложения сложная, поэтому сначала лучше провести первичный анализ и распределить фичи для поочередного запуска. делай набор фичей по оценке сложности, после чего можно запустить второго субагента для оценки по правилам из knowledge. следи за заполнением контекста и по необходимости запускай нового субагента. главное, после выполнения фичи запускай нового субагента внутри gemini с промптом о том, что задача выполнена, и просьбой проверить отсутствие багов на основе knowledge. этот субагент должен запустить explorer и изучить устройство реализованного функционала.
-
-**контроль разных сессий**
-    - Допустим, ты перед началом работы запускал первого агента, которому ты дал команду провести детальный ресерч приложения. А потом во втором агенте ты начал реализовывать саму фичу. Соответственно, поскольку первый агент уже помнит реализацию и план, который мы заставляли, или уже проводил ресерч, то анализ документации можно отдать этому субагенту первому.
-
-ВНИМАНИЕ: ТЫ ОРКЕСТРАТОР. если пользоватеель дает задачу ты не должен самстоятельно ничего искать по коду.
-
-**UX план задачи после exporer**
-    - gemini запустил claude агента с exporer по задаче
-    - gemini дожен оценит user-ux-flow сложность задачи, подовдные камни, и составить дизан интерфейс.
-        ^^ update_docs фича для приложения custom terminal
-            Case: Редактирование фичи Update Docs — подводные камни UI
-            
-              Ситуация                                                                                                                            
-            
-              Хотим добавить кнопку Update API (API анализ → Claude Haiku таб). Казалось бы — просто handler + кнопка. Но прежде чем писать код,
-              нужно пройтись по UI и понять, что сломается или станет неудобным.
-            
-              Подводный камень: Где выбирать модель для первичного анализа?
-            
-              Сейчас ApiSettingsModal (⚙) настраивает модели для кнопки api (clipboard flow):
-              - Claude: Sonnet 4.5 / Opus 4.6
-              - Gemini: Flash / Pro + Thinking level
-            
-              Новая кнопка Update API тоже нуждается в выборе модели для первичного анализа. Варианты:
-            
-              ┌───────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────┐
-              │          Подход           │                                              Проблема                                               │
-              ├───────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────┤
-              │ Переиспользовать          │ Пользователь настроил Flash для быстрых api копий. Нажал Update API — получил поверхностный анализ. │
-              │ ApiSettings               │  Чтобы получить Pro — надо лезть в настройки, менять, а потом менять обратно. Дублирование          │
-              │                           │ действий.                                                                                           │
-              ├───────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────┤
-              │ Отдельная настройка для   │ Два места с одинаковыми кнопками Gemini Flash / Pro. Путаница — какая настройка на что влияет.      │
-              │ Update API                │                                                                                                     │
-              ├───────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────┤
-              │ Inline выбор в popup при  │ Уже частично сделано (popup claude/gemini). Но модель внутри провайдера не выбирается — берётся из  │
-              │ каждом клике              │ общих настроек.                                                                                     │
-              └───────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────┘
-            
-              Вывод
-            
-              Прежде чем кодить, надо решить: будет ли Update API переиспользовать текущие ApiSettings или нужен свой контекст настроек. Это
-              архитектурное решение по UI, которое влияет на store, модалку, и sync с main process. Если начать кодить без этого — потом придётся
-              переделывать.
-        
-    - перед реализацией необходимо пользователю дать типа фидбэк того как именно по UX Flow части это будет работать частично архитектурно, то есть что-то смежное на уровне архитектуры и UX Flow, но без кода 
-
-**auto/context.md**
-    - прочитать логику тестов и запустить
-
-**проверка на архитектруные ошибки knowledge**
-    - проветис docs_search по ключенвым knowledge и понять не допустили ли мы похожих ошибок
-    
-**обновление документации**
-    - вызвать *mcp gemini "update_docs"* и передать туда сессия для обнолвения.
-        - ответ от update_docs передать в нового агента claude haiku -> обновить файлы -> закрыть агента
-    - одна фича -> одни вызов. допустимо передавать несколько сессий если они касались одной фичи. 
-    
-    - результат финального редактирования лучше скинуть в claude агента который занимался фичей для перепроверки 
-        ^^ ложная диагностика привела к переписыванию документации
-            Кейс был классический ложная диагностика → документация по ложной причине → пришлось переписывать.                                    
-                                                                                                                                                
-              Вот цепочка:                                                                                                                          
-           
-              1. Симптом: Ответы через API хуже, чем через интерактивный Gemini CLI (Update Docs)                                                   
-              2. Первая гипотеза: CLI получает 11K-токенный системный промпт из GEMINI.md, а API — нет. Проверили: input: 11279 tokens на простом 
-              "2+2" → подтвердилось. Добавили gemini -p как третий провайдер и задокументировали мотивацию: "headless даёт доступ к системному 
-              промпту, чего нет в API"
-              3. Реальность: Пользователь протестировал — headless gemini -p всё равно даёт ответ хуже, чем интерактивная сессия. Притом что обе
-              используют CLI
-              4. Настоящая причина: Разобрали JSON интерактивной сессии — в ней 67 файлов knowledge base (~370KB) вставлены прямо в промпт через
-              gemini:create-prefilled-session. Ни API, ни headless CLI этого не получали. Разница была не в 11K системного промпта, а в 370KB
-              контекста проекта
-              5. Фикс: Добавили docs:read-knowledge-base во все API-хендлеры. Качество выровнялось
-              6. Проблема с доками: Уже задокументированная мотивация gemini -p ("лучше качество из-за системного промпта") стала неверной. Пришлось
-               переписывать секцию и уточнять, что разница была из-за отсутствия knowledge base, а не из-за CLI vs API
-        
-              Урок: Задокументировали корреляцию (11K токенов = лучше) как причинно-следственную связь, не дождавшись полной верификации. Реальный
-              root cause был глубже.
-        - если агентов было несколько: добавить пометку что часть документации могла быть взята из другой сессии, агент должен проверить только свою часть
-        
-        -docs_reindex
+<instructions>
+  <step index="1">
+    ПЕРЕД написанием кода — ИССЛЕДУЙ реальное состояние:
+    - Запроси реальные данные (SQL/network/curl), не предполагай
+    - Если результат пустой/0/unexpected — проверь данные ПЕРВЫМ, не код
+    - Используй `docs_search` для поиска шрамов и фактов по подсистеме
+  </step>
+  <step index="2">
+    НЕ обновляй документацию без ЯВНОГО приказа пользователя.
+    - Файлы в `docs/` (`knowledge/`, `methodology/`, `fact-*`, `fix-*`) — НЕ создавать и НЕ редактировать, пока пользователь прямо не попросил («обнови доки», вставил `docs-rules.prompt.md` и т.п.).
+    - Закончил фичу/фикс → ОСТАНОВИСЬ. Не пиши документацию «заодно» / «по итогам» / на каждой итерации.
+    - Причина: пользователь сначала сам проверяет код. Документация по непроверенной итерации = мусор, который придётся откатывать. Это всегда отдельный явный шаг, не автомат.
+  </step>
+</instructions>
 <!-- @deploy-end -->
 
 ## Обзор
@@ -164,9 +41,11 @@ Noted Terminal — кастомный эмулятор терминала на �
 - **Home Button Toggle:** Кнопка 🏠 (Home) работает как переключатель. При нахождении на Dashboard повторный клик по 🏠 возвращает пользователя в контекст последнего активного проекта вместо перезагрузки Dashboard. Это сокращает время на навигацию при частом переходе между Dashboard и проектами.
 
 ## Методологии
-- **Дизайн-методология**: [`docs/methodology/design.md`](docs/methodology/design.md) — UX-философия (детерминизм клика, destructive ≠ status, layout reservation) + UI implementation patterns (Invisible Bridge, Cmd+Hover, virtualization, GPU-анимации, immediate injection, tiered debounce). Один файл, два слоя.
-- **Project-specific UX (Claude/Gemini брендинг, multi-select, toast layout)**: [`docs/knowledge/fact-ux-patterns.md`](docs/knowledge/fact-ux-patterns.md) — конкретика этого проекта.
-- **Mobile UX**: [`docs/methodology/design-mobile.md`](docs/methodology/design-mobile.md).
+- **Дизайн-методология**: [`docs/methodology/переносимый-дизайн.md`](docs/methodology/переносимый-дизайн.md) — UX-философия (детерминизм клика, destructive ≠ status, layout reservation) + UI implementation patterns (Invisible Bridge, Cmd+Hover, virtualization, GPU-анимации, immediate injection, tiered debounce). Один файл, два слоя.
+- **Карта кросс-фичевых багов**: [`docs/methodology/сценарии-багов.md`](docs/methodology/сценарии-багов.md) — обязательное чтение ПЕРЕД изменением любой фичи. Граф «трогаешь X — проверь Y и Z», симптомы рассинхрона. Центральный узел — JSONL parentUuid chain (Timeline/HistoryPanel парность, EffortInject, kill-paths, CwdGuard). Дополняется при каждом обнаруженном кросс-баге.
+- **Каталог типовых UI-граблей**: [`docs/methodology/сценарии-багов-design.md`](docs/methodology/сценарии-багов-design.md) — грабли вёрстки (popup-обрезка, hover-bridge, click-outside, z-index). Открывай перед проектированием нового UI-элемента.
+- **Сценарии использования**: [`docs/methodology/сценарии-использования.md`](docs/methodology/сценарии-использования.md) — пошаговые user-flow через несколько фич (Unified AI Launch, Multi-select, Interrupted Overlay).
+- **Mobile UX**: [`docs/methodology/переносимый-дизайн-mobile.md`](docs/methodology/переносимый-дизайн-mobile.md).
 - **Тесты**: глобальный skill `electron-e2e-testing` (`~/.claude/skills/electron-e2e-testing/`) — методология E2E через MCP, активируется по запросам о тестировании Electron. Custom-terminal-specific quirks (CDP-порт 9224, JSONL-side, TUI-side, IPC cookbook) — в `references/custom-terminal.md` этого skill'а. Сценарии (исполняемый код) — `~/Desktop/electron-mcp/scenarios/custom-terminal/`. Бывшая папка `auto/` удалена; бэкап `/tmp/custom-terminal-auto-backup-*.tar.gz`.
 
 ## Документация
@@ -192,28 +71,29 @@ MCP-инструмент `docs_search` — вызови перед работо�
 - **Избегай серверного состояния (Watermark) для истории:** Не пытайся отслеживать в памяти сервера, сколько ходов истории уже "прочитал" агент. Это блокирует повторное чтение с разной детализацией и сбрасывается при рестарте. Используй Stateless API с параметром `last_n`.
 - **Async onData race:** Никогда не делай `await` внутри обработчика PTY `onData` без предварительной **синхронной блокировки** (cooldown/флаг). Высокочастотный вывод терминала породит десятки дублирующих асинхронных вызовов.
 - **Concurrent `safePasteAndSubmit` на одном PTY:** функция уже сериализована через WeakMap `pasteInflight` в `main.js` — не дублируй mutex на стороне caller'ов, не дописывай свою concurrency-логику. Single bracket pair оборачивает все chunks одной парой `\x1b[200~/\x1b[201~`; per-chunk wrapping даёт N chip'ов в Claude TUI. См. [`fix-claude-paste-race.md`](docs/knowledge/fix-claude-paste-race.md), [`fact-claude-tui-mechanics.md`](docs/knowledge/fact-claude-tui-mechanics.md) секция 4.
-- **Manual Cmd+V пропускается transparent в PTY** (без bracketed-обёрток, без chunking на нашей стороне). Если длинный paste дробится на N chip'ов в Claude TUI — root cause **не** в `terminal:input`. Проверь env `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` в shellEnv `terminal:create` и версию node-pty (≥1.2.0-beta для PR #831). См. [`fix-paste-bracket-mode-loss.md`](docs/knowledge/fix-paste-bracket-mode-loss.md), [`methodology/design.md`](docs/methodology/design.md) секция «Transparent passthrough».
+- **Manual Cmd+V пропускается transparent в PTY** (без bracketed-обёрток, без chunking на нашей стороне). Если длинный paste дробится на N chip'ов в Claude TUI — root cause **не** в `terminal:input`. Проверь env `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` в shellEnv `terminal:create` и версию node-pty (≥1.2.0-beta для PR #831). См. [`fix-paste-bracket-mode-loss.md`](docs/knowledge/fix-paste-bracket-mode-loss.md), [`methodology/переносимый-дизайн.md`](docs/methodology/переносимый-дизайн.md) секция «Transparent passthrough».
 - **Не используй `execSync`** в main process — фризит весь UI
-- **Фоновая команда: success ≠ exit code.** Если main спавнит внешний скрипт (build-index, npm-таск, bash-pipeline) и UI показывает результат — `code===0` означает только что процесс дошёл до `exit`, не что задача выполнена. Многие скрипты выходят 0 даже когда внутри упала половина шагов. Парсь summary stdout и собирай success из набора детерминированных сигналов (видели summary, errors==0, warnings==0, per-file ошибки==0). Иначе UI лжёт пользователю — «успешно» в тосте при сломанном артефакте. См. [`methodology/design.md`](docs/methodology/design.md) секция «Success ≠ exit code» и [`fact-project-toolbar.md`](docs/knowledge/fact-project-toolbar.md) секция «Rebuild validation».
+- **Фоновая команда: success ≠ exit code.** Если main спавнит внешний скрипт (build-index, npm-таск, bash-pipeline) и UI показывает результат — `code===0` означает только что процесс дошёл до `exit`, не что задача выполнена. Многие скрипты выходят 0 даже когда внутри упала половина шагов. Парсь summary stdout и собирай success из набора детерминированных сигналов (видели summary, errors==0, warnings==0, per-file ошибки==0). Иначе UI лжёт пользователю — «успешно» в тосте при сломанном артефакте. См. [`methodology/переносимый-дизайн.md`](docs/methodology/переносимый-дизайн.md) секция «Success ≠ exit code» и [`fact-project-toolbar.md`](docs/knowledge/fact-project-toolbar.md) секция «Rebuild validation».
 - **Не используй polling и таймауты для ожидания состояний:** Проект event-driven — для каждого состояния уже есть сигнал (OSC 133, `geminiSpinnerBusy` → `processGeminiQueue`, `geminiResponseQueue`, IPC events). Перед написанием `setTimeout`/`setInterval` для ожидания — найди существующий event-driven механизм в кодовой базе. `setTimeout` допустим только для debounce, не для "подождать пока X будет готов". **Это также относится к ожиданию готовности PTY-интерфейсов (например, Gemini CLI TUI)** — используй детерминированные PTY-события вместо фиксированных таймаутов. Пример: ожидание ANSI-сигнала `HIDE CURSOR` (`\x1b[?25l`) гарантирует, что терминал полностью инициализирован перед вставкой данных.
+- **AI loader: детерминированность важнее мгновенного старта:** задержка <1с на появление loader'а допустима, если источник — авторитетное событие/JSONL-запись; недопустимы ложные обрывы loader'а посреди долгого turn'а и `timeout` как основной источник окончания. Исключение — управляющие действия типа смены модели/rewind, где нужен мгновенный feedback; там таймеры только fallback.
 - **IPC коммуникация:** При добавлении main↔renderer коммуникации проверь существующие хендлеры: `grep 'ipcMain.handle\|ipcMain.on' src/main/main.js`. Конвенция: `модуль:действие` (terminal:paste, claude:spawn-with-watcher). `handle` для request-response, `on` для fire-and-forget.
 - **Не дублируй `ipcMain.handle('X')`:** Electron throws на втором `handle` для того же канала (`Attempted to register a second handler`). Throw обрывает текущий `registerHandlers()` блок — **все handler'ы после throw молча не регистрируются**, их симптом потом мигрирует в "кнопка не работает" без ошибок в renderer. Перед добавлением handler'а grep'ни по всему `src/main/`, не только по одному файлу.
 - **Разделённые update-paths для одного persistent поля:** если для одного и того же поля Zustand-таба есть два метода (`setClaudeSessionId` для PTY-табов + `updateSDKState` для SDK-табов) и только один дёргает `saveTabs` в SQLite — после рестарта Electron'а половина табов теряет это поле. Симптом: SDK таб открывается в *"Waiting for session"* хотя JSONL на диске цел. Любой method который меняет persistent поле (`claudeSessionId`, `geminiSessionId`, `parentTabId`) обязан вызвать `saveTabs(workspace.projectId, workspace.tabs)` после `Object.assign`. См. [`fact-claude-sdk-tab.md`](docs/knowledge/fact-claude-sdk-tab.md) секция «SDK session ID persistence».
 - **Активность компонента в Zustand-селекторе:** При локальной подписке на active-флаг проверяй И `state.activeProjectId === projId`, И `workspace.activeTabId === tabId`. Без `activeProjectId` каждый проект "claim'ит" свой last-active таб → несколько компонентов одновременно в visible-state → z-index race. См. [`fix-performance-lags.md`](docs/knowledge/fix-performance-lags.md) Section 5.
 - **Экранируй `$`** в bash-командах в main.js — Vite трансформирует их при сборке
 - **Не используй `navigator.clipboard`** в renderer — используй `window.require('electron').clipboard`
-- **`cursor: 'wait'` на UI-кнопке поднимает системный wait-cursor macOS** (волчок), который покрывает всё окно и читается юзером как «приложение зависло». Для in-UI loading-state используй встроенный spinner внутри элемента + `cursor: 'default'`. См. [`methodology/design.md`](docs/methodology/design.md) секция «In-UI loader vs системный wait-cursor».
+- **`cursor: 'wait'` на UI-кнопке поднимает системный wait-cursor macOS** (волчок), который покрывает всё окно и читается юзером как «приложение зависло». Для in-UI loading-state используй встроенный spinner внутри элемента + `cursor: 'default'`. См. [`methodology/переносимый-дизайн.md`](docs/methodology/переносимый-дизайн.md) секция «In-UI loader vs системный wait-cursor».
 - **Claude Agent SDK не наследует `mcpServers` из `~/.claude.json` автоматически.** В отличие от Claude Code CLI/Desktop, `query()` в SDK по умолчанию стартует с пустым `options.mcpServers` — агент работает без инструментов и **не сообщает об этом**. Прокидывай конфиг явно (читай `~/.claude.json` один раз при первом вызове, кэшируй). См. [`fact-claude-sdk-tab.md`](docs/knowledge/fact-claude-sdk-tab.md).
-- **Несовместимость параметров — гаси в точке выбора, не в момент отправки.** Если из docs/SDK известна таблица совместимости (effort × model, region × payment, и т.п.) — несовместимые опции в UI должны быть **disabled** (серые, hover-объяснение, клик не работает). При смене одного параметра другой автоматически даунгрейдится до поддерживаемого с короткой info-нотификацией. Toast о расхождении после отправки = плохая идея: юзер уже сделал mental commit на выбор. См. [`methodology/design.md`](docs/methodology/design.md) секция «Несовместимость параметров».
+- **Несовместимость параметров — гаси в точке выбора, не в момент отправки.** Если из docs/SDK известна таблица совместимости (effort × model, region × payment, и т.п.) — несовместимые опции в UI должны быть **disabled** (серые, hover-объяснение, клик не работает). При смене одного параметра другой автоматически даунгрейдится до поддерживаемого с короткой info-нотификацией. Toast о расхождении после отправки = плохая идея: юзер уже сделал mental commit на выбор. См. [`methodology/переносимый-дизайн.md`](docs/methodology/переносимый-дизайн.md) секция «Несовместимость параметров».
 - **TUI Logic Testing:** Для низкоуровневой логики парсинга терминала (маркеры, поиск в буфере) предпочитай **Headless Unit-тесты** (node + @xterm/headless). Playwright-тесты используй только для UI и IPC сценариев.
 - **Dynamic List Overlays:** Запрещено использовать процентное позиционирование (`top: %`) для оверлеев в списках, где элементы имеют динамическую высоту (например, через `flex-grow` или условные маркеры). Это приводит к визуальному рассинхрону. Используй только реальные DOM-координаты (`offsetTop`/`offsetHeight`) через `refs`.
 - **Layout-aware wheel handlers:** Если компонент рендерится в двух режимах (horizontal/vertical), `onWheel`/`addEventListener('wheel')` handlers должны проверять режим до `preventDefault()`. Конкретный шрам: `handleWheel` в TabBar форсировал `scrollLeft += deltaY` на overflowX:hidden контейнере (горизонтальная конвертация wheel). В vertical layout этот же handler глотает событие `preventDefault()`, scrollLeft на overflowX:hidden ничего не делает — нативный вертикальный скролл блокируется. Симптом: «вкладки не скроллятся колесом в sidebar». Фикс — `if (isVerticalLayout) return;` early-return в useEffect. См. [`fact-tabs.md::Wheel handler gotcha`](docs/knowledge/fact-tabs.md).
-- **Mirror Editing:** Паттерн двухколонного редактирования, где форма заменяет соседнюю колонку, сохраняя баланс и контекст. См. [`docs/methodology/design.md`](docs/methodology/design.md) секция «Mirror Editing».
+- **Mirror Editing:** Паттерн двухколонного редактирования, где форма заменяет соседнюю колонку, сохраняя баланс и контекст. См. [`docs/methodology/переносимый-дизайн.md`](docs/methodology/переносимый-дизайн.md) секция «Mirror Editing».
 - **Pointer-based DnD:** Сложные перетаскивания (с live-preview или клонами) реализуются через Pointer Events со статическими координатами (`midY`) для фиксации джиттера. См. [`docs/knowledge/fact-settings.md`](docs/knowledge/fact-settings.md).
 - **Не дублируй детекцию событий:** Если UI уже корректно реагирует на событие (например, `terminal:command-finished` показывает кнопку "Продолжить"), main process должен использовать **тот же сигнал** для своей логики. Построение параллельного механизма с отдельными guard'ами приводит к рассинхрону (один путь работает, другой — нет). Пример: `bridgeKnownSessions` не чистился при выходе Claude, потому что guard по `claudeCliActive` блокировал, хотя `command-finished` уже корректно сигнализировал о выходе. См. [`fix-interrupted-session-lifecycle.md`](docs/knowledge/fix-interrupted-session-lifecycle.md).
 - **Controlled editor echo:** При двух MarkdownEditor instance, делящих один store-источник (например inline + slideout оба на `tab.notes`), программный `view.dispatch({changes:...})` без `userEvent: 'external-sync'` annotation создаёт ping-pong: dispatch → CodeMirror updateListener → onChange echo → React update → второй editor dispatch → ... → `Position N is out of range for changeset of length M`. Любой `view.dispatch` от props-sync useEffect помечать `userEvent: 'external-sync'`, в updateListener чек `transactions.some(tr => tr.annotation(Transaction.userEvent) === 'external-sync')` → skip onChange. См. [`fix-codemirror-controlled-editor.md`](docs/knowledge/fix-codemirror-controlled-editor.md).
-- **Lazy popover + onMouseLeave guard:** когда popover монтируется через conditional (`{open && <Portal>…</Portal>}`), `onMouseLeave` на trigger'е unmount'ит wrapper в том же тике — курсор не успевает перейти в новый узел, mouseenter не выстреливает. Управление видимостью — **только** через глобальный `window.mousemove` listener с geometric hit-test'ом против `getBoundingClientRect()` trigger+popover (tolerance ±2px). `onMouseLeave` на обоих узлах не вешать совсем. См. [`methodology/design-bugs.md::2.7`](docs/methodology/design-bugs.md).
-- **Nested popover внутри click-outside-aware родителя:** `onClick={(e) => e.stopPropagation()}` на кнопке popover'а не достаточен, если родитель закрывается по `window.mousedown`. mousedown bubble'ит first — родитель сбрасывает state до того как обработчик кнопки выстрелит, симптом «кнопка тупо не работает». На корневом div'е popover'а нужны **обе** проп'ы: `onMouseDown` + `onClick`, обе с `stopPropagation`. См. [`methodology/design-bugs.md::4.6`](docs/methodology/design-bugs.md).
+- **Lazy popover + onMouseLeave guard:** когда popover монтируется через conditional (`{open && <Portal>…</Portal>}`), `onMouseLeave` на trigger'е unmount'ит wrapper в том же тике — курсор не успевает перейти в новый узел, mouseenter не выстреливает. Управление видимостью — **только** через глобальный `window.mousemove` listener с geometric hit-test'ом против `getBoundingClientRect()` trigger+popover (tolerance ±2px). `onMouseLeave` на обоих узлах не вешать совсем. См. [`methodology/сценарии-багов-design.md::2.7`](docs/methodology/сценарии-багов-design.md).
+- **Nested popover внутри click-outside-aware родителя:** `onClick={(e) => e.stopPropagation()}` на кнопке popover'а не достаточен, если родитель закрывается по `window.mousedown`. mousedown bubble'ит first — родитель сбрасывает state до того как обработчик кнопки выстрелит, симптом «кнопка тупо не работает». На корневом div'е popover'а нужны **обе** проп'ы: `onMouseDown` + `onClick`, обе с `stopPropagation`. См. [`methodology/сценарии-багов-design.md::4.6`](docs/methodology/сценарии-багов-design.md).
 - **AI-Optimized UI & Video Forensics:**
   - Статус-индикаторы (лоадеры, пульсация) ДОЛЖНЫ быть детектируемы AI на видеозаписях (артефакты H.264/JPEG).
   - ИЗБЕГАЙ чистой анимации прозрачности (`animate-pulse`) — кодеки часто "съедают" такие изменения на темном фоне.
@@ -222,8 +102,8 @@ MCP-инструмент `docs_search` — вызови перед работо�
   - Сопровождай анимацию статичным текстовым лейблом в ВЕРХНЕМ РЕГИСТРЕ (например, "REWINDING...", "BUSY") для 100% надежности OCR.
   - Текстовые лейблы должны быть черно-белыми, статичными (без анимации) и рендериться через **React Portals** с высоким `z-index`, чтобы их не перекрывали терминалы или сайдбары. См. [`Timeline.tsx`](src/renderer/components/Workspace/Timeline.tsx).
 - **`~/.claude/bridge/*.json` могут быть месячной давности — bridge-watcher обязан проверять `updated_at` + `transcript_path` существование перед привязкой к табу.** Claude CLI **никогда не удаляет** свои bridge-файлы после exit, они копятся годами. PID reuse + path-prefix tolerance дают ложно-положительный matсh со свежим PTY-shell новой вкладки → `[Terminal:Bridge] OVERWRITE` стампит мёртвый sessionId на только что AutoResume'нутую вкладку **до того как реальный claude успел дописать свой bridge.json**. Защитные слои: (1) `fs.existsSync(transcript_path)` в `processFile`; (2) `now - updated_at > 600s` skip; (3) `ps -p <ppid> -o command=` — убедиться что PID — это действительно claude, не реюзнутый соседом; (4) убран `terminalProjects.set(tabId, bridge.cwd)` в path-drift branch (овервайт чужого cwd на cwd зомби); (5) `pendingResume` Map (`src/renderer/utils/pendingResume.ts`) — renderer-side guard, любой code path который пишет `claude --resume <X>` в PTY обязан вызвать `markPendingResume(tabId, X)`; `handleSessionDetected` дропает bridge-события с другим sessionId в течение 15 сек; (6) `tabs.claude_session_history` (JSON, cap 5) + UI revert через TabBar context-menu — last line of defense, когда guards всё-таки пропустили. **Любой новый writer `setClaudeSessionId`** обязан передать `reason: SessionWriteReason` (sealed union) — это автоматически попадёт в историю. См. [`fix-bridge-stale-takeover.md`](docs/knowledge/fix-bridge-stale-takeover.md).
-- **Busy-overlay вместо `disabled` на кластере управления:** для блока с несколькими кнопками разной длины (Provider/Model/Effort/Think, любая dropdown-группа с динамическим label'ом), который временно недоступен из-за in-flight операции — НЕ оборачивать детей в `disabled` + `opacity: 0.5`. Это меняет визуальный вес и подсаживает ширину блока («съёживается»). Правильно: на обёртке `pointer-events: none` + CSS-overlay через `::after` с shimmer-полосой; child-кнопки рендерятся как обычно, `cursor: wait` на триггерах. См. [`methodology/design.md::Busy-overlay вместо disabled`](docs/methodology/design.md) и [`fact-claude-control-bar.md::Busy-overlay`](docs/knowledge/fact-claude-control-bar.md).
-- **Overlay-окно которое НЕ должно отбирать фокус:** `BrowserWindow({ alwaysOnTop: true, focusable: false, acceptFirstMouse: true })` — обязательная тройка для окон поверх которых юзер продолжает работать (Global Dictation recording, чип, любой HUD/палитра шлющая keystroke в другое приложение). Раньше думали что для clickable-чипа нужен `focusable:true` — ошибка: `acceptFirstMouse:true` ловит click без активации окна. Без этого каждый клик на чип крадёт фокус у target app (юзер видит как «курсор пропадает с основного приложения»), плюс последующий `osascript ... keystroke "v"` вставит текст в нас, а не в Telegram/VSCode. Дополнительно: ПЕРЕД симуляцией клавиатуры всегда `close()` (не `hide()` — `hide` оставляет окно в стеке Spaces и фокус возвращается с задержкой) + 100ms wait для WindowServer-flip + явный `tell application id "<bundle>" to activate` для **захваченного ДО открытия наших окон** target-app (`captureFrontmostApp()` через osascript get bundle identifier). Без target-capture paste «через раз» попадает в нас (между snapshot'ом и paste юзер успел кликнуть наше UI). См. [`fact-global-dictation.md::AppleScript paste flow + target-app capture`](docs/knowledge/fact-global-dictation.md) и [`methodology/design.md::Overlay не должен забирать фокус`](docs/methodology/design.md).
+- **Busy-overlay вместо `disabled` на кластере управления:** для блока с несколькими кнопками разной длины (Provider/Model/Effort/Think, любая dropdown-группа с динамическим label'ом), который временно недоступен из-за in-flight операции — НЕ оборачивать детей в `disabled` + `opacity: 0.5`. Это меняет визуальный вес и подсаживает ширину блока («съёживается»). Правильно: на обёртке `pointer-events: none` + CSS-overlay через `::after` с shimmer-полосой; child-кнопки рендерятся как обычно, `cursor: wait` на триггерах. См. [`methodology/переносимый-дизайн.md::Busy-overlay вместо disabled`](docs/methodology/переносимый-дизайн.md) и [`fact-claude-control-bar.md::Busy-overlay`](docs/knowledge/fact-claude-control-bar.md).
+- **Overlay-окно которое НЕ должно отбирать фокус:** `BrowserWindow({ alwaysOnTop: true, focusable: false, acceptFirstMouse: true })` — обязательная тройка для окон поверх которых юзер продолжает работать (Global Dictation recording, чип, любой HUD/палитра шлющая keystroke в другое приложение). Раньше думали что для clickable-чипа нужен `focusable:true` — ошибка: `acceptFirstMouse:true` ловит click без активации окна. Без этого каждый клик на чип крадёт фокус у target app (юзер видит как «курсор пропадает с основного приложения»), плюс последующий `osascript ... keystroke "v"` вставит текст в нас, а не в Telegram/VSCode. Дополнительно: ПЕРЕД симуляцией клавиатуры всегда `close()` (не `hide()` — `hide` оставляет окно в стеке Spaces и фокус возвращается с задержкой) + 100ms wait для WindowServer-flip + явный `tell application id "<bundle>" to activate` для **захваченного ДО открытия наших окон** target-app (`captureFrontmostApp()` через osascript get bundle identifier). Без target-capture paste «через раз» попадает в нас (между snapshot'ом и paste юзер успел кликнуть наше UI). См. [`fact-global-dictation.md::AppleScript paste flow + target-app capture`](docs/knowledge/fact-global-dictation.md) и [`methodology/переносимый-дизайн.md::Overlay не должен забирать фокус`](docs/methodology/переносимый-дизайн.md).
 - **Renderer path в asar для побочных HTML-entries:** модуль под `src/main/<subdir>/index.js` в production живёт в `app.asar/src/main/<subdir>/`, `__dirname` указывает на эту папку. Чтобы достать `dist/renderer/<name>.html` нужно подниматься на **три** уровня (`../../../dist/renderer/`), не два: subdir → main → src → asar root → dist/renderer. Ошибка с двумя уровнями (как для main.js где модуль на `dist/main/main.js`) даёт несуществующий `app.asar/src/renderer/<name>.html`, `loadFile()` тихо фейлится без exception (промис rejected, надо явно `.catch()` или подписаться на `did-fail-load`), окно показывает белый transparent прямоугольник, renderer JS не выполняется, в логах ZERO. Симптом — фоновое окно создалось, в state ничего не приходит, IPC handlers молчат. Лекарство: явный `path.join(__dirname, '..', '..', '..', 'dist', 'renderer', ...)` + диагностические listener'ы (`did-fail-load`, `render-process-gone`, `preload-error`, `loadFile().catch()`, и обязательно `console-message` → main log для overlay-окон без DevTools). См. [`fact-global-dictation.md::Debug overlay-окон без DevTools`](docs/knowledge/fact-global-dictation.md).
 
 
@@ -232,7 +112,7 @@ MCP-инструмент `docs_search` — вызови перед работо�
 - **Effort Persistence:** Уровень `max` для Claude не является персистентным и сбрасывается CLI при перезапуске. Максимально допустимое значение для сохранения в `settings.json` — `high`.
 - **Claude Code Source:** Декомпилированные исходники Claude Code (из утечки source map v2.1.88) — `packages/claude-code-src/`. Рядом форки: `packages/claw-code/`, `packages/openclaw/`.
 - **Provider Proxy:** Весь трафик Claude Code проходит через встроенный HTTP proxy (порт 4001+, keepAlive). Три режима: `anthropic` (passthrough), `zen` (opencode.ai/zen), `deepseek` (api.deepseek.com/anthropic — официальный Anthropic-совместимый endpoint). **Per-tab routing**: `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/t/<encoded-tabId>` — каждая вкладка имеет независимый provider state, переключение в одной не затрагивает другие. В anthropic mode body не парсится (fast path) для сохранения prompt cache key. Cache stats логируются из SSE `message_start`. При shutdown — graceful drain активных соединений. Подробнее: [`fact-provider-proxy.md`](docs/knowledge/fact-provider-proxy.md).
-- **Mobile WebServer:** HTTP+WS сервер на порту 7878 (`src/main/web-server.js`) раздаёт мини-Vite SPA из `mobile-web/dist/` для управления SDK-табами с телефона по локальной сети. Bearer token в `~/.noted-terminal/web-token.txt`, копируется на телефон через WebChip в StatusBar (right-click). Sibling-модули в main грузить через `path.join(srcMainDir, '<name>')`, не relative — иначе production не найдёт файл. См. [`fact-mobile-web.md`](docs/knowledge/fact-mobile-web.md). Переносимые принципы мобильного UX — [`methodology/design-mobile.md`](docs/methodology/design-mobile.md).
+- **Mobile WebServer:** HTTP+WS сервер на порту 7878 (`src/main/web-server.js`) раздаёт мини-Vite SPA из `mobile-web/dist/` для управления SDK-табами с телефона по локальной сети. Bearer token в `~/.noted-terminal/web-token.txt`, копируется на телефон через WebChip в StatusBar (right-click). Sibling-модули в main грузить через `path.join(srcMainDir, '<name>')`, не relative — иначе production не найдёт файл. См. [`fact-mobile-web.md`](docs/knowledge/fact-mobile-web.md). Переносимые принципы мобильного UX — [`methodology/переносимый-дизайн-mobile.md`](docs/methodology/переносимый-дизайн-mobile.md).
 - **Обновление markdown-editor:** При правке `gt-editor/packages/markdown-editor/src/` используй `npm run build:markdown` — сборка + rsync `dist/` в `node_modules/@gt-editor/markdown-editor/dist/` + `rm -rf node_modules/.vite`. Без удаления Vite prebundle cache правки не подхватываются на следующем `npm run dev`. См. [`fix-vite-prebundle-cache.md`](docs/knowledge/fix-vite-prebundle-cache.md).
 - **Codesign для persistent TCC (Accessibility / Microphone / Screen Recording):** `build:install` подписывает приложение self-signed cert'ом «Noted Terminal Dev» из login keychain (`package.json::build.mac.identity`). Без этого adhoc-подпись пинит TCC csreq к `cdhash`, который меняется на каждом rebuild — Accessibility-разрешение «слетает» (UI toggle стоит, но `isTrustedAccessibilityClient` возвращает false, `osascript ... keystroke` падает). Один раз настроить: `bash scripts/codesign/setup-dev-cert.sh` + Keychain Access → Trust → Code Signing = Always Trust. **Не возвращать** `CSC_IDENTITY_AUTO_DISCOVERY=false` в build:install — этот env отключает подпись полностью. См. [`fact-codesign-tcc.md`](docs/knowledge/fact-codesign-tcc.md).
 
@@ -274,6 +154,7 @@ awk -v t="$UTC_HHMM" '$1 >= t":00" && $1 <= t":59"' logs/dev.log | grep ...
 
 ## AI Features
 - **Claude SDK Tab:** Параллельный режим работы с Claude через `@anthropic-ai/claude-agent-sdk` (TypeScript, без PTY, поверх `@assistant-ui/react`). Свой JSONL, свой lifecycle, свой набор tool-calls. Ловушки: `tool_result` лежит в `type:'user'`-записях (двухпроходный паринг), MCP не наследуется из `~/.claude.json`, silent downgrade на `(model, effort)` mismatch ловится сравнением `lastRequestRef` с `msg.message.model`. См. [`fact-claude-sdk-tab.md`](docs/knowledge/fact-claude-sdk-tab.md).
+- **Dynamic Workflows (отображение):** workflow в SDK-табе приходит как один `task_started{task_type:'local_workflow'}` + поток `task_progress` с **недокументированным** в `.d.ts` полем `workflow_progress[]` (фазы+агенты, мёрж partial-событий по index, НЕТ per-agent `task_started`). Рендерится как чип в BackgroundTasksBar → раскрытие по требованию в WorkflowPanel. `ultracode`/`enableWorkflows` — поля Settings-схемы (через `extraArgs.settings`), не `query()` Options. См. [`fact-claude-sdk-workflows.md`](docs/knowledge/fact-claude-sdk-workflows.md).
 - **Update API (Haiku pipeline):** Двухэтапный пайплайн для обновления документации. Анализ через Claude/Gemini API (или headless `gemini -p`), затем открытие Claude в табе `docs-XX` с моделью Haiku для применения правок.
 - **Auto-apply Toggle:** Мини-тогл рядом с ⚙ в секции System. Когда ON — Haiku автоматически начинает применение изменений (handshake добавляет `Ответь на промпт выше.`). По умолчанию OFF.
 - **Claude Extended Thinking:** Поддержка режима размышления для API Claude (версия 2025-04-15) с уровнями Low/Med/High (бюджет до 50к токенов).
@@ -290,4 +171,3 @@ awk -v t="$UTC_HHMM" '$1 >= t":00" && $1 <= t":59"' logs/dev.log | grep ...
 - **Auto-inject `/effort`:** при запуске Claude (event `claude:process-started` fires на новый PID, не на session re-sync) шлётся `/effort <defaultClaudeEffort>` из StatusBar. `max` нельзя через settings.json (Claude downgrade'ит) — только через runtime injection.
 - **Prompt Queue overlay:** sticky-панель в Claude-табах справа-вверху. Очередь промптов с auto-run после каждого turn-end, drag-and-drop reorder, Stop-after toggle (SIGTERM после следующего ответа). Текущий ввод Claude забирается через external-editor hijack (Ctrl+G → `EDITOR=noted-code-grab.js` → lock-file dispatcher grab/copy/clear/passthrough). См. [`fact-prompt-queue.md`](docs/knowledge/fact-prompt-queue.md).
 - **Синхронизация:** Все команды отправляются через синхронный IPC `invoke('claude:send-command')` для гарантии порядка выполнения. Используется `safePasteAndSubmit` со **Stash flow** (Ctrl+S вместо Ctrl+C) — user prompt не теряется, Claude сам восстанавливает его после сабмита slash-команды. Время выполнения ~400ms. См. [`fact-claude-tui-control.md`](docs/knowledge/fact-claude-tui-control.md) секция Stash Flow и [`fix-stale-sync-markers.md`](docs/knowledge/fix-stale-sync-markers.md) о фиксе детекции маркеров.
-

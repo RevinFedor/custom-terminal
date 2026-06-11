@@ -30,8 +30,10 @@ class DatabaseManager {
         path TEXT NOT NULL,
         name TEXT NOT NULL,
         description TEXT DEFAULT '',
+        icon TEXT DEFAULT NULL,
         gemini_prompt TEXT DEFAULT 'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ',
         notes_global TEXT DEFAULT '',
+        tab_groups TEXT DEFAULT NULL,
         created_at INTEGER DEFAULT (strftime('%s', 'now')),
         updated_at INTEGER DEFAULT (strftime('%s', 'now'))
       )
@@ -115,6 +117,9 @@ class DatabaseManager {
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN provider_state TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN was_interrupted INTEGER DEFAULT 0`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN gemini_session_id TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_session_id TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_model TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_effort TEXT DEFAULT NULL`); } catch (e) {}
     try {
       this.db.exec(`ALTER TABLE tabs ADD COLUMN overlay_dismissed INTEGER DEFAULT 0`);
     } catch (e) { /* column already exists */ }
@@ -142,6 +147,12 @@ class DatabaseManager {
     try {
       this.db.exec(`ALTER TABLE tabs ADD COLUMN is_collapsed INTEGER DEFAULT 0`);
     } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN tab_group_id TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN visual_parent_tab_id TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
 
     // Project sidebar state
     try {
@@ -152,6 +163,12 @@ class DatabaseManager {
     } catch (e) { /* column already exists */ }
     try {
       this.db.exec(`ALTER TABLE projects ADD COLUMN sidebar_expanded_dirs TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE projects ADD COLUMN tab_groups TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE projects ADD COLUMN icon TEXT DEFAULT NULL`);
     } catch (e) { /* column already exists */ }
 
     // Gemini history table
@@ -344,6 +361,9 @@ class DatabaseManager {
     // Migration: add session IDs to tab_history (for resume on restore)
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN claude_session_id TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN gemini_session_id TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_session_id TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_model TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_effort TEXT DEFAULT NULL`); } catch (e) {}
 
     // Migration: add message_count to tab_history
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN message_count INTEGER DEFAULT NULL`); } catch (e) {}
@@ -395,11 +415,13 @@ class DatabaseManager {
         url TEXT,
         claude_session_id TEXT,
         gemini_session_id TEXT,
+        codex_session_id TEXT,
         created_at INTEGER DEFAULT (strftime('%s', 'now')),
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
       )
     `);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_favorites_project ON favorites(project_id)`);
+    try { this.db.exec(`ALTER TABLE favorites ADD COLUMN codex_session_id TEXT DEFAULT NULL`); } catch (e) {}
 
     // Session links table - tracks parent→child session transitions (Clear Context without JSONL bridge)
     this.db.exec(`
@@ -541,8 +563,18 @@ class DatabaseManager {
       path: project.path,
       name: project.name,
       description: project.description || '',
+      icon: project.icon || null,
       geminiPrompt: project.gemini_prompt,
       notesGlobal: project.notes_global || '',
+      tabGroups: (() => {
+        if (!project.tab_groups) return [];
+        try {
+          const parsed = JSON.parse(project.tab_groups);
+          return Array.isArray(parsed) ? parsed : [];
+        } catch {
+          return [];
+        }
+      })(),
       sidebarOpen: project.sidebar_open === 1,
       openFilePath: project.open_file_path || null,
       sidebarExpandedDirs: project.sidebar_expanded_dirs ? JSON.parse(project.sidebar_expanded_dirs) : null,
@@ -562,6 +594,9 @@ class DatabaseManager {
           catch { return undefined; }
         })(),
         geminiSessionId: t.gemini_session_id || undefined,
+        codexSessionId: t.codex_session_id || undefined,
+        codexModel: t.codex_model || undefined,
+        codexEffort: t.codex_effort || undefined,
         wasInterrupted: t.was_interrupted === 1,
         overlayDismissed: t.overlay_dismissed === 1,
         notes: t.notes || '',
@@ -572,6 +607,8 @@ class DatabaseManager {
         activeView: t.active_view || undefined,
         createdAt: t.created_at || undefined,
         isCollapsed: t.is_collapsed === 1,
+        groupId: t.tab_group_id || undefined,
+        visualParentTabId: t.visual_parent_tab_id || undefined,
         parentTabId: t.parent_tab_id || undefined,
         tabId: t.tab_id || undefined,
         mcpTaskStartedAt: t.mcp_task_started_at || undefined,
@@ -733,7 +770,7 @@ class DatabaseManager {
   }
 
   updateProjectMetadata(projectId, metadata) {
-    const { name, description, geminiPrompt, path: newPath } = metadata;
+    const { name, description, geminiPrompt, path: newPath, icon } = metadata;
     const updates = [];
     const params = [];
 
@@ -741,6 +778,7 @@ class DatabaseManager {
     if (description !== undefined) { updates.push('description = ?'); params.push(description); }
     if (geminiPrompt !== undefined) { updates.push('gemini_prompt = ?'); params.push(geminiPrompt); }
     if (newPath !== undefined) { updates.push('path = ?'); params.push(newPath); }
+    if (icon !== undefined) { updates.push('icon = ?'); params.push(icon || null); }
 
     if (updates.length > 0) {
       params.push(projectId);
@@ -760,6 +798,11 @@ class DatabaseManager {
   updateProjectSidebarExpandedDirs(projectId, expandedDirs) {
     const json = expandedDirs ? JSON.stringify(expandedDirs) : null;
     this.db.prepare('UPDATE projects SET sidebar_expanded_dirs = ? WHERE id = ?').run(json, projectId);
+  }
+
+  updateProjectTabGroups(projectId, groups) {
+    const json = Array.isArray(groups) && groups.length > 0 ? JSON.stringify(groups) : null;
+    this.db.prepare('UPDATE projects SET tab_groups = ?, updated_at = strftime(\'%s\', \'now\') WHERE id = ?').run(json, projectId);
   }
 
   deleteProject(projectId) {
@@ -830,8 +873,8 @@ class DatabaseManager {
 
     const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at, is_collapsed, parent_tab_id, tab_id, mcp_task_started_at, mcp_task_id, claude_task_count, session_status, claude_session_history, provider_state, context_pct, cache_stats)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, parent_tab_id, tab_id, mcp_task_started_at, mcp_task_id, claude_task_count, session_status, claude_session_history, provider_state, context_pct, cache_stats)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
@@ -873,7 +916,7 @@ class DatabaseManager {
         const cacheStatsJson = (tab.cacheStats && typeof tab.cacheStats === 'object')
           ? JSON.stringify(tab.cacheStats)
           : (cacheStatsSnapshot.has(tab.tabId) ? cacheStatsSnapshot.get(tab.tabId) : null);
-        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.parentTabId || null, tab.tabId || null, tab.mcpTaskStartedAt || null, tab.mcpTaskId || null, tab.claudeTaskCount || 0, tab.sessionStatus || null, historyJson, providerStateJson, ctxPct, cacheStatsJson);
+        insert.run(projectId, tab.name, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.codexSessionId || null, tab.codexModel || null, tab.codexEffort || null, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.parentTabId || null, tab.tabId || null, tab.mcpTaskStartedAt || null, tab.mcpTaskId || null, tab.claudeTaskCount || 0, tab.sessionStatus || null, historyJson, providerStateJson, ctxPct, cacheStatsJson);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set
@@ -895,8 +938,8 @@ class DatabaseManager {
   archiveTab(projectId, tab) {
     const now = Math.floor(Date.now() / 1000);
     const info = this.db.prepare(`
-      INSERT INTO tab_history (project_id, name, cwd, color, notes, command_type, tab_type, url, created_at, closed_at, claude_session_id, gemini_session_id, message_count, position, process_was_running, session_status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tab_history (project_id, name, cwd, color, notes, command_type, tab_type, url, created_at, closed_at, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, message_count, position, process_was_running, session_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       projectId,
       tab.name,
@@ -910,6 +953,9 @@ class DatabaseManager {
       now,
       tab.claudeSessionId || null,
       tab.geminiSessionId || null,
+      tab.codexSessionId || null,
+      tab.codexModel || null,
+      tab.codexEffort || null,
       tab.messageCount ?? null,
       tab.position ?? null,
       tab.processWasRunning ? 1 : 0,
@@ -958,8 +1004,8 @@ class DatabaseManager {
 
   addFavorite(projectId, tab) {
     this.db.prepare(`
-      INSERT INTO favorites (project_id, name, cwd, color, notes, command_type, tab_type, url, claude_session_id, gemini_session_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO favorites (project_id, name, cwd, color, notes, command_type, tab_type, url, claude_session_id, gemini_session_id, codex_session_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       projectId,
       tab.name || null,
@@ -970,7 +1016,8 @@ class DatabaseManager {
       tab.tabType || 'terminal',
       tab.url || null,
       tab.claudeSessionId || null,
-      tab.geminiSessionId || null
+      tab.geminiSessionId || null,
+      tab.codexSessionId || null
     );
   }
 

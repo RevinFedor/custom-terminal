@@ -7,6 +7,7 @@ interface Project {
   path: string;
   name: string;
   description?: string;
+  icon?: string | null;
   notes?: string;
   quickActions?: any[];
   tabs?: any[];
@@ -57,13 +58,19 @@ export const useProjectsStore = create<ProjectsStore>((set, get) => ({
       set({ projects: { ...projects, [projectId]: updated } });
 
       // Persist to backend
-      if (updates.name || updates.description || updates.path) {
+      if (
+        updates.name !== undefined ||
+        updates.description !== undefined ||
+        updates.path !== undefined ||
+        updates.icon !== undefined
+      ) {
         await ipcRenderer.invoke('project:save-metadata', {
           projectId: project.id,
           metadata: { 
             name: updates.name, 
             description: updates.description,
-            path: updates.path 
+            path: updates.path,
+            icon: updates.icon
           }
         });
       }

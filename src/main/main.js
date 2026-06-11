@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
 const net = require('net');
+const readline = require('readline');
 
 // Load .env file (works in both dev and packaged builds).
 // Production: prefer ~/.noted-terminal/.env (survives reinstall) and fall back
@@ -73,6 +74,7 @@ const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
 const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCache, getGeminiProjectsJson, calculateGeminiHash } = require(path.join(srcMainDir, 'gemini-utils'));
 const ClaudeAgentManager = require(path.join(srcMainDir, 'claude-agent'));
 const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, deleteEffortEntries, trimTrailingEffortEntries, repairJsonlChainBreaks, _api: claudeDataApi } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
+const codexDataModule = require(path.join(srcMainDir, 'ipc', 'codex-data'));
 
 // SDK session registry — declared early so the mobile-web server can receive
 // the same Map by reference at startup (web-server.start({sdkSessions})).
@@ -227,6 +229,7 @@ const geminiCommandQueue = new Map();   // tabId -> Promise (serialized Gemini c
 // from Claude's static branding title "✳ Claude Code".
 const claudeSpinnerBusy = new Map();       // tabId → boolean
 const claudeSpinnerIdleTimer = new Map();  // tabId → timeout ID
+const claudeSpinnerLastSeenAt = new Map(); // tabId → ms timestamp of last visible TUI spinner frame
 const OSC_RE = /\x1b\][^\x07]*\x07/g;     // matches all OSC sequences (title, etc)
 const CONTENT_SPINNER_RE = /[\u2722\u2733\u2736\u273B\u273D]/; // ✢✳✶✻✽ (no · !)
 
@@ -269,7 +272,7 @@ function resolveActivityIdentity(tabId, engine) {
     if (projectManager?.db?.db) {
       try {
         row = projectManager.db.db.prepare(
-          'SELECT project_id, name, claude_session_id, gemini_session_id FROM tabs WHERE tab_id = ? LIMIT 1'
+          'SELECT project_id, name, claude_session_id, gemini_session_id, codex_session_id FROM tabs WHERE tab_id = ? LIMIT 1'
         ).get(tabId);
       } catch {}
     }
@@ -278,9 +281,10 @@ function resolveActivityIdentity(tabId, engine) {
     if (row) {
       out.tabName = row.name || null;
       out.sessionId = bridgeKnownSessions.get(tabId)
-        || row.claude_session_id || row.gemini_session_id || null;
+        || codexKnownSessions.get(tabId)
+        || row.claude_session_id || row.gemini_session_id || row.codex_session_id || null;
     } else {
-      out.sessionId = bridgeKnownSessions.get(tabId) || null;
+      out.sessionId = bridgeKnownSessions.get(tabId) || codexKnownSessions.get(tabId) || null;
     }
     // SDK tabs aren't in terminalProjectIds; pull cwd/session from sdkSessions.
     const sdk = sdkSessions.get(tabId);
@@ -366,7 +370,7 @@ function computeActiveLoaders() {
   //    get-presence returning 'inactive' (no loader) for a stale bridge entry.
   for (const tabId of bridgeKnownSessions.keys()) {
     if (!terminals.has(tabId)) continue; // PTY dead → not blocking (= 'inactive')
-    const isBusy = !!claudeCliActive.get(tabId) || !!claudeTurnBusy.get(tabId);
+    const isBusy = !!claudeCliActive.get(tabId) || !!claudeTurnBusy.get(tabId) || claudeLocalCommandWatchers.has(tabId);
     const inputReady = claudePromptReady.has(tabId);
     const status = isBusy ? 'busy' : (inputReady ? 'active' : 'starting');
     loaders.push({ tabId, kind: 'claude', status, ...labelFor(tabId) });
@@ -855,6 +859,7 @@ startProxyOnPort(4001);
 // bridge.ppid (Claude PID) → parent PID (shell) → ptyProcess.pid (our tab)
 const bridgeDir = path.join(os.homedir(), '.claude', 'bridge');
 const bridgeKnownSessions = new Map(); // tabId → sessionId
+const codexKnownSessions = new Map(); // tabId → sessionId; Codex TUI alive in this PTY
 const bridgeMetadata = new Map(); // tabId → { model, contextPct }
 const bridgePidCache = new Map(); // claudePid → tabId
 const bridgeFileMtimes = new Map(); // filename → mtimeMs
@@ -1108,8 +1113,11 @@ function clearBridgeTab(tabId) {
   claudeTurnBusy.delete(tabId);
   clearTimeout(claudeTurnWatchdog.get(tabId));
   claudeTurnWatchdog.delete(tabId);
+  claudeSpinnerLastSeenAt.delete(tabId);
   pendingPasteAudit.delete(tabId);
   stopInterruptWatcher(tabId);
+  stopClaudeLocalCommandWatcher(tabId, 'bridge-clear');
+  claudeInputLineBuffers.delete(tabId);
   // Any in-flight grab-input request gets a clean rejection rather than dangling forever.
   const pendingGrab = grabInputPending.get(tabId);
   if (pendingGrab) {
@@ -1120,6 +1128,46 @@ function clearBridgeTab(tabId) {
   if (had) {
     console.log('[Bridge:Clear] Tab ' + tabId.slice(-12) + ' removed from bridgeKnownSessions (remaining=' + bridgeKnownSessions.size + ')');
   }
+}
+
+function setCodexKnownSession(tabId, sessionId, reason = 'detected') {
+  if (!tabId || !sessionId) return;
+  const prev = codexKnownSessions.get(tabId) || null;
+  codexKnownSessions.set(tabId, sessionId);
+  if (prev !== sessionId) {
+    console.log('[Codex:Known] set tab=' + String(tabId).slice(-12) +
+      ' session=' + String(sessionId).slice(0, 8) +
+      ' reason=' + reason +
+      ' prev=' + (prev ? String(prev).slice(0, 8) : 'none') +
+      ' total=' + codexKnownSessions.size);
+  }
+}
+
+function clearCodexKnownSession(tabId, reason = 'clear') {
+  const sid = codexKnownSessions.get(tabId) || null;
+  if (!sid) return;
+  codexKnownSessions.delete(tabId);
+  console.log('[Codex:Known] clear tab=' + String(tabId).slice(-12) +
+    ' session=' + String(sid).slice(0, 8) +
+    ' reason=' + reason +
+    ' remaining=' + codexKnownSessions.size);
+}
+
+function getInterruptedAiSessionEntries() {
+  const entries = new Map();
+  for (const [tabId, sessionId] of bridgeKnownSessions) {
+    if (sessionId) entries.set(tabId, { engine: 'claude', sessionId });
+  }
+  for (const [tabId, sessionId] of codexKnownSessions) {
+    if (sessionId) entries.set(tabId, { engine: 'codex', sessionId });
+  }
+  return entries;
+}
+
+function formatInterruptedAiSessionIds(entries) {
+  return Array.from(entries, ([tabId, info]) =>
+    info.engine + ':' + String(tabId).slice(-7) + '=' + String(info.sessionId).slice(0, 8)
+  ).join(',');
 }
 
 // ========== Claude Turn Event Bridge ==========
@@ -1144,6 +1192,66 @@ const CLAUDE_HOOK_SOCK_LEGACY = '/tmp/noted-terminal-claude-hook.sock';
 const claudeTurnBusy = new Map(); // tabId → boolean (true = turn in flight)
 const claudeTurnWatchdog = new Map(); // tabId → timeout ID (silent-tool-stop safety)
 const CLAUDE_TURN_WATCHDOG_MS = 60 * 60 * 1000; // 60min — safety net against silent-tool-stop (#29881) and hook-script crashes; only fires when Stop legitimately never arrives
+const CLAUDE_TURN_WATCHDOG_EXTENSION_MS = 15 * 60 * 1000;
+const CLAUDE_TURN_WATCHDOG_SPINNER_LIVE_MS = 30 * 1000;
+const CLAUDE_TURN_WATCHDOG_JSONL_LIVE_MS = 10 * 60 * 1000;
+
+function formatWatchdogAge(ageMs) {
+  return Number.isFinite(ageMs) ? Math.round(ageMs / 1000) + 's' : 'none';
+}
+
+function getClaudeTurnLiveness(tabId) {
+  const now = Date.now();
+  const lastSpinnerAt = claudeSpinnerLastSeenAt.get(tabId) || 0;
+  const spinnerAgeMs = lastSpinnerAt ? now - lastSpinnerAt : Infinity;
+  let jsonlAgeMs = Infinity;
+  const watcher = claudeInterruptWatchers.get(tabId);
+  if (watcher && watcher.filePath) {
+    try {
+      jsonlAgeMs = now - fs.statSync(watcher.filePath).mtimeMs;
+    } catch {}
+  }
+  const liveProcess = hasLiveClaudeInTab(tabId);
+  const activeArtifact =
+    spinnerAgeMs <= CLAUDE_TURN_WATCHDOG_SPINNER_LIVE_MS ||
+    jsonlAgeMs <= CLAUDE_TURN_WATCHDOG_JSONL_LIVE_MS;
+  return { liveProcess, activeArtifact, spinnerAgeMs, jsonlAgeMs };
+}
+
+function scheduleClaudeTurnWatchdog(tabId, sessionId, delayMs = CLAUDE_TURN_WATCHDOG_MS) {
+  clearTimeout(claudeTurnWatchdog.get(tabId));
+  claudeTurnWatchdog.set(tabId, setTimeout(() => {
+    claudeTurnWatchdog.delete(tabId);
+    if (claudeTurnBusy.get(tabId) !== true) return;
+
+    const live = getClaudeTurnLiveness(tabId);
+    if (live.liveProcess && live.activeArtifact) {
+      console.warn(
+        '[ClaudeHook] Watchdog extended for tab ' + tabId.slice(-12) +
+        ' (Claude still active; spinnerAge=' + formatWatchdogAge(live.spinnerAgeMs) +
+        ' jsonlAge=' + formatWatchdogAge(live.jsonlAgeMs) + ')'
+      );
+      scheduleClaudeTurnWatchdog(tabId, sessionId, CLAUDE_TURN_WATCHDOG_EXTENSION_MS);
+      return;
+    }
+
+    console.warn(
+      '[ClaudeHook] Watchdog fired for tab ' + tabId.slice(-12) +
+      ' (Stop never arrived; liveProcess=' + live.liveProcess +
+      ' spinnerAge=' + formatWatchdogAge(live.spinnerAgeMs) +
+      ' jsonlAge=' + formatWatchdogAge(live.jsonlAgeMs) + ')'
+    );
+    claudeTurnBusy.set(tabId, false);
+    claudeSpinnerBusy.set(tabId, false);
+    claudeSpinnerLastSeenAt.delete(tabId);
+    recordActivity(tabId, false, 'claude');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      // Stop never arrived within the watchdog window and no fresh Claude-side
+      // activity was observed. This is not a clean completion.
+      mainWindow.webContents.send('claude:busy-state', { tabId, busy: false, reason: 'watchdog' });
+    }
+  }, delayMs));
+}
 
 // Awaiting-user-input state per tab. true = Claude called AskUserQuestion and is
 // blocked in its interactive-permission phase waiting for the human to answer.
@@ -1195,13 +1303,16 @@ const INTERRUPT_TEXTS = new Set([
   '[Request interrupted by user]',
   '[Request interrupted by user for tool use]',
 ]);
+const claudeLocalCommandWatchers = new Map(); // tabId → { command, watcher, filePath, offset, debounce, timeout, startedAt }
+const claudeInputLineBuffers = new Map(); // tabId → best-effort typed line buffer for manual slash commands
 
 let claudeHookServer = null;
 
 // PromptQueue grab-input correlator: noted-code-grab.js sends { event:'GrabInput', ppid, text }.
-// ppid is the helper script's parent = Claude process pid. We resolve it to tabId via bridgePidCache
-// (Claude PID → tabId, populated by SessionBridge).
+// For Claude, ppid resolves through bridgePidCache. For Codex, we explicitly pin
+// the live CLI pid before firing Ctrl+G because there is no Claude SessionBridge.
 const grabInputPending = new Map(); // tabId → { resolve, timer }
+const grabInputPidToTab = new Map(); // cliPid → tabId, used by non-Claude external-editor grabs
 
 function findTabIdBySession(sessionId) {
   if (!sessionId) return null;
@@ -1209,6 +1320,190 @@ function findTabIdBySession(sessionId) {
     if (sid === sessionId) return tabId;
   }
   return null;
+}
+
+function resolveClaudeSessionFileForTab(tabId, sessionId = bridgeKnownSessions.get(tabId) || null) {
+  if (!sessionId) return null;
+  const cwd = terminalProjects.get(tabId);
+  const located = findSessionFile(sessionId, cwd);
+  return located?.filePath || null;
+}
+
+function emitClaudeBusyState(tabId, busy, reason) {
+  claudeSpinnerBusy.set(tabId, busy);
+  recordActivity(tabId, busy, 'claude');
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('claude:busy-state', { tabId, busy, reason });
+  }
+}
+
+function isCompactDoneRecord(rec) {
+  if (!rec || typeof rec !== 'object') return false;
+  if (rec.type === 'system' && rec.subtype === 'compact_boundary') return true;
+  if (rec.type === 'user' && rec.isCompactSummary === true) return true;
+  const content = rec.message?.content;
+  if (typeof content === 'string') {
+    return content.includes('<local-command-stdout>') && content.includes('Compacted');
+  }
+  return false;
+}
+
+function detectClaudeCompactOutputPhase(text) {
+  if (!text) return null;
+  const normalized = String(text).toLowerCase().replace(/\s+/g, '');
+  if (normalized.includes('compactingconversation')) return 'compacting';
+  if (
+    normalized.includes('conversationcompacted') ||
+    normalized.includes('compacted(ctrl+o')
+  ) {
+    return 'compacted';
+  }
+  return null;
+}
+
+function stopClaudeLocalCommandWatcher(tabId, reason = 'stop') {
+  const state = claudeLocalCommandWatchers.get(tabId);
+  if (!state) return;
+  if (state.debounce) clearTimeout(state.debounce);
+  if (state.timeout) clearTimeout(state.timeout);
+  if (state.watcher) { try { state.watcher.close(); } catch {} }
+  claudeLocalCommandWatchers.delete(tabId);
+  console.log('[ClaudeLocalCommand] STOP tab=' + tabId.slice(-12) + ' command=' + state.command + ' reason=' + reason + ' durMs=' + (Date.now() - state.startedAt));
+}
+
+function completeClaudeLocalCommand(tabId, reason) {
+  const state = claudeLocalCommandWatchers.get(tabId);
+  if (!state) return;
+  stopClaudeLocalCommandWatcher(tabId, reason);
+  clearTimeout(claudeSpinnerIdleTimer.get(tabId));
+  claudeSpinnerIdleTimer.delete(tabId);
+  emitClaudeBusyState(tabId, false, 'local-command');
+  console.log('[ClaudeLocalCommand] DONE tab=' + tabId.slice(-12) + ' command=' + state.command + ' reason=' + reason);
+}
+
+function startClaudeLocalCommandWatcher(tabId, command, source = 'unknown') {
+  const normalized = String(command || '').trim();
+  if (normalized !== '/compact') return;
+
+  const existing = claudeLocalCommandWatchers.get(tabId);
+  if (existing) {
+    console.log('[ClaudeLocalCommand] START ignored tab=' + tabId.slice(-12) + ' command=' + normalized + ' source=' + source + ' existingAgeMs=' + (Date.now() - existing.startedAt));
+    return;
+  }
+
+  const sessionId = bridgeKnownSessions.get(tabId) || null;
+  const filePath = resolveClaudeSessionFileForTab(tabId, sessionId);
+  if (!filePath) {
+    console.warn('[ClaudeLocalCommand] START fallback tab=' + tabId.slice(-12) + ' command=' + normalized + ' source=' + source + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none') + ' file=missing - using PTY output completion');
+  }
+
+  let offset = 0;
+  if (filePath) {
+    try { offset = fs.statSync(filePath).size; } catch {}
+  }
+  const state = {
+    command: normalized,
+    watcher: null,
+    filePath,
+    offset,
+    debounce: null,
+    timeout: null,
+    startedAt: Date.now(),
+  };
+
+  const onChange = () => {
+    if (state.debounce) return;
+    state.debounce = setTimeout(() => {
+      state.debounce = null;
+      let stat;
+      try { stat = fs.statSync(filePath); } catch { return; }
+      if (stat.size <= state.offset) { state.offset = stat.size; return; }
+      const fd = fs.openSync(filePath, 'r');
+      const len = stat.size - state.offset;
+      const buf = Buffer.alloc(len);
+      try { fs.readSync(fd, buf, 0, len, state.offset); }
+      finally { fs.closeSync(fd); }
+      state.offset = stat.size;
+      const lines = buf.toString('utf8').split('\n');
+      for (const line of lines) {
+        if (!line) continue;
+        if (
+          line.indexOf('compact_boundary') === -1 &&
+          line.indexOf('isCompactSummary') === -1 &&
+          line.indexOf('Compacted') === -1
+        ) continue;
+        let rec;
+        try { rec = JSON.parse(line); } catch { continue; }
+        if (!isCompactDoneRecord(rec)) continue;
+        completeClaudeLocalCommand(tabId, rec.type === 'system' ? 'compact_boundary' : rec.isCompactSummary ? 'compact_summary' : 'compact_stdout');
+        return;
+      }
+    }, 100);
+  };
+
+  if (filePath) {
+    try {
+      state.watcher = fs.watch(filePath, { persistent: false }, onChange);
+    } catch (e) {
+      console.warn('[ClaudeLocalCommand] watcher failed tab=' + tabId.slice(-12) + ' command=' + normalized + ' file=' + filePath.replace(os.homedir(), '~') + ' error=' + e.message + ' - using PTY output completion');
+      state.watcher = null;
+    }
+  }
+
+  claudeLocalCommandWatchers.set(tabId, state);
+  state.timeout = setTimeout(() => {
+    if (claudeLocalCommandWatchers.get(tabId) !== state) return;
+    console.warn('[ClaudeLocalCommand] TIMEOUT tab=' + tabId.slice(-12) + ' command=' + normalized + ' afterMs=' + (Date.now() - state.startedAt) + ' — clearing local busy without durable compact marker');
+    completeClaudeLocalCommand(tabId, 'timeout');
+  }, 30 * 60 * 1000);
+  state.timeout.unref?.();
+  clearTimeout(claudeSpinnerIdleTimer.get(tabId));
+  claudeSpinnerIdleTimer.delete(tabId);
+  emitClaudeBusyState(tabId, true, 'local-command');
+  console.log('[ClaudeLocalCommand] START tab=' + tabId.slice(-12) + ' command=' + normalized + ' source=' + source + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none') + ' file=' + (filePath ? filePath.replace(os.homedir(), '~') : 'missing') + ' offset=' + offset);
+}
+
+function trackClaudeInputLineForLocalCommands(tabId, data) {
+  if (!bridgeKnownSessions.has(tabId) || typeof data !== 'string' || data.length === 0) return;
+  let buf = claudeInputLineBuffers.get(tabId) || '';
+  const flush = () => {
+    const command = buf.trim();
+    if (command === '/compact') startClaudeLocalCommandWatcher(tabId, command, 'terminal-input');
+    buf = '';
+  };
+
+  const clean = data
+    .replace(/\x1b\[200~/g, '')
+    .replace(/\x1b\[201~/g, '');
+
+  for (let i = 0; i < clean.length; i++) {
+    const ch = clean[i];
+    const code = clean.charCodeAt(i);
+    if (ch === '\r' || ch === '\n') {
+      flush();
+      continue;
+    }
+    if (ch === '\x7f' || ch === '\x08') {
+      buf = buf.slice(0, -1);
+      continue;
+    }
+    if (ch === '\x15' || ch === '\x03') {
+      buf = '';
+      continue;
+    }
+    if (ch === '\x1b') {
+      while (i + 1 < clean.length && !/[A-Za-z~]/.test(clean[i + 1])) i++;
+      if (i + 1 < clean.length) i++;
+      continue;
+    }
+    if (code >= 32 && code !== 127) {
+      buf += ch;
+      if (buf.length > 200) buf = buf.slice(-200);
+    }
+  }
+
+  if (buf) claudeInputLineBuffers.set(tabId, buf);
+  else claudeInputLineBuffers.delete(tabId);
 }
 
 // ─── JSONL interruption watcher implementation ───────────────────────────
@@ -1395,24 +1690,27 @@ function startClaudeHookServer() {
         try { sock.write('ok\n'); } catch {}
 
         // ─── GrabInput: payload from noted-code-grab.js helper (no session_id, has ppid) ───
-        // Helper is invoked by Claude's external-editor flow. We map ppid → tabId via the
-        // Claude-PID cache populated by SessionBridge. `mode` is 'grab' or 'copy' depending
-        // on which IPC the user triggered.
+        // Helper is invoked by the CLI external-editor flow. Claude maps ppid → tabId via
+        // bridgePidCache; Codex uses grabInputPidToTab pinned by captureAgentInput().
         if (event === 'GrabInput') {
-          const claudePid = Number(msg.ppid);
-          const tabId = bridgePidCache.get(claudePid)
-            || (() => { for (const [pid, tid] of bridgePidCache) { if (pid === claudePid) return tid; } return null; })();
+          const cliPid = Number(msg.ppid);
+          const tabId = bridgePidCache.get(cliPid)
+            || grabInputPidToTab.get(cliPid)
+            || (() => { for (const [pid, tid] of bridgePidCache) { if (pid === cliPid) return tid; } return null; })();
           if (!tabId) {
-            console.warn('[ClaudeHook] GrabInput ppid=' + claudePid + ' — no tab match (bridgePidCache.size=' + bridgePidCache.size + ')');
+            console.warn('[ClaudeHook] GrabInput ppid=' + cliPid + ' — no tab match (bridgePidCache.size=' + bridgePidCache.size + ' grabPidMap.size=' + grabInputPidToTab.size + ')');
             continue;
           }
           const pending = grabInputPending.get(tabId);
+          const agent = pending?.agent || (grabInputPidToTab.has(cliPid) ? 'codex' : 'claude');
           const text = typeof msg.text === 'string' ? msg.text : '';
           const mode = msg.mode || pending?.mode || 'grab';
-          console.log('[ClaudeHook] #' + eventSeq + ' GrabInput tab=' + tabId.slice(-12) + ' mode=' + mode + ' bytes=' + text.length + (pending ? '' : ' (no pending — unsolicited?)'));
+          console.log('[ClaudeHook] #' + eventSeq + ' GrabInput agent=' + agent + ' tab=' + tabId.slice(-12) + ' mode=' + mode + ' bytes=' + text.length + (pending ? '' : ' (no pending — unsolicited?)'));
           if (pending) {
             clearTimeout(pending.timer);
             grabInputPending.delete(tabId);
+            if (Array.isArray(pending.pids)) pending.pids.forEach(pid => grabInputPidToTab.delete(pid));
+            else if (pending.pid) grabInputPidToTab.delete(pending.pid);
             const images = (text.match(/\[Image(?:\s+#?\d+)?\]/g) || []).length;
             // Resolve [Image #N] placeholders → real files under
             // ~/.claude/image-cache/<sessionId>/. Logged regardless of UI use so a
@@ -1556,6 +1854,11 @@ function startClaudeHookServer() {
         const busy = event === 'UserPromptSubmit';
         const prev = claudeTurnBusy.get(tabId);
         claudeTurnBusy.set(tabId, busy);
+        if (busy) {
+          // Do not let a spinner frame from the previous turn count as fresh
+          // liveness when this turn's watchdog eventually checks the tab.
+          claudeSpinnerLastSeenAt.delete(tabId);
+        }
         // Clear any stale awaiting-input flag on a turn-end edge (Stop/StopFailure).
         // Normally PostToolUse(AskUserQuestion) already cleared it before Stop, but
         // if the turn died another way (process restart re-emitting, abort) this
@@ -1623,19 +1926,7 @@ function startClaudeHookServer() {
           stopInterruptWatcher(tabId);
         }
         if (busy) {
-          claudeTurnWatchdog.set(tabId, setTimeout(() => {
-            console.warn('[ClaudeHook] Watchdog fired for tab ' + tabId.slice(-12) + ' (Stop never arrived)');
-            claudeTurnBusy.set(tabId, false);
-            claudeSpinnerBusy.set(tabId, false);
-            claudeTurnWatchdog.delete(tabId);
-            recordActivity(tabId, false, 'claude');
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              // Stop never arrived within the watchdog window — turn is hung/dead,
-              // not cleanly finished. reason:'watchdog' makes the prompt-queue
-              // auto-runner skip firing the next prompt into an unknown state.
-              mainWindow.webContents.send('claude:busy-state', { tabId, busy: false, reason: 'watchdog' });
-            }
-          }, CLAUDE_TURN_WATCHDOG_MS));
+          scheduleClaudeTurnWatchdog(tabId, session_id);
         }
 
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -1773,19 +2064,22 @@ function logPeriodicClaudeSnapshot() {
     ...claudeTurnBusy.keys(),
     ...claudeSpinnerBusy.keys(),
     ...claudeHookLastEvent.keys(),
+    ...claudeLocalCommandWatchers.keys(),
   ]);
   for (const tabId of allTabs) {
     const turnBusy = claudeTurnBusy.get(tabId) === true;
     const spinnerBusy = claudeSpinnerBusy.get(tabId) === true;
     const last = claudeHookLastEvent.get(tabId);
+    const local = claudeLocalCommandWatchers.get(tabId);
     const lastAgo = last ? Math.round((now - last.ts) / 1000) : null;
     // Skip rows that are completely cold (no busy state + no recent hook)
-    if (!turnBusy && !spinnerBusy && (lastAgo === null || lastAgo > 300)) continue;
+    if (!turnBusy && !spinnerBusy && !local && (lastAgo === null || lastAgo > 300)) continue;
     rows.push(
       tabId.slice(-12) +
       ' turn=' + (turnBusy ? '1' : '0') +
       ' spin=' + (spinnerBusy ? '1' : '0') +
       (last ? ' last=' + last.event + ':' + lastAgo + 's' : ' last=none') +
+      (local ? ' local=' + local.command + ':' + Math.round((now - local.startedAt) / 1000) + 's' : '') +
       (claudeTurnWatchdog.has(tabId) ? ' wd' : '') +
       (claudeInterruptWatchers.has(tabId) ? ' iw' : '')
     );
@@ -1997,6 +2291,25 @@ function parseOSC133AndEmit(tabId, data) {
         // whether this is a real transition or a duplicate D.
         console.warn(`[RunAfterDiag] D tab=${tabId.slice(-8)} exit=${state.lastExitCode} prevRunning=${terminalCommandState.get(tabId)?.isRunning} claudeCliActive=${claudeCliActive.has(tabId)} spinnerBusy=${claudeSpinnerBusy.get(tabId) === true} turnBusy=${claudeTurnBusy.get(tabId) === true} hasState=${claudeState.has(tabId)} hasPending=${claudePendingPrompt.has(tabId)}`);
         terminalCommandState.set(tabId, state);
+        if (activityOpenIntervals.get(tabId)?.engine === 'codex') {
+          recordActivity(tabId, false, 'codex');
+        }
+        // During graceful app quit, before-quit marks interrupted sessions early,
+        // then sends Ctrl+C. If Codex exits cleanly and emits OSC D before
+        // will-quit, clearing this map here would make will-quit clear the freshly
+        // marked interrupted flag and not re-mark it. Keep the known session until
+        // will-quit finishes its definitive clear+mark pass.
+        if (_gracefulShutdownInProgress) {
+          const sid = codexKnownSessions.get(tabId) || null;
+          if (sid) {
+            console.log('[Codex:Known] keep tab=' + String(tabId).slice(-12) +
+              ' session=' + String(sid).slice(0, 8) +
+              ' reason=command-finished shutdown=true');
+          }
+        } else {
+          clearCodexKnownSession(tabId, 'command-finished');
+        }
+        closeCodexTurnWatcher(tabId, 'command-finished');
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('terminal:command-finished', {
             tabId,
@@ -3444,6 +3757,7 @@ function startMcpHttpServer() {
           }
 
           // Send command via safePasteAndSubmit (ctrlCFirst clears any existing input)
+          startClaudeLocalCommandWatcher(claudeTabId, command, 'mcp-command');
           await safePasteAndSubmit(term, command, { submit: true, ctrlCFirst: true, logPrefix: '[MCP:command]' });
           res.writeHead(200);
           res.end(JSON.stringify({ status: 'sent' }));
@@ -6226,14 +6540,18 @@ app.on('before-quit', async (event) => {
   try {
     if (projectManager?.db?.db) {
       let marked = 0;
+      const activeAiSessions = getInterruptedAiSessionEntries();
       const markStmt = projectManager.db.db.prepare(
         'UPDATE tabs SET was_interrupted = 1, overlay_dismissed = 0 WHERE tab_id = ?'
       );
-      for (const [tabId] of bridgeKnownSessions) {
+      for (const [tabId] of activeAiSessions) {
         marked += markStmt.run(tabId).changes;
       }
-      console.log('[Shutdown:before-quit] EARLY-MARK bridge=' + bridgeKnownSessions.size + ' marked=' + marked +
-        ' ids=[' + Array.from(bridgeKnownSessions.keys()).map(k => k.slice(-7)).join(',') + ']');
+      console.log('[Shutdown:before-quit] EARLY-MARK ai=' + activeAiSessions.size +
+        ' bridge=' + bridgeKnownSessions.size +
+        ' codex=' + codexKnownSessions.size +
+        ' marked=' + marked +
+        ' ids=[' + formatInterruptedAiSessionIds(activeAiSessions) + ']');
     }
   } catch (e) {
     console.error('[Shutdown] before-quit early-mark error:', e.message);
@@ -6245,10 +6563,11 @@ app.on('before-quit', async (event) => {
     console.error('[Activity] flush on quit failed:', e.message);
   }
 
-  // Tell renderer to show "Останавливаю Claude…" overlay
+  // Tell renderer to show shutdown overlay for live AI sessions.
   try {
+    const activeAiSessions = getInterruptedAiSessionEntries();
     const tabsCount = Array.from(terminals.entries())
-      .filter(([tabId]) => bridgeKnownSessions.has(tabId)).length;
+      .filter(([tabId]) => activeAiSessions.has(tabId)).length;
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('shutdown:overlay', { show: true, tabsCount });
     }
@@ -6259,7 +6578,7 @@ app.on('before-quit', async (event) => {
     console.error('[Shutdown] proxyGracefulShutdown error:', e.message);
   }
 
-  // Graceful Ctrl+C to every live claude CLI BEFORE PTY kill. Direct term.kill()
+  // Graceful Ctrl+C to every live AI CLI BEFORE PTY kill. Direct term.kill()
   // delivers SIGHUP, which bypasses Ink TUI and cancels any in-flight SSE chunk
   // → orphan parentUuid on next resume. Sending \x03 lets Claude flush the
   // current assistant entry to JSONL and exit cleanly. Concurrent fan-out:
@@ -6267,25 +6586,33 @@ app.on('before-quit', async (event) => {
   // deadline so we don't hang shutdown when claude refuses to exit.
   // See fix-claude-busy-detection.md::Manual Stop and JsonlChainDiag traces.
   try {
-    const tabs = Array.from(terminals.entries()).filter(([tabId]) => bridgeKnownSessions.has(tabId));
+    const activeAiSessions = getInterruptedAiSessionEntries();
+    const tabs = Array.from(terminals.entries()).filter(([tabId]) => activeAiSessions.has(tabId));
     if (tabs.length > 0) {
-      console.log('[Shutdown:GracefulCtrlC] Sending Ctrl+C to ' + tabs.length + ' live claude tab(s) before kill');
+      console.log('[Shutdown:GracefulCtrlC] Sending Ctrl+C to ' + tabs.length + ' live AI tab(s) before kill');
       await Promise.race([
         Promise.all(tabs.map(async ([tabId, term]) => {
+          const sessionInfo = activeAiSessions.get(tabId) || null;
           let childPid = null;
           try {
-            const psOut = await execAsync('ps -eo pid,ppid,command | grep -E " (claude|gemini)( |$)" | grep -v grep', 1500);
+            const psOut = await execAsync('ps -eo pid,ppid,command', 1500);
             for (const line of (psOut || '').split('\n').filter(Boolean)) {
               const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
               if (!m) continue;
               const [, pid, ppid, cmd] = m;
               if (cmd.includes('Electron') || cmd.includes('electron')) continue;
+              const aiName = getAiProcessNameFromCommand(cmd);
+              if (!aiName) continue;
               if (Number(ppid) === term.pid) { childPid = Number(pid); break; }
             }
           } catch {}
           if (!childPid) return;
-          const sid = bridgeKnownSessions.get(tabId);
-          console.log('[Shutdown:GracefulCtrlC] tabId=' + tabId.slice(-12) + ' childPid=' + childPid + ' sessionId=' + (sid ? sid.substring(0, 8) : 'none') + ' — \\x03 → waiting for graceful exit');
+          const sid = sessionInfo?.sessionId || null;
+          console.log('[Shutdown:GracefulCtrlC] tabId=' + tabId.slice(-12) +
+            ' engine=' + (sessionInfo?.engine || 'ai') +
+            ' childPid=' + childPid +
+            ' sessionId=' + (sid ? sid.substring(0, 8) : 'none') +
+            ' — \\x03 → waiting for graceful exit');
           try { term.write('\x03'); } catch (err) { console.log('[Shutdown:GracefulCtrlC] write failed: ' + err.message); }
           // Poll until process is gone or 1200ms passes.
           await new Promise((resolve) => {
@@ -6327,18 +6654,20 @@ app.on('will-quit', () => {
         'UPDATE tabs SET was_interrupted = 0 WHERE was_interrupted = 1 AND overlay_dismissed = 0'
       ).run();
 
-      // Step 2: Mark tabs with known Claude sessions (bridge-detected, alive until terminal kill)
+      // Step 2: Mark tabs with known AI sessions (bridge/Codex detected, alive until terminal kill)
       let marked = 0;
+      const activeAiSessions = getInterruptedAiSessionEntries();
       const markStmt = projectManager.db.db.prepare(
         'UPDATE tabs SET was_interrupted = 1, overlay_dismissed = 0 WHERE tab_id = ?'
       );
-      for (const [tabId] of bridgeKnownSessions) {
+      for (const [tabId] of activeAiSessions) {
         marked += markStmt.run(tabId).changes;
       }
 
       console.log('[Shutdown:will-quit] cleared=' + cleared.changes + ' marked=' + marked +
         ' bridge=' + bridgeKnownSessions.size +
-        ' ids=[' + Array.from(bridgeKnownSessions.keys()).map(k => k.slice(-7)).join(',') + ']');
+        ' codex=' + codexKnownSessions.size +
+        ' ids=[' + formatInterruptedAiSessionIds(activeAiSessions) + ']');
     }
   } catch (e) {
     console.error('[Shutdown] will-quit error:', e.message);
@@ -6813,6 +7142,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
           // Send each slash command separately, waiting for prompt return after each
           for (var ci = 0; ci < slashCommands.length; ci++) {
             console.log('[Handshake:' + tabId + '] Sending slash command ' + (ci + 1) + '/' + slashCommands.length + ': ' + slashCommands[ci]);
+            startClaudeLocalCommandWatcher(tabId, slashCommands[ci], 'handshake');
             await safePasteAndSubmit(term, slashCommands[ci], {
               submit: true,
               ctrlCFirst: ci > 0,
@@ -7210,8 +7540,13 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
         var dataNoOsc = data.replace(OSC_RE, '');
         var contentStripped = stripVTControlCharacters(dataNoOsc);
         var hasContentSpinner = CONTENT_SPINNER_RE.test(contentStripped);
+        var compactOutputPhase = detectClaudeCompactOutputPhase(contentStripped);
 
         if (hasContentSpinner) {
+          if (compactOutputPhase === 'compacting') {
+            startClaudeLocalCommandWatcher(tabId, '/compact', 'pty-output');
+          }
+          claudeSpinnerLastSeenAt.set(tabId, Date.now());
           // Diagnostic: log what triggered spinner when BoundarySM is already idle.
           // PERF (2026-04-21): hot path — this log fires hundreds of times per second
           // per active Claude TUI (~142K log lines per session). Dev-only; enable in
@@ -7240,12 +7575,17 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
               claudeSpinnerIdleTimer.delete(tabId);
               return;
             }
+            if (claudeLocalCommandWatchers.has(tabId)) {
+              console.log('[Spinner] Tab ' + tabId + ': IDLE suppressed (local command ' + claudeLocalCommandWatchers.get(tabId).command + ' active)');
+              claudeSpinnerIdleTimer.delete(tabId);
+              return;
+            }
             claudeSpinnerBusy.set(tabId, false);
             claudeSpinnerIdleTimer.delete(tabId);
             console.log('[Spinner] Tab ' + tabId + ': IDLE');
             recordActivity(tabId, false, 'claude');
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
+              mainWindow.webContents.send('claude:busy-state', { tabId, busy: false, reason: 'spinner' });
             }
             // MCP sub-agent completion (with interceptor state check)
             if (subAgentParentTab.has(tabId) && !claudeState.has(tabId) && !claudePendingPrompt.has(tabId)) {
@@ -7280,8 +7620,11 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
             console.log('[Spinner] Tab ' + tabId + ': BUSY');
             recordActivity(tabId, true, 'claude');
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('claude:busy-state', { tabId, busy: true });
+              mainWindow.webContents.send('claude:busy-state', { tabId, busy: true, reason: 'spinner' });
             }
+          }
+          if (compactOutputPhase === 'compacted' && claudeLocalCommandWatchers.get(tabId)?.command === '/compact') {
+            completeClaudeLocalCommand(tabId, 'pty-output-compacted');
           }
         }
       }
@@ -7301,11 +7644,12 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       // this moment, the in-flight assistant JSONL entry is lost. Surface session state
       // so we can correlate later breaks with this exit point.
       const _diagSid = bridgeKnownSessions.get(tabId) || null;
-      const _diagBusy = claudeTurnBusy.get(tabId) === true || claudeSpinnerBusy.get(tabId) === true;
+      const _diagLocalBusy = claudeLocalCommandWatchers.has(tabId);
+      const _diagBusy = claudeTurnBusy.get(tabId) === true || claudeSpinnerBusy.get(tabId) === true || _diagLocalBusy;
       const _diagSpinBusy = claudeSpinnerBusy.get(tabId) === true;
       const _diagTurnBusy = claudeTurnBusy.get(tabId) === true;
       console.error(`[PTY:EXIT] tabId=${tabId} pid=${ptyProcess.pid} exitCode=${JSON.stringify(exitCode)} cwd=${workingDir} shell=${shell} args=${JSON.stringify(shellArgs)}`);
-      console.error(`[JsonlChainDiag:PtyExit] tabId=${tabId} shellPid=${ptyProcess.pid} sessionId=${_diagSid ? _diagSid.substring(0, 8) : 'none'} spinnerBusy=${_diagSpinBusy} turnBusy=${_diagTurnBusy} ${_diagBusy ? '*** EXITED MID-TURN — likely JSONL chain break next user prompt ***' : '(idle, safe)'}`);
+      console.error(`[JsonlChainDiag:PtyExit] tabId=${tabId} shellPid=${ptyProcess.pid} sessionId=${_diagSid ? _diagSid.substring(0, 8) : 'none'} spinnerBusy=${_diagSpinBusy} turnBusy=${_diagTurnBusy} localBusy=${_diagLocalBusy} ${_diagBusy ? '*** EXITED MID-TURN — likely JSONL chain break next user prompt ***' : '(idle, safe)'}`);
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('terminal:exit', tabId, exitCode);
       }
@@ -7314,10 +7658,11 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       terminalProjectIds.delete(tabId);
       terminalCommandState.delete(tabId);
       terminalInitialCommand.delete(tabId);
-      terminalOutputBuffer.delete(tabId);
-      claudeCliActive.delete(tabId);
-      clearBridgeTab(tabId);
-      claudeAgentManager.cleanup(tabId);
+	      terminalOutputBuffer.delete(tabId);
+	      claudeCliActive.delete(tabId);
+	      clearBridgeTab(tabId);
+	      clearCodexKnownSession(tabId, 'pty-exit');
+	      claudeAgentManager.cleanup(tabId);
       claudeAgentBuffer.delete(tabId);
       claudeAgentArmed.delete(tabId);
       claudeAgentCooldown.delete(tabId);
@@ -7325,8 +7670,10 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       geminiSpinnerBusy.delete(tabId);
       geminiSpinnerIdleTimers.delete(tabId);
       geminiActiveTabs.delete(tabId);
-      geminiInputCharCount.delete(tabId);
-      geminiResponseQueue.delete(tabId);
+	      geminiInputCharCount.delete(tabId);
+	      geminiResponseQueue.delete(tabId);
+	      closeCodexWatcher(tabId);
+	      closeCodexTurnWatcher(tabId, 'pty-exit');
       // Close any open activity interval on PTY death (idempotent — covers
       // whichever engine, claude or gemini, was mid-turn when the shell died).
       recordActivity(tabId, false);
@@ -7337,7 +7684,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       if (claudeSpinnerBusy.get(tabId)) {
         console.log('[Spinner] Tab ' + tabId + ': IDLE (PTY exit cleanup)');
         if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
+          mainWindow.webContents.send('claude:busy-state', { tabId, busy: false, reason: _diagLocalBusy ? 'local-command' : undefined });
         }
       }
       // Notify mobile-web subscribers that the PTY+Claude session for this
@@ -7394,6 +7741,17 @@ const PASTE_END = '\x1b[201~';
 // for the same term on a single promise; second caller waits until first
 // returns. WeakMap key on term (no manual cleanup needed when PTY dies).
 const pasteInflight = new WeakMap();
+
+function withPtyWriteLock(term, work) {
+  const prev = pasteInflight.get(term) || Promise.resolve();
+  const next = prev.catch(() => {}).then(work);
+  pasteInflight.set(term, next);
+  return next.finally(() => {
+    if (pasteInflight.get(term) === next) {
+      pasteInflight.delete(term);
+    }
+  });
+}
 
 // Per-tab paste audit slot. Filled by safePasteAndSubmit right before Enter is
 // sent. Cleared by the UserPromptSubmit hook handler after comparing the actual
@@ -7584,19 +7942,7 @@ async function safePasteAndSubmit(term, content, options = {}) {
     console.log(logPrefix + ' ❌ Terminal not available');
     return { success: false, error: 'terminal not available' };
   }
-  const prev = pasteInflight.get(term) || Promise.resolve();
-  // Swallow prev errors so one failure doesn't poison every subsequent caller.
-  const work = prev.catch(() => {}).then(() => _safePasteAndSubmitInner(term, content, options));
-  pasteInflight.set(term, work);
-  try {
-    return await work;
-  } finally {
-    // Only delete the slot if WE were the last writer — otherwise a newer
-    // caller has already chained on top of us and we'd nuke their entry.
-    if (pasteInflight.get(term) === work) {
-      pasteInflight.delete(term);
-    }
-  }
+  return await withPtyWriteLock(term, () => _safePasteAndSubmitInner(term, content, options));
 }
 
 async function _safePasteAndSubmitInner(term, content, options = {}) {
@@ -7623,7 +7969,11 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   // will happen mid-stream.
   const broadcastTabId = findTabIdForTerm(term);
   const emitBusy = (busy) => {
-    if (!broadcastTabId) return;
+    if (!broadcastTabId) {
+      console.warn(logPrefix + ' [PasteBusy] no-tab busy=' + busy + ' termPid=' + (term && term.pid ? term.pid : 'unknown'));
+      return;
+    }
+    console.log(logPrefix + ' [PasteBusy] emit tab=' + String(broadcastTabId).slice(-12) + ' busy=' + busy + ' termPid=' + (term && term.pid ? term.pid : 'unknown'));
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('claude:paste-busy', { tabId: broadcastTabId, busy });
     }
@@ -7938,6 +8288,8 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
     }
   }
 
+  trackClaudeInputLineForLocalCommands(tabId, data);
+
 // User paste (Cmd+V) — direct passthrough, no chunking needed.
   if (data.length > 1) {
     const endsWithR = data.endsWith('\r');
@@ -8093,8 +8445,9 @@ ipcMain.handle('claude:get-presence', (event, tabId) => {
   // BUSY = "Claude is generating a turn right now", NOT "Claude is alive" and
   // NOT "the glyph-spinner blinked". This status drives the MOBILE COMPOSER's
   // Send↔Stop swap — the button is a TURN/loader control, so busy must be the
-  // AUTHORITATIVE turn signal only: claudeTurnBusy (Stop-hook pipeline,
-  // UserPromptSubmit→true / Stop→false, installed + alive).
+  // AUTHORITATIVE operation signals only: claudeTurnBusy (Stop-hook pipeline,
+  // UserPromptSubmit→true / Stop→false) OR local slash-command brackets that
+  // have their own durable JSONL completion signal (currently /compact).
   //
   // Deliberately EXCLUDES:
   //   - claudeCliActive — process-liveness, true the whole session incl. idle
@@ -8109,7 +8462,7 @@ ipcMain.handle('claude:get-presence', (event, tabId) => {
   // Process-running ("Claude is up in this PTY") is conveyed by the 'active'
   // status + the navbar Stop button (claudeStatus), NOT by this busy flag.
   // See fact-mobile-claude-pty.md::Composer busy = turn, not spinner/alive.
-  const isBusy = !!claudeTurnBusy.get(tabId);
+  const isBusy = !!claudeTurnBusy.get(tabId) || claudeLocalCommandWatchers.has(tabId);
   const hasTerm = terminals.has(tabId);
   const inputReady = claudePromptReady.has(tabId);
   // awaiting = Claude is blocked on an AskUserQuestion (purple "needs answer"
@@ -8250,32 +8603,112 @@ function resolveGrabbedImagePaths(sessionId, text) {
   return resolved;
 }
 
-// Shared by claude:grab-input and claude:copy-input — both fire Ctrl+G after writing
-// a lock-file telling the helper which mode (clear input vs preserve) to run in.
-async function captureClaudeInput(tabId, mode) {
+function commandLooksLikeAiProcess(cmd, expectedName) {
+  const text = String(cmd || '');
+  const tokens = text.split(/\s+/).filter(Boolean);
+  const firstBase = tokens[0] ? path.basename(tokens[0]) : '';
+  const secondBase = tokens[1] ? path.basename(tokens[1]) : '';
+  if (expectedName === 'codex') {
+    return firstBase === 'codex'
+      || text.includes('@openai/codex')
+      || (firstBase === 'node' && secondBase === 'codex');
+  }
+  if (expectedName === 'claude') return firstBase === 'claude' || (firstBase === 'node' && secondBase === 'claude');
+  if (expectedName === 'gemini') return firstBase === 'gemini' || (firstBase === 'node' && secondBase === 'gemini');
+  return !!getAiProcessNameFromCommand(text);
+}
+
+async function findAiDescendantProcessesByTab(tabId, expectedName) {
+  const term = terminals.get(tabId);
+  if (!term) return [];
+  try {
+    const psOut = await execAsync('ps -eo pid,ppid,command', 2000);
+    const children = new Map();
+    for (const line of (psOut || '').split('\n').filter(Boolean)) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+      if (!m) continue;
+      const [, pid, ppid, cmd] = m;
+      if (cmd.includes('Electron') || cmd.includes('electron')) continue;
+      const child = { pid: Number(pid), ppid: Number(ppid), cmd };
+      if (!children.has(child.ppid)) children.set(child.ppid, []);
+      children.get(child.ppid).push(child);
+    }
+
+    const matches = [];
+    const stack = [{ pid: term.pid, depth: 0 }];
+    const seen = new Set();
+    while (stack.length > 0) {
+      const cur = stack.pop();
+      if (!cur || seen.has(cur.pid)) continue;
+      seen.add(cur.pid);
+      const kids = children.get(cur.pid) || [];
+      for (const child of kids) {
+        const depth = cur.depth + 1;
+        if (commandLooksLikeAiProcess(child.cmd, expectedName)) {
+          matches.push({ ...child, depth, processName: expectedName || getAiProcessNameFromCommand(child.cmd) });
+        }
+        stack.push({ pid: child.pid, depth });
+      }
+    }
+    matches.sort((a, b) => b.depth - a.depth || b.pid - a.pid);
+    return matches;
+  } catch (err) {
+    console.warn('[capture-input:' + expectedName + '] ps lookup failed for tab ' + tabId.slice(-12) + ': ' + err.message);
+  }
+  return [];
+}
+
+// Shared by claude/codex grab/copy/restore input operations. All fire Ctrl+G
+// after writing a lock-file telling noted-code-grab.js which mode to run in.
+async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no_terminal' };
 
-  if (!hasLiveClaudeInTab(tabId)) {
-    console.log('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': no active Claude session (bridge/pid)');
-    return { success: false, error: 'no_claude_session' };
+  const logPrefix = agent === 'claude'
+    ? '[capture-input:' + mode + ']'
+    : '[capture-input:' + agent + ':' + mode + ']';
+
+  let cliPid = null;
+  let lockPids = [];
+  if (agent === 'claude') {
+    if (!hasLiveClaudeInTab(tabId)) {
+      console.log(logPrefix + ' Tab ' + tabId.slice(-12) + ': no active Claude session (bridge/pid)');
+      return { success: false, error: 'no_claude_session' };
+    }
+    cliPid = findClaudePidByTab(tabId);
+    if (cliPid) lockPids = [cliPid];
+  } else if (agent === 'codex') {
+    const candidates = await findAiDescendantProcessesByTab(tabId, 'codex');
+    if (candidates.length === 0) {
+      console.log(logPrefix + ' Tab ' + tabId.slice(-12) + ': no active Codex process under shell pid=' + term.pid);
+      return { success: false, error: 'no_codex_session' };
+    }
+    // Codex has a wrapper chain: shell → `node /opt/homebrew/bin/codex` →
+    // vendor binary `.../bin/codex`. Ctrl+G external-editor is spawned by the
+    // vendor binary, so the helper's ppid is the deepest matching descendant,
+    // not the direct child. Write locks for all matched PIDs; helper consumes
+    // only the one matching its actual ppid.
+    cliPid = candidates[0].pid;
+    lockPids = [...new Set(candidates.map(c => c.pid))];
+    console.log(logPrefix + ' Tab ' + tabId.slice(-12) + ': matched codex pids=' + candidates.map(c => c.pid + '@d' + c.depth).join(',') + ' leaf=' + cliPid + ' shellPid=' + term.pid);
+  } else {
+    return { success: false, error: 'unsupported_agent' };
   }
 
-  const claudePid = findClaudePidByTab(tabId);
-  if (claudePid) {
+  if (cliPid) {
     // Verify the cached PID still maps to a live process. If user restarted Claude in shell
     // (Ctrl+C → claude --resume) without going through our Bridge:Fresh path, bridgePidCache
     // holds a dead PID — the lock-file would be written under the dead PID's name and the
-    // live Claude would never find it. Result: silent timeout → "Helper not reachable".
+    // live CLI would never find it. Result: silent timeout → "Helper not reachable".
     let alive = true;
-    try { process.kill(claudePid, 0); } catch (e) { if (e.code === 'ESRCH') alive = false; }
+    try { process.kill(cliPid, 0); } catch (e) { if (e.code === 'ESRCH') alive = false; }
     if (!alive) {
-      console.warn('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': stale claudePid=' + claudePid + ' (process gone) — bridge cache out of sync, asking renderer to restart Claude');
-      return { success: false, error: 'stale_pid', claudePid };
+      console.warn(logPrefix + ' Tab ' + tabId.slice(-12) + ': stale ' + agent + 'Pid=' + cliPid + ' (process gone)');
+      return { success: false, error: 'stale_pid', pid: cliPid };
     }
-    const editor = await readProcessEditor(claudePid);
+    const editor = await readProcessEditor(cliPid);
     if (editor && !editor.includes('noted-code-grab')) {
-      console.warn('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': wrong EDITOR=' + editor + ' — restart Claude in this tab');
+      console.warn(logPrefix + ' Tab ' + tabId.slice(-12) + ': wrong EDITOR=' + editor + ' — restart ' + agent + ' in this tab');
       return { success: false, error: 'wrong_editor', editor };
     }
   }
@@ -8300,16 +8733,28 @@ async function captureClaudeInput(tabId, mode) {
   // the main process that wrote the lock IS the main that triggered Ctrl+G and
   // owns the pending grab. Helper reads `sock` from the lock and connects there
   // unconditionally — same-cwd ambiguity becomes impossible.
-  if (claudePid) {
+  if (lockPids.length > 0) {
     try {
-      fs.writeFileSync('/tmp/noted-grab-' + claudePid + '.json', JSON.stringify({ mode, ts: Date.now(), sock: CLAUDE_HOOK_SOCK }));
+      const payload = JSON.stringify({
+        mode,
+        agent,
+        tabId,
+        ts: Date.now(),
+        sock: CLAUDE_HOOK_SOCK,
+        ...(typeof options.text === 'string' ? { text: options.text } : {}),
+      });
+      for (const pid of lockPids) {
+        fs.writeFileSync('/tmp/noted-grab-' + pid + '.json', payload);
+        grabInputPidToTab.set(pid, tabId);
+      }
+      console.log(logPrefix + ' Tab ' + tabId.slice(-12) + ': wrote locks pids=' + lockPids.join(','));
     } catch (e) {
-      console.warn('[capture-input:' + mode + '] lock write failed:', e.message);
+      console.warn(logPrefix + ' lock write failed:', e.message);
       return { success: false, error: 'lock_write_failed' };
     }
   } else {
-    console.warn('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': no claude PID — cannot write lock');
-    return { success: false, error: 'no_claude_pid' };
+    console.warn(logPrefix + ' Tab ' + tabId.slice(-12) + ': no ' + agent + ' PID — cannot write lock');
+    return { success: false, error: 'no_' + agent + '_pid' };
   }
 
   // Snapshot helper-log size BEFORE sending Ctrl+G. NOTED_GRAB_DEBUG=1 is
@@ -8325,8 +8770,11 @@ async function captureClaudeInput(tabId, mode) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       grabInputPending.delete(tabId);
+      for (const pid of lockPids) grabInputPidToTab.delete(pid);
       // Clean up the lock if helper never ran (e.g. PTY broken)
-      try { fs.unlinkSync('/tmp/noted-grab-' + claudePid + '.json'); } catch {}
+      for (const pid of lockPids) {
+        try { fs.unlinkSync('/tmp/noted-grab-' + pid + '.json'); } catch {}
+      }
       let helperLogSizeAfter = -1;
       let helperLogMtime = '';
       try {
@@ -8337,18 +8785,29 @@ async function captureClaudeInput(tabId, mode) {
       const helperRan = helperLogSizeAfter > helperLogSizeBefore;
       // Classify the failure: helper-log unchanged = Claude TUI ate the Ctrl+G
       // (mid-stream); helper-log grew = helper ran but socket roundtrip failed.
-      const error = helperRan ? 'editor_not_wired' : 'claude_busy';
-      console.warn('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': timeout (3000ms) → ' + error + ' (helperRan=' + helperRan + ' logBefore=' + helperLogSizeBefore + ' logAfter=' + helperLogSizeAfter + ' mtime=' + helperLogMtime + ') turnBusy=' + claudeTurnBusy.get(tabId) + ' spinnerBusy=' + claudeSpinnerBusy.get(tabId) + ' pid=' + claudePid);
+      const error = helperRan ? 'editor_not_wired' : (agent === 'codex' ? 'codex_ctrl_g_noop' : 'claude_busy');
+      console.warn(logPrefix + ' Tab ' + tabId.slice(-12) + ': timeout (3000ms) → ' + error + ' (helperRan=' + helperRan + ' logBefore=' + helperLogSizeBefore + ' logAfter=' + helperLogSizeAfter + ' mtime=' + helperLogMtime + ') turnBusy=' + claudeTurnBusy.get(tabId) + ' spinnerBusy=' + claudeSpinnerBusy.get(tabId) + ' pid=' + cliPid + ' lockPids=' + lockPids.join(','));
       resolve({ success: false, error });
     }, 3000);
-    grabInputPending.set(tabId, { resolve, timer, mode });
-    console.log('[capture-input:' + mode + '] Tab ' + tabId.slice(-12) + ': sending Ctrl+G pid=' + claudePid + ' helperLogBefore=' + helperLogSizeBefore);
+    grabInputPending.set(tabId, { resolve, timer, mode, agent, pid: cliPid, pids: lockPids });
+    console.log(logPrefix + ' Tab ' + tabId.slice(-12) + ': sending Ctrl+G pid=' + cliPid + ' lockPids=' + lockPids.join(',') + ' helperLogBefore=' + helperLogSizeBefore);
     term.write('\x07'); // Ctrl+G → chat:externalEditor
   });
 }
 
+async function captureClaudeInput(tabId, mode) {
+  return captureAgentInput(tabId, mode, 'claude');
+}
+
+async function restoreAgentInput(tabId, text, agent = 'claude') {
+  if (typeof text !== 'string') return { success: false, error: 'invalid_text' };
+  return captureAgentInput(tabId, 'restore', agent, { text });
+}
+
 ipcMain.handle('claude:grab-input', async (event, tabId) => captureClaudeInput(tabId, 'grab'));
 ipcMain.handle('claude:copy-input', async (event, tabId) => captureClaudeInput(tabId, 'copy'));
+ipcMain.handle('codex:grab-input', async (event, tabId) => captureAgentInput(tabId, 'grab', 'codex'));
+ipcMain.handle('codex:copy-input', async (event, tabId) => captureAgentInput(tabId, 'copy', 'codex'));
 
 // Clear current Claude input WITHOUT going through the queue. Same external-editor
 // hijack, but helper truncates the tempfile and exits — no socket callback.
@@ -8394,6 +8853,7 @@ ipcMain.handle('claude:send-command', async (event, tabId, command) => {
       mainWindow.webContents.send('claude:ctrlc-danger-zone', { tabId, active: false });
     }
   }
+  startClaudeLocalCommandWatcher(tabId, command, 'send-command');
   await safePasteAndSubmit(term, command, {
     submit: true,
     stashFirst: true,
@@ -8451,6 +8911,33 @@ ipcMain.handle('claude:append-input', async (event, tabId, text) => {
     logPrefix: '[append-input:' + tabId + ']'
   });
   return result;
+});
+
+// PromptQueue replay for Codex: same UI contract as Claude replay — paste text
+// into Codex input WITHOUT submitting. Hard refusal when there is no live Codex
+// descendant under this PTY, otherwise a queued chip could become a shell command.
+ipcMain.handle('codex:append-input', async (_event, tabId, text) => {
+  console.log('[codex:append-input] 📩 Received: tabId=' + tabId + ' chars=' + (text || '').length + ' ts=' + Date.now());
+  const term = terminals.get(tabId);
+  if (!term) {
+    console.log('[codex:append-input] ❌ Terminal not found for tabId=' + tabId);
+    return { success: false, error: 'no_terminal' };
+  }
+  if (!text || typeof text !== 'string') {
+    return { success: false, error: 'empty_text' };
+  }
+  const candidates = await findAiDescendantProcessesByTab(tabId, 'codex');
+  if (candidates.length === 0) {
+    console.log('[codex:append-input] ❌ No live Codex process under shell pid=' + term.pid + ' tab=' + tabId);
+    return { success: false, error: 'no_codex_session' };
+  }
+  return safePasteAndSubmit(term, text, {
+    submit: false,
+    stashFirst: false,
+    ctrlCFirst: false,
+    fast: true,
+    logPrefix: '[codex:append-input:' + tabId + ']',
+  });
 });
 
 // ========== Soniox temporary API key ==========
@@ -8967,14 +9454,30 @@ ipcMain.on('terminal:resize', (event, tabId, cols, rows) => {
 
 // Kill terminal
 ipcMain.on('terminal:kill', async (event, tabId) => {
+  const startedAt = Date.now();
   const term = terminals.get(tabId);
+  const bridgeSessionId = bridgeKnownSessions.get(tabId) || null;
+  const turnBusyAtKill = claudeTurnBusy.get(tabId) === true;
+  const spinnerBusyAtKill = claudeSpinnerBusy.get(tabId) === true;
+  const localBusyAtKill = claudeLocalCommandWatchers.has(tabId);
+  console.log('[TerminalKill] start tab=' + String(tabId).slice(-12) +
+    ' hasTerm=' + !!term +
+    ' bridge=' + (bridgeSessionId ? bridgeSessionId.slice(0, 8) : 'none') +
+    ' turnBusy=' + turnBusyAtKill +
+    ' spinnerBusy=' + spinnerBusyAtKill +
+    ' localBusy=' + localBusyAtKill);
   if (term) {
     // Graceful Ctrl+C to live claude before SIGHUP via term.kill().
     // Same reasoning as before-quit and terminal:stop-ai-process: term.kill()
     // delivers SIGHUP through the PTY which propagates to children and
     // bypasses Ink TUI, dropping any in-flight JSONL write. \x03 lets Claude
     // flush the current assistant entry first.
-    if (bridgeKnownSessions.has(tabId)) {
+    //
+    // Only wait when a Claude turn is actually active. At idle prompt a single
+    // Ctrl+C opens Claude's danger-zone instead of exiting, so the old logic
+    // burned the full 1200ms on nearly every close-tab despite no JSONL write
+    // being in flight.
+    if (bridgeSessionId && (turnBusyAtKill || localBusyAtKill)) {
       let childPid = null;
       try {
         const psOut = await execAsync('ps -eo pid,ppid,command | grep -E " (claude|gemini)( |$)" | grep -v grep', 1500);
@@ -9007,18 +9510,33 @@ ipcMain.on('terminal:kill', async (event, tabId) => {
           };
           setTimeout(poll, 60);
         });
+      } else {
+        console.log('[TerminalKill:GracefulCtrlC] tabId=' + tabId.slice(-12) +
+          ' busy turn but no direct child found; skipping wait and killing PTY');
       }
+    } else if (bridgeSessionId) {
+        console.log('[TerminalKill:FastClose] tabId=' + tabId.slice(-12) +
+        ' idle Claude bridge=' + bridgeSessionId.slice(0, 8) +
+        ' turnBusy=' + turnBusyAtKill +
+        ' spinnerBusy=' + spinnerBusyAtKill +
+        ' localBusy=' + localBusyAtKill +
+        ' — skip 1200ms Ctrl+C wait');
     }
     term.kill();
     terminals.delete(tabId);
+    console.log('[TerminalKill] term.kill sent tab=' + String(tabId).slice(-12) +
+      ' durMs=' + (Date.now() - startedAt));
   }
   clearBridgeTab(tabId);
+  clearCodexKnownSession(tabId, 'terminal-kill');
   claudeAgentManager.cleanup(tabId);
   claudeAgentBuffer.delete(tabId);
   claudeAgentArmed.delete(tabId);
   geminiActiveTabs.delete(tabId);
   geminiInputCharCount.delete(tabId);
   geminiResponseQueue.delete(tabId);
+  closeCodexWatcher(tabId, 'terminal-kill');
+  closeCodexTurnWatcher(tabId, 'terminal-kill');
   // Close any open activity interval on kill (idempotent, either engine).
   recordActivity(tabId, false);
   // Claude spinner cleanup on kill
@@ -9028,7 +9546,7 @@ ipcMain.on('terminal:kill', async (event, tabId) => {
   if (claudeSpinnerBusy.get(tabId)) {
     console.log('[Spinner] Tab ' + tabId + ': IDLE (terminal kill cleanup)');
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('claude:busy-state', { tabId, busy: false });
+      mainWindow.webContents.send('claude:busy-state', { tabId, busy: false, reason: localBusyAtKill ? 'local-command' : undefined });
     }
   }
   // Same as PTY exit path — make mobile-web subscribers aware that this
@@ -9081,6 +9599,8 @@ ipcMain.on('terminal:kill', async (event, tabId) => {
       }
     }
   }
+  console.log('[TerminalKill] done tab=' + String(tabId).slice(-12) +
+    ' durMs=' + (Date.now() - startedAt));
 });
 
 // ========== CLAUDE AGENT ORCHESTRATION ==========
@@ -9314,17 +9834,28 @@ ipcMain.handle('terminal:getCommandState', async (event, tabId) => {
   // stays false even though Claude is fully alive, and the Run-after overlay
   // (gated on claudeProcessAlive) never shows until the user Stop+continues.
   //
-  // bridgeKnownSessions is the authoritative "CLI alive in this tab, persists
-  // until terminal killed" signal (see comment @ before-quit). If the bridge
-  // knows a live session for this tab, Claude IS running regardless of whether
-  // we captured the OSC B — report alive so the gate is correct.
+  // bridgeKnownSessions is the authoritative Claude "CLI alive in this tab,
+  // persists until terminal killed" signal (see comment @ before-quit). If the
+  // bridge knows a live session for this tab, Claude IS running regardless of
+  // whether we captured the OSC B — report alive so the gate is correct.
+  //
+  // Codex has no Claude-style bridge, so on initial sync we use a narrow
+  // process-tree fallback: if a real codex descendant is still under this PTY,
+  // the prompt queue overlay/process strip should also treat the tab as alive.
+  // This is not a busy signal; it only answers "is the AI process running?".
   const bridgeAlive = bridgeKnownSessions.has(tabId);
   const oscRunning = !!(state && state.isRunning);
+  const codexAlive = !oscRunning && !bridgeAlive
+    ? (await findAiDescendantProcessesByTab(tabId, 'codex')).length > 0
+    : false;
   if (bridgeAlive && !oscRunning) {
     console.warn(`[RunAfterDiag] getCommandState tab=${tabId.slice(-8)} oscRunning=false BUT bridgeAlive=true → reporting isRunning=true (OSC B was missed)`);
   }
+  if (codexAlive && !oscRunning) {
+    console.warn(`[RunAfterDiag] getCommandState tab=${tabId.slice(-8)} oscRunning=false BUT codexAlive=true → reporting isRunning=true (OSC B was missed)`);
+  }
   return {
-    isRunning: oscRunning || bridgeAlive,
+    isRunning: oscRunning || bridgeAlive || codexAlive,
     lastExitCode: state ? state.lastExitCode : 0,
   };
 });
@@ -9488,7 +10019,16 @@ ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup }) =
   // any save here would reinsert rows with was_interrupted=0 from the in-memory
   // tab and clobber before-quit's EARLY-MARK. preserveInterrupted=true makes
   // db.saveTabs never downgrade an on-disk 1 → 0. See fix-interrupted-session-lifecycle.md.
+  const started = Date.now();
   projectManager.saveProjectTabs(projectId, tabs, forceCleanup, _gracefulShutdownInProgress);
+  const durMs = Date.now() - started;
+  if (durMs > 50 || forceCleanup) {
+    console.log('[SaveTabs:Perf] project=' + String(projectId).slice(-12) +
+      ' tabs=' + (Array.isArray(tabs) ? tabs.length : 'unknown') +
+      ' forceCleanup=' + !!forceCleanup +
+      ' shutdown=' + !!_gracefulShutdownInProgress +
+      ' durMs=' + durMs);
+  }
   return { success: true };
 });
 
@@ -9524,12 +10064,26 @@ ipcMain.handle('tab:get-cache-stats', (event, { tabId }) => {
 
 // Synchronous version for beforeunload (pkill-safe)
 ipcMain.on('project:save-tabs-sync', (event, { projectId, tabs, forceCleanup }) => {
+  const started = Date.now();
   projectManager.saveProjectTabs(projectId, tabs, forceCleanup, _gracefulShutdownInProgress);
+  const durMs = Date.now() - started;
+  if (durMs > 50 || forceCleanup) {
+    console.log('[SaveTabs:Perf] sync project=' + String(projectId).slice(-12) +
+      ' tabs=' + (Array.isArray(tabs) ? tabs.length : 'unknown') +
+      ' forceCleanup=' + !!forceCleanup +
+      ' shutdown=' + !!_gracefulShutdownInProgress +
+      ' durMs=' + durMs);
+  }
   event.returnValue = { success: true };
 });
 
 ipcMain.handle('project:save-metadata', (event, { projectId, metadata }) => {
   projectManager.saveProjectMetadata(projectId, metadata);
+  return { success: true };
+});
+
+ipcMain.handle('project:save-tab-groups', (event, { projectId, groups }) => {
+  projectManager.saveProjectTabGroups(projectId, groups);
   return { success: true };
 });
 
@@ -9550,54 +10104,148 @@ ipcMain.handle('project:delete', (event, projectId) => {
 
 // ========== TAB HISTORY ==========
 
-ipcMain.handle('project:archive-tab', (event, { projectId, tab }) => {
-  // Count user messages from JSONL at archive time (write-once)
-  if (tab.claudeSessionId && tab.cwd) {
+const ARCHIVE_MESSAGE_COUNT_DELAY_MS = 1000;
+const ARCHIVE_MESSAGE_COUNT_MAX_BYTES = 256 * 1024 * 1024;
+const ARCHIVE_AUTO_INDEX_DELAY_MS = 5000;
+const ARCHIVE_AUTO_INDEX_MAX_BYTES = 5 * 1024 * 1024;
+
+function formatBytesShort(bytes) {
+  if (!Number.isFinite(bytes)) return 'unknown';
+  if (bytes < 1024) return bytes + 'B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + 'KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + 'MB';
+}
+
+function isCountableUserEntry(entry) {
+  if (!entry || entry.type !== 'user') return false;
+  let rawContent = entry.message?.content;
+  if (Array.isArray(rawContent)) {
+    if (rawContent.some(item => item?.type === 'tool_result')) return false;
+    const textBlock = rawContent.find(item => item?.type === 'text' && item.text);
+    rawContent = textBlock?.text || null;
+  }
+  if (!rawContent || typeof rawContent !== 'string') return false;
+  if (entry.isMeta) return false;
+  if (rawContent.includes('<command-name>') ||
+      rawContent.includes('<system-reminder>') ||
+      rawContent.includes('<task-notification>') ||
+      rawContent.startsWith('[Request interrupted')) return false;
+  return true;
+}
+
+async function countUserMessagesStreaming(filePath) {
+  let count = 0;
+  const input = fs.createReadStream(filePath, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      const text = line.trim();
+      if (!text) continue;
+      if (!text.includes('"type":"user"') && !text.includes('"type": "user"')) continue;
+      try {
+        const entry = JSON.parse(text);
+        if (isCountableUserEntry(entry)) count++;
+      } catch {}
+    }
+  } finally {
+    input.destroy();
+  }
+  return count;
+}
+
+function scheduleArchiveSideEffects(projectId, tab, historyId) {
+  const sessionId = tab?.claudeSessionId || null;
+  const cwd = tab?.cwd || null;
+  if (!sessionId || !cwd || !historyId) return;
+
+  const found = findSessionFile(sessionId, cwd);
+  if (!found?.filePath) {
+    console.log('[Archive:Close] session file not found sid=' + sessionId.slice(0, 8) + ' cwd=' + cwd);
+    return;
+  }
+
+  let stat = null;
+  try { stat = fs.statSync(found.filePath); } catch {}
+  const size = stat?.size || 0;
+  const projectSlug = path.basename(path.dirname(found.filePath));
+  console.log('[Archive:Close] queued side-effects historyId=' + historyId +
+    ' sid=' + sessionId.slice(0, 8) +
+    ' size=' + formatBytesShort(size) +
+    ' countDelayMs=' + ARCHIVE_MESSAGE_COUNT_DELAY_MS +
+    ' autoIndexMax=' + formatBytesShort(ARCHIVE_AUTO_INDEX_MAX_BYTES));
+
+  if (size > ARCHIVE_MESSAGE_COUNT_MAX_BYTES) {
+    console.log('[Archive:Count] skipped sid=' + sessionId.slice(0, 8) +
+      ' size=' + formatBytesShort(size) +
+      ' max=' + formatBytesShort(ARCHIVE_MESSAGE_COUNT_MAX_BYTES));
+  } else {
+    setTimeout(() => {
+      const started = Date.now();
+      countUserMessagesStreaming(found.filePath)
+        .then((count) => {
+          try {
+            projectManager.db.db
+              .prepare('UPDATE tab_history SET message_count = ? WHERE id = ?')
+              .run(count, historyId);
+          } catch (e) {
+            console.warn('[Archive:Count] DB update failed sid=' + sessionId.slice(0, 8) + ': ' + e.message);
+            return;
+          }
+          console.log('[Archive:Count] sid=' + sessionId.slice(0, 8) +
+            ' count=' + count +
+            ' size=' + formatBytesShort(size) +
+            ' durMs=' + (Date.now() - started));
+        })
+        .catch((e) => console.warn('[Archive:Count] failed sid=' + sessionId.slice(0, 8) + ': ' + e.message));
+    }, ARCHIVE_MESSAGE_COUNT_DELAY_MS);
+  }
+
+  if (size > ARCHIVE_AUTO_INDEX_MAX_BYTES) {
+    console.log('[SemanticSearch:AutoIndex] skipped on close sid=' + sessionId.slice(0, 8) +
+      ' size=' + formatBytesShort(size) +
+      ' max=' + formatBytesShort(ARCHIVE_AUTO_INDEX_MAX_BYTES) +
+      ' reason=avoid-close-freeze');
+    return;
+  }
+
+  setTimeout(() => {
+    const started = Date.now();
     try {
-      const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
-      const projectSlug = tab.cwd.replace(/\//g, '-');
-      const sessionPath = path.join(claudeProjectsDir, projectSlug, `${tab.claudeSessionId}.jsonl`);
-      if (fs.existsSync(sessionPath)) {
-        const uuids = parseTimelineUuids(sessionPath);
-        // parseTimelineUuids returns user entries + compact boundaries, count only user entries
-        // by re-parsing and checking types (compact boundaries are few, this is fast)
-        const content = fs.readFileSync(sessionPath, 'utf-8');
-        const recordMap = new Map();
-        for (const line of content.trim().split('\n')) {
-          try { const r = JSON.parse(line); recordMap.set(r.uuid, r); } catch {}
-        }
-        let count = 0;
-        for (const uuid of uuids) {
-          const r = recordMap.get(uuid);
-          if (r && r.type === 'user') count++;
-        }
-        tab.messageCount = count;
-        console.log('[Archive] Message count for', tab.claudeSessionId?.slice(0, 8), ':', count);
-      }
-    } catch (e) {
-      console.warn('[Archive] Could not count messages:', e.message);
-    }
-  }
-  projectManager.db.archiveTab(projectId, tab);
-
-  // Background: index session for semantic search (fire-and-forget)
-  if (tab.claudeSessionId && tab.cwd) {
-    const projectSlug = tab.cwd.replace(/\//g, '-');
-    const sessionPath = path.join(os.homedir(), '.claude', 'projects', projectSlug, `${tab.claudeSessionId}.jsonl`);
-    if (fs.existsSync(sessionPath)) {
       const semanticSearch = require(path.join(srcMainDir, 'ipc', 'semantic-search'));
-      // Fire-and-forget — don't block tab close
-      semanticSearch.indexSessionFile?.(projectManager.db.db, sessionPath, tab.claudeSessionId, projectSlug)
-        ?.then(r => console.log(`[SemanticSearch] Auto-indexed ${tab.claudeSessionId?.slice(0, 8)}: ${r.chunked} chunks`))
-        ?.catch(e => console.error('[SemanticSearch] Auto-index failed:', e.message));
+      semanticSearch.indexSessionFile?.(projectManager.db.db, found.filePath, sessionId, projectSlug)
+        ?.then(r => console.log('[SemanticSearch:AutoIndex] sid=' + sessionId.slice(0, 8) +
+          ' chunks=' + r.chunked +
+          ' skipped=' + !!r.skipped +
+          ' durMs=' + (Date.now() - started)))
+        ?.catch(e => console.error('[SemanticSearch:AutoIndex] failed sid=' + sessionId.slice(0, 8) + ': ' + e.message));
+    } catch (e) {
+      console.error('[SemanticSearch:AutoIndex] setup failed sid=' + sessionId.slice(0, 8) + ': ' + e.message);
     }
-  }
+  }, ARCHIVE_AUTO_INDEX_DELAY_MS);
+}
 
-  return { success: true };
+ipcMain.handle('project:archive-tab', (event, { projectId, tab }) => {
+  const started = Date.now();
+  const historyId = projectManager.db.archiveTab(projectId, tab);
+  const durMs = Date.now() - started;
+  console.log('[Archive:Close] archived historyId=' + historyId +
+    ' project=' + String(projectId).slice(-12) +
+    ' tabName=' + JSON.stringify(tab?.name || '') +
+    ' cmd=' + (tab?.commandType || 'none') +
+    ' sid=' + (tab?.claudeSessionId ? tab.claudeSessionId.slice(0, 8) : 'none') +
+    ' processWasRunning=' + !!tab?.processWasRunning +
+    ' durMs=' + durMs);
+  scheduleArchiveSideEffects(projectId, tab, historyId);
+  return { success: true, historyId };
 });
 
 ipcMain.handle('project:get-tab-history', (event, { projectId }) => {
-  return projectManager.db.getTabHistory(projectId);
+  const started = Date.now();
+  const rows = projectManager.db.getTabHistory(projectId);
+  console.log('[Perf:HomeIPC] history project=' + String(projectId).slice(-12) +
+    ' count=' + (Array.isArray(rows) ? rows.length : 0) +
+    ' durMs=' + (Date.now() - started));
+  return rows;
 });
 
 ipcMain.handle('project:get-tab-history-count', (event, { projectId }) => {
@@ -9636,7 +10284,12 @@ ipcMain.handle('project:add-favorite', (event, { projectId, tab }) => {
 });
 
 ipcMain.handle('project:get-favorites', (event, { projectId }) => {
-  return projectManager.db.getFavorites(projectId);
+  const started = Date.now();
+  const rows = projectManager.db.getFavorites(projectId);
+  console.log('[Perf:HomeIPC] favorites project=' + String(projectId).slice(-12) +
+    ' count=' + (Array.isArray(rows) ? rows.length : 0) +
+    ' durMs=' + (Date.now() - started));
+  return rows;
 });
 
 ipcMain.handle('project:delete-favorite', (event, { id }) => {
@@ -10318,7 +10971,7 @@ function useUIStore_freePortsToggle() {
   try {
     const raw = projectManager?.db?.getAppState?.('freePortsBeforeStart');
     if (raw == null) return false;
-    return raw === '1' || raw === 'true' || raw === true;
+    return raw === '1' || raw === 'true' || raw === true || raw === 1;
   } catch {
     return false;
   }
@@ -10329,25 +10982,36 @@ function useUIStore_freePortsToggle() {
 // Why not Ctrl+C in PTY: TUI state-dependent (dropdown/picker/danger-zone all
 // behave differently), and double Ctrl+C requires guessing prompt text "again
 // to exit". SIGTERM is independent of Ink state — kernel delivers it directly.
+function getAiProcessNameFromCommand(cmd) {
+  const text = String(cmd || '');
+  if (/(^|[\/\s])claude(\s|$)/.test(text)) return 'claude';
+  if (/(^|[\/\s])gemini(\s|$)/.test(text)) return 'gemini';
+  if (/(^|[\/\s])codex(\s|$)/.test(text) || text.includes('@openai/codex')) return 'codex';
+  return null;
+}
+
 ipcMain.handle('terminal:stop-ai-process', async (event, tabId) => {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'tab not found' };
 
-  // BFS one level: find direct claude/gemini child of our shell PID.
+  // BFS one level: find direct claude/gemini/codex child of our shell PID.
   // We do NOT walk deeper — nested shells inside Claude (bash tool, mcp procs)
   // should NOT be killed; killing the parent CLI cascades cleanup naturally.
   let childPid = null;
   let processName = null;
   try {
-    const psOut = await execAsync('ps -eo pid,ppid,command | grep -E " (claude|gemini)( |$)" | grep -v grep', 2000);
+    const psOut = await execAsync('ps -eo pid,ppid,command', 2000);
     for (const line of (psOut || '').split('\n').filter(Boolean)) {
       const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
       if (!m) continue;
       const [, pid, ppid, cmd] = m;
       if (cmd.includes('Electron') || cmd.includes('electron')) continue;
+      const aiName = getAiProcessNameFromCommand(cmd);
+      if (!aiName) continue;
       if (Number(ppid) === term.pid) {
         childPid = Number(pid);
-        processName = cmd.includes('claude') ? 'claude' : 'gemini';
+        processName = aiName;
+        console.log('[StopAI] matched direct child tab=' + tabId + ' pid=' + childPid + ' name=' + processName + ' cmd=' + cmd);
         break;
       }
     }
@@ -10356,19 +11020,40 @@ ipcMain.handle('terminal:stop-ai-process', async (event, tabId) => {
   }
 
   if (!childPid) {
+    console.log('[StopAI] no AI process found for tab ' + tabId + ' shellPid=' + term.pid);
     return { success: false, error: 'no AI process found' };
   }
 
-  const _diagStopSid = bridgeKnownSessions.get(tabId) || null;
+  const _diagStopIdentity = resolveActivityIdentity(tabId, processName);
+	  const _diagStopSid = _diagStopIdentity.sessionId || bridgeKnownSessions.get(tabId) || codexKnownSessions.get(tabId) || null;
   const _diagStopBusy = claudeTurnBusy.get(tabId) === true || claudeSpinnerBusy.get(tabId) === true;
 
   // Hoist stopBusyState (declared further below) up so the Ctrl+C graceful
   // exit path can call it on success without referring to it before init.
-  const stopBusyState = () => {
+	  const stopBusyState = () => {
+	    if (processName === 'codex') {
+	      clearCodexKnownSession(tabId, 'manual-stop');
+	      closeCodexTurnWatcher(tabId, 'manual-stop');
+	      emitCodexBusy(tabId, false, 'manual-stop');
+	      return;
+	    }
+    if (processName === 'gemini') {
+      clearTimeout(geminiSpinnerIdleTimers.get(tabId));
+      geminiSpinnerIdleTimers.delete(tabId);
+      const wasBusy = geminiSpinnerBusy.get(tabId) === true;
+      geminiSpinnerBusy.set(tabId, false);
+      recordActivity(tabId, false, 'gemini');
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        if (wasBusy) console.log('[StopAI] Tab ' + tabId + ': gemini busy-state cleanup → false (manual Stop)');
+        mainWindow.webContents.send('gemini:busy-state', { tabId, busy: false, reason: 'manual-stop' });
+      }
+      return;
+    }
     clearTimeout(claudeSpinnerIdleTimer.get(tabId));
     claudeSpinnerIdleTimer.delete(tabId);
     clearTimeout(claudeTurnWatchdog.get(tabId));
     claudeTurnWatchdog.delete(tabId);
+    claudeSpinnerLastSeenAt.delete(tabId);
     const wasBusy = claudeSpinnerBusy.get(tabId) === true || claudeTurnBusy.get(tabId) === true;
     claudeSpinnerBusy.set(tabId, false);
     claudeTurnBusy.set(tabId, false);
@@ -10474,6 +11159,7 @@ ipcMain.on('terminal:executeCommand', (event, tabId, command) => {
   const term = terminals.get(tabId);
   if (term) {
     console.log('[main] ✅ Terminal found, PID:', term.pid);
+    startClaudeLocalCommandWatcher(tabId, command, 'execute-command');
     term.write(command);
     setTimeout(() => {
       term.write('\r');
@@ -10502,6 +11188,7 @@ ipcMain.handle('terminal:executeCommandAsync', async (event, tabId, command) => 
   console.log('[main] ✅ Terminal found, PID:', term.pid);
 
   // Write command text
+  startClaudeLocalCommandWatcher(tabId, command, 'execute-command-async');
   console.log('[main] 📝 Writing command text...');
   term.write(command);
   console.log('[main] 📝 Command text written at', Date.now() - startTime, 'ms');
@@ -10685,6 +11372,7 @@ require(path.join(srcMainDir, 'ipc', 'semantic-search')).register({ projectManag
 // claude:copy-range, claude:fork-session-file, claude:get-fork-markers,
 // claude:get-timeline, claude:export-clean-session, claude:get-full-history → ipc/claude-data.js
 require(path.join(srcMainDir, 'ipc', 'claude-data')).register({ projectManager, formatToolAction });
+codexDataModule.register();
 
 // semantic-index:watch, semantic-index:rebuild, semantic-index:status → ipc/semantic-index-status.js
 require(path.join(srcMainDir, 'ipc', 'semantic-index-status')).register({ getMainWindow: () => mainWindow });
@@ -10943,6 +11631,621 @@ ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
 
 // Store active Gemini watchers by tabId (so we can close them when tab closes)
 const geminiWatchers = new Map();
+
+// Store active Codex watchers by tabId. Codex writes append-only JSONL under
+// ~/.codex/sessions/YYYY/MM/DD/rollout-...jsonl; the session id is authoritative
+// in the first session_meta payload, not in PTY output.
+const codexWatchers = new Map();
+const codexTurnWatchers = new Map();
+const codexPickerQueue = new Map();
+const CODEX_WATCHER_TTL_MS = 10 * 60 * 1000;
+const CODEX_WATCHER_SCAN_MS = 1000;
+const CODEX_SYNC_MARKER = '\x1b[?2026l';
+
+function closeCodexWatcher(tabId, reason = 'close') {
+  const state = codexWatchers.get(tabId);
+  if (!state) return;
+  try { state.watcher?.close?.(); } catch {}
+  if (state.interval) clearInterval(state.interval);
+  if (state.timeout) clearTimeout(state.timeout);
+  codexWatchers.delete(tabId);
+  console.log('[Codex Watcher] closed for tab:', tabId, 'reason:', reason);
+}
+
+function emitCodexBusy(tabId, busy, reason) {
+  if (!tabId) return;
+  console.log('[CodexTurn] busy tab=' + String(tabId).slice(-12) + ' busy=' + busy + ' reason=' + reason);
+  recordActivity(tabId, busy, 'codex');
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('codex:busy-state', { tabId, busy, reason });
+  }
+}
+
+function closeCodexTurnWatcher(tabId, reason = 'close') {
+  const state = codexTurnWatchers.get(tabId);
+  if (!state) return;
+  try { state.watcher?.close?.(); } catch {}
+  if (state.interval) clearInterval(state.interval);
+  codexTurnWatchers.delete(tabId);
+  if (state.busy) emitCodexBusy(tabId, false, reason);
+  console.log('[CodexTurn] watcher closed tab=' + String(tabId).slice(-12) + ' session=' + (state.sessionId || 'unknown') + ' reason=' + reason);
+}
+
+function codexEventType(record) {
+  if (!record || record.type !== 'event_msg') return null;
+  return record.payload?.type || null;
+}
+
+function processCodexTurnLine(state, line) {
+  const text = String(line || '').trim();
+  if (!text) return;
+  let record;
+  try {
+    record = JSON.parse(text);
+  } catch {
+    return;
+  }
+  const event = codexEventType(record);
+  if (!event) return;
+  if (event === 'task_started') {
+    state.busy = true;
+    console.log('[CodexTurn] event tab=' + String(state.tabId).slice(-12) + ' session=' + state.sessionId + ' event=task_started ts=' + (record.timestamp || 'n/a'));
+    emitCodexBusy(state.tabId, true, 'task_started');
+    return;
+  }
+  if (event === 'task_complete' || event === 'turn_aborted') {
+    state.busy = false;
+    console.log('[CodexTurn] event tab=' + String(state.tabId).slice(-12) + ' session=' + state.sessionId + ' event=' + event + ' ts=' + (record.timestamp || 'n/a'));
+    emitCodexBusy(state.tabId, false, event);
+  }
+}
+
+function processCodexTurnText(state, text) {
+  const combined = (state.partial || '') + String(text || '');
+  const lines = combined.split('\n');
+  state.partial = lines.pop() || '';
+  for (const line of lines) processCodexTurnLine(state, line);
+}
+
+async function scanCodexTurnAppend(tabId, reason = 'scan') {
+  const state = codexTurnWatchers.get(tabId);
+  if (!state) return;
+  if (state.scanning) {
+    state.needsScan = true;
+    return;
+  }
+  state.scanning = true;
+  try {
+    do {
+      state.needsScan = false;
+      let stat;
+      try {
+        stat = await fs.promises.stat(state.filePath);
+      } catch (e) {
+        console.warn('[CodexTurn] stat failed tab=' + String(tabId).slice(-12) + ' reason=' + reason + ' error=' + e.message);
+        return;
+      }
+      if (stat.size < state.offset) state.offset = 0;
+      if (stat.size === state.offset) continue;
+
+      const start = state.offset;
+      const end = stat.size - 1;
+      state.offset = stat.size;
+      const chunk = await new Promise((resolve, reject) => {
+        let out = '';
+        const stream = fs.createReadStream(state.filePath, { start, end, encoding: 'utf8' });
+        stream.on('data', (part) => { out += part; });
+        stream.on('error', reject);
+        stream.on('end', () => resolve(out));
+      });
+      processCodexTurnText(state, chunk);
+    } while (state.needsScan);
+  } finally {
+    state.scanning = false;
+  }
+}
+
+function startCodexTurnWatcher({ tabId, sessionId, filePath }) {
+  if (!tabId || !sessionId || !filePath) return false;
+  const existing = codexTurnWatchers.get(tabId);
+  if (existing?.sessionId === sessionId && existing?.filePath === filePath) return true;
+  closeCodexTurnWatcher(tabId, 'replace');
+
+  let offset = 0;
+  try {
+    offset = fs.statSync(filePath).size;
+  } catch (e) {
+    console.warn('[CodexTurn] cannot start watcher tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' file=' + filePath + ' error=' + e.message);
+    return false;
+  }
+
+  const state = {
+    tabId,
+    sessionId,
+    filePath,
+    offset,
+    partial: '',
+    busy: false,
+    scanning: false,
+    needsScan: false,
+    watcher: null,
+    interval: null,
+  };
+  codexTurnWatchers.set(tabId, state);
+  try {
+    state.watcher = fs.watch(filePath, () => scanCodexTurnAppend(tabId, 'fs.watch'));
+  } catch (e) {
+    console.warn('[CodexTurn] fs.watch failed tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' error=' + e.message);
+  }
+  state.interval = setInterval(() => scanCodexTurnAppend(tabId, 'scan'), CODEX_WATCHER_SCAN_MS);
+  console.log('[CodexTurn] watcher started tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' file=' + filePath + ' offset=' + offset);
+  return true;
+}
+
+function codexSessionIdFromDb(tabId) {
+  if (!tabId || !projectManager?.db?.db) return null;
+  try {
+    const row = projectManager.db.db.prepare('SELECT codex_session_id FROM tabs WHERE tab_id = ? LIMIT 1').get(tabId);
+    return row?.codex_session_id || null;
+  } catch {
+    return null;
+  }
+}
+
+async function ensureCodexTurnWatcher(tabId, sessionId, cwd) {
+  const existing = codexTurnWatchers.get(tabId);
+  if (existing && (!sessionId || existing.sessionId === sessionId)) return true;
+  const resolvedSessionId = sessionId || codexSessionIdFromDb(tabId);
+  if (!resolvedSessionId) {
+    console.warn('[CodexTurn] no session id for watcher tab=' + String(tabId).slice(-12));
+    return false;
+  }
+  try {
+    const found = await codexDataModule._api.findCodexSessionFile(resolvedSessionId, cwd || terminalProjects.get(tabId));
+    if (!found?.filePath) {
+      console.warn('[CodexTurn] session file not found tab=' + String(tabId).slice(-12) + ' session=' + resolvedSessionId);
+      return false;
+    }
+    return startCodexTurnWatcher({ tabId, sessionId: resolvedSessionId, filePath: found.filePath });
+  } catch (e) {
+    console.warn('[CodexTurn] ensure failed tab=' + String(tabId).slice(-12) + ' error=' + e.message);
+    return false;
+  }
+}
+
+function startCodexSessionWatcher(sender, { tabId, cwd, startedAt, sourceSessionId = null }) {
+  closeCodexWatcher(tabId, 'restart');
+  const sessionsDir = path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions');
+  let found = false;
+  let detecting = false;
+  let detectCount = 0;
+  const normalizedCwd = cwd || terminalProjects.get(tabId);
+
+  const detect = async (reason = 'manual') => {
+    if (found || detecting) return;
+    detecting = true;
+    detectCount += 1;
+    try {
+      const hit = await codexDataModule._api.findLatestCodexSession({
+        cwd: normalizedCwd,
+        sinceMs: startedAt || 0,
+        sourceSessionId,
+      });
+	      if (hit?.sessionId && !found) {
+	        found = true;
+	        console.log('[Codex Watcher] session detected:', hit.sessionId, 'tab:', tabId, 'reason:', reason, 'file:', hit.filePath, 'cwd:', hit.cwd || 'n/a', 'cwdMatched:', !!hit.cwdMatched, 'sourceMatched:', !!hit.sourceMatched, 'source:', sourceSessionId || 'n/a');
+	        setCodexKnownSession(tabId, hit.sessionId, 'watcher-detected');
+	        startCodexTurnWatcher({ tabId, sessionId: hit.sessionId, filePath: hit.filePath });
+	        sender.send('codex:session-detected', { tabId, sessionId: hit.sessionId, cwd: hit.cwd || null });
+	        closeCodexWatcher(tabId, 'detected');
+      } else if (detectCount <= 3 || detectCount % 10 === 0) {
+        console.log('[Codex Watcher] miss tab:', tabId, 'reason:', reason, 'attempt:', detectCount, 'cwd:', normalizedCwd, 'since:', startedAt || 0, 'source:', sourceSessionId || 'n/a');
+      }
+    } catch (e) {
+      console.warn('[Codex Watcher] detect failed:', e.message);
+    } finally {
+      detecting = false;
+    }
+  };
+
+  try {
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    const watcher = fs.watch(sessionsDir, { recursive: true }, () => {
+      detect('fs.watch');
+    });
+    const interval = setInterval(() => detect('scan'), CODEX_WATCHER_SCAN_MS);
+    const timeout = setTimeout(() => closeCodexWatcher(tabId, 'ttl'), CODEX_WATCHER_TTL_MS);
+    codexWatchers.set(tabId, { watcher, interval, timeout, cwd: normalizedCwd, startedAt, sourceSessionId });
+    console.log('[Codex Watcher] watching:', sessionsDir, 'tab:', tabId, 'cwd:', normalizedCwd, 'source:', sourceSessionId || 'n/a', 'ttlMs:', CODEX_WATCHER_TTL_MS);
+  } catch (e) {
+    console.warn('[Codex Watcher] fs.watch failed:', e.message);
+    const interval = setInterval(() => detect('scan-no-watch'), CODEX_WATCHER_SCAN_MS);
+    const timeout = setTimeout(() => closeCodexWatcher(tabId, 'ttl-no-watch'), CODEX_WATCHER_TTL_MS);
+    codexWatchers.set(tabId, { watcher: null, interval, timeout, cwd: normalizedCwd, startedAt, sourceSessionId });
+  }
+
+  detect('start');
+}
+
+function shellQuote(value) {
+  return "'" + String(value).replace(/'/g, "'\\''") + "'";
+}
+
+function buildCodexCommand({ command, sessionId, model, effort }) {
+  const parts = ['command', 'codex', '--no-alt-screen', '--dangerously-bypass-approvals-and-sandbox'];
+  if (model) parts.push('--model', shellQuote(model));
+  if (effort) parts.push('-c', shellQuote('model_reasoning_effort="' + effort + '"'));
+  if (command === 'codex-c' && sessionId) parts.push('resume', shellQuote(sessionId));
+  if (command === 'codex-f' && sessionId) parts.push('fork', shellQuote(sessionId));
+  return parts.join(' ');
+}
+
+function cleanCodexTuiFrame(raw) {
+  const spaced = String(raw || '').replace(/\x1b\[(\d*)C/g, (_m, n) => ' '.repeat(parseInt(n, 10) || 1));
+  const normalized = spaced
+    .replace(/\x1b\[\d*[ABD]/g, '')
+    .replace(/\x1b\[\d+;\d+H/g, '\n')
+    .replace(/\x1b\[\?25[hl]/g, '')
+    .replace(/\x1b\[\?2026[hl]/g, '');
+  return stripVTControlCharacters(normalized);
+}
+
+function normalizeCodexPickerValue(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\(current\)/g, '')
+    .replace(/[^\w.-]+/g, ' ')
+    .trim();
+}
+
+function codexCandidateAliases(candidate) {
+  const normalized = normalizeCodexPickerValue(candidate);
+  if (normalized === 'xhigh') return ['xhigh', 'x high', 'x-high', 'extra high', 'extra-high'];
+  if (normalized === 'medium') return ['medium', 'med'];
+  if (normalized === 'minimal') return ['minimal', 'minimum'];
+  return [normalized];
+}
+
+function codexLineContainsCandidate(line, candidate) {
+  const haystack = ' ' + normalizeCodexPickerValue(line) + ' ';
+  const aliases = codexCandidateAliases(candidate);
+  return aliases.some((needle) => {
+    if (!needle) return false;
+    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+    return new RegExp('(^|[^a-z0-9_.-])' + escaped + '($|[^a-z0-9_.-])', 'i').test(haystack);
+  });
+}
+
+function parseCodexNumberedPicker(cleanText, candidates = null) {
+  const lines = String(cleanText || '').split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
+  const items = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const selected = /^[›❯>]\s*/.test(line);
+    const bare = line.replace(/^[›❯>]\s*/, '').trim();
+    const match = bare.match(/^(\d+)\.\s*(.*)$/);
+    if (!match) continue;
+    let rest = match[2].trim();
+    // Codex may render narrow picker rows as:
+    //   2.
+    //   gpt-5.4
+    //   Strong model...
+    // Treat the next non-empty line as the item label in that layout.
+    if (!rest && i + 1 < lines.length) {
+      rest = lines[i + 1].replace(/^[›❯>]\s*/, '').trim();
+    }
+    if (!rest) continue;
+    let value = null;
+    if (Array.isArray(candidates) && candidates.length > 0) {
+      const found = candidates.find(c => codexLineContainsCandidate(rest, c));
+      if (!found) continue;
+      value = found;
+    } else {
+      const valueMatch = rest.match(/^([^\s(]+)/);
+      value = valueMatch ? valueMatch[1] : rest;
+    }
+    items.push({
+      ordinal: Number(match[1]),
+      index: items.length,
+      selected,
+      value,
+      label: rest,
+      line,
+    });
+  }
+  return {
+    items,
+    selectedIndex: items.findIndex(item => item.selected),
+  };
+}
+
+function captureCodexFrame(term, { timeoutMs = 3000, predicate = null, logPrefix = '[Codex:Picker]' } = {}) {
+  return new Promise((resolve) => {
+    let raw = '';
+    let resolved = false;
+    let sub = null;
+    let timer = null;
+    let quietTimer = null;
+    const finish = (timedOut) => {
+      if (resolved) return;
+      resolved = true;
+      if (timer) clearTimeout(timer);
+      if (quietTimer) clearTimeout(quietTimer);
+      try { sub?.dispose?.(); } catch {}
+      const clean = cleanCodexTuiFrame(raw);
+      resolve({ raw, clean, timedOut });
+    };
+    timer = setTimeout(() => {
+      console.log(logPrefix + ' capture timeout (' + timeoutMs + 'ms), raw=' + raw.length + 'B');
+      finish(true);
+    }, timeoutMs);
+    sub = term.onData((data) => {
+      raw += data;
+      if (!predicate) {
+        if (quietTimer) clearTimeout(quietTimer);
+        quietTimer = setTimeout(() => finish(false), 250);
+      }
+      const clean = cleanCodexTuiFrame(raw);
+      if (predicate && predicate(clean, raw)) {
+        finish(false);
+        return;
+      }
+      if (!predicate && raw.includes(CODEX_SYNC_MARKER)) {
+        finish(false);
+      }
+    });
+  });
+}
+
+async function sendCodexKeyAndCapture(term, key, timeoutMs = 2500, logPrefix = '[Codex:Picker]', predicate = null) {
+  const capture = captureCodexFrame(term, { timeoutMs, logPrefix, predicate });
+  term.write(key);
+  return await capture;
+}
+
+async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]', options = {}) {
+  const text = String(command || '').trim();
+  if (!text.startsWith('/')) {
+    return { success: false, error: 'Codex command must start with /' };
+  }
+  const { clearStrategy = 'line' } = options;
+  const t0 = Date.now();
+  // Codex behaves like other Ink-style TUIs here: if text and Enter arrive in
+  // the same raw write, Enter can be interpreted as a newline in the composer.
+  // Use bracketed paste for the short slash command, then wait until the next
+  // PTY frame either echoes the command or closes a synchronized TUI render.
+  // Both are deterministic "Codex has ingested the input" signals; timeout is
+  // only the error path.
+  const inputFrame = captureCodexFrame(term, {
+    timeoutMs: 2500,
+    logPrefix: logPrefix + ':slash-input',
+    predicate: (clean, raw) => clean.includes(text) || raw.includes(CODEX_SYNC_MARKER),
+  });
+  const clearPrefix = clearStrategy === 'line' ? '\x01\x0b' : '';
+  term.write(clearPrefix + PASTE_START + text + PASTE_END);
+  const frame = await inputFrame;
+  if (frame.timedOut) {
+    console.warn(logPrefix + ' slash input frame timed out for ' + JSON.stringify(text) + ' clean=' + JSON.stringify(frame.clean.slice(0, 500)));
+    return { success: false, error: 'Codex slash input frame timed out' };
+  }
+  term.write('\r');
+  console.log(logPrefix + ' sent slash command ' + JSON.stringify(text) + ' after render +' + (Date.now() - t0) + 'ms');
+  return { success: true };
+}
+
+async function moveCodexPickerTo(term, state, targetIndex, logPrefix) {
+  let selectedIndex = state.selectedIndex;
+  if (selectedIndex < 0) selectedIndex = 0;
+  const delta = targetIndex - selectedIndex;
+  if (delta === 0) return { success: true, pressCount: 0 };
+  const key = delta > 0 ? '\x1b[B' : '\x1b[A';
+  const dir = delta > 0 ? 'DOWN' : 'UP';
+  const pressCount = Math.abs(delta);
+  console.log(logPrefix + ' navigate ' + dir + ' x' + pressCount + ' from=' + selectedIndex + ' to=' + targetIndex);
+  for (let i = 0; i < pressCount; i++) {
+    const frame = await sendCodexKeyAndCapture(term, key, 2500, logPrefix + ':' + dir + '#' + (i + 1));
+    if (frame.timedOut) {
+      console.warn(logPrefix + ' navigation frame timed out at step ' + (i + 1) + '/' + pressCount);
+    }
+  }
+  return { success: true, pressCount };
+}
+
+async function selectCodexPickerItem(term, {
+  kind,
+  target,
+  candidates = null,
+  initialFrame,
+  timeoutMs = 3000,
+  confirmPredicate = null,
+  logPrefix = '[Codex:Picker]',
+}) {
+  const state = parseCodexNumberedPicker(initialFrame.clean, candidates);
+  console.log(logPrefix + ' ' + kind + ' items=' + state.items.map(item => (item.selected ? '>' : '') + item.value).join(', ') + ' selected=' + state.selectedIndex + ' target=' + target);
+
+  if (state.items.length === 0) {
+    return { success: false, error: 'No Codex ' + kind + ' options found', clean: initialFrame.clean };
+  }
+  const targetIndex = state.items.findIndex(item => normalizeCodexPickerValue(item.value) === normalizeCodexPickerValue(target));
+  if (targetIndex < 0) {
+    console.warn(logPrefix + ' ' + kind + ' option not found: ' + target + ' clean=' + JSON.stringify(initialFrame.clean.slice(0, 1200)));
+    try { term.write('\x1b'); } catch {}
+    return {
+      success: false,
+      error: 'Codex ' + kind + ' option not found: ' + target,
+      options: state.items.map(item => item.value),
+      clean: initialFrame.clean,
+    };
+  }
+
+  await moveCodexPickerTo(term, state, targetIndex, logPrefix + ':' + kind);
+  const confirmFrame = await sendCodexKeyAndCapture(term, '\r', timeoutMs, logPrefix + ':' + kind + ':confirm', confirmPredicate);
+  return {
+    success: true,
+    selected: state.items[targetIndex].value,
+    frame: confirmFrame,
+    options: state.items.map(item => item.value),
+  };
+}
+
+async function grabCodexDraftForModelSwitch(tabId, logPrefix) {
+  const result = await captureAgentInput(tabId, 'grab', 'codex');
+  if (!result?.success) {
+    console.warn(logPrefix + ' draft grab failed: ' + (result?.error || 'unknown'));
+    return {
+      success: false,
+      error: result?.error || 'draft_probe_failed',
+      text: '',
+      length: 0,
+    };
+  }
+  const text = typeof result.text === 'string' ? result.text : '';
+  console.log(logPrefix + ' draft grab success len=' + text.length + ' hasDraft=' + (text.length > 0) + ' images=' + (result.images || 0));
+  return {
+    success: true,
+    text,
+    length: text.length,
+    images: result.images || 0,
+  };
+}
+
+async function restoreCodexDraftForModelSwitch(tabId, term, text, logPrefix) {
+  if (!text) return { success: true, via: 'empty' };
+  console.log(logPrefix + ' restoring draft via external-editor helper len=' + text.length);
+  const result = await restoreAgentInput(tabId, text, 'codex');
+  if (result?.success) return { success: true, via: 'editor' };
+
+  console.warn(logPrefix + ' editor restore failed: ' + (result?.error || 'unknown') + ' — falling back to bracketed paste');
+  try {
+    const fallback = await _safePasteAndSubmitInner(term, text, {
+      submit: false,
+      ctrlCFirst: false,
+      stashFirst: false,
+      fast: false,
+      logPrefix: logPrefix + ':restore-paste',
+      safetyTimeoutMs: 3000,
+    });
+    return {
+      success: fallback?.success !== false,
+      via: 'paste',
+      error: fallback?.error,
+      editorError: result?.error || 'unknown',
+    };
+  } catch (error) {
+    console.warn(logPrefix + ' paste restore failed: ' + (error?.message || error));
+    return {
+      success: false,
+      via: 'failed',
+      error: error?.message || String(error),
+      editorError: result?.error || 'unknown',
+    };
+  }
+}
+
+async function selectCodexModelEffort(term, { tabId, model, effort }) {
+  const logPrefix = '[Codex:Picker:' + tabId + ']';
+  const t0 = Date.now();
+  console.log(logPrefix + ' start model=' + model + ' effort=' + (effort || 'skip'));
+
+  const draft = await grabCodexDraftForModelSwitch(tabId, logPrefix);
+  if (!draft.success) {
+    return { success: false, error: 'Cannot capture current Codex input: ' + draft.error };
+  }
+  const draftText = draft.text || '';
+  const shouldRestoreDraft = draftText.length > 0;
+  const finish = async (result) => {
+    if (!shouldRestoreDraft) return result;
+    if (!result?.success) {
+      await sendCodexKeyAndCapture(term, '\x1b', 1500, logPrefix + ':cancel-before-restore').catch(() => null);
+    }
+    const restore = await restoreCodexDraftForModelSwitch(tabId, term, draftText, logPrefix);
+    return {
+      ...result,
+      draftRestored: !!restore.success,
+      draftRestoreVia: restore.via,
+      draftRestoreError: restore.error || null,
+      ...(restore.success ? {} : { success: false, error: (result?.error ? result.error + '; ' : '') + 'Codex draft restore failed: ' + (restore.error || restore.editorError || 'unknown') }),
+    };
+  };
+
+  const openCapture = captureCodexFrame(term, {
+    timeoutMs: 6000,
+    logPrefix: logPrefix + ':open',
+    predicate: (clean) => {
+      if (!/Select Model/i.test(clean)) return false;
+      const state = parseCodexNumberedPicker(clean);
+      if (state.items.length < 2) return false;
+      const hasTarget = state.items.some(item => codexLineContainsCandidate(item.label || item.value, model));
+      return hasTarget || state.items.length >= 4;
+    },
+  });
+  const slashResult = await sendCodexSlashCommand(term, '/model', logPrefix + ':open-command', {
+    clearStrategy: 'none',
+  });
+  if (!slashResult.success) return finish(slashResult);
+  const modelFrame = await openCapture;
+  if (modelFrame.timedOut) {
+    console.warn(logPrefix + ' model menu capture timed out. clean=' + JSON.stringify(modelFrame.clean.slice(0, 500)));
+  }
+
+  // xhigh must be checked before high: Codex renders it as "Extra high".
+  const effortCandidates = ['minimal', 'low', 'medium', 'xhigh', 'high'];
+  const effortPredicate = effort
+    ? (clean) => parseCodexNumberedPicker(clean, effortCandidates).items.length > 0
+    : null;
+  const modelResult = await selectCodexPickerItem(term, {
+    kind: 'model',
+    target: model,
+    initialFrame: modelFrame,
+    timeoutMs: 5000,
+    confirmPredicate: effortPredicate,
+    logPrefix,
+  });
+  if (!modelResult.success) return finish(modelResult);
+
+  let effortResult = null;
+  let parsedEffortOptions = [];
+  if (effort) {
+    let effortFrame = modelResult.frame;
+    let effortState = parseCodexNumberedPicker(effortFrame.clean, effortCandidates);
+    if (effortState.items.length === 0) {
+      const lateFrame = await captureCodexFrame(term, {
+        timeoutMs: 2500,
+        logPrefix: logPrefix + ':effort-late',
+        predicate: effortPredicate,
+      });
+      const lateState = parseCodexNumberedPicker(lateFrame.clean, effortCandidates);
+      if (lateState.items.length > 0) {
+        effortFrame = lateFrame;
+        effortState = lateState;
+      }
+    }
+    if (effortState.items.length > 0) {
+      parsedEffortOptions = effortState.items.map(item => item.value);
+      effortResult = await selectCodexPickerItem(term, {
+        kind: 'effort',
+        target: effort,
+        candidates: effortCandidates,
+        initialFrame: effortFrame,
+        timeoutMs: 5000,
+        logPrefix,
+      });
+      if (!effortResult.success) return finish(effortResult);
+    } else {
+      console.log(logPrefix + ' no effort picker after model confirm; clean=' + JSON.stringify(effortFrame.clean.slice(0, 500)));
+    }
+  }
+
+  console.log(logPrefix + ' done in ' + (Date.now() - t0) + 'ms model=' + modelResult.selected + ' effort=' + (effortResult?.selected || 'skipped'));
+  return finish({
+    success: true,
+    model: modelResult.selected,
+    effort: effortResult?.selected || null,
+    modelOptions: modelResult.options,
+    effortOptions: effortResult?.options || parsedEffortOptions,
+    effortSkipped: !!effort && !effortResult,
+  });
+}
 
 // Gemini Sniper Watcher: watch for new session file creation when gemini starts
 // IMPORTANT: Gemini creates session file only AFTER first user message, not at startup!
@@ -11330,6 +12633,90 @@ ipcMain.on('gemini:send-command', (event, tabId, command) => {
   }));
 });
 
+// ========== CODEX INPUT INTERCEPTION ==========
+
+ipcMain.on('codex:close-watcher', (_event, { tabId }) => {
+  closeCodexWatcher(tabId);
+});
+
+ipcMain.on('codex:run-command', (event, { tabId, command, sessionId, cwd, model, effort }) => {
+  const term = terminals.get(tabId);
+  if (!term) {
+    console.error('[Codex Runner] Terminal not found:', tabId);
+    return;
+  }
+
+  const termCwd = cwd || terminalProjects.get(tabId);
+  const startedAt = Date.now();
+  console.log('[Codex Runner] Command:', command, 'tab:', tabId, 'session:', sessionId || 'new', 'cwd:', termCwd);
+
+  if (command === 'codex-c' && sessionId) {
+    closeCodexWatcher(tabId, 'resume-known-session');
+    setCodexKnownSession(tabId, sessionId, 'resume-known-session');
+    event.sender.send('codex:session-detected', { tabId, sessionId });
+    ensureCodexTurnWatcher(tabId, sessionId, termCwd);
+  } else if (command === 'codex-f' && sessionId) {
+    startCodexSessionWatcher(event.sender, { tabId, cwd: termCwd, startedAt, sourceSessionId: sessionId });
+    console.log('[Codex Runner] Fork source session provided; waiting for watcher to capture the new fork session id');
+  } else {
+    startCodexSessionWatcher(event.sender, { tabId, cwd: termCwd, startedAt });
+  }
+
+  const cmdLine = buildCodexCommand({
+    command: command || 'codex',
+    sessionId,
+    model,
+    effort,
+  });
+  term.write(cmdLine + '\r');
+});
+
+ipcMain.handle('codex:send-command', async (_event, tabId, command) => {
+  console.log('[codex:send-command] Received: tabId=' + tabId + ' command="' + command + '"');
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'terminal not found' };
+  const hasTurnWatcher = await ensureCodexTurnWatcher(tabId, null, terminalProjects.get(tabId));
+  if (hasTurnWatcher) emitCodexBusy(tabId, true, 'send-command');
+  try {
+    const result = await safePasteAndSubmit(term, command, {
+      submit: true,
+      ctrlCFirst: false,
+      fast: true,
+      logPrefix: '[codex:send-command:' + tabId + ']',
+    });
+    if (hasTurnWatcher && result && result.success === false) emitCodexBusy(tabId, false, 'send-command-failed');
+    return result;
+  } catch (error) {
+    if (hasTurnWatcher) emitCodexBusy(tabId, false, 'send-command-error');
+    console.error('[codex:send-command] Error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('codex:select-model-effort', async (_event, { tabId, model, effort }) => {
+  console.log('[codex:select-model-effort] Received: tabId=' + tabId + ' model=' + model + ' effort=' + (effort || ''));
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'terminal not found' };
+  if (!model) return { success: false, error: 'model is required' };
+
+  const prev = codexPickerQueue.get(tabId) || Promise.resolve();
+  const next = prev.catch(() => {}).then(async () => {
+    try {
+      return await withPtyWriteLock(term, () => selectCodexModelEffort(term, { tabId, model, effort }));
+    } catch (error) {
+      console.error('[codex:select-model-effort] Error:', error);
+      try { term.write('\x1b'); } catch {}
+      return { success: false, error: error.message };
+    }
+  });
+  codexPickerQueue.set(tabId, next);
+  try {
+    return await next;
+  } finally {
+    if (codexPickerQueue.get(tabId) === next) codexPickerQueue.delete(tabId);
+  }
+});
+
 // ========== GEMINI REWIND (TUI NAVIGATION) ==========
 // Programmatic rewind: open /rewind menu, navigate to target, confirm.
 // Gemini rewind menu:
@@ -11690,6 +13077,28 @@ ipcMain.on('claude:fork-session', async (event, { tabId, existingSessionId, cwd 
 // ========== CLAUDE COMMAND RUNNER (from UI buttons) ========== 
 // This handles claude commands triggered from InfoPanel buttons
 // bypassing the terminal input interception (which only works for keyboard Enter)
+function readClaudeSessionCwdFromFile(filePath) {
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(64 * 1024);
+    const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    const head = buf.toString('utf-8', 0, bytesRead);
+    for (const line of head.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (entry && typeof entry.cwd === 'string' && entry.cwd.trim()) {
+          return entry.cwd;
+        }
+      } catch {}
+    }
+  } catch (e) {
+    console.warn('[Claude Runner] Could not read session cwd from', filePath, e.message);
+  }
+  return null;
+}
+
 ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessionId, prompt, cdTo }) => {
   console.log('[Claude Runner] Command:', command, 'Tab:', tabId, 'Prompt:', prompt ? `${prompt.slice(0, 50)}...` : 'none');
 
@@ -11819,21 +13228,36 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
         }
 
         if (sourcePath && sourceDir) {
+          const sessionCwd = readClaudeSessionCwdFromFile(sourcePath) || cwd;
+          const destProjectSlug = sessionCwd.replace(/\//g, '-');
+          const destDir = path.join(claudeProjectsDir, destProjectSlug);
           const newSessionId = crypto.randomUUID();
-          // Copy to CWD-based directory so claude --resume can find it
-          if (!fs.existsSync(primaryDir)) {
-            fs.mkdirSync(primaryDir, { recursive: true });
+          // Copy to the session-cwd project directory so `cd <sessionCwd> && claude --resume`
+          // uses the same slug Claude stored in the JSONL and does not show the cwd chooser.
+          if (!fs.existsSync(destDir)) {
+            fs.mkdirSync(destDir, { recursive: true });
           }
-          const destPath = path.join(primaryDir, `${newSessionId}.jsonl`);
+          const destPath = path.join(destDir, `${newSessionId}.jsonl`);
 
           // Get Timeline UUIDs snapshot using Backtrace algorithm
           const entryUuids = parseTimelineUuids(sourcePath);
           console.log('[Claude Runner] Timeline entries:', entryUuids.length);
 
           fs.copyFileSync(sourcePath, destPath);
+          const rawLines = fs.readFileSync(destPath, 'utf-8').split('\n');
+          const rewritten = rawLines.map(line => {
+            if (!line.trim()) return line;
+            try {
+              const rec = JSON.parse(line);
+              if (rec.sessionId) rec.sessionId = newSessionId;
+              return JSON.stringify(rec);
+            } catch { return line; }
+          });
+          fs.writeFileSync(destPath, rewritten.join('\n'));
           console.log('[Claude Runner] Copied session file, new ID:', newSessionId);
           console.log('[Claude Runner] From:', sourcePath);
           console.log('[Claude Runner] To:', destPath);
+          console.log('[Claude Runner] Session cwd:', sessionCwd);
 
           // Save fork marker with UUIDs snapshot (always save, even if empty — marks fork at beginning)
           try {
@@ -11846,8 +13270,7 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
           // session_id for the same UUIDs, so we explicitly rebind them.
           try {
             const allUuids = [];
-            const raw = fs.readFileSync(destPath, 'utf-8');
-            for (const line of raw.split('\n')) {
+            for (const line of rewritten) {
               if (!line.trim()) continue;
               try {
                 const r = JSON.parse(line);
@@ -11876,7 +13299,12 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
           // This is for claude-f <uuid> - resuming external session
           // Enable thinking mode detection (will send Tab when '>' prompt appears)
           claudeState.set(tabId, 'WAITING_PROMPT');
-          term.write(`claude --dangerously-skip-permissions --resume ${newSessionId}\r`);
+          let cmdLine = `claude --dangerously-skip-permissions --resume ${newSessionId}`;
+          if (sessionCwd && sessionCwd.trim()) {
+            const safe = sessionCwd.replace(/'/g, "'\\''");
+            cmdLine = `cd '${safe}' && ${cmdLine}`;
+          }
+          term.write(cmdLine + '\r');
           claudeCliActive.set(tabId, true);
           console.log('[Claude Runner] claudeCliActive SET for tab', tabId);
 
