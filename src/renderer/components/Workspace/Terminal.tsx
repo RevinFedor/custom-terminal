@@ -470,7 +470,14 @@ async function finalizeAiLaunchSnapshot(tabId: string) {
 
   const channel = snapshot.sessionType === 'claude' ? 'claude:get-timeline' : 'codex:get-timeline';
   try {
-    const result = await ipcRenderer.invoke(channel, { sessionId: tabInfo.sessionId, cwd: tabInfo.cwd });
+    const result = await ipcRenderer.invoke(channel, {
+      sessionId: tabInfo.sessionId,
+      cwd: tabInfo.cwd,
+      source: 'Terminal.finalizeAiLaunchSnapshot',
+      reason: 'ai-launch-finalize',
+      tabId,
+      visible: null,
+    });
     const entries = Array.isArray(result?.entries) ? result.entries.length : -1;
     console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=' + snapshot.sessionType + ' sid=' + tabInfo.sessionId.slice(0, 8) + ' success=' + !!result?.success + ' entries=' + entries + (result?.error ? ' error=' + result.error : ''));
     if (result?.success && entries === 0) {

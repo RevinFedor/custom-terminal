@@ -46,6 +46,12 @@ Prompt Queue / Run after использует тот же high-level слой: `
 
 Граница `Escape`: приложение не считает raw `Escape`/`Ctrl+C` Codex-сигналом само по себе. Для Codex авторитетен только rollout JSONL: если после вмешательства появился `turn_aborted`, loader гасится и Run after disarm'ится. Claude-style fallback «нажали Escape → через короткую idle-проверку принудительно busy=false» пока не переносить на Codex без реального симптома, иначе можно получить ложный обрыв long-running turn'а.
 
+### OSC 133 D→B debounce внутри Codex TUI
+
+У Codex есть дополнительный shell-layer шум: PTY shell может эмитить OSC 133 `D` (`terminal:command-finished`) на короткой внутренней границе, а затем почти сразу приходит `B` и Codex продолжает тот же TUI lifecycle. Если на первый `D` сразу делать общий command-finished cleanup, приложение преждевременно чистит `codexKnownSessions`, закрывает turn watcher и гасит process state; пользователь видит микрофлап loader'а или Continue-state при живом Codex.
+
+Для Codex-tab `parseOSC133AndEmit` задерживает `terminal:command-finished` на 250ms. Если за это окно приходит `B`, timer отменяется и логируется `[CodexTurn] suppress command-finished ... reason=osc-d-followed-by-b`. Если `B` не пришёл и `terminalCommandState` всё ещё idle — delayed cleanup выполняется. Это не заменяет rollout JSONL busy: `task_started/task_complete/turn_aborted` остаются источником turn-loader'а; debounce защищает только shell lifecycle cleanup.
+
 ## Модели и effort
 
 Список моделей нужно брать из live `codex debug models`. Bundled catalog используется только fallback'ом: он может содержать hidden/internal/upgrade-only rows, которые интерактивный `/model` picker не примет. UI синхронизирует свои варианты обратно из реально распарсенного picker'а, потому что именно TUI является финальным источником «какие строки доступны этому аккаунту сейчас».

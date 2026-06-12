@@ -45,6 +45,14 @@ localStorage ключ `noted-terminal-process-bar`, дефолт `colorA: #155E7
 
 Один overlay (`.tab-process-bar-ai-shimmer-overlay`), никаких secondary-инстансов. Если в будущем нужно убавить общий glow — снижать `shimmerOpacityPct`, не менять geometry.
 
+## Renderer-only grace для Claude spinner false
+
+Claude PTY spinner остаётся эвристикой: main эмитит `claude:busy-state {busy:false, reason:'spinner'}` после паузы между glyph-кадрами, даже если настоящий turn ещё bracket'ится Stop hook'ом. На длинных `/compact` и thinking phases это может визуально пересоздавать process-bar shimmer каждые 2-4 секунды — пользователь видит «дёргается loader», хотя RunAfter уже не стреляет.
+
+В `App.tsx` и `TabBar.tsx` только для `reason:'spinner'` busy:false применяется 300ms visual idle grace. Если за это окно приходит новый busy:true — pending false отменяется, shimmer DOM не размонтируется и анимация выглядит непрерывной. Любые другие false (`interrupt`, `manual-stop`, `watchdog`, `local-command`, natural Stop) применяются сразу: они несут смысловое завершение, и задерживать их опасно.
+
+Граница принципиальная: grace существует **только в renderer presentation state** (`busyTabs` / tab busy map). PromptQueueRunner слушает raw IPC и игнорирует `spinner` как non-turn signal; он не должен читать сглаженное визуальное состояние. См. `fact-prompt-queue.md::Auto-run стреляет ТОЛЬКО на штатный конец turn'а` и `methodology/переносимый-дизайн.md::Один сигнал состояния — все его поверхности`.
+
 ## CSS-var bridge (live-tunable анимация)
 
 `App.tsx` синхронизирует на `document.documentElement.style`:

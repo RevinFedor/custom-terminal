@@ -29,6 +29,8 @@ import { useMirrorStatusStore } from './store/useMirrorStatusStore';
 
 const { ipcRenderer } = window.require('electron');
 
+const CLAUDE_SPINNER_VISUAL_IDLE_GRACE_MS = 300;
+
 function hexToRgbTriplet(hex: string, fallback = '255, 255, 255') {
   const v = (hex || '').trim().replace(/^#/, '');
   if (!/^[0-9a-fA-F]{6}$/.test(v)) return fallback;
@@ -549,6 +551,7 @@ function App() {
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map()); // tabId -> isRunning
   const [busyTabs, setBusyTabs] = useState<Map<string, boolean>>(new Map()); // tabId -> isBusy (Claude/Gemini thinking)
   const [pasteBusyTabs, setPasteBusyTabs] = useState<Map<string, boolean>>(new Map()); // tabId -> safePasteAndSubmit in flight
+  const claudeSpinnerVisualIdleTimersRef = useRef<Map<string, number>>(new Map());
   // tabId -> awaiting (Claude blocked on AskUserQuestion, waiting for human answer).
   // Feeds the project-tab purple glow. Bracketed by claude:awaiting-input (main.js).
   const [awaitingTabs, setAwaitingTabs] = useState<Map<string, boolean>>(new Map());
@@ -943,16 +946,39 @@ function App() {
       state.setClaudeActive(data.tabId, data.active);
     };
 
-    // Claude CLI spinner busy/idle → track on sub-agent tab + project badge
-    const handleClaudeBusyState = (_: any, data: { tabId: string; busy: boolean }) => {
-      console.warn('[App:BusyState] tabId=' + data.tabId.slice(-8) + ' busy=' + data.busy);
+    const applyClaudeVisualBusy = (tabId: string, busy: boolean) => {
       const state = useWorkspaceStore.getState();
-      state.setClaudeBusy(data.tabId, data.busy);
-      state.setAiBusy(data.tabId, data.busy);
-      setBusyTabs(prev => { const n = new Map(prev); if (data.busy) n.set(data.tabId, true); else n.delete(data.tabId); return n; });
+      state.setClaudeBusy(tabId, busy);
+      state.setAiBusy(tabId, busy);
+      setBusyTabs(prev => { const n = new Map(prev); if (busy) n.set(tabId, true); else n.delete(tabId); return n; });
+    };
+
+    // Claude CLI spinner busy/idle → track on sub-agent tab + project badge.
+    // reason:'spinner' is a PTY-frame heuristic. Delay its false edge so the
+    // visual shimmer is not unmounted during 30-90ms gaps between spinner frames;
+    // RunAfter still consumes the raw IPC edge and ignores it separately.
+    const handleClaudeBusyState = (_: any, data: { tabId: string; busy: boolean; reason?: string }) => {
+      console.warn('[App:BusyState] tabId=' + data.tabId.slice(-8) + ' busy=' + data.busy + (data.reason ? ' reason=' + data.reason : ''));
+      const timers = claudeSpinnerVisualIdleTimersRef.current;
+      const pendingTimer = timers.get(data.tabId);
+      if (pendingTimer !== undefined) {
+        window.clearTimeout(pendingTimer);
+        timers.delete(data.tabId);
+      }
+
+      if (!data.busy && data.reason === 'spinner') {
+        const timer = window.setTimeout(() => {
+          timers.delete(data.tabId);
+          applyClaudeVisualBusy(data.tabId, false);
+        }, CLAUDE_SPINNER_VISUAL_IDLE_GRACE_MS);
+        timers.set(data.tabId, timer);
+        return;
+      }
+
+      applyClaudeVisualBusy(data.tabId, data.busy);
       // Safety net for awaiting ⊆ busy: any turn-end clears a lingering awaiting flag
       // (user pressed Esc to cancel the whole turn instead of answering the question).
-      if (!data.busy) {
+      if (!data.busy && data.reason !== 'spinner') {
         setAwaitingTabs(prev => { if (!prev.get(data.tabId)) return prev; const n = new Map(prev); n.delete(data.tabId); return n; });
       }
     };
@@ -1816,6 +1842,8 @@ function App() {
       ipcRenderer.removeListener('mcp:respawn-sub-agent-pty', handleRespawnSubAgentPty);
       ipcRenderer.removeListener('gemini:auto-spawn', handleGeminiAutoSpawn);
       ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
+      claudeSpinnerVisualIdleTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+      claudeSpinnerVisualIdleTimersRef.current.clear();
       ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
       ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
       ipcRenderer.removeListener('claude:awaiting-input', handleAwaitingInput);

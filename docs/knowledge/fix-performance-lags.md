@@ -257,6 +257,12 @@ parts.push(`${tab.id}:${tab.tabType || 'terminal'}`);
 | `[DB:ForkCache] stats hit=X miss=Y` | hit:miss ≥ 100:1 | низкий ratio = cache invalidation слишком агрессивная или вызовы с разными sessionId |
 | `[Spinner:DIAG]` | 0 в prod | если появилось в `~/Library/Logs/...` — gate за `isDev` сломан |
 | `[Terminal:StateTransition]` | один на реальное изменение состояния | rate-limit ref-diff; если каждый рендер — диф сломан |
+| `[Perf:MainLoop] maxMs=N elu=X` | не появляется или короткие spikes | main process event-loop заблокирован (sync IO, тяжёлый ps/JSONL parse, IPC handler) |
+| `[Perf:EventLoopLag] source=raf/timer` | не появляется в обычном клике | renderer event-loop freeze; если есть без `[Perf:MainLoop]`, ищи React/render/layout, не main IPC |
+| `[Perf:Input]` / `[Perf:EventTiming]` | inputDelay <50ms, handler <50ms | клик доходит поздно или handler/presentation задержан; полезно для «кликаю Home и ничего» |
+| `[Perf:HomeStatusSync]` | item <50ms, done быстро | `terminal:getCommandState` / Codex ps fallback тормозит Active-card status |
+| `[Perf:GetCommandState]` + `[Perf:ProcessTreeLookup]` | редко >50ms | shell OSC state missing → fallback `ps -eo pid,ppid,command` дорогой или часто вызывается |
+| `[Perf:TimelineLoad]` + `[Perf:TimelineIPC]` | poll не мешает interaction | Timeline reload/backtrace/filter/latest ест кадры; сравни renderer durMs и main breakdown |
 
 ### Команды для быстрой диагностики
 ```bash
@@ -269,6 +275,10 @@ grep -E "Perf:(Project|Tab)Switch" ~/Library/Logs/noted-terminal/production.log 
 
 # Cache не работает?
 grep "DB:ForkCache" ~/Library/Logs/noted-terminal/production.log | tail -3
+
+# Home/Timeline freeze: где стоит время?
+grep -E "Perf:(Home|ProjectView|TabSwitch|GetCommandState|ProcessTreeLookup|Timeline|EventLoopLag|Input|MainLoop)" \
+  ~/Library/Logs/noted-terminal/production.log | tail -80
 ```
 
 ---

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo, startTransition } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect, startTransition } from 'react';
 import { useWorkspaceStore, TabColor, TabType, PendingAction } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Tooltip from '../UI/Tooltip';
@@ -186,6 +186,7 @@ const TAB_COLORS: Record<TabColor, { bgColor: string; borderColor: string }> = {
 };
 
 export default function ProjectHome({ projectId }: ProjectHomeProps) {
+  const renderStartedAt = performance.now();
   const switchTab = useWorkspaceStore((state) => state.switchTab);
   const createTab = useWorkspaceStore((state) => state.createTab);
   const closeTab = useWorkspaceStore((state) => state.closeTab);
@@ -233,6 +234,16 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const [favorites, setFavorites] = useState<FavoriteEntry[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
   const historyLoadProjectRef = useRef<string | null>(null);
+  const renderSeqRef = useRef(0);
+  const pendingReadyRef = useRef<{
+    id: number;
+    readyAt: number;
+    firstLoad: boolean;
+    tabs: number;
+    history: number;
+    favorites: number;
+  } | null>(null);
+  const loadSeqRef = useRef(0);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set(['This Month', 'Older']));
   // OSC 133 event-driven process status — mirror of TabBar's subscription. Used
   // to render the same green/red status dot on Active cards that the real
@@ -445,6 +456,41 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     };
   }, [projectId]);
 
+  useLayoutEffect(() => {
+    renderSeqRef.current += 1;
+    const renderToLayoutMs = performance.now() - renderStartedAt;
+    if (renderToLayoutMs > 50) {
+      console.warn(
+        `[Perf:HomeRender] project=${projectId.slice(-12)} seq=${renderSeqRef.current}` +
+        ` loaded=${isLoaded} tabs=${tabs.length} history=${history.length} favorites=${favorites.length}` +
+        ` renderToLayoutMs=${renderToLayoutMs.toFixed(1)}`
+      );
+    }
+  });
+
+  useEffect(() => {
+    if (!isLoaded || !pendingReadyRef.current) return;
+    const pending = pendingReadyRef.current;
+    requestAnimationFrame(() => {
+      if (pendingReadyRef.current?.id !== pending.id) return;
+      const groups = groupByTime(history);
+      let visibleHistory = 0;
+      const groupParts: string[] = [];
+      groups.forEach((entries, group) => {
+        const collapsed = group !== 'Recent' && group !== 'This Week' && collapsedGroups.has(group);
+        if (!collapsed) visibleHistory += entries.length;
+        groupParts.push(group.replace(/\s+/g, '') + ':' + entries.length + (collapsed ? ':closed' : ':open'));
+      });
+      console.warn(
+        `[Perf:HomeCommit] project=${projectId.slice(-12)} loadId=${pending.id}` +
+        ` firstLoad=${pending.firstLoad} readyToFrameMs=${(performance.now() - pending.readyAt).toFixed(1)}` +
+        ` tabs=${pending.tabs} history=${pending.history} favorites=${pending.favorites}` +
+        ` visibleHistory=${visibleHistory} groups=${groupParts.join(',')}`
+      );
+      pendingReadyRef.current = null;
+    });
+  }, [isLoaded, history, favorites, tabs.length, projectId, collapsedGroups]);
+
   // Restore a closed tab from history
   const restoreTab = async (entry: TabHistoryEntry) => {
     let pendingAction: PendingAction | undefined;
@@ -554,18 +600,45 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     }
     const tabIdSet = new Set(tabIds);
     let cancelled = false;
+    const syncStartedAt = performance.now();
+    const tabSummary = tabIds.map((tabId) => {
+      const tab = workspace?.tabs.get(tabId);
+      return tabId.slice(-8) + ':' + (tab?.commandType || tab?.tabType || 'unknown');
+    }).join(',');
+    console.warn(
+      `[Perf:HomeStatusSync] start project=${projectId.slice(-12)}` +
+      ` count=${tabIds.length} tabs=${tabSummary}`
+    );
 
     Promise.all(
       tabIds.map(async (tabId) => {
+        const itemStartedAt = performance.now();
         try {
           const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+          const durMs = performance.now() - itemStartedAt;
+          if (durMs > 50) {
+            console.warn(
+              `[Perf:HomeStatusSync] item project=${projectId.slice(-12)}` +
+              ` tab=${tabId.slice(-8)} running=${!!state?.isRunning} durMs=${durMs.toFixed(1)}`
+            );
+          }
           return [tabId, !!state?.isRunning] as [string, boolean];
         } catch {
+          const durMs = performance.now() - itemStartedAt;
+          console.warn(
+            `[Perf:HomeStatusSync] item-error project=${projectId.slice(-12)}` +
+            ` tab=${tabId.slice(-8)} durMs=${durMs.toFixed(1)}`
+          );
           return [tabId, false] as [string, boolean];
         }
       })
     ).then((pairs) => {
       if (cancelled) return;
+      console.warn(
+        `[Perf:HomeStatusSync] done project=${projectId.slice(-12)}` +
+        ` count=${pairs.length} durMs=${(performance.now() - syncStartedAt).toFixed(1)}` +
+        ` running=${pairs.filter(([, running]) => running).length}`
+      );
       setProcessStatus(new Map(pairs));
     });
 
@@ -602,6 +675,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   useEffect(() => {
     if (!projectId) return;
     let cancelled = false;
+    const loadId = ++loadSeqRef.current;
     const startedAt = performance.now();
     const firstLoadForProject = historyLoadProjectRef.current !== projectId;
     historyLoadProjectRef.current = projectId;
@@ -617,10 +691,18 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       const favoriteRows = f || [];
       const ipcMs = performance.now() - startedAt;
       console.warn(
-        `[Perf:Home] ready project=${projectId.slice(-12)} firstLoad=${firstLoadForProject}` +
+        `[Perf:Home] ready project=${projectId.slice(-12)} loadId=${loadId} firstLoad=${firstLoadForProject}` +
         ` tabs=${tabs.length} history=${historyRows.length} favorites=${favoriteRows.length}` +
         ` ipcMs=${ipcMs.toFixed(1)}`
       );
+      pendingReadyRef.current = {
+        id: loadId,
+        readyAt: performance.now(),
+        firstLoad: firstLoadForProject,
+        tabs: tabs.length,
+        history: historyRows.length,
+        favorites: favoriteRows.length,
+      };
       startTransition(() => {
         setHistory(historyRows);
         setFavorites(favoriteRows);
@@ -631,9 +713,17 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       if (cancelled) return;
       const ipcMs = performance.now() - startedAt;
       console.warn(
-        `[Perf:Home] ready project=${projectId.slice(-12)} firstLoad=${firstLoadForProject}` +
+        `[Perf:Home] ready project=${projectId.slice(-12)} loadId=${loadId} firstLoad=${firstLoadForProject}` +
         ` tabs=${tabs.length} history=0 favorites=0 ipcMs=${ipcMs.toFixed(1)} error=true`
       );
+      pendingReadyRef.current = {
+        id: loadId,
+        readyAt: performance.now(),
+        firstLoad: firstLoadForProject,
+        tabs: tabs.length,
+        history: 0,
+        favorites: 0,
+      };
       startTransition(() => {
         setHistory([]);
         setFavorites([]);
@@ -738,6 +828,13 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   }
 
   const handleTabClick = (tabId: string) => {
+    const activeBefore = workspace?.activeTabId;
+    console.warn(
+      `[Perf:HomeAction] active-tab-click project=${projectId.slice(-12)}` +
+      ` tab=${tabId.slice(-12)} activeBefore=${String(activeBefore).slice(-12)}` +
+      ` sameActive=${activeBefore === tabId ? '1' : '0'}` +
+      ` tabs=${tabs.length} history=${history.length} favorites=${favorites.length}`
+    );
     switchTab(projectId, tabId);
     setProjectView(projectId, 'terminal');
   };

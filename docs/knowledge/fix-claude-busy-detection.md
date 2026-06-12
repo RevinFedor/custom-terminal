@@ -88,6 +88,17 @@ if (reason === 'manual-stop') return;  // skip auto-run / stop-after
 
 `claudeHookLastEvent.set(tabId, {event: 'ManualStop', ...})` обязателен **независимо** от `wasBusy`. Без записи `system:dump-claude-state` показывал бы stale `UserPromptSubmit` часами после ручного Stop'а, и любой будущий debug подумал бы что Stop hook молча уронился (см. `fix-claude-hook-silent-dropouts.md::Observability`). Сам по себе факт пользовательского Stop'а полезен для диагностики, не только когда был busy.
 
+### Local-command watcher тоже входит в busy cleanup (compact-cancel)
+
+После добавления `/compact` watcher'а появился третий busy-source рядом с `claudeTurnBusy` и `claudeSpinnerBusy`: `claudeLocalCommandWatchers.has(tabId)`. Он bracket'ит локальную slash-команду Claude через `reason:'local-command'`, но не является model-turn'ом и не обязан завершаться Stop hook'ом. Симптом в проде: юзер нажимает Escape, compact отменяется, RunAfter больше не стреляет лишний раз, но вертикальная process-bar полоска на вкладке и project badge продолжают анимироваться.
+
+Cleanup paths теперь учитывают `wasLocalBusy`:
+- pure `Escape` / `Ctrl+C` в `terminal:input` вызывает `cancelClaudeLocalCommandFromInput()` и завершает watcher;
+- `terminal:stop-ai-process` вызывает `stopClaudeLocalCommandWatcher(tabId, 'manual-stop')`, а `wasBusy` считает local watcher как busy;
+- `clearBridgeTab`, PTY `onExit` и `terminal:kill` перед удалением state эмитят `claude:busy-state busy:false` с `reason:'local-command'`, если watcher был активен.
+
+Граница с `reason:'interrupt'`: local-command cancel **не** disarm'ит Prompt Queue. Это не прерванный assistant turn, а завершение/отмена inline slash-команды (`/compact`), поэтому runner игнорирует edge как non-turn signal. См. `fact-prompt-queue.md::Auto-run стреляет ТОЛЬКО на штатный конец turn'а`.
+
 ### Что НЕ покрывает
 SDK таб'ы. SDK не использует `terminal:stop-ai-process` (нет PTY) — там cleanup идёт через `claude-sdk:stop` IPC, который закрывает AbortController и `query.close()`. Сам ClaudeSDKTab компонент шлёт `claude-sdk:busy-state {busy:false}` через `useEffect([isRunning])` в `:done` обработчике iterator'а. Если SDK таб не visible (другая project / unmount) в момент Stop'а — busy-state может не отправиться (effect не запускается на unmount'ed компоненте). Это **отдельная latent проблема**, не покрытая текущим фиксом.
 
