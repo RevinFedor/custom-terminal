@@ -21,6 +21,7 @@ class DatabaseManager {
     this.ensureRewindPrompt();
     this.ensureAdoptPrompt();
     this.ensureTabTitlePrompt();
+    this.ensureRunAfterTitlePrompt();
   }
 
   initTables() {
@@ -255,18 +256,6 @@ class DatabaseManager {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
         updated_at INTEGER DEFAULT (strftime('%s', 'now'))
-      )
-    `);
-
-    // Bookmarks table
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS bookmarks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        path TEXT UNIQUE NOT NULL,
-        name TEXT NOT NULL,
-        description TEXT DEFAULT '',
-        position INTEGER DEFAULT 0,
-        created_at INTEGER DEFAULT (strftime('%s', 'now'))
       )
     `);
 
@@ -732,25 +721,6 @@ class DatabaseManager {
     return this.getProjectById(projectId);
   }
 
-  createProjectInstance(projectPath, customName = null) {
-    const normalizedPath = path.resolve(projectPath);
-    const folderName = path.basename(normalizedPath);
-    const projectId = `${Buffer.from(normalizedPath).toString('base64').substring(0, 20)}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
-
-    let projectName = customName;
-    if (!projectName) {
-      const existingCount = this.db.prepare('SELECT COUNT(*) as count FROM projects WHERE path = ?').get(normalizedPath).count;
-      projectName = existingCount > 0 ? `${folderName}-${existingCount + 1}` : folderName;
-    }
-
-    this.db.prepare(`
-      INSERT INTO projects (id, path, name, description, gemini_prompt, notes_global)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(projectId, normalizedPath, projectName, '', 'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ', `<h1>${projectName}</h1>`);
-
-    return this.getProjectById(projectId);
-  }
-
   createEmptyProject(name = 'Новый проект') {
     const projectId = `new_project_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     // Unique placeholder path — legacy prod DBs have UNIQUE constraint on projects.path,
@@ -992,10 +962,15 @@ class DatabaseManager {
     return row;
   }
 
-  getTabHistory(projectId, limit = 200) {
+  getTabHistory(projectId, limit = 0) {
+    if (limit && limit > 0) {
+      return this.db.prepare(
+        'SELECT * FROM tab_history WHERE project_id = ? ORDER BY closed_at DESC, id DESC LIMIT ?'
+      ).all(projectId, limit);
+    }
     return this.db.prepare(
-      'SELECT * FROM tab_history WHERE project_id = ? ORDER BY closed_at DESC LIMIT ?'
-    ).all(projectId, limit);
+      'SELECT * FROM tab_history WHERE project_id = ? ORDER BY closed_at DESC, id DESC'
+    ).all(projectId);
   }
 
   getTabHistoryCount(projectId) {
@@ -1244,6 +1219,17 @@ class DatabaseManager {
         is_built_in: 1,
         show_in_context_menu: 0,
         position: 5
+      },
+      {
+        id: 'run-after-title',
+        name: 'Run After Title',
+        content: 'На основе текста задачи Run after придумай короткое название задачи. Верни только название: 2-7 слов, без кавычек, без точки, без markdown, без пояснений. Если текст на русском — название тоже на русском; если на английском — на английском.',
+        model: 'gemini-3.1-flash-lite',
+        thinking_level: 'NONE',
+        color: '#DA7756',
+        is_built_in: 1,
+        show_in_context_menu: 0,
+        position: 6
       }
     ];
 
@@ -1320,6 +1306,29 @@ class DatabaseManager {
     }
   }
 
+  // Ensure built-in prompt for Run-after task naming exists (migration for existing DBs).
+  // User edits in Settings → AI are preserved; only missing row is inserted.
+  ensureRunAfterTitlePrompt() {
+    const exists = this.db.prepare('SELECT id FROM ai_prompts WHERE id = ?').get('run-after-title');
+    if (!exists) {
+      this.db.prepare(`
+        INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        'run-after-title',
+        'Run After Title',
+        'На основе текста задачи Run after придумай короткое название задачи. Верни только название: 2-7 слов, без кавычек, без точки, без markdown, без пояснений. Если текст на русском — название тоже на русском; если на английском — на английском.',
+        'gemini-3.1-flash-lite',
+        'NONE',
+        '#DA7756',
+        1,
+        0,
+        6
+      );
+      console.log('[DB] Migrated: added run-after-title prompt');
+    }
+  }
+
   // ========== AI SESSIONS ==========
 
   saveAISession(projectId, toolType, sessionKey, contentBlob, originalCwd, originalHash = null) {
@@ -1352,26 +1361,6 @@ class DatabaseManager {
     }
     return this.db.prepare('SELECT * FROM api_call_log ORDER BY created_at DESC LIMIT ?').all(limit);
   }
-
-  // ========== BOOKMARKS ==========
-
-  getAllBookmarks() { return this.db.prepare('SELECT * FROM bookmarks ORDER BY position').all(); }
-  createBookmark(dirPath, name, description = '') {
-    const normalized = path.resolve(dirPath);
-    const existing = this.db.prepare('SELECT * FROM bookmarks WHERE path = ?').get(normalized);
-    if (existing) return existing;
-    const pos = (this.db.prepare('SELECT MAX(position) as max FROM bookmarks').get().max || 0) + 1;
-    const res = this.db.prepare('INSERT INTO bookmarks (path, name, description, position) VALUES (?, ?, ?, ?)').run(normalized, name, description, pos);
-    return this.db.prepare('SELECT * FROM bookmarks WHERE id = ?').get(res.lastInsertRowid);
-  }
-  updateBookmark(id, updates) {
-    const { name, description, position } = updates;
-    if (name !== undefined) this.db.prepare('UPDATE bookmarks SET name = ? WHERE id = ?').run(name, id);
-    if (description !== undefined) this.db.prepare('UPDATE bookmarks SET description = ? WHERE id = ?').run(description, id);
-    if (position !== undefined) this.db.prepare('UPDATE bookmarks SET position = ? WHERE id = ?').run(position, id);
-    return this.db.prepare('SELECT * FROM bookmarks WHERE id = ?').get(id);
-  }
-  deleteBookmark(id) { this.db.prepare('DELETE FROM bookmarks WHERE id = ?').run(id); }
 
   // ========== FORK MARKERS ==========
 

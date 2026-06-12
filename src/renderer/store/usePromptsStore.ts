@@ -1,10 +1,13 @@
 import { create } from 'zustand';
+import type { GeminiModelId } from '../constants/geminiModels';
 
-export type AIModel = 'gemini-3-flash-preview' | 'gemini-3-pro-preview';
+export type AIModel = GeminiModelId;
 export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
 
 export const TAB_TITLE_PROMPT_ID = 'tab-title';
+export const RUN_AFTER_TITLE_PROMPT_ID = 'run-after-title';
 export const DEFAULT_TAB_TITLE_PROMPT = 'На основе первого пользовательского сообщения придумай короткое название вкладки. Верни только название: 2-6 слов, без кавычек, без точки, без markdown, без пояснений.';
+export const DEFAULT_RUN_AFTER_TITLE_PROMPT = 'На основе текста задачи Run after придумай короткое название задачи. Верни только название: 2-7 слов, без кавычек, без точки, без markdown, без пояснений. Если текст на русском — название тоже на русском; если на английском — на английском.';
 
 export interface AIPrompt {
   id: string;              // built-ins like 'research' | 'compact' | 'tab-title' or 'prompt-<timestamp>'
@@ -104,6 +107,18 @@ const FALLBACK_PROMPTS: AIPrompt[] = [
     isBuiltIn: true,
     showInContextMenu: false,
     position: 5,
+    filePaths: []
+  },
+  {
+    id: RUN_AFTER_TITLE_PROMPT_ID,
+    name: 'Run After Title',
+    content: DEFAULT_RUN_AFTER_TITLE_PROMPT,
+    model: 'gemini-3.1-flash-lite',
+    thinkingLevel: 'NONE',
+    color: '#DA7756',
+    isBuiltIn: true,
+    showInContextMenu: false,
+    position: 6,
     filePaths: []
   }
 ];

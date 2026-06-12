@@ -11,6 +11,7 @@ import SemanticIndexButton from './SemanticIndexButton';
 import CopySessionWithChips from './CopySessionWithChips';
 import DocsButton from './DocsButton';
 import ClaudeUsageButton from './ClaudeUsageButton';
+import { buildCodexRunPayload } from '../../utils/codexLaunch';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -94,12 +95,12 @@ export default function ProjectToolbar() {
       // Send resume command based on session type
       if (tab.commandType === 'codex' && tab.codexSessionId) {
         setTabCommandType(tab.id, 'codex');
-        ipcRenderer.send('codex:run-command', {
+        ipcRenderer.send('codex:run-command', buildCodexRunPayload({
           tabId: tab.id,
           command: 'codex-c',
           sessionId: tab.codexSessionId,
           cwd: tab.cwd,
-        });
+        }));
       } else if (tab.claudeSessionId) {
         setTabCommandType(tab.id, 'claude');
         // Arm the per-tab stale-bridge guard before each resume write. Bulk-resume
@@ -116,12 +117,12 @@ export default function ProjectToolbar() {
         ipcRenderer.send('terminal:force-command-started', tab.id);
       } else if (tab.codexSessionId) {
         setTabCommandType(tab.id, 'codex');
-        ipcRenderer.send('codex:run-command', {
+        ipcRenderer.send('codex:run-command', buildCodexRunPayload({
           tabId: tab.id,
           command: 'codex-c',
           sessionId: tab.codexSessionId,
           cwd: tab.cwd,
-        });
+        }));
       }
     });
 

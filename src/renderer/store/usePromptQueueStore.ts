@@ -67,6 +67,12 @@ export type QueuedImageRef = {
 
 export type QueuedPrompt = {
   id: string;
+  // Human-facing label shown in the Run-after menu. The actual payload sent to
+  // the agent remains `text`.
+  title?: string;
+  // false/undefined = title is auto-derived from the current text length.
+  // true = user deliberately edited the title; text edits must not overwrite it.
+  titleManual?: boolean;
   text: string;
   images: number; // number of [Image] / [Pasted image] placeholders the original input had
   // Resolved disk paths for each [Image #N] in `text`, in order of appearance.
@@ -168,8 +174,9 @@ interface PromptQueueStore {
   // Per-tab queues. Outside Claude tabs the overlay is hidden, but state survives tab switching.
   queues: Map<string, TabQueue>;
 
-  addPrompt: (tabId: string, text: string, images?: number, imagePaths?: QueuedImageRef[]) => string;
+  addPrompt: (tabId: string, text: string, images?: number, imagePaths?: QueuedImageRef[], title?: string) => string;
   removePrompt: (tabId: string, id: string) => void;
+  updatePrompt: (tabId: string, id: string, patch: { text?: string; title?: string; titleManual?: boolean }) => void;
   updatePromptText: (tabId: string, id: string, text: string) => void;
   reorderPrompt: (tabId: string, fromIndex: number, toIndex: number) => void;
   clearQueue: (tabId: string) => void;
@@ -269,6 +276,14 @@ function countImages(text: string): number {
   return m ? m.length : 0;
 }
 
+export function countPromptCharacters(text: string): number {
+  return Array.from(text).length;
+}
+
+export function makeDefaultPromptTitle(text: string): string {
+  return `[${countPromptCharacters(text)} символов]`;
+}
+
 export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
   // setAndPersist: write next state, then schedule a debounced disk save.
   // PreviewId-only mutations skip the save (UI-only, see scheduleSave).
@@ -283,13 +298,24 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
   return {
     queues: new Map(),
 
-    addPrompt: (tabId, text, images, imagePaths) => {
+    addPrompt: (tabId, text, images, imagePaths, title) => {
       const id = nextId();
       setAndPersist((state) => {
         const next = new Map(state.queues);
         const cur = next.get(tabId) ?? EMPTY;
         const detectedImages = images ?? countImages(text);
-        const items = [...cur.items, { id, text, images: detectedImages, imagePaths: (imagePaths && imagePaths.length > 0) ? imagePaths : undefined, createdAt: Date.now() }];
+        const defaultTitle = makeDefaultPromptTitle(text);
+        const normalizedTitle = typeof title === 'string' ? title.trim() : '';
+        const titleManual = normalizedTitle.length > 0 && normalizedTitle !== defaultTitle;
+        const items = [...cur.items, {
+          id,
+          title: titleManual ? normalizedTitle : defaultTitle,
+          titleManual,
+          text,
+          images: detectedImages,
+          imagePaths: (imagePaths && imagePaths.length > 0) ? imagePaths : undefined,
+          createdAt: Date.now(),
+        }];
         // First-chip armed hint: only when transitioning empty → 1 AND auto-run
         // is currently OFF. Subsequent adds into a non-empty queue or adds into
         // an already-armed queue don't re-trigger the nudge.
@@ -339,11 +365,48 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       });
     },
 
+    updatePrompt: (tabId, id, patch) => {
+      setAndPersist((state) => {
+        const cur = state.queues.get(tabId);
+        if (!cur) return state;
+        const items = cur.items.map((p) => {
+          if (p.id !== id) return p;
+          const text = typeof patch.text === 'string' ? patch.text : p.text;
+          const images = typeof patch.text === 'string' ? countImages(text) : p.images;
+          const defaultTitle = makeDefaultPromptTitle(text);
+          let titleManual = !!p.titleManual;
+          let title = p.title || defaultTitle;
+          if (typeof patch.title === 'string') {
+            const normalized = patch.title.trim();
+            title = normalized || defaultTitle;
+            titleManual = normalized.length > 0 && normalized !== defaultTitle;
+          } else if (typeof patch.text === 'string' && !titleManual) {
+            title = defaultTitle;
+          }
+          if (typeof patch.titleManual === 'boolean') {
+            titleManual = patch.titleManual;
+            if (!titleManual) title = defaultTitle;
+          }
+          return { ...p, text, images, title, titleManual };
+        });
+        const next = new Map(state.queues);
+        next.set(tabId, { ...cur, items });
+        return { queues: next };
+      });
+    },
+
     updatePromptText: (tabId, id, text) => {
       setAndPersist((state) => {
         const cur = state.queues.get(tabId);
         if (!cur) return state;
-        const items = cur.items.map((p) => p.id === id ? { ...p, text, images: countImages(text) } : p);
+        const items = cur.items.map((p) => p.id === id
+          ? {
+              ...p,
+              text,
+              images: countImages(text),
+              title: p.titleManual ? p.title : makeDefaultPromptTitle(text),
+            }
+          : p);
         const next = new Map(state.queues);
         next.set(tabId, { ...cur, items });
         return { queues: next };

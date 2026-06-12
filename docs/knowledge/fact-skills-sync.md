@@ -18,6 +18,8 @@ Codex-only директории **не удаляются**. Это единст
 
 `~/.codex/skills/.system` не трогается автоматически за счёт общего hidden/system фильтра. System skills Codex принадлежат Codex installation, не Claude sync.
 
+Skill-файлы и project references правятся в `~/.claude/skills`, не в `~/.codex/skills`: Codex-копия derived и может быть перезаписана фоновым sync. В source-файлах Claude добавлена короткая строка `Source of truth...`, чтобы при ручном открытии зеркала было видно, где настоящий оригинал. Эту пометку надо менять именно в Claude source, иначе следующий sync снова затрёт Codex-side правку.
+
 ## Codex YAML frontmatter
 
 Claude и Codex читают один и тот же `SKILL.md` format, но Codex parser строже к YAML frontmatter. Реальный пользовательский симптом после первого sync: Codex пропустил `browser-mcp-debug`, `external-research`, `electron-e2e-testing`, `web-app-e2e-testing` с ошибкой `invalid YAML: mapping values are not allowed in this context`. Причина была не в теле markdown, а в незакавыченном `description:`: внутри длинного описания есть фрагменты вроде ``Error: no result`` / `Covers: ...` / `{model: ..., effort: ...}`. Для YAML это выглядит как nested mapping внутри inline scalar.
@@ -54,4 +56,3 @@ Settings получает push `skills:sync-status` от main process. Если 
 | `skills:sync-status` | main → renderer | Push после watcher start, manual/auto sync или ошибки |
 
 `status` включает `{ sourceDir, targetDir, sourceExists, targetExists, claudeSkills, codexSkills, missingInCodex, codexOnly, watcher }`.
-

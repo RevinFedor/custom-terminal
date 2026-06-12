@@ -33,6 +33,7 @@ import {
 import { hydratePromptQueueStore, usePromptQueueStore, serializePromptQueueCore } from './store/usePromptQueueStore';
 import { usePromptQueueWebSync } from './hooks/usePromptQueueWebSync';
 import { useMirrorStatusStore } from './store/useMirrorStatusStore';
+import { buildCodexRunPayload } from './utils/codexLaunch';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -1455,9 +1456,13 @@ function App() {
           const a = args || {};
           try {
             switch (op) {
-              case 'add':            s.addPrompt(tabId, String(a.text || '')); break;
+              case 'add':            s.addPrompt(tabId, String(a.text || ''), undefined, undefined, typeof a.title === 'string' ? a.title : undefined); break;
               case 'remove':         s.removePrompt(tabId, String(a.id)); break;
-              case 'update':         s.updatePromptText(tabId, String(a.id), String(a.text || '')); break;
+              case 'update':         s.updatePrompt(tabId, String(a.id), {
+                text: String(a.text || ''),
+                title: typeof a.title === 'string' ? a.title : undefined,
+                titleManual: typeof a.titleManual === 'boolean' ? a.titleManual : undefined,
+              }); break;
               case 'reorder':        s.reorderPrompt(tabId, Number(a.fromIndex), Number(a.toIndex)); break;
               case 'clear':          for (const it of s.getQueue(tabId).items) s.removePrompt(tabId, it.id); break;
               case 'setAutoRun':     s.setAutoRun(tabId, !!a.value); break;
@@ -1890,12 +1895,12 @@ function App() {
               s.clearInterruptedState(tabId);
               s.setTabCommandType(tabId, engine);
               if (engine === 'codex') {
-                ipcRenderer.send('codex:run-command', {
+                ipcRenderer.send('codex:run-command', buildCodexRunPayload({
                   tabId,
                   command: 'codex-c',
                   sessionId,
                   cwd,
-                });
+                }));
                 console.warn('[AutoResume] Resumed codex', tabId, sessionId.substring(0, 8));
                 continue;
               }

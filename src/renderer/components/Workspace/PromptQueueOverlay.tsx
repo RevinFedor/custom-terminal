@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { usePromptQueueStore } from '../../store/usePromptQueueStore';
+import { Trash2 } from 'lucide-react';
+import { makeDefaultPromptTitle, usePromptQueueStore, type QueuedPrompt } from '../../store/usePromptQueueStore';
+import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 // Run-after picker SEEDS its busy map from this always-on snapshot on mount,
@@ -10,6 +12,7 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 // that already fired on a background target tab.
 import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
 import { terminalRegistry } from '../../utils/terminalRegistry';
+import { generateTitleFromPromptWithConfig, trimTabTitlePrompt } from '../../utils/generateTabTitle';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -49,6 +52,8 @@ const PANEL_BG = 'rgba(20,20,20,0.92)';
 const BORDER = 'rgba(255,255,255,0.08)';
 const TEXT_MUTED = '#888';
 const TEXT_DIM = '#555';
+const SAVE_GREEN = '#22c55e';
+const DELETE_RED = '#ef4444';
 
 // Panel width is now FIXED (user-resizable, persisted in useUIStore.promptQueueWidth),
 // NOT `fit-content`. Reason: `fit-content` reflowed the panel every time a +grab
@@ -57,8 +62,10 @@ const TEXT_DIM = '#555';
 // split-button uses a CSS grid to reserve the wider label) so the content never
 // pushes past the fixed width. Bounds + default live in useUIStore
 // (PROMPT_QUEUE_WIDTH_MIN/MAX); RESIZE_MIN/MAX_WIDTH below must mirror them.
-const PREVIEW_WIDTH = 380;
-const PREVIEW_MAX_HEIGHT = 420;
+const EDITOR_WIDTH = 380;
+const EDITOR_MARGIN = 8;
+const EDITOR_TITLE_HEIGHT = 24;
+const EDITOR_TEXTAREA_MIN_HEIGHT = 64;
 
 // Which screen edge the overlay is docked to. The panel is pinned by this edge
 // (it never moves), and the resize handle lives on the OPPOSITE (free) edge so
@@ -73,13 +80,8 @@ const ANCHOR_SIDE: 'left' | 'right' = 'right';
 const RESIZE_MIN_WIDTH = 240;
 const RESIZE_MAX_WIDTH = 600;
 
-// First line of the prompt → chip header. Tail is the rest as +chars indicator.
-function chipParts(text: string): { head: string; tail: string } {
-  const firstLineEnd = text.indexOf('\n');
-  const head = firstLineEnd === -1 ? text : text.slice(0, firstLineEnd);
-  const restLen = firstLineEnd === -1 ? 0 : (text.length - firstLineEnd - 1);
-  const trimmedHead = head.length > 40 ? head.slice(0, 40) + '…' : head;
-  return { head: trimmedHead || '(empty)', tail: restLen > 0 ? `+${restLen}` : '' };
+function chipTitle(item: QueuedPrompt): string {
+  return (item.title || '').trim() || makeDefaultPromptTitle(item.text);
 }
 
 type QueueAgent = 'claude' | 'codex';
@@ -109,7 +111,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
   const firstChipArmedHint = queue?.firstChipHintActive ?? false;
   const runAfterTabId = queue?.runAfterTabId ?? null;
   const {
-    addPrompt, removePrompt, updatePromptText, reorderPrompt,
+    addPrompt, removePrompt, updatePrompt, reorderPrompt,
     setAutoRun, setStopAfter, setCloseAfter, setRunAfterTab,
     setPostPromptEnabled, setPostPromptText, consumeFirstChipHint,
     // popNext is consumed by hooks/usePromptQueueRunner.ts — not referenced here.
@@ -143,17 +145,40 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
 
   const [editorOpen, setEditorOpen] = useState(false);
   const [editorText, setEditorText] = useState('');
+  const [editorTitle, setEditorTitle] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
   // When true, the editor edits the per-tab post-prompt body (not a chip).
   // editingId is ignored in this mode. Save writes via setPostPromptText.
   const [isPostPromptMode, setIsPostPromptMode] = useState(false);
+  const [editorAutoFocus, setEditorAutoFocus] = useState(false);
+  const [editorFocusWithin, setEditorFocusWithin] = useState(false);
+  const [editorPinned, setEditorPinned] = useState(false);
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
   const [armedFlash, setArmedFlash] = useState(false);
   // Anchor for the editor modal — when set, the modal aligns its right edge to this rect's left edge
   // and its top edge to this rect's top edge. null = anchor to the whole panel's top-right corner.
-  const [editorAnchor, setEditorAnchor] = useState<{ top: number; right: number } | null>(null);
+  const [editorAnchor, setEditorAnchor] = useState<{ top: number; right: number; maxHeight: number } | null>(null);
+  const [appearingIds, setAppearingIds] = useState<Set<string>>(new Set());
+  const [savedFlashIds, setSavedFlashIds] = useState<Set<string>>(new Set());
+  const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
+  const [removeHoverId, setRemoveHoverId] = useState<string | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<HTMLDivElement>(null);
+  const editorTitleInputRef = useRef<HTMLInputElement>(null);
+  const editorTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const replayButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
+  const committingRef = useRef(false);
+  const removingIdsRef = useRef<Set<string>>(new Set());
+  const chipCloseSuppressRef = useRef<{ id: string; until: number } | null>(null);
+  const titleGeneratingIdsRef = useRef<Set<string>>(new Set());
+  const editorInitialRef = useRef<{
+    id: string | null;
+    post: boolean;
+    text: string;
+    title: string;
+    titleManual: boolean;
+  } | null>(null);
 
   // ─── fixed width + drag-resize ─────────────────────────────────────────────
   // The panel has a FIXED width (no `fit-content`) so adding a +grab chip can't
@@ -248,119 +273,370 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
   // agentBusy prop here is still used for the Run pill's pulsing indicator.
 
   // ─── handlers ────────────────────────────────────────────────────────────
-  // Editor open/close UX rule: every trigger that opens the editor is also a
-  // toggle. Clicking the SAME trigger a second time closes the editor (rather
-  // than reopening identical content). Three triggers — chip body, "+ add"
-  // footer button, ✎ post-prompt pencil — each defines its own "is this trigger
-  // already active" predicate.
-  //
-  // Shared helper that closes the slideout and resets the buffer. Used by the
-  // toggle paths and by Esc / cancel / × so they share one teardown sequence.
-  const closeEditor = useCallback(() => {
+  const resetEditor = useCallback(() => {
     setEditorOpen(false);
     setEditorText('');
+    setEditorTitle('');
     setEditingId(null);
     setIsPostPromptMode(false);
+    setEditorAutoFocus(false);
+    setEditorFocusWithin(false);
+    setEditorPinned(false);
+    editorInitialRef.current = null;
   }, []);
 
-  // Open the editor docked to the LEFT of the queue panel.
-  //  - editing existing chip → anchor top to that chip's top
-  //  - adding new           → anchor top to the panel header
-  // Both align right-edge to the panel's left-edge so the modal feels like a slideout.
-  // Toggle: if the editor is already open in the SAME mode/target, close it.
-  const openEditor = useCallback((id?: string) => {
-    // Toggle-close cases:
-    //   id  given  → close when editing the same chip already.
-    //   id  absent → close when "new chip" editor is open (no editingId, not post mode).
-    if (editorOpen && !isPostPromptMode) {
-      if (id && editingId === id) { closeEditor(); return; }
-      if (!id && !editingId)      { closeEditor(); return; }
+  const markAppearing = useCallback((id: string) => {
+    setAppearingIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+    window.setTimeout(() => {
+      setAppearingIds((prev) => {
+        if (!prev.has(id)) return prev;
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }, 520);
+  }, []);
+
+  const markSaved = useCallback((id: string) => {
+    setSavedFlashIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+    window.setTimeout(() => {
+      setSavedFlashIds((prev) => {
+        if (!prev.has(id)) return prev;
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }, 560);
+  }, []);
+
+  const animateRemovePrompt = useCallback((id: string) => {
+    if (removingIdsRef.current.has(id)) return;
+    removingIdsRef.current.add(id);
+    setRemovingIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+    window.setTimeout(() => {
+      removePrompt(tabId, id);
+      removingIdsRef.current.delete(id);
+      setRemovingIds((prev) => {
+        if (!prev.has(id)) return prev;
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      if (removeHoverId === id) setRemoveHoverId(null);
+    }, 260);
+  }, [removePrompt, removeHoverId, tabId]);
+
+  const generateRunAfterTitle = useCallback((id: string, text: string) => {
+    const source = trimTabTitlePrompt(text.trim());
+    if (!source || titleGeneratingIdsRef.current.has(id)) return;
+    titleGeneratingIdsRef.current.add(id);
+    void (async () => {
+      try {
+        const promptConfig = usePromptsStore.getState().getPromptById(RUN_AFTER_TITLE_PROMPT_ID);
+        const title = await generateTitleFromPromptWithConfig(source, promptConfig, {
+          fallbackPrompt: DEFAULT_RUN_AFTER_TITLE_PROMPT,
+          sourceLabel: 'Текст задачи Run after',
+          logPrefix: 'RunAfterTitle',
+        });
+        if (!title) return;
+        const current = usePromptQueueStore.getState().getQueue(tabId).items.find((p) => p.id === id);
+        if (!current || current.titleManual) return;
+        updatePrompt(tabId, id, { title, titleManual: true });
+        markSaved(id);
+      } finally {
+        titleGeneratingIdsRef.current.delete(id);
+      }
+    })();
+  }, [markSaved, tabId, updatePrompt]);
+
+  const commitEditor = useCallback((opts?: { close?: boolean }) => {
+    if (!editorOpen || committingRef.current) return false;
+    const initial = editorInitialRef.current;
+    if (!initial) {
+      if (opts?.close !== false) resetEditor();
+      return false;
     }
+    committingRef.current = true;
+    let changed = false;
+    try {
+      if (initial.post) {
+        if (editorText !== initial.text) {
+          setPostPromptText(tabId, editorText);
+          changed = true;
+        }
+        if (opts?.close !== false) resetEditor();
+        return changed;
+      }
+
+      const text = editorText.trim();
+      if (!text) {
+        if (opts?.close !== false) resetEditor();
+        return false;
+      }
+
+      const normalizedTitle = editorTitle.trim();
+      if (initial.id) {
+        const nextDefaultTitle = makeDefaultPromptTitle(text);
+        const titleEditedInForm = normalizedTitle !== initial.title;
+        const titleManual = titleEditedInForm
+          ? (normalizedTitle.length > 0 && normalizedTitle !== nextDefaultTitle)
+          : initial.titleManual;
+        const nextTitle = titleManual ? normalizedTitle : nextDefaultTitle;
+        changed =
+          text !== initial.text ||
+          nextTitle !== initial.title ||
+          titleManual !== initial.titleManual;
+        if (changed) {
+          updatePrompt(tabId, initial.id, {
+            text,
+            title: nextTitle,
+            titleManual,
+          });
+          markSaved(initial.id);
+        }
+      } else {
+        const id = addPrompt(tabId, text, undefined, undefined, normalizedTitle);
+        markAppearing(id);
+        if (!normalizedTitle) generateRunAfterTitle(id, text);
+        changed = true;
+      }
+
+      if (opts?.close !== false) resetEditor();
+      return changed;
+    } finally {
+      window.setTimeout(() => { committingRef.current = false; }, 0);
+    }
+  }, [addPrompt, editorOpen, editorText, editorTitle, generateRunAfterTitle, markAppearing, markSaved, resetEditor, setPostPromptText, tabId, updatePrompt]);
+
+  const suppressChipReopen = useCallback((id: string) => {
+    chipCloseSuppressRef.current = { id, until: performance.now() + 450 };
+  }, []);
+
+  const isChipReopenSuppressed = useCallback((id: string) => {
+    const current = chipCloseSuppressRef.current;
+    if (!current) return false;
+    if (performance.now() > current.until) {
+      chipCloseSuppressRef.current = null;
+      return false;
+    }
+    return current.id === id;
+  }, []);
+
+  const blurActiveElement = useCallback(() => {
+    requestAnimationFrame(() => {
+      const active = document.activeElement;
+      if (active instanceof HTMLElement) active.blur();
+    });
+  }, []);
+
+  const closePinnedEditorFromChip = useCallback((id: string) => {
+    if (!editorOpen || !editorPinned || editingId !== id || isPostPromptMode) return false;
+    suppressChipReopen(id);
+    commitEditor();
+    blurActiveElement();
+    return true;
+  }, [blurActiveElement, commitEditor, editingId, editorOpen, editorPinned, isPostPromptMode, suppressChipReopen]);
+
+  const anchorEditor = useCallback((id?: string) => {
     const panelRect = panelRef.current?.getBoundingClientRect();
-    if (!panelRect) return;
+    if (!panelRect) return null;
     const anchorRight = window.innerWidth - panelRect.left + 8; // 8px gap
     let anchorTop = panelRect.top;
     if (id) {
-      const it = items.find((i) => i.id === id);
-      if (!it) return;
+      const it = usePromptQueueStore.getState().getQueue(tabId).items.find((i) => i.id === id);
+      if (!it) return null;
       const chipRect = chipRefs.current.get(id)?.getBoundingClientRect();
       if (chipRect) anchorTop = chipRect.top;
+    }
+    anchorTop = Math.max(EDITOR_MARGIN, anchorTop);
+    const maxHeight = Math.max(96, window.innerHeight - anchorTop - EDITOR_MARGIN);
+    return { top: anchorTop, right: anchorRight, maxHeight };
+  }, [tabId]);
+
+  const openEditor = useCallback((id?: string, mode: 'hover' | 'pin' = 'pin') => {
+    if (id && mode === 'hover' && isChipReopenSuppressed(id)) return;
+    if (mode === 'hover' && editorPinned) return;
+    if (editorOpen && !isPostPromptMode) {
+      if (id && editingId === id) {
+        if (mode === 'hover') return;
+        if (editorPinned) {
+          suppressChipReopen(id);
+          commitEditor();
+          blurActiveElement();
+          return;
+        }
+        setEditorPinned(true);
+        setEditorAutoFocus(true);
+        requestAnimationFrame(() => {
+          editorTitleInputRef.current?.focus();
+        });
+        return;
+      }
+      if (!id && !editingId) {
+        if (mode === 'pin') {
+          if (editorPinned) {
+            commitEditor();
+            blurActiveElement();
+            return;
+          }
+          setEditorPinned(true);
+          setEditorAutoFocus(true);
+          requestAnimationFrame(() => {
+            editorTextareaRef.current?.focus();
+          });
+          return;
+        }
+        commitEditor();
+        return;
+      }
+      commitEditor();
+    } else if (editorOpen) {
+      commitEditor();
+    }
+    const anchor = anchorEditor(id);
+    if (!anchor) return;
+    if (id) {
+      const it = usePromptQueueStore.getState().getQueue(tabId).items.find((i) => i.id === id);
+      if (!it) return;
+      const title = chipTitle(it);
       setEditorText(it.text);
+      setEditorTitle(title);
       setEditingId(id);
+      editorInitialRef.current = {
+        id,
+        post: false,
+        text: it.text,
+        title,
+        titleManual: !!it.titleManual,
+      };
     } else {
       setEditorText('');
+      setEditorTitle('');
       setEditingId(null);
+      editorInitialRef.current = {
+        id: null,
+        post: false,
+        text: '',
+        title: '',
+        titleManual: false,
+      };
     }
     setIsPostPromptMode(false);
-    // Same clamp as preview: prevent the editor from being pushed below the
-    // viewport when the anchored chip is near the bottom of the queue.
-    const margin = 8;
-    const maxTop = window.innerHeight - PREVIEW_MAX_HEIGHT - margin;
-    anchorTop = Math.max(margin, Math.min(anchorTop, maxTop));
-    setEditorAnchor({ top: anchorTop, right: anchorRight });
+    setEditorAutoFocus(mode !== 'hover');
+    setEditorFocusWithin(false);
+    setEditorPinned(mode === 'pin');
+    setEditorAnchor(anchor);
     setEditorOpen(true);
-  }, [items, editorOpen, isPostPromptMode, editingId, closeEditor]);
+  }, [anchorEditor, blurActiveElement, commitEditor, editingId, editorOpen, editorPinned, isChipReopenSuppressed, isPostPromptMode, suppressChipReopen, tabId]);
 
-  // Same slideout pattern as openEditor — but loads the per-tab post-prompt
-  // body into the textarea and saves back into the store on commit. Anchored
-  // to the panel header (top-right) just like "add new chip".
-  //
-  // Toggle: second click on ✎ while the post-prompt editor is open closes it.
-  //
-  // Guard: if a chip-edit (or new-chip) editor is open with unsaved changes,
-  // swapping its purpose silently would discard those edits. Confirm before
-  // swapping. window.confirm is sufficient — losing 30 chars of draft is a
-  // user-correctable annoyance, not a destructive operation worth a modal.
+  // Same editor surface as openEditor, but loads the per-tab post-prompt body.
+  // Switching editor purpose first commits the currently open surface, matching
+  // the blur-save contract and avoiding silent draft loss.
   const openPostPromptEditor = useCallback(() => {
-    if (editorOpen && isPostPromptMode) { closeEditor(); return; }
-    if (editorOpen && !isPostPromptMode) {
-      const originalText = editingId
-        ? (items.find((i) => i.id === editingId)?.text ?? '')
-        : '';
-      if (editorText !== originalText) {
-        const ok = window.confirm('Открыт несохранённый промпт — переключиться на пост-промпт и потерять изменения?');
-        if (!ok) return;
-      }
+    if (editorOpen && isPostPromptMode) {
+      commitEditor();
+      return;
     }
-    const panelRect = panelRef.current?.getBoundingClientRect();
-    if (!panelRect) return;
-    const anchorRight = window.innerWidth - panelRect.left + 8;
-    let anchorTop = panelRect.top;
-    const margin = 8;
-    const maxTop = window.innerHeight - PREVIEW_MAX_HEIGHT - margin;
-    anchorTop = Math.max(margin, Math.min(anchorTop, maxTop));
+    if (editorOpen) commitEditor();
+    const anchor = anchorEditor();
+    if (!anchor) return;
     setEditorText(postPromptText);
+    setEditorTitle('');
     setEditingId(null);
     setIsPostPromptMode(true);
-    setEditorAnchor({ top: anchorTop, right: anchorRight });
+    setEditorAutoFocus(true);
+    setEditorFocusWithin(false);
+    setEditorPinned(true);
+    editorInitialRef.current = {
+      id: null,
+      post: true,
+      text: postPromptText,
+      title: '',
+      titleManual: false,
+    };
+    setEditorAnchor(anchor);
     setEditorOpen(true);
-  }, [postPromptText, editorOpen, isPostPromptMode, editorText, editingId, items, closeEditor]);
+  }, [anchorEditor, commitEditor, editorOpen, isPostPromptMode, postPromptText]);
+
+  useEffect(() => {
+    if (!editorOpen) return;
+    const onMouseDown = (e: MouseEvent) => {
+      const target = e.target as Node | null;
+      if (!target) return;
+      if (editorRef.current?.contains(target)) return;
+      const replayButton = editingId ? replayButtonRefs.current.get(editingId) : null;
+      if (replayButton?.contains(target)) return;
+      const currentChip = editingId ? chipRefs.current.get(editingId) : null;
+      if (currentChip?.contains(target)) return;
+      commitEditor();
+    };
+    window.addEventListener('mousedown', onMouseDown, true);
+    return () => window.removeEventListener('mousedown', onMouseDown, true);
+  }, [commitEditor, editingId, editorOpen]);
+
+  useEffect(() => {
+    if (!editorOpen || !editingId || editorPinned || editorFocusWithin) return;
+    const inRect = (r: DOMRect | undefined, x: number, y: number, pad = 2) =>
+      !!r && x >= r.left - pad && x <= r.right + pad && y >= r.top - pad && y <= r.bottom + pad;
+    const onMove = (e: MouseEvent) => {
+      const trigger = replayButtonRefs.current.get(editingId)?.getBoundingClientRect();
+      const editor = editorRef.current?.getBoundingClientRect();
+      if (!trigger || !editor) return;
+      const x = e.clientX;
+      const y = e.clientY;
+      const inBridge =
+        x >= editor.right - 2 &&
+        x <= trigger.left + 2 &&
+        y >= Math.min(editor.top, trigger.top) - 8 &&
+        y <= Math.max(editor.bottom, trigger.bottom) + 8;
+      if (!inRect(trigger, x, y) && !inRect(editor, x, y) && !inBridge) {
+        resetEditor();
+      }
+    };
+    window.addEventListener('mousemove', onMove);
+    return () => window.removeEventListener('mousemove', onMove);
+  }, [editingId, editorFocusWithin, editorOpen, editorPinned, resetEditor]);
+
+  useLayoutEffect(() => {
+    if (!editorOpen || !editorAnchor) return;
+    const textarea = editorTextareaRef.current;
+    if (!textarea) return;
+    const chromeHeight = isPostPromptMode ? 0 : EDITOR_TITLE_HEIGHT + 1;
+    const maxTextareaHeight = Math.max(
+      EDITOR_TEXTAREA_MIN_HEIGHT,
+      editorAnchor.maxHeight - chromeHeight
+    );
+    textarea.style.height = 'auto';
+    const nextHeight = Math.min(
+      Math.max(textarea.scrollHeight, EDITOR_TEXTAREA_MIN_HEIGHT),
+      maxTextareaHeight
+    );
+    textarea.style.height = `${nextHeight}px`;
+    textarea.style.overflowY = textarea.scrollHeight > maxTextareaHeight ? 'auto' : 'hidden';
+  }, [editorAnchor, editorOpen, editorText, isPostPromptMode]);
+
+  useEffect(() => {
+    if (!editingId) return;
+    if (!items.some((i) => i.id === editingId)) resetEditor();
+  }, [editingId, items, resetEditor]);
 
   // Auto-arm was removed — adding a chip no longer flips Run after on.
   // The user is the sole arbiter of when the queue starts firing (one toggle).
   // History: earlier we auto-armed on the first chip ("queued something = wants
   // auto"), but that fought with the new firstDelay countdown which only makes
   // sense when the user explicitly hits Run with delay configured.
-
-  const commitEditor = useCallback(() => {
-    if (isPostPromptMode) {
-      // Post-prompt: preserve user's exact text (including trailing newlines
-      // they may want as a separator) — do NOT trim. Empty body is a valid
-      // way to "clear" it; the runner treats empty postPromptText as no-op
-      // even if postPromptEnabled is true.
-      setPostPromptText(tabId, editorText);
-      closeEditor();
-      return;
-    }
-    const t = editorText.trim();
-    if (!t) { closeEditor(); return; }
-    if (editingId) {
-      updatePromptText(tabId, editingId, t);
-    } else {
-      addPrompt(tabId, t);
-    }
-    closeEditor();
-  }, [editorText, editingId, addPrompt, updatePromptText, tabId, isPostPromptMode, setPostPromptText, closeEditor]);
 
   // Helper: focus terminal so Ink's render loop stays hot and external-editor flow
   // (clear / grab tempfile re-read) completes in one frame instead of waiting for
@@ -425,7 +701,9 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
           focusActiveTerminal();
           return;
         }
-        addPrompt(tabId, t, res.images || 0, Array.isArray(res.imagePaths) ? res.imagePaths : undefined);
+        const id = addPrompt(tabId, t, res.images || 0, Array.isArray(res.imagePaths) ? res.imagePaths : undefined);
+        markAppearing(id);
+        generateRunAfterTitle(id, t);
         // No success toast on queue-add — the new chip appearing in the overlay
         // is its own confirmation; the toast was redundant noise (user request).
         // Refocus so the agent re-reads the (now empty) tempfile immediately — without
@@ -442,7 +720,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
       showToast(`Grab failed: ${m}`, 'error');
       console.error('[PromptQueue] grab-input error', e);
     }
-  }, [tabId, sessionType, agentLabel, addPrompt, showToast, focusActiveTerminal]);
+  }, [tabId, sessionType, agentLabel, addPrompt, generateRunAfterTitle, markAppearing, showToast, focusActiveTerminal]);
 
   // Copy moved to InfoPanel — see Copy prompt button next to Copy Session.
 
@@ -843,7 +1121,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
         {items.length > 0 && (
           <div style={{ padding: '2px 8px 4px', borderBottom: `1px solid ${BORDER}`, display: 'flex', justifyContent: 'flex-end' }}>
             <button
-              onClick={() => items.forEach((i) => removePrompt(tabId, i.id))}
+              onClick={() => items.forEach((i) => animateRemovePrompt(i.id))}
               style={{ background: 'transparent', border: 'none', color: TEXT_DIM, cursor: 'pointer', fontSize: 9, padding: 0 }}
             >clear all</button>
           </div>
@@ -857,17 +1135,22 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
             </div>
           )}
           {items.map((it, idx) => {
-            const { head, tail } = chipParts(it.text);
-            // Multi-line mode: show the raw text clipped by CSS line-clamp instead
-            // of the 1-line head+tail header. Tail (+N chars) is hidden because
-            // overflowed content is already implied by the ellipsis on the last
-            // visible line.
+            const title = chipTitle(it);
             const isMultiLine = chipLineClamp > 1;
             const isEditing = editorOpen && editingId === it.id;
             const isDragOver = dragOverIdx === idx;
             const isDragging = dragId === it.id;
+            const isRemoveHovered = removeHoverId === it.id;
+            const isRemoving = removingIds.has(it.id);
+            const chipClass = [
+              'pq-chip',
+              appearingIds.has(it.id) ? 'pq-chip-enter' : '',
+              savedFlashIds.has(it.id) ? 'pq-chip-saved' : '',
+              isRemoving ? 'pq-chip-removing' : '',
+            ].filter(Boolean).join(' ');
             return (
               <div
+                className={chipClass}
                 key={it.id}
                 ref={(el) => { if (el) chipRefs.current.set(it.id, el); else chipRefs.current.delete(it.id); }}
                 draggable
@@ -875,37 +1158,57 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
                 onDragOver={onDragOver(idx)}
                 onDrop={onDrop(idx)}
                 onDragEnd={onDragEnd}
+                onMouseDownCapture={(e) => {
+                  const target = e.target as HTMLElement;
+                  if (target.closest('[data-chip-action]')) return;
+                  if (closePinnedEditorFromChip(it.id)) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }
+                }}
                 onClick={(e) => {
                   // Ignore clicks that originated on the replay/remove buttons
                   // (they call stopPropagation themselves, but defensively skip
                   // here too in case event ordering changes). Body click =
-                  // open editor.
+                  // click pins the editor. Hover on ▶ is preview-only.
                   const target = e.target as HTMLElement;
                   if (target.closest('[data-chip-action]')) return;
-                  openEditor(it.id);
+                  if (isChipReopenSuppressed(it.id)) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    return;
+                  }
+                  openEditor(it.id, 'pin');
                 }}
                 style={{
-                  padding: '6px 8px',
-                  borderBottom: `1px solid ${BORDER}`,
-                  background: isEditing ? `${TINT}1a` : (isDragOver ? `${PULSE}22` : 'transparent'),
+                  position: 'relative',
+                  padding: '4px 7px',
+                  margin: '2px 5px',
+                  border: isRemoveHovered
+                    ? `1px solid ${DELETE_RED}`
+                    : (isEditing && editorPinned ? '1px solid rgba(255,255,255,0.62)' : `1px solid ${BORDER}`),
+                  borderRadius: 7,
+                  background: isRemoveHovered
+                    ? `${DELETE_RED}18`
+                    : (isEditing ? `${TINT}1a` : (isDragOver ? `${PULSE}22` : 'transparent')),
+                  boxShadow: 'none',
                   cursor: isDragging ? 'grabbing' : 'pointer',
                   display: 'flex',
-                  // In multi-line mode the auxiliary controls (▶ replay, 📎N, ×)
-                  // sit at the top of the chip so the text column can grow downward.
-                  alignItems: isMultiLine ? 'flex-start' : 'center',
+                  alignItems: 'center',
                   gap: 6,
-                  transition: 'background 0.15s',
+                  transition: 'background 0.15s, border-color 0.15s',
                   // Prevent native text selection while dragging — the synthetic
                   // selection that appears when the cursor moves over the chip
                   // body during a drag looks broken (blue highlight covers the
                   // chip text). Belt-and-braces: HTML drag should suppress
                   // selection on its own, but Electron + macOS sometimes shows
                   // a stale Safari-ish selection mid-drag.
-                  // Chip body is click-as-toggle / drag-as-reorder — never an
+                  // Chip body is click-to-pin / drag-as-reorder — never an
                   // editable text region. Disable text selection always so
                   // double-clicks (or rapid clicks) don't highlight characters.
                   userSelect: 'none',
                   WebkitUserSelect: 'none',
+                  overflow: 'hidden',
                 }}
               >
                 {/* Replay (▶) — paste chip text into agent input, no submit.
@@ -915,8 +1218,13 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
                     as the user holds + moves rather than clicking. */}
                 <button
                   data-chip-action="replay"
+                  ref={(el) => { if (el) replayButtonRefs.current.set(it.id, el); else replayButtonRefs.current.delete(it.id); }}
                   disabled={replayingIds.has(it.id)}
-                  onClick={(e) => { e.stopPropagation(); replayChip(it.id, it.text); }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const latestText = usePromptQueueStore.getState().getQueue(tabId).items.find((p) => p.id === it.id)?.text ?? it.text;
+                    replayChip(it.id, latestText);
+                  }}
                   title={replayingIds.has(it.id) ? 'Replay in progress…' : 'Replay: paste into ' + agentLabel + ' input (no submit)'}
                   style={{
                     background: replayingIds.has(it.id) ? `${TINT}26` : 'transparent',
@@ -925,12 +1233,13 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
                     cursor: replayingIds.has(it.id) ? 'default' : 'pointer',
                     padding: 0, lineHeight: 1, fontSize: 10,
                     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-                    width: 14, height: 14, borderRadius: 3,
+                    width: 16, height: 16, borderRadius: 999,
                     transition: 'all 0.12s',
                     flexShrink: 0,
                   }}
                   onMouseEnter={(e) => {
                     if (replayingIds.has(it.id)) return;
+                    openEditor(it.id, 'hover');
                     (e.currentTarget as HTMLElement).style.background = `${TINT}26`;
                     (e.currentTarget as HTMLElement).style.color = TINT;
                   }}
@@ -942,30 +1251,40 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
                 >{replayingIds.has(it.id) ? <span className="pq-spinner" /> : '▶'}</button>
                 {isMultiLine ? (
                   <span style={{
-                    flex: 1, minWidth: 0, fontSize: 11, lineHeight: 1.35,
-                    // -webkit-box + line-clamp is the only cross-Electron way
-                    // to truncate at N lines with ellipsis. whiteSpace must be
-                    // pre-wrap so newlines in the original prompt are preserved.
+                    flex: 1, minWidth: 0, fontSize: 11, lineHeight: '14px',
                     display: '-webkit-box',
                     WebkitBoxOrient: 'vertical' as const,
                     WebkitLineClamp: chipLineClamp,
                     overflow: 'hidden',
                     textOverflow: 'ellipsis',
-                    whiteSpace: 'pre-wrap',
+                    whiteSpace: 'normal',
                     wordBreak: 'break-word',
-                  }}>{it.text || '(empty)'}</span>
+                  }}>{title}</span>
                 ) : (
-                  <>
-                    <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11 }}>{head}</span>
-                    {tail && <span style={{ color: TEXT_DIM, fontSize: 9 }}>{tail}</span>}
-                  </>
+                  <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, lineHeight: '14px' }}>{title}</span>
                 )}
                 {it.images > 0 && <span style={{ color: TINT, fontSize: 9 }}>📎{it.images}</span>}
                 <button
                   data-chip-action="remove"
-                  onClick={(e) => { e.stopPropagation(); removePrompt(tabId, it.id); }}
-                  style={{ background: 'transparent', border: 'none', color: TEXT_DIM, cursor: 'pointer', padding: 0, lineHeight: 1, fontSize: 12 }}
-                >×</button>
+                  onMouseEnter={() => setRemoveHoverId(it.id)}
+                  onMouseLeave={() => setRemoveHoverId((cur) => cur === it.id ? null : cur)}
+                  onClick={(e) => { e.stopPropagation(); animateRemovePrompt(it.id); }}
+                  style={{
+                    background: isRemoveHovered ? `${DELETE_RED}26` : 'transparent',
+                    border: 'none',
+                    color: isRemoveHovered ? DELETE_RED : TEXT_DIM,
+                    cursor: 'pointer',
+                    padding: 0,
+                    lineHeight: 1,
+                    width: 18,
+                    height: 18,
+                    borderRadius: 999,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    transition: 'background 0.12s, color 0.12s',
+                  }}
+                ><Trash2 size={13} strokeWidth={1.9} /></button>
               </div>
             );
           })}
@@ -989,59 +1308,86 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
           Anchored by editorAnchor: top aligned to chip top (edit) or panel top (new). */}
       {editorOpen && editorAnchor && (
         <div
+          ref={editorRef}
           style={{
             position: 'fixed',
             top: editorAnchor.top,
             right: editorAnchor.right,
-            width: PREVIEW_WIDTH,
-            maxHeight: PREVIEW_MAX_HEIGHT,
+            width: EDITOR_WIDTH,
+            maxHeight: editorAnchor.maxHeight,
             background: PANEL_BG,
-            border: `1px solid ${BORDER}`,
+            border: editorPinned ? '1px solid rgba(255,255,255,0.72)' : `1px solid ${BORDER}`,
             borderRadius: 6,
+            boxShadow: editorPinned ? '0 0 0 1px rgba(255,255,255,0.18)' : 'none',
             backdropFilter: 'blur(8px)',
             zIndex: 60,
             display: 'flex', flexDirection: 'column',
             overflow: 'hidden',
           }}
+          onMouseDown={(e) => e.stopPropagation()}
           onClick={(e) => e.stopPropagation()}
+          onFocusCapture={() => {
+            setEditorFocusWithin(true);
+          }}
+          onBlurCapture={(e) => {
+            const next = e.relatedTarget as Node | null;
+            if (next && e.currentTarget.contains(next)) return;
+            setEditorFocusWithin(false);
+            window.setTimeout(() => {
+              const active = document.activeElement;
+              if (active && editorRef.current?.contains(active)) return;
+              commitEditor();
+            }, 0);
+          }}
         >
-          <div style={{ padding: '6px 8px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: `1px solid ${BORDER}`, fontSize: 10, color: TEXT_MUTED }}>
-            <span>
-              {isPostPromptMode
-                ? 'Post-prompt · добавляется в конец каждого запуска'
-                : (editingId ? 'Редактирование' : 'Новый промпт')}
-              {' · ⌘↩ сохранить · Esc отмена'}
-            </span>
-            <button
-              onClick={() => closeEditor()}
-              style={{ background: 'transparent', border: 'none', color: TEXT_DIM, cursor: 'pointer', fontSize: 14, padding: 0, lineHeight: 1 }}
-            >×</button>
-          </div>
+          {!isPostPromptMode && (
+            <>
+              <input
+                ref={editorTitleInputRef}
+                autoFocus={editorAutoFocus}
+                value={editorTitle}
+                onChange={(e) => setEditorTitle(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+                  if (e.key === 'Escape') resetEditor();
+                }}
+                style={{
+                  height: EDITOR_TITLE_HEIGHT,
+                  flexShrink: 0,
+                  background: '#0e0e0e',
+                  color: '#ddd',
+                  border: 'none',
+                  padding: '0 8px',
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                  fontSize: 12,
+                  outline: 'none',
+                  boxSizing: 'border-box',
+                }}
+              />
+              <div style={{ height: 1, flexShrink: 0, background: BORDER }} />
+            </>
+          )}
           <textarea
-            autoFocus
+            ref={editorTextareaRef}
+            autoFocus={editorAutoFocus && isPostPromptMode}
             value={editorText}
             onChange={(e) => setEditorText(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Escape') closeEditor()
+              if (e.key === 'Escape') resetEditor();
               if (e.key === 'Enter' && e.metaKey) commitEditor();
             }}
-            placeholder={isPostPromptMode
-              ? 'Текст пост-промпта… приклеивается через пустую строку к каждому отправленному запросу.'
-              : 'Введите или вставьте промпт…'}
             style={{
-              flex: 1, minHeight: 180,
+              flex: '0 0 auto',
+              minHeight: EDITOR_TEXTAREA_MIN_HEIGHT,
+              maxHeight: editorAnchor.maxHeight - (isPostPromptMode ? 0 : EDITOR_TITLE_HEIGHT + 1),
               background: '#0e0e0e', color: '#ddd',
-              border: 'none', padding: 10,
+              border: 'none', padding: '6px 8px',
               fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12,
               resize: 'none', outline: 'none',
+              overflowY: 'hidden',
+              boxSizing: 'border-box',
             }}
           />
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6, padding: 8, borderTop: `1px solid ${BORDER}` }}>
-            <button onClick={() => closeEditor()} style={{ background: 'transparent', border: `1px solid ${BORDER}`, color: '#aaa', padding: '4px 10px', borderRadius: 4, fontSize: 11, cursor: 'pointer' }}>Отмена</button>
-            <button onClick={commitEditor} style={{ background: TINT, border: 'none', color: 'white', padding: '4px 10px', borderRadius: 4, fontSize: 11, cursor: 'pointer' }}>
-              {isPostPromptMode ? 'Сохранить' : (editingId ? 'Сохранить' : 'Добавить')}
-            </button>
-          </div>
         </div>
       )}
 
@@ -1084,6 +1430,66 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
           border-right-color: transparent;
           animation: pq-spin 0.7s linear infinite;
           display: inline-block;
+        }
+        .pq-chip::before {
+          content: '';
+          position: absolute;
+          inset: 0;
+          border-radius: inherit;
+          pointer-events: none;
+          opacity: 0;
+          transform: scaleX(0);
+          z-index: 0;
+        }
+        .pq-chip > * {
+          position: relative;
+          z-index: 1;
+        }
+        .pq-chip-enter {
+          animation: pq-chip-enter 520ms ease-out both;
+        }
+        .pq-chip-enter::before {
+          background: ${SAVE_GREEN}2e;
+          transform-origin: left center;
+          animation: pq-chip-green-wipe 520ms ease-out both;
+        }
+        .pq-chip-saved::before {
+          background: ${SAVE_GREEN}38;
+          transform-origin: left center;
+          animation: pq-chip-save-flash 520ms ease-out both;
+        }
+        .pq-chip-removing {
+          pointer-events: none;
+          will-change: clip-path, opacity, transform;
+          animation: pq-chip-remove 260ms ease-in forwards;
+        }
+        .pq-chip-removing::before {
+          background: ${DELETE_RED}32;
+          transform-origin: right center;
+          animation: pq-chip-delete-wipe 260ms ease-in forwards;
+        }
+        @keyframes pq-chip-enter {
+          0% { opacity: 0; transform: translateX(-10px); }
+          100% { opacity: 1; transform: translateX(0); }
+        }
+        @keyframes pq-chip-green-wipe {
+          0% { opacity: 1; transform: scaleX(0); }
+          55% { opacity: 1; transform: scaleX(1); }
+          100% { opacity: 0; transform: scaleX(1); }
+        }
+        @keyframes pq-chip-save-flash {
+          0% { opacity: 0; transform: scaleX(0); }
+          35% { opacity: 1; transform: scaleX(1); }
+          100% { opacity: 0; transform: scaleX(1); }
+        }
+        @keyframes pq-chip-delete-wipe {
+          0% { opacity: 0; transform: scaleX(0); }
+          40% { opacity: 1; transform: scaleX(1); }
+          100% { opacity: 0.15; transform: scaleX(1); }
+        }
+        @keyframes pq-chip-remove {
+          0% { opacity: 1; transform: translateX(0); clip-path: inset(0 0 0 0); }
+          100% { opacity: 0; transform: translateX(-10px); clip-path: inset(0 100% 0 0); }
         }
       `}</style>
     </>
@@ -1200,12 +1606,13 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
 
 // ─── RunAfterTabPicker ─────────────────────────────────────────────────────
 // Compact dropdown next to the "Run after" pill. Lets the user pick ANOTHER
-// tab in the same project — when that tab's loader (claude/gemini/sdk busy
-// signal) finishes, the queue's head fires here.
+// AI tab from any open project — when that tab's loader (claude/gemini/sdk
+// busy signal) finishes, the queue's head fires here.
 //
 // Design choices:
-//  - Width-clamped pill (max 140px) — tab names get truncated with ellipsis,
-//    panel never visibly grows just from a long tab name.
+//  - Closed pill is width-clamped by the parent grid, but it no longer
+//    manually truncates names to 9 chars. The old manual slice cut selected
+//    targets in the middle even when the button had room.
 //  - Violet tint for the active state. Distinct from PULSE (used by Run after
 //    self-firing) so the two states read differently at a glance.
 //  - Status icon on the RIGHT of the name:
@@ -1216,10 +1623,12 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
 //                                          tab AND submit something there
 //                                          before the loader starts; only
 //                                          then do we wait for idle.
-//  - First row in dropdown is always "— no target —" (clears the slot).
+//  - There is NO "no target" row. Clicking the selected row again clears the
+//    slot; this keeps the list semantically clean.
+//  - Project chips sit at the top. Current owner project is selected by
+//    default, but the user can pivot to loader tabs in other open projects.
 //  - Tabs are listed in original project order, color-dot shows their
-//    canonical tab color so user instantly recognises Claude (orange) vs
-//    Gemini (blue) vs bash (green) vs script.
+//    canonical AI runtime color.
 //  - Self-row hidden (selecting yourself = wait-forever loop; setRunAfterTab
 //    also coerces self→null defensively).
 
@@ -1263,16 +1672,44 @@ type AiTab = {
   id: string;
   name: string;
   kind: AiTabKind;
+  projectId: string;
 };
+
+type AiProjectGroup = {
+  projectId: string;
+  name: string;
+  isOwnerProject: boolean;
+  tabs: AiTab[];
+};
+
+function aiKindForTab(tab: {
+  tabType?: string;
+  commandType?: string;
+  claudeSessionId?: string;
+  codexSessionId?: string;
+  geminiSessionId?: string;
+}): AiTabKind | null {
+  const isSDK = tab.tabType === 'claude-sdk';
+  if (isSDK) return 'claude-sdk';
+  if (tab.commandType === 'claude' && !!tab.claudeSessionId) return 'claude-pty';
+  if (tab.commandType === 'codex' && !!tab.codexSessionId) return 'codex';
+  if (tab.commandType === 'gemini' && !!tab.geminiSessionId) return 'gemini';
+  return null;
+}
+
+function projectLabel(projectPath: string, projectId: string): string {
+  const clean = (projectPath || '').replace(/[\\/]+$/, '');
+  return clean.split(/[\\/]/).filter(Boolean).pop() || projectId.slice(-8);
+}
 
 function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: RunAfterTabPickerProps) {
   // Fingerprint Pattern (CLAUDE.md / fix-performance-lags.md): селектор ОБЯЗАН
   // вернуть примитив. Возврат свежего `{projectId, activeTabId, tabs}` каждый
   // раз приводит к infinite loop через Object.is (Zustand сравнение).
-  // Сейчас селектор фильтрует только AI-вкладки (Claude PTY с активной
-  // сессией, Codex с активной сессией, Gemini с активной сессией, любой SDK-таб) и собирает компактный
-  // fingerprint-string из id+name. Re-render только когда AI-инвентарь
-  // проекта реально поменялся.
+  // Сейчас селектор фильтрует AI-вкладки во всех открытых проектах (Claude PTY
+  // с активной сессией, Codex с активной сессией, Gemini с активной сессией,
+  // любой SDK-таб) и собирает компактный fingerprint-string из project+tab
+  // id/name/kind. Re-render только когда AI-инвентарь реально поменялся.
   //
   // Критерий AI-таба (user complaint *«отображаются терминалы, хотя внутри
   // никакой Claude не запущен»* — без этого фильтра в выпадающем списке
@@ -1286,55 +1723,56 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
   //               определению AI-таб, sessionId может быть пуст до первой
   //               отправки)
   const fingerprint = useWorkspaceStore((state) => {
-    let projectId: string | null = null;
-    let workspaceRef: ReturnType<typeof state.openProjects.get> | null = null;
+    let ownerProjectId: string | null = null;
+    const parts: string[] = ['owner:'];
     for (const [pid, ws] of state.openProjects) {
-      if (ws.tabs.has(tabId)) { projectId = pid; workspaceRef = ws; break; }
+      if (ws.tabs.has(tabId)) ownerProjectId = pid;
+      const projectBits: string[] = [pid, ws.projectPath || ''];
+      for (const t of ws.tabs.values()) {
+        if (t.parentTabId) continue;
+        const kind = aiKindForTab(t);
+        if (!kind) continue;
+        projectBits.push(t.id + ':' + (t.name || '') + ':' + kind);
+      }
+      parts.push(projectBits.join('~'));
     }
-    if (!projectId || !workspaceRef) return '';
-    const parts: string[] = [projectId];
-    for (const t of workspaceRef.tabs.values()) {
-      if (t.parentTabId) continue;
-      const isSDK = t.tabType === 'claude-sdk';
-      const isClaudePTY = !isSDK && t.commandType === 'claude' && !!t.claudeSessionId;
-      const isCodex = !isSDK && t.commandType === 'codex' && !!t.codexSessionId;
-      const isGemini = !isSDK && t.commandType === 'gemini' && !!t.geminiSessionId;
-      if (!isSDK && !isClaudePTY && !isCodex && !isGemini) continue;
-      parts.push(t.id + ':' + (t.name || ''));
-    }
+    parts[0] = 'owner:' + (ownerProjectId || '');
     return parts.join('|');
   });
 
-  const aiTabs = useMemo<AiTab[]>(() => {
-    if (!fingerprint) return [];
+  const inventory = useMemo<{ groups: AiProjectGroup[]; ownerProjectId: string | null; selectedTargetProjectId: string | null }>(() => {
+    if (!fingerprint) return { groups: [], ownerProjectId: null, selectedTargetProjectId: null };
     const state = useWorkspaceStore.getState();
-    let ws: ReturnType<typeof state.openProjects.get> | null = null;
-    for (const w of state.openProjects.values()) {
-      if (w.tabs.has(tabId)) { ws = w; break; }
+    let ownerProjectId: string | null = null;
+    let selectedTargetProjectId: string | null = null;
+    const groups: AiProjectGroup[] = [];
+    for (const [projectId, ws] of state.openProjects) {
+      const isOwnerProject = ws.tabs.has(tabId);
+      if (isOwnerProject) ownerProjectId = projectId;
+      const tabs: AiTab[] = [];
+      // Map.values() preserves insertion order — and the workspace store
+      // mutates the Map during reorder so this matches the user-visible tab
+      // order in the terminal sidebar.
+      for (const t of ws.tabs.values()) {
+        if (t.parentTabId) continue;
+        const kind = aiKindForTab(t);
+        if (!kind) continue;
+        const row = { id: t.id, name: t.name || t.id.slice(-6), kind, projectId };
+        tabs.push(row);
+        if (t.id === runAfterTabId) selectedTargetProjectId = projectId;
+      }
+      if (tabs.length > 0 || isOwnerProject) {
+        groups.push({
+          projectId,
+          name: projectLabel(ws.projectPath, projectId),
+          isOwnerProject,
+          tabs,
+        });
+      }
     }
-    if (!ws) return [];
-    // Map.values() preserves insertion order — and `useWorkspaceStore.openTab`
-    // appends new tabs in user-visible sidebar order, so we get them ordered
-    // exactly as the user sees them (per user's spec: «порядок вкладок должен
-    // быть такой же, как в левом сайдбаре»).
-    const out: AiTab[] = [];
-    for (const t of ws.tabs.values()) {
-      if (t.parentTabId) continue;
-      const isSDK = t.tabType === 'claude-sdk';
-      const isClaudePTY = !isSDK && t.commandType === 'claude' && !!t.claudeSessionId;
-      const isCodex = !isSDK && t.commandType === 'codex' && !!t.codexSessionId;
-      const isGemini = !isSDK && t.commandType === 'gemini' && !!t.geminiSessionId;
-      let kind: AiTabKind | null = null;
-      if (isSDK) kind = 'claude-sdk';
-      else if (isClaudePTY) kind = 'claude-pty';
-      else if (isCodex) kind = 'codex';
-      else if (isGemini) kind = 'gemini';
-      if (!kind) continue;
-      out.push({ id: t.id, name: t.name || t.id.slice(-6), kind });
-    }
-    return out;
+    return { groups, ownerProjectId, selectedTargetProjectId };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fingerprint, tabId]);
+  }, [fingerprint, tabId, runAfterTabId]);
 
   // Live per-tab busy map — mirrors TabBar's provider busy maps. The
   // status icon (spinner vs nothing) must update reactively for BACKGROUND
@@ -1373,11 +1811,21 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
   }, []);
 
   const [open, setOpen] = useState(false);
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [showAllTabs, setShowAllTabs] = useState(false);
+  const [closeHover, setCloseHover] = useState(false);
+  const [countHover, setCountHover] = useState(false);
   // Anchor coords for the side slideout — set on every open so it tracks
   // viewport resizes mid-session.
   const [anchor, setAnchor] = useState<{ top: number; right: number; height: number } | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const exists = selectedProjectId && inventory.groups.some((g) => g.projectId === selectedProjectId);
+    if (exists) return;
+    setSelectedProjectId(inventory.selectedTargetProjectId ?? inventory.ownerProjectId ?? inventory.groups[0]?.projectId ?? null);
+  }, [inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, selectedProjectId]);
 
   // Outside-click + Esc → close.
   useEffect(() => {
@@ -1410,8 +1858,10 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
       right: window.innerWidth - r.left + 6,
       height: r.height,
     });
+    setSelectedProjectId(inventory.selectedTargetProjectId ?? inventory.ownerProjectId ?? inventory.groups[0]?.projectId ?? null);
+    setShowAllTabs(false);
     setOpen(true);
-  }, [panelRef]);
+  }, [inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, panelRef]);
 
   // Status: drives the right-side icon both in the closed pill (for the
   // selected target) and in each open-menu row. 2-state by design — a tab
@@ -1421,21 +1871,27 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
   type Status = 'busy' | 'idle';
   const statusFor = (id: string): Status => (busyMap.get(id) === true ? 'busy' : 'idle');
 
+  const allAiTabs = useMemo(() => inventory.groups.flatMap((g) => g.tabs), [inventory.groups]);
   const selectedTab = runAfterTabId
-    ? aiTabs.find((t) => t.id === runAfterTabId) ?? null
+    ? allAiTabs.find((t) => t.id === runAfterTabId) ?? null
     : null;
   const selectedStatus = selectedTab ? statusFor(selectedTab.id) : null;
-  const truncate = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+  const selectedProject = inventory.groups.find((g) => g.projectId === selectedProjectId) ?? inventory.groups[0] ?? null;
+  const targetTabs = selectedProject ? selectedProject.tabs.filter((t) => t.id !== tabId) : [];
+  const loaderCount = targetTabs.filter((t) => statusFor(t.id) === 'busy').length;
+  const visibleTabs = showAllTabs
+    ? targetTabs
+    : targetTabs.filter((t) => statusFor(t.id) === 'busy' || t.id === runAfterTabId);
 
   // Armed palette: purple is a translucent BACKGROUND fill only; border + text
   // are white. Purple as foreground (text/thin border) on near-black is low
   // contrast and "режет глаза" — white foreground on a soft violet fill reads
   // cleanly on the dark overlay. (User: «только background фиолетовым, рамку и
   // цвет внутри — белым».)
-  const armed = !!runAfterTabId;
-  const triggerBorder = armed ? 'rgba(255,255,255,0.55)' : BORDER;
-  const triggerColor = armed ? '#fff' : TEXT_MUTED;
-  const triggerBg = armed ? `${DEEP_PULSE}33` : 'transparent';
+  const armed = !!selectedTab;
+  const triggerBorder = open ? 'rgba(255,255,255,0.78)' : (armed ? 'rgba(255,255,255,0.55)' : BORDER);
+  const triggerColor = (armed || open) ? '#fff' : TEXT_MUTED;
+  const triggerBg = open ? 'rgba(255,255,255,0.08)' : (armed ? `${DEEP_PULSE}33` : 'transparent');
 
   return (
     <>
@@ -1461,6 +1917,7 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
           whiteSpace: 'nowrap',
           overflow: 'hidden',
           boxSizing: 'border-box',
+          boxShadow: open ? '0 0 0 1px rgba(255,255,255,0.22)' : 'none',
           transition: 'background 0.12s, border-color 0.12s, color 0.12s',
         }}
       >
@@ -1476,7 +1933,7 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
               overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
               textAlign: 'left',
               fontSize: 11,  // +2px on the tab name (button base is 9) per user request
-            }}>{truncate(selectedTab.name, 9)}</span>
+            }}>{selectedTab.name}</span>
             <StatusIcon status={selectedStatus!} color="#fff" />
           </>
         ) : (
@@ -1520,42 +1977,102 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
               display: 'flex', flexDirection: 'column',
               overflow: 'hidden',
             }}
+            onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
           >
             <div style={{
-              padding: '6px 8px',
+              padding: '6px 8px 5px',
               borderBottom: `1px solid ${BORDER}`,
-              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              display: 'flex', flexDirection: 'column', gap: 5,
               fontSize: 10, color: TEXT_MUTED,
             }}>
-              <span>Run after · pick a tab</span>
-              <button
-                onClick={() => setOpen(false)}
-                style={{ background: 'transparent', border: 'none', color: TEXT_DIM, cursor: 'pointer', fontSize: 14, padding: 0, lineHeight: 1 }}
-              >×</button>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  Run after · pick a tab
+                </span>
+                <button
+                  onClick={() => setShowAllTabs((v) => !v)}
+                  onMouseEnter={() => setCountHover(true)}
+                  onMouseLeave={() => setCountHover(false)}
+                  title={showAllTabs ? 'Show only tabs with loader' : 'Show all AI tabs'}
+                  style={{
+                    flexShrink: 0,
+                    padding: '1px 5px',
+                    border: `1px solid ${showAllTabs ? 'rgba(255,255,255,0.38)' : BORDER}`,
+                    borderRadius: 999,
+                    background: countHover ? `${DEEP_PULSE}26` : (showAllTabs ? `${DEEP_PULSE}33` : 'transparent'),
+                    color: countHover || showAllTabs ? '#fff' : TEXT_DIM,
+                    cursor: 'pointer',
+                    fontSize: 9,
+                    lineHeight: 1.35,
+                  }}
+                >
+                  {loaderCount}/{targetTabs.length}
+                </button>
+                <button
+                  onClick={() => setOpen(false)}
+                  onMouseEnter={() => setCloseHover(true)}
+                  onMouseLeave={() => setCloseHover(false)}
+                  title="Close"
+                  style={{
+                    width: 18, height: 18,
+                    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                    background: closeHover ? `${DELETE_RED}22` : 'transparent',
+                    border: `1px solid ${closeHover ? `${DELETE_RED}66` : 'transparent'}`,
+                    borderRadius: 5,
+                    color: closeHover ? '#fff' : TEXT_DIM,
+                    cursor: 'pointer',
+                    fontSize: 14,
+                    padding: 0,
+                    lineHeight: 1,
+                    transition: 'background 0.12s, border-color 0.12s, color 0.12s',
+                  }}
+                >×</button>
+              </div>
+
+              <div
+                className="scrollbar-hide"
+                style={{
+                  display: 'flex',
+                  gap: 4,
+                  overflowX: 'auto',
+                  overflowY: 'hidden',
+                  paddingBottom: 1,
+                }}
+              >
+                {inventory.groups.map((g) => (
+                  <ProjectChip
+                    key={g.projectId}
+                    label={g.name}
+                    selected={g.projectId === selectedProject?.projectId}
+                    isOwner={g.isOwnerProject}
+                    count={g.tabs.filter((t) => t.id !== tabId && statusFor(t.id) === 'busy').length}
+                    total={g.tabs.filter((t) => t.id !== tabId).length}
+                    onClick={() => setSelectedProjectId(g.projectId)}
+                  />
+                ))}
+              </div>
             </div>
 
-            <div style={{ overflowY: 'auto', flex: 1, padding: 2 }}>
-              {/* Row 0: clear target → fall back to own-tab autoRun behaviour.
-                  Click on the row when it's already selected (= runAfterTabId
-                  is null) is a no-op — there's nothing to invert from. */}
-              <RunAfterRow
-                label="— no target —"
-                colorDot="transparent"
-                statusIcon={null}
-                selected={!runAfterTabId}
-                onClick={() => { setRunAfterTab(tabId, null); setOpen(false); }}
-                muted
-              />
-              {aiTabs.length === 0 && (
+            <div className="scrollbar-thin" style={{ overflowY: 'auto', flex: 1, padding: 3 }}>
+              {!selectedProject && (
                 <div style={{ padding: '12px 8px', fontSize: 9, color: TEXT_DIM, textAlign: 'center', lineHeight: 1.4 }}>
-                  no AI tabs in this project<br/>
-                  <span style={{ color: '#555' }}>(start Claude / Codex / Gemini in another tab to make it appear here)</span>
+                  no open projects
                 </div>
               )}
-              {aiTabs.map((t) => {
-                // Hide the queue-owner self-row (selecting yourself = wait-forever).
-                if (t.id === tabId) return null;
+              {selectedProject && targetTabs.length === 0 && (
+                <div style={{ padding: '12px 8px', fontSize: 9, color: TEXT_DIM, textAlign: 'center', lineHeight: 1.4 }}>
+                  no target AI tabs<br/>
+                  <span style={{ color: '#555' }}>start Claude / Codex / Gemini in another tab</span>
+                </div>
+              )}
+              {selectedProject && targetTabs.length > 0 && visibleTabs.length === 0 && (
+                <div style={{ padding: '12px 8px', fontSize: 9, color: TEXT_DIM, textAlign: 'center', lineHeight: 1.4 }}>
+                  no loader tabs<br/>
+                  <span style={{ color: '#555' }}>click {loaderCount}/{targetTabs.length} to show all</span>
+                </div>
+              )}
+              {visibleTabs.map((t) => {
                 const status = statusFor(t.id);
                 const isSelected = runAfterTabId === t.id;
                 return (
@@ -1567,9 +2084,8 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
                     selected={isSelected}
                     onClick={() => {
                       // Toggle-off: clicking the already-selected row clears
-                      // the target back to «no target». Lets the user undo
-                      // their pick without scrolling up to row 0. User spec:
-                      // «инверсия, с неё снимается выделение, получается NoTarget».
+                      // the target. No separate "no target" row: selection
+                      // itself is the place where the inverse action lives.
                       setRunAfterTab(tabId, isSelected ? null : t.id);
                       setOpen(false);
                     }}
@@ -1585,8 +2101,52 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
   );
 }
 
-// One dropdown row. Centralised so spacing/hover stays uniform across the
-// "no target" row, all tab rows, and any future "category header" rows.
+function ProjectChip({
+  label, selected, isOwner, count, total, onClick,
+}: {
+  label: string;
+  selected: boolean;
+  isOwner: boolean;
+  count: number;
+  total: number;
+  onClick: () => void;
+}) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      title={`${label}: ${count} loader / ${total} AI tabs`}
+      style={{
+        flex: '0 0 auto',
+        maxWidth: 118,
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4,
+        padding: '2px 6px',
+        borderRadius: 999,
+        border: `1px solid ${selected ? 'rgba(255,255,255,0.5)' : (hover ? `${DEEP_PULSE}55` : BORDER)}`,
+        background: selected ? 'rgba(255,255,255,0.08)' : (hover ? `${DEEP_PULSE}1f` : 'transparent'),
+        color: selected ? '#fff' : (hover ? '#ddd' : TEXT_DIM),
+        cursor: 'pointer',
+        fontSize: 9,
+        lineHeight: 1.25,
+        whiteSpace: 'nowrap',
+        minWidth: 0,
+      }}
+    >
+      {isOwner && <span style={{ width: 4, height: 4, borderRadius: '50%', background: '#fff', opacity: 0.7, flexShrink: 0 }} />}
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
+      {count > 0 && (
+        <span style={{ color: selected ? '#fff' : PULSE, fontSize: 8, flexShrink: 0 }}>{count}</span>
+      )}
+    </button>
+  );
+}
+
+// One dropdown row. Centralised so spacing/hover stays uniform across all tab
+// rows and any future category header rows.
 function RunAfterRow({
   label, colorDot, statusIcon, selected, onClick, muted,
 }: {
@@ -1610,10 +2170,11 @@ function RunAfterRow({
         // is low-contrast / harsh). +2px on the label per user request.
         background: selected ? `${DEEP_PULSE}40` : (hover ? `${DEEP_PULSE}1a` : 'transparent'),
         border: 'none',
-        borderRadius: 3,
+        borderRadius: 5,
         color: muted ? TEXT_DIM : (selected ? '#fff' : '#ddd'),
         cursor: 'pointer',
         fontSize: 12,
+        lineHeight: 1.18,
         display: 'flex', alignItems: 'center', gap: 6,
         textAlign: 'left',
       }}
@@ -1625,7 +2186,9 @@ function RunAfterRow({
       }} />
       <span style={{
         flex: 1, minWidth: 0,
-        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        overflow: 'visible',
+        whiteSpace: 'normal',
+        overflowWrap: 'anywhere',
       }}>{label}</span>
       {statusIcon}
     </button>

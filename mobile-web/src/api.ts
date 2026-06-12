@@ -119,6 +119,8 @@ export type ProcessBarCfg = {
 // desktop's PromptQueueCore (usePromptQueueStore.ts).
 export type QueueItem = {
   id: string;
+  title?: string;
+  titleManual?: boolean;
   text: string;
   images: number;
   createdAt: number;
@@ -133,13 +135,13 @@ export type QueueCore = {
   postPromptEnabled: boolean;
   postPromptText: string;
 };
-export type QueueAiTab = { id: string; name: string; kind: 'claude-pty' | 'claude-sdk' | 'gemini' };
+export type QueueAiTab = { id: string; name: string; kind: 'claude-pty' | 'claude-sdk' | 'gemini' | 'codex' };
 export type QueueData = { tabId: string; queue: QueueCore; aiTabs: QueueAiTab[] };
 // Mutation ops — each maps 1:1 to a desktop store method.
 export type QueueOp =
-  | { op: 'add'; args: { text: string } }
+  | { op: 'add'; args: { text: string; title?: string } }
   | { op: 'remove'; args: { id: string } }
-  | { op: 'update'; args: { id: string; text: string } }
+  | { op: 'update'; args: { id: string; text: string; title?: string; titleManual?: boolean } }
   | { op: 'reorder'; args: { fromIndex: number; toIndex: number } }
   | { op: 'clear'; args?: {} }
   | { op: 'setAutoRun'; args: { value: boolean } }

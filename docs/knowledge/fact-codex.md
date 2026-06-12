@@ -14,7 +14,9 @@ Codex поддержан как третий PTY-agent рядом с Claude и G
 
 Стартовые параметры модели и effort можно передавать сразу: `--model <id>` и `-c 'model_reasoning_effort="<effort>"'`. Это отличается от Claude: у Codex нет отдельного Think-toggle, а reasoning effort меняется через тот же `/model` flow, что и модель.
 
-В ControlBar дефолты Codex (`gpt-5.5` / `xhigh`) — это per-tab UI state, а не скрытый глобальный override запуска. Если вкладка остаётся на дефолте, `codex:run-command` **не** передаёт ни `--model`, ни `model_reasoning_effort`: ожидается что такая пара задана в `~/.codex/config.toml` и принадлежит самому Codex. Аргументы добавляются только когда пользователь явно уводит конкретную вкладку от дефолта. Это защищает от «глобального эха»: настройка одной вкладки не должна молча становиться launch-параметром для всех последующих Codex-сессий.
+Стартовые параметры Codex теперь двухслойные. StatusBar хранит app-level defaults (`defaultCodexModel/defaultCodexEffort`); `none` означает «не добавлять CLI override, пусть Codex читает `~/.codex/config.toml`». ControlBar хранит per-tab `codexModel/codexEffort`, и tab-scoped значения выигрывают над StatusBar. Если итоговые значения не `none`, `codex:run-command` получает `--model` и `-c 'model_reasoning_effort="..."'`.
+
+Модель/effort Codex должны попасть в process-start args, в отличие от Claude startup chain через TUI. Поэтому все renderer launch paths обязаны идти через общий payload helper: Start/Continue/Fork в ControlBar, manual interception `codex`/`codex-c`/`codex-f` в Terminal, pendingAction restore, AutoResume, Resume All и interrupted overlay. Main process дополнительно читает SQLite `app_state`, если payload пришёл без model/effort: это защищает запуск во время renderer hydration или после смены dev-origin, когда localStorage уже не авторитетен. Не возвращать старое правило «не передавать `gpt-5.5/xhigh`, если они совпали с UI fallback»: после выбора в StatusBar это явное намерение пользователя, а не локальный дефолт компонента.
 
 ## Timeline и History
 
@@ -29,6 +31,12 @@ Codex compact надо читать из **top-level** записи `type: "comp
 `replacement_history` может быть очень большим и содержать вложенные content-parts. В HistoryPanel его можно форматировать в полный текст, но Timeline polling не должен таскать это поле каждые 2 секунды: `codex:get-timeline` отдаёт короткое `Conversation compacted` + token count, а self-tooltip при Cmd-hover по compact marker лениво дёргает `codex:get-full-history`, достаёт `compactSummary` по uuid и кэширует. При форматировании пропускай/заменяй тяжёлые и нечитаемые части (`input_image`, `image_url`, `data:image`, encrypted compaction state) на короткие маркеры вроде `[image omitted]`, иначе один hover/copy может утащить base64 вместо полезной истории.
 
 Docs-индикаторы для Codex собираются в `codex:get-timeline` из `response_item`, пока парсер стоит на текущем user-turn. `function_call` с `namespace: "mcp__knowledge"` и `name: "docs_search"` добавляет query в `docsSearchQueries`; `custom_tool_call` / `function_call` с `name: "apply_patch"` извлекает только patch headers `*** Add/Update/Delete File:` для `docs/` и `CLAUDE.md` в `docsEdited`. Не искать docs-события в `function_call_output` или stdout: там могут лежать большие Read-результаты, pasted docs-rules и diff'ы, что даёт ложные «документация обновлена» на Timeline. Цвета и precedence этих атрибутов описаны в `fact-timeline.md::Docs-индикаторы`.
+
+Cmd+\ History controls для Codex идут через agent-runtime adapter, а не через Claude-specific ветки внутри HistoryPanel. Правая панель только рендерит оболочку: статус, textarea, Resume/Stop/Pull/Send/Interrupt; Codex-runtime владеет resume через `codex-c`, stop через `terminal:stop-ai-process`, send через `codex:send-command`, draft-grab через `codex:grab-input`, presence через `terminal:getCommandState` + `codex:get-turn-state`. Это нужно, чтобы следующий PTY-agent (Gemini или другой CLI) добавлялся новым runtime, а не ростом условных веток в HistoryPanel.
+
+History send preflight для Codex сначала читает xterm visual state (`terminalRegistry.getCodexDraftState`). `hasDraft=false` с `source=*:dim-hint` означает пустой composer и **не должен** вызывать `codex:grab-input`: Ctrl+G/external-editor cycle на пустом prompt'е меняет TUI-состояние и может проглотить следующий immediate `codex:send-command`. `hasDraft=true` → вызвать `codex:grab-input`, атомарно забрать и очистить composer, append'нуть текст в History textarea, показать `Send stopped · draft moved` и не отправлять History prompt. `hasDraft=null` → fail closed, потому что speculative send может склеить пользовательский draft с новым prompt'ом.
+
+Manual Pull из History использует тот же visual-state guard. При `hasDraft=false` это no-op: не трогать external-editor helper, не показывать жёлтое `Send stopped`, а дать короткий нейтральный `Terminal input empty`. Это защищает от ложного пользовательского вывода «отправка была остановлена», когда на самом деле переноса не было.
 
 ## Usage limits
 
@@ -46,6 +54,8 @@ Prompt Queue / Run after использует тот же high-level слой: `
 
 Граница `Escape`: приложение не считает raw `Escape`/`Ctrl+C` Codex-сигналом само по себе. Для Codex авторитетен только rollout JSONL: если после вмешательства появился `turn_aborted`, loader гасится и Run after disarm'ится. Claude-style fallback «нажали Escape → через короткую idle-проверку принудительно busy=false» пока не переносить на Codex без реального симптома, иначе можно получить ложный обрыв long-running turn'а.
 
+То же правило действует в Cmd+\ History controls: успешный `codex:send-command` и `PasteBusy` не переводят Codex в долгоживущий `BUSY`, а только `task_started` из rollout JSONL. После Ctrl+C/interrupt HistoryPanel не ставит `READY` оптимистически; он ждёт `turn_aborted` или `task_complete`, затем обновляет presence через `codex:get-turn-state`. Пользовательский симптом нарушения — справа залипает `BUSY` после пустой отправки, или наоборот панель показывает `READY` сразу после Escape, пока turn ещё жив.
+
 ### OSC 133 D→B debounce внутри Codex TUI
 
 У Codex есть дополнительный shell-layer шум: PTY shell может эмитить OSC 133 `D` (`terminal:command-finished`) на короткой внутренней границе, а затем почти сразу приходит `B` и Codex продолжает тот же TUI lifecycle. Если на первый `D` сразу делать общий command-finished cleanup, приложение преждевременно чистит `codexKnownSessions`, закрывает turn watcher и гасит process state; пользователь видит микрофлап loader'а или Continue-state при живом Codex.
@@ -55,6 +65,8 @@ Prompt Queue / Run after использует тот же high-level слой: `
 ## Модели и effort
 
 Список моделей нужно брать из live `codex debug models`. Bundled catalog используется только fallback'ом: он может содержать hidden/internal/upgrade-only rows, которые интерактивный `/model` picker не примет. UI синхронизирует свои варианты обратно из реально распарсенного picker'а, потому что именно TUI является финальным источником «какие строки доступны этому аккаунту сейчас».
+
+Renderer-side список launch-options держится в одном месте рядом с default settings, а main-side picker parser держит named effort candidates отдельно от regex-магии. При изменении Codex labels сохраняй порядок `xhigh` перед `high`: иначе `Extra high` матчится как обычный `high` и UI показывает успешный выбор неправильного effort.
 
 `/model` открывает два последовательных picker'а: сначала модель, потом effort. Парсер обязан:
 - раскрывать `\x1b[<N>C` в реальные пробелы до `stripVTControlCharacters`, иначе строки слипаются;

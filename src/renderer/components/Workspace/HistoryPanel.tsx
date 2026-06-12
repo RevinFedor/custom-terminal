@@ -1,22 +1,16 @@
 import React, { useEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, Send, Square, RotateCcw, Power, AlertTriangle } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
-import { useUIStore } from '../../store/useUIStore';
+import { HISTORY_PANEL_DEFAULT_WIDTH, useUIStore } from '../../store/useUIStore';
 import Tooltip from '../UI/Tooltip';
 import {
-  answerClaudeQuestion,
-  grabClaudePtyDraft,
-  getClaudePendingQuestion,
-  getClaudePtyPresence,
-  interruptClaudePtyTurn,
-  resumeClaudePtySession,
-  sendClaudePtyPrompt,
-  stopClaudePtyProcess,
-  type ClaudePtyDraftGrabResult,
-  type ClaudePendingQuestion,
-  type ClaudeQuestion,
-  type ClaudePtyStatus,
-} from '../../utils/claudePtyActions';
+  getHistoryAgentRuntime,
+  type AgentDraftGrabResult,
+  type AgentHistoryTool,
+  type AgentPendingQuestion,
+  type AgentPtyStatus,
+  type AgentQuestion,
+} from '../../utils/historyAgentRuntimes';
 // Shared conversation blocks — same renderer as the SDK tab. The JSONL history
 // window now draws tool-calls / diff / thinking / markdown through this package
 // so its style matches the rest of the app. Subagents (Task) are intentionally
@@ -385,12 +379,17 @@ const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolT
           <>
             {entry.actions!.map((a, i) => {
               if (isRawAction(a)) {
+                const toolName = String(a.rawTool.toolName || '');
+                const toolResult = a.rawTool.result;
+                const historyResult = toolResult == null && toolName.toLowerCase().includes('mcp')
+                  ? ''
+                  : toolResult;
                 return (
                   <CBToolCallPart
                     key={'raw' + i}
-                    toolName={a.rawTool.toolName}
+                    toolName={toolName}
                     args={a.rawTool.args || {}}
-                    result={a.rawTool.result}
+                    result={historyResult}
                     isError={a.rawTool.isError}
                   />
                 );
@@ -438,18 +437,18 @@ if (!document.getElementById('hp-flash-style')) {
   background-color: rgba(234, 179, 8, 0.8);
   color: #000;
 }
-.hp-claude-prompt::placeholder {
+.hp-agent-prompt::placeholder {
   color: #666;
   opacity: 1;
 }
-.hp-claude-prompt[data-status="inactive"]::placeholder,
-.hp-claude-prompt[data-status="starting"]::placeholder {
+.hp-agent-prompt[data-status="inactive"]::placeholder,
+.hp-agent-prompt[data-status="starting"]::placeholder {
   color: #555;
 }`;
   document.head.appendChild(style);
 }
 
-const CLAUDE_STATUS_META: Record<ClaudePtyStatus, { label: string; color: string }> = {
+const AGENT_STATUS_META: Record<AgentPtyStatus, { label: string; color: string }> = {
   active: { label: 'READY', color: '#4ade80' },
   busy: { label: 'BUSY', color: '#d97706' },
   inactive: { label: 'STOPPED', color: '#777' },
@@ -487,7 +486,7 @@ const DRAFT_GRAB_ERROR_MESSAGES: Record<string, string> = {
   timeout: 'Draft grab timed out',
 };
 
-const draftGrabErrorText = (result: ClaudePtyDraftGrabResult | null | undefined) => {
+const draftGrabErrorText = (result: AgentDraftGrabResult | null | undefined) => {
   const code = result?.error || 'unknown';
   return DRAFT_GRAB_ERROR_MESSAGES[code] || ('Draft grab failed: ' + code);
 };
@@ -500,6 +499,39 @@ const appendPromptText = (base: string, addition: string) => {
   return left + '\n\n' + right;
 };
 
+const prependPromptText = (base: string, addition: string) => {
+  const left = addition.trim();
+  const right = base.trimStart();
+  if (!left) return right;
+  if (!right) return left;
+  return left + '\n\n' + right;
+};
+
+const getDraftNoticeMeta = (message: string) => {
+  if (/terminal input is empty/i.test(message)) {
+    return {
+      label: 'Terminal input empty',
+      tone: 'info' as const,
+    };
+  }
+  if (/interrupted prompt/i.test(message)) {
+    return {
+      label: 'Prompt restored',
+      tone: 'warning' as const,
+    };
+  }
+  if (/image placeholder/i.test(message)) {
+    return {
+      label: 'Draft moved · images',
+      tone: 'warning' as const,
+    };
+  }
+  return {
+    label: 'Send stopped · draft moved',
+    tone: 'warning' as const,
+  };
+};
+
 function ClaudeHistoryQuestionCard({
   pending,
   answering,
@@ -507,7 +539,7 @@ function ClaudeHistoryQuestionCard({
   onAnswer,
   onStop,
 }: {
-  pending: ClaudePendingQuestion;
+  pending: AgentPendingQuestion;
   answering: boolean;
   error: string | null;
   onAnswer: (answers: Record<string, string>) => void;
@@ -531,7 +563,7 @@ function ClaudeHistoryQuestionCard({
     if (questionIndex >= questions.length && questions.length > 0) setQuestionIndex(questions.length - 1);
   }, [questionIndex, questions.length]);
 
-  const currentQuestion: ClaudeQuestion | null = questions.length > 0
+  const currentQuestion: AgentQuestion | null = questions.length > 0
     ? questions[Math.min(questionIndex, questions.length - 1)]
     : null;
   const currentOptions = currentQuestion?.options || [];
@@ -768,57 +800,77 @@ function ClaudeHistoryQuestionCard({
   );
 }
 
-function ClaudeHistoryControls({
+function AgentHistoryControls({
   tabId,
   sessionId,
   cwd,
+  toolType,
   onHistoryRefresh,
 }: {
   tabId: string;
   sessionId: string;
   cwd: string;
+  toolType: AgentHistoryTool;
   onHistoryRefresh: () => void;
 }) {
-  const [status, setStatus] = useState<ClaudePtyStatus>('inactive');
+  const runtime = useMemo(() => getHistoryAgentRuntime(toolType), [toolType]);
+  const [status, setStatus] = useState<AgentPtyStatus>('inactive');
   const [prompt, setPrompt] = useState('');
   const [busyAction, setBusyAction] = useState<'resume' | 'send' | 'interrupt' | 'stop' | 'grab' | null>(null);
   const [isPasteBusy, setIsPasteBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [draftWarning, setDraftWarning] = useState<string | null>(null);
-  const [pendingQuestion, setPendingQuestion] = useState<ClaudePendingQuestion | null>(null);
+  const [pendingQuestion, setPendingQuestion] = useState<AgentPendingQuestion | null>(null);
   const [answeringQuestion, setAnsweringQuestion] = useState(false);
   const [questionError, setQuestionError] = useState<string | null>(null);
   const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const tabIdRef = useRef(tabId);
-  const statusRef = useRef<ClaudePtyStatus>('inactive');
+  const statusRef = useRef<AgentPtyStatus>('inactive');
   const actionInFlightRef = useRef(false);
   const actionSeqRef = useRef(0);
   const pasteBusyRef = useRef(false);
-  const pendingQuestionRef = useRef<ClaudePendingQuestion | null>(null);
+  const pendingQuestionRef = useRef<AgentPendingQuestion | null>(null);
   const answeringQuestionRef = useRef(false);
   const midstreamPromptRecoveryRef = useRef<{ text: string; at: number } | null>(null);
   const interruptRecoveryInFlightRef = useRef(false);
+  const emptyDraftNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const setStatusFrom = useCallback((next: ClaudePtyStatus, reason: string) => {
+  const clearEmptyDraftNoticeTimer = useCallback(() => {
+    if (emptyDraftNoticeTimerRef.current) {
+      clearTimeout(emptyDraftNoticeTimerRef.current);
+      emptyDraftNoticeTimerRef.current = null;
+    }
+  }, []);
+
+  const showEmptyDraftNotice = useCallback((message: string) => {
+    clearEmptyDraftNoticeTimer();
+    setDraftWarning(message);
+    emptyDraftNoticeTimerRef.current = setTimeout(() => {
+      emptyDraftNoticeTimerRef.current = null;
+      setDraftWarning((current) => current === message ? null : current);
+    }, 1100);
+  }, [clearEmptyDraftNoticeTimer]);
+
+  const setStatusFrom = useCallback((next: AgentPtyStatus, reason: string) => {
     const prev = statusRef.current;
     statusRef.current = next;
     if (prev !== next) {
-      console.log('[ClaudeHistoryControls] status tab=' + tabId.slice(-12) + ' ' + prev + ' -> ' + next + ' reason=' + reason);
+      console.log('[' + runtime.logPrefix + '] status tab=' + tabId.slice(-12) + ' ' + prev + ' -> ' + next + ' reason=' + reason);
     }
     setStatus(next);
-  }, [tabId]);
+  }, [runtime.logPrefix, tabId]);
 
-  const setPendingQuestionFrom = useCallback((next: ClaudePendingQuestion | null, reason: string) => {
+  const setPendingQuestionFrom = useCallback((next: AgentPendingQuestion | null, reason: string) => {
     pendingQuestionRef.current = next;
     setPendingQuestion(next);
     console.log('[ClaudeHistoryQuestion] pending tab=' + tabId.slice(-12) + ' reason=' + reason + ' source=' + (next?.source || 'none') + ' qs=' + (next?.questions?.length || 0));
   }, [tabId]);
 
   const refreshPendingQuestion = useCallback(async (reason: string) => {
-    if (!tabId) return null;
+    if (!tabId || !runtime.getPendingQuestion) return null;
     const requestTabId = tabId;
     try {
-      const pending = await getClaudePendingQuestion(tabId);
+      const pending = await runtime.getPendingQuestion(tabId);
       if (tabIdRef.current !== requestTabId) return null;
       setPendingQuestionFrom(pending, reason);
       if (pending && (pending.questions?.length || 0) === 0) {
@@ -832,13 +884,13 @@ function ClaudeHistoryControls({
       setQuestionError(message);
       return null;
     }
-  }, [setPendingQuestionFrom, tabId]);
+  }, [runtime, setPendingQuestionFrom, tabId]);
 
   const refreshPresence = useCallback(async () => {
     if (!tabId) return;
     const requestTabId = tabId;
     try {
-      const presence = await getClaudePtyPresence(tabId);
+      const presence = await runtime.getPresence(tabId);
       if (tabIdRef.current !== requestTabId) return;
       setStatusFrom(presence.status, 'presence');
       if (presence.awaiting) {
@@ -848,10 +900,10 @@ function ClaudeHistoryControls({
       }
     } catch (e: any) {
       if (tabIdRef.current !== requestTabId) return;
-      console.warn('[ClaudeHistoryControls] presence failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
+      console.warn('[' + runtime.logPrefix + '] presence failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
       setStatusFrom('inactive', 'presence-error');
     }
-  }, [refreshPendingQuestion, setPendingQuestionFrom, setStatusFrom, tabId]);
+  }, [refreshPendingQuestion, runtime, setPendingQuestionFrom, setStatusFrom, tabId]);
 
   useEffect(() => {
     tabIdRef.current = tabId;
@@ -871,12 +923,15 @@ function ClaudeHistoryControls({
     setQuestionError(null);
     setStatusFrom('inactive', 'tab-bind');
     refreshPresence();
-  }, [refreshPresence, setStatusFrom, tabId]);
+    return () => {
+      clearEmptyDraftNoticeTimer();
+    };
+  }, [clearEmptyDraftNoticeTimer, refreshPresence, setStatusFrom, tabId]);
 
   useEffect(() => {
     const handleTuiReady = (_: any, data: { tabId?: string }) => {
       if (data?.tabId !== tabId) return;
-      console.log('[ClaudeHistoryControls] tui-ready tab=' + tabId.slice(-12));
+      console.log('[' + runtime.logPrefix + '] ready-event tab=' + tabId.slice(-12));
       refreshPresence();
     };
     const handleStarted = (_: any, data: { tabId?: string }) => {
@@ -913,81 +968,102 @@ function ClaudeHistoryControls({
       if (data?.tabId !== tabId) return;
       pasteBusyRef.current = !!data.busy;
       setIsPasteBusy(!!data.busy);
-      console.log('[ClaudeHistoryControls] paste-busy tab=' + tabId.slice(-12) + ' busy=' + !!data.busy);
+      console.log('[' + runtime.logPrefix + '] paste-busy tab=' + tabId.slice(-12) + ' busy=' + !!data.busy);
     };
 
-    ipcRenderer.on('claude:tui-ready', handleTuiReady);
-    ipcRenderer.on('claude:busy-state', handleBusy);
-    ipcRenderer.on('claude:awaiting-input', handleAwaitingInput);
-    ipcRenderer.on('claude:paste-busy', handlePasteBusy);
+    if (runtime.readyEvent) ipcRenderer.on(runtime.readyEvent, handleTuiReady);
+    ipcRenderer.on(runtime.busyEvent, handleBusy);
+    if (runtime.awaitingEvent) ipcRenderer.on(runtime.awaitingEvent, handleAwaitingInput);
+    if (runtime.pasteBusyEvent) ipcRenderer.on(runtime.pasteBusyEvent, handlePasteBusy);
     ipcRenderer.on('terminal:command-started', handleStarted);
     ipcRenderer.on('terminal:command-finished', handleFinished);
     return () => {
-      ipcRenderer.removeListener('claude:tui-ready', handleTuiReady);
-      ipcRenderer.removeListener('claude:busy-state', handleBusy);
-      ipcRenderer.removeListener('claude:awaiting-input', handleAwaitingInput);
-      ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
+      if (runtime.readyEvent) ipcRenderer.removeListener(runtime.readyEvent, handleTuiReady);
+      ipcRenderer.removeListener(runtime.busyEvent, handleBusy);
+      if (runtime.awaitingEvent) ipcRenderer.removeListener(runtime.awaitingEvent, handleAwaitingInput);
+      if (runtime.pasteBusyEvent) ipcRenderer.removeListener(runtime.pasteBusyEvent, handlePasteBusy);
       ipcRenderer.removeListener('terminal:command-started', handleStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleFinished);
     };
-  }, [refreshPendingQuestion, setPendingQuestionFrom, tabId, refreshPresence, setStatusFrom]);
+  }, [refreshPendingQuestion, runtime, setPendingQuestionFrom, tabId, refreshPresence, setStatusFrom]);
 
   const readTerminalDraft = useCallback(async (reason: string) => {
     const requestTabId = tabId;
-    console.log('[ClaudeHistoryDraft] grab-request tab=' + tabId.slice(-12) + ' reason=' + reason);
-    const result = await grabClaudePtyDraft(tabId);
+    const visualState = runtime.inspectDraft?.(tabId);
+    if (visualState) {
+      console.log('[' + runtime.logPrefix + ':draft] preflight tab=' + tabId.slice(-12) + ' reason=' + reason + ' hasDraft=' + visualState.hasDraft + ' source=' + visualState.source);
+      if (visualState.hasDraft === false) {
+        return { stale: false, text: '', images: 0 };
+      }
+      if (visualState.hasDraft === null) {
+        throw new Error(runtime.label + ' terminal draft state is unknown; send stopped before touching terminal input.');
+      }
+    }
+    console.log('[' + runtime.logPrefix + ':draft] grab-request tab=' + tabId.slice(-12) + ' reason=' + reason);
+    const result = await runtime.grabDraft(tabId);
     if (tabIdRef.current !== requestTabId) return { stale: true, text: '', images: 0 };
     if (!result?.success) {
       const message = draftGrabErrorText(result);
-      console.warn('[ClaudeHistoryDraft] grab-failed tab=' + tabId.slice(-12) + ' reason=' + reason + ' error=' + (result?.error || 'unknown'));
+      console.warn('[' + runtime.logPrefix + ':draft] grab-failed tab=' + tabId.slice(-12) + ' reason=' + reason + ' error=' + (result?.error || 'unknown'));
       throw new Error(message);
     }
     const text = typeof result.text === 'string' ? result.text.trim() : '';
     const images = Number(result.images || 0);
-    console.log('[ClaudeHistoryDraft] grab-ok tab=' + tabId.slice(-12) + ' reason=' + reason + ' chars=' + text.length + ' images=' + images);
+    console.log('[' + runtime.logPrefix + ':draft] grab-ok tab=' + tabId.slice(-12) + ' reason=' + reason + ' chars=' + text.length + ' images=' + images);
     return { stale: false, text, images };
-  }, [tabId]);
+  }, [runtime, tabId]);
 
   useEffect(() => {
+    if (!runtime.supportsInterruptRecovery) return;
     const handleInterruptRecovery = (_: any, data: { tabId?: string; busy?: boolean; reason?: string }) => {
       if (data?.tabId !== tabId || data.busy) return;
+      console.log('[' + runtime.logPrefix + ':draft] interrupt-event tab=' + tabId.slice(-12) + ' reason=' + (data.reason || '-') + ' hasPending=' + !!midstreamPromptRecoveryRef.current);
       if (data.reason !== 'interrupt') {
         midstreamPromptRecoveryRef.current = null;
         return;
       }
       const pending = midstreamPromptRecoveryRef.current;
       if (!pending) {
-        console.log('[ClaudeHistoryDraft] interrupt-recovery skip tab=' + tabId.slice(-12) + ' reason=no-midstream-send');
+        console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery skip tab=' + tabId.slice(-12) + ' reason=no-midstream-send');
         return;
       }
       if (interruptRecoveryInFlightRef.current) {
-        console.log('[ClaudeHistoryDraft] interrupt-recovery skip tab=' + tabId.slice(-12) + ' reason=inflight');
+        console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery skip tab=' + tabId.slice(-12) + ' reason=inflight');
         return;
       }
       const ageMs = Date.now() - pending.at;
       if (ageMs > 120000) {
-        console.log('[ClaudeHistoryDraft] interrupt-recovery skip tab=' + tabId.slice(-12) + ' reason=stale ageMs=' + ageMs);
+        console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery skip tab=' + tabId.slice(-12) + ' reason=stale ageMs=' + ageMs);
         midstreamPromptRecoveryRef.current = null;
         return;
       }
 
       const requestTabId = tabId;
       interruptRecoveryInFlightRef.current = true;
-      console.log('[ClaudeHistoryDraft] interrupt-recovery start tab=' + tabId.slice(-12) + ' ageMs=' + ageMs + ' sentChars=' + pending.text.length);
-      readTerminalDraft('interrupt-recovery')
-        .then((draft) => {
+      console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery start tab=' + tabId.slice(-12) + ' ageMs=' + ageMs + ' sentChars=' + pending.text.length);
+      (async () => {
+        const delays = [0, 160, 420, 900];
+        for (let attempt = 0; attempt < delays.length; attempt++) {
+          const delay = delays[attempt];
+          if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+          if (tabIdRef.current !== requestTabId) return;
+          console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery probe tab=' + tabId.slice(-12) + ' attempt=' + (attempt + 1) + ' delayMs=' + delay);
+          const draft = await readTerminalDraft('interrupt-recovery-' + (attempt + 1));
           if (draft.stale || tabIdRef.current !== requestTabId) return;
           if (!draft.text) {
-            console.log('[ClaudeHistoryDraft] interrupt-recovery empty tab=' + tabId.slice(-12));
-            return;
+            console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery empty tab=' + tabId.slice(-12) + ' attempt=' + (attempt + 1));
+            continue;
           }
-          setPrompt((prev) => appendPromptText(prev, draft.text));
+          setPrompt((prev) => prependPromptText(prev, draft.text));
           setDraftWarning('Claude returned an interrupted prompt; pulled it back from terminal input.');
-          console.log('[ClaudeHistoryDraft] interrupt-recovery restored tab=' + tabId.slice(-12) + ' chars=' + draft.text.length + ' images=' + draft.images);
+          console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery restored tab=' + tabId.slice(-12) + ' attempt=' + (attempt + 1) + ' chars=' + draft.text.length + ' images=' + draft.images);
           requestAnimationFrame(() => promptTextareaRef.current?.focus());
-        })
+          return;
+        }
+        console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery gave-up tab=' + tabId.slice(-12) + ' probes=' + delays.length + ' sentChars=' + pending.text.length);
+      })()
         .catch((e: any) => {
-          console.warn('[ClaudeHistoryDraft] interrupt-recovery failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
+          console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
         })
         .finally(() => {
           if (tabIdRef.current === requestTabId) {
@@ -997,23 +1073,23 @@ function ClaudeHistoryControls({
         });
     };
 
-    ipcRenderer.on('claude:busy-state', handleInterruptRecovery);
+    ipcRenderer.on(runtime.busyEvent, handleInterruptRecovery);
     return () => {
-      ipcRenderer.removeListener('claude:busy-state', handleInterruptRecovery);
+      ipcRenderer.removeListener(runtime.busyEvent, handleInterruptRecovery);
     };
-  }, [readTerminalDraft, tabId]);
+  }, [readTerminalDraft, runtime, tabId]);
 
   const pullTerminalDraft = useCallback(async () => {
     if (actionInFlightRef.current) {
-      console.log('[ClaudeHistoryDraft] drop-pull tab=' + tabId.slice(-12) + ' reason=inflight');
+      console.log('[' + runtime.logPrefix + ':draft] drop-pull tab=' + tabId.slice(-12) + ' reason=inflight');
       return;
     }
     if (statusRef.current !== 'active') {
-      setError('Claude is not ready (' + statusRef.current + ')');
+      setError(runtime.label + ' is not ready (' + statusRef.current + ')');
       return;
     }
     if (pendingQuestionRef.current) {
-      setError('Claude is waiting for a question answer');
+      setError(runtime.label + ' is waiting for a question answer');
       return;
     }
 
@@ -1027,10 +1103,10 @@ function ClaudeHistoryControls({
       const draft = await readTerminalDraft('manual-pull');
       if (draft.stale || tabIdRef.current !== actionTabId) return;
       if (!draft.text) {
-        setDraftWarning('Claude terminal input is empty');
+        showEmptyDraftNotice(runtime.label + ' terminal input is empty');
         return;
       }
-      setPrompt((prev) => appendPromptText(prev, draft.text));
+      setPrompt((prev) => prependPromptText(prev, draft.text));
       if (draft.images > 0) {
         setDraftWarning('Pulled text contains ' + draft.images + ' image placeholder' + (draft.images === 1 ? '' : 's') + '; images are not attached in this History input.');
       }
@@ -1044,15 +1120,15 @@ function ClaudeHistoryControls({
         if (tabIdRef.current === actionTabId) setBusyAction(null);
       }
     }
-  }, [readTerminalDraft, refreshPresence, tabId]);
+  }, [readTerminalDraft, refreshPresence, runtime.label, showEmptyDraftNotice, tabId]);
 
   const runAction = useCallback(async (kind: 'resume' | 'send' | 'interrupt' | 'stop') => {
     if (actionInFlightRef.current) {
-      console.log('[ClaudeHistoryControls] drop-action tab=' + tabId.slice(-12) + ' kind=' + kind + ' reason=inflight');
+      console.log('[' + runtime.logPrefix + '] drop-action tab=' + tabId.slice(-12) + ' kind=' + kind + ' reason=inflight');
       return;
     }
     if (kind === 'send' && pasteBusyRef.current) {
-      console.log('[ClaudeHistoryControls] drop-action tab=' + tabId.slice(-12) + ' kind=send reason=paste-busy');
+      console.log('[' + runtime.logPrefix + '] drop-action tab=' + tabId.slice(-12) + ' kind=send reason=paste-busy');
       return;
     }
     const actionTabId = tabId;
@@ -1063,16 +1139,17 @@ function ClaudeHistoryControls({
     try {
       if (kind === 'resume') {
         setStatusFrom('starting', 'resume-click');
-        const result = await resumeClaudePtySession({ tabId, sessionId, cwd });
+        const result = await runtime.resume({ tabId, sessionId, cwd });
         if (!result.success) throw new Error(result.error || 'Resume failed');
         if (tabIdRef.current !== actionTabId) return;
         if (result.alreadyRunning && result.status) setStatusFrom(result.status, 'resume-already-running');
       } else if (kind === 'send') {
         let text = prompt.trim();
         if (!text) return;
-        if (pendingQuestionRef.current) throw new Error('Claude is waiting for a question answer');
+        if (pendingQuestionRef.current) throw new Error(runtime.label + ' is waiting for a question answer');
         const statusAtSend = statusRef.current;
-        if (statusAtSend !== 'active' && statusAtSend !== 'busy') throw new Error('Claude is not ready (' + statusAtSend + ')');
+        const acceptsBusyPrompt = statusAtSend === 'busy' && runtime.allowSendWhileBusy;
+        if (statusAtSend !== 'active' && !acceptsBusyPrompt) throw new Error(runtime.label + ' is not ready (' + statusAtSend + ')');
         if (statusAtSend === 'active') {
           const terminalDraft = await readTerminalDraft('send-preflight');
           if (terminalDraft.stale || tabIdRef.current !== actionTabId) return;
@@ -1080,7 +1157,7 @@ function ClaudeHistoryControls({
             text = appendPromptText(text, terminalDraft.text);
             setPrompt(text);
             setDraftWarning('Terminal draft found — send stopped, text appended here.');
-            console.log('[ClaudeHistoryDraft] send-preflight blocked tab=' + tabId.slice(-12) + ' chars=' + terminalDraft.text.length + ' images=' + terminalDraft.images);
+            console.log('[' + runtime.logPrefix + ':draft] send-preflight blocked tab=' + tabId.slice(-12) + ' chars=' + terminalDraft.text.length + ' images=' + terminalDraft.images);
             requestAnimationFrame(() => promptTextareaRef.current?.focus());
             if (terminalDraft.images > 0) {
               setDraftWarning('Terminal draft found — send stopped, text appended here. Review image placeholders.');
@@ -1088,27 +1165,33 @@ function ClaudeHistoryControls({
             return;
           }
         } else {
-          console.log('[ClaudeHistoryDraft] send-preflight skipped tab=' + tabId.slice(-12) + ' reason=busy-midstream');
+          console.log('[' + runtime.logPrefix + ':draft] send-preflight skipped tab=' + tabId.slice(-12) + ' reason=busy-midstream');
         }
-        const result = await sendClaudePtyPrompt(tabId, text);
+        const result = await runtime.sendPrompt(tabId, text);
         if (result?.success === false) throw new Error(result?.error || 'Send failed');
         if (tabIdRef.current !== actionTabId) return;
-        if (statusAtSend === 'busy') {
-          midstreamPromptRecoveryRef.current = { text, at: Date.now() };
-          console.log('[ClaudeHistoryDraft] midstream-send tracked tab=' + tabId.slice(-12) + ' chars=' + text.length);
-        } else {
-          midstreamPromptRecoveryRef.current = null;
-        }
+        midstreamPromptRecoveryRef.current = { text, at: Date.now() };
+        console.log('[' + runtime.logPrefix + ':draft] send tracked tab=' + tabId.slice(-12) + ' statusAtSend=' + statusAtSend + ' chars=' + text.length);
         setPrompt('');
         setDraftWarning(null);
-        setStatusFrom('busy', 'send-click');
+        if (runtime.optimisticBusyOnSend) {
+          setStatusFrom('busy', 'send-click');
+        } else {
+          refreshPresence();
+        }
         onHistoryRefresh();
       } else if (kind === 'interrupt') {
-        const result = interruptClaudePtyTurn(tabId);
+        const result = runtime.interruptTurn(tabId);
         if (!result.success) throw new Error(result.error || 'Stop failed');
-        if (result.interrupted && tabIdRef.current === actionTabId) setStatusFrom('active', 'interrupt-click');
+        if (result.interrupted && tabIdRef.current === actionTabId) {
+          if (runtime.optimisticActiveOnInterrupt) {
+            setStatusFrom('active', 'interrupt-click');
+          } else {
+            refreshPresence();
+          }
+        }
       } else if (kind === 'stop') {
-        const result = await stopClaudePtyProcess(tabId);
+        const result = await runtime.stopProcess(tabId);
         if (result?.success === false) throw new Error(result?.error || 'Stop failed');
         if (tabIdRef.current !== actionTabId) return;
         pasteBusyRef.current = false;
@@ -1124,9 +1207,10 @@ function ClaudeHistoryControls({
         if (tabIdRef.current === actionTabId) setBusyAction(null);
       }
     }
-  }, [cwd, onHistoryRefresh, prompt, readTerminalDraft, refreshPresence, sessionId, setStatusFrom, tabId]);
+  }, [cwd, onHistoryRefresh, prompt, readTerminalDraft, refreshPresence, runtime, sessionId, setStatusFrom, tabId]);
 
   const answerPendingQuestion = useCallback(async (answers: Record<string, string>, stop = false) => {
+    if (!runtime.answerQuestion) return;
     if (answeringQuestionRef.current) {
       console.log('[ClaudeHistoryQuestion] drop-answer tab=' + tabId.slice(-12) + ' reason=inflight stop=' + stop);
       return;
@@ -1147,7 +1231,7 @@ function ClaudeHistoryControls({
     setQuestionError(null);
     console.log('[ClaudeHistoryQuestion] answer-start tab=' + tabId.slice(-12) + ' source=' + pending.source + ' stop=' + stop + ' answers=' + Object.keys(answers || {}).length);
     try {
-      const result = await answerClaudeQuestion({ tabId, pendingQuestion: pending, answers, stop });
+      const result = await runtime.answerQuestion({ tabId, pendingQuestion: pending, answers, stop });
       if (result?.success === false) throw new Error(result?.error || result?.reason || 'Question answer failed');
       if (tabIdRef.current !== actionTabId) return;
       setPendingQuestionFrom(null, stop ? 'respond-manually' : 'answered');
@@ -1164,17 +1248,18 @@ function ClaudeHistoryControls({
       if (tabIdRef.current === actionTabId) setAnsweringQuestion(false);
       answeringQuestionRef.current = false;
     }
-  }, [onHistoryRefresh, refreshPendingQuestion, setPendingQuestionFrom, setStatusFrom, tabId]);
+  }, [onHistoryRefresh, refreshPendingQuestion, runtime, setPendingQuestionFrom, setStatusFrom, tabId]);
 
-  const meta = CLAUDE_STATUS_META[status];
+  const meta = AGENT_STATUS_META[status];
   const isTurnBusy = status === 'busy';
   const controlsLocked = !!busyAction || isPasteBusy || answeringQuestion;
-  const canAcceptPrompt = (status === 'active' || status === 'busy');
+  const canAcceptPrompt = status === 'active' || (status === 'busy' && runtime.allowSendWhileBusy);
   const canSend = canAcceptPrompt && prompt.trim().length > 0 && !pendingQuestion && !controlsLocked;
   const canGrabDraft = status === 'active' && !pendingQuestion && !controlsLocked;
   const canInterruptTurn = isTurnBusy && !controlsLocked;
   const canResume = status === 'inactive' && !!sessionId && !busyAction;
   const canStopProcess = (status === 'active' || status === 'busy' || status === 'starting') && !busyAction;
+  const draftNoticeMeta = draftWarning ? getDraftNoticeMeta(draftWarning) : null;
 
   return (
     <div
@@ -1212,7 +1297,7 @@ function ClaudeHistoryControls({
           />
           <span>{meta.label}</span>
         </div>
-        {draftWarning && !error && (
+        {draftWarning && !error && draftNoticeMeta && (
           <Tooltip content={draftWarning}>
             <div
               style={{
@@ -1224,26 +1309,27 @@ function ClaudeHistoryControls({
                 height: 20,
                 padding: '0 7px',
                 borderRadius: 5,
-                border: '1px solid rgba(251, 191, 36, 0.45)',
-                backgroundColor: 'rgba(217, 119, 6, 0.16)',
-                color: '#fbbf24',
+                border: '1px solid ' + (draftNoticeMeta.tone === 'info' ? 'rgba(113, 113, 122, 0.55)' : 'rgba(251, 191, 36, 0.45)'),
+                backgroundColor: draftNoticeMeta.tone === 'info' ? 'rgba(82, 82, 91, 0.18)' : 'rgba(217, 119, 6, 0.16)',
+                color: draftNoticeMeta.tone === 'info' ? '#d4d4d8' : '#fbbf24',
                 fontSize: 10,
                 fontWeight: 650,
                 letterSpacing: 0,
                 flexShrink: 1,
               }}
             >
-              <AlertTriangle size={12} style={{ flexShrink: 0 }} />
+              {draftNoticeMeta.tone !== 'info' && <AlertTriangle size={12} style={{ flexShrink: 0 }} />}
               <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                Send stopped · draft moved
+                {draftNoticeMeta.label}
               </span>
             </div>
           </Tooltip>
         )}
         <div style={{ flex: 1 }} />
         {status === 'inactive' && (
-          <Tooltip content="Resume Claude session">
+          <Tooltip content={'Resume ' + runtime.label + ' session'}>
             <button
+              aria-label={'Resume ' + runtime.label + ' session'}
               onClick={() => runAction('resume')}
               disabled={!canResume}
               style={{
@@ -1260,8 +1346,9 @@ function ClaudeHistoryControls({
           </Tooltip>
         )}
         {status !== 'inactive' && (
-          <Tooltip content="Stop Claude process">
+          <Tooltip content={'Stop ' + runtime.label + ' process'}>
             <button
+              aria-label={'Stop ' + runtime.label + ' process'}
               onClick={() => runAction('stop')}
               disabled={!canStopProcess}
               style={{
@@ -1291,7 +1378,7 @@ function ClaudeHistoryControls({
         <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6 }}>
           <textarea
             ref={promptTextareaRef}
-            className="hp-claude-prompt"
+            className="hp-agent-prompt"
             data-status={status}
             value={prompt}
             onChange={(e) => {
@@ -1304,7 +1391,7 @@ function ClaudeHistoryControls({
                 if (canSend) runAction('send');
               }
             }}
-            placeholder={status === 'inactive' ? 'Resume Claude to send' : status === 'starting' ? 'Waiting for prompt...' : 'Send a prompt...'}
+            placeholder={status === 'inactive' ? 'Resume ' + runtime.label + ' to send' : status === 'starting' ? 'Waiting for prompt...' : 'Send a prompt...'}
             rows={3}
             style={{
               flex: 1,
@@ -1325,8 +1412,9 @@ function ClaudeHistoryControls({
             onFocus={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = '#DA7756'; }}
             onBlur={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = '#333'; }}
           />
-          <Tooltip content={canGrabDraft ? 'Pull terminal draft' : 'Claude must be ready to pull draft'}>
+          <Tooltip content={canGrabDraft ? 'Pull terminal draft' : runtime.label + ' must be ready to pull draft'}>
             <button
+              aria-label={'Pull ' + runtime.label + ' terminal draft'}
               onClick={pullTerminalDraft}
               disabled={!canGrabDraft}
               style={{
@@ -1352,8 +1440,9 @@ function ClaudeHistoryControls({
               )}
             </button>
           </Tooltip>
-          <Tooltip content={isPasteBusy ? 'Claude paste is in progress' : isTurnBusy ? 'Send while Claude streams' : 'Send prompt'}>
+          <Tooltip content={isPasteBusy ? runtime.label + ' paste is in progress' : isTurnBusy ? runtime.label + ' is busy' : 'Send prompt'}>
             <button
+              aria-label={'Send ' + runtime.label + ' prompt'}
               onClick={() => runAction('send')}
               disabled={!canSend}
               style={{
@@ -1382,6 +1471,7 @@ function ClaudeHistoryControls({
           {isTurnBusy && (
             <Tooltip content="Stop current turn">
               <button
+                aria-label={'Stop current ' + runtime.label + ' turn'}
                 onClick={() => runAction('interrupt')}
                 disabled={!canInterruptTurn}
                 style={{
@@ -1422,6 +1512,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const setHistoryVisibleUuids = useUIStore((s) => s.setHistoryVisibleUuids);
   const setHistoryScrollPosition = useUIStore((s) => s.setHistoryScrollPosition);
   const closePanel = useCallback(() => setHistoryPanelOpen(tabId, false), [tabId, setHistoryPanelOpen]);
+  const resetPanelWidth = useCallback(() => setHistoryPanelWidth(HISTORY_PANEL_DEFAULT_WIDTH), [setHistoryPanelWidth]);
 
   // Save scroll position + clean up CSS highlights on unmount.
   // Virtuoso owns scrolling — the scrollTop we save belongs to the inner
@@ -2078,6 +2169,45 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         )}
         {!searchOpen && <div style={{ flex: 1 }} />}
         <button
+          aria-label="Reset History panel width"
+          onClick={resetPanelWidth}
+          style={{
+            background: 'none',
+            border: 'none',
+            color: width === HISTORY_PANEL_DEFAULT_WIDTH ? '#444' : '#666',
+            cursor: 'pointer',
+            padding: 2,
+            width: 22,
+            height: 22,
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            position: 'relative',
+            flexShrink: 0,
+          }}
+          onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+          onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = width === HISTORY_PANEL_DEFAULT_WIDTH ? '#444' : '#666'; }}
+        >
+          <RotateCcw size={15} />
+          <span
+            aria-hidden
+            style={{
+              position: 'absolute',
+              left: 0,
+              right: 0,
+              top: '50%',
+              transform: 'translateY(-48%)',
+              textAlign: 'center',
+              fontSize: 7,
+              fontWeight: 800,
+              lineHeight: 1,
+              pointerEvents: 'none',
+            }}
+          >
+            W
+          </span>
+        </button>
+        <button
           onClick={closePanel}
           style={{
             background: 'none', border: 'none', color: '#666',
@@ -2183,11 +2313,12 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         </Tooltip>
       </div>
 
-      {enableClaudePtyControls && toolType === 'claude' && (
-        <ClaudeHistoryControls
+      {enableClaudePtyControls && (toolType === 'claude' || toolType === 'codex') && (
+        <AgentHistoryControls
           tabId={tabId}
           sessionId={sessionId}
           cwd={cwd}
+          toolType={toolType as AgentHistoryTool}
           onHistoryRefresh={() => loadHistory(true)}
         />
       )}

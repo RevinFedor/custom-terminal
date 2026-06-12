@@ -272,6 +272,12 @@ Popover с двумя уровнями pin'а (light = клик-закреп к 
 
 **Фикс.** Backdrop dismiss срабатывает только если `mousedown` начался на overlay **и** финальный `click` тоже пришёл по overlay. Храни `mouseDownOnOverlay` в ref, сбрасывай после click. Одного `onClick={(e) => e.target === e.currentTarget && close()}` недостаточно: browser синтезирует click по release-target, а intent жеста определялся в момент mouse down. В custom-terminal это применено в `IconCropper`: drag внутри crop-area не должен закрывать окно при release на полупрозрачном фоне.
 
+### 4.9. Same-trigger close не должен reopen'иться тем же кликом
+
+Если один и тот же trigger открывает pinned popover и повторным кликом закрывает его, close-path обязан подавить open-path этого же жеста. Типичный симптом: пользователь кликает активную карточку, окно пропадает на один кадр и появляется снова — mousedown/click закрыл state, а последующий click или hover-open тут же снова открыл тот же popover. Для пользователя второй клик по active surface означает «закрыть и сбросить фокус», не «перерисуй».
+
+Рабочий паттерн: close активного trigger'а делать как можно раньше (`onMouseDownCapture` или отдельный guarded branch), вызвать `preventDefault/stopPropagation`, blur'нуть активный input и поставить короткий suppress-ref `{id, until}` для этого trigger'а. Любой open-handler и hover-preview сначала проверяет suppress; outside-click при этом остаётся обычным закрытием без suppress. Шрам из Run-after editor: повторный клик по уже pinned chip должен вести себя как overlay click, иначе editor flicker'ит и снова закрепляется.
+
 ---
 
 ## 5. Рассинхрон видимости и состояния

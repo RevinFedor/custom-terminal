@@ -7,6 +7,12 @@ import { markPendingResume, isStaleAgainstPending } from '../../utils/pendingRes
 import {
   DEEPSEEK_EFFORT_LEVELS,
 } from '../../constants/claudeLevels';
+import {
+  CODEX_EFFORT_LEVELS,
+  DEFAULT_CODEX_EFFORT,
+  DEFAULT_CODEX_MODEL,
+  normalizeCodexModelOptions,
+} from '../../constants/codexSettings';
 import { PROVIDER_CATALOG } from './providerCatalog';
 import SessionActionChip from './SessionActionChip';
 import MicButton from './MicButton';
@@ -16,10 +22,9 @@ import {
   useDictationSnapshot,
 } from '../../utils/dictationManager';
 import { useCmdKey } from '../../hooks/useCmdHoverPopover';
+import { buildCodexRunPayload } from '../../utils/codexLaunch';
 
 const { ipcRenderer } = window.require('electron');
-const DEFAULT_CODEX_MODEL = 'gpt-5.5';
-const DEFAULT_CODEX_EFFORT = 'xhigh';
 
 interface Props {
   tabId: string;
@@ -231,20 +236,24 @@ export default function ClaudeControlBar({
     }
     return 'high';
   });
-  const codexModel = useWorkspaceStore((s) => {
+  const codexTabModel = useWorkspaceStore((s) => {
     for (const [, ws] of s.openProjects) {
       const t = ws.tabs.get(tabId);
-      if (t) return t.codexModel || DEFAULT_CODEX_MODEL;
+      if (t) return t.codexModel;
     }
-    return DEFAULT_CODEX_MODEL;
+    return undefined;
   });
-  const codexEffort = useWorkspaceStore((s) => {
+  const codexTabEffort = useWorkspaceStore((s) => {
     for (const [, ws] of s.openProjects) {
       const t = ws.tabs.get(tabId);
-      if (t) return t.codexEffort || DEFAULT_CODEX_EFFORT;
+      if (t) return t.codexEffort;
     }
-    return DEFAULT_CODEX_EFFORT;
+    return undefined;
   });
+  const defaultCodexModel = useUIStore((s) => s.defaultCodexModel);
+  const defaultCodexEffort = useUIStore((s) => s.defaultCodexEffort);
+  const codexModel = codexTabModel || (defaultCodexModel !== 'none' ? defaultCodexModel : DEFAULT_CODEX_MODEL);
+  const codexEffort = codexTabEffort || (defaultCodexEffort !== 'none' ? defaultCodexEffort : DEFAULT_CODEX_EFFORT);
   const sdkThinking = useWorkspaceStore((s) => {
     for (const [, ws] of s.openProjects) {
       const t = ws.tabs.get(tabId);
@@ -301,18 +310,20 @@ export default function ClaudeControlBar({
     let cancelled = false;
     ipcRenderer.invoke('codex:list-models').then((res: any) => {
       if (cancelled) return;
-      const models = Array.isArray(res?.models) ? res.models : [];
+      const models = normalizeCodexModelOptions(res?.models);
       if (models.length === 0) return;
       setCodexModels(models);
 
       const state = useWorkspaceStore.getState();
-      let currentModel = DEFAULT_CODEX_MODEL;
-      let currentEffort = DEFAULT_CODEX_EFFORT;
+      let currentModel = defaultCodexModel !== 'none' ? defaultCodexModel : DEFAULT_CODEX_MODEL;
+      let currentEffort = defaultCodexEffort !== 'none' ? defaultCodexEffort : DEFAULT_CODEX_EFFORT;
+      let hasTabCodexState = false;
       for (const [, ws] of state.openProjects) {
         const tab = ws.tabs.get(tabId);
         if (tab) {
-          currentModel = tab.codexModel || DEFAULT_CODEX_MODEL;
-          currentEffort = tab.codexEffort || DEFAULT_CODEX_EFFORT;
+          hasTabCodexState = !!tab.codexModel || !!tab.codexEffort;
+          currentModel = tab.codexModel || currentModel;
+          currentEffort = tab.codexEffort || currentEffort;
           break;
         }
       }
@@ -321,16 +332,16 @@ export default function ClaudeControlBar({
         ? currentModel
         : (models.some((m: any) => m.id === DEFAULT_CODEX_MODEL) ? DEFAULT_CODEX_MODEL : models[0].id);
       const active = models.find((m: any) => m.id === nextModel) || models[0];
-      const efforts = active?.efforts || ['low', 'medium', 'high', 'xhigh'];
+      const efforts = active?.efforts || [...CODEX_EFFORT_LEVELS];
       const nextEffort = efforts.includes(currentEffort)
         ? currentEffort
         : (efforts.includes(DEFAULT_CODEX_EFFORT) ? DEFAULT_CODEX_EFFORT : (active?.defaultEffort || efforts[0] || DEFAULT_CODEX_EFFORT));
-      if (nextModel !== currentModel || nextEffort !== currentEffort) {
+      if (hasTabCodexState && (nextModel !== currentModel || nextEffort !== currentEffort)) {
         state.updateCodexState(tabId, { codexModel: nextModel, codexEffort: nextEffort });
       }
     }).catch((e: any) => console.warn('[CodexControlBar] model list failed:', e));
     return () => { cancelled = true; };
-  }, [sessionType, tabId]);
+  }, [sessionType, tabId, defaultCodexModel, defaultCodexEffort]);
 
   // Seed the meter from the last value persisted for THIS tab, so it shows the
   // last-known context fill even when no Claude process is running (CLI exited
@@ -614,12 +625,7 @@ export default function ClaudeControlBar({
 
   const codexRunPayload = (base: { tabId: string; command: string; sessionId?: string; cwd?: string }) => {
     const payload: { tabId: string; command: string; sessionId?: string; cwd?: string; model?: string; effort?: string } = { ...base };
-    // Default gpt-5.5/xhigh comes from ~/.codex/config.toml on this machine.
-    // Do not turn the default UI state into a hidden launch override; only send
-    // values when the tab was explicitly moved away from the default.
-    if (codexModel && codexModel !== DEFAULT_CODEX_MODEL) payload.model = codexModel;
-    if (codexEffort && codexEffort !== DEFAULT_CODEX_EFFORT) payload.effort = codexEffort;
-    return payload;
+    return buildCodexRunPayload(payload);
   };
 
   // ===== derived state =====
@@ -661,7 +667,7 @@ export default function ClaudeControlBar({
   const claudeCodeModels = claudeCodeSettings.models;
   const claudeCodeEfforts = claudeCodeSettings.efforts;
   const effortLevels = isCodex
-    ? (activeCodexModel?.efforts && activeCodexModel.efforts.length > 0 ? activeCodexModel.efforts : ['low', 'medium', 'high', 'xhigh'])
+    ? (activeCodexModel?.efforts && activeCodexModel.efforts.length > 0 ? activeCodexModel.efforts : [...CODEX_EFFORT_LEVELS])
     : isDeepSeekPTY ? DEEPSEEK_EFFORT_LEVELS : claudeCodeEfforts;
 
   // NOTE: we deliberately DO NOT gate effort pills per model. Real Claude Code
@@ -821,7 +827,7 @@ export default function ClaudeControlBar({
         defaultEffort: DEFAULT_CODEX_EFFORT,
         efforts: Array.isArray(result?.effortOptions) && result.effortOptions.length > 0
           ? result.effortOptions
-          : ['low', 'medium', 'high', 'xhigh'],
+          : [...CODEX_EFFORT_LEVELS],
       };
     }));
   };
@@ -884,7 +890,7 @@ export default function ClaudeControlBar({
     try {
     if (isCodex) {
       const nextModel = codexModels.find(m => m.id === mid);
-      const efforts = nextModel?.efforts || ['low', 'medium', 'high', 'xhigh'];
+      const efforts = nextModel?.efforts || [...CODEX_EFFORT_LEVELS];
       const nextEffort = efforts.includes(codexEffort)
         ? codexEffort
         : (efforts.includes(DEFAULT_CODEX_EFFORT) ? DEFAULT_CODEX_EFFORT : (nextModel?.defaultEffort || efforts[0] || DEFAULT_CODEX_EFFORT));
@@ -1032,6 +1038,35 @@ export default function ClaudeControlBar({
       await setEffortOnPTY(level);
     }
     } finally {
+      endControlAction(actionReason);
+    }
+  };
+
+  const sendCodexFast = async () => {
+    if (!isCodex) return;
+    if (codexTurnBusy) {
+      console.warn('[CodexControlBar] /fast skipped tab=' + tabId.slice(-12) + ' reason=active-turn');
+      focusTerminal();
+      return;
+    }
+    if (!isCommandRunning) {
+      console.warn('[CodexControlBar] /fast skipped tab=' + tabId.slice(-12) + ' reason=no-live-process');
+      focusTerminal();
+      return;
+    }
+    const actionReason = 'codex-fast';
+    if (!beginControlAction(actionReason)) return;
+    setLocalBusy(true, actionReason);
+    try {
+      const result = await ipcRenderer.invoke('codex:send-command', tabId, '/fast');
+      console.log('[CodexControlBar] /fast result tab=' + tabId.slice(-12) + ' result=' + JSON.stringify(result || null));
+      if (result?.success === false) throw new Error(result?.error || 'Codex /fast failed');
+    } catch (e: any) {
+      console.warn('[CodexControlBar] /fast failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
+      showToast('Codex /fast failed: ' + String(e?.message || e), 'error');
+    } finally {
+      setLocalBusy(false, actionReason + ':finally');
+      focusTerminal();
       endControlAction(actionReason);
     }
   };
@@ -2322,9 +2357,43 @@ export default function ClaudeControlBar({
                 </React.Fragment>
               );
             })}
-          </div>
+	          </div>
 
-          {/* Think — single toggle, no dropdown */}
+	          {isCodex && (
+	            <button
+	              type="button"
+	              aria-label="Send /fast to Codex"
+	              title={codexKnobsDisabled ? '/fast недоступен во время streaming' : 'Send /fast to Codex'}
+	              disabled={codexKnobsDisabled}
+	              onClick={sendCodexFast}
+	              style={{
+	                ...triggerStyle,
+	                width: 24,
+	                padding: 0,
+	                justifyContent: 'center',
+	                color: codexKnobsDisabled ? '#555' : '#bbb',
+	                borderColor: codexKnobsDisabled ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.12)',
+	                backgroundColor: 'transparent',
+	                cursor: codexKnobsDisabled ? 'not-allowed' : triggerStyle.cursor,
+	              }}
+	            >
+	              <svg
+	                width="13"
+	                height="13"
+	                viewBox="0 0 24 24"
+	                fill="none"
+	                stroke="currentColor"
+	                strokeWidth="2.4"
+	                strokeLinecap="round"
+	                strokeLinejoin="round"
+	                aria-hidden="true"
+	              >
+	                <path d="M13 2 4 14h7l-1 8 10-13h-7l0-7Z" />
+	              </svg>
+	            </button>
+	          )}
+
+	          {/* Think — single toggle, no dropdown */}
           {!isDeepSeekPTY && !isCodex && (
             <button
               style={{

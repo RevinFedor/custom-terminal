@@ -1,13 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
-import { useUIStore } from '../../store/useUIStore';
-import { useBookmarksStore, Bookmark } from '../../store/useBookmarksStore';
 import { useCmdKey, useCmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import ProjectCard from './ProjectCard';
-import BookmarkCard from './BookmarkCard';
 import Tooltip from '../UI/Tooltip';
-import { Plus, Square, X } from 'lucide-react';
+import { Square, X } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -32,13 +29,28 @@ interface MCPProcess {
   isAlive: boolean; // ppid belongs to live PTY/CLI
 }
 
+interface ElectronDevProcess {
+  pid: number;
+  ppid: number;
+  launcherPid: number | null;
+  cwd: string;
+  name: string;
+  startTime: string;
+  command: string;
+  cpu: string;
+  mem: string;
+  isOrphan: boolean;
+}
+
 export default function Dashboard() {
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
   const [claudeProcesses, setClaudeProcesses] = useState<AIProcess[]>([]);
   const [geminiProcesses, setGeminiProcesses] = useState<AIProcess[]>([]);
   const [mcpProcesses, setMcpProcesses] = useState<MCPProcess[]>([]);
+  const [electronDevProcesses, setElectronDevProcesses] = useState<ElectronDevProcess[]>([]);
   const [mcpExpanded, setMcpExpanded] = useState(false);
   const [isProcessesLoading, setIsProcessesLoading] = useState(true);
+  const [stoppingProcesses, setStoppingProcesses] = useState<Set<string>>(() => new Set());
 
   const [killTooltip, setKillTooltip] = useState<'claude' | 'gemini' | null>(null);
   const [historyCounts, setHistoryCounts] = useState<Map<string, number>>(new Map());
@@ -50,17 +62,66 @@ export default function Dashboard() {
 
   const { projects, loadProjects } = useProjectsStore();
   const { openProject, openProjects } = useWorkspaceStore();
-  const { bookmarks, loadBookmarks, addBookmarkFromDialog, updateBookmark, deleteBookmark } = useBookmarksStore();
-  const { openEditModal } = useUIStore();
 
-  // Remove local modal states
-  // const [editingBookmark, setEditingBookmark] = useState<Bookmark | null>(null);
-  // const [editName, setEditName] = useState('');
-  // const [editDescription, setEditDescription] = useState('');
+  const handleActionKeyDown = (event: React.KeyboardEvent, action: () => void) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    action();
+  };
+
+  const setProcessStopping = (key: string, stopping: boolean) => {
+    setStoppingProcesses(prev => {
+      const next = new Set(prev);
+      if (stopping) {
+        next.add(key);
+      } else {
+        next.delete(key);
+      }
+      return next;
+    });
+  };
+
+  const refreshProcesses = async () => {
+    try {
+      const [claude, gemini, mcp, electronDev] = await Promise.all([
+        ipcRenderer.invoke('system:get-claude-processes'),
+        ipcRenderer.invoke('system:get-gemini-processes'),
+        ipcRenderer.invoke('system:get-mcp-processes'),
+        ipcRenderer.invoke('system:get-electron-dev-processes'),
+      ]);
+      setClaudeProcesses(claude || []);
+      setGeminiProcesses(gemini || []);
+      setMcpProcesses(mcp || []);
+      setElectronDevProcesses(electronDev || []);
+    } catch {
+      setClaudeProcesses([]);
+      setGeminiProcesses([]);
+      setMcpProcesses([]);
+      setElectronDevProcesses([]);
+    }
+  };
+
+  const refreshAfterProcessStop = (key: string) => {
+    window.setTimeout(async () => {
+      await refreshProcesses();
+      setProcessStopping(key, false);
+    }, 500);
+  };
+
+  const handleKillElectronDev = async (proc: ElectronDevProcess) => {
+    const processKey = `electron:${proc.pid}`;
+    if (stoppingProcesses.has(processKey)) return;
+
+    setProcessStopping(processKey, true);
+    try {
+      await ipcRenderer.invoke('system:kill-electron-dev-process', proc.pid);
+    } finally {
+      refreshAfterProcessStop(processKey);
+    }
+  };
 
   useEffect(() => {
     loadProjects();
-    loadBookmarks();
     // Load auto-resume setting
     ipcRenderer.invoke('app:getState', 'auto_resume_sessions').then((val: any) => {
       if (val === true || val === 'true') setAutoResume(true);
@@ -145,24 +206,11 @@ export default function Dashboard() {
     };
   }, [openProjects.size]);
 
-  // Poll for active AI processes (Claude + Gemini)
+  // Poll for active AI processes + Electron dev apps.
   useEffect(() => {
     let isFirst = true;
     const fetchProcesses = async () => {
-      try {
-        const [claude, gemini, mcp] = await Promise.all([
-          ipcRenderer.invoke('system:get-claude-processes'),
-          ipcRenderer.invoke('system:get-gemini-processes'),
-          ipcRenderer.invoke('system:get-mcp-processes'),
-        ]);
-        setClaudeProcesses(claude || []);
-        setGeminiProcesses(gemini || []);
-        setMcpProcesses(mcp || []);
-      } catch {
-        setClaudeProcesses([]);
-        setGeminiProcesses([]);
-        setMcpProcesses([]);
-      }
+      await refreshProcesses();
       if (isFirst) {
         setIsProcessesLoading(false);
         isFirst = false;
@@ -173,47 +221,6 @@ export default function Dashboard() {
     const interval = setInterval(fetchProcesses, 10000);
     return () => clearInterval(interval);
   }, []);
-
-
-  // Create project from bookmark - always creates a NEW project instance
-  const handleCreateProjectFromBookmark = async (bookmark: Bookmark) => {
-    console.log('[Dashboard] handleCreateProjectFromBookmark called with bookmark:', bookmark);
-
-    // Generate unique name with suffix if needed
-    let projectName = bookmark.name;
-    const existingNames = Object.values(projects).map(p => p.name);
-    console.log('[Dashboard] Existing project names:', existingNames);
-
-    if (existingNames.includes(projectName)) {
-      let suffix = 1;
-      while (existingNames.includes(`${bookmark.name}-${suffix}`)) {
-        suffix++;
-      }
-      projectName = `${bookmark.name}-${suffix}`;
-    }
-    console.log('[Dashboard] Final project name:', projectName);
-
-    // Always create new project instance
-    console.log('[Dashboard] Calling project:create-instance...');
-    try {
-      const newProject = await ipcRenderer.invoke('project:create-instance', {
-        path: bookmark.path,
-        name: projectName
-      });
-      console.log('[Dashboard] project:create-instance returned:', newProject);
-
-      if (newProject) {
-        console.log('[Dashboard] Loading projects...');
-        await loadProjects();
-        console.log('[Dashboard] Opening project:', newProject.id, newProject.path);
-        openProject(newProject.id, newProject.path);
-      } else {
-        console.error('[Dashboard] project:create-instance returned null/undefined!');
-      }
-    } catch (err) {
-      console.error('[Dashboard] Error in handleCreateProjectFromBookmark:', err);
-    }
-  };
 
   const handleOpenProjectWorkspace = (projectId: string) => {
     openProject(projectId, projects[projectId].path);
@@ -242,18 +249,6 @@ export default function Dashboard() {
     return { total, active, history: historyCounts.get(projectId) || 0 };
   };
 
-  // Handle edit bookmark
-  const handleEditBookmark = (bookmark: Bookmark) => {
-    openEditModal(bookmark);
-  };
-
-  // Handle delete bookmark
-  const handleDeleteBookmark = async (bookmark: Bookmark) => {
-    if (confirm(`Delete bookmark "${bookmark.name}"?`)) {
-      await deleteBookmark(bookmark.id);
-    }
-  };
-
   return (
     <div className="flex-1 flex flex-col bg-bg-main overflow-hidden">
       <div className="flex-1 overflow-y-auto overflow-x-hidden px-6 pb-6 pt-12">
@@ -262,10 +257,10 @@ export default function Dashboard() {
           <div className="mb-8">
             <h2 className="text-sm font-medium text-[#888] mb-3">Projects</h2>
             <div
-              className="gap-3"
+              className="gap-2"
               style={{
                 display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 180px))',
+                gridTemplateColumns: 'repeat(auto-fill, minmax(118px, 150px))',
               }}
             >
               {allProjects.map((project) => (
@@ -278,6 +273,55 @@ export default function Dashboard() {
                   tabsStats={getTabsStats(project.id)}
                 />
               ))}
+            </div>
+          </div>
+        )}
+
+        {!isProcessesLoading && electronDevProcesses.length > 0 && (
+          <div className="mb-5 -mt-4 px-1">
+            <div className="flex items-center gap-2 overflow-x-auto">
+              <span className="text-xs text-[#666] flex-shrink-0">Electron Dev</span>
+              {electronDevProcesses.map((proc) => {
+                const processKey = `electron:${proc.pid}`;
+                const isStopping = stoppingProcesses.has(processKey);
+
+                return (
+                  <div
+                    key={proc.pid}
+                    role="button"
+                    tabIndex={0}
+                    title={`${proc.command}\n${proc.cwd}`}
+                    className={`group h-7 max-w-[280px] flex items-center gap-2 px-2.5 rounded-md border text-xs select-none transition-colors focus:outline-none ${
+                      isStopping
+                        ? 'cursor-wait border-red-500/30 bg-red-500/10 text-[#ddd]'
+                        : 'cursor-pointer border-[#333] bg-[#171717] text-[#aaa] hover:border-red-500/40 hover:bg-red-500/10 hover:text-[#ddd] focus:border-red-500/40'
+                    }`}
+                    onClick={() => { if (!isStopping) handleKillElectronDev(proc); }}
+                    onKeyDown={(event) => handleActionKeyDown(event, () => { if (!isStopping) handleKillElectronDev(proc); })}
+                  >
+                    <span className="flex-shrink-0 flex items-center justify-center w-4 h-4">
+                      {isStopping ? (
+                        <span className="w-3 h-3 rounded-full border border-red-400/25 border-t-red-300 animate-spin" />
+                      ) : (
+                        <>
+                          <span className="w-2 h-2 rounded-full bg-[#888] group-hover:hidden" />
+                          <Square
+                            size={11}
+                            fill="currentColor"
+                            stroke="none"
+                            className="hidden group-hover:block text-red-400"
+                          />
+                        </>
+                      )}
+                    </span>
+                    <span className="truncate">{proc.name}</span>
+                    <span className={isStopping ? 'text-red-300/80' : 'text-[#555] group-hover:text-red-300/80'}>
+                      {isStopping ? 'stopping' : `pid ${proc.pid}`}
+                    </span>
+                    {proc.isOrphan && !isStopping && <span className="text-[#666] group-hover:text-red-300/80">orphan</span>}
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}
@@ -308,32 +352,6 @@ export default function Dashboard() {
           </Tooltip>
         </div>
 
-        {/* Bookmarks Section */}
-        <div>
-          <h2 className="text-sm font-medium text-[#888] mb-3">Reserved Directories</h2>
-
-          <div className="flex flex-wrap gap-2">
-            {bookmarks.map((bookmark) => (
-              <BookmarkCard
-                key={bookmark.id}
-                bookmark={bookmark}
-                onCreateProject={handleCreateProjectFromBookmark}
-                onEdit={handleEditBookmark}
-                onDelete={handleDeleteBookmark}
-              />
-            ))}
-
-            {/* Add Directory Card - same style as BookmarkCard */}
-            <div
-              className="flex items-center justify-center gap-2 px-3 py-3 rounded-lg border border-dashed border-[#444] bg-transparent cursor-pointer transition-all duration-150 hover:border-[#666] hover:bg-[#1a1a1a]"
-              onClick={addBookmarkFromDialog}
-            >
-              <Plus size={14} className="text-[#666]" />
-              <span className="text-sm text-[#666]">Add Directory</span>
-            </div>
-          </div>
-        </div>
-
         {/* Active AI Processes — two columns */}
         {(() => {
           const getTabLabel = (proc: AIProcess) => {
@@ -348,33 +366,33 @@ export default function Dashboard() {
             return proc.cwd.split('/').filter(Boolean).pop() || proc.cwd;
           };
 
-          const refetchAll = async () => {
-            try {
-              const [claude, gemini, mcp] = await Promise.all([
-                ipcRenderer.invoke('system:get-claude-processes'),
-                ipcRenderer.invoke('system:get-gemini-processes'),
-                ipcRenderer.invoke('system:get-mcp-processes'),
-              ]);
-              setClaudeProcesses(claude || []);
-              setGeminiProcesses(gemini || []);
-              setMcpProcesses(mcp || []);
-            } catch { /* ignore */ }
-          };
-
           const handleKill = async (proc: AIProcess) => {
+            const processKey = `ai:${proc.pid}`;
+            if (stoppingProcesses.has(processKey)) return;
+
             // Protect In-App processes: route through normal close path so PTY cleanup runs
             if (proc.tabId) {
               const ok = window.confirm('Это активная сессия в табе. Закрыть?');
               if (!ok) return;
+
+              setProcessStopping(processKey, true);
               ipcRenderer.send('terminal:kill', proc.tabId);
             } else {
-              await ipcRenderer.invoke('system:kill-process', proc.pid);
+              setProcessStopping(processKey, true);
+              try {
+                await ipcRenderer.invoke('system:kill-process', proc.pid);
+              } finally {
+                refreshAfterProcessStop(processKey);
+              }
+              return;
             }
-            setTimeout(refetchAll, 500);
+            refreshAfterProcessStop(processKey);
           };
 
           const renderProcessCard = (proc: AIProcess, accentColor: string) => {
             const isInApp = !!proc.tabId;
+            const processKey = `ai:${proc.pid}`;
+            const isStopping = stoppingProcesses.has(processKey);
             const label = isInApp
               ? getTabLabel(proc)
               : proc.cwd.split('/').filter(Boolean).pop() || proc.cwd;
@@ -383,40 +401,53 @@ export default function Dashboard() {
             return (
               <div
                 key={proc.pid}
-                className={`relative group flex items-center gap-2 px-3 py-2.5 rounded-lg border transition-colors hover:border-[#444] ${
-                  isInApp ? 'border-[#333] bg-[#1a1a1a]' : 'border-dashed border-[#333] bg-transparent'
+                role="button"
+                tabIndex={0}
+                className={`relative group flex items-center gap-2 px-3 py-2.5 rounded-lg border select-none transition-colors focus:outline-none ${
+                  isStopping
+                    ? 'cursor-wait border-red-500/30 bg-red-500/10'
+                    : `cursor-pointer hover:border-red-500/40 hover:bg-red-500/10 focus:border-red-500/40 ${isInApp ? 'border-[#333] bg-[#1a1a1a]' : 'border-dashed border-[#333] bg-transparent'}`
                 }`}
                 {...processPopover.triggerProps(proc.pid)}
+                onClick={() => { if (!isStopping) handleKill(proc); }}
+                onKeyDown={(event) => handleActionKeyDown(event, () => { if (!isStopping) handleKill(proc); })}
               >
-                {/* Circle → Square on card hover */}
-                <button
-                  className="flex-shrink-0 flex items-center justify-center w-4 h-4"
-                  onClick={() => handleKill(proc)}
-                >
-                  <span
-                    className="w-2 h-2 rounded-full group-hover:hidden"
-                    style={{ backgroundColor: isInApp ? accentColor : '#888' }}
-                  />
-                  <Square
-                    size={11}
-                    fill="currentColor"
-                    stroke="none"
-                    className="hidden group-hover:block text-red-500/50 hover:text-red-400 cursor-pointer"
-                  />
-                </button>
-                <span className={`text-sm ${isInApp ? 'text-[#ccc]' : 'text-[#888]'}`}>{label}</span>
-                <span className={`text-xs ${isInApp ? 'text-[#666]' : 'text-[#555]'}`}>{proc.startTime}</span>
+                <span className="flex-shrink-0 flex items-center justify-center w-4 h-4">
+                  {isStopping ? (
+                    <span className="w-3 h-3 rounded-full border border-red-400/25 border-t-red-300 animate-spin" />
+                  ) : (
+                    <>
+                      <span
+                        className="w-2 h-2 rounded-full group-hover:hidden"
+                        style={{ backgroundColor: isInApp ? accentColor : '#888' }}
+                      />
+                      <Square
+                        size={11}
+                        fill="currentColor"
+                        stroke="none"
+                        className="hidden group-hover:block text-red-400"
+                      />
+                    </>
+                  )}
+                </span>
+                <span className={`text-sm ${isStopping ? 'text-[#ddd]' : isInApp ? 'text-[#ccc]' : 'text-[#888]'}`}>{label}</span>
+                <span className={`text-xs ${isStopping ? 'text-red-300/80' : isInApp ? 'text-[#666]' : 'text-[#555]'}`}>
+                  {isStopping ? 'stopping' : proc.startTime}
+                </span>
 
                 {/* CMD+Hover popover (bridge + pinning via hook) */}
                 {showPopover && (
                   <div
                     className="absolute z-50"
+                    data-process-popover
                     style={{
                       bottom: '100%',
                       left: 0,
                       paddingBottom: '4px',
                     }}
                     {...processPopover.popoverProps}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={(e) => e.stopPropagation()}
                   >
                     <div
                       style={{
@@ -446,22 +477,39 @@ export default function Dashboard() {
           const handleKillAllExternal = async (processes: AIProcess[]) => {
             const external = processes.filter(p => !p.tabId);
             if (external.length === 0) return;
-            await Promise.all(
-              external.map(p => ipcRenderer.invoke('system:kill-process', p.pid))
-            );
-            setTimeout(refetchAll, 500);
+            const keys = external.map(p => `ai:${p.pid}`);
+            keys.forEach(key => setProcessStopping(key, true));
+            try {
+              await Promise.all(
+                external.map(p => ipcRenderer.invoke('system:kill-process', p.pid))
+              );
+            } finally {
+              keys.forEach(refreshAfterProcessStop);
+            }
           };
 
           const handleKillAllOrphanMcp = async () => {
             const orphans = mcpProcesses.filter(p => !p.isAlive);
             if (orphans.length === 0) return;
-            await Promise.all(orphans.map(p => ipcRenderer.invoke('system:kill-process', p.pid)));
-            setTimeout(refetchAll, 500);
+            const keys = orphans.map(p => `mcp:${p.pid}`);
+            keys.forEach(key => setProcessStopping(key, true));
+            try {
+              await Promise.all(orphans.map(p => ipcRenderer.invoke('system:kill-process', p.pid)));
+            } finally {
+              keys.forEach(refreshAfterProcessStop);
+            }
           };
 
           const handleKillMcp = async (pid: number) => {
-            await ipcRenderer.invoke('system:kill-process', pid);
-            setTimeout(refetchAll, 500);
+            const processKey = `mcp:${pid}`;
+            if (stoppingProcesses.has(processKey)) return;
+
+            setProcessStopping(processKey, true);
+            try {
+              await ipcRenderer.invoke('system:kill-process', pid);
+            } finally {
+              refreshAfterProcessStop(processKey);
+            }
           };
 
           const claudeExternal = claudeProcesses.filter(p => !p.tabId);
@@ -582,38 +630,53 @@ export default function Dashboard() {
                   </button>
                   {mcpExpanded && (
                     <div className="mt-2 max-h-64 overflow-y-auto flex flex-col gap-1">
-                      {mcpProcesses.map(p => (
-                        <div
-                          key={p.pid}
-                          className={`group flex items-center gap-2 px-2 py-1 rounded text-xs ${
-                            p.isAlive ? 'text-[#aaa]' : 'text-[#666]'
-                          }`}
-                        >
-                          <Tooltip content="Kill process">
-                            <button
-                              className="flex-shrink-0 flex items-center justify-center w-4 h-4"
-                              onClick={() => handleKillMcp(p.pid)}
-                            >
-                              <span
-                                className="w-2 h-2 rounded-full group-hover:hidden"
-                                style={{ backgroundColor: p.isAlive ? '#888' : '#444' }}
-                              />
-                              <Square
-                                size={11}
-                                fill="currentColor"
-                                stroke="none"
-                                className="hidden group-hover:block text-red-500/50 hover:text-red-400 cursor-pointer"
-                              />
-                            </button>
-                          </Tooltip>
-                          <Tooltip content={p.command}>
-                            <span className="flex-1 truncate">{p.name}</span>
-                          </Tooltip>
-                          <span className="text-[#555]">pid {p.pid}</span>
-                          <span className="text-[#555]">{p.startTime}</span>
-                          {!p.isAlive && <span className="text-[#666]">orphan</span>}
-                        </div>
-                      ))}
+                      {mcpProcesses.map(p => {
+                        const processKey = `mcp:${p.pid}`;
+                        const isStopping = stoppingProcesses.has(processKey);
+
+                        return (
+                          <div
+                            key={p.pid}
+                            role="button"
+                            tabIndex={0}
+                            title={p.command}
+                            className={`group flex items-center gap-2 px-2 py-1 rounded text-xs select-none transition-colors focus:outline-none ${
+                              isStopping
+                                ? 'cursor-wait bg-red-500/10 text-[#ddd]'
+                                : `cursor-pointer hover:border-red-500/40 hover:bg-red-500/10 focus:bg-red-500/10 ${p.isAlive ? 'text-[#aaa]' : 'text-[#666]'}`
+                            }`}
+                            onClick={() => { if (!isStopping) handleKillMcp(p.pid); }}
+                            onKeyDown={(event) => handleActionKeyDown(event, () => { if (!isStopping) handleKillMcp(p.pid); })}
+                          >
+                            <span className="flex-shrink-0 flex items-center justify-center w-4 h-4">
+                              {isStopping ? (
+                                <span className="w-3 h-3 rounded-full border border-red-400/25 border-t-red-300 animate-spin" />
+                              ) : (
+                                <>
+                                  <span
+                                    className="w-2 h-2 rounded-full group-hover:hidden"
+                                    style={{ backgroundColor: p.isAlive ? '#888' : '#444' }}
+                                  />
+                                  <Square
+                                    size={11}
+                                    fill="currentColor"
+                                    stroke="none"
+                                    className="hidden group-hover:block text-red-400"
+                                  />
+                                </>
+                              )}
+                            </span>
+                            <Tooltip content={p.command}>
+                              <span className="flex-1 truncate">{p.name}</span>
+                            </Tooltip>
+                            <span className={isStopping ? 'text-red-300/80' : 'text-[#555]'}>
+                              {isStopping ? 'stopping' : `pid ${p.pid}`}
+                            </span>
+                            <span className="text-[#555]">{p.startTime}</span>
+                            {!p.isAlive && !isStopping && <span className="text-[#666]">orphan</span>}
+                          </div>
+                        );
+                      })}
                     </div>
                   )}
                 </div>

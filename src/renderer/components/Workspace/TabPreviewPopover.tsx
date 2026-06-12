@@ -38,7 +38,6 @@ export interface MetaRow {
   value: React.ReactNode;
   wrap?: boolean;
   muted?: boolean;
-  variant?: 'title';
 }
 
 interface TabPreviewPopoverProps {
@@ -485,25 +484,21 @@ export default function TabPreviewPopover({
 function MetaList({ rows }: { rows: MetaRow[] }) {
   return (
     <div style={{ fontSize: '10px', color: '#888', display: 'flex', flexDirection: 'column', gap: '2px' }}>
-      {rows.map((row, idx) => {
-        const isTitle = row.variant === 'title';
-        return (
-          <div
-            key={idx}
-            style={{
-              wordBreak: row.wrap === false ? 'normal' : 'break-all',
-              color: isTitle ? '#fff' : (row.muted ? '#888' : '#ccc'),
-              whiteSpace: row.wrap === false ? 'nowrap' : 'normal',
-              overflow: row.wrap === false ? 'hidden' : 'visible',
-              textOverflow: row.wrap === false ? 'ellipsis' : 'clip',
-              fontSize: isTitle ? '12px' : undefined,
-            }}
-          >
-            {row.label ? <span style={{ color: isTitle ? '#888' : '#666' }}>{row.label}: </span> : null}
-            {row.value}
-          </div>
-        );
-      })}
+      {rows.map((row, idx) => (
+        <div
+          key={idx}
+          style={{
+            wordBreak: row.wrap === false ? 'normal' : 'break-all',
+            color: row.muted ? '#888' : '#ccc',
+            whiteSpace: row.wrap === false ? 'nowrap' : 'normal',
+            overflow: row.wrap === false ? 'hidden' : 'visible',
+            textOverflow: row.wrap === false ? 'ellipsis' : 'clip',
+          }}
+        >
+          {row.label ? <span style={{ color: '#666' }}>{row.label}: </span> : null}
+          {row.value}
+        </div>
+      ))}
     </div>
   );
 }

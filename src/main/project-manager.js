@@ -28,10 +28,6 @@ class ProjectManager {
     }
   }
 
-  createProjectInstance(projectPath, customName = null) {
-    return this.db.createProjectInstance(projectPath, customName);
-  }
-
   createEmptyProject(name) {
     return this.db.createEmptyProject(name);
   }

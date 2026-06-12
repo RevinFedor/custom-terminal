@@ -49,8 +49,8 @@ const loadRightColWidth = (): number => {
 import { useUIStore } from '../../store/useUIStore';
 import { useCmdKey, useCmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import TabPreviewPopover from './TabPreviewPopover';
-import { Terminal, FolderOpen, Plus, Clock, Trash2, Pencil, Star, ChevronDown, ChevronRight } from 'lucide-react';
-import SemanticSearchSection from './SemanticSearch';
+import { Virtuoso } from 'react-virtuoso';
+import { FolderOpen, Clock, Trash2, Pencil, Search, Database, Loader2 } from 'lucide-react';
 
 // Tooltip is still used for the small icon buttons in the project header
 // (Select/Change directory, Rename project). Cards themselves don't use it —
@@ -100,6 +100,17 @@ interface FavoriteEntry {
   created_at: number;
 }
 
+type ScoredTabHistoryEntry = TabHistoryEntry & { score?: number };
+
+interface TabTitleIndexStats {
+  total: number;
+  indexed: number;
+  unindexed: number;
+  model: string;
+  dims: number;
+  inProgress: boolean;
+}
+
 type ContextMenuState = {
   x: number;
   y: number;
@@ -117,8 +128,23 @@ const TIME_GROUP_LABEL: Record<TimeGroup, string> = {
   'Recent': 'Вкладки за сегодня — вчера',
   'This Week': 'На этой неделе',
   'This Month': 'Этот месяц',
-  'Older': 'Старее',
+  'Older': 'Старее месяца',
 };
+
+const RU_MONTHS = [
+  'январь',
+  'февраль',
+  'март',
+  'апрель',
+  'май',
+  'июнь',
+  'июль',
+  'август',
+  'сентябрь',
+  'октябрь',
+  'ноябрь',
+  'декабрь',
+];
 
 function getTimeGroup(timestamp: number): TimeGroup {
   const now = new Date();
@@ -163,6 +189,13 @@ function formatShortStamp(unix: number): { date: string; time: string } {
   return { date: `${dd}.${mm}.${yy}`, time: `${hh}:${min}` };
 }
 
+function formatShortMonthYear(unix: number): string {
+  const d = new Date(unix * 1000);
+  const month = RU_MONTHS[d.getMonth()] || '';
+  const year = String(d.getFullYear()).slice(-2);
+  return `${month} ${year}`;
+}
+
 function formatTimestamp(unix: number): string {
   const date = new Date(unix * 1000);
   return date.toLocaleDateString('en-US', {
@@ -174,6 +207,10 @@ function formatTimestamp(unix: number): string {
     minute: '2-digit',
     hour12: false,
   });
+}
+
+function normalizeSearchText(value: string): string {
+  return value.toLocaleLowerCase().replace(/\s+/g, ' ').trim();
 }
 
 // Color configs matching TabBar
@@ -237,6 +274,15 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const [history, setHistory] = useState<TabHistoryEntry[]>([]);
   const [favorites, setFavorites] = useState<FavoriteEntry[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
+  const [historyQuery, setHistoryQuery] = useState('');
+  const [semanticQuery, setSemanticQuery] = useState('');
+  const [semanticResults, setSemanticResults] = useState<ScoredTabHistoryEntry[]>([]);
+  const [semanticSearching, setSemanticSearching] = useState(false);
+  const [titleSearchError, setTitleSearchError] = useState<string | null>(null);
+  const [titleIndexStats, setTitleIndexStats] = useState<TabTitleIndexStats | null>(null);
+  const [titleIndexing, setTitleIndexing] = useState(false);
+  const [titleIndexProgress, setTitleIndexProgress] = useState<{ current: number; total: number } | null>(null);
+  const [visibleRange, setVisibleRange] = useState<{ startIndex: number; endIndex: number }>({ startIndex: 0, endIndex: 0 });
   const historyLoadProjectRef = useRef<string | null>(null);
   const renderSeqRef = useRef(0);
   const pendingReadyRef = useRef<{
@@ -418,7 +464,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   // CMD+hover popovers (unified hooks). Tooltip on bare hover was removed —
   // user already has the muscle memory of "hold Cmd to peek details".
   const isCmdPressed = useCmdKey();
-  const activePopover = useCmdHoverPopover<string>(isCmdPressed);
   const historyPopover = useCmdHoverPopover<number>(isCmdPressed);
 
   // Close context menu on mousedown outside
@@ -630,109 +675,8 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     });
   };
 
-  // Subscribe to OSC 133 process status — green/red dot on Active cards.
-  // Initial sync on mount + on tabs.length change (covers create/close).
-  // Same event names as TabBar — single source of truth in main process.
-  useEffect(() => {
-    const tabIds = tabIdsKey ? tabIdsKey.split('|') : [];
-    if (tabIds.length === 0) {
-      setProcessStatus(new Map());
-      return;
-    }
-    const tabIdSet = new Set(tabIds);
-    let cancelled = false;
-    const syncStartedAt = performance.now();
-    const syncStartAbs = performance.timeOrigin + syncStartedAt;
-    const tabSummary = tabIds.map((tabId) => {
-      const tab = workspace?.tabs.get(tabId);
-      return tabId.slice(-8) + ':' + (tab?.commandType || tab?.tabType || 'unknown');
-    }).join(',');
-    console.warn(
-      `[Perf:HomeStatusSync] start project=${projectId.slice(-12)}` +
-      ` startAbs=${syncStartAbs.toFixed(1)}` +
-      ` count=${tabIds.length} tabs=${tabSummary}`
-    );
-
-    Promise.all(
-      tabIds.map(async (tabId) => {
-        const itemStartedAt = performance.now();
-        const itemStartAbs = performance.timeOrigin + itemStartedAt;
-        const tab = workspace?.tabs.get(tabId);
-        const isCodexTab = tab?.commandType === 'codex';
-        try {
-          const state = await ipcRenderer.invoke('terminal:getCommandState', {
-            tabId,
-            caller: 'ProjectHome.statusSync',
-            expectedProcess: 'codex',
-            allowProcessTreeLookup: isCodexTab,
-          });
-          const durMs = performance.now() - itemStartedAt;
-          if (durMs > 50) {
-            console.warn(
-              `[Perf:HomeStatusSync] item project=${projectId.slice(-12)}` +
-              ` tab=${tabId.slice(-8)}` +
-              ` command=${tab?.commandType || tab?.tabType || 'unknown'}` +
-              ` allowProcessTreeLookup=${isCodexTab}` +
-              ` startAbs=${itemStartAbs.toFixed(1)}` +
-              ` endAbs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
-              ` running=${!!state?.isRunning} durMs=${durMs.toFixed(1)}`
-            );
-          }
-          return [tabId, !!state?.isRunning] as [string, boolean];
-        } catch {
-          const durMs = performance.now() - itemStartedAt;
-          console.warn(
-            `[Perf:HomeStatusSync] item-error project=${projectId.slice(-12)}` +
-            ` tab=${tabId.slice(-8)}` +
-            ` startAbs=${itemStartAbs.toFixed(1)}` +
-            ` endAbs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
-            ` durMs=${durMs.toFixed(1)}`
-          );
-          return [tabId, false] as [string, boolean];
-        }
-      })
-    ).then((pairs) => {
-      if (cancelled) return;
-      console.warn(
-        `[Perf:HomeStatusSync] done project=${projectId.slice(-12)}` +
-        ` startAbs=${syncStartAbs.toFixed(1)}` +
-        ` endAbs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
-        ` count=${pairs.length} durMs=${(performance.now() - syncStartedAt).toFixed(1)}` +
-        ` running=${pairs.filter(([, running]) => running).length}`
-      );
-      setProcessStatus(new Map(pairs));
-    });
-
-    const handleStarted = (_: any, { tabId }: { tabId: string }) => {
-      if (!tabIdSet.has(tabId)) return;
-      setProcessStatus(prev => {
-        const next = new Map(prev);
-        next.set(tabId, true);
-        return next;
-      });
-    };
-    const handleFinished = (_: any, { tabId }: { tabId: string }) => {
-      if (!tabIdSet.has(tabId)) return;
-      setProcessStatus(prev => {
-        const next = new Map(prev);
-        next.set(tabId, false);
-        return next;
-      });
-    };
-    ipcRenderer.on('terminal:command-started', handleStarted);
-    ipcRenderer.on('terminal:command-finished', handleFinished);
-    return () => {
-      cancelled = true;
-      ipcRenderer.removeListener('terminal:command-started', handleStarted);
-      ipcRenderer.removeListener('terminal:command-finished', handleFinished);
-    };
-  }, [tabIdsKey]);
-
-  // Fetch history + favorites in parallel. We gate the entire content (lists +
-  // SemanticSearch) on Promise.all so the user doesn't see Search appear before
-  // history finishes loading — IPC for large tab_history can take 200-500ms.
-  // Skeleton placeholder fills the same vertical real-estate, so when content
-  // arrives the layout doesn't jump.
+  // Fetch history only. Active/Favorites are intentionally not rendered on Home:
+  // this view is now a single virtualized closed-tab stream with title search.
   useEffect(() => {
     if (!projectId) return;
     let cancelled = false;
@@ -744,19 +688,15 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     if (firstLoadForProject) {
       setIsLoaded(false);
     }
-    Promise.all([
-      ipcRenderer.invoke('project:get-tab-history', { projectId }) as Promise<TabHistoryEntry[]>,
-      ipcRenderer.invoke('project:get-favorites', { projectId }) as Promise<FavoriteEntry[]>,
-    ]).then(([h, f]) => {
+    (ipcRenderer.invoke('project:get-tab-history', { projectId }) as Promise<TabHistoryEntry[]>).then((h) => {
       if (cancelled) return;
       const historyRows = h || [];
-      const favoriteRows = f || [];
       const ipcMs = performance.now() - startedAt;
       console.warn(
         `[Perf:Home] ready project=${projectId.slice(-12)} loadId=${loadId} firstLoad=${firstLoadForProject}` +
         ` startAbs=${startAbs.toFixed(1)}` +
         ` endAbs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
-        ` tabs=${tabs.length} history=${historyRows.length} favorites=${favoriteRows.length}` +
+        ` tabs=${tabs.length} history=${historyRows.length} favorites=0` +
         ` ipcMs=${ipcMs.toFixed(1)}`
       );
       pendingReadyRef.current = {
@@ -766,11 +706,11 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         firstLoad: firstLoadForProject,
         tabs: tabs.length,
         history: historyRows.length,
-        favorites: favoriteRows.length,
+        favorites: 0,
       };
       startTransition(() => {
         setHistory(historyRows);
-        setFavorites(favoriteRows);
+        setFavorites([]);
         setIsLoaded(true);
       });
     }).catch((err) => {
@@ -887,6 +827,143 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     setHistory(prev => prev.filter(h => h.id !== id));
   };
 
+  const refreshTitleIndexStats = useCallback(async () => {
+    try {
+      const res = await ipcRenderer.invoke('tab-title-index:stats', { projectId });
+      if (res?.success) {
+        setTitleIndexStats(res.data);
+        setTitleIndexing(!!res.data?.inProgress);
+      }
+    } catch (err: any) {
+      setTitleSearchError(err?.message || 'Failed to load title index stats');
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!isLoaded) return;
+    refreshTitleIndexStats();
+  }, [isLoaded, history.length, refreshTitleIndexStats]);
+
+  useEffect(() => {
+    const handler = (_: any, data: any) => {
+      if (data?.projectId !== projectId) return;
+      setTitleIndexProgress({ current: data.current || 0, total: data.total || 0 });
+    };
+    ipcRenderer.on('tab-title-index:progress', handler);
+    return () => { ipcRenderer.removeListener('tab-title-index:progress', handler); };
+  }, [projectId]);
+
+  const handleReindexTitles = useCallback(async () => {
+    setTitleIndexing(true);
+    setTitleIndexProgress(null);
+    setTitleSearchError(null);
+    try {
+      const res = await ipcRenderer.invoke('tab-title-index:reindex', { projectId, force: false });
+      if (res?.success) {
+        setTitleIndexStats(res.stats || null);
+      } else {
+        setTitleSearchError(res?.error || 'Title indexing failed');
+      }
+    } catch (err: any) {
+      setTitleSearchError(err?.message || 'Title indexing failed');
+    } finally {
+      setTitleIndexing(false);
+      setTitleIndexProgress(null);
+      refreshTitleIndexStats();
+    }
+  }, [projectId, refreshTitleIndexStats]);
+
+  const titleIndexButtonLabel = useMemo(() => {
+    if (!titleIndexing) return 'Index';
+    const total = titleIndexProgress?.total ?? titleIndexStats?.unindexed ?? 0;
+    const current = titleIndexProgress?.current ?? 0;
+    return total > 0 ? `${Math.min(current, total)}/${total}` : 'Indexing';
+  }, [titleIndexing, titleIndexProgress, titleIndexStats?.unindexed]);
+
+  const localFilteredHistory = useMemo(() => {
+    const q = normalizeSearchText(historyQuery);
+    if (!q) return history as ScoredTabHistoryEntry[];
+    const tokens = q.split(' ').filter(Boolean);
+    return history.filter((entry) => {
+      const haystack = normalizeSearchText(entry.name || '');
+      return tokens.every((token) => haystack.includes(token));
+    });
+  }, [history, historyQuery]);
+
+  const semanticModeActive = Boolean(
+    semanticQuery.trim() &&
+    normalizeSearchText(semanticQuery) === normalizeSearchText(historyQuery)
+  );
+
+  const displayedHistory = semanticModeActive ? semanticResults : localFilteredHistory;
+
+  const displayedMeta = useMemo(() => {
+    const counts = new Map<TimeGroup, number>();
+    const ranges = new Map<TimeGroup, { from: number; to: number }>();
+    for (const entry of displayedHistory) {
+      const group = getTimeGroup(entry.closed_at);
+      counts.set(group, (counts.get(group) || 0) + 1);
+      const range = ranges.get(group);
+      if (!range) {
+        ranges.set(group, { from: entry.closed_at, to: entry.closed_at });
+      } else {
+        range.from = Math.min(range.from, entry.closed_at);
+        range.to = Math.max(range.to, entry.closed_at);
+      }
+    }
+    const seen = new Map<TimeGroup, number>();
+    return displayedHistory.map((entry) => {
+      const group = getTimeGroup(entry.closed_at);
+      const indexInGroup = seen.get(group) || 0;
+      seen.set(group, indexInGroup + 1);
+      const range = ranges.get(group);
+      const rangeLabel = group === 'Older' && range
+        ? (() => {
+            const from = formatShortMonthYear(range.from);
+            const to = formatShortMonthYear(range.to);
+            return from === to ? from : `${from} — ${to}`;
+          })()
+        : null;
+      return {
+        group,
+        label: rangeLabel ? `${TIME_GROUP_LABEL[group]} (${rangeLabel})` : TIME_GROUP_LABEL[group],
+        indexInGroup,
+        groupCount: counts.get(group) || 0,
+      };
+    });
+  }, [displayedHistory]);
+
+  const currentScrollMeta = displayedMeta[Math.min(
+    Math.max(visibleRange.endIndex, 0),
+    Math.max(displayedMeta.length - 1, 0),
+  )];
+
+  const handleSemanticTitleSearch = useCallback(async () => {
+    const query = historyQuery.trim();
+    if (query.length < 2) return;
+    setSemanticSearching(true);
+    setTitleSearchError(null);
+    try {
+      const res = await ipcRenderer.invoke('tab-title-search:semantic', {
+        projectId,
+        query,
+        maxResults: 120,
+        minScore: 0.38,
+      });
+      if (res?.success) {
+        setSemanticQuery(query);
+        setSemanticResults(res.data || []);
+        setVisibleRange({ startIndex: 0, endIndex: 0 });
+      } else {
+        setTitleSearchError(res?.error || 'Semantic title search failed');
+      }
+    } catch (err: any) {
+      setTitleSearchError(err?.message || 'Semantic title search failed');
+    } finally {
+      setSemanticSearching(false);
+    }
+  }, [historyQuery, projectId]);
+
   if (!workspace || !project) {
     return (
       <div className="flex-1 flex items-center justify-center text-[#666]">
@@ -921,9 +998,9 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   };
 
   return (
-    <div className="h-full bg-bg-main p-6 overflow-y-auto overflow-x-hidden" style={{ position: 'relative' }}>
+    <div className="h-full bg-bg-main p-6 overflow-hidden flex flex-col" style={{ position: 'relative' }}>
       {/* Project Header */}
-      <div className="mb-6">
+      <div className="mb-5 w-full max-w-[680px] mx-auto flex-shrink-0">
         {isDraft ? (
           /* Draft mode: inline input for naming */
           <>
@@ -1048,416 +1125,191 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         )}
       </div>
 
-      {/* Skeleton — gates the lists+search while initial IPC is in-flight.
-          Same vertical footprint as final content so layout doesn't jump. */}
       {!isLoaded && (
-        <div className="flex gap-6">
-          <div className="flex-1 space-y-3">
-            <div className="h-4 w-40 bg-white/5 rounded animate-pulse" />
-            <div className="flex flex-wrap gap-2">
-              {Array.from({ length: 4 }).map((_, i) => (
-                <div key={i} className="h-[40px] w-[120px] bg-white/[0.03] rounded animate-pulse" />
-              ))}
-            </div>
-            <div className="h-4 w-32 bg-white/5 rounded animate-pulse mt-6" />
-            <div className="flex flex-wrap gap-2">
-              {Array.from({ length: 6 }).map((_, i) => (
-                <div key={i} className="h-[36px] w-[110px] bg-white/[0.03] rounded animate-pulse" />
-              ))}
-            </div>
-          </div>
-          <div className="w-px bg-[#2a2a2a]" />
-          <div style={{ width: rightColWidth, flexShrink: 0 }} className="space-y-3">
-            <div className="h-4 w-28 bg-white/5 rounded animate-pulse" />
-            <div className="flex flex-wrap gap-2">
-              {Array.from({ length: 3 }).map((_, i) => (
-                <div key={i} className="h-[40px] w-[120px] bg-white/[0.03] rounded animate-pulse" />
-              ))}
-            </div>
-          </div>
+        <div className="flex-1 min-h-0 w-full max-w-[680px] mx-auto space-y-3">
+          <div className="h-8 w-full bg-white/[0.04] rounded animate-pulse" />
+          <div className="h-7 w-64 bg-white/[0.04] rounded animate-pulse" />
+          {Array.from({ length: 10 }).map((_, i) => (
+            <div key={i} className="h-[34px] w-full bg-white/[0.03] rounded animate-pulse" />
+          ))}
         </div>
       )}
 
-      {/* Two-column layout: LEFT = closed-tab history + (below) semantic search;
-          RIGHT = Active tabs + Favorites. Divider is a real 1px column between them.
-          Right column is fixed width so it doesn't collapse on narrow viewports —
-          history (left) takes the rest. */}
       {isLoaded && (
-      <div className="flex gap-6">
+        <div className="flex-1 min-h-0 w-full max-w-[680px] mx-auto flex flex-col">
+          <div className="flex items-center gap-2 mb-3 flex-shrink-0">
+            <div className="relative flex-1 min-w-0">
+              <Search size={14} className="absolute left-2 top-1/2 -translate-y-1/2 text-[#666]" />
+              <input
+                value={historyQuery}
+                onChange={(e) => {
+                  setHistoryQuery(e.target.value);
+                  setTitleSearchError(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                    e.preventDefault();
+                    handleSemanticTitleSearch();
+                  }
+                }}
+                placeholder="Search tab titles..."
+                className="w-full h-8 bg-[#151515] border border-[#2a2a2a] rounded px-8 text-[12px] text-white outline-none focus:border-[#555]"
+              />
+              {semanticSearching && (
+                <Loader2 size={13} className="absolute right-2 top-1/2 -translate-y-1/2 text-[#818cf8] animate-spin" />
+              )}
+            </div>
+            <button
+              onClick={handleSemanticTitleSearch}
+              disabled={semanticSearching || historyQuery.trim().length < 2}
+              className="h-8 px-3 rounded border border-[#333] text-[12px] text-[#ccc] hover:text-white hover:border-[#555] disabled:opacity-40 disabled:hover:text-[#ccc] disabled:hover:border-[#333] cursor-pointer disabled:cursor-default flex items-center gap-1.5"
+              title="Cmd+Enter"
+            >
+              <Search size={13} />
+              RAG
+            </button>
+            <div className="h-8 px-2 rounded border border-[#2a2a2a] bg-[#111] text-[11px] text-[#888] flex items-center gap-1.5">
+              <Database size={12} className={titleIndexStats?.unindexed ? 'text-[#d97706]' : 'text-[#666]'} />
+              <span>{titleIndexStats?.unindexed ?? 0} new</span>
+            </div>
+            <button
+              onClick={handleReindexTitles}
+              disabled={titleIndexing || !titleIndexStats?.unindexed}
+              className={`h-8 min-w-[72px] px-2 rounded border text-[11px] flex items-center justify-center gap-1.5 ${
+                titleIndexing
+                  ? 'border-[#3a3a52] bg-[#151528] text-[#d7d7ff] cursor-default'
+                  : titleIndexStats?.unindexed
+                    ? 'border-[#333] text-[#aaa] hover:text-white hover:border-[#555] cursor-pointer'
+                    : 'border-[#333] text-[#aaa] opacity-40 cursor-default'
+              }`}
+            >
+              {titleIndexing ? (
+                <Loader2 size={12} className="animate-spin text-[#818cf8]" />
+              ) : (
+                <Database size={12} />
+              )}
+              {titleIndexButtonLabel}
+            </button>
+            <button
+              onClick={() => handleClearHistory()}
+              className="h-8 px-2 rounded text-[11px] text-[#666] hover:text-[#999] cursor-pointer flex items-center gap-1"
+              title="Clear history"
+            >
+              <Trash2 size={12} />
+            </button>
+          </div>
 
-        {/* LEFT — closed tabs history */}
-        <div className="flex-1 min-w-0">
-          {history.length === 0 ? (
-            <div className="text-[#555] text-xs">Нет закрытых вкладок в истории.</div>
-          ) : (
-            <>
-              {Array.from(groupByTime(history).entries()).map(([group, entries]) => {
-                const alwaysOpen = group === 'Recent' || group === 'This Week';
-                const isCollapsed = !alwaysOpen && collapsedGroups.has(group);
-                const label = TIME_GROUP_LABEL[group];
+          <div className="flex items-center justify-between mb-2 flex-shrink-0 text-[11px]">
+            <div className="text-[#666]">
+              {semanticModeActive ? 'RAG results' : 'Instant title filter'} · {displayedHistory.length}/{history.length}
+              {titleIndexStats ? <span className="text-[#4b5563]"> · indexed {titleIndexStats.indexed}/{titleIndexStats.total}</span> : null}
+            </div>
+            {titleSearchError && <div className="text-[#DA7756] truncate max-w-[50%]">{titleSearchError}</div>}
+          </div>
 
-                return (
-                  <div key={group} className="mb-6">
-                    <div className="flex items-center justify-between mb-3">
-                      {alwaysOpen ? (
-                        <div className="flex items-center gap-2">
-                          <Clock size={14} className="text-[#888]" />
-                          <h2 className="text-sm text-[#888]">{label} ({entries.length})</h2>
-                        </div>
-                      ) : (
-                        <div
-                          className="flex items-center gap-2 cursor-pointer"
-                          style={{ display: 'inline-flex' }}
-                          onClick={() => setCollapsedGroups(prev => {
-                            const next = new Set(prev);
-                            if (next.has(group)) next.delete(group); else next.add(group);
-                            return next;
-                          })}
-                        >
-                          {isCollapsed ? <ChevronRight size={14} className="text-[#888]" /> : <ChevronDown size={14} className="text-[#888]" />}
-                          <Clock size={14} className="text-[#888]" />
-                          <h2 className="text-sm text-[#888]">{label} ({entries.length})</h2>
-                        </div>
-                      )}
-                      {!alwaysOpen && (
-                        <div
-                          className="flex items-center gap-2"
-                          onMouseEnter={() => setShowKeepNotes(true)}
-                          onMouseLeave={() => setShowKeepNotes(false)}
-                        >
-                          {showKeepNotes && history.some(h => h.notes) && (
-                            <button
-                              onClick={handleClearExceptNotes}
-                              className="flex items-center gap-1 text-[11px] text-[#DA7756] hover:text-[#e89070] cursor-pointer transition-all"
-                            >
-                              Keep with notes
-                            </button>
-                          )}
-                          <button
-                            onClick={() => handleClearHistory()}
-                            className="flex items-center gap-1 text-[11px] text-[#666] hover:text-[#999] cursor-pointer transition-colors"
-                          >
-                            <Trash2 size={12} />
-                            Clear
-                          </button>
-                        </div>
-                      )}
+          <div className="flex-1 min-h-0 border border-[#242424] rounded bg-[#0f0f0f] overflow-hidden">
+            {displayedHistory.length === 0 ? (
+              <div className="h-full flex items-center justify-center text-[#555] text-xs">
+                {history.length === 0 ? 'Нет закрытых вкладок в истории.' : 'Ничего не найдено.'}
+              </div>
+            ) : (
+              <div className="h-full min-h-0 flex flex-col">
+                <div className="h-8 px-3 bg-[#151515]/95 border-b border-[#2a2a2a] flex items-center justify-between text-[11px] flex-shrink-0">
+                    <div className="flex items-center gap-2 text-[#888] min-w-0">
+                      <Clock size={13} className="text-[#777] flex-shrink-0" />
+                      <span className="truncate">{currentScrollMeta?.label || 'История'}</span>
                     </div>
-                    <div
-                      style={{
-                        maxHeight: isCollapsed ? '0' : 'none',
-                        opacity: isCollapsed ? 0 : 1,
-                        overflow: 'hidden',
-                        transition: 'max-height 0.2s ease, opacity 0.15s ease',
-                      }}
-                    >
-                      <div className="flex flex-wrap gap-2">
-                        {entries.map((entry) => {
-                          const color = (entry.color || 'default') as TabColor;
-                          const colorConfig = TAB_COLORS[color];
-
-                          return (
-                            <div
-                              key={entry.id}
-                              className="relative"
-                              {...historyPopover.triggerProps(entry.id)}
-                              onContextMenu={(e) => handleCardContextMenu(e, 'history', entry.id)}
-                            >
-                              <div
-                                className="transition-all duration-150 cursor-pointer hover:opacity-70"
-                                onClick={() => restoreTab(entry)}
-                                onAuxClick={(e) => {
-                                  if (e.button === 1) {
-                                    e.preventDefault();
-                                    restoreTabBackground(entry);
-                                  }
-                                }}
-                                style={{
-                                  width: CARD_W,
-                                  padding: '6px 10px',
-                                  backgroundColor: colorConfig.bgColor,
-                                  borderRadius: '5px',
-                                  borderLeft: `2px solid ${colorConfig.borderColor}`,
-                                  opacity: 0.5,
-                                  display: 'flex',
-                                  flexDirection: 'column',
-                                  gap: '1px',
-                                }}
-                              >
-                                {/* Status marker (если был выставлен) рендерим inline
-                                    слева от имени — тот же маркер что слева от имени
-                                    в TabBar vertical-mode. Shape/size приходят из
-                                    Settings (statusMarker.{shape,sizePx}). lookup в
-                                    палитре useUIStore.sessionStatuses по id — если
-                                    палитру с этим id юзер удалил, marker не рендерится,
-                                    но data в history-row остаётся. */}
-                                <span className="text-[12px] text-white truncate block" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                                  {(() => {
-                                    const meta = entry.session_status
-                                      ? sessionStatuses.find((s) => s.id === entry.session_status)
-                                      : null;
-                                    if (!meta) return null;
-                                    return (
-                                      <span
-                                        title={meta.label}
-                                        style={{
-                                          flexShrink: 0,
-                                          width: `${statusMarkerSize}px`,
-                                          height: `${statusMarkerSize}px`,
-                                          borderRadius: statusMarkerShape === 'square' ? '2px' : '50%',
-                                          backgroundColor: meta.color,
-                                          border: '1px solid rgba(0,0,0,0.4)',
-                                        }}
-                                      />
-                                    );
-                                  })()}
-                                  <span className="truncate">{entry.name}</span>
-                                </span>
-                                {/* Second row is the closed-at stamp, not the
-                                    CWD: brighter (#aaa vs #666), and useful for
-                                    disambiguating same-named tabs ("claude-03"
-                                    closed twice). CWD still surfaces in the
-                                    Cmd+hover popover.
-
-                                    Negative horizontal margin (-3px each side)
-                                    pulls the stamp slightly past the card's
-                                    own padding so the date and time both fit
-                                    inside the 100px card; the bar between them
-                                    uses tight 2px margins so it doesn't waste
-                                    width on word-spaces. */}
-                                {(() => {
-                                  const { date, time } = formatShortStamp(entry.closed_at);
-                                  return (
-                                    <span
-                                      className="text-[9px] text-[#aaa] truncate block font-mono"
-                                      style={{ marginLeft: -3, marginRight: -3 }}
-                                    >
-                                      {date}
-                                      <span style={{ color: '#555', margin: '0 2px' }}>|</span>
-                                      {time}
-                                    </span>
-                                  );
-                                })()}
-                              </div>
-
-                              {/* CMD indicator: notes exist */}
-                              {isCmdPressed && entry.notes && (
-                                <span
-                                  style={{
-                                    position: 'absolute',
-                                    top: '6px',
-                                    right: '6px',
-                                    width: '5px',
-                                    height: '5px',
-                                    borderRadius: '50%',
-                                    backgroundColor: '#DA7756',
-                                    zIndex: 10,
-                                  }}
-                                />
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
+                    <div className="text-[#666] font-mono">
+                      {currentScrollMeta ? `${currentScrollMeta.indexInGroup + 1}/${currentScrollMeta.groupCount}` : `0/${displayedHistory.length}`}
                     </div>
                   </div>
-                );
-              })}
-            </>
-          )}
-        </div>
-
-        {/* Resizable divider — 5px hit area, 1px visual line. Wider hit area
-            means user doesn't need pixel-precise aim. cursor:col-resize on the
-            strip makes the affordance discoverable; hover-tint reinforces it. */}
-        <div
-          onPointerDown={handleDividerPointerDown}
-          className="self-stretch flex-shrink-0 relative group"
-          style={{
-            width: 5,
-            cursor: 'col-resize',
-            // Negative margin pulls neighbours together so the visual gap stays
-            // tight while the hit area extends ±2px around the visual line.
-            marginLeft: -2,
-            marginRight: -2,
-          }}
-        >
-          <div className="absolute inset-y-0 left-1/2 -translate-x-1/2 w-px bg-[#2a2a2a] group-hover:bg-[#4a4a4a] transition-colors" />
-        </div>
-
-        {/* RIGHT — Active + Favorites */}
-        <div style={{ width: rightColWidth, flexShrink: 0 }}>
-          {/* Active Tabs */}
-          <div className="mb-6">
-            <h2 className="text-sm text-[#888] mb-3">Active Tabs ({tabs.length})</h2>
-            <div className="flex flex-wrap gap-3 w-full">
-          {tabs.map((tab) => {
-            const colorConfig = TAB_COLORS[tab.color || 'default'];
-            const isActive = workspace.activeTabId === tab.id;
-            const isRunning = processStatus.get(tab.id) || false;
-
-            return (
-              <div
-                key={tab.id}
-                {...activePopover.triggerProps(tab.id)}
-                onContextMenu={(e) => handleCardContextMenu(e, 'active-tab', tab.id)}
-              >
-                <button
-                  onClick={() => handleTabClick(tab.id)}
-                  className="group cursor-pointer transition-all duration-150"
-                  style={{
-                    position: 'relative',
-                    width: ACTIVE_CARD_W,
-                    padding: '6px 10px',
-                    backgroundColor: colorConfig.bgColor,
-                    border: `1px solid ${isActive ? colorConfig.borderColor : 'transparent'}`,
-                    borderRadius: '6px',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '8px',
-                  }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.borderColor = colorConfig.borderColor;
-                  }}
-                  onMouseLeave={(e) => {
-                    if (!isActive) {
-                      e.currentTarget.style.borderColor = 'transparent';
-                    }
-                  }}
-                >
-                  {isCmdPressed && tab.notes && (
-                    <span
-                      style={{
-                        position: 'absolute',
-                        top: '4px',
-                        right: '4px',
-                        width: '5px',
-                        height: '5px',
-                        borderRadius: '50%',
-                        backgroundColor: '#DA7756',
-                        zIndex: 10,
-                      }}
-                    />
-                  )}
-                  <Terminal size={12} className="text-[#888] flex-shrink-0" />
-                  <span
-                    className="text-sm text-white truncate flex-1 min-w-0 text-left"
-                  >
-                    {tab.name}
-                  </span>
-                  {isRunning && (
-                    <span
-                      style={{
-                        flexShrink: 0,
-                        width: 6,
-                        height: 6,
-                        borderRadius: '50%',
-                        backgroundColor: '#4ade80',
-                        boxShadow: '0 0 4px rgba(74, 222, 128, 0.5)',
-                      }}
-                    />
-                  )}
-                </button>
-              </div>
-            );
-          })}
-
-          {/* New Tab Button — same dimensions as active cards for grid uniformity */}
-          <button
-            onClick={handleCreateTab}
-            className="cursor-pointer transition-all duration-150 hover:border-[#666]"
-            style={{
-              width: ACTIVE_CARD_W,
-              padding: '6px 10px',
-              backgroundColor: 'transparent',
-              border: '1px dashed #444',
-              borderRadius: '6px',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              gap: '6px',
-            }}
-          >
-            <Plus size={14} className="text-[#666]" />
-            <span className="text-[12px] text-[#666]">New Tab</span>
-          </button>
-        </div>
-      </div>
-
-      {/* Favorites Section — same right column; Favorites entries are allowed
-          to also appear in the history list (no dedup). */}
-      {favorites.length > 0 && (
-        <div className="mb-4 mt-4">
-          <div className="flex items-center gap-2 mb-3">
-            <Star size={14} className="text-[#b8860b]" />
-            <h2 className="text-sm text-[#888]">Favorites ({favorites.length})</h2>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {favorites.map((entry) => {
-              const color = (entry.color || 'default') as TabColor;
-              const colorConfig = TAB_COLORS[color];
-
-              return (
-                <div
-                  key={entry.id}
-                  className="transition-all duration-150 cursor-pointer"
-                  onClick={() => restoreFromFavorite(entry)}
-                  onAuxClick={(e) => {
-                    if (e.button === 1) {
-                      e.preventDefault();
-                      deleteFavorite(entry.id);
-                    }
-                  }}
-                  onContextMenu={(e) => handleCardContextMenu(e, 'favorite', entry.id)}
-                  style={{
-                    width: CARD_W,
-                    padding: '6px 10px',
-                    backgroundColor: colorConfig.bgColor,
-                    borderRadius: '5px',
-                    borderLeft: `2px solid ${colorConfig.borderColor}`,
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: '1px',
-                  }}
-                  onMouseEnter={(e) => {
-                    (e.currentTarget as HTMLDivElement).style.opacity = '0.7';
-                  }}
-                  onMouseLeave={(e) => {
-                    (e.currentTarget as HTMLDivElement).style.opacity = '1';
-                  }}
-                >
-                  <span className="text-[12px] text-white truncate block">
-                    {entry.name || 'tab'}
-                  </span>
-                  {/* Second row = added-to-favorites timestamp, mirrors the
-                      Recent group's card format (DD.MM.YY | HH:MM) verbatim.
-                      Same color/size/margins so the two grids read as one
-                      visual system. CWD still surfaces in Cmd+hover popover. */}
-                  {(() => {
-                    const { date, time } = formatShortStamp(entry.created_at);
+                <Virtuoso
+                  style={{ height: '100%' }}
+                  data={displayedHistory}
+                  rangeChanged={(range) => setVisibleRange((prev) => (
+                    prev.startIndex === range.startIndex && prev.endIndex === range.endIndex
+                      ? prev
+                      : { startIndex: range.startIndex, endIndex: range.endIndex }
+                  ))}
+                  itemContent={(index, entry) => {
+                    const color = (entry.color || 'default') as TabColor;
+                    const colorConfig = TAB_COLORS[color];
+                    const meta = entry.session_status
+                      ? sessionStatuses.find((s) => s.id === entry.session_status)
+                      : null;
+                    const { date, time } = formatShortStamp(entry.closed_at);
                     return (
-                      <span
-                        className="text-[9px] text-[#aaa] truncate block font-mono"
-                        style={{ marginLeft: -3, marginRight: -3 }}
+                      <div
+                        className="px-2 py-[3px]"
+                        {...historyPopover.triggerProps(entry.id)}
+                        onContextMenu={(e) => handleCardContextMenu(e, 'history', entry.id)}
                       >
-                        {date}
-                        <span style={{ color: '#555', margin: '0 2px' }}>|</span>
-                        {time}
-                      </span>
+                        <div
+                          className="relative cursor-pointer transition-opacity hover:opacity-75"
+                          onClick={() => restoreTab(entry)}
+                          onAuxClick={(e) => {
+                            if (e.button === 1) {
+                              e.preventDefault();
+                              restoreTabBackground(entry);
+                            }
+                          }}
+                          style={{
+                            minHeight: 32,
+                            padding: '5px 8px',
+                            backgroundColor: colorConfig.bgColor,
+                            borderRadius: 5,
+                            borderLeft: `2px solid ${colorConfig.borderColor}`,
+                            opacity: 0.62,
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 8,
+                          }}
+                        >
+                          {meta && (
+                            <span
+                              title={meta.label}
+                              style={{
+                                flexShrink: 0,
+                                width: `${statusMarkerSize}px`,
+                                height: `${statusMarkerSize}px`,
+                                borderRadius: statusMarkerShape === 'square' ? '2px' : '50%',
+                                backgroundColor: meta.color,
+                                border: '1px solid rgba(0,0,0,0.4)',
+                              }}
+                            />
+                          )}
+                          <div className="min-w-0 flex-1 text-[12px] leading-[16px] text-white break-words">
+                            {entry.name}
+                          </div>
+                          <div className="flex-shrink-0 flex items-center gap-2 text-[10px] text-[#888] font-mono">
+                            {semanticModeActive && typeof entry.score === 'number' && (
+                              <span className="text-[#818cf8]">{entry.score.toFixed(2)}</span>
+                            )}
+                            <span>{date}<span style={{ color: '#555', margin: '0 2px' }}>|</span>{time}</span>
+                          </div>
+                          {isCmdPressed && entry.notes && (
+                            <span
+                              style={{
+                                position: 'absolute',
+                                top: 5,
+                                right: 5,
+                                width: 5,
+                                height: 5,
+                                borderRadius: '50%',
+                                backgroundColor: '#DA7756',
+                              }}
+                            />
+                          )}
+                        </div>
+                      </div>
                     );
-                  })()}
-                </div>
-              );
-            })}
+                  }}
+                />
+              </div>
+            )}
           </div>
         </div>
       )}
-        </div>
-      </div>
-      )}
-
-      {/* Semantic Search — full width below both columns, gated by isLoaded. */}
-      {isLoaded && <SemanticSearchSection projectPath={project?.path || ''} />}
 
       {/* Context Menu (fixed, pattern from TabBar) */}
       {homeContextMenu && (
@@ -1594,40 +1446,12 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         </div>
       )}
 
-      {/* CMD+Hover Active Tab Popover. Уникальное окно с unified shape
-          (name → metadata → notes). Тот же компонент используется в TabBar и
-          в History-карточках ниже. Metadata теперь живёт ПОД именем и НАД
-          заметками, потому что заметки могут быть переменной длины и должны
-          получать всю остающуюся высоту — техническая инфа сессии сверху. */}
-      {activePopover.isVisible && activePopover.hoveredItem && (() => {
-        const tab = tabs.find(t => t.id === activePopover.hoveredItem!.id);
-        if (!tab) return null;
-        const metaRows = [
-          { label: 'Name', value: tab.name, variant: 'title' as const },
-          { label: 'Path', value: tab.cwd },
-          ...(tab.commandType ? [{ label: 'Type', value: tab.commandType }] : []),
-        ];
-        return (
-          <TabPreviewPopover
-            rect={activePopover.hoveredItem!.rect}
-            popoverProps={activePopover.popoverProps}
-            metaRows={metaRows}
-            notes={tab.notes}
-            split
-            pointerThrough
-            isLocked={activePopover.isLocked}
-            source="home-active"
-          />
-        );
-      })()}
-
-      {/* CMD+Hover History Popover. Та же компонента — отличается набором
-          metaRows (Closed/Created/Path/Type/Messages). */}
+      {/* CMD+Hover History Popover. Name не дублируем: в новой full-width
+          карточке оно уже видно полностью. */}
       {historyPopover.isVisible && historyPopover.hoveredItem && (() => {
         const entry = history.find(h => h.id === historyPopover.hoveredItem!.id);
         if (!entry) return null;
         const metaRows = [
-          { label: 'Name', value: entry.name, variant: 'title' as const },
           { label: 'Closed', value: formatTimestamp(entry.closed_at) },
           { label: 'Created', value: formatTimestamp(entry.created_at) },
           { label: 'Path', value: entry.cwd },

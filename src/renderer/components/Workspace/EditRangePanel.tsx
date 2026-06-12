@@ -5,11 +5,9 @@ import Tooltip from '../UI/Tooltip';
 import MarkdownRenderer from '../Research/MarkdownRenderer';
 import { usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore, ThinkingLevel, AIModel } from '../../store/useUIStore';
+import { GEMINI_MODEL_OPTIONS } from '../../constants/geminiModels';
 
-const AI_MODELS = [
-  { value: 'gemini-3-flash-preview', label: 'Flash' },
-  { value: 'gemini-3-pro-preview', label: 'Pro' }
-] as const;
+const AI_MODELS = GEMINI_MODEL_OPTIONS.map((m) => ({ value: m.value, label: m.label.replace(/^Gemini /, '') }));
 
 const THINKING_LEVELS = [
   { value: 'NONE', label: 'Off' },

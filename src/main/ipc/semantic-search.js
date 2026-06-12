@@ -91,6 +91,18 @@ function cosineSimilarity(a, b) {
   return denom === 0 ? 0 : dot / denom;
 }
 
+function textHash(text) {
+  return crypto.createHash('sha256').update(String(text || '')).digest('hex');
+}
+
+function embeddingToBlob(embedding) {
+  return Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);
+}
+
+function blobToEmbedding(blob) {
+  return new Float32Array(blob.buffer, blob.byteOffset, blob.byteLength / 4);
+}
+
 // ========== JSONL CHUNKING ==========
 
 /**
@@ -274,6 +286,32 @@ function initSearchTables(db) {
   `);
 
   console.log('[SemanticSearch] Tables initialized');
+}
+
+function initTabTitleSearchTables(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS tab_history_title_index (
+      history_id INTEGER PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      name_hash TEXT NOT NULL,
+      embedding BLOB,
+      indexed_at INTEGER DEFAULT (strftime('%s', 'now')),
+      FOREIGN KEY(history_id) REFERENCES tab_history(id) ON DELETE CASCADE
+    )
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_tab_title_index_project
+    ON tab_history_title_index(project_id)
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_tab_title_index_project_hash
+    ON tab_history_title_index(project_id, name_hash)
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_tab_history_project_closed_id
+    ON tab_history(project_id, closed_at DESC, id DESC)
+  `);
 }
 
 /**
@@ -609,12 +647,136 @@ function getIndexStats(db) {
 // ========== IPC HANDLERS ==========
 
 let _indexingInProgress = false;
+let _titleIndexingInProgress = false;
+
+function cleanupTabTitleIndex(db) {
+  db.prepare(`
+    DELETE FROM tab_history_title_index
+     WHERE history_id NOT IN (SELECT id FROM tab_history)
+  `).run();
+}
+
+function getTabTitleIndexStats(db, projectId) {
+  cleanupTabTitleIndex(db);
+  const total = db.prepare(
+    'SELECT COUNT(*) AS count FROM tab_history WHERE project_id = ?'
+  ).get(projectId)?.count || 0;
+  const indexed = db.prepare(`
+    SELECT COUNT(*) AS count
+      FROM tab_history h
+      JOIN tab_history_title_index i ON i.history_id = h.id
+     WHERE h.project_id = ?
+       AND i.embedding IS NOT NULL
+  `).get(projectId)?.count || 0;
+  return {
+    total,
+    indexed,
+    unindexed: Math.max(0, total - indexed),
+    model: GEMINI_EMBED_MODEL,
+    dims: EMBEDDING_DIMS,
+    inProgress: _titleIndexingInProgress,
+  };
+}
+
+async function indexTabTitles(db, projectId, progressCb, force = false) {
+  cleanupTabTitleIndex(db);
+  const rows = db.prepare(`
+    SELECT h.id, h.project_id, h.name, i.name_hash, i.embedding
+      FROM tab_history h
+      LEFT JOIN tab_history_title_index i ON i.history_id = h.id
+     WHERE h.project_id = ?
+     ORDER BY h.closed_at DESC, h.id DESC
+  `).all(projectId);
+
+  const pending = rows
+    .map((row) => {
+      const name = String(row.name || 'tab').trim() || 'tab';
+      const hash = textHash(name);
+      return { id: row.id, projectId: row.project_id, name, hash, indexedHash: row.name_hash, hasEmbedding: !!row.embedding };
+    })
+    .filter((row) => force || row.indexedHash !== row.hash || !row.hasEmbedding);
+
+  const total = pending.length;
+  if (total === 0) {
+    if (progressCb) progressCb(0, 0);
+    return { total: rows.length, indexed: 0, skipped: rows.length, failed: 0 };
+  }
+
+  let indexed = 0;
+  let failed = 0;
+  const upsert = db.prepare(`
+    INSERT INTO tab_history_title_index (history_id, project_id, name, name_hash, embedding, indexed_at)
+    VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))
+    ON CONFLICT(history_id) DO UPDATE SET
+      project_id = excluded.project_id,
+      name = excluded.name,
+      name_hash = excluded.name_hash,
+      embedding = excluded.embedding,
+      indexed_at = excluded.indexed_at
+  `);
+
+  for (let i = 0; i < pending.length; i += MAX_BATCH_SIZE) {
+    const batch = pending.slice(i, i + MAX_BATCH_SIZE);
+    try {
+      const embeddings = await embedTexts(batch.map((row) => row.name));
+      const tx = db.transaction(() => {
+        for (let j = 0; j < batch.length; j++) {
+          const row = batch[j];
+          const embedding = embeddings[j] ? embeddingToBlob(embeddings[j]) : null;
+          upsert.run(row.id, row.projectId, row.name, row.hash, embedding);
+        }
+      });
+      tx();
+      indexed += batch.length;
+    } catch (err) {
+      failed += batch.length;
+      console.error('[TabTitleSearch] title index batch failed:', err.message);
+    }
+    if (progressCb) progressCb(Math.min(i + batch.length, pending.length), pending.length, { indexed, failed });
+  }
+
+  return {
+    total: rows.length,
+    indexed,
+    skipped: rows.length - pending.length,
+    failed,
+  };
+}
+
+async function searchTabTitles(db, projectId, query, opts = {}) {
+  const text = String(query || '').trim();
+  if (text.length === 0) return [];
+  const maxResults = opts.maxResults || 80;
+  const minScore = opts.minScore ?? 0.40;
+  const rows = db.prepare(`
+    SELECT h.*, i.embedding
+      FROM tab_history h
+      JOIN tab_history_title_index i ON i.history_id = h.id
+     WHERE h.project_id = ?
+       AND i.embedding IS NOT NULL
+     ORDER BY h.closed_at DESC, h.id DESC
+  `).all(projectId);
+  if (rows.length === 0) return [];
+
+  const queryVec = await embedQuery(text);
+
+  const scored = [];
+  for (const row of rows) {
+    const score = cosineSimilarity(queryVec, blobToEmbedding(row.embedding));
+    if (score < minScore) continue;
+    const { embedding, ...entry } = row;
+    scored.push({ ...entry, score });
+  }
+  scored.sort((a, b) => b.score - a.score || b.closed_at - a.closed_at || b.id - a.id);
+  return scored.slice(0, maxResults);
+}
 
 function register({ projectManager, mainWindow }) {
   const db = projectManager.db.db; // Access raw better-sqlite3 instance
 
   // Initialize tables on startup
   initSearchTables(db);
+  initTabTitleSearchTables(db);
 
   // Search sessions
   ipcMain.handle('search:query', async (event, { query, maxResults, minScore, projectSlug, dateFrom, dateTo }) => {
@@ -675,6 +837,49 @@ function register({ projectManager, mainWindow }) {
   // Check if indexing is in progress
   ipcMain.handle('search:is-indexing', async () => {
     return { inProgress: _indexingInProgress };
+  });
+
+  ipcMain.handle('tab-title-index:stats', async (event, { projectId }) => {
+    try {
+      return { success: true, data: getTabTitleIndexStats(db, projectId) };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('tab-title-index:reindex', async (event, { projectId, force }) => {
+    if (_titleIndexingInProgress) {
+      return { success: false, error: 'Tab title indexing already in progress' };
+    }
+    _titleIndexingInProgress = true;
+    try {
+      const result = await indexTabTitles(db, projectId, (current, total, stats) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('tab-title-index:progress', {
+            projectId,
+            current,
+            total,
+            ...stats,
+          });
+        }
+      }, !!force);
+      return { success: true, ...result, stats: getTabTitleIndexStats(db, projectId) };
+    } catch (error) {
+      console.error('[TabTitleSearch] reindex error:', error.message);
+      return { success: false, error: error.message };
+    } finally {
+      _titleIndexingInProgress = false;
+    }
+  });
+
+  ipcMain.handle('tab-title-search:semantic', async (event, { projectId, query, maxResults, minScore }) => {
+    try {
+      const results = await searchTabTitles(db, projectId, query, { maxResults, minScore });
+      return { success: true, data: results };
+    } catch (error) {
+      console.error('[TabTitleSearch] query error:', error.message);
+      return { success: false, error: error.message };
+    }
   });
 }
 

@@ -13,6 +13,8 @@ VSCode-style полоса по всей нижней границе окна (п
 |---|---|---|
 | `Model: <value>` chip + popup | Default Claude model для будущих Claude PTY-сессий (`none / default / sonnet / opus / haiku` + модели из настроек) | SQLite `app:setState(defaultClaudeModel)` + localStorage boot mirror |
 | `Effort: <value>` chip + popup | Default Claude effort для будущих сессий (`none / low / med / high / xhi / max / ultra`) | SQLite `app:setState(defaultClaudeEffort)` + localStorage boot mirror |
+| `Codex: <value>` chip + popup | Default Codex model для будущих Codex CLI-запусков (`none` + live список из `codex debug models`) | SQLite `app:setState(defaultCodexModel)` + localStorage boot mirror |
+| `Effort: <value>` chip + popup | Default Codex reasoning effort для будущих Codex CLI-запусков (`none / low / med / high / xhi` с учётом выбранной модели) | SQLite `app:setState(defaultCodexEffort)` + localStorage boot mirror |
 | `● kill dev-ports` toggle | Перед каждым запуском npm-скрипта убивать занятые порты проекта | SQLite `app:setState(freePortsBeforeStart)` + localStorage boot mirror |
 | `● bridges` toggle | Подсвечивать невидимые hover-мосты красным (через `HoverBridgeDebug`) | SQLite `app:setState(debugHoverBridges)` + localStorage boot mirror |
 | `! N` оранжевый chip | Счётчик невалидных файловых путей в AI-промптах (рендерится только если N > 0) | derived, не persist |
@@ -25,7 +27,7 @@ VSCode-style полоса по всей нижней границе окна (п
 
 ## Model/Effort selector: tri-mode trigger
 
-Chip-trigger в status bar открывает popup тремя путями. Model и Effort используют один interaction pattern: StatusBar хранит **global default для будущих запусков**, а не пытается быть per-tab индикатором текущей живой сессии.
+Chip-trigger в status bar открывает popup тремя путями. Model и Effort используют один interaction pattern: StatusBar хранит **global default для будущих запусков**, а не пытается быть per-tab индикатором текущей живой сессии. Для Claude это future TUI startup chain, для Codex - future CLI launch args.
 
 | Trigger | Состояние | Закрытие |
 |---|---|---|
@@ -40,9 +42,11 @@ Chip-trigger в status bar открывает popup тремя путями. Mod
 - **Right-anchor**: `right: window.innerWidth - chipRect.right`. Не left-anchor — иначе popup уходит вправо за Timeline-strip и обрезается. См. [`methodology/сценарии-багов-design.md::1.1 Popup уезжает за правый/нижний край`](../methodology/сценарии-багов-design.md).
 - CSS-bridge через `paddingBottom: 4` ВНУТРИ popup-wrapper'а — gap от popup до chip покрыт hit-area'ой popup'а, курсор может ехать через эти 4px не теряя hover. Wrapper вплотную к chip'у (`bottom: window.innerHeight - chipRect.top`, **без** offset'а).
 
-**Применение к runtime сессии реализовано через ранний `tui-ready`.** Селектор сохраняет global default, а при запуске Claude `Terminal.tsx` ждёт детерминированный prompt-сигнал. Если `defaultClaudeModel !== 'none'`, сначала отправляется `/model <model>`; только после `claude:bridge-update`, где bridge-модель совпала с целью, цепочка продолжает `/effort <level>`. Bridge/process-started остаётся fallback'ом, но не главным trigger'ом: bridge может прийти на 3-6 секунд позже prompt'а и создать дубль. Полная таблица resume/fresh поведения — `fact-claude-tui-control.md::Startup defaults /model + /effort при запуске Claude`.
+**Claude runtime defaults применяются через ранний `tui-ready`.** Селектор сохраняет global default, а при запуске Claude `Terminal.tsx` ждёт детерминированный prompt-сигнал. Если `defaultClaudeModel !== 'none'`, сначала отправляется `/model <model>`; только после `claude:bridge-update`, где bridge-модель совпала с целью, цепочка продолжает `/effort <level>`. Bridge/process-started остаётся fallback'ом, но не главным trigger'ом: bridge может прийти на 3-6 секунд позже prompt'а и создать дубль. Полная таблица resume/fresh поведения — `fact-claude-tui-control.md::Startup defaults /model + /effort при запуске Claude`.
 
-**Persistence source of truth — SQLite.** `localStorage` здесь только synchronous boot mirror для первого paint и старых origin'ов dev-сервера. Dev/prod разделяются разными SQLite DB, поэтому `defaultClaudeModel/defaultClaudeEffort` могут отличаться между development и production без специальных условий в UI.
+**Codex launch defaults применяются до старта процесса.** У Codex нет StatusBar-инжекта в уже живой TUI: если `defaultCodexModel/defaultCodexEffort` не `none`, launch command получает `--model` и `model_reasoning_effort`. Per-tab выбор из ControlBar выигрывает над global default; StatusBar задаёт только стартовую политику для новых/возобновляемых запусков. Main process тоже читает SQLite `app_state` fallback, чтобы запуск без hydrated renderer payload не терял выбранный default.
+
+**Persistence source of truth — SQLite.** `localStorage` здесь только synchronous boot mirror для первого paint и старых origin'ов dev-сервера. Dev/prod разделяются разными SQLite DB, поэтому `defaultClaudeModel/defaultClaudeEffort/defaultCodexModel/defaultCodexEffort` могут отличаться между development и production без специальных условий в UI.
 
 ## Bridges debug toggle
 
