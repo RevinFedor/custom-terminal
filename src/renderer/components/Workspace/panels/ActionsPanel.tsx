@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { useUIStore, ApiClaudeModel, ApiGeminiModel, ThinkingLevel } from '../../../store/useUIStore';
+import { GEMINI_MODEL_OPTIONS } from '../../../constants/geminiModels';
 import { useWorkspaceStore } from '../../../store/useWorkspaceStore';
 import { useCmdKey } from '../../../hooks/useCmdHoverPopover';
 import { terminalRegistry } from '../../../utils/terminalRegistry';
@@ -1518,10 +1519,8 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       { id: 'claude-sonnet-4.5', label: 'Sonnet 4.5' },
       { id: 'claude-opus-4.6', label: 'Opus 4.6' },
     ];
-    const GEMINI_MODELS: { id: ApiGeminiModel; label: string }[] = [
-      { id: 'gemini-3-flash-preview', label: 'Flash' },
-      { id: 'gemini-3-pro-preview', label: 'Pro' },
-    ];
+    const GEMINI_MODELS: { id: ApiGeminiModel; label: string }[] =
+      GEMINI_MODEL_OPTIONS.map((m) => ({ id: m.value, label: m.label.replace(/^Gemini /, '') }));
     const THINKING: { id: ThinkingLevel; label: string }[] = [
       { id: 'NONE', label: 'Off' },
       { id: 'LOW', label: 'Low' },

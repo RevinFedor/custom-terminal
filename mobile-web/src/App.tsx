@@ -2818,9 +2818,13 @@ const Q_VIOLET = '#a78bfa';   // armed / Run-after
 const Q_DEEP_VIOLET = '#8b5cf6'; // Run-after pointed at another tab
 const Q_ORANGE = '#DA7756';   // Stop after / Post
 const Q_RED = '#ef4444';      // Close after
-const Q_AI_KIND_COLOR: Record<'claude-pty' | 'claude-sdk' | 'gemini', string> = {
-  'claude-pty': '#DA7756', 'claude-sdk': '#D28C5A', 'gemini': '#4E86F8',
+const Q_AI_KIND_COLOR: Record<QueueAiTab['kind'], string> = {
+  'claude-pty': '#DA7756', 'claude-sdk': '#D28C5A', 'gemini': '#4E86F8', 'codex': '#10A37F',
 };
+
+function queueItemTitle(it: { title?: string; text: string }) {
+  return (it.title || '').trim() || `[${Array.from(it.text || '').length} символов]`;
+}
 
 function QueueToggle({ label, on, color, onClick, sub }: {
   label: string; on: boolean; color: string; onClick: () => void; sub?: ReactNode;
@@ -3103,8 +3107,7 @@ function QueuePanel({ queue, aiTabs, busy, mutate, onClose }: {
                 </div>
               ) : (
                 queue.items.map((it) => {
-                  const firstLine = it.text.split('\n')[0];
-                  const head = firstLine.length > 60 ? firstLine.slice(0, 60) + '…' : firstLine;
+                  const title = queueItemTitle(it);
                   return (
                     <div
                       key={it.id}
@@ -3116,7 +3119,7 @@ function QueuePanel({ queue, aiTabs, busy, mutate, onClose }: {
                       }}
                     >
                       <span style={{ flex: 1, minWidth: 0, fontSize: 13, color: '#ddd', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {head || '(empty)'}
+                        {title}
                       </span>
                       {it.images > 0 && <span style={{ fontSize: 11, color: Q_ORANGE, flexShrink: 0 }}>📎{it.images}</span>}
                       <button

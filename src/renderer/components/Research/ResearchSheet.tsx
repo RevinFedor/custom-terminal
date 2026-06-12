@@ -2,6 +2,7 @@ import React, { useRef, useEffect, useState, useMemo, useCallback } from 'react'
 import { AnimatePresence, motion } from 'framer-motion';
 import { useResearchStore, ChatType } from '../../store/useResearchStore';
 import { useUIStore, ThinkingLevel, AIModel } from '../../store/useUIStore';
+import { GEMINI_MODEL_OPTIONS } from '../../constants/geminiModels';
 import { usePromptsStore } from '../../store/usePromptsStore';
 import ChatArea from './ChatArea';
 import ResearchInput from './ResearchInput';
@@ -31,10 +32,7 @@ interface ResearchSheetProps {
   projectPath: string;
 }
 
-const AI_MODELS = [
-  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
-  { value: 'gemini-3-pro-preview', label: 'Gemini 3 Pro' }
-] as const;
+const AI_MODELS = GEMINI_MODEL_OPTIONS;
 
 const THINKING_LEVELS = [
   { value: 'NONE', label: 'Off' },

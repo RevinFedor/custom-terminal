@@ -1062,6 +1062,20 @@ const TabItem = memo(({
               }}
             >
               {tab.tabType === 'browser' && <Globe size={12} className="flex-shrink-0 opacity-60" />}
+              {tab.aiClosing && (
+                <span
+                  className="flex-shrink-0"
+                  style={{
+                    width: 9,
+                    height: 9,
+                    borderRadius: '50%',
+                    border: '1.5px solid rgba(138,138,138,0.25)',
+                    borderTopColor: '#8a8a8a',
+                    boxSizing: 'border-box',
+                    animation: 'tab-dot-spin 0.8s linear infinite',
+                  }}
+                />
+              )}
               {tab.aiClosing ? 'остановка сессии...' : tab.name}
             </span>
           )}

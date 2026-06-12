@@ -80,6 +80,14 @@ Flow в `safePasteAndSubmit` опцией `stashFirst: true`:
 
 **Корнер-кейс:** если инпут пуст И в Claude уже есть stash, Ctrl+S **попнет** stash обратно в инпут (`handleStash` в PromptInput.tsx::1357 двунаправленный). Наша команда тогда дописывается к восстановленному тексту. На практике это происходит редко (только сразу после нашего же предыдущего slash-cmd, до того как user успел отправить что-то своё) и сабмит всё равно работает — slash-команда уйдёт как обычный prompt. Альтернатива — детект через PTY-buffer строки `Stashed (auto-restores after submit)` — добавляет 200-300ms; не стоит.
 
+### Cmd+\ History send preflight: draft переносится, отправка останавливается
+
+HistoryPanel send для обычного user prompt не должен вести себя как slash-command stash-flow. Если в живом Claude composer уже есть ручной draft, новый prompt из правой панели нельзя «аккуратно склеить и отправить»: пользователь писал текст в терминале с другим намерением, и auto-send превратит два независимых ввода в один неожиданный запрос. Preflight делает `grab-input`, атомарно забирает и очищает TUI composer, добавляет найденный текст в конец History textarea, показывает compact warning `Send stopped · draft moved` рядом со статусом и **не** вызывает `sendClaudePtyPrompt`.
+
+Это намеренно отличается от `⎘ prompt | + clear`: там пользователь явно просит забрать текст из TUI. В History send `grab-input` — guard перед отправкой, а не основное действие. Симптом нарушения: пользователь набрал текст в терминале, нажал Send в `Cmd+\`, и старый terminal draft оказался дописан к новому prompt'у и ушёл в Claude.
+
+Ручная стрелка «Pull terminal draft» в той же панели — отдельное явное действие. Если Claude composer пуст, она не должна показывать warning `Send stopped`: ничего не переносилось и отправка не останавливалась. Правильный feedback — короткий нейтральный `Terminal input empty` рядом с `READY`, без жёлтого треугольника.
+
 ### Кладбище идей: Esc после paste
 **Попытка №1** — в flow добавили `\x1b` (Esc) перед Enter, чтобы закрыть slash-autocomplete dropdown. Логика: при пасте `/model haiku` сначала появляется autocomplete, и `PromptInput.onSubmit` имеет early-return guard на `suggestionsState.suggestions.length > 0` (PromptInput.tsx::1074). Без закрытия dropdown — `\r` молча игнорируется.
 

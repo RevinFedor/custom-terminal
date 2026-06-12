@@ -7,6 +7,7 @@ import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
 import { motion, AnimatePresence } from 'framer-motion';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { markPendingResume } from '../../utils/pendingResume';
+import { buildCodexRunPayload } from '../../utils/codexLaunch';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -286,7 +287,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
         const ws = useWorkspaceStore.getState().openProjects.get(projectId);
         const cwd = ws?.tabs.get(tabId)?.cwd;
         console.log('[TerminalArea] Sending codex:run-command codex-c:', targetSessionId);
-        ipcRenderer.send('codex:run-command', { tabId, command: 'codex-c', sessionId: targetSessionId, cwd });
+        ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: targetSessionId, cwd }));
       } else {
         // Arm the 15s stale-bridge guard BEFORE the resume write (см.
         // fix-bridge-stale-takeover.md layer 4/5) — иначе протухший bridge.json

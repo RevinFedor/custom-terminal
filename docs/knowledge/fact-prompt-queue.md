@@ -14,7 +14,7 @@ Per-tab очередь: `Map<tabId, { items: QueuedPrompt[], autoRun: boolean, s
 
 **SQLite persistence через `app:setState`.** `items` / `autoRun` / `stopAfter` per-tab сохраняются в `app_state` под ключом `promptQueueByTab` (JSON-encoded `Record<tabId, {items, autoRun, stopAfter}>`). Throttle 250мс на каждый mutator — drag-reorder и быстрый ввод не должны писать SQLite 60 раз/сек, но последнее значение перед unmount-ом гарантированно flush'нется. `previewId` (UI-only state) **не** персистится. Cold tabs (пустой queue + autoRun=false + stopAfter=false) при serialize'е дропаются — kv-таблица не пухнет от мёртвых табов. Hydrate один раз через `hydratePromptQueueStore()` в `App.tsx::useEffect([])` — fire-and-forget, runner ниже терпит появление items после mount'а через subscribe-механизм (см. cold-start).
 
-**Auto-arm Run after на первый chip.** Когда `items.length === 0 && autoRun === false` и юзер дергает `+ grab` или `+ add` — `autoArmIfFirst()` ставит `setAutoRun(true)` ДО `addPrompt`. Логика: пустая очередь + добавление = намерение «хочу автозапуск», иначе зачем класть в очередь вместо обычной отправки. Subsequent adds в уже-armed очередь не re-arm (state уже true). Если юзер потом вручную выключил Run after — следующее добавление не reactivate'ит (`items.length > 0` после disarm). Триггер строго на edge `0 → first`.
+**First-chip hint без auto-arm.** Когда `items.length === 0 && autoRun === false` и юзер дергает `+ grab` или `+ add`, store НЕ включает `autoRun` автоматически. Вместо этого ставится UI-only `firstChipHintActive`: Run after pill мигает красным и сам гаснет после анимации/hover. Модель намерения: положить задачу в очередь = staging, а не согласие на автозапуск; запуск остаётся явным кликом по Run after. Ранняя версия auto-arm'ила первый chip, но это конфликтовало с ожиданием «я просто сохранил задачу на потом» и визуально путало hint с active-state.
 
 ### 2. Overlay UI (`PromptQueueOverlay.tsx`)
 Sticky 240px справа-вверху Claude/Codex PTY-таба. Гейтится тремя условиями:
@@ -301,16 +301,19 @@ Overlay рендерится через гейт `effectiveActive && isClaudeTab
 
 **Что НЕ делает** текущая фича: re-paste картинок при Replay (▶). Кнопка вставляет только текст с плейсхолдерами `[Image #N]` в input Claude — Claude увидит ссылки на несуществующие в его новой `pastedContents` map'е id (если delete-range / fork session). Полноценный image re-attach требует либо (a) копировать файл в clipboard + симулировать Cmd+V в PTY (нужен native paste hook со стороны Claude), либо (b) `/file <path>` команды если она есть. Отдельный pipeline на будущее.
 
-## Editor open = toggle, не permanent open
+## Editor surface: hover-preview + blur-save
 
-Все три триггера, открывающие slideout-редактор (тело чипа, `+add` в футере, ✎ post-prompt в шапке), стали toggle'ами: повторный клик на **том же** триггере закрывает редактор. Предикаты per-trigger:
-- chip → `editorOpen && !isPostPromptMode && editingId === id`
-- `+add` → `editorOpen && !isPostPromptMode && !editingId`
-- ✎ → `editorOpen && isPostPromptMode`
+Чип очереди имеет два независимых слоя: `text` = payload, который уйдёт в terminal input; `title` = label карточки. На создании сначала ставится fallback-label `[N символов]`, но это не финальное название: `+grab` всегда запускает AI-название, а `+add` запускает его если title input остался пустым на blur/outside-save. Источник — встроенный Settings → AI prompt `Run After Title` (`run-after-title`), поэтому пользователь может менять prompt/model/thinking так же, как для остальных AI prompts. Late response перечитывает текущий item из store и skip'ается если `titleManual=true`: ручная правка title всегда выигрывает у async-генерации. Если API key/model недоступны, fallback `[N символов]` остаётся честным size-marker'ом, а не ошибочным «названием».
 
-Cross-trigger swap (чип A → ✎ post-prompt, или ✎ → `+add`) по-прежнему мгновенно переключает purpose редактора без закрытия. При swap'е чип→post-prompt с **незакоммиченными** правками чипа (`editorText` !== оригинального текста чипа) — показывается `window.confirm` перед сменой purpose. Без этого юзер набирал правки в чипе, тыкал ✎ «дай-ка гляну post-prompt» — правки чипа молча сохранялись как post-prompt, чип терял изменения.
+`▶` — альтернативный вход в ту же сущность, поэтому hover по нему открывает **тот же** editor surface, что body-чип / `+add`, а не отдельный tooltip. Визуально editor намеренно состоит только из `input title` → divider → `textarea body`: без header, footer, Cancel/Save и Escape-текста. Save происходит по blur/outside-click; пустой chrome вокруг двух полей здесь вреден, потому что главный контракт поверхности — быстро поправить label/body и уйти кликом в приложение.
 
-Унифицирующий helper `closeEditor()` сбрасывает все editor-state поля одним вызовом (`setEditorOpen(false)`, `setEditingId(null)`, `setIsPostPromptMode(false)`, `setEditorText('')`) — без него повторный open подхватывал stale `editingId`. Принцип «триггер = toggle» переносимый, см. `methodology/переносимый-дизайн.md::Open-toggle для slideout/popover триггеров`.
+Hover-open не autofocus'ит editor, иначе случайный проход мышью по `▶` ворует focus у терминала. Focus ownership начинается только после явного клика/фокуса внутри title или textarea; пока editor focus-owned, mouse-leave из trigger/editor не закрывает его. Клик по самой карточке/чипу переводит editor в pinned-mode с белой рамкой: hover по `▶` уже не двигает и не закрывает окно. Повторный клик по тому же активному чипу = toggle-close, как outside-click; open-handler обязан подавить same-click reopen, иначе окно исчезает на кадр и тут же появляется снова.
+
+Для unfocused hover-preview закрытие идёт через global `mousemove` geometric hit-test по rect'ам replay button + editor, а не через `onMouseLeave` на lazy-mounted popover — иначе cursor не успевает перейти в только что смонтированный DOM.
+
+Save существующего изменённого чипа даёт один короткий зелёный flash на самой карточке. Новый чип входит зелёной left-to-right wipe-анимацией; явное удаление через Trash-кнопку подсвечивает **всю** карточку красным на hover и задерживает `removePrompt` до right-to-left exit-анимации. Replay-success по `▶` удаляет чип сразу: prompt уже перемещён в input, и анимация удаления не должна задерживать runner-семантику.
+
+Stale-closure gotcha: blur-save и следующий click могут произойти в одном пользовательском жесте до React re-render. Поэтому replay click и open-editor обязаны читать актуальный item через `usePromptQueueStore.getState()` в момент клика, а не использовать `it.text` / `items` из JSX closure. Иначе пользователь меняет body, сразу жмёт `▶` или другой чип — и действие применяет старый payload.
 
 ## Focus terminal перед `clear-input`
 
@@ -336,6 +339,8 @@ Cross-trigger swap (чип A → ✎ post-prompt, или ✎ → `+add`) по-п
 ## Мобильный мирор (Run after с телефона)
 
 Десктопный store — **единственный источник правды**, runner — **единственный движок**. Мобилка читает core через `getPromptQueue`, мутирует через `mutatePromptQueue` (1:1 на store-методы), live-дельты через SSE `queue-update` (пушит `usePromptQueueWebSync`). Owner очереди сейчас может быть Claude PTY или Codex PTY; runner сам выбирает `claude:send-command` / `codex:send-command` по owner-runtime, а mobile mirror только передаёт store-операции. Полная архитектура — `fact-mobile-web.md::Prompt Queue ("Run after") — mobile mirror`. **Любой новый store-метод, меняющий очередь, автоматически доступен с телефона** если добавить его в op-таблицу `mutatePromptQueue` + `QueueOp` (mobile-web/src/api.ts) — реимплементировать логику не нужно.
+
+Для title/body split bridge обязан передавать optional `title` / `titleManual` вместе с core item и update-op. Мобильный список показывает title или fallback, но не запускает AI-title сам и не пересчитывает runner-логику: desktop store остаётся owner'ом правил `titleManual`, AI-generation и remove/replay semantics. Если добавляется новое persistent-поле queue item'а, проверяй сразу три слоя: desktop store, `App.tsx::mutatePromptQueue`, `mobile-web/src/api.ts` + render fallback.
 
 ## Что пробовали и почему отбросили
 

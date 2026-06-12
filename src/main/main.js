@@ -167,19 +167,38 @@ let mainLogPath = null; // absolute path to dev.log/production.log — perf-watc
   const _origLog = console.log;
   const _origError = console.error;
   const _origWarn = console.warn;
+  try {
+    process.stdout.on('error', (err) => {
+      if (err && err.code === 'EIO') return;
+      throw err;
+    });
+    process.stderr.on('error', (err) => {
+      if (err && err.code === 'EIO') return;
+      throw err;
+    });
+  } catch {}
+
+  function safeOriginalConsoleWrite(fn, args) {
+    try {
+      fn.apply(console, args);
+    } catch (err) {
+      if (err && err.code === 'EIO') return;
+      throw err;
+    }
+  }
 
   console.log = function(...args) {
-    _origLog.apply(console, args);
+    safeOriginalConsoleWrite(_origLog, args);
     const msg = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
     if (TAG_RE.test(msg)) writeToLog(msg);
   };
   console.error = function(...args) {
-    _origError.apply(console, args);
+    safeOriginalConsoleWrite(_origError, args);
     const msg = args.map(a => typeof a === 'string' ? a : (a instanceof Error ? a.message : JSON.stringify(a))).join(' ');
     writeToLog('[ERROR] ' + msg);
   };
   console.warn = function(...args) {
-    _origWarn.apply(console, args);
+    safeOriginalConsoleWrite(_origWarn, args);
     const msg = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
     if (TAG_RE.test(msg)) writeToLog(msg);
   };
@@ -10664,19 +10683,6 @@ ipcMain.handle('project:getById', (event, projectId) => {
   return result;
 });
 
-// Create new project instance (allows multiple projects with same path)
-ipcMain.handle('project:create-instance', (event, { path: projectPath, name }) => {
-  console.log('[Main] project:create-instance called with:', { projectPath, name });
-  try {
-    const result = projectManager.db.createProjectInstance(projectPath, name);
-    console.log('[Main] project:create-instance result:', result);
-    return result;
-  } catch (err) {
-    console.error('[Main] project:create-instance error:', err);
-    throw err;
-  }
-});
-
 // Create new empty project (path can be set later)
 ipcMain.handle('project:create-empty', (event, { name }) => {
   console.log('[Main] project:create-empty called with:', { name });
@@ -11044,37 +11050,156 @@ ipcMain.handle('project:select-directory', async () => {
   return projectManager.getProject(selectedPath);
 });
 
-// ========== BOOKMARKS IPC ==========
+// ========== SYSTEM: ELECTRON DEV APP PROCESSES ==========
+function parseLongPsLine(line) {
+  const match = String(line || '').trim().match(/^(\d+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+(\w+\s+\w+\s+\d+\s+(\d+:\d+:\d+)\s+\d+)\s+(.+)$/);
+  if (!match) return null;
+  return {
+    pid: Number(match[1]),
+    ppid: Number(match[2]),
+    cpu: match[3],
+    mem: match[4],
+    startTime: match[6].substring(0, 5),
+    command: match[7].trim(),
+  };
+}
 
-ipcMain.handle('bookmark:list', () => {
-  return projectManager.db.getAllBookmarks();
-});
+function isElectronDevAppCommand(command) {
+  const cmd = String(command || '');
+  if (!cmd.includes('/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron')) return false;
+  if (cmd.includes(' --type=')) return false;
+  if (cmd.includes('/mcp/') || cmd.includes('mcp-server') || cmd.includes('terminal-server.mjs')) return false;
+  return true;
+}
 
-ipcMain.handle('bookmark:create', (event, { path: dirPath, name, description }) => {
-  return projectManager.db.createBookmark(dirPath, name, description || '');
-});
+function isElectronLauncherCommand(command) {
+  const cmd = String(command || '');
+  return /(^|\s)node\s+.*\/node_modules\/\.bin\/electron(\s|$)/.test(cmd);
+}
 
-ipcMain.handle('bookmark:update', (event, { id, updates }) => {
-  return projectManager.db.updateBookmark(id, updates);
-});
+async function getPidCwd(pid) {
+  try {
+    const out = await execAsync('lsof -a -p ' + Number(pid) + ' -d cwd -Fn', 1500);
+    const line = (out || '').split('\n').find(l => l.startsWith('n'));
+    return line ? line.slice(1) : '';
+  } catch {
+    return '';
+  }
+}
 
-ipcMain.handle('bookmark:delete', (event, id) => {
-  projectManager.db.deleteBookmark(id);
-  return { success: true };
-});
+function getProjectNameFromCwd(cwd) {
+  if (!cwd) return '';
+  try {
+    const pkgPath = path.join(cwd, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      if (pkg && typeof pkg.name === 'string' && pkg.name.trim()) return pkg.name.trim();
+    }
+  } catch {}
+  return path.basename(cwd);
+}
 
-ipcMain.handle('bookmark:select-directory', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
-    properties: ['openDirectory']
-  });
+async function listElectronDevProcesses() {
+  const psOutput = await execAsync('ps -axo pid=,ppid=,pcpu=,pmem=,lstart=,command=', 3000);
+  const rows = (psOutput || '')
+    .split('\n')
+    .map(parseLongPsLine)
+    .filter(Boolean);
+  const byPid = new Map(rows.map(row => [row.pid, row]));
+  const processes = [];
 
-  if (result.canceled || result.filePaths.length === 0) {
-    return null;
+  for (const row of rows) {
+    if (!isElectronDevAppCommand(row.command)) continue;
+    if (row.pid === process.pid) continue;
+
+    const cwd = await getPidCwd(row.pid);
+    const projectName = getProjectNameFromCwd(cwd);
+    const parent = byPid.get(row.ppid);
+    const launcherPid = parent && isElectronLauncherCommand(parent.command) ? parent.pid : null;
+
+    processes.push({
+      pid: row.pid,
+      ppid: row.ppid,
+      launcherPid,
+      cwd,
+      name: projectName || 'Electron app',
+      startTime: row.startTime,
+      command: row.command,
+      cpu: row.cpu,
+      mem: row.mem,
+      isOrphan: row.ppid === 1,
+    });
   }
 
-  const selectedPath = result.filePaths[0];
-  const name = require('path').basename(selectedPath);
-  return projectManager.db.createBookmark(selectedPath, name, '');
+  return processes.sort((a, b) => {
+    if (a.isOrphan !== b.isOrphan) return a.isOrphan ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+function alivePid(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForPidsToExit(pids, deadlineMs) {
+  const start = Date.now();
+  while (Date.now() - start < deadlineMs) {
+    const alive = pids.filter(alivePid);
+    if (alive.length === 0) return [];
+    await new Promise(resolve => setTimeout(resolve, 60));
+  }
+  return pids.filter(alivePid);
+}
+
+ipcMain.handle('system:get-electron-dev-processes', async () => {
+  try {
+    return await listElectronDevProcesses();
+  } catch (err) {
+    console.log('[ElectronDev] list failed: ' + (err?.message || String(err)));
+    return [];
+  }
+});
+
+ipcMain.handle('system:kill-electron-dev-process', async (_event, pid) => {
+  const targetPid = Number(pid);
+  if (!Number.isInteger(targetPid) || targetPid <= 1) {
+    return { success: false, error: 'invalid pid' };
+  }
+
+  const processes = await listElectronDevProcesses();
+  const target = processes.find(proc => proc.pid === targetPid);
+  if (!target) {
+    return { success: false, error: 'not an Electron dev app process' };
+  }
+
+  const descendants = await findDescendantPids(targetPid);
+  const pids = Array.from(new Set([targetPid, ...descendants, target.launcherPid].filter(Boolean)));
+  const safePids = pids.filter(p => p !== process.pid && p !== process.ppid);
+  console.log('[ElectronDev] stop pid=' + targetPid + ' name=' + target.name + ' pids=[' + safePids.join(',') + ']');
+
+  for (const p of safePids) {
+    try { process.kill(p, 'SIGTERM'); } catch {}
+  }
+
+  let alive = await waitForPidsToExit(safePids, 1500);
+  let escalated = false;
+  if (alive.length > 0) {
+    escalated = true;
+    console.log('[ElectronDev] SIGTERM timeout pid=' + targetPid + ' alive=[' + alive.join(',') + '] → SIGKILL');
+    for (const p of alive) {
+      try { process.kill(p, 'SIGKILL'); } catch {}
+    }
+    alive = await waitForPidsToExit(alive, 500);
+  }
+
+  const success = alive.length === 0;
+  console.log('[ElectronDev] stop done pid=' + targetPid + ' success=' + success + ' escalated=' + escalated + ' residual=[' + alive.join(',') + ']');
+  return { success, killed: safePids, escalated, residual: alive };
 });
 
 // ========== SYSTEM: CLAUDE PROCESSES ==========
@@ -12377,6 +12502,9 @@ const CODEX_WATCHER_TTL_MS = 10 * 60 * 1000;
 const CODEX_WATCHER_SCAN_MS = 1000;
 const CODEX_TURN_CATCHUP_BYTES = 8 * 1024 * 1024;
 const CODEX_SYNC_MARKER = '\x1b[?2026l';
+// Parser order matters: `xhigh` renders as "Extra high", so it must be matched
+// before plain `high` or the effort picker selects the wrong row.
+const CODEX_PICKER_EFFORT_CANDIDATES = ['minimal', 'low', 'medium', 'xhigh', 'high'];
 
 function closeCodexWatcher(tabId, reason = 'close') {
   const state = codexWatchers.get(tabId);
@@ -12406,6 +12534,22 @@ function closeCodexTurnWatcher(tabId, reason = 'close') {
   if (state.busy) emitCodexBusy(tabId, false, reason);
   console.log('[CodexTurn] watcher closed tab=' + String(tabId).slice(-12) + ' session=' + (state.sessionId || 'unknown') + ' reason=' + reason);
 }
+
+ipcMain.handle('codex:get-turn-state', async (_event, tabId) => {
+  const state = codexTurnWatchers.get(tabId);
+  if (!state) {
+    return { success: true, hasWatcher: false, busy: false };
+  }
+  return {
+    success: true,
+    hasWatcher: true,
+    busy: state.busy === true,
+    sessionId: state.sessionId || null,
+    lastEventType: state.lastEventType || null,
+    lastEventTs: state.lastEventTs || null,
+    liveTurnEvents: state.liveTurnEvents || 0,
+  };
+});
 
 function codexEventType(record) {
   if (!record || record.type !== 'event_msg') return null;
@@ -12684,6 +12828,18 @@ function startCodexSessionWatcher(sender, { tabId, cwd, startedAt, sourceSession
 
 function shellQuote(value) {
   return "'" + String(value).replace(/'/g, "'\\''") + "'";
+}
+
+function readDefaultCodexSetting(key) {
+  try {
+    const value = projectManager?.db?.getAppState?.(key);
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === 'none') return null;
+    return trimmed;
+  } catch {
+    return null;
+  }
 }
 
 function buildCodexCommand({ command, sessionId, model, effort }) {
@@ -13026,7 +13182,7 @@ async function selectCodexModelEffort(term, {
     }
 
     // xhigh must be checked before high: Codex renders it as "Extra high".
-    const effortCandidates = ['minimal', 'low', 'medium', 'xhigh', 'high'];
+    const effortCandidates = CODEX_PICKER_EFFORT_CANDIDATES;
     const effortPredicate = effort
       ? (clean) => parseCodexNumberedPicker(clean, effortCandidates).items.length > 0
       : null;
@@ -13500,7 +13656,9 @@ ipcMain.on('codex:run-command', (event, { tabId, command, sessionId, cwd, model,
 
   const termCwd = cwd || terminalProjects.get(tabId);
   const startedAt = Date.now();
-  console.log('[Codex Runner] Command:', command, 'tab:', tabId, 'session:', sessionId || 'new', 'cwd:', termCwd);
+  const effectiveModel = model || readDefaultCodexSetting('defaultCodexModel');
+  const effectiveEffort = effort || readDefaultCodexSetting('defaultCodexEffort');
+  console.log('[Codex Runner] Command:', command, 'tab:', tabId, 'session:', sessionId || 'new', 'cwd:', termCwd, 'model:', effectiveModel || 'default', 'effort:', effectiveEffort || 'default');
 
   if (command === 'codex-c' && sessionId) {
     closeCodexWatcher(tabId, 'resume-known-session');
@@ -13517,8 +13675,8 @@ ipcMain.on('codex:run-command', (event, { tabId, command, sessionId, cwd, model,
   const cmdLine = buildCodexCommand({
     command: command || 'codex',
     sessionId,
-    model,
-    effort,
+    model: effectiveModel,
+    effort: effectiveEffort,
   });
   term.write(cmdLine + '\r');
 });
@@ -13533,7 +13691,6 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command) => {
     return { success: false, error: 'no_codex_session' };
   }
   const hasTurnWatcher = await ensureCodexTurnWatcher(tabId, null, terminalProjects.get(tabId));
-  if (hasTurnWatcher) emitCodexBusy(tabId, true, 'send-command');
   try {
     const result = await safePasteAndSubmit(term, command, {
       submit: true,

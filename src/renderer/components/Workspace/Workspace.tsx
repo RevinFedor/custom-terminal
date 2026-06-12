@@ -673,7 +673,7 @@ export default function Workspace() {
                 notesPanelWidth={notesPanelWidth}
                 isOpen={isHistoryOpen}
                 toolType={timelineToolType}
-                enableClaudePtyControls={timelineToolType === 'claude' && effectiveTabType !== 'claude-sdk'}
+                enableClaudePtyControls={(timelineToolType === 'claude' || timelineToolType === 'codex') && effectiveTabType !== 'claude-sdk'}
               />
             )}
           </div>

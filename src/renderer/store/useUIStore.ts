@@ -1,4 +1,6 @@
 import { create } from 'zustand';
+import type { GeminiModelId } from '../constants/geminiModels';
+import { isGeminiModelId } from '../constants/geminiModels';
 
 interface Toast {
   id: string;
@@ -19,11 +21,10 @@ interface FilePreview {
   language: string | null;
 }
 
-export type AIModel = 'gemini-3-flash-preview' | 'gemini-3-pro-preview';
-
 export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
 
-export type ApiGeminiModel = 'gemini-3-flash-preview' | 'gemini-3-pro-preview';
+export type ApiGeminiModel = GeminiModelId;
+export type AIModel = GeminiModelId;
 export type ApiClaudeModel = 'claude-opus-4.6' | 'claude-sonnet-4.5';
 
 // Re-export from canonical source. Older code imports DefaultClaudeEffort from useUIStore
@@ -32,6 +33,11 @@ export type ApiClaudeModel = 'claude-opus-4.6' | 'claude-sonnet-4.5';
 export type { ClaudeCodeModelOption, ClaudeCodeSettings, DefaultClaudeEffort, DefaultClaudeModel } from '../constants/claudeLevels';
 import type { ClaudeCodeSettings, DefaultClaudeEffort, DefaultClaudeModel } from '../constants/claudeLevels';
 import { DEFAULT_CLAUDE_CODE_SETTINGS } from '../constants/claudeLevels';
+export type { DefaultCodexEffort, DefaultCodexModel } from '../constants/codexSettings';
+import type { DefaultCodexEffort, DefaultCodexModel } from '../constants/codexSettings';
+
+export const HISTORY_PANEL_DEFAULT_WIDTH = 580;
+export const HISTORY_PANEL_MIN_WIDTH = 280;
 
 export interface ApiSettings {
   claudeModel: ApiClaudeModel;
@@ -546,6 +552,12 @@ interface UIStore {
   setDefaultClaudeModel: (v: DefaultClaudeModel) => void;
   claudeCodeSettings: ClaudeCodeSettings;
   setClaudeCodeSettings: (settings: ClaudeCodeSettings) => void;
+  // Default Codex launch overrides. 'none' means "let Codex read ~/.codex/config.toml".
+  // Per-tab Codex model/effort still wins over these defaults.
+  defaultCodexModel: DefaultCodexModel;
+  setDefaultCodexModel: (v: DefaultCodexModel) => void;
+  defaultCodexEffort: DefaultCodexEffort;
+  setDefaultCodexEffort: (v: DefaultCodexEffort) => void;
 
   // Notes Panel — per-tab slide-in. `notesPanelOpenTabs` holds tab IDs for
   // which the panel is currently expanded. Size is shared across tabs and
@@ -743,7 +755,7 @@ const loadSelectedModel = (): AIModel => {
 
     const saved = localStorage.getItem('noted-terminal-ai-model');
 
-    if (saved && ['gemini-3-flash-preview', 'gemini-3-pro-preview'].includes(saved)) {
+    if (isGeminiModelId(saved)) {
 
       return saved as AIModel;
 
@@ -1245,6 +1257,66 @@ const initialDefaultClaudeModel = loadDefaultClaudeModel();
   } catch {}
 })();
 
+const APP_STATE_KEY_CODEX_MODEL = 'defaultCodexModel';
+const loadDefaultCodexModel = (): DefaultCodexModel => {
+  try {
+    const saved = localStorage.getItem('noted-terminal-default-codex-model');
+    if (saved && saved.trim()) return saved.trim();
+  } catch {}
+  return 'none';
+};
+const saveDefaultCodexModel = (v: DefaultCodexModel) => {
+  try { localStorage.setItem('noted-terminal-default-codex-model', v); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_CODEX_MODEL, value: v }).catch(() => {});
+  } catch {}
+};
+const initialDefaultCodexModel = loadDefaultCodexModel();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_CODEX_MODEL);
+    if (typeof v === 'string' && v.trim()) {
+      const s = useUIStore.getState();
+      if (s.defaultCodexModel !== v) {
+        useUIStore.setState({ defaultCodexModel: v.trim() });
+        try { localStorage.setItem('noted-terminal-default-codex-model', v); } catch {}
+      }
+    }
+  } catch {}
+})();
+
+const APP_STATE_KEY_CODEX_EFFORT = 'defaultCodexEffort';
+const loadDefaultCodexEffort = (): DefaultCodexEffort => {
+  try {
+    const saved = localStorage.getItem('noted-terminal-default-codex-effort');
+    if (saved && saved.trim()) return saved.trim();
+  } catch {}
+  return 'none';
+};
+const saveDefaultCodexEffort = (v: DefaultCodexEffort) => {
+  try { localStorage.setItem('noted-terminal-default-codex-effort', v); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_CODEX_EFFORT, value: v }).catch(() => {});
+  } catch {}
+};
+const initialDefaultCodexEffort = loadDefaultCodexEffort();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_CODEX_EFFORT);
+    if (typeof v === 'string' && v.trim()) {
+      const s = useUIStore.getState();
+      if (s.defaultCodexEffort !== v) {
+        useUIStore.setState({ defaultCodexEffort: v.trim() });
+        try { localStorage.setItem('noted-terminal-default-codex-effort', v); } catch {}
+      }
+    }
+  } catch {}
+})();
+
 const APP_STATE_KEY_CLAUDE_CODE_SETTINGS = 'claudeCodeSettings';
 const LOCAL_KEY_CLAUDE_CODE_SETTINGS = 'noted-terminal-claude-code-settings';
 
@@ -1424,7 +1496,7 @@ const loadApiSettings = (): ApiSettings => {
       return {
         claudeModel: parsed.claudeModel || 'claude-sonnet-4.5',
         claudeThinking: parsed.claudeThinking || 'HIGH',
-        geminiModel: parsed.geminiModel || 'gemini-3-flash-preview',
+        geminiModel: isGeminiModelId(parsed.geminiModel) ? parsed.geminiModel : 'gemini-3-flash-preview',
         geminiThinking: parsed.geminiThinking || 'HIGH',
       };
     }
@@ -1814,13 +1886,13 @@ export const useUIStore = create<UIStore>((set, get) => ({
   },
 
   // History Panel (per-tab state)
-  historyPanelOpenTabs: {},
-  historyPanelWidth: (() => {
-    try {
-      const saved = localStorage.getItem('noted-terminal-history-panel-width');
-      return saved ? Math.max(280, parseInt(saved, 10)) : 580;
-    } catch { return 580; }
-  })(),
+	  historyPanelOpenTabs: {},
+	  historyPanelWidth: (() => {
+	    try {
+	      const saved = localStorage.getItem('noted-terminal-history-panel-width');
+	      return saved ? Math.max(HISTORY_PANEL_MIN_WIDTH, parseInt(saved, 10)) : HISTORY_PANEL_DEFAULT_WIDTH;
+	    } catch { return HISTORY_PANEL_DEFAULT_WIDTH; }
+	  })(),
   historyScrollToUuid: null,
   historyVisibleUuids: {},
   historyScrollPositions: {},
@@ -1844,11 +1916,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setTimelineTreeMode: (tabId, open) => set(state => ({
     timelineTreeModeTabs: { ...state.timelineTreeModeTabs, [tabId]: open }
   })),
-  setHistoryPanelWidth: (width) => {
-    const clamped = Math.max(280, width);
-    set({ historyPanelWidth: clamped });
-    localStorage.setItem('noted-terminal-history-panel-width', String(clamped));
-  },
+	  setHistoryPanelWidth: (width) => {
+	    const clamped = Math.max(HISTORY_PANEL_MIN_WIDTH, width);
+	    set({ historyPanelWidth: clamped });
+	    localStorage.setItem('noted-terminal-history-panel-width', String(clamped));
+	  },
 
   // Notes Panel Width
   notesPanelWidth: 300,
@@ -2090,6 +2162,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setDefaultClaudeEffort: (v) => { set({ defaultClaudeEffort: v }); saveDefaultClaudeEffort(v); },
   defaultClaudeModel: initialDefaultClaudeModel,
   setDefaultClaudeModel: (v) => { set({ defaultClaudeModel: v }); saveDefaultClaudeModel(v); },
+  defaultCodexModel: initialDefaultCodexModel,
+  setDefaultCodexModel: (v) => { set({ defaultCodexModel: v }); saveDefaultCodexModel(v); },
+  defaultCodexEffort: initialDefaultCodexEffort,
+  setDefaultCodexEffort: (v) => { set({ defaultCodexEffort: v }); saveDefaultCodexEffort(v); },
   claudeCodeSettings: initialClaudeCodeSettings,
   setClaudeCodeSettings: (settings) => {
     const normalized = normalizeClaudeCodeSettings(settings);

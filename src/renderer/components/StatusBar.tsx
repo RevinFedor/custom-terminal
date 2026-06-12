@@ -2,7 +2,14 @@ import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { Settings } from 'lucide-react';
 import { useUIStore } from '../store/useUIStore';
-import type { DefaultClaudeEffort, DefaultClaudeModel, ClaudeCodeModelOption } from '../store/useUIStore';
+import type { ClaudeCodeModelOption } from '../store/useUIStore';
+import type { CodexModelOption } from '../constants/codexSettings';
+import {
+  CODEX_EFFORT_LEVELS,
+  DEFAULT_CODEX_EFFORT,
+  DEFAULT_CODEX_MODEL_OPTIONS,
+  normalizeCodexModelOptions,
+} from '../constants/codexSettings';
 import { usePromptsStore } from '../store/usePromptsStore';
 import { useCmdKey } from '../hooks/useCmdHoverPopover';
 
@@ -29,6 +36,36 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
   const defaultClaudeModel = useUIStore((s) => s.defaultClaudeModel);
   const setDefaultClaudeModel = useUIStore((s) => s.setDefaultClaudeModel);
   const claudeCodeSettings = useUIStore((s) => s.claudeCodeSettings);
+  const defaultCodexModel = useUIStore((s) => s.defaultCodexModel);
+  const setDefaultCodexModel = useUIStore((s) => s.setDefaultCodexModel);
+  const defaultCodexEffort = useUIStore((s) => s.defaultCodexEffort);
+  const setDefaultCodexEffort = useUIStore((s) => s.setDefaultCodexEffort);
+  const [codexModels, setCodexModels] = useState<CodexModelOption[]>(DEFAULT_CODEX_MODEL_OPTIONS);
+
+  useEffect(() => {
+    let cancelled = false;
+    ipcRenderer.invoke('codex:list-models').then((res: any) => {
+      if (cancelled) return;
+      setCodexModels(normalizeCodexModelOptions(res?.models));
+    }).catch(() => {
+      if (!cancelled) setCodexModels(DEFAULT_CODEX_MODEL_OPTIONS);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  const activeCodexModel = codexModels.find((m) => m.id === defaultCodexModel) || codexModels[0];
+  const codexEfforts = activeCodexModel?.efforts?.length ? activeCodexModel.efforts : [...CODEX_EFFORT_LEVELS];
+  const setDefaultCodexModelWithEffort = (model: string) => {
+    setDefaultCodexModel(model);
+    if (model === 'none' || defaultCodexEffort === 'none') return;
+    const nextModel = codexModels.find((m) => m.id === model);
+    const efforts = nextModel?.efforts?.length ? nextModel.efforts : [...CODEX_EFFORT_LEVELS];
+    if (efforts.includes(defaultCodexEffort)) return;
+    const fallback = (nextModel?.defaultEffort && efforts.includes(nextModel.defaultEffort))
+      ? nextModel.defaultEffort
+      : (efforts.includes(DEFAULT_CODEX_EFFORT) ? DEFAULT_CODEX_EFFORT : efforts[0]);
+    if (fallback) setDefaultCodexEffort(fallback);
+  };
 
   return (
     <div
@@ -46,8 +83,10 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
         <WebServerChip />
       </div>
       <div className="flex items-center gap-2">
-        <ModelSelector value={defaultClaudeModel} options={claudeCodeSettings.models} onChange={setDefaultClaudeModel} />
-        <EffortSelector value={defaultClaudeEffort} options={claudeCodeSettings.efforts} onChange={setDefaultClaudeEffort} />
+        <ModelSelector label="Claude" value={defaultClaudeModel} options={claudeCodeSettings.models} onChange={setDefaultClaudeModel} />
+        <EffortSelector label="Effort" value={defaultClaudeEffort} options={claudeCodeSettings.efforts} onChange={setDefaultClaudeEffort} />
+        <ModelSelector label="Codex" value={defaultCodexModel} options={codexModels} onChange={setDefaultCodexModelWithEffort} />
+        <EffortSelector label="Effort" value={defaultCodexEffort} options={codexEfforts} onChange={setDefaultCodexEffort} />
         <StatusToggle
           label="kill dev-ports"
           title="Если ВКЛ — перед каждым запуском npm-скрипта / restart / stop сначала убиваются занятые порты проекта (vite/backend), считанные из vite.config / .env / NestJS main.ts. Защита от 'address in use' после крашей."
@@ -167,22 +206,24 @@ function SettingsButton({ onClick }: { onClick?: () => void }) {
 }
 
 const effortLabel = (level: string): string => {
+  if (level === 'minimal') return 'min';
   if (level === 'medium') return 'med';
   if (level === 'xhigh') return 'xhi';
   if (level === 'ultracode') return 'ultra';
   return level;
 };
 
-const modelLabel = (model: string, options: ClaudeCodeModelOption[]): string => {
+const modelLabel = (model: string, options: Array<{ id: string; label?: string }>): string => {
   if (model === 'none') return 'none';
   const found = options.find((m) => m.id === model);
   return found?.label || model;
 };
 
-function ModelSelector({ value, options, onChange }: {
-  value: DefaultClaudeModel;
-  options: ClaudeCodeModelOption[];
-  onChange: (v: DefaultClaudeModel) => void;
+function ModelSelector({ label = 'Model', value, options, onChange }: {
+  label?: string;
+  value: string;
+  options: Array<{ id: string; label?: string }>;
+  onChange: (v: string) => void;
 }) {
   const [clicked, setClicked] = useState(false);
   const [chipHover, setChipHover] = useState(false);
@@ -234,7 +275,7 @@ function ModelSelector({ value, options, onChange }: {
         className="inline-flex items-center gap-1 cursor-pointer hover:bg-white/5 rounded"
         style={{ padding: '1px 6px', height: 18 }}
       >
-        <span style={{ color: '#666' }}>Model:</span>
+        <span style={{ color: '#666' }}>{label}:</span>
         <span style={{ color: value === 'none' ? '#666' : '#DA7756', fontWeight: 500 }}>
           {modelLabel(value, options)}
         </span>
@@ -258,9 +299,9 @@ function ModelSelector({ value, options, onChange }: {
 function ModelPopup({ chipRect, popupRef, value, options, onSelect, onPopupEnter, onPopupLeave }: {
   chipRect: DOMRect;
   popupRef: React.RefObject<HTMLDivElement | null>;
-  value: DefaultClaudeModel;
-  options: ClaudeCodeModelOption[];
-  onSelect: (v: DefaultClaudeModel) => void;
+  value: string;
+  options: Array<{ id: string; label?: string; cmd?: boolean }>;
+  onSelect: (v: string) => void;
   onPopupEnter?: () => void;
   onPopupLeave?: () => void;
 }) {
@@ -312,10 +353,11 @@ function ModelPopup({ chipRect, popupRef, value, options, onSelect, onPopupEnter
 // Same visual language as InfoPanel Effort buttons: small pills, accent for active.
 // Status-bar version is a single chip showing the current effort, click → popup with all
 // six levels appearing ABOVE (status bar is at the bottom). One click selects + persists.
-function EffortSelector({ value, options, onChange }: {
-  value: DefaultClaudeEffort;
+function EffortSelector({ label = 'Effort', value, options, onChange }: {
+  label?: string;
+  value: string;
   options: string[];
-  onChange: (v: DefaultClaudeEffort) => void;
+  onChange: (v: string) => void;
 }) {
   const [clicked, setClicked] = useState(false);     // pinned via click
   const [chipHover, setChipHover] = useState(false); // mouse over chip
@@ -380,7 +422,7 @@ function EffortSelector({ value, options, onChange }: {
         className="inline-flex items-center gap-1 cursor-pointer hover:bg-white/5 rounded"
         style={{ padding: '1px 6px', height: 18 }}
       >
-        <span style={{ color: '#666' }}>Effort:</span>
+        <span style={{ color: '#666' }}>{label}:</span>
         <span style={{ color: value === 'none' ? '#666' : '#DA7756', fontWeight: 500 }}>
           {effortLabel(value)}
         </span>
@@ -404,9 +446,9 @@ function EffortSelector({ value, options, onChange }: {
 function EffortPopup({ chipRect, popupRef, value, options, onSelect, onPopupEnter, onPopupLeave }: {
   chipRect: DOMRect;
   popupRef: React.RefObject<HTMLDivElement | null>;
-  value: DefaultClaudeEffort;
+  value: string;
   options: string[];
-  onSelect: (v: DefaultClaudeEffort) => void;
+  onSelect: (v: string) => void;
   onPopupEnter?: () => void;
   onPopupLeave?: () => void;
 }) {

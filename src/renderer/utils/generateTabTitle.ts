@@ -1,5 +1,4 @@
-import type { AIPrompt } from '../store/usePromptsStore';
-import { DEFAULT_TAB_TITLE_PROMPT, TAB_TITLE_PROMPT_ID, usePromptsStore } from '../store/usePromptsStore';
+import { DEFAULT_TAB_TITLE_PROMPT, TAB_TITLE_PROMPT_ID, usePromptsStore, type AIPrompt } from '../store/usePromptsStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 
 const { ipcRenderer } = window.require('electron');
@@ -63,8 +62,8 @@ function sanitizeGeneratedTabTitle(raw: string): string {
   return clean;
 }
 
-async function buildSystemPrompt(promptConfig?: AIPrompt): Promise<string> {
-  const base = (promptConfig?.content || DEFAULT_TAB_TITLE_PROMPT).trim();
+async function buildSystemPrompt(promptConfig: AIPrompt | undefined, fallbackPrompt: string, logPrefix: string): Promise<string> {
+  const base = (promptConfig?.content || fallbackPrompt).trim();
   const filePaths = promptConfig?.filePaths || [];
   if (filePaths.length === 0) return base;
 
@@ -77,25 +76,29 @@ async function buildSystemPrompt(promptConfig?: AIPrompt): Promise<string> {
       .join('\n\n');
     return `${base}\n\n${fileBlock}`;
   } catch (err: any) {
-    console.warn('[TabTitle] failed to read prompt attachments:', err?.message || err);
+    console.warn('[' + logPrefix + '] failed to read prompt attachments:', err?.message || err);
     return base;
   }
 }
 
-export async function generateTabTitleFromPrompt(userPrompt: string, promptConfig?: AIPrompt): Promise<string | null> {
+export async function generateTitleFromPromptWithConfig(
+  userPrompt: string,
+  promptConfig: AIPrompt | undefined,
+  options: { fallbackPrompt: string; sourceLabel: string; logPrefix: string }
+): Promise<string | null> {
   const apiKey = (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY) || '';
   if (!apiKey) {
-    console.warn('[TabTitle] GEMINI_API_KEY missing');
+    console.warn('[' + options.logPrefix + '] GEMINI_API_KEY missing');
     return null;
   }
 
   const model = promptConfig?.model || 'gemini-3-flash-preview';
   const thinkingLevel = promptConfig?.thinkingLevel || 'NONE';
-  const systemPrompt = await buildSystemPrompt(promptConfig);
+  const systemPrompt = await buildSystemPrompt(promptConfig, options.fallbackPrompt, options.logPrefix);
   const requestBody: any = {
     contents: [{
       role: 'user',
-      parts: [{ text: `Первое пользовательское сообщение:\n\n${userPrompt}` }],
+      parts: [{ text: `${options.sourceLabel}:\n\n${userPrompt}` }],
     }],
     systemInstruction: { parts: [{ text: systemPrompt }] },
   };
@@ -117,7 +120,7 @@ export async function generateTabTitleFromPrompt(userPrompt: string, promptConfi
     );
     const data = await response.json();
     if (data?.error) {
-      console.warn('[TabTitle] Gemini error:', data.error.message || data.error.status || response.status);
+      console.warn('[' + options.logPrefix + '] Gemini error:', data.error.message || data.error.status || response.status);
       return null;
     }
     const parts = data?.candidates?.[0]?.content?.parts || [];
@@ -128,9 +131,17 @@ export async function generateTabTitleFromPrompt(userPrompt: string, promptConfi
     const title = sanitizeGeneratedTabTitle(raw);
     return title || null;
   } catch (err: any) {
-    console.warn('[TabTitle] request failed:', err?.message || err);
+    console.warn('[' + options.logPrefix + '] request failed:', err?.message || err);
     return null;
   }
+}
+
+export async function generateTabTitleFromPrompt(userPrompt: string, promptConfig?: AIPrompt): Promise<string | null> {
+  return generateTitleFromPromptWithConfig(userPrompt, promptConfig, {
+    fallbackPrompt: DEFAULT_TAB_TITLE_PROMPT,
+    sourceLabel: 'Первое пользовательское сообщение',
+    logPrefix: 'TabTitle',
+  });
 }
 
 export async function refreshGeneratedTabTitle(

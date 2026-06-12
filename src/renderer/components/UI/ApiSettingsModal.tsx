@@ -1,15 +1,14 @@
 import React from 'react';
 import { useUIStore, ApiClaudeModel, ApiGeminiModel, ThinkingLevel } from '../../store/useUIStore';
+import { GEMINI_MODEL_OPTIONS } from '../../constants/geminiModels';
 
 const CLAUDE_MODELS: { id: ApiClaudeModel; label: string }[] = [
   { id: 'claude-sonnet-4.5', label: 'Sonnet 4.5' },
   { id: 'claude-opus-4.6', label: 'Opus 4.6' },
 ];
 
-const GEMINI_MODELS: { id: ApiGeminiModel; label: string }[] = [
-  { id: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
-  { id: 'gemini-3-pro-preview', label: 'Gemini 3 Pro' },
-];
+const GEMINI_MODELS: { id: ApiGeminiModel; label: string }[] =
+  GEMINI_MODEL_OPTIONS.map((m) => ({ id: m.value, label: m.label }));
 
 const THINKING_LEVELS: { id: ThinkingLevel; label: string }[] = [
   { id: 'NONE', label: 'Off' },

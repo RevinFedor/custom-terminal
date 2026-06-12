@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useUIStore } from '../../store/useUIStore';
 import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel } from '../../store/usePromptsStore';
+import { GEMINI_MODEL_OPTIONS } from '../../constants/geminiModels';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useMirrorStatusStore } from '../../store/useMirrorStatusStore';
 import Tooltip from './Tooltip';
@@ -2390,10 +2391,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                 <span style={{ fontSize: 10.5, color: VR_DIM, flexShrink: 0 }}>Модель:</span>
-                {([
-                  { value: 'gemini-3-flash-preview' as AIModel, label: 'Gemini 3 Flash' },
-                  { value: 'gemini-3-pro-preview' as AIModel, label: 'Gemini 3 Pro' }
-                ]).map((model) => (
+                {GEMINI_MODEL_OPTIONS.map((model) => (
                   <button
                     key={model.value}
                     onClick={(e) => { e.stopPropagation(); setLocalPromptModel(model.value); saveField({ model: model.value }); }}

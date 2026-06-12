@@ -27,13 +27,9 @@ function tabExists(tabId: string): boolean {
   return false;
 }
 
-function tabInSameWorkspace(ownerTabId: string, targetTabId: string): boolean {
-  const state = useWorkspaceStore.getState();
-  for (const ws of state.openProjects.values()) {
-    if (!ws.tabs.has(ownerTabId)) continue;
-    return ws.tabs.has(targetTabId);
-  }
-  return false;
+function tabCanTriggerQueue(ownerTabId: string, targetTabId: string): boolean {
+  if (ownerTabId === targetTabId) return false;
+  return tabExists(targetTabId);
 }
 
 type QueueAgent = 'claude' | 'codex';
@@ -179,8 +175,8 @@ export function usePromptQueueRunner() {
         // Validate stale target before pivoting — if the picked tab was closed,
         // self-clear and fall through to default own-tab behaviour. This is
         // the lazy validation promised in the store schema comment.
-        if (q.runAfterTabId && !tabInSameWorkspace(ownerTabId, q.runAfterTabId)) {
-          console.warn('[PromptQueueRunner] runAfterTabId ' + q.runAfterTabId.slice(-8) + ' no longer belongs to owner workspace, clearing → owner=' + ownerTabId.slice(-8));
+        if (q.runAfterTabId && !tabCanTriggerQueue(ownerTabId, q.runAfterTabId)) {
+          console.warn('[PromptQueueRunner] runAfterTabId ' + q.runAfterTabId.slice(-8) + ' is no longer a valid target, clearing → owner=' + ownerTabId.slice(-8));
           usePromptQueueStore.getState().setRunAfterTab(ownerTabId, null);
           // After clear, q.runAfterTabId is stale in our snapshot; treat as null.
           if (ownerTabId === triggerTabId) owners.push(ownerTabId);
@@ -289,7 +285,7 @@ export function usePromptQueueRunner() {
             }
             if (!q.autoRun && !q.stopAfter && q.firstDelayCountdownAt === null) continue;
             let effectiveTrigger = q.runAfterTabId ?? ownerTabId;
-            if (q.runAfterTabId && !tabInSameWorkspace(ownerTabId, q.runAfterTabId)) {
+            if (q.runAfterTabId && !tabCanTriggerQueue(ownerTabId, q.runAfterTabId)) {
               usePromptQueueStore.getState().setRunAfterTab(ownerTabId, null);
               effectiveTrigger = ownerTabId;
             }
@@ -333,7 +329,7 @@ export function usePromptQueueRunner() {
             return; // wait for THIS prompt's turn before considering stopAfter
           }
 
-          if (!tabInSameWorkspace(tabId, ownQueue.runAfterTabId)) {
+          if (!tabCanTriggerQueue(tabId, ownQueue.runAfterTabId)) {
             usePromptQueueStore.getState().setRunAfterTab(tabId, null);
             fireQueueOwner(tabId, tabId);
             return;
@@ -502,7 +498,7 @@ export function usePromptQueueRunner() {
 
         // Validate the picked target — stale id behaves as null (fall back to
         // own-tab default).
-        let effectiveTrigger = (q.runAfterTabId && tabInSameWorkspace(tabId, q.runAfterTabId))
+        let effectiveTrigger = (q.runAfterTabId && tabCanTriggerQueue(tabId, q.runAfterTabId))
           ? q.runAfterTabId
           : tabId;
         if (q.runAfterTabId && effectiveTrigger === tabId) {

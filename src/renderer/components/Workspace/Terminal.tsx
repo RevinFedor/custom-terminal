@@ -66,6 +66,7 @@ import { PromptQueueOverlay } from './PromptQueueOverlay';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { log } from '../../utils/logger';
 import { markPendingResume, clearPendingResume, isStaleAgainstPending, getPendingResume } from '../../utils/pendingResume';
+import { buildCodexRunPayload } from '../../utils/codexLaunch';
 
 // ============================================================================
 // EffortInject TUI-readiness diagnostic instrumentation (temporary, May 2026)
@@ -347,12 +348,12 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
         getSetTabCommandType()(tabId, 'codex');
         const cwd = getTabCwd(tabId);
         console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex-f" }');
-        ipcRenderer.send('codex:run-command', {
+        ipcRenderer.send('codex:run-command', buildCodexRunPayload({
           tabId,
           command: 'codex-f',
           sessionId: pendingAction.sessionId,
           cwd
-        });
+        }));
       }
       break;
 
@@ -361,11 +362,11 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
         getSetTabCommandType()(tabId, 'codex');
         getSetCodexSessionId()(tabId, pendingAction.sessionId, 'userIntercept');
         console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex-c" }');
-        ipcRenderer.send('codex:run-command', {
+        ipcRenderer.send('codex:run-command', buildCodexRunPayload({
           tabId,
           command: 'codex-c',
           sessionId: pendingAction.sessionId
-        });
+        }));
       }
       break;
 
@@ -373,7 +374,7 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
       getSetTabCommandType()(tabId, 'codex');
       const codexCwd = getTabCwd(tabId);
       console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex" }');
-      ipcRenderer.send('codex:run-command', { tabId, command: 'codex', cwd: codexCwd });
+      ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex', cwd: codexCwd }));
       break;
     }
 
@@ -593,6 +594,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
   const pendingActionExecuted = useRef(false); // Track if pendingAction was executed
 
   const terminalFontSize = useUIStore((state) => state.terminalFontSize);
+  const historyPanelOpen = useUIStore((state) => state.historyPanelOpenTabs[tabId] ?? false);
   const workspaceView = useWorkspaceStore((state) => state.view);
 
   // Claude Agent status for persistent banner
@@ -1770,7 +1772,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
           useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'codex');
           ipcRenderer.send('terminal:input', tabId, '\x15');
-          ipcRenderer.send('codex:run-command', { tabId, command: 'codex', cwd });
+          ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex', cwd }));
           return false;
         }
 
@@ -1786,7 +1788,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           }
           ipcRenderer.send('terminal:input', tabId, '\x15');
           getSetCodexSessionId()(tabId, resumeId, 'userIntercept');
-          ipcRenderer.send('codex:run-command', { tabId, command: 'codex-c', sessionId: resumeId, cwd });
+          ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: resumeId, cwd }));
           return false;
         }
 
@@ -1796,7 +1798,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           const existingSessionId = getCodexSessionId(tabId);
           if (existingSessionId) {
             ipcRenderer.send('terminal:input', tabId, '\x15');
-            ipcRenderer.send('codex:run-command', { tabId, command: 'codex-c', sessionId: existingSessionId, cwd });
+            ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: existingSessionId, cwd }));
           } else {
             ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ No Codex session saved for this tab"\r');
           }
@@ -1814,7 +1816,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             return false;
           }
           ipcRenderer.send('terminal:input', tabId, '\x15');
-          ipcRenderer.send('codex:run-command', { tabId, command: 'codex-f', sessionId: sourceSessionId, cwd });
+          ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-f', sessionId: sourceSessionId, cwd }));
           return false;
         }
 
@@ -2283,7 +2285,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'codex');
             ipcRenderer.send('terminal:input', tabId, '\x15');
             const cwd2 = getTabCwd(tabId);
-            ipcRenderer.send('codex:run-command', { tabId, command: 'codex', cwd: cwd2 });
+            ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex', cwd: cwd2 }));
             return false;
           }
 
@@ -2300,7 +2302,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             ipcRenderer.send('terminal:input', tabId, '\x15');
             getSetCodexSessionId()(tabId, resumeId, 'userIntercept');
             const cwd2 = getTabCwd(tabId);
-            ipcRenderer.send('codex:run-command', { tabId, command: 'codex-c', sessionId: resumeId, cwd: cwd2 });
+            ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: resumeId, cwd: cwd2 }));
             return false;
           }
 
@@ -2311,7 +2313,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             if (existingSessionId) {
               ipcRenderer.send('terminal:input', tabId, '\x15');
               const cwd2 = getTabCwd(tabId);
-              ipcRenderer.send('codex:run-command', { tabId, command: 'codex-c', sessionId: existingSessionId, cwd: cwd2 });
+              ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: existingSessionId, cwd: cwd2 }));
             } else {
               ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ No Codex session saved for this tab"\r');
             }
@@ -2330,7 +2332,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             }
             ipcRenderer.send('terminal:input', tabId, '\x15');
             const cwd2 = getTabCwd(tabId);
-            ipcRenderer.send('codex:run-command', { tabId, command: 'codex-f', sessionId: sourceSessionId, cwd: cwd2 });
+            ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-f', sessionId: sourceSessionId, cwd: cwd2 }));
             return false;
           }
 
@@ -2680,11 +2682,12 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         <button
           onClick={scrollToBottom}
           className="pointer-events-auto flex items-center justify-center cursor-pointer transition-all duration-200 ease-out hover:scale-105"
-          style={{
-            position: 'absolute',
-            bottom: '16px',
-            right: '16px',
-            width: '36px',
+	          style={{
+	            position: 'absolute',
+	            bottom: '16px',
+	            left: historyPanelOpen ? '16px' : undefined,
+	            right: historyPanelOpen ? undefined : '16px',
+	            width: '36px',
             height: '36px',
             borderRadius: '8px',
             backgroundColor: 'rgba(60, 60, 60, 0.85)',

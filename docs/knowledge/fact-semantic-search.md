@@ -1,7 +1,7 @@
 # Feature: Semantic Search (Session History)
 
 ## Intro
-Поиск по всей истории сессий Claude через embedding-based cosine similarity. Индексирует JSONL-файлы сессий в SQLite, позволяет искать по смыслу ("проблемы с вставкой" → найдёт "TTYHOG limit 1024 bytes"). Интегрирован в ProjectHome как collapsible секция.
+Поиск по истории сессий Claude через embedding-based cosine similarity. Основная подсистема индексирует JSONL-файлы сессий в SQLite и ищет по смыслу внутри Q+A чанков ("проблемы с вставкой" → найдёт "TTYHOG limit 1024 bytes"). Отдельно существует лёгкий title-only поиск для ProjectHome: он индексирует только названия закрытых вкладок и не заменяет transcript search.
 
 ## Архитектура
 
@@ -21,16 +21,24 @@
 - **Большие Claude-сессии (`>5MB`)**: auto-index на close сознательно пропускается (`reason=avoid-close-freeze`). Такие архивы индексируются вручную через кнопку Index в Home.
 - **Ручной**: кнопка Index на ProjectHome с настраиваемым лимитом сессий (от последних)
 
+### Title-only поиск на ProjectHome
+
+Home top-search разделён на два режима: instant local filter по `tab_history.name` и RAG по отдельному индексу `tab_history_title_index`. Этот индекс намеренно хранит только названия вкладок (`history_id`, `project_id`, `name_hash`, `embedding`) и использует ту же embedding-модель (`gemini-embedding-001`, 768 dims), но не читает JSONL transcript'ы и не создаёт `session_chunks`.
+
+Причина разделения — latency и mental model. Пользователь печатает в верхнем поиске Home, чтобы найти вкладку по названию; поэтому обычный ввод должен реагировать мгновенно без Gemini/API. `Cmd+Enter`/кнопка `RAG` — отдельный semantic step поверх уже построенного title index. Если title index пустой, semantic search возвращает пусто без запроса к Gemini; сначала нужно нажать `Index`.
+
+Индексация title-only rows маленькая и показывается прямо в кнопке `Index` (`current/total`). Не добавлять отдельный тяжёлый progress panel в Home: это служебное действие на несколько сотен/тысяч коротких строк, а не full transcript rebuild.
+
 ### Stats path на ProjectHome
 
-ProjectHome монтирует `SemanticSearchSection`, а секция сразу запрашивает `search:stats`, чтобы показать количество чанков/файлов/embeddings. Это latency-sensitive путь: он запускается не при поиске, а при обычном клике Home, поэтому sync SQL здесь ощущается как “Home завис”.
+Исторический шрам: раньше ProjectHome монтировал `SemanticSearchSection`, а секция сразу запрашивала `search:stats`, чтобы показать количество чанков/файлов/embeddings. Это latency-sensitive путь: он запускался не при поиске, а при обычном клике Home, поэтому sync SQL ощущался как “Home завис”.
 
 Инвариант БД: `COUNT WHERE embedding IS NOT NULL` должен идти по partial index `idx_chunks_embedding_present`, а не full-scan `session_chunks`. На реальной базе 2026-06-12 запрос без индекса сканировал ~87K строк и блокировал main process на 4.1s; пользователь видел frozen hover/click сразу после Home. После индекса query plan должен быть:
 ```text
 SCAN session_chunks USING INDEX idx_chunks_embedding_present
 ```
 
-Если `search:stats` снова попадает в `[Perf:IpcSlow]` или `ipcAgg5s=search:stats`, сначала проверять `EXPLAIN QUERY PLAN`, а не React render Home. Детальный шрам — [`fix-performance-lags.md::Freeze при открытии Home`](fix-performance-lags.md).
+Текущий Home не должен монтировать `SemanticSearchSection` вообще; он использует title-only IPC (`tab-title-index:*`, `tab-title-search:semantic`). Если `search:stats` снова попадает в `[Perf:IpcSlow]` или `ipcAgg5s=search:stats` при простом открытии Home, сначала ищи случайно возвращённый old mount. Если `search:stats` нужен на отдельной странице full transcript search — проверяй `EXPLAIN QUERY PLAN`, а не React render Home. Детальный шрам — [`fix-performance-lags.md::Freeze при открытии Home`](fix-performance-lags.md).
 
 ## Embedding: Выбор модели и итерации
 
@@ -60,8 +68,9 @@ Gemini сессии хранятся в другом формате и не ин
 
 ## Симптомы типичных проблем
 - **"Search возвращает 0 результатов"** → чанки без embeddings (проверить `SELECT COUNT(*) FROM session_chunks WHERE embedding IS NOT NULL`). Причина: индексация прошла со сломанной моделью. Решение: нажать Index повторно.
+- **"RAG по Home вкладкам возвращает 0 результатов"** → проверить `tab_history_title_index`, а не `session_chunks`. Title-only поиск не индексирует transcript'ы; для него нужен `tab-title-index:reindex`.
 - **"Одинаковые результаты в выдаче"** → форкнутые сессии. См. "Дубликаты из форкнутых сессий".
 - **"Indexing зависает"** → rate limit Gemini API. Уменьшить лимит сессий в настройках.
 - **"Только что закрытая большая сессия не ищется"** → auto-index на close был пропущен по размеру файла (>5MB). Это ожидаемо; запустить ручной Index.
-- **"Не скроллится страница Home с результатами"** → контейнер ProjectHome требует `h-full` вместо `flex-1` для работы `overflow-y-auto` внутри `absolute inset-0` обёртки.
-- **"После клика Home зависают hover и клики"** → проверить `search:stats` и query plan `idx_chunks_embedding_present`; это отдельный stats-path, не сам search query.
+- **"Не скроллится страница Home с результатами"** → текущий Home должен отдавать scroll виртуализатору внутри `flex-1 min-h-0`; внешний `overflow-y-auto` вокруг всего Home возвращать нельзя.
+- **"После клика Home зависают hover и клики"** → проверить, не вернулся ли `SemanticSearchSection` / `search:stats` mount; в нормальном Home-flow title-only stats не должны сканировать `session_chunks`.

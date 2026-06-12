@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { useUIStore } from '../../store/useUIStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
-import { FolderOpen, Settings } from 'lucide-react';
+import { FolderOpen, Settings, Trash2 } from 'lucide-react';
 import SmartPopover from '../UI/SmartPopover';
 
 const { ipcRenderer } = window.require('electron');
@@ -38,10 +38,9 @@ export default function ProjectCard({
   const [pathHovered, setPathHovered] = useState(false);
   const [isHoveringName, setIsHoveringName] = useState(false);
 
-  const { openEditModal } = useUIStore();
-  const { openProjects } = useWorkspaceStore();
-
-  const hasActiveProcesses = tabsStats.active > 0;
+  const { openEditModal, showToast } = useUIStore();
+  const { openProjects, closeProject } = useWorkspaceStore();
+  const { loadProjects } = useProjectsStore();
 
   const getShortPath = (fullPath: string) => {
     if (!fullPath || fullPath.startsWith('__unset__')) return 'No path';
@@ -55,10 +54,27 @@ export default function ProjectCard({
     openEditModal(project);
   };
 
+  const handleDelete = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!confirm(`Delete project "${project.name}"?`)) return;
+
+    if (openProjects.has(project.id)) {
+      await closeProject(project.id);
+    }
+
+    const result = await ipcRenderer.invoke('project:delete', project.id);
+    if (result?.success) {
+      showToast('Project deleted', 'success');
+      await loadProjects();
+    } else {
+      showToast('Failed to delete project', 'error');
+    }
+  };
+
   return (
     <div
       className={`
-        group relative cursor-pointer rounded-lg transition-all duration-150
+        group relative min-w-0 cursor-pointer rounded-md transition-all duration-150
         ${isOpen
           ? 'bg-purple-500/5 border border-white/5 hover:bg-purple-500/10 hover:border-white/10'
           : 'bg-white/[0.03] border border-transparent hover:bg-white/[0.05] hover:border-[#333]'
@@ -73,31 +89,62 @@ export default function ProjectCard({
       }}
       onMouseLeave={() => setPathHovered(false)}
     >
+      <div className="absolute top-1 right-1 z-20 flex items-center gap-0.5 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity">
+        <button
+          className="p-1 text-[#777] bg-[#141414]/95 hover:text-red-400 hover:bg-red-500/15 rounded transition-colors cursor-pointer"
+          onClick={handleDelete}
+          title="Delete project"
+        >
+          <Trash2 size={12} />
+        </button>
+        <button
+          className="p-1 text-[#777] bg-[#141414]/95 hover:text-white hover:bg-white/10 rounded transition-colors cursor-pointer"
+          onClick={handleEdit}
+          title="Project settings"
+        >
+          <Settings size={12} />
+        </button>
+      </div>
+
       {/* Project Name */}
-      <div className="flex items-center gap-2 px-2.5 pt-2 pb-0">
+      <div
+        className="grid min-w-0 items-center gap-1.5 px-2 pt-1 pb-0"
+        style={{ gridTemplateColumns: 'auto minmax(0, 1fr) auto' }}
+      >
         <FolderOpen
-          size={13}
-          className={`flex-shrink-0 ${hasActiveProcesses ? 'text-green-400' : 'text-[#888]'}`}
+          size={12}
+          className="flex-shrink-0 text-[#888]"
         />
-        <SmartPopover content={project.description || ''} isOpen={isHoveringName}>
-          <span
-            className="text-[13px] text-white font-medium truncate group-hover:text-accent transition-colors cursor-help"
-            onMouseEnter={() => setIsHoveringName(true)}
-            onMouseLeave={() => setIsHoveringName(false)}
-          >
-            {project.name}
+        <div className="min-w-0 overflow-hidden">
+          <SmartPopover content={project.description || ''} isOpen={isHoveringName}>
+            <span
+              className="block max-w-full overflow-hidden text-ellipsis whitespace-nowrap text-[12px] leading-4 text-white font-medium group-hover:text-accent transition-colors cursor-help"
+              onMouseEnter={() => setIsHoveringName(true)}
+              onMouseLeave={() => setIsHoveringName(false)}
+            >
+              {project.name}
+            </span>
+          </SmartPopover>
+        </div>
+        <span
+          className="inline-flex flex-shrink-0 items-center gap-1 text-[10px] leading-4 text-[#d6d6d6]"
+          title={`${tabsStats.active} active / ${tabsStats.total} total tabs`}
+        >
+          <span className="text-[8px] leading-4 text-[#d6d6d6]">•</span>
+          <span>
+            {tabsStats.total}
           </span>
-        </SmartPopover>
+        </span>
       </div>
 
       {/* Path with Custom Tooltip */}
-      <div className="px-2.5 leading-tight">
+      <div className="-mt-0.5 px-2 pb-1 leading-[12px]">
         <div 
           className="relative inline-block max-w-full group/path"
           onMouseEnter={() => setPathHovered(true)}
           onMouseLeave={() => setPathHovered(false)}
         >
-          <div className="text-[10px] text-[#555] truncate group-hover/path:text-[#888] transition-colors">
+          <div className="text-[10px] text-[#9a9a9a] truncate group-hover/path:text-[#b0b0b0] transition-colors">
             {getShortPath(project.path)}
           </div>
 
@@ -110,35 +157,6 @@ export default function ProjectCard({
           )}
         </div>
       </div>
-
-      {/* Stats */}
-      <div className="px-2.5 pb-2">
-        <span className={`text-[10px] ${hasActiveProcesses ? 'text-white' : 'text-[#666]'}`}>
-          {tabsStats.total > 0 ? (
-            <>
-              {tabsStats.total} tab{tabsStats.total !== 1 ? 's' : ''}
-              {hasActiveProcesses && (
-                <span className="text-green-400 ml-1">• {tabsStats.active}</span>
-              )}
-            </>
-          ) : (
-            '—'
-          )}
-        </span>
-        {tabsStats.history > 0 && (
-          <span className="text-[10px] ml-1.5" style={{ color: '#b0956e' }}>
-            +{tabsStats.history}
-          </span>
-        )}
-      </div>
-
-      {/* Settings Button - Bottom Right */}
-      <button
-        className="absolute bottom-1.5 right-1.5 p-1 text-[#555] hover:text-white hover:bg-white/10 rounded opacity-0 group-hover:opacity-100 transition-all cursor-pointer"
-        onClick={handleEdit}
-      >
-        <Settings size={12} />
-      </button>
     </div>
   );
 }
