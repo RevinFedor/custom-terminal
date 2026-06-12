@@ -4046,7 +4046,10 @@ async function repairJsonlChainBreaks(sessionId, cwd) {
     const found = findSessionFile(sessionId, cwd);
     if (!found) return { repaired: 0, reason: 'file-not-found' };
     const filePath = found.filePath;
-    const raw = fs.readFileSync(filePath, 'utf-8');
+    // Async read: this function runs in main and is called in bulk by the boot
+    // sweep — readFileSync on a 100MB session blocked the loop for the whole
+    // I/O too, on top of the unavoidable CPU-bound parse below.
+    const raw = await fs.promises.readFile(filePath, 'utf-8');
     const lines = raw.split('\n');
 
     // PARSE every line with real JSON.parse (not regex on raw text).

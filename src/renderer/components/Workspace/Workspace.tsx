@@ -312,7 +312,12 @@ export default function Workspace() {
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
 
     // Get initial state
-    ipcRenderer.invoke('terminal:getCommandState', effectiveTab.id).then((state: any) => {
+    ipcRenderer.invoke('terminal:getCommandState', {
+      tabId: effectiveTab.id,
+      caller: 'Workspace.effectiveTabSync',
+      expectedProcess: 'codex',
+      allowProcessTreeLookup: effectiveCommandType === 'codex' || !!effectiveCodexSessionId,
+    }).then((state: any) => {
       setIsCommandRunning(state?.isRunning || false);
     });
 
@@ -320,7 +325,7 @@ export default function Workspace() {
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
     };
-  }, [effectiveTab?.id]);
+  }, [effectiveTab?.id, effectiveCommandType, effectiveCodexSessionId]);
 
   // Handle resize callback for terminal refit
   const handleResize = useCallback(() => {
@@ -668,6 +673,7 @@ export default function Workspace() {
                 notesPanelWidth={notesPanelWidth}
                 isOpen={isHistoryOpen}
                 toolType={timelineToolType}
+                enableClaudePtyControls={timelineToolType === 'claude' && effectiveTabType !== 'claude-sdk'}
               />
             )}
           </div>

@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const { performance } = require('perf_hooks');
 
 // ========== GEMINI EMBEDDING PROVIDER ==========
 
@@ -241,6 +242,17 @@ function initSearchTables(db) {
     CREATE INDEX IF NOT EXISTS idx_chunks_project ON session_chunks(project_slug);
     CREATE INDEX IF NOT EXISTS idx_chunks_hash ON session_chunks(file_hash);
   `);
+
+  const embeddingIndexStart = performance.now();
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_chunks_embedding_present
+    ON session_chunks(id)
+    WHERE embedding IS NOT NULL;
+  `);
+  const embeddingIndexMs = performance.now() - embeddingIndexStart;
+  if (embeddingIndexMs > 100) {
+    console.warn(`[SemanticSearch] embedding-present index init durMs=${embeddingIndexMs.toFixed(1)}`);
+  }
 
   // Track which files have been indexed (by hash)
   db.exec(`

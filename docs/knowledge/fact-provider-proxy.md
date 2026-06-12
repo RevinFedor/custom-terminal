@@ -57,7 +57,7 @@ Passthrough к `api.anthropic.com`. OAuth-токен подписки пробр
 
 `Tab.providerState` в zustand-сторе — **read-only кэш** для UI; renderer никогда не вызывает `saveTabs` с дельтой по `providerState`. Source of truth — `providerStates` Map в main + `tabs.provider_state` row в SQLite. См. `methodology/переносимый-дизайн.md::Per-tab tooling state` для общего принципа изоляции state между табами.
 
-**Что НЕ персистится:** anthropic-side `/model` выбор (default/opus/sonnet/haiku) — это команда внутри Claude TUI, не часть `providerState`. При `--resume` Claude сам сбрасывает модель на default. Чтобы выбор модели в anthropic-режиме переживал restart, нужна отдельная injection `/model <X>` на `process-started` event (аналог `/effort` auto-inject) — не сделано в этой итерации.
+**Что НЕ персистится в `providerState`:** anthropic-side `/model` выбор (default/opus/sonnet/haiku) — это команда внутри Claude TUI, не часть proxy target. Persistence для Claude TUI model теперь живёт в app-wide `defaultClaudeModel` (`app_state` / StatusBar) и применяется при старте PTY через `/model <X>` перед `/effort`. Это сознательно не смешивается с `providerState`: providerState отвечает за маршрутизацию request body через proxy, а `/model` — за локальное состояние Anthropic TUI.
 
 ## Bridge врёт про active provider
 
@@ -87,6 +87,8 @@ Proxy перехватывает первый SSE `message_start` event в strea
 [ProviderProxy] Cache: read=187000 create=1500 input=3 HIT
 ```
 Поля: `cache_read_input_tokens` (из кэша, 0.1x стоимости), `cache_creation_input_tokens` (записано в кэш, 1.25x).
+
+Эта же декомпрессированная SSE-копия — детерминированный источник live token counter для PTY Claude. JSONL пишет assistant message атомарно по завершении ответа и не даёт token-by-token прогресса; xterm показывает уже отрендеренный UI и мерцает при partial redraw. `message_start.usage` даёт input/cache baseline, последующие `message_delta.usage.output_tokens` на том же stream'е дают растущий output-counter. Поэтому live счётчик надо строить в proxy tap'е, который уже читает SSE, а не парсить терминальный экран.
 
 **Эмпирическая проверка (апрель 2026):** 96% cache hit rate на 904 turns через proxy. Кэш работает — cache key вычисляется сервером по содержимому messages после JSON decode, а не по бинарному HTTP body.
 

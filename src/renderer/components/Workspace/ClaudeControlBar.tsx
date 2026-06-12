@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -8,11 +9,12 @@ import {
 } from '../../constants/claudeLevels';
 import { PROVIDER_CATALOG } from './providerCatalog';
 import SessionActionChip from './SessionActionChip';
-import MicButton, {
+import MicButton from './MicButton';
+import {
   DICTATION_DELIVERED_EVENT,
-  DICTATION_STATE_EVENT,
   DICTATION_STOP_AND_DELIVER_EVENT,
-} from './MicButton';
+  useDictationSnapshot,
+} from '../../utils/dictationManager';
 import { useCmdKey } from '../../hooks/useCmdHoverPopover';
 
 const { ipcRenderer } = window.require('electron');
@@ -259,7 +261,16 @@ export default function ClaudeControlBar({
     }
     return false;
   });
+  const tabAiBusy = useWorkspaceStore((s) => {
+    for (const [, ws] of s.openProjects) {
+      const t = ws.tabs.get(tabId);
+      if (t) return !!t.aiBusy;
+    }
+    return false;
+  });
   const isSDKTab = tabType === 'claude-sdk';
+  const isCodex = sessionType === 'codex';
+  const codexTurnBusy = isCodex && tabAiBusy;
 
   // Live bridge data (PTY only): model name + context %.
   const [claudeModel, setClaudeModel] = useState<string | null>(null);
@@ -470,14 +481,31 @@ export default function ClaudeControlBar({
   const [isLocalBusy, setIsLocalBusy] = useState(false);
   const isBusy = isPasteBusy || isLocalBusy;
   const busySnapshotRef = useRef({ paste: false, local: false });
+  const controlActionInFlightRef = useRef<string | null>(null);
   const setLocalBusy = (busy: boolean, reason: string) => {
-    console.log('[ControlBarLoader] local-set tab=' + tabId.slice(-12) + ' type=' + sessionType + ' reason=' + reason + ' busy=' + busy + ' paste=' + isPasteBusy + ' local=' + isLocalBusy + ' commandRunning=' + isCommandRunning + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
+    console.log('[ControlBarLoader] local-set tab=' + tabId.slice(-12) + ' type=' + sessionType + ' reason=' + reason + ' busy=' + busy + ' paste=' + isPasteBusy + ' local=' + isLocalBusy + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
     setIsLocalBusy(busy);
+  };
+  const beginControlAction = (reason: string) => {
+    const existing = controlActionInFlightRef.current;
+    if (existing || isBusy) {
+      console.warn('[ControlBarAction] blocked tab=' + tabId.slice(-12) + ' type=' + sessionType + ' reason=' + reason + ' existing=' + (existing || 'none') + ' busy=' + isBusy);
+      return false;
+    }
+    controlActionInFlightRef.current = reason;
+    console.log('[ControlBarAction] begin tab=' + tabId.slice(-12) + ' type=' + sessionType + ' reason=' + reason);
+    return true;
+  };
+  const endControlAction = (reason: string) => {
+    const existing = controlActionInFlightRef.current;
+    if (existing === reason) controlActionInFlightRef.current = null;
+    else if (existing) console.warn('[ControlBarAction] end-mismatch tab=' + tabId.slice(-12) + ' reason=' + reason + ' existing=' + existing);
+    console.log('[ControlBarAction] end tab=' + tabId.slice(-12) + ' type=' + sessionType + ' reason=' + reason);
   };
   useEffect(() => {
     busySnapshotRef.current = { paste: isPasteBusy, local: isLocalBusy };
-    console.log('[ControlBarLoader] state tab=' + tabId.slice(-12) + ' type=' + sessionType + ' paste=' + isPasteBusy + ' local=' + isLocalBusy + ' busy=' + isBusy + ' commandRunning=' + isCommandRunning + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
-  }, [tabId, sessionType, isPasteBusy, isLocalBusy, isBusy, isCommandRunning, sessionId]);
+    console.log('[ControlBarLoader] state tab=' + tabId.slice(-12) + ' type=' + sessionType + ' paste=' + isPasteBusy + ' local=' + isLocalBusy + ' busy=' + isBusy + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
+  }, [tabId, sessionType, isPasteBusy, isLocalBusy, isBusy, isCommandRunning, codexTurnBusy, sessionId]);
   // CRITICAL: this component is mounted WITHOUT a `key` (Workspace.tsx) so React
   // REUSES the same instance across tab switches — only the `tabId` prop changes,
   // the instance never remounts. Therefore `useState` busy flags do NOT reset on
@@ -499,8 +527,9 @@ export default function ClaudeControlBar({
   useEffect(() => {
     // Reset synchronously on bind to a new tab — never inherit the previous
     // tab's busy state.
-    console.log('[ControlBarLoader] bind-reset tab=' + tabId.slice(-12) + ' type=' + sessionType + ' paste=' + isPasteBusy + ' local=' + isLocalBusy + ' commandRunning=' + isCommandRunning + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
+    console.log('[ControlBarLoader] bind-reset tab=' + tabId.slice(-12) + ' type=' + sessionType + ' paste=' + isPasteBusy + ' local=' + isLocalBusy + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
     busySnapshotRef.current = { paste: false, local: false };
+    controlActionInFlightRef.current = null;
     setIsPasteBusy(false);
     setIsLocalBusy(false);
     const handler = (_: any, data: { tabId: string; busy: boolean }) => {
@@ -568,6 +597,20 @@ export default function ClaudeControlBar({
   const updateCodexState = (state: { codexModel?: string; codexEffort?: string }) => {
     useWorkspaceStore.getState().updateCodexState(tabId, state);
   };
+  const saveCodexSelectionWithoutLivePicker = (
+    state: { codexModel?: string; codexEffort?: string },
+    reason: string,
+    toastText: string,
+  ) => {
+    console.warn('[CodexControlBar] live picker skipped tab=' + tabId.slice(-12) + ' reason=' + reason + ' state=' + JSON.stringify(state) + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
+    updateCodexState(state);
+    showToast(toastText, 'warning', 2600);
+    focusTerminal();
+  };
+  const ignoreCodexPickerDuringTurn = (kind: 'model' | 'effort', value: string) => {
+    console.warn('[CodexControlBar] picker disabled during active turn tab=' + tabId.slice(-12) + ' kind=' + kind + ' value=' + value + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
+    focusTerminal();
+  };
 
   const codexRunPayload = (base: { tabId: string; command: string; sessionId?: string; cwd?: string }) => {
     const payload: { tabId: string; command: string; sessionId?: string; cwd?: string; model?: string; effort?: string } = { ...base };
@@ -584,10 +627,10 @@ export default function ClaudeControlBar({
     () => PROVIDER_CATALOG.find(p => p.id === providerState.type) || PROVIDER_CATALOG[0],
     [providerState.type]
   );
-  const isCodex = sessionType === 'codex';
   const isAnthropicPTY = !isSDKTab && providerState.type === 'anthropic';
   const isDeepSeekPTY = !isSDKTab && providerState.type === 'deepseek';
   const supportsKnobs = isSDKTab || isAnthropicPTY || isDeepSeekPTY || isCodex;
+  const codexKnobsDisabled = isCodex && codexTurnBusy;
 
   // Cache cooldown chip: Claude only (Anthropic PTY or SDK). DeepSeek/Zen have
   // no prompt cache, so the chip is meaningless there — hide entirely. Also
@@ -597,7 +640,10 @@ export default function ClaudeControlBar({
   const showLivePtyInputActions = (sessionType === 'claude' || sessionType === 'codex') && !isSDKTab && isCommandRunning;
   const [enterPending, setEnterPending] = useState(false);
   const cancelPendingEnterRef = useRef(false);
-  const [dictationState, setDictationState] = useState({ recording: false, stopping: false });
+  const dictationSnapshot = useDictationSnapshot();
+  const dictationState = dictationSnapshot.owner?.tabId === tabId
+    ? { recording: dictationSnapshot.recording, stopping: dictationSnapshot.stopping }
+    : { recording: false, stopping: false };
   // Turn-level busy, NOT process-level. `sdkBusy` is fed by claude:busy-state,
   // which main emits for BOTH SDK and PTY Claude (spinner + stop-hook), filtered
   // by tabId — so it goes false between turns on both. Using isCommandRunning
@@ -609,17 +655,6 @@ export default function ClaudeControlBar({
   useEffect(() => {
     cancelPendingEnterRef.current = false;
     setEnterPending(false);
-    setDictationState({ recording: false, stopping: false });
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent).detail || {};
-      if (detail.tabId !== tabId) return;
-      setDictationState({
-        recording: !!detail.recording,
-        stopping: !!detail.stopping,
-      });
-    };
-    window.addEventListener(DICTATION_STATE_EVENT, handler);
-    return () => window.removeEventListener(DICTATION_STATE_EVENT, handler);
   }, [tabId]);
 
   const activeCodexModel = codexModels.find(m => m.id === codexModel) || codexModels[0];
@@ -686,6 +721,13 @@ export default function ClaudeControlBar({
   const isCmdPressed = useCmdKey();
   const showSessionIdTooltip = isCmdPressed && sessionCopyHover && hasAnySession && !!sessionCopyRect;
 
+  useEffect(() => {
+    if (!codexKnobsDisabled) return;
+    setPinnedPopup(null);
+    setHoveredTrigger(null);
+    setHoveredPopup(null);
+  }, [codexKnobsDisabled]);
+
   // Derived: какой popup сейчас визуально открыт.
   const openPopup: PopupKey | null =
     pinnedPopup
@@ -702,7 +744,10 @@ export default function ClaudeControlBar({
   useEffect(() => {
     if (!pinnedPopup) return;
     const onDown = (e: MouseEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) setPinnedPopup(null);
+      const target = e.target as Node;
+      const inRoot = !!rootRef.current?.contains(target);
+      const inPopup = !!popupRefs.current[pinnedPopup]?.contains(target);
+      if (!inRoot && !inPopup) setPinnedPopup(null);
     };
     document.addEventListener('mousedown', onDown);
     return () => document.removeEventListener('mousedown', onDown);
@@ -781,6 +826,30 @@ export default function ClaudeControlBar({
     }));
   };
 
+  const getCodexDraftStateForPicker = async () => {
+    const visualState = terminalRegistry.getCodexDraftState(tabId);
+    console.warn('[CodexControlBar] draft visual-probe tab=' + tabId.slice(-12) + ' hasDraft=' + visualState.hasDraft + ' source=' + visualState.source + ' preview=' + JSON.stringify(visualState.preview));
+
+    return {
+      hasDraft: visualState.hasDraft,
+      source: 'visual:' + visualState.source,
+      preview: visualState.preview,
+      visualHasDraft: visualState.hasDraft,
+      visualSource: visualState.source,
+      visualPreview: visualState.preview,
+    };
+  };
+
+  const canOpenCodexPicker = (draftState: Awaited<ReturnType<typeof getCodexDraftStateForPicker>>) => {
+    if (draftState.hasDraft === false) return true;
+    if (draftState.hasDraft === true) {
+      console.warn('[CodexControlBar] picker will stash composer draft tab=' + tabId.slice(-12) + ' source=' + draftState.source + ' preview=' + JSON.stringify(draftState.preview));
+      return true;
+    }
+    console.warn('[CodexControlBar] picker blocked because composer state is unknown tab=' + tabId.slice(-12) + ' source=' + draftState.source + ' preview=' + JSON.stringify(draftState.preview));
+    return false;
+  };
+
   // ===== handlers =====
   const setEffortOnPTY = async (level: string) => {
     // Mark this tab as "effort sent" so the tui-ready and Bridge:Fresh auto-inject
@@ -806,17 +875,47 @@ export default function ClaudeControlBar({
 
   const pickModel = async (mid: string) => {
     setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null);
-    if (isBusy) return;
+    if (isCodex && codexTurnBusy) {
+      ignoreCodexPickerDuringTurn('model', mid);
+      return;
+    }
+    const actionReason = 'model:' + mid;
+    if (!beginControlAction(actionReason)) return;
+    try {
     if (isCodex) {
       const nextModel = codexModels.find(m => m.id === mid);
       const efforts = nextModel?.efforts || ['low', 'medium', 'high', 'xhigh'];
       const nextEffort = efforts.includes(codexEffort)
         ? codexEffort
         : (efforts.includes(DEFAULT_CODEX_EFFORT) ? DEFAULT_CODEX_EFFORT : (nextModel?.defaultEffort || efforts[0] || DEFAULT_CODEX_EFFORT));
+      const fallbackState = { codexModel: mid, codexEffort: nextEffort };
+      if (codexTurnBusy) {
+        ignoreCodexPickerDuringTurn('model', mid);
+        return;
+      }
       if (isCommandRunning) {
         setLocalBusy(true, 'codex-model:' + mid + '/effort:' + nextEffort);
         try {
-          const result = await ipcRenderer.invoke('codex:select-model-effort', { tabId, model: mid, effort: nextEffort });
+          const draftState = await getCodexDraftStateForPicker();
+          if (!canOpenCodexPicker(draftState)) {
+            saveCodexSelectionWithoutLivePicker(
+              fallbackState,
+              'unsafe-input:model:' + draftState.source,
+              `Codex model saved for this tab: ${mid}. Live picker skipped.`,
+            );
+            return;
+          }
+          const result = await ipcRenderer.invoke('codex:select-model-effort', {
+            tabId,
+            model: mid,
+            effort: nextEffort,
+            hasDraft: draftState.hasDraft,
+            draftSource: draftState.source,
+            draftPreview: draftState.preview,
+            visualHasDraft: draftState.visualHasDraft,
+            visualSource: draftState.visualSource,
+            visualPreview: draftState.visualPreview,
+          });
           console.log('[ControlBarLoader] codex-model-result tab=' + tabId.slice(-12) + ' model=' + mid + ' effort=' + nextEffort + ' result=' + JSON.stringify(result || null));
           if (result?.success) {
             syncCodexPickerOptions(result);
@@ -824,17 +923,19 @@ export default function ClaudeControlBar({
             if (!result.effortSkipped) {
               patch.codexEffort = result.effort || nextEffort;
               updateCodexState(patch);
-              showToast(`Codex: ${result.model || mid} / ${result.effort || nextEffort}`, 'success', 1600);
             } else {
               updateCodexState(patch);
-              showToast(`Codex model changed: ${result.model || mid}. Effort picker не найден`, 'warning', 2600);
             }
           } else {
-            showToast('Codex model failed: ' + (result?.error || 'unknown error'), 'error', 3200);
+            saveCodexSelectionWithoutLivePicker(
+              fallbackState,
+              'picker-failed:model:' + (result?.error || 'unknown'),
+              `Codex model saved for this tab: ${mid}. Live picker failed.`,
+            );
           }
         } finally { setLocalBusy(false, 'codex-model:' + mid + ':finally'); focusTerminal(); }
       } else {
-        updateCodexState({ codexModel: mid, codexEffort: nextEffort });
+        updateCodexState(fallbackState);
         focusTerminal();
       }
       return;
@@ -849,6 +950,8 @@ export default function ClaudeControlBar({
     }
     if (activeProvider.id === 'anthropic') {
       setLocalBusy(true, 'claude-model:' + mid);
+      const modelSentinelMap = (window as any).__modelSentForTab as Map<string, { at: number; via: string; model: string }> | undefined;
+      if (modelSentinelMap) modelSentinelMap.set(tabId, { at: Date.now(), via: 'manual-click', model: mid });
       try { await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + mid); }
       finally { setLocalBusy(false, 'claude-model:' + mid + ':finally'); focusTerminal(); }
     } else {
@@ -859,27 +962,61 @@ export default function ClaudeControlBar({
         if (r) setProviderState(r);
       } finally { setLocalBusy(false, 'provider-model:' + activeProvider.id + ':' + mid + ':finally'); focusTerminal(); }
     }
+    } finally {
+      endControlAction(actionReason);
+    }
   };
 
   const pickEffort = async (level: string) => {
     setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null);
-    if (isBusy) return;
+    if (isCodex && codexTurnBusy) {
+      ignoreCodexPickerDuringTurn('effort', level);
+      return;
+    }
+    const actionReason = 'effort:' + level;
+    if (!beginControlAction(actionReason)) return;
+    try {
     if (isCodex) {
+      if (codexTurnBusy) {
+        ignoreCodexPickerDuringTurn('effort', level);
+        return;
+      }
       if (isCommandRunning) {
         setLocalBusy(true, 'codex-effort:' + level);
         try {
-          const result = await ipcRenderer.invoke('codex:select-model-effort', { tabId, model: codexModel, effort: level });
+          const draftState = await getCodexDraftStateForPicker();
+          if (!canOpenCodexPicker(draftState)) {
+            saveCodexSelectionWithoutLivePicker(
+              { codexEffort: level },
+              'unsafe-input:effort:' + draftState.source,
+              `Codex effort saved for this tab: ${level}. Live picker skipped.`,
+            );
+            return;
+          }
+          const result = await ipcRenderer.invoke('codex:select-model-effort', {
+            tabId,
+            model: codexModel,
+            effort: level,
+            hasDraft: draftState.hasDraft,
+            draftSource: draftState.source,
+            draftPreview: draftState.preview,
+            visualHasDraft: draftState.visualHasDraft,
+            visualSource: draftState.visualSource,
+            visualPreview: draftState.visualPreview,
+          });
           console.log('[ControlBarLoader] codex-effort-result tab=' + tabId.slice(-12) + ' model=' + codexModel + ' effort=' + level + ' result=' + JSON.stringify(result || null));
           if (result?.success && !result.effortSkipped) {
             syncCodexPickerOptions(result);
             updateCodexState({ codexModel: result.model || codexModel, codexEffort: result.effort || level });
-            showToast(`Codex effort: ${result.effort || level}`, 'success', 1600);
           } else if (result?.success) {
             syncCodexPickerOptions(result);
             updateCodexState({ codexModel: result.model || codexModel });
-            showToast('Codex effort picker не найден', 'warning', 2600);
           } else {
-            showToast('Codex effort failed: ' + (result?.error || 'unknown error'), 'error', 3200);
+            saveCodexSelectionWithoutLivePicker(
+              { codexEffort: level },
+              'picker-failed:effort:' + (result?.error || 'unknown'),
+              `Codex effort saved for this tab: ${level}. Live picker failed.`,
+            );
           }
         } finally { setLocalBusy(false, 'codex-effort:' + level + ':finally'); focusTerminal(); }
       } else {
@@ -894,11 +1031,15 @@ export default function ClaudeControlBar({
     } else {
       await setEffortOnPTY(level);
     }
+    } finally {
+      endControlAction(actionReason);
+    }
   };
 
   const pickProvider = async (pid: string) => {
     setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null);
-    if (isBusy || isSDKTab) return;
+    const actionReason = 'provider:' + pid;
+    if (isSDKTab || !beginControlAction(actionReason)) return;
     setLocalBusy(true, 'provider:' + pid);
     try {
       if (pid === 'anthropic') {
@@ -909,15 +1050,17 @@ export default function ClaudeControlBar({
         const r = await ipcRenderer.invoke('provider:switch', { tabId, type: pid, model: remembered });
         if (r) setProviderState(r);
       }
-    } finally { setLocalBusy(false, 'provider:' + pid + ':finally'); focusTerminal(); }
+    } finally { setLocalBusy(false, 'provider:' + pid + ':finally'); focusTerminal(); endControlAction(actionReason); }
   };
 
   const toggleThink = async () => {
-    if (isBusy) return;
+    const actionReason = 'think-toggle';
+    if (!beginControlAction(actionReason)) return;
     if (isSDKTab) {
       const cur = sdkThinking;
       useWorkspaceStore.getState().updateSDKState(tabId, { sdkThinking: !cur });
       focusTerminal();
+      endControlAction(actionReason);
       return;
     }
     setLocalBusy(true, 'think-toggle');
@@ -932,7 +1075,7 @@ export default function ClaudeControlBar({
     try {
       const r = await ipcRenderer.invoke('claude:toggle-thinking', tabId);
       if (r?.success && typeof r.thinking === 'boolean') { setThinkLocal(r.thinking); thinkMap.set(tabId, r.thinking); }
-    } finally { setLocalBusy(false, 'think-toggle:finally'); focusTerminal(); }
+    } finally { setLocalBusy(false, 'think-toggle:finally'); focusTerminal(); endControlAction(actionReason); }
   };
 
   // ===== Session lifecycle handlers (Start / Continue / Stop / Refresh / Fork) =====
@@ -951,12 +1094,14 @@ export default function ClaudeControlBar({
     focusTerminal();
     if (sessionType === 'codex') {
       store.setTabCommandType(tabId, 'codex');
+      store.markAiLaunchAutoTitle(tabId, 'codex');
       ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex', cwd: projectPath }));
     } else if (sessionType === 'gemini') {
       store.setTabCommandType(tabId, 'gemini');
       ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd: projectPath, yesMode: true });
     } else {
       store.setTabCommandType(tabId, 'claude');
+      store.markAiLaunchAutoTitle(tabId, 'claude');
       ipcRenderer.send('claude:run-command', { tabId, command: 'claude' });
     }
   };
@@ -1297,7 +1442,9 @@ export default function ClaudeControlBar({
 
   const startCodexTab = () => {
     if (!tabId) return;
-    useWorkspaceStore.getState().setTabCommandType(tabId, 'codex');
+    const store = useWorkspaceStore.getState();
+    store.setTabCommandType(tabId, 'codex');
+    store.markAiLaunchAutoTitle(tabId, 'codex');
     terminalRegistry.get(tabId)?.scrollToBottom();
     focusTerminal();
     ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex', cwd: projectPath }));
@@ -1441,6 +1588,29 @@ export default function ClaudeControlBar({
     boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
     whiteSpace: 'nowrap',
   };
+  const getPortalPopupWrapperStyle = (key: PopupKey): React.CSSProperties | null => {
+    const rect = triggerRefs.current[key]?.getBoundingClientRect();
+    if (!rect) return null;
+    return {
+      ...popupWrapperStyle,
+      position: 'fixed',
+      right: Math.max(8, window.innerWidth - rect.right),
+      top: rect.top,
+      bottom: 'auto',
+      transform: 'translateY(-100%)',
+      zIndex: 10050,
+    };
+  };
+  const renderControlPopup = (key: PopupKey, children: React.ReactNode) => {
+    const style = getPortalPopupWrapperStyle(key);
+    if (!style) return null;
+    return createPortal(
+      <div {...popupHoverProps(key)} style={style}>
+        <div style={popupCardStyle}>{children}</div>
+      </div>,
+      document.body,
+    );
+  };
 
   const pillStyle = (active: boolean, disabled: boolean): React.CSSProperties => ({
     height: 20,
@@ -1506,10 +1676,12 @@ export default function ClaudeControlBar({
   //   sdkBusy — claude-sdk:busy-state из ClaudeSDKTab (isRunning эффект).
   //
   // АНТИПАТТЕРН (не повторять):
-  //   — `pointerEvents: 'none' + opacity: 0.5` на disabled-кластере. Это
-  //     меняет визуальный вес и блок «съёживается» при смене ширины model
-  //     label'а. Используй .control-bar-busy-overlay (shimmer ::after) — см.
-  //     fact-claude-control-bar.md::Busy-overlay.
+  //   — Для in-flight control-команд (`/model`, `/effort`, provider switch)
+  //     не ставь `disabled + opacity` на каждый trigger: блок визуально
+  //     съёживается. Используй .control-bar-busy-overlay (shimmer ::after) —
+  //     см. fact-claude-control-bar.md::Busy-overlay. Semantic unavailable
+  //     states (PTY idle, Codex streaming) — отдельный случай: там кнопки
+  //     действительно недоступны, а не "команда уже применяется".
   //   — Композитный селектор Zustand `state => ({ a, b, c })` → новая ссылка
   //     каждый рендер → infinite re-render. Используй отдельные primitive
   //     селекторы (см. начало компонента, `tabType` / `sdkModel` etc).
@@ -1985,9 +2157,12 @@ export default function ClaudeControlBar({
             Привязывать к hasAnySession неправильно: новый SDK таб без
             session_id всё равно должен позволять выбрать модель — иначе
             юзер видит disabled кнопки и видит хвостовой «Start» на чипе,
-            хотя SDK уже готов принять prompt. */}
+            хотя SDK уже готов принять prompt.
+          • Codex: во время active turn Model/Effort disabled целиком. Это
+            не preset-flow и не warning-flow: Codex TUI занят streaming'ом,
+            поэтому никакого `/model`, state-save или toast быть не должно. */}
       {showRightCluster && (() => {
-        const canControl = isSDKTab || isCodex ? true : isCommandRunning;
+        const canControl = isSDKTab ? true : isCodex ? !codexKnobsDisabled : isCommandRunning;
         const modelOptions = isCodex ? codexModels : isAnthropicPTY ? claudeCodeModels : activeProvider.models;
         return (
         <div
@@ -2034,10 +2209,8 @@ export default function ClaudeControlBar({
                 <activeProvider.Icon size={12} color={activeProvider.tint} />
                 <span style={{ opacity: 0.6, fontSize: 9 }}>▴</span>
               </button>
-              {openPopup === 'provider' && (
-                <div {...popupHoverProps('provider')} style={popupWrapperStyle}>
-                  <div style={popupCardStyle}>
-                    {PROVIDER_CATALOG.map(p => {
+              {openPopup === 'provider' && renderControlPopup('provider',
+                PROVIDER_CATALOG.map(p => {
                       const active = p.id === providerState.type;
                       return (
                         <button
@@ -2057,9 +2230,7 @@ export default function ClaudeControlBar({
                           <span>{p.label}</span>
                         </button>
                       );
-                    })}
-                  </div>
-                </div>
+                    })
               )}
             </div>
           )}
@@ -2068,28 +2239,26 @@ export default function ClaudeControlBar({
           <div style={{ position: 'relative' }}>
             <button
               {...triggerProps('model')}
+              disabled={codexKnobsDisabled}
               style={triggerStyle}
-              title="Model (клик закрепит, ⌘+наведение откроет временно)"
+              title={codexKnobsDisabled ? 'Model недоступен во время streaming' : 'Model (клик закрепит, ⌘+наведение откроет временно)'}
             >
               <span style={{ color: '#777', fontSize: 10 }}>Model</span>
               <span style={{ color: '#fff' }}>{modelLabel}</span>
               <span style={{ opacity: 0.6 }}>▴</span>
             </button>
-            {openPopup === 'model' && (
-              <div {...popupHoverProps('model')} style={popupWrapperStyle}>
-                <div style={popupCardStyle}>
-                  {modelOptions.map(m => {
+            {openPopup === 'model' && renderControlPopup('model',
+              modelOptions.map(m => {
                     const active = m.id === modelActiveId;
                     return (
                       <button
                         key={m.id}
-                        style={pillStyle(active, false)}
+                        disabled={codexKnobsDisabled}
+                        style={pillStyle(active, codexKnobsDisabled)}
                         onClick={() => pickModel(m.id)}
                       >{m.label}</button>
                     );
-                  })}
-                </div>
-              </div>
+                  })
             )}
           </div>
 
@@ -2139,7 +2308,14 @@ export default function ClaudeControlBar({
                 <React.Fragment key={level}>
                   {isUltra && <span aria-hidden style={{ width: 1, alignSelf: 'stretch', background: 'rgba(255,255,255,0.12)', margin: '2px 2px' }} />}
                   <button
-                    style={ultraStyle}
+                    disabled={codexKnobsDisabled}
+                    style={isUltra ? {
+                      ...ultraStyle,
+                      ...(codexKnobsDisabled ? { color: '#555', backgroundColor: '#222', borderColor: 'rgba(255,255,255,0.08)', cursor: 'not-allowed' } : {}),
+                    } : {
+                      ...pillStyle(active, codexKnobsDisabled),
+                      ...(codexKnobsDisabled ? { color: '#555', backgroundColor: '#222', cursor: 'not-allowed' } : {}),
+                    }}
                     title={title}
                     onClick={() => pickEffort(level)}
                   >{label}</button>

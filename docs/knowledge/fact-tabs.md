@@ -12,6 +12,15 @@
 ### Persistence Guard
 При создании таба через `createTabAfterCurrent` с опциями `{ nameSetManually: true }` флаг сохраняется в БД и блокирует авто-переименование в `setTabCommandType`. Это критично для вкладок типа `docs-XX`, которые не должны перезаписываться на `claude`/`gemini` при запуске AI.
 
+### AI auto-title по первому пользовательскому prompt
+Claude/Codex вкладка может получить человекочитаемое имя через встроенный prompt `tab-title` из Settings → AI. Prompt редактируемый пользователем; приложение только передаёт в Gemini первое **реальное** user-сообщение из Timeline/Codex rollout и применяет короткий ответ как название вкладки. Служебные команды (`#pack`, `#effort`, `#usage`, slash-команды модели/статуса/help/compact/exit и т.п.) не считаются первым prompt'ом — иначе вкладка получит название по настройке runtime, а не по задаче пользователя.
+
+Автоназвание — не постоянный watcher Timeline, а одноразовый side-effect свежего запуска. При старте Claude/Codex launch-path должен сначала создать `AiLaunchSnapshot`, затем явно пометить его `autoTitleEligible`, и только когда впервые записывается materialized session id (`claudeSessionId` от bridge или `codexSessionId` от fresh rollout detection), store армит transient pending `{tabId, toolType, sessionId}`. Timeline consume'ит pending на первой подходящей user-entry и сразу удаляет его. Pending живёт только в памяти: восстановление вкладки из БД, Cmd+Shift+T, app restart, закрытие/открытие History-tab или обычный `--resume` не должны переименовывать старую вкладку только потому что Timeline заново прочитал первый user prompt.
+
+`nameSetManually` сильнее AI: если пользователь переименовал вкладку до запуска агента, auto-title не армится; если переименовал после запуска, pending consume'ится без Gemini-вызова. ПКМ по любой Claude/Codex вкладке → `Обновить название` — отдельный явный override: он читает текущий Timeline напрямую, показывает per-tab loader `Название обновляется...`, применяет с `overrideManualName:true` и затем помечает результат как ручное имя, чтобы будущие автоматические запуски его не перетёрли.
+
+Шрам из production: fresh Codex вкладка `tab-2` получила session id `019ebbb1-76ef-79e1-a0ea-e2c4615742e0`, первый prompt был про настройку GPT-5.4/1M context, но auto-title не стартовал; ручное `Обновить название` сразу сработало и переименовало вкладку в `Настройка контекста 1М в Codex`. Логи показали, что запуск шёл через отдельный `ClaudeControlBar.startCodexTab`: `setTabCommandType` создал snapshot, но этот путь не вызывал `markAiLaunchAutoTitle`, поэтому `setCodexSessionId(..., reason:'detected')` не видел eligible snapshot и не армил pending. Любой новый launch-entrypoint для Claude/Codex обязан помечать auto-title eligibility там же, где он превращает pristine tab в AI tab; resume/fork/restore paths, наоборот, должны писать session id с reason, который auto-title не армит.
+
 ## User Flow: Жизненный цикл таба
 1. **Создание:** Пользователь нажимает `Cmd+T` или делает двойной клик на пустом месте TabBar.
    - Система ищет первое свободное число для имени (`tab-1`, `tab-2`).
@@ -195,11 +204,25 @@ Status marker 8px (dot или square, sizePx 4..16) рисуется absolute н
 
 В vertical layout TabPreviewPopover открывается справа от таба (`placement='right'`) вертикально центрированным. Детали — `knowledge/fact-tab-preview-popover.md::Layout & позиционирование`.
 
-### EmptyDropZone affordance в vertical
+### Tab-группы и visual-child вкладки
 
-Пустая зона ниже последнего таба — drop-target для cross-project переноса, плюс double-click создаёт новую вкладку. В horizontal mode эта зона тянется вправо до края TabBar; юзер ассоциирует её с пустым местом справа от табов и понимает что туда можно дропать. В vertical mode пустая зона занимает всю остаточную высоту колонки, никаких визуальных подсказок что в неё «можно». Симптом — юзер с пустым sidebar'ом не знает как создать первую вкладку (ПКМ → +add new требует знания контекст-меню).
+В `TabSidebar` есть две независимые иерархии. `groupId` + `tabGroups` — реальные группы сайдбара: group-row существует как отдельная строка, хранит имя, может быть переименован double-click'ом/ПКМ → Rename, закрыт middle-click'ом или через ПКМ → Close Group, либо удалён как контейнер через ПКМ → Delete Group. Close Group закрывает вкладки группы и потом удаляет контейнер; Delete Group сохраняет вкладки, только очищает у них `groupId`. Group-row намеренно использует те же `tabsFontSize`, `tabGeometry`, padding/minHeight/radius и click-target, что и обычная вкладка: группа отличается цветом, иконкой и стилем, но не плотностью строки.
 
-Решение — dashed-border плейсхолдер `+ New tab` в начале vertical empty zone, click = создать таб. Drop-target остаётся на всей зоне как раньше. Hover-state на плейсхолдере подсвечивает border + text → юзер визуально опознаёт «это кликабельно». Horizontal mode без affordance: там empty zone узкая, явный «+» вкладкой сделает её визуально похожей на full-fledged tab при разном hover-state — путаница. См. `methodology/переносимый-дизайн.md::Empty zone в vertical нужно явный placeholder для discoverability`.
+`visualParentTabId` — только визуальная связь вкладка→вкладка для thread/fork-структуры. Не использовать для этого `parentTabId`: `parentTabId` уже занят MCP sub-agent'ами и такие вкладки скрываются из основного `TabBar`, потому что живут в `SubAgentBar`. Visual-child остаётся обычной видимой вкладкой со своим session id. Split-стрелки в tab context menu привязывают вкладку к ближайшему видимому соседу сверху/снизу; `setTabVisualParent` защищает от циклов и нормализует `groupId` ребёнка под группу родителя.
+
+Drag-семантика различает parent и child: перетаскивание parent-вкладки тянет её visual-children как один блок, а перетаскивание child отдельно отвязывает `visualParentTabId`. Fork из текущей Claude/Codex/Gemini/SDK-вкладки создаёт fork как visual-child исходной вкладки, потому что пользователь хочет видеть причинную связь «из этой сессии родилась эта». Clipboard-fork по произвольному UUID остаётся плоским: source-tab может быть неизвестен, и привязка к активной вкладке была бы ложной.
+
+### Vertical DnD через snapshot геометрии
+
+Вертикальный DnD использует `@atlaskit/pragmatic-drag-and-drop` как транспорт событий, но preview/drop решаются своей моделью: на drag-start фиксируется static geometry (`captureVerticalDragGeometry`), а каждый pointer-move пересчитывает layout от base-order через `resolveStaticVerticalPreview`. Не считать от live DOM: inline-preview сам меняет порядок строк, высоту групп и границы body/header, поэтому следующий hit-test видит уже мутировавшую карту и начинает дёргаться на верхней границе элемента или группы.
+
+Симптомы, которые закрывает snapshot-модель: элемент у group/header boundary прыгает то внутрь группы, то перед неё; вкладка уходит в конец группы при плавном движении по верхней границе; чёрная insertion-line не совпадает с итоговым drop; native ghost создаёт вторую визуальную вкладку у курсора. Текущая модель показывает полноценный inline-preview в списке, скрывает native ghost, а source-row во время удержания получает lift/scale и `grabbing`, чтобы пользователь видел активный drag-state до первого движения мыши.
+
+### EmptyDropZone в vertical
+
+Пустая область ниже последнего row — техническая зона для append/drop и быстрых жестов, но не отдельная визуальная команда. Double-click по ней создаёт новую terminal-вкладку в конце списка; ПКМ открывает контекст с `New Terminal Tab` и `New Group`. Отдельный dashed `+ New tab` placeholder и нижний hover-background убраны: пользователь воспринимал подсвеченную нижнюю область как специальную drop-цель, хотя действие там означает только «нести ниже, в конец».
+
+Bottom-drop считается относительно последнего **визуального row**, а не последнего tab-id. Если последняя строка — пустая group-row или группа, которая станет пустой после выноса её единственной dragged-вкладки, drop в нижнюю область должен назначить dragged tab этой группе. Иначе группа остаётся последней structural row без tab-id, а вкладка визуально оказывается предпоследней, хотя курсор был в самом низу.
 
 ## Multi-select persistence через `data-keep-selection`
 

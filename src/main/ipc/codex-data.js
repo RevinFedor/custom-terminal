@@ -9,6 +9,11 @@ const CODEX_SESSIONS_DIR = path.join(CODEX_HOME, 'sessions');
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 
 let modelCache = null;
+const loggedRollbackKeys = new Set();
+
+function compactPreview(value, max = 120) {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
 
 function recordTimestamp(record) {
   return record?.timestamp || record?.time || record?.created_at || new Date().toISOString();
@@ -315,24 +320,73 @@ function pushAssistantEntry(entries, sessionId, record, turnIndex, content, thin
 }
 
 function applyRollback(list, numTurns) {
-  if (!numTurns || numTurns <= 0) return;
+  const requestedTurns = Number(numTurns || 0);
+  const beforeCount = list.length;
+  if (!requestedTurns || requestedTurns <= 0) {
+    return { requestedTurns, beforeCount, afterCount: list.length, removedTurnIds: [], removedEntries: 0, removedPreview: [] };
+  }
   const turnIds = [];
   for (let i = list.length - 1; i >= 0; i--) {
     const tid = list[i].turnIndex;
     if (typeof tid !== 'number') continue;
     if (!turnIds.includes(tid)) turnIds.push(tid);
-    if (turnIds.length >= numTurns) break;
+    if (turnIds.length >= requestedTurns) break;
   }
-  if (turnIds.length === 0) return;
+  if (turnIds.length === 0) {
+    return { requestedTurns, beforeCount, afterCount: list.length, removedTurnIds: [], removedEntries: 0, removedPreview: [] };
+  }
   const remove = new Set(turnIds);
+  let removedEntries = 0;
+  const removedPreview = [];
   for (let i = list.length - 1; i >= 0; i--) {
-    if (remove.has(list[i].turnIndex)) list.splice(i, 1);
+    const entry = list[i];
+    if (!remove.has(entry.turnIndex)) continue;
+    removedEntries += 1;
+    if (removedPreview.length < 4) {
+      removedPreview.push({
+        role: entry.role || entry.type || 'entry',
+        turnIndex: entry.turnIndex,
+        line: entry.uuid ? String(entry.uuid).split('-').pop() : undefined,
+        text: compactPreview(entry.content || entry.thinking || ''),
+      });
+    }
+    list.splice(i, 1);
   }
+  return { requestedTurns, beforeCount, afterCount: list.length, removedTurnIds: turnIds, removedEntries, removedPreview };
+}
+
+function logCodexRollback(context, sessionId, record, result) {
+  if (!result) return;
+  const line = Number(record?.__line ?? -1);
+  const key = `${context}:${sessionId || 'unknown'}:${line}:${result.requestedTurns}:${result.removedTurnIds.join(',')}:${result.removedEntries}`;
+  if (loggedRollbackKeys.has(key)) return;
+  loggedRollbackKeys.add(key);
+  if (loggedRollbackKeys.size > 1000) loggedRollbackKeys.clear();
+  const sid = sessionId ? String(sessionId).slice(0, 8) : 'unknown';
+  const removedTurns = result.removedTurnIds.length > 0 ? result.removedTurnIds.join(',') : 'none';
+  const preview = result.removedPreview.map((item) => (
+    `${item.role}@t${item.turnIndex}${item.line ? `/L${item.line}` : ''}:${JSON.stringify(item.text)}`
+  )).join(' | ');
+  console.warn(
+    `[CodexRollback] context=${context} session=${sid}` +
+    ` line=${line + 1} requested=${result.requestedTurns}` +
+    ` removedTurns=${removedTurns} removedEntries=${result.removedEntries}` +
+    ` before=${result.beforeCount} after=${result.afterCount}` +
+    (preview ? ` preview=${preview}` : ' preview=empty/no-op')
+  );
+}
+
+function lastCodexTimelineUser(entries) {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i]?.type === 'user') return entries[i];
+  }
+  return null;
 }
 
 function buildCodexTimeline(records, sessionId) {
   const entries = [];
   let currentUser = null;
+  let currentTurnIndex = -1;
   let latestModel = null;
   let latestEffort = null;
   let latestTokenCountInfo = null;
@@ -364,6 +418,7 @@ function buildCodexTimeline(records, sessionId) {
 
     if (record.type === 'event_msg') {
       if (payload.type === 'user_message') {
+        currentTurnIndex += 1;
         const text = payload.message || extractTextContent(payload.content) || '';
         const entry = {
           uuid: stableUuid(sessionId, record.__line, 'codex-user'),
@@ -372,14 +427,17 @@ function buildCodexTimeline(records, sessionId) {
           content: text,
           hasImage: Array.isArray(payload.images) ? payload.images.length > 0 : false,
           sessionId,
+          turnIndex: currentTurnIndex,
           responseModel: latestModel || undefined,
           responseEffort: latestEffort || undefined,
         };
         entries.push(entry);
         currentUser = entry;
       } else if (payload.type === 'thread_rolled_back') {
-        applyRollback(entries, Number(payload.num_turns || payload.turns || 1));
-        currentUser = entries.length > 0 ? entries[entries.length - 1] : null;
+        const rollback = applyRollback(entries, Number(payload.num_turns || payload.turns || 1));
+        logCodexRollback('timeline', sessionId, record, rollback);
+        currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
+        currentUser = lastCodexTimelineUser(entries);
       } else if (payload.type === 'token_count') {
         const info = payload.info || {};
         latestTokenCountInfo = info;
@@ -466,7 +524,8 @@ function buildCodexFullHistory(records, sessionId) {
           turnIndex: currentTurnIndex,
         });
       } else if (payload.type === 'thread_rolled_back') {
-        applyRollback(entries, Number(payload.num_turns || payload.turns || 1));
+        const rollback = applyRollback(entries, Number(payload.num_turns || payload.turns || 1));
+        logCodexRollback('full-history', sessionId, record, rollback);
         currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
       } else if (payload.type === 'token_count') {
         latestTokenCountInfo = payload.info || {};

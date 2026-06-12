@@ -98,6 +98,28 @@ const _effortInjectCalls = new Map<string, number>(); // [EffortDiag2026-05] inv
 const _effortSentForTab = new Map<string, { at: number; via: string; level: string }>();
 (window as any).__effortSentForTab = _effortSentForTab;
 
+// Same once-per-Claude-process guard for startup /model. It prevents the
+// Bridge:Fresh fallback from replaying the StatusBar default after tui-ready or
+// a manual ControlBar click already selected a model in this live process.
+const _modelSentForTab = new Map<string, { at: number; via: string; model: string }>();
+(window as any).__modelSentForTab = _modelSentForTab;
+
+const _claudeBridgeModelByTab = new Map<string, { model: string; at: number }>();
+
+function _bridgeModelMatchesTarget(targetModel: string, bridgeModel: string | null | undefined): boolean {
+  const target = String(targetModel || '').trim().toLowerCase();
+  const live = String(bridgeModel || '').trim().toLowerCase();
+  if (!target || target === 'none') return true;
+  if (!live || live === 'unknown') return false;
+  if (target === 'default') return live.includes('1m context');
+  if (target === 'opus' && live.includes('1m context')) return false;
+
+  const option = useUIStore.getState().claudeCodeSettings.models.find((m) => m.id.toLowerCase() === target);
+  const needles = [target, option?.label?.toLowerCase()]
+    .filter((v): v is string => !!v && v !== 'default');
+  return needles.some((needle) => live.includes(needle));
+}
+
 function _effortDiag(tabId: string, label: string, extra?: string) {
   const start = _effortDiagStart.get(tabId);
   if (start === undefined) return;
@@ -337,7 +359,7 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
     case 'codex-continue':
       if (pendingAction.sessionId) {
         getSetTabCommandType()(tabId, 'codex');
-        getSetCodexSessionId()(tabId, pendingAction.sessionId);
+        getSetCodexSessionId()(tabId, pendingAction.sessionId, 'userIntercept');
         console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex-c" }');
         ipcRenderer.send('codex:run-command', {
           tabId,
@@ -407,6 +429,33 @@ function getCurrentCommand(term: XTerminal): string {
 }
 
 const { ipcRenderer } = window.require('electron');
+
+function waitForClaudeStartupModelBridge(tabId: string, model: string, timeoutMs = 6000): Promise<string> {
+  const current = _claudeBridgeModelByTab.get(tabId);
+  if (current && _bridgeModelMatchesTarget(model, current.model)) {
+    return Promise.resolve('already:' + current.model);
+  }
+
+  return new Promise((resolve) => {
+    let done = false;
+    let timer: number | undefined;
+    const finish = (reason: string) => {
+      if (done) return;
+      done = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      ipcRenderer.removeListener('claude:bridge-update', handler);
+      resolve(reason);
+    };
+    const handler = (_: any, data: { tabId?: string; model?: string }) => {
+      if (data?.tabId !== tabId) return;
+      const liveModel = data.model || 'unknown';
+      _claudeBridgeModelByTab.set(tabId, { model: liveModel, at: Date.now() });
+      if (_bridgeModelMatchesTarget(model, liveModel)) finish('matched:' + liveModel);
+    };
+    timer = window.setTimeout(() => finish('timeout'), timeoutMs);
+    ipcRenderer.on('claude:bridge-update', handler);
+  });
+}
 
 const terminalWarmQueue = new Map<string, () => void>();
 let terminalWarmScheduled: any = null;
@@ -587,6 +636,14 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     }
     return false;
   });
+  const allowCodexProcessLookup = useWorkspaceStore((state) => {
+    for (const [, workspace] of state.openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (!tab) continue;
+      return tab.commandType === 'codex' || !!tab.codexSessionId;
+    }
+    return false;
+  });
   const [claudeProcessAlive, setClaudeProcessAlive] = useState(false);
   // Synchronous mirror for use inside the xterm key handler (which captures a
   // stale closure). Tells command-type auto-detection "a foreground program is
@@ -619,13 +676,20 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         // "claude process died, shell alive" signal. See
         // fact-claude-tui-control.md::Auto-inject /effort.
         _effortSentForTab.delete(tabId);
+        _modelSentForTab.delete(tabId);
+        _claudeBridgeModelByTab.delete(tabId);
         finalizeAiLaunchSnapshot(tabId);
       }
     };
     ipcRenderer.on('terminal:command-started', onStarted);
     ipcRenderer.on('terminal:command-finished', onFinished);
     // Initial sync — main keeps per-tab state we can poll once.
-    ipcRenderer.invoke('terminal:getCommandState', tabId).then((s: any) => {
+    ipcRenderer.invoke('terminal:getCommandState', {
+      tabId,
+      caller: 'Terminal.initialSync',
+      expectedProcess: 'codex',
+      allowProcessTreeLookup: allowCodexProcessLookup,
+    }).then((s: any) => {
       console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' initial-sync isRunning=' + !!s?.isRunning);
       if (s?.isRunning) { claudeProcessAliveRef.current = true; setClaudeProcessAlive(true); }
     }).catch(() => {});
@@ -633,7 +697,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       ipcRenderer.removeListener('terminal:command-started', onStarted);
       ipcRenderer.removeListener('terminal:command-finished', onFinished);
     };
-  }, [tabId]);
+  }, [tabId, allowCodexProcessLookup]);
 
   // Per-project currentView: find which project owns this tab and read its currentView
   const projectCurrentView = useWorkspaceStore((state) => {
@@ -861,7 +925,11 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       }
       // Reset the /effort once-per-process sentinel on PTY exit so the next
       // fresh Claude spawn in this tab starts clean.
-      if (exitedTabId === tabId) _effortSentForTab.delete(tabId);
+      if (exitedTabId === tabId) {
+        _effortSentForTab.delete(tabId);
+        _modelSentForTab.delete(tabId);
+        _claudeBridgeModelByTab.delete(tabId);
+      }
     };
 
     // Session Bridge: receive session ID from StatusLine bridge watcher.
@@ -921,19 +989,20 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
     // Fresh Claude process started for this tab (new PID seen in bridge cache).
     // Fires once per real spawn — unlike session-detected which re-syncs on every
-    // bridge update of the same session. Right place to auto-inject /effort.
+    // bridge update of the same session. Fallback path for startup defaults;
+    // tui-ready is the primary signal because it fires when the input prompt is
+    // actually ready.
     //
-    // Kill-switch policy:
-    // - effort === 'none' → do nothing (user opted out, both inject + cleanup skipped)
-    // - this is a --resume (pendingResume marker active) → do nothing
-    //     Reason: 2026-05-21 incident traced a race where inject fired in the
-    //     same ms as Bridge:Fresh during resume → safePasteAndSubmit's Ctrl+S
-    //     stash collided with our paste, 303 bytes of user buffer leaked into
-    //     Claude TUI input. Effort level is preserved in Claude TUI state
-    //     across resume anyway, so injecting on resume is both unnecessary
-    //     and dangerous. Only fire on truly fresh sessions (no --resume).
-    // - claude TUI is fresh start → inject `/effort N` + arm cleanup
-    const handleProcessStarted = (_: any, data: { tabId: string; sessionId: string; claudePid: number }) => {
+    // Startup-default policy:
+    // - default model !== 'none' → apply `/model N` before any `/effort`
+    // - effort === 'none' → skip only `/effort`
+    // - this is a --resume (pendingResume marker active) → do nothing on this
+    //     fallback path. 2026-05-21 incident traced a race where Bridge:Fresh
+    //     fired during resume handshake and safePasteAndSubmit's Ctrl+S stash
+    //     collided with old input. tui-ready applies defaults safely after the
+    //     prompt is rendered.
+    // - claude TUI is fresh start → inject `/model N` then `/effort N`
+    const handleProcessStarted = async (_: any, data: { tabId: string; sessionId: string; claudePid: number }) => {
       if (data.tabId !== tabId) return;
       // Note: NO sentinel reset here. tui-ready fires BEFORE Bridge:Fresh
       // (process-started), so resetting here would clobber the tui-ready
@@ -1001,20 +1070,51 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
       console.log('[Terminal:EffortInject] tab=' + tabId.slice(-12) + ' pid=' + data.claudePid + ' default=' + eff + ' isResume=' + isResume);
 
-      // Kill-switch: effort='none' fully disables both inject and the JSONL
-      // cleanup that follows. User chose to opt out of all our writes to the
-      // session transcript.
-      if (!eff || eff === 'none') {
-        _effortDiag(tabId, '⛔ INJECT SKIPPED', 'effort=none (kill-switch)');
-        console.log('[Terminal:EffortInject] tab=' + tabId.slice(-12) + ' SKIP — effort=none (JSONL editing fully off)');
+      // Resume guard for the Bridge:Fresh fallback only. This event can fire
+      // during the resume handshake; tui-ready fires after the prompt is drawn
+      // and applies startup defaults safely on resume.
+      if (isResume) {
+        _effortDiag(tabId, '⛔ STARTUP DEFAULTS SKIPPED', 'isResume=true on Bridge:Fresh fallback');
+        console.log('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' SKIP — resume in flight on Bridge:Fresh fallback');
         return;
       }
 
-      // Resume guard: skip inject + cleanup on --resume. Effort survives in
-      // Claude TUI memory across resumes; we have nothing to apply.
-      if (isResume) {
-        _effortDiag(tabId, '⛔ INJECT SKIPPED', 'isResume=true (resume-guard)');
-        console.log('[Terminal:EffortInject] tab=' + tabId.slice(-12) + ' SKIP — resume in flight (effort preserved by Claude TUI state)');
+      const tuiReadyModelOwner = _modelSentForTab.get(tabId);
+      if (tuiReadyModelOwner?.via === 'tui-ready' && !_effortSentForTab.has(tabId)) {
+        _effortDiag(tabId, '⛔ STARTUP DEFAULTS SKIPPED', 'tui-ready is sequencing /model before /effort');
+        console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' SKIP — tui-ready owns model→effort sequence');
+        return;
+      }
+
+      const model = useUIStore.getState().defaultClaudeModel;
+      if (model && model !== 'none') {
+        const modelSentinel = _modelSentForTab.get(tabId);
+        if (modelSentinel) {
+          _effortDiag(tabId, '⛔ MODEL SKIPPED', 'already sent via ' + modelSentinel.via + ' at +' + (Date.now() - modelSentinel.at) + 'ms');
+          console.warn('[Terminal:ModelInject] tab=' + tabId.slice(-12) + ' SKIP — already sent via ' + modelSentinel.via);
+        } else {
+          _modelSentForTab.set(tabId, { at: Date.now(), via: 'bridge-fresh', model });
+          _effortDiag(tabId, '🚀 MODEL FIRED', '/model ' + model + ' — sending before /effort');
+          console.warn('[Terminal:ModelInject] tab=' + tabId.slice(-12) + ' /model ' + model + ' (Bridge:Fresh fallback)');
+          try {
+            const result = await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model);
+            if (result?.success === false) throw new Error(result.error || 'send-command failed');
+            const bridgeWait = await waitForClaudeStartupModelBridge(tabId, model);
+            _effortDiag(tabId, '✅ MODEL COMPLETED', '/model ' + model + ' — bridgeWait=' + bridgeWait);
+            console.warn('[Terminal:ModelInject] tab=' + tabId.slice(-12) + ' /model ' + model + ' bridgeWait=' + bridgeWait);
+          } catch (e: unknown) {
+            _effortDiag(tabId, '❌ MODEL FAILED', String(e));
+            console.error('[Terminal:ModelInject] failed', e);
+            _modelSentForTab.delete(tabId);
+          }
+        }
+      }
+
+      // Kill-switch: effort='none' disables only /effort. It must not suppress
+      // /model, because model has its own independent StatusBar default.
+      if (!eff || eff === 'none') {
+        _effortDiag(tabId, '⛔ EFFORT SKIPPED', 'effort=none (kill-switch)');
+        console.log('[Terminal:EffortInject] tab=' + tabId.slice(-12) + ' SKIP — effort=none');
         return;
       }
 
@@ -1061,13 +1161,25 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     };
 
     // Early "Claude TUI ready" signal — fires the moment Claude renders ⏵ in
-    // the PTY stream, 2-6 seconds BEFORE Bridge:Fresh in prod logs. We send
-    // /effort here so the user doesn't sit at a ready prompt with no effort
-    // line for several seconds and then manually click — that race produced
-    // the duplicate /effort. The sentinel makes the later Bridge:Fresh path
-    // (handleProcessStarted) a no-op once this has fired.
-    const handleTuiReady = (_: any, data: { tabId: string; ts: number }) => {
+    // the PTY stream, 2-6 seconds BEFORE Bridge:Fresh in prod logs. Startup
+    // defaults are applied here in command order: /model first, then /effort.
+    // The sentinels make the later Bridge:Fresh path a no-op once this fires.
+    const handleTuiReady = async (_: any, data: { tabId: string; ts: number }) => {
       if (data.tabId !== tabId) return;
+      const model = useUIStore.getState().defaultClaudeModel;
+      if (model && model !== 'none' && !_modelSentForTab.has(tabId)) {
+        _modelSentForTab.set(tabId, { at: Date.now(), via: 'tui-ready', model });
+        console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /model ' + model + ' (early path, before /effort)');
+        try {
+          const result = await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model);
+          if (result?.success === false) throw new Error(result.error || 'send-command failed');
+          const bridgeWait = await waitForClaudeStartupModelBridge(tabId, model);
+          console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /model ' + model + ' bridgeWait=' + bridgeWait + ' — continuing to /effort');
+        } catch (e: unknown) {
+          console.error('[Terminal:TuiReady] model inject failed', e);
+          _modelSentForTab.delete(tabId); // allow Bridge:Fresh fallback to retry on fresh starts
+        }
+      }
       if (_effortSentForTab.has(tabId)) return; // already sent (manual click or earlier tui-ready)
       const eff = useUIStore.getState().defaultClaudeEffort;
       if (!eff || eff === 'none') return;
@@ -1101,6 +1213,11 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       if (!currentId) {
         getSetClaudeSessionId()(tabId, data.sessionId, 'bridge');
       }
+    };
+
+    const handleBridgeUpdate = (_: any, data: { tabId: string; model?: string }) => {
+      if (data.tabId !== tabId) return;
+      _claudeBridgeModelByTab.set(tabId, { model: data.model || 'unknown', at: Date.now() });
     };
 
     // Gemini Sniper Watcher: receive session ID when Gemini creates it
@@ -1151,6 +1268,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     ipcRenderer.on('claude:process-started', handleProcessStarted);
     ipcRenderer.on('claude:tui-ready', handleTuiReady);
     ipcRenderer.on('claude:status-session-detected', handleStatusSessionDetected);
+    ipcRenderer.on('claude:bridge-update', handleBridgeUpdate);
     ipcRenderer.on('gemini:session-detected', handleGeminiSessionDetected);
     ipcRenderer.on('codex:session-detected', handleCodexSessionDetected);
     ipcRenderer.on('claude-agent:status', handleClaudeAgentStatus);
@@ -1503,6 +1621,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Gemini сессия. Откройте новую вкладку для Claude."\r');
             return false;
           }
+          useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'claude');
 
           // Clear line, start watcher, then launch claude
           ipcRenderer.send('terminal:input', tabId, '\x15');
@@ -1596,6 +1715,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             return false;
           }
 
+          useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'claude');
           ipcRenderer.send('terminal:input', tabId, '\x15');
           console.log('[Claude Intercept] Launching Claude');
           ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
@@ -1648,6 +1768,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             return false;
           }
 
+          useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'codex');
           ipcRenderer.send('terminal:input', tabId, '\x15');
           ipcRenderer.send('codex:run-command', { tabId, command: 'codex', cwd });
           return false;
@@ -1664,7 +1785,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             return false;
           }
           ipcRenderer.send('terminal:input', tabId, '\x15');
-          getSetCodexSessionId()(tabId, resumeId);
+          getSetCodexSessionId()(tabId, resumeId, 'userIntercept');
           ipcRenderer.send('codex:run-command', { tabId, command: 'codex-c', sessionId: resumeId, cwd });
           return false;
         }
@@ -1818,6 +1939,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       ipcRenderer.removeListener('claude:process-started', handleProcessStarted);
       ipcRenderer.removeListener('claude:tui-ready', handleTuiReady);
       ipcRenderer.removeListener('claude:status-session-detected', handleStatusSessionDetected);
+      ipcRenderer.removeListener('claude:bridge-update', handleBridgeUpdate);
       ipcRenderer.removeListener('gemini:session-detected', handleGeminiSessionDetected);
       ipcRenderer.removeListener('codex:session-detected', handleCodexSessionDetected);
       ipcRenderer.removeListener('claude-agent:status', handleClaudeAgentStatus);
@@ -2158,6 +2280,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
               ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ В этой вкладке уже есть AI сессия. Откройте новую вкладку для Codex."\r');
               return false;
             }
+            useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'codex');
             ipcRenderer.send('terminal:input', tabId, '\x15');
             const cwd2 = getTabCwd(tabId);
             ipcRenderer.send('codex:run-command', { tabId, command: 'codex', cwd: cwd2 });
@@ -2175,7 +2298,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
               return false;
             }
             ipcRenderer.send('terminal:input', tabId, '\x15');
-            getSetCodexSessionId()(tabId, resumeId);
+            getSetCodexSessionId()(tabId, resumeId, 'userIntercept');
             const cwd2 = getTabCwd(tabId);
             ipcRenderer.send('codex:run-command', { tabId, command: 'codex-c', sessionId: resumeId, cwd: cwd2 });
             return false;
@@ -2229,6 +2352,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
               return false;
             }
 
+            useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'claude');
             ipcRenderer.send('terminal:input', tabId, '\x15');
             console.log('[Claude Intercept] Launching Claude');
             ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
@@ -2317,6 +2441,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
               return false;
             }
 
+            useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'claude');
             ipcRenderer.send('terminal:input', tabId, '\x15');
             console.log('[Claude Intercept] Launching Claude');
             ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });

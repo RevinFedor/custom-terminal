@@ -37,6 +37,10 @@ Anthropic знает о проблеме (issues открыты 5+ месяце�
 
 В renderer летит IPC `jsonl-auto-repair:summary` → info-toast «Auto-repair при старте: починили N orphan parentUuid в M сессиях» (только если `sessionsFixed > 0`).
 
+**Performance boundary 2026-06-12:** AutoRepair сам стал источником startup-freeze: широкий 14-day sweep перечитывал ~1500 JSONL на каждом boot, а один проход дал `[Perf:MainLoopGap] gapMs=7045 heapMb≈975`. Поэтому boot sweep теперь incremental: после успешного DONE пишет `app_state::jsonl_auto_repair_last_sweep`, следующий запуск сканирует только файлы с `mtime >= lastSweepStart`. Если sweep прервался до DONE, watermark не двигается и следующий boot безопасно возвращается к широкому окну.
+
+Каждый файл ремонта обёрнут в perfOp `autoRepairFile`, slow files логируются как `[Startup:AutoRepair] SLOW-FILE session=... sizeMb=... durMs=... heapMb=...`, а между файлами есть `setImmediate` yield. Это не делает parse большого файла бесплатным, но разбивает один многосекундный starvation-turn на отдельные блоки и даёт `[Perf:MainLoopGap]` назвать конкретную сессию. Не возвращать “один большой синхронный sweep” ради простоты — это снова создаст boot black-screen/beachball класс.
+
 **Пример работы (2026-05-23 12:38:27).** После `build:install` рестарта (sessions с накопленными phantom'ами от EffortCleanup race — см. источник #4 выше) Startup:AutoRepair прошёл по 1421 JSONL, нашёл 4 сессии с orphan'ами и переписал их за 5 секунд:
 
 ```

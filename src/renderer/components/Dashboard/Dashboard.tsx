@@ -90,19 +90,26 @@ export default function Dashboard() {
 
   // OSC 133 Event-driven process status
   useEffect(() => {
-    const allTabIds: string[] = [];
+    const allTabs: Array<{ tabId: string; commandType?: string }> = [];
     for (const [, workspace] of openProjects) {
-      allTabIds.push(...workspace.tabs.keys());
+      workspace.tabs.forEach((tab: any, tabId) => {
+        allTabs.push({ tabId, commandType: tab?.commandType });
+      });
     }
 
-    if (allTabIds.length === 0) return;
+    if (allTabs.length === 0) return;
 
     const initStatus = async () => {
       const newStatus = new Map<string, boolean>();
       await Promise.all(
-        allTabIds.map(async (tabId) => {
+        allTabs.map(async ({ tabId, commandType }) => {
           try {
-            const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+            const state = await ipcRenderer.invoke('terminal:getCommandState', {
+              tabId,
+              caller: 'Dashboard.statusInit',
+              expectedProcess: 'codex',
+              allowProcessTreeLookup: commandType === 'codex',
+            });
             newStatus.set(tabId, state.isRunning);
           } catch {
             newStatus.set(tabId, false);

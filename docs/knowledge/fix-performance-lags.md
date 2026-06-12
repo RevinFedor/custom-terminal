@@ -59,6 +59,65 @@ Close-path разделён на быстрый и фоновый слои:
 
 ---
 
+## 1c. Freeze при открытии Home: `search:stats` сканировал embeddings
+
+### Симптомы
+- Пользователь нажимает Home и может даже не кликать обратно: hover на табах/карточках перестаёт реагировать на 2-4 секунды, macOS показывает системный beachball.
+- После первого зависания повторные переходы Home → tab иногда становятся быстрее, что создаёт ложное ощущение “прогрелся Home render”.
+- Tab switch handler сам по себе быстрый: когда click наконец доставлен, `[Perf:TabSwitch]` и `Frame2` укладываются в десятки миллисекунд. Задержка происходит **до** handler'а или в main-process IPC рядом с Home mount.
+
+### Доказательство из логов
+
+Ключевая сигнатура в production 2026-06-12:
+```text
+[Watchdog] STALL proc=main silentMs=514
+[Watchdog] SAMPLING proc=main silentMs=1019
+[Perf:IpcSlow] channel=search:stats durMs=4101.6
+[Perf:MainLoopGap] gapMs=4200.0 ... ipcAgg5s=search:stats:n=1:sum=4102:max=4102
+```
+
+Рядом с этим `ProjectHome.statusSync` и `project:get-tab-history` уже завершились быстро, а `search:stats` закончил ровно в конце main-loop gap. Это важно: до универсальной IPC-обвязки такой freeze выглядел как `activeOps=0`, и подозрение уходило в Timeline, Home render или системную нагрузку.
+
+### Корневая причина
+
+`SemanticSearchSection` монтируется внутри Project Home и сразу вызывает `search:stats`. В `getIndexStats()` один из запросов был:
+```sql
+SELECT COUNT(*) FROM session_chunks WHERE embedding IS NOT NULL
+```
+
+На реальной dev DB было ~87K `session_chunks`, ~19K embeddings и план:
+```text
+SCAN session_chunks
+```
+
+`better-sqlite3` выполняет этот `COUNT` синхронно в main process. Даже если renderer выглядит “просто ждёт Home”, на самом деле весь Electron main-loop стоит внутри SQLite full-scan по BLOB-heavy таблице.
+
+### Исправление
+
+Добавлен partial index:
+```sql
+CREATE INDEX IF NOT EXISTS idx_chunks_embedding_present
+ON session_chunks(id)
+WHERE embedding IS NOT NULL;
+```
+
+После создания индекс меняет план на `SCAN session_chunks USING INDEX idx_chunks_embedding_present`, и `search:stats` перестаёт попадать в slow IPC / MainLoopGap при обычном Home mount. Не удалять этот индекс как “избыточный”: он не про search ranking, а про отзывчивость Home.
+
+### Диагностика регрессии
+
+Если снова появляется “Home открылся, но hover/клики умерли”, проверка первая:
+```bash
+grep -E "search:stats|Perf:MainLoopGap|Watchdog|HomeCommit|HomeStatusSync" \
+  ~/Library/Logs/noted-terminal/production.log | tail -80
+
+sqlite3 "$HOME/Library/Application Support/noted-terminal/noted-terminal-dev.db" \
+  "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM session_chunks WHERE embedding IS NOT NULL;"
+```
+
+Если план снова `SCAN session_chunks`, root cause найден. Если `search:stats` быстрый, не обвинять Semantic Search по инерции — дальше смотреть `ipcAgg5s`, `recentOps5s`, renderer long tasks и watchdog sample.
+
+---
+
 ## 2. Проблема: Render Storm (Zustand Map Trap)
 
 ### Суть
@@ -247,6 +306,14 @@ parts.push(`${tab.id}:${tab.tabType || 'terminal'}`);
 
 После рефакторинга 2026-04-21 в коде расставлены лог-теги, которые **не должны** появляться часто в нормальной работе. Каждый из них — сигнал конкретной регрессии.
 
+Для freeze-разборов логи разных процессов должны сравниваться по абсолютным timestamp'ам, а не по локальному `performance.now()`: renderer пишет `performance.timeOrigin + now`, main — `nodePerformance.timeOrigin + now`. Если пользователь говорит «кликнул и 5 секунд ничего», сначала выровняй `[Perf:InputDelayContext]`, `[Perf:ProjectView/HomeAction]`, `[Perf:TabSwitchFrame2]`, `[Perf:MainLoopGap]` и `[RestoreSession]` по `*Abs` полям. Без этой корреляции легко перепутать позднюю доставку input event, React render freeze, main-process блокировку и обычный долгий IPC.
+
+Для beachball/freeze недостаточно только in-process probe'ов: `[Perf:MainLoopGap]` и renderer EventTiming логируются **после** того как loop разморозился. Поэтому внешний `perf-watchdog.js` работает отдельным plain-node процессом: main шлёт heartbeat по fork IPC, renderer — напрямую в unix socket, чтобы замёрзший main не мог имитировать renderer-stall. При пропаже heartbeat watchdog пишет `[Watchdog] STALL`, а на macOS запускает `/usr/bin/sample <pid>` во время зависания. Это единственный слой, который ловит stack “в момент beachball”, а не реконструирует его постфактум.
+
+`activeOps=0` в `[Perf:MainLoopGap]` больше не означает “ничего не работало”. Смотри рядом `recentOps5s=` и `ipcAgg5s=`: sync IPC может закончиться в тот же тик, когда gap-таймер наконец получил управление, поэтому активных операций уже нет, но агрегат показывает виновный канал (`search:stats:n=1:sum=4102:max=4102`). Для per-keystroke каналов (`terminal:input`, `log:renderer`, `terminal:resize`) подробный recent-ring намеренно не заполняется, иначе они вытесняют редкие тяжёлые операции; их видно через aggregate.
+
+Тестовые логи из CDP/harness проверяй на `document.visibilityState`. Если окно hidden, Chromium может throttle'ить renderer так, что synthetic hover/input выглядит как многосекундная задержка без реального foreground freeze. Для пользовательского Home-lag доказательны только срезы где visibility `visible` или есть внешний watchdog stall main/renderer.
+
 | Тег | Норма | Регрессия |
 |---|---|---|
 | `[Perf:ProjectSwitch] durMs=N` | <50ms | >200ms = что-то синхронно блокирует main thread |
@@ -263,6 +330,11 @@ parts.push(`${tab.id}:${tab.tabType || 'terminal'}`);
 | `[Perf:HomeStatusSync]` | item <50ms, done быстро | `terminal:getCommandState` / Codex ps fallback тормозит Active-card status |
 | `[Perf:GetCommandState]` + `[Perf:ProcessTreeLookup]` | редко >50ms | shell OSC state missing → fallback `ps -eo pid,ppid,command` дорогой или часто вызывается |
 | `[Perf:TimelineLoad]` + `[Perf:TimelineIPC]` | poll не мешает interaction | Timeline reload/backtrace/filter/latest ест кадры; сравни renderer durMs и main breakdown |
+| `[Perf:MainLoopGap] expectedAbs=... firedAbs=... recentOps5s=... ipcAgg5s=...` | не появляется | main event-loop реально не получил tick; `recentOps5s` и `ipcAgg5s` показывают IPC/DB/restore операции перед дырой |
+| `[Watchdog] STALL/SAMPLING/SAMPLE-DONE` | не появляется при foreground idle | внешний процесс не получил heartbeat; если есть `SAMPLE-DONE`, открывай sample file и сверяй с `MainLoopGap` |
+| `[Perf:InputDelayContext] inputDelayMs=N eventTimeAbs=...` | не появляется или <120ms | браузер получил пользовательский input поздно; сравни соседние RAF/timer samples — если там нет gap, ищи delivery/focus/OS-слой, а не React handler |
+| `[RestoreSession] ... restoreId=...` | один связный набор на cold restore | пропали/задержались табы при restore; `liveMapPatched=true` означает что captured `openProjects` Map устарел и был заменён live-state перед commit |
+| `[DB] saveTabs: WARNING ... incoming=[...] dbOnly=[...]` | не появляется | in-memory workspace меньше SQLite; `dbOnly` строки нельзя чистить без intentional `forceCleanup`, сначала расследуй restore/store race |
 
 ### Команды для быстрой диагностики
 ```bash
@@ -278,6 +350,10 @@ grep "DB:ForkCache" ~/Library/Logs/noted-terminal/production.log | tail -3
 
 # Home/Timeline freeze: где стоит время?
 grep -E "Perf:(Home|ProjectView|TabSwitch|GetCommandState|ProcessTreeLookup|Timeline|EventLoopLag|Input|MainLoop)" \
+  ~/Library/Logs/noted-terminal/production.log | tail -80
+
+# Home + Semantic Search freeze: stats full-scan?
+grep -E "search:stats|Watchdog|Perf:MainLoopGap|HomeCommit|HomeStatusSync" \
   ~/Library/Logs/noted-terminal/production.log | tail -80
 ```
 

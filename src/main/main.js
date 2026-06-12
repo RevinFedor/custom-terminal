@@ -96,12 +96,14 @@ const isDev = !app.isPackaged;
 // ========== PRODUCTION FILE LOGGER ==========
 // Intercepts console.log/error/warn → writes tagged messages to file
 // Deduplicates consecutive identical messages (counter instead of spam)
+let mainLogPath = null; // absolute path to dev.log/production.log — perf-watchdog appends here
 {
   const LOG_DIR = isDev
     ? path.join(__dirname, '..', '..', 'logs')
     : path.join(app.getPath('logs'));
   try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch {}
   const LOG_PATH = path.join(LOG_DIR, isDev ? 'dev.log' : 'production.log');
+  mainLogPath = LOG_PATH;
   // No size limit — logs can grow large during active sessions. Rotate only by age (7 days).
   const TAG_RE = /^\[/; // Only log messages starting with [Tag]
 
@@ -192,6 +194,7 @@ const isDev = !app.isPackaged;
 
 const perfActiveOps = global.__notedPerfOps || new Map();
 global.__notedPerfOps = perfActiveOps;
+const perfRecentOps = [];
 let perfOpSeq = global.__notedPerfOpSeq || 0;
 function beginPerfOp(kind, detail = {}) {
   const id = kind + '-' + (++perfOpSeq);
@@ -207,8 +210,153 @@ function beginPerfOp(kind, detail = {}) {
 }
 function endPerfOp(id) {
   if (!id) return;
+  const op = perfActiveOps.get(id);
+  if (op) {
+    const endAbs = nodePerformance.timeOrigin + nodePerformance.now();
+    perfRecentOps.push({
+      id: op.id,
+      kind: op.kind,
+      detail: op.detail || {},
+      startAbs: op.startAbs,
+      endAbs,
+      durMs: nodePerformance.now() - op.startMs
+    });
+    if (perfRecentOps.length > 80) perfRecentOps.splice(0, perfRecentOps.length - 80);
+  }
   perfActiveOps.delete(id);
 }
+
+// ========== UNIVERSAL IPC PERF WRAPPER ==========
+// Closes the `activeOps=0` attribution hole: every ipcMain.handle/on callback
+// (registered from ANY module — main.js, ipc/*.js, claude-manager) is wrapped
+// in a perfOp for its SYNC portion and, for handle(), the async tail too.
+// When [Perf:MainLoopGap] fires, the blocking handler is now either visible in
+// `ops=` (still running) or `recentOps5s=` (just finished) with its channel
+// name and rid instead of an empty list.
+//
+// Design constraints honoured:
+//  - monkey-patch at module top BEFORE any registration (this file registers
+//    handlers at require-time below; ipc/*.js register() runs later) — so the
+//    patch sees 100% of registrations without touching 159 call sites.
+//  - `terminal:input` / `log:renderer` / `terminal:resize` fire per-keystroke;
+//    recording each into perfRecentOps would evict meaningful ops out of the
+//    80-slot ring. They get activeOps visibility only (recordRecent=false)
+//    plus a 5s aggregate counter logged by the gap probe (ipcAgg5s).
+//  - duplicate-handle protection preserved: Electron's own throw on second
+//    handle() must still propagate (see CLAUDE.md anti-pattern).
+const PERF_IPC_NO_RECENT = new Set(['terminal:input', 'log:renderer', 'terminal:resize']);
+const PERF_IPC_AGG_WINDOW_MS = 5000;
+const perfIpcAgg = new Map(); // channel -> { count, totalMs, maxMs, sinceAbs, lastAbs }
+function _perfIpcAggAdd(channel, durMs) {
+  const nowAbs = nodePerformance.timeOrigin + nodePerformance.now();
+  let agg = perfIpcAgg.get(channel);
+  if (!agg || nowAbs - agg.sinceAbs > PERF_IPC_AGG_WINDOW_MS) {
+    agg = { count: 0, totalMs: 0, maxMs: 0, sinceAbs: nowAbs, lastAbs: nowAbs };
+    perfIpcAgg.set(channel, agg);
+  }
+  agg.count++;
+  agg.totalMs += durMs;
+  agg.lastAbs = nowAbs;
+  if (durMs > agg.maxMs) agg.maxMs = durMs;
+}
+function summarizeIpcAgg(windowMs = PERF_IPC_AGG_WINDOW_MS) {
+  const nowAbs = nodePerformance.timeOrigin + nodePerformance.now();
+  const rows = [];
+  for (const [channel, agg] of perfIpcAgg) {
+    if (nowAbs - agg.lastAbs > windowMs * 2) { perfIpcAgg.delete(channel); continue; }
+    if (nowAbs - agg.lastAbs > windowMs) continue;
+    rows.push({ channel, agg });
+  }
+  rows.sort((a, b) => b.agg.totalMs - a.agg.totalMs);
+  return rows
+    .slice(0, 10)
+    .map(({ channel, agg }) => channel + ':n=' + agg.count + ':sum=' + agg.totalMs.toFixed(0) + ':max=' + agg.maxMs.toFixed(0))
+    .join('|');
+}
+function endPerfOpQuiet(id) {
+  if (!id) return;
+  perfActiveOps.delete(id);
+}
+{
+  const RID_KEY = '__perfRid'; // renderer may stamp a request id into the first object arg
+  const wrapIpcCallback = (channel, listener, isHandle) => {
+    return function perfWrappedIpc(event, ...args) {
+      const noRecent = PERF_IPC_NO_RECENT.has(channel);
+      const firstArg = args[0];
+      const rid = firstArg && typeof firstArg === 'object' && typeof firstArg[RID_KEY] === 'string'
+        ? firstArg[RID_KEY]
+        : undefined;
+      const detail = { source: 'ipc' };
+      if (firstArg && typeof firstArg === 'object') {
+        if (typeof firstArg.tabId === 'string') detail.tabId = firstArg.tabId;
+        if (typeof firstArg.sessionId === 'string') detail.sessionId = firstArg.sessionId;
+        if (typeof firstArg.caller === 'string') detail.source = firstArg.caller;
+        if (typeof firstArg.source === 'string') detail.source = firstArg.source;
+        if (typeof firstArg.reason === 'string') detail.reason = firstArg.reason;
+      } else if (typeof firstArg === 'string' && firstArg.length < 120) {
+        detail.tabId = firstArg; // common (event, tabId) signature
+      }
+      if (rid && !detail.reason) detail.reason = rid;
+      const startMs = nodePerformance.now();
+      const opId = beginPerfOp('ipc:' + channel, detail);
+      const finish = () => {
+        const durMs = nodePerformance.now() - startMs;
+        _perfIpcAggAdd(channel, durMs);
+        if (noRecent) endPerfOpQuiet(opId); else endPerfOp(opId);
+        if (durMs > 250) {
+          console.warn(
+            '[Perf:IpcSlow] channel=' + channel +
+            ' durMs=' + durMs.toFixed(1) +
+            ' endAbs=' + (nodePerformance.timeOrigin + nodePerformance.now()).toFixed(1) +
+            (detail.tabId ? ' tab=' + String(detail.tabId).slice(-8) : '') +
+            (detail.source !== 'ipc' ? ' src=' + detail.source : '') +
+            (rid ? ' rid=' + rid : '')
+          );
+        }
+      };
+      let result;
+      try {
+        result = listener.call(this, event, ...args);
+      } catch (err) {
+        finish();
+        throw err;
+      }
+      if (result && typeof result.then === 'function') {
+        // Track the async tail too (handle AND async on-handlers like
+        // terminal:input) — a handler awaiting a long fs/ps call shows up in
+        // activeOps for its full duration, not just the sync prologue. A stuck
+        // op (promise never settles) keeps showing in `ops=` with growing age,
+        // which is itself the diagnostic.
+        return result.then(
+          (v) => { finish(); return v; },
+          (e) => { finish(); throw e; }
+        );
+      }
+      finish();
+      return result;
+    };
+  };
+  const _origHandle = ipcMain.handle.bind(ipcMain);
+  ipcMain.handle = (channel, listener) => _origHandle(channel, wrapIpcCallback(channel, listener, true));
+  const _origOn = ipcMain.on.bind(ipcMain);
+  ipcMain.on = (channel, listener) => {
+    const wrapped = wrapIpcCallback(channel, listener, false);
+    // removeListener(channel, originalFn) must keep working (terminal:create's
+    // prompt-ready-internal dance removes by original reference).
+    wrapped.__perfOrigListener = listener;
+    return _origOn(channel, wrapped);
+  };
+  const _origRemoveListener = ipcMain.removeListener.bind(ipcMain);
+  ipcMain.removeListener = (channel, listener) => {
+    for (const l of ipcMain.listeners(channel)) {
+      if (l === listener || l.__perfOrigListener === listener) {
+        return _origRemoveListener(channel, l);
+      }
+    }
+    return _origRemoveListener(channel, listener);
+  };
+}
+// ========== END UNIVERSAL IPC PERF WRAPPER ==========
 function summarizePerfOps() {
   const now = nodePerformance.now();
   return Array.from(perfActiveOps.values())
@@ -224,19 +372,51 @@ function summarizePerfOps() {
     })
     .join('|');
 }
+function summarizeRecentPerfOps(windowMs = 3000) {
+  const nowAbs = nodePerformance.timeOrigin + nodePerformance.now();
+  return perfRecentOps
+    .filter((op) => nowAbs - op.endAbs <= windowMs)
+    .slice(-12)
+    .map((op) => {
+      const detail = op.detail || {};
+      return op.id + ':' + op.kind +
+        ':endedAgo=' + (nowAbs - op.endAbs).toFixed(0) +
+        ':dur=' + op.durMs.toFixed(0) +
+        (detail.tabId ? ':tab=' + String(detail.tabId).slice(-8) : '') +
+        (detail.sessionId ? ':sid=' + String(detail.sessionId).substring(0, 8) : '') +
+        (detail.source ? ':src=' + detail.source : '') +
+        (detail.reason ? ':reason=' + detail.reason : '');
+    })
+    .join('|');
+}
+function perfFreezeSeverity(ms) {
+  if (ms >= 2000) return 'critical';
+  if (ms >= 1000) return 'major';
+  if (ms >= 500) return 'noticeable';
+  return 'minor';
+}
 
-if (isDev && process.env.NOTED_PERF_LOOP_MONITOR !== '0') {
+if (process.env.NOTED_PERF_LOOP_MONITOR !== '0') {
   try {
+    console.log(
+      '[Perf:MainLoopProbe] installed isDev=' + (isDev ? '1' : '0') +
+      ' intervalMs=100 thresholdMs=250'
+    );
     const mainLoopDelay = monitorEventLoopDelay({ resolution: 20 });
     mainLoopDelay.enable();
     let lastElu = nodePerformance.eventLoopUtilization();
+    let lastCpu = process.cpuUsage();
     const timer = setInterval(() => {
       const delta = nodePerformance.eventLoopUtilization(lastElu);
       lastElu = nodePerformance.eventLoopUtilization();
+      const cpuDelta = process.cpuUsage(lastCpu);
+      lastCpu = process.cpuUsage();
       const maxMs = mainLoopDelay.max / 1e6;
       const meanMs = mainLoopDelay.mean / 1e6;
+      const recentOps = summarizeRecentPerfOps(5000);
       if (maxMs > 120 || delta.utilization > 0.85) {
         const mem = process.memoryUsage();
+        const ipcAgg = summarizeIpcAgg(5000);
         console.log(
           '[Perf:MainLoop] maxMs=' + maxMs.toFixed(1) +
           ' meanMs=' + meanMs.toFixed(1) +
@@ -244,6 +424,10 @@ if (isDev && process.env.NOTED_PERF_LOOP_MONITOR !== '0') {
           ' sampleEndAbs=' + (nodePerformance.timeOrigin + nodePerformance.now()).toFixed(1) +
           ' activeOps=' + perfActiveOps.size +
           (perfActiveOps.size ? ' ops=' + summarizePerfOps() : '') +
+          (recentOps ? ' recentOps5s=' + recentOps : '') +
+          (ipcAgg ? ' ipcAgg5s=' + ipcAgg : '') +
+          ' cpuUserMs=' + (cpuDelta.user / 1000).toFixed(1) +
+          ' cpuSystemMs=' + (cpuDelta.system / 1000).toFixed(1) +
           ' rssMb=' + Math.round(mem.rss / 1024 / 1024) +
           ' heapMb=' + Math.round(mem.heapUsed / 1024 / 1024)
         );
@@ -251,10 +435,119 @@ if (isDev && process.env.NOTED_PERF_LOOP_MONITOR !== '0') {
       mainLoopDelay.reset();
     }, 1000);
     if (typeof timer.unref === 'function') timer.unref();
+
+    const gapIntervalMs = 100;
+    let lastGapTickAbs = nodePerformance.timeOrigin + nodePerformance.now();
+    let lastGapCpu = process.cpuUsage();
+    const gapTimer = setInterval(() => {
+      const firedAbs = nodePerformance.timeOrigin + nodePerformance.now();
+      const gapMs = firedAbs - lastGapTickAbs;
+      const cpuDelta = process.cpuUsage(lastGapCpu);
+      const recentOps = summarizeRecentPerfOps(5000);
+      if (gapMs > 250) {
+        const mem = process.memoryUsage();
+        const ipcAgg = summarizeIpcAgg(5000);
+        console.warn(
+          '[Perf:MainLoopGap]' +
+          ' expectedAbs=' + (lastGapTickAbs + gapIntervalMs).toFixed(1) +
+          ' firedAbs=' + firedAbs.toFixed(1) +
+          ' gapMs=' + gapMs.toFixed(1) +
+          ' activeOps=' + perfActiveOps.size +
+          (perfActiveOps.size ? ' ops=' + summarizePerfOps() : '') +
+          (recentOps ? ' recentOps5s=' + recentOps : '') +
+          (ipcAgg ? ' ipcAgg5s=' + ipcAgg : '') +
+          ' cpuUserMs=' + (cpuDelta.user / 1000).toFixed(1) +
+          ' cpuSystemMs=' + (cpuDelta.system / 1000).toFixed(1) +
+          ' rssMb=' + Math.round(mem.rss / 1024 / 1024) +
+          ' heapMb=' + Math.round(mem.heapUsed / 1024 / 1024)
+        );
+        if (gapMs >= 500) {
+          console.warn(
+            '[Perf:FreezeSummary]' +
+            ' layer=main' +
+            ' kind=eventLoopGap' +
+            ' severity=' + perfFreezeSeverity(gapMs) +
+            ' expectedAbs=' + (lastGapTickAbs + gapIntervalMs).toFixed(1) +
+            ' firedAbs=' + firedAbs.toFixed(1) +
+            ' gapMs=' + gapMs.toFixed(1) +
+            ' activeOps=' + perfActiveOps.size +
+            (perfActiveOps.size ? ' ops=' + summarizePerfOps() : '') +
+            (recentOps ? ' recentOps5s=' + recentOps : '') +
+            (ipcAgg ? ' ipcAgg5s=' + ipcAgg : '') +
+            ' cpuUserMs=' + (cpuDelta.user / 1000).toFixed(1) +
+            ' cpuSystemMs=' + (cpuDelta.system / 1000).toFixed(1) +
+            ' rssMb=' + Math.round(mem.rss / 1024 / 1024) +
+            ' heapMb=' + Math.round(mem.heapUsed / 1024 / 1024)
+          );
+        }
+      }
+      lastGapTickAbs = firedAbs;
+      lastGapCpu = process.cpuUsage();
+    }, gapIntervalMs);
+    if (typeof gapTimer.unref === 'function') gapTimer.unref();
   } catch (err) {
     console.warn('[Perf:MainLoop] monitor-failed ' + (err?.message || String(err)));
   }
 }
+
+// ========== EXTERNAL FREEZE WATCHDOG ==========
+// Forked plain-node process (src/main/perf-watchdog.js) with its OWN event
+// loop. In-process probes ([Perf:MainLoopGap], renderer EventTiming) are
+// themselves frozen during the freeze they should attribute — gap logs always
+// arrive AFTER the stall with activeOps=0. The watchdog observes heartbeat
+// silence in real time and runs macOS `sample <pid>` DURING the stall, giving
+// the native stack of whatever blocked main/renderer. Logs land in the same
+// dev.log/production.log as [Watchdog] STALL/SAMPLING/SAMPLE-DONE/RESUMED.
+let perfWatchdog = null;
+let perfWatchdogSocketPath = null;
+if (process.env.NOTED_PERF_WATCHDOG !== '0' && process.env.NOTED_E2E_TEST !== 'true') {
+  try {
+    const { fork } = require('child_process');
+    perfWatchdogSocketPath = path.join(os.tmpdir(), 'noted-perf-wd-' + process.pid + '.sock');
+    const watchdogScript = path.join(srcMainDir, 'perf-watchdog.js');
+    perfWatchdog = fork(watchdogScript, [String(process.pid), mainLogPath || '', perfWatchdogSocketPath], {
+      // ELECTRON_RUN_AS_NODE: fork() from Electron-main spawns the Electron
+      // binary; this env makes it behave as plain node (no app instance, no
+      // Dock icon). stdio ignored — the watchdog appends to the log file itself.
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      stdio: 'ignore',
+      detached: false,
+    });
+    perfWatchdog.on('error', (e) => {
+      console.warn('[Watchdog] fork error: ' + e.message);
+      perfWatchdog = null;
+    });
+    perfWatchdog.on('exit', (code, signal) => {
+      console.log('[Watchdog] child exited code=' + code + ' signal=' + (signal || 'none'));
+      perfWatchdog = null;
+    });
+    const hbTimer = setInterval(() => {
+      if (!perfWatchdog || !perfWatchdog.connected) return;
+      try {
+        perfWatchdog.send({
+          t: 'hb',
+          proc: 'main',
+          sentAbs: nodePerformance.timeOrigin + nodePerformance.now(),
+          // Snapshot of in-flight ops rides along: when the NEXT heartbeat never
+          // arrives, the watchdog logs THIS list as lastActiveOps — the op that
+          // was running when the loop froze, captured before the freeze.
+          ops: perfActiveOps.size ? summarizePerfOps() : '',
+        });
+      } catch { /* channel raced shutdown */ }
+    }, 250);
+    if (typeof hbTimer.unref === 'function') hbTimer.unref();
+    console.log('[Watchdog] forked pid=' + perfWatchdog.pid + ' sock=' + perfWatchdogSocketPath);
+  } catch (err) {
+    console.warn('[Watchdog] launch failed: ' + (err?.message || String(err)));
+    perfWatchdog = null;
+  }
+}
+// Renderer needs the socket path to send heartbeats DIRECTLY to the watchdog
+// (routing via main would fake renderer stalls whenever main is frozen).
+ipcMain.handle('perf:watchdog-info', () => ({
+  socketPath: perfWatchdog ? perfWatchdogSocketPath : null,
+}));
+// ========== END EXTERNAL FREEZE WATCHDOG ==========
 
 // ⚡ КРИТИЧЕСКИ ВАЖНО: Устанавливаем activation policy ДО app.whenReady()
 // Это обходит защиту macOS Sequoia/Tahoe от "focus stealing" для дочерних процессов
@@ -266,6 +559,10 @@ if (process.platform === 'darwin') {
 let mainWindow;
 const terminals = new Map(); // tabId -> ptyProcess
 const terminalProjects = new Map(); // tabId -> cwd path
+const PROCESS_TREE_SNAPSHOT_TTL_MS = 750;
+let processTreeSnapshotCache = null;
+let processTreeSnapshotInflight = null;
+let processTreeSnapshotWaiters = 0;
 const terminalProjectIds = new Map(); // tabId -> projectId (authoritative parent project for MCP routing)
 const terminalCommandState = new Map(); // tabId -> { isRunning: boolean, lastExitCode: number }
 const codexFinishDebounceTimers = new Map(); // tabId -> timeout; suppress shell D→B blips inside Codex TUI
@@ -278,10 +575,16 @@ const claudeState = new Map(); // tabId -> state string | null
 const claudePendingPrompt = new Map(); // tabId -> prompt string
 const claudeDebounceTimers = new Map(); // tabId -> debounce timer ID
 const claudeCtrlCDangerZone = new Map(); // tabId -> { resolve, promise, timer } (event-driven clear on prompt return)
-const claudeEffortDialogCooldown = new Map(); // tabId -> lastFireTs (ms). Prevents double-Enter on echo re-render.
+const claudeConfirmDialogCooldown = new Map(); // `${tabId}:${dialogType}` -> lastFireTs (ms). Prevents double-Enter on echo re-render.
 let sessionManager; // Initialized after projectManager is ready
 let claudeManager; // Initialized with terminals map
 const claudeAgentManager = new ClaudeAgentManager();
+
+function clearClaudeConfirmDialogCooldown(tabId) {
+  for (const key of claudeConfirmDialogCooldown.keys()) {
+    if (key.startsWith(tabId + ':')) claudeConfirmDialogCooldown.delete(key);
+  }
+}
 const claudeAgentBuffer = new Map(); // tabId -> stripped text buffer for :::claude::: detection
 const claudeAgentCooldown = new Map(); // tabId -> timestamp (ms) — ignore detections until cooldown expires
 const claudeAgentArmed = new Map();   // tabId -> boolean — only detect after first user input (prevents restore replay)
@@ -4131,7 +4434,7 @@ function startMcpHttpServer() {
             return;
           }
 
-          console.log('[MCP:HTTP] POST /update-docs taskIds=' + taskIds.length + ' provider=' + (provider || 'claude') + ' ppid=' + ppid);
+          console.log('[MCP:HTTP] POST /update-docs taskIds=' + taskIds.length + ' provider=' + (provider || 'gemini') + ' ppid=' + ppid);
 
           const docsModule = require(path.join(srcMainDir, 'ipc', 'docs'));
 
@@ -6600,7 +6903,39 @@ app.whenReady().then(() => {
       if (!fs.existsSync(projectsRoot)) return;
       const projects = fs.readdirSync(projectsRoot);
       let scanned = 0, repaired = 0, sessionsFixed = 0;
-      const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000; // 14 days
+      let cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000; // 14 days
+      // Incremental sweep: a dangling parentUuid lives INSIDE the file, so a
+      // file untouched since the last COMPLETED sweep cannot contain a new
+      // break — it was either repaired then or had none. Raising the cutoff
+      // to the previous sweep's start time shrinks the boot scan from ~1500
+      // files (every session active in 14 days, re-read in full on EVERY
+      // boot) to just the sessions that actually changed since last boot.
+      // The mark is written only after DONE — an interrupted sweep falls back
+      // to the wide window on next boot.
+      const sweepStartWallMs = Date.now();
+      try {
+        const lastSweepStartMs = projectManager.db.getAppState('jsonl_auto_repair_last_sweep');
+        if (typeof lastSweepStartMs === 'number' && lastSweepStartMs > cutoff) {
+          cutoff = lastSweepStartMs;
+          console.log('[Startup:AutoRepair] incremental cutoff from last sweep: ' + new Date(cutoff).toISOString());
+        }
+      } catch { /* app_state unavailable — keep 14-day window */ }
+      // Startup-freeze attribution: repairJsonlChainBreaks reads + JSON.parses
+      // the whole session file — one 100MB+ session = seconds of main-loop
+      // block (CPU-bound parse) and ~10× transient heap (string split +
+      // per-line objects). The sweep used to be invisible between its
+      // setTimeout and the single DONE line; now every slow file is named,
+      // each file is a perfOp (shows in MainLoopGap ops=/recentOps5s=), and
+      // cumulative block-time + peak heap land in DONE. Forensics for
+      // gapMs=7045 heapMb=975 at boot 2026-06-12 08:03:20.
+      const sweepStartedAt = nodePerformance.now();
+      let sweepBlockMs = 0;
+      let peakHeapMb = 0;
+      let slowFiles = 0;
+      console.log('[Startup:AutoRepair] SWEEP-START pid=' + process.pid +
+        ' cutoff=' + new Date(cutoff).toISOString() +
+        ' startAbs=' + (nodePerformance.timeOrigin + sweepStartedAt).toFixed(1) +
+        ' heapMb=' + Math.round(process.memoryUsage().heapUsed / 1024 / 1024));
       for (const proj of projects) {
         const projDir = path.join(projectsRoot, proj);
         let entries;
@@ -6613,6 +6948,8 @@ app.whenReady().then(() => {
           if (stat.mtimeMs < cutoff) continue;
           scanned++;
           const sid = f.replace(/\.jsonl$/, '');
+          const fileStartedAt = nodePerformance.now();
+          const opId = beginPerfOp('autoRepairFile', { sessionId: sid, reason: Math.round(stat.size / 1024 / 1024) + 'mb' });
           try {
             const res = await repairJsonlChainBreaks(sid, projDir);
             if (res.repaired > 0) {
@@ -6621,10 +6958,36 @@ app.whenReady().then(() => {
             }
           } catch (e) {
             console.warn('[Startup:AutoRepair] err on ' + sid + ':', e.message);
+          } finally {
+            endPerfOp(opId);
           }
+          const fileMs = nodePerformance.now() - fileStartedAt;
+          sweepBlockMs += fileMs;
+          const heapMb = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+          if (heapMb > peakHeapMb) peakHeapMb = heapMb;
+          if (fileMs > 200) {
+            slowFiles++;
+            console.warn('[Startup:AutoRepair] SLOW-FILE session=' + sid.substring(0, 8) +
+              ' sizeMb=' + (stat.size / 1024 / 1024).toFixed(1) +
+              ' durMs=' + fileMs.toFixed(0) +
+              ' heapMb=' + heapMb +
+              ' endAbs=' + (nodePerformance.timeOrigin + nodePerformance.now()).toFixed(1));
+          }
+          // Yield between files: each repair call is internally synchronous
+          // (readFileSync + full parse), so without this the whole sweep is one
+          // uninterrupted event-loop turn — input/IPC starve for its entire
+          // duration instead of only for the single largest file.
+          await new Promise((resolve) => setImmediate(resolve));
         }
       }
-      console.log('[Startup:AutoRepair] DONE pid=' + process.pid + ' scanned=' + scanned + ' sessionsFixed=' + sessionsFixed + ' totalDanglingRepaired=' + repaired + ' — every individual repair logged above with [JsonlAutoRepair] (grep "JsonlAutoRepair\\|JsonlChainDiag\\|McpReconnect" for full forensic view)');
+      console.log('[Startup:AutoRepair] DONE pid=' + process.pid + ' scanned=' + scanned + ' sessionsFixed=' + sessionsFixed + ' totalDanglingRepaired=' + repaired +
+        ' sweepWallMs=' + (nodePerformance.now() - sweepStartedAt).toFixed(0) +
+        ' sweepBlockMs=' + sweepBlockMs.toFixed(0) +
+        ' slowFiles=' + slowFiles +
+        ' peakHeapMb=' + peakHeapMb +
+        ' — every individual repair logged above with [JsonlAutoRepair] (grep "JsonlAutoRepair\\|JsonlChainDiag\\|McpReconnect" for full forensic view)');
+      // Sweep completed — next boot only needs files modified after THIS sweep began.
+      try { projectManager.db.setAppState('jsonl_auto_repair_last_sweep', sweepStartWallMs); } catch { /* non-fatal */ }
       // Notify renderer so user sees what was healed in the background.
       // Skip when nothing was repaired (silent boot path).
       if (sessionsFixed > 0 && mainWindow && !mainWindow.isDestroyed()) {
@@ -6669,6 +7032,11 @@ app.on('before-quit', async (event) => {
   }
   _gracefulShutdownInProgress = true;
   event.preventDefault();
+
+  // Watchdog lame-duck FIRST: shutdown legitimately stalls the loop (drain,
+  // Ctrl+C fan-out) — without this the watchdog would sample a "freeze" that
+  // is just teardown.
+  try { if (perfWatchdog && perfWatchdog.connected) perfWatchdog.send({ t: 'bye' }); } catch {}
 
   // CRITICAL ORDER: mark was_interrupted FIRST, before any slow/abortable step.
   // The drain + Ctrl+C fan-out below can stall for seconds (a Claude turn still
@@ -7450,33 +7818,47 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
         }
       }
 
-      // ========== AUTO-CONFIRM EFFORT-CHANGE DIALOG ==========
+      // ========== AUTO-CONFIRM CLAUDE SETTINGS DIALOGS ==========
       // After /effort N, Claude shows in new cwds (no saved permission):
       //   Change effort level?
       //   ❯ 1. Yes, switch to <X>
       //     2. No, go back
+      // After /model N, Claude can show the same shape:
+      //   Switch model?
+      //   ❯ 1. Yes, switch to <X>
+      //     2. No, go back
       // Default highlight is on "Yes" — pressing Enter confirms. We auto-press Enter so the user
-      // doesn't have to touch the terminal after clicking the effort button in UI.
-      // Match only "Change effort level" — Ink TUI splits the menu into multiple PTY chunks,
+      // doesn't have to touch the terminal after clicking Model/Effort in UI.
+      // Prefer the unique title line — Ink TUI splits the menu into multiple PTY chunks,
       // and inside each line spaces are encoded as ANSI cursor-forward sequences (`[1C`) instead
       // of literal spaces, so "Yes, switch to low" after strip becomes "Yes,switchtolow".
-      // The unique "Change effort level" string is enough to confirm the dialog. Cooldown 2s
-      // prevents double-fire on Ink re-renders.
+      // When the title chunk is missed, the highlighted "1. Yes, switch to ..." option
+      // is a safe model-dialog fallback. Cooldown is per dialog type: /model followed
+      // by /effort can legitimately show two dialogs less than 2s apart.
       {
         const sc = stripVTControlCharacters(data);
-        if (sc.includes('Change effort level')) {
+        const modelConfirmOption = /❯\s*1\.\s*Yes\s*,?\s*switch\s*to/i.test(sc);
+        const dialogType = sc.includes('Change effort level')
+          ? 'EffortDialog'
+          : sc.includes('Switch model')
+            ? 'ModelDialog'
+            : modelConfirmOption
+              ? 'ModelDialog'
+              : null;
+        if (dialogType) {
           const now = Date.now();
-          const lastFire = claudeEffortDialogCooldown.get(tabId) || 0;
+          const cooldownKey = tabId + ':' + dialogType;
+          const lastFire = claudeConfirmDialogCooldown.get(cooldownKey) || 0;
           if (now - lastFire > 2000) {
-            claudeEffortDialogCooldown.set(tabId, now);
-            console.log('[EffortDialog] Tab ' + tabId + ': detected, sending Enter in 120ms');
+            claudeConfirmDialogCooldown.set(cooldownKey, now);
+            console.log('[' + dialogType + '] Tab ' + tabId + ': detected, sending Enter in 120ms');
             // Delay to let Ink finish rendering the full menu before we press Enter.
             // 80ms was too short — Ink still painted dialog when Enter arrived and Enter went
             // into an undefined state (sometimes worked, sometimes ate the prompt).
             setTimeout(() => {
               const t = terminals.get(tabId);
               if (t) {
-                console.log('[EffortDialog] Tab ' + tabId + ': writing \\r');
+                console.log('[' + dialogType + '] Tab ' + tabId + ': writing \\r');
                 t.write('\r');
               }
             }, 120);
@@ -7844,7 +8226,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       claudePromptReady.delete(tabId);
       claudeSpinnerBusy.delete(tabId);
       claudeSpinnerIdleTimer.delete(tabId);
-      claudeEffortDialogCooldown.delete(tabId);
+      clearClaudeConfirmDialogCooldown(tabId);
       subAgentInterceptor.delete(tabId);
 
       // MCP: Handle sub-agent PTY exit (Claude crash)
@@ -8446,6 +8828,21 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
   // Multi-byte ESC sequences (стрелки `\x1b[A`, F-keys, `\x1bO...`) пропускаем —
   // они не означают interrupt. См. armInterruptIdleProbe выше для подробностей.
   if (data === '\x1b' || data === '\x03') {
+    const codexSid = codexKnownSessions.get(tabId) || null;
+    if (codexSid) {
+      const codexTurnState = codexTurnWatchers.get(tabId) || null;
+      const commandState = terminalCommandState.get(tabId) || null;
+      console.warn(
+        '[CodexInterruptInput]' +
+        ' tab=' + String(tabId).slice(-12) +
+        ' key=' + (data === '\x1b' ? 'Escape' : 'Ctrl+C') +
+        ' session=' + String(codexSid).slice(0, 8) +
+        ' turnBusy=' + (codexTurnState?.busy === true) +
+        ' lastEvent=' + (codexTurnState?.lastEventType || 'none') +
+        ' lastEventTs=' + (codexTurnState?.lastEventTs || 'none') +
+        ' commandRunning=' + (commandState?.isRunning === true)
+      );
+    }
     cancelClaudeLocalCommandFromInput(tabId, data);
     if (claudeTurnBusy.get(tabId) === true) {
       armInterruptIdleProbe(tabId);
@@ -8782,16 +9179,31 @@ function commandLooksLikeAiProcess(cmd, expectedName) {
   return !!getAiProcessNameFromCommand(text);
 }
 
-async function findAiDescendantProcessesByTab(tabId, expectedName) {
-  const term = terminals.get(tabId);
-  if (!term) return [];
+async function getProcessTreeSnapshot() {
+  const now = nodePerformance.now();
+  if (processTreeSnapshotCache && (now - processTreeSnapshotCache.createdAt) < PROCESS_TREE_SNAPSHOT_TTL_MS) {
+    return { ...processTreeSnapshotCache, source: 'cache', waiters: 0 };
+  }
+
+  if (processTreeSnapshotInflight) {
+    processTreeSnapshotWaiters += 1;
+    const waitStartedAt = nodePerformance.now();
+    const snapshot = await processTreeSnapshotInflight;
+    return {
+      ...snapshot,
+      source: 'inflight',
+      waitMs: nodePerformance.now() - waitStartedAt,
+      waiters: processTreeSnapshotWaiters,
+    };
+  }
+
+  const opId = beginPerfOp('psSnapshot', {});
+  processTreeSnapshotWaiters = 0;
   const startedAt = nodePerformance.now();
   const startAbs = nodePerformance.timeOrigin + startedAt;
-  const opId = beginPerfOp('psLookup', { tabId, expectedName });
-  try {
-    const psStartedAt = nodePerformance.now();
+  processTreeSnapshotInflight = (async () => {
     const psOut = await execAsync('ps -eo pid,ppid,command', 2000);
-    const psMs = nodePerformance.now() - psStartedAt;
+    const psMs = nodePerformance.now() - startedAt;
     const parseStartedAt = nodePerformance.now();
     const children = new Map();
     const lines = (psOut || '').split('\n').filter(Boolean);
@@ -8804,7 +9216,50 @@ async function findAiDescendantProcessesByTab(tabId, expectedName) {
       if (!children.has(child.ppid)) children.set(child.ppid, []);
       children.get(child.ppid).push(child);
     }
+    const snapshot = {
+      children,
+      linesCount: lines.length,
+      createdAt: nodePerformance.now(),
+      startAbs,
+      psMs,
+      parseMs: nodePerformance.now() - parseStartedAt,
+    };
+    processTreeSnapshotCache = snapshot;
+    const totalMs = nodePerformance.now() - startedAt;
+    if (totalMs > 50 || psMs > 50 || processTreeSnapshotWaiters > 0) {
+      console.warn(
+        '[Perf:ProcessTreeSnapshot]' +
+        ' startAbs=' + startAbs.toFixed(1) +
+        ' endAbs=' + (nodePerformance.timeOrigin + nodePerformance.now()).toFixed(1) +
+        ' source=spawn' +
+        ' lines=' + lines.length +
+        ' waiters=' + processTreeSnapshotWaiters +
+        ' psMs=' + psMs.toFixed(1) +
+        ' parseMs=' + snapshot.parseMs.toFixed(1) +
+        ' totalMs=' + totalMs.toFixed(1)
+      );
+    }
+    return snapshot;
+  })();
 
+  try {
+    const snapshot = await processTreeSnapshotInflight;
+    return { ...snapshot, source: 'spawn', waiters: processTreeSnapshotWaiters, waitMs: 0 };
+  } finally {
+    processTreeSnapshotInflight = null;
+    endPerfOp(opId);
+  }
+}
+
+async function findAiDescendantProcessesByTab(tabId, expectedName) {
+  const term = terminals.get(tabId);
+  if (!term) return [];
+  const startedAt = nodePerformance.now();
+  const startAbs = nodePerformance.timeOrigin + startedAt;
+  const opId = beginPerfOp('psLookup', { tabId, expectedName });
+  try {
+    const snapshot = await getProcessTreeSnapshot();
+    const parseStartedAt = nodePerformance.now();
     const matches = [];
     const stack = [{ pid: term.pid, depth: 0 }];
     const seen = new Set();
@@ -8812,7 +9267,7 @@ async function findAiDescendantProcessesByTab(tabId, expectedName) {
       const cur = stack.pop();
       if (!cur || seen.has(cur.pid)) continue;
       seen.add(cur.pid);
-      const kids = children.get(cur.pid) || [];
+      const kids = snapshot.children.get(cur.pid) || [];
       for (const child of kids) {
         const depth = cur.depth + 1;
         if (commandLooksLikeAiProcess(child.cmd, expectedName)) {
@@ -8824,16 +9279,20 @@ async function findAiDescendantProcessesByTab(tabId, expectedName) {
     matches.sort((a, b) => b.depth - a.depth || b.pid - a.pid);
     const parseMs = nodePerformance.now() - parseStartedAt;
     const totalMs = nodePerformance.now() - startedAt;
-    if (totalMs > 50 || psMs > 50) {
+    if (totalMs > 50 || snapshot.psMs > 50) {
       console.warn(
         '[Perf:ProcessTreeLookup] tab=' + tabId.slice(-8) +
         ' expected=' + expectedName +
         ' shellPid=' + term.pid +
         ' startAbs=' + startAbs.toFixed(1) +
         ' endAbs=' + (nodePerformance.timeOrigin + nodePerformance.now()).toFixed(1) +
+        ' snapshotSource=' + snapshot.source +
+        ' snapshotAgeMs=' + (nodePerformance.now() - snapshot.createdAt).toFixed(1) +
+        ' waitMs=' + (snapshot.waitMs || 0).toFixed(1) +
         ' matches=' + matches.length +
-        ' lines=' + lines.length +
-        ' psMs=' + psMs.toFixed(1) +
+        ' lines=' + snapshot.linesCount +
+        ' psMs=' + snapshot.psMs.toFixed(1) +
+        ' snapshotParseMs=' + snapshot.parseMs.toFixed(1) +
         ' parseMs=' + parseMs.toFixed(1) +
         ' totalMs=' + totalMs.toFixed(1)
       );
@@ -8846,9 +9305,9 @@ async function findAiDescendantProcessesByTab(tabId, expectedName) {
       ' startAbs=' + startAbs.toFixed(1) +
       ' endAbs=' + (nodePerformance.timeOrigin + nodePerformance.now()).toFixed(1) +
       ' durMs=' + (nodePerformance.now() - startedAt).toFixed(1) +
-      ' error=' + err.message
+      ' error=' + (err?.message || String(err))
     );
-    console.warn('[capture-input:' + expectedName + '] ps lookup failed for tab ' + tabId.slice(-12) + ': ' + err.message);
+    console.warn('[capture-input:' + expectedName + '] ps lookup failed for tab ' + tabId.slice(-12) + ': ' + (err?.message || String(err)));
   }
   finally {
     endPerfOp(opId);
@@ -10011,11 +10470,21 @@ ipcMain.handle('terminal:getCwd', async (event, tabId) => {
     const pid = term.pid;
 
     if (process.platform === 'darwin') {
-      // macOS: use lsof to get cwd (async to not block main process)
-      const result = await execAsync(`lsof -p ${pid} | grep cwd | awk '{print $9}'`);
+      // macOS: field mode returns the full path. Plain lsof table output can
+      // truncate NAME, which corrupts persisted tab cwd on long project paths.
+      const result = await execAsync(`lsof -a -p ${pid} -d cwd -Fn`);
+      const cwdLine = String(result || '').split(/\r?\n/).find(line => line.startsWith('n'));
+      const cwd = cwdLine ? cwdLine.slice(1).trim() : '';
 
-      if (result) {
-        return result;
+      if (cwd) {
+        try {
+          if (path.isAbsolute(cwd) && fs.statSync(cwd).isDirectory()) {
+            return cwd;
+          }
+          console.warn('[terminal:getCwd] Ignoring non-directory cwd from lsof tab=' + tabId + ' cwd=' + cwd);
+        } catch {
+          console.warn('[terminal:getCwd] Ignoring missing cwd from lsof tab=' + tabId + ' cwd=' + cwd);
+        }
       }
     } else if (process.platform === 'linux') {
       // Linux: read /proc/<pid>/cwd symlink (fs.promises for async)
@@ -10032,10 +10501,17 @@ ipcMain.handle('terminal:getCwd', async (event, tabId) => {
 });
 
 // Get command state (is command running?) - uses OSC 133 tracking
-ipcMain.handle('terminal:getCommandState', async (event, tabId) => {
+ipcMain.handle('terminal:getCommandState', async (event, request) => {
+  const requestOptions = (request && typeof request === 'object')
+    ? request
+    : { tabId: request };
+  const tabId = requestOptions.tabId;
+  const caller = requestOptions.caller || 'legacy';
+  const expectedProcess = requestOptions.expectedProcess || 'codex';
+  const allowProcessTreeLookup = requestOptions.allowProcessTreeLookup !== false;
   const startedAt = nodePerformance.now();
   const startAbs = nodePerformance.timeOrigin + startedAt;
-  const opId = beginPerfOp('getCommandState', { tabId });
+  const opId = beginPerfOp('getCommandState', { tabId, source: caller });
   const state = terminalCommandState.get(tabId);
   // OSC 133 B/D drives terminalCommandState.isRunning — but that marker is
   // MISSED when Claude was launched while this tab's Terminal component wasn't
@@ -10059,10 +10535,10 @@ ipcMain.handle('terminal:getCommandState', async (event, tabId) => {
   let codexLookupMs = 0;
   let codexMatches = 0;
   let didCodexLookup = false;
-  if (!oscRunning && !bridgeAlive) {
+  if (!oscRunning && !bridgeAlive && allowProcessTreeLookup) {
     didCodexLookup = true;
     const lookupStartedAt = nodePerformance.now();
-    const matches = await findAiDescendantProcessesByTab(tabId, 'codex');
+    const matches = await findAiDescendantProcessesByTab(tabId, expectedProcess);
     codexLookupMs = nodePerformance.now() - lookupStartedAt;
     codexMatches = matches.length;
     codexAlive = codexMatches > 0;
@@ -10077,11 +10553,14 @@ ipcMain.handle('terminal:getCommandState', async (event, tabId) => {
   if (durMs > 50 || codexLookupMs > 50 || didCodexLookup) {
     console.warn(
       '[Perf:GetCommandState] tab=' + tabId.slice(-8) +
+      ' caller=' + caller +
       ' durMs=' + durMs.toFixed(1) +
       ' startAbs=' + startAbs.toFixed(1) +
       ' endAbs=' + (nodePerformance.timeOrigin + nodePerformance.now()).toFixed(1) +
       ' oscRunning=' + oscRunning +
       ' bridgeAlive=' + bridgeAlive +
+      ' allowProcessTreeLookup=' + allowProcessTreeLookup +
+      ' expected=' + expectedProcess +
       ' codexLookup=' + didCodexLookup +
       ' codexLookupMs=' + codexLookupMs.toFixed(1) +
       ' codexMatches=' + codexMatches +
@@ -10166,7 +10645,22 @@ ipcMain.handle('project:list', () => {
 ipcMain.handle('project:getById', (event, projectId) => {
   console.log('[Main] project:getById called with:', projectId);
   const result = projectManager.db.getProjectById(projectId);
-  console.log('[Main] project:getById result:', result);
+  const tabs = Array.isArray(result?.tabs) ? result.tabs : [];
+  const groups = Array.isArray(result?.tabGroups) ? result.tabGroups : [];
+  const tabIds = tabs.slice(0, 20).map((tab) => {
+    const id = String(tab?.tabId || '').slice(-12);
+    const name = String(tab?.name || '').replace(/\s+/g, ' ').slice(0, 24);
+    const type = tab?.tabType || 'terminal';
+    const command = tab?.commandType || 'generic';
+    return `${id}:${name}:${type}:${command}`;
+  }).join(',');
+  console.log(
+    `[Main] project:getById summary id=${String(projectId).slice(-12)}` +
+    ` found=${!!result}` +
+    ` tabs=${tabs.length}` +
+    ` groups=${groups.length}` +
+    ` tabIds=${tabIds}${tabs.length > 20 ? ',+' + (tabs.length - 20) : ''}`
+  );
   return result;
 });
 
@@ -10466,11 +10960,12 @@ ipcMain.handle('project:archive-tab', (event, { projectId, tab }) => {
   const started = Date.now();
   const historyId = projectManager.db.archiveTab(projectId, tab);
   const durMs = Date.now() - started;
+  const sessionId = tab?.claudeSessionId || tab?.geminiSessionId || tab?.codexSessionId || null;
   console.log('[Archive:Close] archived historyId=' + historyId +
     ' project=' + String(projectId).slice(-12) +
     ' tabName=' + JSON.stringify(tab?.name || '') +
     ' cmd=' + (tab?.commandType || 'none') +
-    ' sid=' + (tab?.claudeSessionId ? tab.claudeSessionId.slice(0, 8) : 'none') +
+    ' sid=' + (sessionId ? sessionId.slice(0, 8) : 'none') +
     ' processWasRunning=' + !!tab?.processWasRunning +
     ' durMs=' + durMs);
   scheduleArchiveSideEffects(projectId, tab, historyId);
@@ -11880,6 +12375,7 @@ const codexTurnWatchers = new Map();
 const codexPickerQueue = new Map();
 const CODEX_WATCHER_TTL_MS = 10 * 60 * 1000;
 const CODEX_WATCHER_SCAN_MS = 1000;
+const CODEX_TURN_CATCHUP_BYTES = 8 * 1024 * 1024;
 const CODEX_SYNC_MARKER = '\x1b[?2026l';
 
 function closeCodexWatcher(tabId, reason = 'close') {
@@ -11928,15 +12424,90 @@ function processCodexTurnLine(state, line) {
   const event = codexEventType(record);
   if (!event) return;
   if (event === 'task_started') {
+    state.lastEventType = event;
+    state.lastEventTs = record.timestamp || null;
+    state.liveTurnEvents = (state.liveTurnEvents || 0) + 1;
     state.busy = true;
     console.log('[CodexTurn] event tab=' + String(state.tabId).slice(-12) + ' session=' + state.sessionId + ' event=task_started ts=' + (record.timestamp || 'n/a'));
     emitCodexBusy(state.tabId, true, 'task_started');
     return;
   }
   if (event === 'task_complete' || event === 'turn_aborted') {
+    state.lastEventType = event;
+    state.lastEventTs = record.timestamp || null;
+    state.liveTurnEvents = (state.liveTurnEvents || 0) + 1;
     state.busy = false;
     console.log('[CodexTurn] event tab=' + String(state.tabId).slice(-12) + ' session=' + state.sessionId + ' event=' + event + ' ts=' + (record.timestamp || 'n/a'));
     emitCodexBusy(state.tabId, false, event);
+  }
+}
+
+function inferCodexBusyFromText(text) {
+  let inferred = null;
+  const lines = String(text || '').split('\n');
+  for (const line of lines) {
+    const trimmed = String(line || '').trim();
+    if (!trimmed || trimmed[0] !== '{') continue;
+    let record;
+    try {
+      record = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    const event = codexEventType(record);
+    if (event === 'task_started') {
+      inferred = { busy: true, event, timestamp: record.timestamp || null };
+    } else if (event === 'task_complete' || event === 'turn_aborted') {
+      inferred = { busy: false, event, timestamp: record.timestamp || null };
+    }
+  }
+  return inferred;
+}
+
+async function catchUpCodexTurnState(tabId, filePath, fileSize) {
+  const readSize = Math.min(fileSize, CODEX_TURN_CATCHUP_BYTES);
+  if (readSize <= 0) return;
+  const start = Math.max(0, fileSize - readSize);
+  let handle = null;
+  try {
+    handle = await fs.promises.open(filePath, 'r');
+    const buffer = Buffer.alloc(readSize);
+    const { bytesRead } = await handle.read(buffer, 0, readSize, start);
+    let text = buffer.subarray(0, bytesRead).toString('utf8');
+    if (start > 0) {
+      const firstNewline = text.indexOf('\n');
+      text = firstNewline >= 0 ? text.slice(firstNewline + 1) : '';
+    }
+
+    const inferred = inferCodexBusyFromText(text);
+    const state = codexTurnWatchers.get(tabId);
+    if (!state || state.filePath !== filePath) return;
+    if (!inferred) {
+      console.log('[CodexTurn] catch-up no-events tab=' + String(tabId).slice(-12) + ' bytes=' + bytesRead + ' start=' + start);
+      return;
+    }
+
+    if (
+      state.liveTurnEvents > 0 &&
+      (!inferred.timestamp || !state.lastEventTs || inferred.timestamp <= state.lastEventTs)
+    ) {
+      console.log('[CodexTurn] catch-up skipped tab=' + String(tabId).slice(-12) + ' inferred=' + inferred.event + ' inferredTs=' + (inferred.timestamp || 'n/a') + ' live=' + state.lastEventType + ' liveTs=' + (state.lastEventTs || 'n/a'));
+      return;
+    }
+
+    state.lastEventType = inferred.event;
+    state.lastEventTs = inferred.timestamp || null;
+    console.log('[CodexTurn] catch-up tab=' + String(tabId).slice(-12) + ' event=' + inferred.event + ' busy=' + inferred.busy + ' ts=' + (inferred.timestamp || 'n/a') + ' bytes=' + bytesRead + ' start=' + start);
+    if (state.busy !== inferred.busy) {
+      state.busy = inferred.busy;
+      emitCodexBusy(tabId, inferred.busy, 'catch-up-' + inferred.event);
+    }
+  } catch (e) {
+    console.warn('[CodexTurn] catch-up failed tab=' + String(tabId).slice(-12) + ' file=' + filePath + ' error=' + (e?.message || String(e)));
+  } finally {
+    if (handle) {
+      try { await handle.close(); } catch {}
+    }
   }
 }
 
@@ -12006,6 +12577,9 @@ function startCodexTurnWatcher({ tabId, sessionId, filePath }) {
     offset,
     partial: '',
     busy: false,
+    lastEventType: null,
+    lastEventTs: null,
+    liveTurnEvents: 0,
     scanning: false,
     needsScan: false,
     watcher: null,
@@ -12019,6 +12593,7 @@ function startCodexTurnWatcher({ tabId, sessionId, filePath }) {
   }
   state.interval = setInterval(() => scanCodexTurnAppend(tabId, 'scan'), CODEX_WATCHER_SCAN_MS);
   console.log('[CodexTurn] watcher started tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' file=' + filePath + ' offset=' + offset);
+  catchUpCodexTurnState(tabId, filePath, offset);
   return true;
 }
 
@@ -12159,6 +12734,10 @@ function codexLineContainsCandidate(line, candidate) {
 function parseCodexNumberedPicker(cleanText, candidates = null) {
   const lines = String(cleanText || '').split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
   const items = [];
+  const isNumberedPickerLine = (value) => {
+    const bareValue = String(value || '').replace(/^[›❯>]\s*/, '').trim();
+    return /^\d+\.\s*/.test(bareValue);
+  };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const selected = /^[›❯>]\s*/.test(line);
@@ -12170,14 +12749,27 @@ function parseCodexNumberedPicker(cleanText, candidates = null) {
     //   2.
     //   gpt-5.4
     //   Strong model...
-    // Treat the next non-empty line as the item label in that layout.
+    // or:
+    //   4.
+    //   Extra
+    //   high
+    //   Extra high reasoning depth...
+    // Build a short label window from following non-numbered lines; candidate
+    // matching uses the window, while display falls back to the first label.
     if (!rest && i + 1 < lines.length) {
       rest = lines[i + 1].replace(/^[›❯>]\s*/, '').trim();
     }
     if (!rest) continue;
+    const labelParts = [rest];
+    for (let j = i + 1; j < lines.length && labelParts.length < 4; j++) {
+      if (isNumberedPickerLine(lines[j])) break;
+      const part = lines[j].replace(/^[›❯>]\s*/, '').trim();
+      if (part && part !== rest) labelParts.push(part);
+    }
+    const labelWindow = labelParts.join(' ');
     let value = null;
     if (Array.isArray(candidates) && candidates.length > 0) {
-      const found = candidates.find(c => codexLineContainsCandidate(rest, c));
+      const found = candidates.find(c => codexLineContainsCandidate(labelWindow, c));
       if (!found) continue;
       value = found;
     } else {
@@ -12189,7 +12781,7 @@ function parseCodexNumberedPicker(cleanText, candidates = null) {
       index: items.length,
       selected,
       value,
-      label: rest,
+      label: labelWindow,
       line,
     });
   }
@@ -12328,173 +12920,183 @@ async function selectCodexPickerItem(term, {
   };
 }
 
-async function grabCodexDraftForModelSwitch(tabId, logPrefix) {
-  const result = await captureAgentInput(tabId, 'grab', 'codex');
-  if (!result?.success) {
-    console.warn(logPrefix + ' draft grab failed: ' + (result?.error || 'unknown'));
-    return {
-      success: false,
-      error: result?.error || 'draft_probe_failed',
-      text: '',
-      length: 0,
-    };
-  }
-  const text = typeof result.text === 'string' ? result.text : '';
-  console.log(logPrefix + ' draft grab success len=' + text.length + ' hasDraft=' + (text.length > 0) + ' images=' + (result.images || 0));
-  return {
-    success: true,
-    text,
-    length: text.length,
-    images: result.images || 0,
-  };
-}
-
-async function settleCodexAfterDraftGrab(term, logPrefix) {
-  const frame = await captureCodexFrame(term, {
-    timeoutMs: 500,
-    logPrefix: logPrefix + ':after-grab-settle',
-  });
-  const preview = String(frame.clean || '').replace(/\s+/g, ' ').trim().slice(0, 180);
-  console.log(logPrefix + ' after-grab settle ' + (frame.timedOut ? 'timeout' : 'frame') + ' raw=' + frame.raw.length + 'B clean=' + JSON.stringify(preview));
-}
-
-async function restoreCodexDraftForModelSwitch(tabId, term, text, logPrefix) {
-  if (!text) return { success: true, via: 'empty' };
-  console.log(logPrefix + ' restoring draft via external-editor helper len=' + text.length);
-  const result = await restoreAgentInput(tabId, text, 'codex');
-  if (result?.success) return { success: true, via: 'editor' };
-
-  console.warn(logPrefix + ' editor restore failed: ' + (result?.error || 'unknown') + ' — falling back to bracketed paste');
+async function stashCodexDraftForPicker(term, { logPrefix, draftPreview = '' } = {}) {
+  const preview = String(draftPreview || '').slice(0, 80);
+  console.log(logPrefix + ' draft-stash start preview=' + JSON.stringify(preview));
   try {
-    const fallback = await _safePasteAndSubmitInner(term, text, {
-      submit: false,
-      ctrlCFirst: false,
-      stashFirst: false,
-      fast: false,
-      logPrefix: logPrefix + ':restore-paste',
-      safetyTimeoutMs: 3000,
-    });
-    return {
-      success: fallback?.success !== false,
-      via: 'paste',
-      error: fallback?.error,
-      editorError: result?.error || 'unknown',
-    };
+    const frame = await sendCodexKeyAndCapture(
+      term,
+      '\x03',
+      1800,
+      logPrefix + ':draft-stash',
+      (clean, raw) => {
+        if (raw.includes(CODEX_SYNC_MARKER)) return true;
+        if (preview && clean.includes(preview)) return false;
+        return /[›❯]\s*(Find and fix a bug|Explain this codebase)?/i.test(clean)
+          || /Context\s+\d+%/i.test(clean);
+      }
+    );
+    console.log(logPrefix + ' draft-stash ' + (frame.timedOut ? 'timeout' : 'frame') + ' clean=' + JSON.stringify(frame.clean.slice(0, 240)));
+    return { success: !frame.timedOut, frame };
   } catch (error) {
-    console.warn(logPrefix + ' paste restore failed: ' + (error?.message || error));
-    return {
-      success: false,
-      via: 'failed',
-      error: error?.message || String(error),
-      editorError: result?.error || 'unknown',
-    };
+    console.warn(logPrefix + ' draft-stash error: ' + (error?.message || String(error)));
+    return { success: false, error: error?.message || String(error) };
   }
 }
 
-async function selectCodexModelEffort(term, { tabId, model, effort }) {
+async function restoreCodexDraftAfterPicker(term, { logPrefix, slashSubmitted = false } = {}) {
+  const presses = slashSubmitted ? 2 : 1;
+  console.log(logPrefix + ' draft-restore start arrowUp=' + presses + ' slashSubmitted=' + slashSubmitted);
+  for (let i = 0; i < presses; i++) {
+    try {
+      const frame = await sendCodexKeyAndCapture(
+        term,
+        '\x1b[A',
+        1600,
+        logPrefix + ':draft-restore#' + (i + 1)
+      );
+      console.log(logPrefix + ' draft-restore step=' + (i + 1) + '/' + presses + ' timedOut=' + frame.timedOut + ' clean=' + JSON.stringify(frame.clean.slice(0, 240)));
+    } catch (error) {
+      console.warn(logPrefix + ' draft-restore step=' + (i + 1) + ' error: ' + (error?.message || String(error)));
+      break;
+    }
+  }
+}
+
+async function selectCodexModelEffort(term, {
+  tabId,
+  model,
+  effort,
+  hasDraft = null,
+  draftSource = '',
+  draftPreview = '',
+  visualHasDraft = null,
+  visualSource = '',
+  visualPreview = '',
+}) {
   const logPrefix = '[Codex:Picker:' + tabId + ']';
   const t0 = Date.now();
-  console.log(logPrefix + ' start model=' + model + ' effort=' + (effort || 'skip'));
+  console.log(logPrefix + ' start model=' + model + ' effort=' + (effort || 'skip') + ' hasDraft=' + hasDraft + ' draftSource=' + (draftSource || 'n/a') + ' draftPreview=' + JSON.stringify(String(draftPreview || '').slice(0, 120)) + ' visualHasDraft=' + visualHasDraft + ' visualSource=' + (visualSource || 'n/a') + ' visualPreview=' + JSON.stringify(String(visualPreview || '').slice(0, 120)));
 
-  const draft = await grabCodexDraftForModelSwitch(tabId, logPrefix);
-  if (!draft.success) {
-    return { success: false, error: 'Cannot capture current Codex input: ' + draft.error };
+  const shouldRestoreDraft = hasDraft === true;
+  let slashSubmitted = false;
+  let outcome = null;
+
+  if (hasDraft !== false && hasDraft !== true) {
+    return { success: false, error: 'Cannot determine Codex input state safely' };
   }
-  await settleCodexAfterDraftGrab(term, logPrefix);
-  const draftText = draft.text || '';
-  const shouldRestoreDraft = draftText.length > 0;
-  const finish = async (result) => {
-    if (!shouldRestoreDraft) return result;
-    if (!result?.success) {
-      await sendCodexKeyAndCapture(term, '\x1b', 1500, logPrefix + ':cancel-before-restore').catch(() => null);
+
+  if (shouldRestoreDraft) {
+    const stashResult = await stashCodexDraftForPicker(term, { logPrefix, draftPreview });
+    if (!stashResult.success) {
+      return {
+        success: false,
+        error: 'Codex draft stash did not confirm prompt state safely',
+        draftSource,
+        draftPreview,
+      };
     }
-    const restore = await restoreCodexDraftForModelSwitch(tabId, term, draftText, logPrefix);
-    return {
-      ...result,
-      draftRestored: !!restore.success,
-      draftRestoreVia: restore.via,
-      draftRestoreError: restore.error || null,
-      ...(restore.success ? {} : { success: false, error: (result?.error ? result.error + '; ' : '') + 'Codex draft restore failed: ' + (restore.error || restore.editorError || 'unknown') }),
-    };
-  };
-
-  const openCapture = captureCodexFrame(term, {
-    timeoutMs: 6000,
-    logPrefix: logPrefix + ':open',
-    predicate: (clean) => {
-      if (!/Select Model/i.test(clean)) return false;
-      const state = parseCodexNumberedPicker(clean);
-      if (state.items.length < 2) return false;
-      const hasTarget = state.items.some(item => codexLineContainsCandidate(item.label || item.value, model));
-      return hasTarget || state.items.length >= 4;
-    },
-  });
-  const slashResult = await sendCodexSlashCommand(term, '/model', logPrefix + ':open-command', {
-    clearStrategy: 'none',
-  });
-  if (!slashResult.success) return finish(slashResult);
-  const modelFrame = await openCapture;
-  if (modelFrame.timedOut) {
-    console.warn(logPrefix + ' model menu capture timed out. clean=' + JSON.stringify(modelFrame.clean.slice(0, 500)));
+  } else {
+    console.log(logPrefix + ' skip Ctrl+C draft clear; picker only runs after empty-composer probe');
   }
 
-  // xhigh must be checked before high: Codex renders it as "Extra high".
-  const effortCandidates = ['minimal', 'low', 'medium', 'xhigh', 'high'];
-  const effortPredicate = effort
-    ? (clean) => parseCodexNumberedPicker(clean, effortCandidates).items.length > 0
-    : null;
-  const modelResult = await selectCodexPickerItem(term, {
-    kind: 'model',
-    target: model,
-    initialFrame: modelFrame,
-    timeoutMs: 5000,
-    confirmPredicate: effortPredicate,
-    logPrefix,
-  });
-  if (!modelResult.success) return finish(modelResult);
+  try {
+    const openCapture = captureCodexFrame(term, {
+      timeoutMs: 6000,
+      logPrefix: logPrefix + ':open',
+      predicate: (clean) => {
+        if (!/Select Model/i.test(clean)) return false;
+        const state = parseCodexNumberedPicker(clean);
+        if (state.items.length < 2) return false;
+        const hasTarget = state.items.some(item => codexLineContainsCandidate(item.label || item.value, model));
+        return hasTarget || state.items.length >= 4;
+      },
+    });
+    const slashResult = await sendCodexSlashCommand(term, '/model', logPrefix + ':open-command', {
+      clearStrategy: 'line',
+    });
+    if (!slashResult.success) {
+      outcome = slashResult;
+      return slashResult;
+    }
+    slashSubmitted = true;
+    const modelFrame = await openCapture;
+    if (modelFrame.timedOut) {
+      console.warn(logPrefix + ' model menu capture timed out. clean=' + JSON.stringify(modelFrame.clean.slice(0, 500)));
+    }
 
-  let effortResult = null;
-  let parsedEffortOptions = [];
-  if (effort) {
-    let effortFrame = modelResult.frame;
-    let effortState = parseCodexNumberedPicker(effortFrame.clean, effortCandidates);
-    if (effortState.items.length === 0) {
-      const lateFrame = await captureCodexFrame(term, {
-        timeoutMs: 2500,
-        logPrefix: logPrefix + ':effort-late',
-        predicate: effortPredicate,
-      });
-      const lateState = parseCodexNumberedPicker(lateFrame.clean, effortCandidates);
-      if (lateState.items.length > 0) {
-        effortFrame = lateFrame;
-        effortState = lateState;
+    // xhigh must be checked before high: Codex renders it as "Extra high".
+    const effortCandidates = ['minimal', 'low', 'medium', 'xhigh', 'high'];
+    const effortPredicate = effort
+      ? (clean) => parseCodexNumberedPicker(clean, effortCandidates).items.length > 0
+      : null;
+    const modelResult = await selectCodexPickerItem(term, {
+      kind: 'model',
+      target: model,
+      initialFrame: modelFrame,
+      timeoutMs: 5000,
+      confirmPredicate: effortPredicate,
+      logPrefix,
+    });
+    if (!modelResult.success) {
+      outcome = modelResult;
+      return modelResult;
+    }
+
+    let effortResult = null;
+    let parsedEffortOptions = [];
+    if (effort) {
+      let effortFrame = modelResult.frame;
+      let effortState = parseCodexNumberedPicker(effortFrame.clean, effortCandidates);
+      if (effortState.items.length === 0) {
+        const lateFrame = await captureCodexFrame(term, {
+          timeoutMs: 2500,
+          logPrefix: logPrefix + ':effort-late',
+          predicate: effortPredicate,
+        });
+        const lateState = parseCodexNumberedPicker(lateFrame.clean, effortCandidates);
+        if (lateState.items.length > 0) {
+          effortFrame = lateFrame;
+          effortState = lateState;
+        }
+      }
+      if (effortState.items.length > 0) {
+        parsedEffortOptions = effortState.items.map(item => item.value);
+        effortResult = await selectCodexPickerItem(term, {
+          kind: 'effort',
+          target: effort,
+          candidates: effortCandidates,
+          initialFrame: effortFrame,
+          timeoutMs: 5000,
+          logPrefix,
+        });
+        if (!effortResult.success) {
+          outcome = effortResult;
+          return effortResult;
+        }
+      } else {
+        console.log(logPrefix + ' no effort picker after model confirm; clean=' + JSON.stringify(effortFrame.clean.slice(0, 500)));
       }
     }
-    if (effortState.items.length > 0) {
-      parsedEffortOptions = effortState.items.map(item => item.value);
-      effortResult = await selectCodexPickerItem(term, {
-        kind: 'effort',
-        target: effort,
-        candidates: effortCandidates,
-        initialFrame: effortFrame,
-        timeoutMs: 5000,
-        logPrefix,
-      });
-      if (!effortResult.success) return finish(effortResult);
-    } else {
-      console.log(logPrefix + ' no effort picker after model confirm; clean=' + JSON.stringify(effortFrame.clean.slice(0, 500)));
+
+    console.log(logPrefix + ' done in ' + (Date.now() - t0) + 'ms model=' + modelResult.selected + ' effort=' + (effortResult?.selected || 'skipped'));
+    outcome = {
+      success: true,
+      model: modelResult.selected,
+      effort: effortResult?.selected || null,
+      modelOptions: modelResult.options,
+      effortOptions: effortResult?.options || parsedEffortOptions,
+      effortSkipped: !!effort && !effortResult,
+    };
+    return outcome;
+  } finally {
+    if (shouldRestoreDraft) {
+      if (slashSubmitted && outcome?.success !== true) {
+        try { term.write('\x1b'); } catch {}
+      }
+      await restoreCodexDraftAfterPicker(term, { logPrefix, slashSubmitted });
     }
   }
-
-  console.log(logPrefix + ' done in ' + (Date.now() - t0) + 'ms model=' + modelResult.selected + ' effort=' + (effortResult?.selected || 'skipped'));
-  return finish({
-    success: true,
-    model: modelResult.selected,
-    effort: effortResult?.selected || null,
-    modelOptions: modelResult.options,
-    effortOptions: effortResult?.options || parsedEffortOptions,
-    effortSkipped: !!effort && !effortResult,
-  });
 }
 
 // Gemini Sniper Watcher: watch for new session file creation when gemini starts
@@ -12948,8 +13550,18 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command) => {
   }
 });
 
-ipcMain.handle('codex:select-model-effort', async (_event, { tabId, model, effort }) => {
-  console.log('[codex:select-model-effort] Received: tabId=' + tabId + ' model=' + model + ' effort=' + (effort || ''));
+ipcMain.handle('codex:select-model-effort', async (_event, {
+  tabId,
+  model,
+  effort,
+  hasDraft = null,
+  draftSource = '',
+  draftPreview = '',
+  visualHasDraft = null,
+  visualSource = '',
+  visualPreview = '',
+}) => {
+  console.log('[codex:select-model-effort] Received: tabId=' + tabId + ' model=' + model + ' effort=' + (effort || '') + ' hasDraft=' + hasDraft + ' draftSource=' + (draftSource || 'n/a') + ' draftPreview=' + JSON.stringify(String(draftPreview || '').slice(0, 120)) + ' visualHasDraft=' + visualHasDraft + ' visualSource=' + (visualSource || 'n/a') + ' visualPreview=' + JSON.stringify(String(visualPreview || '').slice(0, 120)));
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'terminal not found' };
   if (!model) return { success: false, error: 'model is required' };
@@ -12957,7 +13569,17 @@ ipcMain.handle('codex:select-model-effort', async (_event, { tabId, model, effor
   const prev = codexPickerQueue.get(tabId) || Promise.resolve();
   const next = prev.catch(() => {}).then(async () => {
     try {
-      return await withPtyWriteLock(term, () => selectCodexModelEffort(term, { tabId, model, effort }));
+      return await withPtyWriteLock(term, () => selectCodexModelEffort(term, {
+        tabId,
+        model,
+        effort,
+        hasDraft,
+        draftSource,
+        draftPreview,
+        visualHasDraft,
+        visualSource,
+        visualPreview,
+      }));
     } catch (error) {
       console.error('[codex:select-model-effort] Error:', error);
       try { term.write('\x1b'); } catch {}
@@ -14625,6 +15247,16 @@ ipcMain.handle('claude-sdk:load-history', async (event, { sessionId, cwd }) => {
   }
 });
 
+function clearClaudeAwaitingQuestion(tabId, reason) {
+  if (!tabId) return;
+  const wasAwaiting = !!claudeAwaitingInput.get(tabId);
+  if (!wasAwaiting) return;
+  claudeAwaitingInput.set(tabId, false);
+  const win = BrowserWindow.getAllWindows()[0];
+  if (win && !win.isDestroyed()) win.webContents.send('claude:awaiting-input', { tabId, awaiting: false });
+  console.log('[ClaudeQuestion] awaiting cleared tab=' + tabId.slice(-12) + ' reason=' + reason);
+}
+
 // ── Answer a PTY-Claude AskUserQuestion by driving the Ink TUI keystrokes ────
 // PTY-Claude renders its question picker in the xterm (Ink CustomSelect). There
 // is NO IPC answer path like SDK's parked canUseTool — the desktop user answers
@@ -14719,8 +15351,9 @@ async function stopClaudeQuestionPTY(tabId) {
 // Returns { success }.
 async function answerClaudeQuestionUnified({ tabId, source, toolUseID, questions, answers, stop }) {
   if (source === 'pty') {
-    if (stop) return stopClaudeQuestionPTY(tabId);
-    return answerClaudeQuestionPTY(tabId, answers || {});
+    const result = stop ? await stopClaudeQuestionPTY(tabId) : await answerClaudeQuestionPTY(tabId, answers || {});
+    if (result?.success) clearClaudeAwaitingQuestion(tabId, stop ? 'pty-stop' : 'pty-answer');
+    return result;
   }
   // SDK: reuse the existing parked-Promise resolver via the same code the IPC
   // handler runs. We replicate its core here (the IPC handler is renderer-only).
@@ -14756,6 +15389,32 @@ function getClaudePendingQuestion(tabId) {
   }
   return null;
 }
+
+ipcMain.handle('claude:get-pending-question', async (_event, { tabId } = {}) => {
+  if (!tabId) return { success: false, error: 'tabId required', pendingQuestion: null };
+  const pendingQuestion = getClaudePendingQuestion(tabId);
+  console.log('[ClaudeQuestion:IPC] get-pending tab=' + tabId.slice(-12) + ' source=' + (pendingQuestion?.source || 'none') + ' qs=' + (pendingQuestion?.questions?.length || 0));
+  return { success: true, pendingQuestion };
+});
+
+ipcMain.handle('claude:answer-question', async (_event, payload = {}) => {
+  const tabId = payload.tabId;
+  if (!tabId) return { success: false, error: 'tabId required' };
+  const pendingQuestion = getClaudePendingQuestion(tabId);
+  const source = payload.source || pendingQuestion?.source;
+  console.log('[ClaudeQuestion:IPC] answer tab=' + tabId.slice(-12) + ' source=' + (source || 'none') + ' stop=' + !!payload.stop + ' qs=' + ((payload.questions || pendingQuestion?.questions || []).length) + ' answers=' + Object.keys(payload.answers || {}).length);
+  if (!source) return { success: false, error: 'no_pending_question' };
+  const result = await answerClaudeQuestionUnified({
+    tabId,
+    source,
+    toolUseID: payload.toolUseID || pendingQuestion?.toolUseID,
+    questions: payload.questions || pendingQuestion?.questions || [],
+    answers: payload.answers || {},
+    stop: !!payload.stop,
+  });
+  console.log('[ClaudeQuestion:IPC] answer-result tab=' + tabId.slice(-12) + ' success=' + !!result?.success + ' error=' + (result?.error || result?.reason || '-'));
+  return result;
+});
 
 // Resolve a parked AskUserQuestion (SDK tab). The renderer's <SDKAskQuestion>
 // posts either the collected answers or a stop request; we resolve the parked

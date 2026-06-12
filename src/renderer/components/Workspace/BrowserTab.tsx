@@ -51,7 +51,11 @@ function BrowserTab({ tabId, url, active: activeProp, isActiveProject: isActiveP
     ipcRenderer.on('terminal:command-started', onStarted);
     ipcRenderer.on('terminal:command-finished', onFinished);
     // Initial sync
-    ipcRenderer.invoke('terminal:getCommandState', tid).then((state: any) => {
+    ipcRenderer.invoke('terminal:getCommandState', {
+      tabId: tid,
+      caller: 'BrowserTab.initialSync',
+      allowProcessTreeLookup: false,
+    }).then((state: any) => {
       if (state?.isRunning) setHasProcess(true);
     }).catch(() => {});
     return () => {

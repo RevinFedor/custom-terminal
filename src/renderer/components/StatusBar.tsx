@@ -1,7 +1,8 @@
 import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { Settings } from 'lucide-react';
-import { useUIStore, DefaultClaudeEffort } from '../store/useUIStore';
+import { useUIStore } from '../store/useUIStore';
+import type { DefaultClaudeEffort, DefaultClaudeModel, ClaudeCodeModelOption } from '../store/useUIStore';
 import { usePromptsStore } from '../store/usePromptsStore';
 import { useCmdKey } from '../hooks/useCmdHoverPopover';
 
@@ -25,7 +26,9 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
   const setFreePortsBeforeStart = useUIStore((s) => s.setFreePortsBeforeStart);
   const defaultClaudeEffort = useUIStore((s) => s.defaultClaudeEffort);
   const setDefaultClaudeEffort = useUIStore((s) => s.setDefaultClaudeEffort);
-  const claudeCodeEfforts = useUIStore((s) => s.claudeCodeSettings.efforts);
+  const defaultClaudeModel = useUIStore((s) => s.defaultClaudeModel);
+  const setDefaultClaudeModel = useUIStore((s) => s.setDefaultClaudeModel);
+  const claudeCodeSettings = useUIStore((s) => s.claudeCodeSettings);
 
   return (
     <div
@@ -43,7 +46,8 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
         <WebServerChip />
       </div>
       <div className="flex items-center gap-2">
-        <EffortSelector value={defaultClaudeEffort} options={claudeCodeEfforts} onChange={setDefaultClaudeEffort} />
+        <ModelSelector value={defaultClaudeModel} options={claudeCodeSettings.models} onChange={setDefaultClaudeModel} />
+        <EffortSelector value={defaultClaudeEffort} options={claudeCodeSettings.efforts} onChange={setDefaultClaudeEffort} />
         <StatusToggle
           label="kill dev-ports"
           title="Если ВКЛ — перед каждым запуском npm-скрипта / restart / stop сначала убиваются занятые порты проекта (vite/backend), считанные из vite.config / .env / NestJS main.ts. Защита от 'address in use' после крашей."
@@ -168,6 +172,142 @@ const effortLabel = (level: string): string => {
   if (level === 'ultracode') return 'ultra';
   return level;
 };
+
+const modelLabel = (model: string, options: ClaudeCodeModelOption[]): string => {
+  if (model === 'none') return 'none';
+  const found = options.find((m) => m.id === model);
+  return found?.label || model;
+};
+
+function ModelSelector({ value, options, onChange }: {
+  value: DefaultClaudeModel;
+  options: ClaudeCodeModelOption[];
+  onChange: (v: DefaultClaudeModel) => void;
+}) {
+  const [clicked, setClicked] = useState(false);
+  const [chipHover, setChipHover] = useState(false);
+  const [popupHover, setPopupHover] = useState(false);
+  const chipRef = useRef<HTMLButtonElement>(null);
+  const popupRef = useRef<HTMLDivElement>(null);
+  const isCmdPressed = useCmdKey();
+  const open = clicked || (isCmdPressed && chipHover) || popupHover;
+
+  useEffect(() => {
+    if (!clicked) return;
+    const onDown = (e: MouseEvent) => {
+      if (chipRef.current?.contains(e.target as Node)) return;
+      if (popupRef.current?.contains(e.target as Node)) return;
+      setClicked(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [clicked]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onMove = (e: MouseEvent) => {
+      const c = chipRef.current?.getBoundingClientRect();
+      const p = popupRef.current?.getBoundingClientRect();
+      if (!c || !p) return;
+      const { clientX: x, clientY: y } = e;
+      const inC = x >= c.left && x <= c.right && y >= c.top && y <= c.bottom;
+      const inP = x >= p.left && x <= p.right && y >= p.top && y <= p.bottom;
+      const inBridge =
+        x >= Math.min(p.left, c.left) - 8 &&
+        x <= Math.max(p.right, c.right) + 8 &&
+        y >= p.bottom &&
+        y <= c.top;
+      setChipHover(inC);
+      setPopupHover(inP || inBridge);
+    };
+    document.addEventListener('mousemove', onMove);
+    return () => document.removeEventListener('mousemove', onMove);
+  }, [open]);
+
+  return (
+    <>
+      <button
+        ref={chipRef}
+        onClick={() => setClicked(!clicked)}
+        onMouseEnter={() => setChipHover(true)}
+        onMouseLeave={() => setChipHover(false)}
+        className="inline-flex items-center gap-1 cursor-pointer hover:bg-white/5 rounded"
+        style={{ padding: '1px 6px', height: 18 }}
+      >
+        <span style={{ color: '#666' }}>Model:</span>
+        <span style={{ color: value === 'none' ? '#666' : '#DA7756', fontWeight: 500 }}>
+          {modelLabel(value, options)}
+        </span>
+      </button>
+      {open && chipRef.current && createPortal(
+        <ModelPopup
+          chipRect={chipRef.current.getBoundingClientRect()}
+          popupRef={popupRef}
+          value={value}
+          options={options}
+          onSelect={(v) => { onChange(v); setClicked(false); setPopupHover(false); }}
+          onPopupEnter={() => setPopupHover(true)}
+          onPopupLeave={() => setPopupHover(false)}
+        />,
+        document.body
+      )}
+    </>
+  );
+}
+
+function ModelPopup({ chipRect, popupRef, value, options, onSelect, onPopupEnter, onPopupLeave }: {
+  chipRect: DOMRect;
+  popupRef: React.RefObject<HTMLDivElement | null>;
+  value: DefaultClaudeModel;
+  options: ClaudeCodeModelOption[];
+  onSelect: (v: DefaultClaudeModel) => void;
+  onPopupEnter?: () => void;
+  onPopupLeave?: () => void;
+}) {
+  const models = useMemo(() => {
+    const base: ClaudeCodeModelOption[] = [{ id: 'none', label: 'none', cmd: true }, ...options.filter((m) => m?.id)];
+    return base.some((m) => m.id === value) ? base : [...base, { id: value, label: value, cmd: true }];
+  }, [options, value]);
+
+  return (
+    <div
+      ref={popupRef}
+      onMouseEnter={onPopupEnter}
+      onMouseLeave={onPopupLeave}
+      style={{
+        position: 'fixed',
+        right: window.innerWidth - chipRect.right,
+        bottom: window.innerHeight - chipRect.top + 4,
+        paddingBottom: 4,
+        zIndex: 10010,
+      }}
+    >
+      <div
+        className="flex gap-1 bg-[#1a1a1a] border border-[#444] rounded shadow-2xl"
+        style={{ padding: 4, boxShadow: '0 -8px 24px rgba(0,0,0,0.5)' }}
+      >
+        {models.map((model) => {
+          const isActive = value === model.id;
+          return (
+            <button
+              key={model.id}
+              onClick={() => onSelect(isActive ? 'none' : model.id)}
+              className={`text-[10px] px-1.5 py-1 rounded cursor-pointer ${
+                isActive
+                  ? 'bg-[#DA7756]/20 text-white font-medium'
+                  : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'
+              }`}
+              style={{ minWidth: 44 }}
+              title={model.id}
+            >
+              {model.label || model.id}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 // Same visual language as InfoPanel Effort buttons: small pills, accent for active.
 // Status-bar version is a single chip showing the current effort, click → popup with all

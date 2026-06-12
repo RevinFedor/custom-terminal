@@ -6,6 +6,18 @@ import { usePromptQueueStore } from './usePromptQueueStore';
 
 const { ipcRenderer } = window.require('electron');
 
+const restoreShortId = (id: unknown): string => String(id ?? 'null').slice(-12);
+const restoreTabsSummary = (tabs: any[]): string => {
+  const items = tabs.slice(0, 20).map((tab) => {
+    const id = restoreShortId(tab?.tabId || tab?.id);
+    const name = String(tab?.name || '').replace(/\s+/g, ' ').slice(0, 24);
+    const type = tab?.tabType || 'terminal';
+    const command = tab?.commandType || 'generic';
+    return `${id}:${name}:${type}:${command}`;
+  });
+  return items.join(',') + (tabs.length > items.length ? `,+${tabs.length - items.length}` : '');
+};
+
 export type TabColor = 'default' | 'red' | 'yellow' | 'green' | 'blue' | 'purple' | 'claude' | 'gemini' | 'codex';
 
 export type CommandType = 'generic' | 'devServer' | 'claude' | 'gemini' | 'codex';
@@ -37,6 +49,11 @@ export type SessionWriteReason =
   | 'userRevert'
   | 'unknown';
 
+export type CodexSessionWriteReason =
+  | 'detected'
+  | 'userIntercept'
+  | 'unknown';
+
 export interface SessionHistoryEntry {
   sessionId: string;
   reason: SessionWriteReason;
@@ -47,10 +64,12 @@ export interface TabGroup {
   id: string;
   name: string;
   createdAt: number;
+  collapsed?: boolean;
 }
 
 export interface AiLaunchSnapshot {
   sessionType: 'claude' | 'codex';
+  autoTitleEligible?: boolean;
   commandType?: CommandType;
   name: string;
   color?: TabColor;
@@ -64,7 +83,64 @@ export interface AiLaunchSnapshot {
   at: number;
 }
 
+export type AutoTabTitleTool = 'claude' | 'codex';
+
+interface PendingAutoTabTitle {
+  toolType: AutoTabTitleTool;
+  sessionId: string;
+  at: number;
+}
+
 const aiLaunchSnapshots = new Map<string, AiLaunchSnapshot>();
+const pendingAutoTabTitles = new Map<string, PendingAutoTabTitle>();
+const AUTO_TAB_TITLE_PENDING_TTL_MS = 10 * 60 * 1000;
+
+const clearPendingAutoTabTitle = (tabId: string, reason: string): void => {
+  const pending = pendingAutoTabTitles.get(tabId);
+  if (!pending) return;
+  pendingAutoTabTitles.delete(tabId);
+  console.warn(
+    '[Store:AutoTabTitle] clear tab=' + tabId.slice(-8) +
+    ' type=' + pending.toolType +
+    ' sid=' + pending.sessionId.slice(0, 8) +
+    ' reason=' + reason
+  );
+};
+
+const armPendingAutoTabTitle = (tabId: string, toolType: AutoTabTitleTool, sessionId: string): void => {
+  pendingAutoTabTitles.set(tabId, { toolType, sessionId, at: Date.now() });
+  console.warn('[Store:AutoTabTitle] arm tab=' + tabId.slice(-8) + ' type=' + toolType + ' sid=' + sessionId.slice(0, 8));
+};
+
+const shouldArmAutoTabTitle = (
+  tabId: string,
+  toolType: AutoTabTitleTool,
+  prevSessionId: string | undefined,
+  nextSessionId: string
+): boolean => {
+  if (!nextSessionId || prevSessionId) return false;
+  const snapshot = aiLaunchSnapshots.get(tabId);
+  return snapshot?.sessionType === toolType && snapshot.autoTitleEligible === true && !snapshot.nameSetManually;
+};
+
+const consumePendingAutoTabTitle = (tabId: string, toolType: AutoTabTitleTool, sessionId: string): boolean => {
+  const pending = pendingAutoTabTitles.get(tabId);
+  if (!pending) return false;
+
+  if (Date.now() - pending.at > AUTO_TAB_TITLE_PENDING_TTL_MS) {
+    clearPendingAutoTabTitle(tabId, 'expired');
+    return false;
+  }
+
+  if (pending.toolType !== toolType || pending.sessionId !== sessionId) {
+    clearPendingAutoTabTitle(tabId, 'mismatch');
+    return false;
+  }
+
+  pendingAutoTabTitles.delete(tabId);
+  console.warn('[Store:AutoTabTitle] consume tab=' + tabId.slice(-8) + ' type=' + toolType + ' sid=' + sessionId.slice(0, 8));
+  return true;
+};
 
 // Helper: Check if tab has an interrupted AI session that can be resumed
 export const isTabInterrupted = (tab: { wasInterrupted?: boolean; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string }): boolean => {
@@ -331,6 +407,8 @@ interface WorkspaceStore {
   reopenLastClosedTab: (projectId: string) => Promise<{ tabId: string | null; reason?: 'empty' | 'error' }>;
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
+  autoRenameTab: (tabId: string, newName: string, options?: { toolType?: 'claude' | 'gemini' | 'codex'; sessionId?: string; overrideManualName?: boolean; markNameSetManually?: boolean }) => boolean;
+  consumePendingAutoTabTitle: (tabId: string, toolType: AutoTabTitleTool, sessionId: string) => boolean;
 
   // Selection
   toggleTabSelection: (projectId: string, tabId: string, multi?: boolean) => void;
@@ -345,6 +423,7 @@ interface WorkspaceStore {
   setTabColor: (projectId: string, tabId: string, color: TabColor, manual?: boolean) => void;
   setTabSessionStatus: (projectId: string, tabId: string, status: string | null) => void;
   setTabCommandType: (tabId: string, commandType: CommandType) => void; // Also sets auto-color on first run
+  markAiLaunchAutoTitle: (tabId: string, toolType: AutoTabTitleTool) => void;
   getAiLaunchSnapshot: (tabId: string) => AiLaunchSnapshot | null;
   clearAiLaunchSnapshot: (tabId: string, reason?: string) => void;
   rollbackUnmaterializedAiLaunch: (tabId: string, reason: string) => boolean;
@@ -358,6 +437,8 @@ interface WorkspaceStore {
   moveTabsToProject: (sourceProjectId: string, tabIds: string[], targetProjectId: string) => void;
   createTabGroup: (projectId: string, name?: string) => string;
   renameTabGroup: (projectId: string, groupId: string, name: string) => void;
+  toggleTabGroupCollapsed: (projectId: string, groupId: string) => void;
+  deleteTabGroup: (projectId: string, groupId: string) => void;
   setTabVisualParent: (projectId: string, tabId: string, parentTabId: string | undefined) => void;
   applyTabLayout: (projectId: string, orderedIds: string[], groupAssignments?: Record<string, string | null | undefined>, visualParentAssignments?: Record<string, string | null | undefined>) => void;
 
@@ -376,7 +457,7 @@ interface WorkspaceStore {
   getGeminiSessionId: (tabId: string) => string | null;
 
   // Codex session tracking
-  setCodexSessionId: (tabId: string, sessionId: string) => void;
+  setCodexSessionId: (tabId: string, sessionId: string, reason?: CodexSessionWriteReason) => void;
   getCodexSessionId: (tabId: string) => string | null;
   updateCodexState: (tabId: string, state: Partial<Pick<Tab, 'codexModel' | 'codexEffort'>>) => void;
 
@@ -465,6 +546,19 @@ const getNextAvailableName = (baseName: string, existingNames: string[]): string
     num++;
   }
   return `${baseName}-${num.toString().padStart(2, '0')}`;
+};
+
+const normalizeGeneratedTabName = (name: string): string => {
+  let clean = String(name || '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^[`"'“”«»]+|[`"'“”«».:;!?]+$/g, '')
+    .trim();
+  const chars = Array.from(clean);
+  if (chars.length > 64) {
+    clean = chars.slice(0, 64).join('').trim();
+  }
+  return clean;
 };
 
 // Debounce timer for session saving
@@ -568,11 +662,20 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Load from database
     const sessionState = await ipcRenderer.invoke('app:getState', SESSION_KEY) as (SessionState & { projectHistory?: string[] }) | null;
     if (!sessionState) {
+      console.warn('[RestoreSession] no saved session state');
       return;
     }
 
     try {
+      const restoreStart = performance.now();
       const { openProjects, createTab } = get();
+
+      console.warn(
+        `[RestoreSession] start projects=${sessionState.openProjects.length}` +
+        ` active=${restoreShortId(sessionState.activeProjectId)}` +
+        ` view=${sessionState.view || 'unset'}` +
+        ` currentOpen=${Array.from(openProjects.keys()).map(restoreShortId).join(',') || 'none'}`
+      );
 
       set({ isRestoring: true });
 
@@ -581,10 +684,30 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // → 5 projects = 5 set() calls = 5 Workspace remounts = black screen flicker.
       // New approach: load data inline, mutate openProjects map directly, single set() at end.
       for (const proj of sessionState.openProjects) {
-        if (openProjects.has(proj.projectId)) continue;
+        if (openProjects.has(proj.projectId)) {
+          const existing = openProjects.get(proj.projectId);
+          console.warn(
+            `[RestoreSession] projectSkipAlreadyOpen project=${restoreShortId(proj.projectId)}` +
+            ` tabs=${existing?.tabs.size ?? -1}`
+          );
+          continue;
+        }
 
+        const projectStart = performance.now();
+        console.warn(
+          `[RestoreSession] projectStart project=${restoreShortId(proj.projectId)}` +
+          ` path=${proj.projectPath || 'unset'}` +
+          ` activeIndex=${proj.activeTabIndex}`
+        );
         const projectData = await ipcRenderer.invoke('project:getById', proj.projectId);
         const savedTabs = projectData?.tabs || [];
+        console.warn(
+          `[RestoreSession] projectData project=${restoreShortId(proj.projectId)}` +
+          ` found=${!!projectData}` +
+          ` savedTabs=${savedTabs.length}` +
+          ` groups=${projectData?.tabGroups?.length || 0}` +
+          ` tabIds=${restoreTabsSummary(savedTabs)}`
+        );
 
         const newWorkspace: ProjectWorkspace = {
           projectId: proj.projectId,
@@ -602,6 +725,20 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           viewingSubAgentTabId: null
         };
         openProjects.set(proj.projectId, newWorkspace);
+        const liveOpenProjects = get().openProjects;
+        if (liveOpenProjects !== openProjects && !liveOpenProjects.has(proj.projectId)) {
+          liveOpenProjects.set(proj.projectId, newWorkspace);
+          console.warn(
+            `[RestoreSession] liveMapPatched project=${restoreShortId(proj.projectId)}` +
+            ` capturedProjects=${Array.from(openProjects.keys()).map(restoreShortId).join(',')}` +
+            ` liveProjects=${Array.from(liveOpenProjects.keys()).map(restoreShortId).join(',')}`
+          );
+        }
+        console.warn(
+          `[RestoreSession] workspaceCreated project=${restoreShortId(proj.projectId)}` +
+          ` openProjects=${Array.from(openProjects.keys()).map(restoreShortId).join(',')}` +
+          ` tabGroups=${newWorkspace.tabGroups.length}`
+        );
 
         if (savedTabs.length > 0) {
           let maxTabNum = savedTabs.length;
@@ -612,8 +749,22 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             }
           }
           newWorkspace.tabCounter = maxTabNum;
-          for (const savedTab of savedTabs) {
-            await createTab(proj.projectId, savedTab.name, savedTab.cwd, {
+          console.warn(
+            `[RestoreSession] tabCounter project=${restoreShortId(proj.projectId)}` +
+            ` counter=${newWorkspace.tabCounter} savedTabs=${savedTabs.length}`
+          );
+          for (let i = 0; i < savedTabs.length; i++) {
+            const savedTab = savedTabs[i];
+            console.warn(
+              `[RestoreSession] tabRestoreStart project=${restoreShortId(proj.projectId)}` +
+              ` idx=${i + 1}/${savedTabs.length}` +
+              ` tab=${restoreShortId(savedTab.tabId)}` +
+              ` name=${String(savedTab.name || '').replace(/\s+/g, ' ').slice(0, 40)}` +
+              ` type=${savedTab.tabType || 'terminal'}` +
+              ` command=${savedTab.commandType || 'generic'}` +
+              ` cwd=${savedTab.cwd || 'unset'}`
+            );
+            const createdTabId = await createTab(proj.projectId, savedTab.name, savedTab.cwd, {
               color: savedTab.color,
               isUtility: savedTab.isUtility,
               commandType: savedTab.commandType,
@@ -638,6 +789,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               claudeTaskCount: savedTab.claudeTaskCount || 0,
               restoreId: savedTab.tabId
             } as any);
+            const stateWorkspace = get().openProjects.get(proj.projectId);
+            console.warn(
+              `[RestoreSession] tabRestoreEnd project=${restoreShortId(proj.projectId)}` +
+              ` idx=${i + 1}/${savedTabs.length}` +
+              ` requested=${restoreShortId(savedTab.tabId)}` +
+              ` returned=${restoreShortId(createdTabId)}` +
+              ` workspaceTabs=${newWorkspace.tabs.size}` +
+              ` stateWorkspaceTabs=${stateWorkspace?.tabs.size ?? -1}`
+            );
           }
           for (const [, tab] of newWorkspace.tabs) {
             if (tab.parentTabId) {
@@ -646,7 +806,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             }
           }
         } else {
-          await createTab(proj.projectId, 'Terminal 1', proj.projectPath);
+          console.warn(`[RestoreSession] noSavedTabs project=${restoreShortId(proj.projectId)} creatingDefault=true`);
+          const createdTabId = await createTab(proj.projectId, 'Terminal 1', proj.projectPath);
+          console.warn(
+            `[RestoreSession] defaultTabEnd project=${restoreShortId(proj.projectId)}` +
+            ` returned=${restoreShortId(createdTabId)}` +
+            ` workspaceTabs=${newWorkspace.tabs.size}`
+          );
         }
 
         // Set active tab by saved index
@@ -656,6 +822,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             newWorkspace.activeTabId = tabsArray[proj.activeTabIndex];
           }
         }
+        console.warn(
+          `[RestoreSession] projectDone project=${restoreShortId(proj.projectId)}` +
+          ` tabs=${newWorkspace.tabs.size}` +
+          ` active=${restoreShortId(newWorkspace.activeTabId)}` +
+          ` durMs=${(performance.now() - projectStart).toFixed(1)}`
+        );
       }
 
       // SDK history pre-fetch: load JSONL for every SDK tab in parallel BEFORE
@@ -703,6 +875,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         ? sessionState.activeProjectId
         : null;
 
+      console.warn(
+        `[RestoreSession] beforeSet restoredActive=${restoreShortId(restoredActiveId)}` +
+        ` savedView=${savedView}` +
+        ` projects=${Array.from(openProjects.values()).map((ws) => `${restoreShortId(ws.projectId)}:${ws.tabs.size}`).join(',') || 'none'}`
+      );
       set({
         activeProjectId: restoredActiveId,
         view: savedView === 'workspace' && restoredActiveId ? 'workspace' : 'dashboard',
@@ -710,10 +887,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         openProjects: new Map(openProjects),
         projectHistory: restoredHistory
       });
+      console.warn(
+        `[RestoreSession] done durMs=${(performance.now() - restoreStart).toFixed(1)}` +
+        ` stateProjects=${Array.from(get().openProjects.values()).map((ws) => `${restoreShortId(ws.projectId)}:${ws.tabs.size}`).join(',') || 'none'}` +
+        ` active=${restoreShortId(get().activeProjectId)}` +
+        ` view=${get().view}`
+      );
 
       get().saveSession();
     } catch (e) {
-      console.error('[Session] Failed to restore:', e);
+      console.error(
+        '[Session] Failed to restore:',
+        e,
+        'stateProjects=',
+        Array.from(get().openProjects.values()).map((ws) => `${restoreShortId(ws.projectId)}:${ws.tabs.size}`).join(',') || 'none'
+      );
       set({ isRestoring: false });
     }
   },
@@ -946,10 +1134,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const workspace = openProjects.get(projectId);
 
     if (workspace) {
+      const startedAt = performance.now();
+      const startedAbs = performance.timeOrigin + startedAt;
+      const tabsToKill = Array.from(workspace.tabs.keys());
+      console.warn(
+        '[Perf:CloseProject] start' +
+        ' project=' + projectId.slice(-12) +
+        ' active=' + (activeProjectId === projectId ? '1' : '0') +
+        ' view=' + view +
+        ' tabs=' + workspace.tabs.size +
+        ' totalProjects=' + openProjects.size +
+        ' startAbs=' + startedAbs.toFixed(1)
+      );
       // Save tabs before closing (manual close = NOT interrupted)
       saveTabs(workspace.projectId, workspace.tabs);
 
-      const tabsToKill = Array.from(workspace.tabs.keys());
       const nextOpenProjects = new Map(openProjects);
       nextOpenProjects.delete(projectId);
 
@@ -979,6 +1178,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }));
 
       saveSession();
+      console.warn(
+        '[Perf:CloseProject] state-updated' +
+        ' project=' + projectId.slice(-12) +
+        ' nextActive=' + (nextActiveId ? nextActiveId.slice(-12) : 'none') +
+        ' remainingProjects=' + nextOpenProjects.size +
+        ' tabsKilled=' + tabsToKill.length +
+        ' durMs=' + (performance.now() - startedAt).toFixed(1)
+      );
 
       // PTY shutdown may involve process checks and graceful Ctrl+C. Keep it off the
       // critical UI path so closing a project cannot look like a global freeze.
@@ -986,6 +1193,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         usePromptQueueStore.getState().cleanupClosedTab(tabId);
         ipcRenderer.send('terminal:kill', tabId);
       });
+      console.warn(
+        '[Perf:CloseProject] kill-sent' +
+        ' project=' + projectId.slice(-12) +
+        ' tabsKilled=' + tabsToKill.length +
+        ' durMs=' + (performance.now() - startedAt).toFixed(1)
+      );
     }
   },
 
@@ -995,6 +1208,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const workspace = openProjects.get(projectId);
 
     if (!workspace) {
+      console.error(
+        `[Store:createTabMissingWorkspace] project=${restoreShortId(projectId)}` +
+        ` name=${String(name || '').replace(/\s+/g, ' ').slice(0, 40)}` +
+        ` restoreId=${restoreShortId((options as any)?.restoreId)}` +
+        ` isRestoring=${get().isRestoring}` +
+        ` openProjects=${Array.from(openProjects.keys()).map(restoreShortId).join(',') || 'none'}`
+      );
       log.tabs('createTab: No workspace for projectId:', projectId);
       return '';
     }
@@ -1047,14 +1267,38 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         ? options.pendingAction.command
         : undefined;
 
-      const { pid } = await ipcRenderer.invoke('terminal:create', {
-        tabId,
-        projectId,
-        cwd: newTab.cwd,
-        rows: 24,
-        cols: 80,
-        initialCommand
-      });
+      let pid: number;
+      try {
+        console.warn(
+          `[Store:createTabTerminalStart] project=${restoreShortId(projectId)}` +
+          ` tab=${restoreShortId(tabId)}` +
+          ` restore=${!!(options as any)?.restoreId}` +
+          ` cwd=${newTab.cwd}`
+        );
+        const result = await ipcRenderer.invoke('terminal:create', {
+          tabId,
+          projectId,
+          cwd: newTab.cwd,
+          rows: 24,
+          cols: 80,
+          initialCommand
+        });
+        pid = result.pid;
+        console.warn(
+          `[Store:createTabTerminalEnd] project=${restoreShortId(projectId)}` +
+          ` tab=${restoreShortId(tabId)}` +
+          ` pid=${pid}`
+        );
+      } catch (err: any) {
+        console.error(
+          `[Store:createTabTerminalError] project=${restoreShortId(projectId)}` +
+          ` tab=${restoreShortId(tabId)}` +
+          ` restore=${!!(options as any)?.restoreId}` +
+          ` cwd=${newTab.cwd}`,
+          err?.stack || err?.message || err
+        );
+        throw err;
+      }
 
       console.log('[Store] createTab: PTY created with pid:', pid);
       newTab.pid = pid;
@@ -1506,6 +1750,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // Regression: durMs > 150 or [TerminalArea:useMemo RECALCULATING] on a
       // within-project switch means fingerprint regressed.
       const _t0 = performance.now();
+      const _startAbs = performance.timeOrigin + _t0;
       const prevActiveId = workspace.activeTabId;
       const currentView = workspace.currentView;
       const totalTabs = Array.from(openProjects.values()).reduce((acc, ws) => acc + ws.tabs.size, 0);
@@ -1522,12 +1767,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const syncMs = performance.now() - _t0;
       console.warn(
         `[Perf:TabSwitchStart] project=${projectId.slice(-12)} from=${String(prevActiveId).slice(-12)}` +
+        ` startAbs=${_startAbs.toFixed(1)}` +
+        ` endAbs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
         ` to=${tabId.slice(-12)} currentView=${currentView} tabs=${workspace.tabs.size}` +
         ` totalTabs=${totalTabs} syncMs=${syncMs.toFixed(1)}`
       );
       requestAnimationFrame(() => {
         const durMs = (performance.now() - _t0).toFixed(1);
-        console.warn(`[Perf:TabSwitch] project=${projectId.slice(-12)} from=${String(prevActiveId).slice(-12)} to=${tabId.slice(-12)} durMs=${durMs}`);
+        console.warn(
+          `[Perf:TabSwitch] project=${projectId.slice(-12)} from=${String(prevActiveId).slice(-12)}` +
+          ` to=${tabId.slice(-12)} frameAbs=${(performance.timeOrigin + performance.now()).toFixed(1)} durMs=${durMs}`
+        );
         requestAnimationFrame(() => {
           const state = get();
           const wsNow = state.openProjects.get(projectId);
@@ -1535,6 +1785,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           console.warn(
             `[Perf:TabSwitchFrame2] project=${projectId.slice(-12)} from=${String(prevActiveId).slice(-12)}` +
             ` to=${tabId.slice(-12)} durMs=${dur2Ms}` +
+            ` frameAbs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
             ` currentView=${wsNow?.currentView || 'missing'} activeNow=${String(wsNow?.activeTabId).slice(-12)}`
           );
         });
@@ -1558,6 +1809,69 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         saveTabs(workspace.projectId, workspace.tabs);
       }
     }
+  },
+
+  autoRenameTab: (tabId, newName, options = {}) => {
+    const cleanName = normalizeGeneratedTabName(newName);
+    if (!cleanName) return false;
+
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (!tab) continue;
+      if (tab.nameSetManually && !options.overrideManualName) {
+        console.warn('[Store:autoRenameTab] skip tab=' + tabId.slice(-8) + ' reason=manual-name');
+        return false;
+      }
+      if (options.toolType && tab.commandType && tab.commandType !== options.toolType && !options.overrideManualName) {
+        console.warn('[Store:autoRenameTab] skip tab=' + tabId.slice(-8) + ' reason=tool-mismatch expected=' + options.toolType + ' actual=' + tab.commandType);
+        return false;
+      }
+      if (options.sessionId) {
+        const currentSessionId = options.toolType === 'codex'
+          ? tab.codexSessionId
+          : options.toolType === 'gemini'
+            ? tab.geminiSessionId
+            : tab.claudeSessionId;
+        if (currentSessionId !== options.sessionId) {
+          console.warn('[Store:autoRenameTab] skip tab=' + tabId.slice(-8) + ' reason=session-changed expected=' + options.sessionId.slice(0, 8) + ' actual=' + (currentSessionId ? currentSessionId.slice(0, 8) : 'null'));
+          return false;
+        }
+      }
+
+      const existingNames = Array.from(workspace.tabs.values())
+        .filter(t => t.id !== tabId)
+        .map(t => t.name);
+      const uniqueName = getNextAvailableName(cleanName, existingNames);
+      if (tab.name === uniqueName) {
+        if (options.markNameSetManually && !tab.nameSetManually) {
+          tab.nameSetManually = true;
+          set({ openProjects: new Map(openProjects) });
+          saveTabs(workspace.projectId, workspace.tabs);
+          console.warn('[Store:autoRenameTab] tab=' + tabId.slice(-8) + ' unchanged but marked manual ' + JSON.stringify(uniqueName));
+          return true;
+        }
+        return false;
+      }
+
+      const prevName = tab.name;
+      tab.name = uniqueName;
+      if (options.markNameSetManually) {
+        tab.nameSetManually = true;
+      }
+      // Automatic generated names remain auto-owned. Explicit context-menu
+      // refresh can opt into nameSetManually so future automatic launch naming
+      // still respects the user's intentional action.
+      set({ openProjects: new Map(openProjects) });
+      saveTabs(workspace.projectId, workspace.tabs);
+      console.warn('[Store:autoRenameTab] tab=' + tabId.slice(-8) + ' ' + JSON.stringify(prevName) + ' → ' + JSON.stringify(uniqueName));
+      return true;
+    }
+    return false;
+  },
+
+  consumePendingAutoTabTitle: (tabId, toolType, sessionId) => {
+    return consumePendingAutoTabTitle(tabId, toolType, sessionId);
   },
 
   reorderTabs: (projectId, oldIndex, newIndex) => {
@@ -1703,6 +2017,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     return aiLaunchSnapshots.get(tabId) || null;
   },
 
+  markAiLaunchAutoTitle: (tabId, toolType) => {
+    const snap = aiLaunchSnapshots.get(tabId);
+    if (!snap || snap.sessionType !== toolType) {
+      console.warn('[Store:AiLaunchSnapshot] auto-title-skip tab=' + tabId.slice(-8) + ' type=' + toolType + ' reason=no-matching-snapshot');
+      return;
+    }
+    snap.autoTitleEligible = true;
+    console.warn('[Store:AiLaunchSnapshot] auto-title-eligible tab=' + tabId.slice(-8) + ' type=' + toolType);
+  },
+
   clearAiLaunchSnapshot: (tabId, reason = 'materialized') => {
     const snap = aiLaunchSnapshots.get(tabId);
     if (!snap) return;
@@ -1742,6 +2066,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (snap.codexSessionId) tab.codexSessionId = snap.codexSessionId;
       else delete tab.codexSessionId;
 
+      clearPendingAutoTabTitle(tabId, 'ai-launch-rollback');
       tab.wasInterrupted = !!snap.wasInterrupted;
       tab.overlayDismissed = !!snap.overlayDismissed;
 
@@ -1980,6 +2305,36 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     saveTabGroups(projectId, workspace.tabGroups);
   },
 
+  toggleTabGroupCollapsed: (projectId, groupId) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+
+    workspace.tabGroups = workspace.tabGroups.map(group =>
+      group.id === groupId ? { ...group, collapsed: !group.collapsed } : group
+    );
+    set({ openProjects: new Map(openProjects) });
+    saveTabGroups(projectId, workspace.tabGroups);
+  },
+
+  deleteTabGroup: (projectId, groupId) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+
+    workspace.tabGroups = workspace.tabGroups.filter(group => group.id !== groupId);
+    let touchedTabs = false;
+    for (const tab of workspace.tabs.values()) {
+      if (tab.groupId !== groupId) continue;
+      tab.groupId = undefined;
+      touchedTabs = true;
+    }
+
+    set({ openProjects: new Map(openProjects) });
+    saveTabGroups(projectId, workspace.tabGroups);
+    if (touchedTabs) saveTabs(workspace.projectId, workspace.tabs);
+  },
+
   setTabVisualParent: (projectId, tabId, parentTabId) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
@@ -2178,6 +2533,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           tab.claudeSessionHistory = hist.slice(0, 5);
         }
 
+        if (reason === 'bridge' && shouldArmAutoTabTitle(tabId, 'claude', prev, sessionId)) {
+          armPendingAutoTabTitle(tabId, 'claude', sessionId);
+        } else if (!sessionId || (prev && prev !== sessionId)) {
+          clearPendingAutoTabTitle(tabId, !sessionId ? 'claude-session-cleared' : 'claude-session-changed');
+        }
+
         tab.claudeSessionId = sessionId;
         // Reset overlay flags when new session starts (so overlay shows again if interrupted)
         tab.wasInterrupted = false;
@@ -2241,17 +2602,23 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   // Codex session tracking (detected from ~/.codex/sessions JSONL)
-  setCodexSessionId: (tabId, sessionId) => {
+  setCodexSessionId: (tabId, sessionId, reason = 'detected') => {
     const { openProjects } = get();
 
     for (const [projectId, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
         if (tab.codexSessionId === sessionId) return;
+        const prev = tab.codexSessionId;
+        if (reason === 'detected' && shouldArmAutoTabTitle(tabId, 'codex', prev, sessionId)) {
+          armPendingAutoTabTitle(tabId, 'codex', sessionId);
+        } else if (!sessionId || (prev && prev !== sessionId)) {
+          clearPendingAutoTabTitle(tabId, !sessionId ? 'codex-session-cleared' : 'codex-session-changed');
+        }
         tab.codexSessionId = sessionId;
         tab.wasInterrupted = false;
         tab.overlayDismissed = false;
-        console.log(`[Workspace] Codex session set for tab ${tabId}: ${sessionId} (reset overlay flags)`);
+        console.log(`[Workspace] Codex session set for tab ${tabId}: ${sessionId} (reason=${reason}, reset overlay flags)`);
         saveTabs(workspace.projectId, workspace.tabs);
         set({});
         return;
@@ -2707,7 +3074,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           name: tab.name, cwd: tab.cwd, color: tab.color, isUtility: tab.isUtility,
           commandType: tab.commandType, claudeSessionId: tab.claudeSessionId,
           geminiSessionId: tab.geminiSessionId, codexSessionId: tab.codexSessionId,
-          codexModel: tab.codexModel, codexEffort: tab.codexEffort, wasInterrupted: tab.wasInterrupted,
+          codexModel: tab.codexModel, codexEffort: tab.codexEffort, sessionStatus: tab.sessionStatus, wasInterrupted: tab.wasInterrupted,
           overlayDismissed: tab.overlayDismissed, notes: tab.notes, tabType: tab.tabType,
           url: tab.url, terminalId: tab.terminalId, terminalName: tab.terminalName,
           activeView: tab.activeView, createdAt: tab.createdAt, isCollapsed: tab.isCollapsed,
@@ -2754,14 +3121,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const workspace = openProjects.get(projectId);
     if (!workspace || workspace.currentView === view) return;
     const _t0 = performance.now();
+    const _startAbs = performance.timeOrigin + _t0;
     const previousView = workspace.currentView;
     const totalTabs = Array.from(openProjects.values()).reduce((acc, ws) => acc + ws.tabs.size, 0);
     workspace.currentView = view;
-    console.warn(`[Perf:ProjectView] project=${projectId.slice(-12)} ${previousView}->${view} tabs=${workspace.tabs.size} totalTabs=${totalTabs}`);
+    console.warn(
+      `[Perf:ProjectView] project=${projectId.slice(-12)} ${previousView}->${view}` +
+      ` startAbs=${_startAbs.toFixed(1)}` +
+      ` endAbs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
+      ` tabs=${workspace.tabs.size} totalTabs=${totalTabs}`
+    );
     startTransition(() => set({ openProjects: new Map(openProjects) }));
     requestAnimationFrame(() => {
       console.warn(
         `[Perf:ProjectViewFrame] project=${projectId.slice(-12)} ${previousView}->${view}` +
+        ` frameAbs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
         ` durMs=${(performance.now() - _t0).toFixed(1)} tabs=${workspace.tabs.size} totalTabs=${totalTabs}`
       );
     });

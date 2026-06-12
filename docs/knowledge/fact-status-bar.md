@@ -11,7 +11,8 @@ VSCode-style полоса по всей нижней границе окна (п
 
 | Элемент | Назначение | Persistence |
 |---|---|---|
-| `Effort: <value>` chip + popup | Default Claude effort для будущих сессий (`none / auto / low / med / high / max`) | SQLite `app:setState(defaultClaudeEffort)` + localStorage boot mirror |
+| `Model: <value>` chip + popup | Default Claude model для будущих Claude PTY-сессий (`none / default / sonnet / opus / haiku` + модели из настроек) | SQLite `app:setState(defaultClaudeModel)` + localStorage boot mirror |
+| `Effort: <value>` chip + popup | Default Claude effort для будущих сессий (`none / low / med / high / xhi / max / ultra`) | SQLite `app:setState(defaultClaudeEffort)` + localStorage boot mirror |
 | `● kill dev-ports` toggle | Перед каждым запуском npm-скрипта убивать занятые порты проекта | SQLite `app:setState(freePortsBeforeStart)` + localStorage boot mirror |
 | `● bridges` toggle | Подсвечивать невидимые hover-мосты красным (через `HoverBridgeDebug`) | SQLite `app:setState(debugHoverBridges)` + localStorage boot mirror |
 | `! N` оранжевый chip | Счётчик невалидных файловых путей в AI-промптах (рендерится только если N > 0) | derived, не persist |
@@ -22,9 +23,9 @@ VSCode-style полоса по всей нижней границе окна (п
 
 **Чип лимитов Claude — не здесь.** Weekly% Anthropic подписки и per-tab token-cost живут в [`ProjectToolbar`](../../src/renderer/components/Workspace/ProjectToolbar.tsx), не в StatusBar. Причина: chip session-aware (читает `getEffectiveTabId` и активный проект), а status bar — глобальные toggle'ы без привязки к табу. См. [`fact-claude-usage-chip.md`](fact-claude-usage-chip.md).
 
-## EffortSelector: tri-mode trigger
+## Model/Effort selector: tri-mode trigger
 
-Chip-trigger в status bar открывает popup с 6 кнопками тремя путями:
+Chip-trigger в status bar открывает popup тремя путями. Model и Effort используют один interaction pattern: StatusBar хранит **global default для будущих запусков**, а не пытается быть per-tab индикатором текущей живой сессии.
 
 | Trigger | Состояние | Закрытие |
 |---|---|---|
@@ -39,7 +40,9 @@ Chip-trigger в status bar открывает popup с 6 кнопками тре
 - **Right-anchor**: `right: window.innerWidth - chipRect.right`. Не left-anchor — иначе popup уходит вправо за Timeline-strip и обрезается. См. [`methodology/сценарии-багов-design.md::1.1 Popup уезжает за правый/нижний край`](../methodology/сценарии-багов-design.md).
 - CSS-bridge через `paddingBottom: 4` ВНУТРИ popup-wrapper'а — gap от popup до chip покрыт hit-area'ой popup'а, курсор может ехать через эти 4px не теряя hover. Wrapper вплотную к chip'у (`bottom: window.innerHeight - chipRect.top`, **без** offset'а).
 
-**Применение к runtime сессии реализовано через ранний `tui-ready`.** Селектор сохраняет global default, а при запуске Claude `Terminal.tsx` ждёт детерминированный prompt-сигнал и отправляет `/effort <level>` через `claude:send-command`. Bridge/process-started остаётся fallback'ом, но не главным trigger'ом: bridge может прийти на 3-6 секунд позже prompt'а и создать дубль. Полная таблица resume/fresh поведения — `fact-claude-tui-control.md::Auto-inject /effort при запуске Claude`.
+**Применение к runtime сессии реализовано через ранний `tui-ready`.** Селектор сохраняет global default, а при запуске Claude `Terminal.tsx` ждёт детерминированный prompt-сигнал. Если `defaultClaudeModel !== 'none'`, сначала отправляется `/model <model>`; только после `claude:bridge-update`, где bridge-модель совпала с целью, цепочка продолжает `/effort <level>`. Bridge/process-started остаётся fallback'ом, но не главным trigger'ом: bridge может прийти на 3-6 секунд позже prompt'а и создать дубль. Полная таблица resume/fresh поведения — `fact-claude-tui-control.md::Startup defaults /model + /effort при запуске Claude`.
+
+**Persistence source of truth — SQLite.** `localStorage` здесь только synchronous boot mirror для первого paint и старых origin'ов dev-сервера. Dev/prod разделяются разными SQLite DB, поэтому `defaultClaudeModel/defaultClaudeEffort` могут отличаться между development и production без специальных условий в UI.
 
 ## Bridges debug toggle
 

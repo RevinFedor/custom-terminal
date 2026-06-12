@@ -8,6 +8,8 @@ Claude Code использует уникальный RGB-цвет для выд
 *   **ANSI Code:** `\x1b[38;2;177;185;249m`
 *   **Почему это важно:** Символ курсора `❯` часто исчезает из diff-ов PTY при частичном обновлении экрана. Цвет — единственная константа, гарантирующая нахождение активного элемента.
 
+Этот marker использовать как reverse-verification, а не как источник контента. Для Rewind/model/effort/AskUserQuestion контент по возможности берётся из структурного канала (JSONL/tool_input/SSE), а PTY-цвет отвечает только на вопрос «какая видимая строка сейчас активна после нажатия стрелки». Такой narrow parse устойчивее полного screen parsing: flicker и исчезающий `❯` не ломают проверку, пока активная строка сохраняет lavender color.
+
 ## 2. Проблема Stale Sync Markers
 Библиотека Ink (React renderer for CLI) асинхронна. При вставке текста или обновлении UI она может генерировать **несколько** пар маркеров синхронизации (`\x1b[?2026h` ... `\x1b[?2026l`) за одну операцию.
 
@@ -111,4 +113,3 @@ Claude Code с версии 2.1.110 (16 апреля 2026) использует 
 Решение — глобальный детектор поверх существующего: при каждом PTY-data event для таба у которого `bridgeKnownSessions.has` и `claudePromptReady` ещё не выставлен, ищем `⏵`/`>` в данных. Первое попадание → `claudePromptReady.add(tabId)` + WS snapshot для mobile. Локальный handshake-state не трогается — продолжает работать как раньше, просто теперь есть второй reader того же сигнала.
 
 `claude:get-presence` IPC использует флаг для различения `starting` (process есть, prompt ещё нет) и `active` (готов к вводу). Cleanup в трёх местах: `clearBridgeTab` (Claude exit через Ctrl+C×2), PTY `onExit`, `terminal:kill`. См. `fact-mobile-claude-pty.md::Lifecycle states`.
-
