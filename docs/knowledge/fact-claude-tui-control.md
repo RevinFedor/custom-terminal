@@ -6,6 +6,8 @@ Claude Code CLI работает на базе Ink (React TUI) в raw mode с в
 - Обычный `\t` (Tab) → не переключает thinking mode (нужен `meta+t`)
 - Slash-команды (`/model`, `/compact` и т.д.) — обычный текстовый ввод, парсится после Enter
 
+**Поисковые симптомы:** startup default model висит на `❯ 1. Yes, switch to Haiku`; после успешного model switch не вводится `/effort max`; `/effort` уходит в период `Switch model?` confirmation; model/effort dialogs подавляют друг друга cooldown'ом; return из `safePasteAndSubmit` наступил, но Claude TUI ещё не применил настройку.
+
 ## Решение: Bracketed Paste + Delayed Enter
 
 ### Отправка команд (IPC `claude:send-command`)
@@ -240,7 +242,7 @@ ipcRenderer.send('claude:send-command', tabId, '/effort medium');
 ### Защита от двойного срабатывания (Command Guard)
 Как и при переключении модели, Effort отправляется через `safePasteAndSubmit`. Во время отправки команды кнопки Effort, Model и Think **блокируются** флагом `isCommandRunning`. Это предотвращает отправку нескольких команд подряд.
 
-### Auto-confirm «Change effort level?» dialog
+### Auto-confirm settings dialogs: effort и model
 В **новой директории** (нет сохранённого разрешения) после `/effort N` Claude TUI показывает 2-pos меню:
 ```
 Change effort level?
@@ -254,32 +256,38 @@ the full history gets re-read on your next message.
 ```
 Дефолт стоит на «Yes» — Enter подтверждает. Симптом: юзер нажимает «Effort → max» в UI, ничего не происходит, в терминале висит этот диалог; следующий ввод Enter в инпуте уходит в TUI и интерпретируется как подтверждение/отказ непредсказуемо.
 
-**Решение** (`main.js::ptyProcess.onData` после Session ID detection): отдельный детектор смотрит на `stripVTControlCharacters(data).includes('Change effort level')` → через 120мс шлёт `\r` в PTY. Cooldown `claudeEffortDialogCooldown` 2с защищает от двойного срабатывания при Ink re-render. Cleanup при `ptyProcess.onExit`.
+`/model <X>` показывает тот же класс confirmation menu с заголовком `Switch model?` и highlighted option `❯ 1. Yes, switch to <X>`. Симптом: startup default model доходит до меню, курсор стоит на `Yes`, но процесс визуально «зависает» на подтверждении; при повторном запуске model может пройти, а следующий `/effort max` уже не вводится.
 
-**Шрам: текст в Ink-меню рендерится без литеральных пробелов.** Первая версия матча была `'Change effort level' && 'Yes, switch'`. Падала: Ink TUI заменяет пробелы внутри строки меню на `\x1b[1C` (cursor-forward) — после `stripVTControlCharacters` получается `Yes,switchtolow`. Плюс диалог приходит в **3-5 отдельных PTY-чанках** (заголовок жёлтый, описание серое, опции синие — каждый блок отдельным write), поэтому матч из двух подстрок в пределах одного chunk вообще не имеет шансов. Финальный матч — только на уникальном `Change effort level` (это всегда самостоятельный chunk с жёлтым `[1m...[22m`).
+**Решение** (`main.js::ptyProcess.onData` после Session ID detection): detector классифицирует `Change effort level` как `EffortDialog`, `Switch model` как `ModelDialog`, а highlighted строку `❯ 1. Yes, switch to ...` как model fallback. Через 120мс шлёт `\r` в PTY. Cooldown 2с защищает от двойного срабатывания при Ink re-render, но ключ cooldown'а — `${tabId}:${dialogType}`: model-dialog и effort-dialog могут легально идти подряд в одной startup-chain, и общий cooldown на tab подавит второе подтверждение. Cleanup при `ptyProcess.onExit`.
 
-**Задержка 120мс перед `\r`:** ранее было 80 — Ink не успевал дорисовать остаток меню до прихода Enter, и Enter иногда попадал в неопределённое состояние (то срабатывал, то «съедал» prompt). 120мс — детерминированно после полного render.
+**Шрам: текст в Ink-меню рендерится без литеральных пробелов и не всегда приходит заголовком.** Первая версия effort-матча была `'Change effort level' && 'Yes, switch'`. Падала: Ink TUI заменяет пробелы внутри строки меню на `\x1b[1C` (cursor-forward) — после `stripVTControlCharacters` получается `Yes,switchtolow`. Плюс диалог приходит в **3-5 отдельных PTY-чанках** (заголовок жёлтый, описание серое, опции синие — каждый блок отдельным write), поэтому матч из двух подстрок в пределах одного chunk вообще не имеет шансов. Для effort финальный матч — уникальный `Change effort level`; для model дополнительно нужен strict fallback по highlighted `❯ 1. Yes, switch to`, потому что в одном реальном запуске в логах был виден только option chunk. Не матчить generic `Yes, switch` без `❯`: такой текст может появиться в assistant output.
+
+**Задержка 120мс перед `\r`:** ранее было 80 — Ink не успевал дорисовать остаток меню до прихода Enter, и Enter иногда попадал в неопределённое состояние (то срабатывал, то «съедал» prompt). 120мс — post-detection settle после конкретного TUI-события, не primary readiness source. Cooldown — duplicate/error guard, не способ упорядочить startup-chain.
 
 **Принцип:** см. `methodology/переносимый-дизайн.md::Ink TUI: пробелы как ANSI-команды, текст разорван по чанкам`. Любой будущий парсер TUI-вывода для Claude должен матчить **минимальные уникальные подстроки** (одно слово или короткая фраза), не комбинацию из двух — Ink почти гарантированно разнесёт их по чанкам.
 
-### Auto-inject `/effort` при запуске Claude
+### Startup defaults `/model` + `/effort` при запуске Claude
 
-В StatusBar справа — pill `Effort: max` (default per-app, не per-tab). При каждом запуске Claude процесса значение шлётся как `/effort <level>`. Сигнал запуска — **самый ранний детерминированный признак готовности TUI к вводу**, не появление bridge-файла:
+В StatusBar справа — pills `Model: haiku` / `Effort: max` (defaults per-app, не per-tab). При каждом запуске Claude процесса значения шлются как slash-команды в TUI. Сигнал запуска — **самый ранний детерминированный признак готовности TUI к вводу**, не появление bridge-файла:
 
 ```
 Claude рисует prompt-символ ⏵ в PTY → main эмитит claude:tui-ready (~0.8с после старта)
-→ Terminal.tsx handler читает useUIStore.getState().defaultClaudeEffort
-→ если ≠ 'none' и не resume → ipcRenderer.invoke('claude:send-command', tabId, '/effort max')
-→ ставит sentinel _effortSentForTab (via='tui-ready')
+→ Terminal.tsx handler читает useUIStore.getState().defaultClaudeModel/defaultClaudeEffort
+→ если model ≠ 'none': ставит _modelSentForTab и шлёт /model haiku
+→ ждёт claude:bridge-update, где bridge model совпала с target
+→ если effort ≠ 'none': ставит _effortSentForTab и шлёт /effort max
+→ sentinels гасят дубли между tui-ready, Bridge:Fresh и ручными кликами
 ```
 
 `claude:tui-ready` эмитится из того же места `main.js`, где Handshake детектит prompt-символ (`stripVTControlCharacters(data).includes('⏵' | '>')` в state `WAITING_PROMPT`). Это момент когда Claude **готов принять ввод**, а не просто «процесс жив». Принцип «liveness ≠ readiness, бери ранний сигнал» — `methodology/переносимый-дизайн.md::Liveness ≠ readiness`.
 
 **Bridge:Fresh (`claude:process-started`) — теперь fallback, не главный путь.** Раньше инжект висел на нём, но `Bridge:Fresh` лагает: bridge.json должен *появиться* → *пережить DeadTranscript-guard* (у свежей сессии JSONL ещё не на диске, guard «ignoring forever» отбрасывает первый bridge) → *PID зарезолвиться в таб*. В проде измерено **3-6 секунд** после старта Claude (сессии tab-2933 `3c4712b9`, tab-2986). `handleProcessStarted` остался как fallback на случай если ⏵ не распарсился (новая версия TUI / кастомный шрифт) — он проверяет sentinel и молчит если tui-ready уже отработал.
 
+**`/model` completion barrier — bridge-update, не return из `safePasteAndSubmit`.** `safePasteAndSubmit` сериализует paste и ждёт sync-marker render'а; это доказывает что `/model haiku` вставлен и Enter отправлен, но не доказывает что Claude TUI завершил локальную смену модели. Реальный лог tab-3234 (`6f26c93d`, 2026-06-07): `/model haiku` send-command вернулся, через ~4мс стартовал `/effort max`, а `ModelDialog` появился только через ~349мс. Итог: effort paste попадает в период model confirmation и может быть проглочен/направлен не туда. Поэтому цепочка ждёт `claude:bridge-update` с matching model; timeout 6с — только fallback, normal path event-driven.
+
 **Graveyard — Bridge:Fresh как единственный сигнал → двойной `/effort`.** Пока инжект висел только на `Bridge:Fresh`, юзер видел нарисованный prompt без эффекта (3-6с лага), решал что «эффект не выставился», кликал `/effort` руками в ControlBar → улетал **первый** `/effort`, потом запоздавший Bridge:Fresh догонял **вторым**. В JSONL/scrollback копилось два `/effort max` подряд. Детерминированно подтверждено счётчиками `[EffortDiag][HANDLER-ENTRY] callN` / `[INVOKE-FIRE] invokeN` — handler входил один раз, но первая команда уходила за 391мс **до** него (это был ручной клик). Чинится связкой ранний-сигнал + sentinel ниже.
 
-**Once-per-process sentinel `_effortSentForTab`.** Map `tabId → {at, via}`, экспонируется на `window.__effortSentForTab` для доступа из ControlBar. Любой из трёх источников `/effort` (ранний `tui-ready`, fallback `Bridge:Fresh`, ручной клик `setEffortOnPTY` в ControlBar) первым делом ставит метку; остальные видят её и делают early-return. Сброс — НЕ на `process-started`: tui-ready fires раньше Bridge:Fresh, и если сбрасывать на process-started — затрётся метка раннего пути и fallback пошлёт дубль. Это та же ловушка «liveness как reset-триггер», что и в выборе сигнала.
+**Once-per-process sentinels `_modelSentForTab` и `_effortSentForTab`.** Maps `tabId → {at, via}` экспонируются на `window.__modelSentForTab` / `window.__effortSentForTab` для доступа из ControlBar. Любой источник slash-setting (ранний `tui-ready`, fallback `Bridge:Fresh`, ручной клик ControlBar/mobile) первым делом ставит метку; остальные видят её и делают early-return. Сброс — НЕ на `process-started`: tui-ready fires раньше Bridge:Fresh, и если сбрасывать на process-started — затрётся метка раннего пути и fallback пошлёт дубль. Это та же ловушка «liveness как reset-триггер», что и в выборе сигнала.
 
 **Сброс sentinel'а — на смерти Claude (`command-finished`), не только на смерти shell (`terminal:exit`).** Первая версия чистила `_effortSentForTab` **только** в `handleExit` (PTY exit = shell умер). Но `claude-c` (Continue/restart) **переиспользует тот же shell PTY** — shell не выходит, `terminal:exit` не fires, sentinel от **первого** запуска в жизни таба живёт вечно. Каждый последующий рестарт Claude: `tui-ready` fires → `_effortSentForTab.has(tabId)` → `true` → early-return → `/effort` **молча не отправляется**. Эффект: `/effort` инжектится ровно один раз за всю жизнь вкладки, при рестартах — никогда. Юзер: *«сессию я перезапускал, при перезапуске почему-то автоматически /effort не срабатывал, хотя он установлен системой»*.
 

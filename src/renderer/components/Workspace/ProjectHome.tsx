@@ -77,6 +77,9 @@ interface TabHistoryEntry {
   closed_at: number;
   claude_session_id: string | null;
   gemini_session_id: string | null;
+  codex_session_id: string | null;
+  codex_model: string | null;
+  codex_effort: string | null;
   message_count: number | null;
   session_status: string | null;
 }
@@ -93,6 +96,7 @@ interface FavoriteEntry {
   url: string | null;
   claude_session_id: string | null;
   gemini_session_id: string | null;
+  codex_session_id: string | null;
   created_at: number;
 }
 
@@ -238,6 +242,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const pendingReadyRef = useRef<{
     id: number;
     readyAt: number;
+    readyAbs: number;
     firstLoad: boolean;
     tabs: number;
     history: number;
@@ -450,9 +455,17 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
 
   useEffect(() => {
     const mountedAt = performance.now();
-    console.warn(`[Perf:Home] mount project=${projectId.slice(-12)} tabs=${tabs.length}`);
+    console.warn(
+      `[Perf:Home] mount project=${projectId.slice(-12)}` +
+      ` abs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
+      ` tabs=${tabs.length}`
+    );
     return () => {
-      console.warn(`[Perf:Home] unmount project=${projectId.slice(-12)} aliveMs=${(performance.now() - mountedAt).toFixed(1)}`);
+      console.warn(
+        `[Perf:Home] unmount project=${projectId.slice(-12)}` +
+        ` abs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
+        ` aliveMs=${(performance.now() - mountedAt).toFixed(1)}`
+      );
     };
   }, [projectId]);
 
@@ -462,6 +475,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     if (renderToLayoutMs > 50) {
       console.warn(
         `[Perf:HomeRender] project=${projectId.slice(-12)} seq=${renderSeqRef.current}` +
+        ` abs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
         ` loaded=${isLoaded} tabs=${tabs.length} history=${history.length} favorites=${favorites.length}` +
         ` renderToLayoutMs=${renderToLayoutMs.toFixed(1)}`
       );
@@ -483,6 +497,8 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       });
       console.warn(
         `[Perf:HomeCommit] project=${projectId.slice(-12)} loadId=${pending.id}` +
+        ` abs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
+        ` readyAbs=${pending.readyAbs.toFixed(1)}` +
         ` firstLoad=${pending.firstLoad} readyToFrameMs=${(performance.now() - pending.readyAt).toFixed(1)}` +
         ` tabs=${pending.tabs} history=${pending.history} favorites=${pending.favorites}` +
         ` visibleHistory=${visibleHistory} groups=${groupParts.join(',')}`
@@ -506,6 +522,12 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       } else {
         pendingAction = { type: 'gemini-new' };
       }
+    } else if (entry.command_type === 'codex') {
+      if (entry.codex_session_id) {
+        pendingAction = { type: 'codex-continue', sessionId: entry.codex_session_id };
+      } else {
+        pendingAction = { type: 'codex-new' };
+      }
     }
 
     setProjectView(projectId, 'terminal');
@@ -518,6 +540,9 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       pendingAction,
       claudeSessionId: entry.claude_session_id || undefined,
       geminiSessionId: entry.gemini_session_id || undefined,
+      codexSessionId: entry.codex_session_id || undefined,
+      codexModel: entry.codex_model || undefined,
+      codexEffort: entry.codex_effort || undefined,
       sessionStatus: entry.session_status || undefined,
     });
 
@@ -540,6 +565,12 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       } else {
         pendingAction = { type: 'gemini-new' };
       }
+    } else if (entry.command_type === 'codex') {
+      if (entry.codex_session_id) {
+        pendingAction = { type: 'codex-continue', sessionId: entry.codex_session_id };
+      } else {
+        pendingAction = { type: 'codex-new' };
+      }
     }
 
     await createTab(projectId, entry.name, entry.cwd, {
@@ -551,6 +582,9 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       pendingAction,
       claudeSessionId: entry.claude_session_id || undefined,
       geminiSessionId: entry.gemini_session_id || undefined,
+      codexSessionId: entry.codex_session_id || undefined,
+      codexModel: entry.codex_model || undefined,
+      codexEffort: entry.codex_effort || undefined,
       sessionStatus: entry.session_status || undefined,
       background: true,
     });
@@ -574,6 +608,12 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       } else {
         pendingAction = { type: 'gemini-new' };
       }
+    } else if (entry.command_type === 'codex') {
+      if (entry.codex_session_id) {
+        pendingAction = { type: 'codex-continue', sessionId: entry.codex_session_id };
+      } else {
+        pendingAction = { type: 'codex-new' };
+      }
     }
 
     setProjectView(projectId, 'terminal');
@@ -586,6 +626,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       pendingAction,
       claudeSessionId: entry.claude_session_id || undefined,
       geminiSessionId: entry.gemini_session_id || undefined,
+      codexSessionId: entry.codex_session_id || undefined,
     });
   };
 
@@ -601,25 +642,40 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     const tabIdSet = new Set(tabIds);
     let cancelled = false;
     const syncStartedAt = performance.now();
+    const syncStartAbs = performance.timeOrigin + syncStartedAt;
     const tabSummary = tabIds.map((tabId) => {
       const tab = workspace?.tabs.get(tabId);
       return tabId.slice(-8) + ':' + (tab?.commandType || tab?.tabType || 'unknown');
     }).join(',');
     console.warn(
       `[Perf:HomeStatusSync] start project=${projectId.slice(-12)}` +
+      ` startAbs=${syncStartAbs.toFixed(1)}` +
       ` count=${tabIds.length} tabs=${tabSummary}`
     );
 
     Promise.all(
       tabIds.map(async (tabId) => {
         const itemStartedAt = performance.now();
+        const itemStartAbs = performance.timeOrigin + itemStartedAt;
+        const tab = workspace?.tabs.get(tabId);
+        const isCodexTab = tab?.commandType === 'codex';
         try {
-          const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+          const state = await ipcRenderer.invoke('terminal:getCommandState', {
+            tabId,
+            caller: 'ProjectHome.statusSync',
+            expectedProcess: 'codex',
+            allowProcessTreeLookup: isCodexTab,
+          });
           const durMs = performance.now() - itemStartedAt;
           if (durMs > 50) {
             console.warn(
               `[Perf:HomeStatusSync] item project=${projectId.slice(-12)}` +
-              ` tab=${tabId.slice(-8)} running=${!!state?.isRunning} durMs=${durMs.toFixed(1)}`
+              ` tab=${tabId.slice(-8)}` +
+              ` command=${tab?.commandType || tab?.tabType || 'unknown'}` +
+              ` allowProcessTreeLookup=${isCodexTab}` +
+              ` startAbs=${itemStartAbs.toFixed(1)}` +
+              ` endAbs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
+              ` running=${!!state?.isRunning} durMs=${durMs.toFixed(1)}`
             );
           }
           return [tabId, !!state?.isRunning] as [string, boolean];
@@ -627,7 +683,10 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
           const durMs = performance.now() - itemStartedAt;
           console.warn(
             `[Perf:HomeStatusSync] item-error project=${projectId.slice(-12)}` +
-            ` tab=${tabId.slice(-8)} durMs=${durMs.toFixed(1)}`
+            ` tab=${tabId.slice(-8)}` +
+            ` startAbs=${itemStartAbs.toFixed(1)}` +
+            ` endAbs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
+            ` durMs=${durMs.toFixed(1)}`
           );
           return [tabId, false] as [string, boolean];
         }
@@ -636,6 +695,8 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       if (cancelled) return;
       console.warn(
         `[Perf:HomeStatusSync] done project=${projectId.slice(-12)}` +
+        ` startAbs=${syncStartAbs.toFixed(1)}` +
+        ` endAbs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
         ` count=${pairs.length} durMs=${(performance.now() - syncStartedAt).toFixed(1)}` +
         ` running=${pairs.filter(([, running]) => running).length}`
       );
@@ -677,6 +738,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     let cancelled = false;
     const loadId = ++loadSeqRef.current;
     const startedAt = performance.now();
+    const startAbs = performance.timeOrigin + startedAt;
     const firstLoadForProject = historyLoadProjectRef.current !== projectId;
     historyLoadProjectRef.current = projectId;
     if (firstLoadForProject) {
@@ -692,12 +754,15 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       const ipcMs = performance.now() - startedAt;
       console.warn(
         `[Perf:Home] ready project=${projectId.slice(-12)} loadId=${loadId} firstLoad=${firstLoadForProject}` +
+        ` startAbs=${startAbs.toFixed(1)}` +
+        ` endAbs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
         ` tabs=${tabs.length} history=${historyRows.length} favorites=${favoriteRows.length}` +
         ` ipcMs=${ipcMs.toFixed(1)}`
       );
       pendingReadyRef.current = {
         id: loadId,
         readyAt: performance.now(),
+        readyAbs: performance.timeOrigin + performance.now(),
         firstLoad: firstLoadForProject,
         tabs: tabs.length,
         history: historyRows.length,
@@ -714,11 +779,14 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       const ipcMs = performance.now() - startedAt;
       console.warn(
         `[Perf:Home] ready project=${projectId.slice(-12)} loadId=${loadId} firstLoad=${firstLoadForProject}` +
+        ` startAbs=${startAbs.toFixed(1)}` +
+        ` endAbs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
         ` tabs=${tabs.length} history=0 favorites=0 ipcMs=${ipcMs.toFixed(1)} error=true`
       );
       pendingReadyRef.current = {
         id: loadId,
         readyAt: performance.now(),
+        readyAbs: performance.timeOrigin + performance.now(),
         firstLoad: firstLoadForProject,
         tabs: tabs.length,
         history: 0,
@@ -831,6 +899,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     const activeBefore = workspace?.activeTabId;
     console.warn(
       `[Perf:HomeAction] active-tab-click project=${projectId.slice(-12)}` +
+      ` abs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
       ` tab=${tabId.slice(-12)} activeBefore=${String(activeBefore).slice(-12)}` +
       ` sameActive=${activeBefore === tabId ? '1' : '0'}` +
       ` tabs=${tabs.length} history=${history.length} favorites=${favorites.length}`
@@ -1534,6 +1603,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         const tab = tabs.find(t => t.id === activePopover.hoveredItem!.id);
         if (!tab) return null;
         const metaRows = [
+          { label: 'Name', value: tab.name, variant: 'title' as const },
           { label: 'Path', value: tab.cwd },
           ...(tab.commandType ? [{ label: 'Type', value: tab.commandType }] : []),
         ];
@@ -1557,6 +1627,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         const entry = history.find(h => h.id === historyPopover.hoveredItem!.id);
         if (!entry) return null;
         const metaRows = [
+          { label: 'Name', value: entry.name, variant: 'title' as const },
           { label: 'Closed', value: formatTimestamp(entry.closed_at) },
           { label: 'Created', value: formatTimestamp(entry.created_at) },
           { label: 'Path', value: entry.cwd },

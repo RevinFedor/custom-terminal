@@ -3,8 +3,11 @@ import { create } from 'zustand';
 export type AIModel = 'gemini-3-flash-preview' | 'gemini-3-pro-preview';
 export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
 
+export const TAB_TITLE_PROMPT_ID = 'tab-title';
+export const DEFAULT_TAB_TITLE_PROMPT = 'На основе первого пользовательского сообщения придумай короткое название вкладки. Верни только название: 2-6 слов, без кавычек, без точки, без markdown, без пояснений.';
+
 export interface AIPrompt {
-  id: string;              // 'research' | 'compact' | 'description' | 'prompt-<timestamp>'
+  id: string;              // built-ins like 'research' | 'compact' | 'tab-title' or 'prompt-<timestamp>'
   name: string;            // "Research", "Compact (Резюме)", "Code Review"
   content: string;         // Текст промпта
   model: AIModel;
@@ -89,6 +92,18 @@ const FALLBACK_PROMPTS: AIPrompt[] = [
     isBuiltIn: true,
     showInContextMenu: false,
     position: 4,
+    filePaths: []
+  },
+  {
+    id: TAB_TITLE_PROMPT_ID,
+    name: 'Tab Title',
+    content: DEFAULT_TAB_TITLE_PROMPT,
+    model: 'gemini-3-flash-preview',
+    thinkingLevel: 'NONE',
+    color: '#22c55e',
+    isBuiltIn: true,
+    showInContextMenu: false,
+    position: 5,
     filePaths: []
   }
 ];

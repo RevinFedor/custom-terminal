@@ -20,6 +20,7 @@ class DatabaseManager {
     this.seedDefaultAIPrompts();
     this.ensureRewindPrompt();
     this.ensureAdoptPrompt();
+    this.ensureTabTitlePrompt();
   }
 
   initTables() {
@@ -823,14 +824,30 @@ class DatabaseManager {
     // Safety: count existing tabs to detect accidental mass deletion
     const existingCount = this.db.prepare('SELECT COUNT(*) as cnt FROM tabs WHERE project_id = ?').get(projectId)?.cnt || 0;
     const newCount = tabs.length;
+    const newTabIds = tabs.map(t => t.tabId).filter(Boolean);
 
     if (existingCount > 0 && newCount < existingCount - 2) {
       const subAgentCount = tabs.filter(t => t.parentTabId).length;
       const dbSubAgents = this.db.prepare('SELECT COUNT(*) as cnt FROM tabs WHERE project_id = ? AND parent_tab_id IS NOT NULL').get(projectId)?.cnt || 0;
-      console.warn('[DB] saveTabs: WARNING — saving ' + newCount + ' tabs (sub-agents: ' + subAgentCount + ') but DB has ' + existingCount + ' (sub-agents: ' + dbSubAgents + '). Project: ' + projectId);
+      const existingRows = this.db.prepare('SELECT tab_id, name, command_type, tab_type FROM tabs WHERE project_id = ? ORDER BY position, tab_id').all(projectId);
+      const incomingSet = new Set(newTabIds);
+      const summarizeRows = (rows) => rows.slice(0, 20).map((row) => {
+        const id = String(row.tab_id || row.tabId || '').slice(-12);
+        const name = String(row.name || '').replace(/\s+/g, ' ').slice(0, 24);
+        const type = row.tab_type || row.tabType || 'terminal';
+        const command = row.command_type || row.commandType || 'generic';
+        return id + ':' + name + ':' + type + ':' + command;
+      }).join(',') + (rows.length > 20 ? ',+' + (rows.length - 20) : '');
+      const dbOnlyRows = existingRows.filter((row) => row.tab_id && !incomingSet.has(row.tab_id));
+      console.warn(
+        '[DB] saveTabs: WARNING — saving ' + newCount +
+        ' tabs (sub-agents: ' + subAgentCount + ') but DB has ' + existingCount +
+        ' (sub-agents: ' + dbSubAgents + '). Project: ' + projectId +
+        ' forceCleanup=' + forceCleanup +
+        ' incoming=' + summarizeRows(tabs) +
+        ' dbOnly=' + summarizeRows(dbOnlyRows)
+      );
     }
-
-    const newTabIds = tabs.map(t => t.tabId).filter(Boolean);
 
     // Shutdown guard (never-downgrade): saveTabs does a full delete+reinsert,
     // writing was_interrupted from the renderer's in-memory tab, which is always
@@ -1216,6 +1233,17 @@ class DatabaseManager {
         is_built_in: 1,
         show_in_context_menu: 0,
         position: 4
+      },
+      {
+        id: 'tab-title',
+        name: 'Tab Title',
+        content: 'На основе первого пользовательского сообщения придумай короткое название вкладки. Верни только название: 2-6 слов, без кавычек, без точки, без markdown, без пояснений.',
+        model: 'gemini-3-flash-preview',
+        thinking_level: 'NONE',
+        color: '#22c55e',
+        is_built_in: 1,
+        show_in_context_menu: 0,
+        position: 5
       }
     ];
 
@@ -1265,6 +1293,30 @@ class DatabaseManager {
       // Update content if it changed (built-in prompt evolution)
       this.db.prepare('UPDATE ai_prompts SET content = ? WHERE id = ? AND is_built_in = 1').run(adoptContent, 'adopt');
       console.log('[DB] Migrated: updated adopt prompt content');
+    }
+  }
+
+  // Ensure built-in prompt for automatic tab naming exists (migration for existing DBs).
+  // Content is intentionally user-editable in Settings → AI, so unlike adopt we do not
+  // overwrite an existing row.
+  ensureTabTitlePrompt() {
+    const exists = this.db.prepare('SELECT id FROM ai_prompts WHERE id = ?').get('tab-title');
+    if (!exists) {
+      this.db.prepare(`
+        INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        'tab-title',
+        'Tab Title',
+        'На основе первого пользовательского сообщения придумай короткое название вкладки. Верни только название: 2-6 слов, без кавычек, без точки, без markdown, без пояснений.',
+        'gemini-3-flash-preview',
+        'NONE',
+        '#22c55e',
+        1,
+        0,
+        5
+      );
+      console.log('[DB] Migrated: added tab-title prompt');
     }
   }
 

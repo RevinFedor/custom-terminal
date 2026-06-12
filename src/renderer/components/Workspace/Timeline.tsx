@@ -5,7 +5,8 @@ import Tooltip from '../UI/Tooltip';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
-import { usePromptsStore } from '../../store/usePromptsStore';
+import { TAB_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
+import { generateTabTitleFromPrompt, isEligibleTabTitleEntry, trimTabTitlePrompt } from '../../utils/generateTabTitle';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
 
@@ -40,24 +41,24 @@ function isAttributeEntry(entry: { type?: string }): boolean {
 
 const DOCS_TIMELINE_COLORS = {
   edited: {
-    hover: '#22c55e',
-    visible: '#15803d',
-    dim: '#14532d',
-    glow: '34, 197, 94',
-    tooltip: 'rgba(34, 197, 94, 0.9)',
-    tooltipMuted: 'rgba(34, 197, 94, 0.82)',
-    borderClass: 'border-green-700/30',
-    hoverClass: 'hover:bg-green-700/10',
-  },
-  search: {
-    hover: '#bbf7d0',
+    hover: '#86efac',
     visible: '#4ade80',
     dim: '#22c55e',
-    glow: '134, 239, 172',
-    tooltip: 'rgba(134, 239, 172, 0.9)',
-    tooltipMuted: 'rgba(134, 239, 172, 0.82)',
-    borderClass: 'border-emerald-400/20',
-    hoverClass: 'hover:bg-emerald-400/10',
+    glow: '74, 222, 128',
+    tooltip: 'rgba(74, 222, 128, 0.9)',
+    tooltipMuted: 'rgba(74, 222, 128, 0.82)',
+    borderClass: 'border-green-500/15',
+    hoverClass: 'hover:bg-green-500/5',
+  },
+  search: {
+    hover: '#d9f99d',
+    visible: '#bef264',
+    dim: '#84cc16',
+    glow: '190, 242, 100',
+    tooltip: 'rgba(190, 242, 100, 0.9)',
+    tooltipMuted: 'rgba(190, 242, 100, 0.82)',
+    borderClass: 'border-lime-500/15',
+    hoverClass: 'hover:bg-lime-500/5',
   },
 } as const;
 
@@ -322,6 +323,7 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
 const _savedEditRangeMap = new Map<string, any>();
 const SAVED_MAP_MAX = 20;
 let _timelinePollSeq = 0;
+const _autoTabTitleAttempted = new Set<string>();
 
 function perfAbsNow(): number {
   return performance.timeOrigin + performance.now();
@@ -1274,9 +1276,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
     setIsLoading(true);
     try {
+      // Caller attribution rides into main's perfOp registry via the universal
+      // IPC wrapper (it lifts source/reason/tabId/visible from the first arg) —
+      // a MainLoopGap right after a poll now names WHICH Timeline instance
+      // polled, not just "some timeline IPC".
+      const callerContext = {
+        source: 'Timeline.loadTimeline',
+        reason,
+        tabId,
+        visible: visibleAtStart,
+        instanceId: timelineInstanceIdRef.current,
+      };
       if (isGemini) {
         // Gemini: single IPC call, no fork markers or session chains
-        const timelineResult = await ipcRenderer.invoke('gemini:get-timeline', { sessionId, cwd });
+        const timelineResult = await ipcRenderer.invoke('gemini:get-timeline', { sessionId, cwd, ...callerContext });
         if (timelineResult.success) {
           setEntries(timelineResult.entries);
           setSessionBoundaries([]);
@@ -1284,7 +1297,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           setClaudeMemoryBoundaryUuid(null);
         }
       } else if (isCodex) {
-        const timelineResult = await ipcRenderer.invoke('codex:get-timeline', { sessionId, cwd });
+        const timelineResult = await ipcRenderer.invoke('codex:get-timeline', { sessionId, cwd, ...callerContext });
         if (timelineResult.success) {
           setEntries(timelineResult.entries);
           setSessionBoundaries([]);
@@ -1297,13 +1310,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           ipcRenderer.invoke('claude:get-timeline', {
             sessionId,
             cwd,
-            source: 'Timeline.loadTimeline',
-            reason,
-            tabId,
-            visible: visibleAtStart,
-            instanceId: timelineInstanceIdRef.current,
+            ...callerContext,
           }),
-          ipcRenderer.invoke('claude:get-fork-markers', { sessionId })
+          ipcRenderer.invoke('claude:get-fork-markers', { sessionId, ...callerContext })
         ]);
 
         if (timelineResult.success) {
@@ -1385,13 +1394,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         }
       }
       // Load notes for this session (works for both Claude and Gemini)
-      const notesResult = await ipcRenderer.invoke('timeline:get-notes', { sessionId });
+      const notesResult = await ipcRenderer.invoke('timeline:get-notes', { sessionId, ...callerContext });
       if (notesResult.success) {
         setNotes(notesResult.notes || {});
         setNotePositions(notesResult.positions || {});
       }
       // Load rewind markers (pink dots)
-      const markersResult = await ipcRenderer.invoke('timeline:get-rewind-markers', { sessionId });
+      const markersResult = await ipcRenderer.invoke('timeline:get-rewind-markers', { sessionId, ...callerContext });
       if (markersResult.success && markersResult.markers?.length) {
         setRewindMarkers(new Set(markersResult.markers));
       }
@@ -1592,6 +1601,56 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     };
     requestAnimationFrame(() => { jump(); requestAnimationFrame(jump); });
   }, [entries]);
+
+  // Auto-generate a tab title once the first real user prompt is materialized
+  // in the transcript. Uses Timeline entries instead of raw terminal input so
+  // service commands and metadata do not become tab names.
+  useEffect(() => {
+    if (!sessionId || entries.length === 0) return;
+    if (toolType !== 'claude' && toolType !== 'codex') return;
+
+    const firstUserPrompt = entries.find(isEligibleTabTitleEntry);
+    if (!firstUserPrompt) return;
+
+    const attemptKey = `${toolType}:${sessionId}`;
+    if (_autoTabTitleAttempted.has(attemptKey)) {
+      useWorkspaceStore.getState().consumePendingAutoTabTitle(tabId, toolType, sessionId);
+      return;
+    }
+
+    let tab: any = null;
+    const store = useWorkspaceStore.getState();
+    for (const [, workspace] of store.openProjects) {
+      const candidate = workspace.tabs.get(tabId);
+      if (candidate) { tab = candidate; break; }
+    }
+    if (!tab) return;
+    if (tab.nameSetManually) {
+      store.consumePendingAutoTabTitle(tabId, toolType, sessionId);
+      _autoTabTitleAttempted.add(attemptKey);
+      return;
+    }
+
+    const currentSessionId = toolType === 'codex' ? tab.codexSessionId : tab.claudeSessionId;
+    if (currentSessionId !== sessionId) return;
+    if (!store.consumePendingAutoTabTitle(tabId, toolType, sessionId)) return;
+
+    _autoTabTitleAttempted.add(attemptKey);
+    const titleToolType = toolType;
+    const titleSessionId = sessionId;
+    const titleTabId = tabId;
+    const sourcePrompt = trimTabTitlePrompt(firstUserPrompt.content);
+
+    void (async () => {
+      const promptConfig = usePromptsStore.getState().getPromptById(TAB_TITLE_PROMPT_ID);
+      const title = await generateTabTitleFromPrompt(sourcePrompt, promptConfig);
+      if (!title) return;
+      useWorkspaceStore.getState().autoRenameTab(titleTabId, title, {
+        toolType: titleToolType,
+        sessionId: titleSessionId,
+      });
+    })();
+  }, [entries, sessionId, tabId, toolType]);
 
   // effect: sessionId/loadTimeline/isVisible + document.visibilitychange → 2s setInterval(loadTimeline) (paused while tab hidden; PERF: avoids IPC round-trips in background — Timeline:PollPaused/Resumed logs)
   useEffect(() => {

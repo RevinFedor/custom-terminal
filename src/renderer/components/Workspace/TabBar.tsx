@@ -5,6 +5,7 @@ import Tooltip from '../UI/Tooltip';
 import { useUIStore } from '../../store/useUIStore';
 import { useCmdKey, useCmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import TabPreviewPopover from './TabPreviewPopover';
+import { refreshGeneratedTabTitle, type RefreshTabTitleReason } from '../../utils/generateTabTitle';
 import '@gt-editor/markdown-editor/styles.css';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
@@ -1232,16 +1233,30 @@ const ZoneDropTarget = memo(({
   );
 });
 
-const TabGroupHeader = memo(({ group, count, projectId }: {
+const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, onEditChange, onEditSubmit, onEditKeyDown, inputRef, onStartRename, onContextMenu, onAuxClick, onToggleCollapsed, cmdCollapseMode }: {
   group: TabGroup;
   count: number;
   projectId: string;
+  isEditing: boolean;
+  editValue: string;
+  onEditChange: (value: string) => void;
+  onEditSubmit: () => void;
+  onEditKeyDown: (e: React.KeyboardEvent) => void;
+  inputRef: React.RefObject<HTMLInputElement>;
+  onStartRename: () => void;
+  onContextMenu: (e: React.MouseEvent) => void;
+  onAuxClick: (e: React.MouseEvent) => void;
+  onToggleCollapsed: () => void;
+  cmdCollapseMode: boolean;
 }) => {
   const ref = useRef<HTMLDivElement>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isPressing, setIsPressing] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
+  const [isIconHovered, setIsIconHovered] = useState(false);
   const bodyCursorRef = useRef<string | null>(null);
+  const tabGeo = useUIStore((s) => s.tabGeometry);
+  const tabsFontSize = useUIStore((s) => s.tabsFontSize);
 
   const setBodyGrabbing = useCallback(() => {
     if (bodyCursorRef.current === null) {
@@ -1284,6 +1299,11 @@ const TabGroupHeader = memo(({ group, count, projectId }: {
     return combine(
       draggable({
         element,
+        canDrag: ({ input }) => {
+          if (isEditing || input.metaKey || input.ctrlKey) return false;
+          const hit = document.elementFromPoint(input.clientX, input.clientY);
+          return !hit?.closest('[data-group-collapse-button]');
+        },
         getInitialData: (): DragData => ({ type: 'TAB_GROUP', groupId: group.id, zone: 'main', projectId }),
         onGenerateDragPreview: ({ nativeSetDragImage }) => {
           setCustomNativeDragPreview({
@@ -1317,9 +1337,12 @@ const TabGroupHeader = memo(({ group, count, projectId }: {
         canDrop: ({ source }) => source.data.type === 'TAB' || source.data.type === 'TAB_GROUP',
       })
     );
-  }, [group.id, projectId]);
+  }, [group.id, isEditing, projectId]);
 
   const dragLiftActive = isPressing || isDragging;
+  const isCollapsed = !!group.collapsed;
+  const iconAccentActive = isIconHovered || isCollapsed;
+  const headerCursor = dragLiftActive ? 'grabbing' : (cmdCollapseMode ? 'pointer' : 'default');
 
   return (
     <div
@@ -1329,35 +1352,144 @@ const TabGroupHeader = memo(({ group, count, projectId }: {
       style={{
         display: 'flex',
         alignItems: 'center',
-        gap: 7,
-        minHeight: 28,
-        padding: '5px 8px',
-        borderRadius: 7,
-        cursor: dragLiftActive ? 'grabbing' : 'grab',
+        gap: 8,
+        minHeight: 24,
+        padding: `${tabGeo.paddingY}px ${tabGeo.paddingX}px ${tabGeo.paddingY}px ${tabGeo.paddingLeft}px`,
+        borderRadius: tabGeo.borderRadius,
+        boxSizing: 'border-box',
+        fontSize: `${tabsFontSize}px`,
+        cursor: headerCursor,
         userSelect: 'none',
-        color: (isHovered || dragLiftActive) ? '#e5e7eb' : '#a1a1aa',
-        backgroundColor: dragLiftActive ? 'rgba(139,92,246,0.16)' : (isHovered ? 'rgba(255,255,255,0.07)' : 'rgba(255,255,255,0.035)'),
-        border: `1px solid ${dragLiftActive ? 'rgba(139,92,246,0.58)' : 'rgba(255,255,255,0.08)'}`,
+        color: (isHovered || dragLiftActive || isCollapsed) ? '#e5e7eb' : '#a1a1aa',
+        backgroundColor: dragLiftActive
+          ? 'rgba(139,92,246,0.16)'
+          : isCollapsed
+            ? (isHovered ? 'rgba(139,92,246,0.17)' : 'rgba(139,92,246,0.11)')
+            : (isHovered ? 'rgba(255,255,255,0.07)' : 'rgba(255,255,255,0.035)'),
+        border: `1px solid ${dragLiftActive ? 'rgba(139,92,246,0.58)' : (isCollapsed ? 'rgba(139,92,246,0.42)' : 'rgba(255,255,255,0.08)')}`,
         opacity: isDragging ? 0.96 : 1,
         transform: dragLiftActive ? 'scale(1.015)' : undefined,
         transformOrigin: 'center',
-        boxShadow: dragLiftActive ? '0 0 0 1px rgba(139,92,246,0.32), 0 6px 18px rgba(0,0,0,0.28)' : 'none',
+        boxShadow: dragLiftActive
+          ? '0 0 0 1px rgba(139,92,246,0.32), 0 6px 18px rgba(0,0,0,0.28)'
+          : (isCollapsed ? 'inset 0 0 0 1px rgba(139,92,246,0.10)' : 'none'),
         transition: 'background-color 0.12s, color 0.12s, opacity 0.12s, transform 90ms ease, box-shadow 90ms ease, border-color 90ms ease',
       }}
       onMouseDown={(e) => {
+        if (isEditing) return;
         if (e.button !== 0) return;
+        if (e.metaKey || e.ctrlKey) return;
+        if ((e.target as HTMLElement).closest('[data-group-collapse-button]')) return;
         setIsPressing(true);
         setBodyGrabbing();
       }}
+      onClick={(e) => {
+        if (isEditing) return;
+        if (!e.metaKey && !e.ctrlKey) return;
+        e.preventDefault();
+        e.stopPropagation();
+        onToggleCollapsed();
+      }}
+      onDoubleClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (cmdCollapseMode) return;
+        if ((e.target as HTMLElement).closest('[data-group-collapse-button]')) return;
+        onStartRename();
+      }}
+      onContextMenu={onContextMenu}
+      onAuxClick={onAuxClick}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
-      title="Drag group"
+      title={isEditing ? 'Rename group' : (cmdCollapseMode ? 'Collapse / expand group' : 'Hold and drag group')}
     >
-      <Folder size={13} strokeWidth={2} style={{ color: '#8b5cf6', flexShrink: 0 }} />
-      <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12 }}>
-        {group.name}
-      </span>
-      <span style={{ color: '#71717a', fontSize: 11, flexShrink: 0 }}>{count}</span>
+      <button
+        type="button"
+        data-group-collapse-button
+        aria-label={isCollapsed ? 'Expand group' : 'Collapse group'}
+        aria-expanded={!isCollapsed}
+        onMouseDown={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          onToggleCollapsed();
+        }}
+        onDoubleClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          onContextMenu(e);
+        }}
+        onMouseEnter={() => setIsIconHovered(true)}
+        onMouseLeave={() => setIsIconHovered(false)}
+        style={{
+          position: 'relative',
+          width: 20,
+          height: 20,
+          flexShrink: 0,
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          border: 'none',
+          borderRadius: 6,
+          padding: 0,
+          cursor: 'pointer',
+          color: iconAccentActive ? '#c4b5fd' : '#8b5cf6',
+          backgroundColor: iconAccentActive ? 'rgba(139,92,246,0.20)' : 'transparent',
+          transition: 'background-color 120ms ease, color 120ms ease, transform 140ms ease',
+          transform: isIconHovered ? 'scale(1.07)' : 'scale(1)',
+        }}
+        title={isCollapsed ? 'Expand group' : 'Collapse group'}
+      >
+        <Folder
+          size={14}
+          strokeWidth={2}
+          style={{
+            transform: isIconHovered ? 'translateY(-1px)' : 'translateY(0)',
+            transition: 'transform 140ms ease',
+          }}
+        />
+        <ChevronDown
+          size={9}
+          strokeWidth={2.4}
+          style={{
+            position: 'absolute',
+            right: 2,
+            bottom: 1,
+            color: '#ddd6fe',
+            opacity: iconAccentActive ? 1 : 0.62,
+            transform: `rotate(${isCollapsed ? -90 : 0}deg) ${isIconHovered ? 'translateY(1px)' : 'translateY(0)'}`,
+            transformOrigin: 'center',
+            transition: 'transform 140ms ease, opacity 120ms ease',
+          }}
+        />
+      </button>
+      {isEditing ? (
+        <input
+          ref={inputRef}
+          type="text"
+          className="bg-[#333] border border-accent rounded px-2 py-0.5 text-white outline-none"
+          style={{ flex: 1, minWidth: 0, fontSize: 'inherit' }}
+          value={editValue}
+          onChange={(e) => onEditChange(e.target.value)}
+          onBlur={onEditSubmit}
+          onKeyDown={onEditKeyDown}
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => e.stopPropagation()}
+        />
+      ) : (
+        <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'inherit' }}>
+          {group.name}
+        </span>
+      )}
+      <span style={{ color: '#71717a', fontSize: Math.max(10, tabsFontSize - 2), flexShrink: 0 }}>{count}</span>
     </div>
   );
 });
@@ -1621,6 +1753,9 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const closeTab = useWorkspaceStore((state) => state.closeTab);
   const switchTab = useWorkspaceStore((state) => state.switchTab);
   const renameTab = useWorkspaceStore((state) => state.renameTab);
+  const renameTabGroup = useWorkspaceStore((state) => state.renameTabGroup);
+  const toggleTabGroupCollapsed = useWorkspaceStore((state) => state.toggleTabGroupCollapsed);
+  const deleteTabGroup = useWorkspaceStore((state) => state.deleteTabGroup);
   const setTabColor = useWorkspaceStore((state) => state.setTabColor);
   const setTabSessionStatus = useWorkspaceStore((state) => state.setTabSessionStatus);
   const toggleTabUtility = useWorkspaceStore((state) => state.toggleTabUtility);
@@ -1651,6 +1786,9 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; tabId: string } | null>(null);
+  const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
+  const [groupEditValue, setGroupEditValue] = useState('');
+  const [groupContextMenu, setGroupContextMenu] = useState<{ x: number; y: number; groupId: string } | null>(null);
   const [emptyContextMenu, setEmptyContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [contextScripts, setContextScripts] = useState<string[]>([]);
   const [contextShScripts, setContextShScripts] = useState<string[]>([]);
@@ -1664,6 +1802,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const dragPreviewKeyRef = useRef<string>('');
   const verticalDragGeometryRef = useRef<VerticalDragGeometry | null>(null);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
+  const [titleRefreshInFlight, setTitleRefreshInFlight] = useState<Set<string>>(new Set());
   // Tabs currently inside a deterministic stop/restart cycle. While in this set
   // the Restart / Stop buttons render disabled with a wait-cursor, so the user
   // can't fire a second stop while the first one is still polling for descendants
@@ -1948,12 +2087,29 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     if (!workspace) return;
 
     const tabIds = Array.from(workspace.tabs.keys());
+    const syncStartedAt = performance.now();
+    const syncStartAbs = performance.timeOrigin + syncStartedAt;
+    const tabSummary = tabIds.map((tabId) => {
+      const tab = workspace.tabs.get(tabId);
+      return tabId.slice(-8) + ':' + (tab?.commandType || tab?.tabType || 'unknown');
+    }).join(',');
+    console.warn(
+      `[Perf:TabBarStatusSync] start project=${projectId.slice(-12)}` +
+      ` startAbs=${syncStartAbs.toFixed(1)}` +
+      ` count=${tabIds.length} tabs=${tabSummary}`
+    );
 
     const syncStatus = async () => {
       await Promise.all(
         tabIds.map(async (tabId) => {
           try {
-            const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+            const tab = workspace.tabs.get(tabId);
+            const state = await ipcRenderer.invoke('terminal:getCommandState', {
+              tabId,
+              caller: 'TabBar.statusSync',
+              expectedProcess: 'codex',
+              allowProcessTreeLookup: tab?.commandType === 'codex',
+            });
             setProcessStatus(prev => {
               if (prev.get(tabId) === state.isRunning) return prev;
               const next = new Map(prev);
@@ -1978,6 +2134,13 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             return next;
           });
         })
+      );
+      console.warn(
+        `[Perf:TabBarStatusSync] done project=${projectId.slice(-12)}` +
+        ` startAbs=${syncStartAbs.toFixed(1)}` +
+        ` endAbs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
+        ` count=${tabIds.length}` +
+        ` durMs=${(performance.now() - syncStartedAt).toFixed(1)}`
       );
     };
     syncStatus();
@@ -2004,12 +2167,15 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         const groupId = rowEl.dataset.groupId;
         const header = rowEl.querySelector<HTMLElement>('[data-tab-group-header]');
         if (!groupId || !header) continue;
-        const tabRows = Array.from(rowEl.querySelectorAll<HTMLElement>('[data-tab-group-body] [data-tab-item]'))
-          .map(el => {
-            const tabId = el.dataset.tabId;
-            return tabId ? { tabId, rect: snapRect(el) } : null;
-          })
-          .filter((row): row is { tabId: string; rect: RectSnap } => !!row);
+        const isCollapsed = rowEl.dataset.groupCollapsed === 'true';
+        const tabRows = isCollapsed
+          ? []
+          : Array.from(rowEl.querySelectorAll<HTMLElement>('[data-tab-group-body] [data-tab-item]'))
+            .map(el => {
+              const tabId = el.dataset.tabId;
+              return tabId ? { tabId, rect: snapRect(el) } : null;
+            })
+            .filter((row): row is { tabId: string; rect: RectSnap } => !!row);
         rows.push({ type: 'group', groupId, rect: snapRect(rowEl), header: snapRect(header), tabRows });
       }
     }
@@ -2141,6 +2307,13 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       for (const id of sourceIds) groupAssignments[id] = groupId;
       return makePreview(insertAt(withoutSource, sourceIds, indexInGroup(groupId, memberIndex, rowIndex)));
     };
+
+    if (targetData?.type === 'EMPTY_ZONE') {
+      const lastRow = geometry.rows[geometry.rows.length - 1];
+      if (lastRow?.type === 'group' && lastRow.tabRows.every(tabRow => sourceSet.has(tabRow.tabId))) {
+        return assignGroup(lastRow.groupId, 0, geometry.rows.length - 1);
+      }
+    }
 
     for (let rowIndex = 0; rowIndex < geometry.rows.length; rowIndex += 1) {
       const row = geometry.rows[rowIndex];
@@ -2295,11 +2468,11 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   }, [projectId, moveTabToZone, reorderInZone, applyTabLayout, captureVerticalDragGeometry, resolveStaticVerticalPreview, isVerticalLayout, isAdoptDropTarget]);
 
   useEffect(() => {
-    if (editingTabId && inputRef.current) {
+    if ((editingTabId || editingGroupId) && inputRef.current) {
       inputRef.current.focus();
       inputRef.current.select();
     }
-  }, [editingTabId]);
+  }, [editingTabId, editingGroupId]);
 
   // Consume pendingEditTabId set by createTab/createTabAfterCurrent to auto-enter rename mode
   useEffect(() => {
@@ -2314,26 +2487,28 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   }, [pendingEditTabId, projectId]);
 
   useEffect(() => {
-    if (!contextMenu && !emptyContextMenu) return;
+    if (!contextMenu && !emptyContextMenu && !groupContextMenu) return;
     const handleClose = (e: MouseEvent) => {
       // Don't close if clicking inside the context menu itself
       if ((e.target as HTMLElement).closest('[data-tab-context-menu]')) return;
       setContextMenu(null);
       setEmptyContextMenu(null);
+      setGroupContextMenu(null);
     };
     // Use mousedown instead of click — xterm.js canvas swallows click events
     document.addEventListener('mousedown', handleClose);
     return () => document.removeEventListener('mousedown', handleClose);
-  }, [contextMenu, emptyContextMenu]);
+  }, [contextMenu, emptyContextMenu, groupContextMenu]);
 
   // Clamp context menu position to viewport (same pattern as Timeline tooltip)
   useLayoutEffect(() => {
-    if (!contextMenu || !contextMenuRef.current) return;
+    const activeMenu = contextMenu || groupContextMenu;
+    if (!activeMenu || !contextMenuRef.current) return;
     const el = contextMenuRef.current;
     const rect = el.getBoundingClientRect();
     const pad = 8;
-    let x = contextMenu.x;
-    let y = contextMenu.y;
+    let x = activeMenu.x;
+    let y = activeMenu.y;
 
     // Clamp bottom
     if (y + rect.height > window.innerHeight - pad) {
@@ -2351,7 +2526,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     if (x !== contextMenuPos.x || y !== contextMenuPos.y) {
       setContextMenuPos({ x, y });
     }
-  }, [contextMenu, contextScripts.length]);
+  }, [contextMenu, groupContextMenu, contextScripts.length]);
 
   if (!workspace || !project) return null;
 
@@ -2448,11 +2623,35 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     e.stopPropagation();
     // If multi-select and clicked tab is among selected — close all selected
     if (isMultiSelect && selectedTabIds.includes(tabId)) {
+      const startedAt = performance.now();
+      console.warn(
+        '[Perf:CloseTabsBatch] start' +
+        ' project=' + projectId.slice(-12) +
+        ' count=' + selectedTabIds.length +
+        ' trigger=' + tabId.slice(-12) +
+        ' source=close-button' +
+        ' startAbs=' + (performance.timeOrigin + startedAt).toFixed(1)
+      );
       if (await confirmCloseTabs(selectedTabIds)) {
         for (const id of selectedTabIds) {
           const tab = workspace?.tabs.get(id);
           await closeTab(projectId, id, { skipProcessCheck: true, forceCleanup: true, aiBusyOverride: tab ? isTabTurnBusy(tab) : undefined });
         }
+        console.warn(
+          '[Perf:CloseTabsBatch] done' +
+          ' project=' + projectId.slice(-12) +
+          ' count=' + selectedTabIds.length +
+          ' source=close-button' +
+          ' durMs=' + (performance.now() - startedAt).toFixed(1)
+        );
+      } else {
+        console.warn(
+          '[Perf:CloseTabsBatch] cancelled' +
+          ' project=' + projectId.slice(-12) +
+          ' count=' + selectedTabIds.length +
+          ' source=close-button' +
+          ' durMs=' + (performance.now() - startedAt).toFixed(1)
+        );
       }
     } else {
       const tab = workspace?.tabs.get(tabId);
@@ -2461,13 +2660,26 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   };
 
   const handleDoubleClick = (tabId: string, currentName: string) => {
+    setEditingGroupId(null);
+    setGroupEditValue('');
     setEditingTabId(tabId);
     setEditValue(currentName);
+  };
+
+  const handleGroupContextMenu = (e: React.MouseEvent, group: TabGroup) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setContextMenu(null);
+    setEmptyContextMenu(null);
+    setContextMenuPos({ x: e.clientX, y: e.clientY });
+    setGroupContextMenu({ x: e.clientX, y: e.clientY, groupId: group.id });
   };
 
   const handleContextMenu = (e: React.MouseEvent, tabId: string) => {
     e.preventDefault();
     e.stopPropagation();
+    setGroupContextMenu(null);
+    setEmptyContextMenu(null);
     setContextMenuPos({ x: e.clientX, y: e.clientY });
     setContextMenu({ x: e.clientX, y: e.clientY, tabId });
 
@@ -2647,6 +2859,89 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     }
   };
 
+  const handleGroupRenameSubmit = () => {
+    if (editingGroupId && groupEditValue.trim()) {
+      renameTabGroup(projectId, editingGroupId, groupEditValue.trim());
+    }
+    setEditingGroupId(null);
+    setGroupEditValue('');
+  };
+
+  const handleGroupRenameKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      handleGroupRenameSubmit();
+      refocusActiveTerminal();
+    } else if (e.key === 'Escape') {
+      setEditingGroupId(null);
+      setGroupEditValue('');
+      refocusActiveTerminal();
+    }
+  };
+
+  const startGroupRename = (group: TabGroup) => {
+    setEditingTabId(null);
+    setEditValue('');
+    setEditingGroupId(group.id);
+    setGroupEditValue(group.name);
+  };
+
+  const tabTitleRefreshErrorText = (reason?: RefreshTabTitleReason, error?: string) => {
+    switch (reason) {
+      case 'unsupported-tab':
+      case 'no-session':
+        return 'Нет Claude/Codex session ID для названия';
+      case 'no-user-prompt':
+        return 'Не найдено пользовательское сообщение';
+      case 'generation-failed':
+        return 'Gemini не вернул название';
+      case 'timeline-error':
+        return error || 'Не удалось прочитать Timeline';
+      case 'rename-skipped':
+        return 'Название не изменилось';
+      case 'tab-not-found':
+        return 'Вкладка не найдена';
+      case 'manual-name':
+        return 'Название задано вручную';
+      default:
+        return 'Не удалось обновить название';
+    }
+  };
+
+  const handleRefreshGeneratedTitle = async (tabId: string) => {
+    if (titleRefreshInFlight.has(tabId)) {
+      showToast('Название уже обновляется', 'info');
+      return;
+    }
+
+    setTitleRefreshInFlight(prev => {
+      const next = new Set(prev);
+      next.add(tabId);
+      return next;
+    });
+    setContextMenu(null);
+
+    try {
+      const result = await refreshGeneratedTabTitle(tabId, {
+        overrideManualName: true,
+        markNameSetManually: true,
+      });
+      if (result.ok) {
+        showToast(`Название обновлено: ${result.title}`, 'success');
+      } else {
+        showToast(tabTitleRefreshErrorText(result.reason, result.error), result.reason === 'rename-skipped' ? 'info' : 'warning');
+      }
+    } catch (err: any) {
+      console.warn('[TabBar:RefreshTabTitle] failed tab=' + tabId.slice(-8) + ': ' + (err?.message || String(err)));
+      showToast('Не удалось обновить название', 'error');
+    } finally {
+      setTitleRefreshInFlight(prev => {
+        const next = new Set(prev);
+        next.delete(tabId);
+        return next;
+      });
+    }
+  };
+
   const handleContextRename = () => {
     if (contextMenu) {
       const tab = workspace.tabs.get(contextMenu.tabId);
@@ -2656,6 +2951,49 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       }
     }
     setContextMenu(null);
+  };
+
+  const handleGroupContextRename = () => {
+    if (groupContextMenu) {
+      const group = tabGroups.find(candidate => candidate.id === groupContextMenu.groupId);
+      if (group) startGroupRename(group);
+    }
+    setGroupContextMenu(null);
+  };
+
+  const getGroupTabIds = (groupId: string) => {
+    return Array.from(workspace.tabs.values())
+      .filter(tab => !tab.parentTabId && !tab.isUtility && tab.groupId === groupId)
+      .map(tab => tab.id);
+  };
+
+  const handleDeleteGroupOnly = () => {
+    if (groupContextMenu) {
+      deleteTabGroup(projectId, groupContextMenu.groupId);
+    }
+    setGroupContextMenu(null);
+  };
+
+  const closeGroupById = async (groupId: string) => {
+    const groupTabIds = getGroupTabIds(groupId);
+    setGroupContextMenu(null);
+    if (groupTabIds.length > 0) {
+      if (!(await confirmCloseTabs(groupTabIds))) return;
+      for (const id of groupTabIds) {
+        const tab = workspace.tabs.get(id);
+        await closeTab(projectId, id, {
+          skipProcessCheck: true,
+          forceCleanup: true,
+          aiBusyOverride: tab ? isTabTurnBusy(tab) : undefined,
+        });
+      }
+    }
+    deleteTabGroup(projectId, groupId);
+  };
+
+  const handleCloseGroup = async () => {
+    if (!groupContextMenu) return;
+    await closeGroupById(groupContextMenu.groupId);
   };
 
   const handleContextClose = () => {
@@ -2900,6 +3238,9 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             onContextMenu={(e) => {
               e.preventDefault();
               e.stopPropagation();
+              setContextMenu(null);
+              setGroupContextMenu(null);
+              setContextMenuPos({ x: e.clientX, y: e.clientY });
               setEmptyContextMenu({ x: e.clientX, y: e.clientY });
             }}
           />
@@ -3022,23 +3363,63 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                   data-vertical-row
                   data-row-type="group"
                   data-group-id={row.group.id}
+                  data-group-collapsed={row.group.collapsed ? 'true' : 'false'}
                   className="flex flex-col"
-                  style={{ gap: `${tabSidebarGap}px` }}
+                  style={{
+                    gap: row.group.collapsed ? 0 : `${tabSidebarGap}px`,
+                    transition: 'gap 150ms ease',
+                  }}
                 >
-                  <TabGroupHeader group={row.group} count={row.tabs.length} projectId={projectId} />
+                  <TabGroupHeader
+                    group={row.group}
+                    count={row.tabs.length}
+                    projectId={projectId}
+                    isEditing={editingGroupId === row.group.id}
+                    editValue={groupEditValue}
+                    onEditChange={setGroupEditValue}
+                    onEditSubmit={handleGroupRenameSubmit}
+                    onEditKeyDown={handleGroupRenameKeyDown}
+                    inputRef={inputRef as React.RefObject<HTMLInputElement>}
+                    onStartRename={() => startGroupRename(row.group)}
+                    onContextMenu={(e) => handleGroupContextMenu(e, row.group)}
+                    onAuxClick={(e) => {
+                      if (e.button !== 1) return;
+                      e.preventDefault();
+                      e.stopPropagation();
+                      void closeGroupById(row.group.id);
+                    }}
+                    onToggleCollapsed={() => toggleTabGroupCollapsed(projectId, row.group.id)}
+                    cmdCollapseMode={isCmdPressed}
+                  />
                   {row.tabs.length > 0 && (
                     <div
-                      data-tab-group-body
+                      data-tab-group-collapse
                       data-group-id={row.group.id}
-                      className="flex flex-col"
                       style={{
-                        gap: `${tabSidebarGap}px`,
-                        marginLeft: 9,
-                        paddingLeft: 7,
-                        borderLeft: '1px solid rgba(139,92,246,0.22)',
+                        display: 'grid',
+                        gridTemplateRows: row.group.collapsed ? '0fr' : '1fr',
+                        opacity: row.group.collapsed ? 0 : 1,
+                        transform: row.group.collapsed ? 'translateY(-2px)' : 'translateY(0)',
+                        transition: 'grid-template-rows 150ms ease, opacity 120ms ease, transform 150ms ease',
+                        pointerEvents: row.group.collapsed ? 'none' : 'auto',
                       }}
+                      aria-hidden={row.group.collapsed ? true : undefined}
                     >
-                      {row.tabs.map((tab, groupIndex) => renderTab(tab, row.group.id, groupIndex))}
+                      <div
+                        data-tab-group-body
+                        data-group-id={row.group.id}
+                        className="flex flex-col"
+                        style={{
+                          overflow: 'hidden',
+                          minHeight: 0,
+                          gap: `${tabSidebarGap}px`,
+                          marginLeft: 9,
+                          paddingLeft: 7,
+                          borderLeft: '1px solid rgba(139,92,246,0.22)',
+                        }}
+                      >
+                        {row.tabs.map((tab, groupIndex) => renderTab(tab, row.group.id, groupIndex))}
+                      </div>
                     </div>
                   )}
                 </div>
@@ -3051,10 +3432,20 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           <EmptyDropZone
             orientation="vertical"
             onDropMain={(tabId) => {
-              const currentTabs = mainTabsForDisplay.map(t => t.id);
+              const lastRow = verticalRows[verticalRows.length - 1];
+              const currentWorkspace = useWorkspaceStore.getState().openProjects.get(projectId);
+              const currentTabs = currentWorkspace
+                ? orderTabsWithVisualChildren(
+                    Array.from(currentWorkspace.tabs.values()).filter(tab => !tab.parentTabId && !tab.isUtility)
+                  ).map(tab => tab.id)
+                : mainTabsForDisplay.map(t => t.id);
               if (!currentTabs.includes(tabId)) return;
               const newOrder = currentTabs.filter(id => id !== tabId);
               newOrder.push(tabId);
+              if (lastRow?.type === 'group' && lastRow.tabs.every(tab => tab.id === tabId)) {
+                applyTabLayout(projectId, newOrder, { [tabId]: lastRow.group.id });
+                return;
+              }
               reorderInZone(projectId, 'main', newOrder);
             }}
             onDropFromUtility={(tabId) => {
@@ -3079,6 +3470,9 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             onContextMenu={(e) => {
               e.preventDefault();
               e.stopPropagation();
+              setContextMenu(null);
+              setGroupContextMenu(null);
+              setContextMenuPos({ x: e.clientX, y: e.clientY });
               setEmptyContextMenu({ x: e.clientX, y: e.clientY });
             }}
           />
@@ -3354,6 +3748,9 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 onContextMenu={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
+                  setContextMenu(null);
+                  setGroupContextMenu(null);
+                  setContextMenuPos({ x: e.clientX, y: e.clientY });
                   setEmptyContextMenu({ x: e.clientX, y: e.clientY });
                 }}
               />
@@ -3432,6 +3829,9 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
+                setContextMenu(null);
+                setGroupContextMenu(null);
+                setContextMenuPos({ x: e.clientX, y: e.clientY });
                 setEmptyContextMenu({ x: e.clientX, y: e.clientY });
               }}
             />
@@ -3512,11 +3912,35 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
             const handleClose = async () => {
               if (isMultiSelect) {
+                const startedAt = performance.now();
+                console.warn(
+                  '[Perf:CloseTabsBatch] start' +
+                  ' project=' + projectId.slice(-12) +
+                  ' count=' + selectedTabIds.length +
+                  ' trigger=' + String(contextMenu?.tabId || '').slice(-12) +
+                  ' source=context-menu' +
+                  ' startAbs=' + (performance.timeOrigin + startedAt).toFixed(1)
+                );
                 if (await confirmCloseTabs(selectedTabIds)) {
                   for (const id of selectedTabIds) {
                     const tab = workspace.tabs.get(id);
                     await closeTab(projectId, id, { skipProcessCheck: true, forceCleanup: true, aiBusyOverride: tab ? isTabTurnBusy(tab) : undefined });
                   }
+                  console.warn(
+                    '[Perf:CloseTabsBatch] done' +
+                    ' project=' + projectId.slice(-12) +
+                    ' count=' + selectedTabIds.length +
+                    ' source=context-menu' +
+                    ' durMs=' + (performance.now() - startedAt).toFixed(1)
+                  );
+                } else {
+                  console.warn(
+                    '[Perf:CloseTabsBatch] cancelled' +
+                    ' project=' + projectId.slice(-12) +
+                    ' count=' + selectedTabIds.length +
+                    ' source=context-menu' +
+                    ' durMs=' + (performance.now() - startedAt).toFixed(1)
+                  );
                 }
               } else {
                 handleContextClose();
@@ -4016,6 +4440,32 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             );
           })()}
 
+          {/* Explicit AI title refresh. Unlike automatic first-launch naming,
+              this is a user command, so it may override a manually named tab.
+              The resulting name is still marked manual to block future auto
+              launch naming from replacing it. */}
+          {!isMultiSelect && contextMenu && (() => {
+            const refreshing = titleRefreshInFlight.has(contextMenu.tabId);
+            return (
+              <button
+                className={`w-full text-left px-4 py-1.5 text-[13px] flex items-center gap-2 ${
+                  refreshing
+                    ? 'text-[#777] cursor-default'
+                    : 'text-[#ccc] hover:bg-white/10 cursor-pointer'
+                }`}
+                disabled={refreshing}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (!contextMenu || refreshing) return;
+                  void handleRefreshGeneratedTitle(contextMenu.tabId);
+                }}
+              >
+                <RotateCw size={12} className={refreshing ? 'text-[#777] animate-spin' : 'text-[#888]'} />
+                {refreshing ? 'Название обновляется...' : 'Обновить название'}
+              </button>
+            );
+          })()}
+
           {/* Add / Remove Favorites */}
           {!isMultiSelect && (
             <button
@@ -4059,6 +4509,57 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           )}
         </div>
       )}
+
+      {/* Group context menu */}
+      {groupContextMenu && (() => {
+        const group = tabGroups.find(candidate => candidate.id === groupContextMenu.groupId);
+        const groupTabCount = group ? getGroupTabIds(group.id).length : 0;
+        if (!group) return null;
+        return (
+          <div
+            ref={contextMenuRef}
+            data-tab-context-menu
+            className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px] z-[100] rounded-md overflow-hidden"
+            style={{ left: contextMenuPos.x, top: contextMenuPos.y }}
+            onClick={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="px-4 py-2 text-[11px] text-[#777] border-b border-[#333] flex items-center gap-2">
+              <Folder size={12} className="text-[#8b5cf6]" />
+              <span className="truncate">{group.name}</span>
+              <span className="ml-auto">{groupTabCount}</span>
+            </div>
+            <button
+              className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleGroupContextRename();
+              }}
+            >
+              Rename
+            </button>
+            <button
+              className="w-full text-left px-4 py-1.5 text-[13px] text-[#f87171] hover:bg-white/10 cursor-pointer"
+              onClick={(e) => {
+                e.stopPropagation();
+                void handleCloseGroup();
+              }}
+            >
+              Close Group
+            </button>
+            <div className="my-1 border-t border-[#444]" />
+            <button
+              className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleDeleteGroupOnly();
+              }}
+            >
+              Delete Group
+            </button>
+          </div>
+        );
+      })()}
 
       {/* Empty space context menu */}
       {emptyContextMenu && (

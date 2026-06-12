@@ -1,8 +1,22 @@
 import React, { useEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
-import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, Send, Square, RotateCcw, Power, AlertTriangle } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { useUIStore } from '../../store/useUIStore';
 import Tooltip from '../UI/Tooltip';
+import {
+  answerClaudeQuestion,
+  grabClaudePtyDraft,
+  getClaudePendingQuestion,
+  getClaudePtyPresence,
+  interruptClaudePtyTurn,
+  resumeClaudePtySession,
+  sendClaudePtyPrompt,
+  stopClaudePtyProcess,
+  type ClaudePtyDraftGrabResult,
+  type ClaudePendingQuestion,
+  type ClaudeQuestion,
+  type ClaudePtyStatus,
+} from '../../utils/claudePtyActions';
 // Shared conversation blocks — same renderer as the SDK tab. The JSONL history
 // window now draws tool-calls / diff / thinking / markdown through this package
 // so its style matches the rest of the app. Subagents (Task) are intentionally
@@ -60,6 +74,7 @@ interface HistoryPanelProps {
   notesPanelWidth: number;
   isOpen: boolean;
   toolType?: 'claude' | 'gemini' | 'codex';
+  enableClaudePtyControls?: boolean;
 }
 
 // Thinking + markdown now render via @noted/claude-blocks (CBThinkBlock /
@@ -422,12 +437,984 @@ if (!document.getElementById('hp-flash-style')) {
 ::highlight(hp-search-current) {
   background-color: rgba(234, 179, 8, 0.8);
   color: #000;
+}
+.hp-claude-prompt::placeholder {
+  color: #666;
+  opacity: 1;
+}
+.hp-claude-prompt[data-status="inactive"]::placeholder,
+.hp-claude-prompt[data-status="starting"]::placeholder {
+  color: #555;
 }`;
   document.head.appendChild(style);
 }
 
+const CLAUDE_STATUS_META: Record<ClaudePtyStatus, { label: string; color: string }> = {
+  active: { label: 'READY', color: '#4ade80' },
+  busy: { label: 'BUSY', color: '#d97706' },
+  inactive: { label: 'STOPPED', color: '#777' },
+  starting: { label: 'STARTING', color: '#60a5fa' },
+};
 
-function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, toolType = 'claude' }: HistoryPanelProps) {
+const historyControlButtonBase: React.CSSProperties = {
+  height: 26,
+  borderRadius: 5,
+  border: '1px solid #343434',
+  backgroundColor: '#242424',
+  color: '#cfcfcf',
+  padding: '0 8px',
+  fontSize: 11,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: 5,
+};
+
+const QUESTION_PURPLE = '#a78bfa';
+const QUESTION_PURPLE_BG = 'rgba(147, 51, 234, 0.18)';
+const QUESTION_PURPLE_BORDER = 'rgba(168, 85, 247, 0.9)';
+
+const DRAFT_GRAB_ERROR_MESSAGES: Record<string, string> = {
+  no_terminal: 'No terminal for this tab',
+  no_claude_session: 'No Claude session running in this tab',
+  no_claude_pid: 'No Claude process found in this tab',
+  claude_busy: 'Claude is busy - wait for the response to finish',
+  already_in_progress: 'Draft grab already in progress',
+  wrong_editor: 'Restart Claude in this tab - editor helper is not wired',
+  stale_pid: 'Claude was restarted in shell - close and reopen this tab',
+  editor_not_wired: 'Helper never reported back',
+  tab_cleared: 'Tab was closed before grab finished',
+  timeout: 'Draft grab timed out',
+};
+
+const draftGrabErrorText = (result: ClaudePtyDraftGrabResult | null | undefined) => {
+  const code = result?.error || 'unknown';
+  return DRAFT_GRAB_ERROR_MESSAGES[code] || ('Draft grab failed: ' + code);
+};
+
+const appendPromptText = (base: string, addition: string) => {
+  const left = base.trimEnd();
+  const right = addition.trim();
+  if (!right) return left;
+  if (!left) return right;
+  return left + '\n\n' + right;
+};
+
+function ClaudeHistoryQuestionCard({
+  pending,
+  answering,
+  error,
+  onAnswer,
+  onStop,
+}: {
+  pending: ClaudePendingQuestion;
+  answering: boolean;
+  error: string | null;
+  onAnswer: (answers: Record<string, string>) => void;
+  onStop: () => void;
+}) {
+  const questions = pending.questions || [];
+  const multiQuestion = questions.length > 1;
+  const [selection, setSelection] = useState<Record<number, string[]>>({});
+  const [questionIndex, setQuestionIndex] = useState(0);
+  const questionSignature = useMemo(
+    () => questions.map((q) => q?.question || '').join('||'),
+    [questions],
+  );
+
+  useEffect(() => {
+    setSelection({});
+    setQuestionIndex(0);
+  }, [pending.source, pending.toolUseID, questionSignature]);
+
+  useEffect(() => {
+    if (questionIndex >= questions.length && questions.length > 0) setQuestionIndex(questions.length - 1);
+  }, [questionIndex, questions.length]);
+
+  const currentQuestion: ClaudeQuestion | null = questions.length > 0
+    ? questions[Math.min(questionIndex, questions.length - 1)]
+    : null;
+  const currentOptions = currentQuestion?.options || [];
+  const currentSelection = selection[questionIndex] || [];
+  const isMultiSelect = !!currentQuestion?.multiSelect;
+
+  const buildAnswers = useCallback((snapshot: Record<number, string[]>) => {
+    const out: Record<string, string> = {};
+    questions.forEach((q, i) => {
+      const selected = snapshot[i];
+      if (q?.question && selected && selected.length) out[q.question] = selected.join(', ');
+    });
+    return out;
+  }, [questions]);
+
+  const allAnswered = questions.length > 0 && questions.every((_q, i) => (selection[i]?.length || 0) > 0);
+
+  const pickOption = useCallback((label: string) => {
+    if (answering || !currentQuestion) return;
+    if (isMultiSelect) {
+      setSelection((prev) => {
+        const current = prev[questionIndex] || [];
+        const next = current.includes(label)
+          ? current.filter((item) => item !== label)
+          : [...current, label];
+        return { ...prev, [questionIndex]: next };
+      });
+      return;
+    }
+
+    const nextSelection = { ...selection, [questionIndex]: [label] };
+    setSelection(nextSelection);
+    if (!multiQuestion) {
+      onAnswer(buildAnswers(nextSelection));
+    } else if (questionIndex < questions.length - 1) {
+      setQuestionIndex(questionIndex + 1);
+    }
+  }, [answering, buildAnswers, currentQuestion, isMultiSelect, multiQuestion, onAnswer, questionIndex, questions.length, selection]);
+
+  const submit = useCallback(() => {
+    if (answering || !allAnswered) return;
+    onAnswer(buildAnswers(selection));
+  }, [allAnswered, answering, buildAnswers, onAnswer, selection]);
+
+  const headerLabel = questions.length > 0
+    ? 'QUESTION' + (multiQuestion ? ' ' + (questionIndex + 1) + '/' + questions.length : '')
+    : 'QUESTION';
+
+  return (
+    <div
+      style={{
+        border: '1px solid rgba(168, 85, 247, 0.32)',
+        backgroundColor: '#101010',
+        borderRadius: 6,
+        padding: 10,
+        animation: 'noted-fade-in 0.16s ease-out',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, minWidth: 0 }}>
+        <span style={{
+          fontSize: 10,
+          fontWeight: 700,
+          letterSpacing: 0.4,
+          color: QUESTION_PURPLE,
+          padding: '2px 7px',
+          borderRadius: 999,
+          backgroundColor: QUESTION_PURPLE_BG,
+          border: '1px solid ' + QUESTION_PURPLE_BORDER,
+          flexShrink: 0,
+        }}>
+          {headerLabel}
+        </span>
+        {currentQuestion?.header && (
+          <span style={{ color: '#999', fontSize: 11, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {currentQuestion.header}
+          </span>
+        )}
+        <div style={{ flex: 1 }} />
+        {answering && (
+          <svg width="13" height="13" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite', flexShrink: 0 }}>
+            <circle cx="8" cy="8" r="6" fill="none" stroke={QUESTION_PURPLE} strokeWidth="2" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" />
+          </svg>
+        )}
+      </div>
+
+      {multiQuestion && (
+        <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginBottom: 8 }}>
+          {questions.map((q, i) => {
+            const answered = (selection[i]?.length || 0) > 0;
+            const active = i === questionIndex;
+            return (
+              <button
+                key={i}
+                type="button"
+                onClick={() => setQuestionIndex(i)}
+                disabled={answering}
+                style={{
+                  borderRadius: 5,
+                  border: '1px solid ' + (active ? QUESTION_PURPLE_BORDER : '#333'),
+                  backgroundColor: active ? QUESTION_PURPLE_BG : '#191919',
+                  color: active ? '#f3e8ff' : answered ? QUESTION_PURPLE : '#888',
+                  padding: '3px 7px',
+                  fontSize: 10,
+                  cursor: answering ? 'default' : 'pointer',
+                  maxWidth: 120,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+                title={q.question}
+              >
+                {(answered ? 'OK ' : '') + (q.header || 'Q' + (i + 1))}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {currentQuestion ? (
+        <>
+          <div style={{ color: '#f4f4f5', fontSize: 13, fontWeight: 600, lineHeight: 1.35, marginBottom: 8, wordBreak: 'break-word' }}>
+            {currentQuestion.question}
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {currentOptions.map((option, index) => {
+              const checked = currentSelection.includes(option.label);
+              return (
+                <button
+                  key={option.label + ':' + index}
+                  type="button"
+                  onClick={() => pickOption(option.label)}
+                  disabled={answering}
+                  style={{
+                    width: '100%',
+                    textAlign: 'left',
+                    borderRadius: 5,
+                    border: '1px solid ' + (checked ? QUESTION_PURPLE_BORDER : '#303030'),
+                    backgroundColor: checked ? QUESTION_PURPLE_BG : '#181818',
+                    color: '#e5e5e5',
+                    cursor: answering ? 'default' : 'pointer',
+                    padding: '8px 9px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 4,
+                  }}
+                >
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                    <span style={{
+                      width: 10,
+                      height: 10,
+                      borderRadius: isMultiSelect ? 2 : 999,
+                      border: '1px solid ' + (checked ? QUESTION_PURPLE : '#666'),
+                      backgroundColor: checked ? QUESTION_PURPLE : 'transparent',
+                      flexShrink: 0,
+                    }} />
+                    <span style={{ fontSize: 12, fontWeight: checked ? 600 : 500, overflowWrap: 'anywhere' }}>
+                      {option.label}
+                    </span>
+                  </span>
+                  {option.description && (
+                    <span style={{ color: '#999', fontSize: 11, lineHeight: 1.35, paddingLeft: 18 }}>
+                      {option.description}
+                    </span>
+                  )}
+                  {option.preview && (
+                    <pre style={{
+                      margin: '3px 0 0 18px',
+                      padding: '6px 8px',
+                      borderRadius: 4,
+                      backgroundColor: 'rgba(255,255,255,0.03)',
+                      border: '1px solid rgba(255,255,255,0.08)',
+                      color: '#bbb',
+                      fontSize: 11,
+                      lineHeight: 1.35,
+                      maxHeight: 120,
+                      overflow: 'auto',
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-word',
+                    }}>
+                      {option.preview}
+                    </pre>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </>
+      ) : (
+        <div style={{ color: '#bbb', fontSize: 12, lineHeight: 1.35 }}>
+          Claude asked a question in the terminal. The structured payload is empty, so answer manually.
+        </div>
+      )}
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10 }}>
+        <button
+          type="button"
+          onClick={onStop}
+          disabled={answering}
+          style={{
+            ...historyControlButtonBase,
+            height: 28,
+            cursor: answering ? 'default' : 'pointer',
+            color: '#aaa',
+          }}
+        >
+          Respond manually
+        </button>
+        <div style={{ flex: 1 }} />
+        {(isMultiSelect || multiQuestion) && (
+          <button
+            type="button"
+            onClick={submit}
+            disabled={answering || !allAnswered}
+            style={{
+              ...historyControlButtonBase,
+              height: 28,
+              borderColor: allAnswered && !answering ? QUESTION_PURPLE_BORDER : '#343434',
+              backgroundColor: allAnswered && !answering ? QUESTION_PURPLE : '#242424',
+              color: allAnswered && !answering ? '#121212' : '#666',
+              cursor: allAnswered && !answering ? 'pointer' : 'default',
+              fontWeight: 700,
+            }}
+          >
+            Submit{multiQuestion ? ' ' + Object.keys(selection).filter((key) => (selection[Number(key)]?.length || 0) > 0).length + '/' + questions.length : ''}
+          </button>
+        )}
+      </div>
+      {error && (
+        <div style={{ marginTop: 7, color: '#fca5a5', fontSize: 11, wordBreak: 'break-word' }}>
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ClaudeHistoryControls({
+  tabId,
+  sessionId,
+  cwd,
+  onHistoryRefresh,
+}: {
+  tabId: string;
+  sessionId: string;
+  cwd: string;
+  onHistoryRefresh: () => void;
+}) {
+  const [status, setStatus] = useState<ClaudePtyStatus>('inactive');
+  const [prompt, setPrompt] = useState('');
+  const [busyAction, setBusyAction] = useState<'resume' | 'send' | 'interrupt' | 'stop' | 'grab' | null>(null);
+  const [isPasteBusy, setIsPasteBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [draftWarning, setDraftWarning] = useState<string | null>(null);
+  const [pendingQuestion, setPendingQuestion] = useState<ClaudePendingQuestion | null>(null);
+  const [answeringQuestion, setAnsweringQuestion] = useState(false);
+  const [questionError, setQuestionError] = useState<string | null>(null);
+  const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const tabIdRef = useRef(tabId);
+  const statusRef = useRef<ClaudePtyStatus>('inactive');
+  const actionInFlightRef = useRef(false);
+  const actionSeqRef = useRef(0);
+  const pasteBusyRef = useRef(false);
+  const pendingQuestionRef = useRef<ClaudePendingQuestion | null>(null);
+  const answeringQuestionRef = useRef(false);
+  const midstreamPromptRecoveryRef = useRef<{ text: string; at: number } | null>(null);
+  const interruptRecoveryInFlightRef = useRef(false);
+
+  const setStatusFrom = useCallback((next: ClaudePtyStatus, reason: string) => {
+    const prev = statusRef.current;
+    statusRef.current = next;
+    if (prev !== next) {
+      console.log('[ClaudeHistoryControls] status tab=' + tabId.slice(-12) + ' ' + prev + ' -> ' + next + ' reason=' + reason);
+    }
+    setStatus(next);
+  }, [tabId]);
+
+  const setPendingQuestionFrom = useCallback((next: ClaudePendingQuestion | null, reason: string) => {
+    pendingQuestionRef.current = next;
+    setPendingQuestion(next);
+    console.log('[ClaudeHistoryQuestion] pending tab=' + tabId.slice(-12) + ' reason=' + reason + ' source=' + (next?.source || 'none') + ' qs=' + (next?.questions?.length || 0));
+  }, [tabId]);
+
+  const refreshPendingQuestion = useCallback(async (reason: string) => {
+    if (!tabId) return null;
+    const requestTabId = tabId;
+    try {
+      const pending = await getClaudePendingQuestion(tabId);
+      if (tabIdRef.current !== requestTabId) return null;
+      setPendingQuestionFrom(pending, reason);
+      if (pending && (pending.questions?.length || 0) === 0) {
+        console.warn('[ClaudeHistoryQuestion] empty-payload tab=' + tabId.slice(-12) + ' reason=' + reason);
+      }
+      return pending;
+    } catch (e: any) {
+      if (tabIdRef.current !== requestTabId) return null;
+      const message = String(e?.message || e);
+      console.warn('[ClaudeHistoryQuestion] pending refresh failed tab=' + tabId.slice(-12) + ': ' + message);
+      setQuestionError(message);
+      return null;
+    }
+  }, [setPendingQuestionFrom, tabId]);
+
+  const refreshPresence = useCallback(async () => {
+    if (!tabId) return;
+    const requestTabId = tabId;
+    try {
+      const presence = await getClaudePtyPresence(tabId);
+      if (tabIdRef.current !== requestTabId) return;
+      setStatusFrom(presence.status, 'presence');
+      if (presence.awaiting) {
+        refreshPendingQuestion('presence-awaiting');
+      } else if (pendingQuestionRef.current) {
+        setPendingQuestionFrom(null, 'presence-not-awaiting');
+      }
+    } catch (e: any) {
+      if (tabIdRef.current !== requestTabId) return;
+      console.warn('[ClaudeHistoryControls] presence failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
+      setStatusFrom('inactive', 'presence-error');
+    }
+  }, [refreshPendingQuestion, setPendingQuestionFrom, setStatusFrom, tabId]);
+
+  useEffect(() => {
+    tabIdRef.current = tabId;
+    actionSeqRef.current += 1;
+    actionInFlightRef.current = false;
+    pasteBusyRef.current = false;
+    pendingQuestionRef.current = null;
+    answeringQuestionRef.current = false;
+    midstreamPromptRecoveryRef.current = null;
+    interruptRecoveryInFlightRef.current = false;
+    setBusyAction(null);
+    setIsPasteBusy(false);
+    setError(null);
+    setDraftWarning(null);
+    setPendingQuestion(null);
+    setAnsweringQuestion(false);
+    setQuestionError(null);
+    setStatusFrom('inactive', 'tab-bind');
+    refreshPresence();
+  }, [refreshPresence, setStatusFrom, tabId]);
+
+  useEffect(() => {
+    const handleTuiReady = (_: any, data: { tabId?: string }) => {
+      if (data?.tabId !== tabId) return;
+      console.log('[ClaudeHistoryControls] tui-ready tab=' + tabId.slice(-12));
+      refreshPresence();
+    };
+    const handleStarted = (_: any, data: { tabId?: string }) => {
+      if (data?.tabId !== tabId) return;
+      const current = statusRef.current;
+      const next = current === 'active' || current === 'busy' ? current : 'starting';
+      setStatusFrom(next, 'command-started');
+    };
+    const handleBusy = (_: any, data: { tabId?: string; busy?: boolean }) => {
+      if (data?.tabId !== tabId) return;
+      if (data.busy) setStatusFrom('busy', 'busy-state');
+      else {
+        if (pendingQuestionRef.current) setPendingQuestionFrom(null, 'busy-false');
+        refreshPresence();
+      }
+    };
+    const handleFinished = (_: any, data: { tabId?: string }) => {
+      if (data?.tabId !== tabId) return;
+      pasteBusyRef.current = false;
+      setIsPasteBusy(false);
+      refreshPresence();
+    };
+    const handleAwaitingInput = (_: any, data: { tabId?: string; awaiting?: boolean }) => {
+      if (data?.tabId !== tabId) return;
+      console.log('[ClaudeHistoryQuestion] awaiting-event tab=' + tabId.slice(-12) + ' awaiting=' + !!data.awaiting);
+      if (data.awaiting) {
+        refreshPendingQuestion('awaiting-event');
+      } else {
+        setPendingQuestionFrom(null, 'awaiting-cleared');
+        setQuestionError(null);
+      }
+    };
+    const handlePasteBusy = (_: any, data: { tabId?: string; busy?: boolean }) => {
+      if (data?.tabId !== tabId) return;
+      pasteBusyRef.current = !!data.busy;
+      setIsPasteBusy(!!data.busy);
+      console.log('[ClaudeHistoryControls] paste-busy tab=' + tabId.slice(-12) + ' busy=' + !!data.busy);
+    };
+
+    ipcRenderer.on('claude:tui-ready', handleTuiReady);
+    ipcRenderer.on('claude:busy-state', handleBusy);
+    ipcRenderer.on('claude:awaiting-input', handleAwaitingInput);
+    ipcRenderer.on('claude:paste-busy', handlePasteBusy);
+    ipcRenderer.on('terminal:command-started', handleStarted);
+    ipcRenderer.on('terminal:command-finished', handleFinished);
+    return () => {
+      ipcRenderer.removeListener('claude:tui-ready', handleTuiReady);
+      ipcRenderer.removeListener('claude:busy-state', handleBusy);
+      ipcRenderer.removeListener('claude:awaiting-input', handleAwaitingInput);
+      ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
+      ipcRenderer.removeListener('terminal:command-started', handleStarted);
+      ipcRenderer.removeListener('terminal:command-finished', handleFinished);
+    };
+  }, [refreshPendingQuestion, setPendingQuestionFrom, tabId, refreshPresence, setStatusFrom]);
+
+  const readTerminalDraft = useCallback(async (reason: string) => {
+    const requestTabId = tabId;
+    console.log('[ClaudeHistoryDraft] grab-request tab=' + tabId.slice(-12) + ' reason=' + reason);
+    const result = await grabClaudePtyDraft(tabId);
+    if (tabIdRef.current !== requestTabId) return { stale: true, text: '', images: 0 };
+    if (!result?.success) {
+      const message = draftGrabErrorText(result);
+      console.warn('[ClaudeHistoryDraft] grab-failed tab=' + tabId.slice(-12) + ' reason=' + reason + ' error=' + (result?.error || 'unknown'));
+      throw new Error(message);
+    }
+    const text = typeof result.text === 'string' ? result.text.trim() : '';
+    const images = Number(result.images || 0);
+    console.log('[ClaudeHistoryDraft] grab-ok tab=' + tabId.slice(-12) + ' reason=' + reason + ' chars=' + text.length + ' images=' + images);
+    return { stale: false, text, images };
+  }, [tabId]);
+
+  useEffect(() => {
+    const handleInterruptRecovery = (_: any, data: { tabId?: string; busy?: boolean; reason?: string }) => {
+      if (data?.tabId !== tabId || data.busy) return;
+      if (data.reason !== 'interrupt') {
+        midstreamPromptRecoveryRef.current = null;
+        return;
+      }
+      const pending = midstreamPromptRecoveryRef.current;
+      if (!pending) {
+        console.log('[ClaudeHistoryDraft] interrupt-recovery skip tab=' + tabId.slice(-12) + ' reason=no-midstream-send');
+        return;
+      }
+      if (interruptRecoveryInFlightRef.current) {
+        console.log('[ClaudeHistoryDraft] interrupt-recovery skip tab=' + tabId.slice(-12) + ' reason=inflight');
+        return;
+      }
+      const ageMs = Date.now() - pending.at;
+      if (ageMs > 120000) {
+        console.log('[ClaudeHistoryDraft] interrupt-recovery skip tab=' + tabId.slice(-12) + ' reason=stale ageMs=' + ageMs);
+        midstreamPromptRecoveryRef.current = null;
+        return;
+      }
+
+      const requestTabId = tabId;
+      interruptRecoveryInFlightRef.current = true;
+      console.log('[ClaudeHistoryDraft] interrupt-recovery start tab=' + tabId.slice(-12) + ' ageMs=' + ageMs + ' sentChars=' + pending.text.length);
+      readTerminalDraft('interrupt-recovery')
+        .then((draft) => {
+          if (draft.stale || tabIdRef.current !== requestTabId) return;
+          if (!draft.text) {
+            console.log('[ClaudeHistoryDraft] interrupt-recovery empty tab=' + tabId.slice(-12));
+            return;
+          }
+          setPrompt((prev) => appendPromptText(prev, draft.text));
+          setDraftWarning('Claude returned an interrupted prompt; pulled it back from terminal input.');
+          console.log('[ClaudeHistoryDraft] interrupt-recovery restored tab=' + tabId.slice(-12) + ' chars=' + draft.text.length + ' images=' + draft.images);
+          requestAnimationFrame(() => promptTextareaRef.current?.focus());
+        })
+        .catch((e: any) => {
+          console.warn('[ClaudeHistoryDraft] interrupt-recovery failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
+        })
+        .finally(() => {
+          if (tabIdRef.current === requestTabId) {
+            midstreamPromptRecoveryRef.current = null;
+            interruptRecoveryInFlightRef.current = false;
+          }
+        });
+    };
+
+    ipcRenderer.on('claude:busy-state', handleInterruptRecovery);
+    return () => {
+      ipcRenderer.removeListener('claude:busy-state', handleInterruptRecovery);
+    };
+  }, [readTerminalDraft, tabId]);
+
+  const pullTerminalDraft = useCallback(async () => {
+    if (actionInFlightRef.current) {
+      console.log('[ClaudeHistoryDraft] drop-pull tab=' + tabId.slice(-12) + ' reason=inflight');
+      return;
+    }
+    if (statusRef.current !== 'active') {
+      setError('Claude is not ready (' + statusRef.current + ')');
+      return;
+    }
+    if (pendingQuestionRef.current) {
+      setError('Claude is waiting for a question answer');
+      return;
+    }
+
+    const actionTabId = tabId;
+    const actionSeq = ++actionSeqRef.current;
+    actionInFlightRef.current = true;
+    setBusyAction('grab');
+    setError(null);
+    setDraftWarning(null);
+    try {
+      const draft = await readTerminalDraft('manual-pull');
+      if (draft.stale || tabIdRef.current !== actionTabId) return;
+      if (!draft.text) {
+        setDraftWarning('Claude terminal input is empty');
+        return;
+      }
+      setPrompt((prev) => appendPromptText(prev, draft.text));
+      if (draft.images > 0) {
+        setDraftWarning('Pulled text contains ' + draft.images + ' image placeholder' + (draft.images === 1 ? '' : 's') + '; images are not attached in this History input.');
+      }
+      requestAnimationFrame(() => promptTextareaRef.current?.focus());
+    } catch (e: any) {
+      if (tabIdRef.current === actionTabId) setError(String(e?.message || e));
+      refreshPresence();
+    } finally {
+      if (actionSeqRef.current === actionSeq) {
+        actionInFlightRef.current = false;
+        if (tabIdRef.current === actionTabId) setBusyAction(null);
+      }
+    }
+  }, [readTerminalDraft, refreshPresence, tabId]);
+
+  const runAction = useCallback(async (kind: 'resume' | 'send' | 'interrupt' | 'stop') => {
+    if (actionInFlightRef.current) {
+      console.log('[ClaudeHistoryControls] drop-action tab=' + tabId.slice(-12) + ' kind=' + kind + ' reason=inflight');
+      return;
+    }
+    if (kind === 'send' && pasteBusyRef.current) {
+      console.log('[ClaudeHistoryControls] drop-action tab=' + tabId.slice(-12) + ' kind=send reason=paste-busy');
+      return;
+    }
+    const actionTabId = tabId;
+    const actionSeq = ++actionSeqRef.current;
+    actionInFlightRef.current = true;
+    setBusyAction(kind);
+    setError(null);
+    try {
+      if (kind === 'resume') {
+        setStatusFrom('starting', 'resume-click');
+        const result = await resumeClaudePtySession({ tabId, sessionId, cwd });
+        if (!result.success) throw new Error(result.error || 'Resume failed');
+        if (tabIdRef.current !== actionTabId) return;
+        if (result.alreadyRunning && result.status) setStatusFrom(result.status, 'resume-already-running');
+      } else if (kind === 'send') {
+        let text = prompt.trim();
+        if (!text) return;
+        if (pendingQuestionRef.current) throw new Error('Claude is waiting for a question answer');
+        const statusAtSend = statusRef.current;
+        if (statusAtSend !== 'active' && statusAtSend !== 'busy') throw new Error('Claude is not ready (' + statusAtSend + ')');
+        if (statusAtSend === 'active') {
+          const terminalDraft = await readTerminalDraft('send-preflight');
+          if (terminalDraft.stale || tabIdRef.current !== actionTabId) return;
+          if (terminalDraft.text) {
+            text = appendPromptText(text, terminalDraft.text);
+            setPrompt(text);
+            setDraftWarning('Terminal draft found — send stopped, text appended here.');
+            console.log('[ClaudeHistoryDraft] send-preflight blocked tab=' + tabId.slice(-12) + ' chars=' + terminalDraft.text.length + ' images=' + terminalDraft.images);
+            requestAnimationFrame(() => promptTextareaRef.current?.focus());
+            if (terminalDraft.images > 0) {
+              setDraftWarning('Terminal draft found — send stopped, text appended here. Review image placeholders.');
+            }
+            return;
+          }
+        } else {
+          console.log('[ClaudeHistoryDraft] send-preflight skipped tab=' + tabId.slice(-12) + ' reason=busy-midstream');
+        }
+        const result = await sendClaudePtyPrompt(tabId, text);
+        if (result?.success === false) throw new Error(result?.error || 'Send failed');
+        if (tabIdRef.current !== actionTabId) return;
+        if (statusAtSend === 'busy') {
+          midstreamPromptRecoveryRef.current = { text, at: Date.now() };
+          console.log('[ClaudeHistoryDraft] midstream-send tracked tab=' + tabId.slice(-12) + ' chars=' + text.length);
+        } else {
+          midstreamPromptRecoveryRef.current = null;
+        }
+        setPrompt('');
+        setDraftWarning(null);
+        setStatusFrom('busy', 'send-click');
+        onHistoryRefresh();
+      } else if (kind === 'interrupt') {
+        const result = interruptClaudePtyTurn(tabId);
+        if (!result.success) throw new Error(result.error || 'Stop failed');
+        if (result.interrupted && tabIdRef.current === actionTabId) setStatusFrom('active', 'interrupt-click');
+      } else if (kind === 'stop') {
+        const result = await stopClaudePtyProcess(tabId);
+        if (result?.success === false) throw new Error(result?.error || 'Stop failed');
+        if (tabIdRef.current !== actionTabId) return;
+        pasteBusyRef.current = false;
+        setIsPasteBusy(false);
+        setStatusFrom('inactive', 'stop-process-click');
+      }
+    } catch (e: any) {
+      if (tabIdRef.current === actionTabId) setError(String(e?.message || e));
+      refreshPresence();
+    } finally {
+      if (actionSeqRef.current === actionSeq) {
+        actionInFlightRef.current = false;
+        if (tabIdRef.current === actionTabId) setBusyAction(null);
+      }
+    }
+  }, [cwd, onHistoryRefresh, prompt, readTerminalDraft, refreshPresence, sessionId, setStatusFrom, tabId]);
+
+  const answerPendingQuestion = useCallback(async (answers: Record<string, string>, stop = false) => {
+    if (answeringQuestionRef.current) {
+      console.log('[ClaudeHistoryQuestion] drop-answer tab=' + tabId.slice(-12) + ' reason=inflight stop=' + stop);
+      return;
+    }
+    let pending = pendingQuestionRef.current;
+    if (!pending) {
+      pending = await refreshPendingQuestion('answer-missing-pending');
+    }
+    if (!pending) {
+      setQuestionError('No pending question');
+      console.warn('[ClaudeHistoryQuestion] no-pending tab=' + tabId.slice(-12) + ' stop=' + stop);
+      return;
+    }
+
+    const actionTabId = tabId;
+    answeringQuestionRef.current = true;
+    setAnsweringQuestion(true);
+    setQuestionError(null);
+    console.log('[ClaudeHistoryQuestion] answer-start tab=' + tabId.slice(-12) + ' source=' + pending.source + ' stop=' + stop + ' answers=' + Object.keys(answers || {}).length);
+    try {
+      const result = await answerClaudeQuestion({ tabId, pendingQuestion: pending, answers, stop });
+      if (result?.success === false) throw new Error(result?.error || result?.reason || 'Question answer failed');
+      if (tabIdRef.current !== actionTabId) return;
+      setPendingQuestionFrom(null, stop ? 'respond-manually' : 'answered');
+      if (!stop) setStatusFrom('busy', 'question-answered');
+      onHistoryRefresh();
+    } catch (e: any) {
+      if (tabIdRef.current === actionTabId) {
+        const message = String(e?.message || e);
+        setQuestionError(message);
+        console.warn('[ClaudeHistoryQuestion] answer-failed tab=' + tabId.slice(-12) + ': ' + message);
+        refreshPendingQuestion('answer-error');
+      }
+    } finally {
+      if (tabIdRef.current === actionTabId) setAnsweringQuestion(false);
+      answeringQuestionRef.current = false;
+    }
+  }, [onHistoryRefresh, refreshPendingQuestion, setPendingQuestionFrom, setStatusFrom, tabId]);
+
+  const meta = CLAUDE_STATUS_META[status];
+  const isTurnBusy = status === 'busy';
+  const controlsLocked = !!busyAction || isPasteBusy || answeringQuestion;
+  const canAcceptPrompt = (status === 'active' || status === 'busy');
+  const canSend = canAcceptPrompt && prompt.trim().length > 0 && !pendingQuestion && !controlsLocked;
+  const canGrabDraft = status === 'active' && !pendingQuestion && !controlsLocked;
+  const canInterruptTurn = isTurnBusy && !controlsLocked;
+  const canResume = status === 'inactive' && !!sessionId && !busyAction;
+  const canStopProcess = (status === 'active' || status === 'busy' || status === 'starting') && !busyAction;
+
+  return (
+    <div
+      style={{
+        flexShrink: 0,
+        borderTop: '1px solid #333',
+        backgroundColor: '#151515',
+        padding: '8px 10px 10px 12px',
+      }}
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 7 }}>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            minWidth: 0,
+            color: '#888',
+            fontSize: 10,
+            fontWeight: 600,
+            letterSpacing: 0,
+          }}
+        >
+          <span
+            style={{
+              width: 7,
+              height: 7,
+              borderRadius: 999,
+              backgroundColor: meta.color,
+              boxShadow: status === 'busy' ? '0 0 8px rgba(217, 119, 6, 0.8)' : undefined,
+              flexShrink: 0,
+            }}
+          />
+          <span>{meta.label}</span>
+        </div>
+        {draftWarning && !error && (
+          <Tooltip content={draftWarning}>
+            <div
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                minWidth: 0,
+                maxWidth: 260,
+                height: 20,
+                padding: '0 7px',
+                borderRadius: 5,
+                border: '1px solid rgba(251, 191, 36, 0.45)',
+                backgroundColor: 'rgba(217, 119, 6, 0.16)',
+                color: '#fbbf24',
+                fontSize: 10,
+                fontWeight: 650,
+                letterSpacing: 0,
+                flexShrink: 1,
+              }}
+            >
+              <AlertTriangle size={12} style={{ flexShrink: 0 }} />
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                Send stopped · draft moved
+              </span>
+            </div>
+          </Tooltip>
+        )}
+        <div style={{ flex: 1 }} />
+        {status === 'inactive' && (
+          <Tooltip content="Resume Claude session">
+            <button
+              onClick={() => runAction('resume')}
+              disabled={!canResume}
+              style={{
+                ...historyControlButtonBase,
+                cursor: canResume ? 'pointer' : 'default',
+                color: canResume ? '#1a1a1a' : '#777',
+                backgroundColor: canResume ? '#DA7756' : '#242424',
+                borderColor: canResume ? '#DA7756' : '#343434',
+              }}
+            >
+              <RotateCcw size={13} />
+              {busyAction === 'resume' ? 'RESUMING' : 'Resume'}
+            </button>
+          </Tooltip>
+        )}
+        {status !== 'inactive' && (
+          <Tooltip content="Stop Claude process">
+            <button
+              onClick={() => runAction('stop')}
+              disabled={!canStopProcess}
+              style={{
+                ...historyControlButtonBase,
+                width: 28,
+                padding: 0,
+                cursor: canStopProcess ? 'pointer' : 'default',
+                color: canStopProcess ? '#fca5a5' : '#666',
+              }}
+            >
+              <Power size={13} />
+            </button>
+          </Tooltip>
+        )}
+      </div>
+
+      {pendingQuestion ? (
+        <ClaudeHistoryQuestionCard
+          key={(pendingQuestion.source || 'unknown') + ':' + (pendingQuestion.toolUseID || 'none') + ':' + (pendingQuestion.questions?.length || 0)}
+          pending={pendingQuestion}
+          answering={answeringQuestion}
+          error={questionError}
+          onAnswer={(answers) => answerPendingQuestion(answers, false)}
+          onStop={() => answerPendingQuestion({}, true)}
+        />
+      ) : (
+        <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6 }}>
+          <textarea
+            ref={promptTextareaRef}
+            className="hp-claude-prompt"
+            data-status={status}
+            value={prompt}
+            onChange={(e) => {
+              setPrompt(e.target.value);
+              if (draftWarning) setDraftWarning(null);
+            }}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                e.preventDefault();
+                if (canSend) runAction('send');
+              }
+            }}
+            placeholder={status === 'inactive' ? 'Resume Claude to send' : status === 'starting' ? 'Waiting for prompt...' : 'Send a prompt...'}
+            rows={3}
+            style={{
+              flex: 1,
+              minWidth: 0,
+              resize: 'vertical',
+              maxHeight: 120,
+              minHeight: 56,
+              backgroundColor: '#0f0f0f',
+              border: '1px solid #333',
+              borderRadius: 5,
+              color: '#e5e5e5',
+              outline: 'none',
+              padding: '7px 8px',
+              fontSize: 12,
+              lineHeight: 1.35,
+              fontFamily: 'inherit',
+            }}
+            onFocus={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = '#DA7756'; }}
+            onBlur={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = '#333'; }}
+          />
+          <Tooltip content={canGrabDraft ? 'Pull terminal draft' : 'Claude must be ready to pull draft'}>
+            <button
+              onClick={pullTerminalDraft}
+              disabled={!canGrabDraft}
+              style={{
+                width: 34,
+                height: 42,
+                borderRadius: 5,
+                border: '1px solid ' + (canGrabDraft ? '#3f3f46' : '#343434'),
+                backgroundColor: canGrabDraft ? '#202020' : '#242424',
+                color: canGrabDraft ? '#a78bfa' : '#666',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: canGrabDraft ? 'pointer' : 'default',
+                flexShrink: 0,
+              }}
+            >
+              {busyAction === 'grab' ? (
+                <svg width="14" height="14" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite' }}>
+                  <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" />
+                </svg>
+              ) : (
+                <ArrowDown size={14} />
+              )}
+            </button>
+          </Tooltip>
+          <Tooltip content={isPasteBusy ? 'Claude paste is in progress' : isTurnBusy ? 'Send while Claude streams' : 'Send prompt'}>
+            <button
+              onClick={() => runAction('send')}
+              disabled={!canSend}
+              style={{
+                width: 42,
+                height: 42,
+                borderRadius: 5,
+                border: '1px solid ' + (canSend ? '#DA7756' : '#343434'),
+                backgroundColor: canSend ? '#DA7756' : '#242424',
+                color: canSend ? '#1a1a1a' : '#666',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: canSend ? 'pointer' : 'default',
+                flexShrink: 0,
+              }}
+            >
+              {busyAction === 'send' ? (
+                <svg width="14" height="14" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite' }}>
+                  <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" />
+                </svg>
+              ) : (
+                <Send size={14} />
+              )}
+            </button>
+          </Tooltip>
+          {isTurnBusy && (
+            <Tooltip content="Stop current turn">
+              <button
+                onClick={() => runAction('interrupt')}
+                disabled={!canInterruptTurn}
+                style={{
+                  width: 42,
+                  height: 42,
+                  borderRadius: 5,
+                  border: '1px solid ' + (canInterruptTurn ? '#7f1d1d' : '#343434'),
+                  backgroundColor: canInterruptTurn ? '#2a1515' : '#242424',
+                  color: canInterruptTurn ? '#fca5a5' : '#666',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  cursor: canInterruptTurn ? 'pointer' : 'default',
+                  flexShrink: 0,
+                }}
+              >
+                <Square size={14} fill="currentColor" />
+              </button>
+            </Tooltip>
+          )}
+        </div>
+      )}
+      {error && (
+        <div style={{ marginTop: 6, color: '#fca5a5', fontSize: 11, wordBreak: 'break-word' }}>
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, toolType = 'claude', enableClaudePtyControls = false }: HistoryPanelProps) {
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const setHistoryPanelWidth = useUIStore((s) => s.setHistoryPanelWidth);
   const historyScrollToUuid = useUIStore((s) => s.historyScrollToUuid);
@@ -1195,6 +2182,15 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         </div>
         </Tooltip>
       </div>
+
+      {enableClaudePtyControls && toolType === 'claude' && (
+        <ClaudeHistoryControls
+          tabId={tabId}
+          sessionId={sessionId}
+          cwd={cwd}
+          onHistoryRefresh={() => loadHistory(true)}
+        />
+      )}
     </div>
   );
 

@@ -253,7 +253,12 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
     ipcRenderer.on('terminal:command-finished', handleFinished);
     ipcRenderer.on('claude:busy-state', handleBusyState);
     ipcRenderer.on('claude:paste-busy', handlePasteBusy);
-    ipcRenderer.invoke('terminal:getCommandState', activeTabId).then((state: any) => {
+    ipcRenderer.invoke('terminal:getCommandState', {
+      tabId: activeTabId,
+      caller: 'InfoPanel.activeTabSync',
+      expectedProcess: 'codex',
+      allowProcessTreeLookup: activeCommandType === 'codex',
+    }).then((state: any) => {
       setIsCommandRunning(state?.isRunning || false);
     });
     return () => {
@@ -265,7 +270,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       // tabId, the new tab will receive its own state on the next event.
       setIsPasteBusy(false);
     };
-  }, [activeTabId, isSDKTab]);
+  }, [activeTabId, isSDKTab, activeCommandType]);
 
   useEffect(() => {
     const checkSession = () => {

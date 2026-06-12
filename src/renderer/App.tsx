@@ -23,6 +23,13 @@ import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import './utils/logger';
 import { usePromptQueueRunner } from './hooks/usePromptQueueRunner';
 import { markPendingResume } from './utils/pendingResume';
+import {
+  getClaudePtyPresence,
+  interruptClaudePtyTurn,
+  resumeClaudePtySession,
+  sendClaudePtyPrompt,
+  stopClaudePtyProcess,
+} from './utils/claudePtyActions';
 import { hydratePromptQueueStore, usePromptQueueStore, serializePromptQueueCore } from './store/usePromptQueueStore';
 import { usePromptQueueWebSync } from './hooks/usePromptQueueWebSync';
 import { useMirrorStatusStore } from './store/useMirrorStatusStore';
@@ -825,18 +832,23 @@ function App() {
   useEffect(() => {
     // Initial load: get state for all tabs
     const initProcessStatus = async () => {
-      const allTabIds: string[] = [];
+      const allTabs: Array<{ tabId: string; commandType?: string }> = [];
       openProjects.forEach((workspace) => {
-        workspace.tabs.forEach((_, tabId) => {
-          allTabIds.push(tabId);
+        workspace.tabs.forEach((tab: any, tabId) => {
+          allTabs.push({ tabId, commandType: tab?.commandType });
         });
       });
 
       const newStatus = new Map<string, boolean>();
       await Promise.all(
-        allTabIds.map(async (tabId) => {
+        allTabs.map(async ({ tabId, commandType }) => {
           try {
-            const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+            const state = await ipcRenderer.invoke('terminal:getCommandState', {
+              tabId,
+              caller: 'App.processStatusInit',
+              expectedProcess: 'codex',
+              allowProcessTreeLookup: commandType === 'codex',
+            });
             newStatus.set(tabId, state?.isRunning || false);
           } catch {
             newStatus.set(tabId, false);
@@ -1351,6 +1363,8 @@ function App() {
           // during a turn the command queues correctly.
           if (tab.commandType === 'claude' && tab.tabType !== 'claude-sdk') {
             if (model !== undefined) {
+              const modelSentinel = (window as any).__modelSentForTab as Map<string, { at: number; via: string; model: string }> | undefined;
+              if (modelSentinel) modelSentinel.set(tabId, { at: Date.now(), via: 'mobile-click', model });
               try { await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model); } catch {}
             }
             if (effort !== undefined) {
@@ -1547,8 +1561,6 @@ function App() {
           return reply(true, { tabId, name: tab?.name, cwd: tab?.cwd, projectId });
         }
         if (action === 'resumeClaudeTab') {
-          // For Inactive CLAUDE-tabs: spawn `claude --resume <sessionId>` in the
-          // existing PTY (or recreate the PTY if it was killed).
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
           let tab: any = null;
@@ -1559,36 +1571,14 @@ function App() {
           if (!tab) return reply(false, null, 'tab not open');
           if (!tab.claudeSessionId) return reply(false, null, 'no session to resume');
           console.log('[MobResume:Bridge] resumeClaudeTab begin tab=' + String(tabId).slice(-12) + ' sid=' + String(tab.claudeSessionId).slice(0, 8));
-          // Authoritative liveness check: bridgeKnownSessions tracks "Claude
-          // CLI is actually in this PTY". If Claude is alive, sending Ctrl+U
-          // would erase whatever the desktop user is typing AND drop them out
-          // of Claude's input — destructive. Refuse instead.
           try {
-            const presence = await ipcRenderer.invoke('claude:get-presence', tabId);
-            console.log('[MobResume:Bridge] presence tab=' + String(tabId).slice(-12) + ' status=' + (presence?.status || 'unknown'));
-            if (presence?.status === 'active' || presence?.status === 'busy') {
-              state.clearInterruptedState(tabId); // overlay was wrong anyway
-              return reply(true, { tabId, sessionId: tab.claudeSessionId, alreadyRunning: true });
-            }
-          } catch (e) { console.log('[MobResume:Bridge] presence-err tab=' + String(tabId).slice(-12) + ' ' + (e as any)?.message); }
-          // Mark pending-resume guard so stale ~/.claude/bridge/*.json from old
-          // dead processes can't stamp the wrong sessionId during the next 15s.
-          // See docs/knowledge/fix-bridge-stale-takeover.md.
-          markPendingResume(tabId, tab.claudeSessionId);
-          // Clear the "interrupted session" overlay on desktop — mobile is
-          // re-launching Claude, so the overlay's purpose (offer to continue)
-          // is fulfilled. Without this the desktop user sees a stale "Сессия
-          // была прервана" modal even though Claude is already running.
-          state.clearInterruptedState(tabId);
-          // Clear current line then send the resume command. Same exact shape
-          // as Terminal.tsx Case 2 (claude-c interception) which is the
-          // canonical resume path on desktop — using --dangerously-skip-permissions
-          // matches existing PTY-shell expectations and keeps Stop-hook behavior.
-          const cmd = '\x15claude --dangerously-skip-permissions --resume ' + tab.claudeSessionId + '\r';
-          ipcRenderer.send('terminal:input', tabId, cmd);
-          ipcRenderer.send('terminal:force-command-started', tabId);
-          console.log('[MobResume:Bridge] resumeClaudeTab cmd-sent tab=' + String(tabId).slice(-12));
-          return reply(true, { tabId, sessionId: tab.claudeSessionId });
+            const result = await resumeClaudePtySession({ tabId, sessionId: tab.claudeSessionId, cwd: tab.cwd });
+            console.log('[MobResume:Bridge] resumeClaudeTab done tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(result));
+            return reply(!!result.success, { tabId, sessionId: tab.claudeSessionId, ...result }, result.error);
+          } catch (e: any) {
+            console.log('[MobResume:Bridge] resumeClaudeTab err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
+            return reply(false, null, String(e?.message || e));
+          }
         }
         if (action === 'stopClaudeTab') {
           // SIGTERM by PID, not keystrokes. The previous Ctrl+C×2 with
@@ -1604,7 +1594,7 @@ function App() {
           if (!tabId) return reply(false, null, 'tabId required');
           console.log('[MobStop:Bridge] stopClaudeTab SIGTERM begin tab=' + String(tabId).slice(-12));
           try {
-            const r = await ipcRenderer.invoke('terminal:stop-ai-process', tabId);
+            const r = await stopClaudePtyProcess(tabId);
             console.log('[MobStop:Bridge] stopClaudeTab done tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(r));
             return reply(!!r?.success, { tabId, stopped: !!r?.success, ...r });
           } catch (e: any) {
@@ -1625,8 +1615,8 @@ function App() {
           if (!tabId) return reply(false, null, 'tabId required');
           console.log('[MobInterrupt:Bridge] interruptClaudeTurn Esc tab=' + String(tabId).slice(-12));
           try {
-            ipcRenderer.send('terminal:input', tabId, '\x1b');
-            return reply(true, { tabId, interrupted: true });
+            const result = interruptClaudePtyTurn(tabId);
+            return reply(!!result.success, { tabId, interrupted: !!result.interrupted });
           } catch (e: any) {
             console.log('[MobInterrupt:Bridge] err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
             return reply(false, null, String(e?.message || e));
@@ -1645,11 +1635,9 @@ function App() {
           }
           const isClaudePty = tab && tab.commandType === 'claude' && tab.tabType !== 'claude-sdk';
           if (isClaudePty) {
-            state.clearInterruptedState(tabId); // drop desktop "interrupted" overlay
-            const result = await ipcRenderer.invoke('terminal:paste', {
-              tabId, content: prompt, submit: true, fast: false,
-            });
-            return reply(!!result?.success ?? true, result || { tabId });
+            const result = await sendClaudePtyPrompt(tabId, prompt);
+            const ok = result?.success !== false;
+            return reply(ok, result || { tabId }, ok ? undefined : result?.error);
           }
           // SDK path (default)
           const sendCwd = cwd || tab?.cwd;
@@ -1676,25 +1664,20 @@ function App() {
           // desktop UI, both queue up properly.
           const { tabId, prompt } = payload || {};
           if (!tabId || !prompt) return reply(false, null, 'tabId+prompt required');
-          // Drop interrupted-session overlay on desktop: a send from mobile
-          // implies the user is actively using the session, even if the
-          // desktop window has the modal up.
-          state.clearInterruptedState(tabId);
-          const result = await ipcRenderer.invoke('terminal:paste', {
-            tabId, content: prompt, submit: true, fast: false,
-          });
-          return reply(!!result?.success ?? true, result || { tabId });
+          const result = await sendClaudePtyPrompt(tabId, prompt);
+          const ok = result?.success !== false;
+          return reply(ok, result || { tabId }, ok ? undefined : result?.error);
         }
         if (action === 'getClaudeTabStatusBatch') {
           const { tabIds } = payload || {};
           if (!Array.isArray(tabIds)) return reply(false, null, 'tabIds required');
-          const statuses: Record<string, 'active' | 'busy' | 'inactive'> = {};
+          const statuses: Record<string, 'active' | 'busy' | 'inactive' | 'starting'> = {};
           // awaiting (Claude blocked on AskUserQuestion) per tab — drives the
           // mobile tab-list purple dot. Same presence call, extra field.
           const awaiting: Record<string, boolean> = {};
           for (const tid of tabIds) {
             try {
-              const p = await ipcRenderer.invoke('claude:get-presence', tid);
+              const p = await getClaudePtyPresence(tid);
               statuses[tid] = p?.status || 'inactive';
               if (p?.awaiting) awaiting[tid] = true;
             } catch {
@@ -1712,10 +1695,10 @@ function App() {
             if (t) { tab = t; break; }
           }
           if (!tab) return reply(true, { tabId, status: 'inactive', commandType: null, sessionId: null });
-          let status: 'active' | 'busy' | 'inactive' = 'inactive';
+          let status: 'active' | 'busy' | 'inactive' | 'starting' = 'inactive';
           if (tab.commandType === 'claude') {
             try {
-              const p = await ipcRenderer.invoke('claude:get-presence', tabId);
+              const p = await getClaudePtyPresence(tabId);
               status = p?.status || 'inactive';
             } catch { status = 'inactive'; }
           }

@@ -75,3 +75,8 @@ export const DEFAULT_CLAUDE_CODE_SETTINGS: ClaudeCodeSettings = {
 
 export const CLAUDE_MODELS = DEFAULT_CLAUDE_CODE_MODELS.map((m) => m.id);
 export type ClaudeModel = typeof CLAUDE_MODELS[number];
+
+// 'none' is our app-level sentinel for "do not auto-apply /model on Claude
+// startup". Real Claude Code accepts `/model default`, so "default" stays a
+// normal selectable model, distinct from opt-out.
+export type DefaultClaudeModel = string;

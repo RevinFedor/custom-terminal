@@ -379,7 +379,7 @@
    pointer-events:none while busy, so this child re-enables itself with
    pointer-events:auto and sits ABOVE the shimmer ::after (z-index 2 > 1).
    Idle look = invisible (transparent, label hidden) so the orange shimmer shows
-   through untouched. Hover = solid red wash + static white uppercase "СБРОС"
+   through untouched. Hover = dark red wash + static uppercase "СБРОС"
    label — destructive-intent affordance, and per the project's AI-OCR rule the
    label is static uppercase B/W (no opacity-only animation) so it's readable on
    video. Click clears the local busy flags. See
@@ -402,9 +402,9 @@
   transition: background-color 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
 }
 .control-bar-busy-reset:hover {
-  color: #fff;
-  background-color: rgba(220, 38, 38, 0.82);
-  box-shadow: inset 0 0 0 1px rgba(220, 38, 38, 0.9), 0 0 8px rgba(220, 38, 38, 0.5);
+  color: #fecaca;
+  background-color: rgba(82, 22, 22, 0.86);
+  box-shadow: inset 0 0 0 1px rgba(153, 27, 27, 0.55), 0 0 6px rgba(127, 29, 29, 0.28);
 }
 
 @keyframes fadeIn {

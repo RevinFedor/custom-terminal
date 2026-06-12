@@ -32,6 +32,41 @@ function absNow(): number {
   return performance.timeOrigin + performance.now();
 }
 
+type LoopSample = {
+  abs: number;
+  gapMs: number;
+};
+
+function pushLoopSample(samples: LoopSample[], sample: LoopSample) {
+  samples.push(sample);
+  if (samples.length > 80) samples.shift();
+}
+
+function lastSampleBefore(samples: LoopSample[], abs: number): LoopSample | null {
+  for (let i = samples.length - 1; i >= 0; i--) {
+    if (samples[i].abs <= abs) return samples[i];
+  }
+  return null;
+}
+
+function firstSampleAfter(samples: LoopSample[], abs: number): LoopSample | null {
+  for (const sample of samples) {
+    if (sample.abs >= abs) return sample;
+  }
+  return null;
+}
+
+function lastLoopSample(samples: LoopSample[]): LoopSample | null {
+  return samples.length > 0 ? samples[samples.length - 1] : null;
+}
+
+function formatRecentSamples(samples: LoopSample[], receivedAbs: number): string {
+  return samples
+    .slice(-10)
+    .map((sample) => (sample.abs - receivedAbs).toFixed(0) + ':' + sample.gapMs.toFixed(0))
+    .join(',');
+}
+
 function cssPath(target: EventTarget | Element | null): string {
   if (!target) return 'null';
   if (!(target instanceof Element)) {
@@ -51,22 +86,119 @@ function log(message: string) {
   console.warn(message + ' ' + getContext());
 }
 
+function freezeSeverity(ms: number): string {
+  if (ms >= 2000) return 'critical';
+  if (ms >= 1000) return 'major';
+  if (ms >= 500) return 'noticeable';
+  return 'minor';
+}
+
+// ── External watchdog heartbeat ──────────────────────────────────────────────
+// Connects DIRECTLY to the perf-watchdog unix socket (not via main IPC — if it
+// were routed through main, a frozen main would fake a renderer stall). While
+// the renderer event loop is healthy, a JSON heartbeat goes out every 250ms;
+// when the loop freezes, heartbeats stop and the watchdog samples THIS process
+// during the stall. `vis` rides along so the watchdog ignores silence from
+// hidden windows (background timer throttling is not a freeze).
+function installWatchdogHeartbeat() {
+  try {
+    const electronRequire = (window as any).require;
+    if (!electronRequire) return;
+    const { ipcRenderer } = electronRequire('electron');
+    const net = electronRequire('net');
+    const proc = electronRequire('process');
+    ipcRenderer.invoke('perf:watchdog-info').then((info: { socketPath?: string | null }) => {
+      const socketPath = info?.socketPath;
+      if (!socketPath) {
+        log('[Perf:Probe] watchdog-heartbeat disabled (no socket)');
+        return;
+      }
+      let sock: any = null;
+      let timer: number | null = null;
+      let retryDelayMs = 1000;
+      let reconnectPending = false;
+      let stopped = false;
+      const teardownSock = () => {
+        if (timer !== null) { clearInterval(timer); timer = null; }
+        if (sock) {
+          // Listeners off BEFORE destroy — destroy() re-fires 'close', which
+          // would otherwise schedule a second reconnect per cycle and multiply
+          // connection attempts.
+          try { sock.removeAllListeners(); sock.destroy(); } catch {}
+          sock = null;
+        }
+      };
+      const scheduleReconnect = () => {
+        if (stopped || reconnectPending) return;
+        reconnectPending = true;
+        teardownSock();
+        // Watchdog may restart with main; bounded backoff keeps us quiet if it's gone.
+        window.setTimeout(() => { reconnectPending = false; connect(); }, retryDelayMs);
+        retryDelayMs = Math.min(retryDelayMs * 2, 30000);
+      };
+      const connect = () => {
+        if (stopped) return;
+        teardownSock();
+        try {
+          sock = net.createConnection(socketPath);
+        } catch (e: any) {
+          log('[Perf:Probe] watchdog-connect-failed error=' + (e?.message || String(e)));
+          scheduleReconnect();
+          return;
+        }
+        sock.on('connect', () => {
+          retryDelayMs = 1000;
+          timer = window.setInterval(() => {
+            if (!sock || sock.destroyed) return;
+            try {
+              sock.write(JSON.stringify({
+                t: 'hb',
+                proc: 'renderer',
+                pid: proc.pid,
+                abs: absNow(),
+                vis: document.visibilityState,
+              }) + '\n');
+            } catch { /* close handler reconnects */ }
+          }, 250);
+        });
+        sock.on('error', scheduleReconnect);
+        sock.on('close', scheduleReconnect);
+      };
+      connect();
+      window.addEventListener('beforeunload', () => { stopped = true; teardownSock(); });
+      log('[Perf:Probe] watchdog-heartbeat armed sock=' + socketPath);
+    }).catch((e: any) => {
+      log('[Perf:Probe] watchdog-info-failed error=' + (e?.message || String(e)));
+    });
+  } catch (e: any) {
+    log('[Perf:Probe] watchdog-heartbeat-init-failed error=' + (e?.message || String(e)));
+  }
+}
+
 export function installPerfFreezeProbe() {
   if (installed) return;
   installed = true;
 
-  if (!import.meta.env.DEV || typeof window === 'undefined') return;
+  if (typeof window === 'undefined') return;
 
   const supported = PerformanceObserver.supportedEntryTypes || [];
   log(
     '[Perf:Probe] installed longtask=' + (supported.includes('longtask') ? '1' : '0') +
-    ' event=' + (supported.includes('event') ? '1' : '0')
+    ' event=' + (supported.includes('event') ? '1' : '0') +
+    ' dev=' + (import.meta.env.DEV ? '1' : '0')
   );
+
+  installWatchdogHeartbeat();
+
+  const rafSamples: LoopSample[] = [];
+  const timerSamples: LoopSample[] = [];
 
   let lastRaf = performance.now();
   let lastRafLogAt = 0;
   const rafProbe = (now: number) => {
     const gapMs = now - lastRaf;
+    const frameAbs = performance.timeOrigin + now;
+    pushLoopSample(rafSamples, { abs: frameAbs, gapMs });
     if (
       document.visibilityState === 'visible' &&
       gapMs > 120 &&
@@ -76,9 +208,19 @@ export function installPerfFreezeProbe() {
       log(
         '[Perf:EventLoopLag] source=raf' +
         ' prevFrameAbs=' + (performance.timeOrigin + lastRaf).toFixed(1) +
-        ' frameAbs=' + (performance.timeOrigin + now).toFixed(1) +
+        ' frameAbs=' + frameAbs.toFixed(1) +
         ' gapMs=' + gapMs.toFixed(1)
       );
+      if (gapMs >= 500) {
+        log(
+          '[Perf:FreezeSummary] layer=renderer' +
+          ' kind=rafGap' +
+          ' severity=' + freezeSeverity(gapMs) +
+          ' prevFrameAbs=' + (performance.timeOrigin + lastRaf).toFixed(1) +
+          ' frameAbs=' + frameAbs.toFixed(1) +
+          ' gapMs=' + gapMs.toFixed(1)
+        );
+      }
     }
     lastRaf = now;
     window.requestAnimationFrame(rafProbe);
@@ -91,6 +233,8 @@ export function installPerfFreezeProbe() {
   const timerId = window.setInterval(() => {
     const now = performance.now();
     const driftMs = now - lastTimer - timerIntervalMs;
+    const firedAbs = performance.timeOrigin + now;
+    pushLoopSample(timerSamples, { abs: firedAbs, gapMs: Math.max(0, driftMs) });
     if (
       document.visibilityState === 'visible' &&
       driftMs > 150 &&
@@ -100,10 +244,21 @@ export function installPerfFreezeProbe() {
       log(
         '[Perf:EventLoopLag] source=timer' +
         ' expectedAbs=' + (performance.timeOrigin + lastTimer + timerIntervalMs).toFixed(1) +
-        ' firedAbs=' + (performance.timeOrigin + now).toFixed(1) +
+        ' firedAbs=' + firedAbs.toFixed(1) +
         ' intervalMs=' + timerIntervalMs +
         ' driftMs=' + driftMs.toFixed(1)
       );
+      if (driftMs >= 500) {
+        log(
+          '[Perf:FreezeSummary] layer=renderer' +
+          ' kind=timerDrift' +
+          ' severity=' + freezeSeverity(driftMs) +
+          ' expectedAbs=' + (performance.timeOrigin + lastTimer + timerIntervalMs).toFixed(1) +
+          ' firedAbs=' + firedAbs.toFixed(1) +
+          ' intervalMs=' + timerIntervalMs +
+          ' driftMs=' + driftMs.toFixed(1)
+        );
+      }
     }
     lastTimer = now;
   }, timerIntervalMs);
@@ -127,6 +282,18 @@ export function installPerfFreezeProbe() {
             ' name=' + (entry.name || 'unknown') +
             (attribution ? ' attribution=' + attribution.slice(0, 120) : '')
           );
+          if (entry.duration >= 500) {
+            log(
+              '[Perf:FreezeSummary] layer=renderer' +
+              ' kind=longTask' +
+              ' severity=' + freezeSeverity(entry.duration) +
+              ' startAbs=' + (performance.timeOrigin + entry.startTime).toFixed(1) +
+              ' endAbs=' + (performance.timeOrigin + entry.startTime + entry.duration).toFixed(1) +
+              ' durationMs=' + entry.duration.toFixed(1) +
+              ' name=' + (entry.name || 'unknown') +
+              (attribution ? ' attribution=' + attribution.slice(0, 120) : '')
+            );
+          }
         }
       });
       observer.observe({ type: 'longtask', buffered: true } as PerformanceObserverInit);
@@ -162,6 +329,24 @@ export function installPerfFreezeProbe() {
             ' presentationDelayMs=' + (Number.isFinite(presentationDelay) ? presentationDelay.toFixed(1) : 'na') +
             ' target=' + cssPath(entry.target || null)
           );
+          if (
+            (Number.isFinite(inputDelay) && inputDelay >= 500) ||
+            Number(entry.duration || 0) >= 500
+          ) {
+            log(
+              '[Perf:FreezeSummary] layer=input' +
+              ' kind=eventTiming' +
+              ' severity=' + freezeSeverity(Math.max(Number(entry.duration || 0), Number.isFinite(inputDelay) ? inputDelay : 0)) +
+              ' event=' + name +
+              ' interactionId=' + (entry.interactionId || 0) +
+              ' startAbs=' + (performance.timeOrigin + entry.startTime).toFixed(1) +
+              ' processingStartAbs=' + (typeof entry.processingStart === 'number' ? (performance.timeOrigin + entry.processingStart).toFixed(1) : 'na') +
+              ' durationMs=' + Number(entry.duration || 0).toFixed(1) +
+              ' inputDelayMs=' + (Number.isFinite(inputDelay) ? inputDelay.toFixed(1) : 'na') +
+              ' handlerMs=' + (Number.isFinite(handlerMs) ? handlerMs.toFixed(1) : 'na') +
+              ' target=' + cssPath(entry.target || null)
+            );
+          }
         }
       });
       observer.observe({ type: 'event', buffered: true, durationThreshold: 32 } as PerformanceObserverInit);
@@ -171,13 +356,75 @@ export function installPerfFreezeProbe() {
   }
 
   let lastPointerLogAt = 0;
+  let lastDelayContextAt = 0;
+  let lastPointerX = -1;
+  let lastPointerY = -1;
+  let lastCursorKey = '';
+  let lastCursorLogAt = 0;
+
+  const readCursorState = () => {
+    const hasPoint = lastPointerX >= 0 && lastPointerY >= 0;
+    const atPoint = hasPoint ? document.elementFromPoint(lastPointerX, lastPointerY) : null;
+    const computedCursor = atPoint instanceof Element
+      ? window.getComputedStyle(atPoint).cursor
+      : 'none';
+    const bodyCursor = document.body?.style?.cursor || '';
+    const htmlCursor = document.documentElement?.style?.cursor || '';
+    const active = document.activeElement instanceof Element ? cssPath(document.activeElement) : 'none';
+    return {
+      x: lastPointerX,
+      y: lastPointerY,
+      target: cssPath(atPoint),
+      computedCursor,
+      bodyCursor,
+      htmlCursor,
+      active,
+    };
+  };
+
+  const logCursorState = (reason: string, force = false) => {
+    const now = performance.now();
+    const state = readCursorState();
+    const key = [
+      state.computedCursor,
+      state.bodyCursor,
+      state.htmlCursor,
+      state.active,
+    ].join('|');
+    const waitLike = /^(wait|progress)$/.test(state.computedCursor) ||
+      /^(wait|progress)$/.test(state.bodyCursor) ||
+      /^(wait|progress)$/.test(state.htmlCursor);
+    if (!force && key === lastCursorKey && !waitLike) return;
+    if (!force && now - lastCursorLogAt < 250) return;
+    lastCursorKey = key;
+    lastCursorLogAt = now;
+    log(
+      '[Perf:CursorState] reason=' + reason +
+      ' abs=' + absNow().toFixed(1) +
+      ' x=' + state.x +
+      ' y=' + state.y +
+      ' computed=' + (state.computedCursor || 'none') +
+      ' body=' + (state.bodyCursor || 'none') +
+      ' html=' + (state.htmlCursor || 'none') +
+      ' target=' + state.target +
+      ' active=' + state.active
+    );
+  };
+
   const captureInput = (event: Event) => {
     const pointer = event as PointerEvent | MouseEvent;
     const now = performance.now();
-    if (event.type !== 'click' && event.type !== 'pointerdown' && event.type !== 'mousedown' && now - lastPointerLogAt < 250) return;
-    lastPointerLogAt = now;
+    if ('clientX' in pointer) {
+      lastPointerX = pointer.clientX;
+      lastPointerY = pointer.clientY;
+    }
     const eventTimeAbs = performance.timeOrigin + event.timeStamp;
     const receivedAbs = absNow();
+    const inputDelayMs = receivedAbs - eventTimeAbs;
+    const isPrimaryInput = event.type === 'click' || event.type === 'pointerdown' || event.type === 'mousedown';
+    if (!isPrimaryInput && inputDelayMs <= 120) return;
+    if (!isPrimaryInput && now - lastPointerLogAt < 250) return;
+    lastPointerLogAt = now;
     const atPoint = 'clientX' in pointer
       ? document.elementFromPoint(pointer.clientX, pointer.clientY)
       : null;
@@ -189,17 +436,73 @@ export function installPerfFreezeProbe() {
       '[Perf:Input] event=' + event.type +
       ' eventTimeAbs=' + eventTimeAbs.toFixed(1) +
       ' receivedAbs=' + receivedAbs.toFixed(1) +
-      ' inputDelayMs=' + (receivedAbs - eventTimeAbs).toFixed(1) +
+      ' inputDelayMs=' + inputDelayMs.toFixed(1) +
       ' buttons=' + ('buttons' in pointer ? pointer.buttons : 'na') +
       ' isTrusted=' + (event.isTrusted ? '1' : '0') +
       ' target=' + cssPath(event.target) +
       ' atPoint=' + cssPath(atPoint) +
       ' hover=' + hoverStack
     );
+    if (inputDelayMs >= 500) {
+      log(
+        '[Perf:FreezeSummary] layer=input' +
+        ' kind=inputCapture' +
+        ' severity=' + freezeSeverity(inputDelayMs) +
+        ' event=' + event.type +
+        ' eventTimeAbs=' + eventTimeAbs.toFixed(1) +
+        ' receivedAbs=' + receivedAbs.toFixed(1) +
+        ' inputDelayMs=' + inputDelayMs.toFixed(1) +
+        ' target=' + cssPath(event.target) +
+        ' atPoint=' + cssPath(atPoint)
+      );
+    }
+    logCursorState('input-' + event.type, inputDelayMs > 120);
+
+    if (inputDelayMs > 120 && now - lastDelayContextAt > 100) {
+      lastDelayContextAt = now;
+      const rafBefore = lastSampleBefore(rafSamples, eventTimeAbs);
+      const rafAfter = firstSampleAfter(rafSamples, eventTimeAbs);
+      const timerBefore = lastSampleBefore(timerSamples, eventTimeAbs);
+      const timerAfter = firstSampleAfter(timerSamples, eventTimeAbs);
+      const lastRaf = lastLoopSample(rafSamples);
+      const lastTimer = lastLoopSample(timerSamples);
+      log(
+        '[Perf:InputDelayContext] event=' + event.type +
+        ' inputDelayMs=' + inputDelayMs.toFixed(1) +
+        ' eventTimeAbs=' + eventTimeAbs.toFixed(1) +
+        ' receivedAbs=' + receivedAbs.toFixed(1) +
+        ' lastRafAbs=' + (lastRaf ? lastRaf.abs.toFixed(1) : 'none') +
+        ' lastTimerAbs=' + (lastTimer ? lastTimer.abs.toFixed(1) : 'none') +
+        ' rafAgeAtReceiveMs=' + (lastRaf ? (receivedAbs - lastRaf.abs).toFixed(1) : 'na') +
+        ' timerAgeAtReceiveMs=' + (lastTimer ? (receivedAbs - lastTimer.abs).toFixed(1) : 'na') +
+        ' rafBeforeEventAbs=' + (rafBefore ? rafBefore.abs.toFixed(1) : 'none') +
+        ' rafAfterEventAbs=' + (rafAfter ? rafAfter.abs.toFixed(1) : 'none') +
+        ' timerBeforeEventAbs=' + (timerBefore ? timerBefore.abs.toFixed(1) : 'none') +
+        ' timerAfterEventAbs=' + (timerAfter ? timerAfter.abs.toFixed(1) : 'none') +
+        ' recentRafDeltaGap=' + formatRecentSamples(rafSamples, receivedAbs) +
+        ' recentTimerDeltaGap=' + formatRecentSamples(timerSamples, receivedAbs)
+      );
+    }
   };
 
   window.addEventListener('click', captureInput, { capture: true, passive: true });
   window.addEventListener('pointerdown', captureInput, { capture: true, passive: true });
   window.addEventListener('mousedown', captureInput, { capture: true, passive: true });
   window.addEventListener('mouseover', captureInput, { capture: true, passive: true });
+  window.addEventListener('pointermove', (event) => {
+    lastPointerX = event.clientX;
+    lastPointerY = event.clientY;
+    logCursorState('pointermove');
+  }, { capture: true, passive: true });
+
+  const cursorTimer = window.setInterval(() => logCursorState('interval'), 250);
+  void cursorTimer;
+
+  try {
+    const cursorObserver = new MutationObserver(() => logCursorState('mutation'));
+    cursorObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'style'] });
+    if (document.body) cursorObserver.observe(document.body, { attributes: true, attributeFilter: ['class', 'style'] });
+  } catch (err: any) {
+    log('[Perf:CursorState] observer-failed error=' + (err?.message || String(err)));
+  }
 }

@@ -1,6 +1,6 @@
 # Fact: Voice Dictation (Soniox real-time)
 
-Real-time диктовка через Soniox `stt-rt-v4` (`wss://stt-rt.soniox.com/transcribe-websocket`). Кнопка mic живёт в `ClaudeControlBar` справа от Copy-prompt split-pill, real-time транскрипт — в floating-окне-портале над кнопкой. Финальный текст по STOP уходит в композер активного таба (SDK textarea / Claude TUI input / только история для обычного терминала) + всегда сохраняется в localStorage-историю. На мобиле — та же модель: кнопка mic в composer, такой же floating UX. См. [`fact-claude-control-bar.md`](fact-claude-control-bar.md) для размещения, [`fact-mobile-web.md::Mobile composer`](fact-mobile-web.md) для мобильной стороны. Системный аналог поверх всех приложений (Cmd+`\``, плавающий чип над Dock, paste в frontmost app) — [`fact-global-dictation.md`](fact-global-dictation.md); тот же `DictationSession` + `soniox:mint-token` переиспользуются.
+Real-time диктовка через Soniox `stt-rt-v4` (`wss://stt-rt.soniox.com/transcribe-websocket`). Кнопка mic живёт в `ClaudeControlBar` справа от Copy-prompt split-pill, real-time транскрипт — в floating-окне-портале над кнопкой. На desktop финальный текст по STOP уходит в owner-tab, зафиксированный в момент START (SDK textarea / Claude TUI input / только история для обычного терминала), а не в «что сейчас активно на экране»; всегда дополнительно сохраняется в localStorage-историю. Живая desktop-сессия лежит в renderer singleton `dictationManager`, `MicButton` — только view/control для вкладки-владельца. На мобиле — та же модель: кнопка mic в composer, такой же floating UX. См. [`fact-claude-control-bar.md`](fact-claude-control-bar.md) для размещения, [`fact-mobile-web.md::Mobile composer`](fact-mobile-web.md) для мобильной стороны. Системный аналог поверх всех приложений (Cmd+`\``, плавающий чип над Dock, paste в frontmost app) — [`fact-global-dictation.md`](fact-global-dictation.md); тот же `DictationSession` + `soniox:mint-token` переиспользуются.
 
 ## Симптомы для роутера
 
@@ -13,6 +13,9 @@ Real-time диктовка через Soniox `stt-rt-v4` (`wss://stt-rt.soniox.c
 - В SDK таб транскрипт не подставляется в composer после STOP
 - Loader на кнопке mic во время connecting → юзер кликает второй раз, думая что зависло
 - Production-копия web-server на 7878 отвечает «mobile-web/dist not built»
+- При переключении вкладки/проекта/Home запись продолжается, но floating-окно пропадает и непонятно где её остановить
+- На другой live-вкладке mic остаётся активным, хотя запись уже идёт в соседнем табе
+- Строка `RECORDING` справа сверху не появляется или клик по имени вкладки не возвращает к owner-tab
 
 ## Архитектура: instant-record + buffered flush
 
@@ -23,6 +26,17 @@ Click → state `recording=true` синхронно (UI меняется в то
 Когда `ws.onopen`: отправляется JSON config (`api_key`, `model: 'stt-rt-v4'`, `sample_rate: 16000`, `audio_format: 's16le'`, `language_hints: ['en','ru']`), потом **flush'аются все буферизованные PCM-чанки**. С этого момента `onaudioprocess` шлёт напрямую в `ws.send`. Это значит **ни одно слово не теряется в первые 300-700 мс пока ws ещё не открыт** — юзер может начать говорить сразу после клика.
 
 Cap буфера — 200 фреймов (~4 с аудио). Если ws висит дольше — старые фреймы дропаются, но юзер давно нажмёт Stop.
+
+## Tab-owned background recording
+
+Desktop-диктовка принадлежит вкладке, где пользователь нажал mic, а не текущему `activeProjectId/activeTabId` в момент STOP. При START фиксируется owner `{projectId, tabId, tabName, mode}`; delivery, Enter stop-and-deliver и disabled-state других mic-кнопок читают именно этот owner. Это защищает главный user-flow: пользователь начал диктовать prompt в табе A, ушёл на другой проект/Home/другую вкладку, запись продолжает идти в фоне, а STOP/Enter позже доставляет текст в composer таба A.
+
+`MicButton` нельзя снова делать владельцем `DictationSession`: нижний control bar keyless-переиспользуется между табами, а сам `MicButton` может размонтироваться при смене проекта, view или live-guard'ов. Локальная сессия в компоненте в таком сценарии либо теряет UI-контроль над живым Soniox stream, либо переинтерпретирует запись как принадлежащую новой активной вкладке. Поэтому `dictationManager` держит session/snapshot/subscribers на уровне renderer-модуля, а `MicButton` только сравнивает `snapshot.owner.tabId` со своим `tabId`.
+
+Поведение поверхностей:
+- owner-tab показывает обычный recording mic + floating transcript, anchored к своей кнопке;
+- чужие live Claude/Codex вкладки показывают mic disabled, чтобы не стартовать вторую запись и не менять owner;
+- когда owner-tab не является видимой terminal-поверхностью (другая вкладка/проект/Home/Dashboard), floating transcript скрыт, а в `ToastContainer` появляется постоянная status-row `RECORDING` с owner tab name (trim 15 chars) и кликом назад в проект/вкладку owner'а.
 
 ## Почему ScriptProcessorNode, а не AudioWorklet
 
@@ -41,7 +55,7 @@ Soniox реально шлёт synthetic-токены `<end>` (endpoint detectio
 
 ## Three delivery modes
 
-Решение «куда уходит текст после STOP» зависит от типа активного таба (детектится в `MicButton` через Zustand-селекторы `tabType` и `commandType`):
+Решение «куда уходит текст после STOP» зависит от `mode` owner-tab'а, зафиксированного при START. Не пересчитывать mode по активной вкладке во время STOP: к этому моменту пользователь мог уйти на другой проект, Home или соседний tab, но сказанный текст всё ещё принадлежит исходному prompt'у.
 
 - **`sdk`** (claude-sdk таб) → `window.dispatchEvent('claude-sdk:dictation-deliver', {tabId, text})`. Handler внутри `SDKComposer` (НЕ в `ClaudeSDKTab` верхнего уровня) использует прямой `composerTextareaRef` + `writeComposerValue()`. Раньше handler сидел в `ClaudeSDKTab` и искал textarea через `querySelector('.absolute.inset-0:not([style*="display: none"])')` — селектор нестабилен в multi-tab layout'е, текст уходил в чужой таб. Внутри SDKComposer есть готовый `writeComposerValue` (тот же путь что Stash-restore и insert-prompt используют — гарантированно работает с assistant-ui ComposerPrimitive).
 - **`pty-claude` / `pty-codex`** → `ipcRenderer.invoke('terminal:paste', {tabId, content, submit: false})`. Текст печатается в TUI input без Enter — юзер сам решит когда отправить. Codex использует тот же PTY-path, потому что у него нет отдельного React composer'а внутри приложения.
@@ -63,15 +77,15 @@ Header — высота 22px, padding=0 по вертикали (только pa
 
 Final tokens — белый `#e0e0e0`, partial — серый italic `#aaa`. Auto-scroll к bottom на каждом update.
 
-## State machine MicButton
+## State machine
 
-`idle → recording → stopping → idle` (плюс короткий transient `recording`-while-connecting который для UI неотличим от полноценного recording — иконка оранжевая, floating-окно открыто, юзер уже говорит, фоном идёт ws-handshake).
+`dictationManager`: `idle → recording → stopping → idle` (плюс короткий transient `recording`-while-connecting который для UI неотличим от полноценного recording — иконка оранжевая, floating-окно открыто, юзер уже говорит, фоном идёт ws-handshake). `MicButton` не владеет этой machine: owner-tab получает активные controls, non-owner live tabs получают disabled mic, а скрытый owner получает top-right status-row.
 
 ## Enter во время диктовки
 
 В живом Claude/Codex PTY пользователь может нажать `Enter` в ControlBar пока микрофон ещё пишет. Семантика этого жеста: «заверши диктовку, вставь распознанный текст в composer, потом отправь». Нельзя сразу слать raw `\r`: это отправило бы старый TUI input без только что сказанного текста. Нельзя и просто остановить микрофон без submit: пользователь нажал Enter именно как send-action.
 
-`MicButton` публикует window-события состояния (`dictation:state`) и принимает `dictation:stop-and-deliver` с `requestId`. Если состояние `recording`, Enter сначала просит stop; если уже `stopping`, новый stop не запускается, Enter просто ждёт delivery. После финализации `deliverFinal()` делает обычный delivery (`terminal:paste submit:false` для PTY, SDK event для SDK, history-only для обычного terminal) и только после успешной доставки шлёт `dictation:delivered`. ControlBar держит `enterPending` loader всё это время и после matching `requestId` отправляет raw `\r` в PTY.
+`dictationManager` публикует window-события состояния (`dictation:state`) и принимает `dictation:stop-and-deliver` с `requestId`. Если состояние `recording`, Enter сначала просит stop; если уже `stopping`, новый stop не запускается, Enter просто ждёт delivery. После финализации manager делает обычный delivery (`terminal:paste submit:false` для PTY, SDK event для SDK, history-only для обычного terminal) в owner-tab и только после успешной доставки шлёт `dictation:delivered`. ControlBar держит `enterPending` loader только когда `snapshot.owner.tabId === tabId`; чужие вкладки не должны ждать чужую диктовку и не должны наследовать pending-state keyless-компонента.
 
 Для PTY `terminal:paste submit:false` остаётся обязательной промежуточной фазой даже когда следующий шаг — Enter. Paste path сам отвечает за bracketed paste и render-commit; raw `\r` идёт только после delivery signal. Это тот же принцип что у TUI-команд: submit должен идти после подтверждения, что текст уже стал состоянием input'а, а не по фиксированной задержке.
 

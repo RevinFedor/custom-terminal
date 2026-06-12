@@ -13,32 +13,37 @@
 //   In every mode the transcript is also appended to dictation history so
 //   the project-toolbar dropdown can recopy it later.
 //
-// Floating window architecture: anchored to the mic button via DOMRect from
-// onLayoutEffect, position:fixed in a Portal. NOT a child of the button so
+// The live DictationSession is owned by a renderer singleton
+// (dictationManager), not by this button instance. That lets recording survive
+// tab/project/Home switches; this component is just the owner-tab view/control.
+// Floating window architecture: anchored to the owner mic button via DOMRect
+// from onLayoutEffect, position:fixed in a Portal. NOT a child of the button so
 // overflow:hidden ancestors don't clip it.
 
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
-import { DictationSession } from '../../utils/dictation';
-import { appendDictationEntry } from '../../utils/dictationHistory';
+import {
+  type DictationMode,
+  startDictation,
+  stopActiveDictation,
+  useDictationSnapshot,
+} from '../../utils/dictationManager';
 import { DictationHistoryPopover } from './DictationHistoryButton';
 
-const { ipcRenderer } = window.require('electron');
-
-export const DICTATION_STATE_EVENT = 'dictation:state';
-export const DICTATION_STOP_AND_DELIVER_EVENT = 'dictation:stop-and-deliver';
-export const DICTATION_DELIVERED_EVENT = 'dictation:delivered';
+export {
+  DICTATION_DELIVERED_EVENT,
+  DICTATION_STATE_EVENT,
+  DICTATION_STOP_AND_DELIVER_EVENT,
+} from '../../utils/dictationManager';
 
 interface Props {
   tabId: string;
   sessionType: 'claude' | 'gemini' | 'codex';
 }
 
-type MicMode = 'sdk' | 'pty-claude' | 'pty-codex' | 'terminal';
-
-function useTargetMode(tabId: string): MicMode {
+function useTargetMode(tabId: string): DictationMode {
   const tabType = useWorkspaceStore((s) => {
     for (const [, ws] of s.openProjects) {
       const t = ws.tabs.get(tabId);
@@ -62,158 +67,45 @@ function useTargetMode(tabId: string): MicMode {
 export default function MicButton({ tabId }: Props) {
   const showToast = useUIStore((s) => s.showToast);
   const mode = useTargetMode(tabId);
-
-  // Two simple states: 'idle' or 'recording'. Connecting is invisible — audio
-  // capture starts the instant getUserMedia resolves (~50ms), PCM is buffered
-  // locally until ws opens. Stopping is also brief (≤500ms) but shown via the
-  // STOP button's loader inside the floating window, not on the toolbar btn.
-  const [recording, setRecording] = useState(false);
-  const [stopping, setStopping] = useState(false);
-  const [final, setFinal] = useState('');
-  const [partial, setPartial] = useState('');
+  const dictation = useDictationSnapshot();
+  const projectId = useWorkspaceStore((s) => {
+    for (const [pid, ws] of s.openProjects) {
+      if (ws.tabs.has(tabId)) return pid;
+    }
+    return '';
+  });
+  const tabName = useWorkspaceStore((s) => {
+    for (const [, ws] of s.openProjects) {
+      const t = ws.tabs.get(tabId);
+      if (t) return t.name || 'tab';
+    }
+    return 'tab';
+  });
+  const isOwner = dictation.owner?.tabId === tabId;
+  const recording = isOwner && dictation.recording;
+  const stopping = isOwner && dictation.stopping;
+  const disabledByOtherTab = dictation.recording && !isOwner;
   // Cmd+click on the mic opens the dictation-history popover (the old toolbar
   // `history` chip is gone). Plain click toggles recording as before.
   const [historyOpen, setHistoryOpen] = useState(false);
-  const sessionRef = useRef<DictationSession | null>(null);
-  const finalizedSessionRef = useRef<DictationSession | null>(null);
-  const pendingSubmitRequestsRef = useRef<string[]>([]);
-  const statusRef = useRef({ recording: false, stopping: false });
   const btnRef = useRef<HTMLButtonElement>(null);
 
-  const publishState = (next: { recording: boolean; stopping: boolean }) => {
-    statusRef.current = next;
-    window.dispatchEvent(new CustomEvent(DICTATION_STATE_EVENT, {
-      detail: { tabId, ...next, mode },
-    }));
-  };
-
-  useEffect(() => {
-    publishState({ recording, stopping });
-  }, [tabId, mode, recording, stopping]);
-
-  useEffect(() => {
-    return () => {
-      window.dispatchEvent(new CustomEvent(DICTATION_STATE_EVENT, {
-        detail: { tabId, recording: false, stopping: false, mode },
-      }));
-    };
-  }, [tabId, mode]);
-
-  const flushSubmitRequests = (payload: { success: boolean; delivered: boolean; hadText: boolean; error?: string }) => {
-    const requestIds = pendingSubmitRequestsRef.current.splice(0);
-    requestIds.forEach((requestId) => {
-      window.dispatchEvent(new CustomEvent(DICTATION_DELIVERED_EVENT, {
-        detail: { tabId, requestId, ...payload },
-      }));
-    });
-  };
-
-  const finalizeStop = async (session: DictationSession, source: string) => {
-    if (finalizedSessionRef.current === session) return;
-    finalizedSessionRef.current = session;
-    if (sessionRef.current === session) sessionRef.current = null;
-
-    ipcRenderer.send('log:renderer', '[MicButton] onStopped source=' + source);
-    const captured = (session.getText() || '').trim();
-    let success = true;
-    let delivered = false;
-    let error: string | undefined;
-    if (captured) {
-      appendDictationEntry(captured);
-      try {
-        const result = await deliverFinal(captured, mode, tabId);
-        success = result.success;
-        delivered = result.delivered;
-        error = result.error;
-      } catch (e: any) {
-        success = false;
-        error = e?.message || String(e);
-      }
-    }
-    if (!success && error) showToast('Dictation deliver: ' + error, 'error');
-    publishState({ recording: false, stopping: false });
-    setRecording(false);
-    setStopping(false);
-    flushSubmitRequests({ success, delivered, hadText: !!captured, error });
-  };
-
   const start = async () => {
-    if (recording || stopping) return;
-    ipcRenderer.send('log:renderer', '[MicButton] start mode=' + mode);
-    setFinal('');
-    setPartial('');
-    finalizedSessionRef.current = null;
-    publishState({ recording: true, stopping: false });
-    // Flip UI to recording IMMEDIATELY so floating window appears in the same
-    // frame as the click. Don't wait for getUserMedia.
-    setRecording(true);
-    const session = new DictationSession({
-      fetchToken: async () => {
-        const r = await ipcRenderer.invoke('soniox:mint-token');
-        if (!r?.api_key) throw new Error('no api_key in token response');
-        return r.api_key as string;
-      },
-      onUpdate: ({ final, partial }) => {
-        setFinal(final);
-        setPartial(partial);
-      },
-      onConnected: () => {
-        ipcRenderer.send('log:renderer', '[MicButton] onConnected');
-      },
-      onError: (msg) => {
-        ipcRenderer.send('log:renderer', '[MicButton] onError ' + msg);
-        // Silent "socket error" if we initiated stop — it's just teardown noise.
-        if (msg === 'socket error' && (stopping || !recording)) return;
-        showToast('Dictation: ' + msg, 'error');
-      },
-      onStopped: () => { void finalizeStop(session, 'onStopped'); },
-      languageHints: ['en', 'ru'],
-    });
-    sessionRef.current = session;
-    await session.start();
+    if (recording || stopping || disabledByOtherTab) return;
+    if (!projectId) {
+      showToast('Dictation: tab not found', 'error');
+      return;
+    }
+    await startDictation(
+      { tabId, projectId, tabName, mode },
+      (message) => showToast(message, 'error'),
+    );
   };
 
   const stop = async () => {
-    if (stopping) return;
-    const s = sessionRef.current;
-    if (!s) {
-      sessionRef.current = null;
-      publishState({ recording: false, stopping: false });
-      setRecording(false);
-      setStopping(false);
-      flushSubmitRequests({ success: true, delivered: false, hadText: false });
-      return;
-    }
-    ipcRenderer.send('log:renderer', '[MicButton] stop');
-    publishState({ recording: true, stopping: true });
-    setStopping(true);
-    await s.stop();
-    // Force reset if onStopped never fires.
-    setTimeout(() => {
-      if (sessionRef.current === s) {
-        ipcRenderer.send('log:renderer', '[MicButton] onStopped never fired → force reset');
-        void finalizeStop(s, 'fallback');
-      }
-    }, 4000);
+    if (stopping || !isOwner) return;
+    await stopActiveDictation();
   };
-
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const { tabId: targetTabId, requestId } = (e as CustomEvent).detail || {};
-      if (targetTabId !== tabId || typeof requestId !== 'string') return;
-      if (!pendingSubmitRequestsRef.current.includes(requestId)) {
-        pendingSubmitRequestsRef.current.push(requestId);
-      }
-      const status = statusRef.current;
-      if (status.recording && !status.stopping) {
-        void stop();
-      } else if (!status.recording && !status.stopping) {
-        flushSubmitRequests({ success: true, delivered: false, hadText: false });
-      }
-    };
-    window.addEventListener(DICTATION_STOP_AND_DELIVER_EVENT, handler);
-    return () => window.removeEventListener(DICTATION_STOP_AND_DELIVER_EVENT, handler);
-  }, [tabId, recording, stopping]);
 
   const onClick = (e: React.MouseEvent) => {
     // Cmd/Ctrl+click → open dictation history instead of recording. (Meta on
@@ -223,9 +115,9 @@ export default function MicButton({ tabId }: Props) {
       setHistoryOpen(o => !o);
       return;
     }
-    if (stopping) return;
-    if (recording) stop();
-    else start();
+    if (stopping || disabledByOtherTab) return;
+    if (recording) void stop();
+    else void start();
   };
 
   return (
@@ -233,7 +125,12 @@ export default function MicButton({ tabId }: Props) {
       <button
         ref={btnRef}
         onClick={onClick}
-        title={recording ? 'Click to stop' : 'Start voice dictation (Soniox) · ⌘-click for history'}
+        disabled={disabledByOtherTab}
+        title={
+          disabledByOtherTab
+            ? `Dictation is recording in ${dictation.owner?.tabName || 'another tab'}`
+            : recording ? 'Click to stop' : 'Start voice dictation (Soniox) · ⌘-click for history'
+        }
         aria-label={recording ? 'Stop dictation' : 'Start voice dictation'}
         style={{
           height: 22,
@@ -241,24 +138,29 @@ export default function MicButton({ tabId }: Props) {
           padding: 0,
           marginLeft: 2,
           background: recording ? 'rgba(218, 119, 86, 0.18)' : 'transparent',
-          border: `1px solid ${recording ? 'rgba(218,119,86,0.55)' : 'rgba(255,255,255,0.12)'}`,
+          border: `1px solid ${
+            recording ? 'rgba(218,119,86,0.55)'
+              : disabledByOtherTab ? 'rgba(255,255,255,0.08)'
+                : 'rgba(255,255,255,0.12)'
+          }`,
           borderRadius: 4,
-          color: recording ? '#FF9466' : '#bbb',
-          cursor: 'pointer',
+          color: recording ? '#FF9466' : disabledByOtherTab ? '#555' : '#bbb',
+          cursor: disabledByOtherTab ? 'default' : 'pointer',
           display: 'inline-flex',
           alignItems: 'center',
           justifyContent: 'center',
           transition: 'background-color 0.12s, color 0.12s, border-color 0.12s',
           flexShrink: 0,
           position: 'relative',
+          opacity: disabledByOtherTab ? 0.55 : 1,
         }}
         onMouseEnter={(e) => {
-          if (recording) return;
+          if (recording || disabledByOtherTab) return;
           (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.06)';
           (e.currentTarget as HTMLButtonElement).style.color = '#fff';
         }}
         onMouseLeave={(e) => {
-          if (recording) return;
+          if (recording || disabledByOtherTab) return;
           (e.currentTarget as HTMLButtonElement).style.background = 'transparent';
           (e.currentTarget as HTMLButtonElement).style.color = '#bbb';
         }}
@@ -283,8 +185,8 @@ export default function MicButton({ tabId }: Props) {
       {recording && (
         <FloatingTranscript
           anchorRef={btnRef}
-          final={final}
-          partial={partial}
+          final={dictation.final}
+          partial={dictation.partial}
           stopping={stopping}
           onStop={stop}
         />
@@ -313,28 +215,6 @@ export default function MicButton({ tabId }: Props) {
       `}</style>
     </>
   );
-}
-
-// Where the captured text lands when the user clicks Stop.
-async function deliverFinal(text: string, mode: MicMode, tabId: string): Promise<{ success: boolean; delivered: boolean; error?: string }> {
-  if (mode === 'pty-claude' || mode === 'pty-codex') {
-    // safePasteAndSubmit with submit:false types into the TUI input without
-    // pressing Enter. User can then edit / hit Enter themselves.
-    const result = await ipcRenderer.invoke('terminal:paste', { tabId, content: text, submit: false });
-    if (!result?.success) {
-      return { success: false, delivered: false, error: result?.error || 'terminal:paste failed' };
-    }
-    return { success: true, delivered: true };
-  } else if (mode === 'sdk') {
-    // ClaudeSDKTab listens for this event and writes via native setter to
-    // bypass assistant-ui's controlled-input ping-pong.
-    window.dispatchEvent(new CustomEvent('claude-sdk:dictation-deliver', {
-      detail: { tabId, text },
-    }));
-    return { success: true, delivered: true };
-  }
-  // terminal mode → history only; user copies from the dropdown.
-  return { success: true, delivered: false };
 }
 
 function MicIcon({ recording }: { recording: boolean }) {

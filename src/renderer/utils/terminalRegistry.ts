@@ -2,8 +2,20 @@ import { Terminal as XTerminal, IMarker } from '@xterm/xterm';
 import { SearchAddon, ISearchOptions } from '@xterm/addon-search';
 
 // Global registry to access terminal instances from anywhere
-const terminals = new Map<string, XTerminal>();
-const searchAddons = new Map<string, SearchAddon>();
+interface TerminalRegistryStore {
+  terminals: Map<string, XTerminal>;
+  searchAddons: Map<string, SearchAddon>;
+  searchStates: Map<string, SearchState>;
+  viewportStates: Map<string, ViewportState>;
+  entryMarkers: Map<string, Map<string, TrackedEntry>>;
+  promptBoundaries: Map<string, Map<number, IMarker>>;
+  searchCallbacks: Map<string, SearchResultsCallback>;
+  viewportCallbacks: Map<string, ViewportCallback>;
+}
+
+type TerminalRegistryGlobal = typeof globalThis & {
+  __notedTerminalRegistryStore?: TerminalRegistryStore;
+};
 
 // Store current search state per tab
 interface SearchState {
@@ -11,7 +23,6 @@ interface SearchState {
   resultIndex: number;
   resultCount: number;
 }
-const searchStates = new Map<string, SearchState>();
 
 // Viewport state for scroll sync
 interface ViewportState {
@@ -19,7 +30,6 @@ interface ViewportState {
   bottom: number;
   total: number;
 }
-const viewportStates = new Map<string, ViewportState>();
 
 // Marker tracking for timeline entry navigation
 interface TrackedEntry {
@@ -27,19 +37,31 @@ interface TrackedEntry {
   marker: IMarker | null;
   isReachable: boolean;
 }
-// Map<tabId, Map<uuid, TrackedEntry>>
-const entryMarkers = new Map<string, Map<string, TrackedEntry>>();
-
-// Prompt boundary markers injected via OSC 7777 from main.js
-// Map<tabId, Map<seq, IMarker>>
-const promptBoundaries = new Map<string, Map<number, IMarker>>();
 
 // Callbacks
 type SearchResultsCallback = (results: { resultIndex: number; resultCount: number }) => void;
-const searchCallbacks = new Map<string, SearchResultsCallback>();
 
 type ViewportCallback = (viewport: ViewportState) => void;
-const viewportCallbacks = new Map<string, ViewportCallback>();
+
+const registryStore = ((globalThis as TerminalRegistryGlobal).__notedTerminalRegistryStore ||= {
+  terminals: new Map<string, XTerminal>(),
+  searchAddons: new Map<string, SearchAddon>(),
+  searchStates: new Map<string, SearchState>(),
+  viewportStates: new Map<string, ViewportState>(),
+  entryMarkers: new Map<string, Map<string, TrackedEntry>>(),
+  promptBoundaries: new Map<string, Map<number, IMarker>>(),
+  searchCallbacks: new Map<string, SearchResultsCallback>(),
+  viewportCallbacks: new Map<string, ViewportCallback>(),
+});
+
+const terminals = registryStore.terminals;
+const searchAddons = registryStore.searchAddons;
+const searchStates = registryStore.searchStates;
+const viewportStates = registryStore.viewportStates;
+const entryMarkers = registryStore.entryMarkers;
+const promptBoundaries = registryStore.promptBoundaries;
+const searchCallbacks = registryStore.searchCallbacks;
+const viewportCallbacks = registryStore.viewportCallbacks;
 
 const defaultSearchOptions: ISearchOptions = {
   caseSensitive: false,
@@ -54,6 +76,76 @@ const defaultSearchOptions: ISearchOptions = {
 };
 
 const GEMINI_BRAILLE_RE = /[\u280B\u2819\u2839\u2838\u283C\u2834\u2826\u2827\u2807\u280F]/;
+const CODEX_NON_DRAFT_LINE_RE = /(OpenAI Codex|model:|directory:|permissions:|Use \/skills|Full Access|Context \d+%|weekly \d+%|Starting MCP|esc to interrupt|Select Model|Tip:|Model changed|^╭|^╰|^│)/i;
+
+interface LogicalCell {
+  ch: string;
+  dim: boolean;
+}
+
+interface LogicalLineSnapshot {
+  text: string;
+  cells: LogicalCell[];
+}
+
+function getLogicalLineSnapshotAt(buf: any, row: number): LogicalLineSnapshot {
+  if (!buf || row < 0 || row >= buf.length) return { text: '', cells: [] };
+  let start = row;
+  let line = buf.getLine(start);
+  while (line?.isWrapped && start > 0) {
+    start -= 1;
+    line = buf.getLine(start);
+  }
+
+  const cells: LogicalCell[] = [];
+  for (let i = start; i < buf.length; i++) {
+    const cur = buf.getLine(i);
+    if (!cur) break;
+    const next = i + 1 < buf.length ? buf.getLine(i + 1) : null;
+
+    for (let x = 0; x < cur.length; x++) {
+      const cell = cur.getCell(x);
+      if (!cell || cell.getWidth?.() === 0) continue;
+      const ch = cell.getChars?.() || ' ';
+      cells.push({
+        ch: ch || ' ',
+        dim: !!cell.isDim?.(),
+      });
+    }
+    if (!next?.isWrapped) break;
+  }
+
+  while (cells.length > 0 && !cells[cells.length - 1].ch.trim()) cells.pop();
+  return { text: cells.map((cell) => cell.ch).join(''), cells };
+}
+
+function extractCodexDraftFromLine(snapshotOrLine: LogicalLineSnapshot | string): { hasDraft: boolean | null; preview: string; sourceSuffix?: string } {
+  const snapshot: LogicalLineSnapshot = typeof snapshotOrLine === 'string'
+    ? { text: snapshotOrLine, cells: [] }
+    : snapshotOrLine;
+  const normalized = String(snapshot.text || '')
+    .replace(/\u00a0/g, ' ')
+    .trimEnd();
+  const normalizedClean = normalized.replace(/[▌█]/g, '');
+  if (!normalizedClean.trim()) return { hasDraft: false, preview: '' };
+  if (CODEX_NON_DRAFT_LINE_RE.test(normalizedClean.trim())) return { hasDraft: null, preview: normalizedClean.trim().slice(0, 120) };
+
+  const promptIdx = Math.max(normalized.lastIndexOf('›'), normalized.lastIndexOf('❯'));
+  if (promptIdx >= 0) {
+    const afterPrompt = normalized.slice(promptIdx + 1).replace(/[▌█]/g, '').trim();
+    if (!afterPrompt) return { hasDraft: false, preview: '' };
+    if (CODEX_NON_DRAFT_LINE_RE.test(afterPrompt)) return { hasDraft: null, preview: afterPrompt.slice(0, 120) };
+    const afterPromptCells = snapshot.cells
+      .slice(promptIdx + 1)
+      .filter((cell) => cell.ch.trim() && cell.ch !== '▌' && cell.ch !== '█');
+    if (afterPromptCells.length > 0 && afterPromptCells.every((cell) => cell.dim)) {
+      return { hasDraft: false, preview: afterPrompt.slice(0, 120), sourceSuffix: ':dim-hint' };
+    }
+    return { hasDraft: true, preview: afterPrompt.slice(0, 120) };
+  }
+
+  return { hasDraft: null, preview: normalizedClean.trim().slice(0, 120) };
+}
 
 export const terminalRegistry = {
   /** Check if Gemini spinner (Braille characters) is visible on screen for a given tab */
@@ -105,6 +197,33 @@ export const terminalRegistry = {
 
   get(tabId: string): XTerminal | undefined {
     return terminals.get(tabId);
+  },
+
+  getCodexDraftState(tabId: string): { hasDraft: boolean | null; preview: string; source: string } {
+    const terminal = terminals.get(tabId);
+    if (!terminal) return { hasDraft: null, preview: '', source: 'no-terminal' };
+
+    const buf = terminal.buffer.active;
+    const cursorRows = Array.from(new Set([
+      buf.baseY + buf.cursorY,
+      buf.cursorY,
+    ])).filter((row) => row >= 0 && row < buf.length);
+
+    for (const row of cursorRows) {
+      const parsed = extractCodexDraftFromLine(getLogicalLineSnapshotAt(buf, row));
+      if (parsed.hasDraft !== null) return { ...parsed, source: 'cursor:' + row + (parsed.sourceSuffix || '') };
+    }
+
+    const visibleEnd = Math.min(buf.viewportY + terminal.rows, buf.length);
+    const visibleStart = Math.max(buf.viewportY, visibleEnd - 10);
+    for (let row = visibleEnd - 1; row >= visibleStart; row--) {
+      const snapshot = getLogicalLineSnapshotAt(buf, row);
+      if (!/[›❯]/.test(snapshot.text)) continue;
+      const parsed = extractCodexDraftFromLine(snapshot);
+      if (parsed.hasDraft !== null) return { ...parsed, source: 'viewport:' + row + (parsed.sourceSuffix || '') };
+    }
+
+    return { hasDraft: null, preview: '', source: 'unknown' };
   },
 
   updateViewport(tabId: string, top: number, bottom: number, total: number) {

@@ -21,6 +21,17 @@
 - **Большие Claude-сессии (`>5MB`)**: auto-index на close сознательно пропускается (`reason=avoid-close-freeze`). Такие архивы индексируются вручную через кнопку Index в Home.
 - **Ручной**: кнопка Index на ProjectHome с настраиваемым лимитом сессий (от последних)
 
+### Stats path на ProjectHome
+
+ProjectHome монтирует `SemanticSearchSection`, а секция сразу запрашивает `search:stats`, чтобы показать количество чанков/файлов/embeddings. Это latency-sensitive путь: он запускается не при поиске, а при обычном клике Home, поэтому sync SQL здесь ощущается как “Home завис”.
+
+Инвариант БД: `COUNT WHERE embedding IS NOT NULL` должен идти по partial index `idx_chunks_embedding_present`, а не full-scan `session_chunks`. На реальной базе 2026-06-12 запрос без индекса сканировал ~87K строк и блокировал main process на 4.1s; пользователь видел frozen hover/click сразу после Home. После индекса query plan должен быть:
+```text
+SCAN session_chunks USING INDEX idx_chunks_embedding_present
+```
+
+Если `search:stats` снова попадает в `[Perf:IpcSlow]` или `ipcAgg5s=search:stats`, сначала проверять `EXPLAIN QUERY PLAN`, а не React render Home. Детальный шрам — [`fix-performance-lags.md::Freeze при открытии Home`](fix-performance-lags.md).
+
 ## Embedding: Выбор модели и итерации
 
 ### Отброшенные подходы
@@ -53,3 +64,4 @@ Gemini сессии хранятся в другом формате и не ин
 - **"Indexing зависает"** → rate limit Gemini API. Уменьшить лимит сессий в настройках.
 - **"Только что закрытая большая сессия не ищется"** → auto-index на close был пропущен по размеру файла (>5MB). Это ожидаемо; запустить ручной Index.
 - **"Не скроллится страница Home с результатами"** → контейнер ProjectHome требует `h-full` вместо `flex-1` для работы `overflow-y-auto` внутри `absolute inset-0` обёртки.
+- **"После клика Home зависают hover и клики"** → проверить `search:stats` и query plan `idx_chunks_embedding_present`; это отдельный stats-path, не сам search query.

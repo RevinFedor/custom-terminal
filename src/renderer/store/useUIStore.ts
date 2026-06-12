@@ -29,8 +29,8 @@ export type ApiClaudeModel = 'claude-opus-4.6' | 'claude-sonnet-4.5';
 // Re-export from canonical source. Older code imports DefaultClaudeEffort from useUIStore
 // because the type used to be defined here; we keep the alias so we don't touch dozens
 // of call sites. The list itself lives in constants/claudeLevels.ts.
-export type { ClaudeCodeModelOption, ClaudeCodeSettings, DefaultClaudeEffort } from '../constants/claudeLevels';
-import type { ClaudeCodeSettings, DefaultClaudeEffort } from '../constants/claudeLevels';
+export type { ClaudeCodeModelOption, ClaudeCodeSettings, DefaultClaudeEffort, DefaultClaudeModel } from '../constants/claudeLevels';
+import type { ClaudeCodeSettings, DefaultClaudeEffort, DefaultClaudeModel } from '../constants/claudeLevels';
 import { DEFAULT_CLAUDE_CODE_SETTINGS } from '../constants/claudeLevels';
 
 export interface ApiSettings {
@@ -540,6 +540,10 @@ interface UIStore {
   // 'none' means "do not apply any default" — current session keeps whatever was last picked.
   defaultClaudeEffort: DefaultClaudeEffort;
   setDefaultClaudeEffort: (v: DefaultClaudeEffort) => void;
+  // Default Claude model applied to new Claude PTY sessions. 'none' means no
+  // startup /model command; 'default' is a real Claude model alias.
+  defaultClaudeModel: DefaultClaudeModel;
+  setDefaultClaudeModel: (v: DefaultClaudeModel) => void;
   claudeCodeSettings: ClaudeCodeSettings;
   setClaudeCodeSettings: (settings: ClaudeCodeSettings) => void;
 
@@ -1204,6 +1208,38 @@ const initialDefaultClaudeEffort = loadDefaultClaudeEffort();
         // Bypass save (we just read from SQLite) — write only to localStorage mirror.
         useUIStore.setState({ defaultClaudeEffort: v.trim() });
         try { localStorage.setItem('noted-terminal-default-claude-effort', v); } catch {}
+      }
+    }
+  } catch {}
+})();
+
+const APP_STATE_KEY_MODEL = 'defaultClaudeModel';
+const loadDefaultClaudeModel = (): DefaultClaudeModel => {
+  // Same persistence shape as defaultClaudeEffort: localStorage is only the
+  // synchronous boot mirror; SQLite is authoritative and origin-independent.
+  try {
+    const saved = localStorage.getItem('noted-terminal-default-claude-model');
+    if (saved && saved.trim()) return saved.trim();
+  } catch {}
+  return 'none';
+};
+const saveDefaultClaudeModel = (v: DefaultClaudeModel) => {
+  try { localStorage.setItem('noted-terminal-default-claude-model', v); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_MODEL, value: v }).catch(() => {});
+  } catch {}
+};
+const initialDefaultClaudeModel = loadDefaultClaudeModel();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_MODEL);
+    if (typeof v === 'string' && v.trim()) {
+      const s = useUIStore.getState();
+      if (s.defaultClaudeModel !== v) {
+        useUIStore.setState({ defaultClaudeModel: v.trim() });
+        try { localStorage.setItem('noted-terminal-default-claude-model', v); } catch {}
       }
     }
   } catch {}
@@ -2052,6 +2088,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
   // Default Claude effort (status-bar selector)
   defaultClaudeEffort: initialDefaultClaudeEffort,
   setDefaultClaudeEffort: (v) => { set({ defaultClaudeEffort: v }); saveDefaultClaudeEffort(v); },
+  defaultClaudeModel: initialDefaultClaudeModel,
+  setDefaultClaudeModel: (v) => { set({ defaultClaudeModel: v }); saveDefaultClaudeModel(v); },
   claudeCodeSettings: initialClaudeCodeSettings,
   setClaudeCodeSettings: (settings) => {
     const normalized = normalizeClaudeCodeSettings(settings);
