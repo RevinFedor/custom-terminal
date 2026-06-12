@@ -224,6 +224,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
   // Set<chipId> instead of single string so multiple parallel replays don't
   // race (queue actions are independent per chip).
   const [replayingIds, setReplayingIds] = useState<Set<string>>(new Set());
+  const replayingIdsRef = useRef<Set<string>>(new Set());
   const prevHintRef = useRef(false);
   useEffect(() => {
     if (firstChipArmedHint && !prevHintRef.current) {
@@ -376,6 +377,8 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
     // Guard against double-click while the previous IPC roundtrip is still
     // in flight — second click would queue a second bracketed paste against
     // the same chip, then a second removePrompt against an already-gone id.
+    if (replayingIdsRef.current.has(id)) return;
+    replayingIdsRef.current.add(id);
     setReplayingIds((prev) => {
       if (prev.has(id)) return prev;
       const next = new Set(prev);
@@ -408,6 +411,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
         next.delete(id);
         return next;
       });
+      replayingIdsRef.current.delete(id);
     }
   }, [tabId, sessionType, showToast, focusActiveTerminal, removePrompt]);
 

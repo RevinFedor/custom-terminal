@@ -8835,7 +8835,14 @@ ipcMain.handle('claude:clear-input', async (event, tabId) => {
 ipcMain.handle('claude:send-command', async (event, tabId, command) => {
   console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" ts=' + Date.now());
   const term = terminals.get(tabId);
-  if (!term) { console.log('[send-command] ❌ Terminal not found for tabId=' + tabId); return; }
+  if (!term) { console.log('[send-command] ❌ Terminal not found for tabId=' + tabId); return { success: false, error: 'no_terminal' }; }
+  if (!hasLiveClaudeInTab(tabId)) {
+    const candidates = await findAiDescendantProcessesByTab(tabId, 'claude');
+    if (candidates.length === 0) {
+      console.log('[send-command] ❌ No live Claude session (bridge/pid/descendant) in tab ' + tabId + ' — refusing to paste into non-Claude PTY');
+      return { success: false, error: 'no_claude_session' };
+    }
+  }
   // Stash flow: Ctrl+S clears current input by pushing it to Claude's stash;
   // after our slash-cmd submits, Claude auto-restores the user's prompt.
   // Bracketed-paste short commands (<800 chars) open Claude's slash autocomplete
@@ -8854,7 +8861,7 @@ ipcMain.handle('claude:send-command', async (event, tabId, command) => {
     }
   }
   startClaudeLocalCommandWatcher(tabId, command, 'send-command');
-  await safePasteAndSubmit(term, command, {
+  return await safePasteAndSubmit(term, command, {
     submit: true,
     stashFirst: true,
     // dismissAutocomplete intentionally OFF: slash-cmds with arguments (/model haiku,
@@ -12674,7 +12681,12 @@ ipcMain.on('codex:run-command', (event, { tabId, command, sessionId, cwd, model,
 ipcMain.handle('codex:send-command', async (_event, tabId, command) => {
   console.log('[codex:send-command] Received: tabId=' + tabId + ' command="' + command + '"');
   const term = terminals.get(tabId);
-  if (!term) return { success: false, error: 'terminal not found' };
+  if (!term) return { success: false, error: 'no_terminal' };
+  const candidates = await findAiDescendantProcessesByTab(tabId, 'codex');
+  if (candidates.length === 0) {
+    console.log('[codex:send-command] ❌ No live Codex process under shell pid=' + term.pid + ' tab=' + tabId);
+    return { success: false, error: 'no_codex_session' };
+  }
   const hasTurnWatcher = await ensureCodexTurnWatcher(tabId, null, terminalProjects.get(tabId));
   if (hasTurnWatcher) emitCodexBusy(tabId, true, 'send-command');
   try {

@@ -1761,11 +1761,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     } else if (e.metaKey || e.ctrlKey) {
       toggleTabSelection(projectId, tabId, true);
     } else {
-      if (isVerticalLayout && currentView === 'home' && tabId === workspace?.activeTabId) {
-        e.preventDefault();
-        e.stopPropagation();
-        console.warn('[TabBar:click] ignored active tab while Home project=' + projectId + ' tabId=' + tabId + ' ts=' + Date.now());
-        return;
+      if (currentView === 'home' && tabId === workspace?.activeTabId) {
+        console.warn('[TabBar:click] return-from-home active-tab project=' + projectId + ' tabId=' + tabId + ' ts=' + Date.now());
       }
       console.warn('[TabBar:click] switchTab tabId=' + tabId + ' ts=' + Date.now());
       // If clicking the already-active Gemini tab while viewing a sub-agent → return to Gemini

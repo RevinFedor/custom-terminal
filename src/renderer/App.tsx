@@ -74,8 +74,6 @@ interface ProjectTabItemProps {
   interruptedCount?: number; // Count of interrupted (paused) sessions in project
   isProjectBusy?: boolean; // Any tab in project has Claude/Gemini thinking
   isProjectAwaiting?: boolean; // Any tab in project blocked on AskUserQuestion (needs answer)
-  hasProcessBar?: boolean; // Any child tab currently renders the process strip
-  hasProcessBarShimmer?: boolean; // Any child tab currently renders the AI shimmer inside the strip
   isEditing: boolean;
   editValue: string;
   onEditChange: (val: string) => void;
@@ -113,8 +111,6 @@ const ProjectTabItem = memo(({
   isAreaActive,
   isProjectBusy = false,
   isProjectAwaiting = false,
-  hasProcessBar = false,
-  hasProcessBarShimmer = false,
   isProjectLoading = false
 }: ProjectTabItemProps) => {
   const ref = useRef<HTMLButtonElement>(null);
@@ -125,7 +121,6 @@ const ProjectTabItem = memo(({
 
   // Settings → Размеры → ТАБЫ → Проекты. Padding x/y чипа проекта в TitleBar.
   const projectTabGeometry = useUIStore((s) => s.projectTabGeometry);
-  const processBarPosition = useUIStore((s) => s.processBar.position);
 
   useEffect(() => {
     if (isEditing && inputRef.current) {
@@ -230,19 +225,6 @@ const ProjectTabItem = memo(({
     >
       {isActive && (
         <div className="absolute inset-0 bg-white rounded-sm" />
-      )}
-      {hasProcessBar && !isEditing && (
-        <div
-          className="tab-process-bar-static absolute top-[2px] bottom-[2px] rounded-[2px] overflow-hidden pointer-events-none"
-          style={{
-            width: '2px',
-            zIndex: 6,
-            [processBarPosition === 'right' ? 'right' : 'left']: '2px',
-          }}
-          aria-hidden
-        >
-          {hasProcessBarShimmer && <div className="tab-process-bar-ai-shimmer-overlay" />}
-        </div>
       )}
       {/* Awaiting-user-input — project has a tab blocked on AskUserQuestion.
           Purple wash pulses over the whole project tab (above the active-white
@@ -2624,13 +2606,11 @@ function App() {
             let activeCount = 0;
             let hasBusyTab = false;
             let hasPasteBusyTab = false;
-            let hasVisibleProcessBar = false;
             let hasAwaitingTab = false;
             workspace.tabs.forEach((tab, tabId) => {
               const hasLiveProcess = !!processStatus.get(tabId) || !!(tab as any).sdkProcessAlive;
               if (hasLiveProcess) {
                 activeCount++;
-                hasVisibleProcessBar = true;
               }
               if (busyTabs.get(tabId)) hasBusyTab = true;
               if (pasteBusyTabs.get(tabId)) hasPasteBusyTab = true;
@@ -2660,8 +2640,6 @@ function App() {
                 interruptedCount={interruptedCount}
                 isProjectBusy={hasProjectShimmer}
                 isProjectAwaiting={hasAwaitingTab}
-                hasProcessBar={hasVisibleProcessBar || hasProjectShimmer}
-                hasProcessBarShimmer={hasProjectShimmer}
                 isEditing={editingProjectId === projectId}
                 editValue={projectEditValue}
                 onEditChange={setProjectEditValue}
