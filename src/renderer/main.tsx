@@ -9,6 +9,7 @@ import { bootstrapPersistedStorage } from './utils/persistedStorage';
 bootstrapPersistedStorage();
 
 import App from './App';
+import { installPerfFreezeProbe } from './utils/perfFreezeProbe';
 import './styles/globals.css';
 import './styles/sidebar.css';
 // Portable Claude-conversation blocks (tool cards / bash / diff / thinking /
@@ -89,10 +90,29 @@ function _shouldLog(args: any[]): boolean {
 
 // Forward tagged renderer logs to main process for file logging
 const _ipc = (window as any).require?.('electron')?.ipcRenderer;
+const _rendererLogBoot = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+let _rendererLogSeq = 0;
+
+function _rendererAbsNow(): number {
+  return performance.timeOrigin + performance.now();
+}
+
+function _sendRendererLog(msg: string) {
+  if (!_ipc) return;
+  _ipc.send('log:renderer', {
+    msg,
+    seq: ++_rendererLogSeq,
+    boot: _rendererLogBoot,
+    emitAbs: _rendererAbsNow(),
+    emitIso: new Date().toISOString(),
+    href: window.location.href,
+  });
+}
+
 function _forwardToFile(args: any[]) {
   if (!_ipc || !_extractTag(args)) return;
   const msg = args.map((a: any) => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
-  _ipc.send('log:renderer', msg);
+  _sendRendererLog(msg);
 }
 
 // Forward UNTAGGED React/library warnings as `[ReactWarn]`-tagged so they end
@@ -108,7 +128,7 @@ function _forwardUntaggedWarn(args: any[], level: 'warn' | 'error') {
   // log — narrow filter, add to it if real noise appears.
   if (/Warning: Each child in a list/.test(first)) return;
   const msg = '[ReactWarn:' + level + '] ' + args.map((a: any) => typeof a === 'string' ? a : (() => { try { return JSON.stringify(a); } catch { return '<unserializable>'; } })()).join(' ').slice(0, 800);
-  _ipc.send('log:renderer', msg);
+  _sendRendererLog(msg);
 }
 
 console.log = (...args: any[]) => { _forwardToFile(args); if (_shouldLog(args)) _origLog(...args); };
@@ -143,6 +163,14 @@ console.error = (...args: any[]) => { _origError(...args); _forwardToFile(args);
     _origLog('[logs] always:', [...LOG_ALWAYS_TAGS].join(', '));
   },
 };
+
+console.warn(
+  `[RendererLog] boot=${_rendererLogBoot}` +
+  ` timeOriginAbs=${performance.timeOrigin.toFixed(1)}` +
+  ` href=${window.location.href}`
+);
+
+installPerfFreezeProbe();
 
 // === GLOBAL ERROR BOUNDARY ===
 class ErrorBoundary extends React.Component<

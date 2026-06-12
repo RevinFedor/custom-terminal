@@ -321,6 +321,11 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
 // Module-level: survives component remount (project switch destroys Timeline instance)
 const _savedEditRangeMap = new Map<string, any>();
 const SAVED_MAP_MAX = 20;
+let _timelinePollSeq = 0;
+
+function perfAbsNow(): number {
+  return performance.timeOrigin + performance.now();
+}
 
 // ════════════════════════════════════════════════════════════
 // SECTION: COMPONENT SETUP — props, UIStore subscriptions, state, ref declarations
@@ -345,10 +350,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   }, [isOpen]);
 
   const [entries, setEntries] = useState<TimelineEntry[]>([]);
+  const entriesCountRef = useRef(0);
+  entriesCountRef.current = entries.length;
   const [compactSummaryCache, setCompactSummaryCache] = useState<Record<string, string | null>>({});
   const [forkMarkers, setForkMarkers] = useState<ForkMarker[]>([]);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [activeTooltipIndex, setActiveTooltipIndex] = useState<number | null>(null);
+  const timelineInstanceIdRef = useRef(Math.random().toString(36).slice(2, 8));
+  const isVisibleRef = useRef(isVisible);
+  isVisibleRef.current = isVisible;
   const [isExpanded, setIsExpanded] = useState(false);
   const [tooltipCopied, setTooltipCopied] = useState(false);
   // Per-entry collapsed/expanded state for docs blocks in tooltip. Key = entry uuid.
@@ -1222,13 +1232,43 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // ════════════════════════════════════════════════════════════
 
   // Load timeline and fork markers when sessionId changes
-  const loadTimeline = useCallback(async () => {
+  const loadTimeline = useCallback(async (reason = 'unknown') => {
+    const loadStartedAt = performance.now();
+    const loadStartAbs = performance.timeOrigin + loadStartedAt;
+    const shortSession = sessionId ? sessionId.substring(0, 8) : 'none';
+    const shortTab = tabId ? tabId.slice(-8) : 'none';
+    const visibleAtStart = isVisibleRef.current;
+    if (import.meta.env.DEV) {
+      console.warn(
+        `[Perf:TimelineLoad] start reason=${reason}` +
+        ` inst=${timelineInstanceIdRef.current}` +
+        ` tab=${shortTab}` +
+        ` session=${shortSession}` +
+        ` startAbs=${loadStartAbs.toFixed(1)}` +
+        ` tool=${isGemini ? 'gemini' : isCodex ? 'codex' : 'claude'}` +
+        ` visible=${visibleAtStart}` +
+        ` doc=${document.visibilityState}` +
+        ` prevEntries=${entriesCountRef.current}`
+      );
+    }
     if (!sessionId) {
       setEntries([]);
       setForkMarkers([]);
       setExpandedGroups(new Set());
       setTimelineTreeMode(tabId, false);
       setClaudeMemoryBoundaryUuid(null);
+      if (import.meta.env.DEV) {
+        console.warn(
+          `[Perf:TimelineLoad] done reason=${reason}` +
+          ` inst=${timelineInstanceIdRef.current}` +
+          ` tab=${shortTab}` +
+          ` session=none` +
+          ` startAbs=${loadStartAbs.toFixed(1)}` +
+          ` endAbs=${perfAbsNow().toFixed(1)}` +
+          ` durMs=${(performance.now() - loadStartedAt).toFixed(1)}` +
+          ' outcome=no-session'
+        );
+      }
       return;
     }
 
@@ -1254,7 +1294,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       } else {
         // Claude: load timeline entries and fork markers in parallel
         const [timelineResult, markersResult] = await Promise.all([
-          ipcRenderer.invoke('claude:get-timeline', { sessionId, cwd }),
+          ipcRenderer.invoke('claude:get-timeline', {
+            sessionId,
+            cwd,
+            source: 'Timeline.loadTimeline',
+            reason,
+            tabId,
+            visible: visibleAtStart,
+            instanceId: timelineInstanceIdRef.current,
+          }),
           ipcRenderer.invoke('claude:get-fork-markers', { sessionId })
         ]);
 
@@ -1351,12 +1399,26 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       console.error('[Timeline] Error loading timeline:', error);
     } finally {
       setIsLoading(false);
+      if (import.meta.env.DEV) {
+        console.warn(
+          `[Perf:TimelineLoad] done reason=${reason}` +
+          ` inst=${timelineInstanceIdRef.current}` +
+          ` tab=${shortTab}` +
+          ` session=${shortSession}` +
+          ` startAbs=${loadStartAbs.toFixed(1)}` +
+          ` endAbs=${perfAbsNow().toFixed(1)}` +
+          ` durMs=${(performance.now() - loadStartedAt).toFixed(1)}` +
+          ` visibleStart=${visibleAtStart}` +
+          ` visibleNow=${isVisibleRef.current}` +
+          ` entriesNow=${entriesCountRef.current}`
+        );
+      }
     }
   }, [sessionId, cwd, tabId, isGemini, isCodex]);
 
   // effect: loadTimeline callback identity changes (sessionId/cwd/tabId/isGemini) → trigger initial timeline load
   useEffect(() => {
-    loadTimeline();
+    loadTimeline('effect');
   }, [loadTimeline]);
 
   // Tab switch: save editRangeState (ready/done only), reset everything else.
@@ -1368,6 +1430,65 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Always-current sessionId ref — closures in async fetchEditRangeCompact capture stale prop
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
+  const prevPropsDiagRef = useRef<{
+    tabId: string;
+    sessionId: string | null;
+    cwd: string;
+    isVisible: boolean;
+    toolType: string;
+  } | null>(null);
+
+  useEffect(() => {
+    const inst = timelineInstanceIdRef.current;
+    console.warn(
+      '[Timeline:Mount]' +
+      ' inst=' + inst +
+      ' tab=' + tabId.slice(-8) +
+      ' session=' + (sessionId ? sessionId.substring(0, 8) : 'none') +
+      ' tool=' + toolType +
+      ' visible=' + isVisible +
+      ' cwdSet=' + (cwd ? '1' : '0') +
+      ' abs=' + perfAbsNow().toFixed(1)
+    );
+    return () => {
+      console.warn(
+        '[Timeline:Unmount]' +
+        ' inst=' + inst +
+        ' tab=' + tabId.slice(-8) +
+        ' session=' + (sessionIdRef.current ? sessionIdRef.current.substring(0, 8) : 'none') +
+        ' visible=' + isVisibleRef.current +
+        ' abs=' + perfAbsNow().toFixed(1)
+      );
+    };
+  }, []);
+
+  useEffect(() => {
+    const prev = prevPropsDiagRef.current;
+    if (prev) {
+      const changed = prev.tabId !== tabId ||
+        prev.sessionId !== sessionId ||
+        prev.cwd !== cwd ||
+        prev.isVisible !== isVisible ||
+        prev.toolType !== toolType;
+      if (changed) {
+        console.warn(
+          '[Timeline:Props]' +
+          ' inst=' + timelineInstanceIdRef.current +
+          ' prevTab=' + prev.tabId.slice(-8) +
+          ' nextTab=' + tabId.slice(-8) +
+          ' prevSession=' + (prev.sessionId ? prev.sessionId.substring(0, 8) : 'none') +
+          ' nextSession=' + (sessionId ? sessionId.substring(0, 8) : 'none') +
+          ' prevVisible=' + prev.isVisible +
+          ' nextVisible=' + isVisible +
+          ' prevTool=' + prev.toolType +
+          ' nextTool=' + toolType +
+          ' cwdChanged=' + (prev.cwd !== cwd ? '1' : '0') +
+          ' abs=' + perfAbsNow().toFixed(1)
+        );
+      }
+    }
+    prevPropsDiagRef.current = { tabId, sessionId, cwd, isVisible, toolType };
+  }, [tabId, sessionId, cwd, isVisible, toolType]);
   // effect: sessionId changes → save/restore editRangeState via _savedEditRangeMap + reset all overlay/selection/tooltip state; unmount cleanup also saves state
   useEffect(() => {
     if (sessionId !== prevSessionForCleanup.current) {
@@ -1474,17 +1595,64 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   // effect: sessionId/loadTimeline/isVisible + document.visibilitychange → 2s setInterval(loadTimeline) (paused while tab hidden; PERF: avoids IPC round-trips in background — Timeline:PollPaused/Resumed logs)
   useEffect(() => {
-    if (!sessionId || !isVisible) return;
+    if (!sessionId || !isVisible) {
+      console.warn(
+        '[Timeline:PollInactive]' +
+        ' inst=' + timelineInstanceIdRef.current +
+        ' tab=' + tabId.slice(-8) +
+        ' session=' + (sessionId ? sessionId.substring(0, 8) : 'none') +
+        ' reason=' + (!sessionId ? 'no-session' : 'isVisible-false') +
+        ' visible=' + isVisible +
+        ' doc=' + document.visibilityState +
+        ' abs=' + perfAbsNow().toFixed(1)
+      );
+      return;
+    }
 
     let interval: ReturnType<typeof setInterval> | null = null;
+    let intervalId: number | null = null;
     const start = () => {
       if (interval) return;
-      interval = setInterval(loadTimeline, 2000);
+      intervalId = ++_timelinePollSeq;
+      console.warn(
+        '[Timeline:PollStart]' +
+        ' inst=' + timelineInstanceIdRef.current +
+        ' interval=' + intervalId +
+        ' tab=' + tabId.slice(-8) +
+        ' session=' + sessionId.substring(0, 8) +
+        ' visible=' + isVisibleRef.current +
+        ' doc=' + document.visibilityState +
+        ' abs=' + perfAbsNow().toFixed(1)
+      );
+      interval = setInterval(() => {
+        console.warn(
+          '[Timeline:PollTick]' +
+          ' inst=' + timelineInstanceIdRef.current +
+          ' interval=' + (intervalId ?? 'none') +
+          ' tab=' + tabId.slice(-8) +
+          ' session=' + sessionId.substring(0, 8) +
+          ' visible=' + isVisibleRef.current +
+          ' doc=' + document.visibilityState +
+          ' abs=' + perfAbsNow().toFixed(1)
+        );
+        loadTimeline('poll');
+      }, 2000);
     };
     const stop = (reason: string) => {
       if (!interval) return;
       clearInterval(interval);
       interval = null;
+      console.warn(
+        '[Timeline:PollStop]' +
+        ' inst=' + timelineInstanceIdRef.current +
+        ' interval=' + (intervalId ?? 'none') +
+        ' tab=' + tabId.slice(-8) +
+        ' session=' + sessionId.substring(0, 8) +
+        ' reason=' + reason +
+        ' visible=' + isVisibleRef.current +
+        ' doc=' + document.visibilityState +
+        ' abs=' + perfAbsNow().toFixed(1)
+      );
       console.warn(`[Timeline:PollPaused] sessionId=${sessionId.substring(0,8)} reason=${reason}`);
     };
 
@@ -1497,7 +1665,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     const onVis = () => {
       if (document.visibilityState === 'visible') {
         console.warn(`[Timeline:PollResumed] sessionId=${sessionId.substring(0,8)}`);
-        loadTimeline(); // refresh immediately so user sees fresh data on return
+        loadTimeline('visibility-resume'); // refresh immediately so user sees fresh data on return
         start();
       } else {
         stop('visibility-hidden');
@@ -1507,7 +1675,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
     return () => {
       document.removeEventListener('visibilitychange', onVis);
-      if (interval) clearInterval(interval);
+      stop('effect-cleanup');
     };
   }, [sessionId, loadTimeline, isVisible]);
 
@@ -1520,7 +1688,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
       if (detail?.tabId === tabId) {
-        loadTimeline();
+        loadTimeline('force-refresh');
       }
     };
     window.addEventListener('timeline:force-refresh', handler);
@@ -2460,7 +2628,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         const ws = useWorkspaceStore.getState();
         ws.setClaudeSessionId(tabId, '', 'timelineChain');
       } else {
-        loadTimeline();
+        loadTimeline('delete-range');
       }
     } catch (err: any) {
       console.error('[Timeline] Delete range failed:', err);
@@ -2779,7 +2947,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         return;
       }
       useUIStore.getState().showToast('Запрос удалён', 'success', 1800);
-      loadTimeline();
+      loadTimeline('delete-user-entry');
     } catch (err: any) {
       console.error('[Timeline] Delete user entry failed:', err);
       useUIStore.getState().showToast(

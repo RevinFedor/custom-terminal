@@ -193,7 +193,7 @@ Effort Level (уровень интенсивности размышлений) 
 | Кнопка | Что делает | Стиль |
 |---|---|---|
 | **Think** | Локальный тогл `thinkActive[tabId]`. Дефолт `undefined ⇒ true` (orange-tinted активный вид), потому что Claude стартует с `alwaysThinkingEnabled: true` в `~/.claude/settings.json`. Параллельно вызывает `claude:toggle-thinking` (meta+t picker в PTY) — при успехе reconcile из его `result.thinking`. | Активный = `bg-[#DA7756]/20 text-white font-medium` (та же приглушённая индикация что и Effort — local invisible intent, не подтверждённый bridge'ом). Неактивный = `bg-[#2d2d2d] text-[#888]`. |
-| **Compact** | Отправляет `/compact` через `claude:send-command` (тот же Stash flow что Model/Effort: Ctrl+S → bracketed paste → Enter, ~400ms). Никакого матчинга TUI-вывода — `/compact` встроенная slash-команда Claude, ввести+Enter достаточно. | Всегда нейтральный (нет «активного» состояния, разовое действие). |
+| **Compact** | Отправляет `/compact` через `claude:send-command` (тот же Stash flow что Model/Effort: Ctrl+S → bracketed paste → Enter, ~400ms), затем main открывает local-command watcher. `/compact` не является model-turn'ом: Stop hook может не прийти, поэтому loader bracket'ится отдельным `claude:busy-state reason:'local-command'`. | Всегда нейтральный (нет «активного» состояния, разовое действие). |
 
 **Дефолт «Think всегда ON при перезапуске» (важная invariant):**
 - `thinkActive` хранится в `useState<Record<string, boolean>>({})` в InfoPanel.
@@ -201,7 +201,19 @@ Effort Level (уровень интенсивности размышлений) 
 - Хендлер `terminal:command-finished` (OSC 133 D, на любой shell-exit) **удаляет ключ** `tabId` из map → следующий запуск Claude снова покажет Think tinted. Это совпадает с реальным поведением `alwaysThinkingEnabled` — он применяется при каждом старте.
 - Корнер-кейс: если юзер выключил Think через TUI вручную (`meta+t` напрямую в терминале) — наш UI этого не узнает (bridge не транслирует). При перезапуске опять покажем ON, и это совпадёт с реальностью. Рассинхрон mid-session — invisible intent, см. секцию про Effort.
 
-**Почему Compact не использует `claude:toggle-thinking`-style picker:** `/compact` не открывает выбор — он просто сжимает контекст и продолжает разговор. Поэтому достаточно `safePasteAndSubmit` со стандартным `stashFirst: true` (защищает user prompt в инпуте).
+**Почему Compact не использует `claude:toggle-thinking`-style picker:** `/compact` не открывает выбор — он просто сжимает контекст и продолжает разговор. Поэтому для ввода достаточно `safePasteAndSubmit` со стандартным `stashFirst: true` (защищает user prompt в инпуте). Для окончания команды этого уже недостаточно: визуальный loader должен пережить локальную работу Claude по сжатию, но не должен выглядеть как обычный assistant turn.
+
+### `/compact` local-command watcher
+
+`startClaudeLocalCommandWatcher(tabId, '/compact')` взводится после успешного `claude:send-command` и сразу эмитит `claude:busy-state {busy:true, reason:'local-command'}`. Completion ловится по нескольким независимым признакам:
+- JSONL compact boundary (`type:'compact'` / compact summary markers);
+- wrapper stdout в transcript (`<local-command-stdout>...Compacted...`);
+- PTY-текст Claude (`Compacting conversation`, `Conversation compacted`);
+- guard-timeout как error cleanup, а не как источник истины.
+
+Pure `Escape` или `Ctrl+C` во время local-command отменяет watcher через `cancelClaudeLocalCommandFromInput` и гасит loader тем же `reason:'local-command'`. Это сознательно **не** `reason:'interrupt'`: отменённая slash-команда не равна прерванному assistant turn'у, поэтому PromptQueueRunner должен игнорировать edge, а не disarm'ить RunAfter как после настоящего `InterruptStop`. Multi-byte ESC sequences (стрелки, F-keys) не считаются отменой — они остаются обычной навигацией TUI.
+
+Teardown обязан быть симметричным: manual Stop, bridge clear, PTY exit/kill тоже закрывают watcher и эмитят busy false, если local-command был активен. Иначе пользовательский симптом — `/compact` отменён, Claude idle, но vertical loader на вкладке/проекте продолжает крутиться.
 
 **Почему обе кнопки блокируются `isControlBusy`:** Та же мотивация что у Model/Effort — пока `safePasteAndSubmit` или `toggle-thinking` идёт, второй клик может попасть между `Ctrl+S` и `\r`, что **попнет stash** и затрёт сохранённый prompt. См. секцию «Stash Flow» выше.
 
@@ -459,4 +471,3 @@ Thinking mode при запуске **не отправляется** через
 ### Что убрано (v2 → v3)
 - **TAB_SENT / DEBOUNCE_TAB** — отправка `\t` для thinking mode. Стало ненужным с `alwaysThinkingEnabled: true`
 - Было 4 состояния, стало 2
-

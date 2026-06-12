@@ -75,6 +75,8 @@ Final tokens — белый `#e0e0e0`, partial — серый italic `#aaa`. Aut
 
 Для PTY `terminal:paste submit:false` остаётся обязательной промежуточной фазой даже когда следующий шаг — Enter. Paste path сам отвечает за bracketed paste и render-commit; raw `\r` идёт только после delivery signal. Это тот же принцип что у TUI-команд: submit должен идти после подтверждения, что текст уже стал состоянием input'а, а не по фиксированной задержке.
 
+Если пока `enterPending=true` пользователь жмёт `^C` в ControlBar, pending Enter отменяется (`cancelPendingEnterRef`), а в PTY уходит одиночный raw Ctrl+C. `dictation:delivered` всё ещё может прийти и вставить финальный текст в composer, но автоматический `\r` после него уже не отправляется. Это разделяет два намерения: «доставь текст» и «отправь текст». `^C` отменяет второе, не пытаясь откатывать уже запущенный Soniox stop/delivery pipeline.
+
 `stop()` идемпотентен и имеет fallback-таймаут:
 - Если `ws.readyState === OPEN` — шлёт пустой ArrayBuffer (Soniox flush'ит финалы и закрывает) + safety 3-секундный таймер на случай зависшего WebSocket.
 - Если `ws` в CONNECTING / null — отсоединяет handlers ПЕРЕД `close()` (иначе async `onerror`/`onclose` triggered `close()`-ом на half-opened сокете показал бы юзеру toast «socket error» после его же STOP-клика).

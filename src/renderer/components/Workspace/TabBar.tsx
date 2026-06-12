@@ -16,6 +16,8 @@ import { ChevronDown, Globe, Bot, Play, PanelLeft, Plus, StickyNote, RotateCw, F
 
 const { ipcRenderer } = window.require('electron');
 
+const CLAUDE_SPINNER_VISUAL_IDLE_GRACE_MS = 300;
+
 let forcedDragCursorDepth = 0;
 let forcedDragCursorStyleEl: HTMLStyleElement | null = null;
 
@@ -1673,6 +1675,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const [geminiBusyMap, setGeminiBusyMap] = useState<Map<string, boolean>>(new Map());
   const [codexBusyMap, setCodexBusyMap] = useState<Map<string, boolean>>(new Map());
   const [pasteBusyMap, setPasteBusyMap] = useState<Map<string, boolean>>(new Map());
+  const claudeSpinnerVisualIdleTimersRef = useRef<Map<string, number>>(new Map());
   // Awaiting-user-input: Claude called AskUserQuestion and is blocked waiting for
   // the human to answer. Deterministic, bracketed by PreToolUse/PostToolUse hooks
   // (main.js → claude:awaiting-input). Distinct from busy: a question is a special
@@ -1813,14 +1816,34 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       });
     };
 
-    const handleClaudeBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
-      console.warn('[TabBar:BusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy);
+    const applyClaudeVisualBusy = (tabId: string, busy: boolean) => {
       setClaudeBusyMap(prev => {
         if (prev.get(tabId) === busy) return prev;
         const next = new Map(prev);
         next.set(tabId, busy);
         return next;
       });
+    };
+
+    const handleClaudeBusy = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
+      console.warn('[TabBar:BusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy + (reason ? ' reason=' + reason : ''));
+      const timers = claudeSpinnerVisualIdleTimersRef.current;
+      const pendingTimer = timers.get(tabId);
+      if (pendingTimer !== undefined) {
+        window.clearTimeout(pendingTimer);
+        timers.delete(tabId);
+      }
+
+      if (!busy && reason === 'spinner') {
+        const timer = window.setTimeout(() => {
+          timers.delete(tabId);
+          applyClaudeVisualBusy(tabId, false);
+        }, CLAUDE_SPINNER_VISUAL_IDLE_GRACE_MS);
+        timers.set(tabId, timer);
+        return;
+      }
+
+      applyClaudeVisualBusy(tabId, busy);
     };
 
     const handleGeminiBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
@@ -1868,8 +1891,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     // busy:false. If a question was still marked awaiting (e.g. user pressed Esc to
     // cancel the whole turn instead of answering), clear it here — main may not get
     // a PostToolUse in that path. Cheap: only mutates when an awaiting flag is set.
-    const handleClaudeBusyClearAwaiting = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
-      if (busy) return;
+    const handleClaudeBusyClearAwaiting = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
+      if (busy || reason === 'spinner') return;
       setAwaitingMap(prev => {
         if (!prev.get(tabId)) return prev;
         const next = new Map(prev);
@@ -1914,6 +1937,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
       ipcRenderer.removeListener('claude:awaiting-input', handleAwaitingInput);
       ipcRenderer.removeListener('terminal:stop-progress', handleStopProgress);
+      claudeSpinnerVisualIdleTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+      claudeSpinnerVisualIdleTimersRef.current.clear();
     };
   }, []); // Stable — no re-subscriptions
 

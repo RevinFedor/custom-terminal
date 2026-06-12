@@ -596,6 +596,7 @@ export default function ClaudeControlBar({
   const showRightCluster = supportsKnobs && (isSDKTab || hasAnySession || isCommandRunning);
   const showLivePtyInputActions = (sessionType === 'claude' || sessionType === 'codex') && !isSDKTab && isCommandRunning;
   const [enterPending, setEnterPending] = useState(false);
+  const cancelPendingEnterRef = useRef(false);
   const [dictationState, setDictationState] = useState({ recording: false, stopping: false });
   // Turn-level busy, NOT process-level. `sdkBusy` is fed by claude:busy-state,
   // which main emits for BOTH SDK and PTY Claude (spinner + stop-hook), filtered
@@ -606,6 +607,7 @@ export default function ClaudeControlBar({
   const cacheBusy = sdkBusy;
 
   useEffect(() => {
+    cancelPendingEnterRef.current = false;
     setEnterPending(false);
     setDictationState({ recording: false, stopping: false });
     const handler = (e: Event) => {
@@ -1065,6 +1067,14 @@ export default function ClaudeControlBar({
     ipcRenderer.send('terminal:input', tabId, '\r');
   };
 
+  const sendCtrlCToPty = () => {
+    if (!showLivePtyInputActions) return;
+    cancelPendingEnterRef.current = true;
+    if (enterPending) setEnterPending(false);
+    focusTerminal();
+    ipcRenderer.send('terminal:input', tabId, '\x03');
+  };
+
   const waitForDictationDelivery = () => {
     const requestId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     return new Promise<boolean>((resolve) => {
@@ -1104,11 +1114,13 @@ export default function ClaudeControlBar({
     if (!showLivePtyInputActions || enterPending) return;
     focusTerminal();
     if (dictationState.recording || dictationState.stopping) {
+      cancelPendingEnterRef.current = false;
       setEnterPending(true);
       try {
         const ok = await waitForDictationDelivery();
-        if (ok) sendRawEnterToPty();
+        if (ok && !cancelPendingEnterRef.current) sendRawEnterToPty();
       } finally {
+        cancelPendingEnterRef.current = false;
         setEnterPending(false);
       }
       return;
@@ -1468,7 +1480,7 @@ export default function ClaudeControlBar({
   // ⑂ Codex-F (from clipboard)   | + 1)    | -           | -           | -       | -           | -
   // ⎘ prompt | + clear (PTY only)| -       | + Claude/   | -           | -       | -           | -
   //                              |         |   Codex     |   Codex     |         |             |
-  // 🎤 mic | Enter (PTY only)    | -       | + Claude/   | -           | -       | -           | -
+  // 🎤 mic | Enter | ^C (PTY)    | -       | + Claude/   | -           | -       | -           | -
   //                              |         |   Codex     |   Codex     |         |             |
   // Right cluster Provider/Model | hidden  | enabled     | dimmed      | enabled | shimmer     | enabled
   //   /Effort/Think              |         |             |             |         |             |
@@ -1849,7 +1861,9 @@ export default function ClaudeControlBar({
             mic appends dictated text to the composer. Enter normally sends the
             same raw CR byte as a physical Enter key; if dictation is recording
             or stopping, it first asks MicButton to stop+deliver, waits for the
-            terminal:paste submit:false delivery to finish, then sends CR. */}
+            terminal:paste submit:false delivery to finish, then sends CR. ^C sends
+            one raw Ctrl+C byte to the TUI; Claude/Codex decide whether that clears
+            visible input, interrupts work, or exits from an already-empty prompt. */}
         {showLivePtyInputActions && (
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
             <MicButton tabId={tabId} sessionType={sessionType} />
@@ -1883,6 +1897,51 @@ export default function ClaudeControlBar({
                   <path d="M21 12a9 9 0 1 1-6.219-8.56" />
                 </svg>
               ) : 'Enter'}
+            </button>
+            <button
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={sendCtrlCToPty}
+              aria-label={`Send Ctrl+C to ${sessionType === 'codex' ? 'Codex' : 'Claude'}`}
+              className="inline-flex items-center justify-center gap-1 cursor-pointer transition-colors"
+              style={{
+                height: 22,
+                minWidth: 34,
+                padding: '0 7px',
+                background: 'transparent',
+                border: '1px solid rgba(248,113,113,0.30)',
+                borderRadius: 4,
+                color: '#f87171',
+                cursor: 'pointer',
+                fontSize: 11,
+                fontWeight: 650,
+                lineHeight: 1,
+                flexShrink: 0,
+              }}
+              onMouseEnter={(e) => {
+                const el = e.currentTarget as HTMLButtonElement;
+                el.style.backgroundColor = 'rgba(248,113,113,0.12)';
+                el.style.borderColor = 'rgba(248,113,113,0.58)';
+                el.style.color = '#fecaca';
+              }}
+              onMouseLeave={(e) => {
+                const el = e.currentTarget as HTMLButtonElement;
+                el.style.backgroundColor = 'transparent';
+                el.style.borderColor = 'rgba(248,113,113,0.30)';
+                el.style.color = '#f87171';
+              }}
+              title={`Send Ctrl+C to ${sessionType === 'codex' ? 'Codex' : 'Claude'} - clears input first if it is not empty`}
+            >
+              <span
+                aria-hidden
+                style={{
+                  width: 7,
+                  height: 7,
+                  borderRadius: 2,
+                  backgroundColor: 'currentColor',
+                  display: 'inline-block',
+                }}
+              />
+              <span>^C</span>
             </button>
           </div>
         )}

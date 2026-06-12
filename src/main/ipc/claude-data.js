@@ -3,8 +3,30 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const { performance: nodePerformance } = require('node:perf_hooks');
 
 let _projectManager = null;
+
+let _localPerfOpSeq = 0;
+function _beginPerfOp(kind, detail = {}) {
+  const ops = global.__notedPerfOps;
+  if (!ops || typeof ops.set !== 'function') return null;
+  const id = kind + '-claude-data-' + (++_localPerfOpSeq);
+  const startMs = nodePerformance.now();
+  ops.set(id, {
+    id,
+    kind,
+    detail,
+    startMs,
+    startAbs: nodePerformance.timeOrigin + startMs
+  });
+  return id;
+}
+function _endPerfOp(id) {
+  if (!id) return;
+  const ops = global.__notedPerfOps;
+  if (ops && typeof ops.delete === 'function') ops.delete(id);
+}
 
 // ========== JSONL INCREMENTAL CACHE ==========
 // JSONL is append-only — when file grows we only parse NEW bytes, not the whole file.
@@ -2352,18 +2374,59 @@ function register({ projectManager, formatToolAction }) {
   // Get Claude session timeline for navigation
   // Reads JSONL file and returns filtered entries for Timeline component
   // Uses BACKTRACE algorithm to handle Escape/Undo branches correctly
-  ipcMain.handle('claude:get-timeline', async (event, { sessionId, cwd }) => {
+  ipcMain.handle('claude:get-timeline', async (event, {
+    sessionId,
+    cwd,
+    source = 'unknown',
+    reason = 'unknown',
+    tabId = '',
+    visible = null,
+    instanceId = ''
+  }) => {
+    const timelineStartedAt = nodePerformance.now();
+    const timelineStartAbs = nodePerformance.timeOrigin + timelineStartedAt;
+    const shortSession = sessionId ? sessionId.substring(0, 8) : 'none';
+    const shortTab = tabId ? tabId.slice(-8) : 'none';
+    const opId = _beginPerfOp('timelineIPC', { sessionId, tabId, source, reason, visible });
 
     if (!sessionId) {
+      console.warn(
+        '[Perf:TimelineIPC] outcome=no-session' +
+        ' source=' + source +
+        ' reason=' + reason +
+        ' inst=' + (instanceId || 'none') +
+        ' tab=' + shortTab +
+        ' session=none' +
+        ' startAbs=' + timelineStartAbs.toFixed(1) +
+        ' endAbs=' + (nodePerformance.timeOrigin + nodePerformance.now()).toFixed(1) +
+        ' durMs=' + (nodePerformance.now() - timelineStartedAt).toFixed(1)
+      );
+      _endPerfOp(opId);
       return { success: false, error: 'No session ID provided' };
     }
 
     try {
       // Resolve the full session chain (follows bridge entries across "Clear Context" boundaries)
+      const resolveStartedAt = nodePerformance.now();
       let { mergedMap: recordMap, lastRecord, sessionBoundaries } = await resolveSessionChain(sessionId, cwd);
+      const resolveMs = nodePerformance.now() - resolveStartedAt;
 
       if (!lastRecord) {
         console.log('[Timeline:Backtrace] No lastRecord for session:', sessionId.substring(0, 8));
+        console.warn(
+          '[Perf:TimelineIPC] outcome=no-last-record' +
+          ' source=' + source +
+          ' reason=' + reason +
+          ' inst=' + (instanceId || 'none') +
+          ' tab=' + shortTab +
+          ' session=' + shortSession +
+          ' visible=' + visible +
+          ' startAbs=' + timelineStartAbs.toFixed(1) +
+          ' endAbs=' + (nodePerformance.timeOrigin + nodePerformance.now()).toFixed(1) +
+          ' resolveMs=' + resolveMs.toFixed(1) +
+          ' totalMs=' + (nodePerformance.now() - timelineStartedAt).toFixed(1)
+        );
+        _endPerfOp(opId);
         return { success: true, entries: [] };
       }
 
@@ -2371,6 +2434,7 @@ function register({ projectManager, formatToolAction }) {
 
       // BACKTRACE: Walk backwards from the last record following parentUuid
       // Now works across file boundaries thanks to merged recordMap
+      const backtraceStartedAt = nodePerformance.now();
       let _cacheInvalidated = false; // Track if we already retried with fresh cache
       const activeBranch = [];
       let currentUuid = lastRecord.uuid;
@@ -2631,8 +2695,10 @@ function register({ projectManager, formatToolAction }) {
       }
 
       console.log('[Timeline:Backtrace] DONE session=' + sessionId.substring(0, 8) + ' activeBranch=' + activeBranch.length + ' compactRecoveries=' + _compactRecoveryCount + ' compactPassthrough=' + _compactPassthroughCount + ' bridgeFollows=' + _bridgeFollowCount + ' chainBreaks=' + _chainBreaks.length + ' root=' + (activeBranch.length > 0 ? activeBranch[0].uuid.substring(0, 8) + '/' + activeBranch[0].type : 'empty'));
+      const backtraceMs = nodePerformance.now() - backtraceStartedAt;
 
       // Now filter the active branch for Timeline display
+      const filterStartedAt = nodePerformance.now();
       const entries = [];
       let skippedSidechain = 0, skippedSummary = 0, skippedToolResult = 0, skippedNoContent = 0, skippedSystem = 0;
       for (const entry of activeBranch) {
@@ -2800,10 +2866,13 @@ function register({ projectManager, formatToolAction }) {
       }
 
       console.log('[Timeline:Backtrace] session=' + sessionId.substring(0, 8) + ' entries=' + entries.length + ' skipped: sidechain=' + skippedSidechain + ' toolResult=' + skippedToolResult + ' noContent=' + skippedNoContent + ' system=' + skippedSystem + ' summary=' + skippedSummary);
+      const filterMs = nodePerformance.now() - filterStartedAt;
 
       // Resolve the latest session ID in the chain (tip)
       // This helps the renderer detect if claudeSessionId needs updating
+      const latestStartedAt = nodePerformance.now();
       const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
+      const latestMs = nodePerformance.now() - latestStartedAt;
 
       // Claude's own backtrace stops at the first orphan — everything before
       // is invisible to the live Claude process even though it's on disk.
@@ -2813,10 +2882,45 @@ function register({ projectManager, formatToolAction }) {
       // pre-orphan tail). Everything in activeBranch with an index lower than
       // this uuid's index is invisible to Claude.
       const claudeMemoryBoundaryUuid = _chainBreaks.length > 0 ? _chainBreaks[0].recoveredFromUuid : null;
+      console.warn(
+        '[Perf:TimelineIPC] outcome=success' +
+        ' source=' + source +
+        ' reason=' + reason +
+        ' inst=' + (instanceId || 'none') +
+        ' tab=' + shortTab +
+        ' session=' + shortSession +
+        ' visible=' + visible +
+        ' startAbs=' + timelineStartAbs.toFixed(1) +
+        ' endAbs=' + (nodePerformance.timeOrigin + nodePerformance.now()).toFixed(1) +
+        ' recordMap=' + recordMap.size +
+        ' activeBranch=' + activeBranch.length +
+        ' entries=' + entries.length +
+        ' boundaries=' + sessionBoundaries.length +
+        ' resolveMs=' + resolveMs.toFixed(1) +
+        ' backtraceMs=' + backtraceMs.toFixed(1) +
+        ' filterMs=' + filterMs.toFixed(1) +
+        ' latestMs=' + latestMs.toFixed(1) +
+        ' totalMs=' + (nodePerformance.now() - timelineStartedAt).toFixed(1)
+      );
+      _endPerfOp(opId);
       return { success: true, entries: entries, latestSessionId, sessionBoundaries, chainBreaks: _chainBreaks, claudeMemoryBoundaryUuid };
 
     } catch (error) {
       console.error('[Claude Timeline] Error:', error);
+      console.warn(
+        '[Perf:TimelineIPC] outcome=error' +
+        ' source=' + source +
+        ' reason=' + reason +
+        ' inst=' + (instanceId || 'none') +
+        ' tab=' + shortTab +
+        ' session=' + shortSession +
+        ' visible=' + visible +
+        ' startAbs=' + timelineStartAbs.toFixed(1) +
+        ' endAbs=' + (nodePerformance.timeOrigin + nodePerformance.now()).toFixed(1) +
+        ' totalMs=' + (nodePerformance.now() - timelineStartedAt).toFixed(1) +
+        ' error=' + error.message
+      );
+      _endPerfOp(opId);
       return { success: false, error: error.message };
     }
   });

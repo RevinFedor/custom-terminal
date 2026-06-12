@@ -1507,6 +1507,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // within-project switch means fingerprint regressed.
       const _t0 = performance.now();
       const prevActiveId = workspace.activeTabId;
+      const currentView = workspace.currentView;
+      const totalTabs = Array.from(openProjects.values()).reduce((acc, ws) => acc + ws.tabs.size, 0);
       workspace.activeTabId = tabId;
       // Don't reset viewingSubAgentTabId here — it persists across tab switches.
       // User dismisses it explicitly via SubAgentBar "← Back" button or clicking the active chip.
@@ -1517,9 +1519,25 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       startTransition(() => {
         set({ openProjects: new Map(openProjects) });
       });
+      const syncMs = performance.now() - _t0;
+      console.warn(
+        `[Perf:TabSwitchStart] project=${projectId.slice(-12)} from=${String(prevActiveId).slice(-12)}` +
+        ` to=${tabId.slice(-12)} currentView=${currentView} tabs=${workspace.tabs.size}` +
+        ` totalTabs=${totalTabs} syncMs=${syncMs.toFixed(1)}`
+      );
       requestAnimationFrame(() => {
         const durMs = (performance.now() - _t0).toFixed(1);
         console.warn(`[Perf:TabSwitch] project=${projectId.slice(-12)} from=${String(prevActiveId).slice(-12)} to=${tabId.slice(-12)} durMs=${durMs}`);
+        requestAnimationFrame(() => {
+          const state = get();
+          const wsNow = state.openProjects.get(projectId);
+          const dur2Ms = (performance.now() - _t0).toFixed(1);
+          console.warn(
+            `[Perf:TabSwitchFrame2] project=${projectId.slice(-12)} from=${String(prevActiveId).slice(-12)}` +
+            ` to=${tabId.slice(-12)} durMs=${dur2Ms}` +
+            ` currentView=${wsNow?.currentView || 'missing'} activeNow=${String(wsNow?.activeTabId).slice(-12)}`
+          );
+        });
       });
       saveSession();
     }
@@ -2735,11 +2753,18 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
     if (!workspace || workspace.currentView === view) return;
+    const _t0 = performance.now();
     const previousView = workspace.currentView;
     const totalTabs = Array.from(openProjects.values()).reduce((acc, ws) => acc + ws.tabs.size, 0);
     workspace.currentView = view;
     console.warn(`[Perf:ProjectView] project=${projectId.slice(-12)} ${previousView}->${view} tabs=${workspace.tabs.size} totalTabs=${totalTabs}`);
     startTransition(() => set({ openProjects: new Map(openProjects) }));
+    requestAnimationFrame(() => {
+      console.warn(
+        `[Perf:ProjectViewFrame] project=${projectId.slice(-12)} ${previousView}->${view}` +
+        ` durMs=${(performance.now() - _t0).toFixed(1)} tabs=${workspace.tabs.size} totalTabs=${totalTabs}`
+      );
+    });
   },
 
   // Sidebar state (per-project)
