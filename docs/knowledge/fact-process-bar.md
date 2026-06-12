@@ -91,11 +91,11 @@ Mobile-web tab-row рисует **ту же полоску-лоадер** у к�
 
 Маппинг рантайма на полоску: `running` (sessionStatus active/busy или SDK live) → статичная `colorA` полоса. `busy` (turn в полёте) → плюс `.mob-pbar-shimmer` с теми же цветом/spacing/opacity. `position:right` → `{right:0}` + правые радиусы, иначе левые — зеркало desktop edge-anchoring. Строка резервирует `paddingLeft/Right:17` на стороне полоски чтобы текст не лез под неё. Старый whole-row background-breathing (`mob-row-busy`) и правая точка/ring удалены — полоска единственный лоадер, как на desktop. Graceful degrade: старый сервер без `processBar` → дефолт cyan/left.
 
-## Project tabs агрегируют дочерние полоски
+## Project tabs агрегируют сигнал бейджем, не полоской
 
-Вкладка проекта в titlebar показывает тот же edge-strip, если хотя бы одна дочерняя вкладка этого проекта показывает process-bar или busy-shimmer. Это не новый статус, а parent-level поверхность того же сигнала: пользователь может уйти на другой проект, но фоновая работа в соседнем проекте не должна становиться невидимой. Юзер сформулировал правило прямо: *«если он отображается на вкладке, то он отображается на проекте»*.
+Вкладка проекта в titlebar показывает активность дочерних вкладок через круглый зелёный count-badge с цифрой активных процессов внутри, а не через session-level edge-strip. Юзер зафиксировал границу после регресса: *«у проектов должен быть кружочек, как раньше, с цифрой посередине; у вкладок сессии — вертикальная чёрточка»*. Поэтому правило *«если он отображается на вкладке, то он отображается на проекте»* означает перенос **сигнала**, а не копирование визуальной формы.
 
-Агрегация в `App.tsx`: process-alive = `terminal:command-started/finished` или `tab.sdkProcessAlive`; shimmer = `claude:busy-state`, `gemini:busy-state`, `codex:busy-state`, `claude:paste-busy` или `project:api-loading`. Важный шрам: App-root раньше слушал только Claude/Gemini busy, а `TabBar` уже слушал Codex/paste-busy. Это давало потенциальный рассинхрон «на вкладке блик есть, на проекте нет» именно для Codex и короткого paste-stage.
+Edge-strip (`tab-process-bar-static` + shimmer) принадлежит только дочерним session tabs: он показывает live process / AI-busy у конкретной вкладки. Project tab — агрегирующая поверхность навигации между проектами, и ему нужен счётчик, чтобы пользователь видел масштаб фоновой работы в проекте. Не возвращать `hasProcessBar` / `tab-process-bar-static` в `ProjectTabItem`: такая попытка уже делала родительскую вкладку похожей на session-tab и убирала count-семантику.
 
 ## Связи
 

@@ -14,6 +14,8 @@ Codex поддержан как третий PTY-agent рядом с Claude и G
 
 Стартовые параметры модели и effort можно передавать сразу: `--model <id>` и `-c 'model_reasoning_effort="<effort>"'`. Это отличается от Claude: у Codex нет отдельного Think-toggle, а reasoning effort меняется через тот же `/model` flow, что и модель.
 
+В ControlBar дефолты Codex (`gpt-5.5` / `xhigh`) — это per-tab UI state, а не скрытый глобальный override запуска. Если вкладка остаётся на дефолте, `codex:run-command` **не** передаёт ни `--model`, ни `model_reasoning_effort`: ожидается что такая пара задана в `~/.codex/config.toml` и принадлежит самому Codex. Аргументы добавляются только когда пользователь явно уводит конкретную вкладку от дефолта. Это защищает от «глобального эха»: настройка одной вкладки не должна молча становиться launch-параметром для всех последующих Codex-сессий.
+
 ## Timeline и History
 
 `codex:get-timeline` строит точки из `event_msg.user_message`, дополняет их `turn_context` (model/effort) и `event_msg.token_count` (tokens/context%). `thread_rolled_back` откатывает последние turn'ы в уже построенном списке, compact-like события превращаются в compact marker. Это не Claude backtrace: у Codex сейчас нет нашего `parentUuid`-DAG, fork/plan markers, edit-range и token breakdown backend.
@@ -42,6 +44,8 @@ App Server остаётся future-path, если понадобится нат�
 
 Prompt Queue / Run after использует тот же high-level слой: `task_complete` = штатный конец, можно отправлять следующий queued prompt; `turn_aborted` = ненатуральный конец, очередь надо disarm'ить. Дробные состояния «ждёт approval», «печатает ответ», «выполняет команду» для этой фичи не нужны — пользовательский инвариант один: пока Codex-turn не завершён, следующий prompt не уходит.
 
+Граница `Escape`: приложение не считает raw `Escape`/`Ctrl+C` Codex-сигналом само по себе. Для Codex авторитетен только rollout JSONL: если после вмешательства появился `turn_aborted`, loader гасится и Run after disarm'ится. Claude-style fallback «нажали Escape → через короткую idle-проверку принудительно busy=false» пока не переносить на Codex без реального симптома, иначе можно получить ложный обрыв long-running turn'а.
+
 ## Модели и effort
 
 Список моделей нужно брать из live `codex debug models`. Bundled catalog используется только fallback'ом: он может содержать hidden/internal/upgrade-only rows, которые интерактивный `/model` picker не примет. UI синхронизирует свои варианты обратно из реально распарсенного picker'а, потому что именно TUI является финальным источником «какие строки доступны этому аккаунту сейчас».
@@ -65,6 +69,12 @@ Stop для Codex идёт через общий `terminal:stop-ai-process`: н�
 Close tab использует тот же stop-flow перед `terminal:kill`, даже когда confirmation dialog не показывается. Диалог завязан на busy/streaming loader, а не на `codexSessionId`: idle Codex с историей закрывается тихо, но live Codex foreground всё равно получает controlled stop, чтобы rollout JSONL успел дописать хвост. Cleanup `terminal:kill` обязан закрывать и session watcher, и turn watcher (`codexWatchers` + `codexTurnWatchers`); иначе после Esc/Stop/close вкладка может исчезнуть, а busy loader продолжит жить по старому watcher'у.
 
 Codex не требует Claude-style `bridgeKnownSessions` / stale `~/.claude/bridge/*.json` guard'ов: у него нет statusline bridge, который может через секунду перезаписать вкладку древним sessionId. Его durable state — rollout JSONL в `~/.codex/sessions/`; `resume`/`fork` восстанавливаются из этого transcript, не из RAM процесса. Поэтому главный риск при резком убийстве другой: in-flight кусок ответа мог быть виден в терминале, но не успеть попасть в JSONL. Парсер уже игнорирует битый хвост, а UI должен считать историей только то, что записано в rollout. Пока реального симптома нет, не переносить на Codex весь Claude bridge/pendingResume слой «на всякий случай»; достаточно graceful-stop и диагностики SIGKILL как потери последнего незаписанного turn'а.
+
+## Interrupted recovery и AutoResume
+
+Codex участвует в том же interrupted-overlay / AutoResume flow, что Claude, но источник live-сессии другой. У Claude main берёт `bridgeKnownSessions`; у Codex нет bridge-файлов, поэтому main держит `codexKnownSessions` (`tabId -> codexSessionId`) из rollout watcher'а, ручного resume (`codex-c`) и fresh session detection. Shutdown помечает объединение `bridgeKnownSessions ∪ codexKnownSessions`; overlay Continue, AutoResume и Resume All восстанавливают Codex через `codex:run-command {command:'codex-c', sessionId, cwd}` и сразу эмитят `codex:session-detected`, не ждут новой записи в rollout.
+
+Тонкий teardown-шрам: во время graceful quit `before-quit` сначала early-mark'ит активные AI, потом шлёт Ctrl+C живым CLI. Codex может успеть чисто выйти и сгенерировать OSC 133 D **до** `will-quit`. Если в этот момент `command-finished` очистит `codexKnownSessions`, финальный `will-quit` сделает clear stale `was_interrupted=1` и уже не re-mark'нет вкладку — после рестарта overlay пропадёт, хотя session была активна при закрытии. Поэтому `clearCodexKnownSession(tabId, 'command-finished')` запрещён пока `_gracefulShutdownInProgress=true`; map держится до финального clear+mark pass. Это Codex-аналог bridge lifecycle, но без stale-bridge takeover риска.
 
 Микрофонная диктовка для Codex использует тот же PTY-путь, что Claude PTY: `terminal:paste` с `submit:false`, чтобы текст оказался в composer и юзер мог его отредактировать перед Enter. SDK-путь сюда не подходит: у Codex нет отдельного React composer'а внутри приложения.
 

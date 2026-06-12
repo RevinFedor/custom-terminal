@@ -1,6 +1,6 @@
 # Fix: Vite-специфичные ловушки сборки (main + renderer)
 
-Две независимые ловушки Vite, обе про **build-time трансформацию** кода, обе ломают приложение тихо.
+Три независимые ловушки Vite, все про **build-time трансформацию** или source input сборки, все ломают приложение тихо.
 
 ## Часть 1: `$` в template literals = «Unexpected character $»
 
@@ -63,3 +63,32 @@ export default defineConfig({
 - **`VITE_` префикс** (`import.meta.env.VITE_X`) — требует переписать **все** места использования в renderer, ломает единообразие с main (где `process.env.X` работает нативно).
 - **IPC handler `app:getEnv`** — оверинжиниринг для статических значений (ключи API не меняются в runtime), плюс async везде где должно быть sync.
 - **`.env` loader в main.js** — работает только для main process, renderer бандлится отдельно и не видит этот код.
+
+---
+
+## Часть 3: root `index.html` стал production artifact
+
+### Симптом
+`npm run build` падает в начале renderer-сборки:
+
+```text
+vite ... building client environment for production...
+Error: Failed to resolve /assets/index-CC3JuWHx.js from /Users/fedor/Desktop/custom-terminal/index.html
+```
+
+Файл `/assets/index-*.js` реально не обязан существовать в source tree — это hash-артефакт предыдущей production-сборки.
+
+### Причина
+`electron.vite.config.js` использует root `index.html` как renderer input. Если этот source-файл случайно заменить содержимым из `dist/index.html` / packaged bundle, новая сборка воспринимает `<script src="/assets/index-*.js">` и `<link href="/assets/index-*.css">` как исходные зависимости и пытается резолвить старые hash-файлы до генерации новых.
+
+Это особенно легко пропустить при правке CSP: production `dist/index.html` и source `index.html` выглядят почти одинаково, но source-файл должен ссылаться на entrypoint, а не на готовые assets.
+
+### Решение
+Root `index.html` должен оставаться Vite source input:
+
+```html
+<div id="react-root"></div>
+<script type="module" src="/src/renderer/main.tsx"></script>
+```
+
+В source `index.html` не должно быть `/assets/index-*.js` и `/assets/index-*.css`. CSS приходит через import из renderer entrypoint (`main.tsx`), а hashed assets появляются только внутри `dist/` после сборки. После ручной CSP-правки проверяй оба инварианта сразу: CSP содержит нужные directives, но script entry остался `/src/renderer/main.tsx`.

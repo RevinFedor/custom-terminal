@@ -28,8 +28,10 @@ Main маркирует в `before-quit`, затем renderer `saveSessionImmedi
 
 ## Решение
 
-### Правильный сигнал: `bridgeKnownSessions`
-Map `tabId → sessionId`. Устанавливается StatusLine Bridge при обнаружении Claude CLI. Очищается через `clearBridgeTab()` при выходе Claude (OSC 133 D) и при убийстве терминала (`terminal:kill`, PTY exit). Это единственный надёжный сигнал "Claude CLI жив в этом табе".
+### Правильный сигнал: known live AI sessions
+Для Claude это `bridgeKnownSessions` (`tabId → sessionId`), установленный StatusLine Bridge при обнаружении Claude CLI. Для Codex это `codexKnownSessions` (`tabId → sessionId`), установленный rollout watcher'ом или явным `codex-c` resume. Shutdown работает по объединению этих map'ов, потому что пользовательский риск одинаковый: живой AI-процесс мог не успеть дописать durable transcript перед закрытием приложения.
+
+`bridgeKnownSessions` очищается через `clearBridgeTab()` при выходе Claude (OSC 133 D) и при убийстве терминала (`terminal:kill`, PTY exit). `codexKnownSessions` очищается на `command-finished`, `terminal:kill`, PTY exit и manual stop — но не во время `_gracefulShutdownInProgress`, см. Codex-секцию ниже.
 
 ### Правильный момент: `will-quit`
 Fires ПОСЛЕ `beforeunload` → renderer уже мёртв и не может перезаписать DB.
@@ -37,14 +39,14 @@ Fires ПОСЛЕ `beforeunload` → renderer уже мёртв и не може�
 ### Архитектура (единственный источник правды — main process)
 
 ```
-before-quit:   additive safety — маркирует bridgeKnownSessions (на случай если will-quit не fires)
+before-quit:   additive safety — маркирует known live AI sessions (на случай если will-quit не fires)
 beforeunload:  ТОЛЬКО saveSessionImmediate() — НЕ трогает wasInterrupted
-will-quit:     ФИНАЛЬНЫЙ — clear stale + mark bridgeKnownSessions (renderer уже мёртв)
+will-quit:     ФИНАЛЬНЫЙ — clear stale + mark known live AI sessions (renderer уже мёртв)
 ```
 
 ### Логика clear/mark
 - `wasInterrupted=true` при shutdown → **stale** (пользователь не кликнул Continue) → CLEAR
-- `tabId ∈ bridgeKnownSessions` → **active** (CLI жив) → MARK
+- `tabId ∈ bridgeKnownSessions ∪ codexKnownSessions` → **active** (AI CLI жив) → MARK
 
 При повторном перезапуске: stale из предыдущей сессии чистятся, маркируются только реально работавшие.
 
@@ -65,6 +67,12 @@ will-quit:     ФИНАЛЬНЫЙ — clear stale + mark bridgeKnownSessions (re
 OSC 133 D уже отправляет `terminal:command-finished` в renderer **без каких-либо guard'ов** — именно этот сигнал показывает кнопку "Продолжить". Тот же сигнал теперь чистит bridge. Единственный guard — handshake (shell fires D при инициализации до старта Claude).
 
 **Ключевой вывод:** если UI уже корректно реагирует на событие, main process должен использовать тот же сигнал, а не строить параллельную детекцию с собственными guard'ами.
+
+## Codex known-session map во время shutdown (fix 2026-06)
+
+Codex не имеет Claude bridge-файла, поэтому для shutdown recovery main держит `codexKnownSessions`. На обычном выходе Codex `terminal:command-finished` обязан чистить эту map, иначе закрытая вручную сессия будет считаться активной при следующем quit. Но во время app quit порядок другой: `before-quit` early-mark'ит interrupted tabs, затем GracefulCtrlC шлёт `\x03`, Codex может чисто выйти и сгенерировать OSC 133 D **до** `will-quit`. Если `command-finished` очистит `codexKnownSessions` в этом окне, `will-quit` сначала снимет stale `was_interrupted=1`, а re-mark уже не найдёт Codex-сессию. Пользовательский симптом — после рестарта нет синего overlay/AutoResume для Codex, хотя при закрытии он был жив.
+
+Решение: если `_gracefulShutdownInProgress=true`, `command-finished` только логирует keep и не вызывает `clearCodexKnownSession`; map доживает до финального `will-quit` clear+mark pass. Это противоположно нормальному runtime-cleanup и выглядит контринтуитивно, но именно shutdown-window делает clear опаснее stale-записи.
 
 ---
 

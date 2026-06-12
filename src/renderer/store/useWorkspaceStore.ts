@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { startTransition } from 'react';
 import { log } from '../utils/logger';
 import { setPrefetched } from '../utils/sdkHistoryPrefetch';
+import { usePromptQueueStore } from './usePromptQueueStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -982,6 +983,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // PTY shutdown may involve process checks and graceful Ctrl+C. Keep it off the
       // critical UI path so closing a project cannot look like a global freeze.
       tabsToKill.forEach((tabId) => {
+        usePromptQueueStore.getState().cleanupClosedTab(tabId);
         ipcRenderer.send('terminal:kill', tabId);
       });
     }
@@ -1361,6 +1363,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
 
     workspace.tabs.delete(tabId);
+    usePromptQueueStore.getState().cleanupClosedTab(tabId);
     // Remove closed tab from history
     workspace.tabHistory = workspace.tabHistory.filter(id => id !== tabId);
 

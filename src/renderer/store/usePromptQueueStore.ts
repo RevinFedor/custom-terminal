@@ -205,6 +205,11 @@ interface PromptQueueStore {
 
   // Pops the head item — used by the auto-runner when Stop hook fires. Returns null if empty.
   popNext: (tabId: string) => QueuedPrompt | null;
+  commitSentHead: (tabId: string, id: string) => { removed: boolean; beforeCount: number };
+
+  // Drop queue state owned by a closed tab and clear run-after pivots that
+  // pointed at it. Called from workspace closeTab.
+  cleanupClosedTab: (tabId: string) => void;
 
   getQueue: (tabId: string) => TabQueue;
 }
@@ -374,7 +379,12 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         const cur = next.get(tabId) ?? EMPTY;
         // Any user interaction with Run after acknowledges the hint — clear it
         // unconditionally. Re-arming only happens on the next 0→1 chip edge.
-        next.set(tabId, { ...cur, autoRun: value, firstChipHintActive: false });
+        next.set(tabId, {
+          ...cur,
+          autoRun: value,
+          firstChipHintActive: false,
+          firstDelayCountdownAt: value ? cur.firstDelayCountdownAt : null,
+        });
         return { queues: next };
       });
     },
@@ -532,6 +542,45 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         return { queues: next };
       });
       return head;
+    },
+
+    commitSentHead: (tabId, id) => {
+      let removed = false;
+      let beforeCount = 0;
+      setAndPersist((state) => {
+        const cur = state.queues.get(tabId);
+        if (!cur || cur.items.length === 0) return state;
+        beforeCount = cur.items.length;
+        const head = cur.items[0];
+        if (!head || head.id !== id) return state;
+        const next = new Map(state.queues);
+        next.set(tabId, {
+          ...cur,
+          items: cur.items.slice(1),
+          previewId: cur.previewId === id ? null : cur.previewId,
+        });
+        removed = true;
+        return { queues: next };
+      });
+      return { removed, beforeCount };
+    },
+
+    cleanupClosedTab: (closedTabId) => {
+      setAndPersist((state) => {
+        let changed = false;
+        const next = new Map(state.queues);
+
+        if (next.delete(closedTabId)) changed = true;
+
+        for (const [ownerTabId, queue] of next) {
+          if (queue.runAfterTabId !== closedTabId) continue;
+          next.set(ownerTabId, { ...queue, runAfterTabId: null });
+          changed = true;
+        }
+
+        if (!changed) return state;
+        return { queues: next };
+      });
     },
 
     getQueue: (tabId) => get().queues.get(tabId) ?? EMPTY,
