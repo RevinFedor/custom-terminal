@@ -130,9 +130,10 @@ export type TabQueue = {
 
   // ── First-chip armed hint ────────────────────────────────────────────────
   // True when user added the FIRST chip into an empty queue while Run after
-  // was OFF — the Run after pill renders with a soft red glow as a nudge.
-  // Cleared on first hover over the pill (consumeFirstChipHint). Re-armed
-  // every time the queue transitions from 0 → 1 with autoRun=false.
+  // was OFF — the Run after pill renders one red blink, then a low-red resting
+  // state as a nudge. Cleared only by explicit Run after interaction or by
+  // manually emptying the queue. Re-armed every time the queue transitions from
+  // 0 → 1 with autoRun=false.
   // UI-only — not persisted (re-restore would just nag the user on each boot).
   firstChipHintActive: boolean;
 
@@ -205,9 +206,9 @@ interface PromptQueueStore {
   setPostPromptEnabled: (tabId: string, value: boolean) => void;
   setPostPromptText: (tabId: string, text: string) => void;
 
-  // First-chip armed hint helpers. consumeFirstChipHint clears the flag on
-  // first hover. (Setting it happens implicitly inside addPrompt on the 0→1
-  // edge when autoRun is false.)
+  // First-chip armed hint helpers. consumeFirstChipHint clears the flag after
+  // explicit acknowledgement. (Setting it happens implicitly inside addPrompt
+  // on the 0→1 edge when autoRun is false.)
   consumeFirstChipHint: (tabId: string) => void;
 
   // Pops the head item — used by the auto-runner when Stop hook fires. Returns null if empty.

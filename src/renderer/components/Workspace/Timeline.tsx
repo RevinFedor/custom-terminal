@@ -4,7 +4,7 @@ import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, Chevron
 import Tooltip from '../UI/Tooltip';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { useUIStore } from '../../store/useUIStore';
-import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { useWorkspaceStore, type PendingAutoTabTitle } from '../../store/useWorkspaceStore';
 import { TAB_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { generateTabTitleFromPrompt, isEligibleTabTitleEntry, trimTabTitlePrompt } from '../../utils/generateTabTitle';
 import EditRangePanel from './EditRangePanel';
@@ -145,6 +145,50 @@ interface TimelineProps {
   isVisible?: boolean; // New prop to control visibility from parent
   isOpen?: boolean; // CMD+] toggle — controls slide in/out
   toolType?: 'claude' | 'gemini' | 'codex'; // Which AI tool this timeline is for
+}
+
+interface CodexTimelineSessionMeta {
+  id?: string;
+  forked_from_id?: string;
+  timestamp?: string;
+  cwd?: string;
+}
+
+function sessionIdLooseMatch(left?: string, right?: string): boolean {
+  if (!left || !right) return false;
+  return left === right || left.startsWith(right) || right.startsWith(left);
+}
+
+function selectAutoTabTitlePrompt(
+  entries: TimelineEntry[],
+  pending: PendingAutoTabTitle,
+  toolType: 'claude' | 'codex',
+  forkMarkers: ForkMarker[],
+  forkMarkerLastSnapIndex: number[],
+  codexSessionMeta: CodexTimelineSessionMeta | null
+): TimelineEntry | undefined {
+  if (pending.mode !== 'fork') {
+    return entries.find(isEligibleTabTitleEntry);
+  }
+
+  if (toolType === 'claude') {
+    if (forkMarkers.length === 0) return undefined;
+    const boundaryIndex = forkMarkerLastSnapIndex.length > 0
+      ? Math.max(...forkMarkerLastSnapIndex)
+      : -1;
+    return entries.find((entry, index) => index > boundaryIndex && isEligibleTabTitleEntry(entry));
+  }
+
+  const forkedFromId = codexSessionMeta?.forked_from_id;
+  if (pending.sourceSessionId && forkedFromId && !sessionIdLooseMatch(forkedFromId, pending.sourceSessionId)) {
+    return undefined;
+  }
+  const startedAt = codexSessionMeta?.timestamp ? Date.parse(codexSessionMeta.timestamp) : NaN;
+  if (!Number.isFinite(startedAt)) return undefined;
+  return entries.find((entry) => {
+    const entryAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
+    return Number.isFinite(entryAt) && entryAt >= startedAt && isEligibleTabTitleEntry(entry);
+  });
 }
 
 // Truncate text for tooltip display
@@ -356,6 +400,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   entriesCountRef.current = entries.length;
   const [compactSummaryCache, setCompactSummaryCache] = useState<Record<string, string | null>>({});
   const [forkMarkers, setForkMarkers] = useState<ForkMarker[]>([]);
+  const [codexSessionMeta, setCodexSessionMeta] = useState<CodexTimelineSessionMeta | null>(null);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const [activeTooltipIndex, setActiveTooltipIndex] = useState<number | null>(null);
   const timelineInstanceIdRef = useRef(Math.random().toString(36).slice(2, 8));
@@ -1262,6 +1307,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     if (!sessionId) {
       setEntries([]);
       setForkMarkers([]);
+      setCodexSessionMeta(null);
       setExpandedGroups(new Set());
       setTimelineTreeMode(tabId, false);
       setClaudeMemoryBoundaryUuid(null);
@@ -1300,6 +1346,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           setEntries(timelineResult.entries);
           setSessionBoundaries([]);
           setForkMarkers([]);
+          setCodexSessionMeta(null);
           setClaudeMemoryBoundaryUuid(null);
         }
       } else if (isCodex) {
@@ -1308,6 +1355,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           setEntries(timelineResult.entries);
           setSessionBoundaries([]);
           setForkMarkers([]);
+          setCodexSessionMeta(timelineResult.sessionMeta || null);
           setClaudeMemoryBoundaryUuid(null);
         }
       } else {
@@ -1324,6 +1372,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         if (timelineResult.success) {
           setEntries(timelineResult.entries);
           setSessionBoundaries(timelineResult.sessionBoundaries || []);
+          setCodexSessionMeta(null);
           setClaudeMemoryBoundaryUuid(timelineResult.claudeMemoryBoundaryUuid || null);
 
           // CHAIN BREAK notifications.
@@ -1615,17 +1664,27 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     if (!sessionId || entries.length === 0) return;
     if (toolType !== 'claude' && toolType !== 'codex') return;
 
-    const firstUserPrompt = entries.find(isEligibleTabTitleEntry);
-    if (!firstUserPrompt) return;
+    const store = useWorkspaceStore.getState();
+    const pendingAutoTitle = store.getPendingAutoTabTitle(tabId, toolType, sessionId);
+    if (!pendingAutoTitle) return;
 
     const attemptKey = `${toolType}:${sessionId}`;
     if (_autoTabTitleAttempted.has(attemptKey)) {
-      useWorkspaceStore.getState().consumePendingAutoTabTitle(tabId, toolType, sessionId);
+      store.consumePendingAutoTabTitle(tabId, toolType, sessionId);
       return;
     }
 
+    const firstUserPrompt = selectAutoTabTitlePrompt(
+      entries,
+      pendingAutoTitle,
+      toolType,
+      forkMarkers,
+      forkMarkerLastSnapIndex,
+      codexSessionMeta
+    );
+    if (!firstUserPrompt) return;
+
     let tab: any = null;
-    const store = useWorkspaceStore.getState();
     for (const [, workspace] of store.openProjects) {
       const candidate = workspace.tabs.get(tabId);
       if (candidate) { tab = candidate; break; }
@@ -1658,10 +1717,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           sessionId: titleSessionId,
         });
       } finally {
-        useWorkspaceStore.getState().setTabTitleNaming(titleTabId, false);
+      useWorkspaceStore.getState().setTabTitleNaming(titleTabId, false);
       }
     })();
-  }, [entries, sessionId, tabId, toolType]);
+  }, [entries, sessionId, tabId, toolType, forkMarkers, forkMarkerLastSnapIndex, codexSessionMeta]);
 
   // effect: sessionId/loadTimeline/isVisible + document.visibilitychange → 2s setInterval(loadTimeline) (paused while tab hidden; PERF: avoids IPC round-trips in background — Timeline:PollPaused/Resumed logs)
   useEffect(() => {

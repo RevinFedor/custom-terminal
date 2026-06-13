@@ -72,6 +72,8 @@ export interface TabGroup {
 export interface AiLaunchSnapshot {
   sessionType: 'claude' | 'codex';
   autoTitleEligible?: boolean;
+  autoTitleMode?: AutoTabTitleMode;
+  autoTitleSourceSessionId?: string;
   commandType?: CommandType;
   name: string;
   color?: TabColor;
@@ -86,10 +88,13 @@ export interface AiLaunchSnapshot {
 }
 
 export type AutoTabTitleTool = 'claude' | 'codex';
+export type AutoTabTitleMode = 'fresh' | 'fork';
 
-interface PendingAutoTabTitle {
+export interface PendingAutoTabTitle {
   toolType: AutoTabTitleTool;
   sessionId: string;
+  mode: AutoTabTitleMode;
+  sourceSessionId?: string;
   at: number;
 }
 
@@ -105,13 +110,32 @@ const clearPendingAutoTabTitle = (tabId: string, reason: string): void => {
     '[Store:AutoTabTitle] clear tab=' + tabId.slice(-8) +
     ' type=' + pending.toolType +
     ' sid=' + pending.sessionId.slice(0, 8) +
+    ' mode=' + pending.mode +
     ' reason=' + reason
   );
 };
 
-const armPendingAutoTabTitle = (tabId: string, toolType: AutoTabTitleTool, sessionId: string): void => {
-  pendingAutoTabTitles.set(tabId, { toolType, sessionId, at: Date.now() });
-  console.warn('[Store:AutoTabTitle] arm tab=' + tabId.slice(-8) + ' type=' + toolType + ' sid=' + sessionId.slice(0, 8));
+const armPendingAutoTabTitle = (
+  tabId: string,
+  toolType: AutoTabTitleTool,
+  sessionId: string,
+  options: { mode?: AutoTabTitleMode; sourceSessionId?: string } = {}
+): void => {
+  const mode = options.mode || 'fresh';
+  pendingAutoTabTitles.set(tabId, {
+    toolType,
+    sessionId,
+    mode,
+    sourceSessionId: options.sourceSessionId,
+    at: Date.now(),
+  });
+  console.warn(
+    '[Store:AutoTabTitle] arm tab=' + tabId.slice(-8) +
+    ' type=' + toolType +
+    ' sid=' + sessionId.slice(0, 8) +
+    ' mode=' + mode +
+    (options.sourceSessionId ? ' source=' + options.sourceSessionId.slice(0, 8) : '')
+  );
 };
 
 const getAutoTabTitleArmSkipReason = (
@@ -155,22 +179,34 @@ const logAutoTabTitleArmSkip = (
   );
 };
 
-const consumePendingAutoTabTitle = (tabId: string, toolType: AutoTabTitleTool, sessionId: string): boolean => {
+const getPendingAutoTabTitle = (tabId: string, toolType: AutoTabTitleTool, sessionId: string): PendingAutoTabTitle | null => {
   const pending = pendingAutoTabTitles.get(tabId);
-  if (!pending) return false;
+  if (!pending) return null;
 
   if (Date.now() - pending.at > AUTO_TAB_TITLE_PENDING_TTL_MS) {
     clearPendingAutoTabTitle(tabId, 'expired');
-    return false;
+    return null;
   }
 
   if (pending.toolType !== toolType || pending.sessionId !== sessionId) {
     clearPendingAutoTabTitle(tabId, 'mismatch');
-    return false;
+    return null;
   }
 
+  return pending;
+};
+
+const consumePendingAutoTabTitle = (tabId: string, toolType: AutoTabTitleTool, sessionId: string): boolean => {
+  const pending = getPendingAutoTabTitle(tabId, toolType, sessionId);
+  if (!pending) return false;
+
   pendingAutoTabTitles.delete(tabId);
-  console.warn('[Store:AutoTabTitle] consume tab=' + tabId.slice(-8) + ' type=' + toolType + ' sid=' + sessionId.slice(0, 8));
+  console.warn(
+    '[Store:AutoTabTitle] consume tab=' + tabId.slice(-8) +
+    ' type=' + toolType +
+    ' sid=' + sessionId.slice(0, 8) +
+    ' mode=' + pending.mode
+  );
   return true;
 };
 
@@ -239,16 +275,10 @@ interface Tab {
   groupId?: string; // One-level TabBar group membership. Separate from parentTabId (sub-agents).
   visualParentTabId?: string; // Visual-only tab nesting in TabBar. Never use for MCP sub-agents.
   isCollapsed?: boolean; // Collapsed tab — icon-only, for archiving completed sessions
-  claudeAgentSessionId?: string; // Claude Agent SDK session ID (for @claude:...@end orchestration)
-  claudeAgentStatus?: 'idle' | 'running' | 'done' | 'error' | 'summarizing'; // Claude Agent current status
   claudeActive?: boolean; // True if Claude CLI is running inside PTY (not just shell alive)
   claudeBusy?: boolean; // True if Claude CLI spinner is active (from claude:busy-state)
   aiBusy?: boolean; // True when this AI tab is actively streaming/thinking (Claude/SDK/Gemini/Codex)
   aiClosing?: boolean; // Short-lived UI state while close waits for graceful AI stop
-  claudeTaskCount?: number; // Number of completed MCP tasks (delegate/continue)
-  parentTabId?: string; // If this is a MCP sub-agent tab, points to parent (Gemini) tab
-  mcpTaskId?: string; // MCP task UUID assigned when delegate_to_claude created this sub-agent
-  interceptorState?: 'armed' | 'disarmed' | null; // Interceptor state for MCP response delivery
   // Claude SDK tab state
   // SDK turn-state. Splits the «loader is up» window into deterministic phases:
   //   fetching   — onNew fired, no SDK event yet (network + warm-up). Юзер видит «Connecting…»
@@ -448,6 +478,7 @@ interface WorkspaceStore {
   renameTab: (projectId: string, tabId: string, newName: string) => void;
   autoRenameTab: (tabId: string, newName: string, options?: { toolType?: 'claude' | 'gemini' | 'codex'; sessionId?: string; overrideManualName?: boolean; markNameSetManually?: boolean }) => boolean;
   setTabTitleNaming: (tabId: string, naming: boolean) => void;
+  getPendingAutoTabTitle: (tabId: string, toolType: AutoTabTitleTool, sessionId: string) => PendingAutoTabTitle | null;
   consumePendingAutoTabTitle: (tabId: string, toolType: AutoTabTitleTool, sessionId: string) => boolean;
 
   // Selection
@@ -464,6 +495,7 @@ interface WorkspaceStore {
   setTabSessionStatus: (projectId: string, tabId: string, status: string | null) => void;
   setTabCommandType: (tabId: string, commandType: CommandType) => void; // Also sets auto-color on first run
   markAiLaunchAutoTitle: (tabId: string, toolType: AutoTabTitleTool) => void;
+  markAiForkAutoTitle: (tabId: string, toolType: AutoTabTitleTool, sourceSessionId: string) => void;
   getAiLaunchSnapshot: (tabId: string) => AiLaunchSnapshot | null;
   clearAiLaunchSnapshot: (tabId: string, reason?: string) => void;
   rollbackUnmaterializedAiLaunch: (tabId: string, reason: string) => boolean;
@@ -503,17 +535,11 @@ interface WorkspaceStore {
   getCodexSessionId: (tabId: string) => string | null;
   updateCodexState: (tabId: string, state: Partial<Pick<Tab, 'codexModel' | 'codexEffort'>>) => void;
 
-  // Claude Agent orchestration
-  setClaudeAgentStatus: (tabId: string, status: 'idle' | 'running' | 'done' | 'error' | 'summarizing', sessionId?: string) => void;
   setClaudeActive: (tabId: string, alive: boolean) => void;
   setClaudeBusy: (tabId: string, busy: boolean) => void;
   setAiBusy: (tabId: string, busy: boolean) => void;
   setSdkProcessAlive: (tabId: string, alive: boolean) => void;
-  setInterceptorState: (tabId: string, state: 'armed' | 'disarmed' | null) => void;
 
-  // MCP sub-agent tab management
-  setTabParent: (tabId: string, parentTabId: string | undefined) => void;
-  getSubAgentTabs: (parentTabId: string) => Tab[];
   setViewingSubAgent: (tabId: string | null) => void;
   getEffectiveTabId: () => string | null;
 
@@ -634,9 +660,6 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     groupId: tab.groupId,
     visualParentTabId: tab.visualParentTabId,
     nameSetManually: tab.nameSetManually,
-    parentTabId: tab.parentTabId,
-    mcpTaskId: tab.mcpTaskId,
-    claudeTaskCount: tab.claudeTaskCount || 0,
     tabId: tab.id
   }));
   ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray, forceCleanup });
@@ -827,9 +850,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               visualParentTabId: savedTab.visualParentTabId,
               sessionStatus: savedTab.sessionStatus,
               nameSetManually: savedTab.nameSetManually,
-              parentTabId: savedTab.parentTabId,
-              mcpTaskId: savedTab.mcpTaskId,
-              claudeTaskCount: savedTab.claudeTaskCount || 0,
               restoreId: savedTab.tabId
             } as any);
             const stateWorkspace = get().openProjects.get(proj.projectId);
@@ -841,12 +861,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               ` workspaceTabs=${newWorkspace.tabs.size}` +
               ` stateWorkspaceTabs=${stateWorkspace?.tabs.size ?? -1}`
             );
-          }
-          for (const [, tab] of newWorkspace.tabs) {
-            if (tab.parentTabId) {
-              tab.claudeAgentStatus = 'done';
-              tab.claudeActive = false;
-            }
           }
         } else {
           console.warn(`[RestoreSession] noSavedTabs project=${restoreShortId(proj.projectId)} creatingDefault=true`);
@@ -1114,18 +1128,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               visualParentTabId: savedTab.visualParentTabId,
               sessionStatus: savedTab.sessionStatus,
               nameSetManually: savedTab.nameSetManually,
-              parentTabId: savedTab.parentTabId,
-              mcpTaskId: savedTab.mcpTaskId,
-              claudeTaskCount: savedTab.claudeTaskCount || 0,
               restoreId: savedTab.tabId
             } as any);
-          }
-          // After restore: set claudeAgentStatus for sub-agent tabs (not persisted in DB)
-          for (const [, tab] of newWorkspace.tabs) {
-            if (tab.parentTabId) {
-              tab.claudeAgentStatus = 'done';
-              tab.claudeActive = false; // Claude CLI not running after restore
-            }
           }
         } else {
           // Create default tab
@@ -1294,9 +1298,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       groupId: options?.isUtility ? undefined : options?.groupId,
       visualParentTabId: options?.isUtility ? undefined : (options as any)?.visualParentTabId,
       nameSetManually: (options as any)?.nameSetManually,
-      parentTabId: (options as any)?.parentTabId,
-      mcpTaskId: (options as any)?.mcpTaskId,
-      claudeTaskCount: (options as any)?.claudeTaskCount || 0,
       sessionStatus: (options as any)?.sessionStatus
     };
 
@@ -1933,6 +1934,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({ tabTitleNamingIds: next });
   },
 
+  getPendingAutoTabTitle: (tabId, toolType, sessionId) => {
+    return getPendingAutoTabTitle(tabId, toolType, sessionId);
+  },
+
   consumePendingAutoTabTitle: (tabId, toolType, sessionId) => {
     return consumePendingAutoTabTitle(tabId, toolType, sessionId);
   },
@@ -2087,7 +2092,25 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       return;
     }
     snap.autoTitleEligible = true;
-    console.warn('[Store:AiLaunchSnapshot] auto-title-eligible tab=' + tabId.slice(-8) + ' type=' + toolType);
+    snap.autoTitleMode = 'fresh';
+    delete snap.autoTitleSourceSessionId;
+    console.warn('[Store:AiLaunchSnapshot] auto-title-eligible tab=' + tabId.slice(-8) + ' type=' + toolType + ' mode=fresh');
+  },
+
+  markAiForkAutoTitle: (tabId, toolType, sourceSessionId) => {
+    const snap = aiLaunchSnapshots.get(tabId);
+    if (!snap || snap.sessionType !== toolType) {
+      console.warn('[Store:AiLaunchSnapshot] fork-auto-title-skip tab=' + tabId.slice(-8) + ' type=' + toolType + ' reason=no-matching-snapshot');
+      return;
+    }
+    snap.autoTitleEligible = true;
+    snap.autoTitleMode = 'fork';
+    snap.autoTitleSourceSessionId = sourceSessionId;
+    console.warn(
+      '[Store:AiLaunchSnapshot] auto-title-eligible tab=' + tabId.slice(-8) +
+      ' type=' + toolType +
+      ' mode=fork source=' + sourceSessionId.slice(0, 8)
+    );
   },
 
   clearAiLaunchSnapshot: (tabId, reason = 'materialized') => {
@@ -2620,10 +2643,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           tab.claudeSessionHistory = hist.slice(0, 5);
         }
 
-        if (reason === 'bridge') {
+        if (reason === 'bridge' || reason === 'fork') {
           const armSkipReason = getAutoTabTitleArmSkipReason(tabId, 'claude', prev, sessionId);
           if (armSkipReason === null) {
-            armPendingAutoTabTitle(tabId, 'claude', sessionId);
+            const snapshot = aiLaunchSnapshots.get(tabId);
+            armPendingAutoTabTitle(tabId, 'claude', sessionId, {
+              mode: snapshot?.autoTitleMode || 'fresh',
+              sourceSessionId: snapshot?.autoTitleSourceSessionId,
+            });
           } else {
             logAutoTabTitleArmSkip(tabId, 'claude', prev, sessionId, armSkipReason);
           }
@@ -2705,7 +2732,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         if (reason === 'detected') {
           const armSkipReason = getAutoTabTitleArmSkipReason(tabId, 'codex', prev, sessionId);
           if (armSkipReason === null) {
-            armPendingAutoTabTitle(tabId, 'codex', sessionId);
+            const snapshot = aiLaunchSnapshots.get(tabId);
+            armPendingAutoTabTitle(tabId, 'codex', sessionId, {
+              mode: snapshot?.autoTitleMode || 'fresh',
+              sourceSessionId: snapshot?.autoTitleSourceSessionId,
+            });
           } else {
             logAutoTabTitleArmSkip(tabId, 'codex', prev, sessionId, armSkipReason);
           }
@@ -2757,35 +2788,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
   },
 
-  // MCP sub-agent tab management
-  setTabParent: (tabId, parentTabId) => {
-    const { openProjects } = get();
-    for (const [, workspace] of openProjects) {
-      const tab = workspace.tabs.get(tabId);
-      if (tab) {
-        // Detach: undefined or empty string both clear the parent
-        tab.parentTabId = parentTabId || undefined;
-        set({ openProjects: new Map(openProjects) });
-        saveTabs(workspace.projectId, workspace.tabs);
-        return;
-      }
-    }
-  },
-
-  getSubAgentTabs: (parentTabId) => {
-    const { openProjects, activeProjectId } = get();
-    // Scope to active project only — don't return sub-agents from other projects
-    const workspace = activeProjectId ? openProjects.get(activeProjectId) : null;
-    if (!workspace) return [];
-    const result: Tab[] = [];
-    for (const [, tab] of workspace.tabs) {
-      if (tab.parentTabId === parentTabId) {
-        result.push(tab);
-      }
-    }
-    return result;
-  },
-
   setViewingSubAgent: (tabId) => {
     const { openProjects, activeProjectId } = get();
     const workspace = activeProjectId ? openProjects.get(activeProjectId) : null;
@@ -2804,24 +2806,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (subTab) return workspace.viewingSubAgentTabId;
     }
     return workspace.activeTabId;
-  },
-
-  // Claude Agent orchestration status
-  setClaudeAgentStatus: (tabId, status, sessionId) => {
-    const { openProjects } = get();
-    for (const [, workspace] of openProjects) {
-      const tab = workspace.tabs.get(tabId);
-      if (tab) {
-        tab.claudeAgentStatus = status;
-        if (sessionId) tab.claudeAgentSessionId = sessionId;
-        // Increment task counter on terminal states
-        if (status === 'done' || status === 'error') {
-          tab.claudeTaskCount = (tab.claudeTaskCount || 0) + 1;
-        }
-        set({ openProjects: new Map(openProjects) });
-        return;
-      }
-    }
   },
 
   setClaudeActive: (tabId, alive) => {
@@ -2868,19 +2852,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (tab) {
         if (tab.sdkProcessAlive === alive) return; // guard: no re-render if unchanged
         tab.sdkProcessAlive = alive;
-        set({ openProjects: new Map(openProjects) });
-        return;
-      }
-    }
-  },
-
-  setInterceptorState: (tabId: string, state: 'armed' | 'disarmed' | null) => {
-    const { openProjects } = get();
-    for (const [, workspace] of openProjects) {
-      const tab = workspace.tabs.get(tabId);
-      if (tab) {
-        if (tab.interceptorState === state) return; // Guard: no re-render if unchanged
-        tab.interceptorState = state;
         set({ openProjects: new Map(openProjects) });
         return;
       }
@@ -3176,8 +3147,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           url: tab.url, terminalId: tab.terminalId, terminalName: tab.terminalName,
           activeView: tab.activeView, createdAt: tab.createdAt, isCollapsed: tab.isCollapsed,
           groupId: tab.groupId, visualParentTabId: tab.visualParentTabId,
-          nameSetManually: tab.nameSetManually, parentTabId: tab.parentTabId,
-          mcpTaskId: tab.mcpTaskId, claudeTaskCount: tab.claudeTaskCount || 0, tabId: tab.id
+          nameSetManually: tab.nameSetManually, tabId: tab.id
         }));
         ipcRenderer.sendSync('project:save-tabs-sync', { projectId: workspace.projectId, tabs: tabsArray });
       }

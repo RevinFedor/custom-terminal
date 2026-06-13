@@ -610,11 +610,7 @@ class DatabaseManager {
         isCollapsed: t.is_collapsed === 1,
         groupId: t.tab_group_id || undefined,
         visualParentTabId: t.visual_parent_tab_id || undefined,
-        parentTabId: t.parent_tab_id || undefined,
         tabId: t.tab_id || undefined,
-        mcpTaskStartedAt: t.mcp_task_started_at || undefined,
-        mcpTaskId: t.mcp_task_id || undefined,
-        claudeTaskCount: t.claude_task_count || 0,
         sessionStatus: t.session_status || undefined,
         contextPct: (t.context_pct ?? undefined),
         cacheStats: (() => {
@@ -710,15 +706,6 @@ class DatabaseManager {
     }
   }
 
-  // Update mcp_task_started_at for a specific sub-agent tab (by tab_id)
-  setMcpTaskStartedAt(tabId, startedAt) {
-    try {
-      this.db.prepare('UPDATE tabs SET mcp_task_started_at = ? WHERE tab_id = ?').run(startedAt, tabId);
-    } catch (e) {
-      console.error('[DB] setMcpTaskStartedAt error:', e.message);
-    }
-  }
-
   createProject(projectPath) {
     const normalizedPath = path.resolve(projectPath);
     const folderName = path.basename(normalizedPath);
@@ -808,8 +795,6 @@ class DatabaseManager {
     const newTabIds = tabs.map(t => t.tabId).filter(Boolean);
 
     if (existingCount > 0 && newCount < existingCount - 2) {
-      const subAgentCount = tabs.filter(t => t.parentTabId).length;
-      const dbSubAgents = this.db.prepare('SELECT COUNT(*) as cnt FROM tabs WHERE project_id = ? AND parent_tab_id IS NOT NULL').get(projectId)?.cnt || 0;
       const existingRows = this.db.prepare('SELECT tab_id, name, command_type, tab_type FROM tabs WHERE project_id = ? ORDER BY position, tab_id').all(projectId);
       const incomingSet = new Set(newTabIds);
       const summarizeRows = (rows) => rows.slice(0, 20).map((row) => {
@@ -822,8 +807,8 @@ class DatabaseManager {
       const dbOnlyRows = existingRows.filter((row) => row.tab_id && !incomingSet.has(row.tab_id));
       console.warn(
         '[DB] saveTabs: WARNING — saving ' + newCount +
-        ' tabs (sub-agents: ' + subAgentCount + ') but DB has ' + existingCount +
-        ' (sub-agents: ' + dbSubAgents + '). Project: ' + projectId +
+        ' tabs but DB has ' + existingCount +
+        '. Project: ' + projectId +
         ' forceCleanup=' + forceCleanup +
         ' incoming=' + summarizeRows(tabs) +
         ' dbOnly=' + summarizeRows(dbOnlyRows)
@@ -871,8 +856,8 @@ class DatabaseManager {
 
     const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, parent_tab_id, tab_id, mcp_task_started_at, mcp_task_id, claude_task_count, session_status, claude_session_history, provider_state, context_pct, cache_stats)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, claude_session_history, provider_state, context_pct, cache_stats)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
@@ -914,7 +899,7 @@ class DatabaseManager {
         const cacheStatsJson = (tab.cacheStats && typeof tab.cacheStats === 'object')
           ? JSON.stringify(tab.cacheStats)
           : (cacheStatsSnapshot.has(tab.tabId) ? cacheStatsSnapshot.get(tab.tabId) : null);
-        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.codexSessionId || null, tab.codexModel || null, tab.codexEffort || null, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.parentTabId || null, tab.tabId || null, tab.mcpTaskStartedAt || null, tab.mcpTaskId || null, tab.claudeTaskCount || 0, tab.sessionStatus || null, historyJson, providerStateJson, ctxPct, cacheStatsJson);
+        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.codexSessionId || null, tab.codexModel || null, tab.codexEffort || null, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, historyJson, providerStateJson, ctxPct, cacheStatsJson);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set

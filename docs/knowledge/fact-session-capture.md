@@ -150,7 +150,6 @@ setActiveCommandType(tab.commandType || null);
 ### Когда используется Immediate Injection (Sniper не нужен)
 1. **History Restore:** `claudeSessionId` берется из БД.
 2. **Rollback / Fork:** ID новой сессии передается напрямую в `createTab()`.
-3. **Sub-agent Delegation:** При вызове `delegate_to_claude` с `session_id` идентификатор мгновенно прописывается в `bridgeKnownSessions`. Это критично для обхода фазы «Ожидания» и немедленной готовности Timeline. См. `knowledge/fact-mcp-delegation.md`.
 
 ### Результат
 Пользователь всегда видит корректный статус: AI запущен, но ID ещё не захвачен — жёлтый индикатор с пульсом.

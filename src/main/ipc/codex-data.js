@@ -223,6 +223,16 @@ function getSessionMeta(records) {
   return {};
 }
 
+function getTimelineSessionMeta(records) {
+  const meta = getSessionMeta(records);
+  return {
+    id: meta.id,
+    forked_from_id: meta.forked_from_id,
+    timestamp: meta.timestamp,
+    cwd: meta.cwd,
+  };
+}
+
 function getSessionMetas(records) {
   return records
     .filter((record) => record?.type === 'session_meta' && record.payload)
@@ -1028,6 +1038,7 @@ function register() {
       return {
         success: true,
         entries: buildCodexTimeline(loaded.records, sessionId),
+        sessionMeta: getTimelineSessionMeta(loaded.records),
         sessionBoundaries: [],
         claudeMemoryBoundaryUuid: null,
         filePath: loaded.filePath,

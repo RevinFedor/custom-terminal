@@ -221,9 +221,6 @@ const getGeminiSessionId = (tabId: string) => useWorkspaceStore.getState().getGe
 const getSetCodexSessionId = () => useWorkspaceStore.getState().setCodexSessionId;
 const getCodexSessionId = (tabId: string) => useWorkspaceStore.getState().getCodexSessionId(tabId);
 
-// Claude Agent orchestration status setter
-const getSetClaudeAgentStatus = () => useWorkspaceStore.getState().setClaudeAgentStatus;
-
 // Get setTabCommandType for auto-color and restart button visibility
 const getSetTabCommandType = () => useWorkspaceStore.getState().setTabCommandType;
 
@@ -289,6 +286,7 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
     case 'claude-fork':
       if (pendingAction.sessionId) {
         getSetTabCommandType()(tabId, 'claude');
+        useWorkspaceStore.getState().markAiForkAutoTitle(tabId, 'claude', pendingAction.sessionId);
         console.log('[RESTORE] 12. Sending IPC claude:run-command { command: "claude-f", forkSessionId:', pendingAction.sessionId, '}');
         ipcRenderer.send('claude:run-command', {
           tabId,
@@ -355,6 +353,7 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
     case 'codex-fork':
       if (pendingAction.sessionId) {
         getSetTabCommandType()(tabId, 'codex');
+        useWorkspaceStore.getState().markAiForkAutoTitle(tabId, 'codex', pendingAction.sessionId);
         const cwd = getTabCwd(tabId);
         console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex-f" }');
         ipcRenderer.send('codex:run-command', buildCodexRunPayload({
@@ -605,15 +604,6 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
   const terminalFontSize = useUIStore((state) => state.terminalFontSize);
   const historyPanelOpen = useUIStore((state) => state.historyPanelOpenTabs[tabId] ?? false);
   const workspaceView = useWorkspaceStore((state) => state.view);
-
-  // Claude Agent status for persistent banner
-  const claudeAgentStatus = useWorkspaceStore((state) => {
-    for (const [, workspace] of state.openProjects) {
-      const tab = workspace.tabs.get(tabId);
-      if (tab) return tab.claudeAgentStatus;
-    }
-    return undefined;
-  });
 
   // Prompt-queue overlay needs to know two things:
   //  - is this a supported AI tab? (Claude/Codex owners can receive queued prompts)
@@ -1256,22 +1246,6 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       });
     };
 
-    // Claude Agent orchestration: status updates from main process
-    const handleClaudeAgentStatus = (_: any, data: { tabId: string; status: string; sessionId?: string; error?: string }) => {
-      if (data.tabId !== tabId) return;
-      console.warn('[ClaudeAgent] status:', data.status, data.sessionId || '');
-      getSetClaudeAgentStatus()(tabId, data.status as any, data.sessionId);
-
-      // UX toasts so user knows what's happening
-      if (data.status === 'running') {
-        useUIStore.getState().showToast('Claude Agent: working...', 'info', 3000);
-      } else if (data.status === 'done') {
-        useUIStore.getState().showToast('Claude Agent: done, response pasted', 'success', 3000);
-      } else if (data.status === 'error') {
-        useUIStore.getState().showToast('Claude Agent: error — ' + (data.error || 'unknown'), 'error', 5000);
-      }
-    };
-
     // Register IPC listeners synchronously
     ipcRenderer.on('terminal:data', handleData);
     ipcRenderer.on('terminal:exit', handleExit);
@@ -1282,7 +1256,6 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     ipcRenderer.on('claude:bridge-update', handleBridgeUpdate);
     ipcRenderer.on('gemini:session-detected', handleGeminiSessionDetected);
     ipcRenderer.on('codex:session-detected', handleCodexSessionDetected);
-    ipcRenderer.on('claude-agent:status', handleClaudeAgentStatus);
 
     // Resize observer with Guard Clause (prevents WebGL accordion effect)
     const resizeObserver = new ResizeObserver((entries) => {
@@ -1381,34 +1354,6 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       term.loadAddon(new WebLinksAddon((event, uri) => {
         handleLinkActivation(event, uri, onLinkClickRef.current);
       }));
-
-      // UUID Link Provider — clickable Task IDs from MCP delegation
-      term.registerLinkProvider({
-        provideLinks(lineNumber: number, callback: (links: any[] | undefined) => void) {
-          const line = term.buffer.active.getLine(lineNumber - 1);
-          if (!line) { callback(undefined); return; }
-          const text = line.translateToString();
-          const links: any[] = [];
-          const re = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
-          let m;
-          while ((m = re.exec(text)) !== null) {
-            const uuid = m[0];
-            const startX = m.index + 1;
-            links.push({
-              range: {
-                start: { x: startX, y: lineNumber },
-                end: { x: startX + uuid.length, y: lineNumber },
-              },
-              text: uuid,
-              activate() {
-                console.log('[Link] UUID clicked:', uuid);
-                ipcRenderer.send('mcp:focus-task', uuid);
-              },
-            });
-          }
-          callback(links.length > 0 ? links : undefined);
-        },
-      });
 
       term.open(containerRef);
 
@@ -1694,6 +1639,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
                                 if (result.success) {
                                   console.log('[Claude Intercept] Forked to new session:', result.newSessionId);
                                   getSetTabCommandType()(tabId, 'claude'); // Set commandType for Timeline visibility
+                                  useWorkspaceStore.getState().markAiForkAutoTitle(tabId, 'claude', sourceSessionId);
                                   getSetClaudeSessionId()(tabId, result.newSessionId, 'fork');
                                   markPendingResume(tabId, result.newSessionId);
                                   let cmdLine = 'claude --dangerously-skip-permissions --resume ' + result.newSessionId;
@@ -1827,6 +1773,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             return false;
           }
           ipcRenderer.send('terminal:input', tabId, '\x15');
+          useWorkspaceStore.getState().markAiForkAutoTitle(tabId, 'codex', sourceSessionId);
           ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-f', sessionId: sourceSessionId, cwd }));
           return false;
         }
@@ -1955,7 +1902,6 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       ipcRenderer.removeListener('claude:bridge-update', handleBridgeUpdate);
       ipcRenderer.removeListener('gemini:session-detected', handleGeminiSessionDetected);
       ipcRenderer.removeListener('codex:session-detected', handleCodexSessionDetected);
-      ipcRenderer.removeListener('claude-agent:status', handleClaudeAgentStatus);
       // Close AI file watchers if active for this tab
       ipcRenderer.send('gemini:close-watcher', { tabId });
       ipcRenderer.send('codex:close-watcher', { tabId });
@@ -2076,34 +2022,6 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         term.loadAddon(new WebLinksAddon((event, uri) => {
           handleLinkActivation(event, uri, onLinkClickRef.current);
         }));
-
-        // UUID Link Provider — clickable Task IDs from MCP delegation
-        term.registerLinkProvider({
-          provideLinks(lineNumber: number, callback: (links: any[] | undefined) => void) {
-            const line = term.buffer.active.getLine(lineNumber - 1);
-            if (!line) { callback(undefined); return; }
-            const text = line.translateToString();
-            const links: any[] = [];
-            const re = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
-            let m;
-            while ((m = re.exec(text)) !== null) {
-              const uuid = m[0];
-              const startX = m.index + 1;
-              links.push({
-                range: {
-                  start: { x: startX, y: lineNumber },
-                  end: { x: startX + uuid.length, y: lineNumber },
-                },
-                text: uuid,
-                activate() {
-                  console.log('[Link] UUID clicked:', uuid);
-                  ipcRenderer.send('mcp:focus-task', uuid);
-                },
-              });
-            }
-            callback(links.length > 0 ? links : undefined);
-          },
-        });
 
         term.open(terminalRef.current);
 
@@ -2345,6 +2263,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             }
             ipcRenderer.send('terminal:input', tabId, '\x15');
             const cwd2 = getTabCwd(tabId);
+            useWorkspaceStore.getState().markAiForkAutoTitle(tabId, 'codex', sourceSessionId);
             ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-f', sessionId: sourceSessionId, cwd: cwd2 }));
             return false;
           }
@@ -2421,6 +2340,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
               if (result.success) {
                 console.log('[Claude Intercept] Forked to new session:', result.newSessionId);
                 getSetTabCommandType()(tabId, 'claude'); // Set commandType for Timeline visibility
+                useWorkspaceStore.getState().markAiForkAutoTitle(tabId, 'claude', sourceSessionId);
                 getSetClaudeSessionId()(tabId, result.newSessionId, 'fork');
                 markPendingResume(tabId, result.newSessionId);
                 let cmdLine = 'claude --dangerously-skip-permissions --resume ' + result.newSessionId;

@@ -892,86 +892,10 @@ function App() {
       });
     };
 
-    // MCP sub-agent tab creation (main process → renderer)
-    const handleMcpCreateSubAgent = async (_: any, data: { taskId: string; geminiTabId: string; cwd?: string }) => {
-      const state = useWorkspaceStore.getState();
-      const { openProjects } = state;
-
-      // Find the project that actually contains the Gemini tab (NOT activeProjectId —
-      // user may be viewing a different project when delegation happens)
-      let targetProjectId: string | null = null;
-      let workspace: any = null;
-      for (const [projId, ws] of openProjects) {
-        if (ws.tabs.has(data.geminiTabId)) {
-          targetProjectId = projId;
-          workspace = ws;
-          break;
-        }
-      }
-      if (!targetProjectId || !workspace) {
-        console.warn('[MCP:SubAgent] Gemini tab not found in any project:', data.geminiTabId);
-        ipcRenderer.send('mcp:sub-agent-tab-created', { error: 'Gemini tab not found in any open project' });
-        return;
-      }
-
-      // Use CWD from main process (reliable), fallback to Gemini tab or project path
-      const geminiTab = workspace.tabs.get(data.geminiTabId);
-      const cwd = data.cwd || geminiTab?.cwd || workspace.projectPath || '';
-
-      try {
-        const tabId = await state.createTab(targetProjectId, 'claude-sub', cwd, {
-          commandType: 'claude',
-          color: 'claude',
-          background: true,
-          parentTabId: data.geminiTabId,
-          mcpTaskId: data.taskId,
-          claudeSessionId: data.claudeSessionId || undefined,
-        } as any);
-
-        // Note: claudeActive will be set by mcp:claude-cli-active when Claude CLI actually launches
-        const createdTab = useWorkspaceStore.getState().openProjects.get(targetProjectId)?.tabs.get(tabId);
-        ipcRenderer.send('mcp:sub-agent-tab-created', { tabId, taskId: data.taskId, tabName: createdTab?.name || 'claude-sub' });
-      } catch (err: any) {
-        ipcRenderer.send('mcp:sub-agent-tab-created', { error: err.message });
-      }
-    };
-
-    // MCP rename sub-agent tab (main process → renderer)
-    const handleMcpRenameSubAgent = (_: any, data: { claudeTabId: string; name: string }) => {
-      const state = useWorkspaceStore.getState();
-      for (const [projId, ws] of state.openProjects) {
-        if (ws.tabs.has(data.claudeTabId)) {
-          state.renameTab(projId, data.claudeTabId, data.name);
-          break;
-        }
-      }
-    };
-
-    // MCP task status updates (main process → renderer): set claudeAgentStatus on sub-agent tabs
-    const handleMcpTaskStatus = (_: any, data: { taskId: string; claudeTabId: string; status: string }) => {
-      const state = useWorkspaceStore.getState();
-      const statusMap: Record<string, 'running' | 'done' | 'error' | 'idle'> = {
-        running: 'running',
-        completed: 'done',
-        error: 'error',
-        timeout: 'error',
-      };
-      const mapped = statusMap[data.status];
-      if (mapped && data.claudeTabId) {
-        state.setClaudeAgentStatus(data.claudeTabId, mapped);
-      }
-    };
-
     // PTY exit → Claude CLI is dead
     const handleTerminalExit = (_: any, tabId: string) => {
       const state = useWorkspaceStore.getState();
       state.setClaudeActive(tabId, false);
-    };
-
-    // Claude CLI launched/resumed in PTY (from main.js delegate/continue)
-    const handleClaudeCliActive = (_: any, data: { tabId: string; active: boolean }) => {
-      const state = useWorkspaceStore.getState();
-      state.setClaudeActive(data.tabId, data.active);
     };
 
     const applyClaudeVisualBusy = (tabId: string, busy: boolean) => {
@@ -1030,23 +954,6 @@ function App() {
       useWorkspaceStore.getState().setSdkProcessAlive(data.tabId, data.alive);
     };
 
-    // Interceptor state (armed/disarmed) for sub-agent response delivery
-    const handleInterceptorState = (_: any, data: { claudeTabId: string; state: 'armed' | 'disarmed' | null }) => {
-      const state = useWorkspaceStore.getState();
-      state.setInterceptorState(data.claudeTabId, data.state);
-    };
-
-    // MCP close sub-agent tab (main process → renderer, triggered by Gemini via close_sub_agent tool)
-    const handleMcpCloseSubAgent = (_: any, data: { claudeTabId: string }) => {
-      const state = useWorkspaceStore.getState();
-      for (const [projId, ws] of state.openProjects) {
-        if (ws.tabs.has(data.claudeTabId)) {
-          state.closeTab(projId, data.claudeTabId, { skipProcessCheck: true });
-          break;
-        }
-      }
-    };
-
     // Resolve projectId by walking openProjects.tabs.has(tabId). Used by
     // PTY-respawn paths that only have tabId+cwd (no projectId hint).
     const findProjectIdByTabId = (tabId: string): string | null => {
@@ -1055,30 +962,6 @@ function App() {
         if (ws.tabs.has(tabId)) return pid;
       }
       return null;
-    };
-
-    // MCP respawn PTY for dead sub-agent (continue_claude needs a live PTY)
-    const handleRespawnSubAgentPty = (_: any, data: { tabId: string; cwd: string }) => {
-      console.warn('[MCP:Respawn] Creating PTY for dead sub-agent tab:', data.tabId);
-      ipcRenderer.invoke('terminal:create', {
-        tabId: data.tabId,
-        projectId: findProjectIdByTabId(data.tabId),
-        cwd: data.cwd,
-        rows: 32,
-        cols: 96,
-      });
-    };
-
-    // Gemini auto-spawn: main process requests Gemini launch (adopt flow)
-    const handleGeminiAutoSpawn = (_: any, data: { tabId: string; cwd: string; yesMode: boolean }) => {
-      console.warn('[Adopt:AutoSpawn] Launching Gemini for tab:', data.tabId);
-      const store = useWorkspaceStore.getState();
-      store.setTabCommandType(data.tabId, 'gemini');
-      ipcRenderer.send('gemini:spawn-with-watcher', {
-        tabId: data.tabId,
-        cwd: data.cwd,
-        yesMode: data.yesMode,
-      });
     };
 
     // Terminal MCP: restart a terminal (re-create PTY with same tabId)
@@ -1758,17 +1641,9 @@ function App() {
 
     ipcRenderer.on('terminal:command-started', handleCommandStarted);
     ipcRenderer.on('terminal:command-finished', handleCommandFinished);
-    ipcRenderer.on('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
-    ipcRenderer.on('mcp:rename-sub-agent-tab', handleMcpRenameSubAgent);
-    ipcRenderer.on('mcp:task-status', handleMcpTaskStatus);
     ipcRenderer.on('terminal:exit', handleTerminalExit);
-    ipcRenderer.on('mcp:claude-cli-active', handleClaudeCliActive);
     ipcRenderer.on('claude:busy-state', handleClaudeBusyState);
     ipcRenderer.on('claude-sdk:process-state', handleSdkProcessState);
-    ipcRenderer.on('mcp:interceptor-state', handleInterceptorState);
-    ipcRenderer.on('mcp:close-sub-agent-tab', handleMcpCloseSubAgent);
-    ipcRenderer.on('mcp:respawn-sub-agent-pty', handleRespawnSubAgentPty);
-    ipcRenderer.on('gemini:auto-spawn', handleGeminiAutoSpawn);
 
     // Gemini busy state → project badge spinner
     const handleGeminiBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
@@ -1833,17 +1708,9 @@ function App() {
       ipcRenderer.removeListener('web:bridge-request', handleWebBridge);
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
-      ipcRenderer.removeListener('mcp:create-sub-agent-tab', handleMcpCreateSubAgent);
-      ipcRenderer.removeListener('mcp:rename-sub-agent-tab', handleMcpRenameSubAgent);
-      ipcRenderer.removeListener('mcp:task-status', handleMcpTaskStatus);
       ipcRenderer.removeListener('terminal:exit', handleTerminalExit);
-      ipcRenderer.removeListener('mcp:claude-cli-active', handleClaudeCliActive);
       ipcRenderer.removeListener('claude:busy-state', handleClaudeBusyState);
       ipcRenderer.removeListener('claude-sdk:process-state', handleSdkProcessState);
-      ipcRenderer.removeListener('mcp:interceptor-state', handleInterceptorState);
-      ipcRenderer.removeListener('mcp:close-sub-agent-tab', handleMcpCloseSubAgent);
-      ipcRenderer.removeListener('mcp:respawn-sub-agent-pty', handleRespawnSubAgentPty);
-      ipcRenderer.removeListener('gemini:auto-spawn', handleGeminiAutoSpawn);
       ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
       claudeSpinnerVisualIdleTimersRef.current.forEach((timer) => window.clearTimeout(timer));
       claudeSpinnerVisualIdleTimersRef.current.clear();

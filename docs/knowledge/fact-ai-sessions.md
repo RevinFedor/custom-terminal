@@ -9,7 +9,7 @@ Noted Terminal обеспечивает глубокую интеграцию с
 | :--- | :--- | :--- | :--- |
 | **Механизм Fork** | Resume UUID (через `PendingAction`) | **True Fork** (Клонирование JSON) | `codex-f` создаёт новый rollout, source id отслеживает watcher |
 | **Time Machine** | Нет (в планах) | **Есть** (Snapshots turns) | Нет, есть rollout compact/rollback markers |
-| **Захват ID** | Мгновенно (через `mcp:claude-cli-active` для субагентов или Sniper для обычных) | После 1-го сообщения (Sniper) | Из `session_meta.payload.id` в `~/.codex/sessions/.../rollout-*.jsonl` |
+| **Захват ID** | Sniper Watcher (после 1-го обмена) или StatusLine Bridge | После 1-го сообщения (Sniper) | Из `session_meta.payload.id` в `~/.codex/sessions/.../rollout-*.jsonl` |
 | **Хранение** | `~/.claude/projects/` | `~/.gemini/tmp/<hash>/` | `~/.codex/sessions/YYYY/MM/DD/` |
 | **История Minayu** | Нет | `~/.minayu/history/<id>/` | Нет |
 
@@ -52,4 +52,3 @@ Noted Terminal обеспечивает глубокую интеграцию с
     - **Loader state:** остановка процесса/секции сразу переводит карточку в in-place spinner до refresh. Это закрывает задержку между кликом и исчезновением процесса, когда OS ещё не успела убрать PID из списка.
     - **Performance guard:** внешний inventory процессов — не status polling табов. Dashboard делает один aggregate snapshot (`system:get-dashboard-processes`) из одного `ps` результата, owner/Codex/MCP/Electron Dev строятся из него же, CWD кэшируется по PID. Refresh идёт на mount/focus/visibility/terminal events и медленным visible-window интервалом; не возвращать пять отдельных IPC с `ps` каждые несколько секунд и не делать per-card `pgrep/ps`.
 - **PendingAction Pattern:** Очередь команд, выполняемых сразу после готовности Shell в новом табе. См. CLAUDE.md.
-- **Orchestration (Gemini → Claude):** Автоматический перехват паттерна `:::claude ... :::` из вывода Gemini для запуска Claude Agent SDK. См. [`fact-claude-agent-orchestration.md`](fact-claude-agent-orchestration.md). Также поддерживается полноценная делегация задач через MCP в реальные PTY-табы. См. [`fact-mcp-delegation.md`](fact-mcp-delegation.md).

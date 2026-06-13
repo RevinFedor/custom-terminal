@@ -6,11 +6,11 @@ MCP-сервер для управления терминальными вкла
 ## Архитектура
 
 ### Два MCP-сервера, один HTTP backend
-Проект использует два отдельных MCP-сервера:
-- `src/main/mcp-server.mjs` — Gemini→Claude delegation (sub-agents, history, status). Подробнее: [`fact-mcp-delegation.md`](fact-mcp-delegation.md).
-- `.claude/mcp/terminal-server.mjs` — Terminal Management (tabs, restart, run, output).
+Проект использует два отдельных MCP-сервера, и оба ходят в один и тот же main-process HTTP:
+- `.claude/mcp/terminal-server.mjs` — Terminal Management (tabs, restart, run, output). *Оператор*: что сейчас крутится, перезапустить/убить.
+- `~/.claude/mcp/overseer-server.mjs` — контроль сессий (чтение + редактирование истории через `/overseer/*` endpoints). *Историк/редактор*: что сессия сделала, прочитать/переписать транскрипт.
 
-Оба общаются с main process через один и тот же HTTP-сервер (`mcpHttpServer` на localhost). Порт обнаруживается через `~/.noted-terminal/mcp-port-<PID>`.
+Граница по blast radius: terminal MCP может убить dev-сервер, overseer MCP — переписать JSONL. Оба общаются с main process через один и тот же HTTP-сервер (`mcpHttpServer` на localhost). Порт обнаруживается через `~/.noted-terminal/mcp-port-<PID>` (см. [`fix-mcp-multi-instance.md`](fix-mcp-multi-instance.md)).
 
 ### Определение проекта
 MCP-сервер определяет проект через `process.cwd()` (как knowledge-server). Это позволяет одному серверу обслуживать любой проект без конфигурации. Main process находит проект в SQLite по path и отдаёт только его вкладки.
