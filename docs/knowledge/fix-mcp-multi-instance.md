@@ -28,6 +28,11 @@
 3. **Strategy 2 (Liveness Fallback):** Если дерево процессов недоступно, сканируются все `mcp-port-*` файлы. Выбирается самый свежий по `mtime`, чей процесс еще жив.
 4. **Strategy 3 (Backward Compat):** Попытка прочитать старый `mcp-port` (для плавного перехода).
 
+## Dashboard ownership поверх port-файлов
+Те же PID-based port files являются source of truth не только для MCP routing, но и для destructive UI в Dashboard. Если dev и production custom-terminal работают параллельно, проверка «процесс не принадлежит текущему renderer tabId» недостаточна: такой процесс может принадлежать соседнему живому instance и должен быть защищён.
+
+Dashboard поэтому строит карту владельцев из живых `mcp-port-<pid>` файлов, валидирует main PID и поднимается по parent chain Claude/Gemini/Codex/MCP процесса. Термин `external` в UI значит «не принадлежит ни одному живому custom-terminal instance». Для batch kill это критично: кнопка `external only` не должна закрывать вкладки dev из production и вкладки production из dev. Симптом старой логики — пользователь нажимает крестик в одном окне, а пропадают AI-процессы, открытые в другом окне.
+
 ## Invisible Intent: Почему не `execSync` в Main
 Согласно правилам `CLAUDE.md`, Main-процесс не должен блокироваться на системных вызовах. Поэтому тяжелая работа по обходу дерева процессов (`ps -p PID -o ppid=`) вынесена в `mcp-server.mjs`, который является независимым процессом Node.js.
 

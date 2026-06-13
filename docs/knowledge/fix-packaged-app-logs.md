@@ -21,6 +21,11 @@ const LOG_DIR = isDev
 - **Dev:** `<project_root>/logs/dev.log`
 - **Production:** `~/Library/Logs/noted-terminal/production.log`
 
+## Шрам: stdout EIO после закрытия parent terminal
+Если Electron dev-процесс пережил терминал, из которого был запущен, его stdout/stderr могут стать broken pipe. Обычный `console.log` в main process тогда падает с `Error: write EIO`, Electron показывает modal `A JavaScript error occurred in the main process`, и после нажатия OK модалка появляется снова на следующих логах. Для пользователя это выглядит как приложение, которое невозможно закрыть: одно и то же окно ошибки всплывает много раз подряд.
+
+Логирование main process не должно считать stdout надёжным транспортом. Любой wrapper вокруг `console.*` обязан ловить ошибки записи в stdout/stderr и деградировать в файл/тихий fallback, иначе диагностический лог сам становится crash-loop. Это особенно важно для Dashboard Stop dev-process flow: он существует именно для случая «parent terminal умер, Electron child остался жить».
+
 ## Build Optimization
 Чтобы итоговый пакет не содержал старых логов из папки разработки, в конфигурацию сборщика (`package.json`) добавлена фильтрация:
 ```json
