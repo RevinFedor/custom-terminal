@@ -89,6 +89,13 @@ interface LogicalLineSnapshot {
   cells: LogicalCell[];
 }
 
+interface CodexDraftState {
+  hasDraft: boolean | null;
+  preview: string;
+  source: string;
+  debug?: string;
+}
+
 function getLogicalLineSnapshotAt(buf: any, row: number): LogicalLineSnapshot {
   if (!buf || row < 0 || row >= buf.length) return { text: '', cells: [] };
   let start = row;
@@ -160,6 +167,16 @@ function extractCodexDraftFromLine(snapshotOrLine: LogicalLineSnapshot | string)
   return { hasDraft: null, preview: normalizedClean.trim().slice(0, 120) };
 }
 
+function describeCodexDraftProbeRow(buf: any, row: number): string {
+  if (!buf || row < 0 || row >= buf.length) return `row=${row}:out-of-range`;
+  const raw = String(buf.getLine(row)?.translateToString?.(true) || '').replace(/\s+/g, ' ').slice(0, 140);
+  const snapshot = getLogicalLineSnapshotAt(buf, row);
+  const parsed = extractCodexDraftFromLine(snapshot);
+  const text = snapshot.text.replace(/\s+/g, ' ').slice(0, 180);
+  const hasPrompt = /[›❯]/.test(snapshot.text);
+  return `row=${row}:prompt=${hasPrompt}:parsed=${parsed.hasDraft}:suffix=${parsed.sourceSuffix || ''}:raw=${JSON.stringify(raw)}:logical=${JSON.stringify(text)}`;
+}
+
 export const terminalRegistry = {
   /** Check if Gemini spinner (Braille characters) is visible on screen for a given tab */
   hasSpinnerOnScreen(tabId: string): boolean {
@@ -212,9 +229,9 @@ export const terminalRegistry = {
     return terminals.get(tabId);
   },
 
-  getCodexDraftState(tabId: string): { hasDraft: boolean | null; preview: string; source: string } {
+  getCodexDraftState(tabId: string): CodexDraftState {
     const terminal = terminals.get(tabId);
-    if (!terminal) return { hasDraft: null, preview: '', source: 'no-terminal' };
+    if (!terminal) return { hasDraft: null, preview: '', source: 'no-terminal', debug: 'reason=no-terminal' };
 
     const buf = terminal.buffer.active;
     const cursorRows = Array.from(new Set([
@@ -236,7 +253,23 @@ export const terminalRegistry = {
       if (parsed.hasDraft !== null) return { ...parsed, source: 'viewport:' + row + (parsed.sourceSuffix || '') };
     }
 
-    return { hasDraft: null, preview: '', source: 'unknown' };
+    const sampleRows = Array.from(new Set([
+      ...cursorRows,
+      ...Array.from({ length: Math.max(0, visibleEnd - visibleStart) }, (_, i) => visibleStart + i),
+    ])).filter((row) => row >= 0 && row < buf.length);
+    const debug = [
+      'reason=no-definitive-codex-composer-row',
+      `rows=${terminal.rows}`,
+      `cols=${terminal.cols}`,
+      `bufLength=${buf.length}`,
+      `baseY=${buf.baseY}`,
+      `cursorY=${buf.cursorY}`,
+      `viewportY=${buf.viewportY}`,
+      `visible=${visibleStart}-${visibleEnd}`,
+      `cursorRows=${cursorRows.join(',') || 'none'}`,
+      `samples=[${sampleRows.map((row) => describeCodexDraftProbeRow(buf, row)).join(' | ')}]`,
+    ].join(' ');
+    return { hasDraft: null, preview: '', source: 'unknown', debug };
   },
 
   updateViewport(tabId: string, top: number, bottom: number, total: number) {

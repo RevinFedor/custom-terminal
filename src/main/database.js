@@ -1011,6 +1011,22 @@ class DatabaseManager {
     this.db.prepare('DELETE FROM tab_history WHERE id = ?').run(id);
   }
 
+  updateTabHistoryTitle(id, name, nameSetManually = true) {
+    const cleanName = String(name || '').trim();
+    if (!cleanName) return false;
+    const info = this.db.prepare(
+      'UPDATE tab_history SET name = ?, name_set_manually = ? WHERE id = ?'
+    ).run(cleanName, nameSetManually ? 1 : 0, id);
+
+    // Title embeddings are keyed to the old name. Invalidate this row so the
+    // ProjectHome index button can rebuild a matching embedding later.
+    try {
+      this.db.prepare('DELETE FROM tab_history_title_index WHERE history_id = ?').run(id);
+    } catch (_) {}
+
+    return info.changes > 0;
+  }
+
   // ========== FAVORITES ==========
 
   addFavorite(projectId, tab) {

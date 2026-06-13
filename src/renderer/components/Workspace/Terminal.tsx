@@ -523,6 +523,10 @@ async function finalizeAiLaunchSnapshot(tabId: string) {
   }
 
   if (!tabInfo.sessionId) {
+    if (snapshot.sessionType === 'codex') {
+      console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=codex result=no-session-id → keep (watcher may still detect rollout)');
+      return;
+    }
     console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=' + snapshot.sessionType + ' result=no-session-id → rollback');
     store.rollbackUnmaterializedAiLaunch(tabId, 'no-session-id-after-finish');
     return;

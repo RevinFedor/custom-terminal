@@ -13,7 +13,7 @@ import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/prag
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, PanelLeft, Plus, StickyNote, RotateCw, Folder, ArrowUp, ArrowDown } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, PanelLeft, Plus, StickyNote, RotateCw, Folder, ArrowUp, ArrowDown, Square } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -29,7 +29,7 @@ const acquireForcedDragCursor = () => {
   forcedDragCursorStyleEl = document.createElement('style');
   forcedDragCursorStyleEl.setAttribute('data-tabbar-forced-drag-cursor', 'true');
   forcedDragCursorStyleEl.textContent = `
-    html, body, body * {
+    html, html *, body, body * {
       cursor: grabbing !important;
     }
   `;
@@ -133,6 +133,39 @@ type VerticalRowFlipRect = {
 const snapRect = (el: Element): RectSnap => {
   const r = el.getBoundingClientRect();
   return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, height: r.height, midY: r.top + r.height / 2 };
+};
+
+const shortDndId = (id?: string | null) => {
+  if (!id) return '-';
+  return id.length > 12 ? id.slice(-12) : id;
+};
+
+const summarizeVerticalGeometry = (geometry: VerticalDragGeometry | null) => {
+  if (!geometry) return 'none';
+  const keys = geometry.rows.map((row) => {
+    if (row.type === 'tab') return `tab:${shortDndId(row.tabId)}`;
+    return `group:${shortDndId(row.groupId)}(${row.tabRows.length})`;
+  });
+  return `rows=${geometry.rows.length} keys=${keys.join('>')} list=${Math.round(geometry.list.top)}..${Math.round(geometry.list.bottom)}`;
+};
+
+const summarizePreviewLayout = (preview: DragPreviewLayout | null) => {
+  if (!preview) return 'none';
+  const groups = Object.entries(preview.groupAssignments)
+    .map(([id, groupId]) => `${shortDndId(id)}=${shortDndId(groupId || null)}`)
+    .join(',');
+  const visual = Object.entries(preview.visualParentAssignments || {})
+    .map(([id, parentId]) => `${shortDndId(id)}=${shortDndId(parentId || null)}`)
+    .join(',');
+  const anchors = Object.entries(preview.groupAnchorAssignments || {})
+    .map(([id, anchorId]) => `${shortDndId(id)}=${shortDndId(anchorId || null)}`)
+    .join(',');
+  return [
+    `order=${preview.orderedIds.map(shortDndId).join('>')}`,
+    `groups=${groups || '-'}`,
+    `visual=${visual || '-'}`,
+    `anchors=${anchors || '-'}`,
+  ].join(' ');
 };
 
 // Status palette теперь динамическая: SessionStatusDef из useUIStore.
@@ -619,6 +652,7 @@ const TabItem = memo(({
   }, [tab.id, zone, index, projectId, isAdoptDrop, isHorizontal, groupId, groupIndex]);
 
   const [isHovered, setIsHovered] = useState(false);
+  const [isProcessStopHovered, setIsProcessStopHovered] = useState(false);
 
   // Settings → Размеры → ТАБЫ → Терминал. Геометрия каждой карточки таба.
   // Поднято в начало TabItem чтобы быть до объявления tabStyle ниже.
@@ -819,9 +853,82 @@ const TabItem = memo(({
   // position — left|right (юзер выбирает в Settings). Цвет полоски и shimmer
   // читаются через CSS-переменные на :root (App.tsx синхронизирует).
   const processBarPosition = useUIStore((s) => s.processBar.position);
+  const canStopDevProcessFromBar = isVerticalMode
+    && !isCollapsed
+    && verticalHasProcess
+    && commandType === 'devServer'
+    && !!onStop;
+  const processStopHoverActive = canStopDevProcessFromBar && isProcessStopHovered;
+  const processStopCmdHoverActive = processStopHoverActive && cmdPeekMode;
   // Settings → форма маркера статуса (круг или квадрат) + размер в px.
   const statusMarkerShape = useUIStore((s) => s.statusMarker.shape);
   const statusMarkerSize = useUIStore((s) => s.statusMarker.sizePx);
+  const visualStateLogRef = useRef<string>('');
+
+  useEffect(() => {
+    if (!canStopDevProcessFromBar || !isProcessStopHovered || isStopping) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'F7') return;
+      e.preventDefault();
+      e.stopPropagation();
+      onStop?.(tab.id);
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [canStopDevProcessFromBar, isProcessStopHovered, isStopping, onStop, tab.id]);
+
+  useEffect(() => {
+    const rendersProcessBar = isVerticalMode && !isCollapsed && (verticalHasProcess || verticalIsAiBusy);
+    const rendersShimmer = rendersProcessBar && verticalIsAiBusy;
+    const signature = [
+      isVerticalMode ? 1 : 0,
+      isCollapsed ? 1 : 0,
+      verticalHasProcess ? 1 : 0,
+      verticalIsAiBusy ? 1 : 0,
+      verticalIsAwaiting ? 1 : 0,
+      isTitleNaming ? 1 : 0,
+      processBarPosition,
+      tab.commandType || '',
+      tab.tabType || '',
+      tab.name || '',
+    ].join('|');
+    if (visualStateLogRef.current === signature) return;
+    visualStateLogRef.current = signature;
+    if (!rendersProcessBar && !isTitleNaming && !verticalIsAwaiting) return;
+    console.warn(
+      '[TabItem:VisualState]' +
+      ' tab=' + tab.id.slice(-8) +
+      ' cmd=' + (tab.commandType || 'none') +
+      ' type=' + (tab.tabType || 'terminal') +
+      ' vertical=' + isVerticalMode +
+      ' collapsed=' + isCollapsed +
+      ' hasProcess=' + hasProcess +
+      ' sdkProcess=' + sdkProcessAlive +
+      ' busy=' + isBusy +
+      ' awaiting=' + isAwaitingInput +
+      ' titleNaming=' + isTitleNaming +
+      ' processBar=' + rendersProcessBar +
+      ' shimmer=' + rendersShimmer +
+      ' position=' + processBarPosition +
+      ' name=' + JSON.stringify(tab.name)
+    );
+  }, [
+    isVerticalMode,
+    isCollapsed,
+    verticalHasProcess,
+    verticalIsAiBusy,
+    verticalIsAwaiting,
+    isTitleNaming,
+    processBarPosition,
+    tab.id,
+    tab.name,
+    tab.commandType,
+    tab.tabType,
+    hasProcess,
+    sdkProcessAlive,
+    isBusy,
+    isAwaitingInput,
+  ]);
 
   return (
     <div
@@ -900,6 +1007,59 @@ const TabItem = memo(({
                   {verticalIsAiBusy && <div className="tab-process-bar-ai-shimmer-overlay" />}
                 </div>
               )}
+              {canStopDevProcessFromBar && (
+                <Tooltip content={isStopping ? 'Stopping…' : 'Stop process (F7)'}>
+                <button
+                  type="button"
+                  data-no-tab-drag
+                  aria-label="Stop running dev process"
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }}
+                  onMouseEnter={() => setIsProcessStopHovered(true)}
+                  onMouseLeave={() => setIsProcessStopHovered(false)}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (!isStopping) onStop?.(tab.id);
+                  }}
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    bottom: 0,
+                    ...(processBarPosition === 'right' ? { right: 0 } : { left: '-2px' }),
+                    width: processStopCmdHoverActive ? 18 : 14,
+                    padding: 0,
+                    border: 'none',
+                    outline: 'none',
+                    background: processStopCmdHoverActive
+                      ? 'rgba(248, 113, 113, 0.18)'
+                      : (processStopHoverActive ? 'rgba(255,255,255,0.08)' : 'transparent'),
+                    color: processStopCmdHoverActive ? '#f87171' : 'rgba(255,255,255,0.72)',
+                    cursor: isStopping ? 'wait' : 'pointer',
+                    zIndex: 8,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    borderRadius: processBarPosition === 'right'
+                      ? `0 ${tabGeo.borderRadius}px ${tabGeo.borderRadius}px 0`
+                      : `${tabGeo.borderRadius}px 0 0 ${tabGeo.borderRadius}px`,
+                    boxShadow: processStopCmdHoverActive
+                      ? 'inset 0 0 0 1px rgba(248, 113, 113, 0.55), 0 0 10px rgba(248, 113, 113, 0.22)'
+                      : (processStopHoverActive ? 'inset 0 0 0 1px rgba(255,255,255,0.14)' : 'none'),
+                    opacity: processStopHoverActive ? 1 : 0,
+                    transition: 'opacity 120ms ease, width 120ms ease, background-color 120ms ease, box-shadow 120ms ease, color 120ms ease',
+                  }}
+                >
+                  {isStopping ? (
+                    <RotateCw size={9} className="animate-spin" aria-hidden />
+                  ) : (
+                    <Square size={8} fill="currentColor" strokeWidth={1.8} aria-hidden />
+                  )}
+                </button>
+                </Tooltip>
+              )}
               {/* AI-busy loader = the process-bar shimmer STRIP (left/right edge,
                   rendered above). The whole-tab background pulse was removed —
                   the loader is the переливающаяся полоска у края, not a tint of
@@ -948,8 +1108,8 @@ const TabItem = memo(({
                 />
               )}
               {/* В вертикальном режиме middle-click по всей вкладке = close tab (стандартное
-                  поведение TabItem root). Stop через middle-click недоступен — для остановки
-                  процесса юзер открывает ПКМ → Stop, либо использует кнопки InfoPanel. */}
+                  поведение TabItem root). Stop devServer живёт на edge-indicator:
+                  left-click по полоске процесса или F7 пока курсор на ней. */}
             </>
           )}
 
@@ -1368,7 +1528,7 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
     );
   }, [group.id, isEditing, projectId]);
 
-  const dragLiftActive = isDragging;
+  const dragLiftActive = isPressing || isDragging;
   const isCollapsed = !!group.collapsed;
   const iconAccentActive = isHovered || isIconHovered || isCollapsed || isFocused;
   const headerCursor = dragLiftActive ? 'grabbing' : 'pointer';
@@ -1425,6 +1585,7 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
         if (e.button !== 0) return;
         if ((e.target as HTMLElement).closest('[data-group-collapse-button]')) return;
         setIsPressing(true);
+        setBodyGrabbing();
       }}
       onClick={(e) => {
         if (isEditing) return;
@@ -1917,6 +2078,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const verticalMainListRef = useRef<HTMLDivElement>(null);
   const verticalRowFlipRectsRef = useRef<Map<string, VerticalRowFlipRect>>(new Map());
   const verticalRowAnimationsRef = useRef<Map<string, Animation>>(new Map());
+  const tabDndLogUntilRef = useRef(0);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
   const [titleRefreshInFlight, setTitleRefreshInFlight] = useState<Set<string>>(new Set());
   const tabTitleNamingIds = useWorkspaceStore((state) => state.tabTitleNamingIds);
@@ -2050,6 +2212,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   // Stable listeners — subscribe once, never re-create
   useEffect(() => {
     const handleCommandStarted = (_: any, { tabId }: { tabId: string }) => {
+      console.warn('[TabBar:ProcessStatus] tabId=' + tabId.slice(-8) + ' running=true source=command-started');
       setProcessStatus(prev => {
         const next = new Map(prev);
         next.set(tabId, true);
@@ -2058,6 +2221,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     };
 
     const handleCommandFinished = (_: any, { tabId }: { tabId: string }) => {
+      console.warn('[TabBar:ProcessStatus] tabId=' + tabId.slice(-8) + ' running=false source=command-finished');
       setProcessStatus(prev => {
         const next = new Map(prev);
         next.set(tabId, false);
@@ -2066,6 +2230,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     };
 
     const handleSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
+      console.warn('[TabBar:SessionStatus] tabId=' + data.tabId.slice(-8) + ' session=' + String(data.sessionId || '').slice(0, 8) + ' detected=true');
       setSessionStatus(prev => {
         const next = new Map(prev);
         next.set(data.tabId, true);
@@ -2104,6 +2269,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     };
 
     const handleGeminiBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
+      console.warn('[TabBar:GeminiBusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy);
       setGeminiBusyMap(prev => {
         if (prev.get(tabId) === busy) return prev;
         const next = new Map(prev);
@@ -2123,6 +2289,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     };
 
     const handlePasteBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
+      console.warn('[TabBar:PasteBusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy);
       setPasteBusyMap(prev => {
         if (prev.get(tabId) === busy) return prev;
         const next = new Map(prev);
@@ -2298,8 +2465,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       }
     }
 
-    return { list: snapRect(scroller), rows };
-  }, [isVerticalLayout]);
+    const geometry = { list: snapRect(scroller), rows };
+    console.log(`[TabDnd:capture] project=${shortDndId(projectId)} ${summarizeVerticalGeometry(geometry)}`);
+    return geometry;
+  }, [isVerticalLayout, projectId]);
 
   // Tab adoption (Gemini → Claude sub-agent) was removed; no drop is an adopt target.
   const isAdoptDropTarget = useCallback((_sourceData: DragData, _targetData: any): boolean => false, []);
@@ -2482,6 +2651,9 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     }
 
     if (sourceData.type === 'TAB_GROUP') {
+      if (targetData?.type === 'EMPTY_ZONE') {
+        return makePreview(insertAt(withoutSource, sourceIds, withoutSource.length));
+      }
       const targetIndex = indexAtFlatPosition(flatIndexFromY());
       return makePreview(insertAt(withoutSource, sourceIds, targetIndex));
     }
@@ -2490,6 +2662,11 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       for (const id of sourceIds) groupAssignments[id] = null;
       clearSelectedVisualParents();
       return makePreview(insertAt(withoutSource, sourceIds, indexAtFlatPosition(flatIndex)));
+    };
+    const assignFlatEnd = () => {
+      for (const id of sourceIds) groupAssignments[id] = null;
+      clearSelectedVisualParents();
+      return makePreview(insertAt(withoutSource, sourceIds, withoutSource.length));
     };
     const assignGroup = (groupId: string, memberIndex: number, rowIndex: number) => {
       for (const id of sourceIds) groupAssignments[id] = groupId;
@@ -2527,6 +2704,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       if (lastRow?.type === 'group' && lastRow.tabRows.length > 0 && lastRow.tabRows.every(tabRow => sourceSet.has(tabRow.tabId))) {
         return assignGroup(lastRow.groupId, 0, geometry.rows.length - 1);
       }
+      return assignFlatEnd();
     }
 
     for (let rowIndex = 0; rowIndex < geometry.rows.length; rowIndex += 1) {
@@ -2594,6 +2772,14 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       onDragStart({ source }) {
         const sourceData = source.data as DragData;
         verticalDragGeometryRef.current = sourceData.projectId === projectId ? captureVerticalDragGeometry() : null;
+        tabDndLogUntilRef.current = performance.now() + 5000;
+        console.log(
+          `[TabDnd:start] project=${shortDndId(projectId)}` +
+          ` sourceType=${sourceData.type}` +
+          ` source=${shortDndId(sourceData.type === 'TAB' ? sourceData.id : sourceData.groupId)}` +
+          ` sourceProject=${shortDndId(sourceData.projectId || null)}` +
+          ` geometry=${summarizeVerticalGeometry(verticalDragGeometryRef.current)}`
+        );
       },
       onDrag({ source, location }) {
         const target = location.current.dropTargets[0];
@@ -2602,6 +2788,16 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         const key = preview ? JSON.stringify(preview) : '';
         if (key !== dragPreviewKeyRef.current) {
           dragPreviewKeyRef.current = key;
+          tabDndLogUntilRef.current = performance.now() + 5000;
+          const sourceData = source.data as DragData;
+          console.log(
+            `[TabDnd:preview] project=${shortDndId(projectId)}` +
+            ` sourceType=${sourceData.type}` +
+            ` source=${shortDndId(sourceData.type === 'TAB' ? sourceData.id : sourceData.groupId)}` +
+            ` x=${Math.round(input.clientX)} y=${Math.round(input.clientY)}` +
+            ` target=${target?.data?.type || 'none'}` +
+            ` ${summarizePreviewLayout(preview)}`
+          );
           setDragPreview(preview);
         }
       },
@@ -2612,6 +2808,15 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         const input = location.current.input;
 
         const preview = resolveStaticVerticalPreview(sourceData, input.clientX, input.clientY, targetData);
+        tabDndLogUntilRef.current = performance.now() + 5000;
+        console.log(
+          `[TabDnd:drop] project=${shortDndId(projectId)}` +
+          ` sourceType=${sourceData.type}` +
+          ` source=${shortDndId(sourceData.type === 'TAB' ? sourceData.id : sourceData.groupId)}` +
+          ` x=${Math.round(input.clientX)} y=${Math.round(input.clientY)}` +
+          ` target=${targetData?.type || 'none'}` +
+          ` ${summarizePreviewLayout(preview)}`
+        );
         if (preview) {
           applyTabLayout(
             projectId,
@@ -2785,44 +2990,74 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     }
 
     const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-    if (!reduceMotion) {
-      for (const row of rows) {
-        const key = row.dataset.verticalRowKey;
-        if (!key) continue;
-        const prev = verticalRowFlipRectsRef.current.get(key);
-        const next = nextRects.get(key);
-        if (!prev || !next) continue;
-
-        const dx = prev.left - next.left;
-        const dy = prev.top - next.top;
-        if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) continue;
-
-        const previousAnimation = verticalRowAnimationsRef.current.get(key);
-        previousAnimation?.cancel();
-
-        row.style.willChange = 'transform';
-        const animation = row.animate(
-          [
-            { transform: `translate3d(${dx}px, ${dy}px, 0)` },
-            { transform: 'translate3d(0, 0, 0)' },
-          ],
-          {
-            duration: dragPreview ? 118 : 145,
-            easing: 'cubic-bezier(0.16, 1, 0.3, 1)',
-          }
-        );
-        verticalRowAnimationsRef.current.set(key, animation);
-        animation.onfinish = () => {
-          if (verticalRowAnimationsRef.current.get(key) !== animation) return;
-          row.style.willChange = '';
-          verticalRowAnimationsRef.current.delete(key);
-        };
-        animation.oncancel = () => {
-          if (verticalRowAnimationsRef.current.get(key) !== animation) return;
-          row.style.willChange = '';
-          verticalRowAnimationsRef.current.delete(key);
-        };
+    let animatedCount = 0;
+    let missingPrevCount = 0;
+    let zeroDeltaCount = 0;
+    let cancelledCount = 0;
+    const animatedKeys: string[] = [];
+    for (const row of rows) {
+      const key = row.dataset.verticalRowKey;
+      if (!key) continue;
+      const prev = verticalRowFlipRectsRef.current.get(key);
+      const next = nextRects.get(key);
+      if (!prev || !next) {
+        if (!prev) missingPrevCount += 1;
+        continue;
       }
+
+      const dx = prev.left - next.left;
+      const dy = prev.top - next.top;
+      if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) {
+        zeroDeltaCount += 1;
+        continue;
+      }
+
+      const previousAnimation = verticalRowAnimationsRef.current.get(key);
+      if (previousAnimation) {
+        cancelledCount += 1;
+        previousAnimation.cancel();
+      }
+
+      row.style.willChange = 'transform';
+      const animation = row.animate(
+        [
+          { transform: `translate3d(${dx}px, ${dy}px, 0)` },
+          { transform: 'translate3d(0, 0, 0)' },
+        ],
+        {
+          duration: reduceMotion ? 90 : (dragPreview ? 118 : 145),
+          easing: 'cubic-bezier(0.16, 1, 0.3, 1)',
+        }
+      );
+      verticalRowAnimationsRef.current.set(key, animation);
+      animatedCount += 1;
+      animatedKeys.push(`${key}:dx=${Math.round(dx)}:dy=${Math.round(dy)}`);
+      animation.onfinish = () => {
+        if (verticalRowAnimationsRef.current.get(key) !== animation) return;
+        row.style.willChange = '';
+        verticalRowAnimationsRef.current.delete(key);
+      };
+      animation.oncancel = () => {
+        if (verticalRowAnimationsRef.current.get(key) !== animation) return;
+        row.style.willChange = '';
+        verticalRowAnimationsRef.current.delete(key);
+      };
+    }
+
+    if (performance.now() < tabDndLogUntilRef.current) {
+      console.log(
+        `[TabDnd:flip] project=${shortDndId(projectId)}` +
+        ` rows=${rows.length}` +
+        ` prev=${verticalRowFlipRectsRef.current.size}` +
+        ` next=${nextRects.size}` +
+        ` reduceMotion=${!!reduceMotion}` +
+        ` dragPreview=${!!dragPreview}` +
+        ` animated=${animatedCount}` +
+        ` zero=${zeroDeltaCount}` +
+        ` missingPrev=${missingPrevCount}` +
+        ` cancelled=${cancelledCount}` +
+        ` keys=${animatedKeys.slice(0, 12).join('|') || '-'}`
+      );
     }
 
     for (const key of Array.from(verticalRowAnimationsRef.current.keys())) {

@@ -38,6 +38,15 @@ export interface RefreshTabTitleResult {
   error?: string;
 }
 
+export interface GenerateTabTitleFromSessionOptions {
+  toolType: 'claude' | 'codex';
+  sessionId: string;
+  cwd?: string;
+  tabId?: string;
+  source: string;
+  reason: string;
+}
+
 export function isEligibleTabTitleEntry(entry: TabTitleSourceEntry): boolean {
   if (entry.type !== 'user' || entry.isCompactSummary) return false;
   const text = String(entry.content || '').trim();
@@ -167,6 +176,14 @@ export async function generateTitleFromPromptWithConfig(
   const model = promptConfig?.model || 'gemini-3-flash-preview';
   const thinkingLevel = promptConfig?.thinkingLevel || 'NONE';
   const systemPrompt = await buildSystemPrompt(promptConfig, options.fallbackPrompt, options.logPrefix);
+  console.warn(
+    '[' + options.logPrefix + '] request' +
+    ' task=' + (options.taskType || options.logPrefix) +
+    ' promptId=' + (promptConfig?.id || options.promptId || 'none') +
+    ' model=' + model +
+    ' thinking=' + thinkingLevel +
+    ' sourceChars=' + userPrompt.length
+  );
   const requestBody: any = {
     contents: [{
       role: 'user',
@@ -224,6 +241,17 @@ export async function generateTitleFromPromptWithConfig(
       .join('');
     await logUsage('success', data?.usageMetadata || {}, raw);
     const title = (options.sanitize || sanitizeGeneratedTabTitle)(raw);
+    console.warn(
+      '[' + options.logPrefix + '] result' +
+      ' task=' + (options.taskType || options.logPrefix) +
+      ' status=success' +
+      ' rawChars=' + raw.length +
+      ' output=' + JSON.stringify(title || null) +
+      ' promptTokens=' + Number(data?.usageMetadata?.promptTokenCount || 0) +
+      ' candidateTokens=' + Number(data?.usageMetadata?.candidatesTokenCount || 0) +
+      ' thoughtTokens=' + Number(data?.usageMetadata?.thoughtsTokenCount || 0) +
+      ' totalTokens=' + Number(data?.usageMetadata?.totalTokenCount || 0)
+    );
     return title || null;
   } catch (err: any) {
     console.warn('[' + options.logPrefix + '] request failed:', err?.message || err);
@@ -251,6 +279,39 @@ export async function generateTimelinePromptSummaryFromPrompt(userPrompt: string
     promptId: PROMPT_SUMMARY_PROMPT_ID,
     sanitize: sanitizeGeneratedPromptSummary,
   });
+}
+
+export async function generateTabTitleFromSession(options: GenerateTabTitleFromSessionOptions): Promise<RefreshTabTitleResult> {
+  const sessionId = String(options.sessionId || '').trim();
+  if (!sessionId) return { ok: false, reason: 'no-session' };
+
+  const channel = options.toolType === 'codex' ? 'codex:get-timeline' : 'claude:get-timeline';
+  const timelineResult = await ipcRenderer.invoke(channel, {
+    sessionId,
+    cwd: options.cwd,
+    source: options.source,
+    reason: options.reason,
+    tabId: options.tabId,
+    visible: null,
+  });
+
+  if (!timelineResult?.success) {
+    return {
+      ok: false,
+      reason: 'timeline-error',
+      error: timelineResult?.error || 'Timeline unavailable',
+    };
+  }
+
+  const entries = Array.isArray(timelineResult.entries) ? timelineResult.entries : [];
+  const firstUserPrompt = entries.find(isEligibleTabTitleEntry);
+  if (!firstUserPrompt?.content) return { ok: false, reason: 'no-user-prompt' };
+
+  const promptConfig = usePromptsStore.getState().getPromptById(TAB_TITLE_PROMPT_ID);
+  const title = await generateTabTitleFromPrompt(trimTabTitlePrompt(firstUserPrompt.content), promptConfig);
+  if (!title) return { ok: false, reason: 'generation-failed' };
+
+  return { ok: true, title };
 }
 
 export async function refreshGeneratedTabTitle(
@@ -291,32 +352,17 @@ export async function refreshGeneratedTabTitle(
   if (!toolType) return { ok: false, reason: 'unsupported-tab' };
   if (!sessionId) return { ok: false, reason: 'no-session' };
 
-  const channel = toolType === 'codex' ? 'codex:get-timeline' : 'claude:get-timeline';
-  const timelineResult = await ipcRenderer.invoke(channel, {
+  const result = await generateTabTitleFromSession({
+    toolType,
     sessionId,
     cwd: tab.cwd,
     source: 'TabTitle.refreshGeneratedTabTitle',
     reason: options.overrideManualName ? 'context-menu' : 'auto',
     tabId,
-    visible: null,
   });
+  if (!result.ok || !result.title) return result;
 
-  if (!timelineResult?.success) {
-    return {
-      ok: false,
-      reason: 'timeline-error',
-      error: timelineResult?.error || 'Timeline unavailable',
-    };
-  }
-
-  const entries = Array.isArray(timelineResult.entries) ? timelineResult.entries : [];
-  const firstUserPrompt = entries.find(isEligibleTabTitleEntry);
-  if (!firstUserPrompt?.content) return { ok: false, reason: 'no-user-prompt' };
-
-  const promptConfig = usePromptsStore.getState().getPromptById(TAB_TITLE_PROMPT_ID);
-  const title = await generateTabTitleFromPrompt(trimTabTitlePrompt(firstUserPrompt.content), promptConfig);
-  if (!title) return { ok: false, reason: 'generation-failed' };
-
+  const title = result.title;
   const renamed = useWorkspaceStore.getState().autoRenameTab(tabId, title, {
     toolType,
     sessionId,

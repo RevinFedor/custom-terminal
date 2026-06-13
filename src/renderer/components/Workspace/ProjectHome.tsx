@@ -50,7 +50,12 @@ import { useUIStore } from '../../store/useUIStore';
 import { useCmdKey, useCmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import TabPreviewPopover from './TabPreviewPopover';
 import { Virtuoso } from 'react-virtuoso';
-import { FolderOpen, Clock, Trash2, Pencil, Search, Database, Loader2 } from 'lucide-react';
+import { FolderOpen, Clock, Trash2, Pencil, Search, Database, Loader2, RotateCw } from 'lucide-react';
+import {
+  generateTabTitleFromSession,
+  refreshGeneratedTabTitle,
+  type RefreshTabTitleReason,
+} from '../../utils/generateTabTitle';
 
 // Tooltip is still used for the small icon buttons in the project header
 // (Select/Change directory, Rename project). Cards themselves don't use it —
@@ -214,6 +219,45 @@ function normalizeSearchText(value: string): string {
   return value.toLocaleLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+function tabTitleRefreshErrorText(reason?: RefreshTabTitleReason, error?: string): string {
+  switch (reason) {
+    case 'unsupported-tab':
+      return 'Обновление названия доступно для Claude/Codex';
+    case 'no-session':
+      return 'У сессии нет ID';
+    case 'no-user-prompt':
+      return 'Не найдено пользовательское сообщение';
+    case 'generation-failed':
+      return 'Gemini не вернул название';
+    case 'timeline-error':
+      return error || 'Не удалось прочитать Timeline';
+    case 'rename-skipped':
+      return 'Название не изменилось';
+    case 'tab-not-found':
+      return 'Вкладка не найдена';
+    case 'manual-name':
+      return 'Название задано вручную';
+    default:
+      return 'Не удалось обновить название';
+  }
+}
+
+function getHistoryTitleTarget(entry: TabHistoryEntry): { toolType: 'claude' | 'codex'; sessionId: string } | null {
+  if (entry.command_type === 'codex' && entry.codex_session_id) {
+    return { toolType: 'codex', sessionId: entry.codex_session_id };
+  }
+  if (entry.command_type === 'claude' && entry.claude_session_id) {
+    return { toolType: 'claude', sessionId: entry.claude_session_id };
+  }
+  if (entry.codex_session_id) {
+    return { toolType: 'codex', sessionId: entry.codex_session_id };
+  }
+  if (entry.claude_session_id) {
+    return { toolType: 'claude', sessionId: entry.claude_session_id };
+  }
+  return null;
+}
+
 // Color configs matching TabBar
 const TAB_COLORS: Record<TabColor, { bgColor: string; borderColor: string }> = {
   default: { bgColor: 'rgba(255,255,255,0.05)', borderColor: '#666' },
@@ -265,6 +309,8 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const project = useProjectsStore((state) => state.projects[projectId]);
   const updateProject = useProjectsStore((state) => state.updateProject);
   const showToast = useUIStore((state) => state.showToast);
+  const tabTitleNamingIds = useWorkspaceStore((state) => state.tabTitleNamingIds);
+  const setTabTitleNaming = useWorkspaceStore((state) => state.setTabTitleNaming);
   // Status-marker palette + shape/size. Granular selectors — re-rendered только когда
   // юзер правит палитру в SettingsModal, не на каждый closed-tab card flip.
   const sessionStatuses = useUIStore((s) => s.sessionStatuses);
@@ -282,6 +328,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const [titleSearchError, setTitleSearchError] = useState<string | null>(null);
   const [titleIndexStats, setTitleIndexStats] = useState<TabTitleIndexStats | null>(null);
   const [titleIndexing, setTitleIndexing] = useState(false);
+  const [titleRefreshInFlight, setTitleRefreshInFlight] = useState<Set<string>>(new Set());
   const [titleIndexProgress, setTitleIndexProgress] = useState<{ current: number; total: number } | null>(null);
   const [visibleRange, setVisibleRange] = useState<{ startIndex: number; endIndex: number }>({ startIndex: 0, endIndex: 0 });
   const historyLoadProjectRef = useRef<string | null>(null);
@@ -848,6 +895,103 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     }
   }, [projectId]);
 
+  const setTitleRefreshKey = useCallback((key: string, active: boolean) => {
+    setTitleRefreshInFlight(prev => {
+      const has = prev.has(key);
+      if (has === active) return prev;
+      const next = new Set(prev);
+      if (active) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  }, []);
+
+  const handleRefreshActiveTabTitle = useCallback(async (tabId: string) => {
+    const key = `tab:${tabId}`;
+    if (titleRefreshInFlight.has(key) || tabTitleNamingIds.has(tabId)) {
+      showToast('Название уже обновляется', 'info');
+      return;
+    }
+
+    setTitleRefreshKey(key, true);
+    setTabTitleNaming(tabId, true);
+
+    try {
+      const result = await refreshGeneratedTabTitle(tabId, {
+        overrideManualName: true,
+        markNameSetManually: true,
+      });
+      if (result.ok) {
+        showToast(`Название обновлено: ${result.title}`, 'success');
+      } else {
+        showToast(tabTitleRefreshErrorText(result.reason, result.error), result.reason === 'rename-skipped' ? 'info' : 'warning');
+      }
+    } catch (err: any) {
+      console.warn('[ProjectHome:RefreshTabTitle] failed tab=' + tabId.slice(-8) + ': ' + (err?.message || String(err)));
+      showToast('Не удалось обновить название', 'error');
+    } finally {
+      setTitleRefreshKey(key, false);
+      setTabTitleNaming(tabId, false);
+      setHomeContextMenu(null);
+    }
+  }, [setTabTitleNaming, setTitleRefreshKey, showToast, tabTitleNamingIds, titleRefreshInFlight]);
+
+  const handleRefreshHistoryTitle = useCallback(async (entry: TabHistoryEntry) => {
+    const target = getHistoryTitleTarget(entry);
+    if (!target) {
+      showToast('Обновление названия доступно для Claude/Codex', 'warning');
+      setHomeContextMenu(null);
+      return;
+    }
+
+    const key = `history:${entry.id}`;
+    if (titleRefreshInFlight.has(key)) {
+      showToast('Название уже обновляется', 'info');
+      return;
+    }
+
+    setTitleRefreshKey(key, true);
+
+    try {
+      const result = await generateTabTitleFromSession({
+        toolType: target.toolType,
+        sessionId: target.sessionId,
+        cwd: entry.cwd,
+        source: 'ProjectHome.refreshHistoryTitle',
+        reason: 'history-context-menu',
+      });
+      if (!result.ok || !result.title) {
+        showToast(tabTitleRefreshErrorText(result.reason, result.error), result.reason === 'rename-skipped' ? 'info' : 'warning');
+        return;
+      }
+
+      const update = await ipcRenderer.invoke('project:update-tab-history-title', {
+        id: entry.id,
+        name: result.title,
+        nameSetManually: true,
+      });
+      if (!update?.success) {
+        showToast('Не удалось сохранить название', 'error');
+        return;
+      }
+
+      setHistory(prev => prev.map(item => (
+        item.id === entry.id ? { ...item, name: result.title! } : item
+      )));
+      setSemanticResults(prev => prev.map(item => (
+        item.id === entry.id ? { ...item, name: result.title! } : item
+      )));
+      refreshTitleIndexStats();
+      showToast(`Название обновлено: ${result.title}`, 'success');
+    } catch (err: any) {
+      console.warn('[ProjectHome:RefreshHistoryTitle] failed historyId=' + entry.id + ': ' + (err?.message || String(err)));
+      showToast('Не удалось обновить название', 'error');
+    } finally {
+      setTitleRefreshKey(key, false);
+      setHomeContextMenu(null);
+    }
+  }, [refreshTitleIndexStats, setTitleRefreshKey, showToast, titleRefreshInFlight]);
+
   useEffect(() => {
     if (!isLoaded) return;
     refreshTitleIndexStats();
@@ -1341,6 +1485,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
               const tabId = homeContextMenu.itemId as string;
               const tab = workspace.tabs.get(tabId);
               if (!tab) return null;
+              const refreshing = titleRefreshInFlight.has(`tab:${tabId}`) || tabTitleNamingIds.has(tabId);
               return (
                 <>
                   <button
@@ -1362,6 +1507,22 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                     }}
                   >
                     Add to Favorites
+                  </button>
+                  <button
+                    className={`w-full text-left px-4 py-1.5 text-[13px] flex items-center gap-2 ${
+                      refreshing
+                        ? 'text-[#777] cursor-default'
+                        : 'text-[#ccc] hover:bg-white/10 cursor-pointer'
+                    }`}
+                    disabled={refreshing}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (refreshing) return;
+                      void handleRefreshActiveTabTitle(tabId);
+                    }}
+                  >
+                    <RotateCw size={12} className={refreshing ? 'text-[#777] animate-spin' : 'text-[#888]'} />
+                    {refreshing ? 'Название обновляется...' : 'Обновить название'}
                   </button>
                   <div className="my-1 border-t border-[#444]" />
                   <button
@@ -1415,6 +1576,8 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
               const histId = homeContextMenu.itemId as number;
               const entry = history.find(h => h.id === histId);
               if (!entry) return null;
+              const canRefreshTitle = !!getHistoryTitleTarget(entry);
+              const refreshing = titleRefreshInFlight.has(`history:${histId}`);
               return (
                 <>
                   <button
@@ -1437,6 +1600,24 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                   >
                     Add to Favorites
                   </button>
+                  {canRefreshTitle && (
+                    <button
+                      className={`w-full text-left px-4 py-1.5 text-[13px] flex items-center gap-2 ${
+                        refreshing
+                          ? 'text-[#777] cursor-default'
+                          : 'text-[#ccc] hover:bg-white/10 cursor-pointer'
+                      }`}
+                      disabled={refreshing}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (refreshing) return;
+                        void handleRefreshHistoryTitle(entry);
+                      }}
+                    >
+                      <RotateCw size={12} className={refreshing ? 'text-[#777] animate-spin' : 'text-[#888]'} />
+                      {refreshing ? 'Название обновляется...' : 'Обновить название'}
+                    </button>
+                  )}
                   <div className="my-1 border-t border-[#444]" />
                   <button
                     className="w-full text-left px-4 py-1.5 text-[13px] text-[#f87171] hover:bg-white/10 cursor-pointer"

@@ -121,6 +121,7 @@ interface TimelineEntry {
   responseTokens?: number;
   responseModel?: string;          // last assistant.message.model for this turn (e.g. 'deepseek-v4-flash', 'claude-opus-4-7')
   responseHasThinking?: boolean;   // any assistant content block of type 'thinking' in this turn
+  sourceLine?: number;
 }
 
 interface GroupInfo {
@@ -154,6 +155,8 @@ interface CodexTimelineSessionMeta {
   forked_from_id?: string;
   timestamp?: string;
   cwd?: string;
+  sourceLine?: number;
+  forkLiveStartLine?: number;
 }
 
 function sessionIdLooseMatch(left?: string, right?: string): boolean {
@@ -178,7 +181,7 @@ function renderSingleStarHighlights(text: string): React.ReactNode[] {
     }
     if (open > cursor) nodes.push(text.slice(cursor, open));
     nodes.push(
-      <span key={`hl-${key++}`} style={{ color: '#38bdf8', fontWeight: 700 }}>
+      <span key={`hl-${key++}`} style={{ color: '#69dbdb', fontWeight: 700 }}>
         {text.slice(open + 1, close)}
       </span>
     );
@@ -211,11 +214,24 @@ function selectAutoTabTitlePrompt(
   if (pending.sourceSessionId && forkedFromId && !sessionIdLooseMatch(forkedFromId, pending.sourceSessionId)) {
     return undefined;
   }
+
+  const forkLiveStartLine = typeof codexSessionMeta?.forkLiveStartLine === 'number'
+    ? codexSessionMeta.forkLiveStartLine
+    : undefined;
+  if (forkLiveStartLine !== undefined) {
+    return entries.find((entry) => {
+      return typeof entry.sourceLine === 'number'
+        && entry.sourceLine > forkLiveStartLine
+        && isEligibleTabTitleEntry(entry);
+    });
+  }
+  if (forkedFromId || pending.sourceSessionId) return undefined;
+
   const startedAt = codexSessionMeta?.timestamp ? Date.parse(codexSessionMeta.timestamp) : NaN;
   if (!Number.isFinite(startedAt)) return undefined;
   return entries.find((entry) => {
     const entryAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
-    return Number.isFinite(entryAt) && entryAt >= startedAt && isEligibleTabTitleEntry(entry);
+    return Number.isFinite(entryAt) && entryAt >= startedAt + 1000 && isEligibleTabTitleEntry(entry);
   });
 }
 
@@ -1772,6 +1788,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       codexSessionMeta
     );
     if (!firstUserPrompt) return;
+    console.warn(
+      '[Timeline:AutoTabTitle]' +
+      ' candidate' +
+      ' tab=' + tabId.slice(-8) +
+      ' tool=' + toolType +
+      ' session=' + sessionId.slice(0, 8) +
+      ' mode=' + pendingAutoTitle.mode +
+      ' entries=' + entries.length +
+      ' promptChars=' + String(firstUserPrompt.content || '').length
+    );
 
     let tab: any = null;
     for (const [, workspace] of store.openProjects) {
@@ -1780,33 +1806,101 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
     if (!tab) return;
     if (tab.nameSetManually) {
+      console.warn(
+        '[Timeline:AutoTabTitle]' +
+        ' skip=manual-name' +
+        ' tab=' + tabId.slice(-8) +
+        ' tool=' + toolType +
+        ' session=' + sessionId.slice(0, 8) +
+        ' name=' + JSON.stringify(tab.name)
+      );
       store.consumePendingAutoTabTitle(tabId, toolType, sessionId);
       _autoTabTitleAttempted.add(attemptKey);
       return;
     }
 
     const currentSessionId = toolType === 'codex' ? tab.codexSessionId : tab.claudeSessionId;
-    if (currentSessionId !== sessionId) return;
-    if (!store.consumePendingAutoTabTitle(tabId, toolType, sessionId)) return;
+    if (currentSessionId !== sessionId) {
+      console.warn(
+        '[Timeline:AutoTabTitle]' +
+        ' skip=session-mismatch' +
+        ' tab=' + tabId.slice(-8) +
+        ' tool=' + toolType +
+        ' wanted=' + sessionId.slice(0, 8) +
+        ' current=' + (currentSessionId ? String(currentSessionId).slice(0, 8) : 'none')
+      );
+      return;
+    }
+    if (!store.consumePendingAutoTabTitle(tabId, toolType, sessionId)) {
+      console.warn(
+        '[Timeline:AutoTabTitle]' +
+        ' skip=consume-false' +
+        ' tab=' + tabId.slice(-8) +
+        ' tool=' + toolType +
+        ' session=' + sessionId.slice(0, 8)
+      );
+      return;
+    }
 
     _autoTabTitleAttempted.add(attemptKey);
     const titleToolType = toolType;
     const titleSessionId = sessionId;
     const titleTabId = tabId;
     const sourcePrompt = trimTabTitlePrompt(firstUserPrompt.content);
+    console.warn(
+      '[Timeline:AutoTabTitle]' +
+      ' start' +
+      ' tab=' + titleTabId.slice(-8) +
+      ' tool=' + titleToolType +
+      ' session=' + titleSessionId.slice(0, 8) +
+      ' sourceChars=' + sourcePrompt.length
+    );
     store.setTabTitleNaming(titleTabId, true);
 
     void (async () => {
       try {
         const promptConfig = usePromptsStore.getState().getPromptById(TAB_TITLE_PROMPT_ID);
         const title = await generateTabTitleFromPrompt(sourcePrompt, promptConfig);
-        if (!title) return;
+        if (!title) {
+          console.warn(
+            '[Timeline:AutoTabTitle]' +
+            ' generated-null' +
+            ' tab=' + titleTabId.slice(-8) +
+            ' tool=' + titleToolType +
+            ' session=' + titleSessionId.slice(0, 8)
+          );
+          return;
+        }
+        console.warn(
+          '[Timeline:AutoTabTitle]' +
+          ' rename' +
+          ' tab=' + titleTabId.slice(-8) +
+          ' tool=' + titleToolType +
+          ' session=' + titleSessionId.slice(0, 8) +
+          ' title=' + JSON.stringify(title)
+        );
         useWorkspaceStore.getState().autoRenameTab(titleTabId, title, {
           toolType: titleToolType,
           sessionId: titleSessionId,
         });
+      } catch (err: any) {
+        console.warn(
+          '[Timeline:AutoTabTitle]' +
+          ' error' +
+          ' tab=' + titleTabId.slice(-8) +
+          ' tool=' + titleToolType +
+          ' session=' + titleSessionId.slice(0, 8) +
+          ' message=' + (err?.message || err)
+        );
       } finally {
-      useWorkspaceStore.getState().setTabTitleNaming(titleTabId, false);
+        console.warn(
+          '[Timeline:AutoTabTitle]' +
+          ' finish' +
+          ' tab=' + titleTabId.slice(-8) +
+          ' tool=' + titleToolType +
+          ' session=' + titleSessionId.slice(0, 8)
+        );
+        useWorkspaceStore.getState().setTabTitleNaming(titleTabId, false);
       }
     })();
   }, [entries, sessionId, tabId, toolType, forkMarkers, forkMarkerLastSnapIndex, codexSessionMeta]);
@@ -4039,7 +4133,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       const row = promptSummaries[key];
                       if (row?.summary) {
                         previewText = row.summary.trim();
-                        previewColor = 'rgba(191, 219, 254, 0.92)';
                         isSummaryPreview = true;
                       } else if (promptSummaryLoadingKeys.has(key)) {
                         previewText = 'summarizing prompt...';
@@ -4050,6 +4143,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                           WebkitBackgroundClip: 'text',
                           backgroundClip: 'text',
                           color: 'transparent',
+                          WebkitTextFillColor: 'transparent',
+                          willChange: 'background-position',
                           animation: 'timeline-summary-text-shimmer 1.2s linear infinite',
                         };
                       }

@@ -250,6 +250,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const timelineTreeMode = useUIStore((s) => s.timelineTreeModeTabs[tabId] ?? false);
   const setTimelineTreeMode = useUIStore((s) => s.setTimelineTreeMode);
+  const historyPinned = useUIStore((s) => s.historyPinned);
   const timelinePinned = useUIStore((s) => s.timelinePinned);
   const [dragWidth, setDragWidth] = useState<number | null>(null);
   const effectiveWidth = dragWidth ?? promptQueueWidth;
@@ -905,9 +906,9 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
 
   const toggleTimelineTree = useCallback(() => {
     const nextOpen = !timelineTreeMode;
-    if (nextOpen && !timelinePinned) setHistoryPanelOpen(tabId, false);
+    if (nextOpen && !historyPinned) setHistoryPanelOpen(tabId, false);
     setTimelineTreeMode(tabId, nextOpen);
-  }, [timelineTreeMode, tabId, timelinePinned, setHistoryPanelOpen, setTimelineTreeMode]);
+  }, [timelineTreeMode, tabId, historyPinned, setHistoryPanelOpen, setTimelineTreeMode]);
 
   const expandPanel = useCallback(() => {
     if (collapseTimerRef.current !== null) {

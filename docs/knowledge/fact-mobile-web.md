@@ -11,7 +11,7 @@
 Часть REST-эндпоинтов требует **живого renderer state** (Zustand store с открытыми проектами и табами). Main не имеет доступа к store напрямую. Решение — request/reply IPC bridge:
 
 1. Main: `bridgeRequest(action, payload, timeoutMs=5000)` спавнит `requestId`, шлёт `web:bridge-request` в renderer, ждёт ответа на `web:bridge-reply` с тем же id.
-2. Renderer: один listener в `App.tsx` диспатчит по action — `getOpenProjectIds`, `createSDKTab`, `sendSDKMessage`, `loadSDKHistory`, `forkToSDK`, `closeTab`, `renameTab`, `getSDKParams`, `setSDKParams`, `getTabSessionInfo`. Расширение для PTY+Claude: `createClaudeTab`, `resumeClaudeTab`, `stopClaudeTab`, `sendMessageAuto` (единая точка `/send` — сам роутит SDK vs PTY), `getClaudeTabStatus`, `getClaudeTabStatusBatch`, `getProjectTabsLive` (отдаёт `sessionStatus`). Детали — `fact-mobile-claude-pty.md`.
+2. Renderer: один listener в `App.tsx` диспатчит по action — `getOpenProjectIds`, `createSDKTab`, `sendSDKMessage`, `loadSDKHistory`, `forkToSDK`, `closeTab`, `renameTab`, `getSDKParams`, `setSDKParams`, `getTabSessionInfo`. Расширение для PTY+Claude/Codex: `createClaudeTab` (legacy wrapper), `createAgentTab` (generic PTY agent), `resumeClaudeTab`, `stopClaudeTab`, `interruptClaudeTurn` (soft interrupt текущего turn'а), `grabAgentDraft` (authoritative чтение TUI composer после interrupt), `sendMessageAuto` (единая точка `/send` — сам роутит SDK vs PTY), `getClaudeTabStatus`, `getClaudeTabStatusBatch`, `getProjectTabsLive` (отдаёт `sessionStatus`, project `icon`, `statusMarker`). Детали — `fact-mobile-claude-pty.md`.
 3. На таймауте promise rejected — endpoint возвращает 409.
 
 **Критично:** bridge нужен ТОЛЬКО для actions, требующих store. Чисто-серверные operations (timeline parse через `parseTimelineEntries`, projects list из SQLite через `projectManager.db.getAllProjects()`) идут напрямую без bridge — это и быстрее, и работает даже если renderer mounted с задержкой.
@@ -111,6 +111,32 @@ PTY-Claude табы). Три неочевидных факта:
 
 **Prod требует `build:install`** — `App.tsx::handleWebBridge` (новые actions) и `web-server.js` (новые routes) живут в asar; mobile-web Vite-dev итерирует только фронт. См. «Stale prod-app → silent bridge timeout» ниже.
 
+## Native clients share the REST/SSE contract
+
+`mobile-web` больше не единственный потребитель этого сервера. Нативный iOS-клиент Habit Tracker (`fact-voice-chat-tab.md::Terminal mode`) ходит в те же REST/SSE endpoints и рисует Terminal сам на SwiftUI. Это не вторая модель terminal-control: source of truth остаётся в custom-terminal renderer/main, а native app только отображает снапшоты и шлёт команды.
+
+Следствие для контракта: всё, что native UI не может честно вывести из файлов на диске, должно приходить по API уже нормализованным. Project icon (`project.icon`), назначенный status marker (`statusId/statusColor`) и форма/размер marker (`statusMarker:{shape,sizePx}`) передаются сервером, потому что palette и настройка живут в desktop `useUIStore`, недоступном iOS. Runtime `sessionStatus` остаётся отдельным полем: это busy/active/inactive процесса, а не user-assigned категория. Клиент может по-своему резервировать место в строке или менять icon layout, но не должен смешивать эти две оси.
+
+`GET /api/projects` для native клиентов отдаёт не просто SQLite `updated_at DESC`.
+Открытые проекты сортируются по порядку `openProjects` из renderer — это тот же порядок,
+в котором desktop project tabs стоят слева направо; телефон показывает его сверху вниз.
+Закрытые проекты идут после открытых по freshness. Нативный клиент не должен повторно
+сортировать этот ответ: порядок project tabs — пользовательская навигационная раскладка,
+а не производная от времени последнего изменения проекта.
+
+Создание новых PTY-агентов для native идёт через `/api/projects/:id/agent-tabs {toolType:'claude'|'codex'}`. Этот route намеренно делегирует в renderer `createAgentTab`, чтобы Claude и Codex стартовали тем же `pendingAction` path, что desktop. Не заводить на iOS отдельный launch-path, который сам пишет command в PTY: он обойдёт desktop guards, model/effort defaults и session detection.
+
+Native iOS также использует `GET /api/active-loaders` как preflight перед удалённым
+`build:install`. Endpoint возвращает широкий snapshot live-состояний, но install UI блокирует
+только элементы со `status=busy|running`. Важная граница: idle-alive Claude/Codex CLI — это
+живой процесс в PTY, но не loader; такие tabs не должны попадать в `kind:"process"` blockers,
+иначе iOS показывает ложный alert «Terminal занят» при полностью idle вкладках. AI tabs
+блокируют install только через свои deterministic busy-сигналы (`claudeTurnBusy`/spinner/local
+command, Codex rollout `task_started`, SDK query, Gemini busy); ordinary shell commands
+блокируют через `terminalCommandState.isRunning`. Сам install endpoint при этом **не**
+находится в custom-terminal — его держит Voice Record, потому что `build:install` закрывает
+Noted Terminal и управляющий HTTP-сервер цели может исчезнуть в середине операции.
+
 ## Self-healing busy reconciliation (loader никогда не залипает навсегда)
 
 **Проблема.** Мобильный loader («thinking…») управляется SSE-событиями `busy`/`done`. Но если `busy:false`/`done` **потерялся** — turn закончился путём, который не сделал `_webBroadcast busy:false` (например: на десктопе юзер **отклонил** AskUserQuestion → «Request interrupted by user for tool use» → turn оборвался через aborted_streaming), SSE-фрейм дропнулся, ИЛИ баг в самом мобильном коде неверно затрекал busy — phone **залипает** на «thinking…» навсегда. Юзер: *«нажал ⏺ → declined → но на мобилке всё равно идёт thinking… хотя thinking нет; нужен фолбэк, чтобы мобилка подхватывала реальное состояние с продакшена»*.
@@ -135,8 +161,8 @@ setBusy(cur => cur !== authoritativeBusy ? authoritativeBusy : cur);
 
 ```
 GET  /api/me                                   → ping, проверка токена
-GET  /api/projects                             → SQLite + isOpen/isActive из renderer bridge
-GET  /api/projects/:id/tabs                    → tabs + timelineCount + live state
+GET  /api/projects                             → SQLite + isOpen/isActive + project icon из renderer bridge
+GET  /api/projects/:id/tabs                    → tabs + timelineCount + live state + statusMarker
 POST /api/projects/:id/sdk-tabs                → createSDKTab (через bridge)
 POST /api/sdk-tabs/:tabId/send                 → sendSDKMessage + dispatch external-prompt
 POST /api/sdk-tabs/:tabId/stop                 → query.close()
@@ -151,15 +177,19 @@ POST /api/sdk-tabs/:tabId/truncate              → drop everything ≥ targetUu
 GET  /api/sdk-tabs/:tabId/timeline             → parseTimelineEntries
 GET  /api/sdk-tabs/:tabId/params               → getSDKParams
 POST /api/sdk-tabs/:tabId/params               → setSDKParams
+POST /api/sdk-tabs/:tabId/interrupt            → soft interrupt текущего turn'а (PTY Esc / SDK close warm)
+GET  /api/sdk-tabs/:tabId/draft                → authoritative чтение TUI composer после interrupt
 GET  /api/sdk-tabs/:tabId/queue                 → getPromptQueue (core + sibling aiTabs)
 POST /api/sdk-tabs/:tabId/queue                 → mutatePromptQueue ({op, args})
 GET  /api/sdk-tabs/:tabId/pending-question      → текущий AskUserQuestion (connect mid-question)
 POST /api/sdk-tabs/:tabId/answer-question       → answerClaudeQuestion ({source, answers, stop})
+GET  /api/active-loaders                       → live loaders snapshot для external install preflight
 GET  /api/prompts[?etag=X]                     → getPrompts + getPromptGroups (no bridge); ?etag match → { etag, unchanged: true }
 POST /api/log/client                           → mobile diagnostic logs → console.log → dev.log
 GET  /api/events?token=&tabId=                 → SSE (text/event-stream) — ОСНОВНОЙ live-канал. snapshot/message/busy/done/bridge-update/queue-update/ask-question/question-cancelled. Не блокируется anti-tracker'ами как ws://. См. секцию «SSE transport».
 WS   /ws?token=&tabId=                          → тот же набор events. Legacy-канал для permissive-браузеров; на Yandex/Chrome с Protect не работает (ws:// к private-IP режется молча).
 POST /api/projects/:id/claude-tabs              → создать PTY+Claude таб (Terminal.tsx сам spawn'ит Claude по pendingAction)
+POST /api/projects/:id/agent-tabs               → создать PTY+Claude/Codex таб; body {toolType:'claude'|'codex'}
 POST /api/sdk-tabs/:tabId/resume                → claude --resume <sid> в existing PTY
 GET  /api/sdk-tabs/:tabId/status                → status строка (inactive/starting/active/busy) + sessionId + commandType
 ```
@@ -220,7 +250,7 @@ Bridge-action `getProjectTabsLive` в `App.tsx::handleWebBridge` возвращ�
 ```
 { type:'snapshot',     tabId, sessionId, busy, sessionStatus?, inputReady? }   — на connect и при lifecycle-сменах
 { type:'message',      tabId, message, sessionId }                              — каждое SDK или JSONL-сообщение
-{ type:'busy',         tabId, busy }                                            — переключение busy (SDK + PTY-Claude)
+{ type:'busy',         tabId, busy }                                            — переключение busy (SDK + PTY-Claude + Codex)
 { type:'done',         tabId, sessionId }                                       — окончание turn'а
 { type:'bridge-update', tabId, sessionId, model, contextPct }                   — PTY-Claude: StatusLine bridge.json обновился
 { type:'queue-update',  tabId, queue }                                          — Run-after очередь изменилась (десктоп или другой телефон); `queue` = PromptQueueCore

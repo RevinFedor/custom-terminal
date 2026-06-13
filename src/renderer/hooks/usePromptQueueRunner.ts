@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { usePromptQueueStore } from '../store/usePromptQueueStore';
+import { usePromptQueueStore, type TabQueue } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 
@@ -56,6 +56,19 @@ function sendQueueCommand(tabId: string, payload: string): Promise<unknown> {
   return ipcRenderer.invoke(channel, tabId, payload);
 }
 
+type EffectiveTriggerOptions = { clearStaleTarget?: boolean };
+
+function getEffectiveQueueTrigger(ownerTabId: string, queue: TabQueue, options: EffectiveTriggerOptions = {}): string {
+  if (queue.runAfterTabId && tabCanTriggerQueue(ownerTabId, queue.runAfterTabId)) {
+    return queue.runAfterTabId;
+  }
+  if (queue.runAfterTabId && options.clearStaleTarget) {
+    console.warn('[PromptQueueRunner] runAfterTabId ' + queue.runAfterTabId.slice(-8) + ' is no longer a valid target, clearing → owner=' + ownerTabId.slice(-8));
+    usePromptQueueStore.getState().setRunAfterTab(ownerTabId, null);
+  }
+  return ownerTabId;
+}
+
 // When the per-tab post-prompt toggle is ON and post-prompt text is non-empty,
 // every fired queue item gets the post-prompt appended after a blank-line
 // separator. Empty text is treated as disabled (no glue line, no warning).
@@ -76,6 +89,9 @@ function withPostPrompt(tabId: string, body: string): string {
 // truth or edges get double-counted / missed.
 const prevBusyRef = new Map<string, boolean>();
 const queueSendInflight = new Set<string>();
+// After send-command resolves successfully there is a short event gap before
+// the agent emits busy:true. Keep pivoted owners blocked through that gap.
+const queueAwaitingBusyStart = new Set<string>();
 
 // Public accessor — the overlay reads this to render the "target tab is busy
 // now" spinner inside the Run-after dropdown. Not used by the runner itself.
@@ -123,26 +139,28 @@ export function usePromptQueueRunner() {
     // Shared firing logic — pops head, sends to OWNER tab, auto-disarms on last.
     // ownerTabId = which queue's head to pop (always the queue-owner, never the
     // trigger tab). triggerTabId is only used for diagnostics in logs.
-    const fireQueueOwner = (ownerTabId: string, triggerTabId: string) => {
+    const fireQueueOwner = (ownerTabId: string, triggerTabId: string): boolean => {
       const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
       const { commitSentHead, setAutoRun, setStopAfter } = usePromptQueueStore.getState();
-      if (!queue.autoRun || queue.items.length === 0) return;
-      if (queueSendInflight.has(ownerTabId)) return;
+      if (!queue.autoRun || queue.items.length === 0) return false;
+      if (queueSendInflight.has(ownerTabId)) return false;
       if (prevBusyRef.get(ownerTabId) === true) {
         console.log('[PromptQueueRunner] owner=' + ownerTabId.slice(-8) + ' is busy → wait before firing trigger=' + triggerTabId.slice(-8));
-        return;
+        return false;
       }
 
       const beforePop = queue.items.length;
       const head = queue.items[0];
-      if (!head) return;
+      if (!head) return false;
       queueSendInflight.add(ownerTabId);
+      queueAwaitingBusyStart.add(ownerTabId);
 
       const payload = withPostPrompt(ownerTabId, head.text);
       const arrow = ownerTabId === triggerTabId ? '↩' : '⇒';
       console.log('[PromptQueueRunner] fire owner=' + ownerTabId.slice(-8) + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8) + ' remaining=' + (beforePop - 1));
       sendQueueCommand(ownerTabId, payload).then((res: any) => {
         if (res && res.success === false) {
+          queueAwaitingBusyStart.delete(ownerTabId);
           console.error('[PromptQueueRunner] send refused for owner tab', ownerTabId, res.error);
           setAutoRun(ownerTabId, false);
           setStopAfter(ownerTabId, false);
@@ -151,12 +169,37 @@ export function usePromptQueueRunner() {
         const committed = commitSentHead(ownerTabId, head.id);
         if (committed.removed && committed.beforeCount === 1) setAutoRun(ownerTabId, false);
       }).catch((e: unknown) => {
+        queueAwaitingBusyStart.delete(ownerTabId);
         console.error('[PromptQueueRunner] send failed for owner tab', ownerTabId, e);
         setAutoRun(ownerTabId, false);
         setStopAfter(ownerTabId, false);
       }).finally(() => {
         queueSendInflight.delete(ownerTabId);
       });
+      return true;
+    };
+
+    const getReadyTriggerForOwner = (ownerTabId: string): string | null => {
+      const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
+      if (!queue.autoRun || queue.items.length === 0) return null;
+      if (queueAwaitingBusyStart.has(ownerTabId)) return ownerTabId;
+      if (queueSendInflight.has(ownerTabId)) return ownerTabId;
+      if (prevBusyRef.get(ownerTabId) === true) return null;
+
+      const effectiveTrigger = getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true });
+      if (effectiveTrigger === ownerTabId) return ownerTabId;
+
+      // Pivoted queue can only fire when its target has a real idle snapshot.
+      // No busy history means "wait for the first busy→idle edge", not "idle".
+      if (!prevBusyRef.has(effectiveTrigger)) return null;
+      if (prevBusyRef.get(effectiveTrigger) === true) return null;
+      return effectiveTrigger;
+    };
+
+    const ownerHasRunnableContinuation = (ownerTabId: string): boolean => {
+      if (queueAwaitingBusyStart.has(ownerTabId)) return true;
+      if (queueSendInflight.has(ownerTabId)) return true;
+      return getReadyTriggerForOwner(ownerTabId) !== null;
     };
 
     // Walk all queues, find one(s) waiting on `triggerTabId` for turn-end edge.
@@ -175,14 +218,7 @@ export function usePromptQueueRunner() {
         // Validate stale target before pivoting — if the picked tab was closed,
         // self-clear and fall through to default own-tab behaviour. This is
         // the lazy validation promised in the store schema comment.
-        if (q.runAfterTabId && !tabCanTriggerQueue(ownerTabId, q.runAfterTabId)) {
-          console.warn('[PromptQueueRunner] runAfterTabId ' + q.runAfterTabId.slice(-8) + ' is no longer a valid target, clearing → owner=' + ownerTabId.slice(-8));
-          usePromptQueueStore.getState().setRunAfterTab(ownerTabId, null);
-          // After clear, q.runAfterTabId is stale in our snapshot; treat as null.
-          if (ownerTabId === triggerTabId) owners.push(ownerTabId);
-          continue;
-        }
-        const effectiveTrigger = q.runAfterTabId ?? ownerTabId;
+        const effectiveTrigger = getEffectiveQueueTrigger(ownerTabId, q, { clearStaleTarget: true });
         if (effectiveTrigger === triggerTabId) owners.push(ownerTabId);
       }
       return owners;
@@ -195,6 +231,7 @@ export function usePromptQueueRunner() {
         prevBusyRef.set(tabId, busy);
 
         if (busy) {
+          queueAwaitingBusyStart.delete(tabId);
           const { clearFirstDelayCountdown } = usePromptQueueStore.getState();
           const q = usePromptQueueStore.getState().getQueue(tabId);
           if (q.firstDelayCountdownAt !== null) clearFirstDelayCountdown(tabId);
@@ -284,11 +321,7 @@ export function usePromptQueueRunner() {
               continue;
             }
             if (!q.autoRun && !q.stopAfter && q.firstDelayCountdownAt === null) continue;
-            let effectiveTrigger = q.runAfterTabId ?? ownerTabId;
-            if (q.runAfterTabId && !tabCanTriggerQueue(ownerTabId, q.runAfterTabId)) {
-              usePromptQueueStore.getState().setRunAfterTab(ownerTabId, null);
-              effectiveTrigger = ownerTabId;
-            }
+            const effectiveTrigger = getEffectiveQueueTrigger(ownerTabId, q, { clearStaleTarget: true });
             if (ownerTabId !== tabId && effectiveTrigger !== tabId) continue;
             if (q.autoRun) setAutoRun(ownerTabId, false);
             if (q.stopAfter) setStopAfter(ownerTabId, false); // cascades closeAfter→false (closeAfter⟹stopAfter, so this always runs when closeAfter was set)
@@ -301,45 +334,35 @@ export function usePromptQueueRunner() {
           return;
         }
 
-        // Step 1: pivoted queues — any OWNER tab whose runAfterTabId === tabId.
-        // Their head goes to the OWNER (not this trigger tab).
-        const owners = findOwnersWaitingOn(tabId);
-        for (const ownerTabId of owners) {
-          // For pivoted queues we fire and continue — they don't consume the
-          // trigger's stopAfter/closeAfter (those belong to the trigger's own
-          // queue, processed separately below if applicable).
-          if (ownerTabId !== tabId) {
-            fireQueueOwner(ownerTabId, tabId);
-          }
+        // Step 1: target tab's OWN continuation wins over external owners.
+        // If tab A waits on tab B, and tab B has Run-after ready to send its
+        // own next prompt, A must wait for B's whole chain to drain — not just
+        // for B's first busy→idle edge. Otherwise both tabs start from the same
+        // turn-end and A observes half-complete work from B.
+        if (queueSendInflight.has(tabId) || queueAwaitingBusyStart.has(tabId)) {
+          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' has queued turn starting → defer pivoted owners');
+          return;
+        }
+        const ownContinuationTrigger = getReadyTriggerForOwner(tabId);
+        if (ownContinuationTrigger) {
+          const fired = fireQueueOwner(tabId, ownContinuationTrigger);
+          if (fired || queueSendInflight.has(tabId) || queueAwaitingBusyStart.has(tabId)) return; // wait for THIS continuation before pivot fan-out / stopAfter
         }
 
-        // Step 2: own-tab logic for the trigger tab itself (default path).
-        // Only when the trigger tab's own queue is NOT pivoted away — pivoted
-        // queues run when their target finishes, not when own claude finishes.
+        // Step 2: pivoted queues — any OWNER tab whose runAfterTabId === tabId.
+        // Their head goes to the OWNER (not this trigger tab). This now runs
+        // only after the trigger tab has no runnable continuation of its own.
+        const owners = findOwnersWaitingOn(tabId);
+        for (const ownerTabId of owners) {
+          if (ownerTabId !== tabId) fireQueueOwner(ownerTabId, tabId);
+        }
+
+        // Step 3: stopAfter for the trigger tab itself. If own Run-after fired
+        // above we returned before this block, preserving the existing contract:
+        // stopAfter runs only after the queue is empty / no continuation fired.
         const ownQueue = usePromptQueueStore.getState().getQueue(tabId);
         const { setStopAfter } = usePromptQueueStore.getState();
         const showToast = useUIStore.getState().showToast;
-
-        // autoRun: send next queued prompt (only if not pivoted — pivoted
-        // queues already handled in step 1's loop when this very tab IS the
-        // owner with target === self, which we coerce to null in the store).
-        if (ownQueue.autoRun && ownQueue.items.length > 0) {
-          if (!ownQueue.runAfterTabId) {
-            fireQueueOwner(tabId, tabId);
-            return; // wait for THIS prompt's turn before considering stopAfter
-          }
-
-          if (!tabCanTriggerQueue(tabId, ownQueue.runAfterTabId)) {
-            usePromptQueueStore.getState().setRunAfterTab(tabId, null);
-            fireQueueOwner(tabId, tabId);
-            return;
-          }
-
-          if (prevBusyRef.has(ownQueue.runAfterTabId) && prevBusyRef.get(ownQueue.runAfterTabId) !== true) {
-            fireQueueOwner(tabId, ownQueue.runAfterTabId);
-            return;
-          }
-        }
 
         // stopAfter: queue empty (or autoRun off / pivoted away), turn finished
         // → kill claude. closeAfter (chained on top): after the stop fires,
@@ -418,22 +441,24 @@ export function usePromptQueueRunner() {
     };
 
     let firing = false;
-    const fireHead = (ownerTabId: string, triggerTabId: string) => {
-      if (firing) return;
+    const fireHead = (ownerTabId: string, triggerTabId: string): boolean => {
+      if (firing) return false;
       firing = true;
       try {
         const q = usePromptQueueStore.getState().getQueue(ownerTabId);
-        if (!q.autoRun || q.items.length === 0) return;
-        if (queueSendInflight.has(ownerTabId)) return;
-        if (prevBusyRef.get(ownerTabId) === true) return;
+        if (!q.autoRun || q.items.length === 0) return false;
+        if (queueSendInflight.has(ownerTabId)) return false;
+        if (prevBusyRef.get(ownerTabId) === true) return false;
         const head = q.items[0];
         if (head) {
           queueSendInflight.add(ownerTabId);
+          queueAwaitingBusyStart.add(ownerTabId);
           const payload = withPostPrompt(ownerTabId, head.text);
           const arrow = ownerTabId === triggerTabId ? '↩' : '⇒';
           console.log('[PromptQueueRunner] cold-start owner=' + ownerTabId.slice(-8) + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8));
           sendQueueCommand(ownerTabId, payload).then((res: any) => {
             if (res && res.success === false) {
+              queueAwaitingBusyStart.delete(ownerTabId);
               console.error('[PromptQueueRunner] cold-start send refused for tab', ownerTabId, res.error);
               usePromptQueueStore.getState().setAutoRun(ownerTabId, false);
               usePromptQueueStore.getState().setStopAfter(ownerTabId, false);
@@ -442,13 +467,16 @@ export function usePromptQueueRunner() {
             const committed = usePromptQueueStore.getState().commitSentHead(ownerTabId, head.id);
             if (committed.removed && committed.beforeCount === 1) usePromptQueueStore.getState().setAutoRun(ownerTabId, false);
           }).catch((e: unknown) => {
+            queueAwaitingBusyStart.delete(ownerTabId);
             console.error('[PromptQueueRunner] cold-start send failed for tab', ownerTabId, e);
             usePromptQueueStore.getState().setAutoRun(ownerTabId, false);
             usePromptQueueStore.getState().setStopAfter(ownerTabId, false);
           }).finally(() => {
             queueSendInflight.delete(ownerTabId);
           });
+          return true;
         }
+        return false;
       } finally {
         firing = false;
       }
@@ -498,12 +526,7 @@ export function usePromptQueueRunner() {
 
         // Validate the picked target — stale id behaves as null (fall back to
         // own-tab default).
-        let effectiveTrigger = (q.runAfterTabId && tabCanTriggerQueue(tabId, q.runAfterTabId))
-          ? q.runAfterTabId
-          : tabId;
-        if (q.runAfterTabId && effectiveTrigger === tabId) {
-          usePromptQueueStore.getState().setRunAfterTab(tabId, null);
-        }
+        const effectiveTrigger = getEffectiveQueueTrigger(tabId, q, { clearStaleTarget: true });
 
         if (effectiveTrigger !== tabId) {
           // Pivoted: only fire cold-start if the target has been seen busy at
@@ -516,6 +539,10 @@ export function usePromptQueueRunner() {
           }
           if (prevBusyRef.get(effectiveTrigger) === true) {
             // Target is busy right now — wait for its idle edge.
+            continue;
+          }
+          if (ownerHasRunnableContinuation(effectiveTrigger)) {
+            console.log('[PromptQueueRunner] cold-start owner=' + tabId.slice(-8) + ' target=' + effectiveTrigger.slice(-8) + ' has own continuation → wait for chain drain');
             continue;
           }
           // Target is idle and was seen busy before. Cold-start fires.
