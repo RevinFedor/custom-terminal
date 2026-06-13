@@ -64,6 +64,7 @@ export interface TabGroup {
   id: string;
   name: string;
   createdAt: number;
+  anchorTabId?: string;
   collapsed?: boolean;
   color?: TabColor;
   sessionStatus?: string;
@@ -514,7 +515,13 @@ interface WorkspaceStore {
   setTabGroupSessionStatus: (projectId: string, groupId: string, status: string | null) => void;
   deleteTabGroup: (projectId: string, groupId: string) => void;
   setTabVisualParent: (projectId: string, tabId: string, parentTabId: string | undefined) => void;
-  applyTabLayout: (projectId: string, orderedIds: string[], groupAssignments?: Record<string, string | null | undefined>, visualParentAssignments?: Record<string, string | null | undefined>) => void;
+  applyTabLayout: (
+    projectId: string,
+    orderedIds: string[],
+    groupAssignments?: Record<string, string | null | undefined>,
+    visualParentAssignments?: Record<string, string | null | undefined>,
+    groupAnchorAssignments?: Record<string, string | null | undefined>
+  ) => void;
 
   // Update tab cwd
   updateTabCwd: (projectId: string, tabId: string, newCwd: string) => void;
@@ -2481,12 +2488,22 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     saveTabs(workspace.projectId, workspace.tabs);
   },
 
-  applyTabLayout: (projectId, orderedIds, groupAssignments = {}, visualParentAssignments = {}) => {
+  applyTabLayout: (projectId, orderedIds, groupAssignments = {}, visualParentAssignments = {}, groupAnchorAssignments = {}) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
     if (!workspace) return;
 
     const existing = workspace.tabs;
+    const previousMainOrder = Array.from(existing.values())
+      .filter(tab => !tab.parentTabId && !tab.isUtility)
+      .map(tab => tab.id);
+    const previousMembersByGroup = new Map<string, string[]>();
+    for (const tab of existing.values()) {
+      if (tab.parentTabId || tab.isUtility || !tab.groupId) continue;
+      const members = previousMembersByGroup.get(tab.groupId) || [];
+      members.push(tab.id);
+      previousMembersByGroup.set(tab.groupId, members);
+    }
     const orderedSet = new Set(orderedIds);
     const nextTabs = new Map<string, Tab>();
 
@@ -2516,8 +2533,53 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
 
     workspace.tabs = nextTabs;
+    const nextMembersByGroup = new Map<string, string[]>();
+    for (const tab of workspace.tabs.values()) {
+      if (tab.parentTabId || tab.isUtility || !tab.groupId) continue;
+      const members = nextMembersByGroup.get(tab.groupId) || [];
+      members.push(tab.id);
+      nextMembersByGroup.set(tab.groupId, members);
+    }
+    const resolvedGroupAnchorAssignments: Record<string, string | null | undefined> = { ...groupAnchorAssignments };
+    for (const group of workspace.tabGroups) {
+      if (Object.prototype.hasOwnProperty.call(resolvedGroupAnchorAssignments, group.id)) continue;
+      const previousMembers = previousMembersByGroup.get(group.id) || [];
+      if (previousMembers.length === 0) continue;
+      const nextMembers = nextMembersByGroup.get(group.id) || [];
+      if (nextMembers.length > 0) continue;
+
+      const previousMemberSet = new Set(previousMembers);
+      const previousIndexes = previousMembers
+        .map(id => previousMainOrder.indexOf(id))
+        .filter(index => index >= 0);
+      if (previousIndexes.length === 0) continue;
+      const lastPreviousIndex = Math.max(...previousIndexes);
+      const anchorTabId = previousMainOrder
+        .slice(lastPreviousIndex + 1)
+        .find(id => !previousMemberSet.has(id) && workspace.tabs.has(id));
+      resolvedGroupAnchorAssignments[group.id] = anchorTabId || null;
+    }
+    let touchedGroups = false;
+    if (Object.keys(resolvedGroupAnchorAssignments).length > 0) {
+      const mainTabIds = new Set(
+        Array.from(workspace.tabs.values())
+          .filter(tab => !tab.parentTabId && !tab.isUtility)
+          .map(tab => tab.id)
+      );
+      workspace.tabGroups = workspace.tabGroups.map(group => {
+        if (!Object.prototype.hasOwnProperty.call(resolvedGroupAnchorAssignments, group.id)) return group;
+        const requestedAnchor = resolvedGroupAnchorAssignments[group.id];
+        const anchorTabId = requestedAnchor && mainTabIds.has(requestedAnchor)
+          ? requestedAnchor
+          : undefined;
+        if (group.anchorTabId === anchorTabId) return group;
+        touchedGroups = true;
+        return { ...group, anchorTabId };
+      });
+    }
     set({ openProjects: new Map(openProjects) });
     saveTabs(workspace.projectId, workspace.tabs);
+    if (touchedGroups) saveTabGroups(workspace.projectId, workspace.tabGroups);
   },
 
   updateTabCwd: (projectId, tabId, newCwd) => {

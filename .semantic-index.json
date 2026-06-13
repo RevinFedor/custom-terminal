@@ -88,48 +88,56 @@
     "path": "docs/methodology/переносимый-дизайн.md",
     "type": "fact",
     "explicit": [
-      "ux_philosophy",
-      "ui_patterns",
-      "portable_design",
-      "layout_stability",
-      "focus_management",
-      "keyboard_shortcuts",
-      "gesture_handling",
-      "state_consistency"
+      "ux_methodology",
+      "ui_design_patterns",
+      "architecture_principles",
+      "terminal_ux"
     ],
     "implicit": [
-      "react_useEffect_event_drop",
-      "layout_depth_sensitivity",
+      "per_tab_proxy_routing",
+      "server_response_truth",
+      "single_signal_multisurface",
+      "twotier_selectors",
+      "focus_destination_contract",
+      "create_vs_move_notes",
+      "cwd_guard_prefix",
+      "ink_tui_chunk_parse",
+      "master_toggle_cascade",
+      "authoritative_artifact_watcher",
+      "liveness_readiness_sentinel",
+      "shared_append_only_file",
+      "context_routing_mcp",
+      "two_step_inline_confirm",
+      "resize_observer_geometry",
+      "primary_secondary_palette",
+      "inflow_composer_scroll",
+      "stable_scroll_collapse",
+      "capture_phase_shortcut",
+      "drag_mouseup_flush",
       "zustand_silent_mutation",
-      "jsonl_chain_resolution",
-      "paste_path_routing",
       "sync_marker_validity",
-      "css_visibility_canvas_stale",
-      "mcp_routing_instance",
-      "drag_preview_buffer",
-      "containing_block_transform_trap",
-      "split_button_seam_owner",
-      "one_prompt_one_dot_attribute",
-      "double_click_selection_widget",
-      "outside_click_uiohook_napi",
-      "layout_agnostic_shortcuts",
-      "idempotent_focus_caret"
+      "paste_path_routing",
+      "css_visibility_canvas",
+      "jsonl_chain_resolution",
+      "react_useeffect_ipc_listener",
+      "layout_depth_sensitivity"
     ],
     "symptoms": [
-      "UI elements and panels jitter or jump when dragged or resized because of store synchronization loops.",
-      "Global hotkeys stop working when switching system keyboard layout away from QWERTY.",
-      "Clicking on blank spaces in the chat history area resets input focus or collapses text selection.",
-      "Orphan child processes are left in the background after the terminal tab is closed or interrupted.",
-      "Local storage app preferences reset after Vite dev server changes its port."
+      "A background terminal process is finished but the UI shows a stuck loading spinner or active pulse.",
+      "A dropdown or modal shifts alignment, overflows the screen edge, or jumps unexpectedly during window resizing.",
+      "Clicking close to a button inside a temporary overlay closes the entire panel instead of triggering the action.",
+      "Drag-and-drop resize handles stutter or lag, causing visual layout jitter on mouse movement.",
+      "Input element text selection is lost or collapsed when clicking or focusing empty spaces in the chat history."
     ],
     "related_components": [
       "src/renderer/components/UI/SettingsModal.tsx",
       "src/renderer/components/UI/Tooltip.tsx",
-      "src/renderer/components/UI/PromptQueueOverlay.tsx",
-      "src/renderer/components/Terminal/Terminal.tsx",
-      "src/renderer/components/Terminal/ClaudeSDKTab.tsx"
+      "src/renderer/components/icons/ProviderIcons.tsx",
+      "src/main/ipc/semantic-index-status.js",
+      "src/renderer/utils/persistedStorage.ts",
+      "src/main/main.js"
     ],
-    "hash": "1a9d7b24c56c238509b1e18aaeb8c2b72455bd90b19652a70404ef31cc675d7b"
+    "hash": "bb2863a0c02cb78fc7418666dace4c73ba964088d415b7ec8a1339cc319dce85"
   },
   {
     "path": "docs/methodology/сценарии-использования.md",
@@ -446,40 +454,42 @@
     "path": "docs/knowledge/fact-prompt-queue.md",
     "type": "fact",
     "explicit": [
-      "Prompt Queue",
-      "External Editor Hijack",
-      "Run after",
-      "Auto-runner"
+      "prompt-queue",
+      "external-editor",
+      "claude-code",
+      "codex",
+      "pty-input"
     ],
     "implicit": [
-      "prompt_queue_auto_runner",
-      "editor_hijack_noted_code_grab",
-      "bridge_known_sessions_fallback",
-      "run_after_tab_pivot",
-      "split_button_retina_seam",
-      "singleton_listener_unmount_loss",
-      "portal_fixed_backdrop_filter_containment",
-      "fingerprint_selector_loop_fix",
-      "zshrc_editor_override_guard",
-      "editor_basename_gui_spoof",
-      "image_paths_regex_resolver",
-      "replay_input_guard",
-      "skip_reasons_disarm"
+      "noted_code_grab_dispatcher",
+      "usePromptQueueRunner",
+      "bridgeKnownSessions_liveness",
+      "runAfterTabId_pivot",
+      "stopAfter_closeAfter_cascade",
+      "resolveGrabbedImagePaths",
+      "singleton_listener_unmount_drop",
+      "portal_containment_bypass",
+      "split_button_seam_owner",
+      "skip_reasons_disarm",
+      "editor_lock_routing",
+      "first_chip_hint_blink"
     ],
     "symptoms": [
-      "Prompt queue overlay is missing when Claude is running, but suddenly appears after pressing Stop.",
-      "Background AI tab finishes processing but the next queued prompt is not executed.",
-      "Replaying a prompt with the play button fails with 'No Claude session' on auto-resumed tabs.",
-      "Adding a prompt via +grab opens the user's default external editor like Sublime or Vim instead of hijacking the input.",
-      "Prompt queue width changes or jumps erratically when adding prompts or renaming titles."
+      "Run After overlay is invisible even though Claude CLI is currently alive and responding in the tab",
+      "Replay button click on a queued prompt displays a 'no_claude_session' error toast on auto-resumed tabs",
+      "Run After panel width or input fields resize and jump layout when adding prompt chips",
+      "Picker dropdown menu for selecting target tabs is clipped, hidden behind panels, or positioned incorrectly",
+      "Stop after button border or seam disappears randomly when switching workspace tabs",
+      "Auto-run triggers the next queued prompt immediately after user manually aborts the previous run with Escape"
     ],
     "related_components": [
       "src/renderer/store/usePromptQueueStore.ts",
       "src/renderer/components/Workspace/PromptQueueOverlay.tsx",
       "src/renderer/hooks/usePromptQueueRunner.ts",
+      "src/renderer/hooks/usePromptQueueWebSync.ts",
       "src/main/main.js"
     ],
-    "hash": "441358e027eed8c293951013f5fd630af952205d2063e1ec7a3809980e694f63"
+    "hash": "53fa603aadde9e39e48e9dba6ab7a56e4d5e463397f406b3944cde0f64aac6b5"
   },
   {
     "path": "docs/knowledge/fact-session-status.md",
