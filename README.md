@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img src="build-resources/assets/hero.png" alt="Noted Terminal" width="800"/>
+  <img src="assets/hero.png" alt="Noted Terminal" width="800"/>
 </p>
 
 ---
