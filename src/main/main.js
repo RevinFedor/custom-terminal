@@ -11119,6 +11119,30 @@ async function getPidCwd(pid) {
   }
 }
 
+const DASHBOARD_PID_CWD_TTL_MS = 15000;
+const dashboardPidCwdCache = new Map();
+
+async function getDashboardPidCwd(pid) {
+  const safePid = Number(pid);
+  if (!Number.isInteger(safePid) || safePid <= 1) return '';
+
+  const now = Date.now();
+  const cached = dashboardPidCwdCache.get(safePid);
+  if (cached && now - cached.createdAt < DASHBOARD_PID_CWD_TTL_MS) {
+    return cached.cwd;
+  }
+
+  const cwd = await getPidCwd(safePid);
+  dashboardPidCwdCache.set(safePid, { cwd, createdAt: now });
+  if (dashboardPidCwdCache.size > 500) {
+    const cutoff = now - DASHBOARD_PID_CWD_TTL_MS;
+    for (const [cachedPid, entry] of dashboardPidCwdCache) {
+      if (entry.createdAt < cutoff || !alivePid(cachedPid)) dashboardPidCwdCache.delete(cachedPid);
+    }
+  }
+  return cwd;
+}
+
 function getProjectNameFromCwd(cwd) {
   if (!cwd) return '';
   try {
@@ -11167,6 +11191,14 @@ async function listElectronDevProcesses() {
     if (a.isOrphan !== b.isOrphan) return a.isOrphan ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
+}
+
+async function getDashboardProcessRows() {
+  const psOutput = await execAsync('ps -axo pid=,ppid=,pcpu=,pmem=,lstart=,command=', 3000);
+  return (psOutput || '')
+    .split('\n')
+    .map(parseLongPsLine)
+    .filter(Boolean);
 }
 
 function alivePid(pid) {
@@ -11246,6 +11278,37 @@ function readDashboardInstanceFromPortFile(fileName, commandByPid) {
   };
 }
 
+function buildDashboardOwnershipSnapshotFromRows(rows) {
+  const parentByPid = new Map();
+  const commandByPid = new Map();
+  for (const row of rows || []) {
+    parentByPid.set(row.pid, row.ppid);
+    commandByPid.set(row.pid, row.command);
+  }
+
+  const instancesByPid = new Map();
+  instancesByPid.set(process.pid, {
+    pid: process.pid,
+    isPackaged: app.isPackaged,
+    label: formatDashboardInstanceLabel(process.pid, app.isPackaged, commandByPid.get(process.pid) || ''),
+  });
+
+  try {
+    const files = fs.readdirSync(MCP_PORT_DIR).filter(f => f.startsWith('mcp-port-'));
+    for (const fileName of files) {
+      const instance = readDashboardInstanceFromPortFile(fileName, commandByPid);
+      if (instance) instancesByPid.set(instance.pid, instance);
+    }
+  } catch {}
+
+  return {
+    parentByPid,
+    commandByPid,
+    instancesByPid,
+    createdAt: Date.now(),
+  };
+}
+
 async function getDashboardOwnershipSnapshot() {
   const now = Date.now();
   if (dashboardOwnershipSnapshotCache && now - dashboardOwnershipSnapshotCache.createdAt < DASHBOARD_OWNERSHIP_SNAPSHOT_TTL_MS) {
@@ -11255,40 +11318,13 @@ async function getDashboardOwnershipSnapshot() {
   if (dashboardOwnershipSnapshotInflight) return dashboardOwnershipSnapshotInflight;
 
   dashboardOwnershipSnapshotInflight = (async () => {
-    const parentByPid = new Map();
-    const commandByPid = new Map();
     try {
-      const psOut = await execAsync('ps -axo pid=,ppid=,command=', 2000);
-      for (const line of (psOut || '').split('\n')) {
-        const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
-        if (!match) continue;
-        const pid = Number(match[1]);
-        parentByPid.set(pid, Number(match[2]));
-        commandByPid.set(pid, match[3]);
-      }
+      const rows = await getDashboardProcessRows();
+      const snapshot = buildDashboardOwnershipSnapshotFromRows(rows);
+      dashboardOwnershipSnapshotCache = snapshot;
+      return snapshot;
     } catch {}
-
-    const instancesByPid = new Map();
-    instancesByPid.set(process.pid, {
-      pid: process.pid,
-      isPackaged: app.isPackaged,
-      label: formatDashboardInstanceLabel(process.pid, app.isPackaged, commandByPid.get(process.pid) || ''),
-    });
-
-    try {
-      const files = fs.readdirSync(MCP_PORT_DIR).filter(f => f.startsWith('mcp-port-'));
-      for (const fileName of files) {
-        const instance = readDashboardInstanceFromPortFile(fileName, commandByPid);
-        if (instance) instancesByPid.set(instance.pid, instance);
-      }
-    } catch {}
-
-    const snapshot = {
-      parentByPid,
-      commandByPid,
-      instancesByPid,
-      createdAt: Date.now(),
-    };
+    const snapshot = buildDashboardOwnershipSnapshotFromRows([]);
     dashboardOwnershipSnapshotCache = snapshot;
     return snapshot;
   })();
@@ -11586,6 +11622,154 @@ ipcMain.handle('system:get-codex-processes', async () => {
     return processes.filter(Boolean);
   } catch {
     return [];
+  }
+});
+
+async function buildDashboardElectronDevProcessesFromRows(rows) {
+  const byPid = new Map(rows.map(row => [row.pid, row]));
+  const selected = rows.filter(row => isElectronDevAppCommand(row.command) && row.pid !== process.pid);
+  const processes = await Promise.all(selected.map(async (row) => {
+    const cwd = await getDashboardPidCwd(row.pid);
+    const projectName = getProjectNameFromCwd(cwd);
+    const parent = byPid.get(row.ppid);
+    const launcherPid = parent && isElectronLauncherCommand(parent.command) ? parent.pid : null;
+    return {
+      pid: row.pid,
+      ppid: row.ppid,
+      launcherPid,
+      cwd,
+      name: projectName || 'Electron app',
+      startTime: row.startTime,
+      command: row.command,
+      cpu: row.cpu,
+      mem: row.mem,
+      isOrphan: row.ppid === 1,
+    };
+  }));
+
+  return processes.sort((a, b) => {
+    if (a.isOrphan !== b.isOrphan) return a.isOrphan ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+async function buildDashboardAiProcessesFromRows(rows, kind, ownershipSnapshot, pidToTabId) {
+  let selected = rows.filter(row => {
+    const command = row.command || '';
+    if (command.includes('Electron') || command.includes('electron')) return false;
+    if (kind === 'codex') {
+      return command.includes('--no-alt-screen') && commandLooksLikeAiProcess(command, 'codex');
+    }
+    return command.toLowerCase().includes(kind) && commandLooksLikeAiProcess(command, kind);
+  });
+
+  if (kind === 'codex') {
+    const codexPidSet = new Set(selected.map(row => row.pid));
+    selected = selected.filter(row => !codexPidSet.has(row.ppid));
+  }
+
+  const processes = await Promise.all(selected.map(async (row) => {
+    const cwd = await getDashboardPidCwd(row.pid);
+    if (!cwd) return null;
+
+    const tabId = pidToTabId.get(row.ppid) || null;
+    const owner = resolveDashboardProcessOwner(row.ppid, ownershipSnapshot, tabId);
+
+    return {
+      pid: row.pid,
+      ppid: row.ppid,
+      cwd,
+      startTime: row.startTime,
+      command: row.command,
+      tabId,
+      cpu: row.cpu,
+      mem: row.mem,
+      ...owner,
+    };
+  }));
+
+  return processes.filter(Boolean);
+}
+
+function commandLooksLikeMcpProcess(command) {
+  const text = String(command || '');
+  if (text.includes('Electron') || text.includes('electron')) return false;
+  return /mcp|terminal-server\.mjs|knowledge-server\.mjs|gemini-mcp|yougile-mcp|playwright-mcp|chrome-devtools|extension-mcp/i.test(text);
+}
+
+function buildDashboardMcpProcessesFromRows(rows, ownershipSnapshot) {
+  const aliveCliPids = new Set();
+  for (const [, ptyProcess] of terminals) aliveCliPids.add(ptyProcess.pid);
+
+  for (const row of rows) {
+    const command = row.command || '';
+    if (command.includes('Electron') || command.includes('electron')) continue;
+    if ((commandLooksLikeAiProcess(command, 'claude') || commandLooksLikeAiProcess(command, 'gemini')) && aliveCliPids.has(row.ppid)) {
+      aliveCliPids.add(row.pid);
+    }
+  }
+
+  const processes = [];
+  for (const row of rows) {
+    if (!commandLooksLikeMcpProcess(row.command)) continue;
+
+    let name = 'mcp';
+    const m1 = row.command.match(/([\w.-]+(?:-mcp|mcp-server|server\.mjs|extension-mcp\/index\.js))/i);
+    if (m1) name = m1[1].replace(/^.*\//, '');
+    else {
+      const parts = row.command.split(/\s+/);
+      name = (parts[1] || parts[0] || 'mcp').split('/').pop() || 'mcp';
+    }
+
+    const owner = resolveDashboardProcessOwner(row.ppid, ownershipSnapshot, null);
+    const isAlive = aliveCliPids.has(row.ppid) || !!owner.protectedByApp;
+    processes.push({
+      pid: row.pid,
+      ppid: row.ppid,
+      cpu: row.cpu,
+      mem: row.mem,
+      startTime: row.startTime,
+      command: row.command,
+      name,
+      isAlive,
+      ownerInstance: owner.ownerInstance,
+      ownerLabel: owner.ownerLabel,
+      ownerPid: owner.ownerPid,
+      protectedByApp: owner.protectedByApp,
+      killable: owner.killable,
+    });
+  }
+  return processes;
+}
+
+ipcMain.handle('system:get-dashboard-processes', async () => {
+  try {
+    const rows = await getDashboardProcessRows();
+    const ownershipSnapshot = buildDashboardOwnershipSnapshotFromRows(rows);
+    dashboardOwnershipSnapshotCache = ownershipSnapshot;
+
+    const pidToTabId = new Map();
+    for (const [tabId, ptyProcess] of terminals) {
+      pidToTabId.set(ptyProcess.pid, tabId);
+    }
+
+    const [electronDev, claude, gemini, codex] = await Promise.all([
+      buildDashboardElectronDevProcessesFromRows(rows),
+      buildDashboardAiProcessesFromRows(rows, 'claude', ownershipSnapshot, pidToTabId),
+      buildDashboardAiProcessesFromRows(rows, 'gemini', ownershipSnapshot, pidToTabId),
+      buildDashboardAiProcessesFromRows(rows, 'codex', ownershipSnapshot, pidToTabId),
+    ]);
+
+    return {
+      claude,
+      gemini,
+      codex,
+      mcp: buildDashboardMcpProcessesFromRows(rows, ownershipSnapshot),
+      electronDev,
+    };
+  } catch (err) {
+    console.log('[DashboardProcesses] aggregate failed: ' + (err?.message || String(err)));
+    return { claude: [], gemini: [], codex: [], mcp: [], electronDev: [] };
   }
 });
 

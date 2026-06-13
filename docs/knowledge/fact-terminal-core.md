@@ -406,6 +406,8 @@ if (state.isRunning) {
 - `terminal:getCommandState` (читает из памяти, 0 syscalls)
 - IPC-события `terminal:command-started` / `terminal:command-finished`
 
+Исключение — Dashboard inventory внешних AI/Electron/MCP процессов, потому что external terminal нельзя узнать через OSC 133 текущего PTY. Это не должно становиться process-status polling: только один aggregate `ps` snapshot на refresh, без per-tab/per-card `pgrep`, с visible-window guard и медленным safety interval. Если нужен новый тип процесса на Dashboard — добавлять его в общий snapshot-builder, а не новый самостоятельный IPC с отдельным `ps`.
+
 ## TRAP: IPC Listeners + useEffect Dependencies
 
 **Ловушка:** Если `ipcRenderer.on(...)` подписки находятся в `useEffect` с нестабильной зависимостью (например `[workspace?.tabs.size]`), то при каждом изменении зависимости:

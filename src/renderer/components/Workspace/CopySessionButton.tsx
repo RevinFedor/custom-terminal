@@ -64,16 +64,21 @@ export function ClaudeSparkle({ size = 12, color = 'currentColor' }: { size?: nu
   );
 }
 
-function ToolGroupLabel({ tools, hint }: { tools: string[]; hint?: string }) {
+function CopyCategoryLabel({ title, tools, hint }: { title: string; tools?: string[]; hint?: string }) {
   return (
-    <span style={{ display: 'inline-flex', alignItems: 'baseline', flexWrap: 'wrap', gap: '4px' }}>
-      {tools.map((t, i) => (
-        <React.Fragment key={t}>
-          {i > 0 && <span style={{ color: '#555' }}>·</span>}
-          <code style={{ fontFamily: 'ui-monospace, monospace', fontSize: '10.5px', color: '#d4d4d4', background: 'rgba(255,255,255,0.04)', padding: '1px 4px', borderRadius: 3 }}>{t}</code>
-        </React.Fragment>
-      ))}
-      {hint && <span style={{ color: '#666', fontSize: '10px', marginLeft: 2 }}>{hint}</span>}
+    <span style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
+      <span style={{ color: '#d0d0d0', fontSize: '11.5px', fontWeight: 600 }}>{title}</span>
+      {(tools?.length || hint) && (
+        <span style={{ display: 'inline-flex', alignItems: 'baseline', flexWrap: 'wrap', gap: '4px', minWidth: 0 }}>
+          {tools?.map((t, i) => (
+            <React.Fragment key={t}>
+              {i > 0 && <span style={{ color: '#444' }}>·</span>}
+              <code style={{ fontFamily: 'ui-monospace, monospace', fontSize: '10.5px', color: '#d4d4d4', background: 'rgba(255,255,255,0.04)', padding: '1px 4px', borderRadius: 3 }}>{t}</code>
+            </React.Fragment>
+          ))}
+          {hint && <span style={{ color: '#666', fontSize: '10px' }}>{hint}</span>}
+        </span>
+      )}
     </span>
   );
 }
@@ -340,7 +345,7 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
             >
               <div
                 className="bg-[#1a1a1a] border border-[#444] rounded-lg shadow-2xl flex flex-col"
-                style={{ backdropFilter: 'blur(12px)', boxShadow: '0 15px 35px rgba(0,0,0,0.6)', padding: '8px 10px', minWidth: '260px', gap: '1px' }}
+                style={{ backdropFilter: 'blur(12px)', boxShadow: '0 15px 35px rgba(0,0,0,0.6)', padding: '8px 10px', width: 'min(340px, calc(100vw - 24px))', gap: '1px' }}
               >
                 <div style={{ fontSize: '9px', textTransform: 'uppercase', fontWeight: 700, color: '#777', borderBottom: '1px solid #2a2a2a', paddingBottom: 6, marginBottom: 4, letterSpacing: '0.05em' }}>
                   Настройки копирования
@@ -354,21 +359,21 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
                   color={toggleColor}
                   onToggle={() => setIncludeClaude(!includeClaude)}
                 />
-                <ToggleRow label={<span style={{ fontStyle: 'italic' }}>«answer»</span>} active={includeText} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeText(!includeText)} />
+                <ToggleRow label={<CopyCategoryLabel title="Ответ агента" tools={['answer']} />} active={includeText} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeText(!includeText)} />
                 {!isCodex && (
-                  <ToggleRow label={<span style={{ fontStyle: 'italic' }}>«thinking»</span>} active={includeThinking} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeThinking(!includeThinking)} />
+                  <ToggleRow label={<CopyCategoryLabel title="Ход рассуждения" tools={['thinking']} />} active={includeThinking} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeThinking(!includeThinking)} />
                 )}
                 {!isCodex && (
-                  <ToggleRow label={<ToolGroupLabel tools={['read_file']} />} active={includeReading} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeReading(!includeReading)} />
+                  <ToggleRow label={<CopyCategoryLabel title="Чтение файлов" tools={['read_file']} />} active={includeReading} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeReading(!includeReading)} />
                 )}
-                <ToggleRow label={<ToolGroupLabel tools={isCodex ? ['apply_patch'] : ['edit', 'write']} />} active={includeEditing} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeEditing(!includeEditing)} />
-                <ToggleRow label={<ToolGroupLabel tools={isCodex ? ['exec_command', 'write_stdin'] : ['bash', 'monitor', 'grep', 'glob']} hint="shell" />} active={includeBash} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeBash(!includeBash)} />
-                <ToggleRow label={<ToolGroupLabel tools={['mcp__*']} hint="MCP" />} active={includeTools} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeTools(!includeTools)} />
-                <ToggleRow label={<ToolGroupLabel tools={['web_search']} />} active={includeWebSearch} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeWebSearch(!includeWebSearch)} />
+                <ToggleRow label={<CopyCategoryLabel title="Правки файлов" tools={isCodex ? ['apply_patch'] : ['edit', 'write']} hint="изменение файлов" />} active={includeEditing} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeEditing(!includeEditing)} />
+                <ToggleRow label={<CopyCategoryLabel title="Shell-команды" tools={isCodex ? ['exec_command', 'write_stdin'] : ['bash', 'monitor', 'grep', 'glob']} hint="команды и ввод" />} active={includeBash} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeBash(!includeBash)} />
+                <ToggleRow label={<CopyCategoryLabel title="MCP-инструменты" tools={['mcp__*']} hint="docs, electron, browser..." />} active={includeTools} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeTools(!includeTools)} />
+                <ToggleRow label={<CopyCategoryLabel title="Web-поиск" tools={['web_search']} hint="интернет и страницы" />} active={includeWebSearch} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeWebSearch(!includeWebSearch)} />
                 {isCodex && (
-                  <ToggleRow label={<ToolGroupLabel tools={['tool_search']} />} active={includeToolSearch} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeToolSearch(!includeToolSearch)} />
+                  <ToggleRow label={<CopyCategoryLabel title="Поиск доступных tools" tools={['tool_search']} hint="каталог инструментов, не интернет" />} active={includeToolSearch} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeToolSearch(!includeToolSearch)} />
                 )}
-                <ToggleRow label={<ToolGroupLabel tools={['other_tools']} />} active={includeOtherTools} color={toggleColor} disabled={!includeClaude} indent isLastChild onToggle={() => setIncludeOtherTools(!includeOtherTools)} />
+                <ToggleRow label={<CopyCategoryLabel title="Прочие инструменты" tools={['other_tools']} hint="view_image, update_plan..." />} active={includeOtherTools} color={toggleColor} disabled={!includeClaude} indent isLastChild onToggle={() => setIncludeOtherTools(!includeOtherTools)} />
 
                 <div style={{ height: 1, backgroundColor: '#2a2a2a', margin: '6px 0' }} />
 
@@ -385,8 +390,8 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
                     }
                   }}
                 />
-                <ToggleRow label={<span>Финальный результат <span style={{ color: '#666', fontSize: '10px' }}>— {isCodex ? 'ответ wait_agent' : 'ответ Task'}</span></span>} active={includeSubagentResult} color={toggleColor} disabled={!(includeSubagentResult || includeSubagentHistory)} indent onToggle={() => setIncludeSubagentResult(!includeSubagentResult)} />
-                <ToggleRow label={<span>Вся история <span style={{ color: '#666', fontSize: '10px' }}>— {isCodex ? 'spawn/wait/send' : 'все шаги'}</span></span>} active={includeSubagentHistory} color={toggleColor} disabled={!(includeSubagentResult || includeSubagentHistory)} indent isLastChild onToggle={() => setIncludeSubagentHistory(!includeSubagentHistory)} />
+                <ToggleRow label={<CopyCategoryLabel title="Только финальный ответ" tools={isCodex ? ['wait_agent'] : ['Task']} hint="результат субагента" />} active={includeSubagentResult} color={toggleColor} disabled={!(includeSubagentResult || includeSubagentHistory)} indent onToggle={() => setIncludeSubagentResult(!includeSubagentResult)} />
+                <ToggleRow label={<CopyCategoryLabel title="Вся цепочка субагента" tools={isCodex ? ['spawn', 'wait', 'send'] : ['all_steps']} hint="служебная история" />} active={includeSubagentHistory} color={toggleColor} disabled={!(includeSubagentResult || includeSubagentHistory)} indent isLastChild onToggle={() => setIncludeSubagentHistory(!includeSubagentHistory)} />
 
                 {!isCodex && (
                   <>
