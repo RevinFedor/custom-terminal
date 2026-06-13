@@ -2,6 +2,7 @@ import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { Settings } from 'lucide-react';
 import { useUIStore } from '../store/useUIStore';
+import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import type { ClaudeCodeModelOption } from '../store/useUIStore';
 import type { CodexModelOption } from '../constants/codexSettings';
 import {
@@ -80,6 +81,7 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
       }}
     >
       <div className="flex items-center gap-3">
+        <McpActivityChip />
         <WebServerChip />
       </div>
       <div className="flex items-center gap-2">
@@ -113,6 +115,277 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
       </div>
     </div>
   );
+}
+
+type McpActivitySource = {
+  server?: string;
+  mode?: string;
+  projectId?: string;
+  tabId?: string;
+  cwd?: string;
+};
+
+type McpActivityEvent = {
+  id: string;
+  at: number;
+  action: string;
+  status: string;
+  tabId?: string;
+  targetProjectId?: string;
+  targetCwd?: string;
+  targetName?: string;
+  engine?: string;
+  mode?: string;
+  sessionId?: string | null;
+  commandPreview?: string;
+  promptChars?: number;
+  stepCount?: number;
+  error?: string;
+  sourceMeta?: McpActivitySource | null;
+};
+
+const MCP_ACTIVE_STATUSES = new Set(['running', 'creating', 'sending', 'pasting']);
+
+function McpActivityChip() {
+  const [events, setEvents] = useState<McpActivityEvent[]>([]);
+  const [open, setOpen] = useState(false);
+  const chipRef = useRef<HTMLButtonElement>(null);
+  const popupRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const onActivity = (_: unknown, raw: McpActivityEvent) => {
+      if (!raw?.id || !raw.action) return;
+      const next: McpActivityEvent = { ...raw, at: raw.at || Date.now() };
+      setEvents(prev => {
+        const existing = prev.find(e => e.id === next.id);
+        const merged = existing ? { ...existing, ...next } : next;
+        const rest = prev.filter(e => e.id !== next.id);
+        return [merged, ...rest].slice(0, 20);
+      });
+    };
+    ipcRenderer.on('terminal:mcp-activity', onActivity);
+    return () => ipcRenderer.removeListener('terminal:mcp-activity', onActivity);
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (chipRef.current?.contains(e.target as Node)) return;
+      if (popupRef.current?.contains(e.target as Node)) return;
+      setOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
+
+  const latest = events[0];
+  const hasActive = events.some(e => MCP_ACTIVE_STATUSES.has(e.status));
+  const dotColor = hasActive ? '#f59e0b' : latest ? statusColor(latest.status) : '#444';
+  const chipTitle = latest
+    ? `${actionLabel(latest.action)}: ${latest.status}`
+    : 'Нет управляющих terminal MCP вызовов в этой сессии UI';
+
+  return (
+    <>
+      <button
+        ref={chipRef}
+        onClick={() => setOpen(v => !v)}
+        title={chipTitle}
+        className="inline-flex items-center gap-1 cursor-pointer hover:bg-white/5 rounded"
+        style={{ padding: '1px 6px', height: 18 }}
+      >
+        <span
+          style={{
+            width: 8,
+            height: 8,
+            borderRadius: 4,
+            backgroundColor: dotColor,
+            boxShadow: hasActive ? '0 0 7px rgba(245, 158, 11, 0.7)' : 'none',
+            transition: 'background-color 0.15s, box-shadow 0.15s',
+          }}
+        />
+        <span style={{ color: latest ? '#ddd' : '#666' }}>MCP</span>
+        {latest && (
+          <span style={{ color: hasActive ? '#fbbf24' : '#777', maxWidth: 86, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {actionLabel(latest.action)}
+          </span>
+        )}
+      </button>
+      {open && chipRef.current && createPortal(
+        <McpActivityPopup
+          chipRect={chipRef.current.getBoundingClientRect()}
+          popupRef={popupRef}
+          events={events}
+          onFocusTarget={(event) => { focusMcpTarget(event); setOpen(false); }}
+        />,
+        document.body
+      )}
+    </>
+  );
+}
+
+function McpActivityPopup({ chipRect, popupRef, events, onFocusTarget }: {
+  chipRect: DOMRect;
+  popupRef: React.RefObject<HTMLDivElement | null>;
+  events: McpActivityEvent[];
+  onFocusTarget: (event: McpActivityEvent) => void;
+}) {
+  return (
+    <div
+      ref={popupRef}
+      style={{
+        position: 'fixed',
+        left: Math.max(6, Math.min(chipRect.left, window.innerWidth - 430)),
+        bottom: window.innerHeight - chipRect.top + 4,
+        zIndex: 10010,
+      }}
+    >
+      <div
+        className="bg-[#1a1a1a] border border-[#444] rounded shadow-2xl"
+        style={{ width: 420, maxHeight: 360, overflow: 'hidden', boxShadow: '0 -8px 24px rgba(0,0,0,0.5)' }}
+      >
+        <div className="flex items-center justify-between border-b border-[#333]" style={{ padding: '8px 10px' }}>
+          <span style={{ color: '#ddd', fontWeight: 700, fontSize: 11, letterSpacing: 0.4 }}>TERMINAL MCP</span>
+          <span style={{ color: '#666', fontSize: 11 }}>{events.length ? `${events.length} events` : 'idle'}</span>
+        </div>
+        {events.length === 0 ? (
+          <div style={{ padding: 12, color: '#777', fontSize: 12 }}>
+            Управляющих вызовов пока не было. Пассивные чтения истории и списка вкладок здесь не показываются.
+          </div>
+        ) : (
+          <div style={{ maxHeight: 310, overflowY: 'auto', padding: 6 }}>
+            {events.map(event => {
+              const canFocus = !!(event.tabId || event.targetProjectId || event.targetCwd);
+              return (
+                <button
+                  key={event.id}
+                  onClick={() => canFocus && onFocusTarget(event)}
+                  disabled={!canFocus}
+                  className="w-full text-left rounded"
+                  style={{
+                    border: 'none',
+                    outline: 'none',
+                    padding: '7px 8px',
+                    marginBottom: 4,
+                    background: MCP_ACTIVE_STATUSES.has(event.status) ? 'rgba(245, 158, 11, 0.12)' : 'rgba(255,255,255,0.03)',
+                    color: canFocus ? '#ddd' : '#888',
+                    cursor: canFocus ? 'pointer' : 'default',
+                  }}
+                >
+                  <div className="flex items-center justify-between" style={{ gap: 8 }}>
+                    <span style={{ color: statusColor(event.status), fontWeight: 700, fontSize: 12 }}>
+                      {actionLabel(event.action)} · {event.status}
+                    </span>
+                    <span style={{ color: '#666', fontSize: 10, fontVariantNumeric: 'tabular-nums' }}>{timeLabel(event.at)}</span>
+                  </div>
+                  <div style={{ color: '#999', fontSize: 11, marginTop: 3, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {targetLabel(event)}
+                  </div>
+                  <div style={{ color: '#666', fontSize: 11, marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    from {sourceLabel(event.sourceMeta)}
+                    {event.engine ? ` · ${event.engine}` : ''}
+                    {event.mode ? `/${event.mode}` : ''}
+                    {typeof event.promptChars === 'number' ? ` · ${event.promptChars} chars` : ''}
+                    {typeof event.stepCount === 'number' ? ` · ${event.stepCount} steps` : ''}
+                    {event.commandPreview ? ` · ${event.commandPreview}` : ''}
+                  </div>
+                  {event.error && (
+                    <div style={{ color: '#ef4444', fontSize: 11, marginTop: 3, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {event.error}
+                    </div>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+async function focusMcpTarget(event: McpActivityEvent) {
+  const store = useWorkspaceStore.getState();
+  let projectId = event.targetProjectId || '';
+
+  if (!projectId && event.tabId) {
+    for (const [pid, ws] of store.openProjects) {
+      if (ws.tabs.has(event.tabId)) {
+        projectId = pid;
+        break;
+      }
+    }
+  }
+
+  if (!projectId && event.targetCwd) {
+    let bestLen = -1;
+    for (const [pid, ws] of store.openProjects) {
+      const projectPath = ws.projectPath;
+      if (!projectPath || projectPath.startsWith('__unset__')) continue;
+      if (event.targetCwd === projectPath || event.targetCwd.startsWith(projectPath + '/')) {
+        if (projectPath.length > bestLen) {
+          bestLen = projectPath.length;
+          projectId = pid;
+        }
+      }
+    }
+  }
+
+  if (!projectId) return;
+  const latest = useWorkspaceStore.getState();
+  if (!latest.openProjects.has(projectId) && event.targetCwd) {
+    await Promise.resolve((latest.openProject as any)(projectId, event.targetCwd, { background: false }));
+  } else {
+    latest.showWorkspace(projectId);
+  }
+  const after = useWorkspaceStore.getState();
+  after.setProjectView(projectId, 'terminal');
+  if (event.tabId) after.switchTab(projectId, event.tabId);
+}
+
+function actionLabel(action: string): string {
+  switch (action) {
+    case 'create_tab': return 'create';
+    case 'run_command': return 'run';
+    case 'restart_process': return 'restart';
+    case 'kill_process': return 'kill';
+    case 'send_prompt': return 'prompt';
+    case 'start_ai': return 'start AI';
+    case 'stop_ai': return 'stop AI';
+    case 'run_chain': return 'chain';
+    default: return action.replace(/^terminal:/, '');
+  }
+}
+
+function statusColor(status: string): string {
+  if (MCP_ACTIVE_STATUSES.has(status)) return '#f59e0b';
+  if (status === 'error' || status === 'not_stopped' || status === 'completed_with_errors') return '#ef4444';
+  if (status === 'sent' || status === 'started' || status === 'stopped' || status === 'completed' || status === 'killed' || status === 'restarted' || status === 'pasted' || status === 'requested') return '#22c55e';
+  return '#888';
+}
+
+function targetLabel(event: McpActivityEvent): string {
+  const target = event.targetName || event.tabId || event.targetProjectId || event.targetCwd || 'unknown target';
+  const project = event.targetProjectId ? `project ${shortId(event.targetProjectId)}` : '';
+  const tab = event.tabId ? `tab ${shortId(event.tabId)}` : '';
+  return [target, project, tab].filter(Boolean).join(' · ');
+}
+
+function sourceLabel(source?: McpActivitySource | null): string {
+  if (!source) return 'unknown';
+  const mode = source.mode || 'unknown';
+  const tab = source.tabId ? ` tab ${shortId(source.tabId)}` : '';
+  const project = source.projectId ? ` project ${shortId(source.projectId)}` : '';
+  const cwd = source.cwd ? ` ${source.cwd}` : '';
+  return `${source.server || 'terminal'}:${mode}${project}${tab}${cwd}`;
+}
+
+function shortId(id: string): string {
+  return id.length > 8 ? id.slice(-8) : id;
+}
+
+function timeLabel(ms: number): string {
+  return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
 // Counter of broken file paths attached to AI prompts (+ doc-prompt file, if it's used).
