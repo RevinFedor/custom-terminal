@@ -4813,7 +4813,8 @@ function startMcpHttpServer() {
       req.on('end', async () => {
         let activityId = null;
         try {
-          const { name, cwd, command, color, parentProjectId, sourceMeta } = JSON.parse(body);
+          const { name, cwd, command, color, parentProjectId, sourceMeta, background } = JSON.parse(body);
+          const openInBackground = background !== false;
           // When parentProjectId is set, cwd becomes optional — main can fall back
           // to the project's stored path. cwd-only flow (legacy callers) still works.
           let effectiveCwd = cwd;
@@ -4829,13 +4830,14 @@ function startMcpHttpServer() {
             return;
           }
 
-          console.log('[MCP:Terminal] POST /terminal/create name=' + (name || 'auto') + ' projectId=' + (parentProjectId || '-') + ' cwd=' + effectiveCwd + ' cmd=' + (command || '(none)'));
+          console.log('[MCP:Terminal] POST /terminal/create name=' + (name || 'auto') + ' projectId=' + (parentProjectId || '-') + ' cwd=' + effectiveCwd + ' cmd=' + (command || '(none)') + ' background=' + openInBackground);
           activityId = emitTerminalMcpActivity('create_tab', {
             status: 'creating',
             targetProjectId: parentProjectId || undefined,
             targetCwd: effectiveCwd || undefined,
             targetName: name || undefined,
             commandPreview: command ? String(command).slice(0, 120) : undefined,
+            background: openInBackground,
             sourceMeta: sourceMeta || null,
           });
 
@@ -4847,6 +4849,7 @@ function startMcpHttpServer() {
               command: command || undefined,
               color: color || undefined,
               parentProjectId: parentProjectId || undefined,
+              background: openInBackground,
             });
           }
           emitTerminalMcpActivity('create_tab', {
@@ -4856,6 +4859,7 @@ function startMcpHttpServer() {
             targetCwd: effectiveCwd || undefined,
             targetName: name || undefined,
             commandPreview: command ? String(command).slice(0, 120) : undefined,
+            background: openInBackground,
             sourceMeta: sourceMeta || null,
           });
 
@@ -7854,8 +7858,13 @@ ipcMain.handle('claude:clear-input', async (event, tabId) => {
   return { success: true };
 });
 
-ipcMain.handle('claude:send-command', async (event, tabId, command) => {
-  console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" ts=' + Date.now());
+ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions = {}) => {
+  const sendOptions = rawOptions && typeof rawOptions === 'object' ? rawOptions : {};
+  const source = typeof sendOptions.source === 'string' && sendOptions.source.trim()
+    ? sendOptions.source.trim()
+    : 'send-command';
+  const stashFirst = sendOptions.stashFirst === false ? false : true;
+  console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" source=' + source + ' stashFirst=' + stashFirst + ' ts=' + Date.now());
   const term = terminals.get(tabId);
   if (!term) { console.log('[send-command] ❌ Terminal not found for tabId=' + tabId); return { success: false, error: 'no_terminal' }; }
   if (!hasLiveClaudeInTab(tabId)) {
@@ -7885,12 +7894,12 @@ ipcMain.handle('claude:send-command', async (event, tabId, command) => {
   startClaudeLocalCommandWatcher(tabId, command, 'send-command');
   return await safePasteAndSubmit(term, command, {
     submit: true,
-    stashFirst: true,
+    stashFirst,
     // dismissAutocomplete intentionally OFF: slash-cmds with arguments (/model haiku,
     // /effort low) don't match any prefix beyond the slash — autocomplete is empty
     // by the time we send Enter, so PromptInput.onSubmit guard passes. Sending Esc
     // here triggers Claude's "Esc again to clear" hint, visible briefly under input.
-    logPrefix: '[send-command:' + tabId + ']'
+    logPrefix: '[send-command:' + tabId + (source !== 'send-command' ? ':' + source : '') + ']'
   });
 });
 
@@ -11342,6 +11351,39 @@ function codexSessionIdFromDb(tabId) {
   }
 }
 
+function getCodexSessionOwner(sessionId, exceptTabId = null) {
+  if (!sessionId) return null;
+  for (const [knownTabId, knownSessionId] of codexKnownSessions) {
+    if (knownTabId !== exceptTabId && knownSessionId === sessionId) {
+      return { tabId: knownTabId, source: 'memory' };
+    }
+  }
+  try {
+    const row = projectManager?.db?.db?.prepare(
+      'SELECT tab_id FROM tabs WHERE codex_session_id = ? AND tab_id != ? LIMIT 1'
+    ).get(sessionId, exceptTabId || '');
+    if (row?.tab_id) return { tabId: row.tab_id, source: 'db' };
+  } catch {}
+  return null;
+}
+
+function getCodexWatcherExcludedSessionIds(tabId, sourceSessionId = null) {
+  const ids = new Set();
+  if (sourceSessionId) ids.add(String(sourceSessionId));
+  for (const [, sessionId] of codexKnownSessions) {
+    if (sessionId) ids.add(String(sessionId));
+  }
+  try {
+    const rows = projectManager?.db?.db?.prepare(
+      'SELECT tab_id, codex_session_id FROM tabs WHERE codex_session_id IS NOT NULL AND codex_session_id != ""'
+    ).all() || [];
+    for (const row of rows) {
+      if (row?.codex_session_id) ids.add(String(row.codex_session_id));
+    }
+  } catch {}
+  return Array.from(ids);
+}
+
 async function ensureCodexTurnWatcher(tabId, sessionId, cwd) {
   const existing = codexTurnWatchers.get(tabId);
   if (existing && (!sessionId || existing.sessionId === sessionId)) return true;
@@ -11376,18 +11418,25 @@ function startCodexSessionWatcher(sender, { tabId, cwd, startedAt, sourceSession
     detecting = true;
     detectCount += 1;
     try {
+      const excludeSessionIds = getCodexWatcherExcludedSessionIds(tabId, sourceSessionId);
       const hit = await codexDataModule._api.findLatestCodexSession({
         cwd: normalizedCwd,
         sinceMs: startedAt || 0,
         sourceSessionId,
+        excludeSessionIds,
       });
-	      if (hit?.sessionId && !found) {
-	        found = true;
-	        console.log('[Codex Watcher] session detected:', hit.sessionId, 'tab:', tabId, 'reason:', reason, 'file:', hit.filePath, 'cwd:', hit.cwd || 'n/a', 'cwdMatched:', !!hit.cwdMatched, 'sourceMatched:', !!hit.sourceMatched, 'source:', sourceSessionId || 'n/a');
-	        setCodexKnownSession(tabId, hit.sessionId, 'watcher-detected');
-	        startCodexTurnWatcher({ tabId, sessionId: hit.sessionId, filePath: hit.filePath });
-	        sender.send('codex:session-detected', { tabId, sessionId: hit.sessionId, cwd: hit.cwd || null });
-	        closeCodexWatcher(tabId, 'detected');
+      if (hit?.sessionId && !found) {
+        const owner = getCodexSessionOwner(hit.sessionId, tabId);
+        if (owner) {
+          console.warn('[Codex Watcher] duplicate session skipped:', hit.sessionId, 'candidateTab:', tabId, 'ownerTab:', owner.tabId, 'ownerSource:', owner.source, 'reason:', reason);
+          return;
+        }
+        found = true;
+        console.log('[Codex Watcher] session detected:', hit.sessionId, 'tab:', tabId, 'reason:', reason, 'file:', hit.filePath, 'cwd:', hit.cwd || 'n/a', 'cwdMatched:', !!hit.cwdMatched, 'sourceMatched:', !!hit.sourceMatched, 'source:', sourceSessionId || 'n/a', 'excludeCount:', excludeSessionIds.length);
+        setCodexKnownSession(tabId, hit.sessionId, 'watcher-detected');
+        startCodexTurnWatcher({ tabId, sessionId: hit.sessionId, filePath: hit.filePath });
+        sender.send('codex:session-detected', { tabId, sessionId: hit.sessionId, cwd: hit.cwd || null });
+        closeCodexWatcher(tabId, 'detected');
       } else if (detectCount <= 3 || detectCount % 10 === 0) {
         console.log('[Codex Watcher] miss tab:', tabId, 'reason:', reason, 'attempt:', detectCount, 'cwd:', normalizedCwd, 'since:', startedAt || 0, 'source:', sourceSessionId || 'n/a');
       }

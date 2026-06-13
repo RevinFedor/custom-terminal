@@ -1107,7 +1107,10 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           _effortDiag(tabId, '🚀 MODEL FIRED', '/model ' + model + ' — sending before /effort');
           console.warn('[Terminal:ModelInject] tab=' + tabId.slice(-12) + ' /model ' + model + ' (Bridge:Fresh fallback)');
           try {
-            const result = await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model);
+            const result = await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model, {
+              source: 'startup-defaults:bridge-model',
+              stashFirst: false,
+            });
             if (result?.success === false) throw new Error(result.error || 'send-command failed');
             const bridgeWait = await waitForClaudeStartupModelBridge(tabId, model);
             _effortDiag(tabId, '✅ MODEL COMPLETED', '/model ' + model + ' — bridgeWait=' + bridgeWait);
@@ -1162,7 +1165,10 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       const iCount = (_effortInjectCalls.get(tabId) || 0) + 1;
       _effortInjectCalls.set(tabId, iCount);
       console.warn('[EffortDiag2026-05][INVOKE-FIRE] tab=' + tabId.slice(-12) + ' invokeN=' + iCount + ' handlerN=' + (_effortHandlerCalls.get(tabId) || 0) + ' effort=' + eff + ' ts=' + Date.now());
-      ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff).then(() => {
+      ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff, {
+        source: 'startup-defaults:bridge-effort',
+        stashFirst: false,
+      }).then(() => {
         _effortDiag(tabId, '✅ INJECT COMPLETED', '/effort ' + eff + ' — Claude acknowledged');
       }).catch((e: unknown) => {
         _effortDiag(tabId, '❌ INJECT FAILED', String(e));
@@ -1181,7 +1187,10 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         _modelSentForTab.set(tabId, { at: Date.now(), via: 'tui-ready', model });
         console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /model ' + model + ' (early path, before /effort)');
         try {
-          const result = await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model);
+          const result = await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model, {
+            source: 'startup-defaults:tui-model',
+            stashFirst: false,
+          });
           if (result?.success === false) throw new Error(result.error || 'send-command failed');
           const bridgeWait = await waitForClaudeStartupModelBridge(tabId, model);
           console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /model ' + model + ' bridgeWait=' + bridgeWait + ' — continuing to /effort');
@@ -1210,7 +1219,10 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       // Bridge:Fresh, which then no-ops). See fact-claude-tui-control.md.
       _effortSentForTab.set(tabId, { at: Date.now(), via: 'tui-ready', level: eff });
       console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /effort ' + eff + ' (early path, before Bridge:Fresh)');
-      ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff).catch((e: unknown) => {
+      ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff, {
+        source: 'startup-defaults:tui-effort',
+        stashFirst: false,
+      }).catch((e: unknown) => {
         console.error('[Terminal:TuiReady] inject failed', e);
         _effortSentForTab.delete(tabId); // allow Bridge:Fresh fallback to retry
       });

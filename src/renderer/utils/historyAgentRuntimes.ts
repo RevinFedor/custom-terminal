@@ -248,7 +248,9 @@ const CLAUDE_RUNTIME: HistoryAgentRuntime = {
   supportsInterruptRecovery: true,
   interruptRecoveryReasons: ['interrupt'],
   allowSendWhileBusy: true,
-  optimisticBusyOnSend: true,
+  // History controls must not treat paste/send completion as model thinking.
+  // The busy edge comes from Claude's UserPromptSubmit/Stop pipeline.
+  optimisticBusyOnSend: false,
   optimisticActiveOnInterrupt: true,
   getPresence: getClaudePtyPresence,
   resume: resumeClaudePtySession,

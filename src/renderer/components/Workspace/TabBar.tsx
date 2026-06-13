@@ -1249,7 +1249,7 @@ const ZoneDropTarget = memo(({
   );
 });
 
-const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, onEditChange, onEditSubmit, onEditKeyDown, inputRef, onStartRename, onContextMenu, onAuxClick, onToggleCollapsed, cmdCollapseMode }: {
+const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, onEditChange, onEditSubmit, onEditKeyDown, inputRef, onStartRename, onContextMenu, onAuxClick, onToggleCollapsed, onFocusGroup, isFocused }: {
   group: TabGroup;
   count: number;
   projectId: string;
@@ -1263,13 +1263,16 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
   onContextMenu: (e: React.MouseEvent) => void;
   onAuxClick: (e: React.MouseEvent) => void;
   onToggleCollapsed: () => void;
-  cmdCollapseMode: boolean;
+  onFocusGroup: () => void;
+  isFocused: boolean;
 }) => {
   const ref = useRef<HTMLDivElement>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isPressing, setIsPressing] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
   const [isIconHovered, setIsIconHovered] = useState(false);
+  const clickTimerRef = useRef<number | null>(null);
+  const suppressClickAfterDragRef = useRef(false);
   const bodyCursorRef = useRef<string | null>(null);
   const tabGeo = useUIStore((s) => s.tabGeometry);
   const tabsFontSize = useUIStore((s) => s.tabsFontSize);
@@ -1294,6 +1297,9 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
   }, []);
 
   useEffect(() => () => clearBodyGrabbing(), [clearBodyGrabbing]);
+  useEffect(() => () => {
+    if (clickTimerRef.current !== null) window.clearTimeout(clickTimerRef.current);
+  }, []);
 
   useEffect(() => {
     if (!isPressing) return;
@@ -1319,7 +1325,7 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
       draggable({
         element,
         canDrag: ({ input }) => {
-          if (isEditing || input.metaKey || input.ctrlKey) return false;
+          if (isEditing) return false;
           const hit = document.elementFromPoint(input.clientX, input.clientY);
           return !hit?.closest('[data-group-collapse-button]');
         },
@@ -1338,6 +1344,7 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
           });
         },
         onDragStart: () => {
+          suppressClickAfterDragRef.current = true;
           setIsDragging(true);
           setBodyGrabbing();
         },
@@ -1345,6 +1352,9 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
           setIsDragging(false);
           setIsPressing(false);
           clearBodyGrabbing();
+          window.setTimeout(() => {
+            suppressClickAfterDragRef.current = false;
+          }, 0);
         },
       }),
       dropTargetForElements({
@@ -1358,10 +1368,10 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
     );
   }, [group.id, isEditing, projectId]);
 
-  const dragLiftActive = isPressing || isDragging;
+  const dragLiftActive = isDragging;
   const isCollapsed = !!group.collapsed;
-  const iconAccentActive = isIconHovered || isCollapsed;
-  const headerCursor = dragLiftActive ? 'grabbing' : (cmdCollapseMode ? 'pointer' : 'default');
+  const iconAccentActive = isHovered || isIconHovered || isCollapsed || isFocused;
+  const headerCursor = dragLiftActive ? 'grabbing' : 'pointer';
   const groupColor = group.color && group.color !== 'default' ? group.color : undefined;
   const groupColorConfig = TAB_COLORS.find(c => c.color === groupColor);
   const folderColor = groupColorConfig?.borderColor || '#8b5cf6';
@@ -1373,14 +1383,14 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
       return groupColorConfig ? adjustRgbaAlpha(groupColorConfig.bgColor, 0.10) : 'rgba(139,92,246,0.16)';
     }
     if (groupColorConfig) {
-      return adjustRgbaAlpha(groupColorConfig.bgColor, isHovered ? 0.10 : (isCollapsed ? 0.04 : -0.06));
+      return adjustRgbaAlpha(groupColorConfig.bgColor, isHovered || isFocused ? 0.10 : (isCollapsed ? 0.04 : -0.06));
     }
-    if (isCollapsed) return isHovered ? 'rgba(139,92,246,0.17)' : 'rgba(139,92,246,0.11)';
+    if (isCollapsed || isFocused) return isHovered ? 'rgba(139,92,246,0.17)' : 'rgba(139,92,246,0.11)';
     return isHovered ? 'rgba(255,255,255,0.07)' : 'rgba(255,255,255,0.035)';
   })();
   const groupBorder = dragLiftActive
     ? (groupColorConfig?.borderColor || 'rgba(139,92,246,0.58)')
-    : (groupColorConfig?.borderColor || (isCollapsed ? 'rgba(139,92,246,0.42)' : 'rgba(255,255,255,0.08)'));
+    : (groupColorConfig?.borderColor || (isCollapsed || isFocused ? 'rgba(139,92,246,0.42)' : 'rgba(255,255,255,0.08)'));
 
   return (
     <div
@@ -1399,7 +1409,7 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
         fontSize: `${tabsFontSize}px`,
         cursor: headerCursor,
         userSelect: 'none',
-        color: (isHovered || dragLiftActive || isCollapsed) ? '#e5e7eb' : '#a1a1aa',
+        color: (isHovered || dragLiftActive || isCollapsed || isFocused) ? '#e5e7eb' : '#a1a1aa',
         backgroundColor: groupBackground,
         border: `1px solid ${groupBorder}`,
         opacity: isDragging ? 0.96 : 1,
@@ -1407,36 +1417,44 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
         transformOrigin: 'center',
         boxShadow: dragLiftActive
           ? '0 0 0 1px rgba(139,92,246,0.32), 0 6px 18px rgba(0,0,0,0.28)'
-          : (isCollapsed ? 'inset 0 0 0 1px rgba(139,92,246,0.10)' : 'none'),
+          : (isCollapsed || isFocused ? 'inset 0 0 0 1px rgba(139,92,246,0.10)' : 'none'),
         transition: 'background-color 0.12s, color 0.12s, opacity 0.12s, transform 90ms ease, box-shadow 90ms ease, border-color 90ms ease',
       }}
       onMouseDown={(e) => {
         if (isEditing) return;
         if (e.button !== 0) return;
-        if (e.metaKey || e.ctrlKey) return;
         if ((e.target as HTMLElement).closest('[data-group-collapse-button]')) return;
         setIsPressing(true);
-        setBodyGrabbing();
       }}
       onClick={(e) => {
         if (isEditing) return;
-        if (!e.metaKey && !e.ctrlKey) return;
+        if (suppressClickAfterDragRef.current) return;
         e.preventDefault();
         e.stopPropagation();
-        onToggleCollapsed();
+        onFocusGroup();
+        if ((e.target as HTMLElement).closest('[data-group-collapse-button]')) return;
+        if (clickTimerRef.current !== null) window.clearTimeout(clickTimerRef.current);
+        clickTimerRef.current = window.setTimeout(() => {
+          clickTimerRef.current = null;
+          onToggleCollapsed();
+        }, 170);
       }}
       onDoubleClick={(e) => {
         e.preventDefault();
         e.stopPropagation();
-        if (cmdCollapseMode) return;
+        if (clickTimerRef.current !== null) {
+          window.clearTimeout(clickTimerRef.current);
+          clickTimerRef.current = null;
+        }
         if ((e.target as HTMLElement).closest('[data-group-collapse-button]')) return;
+        onFocusGroup();
         onStartRename();
       }}
       onContextMenu={onContextMenu}
       onAuxClick={onAuxClick}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
-      title={isEditing ? 'Rename group' : (cmdCollapseMode ? 'Collapse / expand group' : 'Hold and drag group')}
+      title={isEditing ? 'Rename group' : 'Click to collapse / expand. Double-click to rename.'}
     >
       {statusMeta && (
         <span
@@ -1468,6 +1486,7 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
         onClick={(e) => {
           e.preventDefault();
           e.stopPropagation();
+          onFocusGroup();
           onToggleCollapsed();
         }}
         onDoubleClick={(e) => {
@@ -1494,9 +1513,9 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
           padding: 0,
           cursor: 'pointer',
           color: iconAccentActive ? '#c4b5fd' : folderColor,
-          backgroundColor: iconAccentActive ? 'rgba(139,92,246,0.20)' : 'transparent',
-          transition: 'background-color 120ms ease, color 120ms ease, transform 140ms ease',
-          transform: isIconHovered ? 'scale(1.07)' : 'scale(1)',
+          backgroundColor: iconAccentActive ? 'rgba(139,92,246,0.18)' : 'transparent',
+          boxShadow: isIconHovered ? 'inset 0 0 0 1px rgba(196,181,253,0.22)' : 'inset 0 0 0 1px rgba(196,181,253,0)',
+          transition: 'background-color 120ms ease, color 120ms ease, box-shadow 120ms ease',
         }}
         title={isCollapsed ? 'Expand group' : 'Collapse group'}
       >
@@ -1504,8 +1523,7 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
           size={14}
           strokeWidth={2}
           style={{
-            transform: isIconHovered ? 'translateY(-1px)' : 'translateY(0)',
-            transition: 'transform 140ms ease',
+            transition: 'color 120ms ease',
           }}
         />
         <ChevronDown
@@ -1517,7 +1535,7 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
             bottom: 1,
             color: '#ddd6fe',
             opacity: iconAccentActive ? 1 : 0.62,
-            transform: `rotate(${isCollapsed ? -90 : 0}deg) ${isIconHovered ? 'translateY(1px)' : 'translateY(0)'}`,
+            transform: `rotate(${isCollapsed ? -90 : 0}deg)`,
             transformOrigin: 'center',
             transition: 'transform 140ms ease, opacity 120ms ease',
           }}
@@ -1842,6 +1860,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const createTabAfterCurrent = useWorkspaceStore((state) => state.createTabAfterCurrent);
   const closeTab = useWorkspaceStore((state) => state.closeTab);
   const switchTab = useWorkspaceStore((state) => state.switchTab);
+  const setActiveTabGroup = useWorkspaceStore((state) => state.setActiveTabGroup);
   const renameTab = useWorkspaceStore((state) => state.renameTab);
   const renameTabGroup = useWorkspaceStore((state) => state.renameTabGroup);
   const toggleTabGroupCollapsed = useWorkspaceStore((state) => state.toggleTabGroupCollapsed);
@@ -2483,6 +2502,25 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       for (const id of selectedRootIds) visualParentAssignments[id] = parentId;
       return makePreview(insertAt(withoutSource, sourceIds, targetIndex));
     };
+    const assignParentAfterOwnChild = (childId: string) => {
+      if (sourceData.type !== 'TAB') return null;
+      const sourceId = sourceData.id;
+      const child = tabById.get(childId);
+      if (!child || child.visualParentTabId !== sourceId) return null;
+      const selectedIds = sourceData.selectedTabIds && sourceData.selectedTabIds.includes(sourceId)
+        ? sourceData.selectedTabIds
+        : [sourceId];
+      if (selectedIds.length !== 1) return null;
+      const withoutParentOnly = baseOrder.filter(id => id !== sourceId);
+      const childIndex = withoutParentOnly.indexOf(childId);
+      if (childIndex < 0) return null;
+      for (const id of withoutParentOnly.slice(0, childIndex + 1)) {
+        if (tabById.get(id)?.visualParentTabId === sourceId) {
+          visualParentAssignments[id] = null;
+        }
+      }
+      return makePreview(insertAt(withoutParentOnly, [sourceId], childIndex + 1));
+    };
 
     if (targetData?.type === 'EMPTY_ZONE') {
       const lastRow = geometry.rows[geometry.rows.length - 1];
@@ -2511,15 +2549,20 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       if (clientY < first.rect.top - 8 || clientY > last.rect.bottom + 12) continue;
       let targetMemberIndex = 0;
       for (const tabRow of row.tabRows) {
-        if (sourceSet.has(tabRow.tabId)) continue;
         if (clientY >= tabRow.rect.top && clientY <= tabRow.rect.bottom) {
           const before = clientY < tabRow.rect.midY;
+          if (sourceSet.has(tabRow.tabId)) {
+            const parentAfterChildPreview = !before ? assignParentAfterOwnChild(tabRow.tabId) : null;
+            if (parentAfterChildPreview) return parentAfterChildPreview;
+            continue;
+          }
           const visualDrop = visualDropForTab(tabRow.tabId, before);
           if (visualDrop) return assignVisualParent(visualDrop.parentId, visualDrop.index);
           if (before) break;
           targetMemberIndex += 1;
           break;
         }
+        if (sourceSet.has(tabRow.tabId)) continue;
         if (clientY < tabRow.rect.midY) break;
         targetMemberIndex += 1;
       }
@@ -2528,9 +2571,14 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
     for (let rowIndex = 0; rowIndex < geometry.rows.length; rowIndex += 1) {
       const row = geometry.rows[rowIndex];
-      if (row.type !== 'tab' || sourceSet.has(row.tabId)) continue;
+      if (row.type !== 'tab') continue;
       if (clientY < row.rect.top || clientY > row.rect.bottom) continue;
       const before = clientY < row.rect.midY;
+      if (sourceSet.has(row.tabId)) {
+        const parentAfterChildPreview = !before ? assignParentAfterOwnChild(row.tabId) : null;
+        if (parentAfterChildPreview) return parentAfterChildPreview;
+        continue;
+      }
       const visualDrop = visualDropForTab(row.tabId, before);
       if (visualDrop) return assignVisualParent(visualDrop.parentId, visualDrop.index);
       return assignFlat(before ? rowIndex : rowIndex + 1);
@@ -3716,7 +3764,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                       void closeGroupById(row.group.id);
                     }}
                     onToggleCollapsed={() => toggleTabGroupCollapsed(projectId, row.group.id)}
-                    cmdCollapseMode={isCmdPressed}
+                    onFocusGroup={() => setActiveTabGroup(projectId, row.group.id)}
+                    isFocused={workspace.activeGroupId === row.group.id}
                   />
                   {(row.tabs.length > 0 || !row.group.collapsed) && (
                     <div

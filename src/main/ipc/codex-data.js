@@ -271,9 +271,12 @@ async function findCodexSessionFile(sessionId, cwd) {
   return null;
 }
 
-async function findLatestCodexSession({ cwd, sinceMs = 0, sourceSessionId = null } = {}) {
+async function findLatestCodexSession({ cwd, sinceMs = 0, sourceSessionId = null, excludeSessionIds = [] } = {}) {
   if (!fs.existsSync(CODEX_SESSIONS_DIR)) return null;
   const normalizedCwd = cwd ? path.resolve(cwd) : null;
+  const excludedSessionIds = new Set((Array.isArray(excludeSessionIds) ? excludeSessionIds : [])
+    .filter(Boolean)
+    .map(String));
   const files = await walkJsonlFiles(CODEX_SESSIONS_DIR);
   const candidates = [];
 
@@ -298,11 +301,12 @@ async function findLatestCodexSession({ cwd, sinceMs = 0, sourceSessionId = null
     }
     const meta = getSessionMeta(records);
     if (!meta?.id) continue;
+    if (excludedSessionIds.has(String(meta.id))) continue;
     if (sourceSessionId && meta.id === sourceSessionId) continue;
     const sessionStartedMs = meta.timestamp ? Date.parse(meta.timestamp) : 0;
-    if (sinceMs && sessionStartedMs && sessionStartedMs < sinceMs - 60000) continue;
-    const cwdMatched = !normalizedCwd || !meta.cwd || path.resolve(meta.cwd) === normalizedCwd;
-    const sourceMatched = recordsReferenceSession(records, sourceSessionId);
+    if (sinceMs && Number.isFinite(sessionStartedMs) && sessionStartedMs > 0 && sessionStartedMs < sinceMs - 5000) continue;
+    const cwdMatched = !normalizedCwd || (meta.cwd && path.resolve(meta.cwd) === normalizedCwd);
+    const sourceMatched = !!sourceSessionId && recordsReferenceSession(records, sourceSessionId);
     if (!cwdMatched && !sourceMatched) continue;
     return {
       sessionId: meta.id,

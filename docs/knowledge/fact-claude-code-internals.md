@@ -33,6 +33,8 @@ Fork делает `fs.copyFile` всего JSONL + перезаписывает 
 ```
 Это единственный маркер форка. Наше приложение вместо этого использует fork markers в SQLite.
 
+Механически нативный `/fork` (внутреннее имя `/branch`, декомпил `commands/branch/branch.ts`) делает **ровно то же что наш `forkSessionFile`**: читает JSONL, на каждой записи `{...entry, sessionId: forkSessionId, parentUuid, forkedFrom}`, пишет новый файл. Одно отличие — Claude дополнительно копирует `content-replacement` записи (трекают какие `tool_result` были усечены preview-механизмом); без них `claude -r <fork>` восстанавливает state с пустой replacements-Map → усечённые результаты классифицируются как FROZEN и шлются полным телом (cache miss + overage). Мы это не копируем — влияет только на сессии где Claude активно резал большие tool-выводы. **Cache-miss форка идентичен resume и не наша вина:** первый запрос форка попадает под тот же дрейф billing-prefix что любой `--resume` (см. `fact-provider-proxy.md::Attribution header kill`); с `CLAUDE_CODE_ATTRIBUTION_HEADER=0` и в пределах 1h-TTL форк делит prefix-кэш родителя. `forkSession()` в Agent SDK 0.3.x — **стаб** (`throw 'not implemented'`), реального server-side форка нет ни у кого, только дисковая копия JSONL.
+
 ### Эволюция формата bridge записей
 
 | Версия | parentUuid | slug | message content |

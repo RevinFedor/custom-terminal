@@ -77,6 +77,7 @@ const defaultSearchOptions: ISearchOptions = {
 
 const GEMINI_BRAILLE_RE = /[\u280B\u2819\u2839\u2838\u283C\u2834\u2826\u2827\u2807\u280F]/;
 const CODEX_NON_DRAFT_LINE_RE = /(OpenAI Codex|model:|directory:|permissions:|Use \/skills|Full Access|Context \d+%|weekly \d+%|Starting MCP|esc to interrupt|Select Model|Tip:|Model changed|^╭|^╰|^│)/i;
+const CODEX_EMPTY_COMPOSER_HINT_RE = /Use \/skills to list available skills/i;
 
 interface LogicalCell {
   ch: string;
@@ -128,21 +129,33 @@ function extractCodexDraftFromLine(snapshotOrLine: LogicalLineSnapshot | string)
     .trimEnd();
   const normalizedClean = normalized.replace(/[▌█]/g, '');
   if (!normalizedClean.trim()) return { hasDraft: false, preview: '' };
-  if (CODEX_NON_DRAFT_LINE_RE.test(normalizedClean.trim())) return { hasDraft: null, preview: normalizedClean.trim().slice(0, 120) };
 
   const promptIdx = Math.max(normalized.lastIndexOf('›'), normalized.lastIndexOf('❯'));
   if (promptIdx >= 0) {
     const afterPrompt = normalized.slice(promptIdx + 1).replace(/[▌█]/g, '').trim();
     if (!afterPrompt) return { hasDraft: false, preview: '' };
-    if (CODEX_NON_DRAFT_LINE_RE.test(afterPrompt)) return { hasDraft: null, preview: afterPrompt.slice(0, 120) };
     const afterPromptCells = snapshot.cells
       .slice(promptIdx + 1)
       .filter((cell) => cell.ch.trim() && cell.ch !== '▌' && cell.ch !== '█');
     if (afterPromptCells.length > 0 && afterPromptCells.every((cell) => cell.dim)) {
       return { hasDraft: false, preview: afterPrompt.slice(0, 120), sourceSuffix: ':dim-hint' };
     }
+    if (CODEX_EMPTY_COMPOSER_HINT_RE.test(afterPrompt)) {
+      return { hasDraft: false, preview: afterPrompt.slice(0, 120), sourceSuffix: ':idle-hint' };
+    }
+    if (CODEX_NON_DRAFT_LINE_RE.test(afterPrompt)) return { hasDraft: null, preview: afterPrompt.slice(0, 120) };
     return { hasDraft: true, preview: afterPrompt.slice(0, 120) };
   }
+
+  const nonBlankCells = snapshot.cells
+    .filter((cell) => cell.ch.trim() && cell.ch !== '▌' && cell.ch !== '█');
+  if (nonBlankCells.length > 0 && nonBlankCells.every((cell) => cell.dim)) {
+    return { hasDraft: false, preview: normalizedClean.trim().slice(0, 120), sourceSuffix: ':dim-hint' };
+  }
+  if (CODEX_EMPTY_COMPOSER_HINT_RE.test(normalizedClean.trim())) {
+    return { hasDraft: false, preview: normalizedClean.trim().slice(0, 120), sourceSuffix: ':idle-hint' };
+  }
+  if (CODEX_NON_DRAFT_LINE_RE.test(normalizedClean.trim())) return { hasDraft: null, preview: normalizedClean.trim().slice(0, 120) };
 
   return { hasDraft: null, preview: normalizedClean.trim().slice(0, 120) };
 }

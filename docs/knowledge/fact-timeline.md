@@ -201,7 +201,7 @@ Toolbar не генерирует пересказы сам — он тольк�
 - **Improved Thresholds:** Порог `isIsolatedShort` для коротких сообщений (типа "продолжай") увеличен с $+10$ до $+25$ символов, чтобы учитывать отступы и декорации, добавляемые Gemini TUI.
 
 #### Codex CLI (JSONL + text-search)
-Codex Timeline грузится через `codex:get-timeline`, а HistoryPanel — через `codex:get-full-history`. Это отдельный парсер поверх `~/.codex/sessions/**/rollout-*.jsonl`, не Claude backtrace и не Gemini `projects.json`. Поэтому Claude-only действия (`Edit Range`, rewind, fork marker deletion, token breakdown backend) для Codex отключены; одинарное копирование точки копирует её raw content.
+Codex Timeline грузится через `codex:get-timeline`, а HistoryPanel — через `codex:get-full-history`. Это отдельный парсер поверх `~/.codex/sessions/**/rollout-*.jsonl`, не Claude backtrace и не Gemini `projects.json`. Поэтому Claude-only действия (`Edit Range`, rewind, fork marker deletion, token breakdown backend) для Codex отключены; одинарное копирование точки копирует её raw content, а range-selection теперь тоже работает по double-click-потоку: popup для Codex оставляет только `Копировать` и вызывает `codex:copy-range`.
 
 Навигация Codex использует тот же text-search anchor путь, что Gemini: в Codex PTY нет наших Claude OSC markers, и привязка `terminalRegistry.bindEntryToPromptBoundary` не должна выполняться. Если Codex-F запускает правильную сессию, но Timeline/Copy ID пустые, сначала проверяй `codexSessionId` capture и watcher matching (cwd vs `sourceSessionId`), а не renderer Timeline. Подробности — `fact-codex.md`.
 
