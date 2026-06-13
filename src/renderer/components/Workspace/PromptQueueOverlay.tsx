@@ -310,8 +310,10 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   const [railRunHover, setRailRunHover] = useState(false);
   const [cmdPressed, setCmdPressed] = useState(false);
   const cmdPressedRef = useRef(false);
+  const [panelOpening, setPanelOpening] = useState(false);
   const [panelClosing, setPanelClosing] = useState(false);
   const collapseTimerRef = useRef<number | null>(null);
+  const openingTimerRef = useRef<number | null>(null);
   const prevHintRef = useRef(false);
   useEffect(() => {
     if (firstChipArmedHint && !prevHintRef.current) {
@@ -912,15 +914,28 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       window.clearTimeout(collapseTimerRef.current);
       collapseTimerRef.current = null;
     }
+    if (openingTimerRef.current !== null) {
+      window.clearTimeout(openingTimerRef.current);
+    }
     setPanelClosing(false);
+    setPanelOpening(true);
     setPanelCollapsed(tabId, false);
+    openingTimerRef.current = window.setTimeout(() => {
+      setPanelOpening(false);
+      openingTimerRef.current = null;
+    }, PANEL_SLIDE_MS);
   }, [tabId, setPanelCollapsed]);
 
   const collapsePanel = useCallback(() => {
     commitEditor();
+    if (openingTimerRef.current !== null) {
+      window.clearTimeout(openingTimerRef.current);
+      openingTimerRef.current = null;
+    }
     if (collapseTimerRef.current !== null) {
       window.clearTimeout(collapseTimerRef.current);
     }
+    setPanelOpening(false);
     setPanelClosing(true);
     setPanelCollapsed(tabId, true);
     collapseTimerRef.current = window.setTimeout(() => {
@@ -934,6 +949,10 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       if (collapseTimerRef.current !== null) {
         window.clearTimeout(collapseTimerRef.current);
         collapseTimerRef.current = null;
+      }
+      if (openingTimerRef.current !== null) {
+        window.clearTimeout(openingTimerRef.current);
+        openingTimerRef.current = null;
       }
     };
   }, []);
@@ -1015,7 +1034,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       >
         {panelOpen && (
           <div
-            className={panelClosing ? 'pq-panel-closing' : 'pq-panel-opening'}
+            className={panelClosing ? 'pq-panel-closing' : (panelOpening ? 'pq-panel-opening' : undefined)}
             style={{
               position: 'relative',
               width: effectiveWidth,
@@ -1593,6 +1612,9 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
             zIndex: 2,
             padding: '4px 2px',
             boxSizing: 'border-box',
+            background: '#151515',
+            border: '1px solid #303030',
+            borderRadius: 18,
             display: 'flex',
             flexDirection: 'column',
             alignItems: 'center',

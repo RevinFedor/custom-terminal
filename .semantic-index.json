@@ -88,39 +88,69 @@
     "path": "docs/methodology/переносимый-дизайн.md",
     "type": "fact",
     "explicit": [
-      "design_methodology",
-      "ux_philosophy",
-      "ui_implementation_patterns",
-      "portable_ux"
+      "portable_design_methodology",
+      "ux_principles",
+      "ui_implementation_patterns"
     ],
     "implicit": [
-      "safePasteAndSubmit_chunking",
-      "ink_tui_ansi_repositioning",
-      "zustand_store_reactivity",
-      "jsonl_chain_resolution",
-      "react_useEffect_ipc_drop",
-      "sqlite_localstorage_sync",
-      "drag_preview_buffering",
-      "controlled_editor_pingpong",
-      "clipping_portal_zindex",
-      "clipboard_di_seam",
-      "stale_closure_async"
+      "per_tab_tooling_state",
+      "truth_from_server_response",
+      "two_tier_hierarchical_selectors",
+      "asymmetric_latency_perception",
+      "persistent_state_clear_on_error",
+      "edit_affordance_omnipresence",
+      "ink_tui_ansi_parsing",
+      "authoritative_artifact_detection",
+      "latched_ui_state_reconciliation",
+      "click_outside_universal_escape",
+      "popover_geometry_measurement",
+      "optical_alignment_baseline_shift",
+      "destructive_action_color_differentiation",
+      "loader_localized_element",
+      "draggable_row_primary_click",
+      "dense_row_tint_not_icon_scale",
+      "visual_tokens_vs_components_package",
+      "mirror_editing_layout",
+      "toast_preview_and_checkpoint",
+      "drag_state_mouseup_flush",
+      "hover_highlight_data_attribute",
+      "react_strictmode_double_invoke",
+      "cross_package_clipboard_di",
+      "state_mirror_useeffect_stale_read",
+      "idempotent_repeats_by_position",
+      "sqlite_dev_settings_persistence",
+      "layout_reservation_height",
+      "position_fixed_containing_block_trap",
+      "one_shot_effect_async_reload",
+      "focus_vs_selection_coordination",
+      "global_keystroke_routing",
+      "diff_dark_theme_highlighting",
+      "macos_panel_window_focus",
+      "outside_click_uiohook_monitor",
+      "derived_file_banner_sync",
+      "electron_before_quit_async",
+      "split_button_owner_seam",
+      "pivoted_timing_trigger_runner",
+      "tab_type_live_runtime_promotion",
+      "click_target_entire_linked_zone"
     ],
     "symptoms": [
-      "The UI shows stale data after moving between active tabs or changing model selectors",
-      "A layout shift or jump occurs when clicking buttons or expanding collapsible panels",
-      "Mouse selection copy results in a flat, unformatted plain text stream without breaks",
-      "Drag handles or resizable sidebars lag and stutter when dragging across the screen",
-      "A popup is offset or positioned incorrectly when resizing panels or collapsing sidebars"
+      "UI elements shift, jitter, or jump when expanding collapsible sections or opening popovers",
+      "Settings and interface dimensions reset unexpectedly in development after Vite port changes",
+      "Background task indicators or loaders remain spinning infinitely after aborting a session",
+      "Keyboard shortcuts and ESC-dismiss actions fail to trigger when switching system input layouts",
+      "Text selection in the chat history gets canceled immediately when clicking adjacent areas",
+      "Active status badges and action buttons display outdated states due to optimistic state mismatches",
+      "Cursor shows drag affordance on a clickable row even though the user expects ordinary click or double-click rename",
+      "Hover feedback exists only on a tiny icon inside a dense navigation row instead of the whole click target"
     ],
     "related_components": [
       "src/renderer/components/UI/SettingsModal.tsx",
       "src/renderer/components/UI/Tooltip.tsx",
-      "src/renderer/hooks/usePromptQueueRunner.ts",
-      "src/renderer/utils/persistedStorage.ts",
-      "src/renderer/components/icons/ProviderIcons.tsx"
+      "src/renderer/components/UI/Toast.tsx",
+      "src/renderer/utils/persistedStorage.ts"
     ],
-    "hash": "b366f4080b1307c4ac1849964bc545ac9675d0ef08772f3c89a1da0d4f98e0ee"
+    "hash": "519e1d09ce7db3415accbe362844c203e6fa0f25818787e658d3457ccd20fba0"
   },
   {
     "path": "docs/methodology/сценарии-использования.md",
@@ -314,12 +344,60 @@
   },
   {
     "path": "docs/knowledge/fact-provider-proxy.md",
-    "hash": "b58badb7d4d796eb99220d64257778c16e0557d0ed30e1cc496a8dd54c2ab89d",
-    "type": "unknown",
-    "explicit": [],
-    "implicit": [],
-    "related_components": [],
-    "raw_response": "You've hit your weekly limit · resets Jun 17 at 4am (Europe/Moscow)"
+    "type": "fact",
+    "explicit": [
+      "LLM Provider Proxy",
+      "HTTP proxy routing",
+      "Per-tab routing",
+      "Provider modes (Anthropic, Zen, DeepSeek)",
+      "Prompt cache key preservation",
+      "Effort and thinking injection",
+      "Cache metrics logging",
+      "SQLite persistence",
+      "Connection pooling",
+      "Graceful shutdown"
+    ],
+    "implicit": [
+      "proxy_json_parse_fastpath",
+      "thinking_strip_resentialize",
+      "per_tab_url_prefix_routing",
+      "tabid_state_map",
+      "sqlite_provider_persist",
+      "deepseek_anthropic_compat",
+      "proxy_inject_effort_thinking",
+      "sse_cache_tap_decompression",
+      "cch_billing_sentinel",
+      "attribution_header_prefix_drift",
+      "socket_listener_guard",
+      "graceful_shutdown_drain",
+      "ipc_cache_update",
+      "jsonl_chain_break_recovery"
+    ],
+    "symptoms": [
+      "Provider switch in one tab unexpectedly routes requests from other tabs through the wrong endpoint",
+      "Cache metrics chip remains empty or shows zero stats despite successful streaming responses",
+      "After switching from Zen back to Anthropic, first request shows cache miss instead of hitting cached prefix",
+      "DeepSeek API rejects with HTTP 400: 'thinking options type cannot be disabled when reasoning_effort is set'",
+      "Provider configuration and effort level reset to defaults after restarting Electron",
+      "Statusline model indicator shows wrong provider name after switching mid-session",
+      "Resumed or forked sessions show dramatically lower cache hit rate despite identical system prompt prefix",
+      "Terminal closes abruptly or loses assistant response when proxy crashes during streaming",
+      "Node.js logs MaxListenersExceededWarning: 11 close listeners added to [Socket] under heavy workload",
+      "Long multi-turn sessions accumulate unexpectedly high billing tokens despite cache being hit"
+    ],
+    "related_components": [
+      "main.js",
+      "src/components/ControlBar.tsx",
+      "src/components/StatusBar.tsx",
+      "src/store/tabStore.ts",
+      "src/ipc/handlers.ts",
+      "fact-timeline.md",
+      "fact-claude-control-bar.md",
+      "fact-backtrace-jsonl.md",
+      "fact-dictation.md",
+      "~/.claude/statusline-bridge.sh"
+    ],
+    "hash": "3a599a5dc1b5e8ea433b96e705d6e6ba15e2221ca6e3a723ff9dbda449da7123"
   },
   {
     "path": "docs/knowledge/fact-terminal-rendering.md",
@@ -437,33 +515,32 @@
     "path": "docs/knowledge/fact-prompt-queue.md",
     "type": "fact",
     "explicit": [
-      "prompt-queue",
-      "external-editor",
-      "claude-code",
-      "codex",
-      "pty-input"
+      "prompt_queue_overlay",
+      "external_editor_hijack",
+      "claude_code_tui",
+      "run_after_auto_run",
+      "stop_after_cascade"
     ],
     "implicit": [
-      "noted_code_grab_dispatcher",
-      "usePromptQueueRunner",
-      "bridgeKnownSessions_liveness",
-      "runAfterTabId_pivot",
+      "usePromptQueueStore_sqlite_persistence",
+      "bridgeKnownSessions_liveness_guard",
+      "noted_code_grab_editor_hijack",
+      "usePromptQueueRunner_singleton_hook",
+      "backdrop_filter_containing_block_portal",
+      "runAfterTabId_pivot_tab",
+      "resolveGrabbedImagePaths_image_cache",
       "stopAfter_closeAfter_cascade",
-      "resolveGrabbedImagePaths",
-      "singleton_listener_unmount_drop",
-      "portal_containment_bypass",
-      "split_button_seam_owner",
-      "skip_reasons_disarm",
-      "editor_lock_routing",
-      "first_chip_hint_blink"
+      "first_chip_hint_blink",
+      "replayingIds_spinner_guard",
+      "editor_not_wired_diagnostic"
     ],
     "symptoms": [
-      "Run After overlay is invisible even though Claude CLI is currently alive and responding in the tab",
-      "Replay button click on a queued prompt displays a 'no_claude_session' error toast on auto-resumed tabs",
-      "Run After panel width or input fields resize and jump layout when adding prompt chips",
-      "Picker dropdown menu for selecting target tabs is clipped, hidden behind panels, or positioned incorrectly",
-      "Stop after button border or seam disappears randomly when switching workspace tabs",
-      "Auto-run triggers the next queued prompt immediately after user manually aborts the previous run with Escape"
+      "Run after prompts are not sent automatically when navigating away to another tab or project",
+      "Replay button returns a No Claude session error even though Claude is actively responding in the terminal",
+      "Run after picker dropdown is clipped, mispositioned, or renders completely off-screen",
+      "Clicking external editor shortcut Ctrl+G opens Sublime/Vim instead of capturing terminal input",
+      "Split button borders flicker or disappear when switching tabs or hovering on high-DPI displays",
+      "UI shows stale prompt queue status or fails to update width during drag-resize on slow drives"
     ],
     "related_components": [
       "src/renderer/store/usePromptQueueStore.ts",
@@ -472,7 +549,7 @@
       "src/renderer/hooks/usePromptQueueWebSync.ts",
       "src/main/main.js"
     ],
-    "hash": "53fa603aadde9e39e48e9dba6ab7a56e4d5e463397f406b3944cde0f64aac6b5"
+    "hash": "be612642f62f45291daeb4c0a71d1cef387d27efd21e0b2caa2ec80f7f9d3067"
   },
   {
     "path": "docs/knowledge/fact-session-status.md",
@@ -825,7 +902,9 @@
       "context-menu",
       "drag-and-drop",
       "ai-auto-naming",
-      "multi-select"
+      "multi-select",
+      "tab-groups",
+      "visual-child-forks"
     ],
     "implicit": [
       "tab_sidebar_vertical_mode",
@@ -840,12 +919,20 @@
       "tab_process_bar_dual_indicators",
       "sdk_pty_distinct_hue",
       "group_row_collapse_drag",
+      "active_group_cmd_t_target",
+      "empty_group_anchor_placeholder",
+      "visual_child_manual_dnd",
+      "vertical_row_flip_animation",
       "save_tabs_sqlite_write_storm"
     ],
     "symptoms": [
       "Active tab is incorrectly downgraded to devServer or npm run dev while Claude runs active terminal commands",
       "Multi-select tab highlighting is cleared as soon as a user clicks inside the custom prompt options panel",
       "Dragging tabs inside the left sidebar causes list items to jump, twitch, or place incorrectly at group boundaries",
+      "Clicking a tab group then pressing Cmd+T should create the new tab inside that group",
+      "Dragging below an empty tab group unexpectedly puts the tab into the group instead of below it",
+      "Dragging a tab next to an existing fork should make it another fork of the same parent",
+      "Fork connector line breaks between consecutive child tabs",
       "Claude session tabs lose their custom names and revert back to generic auto-generated names after restarting",
       "Left vertical sidebar fails to scroll using the mouse wheel"
     ],
@@ -856,7 +943,7 @@
       "src/renderer/components/Workspace/panels/ActionsPanel.tsx",
       "src/renderer/components/Workspace/panels/InfoPanel.tsx"
     ],
-    "hash": "ae574ae0c865958bd1fbcb756e11a5552902b783aabbb8e18764b4245cc59ddd"
+    "hash": "ec2e90361b752bf61b25f0c517abab74092de31ed626c973490da4ad2f7d1d2f"
   },
   {
     "path": "docs/knowledge/fix-gemini-capture.md",
@@ -1884,44 +1971,41 @@
     "path": "docs/knowledge/fact-codex.md",
     "type": "fact",
     "explicit": [
-      "codex_cli",
-      "pty_agent",
-      "rollout_jsonl",
-      "session_detection",
-      "history_panel",
-      "timeline_capture",
-      "model_picker",
-      "osc_debounce"
+      "codex_cli_integration",
+      "codex_session_watcher",
+      "rollout_jsonl_parsing",
+      "codex_model_picker",
+      "codex_timeline_history"
     ],
     "implicit": [
-      "codex_jsonl_watcher",
-      "command_codex_bypass",
+      "codex_session_detector_watcher",
+      "command_codex_bypass_alias",
+      "double_picker_model_effort",
       "osc_133_d_b_debounce",
-      "hasDraft_classification",
-      "codex_model_picker_flow",
-      "descendant_pid_lookup",
-      "compacted_replacement_history",
-      "noted_code_grab_wrapper_lock",
-      "sync_marker_validity",
-      "paste_path_routing",
-      "layout_depth_sensitivity",
-      "graceful_shutdown_lifecycle"
+      "replacement_history_compaction",
+      "xterm_draft_state_probe",
+      "noted_code_grab_vendor_pid",
+      "graceful_quit_codex_known_sessions",
+      "descendant_lookup_codex_pid",
+      "manual_pull_visual_state_guard",
+      "bracketed_paste_slash_enter_delay",
+      "pre_tokens_compact_marker"
     ],
     "symptoms": [
-      "Codex session is running but the Timeline or History panel on the right is empty or missing the session ID.",
-      "The right panel loader or busy indicator micro-flaps or remains active after a failed model selection flow.",
-      "Clicking the prompt copy or clear button opens an external editor instead of copying the input buffer.",
-      "The model picker (/model) gets stuck, echoes in the command line, or shows a double-flag error on launch.",
-      "After terminating the process or closing the tab, the companion loader remains stuck on BUSY instead of going READY."
+      "Codex starts in terminal but the right-side Timeline remains blank or the copy session ID button is empty",
+      "Changing Codex model or effort via the UI causes the command to hang, show errors, or dump raw slash text into the input",
+      "The busy loader indicator on the right panel flickers or disappears too early while Codex is still performing a turn",
+      "External editor or prompt-clear tools open but fail to retrieve or truncate the current terminal composer content",
+      "The session recovery overlay or AutoResume feature fails to preserve the active Codex state after restarting the application"
     ],
     "related_components": [
-      "src/main/codex/watcher.ts",
+      "src/main/codex/session-watcher.js",
+      "src/main/terminal/pty-wrapper.js",
       "src/renderer/components/HistoryPanel.tsx",
       "src/renderer/components/ControlBar.tsx",
-      "src/main/pty/terminalRegistry.ts",
       "bin/noted-code-grab.js"
     ],
-    "hash": "1a93f5fe20205405f624df98b51631850528414dc3a94827ad1f77a42557da84"
+    "hash": "60bc43e5f5b1fb9c637fceb923ce54cfeb40c15e9c3b786e95bc43c7d853c5df"
   },
   {
     "path": "docs/knowledge/fact-remote-access.md",
@@ -2185,43 +2269,52 @@
     "type": "fact",
     "explicit": [
       "timeline",
-      "history-panel",
-      "reachability",
-      "edit-range",
+      "claude_history",
+      "expanded_mode",
+      "viewport_dash",
+      "reachability_indicator",
+      "old_history_zone",
+      "chain_break_zone",
+      "edit_range",
+      "delete_range",
       "rewind",
-      "note-on-dot",
-      "viewport-dash",
-      "expanded-mode"
+      "osc_7777",
+      "prompt_summary"
     ],
     "implicit": [
-      "rewind_scroll_stabilization",
-      "timeline_viewport_dash",
-      "timeline_autoscroll_pending_bottom",
-      "edit_range_orphan_cleanup",
+      "viewport_dash_indicator",
+      "hollow_rings_reachability",
+      "custom_scrollbar_pointer_events",
+      "auto_scroll_tab_switch",
+      "osc_7777_boundary_injection",
+      "rgb_visual_search",
+      "orphan_cleanup_cascade",
       "provider_model_think_badge",
-      "timeline_notes_sqlite_on_conflict",
-      "timeline_rAF_debounced_scroll",
-      "history_panel_virtuoso_scroll_race",
-      "timeline_geometry_resize_observer",
-      "safePasteAndSubmit_chunking",
+      "content_visibility_containment",
+      "timeline_flex_height_trap",
+      "history_panel_scrolled_to_event_race",
+      "timeline_overlay_relative_wrapper",
+      "gemini_heuristic_search",
       "jsonl_chain_resolution",
-      "layout_flex_height_trap"
+      "programmatic_paste_safePasteAndSubmit"
     ],
     "symptoms": [
-      "Cmd+clicking a timeline dot opens the History Panel but lands on a completely wrong message due to estimated height errors",
-      "Active messages incorrectly display as red hollow rings even though their text exists in the terminal viewport",
-      "Timeline selection overlays and glows drift away from their dots when the user scrolls the sidebar",
-      "Applying an edit-range or deleting a history block corrupts parent-child chains or leaves phantom ghost entries in the timeline",
-      "Terminal scrolling stutters or drops frames because the timeline component triggers constant React re-renders"
+      "Timeline fails to scroll to the bottom when switching between tabs or resuming a session",
+      "Absolute animation overlays like pulses or selections detach from their points and drift during scroll",
+      "Clicking a timeline point with the history panel closed scrolls the terminal to a completely wrong prompt",
+      "Performing an Edit Range or Rewind causes Claude to restart with 0% context or select an incorrect dead branch",
+      "Timeline container stretches to full height and breaks the app layout instead of rendering its own scrollbar",
+      "Scrolling the timeline stutters heavily because of non-debounced scroll event handlers triggering full-component renders"
     ],
     "related_components": [
       "src/components/Timeline.tsx",
       "src/components/HistoryPanel.tsx",
       "src/components/EditRangePanel.tsx",
+      "src/terminalRegistry.ts",
       "ipc/claude-data.js",
-      "terminalRegistry.ts"
+      "main.js"
     ],
-    "hash": "f1690af1c1ecabde688c4b19d66566a9941bd144f2c98736aa44edd3cc28f4de"
+    "hash": "5a0b6e3fb6273823ca9881a197f4adea67f012ffa995898fda78d409156cd6b1"
   },
   {
     "path": "docs/knowledge/fix-paste-bracket-mode-loss.md",
@@ -3502,87 +3595,99 @@
     "path": "docs/knowledge/fact-claude-control-bar.md",
     "type": "fact",
     "explicit": [
-      "ClaudeControlBar",
-      "PTY",
-      "SDK",
-      "Codex",
-      "Layout",
-      "UX"
+      "ClaudeControlBar component architecture - 30px control strip under Terminal for AI-tab controls",
+      "Session management - session ID copying, clipboard fork operations, pristine tab launch patterns",
+      "Model/Effort/Think controls - inline pill-row design, right-anchored popups, gating logic per mode",
+      "Provider switching - Provider proxy integration, PTY-only controls, provider-gate for cache features",
+      "Live input actions - mic button, Enter key, Ctrl+C handling during dictation and command execution",
+      "Copy-prompt split-pill - atomic grab-input pattern replacing sequential copy+clear, tempfile reading",
+      "Tab binding and busy-state - useState reset on tabId rebind, lifecycle-edge cleanup for paste/local busy",
+      "Context percentage meter and cache cooldown chip - IPC channels for PTY, CustomEvent for SDK",
+      "Codex mode support - shared lifecycle with Claude/Gemini, model picker integration, draft detection",
+      "Visibility guards and focus contracts - pristine tab detection, launch order, focus injection post-submit"
     ],
     "implicit": [
-      "keyless_tab_state_leak",
-      "grab_input_atomic",
-      "dictation_enter_pending",
-      "click_to_reset_busy_overlay",
-      "context_pct_bridge",
-      "sdk_busy_mirror",
-      "zustand_primitive_selectors",
-      "fork_to_tab_behavior",
-      "busy_shimmer_overlay",
-      "ipc_listener_tab_rebind",
-      "session_id_cmd_hover",
-      "focus_contract_start_continue",
-      "effort_inline_pills"
+      "busystate_tab_binding_leak",
+      "paste_busy_event_drop_tabid_mismatch",
+      "stale_session_contextualpct_takeover_guard",
+      "ipcRenderer_claude:bridge_update_sessionId_filter",
+      "ipcRenderer_claude:cache_update_provider_gate",
+      "safePasteAndSubmit_pasteInflight_weakmap_mutex",
+      "keyless_component_reuse_useState_reset_pattern",
+      "useEffect_deps_empty_object_ref_loop",
+      "emitBusy_handler_tabId_rebind_filter",
+      "xterm_hasDraft_probe_stash_fallback",
+      "control_bar_busy_overlay_pointer_events_reset",
+      "sessionActionChip_focus_requestAnimationFrame_ordering",
+      "dictation_recording_state_owner_scope_leak",
+      "pendingEnter_ref_cancel_delivery_race"
     ],
     "symptoms": [
-      "Busy loading shimmer overlay stays stuck on the control bar after switching tabs",
-      "Terminating or killing the Claude PTY process leaves the ControlBar in an un-clickable busy state",
-      "Clicking Enter while dictation is in progress sends empty or outdated text to the terminal",
-      "Copy prompt button copies text successfully but fails to clear the input prompt, leaving characters in the composer",
-      "Model or Effort dropdown selection triggers a React error boundary crash with 'Maximum update depth exceeded'",
-      "Focus remains on the Start or Continue button, requiring the user to manually click the terminal before they can type"
+      "Shimmer overlay persists on new tab after switching from a paste-busy tab, blocking interaction on unrelated work",
+      "Loader remains stuck forever after interrupting a Claude process, even after reload, until manual 'СБРОС' click",
+      "Copy-prompt fails to clear input field, showing '[capture-input:copy]' without '[clear-input]' in logs, input remains visible in TUI",
+      "Right cluster controls (Model/Effort/Think) become disabled/greyed out when they should be active, or remain clickable when unavailable",
+      "Context meter or cache chip displays stale values from previous session after fork or session swap"
     ],
     "related_components": [
-      "src/components/ClaudeControlBar.tsx",
-      "src/components/Workspace.tsx",
-      "src/store/useUIStore.ts"
+      "src/renderer/components/Workspace/ClaudeControlBar.tsx",
+      "src/renderer/components/Workspace/Workspace.tsx",
+      "src/renderer/components/Workspace/Terminal.tsx",
+      "src/renderer/components/Workspace/SessionActionChip.tsx",
+      "src/renderer/components/Workspace/MicButton.tsx",
+      "src/renderer/components/Workspace/ClaudeSDK/ClaudeSDKTab.tsx",
+      "src/renderer/components/Workspace/panels/ActionsPanel.tsx",
+      "src/renderer/components/Workspace/Timeline.tsx",
+      "src/renderer/components/Workspace/HistoryPanel.tsx",
+      "src/renderer/components/Workspace/ProjectToolbar.tsx",
+      "src/renderer/store/useWorkspaceStore.ts",
+      "src/renderer/store/useUIStore.ts",
+      "src/renderer/utils/dictationManager.ts",
+      "src/renderer/utils/pendingResume.ts",
+      "src/renderer/utils/codexLaunch.ts",
+      "src/main/main.js"
     ],
-    "hash": "a82c166cd95b6f6b51272428d3a3440a4d24af8f5b4aa317ac2e3d8b7488c452"
+    "hash": "f6ecfe1c2edf2ffdb1b7b20e501eefe0be4007a143da128efef8638d34098a28"
   },
   {
     "path": "docs/knowledge/fact-clipboard-tools.md",
     "type": "fact",
     "explicit": [
-      "clipboard-tools",
-      "copy-session",
-      "log-compression",
-      "token-estimation",
-      "subagent-handling",
-      "codex-export"
+      "clipboard",
+      "pasted_blocks",
+      "copy_session",
+      "formatToolAction",
+      "token_estimate",
+      "breakdown_popover",
+      "log_compression",
+      "hierarchical_copy_groups"
     ],
     "implicit": [
-      "pasted_syntax_markdown_preprocessor",
-      "copy_session_segmented_chip",
-      "custom_session_id_input_bridge",
-      "hierarchical_copy_cascade",
-      "getToolGroup_glob_grep_sync",
-      "codex_rollback_jsonl_parser",
-      "formatToolAction_deep_serialization",
-      "inline_chips_module_scope_click",
+      "hover_affordance_gap_bridge",
+      "inline_component_recreation",
+      "popover_layout_reservation_min_height",
+      "mousedown_stop_propagation",
+      "dynamic_width_resize_timeline",
+      "global_mousemove_hit_test",
+      "mcp_image_placeholder_serialization",
+      "label_always_chronology",
       "subagent_task_agent_alias",
-      "label_always_depth_semantics",
-      "range_token_estimate_breakdown",
-      "popover_hit_test_mousemove",
-      "layout_reservation_min_height",
-      "css_hover_bridge_gap",
-      "jsonl_chain_resolution",
-      "layout_depth_sensitivity"
+      "codex_rollback_thread_filtering",
+      "ui_store_copy_settings"
     ],
     "symptoms": [
-      "Copied session range contains empty data or missing tool inputs despite MCP toggle being ON",
-      "Breakdown popover closes immediately when moving cursor from the copy chip or clicking JSONL/API tabs",
-      "Clicking inline copy markers in the markers row doesn't toggle settings, swallowing the click event",
-      "Copy session output is missing Subagent tasks/runs after Claude 2.1 Agent SDK upgrade",
-      "JSONL/API tab switch in the token breakdown popover collapses the popup unexpectedly due to layout size change",
-      "Clipboard is flooded with huge base64 strings instead of compact placeholder tags when copying screenshot tool actions"
+      "Copying range with custom MCP tools yields generic tool names instead of actual input parameters and outputs",
+      "Clicking a toggle inside the token breakdown popover closes the entire timeline action menu",
+      "Moving cursor from Copy Session button to custom ID input closes the popup instantly due to a mouse dead-zone",
+      "Clicking indicator chips under Copy Session button does nothing because events are swallowed",
+      "Token breakdown popover collapses and loses focus when switching between JSONL and API views"
     ],
     "related_components": [
       "src/renderer/components/Workspace/CopySessionButton.tsx",
-      "src/renderer/components/Workspace/InfoPanel.tsx",
       "src/renderer/components/Timeline/Timeline.tsx",
       "src/main.js"
     ],
-    "hash": "4cc782dcc9c54fadc8356520c3cd77e35acf18187c6f665df9bc8194c46e636a"
+    "hash": "2c88d87a53c45a68a539d8b01c339b4eb7dbe073f901b43476712bc309f1e092"
   },
   {
     "path": "docs/knowledge/fix-sdk-asar-spawn.md",
@@ -4889,6 +4994,40 @@
     "hash": "7eaa0529b4880376191b5f7e1394027955d71f56d334c7c783d8c17bc4f02dba"
   },
   {
+    "path": "docs/knowledge/fix-codex-дубли-после-сжатия.md",
+    "type": "fix",
+    "explicit": [
+      "codex export duplication",
+      "compaction",
+      "replacement history recursion",
+      "buildCodexCleanEntries"
+    ],
+    "implicit": [
+      "buildCodexCleanEntries_recursion",
+      "replacement_history_snapshot",
+      "codex_export_duplication",
+      "compacted_record_marker",
+      "rollout_stream_chronology",
+      "jsonl_chain_resolution",
+      "compact_gap_recovery",
+      "fork_contamination",
+      "paste_path_routing",
+      "timeline_range_filter"
+    ],
+    "symptoms": [
+      "Exported session Markdown contains the same prompt duplicated multiple times",
+      "Duplicated prompts accumulate and worsen after multiple session compaction steps",
+      "Codex copy output shows older prompts re-appearing inside later compact blocks",
+      "Prompt count in the exported file exceeds the actual number of visual turns in the timeline"
+    ],
+    "related_components": [
+      "src/main/codex/exporter.ts",
+      "src/shared/codex/utils.ts",
+      "src/renderer/components/Timeline.tsx"
+    ],
+    "hash": "261ca4876118571f18451b849da4bd182ef223e13d3bd39591d3d3cabda00c3e"
+  },
+  {
     "path": "docs/knowledge/fact-test-update-api.md",
     "type": "fact",
     "explicit": [
@@ -5046,41 +5185,52 @@
     "path": "docs/knowledge/fact-claude-code-internals.md",
     "type": "fact",
     "explicit": [
-      "Claude Code CLI internals",
-      "JSONL entry types",
-      "session chain architecture",
-      "fork vs bridge mechanism",
-      "environment variables",
-      "file system structure",
-      "token usage calculation"
+      "claude-code-internals",
+      "session-chain",
+      "jsonl-formats",
+      "fork-mechanism",
+      "plan-mode",
+      "bridge-entries",
+      "compact-boundaries",
+      "file-structure",
+      "feature-flags"
     ],
     "implicit": [
-      "jsonl_chain_resolution",
-      "fork_session_copy",
-      "compact_gap_recovery",
-      "usage_token_aggregation",
-      "bash_progress_streaming",
-      "keychain_credential_access",
-      "statsig_feature_flags",
-      "session_chain_cycle_detection",
-      "bridge_entry_evolution",
-      "local_command_parsing",
-      "thinking_metadata_levels"
+      "fork_session_jsonl_copy_uuid_rewrite",
+      "bridge_entry_parentuuid_parent_message_link",
+      "plan_mode_clear_context_same_function",
+      "sessionid_filename_root_identity_invariant",
+      "content_replacement_fork_missing_frozen",
+      "cache_miss_fork_billing_prefix_share_1h_ttl",
+      "compact_boundary_dangling_logicalparentuuid",
+      "thinking_metadata_user_entry_level",
+      "message_uuid_chaining_parent_leaf",
+      "system_turn_duration_timing",
+      "api_error_retry_attempt_tracking",
+      "queue_operation_enqueue_dequeue_remove",
+      "progress_bash_streaming_incremental",
+      "usage_token_caching_uncached_portion",
+      "cyclic_chain_detection_tengu_telemetry",
+      "zustand_state_mutation_setmessages",
+      "sync_marker_validity_forkedfrom_field",
+      "jsonl_chain_resolution_fork_bridge",
+      "timeline_jsonl_session_boundary_rendering"
     ],
     "symptoms": [
-      "Timeline displays multiple unrelated sessions as a single merged thread",
-      "New tab opens with empty history after attempting to fork a session",
-      "Token usage counts appear lower than expected because only uncached tokens are shown",
-      "Bash output streaming is missing or stuck in progress in the UI",
-      "Session backtrace fails due to missing parent UUIDs in compact boundaries"
+      "Timeline doesn't show session boundaries or displays merged dialogs after fork",
+      "New tab opens with empty or partial history when forking a session",
+      "Thinking metadata level not preserved across fork or plan mode exit",
+      "Session resume fails with dangling UUID reference in compact boundaries",
+      "Forked session shows cache miss on first message instead of sharing parent's context"
     ],
     "related_components": [
-      "src/main/session-manager.ts",
-      "src/renderer/components/TimelineView.tsx",
-      "src/main/ipc/claude-jsonl-reader.ts",
-      "src/renderer/store/useSessionStore.ts"
+      "src/renderer/components/Timeline.tsx",
+      "src/renderer/pages/SessionView.tsx",
+      "src/main/ipc/sessionHandlers.ts",
+      "src/utils/jsonlParser.ts",
+      "src/store/sessionStore.ts"
     ],
-    "hash": "f65f409d571c4f584cbeb7588043e7a3636d6a5c315dea0e12ef21aa290996df"
+    "hash": "f36a90a07c1d65c0fb03efc77094ac0b67ab8a073eae191bd61db9b7d45eda6a"
   },
   {
     "path": "docs/knowledge/fix-controlled-textarea-focus-selection.md",

@@ -974,8 +974,9 @@ function App() {
     // Без (1) сценарий: юзер смотрит на проект A, Claude бежит в B (внутри
     // того же инстанса), MCP create_tab отправляется → таб уходит в A (по
     // activeProjectId) или вообще в Default, потому что cwd может совпадать.
-    const handleMcpCreate = async (_: any, data: { name?: string; cwd: string; command?: string; color?: string; parentProjectId?: string }) => {
-      console.warn('[MCP:Terminal] Creating new tab:', data.name || 'auto', 'cwd:', data.cwd, 'parentProjectId:', data.parentProjectId || '-');
+    const handleMcpCreate = async (_: any, data: { name?: string; cwd: string; command?: string; color?: string; parentProjectId?: string; background?: boolean }) => {
+      const openInBackground = data.background !== false;
+      console.warn('[MCP:Terminal] Creating new tab:', data.name || 'auto', 'cwd:', data.cwd, 'parentProjectId:', data.parentProjectId || '-', 'background:', openInBackground);
       const state = useWorkspaceStore.getState();
       let targetProjectId: string | null = null;
 
@@ -1047,6 +1048,7 @@ function App() {
         color: (data.color || (commandType === 'codex' ? 'codex' : commandType === 'claude' ? 'claude' : rawCommand ? 'green' : undefined)) as any,
         pendingAction,
         nameSetManually: !!data.name,
+        background: openInBackground,
         ...sessionPatch,
       } as any);
     };
@@ -2110,8 +2112,8 @@ function App() {
           // → HOME (createTab сам подставит при пустой строке). Юзер: «новая
           // вкладка автоматически в той директории, к которой привязан проект».
           const boundProjectPath = currentProject?.path && !currentProject.path.startsWith('__unset__') ? currentProject.path : '';
-          if (currentProject && effectiveId) {
-            const currentTab = activeProject?.tabs.get(effectiveId);
+          if (currentProject && (effectiveId || activeProject?.activeGroupId)) {
+            const currentTab = effectiveId ? activeProject?.tabs.get(effectiveId) : undefined;
             const cwd = boundProjectPath || currentTab?.cwd || '';
             createTabAfterCurrent(activeProjectId, undefined, cwd);
           } else if (currentProject) {

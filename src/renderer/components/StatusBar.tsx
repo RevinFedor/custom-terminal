@@ -3,7 +3,6 @@ import { createPortal } from 'react-dom';
 import { Pin, Settings } from 'lucide-react';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
-import type { ClaudeCodeModelOption } from '../store/useUIStore';
 import type { CodexModelOption } from '../constants/codexSettings';
 import {
   CODEX_EFFORT_LEVELS,
@@ -13,8 +12,10 @@ import {
 } from '../constants/codexSettings';
 import { usePromptsStore } from '../store/usePromptsStore';
 import { useCmdKey } from '../hooks/useCmdHoverPopover';
+import { CUSTOM_ICONS } from '../assets/icons/registry';
 
 const { ipcRenderer } = window.require('electron');
+const CODEX_ICON_URL = new URL('../assets/icons/codex-color.svg', import.meta.url).href;
 
 // VSCode-style status bar pinned to the bottom of the app.
 // Currently hosts development toggles, a default-effort selector,
@@ -87,10 +88,28 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
         <WebServerChip />
       </div>
       <div className="flex items-center gap-2">
-        <ModelSelector label="Claude" value={defaultClaudeModel} options={claudeCodeSettings.models} onChange={setDefaultClaudeModel} />
-        <EffortSelector label="Effort" value={defaultClaudeEffort} options={claudeCodeSettings.efforts} onChange={setDefaultClaudeEffort} />
-        <ModelSelector label="Codex" value={defaultCodexModel} options={codexModels} onChange={setDefaultCodexModelWithEffort} />
-        <EffortSelector label="Effort" value={defaultCodexEffort} options={codexEfforts} onChange={setDefaultCodexEffort} />
+        <EngineDefaultsSelector
+          engine="Claude"
+          accent="#DA7756"
+          icon={CUSTOM_ICONS.claude}
+          modelValue={defaultClaudeModel}
+          modelOptions={claudeCodeSettings.models}
+          effortValue={defaultClaudeEffort}
+          effortOptions={claudeCodeSettings.efforts}
+          onModelChange={setDefaultClaudeModel}
+          onEffortChange={setDefaultClaudeEffort}
+        />
+        <EngineDefaultsSelector
+          engine="Codex"
+          accent="#7A9DFF"
+          icon={<img src={CODEX_ICON_URL} alt="" style={{ width: '100%', height: '100%', display: 'block' }} />}
+          modelValue={defaultCodexModel}
+          modelOptions={codexModels}
+          effortValue={defaultCodexEffort}
+          effortOptions={codexEfforts}
+          onModelChange={setDefaultCodexModelWithEffort}
+          onEffortChange={setDefaultCodexEffort}
+        />
         <StatusToggle
           label="kill dev-ports"
           title="Если ВКЛ — перед каждым запуском npm-скрипта / restart / stop сначала убиваются занятые порты проекта (vite/backend), считанные из vite.config / .env / NestJS main.ts. Защита от 'address in use' после крашей."
@@ -502,11 +521,50 @@ const modelLabel = (model: string, options: Array<{ id: string; label?: string }
   return found?.label || model;
 };
 
-function ModelSelector({ label = 'Model', value, options, onChange }: {
-  label?: string;
-  value: string;
-  options: Array<{ id: string; label?: string }>;
-  onChange: (v: string) => void;
+type ModelOptionLike = { id: string; label?: string };
+
+function withNoneOption<T extends { id: string; label?: string }>(
+  value: string,
+  options: T[]
+): ModelOptionLike[] {
+  const seen = new Set<string>();
+  const result: ModelOptionLike[] = [];
+  const push = (option: ModelOptionLike) => {
+    if (!option.id || seen.has(option.id)) return;
+    seen.add(option.id);
+    result.push(option);
+  };
+  push({ id: 'none', label: 'none' });
+  options.forEach((option) => push({ id: option.id, label: option.label }));
+  if (value && !seen.has(value)) push({ id: value, label: value });
+  return result;
+}
+
+function withNoneLevel(value: string, options: string[]): string[] {
+  const levels = ['none', ...options.filter(Boolean)];
+  return levels.includes(value) ? levels : [...levels, value];
+}
+
+function EngineDefaultsSelector({
+  engine,
+  accent,
+  icon,
+  modelValue,
+  modelOptions,
+  effortValue,
+  effortOptions,
+  onModelChange,
+  onEffortChange,
+}: {
+  engine: string;
+  accent: string;
+  icon: React.ReactNode;
+  modelValue: string;
+  modelOptions: ModelOptionLike[];
+  effortValue: string;
+  effortOptions: string[];
+  onModelChange: (v: string) => void;
+  onEffortChange: (v: string) => void;
 }) {
   const [clicked, setClicked] = useState(false);
   const [chipHover, setChipHover] = useState(false);
@@ -515,6 +573,8 @@ function ModelSelector({ label = 'Model', value, options, onChange }: {
   const popupRef = useRef<HTMLDivElement>(null);
   const isCmdPressed = useCmdKey();
   const open = clicked || (isCmdPressed && chipHover) || popupHover;
+  const shortModel = modelLabel(modelValue, modelOptions);
+  const shortEffort = effortLabel(effortValue);
 
   useEffect(() => {
     if (!clicked) return;
@@ -555,21 +615,64 @@ function ModelSelector({ label = 'Model', value, options, onChange }: {
         onClick={() => setClicked(!clicked)}
         onMouseEnter={() => setChipHover(true)}
         onMouseLeave={() => setChipHover(false)}
-        className="inline-flex items-center gap-1 cursor-pointer hover:bg-white/5 rounded"
-        style={{ padding: '1px 6px', height: 18 }}
+        title={`${engine} defaults: model ${shortModel}, effort ${shortEffort}`}
+        className="inline-flex items-center cursor-pointer rounded"
+        style={{
+          gap: 5,
+          padding: '1px 7px',
+          height: 20,
+          maxWidth: 190,
+          border: `1px solid ${open ? accent + '66' : 'rgba(255,255,255,0.08)'}`,
+          background: open ? `${accent}16` : 'rgba(255,255,255,0.025)',
+          color: '#ddd',
+          outline: 'none',
+        }}
       >
-        <span style={{ color: '#666' }}>{label}:</span>
-        <span style={{ color: value === 'none' ? '#666' : '#DA7756', fontWeight: 500 }}>
-          {modelLabel(value, options)}
+        <span style={{ width: 14, height: 14, color: accent, display: 'inline-flex', flexShrink: 0 }}>
+          {icon}
         </span>
+        <span style={{ color: '#ddd', fontWeight: 700, fontSize: 11 }}>{engine}</span>
+        <span
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 3,
+            minWidth: 0,
+            overflow: 'hidden',
+            fontSize: 11,
+          }}
+        >
+          <span
+            style={{
+              color: modelValue === 'none' ? '#666' : '#cfcfcf',
+              maxWidth: 86,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {shortModel}
+          </span>
+          <span style={{ color: '#555' }}>/</span>
+          <span style={{ color: effortValue === 'none' ? '#666' : accent, fontWeight: 650 }}>
+            {shortEffort}
+          </span>
+        </span>
+        <Settings size={11} strokeWidth={1.8} style={{ color: '#777', flexShrink: 0 }} />
       </button>
       {open && chipRef.current && createPortal(
-        <ModelPopup
+        <EngineDefaultsPopup
           chipRect={chipRef.current.getBoundingClientRect()}
           popupRef={popupRef}
-          value={value}
-          options={options}
-          onSelect={(v) => { onChange(v); setClicked(false); setPopupHover(false); }}
+          engine={engine}
+          accent={accent}
+          icon={icon}
+          modelValue={modelValue}
+          modelOptions={modelOptions}
+          effortValue={effortValue}
+          effortOptions={effortOptions}
+          onModelSelect={(v) => { onModelChange(v); setClicked(false); setPopupHover(false); }}
+          onEffortSelect={(v) => { onEffortChange(v); setClicked(false); setPopupHover(false); }}
           onPopupEnter={() => setPopupHover(true)}
           onPopupLeave={() => setPopupHover(false)}
         />,
@@ -579,19 +682,38 @@ function ModelSelector({ label = 'Model', value, options, onChange }: {
   );
 }
 
-function ModelPopup({ chipRect, popupRef, value, options, onSelect, onPopupEnter, onPopupLeave }: {
+function EngineDefaultsPopup({
+  chipRect,
+  popupRef,
+  engine,
+  accent,
+  icon,
+  modelValue,
+  modelOptions,
+  effortValue,
+  effortOptions,
+  onModelSelect,
+  onEffortSelect,
+  onPopupEnter,
+  onPopupLeave,
+}: {
   chipRect: DOMRect;
   popupRef: React.RefObject<HTMLDivElement | null>;
-  value: string;
-  options: Array<{ id: string; label?: string; cmd?: boolean }>;
-  onSelect: (v: string) => void;
+  engine: string;
+  accent: string;
+  icon: React.ReactNode;
+  modelValue: string;
+  modelOptions: ModelOptionLike[];
+  effortValue: string;
+  effortOptions: string[];
+  onModelSelect: (v: string) => void;
+  onEffortSelect: (v: string) => void;
   onPopupEnter?: () => void;
   onPopupLeave?: () => void;
 }) {
-  const models = useMemo(() => {
-    const base: ClaudeCodeModelOption[] = [{ id: 'none', label: 'none', cmd: true }, ...options.filter((m) => m?.id)];
-    return base.some((m) => m.id === value) ? base : [...base, { id: value, label: value, cmd: true }];
-  }, [options, value]);
+  const models = useMemo(() => withNoneOption(modelValue, modelOptions), [modelValue, modelOptions]);
+  const levels = useMemo(() => withNoneLevel(effortValue, effortOptions), [effortValue, effortOptions]);
+  const maxWidth = Math.max(300, Math.min(560, window.innerWidth - 12));
 
   return (
     <div
@@ -600,182 +722,116 @@ function ModelPopup({ chipRect, popupRef, value, options, onSelect, onPopupEnter
       onMouseLeave={onPopupLeave}
       style={{
         position: 'fixed',
-        right: window.innerWidth - chipRect.right,
+        right: Math.max(6, window.innerWidth - chipRect.right),
         bottom: window.innerHeight - chipRect.top + 4,
         paddingBottom: 4,
         zIndex: 10010,
       }}
     >
       <div
-        className="flex gap-1 bg-[#1a1a1a] border border-[#444] rounded shadow-2xl"
-        style={{ padding: 4, boxShadow: '0 -8px 24px rgba(0,0,0,0.5)' }}
+        className="bg-[#1a1a1a] border border-[#444] rounded shadow-2xl"
+        style={{
+          width: 'max-content',
+          maxWidth,
+          padding: 8,
+          boxShadow: '0 -8px 24px rgba(0,0,0,0.5)',
+        }}
       >
-        {models.map((model) => {
-          const isActive = value === model.id;
-          return (
-            <button
-              key={model.id}
-              onClick={() => onSelect(isActive ? 'none' : model.id)}
-              className={`text-[10px] px-1.5 py-1 rounded cursor-pointer ${
-                isActive
-                  ? 'bg-[#DA7756]/20 text-white font-medium'
-                  : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'
-              }`}
-              style={{ minWidth: 44 }}
-              title={model.id}
-            >
-              {model.label || model.id}
-            </button>
-          );
-        })}
+        <div className="flex items-center justify-between" style={{ gap: 12, marginBottom: 7 }}>
+          <div className="flex items-center" style={{ gap: 6 }}>
+            <span style={{ width: 16, height: 16, color: accent, display: 'inline-flex', flexShrink: 0 }}>
+              {icon}
+            </span>
+            <span style={{ color: '#e5e5e5', fontSize: 12, fontWeight: 750 }}>{engine} defaults</span>
+          </div>
+          <span style={{ color: '#666', fontSize: 10 }}>future launches</span>
+        </div>
+
+        <EngineOptionRow
+          label="Model"
+          accent={accent}
+          value={modelValue}
+          options={models}
+          getLabel={(option) => option.label || option.id}
+          getKey={(option) => option.id}
+          onSelect={(option) => onModelSelect(option.id === modelValue ? 'none' : option.id)}
+        />
+        <EngineOptionRow
+          label="Effort"
+          accent={accent}
+          value={effortValue}
+          options={levels}
+          getLabel={effortLabel}
+          getKey={(level) => level}
+          onSelect={(level) => onEffortSelect(level === effortValue ? 'none' : level)}
+        />
       </div>
     </div>
   );
 }
 
-// Same visual language as InfoPanel Effort buttons: small pills, accent for active.
-// Status-bar version is a single chip showing the current effort, click → popup with all
-// six levels appearing ABOVE (status bar is at the bottom). One click selects + persists.
-function EffortSelector({ label = 'Effort', value, options, onChange }: {
-  label?: string;
+function EngineOptionRow<T>({
+  label,
+  accent,
+  value,
+  options,
+  getLabel,
+  getKey,
+  onSelect,
+}: {
+  label: string;
+  accent: string;
   value: string;
-  options: string[];
-  onChange: (v: string) => void;
+  options: T[];
+  getLabel: (option: T) => string;
+  getKey: (option: T) => string;
+  onSelect: (option: T) => void;
 }) {
-  const [clicked, setClicked] = useState(false);     // pinned via click
-  const [chipHover, setChipHover] = useState(false); // mouse over chip
-  const [popupHover, setPopupHover] = useState(false); // mouse over popup
-  const chipRef = useRef<HTMLButtonElement>(null);
-  const popupRef = useRef<HTMLDivElement>(null);
-  const isCmdPressed = useCmdKey();
-
-  // Popup is visible when:
-  //   • user clicked the chip (pinned)            → stays until click outside
-  //   • CMD held + cursor over chip               → standard CMD-hover affordance
-  //   • cursor over the popup itself              → keeps open after releasing CMD
-  const open = clicked || (isCmdPressed && chipHover) || popupHover;
-
-  // Close pinned-open on outside click (only when actually clicked open)
-  useEffect(() => {
-    if (!clicked) return;
-    const onDown = (e: MouseEvent) => {
-      if (chipRef.current?.contains(e.target as Node)) return;
-      if (popupRef.current?.contains(e.target as Node)) return;
-      setClicked(false);
-    };
-    document.addEventListener('mousedown', onDown);
-    return () => document.removeEventListener('mousedown', onDown);
-  }, [clicked]);
-
-  // Geometric hit-test bridge: when the popup is open via CMD-hover, the cursor
-  // crossing the 4-px gap between chip and popup must not close it. Padding alone
-  // is unreliable across two Portal-rendered elements, so use mousemove + rect.
-  useEffect(() => {
-    if (!open) return;
-    const onMove = (e: MouseEvent) => {
-      const c = chipRef.current?.getBoundingClientRect();
-      const p = popupRef.current?.getBoundingClientRect();
-      if (!c || !p) return;
-      const { clientX: x, clientY: y } = e;
-      const inC = x >= c.left && x <= c.right && y >= c.top && y <= c.bottom;
-      const inP = x >= p.left && x <= p.right && y >= p.top && y <= p.bottom;
-      // Bridge: vertical corridor between popup.bottom and chip.top (popup is ABOVE).
-      const inBridge =
-        x >= Math.min(p.left, c.left) - 8 &&
-        x <= Math.max(p.right, c.right) + 8 &&
-        y >= p.bottom &&
-        y <= c.top;
-      // Update hover flags from the actual cursor position. This lets the popup
-      // survive: cursor on chip OR popup OR bridge → at least one of {chipHover,
-      // popupHover, isCmdPressed} keeps `open` true on the next render.
-      setChipHover(inC);
-      setPopupHover(inP || inBridge);
-    };
-    document.addEventListener('mousemove', onMove);
-    return () => document.removeEventListener('mousemove', onMove);
-  }, [open]);
-
   return (
-    <>
-      <button
-        ref={chipRef}
-        onClick={() => setClicked(!clicked)}
-        onMouseEnter={() => setChipHover(true)}
-        onMouseLeave={() => setChipHover(false)}
-        className="inline-flex items-center gap-1 cursor-pointer hover:bg-white/5 rounded"
-        style={{ padding: '1px 6px', height: 18 }}
-      >
-        <span style={{ color: '#666' }}>{label}:</span>
-        <span style={{ color: value === 'none' ? '#666' : '#DA7756', fontWeight: 500 }}>
-          {effortLabel(value)}
-        </span>
-      </button>
-      {open && chipRef.current && createPortal(
-        <EffortPopup
-          chipRect={chipRef.current.getBoundingClientRect()}
-          popupRef={popupRef}
-          value={value}
-          options={options}
-          onSelect={(v) => { onChange(v); setClicked(false); setPopupHover(false); }}
-          onPopupEnter={() => setPopupHover(true)}
-          onPopupLeave={() => setPopupHover(false)}
-        />,
-        document.body
-      )}
-    </>
-  );
-}
-
-function EffortPopup({ chipRect, popupRef, value, options, onSelect, onPopupEnter, onPopupLeave }: {
-  chipRect: DOMRect;
-  popupRef: React.RefObject<HTMLDivElement | null>;
-  value: string;
-  options: string[];
-  onSelect: (v: string) => void;
-  onPopupEnter?: () => void;
-  onPopupLeave?: () => void;
-}) {
-  const levels = useMemo(() => {
-    const base = ['none', ...options.filter(Boolean)];
-    return base.includes(value) ? base : [...base, value];
-  }, [options, value]);
-
-  return (
-    <div
-      ref={popupRef}
-      onMouseEnter={onPopupEnter}
-      onMouseLeave={onPopupLeave}
-      style={{
-        position: 'fixed',
-        // Anchor RIGHT edge of popup to RIGHT edge of chip. The chip lives in the right-
-        // hand cluster of the status bar; left-anchoring pushes the popup into the
-        // Timeline strip / sidebar on the right and gets clipped.
-        right: window.innerWidth - chipRect.right,
-        bottom: window.innerHeight - chipRect.top + 4,
-        // paddingBottom acts as CSS-bridge: extends hit area downward to touch the chip,
-        // so the cursor can travel up from chip into the popup without losing hover.
-        paddingBottom: 4,
-        zIndex: 10010,
-      }}
-    >
+    <div className="flex items-start" style={{ gap: 8, marginTop: 5 }}>
+      <span style={{ width: 42, color: '#666', fontSize: 10, paddingTop: 5 }}>{label}</span>
       <div
-        className="flex gap-1 bg-[#1a1a1a] border border-[#444] rounded shadow-2xl"
-        style={{ padding: 4, boxShadow: '0 -8px 24px rgba(0,0,0,0.5)' }}
+        className="flex gap-1"
+        style={{
+          flexWrap: 'wrap',
+          maxWidth: 492,
+          maxHeight: label === 'Model' ? 132 : 72,
+          overflowY: 'auto',
+          paddingRight: 1,
+        }}
       >
-        {levels.map((level) => {
-          const isActive = value === level;
+        {options.map((option) => {
+          const key = getKey(option);
+          const isActive = value === key;
           return (
             <button
-              key={level}
-              onClick={() => onSelect(isActive ? 'none' : level)}
-              className={`text-[10px] px-1.5 py-1 rounded cursor-pointer ${
-                isActive
-                  ? 'bg-[#DA7756]/20 text-white font-medium'
-                  : 'bg-[#2d2d2d] text-[#888] hover:text-white hover:bg-[#3d3d3d]'
-              }`}
-              style={{ minWidth: 32 }}
+              key={key}
+              onClick={() => onSelect(option)}
+              className="text-[10px] px-1.5 py-1 rounded cursor-pointer"
+              style={{
+                minWidth: label === 'Model' ? 44 : 32,
+                maxWidth: 150,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                background: isActive ? `${accent}33` : '#2d2d2d',
+                color: isActive ? '#fff' : '#888',
+                border: isActive ? `1px solid ${accent}88` : '1px solid transparent',
+                fontWeight: isActive ? 650 : 500,
+              }}
+              onMouseEnter={(e) => {
+                if (isActive) return;
+                e.currentTarget.style.background = '#3d3d3d';
+                e.currentTarget.style.color = '#fff';
+              }}
+              onMouseLeave={(e) => {
+                if (isActive) return;
+                e.currentTarget.style.background = '#2d2d2d';
+                e.currentTarget.style.color = '#888';
+              }}
+              title={key}
             >
-              {effortLabel(level)}
+              {getLabel(option)}
             </button>
           );
         })}

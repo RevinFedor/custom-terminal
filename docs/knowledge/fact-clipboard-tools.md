@@ -81,6 +81,8 @@ UI настроек копирования организован в три ве
 
 Codex Copy Session строится из rollout JSONL (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`), а не из Claude backtrace. User turns берутся из `event_msg.user_message`, ответы — из `response_item.message`, thinking — из `response_item.reasoning`, compact — из top-level `type: "compacted"`. `thread_rolled_back` удаляет последние turns из уже собранного export'а, потому что Codex rollback физически оставляет старые записи в файле.
 
+Для clean export и `codex:copy-range` top-level `compacted` остаётся одним compact marker'ом (`═══ COMPACTED ═══`), а `replacement_history` не разворачивается рекурсивно. Иначе каждый следующий compact повторно вытаскивает старые prompts и раздувает копию. `codex:copy-range` фильтрует уже собранный Codex timeline по выбранным `turnIndex` и compact UUID, поэтому если диапазон сознательно начинается позже, ранние MCP/Electron calls в копию не попадут. Это эффект выбранного среза, а не потеря данных.
+
 Tool-result boundary отличается от HistoryPanel raw cards: для чистого export'а canonical output — `response_item.function_call_output` / `custom_tool_call_output` / `tool_search_output`. `event_msg.mcp_tool_call_end` не используется как второй источник результата: там есть server/tool/duration/result, но если смешать оба слоя, MCP-вызов легко задублировать или получить два разных shape'а одного ответа. Для downstream LLM важен один блок `request/response`, не телеметрия lifecycle'а.
 
 Codex tool groups не совпадают с Claude names: `apply_patch` → «Правки файлов», `exec_command`/`write_stdin` → shell, namespace `mcp__*` → MCP, `web_search_call` → Web, `tool_search_call/tool_search_output` → каталог tools, `multi_agent_v1` + `spawn/wait/send` → субагенты, остальное → Other. `tool_search_output` нельзя копировать как полный schema dump: он разворачивает список доступных tools на сотни строк и забивает clipboard внутренней metadata. Export ужимает его до namespace/function list — достаточно, чтобы понять какие инструменты были найдены, без шумного описания каждого аргумента.
@@ -89,7 +91,8 @@ Codex tool groups не совпадают с Claude names: `apply_patch` → «�
 
 ## Unified Formatting (main.js)
 Для обеспечения консистентности данных, логика формирования текста (обработка `thinking` блоков, форматирование `diff` и `tool_use`) вынесена в общую функцию `formatToolAction` в Main-процессе. 
-- **Range Copy:** При двойном клике в Timeline система теперь не просто копирует префикс, а выполняет полноценный Backtrace для поиска `tool_result` и вставляет полное содержание файлов/диффов, если это включено в глобальных настройках.
+- **Claude Range Copy:** При двойном клике в Timeline система теперь не просто копирует префикс, а выполняет полноценный Backtrace для поиска `tool_result` и вставляет полное содержание файлов/диффов, если это включено в глобальных настройках.
+- **Codex Range Copy:** тот же жест в Timeline открывает popup с `Копировать`, но backend идёт через `codex:copy-range` и режет уже собранный Codex timeline по выбранным `turnIndex` / compact UUID.
 - **Actions Block:** Форматирование списка действий (`**Actions:**`) унифицировано для всех видов экспорта.
 
 ## Markers row — inline chips под `Copy session`

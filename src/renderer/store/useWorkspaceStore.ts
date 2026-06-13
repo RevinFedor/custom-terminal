@@ -402,6 +402,7 @@ interface ProjectWorkspace {
   tabs: Map<string, Tab>;
   tabGroups: TabGroup[];
   activeTabId: string | null;
+  activeGroupId: string | null;
   selectedTabIds: string[]; // List of selected tab IDs for multi-action
   tabHistory: string[]; // LRU stack of tab IDs (max 20) for navigation on close
   tabCounter: number;
@@ -476,6 +477,7 @@ interface WorkspaceStore {
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean }) => Promise<boolean>;
   reopenLastClosedTab: (projectId: string) => Promise<{ tabId: string | null; reason?: 'empty' | 'error' }>;
   switchTab: (projectId: string, tabId: string) => void;
+  setActiveTabGroup: (projectId: string, groupId: string | null) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
   autoRenameTab: (tabId: string, newName: string, options?: { toolType?: 'claude' | 'gemini' | 'codex'; sessionId?: string; overrideManualName?: boolean; markNameSetManually?: boolean }) => boolean;
   setTabTitleNaming: (tabId: string, naming: boolean) => void;
@@ -788,6 +790,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           tabs: new Map(),
           tabGroups: projectData?.tabGroups || [],
           activeTabId: null,
+          activeGroupId: null,
           selectedTabIds: [],
           tabHistory: [],
           tabCounter: 0,
@@ -1085,6 +1088,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         tabs: new Map(),
         tabGroups: projectData?.tabGroups || [],
         activeTabId: null,
+        activeGroupId: null,
         selectedTabIds: [],
         tabHistory: [],
         tabCounter: 0, // Start from 0 for new projects
@@ -1360,6 +1364,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const { isRestoring } = get();
     if (!isRestoring && !options?.background) {
       workspace.activeTabId = tabId;
+      workspace.activeGroupId = newTab.groupId || null;
       workspace.viewingSubAgentTabId = null;
       // Push to tab history (LRU, max 20)
       workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
@@ -1397,11 +1402,27 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const existingNames = Array.from(workspace.tabs.values()).map(t => t.name);
     const tabName = name || getNextAvailableName('tab', existingNames);
 
-    const requestedVisualParentId = options?.isUtility ? undefined : options?.visualParentTabId;
+    const explicitGroupId = resolveExistingTabGroupId(workspace, options?.groupId);
+    const activeGroupId = !options?.isUtility ? resolveExistingTabGroupId(workspace, workspace.activeGroupId) : undefined;
+    const referenceTabForGroup = options?.afterTabId || workspace.activeTabId || undefined;
+    const referenceTab = referenceTabForGroup ? workspace.tabs.get(referenceTabForGroup) : undefined;
+    const inheritedVisualParentId = !options?.isUtility && !activeGroupId
+      ? referenceTab?.visualParentTabId
+      : undefined;
+    const requestedVisualParentId = options?.isUtility
+      ? undefined
+      : (options?.visualParentTabId || inheritedVisualParentId);
     const visualParentTab = requestedVisualParentId ? workspace.tabs.get(requestedVisualParentId) : undefined;
     const visualParentTabId = visualParentTab && !visualParentTab.isUtility && !visualParentTab.parentTabId
       ? requestedVisualParentId
       : undefined;
+    const referenceGroupId = referenceTabForGroup
+      ? resolveExistingTabGroupId(workspace, referenceTab?.groupId)
+      : undefined;
+    const visualParentGroupId = resolveExistingTabGroupId(workspace, visualParentTab?.groupId);
+    const targetGroupId = options?.isUtility
+      ? undefined
+      : (explicitGroupId || activeGroupId || referenceGroupId || visualParentGroupId);
 
     const newTab: Tab = {
       id: tabId,
@@ -1422,7 +1443,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       tabType: options?.tabType || 'terminal',
       url: options?.url,
       nameSetManually: (options as any)?.nameSetManually,
-      groupId: options?.isUtility ? undefined : (options?.groupId ?? visualParentTab?.groupId),
+      groupId: targetGroupId,
       visualParentTabId,
       createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000)
     };
@@ -1458,15 +1479,34 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       newTab.pid = pid;
     }
 
-    // Insert after specified tab or current active tab (or at end if no active tab)
-    const referenceTabId = options?.afterTabId || workspace.activeTabId;
+    // Insert after specified tab/current tab. When a group-row owns logical focus,
+    // Cmd+T/add-new should append inside that group, not after the stale active tab.
     const tabsArray = Array.from(workspace.tabs.entries());
     const isUtility = options?.isUtility || false;
+    const groupMemberIds = targetGroupId && !isUtility
+      ? tabsArray
+        .filter(([, tab]) => !tab.parentTabId && !tab.isUtility && tab.groupId === targetGroupId)
+        .map(([id]) => id)
+      : [];
+    const referenceTabId = !isUtility && targetGroupId && !options?.afterTabId
+      ? (groupMemberIds[groupMemberIds.length - 1] || undefined)
+      : (options?.afterTabId || workspace.activeTabId);
 
     // Find position: after reference tab in same zone, or at end of zone
     let insertIndex = tabsArray.length;
 
-    if (referenceTabId && !isUtility) {
+    if (!isUtility && targetGroupId && !referenceTabId) {
+      const targetGroup = workspace.tabGroups.find(group => group.id === targetGroupId);
+      const anchorIndex = targetGroup?.anchorTabId
+        ? tabsArray.findIndex(([id, tab]) => id === targetGroup.anchorTabId && !tab.isUtility)
+        : -1;
+      if (anchorIndex >= 0) {
+        insertIndex = anchorIndex;
+      } else {
+        const firstUtilityIndex = tabsArray.findIndex(([_, tab]) => tab.isUtility);
+        insertIndex = firstUtilityIndex === -1 ? tabsArray.length : firstUtilityIndex;
+      }
+    } else if (referenceTabId && !isUtility) {
       // Find reference tab index
       const currentIndex = tabsArray.findIndex(([id]) => id === referenceTabId);
       if (currentIndex !== -1) {
@@ -1494,6 +1534,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     if (!options?.background) {
       workspace.activeTabId = tabId;
+      workspace.activeGroupId = targetGroupId || null;
       // Push to tab history (LRU, max 20)
       workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
     }
@@ -1810,6 +1851,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const currentView = workspace.currentView;
       const totalTabs = Array.from(openProjects.values()).reduce((acc, ws) => acc + ws.tabs.size, 0);
       workspace.activeTabId = tabId;
+      workspace.activeGroupId = null;
       // Don't reset viewingSubAgentTabId here — it persists across tab switches.
       // User dismisses it explicitly via SubAgentBar "← Back" button or clicking the active chip.
       workspace.selectedTabIds = [tabId]; // Update selection on direct switch
@@ -1847,6 +1889,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       });
       saveSession();
     }
+  },
+
+  setActiveTabGroup: (projectId, groupId) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+
+    const nextGroupId = groupId && workspace.tabGroups.some(group => group.id === groupId)
+      ? groupId
+      : null;
+    if (workspace.activeGroupId === nextGroupId) return;
+
+    workspace.activeGroupId = nextGroupId;
+    if (nextGroupId) workspace.selectedTabIds = [];
+    set({ openProjects: new Map(openProjects) });
   },
 
   renameTab: (projectId, tabId, newName) => {
@@ -2440,6 +2497,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (!workspace) return;
 
     workspace.tabGroups = workspace.tabGroups.filter(group => group.id !== groupId);
+    if (workspace.activeGroupId === groupId) workspace.activeGroupId = null;
     let touchedTabs = false;
     for (const tab of workspace.tabs.values()) {
       if (tab.groupId !== groupId) continue;

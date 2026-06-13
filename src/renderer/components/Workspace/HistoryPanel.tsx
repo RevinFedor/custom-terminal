@@ -565,6 +565,43 @@ const getDraftNoticeMeta = (message: string) => {
   };
 };
 
+function HistoryThinkingChip({ label }: { label: string }) {
+  return (
+    <Tooltip content={label + ' turn is running'}>
+      <div
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 7,
+          height: 22,
+          padding: '0 8px',
+          borderRadius: 5,
+          border: '1px solid rgba(217, 119, 6, 0.38)',
+          backgroundColor: 'rgba(217, 119, 6, 0.12)',
+          color: '#fbbf24',
+          fontSize: 10,
+          fontWeight: 750,
+          letterSpacing: 0,
+          flexShrink: 0,
+        }}
+      >
+        <span
+          className="animate-glow-yellow"
+          aria-hidden
+          style={{
+            width: 8,
+            height: 8,
+            borderRadius: 999,
+            backgroundColor: '#d97706',
+            flexShrink: 0,
+          }}
+        />
+        <span>THINKING</span>
+      </div>
+    </Tooltip>
+  );
+}
+
 function ClaudeHistoryQuestionCard({
   pending,
   answering,
@@ -907,6 +944,10 @@ function AgentHistoryControls({
     console.log('[ClaudeHistoryQuestion] pending tab=' + tabId.slice(-12) + ' reason=' + reason + ' source=' + (next?.source || 'none') + ' qs=' + (next?.questions?.length || 0));
   }, [tabId]);
 
+  const isNonAuthoritativeBusyEvent = useCallback((data: { reason?: string }) => {
+    return runtime.toolType === 'claude' && data.reason === 'spinner';
+  }, [runtime.toolType]);
+
   const refreshPendingQuestion = useCallback(async (reason: string) => {
     if (!tabId || !runtime.getPendingQuestion) return null;
     const requestTabId = tabId;
@@ -983,8 +1024,12 @@ function AgentHistoryControls({
       const next = current === 'active' || current === 'busy' ? current : 'starting';
       setStatusFrom(next, 'command-started');
     };
-    const handleBusy = (_: any, data: { tabId?: string; busy?: boolean }) => {
+    const handleBusy = (_: any, data: { tabId?: string; busy?: boolean; reason?: string }) => {
       if (data?.tabId !== tabId) return;
+      if (isNonAuthoritativeBusyEvent(data)) {
+        refreshPresence();
+        return;
+      }
       if (data.busy) setStatusFrom('busy', 'busy-state');
       else {
         if (pendingQuestionRef.current) setPendingQuestionFrom(null, 'busy-false');
@@ -1028,7 +1073,7 @@ function AgentHistoryControls({
       ipcRenderer.removeListener('terminal:command-started', handleStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleFinished);
     };
-  }, [refreshPendingQuestion, runtime, setPendingQuestionFrom, tabId, refreshPresence, setStatusFrom]);
+  }, [refreshPendingQuestion, runtime, setPendingQuestionFrom, tabId, refreshPresence, setStatusFrom, isNonAuthoritativeBusyEvent]);
 
   const readTerminalDraft = useCallback(async (reason: string) => {
     const requestTabId = tabId;
@@ -1073,6 +1118,7 @@ function AgentHistoryControls({
     };
     const handleInterruptRecovery = (_: any, data: { tabId?: string; busy?: boolean; reason?: string }) => {
       if (data?.tabId !== tabId || data.busy) return;
+      if (isNonAuthoritativeBusyEvent(data)) return;
       console.log('[' + runtime.logPrefix + ':draft] interrupt-event tab=' + tabId.slice(-12) + ' reason=' + (data.reason || '-') + ' hasPending=' + !!midstreamPromptRecoveryRef.current);
       const recoveryReasons = runtime.interruptRecoveryReasons || ['interrupt'];
       if (!recoveryReasons.includes(data.reason || '')) {
@@ -1144,7 +1190,7 @@ function AgentHistoryControls({
     return () => {
       ipcRenderer.removeListener(runtime.busyEvent, handleInterruptRecovery);
     };
-  }, [readTerminalDraft, refreshPresence, runtime, showEmptyDraftNotice, tabId]);
+  }, [isNonAuthoritativeBusyEvent, readTerminalDraft, refreshPresence, runtime, showEmptyDraftNotice, tabId]);
 
   const pullTerminalDraft = useCallback(async () => {
     if (actionInFlightRef.current) {
@@ -1331,6 +1377,7 @@ function AgentHistoryControls({
   const isTurnBusy = status === 'busy';
   const controlsLocked = !!busyAction || isPasteBusy || answeringQuestion;
   const isCancellingTurn = busyAction === 'interrupt' || interruptAwaiting;
+  const showThinkingChip = isTurnBusy && !isCancellingTurn && !pendingQuestion;
   const canAcceptPrompt = status === 'active' || (status === 'busy' && runtime.allowSendWhileBusy);
   const canSend = canAcceptPrompt && prompt.trim().length > 0 && !pendingQuestion && !controlsLocked;
   const canGrabDraft = status === 'active' && !pendingQuestion && !controlsLocked;
@@ -1478,126 +1525,133 @@ function AgentHistoryControls({
           onStop={() => answerPendingQuestion({}, true)}
         />
       ) : (
-        <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6 }}>
-          <textarea
-            ref={promptTextareaRef}
-            className="hp-agent-prompt"
-            data-status={status}
-            value={prompt}
-            onChange={(e) => {
-              if (isCancellingTurn) return;
-              setPrompt(e.target.value);
-              if (draftWarning) setDraftWarning(null);
-            }}
-            onKeyDown={(e) => {
-              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-                e.preventDefault();
-                if (canSend) runAction('send');
-              }
-            }}
-            placeholder={isCancellingTurn ? 'Canceling... waiting for restored prompt' : status === 'inactive' ? 'Resume ' + runtime.label + ' to send' : status === 'starting' ? 'Waiting for prompt...' : 'Send a prompt...'}
-            readOnly={isCancellingTurn}
-            rows={3}
-            style={{
-              flex: 1,
-              minWidth: 0,
-              resize: 'vertical',
-              maxHeight: 120,
-              minHeight: 56,
-              backgroundColor: isCancellingTurn ? '#130f0a' : '#0f0f0f',
-              border: '1px solid ' + promptIdleBorder,
-              borderRadius: 5,
-              color: isCancellingTurn ? '#c7c7c7' : '#e5e5e5',
-              outline: 'none',
-              padding: '7px 8px',
-              fontSize: 12,
-              lineHeight: 1.35,
-              fontFamily: 'inherit',
-            }}
-            onFocus={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = isCancellingTurn ? '#d97706' : '#DA7756'; }}
-            onBlur={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = promptIdleBorder; }}
-          />
-          <Tooltip content={canGrabDraft ? 'Pull terminal draft' : runtime.label + ' must be ready to pull draft'}>
-            <button
-              aria-label={'Pull ' + runtime.label + ' terminal draft'}
-              onClick={pullTerminalDraft}
-              disabled={!canGrabDraft}
-              style={{
-                width: 34,
-                height: 42,
-                borderRadius: 5,
-                border: '1px solid ' + (canGrabDraft ? '#3f3f46' : '#343434'),
-                backgroundColor: canGrabDraft ? '#202020' : '#242424',
-                color: canGrabDraft ? '#a78bfa' : '#666',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                cursor: canGrabDraft ? 'pointer' : 'default',
-                flexShrink: 0,
+        <>
+          {showThinkingChip && (
+            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 6 }}>
+              <HistoryThinkingChip label={runtime.label} />
+            </div>
+          )}
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6 }}>
+            <textarea
+              ref={promptTextareaRef}
+              className="hp-agent-prompt"
+              data-status={status}
+              value={prompt}
+              onChange={(e) => {
+                if (isCancellingTurn) return;
+                setPrompt(e.target.value);
+                if (draftWarning) setDraftWarning(null);
               }}
-            >
-              {busyAction === 'grab' ? (
-                <HistorySpinner size={14} />
-              ) : (
-                <ArrowDown size={14} />
-              )}
-            </button>
-          </Tooltip>
-          <Tooltip content={isCancellingTurn ? 'Waiting for cancellation to finish' : isPasteBusy ? runtime.label + ' paste is in progress' : isTurnBusy ? runtime.label + ' is busy' : 'Send prompt'}>
-            <button
-              aria-label={'Send ' + runtime.label + ' prompt'}
-              onClick={() => runAction('send')}
-              disabled={!canSend}
-              style={{
-                width: 42,
-                height: 42,
-                borderRadius: 5,
-                border: '1px solid ' + (canSend ? '#DA7756' : '#343434'),
-                backgroundColor: canSend ? '#DA7756' : '#242424',
-                color: canSend ? '#1a1a1a' : '#666',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                cursor: canSend ? 'pointer' : 'default',
-                flexShrink: 0,
+              onKeyDown={(e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                  e.preventDefault();
+                  if (canSend) runAction('send');
+                }
               }}
-            >
-              {busyAction === 'send' ? (
-                <HistorySpinner size={14} />
-              ) : (
-                <Send size={14} />
-              )}
-            </button>
-          </Tooltip>
-          {isTurnBusy && (
-            <Tooltip content={isCancellingTurn ? 'Waiting for cancellation record' : 'Stop current turn'}>
+              placeholder={isCancellingTurn ? 'Canceling... waiting for restored prompt' : status === 'inactive' ? 'Resume ' + runtime.label + ' to send' : status === 'starting' ? 'Waiting for prompt...' : 'Send a prompt...'}
+              readOnly={isCancellingTurn}
+              rows={3}
+              style={{
+                flex: 1,
+                minWidth: 0,
+                resize: 'vertical',
+                maxHeight: 120,
+                minHeight: 56,
+                backgroundColor: isCancellingTurn ? '#130f0a' : '#0f0f0f',
+                border: '1px solid ' + promptIdleBorder,
+                borderRadius: 5,
+                color: isCancellingTurn ? '#c7c7c7' : '#e5e5e5',
+                outline: 'none',
+                padding: '7px 8px',
+                fontSize: 12,
+                lineHeight: 1.35,
+                fontFamily: 'inherit',
+              }}
+              onFocus={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = isCancellingTurn ? '#d97706' : '#DA7756'; }}
+              onBlur={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = promptIdleBorder; }}
+            />
+            <Tooltip content={canGrabDraft ? 'Pull terminal draft' : runtime.label + ' must be ready to pull draft'}>
               <button
-                aria-label={'Stop current ' + runtime.label + ' turn'}
-                onClick={() => runAction('interrupt')}
-                disabled={!canInterruptTurn}
+                aria-label={'Pull ' + runtime.label + ' terminal draft'}
+                onClick={pullTerminalDraft}
+                disabled={!canGrabDraft}
+                style={{
+                  width: 34,
+                  height: 42,
+                  borderRadius: 5,
+                  border: '1px solid ' + (canGrabDraft ? '#3f3f46' : '#343434'),
+                  backgroundColor: canGrabDraft ? '#202020' : '#242424',
+                  color: canGrabDraft ? '#a78bfa' : '#666',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  cursor: canGrabDraft ? 'pointer' : 'default',
+                  flexShrink: 0,
+                }}
+              >
+                {busyAction === 'grab' ? (
+                  <HistorySpinner size={14} />
+                ) : (
+                  <ArrowDown size={14} />
+                )}
+              </button>
+            </Tooltip>
+            <Tooltip content={isCancellingTurn ? 'Waiting for cancellation to finish' : isPasteBusy ? runtime.label + ' paste is in progress' : isTurnBusy ? runtime.label + ' is busy' : 'Send prompt'}>
+              <button
+                aria-label={'Send ' + runtime.label + ' prompt'}
+                onClick={() => runAction('send')}
+                disabled={!canSend}
                 style={{
                   width: 42,
                   height: 42,
                   borderRadius: 5,
-                  border: '1px solid ' + (canInterruptTurn ? '#7f1d1d' : '#343434'),
-                  backgroundColor: canInterruptTurn ? '#2a1515' : '#242424',
-                  color: canInterruptTurn ? '#fca5a5' : '#666',
+                  border: '1px solid ' + (canSend ? '#DA7756' : '#343434'),
+                  backgroundColor: canSend ? '#DA7756' : '#242424',
+                  color: canSend ? '#1a1a1a' : '#666',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
-                  cursor: canInterruptTurn ? 'pointer' : 'default',
+                  cursor: canSend ? 'pointer' : 'default',
                   flexShrink: 0,
                 }}
               >
-                {isCancellingTurn ? (
+                {busyAction === 'send' ? (
                   <HistorySpinner size={14} />
                 ) : (
-                  <Square size={14} fill="currentColor" />
+                  <Send size={14} />
                 )}
               </button>
             </Tooltip>
-          )}
-        </div>
+            {isTurnBusy && (
+              <Tooltip content={isCancellingTurn ? 'Waiting for cancellation record' : 'Stop current turn'}>
+                <button
+                  aria-label={'Stop current ' + runtime.label + ' turn'}
+                  onClick={() => runAction('interrupt')}
+                  disabled={!canInterruptTurn}
+                  style={{
+                    width: 42,
+                    height: 42,
+                    borderRadius: 5,
+                    border: '1px solid ' + (canInterruptTurn ? '#7f1d1d' : '#343434'),
+                    backgroundColor: canInterruptTurn ? '#2a1515' : '#242424',
+                    color: canInterruptTurn ? '#fca5a5' : '#666',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    cursor: canInterruptTurn ? 'pointer' : 'default',
+                    flexShrink: 0,
+                  }}
+                >
+                  {isCancellingTurn ? (
+                    <HistorySpinner size={14} />
+                  ) : (
+                    <Square size={14} fill="currentColor" />
+                  )}
+                </button>
+              </Tooltip>
+            )}
+          </div>
+        </>
       )}
       {error && (
         <div style={{ marginTop: 6, color: '#fca5a5', fontSize: 11, wordBreak: 'break-word' }}>
