@@ -49,31 +49,44 @@ UI настроек копирования организован в три ве
 | Уровень 1 | Уровень 2 (children) | Дефолт |
 |---|---|---|
 | `includeUser` | — | ON |
-| `includeClaude` | `includeText`, `includeThinking`, `includeReading`, `includeEditing`, `includeBash`, `includeTools` | ON / ON,ON,prev,prev,OFF,OFF |
+| `includeClaude` | `includeText`, `includeThinking`, `includeReading`, `includeEditing`, `includeBash`, `includeTools`, `includeWebSearch`, `includeToolSearch`, `includeOtherTools` | ON / text+thinking ON, tool groups OFF кроме persisted legacy |
 | Subagent (master) | `includeSubagentResult`, `includeSubagentHistory` | OFF, OFF |
 | — | `fromStart` (range, не content) | true |
 
-**Дефолты Bash/Tools = OFF.** Старые пользователи имели только Reading/Editing тогглы. После иерархического апгрейда Bash и Tools — новые группы с дефолтом OFF, чтобы существующие пайплайны не получили внезапно 200 KB Bash-логов в `clipboard.writeText()`. Если юзер явно включил Bash раньше через старый Editing (хак: до фикса Bash сидел внутри `includeEditing`), его поведение мигрирует не идеально — это сознательная цена за чистую семантику.
+**Дефолты tool-групп = OFF.** Старые пользователи имели только Reading/Editing тогглы. После иерархического апгрейда Bash/MCP/Web/Tool Search/Other — новые группы с дефолтом OFF, чтобы существующие пайплайны не получили внезапно 200 KB tool-логов в `clipboard.writeText()`. Legacy `includeTools` мигрирует в `includeWebSearch/includeToolSearch/includeOtherTools`, чтобы старый явный выбор «копировать tools» не потерял web/tool-search/прочие вызовы после split'а.
 
 **Tool → group mapping (`getToolGroup` в `main.js`):**
 - `reading` ← Read, NotebookRead
 - `editing` ← Edit, Write, NotebookEdit
 - `bash` ← Bash, **Monitor**, **Grep**, **Glob** — shell-flavoured commands. Monitor берёт shell-команду параметром и стримит её stdout, семантически это long-running Bash, не «tool». Отделение Grep/Glob в reading создавало рассинхрон с callsite-классификаторами в `claude-data.js` (там они всегда были bash), при котором Glob с `includeBash=ON, includeReading=OFF` проходил pre-filter callsite, но получал label-only внутри formatToolAction. См. Deep serialization секцию ниже.
 - `subagent` ← Task, Agent
-- `tools` ← всё остальное: `mcp__*`, WebFetch, WebSearch, Skill, Cron*, ScheduleWakeup, RemoteTrigger, PushNotification, EnterWorktree, ExitPlanMode, ListMcpResources*, AskUserQuestion. Новые tools по умолчанию попадают сюда — safe bucket.
+- `mcp`/`includeTools` ← `mcp__*` namespace.
+- `web`/`includeWebSearch` ← WebFetch/WebSearch/`web_search_call`: интернет и страницы.
+- `toolSearch`/`includeToolSearch` ← Codex `tool_search_call`/`tool_search_output`: каталог доступных инструментов, **не web**.
+- `tools`/`includeOtherTools` ← всё остальное: Skill, Cron*, ScheduleWakeup, RemoteTrigger, PushNotification, EnterWorktree, ExitPlanMode, ListMcpResources*, AskUserQuestion, неизвестные будущие tools. Новые tools по умолчанию попадают сюда — safe bucket, но UI обязан подписывать это как «Прочие инструменты», не `other_tools` без пояснения.
 
-**Почему MCP/Web/Agent не разделены на отдельные toggle:** дробление по семантике даёт 4-5 категорий с 1-2 вызовами в каждой. UI-сложность не оправдана. Если в будущем какая-то группа явно понадобится отдельно (например, Web для копирования web-research контекста без MCP-шума) — добавится подтоггл, структура расширяется.
+**Почему MCP/Web/Tool Search/Other разделены:** после появления Codex JSONL `tool_search` и `web_search` стали похожими по имени, но разными по смыслу. Web — внешний интернет-контент, MCP — проектные/локальные инструменты (`docs_search`, Electron, browser), Tool Search — поиск доступных tools и schema, Other — редкие служебные вызовы. Если держать их в одном `Tools`, пользователь не понимает почему включение «Web» тянет MCP или почему `tool_search` не равен web search.
 
 **Master-toggle + incremental cascade.**
 - Parent OFF → все children рендерятся `disabled` (значение сохраняется в store, UI-клик блокируется). Восстановление parent ON возвращает прежний выбор children.
 - `Subagent` master синтезирован: `active = result || history`. Клик по нему: если оба OFF → включает только Result (минимальный полезный набор); если хоть один ON → выключает оба.
 - Subagent.History ON форсирует Subagent.Result ON (история без финального результата теряет анкер для отображения). Subagent.Result OFF форсирует History OFF (зеркально). Принцип «incremental» сформулирован пользователем дословно: *«вкл туго последнее → выкл туго вся история, и наоборот»*. Принцип в `methodology/переносимый-дизайн.md::Master toggle + incremental children`.
 
-**UI-лейблы child-тогглов = реальные имена tool из JSONL.** Раньше child назывались абстрактно (`Bash`, `Tools`) — пользователь не понимал разницу. Теперь рендерятся как код в monospace: `<code>Read</code> · <code>Grep</code> · <code>Glob</code>` для reading; `<code>Bash</code> · <code>Monitor</code>` + хинт `shell`; `<code>mcp__*</code> · <code>Web</code> · <code>Agent</code>` + хинт `MCP и прочее`. См. `methodology/переносимый-дизайн.md::Категориальные toggle — имена сущностей, не абстракции`.
+**UI-лейблы child-тогглов = зона ответственности + реальные tool names.** Raw names одни недостаточны: `apply_patch`, `write_stdin`, `other_tools` понятны разработчику parser'а, но не отвечают на вопрос «что попадёт в копию». Popup показывает human label первым (`Правки файлов`, `Shell-команды`, `MCP-инструменты`, `Web-поиск`, `Поиск доступных tools`, `Прочие инструменты`), а raw names вторым рядом в monospace (`apply_patch`, `exec_command · write_stdin`, `mcp__*`, `web_search`, `tool_search`, `other_tools`). См. `methodology/переносимый-дизайн.md::Категориальные toggle — имена сущностей, не абстракции`.
 
 **Indicator dot-логика на 📋:** красные точки при отклонении от дефолта в сторону «меньше» (User/Claude OFF — пользователь что-то намеренно исключил, потенциально неожиданно при копировании), цветные при отклонении в сторону «больше» (Bash/Tools/Sub-agent ON — добавлен extra-контент). Дефолтное состояние = ни одной точки.
 
 **Невидимый контекст: callsites.** В Timeline все 4 IPC-вызова `copy-range` спредят единый объект `copyFlags` — добавление нового флага не требует обхода всех callsites. Rewind-path (`Phase 1: copy → Gemini compact`) намеренно НЕ передаёт `copyFlags` — для compact-сводки нужен полный контекст диалога, не отфильтрованный пользовательскими настройками.
+
+## Codex Copy Session export
+
+Codex Copy Session строится из rollout JSONL (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`), а не из Claude backtrace. User turns берутся из `event_msg.user_message`, ответы — из `response_item.message`, thinking — из `response_item.reasoning`, compact — из top-level `type: "compacted"`. `thread_rolled_back` удаляет последние turns из уже собранного export'а, потому что Codex rollback физически оставляет старые записи в файле.
+
+Tool-result boundary отличается от HistoryPanel raw cards: для чистого export'а canonical output — `response_item.function_call_output` / `custom_tool_call_output` / `tool_search_output`. `event_msg.mcp_tool_call_end` не используется как второй источник результата: там есть server/tool/duration/result, но если смешать оба слоя, MCP-вызов легко задублировать или получить два разных shape'а одного ответа. Для downstream LLM важен один блок `request/response`, не телеметрия lifecycle'а.
+
+Codex tool groups не совпадают с Claude names: `apply_patch` → «Правки файлов», `exec_command`/`write_stdin` → shell, namespace `mcp__*` → MCP, `web_search_call` → Web, `tool_search_call/tool_search_output` → каталог tools, `multi_agent_v1` + `spawn/wait/send` → субагенты, остальное → Other. `tool_search_output` нельзя копировать как полный schema dump: он разворачивает список доступных tools на сотни строк и забивает clipboard внутренней metadata. Export ужимает его до namespace/function list — достаточно, чтобы понять какие инструменты были найдены, без шумного описания каждого аргумента.
+
+Если добавляешь новый Codex `response_item.type`, сначала реши: это содержательный user/assistant/tool event или telemetry. Содержательное должно попасть в export под одним из существующих toggles или в `other_tools`; telemetry остаётся в History/Timeline diagnostics, но не в clean copy. Пользовательский симптом неправильной классификации — включил категорию в Copy Settings, а в копии либо пусто, либо raw service dump вместо полезного контекста.
 
 ## Unified Formatting (main.js)
 Для обеспечения консистентности данных, логика формирования текста (обработка `thinking` блоков, форматирование `diff` и `tool_use`) вынесена в общую функцию `formatToolAction` в Main-процессе. 
@@ -81,7 +94,7 @@ UI настроек копирования организован в три ве
 - **Actions Block:** Форматирование списка действий (`**Actions:**`) унифицировано для всех видов экспорта.
 
 ## Markers row — inline chips под `Copy session`
-Ряд миниатюрных chip'ов рядом с кнопкой `Copy session` зеркалит флаги копирования (User, Claude, text, thinking, read, edit, bash, mcp, ⑂fork, sub-/result). Каждый chip — одиночный toggle: клик переключает соответствующий `copyInclude*` флаг в `useUIStore`. Цвет ON = `#DA7756` (Claude brand), OFF = `#555`. Sub- chip — split-pill: левая половина включает/выключает субагент целиком, правая переключает режим `result ↔ full` (история).
+Ряд миниатюрных chip'ов рядом с кнопкой `Copy session` зеркалит флаги копирования. Для Claude это User/Claude/answer/thinking/read/edit/bash/mcp/web/other/⑂fork/sub; для Codex — User/Codex/answer/files/shell/mcp/web/catalog/other/sub. Короткий Codex chip `catalog` означает `tool_search`, потому что `tool` рядом с `web` не объясняет отличие; tooltip раскрывает raw имя. Каждый chip — одиночный toggle: клик переключает соответствующий `copyInclude*` флаг в `useUIStore`. Цвет ON = brand текущего агента (`#DA7756` для Claude, `#10A37F` для Codex), OFF = `#555`. Sub- chip — split-pill: левая половина включает/выключает субагент целиком, правая переключает режим `result ↔ full` (история).
 
 **`ChipText` обязан жить на module-scope, не внутри render.** Раньше компонент был объявлен inline в IIFE рендера InfoPanel — React пересоздавал DOM-ноду каждой chip-кнопки на каждый рендер родителя, trusted-клик молча проглатывался (`pointerdown` приходил в старую ноду, `pointerup` — в новую, синтетический `click` event не выстреливал). Симптом: User и Claude иконки (прямой `<button>` в JSX) кликались, всё остальное — нет. Принцип — см. [`fix-inline-компонент-click.md`](fix-inline-компонент-click.md).
 

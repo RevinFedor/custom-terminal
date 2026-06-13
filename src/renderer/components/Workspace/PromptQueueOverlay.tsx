@@ -48,6 +48,10 @@ const HINT_RED = '#ef4444';       // red-500 — first-chip "don't forget to arm
                                   // "orange" and conflicted visually with the
                                   // active Run after state. True red is the
                                   // clearer "needs your attention" signal.
+const HINT_RED_BG = 'rgba(127, 29, 29, 0.14)';
+const HINT_RED_BORDER = 'rgba(239, 68, 68, 0.32)';
+const HINT_RED_TEXT = '#b96b6b';
+const HINT_RED_DOT = '#a45454';
 const PANEL_BG = 'rgba(20,20,20,0.92)';
 const BORDER = 'rgba(255,255,255,0.08)';
 const TEXT_MUTED = '#888';
@@ -122,7 +126,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
   const {
     addPrompt, removePrompt, updatePrompt, reorderPrompt,
     setAutoRun, setStopAfter, setCloseAfter, setRunAfterTab,
-    setPostPromptEnabled, setPostPromptText, consumeFirstChipHint,
+    setPostPromptEnabled, setPostPromptText,
     // popNext is consumed by hooks/usePromptQueueRunner.ts — not referenced here.
   } = usePromptQueueStore.getState();
 
@@ -238,26 +242,18 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
 
   // ─── first-chip blink ────────────────────────────────────────────────────
   // When firstChipArmedHint flips false → true (user added the first chip
-  // into an empty queue while Run after was off), we play a short red blink
-  // on the Run-after pill to draw the eye. Animation runs TWICE (2 × 0.7s =
-  // 1.4s total) and then the hint is auto-consumed — the static red border
-  // disappears at the same instant the animation ends, so the pill never
-  // shows a frozen "still red but not blinking" state.
+  // into an empty queue while Run after was off), we play one red blink to draw
+  // the eye, then leave a low-red armed hint until the user explicitly presses
+  // Run after or manually empties the queue. Hover is only inspection; it must
+  // not acknowledge/clear the hint.
   //
-  // (Hover still consumes the hint as a fast-path: if the user looks at the
-  // pill within the 1.4s window, the blink ends immediately.)
-  //
-  // We can't put the animation directly on the pill (re-renders would
-  // re-start it mid-cycle). Instead, increment a counter every time the
-  // hint re-arms — `key={blinkKey}` on the overlay span unmounts/remounts
-  // it, giving a fresh animation each time.
+  // We can't put the animation directly on the pill (re-renders would re-start
+  // it mid-cycle). Instead, increment a counter every time the hint re-arms —
+  // `key={blinkKey}` on the overlay span unmounts/remounts it, giving a fresh
+  // animation each time.
   const [blinkKey, setBlinkKey] = useState(0);
-  // Keep the blink iteration count + cycle duration as constants so the
-  // post-animation auto-consume timer (below) stays in sync if either is
-  // tweaked. CSS animation uses `${BLINK_CYCLE_MS}ms ease-in-out
-  // ${BLINK_ITERATIONS}` and the timer fires at the exact same instant.
   const BLINK_CYCLE_MS = 700;
-  const BLINK_ITERATIONS = 2;
+  const BLINK_ITERATIONS = 1;
   // Per-chip Replay in-flight flag. Replay roundtrip is ~400-800ms (Ctrl+G grab
   // → helper write → main IPC → paste) and visually silent until the chip
   // disappears — without a per-button spinner the user double-clicks.
@@ -275,18 +271,9 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
   useEffect(() => {
     if (firstChipArmedHint && !prevHintRef.current) {
       setBlinkKey((k) => k + 1);
-      // Schedule auto-consume at the EXACT moment the CSS animation ends.
-      // Tight coupling between CSS animation total and JS timer keeps the
-      // visual snap clean: blink ends → red state drops in the next frame,
-      // no "frozen red" hangover.
-      const t = setTimeout(() => {
-        consumeFirstChipHint(tabId);
-      }, BLINK_CYCLE_MS * BLINK_ITERATIONS);
-      prevHintRef.current = firstChipArmedHint;
-      return () => clearTimeout(t);
     }
     prevHintRef.current = firstChipArmedHint;
-  }, [firstChipArmedHint, tabId, consumeFirstChipHint]);
+  }, [firstChipArmedHint]);
 
   // Auto-runner moved to hooks/usePromptQueueRunner.ts — mounted at App root.
   // The runner subscribes to provider busy-state IPC + queue store globally so
@@ -1051,30 +1038,26 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'stretch', minWidth: 0 }}>
 
           {/* Run-after pill — row 1 of right column. Width: 100% of column.
-              firstChipArmedHint: subtle red glow that appears when user adds
-              the FIRST chip into an empty queue while Run after is OFF — visual
-              nudge "don't forget to arm me". Cleared on first hover and never
-              re-shown until the queue empties again. */}
+              firstChipArmedHint: red blink + low-red resting state when user
+              adds the first chip into an empty queue while Run after is OFF.
+              Cleared only by pressing Run after or manually emptying the queue. */}
           <button
             onClick={toggleAutoRun}
-            onMouseEnter={() => {
-              if (firstChipArmedHint) consumeFirstChipHint(tabId);
-            }}
             style={{
               position: 'relative',
               width: '100%',
               padding: '2px 6px',
-              background: autoRun ? `${PULSE}26` : (firstChipArmedHint ? `${HINT_RED}26` : 'transparent'),
-              border: `1px solid ${autoRun ? PULSE : (firstChipArmedHint ? HINT_RED : BORDER)}`,
+              background: autoRun ? `${PULSE}26` : (firstChipArmedHint ? HINT_RED_BG : 'transparent'),
+              border: `1px solid ${autoRun ? PULSE : (firstChipArmedHint ? HINT_RED_BORDER : BORDER)}`,
               borderRadius: 10,
-              color: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED : TEXT_MUTED),
+              color: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED_TEXT : TEXT_MUTED),
               cursor: 'pointer', fontSize: 9, letterSpacing: 0.3,
               display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 4,
               whiteSpace: 'nowrap',
               transition: 'all 0.15s',
               boxShadow: armedFlash
                 ? `0 0 6px ${PULSE}`
-                : (firstChipArmedHint ? `0 0 6px ${HINT_RED}66` : 'none'),
+                : 'none',
             }}
           >
             {firstChipArmedHint && (
@@ -1093,7 +1076,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
             <span
               style={{
                 width: 6, height: 6, borderRadius: '50%',
-                background: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED : '#555'),
+                background: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED_DOT : '#555'),
                 animation: autoRun && agentBusy ? 'pq-pulse 1.4s ease-in-out infinite' : 'none',
               }}
             />
@@ -1581,15 +1564,29 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
             title={(autoRun ? 'Run after on' : 'Run after off') + ' · ' + items.length + ' queued'}
             aria-label={(autoRun ? 'Run after on' : 'Run after off') + ', ' + items.length + ' queued'}
             style={{
-              background: autoRun ? '#2b2340' : (items.length ? '#242424' : '#2a1a14'),
-              borderColor: autoRun ? '#8b75d9' : (items.length ? '#4a4a4a' : '#8a4a37'),
-              color: autoRun ? PULSE : (items.length ? '#e5e5e5' : TINT),
+              position: 'relative',
+              background: autoRun ? '#2b2340' : (firstChipArmedHint ? HINT_RED_BG : (items.length ? '#242424' : '#2a1a14')),
+              borderColor: autoRun ? '#8b75d9' : (firstChipArmedHint ? HINT_RED_BORDER : (items.length ? '#4a4a4a' : '#8a4a37')),
+              color: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED_TEXT : (items.length ? '#e5e5e5' : TINT)),
               fontSize: items.length > 0 ? 12 : 18,
               fontWeight: items.length > 0 ? 700 : 500,
               cursor: 'default',
               lineHeight: 1,
             }}
           >
+            {firstChipArmedHint && (
+              <span
+                key={`rail-${blinkKey}`}
+                aria-hidden="true"
+                style={{
+                  position: 'absolute',
+                  inset: -1,
+                  borderRadius: 999,
+                  pointerEvents: 'none',
+                  animation: `pq-hint-blink ${BLINK_CYCLE_MS}ms ease-in-out ${BLINK_ITERATIONS}`,
+                }}
+              />
+            )}
             {items.length > 0 ? (items.length > 99 ? '99' : items.length) : '•'}
           </button>
           <button
@@ -1748,10 +1745,9 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
           0%, 100% { box-shadow: 0 0 0 0 ${PULSE}88; }
           50%      { box-shadow: 0 0 0 6px ${PULSE}00; }
         }
-        /* First-chip hint blink: red ring grows outward and fades. The pill
-           runs this twice (2 × 700ms = 1.4s total), then a setTimeout in JS
-           auto-consumes the hint in the SAME frame — so the static red
-           border on the pill never lingers after the animation ends. */
+        /* First-chip hint blink: one red ring grows outward and fades. The
+           low-red resting state remains until the user arms Run after or
+           manually empties the queue. */
         @keyframes pq-hint-blink {
           0%   { box-shadow: 0 0 0 0    ${HINT_RED}cc; background: ${HINT_RED}33; }
           70%  { box-shadow: 0 0 0 5px  ${HINT_RED}00; background: ${HINT_RED}11; }
