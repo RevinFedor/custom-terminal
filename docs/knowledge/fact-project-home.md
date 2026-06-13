@@ -41,6 +41,10 @@ UI рядом с поиском показывает `{unindexed} new` и кно
 - **Active/Favorite:** handlers сохраняются для совместимости, но карточки сейчас не рендерятся на Home.
 - **History:** Restore, Add to Favorites, Delete.
 
+`Обновить название` появляется для Claude/Codex active-tab карточки (если эта поверхность вернётся в UI) и для history-записи с `claude_session_id` или `codex_session_id`. Active path вызывает тот же явный override, что ПКМ по вкладке: обновление игнорирует прежний `nameSetManually`, показывает per-item loader `Название обновляется...`, а результат снова помечается ручным именем, чтобы будущий auto-title его не перетёр. History path не восстанавливает вкладку ради rename: он читает сессию напрямую, генерирует title по сохранённому session id/cwd и сохраняет только `tab_history.name`.
+
+При изменении history-title обязательно инвалидируется `tab_history_title_index` для этой записи. Title-only RAG индекс привязан к старому `name`; простое `UPDATE tab_history SET name` без удаления embedding оставит поиск по старому названию, хотя карточка уже показывает новое. После успешного rename Home обновляет локальные `history`/`semanticResults` и refresh'ит stats, чтобы кнопка `Index` могла пересобрать только устаревшую строку.
+
 ### Directory Management
 Рядом с отображением текущего пути проекта в Home View находится иконка редактирования (карандаш/папка).
 - Клик открывает системный диалог выбора папки.

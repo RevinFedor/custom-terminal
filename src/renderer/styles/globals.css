@@ -236,6 +236,9 @@
   background-size: 260% 100%;
   background-clip: text;
   -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  will-change: background-position;
+  filter: drop-shadow(0 0 4px rgba(129, 140, 248, 0.24));
   animation: tab-title-naming-sweep 1.35s linear infinite;
 }
 

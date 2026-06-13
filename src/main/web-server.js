@@ -46,6 +46,8 @@ const { app, BrowserWindow, ipcMain } = require('electron');
 let findSessionFile = null;
 let parseTimelineUuids = null;
 let parseTimelineEntries = null;
+let loadCodexSessionRecords = null;
+let buildCodexTimeline = null;
 try {
   const cd = require(path.join(__dirname, 'ipc', 'claude-data'));
   findSessionFile = cd.findSessionFile;
@@ -53,6 +55,13 @@ try {
   parseTimelineEntries = cd.parseTimelineEntries;
 } catch (e) {
   console.warn('[WebServer] claude-data helpers not loaded:', e.message);
+}
+try {
+  const codex = require(path.join(__dirname, 'ipc', 'codex-data'));
+  loadCodexSessionRecords = codex._api?.loadSessionRecords || null;
+  buildCodexTimeline = codex._api?.buildCodexTimeline || codex.buildCodexTimeline || null;
+} catch (e) {
+  console.warn('[WebServer] codex-data helpers not loaded:', e.message);
 }
 
 let WebSocketServer;
@@ -163,6 +172,95 @@ function sendJson(res, status, body) {
   }
 }
 
+function mobileTimelineColor(kind) {
+  switch (kind) {
+    case 'compact': return 'f59e0b';
+    case 'continued': return 'fb923c';
+    case 'docs_edit': return '22c55e';
+    case 'docs_search': return '38bdf8';
+    case 'user': return 'a78bfa';
+    default: return '888888';
+  }
+}
+
+function mobileTimelinePreview(value, max = 360) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  return text.length > max ? text.slice(0, max - 1).trimEnd() + '…' : text;
+}
+
+function normalizeMobileTimelineEntries(entries, fullEntries = []) {
+  const fullByUuid = new Map();
+  for (const entry of Array.isArray(fullEntries) ? fullEntries : []) {
+    if (entry && typeof entry.uuid === 'string') fullByUuid.set(entry.uuid, entry);
+  }
+
+  return (Array.isArray(entries) ? entries : [])
+    .filter(entry => entry && typeof entry.uuid === 'string')
+    .map((entry) => {
+      const kind = String(entry.type || entry.role || 'entry');
+      const fullEntry = fullByUuid.get(entry.uuid) || {};
+      const compactSummary = entry.compactSummary || fullEntry.compactSummary || '';
+      const content = entry.content || fullEntry.content || '';
+      const full = kind === 'compact'
+        ? (compactSummary || content || 'Conversation compacted')
+        : (content || compactSummary || '');
+      const preview = kind === 'compact'
+        ? mobileTimelinePreview(full || 'Conversation compacted')
+        : mobileTimelinePreview(content || compactSummary || kind);
+      const tsMs = Date.parse(entry.timestamp || fullEntry.timestamp || '');
+
+      return {
+        uuid: entry.uuid,
+        kind,
+        color: mobileTimelineColor(kind),
+        preview: preview || kind,
+        full: full || undefined,
+        ts: Number.isFinite(tsMs) ? Math.floor(tsMs / 1000) : undefined,
+        preTokens: entry.preTokens || fullEntry.preTokens || undefined,
+      };
+    });
+}
+
+async function sendInitialSnapshot(tabId, sink, sdkSessions) {
+  const session = sdkSessions.get(tabId);
+  if (session) {
+    sink.send(JSON.stringify({
+      type: 'snapshot',
+      tabId,
+      sessionId: session.sessionId || null,
+      busy: true,
+      sessionStatus: 'busy',
+      commandType: 'claude-sdk',
+      toolType: 'claude',
+    }));
+    return;
+  }
+  try {
+    const status = await bridgeRequest('getClaudeTabStatus', { tabId }, 1500);
+    sink.send(JSON.stringify({
+      type: 'snapshot',
+      tabId,
+      sessionId: status?.sessionId || null,
+      busy: status?.status === 'busy',
+      sessionStatus: status?.status || 'inactive',
+      commandType: status?.commandType || null,
+      toolType: status?.toolType || null,
+      inputReady: status?.status === 'active' || status?.status === 'busy',
+    }));
+  } catch {
+    sink.send(JSON.stringify({
+      type: 'snapshot',
+      tabId,
+      sessionId: null,
+      busy: false,
+      sessionStatus: 'inactive',
+      commandType: null,
+      toolType: null,
+    }));
+  }
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -198,6 +296,47 @@ function bridgeRequest(action, payload, timeoutMs = 5000) {
     console.log('[BridgeDiag] SEND action=' + action + ' rid=' + requestId + ' wins=' + wins.length);
     win.webContents.send('web:bridge-request', { requestId, action, payload });
   });
+}
+
+async function resolveAgentSessionInfo(tabId, timeoutMs = 1500) {
+  let info = null;
+  try {
+    info = await bridgeRequest('getTabSessionInfo', { tabId }, timeoutMs);
+  } catch {}
+  if (info?.sessionId && info?.toolType) return info;
+
+  try {
+    const projectManager = require('./project-manager');
+    for (const p of projectManager.db.getAllProjects()) {
+      const t = (p.tabs || []).find(x => x.tabId === tabId);
+      if (!t) continue;
+      const isCodex = t.commandType === 'codex' && (t.tabType || 'terminal') !== 'claude-sdk';
+      const isClaude = t.commandType === 'claude' && (t.tabType || 'terminal') !== 'claude-sdk';
+      const toolType = isCodex ? 'codex' : isClaude ? 'claude' : null;
+      const sessionId = isCodex ? (t.codexSessionId || null) : isClaude ? (t.claudeSessionId || null) : null;
+      return {
+        tabId,
+        toolType,
+        commandType: t.commandType || null,
+        sessionId,
+        claudeSessionId: t.claudeSessionId || null,
+        codexSessionId: t.codexSessionId || null,
+        geminiSessionId: t.geminiSessionId || null,
+        cwd: t.cwd || null,
+      };
+    }
+  } catch {}
+
+  return info || {
+    tabId,
+    toolType: null,
+    commandType: null,
+    sessionId: null,
+    claudeSessionId: null,
+    codexSessionId: null,
+    geminiSessionId: null,
+    cwd: null,
+  };
 }
 
 function registerBridgeReplyHandler() {
@@ -239,11 +378,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
   }
 
   // Active-loaders snapshot — every tab across every project that is still
-  // "working" (Claude PTY alive / SDK streaming / Gemini busy / any running
-  // process). Polled by the external `build:i-obs` script which waits for
-  // `idle:true` before rebuilding. Computed in main against the live Maps that
-  // already drive the UI loader — no separate busy notion. See
-  // computeActiveLoaders() in main.js.
+  // "working" (AI turn/loader, SDK streaming, Gemini busy, or a non-AI running
+  // shell process). AI CLI liveness by itself is not a loader: idle Claude/Codex
+  // tabs are allowed to be closed by build:install. Computed in main against
+  // the live Maps that already drive the UI loader — no separate busy notion.
+  // See computeActiveLoaders() in main.js.
   if (parsed.pathname === '/api/active-loaders' && req.method === 'GET') {
     if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
     if (!computeActiveLoaders) {
@@ -290,13 +429,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
     // Initial snapshot — mirror the WS upgrade path so the client renders
     // immediately without waiting for the next broadcast.
-    const session = sdkSessions.get(tabId);
-    sink.send(JSON.stringify({
-      type: 'snapshot',
-      tabId,
-      sessionId: session?.sessionId || null,
-      busy: !!session,
-    }));
+    sendInitialSnapshot(tabId, sink, sdkSessions).catch(() => {});
     startClaudeTabWatcher(tabId).catch(() => {});
 
     // Heartbeat: SSE connections die silently behind some proxies/radios.
@@ -327,16 +460,21 @@ async function handleApi(req, res, parsed, sdkSessions) {
     // mobile client can split into Active / All. If the bridge fails (renderer
     // not ready, no window), fall back to "nothing is active" — phone still
     // gets the project list, just without the badge.
+    let openProjectIds = [];
     let openIds = new Set();
     let activeProjectId = null;
     let awaitingIds = new Set();
     try {
       const data = await bridgeRequest('getOpenProjectIds', {}, 1500);
-      if (data?.ids) openIds = new Set(data.ids);
+      if (Array.isArray(data?.ids)) {
+        openProjectIds = data.ids;
+        openIds = new Set(data.ids);
+      }
       activeProjectId = data?.activeProjectId || null;
       if (Array.isArray(data?.awaitingIds)) awaitingIds = new Set(data.awaitingIds);
     } catch {}
 
+    const openOrder = new Map(openProjectIds.map((id, index) => [id, index]));
     const all = projectManager.db.getAllProjects().map(p => {
       const tabs = p.tabs || [];
       const sdkTabs = tabs.filter(t => t.tabType === 'claude-sdk');
@@ -347,6 +485,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         id: p.id,
         name: p.name,
         path: p.path,
+        icon: p.icon || null,
         tabCount: tabs.length,
         sdkTabCount: sdkTabs.length,
         liveSdkCount,
@@ -355,6 +494,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
         isActive: p.id === activeProjectId,
         hasAwaiting: awaitingIds.has(p.id),
       };
+    });
+    all.sort((a, b) => {
+      const aOpen = openOrder.has(a.id);
+      const bOpen = openOrder.has(b.id);
+      if (aOpen && bOpen) return openOrder.get(a.id) - openOrder.get(b.id);
+      if (aOpen !== bOpen) return aOpen ? -1 : 1;
+      return (b.updatedAt || 0) - (a.updatedAt || 0);
     });
     return sendJson(res, 200, { projects: all });
   }
@@ -445,22 +591,22 @@ async function handleApi(req, res, parsed, sdkSessions) {
       console.log('[WebServer] 404 project not found: ' + projectId + ' (not in DB, not in live Zustand)');
       return sendJson(res, 404, { error: 'project not found', projectId });
     }
-    // For PTY+Claude tabs (commandType='claude' && tabType!='claude-sdk')
+    // For PTY agent tabs (Claude/Codex, excluding SDK)
     // ask renderer for sessionStatus in a single batch — cheap because
-    // renderer holds the live `claudeCliActive` Map. SDK tabs have no
+    // renderer holds the live runtime adapters. SDK tabs have no
     // sessionStatus concept here; we keep null for them.
     let statusMap = new Map();
     let awaitingMap = new Map();
-    const ptyClaudeIds = (project.tabs || [])
-      .filter(t => t.commandType === 'claude' && (t.tabType || 'terminal') !== 'claude-sdk')
+    const ptyAgentIds = (project.tabs || [])
+      .filter(t => (t.commandType === 'claude' || t.commandType === 'codex') && (t.tabType || 'terminal') !== 'claude-sdk')
       .map(t => t.tabId);
-    if (ptyClaudeIds.length > 0) {
+    if (ptyAgentIds.length > 0) {
       try {
-        const data = await bridgeRequest('getClaudeTabStatusBatch', { tabIds: ptyClaudeIds }, 1500);
+        const data = await bridgeRequest('getClaudeTabStatusBatch', { tabIds: ptyAgentIds }, 1500);
         if (data?.statuses) for (const [id, st] of Object.entries(data.statuses)) statusMap.set(id, st);
         if (data?.awaiting) for (const [id, aw] of Object.entries(data.awaiting)) if (aw) awaitingMap.set(id, true);
       } catch (e) {
-        // Bridge unavailable — every PTY+Claude tab will show no badge until
+        // Bridge unavailable — every PTY agent tab will show no badge until
         // user opens it (per-tab GET /status still works on demand).
       }
     }
@@ -502,6 +648,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         color: t.color || null,   // desktop TabColor — drives row bg (mobile mirrors desktop)
         cwd: t.cwd,
         claudeSessionId: t.claudeSessionId,
+        codexSessionId: t.codexSessionId,
+        geminiSessionId: t.geminiSessionId,
         timelineCount,
         sessionStatus: statusMap.get(t.tabId) || null,
         awaiting: awaitingMap.get(t.tabId) || false,
@@ -514,7 +662,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         } : null,
       };
     });
-    return sendJson(res, 200, { project: { id: project.id, name: project.name, path: project.path }, tabs, statusMarker: markerCfg, processBar: processBarCfg });
+    return sendJson(res, 200, { project: { id: project.id, name: project.name, path: project.path, icon: project.icon || null }, tabs, statusMarker: markerCfg, processBar: processBarCfg });
   }
 
   // Create SDK tab in a project (delegates to renderer store)
@@ -555,6 +703,21 @@ async function handleApi(req, res, parsed, sdkSessions) {
   if (m && req.method === 'POST') {
     try {
       const data = await bridgeRequest('createClaudeTab', { projectId: decId(m[1]) });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
+  // Create PTY agent tab in a project. Body: { toolType: 'claude' | 'codex' }.
+  // Used by the native iOS "New Terminal" picker; keeps Claude/Codex creation
+  // on the same renderer-owned pendingAction path as desktop.
+  m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/agent-tabs$/);
+  if (m && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const toolType = body.toolType === 'codex' ? 'codex' : 'claude';
+      const data = await bridgeRequest('createAgentTab', { projectId: decId(m[1]), toolType });
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });
@@ -690,6 +853,20 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  // Read the current terminal composer draft after a deterministic interrupt.
+  // Mobile uses the same bridge action as desktop History instead of keeping a
+  // local "last sent prompt" fallback.
+  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/draft$/);
+  if (m && (req.method === 'GET' || req.method === 'POST')) {
+    const tabId = decId(m[1]);
+    try {
+      const data = await bridgeRequest('grabAgentDraft', { tabId }, 5000);
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
   // Answer (or stop) an AskUserQuestion from mobile. Body:
   //   { source:'pty'|'sdk', toolUseID, answers:{[questionText]:label|labels}, stop? }
   // Routes to main's answerClaudeQuestion (PTY → drive TUI keystrokes, SDK →
@@ -766,40 +943,59 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const tabId = decId(m[1]);
     const t0 = Date.now();
     console.log(`[WebTiming] /timeline START tabId=${tabId.slice(0, 24)}`);
-    if (!parseTimelineEntries || !findSessionFile) return sendJson(res, 500, { error: 'timeline parser not loaded' });
     try {
-      // Resolve session via the renderer (it knows currently-open tabs and
-      // their cwd). For closed-project tabs we fall back to scanning DB.
-      let sessionId = null;
-      let cwd = null;
-      try {
-        const data = await bridgeRequest('getTabSessionInfo', { tabId }, 1500);
-        sessionId = data?.claudeSessionId || null;
-        cwd = data?.cwd || null;
-      } catch {}
       const tBridge = Date.now();
-      if (!sessionId) {
-        // Scan DB across all projects for the tab
-        const projectManager = require('./project-manager');
-        for (const p of projectManager.db.getAllProjects()) {
-          const t = (p.tabs || []).find(x => x.tabId === tabId);
-          if (t) { sessionId = t.claudeSessionId; cwd = t.cwd; break; }
-        }
-      }
-      if (!sessionId) {
+      const info = await resolveAgentSessionInfo(tabId, 1500);
+      const sessionId = info?.sessionId || null;
+      const cwd = info?.cwd || null;
+      const toolType = info?.toolType || null;
+      if (!sessionId || !toolType) {
         console.log(`[WebTiming] /timeline NO_SESSION bridge=${tBridge-t0}ms total=${Date.now()-t0}ms`);
         return sendJson(res, 200, { entries: [] });
       }
+      if (toolType === 'codex') {
+        if (!loadCodexSessionRecords || !buildCodexTimeline) return sendJson(res, 500, { error: 'codex timeline parser not loaded' });
+        const loaded = await loadCodexSessionRecords(sessionId, cwd);
+        if (!loaded?.success) {
+          console.log(`[WebTiming] /timeline CODEX_NO_FILE bridge=${tBridge-t0}ms total=${Date.now()-t0}ms`);
+          return sendJson(res, 200, { entries: [], sessionId, toolType });
+        }
+        const entries = buildCodexTimeline(loaded.records || [], sessionId);
+        let fullEntries = [];
+        if (entries.some(e => e?.type === 'compact' || e?.role === 'compact')) {
+          try {
+            const full = await bridgeRequest('loadAgentFullHistory', { tabId }, 5000);
+            fullEntries = Array.isArray(full?.entries) ? full.entries : [];
+          } catch (summaryErr) {
+            console.log(`[WebTiming] /timeline CODEX_COMPACT_SUMMARY_SKIP ${String(summaryErr.message)}`);
+          }
+        }
+        const mobileEntries = normalizeMobileTimelineEntries(entries, fullEntries);
+        const tParse = Date.now();
+        console.log(`[WebTiming] /timeline DONE tool=codex entries=${mobileEntries.length} bridge=${tBridge-t0}ms parse=${tParse-tBridge}ms total=${tParse-t0}ms`);
+        return sendJson(res, 200, { entries: mobileEntries, sessionId, toolType, count: mobileEntries.length });
+      }
+      if (!parseTimelineEntries || !findSessionFile) return sendJson(res, 500, { error: 'timeline parser not loaded' });
       const found = findSessionFile(sessionId, cwd);
       if (!found) {
         console.log(`[WebTiming] /timeline NO_FILE bridge=${tBridge-t0}ms total=${Date.now()-t0}ms`);
-        return sendJson(res, 200, { entries: [], sessionId });
+        return sendJson(res, 200, { entries: [], sessionId, toolType });
       }
       const tFind = Date.now();
       const entries = parseTimelineEntries(found.filePath);
+      let fullEntries = [];
+      if (entries.some(e => e?.type === 'compact' || e?.role === 'compact')) {
+        try {
+          const full = await bridgeRequest('loadAgentFullHistory', { tabId }, 5000);
+          fullEntries = Array.isArray(full?.entries) ? full.entries : [];
+        } catch (summaryErr) {
+          console.log(`[WebTiming] /timeline CLAUDE_COMPACT_SUMMARY_SKIP ${String(summaryErr.message)}`);
+        }
+      }
+      const mobileEntries = normalizeMobileTimelineEntries(entries, fullEntries);
       const tParse = Date.now();
-      console.log(`[WebTiming] /timeline DONE entries=${entries.length} bridge=${tBridge-t0}ms find=${tFind-tBridge}ms parse=${tParse-tFind}ms total=${tParse-t0}ms`);
-      return sendJson(res, 200, { entries, sessionId, count: entries.length });
+      console.log(`[WebTiming] /timeline DONE tool=claude entries=${mobileEntries.length} bridge=${tBridge-t0}ms find=${tFind-tBridge}ms parse=${tParse-tFind}ms total=${tParse-t0}ms`);
+      return sendJson(res, 200, { entries: mobileEntries, sessionId, toolType, count: mobileEntries.length });
     } catch (e) {
       console.log(`[WebTiming] /timeline ERROR ${String(e.message)} total=${Date.now()-t0}ms`);
       return sendJson(res, 500, { error: String(e.message) });
@@ -827,9 +1023,36 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const lastN = lastRaw != null ? Math.max(1, Math.min(20000, parseInt(String(lastRaw), 10) || 0)) : null;
     const afterUuid = typeof parsed.query.after === 'string' ? parsed.query.after : null;
     const beforeUuid = typeof parsed.query.before === 'string' ? parsed.query.before : null;
+    const wantHistoryEntries = parsed.query.view === 'history' || parsed.query.entries === '1';
     const wantNdjson = /\bapplication\/x-ndjson\b/.test(req.headers['accept'] || '') || parsed.query.ndjson === '1';
-    console.log(`[WebTiming] /history START tabId=${tabId.slice(0, 24)} last=${lastN || 'all'} after=${afterUuid ? afterUuid.slice(0, 8) : 'none'} before=${beforeUuid ? beforeUuid.slice(0, 8) : 'none'} ndjson=${wantNdjson}`);
+    console.log(`[WebTiming] /history START tabId=${tabId.slice(0, 24)} last=${lastN || 'all'} after=${afterUuid ? afterUuid.slice(0, 8) : 'none'} before=${beforeUuid ? beforeUuid.slice(0, 8) : 'none'} view=${wantHistoryEntries ? 'history' : 'messages'} ndjson=${wantNdjson}`);
     try {
+      if (wantHistoryEntries) {
+        const data = await bridgeRequest('loadAgentFullHistory', { tabId }, 5000);
+        let entries = Array.isArray(data?.entries) ? data.entries : [];
+        const total = entries.length;
+        let dropped = 0;
+        if (afterUuid) {
+          const idx = entries.findIndex((e) => e && e.uuid === afterUuid);
+          entries = idx >= 0 ? entries.slice(idx + 1) : [];
+        }
+        if (beforeUuid) {
+          const idx = entries.findIndex((e) => e && e.uuid === beforeUuid);
+          entries = idx >= 0 ? entries.slice(0, idx) : [];
+        }
+        if (lastN && entries.length > lastN) {
+          dropped = entries.length - lastN;
+          entries = entries.slice(entries.length - lastN);
+        }
+        const truncated = dropped > 0;
+        const firstUuid = entries.length ? (entries[0]?.uuid || null) : null;
+        const lastUuid = entries.length ? (entries[entries.length - 1]?.uuid || null) : null;
+        const etagSrc = entries.map((e) => e?.uuid || '').join('|');
+        const etag = crypto.createHash('sha1').update(etagSrc).digest('hex').slice(0, 16);
+        console.log(`[WebTiming] /history DONE view=history tool=${data?.toolType || '-'} total=${total} returned=${entries.length} dropped=${dropped} ms=${Date.now()-t0}`);
+        return sendJson(res, 200, { ...data, entries, total, truncated, dropped, etag, firstUuid, lastUuid });
+      }
+
       const data = await bridgeRequest('loadSDKHistory', { tabId });
       const allMsgs = data?.messages || [];
       const total = allMsgs.length;
@@ -1285,13 +1508,7 @@ function attachWebSocket(server, sdkSessions) {
         subscribe(tabId, sink);
         // Send initial snapshot of live state — what the phone needs to render
         // immediately without waiting for the next message.
-        const session = sdkSessions.get(tabId);
-        sink.send(JSON.stringify({
-          type: 'snapshot',
-          tabId,
-          sessionId: session?.sessionId || null,
-          busy: !!session,
-        }));
+        sendInitialSnapshot(tabId, sink, sdkSessions).catch(() => {});
         // Start fs-watch on PTY+Claude tab's JSONL (no-op for SDK tabs).
         startClaudeTabWatcher(tabId).catch(() => {});
       }
@@ -1300,13 +1517,7 @@ function attachWebSocket(server, sdkSessions) {
           const msg = JSON.parse(raw.toString());
           if (msg.type === 'subscribe' && msg.tabId) {
             subscribe(msg.tabId, sink);
-            const session = sdkSessions.get(msg.tabId);
-            sink.send(JSON.stringify({
-              type: 'snapshot',
-              tabId: msg.tabId,
-              sessionId: session?.sessionId || null,
-              busy: !!session,
-            }));
+            sendInitialSnapshot(msg.tabId, sink, sdkSessions).catch(() => {});
             startClaudeTabWatcher(msg.tabId).catch(() => {});
           }
         } catch {}

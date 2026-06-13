@@ -33,6 +33,7 @@ import { hydratePromptQueueStore, usePromptQueueStore, serializePromptQueueCore 
 import { usePromptQueueWebSync } from './hooks/usePromptQueueWebSync';
 import { useMirrorStatusStore } from './store/useMirrorStatusStore';
 import { buildCodexRunPayload } from './utils/codexLaunch';
+import { getHistoryAgentRuntime, type AgentHistoryTool } from './utils/historyAgentRuntimes';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -457,6 +458,16 @@ function App() {
     root.style.setProperty('--process-bar-shimmer-spacing', `${processBar.shimmerSpacingPct}%`);
     root.style.setProperty('--process-bar-shimmer-alpha', String(peakAlpha));
     root.style.setProperty('--process-bar-shimmer-edge-alpha', String(Math.max(0.01, peakAlpha * 0.22)));
+    console.warn(
+      '[App:ProcessBarVars]' +
+      ' colorA=' + processBar.colorA +
+      ' shimmerColor=' + processBar.shimmerColor +
+      ' rgb=' + hexToRgbTriplet(processBar.shimmerColor) +
+      ' spacingPct=' + processBar.shimmerSpacingPct +
+      ' opacityPct=' + processBar.shimmerOpacityPct +
+      ' peakAlpha=' + peakAlpha.toFixed(3) +
+      ' edgeAlpha=' + Math.max(0.01, peakAlpha * 0.22).toFixed(3)
+    );
   }, [processBar.colorA, processBar.shimmerColor, processBar.shimmerSpacingPct, processBar.shimmerOpacityPct]);
 
   // AIPulse (whole-tab background pulse) was removed — its :root var sync
@@ -1082,6 +1093,31 @@ function App() {
       };
       try {
         const state = useWorkspaceStore.getState();
+        const findTab = (tabId?: string): any | null => {
+          if (!tabId) return null;
+          for (const ws of state.openProjects.values()) {
+            const t = ws.tabs.get(tabId);
+            if (t) return t;
+          }
+          return null;
+        };
+        const toolForTab = (tab: any | null): AgentHistoryTool | null => {
+          if (!tab || tab.tabType === 'claude-sdk') return null;
+          if (tab.commandType === 'codex') return 'codex';
+          if (tab.commandType === 'claude') return 'claude';
+          return null;
+        };
+        const sessionIdForTab = (tab: any | null, toolType: AgentHistoryTool | null): string | null => {
+          if (!tab || !toolType) return null;
+          return toolType === 'codex' ? (tab.codexSessionId || null) : (tab.claudeSessionId || null);
+        };
+        const describeAgentTab = (tabId?: string) => {
+          const tab = findTab(tabId);
+          const toolType = toolForTab(tab);
+          const runtime = toolType ? getHistoryAgentRuntime(toolType) : null;
+          const sessionId = sessionIdForTab(tab, toolType);
+          return { tab, toolType, runtime, sessionId };
+        };
         if (action === 'getOpenProjectIds') {
           // Live snapshot of which projects are currently open in the desktop UI.
           // Used by /api/projects to split the mobile list into Active vs Other.
@@ -1109,6 +1145,7 @@ function App() {
           if (!projectId) return reply(false, null, 'projectId required');
           const ws = state.openProjects.get(projectId);
           if (!ws) return reply(false, null, 'project not open in UI');
+          const projectMeta = useProjectsStore.getState().projects?.[projectId];
           // Resolve the configurable status-marker palette once per call so each
           // tab can carry its assigned-category COLOR (not just the id) — mobile
           // has no access to useUIStore where the palette lives.
@@ -1117,11 +1154,12 @@ function App() {
           const tabs = await Promise.all(Array.from(ws.tabs.values()).map(async (t: any) => {
             let sessionStatus: 'active' | 'busy' | 'inactive' | null = null;
             let awaiting = false;
-            if (t.commandType === 'claude') {
+            const toolType = toolForTab(t);
+            if (toolType) {
               try {
-                const p = await ipcRenderer.invoke('claude:get-presence', t.tabId);
+                const p = await getHistoryAgentRuntime(toolType).getPresence(t.tabId);
                 sessionStatus = p?.status || 'inactive';
-                awaiting = !!p?.awaiting;
+                awaiting = toolType === 'claude' && !!p?.awaiting;
               } catch { sessionStatus = 'inactive'; }
             }
             // Assigned category status (dev/bugfix/knowledge/custom) — id stored
@@ -1137,6 +1175,8 @@ function App() {
               color: t.color || null,   // desktop TabColor — drives row bg on mobile
               cwd: t.cwd,
               claudeSessionId: t.claudeSessionId,
+              codexSessionId: t.codexSessionId,
+              geminiSessionId: t.geminiSessionId,
               sessionStatus,
               awaiting,
               statusId,
@@ -1144,7 +1184,12 @@ function App() {
             };
           }));
           return reply(true, {
-            project: { id: projectId, name: ws.projectPath?.split('/').pop() || projectId, path: ws.projectPath },
+            project: {
+              id: projectId,
+              name: projectMeta?.name || ws.projectPath?.split('/').pop() || projectId,
+              path: projectMeta?.path || ws.projectPath,
+              icon: projectMeta?.icon || null,
+            },
             tabs,
             statusMarker: { shape: uiState.statusMarker.shape, sizePx: uiState.statusMarker.sizePx },
             processBar: {
@@ -1271,6 +1316,14 @@ function App() {
                 thinking: thinkOn ? 'adaptive' : 'disabled',
               });
             }
+            if (t.commandType === 'codex' && t.tabType !== 'claude-sdk') {
+              return reply(true, {
+                tabId,
+                model: t.codexModel || 'default',
+                effort: t.codexEffort || 'xhigh',
+                thinking: 'disabled',
+              });
+            }
             // SDK path
             return reply(true, {
               tabId,
@@ -1327,6 +1380,18 @@ function App() {
               }
             }
             return reply(true, { tabId, model, effort, thinking });
+          }
+          if (tab.commandType === 'codex' && tab.tabType !== 'claude-sdk') {
+            const partial: any = {};
+            if (model !== undefined) partial.codexModel = model;
+            if (effort !== undefined) partial.codexEffort = effort;
+            if (Object.keys(partial).length > 0) state.updateCodexState(tabId, partial);
+            return reply(true, {
+              tabId,
+              model: partial.codexModel ?? tab.codexModel ?? 'default',
+              effort: partial.codexEffort ?? tab.codexEffort ?? 'xhigh',
+              thinking: 'disabled',
+            });
           }
           // SDK path
           const partial: any = {};
@@ -1416,11 +1481,29 @@ function App() {
         if (action === 'getTabSessionInfo') {
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
-          for (const ws of state.openProjects.values()) {
-            const t = ws.tabs.get(tabId);
-            if (t) return reply(true, { tabId, claudeSessionId: t.claudeSessionId, cwd: t.cwd });
+          const { tab, toolType, sessionId } = describeAgentTab(tabId);
+          if (tab) {
+            return reply(true, {
+              tabId,
+              toolType,
+              commandType: tab.commandType || null,
+              sessionId,
+              claudeSessionId: tab.claudeSessionId || null,
+              codexSessionId: tab.codexSessionId || null,
+              geminiSessionId: tab.geminiSessionId || null,
+              cwd: tab.cwd,
+            });
           }
-          return reply(true, { tabId, claudeSessionId: null, cwd: null });
+          return reply(true, {
+            tabId,
+            toolType: null,
+            commandType: null,
+            sessionId: null,
+            claudeSessionId: null,
+            codexSessionId: null,
+            geminiSessionId: null,
+            cwd: null,
+          });
         }
         if (action === 'truncateHistory') {
           const { tabId, targetUuid } = payload || {};
@@ -1497,65 +1580,86 @@ function App() {
           const tab = ws.tabs.get(tabId);
           return reply(true, { tabId, name: tab?.name, cwd: tab?.cwd, projectId });
         }
+        if (action === 'createAgentTab') {
+          const { projectId, toolType } = payload || {};
+          if (!projectId) return reply(false, null, 'projectId required');
+          const agent: AgentHistoryTool = toolType === 'codex' ? 'codex' : 'claude';
+          const ws = state.openProjects.get(projectId);
+          if (!ws) return reply(false, null, 'project not open');
+          const cwd = ws.projectPath && !ws.projectPath.startsWith('__unset__') ? ws.projectPath : undefined;
+          const tabId = await state.createTab(projectId, undefined, cwd, {
+            commandType: agent,
+            color: agent,
+            pendingAction: { type: agent === 'codex' ? 'codex-new' : 'claude-new' },
+          } as any);
+          const tab = ws.tabs.get(tabId);
+          return reply(true, {
+            tabId,
+            name: tab?.name,
+            cwd: tab?.cwd,
+            projectId,
+            toolType: agent,
+            commandType: agent,
+            color: tab?.color || agent,
+          });
+        }
         if (action === 'resumeClaudeTab') {
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
-          let tab: any = null;
-          for (const ws of state.openProjects.values()) {
-            const t = ws.tabs.get(tabId);
-            if (t) { tab = t; break; }
-          }
-          if (!tab) return reply(false, null, 'tab not open');
-          if (!tab.claudeSessionId) return reply(false, null, 'no session to resume');
-          console.log('[MobResume:Bridge] resumeClaudeTab begin tab=' + String(tabId).slice(-12) + ' sid=' + String(tab.claudeSessionId).slice(0, 8));
+          const { tab, toolType, runtime, sessionId } = describeAgentTab(tabId);
+          if (!tab || !runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
+          if (!sessionId) return reply(false, null, 'no session to resume');
+          console.log('[MobResume:Bridge] resumeAgentTab begin tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' sid=' + String(sessionId).slice(0, 8));
           try {
-            const result = await resumeClaudePtySession({ tabId, sessionId: tab.claudeSessionId, cwd: tab.cwd });
-            console.log('[MobResume:Bridge] resumeClaudeTab done tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(result));
-            return reply(!!result.success, { tabId, sessionId: tab.claudeSessionId, ...result }, result.error);
+            const result = await runtime.resume({ tabId, sessionId, cwd: tab.cwd });
+            console.log('[MobResume:Bridge] resumeAgentTab done tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(result));
+            return reply(!!result.success, { tabId, toolType, sessionId, ...result }, result.error);
           } catch (e: any) {
-            console.log('[MobResume:Bridge] resumeClaudeTab err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
+            console.log('[MobResume:Bridge] resumeAgentTab err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
             return reply(false, null, String(e?.message || e));
           }
         }
         if (action === 'stopClaudeTab') {
-          // SIGTERM by PID, not keystrokes. The previous Ctrl+C×2 with
-          // setTimeout(250ms) was deterministically broken — Ink TUI redraws
-          // the prompt between Ctrl+C's, so the second one is read as a NEW
-          // first one ("Press Ctrl-C again to exit" fires twice, Claude never
-          // exits). See fix-claude-busy-detection.md::4 (rejected approaches)
-          // and fact-claude-tui-control.md::Stop button. Same path the
-          // desktop Stop button uses — finds claude child-PID under the
-          // shell's PID, SIGTERM → 800ms → SIGKILL. Shell survives, so
-          // Resume re-launches `claude --resume <id>` in the same PTY tab.
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
-          console.log('[MobStop:Bridge] stopClaudeTab SIGTERM begin tab=' + String(tabId).slice(-12));
+          const { toolType, runtime } = describeAgentTab(tabId);
+          if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
+          console.log('[MobStop:Bridge] stopAgentTab begin tool=' + toolType + ' tab=' + String(tabId).slice(-12));
           try {
-            const r = await stopClaudePtyProcess(tabId);
-            console.log('[MobStop:Bridge] stopClaudeTab done tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(r));
-            return reply(!!r?.success, { tabId, stopped: !!r?.success, ...r });
+            const r = await runtime.stopProcess(tabId);
+            console.log('[MobStop:Bridge] stopAgentTab done tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(r));
+            return reply(!!r?.success, { tabId, toolType, stopped: !!r?.success, ...r });
           } catch (e: any) {
-            console.log('[MobStop:Bridge] stopClaudeTab err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
+            console.log('[MobStop:Bridge] stopAgentTab err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
             return reply(false, null, String(e?.message || e));
           }
         }
         if (action === 'interruptClaudeTurn') {
-          // SOFT interrupt of the CURRENT TURN — single Escape (\x1b) into the
-          // live Claude TUI. Claude's own Esc-handler stops generating and
-          // returns to the ⏵ prompt; the process STAYS ALIVE (no SIGTERM, no
-          // session loss). This is what the composer Stop button must do —
-          // distinct from stopClaudeTab (navbar Stop = kill the process).
-          // Single \x1b, NOT \x1b×2 (that opens the Rewind menu) and NOT \x03×2
-          // (that exits Claude). Same keystroke a desktop user presses with the
-          // physical Esc key. See fact-mobile-claude-pty.md::Composer Stop = turn-interrupt.
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
-          console.log('[MobInterrupt:Bridge] interruptClaudeTurn Esc tab=' + String(tabId).slice(-12));
+          const { toolType, runtime } = describeAgentTab(tabId);
+          if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
+          console.log('[MobInterrupt:Bridge] interruptAgentTurn tool=' + toolType + ' tab=' + String(tabId).slice(-12));
           try {
-            const result = interruptClaudePtyTurn(tabId);
-            return reply(!!result.success, { tabId, interrupted: !!result.interrupted });
+            const result = runtime.interruptTurn(tabId);
+            return reply(!!result.success, { tabId, toolType, interrupted: !!result.interrupted });
           } catch (e: any) {
             console.log('[MobInterrupt:Bridge] err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
+            return reply(false, null, String(e?.message || e));
+          }
+        }
+        if (action === 'grabAgentDraft') {
+          const { tabId } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          const { toolType, runtime } = describeAgentTab(tabId);
+          if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
+          console.log('[MobDraft:Bridge] grabAgentDraft tool=' + toolType + ' tab=' + String(tabId).slice(-12));
+          try {
+            const result = await runtime.grabDraft(tabId);
+            const ok = result?.success !== false;
+            return reply(ok, { tabId, toolType, ...(result || {}) }, ok ? undefined : result?.error);
+          } catch (e: any) {
+            console.log('[MobDraft:Bridge] err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
             return reply(false, null, String(e?.message || e));
           }
         }
@@ -1565,16 +1669,11 @@ function App() {
           // the routing happens here, in the same call that does the work.
           const { tabId, prompt, model, effort, thinking, cwd } = payload || {};
           if (!tabId || !prompt) return reply(false, null, 'tabId+prompt required');
-          let tab: any = null;
-          for (const ws of state.openProjects.values()) {
-            const t = ws.tabs.get(tabId);
-            if (t) { tab = t; break; }
-          }
-          const isClaudePty = tab && tab.commandType === 'claude' && tab.tabType !== 'claude-sdk';
-          if (isClaudePty) {
-            const result = await sendClaudePtyPrompt(tabId, prompt);
+          const { tab, toolType, runtime } = describeAgentTab(tabId);
+          if (runtime && toolType) {
+            const result = await runtime.sendPrompt(tabId, prompt);
             const ok = result?.success !== false;
-            return reply(ok, result || { tabId }, ok ? undefined : result?.error);
+            return reply(ok, { tabId, toolType, ...(result || {}) }, ok ? undefined : result?.error);
           }
           // SDK path (default)
           const sendCwd = cwd || tab?.cwd;
@@ -1614,9 +1713,10 @@ function App() {
           const awaiting: Record<string, boolean> = {};
           for (const tid of tabIds) {
             try {
-              const p = await getClaudePtyPresence(tid);
+              const { toolType, runtime } = describeAgentTab(tid);
+              const p = runtime ? await runtime.getPresence(tid) : null;
               statuses[tid] = p?.status || 'inactive';
-              if (p?.awaiting) awaiting[tid] = true;
+              if (toolType === 'claude' && p?.awaiting) awaiting[tid] = true;
             } catch {
               statuses[tid] = 'inactive';
             }
@@ -1626,24 +1726,23 @@ function App() {
         if (action === 'getClaudeTabStatus') {
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
-          let tab: any = null;
-          for (const ws of state.openProjects.values()) {
-            const t = ws.tabs.get(tabId);
-            if (t) { tab = t; break; }
-          }
-          if (!tab) return reply(true, { tabId, status: 'inactive', commandType: null, sessionId: null });
+          const { tab, toolType, runtime, sessionId } = describeAgentTab(tabId);
+          if (!tab) return reply(true, { tabId, status: 'inactive', commandType: null, toolType: null, sessionId: null });
           let status: 'active' | 'busy' | 'inactive' | 'starting' = 'inactive';
-          if (tab.commandType === 'claude') {
+          if (runtime) {
             try {
-              const p = await getClaudePtyPresence(tabId);
+              const p = await runtime.getPresence(tabId);
               status = p?.status || 'inactive';
             } catch { status = 'inactive'; }
           }
           return reply(true, {
             tabId,
             status,
+            toolType,
             commandType: tab.commandType || null,
-            sessionId: tab.claudeSessionId || null,
+            sessionId,
+            claudeSessionId: tab.claudeSessionId || null,
+            codexSessionId: tab.codexSessionId || null,
             cwd: tab.cwd,
           });
         }
@@ -1665,6 +1764,22 @@ function App() {
             sessionId: tab.claudeSessionId, cwd: tab.cwd,
           });
           return reply(true, result);
+        }
+        if (action === 'loadAgentFullHistory') {
+          const { tabId } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          const { tab, toolType, sessionId } = describeAgentTab(tabId);
+          if (!tab || !toolType || !sessionId) {
+            return reply(true, { entries: [], sessionId: null, toolType: toolType || null });
+          }
+          const ipcChannel = toolType === 'codex' ? 'codex:get-full-history' : 'claude:get-full-history';
+          const result = await ipcRenderer.invoke(ipcChannel, { sessionId, cwd: tab.cwd });
+          return reply(!!result?.success, {
+            ...(result || {}),
+            toolType,
+            commandType: tab.commandType || null,
+            sessionId,
+          }, result?.error);
         }
         return reply(false, null, 'unknown action: ' + action);
       } catch (err: any) {

@@ -211,6 +211,12 @@ const consumePendingAutoTabTitle = (tabId: string, toolType: AutoTabTitleTool, s
   return true;
 };
 
+const isPendingAiForkLaunch = (commandType: CommandType, pendingAction?: PendingAction): boolean => {
+  if (!pendingAction) return false;
+  return (commandType === 'claude' && pendingAction.type === 'claude-fork')
+    || (commandType === 'codex' && pendingAction.type === 'codex-fork');
+};
+
 // Helper: Check if tab has an interrupted AI session that can be resumed
 export const isTabInterrupted = (tab: { wasInterrupted?: boolean; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string }): boolean => {
   return !!(tab.wasInterrupted && (tab.claudeSessionId || tab.geminiSessionId || tab.codexSessionId));
@@ -1996,6 +2002,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (naming) next.add(tabId);
     else next.delete(tabId);
     set({ tabTitleNamingIds: next });
+    console.warn(
+      '[Store:TabTitleNaming]' +
+      ' tab=' + tabId.slice(-8) +
+      ' naming=' + naming +
+      ' before=' + has +
+      ' activeCount=' + next.size
+    );
   },
 
   getPendingAutoTabTitle: (tabId, toolType, sessionId) => {
@@ -2096,7 +2109,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         tab.commandType = commandType;
 
         // Auto-rename on first run (skip if user renamed tab manually)
-        if (isFirstRun && !tab.nameSetManually) {
+        if (isFirstRun && !tab.nameSetManually && !isPendingAiForkLaunch(commandType, tab.pendingAction)) {
           const existingNames = Array.from(workspace.tabs.values()).map(t => t.name);
           let baseName = '';
 

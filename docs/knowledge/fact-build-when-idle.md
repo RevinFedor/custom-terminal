@@ -10,14 +10,17 @@
 
 | Источник | Map в main | Семантика |
 |---|---|---|
-| PTY Claude | `bridgeKnownSessions` + `terminals` + (`claudeCliActive`\|`claudeTurnBusy`) + `claudePromptReady` | та же логика, что `ipcMain('claude:get-presence')`: `busy`/`active`/`starting`. Stale bridge без живого PTY (`!terminals.has`) **не** блокирует (= `inactive`) |
+| PTY Claude | `bridgeKnownSessions` + `terminals` + (`claudeTurnBusy`\|`claudeSpinnerBusy`\|`claudeLocalCommandWatchers`) + `claudePromptReady` | `busy` только когда реально идёт turn/loader/local slash command; idle-alive Claude (`claudeCliActive`, живой PTY у prompt) отдаётся как `active/starting`, но **не** считается blocker. Stale bridge без живого PTY (`!terminals.has`) **не** блокирует (= `inactive`) |
 | SDK Claude | `sdkSessions` | одна запись = один in-flight `query()` → `busy` |
 | Gemini | `geminiSpinnerBusy` | `busy` только при `=== true` |
-| Любой процесс | `terminalCommandState.isRunning` | `running`. **ЛЮБОЙ** isRunning блокирует, не только `commandType==='devServer'` — юзер просил «npm run dev тоже считается» |
+| Codex | `codexTurnWatchers` | блокирует только rollout `task_started → task_complete/turn_aborted`; живой idle Codex CLI не blocker |
+| Любой non-AI процесс | `terminalCommandState.isRunning` | `running`. **ЛЮБОЙ** non-AI `isRunning` блокирует, не только `commandType==='devServer'` — юзер просил «npm run dev тоже считается». AI CLI tabs исключены из этой ветки, потому что их PTY-процесс может быть живым и idle |
 
 Дедупликация по `tabId` (один таб = максимум один loader; claude-ветка выигрывает у process-ветки для того же таба).
 
 Идемпотентно для idle-определения: `idle === (loaders.length === 0)`.
+
+Шрам mobile install preflight: если `terminalCommandState.isRunning` применять ко всем вкладкам без фильтра AI, `/api/active-loaders` возвращает десятки `kind:"process", status:"running"` для idle Claude/Codex табов. На iOS это выглядит как ложный alert «Terminal занят, остановите вкладки где идёт streaming/loader», хотя loader нигде не идёт. Разделитель: AI tabs блокируют install только через свои deterministic busy-сигналы выше; обычные shell-команды блокируют через `terminalCommandState.isRunning`.
 
 ## Транспорт: переиспользует mobile web-server
 Не отдельный сервер. Эндпоинт добавлен в существующий `src/main/web-server.js` (тот же что обслуживает mobile-web на порту 7878):
@@ -49,6 +52,14 @@ GET /api/active-loaders   (Bearer-token, тот же ~/.noted-terminal/web-token
 - **Failed poll ≠ idle**: таймаут/сетевой блип сбрасывает `idleStreak=0`, не считается за idle.
 - **Старый билд без эндпоинта** (404): печатает «predates /api/active-loaders», просит разовый `build:install` для бутстрапа, exit 2. НЕ строит вслепую.
 - **Прод не запущен**: нечего ждать → строит сразу (или exit при `NO_BUILD=1`).
+
+### Граница применения: не mobile install endpoint
+`build:i-obs` — команда для внешнего ручного/терминального запуска, когда нужно сначала
+наблюдать live Noted Terminal через `/api/active-loaders`. Voice Record endpoint
+`/api/terminal/build-install` не должен запускать этот wrapper: телефон уже сделал preflight
+по тому же endpoint'у перед confirm, а в момент самой переустановки Noted Terminal может быть
+уже закрыт или недоступен. Для sibling-host сценария правильная команда — прямой
+`npm run build:install` из `/Users/fedor/Desktop/custom-terminal`.
 
 ### Env-кнобы
 `POLL_MS=1000`, `IDLE_CONFIRM=2`, `NO_BUILD=1` (только наблюдать), `PORT=7878` (форсить порт, минуя discovery — для теста).

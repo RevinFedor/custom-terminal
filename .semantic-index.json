@@ -88,69 +88,48 @@
     "path": "docs/methodology/переносимый-дизайн.md",
     "type": "fact",
     "explicit": [
-      "portable_design_methodology",
-      "ux_principles",
-      "ui_implementation_patterns"
+      "ux_methodology",
+      "ui_patterns",
+      "portable_design",
+      "accessibility",
+      "state_management",
+      "electron_react_bridge"
     ],
     "implicit": [
-      "per_tab_tooling_state",
-      "truth_from_server_response",
-      "two_tier_hierarchical_selectors",
-      "asymmetric_latency_perception",
-      "persistent_state_clear_on_error",
-      "edit_affordance_omnipresence",
-      "ink_tui_ansi_parsing",
-      "authoritative_artifact_detection",
-      "latched_ui_state_reconciliation",
-      "click_outside_universal_escape",
-      "popover_geometry_measurement",
-      "optical_alignment_baseline_shift",
-      "destructive_action_color_differentiation",
-      "loader_localized_element",
-      "draggable_row_primary_click",
-      "dense_row_tint_not_icon_scale",
-      "visual_tokens_vs_components_package",
-      "mirror_editing_layout",
-      "toast_preview_and_checkpoint",
-      "drag_state_mouseup_flush",
-      "hover_highlight_data_attribute",
-      "react_strictmode_double_invoke",
-      "cross_package_clipboard_di",
-      "state_mirror_useeffect_stale_read",
-      "idempotent_repeats_by_position",
-      "sqlite_dev_settings_persistence",
-      "layout_reservation_height",
-      "position_fixed_containing_block_trap",
-      "one_shot_effect_async_reload",
-      "focus_vs_selection_coordination",
-      "global_keystroke_routing",
-      "diff_dark_theme_highlighting",
-      "macos_panel_window_focus",
-      "outside_click_uiohook_monitor",
-      "derived_file_banner_sync",
-      "electron_before_quit_async",
-      "split_button_owner_seam",
-      "pivoted_timing_trigger_runner",
-      "tab_type_live_runtime_promotion",
-      "click_target_entire_linked_zone"
+      "handshake_prompt_injection",
+      "safePasteAndSubmit_chunking",
+      "containing_block_trap",
+      "stale_closure_timeline",
+      "CwdGuard_mismatch_bypass",
+      "Virtuoso_to_virtua_migration",
+      "NSPanel_electron_activation",
+      "AppleScript_paste_target",
+      "clickmon_native_helper",
+      "uiohook_outside_click",
+      "Clipsnap_clipboard_snapshot",
+      "drag_state_buffer_mouseup",
+      "SQLite_mirror_localStorage",
+      "two_step_inline_confirm",
+      "focused_selection_mouseup_recovery",
+      "useStableCollapseToggle_flushSync",
+      "rejectFlash_1s_animation"
     ],
     "symptoms": [
-      "UI elements shift, jitter, or jump when expanding collapsible sections or opening popovers",
-      "Settings and interface dimensions reset unexpectedly in development after Vite port changes",
-      "Background task indicators or loaders remain spinning infinitely after aborting a session",
-      "Keyboard shortcuts and ESC-dismiss actions fail to trigger when switching system input layouts",
-      "Text selection in the chat history gets canceled immediately when clicking adjacent areas",
-      "Active status badges and action buttons display outdated states due to optimistic state mismatches",
-      "Cursor shows drag affordance on a clickable row even though the user expects ordinary click or double-click rename",
-      "Hover feedback exists only on a tiny icon inside a dense navigation row instead of the whole click target"
+      "UI elements shift or jump when expanding side panels or nested details.",
+      "Keyboard shortcuts fail to trigger when switching system input layouts to non-English.",
+      "Clicking outside a popup fails to close it, or clicks leak into background items.",
+      "A heavy component freeze blocks the UI for several seconds during tab switching.",
+      "The app's settings or panel sizes reset to defaults after rebuilding or restarting the dev environment."
     ],
     "related_components": [
       "src/renderer/components/UI/SettingsModal.tsx",
       "src/renderer/components/UI/Tooltip.tsx",
-      "src/renderer/components/UI/Toast.tsx",
-      "src/renderer/utils/persistedStorage.ts"
+      "src/renderer/components/TabSidebar.tsx",
+      "src/renderer/components/Timeline.tsx",
+      "src/renderer/components/ClaudeSDKTab.tsx",
+      "src/main/main.js"
     ],
-    "hash": "519e1d09ce7db3415accbe362844c203e6fa0f25818787e658d3457ccd20fba0"
+    "hash": "fbc14bda6d0b6b9b590a638eaaad2f2d76d7223edd0a3869177cbd4b3ae3a7bf"
   },
   {
     "path": "docs/methodology/сценарии-использования.md",
@@ -346,58 +325,40 @@
     "path": "docs/knowledge/fact-provider-proxy.md",
     "type": "fact",
     "explicit": [
-      "LLM Provider Proxy",
-      "HTTP proxy routing",
-      "Per-tab routing",
-      "Provider modes (Anthropic, Zen, DeepSeek)",
-      "Prompt cache key preservation",
-      "Effort and thinking injection",
-      "Cache metrics logging",
-      "SQLite persistence",
-      "Connection pooling",
-      "Graceful shutdown"
+      "llm_provider_proxy",
+      "deepseek_integration",
+      "cache_metrics",
+      "keep_alive_connections"
     ],
     "implicit": [
-      "proxy_json_parse_fastpath",
-      "thinking_strip_resentialize",
-      "per_tab_url_prefix_routing",
-      "tabid_state_map",
-      "sqlite_provider_persist",
-      "deepseek_anthropic_compat",
-      "proxy_inject_effort_thinking",
-      "sse_cache_tap_decompression",
-      "cch_billing_sentinel",
-      "attribution_header_prefix_drift",
-      "socket_listener_guard",
-      "graceful_shutdown_drain",
-      "ipc_cache_update",
+      "per_tab_routing_url_prefix",
+      "claude_code_attribution_header_kill",
+      "cch_billing_sentinel_hash",
+      "sqlite_provider_state_persistence",
+      "deepseek_thinking_effort_mutex",
+      "keep_alive_socket_close_leak",
+      "sse_gzip_decompression_tap",
+      "fast_path_prompt_cache_serialization",
+      "thinking_strip_zen_mode",
+      "fallback_unknown_model_deepseek",
+      "zustand_readonly_cache_isolation",
       "jsonl_chain_break_recovery"
     ],
     "symptoms": [
-      "Provider switch in one tab unexpectedly routes requests from other tabs through the wrong endpoint",
-      "Cache metrics chip remains empty or shows zero stats despite successful streaming responses",
-      "After switching from Zen back to Anthropic, first request shows cache miss instead of hitting cached prefix",
-      "DeepSeek API rejects with HTTP 400: 'thinking options type cannot be disabled when reasoning_effort is set'",
-      "Provider configuration and effort level reset to defaults after restarting Electron",
-      "Statusline model indicator shows wrong provider name after switching mid-session",
-      "Resumed or forked sessions show dramatically lower cache hit rate despite identical system prompt prefix",
-      "Terminal closes abruptly or loses assistant response when proxy crashes during streaming",
-      "Node.js logs MaxListenersExceededWarning: 11 close listeners added to [Socket] under heavy workload",
-      "Long multi-turn sessions accumulate unexpectedly high billing tokens despite cache being hit"
+      "Claude crashes with empty key 401 Unauthorized error in DeepSeek mode",
+      "Cache cooldown chip in terminal remains empty despite successful requests",
+      "MaxListenersExceededWarning for socket close events appearing in proxy logs",
+      "DeepSeek upstream returns HTTP 400 due to mismatched thinking and effort config parameters",
+      "Switching LLM providers in one tab silently hijacks active Claude sessions in other background tabs",
+      "Cache hit rate drops to zero or prompt cache miss occurs repeatedly on fork or resume"
     ],
     "related_components": [
-      "main.js",
-      "src/components/ControlBar.tsx",
-      "src/components/StatusBar.tsx",
-      "src/store/tabStore.ts",
-      "src/ipc/handlers.ts",
-      "fact-timeline.md",
-      "fact-claude-control-bar.md",
-      "fact-backtrace-jsonl.md",
-      "fact-dictation.md",
+      "src/main/provider-proxy.ts",
+      "src/main/db.ts",
+      "src/renderer/store/tabStore.ts",
       "~/.claude/statusline-bridge.sh"
     ],
-    "hash": "3a599a5dc1b5e8ea433b96e705d6e6ba15e2221ca6e3a723ff9dbda449da7123"
+    "hash": "b505d5952385227f10d3e432036a31f93542601795f6f0af3032b9df60e6b916"
   },
   {
     "path": "docs/knowledge/fact-terminal-rendering.md",
@@ -515,32 +476,30 @@
     "path": "docs/knowledge/fact-prompt-queue.md",
     "type": "fact",
     "explicit": [
-      "prompt_queue_overlay",
-      "external_editor_hijack",
-      "claude_code_tui",
-      "run_after_auto_run",
-      "stop_after_cascade"
+      "prompt-queue",
+      "external-editor-hijack",
+      "run-after",
+      "code-grabber"
     ],
     "implicit": [
-      "usePromptQueueStore_sqlite_persistence",
-      "bridgeKnownSessions_liveness_guard",
-      "noted_code_grab_editor_hijack",
-      "usePromptQueueRunner_singleton_hook",
-      "backdrop_filter_containing_block_portal",
-      "runAfterTabId_pivot_tab",
-      "resolveGrabbedImagePaths_image_cache",
+      "noted_code_grab_helper",
+      "bridgeKnownSessions_liveness",
+      "reason_disarm_cascade",
+      "runAfterTabId_pivot",
+      "setupShellIntegration_editor_backup",
+      "react_use_effect_ipc_listener_drop",
       "stopAfter_closeAfter_cascade",
-      "first_chip_hint_blink",
-      "replayingIds_spinner_guard",
-      "editor_not_wired_diagnostic"
+      "resolveGrabbedImagePaths",
+      "focusActiveTerminal_clear_sync",
+      "prompt_queue_width_resize",
+      "zustand_silent_mutation_ui_sync"
     ],
     "symptoms": [
-      "Run after prompts are not sent automatically when navigating away to another tab or project",
-      "Replay button returns a No Claude session error even though Claude is actively responding in the terminal",
-      "Run after picker dropdown is clipped, mispositioned, or renders completely off-screen",
-      "Clicking external editor shortcut Ctrl+G opens Sublime/Vim instead of capturing terminal input",
-      "Split button borders flicker or disappear when switching tabs or hovering on high-DPI displays",
-      "UI shows stale prompt queue status or fails to update width during drag-resize on slow drives"
+      "The Run After panel does not show up even though Claude is actively responding in the PTY terminal",
+      "Replaying a queued prompt fails with a 'no_claude_session' error on an AutoResumed tab",
+      "A queued prompt is skipped or fires unexpectedly when Claude hits an API error or is interrupted with Escape",
+      "The terminal input editor fails to clear automatically after grabbing or copying a prompt until the user clicks back into the terminal",
+      "The Prompt Queue runner stops firing when the user switches to a different tab or workspace view"
     ],
     "related_components": [
       "src/renderer/store/usePromptQueueStore.ts",
@@ -549,7 +508,7 @@
       "src/renderer/hooks/usePromptQueueWebSync.ts",
       "src/main/main.js"
     ],
-    "hash": "be612642f62f45291daeb4c0a71d1cef387d27efd21e0b2caa2ec80f7f9d3067"
+    "hash": "6590435feae9aea0ab171378e3652886f0d98a478fc561bdfc5a88092107e473"
   },
   {
     "path": "docs/knowledge/fact-session-status.md",
@@ -897,53 +856,45 @@
     "path": "docs/knowledge/fact-tabs.md",
     "type": "fact",
     "explicit": [
-      "tab-management",
-      "vertical-sidebar",
-      "context-menu",
-      "drag-and-drop",
-      "ai-auto-naming",
-      "multi-select",
-      "tab-groups",
-      "visual-child-forks"
+      "tab_management",
+      "tab_naming_patterns",
+      "tab_groups",
+      "visual_child_tabs",
+      "drag_and_drop_geometry",
+      "multi_select_tabs",
+      "vertical_layout_sidebar"
     ],
     "implicit": [
-      "tab_sidebar_vertical_mode",
-      "tab_naming_persistence_guard",
-      "ai_auto_title_eligible",
-      "tab_downgrade_prevention_alive",
-      "split_close_stop_grid",
-      "vertical_dnd_geometry_snapshot",
-      "multi_select_persistence_keep_selection",
+      "tab_sidebar_layout",
+      "tab_naming_guard",
+      "ai_auto_title_prompt",
+      "active_background_saturation",
+      "double_activity_indicators",
+      "optical_baseline_shift",
       "revert_session_history",
-      "optical_baseline_shift_alignment",
-      "tab_process_bar_dual_indicators",
-      "sdk_pty_distinct_hue",
-      "group_row_collapse_drag",
-      "active_group_cmd_t_target",
-      "empty_group_anchor_placeholder",
-      "visual_child_manual_dnd",
-      "vertical_row_flip_animation",
-      "save_tabs_sqlite_write_storm"
+      "vertical_dnd_snapshot",
+      "visual_parent_connector",
+      "multi_select_persistence",
+      "idempotent_resize_ptypair",
+      "session_hijacking_prevent",
+      "split_close_stop_grid",
+      "unified_multi_close",
+      "lru_navigation_history"
     ],
     "symptoms": [
-      "Active tab is incorrectly downgraded to devServer or npm run dev while Claude runs active terminal commands",
-      "Multi-select tab highlighting is cleared as soon as a user clicks inside the custom prompt options panel",
-      "Dragging tabs inside the left sidebar causes list items to jump, twitch, or place incorrectly at group boundaries",
-      "Clicking a tab group then pressing Cmd+T should create the new tab inside that group",
-      "Dragging below an empty tab group unexpectedly puts the tab into the group instead of below it",
-      "Dragging a tab next to an existing fork should make it another fork of the same parent",
-      "Fork connector line breaks between consecutive child tabs",
-      "Claude session tabs lose their custom names and revert back to generic auto-generated names after restarting",
-      "Left vertical sidebar fails to scroll using the mouse wheel"
+      "AI session tabs unexpectedly revert to standard terminal names or dev-server colors after executing a bash command.",
+      "Tab multi-selection is lost when clicking inside sidebars, settings, or floating panels.",
+      "Dragging tabs in the vertical sidebar causes layout elements to flicker, jump erratically, or drop in the wrong position.",
+      "Active tab indicators or status dots look vertically misaligned relative to the tab title text.",
+      "Closing multiple tabs simultaneously triggers a series of individual confirmation alerts instead of a single merged modal."
     ],
     "related_components": [
       "src/renderer/components/Workspace/TabBar.tsx",
       "src/renderer/store/useWorkspaceStore.ts",
       "src/renderer/components/Workspace/Terminal.tsx",
-      "src/renderer/components/Workspace/panels/ActionsPanel.tsx",
-      "src/renderer/components/Workspace/panels/InfoPanel.tsx"
+      "src/renderer/components/Workspace/panels/ActionsPanel.tsx"
     ],
-    "hash": "ec2e90361b752bf61b25f0c517abab74092de31ed626c973490da4ad2f7d1d2f"
+    "hash": "bcd03533458183265b7ccb2a30f18b171e6451c7e022f7ae4c5cd5642232bc35"
   },
   {
     "path": "docs/knowledge/fix-gemini-capture.md",
@@ -1783,38 +1734,37 @@
     "type": "fact",
     "explicit": [
       "project_home_view",
-      "tab_history",
-      "title_search",
-      "rag_embedding_sqlite",
-      "restore_tab"
+      "closed_tab_history",
+      "title_rag_search",
+      "tab_restore_mechanism",
+      "project_directory_management"
     ],
     "implicit": [
-      "project_get_tab_history",
-      "tab_history_title_index",
-      "immediate_injection_restore",
       "project_name_sync",
-      "z_50_home_overlay",
-      "history_virtualized_stream",
+      "immediate_session_id_injection",
+      "title_search_rag_invalidation",
+      "layout_depth_z_index_overlay",
       "cmd_hover_preview",
-      "perf_home_commit",
-      "reopen_last_closed_tab",
-      "bounded_single_column_layout"
+      "auto_redirect_home",
+      "tab_history_title_index",
+      "gemini_embedding_title_search",
+      "sticky_progress_scroll",
+      "perf_project_view_logging"
     ],
     "symptoms": [
-      "Home screen shows stale tab history after closing a terminal tab",
-      "Title search does not update synchronously or fails to index new tab titles",
-      "Double scrollbar appears on the Project Home view because of outer container overflow",
-      "AI InfoPanel is empty or lags when restoring a closed Claude/Gemini session from history",
-      "Project Home overlay covers the sidebar or clips the window viewport constraints",
-      "CMD+hover on history items does not show metadata preview popover"
+      "Terminal tabs are empty and the screen automatically redirects to an empty Home view",
+      "RAG search on Project Home returns stale results after renaming a closed tab",
+      "InfoPanel shows delayed or blank AI state immediately after restoring a Claude terminal session",
+      "Closed tab scroll list jumps or displays incorrect timeline groups during rapid scrolling",
+      "Project Home view overlays the terminal area but leaves the right sidebar visible"
     ],
     "related_components": [
       "src/renderer/components/ProjectHome.tsx",
       "src/renderer/components/ProjectToolbar.tsx",
-      "src/renderer/store/workspaceStore.ts",
-      "src/main/ipc/project.ts"
+      "src/main/ipc/project.ts",
+      "src/renderer/store/workspaceStore.ts"
     ],
-    "hash": "1b3288bf6a819a9fbf9ef978e4c1f0c492a561985db74e1976c011b8e5bd92e1"
+    "hash": "041ef73b046903b10f4cee65cc57286469a1ba0e854049f175891eed9d5f4101"
   },
   {
     "path": "docs/knowledge/fix-claude-aborted-streaming-loader.md",
@@ -4018,46 +3968,51 @@
     "path": "docs/knowledge/fact-mobile-web.md",
     "type": "fact",
     "explicit": [
-      "mobile_web_access",
-      "bridge_pattern",
-      "sse_transport",
-      "ndjson_streaming",
-      "idb_history_sync",
-      "prompt_queue_mirror",
-      "self_healing_busy",
-      "composer_ui_mobile"
+      "mobile-web",
+      "mobile-access",
+      "ndjson-streaming",
+      "sse-transport",
+      "indexeddb-cache",
+      "mobile-composer",
+      "prompt-queue",
+      "params-sheet",
+      "busy-reconciliation",
+      "url-decoding"
     ],
     "implicit": [
-      "mobile_bridge_request_reply",
-      "sse_fallback_anti_tracker",
-      "ndjson_history_streaming",
-      "idb_delta_sync_history",
-      "synthetic_web_broadcast_dedupe",
-      "authoritative_busy_polling",
-      "decId_path_decoding",
-      "mobile_params_sheet_ios_touch",
-      "prompt_queue_remote_mirror",
-      "zustand_live_tabs_bridge",
-      "mobile_composer_caret_scrollbar",
-      "soniox_secure_context_guard",
-      "build_install_asar_sync",
-      "stale_asar_bridge_timeout"
+      "decId_url_padding",
+      "getProjectTabsLive_fallback",
+      "synthetic_broadcast_skip",
+      "adoptOrPush_dedupe",
+      "active_branch_messages_jsonl",
+      "compact_boundary_metrics",
+      "slash_chip_swap",
+      "ios_touch_retargeting_backdrop",
+      "window_effort_map_sync",
+      "usePromptQueueWebSync",
+      "self_healing_busy_reconciliation",
+      "sse_transport_fallback",
+      "stale_prod_bridge_timeout",
+      "prefix_merge_lock"
     ],
     "symptoms": [
-      "Mobile UI shows 'Thinking' spinner indefinitely even after turn completion",
-      "WebSocket connection fails or hangs on mobile browsers due to private-IP protection",
-      "Specific projects return 404 on mobile despite being active on desktop",
-      "History entries or UUIDs mismatch when switching between mobile and desktop views",
-      "New bridge actions return 500 timeout errors because production asar is not updated"
+      "Mobile app shows endless thinking loader while desktop terminal is idle",
+      "Opening short-named projects from phone returns 404 while long-named projects load fine",
+      "Selecting a model or effort level on iOS Safari instantly closes the bottom sheet without applying the change",
+      "Stale tabs or empty chat screen on phone with 5s Bridge Timeout in web-server console logs",
+      "WebSocket connection hangs forever or fails to open on private LAN IP address inside browser",
+      "User messages are duplicated on the mobile screen after pressing enter",
+      "Timeline navigation anchors mismatch or fail to target specific messages on mobile device"
     ],
     "related_components": [
       "src/main/web-server.js",
+      "src/renderer/App.tsx",
       "mobile-web/src/App.tsx",
       "mobile-web/src/api.ts",
-      "src/renderer/App.tsx",
-      "mobile-web/src/messages.ts"
+      "mobile-web/src/messages.ts",
+      "mobile-web/src/idb.ts"
     ],
-    "hash": "ccb6e1f45d4e1073e8651c3a4febaf5e24ecb6a69f9149533f224cb7a78585bb"
+    "hash": "2bf74188a737aae7e7c28cfa5139368e92ec1b46b9fa582d3e903c041d0722c6"
   },
   {
     "path": "docs/knowledge/fact-build-when-idle.md",
@@ -4065,35 +4020,34 @@
     "explicit": [
       "build:i-obs",
       "computeActiveLoaders",
-      "build-when-idle.js",
-      "idle_detection"
+      "web-server",
+      "idle-detection"
     ],
     "implicit": [
+      "build_install_preflight",
       "computeActiveLoaders_injection",
-      "web_server_bearer_token",
-      "stale_discovery_cleanup",
-      "claude_presence_stale_skip",
-      "terminal_command_state_isRunning",
-      "idle_confirm_hysteresis",
-      "leaf_module_web_server",
-      "prod_vs_dev_port_mapping",
-      "graceful_quit_automation",
-      "active_loader_deduplication"
+      "stale_pid_cleanup",
+      "idle_confirm_debounce",
+      "terminalCommandState_running",
+      "fail_safe_503",
+      "port_discovery_conflict",
+      "no_clear_screen_scrollback",
+      "mock_electron_headless",
+      "mobile_web_server_token"
     ],
     "symptoms": [
-      "Build script interrupts active Claude or Gemini sessions",
-      "Automated rebuild needs to wait for long-running terminal commands to finish",
-      "External script needs to query application idle state via API",
-      "Build process fails because application is still locking resources",
-      "Need to track active loaders across multiple tabs from outside Electron"
+      "Rebuild script interrupts active Claude or Gemini streams inside Noted Terminal",
+      "Release installation cuts off running terminal tasks or background commands",
+      "Stale web-server configuration files from crashed sessions break IDE port discovery",
+      "Testing main-process REST endpoints headless without launching the electron UI shell",
+      "Idle preflight fails to detect running task due to race condition between queue turns"
     ],
     "related_components": [
-      "src/main/main.js",
-      "src/main/web-server.js",
       "scripts/build-when-idle.js",
-      "package.json"
+      "src/main/main.js",
+      "src/main/web-server.js"
     ],
-    "hash": "23c31d2fd2605a39bb2f16b09cd8f0cee201d9b3fb13154649c552f085b8ca0c"
+    "hash": "dc4b936522fda61311da91a2fdcf7c157cbae91b436f4bfdc3bdcde0a9dcbd7a"
   },
   {
     "path": "docs/knowledge/fact-claude-sdk-workflows.md",
@@ -4810,44 +4764,44 @@
     "type": "fact",
     "explicit": [
       "mobile-web",
-      "claude-pty-tabs",
-      "lifecycle-management",
-      "fs-watch-jsonl",
-      "resume-flow",
-      "busy-state-logic",
-      "stop-vs-interrupt"
+      "claude-pty",
+      "lifecycle",
+      "rest-endpoints",
+      "bridge-actions",
+      "fs-watcher",
+      "session-promotion",
+      "resume-guard-rails",
+      "ws-protocol",
+      "presence"
     ],
     "implicit": [
-      "claude_prompt_detection_⏵",
-      "jsonl_incremental_read_race",
-      "bridge_stale_takeover_layer4",
-      "claude_glyph_false_positive_resume",
-      "mobile_resume_interrupted_overlay_clear",
-      "terminal_stop_ai_process_sigterm",
-      "event_driven_session_promotion",
-      "safePasteAndSubmit_slow_ink_tui",
-      "mobile_ui_stale_bundle_hard_reload",
-      "status_marker_server_resolution",
-      "claude_turn_busy_hook_vs_spinner"
+      "claude_tui_presence",
+      "claudeTurnBusy",
+      "claudePromptReady",
+      "fs_watch_jsonl_tail",
+      "entry.inflight_race",
+      "entry.leftover_split",
+      "markPendingResume",
+      "soft_interrupt_esc",
+      "sigterm_kill_process",
+      "getProjectTabsLive",
+      "claudeTabWatcherPending",
+      "terminal_paste_slow"
     ],
     "symptoms": [
-      "Mobile composer button stuck on Stop/Spinner while Claude is idling",
-      "Clicking Stop in mobile chat kills the entire Claude session instead of just interrupting the turn",
-      "Mobile UI hangs on 'Starting Claude...' even after process starts on desktop",
-      "UI shows 'Session Interrupted' banner on desktop after successful mobile Resume",
-      "Status marker colors or shapes on mobile don't match desktop UI palette",
-      "Claude PTY messages not appearing in mobile chat stream despite being visible on desktop",
-      "Resume from mobile fails because another session instance is 'Already Running' (incorrect pre-check)"
+      "Composer button on mobile is stuck on Stop after resuming a Claude session",
+      "Pressing Stop under the composer kills the entire Claude CLI session instead of just interrupting the turn",
+      "Mobile tab list shows wrong status marker shapes or incorrect tab colors compared to desktop UI",
+      "Starting a new Claude tab from mobile hangs indefinitely on 'Starting Claude...'",
+      "Mobile composer does not lock while Claude is running, leading to double-submit errors"
     ],
     "related_components": [
-      "src/main/main.js",
       "src/main/web-server.js",
-      "src/mobile-web/App.tsx",
-      "src/mobile-web/ChatView.tsx",
-      "src/mobile-web/TabRow.tsx",
-      "src/renderer/Terminal.tsx"
+      "src/main/main.js",
+      "src/renderer/App.tsx",
+      "src/renderer/components/Terminal.tsx"
     ],
-    "hash": "9e98785906a873ca0c9063bf377b025516f4001477f4c3b43c54b276e2610ea2"
+    "hash": "44c8725124b03fc4bc8bb254c9c62a519249fea8a76695d269a692c06fc98033"
   },
   {
     "path": "docs/knowledge/fix-performance-lags.md",
@@ -5315,34 +5269,31 @@
     "path": "docs/knowledge/fact-scripts.md",
     "type": "fact",
     "explicit": [
-      "npm_scripts",
-      "sh_scripts",
-      "dev_server_auto_detection",
-      "restart_zone",
-      "process_termination",
-      "context_menu_handling"
+      "terminal-scripts",
+      "package-json-scripts",
+      "shell-scripts",
+      "dev-server-auto-detection",
+      "ctrl-c-termination",
+      "osc-133-handling"
     ],
     "implicit": [
-      "script_auto_detection",
-      "tab_context_menu_react",
-      "terminal_native_context_menu",
-      "devserver_green_tab",
-      "restart_zone_logic",
-      "osc133_status_tracking",
-      "middle_click_stop",
-      "sh_script_parser",
-      "main_renderer_menu_desync",
-      "ipc_pty_direct_input",
-      "zustand_command_type_state",
-      "osc133_non_finishing_processes",
-      "event_propagation_tab_close"
+      "terminal_scripts_cwd_lookup",
+      "dev_server_auto_detection",
+      "sigint_ctrl_c_passthrough",
+      "dual_context_menu_sync",
+      "run_script_ipc_bypass",
+      "osc_133_long_running_server",
+      "restart_zone_triple_ctrl_c",
+      "private_script_filtration",
+      "restart_vs_stop_signals",
+      "tab_context_menu_native_mirror"
     ],
     "symptoms": [
-      "Tab color does not turn green after launching dev script from menu",
-      "Middle-clicking the restart button closes the tab instead of stopping the process",
-      "Scripts starting with an underscore are missing from the context menu",
-      "Shell scripts in the working directory are not appearing in the Scripts submenu",
-      "Restarting a command fails to trigger the shell repeat sequence after stopping"
+      "Tab does not turn green when starting a dev server from the terminal context menu",
+      "Shell scripts in current working directory do not show up in the right-click script menu",
+      "Restart button remains hidden even though a web dev server process is running",
+      "Middle-clicking the restart zone of a tab does not terminate the executing script",
+      "Script with underscore prefix is incorrectly visible in the launch options submenu"
     ],
     "related_components": [
       "src/renderer/components/Workspace/TabBar.tsx",
@@ -5350,7 +5301,7 @@
       "src/renderer/App.tsx",
       "src/renderer/components/Terminal/Terminal.tsx"
     ],
-    "hash": "3914641c019d2508379b79a4b82c9a94b23b590ce8bdbc25ec998d29aef49c2e"
+    "hash": "fa48b95df661a369afd7a0eac0baef83ca4018627169d3fb4a556215f297f075"
   },
   {
     "path": "docs/knowledge/fact-claude-stop-hook.md",
@@ -5396,41 +5347,39 @@
     "path": "docs/knowledge/fact-process-bar.md",
     "type": "fact",
     "explicit": [
-      "process-bar",
-      "tab-indicator",
-      "shimmer-animation",
-      "claude-busy-state",
-      "css-variables",
-      "mobile-mirror"
+      "process_bar",
+      "shimmer_overlay",
+      "tab_sidebar",
+      "active_indicator"
     ],
     "implicit": [
-      "seamless_wrapping_shimmer",
-      "renderer_visual_idle_grace",
-      "css_var_bridge_picker_perf",
-      "left_border_offset_compensation",
-      "project_tab_count_badge",
-      "aipulse_removal_cleanup",
+      "seamless_wrapping_gradient_shimmer",
+      "renderer_only_spinner_grace",
+      "css_var_bridge_live_tune",
+      "left_border_offset_fix",
+      "devserver_edge_stop_zone",
+      "project_tab_count_badge_inline",
       "mobile_web_process_bar_mirror",
-      "safe_paste_busy_state",
-      "claude_spinner_heuristic",
-      "tab_sidebar_layout"
+      "aipulse_entire_removal",
+      "data_no_tab_drag_hitzone",
+      "shimmer_opacity_clamp"
     ],
     "symptoms": [
-      "The tab process loader flickers or blinks during long Claude thinking phases",
-      "The process indicator strip on the left side of the tab has a visual gap or is misaligned",
-      "Changing the tab indicator colors in the settings menu causes interface lag",
-      "The project tab displays a vertical strip instead of a circular active process count badge",
-      "The busy loader animation has a visible break or sudden jump when looping"
+      "Loader animation flickers or restarts every few seconds during long Claude thinking runs",
+      "The active process indicator bar is misaligned or has a visible 2px gap on the left edge of the tab",
+      "Color picker changes for process bar look lagging or cause heavy React re-renders in the tab list",
+      "Project tab shows a misaligned absolute overlay badge instead of an inline count circle next to the title text",
+      "Clicking the process bar edge fails to trigger devServer stop or conflicts with tab dragging",
+      "Whole tab background starts pulsing during AI response generation after an upgrade"
     ],
     "related_components": [
+      "src/App.tsx",
       "src/components/TabBar.tsx",
-      "src/components/TabItem.tsx",
       "src/components/SettingsModal.tsx",
       "src/store/useUIStore.ts",
-      "src/App.tsx",
       "mobile-web/src/App.tsx"
     ],
-    "hash": "cdd526e2e66dcd5a1367bbc2851c9e90c5b63a55dbd04ec6ffe1863b0b8a9619"
+    "hash": "360c42cb425dd84c9bfbecc0d59bec3eda53510817770ea20d8dbfd7d50742c7"
   },
   {
     "path": "docs/knowledge/fact-tab-preview-popover.md",

@@ -543,6 +543,8 @@ interface UIStore {
   // after pointer leaves so user can inspect their inner DOM in devtools.
   freezeCmdPopups: boolean;
   setFreezeCmdPopups: (v: boolean) => void;
+  historyPinned: boolean;
+  setHistoryPinned: (v: boolean) => void;
   timelinePinned: boolean;
   setTimelinePinned: (v: boolean) => void;
 
@@ -1177,8 +1179,8 @@ const initialFreezeCmdPopups = loadFreezeCmdPopups();
   } catch {}
 })();
 
-// timelinePinned — global layout mode: expanded Timeline and HistoryPanel
-// reserve real horizontal space instead of overlaying the terminal.
+// timelinePinned — global layout mode: expanded Timeline reserves real
+// horizontal space instead of overlaying the terminal.
 const APP_STATE_KEY_TIMELINE_PINNED = 'timelinePinned';
 const loadTimelinePinned = (): boolean => {
   try { return localStorage.getItem('noted-terminal-timeline-pinned') === 'true'; }
@@ -1201,6 +1203,41 @@ const initialTimelinePinned = loadTimelinePinned();
       if (useUIStore.getState().timelinePinned !== bool) {
         useUIStore.setState({ timelinePinned: bool });
         try { localStorage.setItem('noted-terminal-timeline-pinned', String(bool)); } catch {}
+      }
+    }
+  } catch {}
+})();
+
+// historyPinned — global layout mode for Cmd+\ HistoryPanel. Defaults to the
+// legacy combined timelinePinned value so users keep their previous layout.
+const APP_STATE_KEY_HISTORY_PINNED = 'historyPinned';
+const loadHistoryPinned = (): boolean => {
+  try {
+    const own = localStorage.getItem('noted-terminal-history-pinned');
+    if (own !== null) return own === 'true';
+    return loadTimelinePinned();
+  } catch { return false; }
+};
+const saveHistoryPinned = (v: boolean) => {
+  try { localStorage.setItem('noted-terminal-history-pinned', String(v)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_HISTORY_PINNED, value: v }).catch(() => {});
+  } catch {}
+};
+const initialHistoryPinned = loadHistoryPinned();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    let v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_HISTORY_PINNED);
+    if (v === null || v === undefined) {
+      v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_TIMELINE_PINNED);
+    }
+    if (v !== null && v !== undefined) {
+      const bool = parsePersistedBool(v);
+      if (useUIStore.getState().historyPinned !== bool) {
+        useUIStore.setState({ historyPinned: bool });
+        try { localStorage.setItem('noted-terminal-history-pinned', String(bool)); } catch {}
       }
     }
   } catch {}
@@ -2241,6 +2278,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setDebugHoverBridges: (v) => { set({ debugHoverBridges: v }); saveDebugHoverBridges(v); },
   freezeCmdPopups: initialFreezeCmdPopups,
   setFreezeCmdPopups: (v) => { set({ freezeCmdPopups: v }); saveFreezeCmdPopups(v); },
+  historyPinned: initialHistoryPinned,
+  setHistoryPinned: (v) => { set({ historyPinned: v }); saveHistoryPinned(v); },
   timelinePinned: initialTimelinePinned,
   setTimelinePinned: (v) => { set({ timelinePinned: v }); saveTimelinePinned(v); },
 

@@ -712,12 +712,13 @@ function resolveActivityIdentity(tabId, engine) {
 // Aggregate "is anything still working" across EVERY tab in EVERY project.
 // Single source of truth: reuses the SAME live Maps that drive the per-tab
 // loader in the UI — there is no second notion of "busy" invented here.
-//   • PTY Claude   → bridgeKnownSessions + terminals + presence trio
-//                    (identical logic to ipcMain 'claude:get-presence')
+//   • PTY Claude   → bridgeKnownSessions + terminals + turn/spinner/local-command
+//                    busy signals; process-liveness alone is only active/starting
 //   • SDK Claude   → sdkSessions (one entry per in-flight query())
 //   • Gemini       → geminiSpinnerBusy
-//   • devServer /  → terminalCommandState.isRunning  (OSC 133 B/D)
-//     any process
+//   • Codex        → rollout watcher task_started/task_complete busy
+//   • devServer /  → terminalCommandState.isRunning  (OSC 133 B/D), excluding
+//     any process      AI CLI tabs whose PTY process is merely alive at prompt
 // Consumed by the external `build:i-obs` poller via GET /api/active-loaders so
 // a rebuild waits until every Claude / Gemini / SDK / running process across
 // the app has gone idle. Runs in main (not via the renderer bridge) so it still
@@ -726,6 +727,45 @@ function computeActiveLoaders() {
   const loaders = [];
   const seen = new Set(); // tabId — one tab contributes at most one loader
 
+  // tabId → DB row. Reused both for labels and for separating "AI CLI alive"
+  // from an ordinary shell command running in a terminal tab.
+  const tabRowCache = new Map();
+  const tabRowFor = (tabId) => {
+    if (tabRowCache.has(tabId)) return tabRowCache.get(tabId);
+    let row = null;
+    if (projectManager?.db?.db) {
+      try {
+        row = projectManager.db.db.prepare(
+          'SELECT project_id, name, command_type, tab_type, claude_session_id, codex_session_id, gemini_session_id FROM tabs WHERE tab_id = ? LIMIT 1'
+        ).get(tabId) || null;
+      } catch {}
+    }
+    tabRowCache.set(tabId, row);
+    return row;
+  };
+
+  const isAiRuntimeTab = (tabId) => {
+    const row = tabRowFor(tabId);
+    const commandType = row?.command_type || '';
+    const tabType = row?.tab_type || '';
+    return (
+      commandType === 'claude' ||
+      commandType === 'codex' ||
+      commandType === 'gemini' ||
+      commandType === 'claude-sdk' ||
+      tabType === 'claude-sdk' ||
+      !!row?.claude_session_id ||
+      !!row?.codex_session_id ||
+      !!row?.gemini_session_id ||
+      bridgeKnownSessions.has(tabId) ||
+      codexKnownSessions.has(tabId) ||
+      codexTurnWatchers.has(tabId) ||
+      claudeTurnBusy.has(tabId) ||
+      claudeSpinnerBusy.has(tabId) ||
+      claudeLocalCommandWatchers.has(tabId)
+    );
+  };
+
   // tabId → { project, name } label, resolved from terminalProjectIds → SQLite
   // tabs row → projects row. Per-call project-name cache keeps it to ~1 query
   // per distinct project even with many tabs.
@@ -733,16 +773,10 @@ function computeActiveLoaders() {
   const labelFor = (tabId) => {
     let projectId = terminalProjectIds.get(tabId) || null;
     let tabName = null;
-    if (projectManager?.db?.db) {
-      try {
-        const row = projectManager.db.db.prepare(
-          'SELECT project_id, name FROM tabs WHERE tab_id = ? LIMIT 1'
-        ).get(tabId);
-        if (row) {
-          tabName = row.name || null;
-          if (!projectId) projectId = row.project_id || null;
-        }
-      } catch {}
+    const row = tabRowFor(tabId);
+    if (row) {
+      tabName = row.name || null;
+      if (!projectId) projectId = row.project_id || null;
     }
     let projectName = null;
     if (projectId) {
@@ -765,9 +799,13 @@ function computeActiveLoaders() {
   // 1) PTY Claude. bridgeKnownSessions = "CLI alive in this tab" (persists until
   //    terminal killed). Skip if the PTY is already gone — that mirrors
   //    get-presence returning 'inactive' (no loader) for a stale bridge entry.
+  //    Do NOT treat claudeCliActive as busy: it is process liveness, true while
+  //    Claude is idle at the prompt. Mobile install preflight blocks only
+  //    entries whose status is busy/running, so idle-alive Claude must surface
+  //    as active/starting, not as a fake loader.
   for (const tabId of bridgeKnownSessions.keys()) {
     if (!terminals.has(tabId)) continue; // PTY dead → not blocking (= 'inactive')
-    const isBusy = !!claudeCliActive.get(tabId) || !!claudeTurnBusy.get(tabId) || claudeLocalCommandWatchers.has(tabId);
+    const isBusy = !!claudeTurnBusy.get(tabId) || !!claudeSpinnerBusy.get(tabId) || claudeLocalCommandWatchers.has(tabId);
     const inputReady = claudePromptReady.has(tabId);
     const status = isBusy ? 'busy' : (inputReady ? 'active' : 'starting');
     loaders.push({ tabId, kind: 'claude', status, ...labelFor(tabId) });
@@ -788,11 +826,23 @@ function computeActiveLoaders() {
     seen.add(tabId);
   }
 
-  // 4) Any running process (npm run dev, build scripts, long commands). The user
-  //    asked that "npm run dev тоже считается" — so ANY isRunning tab blocks,
-  //    not only commandType==='devServer'.
+  // 4) Codex turn watcher. Codex CLI stays alive while idle, so process liveness
+  //    is not enough; only rollout task_started→task_complete busy blocks.
+  for (const [tabId, state] of codexTurnWatchers) {
+    if (seen.has(tabId) || state?.busy !== true) continue;
+    loaders.push({ tabId, kind: 'codex', status: 'busy', ...labelFor(tabId) });
+    seen.add(tabId);
+  }
+
+  // 5) Any non-AI running process (npm run dev, build scripts, long shell
+  //    commands). The user asked that "npm run dev тоже считается" — so any
+  //    non-AI isRunning tab blocks, not only commandType==='devServer'. AI CLI
+  //    tabs are excluded here: their process can be alive and idle at the prompt,
+  //    while install is allowed to close them gracefully. They block only through
+  //    their own deterministic busy/loader signals above.
   for (const [tabId, st] of terminalCommandState) {
     if (!st?.isRunning || seen.has(tabId)) continue;
+    if (isAiRuntimeTab(tabId)) continue;
     const cmd = terminalInitialCommand.get(tabId) || null;
     loaders.push({ tabId, kind: 'process', status: 'running', command: cmd, ...labelFor(tabId) });
     seen.add(tabId);
@@ -1538,6 +1588,16 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected') {
       ' reason=' + reason +
       ' prev=' + (prev ? String(prev).slice(0, 8) : 'none') +
       ' total=' + codexKnownSessions.size);
+    const turn = codexTurnWatchers.get(tabId);
+    _webBroadcast(tabId, {
+      type: 'snapshot',
+      sessionId,
+      busy: turn?.busy === true,
+      sessionStatus: turn?.busy === true ? 'busy' : 'active',
+      toolType: 'codex',
+      commandType: 'codex',
+      inputReady: true,
+    });
   }
 }
 
@@ -1974,6 +2034,17 @@ function startInterruptWatcher(tabId, sessionId) {
               event: 'InterruptStop', busy: false, success: false,
               lastAssistantMessage: null,
             });
+            _webBroadcast(tabId, {
+              type: 'busy',
+              busy: false,
+              reason: 'interrupt',
+              toolType: 'claude',
+              commandType: 'claude',
+              sessionId,
+              sessionStatus: 'active',
+              inputReady: true,
+            });
+            _webBroadcast(tabId, { type: 'done', sessionId, reason: 'interrupt' });
           }
         }
         stopInterruptWatcher(tabId);
@@ -2054,13 +2125,25 @@ function armInterruptIdleProbe(tabId) {
       // Esc/Ctrl+C before Claude wrote anything to JSONL (idle-probe fallback) —
       // NOT a natural completion. reason:'interrupt' makes the prompt-queue
       // auto-runner skip the next prompt. busy:false still clears the loader.
+      const sessionId = bridgeKnownSessions.get(tabId) || null;
       mainWindow.webContents.send('claude:busy-state', { tabId, busy: false, reason: 'interrupt' });
       mainWindow.webContents.send('claude:turn-state', {
         tabId,
-        sessionId: bridgeKnownSessions.get(tabId) || null,
+        sessionId,
         event: 'InterruptStop',
         busy: false, success: false, lastAssistantMessage: null,
       });
+      _webBroadcast(tabId, {
+        type: 'busy',
+        busy: false,
+        reason: 'interrupt',
+        toolType: 'claude',
+        commandType: 'claude',
+        sessionId,
+        sessionStatus: 'active',
+        inputReady: true,
+      });
+      _webBroadcast(tabId, { type: 'done', sessionId, reason: 'interrupt' });
     }
     stopInterruptWatcher(tabId);
   }, PROBE_DELAY_MS);
@@ -9178,6 +9261,11 @@ ipcMain.handle('project:delete-tab-history-entry', (event, { id }) => {
   return { success: true };
 });
 
+ipcMain.handle('project:update-tab-history-title', (event, { id, name, nameSetManually }) => {
+  const success = projectManager.db.updateTabHistoryTitle(id, name, nameSetManually !== false);
+  return { success };
+});
+
 // Shift+Cmd+T reopen — atomically pops the latest closed-tab record for a
 // project. Renderer recreates the tab from the returned metadata (cwd, name,
 // claudeSessionId, processWasRunning, position) and the record disappears from
@@ -11122,6 +11210,26 @@ function emitCodexBusy(tabId, busy, reason) {
   recordActivity(tabId, busy, 'codex');
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('codex:busy-state', { tabId, busy, reason });
+  }
+  const state = codexTurnWatchers.get(tabId);
+  _webBroadcast(tabId, {
+    type: 'busy',
+    busy,
+    reason,
+    toolType: 'codex',
+    commandType: 'codex',
+    sessionId: state?.sessionId || codexKnownSessions.get(tabId) || null,
+    sessionStatus: busy ? 'busy' : 'active',
+    inputReady: true,
+  });
+  if (!busy) {
+    _webBroadcast(tabId, {
+      type: 'done',
+      reason,
+      toolType: 'codex',
+      commandType: 'codex',
+      sessionId: state?.sessionId || codexKnownSessions.get(tabId) || null,
+    });
   }
 }
 

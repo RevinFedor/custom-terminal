@@ -23,6 +23,11 @@ function stableUuid(sessionId, index, prefix = 'codex') {
   return `${prefix}-${sessionId || 'unknown'}-${index}`;
 }
 
+function parseTimestampMs(value) {
+  const ms = value ? Date.parse(value) : NaN;
+  return Number.isFinite(ms) ? ms : NaN;
+}
+
 function safeJsonParse(value, fallback = null) {
   if (typeof value !== 'string') return fallback;
   try {
@@ -223,13 +228,46 @@ function getSessionMeta(records) {
   return {};
 }
 
+function getSessionMetaRecord(records) {
+  for (const record of records) {
+    if (record?.type === 'session_meta') return record;
+  }
+  return null;
+}
+
+function getCodexForkLiveStartLine(records, meta) {
+  if (!meta?.forked_from_id) return undefined;
+  const startedAtMs = parseTimestampMs(meta.timestamp);
+  if (!Number.isFinite(startedAtMs)) return undefined;
+
+  for (const record of records) {
+    const payload = record?.payload || {};
+    if (record?.type !== 'event_msg' || payload.type !== 'task_started') continue;
+
+    const payloadStartedAt = Number(payload.started_at);
+    if (Number.isFinite(payloadStartedAt) && payloadStartedAt > 0) {
+      if (payloadStartedAt * 1000 >= startedAtMs - 1000) return record.__line;
+      continue;
+    }
+
+    const recordAtMs = parseTimestampMs(record.timestamp);
+    if (Number.isFinite(recordAtMs) && recordAtMs >= startedAtMs + 1000) return record.__line;
+  }
+
+  return undefined;
+}
+
 function getTimelineSessionMeta(records) {
-  const meta = getSessionMeta(records);
+  const metaRecord = getSessionMetaRecord(records);
+  const meta = metaRecord?.payload || {};
+  const forkLiveStartLine = getCodexForkLiveStartLine(records, meta);
   return {
     id: meta.id,
     forked_from_id: meta.forked_from_id,
     timestamp: meta.timestamp,
     cwd: meta.cwd,
+    sourceLine: metaRecord?.__line,
+    forkLiveStartLine,
   };
 }
 
@@ -439,6 +477,7 @@ function buildCodexTimeline(records, sessionId) {
           type: 'user',
           timestamp: recordTimestamp(record),
           content: text,
+          sourceLine: record.__line,
           hasImage: Array.isArray(payload.images) ? payload.images.length > 0 : false,
           sessionId,
           turnIndex: currentTurnIndex,
@@ -477,6 +516,7 @@ function buildCodexTimeline(records, sessionId) {
           type: 'compact',
           timestamp: recordTimestamp(record),
           content: compactEventTitle(payload),
+          sourceLine: record.__line,
           preTokens: Number(last.total_tokens || last.input_tokens || 0) || undefined,
           sessionId,
         });
@@ -1224,6 +1264,7 @@ module.exports = {
   buildCodexFullHistory,
   buildCodexCleanExport,
   buildCodexRangeExport,
+  getTimelineSessionMeta,
   _api: {
     findCodexSessionFile,
     findLatestCodexSession,
@@ -1234,6 +1275,7 @@ module.exports = {
     loadSessionRecords,
     buildCodexFullHistory,
     buildCodexTimeline,
+    getTimelineSessionMeta,
     latestCodexUsageInRecords,
     findLatestCodexUsage,
   },

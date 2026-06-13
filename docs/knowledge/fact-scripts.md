@@ -14,14 +14,19 @@
 - **Подменю с отступом:** Scripts отображаются как подменю контекстного меню (CSS `group-hover/scripts`), открывающееся вправо.
 
 ## 3. Stop Running Process
-Три способа остановить активный процесс (все отправляют `\x03` — Ctrl+C):
-- **Middle-click на RestartZone** (зелёная точка/кнопка ↻ на табе). `onAuxClick` с `stopPropagation` — перехватывает middle-click ДО TabItem, поэтому вкладка НЕ закрывается.
-- **ПКМ по табу → Scripts → Stop: {name}** — появляется только если `processStatus.get(tabId) && commandType === 'devServer'`. Текст берётся из `tab.name`.
+Все script/devServer stop-пути отправляют `\x03` — Ctrl+C в PTY. Не подменять это SIGTERM по PID: shell сам доставляет SIGINT foreground process group, dev-server получает graceful exit, а UI остаётся в той же терминальной модели.
+
+Текущие поверхности остановки:
+- **ПКМ по табу → верхний Close+Stop split-pill** — основной путь для running script/devServer в tab context menu. Stop script mirror'ит Stop Claude UX, но зовёт script-stop ветку.
+- **Клик по process-bar edge в vertical sidebar** — только для `commandType === 'devServer'` и живого process-status. `F7` работает как shortcut только пока курсор наведен на эту полоску; подробнее — `fact-process-bar.md::Edge stop hit-zone для devServer`.
+- **Middle-click на RestartZone** — fallback для horizontal layout, где RestartZone всё ещё рендерится отдельно и `onAuxClick` перехватывает middle-click ДО TabItem.
 - **ПКМ по терминалу → Scripts (● running) → ● Stop process** — нативное Electron меню в main.js, проверяет `terminalCommandState.get(tabId).isRunning`.
 
 **Trap: Два раздельных контекстных меню скриптов.** Tab context menu (ПКМ по вкладке) — React-компонент в `TabBar.tsx`, проверяет `processStatus` Map + `commandType` из store. Terminal context menu (ПКМ по терминалу) — нативное `Menu.buildFromTemplate` в `main.js:show-terminal-context-menu`, проверяет `terminalCommandState` Map напрямую. При изменении логики скриптов нужно обновлять **оба** места.
 
 **Один из шрамов: auto-color симметрия.** Долго работала только в React-меню TabBar — оно само звало `setTabCommandType(tabId, 'devServer')` после detect'а `^(dev|start|serve|watch)/i`. Нативное меню main.js шлёт команду через `event.send('context-menu-command', 'run-script', { tabId, command })` → renderer App.tsx делает `ipcRenderer.send('terminal:input', tabId, command)` **напрямую в PTY**. Этот путь полностью обходит xterm keydown Enter handler в Terminal.tsx, где живёт второй auto-detect — поэтому вкладка не зеленела при run-script через нативное меню. Симптом юзера: *«ввёл npm run dev, цвет вкладки не стал зелёным»* (см. лог prod-Electron'а: `[ContextMenu] Command received: run-script` followed by `terminal:input ... "npm run dev"` — но без `[Store:setTabCommandType] devServer`). Fix — мирроринг regex'а в `App.tsx::run-script` handler перед `terminal:input`.
+
+Старая entry `Scripts → Stop: {name}` в React submenu больше не рендерится: stop вынесен в top-level split/edge surfaces, чтобы не прятать прерывание внутри списка launch-команд. В submenu оставлен только запуск `npm run X` / `./script.sh`.
 
 Разница restart vs stop: `handleRestart` = `\x03` → 300ms → `!!\r` (Ctrl+C + повтор последней команды через `!!` bash). `handleStop` = только `\x03`.
 

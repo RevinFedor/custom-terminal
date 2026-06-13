@@ -1,6 +1,6 @@
 import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Pin, Settings } from 'lucide-react';
+import { History, Pin, Settings } from 'lucide-react';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import type { CodexModelOption } from '../constants/codexSettings';
@@ -31,6 +31,8 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
   const setDebugHoverBridges = useUIStore((s) => s.setDebugHoverBridges);
   const freezeCmdPopups = useUIStore((s) => s.freezeCmdPopups);
   const setFreezeCmdPopups = useUIStore((s) => s.setFreezeCmdPopups);
+  const historyPinned = useUIStore((s) => s.historyPinned);
+  const setHistoryPinned = useUIStore((s) => s.setHistoryPinned);
   const timelinePinned = useUIStore((s) => s.timelinePinned);
   const setTimelinePinned = useUIStore((s) => s.setTimelinePinned);
   const freePortsBeforeStart = useUIStore((s) => s.freePortsBeforeStart);
@@ -125,14 +127,12 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
           activeColor="#ef4444"
         />
         <InvalidPathsChip onOpenSettings={onOpenSettings} />
-        <IconStatusToggle
-          title="Закрепить Timeline/History как обычные колонки: expanded Timeline и Cmd+\\ History ужимают терминал, а не лежат поверх него."
-          active={timelinePinned}
-          onClick={() => setTimelinePinned(!timelinePinned)}
-          activeColor="#38bdf8"
-        >
-          <Pin size={13} strokeWidth={1.9} />
-        </IconStatusToggle>
+        <HistoryTimelinePinToggle
+          historyPinned={historyPinned}
+          timelinePinned={timelinePinned}
+          onToggleHistory={() => setHistoryPinned(!historyPinned)}
+          onToggleTimeline={() => setTimelinePinned(!timelinePinned)}
+        />
         <StatusToggle
           label="freeze tooltips"
           title="ВКЛ: Cmd-tooltip / note / fork popup'ы НЕ закрываются при уходе курсора и отпускании Cmd — для инспекции их DOM в devtools."
@@ -942,11 +942,50 @@ function StatusToggle({ label, title, active, onClick, activeColor = '#22c55e' }
   );
 }
 
-function IconStatusToggle({ title, active, onClick, activeColor = '#22c55e', children }: {
+function HistoryTimelinePinToggle({
+  historyPinned,
+  timelinePinned,
+  onToggleHistory,
+  onToggleTimeline,
+}: {
+  historyPinned: boolean;
+  timelinePinned: boolean;
+  onToggleHistory: () => void;
+  onToggleTimeline: () => void;
+}) {
+  return (
+    <div
+      className="inline-flex items-center rounded overflow-hidden"
+      style={{ height: 20, border: '1px solid rgba(255,255,255,0.08)' }}
+    >
+      <SplitIconButton
+        title="History pin (Cmd+\\): когда история открыта, держать её обычной колонкой, а не overlay поверх терминала."
+        active={historyPinned}
+        activeColor="#a78bfa"
+        side="left"
+        onClick={onToggleHistory}
+      >
+        <History size={13} strokeWidth={1.9} />
+      </SplitIconButton>
+      <SplitIconButton
+        title="Timeline pin (Cmd+]): когда таймлайн раскрыт, держать его обычной колонкой, а не overlay поверх терминала."
+        active={timelinePinned}
+        activeColor="#38bdf8"
+        side="right"
+        onClick={onToggleTimeline}
+      >
+        <Pin size={13} strokeWidth={1.9} />
+      </SplitIconButton>
+    </div>
+  );
+}
+
+function SplitIconButton({ title, active, activeColor, side, onClick, children }: {
   title: string;
   active: boolean;
+  activeColor: string;
+  side: 'left' | 'right';
   onClick: () => void;
-  activeColor?: string;
   children: React.ReactNode;
 }) {
   return (
@@ -954,12 +993,13 @@ function IconStatusToggle({ title, active, onClick, activeColor = '#22c55e', chi
       onClick={onClick}
       title={title}
       aria-pressed={active}
-      className="inline-flex items-center justify-center cursor-pointer hover:bg-white/5 rounded"
+      className="inline-flex items-center justify-center cursor-pointer"
       style={{
         width: 22,
-        height: 20,
+        height: 18,
         padding: 0,
         border: 'none',
+        borderLeft: side === 'right' ? '1px solid rgba(255,255,255,0.08)' : 'none',
         outline: 'none',
         background: active ? `${activeColor}22` : 'transparent',
         color: active ? activeColor : '#666',

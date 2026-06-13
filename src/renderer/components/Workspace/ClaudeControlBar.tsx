@@ -605,17 +605,25 @@ export default function ClaudeControlBar({
     requestAnimationFrame(() => terminalRegistry.get(tabId)?.focus());
   };
 
+  const describeActiveElement = () => {
+    const el = document.activeElement as HTMLElement | null;
+    if (!el) return 'none';
+    const tag = el.tagName ? el.tagName.toLowerCase() : 'unknown';
+    const cls = typeof el.className === 'string' && el.className.trim()
+      ? '.' + el.className.trim().split(/\s+/).slice(0, 4).join('.')
+      : '';
+    return tag + cls;
+  };
+
   const updateCodexState = (state: { codexModel?: string; codexEffort?: string }) => {
     useWorkspaceStore.getState().updateCodexState(tabId, state);
   };
   const saveCodexSelectionWithoutLivePicker = (
     state: { codexModel?: string; codexEffort?: string },
     reason: string,
-    toastText: string,
   ) => {
     console.warn('[CodexControlBar] live picker skipped tab=' + tabId.slice(-12) + ' reason=' + reason + ' state=' + JSON.stringify(state) + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
     updateCodexState(state);
-    showToast(toastText, 'warning', 2600);
     focusTerminal();
   };
   const ignoreCodexPickerDuringTurn = (kind: 'model' | 'effort', value: string) => {
@@ -834,7 +842,10 @@ export default function ClaudeControlBar({
 
   const getCodexDraftStateForPicker = async () => {
     const visualState = terminalRegistry.getCodexDraftState(tabId);
-    console.warn('[CodexControlBar] draft visual-probe tab=' + tabId.slice(-12) + ' hasDraft=' + visualState.hasDraft + ' source=' + visualState.source + ' preview=' + JSON.stringify(visualState.preview));
+    const unknownDebug = visualState.hasDraft === null && visualState.debug
+      ? ' debug=' + visualState.debug
+      : '';
+    console.warn('[CodexControlBar] draft visual-probe tab=' + tabId.slice(-12) + ' hasDraft=' + visualState.hasDraft + ' source=' + visualState.source + ' active=' + describeActiveElement() + ' preview=' + JSON.stringify(visualState.preview) + unknownDebug);
 
     return {
       hasDraft: visualState.hasDraft,
@@ -907,7 +918,6 @@ export default function ClaudeControlBar({
             saveCodexSelectionWithoutLivePicker(
               fallbackState,
               'unsafe-input:model:' + draftState.source,
-              `Codex model saved for this tab: ${mid}. Live picker skipped.`,
             );
             return;
           }
@@ -936,7 +946,6 @@ export default function ClaudeControlBar({
             saveCodexSelectionWithoutLivePicker(
               fallbackState,
               'picker-failed:model:' + (result?.error || 'unknown'),
-              `Codex model saved for this tab: ${mid}. Live picker failed.`,
             );
           }
         } finally { setLocalBusy(false, 'codex-model:' + mid + ':finally'); focusTerminal(); }
@@ -995,7 +1004,6 @@ export default function ClaudeControlBar({
             saveCodexSelectionWithoutLivePicker(
               { codexEffort: level },
               'unsafe-input:effort:' + draftState.source,
-              `Codex effort saved for this tab: ${level}. Live picker skipped.`,
             );
             return;
           }
@@ -1021,7 +1029,6 @@ export default function ClaudeControlBar({
             saveCodexSelectionWithoutLivePicker(
               { codexEffort: level },
               'picker-failed:effort:' + (result?.error || 'unknown'),
-              `Codex effort saved for this tab: ${level}. Live picker failed.`,
             );
           }
         } finally { setLocalBusy(false, 'codex-effort:' + level + ':finally'); focusTerminal(); }

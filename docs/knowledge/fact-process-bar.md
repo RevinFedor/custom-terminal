@@ -77,6 +77,12 @@ Claude PTY spinner остаётся эвристикой: main эмитит `cla
 
 Маркер sessionStatus всегда слева независимо от bar-position — потому что слева удобнее читается рядом с текстом названия вкладки. Если bar тоже слева — между ними 2px зазор; если bar справа — слева остаётся padding под маркер.
 
+## Edge stop hit-zone для devServer
+
+В vertical layout process-bar у зелёной devServer-вкладки одновременно остаётся статус-индикатором и становится маленькой stop-поверхностью. Клик по самой полоске вызывает тот же deterministic stop, что top-level Stop script action: только `Ctrl+C` в PTY, без restart и без `!!`. `F7` работает только пока курсор находится на этой полоске; это не глобальный hotkey, иначе одно случайное F7 могло бы остановить не тот dev-server.
+
+Причина размещения именно на edge-indicator: в vertical sidebar middle-click по всей вкладке уже имеет стандартную семантику close tab. Старый RestartZone/middle-click stop подходит для horizontal fallback, но в vertical режиме отдельной зоны справа нет, а перехват middle-click на весь row конфликтовал бы с закрытием вкладки. Поэтому у полоски есть свой `data-no-tab-drag` hit-zone, `mousedown` гасит drag/select/switch, а Cmd-hover только усиливает destructive affordance (красный tint/ширина), не меняя состояние. Bare hover показывает, что strip кликабелен; Cmd-hover говорит «это stop», а не «процесс стал красным».
+
 ## Settings UI (правая колонка 2-column grid)
 
 - Compact превью полоски 32px высотой с реальной анимацией (использует локальные CSS-vars в `style={{['--process-bar-color-a' as any]: ...}}`, не зависит от :root — превью обновляется ДО того как App-effect синхронизирует root)
