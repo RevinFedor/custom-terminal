@@ -106,7 +106,7 @@ export default function CopySessionWithChips() {
               onClick={() => setCopyIncludeUser(!includeUser)}
               className="cursor-pointer hover:opacity-80 transition-opacity inline-flex items-center"
               style={{ background: 'transparent', border: 'none', padding: 0, lineHeight: 1, color: includeUser ? ON : OFF }}
-              title="👤 user prompts"
+              title="Промпты пользователя"
             >
               <UserIcon size={11} strokeWidth={2} />
             </button>
@@ -115,7 +115,7 @@ export default function CopySessionWithChips() {
               onClick={() => setCopyIncludeClaude(!includeClaude)}
               className="cursor-pointer hover:opacity-80 transition-opacity inline-flex items-center"
               style={{ background: 'transparent', border: 'none', padding: 0, lineHeight: 1 }}
-              title="✦ Claude messages"
+              title={isCodex ? 'Сообщения Codex' : 'Сообщения Claude'}
             >
               {isCodex
                 ? <span style={{ color: includeClaude ? ON : OFF, fontSize: 9.5, fontFamily: 'ui-monospace, SFMono-Regular, monospace', lineHeight: 1.2 }}>Codex</span>
@@ -127,7 +127,7 @@ export default function CopySessionWithChips() {
               activeColor={ON}
               active={includeClaude && includeText}
               onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeText(!(includeClaude && includeText)); }}
-              title="«answer» — финальные ответы агента"
+              title="Ответ агента — финальные текстовые сообщения"
             >answer</ChipText>
             {dot}
             {!isCodex && (
@@ -136,7 +136,7 @@ export default function CopySessionWithChips() {
                 activeColor={ON}
                 active={includeClaude && includeThinking}
                 onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeThinking(!(includeClaude && includeThinking)); }}
-                title="«thinking» — extended thinking blocks"
+                title="Ход рассуждения — thinking blocks"
               >thinking</ChipText>
             )}
           </div>
@@ -149,7 +149,7 @@ export default function CopySessionWithChips() {
                   activeColor={ON}
                   active={includeClaude && includeReading}
                   onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeReading(!(includeClaude && includeReading)); }}
-                  title="read_file — Read tool"
+                  title="Чтение файлов — read_file"
                 >read</ChipText>
                 {dot}
               </>
@@ -158,28 +158,28 @@ export default function CopySessionWithChips() {
               activeColor={ON}
               active={includeClaude && includeEditing}
               onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeEditing(!(includeClaude && includeEditing)); }}
-              title={isCodex ? 'apply_patch' : 'edit, write'}
-            >{isCodex ? 'patch' : 'edit'}</ChipText>
+              title={isCodex ? 'Правки файлов — apply_patch' : 'Правки файлов — edit/write'}
+            >{isCodex ? 'files' : 'edit'}</ChipText>
             {dot}
             <ChipText
               activeColor={ON}
               active={includeClaude && includeBash}
               onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeBash(!(includeClaude && includeBash)); }}
-              title={isCodex ? 'exec_command, write_stdin — shell-команды' : 'bash, monitor, grep, glob — shell-команды'}
+              title={isCodex ? 'Shell-команды — exec_command запускает процесс, write_stdin пишет в него' : 'Shell-команды — bash/monitor/grep/glob'}
             >{isCodex ? 'shell' : 'bash'}</ChipText>
             {dot}
             <ChipText
               activeColor={ON}
               active={includeClaude && includeTools}
               onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeTools(!(includeClaude && includeTools)); }}
-              title="mcp__*"
+              title="MCP-инструменты — mcp__*"
             >mcp</ChipText>
             {dot}
             <ChipText
               activeColor={ON}
               active={includeClaude && includeWebSearch}
               onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeWebSearch(!(includeClaude && includeWebSearch)); }}
-              title="web_search"
+              title="Web-поиск — интернет и страницы"
             >web</ChipText>
             {dot}
             {isCodex && (
@@ -188,8 +188,8 @@ export default function CopySessionWithChips() {
                   activeColor={ON}
                   active={includeClaude && includeToolSearch}
                   onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeToolSearch(!(includeClaude && includeToolSearch)); }}
-                  title="tool_search"
-                >tool</ChipText>
+                  title="Поиск доступных tools — tool_search, не интернет"
+                >catalog</ChipText>
                 {dot}
               </>
             )}
@@ -197,7 +197,7 @@ export default function CopySessionWithChips() {
               activeColor={ON}
               active={includeClaude && includeOtherTools}
               onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeOtherTools(!(includeClaude && includeOtherTools)); }}
-              title="other_tools"
+              title="Прочие инструменты — view_image/update_plan и редкие tools"
             >other</ChipText>
             {dot}
             {!isCodex && (

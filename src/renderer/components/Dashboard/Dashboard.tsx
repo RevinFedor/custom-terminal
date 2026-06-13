@@ -112,18 +112,12 @@ export default function Dashboard() {
 
   const refreshProcesses = async () => {
     try {
-      const [claude, gemini, codex, mcp, electronDev] = await Promise.all([
-        ipcRenderer.invoke('system:get-claude-processes'),
-        ipcRenderer.invoke('system:get-gemini-processes'),
-        ipcRenderer.invoke('system:get-codex-processes'),
-        ipcRenderer.invoke('system:get-mcp-processes'),
-        ipcRenderer.invoke('system:get-electron-dev-processes'),
-      ]);
-      setClaudeProcesses(claude || []);
-      setGeminiProcesses(gemini || []);
-      setCodexProcesses(codex || []);
-      setMcpProcesses(mcp || []);
-      setElectronDevProcesses(electronDev || []);
+      const dashboardProcesses = await ipcRenderer.invoke('system:get-dashboard-processes');
+      setClaudeProcesses(dashboardProcesses?.claude || []);
+      setGeminiProcesses(dashboardProcesses?.gemini || []);
+      setCodexProcesses(dashboardProcesses?.codex || []);
+      setMcpProcesses(dashboardProcesses?.mcp || []);
+      setElectronDevProcesses(dashboardProcesses?.electronDev || []);
     } catch {
       setClaudeProcesses([]);
       setGeminiProcesses([]);
@@ -238,20 +232,59 @@ export default function Dashboard() {
     };
   }, [openProjects.size]);
 
-  // Poll for active AI processes + Electron dev apps.
+  // Process snapshot is intentionally low-frequency. Old Dashboard process
+  // polling overloaded macOS sysmond by repeatedly calling ps/pgrep; keep this
+  // to mount/focus/visibility/events plus a slow visible-window safety refresh.
   useEffect(() => {
+    let disposed = false;
+    let inFlight = false;
     let isFirst = true;
-    const fetchProcesses = async () => {
-      await refreshProcesses();
-      if (isFirst) {
+    let eventRefreshTimer: number | null = null;
+
+    const fetchProcesses = async (force = false) => {
+      if (disposed || inFlight) return;
+      if (!force && document.visibilityState === 'hidden') return;
+      inFlight = true;
+      try {
+        await refreshProcesses();
+      } finally {
+        inFlight = false;
+      }
+      if (!disposed && isFirst) {
         setIsProcessesLoading(false);
         isFirst = false;
       }
     };
 
-    fetchProcesses();
-    const interval = setInterval(fetchProcesses, 10000);
-    return () => clearInterval(interval);
+    const scheduleEventRefresh = () => {
+      if (eventRefreshTimer !== null) window.clearTimeout(eventRefreshTimer);
+      eventRefreshTimer = window.setTimeout(() => {
+        eventRefreshTimer = null;
+        fetchProcesses(false);
+      }, 1200);
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') fetchProcesses(true);
+    };
+    const handleFocus = () => fetchProcesses(true);
+
+    fetchProcesses(true);
+    const interval = window.setInterval(() => fetchProcesses(false), 60000);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('focus', handleFocus);
+    ipcRenderer.on('terminal:command-started', scheduleEventRefresh);
+    ipcRenderer.on('terminal:command-finished', scheduleEventRefresh);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+      if (eventRefreshTimer !== null) window.clearTimeout(eventRefreshTimer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('focus', handleFocus);
+      ipcRenderer.removeListener('terminal:command-started', scheduleEventRefresh);
+      ipcRenderer.removeListener('terminal:command-finished', scheduleEventRefresh);
+    };
   }, []);
 
   const handleOpenProjectWorkspace = (projectId: string) => {

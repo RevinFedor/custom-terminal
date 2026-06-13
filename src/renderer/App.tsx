@@ -211,13 +211,15 @@ const ProjectTabItem = memo(({
   return (
     <button
       ref={ref}
-      className={`relative text-sm font-medium cursor-pointer transition-all rounded-sm ${
+      className={`relative inline-flex items-center text-sm font-medium cursor-pointer transition-colors rounded-sm overflow-visible ${
         isActive && isAreaActive ? 'ring-1 ring-white/50 shadow-[0_0_10px_rgba(255,255,255,0.1)]' : ''
       } ${textColor}`}
       style={{
         // padding x/y из Settings (раньше был хардкод px-3 py-1.5 = 12px 6px).
         padding: `${projectTabGeometry.paddingY}px ${projectTabGeometry.paddingX}px`,
         fontSize: `${fontSize}px`,
+        lineHeight: '16px',
+        height: `${Math.max(20, 16 + projectTabGeometry.paddingY * 2)}px`,
         opacity: isDragging ? 0.5 : 1,
         outline: isTabDropTarget ? '2px solid #4ade80' : 'none',
         outlineOffset: '-2px',
@@ -243,7 +245,7 @@ const ProjectTabItem = memo(({
       {isProjectAwaiting && (
         <div className="tab-awaiting-input absolute inset-0 rounded-sm" style={{ zIndex: 8 }} aria-hidden />
       )}
-      <span className="relative z-10 flex items-center gap-1.5">
+      <span className="relative z-10 flex items-center gap-1 leading-none">
         {isEditing ? (
           <input
             ref={inputRef}
@@ -279,49 +281,62 @@ const ProjectTabItem = memo(({
             <span className="max-w-[120px] truncate">{projectName}</span>
           </>
         )}
-        {activeProcessCount > 0 && !isEditing && (
-          <span
-            className="relative flex items-center justify-center text-[10px] font-medium rounded-full"
-            style={{
-              minWidth: '16px',
-              height: '16px',
-              padding: '0 4px',
-              backgroundColor: isActive ? 'rgba(74, 222, 128, 0.3)' : 'rgba(74, 222, 128, 0.2)',
-              color: isActive ? '#166534' : '#4ade80',
-              boxSizing: 'border-box',
-            }}
-          >
-            {(isProjectBusy || isProjectLoading) && (
-              <span
-                className="absolute inset-0 rounded-full"
-                style={{
-                  border: '2px solid rgba(74, 222, 128, 0.2)',
-                  borderTopColor: '#4ade80',
-                  boxSizing: 'border-box',
-                  animation: 'tab-dot-spin 0.8s linear infinite',
-                }}
-              />
-            )}
-            {activeProcessCount}
-          </span>
-        )}
-        {interruptedCount > 0 && !isEditing && (
-          <Tooltip content="Interrupted sessions - click tab to resume">
+      </span>
+      {!isEditing && (activeProcessCount > 0 || interruptedCount > 0) && (
+        <span
+          className="absolute z-20 flex items-center gap-0.5 pointer-events-none"
+          style={{
+            right: '-2px',
+            top: '-5px',
+          }}
+        >
+          {activeProcessCount > 0 && (
             <span
-              className="flex items-center justify-center text-[10px] font-medium rounded-full"
+              className="relative flex items-center justify-center text-[9px] font-semibold rounded-full"
               style={{
-                minWidth: '16px',
-                height: '16px',
-                padding: '0 4px',
-                backgroundColor: isActive ? 'rgba(59, 130, 246, 0.3)' : 'rgba(59, 130, 246, 0.2)',
-                color: isActive ? '#1e40af' : '#3b82f6',
+                minWidth: '14px',
+                height: '14px',
+                padding: '0 3px',
+                backgroundColor: isActive ? 'rgba(187, 247, 208, 0.95)' : 'rgba(74, 222, 128, 0.22)',
+                color: isActive ? '#166534' : '#4ade80',
+                boxSizing: 'border-box',
+                lineHeight: '14px',
               }}
             >
-              {interruptedCount}
+              {(isProjectBusy || isProjectLoading) && (
+                <span
+                  className="absolute inset-0 rounded-full"
+                  style={{
+                    border: '2px solid rgba(74, 222, 128, 0.2)',
+                    borderTopColor: '#4ade80',
+                    boxSizing: 'border-box',
+                    animation: 'tab-dot-spin 0.8s linear infinite',
+                  }}
+                />
+              )}
+              {activeProcessCount}
             </span>
-          </Tooltip>
-        )}
-      </span>
+          )}
+          {interruptedCount > 0 && (
+            <Tooltip content="Interrupted sessions - click tab to resume">
+              <span
+                className="flex items-center justify-center text-[9px] font-semibold rounded-full"
+                style={{
+                  minWidth: '14px',
+                  height: '14px',
+                  padding: '0 3px',
+                  backgroundColor: isActive ? 'rgba(191, 219, 254, 0.95)' : 'rgba(59, 130, 246, 0.22)',
+                  color: isActive ? '#1e40af' : '#60a5fa',
+                  boxSizing: 'border-box',
+                  lineHeight: '14px',
+                }}
+              >
+                {interruptedCount}
+              </span>
+            </Tooltip>
+          )}
+        </span>
+      )}
       {closestEdge && <ProjectDropIndicator edge={closestEdge as 'left' | 'right'} />}
       {forceRightIndicator && !closestEdge && <ProjectDropIndicator edge="right" />}
     </button>
