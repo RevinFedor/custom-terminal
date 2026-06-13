@@ -1,13 +1,13 @@
 # Feature: Terminal MCP Server
 
 ## Intro
-MCP-сервер для управления терминальными вкладками из AI-агента (Claude Code, Gemini CLI). Позволяет агенту видеть запущенные dev-серверы, перезапускать процессы после изменения кода, читать output и выполнять build-цепочки — без ручного переключения вкладок пользователем.
+MCP-сервер для управления терминальными вкладками из AI-агента (Claude Code, Codex CLI, Gemini CLI). Позволяет агенту видеть запущенные dev-серверы, перезапускать процессы после изменения кода, читать output, выполнять build-цепочки и управлять живыми AI CLI во вкладках — без ручного переключения вкладок пользователем.
 
 ## Архитектура
 
 ### Два MCP-сервера, один HTTP backend
 Проект использует два отдельных MCP-сервера, и оба ходят в один и тот же main-process HTTP:
-- `.claude/mcp/terminal-server.mjs` — Terminal Management (tabs, restart, run, output). *Оператор*: что сейчас крутится, перезапустить/убить.
+- `.claude/mcp/terminal-server.mjs` — Terminal Management (tabs, restart, run, output, AI live control). *Оператор*: что сейчас крутится, запустить/отправить prompt/остановить.
 - `~/.claude/mcp/overseer-server.mjs` — контроль сессий (чтение + редактирование истории через `/overseer/*` endpoints). *Историк/редактор*: что сессия сделала, прочитать/переписать транскрипт. Полная механика — [`fact-overseer-mcp.md`](fact-overseer-mcp.md).
 
 Граница по blast radius: terminal MCP может убить dev-сервер, overseer MCP — переписать JSONL. Оба общаются с main process через один и тот же HTTP-сервер (`mcpHttpServer` на localhost). Порт обнаруживается через `~/.noted-terminal/mcp-port-<PID>` (см. [`fix-mcp-multi-instance.md`](fix-mcp-multi-instance.md)).
@@ -19,6 +19,18 @@ MCP-сервер определяет проект через `process.cwd()` (�
 `/terminal/tabs` объединяет данные из двух источников:
 - **SQLite** (renderer → save-tabs): name, color, command_type, cwd, tab_id — снимок на момент последнего save
 - **Main process Maps** (live): terminals (PTY alive?), terminalCommandState (isRunning), terminalInitialCommand, pid
+
+## AI live control
+
+Terminal MCP управляет **живым процессом**, а не историей. `start_ai` создаёт или переиспользует вкладку и запускает `claude` / `codex` / `gemini` через те же app-native launch hooks, что UI. `send_prompt` вставляет prompt в целевую вкладку через существующий safe paste path, `stop_ai` останавливает AI process-tree без уничтожения shell. Для `codex-c` / `codex-f` / `claude-c` / `claude-f` create-tab aliases проходят через pendingAction, чтобы renderer применил тот же resume/fork flow, что пользовательская кнопка.
+
+Граница с Overseer: если нужно узнать, что агент уже сделал, читать session history через overseer. Если нужно заставить живую вкладку что-то сделать сейчас, использовать terminal MCP. Не пытаться реализовать Codex orchestration через rewrite rollout JSONL: Codex history append-only и не имеет Claude edit-range модели.
+
+## MCP activity events
+
+Mutating HTTP routes (`run_command`, `restart_process`, `run_chain`, `create_tab`, `kill_process`, `send_prompt`, `start_ai`, `stop_ai`) эмитят `terminal:mcp-activity` в renderer. Событие несёт `sourceMeta` (кто вызвал MCP), target project/tab, action и status (`running`/`sent`/`completed`/`error` и т.п.). StatusBar показывает это как глобальный `MCP` chip, потому что запрос может прийти из внешней локальной нейронки или соседней вкладки, не из текущего UI-контекста.
+
+Passive reads (`list_tabs`, `read_output`) намеренно молчат. Иначе каждый inspection-loop агента превращает StatusBar в шум, хотя пользовательского действия над вкладкой не было.
 
 ## Soft Restart (Ctrl+C → re-run)
 

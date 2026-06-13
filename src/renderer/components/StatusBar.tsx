@@ -1,6 +1,6 @@
 import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Settings } from 'lucide-react';
+import { Pin, Settings } from 'lucide-react';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import type { ClaudeCodeModelOption } from '../store/useUIStore';
@@ -30,6 +30,8 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
   const setDebugHoverBridges = useUIStore((s) => s.setDebugHoverBridges);
   const freezeCmdPopups = useUIStore((s) => s.freezeCmdPopups);
   const setFreezeCmdPopups = useUIStore((s) => s.setFreezeCmdPopups);
+  const timelinePinned = useUIStore((s) => s.timelinePinned);
+  const setTimelinePinned = useUIStore((s) => s.setTimelinePinned);
   const freePortsBeforeStart = useUIStore((s) => s.freePortsBeforeStart);
   const setFreePortsBeforeStart = useUIStore((s) => s.setFreePortsBeforeStart);
   const defaultClaudeEffort = useUIStore((s) => s.defaultClaudeEffort);
@@ -104,6 +106,14 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
           activeColor="#ef4444"
         />
         <InvalidPathsChip onOpenSettings={onOpenSettings} />
+        <IconStatusToggle
+          title="Закрепить Timeline/History как обычные колонки: expanded Timeline и Cmd+\\ History ужимают терминал, а не лежат поверх него."
+          active={timelinePinned}
+          onClick={() => setTimelinePinned(!timelinePinned)}
+          activeColor="#38bdf8"
+        >
+          <Pin size={13} strokeWidth={1.9} />
+        </IconStatusToggle>
         <StatusToggle
           label="freeze tooltips"
           title="ВКЛ: Cmd-tooltip / note / fork popup'ы НЕ закрываются при уходе курсора и отпускании Cmd — для инспекции их DOM в devtools."
@@ -872,6 +882,43 @@ function StatusToggle({ label, title, active, onClick, activeColor = '#22c55e' }
         }}
       />
       <span style={{ color: active ? '#ddd' : '#666' }}>{label}</span>
+    </button>
+  );
+}
+
+function IconStatusToggle({ title, active, onClick, activeColor = '#22c55e', children }: {
+  title: string;
+  active: boolean;
+  onClick: () => void;
+  activeColor?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      aria-pressed={active}
+      className="inline-flex items-center justify-center cursor-pointer hover:bg-white/5 rounded"
+      style={{
+        width: 22,
+        height: 20,
+        padding: 0,
+        border: 'none',
+        outline: 'none',
+        background: active ? `${activeColor}22` : 'transparent',
+        color: active ? activeColor : '#666',
+        boxShadow: active ? `0 0 8px ${activeColor}55 inset` : 'none',
+      }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.color = active ? activeColor : '#ddd';
+        e.currentTarget.style.background = active ? `${activeColor}2e` : 'rgba(255,255,255,0.08)';
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.color = active ? activeColor : '#666';
+        e.currentTarget.style.background = active ? `${activeColor}22` : 'transparent';
+      }}
+    >
+      {children}
     </button>
   );
 }

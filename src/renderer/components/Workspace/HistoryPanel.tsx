@@ -69,6 +69,7 @@ interface HistoryPanelProps {
   isOpen: boolean;
   toolType?: 'claude' | 'gemini' | 'codex';
   enableClaudePtyControls?: boolean;
+  embedded?: boolean;
 }
 
 // Thinking + markdown now render via @noted/claude-blocks (CBThinkBlock /
@@ -1608,7 +1609,7 @@ function AgentHistoryControls({
 }
 
 
-function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, toolType = 'claude', enableClaudePtyControls = false }: HistoryPanelProps) {
+function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, toolType = 'claude', enableClaudePtyControls = false, embedded = false }: HistoryPanelProps) {
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const setHistoryPanelWidth = useUIStore((s) => s.setHistoryPanelWidth);
   const historyScrollToUuid = useUIStore((s) => s.historyScrollToUuid);
@@ -1617,6 +1618,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const setHistoryScrollPosition = useUIStore((s) => s.setHistoryScrollPosition);
   const closePanel = useCallback(() => setHistoryPanelOpen(tabId, false), [tabId, setHistoryPanelOpen]);
   const resetPanelWidth = useCallback(() => setHistoryPanelWidth(HISTORY_PANEL_DEFAULT_WIDTH), [setHistoryPanelWidth]);
+  const panelRef = useRef<HTMLDivElement>(null);
 
   // Save scroll position + clean up CSS highlights on unmount.
   // Virtuoso owns scrolling — the scrollTop we save belongs to the inner
@@ -2152,7 +2154,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
       if (!isResizing.current) return;
-      const rightEdge = document.body.clientWidth - notesPanelWidth;
+      const rightEdge = panelRef.current?.getBoundingClientRect().right ?? (document.body.clientWidth - notesPanelWidth);
       const newWidth = rightEdge - e.clientX;
       if (newWidth >= 280) {
         setHistoryPanelWidth(newWidth);
@@ -2179,19 +2181,23 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
 
   const panel = (
     <div
+      ref={panelRef}
       style={{
-        position: 'absolute',
+        position: embedded ? 'relative' : 'absolute',
         top: 0,
         bottom: 0,
         right: 0,
-        width: width,
+        width: embedded ? (slideIn ? width : 0) : width,
+        height: '100%',
+        flexShrink: 0,
+        overflow: 'hidden',
         backgroundColor: '#1a1a1a',
-        borderLeft: '1px solid #333',
+        borderLeft: embedded && !slideIn ? 'none' : '1px solid #333',
         zIndex: 101,
         display: 'flex',
         flexDirection: 'column',
-        transform: slideIn ? 'translateX(0)' : 'translateX(100%)',
-        transition: 'transform 50ms ease-out',
+        transform: embedded ? 'none' : (slideIn ? 'translateX(0)' : 'translateX(100%)'),
+        transition: embedded ? 'width 50ms ease-out' : 'transform 50ms ease-out',
       }}
     >
       {/* Resize handle (left edge) */}

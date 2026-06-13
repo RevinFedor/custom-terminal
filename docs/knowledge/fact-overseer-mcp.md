@@ -1,7 +1,9 @@
 # Feature: Overseer MCP (cross-session inspection & editing)
 
 ## Intro
-Overseer — глобальный MCP-сервер (`~/.claude/mcp/overseer-server.mjs`), через который **любая вкладка читает и редактирует историю любой другой сессии** в приложении. Подключается из любого SDK-таба или Claude/Codex CLI. Не оркестратор, раздающий задачи — peer-доступ к JSONL-транскриптам всех открытых сессий поверх того же парсинга, что использует Timeline.
+Overseer — глобальный MCP-сервер (`~/.claude/mcp/overseer-server.mjs`), через который **любая вкладка читает историю любой другой Claude/Codex-сессии** в приложении. Подключается из любого SDK-таба или Claude/Codex CLI. Не оркестратор, раздающий задачи — peer-доступ к JSONL-транскриптам всех открытых сессий поверх того же парсинга, что использует Timeline.
+
+Редактирование истории через Overseer сейчас **Claude-only**. Claude JSONL имеет `parentUuid`-цепочку и уже существующий edit-range/fork pipeline, поэтому `fork_session` / `propose_edit` / `apply_edit` могут безопасно идти через Timeline IPC. Codex rollout JSONL читается для discovery/stats/turn pull, но не переписывается: у Codex нет нашего parentUuid-DAG и edit-range модели, а файл append-only принадлежит живому Codex CLI. Для Codex эти mutation-tools должны возвращать явный unsupported, а live-действия (`start`, prompt, stop) идут через terminal MCP.
 
 Системный промпт-роль регистратора (что делать, как обходить большие ходы) — `docs/meta/оркестратор.prompt.md`, копируется в первое сообщение SDK-таба руками.
 
@@ -13,7 +15,7 @@ Overseer — глобальный MCP-сервер (`~/.claude/mcp/overseer-serv
 
 Два MCP, один main-process HTTP backend, разный blast radius:
 - **terminal MCP** = *оператор*: что сейчас крутится, перезапустить/убить процесс. Project-scoped.
-- **overseer MCP** = *историк/редактор*: что сессия сделала, прочитать/переписать транскрипт. Cross-project.
+- **overseer MCP** = *историк/редактор*: что сессия сделала, прочитать транскрипт; переписать транскрипт только для Claude. Cross-project.
 
 Не объединять: read-introspection целиком принадлежит overseer, act-on-process — terminal, зон размытия нет. terminal MCP имеет независимого потребителя (skill `electron-e2e-testing` гоняет dev-сервер). Подробнее границу см. [`fact-terminal-mcp.md`](fact-terminal-mcp.md).
 
@@ -26,10 +28,12 @@ Overseer — глобальный MCP-сервер (`~/.claude/mcp/overseer-serv
 - `list_notes` — пользовательские якоря Timeline (заметки, rewind-маркеры, orphan-notes)
 - `get_user_prompt` / `get_thinking` / `get_assistant_text` — точечный pull одного блока, byte-range через `start/end` (negative offsets как в Python)
 
-**Редактирование** — через те же IPC что Timeline-кнопка, overseer **никогда не пишет JSONL напрямую**:
+**Редактирование Claude** — через те же IPC что Timeline-кнопка, overseer **никогда не пишет JSONL напрямую**:
 - `fork_session` — клон под новым UUID
 - `propose_edit` — dry-run: что именно удалится (backtrace + forward-expand), без записи на диск
 - `apply_edit` — реальная правка через `claude:edit-range` (mode=compact) или `claude:delete-range` (mode=delete)
+
+Для Codex эти же имена tools остаются видимыми как единый контракт MCP, но mutation path обязан отказать явно. Молчаливый no-op хуже ошибки: агент решит что переписал историю и начнёт строить следующий шаг на несуществующем fork/edit.
 
 ## Granular-чтение: почему agent decides volume
 

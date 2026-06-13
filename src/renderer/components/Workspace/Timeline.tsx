@@ -146,6 +146,7 @@ interface TimelineProps {
   isVisible?: boolean; // New prop to control visibility from parent
   isOpen?: boolean; // CMD+] toggle — controls slide in/out
   toolType?: 'claude' | 'gemini' | 'codex'; // Which AI tool this timeline is for
+  pinned?: boolean; // When true, expanded Timeline reserves layout width instead of overlaying terminal
 }
 
 interface CodexTimelineSessionMeta {
@@ -158,6 +159,32 @@ interface CodexTimelineSessionMeta {
 function sessionIdLooseMatch(left?: string, right?: string): boolean {
   if (!left || !right) return false;
   return left === right || left.startsWith(right) || right.startsWith(left);
+}
+
+function renderSingleStarHighlights(text: string): React.ReactNode[] {
+  const nodes: React.ReactNode[] = [];
+  let cursor = 0;
+  let key = 0;
+  while (cursor < text.length) {
+    const open = text.indexOf('*', cursor);
+    if (open < 0 || text[open - 1] === '*' || text[open + 1] === '*') {
+      nodes.push(text.slice(cursor));
+      break;
+    }
+    const close = text.indexOf('*', open + 1);
+    if (close < 0 || close === open + 1 || text[close - 1] === '*' || text[close + 1] === '*') {
+      nodes.push(text.slice(cursor));
+      break;
+    }
+    if (open > cursor) nodes.push(text.slice(cursor, open));
+    nodes.push(
+      <span key={`hl-${key++}`} style={{ color: '#38bdf8', fontWeight: 700 }}>
+        {text.slice(open + 1, close)}
+      </span>
+    );
+    cursor = close + 1;
+  }
+  return nodes;
 }
 
 function selectAutoTabTitlePrompt(
@@ -377,7 +404,7 @@ function perfAbsNow(): number {
 // ════════════════════════════════════════════════════════════
 // SECTION: COMPONENT SETUP — props, UIStore subscriptions, state, ref declarations
 // ════════════════════════════════════════════════════════════
-function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, isOpen = true, toolType = 'claude' }: TimelineProps) {
+function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, isOpen = true, toolType = 'claude', pinned = false }: TimelineProps) {
   const isGemini = toolType === 'gemini';
   const isCodex = toolType === 'codex';
   const usesTextSearchAnchors = isGemini || isCodex;
@@ -390,8 +417,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const generatePromptSummary = useTimelineSummaryStore(state => state.generateSummary);
   const refreshPromptSummariesForTab = useTimelineSummaryStore(state => state.refreshEntriesForTab);
   const promptSummaryGlobalAuto = useTimelineSummaryStore(state => state.globalAuto);
+  const promptSummaryGlobalAutoSince = useTimelineSummaryStore(state => state.globalAutoSince);
   const promptSummaryTabAuto = useTimelineSummaryStore(state => state.autoByTab[tabId] === true);
+  const promptSummaryTabAutoSince = useTimelineSummaryStore(state => state.autoSinceByTab[tabId] || 0);
   const promptSummaryAutoEnabled = promptSummaryGlobalAuto || promptSummaryTabAuto;
+  const promptSummaryAutoSince = (() => {
+    const candidates = [
+      promptSummaryGlobalAuto ? promptSummaryGlobalAutoSince : 0,
+      promptSummaryTabAuto ? promptSummaryTabAutoSince : 0,
+    ].filter((n) => Number.isFinite(n) && n > 0);
+    return candidates.length ? Math.min(...candidates) : 0;
+  })();
 
   // Slide animation (matches HistoryPanel pattern)
   const [slideIn, setSlideIn] = useState(isOpen);
@@ -864,11 +900,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const timelineWidth = useUIStore(state => state.timelineWidth);
   const setTimelineWidth = useUIStore(state => state.setTimelineWidth);
   const timelineFontSize = useUIStore(state => state.timelineFontSize);
+  const timelineSummaryFontSize = useUIStore(state => state.timelineSummaryFontSize);
   const timelineLineClamp = useUIStore(state => state.timelineLineClamp);
   // treeMode IS the expanded layout (chip + preview text). Old 160px tree-with-labels
   // visualisation is replaced. Width drag-resizable in expanded mode.
   const isExpandedLayout = treeMode;
   const effectiveWidth = treeMode ? timelineWidth : 32;
+  const intrinsicPreviewFontSize = Math.max(timelineFontSize, timelineSummaryFontSize);
   // Measured CSS `right:` value (px) that anchors popups to Timeline's left edge.
   // Computed from real DOM rect — robust to HistoryPanel open/close, treeMode, window resize.
   // Previously hardcoded as `notesPanelWidth + (treeMode ? 160 : 32) - 8` — incorrectly subtracted
@@ -1525,6 +1563,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     if (!promptSummaryLoadedSessionKeys.has(`${summaryToolType}:${sessionId}`)) return;
     for (const entry of entries) {
       if (!entry.uuid || !isEligibleTabTitleEntry(entry)) continue;
+      const entryAt = Date.parse(entry.timestamp || '');
+      if (promptSummaryAutoSince > 0 && (!Number.isFinite(entryAt) || entryAt < promptSummaryAutoSince - 1000)) continue;
       void generatePromptSummary({
         tabId,
         toolType: summaryToolType,
@@ -1532,7 +1572,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         entry,
       });
     }
-  }, [entries, promptSummaryAutoEnabled, promptSummaryLoadedSessionKeys, summaryToolType, sessionId, tabId, generatePromptSummary]);
+  }, [entries, promptSummaryAutoEnabled, promptSummaryAutoSince, promptSummaryLoadedSessionKeys, summaryToolType, sessionId, tabId, generatePromptSummary]);
 
   // Tab switch: save editRangeState (ready/done only), reset everything else.
   // What's saved: editRangeState when phase=ready or done (user has Gemini response in panel).
@@ -3493,12 +3533,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   return (
     <>
-      {/* ──── OUTER SLOT — reserves 32px in the Workspace flex row regardless of
-            expanded state. In expanded mode the real container overflows LEFT as
-            absolute overlay, so chat/terminal width never changes. ──── */}
+      {/* ──── OUTER SLOT — unpinned expanded mode reserves only the 32px rail and
+            overlays left; pinned mode reserves the full expanded width. ──── */}
       <div
         style={{
-          width: slideIn ? '32px' : '0px',
+          width: slideIn ? (pinned ? `${effectiveWidth}px` : '32px') : '0px',
           height: '100%',
           flexShrink: 0,
           position: 'relative',
@@ -3519,10 +3558,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           zIndex: 40,
           visibility: isVisible ? 'inherit' : 'hidden',
           overflow: slideIn ? 'visible' : 'hidden',
-          // Expanded layout overlays content from the right without resizing chat.
-          position: isExpandedLayout ? 'absolute' : 'static',
-          top: isExpandedLayout ? 0 : undefined,
-          right: isExpandedLayout ? 0 : undefined,
+          // Expanded layout overlays content from the right unless StatusBar pin
+          // asks Timeline to participate in normal flex layout.
+          position: isExpandedLayout && !pinned ? 'absolute' : 'static',
+          top: isExpandedLayout && !pinned ? 0 : undefined,
+          right: isExpandedLayout && !pinned ? 0 : undefined,
           // Font-size root for em-based descendants (chip + preview text).
           fontSize: `${timelineFontSize}px`,
           transition: 'width 50ms ease-out',
@@ -3914,7 +3954,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     // intrinsic-size hint ≈ lineHeight(1.3) * lines * fontSize + vertical padding 12.
                     contentVisibility: isExpandedLayout ? 'auto' : undefined,
                     containIntrinsicSize: isExpandedLayout
-                      ? `auto ${Math.round(timelineFontSize * 1.3 * timelineLineClamp + 12)}px`
+                      ? `auto ${Math.round(intrinsicPreviewFontSize * 1.3 * timelineLineClamp + 12)}px`
                       : undefined,
                     backgroundColor: active
                       ? 'rgba(59, 130, 246, 0.15)'
@@ -3993,12 +4033,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     let previewText = (isCompacted ? 'Conversation compacted' : (entry.content || '')).trim();
                     let previewColor = 'rgba(255, 255, 255, 0.85)';
                     let previewStyle: React.CSSProperties = {};
+                    let isSummaryPreview = false;
                     if (!isCompacted && summaryToolType && sessionId && isEligibleTabTitleEntry(entry)) {
                       const key = timelineSummaryKey(summaryToolType, sessionId, entry.uuid);
                       const row = promptSummaries[key];
                       if (row?.summary) {
                         previewText = row.summary.trim();
                         previewColor = 'rgba(191, 219, 254, 0.92)';
+                        isSummaryPreview = true;
                       } else if (promptSummaryLoadingKeys.has(key)) {
                         previewText = 'summarizing prompt...';
                         previewColor = 'rgba(125, 211, 252, 0.88)';
@@ -4017,7 +4059,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       <div
                         className="flex-1 min-w-0 pointer-events-none"
                         style={{
-                          fontSize: '1em',
+                          fontSize: isSummaryPreview ? `${timelineSummaryFontSize}px` : '1em',
                           lineHeight: 1.3,
                           color: previewColor,
                           display: '-webkit-box',
@@ -4029,7 +4071,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         }}
                         title={!isCompacted && previewText !== (entry.content || '').trim() ? (entry.content || '') : undefined}
                       >
-                        {previewText}
+                        {isSummaryPreview ? renderSingleStarHighlights(previewText) : previewText}
                       </div>
                     );
                   })()}

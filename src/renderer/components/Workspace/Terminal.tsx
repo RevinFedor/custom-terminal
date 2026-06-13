@@ -607,8 +607,9 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
   const historyPanelOpen = useUIStore((state) => state.historyPanelOpenTabs[tabId] ?? false);
   const timelineTreeMode = useUIStore((state) => state.timelineTreeModeTabs[tabId] ?? false);
   const timelineWidth = useUIStore((state) => state.timelineWidth);
+  const timelinePinned = useUIStore((state) => state.timelinePinned);
   const promptQueueRightInset =
-    timelineTreeMode && !historyPanelOpen
+    timelineTreeMode && !historyPanelOpen && !timelinePinned
       ? Math.max(0, timelineWidth - TIMELINE_COLLAPSED_SLOT_WIDTH)
       : 0;
   const workspaceView = useWorkspaceStore((state) => state.view);

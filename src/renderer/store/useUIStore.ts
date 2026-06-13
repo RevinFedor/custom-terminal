@@ -286,6 +286,7 @@ interface UIStore {
   promptPickerLeftOffsetPx: number;   // 0 — центр или прижатие к правому. >0 — прижатие к левому краю.
   promptPickerRightOffsetPx: number;  // 0 — центр или прижатие к левому. >0 — приоритет: прижатие к правому краю.
   timelineFontSize: number;    // Timeline entries preview text
+  timelineSummaryFontSize: number; // Generated user-prompt summaries in expanded Timeline
   timelineWidth: number;       // Timeline width (px) when expanded (treeMode). Drag-resizable.
   timelineLineClamp: number;   // How many lines of preview text show in expanded mode.
   promptQueueChipLineClamp: number; // How many lines of chip text show inside Run After overlay (1 = single-line ellipsis).
@@ -309,6 +310,7 @@ interface UIStore {
   setPromptPickerRightOffsetPx: (px: number) => void;
 
   setTimelineFontSize: (size: number) => void;
+  setTimelineSummaryFontSize: (size: number) => void;
   setTimelineWidth: (width: number) => void;
   setTimelineLineClamp: (lines: number) => void;
   setPromptQueueChipLineClamp: (lines: number) => void;
@@ -541,6 +543,8 @@ interface UIStore {
   // after pointer leaves so user can inspect their inner DOM in devtools.
   freezeCmdPopups: boolean;
   setFreezeCmdPopups: (v: boolean) => void;
+  timelinePinned: boolean;
+  setTimelinePinned: (v: boolean) => void;
 
   // Free-ports toggle. When ON, every npm-script start / restart / stop from a
   // devServer-tab first calls `system:free-project-ports` for the tab's cwd —
@@ -938,6 +942,14 @@ const loadTimelineFontSize = (): number => {
   return 12;
 };
 
+const loadTimelineSummaryFontSize = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-timeline-summary-font-size');
+    if (v) return Math.max(10, Math.min(22, Number(v) || 13));
+  } catch {}
+  return 13;
+};
+
 // Width applied when treeMode is on (expanded layout with chip + preview).
 // Drag-resizable via handle on Timeline's left edge.
 const loadTimelineWidth = (): number => {
@@ -1160,6 +1172,35 @@ const initialFreezeCmdPopups = loadFreezeCmdPopups();
       if (useUIStore.getState().freezeCmdPopups !== bool) {
         useUIStore.setState({ freezeCmdPopups: bool });
         try { localStorage.setItem('noted-terminal-freeze-cmd-popups', String(bool)); } catch {}
+      }
+    }
+  } catch {}
+})();
+
+// timelinePinned — global layout mode: expanded Timeline and HistoryPanel
+// reserve real horizontal space instead of overlaying the terminal.
+const APP_STATE_KEY_TIMELINE_PINNED = 'timelinePinned';
+const loadTimelinePinned = (): boolean => {
+  try { return localStorage.getItem('noted-terminal-timeline-pinned') === 'true'; }
+  catch { return false; }
+};
+const saveTimelinePinned = (v: boolean) => {
+  try { localStorage.setItem('noted-terminal-timeline-pinned', String(v)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_TIMELINE_PINNED, value: v }).catch(() => {});
+  } catch {}
+};
+const initialTimelinePinned = loadTimelinePinned();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_TIMELINE_PINNED);
+    if (v !== null && v !== undefined) {
+      const bool = parsePersistedBool(v);
+      if (useUIStore.getState().timelinePinned !== bool) {
+        useUIStore.setState({ timelinePinned: bool });
+        try { localStorage.setItem('noted-terminal-timeline-pinned', String(bool)); } catch {}
       }
     }
   } catch {}
@@ -1643,6 +1684,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
   promptPickerLeftOffsetPx: loadPromptPickerLeftOffsetPx(),
   promptPickerRightOffsetPx: loadPromptPickerRightOffsetPx(),
   timelineFontSize: loadTimelineFontSize(),
+  timelineSummaryFontSize: loadTimelineSummaryFontSize(),
   timelineWidth: loadTimelineWidth(),
   timelineLineClamp: loadTimelineLineClamp(),
   promptQueueChipLineClamp: loadPromptQueueChipLineClamp(),
@@ -1693,6 +1735,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(10, Math.min(18, size));
     set({ timelineFontSize: clamped });
     try { localStorage.setItem('noted-terminal-timeline-font-size', String(clamped)); } catch {}
+  },
+
+  setTimelineSummaryFontSize: (size: number) => {
+    const clamped = Math.max(10, Math.min(22, size));
+    set({ timelineSummaryFontSize: clamped });
+    try { localStorage.setItem('noted-terminal-timeline-summary-font-size', String(clamped)); } catch {}
   },
 
   setTimelineWidth: (width: number) => {
@@ -2193,6 +2241,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setDebugHoverBridges: (v) => { set({ debugHoverBridges: v }); saveDebugHoverBridges(v); },
   freezeCmdPopups: initialFreezeCmdPopups,
   setFreezeCmdPopups: (v) => { set({ freezeCmdPopups: v }); saveFreezeCmdPopups(v); },
+  timelinePinned: initialTimelinePinned,
+  setTimelinePinned: (v) => { set({ timelinePinned: v }); saveTimelinePinned(v); },
 
   freePortsBeforeStart: initialFreePortsBeforeStart,
   setFreePortsBeforeStart: (v) => { set({ freePortsBeforeStart: v }); saveFreePortsBeforeStart(v); },
