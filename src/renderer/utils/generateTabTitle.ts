@@ -76,6 +76,41 @@ function sanitizeGeneratedTabTitle(raw: string): string {
   return clean;
 }
 
+function normalizeSingleStarEmphasis(text: string): string {
+  let clean = String(text || '').replace(/\*\*([^*]+)\*\*/g, '*$1*');
+  let out = '';
+  let inAccent = false;
+  let closedPairs = 0;
+
+  for (let i = 0; i < clean.length; i++) {
+    const ch = clean[i];
+    if (ch !== '*') {
+      out += ch;
+      continue;
+    }
+
+    const prev = clean[i - 1];
+    const next = clean[i + 1];
+    if (prev === '*' || next === '*') {
+      continue;
+    }
+
+    if (!inAccent && closedPairs >= 2) {
+      continue;
+    }
+
+    inAccent = !inAccent;
+    if (!inAccent) closedPairs += 1;
+    out += '*';
+  }
+
+  if (inAccent) {
+    out = out.replace(/\*([^*]*)$/, '$1');
+  }
+
+  return out.replace(/\s+/g, ' ').trim();
+}
+
 function sanitizeGeneratedPromptSummary(raw: string): string {
   let clean = String(raw || '')
     .replace(/```[\s\S]*?```/g, '')
@@ -89,7 +124,7 @@ function sanitizeGeneratedPromptSummary(raw: string): string {
   if (chars.length > 70) {
     clean = chars.slice(0, 70).join('').trim();
   }
-  return clean;
+  return normalizeSingleStarEmphasis(clean);
 }
 
 async function buildSystemPrompt(promptConfig: AIPrompt | undefined, fallbackPrompt: string, logPrefix: string): Promise<string> {

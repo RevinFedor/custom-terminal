@@ -91,6 +91,14 @@ add-zsh-hook precmd __custom_precmd
 - **Invisible Intent:** Колоризация использует посимвольный парсинг для обнаружения и пропуска **OSC-последовательностей** (например, OSC 8 гиперссылок от Claude Code). Вставка ANSI-кодов внутрь OSC ломает парсинг в xterm.js, из-за чего скрытые URL становятся видимыми.
 - **Подробнее:** См. [`fix-claude-visual-glitches.md`](fix-claude-visual-glitches.md).
 
+## Terminal links: xterm linkHandler + WebLinksAddon
+
+HTTP(S)-ссылки в терминале должны открываться одним кликом без browser-style confirm. Живой симптом: клик по `https://x.com/...` показывал xterm-диалог `WARNING: This link could potentially be dangerous`, а после `OK` ничего не открывалось в системном Яндекс.Браузере. Это не политика приложения, а default behavior xterm.js core link provider'а: если не задать `linkHandler`, xterm сам показывает blocking confirm для ссылок, особенно для OSC 8 / link-provider путей.
+
+`WebLinksAddon` сам по себе недостаточен. Он ловит plain-text URL detection, но не является единственным источником links в xterm: OSC 8 hyperlinks и internal link providers идут через core `linkHandler`. Поэтому оба `new XTerminal(...)` пути в `Terminal.tsx` (normal init и lazy reattach) обязаны передавать `linkHandler.activate`, а `WebLinksAddon` должен звать тот же shared handler. Иначе один lifecycle terminal'а работает правильно, второй возвращает default confirm.
+
+Контракт активации: handler всегда делает `preventDefault()` + `stopPropagation()`. Для `http://`/`https://` сначала вызывается контекстный `onLinkClick` (BrowserTab открывает URL во встроенном webview и переключает view), иначе `shell.openExternal(uri)` передаёт ссылку OS default browser. `allowNonHttpProtocols:false` оставляет нестандартные протоколы неактивными на уровне xterm; локальные file-like пути (`/Users/...`, `./...`, `../...`) идут отдельным preview-path и не должны случайно стать external navigation. UX-принцип — `methodology/переносимый-дизайн.md::Недеструктивная внешняя навигация выполняется сразу`.
+
 ## 2. Синхронизация выделения (terminalSelection)
 Для того чтобы кнопки "Research Selection" могли мгновенно реагировать на наличие выделенного текста (становиться активными), используется гибридный подход:
 1.  **Событие `onSelectionChange`:** Терминал слушает изменения выделения.

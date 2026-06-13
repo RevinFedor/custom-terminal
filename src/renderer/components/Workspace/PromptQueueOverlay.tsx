@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { ChevronLeft, Plus, Trash2 } from 'lucide-react';
+import { ChevronLeft, History, PanelRightClose, PanelRightOpen, Plus, Trash2 } from 'lucide-react';
 import { makeDefaultPromptTitle, usePromptQueueStore, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -76,7 +76,7 @@ const EDITOR_TEXTAREA_MIN_HEIGHT = 64;
 const EDITOR_MIN_WIDTH = 280;
 const EDITOR_MIN_HEIGHT = 96;
 const EDITOR_MAX_WIDTH = 760;
-const COLLAPSED_RAIL_WIDTH = 36;
+const COLLAPSED_RAIL_WIDTH = 68;
 const COLLAPSED_RAIL_GAP = 4;
 const PANEL_SLIDE_MS = 100;
 
@@ -246,6 +246,11 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   // for 60fps without store churn) and commit to the store on mouse-up.
   const promptQueueWidth = useUIStore((s) => s.promptQueueWidth);
   const setPromptQueueWidth = useUIStore((s) => s.setPromptQueueWidth);
+  const historyPanelOpen = useUIStore((s) => s.historyPanelOpenTabs[tabId] ?? false);
+  const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
+  const timelineTreeMode = useUIStore((s) => s.timelineTreeModeTabs[tabId] ?? false);
+  const setTimelineTreeMode = useUIStore((s) => s.setTimelineTreeMode);
+  const timelinePinned = useUIStore((s) => s.timelinePinned);
   const [dragWidth, setDragWidth] = useState<number | null>(null);
   const effectiveWidth = dragWidth ?? promptQueueWidth;
 
@@ -889,6 +894,18 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       setTimeout(() => setArmedFlash(false), 600);
     }
   }, [autoRun, tabId, setAutoRun]);
+
+  const toggleHistoryPanel = useCallback(() => {
+    const nextOpen = !historyPanelOpen;
+    if (nextOpen && !timelinePinned) setTimelineTreeMode(tabId, false);
+    setHistoryPanelOpen(tabId, nextOpen);
+  }, [historyPanelOpen, tabId, timelinePinned, setHistoryPanelOpen, setTimelineTreeMode]);
+
+  const toggleTimelineTree = useCallback(() => {
+    const nextOpen = !timelineTreeMode;
+    if (nextOpen && !timelinePinned) setHistoryPanelOpen(tabId, false);
+    setTimelineTreeMode(tabId, nextOpen);
+  }, [timelineTreeMode, tabId, timelinePinned, setHistoryPanelOpen, setTimelineTreeMode]);
 
   const expandPanel = useCallback(() => {
     if (collapseTimerRef.current !== null) {
@@ -1574,7 +1591,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
             width: COLLAPSED_RAIL_WIDTH,
             position: 'relative',
             zIndex: 2,
-            padding: '4px 3px',
+            padding: '4px 2px',
             boxSizing: 'border-box',
             display: 'flex',
             flexDirection: 'column',
@@ -1583,6 +1600,26 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
             flexShrink: 0,
           }}
         >
+          <div className="pq-rail-top-row">
+            <button
+              className={`pq-rail-button pq-rail-meta${timelineTreeMode ? ' pq-rail-active' : ''}`}
+              onClick={toggleTimelineTree}
+              title="Timeline (Cmd+])"
+              aria-label="Toggle Timeline"
+            >
+              {timelineTreeMode
+                ? <PanelRightClose size={17} strokeWidth={2.1} />
+                : <PanelRightOpen size={17} strokeWidth={2.1} />}
+            </button>
+            <button
+              className={`pq-rail-button pq-rail-meta${historyPanelOpen ? ' pq-rail-active' : ''}`}
+              onClick={toggleHistoryPanel}
+              title="History (Cmd+\\)"
+              aria-label="Toggle History"
+            >
+              <History size={17} strokeWidth={2.1} />
+            </button>
+          </div>
           <button
             className="pq-rail-button"
             onClick={() => {
@@ -1834,6 +1871,13 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
         .pq-rail-chevron {
           transition: transform ${PANEL_SLIDE_MS}ms ease-in-out;
         }
+        .pq-rail-top-row {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 4px;
+          width: 100%;
+        }
         .pq-rail-button {
           border: 1px solid #8a4a37;
           background: #2a1a14;
@@ -1854,12 +1898,37 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
           padding: 0;
           line-height: 1;
           appearance: none;
-          transition: background 0.12s, border-color 0.12s, color 0.12s;
+          transition: background 0.12s, border-color 0.12s, color 0.12s, transform 0.08s;
+        }
+        .pq-rail-meta {
+          background: #242424;
+          border-color: #4a4a4a;
+          color: #d6d6d6;
+        }
+        .pq-rail-button.pq-rail-active {
+          background: #2b2340;
+          border-color: #8b75d9;
+          color: #c4b5fd;
         }
         .pq-rail-button:hover {
           background: #3a241b;
           border-color: ${TINT};
           color: #f3d0c2;
+        }
+        .pq-rail-button.pq-rail-active:hover {
+          background: #342a52;
+          border-color: #a78bfa;
+          color: #ddd6fe;
+        }
+        .pq-rail-button:focus {
+          outline: none;
+        }
+        .pq-rail-button:focus-visible {
+          outline: none;
+          box-shadow: 0 0 0 2px rgba(231, 106, 75, 0.38);
+        }
+        .pq-rail-button:active {
+          transform: translateY(1px);
         }
         .pq-rail-primary {
           background: #3a2018;
