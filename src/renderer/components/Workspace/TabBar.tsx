@@ -123,6 +123,12 @@ type VerticalDragGeometry = {
   list: RectSnap;
   rows: Array<VerticalDragTabRow | VerticalDragGroupRow>;
 };
+type VerticalRowFlipRect = {
+  top: number;
+  left: number;
+  width: number;
+  height: number;
+};
 
 const snapRect = (el: Element): RectSnap => {
   const r = el.getBoundingClientRect();
@@ -1889,6 +1895,9 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const [dragPreview, setDragPreview] = useState<DragPreviewLayout | null>(null);
   const dragPreviewKeyRef = useRef<string>('');
   const verticalDragGeometryRef = useRef<VerticalDragGeometry | null>(null);
+  const verticalMainListRef = useRef<HTMLDivElement>(null);
+  const verticalRowFlipRectsRef = useRef<Map<string, VerticalRowFlipRect>>(new Map());
+  const verticalRowAnimationsRef = useRef<Map<string, Animation>>(new Map());
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
   const [titleRefreshInFlight, setTitleRefreshInFlight] = useState<Set<string>>(new Set());
   const tabTitleNamingIds = useWorkspaceStore((state) => state.tabTitleNamingIds);
@@ -2696,6 +2705,95 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     }
   }, [contextMenu, groupContextMenu, contextScripts.length]);
 
+  useLayoutEffect(() => {
+    if (!isVerticalLayout) {
+      verticalRowFlipRectsRef.current.clear();
+      for (const animation of verticalRowAnimationsRef.current.values()) animation.cancel();
+      verticalRowAnimationsRef.current.clear();
+      return;
+    }
+
+    const list = verticalMainListRef.current;
+    if (!list) {
+      verticalRowFlipRectsRef.current.clear();
+      return;
+    }
+
+    const listRect = list.getBoundingClientRect();
+    const nextRects = new Map<string, VerticalRowFlipRect>();
+    const rows = Array.from(list.children)
+      .filter((child): child is HTMLElement => child instanceof HTMLElement && !!child.dataset.verticalRowKey);
+
+    for (const row of rows) {
+      const key = row.dataset.verticalRowKey;
+      if (!key) continue;
+      const rect = row.getBoundingClientRect();
+      nextRects.set(key, {
+        top: rect.top - listRect.top,
+        left: rect.left - listRect.left,
+        width: rect.width,
+        height: rect.height,
+      });
+    }
+
+    const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    if (!reduceMotion) {
+      for (const row of rows) {
+        const key = row.dataset.verticalRowKey;
+        if (!key) continue;
+        const prev = verticalRowFlipRectsRef.current.get(key);
+        const next = nextRects.get(key);
+        if (!prev || !next) continue;
+
+        const dx = prev.left - next.left;
+        const dy = prev.top - next.top;
+        if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) continue;
+
+        const previousAnimation = verticalRowAnimationsRef.current.get(key);
+        previousAnimation?.cancel();
+
+        row.style.willChange = 'transform';
+        const animation = row.animate(
+          [
+            { transform: `translate3d(${dx}px, ${dy}px, 0)` },
+            { transform: 'translate3d(0, 0, 0)' },
+          ],
+          {
+            duration: dragPreview ? 118 : 145,
+            easing: 'cubic-bezier(0.16, 1, 0.3, 1)',
+          }
+        );
+        verticalRowAnimationsRef.current.set(key, animation);
+        animation.onfinish = () => {
+          if (verticalRowAnimationsRef.current.get(key) !== animation) return;
+          row.style.willChange = '';
+          verticalRowAnimationsRef.current.delete(key);
+        };
+        animation.oncancel = () => {
+          if (verticalRowAnimationsRef.current.get(key) !== animation) return;
+          row.style.willChange = '';
+          verticalRowAnimationsRef.current.delete(key);
+        };
+      }
+    }
+
+    for (const key of Array.from(verticalRowAnimationsRef.current.keys())) {
+      if (nextRects.has(key)) continue;
+      verticalRowAnimationsRef.current.get(key)?.cancel();
+      verticalRowAnimationsRef.current.delete(key);
+    }
+
+    verticalRowFlipRectsRef.current = nextRects;
+  });
+
+  useEffect(() => {
+    return () => {
+      for (const animation of verticalRowAnimationsRef.current.values()) animation.cancel();
+      verticalRowAnimationsRef.current.clear();
+      verticalRowFlipRectsRef.current.clear();
+    };
+  }, []);
+
   if (!workspace || !project) return null;
 
   const allTabs = Array.from(workspace.tabs.values());
@@ -3439,7 +3537,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             }}
           />
         ) : (
-          <div data-vertical-main-list className="flex flex-col" style={{ gap: `${tabSidebarGap}px`, padding: `${tabSidebarGap}px` }}>
+          <div
+            ref={verticalMainListRef}
+            data-vertical-main-list
+            className="flex flex-col"
+            style={{ gap: `${tabSidebarGap}px`, padding: `${tabSidebarGap}px` }}
+          >
             {verticalRows.map((row) => {
               const renderTab = (tab: TabData, groupId?: string, groupIndex?: number) => {
                 const index = mainTabsForDisplay.findIndex(t => t.id === tab.id);
@@ -3569,7 +3672,13 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
               if (row.type === 'tab') {
                 return (
-                  <div key={row.tab.id} data-vertical-row data-row-type="tab" data-tab-id={row.tab.id}>
+                  <div
+                    key={row.tab.id}
+                    data-vertical-row
+                    data-vertical-row-key={`tab:${row.tab.id}`}
+                    data-row-type="tab"
+                    data-tab-id={row.tab.id}
+                  >
                     {renderTab(row.tab)}
                   </div>
                 );
@@ -3578,6 +3687,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 <div
                   key={row.group.id}
                   data-vertical-row
+                  data-vertical-row-key={`group:${row.group.id}`}
                   data-row-type="group"
                   data-group-id={row.group.id}
                   data-group-collapsed={row.group.collapsed ? 'true' : 'false'}

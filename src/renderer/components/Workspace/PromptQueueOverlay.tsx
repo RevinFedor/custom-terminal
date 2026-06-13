@@ -302,6 +302,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   const [replayingIds, setReplayingIds] = useState<Set<string>>(new Set());
   const replayingIdsRef = useRef<Set<string>>(new Set());
   const [replayHoverId, setReplayHoverId] = useState<string | null>(null);
+  const [railRunHover, setRailRunHover] = useState(false);
   const [cmdPressed, setCmdPressed] = useState(false);
   const cmdPressedRef = useRef(false);
   const [panelClosing, setPanelClosing] = useState(false);
@@ -946,6 +947,20 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   const panelOpen = !collapsed || panelClosing;
   const arrowExpanded = !collapsed && !panelClosing;
   const addEditorActive = editorOpen && !isPostPromptMode && editingId === null;
+  const railRunBg = autoRun
+    ? (railRunHover ? '#342a52' : '#2b2340')
+    : firstChipArmedHint
+      ? (railRunHover ? 'rgba(127, 29, 29, 0.22)' : HINT_RED_BG)
+      : items.length
+        ? (railRunHover ? '#303030' : '#242424')
+        : (railRunHover ? '#3a241b' : '#2a1a14');
+  const railRunBorder = autoRun
+    ? (railRunHover ? '#a78bfa' : '#8b75d9')
+    : firstChipArmedHint
+      ? (railRunHover ? 'rgba(239, 68, 68, 0.48)' : HINT_RED_BORDER)
+      : items.length
+        ? (railRunHover ? '#666' : '#4a4a4a')
+        : (railRunHover ? TINT : '#8a4a37');
 
   // ─── render ──────────────────────────────────────────────────────────────
   return (
@@ -1589,16 +1604,19 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
           </button>
           <button
             className="pq-rail-button"
+            onClick={toggleAutoRun}
+            onMouseEnter={() => setRailRunHover(true)}
+            onMouseLeave={() => setRailRunHover(false)}
             title={(autoRun ? 'Run after on' : 'Run after off') + ' · ' + items.length + ' queued'}
             aria-label={(autoRun ? 'Run after on' : 'Run after off') + ', ' + items.length + ' queued'}
             style={{
               position: 'relative',
-              background: autoRun ? '#2b2340' : (firstChipArmedHint ? HINT_RED_BG : (items.length ? '#242424' : '#2a1a14')),
-              borderColor: autoRun ? '#8b75d9' : (firstChipArmedHint ? HINT_RED_BORDER : (items.length ? '#4a4a4a' : '#8a4a37')),
+              background: railRunBg,
+              borderColor: railRunBorder,
               color: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED_TEXT : (items.length ? '#e5e5e5' : TINT)),
               fontSize: items.length > 0 ? 12 : 18,
               fontWeight: items.length > 0 ? 700 : 500,
-              cursor: 'default',
+              cursor: 'pointer',
               lineHeight: 1,
             }}
           >

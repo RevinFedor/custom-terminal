@@ -1264,6 +1264,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const promptPickerRightOffsetPx = useUIStore((s) => s.promptPickerRightOffsetPx);
   const setPromptPickerRightOffsetPx = useUIStore((s) => s.setPromptPickerRightOffsetPx);
   const timelineFontSize = useUIStore((s) => s.timelineFontSize);
+  const timelineSummaryFontSize = useUIStore((s) => s.timelineSummaryFontSize);
   const timelineLineClamp = useUIStore((s) => s.timelineLineClamp);
   const setTimelineLineClamp = useUIStore((s) => s.setTimelineLineClamp);
   const promptQueueChipLineClamp = useUIStore((s) => s.promptQueueChipLineClamp);
@@ -1276,6 +1277,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setSidebarFontSize = useUIStore((s) => s.setSidebarFontSize);
   const setFilePreviewFontSize = useUIStore((s) => s.setFilePreviewFontSize);
   const setTimelineFontSize = useUIStore((s) => s.setTimelineFontSize);
+  const setTimelineSummaryFontSize = useUIStore((s) => s.setTimelineSummaryFontSize);
   // Заметки вкладки — три независимых шрифта (сайдбар / раскрытый / превью)
   // + общие padding'и + cap'ы превью (max width/height попавапа CMD+hover).
   const notesSidebarFontSize = useUIStore((s) => s.notesSidebarFontSize);
@@ -3081,6 +3083,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               <SettingsSubSectionHeader title="Таймлайн" />
               <SettingsGrid4>
                 <FontSizeSlider label="Шрифт" value={timelineFontSize} onChange={setTimelineFontSize} min={10} max={18} />
+                <FontSizeSlider label="Шрифт пересказа" value={timelineSummaryFontSize} onChange={setTimelineSummaryFontSize} min={10} max={22} />
                 <FontSizeSlider label="Строки" value={timelineLineClamp} onChange={setTimelineLineClamp} min={1} max={10} suffix="" />
               </SettingsGrid4>
 

@@ -7,7 +7,16 @@ VSCode-style полоса по всей нижней границе окна (п
 - редко используются — не хочется отдавать им место в InfoPanel/TabBar;
 - должны быть всегда видны (debug-флаги, default-настройки).
 
-## Что живёт сейчас (правая зона)
+## Что живёт сейчас
+
+### Левая зона
+
+| Элемент | Назначение | Persistence |
+|---|---|---|
+| `MCP` chip | Последние mutating-вызовы Terminal MCP: запуск/stop/prompt/команда/chain. Клик раскрывает события и может вернуть пользователя в target project/tab. | renderer-session, не persist |
+| `WebServerChip` | LAN IP мобильного web-сервера | derived, не persist |
+
+### Правая зона
 
 | Элемент | Назначение | Persistence |
 |---|---|---|
@@ -21,9 +30,13 @@ VSCode-style полоса по всей нижней границе окна (п
 | `● freeze tooltips` toggle | Cmd-popup'ы Timeline (tooltip / note / fork) не закрываются по Cmd-release / mouseleave — для инспекции DOM в DevTools | SQLite `app:setState(freezeCmdPopups)` + localStorage boot mirror |
 | `⚙` Settings button | Открывает `SettingsModal` | — |
 
-Левая зона зарезервирована под будущие git/branch/lints/etc — пока живёт только `WebServerChip` (LAN IP мобильного web-сервера).
-
 **Чип лимитов Claude — не здесь.** Weekly% Anthropic подписки и per-tab token-cost живут в [`ProjectToolbar`](../../src/renderer/components/Workspace/ProjectToolbar.tsx), не в StatusBar. Причина: chip session-aware (читает `getEffectiveTabId` и активный проект), а status bar — глобальные toggle'ы без привязки к табу. См. [`fact-claude-usage-chip.md`](fact-claude-usage-chip.md).
+
+## MCP Activity chip
+
+`MCP` — постоянная статусная поверхность для внешних или межвкладочных Terminal MCP действий. Это не toast: запрос может быть долгим, прийти из Codex/Claude/локальной нейронки вне текущей вкладки и требовать возврата к owner'у. Чип хранит короткий список последних событий текущей renderer-сессии, показывает источник (`sourceMeta`), цель (project/tab), действие и результат. Клик по событию с target tab фокусирует нужный проект и вкладку через гранулярные методы `useWorkspaceStore`, без подписки на весь `openProjects` Map.
+
+Показываются только действия с побочным эффектом: `start_ai`, `send_prompt`, `stop_ai`, `run_command`, `restart_process`, `run_chain`, `create_tab`, `kill_process`. `list_tabs` и `read_output` скрыты специально — агент может часто инспектировать состояние, и такой read-loop не должен выглядеть для пользователя как активная работа над вкладкой.
 
 ## Model/Effort selector: tri-mode trigger
 

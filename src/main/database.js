@@ -1398,7 +1398,7 @@ class DatabaseManager {
       {
         id: 'prompt-summary',
         name: 'Prompt Summary',
-        content: 'Перескажи пользовательское сообщение для строки таймлайна. Верни только краткий пересказ до 70 символов: без кавычек, без markdown, без точки в конце, без пояснений. Сохрани язык исходного сообщения.',
+        content: 'Перескажи пользовательское сообщение для строки таймлайна. Верни только краткий пересказ до 70 символов: без кавычек, без точки в конце, без пояснений. Сохрани язык исходного сообщения. Одно главное ключевое слово или короткую ключевую фразу оберни одинарными звездочками, например *fork*.',
         model: 'gemini-3.1-flash-lite',
         thinking_level: 'NONE',
         color: '#38bdf8',
@@ -1507,7 +1507,9 @@ class DatabaseManager {
   // Ensure built-in prompt for Timeline user-message summaries exists.
   // Names/content/model stay user-editable; only missing row is inserted.
   ensurePromptSummaryPrompt() {
-    const exists = this.db.prepare('SELECT id FROM ai_prompts WHERE id = ?').get('prompt-summary');
+    const oldDefault = 'Перескажи пользовательское сообщение для строки таймлайна. Верни только краткий пересказ до 70 символов: без кавычек, без markdown, без точки в конце, без пояснений. Сохрани язык исходного сообщения.';
+    const nextDefault = 'Перескажи пользовательское сообщение для строки таймлайна. Верни только краткий пересказ до 70 символов: без кавычек, без точки в конце, без пояснений. Сохрани язык исходного сообщения. Одно главное ключевое слово или короткую ключевую фразу оберни одинарными звездочками, например *fork*.';
+    const exists = this.db.prepare('SELECT id, content FROM ai_prompts WHERE id = ?').get('prompt-summary');
     if (!exists) {
       this.db.prepare(`
         INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position)
@@ -1515,7 +1517,7 @@ class DatabaseManager {
       `).run(
         'prompt-summary',
         'Prompt Summary',
-        'Перескажи пользовательское сообщение для строки таймлайна. Верни только краткий пересказ до 70 символов: без кавычек, без markdown, без точки в конце, без пояснений. Сохрани язык исходного сообщения.',
+        nextDefault,
         'gemini-3.1-flash-lite',
         'NONE',
         '#38bdf8',
@@ -1524,6 +1526,9 @@ class DatabaseManager {
         7
       );
       console.log('[DB] Migrated: added prompt-summary prompt');
+    } else if (exists.content === oldDefault) {
+      this.db.prepare('UPDATE ai_prompts SET content = ? WHERE id = ? AND is_built_in = 1').run(nextDefault, 'prompt-summary');
+      console.log('[DB] Migrated: updated prompt-summary prompt content');
     }
   }
 

@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { PROMPT_SUMMARY_PROMPT_ID, usePromptsStore } from './usePromptsStore';
-import { generateTimelinePromptSummaryFromPrompt, isEligibleTabTitleEntry, trimTabTitlePrompt, type TabTitleSourceEntry } from '../utils/generateTabTitle';
+import { generateTimelinePromptSummaryFromPrompt, isEligibleTabTitleEntry, trimTimelinePromptSummarySource, type TabTitleSourceEntry } from '../utils/generateTabTitle';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -38,7 +38,13 @@ export interface TimelineSummaryBatchProgress {
 }
 
 const GLOBAL_AUTO_KEY = 'noted-terminal-timeline-summary-global-auto';
+const GLOBAL_AUTO_SINCE_KEY = 'noted-terminal-timeline-summary-global-auto-since';
 const TAB_AUTO_KEY = 'noted-terminal-timeline-summary-auto-tabs';
+const TAB_AUTO_SINCE_KEY = 'noted-terminal-timeline-summary-auto-since-tabs';
+const APP_STATE_GLOBAL_AUTO_KEY = 'timelineSummaryGlobalAuto';
+const APP_STATE_GLOBAL_AUTO_SINCE_KEY = 'timelineSummaryGlobalAutoSince';
+const APP_STATE_TAB_AUTO_KEY = 'timelineSummaryAutoTabs';
+const APP_STATE_TAB_AUTO_SINCE_KEY = 'timelineSummaryAutoSinceTabs';
 
 export function timelineSummaryKey(toolType: TimelineSummaryTool, sessionId: string, entryUuid: string): string {
   return `${toolType}:${sessionId}:${entryUuid}`;
@@ -52,12 +58,62 @@ export function timelineSummarySourceHash(content: string): string {
   return (hash >>> 0).toString(36);
 }
 
+function parsePersistedBool(value: unknown): boolean {
+  return value === true || value === 'true' || value === '1' || value === 1;
+}
+
+function normalizeBoolMap(value: unknown): Record<string, boolean> {
+  try {
+    const raw = typeof value === 'string' ? JSON.parse(value || '{}') : value;
+    if (!raw || typeof raw !== 'object') return {};
+    const out: Record<string, boolean> = {};
+    for (const [key, val] of Object.entries(raw as Record<string, unknown>)) {
+      if (parsePersistedBool(val)) out[key] = true;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function normalizeNumberMap(value: unknown, autoByTab: Record<string, boolean>): Record<string, number> {
+  try {
+    const raw = typeof value === 'string' ? JSON.parse(value || '{}') : value;
+    if (!raw || typeof raw !== 'object') return {};
+    const out: Record<string, number> = {};
+    for (const tabId of Object.keys(autoByTab || {})) {
+      const n = Number((raw as Record<string, unknown>)[tabId] || 0);
+      if (Number.isFinite(n) && n > 0) out[tabId] = n;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function persistAppState(key: string, value: unknown) {
+  try {
+    ipcRenderer.invoke('app:setState', { key, value }).catch(() => {});
+  } catch {}
+}
+
 function readGlobalAuto(): boolean {
   try {
     return localStorage.getItem(GLOBAL_AUTO_KEY) === '1';
   } catch {
     return false;
   }
+}
+
+function readGlobalAutoSince(): number {
+  if (!readGlobalAuto()) return 0;
+  try {
+    const raw = Number(localStorage.getItem(GLOBAL_AUTO_SINCE_KEY) || 0);
+    if (Number.isFinite(raw) && raw > 0) return raw;
+  } catch {}
+  const now = Date.now();
+  try { localStorage.setItem(GLOBAL_AUTO_SINCE_KEY, String(now)); } catch {}
+  return now;
 }
 
 function readTabAuto(): Record<string, boolean> {
@@ -69,16 +125,51 @@ function readTabAuto(): Record<string, boolean> {
   }
 }
 
+function readTabAutoSince(autoByTab: Record<string, boolean>): Record<string, number> {
+  let parsed: Record<string, number> = {};
+  try {
+    const raw = localStorage.getItem(TAB_AUTO_SINCE_KEY);
+    parsed = raw ? JSON.parse(raw) : {};
+  } catch {
+    parsed = {};
+  }
+  const now = Date.now();
+  const out: Record<string, number> = {};
+  for (const tabId of Object.keys(autoByTab || {})) {
+    const value = Number(parsed[tabId] || 0);
+    out[tabId] = Number.isFinite(value) && value > 0 ? value : now;
+  }
+  try { localStorage.setItem(TAB_AUTO_SINCE_KEY, JSON.stringify(out)); } catch {}
+  return out;
+}
+
 function persistGlobalAuto(value: boolean) {
   try {
     localStorage.setItem(GLOBAL_AUTO_KEY, value ? '1' : '0');
   } catch {}
+  persistAppState(APP_STATE_GLOBAL_AUTO_KEY, value);
+}
+
+function persistGlobalAutoSince(value: number) {
+  try {
+    if (value > 0) localStorage.setItem(GLOBAL_AUTO_SINCE_KEY, String(value));
+    else localStorage.removeItem(GLOBAL_AUTO_SINCE_KEY);
+  } catch {}
+  persistAppState(APP_STATE_GLOBAL_AUTO_SINCE_KEY, value);
 }
 
 function persistTabAuto(value: Record<string, boolean>) {
   try {
     localStorage.setItem(TAB_AUTO_KEY, JSON.stringify(value));
   } catch {}
+  persistAppState(APP_STATE_TAB_AUTO_KEY, value);
+}
+
+function persistTabAutoSince(value: Record<string, number>) {
+  try {
+    localStorage.setItem(TAB_AUTO_SINCE_KEY, JSON.stringify(value));
+  } catch {}
+  persistAppState(APP_STATE_TAB_AUTO_SINCE_KEY, value);
 }
 
 function normalizeRows(rows: any[]): Record<string, TimelinePromptSummary> {
@@ -96,7 +187,9 @@ interface TimelineSummaryStore {
   loadedSessionKeys: Set<string>;
   batchProgressByTab: Record<string, TimelineSummaryBatchProgress>;
   autoByTab: Record<string, boolean>;
+  autoSinceByTab: Record<string, number>;
   globalAuto: boolean;
+  globalAutoSince: number;
   loadSummaries: (toolType: TimelineSummaryTool, sessionId: string) => Promise<void>;
   setTabAuto: (tabId: string, value: boolean) => void;
   setGlobalAuto: (value: boolean) => void;
@@ -115,13 +208,20 @@ interface TimelineSummaryStore {
   }) => Promise<void>;
 }
 
+const initialAutoByTab = readTabAuto();
+const initialAutoSinceByTab = readTabAutoSince(initialAutoByTab);
+const initialGlobalAuto = readGlobalAuto();
+const initialGlobalAutoSince = readGlobalAutoSince();
+
 export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) => ({
   summaries: {},
   loadingKeys: new Set(),
   loadedSessionKeys: new Set(),
   batchProgressByTab: {},
-  autoByTab: readTabAuto(),
-  globalAuto: readGlobalAuto(),
+  autoByTab: initialAutoByTab,
+  autoSinceByTab: initialAutoSinceByTab,
+  globalAuto: initialGlobalAuto,
+  globalAutoSince: initialGlobalAutoSince,
 
   loadSummaries: async (toolType, sessionId) => {
     if (!toolType || !sessionId) return;
@@ -142,16 +242,22 @@ export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) =
   setTabAuto: (tabId, value) => {
     set((state) => {
       const next = { ...state.autoByTab };
+      const nextSince = { ...state.autoSinceByTab };
       if (value) next[tabId] = true;
       else delete next[tabId];
+      if (value) nextSince[tabId] = Date.now();
+      else delete nextSince[tabId];
       persistTabAuto(next);
-      return { autoByTab: next };
+      persistTabAutoSince(nextSince);
+      return { autoByTab: next, autoSinceByTab: nextSince };
     });
   },
 
   setGlobalAuto: (value) => {
+    const since = value ? Date.now() : 0;
     persistGlobalAuto(value);
-    set({ globalAuto: value });
+    persistGlobalAutoSince(since);
+    set({ globalAuto: value, globalAutoSince: since });
   },
 
   generateSummary: async ({ tabId, toolType, sessionId, entry, force = false }) => {
@@ -172,7 +278,7 @@ export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) =
 
     try {
       const promptConfig = usePromptsStore.getState().getPromptById(PROMPT_SUMMARY_PROMPT_ID);
-      const source = trimTabTitlePrompt(content);
+      const source = trimTimelinePromptSummarySource(content);
       const generated = await generateTimelinePromptSummaryFromPrompt(source, promptConfig);
       if (!generated) return null;
 
@@ -236,3 +342,74 @@ export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) =
     }));
   },
 }));
+
+function writeLocalAutoMirror(args: {
+  globalAuto: boolean;
+  globalAutoSince: number;
+  autoByTab: Record<string, boolean>;
+  autoSinceByTab: Record<string, number>;
+}) {
+  try { localStorage.setItem(GLOBAL_AUTO_KEY, args.globalAuto ? '1' : '0'); } catch {}
+  try {
+    if (args.globalAutoSince > 0) localStorage.setItem(GLOBAL_AUTO_SINCE_KEY, String(args.globalAutoSince));
+    else localStorage.removeItem(GLOBAL_AUTO_SINCE_KEY);
+  } catch {}
+  try { localStorage.setItem(TAB_AUTO_KEY, JSON.stringify(args.autoByTab)); } catch {}
+  try { localStorage.setItem(TAB_AUTO_SINCE_KEY, JSON.stringify(args.autoSinceByTab)); } catch {}
+}
+
+(async () => {
+  try {
+    const [dbGlobalAuto, dbGlobalSince, dbTabAuto, dbTabSince] = await Promise.all([
+      ipcRenderer.invoke('app:getState', APP_STATE_GLOBAL_AUTO_KEY),
+      ipcRenderer.invoke('app:getState', APP_STATE_GLOBAL_AUTO_SINCE_KEY),
+      ipcRenderer.invoke('app:getState', APP_STATE_TAB_AUTO_KEY),
+      ipcRenderer.invoke('app:getState', APP_STATE_TAB_AUTO_SINCE_KEY),
+    ]);
+
+    const hasGlobalAuto = dbGlobalAuto !== null && dbGlobalAuto !== undefined;
+    const hasGlobalSince = dbGlobalSince !== null && dbGlobalSince !== undefined;
+    const hasTabAuto = dbTabAuto !== null && dbTabAuto !== undefined;
+    const hasTabSince = dbTabSince !== null && dbTabSince !== undefined;
+
+    if (!hasGlobalAuto) persistAppState(APP_STATE_GLOBAL_AUTO_KEY, initialGlobalAuto);
+    if (!hasGlobalSince) persistAppState(APP_STATE_GLOBAL_AUTO_SINCE_KEY, initialGlobalAutoSince);
+    if (!hasTabAuto) persistAppState(APP_STATE_TAB_AUTO_KEY, initialAutoByTab);
+    if (!hasTabSince) persistAppState(APP_STATE_TAB_AUTO_SINCE_KEY, initialAutoSinceByTab);
+
+    const nextGlobalAuto = hasGlobalAuto ? parsePersistedBool(dbGlobalAuto) : initialGlobalAuto;
+    const nextGlobalSinceRaw = hasGlobalSince ? Number(dbGlobalSince || 0) : initialGlobalAutoSince;
+    const nextGlobalSince = nextGlobalAuto && Number.isFinite(nextGlobalSinceRaw) && nextGlobalSinceRaw > 0
+      ? nextGlobalSinceRaw
+      : 0;
+    const nextAutoByTab = hasTabAuto ? normalizeBoolMap(dbTabAuto) : initialAutoByTab;
+    let nextAutoSinceByTab = hasTabSince ? normalizeNumberMap(dbTabSince, nextAutoByTab) : initialAutoSinceByTab;
+
+    const now = Date.now();
+    let changedSince = false;
+    nextAutoSinceByTab = { ...nextAutoSinceByTab };
+    for (const tabId of Object.keys(nextAutoByTab)) {
+      if (!nextAutoSinceByTab[tabId]) {
+        nextAutoSinceByTab[tabId] = now;
+        changedSince = true;
+      }
+    }
+    if (changedSince) persistAppState(APP_STATE_TAB_AUTO_SINCE_KEY, nextAutoSinceByTab);
+
+    writeLocalAutoMirror({
+      globalAuto: nextGlobalAuto,
+      globalAutoSince: nextGlobalSince,
+      autoByTab: nextAutoByTab,
+      autoSinceByTab: nextAutoSinceByTab,
+    });
+
+    useTimelineSummaryStore.setState({
+      globalAuto: nextGlobalAuto,
+      globalAutoSince: nextGlobalSince,
+      autoByTab: nextAutoByTab,
+      autoSinceByTab: nextAutoSinceByTab,
+    });
+  } catch (err: any) {
+    console.warn('[TimelineSummary] auto-settings hydrate failed:', err?.message || err);
+  }
+})();

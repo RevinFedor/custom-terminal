@@ -453,7 +453,7 @@ export default function ProjectToolbar() {
             {summaryRunning ? `${summaryProgress?.done || 0}/${summaryProgress?.total || 0}` : 'AI'}
           </button>
         </Tooltip>
-        <Tooltip content={summaryGlobalAuto ? 'Глобальный auto включён: настройка вкладки зафиксирована' : 'Auto пересказ новых user prompts для текущей вкладки'}>
+        <Tooltip content={summaryGlobalAuto ? 'Глобальный auto включён: настройка вкладки зафиксирована' : 'Auto пересказ только новых user prompts в текущей вкладке с момента включения'}>
           <button
             onClick={() => summaryTarget && !summaryGlobalAuto && setSummaryTabAuto(summaryTarget.tabId, !summaryTabAuto)}
             disabled={!summaryTarget || summaryGlobalAuto}
@@ -463,7 +463,7 @@ export default function ProjectToolbar() {
             tab
           </button>
         </Tooltip>
-        <Tooltip content="Auto пересказ новых user prompts во всех вкладках">
+        <Tooltip content="Auto пересказ только новых user prompts во всех вкладках с момента включения">
           <button
             onClick={() => setSummaryGlobalAuto(!summaryGlobalAuto)}
             style={summaryChipStyle(summaryGlobalAuto)}

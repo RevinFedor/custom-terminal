@@ -11,6 +11,7 @@ import { useWorkspaceStore } from '../store/useWorkspaceStore';
 const { ipcRenderer } = window.require('electron');
 
 export const AUTO_TAB_TITLE_MAX_PROMPT_CHARS = 12000;
+export const TIMELINE_PROMPT_SUMMARY_MAX_SOURCE_CHARS = 8000; // ≈2000 tokens for mixed RU/EN prompts.
 
 const TAB_TITLE_COMMAND_RE = /^\s*(#(?:pack|effort|usage|help|model|status|clear)\b|\/(?:model|help|status|usage|compact|clear|exit|quit|login|logout|cost|rewind|init)\b)/i;
 
@@ -50,6 +51,12 @@ export function isEligibleTabTitleEntry(entry: TabTitleSourceEntry): boolean {
 export function trimTabTitlePrompt(content: string): string {
   return content.length > AUTO_TAB_TITLE_MAX_PROMPT_CHARS
     ? content.slice(0, AUTO_TAB_TITLE_MAX_PROMPT_CHARS) + '\n\n[truncated]'
+    : content;
+}
+
+export function trimTimelinePromptSummarySource(content: string): string {
+  return content.length > TIMELINE_PROMPT_SUMMARY_MAX_SOURCE_CHARS
+    ? content.slice(0, TIMELINE_PROMPT_SUMMARY_MAX_SOURCE_CHARS) + '\n\n[truncated]'
     : content;
 }
 
@@ -201,7 +208,7 @@ export async function generateTabTitleFromPrompt(userPrompt: string, promptConfi
 }
 
 export async function generateTimelinePromptSummaryFromPrompt(userPrompt: string, promptConfig?: AIPrompt): Promise<string | null> {
-  return generateTitleFromPromptWithConfig(userPrompt, promptConfig, {
+  return generateTitleFromPromptWithConfig(trimTimelinePromptSummarySource(userPrompt), promptConfig, {
     fallbackPrompt: DEFAULT_PROMPT_SUMMARY_PROMPT,
     sourceLabel: 'Пользовательское сообщение',
     logPrefix: 'PromptSummary',

@@ -74,6 +74,7 @@ export default function Workspace() {
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const timelineTreeModeTabs = useUIStore((s) => s.timelineTreeModeTabs);
   const setTimelineTreeMode = useUIStore((s) => s.setTimelineTreeMode);
+  const timelinePinned = useUIStore((s) => s.timelinePinned);
   const setProjectView = useWorkspaceStore((s) => s.setProjectView);
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.getActiveProject()?.viewingSubAgentTabId ?? null);
   const setViewingSubAgentTabId = useWorkspaceStore((s) => s.setViewingSubAgent);
@@ -324,13 +325,13 @@ export default function Workspace() {
         e.preventDefault();
         const currentOpen = useUIStore.getState().historyPanelOpenTabs[effectiveTab.id] ?? false;
         console.warn('[Workspace:Hotkey] CMD+\\ toggle history: tabId=' + effectiveTab.id.substring(effectiveTab.id.length - 8) + ' ' + currentOpen + ' → ' + !currentOpen);
-        if (!currentOpen) setTimelineTreeMode(effectiveTab.id, false); // close tree mode when opening history
+        if (!currentOpen && !timelinePinned) setTimelineTreeMode(effectiveTab.id, false); // unpinned history overlays expanded timeline
         setHistoryPanelOpen(effectiveTab.id, !currentOpen);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCommandType, setHistoryPanelOpen, setTimelineTreeMode]);
+  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCommandType, setHistoryPanelOpen, setTimelineTreeMode, timelinePinned]);
 
   // CMD+] hotkey to toggle timeline tree mode
   useEffect(() => {
@@ -346,13 +347,13 @@ export default function Workspace() {
         e.preventDefault();
         const current = useUIStore.getState().timelineTreeModeTabs[effectiveTab.id] ?? false;
         console.warn('[Workspace:Hotkey] CMD+] toggle tree: tabId=' + effectiveTab.id.substring(effectiveTab.id.length - 8) + ' ' + current + ' → ' + !current);
-        if (!current) setHistoryPanelOpen(effectiveTab.id, false); // close history when opening tree mode
+        if (!current && !timelinePinned) setHistoryPanelOpen(effectiveTab.id, false); // unpinned tree mode overlays history
         setTimelineTreeMode(effectiveTab.id, !current);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCommandType, setTimelineTreeMode, setHistoryPanelOpen]);
+  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCommandType, setTimelineTreeMode, setHistoryPanelOpen, timelinePinned]);
 
   // CMD+F hotkey for terminal search
   useEffect(() => {
@@ -486,6 +487,20 @@ export default function Workspace() {
     : effectiveGeminiSessionId && effectiveCommandType === 'gemini'
       ? 'gemini'
       : 'claude') as 'claude' | 'gemini' | 'codex';
+  const shouldRenderHistoryPanel = (isHistoryOpen || historyMounted) && !!timelineSessionId && !!effectiveTab && currentView === 'terminal';
+  const historyPanelNode = shouldRenderHistoryPanel ? (
+    <HistoryPanel
+      tabId={effectiveTab.id}
+      sessionId={timelineSessionId}
+      cwd={effectiveTab.cwd || currentProject.path}
+      width={historyPanelWidth}
+      notesPanelWidth={notesPanelWidth}
+      isOpen={isHistoryOpen}
+      toolType={timelineToolType}
+      enableClaudePtyControls={(timelineToolType === 'claude' || timelineToolType === 'codex') && effectiveTabType !== 'claude-sdk'}
+      embedded={timelinePinned}
+    />
+  ) : null;
 
   // DEBUG: Uncomment to debug Timeline visibility
   // console.log('[Timeline Debug] showTimeline:', showTimeline, 'claudeSessionId:', claudeSessionId, 'commandType:', activeTab?.commandType, 'isRunning:', isCommandRunning);
@@ -598,19 +613,8 @@ export default function Workspace() {
             {/* File Preview Overlay */}
             {filePreview && <FilePreview />}
 
-            {/* History Panel — absolute overlay within terminal area only */}
-            {(isHistoryOpen || historyMounted) && timelineSessionId && effectiveTab && currentView === 'terminal' && (
-              <HistoryPanel
-                tabId={effectiveTab.id}
-                sessionId={timelineSessionId}
-                cwd={effectiveTab.cwd || currentProject.path}
-                width={historyPanelWidth}
-                notesPanelWidth={notesPanelWidth}
-                isOpen={isHistoryOpen}
-                toolType={timelineToolType}
-                enableClaudePtyControls={(timelineToolType === 'claude' || timelineToolType === 'codex') && effectiveTabType !== 'claude-sdk'}
-              />
-            )}
+            {/* History Panel — overlay unless Timeline/History pin mode is enabled. */}
+            {!timelinePinned && historyPanelNode}
           </div>
 
           {/* Claude control bar — Provider/Model/Effort/Think + Ctx meter +
@@ -631,6 +635,8 @@ export default function Workspace() {
           )}
           </div>
 
+          {timelinePinned && historyPanelNode}
+
           {/* Timeline — inside terminal row so it only spans terminal height */}
           {showTimeline && (
             <Timeline
@@ -641,6 +647,7 @@ export default function Workspace() {
               isVisible={workspaceView === 'workspace' && currentView === 'terminal'}
               isOpen={true}
               toolType={timelineToolType}
+              pinned={timelinePinned}
             />
           )}
         </div>
