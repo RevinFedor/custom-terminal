@@ -76,7 +76,7 @@ interface TabData {
   groupId?: string;
   visualParentTabId?: string;
   parentTabId?: string;
-  sessionStatus?: 'knowledge' | 'bugfix' | 'dev';
+  sessionStatus?: string;
 }
 
 type TabDragData = {
@@ -393,6 +393,7 @@ interface TabItemProps {
   isCollapsed?: boolean; // Collapsed tab — icon-only
   hasSession?: boolean; // Whether tab has an active AI session
   isBusy?: boolean; // AI agent is actively thinking/streaming
+  isTitleNaming?: boolean; // Gemini is generating/applying this tab's title
   isAwaitingInput?: boolean; // Claude blocked on AskUserQuestion, waiting for human answer
   sdkProcessAlive?: boolean; // SDK tab: the CLI process is alive (parked between
                              // turns or generating). SDK has no PTY → hasProcess
@@ -443,6 +444,7 @@ const TabItem = memo(({
   isCollapsed = false,
   hasSession = false,
   isBusy = false,
+  isTitleNaming = false,
   isAwaitingInput = false,
   sdkProcessAlive = false,
   isViewingSubAgent = false,
@@ -885,9 +887,9 @@ const TabItem = memo(({
                   className="tab-process-bar-static"
                   style={{
                     position: 'absolute',
-                    // -2px компенсирует 2px transparent border (резерв под dashed-states).
-                    // Без этого полоска отрисовывается ВНУТРИ border-area → виден gap у края.
-                    [processBarPosition === 'right' ? 'right' : 'left']: '-2px',
+                    // Слева -2px компенсирует 2px transparent border (резерв под dashed-states).
+                    // Справа такого border нет: right:0 держит полоску на правой границе карточки/меню.
+                    ...(processBarPosition === 'right' ? { right: 0 } : { left: '-2px' }),
                     top: 0,
                     bottom: 0,
                     width: '3px',
@@ -1076,7 +1078,12 @@ const TabItem = memo(({
                   }}
                 />
               )}
-              {tab.aiClosing ? 'остановка сессии...' : tab.name}
+              {tab.aiClosing ? 'остановка сессии...' : isTitleNaming ? (
+                <span className="tab-title-naming-frame" title={tab.name}>
+                  <span className="tab-title-naming-ghost">{tab.name}</span>
+                  <span className="tab-title-naming-text">naming...</span>
+                </span>
+              ) : tab.name}
             </span>
           )}
 
@@ -1271,6 +1278,9 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
   const bodyCursorRef = useRef<string | null>(null);
   const tabGeo = useUIStore((s) => s.tabGeometry);
   const tabsFontSize = useUIStore((s) => s.tabsFontSize);
+  const sessionStatuses = useUIStore((s) => s.sessionStatuses);
+  const statusMarkerShape = useUIStore((s) => s.statusMarker.shape);
+  const statusMarkerSize = useUIStore((s) => s.statusMarker.sizePx);
 
   const setBodyGrabbing = useCallback(() => {
     if (bodyCursorRef.current === null) {
@@ -1357,6 +1367,25 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
   const isCollapsed = !!group.collapsed;
   const iconAccentActive = isIconHovered || isCollapsed;
   const headerCursor = dragLiftActive ? 'grabbing' : (cmdCollapseMode ? 'pointer' : 'default');
+  const groupColor = group.color && group.color !== 'default' ? group.color : undefined;
+  const groupColorConfig = TAB_COLORS.find(c => c.color === groupColor);
+  const folderColor = groupColorConfig?.borderColor || '#8b5cf6';
+  const statusMeta = group.sessionStatus
+    ? sessionStatuses.find((s) => s.id === group.sessionStatus)
+    : null;
+  const groupBackground = (() => {
+    if (dragLiftActive) {
+      return groupColorConfig ? adjustRgbaAlpha(groupColorConfig.bgColor, 0.10) : 'rgba(139,92,246,0.16)';
+    }
+    if (groupColorConfig) {
+      return adjustRgbaAlpha(groupColorConfig.bgColor, isHovered ? 0.10 : (isCollapsed ? 0.04 : -0.06));
+    }
+    if (isCollapsed) return isHovered ? 'rgba(139,92,246,0.17)' : 'rgba(139,92,246,0.11)';
+    return isHovered ? 'rgba(255,255,255,0.07)' : 'rgba(255,255,255,0.035)';
+  })();
+  const groupBorder = dragLiftActive
+    ? (groupColorConfig?.borderColor || 'rgba(139,92,246,0.58)')
+    : (groupColorConfig?.borderColor || (isCollapsed ? 'rgba(139,92,246,0.42)' : 'rgba(255,255,255,0.08)'));
 
   return (
     <div
@@ -1365,6 +1394,7 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
       data-group-id={group.id}
       style={{
         display: 'flex',
+        position: 'relative',
         alignItems: 'center',
         gap: 8,
         minHeight: 24,
@@ -1375,12 +1405,8 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
         cursor: headerCursor,
         userSelect: 'none',
         color: (isHovered || dragLiftActive || isCollapsed) ? '#e5e7eb' : '#a1a1aa',
-        backgroundColor: dragLiftActive
-          ? 'rgba(139,92,246,0.16)'
-          : isCollapsed
-            ? (isHovered ? 'rgba(139,92,246,0.17)' : 'rgba(139,92,246,0.11)')
-            : (isHovered ? 'rgba(255,255,255,0.07)' : 'rgba(255,255,255,0.035)'),
-        border: `1px solid ${dragLiftActive ? 'rgba(139,92,246,0.58)' : (isCollapsed ? 'rgba(139,92,246,0.42)' : 'rgba(255,255,255,0.08)')}`,
+        backgroundColor: groupBackground,
+        border: `1px solid ${groupBorder}`,
         opacity: isDragging ? 0.96 : 1,
         transform: dragLiftActive ? 'scale(1.015)' : undefined,
         transformOrigin: 'center',
@@ -1417,6 +1443,24 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
       onMouseLeave={() => setIsHovered(false)}
       title={isEditing ? 'Rename group' : (cmdCollapseMode ? 'Collapse / expand group' : 'Hold and drag group')}
     >
+      {statusMeta && (
+        <span
+          title={statusMeta.label}
+          style={{
+            position: 'absolute',
+            left: '5px',
+            top: 'calc(50% + 1px)',
+            transform: 'translateY(-50%)',
+            width: `${statusMarkerSize}px`,
+            height: `${statusMarkerSize}px`,
+            borderRadius: statusMarkerShape === 'square' ? '2px' : '50%',
+            backgroundColor: statusMeta.color,
+            border: '1px solid rgba(0,0,0,0.4)',
+            pointerEvents: 'none',
+            zIndex: 2,
+          }}
+        />
+      )}
       <button
         type="button"
         data-group-collapse-button
@@ -1454,7 +1498,7 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
           borderRadius: 6,
           padding: 0,
           cursor: 'pointer',
-          color: iconAccentActive ? '#c4b5fd' : '#8b5cf6',
+          color: iconAccentActive ? '#c4b5fd' : folderColor,
           backgroundColor: iconAccentActive ? 'rgba(139,92,246,0.20)' : 'transparent',
           transition: 'background-color 120ms ease, color 120ms ease, transform 140ms ease',
           transform: isIconHovered ? 'scale(1.07)' : 'scale(1)',
@@ -1769,6 +1813,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const renameTab = useWorkspaceStore((state) => state.renameTab);
   const renameTabGroup = useWorkspaceStore((state) => state.renameTabGroup);
   const toggleTabGroupCollapsed = useWorkspaceStore((state) => state.toggleTabGroupCollapsed);
+  const setTabGroupColor = useWorkspaceStore((state) => state.setTabGroupColor);
+  const setTabGroupSessionStatus = useWorkspaceStore((state) => state.setTabGroupSessionStatus);
   const deleteTabGroup = useWorkspaceStore((state) => state.deleteTabGroup);
   const setTabColor = useWorkspaceStore((state) => state.setTabColor);
   const setTabSessionStatus = useWorkspaceStore((state) => state.setTabSessionStatus);
@@ -1799,6 +1845,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
+  const [editOriginalValue, setEditOriginalValue] = useState('');
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; tabId: string } | null>(null);
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [groupEditValue, setGroupEditValue] = useState('');
@@ -1817,6 +1864,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const verticalDragGeometryRef = useRef<VerticalDragGeometry | null>(null);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
   const [titleRefreshInFlight, setTitleRefreshInFlight] = useState<Set<string>>(new Set());
+  const tabTitleNamingIds = useWorkspaceStore((state) => state.tabTitleNamingIds);
+  const setTabTitleNaming = useWorkspaceStore((state) => state.setTabTitleNaming);
   // Tabs currently inside a deterministic stop/restart cycle. While in this set
   // the Restart / Stop buttons render disabled with a wait-cursor, so the user
   // can't fire a second stop while the first one is still polling for descendants
@@ -2496,6 +2545,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     const tabName = ws.tabs.get(pendingEditTabId)?.name ?? '';
     setEditingTabId(pendingEditTabId);
     setEditValue(tabName);
+    setEditOriginalValue(tabName);
     // Clear so other TabBar instances (other projects) don't also enter edit
     useWorkspaceStore.setState({ pendingEditTabId: null });
   }, [pendingEditTabId, projectId]);
@@ -2678,6 +2728,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     setGroupEditValue('');
     setEditingTabId(tabId);
     setEditValue(currentName);
+    setEditOriginalValue(currentName);
   };
 
   const handleGroupContextMenu = (e: React.MouseEvent, group: TabGroup) => {
@@ -2855,11 +2906,14 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   // Shared close path — also used as the input's onBlur. Commits a non-empty
   // name and exits edit mode. Does NOT refocus (see refocusActiveTerminal).
   const handleRenameSubmit = () => {
-    if (editingTabId && editValue.trim()) {
-      renameTab(projectId, editingTabId, editValue.trim());
+    const nextName = editValue.trim();
+    const originalName = editOriginalValue.trim();
+    if (editingTabId && nextName && nextName !== originalName) {
+      renameTab(projectId, editingTabId, nextName);
     }
     setEditingTabId(null);
     setEditValue('');
+    setEditOriginalValue('');
   };
 
   const handleRenameKeyDown = (e: React.KeyboardEvent) => {
@@ -2869,6 +2923,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     } else if (e.key === 'Escape') {
       setEditingTabId(null);
       setEditValue('');
+      setEditOriginalValue('');
       refocusActiveTerminal();
     }
   };
@@ -2895,8 +2950,17 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const startGroupRename = (group: TabGroup) => {
     setEditingTabId(null);
     setEditValue('');
+    setEditOriginalValue('');
     setEditingGroupId(group.id);
     setGroupEditValue(group.name);
+  };
+
+  const handleCreateGroupWithRename = () => {
+    const groupId = createTabGroup(projectId);
+    if (!groupId) return;
+    const nextGroup = useWorkspaceStore.getState().openProjects
+      .get(projectId)?.tabGroups.find(group => group.id === groupId);
+    if (nextGroup) startGroupRename(nextGroup);
   };
 
   const tabTitleRefreshErrorText = (reason?: RefreshTabTitleReason, error?: string) => {
@@ -2922,7 +2986,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   };
 
   const handleRefreshGeneratedTitle = async (tabId: string) => {
-    if (titleRefreshInFlight.has(tabId)) {
+    if (titleRefreshInFlight.has(tabId) || tabTitleNamingIds.has(tabId)) {
       showToast('Название уже обновляется', 'info');
       return;
     }
@@ -2932,6 +2996,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       next.add(tabId);
       return next;
     });
+    setTabTitleNaming(tabId, true);
     setContextMenu(null);
 
     try {
@@ -2953,6 +3018,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         next.delete(tabId);
         return next;
       });
+      setTabTitleNaming(tabId, false);
     }
   };
 
@@ -2962,6 +3028,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       if (tab) {
         setEditingTabId(contextMenu.tabId);
         setEditValue(tab.name);
+        setEditOriginalValue(tab.name);
       }
     }
     setContextMenu(null);
@@ -3298,6 +3365,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     commandType={tab.commandType}
                     hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId || !!tab.geminiSessionId || !!tab.codexSessionId}
                     isBusy={isTabTurnBusy(tab)}
+                    isTitleNaming={tabTitleNamingIds.has(tab.id) || titleRefreshInFlight.has(tab.id)}
                     isAwaitingInput={awaitingMap.get(tab.id) || false}
                     sdkProcessAlive={!!tab.sdkProcessAlive}
                     onRestart={handleRestart}
@@ -3332,6 +3400,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     style={{
                       position: 'relative',
                       marginLeft: indent,
+                      width: `calc(100% - ${indent}px)`,
+                      boxSizing: 'border-box',
                       paddingLeft: 9,
                     }}
                   >
@@ -3542,6 +3612,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                   commandType={tab.commandType}
                   hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId || !!tab.geminiSessionId || !!tab.codexSessionId}
                   isBusy={isTabTurnBusy(tab)}
+                  isTitleNaming={tabTitleNamingIds.has(tab.id) || titleRefreshInFlight.has(tab.id)}
                   isAwaitingInput={awaitingMap.get(tab.id) || false}
                   sdkProcessAlive={!!tab.sdkProcessAlive}
                   onRestart={handleRestart}
@@ -3718,6 +3789,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         commandType={tab.commandType}
                         hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId || !!tab.geminiSessionId || !!tab.codexSessionId}
                         isBusy={isTabTurnBusy(tab)}
+                        isTitleNaming={tabTitleNamingIds.has(tab.id) || titleRefreshInFlight.has(tab.id)}
                         isAwaitingInput={awaitingMap.get(tab.id) || false}
                         sdkProcessAlive={!!tab.sdkProcessAlive}
                         onRestart={handleRestart}
@@ -3803,6 +3875,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     commandType={tab.commandType}
                     hasSession={sessionStatus.get(tab.id) || !!tab.claudeSessionId || !!tab.geminiSessionId || !!tab.codexSessionId}
                     isBusy={isTabTurnBusy(tab)}
+                    isTitleNaming={tabTitleNamingIds.has(tab.id) || titleRefreshInFlight.has(tab.id)}
                     isAwaitingInput={awaitingMap.get(tab.id) || false}
                     sdkProcessAlive={!!tab.sdkProcessAlive}
                     onRestart={handleRestart}
@@ -4459,7 +4532,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               The resulting name is still marked manual to block future auto
               launch naming from replacing it. */}
           {!isMultiSelect && contextMenu && (() => {
-            const refreshing = titleRefreshInFlight.has(contextMenu.tabId);
+            const refreshing = titleRefreshInFlight.has(contextMenu.tabId) || tabTitleNamingIds.has(contextMenu.tabId);
             return (
               <button
                 className={`w-full text-left px-4 py-1.5 text-[13px] flex items-center gap-2 ${
@@ -4552,6 +4625,115 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             >
               Rename
             </button>
+            <div className="relative group/group-status">
+              <button
+                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between gap-3"
+              >
+                <span>Status</span>
+                <span className="flex items-center gap-1 ml-auto">
+                  {ctxSessionStatuses.slice(0, 6).map((s) => (
+                    <span
+                      key={s.id}
+                      style={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: '50%',
+                        backgroundColor: s.color,
+                        border: '1px solid rgba(0,0,0,0.4)',
+                        display: 'inline-block',
+                      }}
+                    />
+                  ))}
+                  <span className="text-[#666] ml-1">›</span>
+                </span>
+              </button>
+              <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/group-status:block">
+                <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-2 min-w-[220px]">
+                  {ctxSessionStatuses.length === 0 && (
+                    <div className="px-4 py-2 text-[12px] text-[#666] italic">
+                      Нет статусов. Добавь в Settings → Системные.
+                    </div>
+                  )}
+                  {ctxSessionStatuses.map((s) => {
+                    const isSelected = group.sessionStatus === s.id;
+                    return (
+                      <button
+                        key={s.id}
+                        className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-3 whitespace-nowrap"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setTabGroupSessionStatus(projectId, group.id, isSelected ? null : s.id);
+                          setGroupContextMenu(null);
+                        }}
+                      >
+                        <span style={{ width: 12, height: 12, borderRadius: '50%', backgroundColor: s.color, border: '1px solid rgba(0,0,0,0.4)', flexShrink: 0 }} />
+                        <span>{s.label}</span>
+                        {isSelected && <span className="ml-auto text-white">✓</span>}
+                      </button>
+                    );
+                  })}
+                  <div className="my-1 border-t border-[#3a3a3a]" />
+                  <div className="relative group/group-background">
+                    <button
+                      className="w-full text-left px-4 py-1 text-[11px] text-[#888] hover:bg-white/10 hover:text-[#bbb] cursor-pointer flex items-center justify-between gap-3 whitespace-nowrap"
+                    >
+                      <span>Background</span>
+                      <span className="flex items-center gap-1.5 ml-auto">
+                        {(() => {
+                          const currentColor = group.color || 'default';
+                          const meta = TAB_COLORS.find((c) => c.color === currentColor) || TAB_COLORS[0];
+                          return (
+                            <span
+                              style={{
+                                width: 9,
+                                height: 9,
+                                borderRadius: 3,
+                                backgroundColor: meta.bgColor === 'transparent' ? 'transparent' : meta.borderColor,
+                                border: `1px solid ${meta.borderColor}`,
+                                display: 'inline-block',
+                              }}
+                            />
+                          );
+                        })()}
+                        <span className="text-[#555]">›</span>
+                      </span>
+                    </button>
+                    <div className="absolute left-full bottom-0 -ml-2 pl-2 hidden group-hover/group-background:block">
+                      <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 min-w-[165px]">
+                        {TAB_COLORS.map((c) => {
+                          const currentColor = group.color || 'default';
+                          const isSelected = currentColor === c.color;
+                          return (
+                            <button
+                              key={c.color}
+                              className="w-full text-left px-3 py-1 text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2 whitespace-nowrap"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setTabGroupColor(projectId, group.id, c.color);
+                                setGroupContextMenu(null);
+                              }}
+                            >
+                              <span
+                                style={{
+                                  width: 11,
+                                  height: 11,
+                                  borderRadius: 3,
+                                  backgroundColor: c.bgColor === 'transparent' ? 'transparent' : c.borderColor,
+                                  border: `1px solid ${c.borderColor}`,
+                                  flexShrink: 0,
+                                }}
+                              />
+                              <span>{c.label.replace(/^[^\wА-Яа-я]+\s*/, '')}</span>
+                              {isSelected && <span className="ml-auto text-white">✓</span>}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
             <button
               className="w-full text-left px-4 py-1.5 text-[13px] text-[#f87171] hover:bg-white/10 cursor-pointer"
               onClick={(e) => {
@@ -4596,7 +4778,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           <button
             className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
             onClick={() => {
-              createTabGroup(projectId);
+              handleCreateGroupWithRename();
               setEmptyContextMenu(null);
             }}
           >

@@ -431,11 +431,13 @@ interface UIStore {
   historyScrollToUuid: string | null;
   historyVisibleUuids: Record<string, string[]>;
   historyScrollPositions: Record<string, number>;
+  historyPromptDrafts: Record<string, string>;
   setHistoryPanelOpen: (tabId: string, open: boolean) => void;
   setHistoryPanelWidth: (width: number) => void;
   setHistoryScrollToUuid: (uuid: string | null) => void;
   setHistoryVisibleUuids: (tabId: string, uuids: string[]) => void;
   setHistoryScrollPosition: (tabId: string, scrollTop: number) => void;
+  setHistoryPromptDraft: (tabId: string, draft: string) => void;
 
   // Timeline panel visibility (per-tab state, default open)
   timelinePanelOpenTabs: Record<string, boolean>;
@@ -514,6 +516,9 @@ interface UIStore {
   copyIncludeThinking: boolean;
   copyIncludeBash: boolean;
   copyIncludeTools: boolean;
+  copyIncludeWebSearch: boolean;
+  copyIncludeToolSearch: boolean;
+  copyIncludeOtherTools: boolean;
   setCopyIncludeEditing: (v: boolean) => void;
   setCopyIncludeReading: (v: boolean) => void;
   setCopyFromStart: (v: boolean) => void;
@@ -525,6 +530,9 @@ interface UIStore {
   setCopyIncludeThinking: (v: boolean) => void;
   setCopyIncludeBash: (v: boolean) => void;
   setCopyIncludeTools: (v: boolean) => void;
+  setCopyIncludeWebSearch: (v: boolean) => void;
+  setCopyIncludeToolSearch: (v: boolean) => void;
+  setCopyIncludeOtherTools: (v: boolean) => void;
 
   // Status bar debug toggles
   debugHoverBridges: boolean;
@@ -1007,6 +1015,9 @@ type CopySettings = {
   copyIncludeThinking: boolean;
   copyIncludeBash: boolean;
   copyIncludeTools: boolean;
+  copyIncludeWebSearch: boolean;
+  copyIncludeToolSearch: boolean;
+  copyIncludeOtherTools: boolean;
 };
 
 const loadCopySettings = (): CopySettings => {
@@ -1026,6 +1037,9 @@ const loadCopySettings = (): CopySettings => {
         copyIncludeThinking: parsed.copyIncludeThinking ?? true,
         copyIncludeBash: parsed.copyIncludeBash ?? false,
         copyIncludeTools: parsed.copyIncludeTools ?? false,
+        copyIncludeWebSearch: parsed.copyIncludeWebSearch ?? parsed.copyIncludeTools ?? false,
+        copyIncludeToolSearch: parsed.copyIncludeToolSearch ?? parsed.copyIncludeTools ?? false,
+        copyIncludeOtherTools: parsed.copyIncludeOtherTools ?? parsed.copyIncludeTools ?? false,
       };
     }
   } catch (e) {
@@ -1037,12 +1051,19 @@ const loadCopySettings = (): CopySettings => {
     copyIncludeUser: true, copyIncludeClaude: true,
     copyIncludeText: true, copyIncludeThinking: true,
     copyIncludeBash: false, copyIncludeTools: false,
+    copyIncludeWebSearch: false, copyIncludeToolSearch: false, copyIncludeOtherTools: false,
   };
 };
 
-const saveCopySettings = (settings: CopySettings) => {
+const saveCopySettings = (settings: Partial<CopySettings>) => {
   try {
-    localStorage.setItem('noted-terminal-copy-settings', JSON.stringify(settings));
+    let prev = {};
+    try {
+      prev = JSON.parse(localStorage.getItem('noted-terminal-copy-settings') || '{}');
+    } catch {
+      prev = {};
+    }
+    localStorage.setItem('noted-terminal-copy-settings', JSON.stringify({ ...prev, ...settings }));
   } catch (e) {
     console.error('Failed to save copy settings:', e);
   }
@@ -1896,6 +1917,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
   historyScrollToUuid: null,
   historyVisibleUuids: {},
   historyScrollPositions: {},
+  historyPromptDrafts: {},
   setHistoryPanelOpen: (tabId, open) => set(state => ({
     historyPanelOpenTabs: { ...state.historyPanelOpenTabs, [tabId]: open }
   })),
@@ -1906,6 +1928,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setHistoryScrollPosition: (tabId, scrollTop) => set(state => ({
     historyScrollPositions: { ...state.historyScrollPositions, [tabId]: scrollTop }
   })),
+  setHistoryPromptDraft: (tabId, draft) => set(state => {
+    const next = { ...state.historyPromptDrafts };
+    if (draft) next[tabId] = draft;
+    else delete next[tabId];
+    return { historyPromptDrafts: next };
+  }),
 
   timelinePanelOpenTabs: {},
   setTimelinePanelOpen: (tabId, open) => set(state => ({
@@ -2023,6 +2051,9 @@ export const useUIStore = create<UIStore>((set, get) => ({
   copyIncludeThinking: initialCopySettings.copyIncludeThinking,
   copyIncludeBash: initialCopySettings.copyIncludeBash,
   copyIncludeTools: initialCopySettings.copyIncludeTools,
+  copyIncludeWebSearch: initialCopySettings.copyIncludeWebSearch,
+  copyIncludeToolSearch: initialCopySettings.copyIncludeToolSearch,
+  copyIncludeOtherTools: initialCopySettings.copyIncludeOtherTools,
   // Single helper avoids the 11-field re-destructure pattern previously copy-pasted in each setter.
   // Reading get() snapshot AFTER set() ensures we persist the merged state including v.
   setCopyIncludeEditing: (v) => {
@@ -2143,6 +2174,18 @@ export const useUIStore = create<UIStore>((set, get) => ({
       copyIncludeText: s.copyIncludeText, copyIncludeThinking: s.copyIncludeThinking,
       copyIncludeBash: s.copyIncludeBash, copyIncludeTools: s.copyIncludeTools,
     });
+  },
+  setCopyIncludeWebSearch: (v) => {
+    set({ copyIncludeWebSearch: v });
+    saveCopySettings({ copyIncludeWebSearch: v });
+  },
+  setCopyIncludeToolSearch: (v) => {
+    set({ copyIncludeToolSearch: v });
+    saveCopySettings({ copyIncludeToolSearch: v });
+  },
+  setCopyIncludeOtherTools: (v) => {
+    set({ copyIncludeOtherTools: v });
+    saveCopySettings({ copyIncludeOtherTools: v });
   },
 
   // Status bar debug toggles

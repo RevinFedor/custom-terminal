@@ -24,7 +24,7 @@ Active Tabs и Favorites временно не рендерятся отдель
 2. **Скрытая структура групп:** `Recent` = сегодня+вчера, `This Week`, `This Month`, `Older` (`Старые месяцы`). Видимых секций и collapse-state больше нет: группировка нужна только для sticky progress header. Группировка по `closed_at`, не `created_at`.
 3. **Карточка:** одна компактная row-карточка с полным `entry.name`, без ellipsis. Справа остаётся `DD.MM.YY | HH:MM` и optional RAG score. CWD не выводится в строку: у большинства вкладок проекта он одинаковый и не помогает сканированию.
 4. **Hover Popover (CMD+hover):** при зажатом ⌘ показывается metadata/notes split-popover. `Name` больше не дублируется в metaRows: полное имя уже видно прямо в карточке, а popover нужен для `Closed → Created → Path → Type → Messages` и заметок. Bare-hover ничего не делает. Полная механика — `fact-tab-preview-popover.md`.
-5. **Restore:** клик по записи восстанавливает вкладку и удаляет её из истории. Альтернативный путь — глобальный хоткей **Shift+Cmd+T** (VS Code-стиль), который popает самую свежую запись для активного проекта без открытия Home-вью. Учитывает позицию вкладки в TabBar и `processWasRunning`-флаг для авто-Continue Claude. См. [`fact-reopen-last-closed-tab.md`](fact-reopen-last-closed-tab.md).
+5. **Restore:** клик по записи восстанавливает вкладку и удаляет её из истории. Альтернативный путь — глобальный хоткей **Shift+Cmd+T** (VS Code-стиль), который popает самую свежую запись для активного проекта без открытия Home-вью. Учитывает позицию вкладки в TabBar, `processWasRunning`-флаг для авто-Continue Claude и `group_id`, если group-row ещё существует. См. [`fact-reopen-last-closed-tab.md`](fact-reopen-last-closed-tab.md).
 
 ## Title Search
 
@@ -55,7 +55,8 @@ id, project_id, name, cwd, color, notes,
 command_type, tab_type, url,
 created_at, closed_at,
 claude_session_id, gemini_session_id,
-codex_session_id, codex_model, codex_effort
+codex_session_id, codex_model, codex_effort,
+name_set_manually, session_status, group_id
 ```
 
 ## Behavior Specs

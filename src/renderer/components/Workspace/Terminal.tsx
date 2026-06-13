@@ -7,26 +7,35 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 
 const { shell } = window.require('electron');
 
+const isHttpUrl = (uri: string) => /^https?:\/\//i.test(uri);
+
+const suppressLinkEvent = (event: MouseEvent) => {
+  event.preventDefault();
+  event.stopPropagation();
+};
+
+const openExternalUrl = (uri: string) => {
+  console.log('[Link] Opening URL in browser:', uri);
+  shell.openExternal(uri).catch((err: Error) => {
+    console.error('[Link] Failed to open external URL:', err);
+  });
+};
+
 // Helper: open URL in browser or file in preview
-const handleLinkActivation = (event: MouseEvent, uri: string) => {
-  // Only activate on Cmd+click (metaKey on macOS)
-  if (!event.metaKey) {
-    return;
-  }
+const handleLinkActivation = (
+  event: MouseEvent,
+  uri: string,
+  onLinkClick?: (url: string) => void
+) => {
+  suppressLinkEvent(event);
 
-  console.log('[Link] Cmd+click on:', uri);
-
-  // Check if it's a localhost URL - open in browser
-  if (uri.match(/^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)/i)) {
-    console.log('[Link] Opening localhost URL in browser:', uri);
-    shell.openExternal(uri);
-    return;
-  }
-
-  // Check if it's any other URL - open in browser
-  if (uri.match(/^https?:\/\//i)) {
-    console.log('[Link] Opening URL in browser:', uri);
-    shell.openExternal(uri);
+  if (isHttpUrl(uri)) {
+    if (onLinkClick) {
+      console.log('[Link] Opening URL via contextual handler:', uri);
+      onLinkClick(uri);
+    } else {
+      openExternalUrl(uri);
+    }
     return;
   }
 
@@ -1345,6 +1354,12 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         cursorStyle: 'block',
         allowTransparency: false,
         allowProposedApi: true, // Required for SearchAddon
+        linkHandler: {
+          activate: (event: MouseEvent, uri: string) => {
+            handleLinkActivation(event, uri, onLinkClickRef.current);
+          },
+          allowNonHttpProtocols: false,
+        },
         scrollback: 10000
       });
 
@@ -1364,11 +1379,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       term.loadAddon(serializeAddon);
       term.loadAddon(searchAddon);
       term.loadAddon(new WebLinksAddon((event, uri) => {
-        if (onLinkClickRef.current && event.metaKey && uri.match(/^https?:\/\//i)) {
-          onLinkClickRef.current(uri);
-        } else {
-          handleLinkActivation(event, uri);
-        }
+        handleLinkActivation(event, uri, onLinkClickRef.current);
       }));
 
       // UUID Link Provider — clickable Task IDs from MCP delegation
@@ -2043,6 +2054,12 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           cursorStyle: 'block',
           allowTransparency: false,
           allowProposedApi: true, // Required for SearchAddon
+          linkHandler: {
+            activate: (event: MouseEvent, uri: string) => {
+              handleLinkActivation(event, uri, onLinkClickRef.current);
+            },
+            allowNonHttpProtocols: false,
+          },
           scrollback: 50000
         });
 
@@ -2057,12 +2074,8 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         term.loadAddon(serializeAddon);
         term.loadAddon(searchAddon);
         term.loadAddon(new WebLinksAddon((event, uri) => {
-        if (onLinkClickRef.current && event.metaKey && uri.match(/^https?:\/\//i)) {
-          onLinkClickRef.current(uri);
-        } else {
-          handleLinkActivation(event, uri);
-        }
-      }));
+          handleLinkActivation(event, uri, onLinkClickRef.current);
+        }));
 
         // UUID Link Provider — clickable Task IDs from MCP delegation
         term.registerLinkProvider({

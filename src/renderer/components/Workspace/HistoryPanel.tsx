@@ -491,14 +491,6 @@ const draftGrabErrorText = (result: AgentDraftGrabResult | null | undefined) => 
   return DRAFT_GRAB_ERROR_MESSAGES[code] || ('Draft grab failed: ' + code);
 };
 
-const appendPromptText = (base: string, addition: string) => {
-  const left = base.trimEnd();
-  const right = addition.trim();
-  if (!right) return left;
-  if (!left) return right;
-  return left + '\n\n' + right;
-};
-
 const prependPromptText = (base: string, addition: string) => {
   const left = addition.trim();
   const right = base.trimStart();
@@ -506,6 +498,40 @@ const prependPromptText = (base: string, addition: string) => {
   if (!right) return left;
   return left + '\n\n' + right;
 };
+
+const prependPromptTextOnce = (base: string, addition: string) => {
+  const left = addition.trim();
+  const right = base.trim();
+  if (!left) return base;
+  if (
+    right === left ||
+    right.startsWith(left + '\n\n') ||
+    right.endsWith('\n\n' + left) ||
+    right.includes('\n\n' + left + '\n\n')
+  ) {
+    return base;
+  }
+  return prependPromptText(base, left);
+};
+
+function HistorySpinner({ size = 14, flexShrink = 0 }: { size?: number; flexShrink?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      style={{
+        animation: 'spinner-rotate 0.85s linear infinite',
+        transformOrigin: '50% 50%',
+        willChange: 'transform',
+        flexShrink,
+        display: 'block',
+      }}
+    >
+      <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" />
+    </svg>
+  );
+}
 
 const getDraftNoticeMeta = (message: string) => {
   if (/terminal input is empty/i.test(message)) {
@@ -643,9 +669,9 @@ function ClaudeHistoryQuestionCard({
         )}
         <div style={{ flex: 1 }} />
         {answering && (
-          <svg width="13" height="13" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite', flexShrink: 0 }}>
-            <circle cx="8" cy="8" r="6" fill="none" stroke={QUESTION_PURPLE} strokeWidth="2" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" />
-          </svg>
+          <span style={{ color: QUESTION_PURPLE, flexShrink: 0 }}>
+            <HistorySpinner size={13} />
+          </span>
         )}
       </div>
 
@@ -815,7 +841,13 @@ function AgentHistoryControls({
 }) {
   const runtime = useMemo(() => getHistoryAgentRuntime(toolType), [toolType]);
   const [status, setStatus] = useState<AgentPtyStatus>('inactive');
-  const [prompt, setPrompt] = useState('');
+  const prompt = useUIStore(useCallback((s) => s.historyPromptDrafts[tabId] || '', [tabId]));
+  const setHistoryPromptDraft = useUIStore((s) => s.setHistoryPromptDraft);
+  const setPrompt = useCallback((next: string | ((prev: string) => string)) => {
+    const current = useUIStore.getState().historyPromptDrafts[tabId] || '';
+    const value = typeof next === 'function' ? next(current) : next;
+    setHistoryPromptDraft(tabId, value);
+  }, [setHistoryPromptDraft, tabId]);
   const [busyAction, setBusyAction] = useState<'resume' | 'send' | 'interrupt' | 'stop' | 'grab' | null>(null);
   const [isPasteBusy, setIsPasteBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1018,7 +1050,8 @@ function AgentHistoryControls({
     const handleInterruptRecovery = (_: any, data: { tabId?: string; busy?: boolean; reason?: string }) => {
       if (data?.tabId !== tabId || data.busy) return;
       console.log('[' + runtime.logPrefix + ':draft] interrupt-event tab=' + tabId.slice(-12) + ' reason=' + (data.reason || '-') + ' hasPending=' + !!midstreamPromptRecoveryRef.current);
-      if (data.reason !== 'interrupt') {
+      const recoveryReasons = runtime.interruptRecoveryReasons || ['interrupt'];
+      if (!recoveryReasons.includes(data.reason || '')) {
         midstreamPromptRecoveryRef.current = null;
         return;
       }
@@ -1048,19 +1081,27 @@ function AgentHistoryControls({
           if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
           if (tabIdRef.current !== requestTabId) return;
           console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery probe tab=' + tabId.slice(-12) + ' attempt=' + (attempt + 1) + ' delayMs=' + delay);
-          const draft = await readTerminalDraft('interrupt-recovery-' + (attempt + 1));
-          if (draft.stale || tabIdRef.current !== requestTabId) return;
-          if (!draft.text) {
-            console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery empty tab=' + tabId.slice(-12) + ' attempt=' + (attempt + 1));
-            continue;
+          try {
+            const draft = await readTerminalDraft('interrupt-recovery-' + (attempt + 1));
+            if (draft.stale || tabIdRef.current !== requestTabId) return;
+            if (!draft.text) {
+              console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery empty tab=' + tabId.slice(-12) + ' attempt=' + (attempt + 1));
+              continue;
+            }
+            setPrompt((prev) => prependPromptTextOnce(prev, draft.text));
+            setDraftWarning(runtime.label + ' returned an interrupted prompt; pulled it back from terminal input.');
+            console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery restored tab=' + tabId.slice(-12) + ' source=terminal attempt=' + (attempt + 1) + ' chars=' + draft.text.length + ' images=' + draft.images);
+            requestAnimationFrame(() => promptTextareaRef.current?.focus());
+            return;
+          } catch (e: any) {
+            console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery probe-failed tab=' + tabId.slice(-12) + ' attempt=' + (attempt + 1) + ': ' + String(e?.message || e));
           }
-          setPrompt((prev) => prependPromptText(prev, draft.text));
-          setDraftWarning('Claude returned an interrupted prompt; pulled it back from terminal input.');
-          console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery restored tab=' + tabId.slice(-12) + ' attempt=' + (attempt + 1) + ' chars=' + draft.text.length + ' images=' + draft.images);
-          requestAnimationFrame(() => promptTextareaRef.current?.focus());
-          return;
         }
-        console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery gave-up tab=' + tabId.slice(-12) + ' probes=' + delays.length + ' sentChars=' + pending.text.length);
+        if (tabIdRef.current !== requestTabId) return;
+        setPrompt((prev) => prependPromptTextOnce(prev, pending.text));
+        setDraftWarning(runtime.label + ' interrupted prompt restored from last sent text; terminal draft was not readable.');
+        console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery restored tab=' + tabId.slice(-12) + ' source=sent-fallback probes=' + delays.length + ' sentChars=' + pending.text.length);
+        requestAnimationFrame(() => promptTextareaRef.current?.focus());
       })()
         .catch((e: any) => {
           console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
@@ -1154,13 +1195,13 @@ function AgentHistoryControls({
           const terminalDraft = await readTerminalDraft('send-preflight');
           if (terminalDraft.stale || tabIdRef.current !== actionTabId) return;
           if (terminalDraft.text) {
-            text = appendPromptText(text, terminalDraft.text);
+            text = prependPromptText(text, terminalDraft.text);
             setPrompt(text);
-            setDraftWarning('Terminal draft found — send stopped, text appended here.');
+            setDraftWarning('Terminal draft found — send stopped, text moved to top.');
             console.log('[' + runtime.logPrefix + ':draft] send-preflight blocked tab=' + tabId.slice(-12) + ' chars=' + terminalDraft.text.length + ' images=' + terminalDraft.images);
             requestAnimationFrame(() => promptTextareaRef.current?.focus());
             if (terminalDraft.images > 0) {
-              setDraftWarning('Terminal draft found — send stopped, text appended here. Review image placeholders.');
+              setDraftWarning('Terminal draft found — send stopped, text moved to top. Review image placeholders.');
             }
             return;
           }
@@ -1432,9 +1473,7 @@ function AgentHistoryControls({
               }}
             >
               {busyAction === 'grab' ? (
-                <svg width="14" height="14" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite' }}>
-                  <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" />
-                </svg>
+                <HistorySpinner size={14} />
               ) : (
                 <ArrowDown size={14} />
               )}
@@ -1460,9 +1499,7 @@ function AgentHistoryControls({
               }}
             >
               {busyAction === 'send' ? (
-                <svg width="14" height="14" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite' }}>
-                  <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" />
-                </svg>
+                <HistorySpinner size={14} />
               ) : (
                 <Send size={14} />
               )}
@@ -2224,9 +2261,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
         {loading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#818cf8', fontSize: 13, gap: 8 }}>
-            <svg width="16" height="16" viewBox="0 0 16 16" style={{ animation: 'spinner-rotate 1s linear infinite', willChange: 'transform' }}>
-              <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" />
-            </svg>
+            <HistorySpinner size={16} />
             Loading...
           </div>
         ) : entries.length === 0 ? (

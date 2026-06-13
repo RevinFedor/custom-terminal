@@ -9,6 +9,8 @@
 
 Tab.sessionStatus в типах поднят до `string` (раньше был union из трёх литералов). Расширение для custom-id'ов. Backward compat: старые БД с `'dev'`/`'bugfix'`/`'knowledge'` ID'ами продолжают работать — те же id в дефолт-seed.
 
+`TabGroup.sessionStatus` хранит такой же id и рисуется тем же marker shape/size на group-row. Это не отдельная палитра папок: пользовательские статусы описывают рабочое состояние сущности в сайдбаре, а не только terminal tab. Групповой статус живёт в `projects.tab_groups` JSON вместе с именем/collapse/color группы, а не в SQLite `tabs` или `tab_history`.
+
 ## Graceful degrade при удалении статуса
 
 Юзер удаляет статус из Settings → статус исчезает из `sessionStatuses`. Tab.sessionStatus в БД **не чистится** — там остаётся id удалённого статуса. Маркер просто не рендерится (`sessionStatuses.find(s => s.id === tab.sessionStatus)` возвращает undefined → guard в TabBar.tsx).
@@ -29,9 +31,9 @@ Hex normalizer (`normalizeHexValue`) принимает `'fff'` / `'#fff'` / `'f
 
 Цветной круг — кнопка, клик открывает `react-colorful` HexColorPicker (2D saturation×brightness + hue slider, ~3kb gzipped, без peer-deps). Picker открывается popup'ом под строкой, click-outside через `window.mousedown` listener с containment check на `containerRef`.
 
-## Submenu preview в ПКМ-меню вкладки
+## Submenu preview в ПКМ-меню вкладки/группы
 
-Справа от лейбла `Status ›` в context menu отрисовываются 3 первых статуса как мини-точки 8px — preview палитры. Юзер видит «эта строка управляет вон теми цветными точками внутри вкладок» без открытия submenu. Если статусов >3 — показываются первые 3 (slice(0, 6) в исходнике как safety, но cap в 3-4 точки достаточен визуально).
+Справа от лейбла `Status ›` в context menu отрисовываются 3 первых статуса как мини-точки 8px — preview палитры. Юзер видит «эта строка управляет вон теми цветными точками внутри вкладок/групп» без открытия submenu. Если статусов >3 — показываются первые 3 (slice(0, 6) в исходнике как safety, но cap в 3-4 точки достаточен визуально). Тот же submenu используется для обычного tab-row и group-row, чтобы статус не становился tab-only настройкой.
 
 В развёрнутом submenu — полный список с галочкой ✓ у выбранного. Toggle-семантика: клик на уже выбранный статус снимает его (`isSelected ? null : s.id`). Отдельной «Без статуса» кнопки нет — повторный клик и есть «снять».
 
@@ -39,7 +41,7 @@ Hex normalizer (`normalizeHexValue`) принимает `'fff'` / `'#fff'` / `'f
 
 ## Persistence
 
-localStorage ключ `noted-terminal-session-statuses` (массив JSON). `statusMarker` отдельным ключом `noted-terminal-status-marker`. Tab.sessionStatus идёт через стандартный saveTabs → SQLite. **Не зеркалится в SQLite через `app:mirrorLocalStorageSync`** — это локальная UI-настройка, синк между Electron-инстансами на разных машинах для конфигурации статусов не нужен (одна машина = одна палитра).
+localStorage ключ `noted-terminal-session-statuses` (массив JSON). `statusMarker` отдельным ключом `noted-terminal-status-marker`. Tab.sessionStatus идёт через стандартный saveTabs → SQLite; TabGroup.sessionStatus идёт через saveTabGroups → JSON `tab_groups`. **Не зеркалится в SQLite через `app:mirrorLocalStorageSync`** — это локальная UI-настройка, синк между Electron-инстансами на разных машинах для конфигурации статусов не нужен (одна машина = одна палитра).
 
 ## Survival across close/restore
 

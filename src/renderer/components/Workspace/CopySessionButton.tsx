@@ -80,7 +80,7 @@ function ToolGroupLabel({ tools, hint }: { tools: string[]; hint?: string }) {
 
 interface CopySessionButtonProps {
   activeTabId: string | null;
-  sessionType: 'claude' | 'gemini' | null;
+  sessionType: 'claude' | 'gemini' | 'codex' | null;
 }
 
 // Compact Copy Session button placed under the Claude/Gemini session block in
@@ -104,6 +104,9 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
     copyIncludeThinking: includeThinking, setCopyIncludeThinking: setIncludeThinking,
     copyIncludeBash: includeBash, setCopyIncludeBash: setIncludeBash,
     copyIncludeTools: includeTools, setCopyIncludeTools: setIncludeTools,
+    copyIncludeWebSearch: includeWebSearch, setCopyIncludeWebSearch: setIncludeWebSearch,
+    copyIncludeToolSearch: includeToolSearch, setCopyIncludeToolSearch: setIncludeToolSearch,
+    copyIncludeOtherTools: includeOtherTools, setCopyIncludeOtherTools: setIncludeOtherTools,
   } = useUIStore();
 
   const { activeProjectId, getActiveProject, getSelectedTabs } = useWorkspaceStore();
@@ -145,8 +148,10 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
   }, [showInputPopup]);
 
   const isGemini = sessionType === 'gemini';
-  const accent = isGemini ? '#4E86F8' : '#DA7756';
-  const accentRgba = isGemini ? 'rgba(78,134,248,' : 'rgba(218,119,86,';
+  const isCodex = sessionType === 'codex';
+  const accent = isGemini ? '#4E86F8' : isCodex ? '#10A37F' : '#DA7756';
+  const accentRgba = isGemini ? 'rgba(78,134,248,' : isCodex ? 'rgba(16,163,127,' : 'rgba(218,119,86,';
+  const toggleColor = isCodex ? 'bg-[#10A37F]' : 'bg-[#DA7756]';
 
   const selectedTabs = activeProjectId ? getSelectedTabs(activeProjectId) : [];
   const isMultiSelect = selectedTabs.length > 1;
@@ -156,7 +161,7 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
     if (!activeProject) { showToast('No active project', 'error'); return; }
 
     const tabsToCopy = isMultiSelect ? selectedTabs : (activeTabId ? [activeProject.tabs.get(activeTabId)] : []);
-    const validTabs = tabsToCopy.filter(t => t && (t.claudeSessionId || t.geminiSessionId || overrideInput));
+    const validTabs = tabsToCopy.filter(t => t && (t.claudeSessionId || t.geminiSessionId || t.codexSessionId || overrideInput));
     if (validTabs.length === 0) { showToast('Нет сессий для копирования', 'warning'); return; }
 
     setIsCopying(true);
@@ -166,18 +171,19 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
         if (!tab) continue;
         let targetId = '';
         let parsedCwd = '';
-        let kind: 'claude' | 'gemini' = 'claude';
+        let kind: 'claude' | 'gemini' | 'codex' = 'claude';
 
         if (overrideInput) {
           const uuidMatch = overrideInput.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
           const cwdMatch = overrideInput.match(/cwd:\s*(\/[^\s\n]+)/i);
           if (uuidMatch) targetId = uuidMatch[0];
           if (cwdMatch) parsedCwd = cwdMatch[1];
-          kind = tab.geminiSessionId ? 'gemini' : 'claude';
+          kind = tab.codexSessionId ? 'codex' : tab.geminiSessionId ? 'gemini' : 'claude';
         }
         if (!targetId) {
           if (tab.claudeSessionId) { targetId = tab.claudeSessionId; kind = 'claude'; }
           else if (tab.geminiSessionId) { targetId = tab.geminiSessionId; kind = 'gemini'; }
+          else if (tab.codexSessionId) { targetId = tab.codexSessionId; kind = 'codex'; }
         }
         if (!targetId) continue;
 
@@ -187,11 +193,19 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
         let result;
         if (kind === 'gemini') {
           result = await ipcRenderer.invoke('gemini:copy-range', { sessionId: targetId, cwd, startUuid: null, endUuid: null });
+        } else if (kind === 'codex') {
+          result = await ipcRenderer.invoke('codex:export-clean-session', {
+            sessionId: targetId, cwd, includeEditing, includeReading, fromStart,
+            includeSubagentResult, includeSubagentHistory,
+            includeUser, includeClaude, includeText, includeThinking, includeBash, includeTools,
+            includeWebSearch, includeToolSearch, includeOtherTools,
+          });
         } else {
           result = await ipcRenderer.invoke('claude:export-clean-session', {
             sessionId: targetId, cwd, includeEditing, includeReading, fromStart,
             includeSubagentResult, includeSubagentHistory,
             includeUser, includeClaude, includeText, includeThinking, includeBash, includeTools,
+            includeWebSearch, includeToolSearch, includeOtherTools,
           });
         }
         if (result?.success) allResults.push(result.content);
@@ -213,7 +227,8 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
     }
   }, [activeTabId, isMultiSelect, selectedTabs, getActiveProject, showToast,
       includeEditing, includeReading, fromStart, includeSubagentResult, includeSubagentHistory,
-      includeUser, includeClaude, includeText, includeThinking, includeBash, includeTools]);
+      includeUser, includeClaude, includeText, includeThinking, includeBash, includeTools,
+      includeWebSearch, includeToolSearch, includeOtherTools]);
 
   return (
     <>
@@ -330,21 +345,37 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
                 <div style={{ fontSize: '9px', textTransform: 'uppercase', fontWeight: 700, color: '#777', borderBottom: '1px solid #2a2a2a', paddingBottom: 6, marginBottom: 4, letterSpacing: '0.05em' }}>
                   Настройки копирования
                 </div>
-                <ToggleRow label="👤 User" active={includeUser} color="bg-[#DA7756]" onToggle={() => setIncludeUser(!includeUser)} />
-                <ToggleRow label={<span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><ClaudeSparkle size={12} color="#DA7756" /> Claude</span>} active={includeClaude} color="bg-[#DA7756]" onToggle={() => setIncludeClaude(!includeClaude)} />
-                <ToggleRow label={<span style={{ fontStyle: 'italic' }}>«answer»</span>} active={includeText} color="bg-[#DA7756]" disabled={!includeClaude} indent onToggle={() => setIncludeText(!includeText)} />
-                <ToggleRow label={<span style={{ fontStyle: 'italic' }}>«thinking»</span>} active={includeThinking} color="bg-[#DA7756]" disabled={!includeClaude} indent onToggle={() => setIncludeThinking(!includeThinking)} />
-                <ToggleRow label={<ToolGroupLabel tools={['read_file']} />} active={includeReading} color="bg-[#DA7756]" disabled={!includeClaude} indent onToggle={() => setIncludeReading(!includeReading)} />
-                <ToggleRow label={<ToolGroupLabel tools={['edit', 'write']} />} active={includeEditing} color="bg-[#DA7756]" disabled={!includeClaude} indent onToggle={() => setIncludeEditing(!includeEditing)} />
-                <ToggleRow label={<ToolGroupLabel tools={['bash', 'monitor', 'grep', 'glob']} hint="shell" />} active={includeBash} color="bg-[#DA7756]" disabled={!includeClaude} indent onToggle={() => setIncludeBash(!includeBash)} />
-                <ToggleRow label={<ToolGroupLabel tools={['mcp__*', 'web_search']} hint="MCP и прочее" />} active={includeTools} color="bg-[#DA7756]" disabled={!includeClaude} indent isLastChild onToggle={() => setIncludeTools(!includeTools)} />
+                <ToggleRow label="👤 User" active={includeUser} color={toggleColor} onToggle={() => setIncludeUser(!includeUser)} />
+                <ToggleRow
+                  label={isCodex
+                    ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: '#10A37F' }}>Codex</span>
+                    : <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><ClaudeSparkle size={12} color="#DA7756" /> Claude</span>}
+                  active={includeClaude}
+                  color={toggleColor}
+                  onToggle={() => setIncludeClaude(!includeClaude)}
+                />
+                <ToggleRow label={<span style={{ fontStyle: 'italic' }}>«answer»</span>} active={includeText} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeText(!includeText)} />
+                {!isCodex && (
+                  <ToggleRow label={<span style={{ fontStyle: 'italic' }}>«thinking»</span>} active={includeThinking} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeThinking(!includeThinking)} />
+                )}
+                {!isCodex && (
+                  <ToggleRow label={<ToolGroupLabel tools={['read_file']} />} active={includeReading} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeReading(!includeReading)} />
+                )}
+                <ToggleRow label={<ToolGroupLabel tools={isCodex ? ['apply_patch'] : ['edit', 'write']} />} active={includeEditing} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeEditing(!includeEditing)} />
+                <ToggleRow label={<ToolGroupLabel tools={isCodex ? ['exec_command', 'write_stdin'] : ['bash', 'monitor', 'grep', 'glob']} hint="shell" />} active={includeBash} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeBash(!includeBash)} />
+                <ToggleRow label={<ToolGroupLabel tools={['mcp__*']} hint="MCP" />} active={includeTools} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeTools(!includeTools)} />
+                <ToggleRow label={<ToolGroupLabel tools={['web_search']} />} active={includeWebSearch} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeWebSearch(!includeWebSearch)} />
+                {isCodex && (
+                  <ToggleRow label={<ToolGroupLabel tools={['tool_search']} />} active={includeToolSearch} color={toggleColor} disabled={!includeClaude} indent onToggle={() => setIncludeToolSearch(!includeToolSearch)} />
+                )}
+                <ToggleRow label={<ToolGroupLabel tools={['other_tools']} />} active={includeOtherTools} color={toggleColor} disabled={!includeClaude} indent isLastChild onToggle={() => setIncludeOtherTools(!includeOtherTools)} />
 
                 <div style={{ height: 1, backgroundColor: '#2a2a2a', margin: '6px 0' }} />
 
                 <ToggleRow
                   label="🧵 Субагенты"
                   active={includeSubagentResult || includeSubagentHistory}
-                  color="bg-[#DA7756]"
+                  color={toggleColor}
                   onToggle={() => {
                     if (includeSubagentResult || includeSubagentHistory) {
                       setIncludeSubagentHistory(false);
@@ -354,12 +385,15 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
                     }
                   }}
                 />
-                <ToggleRow label={<span>Финальный результат <span style={{ color: '#666', fontSize: '10px' }}>— ответ Task</span></span>} active={includeSubagentResult} color="bg-[#DA7756]" disabled={!(includeSubagentResult || includeSubagentHistory)} indent onToggle={() => setIncludeSubagentResult(!includeSubagentResult)} />
-                <ToggleRow label={<span>Вся история <span style={{ color: '#666', fontSize: '10px' }}>— все шаги</span></span>} active={includeSubagentHistory} color="bg-[#DA7756]" disabled={!(includeSubagentResult || includeSubagentHistory)} indent isLastChild onToggle={() => setIncludeSubagentHistory(!includeSubagentHistory)} />
+                <ToggleRow label={<span>Финальный результат <span style={{ color: '#666', fontSize: '10px' }}>— {isCodex ? 'ответ wait_agent' : 'ответ Task'}</span></span>} active={includeSubagentResult} color={toggleColor} disabled={!(includeSubagentResult || includeSubagentHistory)} indent onToggle={() => setIncludeSubagentResult(!includeSubagentResult)} />
+                <ToggleRow label={<span>Вся история <span style={{ color: '#666', fontSize: '10px' }}>— {isCodex ? 'spawn/wait/send' : 'все шаги'}</span></span>} active={includeSubagentHistory} color={toggleColor} disabled={!(includeSubagentResult || includeSubagentHistory)} indent isLastChild onToggle={() => setIncludeSubagentHistory(!includeSubagentHistory)} />
 
-                <div style={{ height: 1, backgroundColor: '#2a2a2a', margin: '6px 0' }} />
-
-                <ToggleRow label="От fork" active={!fromStart} color="bg-[#DA7756]" onToggle={() => setFromStart(!fromStart)} />
+                {!isCodex && (
+                  <>
+                    <div style={{ height: 1, backgroundColor: '#2a2a2a', margin: '6px 0' }} />
+                    <ToggleRow label="От fork" active={!fromStart} color={toggleColor} onToggle={() => setFromStart(!fromStart)} />
+                  </>
+                )}
               </div>
             </div>
           </SettingsPortal>

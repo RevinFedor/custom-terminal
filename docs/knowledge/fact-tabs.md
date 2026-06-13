@@ -12,6 +12,8 @@
 ### Persistence Guard
 При создании таба через `createTabAfterCurrent` с опциями `{ nameSetManually: true }` флаг сохраняется в БД и блокирует авто-переименование в `setTabCommandType`. Это критично для вкладок типа `docs-XX`, которые не должны перезаписываться на `claude`/`gemini` при запуске AI.
 
+Inline rename становится manual ownership только если значение реально изменилось. Fresh tab может быть создан в режиме редактирования имени; клик по кнопке Claude/Codex блюрит input, но unchanged `tab-N` не должен вызывать `renameTab` и ставить `nameSetManually=true`. Флаг manual-name персистится вместе с табом и историей закрытых вкладок, поэтому Cmd+Shift+T должен восстановить именно прежний ownership: вручную названная вкладка остаётся защищённой, unchanged auto-name остаётся доступным для первого AI auto-title.
+
 ### AI auto-title по первому пользовательскому prompt
 Claude/Codex вкладка может получить человекочитаемое имя через встроенный prompt `tab-title` из Settings → AI. Prompt редактируемый пользователем; приложение только передаёт в Gemini первое **реальное** user-сообщение из Timeline/Codex rollout и применяет короткий ответ как название вкладки. Служебные команды (`#pack`, `#effort`, `#usage`, slash-команды модели/статуса/help/compact/exit и т.п.) не считаются первым prompt'ом — иначе вкладка получит название по настройке runtime, а не по задаче пользователя.
 
@@ -20,6 +22,8 @@ Claude/Codex вкладка может получить человекочита
 `nameSetManually` сильнее AI: если пользователь переименовал вкладку до запуска агента, auto-title не армится; если переименовал после запуска, pending consume'ится без Gemini-вызова. ПКМ по любой Claude/Codex вкладке → `Обновить название` — отдельный явный override: он читает текущий Timeline напрямую, показывает per-tab loader `Название обновляется...`, применяет с `overrideManualName:true` и затем помечает результат как ручное имя, чтобы будущие автоматические запуски его не перетёрли.
 
 Шрам из production: fresh Codex вкладка `tab-2` получила session id `019ebbb1-76ef-79e1-a0ea-e2c4615742e0`, первый prompt был про настройку GPT-5.4/1M context, но auto-title не стартовал; ручное `Обновить название` сразу сработало и переименовало вкладку в `Настройка контекста 1М в Codex`. Логи показали, что запуск шёл через отдельный `ClaudeControlBar.startCodexTab`: `setTabCommandType` создал snapshot, но этот путь не вызывал `markAiLaunchAutoTitle`, поэтому `setCodexSessionId(..., reason:'detected')` не видел eligible snapshot и не армил pending. Любой новый launch-entrypoint для Claude/Codex обязан помечать auto-title eligibility там же, где он превращает pristine tab в AI tab; resume/fork/restore paths, наоборот, должны писать session id с reason, который auto-title не армит.
+
+Второй prod-шрам: вкладка `019ebd84-a092-7f70-9dd9-be05e37b8a66` (`tab-1`, Codex, session id записался, первый prompt был отправлен) осталась с generic именем, хотя пользователь имя не менял; ПКМ `Обновить название` позже сработал. Трасса показала свежий tab в inline rename, затем клик запуска Codex: blur старого rename submit'ил unchanged `tab-1` как ручное имя, и auto-title skip'ался по manual guard. Защита двойная: TabBar сравнивает edit value с исходным и не вызывает rename на unchanged blur/Enter, а `renameTab` сам no-op'ит unchanged trim; auto-title arm логирует skip-reason (`manual-name`, `existing-session`, `no-snapshot` и т.п.), чтобы следующий такой случай не выглядел как «Gemini не вызвался без причины».
 
 ## User Flow: Жизненный цикл таба
 1. **Создание:** Пользователь нажимает `Cmd+T` или делает двойной клик на пустом месте TabBar.
@@ -208,15 +212,25 @@ Status marker 8px (dot или square, sizePx 4..16) рисуется absolute н
 
 В `TabSidebar` есть две независимые иерархии. `groupId` + `tabGroups` — реальные группы сайдбара: group-row существует как отдельная строка, хранит имя, может быть переименован double-click'ом/ПКМ → Rename, закрыт middle-click'ом или через ПКМ → Close Group, либо удалён как контейнер через ПКМ → Delete Group. Close Group закрывает вкладки группы и потом удаляет контейнер; Delete Group сохраняет вкладки, только очищает у них `groupId`. Group-row намеренно использует те же `tabsFontSize`, `tabGeometry`, padding/minHeight/radius и click-target, что и обычная вкладка: группа отличается цветом, иконкой и стилем, но не плотностью строки.
 
+Создание group-row через EmptyDropZone → `New Group` сразу открывает inline rename, как `Cmd+T`/double-click для новой вкладки. Дефолтное имя группы — только временный draft, пользовательский следующий жест почти всегда «назвать контейнер», поэтому cursor/focus должен оказаться в названии без отдельного double-click.
+
+Сворачивание группы — отдельный локальный control на folder-иконке, не жест всей draggable-строки. Folder-button перехватывает `mousedown`/`click`/`doubleClick`/`contextmenu`, чтобы быстрый клик не запускал drag и не входил в rename. Cmd/Ctrl-click по всей group-row — ускоренный collapse/expand режим: на время модификатора drag и rename отключаются, cursor становится pointer, а body сворачивается через короткую grid-анимацию (~150ms). В collapsed состоянии hidden body не участвует в DnD geometry и не ловит pointer events.
+
+Group-row поддерживает те же пользовательские visual metadata, что и обычная вкладка: `sessionStatus` рисуется тем же marker shape/size слева, `color` выбирает background/folder accent из `TAB_COLORS`. ПКМ по группе зеркалит tab-context menu для Status и Background: повторный клик по выбранному статусу снимает его, а пустой список статусов показывает тот же hint про Settings → Системные. Статусы групп живут в `tabGroups` JSON, а не в `tabs`/`tab_history`.
+
 `visualParentTabId` — только визуальная связь вкладка→вкладка для thread/fork-структуры. Не использовать для этого `parentTabId`: `parentTabId` уже занят MCP sub-agent'ами и такие вкладки скрываются из основного `TabBar`, потому что живут в `SubAgentBar`. Visual-child остаётся обычной видимой вкладкой со своим session id. Split-стрелки в tab context menu привязывают вкладку к ближайшему видимому соседу сверху/снизу; `setTabVisualParent` защищает от циклов и нормализует `groupId` ребёнка под группу родителя.
 
 Drag-семантика различает parent и child: перетаскивание parent-вкладки тянет её visual-children как один блок, а перетаскивание child отдельно отвязывает `visualParentTabId`. Fork из текущей Claude/Codex/Gemini/SDK-вкладки создаёт fork как visual-child исходной вкладки, потому что пользователь хочет видеть причинную связь «из этой сессии родилась эта». Clipboard-fork по произвольному UUID остаётся плоским: source-tab может быть неизвестен, и привязка к активной вкладке была бы ложной.
+
+Закрытая вкладка помнит `groupId` в `tab_history` и при Restore/Home/Shift+Cmd+T возвращается в группу только если group-row ещё существует. Если контейнер удалён через Delete/Close Group, restore деградирует в плоскую вкладку: история восстанавливает саму рабочую сессию, но не воскресает удалённую папку.
 
 ### Vertical DnD через snapshot геометрии
 
 Вертикальный DnD использует `@atlaskit/pragmatic-drag-and-drop` как транспорт событий, но preview/drop решаются своей моделью: на drag-start фиксируется static geometry (`captureVerticalDragGeometry`), а каждый pointer-move пересчитывает layout от base-order через `resolveStaticVerticalPreview`. Не считать от live DOM: inline-preview сам меняет порядок строк, высоту групп и границы body/header, поэтому следующий hit-test видит уже мутировавшую карту и начинает дёргаться на верхней границе элемента или группы.
 
 Симптомы, которые закрывает snapshot-модель: элемент у group/header boundary прыгает то внутрь группы, то перед неё; вкладка уходит в конец группы при плавном движении по верхней границе; чёрная insertion-line не совпадает с итоговым drop; native ghost создаёт вторую визуальную вкладку у курсора. Текущая модель показывает полноценный inline-preview в списке, скрывает native ghost, а source-row во время удержания получает lift/scale и `grabbing`, чтобы пользователь видел активный drag-state до первого движения мыши.
+
+Collapsed group body исключается из snapshot: hidden tab rows не должны оставаться невидимыми drop targets. Иначе пользователь ведёт вкладку по видимому списку, а preview прыгает в закрытое тело группы, которого на экране нет.
 
 ### EmptyDropZone в vertical
 

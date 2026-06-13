@@ -65,6 +65,8 @@ export interface TabGroup {
   name: string;
   createdAt: number;
   collapsed?: boolean;
+  color?: TabColor;
+  sessionStatus?: string;
 }
 
 export interface AiLaunchSnapshot {
@@ -112,15 +114,45 @@ const armPendingAutoTabTitle = (tabId: string, toolType: AutoTabTitleTool, sessi
   console.warn('[Store:AutoTabTitle] arm tab=' + tabId.slice(-8) + ' type=' + toolType + ' sid=' + sessionId.slice(0, 8));
 };
 
-const shouldArmAutoTabTitle = (
+const getAutoTabTitleArmSkipReason = (
   tabId: string,
   toolType: AutoTabTitleTool,
   prevSessionId: string | undefined,
   nextSessionId: string
-): boolean => {
-  if (!nextSessionId || prevSessionId) return false;
+): string | null => {
+  if (!nextSessionId) return 'empty-session';
+  if (prevSessionId) return 'existing-session';
   const snapshot = aiLaunchSnapshots.get(tabId);
-  return snapshot?.sessionType === toolType && snapshot.autoTitleEligible === true && !snapshot.nameSetManually;
+  if (!snapshot) return 'no-snapshot';
+  if (snapshot.sessionType !== toolType) return 'snapshot-type-' + snapshot.sessionType;
+  if (snapshot.autoTitleEligible !== true) return 'not-eligible';
+  if (snapshot.nameSetManually) return 'manual-name';
+  return null;
+};
+
+const logAutoTabTitleArmSkip = (
+  tabId: string,
+  toolType: AutoTabTitleTool,
+  prevSessionId: string | undefined,
+  nextSessionId: string,
+  reason: string
+): void => {
+  const snapshot = aiLaunchSnapshots.get(tabId);
+  console.warn(
+    '[Store:AutoTabTitle] skip-arm tab=' + tabId.slice(-8) +
+    ' type=' + toolType +
+    ' sid=' + (nextSessionId ? nextSessionId.slice(0, 8) : 'null') +
+    ' reason=' + reason +
+    ' prev=' + (prevSessionId ? prevSessionId.slice(0, 8) : 'null') +
+    ' snapshot=' + (snapshot
+      ? JSON.stringify({
+          type: snapshot.sessionType,
+          eligible: snapshot.autoTitleEligible === true,
+          manual: snapshot.nameSetManually === true,
+          name: snapshot.name,
+        })
+      : 'null')
+  );
 };
 
 const consumePendingAutoTabTitle = (tabId: string, toolType: AutoTabTitleTool, sessionId: string): boolean => {
@@ -349,6 +381,12 @@ interface ProjectWorkspace {
   viewingSubAgentTabId: string | null; // When viewing a sub-agent, points to the Claude sub-agent tab
 }
 
+const resolveExistingTabGroupId = (workspace: ProjectWorkspace | undefined, rawGroupId: unknown): string | undefined => {
+  const groupId = typeof rawGroupId === 'string' && rawGroupId ? rawGroupId : undefined;
+  if (!groupId || !workspace?.tabGroups?.some(group => group.id === groupId)) return undefined;
+  return groupId;
+};
+
 const isAiRuntimeTab = (tab?: Pick<Tab, 'commandType' | 'tabType'> | null): boolean => {
   return !!tab && (tab.tabType === 'claude-sdk' || tab.commandType === 'claude' || tab.commandType === 'gemini' || tab.commandType === 'codex');
 };
@@ -381,6 +419,7 @@ interface WorkspaceStore {
   projectHistory: string[]; // Stack of project IDs in order of activation
   isRestoring: boolean;
   pendingEditTabId: string | null; // Set after createTab to trigger inline rename; consumed once by TabBar
+  tabTitleNamingIds: Set<string>; // Transient UI-only loader while Gemini generates a tab title
 
   // Terminal buffer serialization (for preserving history on unmount/remount)
   terminalBuffers: Map<string, string>;
@@ -408,6 +447,7 @@ interface WorkspaceStore {
   switchTab: (projectId: string, tabId: string) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
   autoRenameTab: (tabId: string, newName: string, options?: { toolType?: 'claude' | 'gemini' | 'codex'; sessionId?: string; overrideManualName?: boolean; markNameSetManually?: boolean }) => boolean;
+  setTabTitleNaming: (tabId: string, naming: boolean) => void;
   consumePendingAutoTabTitle: (tabId: string, toolType: AutoTabTitleTool, sessionId: string) => boolean;
 
   // Selection
@@ -438,6 +478,8 @@ interface WorkspaceStore {
   createTabGroup: (projectId: string, name?: string) => string;
   renameTabGroup: (projectId: string, groupId: string, name: string) => void;
   toggleTabGroupCollapsed: (projectId: string, groupId: string) => void;
+  setTabGroupColor: (projectId: string, groupId: string, color: TabColor) => void;
+  setTabGroupSessionStatus: (projectId: string, groupId: string, status: string | null) => void;
   deleteTabGroup: (projectId: string, groupId: string) => void;
   setTabVisualParent: (projectId: string, tabId: string, parentTabId: string | undefined) => void;
   applyTabLayout: (projectId: string, orderedIds: string[], groupAssignments?: Record<string, string | null | undefined>, visualParentAssignments?: Record<string, string | null | undefined>) => void;
@@ -611,6 +653,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   projectHistory: [],
   isRestoring: false,
   pendingEditTabId: null,
+  tabTitleNamingIds: new Set(),
 
   // Terminal buffer serialization
   terminalBuffers: new Map(),
@@ -1594,6 +1637,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           codexModel: tab.codexModel,
           codexEffort: tab.codexEffort,
           sessionStatus: tab.sessionStatus,
+          groupId: tab.groupId,
           position: closedPosition >= 0 ? closedPosition : null,
           processWasRunning,
         }
@@ -1695,6 +1739,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       .map(t => t.id);
     const hinted = typeof entry.position === 'number' ? entry.position : mainTabIds.length;
     const targetIndex = Math.max(0, Math.min(mainTabIds.length, hinted));
+    const restoredGroupId = resolveExistingTabGroupId(workspace, entry.group_id);
 
     // createTab appends at the end of main zone — we then shuffle the new tab
     // into the saved slot by rebuilding the Map in the right order. This avoids
@@ -1712,6 +1757,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       codexModel: entry.codex_model || undefined,
       codexEffort: entry.codex_effort || undefined,
       sessionStatus: entry.session_status || undefined,
+      nameSetManually: entry.name_set_manually === 1,
+      groupId: restoredGroupId,
     });
 
     // Re-order: pull the freshly-created tab out and splice it at targetIndex
@@ -1797,11 +1844,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   renameTab: (projectId, tabId, newName) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
+    const cleanName = newName.trim();
+    if (!cleanName) return;
 
     if (workspace) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
-        tab.name = newName;
+        if (tab.name === cleanName) {
+          console.warn('[Store:renameTab] noop unchanged tab=' + tabId.slice(-8) + ' name=' + JSON.stringify(cleanName));
+          return;
+        }
+        tab.name = cleanName;
         tab.nameSetManually = true;
         set({ openProjects: new Map(openProjects) });
 
@@ -1868,6 +1921,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       return true;
     }
     return false;
+  },
+
+  setTabTitleNaming: (tabId, naming) => {
+    const { tabTitleNamingIds } = get();
+    const has = tabTitleNamingIds.has(tabId);
+    if (has === naming) return;
+    const next = new Set(tabTitleNamingIds);
+    if (naming) next.add(tabId);
+    else next.delete(tabId);
+    set({ tabTitleNamingIds: next });
   },
 
   consumePendingAutoTabTitle: (tabId, toolType, sessionId) => {
@@ -1955,7 +2018,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               overlayDismissed: tab.overlayDismissed,
               at: Date.now(),
             });
-            console.warn('[Store:AiLaunchSnapshot] capture tab=' + tabId.slice(-8) + ' type=' + commandType + ' prevCommand=' + (tab.commandType || 'null') + ' name=' + JSON.stringify(tab.name) + ' color=' + (tab.color || 'null'));
+            console.warn('[Store:AiLaunchSnapshot] capture tab=' + tabId.slice(-8) + ' type=' + commandType + ' prevCommand=' + (tab.commandType || 'null') + ' name=' + JSON.stringify(tab.name) + ' color=' + (tab.color || 'null') + ' manualName=' + (tab.nameSetManually === true));
           }
         }
 
@@ -2317,6 +2380,30 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     saveTabGroups(projectId, workspace.tabGroups);
   },
 
+  setTabGroupColor: (projectId, groupId, color) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+
+    workspace.tabGroups = workspace.tabGroups.map(group =>
+      group.id === groupId ? { ...group, color } : group
+    );
+    set({ openProjects: new Map(openProjects) });
+    saveTabGroups(projectId, workspace.tabGroups);
+  },
+
+  setTabGroupSessionStatus: (projectId, groupId, status) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+
+    workspace.tabGroups = workspace.tabGroups.map(group =>
+      group.id === groupId ? { ...group, sessionStatus: status || undefined } : group
+    );
+    set({ openProjects: new Map(openProjects) });
+    saveTabGroups(projectId, workspace.tabGroups);
+  },
+
   deleteTabGroup: (projectId, groupId) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
@@ -2533,8 +2620,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           tab.claudeSessionHistory = hist.slice(0, 5);
         }
 
-        if (reason === 'bridge' && shouldArmAutoTabTitle(tabId, 'claude', prev, sessionId)) {
-          armPendingAutoTabTitle(tabId, 'claude', sessionId);
+        if (reason === 'bridge') {
+          const armSkipReason = getAutoTabTitleArmSkipReason(tabId, 'claude', prev, sessionId);
+          if (armSkipReason === null) {
+            armPendingAutoTabTitle(tabId, 'claude', sessionId);
+          } else {
+            logAutoTabTitleArmSkip(tabId, 'claude', prev, sessionId, armSkipReason);
+          }
         } else if (!sessionId || (prev && prev !== sessionId)) {
           clearPendingAutoTabTitle(tabId, !sessionId ? 'claude-session-cleared' : 'claude-session-changed');
         }
@@ -2610,8 +2702,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (tab) {
         if (tab.codexSessionId === sessionId) return;
         const prev = tab.codexSessionId;
-        if (reason === 'detected' && shouldArmAutoTabTitle(tabId, 'codex', prev, sessionId)) {
-          armPendingAutoTabTitle(tabId, 'codex', sessionId);
+        if (reason === 'detected') {
+          const armSkipReason = getAutoTabTitleArmSkipReason(tabId, 'codex', prev, sessionId);
+          if (armSkipReason === null) {
+            armPendingAutoTabTitle(tabId, 'codex', sessionId);
+          } else {
+            logAutoTabTitleArmSkip(tabId, 'codex', prev, sessionId, armSkipReason);
+          }
         } else if (!sessionId || (prev && prev !== sessionId)) {
           clearPendingAutoTabTitle(tabId, !sessionId ? 'codex-session-cleared' : 'codex-session-changed');
         }

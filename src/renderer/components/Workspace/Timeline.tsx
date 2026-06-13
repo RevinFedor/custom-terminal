@@ -826,6 +826,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const copyIncludeThinking = useUIStore(state => state.copyIncludeThinking);
   const copyIncludeBash = useUIStore(state => state.copyIncludeBash);
   const copyIncludeTools = useUIStore(state => state.copyIncludeTools);
+  const copyIncludeWebSearch = useUIStore(state => state.copyIncludeWebSearch);
+  const copyIncludeToolSearch = useUIStore(state => state.copyIncludeToolSearch);
+  const copyIncludeOtherTools = useUIStore(state => state.copyIncludeOtherTools);
   const copyIncludeSubagentResult = useUIStore(state => state.copyIncludeSubagentResult);
   const copyIncludeSubagentHistory = useUIStore(state => state.copyIncludeSubagentHistory);
   const debugHoverBridges = useUIStore(state => state.debugHoverBridges);
@@ -843,6 +846,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     includeThinking: copyIncludeThinking,
     includeBash: copyIncludeBash,
     includeTools: copyIncludeTools,
+    includeWebSearch: copyIncludeWebSearch,
+    includeToolSearch: copyIncludeToolSearch,
+    includeOtherTools: copyIncludeOtherTools,
     includeSubagentResult: copyIncludeSubagentResult,
     includeSubagentHistory: copyIncludeSubagentHistory,
   };
@@ -1640,15 +1646,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     const titleSessionId = sessionId;
     const titleTabId = tabId;
     const sourcePrompt = trimTabTitlePrompt(firstUserPrompt.content);
+    store.setTabTitleNaming(titleTabId, true);
 
     void (async () => {
-      const promptConfig = usePromptsStore.getState().getPromptById(TAB_TITLE_PROMPT_ID);
-      const title = await generateTabTitleFromPrompt(sourcePrompt, promptConfig);
-      if (!title) return;
-      useWorkspaceStore.getState().autoRenameTab(titleTabId, title, {
-        toolType: titleToolType,
-        sessionId: titleSessionId,
-      });
+      try {
+        const promptConfig = usePromptsStore.getState().getPromptById(TAB_TITLE_PROMPT_ID);
+        const title = await generateTabTitleFromPrompt(sourcePrompt, promptConfig);
+        if (!title) return;
+        useWorkspaceStore.getState().autoRenameTab(titleTabId, title, {
+          toolType: titleToolType,
+          sessionId: titleSessionId,
+        });
+      } finally {
+        useWorkspaceStore.getState().setTabTitleNaming(titleTabId, false);
+      }
     })();
   }, [entries, sessionId, tabId, toolType]);
 
