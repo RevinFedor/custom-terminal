@@ -3364,15 +3364,169 @@ function _groupIntoTurns(branch) {
 // /overseer/session/:id/* handlers.
 const _overseerTurnsCache = new Map(); // sessionId → { mtimeMs, turns, lastRecord, recordMap }
 
-async function _loadSessionTurns(sessionId, cwd) {
-  const located = findSessionFile(sessionId, cwd);
-  if (!located) {
-    const err = new Error(`Session ${sessionId} not found on disk`);
+async function _loadCodexSessionTurns(sessionId, cwd) {
+  if (!codexDataModule?._api?.loadSessionRecords || !codexDataModule?._api?.buildCodexFullHistory) {
+    const err = new Error('Codex overseer loader is unavailable');
+    err.status = 500;
+    throw err;
+  }
+  const loaded = await codexDataModule._api.loadSessionRecords(sessionId, cwd);
+  if (!loaded?.success) {
+    const err = new Error(loaded?.error || `Codex session ${sessionId} not found on disk`);
     err.status = 404;
     throw err;
   }
+  const stat = fs.statSync(loaded.filePath);
+  const cacheKey = 'codex:' + sessionId;
+  const cached = _overseerTurnsCache.get(cacheKey);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    const annotations = _loadSessionAnnotations(sessionId, cached.turns);
+    return { ...cached, ...annotations, filePath: loaded.filePath };
+  }
+
+  const historyEntries = codexDataModule._api.buildCodexFullHistory(loaded.records, sessionId);
+  const turns = [];
+  const recordMap = new Map();
+  let current = null;
+
+  const flush = () => {
+    if (current) turns.push(current);
+    current = null;
+  };
+
+  for (const entry of historyEntries || []) {
+    if (!entry) continue;
+    if (entry.role === 'user') {
+      flush();
+      const text = String(entry.content || '');
+      const rec = {
+        uuid: entry.uuid,
+        type: 'user',
+        timestamp: entry.timestamp || null,
+        sessionId,
+        message: { content: text },
+      };
+      recordMap.set(entry.uuid, rec);
+      current = {
+        kind: 'user',
+        userUuid: entry.uuid,
+        userTimestamp: entry.timestamp || null,
+        userChars: text.length,
+        isNoise: _isNoisePrompt(text),
+        thinkingBlocks: [],
+        textBlocks: [],
+        toolUses: [],
+        assistantUuids: [],
+        assistantModel: null,
+      };
+      continue;
+    }
+
+    if (entry.role === 'compact') {
+      flush();
+      const text = String(entry.compactSummary || entry.content || 'Conversation compacted');
+      const rec = {
+        uuid: entry.uuid,
+        type: 'user',
+        isCompactSummary: true,
+        timestamp: entry.timestamp || null,
+        sessionId,
+        message: { content: text },
+      };
+      recordMap.set(entry.uuid, rec);
+      current = {
+        kind: 'compact_summary',
+        userUuid: entry.uuid,
+        userTimestamp: entry.timestamp || null,
+        userChars: text.length,
+        isNoise: false,
+        preTokens: entry.preTokens || null,
+        thinkingBlocks: [],
+        textBlocks: [],
+        toolUses: [],
+        assistantUuids: [],
+        assistantModel: null,
+      };
+      flush();
+      continue;
+    }
+
+    if (entry.role === 'assistant') {
+      if (!current) {
+        current = {
+          kind: 'user',
+          userUuid: null,
+          userTimestamp: entry.timestamp || null,
+          userChars: 0,
+          isNoise: false,
+          thinkingBlocks: [],
+          textBlocks: [],
+          toolUses: [],
+          assistantUuids: [],
+          assistantModel: null,
+        };
+      }
+      const blocks = [];
+      const thinking = String(entry.thinking || '');
+      const text = String(entry.content || '');
+      if (thinking) {
+        current.thinkingBlocks.push({
+          idx: current.thinkingBlocks.length,
+          chars: thinking.length,
+          preview: thinking.slice(0, 160),
+        });
+        blocks.push({ type: 'thinking', thinking });
+      }
+      if (text) {
+        current.textBlocks.push({
+          idx: current.textBlocks.length,
+          chars: text.length,
+          preview: text.slice(0, 160),
+        });
+        blocks.push({ type: 'text', text });
+      }
+      for (const action of entry.actions || []) {
+        const name = action?.rawTool?.toolName || action?.tool || 'tool';
+        current.toolUses.push({ idx: current.toolUses.length, name });
+        blocks.push({ type: 'tool_use', name });
+      }
+      const rec = {
+        uuid: entry.uuid,
+        type: 'assistant',
+        timestamp: entry.timestamp || null,
+        sessionId,
+        message: { content: blocks },
+      };
+      recordMap.set(entry.uuid, rec);
+      current.assistantUuids.push(entry.uuid);
+    }
+  }
+  flush();
+
+  const annotations = _loadSessionAnnotations(sessionId, turns);
+  const result = {
+    engine: 'codex',
+    sessionId,
+    mtimeMs: stat.mtimeMs,
+    size: stat.size,
+    turns,
+    branchLength: historyEntries.length,
+    filePath: loaded.filePath,
+    recordMap,
+    ...annotations,
+  };
+  _overseerTurnsCache.set(cacheKey, result);
+  return result;
+}
+
+async function _loadSessionTurns(sessionId, cwd) {
+  const located = findSessionFile(sessionId, cwd);
+  if (!located) {
+    return _loadCodexSessionTurns(sessionId, cwd);
+  }
   const stat = fs.statSync(located.filePath);
-  const cached = _overseerTurnsCache.get(sessionId);
+  const cacheKey = 'claude:' + sessionId;
+  const cached = _overseerTurnsCache.get(cacheKey);
   if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
     // Annotations (notes, rewind markers) can change WITHOUT JSONL changing,
     // so we always re-read them per request — cheap point lookups on SQLite.
@@ -3393,8 +3547,43 @@ async function _loadSessionTurns(sessionId, cwd) {
     recordMap,
     ...annotations,
   };
-  _overseerTurnsCache.set(sessionId, result);
+  _overseerTurnsCache.set(cacheKey, result);
   return result;
+}
+
+function _markTerminalAsAiTab(tabId, engine, sessionId = null) {
+  if (!tabId || !engine) return;
+  const color = engine === 'codex' ? 'codex' : engine === 'gemini' ? 'gemini' : 'claude';
+  try {
+    const setSessionSql = engine === 'codex'
+      ? 'codex_session_id = COALESCE(?, codex_session_id), '
+      : engine === 'claude'
+        ? 'claude_session_id = COALESCE(?, claude_session_id), '
+        : engine === 'gemini'
+          ? 'gemini_session_id = COALESCE(?, gemini_session_id), '
+          : '';
+    if (setSessionSql) {
+      projectManager.db.db.prepare(
+        `UPDATE tabs
+         SET command_type = ?,
+             ${setSessionSql}
+             color = CASE WHEN color IS NULL OR color = '' OR color = 'default' THEN ? ELSE color END
+         WHERE tab_id = ?`
+      ).run(engine, sessionId || null, color, tabId);
+    } else {
+      projectManager.db.db.prepare(
+        `UPDATE tabs
+         SET command_type = ?,
+             color = CASE WHEN color IS NULL OR color = '' OR color = 'default' THEN ? ELSE color END
+         WHERE tab_id = ?`
+      ).run(engine, color, tabId);
+    }
+  } catch (e) {
+    console.warn('[MCP:Terminal] mark-ai-tab DB update failed tab=' + tabId + ' engine=' + engine + ': ' + e.message);
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('terminal:mcp-ai-tab', { tabId, engine, sessionId: sessionId || undefined });
+  }
 }
 
 // Load timeline_notes + timeline_rewind_markers for a session and build maps
@@ -3484,32 +3673,41 @@ async function handleOverseerRequest(rawUrl) {
   const p = url.pathname; // e.g. /overseer/sessions
 
   if (p === '/overseer/sessions') {
-    // Live tabs from DB (any project) with a known Claude sessionId.
+    // Live tabs from DB (any project) with a known Claude/Codex sessionId.
     // bridgeKnownSessions wins over DB column (it reflects the currently active
     // CLI process, which may be a fork of the persisted id).
     const rows = projectManager.db.db.prepare(`
-      SELECT t.tab_id, t.name, t.cwd, t.claude_session_id, t.command_type,
+      SELECT t.tab_id, t.name, t.cwd, t.claude_session_id, t.gemini_session_id,
+             t.codex_session_id, t.command_type,
              t.created_at, p.path AS project_path, p.name AS project_title
       FROM tabs t LEFT JOIN projects p ON p.id = t.project_id
       WHERE t.tab_id IS NOT NULL
-        AND (t.claude_session_id IS NOT NULL OR t.command_type IN ('claude', 'claude-sdk'))
+        AND (
+          t.claude_session_id IS NOT NULL
+          OR t.codex_session_id IS NOT NULL
+          OR t.command_type IN ('claude', 'claude-sdk', 'codex')
+        )
       ORDER BY t.created_at DESC
     `).all();
 
     const sessions = [];
     for (const r of rows) {
       const tabId = r.tab_id;
-      const sessionId = bridgeKnownSessions.get(tabId) || r.claude_session_id || null;
+      const isCodex = r.command_type === 'codex' || !!r.codex_session_id || codexKnownSessions.has(tabId);
+      const sessionId = isCodex
+        ? (codexKnownSessions.get(tabId) || r.codex_session_id || null)
+        : (bridgeKnownSessions.get(tabId) || r.claude_session_id || null);
       if (!sessionId) continue;
       const isLive = terminals.has(tabId);
       sessions.push({
         tabId,
         tabName: r.name,
         sessionId,
+        engine: isCodex ? 'codex' : 'claude',
         cwd: terminalProjects.get(tabId) || r.cwd,
         projectPath: r.project_path || null,
         projectTitle: r.project_title || null,
-        commandType: r.command_type || null,
+        commandType: r.command_type || (isCodex ? 'codex' : 'claude'),
         isLive,
         createdAt: r.created_at || null,
       });
@@ -3761,6 +3959,24 @@ async function _resolveSessionFile(sessionId, cwd) {
   return located;
 }
 
+async function _rejectUnsupportedOverseerMutation(sessionId, cwd, operation) {
+  if (findSessionFile(sessionId, cwd)) return null;
+  try {
+    const loaded = await codexDataModule?._api?.loadSessionRecords?.(sessionId, cwd);
+    if (loaded?.success) {
+      return {
+        status: 400,
+        body: {
+          error: `${operation} is Claude-only. Codex sessions are exposed through Overseer for read/navigation and through Terminal MCP for live start/send/stop, not JSONL rewrite.`,
+          engine: 'codex',
+          supported: ['read', 'terminal:start_ai', 'terminal:send_prompt', 'terminal:stop_ai'],
+        },
+      };
+    }
+  } catch {}
+  return null;
+}
+
 // Mirror of edit-range's forward-expand logic but **read-only**.
 // Returns: { removeUuids: Set, actualEnd: number, branch: array, entryBefore, entryAfter }
 function _computeEditRangePlan(sessionId, cwd, startUuid, endUuid) {
@@ -3884,6 +4100,8 @@ async function handleOverseerMutation(rawUrl, payload) {
   if (p === '/overseer/fork') {
     const { sessionId, cwd } = payload;
     if (!sessionId) return { status: 400, body: { error: 'sessionId required' } };
+    const unsupported = await _rejectUnsupportedOverseerMutation(sessionId, cwd, 'fork');
+    if (unsupported) return unsupported;
     if (!claudeDataApi || !claudeDataApi.forkSessionFile) {
       return { status: 500, body: { error: 'claudeDataApi not initialised (register() not called yet)' } };
     }
@@ -3901,6 +4119,8 @@ async function handleOverseerMutation(rawUrl, payload) {
     if (!mode || !['compact', 'delete'].includes(mode)) {
       return { status: 400, body: { error: 'mode must be "compact" or "delete"' } };
     }
+    const unsupported = await _rejectUnsupportedOverseerMutation(sessionId, cwd, 'propose_edit');
+    if (unsupported) return unsupported;
     const plan = _computeEditRangePlan(sessionId, cwd, startUuid, endUuid);
     plan.mode = mode;
     plan.sessionId = sessionId;
@@ -3922,6 +4142,8 @@ async function handleOverseerMutation(rawUrl, payload) {
     if (mode === 'compact' && !compactText) {
       return { status: 400, body: { error: 'compactText required for mode="compact"' } };
     }
+    const unsupported = await _rejectUnsupportedOverseerMutation(sessionId, cwd, 'apply_edit');
+    if (unsupported) return unsupported;
     if (!claudeDataApi || !claudeDataApi.editRange || !claudeDataApi.deleteRange) {
       return { status: 500, body: { error: 'claudeDataApi not initialised' } };
     }
@@ -3945,7 +4167,7 @@ async function handleOverseerMutation(rawUrl, payload) {
 
     // Invalidate overseer turns cache for the edited session (file mtime changed,
     // but explicit clear avoids one stale read).
-    _overseerTurnsCache.delete(workingSessionId);
+    _overseerTurnsCache.delete('claude:' + workingSessionId);
 
     return { body: {
       mode,
@@ -3958,6 +4180,26 @@ async function handleOverseerMutation(rawUrl, payload) {
   }
 
   return { status: 404, body: { error: 'Unknown overseer mutation: ' + p } };
+}
+
+function emitTerminalMcpActivity(action, details = {}) {
+  const id = details.id || ('mcp-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
+  const { id: _ignoredId, ...rest } = details;
+  const event = {
+    id,
+    at: Date.now(),
+    action,
+    status: 'ok',
+    ...rest,
+  };
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('terminal:mcp-activity', event);
+    }
+  } catch (e) {
+    console.warn('[MCP:Terminal] failed to emit activity:', e.message);
+  }
+  return id;
 }
 
 function startMcpHttpServer() {
@@ -3983,6 +4225,35 @@ function startMcpHttpServer() {
         ).get(tabId);
         if (row && row.project_id) return row.project_id;
       } catch {}
+      return null;
+    };
+
+    const routeRejectsPinnedProject = (tabId, parentProjectId, routeName) => {
+      if (!parentProjectId) return null;
+      const owner = resolveProjectForTab(tabId);
+      if (owner && owner !== parentProjectId) {
+        console.warn('[MCP:Terminal] ' + routeName + ' rejected: tab ' + tabId + ' belongs to project ' + owner + ', caller pinned ' + parentProjectId);
+        return { error: 'tab does not belong to the requested project', owner, requested: parentProjectId };
+      }
+      return null;
+    };
+
+    const detectAiEngineForTab = async (tabId) => {
+      let row = null;
+      try {
+        row = projectManager.db.db.prepare(
+          'SELECT command_type, claude_session_id, gemini_session_id, codex_session_id FROM tabs WHERE tab_id = ? LIMIT 1'
+        ).get(tabId);
+      } catch {}
+      if (row?.command_type === 'codex' || codexKnownSessions.has(tabId) || row?.codex_session_id) return 'codex';
+      if (row?.command_type === 'claude' || row?.command_type === 'claude-sdk' || hasLiveClaudeInTab(tabId) || row?.claude_session_id) return 'claude';
+      if (row?.command_type === 'gemini' || geminiActiveTabs.has(tabId) || row?.gemini_session_id) return 'gemini';
+      const codexMatches = await findAiDescendantProcessesByTab(tabId, 'codex');
+      if (codexMatches.length > 0) return 'codex';
+      const claudeMatches = await findAiDescendantProcessesByTab(tabId, 'claude');
+      if (claudeMatches.length > 0) return 'claude';
+      const geminiMatches = await findAiDescendantProcessesByTab(tabId, 'gemini');
+      if (geminiMatches.length > 0) return 'gemini';
       return null;
     };
 
@@ -4038,12 +4309,28 @@ function startMcpHttpServer() {
 
             const pty = terminals.get(tabId);
             const cmdState = terminalCommandState.get(tabId);
+            const commandType = t.command_type || 'generic';
+            const claudeSessionId = bridgeKnownSessions.get(tabId) || t.claude_session_id || null;
+            const codexSessionId = codexKnownSessions.get(tabId) || t.codex_session_id || null;
+            const geminiSessionId = t.gemini_session_id || null;
+            const sessionId = commandType === 'codex'
+              ? codexSessionId
+              : commandType === 'gemini'
+                ? geminiSessionId
+                : commandType === 'claude' || commandType === 'claude-sdk'
+                  ? claudeSessionId
+                  : (codexSessionId || claudeSessionId || geminiSessionId);
 
             tabs.push({
               tabId,
               name: t.name,
               color: t.color || 'default',
-              commandType: t.command_type || 'generic',
+              commandType,
+              sessionId,
+              claudeSessionId,
+              geminiSessionId,
+              codexSessionId,
+              aiBusy: t.ai_busy === 1 || t.ai_busy === true,
               cwd: terminalProjects.get(tabId) || t.cwd,
               isAlive: !!pty,
               pid: pty ? pty.pid : null,
@@ -4067,8 +4354,9 @@ function startMcpHttpServer() {
       let body = '';
       req.on('data', chunk => { body += chunk; });
       req.on('end', async () => {
+        let activityId = null;
         try {
-          const { tabId, command, parentProjectId } = JSON.parse(body);
+          const { tabId, command, parentProjectId, sourceMeta } = JSON.parse(body);
           if (!tabId) {
             res.writeHead(400);
             res.end(JSON.stringify({ error: 'tabId is required' }));
@@ -4100,6 +4388,13 @@ function startMcpHttpServer() {
           }
 
           console.log('[MCP:Terminal] POST /terminal/restart tabId=' + tabId + ' cmd=' + restartCmd);
+          activityId = emitTerminalMcpActivity('restart_process', {
+            status: 'running',
+            tabId,
+            targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+            commandPreview: String(restartCmd).slice(0, 120),
+            sourceMeta: sourceMeta || null,
+          });
 
           const cmdState = terminalCommandState.get(tabId);
           const wasRunning = cmdState && cmdState.isRunning;
@@ -4130,10 +4425,21 @@ function startMcpHttpServer() {
 
           // Step 3: Re-run command
           term.write(restartCmd + '\r');
+          emitTerminalMcpActivity('restart_process', {
+            id: activityId,
+            status: 'restarted',
+            tabId,
+            targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+            commandPreview: String(restartCmd).slice(0, 120),
+            sourceMeta: sourceMeta || null,
+          });
 
           res.writeHead(200);
           res.end(JSON.stringify({ status: 'restarted', tabId, command: restartCmd }));
         } catch (e) {
+          if (activityId) {
+            emitTerminalMcpActivity('restart_process', { id: activityId, status: 'error', error: e.message });
+          }
           res.writeHead(500);
           res.end(JSON.stringify({ error: e.message }));
         }
@@ -4144,8 +4450,9 @@ function startMcpHttpServer() {
       let body = '';
       req.on('data', chunk => { body += chunk; });
       req.on('end', async () => {
+        let activityId = null;
         try {
-          const { tabId, command, parentProjectId } = JSON.parse(body);
+          const { tabId, command, parentProjectId, sourceMeta } = JSON.parse(body);
           if (!tabId || !command) {
             res.writeHead(400);
             res.end(JSON.stringify({ error: 'tabId and command are required' }));
@@ -4170,13 +4477,330 @@ function startMcpHttpServer() {
           }
 
           console.log('[MCP:Terminal] POST /terminal/run tabId=' + tabId + ' cmd="' + command.substring(0, 80) + '"');
+          activityId = emitTerminalMcpActivity('run_command', {
+            status: 'running',
+            tabId,
+            targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+            commandPreview: String(command).slice(0, 120),
+            sourceMeta: sourceMeta || null,
+          });
 
           // Send command + Enter to PTY
           pty.write(command + '\r');
+          emitTerminalMcpActivity('run_command', {
+            id: activityId,
+            status: 'sent',
+            tabId,
+            targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+            commandPreview: String(command).slice(0, 120),
+            sourceMeta: sourceMeta || null,
+          });
 
           res.writeHead(200);
           res.end(JSON.stringify({ status: 'sent', tabId }));
         } catch (e) {
+          if (activityId) {
+            emitTerminalMcpActivity('run_command', { id: activityId, status: 'error', error: e.message });
+          }
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+
+    } else if (req.method === 'POST' && req.url === '/terminal/ai-prompt') {
+      // Send/paste prompt to a live AI TUI via the same safe path as History/Replay.
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        let activityId = null;
+        try {
+          const { tabId, prompt, submit = true, parentProjectId, sourceMeta } = JSON.parse(body);
+          if (!tabId || typeof prompt !== 'string') {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'tabId and prompt are required' }));
+            return;
+          }
+
+          const projectReject = routeRejectsPinnedProject(tabId, parentProjectId, '/terminal/ai-prompt');
+          if (projectReject) {
+            res.writeHead(403);
+            res.end(JSON.stringify(projectReject));
+            return;
+          }
+
+          const term = terminals.get(tabId);
+          if (!term) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ error: 'Terminal not alive for tab ' + tabId }));
+            return;
+          }
+
+          const engine = await detectAiEngineForTab(tabId);
+          if (!engine) {
+            res.writeHead(409);
+            res.end(JSON.stringify({ error: 'No live AI session detected in tab ' + tabId }));
+            return;
+          }
+
+          if (engine === 'codex') {
+            const candidates = await findAiDescendantProcessesByTab(tabId, 'codex');
+            if (candidates.length === 0) {
+              res.writeHead(409);
+              res.end(JSON.stringify({ error: 'no_codex_session' }));
+              return;
+            }
+            if (submit !== false) {
+              await ensureCodexTurnWatcher(tabId, codexKnownSessions.get(tabId) || null, terminalProjects.get(tabId));
+            }
+          } else if (engine === 'claude') {
+            if (!hasLiveClaudeInTab(tabId)) {
+              const candidates = await findAiDescendantProcessesByTab(tabId, 'claude');
+              if (candidates.length === 0) {
+                res.writeHead(409);
+                res.end(JSON.stringify({ error: 'no_claude_session' }));
+                return;
+              }
+            }
+          } else if (engine === 'gemini') {
+            const candidates = await findAiDescendantProcessesByTab(tabId, 'gemini');
+            if (candidates.length === 0 && !geminiActiveTabs.has(tabId)) {
+              res.writeHead(409);
+              res.end(JSON.stringify({ error: 'no_gemini_session' }));
+              return;
+            }
+          }
+
+          activityId = emitTerminalMcpActivity('send_prompt', {
+            status: submit === false ? 'pasting' : 'sending',
+            tabId,
+            targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+            engine,
+            promptChars: prompt.length,
+            sourceMeta: sourceMeta || null,
+          });
+
+          const result = await safePasteAndSubmit(term, prompt, {
+            submit: submit !== false,
+            ctrlCFirst: false,
+            stashFirst: false,
+            fast: engine !== 'claude',
+            logPrefix: '[MCP:Terminal:ai-prompt:' + engine + ':' + tabId + ']',
+          });
+          console.log('[MCP:Terminal] POST /terminal/ai-prompt tabId=' + tabId + ' engine=' + engine + ' submit=' + (submit !== false) + ' chars=' + prompt.length + ' success=' + (result?.success !== false));
+          emitTerminalMcpActivity('send_prompt', {
+            id: activityId,
+            status: result?.success === false ? 'error' : (submit === false ? 'pasted' : 'sent'),
+            tabId,
+            targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+            engine,
+            promptChars: prompt.length,
+            sourceMeta: sourceMeta || null,
+            error: result?.success === false ? (result?.error || 'safePasteAndSubmit failed') : undefined,
+          });
+          res.writeHead(result?.success === false ? 500 : 200);
+          res.end(JSON.stringify({
+            status: submit === false ? 'pasted' : 'sent',
+            tabId,
+            engine,
+            result,
+          }));
+        } catch (e) {
+          if (activityId) {
+            emitTerminalMcpActivity('send_prompt', { id: activityId, status: 'error', error: e.message });
+          }
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+
+    } else if (req.method === 'POST' && req.url === '/terminal/ai-stop') {
+      // Stop an AI process without closing the shell tab.
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        let activityId = null;
+        try {
+          const { tabId, parentProjectId, sourceMeta } = JSON.parse(body);
+          if (!tabId) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'tabId is required' }));
+            return;
+          }
+          const projectReject = routeRejectsPinnedProject(tabId, parentProjectId, '/terminal/ai-stop');
+          if (projectReject) {
+            res.writeHead(403);
+            res.end(JSON.stringify(projectReject));
+            return;
+          }
+          activityId = emitTerminalMcpActivity('stop_ai', {
+            status: 'running',
+            tabId,
+            targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+            sourceMeta: sourceMeta || null,
+          });
+          const result = await stopAiProcessInTab(tabId);
+          console.log('[MCP:Terminal] POST /terminal/ai-stop tabId=' + tabId + ' success=' + (result?.success === true) + ' process=' + (result?.processName || 'unknown'));
+          emitTerminalMcpActivity('stop_ai', {
+            id: activityId,
+            status: result?.success === false ? 'not_stopped' : 'stopped',
+            tabId,
+            targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+            engine: result?.processName || undefined,
+            sourceMeta: sourceMeta || null,
+            error: result?.success === false ? (result?.error || 'not stopped') : undefined,
+          });
+          res.writeHead(result?.success === false ? 409 : 200);
+          res.end(JSON.stringify({
+            status: result?.success === false ? 'not_stopped' : 'stopped',
+            tabId,
+            ...result,
+          }));
+        } catch (e) {
+          if (activityId) {
+            emitTerminalMcpActivity('stop_ai', { id: activityId, status: 'error', error: e.message });
+          }
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+
+    } else if (req.method === 'POST' && req.url === '/terminal/ai-start') {
+      // Start/resume an AI process in an existing shell tab using app-native launch hooks.
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        let activityId = null;
+        try {
+          const { tabId, agent, sessionId, mode, cwd, parentProjectId, model, effort, sourceMeta } = JSON.parse(body);
+          const engine = String(agent || '').toLowerCase();
+          if (!tabId || !['claude', 'codex', 'gemini'].includes(engine)) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'tabId and agent=claude|codex|gemini are required' }));
+            return;
+          }
+          const projectReject = routeRejectsPinnedProject(tabId, parentProjectId, '/terminal/ai-start');
+          if (projectReject) {
+            res.writeHead(403);
+            res.end(JSON.stringify(projectReject));
+            return;
+          }
+          const term = terminals.get(tabId);
+          if (!term) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ error: 'Terminal not alive for tab ' + tabId }));
+            return;
+          }
+
+          const termCwd = cwd || terminalProjects.get(tabId);
+          let commandText = '';
+
+          if (engine === 'codex') {
+            if (mode === 'fork' && !sessionId) {
+              res.writeHead(400);
+              res.end(JSON.stringify({ error: 'Codex fork requires sessionId' }));
+              return;
+            }
+            _markTerminalAsAiTab(tabId, engine, mode === 'new' ? null : (sessionId || null));
+            const startedAt = Date.now();
+            const command = mode === 'fork'
+              ? 'codex-f'
+              : mode === 'new'
+                ? 'codex'
+                : sessionId
+                ? 'codex-c'
+                : 'codex';
+            const effectiveModel = model || readDefaultCodexSetting('defaultCodexModel');
+            const effectiveEffort = effort || readDefaultCodexSetting('defaultCodexEffort');
+            if (command === 'codex-c') {
+              closeCodexWatcher(tabId, 'mcp-resume-known-session');
+              setCodexKnownSession(tabId, sessionId, 'mcp-resume-known-session');
+              ensureCodexTurnWatcher(tabId, sessionId, termCwd);
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('codex:session-detected', { tabId, sessionId });
+              }
+            } else if (command === 'codex-f') {
+              startCodexSessionWatcher(mainWindow?.webContents || { send: () => {} }, {
+                tabId,
+                cwd: termCwd,
+                startedAt,
+                sourceSessionId: sessionId,
+              });
+            } else {
+              startCodexSessionWatcher(mainWindow?.webContents || { send: () => {} }, { tabId, cwd: termCwd, startedAt });
+            }
+            commandText = buildCodexCommand({
+              command,
+              sessionId,
+              model: effectiveModel,
+              effort: effectiveEffort,
+            });
+          } else if (engine === 'claude') {
+            if (mode === 'fork') {
+              res.writeHead(400);
+              res.end(JSON.stringify({ error: 'Claude fork requires create_tab with command "claude-f <sessionId>" so the existing fork machinery can copy JSONL safely.' }));
+              return;
+            }
+            _markTerminalAsAiTab(tabId, engine, mode === 'new' ? null : (sessionId || null));
+            claudeState.set(tabId, 'WAITING_PROMPT');
+            commandText = sessionId && mode !== 'new'
+              ? 'claude --dangerously-skip-permissions --resume ' + sessionId
+              : 'claude --dangerously-skip-permissions';
+            if (sessionId && mode !== 'new' && termCwd) {
+              const safe = String(termCwd).replace(/'/g, "'\\''");
+              commandText = "cd '" + safe + "' && " + commandText;
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('claude:session-detected', { tabId, sessionId });
+              }
+              _notifyClaudeSession(tabId, sessionId);
+            }
+            claudeCliActive.set(tabId, true);
+          } else {
+            _markTerminalAsAiTab(tabId, engine, mode === 'new' ? null : (sessionId || null));
+            geminiActiveTabs.add(tabId);
+            commandText = sessionId ? 'gemini -r ' + sessionId : 'gemini -y';
+          }
+
+          const state = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
+          state.isRunning = true;
+          state.lastCommand = commandText;
+          terminalCommandState.set(tabId, state);
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('terminal:command-started', { tabId });
+          }
+          activityId = emitTerminalMcpActivity('start_ai', {
+            status: 'running',
+            tabId,
+            targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+            engine,
+            mode: mode || (sessionId ? 'continue' : 'new'),
+            sessionId: mode === 'new' ? null : (sessionId || null),
+            sourceMeta: sourceMeta || null,
+          });
+          term.write(commandText + '\r');
+          emitTerminalMcpActivity('start_ai', {
+            id: activityId,
+            status: 'started',
+            tabId,
+            targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+            engine,
+            mode: mode || (sessionId ? 'continue' : 'new'),
+            sessionId: mode === 'new' ? null : (sessionId || null),
+            sourceMeta: sourceMeta || null,
+          });
+
+          console.log('[MCP:Terminal] POST /terminal/ai-start tabId=' + tabId + ' engine=' + engine + ' mode=' + (mode || (sessionId ? 'continue' : 'new')) + ' cmd=' + commandText);
+          res.writeHead(200);
+          res.end(JSON.stringify({
+            status: 'started',
+            tabId,
+            agent: engine,
+            mode: mode || (sessionId ? 'continue' : 'new'),
+            sessionId: mode === 'new' ? null : (sessionId || null),
+          }));
+        } catch (e) {
+          if (activityId) {
+            emitTerminalMcpActivity('start_ai', { id: activityId, status: 'error', error: e.message });
+          }
           res.writeHead(500);
           res.end(JSON.stringify({ error: e.message }));
         }
@@ -4187,8 +4811,9 @@ function startMcpHttpServer() {
       let body = '';
       req.on('data', chunk => { body += chunk; });
       req.on('end', async () => {
+        let activityId = null;
         try {
-          const { name, cwd, command, color, parentProjectId } = JSON.parse(body);
+          const { name, cwd, command, color, parentProjectId, sourceMeta } = JSON.parse(body);
           // When parentProjectId is set, cwd becomes optional — main can fall back
           // to the project's stored path. cwd-only flow (legacy callers) still works.
           let effectiveCwd = cwd;
@@ -4205,6 +4830,14 @@ function startMcpHttpServer() {
           }
 
           console.log('[MCP:Terminal] POST /terminal/create name=' + (name || 'auto') + ' projectId=' + (parentProjectId || '-') + ' cwd=' + effectiveCwd + ' cmd=' + (command || '(none)'));
+          activityId = emitTerminalMcpActivity('create_tab', {
+            status: 'creating',
+            targetProjectId: parentProjectId || undefined,
+            targetCwd: effectiveCwd || undefined,
+            targetName: name || undefined,
+            commandPreview: command ? String(command).slice(0, 120) : undefined,
+            sourceMeta: sourceMeta || null,
+          });
 
           // Tell renderer to create a new tab
           if (mainWindow && !mainWindow.isDestroyed()) {
@@ -4216,10 +4849,22 @@ function startMcpHttpServer() {
               parentProjectId: parentProjectId || undefined,
             });
           }
+          emitTerminalMcpActivity('create_tab', {
+            id: activityId,
+            status: 'requested',
+            targetProjectId: parentProjectId || undefined,
+            targetCwd: effectiveCwd || undefined,
+            targetName: name || undefined,
+            commandPreview: command ? String(command).slice(0, 120) : undefined,
+            sourceMeta: sourceMeta || null,
+          });
 
           res.writeHead(200);
           res.end(JSON.stringify({ status: 'creating' }));
         } catch (e) {
+          if (activityId) {
+            emitTerminalMcpActivity('create_tab', { id: activityId, status: 'error', error: e.message });
+          }
           res.writeHead(500);
           res.end(JSON.stringify({ error: e.message }));
         }
@@ -4230,8 +4875,9 @@ function startMcpHttpServer() {
       let body = '';
       req.on('data', chunk => { body += chunk; });
       req.on('end', async () => {
+        let activityId = null;
         try {
-          const { tabId, parentProjectId } = JSON.parse(body);
+          const { tabId, parentProjectId, sourceMeta } = JSON.parse(body);
           if (!tabId) {
             res.writeHead(400);
             res.end(JSON.stringify({ error: 'tabId is required' }));
@@ -4256,11 +4902,27 @@ function startMcpHttpServer() {
           }
 
           console.log('[MCP:Terminal] POST /terminal/kill tabId=' + tabId);
+          activityId = emitTerminalMcpActivity('kill_process', {
+            status: 'running',
+            tabId,
+            targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+            sourceMeta: sourceMeta || null,
+          });
           pty.kill();
+          emitTerminalMcpActivity('kill_process', {
+            id: activityId,
+            status: 'killed',
+            tabId,
+            targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+            sourceMeta: sourceMeta || null,
+          });
 
           res.writeHead(200);
           res.end(JSON.stringify({ status: 'killed', tabId }));
         } catch (e) {
+          if (activityId) {
+            emitTerminalMcpActivity('kill_process', { id: activityId, status: 'error', error: e.message });
+          }
           res.writeHead(500);
           res.end(JSON.stringify({ error: e.message }));
         }
@@ -4271,8 +4933,9 @@ function startMcpHttpServer() {
       let body = '';
       req.on('data', chunk => { body += chunk; });
       req.on('end', async () => {
+        let activityId = null;
         try {
-          const { steps, parentProjectId } = JSON.parse(body);
+          const { steps, parentProjectId, sourceMeta } = JSON.parse(body);
           if (!steps || !Array.isArray(steps) || steps.length === 0) {
             res.writeHead(400);
             res.end(JSON.stringify({ error: 'steps array is required' }));
@@ -4293,6 +4956,12 @@ function startMcpHttpServer() {
           }
 
           console.log('[MCP:Terminal] POST /terminal/chain projectId=' + (parentProjectId || '-') + ' steps=' + steps.length);
+          activityId = emitTerminalMcpActivity('run_chain', {
+            status: 'running',
+            targetProjectId: parentProjectId || undefined,
+            stepCount: steps.length,
+            sourceMeta: sourceMeta || null,
+          });
           const results = [];
 
           for (const step of steps) {
@@ -4356,8 +5025,18 @@ function startMcpHttpServer() {
           }
 
           res.writeHead(200);
+          emitTerminalMcpActivity('run_chain', {
+            id: activityId,
+            status: results.some(r => r.status === 'error') ? 'completed_with_errors' : 'completed',
+            targetProjectId: parentProjectId || undefined,
+            stepCount: steps.length,
+            sourceMeta: sourceMeta || null,
+          });
           res.end(JSON.stringify({ status: 'completed', results }));
         } catch (e) {
+          if (activityId) {
+            emitTerminalMcpActivity('run_chain', { id: activityId, status: 'error', error: e.message });
+          }
           res.writeHead(500);
           res.end(JSON.stringify({ error: e.message }));
         }
@@ -9756,7 +10435,7 @@ function getAiProcessNameFromCommand(cmd) {
   return null;
 }
 
-ipcMain.handle('terminal:stop-ai-process', async (event, tabId) => {
+async function stopAiProcessInTab(tabId) {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'tab not found' };
 
@@ -9915,6 +10594,10 @@ ipcMain.handle('terminal:stop-ai-process', async (event, tabId) => {
     };
     setTimeout(check, 80);
   });
+}
+
+ipcMain.handle('terminal:stop-ai-process', async (_event, tabId) => {
+  return stopAiProcessInTab(tabId);
 });
 
 // Execute quick action command in terminal (fire-and-forget version)
