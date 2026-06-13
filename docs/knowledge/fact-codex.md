@@ -42,7 +42,9 @@ Manual Pull из History использует тот же visual-state guard. П
 
 Порядок prepend общий с Claude: текст, уже набранный в TUI composer, является первичным draft'ом пользователя и должен оказаться перед текстом из History textarea. Append ломает намерение в сценарии «сначала написал в terminal, потом открыл History и решил отправить другое»: пользователь получает обратный порядок причин, хотя приложение формально ничего не потеряло.
 
-Если prompt ушёл из History и пользователь быстро нажал Stop, Codex может сначала вернуть draft в terminal composer и только затем записать `turn_aborted` в rollout JSONL. History runtime слушает именно `turn_aborted`, после него делает короткую серию probes terminal draft (первый probe может быть пустым) и prepend'ит найденный текст обратно в textarea с `Prompt restored`. Если terminal draft не читается, fallback — последний отправленный History prompt; это лучше дубликата в TUI, чем пустая History textarea при видимом пользовательском тексте в терминале.
+Если prompt ушёл из History и пользователь быстро нажал Stop, Codex может сначала вернуть draft в terminal composer и только затем записать `turn_aborted` в rollout JSONL. History runtime слушает именно `turn_aborted`, держит `Canceling`-state до подтверждения и после него делает короткую серию probes terminal draft (первый probe может быть пустым). Найденный terminal draft prepend'ится обратно в textarea с `Prompt restored`.
+
+Если terminal draft не читается, History НЕ возвращает последний отправленный prompt из памяти. Last-sent fallback создаёт ложный рассинхрон: textarea показывает текст, которого terminal input фактически не вернул; пользователь видит это как prompt, появившийся "в какой-то рандомный момент". В этом случае показывается нейтральное `Cancel confirmed` / `prompt was not returned`, textarea остаётся пустой.
 
 History textarea draft хранится per-tab вне mount-cycle панели. Закрытие/открытие `Cmd+\` не очищает input; clear происходит после успешного send или явного действия пользователя. Симптом регресса: юзер закрыл History на время проверки терминала, открыл снова, а недоотправленный prompt исчез.
 

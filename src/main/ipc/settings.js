@@ -81,38 +81,6 @@ function sanitizeFileForPrompt(raw, filePath) {
 }
 
 function register({ projectManager }) {
-  // ── Research Conversations ──
-
-  ipcMain.handle('research:save-conversation', async (event, { dirPath, conversation }) => {
-    try {
-      projectManager.db.saveResearchConversation(dirPath, conversation);
-      return { success: true };
-    } catch (error) {
-      console.error('[main] Error saving research conversation:', error);
-      return { success: false, error: error.message };
-    }
-  });
-
-  ipcMain.handle('research:get-conversations', async (event, dirPath) => {
-    try {
-      const conversations = projectManager.db.getResearchConversations(dirPath);
-      return { success: true, data: conversations };
-    } catch (error) {
-      console.error('[main] Error getting research conversations:', error);
-      return { success: false, error: error.message };
-    }
-  });
-
-  ipcMain.handle('research:delete-conversation', async (event, { dirPath, conversationId }) => {
-    try {
-      projectManager.db.deleteResearchConversation(dirPath, conversationId);
-      return { success: true };
-    } catch (error) {
-      console.error('[main] Error deleting research conversation:', error);
-      return { success: false, error: error.message };
-    }
-  });
-
   // ── Global Commands ──
 
   ipcMain.handle('commands:get-global', async () => {
@@ -285,20 +253,6 @@ function register({ projectManager }) {
     }
   });
 
-  // API Call Log
-  ipcMain.handle('api-calls:list', async (event, args) => {
-    try {
-      const projectId = args?.projectId || null;
-      const limit = args?.limit || 50;
-      console.log('[ApiCallLog] Listing API calls, projectId=' + (projectId || 'all') + ' limit=' + limit);
-      const data = projectManager.db.getApiCallLog(projectId, limit);
-      console.log('[ApiCallLog] Found ' + data.length + ' entries');
-      return { success: true, data };
-    } catch (error) {
-      console.error('[ApiCallLog] Error listing API calls:', error);
-      return { success: false, error: error.message };
-    }
-  });
 }
 
 module.exports = { register };

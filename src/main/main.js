@@ -2974,20 +2974,6 @@ ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, 
     });
   }
 
-  // Fallback if no AI prompts loaded
-  if (aiPrompts.length === 0) {
-    template.push({
-      label: '🔍 Research',
-      enabled: hasSelection,
-      click: () => { event.sender.send('context-menu-command', 'ai-prompt', 'research'); }
-    });
-    template.push({
-      label: '📋 Compact',
-      enabled: hasSelection,
-      click: () => { event.sender.send('context-menu-command', 'ai-prompt', 'compact'); }
-    });
-  }
-
   template.push({ type: 'separator' });
 
   // Add Insert Prompt submenu (with group support)

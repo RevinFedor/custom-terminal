@@ -2,11 +2,7 @@ import React from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import InfoPanel from './panels/InfoPanel';
 
-// AI Sessions tab (GeminiPanel) — открывается через Cmd+Shift+E как модалка ResearchSheet.
-// Sessions tab (SessionsPanel, Trojan-Horse import) — устарел: команды Gemini /chat save
-// больше не нужны (мы используем JSONL), Claude вообще не нуждается в spawning через PTY.
-// Файлы panels/GeminiPanel.tsx и panels/SessionsPanel.tsx сохранены в кодовой базе как
-// historical reference (см. ResearchSheet для актуального replacement). Удалены отсюда.
+// Legacy Gemini-orchestration / research-chat panels удалены в 2026-06.
 
 interface Project {
   id: string;

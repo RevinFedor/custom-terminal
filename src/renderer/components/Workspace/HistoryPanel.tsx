@@ -540,6 +540,12 @@ const getDraftNoticeMeta = (message: string) => {
       tone: 'info' as const,
     };
   }
+  if (/prompt was not returned/i.test(message)) {
+    return {
+      label: 'Cancel confirmed',
+      tone: 'info' as const,
+    };
+  }
   if (/interrupted prompt/i.test(message)) {
     return {
       label: 'Prompt restored',
@@ -852,6 +858,7 @@ function AgentHistoryControls({
   const [isPasteBusy, setIsPasteBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [draftWarning, setDraftWarning] = useState<string | null>(null);
+  const [interruptAwaiting, setInterruptAwaiting] = useState(false);
   const [pendingQuestion, setPendingQuestion] = useState<AgentPendingQuestion | null>(null);
   const [answeringQuestion, setAnsweringQuestion] = useState(false);
   const [questionError, setQuestionError] = useState<string | null>(null);
@@ -865,6 +872,7 @@ function AgentHistoryControls({
   const answeringQuestionRef = useRef(false);
   const midstreamPromptRecoveryRef = useRef<{ text: string; at: number } | null>(null);
   const interruptRecoveryInFlightRef = useRef(false);
+  const interruptAwaitRef = useRef<{ tabId: string; seq: number; at: number } | null>(null);
   const emptyDraftNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const clearEmptyDraftNoticeTimer = useCallback(() => {
@@ -946,10 +954,12 @@ function AgentHistoryControls({
     answeringQuestionRef.current = false;
     midstreamPromptRecoveryRef.current = null;
     interruptRecoveryInFlightRef.current = false;
+    interruptAwaitRef.current = null;
     setBusyAction(null);
     setIsPasteBusy(false);
     setError(null);
     setDraftWarning(null);
+    setInterruptAwaiting(false);
     setPendingQuestion(null);
     setAnsweringQuestion(false);
     setQuestionError(null);
@@ -1047,17 +1057,32 @@ function AgentHistoryControls({
 
   useEffect(() => {
     if (!runtime.supportsInterruptRecovery) return;
+    const finishInterruptAwait = (finishReason: string) => {
+      const waiting = interruptAwaitRef.current;
+      if (!waiting || waiting.tabId !== tabIdRef.current) return;
+      const ageMs = Date.now() - waiting.at;
+      console.log('[' + runtime.logPrefix + ':draft] interrupt-await done tab=' + tabId.slice(-12) + ' reason=' + finishReason + ' ageMs=' + ageMs);
+      interruptAwaitRef.current = null;
+      setInterruptAwaiting(false);
+      if (actionSeqRef.current === waiting.seq) {
+        actionInFlightRef.current = false;
+        setBusyAction((current) => current === 'interrupt' ? null : current);
+      }
+      refreshPresence();
+    };
     const handleInterruptRecovery = (_: any, data: { tabId?: string; busy?: boolean; reason?: string }) => {
       if (data?.tabId !== tabId || data.busy) return;
       console.log('[' + runtime.logPrefix + ':draft] interrupt-event tab=' + tabId.slice(-12) + ' reason=' + (data.reason || '-') + ' hasPending=' + !!midstreamPromptRecoveryRef.current);
       const recoveryReasons = runtime.interruptRecoveryReasons || ['interrupt'];
       if (!recoveryReasons.includes(data.reason || '')) {
         midstreamPromptRecoveryRef.current = null;
+        finishInterruptAwait('busy-false:' + (data.reason || 'unknown'));
         return;
       }
       const pending = midstreamPromptRecoveryRef.current;
       if (!pending) {
         console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery skip tab=' + tabId.slice(-12) + ' reason=no-midstream-send');
+        finishInterruptAwait('confirmed-no-prompt');
         return;
       }
       if (interruptRecoveryInFlightRef.current) {
@@ -1068,6 +1093,7 @@ function AgentHistoryControls({
       if (ageMs > 120000) {
         console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery skip tab=' + tabId.slice(-12) + ' reason=stale ageMs=' + ageMs);
         midstreamPromptRecoveryRef.current = null;
+        finishInterruptAwait('stale-pending-prompt');
         return;
       }
 
@@ -1098,10 +1124,8 @@ function AgentHistoryControls({
           }
         }
         if (tabIdRef.current !== requestTabId) return;
-        setPrompt((prev) => prependPromptTextOnce(prev, pending.text));
-        setDraftWarning(runtime.label + ' interrupted prompt restored from last sent text; terminal draft was not readable.');
-        console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery restored tab=' + tabId.slice(-12) + ' source=sent-fallback probes=' + delays.length + ' sentChars=' + pending.text.length);
-        requestAnimationFrame(() => promptTextareaRef.current?.focus());
+        showEmptyDraftNotice(runtime.label + ' cancellation confirmed; prompt was not returned by terminal input.');
+        console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery not-restored tab=' + tabId.slice(-12) + ' reason=no-terminal-draft probes=' + delays.length + ' sentChars=' + pending.text.length);
       })()
         .catch((e: any) => {
           console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
@@ -1110,6 +1134,7 @@ function AgentHistoryControls({
           if (tabIdRef.current === requestTabId) {
             midstreamPromptRecoveryRef.current = null;
             interruptRecoveryInFlightRef.current = false;
+            finishInterruptAwait('recovery-complete');
           }
         });
     };
@@ -1118,7 +1143,7 @@ function AgentHistoryControls({
     return () => {
       ipcRenderer.removeListener(runtime.busyEvent, handleInterruptRecovery);
     };
-  }, [readTerminalDraft, runtime, tabId]);
+  }, [readTerminalDraft, refreshPresence, runtime, showEmptyDraftNotice, tabId]);
 
   const pullTerminalDraft = useCallback(async () => {
     if (actionInFlightRef.current) {
@@ -1222,10 +1247,16 @@ function AgentHistoryControls({
         }
         onHistoryRefresh();
       } else if (kind === 'interrupt') {
+        const statusAtInterrupt = statusRef.current;
         const result = runtime.interruptTurn(tabId);
         if (!result.success) throw new Error(result.error || 'Stop failed');
         if (result.interrupted && tabIdRef.current === actionTabId) {
-          if (runtime.optimisticActiveOnInterrupt) {
+          if (statusAtInterrupt === 'busy') {
+            interruptAwaitRef.current = { tabId: actionTabId, seq: actionSeq, at: Date.now() };
+            setInterruptAwaiting(true);
+            setDraftWarning(null);
+            console.log('[' + runtime.logPrefix + ':draft] interrupt-await start tab=' + tabId.slice(-12) + ' status=' + statusAtInterrupt);
+          } else if (runtime.optimisticActiveOnInterrupt) {
             setStatusFrom('active', 'interrupt-click');
           } else {
             refreshPresence();
@@ -1243,7 +1274,11 @@ function AgentHistoryControls({
       if (tabIdRef.current === actionTabId) setError(String(e?.message || e));
       refreshPresence();
     } finally {
-      if (actionSeqRef.current === actionSeq) {
+      const keepInterruptAwait =
+        kind === 'interrupt' &&
+        tabIdRef.current === actionTabId &&
+        interruptAwaitRef.current?.seq === actionSeq;
+      if (actionSeqRef.current === actionSeq && !keepInterruptAwait) {
         actionInFlightRef.current = false;
         if (tabIdRef.current === actionTabId) setBusyAction(null);
       }
@@ -1294,6 +1329,7 @@ function AgentHistoryControls({
   const meta = AGENT_STATUS_META[status];
   const isTurnBusy = status === 'busy';
   const controlsLocked = !!busyAction || isPasteBusy || answeringQuestion;
+  const isCancellingTurn = busyAction === 'interrupt' || interruptAwaiting;
   const canAcceptPrompt = status === 'active' || (status === 'busy' && runtime.allowSendWhileBusy);
   const canSend = canAcceptPrompt && prompt.trim().length > 0 && !pendingQuestion && !controlsLocked;
   const canGrabDraft = status === 'active' && !pendingQuestion && !controlsLocked;
@@ -1301,6 +1337,7 @@ function AgentHistoryControls({
   const canResume = status === 'inactive' && !!sessionId && !busyAction;
   const canStopProcess = (status === 'active' || status === 'busy' || status === 'starting') && !busyAction;
   const draftNoticeMeta = draftWarning ? getDraftNoticeMeta(draftWarning) : null;
+  const promptIdleBorder = isCancellingTurn ? 'rgba(217, 119, 6, 0.65)' : '#333';
 
   return (
     <div
@@ -1366,6 +1403,30 @@ function AgentHistoryControls({
             </div>
           </Tooltip>
         )}
+        {isCancellingTurn && !draftWarning && !error && (
+          <Tooltip content={'Waiting for ' + runtime.label + ' cancellation record and restored prompt'}>
+            <div
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 5,
+                height: 20,
+                padding: '0 7px',
+                borderRadius: 5,
+                border: '1px solid rgba(217, 119, 6, 0.5)',
+                backgroundColor: 'rgba(217, 119, 6, 0.14)',
+                color: '#fbbf24',
+                fontSize: 10,
+                fontWeight: 650,
+                letterSpacing: 0,
+                flexShrink: 0,
+              }}
+            >
+              <HistorySpinner size={11} />
+              <span>Canceling</span>
+            </div>
+          </Tooltip>
+        )}
         <div style={{ flex: 1 }} />
         {status === 'inactive' && (
           <Tooltip content={'Resume ' + runtime.label + ' session'}>
@@ -1423,6 +1484,7 @@ function AgentHistoryControls({
             data-status={status}
             value={prompt}
             onChange={(e) => {
+              if (isCancellingTurn) return;
               setPrompt(e.target.value);
               if (draftWarning) setDraftWarning(null);
             }}
@@ -1432,7 +1494,8 @@ function AgentHistoryControls({
                 if (canSend) runAction('send');
               }
             }}
-            placeholder={status === 'inactive' ? 'Resume ' + runtime.label + ' to send' : status === 'starting' ? 'Waiting for prompt...' : 'Send a prompt...'}
+            placeholder={isCancellingTurn ? 'Canceling... waiting for restored prompt' : status === 'inactive' ? 'Resume ' + runtime.label + ' to send' : status === 'starting' ? 'Waiting for prompt...' : 'Send a prompt...'}
+            readOnly={isCancellingTurn}
             rows={3}
             style={{
               flex: 1,
@@ -1440,18 +1503,18 @@ function AgentHistoryControls({
               resize: 'vertical',
               maxHeight: 120,
               minHeight: 56,
-              backgroundColor: '#0f0f0f',
-              border: '1px solid #333',
+              backgroundColor: isCancellingTurn ? '#130f0a' : '#0f0f0f',
+              border: '1px solid ' + promptIdleBorder,
               borderRadius: 5,
-              color: '#e5e5e5',
+              color: isCancellingTurn ? '#c7c7c7' : '#e5e5e5',
               outline: 'none',
               padding: '7px 8px',
               fontSize: 12,
               lineHeight: 1.35,
               fontFamily: 'inherit',
             }}
-            onFocus={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = '#DA7756'; }}
-            onBlur={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = '#333'; }}
+            onFocus={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = isCancellingTurn ? '#d97706' : '#DA7756'; }}
+            onBlur={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = promptIdleBorder; }}
           />
           <Tooltip content={canGrabDraft ? 'Pull terminal draft' : runtime.label + ' must be ready to pull draft'}>
             <button
@@ -1479,7 +1542,7 @@ function AgentHistoryControls({
               )}
             </button>
           </Tooltip>
-          <Tooltip content={isPasteBusy ? runtime.label + ' paste is in progress' : isTurnBusy ? runtime.label + ' is busy' : 'Send prompt'}>
+          <Tooltip content={isCancellingTurn ? 'Waiting for cancellation to finish' : isPasteBusy ? runtime.label + ' paste is in progress' : isTurnBusy ? runtime.label + ' is busy' : 'Send prompt'}>
             <button
               aria-label={'Send ' + runtime.label + ' prompt'}
               onClick={() => runAction('send')}
@@ -1506,7 +1569,7 @@ function AgentHistoryControls({
             </button>
           </Tooltip>
           {isTurnBusy && (
-            <Tooltip content="Stop current turn">
+            <Tooltip content={isCancellingTurn ? 'Waiting for cancellation record' : 'Stop current turn'}>
               <button
                 aria-label={'Stop current ' + runtime.label + ' turn'}
                 onClick={() => runAction('interrupt')}
@@ -1525,7 +1588,11 @@ function AgentHistoryControls({
                   flexShrink: 0,
                 }}
               >
-                <Square size={14} fill="currentColor" />
+                {isCancellingTurn ? (
+                  <HistorySpinner size={14} />
+                ) : (
+                  <Square size={14} fill="currentColor" />
+                )}
               </button>
             </Tooltip>
           )}
