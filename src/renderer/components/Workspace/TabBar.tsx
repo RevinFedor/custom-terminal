@@ -103,6 +103,7 @@ type DragPreviewLayout = {
   orderedIds: string[];
   groupAssignments: Record<string, string | null | undefined>;
   visualParentAssignments?: Record<string, string | null | undefined>;
+  groupAnchorAssignments?: Record<string, string | null | undefined>;
 };
 
 type VerticalRow =
@@ -1712,9 +1713,46 @@ const UtilsButtonDropTarget = memo(({
 function buildVerticalRows(mainTabs: TabData[], tabGroups: TabGroup[]): VerticalRow[] {
   const rows: VerticalRow[] = [];
   const groupById = new Map(tabGroups.map(group => [group.id, group]));
+  const tabById = new Map(mainTabs.map(tab => [tab.id, tab]));
+  const tabIds = new Set(mainTabs.map(tab => tab.id));
+  const tabsByGroup = new Map<string, TabData[]>();
+  for (const tab of mainTabs) {
+    const groupId = tab.groupId && groupById.has(tab.groupId) ? tab.groupId : undefined;
+    if (!groupId) continue;
+    const tabs = tabsByGroup.get(groupId) || [];
+    tabs.push(tab);
+    tabsByGroup.set(groupId, tabs);
+  }
+  const emptyGroupsByAnchor = new Map<string, TabGroup[]>();
+  const trailingEmptyGroups: TabGroup[] = [];
+  for (const group of tabGroups) {
+    if (tabsByGroup.has(group.id)) continue;
+    const rawAnchorTabId = group.anchorTabId && tabIds.has(group.anchorTabId) ? group.anchorTabId : undefined;
+    const anchorTab = rawAnchorTabId ? tabById.get(rawAnchorTabId) : undefined;
+    const anchorGroupId = anchorTab?.groupId && tabsByGroup.has(anchorTab.groupId) ? anchorTab.groupId : undefined;
+    const anchorTabId = anchorGroupId
+      ? tabsByGroup.get(anchorGroupId)?.[0]?.id
+      : rawAnchorTabId;
+    if (!anchorTabId) {
+      trailingEmptyGroups.push(group);
+      continue;
+    }
+    const anchored = emptyGroupsByAnchor.get(anchorTabId) || [];
+    anchored.push(group);
+    emptyGroupsByAnchor.set(anchorTabId, anchored);
+  }
   const renderedGroups = new Set<string>();
+  const pushEmptyGroupsAnchoredTo = (tabId: string) => {
+    const groups = emptyGroupsByAnchor.get(tabId);
+    if (!groups) return;
+    for (const group of groups) {
+      renderedGroups.add(group.id);
+      rows.push({ type: 'group', group, tabs: [], index: rows.length });
+    }
+  };
 
   for (const tab of mainTabs) {
+    pushEmptyGroupsAnchoredTo(tab.id);
     const groupId = tab.groupId && groupById.has(tab.groupId) ? tab.groupId : undefined;
     if (!groupId) {
       rows.push({ type: 'tab', tab, index: rows.length });
@@ -1722,12 +1760,12 @@ function buildVerticalRows(mainTabs: TabData[], tabGroups: TabGroup[]): Vertical
     }
     if (renderedGroups.has(groupId)) continue;
     const group = groupById.get(groupId)!;
-    const tabs = mainTabs.filter(candidate => candidate.groupId === groupId);
+    const tabs = tabsByGroup.get(groupId) || [];
     renderedGroups.add(groupId);
     rows.push({ type: 'group', group, tabs, index: rows.length });
   }
 
-  for (const group of tabGroups) {
+  for (const group of trailingEmptyGroups) {
     if (!renderedGroups.has(group.id)) {
       rows.push({ type: 'group', group, tabs: [], index: rows.length });
     }
@@ -1829,6 +1867,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   // Settings → Размеры → ТАБЫ → Терминал. Зазор между табами в TabSidebar (вертикальный layout).
   // Также используется как padding контейнера, чтобы первая/последняя вкладка не липли к краю.
   const tabSidebarGap = useUIStore((state) => state.tabGeometry.gap);
+  const tabGeometry = useUIStore((state) => state.tabGeometry);
   // tabNotes* font / padding теперь читаются внутри TabPreviewPopover.
 
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
@@ -2262,6 +2301,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     );
     const baseOrder = baseTabs.map(tab => tab.id);
     const tabById = new Map(baseTabs.map(tab => [tab.id, tab]));
+    const currentGroups = currentWorkspace.tabGroups || [];
     const collectWithVisualChildren = (ids: string[]) => {
       const result: string[] = [];
       const add = (id: string) => {
@@ -2284,12 +2324,15 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         : [sourceData.id];
       return collectWithVisualChildren(selected.filter(id => tabById.has(id)));
     })();
-    if (sourceIds.length === 0) return null;
+    const isEmptyGroupDrag = sourceData.type === 'TAB_GROUP' && sourceIds.length === 0
+      && currentGroups.some(group => group.id === sourceData.groupId);
+    if (sourceIds.length === 0 && !isEmptyGroupDrag) return null;
 
     const sourceSet = new Set(sourceIds);
     const withoutSource = baseOrder.filter(id => !sourceSet.has(id));
     const groupAssignments: Record<string, string | null | undefined> = {};
     const visualParentAssignments: Record<string, string | null | undefined> = {};
+    const groupAnchorAssignments: Record<string, string | null | undefined> = {};
     const selectedTabRootCandidates = sourceData.type === 'TAB'
       ? Array.from(new Set((sourceData.selectedTabIds && sourceData.selectedTabIds.includes(sourceData.id)
         ? sourceData.selectedTabIds
@@ -2337,6 +2380,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       orderedIds,
       groupAssignments,
       visualParentAssignments,
+      groupAnchorAssignments,
     });
     const insertAt = (order: string[], ids: string[], index: number) => {
       const next = [...order];
@@ -2366,6 +2410,23 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       }
       return flatIndex;
     };
+    const firstTabIdForRow = (row: VerticalDragGeometry['rows'][number]): string | undefined => {
+      if (row.type === 'tab') return row.tabId;
+      const visibleTab = row.tabRows.find(tabRow => tabById.has(tabRow.tabId));
+      if (visibleTab) return visibleTab.tabId;
+      return baseOrder.find(id => tabById.get(id)?.groupId === row.groupId);
+    };
+    const anchorBeforeRow = (rowIndex: number): string | null => {
+      for (let i = Math.max(0, rowIndex); i < geometry!.rows.length; i += 1) {
+        const row = geometry!.rows[i];
+        if (sourceData.type === 'TAB_GROUP' && row.type === 'group' && row.groupId === sourceData.groupId) {
+          continue;
+        }
+        const tabId = firstTabIdForRow(row);
+        if (tabId && !sourceSet.has(tabId)) return tabId;
+      }
+      return null;
+    };
     const indexInGroup = (groupId: string, memberIndex: number, rowIndex: number) => {
       const members = withoutSource.filter(id => tabById.get(id)?.groupId === groupId);
       if (members.length === 0) return indexAtFlatPosition(rowIndex);
@@ -2373,6 +2434,24 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       if (beforeId) return withoutSource.indexOf(beforeId);
       return withoutSource.indexOf(members[members.length - 1]) + 1;
     };
+    const assignEmptyGroupAnchor = (anchorTabId: string | null) => {
+      if (sourceData.type !== 'TAB_GROUP') return null;
+      groupAnchorAssignments[sourceData.groupId] = anchorTabId;
+      return makePreview(baseOrder);
+    };
+
+    if (isEmptyGroupDrag) {
+      if (targetData?.type === 'EMPTY_ZONE') {
+        return assignEmptyGroupAnchor(null);
+      }
+      for (let rowIndex = 0; rowIndex < geometry.rows.length; rowIndex += 1) {
+        const row = geometry.rows[rowIndex];
+        if (clientY < row.rect.top || clientY > row.rect.bottom) continue;
+        const before = clientY < row.rect.midY;
+        return assignEmptyGroupAnchor(anchorBeforeRow(before ? rowIndex : rowIndex + 1));
+      }
+      return assignEmptyGroupAnchor(anchorBeforeRow(flatIndexFromY()));
+    }
 
     if (sourceData.type === 'TAB_GROUP') {
       const targetIndex = indexAtFlatPosition(flatIndexFromY());
@@ -2398,7 +2477,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
     if (targetData?.type === 'EMPTY_ZONE') {
       const lastRow = geometry.rows[geometry.rows.length - 1];
-      if (lastRow?.type === 'group' && lastRow.tabRows.every(tabRow => sourceSet.has(tabRow.tabId))) {
+      if (lastRow?.type === 'group' && lastRow.tabRows.length > 0 && lastRow.tabRows.every(tabRow => sourceSet.has(tabRow.tabId))) {
         return assignGroup(lastRow.groupId, 0, geometry.rows.length - 1);
       }
     }
@@ -2411,7 +2490,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           ? assignFlat(rowIndex)
           : assignGroup(row.groupId, 0, rowIndex);
       }
-      if (row.tabRows.length === 0) continue;
+      if (row.tabRows.length === 0) {
+        if (clientY > row.header.bottom && clientY <= row.rect.bottom) {
+          return assignGroup(row.groupId, 0, rowIndex);
+        }
+        continue;
+      }
       const first = row.tabRows[0];
       const last = row.tabRows[row.tabRows.length - 1];
       if (clientY < row.header.bottom || clientY > row.rect.bottom) continue;
@@ -2472,7 +2556,13 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
         const preview = resolveStaticVerticalPreview(sourceData, input.clientX, input.clientY, targetData);
         if (preview) {
-          applyTabLayout(projectId, preview.orderedIds, preview.groupAssignments, preview.visualParentAssignments);
+          applyTabLayout(
+            projectId,
+            preview.orderedIds,
+            preview.groupAssignments,
+            preview.visualParentAssignments,
+            preview.groupAnchorAssignments
+          );
           dragPreviewKeyRef.current = '';
           verticalDragGeometryRef.current = null;
           setDragPreview(null);
@@ -2613,6 +2703,16 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const mainTabsBase = visibleTabs.filter(t => !t.isUtility);
   const utilityTabs = visibleTabs.filter(t => t.isUtility);
   const tabGroups = workspace.tabGroups || [];
+  const tabGroupsForDisplay = (() => {
+    if (!isVerticalLayout || !dragPreview?.groupAnchorAssignments) return tabGroups;
+    return tabGroups.map(group => {
+      if (!Object.prototype.hasOwnProperty.call(dragPreview.groupAnchorAssignments!, group.id)) return group;
+      return {
+        ...group,
+        anchorTabId: dragPreview.groupAnchorAssignments![group.id] || undefined,
+      };
+    });
+  })();
   const mainTabs = (() => {
     if (!isVerticalLayout || !dragPreview) return mainTabsBase;
     const byId = new Map(mainTabsBase.map(tab => [tab.id, tab]));
@@ -2642,7 +2742,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   })();
   const mainTabsForDisplay = isVerticalLayout ? orderTabsWithVisualChildren(mainTabs) : mainTabs;
   const visualDepthById = isVerticalLayout ? buildVisualDepthMap(mainTabsForDisplay) : new Map<string, number>();
-  const verticalRows = isVerticalLayout ? buildVerticalRows(mainTabsForDisplay, tabGroups) : [];
+  const verticalRows = isVerticalLayout ? buildVerticalRows(mainTabsForDisplay, tabGroupsForDisplay) : [];
 
   // CWD priority: project.path (if bound) → активный таб cwd → HOME.
   // Раньше было наоборот (активный таб → project.path) — при бранч-хоппинге
@@ -3257,7 +3357,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
     return autoScrollForElements({
       element: scrollContainer,
-      canScroll: ({ source }) => source.data.type === 'TAB',
+      canScroll: ({ source }) => source.data.type === 'TAB' || source.data.type === 'TAB_GROUP',
       getConfiguration: () => ({
         maxScrollSpeed: 'fast',
       }),
@@ -3508,7 +3608,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     onToggleCollapsed={() => toggleTabGroupCollapsed(projectId, row.group.id)}
                     cmdCollapseMode={isCmdPressed}
                   />
-                  {row.tabs.length > 0 && (
+                  {(row.tabs.length > 0 || !row.group.collapsed) && (
                     <div
                       data-tab-group-collapse
                       data-group-id={row.group.id}
@@ -3535,7 +3635,29 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                           borderLeft: '1px solid rgba(139,92,246,0.22)',
                         }}
                       >
-                        {row.tabs.map((tab, groupIndex) => renderTab(tab, row.group.id, groupIndex))}
+                        {row.tabs.length > 0 ? (
+                          row.tabs.map((tab, groupIndex) => renderTab(tab, row.group.id, groupIndex))
+                        ) : (
+                          <div
+                            data-empty-group-placeholder
+                            data-group-id={row.group.id}
+                            style={{
+                              minHeight: 24,
+                              padding: `${tabGeometry.paddingY}px ${tabGeometry.paddingX}px ${tabGeometry.paddingY}px ${tabGeometry.paddingLeft}px`,
+                              borderRadius: tabGeometry.borderRadius,
+                              boxSizing: 'border-box',
+                              fontSize: `${tabsFontSize}px`,
+                              color: '#71717a',
+                              backgroundColor: 'rgba(139,92,246,0.055)',
+                              border: '1px dashed rgba(139,92,246,0.24)',
+                              display: 'flex',
+                              alignItems: 'center',
+                              userSelect: 'none',
+                            }}
+                          >
+                            Пусто
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}
@@ -3559,7 +3681,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               if (!currentTabs.includes(tabId)) return;
               const newOrder = currentTabs.filter(id => id !== tabId);
               newOrder.push(tabId);
-              if (lastRow?.type === 'group' && lastRow.tabs.every(tab => tab.id === tabId)) {
+              if (lastRow?.type === 'group' && lastRow.tabs.length > 0 && lastRow.tabs.every(tab => tab.id === tabId)) {
                 applyTabLayout(projectId, newOrder, { [tabId]: lastRow.group.id });
                 return;
               }
@@ -3574,10 +3696,13 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               const groupIds = Array.from(currentWorkspace.tabs.values())
                 .filter(tab => !tab.parentTabId && !tab.isUtility && tab.groupId === groupId)
                 .map(tab => tab.id);
-              if (groupIds.length === 0) return;
               const currentTabs = orderTabsWithVisualChildren(
                 Array.from(currentWorkspace.tabs.values()).filter(tab => !tab.parentTabId && !tab.isUtility)
               ).map(tab => tab.id);
+              if (groupIds.length === 0) {
+                applyTabLayout(projectId, currentTabs, {}, {}, { [groupId]: null });
+                return;
+              }
               const newOrder = currentTabs.filter(id => !groupIds.includes(id));
               newOrder.push(...groupIds);
               applyTabLayout(projectId, newOrder, {});
