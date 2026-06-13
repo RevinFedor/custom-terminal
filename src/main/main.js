@@ -3762,6 +3762,7 @@ async function handleOverseerRequest(rawUrl) {
     const rows = projectManager.db.db.prepare(`
       SELECT t.tab_id, t.name, t.cwd, t.claude_session_id, t.gemini_session_id,
              t.codex_session_id, t.command_type,
+             t.context_pct,
              t.created_at, p.path AS project_path, p.name AS project_title
       FROM tabs t LEFT JOIN projects p ON p.id = t.project_id
       WHERE t.tab_id IS NOT NULL
@@ -3782,11 +3783,31 @@ async function handleOverseerRequest(rawUrl) {
         : (bridgeKnownSessions.get(tabId) || r.claude_session_id || null);
       if (!sessionId) continue;
       const isLive = terminals.has(tabId);
+      const bridgeMeta = !isCodex ? (bridgeMetadata.get(tabId) || null) : null;
+      const bridgeContextPct = bridgeMeta && typeof bridgeMeta.contextPct === 'number'
+        ? bridgeMeta.contextPct
+        : null;
+      const persistedContextPct = !isCodex && typeof r.context_pct === 'number'
+        ? r.context_pct
+        : null;
+      const rawContextPct = bridgeContextPct && bridgeContextPct > 0
+        ? bridgeContextPct
+        : persistedContextPct;
+      const contextUsedPct = typeof rawContextPct === 'number' && Number.isFinite(rawContextPct) && rawContextPct > 0
+        ? Math.min(100, Math.max(0, rawContextPct))
+        : null;
+      const model = bridgeMeta && bridgeMeta.model && bridgeMeta.model !== 'unknown'
+        ? bridgeMeta.model
+        : null;
       sessions.push({
         tabId,
         tabName: r.name,
         sessionId,
         engine: isCodex ? 'codex' : 'claude',
+        model,
+        contextUsedPct,
+        contextRemainingPct: contextUsedPct == null ? null : Math.max(0, 100 - contextUsedPct),
+        contextSource: contextUsedPct == null ? null : (bridgeContextPct && bridgeContextPct > 0 ? 'bridge' : 'persisted'),
         cwd: terminalProjects.get(tabId) || r.cwd,
         projectPath: r.project_path || null,
         projectTitle: r.project_title || null,
