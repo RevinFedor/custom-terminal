@@ -1020,17 +1020,64 @@ function App() {
       if (!targetProjectId) targetProjectId = state.activeProjectId;
       if (!targetProjectId) return;
 
-      const pendingAction = data.command ? { type: 'shell-command' as const, command: data.command } : undefined;
+      const rawCommand = (data.command || '').trim();
+      let pendingAction: any = undefined;
+      let commandType: any = undefined;
+      let sessionPatch: any = {};
+      const sessionPattern = '([0-9a-fA-F-]{8,})';
+      const codexForkMatch = rawCommand.match(new RegExp('^codex-f\\s+' + sessionPattern + '$', 'i'));
+      const codexContinueMatch = rawCommand.match(new RegExp('^(?:codex-c|codex\\s+(?:resume|--resume))\\s+' + sessionPattern + '$', 'i'));
+      const claudeForkMatch = rawCommand.match(new RegExp('^claude-f\\s+' + sessionPattern + '$', 'i'));
+      const claudeContinueMatch = rawCommand.match(new RegExp('^(?:claude-c|claude\\s+--resume)\\s+' + sessionPattern + '$', 'i'));
+
+      if (codexForkMatch) {
+        pendingAction = { type: 'codex-fork', sessionId: codexForkMatch[1] };
+        commandType = 'codex';
+      } else if (codexContinueMatch) {
+        pendingAction = { type: 'codex-continue', sessionId: codexContinueMatch[1] };
+        commandType = 'codex';
+        sessionPatch.codexSessionId = codexContinueMatch[1];
+      } else if (rawCommand === 'codex') {
+        pendingAction = { type: 'codex-new' };
+        commandType = 'codex';
+      } else if (claudeForkMatch) {
+        pendingAction = { type: 'claude-fork', sessionId: claudeForkMatch[1] };
+        commandType = 'claude';
+      } else if (claudeContinueMatch) {
+        pendingAction = { type: 'claude-continue', sessionId: claudeContinueMatch[1] };
+        commandType = 'claude';
+        sessionPatch.claudeSessionId = claudeContinueMatch[1];
+      } else if (rawCommand === 'claude' || rawCommand === 'claude-d') {
+        pendingAction = { type: 'claude-new' };
+        commandType = 'claude';
+      } else if (rawCommand) {
+        pendingAction = { type: 'shell-command' as const, command: rawCommand };
+        commandType = 'devServer';
+      }
+
       await state.createTab(targetProjectId, data.name, data.cwd, {
-        commandType: data.command ? 'devServer' : undefined,
-        color: (data.color || (data.command ? 'green' : undefined)) as any,
+        commandType,
+        color: (data.color || (commandType === 'codex' ? 'codex' : commandType === 'claude' ? 'claude' : rawCommand ? 'green' : undefined)) as any,
         pendingAction,
         nameSetManually: !!data.name,
+        ...sessionPatch,
       } as any);
+    };
+
+    const handleMcpAiTab = (_: any, data: { tabId: string; engine: 'claude' | 'codex' | 'gemini'; sessionId?: string }) => {
+      if (!data?.tabId || !data?.engine) return;
+      const store = useWorkspaceStore.getState();
+      store.setTabCommandType(data.tabId, data.engine as any);
+      if (data.engine === 'claude' && data.sessionId) {
+        store.setClaudeSessionId(data.tabId, data.sessionId, 'unknown');
+      } else if (data.engine === 'codex' && data.sessionId) {
+        store.setCodexSessionId(data.tabId, data.sessionId, 'unknown');
+      }
     };
 
     ipcRenderer.on('terminal:mcp-restart', handleMcpRestart);
     ipcRenderer.on('terminal:mcp-create', handleMcpCreate);
+    ipcRenderer.on('terminal:mcp-ai-tab', handleMcpAiTab);
 
     // Mobile-web bridge: main process asks renderer to perform UI-state actions
     // (create SDK tab, send message via the renderer's selected model/effort,
@@ -1703,6 +1750,7 @@ function App() {
     return () => {
       ipcRenderer.removeListener('terminal:mcp-restart', handleMcpRestart);
       ipcRenderer.removeListener('terminal:mcp-create', handleMcpCreate);
+      ipcRenderer.removeListener('terminal:mcp-ai-tab', handleMcpAiTab);
       ipcRenderer.removeListener('web:bridge-request', handleWebBridge);
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
