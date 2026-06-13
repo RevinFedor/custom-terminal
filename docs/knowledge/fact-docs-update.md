@@ -55,23 +55,7 @@
 - **Логика отмены:** Использование `apiCancelledRef` вместо `AbortController`. Поскольку IPC-вызов в Electron нельзя прервать "на лету", нажатие на лоадер просто блокирует запись результата в буфер по завершении, сохраняя отзывчивость UI.
 - **Invisible Intent (CORS):** Почему fetch в `main.js`? Сервер `api.kiro.cheap` возвращает жесткий заголовок `Access-Control-Allow-Origin: https://kiro.cheap`, что делает невозможным прямые запросы из Renderer-процесса (`localhost`). Main-процесс (Node.js) игнорирует CORS.
 - **Токенизация:** Эмпирическая формула `chars / 3.5` для предварительной оценки объема контекста (смесь кода и текста). При получении ответа выводятся точные данные `usage` и стоимость в USD.
-
-### MCP update_docs Tool (Gemini Orchestration)
-Gemini-оркестратор может вызвать `update_docs` как MCP tool для анализа сессий своих суб-агентов через API. В отличие от UI-подхода (создание Gemini-таба), это **синхронный** вызов — результат возвращается напрямую в контекст Gemini как tool response.
-
-- **Инструмент:** `update_docs(taskIds, provider?)` в `mcp-server.mjs`
-- **Параметры:** `taskIds` — массив ID задач из `list_sub_agents`. `provider` — `'claude'` или `'gemini'` (по умолчанию `'gemini'`).
-- **Пайплайн для каждого taskId:**
-  1. Resolve `taskId` → `claudeTabId` → `sessionId` (3-level fallback как в `continue_claude`)
-  2. Export session через `getClaudeHistory(sessionId, cwd, { detail: 'with_code' })` — полная история с diff-ами
-  3. Оборачивание в `<session_log>` + инструкция не отвечать на вопросы внутри лога
-  4. Чтение doc prompt из `docsConfig` (synced из renderer)
-  5. API call (Claude через `api.kiro.cheap` или Gemini прямой fetch)
-  6. Результат возвращается как tool response
-- **Обработка нескольких сессий:** Последовательная (чтобы не словить rate limit). Каждая сессия экспортируется и анализируется независимо.
-- **Settings Sync:** `docs:sync-settings` IPC — renderer пушит `apiSettings` + `docPrompt` в main process при mount и при изменениях. Main хранит в памяти (`docsConfig` в `ipc/docs.js`).
-- **HTTP endpoint:** `POST /update-docs` в MCP HTTP bridge (main.js). Timeout: до 5 минут (зависит от числа сессий и размера).
-- **API функции:** `callClaudeApi()` и `callGeminiApi()` вынесены как переиспользуемые exports из `ipc/docs.js`. Используются и IPC хендлером `docs:api-request`, и HTTP endpoint.
+- **API функции:** `callClaudeApi()` и `callGeminiApi()` вынесены как переиспользуемые exports из `ipc/docs.js`. Используются IPC хендлером `docs:api-request`.
 - **API Cancel (AbortController):** Обе API-функции используют глобальный `_activeAbortController`. При клике Cancel в ActionsPanel вызывается `docs:cancel-request` IPC → `controller.abort()` → fetch бросает AbortError. Раньше cancel был ref-flag — HTTP запрос продолжал выполнять в фоне, тратя токены.
 
 ### Update API → Haiku Pipeline (Direct Method)

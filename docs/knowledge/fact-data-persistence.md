@@ -57,14 +57,6 @@ SQLite-схема приложения, философия «проект как
 ### Transaction safety для global commands & prompts
 Методы `saveGlobalCommands()` и `savePrompts()` обёрнуты в `db.transaction()` с **empty-array guard**: если передан пустой массив при наличии данных в БД, удаление блокируется и логируется. Защита от потери пользовательских данных из-за багов рендерера (например, racy initial state до hydration).
 
-### Evolution of built-in prompts — `ensureAdoptPrompt`
-При запуске приложения механизм `ensureAdoptPrompt` проверяет: совпадают ли встроенные системные промпты в коде (например, summarization-prompt при адоптации Claude-агента) с версией в БД. Если код изменился — БД обновляется автоматически.
-
-Это позволяет обновлять логику суммаризации у всех юзеров без ручного reset БД или explicit миграций. Изменения распространяются при следующем запуске.
-
-### Response queue persistence
-Очередь ответов суб-агентов (`geminiResponseQueue`) сохраняется в `app_state` при closing и восстанавливается при запуске. Защита от потери auto-delivery, если Gemini был busy в момент shutdown.
-
 ---
 
 ## Xterm serialization при unmount
@@ -129,14 +121,6 @@ CREATE TABLE favorites (
 ## Runtime-only поля таба (НЕ персистятся)
 
 Эти поля живут только в `Tab` interface в памяти, не пишутся в SQLite:
-- `claudeAgentStatus`, `claudeActive`, `claudeBusy` — process state.
-- `interceptorState` — runtime детекция перехвата.
+- `claudeActive`, `claudeBusy` — process state.
 
-После рестарта сбрасываются к default. Это намеренно — они отражают **живое состояние процесса**, не его конфигурацию.
-
-**Персистентные MCP-поля** (наоборот, сохраняются в `tabs`):
-- `mcp_task_id` (UUID активной задачи).
-- `claude_task_count` (счётчик итераций).
-- `mcp_task_started_at` (timestamp старта).
-
-Различие: `claudeBusy` восстановится сам как только Claude напишет в PTY; `mcp_task_id` нужен для корректного reconnect orchestrator'а после рестарта приложения.
+После рестарта сбрасываются к default. Это намеренно — они отражают **живое состояние процесса**, не его конфигурацию. `claudeBusy` восстановится сам, как только Claude напишет в PTY.

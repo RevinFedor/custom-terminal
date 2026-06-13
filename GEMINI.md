@@ -20,7 +20,7 @@
 <!-- @deploy-end -->
 
 ## Обзор
-Noted Terminal — кастомный эмулятор терминала на базе Electron с глубокой интеграцией AI-агентов (Gemini CLI, Claude Code) и управлением проектами.
+Noted Terminal — кастомный эмулятор терминала на базе Electron с глубокой интеграцией AI-агентов (Claude Code — PTY + Agent SDK, Codex CLI, Gemini CLI) и управлением проектами. Любая вкладка может читать и редактировать историю любой другой сессии через overseer MCP (cross-session access поверх полного парсинга JSONL обоих агентов).
 
 ## Технический Стек
 - **Runtime:** Electron 28
@@ -34,8 +34,6 @@ Noted Terminal — кастомный эмулятор терминала на �
 
 ## State Management
 - **ProjectWorkspace:** Хранит состояние вкладок, директорий и активных сессий проекта.
-- **viewingSubAgentTabId:** Позволяет переключать вьюпорт на суб-агента, сохраняя основной фокус на родительском табе (Gemini).
-- **effectiveTab Pattern:** Абстракция в `Workspace.tsx`, которая резолвит текущий "смысловой" таб (суб-агент или активный). Используется для автоматического переключения Timeline, поиска и заметок.
 
 ## Navigation
 - **Home Button Toggle:** Кнопка 🏠 (Home) работает как переключатель. При нахождении на Dashboard повторный клик по 🏠 возвращает пользователя в контекст последнего активного проекта вместо перезагрузки Dashboard. Это сокращает время на навигацию при частом переходе между Dashboard и проектами.
@@ -74,7 +72,7 @@ MCP-инструмент `docs_search` — вызови перед работо�
 - **Manual Cmd+V пропускается transparent в PTY** (без bracketed-обёрток, без chunking на нашей стороне). Если длинный paste дробится на N chip'ов в Claude TUI — root cause **не** в `terminal:input`. Проверь env `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` в shellEnv `terminal:create` и версию node-pty (≥1.2.0-beta для PR #831). См. [`fix-paste-bracket-mode-loss.md`](docs/knowledge/fix-paste-bracket-mode-loss.md), [`methodology/переносимый-дизайн.md`](docs/methodology/переносимый-дизайн.md) секция «Transparent passthrough».
 - **Не используй `execSync`** в main process — фризит весь UI
 - **Фоновая команда: success ≠ exit code.** Если main спавнит внешний скрипт (build-index, npm-таск, bash-pipeline) и UI показывает результат — `code===0` означает только что процесс дошёл до `exit`, не что задача выполнена. Многие скрипты выходят 0 даже когда внутри упала половина шагов. Парсь summary stdout и собирай success из набора детерминированных сигналов (видели summary, errors==0, warnings==0, per-file ошибки==0). Иначе UI лжёт пользователю — «успешно» в тосте при сломанном артефакте. См. [`methodology/переносимый-дизайн.md`](docs/methodology/переносимый-дизайн.md) секция «Success ≠ exit code» и [`fact-project-toolbar.md`](docs/knowledge/fact-project-toolbar.md) секция «Rebuild validation».
-- **Не используй polling и таймауты для ожидания состояний:** Проект event-driven — для каждого состояния уже есть сигнал (OSC 133, `geminiSpinnerBusy` → `processGeminiQueue`, `geminiResponseQueue`, IPC events). Перед написанием `setTimeout`/`setInterval` для ожидания — найди существующий event-driven механизм в кодовой базе. `setTimeout` допустим только для debounce, не для "подождать пока X будет готов". **Это также относится к ожиданию готовности PTY-интерфейсов (например, Gemini CLI TUI)** — используй детерминированные PTY-события вместо фиксированных таймаутов. Пример: ожидание ANSI-сигнала `HIDE CURSOR` (`\x1b[?25l`) гарантирует, что терминал полностью инициализирован перед вставкой данных.
+- **Не используй polling и таймауты для ожидания состояний:** Проект event-driven — для каждого состояния уже есть сигнал (OSC 133, Stop hook `claude:busy-state`, `claude-sdk:busy-state`, Codex rollout `task_started`/`task_complete`/`turn_aborted`, sync markers, IPC events). Перед написанием `setTimeout`/`setInterval` для ожидания — найди существующий event-driven механизм в кодовой базе. `setTimeout` допустим только для debounce, не для "подождать пока X будет готов". **Это также относится к ожиданию готовности PTY-интерфейсов (например, Claude/Codex CLI TUI)** — используй детерминированные PTY-события вместо фиксированных таймаутов. Пример: ожидание ANSI-сигнала `HIDE CURSOR` (`\x1b[?25l`) гарантирует, что терминал полностью инициализирован перед вставкой данных.
 - **AI loader: детерминированность важнее мгновенного старта:** задержка <1с на появление loader'а допустима, если источник — авторитетное событие/JSONL-запись; недопустимы ложные обрывы loader'а посреди долгого turn'а и `timeout` как основной источник окончания. Исключение — управляющие действия типа смены модели/rewind, где нужен мгновенный feedback; там таймеры только fallback.
 - **IPC коммуникация:** При добавлении main↔renderer коммуникации проверь существующие хендлеры: `grep 'ipcMain.handle\|ipcMain.on' src/main/main.js`. Конвенция: `модуль:действие` (terminal:paste, claude:spawn-with-watcher). `handle` для request-response, `on` для fire-and-forget.
 - **Не дублируй `ipcMain.handle('X')`:** Electron throws на втором `handle` для того же канала (`Attempted to register a second handler`). Throw обрывает текущий `registerHandlers()` блок — **все handler'ы после throw молча не регистрируются**, их симптом потом мигрирует в "кнопка не работает" без ошибок в renderer. Перед добавлением handler'а grep'ни по всему `src/main/`, не только по одному файлу.

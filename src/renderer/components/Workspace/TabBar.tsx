@@ -492,20 +492,8 @@ const TabItem = memo(({
     };
   }, [clearBodyGrabbing, isPressing]);
 
-  // Check if a drag source is a Claude tab eligible for adoption onto this Gemini tab
-  const isAdoptDrop = useCallback((sourceData: DragData) => {
-    if (sourceData.type !== 'TAB') return false;
-    if (commandType !== 'gemini') return false;
-    const sourceTabId = sourceData.id;
-    const state = useWorkspaceStore.getState();
-    for (const [, ws] of state.openProjects) {
-      const sourceTab = ws.tabs.get(sourceTabId);
-      if (sourceTab) {
-        return sourceTab.commandType === 'claude' && !sourceTab.parentTabId;
-      }
-    }
-    return false;
-  }, [commandType]);
+  // Tab adoption (Gemini → Claude sub-agent) was removed; no drag source is adoptable.
+  const isAdoptDrop = useCallback((_sourceData: DragData) => false, []);
 
   // Resolve effective orientation: explicit prop wins, otherwise zone fallback
   // (main = horizontal in legacy TabBar, utility dropdown = vertical).
@@ -2246,14 +2234,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     return { list: snapRect(scroller), rows };
   }, [isVerticalLayout]);
 
-  const isAdoptDropTarget = useCallback((sourceData: DragData, targetData: any): boolean => {
-    if (sourceData.type !== 'TAB' || targetData?.type !== 'TAB') return false;
-    const currentWorkspace = useWorkspaceStore.getState().openProjects.get(projectId);
-    if (!currentWorkspace) return false;
-    const sourceTab = currentWorkspace.tabs.get(sourceData.id);
-    const targetTab = currentWorkspace.tabs.get(targetData.id);
-    return !!(sourceTab?.commandType === 'claude' && !sourceTab.parentTabId && targetTab?.commandType === 'gemini');
-  }, [projectId]);
+  // Tab adoption (Gemini → Claude sub-agent) was removed; no drop is an adopt target.
+  const isAdoptDropTarget = useCallback((_sourceData: DragData, _targetData: any): boolean => false, []);
 
   const resolveStaticVerticalPreview = useCallback((sourceData: DragData, clientX: number, clientY: number, targetData?: any): DragPreviewLayout | null => {
     if (!isVerticalLayout) return null;
@@ -2445,16 +2427,6 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         if (!currentWorkspace) return;
         if (sourceData.type !== 'TAB') return;
 
-        // ===== DETACH: sub-agent chip dropped back to TabBar → detach from parent =====
-        const sourceTab = currentWorkspace.tabs.get(sourceData.id);
-        if (sourceTab?.parentTabId) {
-          const store = useWorkspaceStore.getState();
-          store.setTabParent(sourceData.id, undefined as any);
-          store.setViewingSubAgent(null);
-          // Switch to detached tab — user dragged it to TabBar, they want to see it
-          store.switchTab(projectId, sourceData.id);
-          return;
-        }
         if (isVerticalLayout && sourceData.zone === 'main' && !isAdoptDropTarget(sourceData, targetData)) return;
 
         const allTabsNow = Array.from(currentWorkspace.tabs.values());
@@ -2473,25 +2445,6 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
         // Dropped on another tab
         if (targetData.type === 'TAB') {
-          // ===== ADOPT: Claude tab dropped on Gemini tab → adopt as sub-agent =====
-          const targetTabId = targetData.id as string;
-          const sourceTabId = sourceData.id;
-          const currentWs = useWorkspaceStore.getState().openProjects.get(projectId);
-          if (currentWs) {
-            const sourceTab = currentWs.tabs.get(sourceTabId);
-            const targetTab = currentWs.tabs.get(targetTabId);
-            if (sourceTab?.commandType === 'claude' && !sourceTab.parentTabId &&
-                targetTab?.commandType === 'gemini') {
-              const { ipcRenderer } = window.require('electron');
-              ipcRenderer.invoke('mcp:adopt-agent', { claudeTabId: sourceTabId, geminiTabId: targetTabId });
-              // Switch to Gemini tab (adopted tab will vanish from TabBar)
-              if (currentWs.activeTabId === sourceTabId) {
-                useWorkspaceStore.getState().switchTab(projectId, targetTabId);
-              }
-              return; // Don't reorder
-            }
-          }
-
           const edge = extractClosestEdge(targetData);
           const targetZone = targetData.zone as 'main' | 'utility';
           const targetIndex = targetData.index as number;
@@ -2595,8 +2548,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   if (!workspace || !project) return null;
 
   const allTabs = Array.from(workspace.tabs.values());
-  // Hide sub-agent tabs (parentTabId set) — they are only shown in SubAgentBar
-  const visibleTabs = allTabs.filter(t => !t.parentTabId);
+  const visibleTabs = allTabs;
   const mainTabsBase = visibleTabs.filter(t => !t.isUtility);
   const utilityTabs = visibleTabs.filter(t => t.isUtility);
   const tabGroups = workspace.tabGroups || [];

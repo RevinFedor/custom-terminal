@@ -1322,7 +1322,7 @@ export default function ClaudeControlBar({
       const forkName = tab.name ? `${tab.name}_fork` : undefined;
       await state.createTabAfterCurrent(projectId, forkName, currentCwd, {
         pendingAction: { type: sessionType === 'claude' ? 'claude-fork' : sessionType === 'codex' ? 'codex-fork' : 'gemini-fork', sessionId },
-        nameSetManually: !!forkName,
+        nameSetManually: sessionType === 'gemini' ? !!forkName : false,
         afterTabId: tab.id,
         visualParentTabId: tab.id,
       });
@@ -1371,6 +1371,7 @@ export default function ClaudeControlBar({
         const currentCwd = tab.cwd || projectPath || '';
         if (canUseCurrentEmptyPtyForFork(tab)) {
           state.setTabCommandType(tabId, 'claude');
+          state.markAiForkAutoTitle(tabId, 'claude', clipSid);
           terminalRegistry.get(tabId)?.scrollToBottom();
           focusTerminal();
           ipcRenderer.send('claude:run-command', { tabId, command: 'claude-f', forkSessionId: clipSid, cwd: currentCwd });
@@ -1380,7 +1381,7 @@ export default function ClaudeControlBar({
         const forkName = `${clipSid.slice(0, 8)}_fork`;
         await state.createTabAfterCurrent(projectId, forkName, currentCwd, {
           pendingAction: { type: 'claude-fork', sessionId: clipSid },
-          nameSetManually: true,
+          nameSetManually: false,
         });
         showToast(`Claude fork ← ${clipSid.slice(0, 8)}`, 'success');
         return;
@@ -1443,6 +1444,7 @@ export default function ClaudeControlBar({
         const currentCwd = tab.cwd || projectPath || '';
         if (canUseCurrentEmptyPtyForFork(tab)) {
           state.setTabCommandType(tabId, 'codex');
+          state.markAiForkAutoTitle(tabId, 'codex', clipSid);
           terminalRegistry.get(tabId)?.scrollToBottom();
           focusTerminal();
           ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex-f', sessionId: clipSid, cwd: currentCwd }));
@@ -1452,7 +1454,7 @@ export default function ClaudeControlBar({
         const forkName = `${clipSid.slice(0, 8)}_codex`;
         await state.createTabAfterCurrent(projectId, forkName, currentCwd, {
           pendingAction: { type: 'codex-fork', sessionId: clipSid },
-          nameSetManually: true,
+          nameSetManually: false,
         });
         showToast(`Codex fork ← ${clipSid.slice(0, 8)}`, 'success');
         return;

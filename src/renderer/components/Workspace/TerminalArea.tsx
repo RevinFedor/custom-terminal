@@ -11,55 +11,6 @@ import { buildCodexRunPayload } from '../../utils/codexLaunch';
 
 const { ipcRenderer } = window.require('electron');
 
-// ========== INTERCEPTOR BADGE ==========
-// Shows on sub-agent terminal viewport when Claude is busy.
-// Purple = armed (response will be delivered), Red = disarmed (won't deliver).
-// Clickable to toggle state.
-function InterceptorBadge({ claudeTabId, interceptorState, busy }: {
-  claudeTabId: string;
-  interceptorState: 'armed' | 'disarmed' | null | undefined;
-  busy: boolean;
-}) {
-  if (!busy || !interceptorState) return null;
-
-  const isArmed = interceptorState === 'armed';
-  const actionHint = isArmed ? 'Click to disarm' : 'Click to arm';
-  const label = isArmed ? 'INTERCEPTOR: ON' : 'INTERCEPTOR: OFF';
-  const blinkClass = isArmed ? 'animate-glow-purple' : 'animate-glow-red';
-
-  return (
-    <button
-      onClick={handleClick}
-      className="flex items-center gap-1.5 rounded transition-all shadow-[0_0_15px_rgba(0,0,0,0.4)]"
-      style={{
-        position: 'absolute',
-        top: '8px',
-        right: '12px',
-        zIndex: 100,
-        backgroundColor: isArmed ? 'rgba(180, 160, 255, 0.25)' : 'rgba(243, 139, 168, 0.25)',
-        border: `2px solid ${isArmed ? '#a855f7' : '#ef4444'}`,
-        color: '#ffffff',
-        padding: '6px 12px',
-        fontSize: '11px',
-        fontWeight: 'bold',
-        cursor: 'pointer',
-        backdropFilter: 'blur(12px)',
-        letterSpacing: '0.05em',
-      }}
-      title={`${label}\n${actionHint}`}
-    >
-      <span
-        className={`w-2 h-2 rounded-full ${blinkClass}`}
-        style={{
-          display: 'inline-block',
-          boxShadow: `0 0 8px ${isArmed ? '#a855f7' : '#ef4444'}`,
-        }}
-      />
-      <span>{label}</span>
-    </button>
-  );
-}
-
 type InterruptedEngine = 'claude' | 'codex';
 
 // Overlay for interrupted AI sessions
@@ -184,29 +135,6 @@ interface TerminalAreaProps {
 
 function TerminalArea({ projectId }: TerminalAreaProps) {
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.viewingSubAgentTabId ?? null);
-
-  // Interceptor badge: get sub-agent tab's busy + interceptor state
-  // IMPORTANT: separate primitive selectors to avoid infinite re-render loop.
-  // Returning a new object from useWorkspaceStore selector causes Object.is mismatch → re-render → new object → loop.
-  const subAgentInterceptorState = useWorkspaceStore((s) => {
-    if (!viewingSubAgentTabId) return null;
-    for (const [, workspace] of s.openProjects) {
-      const tab = workspace.tabs.get(viewingSubAgentTabId);
-      if (tab) return tab.interceptorState ?? null;
-    }
-    return null;
-  });
-  const subAgentBusy = useWorkspaceStore((s) => {
-    if (!viewingSubAgentTabId) return false;
-    for (const [, workspace] of s.openProjects) {
-      const tab = workspace.tabs.get(viewingSubAgentTabId);
-      if (tab) return tab.claudeBusy === true;
-    }
-    return false;
-  });
-  const subAgentBadgeProps = viewingSubAgentTabId && (subAgentInterceptorState || subAgentBusy)
-    ? { claudeTabId: viewingSubAgentTabId, interceptorState: subAgentInterceptorState, busy: subAgentBusy }
-    : null;
 
   // DEBUG: Track TerminalArea mount/unmount lifecycle
   useEffect(() => {
@@ -447,15 +375,6 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
             borderRadius: '4px',
             zIndex: 10,
           }}
-        />
-      )}
-
-      {/* Interceptor badge on sub-agent viewport */}
-      {subAgentBadgeProps && (
-        <InterceptorBadge
-          claudeTabId={subAgentBadgeProps.claudeTabId}
-          interceptorState={subAgentBadgeProps.interceptorState}
-          busy={subAgentBadgeProps.busy}
         />
       )}
 

@@ -58,6 +58,9 @@ const TEXT_MUTED = '#888';
 const TEXT_DIM = '#555';
 const SAVE_GREEN = '#22c55e';
 const DELETE_RED = '#ef4444';
+const OVERLAY_Z_INDEX = 120;           // above HistoryPanel (z:101)
+const FLOATING_OVERLAY_Z_INDEX = 130;  // editor/dropdowns above the rail/panel
+const INSERT_PROMPT_TITLE_MATCH_CHARS = 50;
 
 // Panel width is now FIXED (user-resizable, persisted in useUIStore.promptQueueWidth),
 // NOT `fit-content`. Reason: `fit-content` reflowed the panel every time a +grab
@@ -95,9 +98,44 @@ function chipTitle(item: QueuedPrompt): string {
   return (item.title || '').trim() || makeDefaultPromptTitle(item.text);
 }
 
+function takeLeadingChars(value: string, count: number): string {
+  return Array.from(value).slice(0, count).join('');
+}
+
+type StoredInsertPrompt = { title?: unknown; content?: unknown };
+
+async function findSavedInsertPromptTitle(text: string): Promise<string | null> {
+  const normalizedText = text.trim();
+  if (!normalizedText) return null;
+  const textPrefix = takeLeadingChars(normalizedText, INSERT_PROMPT_TITLE_MATCH_CHARS);
+
+  try {
+    const result = await ipcRenderer.invoke('prompts:get');
+    const prompts: StoredInsertPrompt[] =
+      result && result.success && Array.isArray(result.data) ? result.data : [];
+
+    for (const prompt of prompts) {
+      const content = typeof prompt.content === 'string' ? prompt.content.trim() : '';
+      const title = typeof prompt.title === 'string' ? prompt.title.trim() : '';
+      if (!content || !title) continue;
+
+      const contentChars = Array.from(content);
+      const contentPrefix = takeLeadingChars(content, INSERT_PROMPT_TITLE_MATCH_CHARS);
+      const matches =
+        contentChars.length >= INSERT_PROMPT_TITLE_MATCH_CHARS
+          ? textPrefix === contentPrefix
+          : normalizedText.startsWith(content);
+      if (matches) return title;
+    }
+  } catch (e) {
+    console.warn('[PromptQueue] insert-prompt title lookup failed', e);
+  }
+
+  return null;
+}
+
 type QueueAgent = 'claude' | 'codex';
 type EditorAnchorMode = 'panel' | 'list';
-type EditorResizeDirection = 'left' | 'bottom' | 'bottom-left';
 
 const AGENT_LABEL: Record<QueueAgent, string> = {
   claude: 'Claude',
@@ -109,9 +147,10 @@ type Props = {
   sessionType: QueueAgent;
   // Existing per-tab AI busy state from provider busy-state. We hold the loader's truth.
   agentBusy: boolean;
+  rightInset?: number;
 };
 
-export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
+export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset = 0 }: Props) {
   const agentLabel = AGENT_LABEL[sessionType];
   const chipLineClamp = useUIStore((s) => s.promptQueueChipLineClamp);
   const queue = usePromptQueueStore((s) => s.queues.get(tabId));
@@ -172,9 +211,8 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
   // Anchor for the editor modal — when set, the modal aligns its right edge to this rect's left edge
   // and its top edge to this rect's top edge. null = anchor to the whole panel's top-right corner.
   const [editorAnchor, setEditorAnchor] = useState<{ top: number; right: number; maxHeight: number } | null>(null);
-  const [editorSize, setEditorSize] = useState<{ width: number; height: number | null }>({
+  const [editorSize, setEditorSize] = useState<{ width: number }>({
     width: EDITOR_WIDTH,
-    height: null,
   });
   const [appearingIds, setAppearingIds] = useState<Set<string>>(new Set());
   const [savedFlashIds, setSavedFlashIds] = useState<Set<string>>(new Set());
@@ -491,48 +529,31 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
     return { top: anchorTop, right: anchorRight, maxHeight };
   }, [tabId]);
 
-  const startEditorResize = useCallback((e: React.MouseEvent, direction: EditorResizeDirection) => {
+  const startEditorResize = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
     const rect = editorRef.current?.getBoundingClientRect();
     if (!rect || !editorAnchor) return;
 
     const startX = e.clientX;
-    const startY = e.clientY;
     const startWidth = rect.width;
-    const startHeight = rect.height;
     const rightEdge = window.innerWidth - editorAnchor.right;
     const maxWidth = Math.max(
       EDITOR_MIN_WIDTH,
       Math.min(EDITOR_MAX_WIDTH, rightEdge - EDITOR_MARGIN)
     );
-    const maxHeight = Math.max(
-      EDITOR_MIN_HEIGHT,
-      window.innerHeight - editorAnchor.top - EDITOR_MARGIN
-    );
     const prevCursor = document.body.style.cursor;
     const prevUserSelect = document.body.style.userSelect;
-    document.body.style.cursor =
-      direction === 'bottom' ? 'ns-resize' :
-      direction === 'left' ? 'ew-resize' :
-      'nesw-resize';
+    document.body.style.cursor = 'ew-resize';
     document.body.style.userSelect = 'none';
 
     const onMove = (ev: MouseEvent) => {
       setEditorSize((prev) => {
         const next = { ...prev };
-        if (direction === 'left' || direction === 'bottom-left') {
-          next.width = Math.max(
-            EDITOR_MIN_WIDTH,
-            Math.min(maxWidth, startWidth + (startX - ev.clientX))
-          );
-        }
-        if (direction === 'bottom' || direction === 'bottom-left') {
-          next.height = Math.max(
-            EDITOR_MIN_HEIGHT,
-            Math.min(maxHeight, startHeight + (ev.clientY - startY))
-          );
-        }
+        next.width = Math.max(
+          EDITOR_MIN_WIDTH,
+          Math.min(maxWidth, startWidth + (startX - ev.clientX))
+        );
         return next;
       });
     };
@@ -697,11 +718,6 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
     if (!editorOpen || !editorAnchor) return;
     const textarea = editorTextareaRef.current;
     if (!textarea) return;
-    if (editorSize.height !== null) {
-      textarea.style.height = 'auto';
-      textarea.style.overflowY = 'auto';
-      return;
-    }
     const chromeHeight = isPostPromptMode ? 0 : EDITOR_TITLE_HEIGHT + 1;
     const maxTextareaHeight = Math.max(
       EDITOR_TEXTAREA_MIN_HEIGHT,
@@ -714,7 +730,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
     );
     textarea.style.height = `${nextHeight}px`;
     textarea.style.overflowY = textarea.scrollHeight > maxTextareaHeight ? 'auto' : 'hidden';
-  }, [editorAnchor, editorOpen, editorSize.height, editorText, isPostPromptMode]);
+  }, [editorAnchor, editorOpen, editorSize.width, editorText, isPostPromptMode]);
 
   useEffect(() => {
     if (!editingId) return;
@@ -824,8 +840,15 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
           focusActiveTerminal();
           return;
         }
-        const id = addPrompt(tabId, t, res.images || 0, Array.isArray(res.imagePaths) ? res.imagePaths : undefined);
-        const titleWillGenerate = generateRunAfterTitle(id, t);
+        const insertPromptTitle = await findSavedInsertPromptTitle(t);
+        const id = addPrompt(
+          tabId,
+          t,
+          res.images || 0,
+          Array.isArray(res.imagePaths) ? res.imagePaths : undefined,
+          insertPromptTitle || undefined,
+        );
+        const titleWillGenerate = insertPromptTitle ? false : generateRunAfterTitle(id, t);
         if (!titleWillGenerate) markAppearing(id);
         // No success toast on queue-add — the new chip appearing in the overlay
         // is its own confirmation; the toast was redundant noise (user request).
@@ -926,21 +949,23 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
     <>
       {/* Main overlay — terminal-right, directly left of Timeline. The outer
           wrapper is intentionally transparent: the control rail lives outside
-          the Run after panel, while the panel itself opens to the rail's left. */}
+          the Run after panel, while the panel itself opens to the rail's left.
+          rightInset shifts the anchor left only for expanded Timeline; History
+          keeps the normal terminal-right position and this overlay sits above it. */}
       <div
         ref={panelRef}
         style={{
           position: 'absolute',
           top: 0,
           // Anchored edge — pinned, never moves during resize.
-          ...(ANCHOR_SIDE === 'right' ? { right: 0 } : { left: 0 }),
+          ...(ANCHOR_SIDE === 'right' ? { right: rightInset } : { left: 0 }),
           // FIXED width (was `fit-content` clamped [min,max] → reflowed on +grab).
           // Drag-resizable via the handle on the free edge below.
           width: panelOpen ? effectiveWidth + COLLAPSED_RAIL_GAP + COLLAPSED_RAIL_WIDTH : COLLAPSED_RAIL_WIDTH,
           background: 'transparent',
           border: 'none',
           borderRadius: 0,
-          zIndex: 50,
+          zIndex: OVERLAY_Z_INDEX,
           fontSize: 11,
           color: '#ddd',
           maxHeight: '100%',
@@ -990,7 +1015,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
             ...(ANCHOR_SIDE === 'right' ? { left: 0 } : { right: 0 }),
             width: 6,
             cursor: 'ew-resize',
-            zIndex: 60,
+            zIndex: FLOATING_OVERLAY_Z_INDEX,
           }}
         />
         {/* Header row: first-delay timer input on left, Run/Stop pills on right.
@@ -1602,7 +1627,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
 
       {/* Editor slideout — docked to the LEFT of the queue panel, no scrim.
           Anchored by editorAnchor: top aligned to chip/list/panel, right edge stays fixed.
-          Resize is only on the free edges: left, bottom, bottom-left corner. */}
+          Resize controls only width; height stays content-driven by textarea rows. */}
       {!collapsed && !panelClosing && editorOpen && editorAnchor && (
         <div
           ref={editorRef}
@@ -1611,7 +1636,6 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
             top: editorAnchor.top,
             right: editorAnchor.right,
             width: editorSize.width,
-            height: editorSize.height ?? undefined,
             minWidth: EDITOR_MIN_WIDTH,
             minHeight: EDITOR_MIN_HEIGHT,
             maxHeight: editorAnchor.maxHeight,
@@ -1620,7 +1644,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
             borderRadius: 6,
             boxShadow: editorPinned ? '0 0 0 1px rgba(190,190,190,0.10)' : 'none',
             backdropFilter: 'blur(8px)',
-            zIndex: 60,
+            zIndex: FLOATING_OVERLAY_Z_INDEX,
             display: 'flex', flexDirection: 'column',
             overflow: 'hidden',
             boxSizing: 'border-box',
@@ -1678,21 +1702,21 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
               if (e.key === 'Enter' && e.metaKey) commitEditor();
             }}
             style={{
-              flex: editorSize.height !== null ? '1 1 auto' : '0 0 auto',
+              flex: '0 0 auto',
               minHeight: EDITOR_TEXTAREA_MIN_HEIGHT,
-              maxHeight: editorSize.height !== null ? 'none' : editorAnchor.maxHeight - (isPostPromptMode ? 0 : EDITOR_TITLE_HEIGHT + 1),
+              maxHeight: editorAnchor.maxHeight - (isPostPromptMode ? 0 : EDITOR_TITLE_HEIGHT + 1),
               background: '#0e0e0e', color: '#ddd',
               border: 'none', padding: '6px 8px',
               fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12,
               resize: 'none', outline: 'none',
-              overflowY: editorSize.height !== null ? 'auto' : 'hidden',
+              overflowY: 'hidden',
               boxSizing: 'border-box',
             }}
           />
           <div
             className="pq-editor-resize-handle"
             data-cmd-hover-popover
-            onMouseDown={(e) => startEditorResize(e, 'left')}
+            onMouseDown={startEditorResize}
             title="Потяни — изменить ширину"
             style={{
               position: 'absolute',
@@ -1705,32 +1729,17 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
             }}
           />
           <div
-            className="pq-editor-resize-handle"
-            data-cmd-hover-popover
-            onMouseDown={(e) => startEditorResize(e, 'bottom')}
-            title="Потяни — изменить высоту"
-            style={{
-              position: 'absolute',
-              left: 0,
-              right: 0,
-              bottom: 0,
-              height: 7,
-              cursor: 'ns-resize',
-              zIndex: 70,
-            }}
-          />
-          <div
             className="pq-editor-resize-handle pq-editor-resize-corner"
             data-cmd-hover-popover
-            onMouseDown={(e) => startEditorResize(e, 'bottom-left')}
-            title="Потяни — изменить размер"
+            onMouseDown={startEditorResize}
+            title="Потяни — изменить ширину"
             style={{
               position: 'absolute',
               left: 0,
               bottom: 0,
               width: 15,
               height: 15,
-              cursor: 'nesw-resize',
+              cursor: 'ew-resize',
               zIndex: 71,
             }}
           />
@@ -2400,7 +2409,7 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
               borderRadius: 6,
               boxShadow: '0 6px 20px rgba(0,0,0,0.45)',
               backdropFilter: 'blur(8px)',
-              zIndex: 60,
+              zIndex: FLOATING_OVERLAY_Z_INDEX,
               display: 'flex', flexDirection: 'column',
               overflow: 'hidden',
             }}
