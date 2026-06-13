@@ -2290,14 +2290,49 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     const withoutSource = baseOrder.filter(id => !sourceSet.has(id));
     const groupAssignments: Record<string, string | null | undefined> = {};
     const visualParentAssignments: Record<string, string | null | undefined> = {};
-    if (sourceData.type === 'TAB') {
-      const selectedRoots = sourceData.selectedTabIds && sourceData.selectedTabIds.includes(sourceData.id)
+    const selectedTabRootCandidates = sourceData.type === 'TAB'
+      ? Array.from(new Set((sourceData.selectedTabIds && sourceData.selectedTabIds.includes(sourceData.id)
         ? sourceData.selectedTabIds
-        : [sourceData.id];
-      for (const id of selectedRoots) {
+        : [sourceData.id]).filter(id => tabById.has(id))))
+      : [];
+    const selectedRootSet = new Set(selectedTabRootCandidates);
+    const selectedRootIds = selectedTabRootCandidates.filter(id => {
+      const parentId = tabById.get(id)?.visualParentTabId;
+      return !parentId || !selectedRootSet.has(parentId);
+    });
+    const hasVisibleVisualChildren = (parentId: string) =>
+      baseTabs.some(tab => tab.visualParentTabId === parentId && !sourceSet.has(tab.id));
+    const canAssignVisualParent = (parentId: string | undefined): parentId is string => {
+      if (!parentId || sourceSet.has(parentId)) return false;
+      const parent = tabById.get(parentId);
+      return !!parent && !parent.parentTabId && !parent.isUtility;
+    };
+    const clearSelectedVisualParents = () => {
+      for (const id of selectedRootIds) {
         if (tabById.get(id)?.visualParentTabId) visualParentAssignments[id] = null;
       }
-    }
+    };
+    const visualDropForTab = (tabId: string, before: boolean): { parentId: string; index: number } | null => {
+      if (sourceSet.has(tabId)) return null;
+      const tab = tabById.get(tabId);
+      if (!tab) return null;
+
+      if (canAssignVisualParent(tab.visualParentTabId)) {
+        const targetIndex = withoutSource.indexOf(tabId);
+        if (targetIndex < 0) return null;
+        return {
+          parentId: tab.visualParentTabId,
+          index: before ? targetIndex : targetIndex + 1,
+        };
+      }
+
+      if (!before && hasVisibleVisualChildren(tabId) && canAssignVisualParent(tabId)) {
+        const targetIndex = withoutSource.indexOf(tabId);
+        if (targetIndex < 0) return null;
+        return { parentId: tabId, index: targetIndex + 1 };
+      }
+      return null;
+    };
     const makePreview = (orderedIds: string[]) => ({
       orderedIds,
       groupAssignments,
@@ -2346,11 +2381,19 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
     const assignFlat = (flatIndex: number) => {
       for (const id of sourceIds) groupAssignments[id] = null;
+      clearSelectedVisualParents();
       return makePreview(insertAt(withoutSource, sourceIds, indexAtFlatPosition(flatIndex)));
     };
     const assignGroup = (groupId: string, memberIndex: number, rowIndex: number) => {
       for (const id of sourceIds) groupAssignments[id] = groupId;
+      clearSelectedVisualParents();
       return makePreview(insertAt(withoutSource, sourceIds, indexInGroup(groupId, memberIndex, rowIndex)));
+    };
+    const assignVisualParent = (parentId: string, targetIndex: number) => {
+      const parent = tabById.get(parentId);
+      for (const id of sourceIds) groupAssignments[id] = parent?.groupId || null;
+      for (const id of selectedRootIds) visualParentAssignments[id] = parentId;
+      return makePreview(insertAt(withoutSource, sourceIds, targetIndex));
     };
 
     if (targetData?.type === 'EMPTY_ZONE') {
@@ -2376,10 +2419,28 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       let targetMemberIndex = 0;
       for (const tabRow of row.tabRows) {
         if (sourceSet.has(tabRow.tabId)) continue;
+        if (clientY >= tabRow.rect.top && clientY <= tabRow.rect.bottom) {
+          const before = clientY < tabRow.rect.midY;
+          const visualDrop = visualDropForTab(tabRow.tabId, before);
+          if (visualDrop) return assignVisualParent(visualDrop.parentId, visualDrop.index);
+          if (before) break;
+          targetMemberIndex += 1;
+          break;
+        }
         if (clientY < tabRow.rect.midY) break;
         targetMemberIndex += 1;
       }
       return assignGroup(row.groupId, targetMemberIndex, rowIndex);
+    }
+
+    for (let rowIndex = 0; rowIndex < geometry.rows.length; rowIndex += 1) {
+      const row = geometry.rows[rowIndex];
+      if (row.type !== 'tab' || sourceSet.has(row.tabId)) continue;
+      if (clientY < row.rect.top || clientY > row.rect.bottom) continue;
+      const before = clientY < row.rect.midY;
+      const visualDrop = visualDropForTab(row.tabId, before);
+      if (visualDrop) return assignVisualParent(visualDrop.parentId, visualDrop.index);
+      return assignFlat(before ? rowIndex : rowIndex + 1);
     }
 
     return assignFlat(flatIndexFromY());
@@ -3344,6 +3405,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                   : 'rgba(255,255,255,0.14)';
                 const indent = Math.min(18, 3 + (visualDepth - 1) * 6);
                 const connectorLeft = 3;
+                const currentDisplayIndex = mainTabsForDisplay.findIndex(candidate => candidate.id === tab.id);
+                const nextDisplayTab = currentDisplayIndex >= 0
+                  ? mainTabsForDisplay[currentDisplayIndex + 1]
+                  : undefined;
+                const hasNextVisualSibling = !!tab.visualParentTabId
+                  && nextDisplayTab?.visualParentTabId === tab.visualParentTabId;
                 return (
                   <div
                     key={tab.id}
@@ -3369,6 +3436,20 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         pointerEvents: 'none',
                       }}
                     />
+                    {hasNextVisualSibling && (
+                      <span
+                        aria-hidden
+                        style={{
+                          position: 'absolute',
+                          left: connectorLeft,
+                          top: '50%',
+                          bottom: `-${tabSidebarGap}px`,
+                          width: 1,
+                          background: connectorColor,
+                          pointerEvents: 'none',
+                        }}
+                      />
+                    )}
                     <span
                       aria-hidden
                       style={{

@@ -160,12 +160,14 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   const closeAfter = queue?.closeAfter ?? false;
   const postPromptEnabled = queue?.postPromptEnabled ?? false;
   const postPromptText = queue?.postPromptText ?? '';
+  const collapsed = queue?.panelCollapsed ?? false;
   const firstChipArmedHint = queue?.firstChipHintActive ?? false;
   const runAfterTabId = queue?.runAfterTabId ?? null;
   const {
     addPrompt, removePrompt, updatePrompt, reorderPrompt,
     setAutoRun, setStopAfter, setCloseAfter, setRunAfterTab,
     setPostPromptEnabled, setPostPromptText,
+    setPanelCollapsed,
     // popNext is consumed by hooks/usePromptQueueRunner.ts — not referenced here.
   } = usePromptQueueStore.getState();
 
@@ -302,7 +304,6 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   const [replayHoverId, setReplayHoverId] = useState<string | null>(null);
   const [cmdPressed, setCmdPressed] = useState(false);
   const cmdPressedRef = useRef(false);
-  const [collapsed, setCollapsed] = useState(true);
   const [panelClosing, setPanelClosing] = useState(false);
   const collapseTimerRef = useRef<number | null>(null);
   const prevHintRef = useRef(false);
@@ -408,6 +409,8 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
           fallbackPrompt: DEFAULT_RUN_AFTER_TITLE_PROMPT,
           sourceLabel: 'Текст задачи Run after',
           logPrefix: 'RunAfterTitle',
+          taskType: 'run-after-title',
+          promptId: RUN_AFTER_TITLE_PROMPT_ID,
         });
         if (!title) return;
         const current = usePromptQueueStore.getState().getQueue(tabId).items.find((p) => p.id === id);
@@ -892,8 +895,8 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       collapseTimerRef.current = null;
     }
     setPanelClosing(false);
-    setCollapsed(false);
-  }, []);
+    setPanelCollapsed(tabId, false);
+  }, [tabId, setPanelCollapsed]);
 
   const collapsePanel = useCallback(() => {
     commitEditor();
@@ -901,12 +904,12 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       window.clearTimeout(collapseTimerRef.current);
     }
     setPanelClosing(true);
+    setPanelCollapsed(tabId, true);
     collapseTimerRef.current = window.setTimeout(() => {
-      setCollapsed(true);
       setPanelClosing(false);
       collapseTimerRef.current = null;
     }, PANEL_SLIDE_MS);
-  }, [commitEditor]);
+  }, [commitEditor, tabId, setPanelCollapsed]);
 
   useEffect(() => {
     return () => {

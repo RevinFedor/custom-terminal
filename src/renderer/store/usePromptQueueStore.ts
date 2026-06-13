@@ -5,9 +5,10 @@ const { ipcRenderer } = window.require('electron');
 // SQLite-backed persistence via the existing app:setState / app:getState
 // pattern (same as defaultClaudeEffort, debugHoverBridges, freePorts).
 // Persist: items, autoRun, stopAfter, firstDelaySeconds, postPromptEnabled,
-// postPromptText PER TAB. Skip: previewId, firstChipHintActive (UI-only).
+// postPromptText, panelCollapsed PER TAB. Skip: previewId,
+// firstChipHintActive (UI-only).
 // Serialized shape: { [tabId]: { items, autoRun, stopAfter, firstDelaySeconds,
-//                                postPromptEnabled, postPromptText } }.
+//                                postPromptEnabled, postPromptText, panelCollapsed } }.
 const APP_STATE_KEY_QUEUE = 'promptQueueByTab';
 
 // Throttle disk writes — drag-reorder fires many state updates per second and
@@ -18,7 +19,7 @@ function scheduleSave(snapshot: Map<string, TabQueue>) {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    const out: Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText' | 'runAfterTabId'>> = {};
+    const out: Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText' | 'runAfterTabId' | 'panelCollapsed'>> = {};
     for (const [tabId, q] of snapshot) {
       // Skip cold tabs with no persistable state — saves space + avoids polluting
       // the kv store with thousands of empty rows over time. Non-default delay
@@ -32,7 +33,8 @@ function scheduleSave(snapshot: Map<string, TabQueue>) {
         q.firstDelaySeconds === 0 &&
         !q.postPromptEnabled &&
         !q.postPromptText &&
-        !q.runAfterTabId
+        !q.runAfterTabId &&
+        !q.panelCollapsed
       ) continue;
       out[tabId] = {
         items: q.items,
@@ -43,6 +45,7 @@ function scheduleSave(snapshot: Map<string, TabQueue>) {
         postPromptEnabled: q.postPromptEnabled,
         postPromptText: q.postPromptText,
         runAfterTabId: q.runAfterTabId,
+        panelCollapsed: q.panelCollapsed,
       };
     }
     ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_QUEUE, value: JSON.stringify(out) })
@@ -128,6 +131,14 @@ export type TabQueue = {
   postPromptEnabled: boolean;
   postPromptText: string;
 
+  // ── Overlay collapsed/expanded state ─────────────────────────────────────
+  // Per-tab UI state for the Run-after panel. Default is expanded (false);
+  // if the user collapses a specific tab, that choice persists across tab
+  // navigation and app restart until they manually expand it again.
+  // Persisted even for empty queues, because the user's layout preference is
+  // independent from whether queued prompts currently exist.
+  panelCollapsed: boolean;
+
   // ── First-chip armed hint ────────────────────────────────────────────────
   // True when user added the FIRST chip into an empty queue while Run after
   // was OFF — the Run after pill renders one red blink, then a low-red resting
@@ -205,6 +216,7 @@ interface PromptQueueStore {
   // setPostPromptText writes the body. Both are persisted.
   setPostPromptEnabled: (tabId: string, value: boolean) => void;
   setPostPromptText: (tabId: string, text: string) => void;
+  setPanelCollapsed: (tabId: string, value: boolean) => void;
 
   // First-chip armed hint helpers. consumeFirstChipHint clears the flag after
   // explicit acknowledgement. (Setting it happens implicitly inside addPrompt
@@ -232,6 +244,7 @@ const EMPTY: TabQueue = {
   firstDelayCountdownAt: null,
   postPromptEnabled: false,
   postPromptText: '',
+  panelCollapsed: false,
   firstChipHintActive: false,
   stopBeforeCloseArm: false,
   runAfterTabId: null,
@@ -585,6 +598,15 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       });
     },
 
+    setPanelCollapsed: (tabId, value) => {
+      setAndPersist((state) => {
+        const next = new Map(state.queues);
+        const cur = next.get(tabId) ?? EMPTY;
+        next.set(tabId, { ...cur, panelCollapsed: value });
+        return { queues: next };
+      });
+    },
+
     consumeFirstChipHint: (tabId) => {
       // UI-only state — skip disk save.
       setAndPersist((state) => {
@@ -674,6 +696,7 @@ export async function hydratePromptQueueStore(): Promise<void> {
       postPromptEnabled?: boolean;
       postPromptText?: string;
       runAfterTabId?: string | null;
+      panelCollapsed?: boolean;
     }>;
     if (!parsed || typeof parsed !== 'object') return;
     usePromptQueueStore.setState((state) => {
@@ -694,6 +717,7 @@ export async function hydratePromptQueueStore(): Promise<void> {
           firstDelayCountdownAt: null, // never restore an in-flight countdown across restart
           postPromptEnabled: !!entry.postPromptEnabled,
           postPromptText: typeof entry.postPromptText === 'string' ? entry.postPromptText : '',
+          panelCollapsed: !!entry.panelCollapsed,
           firstChipHintActive: false, // UI-only, never restored
           stopBeforeCloseArm: false, // UI-only memory, never restored
           runAfterTabId: typeof entry.runAfterTabId === 'string' ? entry.runAfterTabId : null,

@@ -1,4 +1,11 @@
-import { DEFAULT_TAB_TITLE_PROMPT, TAB_TITLE_PROMPT_ID, usePromptsStore, type AIPrompt } from '../store/usePromptsStore';
+import {
+  DEFAULT_PROMPT_SUMMARY_PROMPT,
+  DEFAULT_TAB_TITLE_PROMPT,
+  PROMPT_SUMMARY_PROMPT_ID,
+  TAB_TITLE_PROMPT_ID,
+  usePromptsStore,
+  type AIPrompt,
+} from '../store/usePromptsStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 
 const { ipcRenderer } = window.require('electron');
@@ -62,6 +69,22 @@ function sanitizeGeneratedTabTitle(raw: string): string {
   return clean;
 }
 
+function sanitizeGeneratedPromptSummary(raw: string): string {
+  let clean = String(raw || '')
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^(summary|пересказ|кратко)\s*[:—-]\s*/i, '')
+    .replace(/^[`"'“”«»]+|[`"'“”«».:;!?]+$/g, '')
+    .trim();
+
+  const chars = Array.from(clean);
+  if (chars.length > 70) {
+    clean = chars.slice(0, 70).join('').trim();
+  }
+  return clean;
+}
+
 async function buildSystemPrompt(promptConfig: AIPrompt | undefined, fallbackPrompt: string, logPrefix: string): Promise<string> {
   const base = (promptConfig?.content || fallbackPrompt).trim();
   const filePaths = promptConfig?.filePaths || [];
@@ -84,7 +107,14 @@ async function buildSystemPrompt(promptConfig: AIPrompt | undefined, fallbackPro
 export async function generateTitleFromPromptWithConfig(
   userPrompt: string,
   promptConfig: AIPrompt | undefined,
-  options: { fallbackPrompt: string; sourceLabel: string; logPrefix: string }
+  options: {
+    fallbackPrompt: string;
+    sourceLabel: string;
+    logPrefix: string;
+    taskType?: string;
+    promptId?: string;
+    sanitize?: (raw: string) => string;
+  }
 ): Promise<string | null> {
   const apiKey = (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY) || '';
   if (!apiKey) {
@@ -109,6 +139,27 @@ export async function generateTitleFromPromptWithConfig(
     };
   }
 
+  const logUsage = async (status: 'success' | 'error', usage: any = {}, raw = '', error?: string) => {
+    try {
+      await ipcRenderer.invoke('ai-prompts:log-call', {
+        promptId: promptConfig?.id || options.promptId || null,
+        taskType: options.taskType || options.logPrefix,
+        model,
+        thinkingLevel,
+        promptTokens: Number(usage?.promptTokenCount || 0),
+        candidateTokens: Number(usage?.candidatesTokenCount || 0),
+        thoughtTokens: Number(usage?.thoughtsTokenCount || 0),
+        totalTokens: Number(usage?.totalTokenCount || 0),
+        status,
+        error: error ? String(error).slice(0, 500) : null,
+        sourceChars: userPrompt.length,
+        outputChars: raw.length,
+      });
+    } catch (err: any) {
+      console.warn('[' + options.logPrefix + '] failed to log usage:', err?.message || err);
+    }
+  };
+
   try {
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
@@ -121,6 +172,7 @@ export async function generateTitleFromPromptWithConfig(
     const data = await response.json();
     if (data?.error) {
       console.warn('[' + options.logPrefix + '] Gemini error:', data.error.message || data.error.status || response.status);
+      await logUsage('error', data?.usageMetadata || {}, '', data.error.message || data.error.status || response.status);
       return null;
     }
     const parts = data?.candidates?.[0]?.content?.parts || [];
@@ -128,10 +180,12 @@ export async function generateTitleFromPromptWithConfig(
       .filter((p: any) => !p.thought)
       .map((p: any) => p.text || '')
       .join('');
-    const title = sanitizeGeneratedTabTitle(raw);
+    await logUsage('success', data?.usageMetadata || {}, raw);
+    const title = (options.sanitize || sanitizeGeneratedTabTitle)(raw);
     return title || null;
   } catch (err: any) {
     console.warn('[' + options.logPrefix + '] request failed:', err?.message || err);
+    await logUsage('error', {}, '', err?.message || err);
     return null;
   }
 }
@@ -141,6 +195,19 @@ export async function generateTabTitleFromPrompt(userPrompt: string, promptConfi
     fallbackPrompt: DEFAULT_TAB_TITLE_PROMPT,
     sourceLabel: 'Первое пользовательское сообщение',
     logPrefix: 'TabTitle',
+    taskType: 'tab-title',
+    promptId: TAB_TITLE_PROMPT_ID,
+  });
+}
+
+export async function generateTimelinePromptSummaryFromPrompt(userPrompt: string, promptConfig?: AIPrompt): Promise<string | null> {
+  return generateTitleFromPromptWithConfig(userPrompt, promptConfig, {
+    fallbackPrompt: DEFAULT_PROMPT_SUMMARY_PROMPT,
+    sourceLabel: 'Пользовательское сообщение',
+    logPrefix: 'PromptSummary',
+    taskType: 'prompt-summary',
+    promptId: PROMPT_SUMMARY_PROMPT_ID,
+    sanitize: sanitizeGeneratedPromptSummary,
   });
 }
 

@@ -6,8 +6,10 @@ export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
 
 export const TAB_TITLE_PROMPT_ID = 'tab-title';
 export const RUN_AFTER_TITLE_PROMPT_ID = 'run-after-title';
+export const PROMPT_SUMMARY_PROMPT_ID = 'prompt-summary';
 export const DEFAULT_TAB_TITLE_PROMPT = 'На основе первого пользовательского сообщения придумай короткое название вкладки. Верни только название: 2-6 слов, без кавычек, без точки, без markdown, без пояснений.';
 export const DEFAULT_RUN_AFTER_TITLE_PROMPT = 'На основе текста задачи Run after придумай короткое название задачи. Верни только название: 2-7 слов, без кавычек, без точки, без markdown, без пояснений. Если текст на русском — название тоже на русском; если на английском — на английском.';
+export const DEFAULT_PROMPT_SUMMARY_PROMPT = 'Перескажи пользовательское сообщение для строки таймлайна. Верни только краткий пересказ до 70 символов: без кавычек, без markdown, без точки в конце, без пояснений. Сохрани язык исходного сообщения.';
 
 export interface AIPrompt {
   id: string;              // built-ins like 'research' | 'compact' | 'tab-title' or 'prompt-<timestamp>'
@@ -95,6 +97,18 @@ const FALLBACK_PROMPTS: AIPrompt[] = [
     isBuiltIn: true,
     showInContextMenu: false,
     position: 6,
+    filePaths: []
+  },
+  {
+    id: PROMPT_SUMMARY_PROMPT_ID,
+    name: 'Prompt Summary',
+    content: DEFAULT_PROMPT_SUMMARY_PROMPT,
+    model: 'gemini-3.1-flash-lite',
+    thinkingLevel: 'NONE',
+    color: '#38bdf8',
+    isBuiltIn: true,
+    showInContextMenu: false,
+    position: 7,
     filePaths: []
   }
 ];

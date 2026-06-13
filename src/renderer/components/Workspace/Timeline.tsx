@@ -7,6 +7,7 @@ import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore, type PendingAutoTabTitle } from '../../store/useWorkspaceStore';
 import { TAB_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { generateTabTitleFromPrompt, isEligibleTabTitleEntry, trimTabTitlePrompt } from '../../utils/generateTabTitle';
+import { timelineSummaryKey, useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
 
@@ -381,6 +382,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const isCodex = toolType === 'codex';
   const usesTextSearchAnchors = isGemini || isCodex;
   const supportsClaudeTimelineActions = !isGemini && !isCodex;
+  const summaryToolType: TimelineSummaryTool | null = isGemini ? null : (isCodex ? 'codex' : 'claude');
+  const promptSummaries = useTimelineSummaryStore(state => state.summaries);
+  const promptSummaryLoadingKeys = useTimelineSummaryStore(state => state.loadingKeys);
+  const promptSummaryLoadedSessionKeys = useTimelineSummaryStore(state => state.loadedSessionKeys);
+  const loadPromptSummaries = useTimelineSummaryStore(state => state.loadSummaries);
+  const generatePromptSummary = useTimelineSummaryStore(state => state.generateSummary);
+  const refreshPromptSummariesForTab = useTimelineSummaryStore(state => state.refreshEntriesForTab);
+  const promptSummaryGlobalAuto = useTimelineSummaryStore(state => state.globalAuto);
+  const promptSummaryTabAuto = useTimelineSummaryStore(state => state.autoByTab[tabId] === true);
+  const promptSummaryAutoEnabled = promptSummaryGlobalAuto || promptSummaryTabAuto;
 
   // Slide animation (matches HistoryPanel pattern)
   const [slideIn, setSlideIn] = useState(isOpen);
@@ -1485,6 +1496,44 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     loadTimeline('effect');
   }, [loadTimeline]);
 
+  useEffect(() => {
+    if (!summaryToolType || !sessionId) return;
+    void loadPromptSummaries(summaryToolType, sessionId);
+  }, [summaryToolType, sessionId, loadPromptSummaries]);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId?: string }>).detail;
+      if (detail?.tabId !== tabId) return;
+      if (!summaryToolType || !sessionId) {
+        showToast('Нет Claude/Codex сессии для пересказа', 'warning');
+        return;
+      }
+      void refreshPromptSummariesForTab({
+        tabId,
+        toolType: summaryToolType,
+        sessionId,
+        entries,
+      });
+    };
+    window.addEventListener('timeline-summary:refresh-tab', handler as EventListener);
+    return () => window.removeEventListener('timeline-summary:refresh-tab', handler as EventListener);
+  }, [tabId, summaryToolType, sessionId, entries, refreshPromptSummariesForTab, showToast]);
+
+  useEffect(() => {
+    if (!promptSummaryAutoEnabled || !summaryToolType || !sessionId) return;
+    if (!promptSummaryLoadedSessionKeys.has(`${summaryToolType}:${sessionId}`)) return;
+    for (const entry of entries) {
+      if (!entry.uuid || !isEligibleTabTitleEntry(entry)) continue;
+      void generatePromptSummary({
+        tabId,
+        toolType: summaryToolType,
+        sessionId,
+        entry,
+      });
+    }
+  }, [entries, promptSummaryAutoEnabled, promptSummaryLoadedSessionKeys, summaryToolType, sessionId, tabId, generatePromptSummary]);
+
   // Tab switch: save editRangeState (ready/done only), reset everything else.
   // What's saved: editRangeState when phase=ready or done (user has Gemini response in panel).
   // What's NOT saved: loading (fetch aborted), applying (runs in background), all other overlays.
@@ -2470,7 +2519,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   };
 
   const handleEntryDoubleClick = (entry: TimelineEntry) => {
-    if (isCodex) return;
     if (clickTimerRef.current) {
       clearTimeout(clickTimerRef.current);
       clickTimerRef.current = null;
@@ -2687,7 +2735,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setCopyingRange(range);
 
     try {
-      const result = await ipcRenderer.invoke('claude:copy-range', {
+      const copyRangeChannel = isCodex ? 'codex:copy-range' : isGemini ? 'gemini:copy-range' : 'claude:copy-range';
+      const result = await ipcRenderer.invoke(copyRangeChannel, {
         sessionId,
         cwd,
         startUuid,
@@ -3014,12 +3063,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const handleCopySingleEntry = async (entry: TimelineEntry) => {
     if (!sessionId) return;
     setContextMenu(null);
-    if (isCodex) {
-      clipboard.writeText(entry.content || '');
-      useUIStore.getState().showToast('Скопировано', 'success', 1500);
-      return;
-    }
-    const channel = isGemini ? 'gemini:copy-range' : 'claude:copy-range';
+    const channel = isCodex ? 'codex:copy-range' : isGemini ? 'gemini:copy-range' : 'claude:copy-range';
     try {
       const result = await ipcRenderer.invoke(channel, {
         sessionId,
@@ -3946,7 +3990,28 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
                   {/* Expanded layout: N-line preview text only (type is conveyed by dot color) */}
                   {isExpandedLayout && !isExpandedHeader && (() => {
-                    const previewText = (isCompacted ? 'Conversation compacted' : (entry.content || '')).trim();
+                    let previewText = (isCompacted ? 'Conversation compacted' : (entry.content || '')).trim();
+                    let previewColor = 'rgba(255, 255, 255, 0.85)';
+                    let previewStyle: React.CSSProperties = {};
+                    if (!isCompacted && summaryToolType && sessionId && isEligibleTabTitleEntry(entry)) {
+                      const key = timelineSummaryKey(summaryToolType, sessionId, entry.uuid);
+                      const row = promptSummaries[key];
+                      if (row?.summary) {
+                        previewText = row.summary.trim();
+                        previewColor = 'rgba(191, 219, 254, 0.92)';
+                      } else if (promptSummaryLoadingKeys.has(key)) {
+                        previewText = 'summarizing prompt...';
+                        previewColor = 'rgba(125, 211, 252, 0.88)';
+                        previewStyle = {
+                          background: 'linear-gradient(90deg, rgba(56,189,248,0.28), rgba(255,255,255,0.72), rgba(56,189,248,0.28))',
+                          backgroundSize: '180% 100%',
+                          WebkitBackgroundClip: 'text',
+                          backgroundClip: 'text',
+                          color: 'transparent',
+                          animation: 'timeline-summary-text-shimmer 1.2s linear infinite',
+                        };
+                      }
+                    }
                     if (!previewText) return null;
                     return (
                       <div
@@ -3954,13 +4019,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         style={{
                           fontSize: '1em',
                           lineHeight: 1.3,
-                          color: 'rgba(255, 255, 255, 0.85)',
+                          color: previewColor,
                           display: '-webkit-box',
                           WebkitLineClamp: timelineLineClamp,
                           WebkitBoxOrient: 'vertical',
                           overflow: 'hidden',
                           wordBreak: 'break-word',
+                          ...previewStyle,
                         }}
+                        title={!isCompacted && previewText !== (entry.content || '').trim() ? (entry.content || '') : undefined}
                       >
                         {previewText}
                       </div>
@@ -5342,7 +5409,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
         {/* ──── RANGE ACTION MENU PORTAL (Copy/Edit/Delete after range selection; inline delete-confirm + post-prompt textarea) ──── */}
         {/* Range Action Menu — appears after selecting range (double-click start + click end) */}
-        {isVisible && rangeActionMenu && !isCodex && (
+        {isVisible && rangeActionMenu && (
           <TooltipPortal>
             <div
               ref={rangeActionMenuRef}

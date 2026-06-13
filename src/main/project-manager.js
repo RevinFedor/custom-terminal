@@ -130,6 +130,22 @@ class ProjectManager {
     this.db.deleteAIPrompt(id);
   }
 
+  getTimelinePromptSummaries(toolType, sessionId) {
+    return this.db.getTimelinePromptSummaries(toolType, sessionId);
+  }
+
+  saveTimelinePromptSummary(summary) {
+    return this.db.saveTimelinePromptSummary(summary);
+  }
+
+  logAIPromptCall(call) {
+    return this.db.logAIPromptCall(call);
+  }
+
+  getAIPromptUsageStats(range) {
+    return this.db.getAIPromptUsageStats(range);
+  }
+
   // Tab history methods
   archiveTab(projectId, tab) {
     this.db.archiveTab(projectId, tab);

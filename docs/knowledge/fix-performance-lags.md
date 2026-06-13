@@ -148,6 +148,8 @@ const ids = useStore(useShallow(s => s.items.filter(i => i.active).map(i => i.id
 
 **Recurrence 2026-05-28: Run-after picker.** Селектор `useWorkspaceStore((state) => { /* walk projects, build tabs array */ return { projectId, activeTabId, tabs }; })` возвращал свежий объект на каждый рендер. `set({ openProjects: new Map(...) })` срабатывает на любое busy-событие в любом табе любого проекта → новая ссылка → re-render picker'а → селектор снова создаёт свежий `{projectId, activeTabId, tabs}` → loop → `Maximum update depth exceeded`. Фикс — fingerprint string из id+name AI-табов (только нашего проекта) + `useMemo([fingerprint, tabId])` для деривации shape через `useWorkspaceStore.getState()` внутри useMemo. См. `knowledge/fact-prompt-queue.md::Fingerprint Pattern в селекторе`. Урок: при подписке на nested Map (`openProjects.<projectId>.tabs`) **всегда** возвращай примитив, никогда — объект-результат итерации.
 
+**Recurrence 2026-06-13: ProjectToolbar prompt-summary controls.** Симптом в production: при открытии приложения React показывал `Something went wrong / Minified React error #185`. Причина была не в Timeline summary store, а в `ProjectToolbar` selector'е к `useWorkspaceStore`: он каждый render возвращал новый объект `{ tabId, toolType, sessionId }` для активной вкладки. Даже без `map/filter` это тот же trap — Zustand сравнивает selector result по `Object.is`, object literal всегда новый, React 19 уходит в loop. Фикс: selector возвращает primitive key `${tabId}|${toolType}|${sessionId}`, а объект собирается рядом через `useMemo`. Правило распространяется и на "маленькие" selectors активного таба; свежий объект опасен не только при больших списках.
+
 ---
 
 ## 3. Проблема: O(n²) Startup Cascade

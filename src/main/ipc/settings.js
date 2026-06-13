@@ -180,6 +180,44 @@ function register({ projectManager }) {
     }
   });
 
+  ipcMain.handle('ai-prompts:log-call', async (event, payload) => {
+    try {
+      projectManager.logAIPromptCall(payload);
+      return { success: true };
+    } catch (error) {
+      console.error('[main] Error logging AI prompt call:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('ai-prompts:usage-stats', async (event, range) => {
+    try {
+      return { success: true, data: projectManager.getAIPromptUsageStats(range) };
+    } catch (error) {
+      console.error('[main] Error getting AI prompt usage stats:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('timeline-prompt-summaries:get', async (event, { toolType, sessionId }) => {
+    try {
+      return { success: true, data: projectManager.getTimelinePromptSummaries(toolType, sessionId) };
+    } catch (error) {
+      console.error('[main] Error getting timeline prompt summaries:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('timeline-prompt-summaries:save', async (event, payload) => {
+    try {
+      projectManager.saveTimelinePromptSummary(payload);
+      return { success: true };
+    } catch (error) {
+      console.error('[main] Error saving timeline prompt summary:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
   // ── AI Prompt File Attachments ──
 
   ipcMain.handle('ai-prompts:select-file', async () => {
