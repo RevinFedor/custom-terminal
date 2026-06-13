@@ -22,6 +22,7 @@ class DatabaseManager {
     this.ensureAdoptPrompt();
     this.ensureTabTitlePrompt();
     this.ensureRunAfterTitlePrompt();
+    this.ensurePromptSummaryPrompt();
   }
 
   initTables() {
@@ -358,8 +359,67 @@ class DatabaseManager {
         color TEXT NOT NULL DEFAULT '#0ea5e9',
         is_built_in INTEGER NOT NULL DEFAULT 0,
         show_in_context_menu INTEGER NOT NULL DEFAULT 1,
-        position INTEGER NOT NULL DEFAULT 0
+        position INTEGER NOT NULL DEFAULT 0,
+        file_paths TEXT DEFAULT NULL
       )
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS timeline_prompt_summaries (
+        tool_type TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        entry_uuid TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        source_hash TEXT DEFAULT NULL,
+        model TEXT DEFAULT NULL,
+        prompt_id TEXT DEFAULT NULL,
+        thinking_level TEXT DEFAULT NULL,
+        prompt_tokens INTEGER DEFAULT 0,
+        candidate_tokens INTEGER DEFAULT 0,
+        thought_tokens INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+        PRIMARY KEY (tool_type, session_id, entry_uuid)
+      )
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_timeline_prompt_summaries_session
+      ON timeline_prompt_summaries(tool_type, session_id)
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_timeline_prompt_summaries_updated
+      ON timeline_prompt_summaries(updated_at DESC)
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS ai_prompt_call_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        prompt_id TEXT DEFAULT NULL,
+        task_type TEXT DEFAULT NULL,
+        model TEXT DEFAULT NULL,
+        thinking_level TEXT DEFAULT NULL,
+        prompt_tokens INTEGER DEFAULT 0,
+        candidate_tokens INTEGER DEFAULT 0,
+        thought_tokens INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'success',
+        error TEXT DEFAULT NULL,
+        source_chars INTEGER DEFAULT 0,
+        output_chars INTEGER DEFAULT 0,
+        created_at INTEGER DEFAULT (strftime('%s', 'now'))
+      )
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_ai_prompt_call_logs_created
+      ON ai_prompt_call_logs(created_at DESC)
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_ai_prompt_call_logs_prompt
+      ON ai_prompt_call_logs(prompt_id)
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_ai_prompt_call_logs_model
+      ON ai_prompt_call_logs(model)
     `);
 
     // Favorites table
@@ -1109,6 +1169,173 @@ class DatabaseManager {
     this.db.prepare('DELETE FROM ai_prompts WHERE id = ? AND is_built_in = 0').run(id);
   }
 
+  getTimelinePromptSummaries(toolType, sessionId) {
+    if (!toolType || !sessionId) return [];
+    return this.db.prepare(`
+      SELECT * FROM timeline_prompt_summaries
+      WHERE tool_type = ? AND session_id = ?
+      ORDER BY updated_at DESC
+    `).all(toolType, sessionId).map(row => ({
+      toolType: row.tool_type,
+      sessionId: row.session_id,
+      entryUuid: row.entry_uuid,
+      summary: row.summary,
+      sourceHash: row.source_hash,
+      model: row.model,
+      promptId: row.prompt_id,
+      thinkingLevel: row.thinking_level,
+      promptTokens: row.prompt_tokens || 0,
+      candidateTokens: row.candidate_tokens || 0,
+      thoughtTokens: row.thought_tokens || 0,
+      totalTokens: row.total_tokens || 0,
+      updatedAt: row.updated_at || 0,
+    }));
+  }
+
+  saveTimelinePromptSummary(summary) {
+    if (!summary || !summary.toolType || !summary.sessionId || !summary.entryUuid || !summary.summary) {
+      return false;
+    }
+    this.db.prepare(`
+      INSERT INTO timeline_prompt_summaries (
+        tool_type, session_id, entry_uuid, summary, source_hash, model, prompt_id, thinking_level,
+        prompt_tokens, candidate_tokens, thought_tokens, total_tokens, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+      ON CONFLICT(tool_type, session_id, entry_uuid) DO UPDATE SET
+        summary = excluded.summary,
+        source_hash = excluded.source_hash,
+        model = excluded.model,
+        prompt_id = excluded.prompt_id,
+        thinking_level = excluded.thinking_level,
+        prompt_tokens = excluded.prompt_tokens,
+        candidate_tokens = excluded.candidate_tokens,
+        thought_tokens = excluded.thought_tokens,
+        total_tokens = excluded.total_tokens,
+        updated_at = strftime('%s', 'now')
+    `).run(
+      summary.toolType,
+      summary.sessionId,
+      summary.entryUuid,
+      summary.summary,
+      summary.sourceHash || null,
+      summary.model || null,
+      summary.promptId || null,
+      summary.thinkingLevel || null,
+      Number(summary.promptTokens || 0),
+      Number(summary.candidateTokens || 0),
+      Number(summary.thoughtTokens || 0),
+      Number(summary.totalTokens || 0)
+    );
+    return true;
+  }
+
+  logAIPromptCall(call) {
+    if (!call) return false;
+    this.db.prepare(`
+      INSERT INTO ai_prompt_call_logs (
+        prompt_id, task_type, model, thinking_level, prompt_tokens, candidate_tokens,
+        thought_tokens, total_tokens, status, error, source_chars, output_chars
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      call.promptId || null,
+      call.taskType || null,
+      call.model || null,
+      call.thinkingLevel || null,
+      Number(call.promptTokens || 0),
+      Number(call.candidateTokens || 0),
+      Number(call.thoughtTokens || 0),
+      Number(call.totalTokens || 0),
+      call.status || 'success',
+      call.error || null,
+      Number(call.sourceChars || 0),
+      Number(call.outputChars || 0)
+    );
+    return true;
+  }
+
+  getAIPromptUsageStats(range = 'week') {
+    const now = Math.floor(Date.now() / 1000);
+    const since = range === 'all' ? 0 : now - (range === 'month' ? 30 : 7) * 24 * 60 * 60;
+    const rows = this.db.prepare(`
+      SELECT l.*, p.name AS prompt_name
+      FROM ai_prompt_call_logs l
+      LEFT JOIN ai_prompts p ON p.id = l.prompt_id
+      WHERE (? = 0 OR l.created_at >= ?)
+      ORDER BY l.created_at DESC
+    `).all(since, since);
+
+    const totals = {
+      calls: rows.length,
+      promptTokens: 0,
+      candidateTokens: 0,
+      thoughtTokens: 0,
+      totalTokens: 0,
+      errors: 0,
+    };
+    const byModel = new Map();
+    const byPrompt = new Map();
+    const bump = (map, key, row) => {
+      const id = key || 'unknown';
+      const cur = map.get(id) || {
+        id,
+        calls: 0,
+        promptTokens: 0,
+        candidateTokens: 0,
+        thoughtTokens: 0,
+        totalTokens: 0,
+        errors: 0,
+      };
+      cur.calls += 1;
+      cur.promptTokens += row.prompt_tokens || 0;
+      cur.candidateTokens += row.candidate_tokens || 0;
+      cur.thoughtTokens += row.thought_tokens || 0;
+      cur.totalTokens += row.total_tokens || 0;
+      if (row.status === 'error') cur.errors += 1;
+      map.set(id, cur);
+    };
+
+    for (const row of rows) {
+      totals.promptTokens += row.prompt_tokens || 0;
+      totals.candidateTokens += row.candidate_tokens || 0;
+      totals.thoughtTokens += row.thought_tokens || 0;
+      totals.totalTokens += row.total_tokens || 0;
+      if (row.status === 'error') totals.errors += 1;
+      bump(byModel, row.model, row);
+      const promptKey = row.prompt_id || row.task_type || 'unknown';
+      const before = byPrompt.get(promptKey);
+      bump(byPrompt, promptKey, row);
+      const after = byPrompt.get(promptKey);
+      if (!before && after) after.name = row.prompt_name || row.task_type || promptKey;
+    }
+
+    return {
+      range,
+      since,
+      totals,
+      byModel: Array.from(byModel.values()).sort((a, b) => b.totalTokens - a.totalTokens),
+      byPrompt: Array.from(byPrompt.values()).sort((a, b) => b.totalTokens - a.totalTokens),
+      history: rows.slice(0, 500).map(row => ({
+        id: row.id,
+        promptId: row.prompt_id,
+        promptName: row.prompt_name,
+        taskType: row.task_type,
+        model: row.model,
+        thinkingLevel: row.thinking_level,
+        promptTokens: row.prompt_tokens || 0,
+        candidateTokens: row.candidate_tokens || 0,
+        thoughtTokens: row.thought_tokens || 0,
+        totalTokens: row.total_tokens || 0,
+        status: row.status || 'success',
+        error: row.error,
+        sourceChars: row.source_chars || 0,
+        outputChars: row.output_chars || 0,
+        createdAt: row.created_at || 0,
+      })),
+    };
+  }
+
   seedDefaultAIPrompts() {
     if (this.db.prepare('SELECT COUNT(*) as count FROM ai_prompts').get().count > 0) return;
 
@@ -1167,6 +1394,17 @@ class DatabaseManager {
         is_built_in: 1,
         show_in_context_menu: 0,
         position: 6
+      },
+      {
+        id: 'prompt-summary',
+        name: 'Prompt Summary',
+        content: 'Перескажи пользовательское сообщение для строки таймлайна. Верни только краткий пересказ до 70 символов: без кавычек, без markdown, без точки в конце, без пояснений. Сохрани язык исходного сообщения.',
+        model: 'gemini-3.1-flash-lite',
+        thinking_level: 'NONE',
+        color: '#38bdf8',
+        is_built_in: 1,
+        show_in_context_menu: 0,
+        position: 7
       }
     ];
 
@@ -1263,6 +1501,29 @@ class DatabaseManager {
         6
       );
       console.log('[DB] Migrated: added run-after-title prompt');
+    }
+  }
+
+  // Ensure built-in prompt for Timeline user-message summaries exists.
+  // Names/content/model stay user-editable; only missing row is inserted.
+  ensurePromptSummaryPrompt() {
+    const exists = this.db.prepare('SELECT id FROM ai_prompts WHERE id = ?').get('prompt-summary');
+    if (!exists) {
+      this.db.prepare(`
+        INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        'prompt-summary',
+        'Prompt Summary',
+        'Перескажи пользовательское сообщение для строки таймлайна. Верни только краткий пересказ до 70 символов: без кавычек, без markdown, без точки в конце, без пояснений. Сохрани язык исходного сообщения.',
+        'gemini-3.1-flash-lite',
+        'NONE',
+        '#38bdf8',
+        1,
+        0,
+        7
+      );
+      console.log('[DB] Migrated: added prompt-summary prompt');
     }
   }
 

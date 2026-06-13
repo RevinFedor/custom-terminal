@@ -76,7 +76,8 @@ const snapRect = (el: Element): RectSnap => {
 const fmtY = (r: RectSnap) => `${Math.round(r.top)}-${Math.round(r.midY)}-${Math.round(r.bottom)}`;
 
 type SettingsTab = 'shortcuts' | 'fonts' | 'colors' | 'ai' | 'projects';
-type AISubTab = 'text' | 'system';
+type AISubTab = 'text' | 'system' | 'usage';
+type AIUsageRange = 'week' | 'month' | 'all';
 
 const VR_ACCENT = '#3b82f6';
 const VR_CARD = '#1e1e22';
@@ -1361,6 +1362,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [filePathInputs, setFilePathInputs] = useState<{ value: string; valid: boolean | null }[]>([]);
   const [savedFlashField, setSavedFlashField] = useState<'name' | 'content' | null>(null);
   const savedFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [aiUsageRange, setAIUsageRange] = useState<AIUsageRange>('week');
+  const [aiUsageStats, setAIUsageStats] = useState<any | null>(null);
+  const [aiUsageLoading, setAIUsageLoading] = useState(false);
 
   // Refs for editing containers (to check if blur target is inside)
   const claudeEditRef = useRef<HTMLDivElement>(null);
@@ -1476,6 +1480,24 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     saveCurrentAIPrompt();
     setEditingPromptId(null);
   };
+
+  const loadAIUsageStats = useCallback(async () => {
+    setAIUsageLoading(true);
+    try {
+      const result = await ipcRenderer.invoke('ai-prompts:usage-stats', aiUsageRange);
+      if (result?.success) setAIUsageStats(result.data);
+    } catch (err) {
+      console.warn('[Settings] Failed to load AI usage stats:', err);
+    } finally {
+      setAIUsageLoading(false);
+    }
+  }, [aiUsageRange]);
+
+  useEffect(() => {
+    if (isOpen && activeTab === 'ai' && aiSubTab === 'usage') {
+      void loadAIUsageStats();
+    }
+  }, [isOpen, activeTab, aiSubTab, loadAIUsageStats]);
 
   // Save current text insertion from local state
   const saveCurrentInsertion = (overrideFilePaths?: string[]) => {
@@ -2006,10 +2028,11 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
 
   const switchAISubTab = (next: AISubTab) => {
     if (next === aiSubTab) return;
-    if (next === 'text') {
+    if (aiSubTab === 'system') {
       saveCurrentAIPrompt();
       setEditingPromptId(null);
-    } else {
+    }
+    if (aiSubTab === 'text') {
       saveCurrentInsertion();
       saveCurrentGroup();
       setEditingInsertionIndex(null);
@@ -2312,6 +2335,149 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     );
   };
 
+  const fmtTokens = (n: number) => {
+    const value = Number(n || 0);
+    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+    if (value >= 1000) return `${Math.round(value / 100) / 10}k`;
+    return String(value);
+  };
+
+  const renderTokenMetric = (label: string, value: number, color: string) => (
+    <div style={{ background: VR_CARD, border: `1px solid ${VR_BORDER}`, borderRadius: 8, padding: 10, minWidth: 0 }}>
+      <div style={{ color: VR_DIM, fontSize: 10, textTransform: 'uppercase', marginBottom: 6, fontWeight: 750 }}>{label}</div>
+      <div style={{ color, fontSize: 19, fontWeight: 800, fontFamily: 'ui-monospace, Menlo, monospace', fontVariantNumeric: 'tabular-nums' }}>
+        {fmtTokens(value)}
+      </div>
+    </div>
+  );
+
+  const renderUsageBreakdownRow = (row: any, label: string, accent?: boolean) => (
+    <div style={{ display: 'grid', gridTemplateColumns: 'minmax(140px, 1fr) auto', alignItems: 'center', gap: 10, minWidth: 0 }}>
+      <div style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: accent ? '#bae6fd' : VR_TEXT, fontSize: 11.5, fontWeight: 650 }}>
+        {label}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: VR_DIM, fontSize: 10.5, fontFamily: 'ui-monospace, Menlo, monospace', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+        <span style={{ color: '#bae6fd' }}>in {fmtTokens(row?.promptTokens || 0)}</span>
+        <span style={{ color: '#bbf7d0' }}>out {fmtTokens(row?.candidateTokens || 0)}</span>
+        <span style={{ color: '#ddd6fe' }}>think {fmtTokens(row?.thoughtTokens || 0)}</span>
+        <span style={{ color: accent ? '#7dd3fc' : '#d4d4d8' }}>Σ {fmtTokens(row?.totalTokens || 0)}</span>
+      </div>
+    </div>
+  );
+
+  const renderAIUsageStatsPanel = () => {
+    const totals = aiUsageStats?.totals || {};
+    const history = Array.isArray(aiUsageStats?.history) ? aiUsageStats.history : [];
+    const byModel = Array.isArray(aiUsageStats?.byModel) ? aiUsageStats.byModel.slice(0, 8) : [];
+    const byPrompt = Array.isArray(aiUsageStats?.byPrompt) ? aiUsageStats.byPrompt.slice(0, 8) : [];
+    const grouped = history.reduce((acc: Record<string, any[]>, row: any) => {
+      const key = row.createdAt
+        ? new Date(row.createdAt * 1000).toLocaleDateString('ru-RU', { day: '2-digit', month: 'short' })
+        : 'без даты';
+      if (!acc[key]) acc[key] = [];
+      acc[key].push(row);
+      return acc;
+    }, {});
+    const rangeItems: Array<{ id: AIUsageRange; label: string }> = [
+      { id: 'week', label: '7d' },
+      { id: 'month', label: '30d' },
+      { id: 'all', label: 'all' },
+    ];
+
+    return (
+      <div style={{ height: '100%', minHeight: 0, display: 'grid', gridTemplateColumns: 'minmax(360px, 1fr) minmax(360px, 1fr)', gap: 12 }}>
+        <div style={{ minHeight: 0, display: 'flex', flexDirection: 'column', background: '#17171a', border: `1px solid ${VR_BORDER}`, borderRadius: 10, overflow: 'hidden' }}>
+          <div style={{ padding: '10px 12px', borderBottom: `1px solid ${VR_BORDER}`, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 11, fontWeight: 750, letterSpacing: 0.4, color: VR_DIM, textTransform: 'uppercase' }}>Статистика AI</span>
+            <VRTag>{totals.calls || 0}</VRTag>
+            <div style={{ flex: 1 }} />
+            <div style={{ display: 'inline-flex', background: VR_FIELD, border: `1px solid ${VR_BORDER}`, borderRadius: 7, padding: 2, gap: 2 }}>
+              {rangeItems.map((item) => (
+                <button
+                  key={item.id}
+                  onClick={() => setAIUsageRange(item.id)}
+                  style={{
+                    height: 22,
+                    padding: '0 7px',
+                    borderRadius: 5,
+                    border: 'none',
+                    background: aiUsageRange === item.id ? '#24242a' : 'transparent',
+                    color: aiUsageRange === item.id ? '#bae6fd' : VR_DIM,
+                    fontSize: 10,
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ padding: 12, display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 8, borderBottom: `1px solid ${VR_BORDER}` }}>
+            {renderTokenMetric('input', totals.promptTokens || 0, '#bae6fd')}
+            {renderTokenMetric('output', totals.candidateTokens || 0, '#bbf7d0')}
+            {renderTokenMetric('thinking', totals.thoughtTokens || 0, '#ddd6fe')}
+            {renderTokenMetric('total', totals.totalTokens || 0, '#e0f2fe')}
+          </div>
+
+          <div style={{ padding: 12, minHeight: 0, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div style={{ background: VR_CARD, border: `1px solid ${VR_BORDER}`, borderRadius: 8, padding: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <div style={{ color: VR_DIM, fontSize: 10, textTransform: 'uppercase', fontWeight: 750 }}>по prompt</div>
+              {byPrompt.length > 0
+                ? byPrompt.map((p: any) => renderUsageBreakdownRow(p, p.name || p.id, p.id === editingPromptId))
+                : <div style={{ color: '#666', fontSize: 11 }}>Пока нет вызовов</div>}
+            </div>
+            <div style={{ background: VR_CARD, border: `1px solid ${VR_BORDER}`, borderRadius: 8, padding: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <div style={{ color: VR_DIM, fontSize: 10, textTransform: 'uppercase', fontWeight: 750 }}>по model</div>
+              {byModel.length > 0
+                ? byModel.map((m: any) => renderUsageBreakdownRow(m, m.id, false))
+                : <div style={{ color: '#666', fontSize: 11 }}>Пока нет моделей</div>}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ minHeight: 0, display: 'flex', flexDirection: 'column', background: '#17171a', border: `1px solid ${VR_BORDER}`, borderRadius: 10, overflow: 'hidden' }}>
+          <div style={{ padding: '10px 12px', borderBottom: `1px solid ${VR_BORDER}`, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 11, fontWeight: 750, letterSpacing: 0.4, color: VR_DIM, textTransform: 'uppercase' }}>История вызовов</span>
+            {aiUsageLoading && <VRTag>loading</VRTag>}
+          </div>
+          <div style={{ padding: 12, minHeight: 0, flex: 1, overflowY: 'auto' }}>
+            {Object.keys(grouped).length === 0 && !aiUsageLoading ? (
+              <VREmpty text="История AI-вызовов пустая" />
+            ) : Object.entries(grouped).map(([date, rows]) => (
+              <div key={date} style={{ marginBottom: 12 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                  <span style={{ color: '#9ca3af', fontSize: 10.5, fontWeight: 750, textTransform: 'uppercase' }}>{date}</span>
+                  <div style={{ height: 1, background: VR_BORDER, flex: 1 }} />
+                  <span style={{ color: '#666', fontSize: 10 }}>{(rows as any[]).length}</span>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {(rows as any[]).map((row) => (
+                    <div key={row.id} style={{ background: row.status === 'error' ? 'rgba(239,68,68,0.08)' : VR_CARD, border: `1px solid ${row.status === 'error' ? 'rgba(239,68,68,0.28)' : VR_BORDER}`, borderRadius: 8, padding: '7px 8px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, marginBottom: 4 }}>
+                        <span style={{ color: row.status === 'error' ? '#fca5a5' : VR_TEXT, fontSize: 11.5, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {row.promptName || row.taskType || row.promptId || 'AI prompt'}
+                        </span>
+                        {row.thinkingLevel && row.thinkingLevel !== 'NONE' && <VRTag>{row.thinkingLevel}</VRTag>}
+                      </div>
+                      <div style={{ color: VR_DIM, fontSize: 10.5, display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                        <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.model || 'model?'}</span>
+                        <span style={{ fontFamily: 'ui-monospace, Menlo, monospace', whiteSpace: 'nowrap' }}>
+                          in {fmtTokens(row.promptTokens)} · out {fmtTokens(row.candidateTokens)} · think {fmtTokens(row.thoughtTokens)} · Σ {fmtTokens(row.totalTokens)}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   const renderSystemPrompts = () => {
     const editingAIPrompt = editingPromptId !== null ? aiPrompts.find(p => p.id === editingPromptId) : null;
 
@@ -2517,7 +2683,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     };
 
     return (
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 34%) minmax(360px, 1fr)', gap: 12, height: '100%', minHeight: 0 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 34%) minmax(420px, 1fr)', gap: 12, height: '100%', minHeight: 0 }}>
         <div style={{ minHeight: 0, display: 'flex', flexDirection: 'column', background: '#17171a', border: `1px solid ${VR_BORDER}`, borderRadius: 10, overflow: 'hidden' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 10px', borderBottom: `1px solid ${VR_BORDER}` }}>
             <span style={{ fontSize: 11, fontWeight: 750, letterSpacing: 0.4, color: VR_DIM, textTransform: 'uppercase' }}>Системные промпты</span>
@@ -2668,6 +2834,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
         <div style={{ minHeight: 0, background: '#17171a', border: `1px solid ${VR_BORDER}`, borderRadius: 10, overflow: 'hidden' }}>
           {renderAIPromptEditor()}
         </div>
+
       </div>
     );
   };
@@ -3081,6 +3248,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 {([
                   { id: 'text' as AISubTab, label: 'Текстовые вставки' },
                   { id: 'system' as AISubTab, label: 'Системные промпты' },
+                  { id: 'usage' as AISubTab, label: 'Статистика' },
                 ]).map((tab) => (
                   <button
                     key={tab.id}
@@ -3102,7 +3270,11 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 ))}
               </div>
               <div style={{ flex: 1, minHeight: 0 }}>
-                {aiSubTab === 'text' ? renderTextInsertEditor() : renderSystemPrompts()}
+                {aiSubTab === 'text'
+                  ? renderTextInsertEditor()
+                  : aiSubTab === 'system'
+                    ? renderSystemPrompts()
+                    : renderAIUsageStatsPanel()}
               </div>
             </div>
           )}

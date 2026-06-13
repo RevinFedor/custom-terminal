@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
-import { Home, Minimize2, RotateCcw, Globe, PanelLeft, FileEdit } from 'lucide-react';
+import { Home, Minimize2, RotateCcw, Globe, PanelLeft, FileEdit, RefreshCw, Sparkles } from 'lucide-react';
 import { VscVscode } from 'react-icons/vsc';
 import { useUIStore } from '../../store/useUIStore';
 import Tooltip from '../UI/Tooltip';
@@ -12,6 +12,7 @@ import CopySessionWithChips from './CopySessionWithChips';
 import DocsButton from './DocsButton';
 import ClaudeUsageButton from './ClaudeUsageButton';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
+import { useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -50,6 +51,74 @@ export default function ProjectToolbar() {
   const [isCompressing, setIsCompressing] = useState(false);
 
   const isHomeActive = currentView === 'home';
+  const summaryTargetKey = useWorkspaceStore((state) => {
+    const projectId = state.activeProjectId;
+    if (!projectId) return '';
+    const workspace = state.openProjects.get(projectId);
+    if (!workspace) return '';
+    const effectiveId = state.getEffectiveTabId();
+    const tab = effectiveId ? workspace.tabs.get(effectiveId) : null;
+    if (!tab || tab.tabType === 'browser') return '';
+    let toolType: TimelineSummaryTool | null = null;
+    let sessionId = '';
+    if (tab.commandType === 'codex' && tab.codexSessionId) {
+      toolType = 'codex';
+      sessionId = tab.codexSessionId;
+    } else if (tab.commandType === 'claude' && tab.claudeSessionId) {
+      toolType = 'claude';
+      sessionId = tab.claudeSessionId;
+    } else if (tab.codexSessionId) {
+      toolType = 'codex';
+      sessionId = tab.codexSessionId;
+    } else if (tab.claudeSessionId) {
+      toolType = 'claude';
+      sessionId = tab.claudeSessionId;
+    }
+    if (!toolType || !sessionId || !effectiveId) return '';
+    return `${effectiveId}|${toolType}|${sessionId}`;
+  });
+  const summaryTarget = useMemo(() => {
+    if (!summaryTargetKey) return null;
+    const [tabId, toolType, sessionId] = summaryTargetKey.split('|') as [string, TimelineSummaryTool, string];
+    if (!tabId || !toolType || !sessionId) return null;
+    return { tabId, toolType, sessionId };
+  }, [summaryTargetKey]);
+  const summaryProgressByTab = useTimelineSummaryStore((state) => state.batchProgressByTab);
+  const summaryGlobalAuto = useTimelineSummaryStore((state) => state.globalAuto);
+  const setSummaryGlobalAuto = useTimelineSummaryStore((state) => state.setGlobalAuto);
+  const summaryTabAuto = useTimelineSummaryStore((state) => (
+    summaryTarget?.tabId ? state.autoByTab[summaryTarget.tabId] === true : false
+  ));
+  const setSummaryTabAuto = useTimelineSummaryStore((state) => state.setTabAuto);
+  const summaryProgress = summaryTarget?.tabId ? summaryProgressByTab[summaryTarget.tabId] : undefined;
+  const summaryRunning = summaryProgress?.running === true;
+  const summaryAutoEffective = summaryGlobalAuto || summaryTabAuto;
+
+  const summaryChipStyle = (active: boolean, disabled = false): React.CSSProperties => ({
+    height: 22,
+    minWidth: 32,
+    padding: '0 7px',
+    borderRadius: 6,
+    border: `1px solid ${active ? 'rgba(56,189,248,0.7)' : 'rgba(255,255,255,0.12)'}`,
+    background: active ? 'rgba(56,189,248,0.16)' : 'rgba(255,255,255,0.04)',
+    color: active ? '#bae6fd' : '#8a8a8d',
+    fontSize: 10,
+    fontWeight: 700,
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    cursor: disabled ? 'default' : 'pointer',
+    opacity: disabled ? 0.62 : 1,
+    fontVariantNumeric: 'tabular-nums',
+  });
+
+  const handleRefreshPromptSummaries = useCallback(() => {
+    if (!summaryTarget || summaryRunning) return;
+    window.dispatchEvent(new CustomEvent('timeline-summary:refresh-tab', {
+      detail: { tabId: summaryTarget.tabId },
+    }));
+  }, [summaryTarget, summaryRunning]);
 
   // Get interrupted tabs for CURRENT project only
   const interruptedTabs = useMemo(() => {
@@ -373,6 +442,37 @@ export default function ProjectToolbar() {
       {/* Claude usage chip — weekly utilization % from Anthropic OAuth usage API
           (same source as Blimp-Labs claude-usage-bar). Sits left of Dictation
           history; popover opens DOWN with full 5h/7d/extra-credits breakdown. */}
+      <div className="flex items-center gap-1 pr-2">
+        <Tooltip content="Обновить пересказы user prompts в текущей сессии">
+          <button
+            onClick={handleRefreshPromptSummaries}
+            disabled={!summaryTarget || summaryRunning}
+            style={summaryChipStyle(false, !summaryTarget || summaryRunning)}
+          >
+            <RefreshCw size={12} className={summaryRunning ? 'animate-spin text-sky-300' : ''} />
+            {summaryRunning ? `${summaryProgress?.done || 0}/${summaryProgress?.total || 0}` : 'AI'}
+          </button>
+        </Tooltip>
+        <Tooltip content={summaryGlobalAuto ? 'Глобальный auto включён: настройка вкладки зафиксирована' : 'Auto пересказ новых user prompts для текущей вкладки'}>
+          <button
+            onClick={() => summaryTarget && !summaryGlobalAuto && setSummaryTabAuto(summaryTarget.tabId, !summaryTabAuto)}
+            disabled={!summaryTarget || summaryGlobalAuto}
+            style={summaryChipStyle(summaryAutoEffective, !summaryTarget || summaryGlobalAuto)}
+          >
+            <Sparkles size={11} />
+            tab
+          </button>
+        </Tooltip>
+        <Tooltip content="Auto пересказ новых user prompts во всех вкладках">
+          <button
+            onClick={() => setSummaryGlobalAuto(!summaryGlobalAuto)}
+            style={summaryChipStyle(summaryGlobalAuto)}
+          >
+            all
+          </button>
+        </Tooltip>
+      </div>
+
       <div className="flex items-center pr-2">
         <ClaudeUsageButton />
       </div>

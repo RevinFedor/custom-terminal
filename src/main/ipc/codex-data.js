@@ -756,12 +756,32 @@ function removeLastCodexTurns(entries, numTurns) {
   }
 }
 
-function buildCodexCleanExport(records, sessionId, cwd, opts) {
-  const meta = getSessionMeta(records);
+function codexCopyOptions(params = {}) {
+  const includeTools = params.includeTools ?? false;
+  return {
+    includeEditing: params.includeEditing ?? false,
+    includeReading: params.includeReading ?? false,
+    fromStart: params.fromStart ?? true,
+    includeSubagentResult: params.includeSubagentResult ?? false,
+    includeSubagentHistory: params.includeSubagentHistory ?? false,
+    includeUser: params.includeUser ?? true,
+    includeClaude: params.includeClaude ?? true,
+    includeText: params.includeText ?? true,
+    includeThinking: params.includeThinking ?? true,
+    includeBash: params.includeBash ?? false,
+    includeTools,
+    includeWebSearch: params.includeWebSearch ?? false,
+    includeToolSearch: params.includeToolSearch ?? false,
+    includeOtherTools: params.includeOtherTools ?? includeTools,
+  };
+}
+
+function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
   const entries = [];
   const pendingCalls = new Map();
   let currentTurnIndex = -1;
   let pendingThinking = '';
+  let lastTopLevelCompactLine = -Infinity;
 
   const push = (entry) => entries.push({ ...entry, turnIndex: currentTurnIndex });
 
@@ -769,10 +789,15 @@ function buildCodexCleanExport(records, sessionId, cwd, opts) {
     const payload = record.payload || {};
 
     if (record.type === 'compacted') {
+      // For clean export, a Codex compacted record is a snapshot of model
+      // context, not a new user-visible turn. Expanding replacement_history
+      // recursively re-exports old/rolled-back prompts on every compaction.
       push({
         kind: 'compact',
-        text: compactEventContent(payload),
+        text: compactEventTitle(payload),
+        sourceUuid: stableUuid(sessionId, record.__line, 'codex-compact'),
       });
+      lastTopLevelCompactLine = record.__line;
       continue;
     }
 
@@ -788,11 +813,20 @@ function buildCodexCleanExport(records, sessionId, cwd, opts) {
           push({
             kind: 'user',
             text: [payload.message || extractTextContent(payload.content), ...imageLines].filter(Boolean).join('\n'),
+            sourceUuid: stableUuid(sessionId, record.__line, 'codex-user'),
           });
         }
       } else if (payload.type === 'thread_rolled_back') {
         removeLastCodexTurns(entries, Number(payload.num_turns || payload.turns || 1));
         currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
+      } else if (isCompactPayload(payload)) {
+        if (record.__line > lastTopLevelCompactLine + 3) {
+          push({
+            kind: 'compact',
+            text: compactEventTitle(payload),
+            sourceUuid: stableUuid(sessionId, record.__line, 'codex-compact'),
+          });
+        }
       }
       continue;
     }
@@ -854,8 +888,12 @@ function buildCodexCleanExport(records, sessionId, cwd, opts) {
     }
   }
 
+  return entries;
+}
+
+function formatCodexCleanExport(entries, sessionId, cwd, meta, title = '# Codex Session Export') {
   const out = [];
-  out.push('# Codex Session Export');
+  out.push(title);
   out.push(`Session: ${sessionId}`);
   out.push(`CWD: ${cwd || meta.cwd || 'unknown'}`);
   if (meta.forked_from_id) out.push(`Forked from: ${meta.forked_from_id}`);
@@ -875,6 +913,55 @@ function buildCodexCleanExport(records, sessionId, cwd, opts) {
     }
   }
   return out.join('\n');
+}
+
+function buildCodexCleanExport(records, sessionId, cwd, opts) {
+  const meta = getSessionMeta(records);
+  const entries = buildCodexCleanEntries(records, sessionId, codexCopyOptions(opts));
+  return formatCodexCleanExport(entries, sessionId, cwd, meta);
+}
+
+function buildCodexRangeExport(records, sessionId, cwd, opts, startUuid, endUuid) {
+  if (!startUuid || !endUuid) {
+    return { success: false, error: 'startUuid/endUuid required' };
+  }
+
+  const timeline = buildCodexTimeline(records, sessionId);
+  const startIndex = timeline.findIndex((entry) => entry.uuid === startUuid);
+  const endIndex = timeline.findIndex((entry) => entry.uuid === endUuid);
+  if (startIndex < 0 || endIndex < 0) {
+    return { success: false, error: 'Timeline range not found' };
+  }
+
+  const minIndex = Math.min(startIndex, endIndex);
+  const maxIndex = Math.max(startIndex, endIndex);
+  const selected = timeline.slice(minIndex, maxIndex + 1);
+  const selectedTurns = new Set();
+  const selectedCompacts = new Set();
+  for (const entry of selected) {
+    if (entry.type === 'compact') {
+      selectedCompacts.add(entry.uuid);
+    } else if (typeof entry.turnIndex === 'number') {
+      selectedTurns.add(entry.turnIndex);
+    }
+  }
+
+  const cleanEntries = buildCodexCleanEntries(records, sessionId, codexCopyOptions(opts));
+  const filtered = cleanEntries.filter((entry) => {
+    if (entry.kind === 'compact') return selectedCompacts.has(entry.sourceUuid);
+    return typeof entry.turnIndex === 'number' && selectedTurns.has(entry.turnIndex);
+  });
+
+  if (filtered.length === 0) {
+    return { success: false, error: 'Selected range has no copyable content' };
+  }
+
+  const meta = getSessionMeta(records);
+  return {
+    success: true,
+    content: formatCodexCleanExport(filtered, sessionId, cwd, meta, '# Codex Range Export'),
+    selectedCount: selected.length,
+  };
 }
 
 function normalizeCodexReset(value) {
@@ -1065,37 +1152,35 @@ function register() {
     }
   });
 
-  ipcMain.handle('codex:export-clean-session', async (_event, {
-    sessionId, cwd,
-    includeEditing = false, includeReading = false, fromStart = true,
-    includeSubagentResult = false, includeSubagentHistory = false,
-    includeUser = true, includeClaude = true,
-    includeText = true, includeThinking = true,
-    includeBash = false, includeTools = false,
-    includeWebSearch = false, includeToolSearch = false, includeOtherTools = includeTools,
-  }) => {
+  ipcMain.handle('codex:export-clean-session', async (_event, params = {}) => {
     try {
+      const { sessionId, cwd } = params;
       const loaded = await loadSessionRecords(sessionId, cwd);
       if (!loaded.success) return loaded;
-      const content = buildCodexCleanExport(loaded.records, sessionId, cwd, {
-        includeEditing,
-        includeReading,
-        fromStart,
-        includeSubagentResult,
-        includeSubagentHistory,
-        includeUser,
-        includeClaude,
-        includeText,
-        includeThinking,
-        includeBash,
-        includeTools,
-        includeWebSearch,
-        includeToolSearch,
-        includeOtherTools,
-      });
+      const content = buildCodexCleanExport(loaded.records, sessionId, cwd, codexCopyOptions(params));
       return { success: true, content, filePath: loaded.filePath };
     } catch (error) {
       console.error('[CodexData] export-clean-session error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('codex:copy-range', async (_event, params = {}) => {
+    try {
+      const { sessionId, cwd, startUuid, endUuid } = params;
+      const loaded = await loadSessionRecords(sessionId, cwd);
+      if (!loaded.success) return loaded;
+      const result = buildCodexRangeExport(
+        loaded.records,
+        sessionId,
+        cwd,
+        codexCopyOptions(params),
+        startUuid,
+        endUuid
+      );
+      return result.success ? { ...result, filePath: loaded.filePath } : result;
+    } catch (error) {
+      console.error('[CodexData] copy-range error:', error);
       return { success: false, error: error.message };
     }
   });
@@ -1133,10 +1218,15 @@ module.exports = {
   findLatestCodexSession,
   buildCodexTimeline,
   buildCodexFullHistory,
+  buildCodexCleanExport,
+  buildCodexRangeExport,
   _api: {
     findCodexSessionFile,
     findLatestCodexSession,
     parseJsonlFile,
+    buildCodexCleanEntries,
+    buildCodexCleanExport,
+    buildCodexRangeExport,
     latestCodexUsageInRecords,
     findLatestCodexUsage,
   },
