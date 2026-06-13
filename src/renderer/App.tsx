@@ -2,7 +2,6 @@ import React, { useEffect, useState, useRef, useCallback, memo } from 'react';
 import { useWorkspaceStore, isTabInterrupted } from './store/useWorkspaceStore';
 import { useProjectsStore } from './store/useProjectsStore';
 import { useUIStore } from './store/useUIStore';
-import { useResearchStore } from './store/useResearchStore';
 import { usePromptsStore } from './store/usePromptsStore';
 import Dashboard from './components/Dashboard/Dashboard';
 import Workspace from './components/Workspace/Workspace';
@@ -450,7 +449,6 @@ function App() {
   const setOpenFilePath = useWorkspaceStore((s) => s.setOpenFilePath);
   const { projects, loadProjects, updateProject } = useProjectsStore();
   const { closeFilePreview, filePreview, showToast, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, dragAreaWidth, setDragAreaWidth } = useUIStore();
-  const { toggleResearch } = useResearchStore();
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -2219,15 +2217,6 @@ function App() {
         return;
       }
 
-      // Cmd+Shift+E - Toggle Research panel
-      if (e.metaKey && e.shiftKey && e.code === 'KeyE') {
-        e.preventDefault();
-        if (view === 'workspace') {
-          toggleResearch();
-        }
-        return;
-      }
-
     };
 
     window.addEventListener('keydown', handleKeyDown);
@@ -2283,34 +2272,7 @@ function App() {
     // Handle Context Menu commands from main process
     const handleContextMenuCommand = (_: any, cmd: string, data?: any) => {
       console.log('[ContextMenu] Command received:', cmd);
-      if (cmd === 'ai-prompt') {
-        // Dynamic AI prompt — data is the promptId
-        const promptId = data as string;
-        const terminalSelection = useUIStore.getState().terminalSelection;
-        console.log('[ContextMenu] AI prompt:', promptId, 'Selection:', terminalSelection ? terminalSelection.slice(0, 50) : 'EMPTY');
-        if (terminalSelection) {
-          useResearchStore.getState().triggerResearch(promptId);
-          console.log('[ContextMenu] Triggered', promptId, 'via store');
-        } else {
-          showToast('Select text in terminal first', 'error');
-        }
-      } else if (cmd === 'gemini-research') {
-        // Legacy fallback
-        const terminalSelection = useUIStore.getState().terminalSelection;
-        if (terminalSelection) {
-          useResearchStore.getState().triggerResearch('research');
-        } else {
-          showToast('Select text in terminal first', 'error');
-        }
-      } else if (cmd === 'gemini-compact') {
-        // Legacy fallback
-        const terminalSelection = useUIStore.getState().terminalSelection;
-        if (terminalSelection) {
-          useResearchStore.getState().triggerResearch('compact');
-        } else {
-          showToast('Select text in terminal first', 'error');
-        }
-      } else if (cmd === 'insert-prompt') {
+      if (cmd === 'insert-prompt') {
         // Insert prompt text + file attachments into effective terminal (sub-agent aware)
         const effectiveId = getEffectiveTabId();
         const { content, filePaths } = data as { content: string; filePaths: string[] };
@@ -2407,7 +2369,7 @@ function App() {
       window.removeEventListener('keydown', handleReopenLastClosedCapture, true);
       ipcRenderer.removeListener('context-menu-command', handleContextMenuCommand);
     };
-  }, [view, activeProjectId, filePreview, incrementAllFontSizes, decrementAllFontSizes, toggleResearch, activeArea, openProjects, setActiveArea]);
+  }, [view, activeProjectId, filePreview, incrementAllFontSizes, decrementAllFontSizes, activeArea, openProjects, setActiveArea]);
 
   const openProjectsList = Array.from(openProjects.entries());
 

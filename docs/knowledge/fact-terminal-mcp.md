@@ -8,7 +8,7 @@ MCP-сервер для управления терминальными вкла
 ### Два MCP-сервера, один HTTP backend
 Проект использует два отдельных MCP-сервера, и оба ходят в один и тот же main-process HTTP:
 - `.claude/mcp/terminal-server.mjs` — Terminal Management (tabs, restart, run, output). *Оператор*: что сейчас крутится, перезапустить/убить.
-- `~/.claude/mcp/overseer-server.mjs` — контроль сессий (чтение + редактирование истории через `/overseer/*` endpoints). *Историк/редактор*: что сессия сделала, прочитать/переписать транскрипт.
+- `~/.claude/mcp/overseer-server.mjs` — контроль сессий (чтение + редактирование истории через `/overseer/*` endpoints). *Историк/редактор*: что сессия сделала, прочитать/переписать транскрипт. Полная механика — [`fact-overseer-mcp.md`](fact-overseer-mcp.md).
 
 Граница по blast radius: terminal MCP может убить dev-сервер, overseer MCP — переписать JSONL. Оба общаются с main process через один и тот же HTTP-сервер (`mcpHttpServer` на localhost). Порт обнаруживается через `~/.noted-terminal/mcp-port-<PID>` (см. [`fix-mcp-multi-instance.md`](fix-mcp-multi-instance.md)).
 

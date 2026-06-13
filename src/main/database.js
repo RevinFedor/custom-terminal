@@ -204,25 +204,6 @@ class DatabaseManager {
       )
     `);
 
-    // API Call Log table (adopt, update_docs, research — one-off API calls)
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS api_call_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        project_id TEXT,
-        call_type TEXT NOT NULL,
-        model TEXT,
-        input_tokens INTEGER DEFAULT 0,
-        output_tokens INTEGER DEFAULT 0,
-        result_text TEXT,
-        source_tab_id TEXT,
-        source_session_id TEXT,
-        target_tab_id TEXT,
-        payload_size INTEGER DEFAULT 0,
-        created_at INTEGER DEFAULT (strftime('%s', 'now')),
-        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
-      )
-    `);
-
     // Create indexes
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_quick_actions_project ON quick_actions(project_id);
@@ -230,28 +211,8 @@ class DatabaseManager {
       CREATE INDEX IF NOT EXISTS idx_gemini_history_project ON gemini_history(project_id);
       CREATE INDEX IF NOT EXISTS idx_gemini_history_timestamp ON gemini_history(timestamp DESC);
       CREATE INDEX IF NOT EXISTS idx_ai_sessions_project ON ai_sessions(project_id);
-      CREATE INDEX IF NOT EXISTS idx_api_call_log_project ON api_call_log(project_id);
-      CREATE INDEX IF NOT EXISTS idx_api_call_log_type ON api_call_log(call_type);
     `);
 
-    // Migration: add session_meta and input_payload to api_call_log
-    try { this.db.exec('ALTER TABLE api_call_log ADD COLUMN session_meta TEXT'); } catch {}
-    try { this.db.exec('ALTER TABLE api_call_log ADD COLUMN input_payload TEXT'); } catch {}
-
-    // Research Conversations table
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS research_conversations (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        title TEXT,
-        type TEXT DEFAULT 'research',
-        messages_json TEXT NOT NULL,
-        created_at INTEGER DEFAULT (strftime('%s', 'now')),
-        updated_at INTEGER DEFAULT (strftime('%s', 'now')),
-        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
-      )
-    `);
-    
     // App state table
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS app_state (
@@ -1153,28 +1114,6 @@ class DatabaseManager {
 
     const defaults = [
       {
-        id: 'research',
-        name: 'Research',
-        content: 'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ',
-        model: 'gemini-3-flash-preview',
-        thinking_level: 'HIGH',
-        color: '#0ea5e9',
-        is_built_in: 1,
-        show_in_context_menu: 1,
-        position: 0
-      },
-      {
-        id: 'compact',
-        name: 'Compact (Резюме)',
-        content: 'Проанализируй всю нашу текущую сессию и составь структурированное резюме для переноса контекста в новый чат, включив в него: изначальную цель; список всех созданных файлов с пояснением, почему мы выбрали именно такую структуру и эти файлы; краткий отчет о том, что работает; детальный разбор того, что НЕ получилось, с указанием конкретных причин ошибок (почему выбранные решения не сработали); текущее состояние кода и пошаговый план дальнейших действий — оформи это всё одним компактным сообщением, которое я смогу скопировать и отправить тебе в новом чате для полного восстановления контекста.\n\nВот текст сессии:\n',
-        model: 'gemini-3-flash-preview',
-        thinking_level: 'HIGH',
-        color: '#a855f7',
-        is_built_in: 1,
-        show_in_context_menu: 1,
-        position: 1
-      },
-      {
         id: 'rewind',
         name: 'Rewind (Откат)',
         content: 'Ниже представлена сессия из нейронки (Claude Code). Составь краткую сводку:\n\n1. **Изначальная цель** — что делали\n2. **Изменённые файлы** — путь, какие функции/компоненты затронуты, зачем\n3. **Что работает** — кратко\n4. **Что НЕ работает и ПОЧЕМУ** — конкретные причины ошибок, какие решения пробовали и почему они не сработали\n5. **Текущее состояние** — на чём остановились\n\nВажно: только факты и анализ. Никакого плана, никаких рекомендаций, никаких \"следующих шагов\". Не добавляй своё мнение. Начни сразу со сводки.\n\nСессия:\n',
@@ -1342,22 +1281,6 @@ class DatabaseManager {
   getAISessions(projectId, toolType = null) {
     if (toolType) return this.db.prepare('SELECT * FROM ai_sessions WHERE project_id = ? AND tool_type = ? ORDER BY updated_at DESC').all(projectId, toolType);
     return this.db.prepare('SELECT * FROM ai_sessions WHERE project_id = ? ORDER BY updated_at DESC').all(projectId);
-  }
-
-  // ========== API CALL LOG ==========
-
-  saveApiCallLog({ projectId, callType, model, inputTokens, outputTokens, resultText, sourceTabId, sourceSessionId, targetTabId, payloadSize, sessionMeta, inputPayload }) {
-    return this.db.prepare(`
-      INSERT INTO api_call_log (project_id, call_type, model, input_tokens, output_tokens, result_text, source_tab_id, source_session_id, target_tab_id, payload_size, session_meta, input_payload)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(projectId || null, callType, model || null, inputTokens || 0, outputTokens || 0, resultText || null, sourceTabId || null, sourceSessionId || null, targetTabId || null, payloadSize || 0, sessionMeta ? JSON.stringify(sessionMeta) : null, inputPayload || null).lastInsertRowid;
-  }
-
-  getApiCallLog(projectId = null, limit = 50) {
-    if (projectId) {
-      return this.db.prepare('SELECT * FROM api_call_log WHERE project_id = ? ORDER BY created_at DESC LIMIT ?').all(projectId, limit);
-    }
-    return this.db.prepare('SELECT * FROM api_call_log ORDER BY created_at DESC LIMIT ?').all(limit);
   }
 
   // ========== FORK MARKERS ==========

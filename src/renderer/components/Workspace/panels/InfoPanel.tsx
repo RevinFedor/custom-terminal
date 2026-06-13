@@ -756,7 +756,11 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                     try {
                       const clipboardText = await navigator.clipboard.readText();
                       const match = clipboardText.match(UUID_EXTRACT_REGEX);
-                      if (match) { setTabCommandType(activeTabId, 'claude'); ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-f', forkSessionId: match[0] }); }
+                      if (match) {
+                        setTabCommandType(activeTabId, 'claude');
+                        useWorkspaceStore.getState().markAiForkAutoTitle(activeTabId, 'claude', match[0]);
+                        ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-f', forkSessionId: match[0] });
+                      }
                       else showToast('В буфере нет UUID', 'warning');
                     } catch (err) { showToast('Не удалось прочитать буфер', 'error'); }
                   }}

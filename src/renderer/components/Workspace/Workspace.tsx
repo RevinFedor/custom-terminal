@@ -17,7 +17,6 @@ import Sidebar from './Sidebar';
 import FilePreview from './FilePreview';
 // Resizer was used only by the deleted right-side NotesPanel column.
 // import Resizer from './Resizer';
-import ResearchSheet from '../Research/ResearchSheet';
 import TabNotesSlideout from './TabNotesSlideout';
 import HistoryPanel from './HistoryPanel';
 import ClaudeControlBar from './ClaudeControlBar';
@@ -598,9 +597,6 @@ export default function Workspace() {
 
             {/* File Preview Overlay */}
             {filePreview && <FilePreview />}
-
-            {/* Research Sheet */}
-            <ResearchSheet projectId={activeProjectId} projectPath={currentProject.path} />
 
             {/* History Panel — absolute overlay within terminal area only */}
             {(isHistoryOpen || historyMounted) && timelineSessionId && effectiveTab && currentView === 'terminal' && (

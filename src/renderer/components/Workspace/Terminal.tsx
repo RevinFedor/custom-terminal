@@ -77,6 +77,8 @@ import { log } from '../../utils/logger';
 import { markPendingResume, clearPendingResume, isStaleAgainstPending, getPendingResume } from '../../utils/pendingResume';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 
+const TIMELINE_COLLAPSED_SLOT_WIDTH = 32;
+
 // ============================================================================
 // EffortInject TUI-readiness diagnostic instrumentation (temporary, May 2026)
 // ============================================================================
@@ -603,6 +605,12 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
   const terminalFontSize = useUIStore((state) => state.terminalFontSize);
   const historyPanelOpen = useUIStore((state) => state.historyPanelOpenTabs[tabId] ?? false);
+  const timelineTreeMode = useUIStore((state) => state.timelineTreeModeTabs[tabId] ?? false);
+  const timelineWidth = useUIStore((state) => state.timelineWidth);
+  const promptQueueRightInset =
+    timelineTreeMode && !historyPanelOpen
+      ? Math.max(0, timelineWidth - TIMELINE_COLLAPSED_SLOT_WIDTH)
+      : 0;
   const workspaceView = useWorkspaceStore((state) => state.view);
 
   // Prompt-queue overlay needs to know two things:
@@ -2598,15 +2606,18 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           onContextMenu={handleContextMenu}
         />
 
-        {/* Prompt Queue overlay — only for Claude/Codex tabs with a live process.
-            has sessionId AND processAlive (OSC 133 or provider session-detected says the
-            AI process is actually running). When it exits, process-finished fires
-            → overlay disappears. */}
-        {effectiveActive && promptQueueAgent && hasPromptQueueSession && claudeProcessAlive && (
-          <PromptQueueOverlay tabId={tabId} sessionType={promptQueueAgent} agentBusy={agentBusy} />
-        )}
-
       </div>
+
+      {/* Prompt Queue overlay — outside isolation:isolate so it can sit above
+          HistoryPanel. `rightInset` only shifts it left for expanded Timeline. */}
+      {effectiveActive && promptQueueAgent && hasPromptQueueSession && claudeProcessAlive && (
+        <PromptQueueOverlay
+          tabId={tabId}
+          sessionType={promptQueueAgent}
+          agentBusy={agentBusy}
+          rightInset={promptQueueRightInset}
+        />
+      )}
 
       {/* Scroll-to-bottom button — OUTSIDE isolation:isolate wrapper so its z-index
           participates in root stacking context (above Timeline tooltip portal z:10000) */}
