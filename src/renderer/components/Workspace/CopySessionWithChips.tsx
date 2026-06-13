@@ -15,15 +15,15 @@ import CopySessionButton, { ClaudeSparkle } from './CopySessionButton';
 const CHIP_ON = '#DA7756';
 const CHIP_OFF = '#555';
 
-const ChipText = ({ active, children, onClick, title, italic = false }:
-  { active: boolean; children: React.ReactNode; onClick: () => void; title: string; italic?: boolean }) => (
+const ChipText = ({ active, children, onClick, title, italic = false, activeColor = CHIP_ON }:
+  { active: boolean; children: React.ReactNode; onClick: () => void; title: string; italic?: boolean; activeColor?: string }) => (
   <button
     onClick={onClick}
     title={title}
     className="cursor-pointer hover:opacity-80 transition-opacity"
     style={{
       background: 'transparent', border: 'none', padding: 0,
-      color: active ? CHIP_ON : CHIP_OFF,
+      color: active ? activeColor : CHIP_OFF,
       fontSize: 9.5,
       fontFamily: 'ui-monospace, SFMono-Regular, monospace',
       fontStyle: italic ? 'italic' : 'normal',
@@ -43,6 +43,7 @@ export default function CopySessionWithChips() {
       if (t) {
         if (t.claudeSessionId) return 'claude' as const;
         if (t.geminiSessionId) return 'gemini' as const;
+        if (t.codexSessionId) return 'codex' as const;
         return null;
       }
     }
@@ -57,6 +58,9 @@ export default function CopySessionWithChips() {
   const includeEditing = useUIStore((s) => s.copyIncludeEditing);
   const includeBash = useUIStore((s) => s.copyIncludeBash);
   const includeTools = useUIStore((s) => s.copyIncludeTools);
+  const includeWebSearch = useUIStore((s) => s.copyIncludeWebSearch);
+  const includeToolSearch = useUIStore((s) => s.copyIncludeToolSearch);
+  const includeOtherTools = useUIStore((s) => s.copyIncludeOtherTools);
   const includeSubagentResult = useUIStore((s) => s.copyIncludeSubagentResult);
   const includeSubagentHistory = useUIStore((s) => s.copyIncludeSubagentHistory);
   const setCopyIncludeUser = useUIStore((s) => s.setCopyIncludeUser);
@@ -67,6 +71,9 @@ export default function CopySessionWithChips() {
   const setCopyIncludeEditing = useUIStore((s) => s.setCopyIncludeEditing);
   const setCopyIncludeBash = useUIStore((s) => s.setCopyIncludeBash);
   const setCopyIncludeTools = useUIStore((s) => s.setCopyIncludeTools);
+  const setCopyIncludeWebSearch = useUIStore((s) => s.setCopyIncludeWebSearch);
+  const setCopyIncludeToolSearch = useUIStore((s) => s.setCopyIncludeToolSearch);
+  const setCopyIncludeOtherTools = useUIStore((s) => s.setCopyIncludeOtherTools);
   const setCopyIncludeSubagentResult = useUIStore((s) => s.setCopyIncludeSubagentResult);
   const setCopyIncludeSubagentHistory = useUIStore((s) => s.setCopyIncludeSubagentHistory);
   const fromStart = useUIStore((s) => s.copyFromStart);
@@ -75,7 +82,8 @@ export default function CopySessionWithChips() {
 
   if (!activeTabId || !sessionType) return null;
 
-  const ON = CHIP_ON;
+  const isCodex = sessionType === 'codex';
+  const ON = isCodex ? '#10A37F' : CHIP_ON;
   const OFF = CHIP_OFF;
   const dot = <span style={{ color: '#333', fontSize: 10, lineHeight: 1.2 }}>·</span>;
 
@@ -87,7 +95,7 @@ export default function CopySessionWithChips() {
   return (
     <div className="flex items-center select-none" style={{ gap: 8 }}>
       <CopySessionButton activeTabId={activeTabId} sessionType={sessionType} />
-      {sessionType === 'claude' && (
+      {sessionType !== 'gemini' && (
         // Two rows so the chip cluster doesn't stretch the ProjectToolbar.
         // Row 1 = роли / контент Claude (user, claude, answer, thinking).
         // Row 2 = инструменты + scope (read, edit, bash, mcp, ⑂fork, sub-pill).
@@ -109,67 +117,110 @@ export default function CopySessionWithChips() {
               style={{ background: 'transparent', border: 'none', padding: 0, lineHeight: 1 }}
               title="✦ Claude messages"
             >
-              <ClaudeSparkle size={11} color={includeClaude ? ON : OFF} />
+              {isCodex
+                ? <span style={{ color: includeClaude ? ON : OFF, fontSize: 9.5, fontFamily: 'ui-monospace, SFMono-Regular, monospace', lineHeight: 1.2 }}>Codex</span>
+                : <ClaudeSparkle size={11} color={includeClaude ? ON : OFF} />}
             </button>
             {dot}
             <ChipText
               italic
+              activeColor={ON}
               active={includeClaude && includeText}
               onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeText(!(includeClaude && includeText)); }}
-              title="«answer» — финальные ответы Claude"
+              title="«answer» — финальные ответы агента"
             >answer</ChipText>
             {dot}
-            <ChipText
-              italic
-              active={includeClaude && includeThinking}
-              onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeThinking(!(includeClaude && includeThinking)); }}
-              title="«thinking» — extended thinking blocks"
-            >thinking</ChipText>
+            {!isCodex && (
+              <ChipText
+                italic
+                activeColor={ON}
+                active={includeClaude && includeThinking}
+                onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeThinking(!(includeClaude && includeThinking)); }}
+                title="«thinking» — extended thinking blocks"
+              >thinking</ChipText>
+            )}
           </div>
 
           {/* Row 2 */}
           <div className="flex items-center" style={{ gap: '2px 4px' }}>
+            {!isCodex && (
+              <>
+                <ChipText
+                  activeColor={ON}
+                  active={includeClaude && includeReading}
+                  onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeReading(!(includeClaude && includeReading)); }}
+                  title="read_file — Read tool"
+                >read</ChipText>
+                {dot}
+              </>
+            )}
             <ChipText
-              active={includeClaude && includeReading}
-              onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeReading(!(includeClaude && includeReading)); }}
-              title="read_file — Read tool"
-            >read</ChipText>
-            {dot}
-            <ChipText
+              activeColor={ON}
               active={includeClaude && includeEditing}
               onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeEditing(!(includeClaude && includeEditing)); }}
-              title="edit, write"
-            >edit</ChipText>
+              title={isCodex ? 'apply_patch' : 'edit, write'}
+            >{isCodex ? 'patch' : 'edit'}</ChipText>
             {dot}
             <ChipText
+              activeColor={ON}
               active={includeClaude && includeBash}
               onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeBash(!(includeClaude && includeBash)); }}
-              title="bash, monitor, grep, glob — shell-команды"
-            >bash</ChipText>
+              title={isCodex ? 'exec_command, write_stdin — shell-команды' : 'bash, monitor, grep, glob — shell-команды'}
+            >{isCodex ? 'shell' : 'bash'}</ChipText>
             {dot}
             <ChipText
+              activeColor={ON}
               active={includeClaude && includeTools}
               onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeTools(!(includeClaude && includeTools)); }}
-              title="mcp__*, web_search"
+              title="mcp__*"
             >mcp</ChipText>
             {dot}
-            <button
-              onClick={() => setCopyFromStart(!fromStart)}
-              className="cursor-pointer hover:opacity-80 transition-opacity inline-flex items-center"
-              style={{
-                background: 'transparent', border: 'none', padding: 0,
-                color: !fromStart ? '#3b82f6' : OFF,
-                fontSize: 9.5,
-                fontFamily: 'ui-monospace, SFMono-Regular, monospace',
-                lineHeight: 1.2,
-                gap: 3,
-              }}
-              title="Fork starting point: from fork (blue) / from start (grey)"
-            >
-              <span style={{ fontSize: 10, lineHeight: 1 }}>⑂</span>
-              <span>fork</span>
-            </button>
+            <ChipText
+              activeColor={ON}
+              active={includeClaude && includeWebSearch}
+              onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeWebSearch(!(includeClaude && includeWebSearch)); }}
+              title="web_search"
+            >web</ChipText>
             {dot}
+            {isCodex && (
+              <>
+                <ChipText
+                  activeColor={ON}
+                  active={includeClaude && includeToolSearch}
+                  onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeToolSearch(!(includeClaude && includeToolSearch)); }}
+                  title="tool_search"
+                >tool</ChipText>
+                {dot}
+              </>
+            )}
+            <ChipText
+              activeColor={ON}
+              active={includeClaude && includeOtherTools}
+              onClick={() => { if (!includeClaude) setCopyIncludeClaude(true); setCopyIncludeOtherTools(!(includeClaude && includeOtherTools)); }}
+              title="other_tools"
+            >other</ChipText>
+            {dot}
+            {!isCodex && (
+              <>
+                <button
+                  onClick={() => setCopyFromStart(!fromStart)}
+                  className="cursor-pointer hover:opacity-80 transition-opacity inline-flex items-center"
+                  style={{
+                    background: 'transparent', border: 'none', padding: 0,
+                    color: !fromStart ? '#3b82f6' : OFF,
+                    fontSize: 9.5,
+                    fontFamily: 'ui-monospace, SFMono-Regular, monospace',
+                    lineHeight: 1.2,
+                    gap: 3,
+                  }}
+                  title="Fork starting point: from fork (blue) / from start (grey)"
+                >
+                  <span style={{ fontSize: 10, lineHeight: 1 }}>⑂</span>
+                  <span>fork</span>
+                </button>
+                {dot}
+              </>
+            )}
             <span
               className="inline-flex items-center"
               style={{ fontSize: 9.5, fontFamily: 'ui-monospace, SFMono-Regular, monospace', lineHeight: 1.2 }}

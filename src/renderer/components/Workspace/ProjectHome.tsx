@@ -82,6 +82,7 @@ interface TabHistoryEntry {
   codex_effort: string | null;
   message_count: number | null;
   session_status: string | null;
+  group_id: string | null;
 }
 
 interface FavoriteEntry {
@@ -497,6 +498,12 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     workspace ? Array.from(workspace.tabs.values()) : []
   ), [workspace, workspaceFingerprint]);
   const tabIdsKey = useMemo(() => tabs.map((tab) => tab.id).join('|'), [tabs]);
+  const resolveHistoryGroupId = useCallback((entry: TabHistoryEntry): string | undefined => {
+    const groupId = entry.group_id || undefined;
+    if (!groupId) return undefined;
+    const currentWorkspace = useWorkspaceStore.getState().openProjects.get(projectId);
+    return currentWorkspace?.tabGroups?.some(group => group.id === groupId) ? groupId : undefined;
+  }, [projectId]);
 
   useEffect(() => {
     const mountedAt = performance.now();
@@ -589,6 +596,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       codexModel: entry.codex_model || undefined,
       codexEffort: entry.codex_effort || undefined,
       sessionStatus: entry.session_status || undefined,
+      groupId: resolveHistoryGroupId(entry),
     });
 
     await ipcRenderer.invoke('project:delete-tab-history-entry', { id: entry.id });
@@ -631,6 +639,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       codexModel: entry.codex_model || undefined,
       codexEffort: entry.codex_effort || undefined,
       sessionStatus: entry.session_status || undefined,
+      groupId: resolveHistoryGroupId(entry),
       background: true,
     });
 

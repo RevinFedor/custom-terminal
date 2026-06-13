@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">Noted Terminal</h1>
   <p align="center">
-    Electron-терминал для разработки с Claude Code и Gemini CLI.<br/>
+    Electron-терминал для разработки с Claude Code и Codex CLI.<br/>
     Не обёртка — инфраструктура управления контекстом, памятью и историей AI-сессий.
   </p>
 </p>
@@ -14,15 +14,18 @@
 
 ## Проблема
 
-Все AI-инструменты теряют контекст: сессия закончилась → агент забыл всё. С 1M контекстом один агент умеет почти всё, но через 2 часа окно забито мусором — начинаешь заново или чистишь вручную.
+Все AI-инструменты теряют контекст: сессия закончилась → агент забыл всё. С 1M контекстом один агент умеет почти всё, но через 2 часа окно забито мусором — начинаешь заново или чистишь вручную. А когда параллельно открыто 5 сессий — ни одна не знает что делают остальные.
 
-**Noted Terminal даёт три вещи которых нет ни у Cursor, ни у Claude CLI:**
+**Noted Terminal даёт четыре вещи которых нет ни у Cursor, ни у CLI:**
 
 | | Возможность | Суть |
 |---|---|---|
 | 🔀 | **Fork / Rewind / Edit Range** | Git для диалогов с AI |
 | 🧠 | **Knowledge Base + Semantic Router** | Персистентная память проекта между сессиями |
 | 📊 | **Visual Timeline** | История как дерево, а не лог |
+| 🎛️ | **Cross-Session Access** | Любая вкладка читает и редактирует историю любой другой |
+
+> Под капотом — не spawn-subprocess-и-собери-stdout. Приложение **полностью парсит** PTY-поток и JSONL-транскрипты обоих CLI (Claude и Codex), превращая живую сессию в структурированное, адресуемое состояние. На этом стоит всё остальное.
 
 ---
 
@@ -33,7 +36,7 @@
 <details>
 <summary><b>Fork</b> — клонирование сессии в один клик</summary>
 
-Нажал кнопку → получил полную копию истории в новом табе, оригинал не тронут.
+Нажал кнопку → получил полную копию истории в новом табе, оригинал не тронут. `fs.copyFile` JSONL + перезапись всех `sessionId` на новый UUID (чтобы Timeline не показал ложную Clear-Context границу).
 
 Основной паттерн: **Fork → вырезать ненужное → продолжить с чистой историей.**
 
@@ -42,9 +45,9 @@
 <details>
 <summary><b>Edit Range</b> — компактирование мусора в резюме</summary>
 
-Выделяешь диапазон на Timeline (например 30 шагов где Claude не мог пройти тесты) → Gemini сжимает в резюме: *"пробовали X, Y, Z — не вышло, ошибка была в W"* → JSONL редактируется, Claude рестартует с чистым контекстом.
+Выделяешь диапазон на Timeline (например 30 шагов где агент не мог пройти тесты) → диапазон сжимается в одно резюме: *"пробовали X, Y, Z — не вышло, ошибка была в W"* → JSONL атомарно редактируется (backtrace + forward-expand + relink `parentUuid` + orphan cleanup), агент рестартует с чистым контекстом.
 
-Контекстное окно освободилось, суть сохранилась.
+Контекстное окно освободилось, суть сохранилась. Тот же движок доступен другим агентам через MCP (см. Cross-Session Access).
 
 </details>
 
@@ -81,14 +84,14 @@
                                                   ↓
               Haiku выбирает 2-4 релевантных файла по тегам и симптомам
                                                   ↓
-              Содержимое файлов инжектится в контекст Claude Code
+              Содержимое файлов инжектится в контекст агента
                                                   ↓
-              Claude сразу знает: "Axenta имеет telemetryAccountId: null,
+              Агент сразу знает: "Axenta имеет telemetryAccountId: null,
               искать нужно через userId"
 ```
 
 - **`???`** в промпте — ручной триггер, Haiku роутинг
-- **`docs_search` MCP** — Claude сам вызывает когда работает с незнакомой подсистемой
+- **`docs_search` MCP** — агент сам вызывает когда работает с незнакомой подсистемой
 - **`build-index.sh`** — офлайн-индексация: Haiku извлекает explicit-темы, implicit-концепции и symptoms из каждого файла
 
 > Новый агент (хоть другая модель через полгода) за 5 минут входит в проект на уровне, недостижимом для человека за неделю.
@@ -104,43 +107,88 @@
 - Session chain: `(root)` → `(plan mode)` → `(fork)` с маркером активной ветки
 - **History Panel:** полная markdown-рендеренная история с syntax highlighting и diff-view
 - Compact counter `♻️ ×N`, token usage, длительность каждого хода
+- Якоря: пользовательские заметки (фиолетовые), rewind-маркеры (розовые), docs-update индикаторы (зелёные)
 - Range copy: выбор диапазона сообщений для экспорта
 
 ---
 
-### 🤖 Orchestration (Gemini → Claude)
+### 🎛️ Cross-Session Access
 
-Gemini CLI в одном табе управляет Claude-агентами в других через **6 MCP V2 tools**.
+**Не оркестратор, раздающий задачи. Peer-модель: любая вкладка имеет доступ к любой другой.**
 
-> Не для параллельного кодинга (с 1M контекстом один агент справляется сам). Для случаев когда нужен **другой контекст**: фоновые тесты, аудит кода с чистого листа, автообновление документации.
+Claude Code в PTY-табе, Claude SDK-таб, Codex — любой локальный чат, подключённый к MCP, может **прочитать историю** и **отредактировать** любую другую сессию в приложении. Открыл 5 сессий (фича, багфикс, рефакторинг, форк) — спрашиваешь одну из них *«что сейчас делается в остальных и на чём они остановились»*, и получаешь ответ из распарсенных транскриптов, а не из догадок по имени вкладки.
 
-| Tool | Назначение |
-|------|-----------|
-| `delegate_to_claude` | Создать таб с Claude, отправить промпт |
-| `continue_claude` | Сообщение существующему агенту (auto-respawn при crash) |
-| `read_claude_history` | Что агент наделал (`summary` / `full` / `with_code`) |
-| `list_sub_agents` | Статусы `ACTIVE` / `IDLE` / `STOPPED` |
-| `close_sub_agent` | Graceful shutdown + архивация таба |
-| `update_docs` | Batch analysis → обновление knowledge/ |
+Работает это потому что весь парсинг JSONL обоих агентов экспонирован через HTTP в main process. Два глобальных stdio-MCP — тонкие обёртки над ним:
 
-**Response Queue:** zero-loss delivery, persistence в SQLite, восстановление после рестарта.
+<details open>
+<summary><b>overseer MCP</b> — контроль сессий (чтение + редактирование истории)</summary>
+
+Гранулярный доступ: агент **сам решает сколько контекста забрать**. Сначала карта сессии (только размеры), потом точечный pull нужных блоков. Сессия 19MB / 262 turn'а → читаемый overview за **~6K токенов** — без затягивания дампа в контекст.
+
+| Tool | |
+|------|--|
+| `list_open_sessions` | все Claude/Codex табы во всех проектах: sessionId, isLive, cwd, когда создан |
+| `session_stats` | масштаб без контента: turn count, char-counts по ролям, largest turns, compact'ы |
+| `list_turns` | карта ходов: preview + размеры thinking/text-блоков + имена tool_uses (контент НЕ грузится) |
+| `get_user_prompt` · `get_thinking` · `get_assistant_text` | точечный pull одного блока, byte-range для больших |
+| `list_notes` | пользовательские якоря на Timeline (заметки, rewind-маркеры, docs-edits) |
+| `fork_session` | клон сессии под новым UUID |
+| `propose_edit` | dry-run: что именно будет удалено, без записи на диск |
+| `apply_edit` | реальная правка JSONL через **те же IPC что Timeline-кнопка** (backtrace, relink, orphan cleanup, atomic write); auto-fork по умолчанию |
+
+**Safety:** первая правка сессии автоматически делает fork и оперирует на копии — оригинал нетронут, откат = закрыть таб форка. Редактирование никогда не пишет JSONL напрямую: только через обкатанные edit-range / delete-range пути, которые знают про compact-границы и parentUuid-цепочку.
+
+</details>
+
+<details>
+<summary><b>terminal MCP</b> — контроль вкладок (живые процессы)</summary>
+
+| Tool | |
+|------|--|
+| `list_tabs` | вкладки проекта: что запущено, PID, цвет, тип (claude / codex / devServer / shell) |
+| `run_command` · `restart_process` · `kill_process` | управление процессом в табе |
+| `read_output` | хвост вывода терминала |
+| `create_tab` · `run_chain` | создание вкладок, последовательные пайплайны |
+
+Project-scoped (фильтрует по cwd). Управляет **живым** состоянием, не историей.
+
+</details>
+
+> **Граница чёткая:** terminal MCP — *оператор* (что сейчас крутится, перезапустить/убить), overseer MCP — *историк/редактор* (что сессия сделала, прочитать/переписать). Разный blast radius: terminal может убить dev-сервер, overseer переписать транскрипт. Подключаешь оба, когда нужно и то и другое — конфликта нет, оба ходят в один main-process HTTP.
+
+**Типичный flow:** внешнему чату даёшь имя проекта → `list_open_sessions` показывает вкладки → `session_stats` + `list_turns` локализуют где мясо → `get_thinking` на ключевой ход → *«сессия багфикса застряла на 30 итерациях вокруг loader'а, не смогла поднять dev через MCP»*. Захотел почистить → `propose_edit` показывает план, `apply_edit` сжимает диапазон в summary на форке.
 
 ---
 
-### ⌨️ Claude TUI Control
+### ⌨️ TUI Control (Claude & Codex)
+
+Управление обоими CLI напрямую из UI — детерминированно, через парсинг PTY-потока, без `setTimeout`.
+
+**Claude**
 
 | Команда | Что делает |
 |---------|-----------|
-| `/model` | `default\|sonnet\|opus\|haiku` из UI-кнопки. Command Guard блокирует double operations |
-| `/effort` | `low\|medium\|high` — бюджет thinking tokens (5K/16K/50K) |
+| `/model` | `default \| sonnet \| opus \| haiku` из UI-кнопки. Command Guard блокирует double operations |
+| `/effort` | `low \| medium \| high \| xhigh \| max` — уровень reasoning (single source в `claudeLevels.ts`) |
 | `meta+t` | Think mode — парсинг picker menu, навигация стрелками |
-| Handshake | Автоматическая отправка промпта при старте (History Restore, Delegation) |
+| Stop hook | Детерминированный конец turn'а: `UserPromptSubmit`/`Stop` хуки → Unix socket → authoritative loader |
+
+**Codex**
+
+| Команда | Что делает |
+|---------|-----------|
+| `/model` | Два последовательных picker'а (модель → effort), парсинг через PTY-кадры, не таймауты |
+| `--model` / effort | Передаются прямо в process-start args (`-c 'model_reasoning_effort=...'`), не через TUI |
+| Draft stash | Native `Ctrl+C` сохраняет недописанный composer в history перед сменой модели |
+| Stop | `terminal:stop-ai-process` — controlled kill-ladder (`\x03` → SIGTERM → SIGKILL) по PID агента |
+
+> У Codex нет отдельного Think-toggle — reasoning effort идёт через тот же `/model` flow, что и модель. Loader держится на rollout-событиях `task_started` / `task_complete` / `turn_aborted`, а не на эвристиках спиннера.
 
 ---
 
 ### 📝 Docs Pipeline
 
-В конце сессии вставляешь промпт `docs-rules.prompt.md` → Claude анализирует изменения → обновляет `docs/knowledge/`. Фильтрация: только невидимый контекст (мотивация, шрамы, неочевидные связи — не пересказ кода). Индекс пересобирается через `build-index.sh`.
+В конце сессии вставляешь промпт `docs-rules.prompt.md` → агент анализирует изменения → обновляет `docs/knowledge/`. Фильтрация: только невидимый контекст (мотивация, шрамы, неочевидные связи — не пересказ кода). Индекс пересобирается через `build-index.sh`.
 
 ---
 
@@ -151,7 +199,7 @@ Gemini CLI в одном табе управляет Claude-агентами в 
 ```bash
 git clone https://github.com/RevinFedor/custom-terminal.git
 cd custom-terminal
-cp .env.example .env        # вписать GEMINI_API_KEY
+cp .env.example .env        # вписать API-ключи (см. комментарии внутри)
 npm install
 npm run dev                  # dev mode с hot-reload
 ```
@@ -161,6 +209,15 @@ npm run dev                  # dev mode с hot-reload
 ```bash
 npm run build:i              # собирает, копирует в /Applications, запускает
 ```
+
+**MCP-серверы** (overseer / terminal / knowledge) регистрируются глобально один раз:
+
+```bash
+claude mcp add overseer node ~/.claude/mcp/overseer-server.mjs --scope user
+claude mcp add terminal node ~/.claude/mcp/terminal-server.mjs --scope user
+```
+
+После этого любой агент в любом проекте получает к ним доступ.
 
 ## Tech Stack
 
@@ -173,6 +230,7 @@ npm run build:i              # собирает, копирует в /Applicatio
 | Styling | Tailwind CSS v4 |
 | DB | SQLite (sessions, projects, tabs) |
 | AI Rendering | react-markdown + remark-gfm + syntax-highlighter |
+| Agents | Claude Code (PTY + Agent SDK), Codex CLI (PTY) |
 
 ---
 
@@ -182,7 +240,7 @@ npm run build:i              # собирает, копирует в /Applicatio
 <summary><b>Event-Driven — ноль таймаутов</b></summary>
 
 Всё управление через события, не `setTimeout`:
-- `safePasteAndSubmit` с sync marker verification (`\x1b[?2026l]`)
+- `safePasteAndSubmit` с sync marker verification (`\x1b[?2026l`)
 - OSC 7777 маркеры → xterm.js IMarker на точную строку
 - OSC 133 детектит начало/конец команды, OSC 7 трекает CWD
 - Busy state: content-based Braille spinner detection (`✢✳✶✻✽`), 500ms debounce
@@ -191,26 +249,39 @@ npm run build:i              # собирает, копирует в /Applicatio
 </details>
 
 <details>
-<summary><b>JSONL Parsing</b></summary>
+<summary><b>PTY & JSONL Parsing — две модели транскрипта</b></summary>
 
-Полный парсинг Claude Code JSONL — структурированные данные, не скриншот:
+Приложение читает не скриншот терминала, а структурированный транскрипт. У двух агентов он устроен по-разному, и парсер это учитывает:
+
+**Claude — parentUuid DAG**
 - **Backtrace** — обратный обход `parentUuid` цепочки с пропуском Escape-отменённых веток
 - **Bridge following** — автоматический переход между файлами при Clear Context / Plan Mode
 - **Incremental reader** — async чтение только новых байт, race-safe снапшот перед `await`
-- **Compact boundary recovery** — двухуровневый fallback после `/compact`
-- **Sub-agent progress** — группировка по `parentToolUseID`, inline отображение в timeline
+- **Compact boundary recovery** — `compact_boundary` + `isCompactSummary` пишутся парой записей; двухуровневый fallback восстанавливает историю после `/compact`
+- **Sub-agent progress** — группировка по `parentToolUseID`, inline в timeline
+
+**Codex — линейный rollout**
+- Session id из `session_meta.payload.id` в `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (append-only, парсер игнорирует битый хвост)
+- Timeline из `event_msg.user_message` + `turn_context` (model/effort) + `token_count` (context% / rate-limits)
+- History из `response_item`: reasoning summary → thinking, message → ответ, `function_call` + output → tool card
+- Compact из top-level `type:"compacted"` с `payload.replacement_history`; `thread_rolled_back` откатывает turn'ы
+- Нет parentUuid-DAG: turn-grouping линейное, что упрощает edit (вырезать по индексам, без relink цепочки)
+
+Обе модели отдаются через единый HTTP-слой в main, поверх которого работают Timeline UI, History Panel и overseer MCP.
 
 </details>
 
 <details>
 <summary><b>Session Management</b></summary>
 
-Три метода детекции sessionId:
-- **StatusLine Bridge:** shell script после каждого ответа Claude → `~/.claude/bridge/`
+**Claude** — три метода детекции sessionId:
+- **StatusLine Bridge:** shell script после каждого ответа Claude → `~/.claude/bridge/` (с защитой от stale-takeover: проверка `updated_at` + `transcript_path` + ppid)
 - **Sniper Watcher:** `fs.watch` + 1s polling fallback, snapshot filtering
 - **Manual entry:** real-time validation на диске
 
-Session chain resolution: автоматический обход Plan Mode / Clear Context / Fork через `resolveSessionChain()` (backward walk) и `resolveLatestSessionInChain()` (forward walk).
+Session chain resolution: обход Plan Mode / Clear Context / Fork через `resolveSessionChain()` (backward) и `resolveLatestSessionInChain()` (forward).
+
+**Codex** — `codexKnownSessions` Map из rollout-watcher'а: нет statusline-bridge, durable state — сам rollout JSONL. Resume/fork восстанавливаются из транскрипта, не из RAM. Для `codex-f` (fork) watcher принимает файл по cwd-match или по `sourceSessionId` внутри JSONL.
 
 </details>
 
@@ -228,11 +299,12 @@ Session chain resolution: автоматический обход Plan Mode / Cl
 <summary><b>Workspace & Projects</b></summary>
 
 Multi-project: каждый проект = набор табов + sessions + notes.
-- Auto-naming (`claude-N`, `gemini-N`, `docs-XX`), colors, drag-and-drop
+- Левый `TabSidebar` (drag-resize), tab-группы, visual-child вкладки (fork → visual child источника)
+- Auto-naming (`claude-N`, `codex-N`, `docs-XX`), AI auto-title по первому prompt, цвета, drag-and-drop
 - Multi-select: Shift+Click range, Cmd+Click toggle, batch operations
 - SQLite persistence с safety guard (no silent data loss)
 - Terminal buffer serialization: save/restore при switch между табами
-- Dashboard: процесс-мониторинг (In-App vs External), stop button
+- Dashboard: процесс-мониторинг (In-App vs External), stop button, Tab History (reopen закрытых)
 
 </details>
 
@@ -240,14 +312,14 @@ Multi-project: каждый проект = набор табов + sessions + no
 
 ## Testing
 
-Two-tier:
+Two-tier + live MCP:
 
 | Уровень | Runtime | Скорость | Что тестирует |
 |---------|---------|----------|--------------|
 | Headless | Node.js | <1s | JSONL parsing, backtrace, TUI markers |
-| E2E | Playwright + Electron | 15-60s | Store polling, OSC signals, real PTY |
+| E2E | Electron + `mcp__electron__*` | 15-60s | Store polling, OSC signals, real PTY, drag/IPC/dialog |
 
-Event-driven: `waitForClaudeSessionId`, `findInLogs('BoundaryMarker')`, no `waitForTimeout`.
+Event-driven: `waitForClaudeSessionId`, `findInLogs('BoundaryMarker')`, no `waitForTimeout`. Методология — глобальный skill `electron-e2e-testing`.
 
 ---
 

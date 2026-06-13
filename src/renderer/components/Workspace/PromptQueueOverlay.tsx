@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Trash2 } from 'lucide-react';
+import { ChevronLeft, Plus, Trash2 } from 'lucide-react';
 import { makeDefaultPromptTitle, usePromptQueueStore, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -66,13 +66,20 @@ const EDITOR_WIDTH = 380;
 const EDITOR_MARGIN = 8;
 const EDITOR_TITLE_HEIGHT = 24;
 const EDITOR_TEXTAREA_MIN_HEIGHT = 64;
+const EDITOR_MIN_WIDTH = 280;
+const EDITOR_MIN_HEIGHT = 96;
+const EDITOR_MAX_WIDTH = 760;
+const COLLAPSED_RAIL_WIDTH = 36;
+const COLLAPSED_RAIL_GAP = 4;
+const PANEL_SLIDE_MS = 100;
 
 // Which screen edge the overlay is docked to. The panel is pinned by this edge
 // (it never moves), and the resize handle lives on the OPPOSITE (free) edge so
 // dragging only grows/shrinks toward the available space — per
 // `🧩 Code-Patterns/.../tooltip-resize-modal.md`: «resize только в сторону,
-// противоположную опорной границе». Today the overlay sits top-RIGHT
-// (style `right: 8`), so anchor = 'right' → handle on the LEFT → drag-left grows.
+// противоположную опорной границе». Today the overlay sits flush against the
+// terminal's RIGHT edge (left of Timeline), so anchor = 'right' → handle on the
+// LEFT → drag-left grows.
 // When the menu later moves to the left side, flip this to 'left' (and swap the
 // style to `left: 8`) — the handle auto-moves to the right, no other change.
 const ANCHOR_SIDE: 'left' | 'right' = 'right';
@@ -85,6 +92,8 @@ function chipTitle(item: QueuedPrompt): string {
 }
 
 type QueueAgent = 'claude' | 'codex';
+type EditorAnchorMode = 'panel' | 'list';
+type EditorResizeDirection = 'left' | 'bottom' | 'bottom-left';
 
 const AGENT_LABEL: Record<QueueAgent, string> = {
   claude: 'Claude',
@@ -159,11 +168,17 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
   // Anchor for the editor modal — when set, the modal aligns its right edge to this rect's left edge
   // and its top edge to this rect's top edge. null = anchor to the whole panel's top-right corner.
   const [editorAnchor, setEditorAnchor] = useState<{ top: number; right: number; maxHeight: number } | null>(null);
+  const [editorSize, setEditorSize] = useState<{ width: number; height: number | null }>({
+    width: EDITOR_WIDTH,
+    height: null,
+  });
   const [appearingIds, setAppearingIds] = useState<Set<string>>(new Set());
   const [savedFlashIds, setSavedFlashIds] = useState<Set<string>>(new Set());
+  const [titleLoadingIds, setTitleLoadingIds] = useState<Set<string>>(new Set());
   const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
   const [removeHoverId, setRemoveHoverId] = useState<string | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const chipListRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
   const editorTitleInputRef = useRef<HTMLInputElement>(null);
   const editorTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -250,6 +265,12 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
   // race (queue actions are independent per chip).
   const [replayingIds, setReplayingIds] = useState<Set<string>>(new Set());
   const replayingIdsRef = useRef<Set<string>>(new Set());
+  const [replayHoverId, setReplayHoverId] = useState<string | null>(null);
+  const [cmdPressed, setCmdPressed] = useState(false);
+  const cmdPressedRef = useRef(false);
+  const [collapsed, setCollapsed] = useState(true);
+  const [panelClosing, setPanelClosing] = useState(false);
+  const collapseTimerRef = useRef<number | null>(null);
   const prevHintRef = useRef(false);
   useEffect(() => {
     if (firstChipArmedHint && !prevHintRef.current) {
@@ -317,6 +338,18 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
     }, 560);
   }, []);
 
+  const setTitleLoading = useCallback((id: string, loading: boolean) => {
+    setTitleLoadingIds((prev) => {
+      const has = prev.has(id);
+      if (loading && has) return prev;
+      if (!loading && !has) return prev;
+      const next = new Set(prev);
+      if (loading) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }, []);
+
   const animateRemovePrompt = useCallback((id: string) => {
     if (removingIdsRef.current.has(id)) return;
     removingIdsRef.current.add(id);
@@ -340,8 +373,9 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
 
   const generateRunAfterTitle = useCallback((id: string, text: string) => {
     const source = trimTabTitlePrompt(text.trim());
-    if (!source || titleGeneratingIdsRef.current.has(id)) return;
+    if (!source || titleGeneratingIdsRef.current.has(id)) return false;
     titleGeneratingIdsRef.current.add(id);
+    setTitleLoading(id, true);
     void (async () => {
       try {
         const promptConfig = usePromptsStore.getState().getPromptById(RUN_AFTER_TITLE_PROMPT_ID);
@@ -357,9 +391,11 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
         markSaved(id);
       } finally {
         titleGeneratingIdsRef.current.delete(id);
+        setTitleLoading(id, false);
       }
     })();
-  }, [markSaved, tabId, updatePrompt]);
+    return true;
+  }, [markSaved, setTitleLoading, tabId, updatePrompt]);
 
   const commitEditor = useCallback((opts?: { close?: boolean }) => {
     if (!editorOpen || committingRef.current) return false;
@@ -408,8 +444,8 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
         }
       } else {
         const id = addPrompt(tabId, text, undefined, undefined, normalizedTitle);
-        markAppearing(id);
-        if (!normalizedTitle) generateRunAfterTitle(id, text);
+        const titleWillGenerate = !normalizedTitle && generateRunAfterTitle(id, text);
+        if (!titleWillGenerate) markAppearing(id);
         changed = true;
       }
 
@@ -449,7 +485,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
     return true;
   }, [blurActiveElement, commitEditor, editingId, editorOpen, editorPinned, isPostPromptMode, suppressChipReopen]);
 
-  const anchorEditor = useCallback((id?: string) => {
+  const anchorEditor = useCallback((id?: string, anchorMode: EditorAnchorMode = 'list') => {
     const panelRect = panelRef.current?.getBoundingClientRect();
     if (!panelRect) return null;
     const anchorRight = window.innerWidth - panelRect.left + 8; // 8px gap
@@ -459,11 +495,70 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
       if (!it) return null;
       const chipRect = chipRefs.current.get(id)?.getBoundingClientRect();
       if (chipRect) anchorTop = chipRect.top;
+    } else if (anchorMode === 'list') {
+      const listRect = chipListRef.current?.getBoundingClientRect();
+      if (listRect) anchorTop = listRect.top;
     }
     anchorTop = Math.max(EDITOR_MARGIN, anchorTop);
     const maxHeight = Math.max(96, window.innerHeight - anchorTop - EDITOR_MARGIN);
     return { top: anchorTop, right: anchorRight, maxHeight };
   }, [tabId]);
+
+  const startEditorResize = useCallback((e: React.MouseEvent, direction: EditorResizeDirection) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = editorRef.current?.getBoundingClientRect();
+    if (!rect || !editorAnchor) return;
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startWidth = rect.width;
+    const startHeight = rect.height;
+    const rightEdge = window.innerWidth - editorAnchor.right;
+    const maxWidth = Math.max(
+      EDITOR_MIN_WIDTH,
+      Math.min(EDITOR_MAX_WIDTH, rightEdge - EDITOR_MARGIN)
+    );
+    const maxHeight = Math.max(
+      EDITOR_MIN_HEIGHT,
+      window.innerHeight - editorAnchor.top - EDITOR_MARGIN
+    );
+    const prevCursor = document.body.style.cursor;
+    const prevUserSelect = document.body.style.userSelect;
+    document.body.style.cursor =
+      direction === 'bottom' ? 'ns-resize' :
+      direction === 'left' ? 'ew-resize' :
+      'nesw-resize';
+    document.body.style.userSelect = 'none';
+
+    const onMove = (ev: MouseEvent) => {
+      setEditorSize((prev) => {
+        const next = { ...prev };
+        if (direction === 'left' || direction === 'bottom-left') {
+          next.width = Math.max(
+            EDITOR_MIN_WIDTH,
+            Math.min(maxWidth, startWidth + (startX - ev.clientX))
+          );
+        }
+        if (direction === 'bottom' || direction === 'bottom-left') {
+          next.height = Math.max(
+            EDITOR_MIN_HEIGHT,
+            Math.min(maxHeight, startHeight + (ev.clientY - startY))
+          );
+        }
+        return next;
+      });
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevUserSelect;
+    };
+
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }, [editorAnchor]);
 
   const openEditor = useCallback((id?: string, mode: 'hover' | 'pin' = 'pin') => {
     if (id && mode === 'hover' && isChipReopenSuppressed(id)) return;
@@ -550,7 +645,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
       return;
     }
     if (editorOpen) commitEditor();
-    const anchor = anchorEditor();
+    const anchor = anchorEditor(undefined, 'panel');
     if (!anchor) return;
     setEditorText(postPromptText);
     setEditorTitle('');
@@ -575,6 +670,8 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
     const onMouseDown = (e: MouseEvent) => {
       const target = e.target as Node | null;
       if (!target) return;
+      const targetElement = target instanceof Element ? target : null;
+      if (targetElement?.closest('[data-editor-trigger]')) return;
       if (editorRef.current?.contains(target)) return;
       const replayButton = editingId ? replayButtonRefs.current.get(editingId) : null;
       if (replayButton?.contains(target)) return;
@@ -613,6 +710,11 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
     if (!editorOpen || !editorAnchor) return;
     const textarea = editorTextareaRef.current;
     if (!textarea) return;
+    if (editorSize.height !== null) {
+      textarea.style.height = 'auto';
+      textarea.style.overflowY = 'auto';
+      return;
+    }
     const chromeHeight = isPostPromptMode ? 0 : EDITOR_TITLE_HEIGHT + 1;
     const maxTextareaHeight = Math.max(
       EDITOR_TEXTAREA_MIN_HEIGHT,
@@ -625,7 +727,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
     );
     textarea.style.height = `${nextHeight}px`;
     textarea.style.overflowY = textarea.scrollHeight > maxTextareaHeight ? 'auto' : 'hidden';
-  }, [editorAnchor, editorOpen, editorText, isPostPromptMode]);
+  }, [editorAnchor, editorOpen, editorSize.height, editorText, isPostPromptMode]);
 
   useEffect(() => {
     if (!editingId) return;
@@ -646,10 +748,10 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
   }, [tabId]);
 
   // Replay handler — paste chip's text into the agent's current input WITHOUT
-  // touching stash and WITHOUT submitting. On success the chip is removed
-  // from the queue (the prompt has "moved" into the agent's input). On failure
-  // chip stays so user can retry.
-  const replayChip = useCallback(async (id: string, text: string) => {
+  // touching stash. Normal click leaves it for review; Cmd+click also submits
+  // immediately (same as user pressing Enter after paste). On success the chip
+  // is removed from the queue (the prompt has "moved" into the agent input).
+  const replayChip = useCallback(async (id: string, text: string, opts?: { submit?: boolean }) => {
     // Guard against double-click while the previous IPC roundtrip is still
     // in flight — second click would queue a second bracketed paste against
     // the same chip, then a second removePrompt against an already-gone id.
@@ -662,12 +764,24 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
       return next;
     });
     try {
-      const res = await ipcRenderer.invoke(sessionType + ':append-input', tabId, text);
+      const submitNow = opts?.submit === true;
+      const res = await ipcRenderer.invoke(sessionType + ':append-input', tabId, text, {
+        submit: submitNow,
+      });
       if (!res || !res.success) {
         const err = res?.error || 'unknown';
         showToast('Replay failed: ' + err, 'error');
         console.warn('[PromptQueue] replay failed:', err);
         return;
+      }
+      if (submitNow && res.submitted !== true) {
+        // Current dev main may still run the old append-input handler that
+        // ignores the submit option. It still returns only after the paste path
+        // finished, so send a separate Enter with the same conservative timing:
+        // Codex/Gemini-style fast paste needs the 500ms delay from safePaste,
+        // Claude slow paste has already waited for Ink's sync marker.
+        await new Promise((resolve) => window.setTimeout(resolve, sessionType === 'codex' ? 500 : 150));
+        ipcRenderer.send('terminal:input', tabId, '\r');
       }
       // Paste succeeded — chip has effectively moved into agent input, drop
       // it from the queue so it cannot be double-fired by Run after later.
@@ -691,6 +805,28 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
     }
   }, [tabId, sessionType, showToast, focusActiveTerminal, removePrompt]);
 
+  useEffect(() => {
+    const setCmd = (value: boolean) => {
+      cmdPressedRef.current = value;
+      setCmdPressed(value);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.metaKey) setCmd(true);
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Meta') setCmd(false);
+    };
+    const onBlur = () => setCmd(false);
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
+    };
+  }, []);
+
   const grabCurrent = useCallback(async () => {
     try {
       const res = await ipcRenderer.invoke(sessionType + ':grab-input', tabId);
@@ -702,8 +838,8 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
           return;
         }
         const id = addPrompt(tabId, t, res.images || 0, Array.isArray(res.imagePaths) ? res.imagePaths : undefined);
-        markAppearing(id);
-        generateRunAfterTitle(id, t);
+        const titleWillGenerate = generateRunAfterTitle(id, t);
+        if (!titleWillGenerate) markAppearing(id);
         // No success toast on queue-add — the new chip appearing in the overlay
         // is its own confirmation; the toast was redundant noise (user request).
         // Refocus so the agent re-reads the (now empty) tempfile immediately — without
@@ -740,6 +876,37 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
     }
   }, [autoRun, tabId, setAutoRun]);
 
+  const expandPanel = useCallback(() => {
+    if (collapseTimerRef.current !== null) {
+      window.clearTimeout(collapseTimerRef.current);
+      collapseTimerRef.current = null;
+    }
+    setPanelClosing(false);
+    setCollapsed(false);
+  }, []);
+
+  const collapsePanel = useCallback(() => {
+    commitEditor();
+    if (collapseTimerRef.current !== null) {
+      window.clearTimeout(collapseTimerRef.current);
+    }
+    setPanelClosing(true);
+    collapseTimerRef.current = window.setTimeout(() => {
+      setCollapsed(true);
+      setPanelClosing(false);
+      collapseTimerRef.current = null;
+    }, PANEL_SLIDE_MS);
+  }, [commitEditor]);
+
+  useEffect(() => {
+    return () => {
+      if (collapseTimerRef.current !== null) {
+        window.clearTimeout(collapseTimerRef.current);
+        collapseTimerRef.current = null;
+      }
+    };
+  }, []);
+
   // ─── drag-and-drop reorder ───────────────────────────────────────────────
   const onDragStart = (id: string) => (e: React.DragEvent) => {
     setDragId(id);
@@ -763,34 +930,61 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
   // chipRefs is still used: openEditor() needs each chip's top coordinate to
   // anchor the editor slideout next to the clicked chip.
   const chipRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const panelOpen = !collapsed || panelClosing;
+  const arrowExpanded = !collapsed && !panelClosing;
+  const addEditorActive = editorOpen && !isPostPromptMode && editingId === null;
 
   // ─── render ──────────────────────────────────────────────────────────────
   return (
     <>
-      {/* Main overlay — top-right, absolute over the AI terminal area */}
+      {/* Main overlay — terminal-right, directly left of Timeline. The outer
+          wrapper is intentionally transparent: the control rail lives outside
+          the Run after panel, while the panel itself opens to the rail's left. */}
       <div
         ref={panelRef}
         style={{
           position: 'absolute',
-          top: 8,
+          top: 0,
           // Anchored edge — pinned, never moves during resize.
-          ...(ANCHOR_SIDE === 'right' ? { right: 8 } : { left: 8 }),
+          ...(ANCHOR_SIDE === 'right' ? { right: 0 } : { left: 0 }),
           // FIXED width (was `fit-content` clamped [min,max] → reflowed on +grab).
           // Drag-resizable via the handle on the free edge below.
-          width: effectiveWidth,
-          background: PANEL_BG,
-          border: `1px solid ${BORDER}`,
-          borderRadius: 6,
-          backdropFilter: 'blur(8px)',
+          width: panelOpen ? effectiveWidth + COLLAPSED_RAIL_GAP + COLLAPSED_RAIL_WIDTH : COLLAPSED_RAIL_WIDTH,
+          background: 'transparent',
+          border: 'none',
+          borderRadius: 0,
           zIndex: 50,
           fontSize: 11,
           color: '#ddd',
-          maxHeight: 'calc(100% - 16px)',
+          maxHeight: '100%',
           display: 'flex',
-          flexDirection: 'column',
-          overflow: 'hidden',
+          alignItems: 'flex-start',
+          justifyContent: ANCHOR_SIDE === 'right' ? 'flex-end' : 'flex-start',
+          gap: panelOpen ? COLLAPSED_RAIL_GAP : 0,
+          overflow: 'visible',
+          transition: `width ${PANEL_SLIDE_MS}ms ease-out`,
+          boxSizing: 'border-box',
         }}
       >
+        {panelOpen && (
+          <div
+            className={panelClosing ? 'pq-panel-closing' : 'pq-panel-opening'}
+            style={{
+              position: 'relative',
+              width: effectiveWidth,
+              background: PANEL_BG,
+              border: `1px solid ${BORDER}`,
+              borderRadius: 6,
+              backdropFilter: 'blur(8px)',
+              maxHeight: '100%',
+              display: 'flex',
+              flexDirection: 'column',
+              overflow: 'hidden',
+              boxSizing: 'border-box',
+              flexShrink: 0,
+              zIndex: 1,
+            }}
+          >
         {/* Resize handle on the FREE edge (opposite the anchor). Drag changes
             width only; height is governed by chip line-clamp in Settings, not
             here. `data-cmd-hover-popover` so a Cmd+Shift-pinned popover elsewhere
@@ -1086,6 +1280,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
               Post
             </button>
             <button
+              data-editor-trigger="post"
               onClick={openPostPromptEditor}
               title="Edit post-prompt text"
               style={{
@@ -1128,20 +1323,23 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
         )}
 
         {/* Chip list */}
-        <div style={{ overflowY: 'auto', flex: 1 }}>
+        <div ref={chipListRef} style={{ overflowY: 'auto', flex: 1 }}>
           {items.length === 0 && (
             <div style={{ padding: '4px 8px', fontSize: 9, color: TEXT_DIM, textAlign: 'center', lineHeight: 1.2 }}>
               empty
             </div>
           )}
           {items.map((it, idx) => {
-            const title = chipTitle(it);
+            const isTitleLoading = titleLoadingIds.has(it.id) && !it.titleManual;
+            const title = isTitleLoading ? '' : chipTitle(it);
             const isMultiLine = chipLineClamp > 1;
             const isEditing = editorOpen && editingId === it.id;
             const isDragOver = dragOverIdx === idx;
             const isDragging = dragId === it.id;
             const isRemoveHovered = removeHoverId === it.id;
             const isRemoving = removingIds.has(it.id);
+            const isReplayHovered = replayHoverId === it.id;
+            const isReplaySubmitMode = isReplayHovered && cmdPressed && !replayingIds.has(it.id);
             const chipClass = [
               'pq-chip',
               appearingIds.has(it.id) ? 'pq-chip-enter' : '',
@@ -1186,7 +1384,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
                   margin: '2px 5px',
                   border: isRemoveHovered
                     ? `1px solid ${DELETE_RED}`
-                    : (isEditing && editorPinned ? '1px solid rgba(255,255,255,0.62)' : `1px solid ${BORDER}`),
+                    : (isEditing && editorPinned ? '1px solid rgba(190,190,190,0.34)' : `1px solid ${BORDER}`),
                   borderRadius: 7,
                   background: isRemoveHovered
                     ? `${DELETE_RED}18`
@@ -1223,33 +1421,63 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
                   onClick={(e) => {
                     e.stopPropagation();
                     const latestText = usePromptQueueStore.getState().getQueue(tabId).items.find((p) => p.id === it.id)?.text ?? it.text;
-                    replayChip(it.id, latestText);
+                    replayChip(it.id, latestText, { submit: e.metaKey || cmdPressedRef.current });
                   }}
-                  title={replayingIds.has(it.id) ? 'Replay in progress…' : 'Replay: paste into ' + agentLabel + ' input (no submit)'}
+                  title={
+                    replayingIds.has(it.id)
+                      ? 'Replay in progress…'
+                      : (isReplaySubmitMode
+                        ? '⌘+click: paste and send'
+                        : 'Replay: paste into ' + agentLabel + ' input. Hold ⌘ to send')
+                  }
                   style={{
-                    background: replayingIds.has(it.id) ? `${TINT}26` : 'transparent',
-                    border: 'none',
-                    color: replayingIds.has(it.id) ? TINT : TEXT_MUTED,
+                    background: replayingIds.has(it.id)
+                      ? `${TINT}26`
+                      : (isReplaySubmitMode
+                        ? `${SAVE_GREEN}30`
+                        : (isReplayHovered ? `${TINT}26` : 'transparent')),
+                    border: isReplaySubmitMode ? `1px solid ${SAVE_GREEN}88` : '1px solid transparent',
+                    color: replayingIds.has(it.id)
+                      ? TINT
+                      : (isReplaySubmitMode ? SAVE_GREEN : (isReplayHovered ? TINT : TEXT_MUTED)),
                     cursor: replayingIds.has(it.id) ? 'default' : 'pointer',
                     padding: 0, lineHeight: 1, fontSize: 10,
                     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
                     width: 16, height: 16, borderRadius: 999,
-                    transition: 'all 0.12s',
+                    transition: 'background 0.12s, border-color 0.12s, color 0.12s',
                     flexShrink: 0,
+                    boxSizing: 'border-box',
                   }}
                   onMouseEnter={(e) => {
                     if (replayingIds.has(it.id)) return;
+                    setReplayHoverId(it.id);
+                    const effectiveCmd = e.metaKey || cmdPressedRef.current;
+                    cmdPressedRef.current = effectiveCmd;
+                    setCmdPressed(effectiveCmd);
                     openEditor(it.id, 'hover');
-                    (e.currentTarget as HTMLElement).style.background = `${TINT}26`;
-                    (e.currentTarget as HTMLElement).style.color = TINT;
                   }}
-                  onMouseLeave={(e) => {
+                  onMouseMove={(e) => {
                     if (replayingIds.has(it.id)) return;
-                    (e.currentTarget as HTMLElement).style.background = 'transparent';
-                    (e.currentTarget as HTMLElement).style.color = TEXT_MUTED;
+                    cmdPressedRef.current = e.metaKey;
+                    setCmdPressed(e.metaKey);
+                  }}
+                  onMouseLeave={() => {
+                    if (replayingIds.has(it.id)) return;
+                    setReplayHoverId((cur) => cur === it.id ? null : cur);
                   }}
                 >{replayingIds.has(it.id) ? <span className="pq-spinner" /> : '▶'}</button>
-                {isMultiLine ? (
+                {isTitleLoading ? (
+                  <span style={{
+                    flex: 1,
+                    minWidth: 0,
+                    minHeight: 14,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    color: TEXT_DIM,
+                  }}>
+                    <span className="pq-spinner" style={{ width: 9, height: 9, borderWidth: 1.25 }} />
+                  </span>
+                ) : isMultiLine ? (
                   <span style={{
                     flex: 1, minWidth: 0, fontSize: 11, lineHeight: '14px',
                     display: '-webkit-box',
@@ -1298,31 +1526,107 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
             style={{ flex: 1, padding: '6px 4px', background: 'transparent', border: 'none', borderRight: `1px solid ${BORDER}`, color: '#aaa', cursor: 'pointer', fontSize: 10 }}
           >+ grab</button>
           <button
+            data-editor-trigger="add"
             onClick={() => openEditor()}
-            style={{ flex: 1, padding: '6px 4px', background: 'transparent', border: 'none', color: '#aaa', cursor: 'pointer', fontSize: 10 }}
+            style={{
+              flex: 1,
+              padding: '6px 4px',
+              background: addEditorActive ? `${TINT}26` : 'transparent',
+              border: 'none',
+              color: addEditorActive ? TINT : '#aaa',
+              cursor: 'pointer',
+              fontSize: 10,
+              transition: 'background 0.12s, color 0.12s',
+            }}
           >+ add</button>
+        </div>
+          </div>
+        )}
+        <div
+          className="pq-collapsed-rail"
+          style={{
+            width: COLLAPSED_RAIL_WIDTH,
+            position: 'relative',
+            zIndex: 2,
+            padding: '4px 3px',
+            boxSizing: 'border-box',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: 4,
+            flexShrink: 0,
+          }}
+        >
+          <button
+            className="pq-rail-button"
+            onClick={() => {
+              if (collapsed || panelClosing) {
+                expandPanel();
+              } else {
+                collapsePanel();
+              }
+            }}
+            title={(collapsed || panelClosing) ? 'Expand Run after' : 'Collapse Run after'}
+            aria-label={(collapsed || panelClosing) ? 'Expand Run after' : 'Collapse Run after'}
+          >
+            <ChevronLeft
+              className="pq-rail-chevron"
+              size={18}
+              strokeWidth={2.1}
+              style={{ transform: arrowExpanded ? 'rotate(180deg)' : 'rotate(0deg)' }}
+            />
+          </button>
+          <button
+            className="pq-rail-button"
+            title={(autoRun ? 'Run after on' : 'Run after off') + ' · ' + items.length + ' queued'}
+            aria-label={(autoRun ? 'Run after on' : 'Run after off') + ', ' + items.length + ' queued'}
+            style={{
+              background: autoRun ? '#2b2340' : (items.length ? '#242424' : '#2a1a14'),
+              borderColor: autoRun ? '#8b75d9' : (items.length ? '#4a4a4a' : '#8a4a37'),
+              color: autoRun ? PULSE : (items.length ? '#e5e5e5' : TINT),
+              fontSize: items.length > 0 ? 12 : 18,
+              fontWeight: items.length > 0 ? 700 : 500,
+              cursor: 'default',
+              lineHeight: 1,
+            }}
+          >
+            {items.length > 0 ? (items.length > 99 ? '99' : items.length) : '•'}
+          </button>
+          <button
+            className="pq-rail-button pq-rail-primary"
+            onClick={grabCurrent}
+            title="+ grab"
+            aria-label="Grab current input"
+          >
+            <Plus size={18} strokeWidth={2.2} />
+          </button>
         </div>
       </div>
 
       {/* Editor slideout — docked to the LEFT of the queue panel, no scrim.
-          Anchored by editorAnchor: top aligned to chip top (edit) or panel top (new). */}
-      {editorOpen && editorAnchor && (
+          Anchored by editorAnchor: top aligned to chip/list/panel, right edge stays fixed.
+          Resize is only on the free edges: left, bottom, bottom-left corner. */}
+      {!collapsed && !panelClosing && editorOpen && editorAnchor && (
         <div
           ref={editorRef}
           style={{
             position: 'fixed',
             top: editorAnchor.top,
             right: editorAnchor.right,
-            width: EDITOR_WIDTH,
+            width: editorSize.width,
+            height: editorSize.height ?? undefined,
+            minWidth: EDITOR_MIN_WIDTH,
+            minHeight: EDITOR_MIN_HEIGHT,
             maxHeight: editorAnchor.maxHeight,
             background: PANEL_BG,
-            border: editorPinned ? '1px solid rgba(255,255,255,0.72)' : `1px solid ${BORDER}`,
+            border: editorPinned ? '1px solid rgba(190,190,190,0.36)' : `1px solid ${BORDER}`,
             borderRadius: 6,
-            boxShadow: editorPinned ? '0 0 0 1px rgba(255,255,255,0.18)' : 'none',
+            boxShadow: editorPinned ? '0 0 0 1px rgba(190,190,190,0.10)' : 'none',
             backdropFilter: 'blur(8px)',
             zIndex: 60,
             display: 'flex', flexDirection: 'column',
             overflow: 'hidden',
+            boxSizing: 'border-box',
           }}
           onMouseDown={(e) => e.stopPropagation()}
           onClick={(e) => e.stopPropagation()}
@@ -1377,15 +1681,60 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
               if (e.key === 'Enter' && e.metaKey) commitEditor();
             }}
             style={{
-              flex: '0 0 auto',
+              flex: editorSize.height !== null ? '1 1 auto' : '0 0 auto',
               minHeight: EDITOR_TEXTAREA_MIN_HEIGHT,
-              maxHeight: editorAnchor.maxHeight - (isPostPromptMode ? 0 : EDITOR_TITLE_HEIGHT + 1),
+              maxHeight: editorSize.height !== null ? 'none' : editorAnchor.maxHeight - (isPostPromptMode ? 0 : EDITOR_TITLE_HEIGHT + 1),
               background: '#0e0e0e', color: '#ddd',
               border: 'none', padding: '6px 8px',
               fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12,
               resize: 'none', outline: 'none',
-              overflowY: 'hidden',
+              overflowY: editorSize.height !== null ? 'auto' : 'hidden',
               boxSizing: 'border-box',
+            }}
+          />
+          <div
+            className="pq-editor-resize-handle"
+            data-cmd-hover-popover
+            onMouseDown={(e) => startEditorResize(e, 'left')}
+            title="Потяни — изменить ширину"
+            style={{
+              position: 'absolute',
+              left: 0,
+              top: 0,
+              bottom: 0,
+              width: 7,
+              cursor: 'ew-resize',
+              zIndex: 70,
+            }}
+          />
+          <div
+            className="pq-editor-resize-handle"
+            data-cmd-hover-popover
+            onMouseDown={(e) => startEditorResize(e, 'bottom')}
+            title="Потяни — изменить высоту"
+            style={{
+              position: 'absolute',
+              left: 0,
+              right: 0,
+              bottom: 0,
+              height: 7,
+              cursor: 'ns-resize',
+              zIndex: 70,
+            }}
+          />
+          <div
+            className="pq-editor-resize-handle pq-editor-resize-corner"
+            data-cmd-hover-popover
+            onMouseDown={(e) => startEditorResize(e, 'bottom-left')}
+            title="Потяни — изменить размер"
+            style={{
+              position: 'absolute',
+              left: 0,
+              bottom: 0,
+              width: 15,
+              height: 15,
+              cursor: 'nesw-resize',
+              zIndex: 71,
             }}
           />
         </div>
@@ -1430,6 +1779,88 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy }: Props) {
           border-right-color: transparent;
           animation: pq-spin 0.7s linear infinite;
           display: inline-block;
+        }
+        .pq-panel-opening {
+          transform-origin: right top;
+          animation: pq-panel-open ${PANEL_SLIDE_MS}ms ease-out both;
+        }
+        .pq-panel-closing {
+          pointer-events: none;
+          transform-origin: right top;
+          animation: pq-panel-close ${PANEL_SLIDE_MS}ms ease-in both;
+        }
+        @keyframes pq-panel-open {
+          0% {
+            transform: translateX(calc(100% + ${COLLAPSED_RAIL_GAP}px));
+          }
+          100% {
+            transform: translateX(0);
+          }
+        }
+        @keyframes pq-panel-close {
+          0% {
+            transform: translateX(0);
+          }
+          100% {
+            transform: translateX(calc(100% + ${COLLAPSED_RAIL_GAP}px));
+          }
+        }
+        .pq-rail-chevron {
+          transition: transform ${PANEL_SLIDE_MS}ms ease-in-out;
+        }
+        .pq-rail-button {
+          border: 1px solid #8a4a37;
+          background: #2a1a14;
+          color: ${TINT};
+          cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          box-sizing: border-box;
+          width: 30px;
+          min-width: 30px;
+          max-width: 30px;
+          height: 30px;
+          min-height: 30px;
+          max-height: 30px;
+          flex: 0 0 30px;
+          border-radius: 999px;
+          padding: 0;
+          line-height: 1;
+          appearance: none;
+          transition: background 0.12s, border-color 0.12s, color 0.12s;
+        }
+        .pq-rail-button:hover {
+          background: #3a241b;
+          border-color: ${TINT};
+          color: #f3d0c2;
+        }
+        .pq-rail-primary {
+          background: #3a2018;
+          border-color: #a85840;
+        }
+        .pq-rail-primary:hover {
+          background: #4a281d;
+          border-color: ${TINT};
+          color: ${TINT};
+        }
+        .pq-editor-resize-handle {
+          background: transparent;
+          transition: background 0.12s;
+        }
+        .pq-editor-resize-handle:hover {
+          background: ${TINT}18;
+        }
+        .pq-editor-resize-corner::after {
+          content: '';
+          position: absolute;
+          left: 3px;
+          bottom: 3px;
+          width: 6px;
+          height: 6px;
+          border-left: 1px solid rgba(255,255,255,0.22);
+          border-bottom: 1px solid rgba(255,255,255,0.22);
+          pointer-events: none;
         }
         .pq-chip::before {
           content: '';
@@ -1889,7 +2320,7 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
   // cleanly on the dark overlay. (User: «только background фиолетовым, рамку и
   // цвет внутри — белым».)
   const armed = !!selectedTab;
-  const triggerBorder = open ? 'rgba(255,255,255,0.78)' : (armed ? 'rgba(255,255,255,0.55)' : BORDER);
+  const triggerBorder = open ? 'rgba(190,190,190,0.36)' : (armed ? 'rgba(190,190,190,0.28)' : BORDER);
   const triggerColor = (armed || open) ? '#fff' : TEXT_MUTED;
   const triggerBg = open ? 'rgba(255,255,255,0.08)' : (armed ? `${DEEP_PULSE}33` : 'transparent');
 
@@ -1917,7 +2348,7 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
           whiteSpace: 'nowrap',
           overflow: 'hidden',
           boxSizing: 'border-box',
-          boxShadow: open ? '0 0 0 1px rgba(255,255,255,0.22)' : 'none',
+          boxShadow: open ? '0 0 0 1px rgba(190,190,190,0.10)' : 'none',
           transition: 'background 0.12s, border-color 0.12s, color 0.12s',
         }}
       >

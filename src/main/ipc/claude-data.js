@@ -868,6 +868,7 @@ function register({ projectManager, formatToolAction }) {
     includeUser = true, includeClaude = true,
     includeText = true, includeThinking = true,
     includeBash = false, includeTools = false,
+    includeWebSearch = false, includeToolSearch = false, includeOtherTools = includeTools,
   }) => {
     console.log('[Claude Export] Exporting range from', startUuid, 'to', endUuid);
 
@@ -1015,12 +1016,15 @@ function register({ projectManager, formatToolAction }) {
         reading: !!includeReading,
         editing: !!includeEditing,
         bash: !!includeBash,
-        tools: !!includeTools,
+        mcp: !!includeTools,
+        web: !!includeWebSearch,
+        toolSearch: !!includeToolSearch,
+        tools: !!includeOtherTools,
       };
       // Used to decide whether ANY action label is worth attaching to a Claude turn.
       // Without this guard a turn that contains only a filtered-out tool_use would still
       // emit an empty "## Claude" block with the user prefix.
-      const claudeHasActionAppetite = includeReading || includeEditing || includeBash || includeTools || includeSubagentResult || includeSubagentHistory;
+      const claudeHasActionAppetite = includeReading || includeEditing || includeBash || includeTools || includeWebSearch || includeToolSearch || includeOtherTools || includeSubagentResult || includeSubagentHistory;
 
       // Format the range
       let output = `# Claude Session Export (Range)\nSession: ${sessionId}\n\n---\n\n`;
@@ -1088,11 +1092,16 @@ function register({ projectManager, formatToolAction }) {
                   if (block.name === 'Edit' || block.name === 'Write' || block.name === 'NotebookEdit') return 'editing';
                   if (block.name === 'Bash' || block.name === 'Monitor' || block.name === 'Grep' || block.name === 'Glob') return 'bash';
                   if (block.name === 'Task' || block.name === 'Agent') return 'subagent';
+                  if (block.name === 'WebSearch' || block.name === 'WebFetch') return 'web';
+                  if (typeof block.name === 'string' && block.name.startsWith('mcp__')) return 'mcp';
                   return 'tools';
                 })();
                 const groupOn = (group === 'reading' && groupFlags.reading)
                   || (group === 'editing' && groupFlags.editing)
                   || (group === 'bash' && groupFlags.bash)
+                  || (group === 'mcp' && groupFlags.mcp)
+                  || (group === 'web' && groupFlags.web)
+                  || (group === 'toolSearch' && groupFlags.toolSearch)
                   || (group === 'tools' && groupFlags.tools)
                   || (group === 'subagent' && (includeSubagentResult || includeSubagentHistory));
 
@@ -2935,6 +2944,7 @@ function register({ projectManager, formatToolAction }) {
     includeUser = true, includeClaude = true,
     includeText = true, includeThinking = true,
     includeBash = false, includeTools = false,
+    includeWebSearch = false, includeToolSearch = false, includeOtherTools = includeTools,
   }) => {
     // Backward compat: old callers may pass includeCode
     if (includeCode !== undefined && includeEditing === undefined) {
@@ -3254,9 +3264,12 @@ function register({ projectManager, formatToolAction }) {
         reading: !!includeReading,
         editing: !!includeEditing,
         bash: !!includeBash,
-        tools: !!includeTools,
+        mcp: !!includeTools,
+        web: !!includeWebSearch,
+        toolSearch: !!includeToolSearch,
+        tools: !!includeOtherTools,
       };
-      const claudeHasActionAppetite = includeReading || includeEditing || includeBash || includeTools || includeSubagentResult || includeSubagentHistory;
+      const claudeHasActionAppetite = includeReading || includeEditing || includeBash || includeTools || includeWebSearch || includeToolSearch || includeOtherTools || includeSubagentResult || includeSubagentHistory;
 
       // Delegate to shared formatToolAction with current session's settings
       const formatTool = (toolName, input, toolResult = null, toolUseId = null) => {
@@ -3335,11 +3348,16 @@ function register({ projectManager, formatToolAction }) {
                   if (block.name === 'Edit' || block.name === 'Write' || block.name === 'NotebookEdit') return 'editing';
                   if (block.name === 'Bash' || block.name === 'Monitor' || block.name === 'Grep' || block.name === 'Glob') return 'bash';
                   if (block.name === 'Task' || block.name === 'Agent') return 'subagent';
+                  if (block.name === 'WebSearch' || block.name === 'WebFetch') return 'web';
+                  if (typeof block.name === 'string' && block.name.startsWith('mcp__')) return 'mcp';
                   return 'tools';
                 })();
                 const groupOn = (group === 'reading' && groupFlags.reading)
                   || (group === 'editing' && groupFlags.editing)
                   || (group === 'bash' && groupFlags.bash)
+                  || (group === 'mcp' && groupFlags.mcp)
+                  || (group === 'web' && groupFlags.web)
+                  || (group === 'toolSearch' && groupFlags.toolSearch)
                   || (group === 'tools' && groupFlags.tools)
                   || (group === 'subagent' && (includeSubagentResult || includeSubagentHistory));
 

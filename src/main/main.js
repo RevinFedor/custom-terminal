@@ -2740,10 +2740,28 @@ function parseOSC133AndEmit(tabId, data) {
             clearTimeout(codexFinishDebounceTimers.get(tabId));
           }
           const exitCode = state.lastExitCode;
-          const timer = setTimeout(() => {
+          const timer = setTimeout(async () => {
             codexFinishDebounceTimers.delete(tabId);
             if (terminalCommandState.get(tabId)?.isRunning) {
               console.warn('[CodexTurn] skip delayed command-finished tab=' + tabId.slice(-8) + ' reason=state-running');
+              return;
+            }
+            const liveCodex = await findAiDescendantProcessesByTab(tabId, 'codex');
+            if (liveCodex.length > 0) {
+              const liveState = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: exitCode };
+              liveState.isRunning = true;
+              terminalCommandState.set(tabId, liveState);
+              console.warn(
+                '[CodexTurn] keep delayed command-finished tab=' + tabId.slice(-8) +
+                ' reason=codex-descendant-alive matches=' + liveCodex.length
+              );
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('terminal:command-started', { tabId });
+              }
+              const sid = codexKnownSessions.get(tabId) || codexSessionIdFromDb(tabId);
+              if (sid && !codexTurnWatchers.has(tabId)) {
+                ensureCodexTurnWatcher(tabId, sid, terminalProjects.get(tabId));
+              }
               return;
             }
             if (activityOpenIntervals.get(tabId)?.engine === 'codex') {
@@ -7270,8 +7288,10 @@ app.on('activate', () => {
 // 'editing'  → file mutation (Edit, Write, NotebookEdit)
 // 'bash'    → shell execution + long-running shell streams (Bash, Monitor)
 // 'subagent' → Task (sub-agent invocation — separate toggle pair Result/History)
-// 'tools'   → everything else: MCP, WebFetch/Search, Skill, Cron*, Agent, planning, notifications, …
-// New tools default to 'tools' — safe bucket that's always included if user keeps Claude+Tools on.
+// 'mcp'      → mcp__* names
+// 'web'      → WebFetch/Search
+// 'tools'    → everything else: Skill, Cron*, planning, notifications, …
+// New tools default to 'tools' — explicit "other_tools" bucket in the copy UI.
 function getToolGroup(toolName) {
   if (toolName === 'Read' || toolName === 'NotebookRead') return 'reading';
   if (toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit') return 'editing';
@@ -7286,6 +7306,8 @@ function getToolGroup(toolName) {
   // toggle pair, otherwise Agent-using sessions fall into the `tools` bucket and the
   // history/result toggles silently no-op for the user.
   if (toolName === 'Task' || toolName === 'Agent') return 'subagent';
+  if (toolName === 'WebSearch' || toolName === 'WebFetch') return 'web';
+  if (typeof toolName === 'string' && toolName.startsWith('mcp__')) return 'mcp';
   return 'tools';
 }
 
@@ -7340,6 +7362,9 @@ function formatToolAction(toolName, input, toolResult = null, includeEditing = f
     if (group === 'reading') shouldInclude = !!flags.reading;
     else if (group === 'editing') shouldInclude = !!flags.editing;
     else if (group === 'bash') shouldInclude = !!flags.bash;
+    else if (group === 'mcp') shouldInclude = !!(flags.mcp ?? flags.tools);
+    else if (group === 'web') shouldInclude = !!flags.web;
+    else if (group === 'toolSearch') shouldInclude = !!flags.toolSearch;
     else if (group === 'tools') shouldInclude = !!flags.tools;
     else if (group === 'subagent') shouldInclude = !!(includeSubagentResult || includeSubagentHistory);
   } else {
@@ -9549,11 +9574,12 @@ ipcMain.handle('claude:send-command', async (event, tabId, command) => {
 });
 
 // PromptQueue replay (▶ chip button): paste text into Claude's input WITHOUT
-// stashing the user's current draft and WITHOUT pressing Enter. Just appends
-// to whatever is already in the prompt — user reviews and submits manually.
+// stashing the user's current draft. Default mode does NOT press Enter — user
+// reviews and submits manually. Cmd+click passes { submit:true } and behaves
+// like "paste, then press Enter" through the same safePasteAndSubmit path.
 // Goes through safePasteAndSubmit so bracketed-paste + sync marker logic still
 // guarantees Ink ingests the chip atomically (no [Pasted text #N] fragments).
-ipcMain.handle('claude:append-input', async (event, tabId, text) => {
+ipcMain.handle('claude:append-input', async (event, tabId, text, options = {}) => {
   console.log('[append-input] 📩 Received: tabId=' + tabId + ' chars=' + (text || '').length + ' ts=' + Date.now());
   const term = terminals.get(tabId);
   if (!term) {
@@ -9587,19 +9613,22 @@ ipcMain.handle('claude:append-input', async (event, tabId, text) => {
     console.log('[append-input] ❌ No live Claude session (bridge/pid) in tab ' + tabId + ' — refusing to paste into non-Claude PTY');
     return { success: false, error: 'no_claude_session' };
   }
+  const shouldSubmit = !!(options && options.submit === true);
   const result = await safePasteAndSubmit(term, text, {
-    submit: false,
+    submit: shouldSubmit,
     stashFirst: false, // never stash on replay — user wants append, not replace
     ctrlCFirst: false,
     logPrefix: '[append-input:' + tabId + ']'
   });
+  if (result && typeof result === 'object') result.submitted = shouldSubmit;
   return result;
 });
 
 // PromptQueue replay for Codex: same UI contract as Claude replay — paste text
-// into Codex input WITHOUT submitting. Hard refusal when there is no live Codex
-// descendant under this PTY, otherwise a queued chip could become a shell command.
-ipcMain.handle('codex:append-input', async (_event, tabId, text) => {
+// into Codex input, submit only when renderer passes { submit:true }. Hard
+// refusal when there is no live Codex descendant under this PTY, otherwise a
+// queued chip could become a shell command.
+ipcMain.handle('codex:append-input', async (_event, tabId, text, options = {}) => {
   console.log('[codex:append-input] 📩 Received: tabId=' + tabId + ' chars=' + (text || '').length + ' ts=' + Date.now());
   const term = terminals.get(tabId);
   if (!term) {
@@ -9614,13 +9643,16 @@ ipcMain.handle('codex:append-input', async (_event, tabId, text) => {
     console.log('[codex:append-input] ❌ No live Codex process under shell pid=' + term.pid + ' tab=' + tabId);
     return { success: false, error: 'no_codex_session' };
   }
-  return safePasteAndSubmit(term, text, {
-    submit: false,
+  const shouldSubmit = !!(options && options.submit === true);
+  const result = await safePasteAndSubmit(term, text, {
+    submit: shouldSubmit,
     stashFirst: false,
     ctrlCFirst: false,
     fast: true,
     logPrefix: '[codex:append-input:' + tabId + ']',
   });
+  if (result && typeof result === 'object') result.submitted = shouldSubmit;
+  return result;
 });
 
 // ========== Soniox temporary API key ==========
@@ -11156,6 +11188,163 @@ async function waitForPidsToExit(pids, deadlineMs) {
   return pids.filter(alivePid);
 }
 
+const DASHBOARD_OWNERSHIP_SNAPSHOT_TTL_MS = 1000;
+let dashboardOwnershipSnapshotCache = null;
+let dashboardOwnershipSnapshotInflight = null;
+
+function commandLooksLikeNotedTerminalMain(command) {
+  const text = String(command || '');
+  const lower = text.toLowerCase();
+  if (!text || lower.includes(' --type=')) return false;
+  if (lower.includes('/noted terminal.app/contents/macos/noted terminal')) return true;
+  if (lower.includes('/custom-terminal/node_modules/electron/dist/electron.app/contents/macos/electron')) return true;
+  if (lower.includes('/noted-terminal') && lower.includes('/contents/macos/')) return true;
+  return false;
+}
+
+function getDashboardInstanceKind(isPackaged, command) {
+  if (isPackaged === false) return 'dev';
+  if (isPackaged === true) return 'prod';
+  const lower = String(command || '').toLowerCase();
+  if (lower.includes('/node_modules/electron/')) return 'dev';
+  if (lower.includes('.app/contents/macos/')) return 'prod';
+  return 'app';
+}
+
+function formatDashboardInstanceLabel(pid, isPackaged, command) {
+  const kind = getDashboardInstanceKind(isPackaged, command);
+  if (pid === process.pid) return kind === 'app' ? 'this app' : 'this ' + kind;
+  return kind === 'app' ? 'custom app' : kind;
+}
+
+function readDashboardInstanceFromPortFile(fileName, commandByPid) {
+  const match = String(fileName || '').match(/^mcp-port-(\d+)$/);
+  if (!match) return null;
+
+  const pid = Number(match[1]);
+  if (!Number.isInteger(pid) || pid <= 1 || !alivePid(pid)) return null;
+
+  const command = commandByPid.get(pid) || '';
+  if (pid !== process.pid && !commandLooksLikeNotedTerminalMain(command)) return null;
+
+  let payload = null;
+  try {
+    const raw = fs.readFileSync(path.join(MCP_PORT_DIR, fileName), 'utf8');
+    payload = JSON.parse(raw);
+  } catch {}
+
+  if (payload && payload.pid && Number(payload.pid) !== pid) return null;
+
+  const isPackaged = typeof payload?.isPackaged === 'boolean'
+    ? payload.isPackaged
+    : (pid === process.pid ? app.isPackaged : undefined);
+
+  return {
+    pid,
+    isPackaged,
+    label: formatDashboardInstanceLabel(pid, isPackaged, command),
+  };
+}
+
+async function getDashboardOwnershipSnapshot() {
+  const now = Date.now();
+  if (dashboardOwnershipSnapshotCache && now - dashboardOwnershipSnapshotCache.createdAt < DASHBOARD_OWNERSHIP_SNAPSHOT_TTL_MS) {
+    return dashboardOwnershipSnapshotCache;
+  }
+
+  if (dashboardOwnershipSnapshotInflight) return dashboardOwnershipSnapshotInflight;
+
+  dashboardOwnershipSnapshotInflight = (async () => {
+    const parentByPid = new Map();
+    const commandByPid = new Map();
+    try {
+      const psOut = await execAsync('ps -axo pid=,ppid=,command=', 2000);
+      for (const line of (psOut || '').split('\n')) {
+        const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+        if (!match) continue;
+        const pid = Number(match[1]);
+        parentByPid.set(pid, Number(match[2]));
+        commandByPid.set(pid, match[3]);
+      }
+    } catch {}
+
+    const instancesByPid = new Map();
+    instancesByPid.set(process.pid, {
+      pid: process.pid,
+      isPackaged: app.isPackaged,
+      label: formatDashboardInstanceLabel(process.pid, app.isPackaged, commandByPid.get(process.pid) || ''),
+    });
+
+    try {
+      const files = fs.readdirSync(MCP_PORT_DIR).filter(f => f.startsWith('mcp-port-'));
+      for (const fileName of files) {
+        const instance = readDashboardInstanceFromPortFile(fileName, commandByPid);
+        if (instance) instancesByPid.set(instance.pid, instance);
+      }
+    } catch {}
+
+    const snapshot = {
+      parentByPid,
+      commandByPid,
+      instancesByPid,
+      createdAt: Date.now(),
+    };
+    dashboardOwnershipSnapshotCache = snapshot;
+    return snapshot;
+  })();
+
+  try {
+    return await dashboardOwnershipSnapshotInflight;
+  } finally {
+    dashboardOwnershipSnapshotInflight = null;
+  }
+}
+
+function findDashboardOwnerPid(startPid, ownershipSnapshot) {
+  let currentPid = Number(startPid);
+  const seen = new Set();
+  while (Number.isInteger(currentPid) && currentPid > 1 && !seen.has(currentPid)) {
+    if (ownershipSnapshot.instancesByPid.has(currentPid)) return currentPid;
+    seen.add(currentPid);
+    currentPid = ownershipSnapshot.parentByPid.get(currentPid);
+  }
+  return null;
+}
+
+function resolveDashboardProcessOwner(startPid, ownershipSnapshot, tabId = null) {
+  const ownerPid = findDashboardOwnerPid(startPid, ownershipSnapshot);
+  const owner = ownerPid ? ownershipSnapshot.instancesByPid.get(ownerPid) : null;
+  const isCurrentOwner = ownerPid === process.pid || !!tabId;
+
+  if (owner) {
+    return {
+      ownerInstance: isCurrentOwner ? 'current' : 'custom-terminal',
+      ownerPid,
+      ownerLabel: owner.label,
+      protectedByApp: true,
+      killable: isCurrentOwner,
+    };
+  }
+
+  if (tabId) {
+    return {
+      ownerInstance: 'current',
+      ownerPid: process.pid,
+      ownerLabel: formatDashboardInstanceLabel(process.pid, app.isPackaged, ownershipSnapshot.commandByPid.get(process.pid) || ''),
+      protectedByApp: true,
+      killable: true,
+    };
+  }
+
+  return {
+    ownerInstance: 'external',
+    ownerPid: null,
+    ownerLabel: 'external',
+    protectedByApp: false,
+    killable: true,
+  };
+}
+
 ipcMain.handle('system:get-electron-dev-processes', async () => {
   try {
     return await listElectronDevProcesses();
@@ -11221,6 +11410,7 @@ ipcMain.handle('system:get-claude-processes', async () => {
       ourShellPids.add(ptyProcess.pid);
       pidToTabId.set(ptyProcess.pid, tabId);
     }
+    const ownershipSnapshot = await getDashboardOwnershipSnapshot();
 
     const lines = psOutput.split('\n').filter(Boolean);
     const processes = [];
@@ -11239,30 +11429,27 @@ ipcMain.handle('system:get-claude-processes', async () => {
         const command = match[6].trim();
 
         // Skip non-CLI claude processes
-        if (!command.includes('claude') || command.includes('Electron')) continue;
+        if (!commandLooksLikeAiProcess(command, 'claude') || command.includes('Electron')) continue;
 
         // Get CWD via lsof
-        let cwd = '';
-        try {
-          cwd = await execAsync('lsof -p ' + pid + ' | grep cwd | awk \'{print ' + '\$' + '9}\'', 2000);
-        } catch {
-          // Process may have exited
-          continue;
-        }
+        const cwd = await getPidCwd(Number(pid));
 
         if (!cwd) continue;
 
         // Check if this process belongs to one of our terminal tabs
         const tabId = pidToTabId.get(ppid) || null;
+        const owner = resolveDashboardProcessOwner(ppid, ownershipSnapshot, tabId);
 
         processes.push({
           pid: Number(pid),
+          ppid,
           cwd,
           startTime: startTime.substring(0, 5), // HH:MM
           command,
           tabId,
           cpu,
           mem,
+          ...owner,
         });
       } catch {
         // Skip unparseable lines
@@ -11277,9 +11464,9 @@ ipcMain.handle('system:get-claude-processes', async () => {
 
 ipcMain.handle('system:get-gemini-processes', async () => {
   try {
-    // Find gemini processes with no controlling terminal (?? = detached)
+    // Find gemini CLI processes with PPID for ownership detection.
     const psOutput = await execAsync(
-      'ps aux | grep gemini | grep "\\?\\?" | grep -v grep',
+      'ps -eo pid,ppid,pcpu,pmem,lstart,command | grep -i "gemini" | grep -v grep | grep -v electron',
       3000
     );
 
@@ -11292,54 +11479,44 @@ ipcMain.handle('system:get-gemini-processes', async () => {
       ourShellPids.add(ptyProcess.pid);
       pidToTabId.set(ptyProcess.pid, tabId);
     }
+    const ownershipSnapshot = await getDashboardOwnershipSnapshot();
 
     const lines = psOutput.split('\n').filter(Boolean);
     const processes = [];
 
     for (const line of lines) {
       try {
-        // ps aux columns: USER PID %CPU %MEM VSZ RSS TT STAT STARTED TIME COMMAND
-        const parts = line.trim().split(/\s+/);
-        if (parts.length < 11) continue;
+        const match = line.trim().match(/^\s*(\d+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+\w+\s+\w+\s+\d+\s+(\d+:\d+:\d+)\s+\d+\s+(.+)/);
+        if (!match) continue;
 
-        const pid = parts[1];
-        const cpu = parts[2]; // %CPU
-        const mem = parts[3]; // %MEM
-        const startTime = parts[8]; // STARTED column
-        const command = parts.slice(10).join(' ');
+        const pid = Number(match[1]);
+        const ppid = Number(match[2]);
+        const cpu = match[3];
+        const mem = match[4];
+        const startTime = match[5];
+        const command = match[6].trim();
 
         // Skip non-CLI gemini processes
-        if (!command.includes('gemini')) continue;
-
-        // Get PPID for ownership detection
-        let ppid = 0;
-        try {
-          const ppidStr = await execAsync('ps -o ppid= -p ' + pid, 2000);
-          ppid = Number(ppidStr.trim());
-        } catch {
-          // Process may have exited
-        }
+        if (!commandLooksLikeAiProcess(command, 'gemini')) continue;
 
         // Get CWD via lsof
-        let cwd = '';
-        try {
-          cwd = await execAsync('lsof -p ' + pid + ' | grep cwd | awk \'{print ' + '\$' + '9}\'', 2000);
-        } catch {
-          continue;
-        }
+        const cwd = await getPidCwd(pid);
 
         if (!cwd) continue;
 
         const tabId = pidToTabId.get(ppid) || null;
+        const owner = resolveDashboardProcessOwner(ppid, ownershipSnapshot, tabId);
 
         processes.push({
-          pid: Number(pid),
+          pid,
+          ppid,
           cwd,
-          startTime: startTime || '',
+          startTime: startTime.substring(0, 5),
           command,
           tabId,
           cpu,
           mem,
+          ...owner,
         });
       } catch {
         // Skip unparseable lines
@@ -11347,6 +11524,66 @@ ipcMain.handle('system:get-gemini-processes', async () => {
     }
 
     return processes;
+  } catch {
+    return [];
+  }
+});
+
+ipcMain.handle('system:get-codex-processes', async () => {
+  try {
+    const psOutput = await execAsync('ps -eo pid,ppid,pcpu,pmem,lstart,command', 3000);
+    if (!psOutput) return [];
+
+    const pidToTabId = new Map();
+    for (const [tabId, ptyProcess] of terminals) {
+      pidToTabId.set(ptyProcess.pid, tabId);
+    }
+    const ownershipSnapshot = await getDashboardOwnershipSnapshot();
+
+    const rows = [];
+    for (const line of psOutput.split('\n').filter(Boolean)) {
+      const match = line.trim().match(/^\s*(\d+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+\w+\s+\w+\s+\d+\s+(\d+:\d+:\d+)\s+\d+\s+(.+)/);
+      if (!match) continue;
+      const command = match[6].trim();
+      if (!command.includes('--no-alt-screen')) continue;
+      if (!commandLooksLikeAiProcess(command, 'codex')) continue;
+
+      rows.push({
+        pid: Number(match[1]),
+        ppid: Number(match[2]),
+        cpu: match[3],
+        mem: match[4],
+        startTime: match[5].substring(0, 5),
+        command,
+      });
+    }
+
+    const codexPidSet = new Set(rows.map(row => row.pid));
+    const processes = await Promise.all(rows.map(async (row) => {
+      // Codex TUI normally appears as shell → node wrapper → vendor codex.
+      // Show only the root wrapper so one chat is one Dashboard card.
+      if (codexPidSet.has(row.ppid)) return null;
+
+      const cwd = await getPidCwd(row.pid);
+      if (!cwd) return null;
+
+      const tabId = pidToTabId.get(row.ppid) || null;
+      const owner = resolveDashboardProcessOwner(row.ppid, ownershipSnapshot, tabId);
+
+      return {
+        pid: row.pid,
+        ppid: row.ppid,
+        cwd,
+        startTime: row.startTime,
+        command: row.command,
+        tabId,
+        cpu: row.cpu,
+        mem: row.mem,
+        ...owner,
+      };
+    }));
+
+    return processes.filter(Boolean);
   } catch {
     return [];
   }
@@ -11377,6 +11614,7 @@ ipcMain.handle('system:get-mcp-processes', async () => {
       }
     } catch {}
 
+    const ownershipSnapshot = await getDashboardOwnershipSnapshot();
     const lines = psOutput.split('\n').filter(Boolean);
     const processes = [];
     for (const line of lines) {
@@ -11396,9 +11634,25 @@ ipcMain.handle('system:get-mcp-processes', async () => {
       if (m1) name = m1[1].replace(/^.*\//, '');
       else { const parts = command.split(/\s+/); name = (parts[1] || parts[0] || 'mcp').split('/').pop() || 'mcp'; }
 
-      // Alive = ppid is one of our PTY shells OR one of CLI children of them
-      const isAlive = aliveCliPids.has(ppid);
-      processes.push({ pid, ppid, cpu, mem, startTime, command, name, isAlive });
+      // Alive = ppid is one of our PTY shells / CLI children OR it belongs
+      // to another live custom-terminal instance (dev/prod protected).
+      const owner = resolveDashboardProcessOwner(ppid, ownershipSnapshot, null);
+      const isAlive = aliveCliPids.has(ppid) || !!owner.protectedByApp;
+      processes.push({
+        pid,
+        ppid,
+        cpu,
+        mem,
+        startTime,
+        command,
+        name,
+        isAlive,
+        ownerInstance: owner.ownerInstance,
+        ownerLabel: owner.ownerLabel,
+        ownerPid: owner.ownerPid,
+        protectedByApp: owner.protectedByApp,
+        killable: owner.killable,
+      });
     }
     return processes;
   } catch {
@@ -11407,13 +11661,31 @@ ipcMain.handle('system:get-mcp-processes', async () => {
 });
 
 ipcMain.handle('system:kill-process', async (event, pid) => {
+  const targetPid = Number(pid);
+  if (!Number.isInteger(targetPid) || targetPid <= 1) {
+    return { success: false, error: 'invalid pid' };
+  }
+
   try {
-    await execAsync('kill ' + pid, 2000);
+    const ownershipSnapshot = await getDashboardOwnershipSnapshot();
+    const targetOwnerPid = findDashboardOwnerPid(targetPid, ownershipSnapshot);
+    const targetParentPid = ownershipSnapshot.parentByPid.get(targetPid);
+    const parentOwner = resolveDashboardProcessOwner(targetParentPid, ownershipSnapshot, null);
+    if ((targetOwnerPid && targetOwnerPid !== process.pid) ||
+        (parentOwner.protectedByApp && parentOwner.ownerPid !== process.pid)) {
+      return { success: false, error: 'protected custom-terminal process' };
+    }
+  } catch {
+    return { success: false, error: 'ownership check failed' };
+  }
+
+  try {
+    await execAsync('kill ' + targetPid, 2000);
     return { success: true };
   } catch {
     // Try SIGKILL if graceful kill failed
     try {
-      await execAsync('kill -9 ' + pid, 2000);
+      await execAsync('kill -9 ' + targetPid, 2000);
       return { success: true };
     } catch {
       return { success: false };

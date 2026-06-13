@@ -198,6 +198,47 @@
   to { transform: rotate(360deg); }
 }
 
+@keyframes tab-title-naming-sweep {
+  0% { background-position: 180% 0; }
+  100% { background-position: -80% 0; }
+}
+
+.tab-title-naming-frame {
+  position: relative;
+  display: inline-block;
+  min-width: 58px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+
+.tab-title-naming-ghost {
+  visibility: hidden;
+  white-space: nowrap;
+}
+
+.tab-title-naming-text {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: transparent;
+  background-image: linear-gradient(
+    90deg,
+    rgba(148, 163, 184, 0.55) 0%,
+    rgba(255, 255, 255, 0.95) 42%,
+    rgba(129, 140, 248, 0.95) 50%,
+    rgba(255, 255, 255, 0.95) 58%,
+    rgba(148, 163, 184, 0.55) 100%
+  );
+  background-size: 260% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  animation: tab-title-naming-sweep 1.35s linear infinite;
+}
+
 /* Vertical tab sidebar — два РАЗНЫХ сигнала:
    1) Process bar (узкая полоса 2px слева/справа): статично горит пока PTY/SDK процесс жив.
    2) AI shimmer внутри process bar: блик бежит сверху вниз пока AI-сессия думает/стримит.
@@ -213,6 +254,11 @@
 }
 .tab-process-bar-static {
   background-color: var(--process-bar-color-a, #155E75);
+}
+
+@keyframes spinner-rotate {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 /* AI-busy блик внутри полоски процесса — настраиваемая полупрозрачная просвечка

@@ -88,96 +88,104 @@
     "path": "docs/methodology/переносимый-дизайн.md",
     "type": "fact",
     "explicit": [
-      "portable_ux_methodology",
+      "design_methodology",
+      "ux_philosophy",
       "ui_implementation_patterns",
-      "state_synchronization",
-      "async_latency_mitigation",
-      "error_boundary_cleanup",
-      "focus_management",
-      "path_prefix_matching",
-      "ansi_parsing_tui",
-      "click_outside_handling",
-      "drag_state_buffering"
+      "multi_tab_architecture",
+      "multi_backend_routing"
     ],
     "implicit": [
-      "handshake_prompt_injection",
-      "safePasteAndSubmit_chunking",
-      "cwd_prefix_trailing_slash_match",
-      "ansi_cursor_positioning_stripping",
-      "zombie_state_prevention",
-      "drag_state_mouseup_flush",
-      "double_updater_react_collision",
-      "containing_block_transform_trap",
-      "clipboard_restore_multi_format",
-      "axis_state_separation",
-      "ax_focused_element_refocus",
-      "split_button_border_owner",
-      "interactive_shell_ipc_obs133",
-      "zustand_silent_mutation_ui",
-      "sync_marker_validity_15ms",
-      "paste_path_routing_tier_1_2",
-      "layout_depth_sensitivity_portal",
-      "react_useeffect_ipc_listener_unsubscription",
-      "jsonl_chain_resolution_fork_compact"
+      "per_tab_routing_proxy",
+      "timeline_provider_badge",
+      "two_tier_model_selector",
+      "edit_range_persistence",
+      "cwd_guard_prefix_match",
+      "ink_tui_ansi_chunking",
+      "hierarchical_copy_groups",
+      "aborted_streaming_jsonl_watcher",
+      "startup_defaults_gating",
+      "mcp_routing_pid_match",
+      "scrollbar_gutter_stable",
+      "clipsnap_clipboard_restore",
+      "zustand_store_reactivity",
+      "state_mirror_stale_closure",
+      "containing_block_transform_portal_trap",
+      "singleton_listener_unmount_resilience",
+      "sqlite_dev_origin_mirror",
+      "layout_reservation_height_stability",
+      "hover_isolation_split_button",
+      "window_focus_dom_refocus"
     ],
     "symptoms": [
-      "UI displays a frozen loading spinner indefinitely after an async task fails or is aborted.",
-      "Clicking a card's secondary action button causes the entire parent element to shift or flicker.",
-      "Dragging a resize handle triggers laggy rendering, layout shifts, or cursor desynchronization.",
-      "An autocomplete popup closes instantly when moving the mouse from the trigger toward the menu.",
-      "An overlay window designed to float without stealing focus unexpectedly activates the main application."
+      "UI displays zombie loading spinners after a network error or tab switch",
+      "Floating popups jump or render in incorrect positions when window is resized",
+      "Active process indicators show green while the task is actually stopped or idle",
+      "Copying formatted markdown results in flat text lines with missing list bullet points",
+      "Dragging and resizing sidebar panels causes massive layout stuttering and cursor lag",
+      "Global shortcuts fail to trigger or conflict with default inputs when typing in active editors"
     ],
     "related_components": [
       "src/renderer/components/UI/SettingsModal.tsx",
       "src/renderer/components/UI/Tooltip.tsx",
-      "src/renderer/components/icons/ProviderIcons.tsx",
-      "src/main/ipc/semantic-index-status.js",
+      "src/renderer/components/UI/TabItem.tsx",
+      "src/renderer/components/UI/InfoPanel.tsx",
+      "src/renderer/components/UI/ClaudeSDKTab.tsx",
       "src/renderer/utils/persistedStorage.ts",
       "src/main/main.js"
     ],
-    "hash": "7cbda0161318e5880ac2243bdbb5377c3d12464e8540690f9540fe47105c9406"
+    "hash": "8ab64008b1dda7da32e1570737035efc092e8c1e4b2ee98d229857de9172b001"
   },
   {
     "path": "docs/methodology/сценарии-использования.md",
     "type": "fact",
     "explicit": [
-      "user-journeys",
-      "unified-ai-launch",
-      "dictation",
-      "browser-tabs",
-      "interrupted-overlay",
-      "sdk-tab-lifecycle",
-      "mobile-resume"
+      "user journeys",
+      "unified ai launch",
+      "dictation workflow",
+      "history preflight",
+      "multi-select persistence",
+      "browser tab navigation",
+      "interrupted session recovery",
+      "mobile claude resume",
+      "sdk soft interrupt"
     ],
     "implicit": [
-      "tabbar_mousedown_keep_selection",
-      "browser_tab_link_hijack",
-      "dictation_stop_and_deliver",
-      "mobile_resume_post_bridge",
-      "fs_watch_claude_projects",
-      "beforeunload_session_interrupted",
-      "dismissInterruptedSession_sqlite",
-      "sdk_process_soft_interrupt",
-      "claude_jsonl_history_resume",
-      "terminal_paste_waitForRender",
-      "claude_prompt_ready_detection"
+      "unified_ai_launch",
+      "claude_control_bar_lifecycle",
+      "tab_auto_title_gemini",
+      "external_editor_hijack",
+      "dictation_stop_deliver",
+      "terminal_paste_pipeline",
+      "cmd_history_preflight",
+      "background_dictation_owner",
+      "multi_select_persistence",
+      "browser_tab_link_intercept",
+      "interrupted_overlay_lifecycle",
+      "mobile_claude_pty_resume",
+      "prompt_ready_detector",
+      "sdk_soft_interrupt",
+      "workflow_teardown_sync",
+      "mousedown_keep_selection",
+      "handshake_osc_133_d"
     ],
     "symptoms": [
-      "Multi-select tabs border clears and selection drops when interacting with the ActionsPanel input text area.",
-      "Clicking localhost dev-server links in a browser tab opens the external system browser instead of changing the internal view to webview.",
-      "Interrupted session recovery popup appears again during cold boot even when previously dismissed.",
-      "Resuming an inactive Claude session from a mobile device remains stuck on a busy screen or fails to bind to the active PTY session.",
-      "Stopping an active SDK response kills all background workflow agents instead of just interrupting the foreground token stream."
+      "Multi-select tab state unexpectedly clears when clicking inputs inside the ActionsPanel.",
+      "Clicking localhost URLs in BrowserTab terminal output opens an external desktop browser instead of the webview.",
+      "The Interrupted session recovery overlay loops repeatedly after clicking Dismiss or cold launching.",
+      "Mobile session resume gets stuck on a loading spinner or fails to flip the UI to the active composer.",
+      "Pressing Escape or stopping a response in an SDK tab kills the running background agents instead of performing a soft interrupt."
     ],
     "related_components": [
-      "src/components/TabBar.tsx",
       "src/components/ClaudeControlBar.tsx",
-      "src/components/Terminal.tsx",
+      "src/components/TabBar.tsx",
+      "src/components/HistoryPanel.tsx",
       "src/components/ActionsPanel.tsx",
+      "src/components/Terminal.tsx",
+      "src/components/BrowserTab.tsx",
       "src/store/useWorkspaceStore.ts",
       "src/main/main.js"
     ],
-    "hash": "c1c2ecf5696fd74ce241c5da76b46da11059efe08f720a1b1ca1b507ce660ec8"
+    "hash": "b77bfecf4c6c41bd61d77d1089eb6378cb36ef04f4db9bc29e2feccc36a853ad"
   },
   {
     "path": "docs/methodology/сценарии-багов-design.md",
@@ -227,40 +235,45 @@
     "path": "docs/methodology/сценарии-багов.md",
     "type": "fact",
     "explicit": [
-      "cross_feature_map",
-      "bug_dependency_graph",
-      "regression_checklist"
+      "bug_scenarios",
+      "feature_relationship_map",
+      "integration_testing",
+      "dependency_graph"
     ],
     "implicit": [
       "jsonl_parentuuid_chain",
       "effort_inject_startup",
-      "graceful_ctrl_c_pty",
-      "cwdguard_session_takeover",
+      "kill_paths_graceful_exit",
+      "cwd_guard_takeover",
       "codex_session_lifecycle",
+      "tab_naming_auto_title",
       "sdk_midstream_queue",
-      "virtuoso_focus_blur",
+      "sdk_focus_management",
       "timeline_history_parity",
       "project_home_semantic_search",
       "provider_proxy_routing",
-      "clipboard_editor_adapter",
-      "safe_paste_mutex",
-      "vite_prebundle_cache"
+      "editor_clipboard_adapter",
+      "jsonl_chain_resolution",
+      "sync_marker_validity",
+      "paste_path_routing",
+      "react_ipc_listener_drop"
     ],
     "symptoms": [
-      "Changing a terminal feature breaks Claude resume or timeline integrity",
-      "Timeline and Cmd+\\ HistoryPanel show mismatched message history or truncation",
-      "Developer is unsure what other systems to test after modifying PTY graceful shutdown or SIGTERM logic",
-      "UI freezes or lags for several seconds when switching to the Project Home screen",
-      "Markdown editor copy-paste behaves unexpectedly or fails silently in Electron renderer"
+      "Timeline and History Panel display different history lengths or mismatch after model switches",
+      "AI terminal or session hangs and fails to respond to Stop commands or graceful exits",
+      "Tab loses session connection and persistence details after application restart",
+      "First prompt fails to trigger automatic tab renaming while manual rename works",
+      "Application freezes or lags for 2 to 4 seconds when navigating to Project Home",
+      "Copy, cut, or paste shortcuts do not respond inside the notes markdown editor"
     ],
     "related_components": [
       "main.js",
-      "src/components/Timeline.tsx",
-      "src/components/HistoryPanel.tsx",
-      "src/components/ProjectHome.tsx",
-      "src/components/ClaudeSDKTab.tsx"
+      "src/renderer/components/Timeline.tsx",
+      "src/renderer/components/HistoryPanel.tsx",
+      "src/renderer/components/ProjectHome.tsx",
+      "src/renderer/components/ClaudeSDKTab.tsx"
     ],
-    "hash": "51f53834f6a1e42ae47c218328837690ded9c417bebb53d91614a82ecee244ec"
+    "hash": "a86e117cb7280f89748b551fd935e56ccd8f566214240cb5ea892003db9795fc"
   },
   {
     "path": "docs/meta/оркестратор.prompt.md",
@@ -426,78 +439,76 @@
     "explicit": [
       "prompt_queue",
       "external_editor_hijack",
+      "run_after",
+      "stop_after",
+      "close_after",
       "noted_code_grab",
-      "run_after_pivot",
-      "stop_after_close_after_split",
-      "image_path_resolution"
+      "editor_env_injection",
+      "image_path_resolver"
     ],
     "implicit": [
-      "noted_code_grab_js_hook",
       "usePromptQueueStore_persistence",
-      "usePromptQueueRunner_singleton",
-      "run_after_pivot_tab_state",
-      "backdrop_filter_containing_block_portal",
-      "split_button_seam_rendering",
-      "shell_integration_editor_restore",
-      "ink_alt_screen_flash_avoidance",
-      "zustand_fingerprint_selector",
-      "claude_image_cache_resolver",
-      "ink_render_loop_throttle_focus",
-      "turn_end_skip_reasons"
+      "PromptQueueOverlay_unmount_dropouts",
+      "noted_code_grab_editor_override",
+      "editor_zshrc_clobber_guard",
+      "run_after_tab_pivot",
+      "createPortal_backdrop_filter_clipping",
+      "bridgeKnownSessions_liveness_guard",
+      "auto_run_disarm_reasons",
+      "image_cache_path_resolver",
+      "split_button_seam_owner",
+      "zustand_selector_fingerprint_loop"
     ],
     "symptoms": [
-      "Prompt Queue overlay disappears when switching tabs or fails to process background events",
-      "Run after target picker dropdown is invisible or clipped inside blurred panel containers",
-      "Replay button fails with no_claude_session error on auto-resumed terminal tabs",
-      "Terminal flashes with an alternate screen buffer when opening external editor grab",
-      "Split button borders flicker or disappear on retina screens when switching tabs",
-      "Maximum update depth exceeded crash happens after updating workspace project tabs"
+      "The Run after overlay is hidden even though Claude is active and answering in the terminal",
+      "Auto-run queue stops firing when switching tabs or navigating to another workspace",
+      "Clicking the Replay button fails with 'no_claude_session' on auto-resumed tabs",
+      "The target selection dropdown or picker is clipped, mispositioned, or fails to render inside blurred panels",
+      "The helper-driven grab input fails because user shell configuration files overwrite the custom EDITOR environment variable"
     ],
     "related_components": [
       "src/renderer/store/usePromptQueueStore.ts",
       "src/renderer/components/Workspace/PromptQueueOverlay.tsx",
       "src/renderer/hooks/usePromptQueueRunner.ts",
-      "src/renderer/hooks/usePromptQueueWebSync.ts",
-      "src/main/main.js"
+      "src/renderer/hooks/usePromptQueueWebSync.ts"
     ],
-    "hash": "b15d5cdfbc81e289d65c0e79e352338d4fd3b1a3dcf679ec5dbf953a7018c1db"
+    "hash": "005972ebb5763b92d37fa0d3effacbff2b30922ea465201288036d83bf74a31b"
   },
   {
     "path": "docs/knowledge/fact-session-status.md",
     "type": "fact",
     "explicit": [
-      "Session Status",
-      "Tab Markers",
-      "Color Configuration",
-      "CRUD UI"
+      "session_status",
+      "tab_markers",
+      "settings_crud",
+      "status_color_picker"
     ],
     "implicit": [
-      "session_status_id_mapping",
-      "graceful_degradation_ui",
-      "hex_normalization_logic",
-      "react_colorful_popup_ref",
-      "tab_history_status_persistence",
-      "vertical_tab_layout_geometry",
-      "zustand_session_status_store",
-      "context_menu_status_preview",
-      "click_outside_containment_check",
-      "status_marker_reopen_last_closed",
-      "hex_draft_buffer_sync"
+      "ghost_status_id_preservation",
+      "hex_draft_input_buffer",
+      "react_colorful_containment",
+      "submenu_palette_preview",
+      "tab_history_marker_inline",
+      "optical_baseline_alignment",
+      "tab_group_status_json",
+      "zustand_silent_mutation",
+      "layout_depth_sensitivity"
     ],
     "symptoms": [
-      "Colored dots in tabs are missing after deleting a status in settings",
-      "Unable to input hex color code due to immediate validation reset while typing",
-      "Tab status is lost when reopening a closed tab from history or using Shift+Cmd+T",
-      "Color picker popup doesn't close when clicking outside in the settings panel",
-      "Status marker alignment looks slightly off or shifted vertically relative to tab text"
+      "Tab status marker is misaligned or looks vertically off-center in the vertical layout sidebar",
+      "Deleting a status in settings permanently wipes assigned markers from active tabs",
+      "Typing shorthand hex colors in settings resets the input or causes validation glitches",
+      "Color picker popup fails to close when clicking outside of the active row in settings",
+      "Restored tabs from closed history or home screen lose their color status indicators"
     ],
     "related_components": [
       "src/components/TabBar.tsx",
-      "src/store/useUIStore.ts",
-      "src/components/Settings/SystemSettings.tsx",
-      "src/components/Home/HistoryCard.tsx"
+      "src/components/TabSidebar.tsx",
+      "src/components/ContextMenu.tsx",
+      "src/components/Settings.tsx",
+      "src/store/useUIStore.ts"
     ],
-    "hash": "b7de92664f9e2c325499f288a2643299a9f715f1ec08ac82917186a692b75e37"
+    "hash": "50328c57ef777918fc6abd7fc672240225e62a779712094cafc79b501b428aff"
   },
   {
     "path": "docs/knowledge/fix-notes-font-fragmentation.md",
@@ -726,30 +737,32 @@
     "path": "docs/knowledge/fact-reopen-last-closed-tab.md",
     "type": "fact",
     "explicit": [
-      "reopen_last_closed_tab",
-      "tab_history_persistence",
-      "shift_cmd_t_shortcut",
-      "claude_resume_logic",
-      "ui_pulse_feedback"
+      "Reopen Last Closed Tab",
+      "Shift+Cmd+T",
+      "tab_history",
+      "tab position preservation",
+      "tab group validation",
+      "process_was_running",
+      "pulse feedback overlay"
     ],
     "implicit": [
-      "tab_history_atomic_pop",
-      "reopen_pulse_feedback",
-      "layout_agnostic_event_code",
-      "claude_continue_decision_logic",
-      "capture_phase_shortcut_hijack",
-      "tab_bar_overlay_pulse",
-      "sqlite_transaction_safety",
-      "bracketed_paste_resume",
-      "process_was_running_signal",
-      "tab_position_hinting"
+      "shift_cmd_t_hijack",
+      "tab_history_pop",
+      "reopen_pulse_animation",
+      "tab_position_hint_clamp",
+      "process_was_running_check",
+      "claude_resume_handshake",
+      "layout_agnostic_hotkey",
+      "tab_groups_validation",
+      "xterm_attach_key_event"
     ],
     "symptoms": [
-      "Reopened tab appears at the end of the bar instead of its previous position",
-      "The character T is printed in the terminal when pressing Shift+Cmd+T",
-      "Claude session does not auto-resume after reopening a tab that was active",
-      "Double-pressing the reopen shortcut causes a race condition or duplicate tabs",
-      "No visual indication occurs when reopening a tab on a slow connection"
+      "Pressing Shift+Cmd+T prints letter T in the xterm terminal",
+      "Reopening a tab does not restore its original position in the tab bar",
+      "Claude session auto-resumes even when it was stopped prior to tab closure",
+      "Double tapping the reopen hotkey creates duplicate restored tabs",
+      "No visual indicator or feedback is shown when reopening a closed tab takes time",
+      "Reopened tab fails to join its original tab group even if the group exists"
     ],
     "related_components": [
       "src/renderer/App.tsx",
@@ -757,9 +770,9 @@
       "src/main/main.js",
       "src/main/database.js",
       "src/renderer/components/Workspace/Terminal.tsx",
-      "src/renderer/store/useUIStore.ts"
+      "src/renderer/components/Workspace/ProjectHome.tsx"
     ],
-    "hash": "f4cbd024c0557f1a6c8aab3ba025dd763cab407753fd8541149ef0a626197672"
+    "hash": "b9baffa19b6858ca9fa4f8df0308ba30ea64cec30e41b0d02d32ed7fe2cf1806"
   },
   {
     "path": "docs/knowledge/fact-mcp-v2-lifecycle.md",
@@ -849,51 +862,44 @@
     "path": "docs/knowledge/fact-tabs.md",
     "type": "fact",
     "explicit": [
-      "tab management",
-      "tab sidebar vertical layout",
-      "tab naming patterns",
-      "persistence guard",
-      "ai auto-title",
-      "sub-agent bar",
-      "split close stop",
-      "vertical dnd",
-      "multi-select persistence"
+      "tab_management",
+      "tab_sidebar",
+      "tab_naming_patterns",
+      "ai_auto_title",
+      "tab_groups",
+      "multi_select_tabs",
+      "vertical_drag_and_drop",
+      "multi_select_persistence"
     ],
     "implicit": [
-      "tab_sidebar_vertical_layout",
-      "ai_auto_title_eligible",
-      "name_set_manually_guard",
-      "sub_agent_visibility_filtering",
-      "split_close_stop_grid",
-      "multi_select_persistence_keep_selection",
-      "vertical_dnd_snapshot_geometry",
-      "sdk_terracotta_hue_override",
-      "lru_tab_navigation",
-      "safe_persistence_delete_guard",
-      "optical_baseline_shift_compensation",
-      "ai_downgrade_tui_match_guard",
-      "tab_history_reopen_last_closed",
-      "multi_select_majority_badge",
-      "empty_string_tab_parent_normalization",
-      "wheel_handler_vertical_sidebar_bug",
-      "react_useeffect_ipc_event_drop",
-      "zustand_silent_mutation_reactivity"
+      "nameSetManually_persistence_guard",
+      "claudeProcessAliveRef_terminal_regex_hijack",
+      "autoTitleEligible_ai_snapshot",
+      "data-keep-selection_mousedown_clearSelection_bypass",
+      "handleWheel_vertical_layout_block",
+      "captureVerticalDragGeometry_resolveStaticVerticalPreview",
+      "stable_2x2_grid_disabled_stop_pill",
+      "setTabCommandType_saveTabs_storm",
+      "vertical_layout_alpha_saturation",
+      "SubAgentBar_string_key_selector_infinite_render",
+      "split_close_stop_majority_badge"
     ],
     "symptoms": [
-      "Vertical sidebar tabs fail to scroll when using the mouse wheel",
-      "Clicking inside the ActionsPanel or setting panels clears the active multi-tab selection",
-      "Claude or Codex tab type degrades back to devServer because of the terminal TUI output containing bash strings",
-      "Tab selection indicator or visual elements jump and flicker during drag-and-drop reordering in vertical sidebar",
-      "Two tabs with the same name restore to the wrong AI sessions from the history dashboard"
+      "An active AI tab suddenly downgrades to a devServer tab when the agent outputs npm run dev commands to the terminal",
+      "The tab sidebar fails to scroll with the mouse wheel while horizontal scrolling works fine in fallback layout",
+      "Multi-tab selection is lost as soon as the user clicks inside the prompt editing textarea or actions panel",
+      "A newly created tab group collapses or jumps erratically when dragged near headers during vertical layout reordering",
+      "The custom project icon updated in settings does not instantly reflect in the titlebar workspace tabs"
     ],
     "related_components": [
       "src/renderer/components/Workspace/TabBar.tsx",
       "src/renderer/store/useWorkspaceStore.ts",
       "src/renderer/components/Workspace/Terminal.tsx",
       "src/renderer/components/Workspace/panels/ActionsPanel.tsx",
-      "src/renderer/components/Workspace/panels/InfoPanel.tsx"
+      "src/renderer/components/Workspace/panels/InfoPanel.tsx",
+      "main.js"
     ],
-    "hash": "318b1034094ae2b98dbac821cf356781410836ab7b7a0afb09f4109d230fdefc"
+    "hash": "d673fa33f9d886f0f9ddcbd893da05122cd8f96c47dac3f03ca6c7ed2ee1deb4"
   },
   {
     "path": "docs/knowledge/fix-gemini-capture.md",
@@ -1803,38 +1809,37 @@
     "explicit": [
       "project_home_view",
       "tab_history",
-      "closed_tabs",
-      "title_search_rag",
-      "restore_tab",
-      "virtualized_history",
-      "sqlite_tab_history"
+      "title_search",
+      "rag_embedding_sqlite",
+      "restore_tab"
     ],
     "implicit": [
-      "immediate_session_id_injection",
-      "js_embedding_vector_scan",
-      "z_50_tabbar_overlay",
-      "virtualizer_scroll_overflow_conflict",
-      "inline_progress_indexing",
-      "hotkey_reopen_last_tab",
+      "project_get_tab_history",
+      "tab_history_title_index",
+      "immediate_injection_restore",
       "project_name_sync",
-      "perf_home_commit_trace",
-      "sqlite_tab_history_schema"
+      "z_50_home_overlay",
+      "history_virtualized_stream",
+      "cmd_hover_preview",
+      "perf_home_commit",
+      "reopen_last_closed_tab",
+      "bounded_single_column_layout"
     ],
     "symptoms": [
-      "Restored AI tabs display empty InfoPanel context or delayed session initialization",
-      "Project Home scrollbar is buggy, duplicated, or virtualized rows overlap with header",
-      "TabBar click events leak through the open Project Home view overlay",
-      "Shift+Cmd+T shortcut fails to restore the last closed terminal or bypasses process state recovery",
-      "Semantic search on tab titles is slow or fails due to missing SQLite vector native dependency",
-      "Project Home screen flickers or displays old Active/Favorites columns before history loads"
+      "Home screen shows stale tab history after closing a terminal tab",
+      "Title search does not update synchronously or fails to index new tab titles",
+      "Double scrollbar appears on the Project Home view because of outer container overflow",
+      "AI InfoPanel is empty or lags when restoring a closed Claude/Gemini session from history",
+      "Project Home overlay covers the sidebar or clips the window viewport constraints",
+      "CMD+hover on history items does not show metadata preview popover"
     ],
     "related_components": [
       "src/renderer/components/ProjectHome.tsx",
       "src/renderer/components/ProjectToolbar.tsx",
-      "src/main/ipc/project.ts",
-      "src/main/database/sqlite.ts"
+      "src/renderer/store/workspaceStore.ts",
+      "src/main/ipc/project.ts"
     ],
-    "hash": "5df49b905b302018fe0ea5d019066b72cea0bd2990412d902c1b1160ba4cb9f8"
+    "hash": "1b3288bf6a819a9fbf9ef978e4c1f0c492a561985db74e1976c011b8e5bd92e1"
   },
   {
     "path": "docs/knowledge/fix-claude-aborted-streaming-loader.md",
@@ -2024,42 +2029,41 @@
     "path": "docs/knowledge/fact-codex.md",
     "type": "fact",
     "explicit": [
-      "codex_cli_integration",
-      "pty_agent",
-      "rollout_jsonl",
-      "session_id_detection",
-      "model_picker_flow",
-      "osc133_debounce",
-      "history_panel_adapter"
+      "Codex CLI Integration",
+      "PTY Agent Lifecycles",
+      "Timeline and History parsing",
+      "Model Selection Picker"
     ],
     "implicit": [
-      "codex_rollout_jsonl_parser",
-      "command_codex_bypass",
-      "osc_d_followed_by_b_debounce",
-      "sync_marker_bracketed_paste",
-      "draft_stash_arrow_up_restore",
-      "noted_code_grab_vendor_pid",
-      "codex_known_sessions_teardown",
-      "global_this_singleton_hmr",
-      "replacement_history_compaction",
-      "rate_limits_epoch_seconds",
-      "codex_stop_process_tree"
+      "codex_session_rollout_watcher",
+      "codex_fork_cwd_filter_bypass",
+      "command_codex_bypass_alias",
+      "codex_replacement_history_compaction",
+      "codex_history_preflight_draft",
+      "codex_rate_limit_token_count",
+      "osc133_debounce_cleanup_timer",
+      "descendant_lookup_vendor_pid",
+      "sync_marker_validity_gate",
+      "paste_path_routing",
+      "jsonl_chain_resolution_fork",
+      "hmr_singleton_xterm_registry",
+      "teardown_graceful_interrupted_override"
     ],
     "symptoms": [
-      "Codex starts correctly in terminal but the right-side Timeline or History panel remains empty.",
-      "The model or effort picker hangs, shows a duplicated flag error, or fails to select the reasoning level.",
-      "Closing a tab, quitting the app, or clicking Stop does not fully clean up the background Codex processes.",
-      "The UI loader flickers or gets stuck in a BUSY state right after Codex executes a command.",
-      "Clicking prompt copy or clear opens an external editor but fails to copy or clear the actual TUI composer."
+      "Codex starts successfully but the right Timeline panel is completely empty or missing.",
+      "The copy button for the session ID is empty or the Continue state is unavailable after stopping the process.",
+      "The right-hand loader stays active or stuck in BUSY after a model or reasoning effort picker flow fails.",
+      "Clicking the prompt copy or clear split-button opens an external terminal editor but fails to transfer the input text.",
+      "Selecting a model or effort via dropdown inputs raw text in the CLI instead of applying the setting correctly."
     ],
     "related_components": [
-      "src/main/services/codexWatcher.ts",
-      "src/renderer/components/ControlBar.tsx",
+      "src/main/services/codex-watcher.ts",
       "src/renderer/components/HistoryPanel.tsx",
+      "src/renderer/components/ControlBar.tsx",
       "src/main/pty/terminalRegistry.ts",
       "bin/noted-code-grab.js"
     ],
-    "hash": "9509065f7f7a00673c53f5a5270b99411a61e93043e59acef78bbc45cbce465e"
+    "hash": "1632e804e67416c082bc6ff192d4a49bd4d853849c499cc4f30ac378acf4c978"
   },
   {
     "path": "docs/knowledge/fact-research.md",
@@ -3845,41 +3849,41 @@
     "type": "fact",
     "explicit": [
       "ClaudeControlBar",
-      "AI-tab layout",
-      "Copy-prompt split-pill",
-      "Live input actions",
-      "Codex control bar integration",
-      "Context percentage bridge",
-      "Zustand tab selectors",
-      "Busy-overlay resetting",
-      "Engine branding"
+      "PTY",
+      "SDK",
+      "Codex",
+      "Layout",
+      "UX"
     ],
     "implicit": [
-      "atomic_grab_input",
-      "keyless_component_state_leak",
-      "control_bar_busy_reset",
-      "context_pct_stale_session_guard",
-      "sdk_busy_state_mirror",
-      "focus_terminal_refocus",
-      "popup_right_anchored_geometry",
-      "codex_model_effort_picker",
-      "sdk_context_update_customevent",
+      "keyless_tab_state_leak",
+      "grab_input_atomic",
+      "dictation_enter_pending",
+      "click_to_reset_busy_overlay",
+      "context_pct_bridge",
+      "sdk_busy_mirror",
       "zustand_primitive_selectors",
-      "tab_owned_background_recording"
+      "fork_to_tab_behavior",
+      "busy_shimmer_overlay",
+      "ipc_listener_tab_rebind",
+      "session_id_cmd_hover",
+      "focus_contract_start_continue",
+      "effort_inline_pills"
     ],
     "symptoms": [
-      "Loader overlay in the AI control bar remains stuck or leaks to other tabs after switching",
-      "Clicking clear on the prompt input copies the text but fails to empty the TUI composer, leaving literal ^G sequences",
-      "Focus is lost from the terminal window after clicking Start, Continue, or Fork buttons in the bottom bar",
-      "The context percentage meter displays incorrect or zero values after resuming a stale terminal session",
-      "Selecting Model or Effort triggers an infinite React re-render loop inside the ClaudeControlBar"
+      "Busy loading shimmer overlay stays stuck on the control bar after switching tabs",
+      "Terminating or killing the Claude PTY process leaves the ControlBar in an un-clickable busy state",
+      "Clicking Enter while dictation is in progress sends empty or outdated text to the terminal",
+      "Copy prompt button copies text successfully but fails to clear the input prompt, leaving characters in the composer",
+      "Model or Effort dropdown selection triggers a React error boundary crash with 'Maximum update depth exceeded'",
+      "Focus remains on the Start or Continue button, requiring the user to manually click the terminal before they can type"
     ],
     "related_components": [
       "src/components/ClaudeControlBar.tsx",
       "src/components/Workspace.tsx",
-      "src/components/Terminal.tsx"
+      "src/store/useUIStore.ts"
     ],
-    "hash": "014fb8fb05828f783c1c5fc1eac71bc8a4354c8760040468e183c0236fa9f22c"
+    "hash": "a82c166cd95b6f6b51272428d3a3440a4d24af8f5b4aa317ac2e3d8b7488c452"
   },
   {
     "path": "docs/knowledge/fact-clipboard-tools.md",
@@ -5084,48 +5088,50 @@
     "type": "fact",
     "explicit": [
       "settings_modal",
-      "prompt_management",
+      "prompts_management",
       "claude_extended_thinking",
-      "timeline_virtualization",
-      "notes_line_numbers",
       "custom_drag_and_drop",
       "prompt_groups",
       "sidebar_behavior",
       "auto_apply_toggle",
-      "post_check_toggle"
+      "post_check_toggle",
+      "stepper_control",
+      "timeline_font_settings",
+      "tab_notes_settings"
     ],
     "implicit": [
-      "sidebar_overlay_capture_mousedown",
-      "auto_apply_docs_handshake",
-      "settings_fixed_dimensions",
-      "prompt_auto_save_blur",
-      "timeline_expanded_virtualization",
-      "notes_density_fonts",
-      "stepper_editable_input",
-      "custom_pointer_dnd",
-      "static_midpoints_dnd",
-      "atomic_drop_transitions",
-      "prompt_groups_shared_position",
-      "gemini_cli_response_detection",
-      "post_check_claude_md"
+      "useUIStore_reactivity",
+      "xterm_canvas_pointer_events_capture",
+      "pointer_events_dnd_midpoints",
+      "setDragTransitionsReady_batching",
+      "containIntrinsicSize_timeline_clamp",
+      "stale_state_protection_sqlite_race",
+      "settings_open_customevent_routing",
+      "builtin_prompts_stable_id",
+      "gemini_canonical_model_list",
+      "skills_sync_yaml_normalization",
+      "data_file_preview_root_exclusion",
+      "terminalRegistry_hasSpinnerOnScreen_polling",
+      "stepper_editable_inline_focus_select"
     ],
     "symptoms": [
-      "Modal window size jumps or shifts layout when switching tabs in Settings",
-      "Virtual scrollbar in Timeline jumps or jitters when changing font-size or line-clamp settings",
-      "Prompt configurations or input fields fail to save immediately when losing focus or closing the Settings modal",
-      "Drag-and-drop of prompt items causes flickering, layout target jitter, or double-height gaps upon release",
-      "Sidebar closes unexpectedly when clicking inside the file preview or fails to close when clicking outside on the terminal canvas",
-      "Haiku automated pipeline waits for user manual input instead of auto-applying instructions",
-      "Gemini CLI post-check fires too early and inserts the verification prompt before the model finished outputting due to wrong IDLE detection"
+      "The terminal scrollbar jumps or shakes when scrolling through expanded timeline rows.",
+      "Dragging prompt items or groups in the settings list results in layout flickering or coordinate calculation failures.",
+      "Clicking outside the sidebar fails to close it because the terminal canvas intercepts the mouse event first.",
+      "Changing font sizes or line numbers settings does not update the tab notes slide-out or CMD+hover preview.",
+      "AI settings or prompts are lost or overwritten during asynchronous database writes.",
+      "The post-check prompt is sent too early before Gemini CLI finishes rendering its response due to spinner timing."
     ],
     "related_components": [
       "src/components/SettingsModal.tsx",
-      "src/store/useUIStore.ts",
+      "src/store/uiStore.ts",
+      "src/components/PromptEditor.tsx",
       "src/components/Timeline.tsx",
+      "src/components/Sidebar.tsx",
       "src/components/TabPreviewPopover.tsx",
-      "src/components/PromptEditor.tsx"
+      "src/components/Stepper.tsx"
     ],
-    "hash": "9f4331c91bd2e2ffcd0223903139408524de785a68229e97f3448318ee5c2472"
+    "hash": "8aa479e11eb997f240676b5731be37127b0bb2e9b8cf6c264495fde716f4e43f"
   },
   {
     "path": "docs/knowledge/fix-codemirror-controlled-editor.md",
@@ -5428,42 +5434,43 @@
     "type": "fact",
     "explicit": [
       "claude_code_tui",
-      "bracketed_paste_mode",
       "safe_paste_and_submit",
-      "effort_level_control",
-      "model_switching",
       "stash_flow",
-      "sync_markers",
-      "think_mode"
+      "effort_level",
+      "think_mode",
+      "compact_command",
+      "auto_confirm_dialogs",
+      "sync_markers"
     ],
     "implicit": [
-      "safePasteAndSubmit_chunking",
-      "stash_flow_ctrl_s",
-      "macos_ttyhog_split",
-      "ink_ansi_space_collapse",
-      "utf8_byte_truncate_race",
-      "sentinel_lifecycle_resume",
+      "stale_sync_markers_waitForRender",
+      "programmatic_vs_user_paste",
+      "isControlBusy_derived_state",
+      "claude_tui_bracketed_paste_mode",
+      "claude_tui_stash_flow_ctrl_s",
+      "trim_trailing_effort_entries_buffer",
+      "claude_tui_ready_detector_prompt_char",
+      "auto_confirm_dialog_enter",
+      "history_send_preflight_grab_input",
+      "macos_ttyhog_1024_byte_chunking",
       "deepseek_thinking_effort_conflict",
-      "sigterm_child_pid_stop",
-      "sync_marker_validity",
-      "claude_local_command_watcher",
-      "tui_ready_early_trigger"
+      "local_command_watcher_compact"
     ],
     "symptoms": [
-      "Model or effort switch command gets stuck on confirmation dialog with Yes switch to Haiku option",
-      "Pasted slash commands in Claude Code appear in the terminal input but do not execute until pressing space",
-      "User draft in the terminal input is wiped or lost when clicking a model switch button in the control bar",
-      "Session history file becomes corrupted after session restart when appending Cyrillic or non-ASCII characters",
-      "Stop button in the panel does not terminate the running Claude process and leaves the terminal frozen",
-      "Double-clicking control panel buttons causes command execution to fail and duplicates the input prompt"
+      "Startup default model or effort setting hangs at the confirmation prompt in the terminal",
+      "Pasted text gets corrupted or truncated when sending large inputs to the PTY on macOS",
+      "Double clicking control buttons or triggers causes command interleaving and prompt corruption",
+      "TUI spaces are swallowed, merging words together when parsing or copying text",
+      "User drafts in the terminal prompt are lost or mixed up when triggers or history panel items are clicked"
     ],
     "related_components": [
       "src/main/main.js",
+      "src/renderer/components/InfoPanel.tsx",
       "src/renderer/constants/claudeLevels.ts",
-      "src/main/claude/claude-data.js",
-      "src/renderer/components/InfoPanel.tsx"
+      "src/renderer/utils/claude-data.js",
+      "src/renderer/utils/pendingResume.ts"
     ],
-    "hash": "ee73af2981189480657e07f3e00a065ba6fa94b69034bb7d464b12e2d38a5383"
+    "hash": "b8d5f68fdd5c1e3390956ad54146293cfaf056e0c18b00b800942a746903c6da"
   },
   {
     "path": "docs/knowledge/fact-mcp-routing.md",
@@ -5708,43 +5715,43 @@
     "type": "fact",
     "explicit": [
       "Tab Process Bar",
-      "AI Busy Shimmer",
-      "PTY Status Indicator",
-      "Visual Feedback Settings"
+      "PTY-alive indicator",
+      "AI-busy shimmer",
+      "ProcessBarSettings",
+      "AIPulse removal",
+      "seamless wrapping gradient",
+      "renderer grace period",
+      "CSS-var bridge",
+      "tab layout positioning",
+      "mobile-web mirroring",
+      "project count-badge"
     ],
     "implicit": [
-      "tab_process_bar",
-      "ai_busy_shimmer",
-      "pty_alive_indicator",
-      "renderer_grace_period",
-      "mobile_web_mirror",
-      "css_variable_bridge",
-      "project_tab_aggregation",
-      "aipulse_removal",
-      "layout_edge_anchoring",
-      "border_area_offset",
-      "ui_settings_sync",
-      "claude_spinner_grace_logic",
-      "seamless_gradient_loop",
-      "safePasteAndSubmit_busy_signal"
+      "shimmer_gradient_wrapping",
+      "spinner_grace_window",
+      "css_var_bridge_performance",
+      "border_padding_compensation",
+      "mobile_process_bar_mirror",
+      "project_badge_signal_aggregation",
+      "AIPulse_cleanup",
+      "layout_depth_border_safety",
+      "react_state_avoidance"
     ],
     "symptoms": [
-      "Process bar has a 2px gap from the tab edge",
-      "Claude loading shimmer flickers or resets during thinking phases",
-      "Color picker changes for the loader do not apply instantly",
-      "Mobile app does not show active process indicators in tab list",
-      "Shimmer animation jump or visible seam at the end of the cycle",
-      "Project tabs showing strips instead of numeric count badges"
+      "The tab loader flickers or restarts visual animation every few seconds during Claude long-thinking phases",
+      "The process bar on the left side of the tab has a visible gap or looks misaligned with the active border",
+      "Color picker changes in Settings cause lag or slow down the UI due to intensive tab list re-rendering",
+      "A customized shimmer color looks washed out or fails to reflect the user's opacity adjustment",
+      "Project tabs show a vertical line instead of a count-badge indicating child process activity"
     ],
     "related_components": [
-      "src/renderer/components/TabBar.tsx",
-      "src/renderer/components/TabItem.tsx",
-      "src/renderer/App.tsx",
-      "src/renderer/store/useUIStore.ts",
-      "src/mobile-web/src/App.tsx",
-      "src/renderer/components/SettingsModal.tsx"
+      "src/components/TabBar.tsx",
+      "src/App.tsx",
+      "src/store/useUIStore.ts",
+      "src/components/SettingsModal.tsx",
+      "mobile-web/src/App.tsx"
     ],
-    "hash": "997cd20473648d9477d0aea2f811df71e701b61d2a335d8cbccab0f517bf32f7"
+    "hash": "31b1b0879b5c094e6d76b1e57cb64fde5cbda70840630e808f94a829dfaa8fa8"
   },
   {
     "path": "docs/knowledge/fact-tab-preview-popover.md",

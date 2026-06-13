@@ -34,9 +34,15 @@ Docs-индикаторы для Codex собираются в `codex:get-timeli
 
 Cmd+\ History controls для Codex идут через agent-runtime adapter, а не через Claude-specific ветки внутри HistoryPanel. Правая панель только рендерит оболочку: статус, textarea, Resume/Stop/Pull/Send/Interrupt; Codex-runtime владеет resume через `codex-c`, stop через `terminal:stop-ai-process`, send через `codex:send-command`, draft-grab через `codex:grab-input`, presence через `terminal:getCommandState` + `codex:get-turn-state`. Это нужно, чтобы следующий PTY-agent (Gemini или другой CLI) добавлялся новым runtime, а не ростом условных веток в HistoryPanel.
 
-History send preflight для Codex сначала читает xterm visual state (`terminalRegistry.getCodexDraftState`). `hasDraft=false` с `source=*:dim-hint` означает пустой composer и **не должен** вызывать `codex:grab-input`: Ctrl+G/external-editor cycle на пустом prompt'е меняет TUI-состояние и может проглотить следующий immediate `codex:send-command`. `hasDraft=true` → вызвать `codex:grab-input`, атомарно забрать и очистить composer, append'нуть текст в History textarea, показать `Send stopped · draft moved` и не отправлять History prompt. `hasDraft=null` → fail closed, потому что speculative send может склеить пользовательский draft с новым prompt'ом.
+History send preflight для Codex сначала читает xterm visual state (`terminalRegistry.getCodexDraftState`). `hasDraft=false` с `source=*:dim-hint` означает пустой composer и **не должен** вызывать `codex:grab-input`: Ctrl+G/external-editor cycle на пустом prompt'е меняет TUI-состояние и может проглотить следующий immediate `codex:send-command`. `hasDraft=true` → вызвать `codex:grab-input`, атомарно забрать и очистить composer, prepend'нуть текст в History textarea, показать `Send stopped · draft moved` и не отправлять History prompt. `hasDraft=null` → fail closed, потому что speculative send может склеить пользовательский draft с новым prompt'ом.
 
 Manual Pull из History использует тот же visual-state guard. При `hasDraft=false` это no-op: не трогать external-editor helper, не показывать жёлтое `Send stopped`, а дать короткий нейтральный `Terminal input empty`. Это защищает от ложного пользовательского вывода «отправка была остановлена», когда на самом деле переноса не было.
+
+Порядок prepend общий с Claude: текст, уже набранный в TUI composer, является первичным draft'ом пользователя и должен оказаться перед текстом из History textarea. Append ломает намерение в сценарии «сначала написал в terminal, потом открыл History и решил отправить другое»: пользователь получает обратный порядок причин, хотя приложение формально ничего не потеряло.
+
+Если prompt ушёл из History и пользователь быстро нажал Stop, Codex может сначала вернуть draft в terminal composer и только затем записать `turn_aborted` в rollout JSONL. History runtime слушает именно `turn_aborted`, после него делает короткую серию probes terminal draft (первый probe может быть пустым) и prepend'ит найденный текст обратно в textarea с `Prompt restored`. Если terminal draft не читается, fallback — последний отправленный History prompt; это лучше дубликата в TUI, чем пустая History textarea при видимом пользовательском тексте в терминале.
+
+History textarea draft хранится per-tab вне mount-cycle панели. Закрытие/открытие `Cmd+\` не очищает input; clear происходит после успешного send или явного действия пользователя. Симптом регресса: юзер закрыл History на время проверки терминала, открыл снова, а недоотправленный prompt исчез.
 
 ## Usage limits
 
@@ -61,6 +67,8 @@ Prompt Queue / Run after использует тот же high-level слой: `
 У Codex есть дополнительный shell-layer шум: PTY shell может эмитить OSC 133 `D` (`terminal:command-finished`) на короткой внутренней границе, а затем почти сразу приходит `B` и Codex продолжает тот же TUI lifecycle. Если на первый `D` сразу делать общий command-finished cleanup, приложение преждевременно чистит `codexKnownSessions`, закрывает turn watcher и гасит process state; пользователь видит микрофлап loader'а или Continue-state при живом Codex.
 
 Для Codex-tab `parseOSC133AndEmit` задерживает `terminal:command-finished` на 250ms. Если за это окно приходит `B`, timer отменяется и логируется `[CodexTurn] suppress command-finished ... reason=osc-d-followed-by-b`. Если `B` не пришёл и `terminalCommandState` всё ещё idle — delayed cleanup выполняется. Это не заменяет rollout JSONL busy: `task_started/task_complete/turn_aborted` остаются источником turn-loader'а; debounce защищает только shell lifecycle cleanup.
+
+После задержки `D` недостаточно проверить только `terminalCommandState`: Codex может продолжать жить как descendant под shell, даже если shell-level OSC уже сказал idle. Перед финальным `command-finished` main делает descendant-lookup по tab и engine=`codex`; если найден живой Codex PID, state возвращается в running, renderer получает `terminal:command-started`, а turn watcher переармится по известному session id. Пользовательский симптом без этого guard'а — loader/Continue флапает или гаснет на живом Codex TUI после короткой shell-границы.
 
 ## Модели и effort
 

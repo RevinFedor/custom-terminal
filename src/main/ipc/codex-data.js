@@ -607,6 +607,266 @@ function buildCodexFullHistory(records, sessionId) {
   return entries.map(({ turnIndex, ...entry }) => entry);
 }
 
+const CODEX_SHELL_TOOLS = new Set([
+  'exec_command', 'write_stdin', 'read_output', 'run_command', 'restart_process',
+  'kill_process', 'run_chain',
+]);
+const CODEX_SUBAGENT_NAMES = new Set(['spawn_agent', 'resume_agent', 'wait_agent', 'send_input', 'close_agent']);
+const CODEX_OUTPUT_LIMIT = 60_000;
+
+function stringifyCompact(value, max = CODEX_OUTPUT_LIMIT) {
+  let text = '';
+  if (value == null) text = '';
+  else if (typeof value === 'string') text = value;
+  else text = JSON.stringify(value, null, 2);
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}\n\n[truncated ${text.length - max} chars]`;
+}
+
+function stripBase64Images(text) {
+  return String(text || '').replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=_-]+/g, '[image: base64 omitted]');
+}
+
+function summarizeToolSearchOutput(payload) {
+  const tools = Array.isArray(payload?.tools) ? payload.tools : [];
+  if (tools.length === 0) return stringifyCompact(payload?.output || payload, 10_000);
+  const lines = [];
+  const visit = (node, prefix = '') => {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 'namespace' && node.name) {
+      lines.push(`${prefix}${node.name}/`);
+      const childPrefix = `${prefix}  `;
+      for (const child of Array.isArray(node.tools) ? node.tools : []) visit(child, childPrefix);
+      return;
+    }
+    if (node.name) {
+      lines.push(`${prefix}${node.name}`);
+    }
+  };
+  for (const tool of tools) visit(tool);
+  return lines.join('\n') || `[tool_search returned ${tools.length} tools]`;
+}
+
+function codexToolName(call) {
+  if (!call) return 'tool';
+  if (call.type === 'web_search_call') return 'web_search';
+  if (call.type === 'tool_search_call' || call.type === 'tool_search_output') return 'tool_search';
+  return call.name || call.tool_name || call.type || 'tool';
+}
+
+function codexToolGroup(call) {
+  const type = call?.type;
+  const name = codexToolName(call);
+  const namespace = call?.namespace || '';
+  if (type === 'web_search_call' || name === 'web_search') return 'web';
+  if (type === 'tool_search_call' || type === 'tool_search_output' || name === 'tool_search') return 'toolSearch';
+  if (namespace === 'multi_agent_v1' || CODEX_SUBAGENT_NAMES.has(name)) return 'subagent';
+  if (name === 'apply_patch') return 'editing';
+  if (namespace && namespace.startsWith('mcp__')) return 'mcp';
+  if (CODEX_SHELL_TOOLS.has(name)) return 'bash';
+  return 'tools';
+}
+
+function parseCodexCallArgs(call) {
+  if (!call) return {};
+  if (call.type === 'web_search_call') return call.action || {};
+  if (call.type === 'tool_search_call') return call.arguments || {};
+  return parseToolArguments(call);
+}
+
+function shouldIncludeCodexTool(group, toolName, opts) {
+  if (!opts.includeClaude) return false;
+  if (group === 'editing') return !!opts.includeEditing;
+  if (group === 'bash') return !!opts.includeBash;
+  if (group === 'mcp') return !!opts.includeTools;
+  if (group === 'web') return !!opts.includeWebSearch;
+  if (group === 'toolSearch') return !!opts.includeToolSearch;
+  if (group === 'tools') return !!opts.includeOtherTools;
+  if (group === 'subagent') {
+    if (opts.includeSubagentHistory) return true;
+    return !!opts.includeSubagentResult && toolName === 'wait_agent';
+  }
+  return false;
+}
+
+function codexToolLabel(call) {
+  const name = codexToolName(call);
+  const namespace = call?.namespace || '';
+  if (name === 'apply_patch') return '🧩 apply_patch';
+  if (CODEX_SHELL_TOOLS.has(name)) return `🖥 ${name}`;
+  if (namespace === 'multi_agent_v1' || CODEX_SUBAGENT_NAMES.has(name)) return `🧵 ${name}`;
+  if (namespace && namespace.startsWith('mcp__')) return `🔌 ${namespace} / ${name}`;
+  if (name === 'web_search') return '🌐 web_search';
+  if (name === 'tool_search') return '🧰 tool_search';
+  return `⚙️ ${name}`;
+}
+
+function normalizeCodexToolOutput(outputPayload) {
+  if (!outputPayload) return '';
+  if (outputPayload.type === 'tool_search_output') return summarizeToolSearchOutput(outputPayload);
+  const raw = outputPayload.output != null ? outputPayload.output : outputPayload.result;
+  if (raw == null) return '';
+  return stripBase64Images(stringifyCompact(raw));
+}
+
+function formatCodexToolForExport(call, outputPayload, opts) {
+  const group = codexToolGroup(call);
+  const name = codexToolName(call);
+  if (!shouldIncludeCodexTool(group, name, opts)) return null;
+
+  const args = parseCodexCallArgs(call);
+  const output = normalizeCodexToolOutput(outputPayload);
+  const body = { request: args };
+  if (output) body.response = output;
+  if (outputPayload?.is_error) body.isError = true;
+
+  return [
+    '🛠 TOOL:',
+    codexToolLabel(call),
+    '```json',
+    stringifyCompact(body),
+    '```',
+    '',
+  ].join('\n');
+}
+
+function removeLastCodexTurns(entries, numTurns) {
+  const requested = Number(numTurns || 1);
+  if (!requested || requested <= 0) return;
+  const turns = [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const tid = entries[i]?.turnIndex;
+    if (typeof tid !== 'number') continue;
+    if (!turns.includes(tid)) turns.push(tid);
+    if (turns.length >= requested) break;
+  }
+  const remove = new Set(turns);
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (remove.has(entries[i]?.turnIndex)) entries.splice(i, 1);
+  }
+}
+
+function buildCodexCleanExport(records, sessionId, cwd, opts) {
+  const meta = getSessionMeta(records);
+  const entries = [];
+  const pendingCalls = new Map();
+  let currentTurnIndex = -1;
+  let pendingThinking = '';
+
+  const push = (entry) => entries.push({ ...entry, turnIndex: currentTurnIndex });
+
+  for (const record of records) {
+    const payload = record.payload || {};
+
+    if (record.type === 'compacted') {
+      push({
+        kind: 'compact',
+        text: compactEventContent(payload),
+      });
+      continue;
+    }
+
+    if (record.type === 'event_msg') {
+      if (payload.type === 'user_message') {
+        currentTurnIndex += 1;
+        if (opts.includeUser) {
+          const images = [
+            ...(Array.isArray(payload.local_images) ? payload.local_images : []),
+            ...(Array.isArray(payload.images) ? payload.images : []),
+          ];
+          const imageLines = images.map((img) => `[image: ${typeof img === 'string' ? img : 'attached image'}]`);
+          push({
+            kind: 'user',
+            text: [payload.message || extractTextContent(payload.content), ...imageLines].filter(Boolean).join('\n'),
+          });
+        }
+      } else if (payload.type === 'thread_rolled_back') {
+        removeLastCodexTurns(entries, Number(payload.num_turns || payload.turns || 1));
+        currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
+      }
+      continue;
+    }
+
+    if (record.type !== 'response_item') continue;
+
+    if (payload.type === 'reasoning') {
+      const text = extractReasoning(payload.summary || payload.content);
+      if (text) pendingThinking = pendingThinking ? `${pendingThinking}\n${text}` : text;
+      continue;
+    }
+
+    if (payload.type === 'message' && payload.role === 'assistant') {
+      if (!opts.includeClaude) {
+        pendingThinking = '';
+        continue;
+      }
+      const text = opts.includeText ? extractTextContent(payload.content) : '';
+      const thinking = opts.includeThinking && pendingThinking ? `<thinking>\n${pendingThinking}\n</thinking>` : '';
+      const content = [thinking, text].filter(Boolean).join('\n\n').trim();
+      if (content) push({ kind: 'assistant', text: content });
+      pendingThinking = '';
+      continue;
+    }
+
+    if (payload.type === 'web_search_call') {
+      const formatted = formatCodexToolForExport(payload, null, opts);
+      if (formatted) push({ kind: 'tool', text: formatted });
+      continue;
+    }
+
+    if (payload.type === 'tool_search_call') {
+      const callId = payload.call_id || stableUuid(sessionId, record.__line, 'codex-tool-search');
+      pendingCalls.set(callId, payload);
+      continue;
+    }
+
+    if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
+      const callId = payload.call_id || payload.id || stableUuid(sessionId, record.__line, 'codex-call');
+      pendingCalls.set(callId, payload);
+      continue;
+    }
+
+    if (payload.type === 'tool_search_output') {
+      const callId = payload.call_id || payload.id;
+      const call = pendingCalls.get(callId) || { type: 'tool_search_call', arguments: {} };
+      const formatted = formatCodexToolForExport(call, payload, opts);
+      if (formatted) push({ kind: 'tool', text: formatted });
+      pendingCalls.delete(callId);
+      continue;
+    }
+
+    if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
+      const callId = payload.call_id || payload.id;
+      const call = pendingCalls.get(callId) || { type: payload.type, name: payload.name || 'tool' };
+      const formatted = formatCodexToolForExport(call, payload, opts);
+      if (formatted) push({ kind: 'tool', text: formatted });
+      pendingCalls.delete(callId);
+    }
+  }
+
+  const out = [];
+  out.push('# Codex Session Export');
+  out.push(`Session: ${sessionId}`);
+  out.push(`CWD: ${cwd || meta.cwd || 'unknown'}`);
+  if (meta.forked_from_id) out.push(`Forked from: ${meta.forked_from_id}`);
+  out.push('');
+
+  for (const entry of entries) {
+    const text = String(entry.text || '').trim();
+    if (!text) continue;
+    if (entry.kind === 'user') {
+      out.push('---', '', '👤 USER:', text, '');
+    } else if (entry.kind === 'assistant') {
+      out.push('🤖 CODEX:', text, '');
+    } else if (entry.kind === 'tool') {
+      out.push(text);
+    } else if (entry.kind === 'compact') {
+      out.push('═══ COMPACTED ═══', text, '');
+    }
+  }
+  return out.join('\n');
+}
+
 function normalizeCodexReset(value) {
   if (value == null) return null;
   if (typeof value === 'number' && Number.isFinite(value)) {
@@ -790,6 +1050,41 @@ function register() {
       };
     } catch (error) {
       console.error('[CodexData] get-full-history error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('codex:export-clean-session', async (_event, {
+    sessionId, cwd,
+    includeEditing = false, includeReading = false, fromStart = true,
+    includeSubagentResult = false, includeSubagentHistory = false,
+    includeUser = true, includeClaude = true,
+    includeText = true, includeThinking = true,
+    includeBash = false, includeTools = false,
+    includeWebSearch = false, includeToolSearch = false, includeOtherTools = includeTools,
+  }) => {
+    try {
+      const loaded = await loadSessionRecords(sessionId, cwd);
+      if (!loaded.success) return loaded;
+      const content = buildCodexCleanExport(loaded.records, sessionId, cwd, {
+        includeEditing,
+        includeReading,
+        fromStart,
+        includeSubagentResult,
+        includeSubagentHistory,
+        includeUser,
+        includeClaude,
+        includeText,
+        includeThinking,
+        includeBash,
+        includeTools,
+        includeWebSearch,
+        includeToolSearch,
+        includeOtherTools,
+      });
+      return { success: true, content, filePath: loaded.filePath };
+    } catch (error) {
+      console.error('[CodexData] export-clean-session error:', error);
       return { success: false, error: error.message };
     }
   });

@@ -12,6 +12,11 @@ Source: `src/renderer/App.tsx::handleReopenLastClosedCapture`, `src/renderer/sto
 
 Позиция — именно **hint**, а не контракт. Если юзер успел закрыть три вкладки слева и открыть две новые, точную «прежнюю позицию» восстановить невозможно — клемп гарантирует, что новая вкладка хотя бы не вылезет за пределы main-зоны (utility всегда после main).
 
+### Восстановление в tab-группу
+Если вкладка закрывалась внутри group-row, `archiveTab` сохраняет её `group_id`. При Shift+Cmd+T и restore из Home это поле применяется только после проверки, что группа с таким id всё ещё существует в текущем `workspace.tabGroups`.
+
+Мы намеренно сохраняем только id контейнера, не snapshot группы. Если пользователь к моменту restore удалил папку через Delete Group или Close Group, вкладка восстанавливается плоско: история отвечает за рабочую сессию, а не за воскресение удалённой структуры сайдбара. Иначе закрытая вкладка могла бы незаметно вернуть папку, которую пользователь уже убрал.
+
 ### Continue Session — авто-decision по live-state
 Для Claude/Gemini-вкладок ключевой вопрос: запускать ли `claude-c --resume <sessionId>` при reopen, или просто открыть таб без процесса. Решение зависит от того, **был ли CLI жив на момент закрытия**:
 
@@ -50,20 +55,24 @@ App-level capture listener: `e.metaKey && e.shiftKey && e.code === 'KeyT'` (см
 
 ## Schema migration
 ```sql
+ALTER TABLE tabs ADD COLUMN name_set_manually INTEGER DEFAULT 0;
+ALTER TABLE tab_history ADD COLUMN name_set_manually INTEGER DEFAULT 0;
 ALTER TABLE tab_history ADD COLUMN position INTEGER DEFAULT NULL;
 ALTER TABLE tab_history ADD COLUMN process_was_running INTEGER DEFAULT 0;
+ALTER TABLE tab_history ADD COLUMN group_id TEXT DEFAULT NULL;
 ```
 
-Старые записи (созданные до миграции) попадают с `position=NULL`, `process_was_running=0`. Поведение для них: вкладка восстанавливается в конец TabBar, без auto-continue. Это совместимо со старым `ProjectHome::restoreTab`, который и сейчас даёт `pendingAction = 'claude-continue'` если есть `claude_session_id` — просто Shift+Cmd+T здесь чуть консервативнее по умолчанию (только живой процесс).
+Старые записи (созданные до миграции) попадают с `position=NULL`, `process_was_running=0`, `group_id=NULL`, `name_set_manually=0`. Поведение для них: вкладка восстанавливается в конец TabBar, без auto-continue и без group assignment. Это совместимо со старым `ProjectHome::restoreTab`, который и сейчас даёт `pendingAction = 'claude-continue'` если есть `claude_session_id` — просто Shift+Cmd+T здесь чуть консервативнее по умолчанию (только живой процесс).
 
 ## Path-зависимости
 
 | Файл | Что делает |
 |---|---|
-| `src/main/database.js` | Колонки `position`, `process_was_running` в `tab_history`. `archiveTab` принимает их. Новый метод `popLatestTabHistory(projectId)`. |
+| `src/main/database.js` | Колонки `name_set_manually`, `position`, `process_was_running`, `group_id` в `tab_history`; `name_set_manually` в `tabs`. `archiveTab` принимает их. Новый метод `popLatestTabHistory(projectId)`. |
 | `src/main/main.js` | IPC `project:reopen-last-closed-tab` (pop + return). |
-| `src/renderer/store/useWorkspaceStore.ts::closeTab` | Перед archive снимает `commandState.isRunning` (OSC 133) и position в main-зоне. |
-| `src/renderer/store/useWorkspaceStore.ts::reopenLastClosedTab` | Pop через IPC → createTab с pendingAction (по condition `wasRunning`) → re-order в Map по `position` → switchTab. |
+| `src/renderer/store/useWorkspaceStore.ts::closeTab` | Перед archive снимает `commandState.isRunning` (OSC 133), position в main-зоне, `nameSetManually` и текущий `groupId`. |
+| `src/renderer/store/useWorkspaceStore.ts::reopenLastClosedTab` | Pop через IPC → validate `group_id` against live `workspace.tabGroups` → createTab с pendingAction (по condition `wasRunning`) и `nameSetManually` → re-order в Map по `position` → switchTab. |
+| `src/renderer/components/Workspace/ProjectHome.tsx::restoreTab` | Restore из Home использует тот же group-id validation, чтобы клик по history-card и Shift+Cmd+T не расходились по поведению. |
 | `src/renderer/App.tsx::handleReopenLastClosedCapture` | Capture-phase keydown listener (`Shift+Cmd+T`). |
 | `src/renderer/components/Workspace/Terminal.tsx` (оба `attachCustomKeyEventHandler`) | Swallow Shift+Cmd+T чтобы `T` не утёк в PTY. |
 

@@ -69,9 +69,11 @@ Claude PTY spinner остаётся эвристикой: main эмитит `cla
 
 ## ProcessBar position toggle
 
-`position: 'left' | 'right'` — рисуется у левого или правого края вкладки. `[processBarPosition === 'right' ? 'right' : 'left']: -2px` + закругление углов только на «своей» стороне (`borderTopLeftRadius` или `borderTopRightRadius`). Юзер: *«добавь также тогл переключатель, чтобы она отображалась справа вкладки в правом конце»*.
+`position: 'left' | 'right'` — рисуется у левого или правого края вкладки. Для левого края применяется `left: -2px`; для правого — `right: 0`. Закругление углов только на «своей» стороне (`borderTopLeftRadius` или `borderTopRightRadius`). Юзер: *«добавь также тогл переключатель, чтобы она отображалась справа вкладки в правом конце»*.
 
-**Почему `-2px`, не `0`.** Сама вкладка имеет `border-left: 2px solid transparent` (резерв под dashed-states selected/interrupted чтобы все табы не дёргались по ширине при включении выделения). Абсолютные дети с `left: 0` позиционируются от **padding-edge**, не от outer perimeter — отрисовываются ВНУТРИ border-area, между transparent border'ом и контентом. Визуально это даёт 2px зазор между полоской и реальным краем карточки. Симптом — юзер: *«полоска не прижата, там расстояние где-то в 1-2 пикселя есть»*. Фикс — `left: -2px` (соответственно `right: -2px` при position=right), полоска занимает border-area целиком, упирается в outer-edge.
+**Почему слева `-2px`, а справа `0`.** Сама вкладка имеет `border-left: 2px solid transparent` (резерв под dashed-states selected/interrupted чтобы все табы не дёргались по ширине при включении выделения). Абсолютные дети с `left: 0` позиционируются от **padding-edge**, не от outer perimeter — отрисовываются ВНУТРИ border-area, между transparent border'ом и контентом. Визуально это даёт 2px зазор между полоской и реальным левым краем карточки. Фикс слева — `left: -2px`, полоска занимает border-area целиком.
+
+Справа такого transparent border нет. Старый симметричный `right: -2px` у visual-child вкладок выталкивал полоску за правую границу меню: child-row уже смещён вправо через indent, и лишние 2px оказывались за контейнером. Поэтому right-position anchored как `right: 0`, а visual-child wrapper получает `width: calc(100% - indent)` + `boxSizing: border-box`: вся вложенная карточка с process-bar остаётся внутри правой границы sidebar.
 
 Маркер sessionStatus всегда слева независимо от bar-position — потому что слева удобнее читается рядом с текстом названия вкладки. Если bar тоже слева — между ними 2px зазор; если bar справа — слева остаётся padding под маркер.
 

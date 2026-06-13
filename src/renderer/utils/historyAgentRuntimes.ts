@@ -52,6 +52,7 @@ export interface HistoryAgentRuntime {
   pasteBusyEvent?: string;
   supportsQuestions: boolean;
   supportsInterruptRecovery: boolean;
+  interruptRecoveryReasons?: readonly string[];
   allowSendWhileBusy: boolean;
   optimisticBusyOnSend: boolean;
   optimisticActiveOnInterrupt: boolean;
@@ -245,6 +246,7 @@ const CLAUDE_RUNTIME: HistoryAgentRuntime = {
   pasteBusyEvent: 'claude:paste-busy',
   supportsQuestions: true,
   supportsInterruptRecovery: true,
+  interruptRecoveryReasons: ['interrupt'],
   allowSendWhileBusy: true,
   optimisticBusyOnSend: true,
   optimisticActiveOnInterrupt: true,
@@ -266,7 +268,8 @@ const CODEX_RUNTIME: HistoryAgentRuntime = {
   busyEvent: 'codex:busy-state',
   readyEvent: 'codex:session-detected',
   supportsQuestions: false,
-  supportsInterruptRecovery: false,
+  supportsInterruptRecovery: true,
+  interruptRecoveryReasons: ['turn_aborted'],
   allowSendWhileBusy: false,
   optimisticBusyOnSend: false,
   optimisticActiveOnInterrupt: false,
