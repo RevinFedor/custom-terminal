@@ -28,6 +28,11 @@
   </tr>
 </table>
 
+## Related Repositories
+
+- [Desktop AI App](https://github.com/RevinFedor/Desktop-ai-app) — macOS companion app for system dictation, desktop Gemini chat, prompt library, and the Voice Record REST/SSE API used by the iOS client.
+- [Main iOS App](https://github.com/RevinFedor/main-ios-app) — native iPhone control surface for Noted Terminal projects/tabs and Desktop AI App chat/voice workflows.
+
 ---
 
 ## Проблема
@@ -208,6 +213,17 @@ Project-scoped (фильтрует по cwd). Управляет **живым** 
 
 В конце сессии вставляешь промпт `docs-rules.prompt.md` → агент анализирует изменения → обновляет `docs/knowledge/`. Фильтрация: только невидимый контекст (мотивация, шрамы, неочевидные связи — не пересказ кода). Индекс пересобирается через `build-index.sh`.
 
+### 🔎 Documentation Search MCP
+
+Для поиска по проектной документации используется отдельный публичный пакет
+[docs_search MCP](https://github.com/RevinFedor/docs_search_mcp). Проект хранит факты, шрамы и методологию в `docs/`, а `.semantic-index.json` выступает компактной картой: агент отправляет в `docs_search` симптом или задачу, MCP выбирает нужные markdown-файлы, и агент читает их в контекст перед изменением кода.
+
+После существенных изменений в документации индекс пересобирается через MCP `docs_reindex` или напрямую:
+
+```bash
+bash scripts/ai/build-index.sh --gemini-write
+```
+
 ---
 
 ## Getting Started
@@ -344,3 +360,5 @@ Event-driven: `waitForClaudeSessionId`, `findInLogs('BoundaryMarker')`, no `wait
 ## License
 
 MIT
+
+> ! Documentation is routed through `docs_search MCP`: agents call `docs_search`, receive relevant files from `.semantic-index.json`, and read those files into context before non-trivial code changes.
