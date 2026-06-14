@@ -61,6 +61,21 @@ GET /api/active-loaders   (Bearer-token, тот же ~/.noted-terminal/web-token
 уже закрыт или недоступен. Для sibling-host сценария правильная команда — прямой
 `npm run build:install` из `/Users/fedor/Desktop/custom-terminal`.
 
+### AI-hop изнутри Noted Terminal
+Когда rebuild инициирует агент внутри самого Noted Terminal, он не должен запускать
+`npm run build:install` в своей PTY-вкладке: управляющий процесс умрёт вместе с приложением.
+Terminal MCP tool `build_install_noted_terminal` передаёт задачу в Voice Record
+`POST /api/terminal/build-install` с `returnTo` (`tabId`, `sessionId`, `projectId`,
+`projectPath`). MCP tool сразу возвращает job id; дальнейшее ожидание живёт в Voice Record.
+
+После exit build-команды Voice Record не использует фиксированный sleep. Он читает live
+`~/.noted-terminal/mcp-port-*`, фильтрует живые PID и проект, предпочитает packaged-инстанс,
+дёргает `/terminal/tabs?color=` и ждёт, пока исходный tab существует, PTY alive, а `sessionId`
+снова совпал. Только после этого callback шлёт completion prompt через `/terminal/ai-prompt`.
+Это защищает кейс, где после install восстанавливается 20+ вкладок и нужная AI-сессия появляется
+позже самого окна. Статус callback виден в Voice Record `GET /api/terminal/build-install`
+(`returnTo`, `callback`, `logTail`).
+
 ### Env-кнобы
 `POLL_MS=1000`, `IDLE_CONFIRM=2`, `NO_BUILD=1` (только наблюдать), `PORT=7878` (форсить порт, минуя discovery — для теста).
 

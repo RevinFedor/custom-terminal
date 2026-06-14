@@ -22,7 +22,7 @@ Overseer — глобальный MCP-сервер (`~/.claude/mcp/overseer-serv
 ## 10 тулов: чтение (granular) + редактирование
 
 **Чтение** — agent сам решает сколько контекста забрать, сервер не навязывает:
-- `list_open_sessions` — все Claude/Codex табы всех проектов: tabId, sessionId, isLive, cwd, project, createdAt
+- `list_open_sessions` — все Claude/Codex табы всех проектов: tabId, sessionId, cwd, project, createdAt + runtime-поля `status`, `busy`, `busySources`, `turnBusy`, `lastEventType/lastEventTs`. Для Claude дополнительно отдаёт `model`, `contextUsedPct/contextRemainingPct` и `contextSource` (`bridge` или persisted DB), если это видно из statusline bridge. Эти поля нужны регистратору: `isLive` означает только «PTY/таб жив», а не «ответ уже готов».
 - `session_stats` — масштаб **без контента**: turnCount, char-counts по ролям, toolUseCount, largestUserTurn/largestThinkingTurn, compact-счётчики, заметки/rewind-маркеры/docs-edits
 - `list_turns` — карта ходов: preview (220 char) + размеры каждого thinking/text-блока + имена tool_uses. Контент НЕ грузится
 - `list_notes` — пользовательские якоря Timeline (заметки, rewind-маркеры, orphan-notes)
@@ -38,6 +38,14 @@ Overseer — глобальный MCP-сервер (`~/.claude/mcp/overseer-serv
 ## Granular-чтение: почему agent decides volume
 
 19MB-сессия (262 turn'а) → читаемый overview за ~6K токенов. Сервер отдаёт **карту размеров** (`session_stats` → `list_turns`), агент видит где мясо и тянет точечно `get_thinking` только нужных ходов с byte-range для больших. Это не truncate-на-сервере: агент сам решает глубину. Эмпирически agent сначала зовёт thinking (плотнее текста — Claude в нём пересказывает задачу), text только если непонятно.
+
+## Ожидание ответа: status первичен, текст вторичен
+
+Terminal MCP `send_prompt` подтверждает только доставку текста в живую вкладку. `Status: sent` не означает, что Claude/Codex закончил отвечать. После отправки регистратор должен ждать через Overseer: `list_open_sessions` пока нужная сессия появилась с `sessionId`, затем пока `busy:false` и `status` стал `active` или `closed`.
+
+`get_assistant_text` может уже показывать промежуточные text-блоки, пока `busy:true`: для длинного Claude-аудита это нормальное состояние, а не готовый финал. Если оркестратор объявил «Claude не ответил», а позже в JSONL появился финальный text-блок, это баг преждевременного ожидания/timeout в оркестраторе, не потеря ответа.
+
+`terminal.read_output` допустим только как аварийный fallback, когда Overseer вообще не видит sessionId. TUI-буфер содержит ANSI/обрезку/wrap и может отставать от JSONL, поэтому не является источником истины для ответа агента.
 
 ## Edit через существующие IPC + auto-fork safety
 

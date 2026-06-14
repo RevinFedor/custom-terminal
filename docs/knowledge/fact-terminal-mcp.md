@@ -24,6 +24,18 @@ MCP-сервер определяет проект через `process.cwd()` (�
 
 Terminal MCP управляет **живым процессом**, а не историей. `start_ai` создаёт или переиспользует вкладку и запускает `claude` / `codex` / `gemini` через те же app-native launch hooks, что UI. `send_prompt` вставляет prompt в целевую вкладку через существующий safe paste path, `stop_ai` останавливает AI process-tree без уничтожения shell. Для `codex-c` / `codex-f` / `claude-c` / `claude-f` create-tab aliases проходят через pendingAction, чтобы renderer применил тот же resume/fork flow, что пользовательская кнопка.
 
+`send_prompt` / `Status: sent` — это delivery-only сигнал. Он подтверждает, что prompt доставлен в PTY/agent tab, но не ждёт завершения ответа. Completion и финальный текст читать через Overseer (`list_open_sessions` → `busy/status` → `session_stats/list_turns/get_assistant_text`), иначе агент начинает парсить TUI-output и преждевременно объявляет long-running Claude «не ответившим».
+
+`build_install_noted_terminal` — исключение из обычных terminal-actions: это fire-and-forget
+handoff в Voice Record, а не команда в текущей PTY. Использовать его, когда агент внутри
+Noted Terminal должен инициировать `npm run build:install` самого Noted Terminal. Tool
+передаёт `returnTo` исходного tab/session в Voice Record и сразу возвращает job id; после
+рестарта callback в Voice Record ждёт восстановления именно этой вкладки/сессии и сам
+отправляет completion prompt через `/terminal/ai-prompt`. Нельзя заменять это на
+`run_command("npm run build:install")` или чтение terminal output: управляющая вкладка будет
+убита install-процессом, а readiness после рестарта определяется через MCP `/terminal/tabs`,
+не через таймаут.
+
 Граница с Overseer: если нужно узнать, что агент уже сделал, читать session history через overseer. Если нужно заставить живую вкладку что-то сделать сейчас, использовать terminal MCP. Не пытаться реализовать Codex orchestration через rewrite rollout JSONL: Codex history append-only и не имеет Claude edit-range модели.
 
 ## MCP activity events
