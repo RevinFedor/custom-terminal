@@ -107,6 +107,69 @@ const subscribers = new Map();
 // pending bridge requests to renderer: requestId → { resolve, reject, timer }
 const pendingBridge = new Map();
 
+function shortId(value, len = 8) {
+  const s = value == null ? '' : String(value);
+  return s ? s.slice(-len) : 'nil';
+}
+
+function summarizeStreamMessage(message) {
+  const recordType = message?.type || '-';
+  const msg = message?.message && typeof message.message === 'object' ? message.message : null;
+  const blocks = Array.isArray(msg?.content) ? msg.content : [];
+  let textLen = 0;
+  let thinkingLen = 0;
+  let toolUses = 0;
+  let toolResults = 0;
+  let toolResultLen = 0;
+  for (const block of blocks) {
+    if (!block || typeof block !== 'object') continue;
+    if (block.type === 'text') textLen += String(block.text || '').length;
+    else if (block.type === 'thinking') thinkingLen += String(block.thinking || '').length;
+    else if (block.type === 'tool_use') toolUses += 1;
+    else if (block.type === 'tool_result') {
+      toolResults += 1;
+      const c = block.content;
+      toolResultLen += typeof c === 'string' ? c.length : JSON.stringify(c || '').length;
+    }
+  }
+  const resultLen = message?.result == null
+    ? 0
+    : typeof message.result === 'string'
+      ? message.result.length
+      : JSON.stringify(message.result).length;
+  return ' record=' + recordType +
+    ' uuid=' + shortId(message?.uuid) +
+    ' msg=' + shortId(msg?.id) +
+    ' session=' + shortId(message?.sessionId || message?.session_id) +
+    ' blocks=' + blocks.length +
+    ' textLen=' + textLen +
+    ' thinkingLen=' + thinkingLen +
+    ' tools=' + toolUses +
+    ' toolResults=' + toolResults +
+    ' toolResultLen=' + toolResultLen +
+    ' resultLen=' + resultLen +
+    ' synthetic=' + (message?.__webSynthetic === true) +
+    ' queued=' + (message?.__wasQueued === true);
+}
+
+function summarizeBroadcastPayload(payload) {
+  if (!payload || typeof payload !== 'object') return '';
+  if (payload.type === 'message') return summarizeStreamMessage(payload.message);
+  if (payload.type === 'snapshot') {
+    return ' status=' + (payload.sessionStatus || '-') +
+      ' busy=' + (payload.busy == null ? '-' : payload.busy) +
+      ' session=' + shortId(payload.sessionId) +
+      ' tool=' + (payload.toolType || payload.commandType || '-');
+  }
+  if (payload.type === 'busy') return ' busy=' + (payload.busy == null ? '-' : payload.busy) + ' reason=' + (payload.reason || '-');
+  if (payload.type === 'done') return ' session=' + shortId(payload.sessionId) + ' reason=' + (payload.reason || '-');
+  if (payload.type === 'bridge-update') return ' model=' + (payload.model || '-') + ' context=' + (payload.contextPct == null ? '-' : payload.contextPct);
+  if (payload.type === 'queue-update') return ' queue=yes';
+  if (payload.type === 'ask-question') return ' source=' + (payload.source || '-') + ' questions=' + (Array.isArray(payload.questions) ? payload.questions.length : 0);
+  if (payload.type === 'question-cancelled') return ' source=' + (payload.source || '-');
+  return '';
+}
+
 function loadOrCreateToken() {
   try {
     fs.mkdirSync(path.dirname(TOKEN_PATH), { recursive: true });
@@ -454,12 +517,22 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
     const sink = {
       kind: 'sse',
-      send: (str) => { try { res.write('data: ' + str + '\n\n'); } catch {} },
+      sent: 0,
+      errors: 0,
+      send: (str) => {
+        try {
+          res.write('data: ' + str + '\n\n');
+          sink.sent += 1;
+        } catch (e) {
+          sink.errors += 1;
+          console.warn('[WebSSE:WriteError] tab=' + shortId(tabId, 12) + ' sent=' + sink.sent + ' err=' + (e?.message || e));
+        }
+      },
       isAlive: () => !res.writableEnded && !res.destroyed,
       close: () => { try { res.end(); } catch {} },
     };
     subscribe(tabId, sink);
-    console.log('[WebSSE:Open] tab=' + String(tabId).slice(-12) + ' from=' + (req.socket.remoteAddress || '?'));
+    console.log('[WebSSE:Open] tab=' + shortId(tabId, 12) + ' from=' + (req.socket.remoteAddress || '?'));
 
     // Initial snapshot — mirror the WS upgrade path so the client renders
     // immediately without waiting for the next broadcast.
@@ -477,7 +550,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       clearInterval(hb);
       unsubscribeAll(sink);
       releaseClaudeWatchersIfOrphan();
-      console.log('[WebSSE:Close] tab=' + String(tabId).slice(-12));
+      console.log('[WebSSE:Close] tab=' + shortId(tabId, 12) + ' sent=' + sink.sent + ' errors=' + sink.errors);
     };
     req.on('close', cleanup);
     req.on('error', cleanup);
@@ -1256,7 +1329,7 @@ function serveStatic(req, res, parsed) {
 function subscribe(tabId, sink) {
   if (!subscribers.has(tabId)) subscribers.set(tabId, new Set());
   subscribers.get(tabId).add(sink);
-  console.log('[WebSub:Subscribe] tab=' + String(tabId).slice(-12) + ' kind=' + sink.kind + ' total=' + subscribers.get(tabId).size + ' tabs=' + subscribers.size);
+  console.log('[WebSub:Subscribe] tab=' + shortId(tabId, 12) + ' kind=' + sink.kind + ' total=' + subscribers.get(tabId).size + ' tabs=' + subscribers.size);
 }
 function unsubscribeAll(sink) {
   let removed = 0;
@@ -1293,19 +1366,17 @@ function releaseClaudeWatchersIfOrphan() {
 // subscribed to that specific tabId — usually 0-1 phone connected. Transport
 // (ws/sse) is opaque here; each Sink knows how to write itself.
 //
-// Logging is LIFECYCLE-ONLY. The 'message' type fires once per stream chunk —
-// dozens per Claude turn — and with no phone connected (the 99% desktop case)
-// would flood dev.log with [WebBcast:DROP] type=message on every token. We
-// only log the transitions worth correlating (snapshot/busy/done/bridge-update
-// + the no-subscriber drop for those), never the per-chunk message fan-out.
-// See CLAUDE.md::Логирование (no spam in hot paths).
+// Logging is lifecycle-first, with one important exception: when a phone is
+// actively subscribed, 'message' fan-out is logged with metadata only. That
+// gives a permanent causal trace for "server emitted → SSE wrote → iOS applied"
+// without dumping chat text or spamming desktop-only sessions with message drops.
 const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'bridge-update', 'queue-update', 'ask-question', 'question-cancelled']);
 function webBroadcast(tabId, payload) {
   const type = payload && payload.type;
   const loggable = BCAST_LOG_TYPES.has(type);
   const set = subscribers.get(tabId);
   if (!set || set.size === 0) {
-    if (loggable) console.log('[WebBcast:DROP] tab=' + String(tabId).slice(-12) + ' type=' + type + ' noSubscribers (registered=' + subscribers.size + ')');
+    if (loggable) console.log('[WebBcast:DROP] tab=' + shortId(tabId, 12) + ' type=' + type + summarizeBroadcastPayload(payload) + ' noSubscribers (registered=' + subscribers.size + ')');
     return;
   }
   const msg = JSON.stringify({ tabId, ...payload });
@@ -1318,8 +1389,8 @@ function webBroadcast(tabId, payload) {
     } catch { dead.push(sink); }
   }
   for (const d of dead) set.delete(d);
-  if (loggable || dead.length) {
-    console.log('[WebBcast:SEND] tab=' + String(tabId).slice(-12) + ' type=' + type + ' to=' + sent + '/' + (sent + dead.length) + (dead.length ? ' (pruned ' + dead.length + ' dead)' : ''));
+  if (loggable || type === 'message' || dead.length) {
+    console.log('[WebBcast:SEND] tab=' + shortId(tabId, 12) + ' type=' + type + ' to=' + sent + '/' + (sent + dead.length) + summarizeBroadcastPayload(payload) + (dead.length ? ' (pruned ' + dead.length + ' dead)' : ''));
   }
 }
 
@@ -1346,28 +1417,39 @@ const claudeTabWatcherPending = new Set();
 // pending watcher for this tabId from "waiting for sessionId" → live fs.watch.
 // Idempotent: a no-op if no pending entry exists.
 function notifyClaudeSessionAvailable(tabId) {
-  if (!claudeTabWatcherPending.has(tabId)) return;
+  if (!claudeTabWatcherPending.has(tabId)) {
+    console.log('[ClaudeWatcher] notify ignored tabId=' + shortId(tabId, 12) + ' no pending watcher');
+    return;
+  }
+  console.log('[ClaudeWatcher] notify promote tabId=' + shortId(tabId, 12));
   claudeTabWatcherPending.delete(tabId);
   startClaudeTabWatcher(tabId).catch((e) => {
-    console.warn('[ClaudeWatcher] late-start failed for', tabId.slice(-12), e?.message);
+    console.warn('[ClaudeWatcher] late-start failed for', shortId(tabId, 12), e?.message);
   });
 }
 
 async function startClaudeTabWatcher(tabId) {
-  if (claudeTabWatchers.has(tabId)) return;
+  if (claudeTabWatchers.has(tabId)) {
+    console.log('[ClaudeWatcher] already-active tabId=' + shortId(tabId, 12));
+    return;
+  }
   let status;
   try {
     status = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
-  } catch {
+  } catch (e) {
+    console.warn('[ClaudeWatcher] status failed tabId=' + shortId(tabId, 12) + ' err=' + (e?.message || e));
     return; // tab not open in renderer or bridge unavailable — skip
   }
-  if (status?.commandType !== 'claude') return; // not a PTY+Claude tab
+  if (status?.commandType !== 'claude') {
+    console.log('[ClaudeWatcher] skip tabId=' + shortId(tabId, 12) + ' command=' + (status?.commandType || '-') + ' tool=' + (status?.toolType || '-'));
+    return; // not a PTY+Claude tab
+  }
   if (!status.sessionId || !findSessionFile) {
     // No sessionId yet — Claude is still booting. Park the tabId; main.js will
     // call notifyClaudeSessionAvailable(tabId) the moment session-detected
     // fires (deterministic event from SessionBridge — never polled).
     claudeTabWatcherPending.add(tabId);
-    console.log('[ClaudeWatcher] parked tabId=' + tabId.slice(-12) + ' waiting for sessionId event');
+    console.log('[ClaudeWatcher] parked tabId=' + shortId(tabId, 12) + ' waiting for sessionId event findSessionFile=' + !!findSessionFile);
     return;
   }
   const found = findSessionFile(status.sessionId, status.cwd);
@@ -1376,7 +1458,10 @@ async function startClaudeTabWatcher(tabId) {
     // the bridge.json moments before the first JSONL line landed (it batches
     // initial writes). Watch the parent directory ONCE for the file to
     // appear, then promote. No polling — fs.watch on the dir is event-driven.
-    if (claudeTabWatcherPending.has(tabId)) return;
+    if (claudeTabWatcherPending.has(tabId)) {
+      console.log('[ClaudeWatcher] still-pending tabId=' + shortId(tabId, 12) + ' sid=' + shortId(status.sessionId));
+      return;
+    }
     claudeTabWatcherPending.add(tabId);
     const projectDir = path.dirname(path.join(require('os').homedir(),
       '.claude', 'projects', 'placeholder', 'placeholder.jsonl'));
@@ -1384,6 +1469,7 @@ async function startClaudeTabWatcher(tabId) {
     const tryPromote = () => {
       if (findSessionFile(status.sessionId, status.cwd)) {
         try { dirWatcher?.close(); } catch {}
+        console.log('[ClaudeWatcher] dir-promote tabId=' + shortId(tabId, 12) + ' sid=' + shortId(status.sessionId));
         claudeTabWatcherPending.delete(tabId);
         startClaudeTabWatcher(tabId).catch(() => {});
       }
@@ -1396,7 +1482,7 @@ async function startClaudeTabWatcher(tabId) {
         if (fname && fname.includes(status.sessionId)) tryPromote();
       });
     } catch (e) {
-      console.warn('[ClaudeWatcher] dir-watch failed', e?.message);
+      console.warn('[ClaudeWatcher] dir-watch failed tabId=' + shortId(tabId, 12) + ' sid=' + shortId(status.sessionId) + ' err=' + (e?.message || e));
     }
     return;
   }
@@ -1412,7 +1498,10 @@ async function startClaudeTabWatcher(tabId) {
   // window arrive via the next turn's WS push because reducer.apply is
   // idempotent on uuid.
   let offset = 0;
-  try { offset = fs.statSync(filePath).size; } catch { return; }
+  try { offset = fs.statSync(filePath).size; } catch (e) {
+    console.warn('[ClaudeWatcher] stat failed tabId=' + shortId(tabId, 12) + ' file=' + filePath + ' err=' + (e?.message || e));
+    return;
+  }
   const entry = {
     sessionId: status.sessionId,
     filePath,
@@ -1431,14 +1520,21 @@ async function startClaudeTabWatcher(tabId) {
     // scheduleRead debounce and stream.on('end'). Without this, two concurrent
     // reads share entry.offset and skip bytes (same shape as bug in
     // fix-incremental-reader-race.md::Race condition in Case 2).
-    if (entry.inflight) return;
+    if (entry.inflight) {
+      console.log('[ClaudeWatcher:Delta] skip-inflight tab=' + shortId(tabId, 12) + ' offset=' + entry.offset);
+      return;
+    }
     let size;
-    try { size = fs.statSync(filePath).size; } catch { return; }
+    try { size = fs.statSync(filePath).size; } catch (e) {
+      console.warn('[ClaudeWatcher:Delta] stat failed tab=' + shortId(tabId, 12) + ' err=' + (e?.message || e));
+      return;
+    }
     if (size <= entry.offset) {
       // File got truncated (e.g. fork rewrite reusing same sessionId, or
       // session rewrite via `claude:fork-session-file`). Reset to head and
       // also drop leftover — old position invalidates partial line buffer.
       if (size < entry.offset) {
+        console.log('[ClaudeWatcher:Delta] truncated tab=' + shortId(tabId, 12) + ' oldOffset=' + entry.offset + ' newSize=' + size);
         entry.offset = 0;
         entry.leftover = '';
       }
@@ -1457,6 +1553,8 @@ async function startClaudeTabWatcher(tabId) {
       const endsWithNewline = buf.endsWith('\n');
       const lines = buf.split('\n');
       if (!endsWithNewline) entry.leftover = lines.pop() || '';
+      let sentRecords = 0;
+      let parseErrors = 0;
       for (const raw of lines) {
         const line = raw.trim();
         if (!line) continue;
@@ -1464,12 +1562,22 @@ async function startClaudeTabWatcher(tabId) {
         try { parsed = JSON.parse(line); } catch {
           // Malformed JSON in a complete line is a real corruption — log
           // (deduped) and skip. NOT the partial-line case above.
+          parseErrors += 1;
           continue;
         }
         // Mirror SDK WS protocol — mobile reducer expects { type:'message', message: inner }.
         // The inner record is what JSONL stores: { type:'user'|'assistant'|..., message:..., uuid, ... }.
         webBroadcast(tabId, { type: 'message', sessionId: parsed.sessionId || status.sessionId, message: parsed });
+        sentRecords += 1;
       }
+      console.log('[ClaudeWatcher:Delta] tab=' + shortId(tabId, 12) +
+        ' sid=' + shortId(status.sessionId) +
+        ' bytes=' + (size - startOffset) +
+        ' range=' + startOffset + '..' + size +
+        ' lines=' + lines.filter(Boolean).length +
+        ' sent=' + sentRecords +
+        ' parseErrors=' + parseErrors +
+        ' leftover=' + entry.leftover.length);
       entry.inflight = false;
       // If fs.stat shows growth that happened DURING our read, schedule once
       // more so we don't miss bytes flushed between stat and our consumption.
@@ -1478,7 +1586,10 @@ async function startClaudeTabWatcher(tabId) {
         if (nowSize > entry.offset) scheduleRead();
       } catch {}
     });
-    stream.on('error', () => { entry.inflight = false; });
+    stream.on('error', (e) => {
+      entry.inflight = false;
+      console.warn('[ClaudeWatcher:Delta] read error tab=' + shortId(tabId, 12) + ' err=' + (e?.message || e));
+    });
   };
 
   // Debounced re-read to coalesce rapid writes (Claude flushes JSONL in bursts).
@@ -1488,13 +1599,16 @@ async function startClaudeTabWatcher(tabId) {
   };
 
   try {
-    entry.watcher = fs.watch(filePath, () => scheduleRead());
+    entry.watcher = fs.watch(filePath, () => {
+      console.log('[ClaudeWatcher:FS] change tab=' + shortId(tabId, 12) + ' offset=' + entry.offset);
+      scheduleRead();
+    });
   } catch (e) {
     console.warn('[ClaudeWatcher] fs.watch failed for', filePath, e.message);
     return;
   }
   claudeTabWatchers.set(tabId, entry);
-  console.log('[ClaudeWatcher] started tabId=' + tabId.slice(-12) + ' file=' + filePath + ' startOffset=' + offset);
+  console.log('[ClaudeWatcher] started tabId=' + shortId(tabId, 12) + ' sid=' + shortId(status.sessionId) + ' status=' + (status.status || '-') + ' file=' + filePath + ' startOffset=' + offset);
   // Immediate read once — covers the race where Claude appended bytes between
   // our fs.statSync(filePath).size above and fs.watch arming. Subsequent
   // growth is caught by the watcher itself; offset guards against duplicates.
@@ -1510,7 +1624,7 @@ function stopClaudeTabWatcher(tabId) {
   try { entry.watcher?.close(); } catch {}
   if (entry.timer) clearTimeout(entry.timer);
   claudeTabWatchers.delete(tabId);
-  console.log('[ClaudeWatcher] stopped tabId=' + tabId.slice(-12));
+  console.log('[ClaudeWatcher] stopped tabId=' + shortId(tabId, 12) + ' sid=' + shortId(entry.sessionId) + ' offset=' + entry.offset);
 }
 
 function attachWebSocket(server, sdkSessions) {

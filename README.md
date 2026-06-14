@@ -10,6 +10,24 @@
   <img src="assets/hero.png" alt="Noted Terminal" width="800"/>
 </p>
 
+<table>
+  <tr>
+    <td width="34%">
+      <img src="assets/mobile-main-ios-app-terminal.png" alt="Main iOS App terminal project list" width="260"/>
+    </td>
+    <td>
+      <h3>Mobile terminal control</h3>
+      <p>
+        Для управления терминалами с телефона используется отдельное нативное приложение
+        <a href="https://github.com/RevinFedor/main-ios-app">Main iOS App</a>.
+        Оно подключается к REST/SSE API Noted Terminal, показывает проекты и вкладки,
+        управляет Claude/Codex/SDK-сессиями, отправляет prompt'ы, делает interrupt/resume,
+        читает history/timeline/queue и запускает build-install без web-зеркала терминала.
+      </p>
+    </td>
+  </tr>
+</table>
+
 ---
 
 ## Проблема
