@@ -3799,11 +3799,39 @@ async function handleOverseerRequest(rawUrl) {
       const model = bridgeMeta && bridgeMeta.model && bridgeMeta.model !== 'unknown'
         ? bridgeMeta.model
         : null;
+      const codexTurnState = isCodex ? (codexTurnWatchers.get(tabId) || null) : null;
+      const claudeLastEvent = !isCodex ? (claudeHookLastEvent.get(tabId) || null) : null;
+      const claudeTurn = !isCodex && claudeTurnBusy.get(tabId) === true;
+      const claudeSpinner = !isCodex && claudeSpinnerBusy.get(tabId) === true;
+      const claudeLocal = !isCodex && claudeLocalCommandWatchers.has(tabId);
+      const codexTurn = isCodex && codexTurnState?.busy === true;
+      const sdkTurn = !isCodex && r.command_type === 'claude-sdk' && sdkSessions.has(tabId);
+      const busySources = [];
+      if (claudeTurn) busySources.push('claude-turn');
+      if (claudeSpinner) busySources.push('claude-spinner');
+      if (claudeLocal) busySources.push('claude-local-command');
+      if (codexTurn) busySources.push('codex-turn');
+      if (sdkTurn) busySources.push('claude-sdk');
+      const isBusy = busySources.length > 0;
+      const sessionStatus = isBusy
+        ? 'busy'
+        : (isLive ? 'active' : 'closed');
+      let claudeLastEventTs = null;
+      if (!isCodex && claudeLastEvent?.ts) {
+        const d = new Date(claudeLastEvent.ts);
+        if (!Number.isNaN(d.getTime())) claudeLastEventTs = d.toISOString();
+      }
       sessions.push({
         tabId,
         tabName: r.name,
         sessionId,
         engine: isCodex ? 'codex' : 'claude',
+        status: sessionStatus,
+        busy: isBusy,
+        busySources,
+        turnBusy: claudeTurn || codexTurn || sdkTurn,
+        lastEventType: isCodex ? (codexTurnState?.lastEventType || null) : (claudeLastEvent?.event || null),
+        lastEventTs: isCodex ? (codexTurnState?.lastEventTs || null) : claudeLastEventTs,
         model,
         contextUsedPct,
         contextRemainingPct: contextUsedPct == null ? null : Math.max(0, 100 - contextUsedPct),
