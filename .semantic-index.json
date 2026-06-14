@@ -288,38 +288,40 @@
     "path": "docs/meta/оркестратор.prompt.md",
     "type": "fact",
     "explicit": [
-      "overseer_orchestrator",
-      "mcp_overseer_tools",
-      "jsonl_timeline_editing",
-      "session_management_flow"
+      "overseer_role",
+      "orchestration_prompt",
+      "mcp_tools",
+      "jsonl_session_management",
+      "history_editing",
+      "system_preamble"
     ],
     "implicit": [
-      "overseer_mcp_api",
-      "jsonl_editing_logic",
-      "session_forking_safety",
-      "compact_range_implementation",
-      "timeline_visual_sync_markers",
-      "thinking_block_sampling",
-      "note_anchored_navigation",
-      "propose_edit_dry_run",
+      "overseer_mcp",
+      "terminal_mcp",
       "jsonl_chain_resolution",
-      "token_efficient_sampling",
-      "rewind_marker_handling",
-      "orphan_entry_cleanup"
+      "propose_apply_edit",
+      "timeline_visual_sync",
+      "compact_boundary_pairing",
+      "fork_session_isolation",
+      "sync_marker_validity",
+      "drop_user_only_pattern",
+      "drop_assistant_only_pattern",
+      "compact_range_summary"
     ],
     "symptoms": [
-      "The Overseer AI fails to see active Claude sessions",
-      "The AI pulls too much text from long JSONL files causing context overflow",
-      "Timeline markers like notes or rewind points are not recognized by the model",
-      "User wants to safely compact or delete specific turns in a chat history",
-      "Developer needs to understand how the AI orchestrates multiple SDK tabs"
+      "AI orchestrator attempts to pull raw text without checking token limits or session statistics first",
+      "Timeline UI shows mismatch between notes, rewind markers, and actual AI agent comprehension of state",
+      "Session edit dry-run fails to accurately calculate atomic history shifts or forks",
+      "AI Agent struggles to understand the boundaries between auto-compact summaries and real user prompts",
+      "Orchestrator gets confused trying to map visual purple notes or pink rewind markers on the timeline"
     ],
     "related_components": [
       "src/main/mcp/overseer.ts",
+      "src/main/mcp/terminal.ts",
       "src/renderer/components/Timeline.tsx",
-      "src/main/jsonl/HistoryManager.ts"
+      "src/main/session/jsonlStore.ts"
     ],
-    "hash": "9f323334fa6eff6bd66a3c37cc1d2da8a8e15435bbe69dfa175753aca2c7c27c"
+    "hash": "93d0b0870b22ecd105b8a44048ebd2c14e97014068edaa3ae3fcf2c55e508538"
   },
   {
     "path": "docs/knowledge/fact-provider-proxy.md",
@@ -1696,38 +1698,53 @@
     "path": "docs/knowledge/fact-terminal-mcp.md",
     "type": "fact",
     "explicit": [
-      "terminal_mcp",
-      "mcp_server",
-      "terminal_live_control",
-      "soft_restart",
-      "output_ring_buffer"
+      "Terminal MCP Server architecture",
+      "Tab management SQLite + live state",
+      "AI live control",
+      "MCP activity events",
+      "Soft Restart mechanism",
+      "Output Ring Buffer",
+      "Multi-instance coordination"
     ],
     "implicit": [
-      "mcp_port_pid_discovery",
-      "terminal_overseer_boundary",
-      "osc_133_d_command_finished",
-      "soft_restart_sigint",
-      "ring_buffer_onData",
-      "kernel_task_thermal_throttling",
-      "mcp_activity_status_chip",
-      "send_prompt_safe_paste",
-      "pty_command_state_map",
-      "electron_graceful_shutdown_timeout"
+      "tab_sqlite_live_maps_merge",
+      "soft_restart_ctrl_c_osc133d_pattern",
+      "output_ring_buffer_o1_circular",
+      "send_prompt_delivery_only_signal",
+      "mcp_activity_statusbar_chip",
+      "build_install_voicerecord_handoff",
+      "project_cwd_sqlite_lookup",
+      "two_mcp_servers_one_http_backend",
+      "pending_action_resolver_aliases",
+      "terminalCommandState_polling_isRunning",
+      "ptyprocess_ondata_sync_required",
+      "tab_persistence_sqlite_vs_live_maps",
+      "mcp_port_discovery_pidfile",
+      "hard_kill_abandoned_race_condition",
+      "terminal_overseer_boundary_noncrossing",
+      "graceful_shutdown_electron_vite_timeout",
+      "initialCommand_validation_notfallback",
+      "renderer_tabstate_store_maps_desync",
+      "osc_133d_shellintegration_marker_validity",
+      "send_prompt_safepaste_integration_routing",
+      "renderer_mcp_activity_ipc_listener_subscription"
     ],
     "symptoms": [
-      "Terminal displays '[Process completed]' and becomes unresponsive when an AI agent attempts a restart",
-      "macOS kernel_task shows extremely high CPU utilization and thermal throttling during intense AI terminal activity",
-      "AI agent fails to read terminal output history after a process is killed and recreated",
-      "Status bar fails to display the global MCP chip during agent execution",
-      "A soft restart fails because a command is sent before the shell prompt is fully rendered"
+      "Dev-server process continues running after Soft Restart command, or restart hangs without progress",
+      "Agent prompt sent via send_prompt appears in PTY but agent reports prompt not received",
+      "Terminal output read by agent is incomplete or skips lines, especially with many concurrent tabs",
+      "StatusBar does not show MCP activity chip when agent runs commands from terminal tabs",
+      "Multiple MCP instances conflict or port discovery fails with 'address already in use' error",
+      "Terminal state shows 'running' in agent but tab is actually idle, or vice versa",
+      "build_install_noted_terminal returns but Noted Terminal never restarts or callback fails to deliver",
+      "Hard restart of dev-server causes PTY to become unresponsive until tab is manually recreated"
     ],
     "related_components": [
       ".claude/mcp/terminal-server.mjs",
-      "src/main/mcp/mcpHttpServer.ts",
-      "src/main/terminal/ptyManager.ts",
-      "src/renderer/components/TabBar.tsx"
+      ".claude/mcp/overseer-server.mjs",
+      "src/renderer/ui/TabBar.tsx"
     ],
-    "hash": "27f73a16fba5f1ac6c680500108e10d80acfe4131d52581b2ceedb3614a5d5b3"
+    "hash": "a933734d55fe6f4f7465ddbda77952e23584e82f9101ae26bf1d4df4ea9e918f"
   },
   {
     "path": "docs/knowledge/fact-project-home.md",
@@ -2040,36 +2057,38 @@
     "path": "docs/knowledge/fact-overseer-mcp.md",
     "type": "fact",
     "explicit": [
-      "overseer_mcp",
-      "cross_session_inspection",
-      "claude_history_editing",
-      "two_entry_compact"
+      "overseer mcp",
+      "cross-session inspection",
+      "history editing",
+      "jsonl transcripts",
+      "claude session fork"
     ],
     "implicit": [
+      "overseer_mcp_server",
+      "cross_session_discovery",
+      "terminal_mcp_boundary",
+      "granular_byte_range_pull",
+      "autofork_session_safety",
+      "double_record_compact",
       "jsonl_chain_resolution",
-      "sync_marker_validity",
-      "fork_session_copy",
-      "compact_gap_recovery",
-      "overseer_http_bridge",
-      "port_discovery_pid",
-      "claude_data_api_bridge",
-      "terminal_overseer_boundary",
-      "auto_fork_safety",
-      "propose_edit_dryrun",
-      "codex_mutation_rejection"
+      "ipc_claude_data_bridge",
+      "codex_mutation_unsupported",
+      "overseer_status_polling"
     ],
     "symptoms": [
-      "Agent in one tab cannot access or read the transcript of another active session",
-      "Modifying Codex history via Overseer MCP fails or results in silent errors",
-      "Overseer MCP client cannot resolve port to connect to the Electron main process",
-      "Editing session history via MCP creates broken parentUuid chains or corrupts JSONL structure",
-      "Parsing large JSONL transcripts causes temporary UI lag or high CPU load during discovery"
+      "Agent in one tab cannot access or read the transcription history of another concurrent tab",
+      "Orchestrator times out or misses Claude responses because it checks terminal output instead of session status polling",
+      "Mutating history or deleting turns via MCP results in broken parentUuid chain references or doesn't update the Timeline UI",
+      "Editing operations fail or silently drop when triggered on a Codex terminal session",
+      "First access to a large JSONL session history causes temporary CPU spikes and long retrieval times"
     ],
     "related_components": [
-      "src/main/ipc/claude-data.js",
-      "src/main/main.js"
+      "ipc/claude-data.js",
+      "main.js",
+      "docs/knowledge/fact-terminal-mcp.md",
+      "docs/knowledge/fix-mcp-multi-instance.md"
     ],
-    "hash": "d3f51e9b5df21faf6b6306accffab804983d37f9d3a453c185ebec59377976f7"
+    "hash": "f2559b10518daf35dbcebd7cd3dddb01e7e86aba604be5d2760b5ab01fd3a5ac"
   },
   {
     "path": "docs/knowledge/fact-log-compression.md",
@@ -3969,85 +3988,103 @@
     "type": "fact",
     "explicit": [
       "mobile-web",
-      "mobile-access",
-      "ndjson-streaming",
+      "bridge-pattern",
       "sse-transport",
-      "indexeddb-cache",
-      "mobile-composer",
+      "ndjson-streaming",
+      "idb-cache",
+      "swr",
       "prompt-queue",
-      "params-sheet",
-      "busy-reconciliation",
-      "url-decoding"
+      "dictation",
+      "port-walk",
+      "url-encoding"
     ],
     "implicit": [
-      "decId_url_padding",
-      "getProjectTabsLive_fallback",
-      "synthetic_broadcast_skip",
-      "adoptOrPush_dedupe",
-      "active_branch_messages_jsonl",
-      "compact_boundary_metrics",
-      "slash_chip_swap",
-      "ios_touch_retargeting_backdrop",
-      "window_effort_map_sync",
-      "usePromptQueueWebSync",
-      "self_healing_busy_reconciliation",
-      "sse_transport_fallback",
-      "stale_prod_bridge_timeout",
-      "prefix_merge_lock"
+      "mobile_bridge_timeout_handler",
+      "sse_event_source_fallback",
+      "idb_delta_history_sync",
+      "decid_url_encoded_padding",
+      "prefix_merge_lock_race",
+      "ios_safari_touch_retarget_backdrop",
+      "swr_idb_tab_list_cache",
+      "mic_dictation_secure_context",
+      "prompt_queue_mirror_sync",
+      "empty_slate_web_synthetic",
+      "virtuoso_list_mount_expansion",
+      "port_walk_fallback_eaddrinuse",
+      "active_branch_messages_history"
     ],
     "symptoms": [
-      "Mobile app shows endless thinking loader while desktop terminal is idle",
-      "Opening short-named projects from phone returns 404 while long-named projects load fine",
-      "Selecting a model or effort level on iOS Safari instantly closes the bottom sheet without applying the change",
-      "Stale tabs or empty chat screen on phone with 5s Bridge Timeout in web-server console logs",
-      "WebSocket connection hangs forever or fails to open on private LAN IP address inside browser",
-      "User messages are duplicated on the mobile screen after pressing enter",
-      "Timeline navigation anchors mismatch or fail to target specific messages on mobile device"
+      "Mobile phone shows infinite loading spinner or blank chat screen after updating desktop app code",
+      "Projects with short base64-padded names return 404 Not Found from mobile web, but long names work",
+      "WebSocket connection to mobile server is stuck in CONNECTING state on Yandex Browser or Chrome with security extensions",
+      "Tapping backdrop of modal or dropdown sheet on iOS Safari instantly triggers a selection or unexpected dismiss",
+      "User message sent from phone does not appear on the desktop screen, even though the AI responds",
+      "Chat history displays duplicate user bubbles when streaming finishes loading"
     ],
     "related_components": [
       "src/main/web-server.js",
-      "src/renderer/App.tsx",
       "mobile-web/src/App.tsx",
       "mobile-web/src/api.ts",
-      "mobile-web/src/messages.ts",
-      "mobile-web/src/idb.ts"
+      "mobile-web/src/messages.ts"
     ],
-    "hash": "2bf74188a737aae7e7c28cfa5139368e92ec1b46b9fa582d3e903c041d0722c6"
+    "hash": "5b8aaefad9e2bc45dc2840fbd76dbdb6d4eb1bc3f0d8bf2f7130a71b5ce93ff4"
   },
   {
     "path": "docs/knowledge/fact-build-when-idle.md",
     "type": "fact",
     "explicit": [
-      "build:i-obs",
-      "computeActiveLoaders",
-      "web-server",
-      "idle-detection"
+      "build:i-obs command",
+      "npm run build:install",
+      "scripts/build-when-idle.js",
+      "computeActiveLoaders aggregation",
+      "/api/active-loaders endpoint",
+      "graceful-quit.sh sequence",
+      "idle confirmation polling",
+      "terminal state monitoring",
+      "web-server reuse",
+      "Voice Record job handoff"
     ],
     "implicit": [
-      "build_install_preflight",
-      "computeActiveLoaders_injection",
-      "stale_pid_cleanup",
-      "idle_confirm_debounce",
-      "terminalCommandState_running",
-      "fail_safe_503",
-      "port_discovery_conflict",
-      "no_clear_screen_scrollback",
-      "mock_electron_headless",
-      "mobile_web_server_token"
+      "idle_confirm_streak_gate",
+      "stale_web_config_pid_discovery_filter",
+      "computeActiveLoaders_live_map_aggregation",
+      "voice_record_return_to_tab_restoration",
+      "graceful_quit_applescript_before_kill",
+      "web_token_bearer_auth_leaf_injection",
+      "failed_poll_streak_reset_safety",
+      "ai_tab_process_dedup_priority",
+      "prod_port_7878_vs_dev_7979_discovery",
+      "mobile_install_preflight_false_alert_class",
+      "renderer_independent_main_busy_loop",
+      "old_build_404_predates_endpoint_detection",
+      "bridgeKnownSessions_map_blocking_rule",
+      "claudeTurnBusy_authoritative_signal",
+      "terminalCommandState_isRunning_all_commands",
+      "sdkSessions_query_in_flight_tracking"
     ],
     "symptoms": [
-      "Rebuild script interrupts active Claude or Gemini streams inside Noted Terminal",
-      "Release installation cuts off running terminal tasks or background commands",
-      "Stale web-server configuration files from crashed sessions break IDE port discovery",
-      "Testing main-process REST endpoints headless without launching the electron UI shell",
-      "Idle preflight fails to detect running task due to race condition between queue turns"
+      "Приложение перезагружается во время активного Claude turn'а, разрывая работу",
+      "build-when-idle думает, что всё idle, но скрипт запускает rebuild пока Claude реально занят",
+      "После rebuild не восстанавливается правильный AI session или tab, история потеряна",
+      "/api/active-loaders возвращает 503 или неправильное idle-состояние",
+      "Сетевой блип в polling цикле сбросил счётчик idle, пришлось ждать дольше, чем нужно",
+      "Нужно сделать graceful rebuild из Voice Record или внешнего терминала без потери Claude сессии",
+      "Скрипт обнаружил, что предыдущий build устаревший и не имеет /api/active-loaders эндпоинта"
     ],
     "related_components": [
-      "scripts/build-when-idle.js",
       "src/main/main.js",
-      "src/main/web-server.js"
+      "src/main/web-server.js",
+      "scripts/build-when-idle.js",
+      "scripts/graceful-quit.sh",
+      "src/main/bridge-launcher.js",
+      "src/main/terminal-manager.js",
+      "fix-claude-busy-detection.md",
+      "fix-bridge-stale-takeover.md",
+      "fact-claude-stop-hook.md",
+      "fact-mobile-web.md",
+      "fact-terminal-mcp.md"
     ],
-    "hash": "dc4b936522fda61311da91a2fdcf7c157cbae91b436f4bfdc3bdcde0a9dcbd7a"
+    "hash": "8dfd9f3b035f49f1ee5eacafc9812d419e3d3f944d6c32cdd2a3ad40e9f9dc39"
   },
   {
     "path": "docs/knowledge/fact-claude-sdk-workflows.md",
@@ -4764,44 +4801,40 @@
     "type": "fact",
     "explicit": [
       "mobile-web",
-      "claude-pty",
-      "lifecycle",
-      "rest-endpoints",
-      "bridge-actions",
-      "fs-watcher",
+      "pty-claude",
+      "claude-tui-control",
       "session-promotion",
-      "resume-guard-rails",
-      "ws-protocol",
-      "presence"
+      "fs-watch-tailing"
     ],
     "implicit": [
-      "claude_tui_presence",
-      "claudeTurnBusy",
-      "claudePromptReady",
-      "fs_watch_jsonl_tail",
-      "entry.inflight_race",
-      "entry.leftover_split",
-      "markPendingResume",
-      "soft_interrupt_esc",
-      "sigterm_kill_process",
-      "getProjectTabsLive",
-      "claudeTabWatcherPending",
-      "terminal_paste_slow"
+      "statusMarker_server_resolve",
+      "claudePromptReady_detection",
+      "sendMessageAuto_paste_routing",
+      "stopClaudeTab_sigterm_escalation",
+      "watcher_inflight_debounce_guard",
+      "watcher_leftover_line_carry",
+      "claudeTabWatcherPending_promotion",
+      "markPendingResume_bridge_stale_takeover",
+      "claudeTurnBusy_only_presence",
+      "prompt_detector_busy_leak",
+      "interruptClaudeTurn_single_esc",
+      "terminal_paste_slow_mode"
     ],
     "symptoms": [
-      "Composer button on mobile is stuck on Stop after resuming a Claude session",
-      "Pressing Stop under the composer kills the entire Claude CLI session instead of just interrupting the turn",
-      "Mobile tab list shows wrong status marker shapes or incorrect tab colors compared to desktop UI",
-      "Starting a new Claude tab from mobile hangs indefinitely on 'Starting Claude...'",
-      "Mobile composer does not lock while Claude is running, leading to double-submit errors"
+      "Mobile composer is stuck on Stop or Loader when Claude is completely idle",
+      "Tapping stop button on mobile client kills the entire Claude CLI session instead of just interrupting the turn",
+      "Mobile client shows Starting Claude indefinitely because no sessionId is promoted",
+      "Stale old UUID replaces current Claude sessionId shortly after resuming a session from mobile",
+      "Status badge or marker on mobile list row shows empty circle or wrong shape compared to desktop configuration",
+      "Rapid double sends from mobile result in lost messages because composer was not disabled during terminal AI turn"
     ],
     "related_components": [
       "src/main/web-server.js",
       "src/main/main.js",
-      "src/renderer/App.tsx",
-      "src/renderer/components/Terminal.tsx"
+      "mobile-web/src/App.tsx",
+      "mobile-web/src/components/TabRow.tsx"
     ],
-    "hash": "44c8725124b03fc4bc8bb254c9c62a519249fea8a76695d269a692c06fc98033"
+    "hash": "e2c29eecc070bd69a9942280a508f33b83fd658f355f7bf0538c561c2587b814"
   },
   {
     "path": "docs/knowledge/fix-performance-lags.md",
