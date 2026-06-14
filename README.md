@@ -30,8 +30,8 @@
 
 ## Related Repositories
 
-- [Desktop AI App](https://github.com/RevinFedor/Desktop-ai-app) — macOS companion app for system dictation, desktop Gemini chat, prompt library, and the Voice Record REST/SSE API used by the iOS client.
-- [Main iOS App](https://github.com/RevinFedor/main-ios-app) — native iPhone control surface for Noted Terminal projects/tabs and Desktop AI App chat/voice workflows.
+- [AI Mac Electron](https://github.com/RevinFedor/ai-mac-electron) — macOS companion app for system dictation, desktop Gemini chat, prompt library, and the Voice Record REST/SSE API used by the iOS client.
+- [Main iOS App](https://github.com/RevinFedor/main-ios-app) — native iPhone control surface for Noted Terminal projects/tabs and AI Mac Electron chat/voice workflows.
 
 ---
 
