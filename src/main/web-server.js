@@ -189,6 +189,14 @@ function mobileTimelinePreview(value, max = 360) {
   return text.length > max ? text.slice(0, max - 1).trimEnd() + '…' : text;
 }
 
+function mobileTimelineTs(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value > 1e12 ? Math.floor(value / 1000) : value;
+  }
+  const ms = Date.parse(String(value || ''));
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : undefined;
+}
+
 function normalizeMobileTimelineEntries(entries, fullEntries = []) {
   const fullByUuid = new Map();
   for (const entry of Array.isArray(fullEntries) ? fullEntries : []) {
@@ -198,8 +206,24 @@ function normalizeMobileTimelineEntries(entries, fullEntries = []) {
   return (Array.isArray(entries) ? entries : [])
     .filter(entry => entry && typeof entry.uuid === 'string')
     .map((entry) => {
-      const kind = String(entry.type || entry.role || 'entry');
       const fullEntry = fullByUuid.get(entry.uuid) || {};
+      if (entry.kind && (entry.preview || entry.full)) {
+        const kind = String(entry.kind || 'entry');
+        const full = entry.full || fullEntry.full || entry.preview || '';
+        const preview = mobileTimelinePreview(entry.preview || full || kind);
+        return {
+          uuid: entry.uuid,
+          kind,
+          color: entry.color || mobileTimelineColor(kind),
+          preview: preview || kind,
+          full: full || undefined,
+          ts: mobileTimelineTs(entry.ts || entry.timestamp || fullEntry.ts || fullEntry.timestamp),
+          preTokens: entry.preTokens || fullEntry.preTokens || undefined,
+          truncated: entry.truncated || undefined,
+          tools: entry.tools || undefined,
+        };
+      }
+      const kind = String(entry.type || entry.role || 'entry');
       const compactSummary = entry.compactSummary || fullEntry.compactSummary || '';
       const content = entry.content || fullEntry.content || '';
       const full = kind === 'compact'
@@ -224,6 +248,7 @@ function normalizeMobileTimelineEntries(entries, fullEntries = []) {
 
 async function sendInitialSnapshot(tabId, sink, sdkSessions) {
   const session = sdkSessions.get(tabId);
+  const pendingQuestion = getClaudePendingQuestion ? getClaudePendingQuestion(tabId) : null;
   if (session) {
     sink.send(JSON.stringify({
       type: 'snapshot',
@@ -233,6 +258,9 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       sessionStatus: 'busy',
       commandType: 'claude-sdk',
       toolType: 'claude',
+      source: pendingQuestion?.source,
+      toolUseID: pendingQuestion?.toolUseID,
+      questions: pendingQuestion?.questions,
     }));
     return;
   }
@@ -247,6 +275,9 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       commandType: status?.commandType || null,
       toolType: status?.toolType || null,
       inputReady: status?.status === 'active' || status?.status === 'busy',
+      source: pendingQuestion?.source,
+      toolUseID: pendingQuestion?.toolUseID,
+      questions: pendingQuestion?.questions,
     }));
   } catch {
     sink.send(JSON.stringify({
@@ -257,6 +288,9 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       sessionStatus: 'inactive',
       commandType: null,
       toolType: null,
+      source: pendingQuestion?.source,
+      toolUseID: pendingQuestion?.toolUseID,
+      questions: pendingQuestion?.questions,
     }));
   }
 }
