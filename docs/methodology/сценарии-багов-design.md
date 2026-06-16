@@ -278,6 +278,12 @@ Popover с двумя уровнями pin'а (light = клик-закреп к 
 
 Рабочий паттерн: close активного trigger'а делать как можно раньше (`onMouseDownCapture` или отдельный guarded branch), вызвать `preventDefault/stopPropagation`, blur'нуть активный input и поставить короткий suppress-ref `{id, until}` для этого trigger'а. Любой open-handler и hover-preview сначала проверяет suppress; outside-click при этом остаётся обычным закрытием без suppress. Если outside-close висит на `window.mousedown`, trigger-кнопки самой поверхности надо явно исключать из outside-close: иначе повторный клик по `+add` сначала закрывает editor на mousedown, а потом click-path видит «закрыто» и открывает его снова. Шрамы из Run-after editor: повторный клик по уже pinned chip должен вести себя как overlay click, а повторный клик по активной `+add` должен закрывать editor, не flicker'ить reopen.
 
+### 4.10. Navigation persistence не отменяет ordinary click-outside
+
+Когда click-open editor должен пережить уход на другую вкладку или проект, не превращай pinned state в «игнорировать любой outside mousedown». Это два разных жеста: navigation-away сохраняет контекст для возврата, ordinary outside click в терминал, сайдбар или пустую область означает «я закончил». Handler должен различать navigation targets (tab/project/Home) и обычные outside targets: первые делают save-without-clear, вторые save+close+clear pin.
+
+Иначе пользователь получает окно, которое нельзя закрыть кликом мимо, хотя именно click-outside был базовым escape. Шрам Run-after editor: после persistence через `previewId` любой outside click стал `close:false`; клики в терминал и сайдбар перестали закрывать editor.
+
 ---
 
 ## 5. Рассинхрон видимости и состояния
@@ -447,6 +453,12 @@ useLayoutEffect(() => {
 **Симптом.** `top: 65%` в списке где элементы имеют `flex-grow` или условные маркеры — overlay визуально рассинхронизирован с целевой строкой.
 
 **Фикс.** Используй `offsetTop` / `offsetHeight` целевого элемента через ref. См. `CLAUDE.md::Dynamic List Overlays`.
+
+### 9.3. FLIP мерит accordion transition как reorder
+
+**Симптом.** После collapse/expand группы пользователь ведёт курсор за нижнюю границу, и список на мгновение проигрывает обратную анимацию, как будто группа быстро раскрылась и снова свернулась. В логах при этом нет второго toggle — дрожит только presentation-layer.
+
+**Фикс.** Если row-FLIP общий для reorder и accordion/collapse, не меряй baseline во время `grid-template-rows` / height transition. На время layout transition suppress'ь FLIP-анимации rows, а на `transitionend` обнови baseline rects. Long click cooldown здесь не фикс: он прячет oscillation ценой задержки explicit user action.
 
 ---
 

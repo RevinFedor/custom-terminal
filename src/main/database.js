@@ -141,6 +141,9 @@ class DatabaseManager {
       this.db.exec(`ALTER TABLE tabs ADD COLUMN url TEXT DEFAULT NULL`);
     } catch (e) { /* column already exists */ }
     try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN file_path TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
+    try {
       this.db.exec(`ALTER TABLE tabs ADD COLUMN terminal_id TEXT DEFAULT NULL`);
     } catch (e) { /* column already exists */ }
     try {
@@ -289,6 +292,10 @@ class DatabaseManager {
     // если id больше нет в палитре — marker просто не рендерится, но данные не теряем.
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN session_status TEXT DEFAULT NULL`); } catch (e) {}
 
+    // Migration: persistent tab-completion notification mode. One-shot armed/fired
+    // state is renderer-runtime only; this flag means "auto-arm on every new turn".
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN completion_notification_persistent INTEGER DEFAULT 0`); } catch (e) {}
+
     // Migration: claude_session_history — JSON array (most-recent-first, cap 5)
     // of {sessionId, reason, at}. Lets the user revert when an automated writer
     // (bridge watcher, AutoResume, timeline chain) overwrites the wrong session.
@@ -341,12 +348,23 @@ class DatabaseManager {
     // closing a whole group deletes the container, and later restore must degrade
     // to a flat tab instead of resurrecting a removed folder.
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN group_id TEXT DEFAULT NULL`); } catch (e) {}
+    // Migration: linked file tabs preserve the absolute path across restart and Shift+Cmd+T restore.
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN file_path TEXT DEFAULT NULL`); } catch (e) {}
 
     // Migration: add position to timeline_notes
     try { this.db.exec(`ALTER TABLE timeline_notes ADD COLUMN position TEXT DEFAULT 'before'`); } catch (e) {}
 
     // Migration: add file_paths to ai_prompts (JSON array of absolute file paths)
     try { this.db.exec(`ALTER TABLE ai_prompts ADD COLUMN file_paths TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE ai_prompt_call_logs ADD COLUMN project_id TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE ai_prompt_call_logs ADD COLUMN project_name TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE ai_prompt_call_logs ADD COLUMN project_path TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE ai_prompt_call_logs ADD COLUMN tab_id TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE ai_prompt_call_logs ADD COLUMN tab_name TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE ai_prompt_call_logs ADD COLUMN tool_type TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE ai_prompt_call_logs ADD COLUMN session_id TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE ai_prompt_call_logs ADD COLUMN entry_uuid TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE ai_prompt_call_logs ADD COLUMN iteration_index INTEGER DEFAULT NULL`); } catch (e) {}
 
     // AI Prompts table (dynamic AI prompts for Research/Compact/Description/Custom)
     this.db.exec(`
@@ -406,6 +424,15 @@ class DatabaseManager {
         error TEXT DEFAULT NULL,
         source_chars INTEGER DEFAULT 0,
         output_chars INTEGER DEFAULT 0,
+        project_id TEXT DEFAULT NULL,
+        project_name TEXT DEFAULT NULL,
+        project_path TEXT DEFAULT NULL,
+        tab_id TEXT DEFAULT NULL,
+        tab_name TEXT DEFAULT NULL,
+        tool_type TEXT DEFAULT NULL,
+        session_id TEXT DEFAULT NULL,
+        entry_uuid TEXT DEFAULT NULL,
+        iteration_index INTEGER DEFAULT NULL,
         created_at INTEGER DEFAULT (strftime('%s', 'now'))
       )
     `);
@@ -624,6 +651,7 @@ class DatabaseManager {
         notes: t.notes || '',
         tabType: t.tab_type || 'terminal',
         url: t.url || undefined,
+        filePath: t.file_path || undefined,
         terminalId: t.terminal_id || undefined,
         terminalName: t.terminal_name || undefined,
         activeView: t.active_view || undefined,
@@ -633,6 +661,7 @@ class DatabaseManager {
         visualParentTabId: t.visual_parent_tab_id || undefined,
         tabId: t.tab_id || undefined,
         sessionStatus: t.session_status || undefined,
+        completionNotificationPersistent: t.completion_notification_persistent === 1 || undefined,
         contextPct: (t.context_pct ?? undefined),
         cacheStats: (() => {
           if (!t.cache_stats) return undefined;
@@ -877,8 +906,8 @@ class DatabaseManager {
 
     const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, was_interrupted, overlay_dismissed, notes, tab_type, url, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, claude_session_history, provider_state, context_pct, cache_stats)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, was_interrupted, overlay_dismissed, notes, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, claude_session_history, provider_state, context_pct, cache_stats)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
@@ -920,7 +949,7 @@ class DatabaseManager {
         const cacheStatsJson = (tab.cacheStats && typeof tab.cacheStats === 'object')
           ? JSON.stringify(tab.cacheStats)
           : (cacheStatsSnapshot.has(tab.tabId) ? cacheStatsSnapshot.get(tab.tabId) : null);
-        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.codexSessionId || null, tab.codexModel || null, tab.codexEffort || null, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, historyJson, providerStateJson, ctxPct, cacheStatsJson);
+        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.codexSessionId || null, tab.codexModel || null, tab.codexEffort || null, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set
@@ -942,8 +971,8 @@ class DatabaseManager {
   archiveTab(projectId, tab) {
     const now = Math.floor(Date.now() / 1000);
     const info = this.db.prepare(`
-      INSERT INTO tab_history (project_id, name, name_set_manually, cwd, color, notes, command_type, tab_type, url, created_at, closed_at, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, message_count, position, process_was_running, session_status, group_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tab_history (project_id, name, name_set_manually, cwd, color, notes, command_type, tab_type, url, file_path, created_at, closed_at, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, message_count, position, process_was_running, session_status, group_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       projectId,
       tab.name,
@@ -954,6 +983,7 @@ class DatabaseManager {
       tab.commandType || null,
       tab.tabType || 'terminal',
       tab.url || null,
+      tab.filePath || null,
       tab.createdAt || now,
       now,
       tab.claudeSessionId || null,
@@ -1251,9 +1281,11 @@ class DatabaseManager {
     this.db.prepare(`
       INSERT INTO ai_prompt_call_logs (
         prompt_id, task_type, model, thinking_level, prompt_tokens, candidate_tokens,
-        thought_tokens, total_tokens, status, error, source_chars, output_chars
+        thought_tokens, total_tokens, status, error, source_chars, output_chars,
+        project_id, project_name, project_path, tab_id, tab_name, tool_type,
+        session_id, entry_uuid, iteration_index
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       call.promptId || null,
       call.taskType || null,
@@ -1266,7 +1298,16 @@ class DatabaseManager {
       call.status || 'success',
       call.error || null,
       Number(call.sourceChars || 0),
-      Number(call.outputChars || 0)
+      Number(call.outputChars || 0),
+      call.projectId || null,
+      call.projectName || null,
+      call.projectPath || null,
+      call.tabId || null,
+      call.tabName || null,
+      call.toolType || null,
+      call.sessionId || null,
+      call.entryUuid || null,
+      Number.isFinite(Number(call.iterationIndex)) ? Number(call.iterationIndex) : null
     );
     return true;
   }
@@ -1347,6 +1388,15 @@ class DatabaseManager {
         error: row.error,
         sourceChars: row.source_chars || 0,
         outputChars: row.output_chars || 0,
+        projectId: row.project_id || null,
+        projectName: row.project_name || null,
+        projectPath: row.project_path || null,
+        tabId: row.tab_id || null,
+        tabName: row.tab_name || null,
+        toolType: row.tool_type || null,
+        sessionId: row.session_id || null,
+        entryUuid: row.entry_uuid || null,
+        iterationIndex: row.iteration_index || null,
         createdAt: row.created_at || 0,
       })),
     };

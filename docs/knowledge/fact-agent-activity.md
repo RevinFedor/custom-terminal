@@ -50,14 +50,14 @@ Timestamps — **ms epoch** (не секунды как у usage-snapshots — �
 IPC `claude-usage:activity { days }` (default 14). Читает сырые интервалы `getActivityIntervals(from,to)`, считает три среза:
 
 - **byDay** — интервал, пересекающий локальную полночь, **разбивается** на границах полночи (та же local-date конвенция что usage-график; см. `fact-claude-usage-chip.md::Baseline дня`). Каждый день несёт `byEngine` разбивку.
-- **byProject** — суммарное время + число уникальных табов. Ключ: `project_id` → `project_path` → `'∅'`.
+- **byProject** — wall-clock union времени + число уникальных табов. Ключ: `project_id` → `project_path` → `'∅'`.
 - **byTab** — топ табов по времени.
 
-«Active time» = сумма длительностей интервалов. Два агента параллельно = 2× wall-clock — это честный ответ на «сколько работы агентов произошло», не «сколько шёл таймер».
+«Active time» в UI = **wall-clock union**, а не сумма работы всех агентов. Если Claude и Codex работали параллельно с 12:00 до 13:00, total = 1h, не 2h. Пользовательский вопрос был именно «сколько часов суммарно потрачено» в смысле прошедшего времени, а не CPU-agent-hours; сумма интервалов завышала бы дни с параллельными сессиями. Для stacked bars overlap делится между активными engines поровну внутри пересекающегося slice, чтобы цветные сегменты всё равно складывались в 100% union-бара и не врали total.
 
 ## UI — Activity section в popover'е
 
-Collapsible-секция рядом с «By day» (та же механика expand/refresh/ephemeral-reset что у This-tab и By-day). Total active + per-day stacked bars (сегменты по engine-цвету: Claude `#DA7756`, Claude SDK `#C9826A`, Gemini `#4E86F8`, Codex `#22c55e`) + by-project список + легенда. `dayLabel` теперь date-aware (today/yest от реального календаря, не от индекса массива) — у активности есть дырки (день без агентов = нет строки), индекс врал бы.
+Collapsible-секция рядом с «By day» (та же механика expand/refresh/ephemeral-reset что у This-tab и By-day). Body имеет собственный scroll (`maxHeight` + `overflowY:auto`), иначе by-day + by-project + legend раздувают usage popover и нижние строки становятся недоступны. Total wall time + per-day stacked bars (сегменты по engine-цвету: Claude `#DA7756`, Claude SDK `#C9826A`, Gemini `#4E86F8`, Codex `#22c55e`) + by-project список + легенда. `dayLabel` теперь date-aware (today/yest от реального календаря, не от индекса массива) — у активности есть дырки (день без агентов = нет строки), индекс врал бы.
 
 ## Связи
 

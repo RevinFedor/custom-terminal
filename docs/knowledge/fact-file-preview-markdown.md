@@ -80,6 +80,12 @@ foldStateKey={`file-preview:${filePreview.path}`}
 - Если пользователь свернул заголовок H2 в файле `README.md` → при повторном открытии этот же заголовок останется свёрнутым
 - Если поменять/убрать `foldStateKey` → состояние сбросится
 
+### 7. Open in Sublime Text
+
+FilePreview остаётся read-only поверх `MarkdownEditor`; кнопка `Sublime` в header'е — явный выход из режима чтения в полноценный внешний редактор. Это не должно идти через renderer `exec` или `shell.openPath`: production `.app` на macOS наследует launchd PATH без Homebrew/user-local bin, поэтому main-side handler сам расширяет PATH (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.claude/local/bin`), валидирует что путь абсолютный и указывает на файл, затем пробует `SUBLIME_TEXT_CLI`, app-bundle `subl`, `subl` из PATH и только потом `open -a "Sublime Text"`.
+
+Fallback на LaunchServices нужен потому что у пользователя Sublime может быть установлен как `.app`, но `subl` не добавлен в shell PATH. Обратная ситуация тоже частая: CLI есть через Homebrew, а app path отличается. Логи `[FileOps:Sublime]` намеренно пишут и failed candidates, и successful method — если кнопка «ничего не делает» в production, сначала смотреть эти строки, а не FilePreview/MarkdownEditor. Общий принцип PATH — `methodology/переносимый-дизайн.md::Production Electron на macOS наследует launchd PATH`.
+
 ## Архитектурное решение
 
 **Файл:** `src/renderer/components/Workspace/FilePreview.tsx`

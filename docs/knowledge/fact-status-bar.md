@@ -27,10 +27,15 @@ VSCode-style полоса по всей нижней границе окна (п
 | `● kill dev-ports` toggle | Перед каждым запуском npm-скрипта убивать занятые порты проекта | SQLite `app:setState(freePortsBeforeStart)` + localStorage boot mirror |
 | `● bridges` toggle | Подсвечивать невидимые hover-мосты красным (через `HoverBridgeDebug`) | SQLite `app:setState(debugHoverBridges)` + localStorage boot mirror |
 | `! N` оранжевый chip | Счётчик невалидных файловых путей в AI-промптах (рендерится только если N > 0) | derived, не persist |
+| `H` / `T` pin split | `History pin` (`Cmd+\`) и `Timeline pin` (`Cmd+]`) независимо выбирают overlay vs reserved layout для двух разных правых поверхностей | SQLite `app:setState(historyPinned/timelinePinned)` + localStorage boot mirror |
 | `● freeze tooltips` toggle | Cmd-popup'ы Timeline (tooltip / note / fork) не закрываются по Cmd-release / mouseleave — для инспекции DOM в DevTools | SQLite `app:setState(freezeCmdPopups)` + localStorage boot mirror |
 | `⚙` Settings button | Открывает `SettingsModal` | — |
 
 **Чип лимитов Claude — не здесь.** Weekly% Anthropic подписки и per-tab token-cost живут в [`ProjectToolbar`](../../src/renderer/components/Workspace/ProjectToolbar.tsx), не в StatusBar. Причина: chip session-aware (читает `getEffectiveTabId` и активный проект), а status bar — глобальные toggle'ы без привязки к табу. См. [`fact-claude-usage-chip.md`](fact-claude-usage-chip.md).
+
+**History/Timeline pin split.** Раньше один pin смешивал две разные поверхности: HistoryPanel (`Cmd+\`) и expanded Timeline (`Cmd+]`). Это разные жесты и разные layout-риски: пользователь может хотеть держать History обычной колонкой, но Timeline оставлять overlay поверх терминала для быстрого скана, или наоборот. Поэтому StatusBar показывает две соседние половины с независимым active state. Legacy migration для `historyPinned` читает старое combined `timelinePinned`, чтобы существующим пользователям не сломать привычную pinned-историю после обновления; дальше значения живут отдельно.
+
+Для Timeline pin есть отдельный event-boundary: wrapper `H/T` имеет `data-history-timeline-pin-toggle`, и Workspace outside-click handler expanded Timeline его пропускает. Иначе клик по `T` сначала свернул бы unpinned overlay на `mousedown`, а `click` уже закреплял бы пустое состояние; пользователь не мог бы превратить «просто открыт» в pinned layout одним жестом. См. [`fact-timeline.md::Expanded mode`](fact-timeline.md).
 
 ## MCP Activity chip
 

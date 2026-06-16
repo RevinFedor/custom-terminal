@@ -365,6 +365,16 @@
 @keyframes tab-awaiting-spin {
   to { --awaiting-angle: 360deg; }
 }
+@keyframes tab-completion-notification-dismiss {
+  from {
+    opacity: 1;
+    filter: drop-shadow(0 0 5px rgba(239, 68, 68, 0.28));
+  }
+  to {
+    opacity: 0;
+    filter: drop-shadow(0 0 0 rgba(239, 68, 68, 0));
+  }
+}
 .tab-awaiting-input {
   padding: 1.2px; /* толщина бегущей рамки */
   background:
@@ -387,6 +397,35 @@
   mask-composite: exclude;
   animation: tab-awaiting-spin 1.6s linear infinite;
   pointer-events: none;
+}
+
+.tab-completion-notification-alert {
+  padding: 1.2px;
+  background:
+    conic-gradient(from var(--awaiting-angle),
+      rgba(220, 38, 38, 0) 0deg,
+      rgba(220, 38, 38, 0) 240deg,
+      rgba(220, 38, 38, 0.88) 312deg,
+      rgba(254, 202, 202, 1) 348deg,
+      rgba(220, 38, 38, 0) 360deg),
+    rgba(185, 28, 28, 0.28);
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: tab-awaiting-spin 1.6s linear infinite;
+  pointer-events: none;
+}
+
+.tab-completion-notification-alert--dismiss {
+  animation:
+    tab-awaiting-spin 1.6s linear infinite,
+    tab-completion-notification-dismiss 420ms ease-out forwards;
+  will-change: opacity, filter;
 }
 
 /* ControlBar (Provider/Model/Effort/Think) busy-overlay. Используется когда

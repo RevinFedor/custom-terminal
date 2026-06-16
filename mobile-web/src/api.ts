@@ -119,6 +119,7 @@ export type ProcessBarCfg = {
 // desktop's PromptQueueCore (usePromptQueueStore.ts).
 export type QueueItem = {
   id: string;
+  enabled?: boolean;
   title?: string;
   titleManual?: boolean;
   text: string;
@@ -141,7 +142,7 @@ export type QueueData = { tabId: string; queue: QueueCore; aiTabs: QueueAiTab[] 
 export type QueueOp =
   | { op: 'add'; args: { text: string; title?: string } }
   | { op: 'remove'; args: { id: string } }
-  | { op: 'update'; args: { id: string; text: string; title?: string; titleManual?: boolean } }
+  | { op: 'update'; args: { id: string; text?: string; title?: string; titleManual?: boolean; enabled?: boolean } }
   | { op: 'reorder'; args: { fromIndex: number; toIndex: number } }
   | { op: 'clear'; args?: {} }
   | { op: 'setAutoRun'; args: { value: boolean } }

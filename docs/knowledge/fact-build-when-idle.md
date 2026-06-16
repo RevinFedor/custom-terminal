@@ -10,7 +10,7 @@
 
 | Источник | Map в main | Семантика |
 |---|---|---|
-| PTY Claude | `bridgeKnownSessions` + `terminals` + (`claudeTurnBusy`\|`claudeSpinnerBusy`\|`claudeLocalCommandWatchers`) + `claudePromptReady` | `busy` только когда реально идёт turn/loader/local slash command; idle-alive Claude (`claudeCliActive`, живой PTY у prompt) отдаётся как `active/starting`, но **не** считается blocker. Stale bridge без живого PTY (`!terminals.has`) **не** блокирует (= `inactive`) |
+| PTY Claude | `bridgeKnownSessions` + `terminals` + (`claudeTurnBusy`\|`claudeSpinnerBusy`\|`claudeLocalCommandWatchers`) + `claudePromptReady` | `busy` только когда реально идёт turn/loader/local slash command; idle-alive Claude (`claudeCliActive`, живой PTY у prompt) **не возвращается из `/api/active-loaders` вообще**. `active/starting` — это presence/status-слой, не blocker-list. Stale bridge без живого PTY (`!terminals.has`) **не** блокирует (= `inactive`) |
 | SDK Claude | `sdkSessions` | одна запись = один in-flight `query()` → `busy` |
 | Gemini | `geminiSpinnerBusy` | `busy` только при `=== true` |
 | Codex | `codexTurnWatchers` | блокирует только rollout `task_started → task_complete/turn_aborted`; живой idle Codex CLI не blocker |
@@ -53,20 +53,39 @@ GET /api/active-loaders   (Bearer-token, тот же ~/.noted-terminal/web-token
 - **Старый билд без эндпоинта** (404): печатает «predates /api/active-loaders», просит разовый `build:install` для бутстрапа, exit 2. НЕ строит вслепую.
 - **Прод не запущен**: нечего ждать → строит сразу (или exit при `NO_BUILD=1`).
 
-### Граница применения: не mobile install endpoint
-`build:i-obs` — команда для внешнего ручного/терминального запуска, когда нужно сначала
-наблюдать live Noted Terminal через `/api/active-loaders`. Voice Record endpoint
-`/api/terminal/build-install` не должен запускать этот wrapper: телефон уже сделал preflight
-по тому же endpoint'у перед confirm, а в момент самой переустановки Noted Terminal может быть
-уже закрыт или недоступен. Для sibling-host сценария правильная команда — прямой
-`npm run build:install` из `/Users/fedor/Desktop/custom-terminal`.
+### Observe-фаза в Voice Record endpoint (НЕ wrapper-скрипт)
+`build:i-obs` (wrapper `scripts/build-when-idle.js`) — команда для внешнего ручного запуска
+в отдельном терминале. Voice Record endpoint `/api/terminal/build-install` этот **wrapper не
+запускает** (он foreground-поллер, а Voice Record — sibling-сервис), но с июня 2026 делает
+**собственную observe-фазу** против того же `/api/active-loaders` перед спавном `build:install`.
+
+Раньше (graveyard) endpoint строил **мгновенно** без idle-проверки, полагаясь на то, что iOS
+сделал preflight перед confirm. Это ломалось при AI-hop: агент в одной вкладке дёргал rebuild,
+а `build:install` через `pkill` гасит **весь** прод — включая соседние проекты, где в этот
+момент шёл turn. Теперь endpoint ждёт, пока все сессии **кроме вызвавшей** не уйдут в idle.
+
+Механика observe (`observeTerminalIdle` в voice-record `web-server.js`):
+- **Exclude-caller**: `returnTo.tabId` вычитается из списка блокеров. Вкладка-инициатор busy
+  именно потому, что запустила rebuild — ждать её = вечный дедлок. iOS-путь без `returnTo`
+  ждёт полный idle (телефон уже сделал preflight, поэтому проходит за пару поллов).
+- **Discovery прода**: `web-server-<pid>.json` (живой PID) + авторитетный `isPackaged` из
+  соседнего `mcp-port-<pid>` (тот же main PID пишет оба файла); фоллбэк — `ps`-маркер
+  `/Applications/Noted Terminal.app`. Тот же stale-файл фильтр, что в wrapper'е.
+- **Fail-safe сохраняет «строить даже когда прод недоступен»** (старый rationale): нет живого
+  прод-инстанса → строить сразу; 404 (старый прод без эндпоинта, этот же build его и завезёт)
+  → строить; 503/timeout/401 **никогда** не считается idle (сбрасывает streak); `IDLE_CONFIRM=2`
+  подряд гасит 1-тиковый разрыв между turn'ами. Любая ошибка наблюдения → строить (явно
+  запрошенный rebuild не должен застрять из-за бага в idle-watching).
+- Прогресс виден в `GET /api/terminal/build-install`: `job.phase` (pending→observing→building→
+  finished), `job.wait.blockers` (какая соседняя сессия держит).
 
 ### AI-hop изнутри Noted Terminal
 Когда rebuild инициирует агент внутри самого Noted Terminal, он не должен запускать
 `npm run build:install` в своей PTY-вкладке: управляющий процесс умрёт вместе с приложением.
 Terminal MCP tool `build_install_noted_terminal` передаёт задачу в Voice Record
 `POST /api/terminal/build-install` с `returnTo` (`tabId`, `sessionId`, `projectId`,
-`projectPath`). MCP tool сразу возвращает job id; дальнейшее ожидание живёт в Voice Record.
+`projectPath`). MCP tool сразу возвращает job id; ожидание соседей (observe-фаза выше) и
+ожидание рестарта (callback ниже) живут в Voice Record — вызвавший агент не блокируется.
 
 После exit build-команды Voice Record не использует фиксированный sleep. Он читает live
 `~/.noted-terminal/mcp-port-*`, фильтрует живые PID и проект, предпочитает packaged-инстанс,

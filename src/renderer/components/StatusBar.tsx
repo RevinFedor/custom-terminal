@@ -872,7 +872,7 @@ function WebServerChip() {
 
   // Prod (7878) → публичный домен через VPS-туннель; dev (7979 и любой другой) → локальный IP:port
   const isProd = info.port === 7878;
-  const PUBLIC_HOST = 'remote-control.f9922.tech';
+  const PUBLIC_HOST = 'remote-control.f9922.tech:8443';
   const fullUrl = isProd
     ? `https://${PUBLIC_HOST}/?token=${info.token}`
     : `http://${info.lanIp}:${info.port}/?token=${info.token}`;
@@ -955,6 +955,7 @@ function HistoryTimelinePinToggle({
 }) {
   return (
     <div
+      data-history-timeline-pin-toggle
       className="inline-flex items-center rounded overflow-hidden"
       style={{ height: 20, border: '1px solid rgba(255,255,255,0.08)' }}
     >

@@ -2,13 +2,17 @@ const { ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 const { execFile } = require('child_process');
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const CODEX_SESSIONS_DIR = path.join(CODEX_HOME, 'sessions');
+const CODEX_LOGS_DB = path.join(CODEX_HOME, 'logs_2.sqlite');
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+const USAGE_ACCOUNTS_CACHE_TTL_MS = 60 * 1000;
 
 let modelCache = null;
+let usageAccountsCache = null;
 const loggedRollbackKeys = new Set();
 
 function compactPreview(value, max = 120) {
@@ -26,6 +30,23 @@ function stableUuid(sessionId, index, prefix = 'codex') {
 function parseTimestampMs(value) {
   const ms = value ? Date.parse(value) : NaN;
   return Number.isFinite(ms) ? ms : NaN;
+}
+
+function pathsAreSameOrNested(a, b) {
+  if (!a || !b) return false;
+  const left = path.resolve(a);
+  const right = path.resolve(b);
+  if (left === right) return true;
+  const isNestedRelative = (relativePath) => (
+    !!relativePath &&
+    relativePath !== '..' &&
+    !relativePath.startsWith('..' + path.sep) &&
+    !path.isAbsolute(relativePath)
+  );
+  const leftToRight = path.relative(left, right);
+  if (isNestedRelative(leftToRight)) return true;
+  const rightToLeft = path.relative(right, left);
+  return isNestedRelative(rightToLeft);
 }
 
 function safeJsonParse(value, fallback = null) {
@@ -330,6 +351,7 @@ async function findLatestCodexSession({ cwd, sinceMs = 0, sourceSessionId = null
   }
   candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
+  const relatedFallbacks = [];
   for (const candidate of candidates.slice(0, 80)) {
     let records;
     try {
@@ -343,18 +365,33 @@ async function findLatestCodexSession({ cwd, sinceMs = 0, sourceSessionId = null
     if (sourceSessionId && meta.id === sourceSessionId) continue;
     const sessionStartedMs = meta.timestamp ? Date.parse(meta.timestamp) : 0;
     if (sinceMs && Number.isFinite(sessionStartedMs) && sessionStartedMs > 0 && sessionStartedMs < sinceMs - 5000) continue;
-    const cwdMatched = !normalizedCwd || (meta.cwd && path.resolve(meta.cwd) === normalizedCwd);
+    const metaCwd = meta.cwd ? path.resolve(meta.cwd) : null;
+    const cwdMatched = !normalizedCwd || (metaCwd && metaCwd === normalizedCwd);
+    const cwdRelated = !normalizedCwd || (metaCwd && pathsAreSameOrNested(metaCwd, normalizedCwd));
     const sourceMatched = !!sourceSessionId && recordsReferenceSession(records, sourceSessionId);
-    if (!cwdMatched && !sourceMatched) continue;
+    if (!cwdMatched && !sourceMatched) {
+      if (cwdRelated) {
+        relatedFallbacks.push({
+          sessionId: meta.id,
+          filePath: candidate.filePath,
+          cwd: meta.cwd,
+          cwdMatched: false,
+          cwdRelated: true,
+          sourceMatched,
+        });
+      }
+      continue;
+    }
     return {
       sessionId: meta.id,
       filePath: candidate.filePath,
       cwd: meta.cwd,
       cwdMatched,
+      cwdRelated,
       sourceMatched,
     };
   }
-  return null;
+  return relatedFallbacks[0] || null;
 }
 
 function pushAssistantEntry(entries, sessionId, record, turnIndex, content, thinking, actions) {
@@ -504,6 +541,36 @@ function buildCodexTimeline(records, sessionId) {
           const totalTokens = Number(total.total_tokens || 0);
           if (contextWindow > 0 && totalTokens > 0) {
             currentUser.contextPct = Math.min(100, Math.max(0, (totalTokens / contextWindow) * 100));
+          }
+          // Per-turn API usage from THIS request's last_token_usage. Codex re-sends
+          // full history each turn, so `last` is exactly this turn's billing receipt
+          // (per-entry is honest; do NOT sum across a range — counters overlap).
+          // Shape differs from Claude: Codex exposes cached_input_tokens (cache-read
+          // analogue; no cache_creation) and splits output into reasoning vs answer.
+          const lastInput = Number(last.input_tokens || 0);
+          const lastCached = Number(last.cached_input_tokens || 0);
+          const lastOutput = Number(last.output_tokens || 0);
+          const lastReasoning = Number(last.reasoning_output_tokens || 0);
+          if (lastInput > 0 || lastOutput > 0) {
+            currentUser.codexUsage = {
+              inputCached: lastCached,
+              inputUncached: Math.max(0, lastInput - lastCached),
+              outputAnswer: Math.max(0, lastOutput - lastReasoning),
+              outputReasoning: lastReasoning,
+            };
+          }
+          // Subscription quota snapshot (5h / weekly). Same source the toolbar usage
+          // chip reads; surfaced here too so the detail panel can show "where this
+          // turn left my budget" without a second lookup. resets_at → epoch seconds.
+          const limits = buildCodexUsageFromRateLimits(payload.rate_limits);
+          if (limits && (limits.five_hour || limits.seven_day)) {
+            currentUser.codexLimits = {
+              fiveHourPct: limits.five_hour?.utilization ?? null,
+              fiveHourResetsAt: limits.five_hour?.resets_at ?? null,
+              weeklyPct: limits.seven_day?.utilization ?? null,
+              weeklyResetsAt: limits.seven_day?.resets_at ?? null,
+              planType: limits.plan_type ?? null,
+            };
           }
         }
       } else if (isCompactPayload(payload)) {
@@ -820,14 +887,22 @@ function codexCopyOptions(params = {}) {
   };
 }
 
-function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
+function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), options = {}) {
   const entries = [];
   const pendingCalls = new Map();
   let currentTurnIndex = -1;
   let pendingThinking = '';
   let lastTopLevelCompactLine = -Infinity;
+  const expandedCompactUuids = options.expandedCompactUuids instanceof Set
+    ? options.expandedCompactUuids
+    : new Set();
 
   const push = (entry) => entries.push({ ...entry, turnIndex: currentTurnIndex });
+  const compactText = (payload, sourceUuid) => (
+    expandedCompactUuids.has(sourceUuid)
+      ? compactEventContent(payload)
+      : compactEventTitle(payload)
+  );
 
   for (const record of records) {
     const payload = record.payload || {};
@@ -836,10 +911,11 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
       // For clean export, a Codex compacted record is a snapshot of model
       // context, not a new user-visible turn. Expanding replacement_history
       // recursively re-exports old/rolled-back prompts on every compaction.
+      const sourceUuid = stableUuid(sessionId, record.__line, 'codex-compact');
       push({
         kind: 'compact',
-        text: compactEventTitle(payload),
-        sourceUuid: stableUuid(sessionId, record.__line, 'codex-compact'),
+        text: compactText(payload, sourceUuid),
+        sourceUuid,
       });
       lastTopLevelCompactLine = record.__line;
       continue;
@@ -865,10 +941,11 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
         currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
       } else if (isCompactPayload(payload)) {
         if (record.__line > lastTopLevelCompactLine + 3) {
+          const sourceUuid = stableUuid(sessionId, record.__line, 'codex-compact');
           push({
             kind: 'compact',
-            text: compactEventTitle(payload),
-            sourceUuid: stableUuid(sessionId, record.__line, 'codex-compact'),
+            text: compactText(payload, sourceUuid),
+            sourceUuid,
           });
         }
       }
@@ -990,7 +1067,14 @@ function buildCodexRangeExport(records, sessionId, cwd, opts, startUuid, endUuid
     }
   }
 
-  const cleanEntries = buildCodexCleanEntries(records, sessionId, codexCopyOptions(opts));
+  // Context-menu "Copy compact" passes start=end for one compact marker.
+  // Expand only that case; multi-entry ranges keep compact markers shallow.
+  const expandedCompactUuids = selected.length === 1 && selected[0]?.type === 'compact'
+    ? new Set([selected[0].uuid])
+    : new Set();
+  const cleanEntries = buildCodexCleanEntries(records, sessionId, codexCopyOptions(opts), {
+    expandedCompactUuids,
+  });
   const filtered = cleanEntries.filter((entry) => {
     if (entry.kind === 'compact') return selectedCompacts.has(entry.sourceUuid);
     return typeof entry.turnIndex === 'number' && selectedTurns.has(entry.turnIndex);
@@ -1029,7 +1113,7 @@ function normalizeCodexLimitBucket(bucket) {
   const used = Number(bucket.used_percent ?? bucket.utilization ?? bucket.usedPercent);
   return {
     utilization: Number.isFinite(used) ? used : null,
-    resets_at: normalizeCodexReset(bucket.resets_at ?? bucket.resetsAt),
+    resets_at: normalizeCodexReset(bucket.resets_at ?? bucket.resetsAt ?? bucket.reset_at ?? bucket.resetAt),
     window_minutes: Number.isFinite(Number(bucket.window_minutes ?? bucket.windowMinutes))
       ? Number(bucket.window_minutes ?? bucket.windowMinutes)
       : null,
@@ -1087,6 +1171,237 @@ async function findLatestCodexUsage() {
     } catch {}
   }
   return null;
+}
+
+function runSqliteJson(dbPath, sql) {
+  return new Promise((resolve, reject) => {
+    execFile('sqlite3', ['-json', dbPath, sql], {
+      timeout: 15_000,
+      maxBuffer: 16 * 1024 * 1024,
+    }, (error, stdout, stderr) => {
+      if (error) {
+        const message = stderr?.trim() || error.message;
+        reject(new Error(message));
+        return;
+      }
+      resolve(safeJsonParse(stdout || '[]', []));
+    });
+  });
+}
+
+function shortCodexId(value) {
+  if (!value) return null;
+  const s = String(value);
+  if (s.length <= 12) return s;
+  return `${s.slice(0, 8)}…${s.slice(-4)}`;
+}
+
+function maskCodexEmail(value) {
+  if (!value || typeof value !== 'string') return null;
+  const [local, domain] = value.split('@');
+  if (!domain) return shortCodexId(value);
+  const prefix = local.slice(0, Math.min(2, Math.max(1, local.length)));
+  return `${prefix}***@${domain}`;
+}
+
+function hashCodexAccountKey(raw) {
+  return crypto.createHash('sha256').update(String(raw || 'unknown')).digest('hex').slice(0, 16);
+}
+
+function extractCodexThreadId(body) {
+  if (!body || typeof body !== 'string') return null;
+  return (body.match(/thread_id=([0-9a-f-]+)/) || [])[1]
+    || (body.match(/thread\.id=([0-9a-f-]+)/) || [])[1]
+    || (body.match(/conversation\.id=([0-9a-f-]+)/) || [])[1]
+    || null;
+}
+
+function parseCodexRateLimitLog(body) {
+  if (!body || typeof body !== 'string' || !body.includes('codex.rate_limits')) return null;
+  const plan = (body.match(/"plan_type":"([^"]+)"/) || [])[1] || null;
+  const primaryMatch = body.match(/"primary":\{"used_percent":([0-9.]+),"window_minutes":([0-9]+)(?:,"reset_after_seconds":[0-9.]+)?,"reset_at":([0-9]+)\}/);
+  const secondaryMatch = body.match(/"secondary":\{"used_percent":([0-9.]+),"window_minutes":([0-9]+)(?:,"reset_after_seconds":[0-9.]+)?,"reset_at":([0-9]+)\}/);
+  const primary = primaryMatch ? {
+    used_percent: Number(primaryMatch[1]),
+    window_minutes: Number(primaryMatch[2]),
+    reset_at: Number(primaryMatch[3]),
+  } : null;
+  const secondary = secondaryMatch ? {
+    used_percent: Number(secondaryMatch[1]),
+    window_minutes: Number(secondaryMatch[2]),
+    reset_at: Number(secondaryMatch[3]),
+  } : null;
+  if (!primary && !secondary) return null;
+  return {
+    limit_id: 'codex',
+    limit_name: null,
+    primary,
+    secondary,
+    credits: null,
+    individual_limit: null,
+    plan_type: plan,
+    rate_limit_reached_type: null,
+  };
+}
+
+function parseCodexAccountIdentityLog(body) {
+  if (!body || typeof body !== 'string') return { accountId: null, email: null };
+  return {
+    accountId: (body.match(/user\.account_id="([^"]+)"/) || [])[1] || null,
+    email: (body.match(/user\.email="([^"]+)"/) || [])[1] || null,
+  };
+}
+
+function codexLogTimeMs(row) {
+  return (Number(row?.ts) || 0) * 1000 + (Number(row?.ts_nanos) || 0) / 1_000_000;
+}
+
+function closestCodexIdentity(rate, identities) {
+  if (!rate || !Array.isArray(identities) || identities.length === 0) return null;
+  let closest = null;
+  for (const identity of identities) {
+    const distance = Math.abs(identity.timeMs - rate.timeMs);
+    if (!closest || distance < closest.distance) {
+      closest = { identity, distance };
+    }
+  }
+  return closest?.identity || null;
+}
+
+function codexAccountLabel({ email, accountId }, index) {
+  const maskedEmail = maskCodexEmail(email);
+  if (maskedEmail) return maskedEmail;
+  const short = shortCodexId(accountId);
+  return short ? `Account ${short}` : `Account ${index + 1}`;
+}
+
+function buildCodexUsageAccount(raw, index) {
+  const identity = raw.accountId || raw.email || `unknown-${index}`;
+  const accountKey = hashCodexAccountKey(identity);
+  const label = codexAccountLabel(raw, index);
+  const usage = buildCodexUsageFromRateLimits(raw.rateLimits, raw.timestamp, raw.filePath);
+  if (!usage) return null;
+  return {
+    accountKey,
+    label,
+    accountHint: raw.email ? maskCodexEmail(raw.email) : shortCodexId(raw.accountId),
+    accountIdHint: shortCodexId(raw.accountId),
+    plan_type: usage.plan_type,
+    timestamp: usage.timestamp,
+    source: 'codex-log',
+    usage,
+  };
+}
+
+async function findLatestCodexUsageAccounts({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && usageAccountsCache && now - usageAccountsCache.ts < USAGE_ACCOUNTS_CACHE_TTL_MS) {
+    return usageAccountsCache.accounts;
+  }
+
+  if (!fs.existsSync(CODEX_LOGS_DB)) {
+    usageAccountsCache = { ts: now, accounts: [] };
+    return [];
+  }
+
+  // Extract only the useful slices from the large Codex log rows. Full rows can
+  // contain prompts/instructions and can be very large; these substr() windows
+  // keep the query lightweight and prevent leaking content into this process.
+  const sql = `
+    SELECT
+      ts,
+      ts_nanos,
+      thread_id,
+      substr(feedback_log_body, 1, 260) || ' ' ||
+      CASE
+        WHEN instr(feedback_log_body, 'websocket event: {"type":"codex.rate_limits"') > 0
+          THEN substr(feedback_log_body, instr(feedback_log_body, 'websocket event: {"type":"codex.rate_limits"'), 5000)
+        WHEN instr(feedback_log_body, 'user.account_id=') > 0
+          THEN substr(feedback_log_body, instr(feedback_log_body, 'user.account_id='), 900)
+        WHEN instr(feedback_log_body, 'user.email=') > 0
+          THEN substr(feedback_log_body, instr(feedback_log_body, 'user.email='), 900)
+        ELSE ''
+      END AS body
+    FROM logs
+    WHERE ts > strftime('%s','now','-10 days')
+      AND (
+        feedback_log_body LIKE '%websocket event: {"type":"codex.rate_limits"%'
+        OR feedback_log_body LIKE '%user.account_id=%'
+        OR feedback_log_body LIKE '%user.email=%'
+      )
+    ORDER BY ts DESC, ts_nanos DESC
+    LIMIT 12000;
+  `;
+
+  let rows;
+  try {
+    rows = await runSqliteJson(CODEX_LOGS_DB, sql);
+  } catch (error) {
+    console.warn('[CodexData] usage accounts log scan failed: ' + error.message);
+    usageAccountsCache = { ts: now, accounts: [] };
+    return [];
+  }
+
+  const byThread = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const body = row?.body || '';
+    const threadId = row?.thread_id || extractCodexThreadId(body);
+    if (!threadId) continue;
+    const ctx = byThread.get(threadId) || { threadId, identities: [], rates: [] };
+    const { accountId, email } = parseCodexAccountIdentityLog(body);
+    if (accountId || email) {
+      ctx.identities.push({
+        ts: Number(row.ts) || 0,
+        tsNanos: Number(row.ts_nanos) || 0,
+        timeMs: codexLogTimeMs(row),
+        accountId,
+        email,
+      });
+    }
+    const rateLimits = parseCodexRateLimitLog(body);
+    if (rateLimits) {
+      ctx.rates.push({
+        ts: Number(row.ts) || 0,
+        tsNanos: Number(row.ts_nanos) || 0,
+        timeMs: codexLogTimeMs(row),
+        rateLimits,
+        timestamp: row.ts ? new Date(Number(row.ts) * 1000).toISOString() : null,
+      });
+    }
+    byThread.set(threadId, ctx);
+  }
+
+  const latestByIdentity = new Map();
+  for (const ctx of byThread.values()) {
+    if (!ctx.rates?.length) continue;
+    for (const rate of ctx.rates) {
+      const accountIdentity = closestCodexIdentity(rate, ctx.identities);
+      const accountId = accountIdentity?.accountId || null;
+      const email = accountIdentity?.email || null;
+      const identity = accountId || email || `thread:${ctx.threadId}`;
+      const prev = latestByIdentity.get(identity);
+      if (!prev || rate.ts > prev.ts || (rate.ts === prev.ts && rate.tsNanos > prev.tsNanos)) {
+        latestByIdentity.set(identity, {
+          accountId,
+          email,
+          rateLimits: rate.rateLimits,
+          timestamp: rate.timestamp,
+          ts: rate.ts,
+          tsNanos: rate.tsNanos,
+        });
+      }
+    }
+  }
+
+  const accounts = [...latestByIdentity.values()]
+    .sort((a, b) => (b.ts - a.ts) || (b.tsNanos - a.tsNanos))
+    .map(buildCodexUsageAccount)
+    .filter(Boolean);
+
+  console.log('[CodexData] usage accounts scanned count=' + accounts.length +
+    ' labels=' + accounts.map((a) => a.label + ':' + (a.plan_type || 'unknown')).join(','));
+  usageAccountsCache = { ts: now, accounts };
+  return accounts;
 }
 
 function normalizeCodexModel(raw) {
@@ -1240,15 +1555,42 @@ function register() {
 
   ipcMain.handle('codex:get-usage', async (_event, opts = {}) => {
     try {
-      let usage = null;
-      if (opts?.sessionId) {
+      const accountUsages = await findLatestCodexUsageAccounts({ force: !!opts?.force });
+      const selectedAccount = opts?.accountKey
+        ? accountUsages.find((account) => account.accountKey === opts.accountKey)
+        : null;
+      let usage = selectedAccount?.usage || accountUsages[0]?.usage || null;
+      let selectedAccountKey = selectedAccount?.accountKey || accountUsages[0]?.accountKey || null;
+      let source = usage ? 'account-log' : 'none';
+
+      if (!usage && opts?.sessionId) {
         const loaded = await loadSessionRecords(opts.sessionId, opts.cwd);
         if (loaded.success) {
           usage = latestCodexUsageInRecords(loaded.records, loaded.filePath);
+          source = usage ? 'active-session-rollout' : source;
         }
       }
-      if (!usage) usage = await findLatestCodexUsage();
-      return { success: true, data: usage };
+      if (!usage) {
+        usage = await findLatestCodexUsage();
+        source = usage ? 'latest-rollout' : source;
+      }
+
+      const weekly = usage?.seven_day?.utilization ?? usage?.secondary?.utilization ?? null;
+      const fiveHour = usage?.five_hour?.utilization ?? usage?.primary?.utilization ?? null;
+      const accountLabel = selectedAccount?.label || accountUsages[0]?.label || 'none';
+      console.log('[CodexData] get-usage source=' + source +
+        ' accounts=' + accountUsages.length +
+        ' selected=' + accountLabel +
+        ' weekly=' + (weekly ?? 'null') +
+        ' fiveHour=' + (fiveHour ?? 'null') +
+        ' session=' + (opts?.sessionId ? String(opts.sessionId).slice(0, 8) : 'none'));
+
+      return {
+        success: true,
+        data: usage,
+        accounts: accountUsages,
+        selectedAccountKey,
+      };
     } catch (error) {
       console.error('[CodexData] get-usage error:', error);
       return { success: false, error: error.message };
@@ -1265,7 +1607,9 @@ module.exports = {
   buildCodexCleanExport,
   buildCodexRangeExport,
   getTimelineSessionMeta,
+  listCodexModels,
   _api: {
+    listCodexModels,
     findCodexSessionFile,
     findLatestCodexSession,
     parseJsonlFile,
@@ -1278,5 +1622,6 @@ module.exports = {
     getTimelineSessionMeta,
     latestCodexUsageInRecords,
     findLatestCodexUsage,
+    findLatestCodexUsageAccounts,
   },
 };

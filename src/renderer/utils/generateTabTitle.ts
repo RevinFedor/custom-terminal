@@ -14,6 +14,12 @@ export const AUTO_TAB_TITLE_MAX_PROMPT_CHARS = 12000;
 export const TIMELINE_PROMPT_SUMMARY_MAX_SOURCE_CHARS = 8000; // ≈2000 tokens for mixed RU/EN prompts.
 
 const TAB_TITLE_COMMAND_RE = /^\s*(#(?:pack|effort|usage|help|model|status|clear)\b|\/(?:model|help|status|usage|compact|clear|exit|quit|login|logout|cost|rewind|init)\b)/i;
+const TAB_TITLE_BOOTSTRAP_PROMPT_RE = /^\s*Continue from where you left off\.?\s*$/i;
+const TAB_TITLE_CODEX_BOOTSTRAP_PROMPT_RE = /^\s*(?:#\s*)?(?:AGENTS|GEMINI)\.md instructions for\b/i;
+
+function isCodexBootstrapInstructionPrompt(text: string): boolean {
+  return TAB_TITLE_CODEX_BOOTSTRAP_PROMPT_RE.test(text);
+}
 
 export interface TabTitleSourceEntry {
   type?: string;
@@ -47,11 +53,26 @@ export interface GenerateTabTitleFromSessionOptions {
   reason: string;
 }
 
+interface PromptUsageMetadata {
+  projectId?: string | null;
+  projectName?: string | null;
+  projectPath?: string | null;
+  tabId?: string | null;
+  tabName?: string | null;
+  toolType?: string | null;
+  sessionId?: string | null;
+  entryUuid?: string | null;
+  iterationIndex?: number | null;
+}
+
 export function isEligibleTabTitleEntry(entry: TabTitleSourceEntry): boolean {
   if (entry.type !== 'user' || entry.isCompactSummary) return false;
   const text = String(entry.content || '').trim();
   if (text.length < 2) return false;
   if (TAB_TITLE_COMMAND_RE.test(text)) return false;
+  if (TAB_TITLE_BOOTSTRAP_PROMPT_RE.test(text)) return false;
+  // Codex can emit project instructions as a role=user bootstrap block; it is not a user prompt.
+  if (isCodexBootstrapInstructionPrompt(text)) return false;
   if (text.startsWith('This session is being continued from a previous conversation')) return false;
   if (text.startsWith('[Request interrupted') || text === '[User cancelled]') return false;
   return true;
@@ -83,6 +104,39 @@ function sanitizeGeneratedTabTitle(raw: string): string {
     clean = chars.slice(0, 64).join('').trim();
   }
   return clean;
+}
+
+function buildLocalFallbackTabTitle(userPrompt: string): string | null {
+  if (isCodexBootstrapInstructionPrompt(String(userPrompt || '').trimStart())) {
+    return null;
+  }
+
+  const lines = String(userPrompt || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/!\[[^\]]*]\([^)]+\)/g, ' ')
+    .replace(/\[[^\]]*]\(([^)]+)\)/g, '$1')
+    .replace(/<[^>\n]+>/g, ' ')
+    .split(/\n+/)
+    .map((line) => line
+      .replace(/^\s*(?:#{1,6}|[-*+>]|\d+[.)])\s+/g, '')
+      .replace(/^(?:\^+\s*)+/, '')
+      .replace(/^[\s#>*_\-–—:;,.!?/\\|+=~]+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+    )
+    .filter((line) => line.length >= 2 && !TAB_TITLE_COMMAND_RE.test(line));
+
+  const source = lines[0] || '';
+  if (!source) return null;
+
+  const words = source
+    .split(/\s+/)
+    .map((word) => word.replace(/^[`"'“”«»()[\]{}.,:;!?]+|[`"'“”«»()[\]{}.,:;!?]+$/g, ''))
+    .filter(Boolean);
+  if (words.length === 0) return null;
+
+  return sanitizeGeneratedTabTitle(words.slice(0, 6).join(' ')) || null;
 }
 
 function normalizeSingleStarEmphasis(text: string): string {
@@ -136,6 +190,37 @@ function sanitizeGeneratedPromptSummary(raw: string): string {
   return normalizeSingleStarEmphasis(clean);
 }
 
+function buildTimelinePromptSummarySource(currentPrompt: string, previousUserMessages: string[] = []): string {
+  const current = String(currentPrompt || '').trim();
+  const previous = previousUserMessages
+    .map((msg) => String(msg || '').trim())
+    .filter(Boolean);
+  if (previous.length === 0) return current;
+
+  const header = [
+    'Контекст для пересказа:',
+    'Ниже перечислены предыдущие user-сообщения той же сессии в хронологическом порядке.',
+    'Используй их только как контекст. Пересказывай именно текущее user-сообщение.',
+  ].join('\n');
+  const currentBlock = `Текущее user-сообщение:\n${current}`;
+  const fixedChars = header.length + currentBlock.length + 8;
+  let remaining = Math.max(0, TIMELINE_PROMPT_SUMMARY_MAX_SOURCE_CHARS - fixedChars);
+  const selected: string[] = [];
+
+  for (let i = previous.length - 1; i >= 0; i--) {
+    const label = `Предыдущее user-сообщение ${i + 1}:\n`;
+    const available = remaining - label.length - 2;
+    if (available <= 0) break;
+    const raw = previous[i];
+    const text = raw.length > available ? raw.slice(raw.length - available) : raw;
+    selected.unshift(label + text);
+    remaining -= label.length + text.length + 2;
+  }
+
+  if (selected.length === 0) return current;
+  return `${header}\n\n${selected.join('\n\n')}\n\n${currentBlock}`;
+}
+
 async function buildSystemPrompt(promptConfig: AIPrompt | undefined, fallbackPrompt: string, logPrefix: string): Promise<string> {
   const base = (promptConfig?.content || fallbackPrompt).trim();
   const filePaths = promptConfig?.filePaths || [];
@@ -165,6 +250,8 @@ export async function generateTitleFromPromptWithConfig(
     taskType?: string;
     promptId?: string;
     sanitize?: (raw: string) => string;
+    sourceChars?: number;
+    usageMetadata?: PromptUsageMetadata;
   }
 ): Promise<string | null> {
   const apiKey = (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY) || '';
@@ -211,8 +298,9 @@ export async function generateTitleFromPromptWithConfig(
         totalTokens: Number(usage?.totalTokenCount || 0),
         status,
         error: error ? String(error).slice(0, 500) : null,
-        sourceChars: userPrompt.length,
+        sourceChars: Number.isFinite(Number(options.sourceChars)) ? Number(options.sourceChars) : userPrompt.length,
         outputChars: raw.length,
+        ...(options.usageMetadata || {}),
       });
     } catch (err: any) {
       console.warn('[' + options.logPrefix + '] failed to log usage:', err?.message || err);
@@ -261,23 +349,43 @@ export async function generateTitleFromPromptWithConfig(
 }
 
 export async function generateTabTitleFromPrompt(userPrompt: string, promptConfig?: AIPrompt): Promise<string | null> {
-  return generateTitleFromPromptWithConfig(userPrompt, promptConfig, {
+  const title = await generateTitleFromPromptWithConfig(userPrompt, promptConfig, {
     fallbackPrompt: DEFAULT_TAB_TITLE_PROMPT,
     sourceLabel: 'Первое пользовательское сообщение',
     logPrefix: 'TabTitle',
     taskType: 'tab-title',
     promptId: TAB_TITLE_PROMPT_ID,
   });
+  if (title) return title;
+
+  const fallbackTitle = buildLocalFallbackTabTitle(userPrompt);
+  console.warn(
+    '[TabTitle] fallback-local' +
+    ' sourceChars=' + String(userPrompt || '').length +
+    ' output=' + JSON.stringify(fallbackTitle || null)
+  );
+  return fallbackTitle;
 }
 
-export async function generateTimelinePromptSummaryFromPrompt(userPrompt: string, promptConfig?: AIPrompt): Promise<string | null> {
-  return generateTitleFromPromptWithConfig(trimTimelinePromptSummarySource(userPrompt), promptConfig, {
+export async function generateTimelinePromptSummaryFromPrompt(
+  userPrompt: string,
+  promptConfig?: AIPrompt,
+  options: {
+    previousUserMessages?: string[];
+    usageMetadata?: PromptUsageMetadata;
+  } = {}
+): Promise<string | null> {
+  const current = trimTimelinePromptSummarySource(userPrompt);
+  const source = buildTimelinePromptSummarySource(current, options.previousUserMessages || []);
+  return generateTitleFromPromptWithConfig(trimTimelinePromptSummarySource(source), promptConfig, {
     fallbackPrompt: DEFAULT_PROMPT_SUMMARY_PROMPT,
-    sourceLabel: 'Пользовательское сообщение',
+    sourceLabel: options.previousUserMessages?.length ? 'Контекст и текущее пользовательское сообщение' : 'Пользовательское сообщение',
     logPrefix: 'PromptSummary',
     taskType: 'prompt-summary',
     promptId: PROMPT_SUMMARY_PROMPT_ID,
     sanitize: sanitizeGeneratedPromptSummary,
+    sourceChars: current.length,
+    usageMetadata: options.usageMetadata,
   });
 }
 

@@ -55,7 +55,8 @@ const handleLinkActivation = (
         useUIStore.getState().openFilePreview({
           path: uri,
           content: result.content,
-          language: languageMap[ext] || null
+          language: languageMap[ext] || null,
+          source: 'terminal-link'
         });
         const { activeProjectId } = useWorkspaceStore.getState();
         if (activeProjectId) {
@@ -523,6 +524,10 @@ async function finalizeAiLaunchSnapshot(tabId: string) {
   }
 
   if (!tabInfo.sessionId) {
+    if (snapshot.autoTitleMode === 'fork') {
+      console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=' + snapshot.sessionType + ' result=no-session-id mode=fork → keep (bridge/watcher may detect forked session later)');
+      return;
+    }
     if (snapshot.sessionType === 'codex') {
       console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=codex result=no-session-id → keep (watcher may still detect rollout)');
       return;

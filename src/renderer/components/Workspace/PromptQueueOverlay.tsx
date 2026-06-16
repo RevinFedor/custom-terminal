@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
+import type { CSSProperties, WheelEvent } from 'react';
 import { createPortal } from 'react-dom';
-import { ChevronLeft, History, PanelRightClose, PanelRightOpen, Plus, Trash2 } from 'lucide-react';
-import { makeDefaultPromptTitle, usePromptQueueStore, type QueuedPrompt } from '../../store/usePromptQueueStore';
+import { CheckSquare, ChevronLeft, History, PanelRightClose, PanelRightOpen, Plus, RefreshCw, Square, Trash2 } from 'lucide-react';
+import { countEnabledQueuedPrompts, isQueuedPromptEnabled, makeDefaultPromptTitle, usePromptQueueStore, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -58,6 +59,9 @@ const TEXT_MUTED = '#888';
 const TEXT_DIM = '#555';
 const SAVE_GREEN = '#22c55e';
 const DELETE_RED = '#ef4444';
+const DISABLED_PROMPT_BG = 'rgba(82, 18, 48, 0.48)';
+const DISABLED_PROMPT_BG_HOVER = 'rgba(104, 24, 60, 0.56)';
+const DISABLED_PROMPT_TEXT = '#d8c5cf';
 const OVERLAY_Z_INDEX = 120;           // above HistoryPanel (z:101)
 const FLOATING_OVERLAY_Z_INDEX = 130;  // editor/dropdowns above the rail/panel
 const INSERT_PROMPT_TITLE_MATCH_CHARS = 50;
@@ -100,6 +104,10 @@ function chipTitle(item: QueuedPrompt): string {
 
 function takeLeadingChars(value: string, count: number): string {
   return Array.from(value).slice(0, count).join('');
+}
+
+function shouldPreservePinnedEditorOnOutsideClick(target: Element | null): boolean {
+  return !!target?.closest('[data-tab-item], [data-workspace-navigation]');
 }
 
 type StoredInsertPrompt = { title?: unknown; content?: unknown };
@@ -153,8 +161,11 @@ type Props = {
 export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset = 0 }: Props) {
   const agentLabel = AGENT_LABEL[sessionType];
   const chipLineClamp = useUIStore((s) => s.promptQueueChipLineClamp);
+  const promptQueueChipFontSize = useUIStore((s) => s.promptQueueChipFontSize);
+  const promptQueueEditorFontSize = useUIStore((s) => s.promptQueueEditorFontSize);
   const queue = usePromptQueueStore((s) => s.queues.get(tabId));
   const items = queue?.items ?? [];
+  const activeItemCount = useMemo(() => countEnabledQueuedPrompts(items), [items]);
   const autoRun = queue?.autoRun ?? false;
   const stopAfter = queue?.stopAfter ?? false;
   const closeAfter = queue?.closeAfter ?? false;
@@ -163,11 +174,12 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   const collapsed = queue?.panelCollapsed ?? false;
   const firstChipArmedHint = queue?.firstChipHintActive ?? false;
   const runAfterTabId = queue?.runAfterTabId ?? null;
+  const pinnedPreviewId = queue?.previewId ?? null;
   const {
     addPrompt, removePrompt, updatePrompt, reorderPrompt,
     setAutoRun, setStopAfter, setCloseAfter, setRunAfterTab,
     setPostPromptEnabled, setPostPromptText,
-    setPanelCollapsed,
+    setPanelCollapsed, setPreviewId,
     // popNext is consumed by hooks/usePromptQueueRunner.ts — not referenced here.
   } = usePromptQueueStore.getState();
 
@@ -221,6 +233,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   const [titleLoadingIds, setTitleLoadingIds] = useState<Set<string>>(new Set());
   const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
   const [removeHoverId, setRemoveHoverId] = useState<string | null>(null);
+  const [chipContextMenu, setChipContextMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const chipListRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
@@ -238,6 +251,10 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     title: string;
     titleManual: boolean;
   } | null>(null);
+  const chipContextItem = useMemo(
+    () => chipContextMenu ? items.find((item) => item.id === chipContextMenu.id) ?? null : null,
+    [chipContextMenu, items]
+  );
 
   // ─── fixed width + drag-resize ─────────────────────────────────────────────
   // The panel has a FIXED width (no `fit-content`) so adding a +grab chip can't
@@ -254,6 +271,9 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   const timelinePinned = useUIStore((s) => s.timelinePinned);
   const [dragWidth, setDragWidth] = useState<number | null>(null);
   const effectiveWidth = dragWidth ?? promptQueueWidth;
+  const chipTextLineHeight = Math.max(12, Math.round(promptQueueChipFontSize * 1.27));
+  const editorTitleHeight = Math.max(EDITOR_TITLE_HEIGHT, Math.round(promptQueueEditorFontSize * 1.8));
+  const editorTextareaMinHeight = Math.max(EDITOR_TEXTAREA_MIN_HEIGHT, Math.round(promptQueueEditorFontSize * 4.8));
 
   const startResize = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -330,6 +350,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
 
   // ─── handlers ────────────────────────────────────────────────────────────
   const resetEditor = useCallback(() => {
+    if (editingId) setPreviewId(tabId, null);
     setEditorOpen(false);
     setEditorText('');
     setEditorTitle('');
@@ -339,7 +360,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     setEditorFocusWithin(false);
     setEditorPinned(false);
     editorInitialRef.current = null;
-  }, []);
+  }, [editingId, setPreviewId, tabId]);
 
   const markAppearing = useCallback((id: string) => {
     setAppearingIds((prev) => {
@@ -406,7 +427,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     }, 260);
   }, [removePrompt, removeHoverId, tabId]);
 
-  const generateRunAfterTitle = useCallback((id: string, text: string) => {
+  const generateRunAfterTitle = useCallback((id: string, text: string, opts?: { force?: boolean }) => {
     const source = trimTabTitlePrompt(text.trim());
     if (!source || titleGeneratingIdsRef.current.has(id)) return false;
     titleGeneratingIdsRef.current.add(id);
@@ -423,7 +444,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
         });
         if (!title) return;
         const current = usePromptQueueStore.getState().getQueue(tabId).items.find((p) => p.id === id);
-        if (!current || current.titleManual) return;
+        if (!current || (current.titleManual && !opts?.force)) return;
         updatePrompt(tabId, id, { title, titleManual: true });
         markSaved(id);
       } finally {
@@ -453,13 +474,20 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
         return changed;
       }
 
-      const text = editorText.trim();
+      const normalizedTitle = editorTitle.trim();
+      const bodyText = editorText.trim();
+      const titleCanStandInForBody = normalizedTitle.length > 0 && (
+        !initial.id ||
+        !!initial.titleManual ||
+        normalizedTitle !== initial.title ||
+        normalizedTitle !== makeDefaultPromptTitle(initial.text)
+      );
+      const text = bodyText || (titleCanStandInForBody ? normalizedTitle : '');
       if (!text) {
         if (opts?.close !== false) resetEditor();
         return false;
       }
 
-      const normalizedTitle = editorTitle.trim();
       if (initial.id) {
         const nextDefaultTitle = makeDefaultPromptTitle(text);
         const titleEditedInForm = normalizedTitle !== initial.title;
@@ -522,6 +550,27 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     return true;
   }, [blurActiveElement, commitEditor, editingId, editorOpen, editorPinned, isPostPromptMode, suppressChipReopen]);
 
+  const openChipContextMenu = useCallback((id: string, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    closePinnedEditorFromChip(id);
+    setChipContextMenu({ id, x: e.clientX, y: e.clientY });
+  }, [closePinnedEditorFromChip]);
+
+  const toggleChipEnabled = useCallback((id: string) => {
+    const current = usePromptQueueStore.getState().getQueue(tabId).items.find((item) => item.id === id);
+    if (!current) return;
+    updatePrompt(tabId, id, { enabled: !isQueuedPromptEnabled(current) });
+    setChipContextMenu(null);
+  }, [tabId, updatePrompt]);
+
+  const regenerateChipTitle = useCallback((id: string) => {
+    const current = usePromptQueueStore.getState().getQueue(tabId).items.find((item) => item.id === id);
+    if (!current) return;
+    generateRunAfterTitle(id, current.text, { force: true });
+    setChipContextMenu(null);
+  }, [generateRunAfterTitle, tabId]);
+
   const anchorEditor = useCallback((id?: string, anchorMode: EditorAnchorMode = 'list') => {
     const panelRect = panelRef.current?.getBoundingClientRect();
     if (!panelRect) return null;
@@ -580,12 +629,13 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     document.addEventListener('mouseup', onUp);
   }, [editorAnchor]);
 
-  const openEditor = useCallback((id?: string, mode: 'hover' | 'pin' = 'pin') => {
+  const openEditor = useCallback((id?: string, mode: 'hover' | 'pin' | 'restore' = 'pin') => {
     if (id && mode === 'hover' && isChipReopenSuppressed(id)) return;
     if (mode === 'hover' && editorPinned) return;
     if (editorOpen && !isPostPromptMode) {
       if (id && editingId === id) {
         if (mode === 'hover') return;
+        if (mode === 'restore') return;
         if (editorPinned) {
           suppressChipReopen(id);
           commitEditor();
@@ -593,6 +643,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
           return;
         }
         setEditorPinned(true);
+        setPreviewId(tabId, id);
         setEditorAutoFocus(true);
         requestAnimationFrame(() => {
           editorTitleInputRef.current?.focus();
@@ -602,10 +653,12 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       if (!id && !editingId) {
         if (mode === 'pin') {
           if (editorPinned) {
+            setPreviewId(tabId, null);
             commitEditor();
             blurActiveElement();
             return;
           }
+          setPreviewId(tabId, null);
           setEditorPinned(true);
           setEditorAutoFocus(true);
           requestAnimationFrame(() => {
@@ -629,6 +682,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       setEditorText(it.text);
       setEditorTitle(title);
       setEditingId(id);
+      if (mode === 'pin') setPreviewId(tabId, id);
       editorInitialRef.current = {
         id,
         post: false,
@@ -640,6 +694,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       setEditorText('');
       setEditorTitle('');
       setEditingId(null);
+      if (mode === 'pin') setPreviewId(tabId, null);
       editorInitialRef.current = {
         id: null,
         post: false,
@@ -649,12 +704,12 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       };
     }
     setIsPostPromptMode(false);
-    setEditorAutoFocus(mode !== 'hover');
+    setEditorAutoFocus(mode === 'pin');
     setEditorFocusWithin(false);
-    setEditorPinned(mode === 'pin');
+    setEditorPinned(mode !== 'hover');
     setEditorAnchor(anchor);
     setEditorOpen(true);
-  }, [anchorEditor, blurActiveElement, commitEditor, editingId, editorOpen, editorPinned, isChipReopenSuppressed, isPostPromptMode, suppressChipReopen, tabId]);
+  }, [anchorEditor, blurActiveElement, commitEditor, editingId, editorOpen, editorPinned, isChipReopenSuppressed, isPostPromptMode, setPreviewId, suppressChipReopen, tabId]);
 
   // Same editor surface as openEditor, but loads the per-tab post-prompt body.
   // Switching editor purpose first commits the currently open surface, matching
@@ -667,6 +722,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     if (editorOpen) commitEditor();
     const anchor = anchorEditor(undefined, 'panel');
     if (!anchor) return;
+    setPreviewId(tabId, null);
     setEditorText(postPromptText);
     setEditorTitle('');
     setEditingId(null);
@@ -683,7 +739,25 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     };
     setEditorAnchor(anchor);
     setEditorOpen(true);
-  }, [anchorEditor, commitEditor, editorOpen, isPostPromptMode, postPromptText]);
+  }, [anchorEditor, commitEditor, editorOpen, isPostPromptMode, postPromptText, setPreviewId, tabId]);
+
+  useEffect(() => {
+    if (!chipContextMenu) return;
+    if (!chipContextItem) {
+      setChipContextMenu(null);
+      return;
+    }
+    const onMouseDown = () => setChipContextMenu(null);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setChipContextMenu(null);
+    };
+    window.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [chipContextItem, chipContextMenu]);
 
   useEffect(() => {
     if (!editorOpen) return;
@@ -697,11 +771,15 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       if (replayButton?.contains(target)) return;
       const currentChip = editingId ? chipRefs.current.get(editingId) : null;
       if (currentChip?.contains(target)) return;
+      if (editorPinned && shouldPreservePinnedEditorOnOutsideClick(targetElement)) {
+        commitEditor({ close: false });
+        return;
+      }
       commitEditor();
     };
     window.addEventListener('mousedown', onMouseDown, true);
     return () => window.removeEventListener('mousedown', onMouseDown, true);
-  }, [commitEditor, editingId, editorOpen]);
+  }, [commitEditor, editingId, editorOpen, editorPinned]);
 
   useEffect(() => {
     if (!editorOpen || !editingId || editorPinned || editorFocusWithin) return;
@@ -730,24 +808,47 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     if (!editorOpen || !editorAnchor) return;
     const textarea = editorTextareaRef.current;
     if (!textarea) return;
-    const chromeHeight = isPostPromptMode ? 0 : EDITOR_TITLE_HEIGHT + 1;
+    const chromeHeight = isPostPromptMode ? 0 : editorTitleHeight + 1;
     const maxTextareaHeight = Math.max(
-      EDITOR_TEXTAREA_MIN_HEIGHT,
+      editorTextareaMinHeight,
       editorAnchor.maxHeight - chromeHeight
     );
     textarea.style.height = 'auto';
     const nextHeight = Math.min(
-      Math.max(textarea.scrollHeight, EDITOR_TEXTAREA_MIN_HEIGHT),
+      Math.max(textarea.scrollHeight, editorTextareaMinHeight),
       maxTextareaHeight
     );
     textarea.style.height = `${nextHeight}px`;
     textarea.style.overflowY = textarea.scrollHeight > maxTextareaHeight ? 'auto' : 'hidden';
-  }, [editorAnchor, editorOpen, editorSize.width, editorText, isPostPromptMode]);
+  }, [editorAnchor, editorOpen, editorSize.width, editorText, editorTextareaMinHeight, editorTitleHeight, isPostPromptMode]);
 
   useEffect(() => {
     if (!editingId) return;
     if (!items.some((i) => i.id === editingId)) resetEditor();
   }, [editingId, items, resetEditor]);
+
+  useEffect(() => {
+    if (!pinnedPreviewId || collapsed || panelClosing) return;
+    if (editorOpen && editorPinned && editingId === pinnedPreviewId && !isPostPromptMode) return;
+    if (!items.some((i) => i.id === pinnedPreviewId)) {
+      setPreviewId(tabId, null);
+      return;
+    }
+    const raf = requestAnimationFrame(() => openEditor(pinnedPreviewId, 'restore'));
+    return () => cancelAnimationFrame(raf);
+  }, [
+    collapsed,
+    editingId,
+    editorOpen,
+    editorPinned,
+    isPostPromptMode,
+    items,
+    openEditor,
+    panelClosing,
+    pinnedPreviewId,
+    setPreviewId,
+    tabId,
+  ]);
 
   // Auto-arm was removed — adding a chip no longer flips Run after on.
   // The user is the sole arbiter of when the queue starts firing (one toggle).
@@ -988,14 +1089,14 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     ? (railRunHover ? '#342a52' : '#2b2340')
     : firstChipArmedHint
       ? (railRunHover ? 'rgba(127, 29, 29, 0.22)' : HINT_RED_BG)
-      : items.length
+      : activeItemCount
         ? (railRunHover ? '#303030' : '#242424')
         : (railRunHover ? '#3a241b' : '#2a1a14');
   const railRunBorder = autoRun
     ? (railRunHover ? '#a78bfa' : '#8b75d9')
     : firstChipArmedHint
       ? (railRunHover ? 'rgba(239, 68, 68, 0.48)' : HINT_RED_BORDER)
-      : items.length
+      : activeItemCount
         ? (railRunHover ? '#666' : '#4a4a4a')
         : (railRunHover ? TINT : '#8a4a37');
 
@@ -1076,7 +1177,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
         {/* Header row: first-delay timer input on left, Run/Stop pills on right.
             The title "Очередь" was removed — context is obvious from the panel.
             Timer input doubles as a countdown display when armed:
-              idle  → shows configured firstDelaySeconds, editable.
+              idle  → shows pending firstDelaySeconds, editable.
               armed → shows live remaining seconds, read-only.
             "Run after" toggles autoRun. Arming with delay > 0 starts the countdown.
             Disarming mid-countdown freezes the remaining seconds back into the input.
@@ -1102,14 +1203,15 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
             <RunAfterTabPicker
               tabId={tabId}
+              autoRun={autoRun}
               runAfterTabId={runAfterTabId}
               setRunAfterTab={setRunAfterTab}
               panelRef={panelRef}
             />
             <div style={{ display: 'flex', alignItems: 'center', gap: 4, width: '100%' }}>
               <FirstDelayInput tabId={tabId} autoRun={autoRun} />
-              {items.length > 0 && (
-                <span style={{ color: TEXT_DIM, fontSize: 9, userSelect: 'none', flexShrink: 0 }}>·{items.length}</span>
+              {activeItemCount > 0 && (
+                <span style={{ color: TEXT_DIM, fontSize: 9, userSelect: 'none', flexShrink: 0 }}>·{activeItemCount}</span>
               )}
             </div>
           </div>
@@ -1393,7 +1495,8 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
             </div>
           )}
           {items.map((it, idx) => {
-            const isTitleLoading = titleLoadingIds.has(it.id) && !it.titleManual;
+            const isEnabled = isQueuedPromptEnabled(it);
+            const isTitleLoading = titleLoadingIds.has(it.id);
             const title = isTitleLoading ? '' : chipTitle(it);
             const isMultiLine = chipLineClamp > 1;
             const isEditing = editorOpen && editingId === it.id;
@@ -1420,6 +1523,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                 onDrop={onDrop(idx)}
                 onDragEnd={onDragEnd}
                 onMouseDownCapture={(e) => {
+                  if (e.button === 2) return;
                   const target = e.target as HTMLElement;
                   if (target.closest('[data-chip-action]')) return;
                   if (closePinnedEditorFromChip(it.id)) {
@@ -1441,6 +1545,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                   }
                   openEditor(it.id, 'pin');
                 }}
+                onContextMenu={(e) => openChipContextMenu(it.id, e)}
                 style={{
                   position: 'relative',
                   padding: '4px 7px',
@@ -1451,7 +1556,9 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                   borderRadius: 7,
                   background: isRemoveHovered
                     ? `${DELETE_RED}18`
-                    : (isEditing ? `${TINT}1a` : (isDragOver ? `${PULSE}22` : 'transparent')),
+                    : (!isEnabled
+                      ? (isEditing || isDragOver ? DISABLED_PROMPT_BG_HOVER : DISABLED_PROMPT_BG)
+                      : (isEditing ? `${TINT}1a` : (isDragOver ? `${PULSE}22` : 'transparent'))),
                   boxShadow: 'none',
                   cursor: isDragging ? 'grabbing' : 'pointer',
                   display: 'flex',
@@ -1533,16 +1640,17 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                   <span style={{
                     flex: 1,
                     minWidth: 0,
-                    minHeight: 14,
+                    minHeight: chipTextLineHeight,
                     display: 'inline-flex',
                     alignItems: 'center',
-                    color: TEXT_DIM,
+                    color: isEnabled ? TEXT_DIM : DISABLED_PROMPT_TEXT,
                   }}>
                     <span className="pq-spinner" style={{ width: 9, height: 9, borderWidth: 1.25 }} />
                   </span>
                 ) : isMultiLine ? (
                   <span style={{
-                    flex: 1, minWidth: 0, fontSize: 11, lineHeight: '14px',
+                    flex: 1, minWidth: 0, fontSize: promptQueueChipFontSize, lineHeight: `${chipTextLineHeight}px`,
+                    color: isEnabled ? '#ddd' : DISABLED_PROMPT_TEXT,
                     display: '-webkit-box',
                     WebkitBoxOrient: 'vertical' as const,
                     WebkitLineClamp: chipLineClamp,
@@ -1552,7 +1660,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                     wordBreak: 'break-word',
                   }}>{title}</span>
                 ) : (
-                  <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, lineHeight: '14px' }}>{title}</span>
+                  <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: promptQueueChipFontSize, lineHeight: `${chipTextLineHeight}px`, color: isEnabled ? '#ddd' : DISABLED_PROMPT_TEXT }}>{title}</span>
                 )}
                 {it.images > 0 && <span style={{ color: TINT, fontSize: 9 }}>📎{it.images}</span>}
                 <button
@@ -1667,15 +1775,15 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
             onClick={toggleAutoRun}
             onMouseEnter={() => setRailRunHover(true)}
             onMouseLeave={() => setRailRunHover(false)}
-            title={(autoRun ? 'Run after on' : 'Run after off') + ' · ' + items.length + ' queued'}
-            aria-label={(autoRun ? 'Run after on' : 'Run after off') + ', ' + items.length + ' queued'}
+            title={(autoRun ? 'Run after on' : 'Run after off') + ' · ' + activeItemCount + ' queued'}
+            aria-label={(autoRun ? 'Run after on' : 'Run after off') + ', ' + activeItemCount + ' queued'}
             style={{
               position: 'relative',
               background: railRunBg,
               borderColor: railRunBorder,
-              color: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED_TEXT : (items.length ? '#e5e5e5' : TINT)),
-              fontSize: items.length > 0 ? 12 : 18,
-              fontWeight: items.length > 0 ? 700 : 500,
+              color: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED_TEXT : (activeItemCount ? '#e5e5e5' : TINT)),
+              fontSize: activeItemCount > 0 ? 12 : 18,
+              fontWeight: activeItemCount > 0 ? 700 : 500,
               cursor: 'pointer',
               lineHeight: 1,
             }}
@@ -1693,7 +1801,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                 }}
               />
             )}
-            {items.length > 0 ? (items.length > 99 ? '99' : items.length) : '•'}
+            {activeItemCount > 0 ? (activeItemCount > 99 ? '99' : activeItemCount) : '•'}
           </button>
           <button
             className="pq-rail-button pq-rail-primary"
@@ -1705,6 +1813,82 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
           </button>
         </div>
       </div>
+
+      {chipContextMenu && chipContextItem && createPortal((() => {
+        const enabled = isQueuedPromptEnabled(chipContextItem);
+        const menuWidth = 206;
+        const menuHeight = 74;
+        const left = Math.max(8, Math.min(chipContextMenu.x, window.innerWidth - menuWidth - 8));
+        const top = Math.max(8, Math.min(chipContextMenu.y, window.innerHeight - menuHeight - 8));
+        const itemBase: CSSProperties = {
+          width: '100%',
+          minHeight: 30,
+          padding: '6px 8px',
+          background: 'transparent',
+          border: 'none',
+          borderRadius: 5,
+          color: '#ddd',
+          cursor: 'pointer',
+          fontSize: 12,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          textAlign: 'left',
+          fontFamily: 'inherit',
+        };
+        return (
+          <div
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              position: 'fixed',
+              left,
+              top,
+              width: menuWidth,
+              padding: 4,
+              background: 'rgba(18,18,18,0.98)',
+              border: `1px solid ${BORDER}`,
+              borderRadius: 7,
+              boxShadow: '0 10px 30px rgba(0,0,0,0.36)',
+              zIndex: FLOATING_OVERLAY_Z_INDEX + 10,
+              boxSizing: 'border-box',
+            }}
+          >
+            <button
+              onClick={() => toggleChipEnabled(chipContextItem.id)}
+              style={{
+                ...itemBase,
+                background: enabled ? 'transparent' : DISABLED_PROMPT_BG,
+                color: enabled ? '#ddd' : DISABLED_PROMPT_TEXT,
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = enabled ? 'rgba(255,255,255,0.06)' : DISABLED_PROMPT_BG_HOVER; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = enabled ? 'transparent' : DISABLED_PROMPT_BG; }}
+            >
+              {enabled ? <CheckSquare size={14} strokeWidth={1.9} /> : <Square size={14} strokeWidth={1.9} />}
+              <span style={{ flex: 1, minWidth: 0 }}>Отправлять из очереди</span>
+            </button>
+            <button
+              onClick={() => regenerateChipTitle(chipContextItem.id)}
+              disabled={titleLoadingIds.has(chipContextItem.id)}
+              style={{
+                ...itemBase,
+                color: titleLoadingIds.has(chipContextItem.id) ? TEXT_DIM : '#ddd',
+                cursor: titleLoadingIds.has(chipContextItem.id) ? 'default' : 'pointer',
+              }}
+              onMouseEnter={(e) => {
+                if (titleLoadingIds.has(chipContextItem.id)) return;
+                (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.06)';
+              }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+            >
+              {titleLoadingIds.has(chipContextItem.id)
+                ? <span className="pq-spinner" style={{ width: 12, height: 12, borderWidth: 1.5 }} />
+                : <RefreshCw size={14} strokeWidth={1.9} />}
+              <span style={{ flex: 1, minWidth: 0 }}>Обновить название</span>
+            </button>
+          </div>
+        );
+      })(), document.body)}
 
       {/* Editor slideout — docked to the LEFT of the queue panel, no scrim.
           Anchored by editorAnchor: top aligned to chip/list/panel, right edge stays fixed.
@@ -1742,7 +1926,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
             window.setTimeout(() => {
               const active = document.activeElement;
               if (active && editorRef.current?.contains(active)) return;
-              commitEditor();
+              commitEditor(editorPinned ? { close: false } : undefined);
             }, 0);
           }}
         >
@@ -1758,14 +1942,14 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                   if (e.key === 'Escape') resetEditor();
                 }}
                 style={{
-                  height: EDITOR_TITLE_HEIGHT,
+                  height: editorTitleHeight,
                   flexShrink: 0,
                   background: '#0e0e0e',
                   color: '#ddd',
                   border: 'none',
                   padding: '0 8px',
                   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                  fontSize: 12,
+                  fontSize: promptQueueEditorFontSize,
                   outline: 'none',
                   boxSizing: 'border-box',
                 }}
@@ -1784,11 +1968,13 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
             }}
             style={{
               flex: '0 0 auto',
-              minHeight: EDITOR_TEXTAREA_MIN_HEIGHT,
-              maxHeight: editorAnchor.maxHeight - (isPostPromptMode ? 0 : EDITOR_TITLE_HEIGHT + 1),
+              minHeight: editorTextareaMinHeight,
+              maxHeight: editorAnchor.maxHeight - (isPostPromptMode ? 0 : editorTitleHeight + 1),
               background: '#0e0e0e', color: '#ddd',
               border: 'none', padding: '6px 8px',
-              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12,
+              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+              fontSize: promptQueueEditorFontSize,
+              lineHeight: 1.35,
               resize: 'none', outline: 'none',
               overflowY: 'hidden',
               boxSizing: 'border-box',
@@ -1863,7 +2049,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
           width: 10px; height: 10px; border-radius: 50%;
           border: 1.5px solid currentColor;
           border-right-color: transparent;
-          animation: pq-spin 0.7s linear infinite;
+          animation: pq-spin 1.35s linear infinite;
           display: inline-block;
         }
         .pq-panel-opening {
@@ -2050,8 +2236,8 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
 //   idle      — number input with placeholder "сек", user types desired delay.
 //   counting  — read-only countdown display ticking from N → 0 once per second.
 // When countdown reaches 0 the runner pops + fires (we just stop ticking here).
-// Disarming Run while counting freezes "what's left" back into firstDelaySeconds
-// — that bookkeeping happens in the store, this component just re-reads it.
+// Disarming Run while counting freezes "what's left" back into firstDelaySeconds.
+// Natural fire consumes the delay back to 0, which renders as an empty input.
 type FirstDelayInputProps = { tabId: string; autoRun: boolean };
 function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
   const cfg = usePromptQueueStore((s) => s.queues.get(tabId)?.firstDelaySeconds ?? 0);
@@ -2183,6 +2369,7 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
 
 type RunAfterTabPickerProps = {
   tabId: string;
+  autoRun: boolean;
   runAfterTabId: string | null;
   setRunAfterTab: (tabId: string, target: string | null) => void;
   // Ref to the overlay panel's outer container. Used to anchor the side
@@ -2251,7 +2438,7 @@ function projectLabel(projectPath: string, projectId: string): string {
   return clean.split(/[\\/]/).filter(Boolean).pop() || projectId.slice(-8);
 }
 
-function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: RunAfterTabPickerProps) {
+function RunAfterTabPicker({ tabId, autoRun, runAfterTabId, setRunAfterTab, panelRef }: RunAfterTabPickerProps) {
   // Fingerprint Pattern (CLAUDE.md / fix-performance-lags.md): селектор ОБЯЗАН
   // вернуть примитив. Возврат свежего `{projectId, activeTabId, tabs}` каждый
   // раз приводит к infinite loop через Object.is (Zustand сравнение).
@@ -2412,6 +2599,16 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
     setOpen(true);
   }, [inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, panelRef]);
 
+  const handleProjectWheel = useCallback((e: WheelEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    if (el.scrollWidth <= el.clientWidth) return;
+    const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+    if (delta === 0) return;
+    const before = el.scrollLeft;
+    el.scrollLeft += delta;
+    if (el.scrollLeft !== before) e.preventDefault();
+  }, []);
+
   // Status: drives the right-side icon both in the closed pill (for the
   // selected target) and in each open-menu row. 2-state by design — a tab
   // whose agent is actively thinking shows a spinner, anything else shows
@@ -2432,15 +2629,25 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
     ? targetTabs
     : targetTabs.filter((t) => statusFor(t.id) === 'busy' || t.id === runAfterTabId);
 
-  // Armed palette: purple is a translucent BACKGROUND fill only; border + text
-  // are white. Purple as foreground (text/thin border) on near-black is low
-  // contrast and "режет глаза" — white foreground on a soft violet fill reads
-  // cleanly on the dark overlay. (User: «только background фиолетовым, рамку и
-  // цвет внутри — белым».)
-  const armed = !!selectedTab;
-  const triggerBorder = open ? 'rgba(190,190,190,0.36)' : (armed ? 'rgba(190,190,190,0.28)' : BORDER);
-  const triggerColor = (armed || open) ? '#fff' : TEXT_MUTED;
-  const triggerBg = open ? 'rgba(255,255,255,0.08)' : (armed ? `${DEEP_PULSE}33` : 'transparent');
+  // Selected target can stay while Run after is OFF. Purple means active wait;
+  // gray means "target remembered, not armed".
+  const hasSelectedTarget = !!selectedTab;
+  const activeTargetWait = hasSelectedTarget && autoRun;
+  const triggerBorder = open
+    ? 'rgba(190,190,190,0.36)'
+    : activeTargetWait
+      ? 'rgba(190,190,190,0.28)'
+      : hasSelectedTarget
+        ? 'rgba(180,180,180,0.24)'
+        : BORDER;
+  const triggerColor = (hasSelectedTarget || open) ? (activeTargetWait ? '#fff' : '#d8d8d8') : TEXT_MUTED;
+  const triggerBg = open
+    ? 'rgba(255,255,255,0.08)'
+    : activeTargetWait
+      ? `${DEEP_PULSE}33`
+      : hasSelectedTarget
+        ? 'rgba(255,255,255,0.07)'
+        : 'transparent';
 
   return (
     <>
@@ -2448,9 +2655,12 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
         ref={triggerRef}
         onClick={() => open ? setOpen(false) : handleOpen()}
         title={
-          armed && selectedTab
-            ? `Run after tab "${selectedTab.name}" finishes` +
-              (selectedStatus === 'busy' ? ' (busy now)' : '')
+          hasSelectedTarget && selectedTab
+            ? (
+              autoRun
+                ? `Run after tab "${selectedTab.name}" finishes`
+                : `Run after target saved: "${selectedTab.name}" (off)`
+            ) + (selectedStatus === 'busy' ? ' (busy now)' : '')
             : 'Pick a tab to wait on (otherwise fires on own turn-end)'
         }
         style={{
@@ -2470,7 +2680,7 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
           transition: 'background 0.12s, border-color 0.12s, color 0.12s',
         }}
       >
-        {armed && selectedTab ? (
+        {hasSelectedTarget && selectedTab ? (
           <>
             <span style={{
               width: 5, height: 5, borderRadius: '50%',
@@ -2483,7 +2693,7 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
               textAlign: 'left',
               fontSize: 11,  // +2px on the tab name (button base is 9) per user request
             }}>{selectedTab.name}</span>
-            <StatusIcon status={selectedStatus!} color="#fff" />
+            <StatusIcon status={selectedStatus!} color={activeTargetWait ? '#fff' : '#cfcfcf'} />
           </>
         ) : (
           <>
@@ -2581,6 +2791,7 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
 
               <div
                 className="scrollbar-hide"
+                onWheel={handleProjectWheel}
                 style={{
                   display: 'flex',
                   gap: 4,
@@ -2629,8 +2840,9 @@ function RunAfterTabPicker({ tabId, runAfterTabId, setRunAfterTab, panelRef }: R
                     key={t.id}
                     label={t.name}
                     colorDot={AI_KIND_COLOR[t.kind]}
-                    statusIcon={<StatusIcon status={status} color="#fff" />}
+                    statusIcon={<StatusIcon status={status} color={autoRun ? '#fff' : '#cfcfcf'} />}
                     selected={isSelected}
+                    active={autoRun}
                     onClick={() => {
                       // Toggle-off: clicking the already-selected row clears
                       // the target. No separate "no target" row: selection
@@ -2697,16 +2909,19 @@ function ProjectChip({
 // One dropdown row. Centralised so spacing/hover stays uniform across all tab
 // rows and any future category header rows.
 function RunAfterRow({
-  label, colorDot, statusIcon, selected, onClick, muted,
+  label, colorDot, statusIcon, selected, active, onClick, muted,
 }: {
   label: string;
   colorDot: string;
   statusIcon: React.ReactNode | null;
   selected: boolean;
+  active: boolean;
   onClick: () => void;
   muted?: boolean;
 }) {
   const [hover, setHover] = useState(false);
+  const selectedActive = selected && active;
+  const selectedInactive = selected && !active;
   return (
     <button
       onClick={onClick}
@@ -2715,12 +2930,16 @@ function RunAfterRow({
       style={{
         width: '100%',
         padding: '4px 6px',
-        // Purple is BACKGROUND only; selected text is white (purple-on-dark text
-        // is low-contrast / harsh). +2px on the label per user request.
-        background: selected ? `${DEEP_PULSE}40` : (hover ? `${DEEP_PULSE}1a` : 'transparent'),
+        // Purple means active Run after wait; gray selected means remembered
+        // target while Run after itself is off.
+        background: selectedActive
+          ? `${DEEP_PULSE}40`
+          : selectedInactive
+            ? 'rgba(255,255,255,0.08)'
+            : (hover ? `${DEEP_PULSE}1a` : 'transparent'),
         border: 'none',
         borderRadius: 5,
-        color: muted ? TEXT_DIM : (selected ? '#fff' : '#ddd'),
+        color: muted ? TEXT_DIM : (selectedActive ? '#fff' : (selectedInactive ? '#d8d8d8' : '#ddd')),
         cursor: 'pointer',
         fontSize: 12,
         lineHeight: 1.18,
@@ -2751,7 +2970,7 @@ function StatusIcon({ status, color }: { status: 'busy' | 'idle'; color: string 
   if (status === 'busy') {
     return (
       <span style={{ flexShrink: 0, display: 'inline-flex' }}>
-        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="3" strokeLinecap="round" aria-hidden="true" style={{ animation: 'pq-spin 0.9s linear infinite' }}>
+        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="3" strokeLinecap="round" aria-hidden="true" style={{ animation: 'pq-spin 1.35s linear infinite' }}>
           <path d="M12 2v4" />
           <path d="M12 18v4" />
           <path d="M4.93 4.93l2.83 2.83" />

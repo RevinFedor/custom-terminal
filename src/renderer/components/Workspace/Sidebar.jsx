@@ -255,7 +255,7 @@ function IconPicker({ item, onSelect, onClose, onReset, onResetToVsc, existingIc
   )
 }
 
-function ContextMenu({ x, y, node, onClose, onCopyPath, onCopyContent, onRename, onChooseIcon, onNewFile, onNewFolder, onDelete, multiSelectCount = 0 }) {
+function ContextMenu({ x, y, node, onClose, onCopyPath, onCopyContent, onRename, onChooseIcon, onNewFile, onNewFolder, onDelete, onLinkFile, linkTargets = [], multiSelectCount = 0 }) {
   const menuRef = useRef(null)
 
   useEffect(() => {
@@ -293,6 +293,31 @@ function ContextMenu({ x, y, node, onClose, onCopyPath, onCopyContent, onRename,
           <div className="context-menu-item" onClick={() => { onCopyPath(node.id); onClose() }}>Copy Path</div>
           {!node.isDirectory && (
             <div className="context-menu-item" onClick={() => { onCopyContent(node.id); onClose() }}>Copy Content</div>
+          )}
+          {!node.isDirectory && multiSelectCount <= 1 && onLinkFile && (
+            <div className="context-menu-item context-menu-submenu">
+              <span>Link File</span>
+              <span className="context-menu-arrow">›</span>
+              <div className="context-menu-submenu-panel">
+                {linkTargets.length === 0 && (
+                  <div className="context-menu-submenu-empty">No Claude/Codex tabs</div>
+                )}
+                {linkTargets.map((target) => (
+                  <div
+                    key={target.id}
+                    className="context-menu-submenu-item"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      onLinkFile(node.id, target.id)
+                      onClose()
+                    }}
+                  >
+                    <span className="context-menu-submenu-kind">{target.kind}</span>
+                    <span className="context-menu-submenu-title">{target.name}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
           )}
           {multiSelectCount <= 1 && (
             <div className="context-menu-item" onClick={handleRenameClick}>Rename</div>
@@ -351,6 +376,8 @@ function Sidebar({
   onCollapse,
   initialExpandedDirs,
   onExpandedDirsChange,
+  linkTargets = [],
+  onLinkFile,
 }) {
   const [treeData, setTreeData] = useState([])
   const [contextMenu, setContextMenu] = useState(null)
@@ -1141,6 +1168,8 @@ function Sidebar({
           onNewFile={handleNewFile}
           onNewFolder={handleNewFolder}
           onDelete={handleDelete}
+          onLinkFile={onLinkFile}
+          linkTargets={linkTargets}
           multiSelectCount={multiSelected.size}
         />
       )}

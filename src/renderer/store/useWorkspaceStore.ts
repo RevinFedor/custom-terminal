@@ -5,6 +5,7 @@ import { setPrefetched } from '../utils/sdkHistoryPrefetch';
 import { usePromptQueueStore } from './usePromptQueueStore';
 
 const { ipcRenderer } = window.require('electron');
+let tabGroupSaveSeq = 0;
 
 const restoreShortId = (id: unknown): string => String(id ?? 'null').slice(-12);
 const restoreTabsSummary = (tabs: any[]): string => {
@@ -22,7 +23,7 @@ export type TabColor = 'default' | 'red' | 'yellow' | 'green' | 'blue' | 'purple
 
 export type CommandType = 'generic' | 'devServer' | 'claude' | 'gemini' | 'codex';
 
-export type TabType = 'terminal' | 'browser' | 'claude-sdk';
+export type TabType = 'terminal' | 'browser' | 'claude-sdk' | 'file';
 
 /**
  * Tag for the source that wrote `tab.claudeSessionId`. Used for diagnostics
@@ -70,6 +71,43 @@ export interface TabGroup {
   sessionStatus?: string;
 }
 
+const dndShortId = (id: unknown): string => {
+  const text = String(id ?? 'null');
+  return text.length > 12 ? text.slice(-12) : text;
+};
+
+const dndShortValue = (value: unknown): string => {
+  if (value === undefined) return 'undefined';
+  if (value === null) return 'null';
+  return dndShortId(value);
+};
+
+const summarizeDndIds = (ids: unknown[]): string =>
+  ids.map(dndShortId).join('>') || '-';
+
+const summarizeDndAssignments = (assignments: Record<string, string | null | undefined>): string => {
+  const entries = Object.entries(assignments);
+  if (entries.length === 0) return '-';
+  return entries
+    .map(([id, value]) => `${dndShortId(id)}=${dndShortValue(value)}`)
+    .join(',');
+};
+
+const summarizeDndGroupMembers = (membersByGroup: Map<string, string[]>): string => {
+  const entries = Array.from(membersByGroup.entries());
+  if (entries.length === 0) return '-';
+  return entries
+    .map(([groupId, ids]) => `${dndShortId(groupId)}[${summarizeDndIds(ids)}]`)
+    .join(';');
+};
+
+const summarizeDndGroups = (groups: TabGroup[]): string => {
+  if (groups.length === 0) return '-';
+  return groups
+    .map(group => `${dndShortId(group.id)}(anchor=${dndShortValue(group.anchorTabId)},c=${group.collapsed ? 1 : 0})`)
+    .join(';');
+};
+
 export interface AiLaunchSnapshot {
   sessionType: 'claude' | 'codex';
   autoTitleEligible?: boolean;
@@ -99,9 +137,55 @@ export interface PendingAutoTabTitle {
   at: number;
 }
 
+interface AutoTabTitleIntent {
+  toolType: AutoTabTitleTool;
+  mode: AutoTabTitleMode;
+  sourceSessionId?: string;
+  at: number;
+}
+
 const aiLaunchSnapshots = new Map<string, AiLaunchSnapshot>();
 const pendingAutoTabTitles = new Map<string, PendingAutoTabTitle>();
+const autoTabTitleIntents = new Map<string, AutoTabTitleIntent>();
 const AUTO_TAB_TITLE_PENDING_TTL_MS = 10 * 60 * 1000;
+
+const setAutoTabTitleIntent = (
+  tabId: string,
+  toolType: AutoTabTitleTool,
+  mode: AutoTabTitleMode,
+  sourceSessionId?: string
+): void => {
+  autoTabTitleIntents.set(tabId, {
+    toolType,
+    mode,
+    sourceSessionId,
+    at: Date.now(),
+  });
+  console.warn(
+    '[Store:AutoTabTitleIntent] set tab=' + tabId.slice(-8) +
+    ' type=' + toolType +
+    ' mode=' + mode +
+    (sourceSessionId ? ' source=' + sourceSessionId.slice(0, 8) : '')
+  );
+};
+
+const getAutoTabTitleIntent = (tabId: string, toolType: AutoTabTitleTool): AutoTabTitleIntent | null => {
+  const intent = autoTabTitleIntents.get(tabId);
+  if (!intent) return null;
+
+  if (Date.now() - intent.at > AUTO_TAB_TITLE_PENDING_TTL_MS) {
+    autoTabTitleIntents.delete(tabId);
+    console.warn(
+      '[Store:AutoTabTitleIntent] expire tab=' + tabId.slice(-8) +
+      ' type=' + intent.toolType +
+      ' mode=' + intent.mode
+    );
+    return null;
+  }
+
+  if (intent.toolType !== toolType) return null;
+  return intent;
+};
 
 const clearPendingAutoTabTitle = (tabId: string, reason: string): void => {
   const pending = pendingAutoTabTitles.get(tabId);
@@ -202,6 +286,7 @@ const consumePendingAutoTabTitle = (tabId: string, toolType: AutoTabTitleTool, s
   if (!pending) return false;
 
   pendingAutoTabTitles.delete(tabId);
+  autoTabTitleIntents.delete(tabId);
   console.warn(
     '[Store:AutoTabTitle] consume tab=' + tabId.slice(-8) +
     ' type=' + toolType +
@@ -241,6 +326,7 @@ interface Tab {
   isUtility?: boolean;
   tabType?: TabType; // Terminal or browser tab
   url?: string; // URL for browser tabs
+  filePath?: string; // Absolute file path for linked file tabs
   terminalId?: string; // Terminal ID for browser tabs (linked terminal)
   terminalName?: string; // Terminal name for browser tabs
   activeView?: 'browser' | 'terminal'; // Which view is active in the tab
@@ -279,6 +365,15 @@ interface Tab {
    * (graceful degrade), значение в БД сохраняется.
    */
   sessionStatus?: string;
+  /**
+   * Completion notification state for right-click "bell" on a tab.
+   * persistent is saved to SQLite; armed/fired are runtime-only so an app
+   * restart never resurrects stale "waiting" or "completed" frames.
+   */
+  completionNotificationPersistent?: boolean;
+  completionNotificationArmed?: boolean;
+  completionNotificationFired?: boolean;
+  completionNotificationFiredAt?: number;
   groupId?: string; // One-level TabBar group membership. Separate from parentTabId (sub-agents).
   visualParentTabId?: string; // Visual-only tab nesting in TabBar. Never use for MCP sub-agents.
   isCollapsed?: boolean; // Collapsed tab — icon-only, for archiving completed sessions
@@ -438,6 +533,20 @@ const isAiBusyTab = (tab?: Pick<Tab, 'aiBusy' | 'claudeBusy' | 'sdkState'> | nul
   return !!(tab?.aiBusy || tab?.claudeBusy || isSdkBusyState(tab));
 };
 
+const emitTabCompletionNotification = (detail: { projectId: string; tabId: string; tabName: string }) => {
+  try {
+    window.dispatchEvent(new CustomEvent('tab-completion-notification', { detail }));
+  } catch {}
+};
+
+const isNaturalCompletionNotificationEnd = (reason?: string): boolean => {
+  // Mirrors PromptQueueRunner's outcome contract: reason-less Claude/Gemini/SDK
+  // false edges are natural completions, Codex uses task_complete explicitly.
+  // manual-stop / interrupt / turn_aborted / error / watchdog are user-visible
+  // liveness cleanup only and must not ring the completion bell.
+  return !reason || reason === 'task_complete';
+};
+
 const isAiForegroundProcess = (info?: { hasProcess?: boolean; processName?: string; command?: string } | null): boolean => {
   if (!info?.hasProcess) return false;
   const text = `${info.processName || ''} ${info.command || ''}`.toLowerCase();
@@ -478,8 +587,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; background?: boolean; sessionStatus?: string; groupId?: string; visualParentTabId?: string }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; filePath?: string; background?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; filePath?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean; completionNotificationPersistent?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean }) => Promise<boolean>;
   reopenLastClosedTab: (projectId: string) => Promise<{ tabId: string | null; reason?: 'empty' | 'error' }>;
   switchTab: (projectId: string, tabId: string) => void;
@@ -502,6 +611,9 @@ interface WorkspaceStore {
   // Tab color and utility
   setTabColor: (projectId: string, tabId: string, color: TabColor, manual?: boolean) => void;
   setTabSessionStatus: (projectId: string, tabId: string, status: string | null) => void;
+  setTabCompletionNotificationArmed: (projectId: string, tabId: string, armed: boolean) => void;
+  setTabCompletionNotificationPersistent: (projectId: string, tabId: string, persistent: boolean) => void;
+  clearTabCompletionNotification: (projectId: string, tabId: string, options?: { keepPersistent?: boolean }) => void;
   setTabCommandType: (tabId: string, commandType: CommandType) => void; // Also sets auto-color on first run
   markAiLaunchAutoTitle: (tabId: string, toolType: AutoTabTitleTool) => void;
   markAiForkAutoTitle: (tabId: string, toolType: AutoTabTitleTool, sourceSessionId: string) => void;
@@ -552,7 +664,7 @@ interface WorkspaceStore {
 
   setClaudeActive: (tabId: string, alive: boolean) => void;
   setClaudeBusy: (tabId: string, busy: boolean) => void;
-  setAiBusy: (tabId: string, busy: boolean) => void;
+  setAiBusy: (tabId: string, busy: boolean, reason?: string) => void;
   setSdkProcessAlive: (tabId: string, alive: boolean) => void;
 
   setViewingSubAgent: (tabId: string | null) => void;
@@ -666,12 +778,14 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     notes: tab.notes,
     tabType: tab.tabType,
     url: tab.url,
+    filePath: tab.filePath,
     terminalId: tab.terminalId,
     terminalName: tab.terminalName,
     activeView: tab.activeView,
     createdAt: tab.createdAt,
     isCollapsed: tab.isCollapsed,
     sessionStatus: tab.sessionStatus,
+    completionNotificationPersistent: tab.completionNotificationPersistent,
     groupId: tab.groupId,
     visualParentTabId: tab.visualParentTabId,
     nameSetManually: tab.nameSetManually,
@@ -681,7 +795,37 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
 };
 
 const saveTabGroups = (projectId: string, groups: TabGroup[]) => {
-  ipcRenderer.invoke('project:save-tab-groups', { projectId, groups });
+  const seq = ++tabGroupSaveSeq;
+  const start = performance.now();
+  console.warn(
+    '[TabGroupCollapse:save]' +
+    ' phase=start' +
+    ` seq=${seq}` +
+    ` project=${dndShortId(projectId)}` +
+    ` groups=${summarizeDndGroups(groups)}` +
+    ` t=${Math.round(start)}`
+  );
+  ipcRenderer.invoke('project:save-tab-groups', { projectId, groups })
+    .then(() => {
+      console.warn(
+        '[TabGroupCollapse:save]' +
+        ' phase=done' +
+        ` seq=${seq}` +
+        ` project=${dndShortId(projectId)}` +
+        ` durMs=${Math.round(performance.now() - start)}` +
+        ` groups=${summarizeDndGroups(groups)}`
+      );
+    })
+    .catch((error: unknown) => {
+      console.warn(
+        '[TabGroupCollapse:save]' +
+        ' phase=error' +
+        ` seq=${seq}` +
+        ` project=${dndShortId(projectId)}` +
+        ` durMs=${Math.round(performance.now() - start)}` +
+        ` error=${error instanceof Error ? JSON.stringify(error.message) : JSON.stringify(String(error))}`
+      );
+    });
 };
 
 export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
@@ -860,11 +1004,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               notes: savedTab.notes,
               tabType: savedTab.tabType,
               url: savedTab.url,
+              filePath: savedTab.filePath,
               createdAt: savedTab.createdAt,
               isCollapsed: savedTab.isCollapsed,
               groupId: savedTab.groupId,
               visualParentTabId: savedTab.visualParentTabId,
               sessionStatus: savedTab.sessionStatus,
+              completionNotificationPersistent: savedTab.completionNotificationPersistent,
               nameSetManually: savedTab.nameSetManually,
               restoreId: savedTab.tabId
             } as any);
@@ -1055,16 +1201,25 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   showWorkspace: (projectId) => {
-    const { projectHistory } = get();
+    const { projectHistory, openProjects } = get();
     // Move to end of history (max 20)
     const newHistory = [...projectHistory.filter(id => id !== projectId), projectId].slice(-20);
+    const workspace = openProjects.get(projectId);
+    const activeTab = workspace?.activeTabId ? workspace.tabs.get(workspace.activeTabId) : null;
+    const clearedNotification = !!(activeTab?.completionNotificationArmed || activeTab?.completionNotificationFired);
+    if (activeTab && clearedNotification) {
+      delete activeTab.completionNotificationArmed;
+      delete activeTab.completionNotificationFired;
+      delete activeTab.completionNotificationFiredAt;
+    }
 
     // Use startTransition for smooth project switching
     startTransition(() => {
-      set({ 
+      set({
         view: 'workspace', 
         activeProjectId: projectId,
-        projectHistory: newHistory 
+        projectHistory: newHistory,
+        ...(clearedNotification ? { openProjects: new Map(openProjects) } : {})
       });
     });
     get().saveSession();
@@ -1139,11 +1294,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               notes: savedTab.notes,
               tabType: savedTab.tabType,
               url: savedTab.url,
+              filePath: savedTab.filePath,
               createdAt: savedTab.createdAt,
               isCollapsed: savedTab.isCollapsed,
               groupId: savedTab.groupId,
               visualParentTabId: savedTab.visualParentTabId,
               sessionStatus: savedTab.sessionStatus,
+              completionNotificationPersistent: savedTab.completionNotificationPersistent,
               nameSetManually: savedTab.nameSetManually,
               restoreId: savedTab.tabId
             } as any);
@@ -1178,10 +1335,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // Target after the Apr refactor: <50ms. Regression signal: durMs > 200.
       const prevActiveId = get().activeProjectId;
       const _t0 = performance.now();
+      const workspace = openProjects.get(projectId);
+      const activeTab = workspace?.activeTabId ? workspace.tabs.get(workspace.activeTabId) : null;
+      const clearedNotification = !!(activeTab?.completionNotificationArmed || activeTab?.completionNotificationFired);
+      if (activeTab && clearedNotification) {
+        delete activeTab.completionNotificationArmed;
+        delete activeTab.completionNotificationFired;
+        delete activeTab.completionNotificationFiredAt;
+      }
       set({
         activeProjectId: projectId,
         view: 'workspace',
-        projectHistory: newHistory
+        projectHistory: newHistory,
+        ...(clearedNotification ? { openProjects: new Map(openProjects) } : {})
       });
       requestAnimationFrame(() => {
         const durMs = (performance.now() - _t0).toFixed(1);
@@ -1310,17 +1476,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       notes: options?.notes,
       tabType: options?.tabType || 'terminal',
       url: options?.url,
+      filePath: (options as any)?.filePath,
       createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000),
       isCollapsed: (options as any)?.isCollapsed,
       groupId: options?.isUtility ? undefined : options?.groupId,
       visualParentTabId: options?.isUtility ? undefined : (options as any)?.visualParentTabId,
       nameSetManually: (options as any)?.nameSetManually,
-      sessionStatus: (options as any)?.sessionStatus
+      sessionStatus: (options as any)?.sessionStatus,
+      completionNotificationPersistent: (options as any)?.completionNotificationPersistent || undefined
     };
 
-    // Claude SDK tabs don't need a PTY process
-    if (newTab.tabType === 'claude-sdk') {
-      console.log('[Store] createTab: SDK tab, skipping PTY for:', tabId);
+    // Claude SDK and linked file tabs don't need a PTY process.
+    if (newTab.tabType === 'claude-sdk' || newTab.tabType === 'file') {
+      console.log('[Store] createTab: non-PTY tab, skipping terminal for:', tabId, 'type:', newTab.tabType);
     } else {
       console.log('[Store] createTab: Creating PTY terminal for:', tabId, 'cwd:', newTab.cwd);
       // Only pass initialCommand for shell-command type, not for internal commands
@@ -1448,6 +1616,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       notes: options?.notes,
       tabType: options?.tabType || 'terminal',
       url: options?.url,
+      filePath: (options as any)?.filePath,
       nameSetManually: (options as any)?.nameSetManually,
       groupId: targetGroupId,
       visualParentTabId,
@@ -1459,11 +1628,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       ? options.pendingAction.command
       : undefined;
 
-    // Claude SDK tabs don't need a PTY process — mirror createTab's guard.
-    // Without it, routing SDK fork through this function would spawn an unused
-    // PTY (waste + потенциальные phantom lifecycle-сигналы для SDK-таба).
-    if (newTab.tabType === 'claude-sdk') {
-      console.log('[Store:createTabAfterCurrent] SDK tab, skipping PTY for:', tabId);
+    // Claude SDK and linked file tabs don't need a PTY process — mirror createTab's guard.
+    // Without it, non-terminal tabs spawn unused shells and enter process lifecycle by accident.
+    if (newTab.tabType === 'claude-sdk' || newTab.tabType === 'file') {
+      console.log('[Store:createTabAfterCurrent] non-PTY tab, skipping terminal for:', tabId, 'type:', newTab.tabType);
     } else {
       console.log('[Store:createTabAfterCurrent] Creating terminal with:', {
         tabId,
@@ -1586,7 +1754,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     let runningProcessInfo: any = null;
     let foregroundAiProcess = false;
 
-    if (tab.tabType !== 'claude-sdk') {
+    if (tab.tabType !== 'claude-sdk' && tab.tabType !== 'file') {
       // Check if terminal has running process via OSC 133 state (fast, no syscalls)
       commandState = await ipcRenderer.invoke('terminal:getCommandState', tabId);
       processWasRunning = !!commandState?.isRunning;
@@ -1663,10 +1831,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (!aiBusyAtClose) {
         ipcRenderer.invoke('claude-sdk:stop', { tabId, hard: true }).catch(() => {});
       }
-      ipcRenderer.send('claude-sdk:busy-state', { tabId, busy: false });
+      ipcRenderer.send('claude-sdk:busy-state', { tabId, busy: false, reason: 'close' });
     }
 
-    if (tab.tabType !== 'claude-sdk') {
+    if (tab.tabType !== 'claude-sdk' && tab.tabType !== 'file') {
       ipcRenderer.send('terminal:kill', tabId);
       console.log('[CloseTab] terminal:kill sent tab=' + tabId.slice(-12) +
         ' durMs=' + (Date.now() - closeStartedAt));
@@ -1685,6 +1853,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           commandType: tab.commandType,
           tabType: tab.tabType,
           url: tab.url,
+          filePath: tab.filePath,
           createdAt: tab.createdAt,
           claudeSessionId: tab.claudeSessionId,
           geminiSessionId: tab.geminiSessionId,
@@ -1805,6 +1974,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       commandType: (entry.command_type || undefined) as CommandType | undefined,
       tabType: (entry.tab_type || 'terminal') as TabType,
       url: entry.url || undefined,
+      filePath: entry.file_path || undefined,
       pendingAction,
       claudeSessionId: entry.claude_session_id || undefined,
       geminiSessionId: entry.gemini_session_id || undefined,
@@ -1856,6 +2026,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const prevActiveId = workspace.activeTabId;
       const currentView = workspace.currentView;
       const totalTabs = Array.from(openProjects.values()).reduce((acc, ws) => acc + ws.tabs.size, 0);
+      const targetTab = workspace.tabs.get(tabId);
+      if (targetTab?.completionNotificationArmed || targetTab?.completionNotificationFired) {
+        delete targetTab.completionNotificationArmed;
+        delete targetTab.completionNotificationFired;
+        delete targetTab.completionNotificationFiredAt;
+      }
       workspace.activeTabId = tabId;
       workspace.activeGroupId = null;
       // Don't reset viewingSubAgentTabId here — it persists across tab switches.
@@ -2070,6 +2246,57 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     saveTabs(workspace.projectId, workspace.tabs);
   },
 
+  setTabCompletionNotificationArmed: (projectId, tabId, armed) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+    const tab = workspace.tabs.get(tabId);
+    if (!tab) return;
+    if (armed) {
+      tab.completionNotificationArmed = true;
+      delete tab.completionNotificationFired;
+      delete tab.completionNotificationFiredAt;
+    } else {
+      delete tab.completionNotificationArmed;
+      delete tab.completionNotificationFired;
+      delete tab.completionNotificationFiredAt;
+    }
+    set({ openProjects: new Map(openProjects) });
+  },
+
+  setTabCompletionNotificationPersistent: (projectId, tabId, persistent) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+    const tab = workspace.tabs.get(tabId);
+    if (!tab) return;
+    if (persistent) {
+      tab.completionNotificationPersistent = true;
+      tab.completionNotificationArmed = true;
+      delete tab.completionNotificationFired;
+      delete tab.completionNotificationFiredAt;
+    } else {
+      delete tab.completionNotificationPersistent;
+    }
+    set({ openProjects: new Map(openProjects) });
+    saveTabs(workspace.projectId, workspace.tabs);
+  },
+
+  clearTabCompletionNotification: (projectId, tabId, options) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+    const tab = workspace.tabs.get(tabId);
+    if (!tab) return;
+    const hadPersistent = !!tab.completionNotificationPersistent;
+    delete tab.completionNotificationArmed;
+    delete tab.completionNotificationFired;
+    delete tab.completionNotificationFiredAt;
+    if (!options?.keepPersistent) delete tab.completionNotificationPersistent;
+    set({ openProjects: new Map(openProjects) });
+    if (!options?.keepPersistent && hadPersistent) saveTabs(workspace.projectId, workspace.tabs);
+  },
+
   setTabCommandType: (tabId, commandType) => {
     const { openProjects } = get();
 
@@ -2163,6 +2390,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   markAiLaunchAutoTitle: (tabId, toolType) => {
+    setAutoTabTitleIntent(tabId, toolType, 'fresh');
     const snap = aiLaunchSnapshots.get(tabId);
     if (!snap || snap.sessionType !== toolType) {
       console.warn('[Store:AiLaunchSnapshot] auto-title-skip tab=' + tabId.slice(-8) + ' type=' + toolType + ' reason=no-matching-snapshot');
@@ -2175,6 +2403,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   markAiForkAutoTitle: (tabId, toolType, sourceSessionId) => {
+    setAutoTabTitleIntent(tabId, toolType, 'fork', sourceSessionId);
     const snap = aiLaunchSnapshots.get(tabId);
     if (!snap || snap.sessionType !== toolType) {
       console.warn('[Store:AiLaunchSnapshot] fork-auto-title-skip tab=' + tabId.slice(-8) + ' type=' + toolType + ' reason=no-matching-snapshot');
@@ -2230,6 +2459,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       else delete tab.codexSessionId;
 
       clearPendingAutoTabTitle(tabId, 'ai-launch-rollback');
+      autoTabTitleIntents.delete(tabId);
       tab.wasInterrupted = !!snap.wasInterrupted;
       tab.overlayDismissed = !!snap.overlayDismissed;
 
@@ -2243,6 +2473,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     console.warn('[Store:AiLaunchRollback] skip tab=' + tabId.slice(-8) + ' reason=' + reason + ' tab-not-found');
     aiLaunchSnapshots.delete(tabId);
+    autoTabTitleIntents.delete(tabId);
     return false;
   },
 
@@ -2471,12 +2702,48 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   toggleTabGroupCollapsed: (projectId, groupId) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
-    if (!workspace) return;
+    if (!workspace) {
+      console.warn('[TabGroupCollapse:store] phase=skip reason=no-workspace project=' + dndShortId(projectId) + ' group=' + dndShortId(groupId));
+      return;
+    }
+
+    const targetGroup = workspace.tabGroups.find(group => group.id === groupId);
+    if (!targetGroup) {
+      console.warn('[TabGroupCollapse:store] phase=skip reason=no-group project=' + dndShortId(projectId) + ' group=' + dndShortId(groupId));
+      return;
+    }
+
+    const beforeCollapsed = !!targetGroup.collapsed;
+    const memberIds = Array.from(workspace.tabs.values())
+      .filter(tab => tab.groupId === groupId)
+      .map(tab => tab.id);
+    const start = performance.now();
+    console.warn(
+      '[TabGroupCollapse:store]' +
+      ' phase=toggle' +
+      ` project=${dndShortId(projectId)}` +
+      ` group=${dndShortId(groupId)}` +
+      ` from=${beforeCollapsed ? 1 : 0}` +
+      ` to=${beforeCollapsed ? 0 : 1}` +
+      ` members=${memberIds.length}:${summarizeDndIds(memberIds)}` +
+      ` activeGroup=${dndShortValue(workspace.activeGroupId)}` +
+      ` selected=${workspace.selectedTabIds?.length || 0}` +
+      ` groupsBefore=${summarizeDndGroups(workspace.tabGroups)}` +
+      ` t=${Math.round(start)}`
+    );
 
     workspace.tabGroups = workspace.tabGroups.map(group =>
       group.id === groupId ? { ...group, collapsed: !group.collapsed } : group
     );
     set({ openProjects: new Map(openProjects) });
+    console.warn(
+      '[TabGroupCollapse:store]' +
+      ' phase=set' +
+      ` project=${dndShortId(projectId)}` +
+      ` group=${dndShortId(groupId)}` +
+      ` durMs=${Math.round(performance.now() - start)}` +
+      ` groupsAfter=${summarizeDndGroups(workspace.tabGroups)}`
+    );
     saveTabGroups(projectId, workspace.tabGroups);
   },
 
@@ -2648,6 +2915,23 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         return { ...group, anchorTabId };
       });
     }
+    const nextMainOrder = Array.from(workspace.tabs.values())
+      .filter(tab => !tab.parentTabId && !tab.isUtility)
+      .map(tab => tab.id);
+    console.log(
+      `[TabDnd:apply] project=${dndShortId(projectId)}` +
+      ` prev=${summarizeDndIds(previousMainOrder)}` +
+      ` requested=${summarizeDndIds(orderedIds)}` +
+      ` next=${summarizeDndIds(nextMainOrder)}` +
+      ` groupAssign=${summarizeDndAssignments(groupAssignments)}` +
+      ` visual=${summarizeDndAssignments(visualParentAssignments)}` +
+      ` anchorsReq=${summarizeDndAssignments(groupAnchorAssignments)}` +
+      ` anchorsResolved=${summarizeDndAssignments(resolvedGroupAnchorAssignments)}` +
+      ` prevMembers=${summarizeDndGroupMembers(previousMembersByGroup)}` +
+      ` nextMembers=${summarizeDndGroupMembers(nextMembersByGroup)}` +
+      ` groups=${summarizeDndGroups(workspace.tabGroups)}` +
+      ` touchedGroups=${touchedGroups ? 1 : 0}`
+    );
     set({ openProjects: new Map(openProjects) });
     saveTabs(workspace.projectId, workspace.tabs);
     if (touchedGroups) saveTabGroups(workspace.projectId, workspace.tabGroups);
@@ -2785,7 +3069,25 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               sourceSessionId: snapshot?.autoTitleSourceSessionId,
             });
           } else {
-            logAutoTabTitleArmSkip(tabId, 'claude', prev, sessionId, armSkipReason);
+            const intent = getAutoTabTitleIntent(tabId, 'claude');
+            if ((armSkipReason === 'no-snapshot' || armSkipReason === 'not-eligible')
+                && intent
+                && !prev
+                && !tab.nameSetManually) {
+              armPendingAutoTabTitle(tabId, 'claude', sessionId, {
+                mode: intent.mode,
+                sourceSessionId: intent.sourceSessionId,
+              });
+              console.warn(
+                '[Store:AutoTabTitle] arm-via-intent tab=' + tabId.slice(-8) +
+                ' type=claude sid=' + sessionId.slice(0, 8) +
+                ' mode=' + intent.mode +
+                (intent.sourceSessionId ? ' source=' + intent.sourceSessionId.slice(0, 8) : '') +
+                ' originalSkip=' + armSkipReason
+              );
+            } else {
+              logAutoTabTitleArmSkip(tabId, 'claude', prev, sessionId, armSkipReason);
+            }
           }
         } else if (!sessionId || (prev && prev !== sessionId)) {
           clearPendingAutoTabTitle(tabId, !sessionId ? 'claude-session-cleared' : 'claude-session-changed');
@@ -2871,7 +3173,25 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               sourceSessionId: snapshot?.autoTitleSourceSessionId,
             });
           } else {
-            logAutoTabTitleArmSkip(tabId, 'codex', prev, sessionId, armSkipReason);
+            const intent = getAutoTabTitleIntent(tabId, 'codex');
+            if ((armSkipReason === 'no-snapshot' || armSkipReason === 'not-eligible')
+                && intent
+                && !prev
+                && !tab.nameSetManually) {
+              armPendingAutoTabTitle(tabId, 'codex', sessionId, {
+                mode: intent.mode,
+                sourceSessionId: intent.sourceSessionId,
+              });
+              console.warn(
+                '[Store:AutoTabTitle] arm-via-intent tab=' + tabId.slice(-8) +
+                ' type=codex sid=' + sessionId.slice(0, 8) +
+                ' mode=' + intent.mode +
+                (intent.sourceSessionId ? ' source=' + intent.sourceSessionId.slice(0, 8) : '') +
+                ' originalSkip=' + armSkipReason
+              );
+            } else {
+              logAutoTabTitleArmSkip(tabId, 'codex', prev, sessionId, armSkipReason);
+            }
           }
         } else if (!sessionId || (prev && prev !== sessionId)) {
           clearPendingAutoTabTitle(tabId, !sessionId ? 'codex-session-cleared' : 'codex-session-changed');
@@ -2965,14 +3285,41 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
   },
 
-  setAiBusy: (tabId, busy) => {
-    const { openProjects } = get();
+  setAiBusy: (tabId, busy, reason) => {
+    const { openProjects, activeProjectId } = get();
+    let notificationDetail: { projectId: string; tabId: string; tabName: string } | null = null;
     for (const [, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
-        if (tab.aiBusy === busy) return;
+        const wasBusy = !!tab.aiBusy;
+        if (wasBusy === busy) return;
         tab.aiBusy = busy;
+        if (busy) {
+          if (tab.completionNotificationPersistent) {
+            tab.completionNotificationArmed = true;
+          }
+          if (tab.completionNotificationFired) {
+            delete tab.completionNotificationFired;
+            delete tab.completionNotificationFiredAt;
+          }
+        } else if (wasBusy && (tab.completionNotificationArmed || tab.completionNotificationPersistent)) {
+          const isVisibleTarget =
+            activeProjectId === workspace.projectId &&
+            workspace.activeTabId === tabId &&
+            workspace.currentView === 'terminal';
+          delete tab.completionNotificationArmed;
+          delete tab.completionNotificationFired;
+          delete tab.completionNotificationFiredAt;
+          if (isNaturalCompletionNotificationEnd(reason)) {
+            notificationDetail = { projectId: workspace.projectId, tabId, tabName: tab.name || 'Terminal' };
+            if (!isVisibleTarget) {
+              tab.completionNotificationFired = true;
+              tab.completionNotificationFiredAt = Date.now();
+            }
+          }
+        }
         set({ openProjects: new Map(openProjects) });
+        if (notificationDetail) emitTabCompletionNotification(notificationDetail);
         return;
       }
     }
@@ -3277,9 +3624,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           geminiSessionId: tab.geminiSessionId, codexSessionId: tab.codexSessionId,
           codexModel: tab.codexModel, codexEffort: tab.codexEffort, sessionStatus: tab.sessionStatus, wasInterrupted: tab.wasInterrupted,
           overlayDismissed: tab.overlayDismissed, notes: tab.notes, tabType: tab.tabType,
-          url: tab.url, terminalId: tab.terminalId, terminalName: tab.terminalName,
+          url: tab.url, filePath: tab.filePath, terminalId: tab.terminalId, terminalName: tab.terminalName,
           activeView: tab.activeView, createdAt: tab.createdAt, isCollapsed: tab.isCollapsed,
           groupId: tab.groupId, visualParentTabId: tab.visualParentTabId,
+          completionNotificationPersistent: tab.completionNotificationPersistent,
           nameSetManually: tab.nameSetManually, tabId: tab.id
         }));
         ipcRenderer.sendSync('project:save-tabs-sync', { projectId: workspace.projectId, tabs: tabsArray });

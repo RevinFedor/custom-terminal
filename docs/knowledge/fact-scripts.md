@@ -18,7 +18,7 @@
 
 Текущие поверхности остановки:
 - **ПКМ по табу → верхний Close+Stop split-pill** — основной путь для running script/devServer в tab context menu. Stop script mirror'ит Stop Claude UX, но зовёт script-stop ветку.
-- **Клик по process-bar edge в vertical sidebar** — только для `commandType === 'devServer'` и живого process-status. `F7` работает как shortcut только пока курсор наведен на эту полоску; подробнее — `fact-process-bar.md::Edge stop hit-zone для devServer`.
+- **Cmd+hover по правой reload-кнопке в vertical sidebar** — только для зелёной `commandType === 'devServer'` вкладки с живым process-status. Та же кнопка превращается из restart в красный square-stop; click шлёт только Ctrl+C. Подробнее — `fact-process-bar.md::Restart button stop-mode для devServer`.
 - **Middle-click на RestartZone** — fallback для horizontal layout, где RestartZone всё ещё рендерится отдельно и `onAuxClick` перехватывает middle-click ДО TabItem.
 - **ПКМ по терминалу → Scripts (● running) → ● Stop process** — нативное Electron меню в main.js, проверяет `terminalCommandState.get(tabId).isRunning`.
 

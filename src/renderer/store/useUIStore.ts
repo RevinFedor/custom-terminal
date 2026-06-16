@@ -19,6 +19,8 @@ interface FilePreview {
   path: string;
   content: string;
   language: string | null;
+  source?: 'sidebar' | 'terminal-link' | 'tab';
+  sourceTabId?: string;
 }
 
 export type ThinkingLevel = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
@@ -289,6 +291,8 @@ interface UIStore {
   timelineSummaryFontSize: number; // Generated user-prompt summaries in expanded Timeline
   timelineWidth: number;       // Timeline width (px) when expanded (treeMode). Drag-resizable.
   timelineLineClamp: number;   // How many lines of preview text show in expanded mode.
+  promptQueueChipFontSize: number; // Run-after chip title font inside the queue list.
+  promptQueueEditorFontSize: number; // Run-after chip editor title/body font in the slideout.
   promptQueueChipLineClamp: number; // How many lines of chip text show inside Run After overlay (1 = single-line ellipsis).
   promptQueueWidth: number;    // Run-after overlay width (px). FIXED — adding a +grab chip must not reflow it. Drag-resizable on the free (non-anchor) edge. Global, like timelineWidth.
 
@@ -313,6 +317,8 @@ interface UIStore {
   setTimelineSummaryFontSize: (size: number) => void;
   setTimelineWidth: (width: number) => void;
   setTimelineLineClamp: (lines: number) => void;
+  setPromptQueueChipFontSize: (size: number) => void;
+  setPromptQueueEditorFontSize: (size: number) => void;
   setPromptQueueChipLineClamp: (lines: number) => void;
   setPromptQueueWidth: (width: number) => void;
 
@@ -555,6 +561,10 @@ interface UIStore {
   // crashed without releasing the port (common after Electron force-quit).
   freePortsBeforeStart: boolean;
   setFreePortsBeforeStart: (v: boolean) => void;
+
+  // Completion notification sound for tab bell. Default ON; persisted globally.
+  tabCompletionNotificationSound: boolean;
+  setTabCompletionNotificationSound: (v: boolean) => void;
 
   // Default Claude effort applied to new sessions (status-bar selector).
   // 'none' means "do not apply any default" — current session keeps whatever was last picked.
@@ -976,6 +986,20 @@ const loadPromptQueueChipLineClamp = (): number => {
   } catch {}
   return 1;
 };
+const loadPromptQueueChipFontSize = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-prompt-queue-chip-font-size');
+    if (v) return Math.max(9, Math.min(18, Number(v) || 11));
+  } catch {}
+  return 11;
+};
+const loadPromptQueueEditorFontSize = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-prompt-queue-editor-font-size');
+    if (v) return Math.max(10, Math.min(24, Number(v) || 12));
+  } catch {}
+  return 12;
+};
 // Run-after overlay width. Clamp [240, 600] — 240 ≈ the old PANEL_MIN_WIDTH so
 // existing layouts don't shrink; default 300 sits inside the old fit-content
 // [240,360] band so the first render after this change doesn't jump.
@@ -1144,6 +1168,38 @@ const initialFreePortsBeforeStart = loadFreePortsBeforeStart();
       if (useUIStore.getState().freePortsBeforeStart !== bool) {
         useUIStore.setState({ freePortsBeforeStart: bool });
         try { localStorage.setItem('noted-terminal-free-ports', String(bool)); } catch {}
+      }
+    }
+  } catch {}
+})();
+
+// tabCompletionNotificationSound — global UX preference for the tab-completion
+// bell. Default is ON; persisted in SQLite so it survives vite origin changes.
+const APP_STATE_KEY_TAB_COMPLETION_SOUND = 'tabCompletionNotificationSound';
+const LOCAL_KEY_TAB_COMPLETION_SOUND = 'noted-terminal-tab-completion-notification-sound';
+const loadTabCompletionNotificationSound = (): boolean => {
+  try {
+    const raw = localStorage.getItem(LOCAL_KEY_TAB_COMPLETION_SOUND);
+    return raw === null ? true : raw === 'true';
+  } catch { return true; }
+};
+const saveTabCompletionNotificationSound = (v: boolean) => {
+  try { localStorage.setItem(LOCAL_KEY_TAB_COMPLETION_SOUND, String(v)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_TAB_COMPLETION_SOUND, value: v }).catch(() => {});
+  } catch {}
+};
+const initialTabCompletionNotificationSound = loadTabCompletionNotificationSound();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_TAB_COMPLETION_SOUND);
+    if (v !== null && v !== undefined) {
+      const bool = parsePersistedBool(v);
+      if (useUIStore.getState().tabCompletionNotificationSound !== bool) {
+        useUIStore.setState({ tabCompletionNotificationSound: bool });
+        try { localStorage.setItem(LOCAL_KEY_TAB_COMPLETION_SOUND, String(bool)); } catch {}
       }
     }
   } catch {}
@@ -1724,6 +1780,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
   timelineSummaryFontSize: loadTimelineSummaryFontSize(),
   timelineWidth: loadTimelineWidth(),
   timelineLineClamp: loadTimelineLineClamp(),
+  promptQueueChipFontSize: loadPromptQueueChipFontSize(),
+  promptQueueEditorFontSize: loadPromptQueueEditorFontSize(),
   promptQueueChipLineClamp: loadPromptQueueChipLineClamp(),
   promptQueueWidth: loadPromptQueueWidth(),
 
@@ -1790,6 +1848,18 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(1, Math.min(10, Math.round(lines)));
     set({ timelineLineClamp: clamped });
     try { localStorage.setItem('noted-terminal-timeline-line-clamp', String(clamped)); } catch {}
+  },
+
+  setPromptQueueChipFontSize: (size: number) => {
+    const clamped = Math.max(9, Math.min(18, Math.round(size)));
+    set({ promptQueueChipFontSize: clamped });
+    try { localStorage.setItem('noted-terminal-prompt-queue-chip-font-size', String(clamped)); } catch {}
+  },
+
+  setPromptQueueEditorFontSize: (size: number) => {
+    const clamped = Math.max(10, Math.min(24, Math.round(size)));
+    set({ promptQueueEditorFontSize: clamped });
+    try { localStorage.setItem('noted-terminal-prompt-queue-editor-font-size', String(clamped)); } catch {}
   },
 
   setPromptQueueChipLineClamp: (lines: number) => {
@@ -2285,6 +2355,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
   freePortsBeforeStart: initialFreePortsBeforeStart,
   setFreePortsBeforeStart: (v) => { set({ freePortsBeforeStart: v }); saveFreePortsBeforeStart(v); },
+  tabCompletionNotificationSound: initialTabCompletionNotificationSound,
+  setTabCompletionNotificationSound: (v) => { set({ tabCompletionNotificationSound: v }); saveTabCompletionNotificationSound(v); },
 
   claudeMdMirrorEnabled: initialMirrorEnabled,
   setClaudeMdMirrorEnabled: (v) => { set({ claudeMdMirrorEnabled: v }); saveMirrorEnabled(v); },

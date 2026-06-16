@@ -678,6 +678,7 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
   // natural `result` shouldn't arrive after Stop, but guards the rare race).
   const wasStoppedRef = useRef(false);
   useEffect(() => { wasStoppedRef.current = wasStopped; }, [wasStopped]);
+  const sdkBusyEndReasonRef = useRef<string | null>(null);
   // isRunning mirror for `onCancel`. assistant-ui's runtime can invoke onCancel
   // unconditionally on Escape (even after the turn finished and the Cancel
   // affordance is gone), and onCancel's rollback branch (B) would then drop the
@@ -1167,6 +1168,7 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
     const handler = (e: Event) => {
       const { tabId: tid } = (e as CustomEvent).detail;
       if (tid !== tabId) return;
+      if (isRunningRef.current) sdkBusyEndReasonRef.current = 'manual-stop';
       setWasStopped(true);
       // Stop = "abandon this turn". JSONL is the source of truth: anything
       // that already landed in the transcript was promoted by
@@ -1352,8 +1354,17 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
 
   // Emit busy state for TabBar spinner + cleanup on unmount
   useEffect(() => {
-    ipcRenderer.send('claude-sdk:busy-state', { tabId, busy: isRunning });
-    return () => { ipcRenderer.send('claude-sdk:busy-state', { tabId, busy: false }); };
+    if (isRunning) sdkBusyEndReasonRef.current = null;
+    const reason = !isRunning ? (sdkBusyEndReasonRef.current || undefined) : undefined;
+    ipcRenderer.send('claude-sdk:busy-state', { tabId, busy: isRunning, reason });
+    if (!isRunning) sdkBusyEndReasonRef.current = null;
+    return () => {
+      ipcRenderer.send('claude-sdk:busy-state', {
+        tabId,
+        busy: false,
+        reason: sdkBusyEndReasonRef.current || undefined,
+      });
+    };
   }, [isRunning, tabId]);
 
   // ---- Timeline click → scroll to matching message ----
@@ -2347,6 +2358,7 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
     // hard kill before truncating, because JSONL surgery can't run under a live
     // stream.) The interrupted partial answer gets the «⊘ stopped» badge.
     const sid = sessionIdRef.current;
+    sdkBusyEndReasonRef.current = 'interrupt';
     ipcRenderer.invoke('claude-sdk:stop', { tabId });
     setIsRunning(false);
     updateSDKState(tabId, { sdkState: 'idle' });

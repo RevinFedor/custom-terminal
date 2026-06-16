@@ -29,8 +29,11 @@ Terminal MCP управляет **живым процессом**, а не ис�
 `build_install_noted_terminal` — исключение из обычных terminal-actions: это fire-and-forget
 handoff в Voice Record, а не команда в текущей PTY. Использовать его, когда агент внутри
 Noted Terminal должен инициировать `npm run build:install` самого Noted Terminal. Tool
-передаёт `returnTo` исходного tab/session в Voice Record и сразу возвращает job id; после
-рестарта callback в Voice Record ждёт восстановления именно этой вкладки/сессии и сам
+передаёт `returnTo` исходного tab/session в Voice Record и сразу возвращает job id. Перед
+самой сборкой Voice Record ждёт, пока все соседние сессии (вкладки/проекты с живым turn'ом
+или running-процессом) уйдут в idle — **вызвавшую вкладку исключает**, иначе дедлок; прогресс
+в `job.phase`/`job.wait` (см. `fact-build-when-idle.md::Observe-фаза`). После рестарта callback
+в Voice Record ждёт восстановления именно этой вкладки/сессии и сам
 отправляет completion prompt через `/terminal/ai-prompt`. Нельзя заменять это на
 `run_command("npm run build:install")` или чтение terminal output: управляющая вкладка будет
 убита install-процессом, а readiness после рестарта определяется через MCP `/terminal/tabs`,

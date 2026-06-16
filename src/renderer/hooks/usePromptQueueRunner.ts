@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { usePromptQueueStore, type TabQueue } from '../store/usePromptQueueStore';
+import { countEnabledQueuedPrompts, isQueuedPromptEnabled, usePromptQueueStore, type TabQueue } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 
@@ -27,9 +27,36 @@ function tabExists(tabId: string): boolean {
   return false;
 }
 
+function canValidateQueueTabs(): boolean {
+  const state = useWorkspaceStore.getState();
+  return !state.isRestoring && state.openProjects.size > 0;
+}
+
 function tabCanTriggerQueue(ownerTabId: string, targetTabId: string): boolean {
   if (ownerTabId === targetTabId) return false;
   return tabExists(targetTabId);
+}
+
+function workspaceTabBusyNow(tabId: string): boolean {
+  const state = useWorkspaceStore.getState();
+  for (const ws of state.openProjects.values()) {
+    const tab = ws.tabs.get(tabId);
+    if (!tab) continue;
+    const sdkBusy = tab.tabType === 'claude-sdk' && (
+      tab.sdkState === 'fetching' ||
+      tab.sdkState === 'thinking' ||
+      tab.sdkState === 'tool_use'
+    );
+    return !!(tab.aiBusy || tab.claudeBusy || sdkBusy);
+  }
+  return false;
+}
+
+function seedBusySnapshotFromWorkspace(tabId: string): void {
+  if (prevBusyRef.has(tabId)) return;
+  if (!workspaceTabBusyNow(tabId)) return;
+  prevBusyRef.set(tabId, true);
+  console.log('[PromptQueueRunner] seed busy snapshot from workspace tab=' + tabId.slice(-12));
 }
 
 type QueueAgent = 'claude' | 'codex';
@@ -57,8 +84,12 @@ function sendQueueCommand(tabId: string, payload: string): Promise<unknown> {
 }
 
 type EffectiveTriggerOptions = { clearStaleTarget?: boolean };
+type QueueStateSnapshot = { queues: Map<string, TabQueue> };
 
 function getEffectiveQueueTrigger(ownerTabId: string, queue: TabQueue, options: EffectiveTriggerOptions = {}): string {
+  if (queue.runAfterTabId && !canValidateQueueTabs()) {
+    return queue.runAfterTabId;
+  }
   if (queue.runAfterTabId && tabCanTriggerQueue(ownerTabId, queue.runAfterTabId)) {
     return queue.runAfterTabId;
   }
@@ -92,6 +123,28 @@ const queueSendInflight = new Set<string>();
 // After send-command resolves successfully there is a short event gap before
 // the agent emits busy:true. Keep pivoted owners blocked through that gap.
 const queueAwaitingBusyStart = new Set<string>();
+
+type BusyStatePayload = {
+  tabId: string;
+  busy: boolean;
+  reason?: string;
+  localCommand?: string;
+  localCommandReason?: string;
+};
+
+const SUCCESSFUL_COMPACT_LOCAL_COMMAND_REASONS = new Set([
+  'compact_boundary',
+  'compact_summary',
+  'compact_stdout',
+  'pty-output-compacted',
+]);
+
+function isSuccessfulCompactLocalCommandEnd(data: BusyStatePayload): boolean {
+  return data.reason === 'local-command' &&
+    data.busy === false &&
+    data.localCommand === '/compact' &&
+    SUCCESSFUL_COMPACT_LOCAL_COMMAND_REASONS.has(data.localCommandReason || '');
+}
 
 // Public accessor — the overlay reads this to render the "target tab is busy
 // now" spinner inside the Run-after dropdown. Not used by the runner itself.
@@ -142,15 +195,15 @@ export function usePromptQueueRunner() {
     const fireQueueOwner = (ownerTabId: string, triggerTabId: string): boolean => {
       const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
       const { commitSentHead, setAutoRun, setStopAfter } = usePromptQueueStore.getState();
-      if (!queue.autoRun || queue.items.length === 0) return false;
+      const beforePop = countEnabledQueuedPrompts(queue.items);
+      if (!queue.autoRun || beforePop === 0) return false;
       if (queueSendInflight.has(ownerTabId)) return false;
       if (prevBusyRef.get(ownerTabId) === true) {
         console.log('[PromptQueueRunner] owner=' + ownerTabId.slice(-8) + ' is busy → wait before firing trigger=' + triggerTabId.slice(-8));
         return false;
       }
 
-      const beforePop = queue.items.length;
-      const head = queue.items[0];
+      const head = queue.items.find(isQueuedPromptEnabled);
       if (!head) return false;
       queueSendInflight.add(ownerTabId);
       queueAwaitingBusyStart.add(ownerTabId);
@@ -180,8 +233,9 @@ export function usePromptQueueRunner() {
     };
 
     const getReadyTriggerForOwner = (ownerTabId: string): string | null => {
+      if (!canValidateQueueTabs()) return null;
       const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
-      if (!queue.autoRun || queue.items.length === 0) return null;
+      if (!queue.autoRun || countEnabledQueuedPrompts(queue.items) === 0) return null;
       if (queueAwaitingBusyStart.has(ownerTabId)) return ownerTabId;
       if (queueSendInflight.has(ownerTabId)) return ownerTabId;
       if (prevBusyRef.get(ownerTabId) === true) return null;
@@ -207,6 +261,7 @@ export function usePromptQueueRunner() {
     // pivoted (runAfterTabId !== null) the owner is some OTHER tab whose queue
     // wants this tab's transition.
     const findOwnersWaitingOn = (triggerTabId: string): string[] => {
+      if (!canValidateQueueTabs()) return [];
       const owners: string[] = [];
       const queues = usePromptQueueStore.getState().queues;
       for (const [ownerTabId, q] of queues) {
@@ -214,7 +269,7 @@ export function usePromptQueueRunner() {
           usePromptQueueStore.getState().cleanupClosedTab(ownerTabId);
           continue;
         }
-        if (!q.autoRun || q.items.length === 0) continue;
+        if (!q.autoRun || countEnabledQueuedPrompts(q.items) === 0) continue;
         // Validate stale target before pivoting — if the picked tab was closed,
         // self-clear and fall through to default own-tab behaviour. This is
         // the lazy validation promised in the store schema comment.
@@ -225,7 +280,7 @@ export function usePromptQueueRunner() {
     };
 
     const handleBusyState = (channel: 'claude' | 'gemini' | 'codex') =>
-      (_: any, data: { tabId: string; busy: boolean; reason?: string }) => {
+      (_: any, data: BusyStatePayload) => {
         const { tabId, busy, reason } = data;
         const wasBusy = prevBusyRef.get(tabId) ?? false;
         prevBusyRef.set(tabId, busy);
@@ -268,14 +323,22 @@ export function usePromptQueueRunner() {
         // только метаданные исхода. Натуральные reason-less пути проходят гард и
         // стреляют как раньше.
         //
-        // These reasons are NOT end-of-turn signals. They exist for UI liveness
-        // only, so never fire or disarm prompt queues from this edge:
+        // These reasons are NOT normal turn-end signals. They exist for UI
+        // liveness only, so never fire or disarm prompt queues from this edge:
         // - 'spinner' — PTY glyph heuristic that can flap between thinking phases.
-        // - 'local-command' — slash-command bracket such as /compact; completion
-        //   is a local Claude operation, not a successful answer to a queued prompt.
-        if (reason === 'spinner' || reason === 'local-command') {
-          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + ' → IGNORE non-turn busy edge');
+        // - 'local-command' — slash-command bracket. Successful /compact is the
+        //   one exception: it is a durable boundary and Run-after should continue
+        //   with the next queued prompt after compact finishes.
+        const compactLocalCommandDone = isSuccessfulCompactLocalCommandEnd(data);
+        if (reason === 'spinner' || (reason === 'local-command' && !compactLocalCommandDone)) {
+          const localSuffix = reason === 'local-command'
+            ? ' command=' + (data.localCommand || '-') + ' localReason=' + (data.localCommandReason || '-')
+            : '';
+          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + localSuffix + ' → IGNORE non-turn busy edge');
           return;
+        }
+        if (compactLocalCommandDone) {
+          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' command=/compact localReason=' + data.localCommandReason + ' → CONTINUE queue after compact');
         }
 
         // Natural reason-less paths still fire: authoritative Stop hook,
@@ -310,6 +373,10 @@ export function usePromptQueueRunner() {
           'close',
         ];
         if (reason && SKIP_REASONS.includes(reason)) {
+          if (!canValidateQueueTabs()) {
+            console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + ' → SKIP disarm while workspace restores');
+            return;
+          }
           // Disarm EVERY owner queue this turn-end affects: the trigger tab's own
           // queue AND any pivoted queue waiting on this tab as its target — same
           // fan-out the firing path uses, so a target abort disarms the owner too.
@@ -446,10 +513,10 @@ export function usePromptQueueRunner() {
       firing = true;
       try {
         const q = usePromptQueueStore.getState().getQueue(ownerTabId);
-        if (!q.autoRun || q.items.length === 0) return false;
+        if (!q.autoRun || countEnabledQueuedPrompts(q.items) === 0) return false;
         if (queueSendInflight.has(ownerTabId)) return false;
         if (prevBusyRef.get(ownerTabId) === true) return false;
-        const head = q.items[0];
+        const head = q.items.find(isQueuedPromptEnabled);
         if (head) {
           queueSendInflight.add(ownerTabId);
           queueAwaitingBusyStart.add(ownerTabId);
@@ -482,7 +549,8 @@ export function usePromptQueueRunner() {
       }
     };
 
-    const unsubscribe = usePromptQueueStore.subscribe((state, prevState) => {
+    const evaluateQueues = (state: QueueStateSnapshot, prevState: QueueStateSnapshot) => {
+      if (!canValidateQueueTabs()) return;
       for (const [tabId, q] of state.queues) {
         if (!tabExists(tabId)) {
           usePromptQueueStore.getState().cleanupClosedTab(tabId);
@@ -512,11 +580,12 @@ export function usePromptQueueRunner() {
           }
         }
 
-        if (!q.autoRun || q.items.length === 0) continue;
+        if (!q.autoRun || countEnabledQueuedPrompts(q.items) === 0) continue;
 
-        const prevCount = prevQ?.items.length ?? 0;
+        const prevCount = prevQ ? countEnabledQueuedPrompts(prevQ.items) : 0;
+        const activeCount = countEnabledQueuedPrompts(q.items);
         const prevAutoRun = prevQ?.autoRun ?? false;
-        const itemsArrived = prevCount === 0 && q.items.length > 0;
+        const itemsArrived = prevCount === 0 && activeCount > 0;
         const autoRunArmed = !prevAutoRun && q.autoRun;
         // Treat "target swapped while armed" as an arm-edge too — the user
         // explicitly changed who we're waiting on, evaluate cold-start fit
@@ -529,6 +598,7 @@ export function usePromptQueueRunner() {
         const effectiveTrigger = getEffectiveQueueTrigger(tabId, q, { clearStaleTarget: true });
 
         if (effectiveTrigger !== tabId) {
+          seedBusySnapshotFromWorkspace(effectiveTrigger);
           // Pivoted: only fire cold-start if the target has been seen busy at
           // least once AND is currently idle. Otherwise wait for the busy→idle
           // edge in the IPC handler. The "seen at least once" gate prevents
@@ -565,20 +635,31 @@ export function usePromptQueueRunner() {
           pendingTimers.set(tabId, setTimeout(() => {
             pendingTimers.delete(tabId);
             const q2 = usePromptQueueStore.getState().getQueue(tabId);
-            if (!q2.autoRun || q2.items.length === 0 || q2.firstDelayCountdownAt === null) {
+            if (!q2.autoRun || countEnabledQueuedPrompts(q2.items) === 0 || q2.firstDelayCountdownAt === null) {
               usePromptQueueStore.getState().clearFirstDelayCountdown(tabId);
               return;
             }
-            usePromptQueueStore.getState().clearFirstDelayCountdown(tabId);
+            usePromptQueueStore.getState().consumeFirstDelayCountdown(tabId);
             fireHead(tabId, tabId);
           }, delayMs));
         } else {
           fireHead(tabId, tabId);
         }
       }
+    };
+
+    const unsubscribeQueue = usePromptQueueStore.subscribe((state, prevState) => {
+      evaluateQueues(state, prevState);
+    });
+    const unsubscribeWorkspace = useWorkspaceStore.subscribe((state, prevState) => {
+      const wasReady = !prevState.isRestoring && prevState.openProjects.size > 0;
+      const isReady = !state.isRestoring && state.openProjects.size > 0;
+      if (wasReady || !isReady) return;
+      evaluateQueues(usePromptQueueStore.getState(), { queues: new Map() });
     });
     return () => {
-      unsubscribe();
+      unsubscribeQueue();
+      unsubscribeWorkspace();
       for (const t of pendingTimers.values()) clearTimeout(t);
       pendingTimers.clear();
     };

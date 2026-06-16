@@ -1,6 +1,6 @@
 # Feature: AI Usage Chips (Claude + Codex)
 
-Два цветных chip'а в [`ProjectToolbar.tsx`](../../src/renderer/components/Workspace/ProjectToolbar.tsx) слева от `DictationHistoryButton`, реализация — [`ClaudeUsageButton.tsx`](../../src/renderer/components/Workspace/ClaudeUsageButton.tsx). Claude-чип показывает **недельный % лимита** Anthropic Max-подписки и раскрывает popover с детальной разбивкой плюс per-tab cost'ом из JSONL на диске. Codex-чип показывает weekly/5-hour лимиты OpenAI Codex из rollout JSONL и отдельный popover без Claude-only token-cost секции.
+Два цветных chip'а в [`ProjectToolbar.tsx`](../../src/renderer/components/Workspace/ProjectToolbar.tsx) слева от `DictationHistoryButton`, реализация — [`ClaudeUsageButton.tsx`](../../src/renderer/components/Workspace/ClaudeUsageButton.tsx). Claude-чип показывает **недельный % лимита** Anthropic Max-подписки, если текущий Claude Code auth — OAuth Max; если текущий auth — API Platform key, popover переключается в API-account режим с key/org/spend вместо Max quota. Codex-чип показывает weekly/5-hour лимиты выбранного OpenAI Codex аккаунта и отдельный popover без Claude-only token-cost секции; rollout JSONL остаётся fallback'ом, когда account-log ещё пуст.
 
 ## Лицо чипов: иконка + % + reset countdown
 
@@ -43,9 +43,19 @@ Endpoint — `GET https://api.anthropic.com/api/oauth/usage` с заголовк
 
 `extra_usage` — overflow в pay-as-you-go USD-кредитах после исчерпания Max-плана. `used_credits` и `monthly_limit` в **центах**, не в долларах — делим на 100.
 
+Claude Code может быть залогинен не через Max OAuth, а через API Platform key (`security` service `"Claude Code"`). Такой ключ **может запускать Claude Code локально**, но `/api/oauth/usage` для него недоступен: Max quota, weekly reset и extra usage относятся только к OAuth Max token. Поэтому accounts в Claude popover — это не косметика: `api:<hash>` и `oauth:<hash>` разные auth sources, один может быть current, другой cached/secondary. Текущий key source показывается в шапке, чтобы не путать “Claude работает” с “Max quota доступна”.
+
+Для API Platform публичная информация ограничена: обычный API key валидируется через `GET /v1/models?limit=1` и даёт `anthropic-organization-id` в headers; spend читается только через Admin API key (`ANTHROPIC_ADMIN_API_KEY` / `ANTHROPIC_ADMIN_KEY`) и `GET /v1/organizations/cost_report` bucket'ами за последние 31 день. Этот endpoint возвращает cost report (month spend, last 7d, latest bucket), но **не возвращает remaining credits / balance**. В UI строка `Credits left` намеренно показывает `not exposed`: баланс остаётся только в Claude Console Billing, не выводить фейковый `$0` и не пытаться выводить остаток из spend.
+
 ## Источник данных Codex: rollout `token_count.rate_limits`
 
-Codex-чип не ходит в OpenAI usage endpoint. Backend `codex:get-usage` читает последние rollout JSONL в `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` и ищет самый свежий `event_msg` с `payload.type === "token_count"` и `payload.rate_limits`. `primary` маппится в `five_hour`, `secondary` — в `seven_day`; `resets_at` приходит epoch seconds и приводится к ISO для общего renderer-форматтера. Пока в сессии нет ни одного такого record'а, состояние «No Codex limit sample yet» корректно: лимит ещё не материализован в durable transcript.
+Codex-чип не ходит в OpenAI usage endpoint. Для текущего toolbar-числа backend `codex:get-usage` сначала читает `~/.codex/logs_2.sqlite`: строки `codex.rate_limits` из websocket-логов связываются с `thread_id`, `user.account_id` и `user.email`, затем берётся самый свежий snapshot на identity за последние 10 дней. Это нужно для мультиаккаунтинга: активная вкладка может принадлежать одному Codex аккаунту, а пользователь хочет смотреть бюджет другого, поэтому «последний rollout активной сессии» больше не является достаточным source-of-truth.
+
+SQL вытаскивает только короткие `substr()`-окна вокруг `codex.rate_limits` / `user.account_id` / `user.email`, а не полный `feedback_log_body`: в этих логах могут лежать prompts и tool-output. Email маскируется (`ab***@domain`), account key хранится как короткий sha256-хеш, selected account persist'ится только в `localStorage('noted.codexUsage.accountKey')`. Верхний segmented switcher рендерится только когда найдено больше одного аккаунта; если аккаунт один — лишняя оболочка не показывается. UX-принцип: `methodology/переносимый-дизайн.md::Аккаунт как область данных`.
+
+Fallback order в `codex:get-usage`: `account-log` → active session rollout (`opts.sessionId`, если account-log пуст) → latest rollout в `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. В rollout авторитетная запись та же: `event_msg` с `payload.type === "token_count"` и `payload.rate_limits`; `primary` маппится в `five_hour`, `secondary` — в `seven_day`; `resets_at` приходит epoch seconds и приводится к ISO для общего renderer-форматтера. Пока нет ни account-log, ни rollout record'а, состояние «No Codex limit sample yet» корректно: лимит ещё не материализован в durable локальных артефактах.
+
+Диагностика для рассинхрона «в разных вкладках разные значения»: main пишет `[CodexData] get-usage source=<account-log|active-session-rollout|latest-rollout> accounts=N selected=<label> weekly=X fiveHour=Y session=<sid>`, renderer пишет `[CodexUsage] refresh ok ...` и `[CodexUsage] account selected ...`. Сначала сравни эти логи, а не Timeline: Timeline показывает per-session snapshots, toolbar — selected-account текущий budget.
 
 Не пересчитывать Codex лимит из `last_token_usage.total_tokens`. Это тот же anti-pattern что для Anthropic usage history: локальные токены не равны провайдерскому quota%, потому что provider применяет свою формулу и reset-бакеты. Конкретика Codex JSONL — [`fact-codex.md`](fact-codex.md).
 

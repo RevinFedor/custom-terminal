@@ -10,27 +10,48 @@ import '@gt-editor/markdown-editor/styles.css';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
+import {
+  attachInstruction as attachListInstruction,
+  extractInstruction as extractListInstruction,
+  type Availability as ListInstructionAvailability,
+  type Instruction as ListInstruction,
+} from '@atlaskit/pragmatic-drag-and-drop-hitbox/list-item';
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, PanelLeft, Plus, StickyNote, RotateCw, Folder, ArrowUp, ArrowDown, Square } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, PanelLeft, Plus, StickyNote, RotateCw, Folder, ArrowUp, ArrowDown, Square, Bell, BellRing, FileText } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
 const CLAUDE_SPINNER_VISUAL_IDLE_GRACE_MS = 300;
+const COMPLETION_NOTIFICATION_DISMISS_MS = 420;
+const TABBAR_DRAG_VISUAL_LOCK_ATTR = 'data-tabbar-drag-visual-lock';
+const GROUP_COLLAPSE_FLIP_SUPPRESS_MS = 320;
 
 let forcedDragCursorDepth = 0;
 let forcedDragCursorStyleEl: HTMLStyleElement | null = null;
 
+const isTabbarDragVisualLockActive = () =>
+  typeof document !== 'undefined' && document.documentElement.hasAttribute(TABBAR_DRAG_VISUAL_LOCK_ATTR);
+
 const acquireForcedDragCursor = () => {
   if (typeof document === 'undefined') return;
+  const wasInactive = forcedDragCursorDepth === 0;
   forcedDragCursorDepth += 1;
+  document.documentElement.setAttribute(TABBAR_DRAG_VISUAL_LOCK_ATTR, 'true');
+  if (wasInactive) {
+    console.log(`[TabDnd:bg-lock] active=1 depth=${forcedDragCursorDepth} t=${Math.round(performance.now())}`);
+  }
   if (forcedDragCursorStyleEl) return;
   forcedDragCursorStyleEl = document.createElement('style');
   forcedDragCursorStyleEl.setAttribute('data-tabbar-forced-drag-cursor', 'true');
   forcedDragCursorStyleEl.textContent = `
     html, html *, body, body * {
       cursor: grabbing !important;
+    }
+    html[${TABBAR_DRAG_VISUAL_LOCK_ATTR}="true"] [data-tab-item],
+    html[${TABBAR_DRAG_VISUAL_LOCK_ATTR}="true"] [data-tab-group-header] {
+      transition-property: transform, box-shadow, border-color !important;
     }
   `;
   document.head.appendChild(forcedDragCursorStyleEl);
@@ -40,6 +61,8 @@ const releaseForcedDragCursor = () => {
   if (typeof document === 'undefined') return;
   forcedDragCursorDepth = Math.max(0, forcedDragCursorDepth - 1);
   if (forcedDragCursorDepth > 0) return;
+  document.documentElement.removeAttribute(TABBAR_DRAG_VISUAL_LOCK_ATTR);
+  console.log(`[TabDnd:bg-lock] active=0 depth=${forcedDragCursorDepth} t=${Math.round(performance.now())}`);
   forcedDragCursorStyleEl?.remove();
   forcedDragCursorStyleEl = null;
 };
@@ -71,12 +94,17 @@ interface TabData {
   geminiSessionId?: string;
   codexSessionId?: string;
   tabType?: string;
+  filePath?: string;
+  notes?: string;
   aiClosing?: boolean;
   isCollapsed?: boolean;
   groupId?: string;
   visualParentTabId?: string;
   parentTabId?: string;
   sessionStatus?: string;
+  completionNotificationPersistent?: boolean;
+  completionNotificationArmed?: boolean;
+  completionNotificationFired?: boolean;
 }
 
 type TabDragData = {
@@ -117,17 +145,61 @@ type VerticalDragGroupRow = {
   groupId: string;
   rect: RectSnap;
   header: RectSnap;
+  collapsed: boolean;
+  memberIds: string[];
   tabRows: { tabId: string; rect: RectSnap }[];
 };
 type VerticalDragGeometry = {
+  id: number;
+  reason: string;
+  capturedAtMs: number;
   list: RectSnap;
   rows: Array<VerticalDragTabRow | VerticalDragGroupRow>;
+};
+type VerticalDragAnchor = {
+  offsetY: number;
+  startY: number;
+  sourceTop: number;
+  sourceBottom: number;
+  sourceMidY: number;
 };
 type VerticalRowFlipRect = {
   top: number;
   left: number;
   width: number;
   height: number;
+};
+
+const measureVerticalRowFlipRect = (row: HTMLElement, root: HTMLElement): VerticalRowFlipRect => {
+  let top = 0;
+  let left = 0;
+  let current: HTMLElement | null = row;
+  const seen = new Set<HTMLElement>();
+
+  while (current && current !== root && root.contains(current) && !seen.has(current)) {
+    seen.add(current);
+    top += current.offsetTop;
+    left += current.offsetLeft;
+    current = current.offsetParent as HTMLElement | null;
+  }
+
+  if (current === root) {
+    return {
+      top,
+      left,
+      width: row.offsetWidth,
+      height: row.offsetHeight,
+    };
+  }
+
+  const rowRect = row.getBoundingClientRect();
+  const rootRect = root.getBoundingClientRect();
+  return {
+    top: rowRect.top - rootRect.top + root.scrollTop,
+    left: rowRect.left - rootRect.left + root.scrollLeft,
+    width: row.offsetWidth,
+    height: row.offsetHeight,
+  };
 };
 
 const snapRect = (el: Element): RectSnap => {
@@ -140,13 +212,172 @@ const shortDndId = (id?: string | null) => {
   return id.length > 12 ? id.slice(-12) : id;
 };
 
+const shortVerticalRowKey = (key?: string | null) => {
+  if (!key) return '-';
+  const [kind, id] = key.split(':');
+  if (!id) return shortDndId(key);
+  return `${kind}:${shortDndId(id)}`;
+};
+
+const describePaintNode = (element: HTMLElement | null) => {
+  if (!element) return 'none';
+  const styles = window.getComputedStyle(element);
+  const before = window.getComputedStyle(element, '::before');
+  const after = window.getComputedStyle(element, '::after');
+  return JSON.stringify({
+    tag: element.tagName.toLowerCase(),
+    rowType: element.dataset.rowType || undefined,
+    tab: shortDndId(element.dataset.tabId),
+    group: shortDndId(element.dataset.groupId),
+    bg: styles.backgroundColor,
+    opacity: styles.opacity,
+    transform: styles.transform,
+    willChange: styles.willChange,
+    filter: styles.filter,
+    boxShadow: styles.boxShadow,
+    transitionProperty: styles.transitionProperty,
+    transitionDuration: styles.transitionDuration,
+    beforeBg: before.backgroundColor,
+    afterBg: after.backgroundColor,
+  });
+};
+
+const describeCollapseNode = (element: HTMLElement | null, root?: HTMLElement | null) => {
+  if (!element) return 'none';
+  const rect = element.getBoundingClientRect();
+  const rootRect = root?.getBoundingClientRect();
+  const styles = window.getComputedStyle(element);
+  return JSON.stringify({
+    tag: element.tagName.toLowerCase(),
+    rowType: element.dataset.rowType || undefined,
+    tab: shortDndId(element.dataset.tabId),
+    group: shortDndId(element.dataset.groupId),
+    collapsed: element.dataset.groupCollapsed,
+    top: Math.round(rect.top),
+    relTop: rootRect ? Math.round(rect.top - rootRect.top + (root?.scrollTop || 0)) : undefined,
+    height: Math.round(rect.height),
+    offsetHeight: element.offsetHeight,
+    scrollHeight: element.scrollHeight,
+    display: styles.display,
+    gridTemplateRows: styles.gridTemplateRows,
+    opacity: styles.opacity,
+    transform: styles.transform,
+    overflow: styles.overflow,
+    gap: styles.gap,
+    transitionProperty: styles.transitionProperty,
+    transitionDuration: styles.transitionDuration,
+  });
+};
+
+const fmtDndY = (rect: RectSnap) =>
+  `${Math.round(rect.top)}/${Math.round(rect.midY)}/${Math.round(rect.bottom)}`;
+
+type ListInstructionOperations = Partial<Record<ListInstruction['operation'], ListInstructionAvailability>>;
+
+const REORDER_ONLY_OPERATIONS: ListInstructionOperations = {
+  'reorder-before': 'available',
+  'reorder-after': 'available',
+};
+
+const GROUP_CONTAINER_OPERATIONS: ListInstructionOperations = {
+  'reorder-before': 'available',
+  combine: 'available',
+};
+
+const summarizeListInstruction = (instruction: ListInstruction | null) => {
+  if (!instruction) return '-';
+  return `${instruction.operation}${instruction.blocked ? ':blocked' : ''}/${instruction.axis}`;
+};
+
+const listInstructionToEdge = (instruction: ListInstruction | null): Edge | null => {
+  if (!instruction || instruction.operation === 'combine') return null;
+  if (instruction.axis === 'horizontal') {
+    return instruction.operation === 'reorder-before' ? 'left' : 'right';
+  }
+  return instruction.operation === 'reorder-before' ? 'top' : 'bottom';
+};
+
+const extractDropIndicatorEdge = (data?: Record<string | symbol, unknown> | null): Edge | null => {
+  if (!data) return null;
+  return listInstructionToEdge(extractListInstruction(data)) || extractClosestEdge(data);
+};
+
+const getStaticListInstruction = (
+  rect: RectSnap,
+  clientX: number,
+  clientY: number,
+  operations: ListInstructionOperations,
+  axis: 'vertical' | 'horizontal' = 'vertical'
+): ListInstruction | null => {
+  const point = axis === 'vertical' ? clientY : clientX;
+  const start = axis === 'vertical' ? rect.top : rect.left;
+  const end = axis === 'vertical' ? rect.bottom : rect.right;
+  const size = axis === 'vertical' ? rect.height : rect.right - rect.left;
+  const possible = (availability: ListInstructionAvailability | undefined) =>
+    availability === 'available' || availability === 'blocked';
+  const combine = operations.combine || 'not-available';
+  const before = operations['reorder-before'] || 'not-available';
+  const after = operations['reorder-after'] || 'not-available';
+  let operation: ListInstruction['operation'] | null = null;
+
+  if (!possible(combine)) {
+    if (possible(before) && possible(after)) {
+      operation = point < start + size / 2 ? 'reorder-before' : 'reorder-after';
+    } else if (possible(before)) {
+      operation = 'reorder-before';
+    } else if (possible(after)) {
+      operation = 'reorder-after';
+    }
+  } else {
+    const quarter = size / 4;
+    if (point <= start + quarter) {
+      operation = possible(before) ? 'reorder-before' : 'combine';
+    } else if (point >= end - quarter) {
+      operation = possible(after) ? 'reorder-after' : 'combine';
+    } else {
+      operation = 'combine';
+    }
+  }
+
+  if (!operation) return null;
+  return {
+    operation,
+    blocked: operations[operation] === 'blocked',
+    axis,
+  };
+};
+
+const verticalRowDebugKey = (row: VerticalDragGeometry['rows'][number]) => {
+  if (row.type === 'tab') return `tab:${shortDndId(row.tabId)}@${fmtDndY(row.rect)}`;
+  return `group:${shortDndId(row.groupId)}(v=${row.tabRows.length},m=${row.memberIds.length},c=${row.collapsed ? 1 : 0})@h${fmtDndY(row.header)}r${fmtDndY(row.rect)}`;
+};
+
 const summarizeVerticalGeometry = (geometry: VerticalDragGeometry | null) => {
   if (!geometry) return 'none';
-  const keys = geometry.rows.map((row) => {
-    if (row.type === 'tab') return `tab:${shortDndId(row.tabId)}`;
-    return `group:${shortDndId(row.groupId)}(${row.tabRows.length})`;
-  });
-  return `rows=${geometry.rows.length} keys=${keys.join('>')} list=${Math.round(geometry.list.top)}..${Math.round(geometry.list.bottom)}`;
+  const keys = geometry.rows.map(verticalRowDebugKey);
+  return `gid=${geometry.id} reason=${geometry.reason} rows=${geometry.rows.length} keys=${keys.join('>')} list=${Math.round(geometry.list.top)}..${Math.round(geometry.list.bottom)}`;
+};
+
+const summarizeVerticalAnchor = (anchor: VerticalDragAnchor | null) => {
+  if (!anchor) return 'none';
+  return `startY=${Math.round(anchor.startY)} source=${Math.round(anchor.sourceTop)}..${Math.round(anchor.sourceBottom)}` +
+    ` mid=${Math.round(anchor.sourceMidY)} offset=${Math.round(anchor.offsetY)}`;
+};
+
+const summarizeDropTargetData = (data?: Record<string | symbol, unknown> | null) => {
+  if (!data) return 'none';
+  const type = data.type;
+  const instruction = summarizeListInstruction(extractListInstruction(data));
+  if (type === 'TAB') {
+    return `TAB:${shortDndId(data.id as string | undefined)} edge=${extractClosestEdge(data) || '-'} instr=${instruction}`;
+  }
+  if (type === 'GROUP') {
+    return `GROUP:${shortDndId(data.groupId as string | undefined)} edge=${extractClosestEdge(data) || '-'} instr=${instruction}`;
+  }
+  if (type === 'TAB_GROUP') {
+    return `TAB_GROUP:${shortDndId(data.groupId as string | undefined)}`;
+  }
+  return String(type || 'unknown');
 };
 
 const summarizePreviewLayout = (preview: DragPreviewLayout | null) => {
@@ -166,6 +397,24 @@ const summarizePreviewLayout = (preview: DragPreviewLayout | null) => {
     `visual=${visual || '-'}`,
     `anchors=${anchors || '-'}`,
   ].join(' ');
+};
+
+const summarizeResolveTrace = (trace: string | null | undefined) => trace || 'resolve=none';
+
+const findVerticalDragSourceRect = (sourceData: DragData, geometry: VerticalDragGeometry | null): RectSnap | null => {
+  if (!geometry) return null;
+  for (const row of geometry.rows) {
+    if (sourceData.type === 'TAB') {
+      if (row.type === 'tab' && row.tabId === sourceData.id) return row.rect;
+      if (row.type === 'group') {
+        const tabRow = row.tabRows.find((candidate) => candidate.tabId === sourceData.id);
+        if (tabRow) return tabRow.rect;
+      }
+    } else if (row.type === 'group' && row.groupId === sourceData.groupId) {
+      return row.header;
+    }
+  }
+  return null;
 };
 
 // Status palette теперь динамическая: SessionStatusDef из useUIStore.
@@ -194,10 +443,29 @@ const adjustRgbaAlpha = (rgba: string, delta: number): string => {
   return `rgba(${r}, ${g}, ${b}, ${newAlpha})`;
 };
 
+const TABBAR_PANEL_RGB = { r: 37, g: 37, b: 38 };
+const TABBAR_PANEL_BG = `rgb(${TABBAR_PANEL_RGB.r}, ${TABBAR_PANEL_RGB.g}, ${TABBAR_PANEL_RGB.b})`;
+
+const flattenRgbaOnTabbarPanel = (color: string): string => {
+  if (color === 'transparent') return TABBAR_PANEL_BG;
+  const m = color.match(/rgba?\(\s*(\d+),\s*(\d+),\s*(\d+)(?:,?\s*([\d.]+))?\s*\)/);
+  if (!m) return color;
+  const [, rText, gText, bText, aText] = m;
+  const alpha = aText === undefined ? 1 : Math.max(0, Math.min(1, parseFloat(aText)));
+  const r = Number(rText);
+  const g = Number(gText);
+  const b = Number(bText);
+  if (alpha >= 1) return `rgb(${r}, ${g}, ${b})`;
+  const blend = (fg: number, bg: number) => Math.round((fg * alpha) + (bg * (1 - alpha)));
+  return `rgb(${blend(r, TABBAR_PANEL_RGB.r)}, ${blend(g, TABBAR_PANEL_RGB.g)}, ${blend(b, TABBAR_PANEL_RGB.b)})`;
+};
+
 const getTabChromeColorConfig = (tab: Pick<TabData, 'color' | 'tabType'>) => {
   const base = TAB_COLORS.find(c => c.color === tab.color) || TAB_COLORS[0];
   return tab.tabType === 'claude-sdk' && tab.color === 'claude'
     ? { ...base, bgColor: 'rgba(210, 140, 90, 0.30)', borderColor: '#D28C5A' }
+    : tab.tabType === 'file'
+      ? { ...base, bgColor: '#181725', borderColor: '#8b5cf6' }
     : base;
 };
 
@@ -418,6 +686,7 @@ interface TabItemProps {
   isStopping?: boolean; // Deterministic-stop is mid-cycle; lock the click + spin icon
   isInterrupted?: boolean; // Tab has an interrupted AI session
   draggingGroupIds?: string[]; // IDs of tabs being dragged as a group
+  isAnyDragging?: boolean;
   onHoverChange?: (hovering: boolean, rect?: DOMRect) => void; // CMD+hover notes preview
   showNotesPeek?: boolean; // CMD held + cursor in TabBar + tab has notes → show the notes
                             // button as a CLICKABLE peek affordance (not just visual indicator).
@@ -445,6 +714,9 @@ interface TabItemProps {
                                             // utility-zone (dropdown) defaults to vertical. TabSidebar
                                             // overrides main-zone to vertical.
   sessionStatus?: SessionStatus; // Status marker color (vertical mode only).
+  completionNotificationArmed?: boolean;
+  completionNotificationFired?: boolean;
+  completionNotificationPersistent?: boolean;
 }
 
 const TabItem = memo(({
@@ -476,6 +748,7 @@ const TabItem = memo(({
   isStopping = false,
   isInterrupted = false,
   draggingGroupIds = [],
+  isAnyDragging = false,
   onHoverChange,
   showNotesPeek = false,
   slideoutOpenHere = false,
@@ -490,13 +763,27 @@ const TabItem = memo(({
   isViewingSubAgent = false,
   orientation,
   sessionStatus,
+  completionNotificationArmed = false,
+  completionNotificationFired = false,
 }: TabItemProps) => {
   const ref = useRef<HTMLDivElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isPressing, setIsPressing] = useState(false);
   const [isAdoptTarget, setIsAdoptTarget] = useState(false);
+  const [isHovered, setIsHovered] = useState(false);
+  const [isRestartButtonHovered, setIsRestartButtonHovered] = useState(false);
   const bodyCursorRef = useRef<string | null>(null);
+
+  const setDropIndicatorEdge = useCallback((edge: Edge | null) => {
+    if (suppressDropIndicator) return;
+    setClosestEdge((previous) => previous === edge ? previous : edge);
+  }, [suppressDropIndicator]);
+
+  useEffect(() => {
+    if (!suppressDropIndicator) return;
+    setClosestEdge((previous) => previous === null ? previous : null);
+  }, [suppressDropIndicator]);
 
   const setBodyGrabbing = useCallback(() => {
     if (bodyCursorRef.current === null) {
@@ -515,6 +802,15 @@ const TabItem = memo(({
   }, []);
 
   useEffect(() => () => clearBodyGrabbing(), [clearBodyGrabbing]);
+
+  useEffect(() => {
+    if (!isAnyDragging) return;
+    if (isHovered) {
+      setIsHovered(false);
+      onHoverChange?.(false);
+    }
+    if (isRestartButtonHovered) setIsRestartButtonHovered(false);
+  }, [isAnyDragging, isHovered, isRestartButtonHovered, onHoverChange]);
 
   useEffect(() => {
     if (!isPressing) return;
@@ -614,10 +910,16 @@ const TabItem = memo(({
       dropTargetForElements({
         element,
         getData: ({ input, element }) => {
-          return attachClosestEdge(
+          const data = attachClosestEdge(
             { type: 'TAB', id: tab.id, zone, index, groupId, groupIndex },
             { element, input, allowedEdges }
           );
+          return attachListInstruction(data, {
+            element,
+            input,
+            axis: isHorizontal ? 'horizontal' : 'vertical',
+            operations: REORDER_ONLY_OPERATIONS,
+          });
         },
         canDrop: ({ source }) => source.data.type === 'TAB' || source.data.type === 'TAB_GROUP',
         onDragEnter: ({ source, self }) => {
@@ -625,34 +927,31 @@ const TabItem = memo(({
           if (sourceData.type === 'TAB' && sourceData.id === tab.id) return;
           if (sourceData.type === 'TAB' && isAdoptDrop(sourceData)) {
             setIsAdoptTarget(true);
-            setClosestEdge(null);
+            setDropIndicatorEdge(null);
           } else {
-            setClosestEdge(extractClosestEdge(self.data));
+            setDropIndicatorEdge(extractDropIndicatorEdge(self.data));
           }
         },
         onDrag: ({ source, self }) => {
           const sourceData = source.data as DragData;
           if (sourceData.type === 'TAB' && sourceData.id === tab.id) {
-            setClosestEdge(null);
+            setDropIndicatorEdge(null);
             setIsAdoptTarget(false);
             return;
           }
           if (sourceData.type === 'TAB' && isAdoptDrop(sourceData)) {
             setIsAdoptTarget(true);
-            setClosestEdge(null);
+            setDropIndicatorEdge(null);
           } else {
             setIsAdoptTarget(false);
-            setClosestEdge(extractClosestEdge(self.data));
+            setDropIndicatorEdge(extractDropIndicatorEdge(self.data));
           }
         },
-        onDragLeave: () => { setClosestEdge(null); setIsAdoptTarget(false); },
-        onDrop: () => { setClosestEdge(null); setIsAdoptTarget(false); },
+        onDragLeave: () => { setDropIndicatorEdge(null); setIsAdoptTarget(false); },
+        onDrop: () => { setDropIndicatorEdge(null); setIsAdoptTarget(false); },
       })
     );
-  }, [tab.id, zone, index, projectId, isAdoptDrop, isHorizontal, groupId, groupIndex]);
-
-  const [isHovered, setIsHovered] = useState(false);
-  const [isProcessStopHovered, setIsProcessStopHovered] = useState(false);
+  }, [tab.id, zone, index, projectId, isAdoptDrop, isHorizontal, groupId, groupIndex, setDropIndicatorEdge]);
 
   // Settings → Размеры → ТАБЫ → Терминал. Геометрия каждой карточки таба.
   // Поднято в начало TabItem чтобы быть до объявления tabStyle ниже.
@@ -667,6 +966,8 @@ const TabItem = memo(({
   const baseColorConfig = TAB_COLORS.find(c => c.color === tab.color) || TAB_COLORS[0];
   const colorConfig = tab.tabType === 'claude-sdk' && tab.color === 'claude'
     ? { ...baseColorConfig, bgColor: 'rgba(210, 140, 90, 0.30)', borderColor: '#D28C5A' }
+    : tab.tabType === 'file'
+      ? { ...baseColorConfig, bgColor: '#181725', borderColor: '#8b5cf6' }
     : baseColorConfig;
 
 
@@ -689,8 +990,18 @@ const TabItem = memo(({
   // Без -0.10 дампера: inactive coloured tab уже видно как сейчас hover'нутый.
   // SDK Claude override на 0.30 (выше PTY claude 0.20) → SDK active = 0.55 vs PTY active = 0.45,
   // SDK явно светлее/жёлтее на одинаковом #252526 фоне.
+  const isVerticalMode = !isHorizontal;
   const isVertActive = !isHorizontal && isActive;
+  const isDraggedByMonitor = draggingGroupIds.includes(tab.id);
+  const effectiveHovered = isHovered && !isAnyDragging;
+  const shouldFlattenDragBackground = isVerticalMode;
   const getBgColor = () => {
+    if (tab.tabType === 'file') {
+      if (isActive) return isVertActive ? '#211f36' : '#181725';
+      if (isSelected) return '#1f1d31';
+      if (effectiveHovered) return '#201e32';
+      return '#181725';
+    }
     if (isActive) {
       if (hasColor) {
         return isVertActive ? adjustAlpha(colorConfig.bgColor, 0.25) : colorConfig.bgColor;
@@ -705,7 +1016,7 @@ const TabItem = memo(({
       return 'rgba(255,255,255,0.06)';
     }
     // Hovered tabs — чуть ярче inactive чтобы hover работал как лёгкая подсветка.
-    if (isHovered) {
+    if (effectiveHovered) {
       if (hasColor) {
         return !isHorizontal ? adjustAlpha(colorConfig.bgColor, 0.08) : colorConfig.bgColor;
       }
@@ -720,6 +1031,11 @@ const TabItem = memo(({
     // Inactive uncoloured: в vertical — лёгкая белая подложка чтоб не сливаться с панелью.
     return !isHorizontal ? 'rgba(255,255,255,0.04)' : 'transparent';
   };
+  const rawTabBackgroundColor = getBgColor();
+  const rawEffectiveTabBackgroundColor = isAdoptTarget ? 'rgba(99, 102, 241, 0.15)' : rawTabBackgroundColor;
+  const tabBackgroundColor = shouldFlattenDragBackground
+    ? flattenRgbaOnTabbarPanel(rawEffectiveTabBackgroundColor)
+    : rawEffectiveTabBackgroundColor;
 
   // Border/indicator for active, selected, or interrupted tabs
   const getTopBorder = () => {
@@ -755,6 +1071,7 @@ const TabItem = memo(({
 
   // Collapsed tab icon color based on tab brand
   const getCollapsedIconColor = () => {
+    if (tab.tabType === 'file') return '#a78bfa';
     if (tab.color === 'claude') return '#DA7756';
     if (tab.color === 'gemini') return '#4E86F8';
     if (tab.color === 'codex') return '#10A37F';
@@ -768,8 +1085,20 @@ const TabItem = memo(({
   //   и SVG-маркер статуса справа от неё). Поэтому исчезает 32px-gutter слева.
   // — Тонкая полоса процесса 2px + маркер статуса 8px рисуются абсолютом, поэтому в padding
   //   достаточно резервировать ~20px слева.
-  const isVerticalMode = !isHorizontal;
-  const dragLiftActive = isVerticalMode && (isPressing || isDragging);
+  const dragLiftActive = isVerticalMode && (isPressing || isDragging || isDraggedByMonitor);
+  const completionNotificationWaiting = completionNotificationArmed && !completionNotificationFired;
+  const [completionNotificationDismissing, setCompletionNotificationDismissing] = useState(false);
+  const completionNotificationWasVisibleRef = useRef(completionNotificationFired);
+  const completionNotificationDismissTimerRef = useRef<number | null>(null);
+  const completionNotificationShadow = !isCollapsed && completionNotificationFired
+    ? 'inset 0 0 0 1.5px rgba(239, 68, 68, 0.9), 0 0 12px rgba(239, 68, 68, 0.22)'
+    : (!isCollapsed && completionNotificationWaiting
+      ? 'inset 0 0 0 1px rgba(248, 113, 113, 0.55)'
+      : null);
+  const tabBoxShadow = [
+    completionNotificationShadow,
+    isAdoptTarget ? 'inset 0 0 0 1.5px rgba(99, 102, 241, 0.7)' : null,
+  ].filter(Boolean).join(', ') || undefined;
 
   // Build inline styles - full control to avoid Tailwind conflicts
   const tabStyle: React.CSSProperties = {
@@ -801,8 +1130,8 @@ const TabItem = memo(({
     width: isCollapsed ? '28px' : undefined,
     minWidth: isCollapsed ? '28px' : (isHorizontal ? 'auto' : '100%'),
     maxWidth: isCollapsed ? '28px' : undefined,
-    color: (isActive || isHovered || isSelected) ? '#fff' : '#888',
-    backgroundColor: getBgColor(),
+    color: (isActive || effectiveHovered || isSelected || isDraggedByMonitor) ? '#fff' : '#888',
+    backgroundColor: tabBackgroundColor,
     // Vertical mode: NO activity border — насыщенность фона сама показывает активную вкладку.
     // Interrupted (dashed blue) и selected (dashed white) сохраняем как маркеры состояния.
     borderTop: isHorizontal ? getTopBorder() : 'none',
@@ -811,19 +1140,16 @@ const TabItem = memo(({
         ? '2px dashed #3b82f6'
         : (isSelected && !isActive ? '2px dashed rgba(255,255,255,0.3)' : '2px solid transparent'))
       : 'none',
-    opacity: isDragging ? (isVerticalMode ? 0.96 : 0.5) : (draggingGroupIds.includes(tab.id) && !isDragging ? 0.5 : (isCollapsed && !isActive ? 0.6 : 1)),
-    transform: dragLiftActive ? 'scale(1.015)' : undefined,
+    opacity: isVerticalMode && isAnyDragging ? 1 : (isDragging ? (isVerticalMode ? 1 : 0.5) : (isDraggedByMonitor && !dragLiftActive ? 0.5 : (isCollapsed && !isActive ? 0.6 : 1))),
+    transform: undefined,
     transformOrigin: 'center',
-    transition: 'color 0.15s ease, background-color 0.15s ease, transform 90ms ease, box-shadow 90ms ease, opacity 0.12s ease',
+    outline: dragLiftActive ? '1px solid rgba(139, 92, 246, 0.78)' : undefined,
+    outlineOffset: dragLiftActive ? '-1px' : undefined,
+    transition: isAnyDragging
+      ? 'transform 90ms ease, box-shadow 90ms ease'
+      : 'color 0.15s ease, background-color 0.15s ease, transform 90ms ease, box-shadow 90ms ease, opacity 0.12s ease',
     borderRight: isViewingSubAgent ? '2px solid rgba(168, 85, 247, 0.6)' : 'none',
-    ...(dragLiftActive ? {
-      boxShadow: '0 0 0 1px rgba(139, 92, 246, 0.55), 0 6px 18px rgba(0, 0, 0, 0.28)',
-      backgroundColor: hasColor ? adjustAlpha(colorConfig.bgColor, 0.10) : 'rgba(139, 92, 246, 0.16)',
-    } : {}),
-    ...(isAdoptTarget ? {
-      boxShadow: 'inset 0 0 0 1.5px rgba(99, 102, 241, 0.7)',
-      backgroundColor: 'rgba(99, 102, 241, 0.15)',
-    } : {}),
+    boxShadow: tabBoxShadow,
   };
 
   // Vertical mode разделяет два сигнала:
@@ -853,29 +1179,230 @@ const TabItem = memo(({
   // position — left|right (юзер выбирает в Settings). Цвет полоски и shimmer
   // читаются через CSS-переменные на :root (App.tsx синхронизирует).
   const processBarPosition = useUIStore((s) => s.processBar.position);
-  const canStopDevProcessFromBar = isVerticalMode
-    && !isCollapsed
-    && verticalHasProcess
+  const canShowVerticalRestartButton = isVerticalMode && tab.color === 'green' && hasProcess;
+  const verticalRestartStopMode = canShowVerticalRestartButton
+    && isRestartButtonHovered
+    && cmdPeekMode
     && commandType === 'devServer'
-    && !!onStop;
-  const processStopHoverActive = canStopDevProcessFromBar && isProcessStopHovered;
-  const processStopCmdHoverActive = processStopHoverActive && cmdPeekMode;
+    && !!onStop
+    && !isStopping;
+  const verticalRestartHoverActive = canShowVerticalRestartButton && isRestartButtonHovered && !isStopping;
+  const verticalRestartButtonBackground = verticalRestartStopMode
+    ? 'rgba(248, 113, 113, 0.16)'
+    : (verticalRestartHoverActive ? 'rgba(34,197,94,0.18)' : '#1e1e2e');
+  const verticalRestartButtonColor = isStopping
+    ? '#666'
+    : (verticalRestartStopMode ? '#f87171' : (verticalRestartHoverActive ? '#bbf7d0' : '#86efac'));
+  const verticalRestartButtonBorder = verticalRestartStopMode
+    ? '1px solid rgba(248, 113, 113, 0.35)'
+    : '1px solid rgba(34,197,94,0.25)';
   // Settings → форма маркера статуса (круг или квадрат) + размер в px.
   const statusMarkerShape = useUIStore((s) => s.statusMarker.shape);
   const statusMarkerSize = useUIStore((s) => s.statusMarker.sizePx);
   const visualStateLogRef = useRef<string>('');
+  const bgDiagRenderRef = useRef<string>('');
+  const bgDiagComputedRef = useRef<string>('');
+  const bgDiagFrameRef = useRef<number | null>(null);
+
+  useLayoutEffect(() => {
+    const lock = isTabbarDragVisualLockActive();
+    const activeDiag = isVerticalMode && (lock || isAnyDragging || isPressing || isDragging || isDraggedByMonitor);
+
+    if (!activeDiag) {
+      bgDiagRenderRef.current = '';
+      bgDiagComputedRef.current = '';
+      if (bgDiagFrameRef.current !== null) {
+        window.cancelAnimationFrame(bgDiagFrameRef.current);
+        bgDiagFrameRef.current = null;
+      }
+      return;
+    }
+
+    const inlineBg = String(tabStyle.backgroundColor || '');
+    const inlineTransition = String(tabStyle.transition || '');
+    const inlineShadow = String(tabStyle.boxShadow || '');
+    const inlineOutline = String(tabStyle.outline || '');
+    const renderSig = [
+      inlineBg,
+      rawEffectiveTabBackgroundColor,
+      shouldFlattenDragBackground ? 1 : 0,
+      inlineTransition,
+      inlineShadow,
+      inlineOutline,
+      isActive ? 1 : 0,
+      isSelected ? 1 : 0,
+      isHovered ? 1 : 0,
+      effectiveHovered ? 1 : 0,
+      isDragging ? 1 : 0,
+      isPressing ? 1 : 0,
+      isDraggedByMonitor ? 1 : 0,
+      dragLiftActive ? 1 : 0,
+      isAdoptTarget ? 1 : 0,
+      closestEdge || '-',
+      lock ? 1 : 0,
+      isAnyDragging ? 1 : 0,
+    ].join('|');
+
+    if (bgDiagRenderRef.current !== renderSig) {
+      bgDiagRenderRef.current = renderSig;
+      console.log(
+        `[TabDnd:bg] kind=tab phase=render tab=${shortDndId(tab.id)}` +
+        ` name=${JSON.stringify(tab.name || '')}` +
+        ` inlineBg=${inlineBg}` +
+        ` rawBg=${rawEffectiveTabBackgroundColor}` +
+        ` opaqueBg=${shouldFlattenDragBackground ? 1 : 0}` +
+        ` inlineTransition=${JSON.stringify(inlineTransition)}` +
+        ` inlineShadow=${JSON.stringify(inlineShadow)}` +
+        ` inlineOutline=${JSON.stringify(inlineOutline)}` +
+        ` active=${isActive ? 1 : 0}` +
+        ` selected=${isSelected ? 1 : 0}` +
+        ` hovered=${isHovered ? 1 : 0}` +
+        ` effectiveHovered=${effectiveHovered ? 1 : 0}` +
+        ` dragging=${isDragging ? 1 : 0}` +
+        ` pressing=${isPressing ? 1 : 0}` +
+        ` draggedByMonitor=${isDraggedByMonitor ? 1 : 0}` +
+        ` lift=${dragLiftActive ? 1 : 0}` +
+        ` adopt=${isAdoptTarget ? 1 : 0}` +
+        ` edge=${closestEdge || '-'}` +
+        ` lock=${lock ? 1 : 0}` +
+        ` anyDragging=${isAnyDragging ? 1 : 0}`
+      );
+    }
+
+    const element = ref.current;
+    if (!element) return;
+    if (bgDiagFrameRef.current !== null) {
+      window.cancelAnimationFrame(bgDiagFrameRef.current);
+    }
+    bgDiagFrameRef.current = window.requestAnimationFrame(() => {
+      bgDiagFrameRef.current = null;
+      const styles = window.getComputedStyle(element);
+      const computedSig = [
+        styles.backgroundColor,
+        styles.transitionProperty,
+        styles.transitionDuration,
+        styles.transitionTimingFunction,
+      ].join('|');
+      if (bgDiagComputedRef.current === computedSig) return;
+      bgDiagComputedRef.current = computedSig;
+      console.log(
+        `[TabDnd:bg] kind=tab phase=computed tab=${shortDndId(tab.id)}` +
+        ` computedBg=${styles.backgroundColor}` +
+        ` transitionProperty=${JSON.stringify(styles.transitionProperty)}` +
+        ` transitionDuration=${JSON.stringify(styles.transitionDuration)}` +
+        ` transitionTiming=${JSON.stringify(styles.transitionTimingFunction)}` +
+        ` inlineBg=${inlineBg}` +
+        ` rawBg=${rawEffectiveTabBackgroundColor}` +
+        ` opaqueBg=${shouldFlattenDragBackground ? 1 : 0}` +
+        ` lock=${isTabbarDragVisualLockActive() ? 1 : 0}` +
+        ` anyDragging=${isAnyDragging ? 1 : 0}`
+      );
+    });
+
+    return () => {
+      if (bgDiagFrameRef.current !== null) {
+        window.cancelAnimationFrame(bgDiagFrameRef.current);
+        bgDiagFrameRef.current = null;
+      }
+    };
+  }, [
+    closestEdge,
+    dragLiftActive,
+    effectiveHovered,
+    isActive,
+    isAdoptTarget,
+    isAnyDragging,
+    isDraggedByMonitor,
+    isDragging,
+    isHovered,
+    isPressing,
+    isSelected,
+    isVerticalMode,
+    tab.id,
+    tab.name,
+    rawEffectiveTabBackgroundColor,
+    shouldFlattenDragBackground,
+    tabStyle.backgroundColor,
+    tabStyle.boxShadow,
+    tabStyle.outline,
+    tabStyle.transition,
+  ]);
 
   useEffect(() => {
-    if (!canStopDevProcessFromBar || !isProcessStopHovered || isStopping) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'F7') return;
-      e.preventDefault();
-      e.stopPropagation();
-      onStop?.(tab.id);
+    if (!isVerticalMode) return;
+    const element = ref.current;
+    if (!element) return;
+
+    const onBgTransition = (event: TransitionEvent) => {
+      if (event.target !== element) return;
+      if (!event.propertyName.includes('background')) return;
+      const lock = isTabbarDragVisualLockActive();
+      const activeDiag = lock || isAnyDragging || isPressing || isDragging || isDraggedByMonitor;
+      if (!activeDiag) return;
+      const styles = window.getComputedStyle(element);
+      console.log(
+        `[TabDnd:bg] kind=tab phase=${event.type} tab=${shortDndId(tab.id)}` +
+        ` prop=${event.propertyName}` +
+        ` elapsed=${event.elapsedTime}` +
+        ` inlineBg=${String(tabStyle.backgroundColor || '')}` +
+        ` rawBg=${rawEffectiveTabBackgroundColor}` +
+        ` opaqueBg=${shouldFlattenDragBackground ? 1 : 0}` +
+        ` computedBg=${styles.backgroundColor}` +
+        ` transitionProperty=${JSON.stringify(styles.transitionProperty)}` +
+        ` transitionDuration=${JSON.stringify(styles.transitionDuration)}` +
+        ` hovered=${isHovered ? 1 : 0}` +
+        ` effectiveHovered=${effectiveHovered ? 1 : 0}` +
+        ` dragging=${isDragging ? 1 : 0}` +
+        ` pressing=${isPressing ? 1 : 0}` +
+        ` draggedByMonitor=${isDraggedByMonitor ? 1 : 0}` +
+        ` lock=${lock ? 1 : 0}` +
+        ` anyDragging=${isAnyDragging ? 1 : 0}`
+      );
     };
-    window.addEventListener('keydown', onKeyDown, true);
-    return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [canStopDevProcessFromBar, isProcessStopHovered, isStopping, onStop, tab.id]);
+
+    element.addEventListener('transitionrun', onBgTransition);
+    element.addEventListener('transitionstart', onBgTransition);
+    return () => {
+      element.removeEventListener('transitionrun', onBgTransition);
+      element.removeEventListener('transitionstart', onBgTransition);
+    };
+  }, [
+    effectiveHovered,
+    isAnyDragging,
+    isDraggedByMonitor,
+    isDragging,
+    isHovered,
+    isPressing,
+    isVerticalMode,
+    tab.id,
+    tabStyle.backgroundColor,
+  ]);
+
+  useLayoutEffect(() => {
+    if (completionNotificationDismissTimerRef.current !== null) {
+      window.clearTimeout(completionNotificationDismissTimerRef.current);
+      completionNotificationDismissTimerRef.current = null;
+    }
+
+    if (completionNotificationFired) {
+      setCompletionNotificationDismissing(false);
+    } else if (completionNotificationWasVisibleRef.current) {
+      setCompletionNotificationDismissing(true);
+      completionNotificationDismissTimerRef.current = window.setTimeout(() => {
+        setCompletionNotificationDismissing(false);
+        completionNotificationDismissTimerRef.current = null;
+      }, COMPLETION_NOTIFICATION_DISMISS_MS);
+    }
+
+    completionNotificationWasVisibleRef.current = completionNotificationFired;
+
+    return () => {
+      if (completionNotificationDismissTimerRef.current !== null) {
+        window.clearTimeout(completionNotificationDismissTimerRef.current);
+        completionNotificationDismissTimerRef.current = null;
+      }
+    };
+  }, [completionNotificationFired]);
 
   useEffect(() => {
     const rendersProcessBar = isVerticalMode && !isCollapsed && (verticalHasProcess || verticalIsAiBusy);
@@ -950,6 +1477,21 @@ const TabItem = memo(({
       onDoubleClick={onDoubleClick}
       onContextMenu={onContextMenu}
       onMouseEnter={() => {
+        const lock = isTabbarDragVisualLockActive();
+        if (isAnyDragging || lock) {
+          console.log(
+            `[TabDnd:bg] kind=tab phase=mouseenter tab=${shortDndId(tab.id)}` +
+            ` action=suppress lock=${lock ? 1 : 0}` +
+            ` anyDragging=${isAnyDragging ? 1 : 0}` +
+            ` hoveredBefore=${isHovered ? 1 : 0}`
+          );
+          onHoverChange?.(false);
+          return;
+        }
+        console.log(
+          `[TabDnd:bg] kind=tab phase=mouseenter tab=${shortDndId(tab.id)}` +
+          ` action=accept lock=0 anyDragging=0 hoveredBefore=${isHovered ? 1 : 0}`
+        );
         setIsHovered(true);
         if (onHoverChange && ref.current) {
           onHoverChange(true, ref.current.getBoundingClientRect());
@@ -970,7 +1512,11 @@ const TabItem = memo(({
     >
       {/* Collapsed: Bot icon only */}
       {isCollapsed ? (
-        <Bot size={14} style={{ color: getCollapsedIconColor(), flexShrink: 0 }} />
+        tab.tabType === 'file' ? (
+          <FileText size={14} style={{ color: getCollapsedIconColor(), flexShrink: 0 }} />
+        ) : (
+          <Bot size={14} style={{ color: getCollapsedIconColor(), flexShrink: 0 }} />
+        )
       ) : (
         <>
           {/* Vertical mode: thin process bar on the very left + status SVG marker
@@ -1007,59 +1553,6 @@ const TabItem = memo(({
                   {verticalIsAiBusy && <div className="tab-process-bar-ai-shimmer-overlay" />}
                 </div>
               )}
-              {canStopDevProcessFromBar && (
-                <Tooltip content={isStopping ? 'Stopping…' : 'Stop process (F7)'}>
-                <button
-                  type="button"
-                  data-no-tab-drag
-                  aria-label="Stop running dev process"
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                  }}
-                  onMouseEnter={() => setIsProcessStopHovered(true)}
-                  onMouseLeave={() => setIsProcessStopHovered(false)}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    if (!isStopping) onStop?.(tab.id);
-                  }}
-                  style={{
-                    position: 'absolute',
-                    top: 0,
-                    bottom: 0,
-                    ...(processBarPosition === 'right' ? { right: 0 } : { left: '-2px' }),
-                    width: processStopCmdHoverActive ? 18 : 14,
-                    padding: 0,
-                    border: 'none',
-                    outline: 'none',
-                    background: processStopCmdHoverActive
-                      ? 'rgba(248, 113, 113, 0.18)'
-                      : (processStopHoverActive ? 'rgba(255,255,255,0.08)' : 'transparent'),
-                    color: processStopCmdHoverActive ? '#f87171' : 'rgba(255,255,255,0.72)',
-                    cursor: isStopping ? 'wait' : 'pointer',
-                    zIndex: 8,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    borderRadius: processBarPosition === 'right'
-                      ? `0 ${tabGeo.borderRadius}px ${tabGeo.borderRadius}px 0`
-                      : `${tabGeo.borderRadius}px 0 0 ${tabGeo.borderRadius}px`,
-                    boxShadow: processStopCmdHoverActive
-                      ? 'inset 0 0 0 1px rgba(248, 113, 113, 0.55), 0 0 10px rgba(248, 113, 113, 0.22)'
-                      : (processStopHoverActive ? 'inset 0 0 0 1px rgba(255,255,255,0.14)' : 'none'),
-                    opacity: processStopHoverActive ? 1 : 0,
-                    transition: 'opacity 120ms ease, width 120ms ease, background-color 120ms ease, box-shadow 120ms ease, color 120ms ease',
-                  }}
-                >
-                  {isStopping ? (
-                    <RotateCw size={9} className="animate-spin" aria-hidden />
-                  ) : (
-                    <Square size={8} fill="currentColor" strokeWidth={1.8} aria-hidden />
-                  )}
-                </button>
-                </Tooltip>
-              )}
               {/* AI-busy loader = the process-bar shimmer STRIP (left/right edge,
                   rendered above). The whole-tab background pulse was removed —
                   the loader is the переливающаяся полоска у края, not a tint of
@@ -1077,6 +1570,26 @@ const TabItem = memo(({
                     right: '-2px',
                     pointerEvents: 'none',
                     zIndex: 1,
+                    borderRadius: tabGeo.borderRadius,
+                  }}
+                  aria-hidden
+                />
+              )}
+              {(completionNotificationFired || completionNotificationDismissing) && (
+                <div
+                  className={`tab-completion-notification-alert ${
+                    completionNotificationDismissing && !completionNotificationFired
+                      ? 'tab-completion-notification-alert--dismiss'
+                      : ''
+                  }`}
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    bottom: 0,
+                    left: '-2px',
+                    right: '-2px',
+                    pointerEvents: 'none',
+                    zIndex: 2,
                     borderRadius: tabGeo.borderRadius,
                   }}
                   aria-hidden
@@ -1108,8 +1621,8 @@ const TabItem = memo(({
                 />
               )}
               {/* В вертикальном режиме middle-click по всей вкладке = close tab (стандартное
-                  поведение TabItem root). Stop devServer живёт на edge-indicator:
-                  left-click по полоске процесса или F7 пока курсор на ней. */}
+                  поведение TabItem root). Stop devServer живёт в правой restart-кнопке:
+                  Cmd+hover показывает красный square, click отправляет stop без restart. */}
             </>
           )}
 
@@ -1219,6 +1732,7 @@ const TabItem = memo(({
               }}
             >
               {tab.tabType === 'browser' && <Globe size={12} className="flex-shrink-0 opacity-60" />}
+              {tab.tabType === 'file' && <FileText size={12} className="flex-shrink-0 text-[#a78bfa] opacity-90" />}
               {tab.aiClosing && (
                 <span
                   className="flex-shrink-0"
@@ -1246,19 +1760,31 @@ const TabItem = memo(({
                 занимает место notes-кнопки. Логика: зелёный таб обычно = npm run dev,
                 заметок там почти не пишут, зато перезапуск из меню вкладки нужен часто.
                 Mutex с notes: если рендерится restart — notes не рендерится. Кнопка
-                делегирует в onRestart (детерминистический stop+!! в одном IPC).
+                делегирует в onRestart (детерминистический stop+!! в одном IPC);
+                Cmd+hover превращает эту же кнопку в Stop (красный square, без
+                отдельной hit-zone на полоске процесса).
                 Пока stop в полёте — иконка крутится, click заблокирован. */}
-          {isVerticalMode && tab.color === 'green' && hasProcess && (
+          {canShowVerticalRestartButton && (
             <button
+              type="button"
               data-no-tab-drag
               onClick={(e) => {
                 e.stopPropagation();
                 if (isStopping) return;
-                onRestart?.(tab.id);
+                if (verticalRestartStopMode) {
+                  onStop?.(tab.id);
+                } else {
+                  onRestart?.(tab.id);
+                }
               }}
               onMouseDown={(e) => e.stopPropagation()}
               onDoubleClick={(e) => e.stopPropagation()}
-              title={isStopping ? 'Stopping…' : 'Restart process (kill descendants + ports, then re-run)'}
+              title={isStopping
+                ? 'Stopping…'
+                : (verticalRestartStopMode
+                  ? 'Stop process (Cmd+click)'
+                  : 'Restart process (kill descendants + ports, then re-run)')}
+              aria-label={verticalRestartStopMode ? 'Stop running dev process' : 'Restart process'}
               className="flex-shrink-0 inline-flex items-center justify-center transition-colors"
               style={{
                 width: 20,
@@ -1266,29 +1792,41 @@ const TabItem = memo(({
                 marginLeft: 6,
                 padding: 0,
                 borderRadius: 4,
-                backgroundColor: '#1e1e2e',
-                color: isStopping ? '#666' : '#86efac',
-                border: '1px solid rgba(34,197,94,0.25)',
+                backgroundColor: verticalRestartButtonBackground,
+                color: verticalRestartButtonColor,
+                border: verticalRestartButtonBorder,
                 cursor: isStopping ? 'wait' : 'pointer',
               }}
-              onMouseEnter={(e) => {
-                if (isStopping) return;
-                const el = e.currentTarget as HTMLButtonElement;
-                el.style.backgroundColor = 'rgba(34,197,94,0.18)';
-                el.style.color = '#bbf7d0';
+              onMouseEnter={() => {
+                const lock = isTabbarDragVisualLockActive();
+                if (isStopping || isAnyDragging || lock) {
+                  setIsRestartButtonHovered(false);
+                  console.log(
+                    `[TabDnd:bg] kind=tab-child phase=mouseenter child=restart tab=${shortDndId(tab.id)}` +
+                    ` action=suppress stopping=${isStopping ? 1 : 0}` +
+                    ` lock=${lock ? 1 : 0}` +
+                    ` anyDragging=${isAnyDragging ? 1 : 0}`
+                  );
+                  return;
+                }
+                console.log(
+                  `[TabDnd:bg] kind=tab-child phase=mouseenter child=restart tab=${shortDndId(tab.id)}` +
+                  ` action=accept lock=0 anyDragging=0`
+                );
+                setIsRestartButtonHovered(true);
               }}
-              onMouseLeave={(e) => {
-                if (isStopping) return;
-                const el = e.currentTarget as HTMLButtonElement;
-                el.style.backgroundColor = '#1e1e2e';
-                el.style.color = '#86efac';
-              }}
+              onMouseLeave={() => setIsRestartButtonHovered(false)}
             >
-              <RotateCw
-                size={11}
-                strokeWidth={2.2}
-                style={isStopping ? { animation: 'tab-dot-spin 0.8s linear infinite' } : undefined}
-              />
+              {verticalRestartStopMode ? (
+                <Square size={9} fill="currentColor" strokeWidth={1.9} aria-hidden />
+              ) : (
+                <RotateCw
+                  size={11}
+                  strokeWidth={2.2}
+                  style={isStopping ? { animation: 'tab-dot-spin 0.8s linear infinite' } : undefined}
+                  aria-hidden
+                />
+              )}
             </button>
           )}
 
@@ -1307,7 +1845,7 @@ const TabItem = memo(({
               static-кнопки в том же flex'е. См. fact-notes.md::Z-index над AI-pulse.
               Mutex: если этот же таб зелёный с активным процессом — место занимает Restart-кнопка
               выше, notes не рендерится. */}
-          {isVerticalMode && !(tab.color === 'green' && hasProcess) && (slideoutOpenHere || showNotesPeek || (isActive && !anySlideoutOpen && !cmdPeekMode)) && (() => {
+          {isVerticalMode && tab.tabType !== 'file' && !(tab.color === 'green' && hasProcess) && (slideoutOpenHere || showNotesPeek || (isActive && !anySlideoutOpen && !cmdPeekMode)) && (() => {
             const hasNotes = !!(tab.notes && tab.notes.trim().length > 0);
             const dim = !slideoutOpenHere && !hasNotes;
             const baseBg = slideoutOpenHere ? '#6366f1' : '#1e1e2e';
@@ -1346,7 +1884,20 @@ const TabItem = memo(({
                   border: baseBorder,
                 }}
                 onMouseEnter={(e) => {
-                  if (slideoutOpenHere) return; // solid state — no hover swap
+                  const lock = isTabbarDragVisualLockActive();
+                  if (slideoutOpenHere || isAnyDragging || lock) {
+                    console.log(
+                      `[TabDnd:bg] kind=tab-child phase=mouseenter child=notes tab=${shortDndId(tab.id)}` +
+                      ` action=suppress slideoutOpen=${slideoutOpenHere ? 1 : 0}` +
+                      ` lock=${lock ? 1 : 0}` +
+                      ` anyDragging=${isAnyDragging ? 1 : 0}`
+                    );
+                    return;
+                  } // solid state — no hover swap
+                  console.log(
+                    `[TabDnd:bg] kind=tab-child phase=mouseenter child=notes tab=${shortDndId(tab.id)}` +
+                    ` action=accept lock=0 anyDragging=0`
+                  );
                   const el = e.currentTarget as HTMLButtonElement;
                   el.style.backgroundColor = '#2a2a3e';
                   el.style.color = dim ? '#a5b4fc' : '#c7d2fe';
@@ -1409,7 +1960,7 @@ const ZoneDropTarget = memo(({
   );
 });
 
-const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, onEditChange, onEditSubmit, onEditKeyDown, inputRef, onStartRename, onContextMenu, onAuxClick, onToggleCollapsed, onFocusGroup, isFocused }: {
+const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, onEditChange, onEditSubmit, onEditKeyDown, inputRef, onStartRename, onContextMenu, onAuxClick, onToggleCollapsed, onFocusGroup, isFocused, isAnyDragging }: {
   group: TabGroup;
   count: number;
   projectId: string;
@@ -1425,6 +1976,7 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
   onToggleCollapsed: () => void;
   onFocusGroup: () => void;
   isFocused: boolean;
+  isAnyDragging?: boolean;
 }) => {
   const ref = useRef<HTMLDivElement>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -1460,6 +2012,12 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
   useEffect(() => () => {
     if (clickTimerRef.current !== null) window.clearTimeout(clickTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    if (!isAnyDragging) return;
+    if (isHovered) setIsHovered(false);
+    if (isIconHovered) setIsIconHovered(false);
+  }, [isAnyDragging, isHovered, isIconHovered]);
 
   useEffect(() => {
     if (!isPressing) return;
@@ -1519,10 +2077,18 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
       }),
       dropTargetForElements({
         element,
-        getData: ({ input, element }) => attachClosestEdge(
-          { type: 'GROUP', groupId: group.id },
-          { element, input, allowedEdges: ['top', 'bottom'] }
-        ),
+        getData: ({ input, element }) => {
+          const data = attachClosestEdge(
+            { type: 'GROUP', groupId: group.id },
+            { element, input, allowedEdges: ['top', 'bottom'] }
+          );
+          return attachListInstruction(data, {
+            element,
+            input,
+            axis: 'vertical',
+            operations: GROUP_CONTAINER_OPERATIONS,
+          });
+        },
         canDrop: ({ source }) => source.data.type === 'TAB' || source.data.type === 'TAB_GROUP',
       })
     );
@@ -1530,8 +2096,10 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
 
   const dragLiftActive = isPressing || isDragging;
   const isCollapsed = !!group.collapsed;
-  const iconAccentActive = isHovered || isIconHovered || isCollapsed || isFocused;
+  const effectiveHovered = isHovered && !isAnyDragging;
+  const iconAccentActive = effectiveHovered || isIconHovered || isCollapsed || isFocused;
   const headerCursor = dragLiftActive ? 'grabbing' : 'pointer';
+  const shouldFlattenDragBackground = true;
   const groupColor = group.color && group.color !== 'default' ? group.color : undefined;
   const groupColorConfig = TAB_COLORS.find(c => c.color === groupColor);
   const folderColor = groupColorConfig?.borderColor || '#8b5cf6';
@@ -1539,18 +2107,176 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
     ? sessionStatuses.find((s) => s.id === group.sessionStatus)
     : null;
   const groupBackground = (() => {
-    if (dragLiftActive) {
-      return groupColorConfig ? adjustRgbaAlpha(groupColorConfig.bgColor, 0.10) : 'rgba(139,92,246,0.16)';
-    }
     if (groupColorConfig) {
-      return adjustRgbaAlpha(groupColorConfig.bgColor, isHovered || isFocused ? 0.10 : (isCollapsed ? 0.04 : -0.06));
+      return adjustRgbaAlpha(groupColorConfig.bgColor, effectiveHovered || isFocused ? 0.10 : (isCollapsed ? 0.04 : -0.06));
     }
-    if (isCollapsed || isFocused) return isHovered ? 'rgba(139,92,246,0.17)' : 'rgba(139,92,246,0.11)';
-    return isHovered ? 'rgba(255,255,255,0.07)' : 'rgba(255,255,255,0.035)';
+    if (isCollapsed || isFocused) return effectiveHovered ? 'rgba(139,92,246,0.17)' : 'rgba(139,92,246,0.11)';
+    return effectiveHovered ? 'rgba(255,255,255,0.07)' : 'rgba(255,255,255,0.035)';
   })();
-  const groupBorder = dragLiftActive
-    ? (groupColorConfig?.borderColor || 'rgba(139,92,246,0.58)')
-    : (groupColorConfig?.borderColor || (isCollapsed || isFocused ? 'rgba(139,92,246,0.42)' : 'rgba(255,255,255,0.08)'));
+  const groupDisplayBackground = shouldFlattenDragBackground
+    ? flattenRgbaOnTabbarPanel(groupBackground)
+    : groupBackground;
+  const groupBorder = groupColorConfig?.borderColor || (isCollapsed || isFocused ? 'rgba(139,92,246,0.42)' : 'rgba(255,255,255,0.08)');
+  const bgDiagRenderRef = useRef<string>('');
+  const bgDiagComputedRef = useRef<string>('');
+  const bgDiagFrameRef = useRef<number | null>(null);
+
+  useLayoutEffect(() => {
+    const lock = isTabbarDragVisualLockActive();
+    const activeDiag = lock || isAnyDragging || isPressing || isDragging;
+
+    if (!activeDiag) {
+      bgDiagRenderRef.current = '';
+      bgDiagComputedRef.current = '';
+      if (bgDiagFrameRef.current !== null) {
+        window.cancelAnimationFrame(bgDiagFrameRef.current);
+        bgDiagFrameRef.current = null;
+      }
+      return;
+    }
+
+    const renderSig = [
+      groupDisplayBackground,
+      groupBackground,
+      shouldFlattenDragBackground ? 1 : 0,
+      groupBorder,
+      isHovered ? 1 : 0,
+      effectiveHovered ? 1 : 0,
+      isIconHovered ? 1 : 0,
+      isCollapsed ? 1 : 0,
+      isFocused ? 1 : 0,
+      isDragging ? 1 : 0,
+      isPressing ? 1 : 0,
+      dragLiftActive ? 1 : 0,
+      lock ? 1 : 0,
+      isAnyDragging ? 1 : 0,
+    ].join('|');
+
+    if (bgDiagRenderRef.current !== renderSig) {
+      bgDiagRenderRef.current = renderSig;
+      console.log(
+        `[TabDnd:bg] kind=group phase=render group=${shortDndId(group.id)}` +
+        ` name=${JSON.stringify(group.name || '')}` +
+        ` inlineBg=${groupDisplayBackground}` +
+        ` rawBg=${groupBackground}` +
+        ` opaqueBg=${shouldFlattenDragBackground ? 1 : 0}` +
+        ` border=${groupBorder}` +
+        ` hovered=${isHovered ? 1 : 0}` +
+        ` effectiveHovered=${effectiveHovered ? 1 : 0}` +
+        ` iconHovered=${isIconHovered ? 1 : 0}` +
+        ` collapsed=${isCollapsed ? 1 : 0}` +
+        ` focused=${isFocused ? 1 : 0}` +
+        ` dragging=${isDragging ? 1 : 0}` +
+        ` pressing=${isPressing ? 1 : 0}` +
+        ` lift=${dragLiftActive ? 1 : 0}` +
+        ` lock=${lock ? 1 : 0}` +
+        ` anyDragging=${isAnyDragging ? 1 : 0}`
+      );
+    }
+
+    const element = ref.current;
+    if (!element) return;
+    if (bgDiagFrameRef.current !== null) {
+      window.cancelAnimationFrame(bgDiagFrameRef.current);
+    }
+    bgDiagFrameRef.current = window.requestAnimationFrame(() => {
+      bgDiagFrameRef.current = null;
+      const styles = window.getComputedStyle(element);
+      const computedSig = [
+        styles.backgroundColor,
+        styles.transitionProperty,
+        styles.transitionDuration,
+        styles.transitionTimingFunction,
+      ].join('|');
+      if (bgDiagComputedRef.current === computedSig) return;
+      bgDiagComputedRef.current = computedSig;
+      console.log(
+        `[TabDnd:bg] kind=group phase=computed group=${shortDndId(group.id)}` +
+        ` computedBg=${styles.backgroundColor}` +
+        ` transitionProperty=${JSON.stringify(styles.transitionProperty)}` +
+        ` transitionDuration=${JSON.stringify(styles.transitionDuration)}` +
+        ` transitionTiming=${JSON.stringify(styles.transitionTimingFunction)}` +
+        ` inlineBg=${groupDisplayBackground}` +
+        ` rawBg=${groupBackground}` +
+        ` opaqueBg=${shouldFlattenDragBackground ? 1 : 0}` +
+        ` lock=${isTabbarDragVisualLockActive() ? 1 : 0}` +
+        ` anyDragging=${isAnyDragging ? 1 : 0}`
+      );
+    });
+
+    return () => {
+      if (bgDiagFrameRef.current !== null) {
+        window.cancelAnimationFrame(bgDiagFrameRef.current);
+        bgDiagFrameRef.current = null;
+      }
+    };
+  }, [
+    dragLiftActive,
+    effectiveHovered,
+    group.id,
+    group.name,
+    groupBackground,
+    groupDisplayBackground,
+    groupBorder,
+    isAnyDragging,
+    isCollapsed,
+    isDragging,
+    isFocused,
+    isHovered,
+    isIconHovered,
+    isPressing,
+    shouldFlattenDragBackground,
+  ]);
+
+  useEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+
+    const onBgTransition = (event: TransitionEvent) => {
+      if (event.target !== element) return;
+      if (!event.propertyName.includes('background')) return;
+      const lock = isTabbarDragVisualLockActive();
+      const activeDiag = lock || isAnyDragging || isPressing || isDragging;
+      if (!activeDiag) return;
+      const styles = window.getComputedStyle(element);
+      console.log(
+        `[TabDnd:bg] kind=group phase=${event.type} group=${shortDndId(group.id)}` +
+        ` prop=${event.propertyName}` +
+        ` elapsed=${event.elapsedTime}` +
+        ` inlineBg=${groupDisplayBackground}` +
+        ` rawBg=${groupBackground}` +
+        ` opaqueBg=${shouldFlattenDragBackground ? 1 : 0}` +
+        ` computedBg=${styles.backgroundColor}` +
+        ` transitionProperty=${JSON.stringify(styles.transitionProperty)}` +
+        ` transitionDuration=${JSON.stringify(styles.transitionDuration)}` +
+        ` hovered=${isHovered ? 1 : 0}` +
+        ` effectiveHovered=${effectiveHovered ? 1 : 0}` +
+        ` iconHovered=${isIconHovered ? 1 : 0}` +
+        ` dragging=${isDragging ? 1 : 0}` +
+        ` pressing=${isPressing ? 1 : 0}` +
+        ` lock=${lock ? 1 : 0}` +
+        ` anyDragging=${isAnyDragging ? 1 : 0}`
+      );
+    };
+
+    element.addEventListener('transitionrun', onBgTransition);
+    element.addEventListener('transitionstart', onBgTransition);
+    return () => {
+      element.removeEventListener('transitionrun', onBgTransition);
+      element.removeEventListener('transitionstart', onBgTransition);
+    };
+  }, [
+    effectiveHovered,
+    group.id,
+    groupBackground,
+    groupDisplayBackground,
+    isAnyDragging,
+    isDragging,
+    isHovered,
+    isIconHovered,
+    isPressing,
+    shouldFlattenDragBackground,
+  ]);
 
   return (
     <div
@@ -1569,16 +2295,18 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
         fontSize: `${tabsFontSize}px`,
         cursor: headerCursor,
         userSelect: 'none',
-        color: (isHovered || dragLiftActive || isCollapsed || isFocused) ? '#e5e7eb' : '#a1a1aa',
-        backgroundColor: groupBackground,
+        color: (effectiveHovered || isCollapsed || isFocused) ? '#e5e7eb' : '#a1a1aa',
+        backgroundColor: groupDisplayBackground,
         border: `1px solid ${groupBorder}`,
-        opacity: isDragging ? 0.96 : 1,
-        transform: dragLiftActive ? 'scale(1.015)' : undefined,
+        opacity: 1,
+        transform: undefined,
         transformOrigin: 'center',
-        boxShadow: dragLiftActive
-          ? '0 0 0 1px rgba(139,92,246,0.32), 0 6px 18px rgba(0,0,0,0.28)'
-          : (isCollapsed || isFocused ? 'inset 0 0 0 1px rgba(139,92,246,0.10)' : 'none'),
-        transition: 'background-color 0.12s, color 0.12s, opacity 0.12s, transform 90ms ease, box-shadow 90ms ease, border-color 90ms ease',
+        outline: dragLiftActive ? '1px solid rgba(139,92,246,0.78)' : undefined,
+        outlineOffset: dragLiftActive ? '-1px' : undefined,
+        boxShadow: isCollapsed || isFocused ? 'inset 0 0 0 1px rgba(139,92,246,0.10)' : 'none',
+        transition: isAnyDragging
+          ? 'transform 90ms ease, box-shadow 90ms ease, border-color 90ms ease'
+          : 'background-color 0.12s, color 0.12s, opacity 0.12s, transform 90ms ease, box-shadow 90ms ease, border-color 90ms ease',
       }}
       onMouseDown={(e) => {
         if (isEditing) return;
@@ -1594,6 +2322,11 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
         e.stopPropagation();
         onFocusGroup();
         if ((e.target as HTMLElement).closest('[data-group-collapse-button]')) return;
+        const titleTarget = !!(e.target as HTMLElement).closest('[data-group-title-text]');
+        if (!titleTarget) {
+          onToggleCollapsed();
+          return;
+        }
         if (clickTimerRef.current !== null) window.clearTimeout(clickTimerRef.current);
         clickTimerRef.current = window.setTimeout(() => {
           clickTimerRef.current = null;
@@ -1608,14 +2341,31 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
           clickTimerRef.current = null;
         }
         if ((e.target as HTMLElement).closest('[data-group-collapse-button]')) return;
+        if (!(e.target as HTMLElement).closest('[data-group-title-text]')) return;
         onFocusGroup();
         onStartRename();
       }}
       onContextMenu={onContextMenu}
       onAuxClick={onAuxClick}
-      onMouseEnter={() => setIsHovered(true)}
+      onMouseEnter={() => {
+        const lock = isTabbarDragVisualLockActive();
+        if (isAnyDragging || lock) {
+          console.log(
+            `[TabDnd:bg] kind=group phase=mouseenter group=${shortDndId(group.id)}` +
+            ` action=suppress lock=${lock ? 1 : 0}` +
+            ` anyDragging=${isAnyDragging ? 1 : 0}` +
+            ` hoveredBefore=${isHovered ? 1 : 0}`
+          );
+          return;
+        }
+        console.log(
+          `[TabDnd:bg] kind=group phase=mouseenter group=${shortDndId(group.id)}` +
+          ` action=accept lock=0 anyDragging=0 hoveredBefore=${isHovered ? 1 : 0}`
+        );
+        setIsHovered(true);
+      }}
       onMouseLeave={() => setIsHovered(false)}
-      title={isEditing ? 'Rename group' : 'Click to collapse / expand. Double-click to rename.'}
+      title={isEditing ? 'Rename group' : 'Click empty row area to collapse / expand. Double-click group name to rename.'}
     >
       {statusMeta && (
         <span
@@ -1659,7 +2409,23 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
           e.stopPropagation();
           onContextMenu(e);
         }}
-        onMouseEnter={() => setIsIconHovered(true)}
+        onMouseEnter={() => {
+          const lock = isTabbarDragVisualLockActive();
+          if (isAnyDragging || lock) {
+            console.log(
+              `[TabDnd:bg] kind=group-icon phase=mouseenter group=${shortDndId(group.id)}` +
+              ` action=suppress lock=${lock ? 1 : 0}` +
+              ` anyDragging=${isAnyDragging ? 1 : 0}` +
+              ` iconHoveredBefore=${isIconHovered ? 1 : 0}`
+            );
+            return;
+          }
+          console.log(
+            `[TabDnd:bg] kind=group-icon phase=mouseenter group=${shortDndId(group.id)}` +
+            ` action=accept lock=0 anyDragging=0 iconHoveredBefore=${isIconHovered ? 1 : 0}`
+          );
+          setIsIconHovered(true);
+        }}
         onMouseLeave={() => setIsIconHovered(false)}
         style={{
           position: 'relative',
@@ -1717,8 +2483,19 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
           onDoubleClick={(e) => e.stopPropagation()}
         />
       ) : (
-        <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'inherit' }}>
-          {group.name}
+        <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', whiteSpace: 'nowrap', fontSize: 'inherit' }}>
+          <span
+            data-group-title-text
+            style={{
+              display: 'inline-block',
+              maxWidth: '100%',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              verticalAlign: 'bottom',
+            }}
+          >
+            {group.name}
+          </span>
         </span>
       )}
       <span style={{ color: '#71717a', fontSize: Math.max(10, tabsFontSize - 2), flexShrink: 0 }}>{count}</span>
@@ -2030,6 +2807,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const deleteTabGroup = useWorkspaceStore((state) => state.deleteTabGroup);
   const setTabColor = useWorkspaceStore((state) => state.setTabColor);
   const setTabSessionStatus = useWorkspaceStore((state) => state.setTabSessionStatus);
+  const setTabCompletionNotificationArmed = useWorkspaceStore((state) => state.setTabCompletionNotificationArmed);
+  const setTabCompletionNotificationPersistent = useWorkspaceStore((state) => state.setTabCompletionNotificationPersistent);
   const toggleTabUtility = useWorkspaceStore((state) => state.toggleTabUtility);
   const reorderInZone = useWorkspaceStore((state) => state.reorderInZone);
   const moveTabToZone = useWorkspaceStore((state) => state.moveTabToZone);
@@ -2075,9 +2854,13 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const [dragPreview, setDragPreview] = useState<DragPreviewLayout | null>(null);
   const dragPreviewKeyRef = useRef<string>('');
   const verticalDragGeometryRef = useRef<VerticalDragGeometry | null>(null);
+  const verticalDragAnchorRef = useRef<VerticalDragAnchor | null>(null);
+  const verticalDragGeometrySeqRef = useRef(0);
+  const verticalDragResolveTraceRef = useRef<string | null>(null);
   const verticalMainListRef = useRef<HTMLDivElement>(null);
   const verticalRowFlipRectsRef = useRef<Map<string, VerticalRowFlipRect>>(new Map());
   const verticalRowAnimationsRef = useRef<Map<string, Animation>>(new Map());
+  const groupCollapseFlipSuppressUntilRef = useRef(0);
   const tabDndLogUntilRef = useRef(0);
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
   const [titleRefreshInFlight, setTitleRefreshInFlight] = useState<Set<string>>(new Set());
@@ -2154,7 +2937,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         busyAiTabs.push({ id, name: tab.name || 'AI' });
         continue;
       }
-      if (tab.tabType === 'claude-sdk') continue;
+      if (tab.tabType === 'claude-sdk' || tab.tabType === 'file') continue;
 
       const state = await ipcRenderer.invoke('terminal:getCommandState', id);
       if (!state?.isRunning) continue;
@@ -2431,11 +3214,22 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     syncStatus();
   }, [workspace?.tabs.size]); // Sync new tabs, but never clobber existing state
 
-  const captureVerticalDragGeometry = useCallback((): VerticalDragGeometry | null => {
+  const captureVerticalDragGeometry = useCallback((reason = 'manual'): VerticalDragGeometry | null => {
     if (!isVerticalLayout) return null;
     const scroller = scrollContainerRef.current;
     const list = scroller?.querySelector<HTMLElement>('[data-vertical-main-list]');
     if (!scroller || !list) return null;
+
+    const currentWorkspace = useWorkspaceStore.getState().openProjects.get(projectId);
+    const memberIdsByGroup = new Map<string, string[]>();
+    if (currentWorkspace) {
+      for (const tab of currentWorkspace.tabs.values()) {
+        if (tab.parentTabId || tab.isUtility || !tab.groupId) continue;
+        const members = memberIdsByGroup.get(tab.groupId) || [];
+        members.push(tab.id);
+        memberIdsByGroup.set(tab.groupId, members);
+      }
+    }
 
     const rows: VerticalDragGeometry['rows'] = [];
     for (const rowEl of Array.from(list.querySelectorAll<HTMLElement>(':scope > [data-vertical-row]'))) {
@@ -2453,6 +3247,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         const header = rowEl.querySelector<HTMLElement>('[data-tab-group-header]');
         if (!groupId || !header) continue;
         const isCollapsed = rowEl.dataset.groupCollapsed === 'true';
+        const memberIds = memberIdsByGroup.get(groupId) || [];
         const tabRows = isCollapsed
           ? []
           : Array.from(rowEl.querySelectorAll<HTMLElement>('[data-tab-group-body] [data-tab-item]'))
@@ -2461,11 +3256,17 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               return tabId ? { tabId, rect: snapRect(el) } : null;
             })
             .filter((row): row is { tabId: string; rect: RectSnap } => !!row);
-        rows.push({ type: 'group', groupId, rect: snapRect(rowEl), header: snapRect(header), tabRows });
+        rows.push({ type: 'group', groupId, rect: snapRect(rowEl), header: snapRect(header), collapsed: isCollapsed, memberIds, tabRows });
       }
     }
 
-    const geometry = { list: snapRect(scroller), rows };
+    const geometry = {
+      id: ++verticalDragGeometrySeqRef.current,
+      reason,
+      capturedAtMs: performance.now(),
+      list: snapRect(scroller),
+      rows
+    };
     console.log(`[TabDnd:capture] project=${shortDndId(projectId)} ${summarizeVerticalGeometry(geometry)}`);
     return geometry;
   }, [isVerticalLayout, projectId]);
@@ -2474,25 +3275,36 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const isAdoptDropTarget = useCallback((_sourceData: DragData, _targetData: any): boolean => false, []);
 
   const resolveStaticVerticalPreview = useCallback((sourceData: DragData, clientX: number, clientY: number, targetData?: any): DragPreviewLayout | null => {
-    if (!isVerticalLayout) return null;
-    if (sourceData.projectId && sourceData.projectId !== projectId) return null;
-    if (sourceData.zone !== 'main') return null;
-    if (isAdoptDropTarget(sourceData, targetData)) return null;
+    const resolveStartedAt = performance.now();
+    const rejectResolve = (reason: string) => {
+      verticalDragResolveTraceRef.current =
+        `resolve reject=${reason} durMs=${(performance.now() - resolveStartedAt).toFixed(1)}`;
+      return null;
+    };
+
+    if (!isVerticalLayout) return rejectResolve('not-vertical');
+    if (sourceData.projectId && sourceData.projectId !== projectId) return rejectResolve('foreign-project');
+    if (sourceData.zone !== 'main') return rejectResolve('non-main-zone');
+    if (isAdoptDropTarget(sourceData, targetData)) return rejectResolve('adopt-target');
 
     let geometry = verticalDragGeometryRef.current;
+    let recapturedGeometry = false;
     if (!geometry) {
-      geometry = captureVerticalDragGeometry();
+      recapturedGeometry = true;
+      geometry = captureVerticalDragGeometry('resolve-fallback');
       verticalDragGeometryRef.current = geometry;
     }
-    if (!geometry) return null;
+    if (!geometry) return rejectResolve('no-geometry');
 
     const list = geometry.list;
     if (clientX < list.left - 28 || clientX > list.right + 28 || clientY < list.top - 80 || clientY > list.bottom + 80) {
-      return null;
+      return rejectResolve('outside-list-bounds');
     }
+    const lastGeometryRow = geometry.rows[geometry.rows.length - 1];
+    const isEffectiveEmptyZone = targetData?.type === 'EMPTY_ZONE' && (!lastGeometryRow || clientY >= lastGeometryRow.rect.bottom);
 
     const currentWorkspace = useWorkspaceStore.getState().openProjects.get(projectId);
-    if (!currentWorkspace) return null;
+    if (!currentWorkspace) return rejectResolve('no-workspace');
     const baseTabs = orderTabsWithVisualChildren(
       Array.from(currentWorkspace.tabs.values()).filter(tab => !tab.parentTabId && !tab.isUtility)
     );
@@ -2523,7 +3335,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     })();
     const isEmptyGroupDrag = sourceData.type === 'TAB_GROUP' && sourceIds.length === 0
       && currentGroups.some(group => group.id === sourceData.groupId);
-    if (sourceIds.length === 0 && !isEmptyGroupDrag) return null;
+    if (sourceIds.length === 0 && !isEmptyGroupDrag) return rejectResolve('no-source-ids');
 
     const sourceSet = new Set(sourceIds);
     const withoutSource = baseOrder.filter(id => !sourceSet.has(id));
@@ -2579,6 +3391,18 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       visualParentAssignments,
       groupAnchorAssignments,
     });
+    const finish = (preview: DragPreviewLayout | null, branch: string, detail = '') => {
+      verticalDragResolveTraceRef.current = [
+        `resolve gid=${geometry!.id}`,
+        `recaptured=${recapturedGeometry ? 1 : 0}`,
+        `branch=${branch}`,
+        detail,
+        `source=${sourceIds.map(shortDndId).join('.') || '-'}`,
+        `without=${withoutSource.map(shortDndId).join('.') || '-'}`,
+        `durMs=${(performance.now() - resolveStartedAt).toFixed(1)}`
+      ].filter(Boolean).join(' ');
+      return preview;
+    };
     const insertAt = (order: string[], ids: string[], index: number) => {
       const next = [...order];
       next.splice(Math.max(0, Math.min(index, next.length)), 0, ...ids);
@@ -2591,16 +3415,25 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         if (row.type === 'tab') {
           if (withoutSource.includes(row.tabId)) index += 1;
         } else {
-          index += row.tabRows.filter(tabRow => withoutSource.includes(tabRow.tabId)).length;
+          index += row.memberIds.filter(tabId => withoutSource.includes(tabId)).length;
         }
       }
       return index;
     };
+    const staticReorderInstructionForRow = (row: VerticalDragGeometry['rows'][number]) =>
+      getStaticListInstruction(row.rect, clientX, clientY, REORDER_ONLY_OPERATIONS);
+    const staticReorderInstructionForTab = (rect: RectSnap) =>
+      getStaticListInstruction(rect, clientX, clientY, REORDER_ONLY_OPERATIONS);
+    const staticGroupHeaderInstruction = (rect: RectSnap) =>
+      getStaticListInstruction(rect, clientX, clientY, GROUP_CONTAINER_OPERATIONS);
+    const isInstructionBefore = (instruction: ListInstruction | null) =>
+      instruction?.operation !== 'reorder-after';
     const flatIndexFromY = () => {
       let flatIndex = geometry!.rows.length;
       for (let i = 0; i < geometry!.rows.length; i += 1) {
         const row = geometry!.rows[i];
-        if (clientY < row.rect.midY) {
+        const instruction = staticReorderInstructionForRow(row);
+        if (instruction?.operation === 'reorder-before') {
           flatIndex = i;
           break;
         }
@@ -2631,55 +3464,97 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       if (beforeId) return withoutSource.indexOf(beforeId);
       return withoutSource.indexOf(members[members.length - 1]) + 1;
     };
-    const assignEmptyGroupAnchor = (anchorTabId: string | null) => {
+    const assignEmptyGroupAnchor = (anchorTabId: string | null, branch = 'empty-group-anchor', detail = '') => {
       if (sourceData.type !== 'TAB_GROUP') return null;
       groupAnchorAssignments[sourceData.groupId] = anchorTabId;
-      return makePreview(baseOrder);
+      return finish(
+        makePreview(baseOrder),
+        branch,
+        `anchor=${shortDndId(anchorTabId)} ${detail}`.trim()
+      );
     };
 
     if (isEmptyGroupDrag) {
-      if (targetData?.type === 'EMPTY_ZONE') {
-        return assignEmptyGroupAnchor(null);
+      if (isEffectiveEmptyZone) {
+        return assignEmptyGroupAnchor(null, 'empty-group:empty-zone');
       }
       for (let rowIndex = 0; rowIndex < geometry.rows.length; rowIndex += 1) {
         const row = geometry.rows[rowIndex];
         if (clientY < row.rect.top || clientY > row.rect.bottom) continue;
-        const before = clientY < row.rect.midY;
-        return assignEmptyGroupAnchor(anchorBeforeRow(before ? rowIndex : rowIndex + 1));
+        const instruction = staticReorderInstructionForRow(row);
+        const before = isInstructionBefore(instruction);
+        const anchorTabId = anchorBeforeRow(before ? rowIndex : rowIndex + 1);
+        return assignEmptyGroupAnchor(
+          anchorTabId,
+          'empty-group:row',
+          `row=${rowIndex}:${verticalRowDebugKey(row)} before=${before ? 1 : 0} staticInstr=${summarizeListInstruction(instruction)}`
+        );
       }
-      return assignEmptyGroupAnchor(anchorBeforeRow(flatIndexFromY()));
+      const flatIndex = flatIndexFromY();
+      return assignEmptyGroupAnchor(
+        anchorBeforeRow(flatIndex),
+        'empty-group:flat-index',
+        `flatIndex=${flatIndex}`
+      );
     }
 
     if (sourceData.type === 'TAB_GROUP') {
-      if (targetData?.type === 'EMPTY_ZONE') {
-        return makePreview(insertAt(withoutSource, sourceIds, withoutSource.length));
+      if (isEffectiveEmptyZone) {
+        return finish(
+          makePreview(insertAt(withoutSource, sourceIds, withoutSource.length)),
+          'group:empty-zone',
+          `insert=${withoutSource.length}`
+        );
       }
-      const targetIndex = indexAtFlatPosition(flatIndexFromY());
-      return makePreview(insertAt(withoutSource, sourceIds, targetIndex));
+      const flatIndex = flatIndexFromY();
+      const targetIndex = indexAtFlatPosition(flatIndex);
+      return finish(
+        makePreview(insertAt(withoutSource, sourceIds, targetIndex)),
+        'group:flat',
+        `flatIndex=${flatIndex} insert=${targetIndex}`
+      );
     }
 
-    const assignFlat = (flatIndex: number) => {
+    const assignFlat = (flatIndex: number, branch = 'flat', detail = '') => {
       for (const id of sourceIds) groupAssignments[id] = null;
       clearSelectedVisualParents();
-      return makePreview(insertAt(withoutSource, sourceIds, indexAtFlatPosition(flatIndex)));
+      const insertIndex = indexAtFlatPosition(flatIndex);
+      return finish(
+        makePreview(insertAt(withoutSource, sourceIds, insertIndex)),
+        branch,
+        `flatIndex=${flatIndex} insert=${insertIndex} ${detail}`.trim()
+      );
     };
-    const assignFlatEnd = () => {
+    const assignFlatEnd = (branch = 'flat-end', detail = '') => {
       for (const id of sourceIds) groupAssignments[id] = null;
       clearSelectedVisualParents();
-      return makePreview(insertAt(withoutSource, sourceIds, withoutSource.length));
+      return finish(
+        makePreview(insertAt(withoutSource, sourceIds, withoutSource.length)),
+        branch,
+        `insert=${withoutSource.length} ${detail}`.trim()
+      );
     };
-    const assignGroup = (groupId: string, memberIndex: number, rowIndex: number) => {
+    const assignGroup = (groupId: string, memberIndex: number, rowIndex: number, branch = 'group-body', detail = '') => {
       for (const id of sourceIds) groupAssignments[id] = groupId;
       clearSelectedVisualParents();
-      return makePreview(insertAt(withoutSource, sourceIds, indexInGroup(groupId, memberIndex, rowIndex)));
+      const insertIndex = indexInGroup(groupId, memberIndex, rowIndex);
+      return finish(
+        makePreview(insertAt(withoutSource, sourceIds, insertIndex)),
+        branch,
+        `group=${shortDndId(groupId)} memberIndex=${memberIndex} rowIndex=${rowIndex} insert=${insertIndex} ${detail}`.trim()
+      );
     };
-    const assignVisualParent = (parentId: string, targetIndex: number) => {
+    const assignVisualParent = (parentId: string, targetIndex: number, branch = 'visual-parent', detail = '') => {
       const parent = tabById.get(parentId);
       for (const id of sourceIds) groupAssignments[id] = parent?.groupId || null;
       for (const id of selectedRootIds) visualParentAssignments[id] = parentId;
-      return makePreview(insertAt(withoutSource, sourceIds, targetIndex));
+      return finish(
+        makePreview(insertAt(withoutSource, sourceIds, targetIndex)),
+        branch,
+        `parent=${shortDndId(parentId)} insert=${targetIndex} ${detail}`.trim()
+      );
     };
-    const assignParentAfterOwnChild = (childId: string) => {
+    const assignParentAfterOwnChild = (childId: string, detail = '') => {
       if (sourceData.type !== 'TAB') return null;
       const sourceId = sourceData.id;
       const child = tabById.get(childId);
@@ -2696,28 +3571,33 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           visualParentAssignments[id] = null;
         }
       }
-      return makePreview(insertAt(withoutParentOnly, [sourceId], childIndex + 1));
+      return finish(
+        makePreview(insertAt(withoutParentOnly, [sourceId], childIndex + 1)),
+        'parent-after-own-child',
+        `child=${shortDndId(childId)} insert=${childIndex + 1} ${detail}`.trim()
+      );
     };
 
-    if (targetData?.type === 'EMPTY_ZONE') {
+    if (isEffectiveEmptyZone) {
       const lastRow = geometry.rows[geometry.rows.length - 1];
       if (lastRow?.type === 'group' && lastRow.tabRows.length > 0 && lastRow.tabRows.every(tabRow => sourceSet.has(tabRow.tabId))) {
-        return assignGroup(lastRow.groupId, 0, geometry.rows.length - 1);
+        return assignGroup(lastRow.groupId, 0, geometry.rows.length - 1, 'empty-zone:last-source-group');
       }
-      return assignFlatEnd();
+      return assignFlatEnd('empty-zone:flat-end');
     }
 
     for (let rowIndex = 0; rowIndex < geometry.rows.length; rowIndex += 1) {
       const row = geometry.rows[rowIndex];
       if (row.type !== 'group') continue;
       if (clientY >= row.header.top && clientY <= row.header.bottom) {
-        return clientY < row.header.midY
-          ? assignFlat(rowIndex)
-          : assignGroup(row.groupId, 0, rowIndex);
+        const instruction = staticGroupHeaderInstruction(row.header);
+        return instruction?.operation === 'reorder-before'
+          ? assignFlat(rowIndex, 'group-header:before', `row=${rowIndex}:${verticalRowDebugKey(row)} staticInstr=${summarizeListInstruction(instruction)}`)
+          : assignGroup(row.groupId, 0, rowIndex, 'group-header:inside-start', `row=${rowIndex}:${verticalRowDebugKey(row)} staticInstr=${summarizeListInstruction(instruction)}`);
       }
       if (row.tabRows.length === 0) {
         if (clientY > row.header.bottom && clientY <= row.rect.bottom) {
-          return assignGroup(row.groupId, 0, rowIndex);
+          return assignGroup(row.groupId, 0, rowIndex, 'empty-group-body', `row=${rowIndex}:${verticalRowDebugKey(row)}`);
         }
         continue;
       }
@@ -2728,63 +3608,104 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       let targetMemberIndex = 0;
       for (const tabRow of row.tabRows) {
         if (clientY >= tabRow.rect.top && clientY <= tabRow.rect.bottom) {
-          const before = clientY < tabRow.rect.midY;
+          const instruction = staticReorderInstructionForTab(tabRow.rect);
+          const before = isInstructionBefore(instruction);
           if (sourceSet.has(tabRow.tabId)) {
-            const parentAfterChildPreview = !before ? assignParentAfterOwnChild(tabRow.tabId) : null;
+            const parentAfterChildPreview = !before
+              ? assignParentAfterOwnChild(tabRow.tabId, `groupRow=${rowIndex}:${shortDndId(row.groupId)} before=${before ? 1 : 0} staticInstr=${summarizeListInstruction(instruction)}`)
+              : null;
             if (parentAfterChildPreview) return parentAfterChildPreview;
             continue;
           }
           const visualDrop = visualDropForTab(tabRow.tabId, before);
-          if (visualDrop) return assignVisualParent(visualDrop.parentId, visualDrop.index);
+          if (visualDrop) {
+            return assignVisualParent(
+              visualDrop.parentId,
+              visualDrop.index,
+              'group-tab:visual-parent',
+              `row=${rowIndex}:${shortDndId(row.groupId)} target=${shortDndId(tabRow.tabId)} before=${before ? 1 : 0} staticInstr=${summarizeListInstruction(instruction)}`
+            );
+          }
           if (before) break;
           targetMemberIndex += 1;
           break;
         }
         if (sourceSet.has(tabRow.tabId)) continue;
-        if (clientY < tabRow.rect.midY) break;
+        const instruction = staticReorderInstructionForTab(tabRow.rect);
+        if (instruction?.operation === 'reorder-before') break;
         targetMemberIndex += 1;
       }
-      return assignGroup(row.groupId, targetMemberIndex, rowIndex);
+      return assignGroup(row.groupId, targetMemberIndex, rowIndex, 'group-body', `row=${rowIndex}:${verticalRowDebugKey(row)}`);
     }
 
     for (let rowIndex = 0; rowIndex < geometry.rows.length; rowIndex += 1) {
       const row = geometry.rows[rowIndex];
       if (row.type !== 'tab') continue;
       if (clientY < row.rect.top || clientY > row.rect.bottom) continue;
-      const before = clientY < row.rect.midY;
+      const instruction = staticReorderInstructionForRow(row);
+      const before = isInstructionBefore(instruction);
       if (sourceSet.has(row.tabId)) {
-        const parentAfterChildPreview = !before ? assignParentAfterOwnChild(row.tabId) : null;
+        const parentAfterChildPreview = !before
+          ? assignParentAfterOwnChild(row.tabId, `row=${rowIndex}:${verticalRowDebugKey(row)} before=${before ? 1 : 0} staticInstr=${summarizeListInstruction(instruction)}`)
+          : null;
         if (parentAfterChildPreview) return parentAfterChildPreview;
         continue;
       }
       const visualDrop = visualDropForTab(row.tabId, before);
-      if (visualDrop) return assignVisualParent(visualDrop.parentId, visualDrop.index);
-      return assignFlat(before ? rowIndex : rowIndex + 1);
+      if (visualDrop) {
+        return assignVisualParent(
+          visualDrop.parentId,
+          visualDrop.index,
+          'tab-row:visual-parent',
+          `row=${rowIndex}:${verticalRowDebugKey(row)} before=${before ? 1 : 0} staticInstr=${summarizeListInstruction(instruction)}`
+        );
+      }
+      return assignFlat(
+        before ? rowIndex : rowIndex + 1,
+        'tab-row:flat',
+        `row=${rowIndex}:${verticalRowDebugKey(row)} before=${before ? 1 : 0} staticInstr=${summarizeListInstruction(instruction)}`
+      );
     }
 
-    return assignFlat(flatIndexFromY());
+    const flatIndex = flatIndexFromY();
+    return assignFlat(flatIndex, 'fallback:flat-index', `flatIndex=${flatIndex}`);
   }, [captureVerticalDragGeometry, isAdoptDropTarget, isVerticalLayout, projectId]);
 
   // Monitor for all drag events
   useEffect(() => {
     return monitorForElements({
       canMonitor: ({ source }) => source.data.type === 'TAB' || source.data.type === 'TAB_GROUP',
-      onDragStart({ source }) {
+      onDragStart({ source, location }) {
         const sourceData = source.data as DragData;
-        verticalDragGeometryRef.current = sourceData.projectId === projectId ? captureVerticalDragGeometry() : null;
+        verticalDragResolveTraceRef.current = null;
+        verticalDragGeometryRef.current = sourceData.projectId === projectId ? captureVerticalDragGeometry('start') : null;
+        const sourceRect = findVerticalDragSourceRect(sourceData, verticalDragGeometryRef.current);
+        verticalDragAnchorRef.current = sourceRect
+          ? {
+              startY: location.initial.input.clientY,
+              sourceTop: sourceRect.top,
+              sourceBottom: sourceRect.bottom,
+              sourceMidY: sourceRect.midY,
+              offsetY: sourceRect.midY - location.initial.input.clientY,
+            }
+          : null;
         tabDndLogUntilRef.current = performance.now() + 5000;
         console.log(
           `[TabDnd:start] project=${shortDndId(projectId)}` +
           ` sourceType=${sourceData.type}` +
           ` source=${shortDndId(sourceData.type === 'TAB' ? sourceData.id : sourceData.groupId)}` +
           ` sourceProject=${shortDndId(sourceData.projectId || null)}` +
+          ` rawStartY=${Math.round(location.initial.input.clientY)}` +
+          ` anchor=${summarizeVerticalAnchor(verticalDragAnchorRef.current)}` +
           ` geometry=${summarizeVerticalGeometry(verticalDragGeometryRef.current)}`
         );
       },
       onDrag({ source, location }) {
         const target = location.current.dropTargets[0];
         const input = location.current.input;
-        const preview = resolveStaticVerticalPreview(source.data as DragData, input.clientX, input.clientY, target?.data);
+        const anchor = verticalDragAnchorRef.current;
+        const effectiveY = anchor ? input.clientY + anchor.offsetY : input.clientY;
+        const preview = resolveStaticVerticalPreview(source.data as DragData, input.clientX, effectiveY, target?.data);
         const key = preview ? JSON.stringify(preview) : '';
         if (key !== dragPreviewKeyRef.current) {
           dragPreviewKeyRef.current = key;
@@ -2795,7 +3716,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             ` sourceType=${sourceData.type}` +
             ` source=${shortDndId(sourceData.type === 'TAB' ? sourceData.id : sourceData.groupId)}` +
             ` x=${Math.round(input.clientX)} y=${Math.round(input.clientY)}` +
-            ` target=${target?.data?.type || 'none'}` +
+            ` effectiveY=${Math.round(effectiveY)}` +
+            ` anchorDy=${anchor ? Math.round(anchor.offsetY) : 0}` +
+            ` target=${summarizeDropTargetData(target?.data)}` +
+            ` ${summarizeResolveTrace(verticalDragResolveTraceRef.current)}` +
             ` ${summarizePreviewLayout(preview)}`
           );
           setDragPreview(preview);
@@ -2806,15 +3730,22 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         const target = location.current.dropTargets[0];
         const targetData = target?.data as any;
         const input = location.current.input;
+        const anchor = verticalDragAnchorRef.current;
+        const effectiveY = anchor ? input.clientY + anchor.offsetY : input.clientY;
+        const geometryBeforeDrop = verticalDragGeometryRef.current;
 
-        const preview = resolveStaticVerticalPreview(sourceData, input.clientX, input.clientY, targetData);
+        const preview = resolveStaticVerticalPreview(sourceData, input.clientX, effectiveY, targetData);
         tabDndLogUntilRef.current = performance.now() + 5000;
         console.log(
           `[TabDnd:drop] project=${shortDndId(projectId)}` +
           ` sourceType=${sourceData.type}` +
           ` source=${shortDndId(sourceData.type === 'TAB' ? sourceData.id : sourceData.groupId)}` +
           ` x=${Math.round(input.clientX)} y=${Math.round(input.clientY)}` +
-          ` target=${targetData?.type || 'none'}` +
+          ` effectiveY=${Math.round(effectiveY)}` +
+          ` anchorDy=${anchor ? Math.round(anchor.offsetY) : 0}` +
+          ` target=${summarizeDropTargetData(targetData)}` +
+          ` geometryBefore=${geometryBeforeDrop ? geometryBeforeDrop.id : 'none'}` +
+          ` ${summarizeResolveTrace(verticalDragResolveTraceRef.current)}` +
           ` ${summarizePreviewLayout(preview)}`
         );
         if (preview) {
@@ -2827,11 +3758,13 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           );
           dragPreviewKeyRef.current = '';
           verticalDragGeometryRef.current = null;
+          verticalDragAnchorRef.current = null;
           setDragPreview(null);
           return;
         }
         dragPreviewKeyRef.current = '';
         verticalDragGeometryRef.current = null;
+        verticalDragAnchorRef.current = null;
         setDragPreview(null);
         if (!target) return;
 
@@ -2972,24 +3905,43 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       return;
     }
 
-    const listRect = list.getBoundingClientRect();
     const nextRects = new Map<string, VerticalRowFlipRect>();
-    const rows = Array.from(list.children)
+    const rows = Array.from(list.querySelectorAll<HTMLElement>('[data-vertical-row-key]'))
       .filter((child): child is HTMLElement => child instanceof HTMLElement && !!child.dataset.verticalRowKey);
 
     for (const row of rows) {
       const key = row.dataset.verticalRowKey;
       if (!key) continue;
-      const rect = row.getBoundingClientRect();
-      nextRects.set(key, {
-        top: rect.top - listRect.top,
-        left: rect.left - listRect.left,
-        width: rect.width,
-        height: rect.height,
-      });
+      nextRects.set(key, measureVerticalRowFlipRect(row, list));
     }
 
     const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    const now = performance.now();
+    const suppressFlipForGroupCollapse = !dragPreview && now < groupCollapseFlipSuppressUntilRef.current;
+    if (suppressFlipForGroupCollapse) {
+      let cancelledCount = 0;
+      for (const row of rows) row.style.willChange = '';
+      for (const animation of Array.from(verticalRowAnimationsRef.current.values())) {
+        cancelledCount += 1;
+        animation.cancel();
+      }
+      verticalRowAnimationsRef.current.clear();
+      if (now < tabDndLogUntilRef.current) {
+        console.log(
+          `[TabDnd:flip] project=${shortDndId(projectId)}` +
+          ` rows=${rows.length}` +
+          ` measure=offset-chain` +
+          ` prev=${verticalRowFlipRectsRef.current.size}` +
+          ` next=${nextRects.size}` +
+          ` suppress=group-collapse` +
+          ` untilMs=${Math.round(groupCollapseFlipSuppressUntilRef.current - now)}` +
+          ` cancelled=${cancelledCount}`
+        );
+      }
+      verticalRowFlipRectsRef.current = nextRects;
+      return;
+    }
+
     let animatedCount = 0;
     let missingPrevCount = 0;
     let zeroDeltaCount = 0;
@@ -3019,6 +3971,22 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       }
 
       row.style.willChange = 'transform';
+      const card = row.querySelector<HTMLElement>('[data-tab-item], [data-tab-group-header]');
+      const shouldLogPaint = performance.now() < tabDndLogUntilRef.current;
+      const logPaintState = (phase: string) => {
+        if (!shouldLogPaint) return;
+        console.log(
+          `[TabDnd:flip-paint] phase=${phase}` +
+          ` project=${shortDndId(projectId)}` +
+          ` key=${shortVerticalRowKey(key)}` +
+          ` dx=${Math.round(dx)}` +
+          ` dy=${Math.round(dy)}` +
+          ` dragPreview=${dragPreview ? 1 : 0}` +
+          ` row=${describePaintNode(row)}` +
+          ` card=${describePaintNode(card)}`
+        );
+      };
+      logPaintState('before');
       const animation = row.animate(
         [
           { transform: `translate3d(${dx}px, ${dy}px, 0)` },
@@ -3032,13 +4000,16 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       verticalRowAnimationsRef.current.set(key, animation);
       animatedCount += 1;
       animatedKeys.push(`${key}:dx=${Math.round(dx)}:dy=${Math.round(dy)}`);
+      window.requestAnimationFrame(() => logPaintState('raf1'));
       animation.onfinish = () => {
         if (verticalRowAnimationsRef.current.get(key) !== animation) return;
+        logPaintState('finish');
         row.style.willChange = '';
         verticalRowAnimationsRef.current.delete(key);
       };
       animation.oncancel = () => {
         if (verticalRowAnimationsRef.current.get(key) !== animation) return;
+        logPaintState('cancel');
         row.style.willChange = '';
         verticalRowAnimationsRef.current.delete(key);
       };
@@ -3048,6 +4019,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       console.log(
         `[TabDnd:flip] project=${shortDndId(projectId)}` +
         ` rows=${rows.length}` +
+        ` measure=offset-chain` +
         ` prev=${verticalRowFlipRectsRef.current.size}` +
         ` next=${nextRects.size}` +
         ` reduceMotion=${!!reduceMotion}` +
@@ -3125,6 +4097,125 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const visualDepthById = isVerticalLayout ? buildVisualDepthMap(mainTabsForDisplay) : new Map<string, number>();
   const verticalRows = isVerticalLayout ? buildVerticalRows(mainTabsForDisplay, tabGroupsForDisplay) : [];
 
+  const describeGroupCollapseSnapshot = useCallback((groupId: string): string => {
+    const list = verticalMainListRef.current;
+    if (!list) return 'list=none';
+    const groupRow = Array.from(list.querySelectorAll<HTMLElement>('[data-row-type="group"]'))
+      .find((element) => element.dataset.groupId === groupId) || null;
+    const collapse = Array.from(list.querySelectorAll<HTMLElement>('[data-tab-group-collapse]'))
+      .find((element) => element.dataset.groupId === groupId) || null;
+    const body = Array.from(list.querySelectorAll<HTMLElement>('[data-tab-group-body]'))
+      .find((element) => element.dataset.groupId === groupId) || null;
+    const childRows = body
+      ? Array.from(body.querySelectorAll<HTMLElement>('[data-vertical-row-key]'))
+      : [];
+    const allRows = Array.from(list.querySelectorAll<HTMLElement>('[data-vertical-row-key]'))
+      .slice(0, 40)
+      .map((row) => {
+        const rect = measureVerticalRowFlipRect(row, list);
+        return `${shortVerticalRowKey(row.dataset.verticalRowKey)}:${row.dataset.rowType || '-'}:t${Math.round(rect.top)}:h${Math.round(rect.height)}`;
+      })
+      .join('|') || '-';
+    const childSummary = childRows
+      .slice(0, 20)
+      .map((row) => {
+        const rect = measureVerticalRowFlipRect(row, list);
+        return `${shortVerticalRowKey(row.dataset.verticalRowKey)}:t${Math.round(rect.top)}:h${Math.round(rect.height)}`;
+      })
+      .join('|') || '-';
+
+    return (
+      `list=${describeCollapseNode(list)}` +
+      ` groupRow=${describeCollapseNode(groupRow, list)}` +
+      ` collapse=${describeCollapseNode(collapse, list)}` +
+      ` body=${describeCollapseNode(body, list)}` +
+      ` childRows=${childRows.length}:${childSummary}` +
+      ` allRows=${allRows}`
+    );
+  }, []);
+
+  const handleToggleGroupCollapsed = useCallback((group: TabGroup) => {
+    const now = performance.now();
+    tabDndLogUntilRef.current = Math.max(tabDndLogUntilRef.current, now + 1600);
+    groupCollapseFlipSuppressUntilRef.current = Math.max(
+      groupCollapseFlipSuppressUntilRef.current,
+      now + GROUP_COLLAPSE_FLIP_SUPPRESS_MS
+    );
+    const memberIds = mainTabsForDisplay
+      .filter((tab) => tab.groupId === group.id)
+      .map((tab) => tab.id);
+    const logPhase = (phase: string) => {
+      console.warn(
+        '[TabGroupCollapse:renderer]' +
+        ` phase=${phase}` +
+        ` project=${shortDndId(projectId)}` +
+        ` group=${shortDndId(group.id)}` +
+        ` collapsed=${group.collapsed ? 1 : 0}` +
+        ` memberCount=${memberIds.length}` +
+        ` members=${memberIds.map(shortDndId).join('>') || '-'}` +
+        ` activeGroup=${shortDndId(workspace.activeGroupId)}` +
+        ` dragPreview=${dragPreview ? 1 : 0}` +
+        ` t=${Math.round(performance.now())}` +
+        ` snapshot=${describeGroupCollapseSnapshot(group.id)}`
+      );
+    };
+
+    logPhase('before-toggle');
+    toggleTabGroupCollapsed(projectId, group.id);
+    window.requestAnimationFrame(() => logPhase('raf1-after-toggle'));
+    window.setTimeout(() => logPhase('after-170ms'), 170);
+    window.setTimeout(() => logPhase('after-1000ms'), 1000);
+  }, [
+    describeGroupCollapseSnapshot,
+    dragPreview,
+    mainTabsForDisplay,
+    projectId,
+    toggleTabGroupCollapsed,
+    workspace.activeGroupId,
+  ]);
+
+  const handleGroupCollapseTransition = useCallback((event: React.TransitionEvent<HTMLDivElement>) => {
+    if (event.target !== event.currentTarget) return;
+    if (performance.now() > tabDndLogUntilRef.current) return;
+    const groupId = event.currentTarget.dataset.groupId || '';
+    if (
+      (event.type === 'transitionend' || event.type === 'transitioncancel') &&
+      event.propertyName === 'grid-template-rows'
+    ) {
+      const list = verticalMainListRef.current;
+      if (list) {
+        const nextRects = new Map<string, VerticalRowFlipRect>();
+        const rows = Array.from(list.querySelectorAll<HTMLElement>('[data-vertical-row-key]'))
+          .filter((row): row is HTMLElement => row instanceof HTMLElement && !!row.dataset.verticalRowKey);
+        for (const row of rows) {
+          const key = row.dataset.verticalRowKey;
+          if (!key) continue;
+          nextRects.set(key, measureVerticalRowFlipRect(row, list));
+        }
+        verticalRowFlipRectsRef.current = nextRects;
+        console.log(
+          '[TabGroupCollapse:transition]' +
+          ` type=${event.type}` +
+          ` project=${shortDndId(projectId)}` +
+          ` group=${shortDndId(groupId)}` +
+          ` phase=flip-baseline-refresh` +
+          ` rows=${nextRects.size}` +
+          ` t=${Math.round(performance.now())}`
+        );
+      }
+    }
+    console.warn(
+      '[TabGroupCollapse:transition]' +
+      ` type=${event.type}` +
+      ` project=${shortDndId(projectId)}` +
+      ` group=${shortDndId(groupId)}` +
+      ` prop=${event.propertyName}` +
+      ` elapsed=${event.elapsedTime.toFixed(3)}` +
+      ` t=${Math.round(performance.now())}` +
+      ` snapshot=${describeGroupCollapseSnapshot(groupId)}`
+    );
+  }, [describeGroupCollapseSnapshot, projectId]);
+
   // CWD priority: project.path (if bound) → активный таб cwd → HOME.
   // Раньше было наоборот (активный таб → project.path) — при бранч-хоппинге
   // в активном табе следующий «New Tab» наследовал cwd текущей ветки/папки
@@ -3166,6 +4257,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   };
 
   const contextMenuTabId = contextMenu?.tabId || null;
+  const contextTabForMenu = contextMenuTabId ? workspace?.tabs.get(contextMenuTabId) : null;
+  const isContextFileTab = contextTabForMenu?.tabType === 'file';
   const visualParentAboveId = contextMenuTabId ? getVisualParentCandidateId(contextMenuTabId, 'up') : null;
   const visualParentBelowId = contextMenuTabId ? getVisualParentCandidateId(contextMenuTabId, 'down') : null;
 
@@ -3241,6 +4334,14 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     setEmptyContextMenu(null);
     setContextMenuPos({ x: e.clientX, y: e.clientY });
     setContextMenu({ x: e.clientX, y: e.clientY, tabId });
+
+    const targetTab = workspace.tabs.get(tabId);
+    if (targetTab?.tabType === 'file') {
+      setContextScripts([]);
+      setContextShScripts([]);
+      setContextFavoriteId(null);
+      return;
+    }
 
     // Load scripts for this tab's CWD (npm + sh)
     (async () => {
@@ -3574,7 +4675,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const handleContextClose = () => {
     if (contextMenu) {
       const tab = workspace.tabs.get(contextMenu.tabId);
-      closeTab(projectId, contextMenu.tabId, { aiBusyOverride: tab ? isTabTurnBusy(tab) : undefined });
+      closeTab(projectId, contextMenu.tabId, {
+        skipProcessCheck: tab?.tabType === 'file',
+        aiBusyOverride: tab ? isTabTurnBusy(tab) : undefined,
+      });
     }
     setContextMenu(null);
   };
@@ -3594,6 +4698,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   // Track if dragging is in progress
   const [isDraggingTab, setIsDraggingTab] = useState(false);
   const [draggingGroupIds, setDraggingGroupIds] = useState<string[]>([]);
+  const tabbarVisualLockActive = isDraggingTab;
   const dropCooldownRef = useRef(false);
 
   // Monitor drag start/end for utils dropdown behavior
@@ -3603,16 +4708,21 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       onDragStart: ({ source }) => {
         setIsDraggingTab(true);
         const data = source.data as DragData;
-        if (data.type === 'TAB' && data.selectedTabIds && data.selectedTabIds.length > 1) {
-          setDraggingGroupIds(data.selectedTabIds);
+        if (data.type === 'TAB') {
+          setDraggingGroupIds(data.selectedTabIds?.length ? data.selectedTabIds : [data.id]);
         }
       },
       onDrop: () => {
         setIsDraggingTab(false);
         setDraggingGroupIds([]);
-        dragPreviewKeyRef.current = '';
-        verticalDragGeometryRef.current = null;
-        setDragPreview(null);
+        if (performance.now() < tabDndLogUntilRef.current) {
+          console.log(
+            `[TabDnd:secondary-drop] project=${shortDndId(projectId)}` +
+            ` keptGeometry=${verticalDragGeometryRef.current ? verticalDragGeometryRef.current.id : 'none'}` +
+            ` keptAnchor=${verticalDragAnchorRef.current ? 1 : 0}` +
+            ` keptPreview=${dragPreviewKeyRef.current ? 1 : 0}`
+          );
+        }
         dropCooldownRef.current = true;
         setTimeout(() => { dropCooldownRef.current = false; }, 100);
         // Close Utils if it was opened by hover (not manually)
@@ -3621,7 +4731,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         }
       },
     });
-  }, [utilityExpanded, utilityOpenedManually]);
+  }, [projectId, utilityExpanded, utilityOpenedManually]);
 
   // Close utils dropdown on click outside (but not during drag)
   useEffect(() => {
@@ -3824,7 +4934,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             ref={verticalMainListRef}
             data-vertical-main-list
             className="flex flex-col"
-            style={{ gap: `${tabSidebarGap}px`, padding: `${tabSidebarGap}px` }}
+            style={{ position: 'relative', gap: `${tabSidebarGap}px`, padding: `${tabSidebarGap}px` }}
           >
             {verticalRows.map((row) => {
               const renderTab = (tab: TabData, groupId?: string, groupIndex?: number) => {
@@ -3852,7 +4962,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     }}
                     onClose={(e) => handleCloseTab(e, tab.id)}
                     onDoubleClick={() => {
-                      if (!isMultiSelect) handleDoubleClick(tab.id, tab.name);
+                      if (!isMultiSelect && tab.tabType !== 'file') handleDoubleClick(tab.id, tab.name);
                     }}
                     onContextMenu={(e) => handleContextMenu(e, tab.id)}
                     onEditChange={setEditValue}
@@ -3872,6 +4982,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     isStopping={restartInFlight.has(tab.id)}
                     isInterrupted={isTabInterrupted(tab)}
                     draggingGroupIds={draggingGroupIds}
+                    isAnyDragging={tabbarVisualLockActive}
                     onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
                     showNotesPeek={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
                     slideoutOpenHere={openSlideoutTabId === tab.id}
@@ -3879,6 +4990,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     cmdPeekMode={isCmdPressed && isMouseInTabBar}
                     isCollapsed={!!tab.isCollapsed}
                     isViewingSubAgent={viewingSubAgentParentId === tab.id}
+                    completionNotificationArmed={!!tab.completionNotificationArmed}
+                    completionNotificationFired={!!tab.completionNotificationFired}
                   />
                 );
                 if (!visualDepth) return tabNode;
@@ -3998,9 +5111,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                       e.stopPropagation();
                       void closeGroupById(row.group.id);
                     }}
-                    onToggleCollapsed={() => toggleTabGroupCollapsed(projectId, row.group.id)}
+                    onToggleCollapsed={() => handleToggleGroupCollapsed(row.group)}
                     onFocusGroup={() => setActiveTabGroup(projectId, row.group.id)}
                     isFocused={workspace.activeGroupId === row.group.id}
+                    isAnyDragging={tabbarVisualLockActive}
                   />
                   {(row.tabs.length > 0 || !row.group.collapsed) && (
                     <div
@@ -4009,11 +5123,15 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                       style={{
                         display: 'grid',
                         gridTemplateRows: row.group.collapsed ? '0fr' : '1fr',
-                        opacity: row.group.collapsed ? 0 : 1,
+                        opacity: 1,
                         transform: row.group.collapsed ? 'translateY(-2px)' : 'translateY(0)',
-                        transition: 'grid-template-rows 150ms ease, opacity 120ms ease, transform 150ms ease',
+                        transition: 'grid-template-rows 150ms ease, transform 150ms ease',
                         pointerEvents: row.group.collapsed ? 'none' : 'auto',
                       }}
+                      onTransitionRun={handleGroupCollapseTransition}
+                      onTransitionStart={handleGroupCollapseTransition}
+                      onTransitionEnd={handleGroupCollapseTransition}
+                      onTransitionCancel={handleGroupCollapseTransition}
                       aria-hidden={row.group.collapsed ? true : undefined}
                     >
                       <div
@@ -4030,7 +5148,16 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         }}
                       >
                         {row.tabs.length > 0 ? (
-                          row.tabs.map((tab, groupIndex) => renderTab(tab, row.group.id, groupIndex))
+                          row.tabs.map((tab, groupIndex) => (
+                            <div
+                              key={tab.id}
+                              data-vertical-row-key={`tab:${tab.id}`}
+                              data-group-tab-row
+                              data-tab-id={tab.id}
+                            >
+                              {renderTab(tab, row.group.id, groupIndex)}
+                            </div>
+                          ))
                         ) : (
                           <div
                             data-empty-group-placeholder
@@ -4042,8 +5169,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                               boxSizing: 'border-box',
                               fontSize: `${tabsFontSize}px`,
                               color: '#71717a',
-                              backgroundColor: 'rgba(139,92,246,0.055)',
-                              border: '1px dashed rgba(139,92,246,0.24)',
+                              backgroundColor: flattenRgbaOnTabbarPanel('rgba(139,92,246,0.055)'),
+                              border: `1px dashed ${flattenRgbaOnTabbarPanel('rgba(139,92,246,0.24)')}`,
                               display: 'flex',
                               alignItems: 'center',
                               userSelect: 'none',
@@ -4152,7 +5279,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                   }}
                   onClose={(e) => handleCloseTab(e, tab.id)}
                   onDoubleClick={() => {
-                    if (!isMultiSelect) handleDoubleClick(tab.id, tab.name);
+                    if (!isMultiSelect && tab.tabType !== 'file') handleDoubleClick(tab.id, tab.name);
                   }}
                   onContextMenu={(e) => handleContextMenu(e, tab.id)}
                   onEditChange={setEditValue}
@@ -4172,6 +5299,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                   isStopping={restartInFlight.has(tab.id)}
                   isInterrupted={isTabInterrupted(tab)}
                   draggingGroupIds={draggingGroupIds}
+                  isAnyDragging={isDraggingTab}
                   onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
                   showNotesPeek={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
                 slideoutOpenHere={openSlideoutTabId === tab.id}
@@ -4179,6 +5307,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 cmdPeekMode={isCmdPressed && isMouseInTabBar}
                   isCollapsed={!!tab.isCollapsed}
                   isViewingSubAgent={viewingSubAgentParentId === tab.id}
+                  completionNotificationArmed={!!tab.completionNotificationArmed}
+                  completionNotificationFired={!!tab.completionNotificationFired}
                 />
               ))}
             </div>
@@ -4327,7 +5457,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         }}
                         onClose={(e) => handleCloseTab(e, tab.id)} // Close tab, not move to main
                         onDoubleClick={() => {
-                      if (!isMultiSelect) {
+                      if (!isMultiSelect && tab.tabType !== 'file') {
                         handleDoubleClick(tab.id, tab.name);
                       }
                     }}
@@ -4349,6 +5479,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         isStopping={restartInFlight.has(tab.id)}
                         isInterrupted={isTabInterrupted(tab)}
                         draggingGroupIds={draggingGroupIds}
+                        isAnyDragging={isDraggingTab}
                         onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
                         showNotesPeek={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
                 slideoutOpenHere={openSlideoutTabId === tab.id}
@@ -4356,6 +5487,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 cmdPeekMode={isCmdPressed && isMouseInTabBar}
                         isCollapsed={!!tab.isCollapsed}
                         isViewingSubAgent={viewingSubAgentParentId === tab.id}
+                        completionNotificationArmed={!!tab.completionNotificationArmed}
+                        completionNotificationFired={!!tab.completionNotificationFired}
                       />
                     ))}
                   </div>
@@ -4412,7 +5545,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     }}
                     onClose={(e) => handleCloseTab(e, tab.id)}
                     onDoubleClick={() => {
-                      if (!isMultiSelect) {
+                      if (!isMultiSelect && tab.tabType !== 'file') {
                         handleDoubleClick(tab.id, tab.name);
                       }
                     }}
@@ -4435,6 +5568,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     isStopping={restartInFlight.has(tab.id)}
                     isInterrupted={isTabInterrupted(tab)}
                     draggingGroupIds={draggingGroupIds}
+                    isAnyDragging={isDraggingTab}
                     onHoverChange={(hovering, rect) => handleTabHoverChange(tab.id, hovering, rect)}
                     showNotesPeek={isCmdPressed && isMouseInTabBar && !!workspace.tabs.get(tab.id)?.notes}
                 slideoutOpenHere={openSlideoutTabId === tab.id}
@@ -4442,6 +5576,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 cmdPeekMode={isCmdPressed && isMouseInTabBar}
                     isCollapsed={!!tab.isCollapsed}
                     isViewingSubAgent={viewingSubAgentParentId === tab.id}
+                    completionNotificationArmed={!!tab.completionNotificationArmed}
+                    completionNotificationFired={!!tab.completionNotificationFired}
                   />
                 ))}
               </div>
@@ -4504,6 +5640,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             // (isMultiSelect already gates this). We count AI engines separately
             // so the badge can show majority+minority split.
             const targetTabIds = isMultiSelect ? selectedTabIds : (contextMenu ? [contextMenu.tabId] : []);
+            const targetFileTab = !isMultiSelect && targetTabIds.length === 1 ? workspace.tabs.get(targetTabIds[0]) : null;
+            const isFileTab = targetFileTab?.tabType === 'file';
             let claudeCount = 0;
             let geminiCount = 0;
             let codexCount = 0;
@@ -4586,6 +5724,15 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               }
               setContextMenu(null);
             };
+
+            if (isFileTab) {
+              return (
+                <div className="px-3 py-1.5 text-[13px] text-[#d8b4fe] flex items-center gap-2 border-b border-[#3a3a3a]">
+                  <FileText size={13} className="text-[#a78bfa] flex-shrink-0" />
+                  <span className="truncate">{targetFileTab?.name || 'Linked File'}</span>
+                </div>
+              );
+            }
 
             const handleStopAI = async (e: React.MouseEvent) => {
               e.stopPropagation();
@@ -4769,6 +5916,57 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
           {!isMultiSelect && (
             <>
+              {(() => {
+                const ctxTab = contextMenu ? workspace.tabs.get(contextMenu.tabId) : null;
+                if (!ctxTab || !contextMenu || ctxTab.tabType === 'file') return null;
+                const isArmed = !!ctxTab.completionNotificationArmed;
+                const isFired = !!ctxTab.completionNotificationFired;
+                const isPersistent = !!ctxTab.completionNotificationPersistent;
+                const oneShotActive = isArmed || isFired;
+                const tint = isFired ? '#ef4444' : (oneShotActive ? '#f87171' : '#888');
+                const label = isFired
+                  ? 'Уведомление готово'
+                  : (oneShotActive ? 'Уведомление включено' : 'Активировать уведомления');
+                return (
+                  <div className="flex items-stretch w-full border-t border-[#3a3a3a]">
+                    <button
+                      className="min-w-0 text-left px-3 py-1.5 text-[13px] hover:bg-white/10 cursor-pointer flex items-center gap-2 whitespace-nowrap"
+                      style={{
+                        flex: '4 1 0%',
+                        color: oneShotActive ? '#fecaca' : '#ccc',
+                        backgroundColor: oneShotActive ? 'rgba(239, 68, 68, 0.10)' : 'transparent',
+                      }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setTabCompletionNotificationArmed(projectId, contextMenu.tabId, !oneShotActive);
+                        setContextMenu(null);
+                      }}
+                    >
+                      <Bell size={13} style={{ color: tint, flexShrink: 0 }} />
+                      <span className="truncate">{label}</span>
+                      {oneShotActive && <span className="ml-auto text-[#ef4444]">✓</span>}
+                    </button>
+                    <Tooltip content={isPersistent ? 'Постоянные уведомления включены' : 'Включать уведомление для каждого нового запроса'}>
+                      <button
+                        className="px-2 py-1.5 text-[12px] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444]"
+                        style={{
+                          flex: '1 0 42px',
+                          color: isPersistent ? '#fecaca' : '#777',
+                          backgroundColor: isPersistent ? 'rgba(239, 68, 68, 0.16)' : 'transparent',
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setTabCompletionNotificationPersistent(projectId, contextMenu.tabId, !isPersistent);
+                          setContextMenu(null);
+                        }}
+                      >
+                        <BellRing size={13} fill={isPersistent ? 'rgba(239, 68, 68, 0.35)' : 'none'} />
+                      </button>
+                    </Tooltip>
+                  </div>
+                );
+              })()}
+
               {/* Status - submenu (independent of runtime type). Toggle-семантика:
                   повторный клик на активный статус снимает его. Отдельной «Без статуса»
                   кнопки нет — юзер просто кликает второй раз на выделенную галочкой строку. */}
@@ -4821,64 +6019,68 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         </button>
                       );
                     })}
-                    <div className="my-1 border-t border-[#3a3a3a]" />
-                    <div className="relative group/background">
-                      <button
-                        className="w-full text-left px-4 py-1 text-[11px] text-[#888] hover:bg-white/10 hover:text-[#bbb] cursor-pointer flex items-center justify-between gap-3 whitespace-nowrap"
-                      >
-                        <span>Background</span>
-                        <span className="flex items-center gap-1.5 ml-auto">
-                          {(() => {
-                            const currentColor = workspace.tabs.get(contextMenu.tabId)?.color || 'default';
-                            const meta = TAB_COLORS.find((c) => c.color === currentColor) || TAB_COLORS[0];
-                            return (
-                              <span
-                                style={{
-                                  width: 9,
-                                  height: 9,
-                                  borderRadius: 3,
-                                  backgroundColor: meta.bgColor === 'transparent' ? 'transparent' : meta.borderColor,
-                                  border: `1px solid ${meta.borderColor}`,
-                                  display: 'inline-block',
-                                }}
-                              />
-                            );
-                          })()}
-                          <span className="text-[#555]">›</span>
-                        </span>
-                      </button>
-                      <div className="absolute left-full bottom-0 -ml-2 pl-2 hidden group-hover/background:block">
-                        <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 min-w-[165px]">
-                          {TAB_COLORS.map((c) => {
-                            const currentColor = workspace.tabs.get(contextMenu.tabId)?.color || 'default';
-                            const isSelected = currentColor === c.color;
-                            return (
-                              <button
-                                key={c.color}
-                                className="w-full text-left px-3 py-1 text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2 whitespace-nowrap"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handleSetColor(c.color);
-                                }}
-                              >
-                                <span
-                                  style={{
-                                    width: 11,
-                                    height: 11,
-                                    borderRadius: 3,
-                                    backgroundColor: c.bgColor === 'transparent' ? 'transparent' : c.borderColor,
-                                    border: `1px solid ${c.borderColor}`,
-                                    flexShrink: 0,
-                                  }}
-                                />
-                                <span>{c.label.replace(/^[^\wА-Яа-я]+\\s*/, '')}</span>
-                                {isSelected && <span className="ml-auto text-white">✓</span>}
-                              </button>
-                            );
-                          })}
+                    {!isContextFileTab && (
+                      <>
+                        <div className="my-1 border-t border-[#3a3a3a]" />
+                        <div className="relative group/background">
+                          <button
+                            className="w-full text-left px-4 py-1 text-[11px] text-[#888] hover:bg-white/10 hover:text-[#bbb] cursor-pointer flex items-center justify-between gap-3 whitespace-nowrap"
+                          >
+                            <span>Background</span>
+                            <span className="flex items-center gap-1.5 ml-auto">
+                              {(() => {
+                                const currentColor = workspace.tabs.get(contextMenu.tabId)?.color || 'default';
+                                const meta = TAB_COLORS.find((c) => c.color === currentColor) || TAB_COLORS[0];
+                                return (
+                                  <span
+                                    style={{
+                                      width: 9,
+                                      height: 9,
+                                      borderRadius: 3,
+                                      backgroundColor: meta.bgColor === 'transparent' ? 'transparent' : meta.borderColor,
+                                      border: `1px solid ${meta.borderColor}`,
+                                      display: 'inline-block',
+                                    }}
+                                  />
+                                );
+                              })()}
+                              <span className="text-[#555]">›</span>
+                            </span>
+                          </button>
+                          <div className="absolute left-full bottom-0 -ml-2 pl-2 hidden group-hover/background:block">
+                            <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 min-w-[165px]">
+                              {TAB_COLORS.map((c) => {
+                                const currentColor = workspace.tabs.get(contextMenu.tabId)?.color || 'default';
+                                const isSelected = currentColor === c.color;
+                                return (
+                                  <button
+                                    key={c.color}
+                                    className="w-full text-left px-3 py-1 text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2 whitespace-nowrap"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleSetColor(c.color);
+                                    }}
+                                  >
+                                    <span
+                                      style={{
+                                        width: 11,
+                                        height: 11,
+                                        borderRadius: 3,
+                                        backgroundColor: c.bgColor === 'transparent' ? 'transparent' : c.borderColor,
+                                        border: `1px solid ${c.borderColor}`,
+                                        flexShrink: 0,
+                                      }}
+                                    />
+                                    <span>{c.label.replace(/^[^\wА-Яа-я]+\\s*/, '')}</span>
+                                    {isSelected && <span className="ml-auto text-white">✓</span>}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
                         </div>
-                      </div>
-                    </div>
+                      </>
+                    )}
                   </div>
                 </div>
               </div>
@@ -4916,7 +6118,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           )}
 
           {/* Scripts - submenu */}
-          {!isMultiSelect && (contextScripts.length > 0 || contextShScripts.length > 0 || (contextMenu && processStatus.get(contextMenu.tabId) && workspace.tabs.get(contextMenu.tabId)?.commandType === 'devServer')) && (
+          {!isMultiSelect && !isContextFileTab && (contextScripts.length > 0 || contextShScripts.length > 0 || (contextMenu && processStatus.get(contextMenu.tabId) && workspace.tabs.get(contextMenu.tabId)?.commandType === 'devServer')) && (
             <div className="relative group/scripts">
               <button
                 className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
@@ -4991,38 +6193,86 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           {/* Separator */}
           <div className="my-1 border-t border-[#444]" />
 
-          {/* Copy Session(s) */}
-          <button
-            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
-            onClick={() => {
-              if (isMultiSelect) {
-                // Copy all selected tabs' session IDs + cwds
-                const lines: string[] = [];
-                selectedTabIds.forEach(tabId => {
-                  const tab = workspace.tabs.get(tabId);
+          {!isMultiSelect && isContextFileTab ? (
+            <>
+              <button
+                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                onClick={() => {
+                  const tab = contextMenu ? workspace.tabs.get(contextMenu.tabId) : null;
+                  const filePath = tab?.filePath || tab?.cwd || '';
+                  if (filePath) {
+                    window.require('electron').clipboard.writeText(filePath);
+                    showToast('File path copied', 'success');
+                  }
+                  setContextMenu(null);
+                }}
+              >
+                Copy Path
+              </button>
+              <button
+                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                onClick={async () => {
+                  const tab = contextMenu ? workspace.tabs.get(contextMenu.tabId) : null;
+                  const filePath = tab?.filePath;
+                  if (!filePath) {
+                    setContextMenu(null);
+                    return;
+                  }
+                  const result = await ipcRenderer.invoke('file:read', filePath).catch(() => null);
+                  if (result?.success) {
+                    window.require('electron').clipboard.writeText(result.content || '');
+                    showToast('File content copied', 'success');
+                  } else {
+                    showToast('Could not read file', 'error');
+                  }
+                  setContextMenu(null);
+                }}
+              >
+                Copy Content
+              </button>
+              <div className="my-1 border-t border-[#444]" />
+              <button
+                className="w-full text-left px-4 py-1.5 text-[13px] text-[#f87171] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                onClick={() => {
+                  handleContextClose();
+                }}
+              >
+                Unlink File
+              </button>
+            </>
+          ) : (
+            <button
+              className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+              onClick={() => {
+                if (isMultiSelect) {
+                  // Copy all selected tabs' session IDs + cwds
+                  const lines: string[] = [];
+                  selectedTabIds.forEach(tabId => {
+                    const tab = workspace.tabs.get(tabId);
+                    if (tab) {
+                      const sessionId = tab.claudeSessionId || tab.geminiSessionId || tab.codexSessionId || 'no-session';
+                      const path = tab.cwd || project?.path || '/';
+                      lines.push(`${sessionId}\ncwd: ${path}`);
+                    }
+                  });
+                  navigator.clipboard.writeText(lines.join('\n\n'));
+                  showToast(`Copied ${selectedTabIds.length} sessions`, 'success');
+                } else {
+                  const tab = workspace.tabs.get(contextMenu.tabId);
                   if (tab) {
                     const sessionId = tab.claudeSessionId || tab.geminiSessionId || tab.codexSessionId || 'no-session';
                     const path = tab.cwd || project?.path || '/';
-                    lines.push(`${sessionId}\ncwd: ${path}`);
+                    const text = `${sessionId}\ncwd: ${path}`;
+                    navigator.clipboard.writeText(text);
+                    showToast('Session ID copied', 'success');
                   }
-                });
-                navigator.clipboard.writeText(lines.join('\n\n'));
-                showToast(`Copied ${selectedTabIds.length} sessions`, 'success');
-              } else {
-                const tab = workspace.tabs.get(contextMenu.tabId);
-                if (tab) {
-                  const sessionId = tab.claudeSessionId || tab.geminiSessionId || tab.codexSessionId || 'no-session';
-                  const path = tab.cwd || project?.path || '/';
-                  const text = `${sessionId}\ncwd: ${path}`;
-                  navigator.clipboard.writeText(text);
-                  showToast('Session ID copied', 'success');
                 }
-              }
-              setContextMenu(null);
-            }}
-          >
-            {isMultiSelect ? `Copy ${selectedTabIds.length} Sessions` : 'Copy ID/Path'}
-          </button>
+                setContextMenu(null);
+              }}
+            >
+              {isMultiSelect ? `Copy ${selectedTabIds.length} Sessions` : 'Copy ID/Path'}
+            </button>
+          )}
 
           {/* Revert Session — submenu shown only for claude tabs with rotation history.
               Safety-net for accidental overwrites by bridge watcher / AutoResume / Timeline

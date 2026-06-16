@@ -10,6 +10,7 @@ const https = require('https');
 const net = require('net');
 const readline = require('readline');
 const { performance: nodePerformance, monitorEventLoopDelay } = require('node:perf_hooks');
+const { spawn } = require('child_process');
 
 // Load .env file (works in both dev and packaged builds).
 // Production: prefer ~/.noted-terminal/.env (survives reinstall) and fall back
@@ -594,6 +595,7 @@ const claudePendingPrompt = new Map(); // tabId -> prompt string
 const claudeDebounceTimers = new Map(); // tabId -> debounce timer ID
 const claudeCtrlCDangerZone = new Map(); // tabId -> { resolve, promise, timer } (event-driven clear on prompt return)
 const claudeConfirmDialogCooldown = new Map(); // `${tabId}:${dialogType}` -> lastFireTs (ms). Prevents double-Enter on echo re-render.
+const codexCwdChooserAutoEnter = new Map(); // tabId -> one-shot state for Codex resume cwd picker
 let sessionManager; // Initialized after projectManager is ready
 let claudeManager; // Initialized with terminals map
 
@@ -652,6 +654,7 @@ const geminiActiveTabs = new Set();        // tabs with active Gemini process (f
 // session) is snapshotted at OPEN time, while the tab is still alive, and
 // denormalized into the row so it survives later tab/project deletion.
 const activityOpenIntervals = new Map();   // tabId \u2192 { startTs, engine, projectId, projectPath, projectName, tabName, sessionId }
+let projectActivityBroadcastTimer = null;
 
 // Resolve a denormalized identity snapshot for a tab at this instant. Works for
 // PTY tabs (terminalProjectIds live map \u2192 SQLite fallback) and SDK tabs
@@ -800,15 +803,13 @@ function computeActiveLoaders() {
   //    terminal killed). Skip if the PTY is already gone — that mirrors
   //    get-presence returning 'inactive' (no loader) for a stale bridge entry.
   //    Do NOT treat claudeCliActive as busy: it is process liveness, true while
-  //    Claude is idle at the prompt. Mobile install preflight blocks only
-  //    entries whose status is busy/running, so idle-alive Claude must surface
-  //    as active/starting, not as a fake loader.
+  //    Claude is idle at the prompt. /api/active-loaders is a blocker list, not
+  //    a presence list, so idle-alive Claude must not be returned at all.
   for (const tabId of bridgeKnownSessions.keys()) {
     if (!terminals.has(tabId)) continue; // PTY dead → not blocking (= 'inactive')
     const isBusy = !!claudeTurnBusy.get(tabId) || !!claudeSpinnerBusy.get(tabId) || claudeLocalCommandWatchers.has(tabId);
-    const inputReady = claudePromptReady.has(tabId);
-    const status = isBusy ? 'busy' : (inputReady ? 'active' : 'starting');
-    loaders.push({ tabId, kind: 'claude', status, ...labelFor(tabId) });
+    if (!isBusy) continue;
+    loaders.push({ tabId, kind: 'claude', status: 'busy', ...labelFor(tabId) });
     seen.add(tabId);
   }
 
@@ -851,6 +852,128 @@ function computeActiveLoaders() {
   return { idle: loaders.length === 0, count: loaders.length, loaders, ts: Date.now() };
 }
 
+// Tiny project-level aggregate for native iOS project badges. This intentionally
+// does NOT read every project's /tabs payload and does NOT include transcript
+// state. It mirrors the same runtime maps that drive the desktop/mobile loader:
+// count = live agent tabs in a project; streaming = at least one loader-on tab.
+function computeProjectActivity() {
+  const byProject = new Map(); // projectId -> { projectId, count, streaming }
+  const seenTabs = new Set();
+  const tabRowCache = new Map();
+
+  const tabRowFor = (tabId) => {
+    if (tabRowCache.has(tabId)) return tabRowCache.get(tabId);
+    let row = null;
+    if (projectManager?.db?.db) {
+      try {
+        row = projectManager.db.db.prepare(
+          'SELECT project_id, command_type, tab_type, claude_session_id, codex_session_id, gemini_session_id FROM tabs WHERE tab_id = ? LIMIT 1'
+        ).get(tabId) || null;
+      } catch {}
+    }
+    tabRowCache.set(tabId, row);
+    return row;
+  };
+
+  const projectIdFor = (tabId, row, hint) => (
+    hint ||
+    terminalProjectIds.get(tabId) ||
+    row?.project_id ||
+    null
+  );
+
+  const mark = (tabId, { live = true, busy = false, projectIdHint = null } = {}) => {
+    if (!tabId || !live) return;
+    const row = tabRowFor(tabId);
+    const projectId = projectIdFor(tabId, row, projectIdHint);
+    if (!projectId) return;
+    let item = byProject.get(projectId);
+    if (!item) {
+      item = { projectId, count: 0, streaming: false, tabs: [] };
+      byProject.set(projectId, item);
+    }
+    const status = busy ? 'busy' : 'active';
+    if (!seenTabs.has(tabId)) {
+      item.count += 1;
+      seenTabs.add(tabId);
+      item.tabs.push({ tabId, status, streaming: !!busy });
+    } else if (busy) {
+      const existing = item.tabs.find((t) => t.tabId === tabId);
+      if (existing) {
+        existing.status = 'busy';
+        existing.streaming = true;
+      }
+    }
+    if (busy) item.streaming = true;
+  };
+
+  for (const tabId of bridgeKnownSessions.keys()) {
+    mark(tabId, {
+      live: terminals.has(tabId),
+      busy: claudeTurnBusy.get(tabId) === true ||
+        claudeLocalCommandWatchers.has(tabId) ||
+        activityOpenIntervals.has(tabId),
+    });
+  }
+
+  for (const tabId of codexKnownSessions.keys()) {
+    const state = codexTurnWatchers.get(tabId);
+    mark(tabId, {
+      live: terminals.has(tabId),
+      busy: state?.busy === true || activityOpenIntervals.has(tabId),
+    });
+  }
+  for (const [tabId, state] of codexTurnWatchers) {
+    mark(tabId, {
+      live: terminals.has(tabId),
+      busy: state?.busy === true || activityOpenIntervals.has(tabId),
+    });
+  }
+
+  for (const tabId of geminiActiveTabs) {
+    mark(tabId, {
+      live: terminals.has(tabId),
+      busy: geminiSpinnerBusy.get(tabId) === true || activityOpenIntervals.has(tabId),
+    });
+  }
+  for (const [tabId, busy] of geminiSpinnerBusy) {
+    mark(tabId, {
+      live: terminals.has(tabId),
+      busy: busy === true || activityOpenIntervals.has(tabId),
+    });
+  }
+
+  // SDK sessions are in-flight query() calls: live == busy.
+  for (const tabId of sdkSessions.keys()) {
+    mark(tabId, { live: true, busy: true });
+  }
+
+  // Safety net for any loader-on interval whose engine edge fired before the
+  // corresponding liveness map was observable here. recordActivity stores the
+  // project identity at open-time, so this can still set streaming without a
+  // heavy renderer bridge call.
+  for (const [tabId, open] of activityOpenIntervals) {
+    mark(tabId, { live: true, busy: true, projectIdHint: open?.projectId || null });
+  }
+
+  return {
+    projects: Array.from(byProject.values())
+      .filter((p) => p.count > 0 || p.streaming)
+      .sort((a, b) => String(a.projectId).localeCompare(String(b.projectId))),
+    ts: Date.now(),
+  };
+}
+
+function scheduleProjectActivityBroadcast(reason = 'event') {
+  if (projectActivityBroadcastTimer) return;
+  projectActivityBroadcastTimer = setTimeout(() => {
+    projectActivityBroadcastTimer = null;
+    try {
+      require(path.join(srcMainDir, 'web-server')).broadcastProjectActivity(reason);
+    } catch {}
+  }, 80);
+}
+
 function recordActivity(tabId, busy, engine) {
   if (!tabId) return;
   const open = activityOpenIntervals.get(tabId);
@@ -858,6 +981,7 @@ function recordActivity(tabId, busy, engine) {
     if (open) return; // already open \u2014 no-op (idempotent)
     const id = resolveActivityIdentity(tabId, engine);
     activityOpenIntervals.set(tabId, { startTs: Date.now(), ...id });
+    scheduleProjectActivityBroadcast('activity-open');
   } else {
     if (!open) return; // wasn't open \u2014 no-op
     activityOpenIntervals.delete(tabId);
@@ -880,6 +1004,7 @@ function recordActivity(tabId, busy, engine) {
     } catch (e) {
       console.error('[Activity] save failed:', e.message);
     }
+    scheduleProjectActivityBroadcast('activity-close');
   }
 }
 
@@ -1787,11 +1912,13 @@ function resolveClaudeSessionFileForTab(tabId, sessionId = bridgeKnownSessions.g
   return located?.filePath || null;
 }
 
-function emitClaudeBusyState(tabId, busy, reason) {
+function emitClaudeBusyState(tabId, busy, reason, meta = null) {
   claudeSpinnerBusy.set(tabId, busy);
   recordActivity(tabId, busy, 'claude');
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('claude:busy-state', { tabId, busy, reason });
+    const payload = { tabId, busy, reason };
+    if (meta && typeof meta === 'object') Object.assign(payload, meta);
+    mainWindow.webContents.send('claude:busy-state', payload);
   }
 }
 
@@ -1835,7 +1962,10 @@ function completeClaudeLocalCommand(tabId, reason) {
   stopClaudeLocalCommandWatcher(tabId, reason);
   clearTimeout(claudeSpinnerIdleTimer.get(tabId));
   claudeSpinnerIdleTimer.delete(tabId);
-  emitClaudeBusyState(tabId, false, 'local-command');
+  emitClaudeBusyState(tabId, false, 'local-command', {
+    localCommand: state.command,
+    localCommandReason: reason,
+  });
   console.log('[ClaudeLocalCommand] DONE tab=' + tabId.slice(-12) + ' command=' + state.command + ' reason=' + reason);
 }
 
@@ -1927,7 +2057,11 @@ function startClaudeLocalCommandWatcher(tabId, command, source = 'unknown') {
   state.timeout.unref?.();
   clearTimeout(claudeSpinnerIdleTimer.get(tabId));
   claudeSpinnerIdleTimer.delete(tabId);
-  emitClaudeBusyState(tabId, true, 'local-command');
+  emitClaudeBusyState(tabId, true, 'local-command', {
+    localCommand: normalized,
+    localCommandReason: 'start',
+    localCommandSource: source,
+  });
   console.log('[ClaudeLocalCommand] START tab=' + tabId.slice(-12) + ' command=' + normalized + ' source=' + source + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none') + ' file=' + (filePath ? filePath.replace(os.homedir(), '~') : 'missing') + ' offset=' + offset);
 }
 
@@ -5515,6 +5649,7 @@ app.whenReady().then(() => {
     webServer.start({
       sdkSessions,
       computeActiveLoaders,
+      computeProjectActivity,
       // Mobile question answering (PTY drives TUI keystrokes, SDK resolves the
       // parked canUseTool Promise) + snapshot read for connect-mid-question.
       answerClaudeQuestion: answerClaudeQuestionUnified,
@@ -5548,7 +5683,7 @@ app.whenReady().then(() => {
         // Dev и любой другой порт → локальный LAN-IP.
         const isProd = info.port === 7878;
         const url = isProd
-          ? `https://remote-control.f9922.tech/?token=${encodeURIComponent(info.token)}`
+          ? `https://remote-control.f9922.tech:8443/?token=${encodeURIComponent(info.token)}`
           : `http://${info.lanIp}:${info.port}/?token=${encodeURIComponent(info.token)}`;
         require('electron').shell.openExternal(url);
         return { ok: true };
@@ -6278,6 +6413,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
 
       // Parse OSC 133 for command lifecycle events (just spy, don't modify)
       parseOSC133AndEmit(tabId, data);
+      tryHandleCodexCwdChooserAutoEnter(tabId, data);
 
       // ========== CLAUDE HANDSHAKE (Prompt Injection) ==========
       // Wait for prompt to appear, debounce UI settling, then send pending prompt.
@@ -6773,6 +6909,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
 	      claudeCliActive.delete(tabId);
 	      clearBridgeTab(tabId);
 	      clearCodexKnownSession(tabId, 'pty-exit');
+      clearCodexCwdChooserAutoEnter(tabId, 'pty-exit');
       clearTimeout(geminiSpinnerIdleTimers.get(tabId));
       geminiSpinnerBusy.delete(tabId);
       geminiSpinnerIdleTimers.delete(tabId);
@@ -9119,6 +9256,22 @@ ipcMain.on('project:save-tabs-sync', (event, { projectId, tabs, forceCleanup }) 
   event.returnValue = { success: true };
 });
 
+ipcMain.on('tab-notification:play-sound', () => {
+  try {
+    if (process.platform === 'darwin') {
+      const soundPath = '/System/Library/Sounds/Glass.aiff';
+      if (fs.existsSync(soundPath)) {
+        const child = spawn('afplay', [soundPath], { stdio: 'ignore', detached: true });
+        child.unref();
+        return;
+      }
+    }
+    process.stdout.write('\x07');
+  } catch (e) {
+    console.warn('[TabNotification] sound failed: ' + (e?.message || e));
+  }
+});
+
 ipcMain.handle('project:save-metadata', (event, { projectId, metadata }) => {
   projectManager.saveProjectMetadata(projectId, metadata);
   return { success: true };
@@ -10826,6 +10979,81 @@ ipcMain.handle('file:read', async (event, filePath) => {
   }
 });
 
+function buildExternalToolPath() {
+  const homeDir = os.homedir();
+  const extraPaths = [
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    path.join(homeDir, '.local', 'bin'),
+    path.join(homeDir, '.claude', 'local', 'bin'),
+  ];
+  return [...extraPaths, process.env.PATH || ''].filter(Boolean).join(':');
+}
+
+function execFileAsync(command, args, options = {}) {
+  const { execFile } = require('child_process');
+  return new Promise((resolve, reject) => {
+    execFile(command, args, options, (error, stdout, stderr) => {
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+ipcMain.handle('file:open-in-sublime', async (event, filePath) => {
+  try {
+    if (typeof filePath !== 'string' || !path.isAbsolute(filePath)) {
+      return { success: false, error: 'Invalid file path' };
+    }
+
+    const stats = fs.statSync(filePath);
+    if (!stats.isFile()) {
+      return { success: false, error: 'Path is not a file' };
+    }
+
+    const env = { ...process.env, PATH: buildExternalToolPath() };
+    const candidates = [
+      process.env.SUBLIME_TEXT_CLI,
+      '/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl',
+      'subl',
+    ].filter(Boolean);
+
+    let lastError = null;
+    for (const candidate of candidates) {
+      try {
+        await execFileAsync(candidate, [filePath], { env, timeout: 10000 });
+        console.log('[FileOps:Sublime] Opened file via ' + candidate + ': ' + filePath);
+        return { success: true, method: candidate };
+      } catch (error) {
+        lastError = error;
+        console.warn('[FileOps:Sublime] Failed via ' + candidate + ': ' + (error.stderr || error.message || error));
+      }
+    }
+
+    try {
+      await execFileAsync('open', ['-a', 'Sublime Text', filePath], { env, timeout: 10000 });
+      console.log('[FileOps:Sublime] Opened file via LaunchServices: ' + filePath);
+      return { success: true, method: 'open -a Sublime Text' };
+    } catch (error) {
+      lastError = error;
+      console.error('[FileOps:Sublime] LaunchServices fallback failed:', error.stderr || error.message || error);
+    }
+
+    return {
+      success: false,
+      error: lastError?.stderr || lastError?.message || 'Sublime Text is not available',
+    };
+  } catch (error) {
+    console.error('[FileOps:Sublime] Error opening file:', error);
+    return { success: false, error: error.message };
+  }
+});
+
 ipcMain.handle('file:read-directory', async (event, dirPath) => {
   try {
     const items = fs.readdirSync(dirPath, { withFileTypes: true });
@@ -11239,6 +11467,8 @@ const CODEX_WATCHER_TTL_MS = 10 * 60 * 1000;
 const CODEX_WATCHER_SCAN_MS = 1000;
 const CODEX_TURN_CATCHUP_BYTES = 8 * 1024 * 1024;
 const CODEX_SYNC_MARKER = '\x1b[?2026l';
+const CODEX_CWD_CHOOSER_AUTO_ENTER_TTL_MS = 45 * 1000;
+const CODEX_CWD_CHOOSER_BUFFER_LIMIT = 20 * 1024;
 // Parser order matters: `xhigh` renders as "Extra high", so it must be matched
 // before plain `high` or the effort picker selects the wrong row.
 const CODEX_PICKER_EFFORT_CANDIDATES = ['minimal', 'low', 'medium', 'xhigh', 'high'];
@@ -11282,6 +11512,45 @@ function emitCodexBusy(tabId, busy, reason) {
   }
 }
 
+// Live context-window fill % for the control-bar meter — Codex parity with the
+// Claude/SDK context chip. The number is NOT our own running tally: it comes
+// straight from the rollout `token_count.info`, the authoritative record Codex
+// writes itself (same field that feeds usage/Timeline).
+//
+// Formula: info.last_token_usage.total_tokens / info.model_context_window.
+// `last_token_usage` is the MOST RECENT single request — and because each turn
+// re-sends the whole prior conversation, that request's total ≈ current context
+// occupancy. Do NOT use info.total_token_usage here: that's cumulative
+// session-lifetime billing (tens of millions of tokens across a long session →
+// it divides to thousands-of-percent and clamps to 100% forever). The renderer
+// reuses the exact same `contextPct` state + SQLite persistence as Claude, so
+// once this fires the Codex chip seeds/persists for free. See
+// fact-claude-control-bar.md::Context % bridge + fact-codex.md::Timeline.
+function emitCodexContextPct(tabId, info) {
+  if (!tabId || !info) return;
+  const last = info.last_token_usage || {};
+  const used = Number(last.total_tokens || 0);
+  const windowSize = Number(info.model_context_window || 0);
+  if (windowSize <= 0 || used <= 0) return;
+  const pct = Math.min(100, Math.max(0, (used / windowSize) * 100));
+  const state = codexTurnWatchers.get(tabId);
+  const sessionId = state?.sessionId || codexKnownSessions.get(tabId) || null;
+  console.log('[CodexContext] tab=' + String(tabId).slice(-12) + ' session=' + (sessionId || 'unknown') + ' used=' + used + ' window=' + windowSize + ' pct=' + pct.toFixed(1));
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('codex:context-update', { tabId, sessionId, contextPct: pct });
+  }
+  // Mirror to mobile/native SSE subscribers via the same `bridge-update` envelope
+  // Claude uses, so the phone header pill gets Codex context % too. Codex has no
+  // StatusLine bridge, so without this the native client never receives a value.
+  try {
+    _webBroadcast(tabId, {
+      type: 'bridge-update',
+      sessionId: sessionId || undefined,
+      contextPct: pct,
+    });
+  } catch {}
+}
+
 function closeCodexTurnWatcher(tabId, reason = 'close') {
   const state = codexTurnWatchers.get(tabId);
   if (!state) return;
@@ -11313,6 +11582,210 @@ function codexEventType(record) {
   return record.payload?.type || null;
 }
 
+function codexLiveUuid(state, record, kind) {
+  state.liveMessageSeq = (state.liveMessageSeq || 0) + 1;
+  const sid = state.sessionId || 'unknown';
+  const ts = String(record?.timestamp || Date.now()).replace(/[^0-9A-Za-z]+/g, '-');
+  return 'codex-live-' + sid + '-' + ts + '-' + state.liveMessageSeq + '-' + kind;
+}
+
+function extractCodexLiveText(content) {
+  if (!content) return '';
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) {
+    if (typeof content.text === 'string') return content.text;
+    if (typeof content.value === 'string') return content.value;
+    if (typeof content.message === 'string') return content.message;
+    return '';
+  }
+  const out = [];
+  for (const part of content) {
+    if (!part) continue;
+    if (typeof part === 'string') {
+      out.push(part);
+    } else if (typeof part.text === 'string') {
+      out.push(part.text);
+    } else if (typeof part.value === 'string') {
+      out.push(part.value);
+    } else if (typeof part.message === 'string') {
+      out.push(part.message);
+    }
+  }
+  return out.join('\n');
+}
+
+function extractCodexLiveReasoning(summary) {
+  if (!summary) return '';
+  if (typeof summary === 'string') return summary;
+  if (!Array.isArray(summary)) return '';
+  return summary.map((part) => {
+    if (!part) return '';
+    if (typeof part === 'string') return part;
+    return part.text || part.summary || part.content || '';
+  }).filter(Boolean).join('\n');
+}
+
+function parseCodexLiveArgs(payload) {
+  const raw = payload?.arguments != null ? payload.arguments : payload?.input;
+  if (raw == null) return {};
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : { value: parsed };
+    } catch {
+      return { raw };
+    }
+  }
+  return raw && typeof raw === 'object' ? raw : { value: raw };
+}
+
+function buildCodexLiveRawMessage(state, record) {
+  const payload = record?.payload || {};
+  const event = codexEventType(record);
+  const sessionId = state.sessionId || codexKnownSessions.get(state.tabId) || null;
+
+  if (record.type === 'event_msg' && event === 'user_message') {
+    const text = payload.message || extractCodexLiveText(payload.content) || '';
+    if (!String(text).trim()) return null;
+    const uuid = codexLiveUuid(state, record, 'user');
+    return {
+      type: 'user',
+      uuid,
+      sessionId,
+      message: { role: 'user', content: [{ type: 'text', text }] },
+    };
+  }
+
+  if (record.type !== 'response_item') return null;
+
+  if (payload.type === 'reasoning') {
+    const thinking = extractCodexLiveReasoning(payload.summary);
+    if (!String(thinking).trim()) return null;
+    const uuid = codexLiveUuid(state, record, 'thinking');
+    return {
+      type: 'assistant',
+      uuid,
+      sessionId,
+      message: {
+        id: uuid,
+        role: 'assistant',
+        content: [{ type: 'thinking', thinking }],
+      },
+    };
+  }
+
+  if (payload.type === 'message' && payload.role === 'assistant') {
+    const text = extractCodexLiveText(payload.content);
+    if (!String(text).trim()) return null;
+    const uuid = codexLiveUuid(state, record, 'assistant');
+    return {
+      type: 'assistant',
+      uuid,
+      sessionId,
+      message: {
+        id: uuid,
+        role: 'assistant',
+        content: [{ type: 'text', text }],
+      },
+    };
+  }
+
+  if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
+    const callId = payload.call_id || payload.id || codexLiveUuid(state, record, 'tool');
+    const uuid = codexLiveUuid(state, record, 'tool');
+    return {
+      type: 'assistant',
+      uuid,
+      sessionId,
+      message: {
+        id: uuid,
+        role: 'assistant',
+        content: [{
+          type: 'tool_use',
+          id: callId,
+          name: payload.name || payload.tool_name || payload.type || 'tool',
+          input: parseCodexLiveArgs(payload),
+        }],
+      },
+    };
+  }
+
+  if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
+    const callId = payload.call_id || payload.id;
+    if (!callId) return null;
+    const output = typeof payload.output === 'string'
+      ? payload.output
+      : payload.output != null ? JSON.stringify(payload.output, null, 2) : '';
+    const uuid = codexLiveUuid(state, record, 'tool-result');
+    return {
+      type: 'user',
+      uuid,
+      sessionId,
+      message: {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: callId,
+          content: output,
+          is_error: !!payload.is_error,
+        }],
+      },
+    };
+  }
+
+  return null;
+}
+
+function summarizeCodexTurnChunk(text) {
+  const summary = {
+    lines: 0,
+    parseErrors: 0,
+    eventCounts: new Map(),
+    responseItems: 0,
+    compacted: 0,
+    otherTypes: new Map(),
+    lastEvent: null,
+    lastResponseItem: null,
+  };
+  const bump = (map, key) => map.set(key, (map.get(key) || 0) + 1);
+  for (const line of String(text || '').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    summary.lines += 1;
+    let record;
+    try {
+      record = JSON.parse(trimmed);
+    } catch {
+      summary.parseErrors += 1;
+      continue;
+    }
+    if (record.type === 'event_msg') {
+      const event = codexEventType(record) || 'unknown';
+      bump(summary.eventCounts, event);
+      summary.lastEvent = event + '@' + (record.timestamp || 'n/a');
+    } else if (record.type === 'response_item') {
+      summary.responseItems += 1;
+      const item = record.payload || record.item || record.response_item || {};
+      summary.lastResponseItem = (item.type || record.payload?.type || 'response_item') + '@' + (record.timestamp || 'n/a');
+    } else if (record.type === 'compacted') {
+      summary.compacted += 1;
+    } else {
+      bump(summary.otherTypes, record.type || 'unknown');
+    }
+  }
+  const fmtMap = (map) => Array.from(map.entries()).map(([k, v]) => k + ':' + v).join(',') || '-';
+  return {
+    lines: summary.lines,
+    parseErrors: summary.parseErrors,
+    events: fmtMap(summary.eventCounts),
+    responseItems: summary.responseItems,
+    compacted: summary.compacted,
+    other: fmtMap(summary.otherTypes),
+    lastEvent: summary.lastEvent || '-',
+    lastResponseItem: summary.lastResponseItem || '-',
+  };
+}
+
 function processCodexTurnLine(state, line) {
   const text = String(line || '').trim();
   if (!text) return;
@@ -11322,8 +11795,23 @@ function processCodexTurnLine(state, line) {
   } catch {
     return;
   }
+  const liveMessage = buildCodexLiveRawMessage(state, record);
+  if (liveMessage) {
+    _webBroadcast(state.tabId, {
+      type: 'message',
+      sessionId: state.sessionId || codexKnownSessions.get(state.tabId) || null,
+      message: liveMessage,
+    });
+  }
   const event = codexEventType(record);
   if (!event) return;
+  if (event === 'token_count') {
+    // Codex emits token_count on every assistant step (and a final one at
+    // turn end) — this is the live feed for the context-window meter. Not a
+    // turn-lifecycle event, so it doesn't touch busy/lastEvent bookkeeping.
+    emitCodexContextPct(state.tabId, record.payload?.info);
+    return;
+  }
   if (event === 'task_started') {
     state.lastEventType = event;
     state.lastEventTs = record.timestamp || null;
@@ -11345,6 +11833,7 @@ function processCodexTurnLine(state, line) {
 
 function inferCodexBusyFromText(text) {
   let inferred = null;
+  let lastTokenInfo = null;
   const lines = String(text || '').split('\n');
   for (const line of lines) {
     const trimmed = String(line || '').trim();
@@ -11360,9 +11849,15 @@ function inferCodexBusyFromText(text) {
       inferred = { busy: true, event, timestamp: record.timestamp || null };
     } else if (event === 'task_complete' || event === 'turn_aborted') {
       inferred = { busy: false, event, timestamp: record.timestamp || null };
+    } else if (event === 'token_count' && record.payload?.info) {
+      // Carry the freshest token_count so a resumed/re-armed watcher can seed
+      // the context meter from the transcript tail without waiting for the
+      // next live turn. Returned separately from busy because token_count is
+      // not a turn-lifecycle event.
+      lastTokenInfo = record.payload.info;
     }
   }
-  return inferred;
+  return { inferred, lastTokenInfo };
 }
 
 async function catchUpCodexTurnState(tabId, filePath, fileSize) {
@@ -11380,9 +11875,16 @@ async function catchUpCodexTurnState(tabId, filePath, fileSize) {
       text = firstNewline >= 0 ? text.slice(firstNewline + 1) : '';
     }
 
-    const inferred = inferCodexBusyFromText(text);
+    const { inferred, lastTokenInfo } = inferCodexBusyFromText(text);
     const state = codexTurnWatchers.get(tabId);
     if (!state || state.filePath !== filePath) return;
+
+    // Seed the context meter from the tail's freshest token_count, independent of
+    // turn-lifecycle events: a resumed/re-armed watcher should show the current
+    // context fill immediately instead of waiting for the next live turn. Fires
+    // even when there were no task_* events in the window.
+    if (lastTokenInfo) emitCodexContextPct(tabId, lastTokenInfo);
+
     if (!inferred) {
       console.log('[CodexTurn] catch-up no-events tab=' + String(tabId).slice(-12) + ' bytes=' + bytesRead + ' start=' + start);
       return;
@@ -11450,6 +11952,21 @@ async function scanCodexTurnAppend(tabId, reason = 'scan') {
         stream.on('error', reject);
         stream.on('end', () => resolve(out));
       });
+      const chunkSummary = summarizeCodexTurnChunk(chunk);
+      console.log('[CodexTurn:Delta]' +
+        ' tab=' + String(tabId).slice(-12) +
+        ' session=' + (state.sessionId || 'unknown') +
+        ' reason=' + reason +
+        ' bytes=' + chunk.length +
+        ' range=' + start + '..' + stat.size +
+        ' lines=' + chunkSummary.lines +
+        ' parseErrors=' + chunkSummary.parseErrors +
+        ' events=' + chunkSummary.events +
+        ' responseItems=' + chunkSummary.responseItems +
+        ' compacted=' + chunkSummary.compacted +
+        ' other=' + chunkSummary.other +
+        ' lastEvent=' + chunkSummary.lastEvent +
+        ' lastResponseItem=' + chunkSummary.lastResponseItem);
       processCodexTurnText(state, chunk);
     } while (state.needsScan);
   } finally {
@@ -11656,6 +12173,90 @@ function cleanCodexTuiFrame(raw) {
     .replace(/\x1b\[\?25[hl]/g, '')
     .replace(/\x1b\[\?2026[hl]/g, '');
   return stripVTControlCharacters(normalized);
+}
+
+function clearCodexCwdChooserAutoEnter(tabId, reason = 'clear') {
+  const state = codexCwdChooserAutoEnter.get(tabId);
+  if (!state) return;
+  if (state.timeout) clearTimeout(state.timeout);
+  codexCwdChooserAutoEnter.delete(tabId);
+  console.log('[CodexCwdChooser] clear tab=' + String(tabId).slice(-12) + ' reason=' + reason + ' fired=' + !!state.fired);
+}
+
+function armCodexCwdChooserAutoEnter(tabId, { command, sessionId, cwd } = {}) {
+  if (!tabId) return;
+  clearCodexCwdChooserAutoEnter(tabId, 'rearm');
+  const state = {
+    raw: '',
+    command: command || '',
+    sessionId: sessionId || null,
+    cwd: cwd || null,
+    armedAt: Date.now(),
+    fired: false,
+    timeout: null,
+  };
+  state.timeout = setTimeout(() => {
+    clearCodexCwdChooserAutoEnter(tabId, 'ttl');
+  }, CODEX_CWD_CHOOSER_AUTO_ENTER_TTL_MS);
+  codexCwdChooserAutoEnter.set(tabId, state);
+  console.log('[CodexCwdChooser] armed tab=' + String(tabId).slice(-12) +
+    ' command=' + (state.command || 'unknown') +
+    ' session=' + (state.sessionId ? String(state.sessionId).slice(0, 8) : 'none') +
+    ' cwd=' + (state.cwd || 'n/a') +
+    ' ttlMs=' + CODEX_CWD_CHOOSER_AUTO_ENTER_TTL_MS);
+}
+
+function isCodexResumeCwdChooser(cleanText) {
+  const text = String(cleanText || '').replace(/\u00a0/g, ' ');
+  const compact = text.toLowerCase().replace(/\s+/g, ' ');
+  const squashed = compact.replace(/[^a-z0-9]+/g, '');
+  const hasPhrase = (phrase) => squashed.includes(String(phrase).toLowerCase().replace(/[^a-z0-9]+/g, ''));
+  const secondOptionSelected = /[›❯>]\s*2\.\s*Use\s+current\s+directory/i.test(text);
+  if (secondOptionSelected) return false;
+  return hasPhrase('directory to resume this session') &&
+    hasPhrase('session latest cwd recorded in the resumed session') &&
+    hasPhrase('current your current working directory') &&
+    hasPhrase('use session directory') &&
+    hasPhrase('use current directory') &&
+    hasPhrase('press enter to continue');
+}
+
+function tryHandleCodexCwdChooserAutoEnter(tabId, data) {
+  const state = codexCwdChooserAutoEnter.get(tabId);
+  if (!state || state.fired) return;
+  const ageMs = Date.now() - state.armedAt;
+  if (ageMs > CODEX_CWD_CHOOSER_AUTO_ENTER_TTL_MS) {
+    clearCodexCwdChooserAutoEnter(tabId, 'expired-on-data');
+    return;
+  }
+  state.raw += data;
+  if (state.raw.length > CODEX_CWD_CHOOSER_BUFFER_LIMIT) {
+    state.raw = state.raw.slice(-CODEX_CWD_CHOOSER_BUFFER_LIMIT);
+  }
+  const clean = cleanCodexTuiFrame(state.raw);
+  if (!isCodexResumeCwdChooser(clean)) return;
+
+  state.fired = true;
+  const preview = clean.replace(/\s+/g, ' ').trim().slice(0, 260);
+  console.log('[CodexCwdChooser] detected tab=' + String(tabId).slice(-12) +
+    ' command=' + (state.command || 'unknown') +
+    ' session=' + (state.sessionId ? String(state.sessionId).slice(0, 8) : 'none') +
+    ' ageMs=' + ageMs +
+    ' rawBytes=' + state.raw.length +
+    ' preview=' + JSON.stringify(preview) +
+    ' — sending Enter in 120ms');
+  setTimeout(() => {
+    const current = codexCwdChooserAutoEnter.get(tabId);
+    if (current !== state) return;
+    const term = terminals.get(tabId);
+    if (term) {
+      console.log('[CodexCwdChooser] writing Enter tab=' + String(tabId).slice(-12));
+      term.write('\r');
+    } else {
+      console.warn('[CodexCwdChooser] terminal missing before Enter tab=' + String(tabId).slice(-12));
+    }
+    clearCodexCwdChooserAutoEnter(tabId, 'confirmed');
+  }, 120);
 }
 
 function normalizeCodexPickerValue(value) {
@@ -11897,9 +12498,10 @@ async function stashCodexDraftForPicker(term, { logPrefix, draftPreview = '' } =
   }
 }
 
-async function restoreCodexDraftAfterPicker(term, { logPrefix, slashSubmitted = false } = {}) {
+async function restoreCodexDraftAfterPicker(term, { logPrefix, slashSubmitted = false, expectedPreview = '' } = {}) {
   const presses = slashSubmitted ? 2 : 1;
   console.log(logPrefix + ' draft-restore start arrowUp=' + presses + ' slashSubmitted=' + slashSubmitted);
+  let lastFrame = null;
   for (let i = 0; i < presses; i++) {
     try {
       const frame = await sendCodexKeyAndCapture(
@@ -11908,12 +12510,19 @@ async function restoreCodexDraftAfterPicker(term, { logPrefix, slashSubmitted = 
         1600,
         logPrefix + ':draft-restore#' + (i + 1)
       );
+      lastFrame = frame;
       console.log(logPrefix + ' draft-restore step=' + (i + 1) + '/' + presses + ' timedOut=' + frame.timedOut + ' clean=' + JSON.stringify(frame.clean.slice(0, 240)));
     } catch (error) {
       console.warn(logPrefix + ' draft-restore step=' + (i + 1) + ' error: ' + (error?.message || String(error)));
       break;
     }
   }
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const expected = normalize(expectedPreview);
+  const actual = normalize(lastFrame?.clean || '');
+  const expectedPrefix = expected.slice(0, 32);
+  const matched = !expectedPrefix || actual.includes(expectedPrefix);
+  console.log(logPrefix + ' draft-restore verify expectedPrefix=' + JSON.stringify(expectedPrefix) + ' matched=' + matched + ' actual=' + JSON.stringify(actual.slice(0, 240)));
 }
 
 async function selectCodexModelEffort(term, {
@@ -12047,7 +12656,7 @@ async function selectCodexModelEffort(term, {
       if (slashSubmitted && outcome?.success !== true) {
         try { term.write('\x1b'); } catch {}
       }
-      await restoreCodexDraftAfterPicker(term, { logPrefix, slashSubmitted });
+      await restoreCodexDraftAfterPicker(term, { logPrefix, slashSubmitted, expectedPreview: draftPreview });
     }
   }
 }
@@ -12456,6 +13065,12 @@ ipcMain.on('codex:run-command', (event, { tabId, command, sessionId, cwd, model,
   const effectiveModel = model || readDefaultCodexSetting('defaultCodexModel');
   const effectiveEffort = effort || readDefaultCodexSetting('defaultCodexEffort');
   console.log('[Codex Runner] Command:', command, 'tab:', tabId, 'session:', sessionId || 'new', 'cwd:', termCwd, 'model:', effectiveModel || 'default', 'effort:', effectiveEffort || 'default');
+
+  if ((command === 'codex-c' || command === 'codex-f') && sessionId) {
+    armCodexCwdChooserAutoEnter(tabId, { command, sessionId, cwd: termCwd });
+  } else {
+    clearCodexCwdChooserAutoEnter(tabId, 'not-resume-command');
+  }
 
   if (command === 'codex-c' && sessionId) {
     closeCodexWatcher(tabId, 'resume-known-session');
@@ -13329,6 +13944,10 @@ function loadGlobalMcpServers() {
 // Same path resolution as the startup load — must use srcMainDir, not relative.
 function _webBroadcast(tabId, payload) {
   try { require(path.join(srcMainDir, 'web-server')).webBroadcast(tabId, payload); } catch {}
+  const type = payload && payload.type;
+  if (type === 'busy' || type === 'done' || type === 'snapshot') {
+    scheduleProjectActivityBroadcast('tab-' + type);
+  }
 }
 
 // Event-driven hand-off: fired whenever a tab's Claude sessionId becomes
@@ -13340,6 +13959,7 @@ function _notifyClaudeSession(tabId, sessionId) {
   try {
     require(path.join(srcMainDir, 'web-server')).notifyClaudeSessionAvailable(tabId);
   } catch {}
+  scheduleProjectActivityBroadcast('claude-session');
   // Mobile subscribers also need the sessionId itself for their snapshot —
   // sending it through the WS protocol lets the phone update without waiting
   // for the next /status poll.
@@ -14169,13 +14789,13 @@ ipcMain.handle('claude-sdk:send-message', async (event, { tabId, cwd, prompt, mo
 });
 
 // Forward SDK busy state to TabBar via existing claude:busy-state channel
-ipcMain.on('claude-sdk:busy-state', (event, { tabId, busy }) => {
+ipcMain.on('claude-sdk:busy-state', (event, { tabId, busy, reason }) => {
   // Activity tracking — for SDK tabs this is the ONLY busy signal (no PTY,
   // no spinner heuristic, no Stop hook). Idempotent recorder.
   recordActivity(tabId, busy, 'claude-sdk');
   const win = BrowserWindow.getAllWindows()[0];
   if (win && !win.isDestroyed()) {
-    win.webContents.send('claude:busy-state', { tabId, busy });
+    win.webContents.send('claude:busy-state', { tabId, busy, reason });
   }
 });
 
