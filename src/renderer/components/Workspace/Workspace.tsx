@@ -294,10 +294,17 @@ export default function Workspace() {
       return;
     }
 
-    // Sidebar open — restore saved file only if persist toggle is on. Otherwise
-    // we want a clean tree on every reopen.
+    // Sidebar open — persist=false only disables automatic restore on reopen.
+    // A direct file click must still keep its preview; otherwise the click opens
+    // successfully and this sync effect closes it in the next render.
     if (!sidebarPersistFile) {
-      if (filePreview && filePreview.source !== 'tab') closeFilePreview();
+      if (filePreview) {
+        console.warn('[SidebarPreviewSync] persist-off-keep-current', {
+          previewPath: filePreview.path,
+          previewSource: filePreview.source || null,
+          openFilePath,
+        });
+      }
       return;
     }
     if (filePreview?.source === 'tab') return;
