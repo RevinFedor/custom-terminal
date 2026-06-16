@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
+import { ExternalLink, Loader2 } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -10,9 +11,10 @@ export default function FilePreview() {
   const { filePreview, closeFilePreview, showToast } = useUIStore();
   const filePreviewFontSize = useUIStore((s) => s.filePreviewFontSize);
   const setFilePreviewFontSize = useUIStore((s) => s.setFilePreviewFontSize);
-  const { activeProjectId, getSidebarState, setOpenFilePath } = useWorkspaceStore();
+  const { activeProjectId, getSidebarState, setOpenFilePath, closeTab } = useWorkspaceStore();
   const { sidebarOpen } = activeProjectId ? getSidebarState(activeProjectId) : { sidebarOpen: false };
   const [copied, setCopied] = useState(false);
+  const [openingSublime, setOpeningSublime] = useState(false);
 
   const handleCopyContent = async () => {
     if (filePreview) {
@@ -24,7 +26,29 @@ export default function FilePreview() {
     }
   };
 
+  const handleOpenInSublime = async () => {
+    if (!filePreview || openingSublime) return;
+    const targetPath = filePreview.path;
+    setOpeningSublime(true);
+    try {
+      const { ipcRenderer } = window.require('electron');
+      const result = await ipcRenderer.invoke('file:open-in-sublime', targetPath);
+      if (!result?.success) {
+        showToast(`Sublime Text: ${result?.error || 'failed to open file'}`, 'error');
+      }
+    } catch (error: any) {
+      showToast(`Sublime Text: ${error?.message || 'failed to open file'}`, 'error');
+    } finally {
+      setOpeningSublime(false);
+    }
+  };
+
   const handleClose = () => {
+    if (filePreview?.source === 'tab' && filePreview.sourceTabId && activeProjectId) {
+      closeFilePreview();
+      closeTab(activeProjectId, filePreview.sourceTabId, { skipProcessCheck: true }).catch(() => {});
+      return;
+    }
     closeFilePreview();
     if (activeProjectId) {
       setOpenFilePath(activeProjectId, null);
@@ -36,13 +60,21 @@ export default function FilePreview() {
 
   if (!filePreview) return null;
 
+  const tabbarRect = document.querySelector('[data-tabbar-vertical]')?.getBoundingClientRect();
+  const tabPreviewLeft = tabbarRect?.right ?? 0;
+  const tabPreviewTop = tabbarRect?.top ?? 70;
+  const previewLeft = filePreview.source === 'tab'
+    ? tabPreviewLeft
+    : (sidebarOpen ? (useUIStore.getState().sidebarWidth || 280) : 0);
+  const previewTop = filePreview.source === 'tab' ? tabPreviewTop : 36;
+
   return createPortal(
     <div
       data-file-preview-root
       style={{
         position: 'fixed',
-        top: 36,
-        left: sidebarOpen ? (useUIStore.getState().sidebarWidth || 280) : 0,
+        top: previewTop,
+        left: previewLeft,
         right: 0,
         bottom: 0,
         zIndex: 100000,
@@ -79,6 +111,20 @@ export default function FilePreview() {
             >+</button>
             </Tooltip>
           </div>
+          <Tooltip content="Open in Sublime Text">
+          <button
+            className="h-7 px-2 flex items-center gap-1.5 rounded text-xs text-[#666] hover:text-accent hover:bg-white/5 disabled:opacity-60 disabled:cursor-default transition-colors"
+            disabled={openingSublime}
+            onClick={handleOpenInSublime}
+          >
+            {openingSublime ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <ExternalLink className="w-3.5 h-3.5" />
+            )}
+            <span>Sublime</span>
+          </button>
+          </Tooltip>
           <button
             className={`text-xs px-2 py-1 rounded transition-colors ${
               copied

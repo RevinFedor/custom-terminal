@@ -56,6 +56,7 @@ export default function Workspace() {
   const setSidebarOpen = useWorkspaceStore((s) => s.setSidebarOpen);
   const setSidebarExpandedDirs = useWorkspaceStore((s) => s.setSidebarExpandedDirs);
   const setOpenFilePath = useWorkspaceStore((s) => s.setOpenFilePath);
+  const createTabAfterCurrent = useWorkspaceStore((s) => s.createTabAfterCurrent);
   // Subscribe to sidebarOpen so Workspace re-renders when sidebar toggles
   const sidebarOpenForRender = useWorkspaceStore((s) => {
     const p = s.activeProjectId ? s.openProjects.get(s.activeProjectId) : null;
@@ -130,6 +131,41 @@ export default function Workspace() {
   // Per-project currentView
   const currentView = activeProject?.currentView || 'terminal';
 
+  const fileLinkTargets = useMemo(() => {
+    if (!activeProject) return [];
+    return Array.from(activeProject.tabs.values())
+      .filter((tab: any) => {
+        if (tab.parentTabId || tab.isUtility || tab.tabType === 'file') return false;
+        return tab.tabType === 'claude-sdk' || tab.commandType === 'claude' || tab.commandType === 'codex';
+      })
+      .map((tab: any) => ({
+        id: tab.id,
+        name: tab.name || 'Untitled',
+        kind: tab.commandType === 'codex' ? 'Codex' : (tab.tabType === 'claude-sdk' ? 'SDK' : 'Claude'),
+      }));
+  }, [activeProject]);
+
+  const handleLinkFileToTab = useCallback(async (filePath: string, targetTabId: string) => {
+    if (!activeProjectId) return;
+    const workspace = useWorkspaceStore.getState().openProjects.get(activeProjectId);
+    const targetTab = workspace?.tabs.get(targetTabId);
+    if (!workspace || !targetTab) return;
+
+    const fileName = path.basename(filePath);
+    const fileDir = path.dirname(filePath);
+    await createTabAfterCurrent(activeProjectId, fileName, targetTab.cwd || fileDir, {
+      tabType: 'file',
+      filePath,
+      color: 'purple',
+      nameSetManually: true,
+      background: true,
+      afterTabId: targetTabId,
+      visualParentTabId: targetTabId,
+      groupId: targetTab.groupId,
+    } as any);
+    useUIStore.getState().showToast(`Linked ${fileName}`, 'success');
+  }, [activeProjectId, createTabAfterCurrent]);
+
   // Get active tab early for process checking
   const activeTab = activeProject?.activeTabId
     ? activeProject.tabs.get(activeProject.activeTabId)
@@ -164,6 +200,10 @@ export default function Workspace() {
     }
     return activeTab;
   }, [viewingSubAgentTabId, activeProject, activeTab]);
+  const activeFileTab = currentView === 'terminal' && effectiveTab?.tabType === 'file'
+    ? effectiveTab
+    : null;
+  const activeFileTabPath = activeFileTab?.filePath || null;
 
   // Track effective session state transitions for debugging
   const prevEffectiveRef = useRef({ tab: effectiveTab?.id, claude: effectiveClaudeSessionId, gemini: effectiveGeminiSessionId, codex: effectiveCodexSessionId, cmd: effectiveCommandType });
@@ -187,6 +227,56 @@ export default function Workspace() {
     if (activeTab?.id) terminalRegistry.clearSearch(activeTab.id);
   }, [viewingSubAgentTabId]);
 
+  // Linked file tabs are real tabs in TabSidebar but render through the same
+  // FilePreview surface as Sidebar/Cmd-click file opens. The preview belongs to
+  // the active file tab only while that tab stays active.
+  useEffect(() => {
+    if (!activeProjectId) return;
+
+    if (!activeFileTabPath || !activeFileTab?.id) {
+      const currentPreview = useUIStore.getState().filePreview;
+      if (currentPreview?.source === 'tab') {
+        closeFilePreview();
+      }
+      return;
+    }
+
+    const currentPreview = useUIStore.getState().filePreview;
+    if (
+      currentPreview?.source === 'tab' &&
+      currentPreview.sourceTabId === activeFileTab.id &&
+      currentPreview.path === activeFileTabPath
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await ipcRenderer.invoke('file:read', activeFileTabPath);
+        if (!cancelled && result?.success) {
+          const ext = path.extname(activeFileTabPath).toLowerCase();
+          const language = detectLanguage(ext);
+          openFilePreview({
+            path: activeFileTabPath,
+            content: result.content,
+            language,
+            source: 'tab',
+            sourceTabId: activeFileTab.id,
+          });
+        } else if (!cancelled) {
+          useUIStore.getState().showToast(`File preview: ${result?.error || 'failed to read file'}`, 'error');
+        }
+      } catch (e: any) {
+        if (!cancelled) {
+          useUIStore.getState().showToast(`File preview: ${e?.message || 'failed to read file'}`, 'error');
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [activeProjectId, activeFileTabPath, activeFileTab?.id, currentView, closeFilePreview, openFilePreview]);
+
   // Sync file preview with sidebar state (project switch + sidebar open/close)
   useEffect(() => {
     if (!activeProjectId) return;
@@ -197,7 +287,7 @@ export default function Workspace() {
     if (!sidebarOpenForRender) {
       // Sidebar closed — hide file preview. When persist=false, also drop the saved
       // path so the next sidebar open starts clean (just the tree, no file).
-      if (filePreview) closeFilePreview();
+      if (filePreview && filePreview.source !== 'tab') closeFilePreview();
       if (!sidebarPersistFile && openFilePath) {
         setOpenFilePath(activeProjectId, null);
       }
@@ -207,9 +297,10 @@ export default function Workspace() {
     // Sidebar open — restore saved file only if persist toggle is on. Otherwise
     // we want a clean tree on every reopen.
     if (!sidebarPersistFile) {
-      if (filePreview) closeFilePreview();
+      if (filePreview && filePreview.source !== 'tab') closeFilePreview();
       return;
     }
+    if (filePreview?.source === 'tab') return;
     if (filePreview && filePreview.path !== openFilePath) {
       closeFilePreview();
     }
@@ -220,14 +311,14 @@ export default function Workspace() {
           if (result.success) {
             const ext = path.extname(openFilePath).toLowerCase();
             const language = detectLanguage(ext);
-            openFilePreview({ path: openFilePath, content: result.content, language });
+            openFilePreview({ path: openFilePath, content: result.content, language, source: 'sidebar' });
           }
         } catch (e) {
           console.error('[Workspace] Failed to restore file preview:', e);
         }
       })();
     }
-  }, [activeProjectId, sidebarOpenForRender]);
+  }, [activeProjectId, sidebarOpenForRender, filePreview, closeFilePreview, getSidebarState, openFilePreview, setOpenFilePath]);
 
   // Click outside the sidebar closes it (when toggle is on). Captures mousedown
   // on window so we don't fight terminal canvas pointer-events; check whether the
@@ -250,6 +341,30 @@ export default function Workspace() {
     window.addEventListener('mousedown', onDown, true);
     return () => window.removeEventListener('mousedown', onDown, true);
   }, [sidebarOpenForRender, activeProjectId]);
+
+  // Unpinned expanded Timeline is an overlay over the terminal. A click outside
+  // Timeline should return the workspace to the collapsed rail, but clicking
+  // the StatusBar pin must be allowed to convert the open overlay into pinned
+  // layout without the mousedown closing it first.
+  useEffect(() => {
+    if (workspaceView !== 'workspace' || currentView !== 'terminal') return;
+    if (!effectiveTab?.id || timelinePinned) return;
+    const onDown = (e: MouseEvent) => {
+      const tabId = effectiveTab.id;
+      if (!useUIStore.getState().timelineTreeModeTabs[tabId]) return;
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      if (target.closest([
+        '[data-timeline]',
+        '[data-timeline-context-menu]',
+        '[data-cmd-hover-popover]',
+        '[data-history-timeline-pin-toggle]',
+      ].join(','))) return;
+      setTimelineTreeMode(tabId, false);
+    };
+    window.addEventListener('mousedown', onDown, true);
+    return () => window.removeEventListener('mousedown', onDown, true);
+  }, [workspaceView, currentView, effectiveTab?.id, timelinePinned, setTimelineTreeMode]);
 
   // Listen for OSC 133 command lifecycle events (Shell Integration)
   useEffect(() => {
@@ -623,7 +738,7 @@ export default function Workspace() {
               column (any tabType except 'browser'). Without a live AI session
               the bar dims the right cluster and shows a Start-capable chip so
               the user can spawn Claude from any terminal. */}
-          {effectiveTab && currentView === 'terminal' && effectiveTabType !== 'browser' && (
+          {effectiveTab && currentView === 'terminal' && effectiveTabType !== 'browser' && effectiveTabType !== 'file' && (
             <ClaudeControlBar
               tabId={effectiveTab.id}
               claudeSessionId={effectiveClaudeSessionId}
@@ -688,6 +803,8 @@ export default function Workspace() {
               activeFilePath={filePreview?.path || null}
               initialExpandedDirs={sidebarExpandedDirs}
               onExpandedDirsChange={(expandedDirs: Record<string, boolean>) => setSidebarExpandedDirs(activeProjectId, expandedDirs)}
+              linkTargets={fileLinkTargets}
+              onLinkFile={handleLinkFileToTab}
               onFileSelect={(filePath: string, isDir: boolean) => {
                 if (!isDir) {
                   if (filePreview?.path === filePath) {
@@ -698,7 +815,7 @@ export default function Workspace() {
                     ipc.invoke('file:read', filePath).then((result: any) => {
                       if (result?.success) {
                         const ext = filePath.split('.').pop()?.toLowerCase() || '';
-                        openFilePreview({ path: filePath, content: result.content, language: ext });
+                        openFilePreview({ path: filePath, content: result.content, language: ext, source: 'sidebar' });
                         setOpenFilePath(activeProjectId, filePath);
                       }
                     });

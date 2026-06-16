@@ -1,16 +1,17 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useUIStore } from '../../store/useUIStore';
-import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel } from '../../store/usePromptsStore';
+import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel, PROMPT_SUMMARY_PROMPT_ID } from '../../store/usePromptsStore';
 import { GEMINI_MODEL_OPTIONS } from '../../constants/geminiModels';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useMirrorStatusStore } from '../../store/useMirrorStatusStore';
+import { useTimelineSummaryStore } from '../../store/useTimelineSummaryStore';
 import Tooltip from './Tooltip';
 import ProjectIconsSettings from './ProjectIconsSettings';
 import { HexColorPicker } from 'react-colorful';
 import { Trash2, Plus } from 'lucide-react';
 import { DEFAULT_CLAUDE_CODE_SETTINGS } from '../../constants/claudeLevels';
 
-const { ipcRenderer } = window.require('electron');
+const { ipcRenderer, clipboard } = window.require('electron');
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -1267,6 +1268,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const timelineSummaryFontSize = useUIStore((s) => s.timelineSummaryFontSize);
   const timelineLineClamp = useUIStore((s) => s.timelineLineClamp);
   const setTimelineLineClamp = useUIStore((s) => s.setTimelineLineClamp);
+  const promptQueueChipFontSize = useUIStore((s) => s.promptQueueChipFontSize);
+  const setPromptQueueChipFontSize = useUIStore((s) => s.setPromptQueueChipFontSize);
+  const promptQueueEditorFontSize = useUIStore((s) => s.promptQueueEditorFontSize);
+  const setPromptQueueEditorFontSize = useUIStore((s) => s.setPromptQueueEditorFontSize);
   const promptQueueChipLineClamp = useUIStore((s) => s.promptQueueChipLineClamp);
   const setPromptQueueChipLineClamp = useUIStore((s) => s.setPromptQueueChipLineClamp);
   const setTerminalFontSize = useUIStore((s) => s.setTerminalFontSize);
@@ -1303,6 +1308,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setClaudeCodeSettings = useUIStore((s) => s.setClaudeCodeSettings);
   const claudeMdMirrorEnabled = useUIStore((s) => s.claudeMdMirrorEnabled);
   const setClaudeMdMirrorEnabled = useUIStore((s) => s.setClaudeMdMirrorEnabled);
+  const tabCompletionNotificationSound = useUIStore((s) => s.tabCompletionNotificationSound);
+  const setTabCompletionNotificationSound = useUIStore((s) => s.setTabCompletionNotificationSound);
   const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
   const mirrorStatus = useMirrorStatusStore((s) => (activeProjectId ? s.byProject[activeProjectId] : undefined));
   const setSemanticIndexParallelism = useUIStore((s) => s.setSemanticIndexParallelism);
@@ -1367,6 +1374,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [aiUsageRange, setAIUsageRange] = useState<AIUsageRange>('week');
   const [aiUsageStats, setAIUsageStats] = useState<any | null>(null);
   const [aiUsageLoading, setAIUsageLoading] = useState(false);
+  const [expandedAIUsageLogIds, setExpandedAIUsageLogIds] = useState<Set<number>>(new Set());
+  const promptSummaryPreviousUserCount = useTimelineSummaryStore((s) => s.previousUserContextCount);
+  const setPromptSummaryPreviousUserCount = useTimelineSummaryStore((s) => s.setPreviousUserContextCount);
 
   // Refs for editing containers (to check if blur target is inside)
   const claudeEditRef = useRef<HTMLDivElement>(null);
@@ -2344,6 +2354,28 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     return String(value);
   };
 
+  const fmtChars = (n: number) => {
+    const value = Number(n || 0);
+    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+    if (value >= 1000) return `${Math.round(value / 100) / 10}k`;
+    return String(value);
+  };
+
+  const toggleAIUsageLog = (id: number) => {
+    setExpandedAIUsageLogIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const copyAIUsageTabId = (tabId?: string | null) => {
+    if (!tabId) return;
+    clipboard.writeText(tabId);
+    showToast('ID вкладки скопирован', 'success');
+  };
+
   const renderTokenMetric = (label: string, value: number, color: string) => (
     <div style={{ background: VR_CARD, border: `1px solid ${VR_BORDER}`, borderRadius: 8, padding: 10, minWidth: 0 }}>
       <div style={{ color: VR_DIM, fontSize: 10, textTransform: 'uppercase', marginBottom: 6, fontWeight: 750 }}>{label}</div>
@@ -2455,22 +2487,90 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   <span style={{ color: '#666', fontSize: 10 }}>{(rows as any[]).length}</span>
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  {(rows as any[]).map((row) => (
-                    <div key={row.id} style={{ background: row.status === 'error' ? 'rgba(239,68,68,0.08)' : VR_CARD, border: `1px solid ${row.status === 'error' ? 'rgba(239,68,68,0.28)' : VR_BORDER}`, borderRadius: 8, padding: '7px 8px' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, marginBottom: 4 }}>
-                        <span style={{ color: row.status === 'error' ? '#fca5a5' : VR_TEXT, fontSize: 11.5, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          {row.promptName || row.taskType || row.promptId || 'AI prompt'}
-                        </span>
-                        {row.thinkingLevel && row.thinkingLevel !== 'NONE' && <VRTag>{row.thinkingLevel}</VRTag>}
+                  {(rows as any[]).map((row) => {
+                    const expanded = expandedAIUsageLogIds.has(row.id);
+                    const projectLabel = row.projectName || (row.projectPath ? String(row.projectPath).split('/').filter(Boolean).pop() : '') || 'project?';
+                    const tabLabel = row.tabName || (row.tabId ? row.tabId.slice(-8) : 'tab?');
+                    return (
+                      <div
+                        key={row.id}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => toggleAIUsageLog(row.id)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            toggleAIUsageLog(row.id);
+                          }
+                        }}
+                        style={{
+                          background: row.status === 'error' ? 'rgba(239,68,68,0.08)' : VR_CARD,
+                          border: `1px solid ${row.status === 'error' ? 'rgba(239,68,68,0.28)' : VR_BORDER}`,
+                          borderRadius: 8,
+                          padding: '7px 8px',
+                          cursor: 'pointer',
+                          outline: 'none',
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, marginBottom: 4 }}>
+                          <span style={{ color: row.status === 'error' ? '#fca5a5' : VR_TEXT, fontSize: 11.5, fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {row.promptName || row.taskType || row.promptId || 'AI prompt'}
+                          </span>
+                          {row.thinkingLevel && row.thinkingLevel !== 'NONE' && <VRTag>{row.thinkingLevel}</VRTag>}
+                          <div style={{ flex: 1 }} />
+                          <span style={{ color: '#73737a', display: 'inline-flex' }}>
+                            <VRChevronIcon open={expanded} />
+                          </span>
+                        </div>
+                        <div style={{ color: VR_DIM, fontSize: 10.5, display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                          <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.model || 'model?'}</span>
+                          <span style={{ fontFamily: 'ui-monospace, Menlo, monospace', whiteSpace: 'nowrap' }}>
+                            in {fmtTokens(row.promptTokens)} · out {fmtTokens(row.candidateTokens)} · think {fmtTokens(row.thoughtTokens)} · Σ {fmtTokens(row.totalTokens)}
+                          </span>
+                        </div>
+                        {expanded && (
+                          <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px solid ${VR_BORDER}`, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: '6px 10px', color: VR_DIM, fontSize: 10.5 }}>
+                            <div style={{ minWidth: 0 }}>
+                              <span style={{ color: '#666' }}>project </span>
+                              <span title={row.projectPath || projectLabel} style={{ color: VR_TEXT, overflowWrap: 'anywhere' }}>{projectLabel}</span>
+                            </div>
+                            <div style={{ minWidth: 0 }}>
+                              <span style={{ color: '#666' }}>iteration </span>
+                              <span style={{ color: VR_TEXT, fontFamily: 'ui-monospace, Menlo, monospace' }}>{row.iterationIndex ? `#${row.iterationIndex}` : '—'}</span>
+                            </div>
+                            <div style={{ minWidth: 0 }}>
+                              <span style={{ color: '#666' }}>tab </span>
+                              <span
+                                title={row.tabId ? `Copy tab id: ${row.tabId}` : tabLabel}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  copyAIUsageTabId(row.tabId);
+                                }}
+                                style={{
+                                  color: row.tabId ? '#7dd3fc' : VR_TEXT,
+                                  cursor: row.tabId ? 'pointer' : 'default',
+                                  textDecoration: row.tabId ? 'underline' : 'none',
+                                  textUnderlineOffset: 2,
+                                  overflowWrap: 'anywhere',
+                                }}
+                              >
+                                {tabLabel}
+                              </span>
+                            </div>
+                            <div style={{ minWidth: 0 }}>
+                              <span style={{ color: '#666' }}>source chars </span>
+                              <span style={{ color: VR_TEXT, fontFamily: 'ui-monospace, Menlo, monospace' }}>{fmtChars(row.sourceChars || 0)}</span>
+                            </div>
+                            {row.error && (
+                              <div style={{ gridColumn: '1 / -1', color: '#fca5a5', overflowWrap: 'anywhere' }}>
+                                {row.error}
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
-                      <div style={{ color: VR_DIM, fontSize: 10.5, display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-                        <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.model || 'model?'}</span>
-                        <span style={{ fontFamily: 'ui-monospace, Menlo, monospace', whiteSpace: 'nowrap' }}>
-                          in {fmtTokens(row.promptTokens)} · out {fmtTokens(row.candidateTokens)} · think {fmtTokens(row.thoughtTokens)} · Σ {fmtTokens(row.totalTokens)}
-                        </span>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             ))}
@@ -2582,6 +2682,18 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   </button>
                 ))}
               </div>
+
+              {editingAIPrompt.id === PROMPT_SUMMARY_PROMPT_ID && (
+                <FontSizeSlider
+                  label="Предыдущие user-сообщения"
+                  description="Контекст для Prompt Summary"
+                  value={promptSummaryPreviousUserCount}
+                  onChange={setPromptSummaryPreviousUserCount}
+                  min={0}
+                  max={10}
+                  suffix=""
+                />
+              )}
 
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                 <span style={{ fontSize: 10.5, color: VR_DIM, flexShrink: 0 }}>Цвет:</span>
@@ -3073,6 +3185,17 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               <SettingsSubSectionHeader title="Полоска процесса" />
               <ProcessBarEditor />
 
+              <SettingsSubSectionHeader title="Уведомления вкладки" />
+              <div style={{ paddingLeft: '12px' }}>
+                <LineNumbersToggle
+                  checked={tabCompletionNotificationSound}
+                  onChange={setTabCompletionNotificationSound}
+                  label="Системный звук"
+                  description="Проигрывать звук при завершении вкладки с активированным уведомлением"
+                  tooltip="Включает одноразовый системный звук при срабатывании уведомления вкладки."
+                />
+              </div>
+
               {/* 2. ТЕРМИНАЛ — шрифт самого терминала + Таймлайн как часть терминала */}
               <SettingsSectionHeader title="Терминал" />
               <SettingsGrid4>
@@ -3089,6 +3212,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
 
               <SettingsSubSectionHeader title="Run after" />
               <SettingsGrid4>
+                <FontSizeSlider label="Шрифт чипа" description="Размер текста в чипах очереди Run after" value={promptQueueChipFontSize} onChange={setPromptQueueChipFontSize} min={9} max={18} />
+                <FontSizeSlider label="Шрифт раскрытый" description="Размер текста в моталке редактирования при клике по чипу" value={promptQueueEditorFontSize} onChange={setPromptQueueEditorFontSize} min={10} max={24} />
                 <FontSizeSlider label="Строки в чипе" description="Сколько строк текста промпта показывать в каждом чипе очереди (1 = ellipsis в одну строку)" value={promptQueueChipLineClamp} onChange={setPromptQueueChipLineClamp} min={1} max={10} suffix="" />
               </SettingsGrid4>
 

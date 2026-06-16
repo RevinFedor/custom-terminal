@@ -339,6 +339,7 @@ export default function ProjectToolbar() {
       {/* Home Button */}
       <Tooltip content="Project Home">
       <button
+        data-workspace-navigation
         onClick={() => activeProjectId && setProjectView(activeProjectId, isHomeActive ? 'terminal' : 'home')}
         style={buttonStyle(isHomeActive)}
         onMouseEnter={(e) => handleMouseEnter(e, isHomeActive)}

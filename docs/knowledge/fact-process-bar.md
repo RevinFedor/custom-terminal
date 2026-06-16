@@ -77,11 +77,11 @@ Claude PTY spinner остаётся эвристикой: main эмитит `cla
 
 Маркер sessionStatus всегда слева независимо от bar-position — потому что слева удобнее читается рядом с текстом названия вкладки. Если bar тоже слева — между ними 2px зазор; если bar справа — слева остаётся padding под маркер.
 
-## Edge stop hit-zone для devServer
+## Restart button stop-mode для devServer
 
-В vertical layout process-bar у зелёной devServer-вкладки одновременно остаётся статус-индикатором и становится маленькой stop-поверхностью. Клик по самой полоске вызывает тот же deterministic stop, что top-level Stop script action: только `Ctrl+C` в PTY, без restart и без `!!`. `F7` работает только пока курсор находится на этой полоске; это не глобальный hotkey, иначе одно случайное F7 могло бы остановить не тот dev-server.
+В vertical layout process-bar остаётся **только** индикатором process-alive / AI-busy, не stop hit-zone. Stop для зелёной devServer-вкладки живёт в той же правой кнопке, которая обычно делает restart: bare hover показывает обычный `RotateCw`, `Cmd+hover` превращает **эту же кнопку с тем же местом и background'ом** в красный `Square`, click отправляет deterministic stop (`Ctrl+C`) без restart и без `!!`. Отдельную stop-кнопку рядом с вкладкой не добавлять: пользователь видит два соседних destructive/restart affordance и не понимает, какой из них главный.
 
-Причина размещения именно на edge-indicator: в vertical sidebar middle-click по всей вкладке уже имеет стандартную семантику close tab. Старый RestartZone/middle-click stop подходит для horizontal fallback, но в vertical режиме отдельной зоны справа нет, а перехват middle-click на весь row конфликтовал бы с закрытием вкладки. Поэтому у полоски есть свой `data-no-tab-drag` hit-zone, `mousedown` гасит drag/select/switch, а Cmd-hover только усиливает destructive affordance (красный tint/ширина), не меняя состояние. Bare hover показывает, что strip кликабелен; Cmd-hover говорит «это stop», а не «процесс стал красным».
+Причина: в vertical sidebar middle-click по всей вкладке уже имеет стандартную семантику close tab, а отдельная edge-hit-zone конкурировала с process-bar как чистым индикатором. Horizontal fallback всё ещё использует `RestartZone` с middle-click stop; vertical sidebar использует modifier-mode на inline reload button. Это локальное применение общего принципа `methodology/переносимый-дизайн.md::Modifier-mode на существующей action surface`.
 
 ## Settings UI (правая колонка 2-column grid)
 

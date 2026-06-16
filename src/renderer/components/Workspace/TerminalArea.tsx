@@ -291,6 +291,11 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
               cwd={tab.cwd}
             />
           );
+        } else if (tab.tabType === 'file') {
+          totalCount++;
+          // Linked file tabs render through the global FilePreview overlay in Workspace.
+          // They are real tabs for grouping/DnD/status, but they have no PTY layer.
+          return;
         } else {
           totalCount++;
           result.push(

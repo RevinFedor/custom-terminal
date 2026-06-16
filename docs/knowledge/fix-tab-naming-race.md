@@ -29,3 +29,11 @@ const tab = new Tab({
 ## Reference
 - `knowledge/fact-tabs.md` — паттерны именования.
 - `src/renderer/store/useWorkspaceStore.ts` — реализация `createTabAfterCurrent`.
+
+## Codex bootstrap-инструкции как ложный первый prompt
+
+**Симптом:** прод-вкладка Codex `019ecf86-c525-7340-9012-bb8fef436701` получила название `лаги навигации терминала`, хотя первый реальный user prompt в rollout был про вход в аккаунт и пароль. Пользователь видел это как «в этой сессии мы не решали лаги навигации терминала».
+
+**Корень:** перед первым `event_msg.user_message` Codex пишет большой bootstrap-блок `# AGENTS.md instructions for ...` как `response_item role=user`. В текущем parser'е Timeline строится из `event_msg.user_message`, но prod/legacy путь уже успел протащить bootstrap как обычный user-entry в auto-title candidate. Gemini честно назвал вкладку по тексту инструкций проекта.
+
+**Фикс:** eligibility auto-title фильтрует `AGENTS.md/GEMINI.md instructions for ...` независимо от upstream parser'а. Это defense-in-depth: даже если Codex parser, manual refresh или cache снова принесут такой блок с `type='user'`, он не станет источником названия. Реальный первый prompt остаётся `event_msg.user_message`; bootstrap-инструкции — среда выполнения, не намерение пользователя.

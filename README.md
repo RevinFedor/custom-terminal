@@ -1,8 +1,8 @@
 <p align="center">
   <h1 align="center">Noted Terminal</h1>
   <p align="center">
-    Electron-терминал для разработки с Claude Code и Codex CLI.<br/>
-    Не обёртка — инфраструктура управления контекстом, памятью и историей AI-сессий.
+    Terminal-native API/workbench для Claude Code и Codex CLI.<br/>
+    Не обёртка над SDK — живой терминал + детерминированный PTY/JSONL control layer.
   </p>
 </p>
 
@@ -35,20 +35,158 @@
 
 ---
 
+## Что это
+
+Noted Terminal запускает настоящие локальные AI CLI в терминале и превращает их в управляемые сессии: внешний агент или мобильный клиент может создать вкладку, запустить Claude/Codex, отправить prompt, остановить turn/process, прочитать историю и сделать fork/edit без переписывания собственного terminal parser.
+
+Главная ценность не в UI-оболочке, а в готовом слое управления:
+
+- **PTY/TUI control:** безопасная доставка prompt/slash-команд в живой `claude`/`codex`, без `claude -p` как основного пути.
+- **Structured history:** Claude JSONL и Codex rollout парсятся в Timeline/History, а не в сырой terminal scrollback.
+- **MCP API:** внешние AI-клиенты управляют вкладками и читают/редактируют историю через MCP.
+- **Mobile REST/SSE API:** телефон и нативные клиенты используют тот же backend, что desktop UI.
+- **Event-driven status:** завершение turn'а, prompt-ready, CWD, session id и context% берутся из событий/транскриптов; таймеры только fallback.
+
+Подробнее по продуктовой рамке:
+
+- [docs/product/наш-терминал.md](docs/product/наш-терминал.md)
+- [docs/product/анализ-конкурентов.md](docs/product/анализ-конкурентов.md)
+
+---
+
+## API surfaces
+
+### 1. Terminal MCP — управлять живыми вкладками
+
+Для внешнего AI это основной путь: он не пишет bytes в PTY напрямую, а вызывает готовые tools.
+
+| Tool | Что делает |
+|---|---|
+| `list_projects` | показывает открытые проекты Noted Terminal |
+| `list_tabs` | показывает вкладки, live PID, commandType, sessionId |
+| `create_tab` | создаёт terminal/AI вкладку |
+| `start_ai` | запускает или resume'ит Claude/Codex через native launch hooks |
+| `send_prompt` | доставляет prompt в live AI TUI через TUI-safe paste |
+| `stop_ai` | останавливает AI process, не уничтожая shell tab |
+| `run_command` / `restart_process` / `kill_process` | управляет обычными shell/dev-server вкладками |
+| `read_output` | читает хвост terminal output как fallback |
+
+Где смотреть:
+
+- MCP wrapper: [mcp/terminal-server.mjs](mcp/terminal-server.mjs)
+- HTTP backend: [src/main/main.js](src/main/main.js) — `startMcpHttpServer()`, routes `/terminal/*`
+- docs: [docs/knowledge/fact-terminal-mcp.md](docs/knowledge/fact-terminal-mcp.md), [docs/knowledge/fact-mcp-routing.md](docs/knowledge/fact-mcp-routing.md)
+
+Минимальный сценарий для внешнего агента:
+
+```text
+list_projects
+→ list_tabs { color: "" }
+→ create_tab или start_ai
+→ send_prompt { tabId, prompt }
+→ wait через Overseer busy/status
+→ get_assistant_text / list_turns
+```
+
+### 2. Overseer MCP — читать и редактировать историю
+
+Overseer — read/edit API поверх Claude JSONL и Codex rollout. Он нужен, когда важно не "что видно на экране", а что реально записано в транскрипте.
+
+| Tool | Что делает |
+|---|---|
+| `list_open_sessions` | все Claude/Codex сессии во всех открытых проектах |
+| `session_stats` | масштаб сессии без загрузки контента |
+| `list_turns` | карта ходов: previews, размеры блоков, tool names |
+| `get_user_prompt` / `get_thinking` / `get_assistant_text` | точечное чтение нужного блока |
+| `list_notes` | заметки и rewind-маркеры Timeline |
+| `fork_session` | безопасная копия Claude-сессии |
+| `propose_edit` | dry-run edit/delete range |
+| `apply_edit` | реальное Claude edit-range/delete-range через тот же pipeline, что UI |
+
+Где смотреть:
+
+- MCP wrapper: [mcp/overseer-server.mjs](mcp/overseer-server.mjs)
+- HTTP backend: [src/main/main.js](src/main/main.js) — routes `/overseer/*`
+- Claude parser/edit engine: [src/main/ipc/claude-data.js](src/main/ipc/claude-data.js)
+- Codex parser: [src/main/ipc/codex-data.js](src/main/ipc/codex-data.js)
+- docs: [docs/knowledge/fact-overseer-mcp.md](docs/knowledge/fact-overseer-mcp.md), [docs/knowledge/fact-backtrace-jsonl.md](docs/knowledge/fact-backtrace-jsonl.md)
+
+Граница: Codex через Overseer сейчас read-only. У Codex нет Claude `parentUuid` DAG и edit-range модели, поэтому fork/edit/apply для Codex намеренно unsupported.
+
+### 3. Mobile / external REST + SSE API
+
+Mobile API уже используется web/mobile клиентами и нативным iOS-клиентом. Это не web-зеркало терминала: клиент получает структурные snapshots/history/timeline/events и отправляет команды в тот же backend.
+
+Ключевые endpoints:
+
+```text
+GET  /api/projects
+GET  /api/projects/:id/tabs
+POST /api/projects/:id/agent-tabs        { toolType: "claude" | "codex" }
+POST /api/sdk-tabs/:tabId/send
+POST /api/sdk-tabs/:tabId/interrupt
+POST /api/sdk-tabs/:tabId/stop
+POST /api/sdk-tabs/:tabId/resume
+GET  /api/sdk-tabs/:tabId/status
+GET  /api/sdk-tabs/:tabId/history
+GET  /api/sdk-tabs/:tabId/timeline
+GET  /api/sdk-tabs/:tabId/params
+POST /api/sdk-tabs/:tabId/params
+GET  /api/events?token=&tabId=           # SSE live channel
+```
+
+Где смотреть:
+
+- REST/SSE backend: [src/main/web-server.js](src/main/web-server.js)
+- renderer bridge actions: [src/renderer/App.tsx](src/renderer/App.tsx)
+- mobile frontend: [mobile-web/](mobile-web/)
+- docs: [docs/knowledge/fact-mobile-web.md](docs/knowledge/fact-mobile-web.md), [docs/knowledge/fact-mobile-claude-pty.md](docs/knowledge/fact-mobile-claude-pty.md)
+
+### 4. Core source map
+
+Если нужно встроить или переиспользовать только terminal/API слой, начинать отсюда:
+
+| Файл | Зачем читать |
+|---|---|
+| [src/main/main.js](src/main/main.js) | PTY lifecycle, `safePasteAndSubmit`, Claude/Codex launch, Stop/interrupt, MCP HTTP |
+| [src/main/ipc/claude-data.js](src/main/ipc/claude-data.js) | Claude JSONL: session file lookup, active-branch backtrace, fork/edit/delete range |
+| [src/main/ipc/codex-data.js](src/main/ipc/codex-data.js) | Codex rollout: timeline/history/context/compact parsing |
+| [src/main/web-server.js](src/main/web-server.js) | mobile/native REST API, SSE, live JSONL tail |
+| [src/renderer/components/Workspace/Terminal.tsx](src/renderer/components/Workspace/Terminal.tsx) | xterm lifecycle, pendingAction launch, prompt readiness |
+| [src/renderer/components/Workspace/ClaudeControlBar.tsx](src/renderer/components/Workspace/ClaudeControlBar.tsx) | user-facing controls for model/effort/stop/fork/copy prompt |
+| [src/renderer/components/Workspace/Timeline.tsx](src/renderer/components/Workspace/Timeline.tsx) | Timeline, range selection, edit-range UI |
+
+---
+
+## Demo flow
+
+Самая короткая демонстрация продукта:
+
+1. Открыть Noted Terminal с живой Claude/Codex вкладкой.
+2. Рядом открыть mobile client или `mobile-web`.
+3. Написать prompt в desktop History/agent input.
+4. Показать, что mobile side получает тот же turn через REST/SSE: user message, busy, assistant output, status/context.
+5. Нажать mobile interrupt/stop/resume или поменять params — desktop остаётся источником живого процесса, mobile только внешний клиент.
+
+Это демонстрирует главное: API уже существует и используется реальным вторым клиентом. Мобилка не парсит терминальный экран и не запускает свой Claude; она ходит в backend Noted Terminal, который сам владеет PTY, JSONL/rollout parsing, session status и history.
+
+---
+
 ## Проблема
 
 Все AI-инструменты теряют контекст: сессия закончилась → агент забыл всё. С 1M контекстом один агент умеет почти всё, но через 2 часа окно забито мусором — начинаешь заново или чистишь вручную. А когда параллельно открыто 5 сессий — ни одна не знает что делают остальные.
 
-**Noted Terminal даёт четыре вещи которых нет ни у Cursor, ни у CLI:**
+**Noted Terminal даёт пять вещей, которых не даёт обычный терминал или SDK-wrapper:**
 
 | | Возможность | Суть |
 |---|---|---|
+| 🔌 | **Terminal/API layer** | Готовый MCP/REST/SSE доступ к живым Claude/Codex сессиям |
 | 🔀 | **Fork / Rewind / Edit Range** | Git для диалогов с AI |
 | 🧠 | **Knowledge Base + Semantic Router** | Персистентная память проекта между сессиями |
 | 📊 | **Visual Timeline** | История как дерево, а не лог |
 | 🎛️ | **Cross-Session Access** | Любая вкладка читает и редактирует историю любой другой |
 
-> Под капотом — не spawn-subprocess-и-собери-stdout. Приложение **полностью парсит** PTY-поток и JSONL-транскрипты обоих CLI (Claude и Codex), превращая живую сессию в структурированное, адресуемое состояние. На этом стоит всё остальное.
+> Под капотом — не spawn-subprocess-и-собери-stdout. Приложение **полностью парсит** PTY-поток и JSONL-транскрипты активных CLI (Claude и Codex), превращая живую сессию в структурированное, адресуемое состояние. На этом стоит всё остальное.
 
 ---
 
@@ -244,11 +382,11 @@ npm run dev                  # dev mode с hot-reload
 npm run build:i              # собирает, копирует в /Applications, запускает
 ```
 
-**MCP-серверы** (overseer / terminal / knowledge) регистрируются глобально один раз:
+**MCP-серверы** (overseer / terminal) регистрируются глобально один раз:
 
 ```bash
-claude mcp add overseer node ~/.claude/mcp/overseer-server.mjs --scope user
-claude mcp add terminal node ~/.claude/mcp/terminal-server.mjs --scope user
+claude mcp add overseer node "$(pwd)/mcp/overseer-server.mjs" --scope user
+claude mcp add terminal node "$(pwd)/mcp/terminal-server.mjs" --scope user
 ```
 
 После этого любой агент в любом проекте получает к ним доступ.
@@ -264,21 +402,23 @@ claude mcp add terminal node ~/.claude/mcp/terminal-server.mjs --scope user
 | Styling | Tailwind CSS v4 |
 | DB | SQLite (sessions, projects, tabs) |
 | AI Rendering | react-markdown + remark-gfm + syntax-highlighter |
-| Agents | Claude Code (PTY + Agent SDK), Codex CLI (PTY) |
+| Agents | Claude Code (PTY + Agent SDK), Codex CLI (PTY). Gemini integration is legacy/partial and not part of the current public positioning. |
 
 ---
 
 ## Architecture
 
 <details>
-<summary><b>Event-Driven — ноль таймаутов</b></summary>
+<summary><b>Event-Driven — таймеры только fallback</b></summary>
 
-Всё управление через события, не `setTimeout`:
+Всё критичное управление через события, не через "подождать N секунд":
 - `safePasteAndSubmit` с sync marker verification (`\x1b[?2026l`)
 - OSC 7777 маркеры → xterm.js IMarker на точную строку
 - OSC 133 детектит начало/конец команды, OSC 7 трекает CWD
-- Busy state: content-based Braille spinner detection (`✢✳✶✻✽`), 500ms debounce
-- Результат: ноль потерянных команд, ноль race conditions
+- Claude busy state: Stop hook (`UserPromptSubmit`/`Stop`) → Unix socket → UI/Mobile/MCP status
+- Codex busy state: rollout events `task_started` / `task_complete` / `turn_aborted`
+- Safety timers есть только как аварийный выход, не как источник truth
+- Результат: меньше потерянных команд, race conditions и ложных "агент закончил"
 
 </details>
 
@@ -299,7 +439,7 @@ claude mcp add terminal node ~/.claude/mcp/terminal-server.mjs --scope user
 - Timeline из `event_msg.user_message` + `turn_context` (model/effort) + `token_count` (context% / rate-limits)
 - History из `response_item`: reasoning summary → thinking, message → ответ, `function_call` + output → tool card
 - Compact из top-level `type:"compacted"` с `payload.replacement_history`; `thread_rolled_back` откатывает turn'ы
-- Нет parentUuid-DAG: turn-grouping линейное, что упрощает edit (вырезать по индексам, без relink цепочки)
+- Нет parentUuid-DAG: Overseer читает Codex, но fork/edit через Overseer намеренно не поддерживаются
 
 Обе модели отдаются через единый HTTP-слой в main, поверх которого работают Timeline UI, History Panel и overseer MCP.
 

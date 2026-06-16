@@ -122,6 +122,23 @@ interface TimelineEntry {
   responseModel?: string;          // last assistant.message.model for this turn (e.g. 'deepseek-v4-flash', 'claude-opus-4-7')
   responseHasThinking?: boolean;   // any assistant content block of type 'thinking' in this turn
   sourceLine?: number;
+  // Codex-only per-turn API usage from last_token_usage (honest per-entry, see codex-data.js).
+  // Input split = uncached + cache-read (Codex has no cache_creation); output split = answer + reasoning.
+  codexUsage?: {
+    inputCached: number;
+    inputUncached: number;
+    outputAnswer: number;
+    outputReasoning: number;
+  };
+  // Codex-only subscription quota snapshot at this turn. resets_at = ISO string
+  // (normalizeCodexReset converts epoch→ISO; same shape the toolbar usage chip uses).
+  codexLimits?: {
+    fiveHourPct: number | null;
+    fiveHourResetsAt: string | null;
+    weeklyPct: number | null;
+    weeklyResetsAt: string | null;
+    planType: string | null;
+  };
 }
 
 interface GroupInfo {
@@ -233,6 +250,11 @@ function selectAutoTabTitlePrompt(
     const entryAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
     return Number.isFinite(entryAt) && entryAt >= startedAt + 1000 && isEligibleTabTitleEntry(entry);
   });
+}
+
+function isGenericAiTabName(name: unknown, toolType: 'claude' | 'codex'): boolean {
+  const text = String(name || '').trim().toLowerCase();
+  return text === toolType || new RegExp(`^${toolType}-\\d{2}$`).test(text);
 }
 
 // Truncate text for tooltip display
@@ -412,6 +434,7 @@ const _savedEditRangeMap = new Map<string, any>();
 const SAVED_MAP_MAX = 20;
 let _timelinePollSeq = 0;
 const _autoTabTitleAttempted = new Set<string>();
+const _autoTabTitleInFlight = new Set<string>();
 
 function perfAbsNow(): number {
   return performance.timeOrigin + performance.now();
@@ -436,6 +459,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const promptSummaryGlobalAutoSince = useTimelineSummaryStore(state => state.globalAutoSince);
   const promptSummaryTabAuto = useTimelineSummaryStore(state => state.autoByTab[tabId] === true);
   const promptSummaryTabAutoSince = useTimelineSummaryStore(state => state.autoSinceByTab[tabId] || 0);
+  const promptSummaryPreviousUserCount = useTimelineSummaryStore(state => state.previousUserContextCount);
   const promptSummaryAutoEnabled = promptSummaryGlobalAuto || promptSummaryTabAuto;
   const promptSummaryAutoSince = (() => {
     const candidates = [
@@ -1577,18 +1601,25 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   useEffect(() => {
     if (!promptSummaryAutoEnabled || !summaryToolType || !sessionId) return;
     if (!promptSummaryLoadedSessionKeys.has(`${summaryToolType}:${sessionId}`)) return;
-    for (const entry of entries) {
+    const eligibleEntries = entries.filter((entry) => entry.uuid && isEligibleTabTitleEntry(entry));
+    for (let i = 0; i < eligibleEntries.length; i++) {
+      const entry = eligibleEntries[i];
       if (!entry.uuid || !isEligibleTabTitleEntry(entry)) continue;
       const entryAt = Date.parse(entry.timestamp || '');
       if (promptSummaryAutoSince > 0 && (!Number.isFinite(entryAt) || entryAt < promptSummaryAutoSince - 1000)) continue;
+      const previousUserMessages = promptSummaryPreviousUserCount > 0
+        ? eligibleEntries.slice(Math.max(0, i - promptSummaryPreviousUserCount), i).map((candidate) => String(candidate.content || ''))
+        : [];
       void generatePromptSummary({
         tabId,
         toolType: summaryToolType,
         sessionId,
         entry,
+        previousUserMessages,
+        iterationIndex: i + 1,
       });
     }
-  }, [entries, promptSummaryAutoEnabled, promptSummaryAutoSince, promptSummaryLoadedSessionKeys, summaryToolType, sessionId, tabId, generatePromptSummary]);
+  }, [entries, promptSummaryAutoEnabled, promptSummaryAutoSince, promptSummaryLoadedSessionKeys, promptSummaryPreviousUserCount, summaryToolType, sessionId, tabId, generatePromptSummary]);
 
   // Tab switch: save editRangeState (ready/done only), reset everything else.
   // What's saved: editRangeState when phase=ready or done (user has Gemini response in panel).
@@ -1770,14 +1801,44 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     if (toolType !== 'claude' && toolType !== 'codex') return;
 
     const store = useWorkspaceStore.getState();
-    const pendingAutoTitle = store.getPendingAutoTabTitle(tabId, toolType, sessionId);
-    if (!pendingAutoTitle) return;
-
     const attemptKey = `${toolType}:${sessionId}`;
     if (_autoTabTitleAttempted.has(attemptKey)) {
       store.consumePendingAutoTabTitle(tabId, toolType, sessionId);
       return;
     }
+    if (_autoTabTitleInFlight.has(attemptKey)) return;
+
+    let pendingAutoTitle = store.getPendingAutoTabTitle(tabId, toolType, sessionId);
+    let recoveredGenericForkTitle = false;
+    if (!pendingAutoTitle && toolType === 'claude' && forkMarkers.length > 0) {
+      let tab: any = null;
+      for (const [, workspace] of store.openProjects) {
+        const candidate = workspace.tabs.get(tabId);
+        if (candidate) { tab = candidate; break; }
+      }
+      const currentSessionId = tab?.claudeSessionId;
+      if (tab
+          && currentSessionId === sessionId
+          && !tab.nameSetManually
+          && isGenericAiTabName(tab.name, toolType)) {
+        pendingAutoTitle = {
+          toolType,
+          sessionId,
+          mode: 'fork',
+          at: Date.now(),
+        };
+        recoveredGenericForkTitle = true;
+        console.warn(
+          '[Timeline:AutoTabTitle]' +
+          ' recover-generic-fork' +
+          ' tab=' + tabId.slice(-8) +
+          ' tool=' + toolType +
+          ' session=' + sessionId.slice(0, 8) +
+          ' name=' + JSON.stringify(tab.name)
+        );
+      }
+    }
+    if (!pendingAutoTitle) return;
 
     const firstUserPrompt = selectAutoTabTitlePrompt(
       entries,
@@ -1831,21 +1892,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       );
       return;
     }
-    if (!store.consumePendingAutoTabTitle(tabId, toolType, sessionId)) {
-      console.warn(
-        '[Timeline:AutoTabTitle]' +
-        ' skip=consume-false' +
-        ' tab=' + tabId.slice(-8) +
-        ' tool=' + toolType +
-        ' session=' + sessionId.slice(0, 8)
-      );
-      return;
-    }
 
-    _autoTabTitleAttempted.add(attemptKey);
+    _autoTabTitleInFlight.add(attemptKey);
     const titleToolType = toolType;
     const titleSessionId = sessionId;
     const titleTabId = tabId;
+    const titleAttemptKey = attemptKey;
     const sourcePrompt = trimTabTitlePrompt(firstUserPrompt.content);
     console.warn(
       '[Timeline:AutoTabTitle]' +
@@ -1869,6 +1921,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             ' tool=' + titleToolType +
             ' session=' + titleSessionId.slice(0, 8)
           );
+          if (!recoveredGenericForkTitle) {
+            useWorkspaceStore.getState().consumePendingAutoTabTitle(titleTabId, titleToolType, titleSessionId);
+          }
+          _autoTabTitleAttempted.add(titleAttemptKey);
           return;
         }
         console.warn(
@@ -1879,10 +1935,29 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           ' session=' + titleSessionId.slice(0, 8) +
           ' title=' + JSON.stringify(title)
         );
-        useWorkspaceStore.getState().autoRenameTab(titleTabId, title, {
+        const renamed = useWorkspaceStore.getState().autoRenameTab(titleTabId, title, {
           toolType: titleToolType,
           sessionId: titleSessionId,
         });
+        if (renamed) {
+          if (!recoveredGenericForkTitle) {
+            useWorkspaceStore.getState().consumePendingAutoTabTitle(titleTabId, titleToolType, titleSessionId);
+          }
+          _autoTabTitleAttempted.add(titleAttemptKey);
+        } else {
+          console.warn(
+            '[Timeline:AutoTabTitle]' +
+            ' rename-skipped' +
+            ' tab=' + titleTabId.slice(-8) +
+            ' tool=' + titleToolType +
+            ' session=' + titleSessionId.slice(0, 8) +
+            ' title=' + JSON.stringify(title)
+          );
+          if (!recoveredGenericForkTitle) {
+            useWorkspaceStore.getState().consumePendingAutoTabTitle(titleTabId, titleToolType, titleSessionId);
+          }
+          _autoTabTitleAttempted.add(titleAttemptKey);
+        }
       } catch (err: any) {
         console.warn(
           '[Timeline:AutoTabTitle]' +
@@ -1900,6 +1975,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           ' tool=' + titleToolType +
           ' session=' + titleSessionId.slice(0, 8)
         );
+        _autoTabTitleInFlight.delete(titleAttemptKey);
         useWorkspaceStore.getState().setTabTitleNaming(titleTabId, false);
       }
     })();
@@ -3439,6 +3515,60 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // ════════════════════════════════════════════════════════════
 
   const currentActiveEntry = activeTooltipIndex !== null ? entries[activeTooltipIndex] : null;
+
+  // Codex-only per-turn usage block in the detail panel. Renders directly from the
+  // entry fields attached in buildCodexTimeline (source), no estimate backend call.
+  // Two facts surfaced honestly from last_token_usage:
+  //   • Input: uncached / cached (cache-read) — the "был ли кэш" signal, post-hoc per turn.
+  //   • Output: answer / reasoning — Codex splits thinking tokens out; Claude doesn't here.
+  // Plus the subscription quota snapshot (5h / weekly) at this turn.
+  // Numbers are DETERMINISTIC (not user-chosen) → neutral grey, no severity colours.
+  const renderCodexUsageBlock = (entry: TimelineEntry) => {
+    if (!isCodex) return null;
+    const u = entry.codexUsage;
+    const lim = entry.codexLimits;
+    if (!u && !lim) return null;
+    const fmtReset = (iso: string | null): string => {
+      if (!iso) return '';
+      const t = Date.parse(iso);
+      if (Number.isNaN(t)) return '';
+      const ms = t - Date.now();
+      if (ms <= 0) return 'now';
+      const m = Math.floor(ms / 60000);
+      if (m < 60) return `${m}m`;
+      const h = Math.floor(m / 60);
+      if (h < 24) return `${h}h ${m % 60}m`;
+      return `${Math.floor(h / 24)}d ${h % 24}h`;
+    };
+    const Row = ({ label, value, dim }: { label: string; value: string; dim?: boolean }) => (
+      <div className="flex items-center justify-between leading-snug">
+        <span style={{ color: dim ? 'rgba(255,255,255,0.35)' : 'rgba(255,255,255,0.5)' }}>{label}</span>
+        <span className="font-mono" style={{ color: dim ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.8)' }}>{value}</span>
+      </div>
+    );
+    return (
+      <div className="mt-1 pt-1 border-t border-white/5 text-[10px] shrink-0" style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+        {u && (
+          <>
+            <Row label="вход" value={formatTokenCount(u.inputUncached)} />
+            <Row label="↳ из кэша" value={formatTokenCount(u.inputCached)} dim />
+            <Row label="ответ" value={formatTokenCount(u.outputAnswer)} />
+            {u.outputReasoning > 0 && <Row label="↳ размышление" value={formatTokenCount(u.outputReasoning)} dim />}
+          </>
+        )}
+        {lim && (lim.fiveHourPct != null || lim.weeklyPct != null) && (
+          <div className="mt-1 pt-1 border-t border-white/5" style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+            {lim.fiveHourPct != null && (
+              <Row label="лимит 5ч" value={`${Math.round(lim.fiveHourPct)}%${lim.fiveHourResetsAt ? ` · ${fmtReset(lim.fiveHourResetsAt)}` : ''}`} dim />
+            )}
+            {lim.weeklyPct != null && (
+              <Row label="лимит неделя" value={`${Math.round(lim.weeklyPct)}%${lim.weeklyResetsAt ? ` · ${fmtReset(lim.weeklyResetsAt)}` : ''}`} dim />
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   // Shared body renderer for the JSONL/API breakdown popovers. Same shape in both range
   // and single-entry mode — only the estimate object varies. Top row is a JSONL/API
@@ -5294,6 +5424,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         </Tooltip>
                       );
                     })()}
+                    {renderCodexUsageBlock(currentActiveEntry)}
                   </>
                 )}
               </div>

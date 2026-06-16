@@ -1164,6 +1164,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   // no-ops on SDK tabs; so an SDK-owned queue could never fire. SDK/gemini tabs
   // can still be PIVOT TARGETS (valid turn-end triggers) — just not queue owners.
   const canQueue = !readOnly && !!tab.tabId && isClaudePtyTab;
+  const activeQueueCount = queue ? countActiveQueueItems(queue.items) : 0;
 
   // Fetch the queue core once when the panel is first opened (and re-fetch the
   // sibling AI-tab list, which can change). SSE keeps `queue` fresh afterward.
@@ -2242,9 +2243,9 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
                     <circle cx="3.5" cy="6" r="1.3" fill="currentColor" stroke="none" /><circle cx="3.5" cy="12" r="1.3" fill="currentColor" stroke="none" /><circle cx="3.5" cy="18" r="1.3" fill="currentColor" stroke="none" />
                   </svg>
                   {/* Armed → violet [N] count. Plain count when items but not armed. */}
-                  {(queue?.items.length ?? 0) > 0 && (
+                  {activeQueueCount > 0 && (
                     <span style={{ fontSize: 11, color: queue?.autoRun ? '#a78bfa' : '#888', fontVariantNumeric: 'tabular-nums' }}>
-                      [{queue!.items.length}]
+                      [{activeQueueCount}]
                     </span>
                   )}
                 </>
@@ -2818,9 +2819,20 @@ const Q_VIOLET = '#a78bfa';   // armed / Run-after
 const Q_DEEP_VIOLET = '#8b5cf6'; // Run-after pointed at another tab
 const Q_ORANGE = '#DA7756';   // Stop after / Post
 const Q_RED = '#ef4444';      // Close after
+const Q_DISABLED_BG = 'rgba(82, 18, 48, 0.48)';
+const Q_DISABLED_BG_HOVER = 'rgba(104, 24, 60, 0.56)';
+const Q_DISABLED_TEXT = '#d8c5cf';
 const Q_AI_KIND_COLOR: Record<QueueAiTab['kind'], string> = {
   'claude-pty': '#DA7756', 'claude-sdk': '#D28C5A', 'gemini': '#4E86F8', 'codex': '#10A37F',
 };
+
+function isQueueItemEnabled(it: { enabled?: boolean }) {
+  return it.enabled !== false;
+}
+
+function countActiveQueueItems(items: { enabled?: boolean }[]) {
+  return items.reduce((sum, it) => sum + (isQueueItemEnabled(it) ? 1 : 0), 0);
+}
 
 function queueItemTitle(it: { title?: string; text: string }) {
   return (it.title || '').trim() || `[${Array.from(it.text || '').length} символов]`;
@@ -2889,6 +2901,7 @@ function QueuePanel({ queue, aiTabs, busy, mutate, onClose }: {
   };
 
   const targetTab = queue.runAfterTabId ? aiTabs.find((t) => t.id === queue.runAfterTabId) : null;
+  const activeCount = countActiveQueueItems(queue.items);
 
   return (
     <div
@@ -2920,7 +2933,7 @@ function QueuePanel({ queue, aiTabs, busy, mutate, onClose }: {
               display: 'inline-flex', alignItems: 'center', gap: 5,
             }}>
               <span style={{ width: 6, height: 6, borderRadius: '50%', background: Q_VIOLET, animation: busy ? 'mob-mic-pulse 1.4s ease-in-out infinite' : 'none' }} />
-              armed [{queue.items.length}]
+              armed [{activeCount}]
             </span>
           )}
           <div style={{ flex: 1 }} />
@@ -3108,6 +3121,7 @@ function QueuePanel({ queue, aiTabs, busy, mutate, onClose }: {
               ) : (
                 queue.items.map((it) => {
                   const title = queueItemTitle(it);
+                  const enabled = isQueueItemEnabled(it);
                   return (
                     <div
                       key={it.id}
@@ -3115,13 +3129,29 @@ function QueuePanel({ queue, aiTabs, busy, mutate, onClose }: {
                       style={{
                         display: 'flex', alignItems: 'center', gap: 8,
                         padding: '11px 12px', borderBottom: '1px solid #1a1a1a',
+                        background: enabled ? 'transparent' : Q_DISABLED_BG,
+                        color: enabled ? '#ddd' : Q_DISABLED_TEXT,
                         cursor: 'pointer',
                       }}
                     >
-                      <span style={{ flex: 1, minWidth: 0, fontSize: 13, color: '#ddd', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <span style={{ flex: 1, minWidth: 0, fontSize: 13, color: enabled ? '#ddd' : Q_DISABLED_TEXT, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {title}
                       </span>
                       {it.images > 0 && <span style={{ fontSize: 11, color: Q_ORANGE, flexShrink: 0 }}>📎{it.images}</span>}
+                      <button
+                        onClick={(e) => { e.stopPropagation(); mutate({ op: 'update', args: { id: it.id, enabled: !enabled } }); }}
+                        aria-label={enabled ? 'Disable prompt in queue' : 'Enable prompt in queue'}
+                        style={{
+                          flexShrink: 0,
+                          width: 26, height: 26, borderRadius: 7,
+                          border: 'none',
+                          background: enabled ? 'transparent' : Q_DISABLED_BG_HOVER,
+                          color: enabled ? '#777' : Q_DISABLED_TEXT,
+                          fontSize: 15,
+                          cursor: 'pointer',
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        }}
+                      >{enabled ? '☑' : '☐'}</button>
                       <button
                         onClick={(e) => { e.stopPropagation(); mutate({ op: 'remove', args: { id: it.id } }); }}
                         aria-label="Remove"

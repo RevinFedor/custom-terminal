@@ -6,6 +6,7 @@
 //
 // What's exposed:
 //   GET  /api/me                                 → { ok: true } if token valid
+//   GET  /api/agent-models                        → { codex:[…], claude:[…] } model catalog
 //   GET  /api/projects                            → all projects from DB
 //   GET  /api/projects/:projectId/tabs            → tabs of one project (DB)
 //   POST /api/projects/:projectId/sdk-tabs        → ask renderer to create SDK tab
@@ -48,6 +49,7 @@ let parseTimelineUuids = null;
 let parseTimelineEntries = null;
 let loadCodexSessionRecords = null;
 let buildCodexTimeline = null;
+let listCodexModels = null;
 try {
   const cd = require(path.join(__dirname, 'ipc', 'claude-data'));
   findSessionFile = cd.findSessionFile;
@@ -60,9 +62,22 @@ try {
   const codex = require(path.join(__dirname, 'ipc', 'codex-data'));
   loadCodexSessionRecords = codex._api?.loadSessionRecords || null;
   buildCodexTimeline = codex._api?.buildCodexTimeline || codex.buildCodexTimeline || null;
+  listCodexModels = codex.listCodexModels || codex._api?.listCodexModels || null;
 } catch (e) {
   console.warn('[WebServer] codex-data helpers not loaded:', e.message);
 }
+
+// Claude model list for native/web clients. Mirror of the renderer source of
+// truth `src/renderer/constants/claudeLevels.ts::DEFAULT_CLAUDE_CODE_MODELS` —
+// kept inline because that file is TS/renderer-only and main cannot require it.
+// If Anthropic revs the list, edit both (claudeLevels.ts is canonical).
+const CLAUDE_MODELS_FOR_CLIENTS = [
+  { id: 'default', label: 'default' },
+  { id: 'sonnet', label: 'sonnet' },
+  { id: 'opus', label: 'opus' },
+  { id: 'haiku', label: 'haiku' },
+  { id: 'claude-fable-5[1m]', label: 'fable' },
+];
 
 let WebSocketServer;
 try {
@@ -91,6 +106,10 @@ let token = null;
 // Injected from main at start() — reads the live busy/running Maps (the same
 // ones that drive the per-tab UI loader). Used by GET /api/active-loaders.
 let computeActiveLoaders = null;
+// Injected from main at start() — tiny aggregate for the native iOS project
+// list badge. This is deliberately project-scoped, not a tab transcript stream:
+// one SSE connection carries a full snapshot of {projectId,count,streaming}.
+let computeProjectActivity = null;
 // Mobile question answering — injected by main.start(). answerClaudeQuestion
 // routes SDK (resolve parked Promise) vs PTY (drive TUI keystrokes);
 // getClaudePendingQuestion reads the live pending question for the SSE snapshot.
@@ -104,6 +123,7 @@ let getClaudePendingQuestion = null;
 // fetch 200 but WS TIMEOUT rs=0, while curl gets 101) — SSE over plain GET is
 // the reliable fallback. See fact-mobile-web.md::SSE transport.
 const subscribers = new Map();
+const PROJECT_ACTIVITY_TOPIC = '__project_activity__';
 // pending bridge requests to renderer: requestId → { resolve, reject, timer }
 const pendingBridge = new Map();
 
@@ -155,6 +175,12 @@ function summarizeStreamMessage(message) {
 function summarizeBroadcastPayload(payload) {
   if (!payload || typeof payload !== 'object') return '';
   if (payload.type === 'message') return summarizeStreamMessage(payload.message);
+  if (payload.type === 'project-activity') {
+    const projects = Array.isArray(payload.projects) ? payload.projects : [];
+    const active = projects.filter((p) => (Number(p?.count) || 0) > 0 || p?.streaming === true).length;
+    const streaming = projects.filter((p) => p?.streaming === true).length;
+    return ' projects=' + projects.length + ' active=' + active + ' streaming=' + streaming;
+  }
   if (payload.type === 'snapshot') {
     return ' status=' + (payload.sessionStatus || '-') +
       ' busy=' + (payload.busy == null ? '-' : payload.busy) +
@@ -358,6 +384,30 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
   }
 }
 
+function projectActivitySnapshot(reason = 'snapshot') {
+  if (!computeProjectActivity) {
+    return { type: 'project-activity', projects: [], ts: Date.now(), reason, unavailable: true };
+  }
+  try {
+    const snap = computeProjectActivity() || {};
+    return {
+      type: 'project-activity',
+      projects: Array.isArray(snap.projects) ? snap.projects : [],
+      ts: snap.ts || Date.now(),
+      reason,
+    };
+  } catch (e) {
+    console.warn('[ProjectActivity] snapshot failed:', e?.message || e);
+    return { type: 'project-activity', projects: [], ts: Date.now(), reason, error: String(e?.message || e) };
+  }
+}
+
+function sendProjectActivitySnapshot(sink, reason = 'connect') {
+  const payload = projectActivitySnapshot(reason);
+  sink.send(JSON.stringify(payload));
+  return payload;
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -494,6 +544,22 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  // Project-level activity snapshot for native iOS project badges. This is a
+  // small aggregate, not a tab list refresh: count = live agent tabs in project,
+  // streaming = at least one child tab currently has its loader on. The matching
+  // SSE scope sends the same full snapshot so dropped events self-heal.
+  if (parsed.pathname === '/api/project-activity' && req.method === 'GET') {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    if (!computeProjectActivity) {
+      return sendJson(res, 503, { error: 'project-activity unavailable', projects: [], ts: Date.now() });
+    }
+    try {
+      return sendJson(res, 200, computeProjectActivity());
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message), projects: [], ts: Date.now() });
+    }
+  }
+
   // ───────── SSE live channel (WebSocket replacement) ─────────
   // EventSource over plain HTTP GET. Yandex/Chrome anti-tracker extensions
   // block ws:// to private IPs but NOT text/event-stream. Same subscriber
@@ -501,8 +567,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // Auth via ?token= (EventSource can't set headers, same as WS handshake).
   if (parsed.pathname === '/api/events' && req.method === 'GET') {
     if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    const scope = parsed.query.scope ? String(parsed.query.scope) : '';
+    const isProjectActivity = scope === 'projects' || parsed.query.projectActivity === '1';
     const tabId = parsed.query.tabId ? decId(String(parsed.query.tabId)) : null;
-    if (!tabId) return sendJson(res, 400, { error: 'tabId required' });
+    if (!tabId && !isProjectActivity) return sendJson(res, 400, { error: 'tabId required' });
+    const topic = isProjectActivity ? PROJECT_ACTIVITY_TOPIC : tabId;
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -525,19 +594,25 @@ async function handleApi(req, res, parsed, sdkSessions) {
           sink.sent += 1;
         } catch (e) {
           sink.errors += 1;
-          console.warn('[WebSSE:WriteError] tab=' + shortId(tabId, 12) + ' sent=' + sink.sent + ' err=' + (e?.message || e));
+          console.warn('[WebSSE:WriteError] tab=' + shortId(topic, 12) + ' sent=' + sink.sent + ' err=' + (e?.message || e));
         }
       },
       isAlive: () => !res.writableEnded && !res.destroyed,
       close: () => { try { res.end(); } catch {} },
     };
-    subscribe(tabId, sink);
-    console.log('[WebSSE:Open] tab=' + shortId(tabId, 12) + ' from=' + (req.socket.remoteAddress || '?'));
+    subscribe(topic, sink);
+    console.log('[WebSSE:Open] tab=' + shortId(topic, 12) + ' scope=' + (isProjectActivity ? 'projects' : 'tab') + ' from=' + (req.socket.remoteAddress || '?'));
 
-    // Initial snapshot — mirror the WS upgrade path so the client renders
-    // immediately without waiting for the next broadcast.
-    sendInitialSnapshot(tabId, sink, sdkSessions).catch(() => {});
-    startClaudeTabWatcher(tabId).catch(() => {});
+    if (isProjectActivity) {
+      // Full summary snapshot on connect; the client treats later events as
+      // replacement snapshots, not deltas.
+      try { sendProjectActivitySnapshot(sink, 'connect'); } catch {}
+    } else {
+      // Initial snapshot — mirror the WS upgrade path so the client renders
+      // immediately without waiting for the next broadcast.
+      sendInitialSnapshot(tabId, sink, sdkSessions).catch(() => {});
+      startClaudeTabWatcher(tabId).catch(() => {});
+    }
 
     // Heartbeat: SSE connections die silently behind some proxies/radios.
     // A comment line every 25s keeps the socket warm and lets the client's
@@ -549,8 +624,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const cleanup = () => {
       clearInterval(hb);
       unsubscribeAll(sink);
-      releaseClaudeWatchersIfOrphan();
-      console.log('[WebSSE:Close] tab=' + shortId(tabId, 12) + ' sent=' + sink.sent + ' errors=' + sink.errors);
+      if (!isProjectActivity) releaseClaudeWatchersIfOrphan();
+      console.log('[WebSSE:Close] tab=' + shortId(topic, 12) + ' scope=' + (isProjectActivity ? 'projects' : 'tab') + ' sent=' + sink.sent + ' errors=' + sink.errors);
     };
     req.on('close', cleanup);
     req.on('error', cleanup);
@@ -610,6 +685,28 @@ async function handleApi(req, res, parsed, sdkSessions) {
       return (b.updatedAt || 0) - (a.updatedAt || 0);
     });
     return sendJson(res, 200, { projects: all });
+  }
+
+  // Rename a project. Mobile parity with the tab rename below — same shape
+  // (POST {name}) delegating to the renderer store so the desktop UI, the
+  // SQLite metadata and the mobile list all converge. `renameProject` bridge
+  // action persists via project:save-metadata (see useProjectsStore.updateProject).
+  // NOTE: first use of `m` in this handler — declare it here with `let`. The old
+  // first declaration (the /tabs route below) is now a plain reassignment. A
+  // bare `m = …` here referenced the later `let m` → TDZ "Cannot access 'm'
+  // before initialization", which 500'd every route from this point down.
+  let m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/rename$/);
+  if (m && req.method === 'POST') {
+    const projectId = decId(m[1]);
+    try {
+      const body = await readBody(req);
+      const name = (body.name || '').trim();
+      if (!name) return sendJson(res, 400, { error: 'name required' });
+      const data = await bridgeRequest('renameProject', { projectId, name });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 409, { error: String(e.message) });
+    }
   }
 
   // Soniox temporary API key — mints a short-lived (5 min) key bound to
@@ -678,8 +775,31 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
-  // Tabs of a project
-  let m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/tabs$/);
+  // Agent model catalog for native/web clients. Codex list comes from the live
+  // `codex debug models` (cached 5 min in codex-data); the bundled catalog is
+  // fallback-only and can carry hidden/upgrade-only rows the TUI rejects, so the
+  // phone must NOT hardcode a stale subset (symptom: "у Codex не все модели").
+  // Claude list is the static renderer literal. Server-wide, no tabId, no bridge
+  // (listCodexModels runs in main). Direct `pathname ===` route — does NOT touch
+  // `m`, so it's safe above the `let m` chain (see fact-mobile-web.md::let m TDZ).
+  if (parsed.pathname === '/api/agent-models' && req.method === 'GET') {
+    try {
+      let codexModels = [];
+      if (listCodexModels) {
+        try {
+          codexModels = await listCodexModels();
+        } catch (e) {
+          console.warn('[WebServer] /api/agent-models codex list failed:', e.message);
+        }
+      }
+      return sendJson(res, 200, { success: true, codex: codexModels, claude: CLAUDE_MODELS_FOR_CLIENTS });
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
+  // Tabs of a project. (`m` is declared at the project-rename route above.)
+  m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/tabs$/);
   if (m && req.method === 'GET') {
     const projectId = decId(m[1]);
     let project = projectManager.db.getProjectById(projectId);
@@ -762,6 +882,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
         awaiting: awaitingMap.get(t.tabId) || false,
         statusId,
         statusColor: statusId ? (paletteById.get(statusId) || null) : null,
+        // Last-known context fill % (SQLite context_pct). Seeds the native/web
+        // header pill on open so it shows a value before the next live
+        // bridge-update/turn, instead of being blank until the first turn.
+        contextPct: (typeof t.contextPct === 'number' && isFinite(t.contextPct)) ? t.contextPct : null,
         // Live state if SDK session is active in main right now
         live: t.tabId && sdkSessions.has(t.tabId) ? {
           sessionId: sdkSessions.get(t.tabId).sessionId,
@@ -848,10 +972,19 @@ async function handleApi(req, res, parsed, sdkSessions) {
   m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/status$/);
   if (m && req.method === 'GET') {
     const tabId = decId(m[1]);
+    const started = Date.now();
     try {
       const data = await bridgeRequest('getClaudeTabStatus', { tabId });
+      console.log('[WebStatus] tab=' + shortId(tabId, 12) +
+        ' status=' + (data?.status || '-') +
+        ' busy=' + (data?.busy == null ? '-' : data.busy) +
+        ' session=' + shortId(data?.sessionId) +
+        ' command=' + (data?.commandType || '-') +
+        ' tool=' + (data?.toolType || '-') +
+        ' ms=' + (Date.now() - started));
       return sendJson(res, 200, data);
     } catch (e) {
+      console.warn('[WebStatus] tab=' + shortId(tabId, 12) + ' error=' + String(e.message || e) + ' ms=' + (Date.now() - started));
       return sendJson(res, 500, { error: String(e.message) });
     }
   }
@@ -1370,16 +1503,17 @@ function releaseClaudeWatchersIfOrphan() {
 // actively subscribed, 'message' fan-out is logged with metadata only. That
 // gives a permanent causal trace for "server emitted → SSE wrote → iOS applied"
 // without dumping chat text or spamming desktop-only sessions with message drops.
-const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'bridge-update', 'queue-update', 'ask-question', 'question-cancelled']);
+const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'bridge-update', 'queue-update', 'ask-question', 'question-cancelled', 'project-activity']);
 function webBroadcast(tabId, payload) {
   const type = payload && payload.type;
   const loggable = BCAST_LOG_TYPES.has(type);
   const set = subscribers.get(tabId);
   if (!set || set.size === 0) {
-    if (loggable) console.log('[WebBcast:DROP] tab=' + shortId(tabId, 12) + ' type=' + type + summarizeBroadcastPayload(payload) + ' noSubscribers (registered=' + subscribers.size + ')');
+    if (loggable || type === 'message') console.log('[WebBcast:DROP] tab=' + shortId(tabId, 12) + ' type=' + type + summarizeBroadcastPayload(payload) + ' noSubscribers (registered=' + subscribers.size + ')');
     return;
   }
-  const msg = JSON.stringify({ tabId, ...payload });
+  const envelope = tabId === PROJECT_ACTIVITY_TOPIC ? payload : { tabId, ...payload };
+  const msg = JSON.stringify(envelope);
   let sent = 0;
   const dead = [];
   for (const sink of set) {
@@ -1392,6 +1526,14 @@ function webBroadcast(tabId, payload) {
   if (loggable || type === 'message' || dead.length) {
     console.log('[WebBcast:SEND] tab=' + shortId(tabId, 12) + ' type=' + type + ' to=' + sent + '/' + (sent + dead.length) + summarizeBroadcastPayload(payload) + (dead.length ? ' (pruned ' + dead.length + ' dead)' : ''));
   }
+}
+
+function broadcastProjectActivity(reason = 'event') {
+  const set = subscribers.get(PROJECT_ACTIVITY_TOPIC);
+  if (!set || set.size === 0) return false;
+  const payload = projectActivitySnapshot(reason);
+  webBroadcast(PROJECT_ACTIVITY_TOPIC, payload);
+  return true;
 }
 
 // ───────── JSONL tail-watchers for PTY+Claude tabs ─────────
@@ -1678,13 +1820,14 @@ function attachWebSocket(server, sdkSessions) {
 
 // ───────── lifecycle ─────────
 
-function start({ sdkSessions, computeActiveLoaders: computeFn, answerClaudeQuestion: answerFn, getClaudePendingQuestion: getQFn }) {
+function start({ sdkSessions, computeActiveLoaders: computeFn, computeProjectActivity: computeProjectActivityFn, answerClaudeQuestion: answerFn, getClaudePendingQuestion: getQFn }) {
   if (httpServer) {
     console.log('[WebServer] already started');
     return;
   }
   if (!sdkSessions) throw new Error('start({sdkSessions}) — Map of live SDK sessions required');
   computeActiveLoaders = computeFn || null;
+  computeProjectActivity = computeProjectActivityFn || null;
   answerClaudeQuestion = answerFn || null;
   getClaudePendingQuestion = getQFn || null;
   token = loadOrCreateToken();
@@ -1748,6 +1891,10 @@ function stop() {
   try { fs.unlinkSync(DISCOVERY_FILE); } catch {}
   httpServer = null;
   wss = null;
+  computeActiveLoaders = null;
+  computeProjectActivity = null;
+  answerClaudeQuestion = null;
+  getClaudePendingQuestion = null;
   subscribers.clear();
 }
 
@@ -1760,4 +1907,4 @@ function getInfo() {
   };
 }
 
-module.exports = { start, stop, webBroadcast, getInfo, notifyClaudeSessionAvailable };
+module.exports = { start, stop, webBroadcast, broadcastProjectActivity, getInfo, notifyClaudeSessionAvailable };

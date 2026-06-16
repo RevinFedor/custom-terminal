@@ -92,6 +92,12 @@ Mobile-web Resume для CLAUDE-таба обязан соблюдать три 
 
 `getSDKParams` / `setSDKParams` bridge actions расширены — для PTY-таба читают `bridgeMetadata` (model) + `tab.claudeEffortLocal` (effort), пишут через `claude:send-command` (`/model X`, `/effort Y`). Думать/Think кнопки у SDK на mobile нет, у PTY тоже не добавляем.
 
+## Контекст-% и список моделей: единый снапшот, не разрозненные каналы
+
+`getSDKParams` (GET `/params`) отдаёт **полный** рантайм-снимок вкладки — `model, effort, thinking` **и `contextPct`** — для всех трёх движков. Раньше процент контекста доезжал до native/web только живым SSE `bridge-update`, и у него не было pull-on-open пути: на простаивающей вкладке клиент показывал модель сразу (она в `/params`), а процент — через ~30с, до следующего случайного `bridge-update`. Симптом со стороны iOS: «данные передаются вперемешку, процент появляется спустя время». Лечение — `contextPct` поехал в том же `/params`-бандле: Claude из `bridgeMetadata` (live) ?? `tab:get-context-pct` (SQLite last-known), Codex из SQLite, SDK из `tab.contextPct`. Плюс `/api/projects/:id/tabs` (оба пути — DB и live-Zustand `getProjectTabsLive`) несёт `contextPct` как seed, чтобы значение было до входа в чат. SSE после этого только патчит дельту. Принцип «один канал на факт» — `methodology/переносимый-дизайн.md` desktop'а нет, он в `habit-tracker/methodology::Рантайм-факты экрана едут одним каналом`.
+
+Список моделей для native — `GET /api/agent-models` (прямой роут, без bridge: `listCodexModels()` живёт в main). Возвращает `{codex:[{id,label,efforts}], claude:[{id,label}]}` — Codex из live `codex debug models` (кэш 5 мин), Claude из `claudeLevels.ts` литерала, инлайн-зеркалом в `web-server.js`. Native строит пикер из ответа с фолбэком на свой хардкод; раньше iOS хардкодил 2 модели Codex и показывал не весь аккаунт. Роут вставлен **до** цепочки `let m =` (прямой `pathname ===`, не трогает `m`) — иначе TDZ-шрам `fact-mobile-web.md::Гочи let m`.
+
 ## Tab-row: два разных «статуса» на одном поле
 
 В строке вкладки (project tab list) **две независимые оси состояния**, которые легко спутать, потому что desktop и mobile исторически назвали их одинаково `sessionStatus`:

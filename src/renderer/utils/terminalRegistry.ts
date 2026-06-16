@@ -177,6 +177,25 @@ function describeCodexDraftProbeRow(buf: any, row: number): string {
   return `row=${row}:prompt=${hasPrompt}:parsed=${parsed.hasDraft}:suffix=${parsed.sourceSuffix || ''}:raw=${JSON.stringify(raw)}:logical=${JSON.stringify(text)}`;
 }
 
+function buildCodexProbeDebug(buf: any, terminal: XTerminal, cursorRows: number[], visibleStart: number, visibleEnd: number, reason: string): string {
+  const sampleRows = Array.from(new Set([
+    ...cursorRows,
+    ...Array.from({ length: Math.max(0, visibleEnd - visibleStart) }, (_, i) => visibleStart + i),
+  ])).filter((row) => row >= 0 && row < buf.length);
+  return [
+    `reason=${reason}`,
+    `rows=${terminal.rows}`,
+    `cols=${terminal.cols}`,
+    `bufLength=${buf.length}`,
+    `baseY=${buf.baseY}`,
+    `cursorY=${buf.cursorY}`,
+    `viewportY=${buf.viewportY}`,
+    `visible=${visibleStart}-${visibleEnd}`,
+    `cursorRows=${cursorRows.join(',') || 'none'}`,
+    `samples=[${sampleRows.map((row) => describeCodexDraftProbeRow(buf, row)).join(' | ')}]`,
+  ].join(' ');
+}
+
 export const terminalRegistry = {
   /** Check if Gemini spinner (Braille characters) is visible on screen for a given tab */
   hasSpinnerOnScreen(tabId: string): boolean {
@@ -234,6 +253,8 @@ export const terminalRegistry = {
     if (!terminal) return { hasDraft: null, preview: '', source: 'no-terminal', debug: 'reason=no-terminal' };
 
     const buf = terminal.buffer.active;
+    const visibleEnd = Math.min(buf.viewportY + terminal.rows, buf.length);
+    const visibleStart = Math.max(buf.viewportY, visibleEnd - 10);
     const cursorRows = Array.from(new Set([
       buf.baseY + buf.cursorY,
       buf.cursorY,
@@ -241,34 +262,27 @@ export const terminalRegistry = {
 
     for (const row of cursorRows) {
       const parsed = extractCodexDraftFromLine(getLogicalLineSnapshotAt(buf, row));
-      if (parsed.hasDraft !== null) return { ...parsed, source: 'cursor:' + row + (parsed.sourceSuffix || '') };
+      if (parsed.hasDraft !== null) {
+        const debug = parsed.hasDraft === false && !parsed.preview
+          ? buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'cursor-empty-false')
+          : undefined;
+        return { ...parsed, source: 'cursor:' + row + (parsed.sourceSuffix || ''), debug };
+      }
     }
 
-    const visibleEnd = Math.min(buf.viewportY + terminal.rows, buf.length);
-    const visibleStart = Math.max(buf.viewportY, visibleEnd - 10);
     for (let row = visibleEnd - 1; row >= visibleStart; row--) {
       const snapshot = getLogicalLineSnapshotAt(buf, row);
       if (!/[›❯]/.test(snapshot.text)) continue;
       const parsed = extractCodexDraftFromLine(snapshot);
-      if (parsed.hasDraft !== null) return { ...parsed, source: 'viewport:' + row + (parsed.sourceSuffix || '') };
+      if (parsed.hasDraft !== null) {
+        const debug = parsed.hasDraft === false && !parsed.preview
+          ? buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'viewport-empty-false')
+          : undefined;
+        return { ...parsed, source: 'viewport:' + row + (parsed.sourceSuffix || ''), debug };
+      }
     }
 
-    const sampleRows = Array.from(new Set([
-      ...cursorRows,
-      ...Array.from({ length: Math.max(0, visibleEnd - visibleStart) }, (_, i) => visibleStart + i),
-    ])).filter((row) => row >= 0 && row < buf.length);
-    const debug = [
-      'reason=no-definitive-codex-composer-row',
-      `rows=${terminal.rows}`,
-      `cols=${terminal.cols}`,
-      `bufLength=${buf.length}`,
-      `baseY=${buf.baseY}`,
-      `cursorY=${buf.cursorY}`,
-      `viewportY=${buf.viewportY}`,
-      `visible=${visibleStart}-${visibleEnd}`,
-      `cursorRows=${cursorRows.join(',') || 'none'}`,
-      `samples=[${sampleRows.map((row) => describeCodexDraftProbeRow(buf, row)).join(' | ')}]`,
-    ].join(' ');
+    const debug = buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'no-definitive-codex-composer-row');
     return { hasDraft: null, preview: '', source: 'unknown', debug };
   },
 

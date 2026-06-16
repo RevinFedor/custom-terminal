@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef, useCallback, memo } from 'react';
+import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, memo } from 'react';
 import { useWorkspaceStore, isTabInterrupted } from './store/useWorkspaceStore';
 import { useProjectsStore } from './store/useProjectsStore';
 import { useUIStore } from './store/useUIStore';
@@ -29,7 +29,7 @@ import {
   sendClaudePtyPrompt,
   stopClaudePtyProcess,
 } from './utils/claudePtyActions';
-import { hydratePromptQueueStore, usePromptQueueStore, serializePromptQueueCore } from './store/usePromptQueueStore';
+import { hydratePromptQueueStore, usePromptQueueStore, serializePromptQueueCore, flushPromptQueueStoreSync } from './store/usePromptQueueStore';
 import { usePromptQueueWebSync } from './hooks/usePromptQueueWebSync';
 import { useMirrorStatusStore } from './store/useMirrorStatusStore';
 import { buildCodexRunPayload } from './utils/codexLaunch';
@@ -38,6 +38,7 @@ import { getHistoryAgentRuntime, type AgentHistoryTool } from './utils/historyAg
 const { ipcRenderer } = window.require('electron');
 
 const CLAUDE_SPINNER_VISUAL_IDLE_GRACE_MS = 300;
+const COMPLETION_NOTIFICATION_DISMISS_MS = 420;
 
 function hexToRgbTriplet(hex: string, fallback = '255, 255, 255') {
   const v = (hex || '').trim().replace(/^#/, '');
@@ -56,6 +57,12 @@ function isAiForegroundProcess(info?: { hasProcess?: boolean; processName?: stri
   const text = `${info.processName || ''} ${info.command || ''}`.toLowerCase();
   return /\b(claude|gemini|codex)\b/.test(text) || text.includes('@openai/codex');
 }
+
+type TabCompletionNotificationDetail = {
+  projectId: string;
+  tabId: string;
+  tabName: string;
+};
 
 // Drop Indicator Line for project tabs
 const ProjectDropIndicator = memo(({ edge }: { edge: 'left' | 'right' }) => {
@@ -82,6 +89,7 @@ interface ProjectTabItemProps {
   forceRightIndicator?: boolean;
   activeProcessCount?: number; // Count of running processes in project
   interruptedCount?: number; // Count of interrupted (paused) sessions in project
+  completionNotificationCount?: number; // Count of completed tabs with armed notification
   isProjectBusy?: boolean; // Any tab in project has Claude/Gemini thinking
   isProjectAwaiting?: boolean; // Any tab in project blocked on AskUserQuestion (needs answer)
   isEditing: boolean;
@@ -108,6 +116,7 @@ const ProjectTabItem = memo(({
   forceRightIndicator = false,
   activeProcessCount = 0,
   interruptedCount = 0,
+  completionNotificationCount = 0,
   isEditing,
   editValue,
   onEditChange,
@@ -128,6 +137,10 @@ const ProjectTabItem = memo(({
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isTabDropTarget, setIsTabDropTarget] = useState(false); // Highlight when terminal tab is over
+  const hasCompletionNotification = completionNotificationCount > 0;
+  const [completionNotificationDismissing, setCompletionNotificationDismissing] = useState(false);
+  const completionNotificationWasVisibleRef = useRef(hasCompletionNotification);
+  const completionNotificationDismissTimerRef = useRef<number | null>(null);
 
   // Settings → Размеры → ТАБЫ → Проекты. Padding x/y чипа проекта в TitleBar.
   const projectTabGeometry = useUIStore((s) => s.projectTabGeometry);
@@ -138,6 +151,32 @@ const ProjectTabItem = memo(({
       inputRef.current.select();
     }
   }, [isEditing]);
+
+  useLayoutEffect(() => {
+    if (completionNotificationDismissTimerRef.current !== null) {
+      window.clearTimeout(completionNotificationDismissTimerRef.current);
+      completionNotificationDismissTimerRef.current = null;
+    }
+
+    if (hasCompletionNotification) {
+      setCompletionNotificationDismissing(false);
+    } else if (completionNotificationWasVisibleRef.current) {
+      setCompletionNotificationDismissing(true);
+      completionNotificationDismissTimerRef.current = window.setTimeout(() => {
+        setCompletionNotificationDismissing(false);
+        completionNotificationDismissTimerRef.current = null;
+      }, COMPLETION_NOTIFICATION_DISMISS_MS);
+    }
+
+    completionNotificationWasVisibleRef.current = hasCompletionNotification;
+
+    return () => {
+      if (completionNotificationDismissTimerRef.current !== null) {
+        window.clearTimeout(completionNotificationDismissTimerRef.current);
+        completionNotificationDismissTimerRef.current = null;
+      }
+    };
+  }, [hasCompletionNotification]);
 
   useEffect(() => {
     const element = ref.current;
@@ -211,6 +250,7 @@ const ProjectTabItem = memo(({
   return (
     <button
       ref={ref}
+      data-workspace-navigation
       className={`relative inline-flex items-center text-sm font-medium cursor-pointer transition-colors rounded-sm overflow-visible ${
         isActive && isAreaActive ? 'ring-1 ring-white/50 shadow-[0_0_10px_rgba(255,255,255,0.1)]' : ''
       } ${textColor}`}
@@ -244,6 +284,17 @@ const ProjectTabItem = memo(({
           active. Same signal/keyframe as the per-tab glow. */}
       {isProjectAwaiting && (
         <div className="tab-awaiting-input absolute inset-0 rounded-sm" style={{ zIndex: 8 }} aria-hidden />
+      )}
+      {(hasCompletionNotification || completionNotificationDismissing) && (
+        <div
+          className={`tab-completion-notification-alert absolute inset-0 rounded-sm ${
+            completionNotificationDismissing && !hasCompletionNotification
+              ? 'tab-completion-notification-alert--dismiss'
+              : ''
+          }`}
+          style={{ zIndex: 9 }}
+          aria-hidden
+        />
       )}
       <span className="relative z-10 flex items-center gap-1 leading-none">
         {isEditing ? (
@@ -306,6 +357,23 @@ const ProjectTabItem = memo(({
             )}
             {activeProcessCount}
           </span>
+        )}
+        {completionNotificationCount > 0 && !isEditing && (
+          <Tooltip content="Tab completion notification ready">
+            <span
+              className="relative flex items-center justify-center text-[10px] font-semibold rounded-full"
+              style={{
+                minWidth: '16px',
+                height: '16px',
+                padding: '0 4px',
+                backgroundColor: isActive ? 'rgba(239, 68, 68, 0.32)' : 'rgba(239, 68, 68, 0.22)',
+                color: isActive ? '#7f1d1d' : '#f87171',
+                boxSizing: 'border-box',
+              }}
+            >
+              {completionNotificationCount}
+            </span>
+          </Tooltip>
         )}
         {interruptedCount > 0 && !isEditing && (
           <Tooltip content="Interrupted sessions - click tab to resume">
@@ -469,6 +537,42 @@ function App() {
       ' edgeAlpha=' + Math.max(0.01, peakAlpha * 0.22).toFixed(3)
     );
   }, [processBar.colorA, processBar.shimmerColor, processBar.shimmerSpacingPct, processBar.shimmerOpacityPct]);
+
+  useEffect(() => {
+    const showNativeNotification = async (detail: TabCompletionNotificationDetail) => {
+      if (!('Notification' in window)) return;
+      const show = () => {
+        try {
+          new Notification('Вкладка завершилась', {
+            body: detail.tabName,
+            silent: true,
+          });
+        } catch {}
+      };
+
+      if (Notification.permission === 'granted') {
+        show();
+        return;
+      }
+      if (Notification.permission === 'denied') return;
+      try {
+        const permission = await Notification.requestPermission();
+        if (permission === 'granted') show();
+      } catch {}
+    };
+
+    const handleTabCompletionNotification = (event: Event) => {
+      const detail = (event as CustomEvent<TabCompletionNotificationDetail>).detail;
+      if (!detail?.tabId) return;
+      if (useUIStore.getState().tabCompletionNotificationSound) {
+        ipcRenderer.send('tab-notification:play-sound');
+      }
+      void showNativeNotification(detail);
+    };
+
+    window.addEventListener('tab-completion-notification', handleTabCompletionNotification);
+    return () => window.removeEventListener('tab-completion-notification', handleTabCompletionNotification);
+  }, []);
 
   // AIPulse (whole-tab background pulse) was removed — its :root var sync
   // (--ai-pulse-*) went with it. The loader is the process-bar shimmer strip,
@@ -894,10 +998,10 @@ function App() {
       state.setClaudeActive(tabId, false);
     };
 
-    const applyClaudeVisualBusy = (tabId: string, busy: boolean) => {
+    const applyClaudeVisualBusy = (tabId: string, busy: boolean, reason?: string) => {
       const state = useWorkspaceStore.getState();
       state.setClaudeBusy(tabId, busy);
-      state.setAiBusy(tabId, busy);
+      state.setAiBusy(tabId, busy, reason);
       setBusyTabs(prev => { const n = new Map(prev); if (busy) n.set(tabId, true); else n.delete(tabId); return n; });
     };
 
@@ -917,13 +1021,13 @@ function App() {
       if (!data.busy && data.reason === 'spinner') {
         const timer = window.setTimeout(() => {
           timers.delete(data.tabId);
-          applyClaudeVisualBusy(data.tabId, false);
+          applyClaudeVisualBusy(data.tabId, false, data.reason);
         }, CLAUDE_SPINNER_VISUAL_IDLE_GRACE_MS);
         timers.set(data.tabId, timer);
         return;
       }
 
-      applyClaudeVisualBusy(data.tabId, data.busy);
+      applyClaudeVisualBusy(data.tabId, data.busy, data.reason);
       // Safety net for awaiting ⊆ busy: any turn-end clears a lingering awaiting flag
       // (user pressed Esc to cancel the whole turn instead of answering the question).
       if (!data.busy && data.reason !== 'spinner') {
@@ -1181,6 +1285,9 @@ function App() {
               awaiting,
               statusId,
               statusColor: statusMeta?.color || null,
+              // Seed last-known context % so the native/web header pill shows a
+              // value on open (parity with the SQLite path in web-server.js).
+              contextPct: (typeof t.contextPct === 'number' && isFinite(t.contextPct)) ? t.contextPct : null,
             };
           }));
           return reply(true, {
@@ -1272,6 +1379,18 @@ function App() {
           }
           return reply(false, null, 'tab not in any open project');
         }
+        if (action === 'renameProject') {
+          const { projectId, name } = payload || {};
+          if (!projectId || !name) return reply(false, null, 'projectId+name required');
+          const projectsState = useProjectsStore.getState();
+          if (!projectsState.projects?.[projectId]) {
+            return reply(false, null, 'project not found');
+          }
+          // updateProject persists {name} via project:save-metadata (SQLite) and
+          // updates the in-memory map the desktop UI + /api/projects read from.
+          await projectsState.updateProject(projectId, { name });
+          return reply(true, { projectId, name });
+        }
         if (action === 'getSDKParams') {
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
@@ -1309,19 +1428,44 @@ function App() {
               // alwaysThinkingEnabled:true), so absent → 'adaptive'.
               const thinkMap = (window as any).__thinkStateForTab as Map<string, boolean> | undefined;
               const thinkOn = thinkMap?.has(tabId) ? thinkMap.get(tabId)! : true;
+              // Context % travels in the SAME params bundle as model/effort so the
+              // native client gets a COMPLETE runtime snapshot in one on-open fetch
+              // — no more "model shows instantly, % appears ~30s later when the
+              // next bridge-update happens to fire". Live value from bridgeMetadata,
+              // last-known fallback from SQLite (same seed the desktop meter uses).
+              let contextPct: number | null = null;
+              try {
+                const meta = await ipcRenderer.invoke('claude:get-bridge-metadata', tabId);
+                if (typeof meta?.contextPct === 'number' && meta.contextPct > 0) contextPct = meta.contextPct;
+              } catch {}
+              if (contextPct == null) {
+                try {
+                  const r = await ipcRenderer.invoke('tab:get-context-pct', { tabId });
+                  if (typeof r?.pct === 'number' && r.pct > 0) contextPct = r.pct;
+                } catch {}
+              }
               return reply(true, {
                 tabId,
                 model,
                 effort: liveEffort || '?',
                 thinking: thinkOn ? 'adaptive' : 'disabled',
+                contextPct,
               });
             }
             if (t.commandType === 'codex' && t.tabType !== 'claude-sdk') {
+              // Codex has no bridge metadata; last-known % lives in SQLite (written
+              // by emitCodexContextPct's persist path). Same on-open seed contract.
+              let contextPct: number | null = null;
+              try {
+                const r = await ipcRenderer.invoke('tab:get-context-pct', { tabId });
+                if (typeof r?.pct === 'number' && r.pct > 0) contextPct = r.pct;
+              } catch {}
               return reply(true, {
                 tabId,
                 model: t.codexModel || 'default',
                 effort: t.codexEffort || 'xhigh',
                 thinking: 'disabled',
+                contextPct,
               });
             }
             // SDK path
@@ -1330,6 +1474,7 @@ function App() {
               model: t.sdkModel || 'default',
               effort: t.sdkEffort || 'high',
               thinking: t.sdkThinking === false ? 'disabled' : 'adaptive',
+              contextPct: (typeof t.contextPct === 'number' && t.contextPct > 0) ? t.contextPct : null,
             });
           }
           return reply(false, null, 'tab not open');
@@ -1456,9 +1601,10 @@ function App() {
               case 'add':            s.addPrompt(tabId, String(a.text || ''), undefined, undefined, typeof a.title === 'string' ? a.title : undefined); break;
               case 'remove':         s.removePrompt(tabId, String(a.id)); break;
               case 'update':         s.updatePrompt(tabId, String(a.id), {
-                text: String(a.text || ''),
+                text: typeof a.text === 'string' ? a.text : undefined,
                 title: typeof a.title === 'string' ? a.title : undefined,
                 titleManual: typeof a.titleManual === 'boolean' ? a.titleManual : undefined,
+                enabled: typeof a.enabled === 'boolean' ? a.enabled : undefined,
               }); break;
               case 'reorder':        s.reorderPrompt(tabId, Number(a.fromIndex), Number(a.toIndex)); break;
               case 'clear':          for (const it of s.getQueue(tabId).items) s.removePrompt(tabId, it.id); break;
@@ -1795,8 +1941,8 @@ function App() {
     ipcRenderer.on('claude-sdk:process-state', handleSdkProcessState);
 
     // Gemini busy state → project badge spinner
-    const handleGeminiBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
-      useWorkspaceStore.getState().setAiBusy(tabId, busy);
+    const handleGeminiBusy = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
+      useWorkspaceStore.getState().setAiBusy(tabId, busy, reason);
       setBusyTabs(prev => { const n = new Map(prev); if (busy) n.set(tabId, true); else n.delete(tabId); return n; });
     };
     ipcRenderer.on('gemini:busy-state', handleGeminiBusy);
@@ -1804,8 +1950,8 @@ function App() {
     // Codex busy-state must feed the same project-level signal as the per-tab
     // process strip. Otherwise Codex can shimmer in the sidebar while the project
     // tab stays visually idle.
-    const handleCodexBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
-      useWorkspaceStore.getState().setAiBusy(tabId, busy);
+    const handleCodexBusy = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
+      useWorkspaceStore.getState().setAiBusy(tabId, busy, reason);
       setBusyTabs(prev => { const n = new Map(prev); if (busy) n.set(tabId, true); else n.delete(tabId); return n; });
     };
     ipcRenderer.on('codex:busy-state', handleCodexBusy);
@@ -1880,6 +2026,7 @@ function App() {
       // NOTE: interrupted state is NOT managed here — main process will-quit handler
       // sets wasInterrupted AFTER this save completes, avoiding race conditions.
       state.saveSessionImmediate();
+      flushPromptQueueStoreSync();
     };
 
     window.addEventListener('beforeunload', handleBeforeUnload);
@@ -2184,7 +2331,7 @@ function App() {
       if (e.metaKey && isCmdB) {
         e.preventDefault();
         if (view === 'workspace' && activeProjectId) {
-          if (filePreview) {
+          if (filePreview && filePreview.source !== 'tab') {
             closeFilePreview();
             setOpenFilePath(activeProjectId, null);
           }
@@ -2198,6 +2345,11 @@ function App() {
       if (e.code === 'Escape') {
         if (filePreview) {
           e.preventDefault();
+          if (filePreview.source === 'tab' && filePreview.sourceTabId && activeProjectId) {
+            closeFilePreview();
+            closeTab(activeProjectId, filePreview.sourceTabId, { skipProcessCheck: true });
+            return;
+          }
           closeFilePreview();
           if (activeProjectId) {
             setOpenFilePath(activeProjectId, null);
@@ -2564,6 +2716,7 @@ function App() {
           {window.location.hostname === 'localhost' ? (
             <Tooltip content="Development Mode - Dashboard">
               <button
+                data-workspace-navigation
                 className="relative px-4 py-1.5 text-sm font-bold cursor-pointer transition-colors"
                 style={{
                   fontSize: `${projectTabsFontSize}px`,
@@ -2582,6 +2735,7 @@ function App() {
           ) : (
             <Tooltip content="Dashboard">
               <button
+                data-workspace-navigation
                 className={`relative px-3 py-1.5 text-sm font-medium cursor-pointer transition-colors ${
                   view === 'dashboard'
                     ? 'text-black'
@@ -2619,6 +2773,7 @@ function App() {
             let hasBusyTab = false;
             let hasPasteBusyTab = false;
             let hasAwaitingTab = false;
+            let completionNotificationCount = 0;
             workspace.tabs.forEach((tab, tabId) => {
               const hasLiveProcess = !!processStatus.get(tabId) || !!(tab as any).sdkProcessAlive;
               if (hasLiveProcess) {
@@ -2627,6 +2782,7 @@ function App() {
               if (busyTabs.get(tabId)) hasBusyTab = true;
               if (pasteBusyTabs.get(tabId)) hasPasteBusyTab = true;
               if (awaitingTabs.get(tabId)) hasAwaitingTab = true;
+              if ((tab as any).completionNotificationFired) completionNotificationCount++;
             });
             const projectIsLoading = apiLoadingProjects.has(projectId);
             const hasProjectShimmer = hasBusyTab || hasPasteBusyTab || projectIsLoading;
@@ -2650,6 +2806,7 @@ function App() {
                 forceRightIndicator={isLast && projectEmptyZoneHovered}
                 activeProcessCount={activeCount}
                 interruptedCount={interruptedCount}
+                completionNotificationCount={completionNotificationCount}
                 isProjectBusy={hasProjectShimmer}
                 isProjectAwaiting={hasAwaitingTab}
                 isEditing={editingProjectId === projectId}

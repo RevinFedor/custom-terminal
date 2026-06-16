@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { PROMPT_SUMMARY_PROMPT_ID, usePromptsStore } from './usePromptsStore';
 import { generateTimelinePromptSummaryFromPrompt, isEligibleTabTitleEntry, trimTimelinePromptSummarySource, type TabTitleSourceEntry } from '../utils/generateTabTitle';
+import { useWorkspaceStore } from './useWorkspaceStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -45,6 +46,10 @@ const APP_STATE_GLOBAL_AUTO_KEY = 'timelineSummaryGlobalAuto';
 const APP_STATE_GLOBAL_AUTO_SINCE_KEY = 'timelineSummaryGlobalAutoSince';
 const APP_STATE_TAB_AUTO_KEY = 'timelineSummaryAutoTabs';
 const APP_STATE_TAB_AUTO_SINCE_KEY = 'timelineSummaryAutoSinceTabs';
+const PREVIOUS_USER_CONTEXT_COUNT_KEY = 'noted-terminal-timeline-summary-previous-user-count';
+const APP_STATE_PREVIOUS_USER_CONTEXT_COUNT_KEY = 'timelineSummaryPreviousUserContextCount';
+const DEFAULT_PREVIOUS_USER_CONTEXT_COUNT = 1;
+const MAX_PREVIOUS_USER_CONTEXT_COUNT = 10;
 
 export function timelineSummaryKey(toolType: TimelineSummaryTool, sessionId: string, entryUuid: string): string {
   return `${toolType}:${sessionId}:${entryUuid}`;
@@ -91,10 +96,32 @@ function normalizeNumberMap(value: unknown, autoByTab: Record<string, boolean>):
   }
 }
 
+function clampPreviousUserContextCount(value: unknown): number {
+  const n = Math.round(Number(value));
+  if (!Number.isFinite(n)) return DEFAULT_PREVIOUS_USER_CONTEXT_COUNT;
+  return Math.max(0, Math.min(MAX_PREVIOUS_USER_CONTEXT_COUNT, n));
+}
+
+function readPreviousUserContextCount(): number {
+  try {
+    const raw = localStorage.getItem(PREVIOUS_USER_CONTEXT_COUNT_KEY);
+    if (raw !== null) return clampPreviousUserContextCount(raw);
+  } catch {}
+  return DEFAULT_PREVIOUS_USER_CONTEXT_COUNT;
+}
+
 function persistAppState(key: string, value: unknown) {
   try {
     ipcRenderer.invoke('app:setState', { key, value }).catch(() => {});
   } catch {}
+}
+
+function persistPreviousUserContextCount(value: number) {
+  const clamped = clampPreviousUserContextCount(value);
+  try {
+    localStorage.setItem(PREVIOUS_USER_CONTEXT_COUNT_KEY, String(clamped));
+  } catch {}
+  persistAppState(APP_STATE_PREVIOUS_USER_CONTEXT_COUNT_KEY, clamped);
 }
 
 function readGlobalAuto(): boolean {
@@ -181,6 +208,44 @@ function normalizeRows(rows: any[]): Record<string, TimelinePromptSummary> {
   return out;
 }
 
+function inferProjectName(projectPath?: string): string | null {
+  const clean = String(projectPath || '').replace(/\/+$/, '');
+  if (!clean) return null;
+  return clean.split('/').filter(Boolean).pop() || clean;
+}
+
+function getUsageMetadata(args: {
+  tabId: string;
+  toolType: TimelineSummaryTool;
+  sessionId: string;
+  entryUuid: string;
+  iterationIndex?: number | null;
+}) {
+  const workspaceState = useWorkspaceStore.getState();
+  for (const workspace of workspaceState.openProjects.values()) {
+    const tab = workspace.tabs.get(args.tabId);
+    if (!tab) continue;
+    return {
+      projectId: workspace.projectId,
+      projectName: inferProjectName(workspace.projectPath),
+      projectPath: workspace.projectPath,
+      tabId: args.tabId,
+      tabName: tab.name,
+      toolType: args.toolType,
+      sessionId: args.sessionId,
+      entryUuid: args.entryUuid,
+      iterationIndex: args.iterationIndex || null,
+    };
+  }
+  return {
+    tabId: args.tabId,
+    toolType: args.toolType,
+    sessionId: args.sessionId,
+    entryUuid: args.entryUuid,
+    iterationIndex: args.iterationIndex || null,
+  };
+}
+
 interface TimelineSummaryStore {
   summaries: Record<string, TimelinePromptSummary>;
   loadingKeys: Set<string>;
@@ -190,14 +255,18 @@ interface TimelineSummaryStore {
   autoSinceByTab: Record<string, number>;
   globalAuto: boolean;
   globalAutoSince: number;
+  previousUserContextCount: number;
   loadSummaries: (toolType: TimelineSummaryTool, sessionId: string) => Promise<void>;
   setTabAuto: (tabId: string, value: boolean) => void;
   setGlobalAuto: (value: boolean) => void;
+  setPreviousUserContextCount: (value: number) => void;
   generateSummary: (args: {
     tabId: string;
     toolType: TimelineSummaryTool;
     sessionId: string;
     entry: TimelineSummaryEntry;
+    previousUserMessages?: string[];
+    iterationIndex?: number | null;
     force?: boolean;
   }) => Promise<TimelinePromptSummary | null>;
   refreshEntriesForTab: (args: {
@@ -212,6 +281,7 @@ const initialAutoByTab = readTabAuto();
 const initialAutoSinceByTab = readTabAutoSince(initialAutoByTab);
 const initialGlobalAuto = readGlobalAuto();
 const initialGlobalAutoSince = readGlobalAutoSince();
+const initialPreviousUserContextCount = readPreviousUserContextCount();
 
 export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) => ({
   summaries: {},
@@ -222,6 +292,7 @@ export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) =
   autoSinceByTab: initialAutoSinceByTab,
   globalAuto: initialGlobalAuto,
   globalAutoSince: initialGlobalAutoSince,
+  previousUserContextCount: initialPreviousUserContextCount,
 
   loadSummaries: async (toolType, sessionId) => {
     if (!toolType || !sessionId) return;
@@ -260,12 +331,19 @@ export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) =
     set({ globalAuto: value, globalAutoSince: since });
   },
 
-  generateSummary: async ({ tabId, toolType, sessionId, entry, force = false }) => {
+  setPreviousUserContextCount: (value) => {
+    const clamped = clampPreviousUserContextCount(value);
+    persistPreviousUserContextCount(clamped);
+    set({ previousUserContextCount: clamped });
+  },
+
+  generateSummary: async ({ tabId, toolType, sessionId, entry, previousUserMessages = [], iterationIndex = null, force = false }) => {
     const content = String(entry?.content || '').trim();
     if (!tabId || !sessionId || !entry?.uuid || !content || !isEligibleTabTitleEntry(entry)) return null;
 
     const key = timelineSummaryKey(toolType, sessionId, entry.uuid);
-    const sourceHash = timelineSummarySourceHash(content);
+    const contextMessages = previousUserMessages.map((msg) => String(msg || '').trim()).filter(Boolean);
+    const sourceHash = timelineSummarySourceHash([content, ...contextMessages].join('\n\n'));
     const existing = get().summaries[key];
     if (!force && existing?.summary && existing.sourceHash === sourceHash) return existing;
     if (get().loadingKeys.has(key)) return null;
@@ -279,7 +357,16 @@ export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) =
     try {
       const promptConfig = usePromptsStore.getState().getPromptById(PROMPT_SUMMARY_PROMPT_ID);
       const source = trimTimelinePromptSummarySource(content);
-      const generated = await generateTimelinePromptSummaryFromPrompt(source, promptConfig);
+      const generated = await generateTimelinePromptSummaryFromPrompt(source, promptConfig, {
+        previousUserMessages: contextMessages,
+        usageMetadata: getUsageMetadata({
+          tabId,
+          toolType,
+          sessionId,
+          entryUuid: entry.uuid,
+          iterationIndex,
+        }),
+      });
       if (!generated) return null;
 
       const row: TimelinePromptSummary = {
@@ -318,9 +405,22 @@ export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) =
 
     let done = 0;
     let lastError = '';
-    for (const entry of eligible) {
+    const contextCount = get().previousUserContextCount;
+    for (let currentIndex = 0; currentIndex < eligible.length; currentIndex++) {
+      const entry = eligible[currentIndex];
       try {
-        await get().generateSummary({ tabId, toolType, sessionId, entry, force: true });
+        const previousUserMessages = contextCount > 0
+          ? eligible.slice(Math.max(0, currentIndex - contextCount), currentIndex).map((candidate) => String(candidate.content || ''))
+          : [];
+        await get().generateSummary({
+          tabId,
+          toolType,
+          sessionId,
+          entry,
+          previousUserMessages,
+          iterationIndex: currentIndex >= 0 ? currentIndex + 1 : null,
+          force: true,
+        });
       } catch (err: any) {
         lastError = err?.message || String(err);
       } finally {
@@ -348,6 +448,7 @@ function writeLocalAutoMirror(args: {
   globalAutoSince: number;
   autoByTab: Record<string, boolean>;
   autoSinceByTab: Record<string, number>;
+  previousUserContextCount: number;
 }) {
   try { localStorage.setItem(GLOBAL_AUTO_KEY, args.globalAuto ? '1' : '0'); } catch {}
   try {
@@ -356,26 +457,30 @@ function writeLocalAutoMirror(args: {
   } catch {}
   try { localStorage.setItem(TAB_AUTO_KEY, JSON.stringify(args.autoByTab)); } catch {}
   try { localStorage.setItem(TAB_AUTO_SINCE_KEY, JSON.stringify(args.autoSinceByTab)); } catch {}
+  try { localStorage.setItem(PREVIOUS_USER_CONTEXT_COUNT_KEY, String(args.previousUserContextCount)); } catch {}
 }
 
 (async () => {
   try {
-    const [dbGlobalAuto, dbGlobalSince, dbTabAuto, dbTabSince] = await Promise.all([
+    const [dbGlobalAuto, dbGlobalSince, dbTabAuto, dbTabSince, dbPreviousCount] = await Promise.all([
       ipcRenderer.invoke('app:getState', APP_STATE_GLOBAL_AUTO_KEY),
       ipcRenderer.invoke('app:getState', APP_STATE_GLOBAL_AUTO_SINCE_KEY),
       ipcRenderer.invoke('app:getState', APP_STATE_TAB_AUTO_KEY),
       ipcRenderer.invoke('app:getState', APP_STATE_TAB_AUTO_SINCE_KEY),
+      ipcRenderer.invoke('app:getState', APP_STATE_PREVIOUS_USER_CONTEXT_COUNT_KEY),
     ]);
 
     const hasGlobalAuto = dbGlobalAuto !== null && dbGlobalAuto !== undefined;
     const hasGlobalSince = dbGlobalSince !== null && dbGlobalSince !== undefined;
     const hasTabAuto = dbTabAuto !== null && dbTabAuto !== undefined;
     const hasTabSince = dbTabSince !== null && dbTabSince !== undefined;
+    const hasPreviousCount = dbPreviousCount !== null && dbPreviousCount !== undefined;
 
     if (!hasGlobalAuto) persistAppState(APP_STATE_GLOBAL_AUTO_KEY, initialGlobalAuto);
     if (!hasGlobalSince) persistAppState(APP_STATE_GLOBAL_AUTO_SINCE_KEY, initialGlobalAutoSince);
     if (!hasTabAuto) persistAppState(APP_STATE_TAB_AUTO_KEY, initialAutoByTab);
     if (!hasTabSince) persistAppState(APP_STATE_TAB_AUTO_SINCE_KEY, initialAutoSinceByTab);
+    if (!hasPreviousCount) persistAppState(APP_STATE_PREVIOUS_USER_CONTEXT_COUNT_KEY, initialPreviousUserContextCount);
 
     const nextGlobalAuto = hasGlobalAuto ? parsePersistedBool(dbGlobalAuto) : initialGlobalAuto;
     const nextGlobalSinceRaw = hasGlobalSince ? Number(dbGlobalSince || 0) : initialGlobalAutoSince;
@@ -384,6 +489,7 @@ function writeLocalAutoMirror(args: {
       : 0;
     const nextAutoByTab = hasTabAuto ? normalizeBoolMap(dbTabAuto) : initialAutoByTab;
     let nextAutoSinceByTab = hasTabSince ? normalizeNumberMap(dbTabSince, nextAutoByTab) : initialAutoSinceByTab;
+    const nextPreviousUserContextCount = hasPreviousCount ? clampPreviousUserContextCount(dbPreviousCount) : initialPreviousUserContextCount;
 
     const now = Date.now();
     let changedSince = false;
@@ -401,6 +507,7 @@ function writeLocalAutoMirror(args: {
       globalAutoSince: nextGlobalSince,
       autoByTab: nextAutoByTab,
       autoSinceByTab: nextAutoSinceByTab,
+      previousUserContextCount: nextPreviousUserContextCount,
     });
 
     useTimelineSummaryStore.setState({
@@ -408,6 +515,7 @@ function writeLocalAutoMirror(args: {
       globalAutoSince: nextGlobalSince,
       autoByTab: nextAutoByTab,
       autoSinceByTab: nextAutoSinceByTab,
+      previousUserContextCount: nextPreviousUserContextCount,
     });
   } catch (err: any) {
     console.warn('[TimelineSummary] auto-settings hydrate failed:', err?.message || err);

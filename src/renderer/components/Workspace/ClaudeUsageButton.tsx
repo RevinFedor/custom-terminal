@@ -45,6 +45,54 @@ interface UsageResponse {
   seven_day_sonnet?: UsageBucket | null;
   extra_usage?: ExtraUsage | null;
 }
+interface ApiPlatformBilling {
+  ok?: boolean;
+  source?: string;
+  adminKeyConfigured?: boolean;
+  currency?: string;
+  monthSpendUsd?: number | null;
+  last7dSpendUsd?: number | null;
+  last31dSpendUsd?: number | null;
+  bucketCount?: number | null;
+  latestBucketDate?: string | null;
+  balanceAvailable?: boolean;
+  balanceNote?: string | null;
+  error?: string | null;
+  cachedMsAgo?: number | null;
+  lastAttemptAt?: number | null;
+  apiKeyStatus?: {
+    ok?: boolean;
+    orgId?: string | null;
+    orgIdShort?: string | null;
+    error?: string | null;
+  } | null;
+}
+interface ClaudeUsageAccount {
+  accountKey: string;
+  kind?: 'max-oauth' | 'api-platform' | string;
+  label: string;
+  accountHint?: string | null;
+  accountIdHint?: string | null;
+  source?: string | null;
+  isCurrent?: boolean;
+  usage?: UsageResponse | null;
+  billing?: ApiPlatformBilling | null;
+  notice?: string | null;
+  error?: string | null;
+}
+interface ClaudeUsageIpcResponse {
+  ok?: boolean;
+  error?: string | null;
+  notice?: string | null;
+  data?: UsageResponse | null;
+  accounts?: ClaudeUsageAccount[];
+  selectedAccountKey?: string | null;
+  currentAccountKey?: string | null;
+  authKind?: string | null;
+  billing?: ApiPlatformBilling | null;
+  cachedMsAgo?: number | null;
+  lastAttemptAt?: number | null;
+}
 
 interface ModelBucket {
   input: number;
@@ -117,15 +165,54 @@ interface CodexUsageData {
   plan_type?: string | null;
   timestamp?: string | null;
 }
+interface CodexUsageAccount {
+  accountKey: string;
+  label: string;
+  accountHint?: string | null;
+  accountIdHint?: string | null;
+  plan_type?: string | null;
+  timestamp?: string | null;
+  source?: string | null;
+  usage: CodexUsageData;
+}
 interface CodexUsageResponse {
   success?: boolean;
   error?: string;
   data?: CodexUsageData | null;
+  accounts?: CodexUsageAccount[];
+  selectedAccountKey?: string | null;
+}
+
+const CODEX_USAGE_ACCOUNT_STORAGE_KEY = 'noted.codexUsage.accountKey';
+
+function loadStoredCodexUsageAccountKey(): string | null {
+  try {
+    return window.localStorage.getItem(CODEX_USAGE_ACCOUNT_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function storeCodexUsageAccountKey(value: string | null) {
+  try {
+    if (value) window.localStorage.setItem(CODEX_USAGE_ACCOUNT_STORAGE_KEY, value);
+    else window.localStorage.removeItem(CODEX_USAGE_ACCOUNT_STORAGE_KEY);
+  } catch {
+    // localStorage is a convenience for this view, not the source of truth.
+  }
 }
 
 function formatUsd(amount: number | null | undefined): string {
   if (amount == null) return '—';
   if (amount < 0.01) return '<$0.01';
+  return `$${amount.toFixed(2)}`;
+}
+
+function formatBillingUsd(amount: number | null | undefined): string {
+  if (amount == null) return '—';
+  if (amount === 0) return '$0.00';
+  if (amount < 0.01) return '<$0.01';
+  if (amount >= 1000) return `$${amount.toFixed(0)}`;
   return `$${amount.toFixed(2)}`;
 }
 
@@ -395,8 +482,8 @@ const ENGINE_LABEL: Record<string, string> = {
   codex: 'Codex',
 };
 
-// Activity section body: total active time + per-day stacked bars (segmented
-// by engine) + a by-project breakdown. "Active" = loader-on time, summed.
+// Activity section body: total wall-clock active time + per-day stacked bars
+// (segmented by engine) + a by-project breakdown.
 function ActivityView({ activity }: { activity: ActivityResponse }) {
   const byDay = activity.byDay || [];
   const byProject = activity.byProject || [];
@@ -405,10 +492,18 @@ function ActivityView({ activity }: { activity: ActivityResponse }) {
   const engines = ['claude', 'claude-sdk', 'gemini', 'codex'];
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+    <div style={{
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 8,
+      maxHeight: 280,
+      overflowY: 'auto',
+      overscrollBehavior: 'contain',
+      paddingRight: 4,
+    }}>
       {/* Total */}
       <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#888' }}>
-        <span>Total active (14d)</span>
+        <span>Total wall time (14d)</span>
         <span style={{ color: '#ddd', fontVariantNumeric: 'tabular-nums' }}>
           {formatDuration(activity.totalMs)}
         </span>
@@ -516,8 +611,8 @@ function ActivityView({ activity }: { activity: ActivityResponse }) {
       )}
 
       {/* Engine legend */}
-      <div style={{ display: 'flex', gap: 10, marginTop: 2, fontSize: 9, color: '#666' }}>
-        {(['claude', 'claude-sdk', 'gemini'] as const).map((eng) => (
+      <div style={{ display: 'flex', gap: 10, marginTop: 2, fontSize: 9, color: '#666', flexWrap: 'wrap' }}>
+        {(['claude', 'claude-sdk', 'gemini', 'codex'] as const).map((eng) => (
           <span key={eng} style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
             <span style={{ width: 7, height: 7, borderRadius: 1, background: ENGINE_COLOR[eng] }} />
             {ENGINE_LABEL[eng]}
@@ -542,7 +637,10 @@ function ClaudeUsageChip() {
 
   // Global usage limits (independent of tab)
   const [data, setData] = useState<UsageResponse | null>(null);
+  const [accounts, setAccounts] = useState<ClaudeUsageAccount[]>([]);
+  const [selectedAccountKey, setSelectedAccountKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   // Timestamp последней live-попытки (от backend). Banner показывает «Xs ago»,
   // чтобы юзер видел, что force-refresh реально стрельнул, даже если та же
@@ -608,23 +706,44 @@ function ClaudeUsageChip() {
     // не понимает что клик сработал.
     const minSpinUntil = force ? Date.now() + 400 : 0;
     try {
-      const res = await ipcRenderer.invoke('claude-usage:get', { force });
+      const res: ClaudeUsageIpcResponse = await ipcRenderer.invoke('claude-usage:get', {
+        force,
+        accountKey: selectedAccountKey,
+      });
+      const nextAccounts = Array.isArray(res?.accounts) ? res.accounts : [];
+      const nextKey = res?.selectedAccountKey
+        || nextAccounts.find((account) => account.isCurrent)?.accountKey
+        || nextAccounts[0]?.accountKey
+        || null;
+      const selected = nextAccounts.find((account) => account.accountKey === nextKey) || nextAccounts[0] || null;
+      const selectedUsage = selected?.usage || res?.data || null;
+      setAccounts(nextAccounts);
+      if (nextKey !== selectedAccountKey) setSelectedAccountKey(nextKey);
       if (res?.ok) {
-        setData(res.data);
+        setData(selectedUsage);
         setError(null);
+        setNotice(res?.notice || selected?.notice || null);
       } else {
-        setError(res?.error || 'Failed to fetch usage');
-        if (res?.data) setData(res.data);
+        setData(selectedUsage);
+        setError(res?.error || selected?.error || 'Failed to fetch usage');
+        setNotice(res?.notice || selected?.notice || null);
       }
       if (typeof res?.lastAttemptAt === 'number') setLastAttemptAt(res.lastAttemptAt);
+      const weekly = selectedUsage?.seven_day?.utilization ?? null;
+      const fiveHour = selectedUsage?.five_hour?.utilization ?? null;
+      console.log(
+        `[ClaudeUsage] refresh ${res?.ok ? 'ok' : 'failed'} account=${selected?.label || 'unknown'} kind=${selected?.kind || res?.authKind || 'unknown'} accounts=${nextAccounts.length} weekly=${weekly ?? 'null'} fiveHour=${fiveHour ?? 'null'} force=${force}`
+      );
     } catch (e: any) {
       setError(e?.message || String(e));
+      setNotice(null);
+      console.warn(`[ClaudeUsage] refresh exception error=${e?.message || String(e)} force=${force}`);
     } finally {
       const remain = minSpinUntil - Date.now();
       if (remain > 0) setTimeout(() => setLoading(false), remain);
       else setLoading(false);
     }
-  }, []);
+  }, [selectedAccountKey]);
 
   const refreshTokens = useCallback(async () => {
     if (!activeClaudeSessionId) { setTokens(null); return; }
@@ -823,6 +942,14 @@ function ClaudeUsageChip() {
     });
   };
 
+  const selectedAccount = accounts.find((account) => account.accountKey === selectedAccountKey)
+    || accounts.find((account) => account.isCurrent)
+    || accounts[0]
+    || null;
+  const isApiPlatformAccount = selectedAccount?.kind === 'api-platform';
+  const apiBilling = selectedAccount?.billing || null;
+  const accountLabel = selectedAccount?.label || null;
+  const accountKindLabel = isApiPlatformAccount ? 'API Platform' : 'Claude Max';
   const weeklyPct = data?.seven_day?.utilization ?? null;
   const fiveHourPct = data?.five_hour?.utilization ?? null;
   const sonnetPct = data?.seven_day_sonnet?.utilization ?? null;
@@ -831,6 +958,19 @@ function ClaudeUsageChip() {
   const chipColor = colorForPct(weeklyPct);
   // Compact "time until weekly reset" for the chip face. null → no resets_at.
   const resetShort = formatResetShort(data?.seven_day?.resets_at);
+
+  const selectAccount = (account: ClaudeUsageAccount) => {
+    if (!account?.accountKey) return;
+    setSelectedAccountKey(account.accountKey);
+    setData(account.usage || null);
+    setError(account.error || null);
+    setNotice(account.notice || null);
+    const accountWeekly = account.usage?.seven_day?.utilization ?? null;
+    const accountFiveHour = account.usage?.five_hour?.utilization ?? null;
+    console.log(
+      `[ClaudeUsage] account selected account=${account.label} kind=${account.kind || 'unknown'} weekly=${accountWeekly ?? 'null'} fiveHour=${accountFiveHour ?? 'null'}`
+    );
+  };
 
   // Border style: sticky uses brighter white for "this is pinned long-term"
   const popoverBorder = sticky
@@ -846,8 +986,8 @@ function ClaudeUsageChip() {
         onMouseEnter={() => setTriggerHover(true)}
         onMouseLeave={() => setTriggerHover(false)}
         title={weeklyPct != null
-          ? `Claude weekly: ${formatPct(weeklyPct)}${resetShort ? ` • resets in ${resetShort}` : ''}  •  click → pin to tab  •  ⌘+hover → peek  •  ⌘⇧ → sticky pin`
-          : (error || 'Click to fetch Claude usage')}
+          ? `Claude ${accountLabel ? `${accountLabel} ` : ''}weekly: ${formatPct(weeklyPct)}${resetShort ? ` • resets in ${resetShort}` : ''}  •  click → pin to tab  •  ⌘+hover → peek  •  ⌘⇧ → sticky pin`
+          : (notice || error || `${accountKindLabel}${accountLabel ? ` ${accountLabel}` : ''}` || 'Click to fetch Claude usage')}
         style={{
           display: 'inline-flex',
           alignItems: 'center',
@@ -868,8 +1008,16 @@ function ClaudeUsageChip() {
       >
         {loading && !data ? (
           '…'
+        ) : isApiPlatformAccount && !data && !error ? (
+          <>
+            <ClaudeSparkle size={12} color="#9ca3af" />
+            <span>API</span>
+          </>
         ) : error && !data ? (
-          '—'
+          <>
+            <ClaudeSparkle size={12} color={isApiPlatformAccount ? '#9ca3af' : '#777'} />
+            <span>{isApiPlatformAccount ? 'API' : '—'}</span>
+          </>
         ) : (
           <>
             <ClaudeSparkle size={12} color={weeklyPct != null ? '#DA7756' : '#777'} />
@@ -902,6 +1050,76 @@ function ClaudeUsageChip() {
             flexDirection: 'column',
           }}
         >
+          {(accounts.length > 1 || isApiPlatformAccount) && (
+            <div style={{
+              padding: '7px 12px',
+              borderBottom: '1px solid rgba(255,255,255,0.07)',
+              display: 'flex',
+              justifyContent: 'center',
+            }}>
+              <div style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 2,
+                padding: 2,
+                background: 'rgba(255,255,255,0.05)',
+                border: '1px solid rgba(255,255,255,0.08)',
+                borderRadius: 999,
+                maxWidth: '100%',
+              }}>
+                {accounts.map((account, idx) => {
+                  const active = account.accountKey === (selectedAccount?.accountKey || selectedAccountKey);
+                  const accountWeekly = account.usage?.seven_day?.utilization ?? null;
+                  const accountFiveHour = account.usage?.five_hour?.utilization ?? null;
+                  const color = account.kind === 'api-platform' && accountWeekly == null
+                    ? '#9ca3af'
+                    : colorForPct(accountWeekly);
+                  return (
+                    <button
+                      key={account.accountKey || idx}
+                      onClick={(e) => { e.stopPropagation(); selectAccount(account); }}
+                      title={`${account.label} • ${account.accountHint || account.kind || 'Claude'}${accountWeekly != null ? ` • weekly ${formatPct(accountWeekly)} • 5-hour ${formatPct(accountFiveHour)}` : ''}${account.notice ? ` • ${account.notice}` : ''}${account.error ? ` • ${account.error}` : ''}`}
+                      style={{
+                        height: 20,
+                        maxWidth: 132,
+                        minWidth: 0,
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: 5,
+                        padding: '0 8px',
+                        borderRadius: 999,
+                        border: active ? '1px solid rgba(255,255,255,0.28)' : '1px solid transparent',
+                        background: active ? 'rgba(255,255,255,0.12)' : 'transparent',
+                        color: active ? '#f3f4f6' : '#8a8a8a',
+                        fontSize: 10,
+                        fontWeight: active ? 700 : 500,
+                        cursor: 'pointer',
+                        fontVariantNumeric: 'tabular-nums',
+                      }}
+                    >
+                      <span style={{
+                        width: 6,
+                        height: 6,
+                        borderRadius: 999,
+                        background: color,
+                        boxShadow: active ? `0 0 8px ${color}66` : 'none',
+                        flexShrink: 0,
+                      }} />
+                      <span style={{
+                        minWidth: 0,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}>
+                        {account.label}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           <div style={{
             display: 'flex',
             alignItems: 'center',
@@ -916,7 +1134,17 @@ function ClaudeUsageChip() {
                 reset'а (тот же resets_at что в строке "Weekly (all)"). Тикает
                 раз в 30с пока popover открыт. */}
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-              {data?.seven_day?.resets_at ? (
+              {accountLabel && !isApiPlatformAccount && (
+                <span style={{ color: '#aaa', maxWidth: 116, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {accountLabel}
+                </span>
+              )}
+              {isApiPlatformAccount ? (
+                <>
+                  <span style={{ color: '#666' }}>Claude auth</span>
+                  <span style={{ color: '#ddd' }}>API Platform</span>
+                </>
+              ) : data?.seven_day?.resets_at ? (
                 <>
                   <span style={{ color: '#666' }}>weekly reset</span>
                   <span style={{ color: '#ddd' }}>
@@ -964,7 +1192,101 @@ function ClaudeUsageChip() {
             <div style={{ padding: '12px', fontSize: 11, color: '#f87171' }}>
               {error}
               <div style={{ marginTop: 6, color: '#666' }}>
-                Sign in via <code>claude</code> CLI first.
+                {isApiPlatformAccount
+                  ? 'Check the Claude API key stored by Claude Code.'
+                  : <>Sign in via <code>claude</code> CLI first.</>}
+              </div>
+            </div>
+          )}
+
+          {isApiPlatformAccount && !data && !error && (
+            <div style={{
+              padding: '8px 12px',
+              borderTop: '1px solid rgba(255,255,255,0.07)',
+              fontSize: 11,
+              color: '#aaa',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 6,
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                <span>API key</span>
+                <span style={{ color: '#d1d5db' }}>active</span>
+              </div>
+              {apiBilling?.apiKeyStatus?.orgIdShort && (
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                  <span>Org</span>
+                  <span style={{ color: '#8a8a8a', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                    {apiBilling.apiKeyStatus.orgIdShort}
+                  </span>
+                </div>
+              )}
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                <span>Month spend</span>
+                <span style={{ color: apiBilling?.ok ? '#d1d5db' : '#8a8a8a', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                  {apiBilling?.ok
+                    ? formatBillingUsd(apiBilling.monthSpendUsd)
+                    : (apiBilling?.adminKeyConfigured === false ? 'admin key missing' : '—')}
+                </span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                <span>Last 7d</span>
+                <span style={{ color: apiBilling?.ok ? '#d1d5db' : '#8a8a8a', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                  {apiBilling?.ok ? formatBillingUsd(apiBilling.last7dSpendUsd) : '—'}
+                </span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                <span>Credits left</span>
+                <span
+                  title={apiBilling?.balanceNote || 'Anthropic Admin API exposes spend reports, not remaining balance.'}
+                  style={{ color: '#8a8a8a', textAlign: 'right' }}
+                >
+                  not exposed
+                </span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                <span>Usage source</span>
+                <span style={{ color: '#8a8a8a', textAlign: 'right' }}>
+                  {apiBilling?.adminKeyConfigured === false ? 'local session / Console' : 'Admin API / Console'}
+                </span>
+              </div>
+              {apiBilling?.latestBucketDate && (
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, color: '#666', fontSize: 10 }}>
+                  <span>Updated</span>
+                  <span style={{ textAlign: 'right' }}>{apiBilling.latestBucketDate}</span>
+                </div>
+              )}
+              {apiBilling?.error && (
+                <div style={{
+                  color: '#fca5a5',
+                  background: 'rgba(248,113,113,0.08)',
+                  border: '1px solid rgba(248,113,113,0.12)',
+                  borderRadius: 4,
+                  padding: '6px 7px',
+                  lineHeight: 1.35,
+                }}>
+                  Admin API: {apiBilling.error}
+                </div>
+              )}
+              {apiBilling?.apiKeyStatus?.error && (
+                <div style={{ color: '#a3a3a3', fontSize: 10, lineHeight: 1.35 }}>
+                  API key check: {apiBilling.apiKeyStatus.error}
+                </div>
+              )}
+            </div>
+          )}
+
+          {notice && !data && !error && (
+            <div style={{
+              padding: '10px 12px',
+              fontSize: 11,
+              color: '#a3a3a3',
+              borderTop: '1px solid rgba(255,255,255,0.07)',
+              lineHeight: 1.35,
+            }}>
+              {notice}
+              <div style={{ marginTop: 6, color: '#666' }}>
+                Claude Code can run with this key; this panel just has no Max quota meter for it.
               </div>
             </div>
           )}
@@ -1229,7 +1551,7 @@ function ClaudeUsageChip() {
                   transition: 'transform 0.15s',
                 }} />
                 Activity
-                <span style={{ color: '#666', fontSize: 10 }}>(agent time)</span>
+                <span style={{ color: '#666', fontSize: 10 }}>(wall time)</span>
               </span>
               {activityExpanded && (
                 <span
@@ -1334,6 +1656,8 @@ function CodexUsageChip() {
   const [triggerHover, setTriggerHover] = useState(false);
   const [popoverHover, setPopoverHover] = useState(false);
   const [data, setData] = useState<CodexUsageData | null>(null);
+  const [accounts, setAccounts] = useState<CodexUsageAccount[]>([]);
+  const [selectedAccountKey, setSelectedAccountKey] = useState<string | null>(() => loadStoredCodexUsageAccountKey());
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [activity, setActivity] = useState<ActivityResponse | null>(null);
@@ -1341,43 +1665,41 @@ function CodexUsageChip() {
   const [activityExpanded, setActivityExpanded] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
-  const activeTabId = useWorkspaceStore((s) => s.getEffectiveTabId());
-  const activeCodexSessionId = useWorkspaceStore((s) => {
-    if (!activeTabId) return null;
-    for (const [, ws] of s.openProjects) {
-      const t = ws.tabs.get(activeTabId);
-      if (t?.codexSessionId) return t.codexSessionId;
-    }
-    return null;
-  });
-  const activeCwd = useWorkspaceStore((s) => {
-    if (!activeTabId) return null;
-    for (const [, ws] of s.openProjects) {
-      const t = ws.tabs.get(activeTabId);
-      if (t) return t.cwd || null;
-    }
-    return null;
-  });
-
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (force = false) => {
     setLoading(true);
     try {
       const res: CodexUsageResponse = await ipcRenderer.invoke('codex:get-usage', {
-        sessionId: activeCodexSessionId,
-        cwd: activeCwd,
+        accountKey: selectedAccountKey,
+        force,
       });
       if (res?.success) {
+        const nextAccounts = Array.isArray(res.accounts) ? res.accounts : [];
+        setAccounts(nextAccounts);
         setData(res.data || null);
         setError(null);
+        const nextKey = res.selectedAccountKey || nextAccounts[0]?.accountKey || null;
+        if (nextAccounts.length > 0 && nextKey !== selectedAccountKey) {
+          setSelectedAccountKey(nextKey);
+          storeCodexUsageAccountKey(nextKey);
+        }
+        const selected = nextAccounts.find((account) => account.accountKey === nextKey);
+        const usage = selected?.usage || res.data || null;
+        const weeklyPct = usage?.seven_day?.utilization ?? usage?.secondary?.utilization ?? null;
+        const fiveHourPct = usage?.five_hour?.utilization ?? usage?.primary?.utilization ?? null;
+        console.log(
+          `[CodexUsage] refresh ok account=${selected?.label || 'latest'} accounts=${nextAccounts.length} weekly=${weeklyPct ?? 'null'} fiveHour=${fiveHourPct ?? 'null'} force=${force}`
+        );
       } else {
         setError(res?.error || 'Failed to read Codex usage');
+        console.warn(`[CodexUsage] refresh failed error=${res?.error || 'unknown'} force=${force}`);
       }
     } catch (e: any) {
       setError(e?.message || String(e));
+      console.warn(`[CodexUsage] refresh exception error=${e?.message || String(e)} force=${force}`);
     } finally {
       setLoading(false);
     }
-  }, [activeCodexSessionId, activeCwd]);
+  }, [selectedAccountKey]);
 
   const refreshActivity = useCallback(async () => {
     setActivityLoading(true);
@@ -1396,14 +1718,14 @@ function CodexUsageChip() {
     let id: ReturnType<typeof setInterval> | null = null;
     const start = () => {
       if (id) return;
-      id = setInterval(() => refresh(), 180 * 1000);
+      id = setInterval(() => refresh(false), 180 * 1000);
     };
     const stop = () => {
       if (id) { clearInterval(id); id = null; }
     };
     const onVis = () => {
       if (document.visibilityState === 'visible') {
-        refresh();
+        refresh(false);
         start();
       } else {
         stop();
@@ -1471,11 +1793,27 @@ function CodexUsageChip() {
     return () => clearInterval(id);
   }, []);
 
-  const weekly = data?.seven_day || data?.secondary || null;
-  const fiveHour = data?.five_hour || data?.primary || null;
+  const selectedAccount = accounts.find((account) => account.accountKey === selectedAccountKey) || accounts[0] || null;
+  const usageData = selectedAccount?.usage || data;
+  const weekly = usageData?.seven_day || usageData?.secondary || null;
+  const fiveHour = usageData?.five_hour || usageData?.primary || null;
   const weeklyPct = weekly?.utilization ?? null;
   const chipColor = colorForPct(weeklyPct);
   const resetShort = formatResetShort(weekly?.resets_at);
+  const accountLabel = selectedAccount?.label || null;
+
+  const selectAccount = (account: CodexUsageAccount) => {
+    if (!account?.accountKey) return;
+    setSelectedAccountKey(account.accountKey);
+    storeCodexUsageAccountKey(account.accountKey);
+    setData(account.usage || null);
+    setError(null);
+    const accountWeekly = account.usage?.seven_day?.utilization ?? account.usage?.secondary?.utilization ?? null;
+    const accountFiveHour = account.usage?.five_hour?.utilization ?? account.usage?.primary?.utilization ?? null;
+    console.log(
+      `[CodexUsage] account selected account=${account.label} weekly=${accountWeekly ?? 'null'} fiveHour=${accountFiveHour ?? 'null'}`
+    );
+  };
 
   return (
     <div ref={rootRef} style={{ position: 'relative' }}>
@@ -1484,7 +1822,7 @@ function CodexUsageChip() {
         onMouseEnter={() => setTriggerHover(true)}
         onMouseLeave={() => setTriggerHover(false)}
         title={weeklyPct != null
-          ? `Codex weekly: ${formatPct(weeklyPct)}${resetShort ? ` • resets in ${resetShort}` : ''}`
+          ? `Codex${accountLabel ? ` ${accountLabel}` : ''} weekly: ${formatPct(weeklyPct)}${resetShort ? ` • resets in ${resetShort}` : ''}`
           : (error || 'Codex usage appears after Codex writes a token_count record')}
         style={{
           display: 'inline-flex',
@@ -1504,9 +1842,9 @@ function CodexUsageChip() {
           transition: 'background-color 0.12s, color 0.12s, border-color 0.12s',
         }}
       >
-        {loading && !data ? (
+        {loading && !usageData ? (
           '…'
-        ) : error && !data ? (
+        ) : error && !usageData ? (
           <>
             <CodexIcon size={15} muted />
             <span>—</span>
@@ -1540,6 +1878,74 @@ function CodexUsageChip() {
             flexDirection: 'column',
           }}
         >
+          {accounts.length > 1 && (
+            <div style={{
+              padding: '7px 12px',
+              borderBottom: '1px solid rgba(255,255,255,0.07)',
+              display: 'flex',
+              justifyContent: 'center',
+            }}>
+              <div style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 2,
+                padding: 2,
+                background: 'rgba(255,255,255,0.05)',
+                border: '1px solid rgba(255,255,255,0.08)',
+                borderRadius: 999,
+                maxWidth: '100%',
+              }}>
+                {accounts.map((account, idx) => {
+                  const active = account.accountKey === (selectedAccount?.accountKey || selectedAccountKey);
+                  const accountWeekly = account.usage?.seven_day?.utilization ?? account.usage?.secondary?.utilization ?? null;
+                  const accountFiveHour = account.usage?.five_hour?.utilization ?? account.usage?.primary?.utilization ?? null;
+                  const color = colorForPct(accountWeekly);
+                  return (
+                    <button
+                      key={account.accountKey || idx}
+                      onClick={(e) => { e.stopPropagation(); selectAccount(account); }}
+                      title={`${account.label} • weekly ${formatPct(accountWeekly)} • 5-hour ${formatPct(accountFiveHour)}${account.plan_type ? ` • ${account.plan_type}` : ''}`}
+                      style={{
+                        height: 20,
+                        maxWidth: 132,
+                        minWidth: 0,
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: 5,
+                        padding: '0 8px',
+                        borderRadius: 999,
+                        border: active ? '1px solid rgba(255,255,255,0.28)' : '1px solid transparent',
+                        background: active ? 'rgba(255,255,255,0.12)' : 'transparent',
+                        color: active ? '#f3f4f6' : '#8a8a8a',
+                        fontSize: 10,
+                        fontWeight: active ? 700 : 500,
+                        cursor: 'pointer',
+                        fontVariantNumeric: 'tabular-nums',
+                      }}
+                    >
+                      <span style={{
+                        width: 6,
+                        height: 6,
+                        borderRadius: 999,
+                        background: color,
+                        boxShadow: active ? `0 0 8px ${color}66` : 'none',
+                        flexShrink: 0,
+                      }} />
+                      <span style={{
+                        minWidth: 0,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}>
+                        {account.label}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           <div style={{
             display: 'flex',
             alignItems: 'center',
@@ -1551,6 +1957,11 @@ function CodexUsageChip() {
           }}>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
               <CodexIcon size={15} />
+              {accountLabel && (
+                <span style={{ color: '#aaa', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {accountLabel}
+                </span>
+              )}
               {weekly?.resets_at ? (
                 <>
                   <span style={{ color: '#666' }}>weekly reset</span>
@@ -1561,7 +1972,7 @@ function CodexUsageChip() {
               )}
             </span>
             <button
-              onClick={(e) => { e.stopPropagation(); refresh(); }}
+              onClick={(e) => { e.stopPropagation(); refresh(true); }}
               disabled={loading}
               style={{
                 background: 'transparent',
@@ -1581,7 +1992,7 @@ function CodexUsageChip() {
             </button>
           </div>
 
-          {error && !data && (
+          {error && !usageData && (
             <div style={{ padding: '12px', fontSize: 11, color: '#f87171' }}>
               {error}
               <div style={{ marginTop: 6, color: '#666' }}>
@@ -1590,11 +2001,11 @@ function CodexUsageChip() {
             </div>
           )}
 
-          {data ? (
+          {usageData ? (
             <>
               <ProgressRow label="Weekly (Codex)" pct={weekly?.utilization} resetsAt={weekly?.resets_at} />
               <ProgressRow label="5-hour" pct={fiveHour?.utilization} resetsAt={fiveHour?.resets_at} />
-              {(data.plan_type || data.limit_id) && (
+              {(usageData.plan_type || usageData.limit_id || usageData.timestamp) && (
                 <div style={{
                   padding: '6px 12px',
                   borderTop: '1px solid rgba(255,255,255,0.07)',
@@ -1606,7 +2017,7 @@ function CodexUsageChip() {
                 }}>
                   <span>Plan</span>
                   <span style={{ color: '#aaa', fontFamily: 'ui-monospace, monospace' }}>
-                    {[data.plan_type, data.limit_id].filter(Boolean).join(' · ')}
+                    {[usageData.plan_type, usageData.limit_id, usageData.timestamp ? formatResetDateTime(usageData.timestamp) : null].filter(Boolean).join(' · ')}
                   </span>
                 </div>
               )}
@@ -1642,7 +2053,7 @@ function CodexUsageChip() {
                   transition: 'transform 0.15s',
                 }} />
                 Activity
-                <span style={{ color: '#666', fontSize: 10 }}>(agent time)</span>
+                <span style={{ color: '#666', fontSize: 10 }}>(wall time)</span>
               </span>
               {activityExpanded && (
                 <span

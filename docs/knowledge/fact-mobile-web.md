@@ -11,7 +11,7 @@
 Часть REST-эндпоинтов требует **живого renderer state** (Zustand store с открытыми проектами и табами). Main не имеет доступа к store напрямую. Решение — request/reply IPC bridge:
 
 1. Main: `bridgeRequest(action, payload, timeoutMs=5000)` спавнит `requestId`, шлёт `web:bridge-request` в renderer, ждёт ответа на `web:bridge-reply` с тем же id.
-2. Renderer: один listener в `App.tsx` диспатчит по action — `getOpenProjectIds`, `createSDKTab`, `sendSDKMessage`, `loadSDKHistory`, `forkToSDK`, `closeTab`, `renameTab`, `getSDKParams`, `setSDKParams`, `getTabSessionInfo`. Расширение для PTY+Claude/Codex: `createClaudeTab` (legacy wrapper), `createAgentTab` (generic PTY agent), `resumeClaudeTab`, `stopClaudeTab`, `interruptClaudeTurn` (soft interrupt текущего turn'а), `grabAgentDraft` (authoritative чтение TUI composer после interrupt), `sendMessageAuto` (единая точка `/send` — сам роутит SDK vs PTY), `getClaudeTabStatus`, `getClaudeTabStatusBatch`, `getProjectTabsLive` (отдаёт `sessionStatus`, project `icon`, `statusMarker`). Детали — `fact-mobile-claude-pty.md`.
+2. Renderer: один listener в `App.tsx` диспатчит по action — `getOpenProjectIds`, `createSDKTab`, `sendSDKMessage`, `loadSDKHistory`, `forkToSDK`, `closeTab`, `renameTab`, `renameProject` (мобильный rename проекта → `useProjectsStore.updateProject{name}`), `getSDKParams`, `setSDKParams`, `getTabSessionInfo`. Расширение для PTY+Claude/Codex: `createClaudeTab` (legacy wrapper), `createAgentTab` (generic PTY agent), `resumeClaudeTab`, `stopClaudeTab`, `interruptClaudeTurn` (soft interrupt текущего turn'а), `grabAgentDraft` (authoritative чтение TUI composer после interrupt), `sendMessageAuto` (единая точка `/send` — сам роутит SDK vs PTY), `getClaudeTabStatus`, `getClaudeTabStatusBatch`, `getProjectTabsLive` (отдаёт `sessionStatus`, project `icon`, `statusMarker`). Детали — `fact-mobile-claude-pty.md`.
 3. На таймауте promise rejected — endpoint возвращает 409.
 
 **Критично:** bridge нужен ТОЛЬКО для actions, требующих store. Чисто-серверные operations (timeline parse через `parseTimelineEntries`, projects list из SQLite через `projectManager.db.getAllProjects()`) идут напрямую без bridge — это и быстрее, и работает даже если renderer mounted с задержкой.
@@ -100,14 +100,14 @@ PTY-Claude табы). Три неочевидных факта:
 
 **Три канала (read / write / live), все через bridge:**
 - **Read:** `GET /queue` → bridge `getPromptQueue` → renderer сериализует `serializePromptQueueCore(getQueue(tabId))` + список sibling AI-табов (для pivot-пикера «on tab», тот же предикат что десктопный `RunAfterTabPicker`: SDK / PTY-claude+sessionId / gemini+sessionId, self исключён).
-- **Write:** любой контрол → `POST /queue {op,args}` → bridge `mutatePromptQueue` → вызывает **тот же store-метод** что десктопный оверлей (`addPrompt`/`setAutoRun`/`setStopAfter`/`setCloseAfter`/`setRunAfterTab`/`setFirstDelaySeconds`/`setPostPrompt*`/...). Все каскады (closeAfter⟹stopAfter, auto-disarm на manual empty-out, SQLite-persist, hint-arming) срабатывают идентично — мы **не реимплементим** логику очереди, только remote-invoke. Op-таблица `QueueOp` в `mobile-web/src/api.ts` — 1:1 с case-веткой в `App.tsx::mutatePromptQueue`.
+- **Write:** любой контрол → `POST /queue {op,args}` → bridge `mutatePromptQueue` → вызывает **тот же store-метод** что десктопный оверлей (`addPrompt`/`updatePrompt(enabled)`/`setAutoRun`/`setStopAfter`/`setCloseAfter`/`setRunAfterTab`/`setFirstDelaySeconds`/`setPostPrompt*`/...). Все каскады (closeAfter⟹stopAfter, auto-disarm на manual empty-out по active-count, SQLite-persist, hint-arming) срабатывают идентично — мы **не реимплементим** логику очереди, только remote-invoke. Op-таблица `QueueOp` в `mobile-web/src/api.ts` — 1:1 с case-веткой в `App.tsx::mutatePromptQueue`.
 - **Live:** любое изменение store (десктоп ИЛИ телефон) → `usePromptQueueWebSync` (App-root, рядом с runner) диффает per-tab core-JSON → `web:broadcast-queue` IPC → main `_webBroadcast(type:'queue-update')` → SSE → телефон обновляет мирор. `webBroadcast` no-op'ит без подписчиков, поэтому на desktop-only пути это один `JSON.stringify`+Map-дифф на мутацию и ничего больше.
 
 **Owner = ТОЛЬКО PTY-claude (`canQueue = isClaudePtyTab`).** Runner стреляет через `claude:send-command`, а это **PTY-TUI paste** (`terminals.get(tabId)`, no-op на SDK-табах). SDK-owned очередь никогда бы не выстрелила. Поэтому иконка очереди на мобилке доступна только на PTY-claude-табах — **точно как десктопный оверлей** (`commandType==='claude' && claudeSessionId`). SDK/gemini-табы остаются валидными **pivot-таргетами** (у них есть turn-end edge), просто не owner'ами. Если будущий код добавит SDK-owner — сначала научить runner роутить SDK-ветку, иначе тихо-немая очередь.
 
 **Почему web-sync на App-root, не в панели:** идентично runner'у — панель unmount'ится как только юзер ушёл с Claude-таба, но телефон может смотреть **фоновый** таб. Gated-by-active-tab бродкастер замолчал бы ровно когда телефон ждёт дельту. См. `fact-prompt-queue.md::Auto-runner — singleton hook, не в overlay`.
 
-**UI-маппинг на десктопный оверлей (bottom-sheet, не right-panel — thumb-reach, как ParamsSheet/ActionSheet):** хедер-иконка = list-глиф + violet `[N]` когда armed; при открытой панели становится ✕ (закрывает и панель, и редактор). Две колонки настроек: левая — pivot «on tab» + delay-секунды; правая — Run after (violet) / Stop after split с power-иконкой Close-after (red) / Post split с карандашом. Список очереди (≈5 строк, потом скролл), тап по строке или «+ Add» → инлайн-редактор (Mirror Editing, ≈5 строк textarea, Save). `queue-update` SSE держит всё live без ре-фетча. Цвета — те же семантические роли что в `PromptQueueOverlay`: `#a78bfa` armed, `#8b5cf6` pivot-target, `#DA7756` stop/post, `#ef4444` close.
+**UI-маппинг на десктопный оверлей (bottom-sheet, не right-panel — thumb-reach, как ParamsSheet/ActionSheet):** хедер-иконка = list-глиф + violet `[N]` когда armed; `[N]` считает только enabled items, как desktop. При открытой панели становится ✕ (закрывает и панель, и редактор). Две колонки настроек: левая — pivot «on tab» + delay-секунды; правая — Run after (violet) / Stop after split с power-иконкой Close-after (red) / Post split с карандашом. Список очереди (≈5 строк, потом скролл), тап по строке или «+ Add» → инлайн-редактор (Mirror Editing, ≈5 строк textarea, Save). Checkbox на строке шлёт `update(enabled)` и оставляет disabled item видимым с темно-малиновым фоном; это mirror skip-state, не mobile-only фильтр. `queue-update` SSE держит всё live без ре-фетча. Цвета — те же семантические роли что в `PromptQueueOverlay`: `#a78bfa` armed, `#8b5cf6` pivot-target, `#DA7756` stop/post, `#ef4444` close.
 
 **Prod требует `build:install`** — `App.tsx::handleWebBridge` (новые actions) и `web-server.js` (новые routes) живут в asar; mobile-web Vite-dev итерирует только фронт. См. «Stale prod-app → silent bridge timeout» ниже.
 
@@ -162,6 +162,7 @@ setBusy(cur => cur !== authoritativeBusy ? authoritativeBusy : cur);
 ```
 GET  /api/me                                   → ping, проверка токена
 GET  /api/projects                             → SQLite + isOpen/isActive + project icon из renderer bridge
+POST /api/projects/:id/rename                  → renameProject (через bridge → updateProject{name} → project:save-metadata)
 GET  /api/projects/:id/tabs                    → tabs + timelineCount + live state + statusMarker
 POST /api/projects/:id/sdk-tabs                → createSDKTab (через bridge)
 POST /api/sdk-tabs/:tabId/send                 → sendSDKMessage + dispatch external-prompt
@@ -185,6 +186,7 @@ GET  /api/sdk-tabs/:tabId/pending-question      → текущий AskUserQuesti
 POST /api/sdk-tabs/:tabId/answer-question       → answerClaudeQuestion ({source, answers, stop})
 GET  /api/active-loaders                       → live loaders snapshot для external install preflight
 GET  /api/prompts[?etag=X]                     → getPrompts + getPromptGroups (no bridge); ?etag match → { etag, unchanged: true }
+GET  /api/agent-models                         → { codex:[{id,label,efforts}], claude:[{id,label}] } каталог моделей (no bridge; codex из live `codex debug models`). Прямой роут до `let m` — см. «Гочи let m». Детали — fact-mobile-claude-pty.md::Контекст-% и список моделей
 POST /api/log/client                           → mobile diagnostic logs → console.log → dev.log
 GET  /api/events?token=&tabId=                 → SSE (text/event-stream) — ОСНОВНОЙ live-канал. snapshot/message/busy/done/bridge-update/queue-update/ask-question/question-cancelled. Не блокируется anti-tracker'ами как ws://. См. секцию «SSE transport».
 WS   /ws?token=&tabId=                          → тот же набор events. Legacy-канал для permissive-браузеров; на Yandex/Chrome с Protect не работает (ws:// к private-IP режется молча).
@@ -199,6 +201,8 @@ GET  /api/sdk-tabs/:tabId/status                → status строка (inactiv
 Все pathname-параметры (`:id`, `:tabId`) ОБЯЗАТЕЛЬНО прогоняются через `decId()` (`decodeURIComponent`) перед использованием — см. секцию «URL-encoded path параметры» ниже.
 
 Публичный URL вместо LAN-IP — см. [`fact-remote-access.md`](fact-remote-access.md). С phone'а через интернет endpoint-map тот же, отличается только хост в URL.
+
+**Гочи: общий `let m` в цепочке роутов = TDZ на вставке нового роута выше.** Хендлер строит роуты последовательными `m = parsed.pathname.match(...)`, но переменная `m` объявляется через `let` **один раз** — исторически на роуте `/tabs` где-то в середине файла. Если добавить новый роут (как project-rename) **выше** этой `let`-строки и написать там `m = match()`, JS temporal dead zone роняет вызов: `Cannot access 'm' before initialization` — и не только новый роут, а **все** роуты от точки вставки и ниже отдают 500 (исключение прерывает хендлер). Симптом был коварный: `/api/projects` (отдаётся выше вставки) работал 200, а `/api/projects/:id/tabs` и `/rename` (ниже) — 500, на iOS «переименование откатилось, на десктопе ничего». Правило при вставке роута: первый по файлу `m = match()` обязан быть `let m =`; всё ниже — голые присваивания. Перенёс объявление `let m` на самый верхний роут (project-rename), бывший `let m` у `/tabs` стал `m =`.
 
 ## URL-encoded path параметры (`=` в base64-id)
 
@@ -363,6 +367,8 @@ Warm-cache путь: только одна фаза `?after=<cachedLastUuid>` �
 - `ChatRoute` deep-link reload: резолвит таб сперва из `tabs:<id>` кэша (instant),
   потом подтверждает сетью. Историю чата дальше красит свой IDB-кэш истории.
 
+Known edge 2026-06-14: если project-card loader на экране всех проектов не горит при уже активном desktop turn, но после захода в проект tab-row loader виден и после возврата project-card тоже начинает гореть, не чини Codex/Claude streaming заново. In-tab SSE уже жив; рассинхрон находится между child tab runtime/revalidation и parent `ProjectsView` aggregate/cache adoption. Симптом важен для поиска: «loader на проекте появляется только после открытия проекта».
+
 **Error-policy (важно):** ошибка сети показывается full-screen ТОЛЬКО когда показать
 нечего (`error && !data`). Если кэш есть — стейл-табы остаются, ошибка глотается, next
 poll восстановит. Иначе мигающий «Failed» поверх рабочего списка.
@@ -391,14 +397,14 @@ poll восстановит. Иначе мигающий «Failed» поверх
 
 Клиент: `EventSource` имеет **встроенный** auto-reconnect — рукодельный backoff/watchdog/visibilitychange (которые были у WS) удалены, браузер сам реконнектит. `esRef`, `eventsUrl()` в `api.ts`. Парсинг сообщений тот же (общий JSON-envelope).
 
-**`webBroadcast` логирование — lifecycle-only:** `type:'message'` фанится десятками раз за turn → без подписчика залил бы `dev.log` сотнями `[WebBcast:DROP] type=message`. `BCAST_LOG_TYPES = {snapshot,busy,done,bridge-update}` — логируется только это + `dead`-pruning. `message` молчит. См. CLAUDE.md::Логирование (no spam in hot paths).
+**`webBroadcast` логирование — lifecycle-first, но `message` тоже трассируется metadata-only:** `type:'message'` может лететь десятками раз за turn, поэтому в лог не пишется chat text/content. Но SEND/DROP для `message` логируются с коротким summary (`role/content-types`, `noSubscribers`, `to=N/N`), потому что иначе баг «iOS не видит live text, но история появляется после переоткрытия» не отличить от parser-регрессии. Lifecycle-типы (`snapshot`, `busy`, `done`, `bridge-update`, `queue-update`, questions) продолжают логироваться всегда.
 
 **Loader'ы Resume/Stop — строго по SSE-событию, без таймаутов:**
 - Resume: `setResuming(true)` на клик, HTTP-ответ (~15ms) loader НЕ гасит. Гаснет `useEffect` когда `claudeStatus → active|busy` (SSE snapshot от `Bridge:Fresh`/`ClaudePromptReady`, ~1.1s). Edge: bridge вернул `alreadyRunning:true` (Claude уже жив, stale mobile-статус) → нового snapshot не будет → гасим loader сразу в `onResume` + `setClaudeStatus('active')`, иначе вечный спиннер.
 - Stop: `setStopping(true)` на клик, гаснет когда `claudeStatus → inactive` (SSE snapshot от `clearBridgeTab` после реальной смерти процесса, ~500ms). Edge: `stop` вернул `{stopped:false}` (процесса уже не было) → нет PTY-exit → гасим loader сразу + `setClaudeStatus('inactive')`.
 - `InlineSpinner` — `transform:rotate` (не opacity), UPPERCASE лейбл «RESUMING…»/«STOPPING» — детектируется на видеозаписи (CLAUDE.md::AI-Optimized UI).
 
-**Регрессия-canary:** `[WebSSE:Open/Close]`, `[WebSub:Subscribe/Unsubscribe]`, `[WebBcast:SEND/DROP]` (lifecycle-типы), `[MobResume]/[MobStop] click/reply-ok/loader-cleared`, `[MobWS] snapshot/busy/done` (имя `MobWS` историческое, канал теперь SSE). Если loader виснет — grep `loader-cleared` отсутствует → SSE-событие смены статуса не пришло (проверь `[WebBcast:SEND] to=N/N` на сервере и `EventSource` readyState на клиенте).
+**Регрессия-canary:** `[WebSSE:Open/Close]`, `[WebSub:Subscribe/Unsubscribe]`, `[WebBcast:SEND/DROP]` (metadata-only для lifecycle/message), `[MobResume]/[MobStop] click/reply-ok/loader-cleared`, `[MobWS] snapshot/busy/done` (имя `MobWS` историческое, канал теперь SSE). Если loader виснет — grep `loader-cleared` отсутствует → SSE-событие смены статуса не пришло (проверь `[WebBcast:SEND] to=N/N` на сервере и `EventSource` readyState на клиенте).
 
 **Stream idle watchdog:** 30s без bytes → abort + onError. Без этого Electron-crash mid-stream → phone forever pending без сигнала.
 

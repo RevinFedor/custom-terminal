@@ -250,6 +250,14 @@ export default function ClaudeControlBar({
     }
     return undefined;
   });
+  const currentTabCwd = useWorkspaceStore((s) => {
+    for (const [, ws] of s.openProjects) {
+      const t = ws.tabs.get(tabId);
+      if (t) return t.cwd;
+    }
+    return undefined;
+  });
+  const launchCwd = currentTabCwd || projectPath;
   const defaultCodexModel = useUIStore((s) => s.defaultCodexModel);
   const defaultCodexEffort = useUIStore((s) => s.defaultCodexEffort);
   const codexModel = codexTabModel || (defaultCodexModel !== 'none' ? defaultCodexModel : DEFAULT_CODEX_MODEL);
@@ -401,6 +409,28 @@ export default function ClaudeControlBar({
     window.addEventListener('sdk-context-update', handler);
     return () => window.removeEventListener('sdk-context-update', handler);
   }, [tabId, isSDKTab]);
+
+  // Codex tab: context % comes via codex:context-update IPC, emitted by the
+  // rollout turn watcher (main) on every token_count event. The number is
+  // Codex's own — last_token_usage.total_tokens / model_context_window — not our
+  // recompute (see emitCodexContextPct + fact-codex.md::Timeline). Same
+  // contextPct state + SQLite seed/persist as Claude/SDK, so the chip renders,
+  // colors and survives restart identically. Stale-bridge guard mirrors the
+  // claude:bridge-update handler: during a resume/PID-reuse race a dead session's
+  // tail could fire first; don't stamp another session's % onto this tab.
+  useEffect(() => {
+    if (!isCodex) return;
+    const handler = (_: any, data: { tabId: string; sessionId?: string; contextPct: number }) => {
+      if (data.tabId !== tabId) return;
+      if (data.sessionId && isStaleAgainstPending(tabId, data.sessionId)) return;
+      if (typeof data.contextPct === 'number' && data.contextPct > 0) {
+        setContextPct(data.contextPct);
+        persistContextPct(data.contextPct);
+      }
+    };
+    ipcRenderer.on('codex:context-update', handler);
+    return () => ipcRenderer.removeListener('codex:context-update', handler);
+  }, [tabId, isCodex]);
 
   // Cache cooldown data — two channels, same shape, mutually exclusive by tab type.
   // PTY: claude:cache-update IPC (proxy parsed message_start, only fires for
@@ -618,12 +648,11 @@ export default function ClaudeControlBar({
   const updateCodexState = (state: { codexModel?: string; codexEffort?: string }) => {
     useWorkspaceStore.getState().updateCodexState(tabId, state);
   };
-  const saveCodexSelectionWithoutLivePicker = (
+  const rejectCodexLivePickerWithoutStateChange = (
     state: { codexModel?: string; codexEffort?: string },
     reason: string,
   ) => {
-    console.warn('[CodexControlBar] live picker skipped tab=' + tabId.slice(-12) + ' reason=' + reason + ' state=' + JSON.stringify(state) + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
-    updateCodexState(state);
+    console.warn('[CodexControlBar] live picker rejected tab=' + tabId.slice(-12) + ' reason=' + reason + ' requestedState=' + JSON.stringify(state) + ' currentState=' + JSON.stringify({ codexModel, codexEffort }) + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
     focusTerminal();
   };
   const ignoreCodexPickerDuringTurn = (kind: 'model' | 'effort', value: string) => {
@@ -842,10 +871,10 @@ export default function ClaudeControlBar({
 
   const getCodexDraftStateForPicker = async () => {
     const visualState = terminalRegistry.getCodexDraftState(tabId);
-    const unknownDebug = visualState.hasDraft === null && visualState.debug
+    const probeDebug = visualState.debug
       ? ' debug=' + visualState.debug
       : '';
-    console.warn('[CodexControlBar] draft visual-probe tab=' + tabId.slice(-12) + ' hasDraft=' + visualState.hasDraft + ' source=' + visualState.source + ' active=' + describeActiveElement() + ' preview=' + JSON.stringify(visualState.preview) + unknownDebug);
+    console.warn('[CodexControlBar] draft visual-probe tab=' + tabId.slice(-12) + ' hasDraft=' + visualState.hasDraft + ' source=' + visualState.source + ' active=' + describeActiveElement() + ' preview=' + JSON.stringify(visualState.preview) + probeDebug);
 
     return {
       hasDraft: visualState.hasDraft,
@@ -915,7 +944,7 @@ export default function ClaudeControlBar({
         try {
           const draftState = await getCodexDraftStateForPicker();
           if (!canOpenCodexPicker(draftState)) {
-            saveCodexSelectionWithoutLivePicker(
+            rejectCodexLivePickerWithoutStateChange(
               fallbackState,
               'unsafe-input:model:' + draftState.source,
             );
@@ -943,7 +972,7 @@ export default function ClaudeControlBar({
               updateCodexState(patch);
             }
           } else {
-            saveCodexSelectionWithoutLivePicker(
+            rejectCodexLivePickerWithoutStateChange(
               fallbackState,
               'picker-failed:model:' + (result?.error || 'unknown'),
             );
@@ -1001,7 +1030,7 @@ export default function ClaudeControlBar({
         try {
           const draftState = await getCodexDraftStateForPicker();
           if (!canOpenCodexPicker(draftState)) {
-            saveCodexSelectionWithoutLivePicker(
+            rejectCodexLivePickerWithoutStateChange(
               { codexEffort: level },
               'unsafe-input:effort:' + draftState.source,
             );
@@ -1026,7 +1055,7 @@ export default function ClaudeControlBar({
             syncCodexPickerOptions(result);
             updateCodexState({ codexModel: result.model || codexModel });
           } else {
-            saveCodexSelectionWithoutLivePicker(
+            rejectCodexLivePickerWithoutStateChange(
               { codexEffort: level },
               'picker-failed:effort:' + (result?.error || 'unknown'),
             );
@@ -1137,10 +1166,10 @@ export default function ClaudeControlBar({
     if (sessionType === 'codex') {
       store.setTabCommandType(tabId, 'codex');
       store.markAiLaunchAutoTitle(tabId, 'codex');
-      ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex', cwd: projectPath }));
+      ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex', cwd: launchCwd }));
     } else if (sessionType === 'gemini') {
       store.setTabCommandType(tabId, 'gemini');
-      ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd: projectPath, yesMode: true });
+      ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd: launchCwd, yesMode: true });
     } else {
       store.setTabCommandType(tabId, 'claude');
       store.markAiLaunchAutoTitle(tabId, 'claude');
@@ -1177,7 +1206,7 @@ export default function ClaudeControlBar({
       terminalRegistry.get(tabId)?.scrollToBottom();
       focusTerminal();
       window.dispatchEvent(new CustomEvent('timeline:scroll-to-bottom', { detail: { tabId } }));
-      ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex-c', sessionId: codexSessionId || undefined, cwd: projectPath }));
+      ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex-c', sessionId: codexSessionId || undefined, cwd: launchCwd }));
     }
   };
 
@@ -1218,7 +1247,7 @@ export default function ClaudeControlBar({
     if (!tabId || !isSDKTab) return;
     ipcRenderer.invoke('claude-sdk:warm-start', {
       tabId,
-      cwd: projectPath,
+      cwd: launchCwd,
       model: sdkModel || undefined,
       effort: sdkEffort,
       thinking: sdkThinking ? 'adaptive' : 'disabled',
@@ -1491,7 +1520,7 @@ export default function ClaudeControlBar({
     store.markAiLaunchAutoTitle(tabId, 'codex');
     terminalRegistry.get(tabId)?.scrollToBottom();
     focusTerminal();
-    ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex', cwd: projectPath }));
+    ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex', cwd: launchCwd }));
   };
 
   // Fork current Claude session into SDK. This is a branch action FROM a tab
