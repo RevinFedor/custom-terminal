@@ -455,6 +455,8 @@ const formatCodexImagePasteError = (value: unknown): string => {
     .slice(0, 120) || 'unknown';
 };
 
+const formatCodexImagePathPayload = (path: string): string => `[imagePath: ${path}]`;
+
 const normalizeLocalImagePathText = (text: string): string | null => {
   let trimmed = text.trim();
   if (!trimmed || trimmed.includes('\n')) return null;
@@ -807,17 +809,44 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
   const shouldInterceptCodexClipboardImagePaste = useCallback((event: KeyboardEvent): boolean => {
     if (event.type !== 'keydown' || event.code !== 'KeyV') return false;
-    if (event.altKey || event.shiftKey) return false;
+    const logPrefix = '[CodexImagePaste:keydown] tab=' + tabId.slice(-12)
+      + ' key=' + event.key
+      + ' code=' + event.code
+      + ' meta=' + event.metaKey
+      + ' ctrl=' + event.ctrlKey
+      + ' alt=' + event.altKey
+      + ' shift=' + event.shiftKey
+      + ' agent=' + (promptQueueAgentRef.current || 'none')
+      + ' alive=' + claudeProcessAliveRef.current;
+    if (event.altKey || event.shiftKey) {
+      console.warn(logPrefix + ' decision=skip-modifier');
+      return false;
+    }
     const pasteModifier = (event.metaKey && !event.ctrlKey) || (event.ctrlKey && !event.metaKey);
-    if (!pasteModifier) return false;
-    if (promptQueueAgentRef.current !== 'codex') return false;
-    if (!claudeProcessAliveRef.current) return false;
+    if (!pasteModifier) {
+      console.warn(logPrefix + ' decision=skip-no-paste-modifier');
+      return false;
+    }
+    if (promptQueueAgentRef.current !== 'codex') {
+      console.warn(logPrefix + ' decision=skip-agent');
+      return false;
+    }
+    if (!claudeProcessAliveRef.current) {
+      console.warn(logPrefix + ' decision=skip-not-alive');
+      return false;
+    }
 
     try {
       const text = clipboard.readText();
-      if (typeof text === 'string' && normalizeLocalImagePathText(text)) return true;
+      const textPath = typeof text === 'string' ? normalizeLocalImagePathText(text) : null;
+      if (textPath) {
+        console.warn(logPrefix + ' decision=intercept-text-path textLen=' + text.length + ' path=' + textPath);
+        return true;
+      }
       const image = clipboard.readImage();
-      return !!image && !image.isEmpty();
+      const imageEmpty = !image || image.isEmpty();
+      console.warn(logPrefix + ' decision=' + (imageEmpty ? 'skip-no-image' : 'intercept-bitmap') + ' textLen=' + (typeof text === 'string' ? text.length : -1) + ' imageEmpty=' + imageEmpty);
+      return !imageEmpty;
     } catch (error) {
       console.warn('[CodexImagePaste] clipboard probe failed:', error);
       return false;
@@ -826,24 +855,30 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
   const pasteCodexClipboardImageFromClipboard = useCallback(async () => {
     let payload = '';
+    let source = 'unknown';
     try {
       const textPath = normalizeLocalImagePathText(clipboard.readText() || '');
       if (textPath) {
-        payload = textPath;
+        payload = formatCodexImagePathPayload(textPath);
+        source = 'text-path';
       } else {
         const saved = await ipcRenderer.invoke('codex:save-clipboard-image', { tabId });
         if (saved?.success && typeof saved.path === 'string' && saved.path.length > 0) {
-          payload = saved.path;
+          payload = formatCodexImagePathPayload(saved.path);
+          source = 'saved-bitmap';
         } else {
           payload = `[imageError: ${formatCodexImagePasteError(saved?.error || 'save_failed')}]`;
+          source = 'save-error';
         }
       }
     } catch (error) {
       payload = `[imageError: ${formatCodexImagePasteError(error)}]`;
+      source = 'exception';
     }
 
-    // Raw input on purpose: bracketed paste makes Codex auto-attach image paths
-    // and rewrites the composer to [Image #N]. RunAuthor needs the literal path.
+    // Raw input + non-bare path on purpose: Codex treats a fast bare image path
+    // as a paste burst and rewrites it to [Image #N]. RunAuthor needs text.
+    console.warn('[CodexImagePaste:inject] tab=' + tabId.slice(-12) + ' source=' + source + ' len=' + payload.length + ' payload=' + payload);
     ipcRenderer.send('terminal:input', tabId, payload);
   }, [tabId]);
 

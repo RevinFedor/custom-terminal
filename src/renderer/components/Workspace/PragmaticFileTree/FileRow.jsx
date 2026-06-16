@@ -179,8 +179,19 @@ const FileRow = memo(({
     if (e.button !== 0) return; // Only left click
     e.stopPropagation();
     const now = Date.now();
+    console.warn('[SidebarFileRow] click', {
+      id: node.id,
+      name: node.name,
+      isDirectory: node.isDirectory,
+      isSelected,
+      isEditing,
+      metaKey: !!(e.metaKey || e.ctrlKey),
+      shiftKey: !!e.shiftKey,
+      sinceLastClickMs: now - lastClickRef.current,
+    });
     // Suppress second click of a double-click on files (prevents toggle-close)
     if (!node.isDirectory && isSelected && now - lastClickRef.current < 400) {
+      console.warn('[SidebarFileRow] suppress-second-click', { id: node.id, sinceLastClickMs: now - lastClickRef.current });
       return;
     }
     lastClickRef.current = now;

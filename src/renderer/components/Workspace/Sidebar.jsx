@@ -986,12 +986,23 @@ function Sidebar({
 
   const handleFileSelect = useCallback((path, isDirectory, modifiers = {}) => {
     // Skip placeholder nodes — they're not real files
-    if (path.startsWith('__new__')) return
+    if (path.startsWith('__new__')) {
+      console.warn('[SidebarFileTree] select-skip-placeholder', { path, isDirectory, modifiers })
+      return
+    }
 
     const { metaKey, shiftKey } = modifiers
+    console.warn('[SidebarFileTree] select', {
+      path,
+      isDirectory,
+      metaKey: !!metaKey,
+      shiftKey: !!shiftKey,
+      multiSelected: multiSelected.size,
+    })
     setFocusedId(path)
 
     if (metaKey) {
+      console.warn('[SidebarFileTree] select-meta-toggle', { path })
       // Cmd+Click: toggle item in selection
       setMultiSelected(prev => {
         const next = new Set(prev)
@@ -1007,6 +1018,7 @@ function Sidebar({
     }
 
     if (shiftKey && lastClickedRef.current) {
+      console.warn('[SidebarFileTree] select-shift-range', { path, anchor: lastClickedRef.current })
       // Shift+Click: range select in visible order
       const visible = flattenTree(treeData, openStateRef.current)
       const anchorIdx = visible.findIndex(n => n.id === lastClickedRef.current)
@@ -1026,8 +1038,13 @@ function Sidebar({
     // Normal click: clear multi-selection, single select + open
     setMultiSelected(new Set())
     lastClickedRef.current = path
-    if (!isDirectory) onFileSelect(path, isDirectory)
-  }, [onFileSelect, treeData])
+    if (!isDirectory) {
+      console.warn('[SidebarFileTree] open-file', { path })
+      onFileSelect(path, isDirectory)
+    } else {
+      console.warn('[SidebarFileTree] directory-selected-no-open', { path })
+    }
+  }, [onFileSelect, treeData, multiSelected.size])
 
   const handleContextMenu = useCallback((e, node) => {
     setFocusedId(node?.id || null)

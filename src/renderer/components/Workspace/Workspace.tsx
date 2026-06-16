@@ -323,8 +323,8 @@ export default function Workspace() {
   // Click outside the sidebar closes it (when toggle is on). Captures mousedown
   // on window so we don't fight terminal canvas pointer-events; check whether the
   // event target lives inside [data-sidebar-portal]. We also let clicks inside the
-  // file preview (it sits next to the sidebar) propagate through and close the
-  // sidebar, since user wants the sidebar to behave as an overlay.
+  // file preview (it sits next to the sidebar) close the sidebar too: the file
+  // tree behaves as an overlay even when the editor occupies the rest of screen.
   useEffect(() => {
     if (!sidebarOpenForRender || !activeProjectId) return;
     const onDown = (e: MouseEvent) => {
@@ -332,10 +332,33 @@ export default function Workspace() {
       if (!sidebarOverlayCloseOnClickOutside) return;
       const target = e.target as HTMLElement | null;
       if (!target) return;
-      // Inside the sidebar itself — keep open.
-      if (target.closest('[data-sidebar-portal]')) return;
-      // Inside the file preview — also keep open (sidebar+preview are "linked").
-      if (target.closest('[data-file-preview-root]')) return;
+      const sidebarEl = document.querySelector('[data-sidebar-portal]') as HTMLElement | null;
+      const sidebarRect = sidebarEl?.getBoundingClientRect();
+      const insideSidebarDom = !!target.closest('[data-sidebar-portal]');
+      const insideSidebarRect = !!sidebarRect &&
+        e.clientX >= sidebarRect.left &&
+        e.clientX <= sidebarRect.right &&
+        e.clientY >= sidebarRect.top &&
+        e.clientY <= sidebarRect.bottom;
+      const insideFilePreview = !!target.closest('[data-file-preview-root]');
+      const targetLabel = `${target.tagName.toLowerCase()}${target.className ? '.' + String(target.className).replace(/\s+/g, '.') : ''}`;
+      if (insideSidebarDom || insideSidebarRect) {
+        console.warn('[SidebarOverlayClose] keep-open', {
+          reason: insideSidebarDom ? 'inside-sidebar-dom' : 'inside-sidebar-rect',
+          target: targetLabel,
+          x: e.clientX,
+          y: e.clientY,
+          insideFilePreview,
+          rect: sidebarRect ? { left: sidebarRect.left, right: sidebarRect.right, top: sidebarRect.top, bottom: sidebarRect.bottom } : null,
+        });
+        return;
+      }
+      console.warn('[SidebarOverlayClose] close', {
+        target: targetLabel,
+        x: e.clientX,
+        y: e.clientY,
+        insideFilePreview,
+      });
       setSidebarOpen(activeProjectId, false);
     };
     window.addEventListener('mousedown', onDown, true);
@@ -793,7 +816,7 @@ export default function Workspace() {
         const { sidebarExpandedDirs } = getSidebarState(activeProjectId);
         const sidebarWidth = useUIStore.getState().sidebarWidth || 280;
         return ReactDOM.createPortal(
-          <div data-sidebar-portal style={{ position: 'fixed', left: 0, top: 70, bottom: 0, width: sidebarWidth, zIndex: 100020, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
+          <div data-sidebar-portal style={{ position: 'fixed', left: 0, top: 70, bottom: 0, width: sidebarWidth, zIndex: 2147482000, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
             <Sidebar
               folderPath={explorerPath}
               width={sidebarWidth}
@@ -806,13 +829,27 @@ export default function Workspace() {
               linkTargets={fileLinkTargets}
               onLinkFile={handleLinkFileToTab}
               onFileSelect={(filePath: string, isDir: boolean) => {
+                console.warn('[SidebarFileOpen] select', {
+                  filePath,
+                  isDir,
+                  previewPath: filePreview?.path || null,
+                  previewSource: filePreview?.source || null,
+                });
                 if (!isDir) {
                   if (filePreview?.path === filePath && filePreview?.source !== 'tab') {
+                    console.warn('[SidebarFileOpen] close-current-preview', { filePath });
                     useUIStore.getState().closeFilePreview();
                     setOpenFilePath(activeProjectId, null);
                   } else {
                     const ipc = window.require('electron').ipcRenderer;
+                    console.warn('[SidebarFileOpen] read-start', { filePath });
                     ipc.invoke('file:read', filePath).then((result: any) => {
+                      console.warn('[SidebarFileOpen] read-result', {
+                        filePath,
+                        success: !!result?.success,
+                        error: result?.error || null,
+                        length: typeof result?.content === 'string' ? result.content.length : null,
+                      });
                       if (result?.success) {
                         const language = detectLanguage(path.extname(filePath).toLowerCase());
                         openFilePreview({ path: filePath, content: result.content, language, source: 'sidebar' });

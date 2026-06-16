@@ -6349,7 +6349,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               this is a user command, so it may override a manually named tab.
               The resulting name is still marked manual to block future auto
               launch naming from replacing it. */}
-          {!isMultiSelect && contextMenu && (() => {
+          {!isMultiSelect && contextMenu && !isContextFileTab && (() => {
             const refreshing = titleRefreshInFlight.has(contextMenu.tabId) || tabTitleNamingIds.has(contextMenu.tabId);
             return (
               <button
@@ -6372,7 +6372,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           })()}
 
           {/* Add / Remove Favorites */}
-          {!isMultiSelect && (
+          {!isMultiSelect && !isContextFileTab && (
             <button
               className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
               onClick={async (e) => {

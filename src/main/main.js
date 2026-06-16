@@ -1896,6 +1896,31 @@ let claudeHookServer = null;
 // the live CLI pid before firing Ctrl+G because there is no Claude SessionBridge.
 const grabInputPending = new Map(); // tabId → { resolve, timer }
 const grabInputPidToTab = new Map(); // cliPid → tabId, used by non-Claude external-editor grabs
+const codexSavedClipboardImagesByTab = new Map(); // tabId → [{ path, at }]
+
+function rememberCodexClipboardImagePath(tabId, filePath) {
+  if (!tabId || !filePath) return;
+  const now = Date.now();
+  const prev = codexSavedClipboardImagesByTab.get(tabId) || [];
+  const next = prev
+    .filter((entry) => entry && typeof entry.path === 'string' && now - Number(entry.at || 0) < 5 * 60 * 1000)
+    .concat({ path: filePath, at: now })
+    .slice(-12);
+  codexSavedClipboardImagesByTab.set(tabId, next);
+}
+
+function takeRecentCodexClipboardImagePaths(tabId, count) {
+  if (!tabId || count <= 0) return [];
+  const now = Date.now();
+  const prev = codexSavedClipboardImagesByTab.get(tabId) || [];
+  const fresh = prev.filter((entry) => entry && typeof entry.path === 'string' && now - Number(entry.at || 0) < 5 * 60 * 1000);
+  const chosen = fresh.slice(-count);
+  const chosenSet = new Set(chosen);
+  const remaining = fresh.filter((entry) => !chosenSet.has(entry)).slice(-12);
+  if (remaining.length > 0) codexSavedClipboardImagesByTab.set(tabId, remaining);
+  else codexSavedClipboardImagesByTab.delete(tabId);
+  return chosen;
+}
 
 function findTabIdBySession(sessionId) {
   if (!sessionId) return null;
@@ -2341,6 +2366,8 @@ function startClaudeHookServer() {
             if (Array.isArray(pending.pids)) pending.pids.forEach(pid => grabInputPidToTab.delete(pid));
             else if (pending.pid) grabInputPidToTab.delete(pending.pid);
             const images = (text.match(/\[Image(?:\s+#?\d+)?\]/g) || []).length;
+            let resolvedText = text;
+            let imageCountForQueue = images;
             // Resolve [Image #N] placeholders → real files under
             // ~/.claude/image-cache/<sessionId>/. Logged regardless of UI use so a
             // missing file surfaces here (helps when Claude was restarted between
@@ -2348,13 +2375,30 @@ function startClaudeHookServer() {
             // but won't be touched by cleanupOldImageCaches until next boot).
             let imagePaths = [];
             if (images > 0) {
-              const sid = bridgeKnownSessions.get(tabId) || null;
-              const resolved = resolveGrabbedImagePaths(sid, text);
-              imagePaths = resolved.filter(r => !r.missing).map(r => ({ id: r.id, path: r.path, mediaType: r.mediaType, size: r.size }));
-              const summary = resolved.map(r => r.missing ? ('#' + r.id + ':MISSING') : ('#' + r.id + ':' + (r.size / 1024).toFixed(1) + 'KB')).join(',');
-              console.log('[GrabImages] tab=' + tabId.slice(-12) + ' sessionId=' + (sid ? sid.slice(0, 8) : 'none') + ' refs=' + images + ' resolved=[' + summary + ']');
+              if (agent === 'codex') {
+                let replaced = 0;
+                let pathResolved = 0;
+                const recentImagePaths = takeRecentCodexClipboardImagePaths(tabId, images);
+                resolvedText = text.replace(/\[Image(?:\s+#?(\d+))?\]/g, (_match, id) => {
+                  const staged = recentImagePaths[replaced];
+                  replaced += 1;
+                  if (staged?.path) {
+                    pathResolved += 1;
+                    return '[imagePath: ' + staged.path + ']';
+                  }
+                  return '[imageError: codex_image_path_unavailable' + (id ? ' #' + id : '') + ']';
+                });
+                imageCountForQueue = 0;
+                console.warn('[GrabImages:Codex] tab=' + tabId.slice(-12) + ' refs=' + images + ' replaced=' + replaced + ' pathResolved=' + pathResolved + ' reason=external-editor-returned-placeholder');
+              } else {
+                const sid = bridgeKnownSessions.get(tabId) || null;
+                const resolved = resolveGrabbedImagePaths(sid, text);
+                imagePaths = resolved.filter(r => !r.missing).map(r => ({ id: r.id, path: r.path, mediaType: r.mediaType, size: r.size }));
+                const summary = resolved.map(r => r.missing ? ('#' + r.id + ':MISSING') : ('#' + r.id + ':' + (r.size / 1024).toFixed(1) + 'KB')).join(',');
+                console.log('[GrabImages] tab=' + tabId.slice(-12) + ' sessionId=' + (sid ? sid.slice(0, 8) : 'none') + ' refs=' + images + ' resolved=[' + summary + ']');
+              }
             }
-            pending.resolve({ success: true, text, images, imagePaths, mode });
+            pending.resolve({ success: true, text: resolvedText, images: imageCountForQueue, imagePaths, mode });
           }
           continue;
         }
@@ -7635,6 +7679,7 @@ ipcMain.handle('codex:save-clipboard-image', async (_event, { tabId } = {}) => {
     const hash = crypto.createHash('sha256').update(png).digest('hex').slice(0, 16);
     const filePath = path.join(dir, Date.now() + '-' + hash + '.png');
     await fs.promises.writeFile(filePath, png, { mode: 0o600 });
+    rememberCodexClipboardImagePath(tabId, filePath);
     console.log('[codex:save-clipboard-image] tab=' + safeTabId.slice(-12) + ' path=' + filePath + ' bytes=' + png.length);
     return { success: true, path: filePath, size: png.length };
   } catch (error) {
