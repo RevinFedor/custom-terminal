@@ -674,6 +674,7 @@ export default function ClaudeControlBar({
   const isDeepSeekPTY = !isSDKTab && providerState.type === 'deepseek';
   const supportsKnobs = isSDKTab || isAnthropicPTY || isDeepSeekPTY || isCodex;
   const codexKnobsDisabled = isCodex && codexTurnBusy;
+  const codexFastDisabled = isCodex && !isCommandRunning;
 
   // Cache cooldown chip: Claude only (Anthropic PTY or SDK). DeepSeek/Zen have
   // no prompt cache, so the chip is meaningless there — hide entirely. Also
@@ -1080,11 +1081,6 @@ export default function ClaudeControlBar({
 
   const sendCodexFast = async () => {
     if (!isCodex) return;
-    if (codexTurnBusy) {
-      console.warn('[CodexControlBar] /fast skipped tab=' + tabId.slice(-12) + ' reason=active-turn');
-      focusTerminal();
-      return;
-    }
     if (!isCommandRunning) {
       console.warn('[CodexControlBar] /fast skipped tab=' + tabId.slice(-12) + ' reason=no-live-process');
       focusTerminal();
@@ -2233,9 +2229,10 @@ export default function ClaudeControlBar({
             хотя SDK уже готов принять prompt.
           • Codex: во время active turn Model/Effort disabled целиком. Это
             не preset-flow и не warning-flow: Codex TUI занят streaming'ом,
-            поэтому никакого `/model`, state-save или toast быть не должно. */}
+            поэтому никакого `/model`, state-save или toast быть не должно.
+            `/fast` — отдельная live-команда и остаётся доступной при streaming. */}
       {showRightCluster && (() => {
-        const canControl = isSDKTab ? true : isCodex ? !codexKnobsDisabled : isCommandRunning;
+        const canControl = isSDKTab ? true : isCodex ? (!codexKnobsDisabled || !codexFastDisabled) : isCommandRunning;
         const modelOptions = isCodex ? codexModels : isAnthropicPTY ? claudeCodeModels : activeProvider.models;
         return (
         <div
@@ -2313,12 +2310,20 @@ export default function ClaudeControlBar({
             <button
               {...triggerProps('model')}
               disabled={codexKnobsDisabled}
-              style={triggerStyle}
+              style={{
+                ...triggerStyle,
+                ...(codexKnobsDisabled ? {
+                  color: '#555',
+                  borderColor: 'rgba(255,255,255,0.08)',
+                  backgroundColor: '#222',
+                  cursor: 'not-allowed',
+                } : {}),
+              }}
               title={codexKnobsDisabled ? 'Model недоступен во время streaming' : 'Model (клик закрепит, ⌘+наведение откроет временно)'}
             >
-              <span style={{ color: '#777', fontSize: 10 }}>Model</span>
-              <span style={{ color: '#fff' }}>{modelLabel}</span>
-              <span style={{ opacity: 0.6 }}>▴</span>
+              <span style={{ color: codexKnobsDisabled ? '#555' : '#777', fontSize: 10 }}>Model</span>
+              <span style={{ color: codexKnobsDisabled ? '#666' : '#fff' }}>{modelLabel}</span>
+              <span style={{ opacity: codexKnobsDisabled ? 0.25 : 0.6 }}>▴</span>
             </button>
             {openPopup === 'model' && renderControlPopup('model',
               modelOptions.map(m => {
@@ -2395,41 +2400,41 @@ export default function ClaudeControlBar({
                 </React.Fragment>
               );
             })}
-	          </div>
+          </div>
 
-	          {isCodex && (
-	            <button
-	              type="button"
-	              aria-label="Send /fast to Codex"
-	              title={codexKnobsDisabled ? '/fast недоступен во время streaming' : 'Send /fast to Codex'}
-	              disabled={codexKnobsDisabled}
-	              onClick={sendCodexFast}
-	              style={{
-	                ...triggerStyle,
-	                width: 24,
-	                padding: 0,
-	                justifyContent: 'center',
-	                color: codexKnobsDisabled ? '#555' : '#bbb',
-	                borderColor: codexKnobsDisabled ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.12)',
-	                backgroundColor: 'transparent',
-	                cursor: codexKnobsDisabled ? 'not-allowed' : triggerStyle.cursor,
-	              }}
-	            >
-	              <svg
-	                width="13"
-	                height="13"
-	                viewBox="0 0 24 24"
-	                fill="none"
-	                stroke="currentColor"
-	                strokeWidth="2.4"
-	                strokeLinecap="round"
-	                strokeLinejoin="round"
-	                aria-hidden="true"
-	              >
-	                <path d="M13 2 4 14h7l-1 8 10-13h-7l0-7Z" />
-	              </svg>
-	            </button>
-	          )}
+          {isCodex && (
+            <button
+              type="button"
+              aria-label="Send /fast to Codex"
+              title={codexFastDisabled ? '/fast доступен только при живом Codex' : 'Send /fast to Codex'}
+              disabled={codexFastDisabled}
+              onClick={sendCodexFast}
+              style={{
+                ...triggerStyle,
+                width: 24,
+                padding: 0,
+                justifyContent: 'center',
+                color: codexFastDisabled ? '#555' : '#bbb',
+                borderColor: codexFastDisabled ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.12)',
+                backgroundColor: 'transparent',
+                cursor: codexFastDisabled ? 'not-allowed' : triggerStyle.cursor,
+              }}
+            >
+              <svg
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.4"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M13 2 4 14h7l-1 8 10-13h-7l0-7Z" />
+              </svg>
+            </button>
+          )}
 
 	          {/* Think — single toggle, no dropdown */}
           {!isDeepSeekPTY && !isCodex && (
