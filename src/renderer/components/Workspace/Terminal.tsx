@@ -455,6 +455,23 @@ const formatCodexImagePasteError = (value: unknown): string => {
     .slice(0, 120) || 'unknown';
 };
 
+const normalizeLocalImagePathText = (text: string): string | null => {
+  let trimmed = text.trim();
+  if (!trimmed || trimmed.includes('\n')) return null;
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+    trimmed = trimmed.slice(1, -1);
+  }
+  let pathText = trimmed;
+  if (trimmed.startsWith('file://')) {
+    try {
+      pathText = decodeURIComponent(trimmed.replace(/^file:\/\//, ''));
+    } catch {
+      pathText = trimmed.replace(/^file:\/\//, '');
+    }
+  }
+  return /^\/.+\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(pathText) ? pathText : null;
+};
+
 function waitForClaudeStartupModelBridge(tabId: string, model: string, timeoutMs = 6000): Promise<string> {
   const current = _claudeBridgeModelByTab.get(tabId);
   if (current && _bridgeModelMatchesTarget(model, current.model)) {
@@ -798,7 +815,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
     try {
       const text = clipboard.readText();
-      if (typeof text === 'string' && text.trim().length > 0) return false;
+      if (typeof text === 'string' && normalizeLocalImagePathText(text)) return true;
       const image = clipboard.readImage();
       return !!image && !image.isEmpty();
     } catch (error) {
@@ -810,24 +827,22 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
   const pasteCodexClipboardImageFromClipboard = useCallback(async () => {
     let payload = '';
     try {
-      const saved = await ipcRenderer.invoke('codex:save-clipboard-image', { tabId });
-      if (saved?.success && typeof saved.path === 'string' && saved.path.length > 0) {
-        payload = saved.path;
+      const textPath = normalizeLocalImagePathText(clipboard.readText() || '');
+      if (textPath) {
+        payload = textPath;
       } else {
-        payload = `[imageError: ${formatCodexImagePasteError(saved?.error || 'save_failed')}]`;
+        const saved = await ipcRenderer.invoke('codex:save-clipboard-image', { tabId });
+        if (saved?.success && typeof saved.path === 'string' && saved.path.length > 0) {
+          payload = saved.path;
+        } else {
+          payload = `[imageError: ${formatCodexImagePasteError(saved?.error || 'save_failed')}]`;
+        }
       }
     } catch (error) {
       payload = `[imageError: ${formatCodexImagePasteError(error)}]`;
     }
 
-    try {
-      const res = await ipcRenderer.invoke('codex:append-input', tabId, payload, { submit: false });
-      if (!res || res.success !== true) {
-        console.warn('[CodexImagePaste] append failed:', res?.error || 'unknown');
-      }
-    } catch (error) {
-      console.warn('[CodexImagePaste] append threw:', error);
-    }
+    ipcRenderer.send('terminal:input', tabId, payload);
   }, [tabId]);
 
   // Check if terminal is scrolled up (not at bottom)
@@ -1583,6 +1598,11 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             && event.type === 'keydown' && event.code === 'KeyT') {
           return false;
         }
+        if (shouldInterceptCodexClipboardImagePaste(event)) {
+          event.preventDefault();
+          void pasteCodexClipboardImageFromClipboard();
+          return false;
+        }
         // When the picker is open, swallow arrow/Enter/Esc so they navigate
         // the picker (handled by App-level capture listener) and don't reach
         // shell history / Claude TUI input.
@@ -2181,6 +2201,11 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           // Shift+Cmd+T — reopen last closed tab (VS Code-style). Layout-agnostic.
           if (event.metaKey && event.shiftKey && !event.altKey && !event.ctrlKey
               && event.type === 'keydown' && event.code === 'KeyT') {
+            return false;
+          }
+          if (shouldInterceptCodexClipboardImagePaste(event)) {
+            event.preventDefault();
+            void pasteCodexClipboardImageFromClipboard();
             return false;
           }
           // When the picker is open, swallow arrow/Enter/Esc so they navigate

@@ -2966,6 +2966,22 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     } else if (e.metaKey || e.ctrlKey) {
       toggleTabSelection(projectId, tabId, true);
     } else {
+      const clickedTab = workspace?.tabs.get(tabId);
+      if (clickedTab?.tabType === 'file' && tabId === workspace?.activeTabId) {
+        const historyTargetId = [...(workspace.tabHistory || [])]
+          .reverse()
+          .find((id) => id !== tabId && workspace.tabs.get(id)?.tabType !== 'file');
+        const fallbackParentId = clickedTab.visualParentTabId && workspace.tabs.has(clickedTab.visualParentTabId)
+          ? clickedTab.visualParentTabId
+          : null;
+        const returnTargetId = historyTargetId || fallbackParentId;
+        if (returnTargetId) {
+          console.warn('[TabBar:click] file-tab-toggle-back tabId=' + tabId + ' target=' + returnTargetId + ' ts=' + Date.now());
+          switchTab(projectId, returnTargetId);
+          setProjectView(projectId, 'terminal');
+          return;
+        }
+      }
       if (currentView === 'home' && tabId === workspace?.activeTabId) {
         console.warn('[TabBar:click] return-from-home active-tab project=' + projectId + ' tabId=' + tabId + ' ts=' + Date.now());
       }
@@ -3865,7 +3881,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
   // Clamp context menu position to viewport (same pattern as Timeline tooltip)
   useLayoutEffect(() => {
-    const activeMenu = contextMenu || groupContextMenu;
+    const activeMenu = contextMenu || groupContextMenu || emptyContextMenu;
     if (!activeMenu || !contextMenuRef.current) return;
     const el = contextMenuRef.current;
     const rect = el.getBoundingClientRect();
@@ -3889,7 +3905,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     if (x !== contextMenuPos.x || y !== contextMenuPos.y) {
       setContextMenuPos({ x, y });
     }
-  }, [contextMenu, groupContextMenu, contextScripts.length]);
+  }, [contextMenu, groupContextMenu, emptyContextMenu, contextScripts.length]);
 
   useLayoutEffect(() => {
     if (!isVerticalLayout) {
@@ -5620,8 +5636,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         <div
           ref={contextMenuRef}
           data-tab-context-menu
-          className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px] z-[100]"
-          style={{ left: contextMenuPos.x, top: contextMenuPos.y }}
+          className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px]"
+          style={{ left: contextMenuPos.x, top: contextMenuPos.y, zIndex: 100030 }}
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
         >
@@ -6408,8 +6424,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           <div
             ref={contextMenuRef}
             data-tab-context-menu
-            className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px] z-[100] rounded-md overflow-hidden"
-            style={{ left: contextMenuPos.x, top: contextMenuPos.y }}
+            className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px] rounded-md overflow-hidden"
+            style={{ left: contextMenuPos.x, top: contextMenuPos.y, zIndex: 100030 }}
             onClick={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
           >
@@ -6562,8 +6578,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       {/* Empty space context menu */}
       {emptyContextMenu && (
         <div
-          className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px] z-[100] rounded-md overflow-hidden"
-          style={{ left: emptyContextMenu.x, top: emptyContextMenu.y }}
+          ref={contextMenuRef}
+          data-tab-context-menu
+          className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px] rounded-md overflow-hidden"
+          style={{ left: contextMenuPos.x, top: contextMenuPos.y, zIndex: 100030 }}
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
         >

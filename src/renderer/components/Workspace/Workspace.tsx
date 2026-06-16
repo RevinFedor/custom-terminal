@@ -793,7 +793,7 @@ export default function Workspace() {
         const { sidebarExpandedDirs } = getSidebarState(activeProjectId);
         const sidebarWidth = useUIStore.getState().sidebarWidth || 280;
         return ReactDOM.createPortal(
-          <div data-sidebar-portal style={{ position: 'fixed', left: 0, top: 70, bottom: 0, width: sidebarWidth, zIndex: 99999, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
+          <div data-sidebar-portal style={{ position: 'fixed', left: 0, top: 70, bottom: 0, width: sidebarWidth, zIndex: 100020, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
             <Sidebar
               folderPath={explorerPath}
               width={sidebarWidth}
@@ -807,15 +807,15 @@ export default function Workspace() {
               onLinkFile={handleLinkFileToTab}
               onFileSelect={(filePath: string, isDir: boolean) => {
                 if (!isDir) {
-                  if (filePreview?.path === filePath) {
+                  if (filePreview?.path === filePath && filePreview?.source !== 'tab') {
                     useUIStore.getState().closeFilePreview();
                     setOpenFilePath(activeProjectId, null);
                   } else {
                     const ipc = window.require('electron').ipcRenderer;
                     ipc.invoke('file:read', filePath).then((result: any) => {
                       if (result?.success) {
-                        const ext = filePath.split('.').pop()?.toLowerCase() || '';
-                        openFilePreview({ path: filePath, content: result.content, language: ext, source: 'sidebar' });
+                        const language = detectLanguage(path.extname(filePath).toLowerCase());
+                        openFilePreview({ path: filePath, content: result.content, language, source: 'sidebar' });
                         setOpenFilePath(activeProjectId, filePath);
                       }
                     });

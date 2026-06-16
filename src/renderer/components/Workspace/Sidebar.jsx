@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import React, { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect } from 'react'
 import PragmaticFileTree from './PragmaticFileTree/PragmaticFileTree'
 import { flattenTree } from './PragmaticFileTree/utils'
 import Tooltip from '../UI/Tooltip'
@@ -257,6 +257,14 @@ function IconPicker({ item, onSelect, onClose, onReset, onResetToVsc, existingIc
 
 function ContextMenu({ x, y, node, onClose, onCopyPath, onCopyContent, onRename, onChooseIcon, onNewFile, onNewFolder, onDelete, onLinkFile, linkTargets = [], multiSelectCount = 0 }) {
   const menuRef = useRef(null)
+  const linkItemRef = useRef(null)
+  const [position, setPosition] = useState({ left: x, top: y })
+  const [linkSubmenuStyle, setLinkSubmenuStyle] = useState({
+    top: -4,
+    maxHeight: 300,
+    left: 'calc(100% - 4px)',
+    right: 'auto',
+  })
 
   useEffect(() => {
     const handleClickOutside = (e) => {
@@ -286,8 +294,49 @@ function ContextMenu({ x, y, node, onClose, onCopyPath, onCopyContent, onRename,
     onClose()
   }
 
+  useLayoutEffect(() => {
+    const el = menuRef.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    const pad = 8
+    const maxLeft = Math.max(pad, window.innerWidth - rect.width - pad)
+    const maxTop = Math.max(pad, window.innerHeight - rect.height - pad)
+    const next = {
+      left: Math.min(Math.max(x, pad), maxLeft),
+      top: Math.min(Math.max(y, pad), maxTop),
+    }
+    if (next.left !== position.left || next.top !== position.top) {
+      setPosition(next)
+    }
+  }, [x, y, node, linkTargets.length, multiSelectCount, position.left, position.top])
+
+  useLayoutEffect(() => {
+    const trigger = linkItemRef.current
+    if (!trigger) return
+    const rect = trigger.getBoundingClientRect()
+    const pad = 8
+    const itemHeight = 31
+    const naturalHeight = Math.min(300, Math.max(40, (linkTargets.length || 1) * itemHeight + 8))
+    const bottomLimit = window.innerHeight - pad
+    let top = -4
+    if (rect.top + top + naturalHeight > bottomLimit) {
+      top = bottomLimit - rect.top - naturalHeight
+    }
+    if (rect.top + top < pad) {
+      top = pad - rect.top
+    }
+    const availableHeight = Math.max(80, bottomLimit - (rect.top + top))
+    const openLeft = rect.right + 220 > window.innerWidth - pad
+    setLinkSubmenuStyle({
+      top,
+      maxHeight: Math.min(300, availableHeight),
+      left: openLeft ? 'auto' : 'calc(100% - 4px)',
+      right: openLeft ? 'calc(100% - 4px)' : 'auto',
+    })
+  }, [position.left, position.top, linkTargets.length, node])
+
   return (
-    <div ref={menuRef} className="context-menu" style={{ left: x, top: y }}>
+    <div ref={menuRef} className="context-menu" style={{ left: position.left, top: position.top }}>
       {node && (
         <>
           <div className="context-menu-item" onClick={() => { onCopyPath(node.id); onClose() }}>Copy Path</div>
@@ -295,10 +344,10 @@ function ContextMenu({ x, y, node, onClose, onCopyPath, onCopyContent, onRename,
             <div className="context-menu-item" onClick={() => { onCopyContent(node.id); onClose() }}>Copy Content</div>
           )}
           {!node.isDirectory && multiSelectCount <= 1 && onLinkFile && (
-            <div className="context-menu-item context-menu-submenu">
+            <div ref={linkItemRef} className="context-menu-item context-menu-submenu">
               <span>Link File</span>
               <span className="context-menu-arrow">›</span>
-              <div className="context-menu-submenu-panel">
+              <div className="context-menu-submenu-panel" style={linkSubmenuStyle}>
                 {linkTargets.length === 0 && (
                   <div className="context-menu-submenu-empty">No Claude/Codex tabs</div>
                 )}
