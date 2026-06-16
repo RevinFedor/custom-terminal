@@ -842,6 +842,8 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       payload = `[imageError: ${formatCodexImagePasteError(error)}]`;
     }
 
+    // Raw input on purpose: bracketed paste makes Codex auto-attach image paths
+    // and rewrites the composer to [Image #N]. RunAuthor needs the literal path.
     ipcRenderer.send('terminal:input', tabId, payload);
   }, [tabId]);
 
