@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, Menu, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, dialog, shell, clipboard } = require('electron');
 const path = require('path');
 const pty = require('node-pty');
 const fs = require('fs');
@@ -7615,6 +7615,31 @@ ipcMain.handle('terminal:paste', async (event, { tabId, content, submit = true, 
   } catch (error) {
     console.error('[terminal:paste] Error:', error);
     return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('codex:save-clipboard-image', async (_event, { tabId } = {}) => {
+  try {
+    const image = clipboard.readImage();
+    if (!image || image.isEmpty()) {
+      return { success: false, error: 'clipboard_image_empty' };
+    }
+    const png = image.toPNG();
+    if (!Buffer.isBuffer(png) || png.length === 0) {
+      return { success: false, error: 'clipboard_png_empty' };
+    }
+
+    const safeTabId = String(tabId || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80) || 'unknown';
+    const dir = path.join(os.tmpdir(), 'noted-terminal', 'codex-images', safeTabId);
+    await fs.promises.mkdir(dir, { recursive: true });
+    const hash = crypto.createHash('sha256').update(png).digest('hex').slice(0, 16);
+    const filePath = path.join(dir, Date.now() + '-' + hash + '.png');
+    await fs.promises.writeFile(filePath, png, { mode: 0o600 });
+    console.log('[codex:save-clipboard-image] tab=' + safeTabId.slice(-12) + ' path=' + filePath + ' bytes=' + png.length);
+    return { success: true, path: filePath, size: png.length };
+  } catch (error) {
+    console.warn('[codex:save-clipboard-image] failed:', error?.message || error);
+    return { success: false, error: error?.code || 'save_failed' };
   }
 });
 // Send a slash command to Claude's Ink TUI (chunked paste + echo verification)

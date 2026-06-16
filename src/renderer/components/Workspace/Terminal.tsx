@@ -440,7 +440,20 @@ function getCurrentCommand(term: XTerminal): string {
   return logicalLine;
 }
 
-const { ipcRenderer } = window.require('electron');
+const { ipcRenderer, clipboard } = window.require('electron');
+
+const formatCodexImagePasteError = (value: unknown): string => {
+  const raw = typeof value === 'string'
+    ? value
+    : (value && typeof value === 'object' && 'message' in value)
+      ? String((value as { message?: unknown }).message)
+      : String(value || 'unknown');
+  return raw
+    .replace(/[\r\n\]]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120) || 'unknown';
+};
 
 function waitForClaudeStartupModelBridge(tabId: string, model: string, timeoutMs = 6000): Promise<string> {
   const current = _claudeBridgeModelByTab.get(tabId);
@@ -635,6 +648,10 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     }
     return null;
   });
+  const promptQueueAgentRef = useRef<'claude' | 'codex' | null>(promptQueueAgent);
+  useEffect(() => {
+    promptQueueAgentRef.current = promptQueueAgent;
+  }, [promptQueueAgent]);
   const agentBusy = useWorkspaceStore((state) => {
     for (const [, workspace] of state.openProjects) {
       const tab = workspace.tabs.get(tabId);
@@ -770,6 +787,48 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     console.warn('[QueueGate:flip] tab=' + tabId.slice(-8) + ' ' + tuple + ' → overlay=' + (all ? 'SHOWN' : 'HIDDEN'));
     queueGatePrevRef.current = tuple;
   }, [tabId, effectiveActive, promptQueueAgent, hasPromptQueueSession, claudeProcessAlive]);
+
+  const shouldInterceptCodexClipboardImagePaste = useCallback((event: KeyboardEvent): boolean => {
+    if (event.type !== 'keydown' || event.code !== 'KeyV') return false;
+    if (event.altKey || event.shiftKey) return false;
+    const pasteModifier = (event.metaKey && !event.ctrlKey) || (event.ctrlKey && !event.metaKey);
+    if (!pasteModifier) return false;
+    if (promptQueueAgentRef.current !== 'codex') return false;
+    if (!claudeProcessAliveRef.current) return false;
+
+    try {
+      const text = clipboard.readText();
+      if (typeof text === 'string' && text.trim().length > 0) return false;
+      const image = clipboard.readImage();
+      return !!image && !image.isEmpty();
+    } catch (error) {
+      console.warn('[CodexImagePaste] clipboard probe failed:', error);
+      return false;
+    }
+  }, []);
+
+  const pasteCodexClipboardImageFromClipboard = useCallback(async () => {
+    let payload = '';
+    try {
+      const saved = await ipcRenderer.invoke('codex:save-clipboard-image', { tabId });
+      if (saved?.success && typeof saved.path === 'string' && saved.path.length > 0) {
+        payload = saved.path;
+      } else {
+        payload = `[imageError: ${formatCodexImagePasteError(saved?.error || 'save_failed')}]`;
+      }
+    } catch (error) {
+      payload = `[imageError: ${formatCodexImagePasteError(error)}]`;
+    }
+
+    try {
+      const res = await ipcRenderer.invoke('codex:append-input', tabId, payload, { submit: false });
+      if (!res || res.success !== true) {
+        console.warn('[CodexImagePaste] append failed:', res?.error || 'unknown');
+      }
+    } catch (error) {
+      console.warn('[CodexImagePaste] append threw:', error);
+    }
+  }, [tabId]);
 
   // Check if terminal is scrolled up (not at bottom)
   // ALL callers go through rAF debounce — never call this synchronously during term.write()
