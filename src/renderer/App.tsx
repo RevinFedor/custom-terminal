@@ -2140,12 +2140,10 @@ function App() {
         if (action === 'setExternalRunMeta') {
           const { tabId, meta } = payload || {};
           if (!tabId || !meta || typeof meta !== 'object') return reply(false, null, 'tabId+meta required');
+          useWorkspaceStore.getState().updateExternalRunMeta(tabId, meta);
           for (const [projectId, ws] of useWorkspaceStore.getState().openProjects) {
             const tab = ws.tabs.get(tabId) as any;
-            if (!tab) continue;
-            tab.externalRun = { ...(tab.externalRun || {}), ...meta };
-            useWorkspaceStore.setState((s: any) => ({ openProjects: new Map(s.openProjects) }));
-            return reply(true, { tabId, projectId, externalRun: tab.externalRun });
+            if (tab) return reply(true, { tabId, projectId, externalRun: tab.externalRun });
           }
           return reply(false, null, 'tab not open');
         }
@@ -2294,6 +2292,8 @@ function App() {
               source: typeof source === 'string' ? source : 'mobile-native',
               statusAtSend: typeof statusAtSend === 'string' ? statusAtSend : undefined,
               queue: queue === true,
+              model: typeof model === 'string' ? model : undefined,
+              effort: typeof effort === 'string' ? effort : undefined,
             });
             const ok = result?.success !== false;
             return reply(ok, { tabId, toolType, ...(result || {}) }, ok ? undefined : result?.error);

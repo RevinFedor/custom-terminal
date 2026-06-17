@@ -1125,6 +1125,19 @@ const promptBoundaryState = new Map(); // tabId → 'idle' | 'busy'
 const promptBoundarySeq = new Map();   // tabId → number (auto-increment sequence)
 const escapeCarryover = new Map();     // tabId → string (buffered incomplete escape tail from previous chunk)
 
+function hasClaudePromptGlyph(text) {
+  return String(text || '').includes('\u23F5') || // ⏵
+    String(text || '').includes('\u276F') ||      // ❯
+    String(text || '').includes('\u203A') ||      // ›
+    String(text || '').includes('\u2570');        // ╰
+}
+
+function armPromptBoundaryForSubmittedCommand(tabId, reason = 'command-submit') {
+  if (!tabId) return;
+  promptBoundaryState.set(tabId, 'busy');
+  console.log('[BoundarySM] Tab ' + String(tabId).slice(-8) + ': forced busy for next prompt reason=' + reason + ' seq=' + (promptBoundarySeq.get(tabId) || 0));
+}
+
 // Detect incomplete escape sequence at the end of a PTY data chunk.
 // Returns number of bytes to buffer (0 if no incomplete sequence).
 // This prevents OSC 7777 injection from splitting a multi-chunk escape sequence.
@@ -1628,6 +1641,10 @@ function startSessionBridge() {
 
       bridgeKnownSessions.set(tabId, data.session_id);
       console.log('[Bridge] Tab', tabId, '-> session:', data.session_id.substring(0, 8) + '...', '(model:', data.model + ', ctx:', data.context_pct + '%)');
+      emitClaudeTuiReadyFromVisibleBuffer(tabId, 'bridge-fresh').catch((err) => {
+        console.log('[TUI-Ready] tab=' + String(tabId).slice(-12) +
+          ' — visible-buffer fallback failed source=bridge-fresh err=' + (err?.message || err));
+      });
 
       // Save session link for Clear Context chain resolution (old → new)
       if (oldSessionId) {
@@ -1699,7 +1716,10 @@ function clearBridgeTab(tabId) {
     _webBroadcast(tabId, { type: 'snapshot', sessionId: null, busy: false, sessionStatus: 'inactive', inputReady: false });
   }
   promptBoundaryState.delete(tabId);
-  promptBoundarySeq.delete(tabId);
+  // Do not reset promptBoundarySeq on Claude exit. The renderer keeps existing
+  // OSC markers in the xterm buffer for this tab; restarting from #1 makes the
+  // next marker look stale/duplicate and any waitForPromptBoundaryAfter() call
+  // times out. Sequence lifetime is the tab/buffer, not the Claude process.
   escapeCarryover.delete(tabId);
   for (const [pid, tid] of bridgePidCache) {
     if (tid === tabId) bridgePidCache.delete(pid);
@@ -1734,6 +1754,36 @@ function clearBridgeTab(tabId) {
   if (had) {
     console.log('[Bridge:Clear] Tab ' + tabId.slice(-12) + ' removed from bridgeKnownSessions (remaining=' + bridgeKnownSessions.size + ')');
   }
+}
+
+async function emitClaudeTuiReadyFromVisibleBuffer(tabId, source) {
+  if (!tabId || claudePromptReady.has(tabId)) return false;
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  const snapshot = await requestTerminalVisibleBufferSnapshot(
+    mainWindow.webContents,
+    tabId,
+    'claude-tui-ready-' + source,
+    700
+  );
+  if (!snapshot?.success || !Array.isArray(snapshot.lines)) {
+    console.log('[TUI-Ready] tab=' + String(tabId).slice(-12) +
+      ' — visible-buffer fallback skipped source=' + source +
+      ' error=' + (snapshot?.error || 'bad-snapshot'));
+    return false;
+  }
+  const visibleText = snapshot.lines.map((line) => line?.text || '').join('\n');
+  if (!hasClaudePromptGlyph(visibleText) && !visibleText.includes('>')) {
+    console.log('[TUI-Ready] tab=' + String(tabId).slice(-12) +
+      ' — visible-buffer fallback saw no prompt source=' + source +
+      ' lines=' + snapshot.lines.length);
+    return false;
+  }
+  claudePromptReady.add(tabId);
+  console.log('[TUI-Ready] tab=' + String(tabId).slice(-12) +
+    ' — emitting claude:tui-ready (visible-buffer ' + source + ')');
+  mainWindow.webContents.send('claude:tui-ready', { tabId, ts: Date.now() });
+  ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'claude' });
+  return true;
 }
 
 function setCodexKnownSession(tabId, sessionId, reason = 'detected') {
@@ -5801,6 +5851,13 @@ app.whenReady().then(() => {
         return { running: false, error: String(e.message) };
       }
     });
+    ipcMain.handle('web:update-external-run-settings', (_event, payload = {}) => {
+      try {
+        return webServer.updateExternalRunSettings(payload);
+      } catch (e) {
+        return { ok: false, error: String(e.message || e) };
+      }
+    });
     // Renderer → web relay for prompt-queue deltas. usePromptQueueWebSync (App
     // root) fires this whenever a tab's queue core changes; we fan it out to any
     // phone subscribed to that tab as a `queue-update` SSE event. webBroadcast
@@ -6538,11 +6595,8 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       const fallbackTimer = setTimeout(() => {
         if (dispatched) return;
         ipcMain.removeListener('terminal:prompt-ready-internal', tryDispatch);
-        console.warn(`[terminal:create] OSC 133 A timeout 5s for ${tabId} — dispatching initialCommand anyway`);
+        console.warn(`[terminal:create] OSC 133 A timeout 5s for ${tabId} — aborting initialCommand, shell left idle`);
         dispatched = true;
-        try { ptyProcess.write(initialCommand + '\r'); } catch (e) {
-          console.warn(`[terminal:create] write failed: ${e.message}`);
-        }
       }, 5000);
     }
 
@@ -6659,12 +6713,19 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       // and stops showing the "starting Claude..." loader on its composer.
       // Cheap path: skip the stripVT call when the flag is already set OR when
       // there's no Claude process for this tab.
+      let emittedGlobalTuiReady = false;
       if (!claudePromptReady.has(tabId) && bridgeKnownSessions.has(tabId)) {
         const checked = currentState ? null : stripVTControlCharacters(data);
         const hayStack = checked != null ? checked : data;
-        if (hayStack.includes('⏵') || hayStack.includes('>')) {
+        if (hasClaudePromptGlyph(hayStack) || hayStack.includes('>')) {
           claudePromptReady.add(tabId);
           console.log('[ClaudePromptReady] Tab ' + tabId.slice(-12) + ' — input ready (⏵ rendered)');
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            console.log('[TUI-Ready] tab=' + tabId.slice(-12) + ' — emitting claude:tui-ready (global prompt-ready)');
+            mainWindow.webContents.send('claude:tui-ready', { tabId, ts: Date.now() });
+            ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'claude' });
+            emittedGlobalTuiReady = true;
+          }
           // BUSY here must be the AUTHORITATIVE turn flag (claudeTurnBusy, the
           // Stop-hook), NOT claudeSpinnerBusy. On Resume the PTY replays old
           // scrollback containing a stale spinner glyph (`✻ Cooked for 13s`),
@@ -6690,7 +6751,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
 
         // STEP 1: WAITING_PROMPT -> See prompt char -> Start debounce
         // Claude v2.1.32+ uses ⏵ (U+23F5) instead of >
-        if (currentState === 'WAITING_PROMPT' && (stripped.includes('⏵') || stripped.includes('>'))) {
+        if (currentState === 'WAITING_PROMPT' && (hasClaudePromptGlyph(stripped) || stripped.includes('>'))) {
           console.log('[Claude Handshake] Tab ' + tabId + ': Prompt detected. Starting debounce...');
           claudeState.set(tabId, 'DEBOUNCE_PROMPT');
           // Early "TUI is ready for input" signal — fires as soon as Claude
@@ -6700,7 +6761,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
           // resolve). Renderer uses this for auto /effort inject so the user
           // doesn't sit looking at a ready prompt for 3+ seconds before the
           // effort line appears. Bridge:Fresh stays as the fallback path.
-          if (mainWindow && !mainWindow.isDestroyed()) {
+          if (!emittedGlobalTuiReady && mainWindow && !mainWindow.isDestroyed()) {
             console.log('[TUI-Ready] tab=' + tabId.slice(-12) + ' — emitting claude:tui-ready (prompt rendered)');
               mainWindow.webContents.send('claude:tui-ready', { tabId, ts: Date.now() });
               ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'claude' });
@@ -6851,7 +6912,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
           // but warning lasts ~3-4 seconds. Only accept ⏵ after min hold.
           const dz = claudeCtrlCDangerZone.get(tabId);
           if (dz && (Date.now() - dz.setAt >= 3000) &&
-              (sc.includes('\u23F5') || sc.includes('\u2335') || sc.includes('\u2570'))) {
+              (hasClaudePromptGlyph(sc) || sc.includes('\u2335'))) {
             // ⏵ (U+23F5) = Claude prompt, ⌵ (U+2335) = alt prompt, ╰ (U+2570) = input box bottom
             clearTimeout(dz.timer);
             claudeCtrlCDangerZone.delete(tabId);
@@ -6913,7 +6974,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       // in-progress CSI in xterm.js parser, rendering escape params as visible text.
       // Solution: buffer incomplete escape tails, reassemble before injection.
       {
-        if (claudeSpinnerBusy.has(tabId)) {
+        if (claudeSpinnerBusy.has(tabId) || promptBoundaryState.has(tabId)) {
           // Reassemble any carryover escape bytes from previous chunk
           const carryover = escapeCarryover.get(tabId);
           if (carryover) {
@@ -6922,7 +6983,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
           }
 
           const sc = stripVTControlCharacters(data);
-          const hasPrompt = sc.includes('\u23F5') || sc.includes('\u276F');
+          const hasPrompt = hasClaudePromptGlyph(sc);
           const state = promptBoundaryState.get(tabId) || 'idle';
           const substance = sc.replace(/\s/g, '').length;
 
@@ -6935,8 +6996,8 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
           } else if (state === 'busy' && hasPrompt) {
             // Prompt returned while busy → response complete, inject marker
             promptBoundaryState.set(tabId, 'idle');
-            const seq = promptBoundarySeq.get(tabId) || 0;
-            promptBoundarySeq.set(tabId, seq + 1);
+            const seq = (promptBoundarySeq.get(tabId) || 0) + 1;
+            promptBoundarySeq.set(tabId, seq);
             // Prepend OSC before data chunk so marker lands at start of prompt frame
             data = '\x1b]7777;prompt:' + seq + '\x07' + data;
             console.log('[BoundaryMarker] Tab ' + tabId + ': Injected prompt #' + seq);
@@ -7388,7 +7449,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     safetyTimeoutMs = 8000,
     fast = false, // Turbo mode for Gemini/Bash (skip render waits)
     submitSequence = '\r',
-    submitLabel = null
+    submitLabel = null,
+    armPromptBoundaryOnSubmit = false,
+    promptBoundaryReason = null
   } = options;
 
   // TTYHOG on macOS = 1024 bytes. Paste brackets = 12 bytes. Leave margin.
@@ -7572,6 +7635,17 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     render.markWriteTime(); // baseline = post-write, not subscription-time
     const r = await render;
     console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Paste render: timedOut=' + r.timedOut + ' elapsed=' + (r.elapsedMs || 'n/a') + 'ms');
+    if (r.timedOut) {
+      console.error(logPrefix + ' [+' + (Date.now() - t0) + 'ms] ❌ Paste render timed out — aborting before submit');
+      return {
+        success: false,
+        error: 'paste_render_timeout',
+        submitted: false,
+        chunksTotal: chunks.length,
+        renderTimeMs: renderTimes,
+        submitKey: null,
+      };
+    }
   }
 
   if (submit) {
@@ -7645,6 +7719,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       await drainPtyData(term, 50, 600);
     }
     term.write(submitSequence);
+    if (armPromptBoundaryOnSubmit && broadcastTabId) {
+      armPromptBoundaryForSubmittedCommand(broadcastTabId, promptBoundaryReason || logPrefix);
+    }
     console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] ✅ Sent ' + resolvedSubmitLabel + ' handoff=' + (handoffId || '-') + ' (total: ' + (Date.now() - t0) + 'ms)');
   }
 
@@ -8449,6 +8526,7 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
     ? sendOptions.source.trim()
     : 'send-command';
   const stashFirst = sendOptions.stashFirst === false ? false : true;
+  const armPromptBoundaryOnSubmit = sendOptions.armPromptBoundaryOnSubmit === true || source.startsWith('startup-defaults:');
   console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" source=' + source + ' stashFirst=' + stashFirst + ' ts=' + Date.now());
   const term = terminals.get(tabId);
   if (!term) { console.log('[send-command] ❌ Terminal not found for tabId=' + tabId); return { success: false, error: 'no_terminal' }; }
@@ -8480,6 +8558,8 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
   return await safePasteAndSubmit(term, command, {
     submit: true,
     stashFirst,
+    armPromptBoundaryOnSubmit,
+    promptBoundaryReason: source + ':' + command,
     // dismissAutocomplete intentionally OFF: slash-cmds with arguments (/model haiku,
     // /effort low) don't match any prefix beyond the slash — autocomplete is empty
     // by the time we send Enter, so PromptInput.onSubmit guard passes. Sending Esc
@@ -8713,8 +8793,10 @@ ipcMain.handle('claude:toggle-thinking', async (event, tabId) => {
         // Claude may show "Do you want to proceed?" confirmation dialog
         // Listen for it and auto-confirm
         let proceedResolved = false;
+        let sawPostConfirmFrame = false;
         let proceedBuffer = '';
         const proceedSub = term.onData((proceedData) => {
+          sawPostConfirmFrame = true;
           proceedBuffer += proceedData;
           console.log('[Think] Post-confirm RAW (' + proceedData.length + ' bytes):', JSON.stringify(proceedData).substring(0, 300));
 
@@ -8732,20 +8814,24 @@ ipcMain.handle('claude:toggle-thinking', async (event, tabId) => {
         setTimeout(() => {
           proceedSub.dispose();
           if (!proceedResolved) {
-            console.log('[Think] No proceed dialog, resolving');
-            resolve({ success: true, thinking: newState });
+            if (sawPostConfirmFrame) {
+              console.log('[Think] No proceed dialog, but post-confirm frame arrived');
+              resolve({ success: true, thinking: newState });
+            } else {
+              console.log('[Think] No post-confirm frame after Enter');
+              resolve({ success: false, error: 'think_post_confirm_timeout' });
+            }
           }
         }, 2000);
       });
 
-      // Safety: if no data after arrow, confirm anyway
+      // If the arrow does not produce a frame, selection state is unknown.
       setTimeout(() => {
         if (confirmResolved) return;
         confirmSub.dispose();
         confirmResolved = true;
-        console.log('[Think] No arrow response, sending Enter anyway');
-        term.write('\r');
-        resolve({ success: true, thinking: newState });
+        console.log('[Think] No arrow response, aborting');
+        resolve({ success: false, error: 'think_arrow_timeout' });
       }, 300);
     });
 
@@ -9265,33 +9351,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
           console.log('[Claude:Rewind] ' + label + ' #' + pressCount + ' -> "' + (selectedText || 'null').substring(0, 70) + '"');
 
           if (!selectedText) continue;
-          if (!screenSelection.targetBeforeSelected) {
-            if (matchedTarget) {
-              console.warn('[Claude:Rewind] Target row is selected, but Claude /rewind commits the item above selected; stepping back to commit-position.');
-              const reverseKey = key === '\x1b[A' ? '\x1b[B' : '\x1b[A';
-              const reverseLabel = key === '\x1b[A' ? 'DOWN' : 'UP';
-              const reverseRaw = await writeAndWait(
-                reverseKey,
-                /\x1b\[38;2;\d+;\d+;\d+m|[●❯]|\x1b\[\?2026l/,
-                1200,
-                '[Claude:Rewind:nav-reverse]'
-              );
-              pressCount++;
-              const reverseSelection = await readRendererSelection(reason + ':' + reverseLabel + '#commit-position');
-              logRewindFrame(reverseRaw, reason + ':' + reverseLabel + '#commit-position', {
-                key: reverseLabel,
-                screenSelectedText: (reverseSelection.selectedText || '').substring(0, 140),
-                targetBeforeSelected: reverseSelection.targetBeforeSelected,
-                previousItemText: (reverseSelection.previousItemText || '').substring(0, 140),
-                visibleTargetLines: reverseSelection.visibleTargetLines,
-              });
-              if (reverseSelection.targetBeforeSelected) {
-                console.log('[Claude:Rewind] Commit-position verified after reverse step');
-                return true;
-              }
-            }
-            continue;
-          }
+          if (!matchedTarget) continue;
 
           if (duplicatesRemaining > 0) {
             duplicatesRemaining--;
@@ -9305,62 +9365,9 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       }
 
       if (hasDeterministicIndex) {
-        const targetSteps = Math.max(0, count - 1 - idx);
-        console.log('[Claude:Rewind] Navigating deterministic: target="' + targetPrefix.substring(0, 180) + '" count=' + count + ' targetIndex=' + idx + ' UP commit-position steps=' + targetSteps + ' skipDuplicates=' + skipDuplicates);
-
-        let selectedText = initialCandidates.length > 0 ? initialCandidates[initialCandidates.length - 1] : null;
-        if (targetSteps > 0) {
-          throwIfRewindCancelled('deterministic-before-burst');
-          const navWait = waitForPtyText(
-            term,
-            /\x1b\[\?2026l|\x1b\[38;2;\d+;\d+;\d+m|[●❯]/,
-            Math.min(1500, Math.max(500, targetSteps * 40)),
-            '[Claude:Rewind:nav]'
-          );
-
-          let remaining = targetSteps;
-          while (remaining > 0) {
-            const batch = Math.min(remaining, 100);
-            term.write('\x1b[A'.repeat(batch));
-            pressCount += batch;
-            remaining -= batch;
-            if (remaining > 0) await drainPtyData(term, 10, 80);
-          }
-
-          const navRaw = await navWait;
-          const candidates = extractSelectedCandidates(navRaw);
-          const ptySelectedText = candidates.length > 0 ? candidates[candidates.length - 1] : selectedText;
-          await drainPtyData(term, 80, Math.min(1000, 150 + targetSteps * 20));
-          const screenSelection = await readRendererSelection('deterministic-burst');
-          selectedText = screenSelection.selectedText || ptySelectedText;
-          const matchedTarget = screenSelection.selectedText
-            ? screenSelection.matchedTarget
-            : textMatchesTarget(ptySelectedText, targetPrefix);
-          logRewindFrame(navRaw, 'deterministic-burst', {
-            targetSteps,
-            ptySelectedText: (ptySelectedText || '').substring(0, 140),
-            screenSelectedText: (screenSelection.selectedText || '').substring(0, 140),
-            screenMatchedTarget: screenSelection.matchedTarget,
-            targetBeforeSelected: screenSelection.targetBeforeSelected,
-            previousItemText: (screenSelection.previousItemText || '').substring(0, 140),
-            visibleTargetLines: screenSelection.visibleTargetLines,
-            selectedText: (selectedText || '').substring(0, 140),
-            matchedTarget
-          });
-          console.log('[Claude:Rewind] UP burst #' + pressCount + ' -> "' + (selectedText || 'moved').substring(0, 70) + '" raw=' + (navRaw ? navRaw.length : 0) + 'B');
-        }
-
-        if (!selectedText) selectedText = await readCurrentSelection('after deterministic');
-        const deterministicSelection = await readRendererSelection('after deterministic commit-position');
-        if (deterministicSelection.targetBeforeSelected) {
-          found = true;
-        } else {
-          console.warn('[Claude:Rewind] Deterministic commit-position mismatch; scanning by text. selected="' + (deterministicSelection.selectedText || selectedText || 'null').substring(0, 100) + '" previous="' + (deterministicSelection.previousItemText || '').substring(0, 100) + '" target="' + targetPrefix + '"');
-          found = await scanForTarget('\x1b[A', 'UP', maxPresses, skipDuplicates, 'fallback-after-deterministic');
-        }
-      } else {
-        found = await scanForTarget('\x1b[A', 'UP', maxPresses, skipDuplicates, 'fallback');
+        console.log('[Claude:Rewind] Timeline index is advisory only: Claude /rewind menu also contains slash-command rows; scanning selected rows by text. count=' + count + ' targetIndex=' + idx + ' skipDuplicates=' + skipDuplicates);
       }
+      found = await scanForTarget('\x1b[A', 'UP', maxPresses, skipDuplicates, hasDeterministicIndex ? 'text-scan-index-advisory' : 'fallback');
 
       if (!found) {
         console.error('[Claude:Rewind] Target not found after ' + pressCount + ' presses. Closing menu.');
@@ -9528,11 +9535,20 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     };
   }
 
+  function codexOverlayFrameHasNoSelectableText(match) {
+    return Number(match?.visibleLength || 0) === 0
+      && normalizeCandidate(match?.visiblePreview || '').length === 0;
+  }
+
   function codexFrameLooksLikePrompt(clean, raw) {
     return raw.includes(CODEX_SYNC_MARKER)
       || /Context\s+\d+%/i.test(clean)
       || /›\s*/.test(clean)
       || /No previous message to edit/i.test(clean);
+  }
+
+  function codexPrimeHintObserved(clean) {
+    return /esc\s+again\s+to\s+edit\s+previous\s+message/i.test(String(clean || ''));
   }
 
   function throwIfCodexRewindCancelled(stage) {
@@ -9655,7 +9671,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           '[Codex:Rewind:ai-fallback:esc]',
           (clean, raw) => raw.includes(CODEX_SYNC_MARKER)
             || /turn_aborted|aborted|interrupted/i.test(clean)
-            || /esc again to edit previous message/i.test(clean)
+            || codexPrimeHintObserved(clean)
             || codexFrameLooksLikePrompt(clean, raw)
         );
         console.log('[Codex:Rewind] AI paste fallback Esc timedOut=' + abortFrame.timedOut
@@ -9706,9 +9722,9 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         '\x1b',
         2200,
         '[Codex:Rewind:prime:initial]',
-        (clean) => /esc again to edit previous message/i.test(clean)
+        (clean) => codexPrimeHintObserved(clean)
       );
-      let hasPrimeHint = !primeFrame.timedOut && /esc again to edit previous message/i.test(primeFrame.clean || '');
+      let hasPrimeHint = !primeFrame.timedOut && codexPrimeHintObserved(primeFrame.clean);
       console.log('[Codex:Rewind] prime initial timedOut=' + primeFrame.timedOut + ' hint=' + hasPrimeHint + ' clean=' + JSON.stringify(primeFrame.clean.slice(0, 220)));
 
       if (!hasPrimeHint) {
@@ -9731,9 +9747,9 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           '\x1b',
           2600,
           '[Codex:Rewind:prime:after-grab]',
-          (clean) => /esc again to edit previous message/i.test(clean)
+          (clean) => codexPrimeHintObserved(clean)
         );
-        hasPrimeHint = !primeFrame.timedOut && /esc again to edit previous message/i.test(primeFrame.clean || '');
+        hasPrimeHint = !primeFrame.timedOut && codexPrimeHintObserved(primeFrame.clean);
         console.log('[Codex:Rewind] prime after-grab timedOut=' + primeFrame.timedOut + ' hint=' + hasPrimeHint + ' clean=' + JSON.stringify(primeFrame.clean.slice(0, 220)));
       }
 
@@ -9774,6 +9790,9 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         } else {
           selectedOlderSteps = 0;
         }
+      } else if (olderSteps === 0 && codexOverlayFrameHasNoSelectableText(selectedMatch)) {
+        selectedOlderSteps = 0;
+        console.log('[Codex:Rewind] overlay initial frame has no selectable text; using latest prompt position and verifying restored composer after Enter');
       }
 
       if (selectedOlderSteps === null && maxOlderSteps > 0) {
@@ -14137,6 +14156,7 @@ async function moveCodexPickerTo(term, state, targetIndex, logPrefix) {
     const frame = await sendCodexKeyAndCapture(term, key, 2500, logPrefix + ':' + dir + '#' + (i + 1));
     if (frame.timedOut) {
       console.warn(logPrefix + ' navigation frame timed out at step ' + (i + 1) + '/' + pressCount);
+      return { success: false, error: 'Codex picker navigation frame timed out', pressCount: i };
     }
   }
   return { success: true, pressCount };
@@ -14169,8 +14189,25 @@ async function selectCodexPickerItem(term, {
     };
   }
 
-  await moveCodexPickerTo(term, state, targetIndex, logPrefix + ':' + kind);
+  const moveResult = await moveCodexPickerTo(term, state, targetIndex, logPrefix + ':' + kind);
+  if (!moveResult.success) {
+    return {
+      success: false,
+      error: moveResult.error || 'Codex picker navigation failed',
+      options: state.items.map(item => item.value),
+      clean: initialFrame.clean,
+    };
+  }
   const confirmFrame = await sendCodexKeyAndCapture(term, '\r', timeoutMs, logPrefix + ':' + kind + ':confirm', confirmPredicate);
+  if (confirmFrame.timedOut) {
+    return {
+      success: false,
+      error: 'Codex ' + kind + ' confirm frame timed out',
+      selected: state.items[targetIndex].value,
+      frame: confirmFrame,
+      options: state.items.map(item => item.value),
+    };
+  }
   return {
     success: true,
     selected: state.items[targetIndex].value,
@@ -14290,6 +14327,8 @@ async function selectCodexModelEffort(term, {
     const modelFrame = await openCapture;
     if (modelFrame.timedOut) {
       console.warn(logPrefix + ' model menu capture timed out. clean=' + JSON.stringify(modelFrame.clean.slice(0, 500)));
+      outcome = { success: false, error: 'Codex model menu capture timed out', clean: modelFrame.clean };
+      return outcome;
     }
 
     // xhigh must be checked before high: Codex renders it as "Extra high".
@@ -14343,6 +14382,14 @@ async function selectCodexModelEffort(term, {
         }
       } else {
         console.log(logPrefix + ' no effort picker after model confirm; clean=' + JSON.stringify(effortFrame.clean.slice(0, 500)));
+        outcome = {
+          success: false,
+          error: 'Codex effort picker did not appear after model selection',
+          model: modelResult.selected,
+          modelOptions: modelResult.options,
+          effortOptions: parsedEffortOptions,
+        };
+        return outcome;
       }
     }
 

@@ -15,12 +15,21 @@
 | SemanticIndex | переменная (см. ниже) | Статус `.semantic-index.json`; клик = переиндексация. |
 | Resume All | `RotateCcw` + badge | Появляется ТОЛЬКО если `interruptedTabs.length > 0` для текущего проекта. |
 | *— flex spacer —* |  | Дальнейшие кнопки прижаты к правому краю. |
+| External run settings | `Settings` (lucide) | Появляется только на активной Inbox-вкладке, созданной внешним Codex run. Управляет видимостью бейджа, auto-stop процесса и auto-close вкладки. |
 | Docs | `BookOpen` (lucide) | Popover с `ActionsPanel embedded` (Update Docs / Update API → Haiku pipeline). Раньше жил в InfoPanel-сайдбаре `КОМАНДЫ`-блоком — после удаления правой колонки переехал сюда. |
 | Copy session + chips | `Copy` + 9-chip row | `CopySessionButton` + ряд чипов выбора секций (👤/✦/answer/thinking/read/edit/bash/mcp/⑂fork/sub-pill) в **две** строки чтобы не растягивать toolbar по высоте. Рендерится ТОЛЬКО когда у активной вкладки есть Claude/Gemini-сессия — toolbar collapses gracefully на Home / browser-табах. |
 
 **Pair-aligned popover'ы.** Оба popover'а (Docs и Copy-session) открываются downward-right-aligned относительно триггера: `top: bRect.bottom + 6, right: window.innerWidth - bRect.right`. Это сохраняет одну нижнюю горизонталь между двумя popover'ами, и убирает зависимость от viewport-left-edge (раньше Copy popover открывался центр-влево от триггера — на правом краю окна он мог вылетать за viewport). Статичное правило, а не runtime-расчёт «куда умещается»: проще для предсказуемого muscle memory, минус один источник позиционных багов.
 
 **Что было до и почему изменилось:** до этой сессии VS Code был привязан к хоткею `Cmd+.` без UI-кнопки. Хоткей был неоткрываемым (юзер на него натыкался случайно), плюс конфликтовал с системными окнами, которые тоже слушают `Cmd+.`. Решение — снять хоткей полностью (в `src/renderer/App.tsx` весь блок удалён, в `SettingsModal::SHORTCUTS` строка `⌘ + \` снята; реальный хоткей вообще был на `.`, не `\` — там в любом случае было расхождение текста и кода) и добавить видимую кнопку. Cmd+. больше нигде не висит.
+
+## External Codex run settings
+
+Кнопка настроек external run — локальный control активной Inbox-вкладки, а не общая настройка проекта. Внешний клиент (например Voice Record) владеет своим чатом, но Noted Terminal владеет видимой Codex-вкладкой, поэтому пользователю нужен быстрый доступ именно здесь: свернуть/развернуть бейдж external run, изменить stop процесса в секундах и закрытие вкладки в минутах.
+
+Stop процесса и close вкладки — разные оси. Stop завершает Codex runtime после `done`, а close убирает визуальную вкладку после отдельного countdown, чтобы system Inbox не копил старые external runs. Collapsed badge оставляет маленький статусный маркер без захвата высоты терминала; развёрнутый badge показывает источник, process countdown и tab countdown.
+
+Видимость кнопки не должна зависеть только от живой app-server metadata: при hot reload/restart renderer может восстановить вкладку раньше, чем external-run map снова появится. Поэтому `externalRun` сериализуется в SQLite, а для старых Inbox Codex-вкладок toolbar имеет fallback по признаку `Inbox + commandType=codex + name starts "Codex ·"`. Без этого пользователь видит выбранную `Codex · ...` вкладку на Home-виде, но кнопки настроек нет вообще.
 
 ## SemanticIndex visual language
 

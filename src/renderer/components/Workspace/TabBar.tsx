@@ -19,7 +19,7 @@ import {
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, PanelLeft, Plus, StickyNote, RotateCw, Folder, ArrowUp, ArrowDown, Square, Bell, BellRing, FileText } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, PanelLeft, Plus, StickyNote, RotateCw, Folder, ArrowUp, ArrowDown, Square, Bell, BellRing, FileText, X } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -27,6 +27,7 @@ const CLAUDE_SPINNER_VISUAL_IDLE_GRACE_MS = 300;
 const COMPLETION_NOTIFICATION_DISMISS_MS = 420;
 const TABBAR_DRAG_VISUAL_LOCK_ATTR = 'data-tabbar-drag-visual-lock';
 const GROUP_COLLAPSE_FLIP_SUPPRESS_MS = 320;
+const isNaturalRestartAfterEnd = (reason?: string) => !reason || reason === 'task_complete';
 
 let forcedDragCursorDepth = 0;
 let forcedDragCursorStyleEl: HTMLStyleElement | null = null;
@@ -105,6 +106,9 @@ interface TabData {
   completionNotificationPersistent?: boolean;
   completionNotificationArmed?: boolean;
   completionNotificationFired?: boolean;
+  restartAfterTabId?: string;
+  restartAfterPersistent?: boolean;
+  restartAfterArmed?: boolean;
 }
 
 type TabDragData = {
@@ -2809,6 +2813,9 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const setTabSessionStatus = useWorkspaceStore((state) => state.setTabSessionStatus);
   const setTabCompletionNotificationArmed = useWorkspaceStore((state) => state.setTabCompletionNotificationArmed);
   const setTabCompletionNotificationPersistent = useWorkspaceStore((state) => state.setTabCompletionNotificationPersistent);
+  const setTabRestartAfterTarget = useWorkspaceStore((state) => state.setTabRestartAfterTarget);
+  const setTabRestartAfterArmed = useWorkspaceStore((state) => state.setTabRestartAfterArmed);
+  const setTabRestartAfterPersistent = useWorkspaceStore((state) => state.setTabRestartAfterPersistent);
   const toggleTabUtility = useWorkspaceStore((state) => state.toggleTabUtility);
   const reorderInZone = useWorkspaceStore((state) => state.reorderInZone);
   const moveTabToZone = useWorkspaceStore((state) => state.moveTabToZone);
@@ -2872,10 +2879,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   // to die. Populated synchronously when handleRestart/handleStop is called,
   // cleared on `terminal:stop-progress { phase: 'done' }`.
   const [restartInFlight, setRestartInFlight] = useState<Set<string>>(new Set());
+  const restartInFlightRef = useRef<Set<string>>(new Set());
   const [sessionStatus, setSessionStatus] = useState<Map<string, boolean>>(new Map());
   const [claudeBusyMap, setClaudeBusyMap] = useState<Map<string, boolean>>(new Map());
   const [geminiBusyMap, setGeminiBusyMap] = useState<Map<string, boolean>>(new Map());
   const [codexBusyMap, setCodexBusyMap] = useState<Map<string, boolean>>(new Map());
+  const codexBusyRef = useRef<Map<string, boolean>>(new Map());
   const [pasteBusyMap, setPasteBusyMap] = useState<Map<string, boolean>>(new Map());
   const claudeSpinnerVisualIdleTimersRef = useRef<Map<string, number>>(new Map());
   // Awaiting-user-input: Claude called AskUserQuestion and is blocked waiting for
@@ -3079,6 +3088,19 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
     const handleCodexBusy = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
       console.warn('[TabBar:CodexBusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy + (reason ? ' reason=' + reason : ''));
+      const prevBusy = codexBusyRef.current.get(tabId) || false;
+      codexBusyRef.current.set(tabId, busy);
+      if (busy) {
+        useWorkspaceStore.getState().markRestartAfterTriggerBusy(tabId);
+      } else if (prevBusy) {
+        const naturalEnd = isNaturalRestartAfterEnd(reason);
+        const restartTargetIds = useWorkspaceStore.getState().consumeRestartAfterTriggerIdle(tabId, naturalEnd);
+        for (const targetId of restartTargetIds) {
+          if (targetId === tabId) continue;
+          console.warn('[TabBar:RestartAfter] trigger=' + tabId.slice(-8) + ' target=' + targetId.slice(-8) + ' reason=' + (reason || 'natural'));
+          void runDeterministicStop(targetId, true);
+        }
+      }
       setCodexBusyMap(prev => {
         if (prev.get(tabId) === busy) return prev;
         const next = new Map(prev);
@@ -3129,6 +3151,9 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     // second Stop while the first one is still polling lsof → races.
     const handleStopProgress = (_: any, { tabId, phase }: { tabId: string; phase: string }) => {
       if (phase === 'done') {
+        const refNext = new Set(restartInFlightRef.current);
+        refNext.delete(tabId);
+        restartInFlightRef.current = refNext;
         setRestartInFlight(prev => {
           if (!prev.has(tabId)) return prev;
           const next = new Set(prev);
@@ -3905,7 +3930,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     if (x !== contextMenuPos.x || y !== contextMenuPos.y) {
       setContextMenuPos({ x, y });
     }
-  }, [contextMenu, groupContextMenu, emptyContextMenu, contextScripts.length]);
+  }, [contextMenu, groupContextMenu, emptyContextMenu, contextScripts.length, contextShScripts.length, openProjects]);
 
   useLayoutEffect(() => {
     if (!isVerticalLayout) {
@@ -4454,13 +4479,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   //
   // While the call is in-flight, restartInFlight contains tabId; render layer
   // uses it to grey-out both buttons (no double-fire while polling).
-  const runDeterministicStop = async (tabId: string, restart: boolean) => {
-    setRestartInFlight(prev => {
-      if (prev.has(tabId)) return prev;
-      const next = new Set(prev);
-      next.add(tabId);
-      return next;
-    });
+  async function runDeterministicStop(tabId: string, restart: boolean) {
+    if (restartInFlightRef.current.has(tabId)) return;
+    const refNext = new Set(restartInFlightRef.current);
+    refNext.add(tabId);
+    restartInFlightRef.current = refNext;
+    setRestartInFlight(new Set(refNext));
     try {
       const res = await ipcRenderer.invoke('terminal:deterministic-stop', { tabId, restart });
       if (!res?.success) {
@@ -4471,17 +4495,14 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     } finally {
       // Listener on terminal:stop-progress { phase: 'done' } clears the flag,
       // but clear here too as a safety net for early errors that never emit.
-      setRestartInFlight(prev => {
-        if (!prev.has(tabId)) return prev;
-        const next = new Set(prev);
-        next.delete(tabId);
-        return next;
-      });
+      const doneNext = new Set(restartInFlightRef.current);
+      doneNext.delete(tabId);
+      restartInFlightRef.current = doneNext;
+      setRestartInFlight(new Set(doneNext));
     }
-  };
+  }
 
   const handleRestart = async (tabId: string) => {
-    if (restartInFlight.has(tabId)) return;
     await runDeterministicStop(tabId, true);
   };
 
@@ -4500,7 +4521,6 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       } catch (e: any) { console.error('[TabBar:SDKStop] error', e); }
       return;
     }
-    if (restartInFlight.has(tabId)) return;
     await runDeterministicStop(tabId, false);
   };
 
@@ -5979,6 +5999,122 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         <BellRing size={13} fill={isPersistent ? 'rgba(239, 68, 68, 0.35)' : 'none'} />
                       </button>
                     </Tooltip>
+                  </div>
+                );
+              })()}
+
+              {(() => {
+                const ctxTab = contextMenu ? workspace.tabs.get(contextMenu.tabId) : null;
+                if (!ctxTab || !contextMenu || ctxTab.tabType === 'file') return null;
+                const ctxTabId = contextMenu.tabId;
+                if (ctxTab.tabType && ctxTab.tabType !== 'terminal') return null;
+                if (ctxTab.commandType === 'claude' || ctxTab.commandType === 'gemini' || ctxTab.commandType === 'codex') return null;
+                const codexTargets = Array.from(workspace.tabs.values())
+                  .filter((tab) => tab.id !== ctxTabId && !tab.isUtility && tab.tabType !== 'file' && tab.commandType === 'codex')
+                  .map((tab) => ({ id: tab.id, name: tab.name || 'Untitled', kind: 'Codex' }));
+                const selectedTriggerId = ctxTab.restartAfterTabId || null;
+                const selectedTrigger = selectedTriggerId ? workspace.tabs.get(selectedTriggerId) : null;
+                const hasSelection = !!selectedTriggerId;
+                const oneShotActive = !!ctxTab.restartAfterArmed;
+                const persistentActive = !!ctxTab.restartAfterPersistent;
+                const oneShotTint = oneShotActive ? '#f87171' : '#888';
+                const persistentTint = persistentActive ? '#f87171' : '#777';
+                return (
+                  <div className="border-t border-[#3a3a3a]">
+                    <div className="relative group/restart-after">
+                      <div className="w-full px-3 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 flex items-center gap-2">
+                        <button
+                          className="flex-1 min-w-0 text-left cursor-pointer flex items-center justify-between gap-2"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <span className="flex items-center gap-2 min-w-0">
+                            <RotateCw size={12} className={hasSelection ? 'text-[#10A37F]' : 'text-[#666]'} />
+                            <span className="truncate">Restart after</span>
+                          </span>
+                          <span className="flex items-center gap-1.5 min-w-0 text-[12px]">
+                            <span className={hasSelection ? 'text-[#a7f3d0] truncate max-w-[92px]' : 'text-[#666]'}>
+                              {selectedTrigger?.name || (hasSelection ? 'Missing tab' : 'Codex')}
+                            </span>
+                            <span className="text-[#666]">{'\u203A'}</span>
+                          </span>
+                        </button>
+                        {hasSelection && (
+                          <button
+                            className="w-5 h-5 flex items-center justify-center rounded text-[#777] hover:text-[#ddd] hover:bg-white/10 cursor-pointer flex-shrink-0"
+                            title="Clear"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setTabRestartAfterTarget(projectId, ctxTabId, null);
+                            }}
+                          >
+                            <X size={12} />
+                          </button>
+                        )}
+                      </div>
+                      <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/restart-after:block">
+                        <div className="bg-[#2a2a2a] border border-[#444] rounded-md shadow-2xl py-1 min-w-[220px] max-h-[300px] overflow-y-auto">
+                          {codexTargets.length === 0 && (
+                            <div className="context-menu-submenu-empty">No Codex tabs</div>
+                          )}
+                          {codexTargets.map((target) => {
+                            const isSelected = target.id === selectedTriggerId;
+                            return (
+                              <button
+                                key={target.id}
+                                className="context-menu-submenu-item w-full"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setTabRestartAfterTarget(projectId, ctxTabId, target.id);
+                                }}
+                              >
+                                <span className="context-menu-submenu-kind">{target.kind}</span>
+                                <span className="context-menu-submenu-title">{target.name}</span>
+                                {isSelected && <span className="ml-auto text-white">✓</span>}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+
+                    {hasSelection && (
+                      <div className="px-3 pb-2">
+                        <div className="flex items-stretch w-full border border-[#333] rounded overflow-hidden">
+                          <Tooltip content={oneShotActive ? 'Разовый автоперезапуск включен' : 'Разовый автоперезапуск'}>
+                            <button
+                              className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[13px] hover:bg-white/10 cursor-pointer flex items-center justify-center"
+                              style={{
+                                color: oneShotActive ? '#fecaca' : '#ccc',
+                                backgroundColor: oneShotActive ? 'rgba(239, 68, 68, 0.10)' : 'transparent',
+                              }}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setTabRestartAfterArmed(projectId, ctxTabId, !oneShotActive);
+                                setContextMenu(null);
+                              }}
+                            >
+                              <Bell size={13} style={{ color: oneShotTint, flexShrink: 0 }} />
+                            </button>
+                          </Tooltip>
+                          <Tooltip content={persistentActive ? 'Постоянный автоперезапуск включен' : 'Постоянный автоперезапуск'}>
+                            <button
+                              className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[13px] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#333]"
+                              style={{
+                                color: persistentActive ? '#fecaca' : '#777',
+                                backgroundColor: persistentActive ? 'rgba(239, 68, 68, 0.16)' : 'transparent',
+                              }}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setTabRestartAfterPersistent(projectId, ctxTabId, !persistentActive);
+                                setContextMenu(null);
+                              }}
+                            >
+                              <BellRing size={13} style={{ color: persistentTint }} fill={persistentActive ? 'rgba(239, 68, 68, 0.35)' : 'none'} />
+                            </button>
+                          </Tooltip>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 );
               })()}

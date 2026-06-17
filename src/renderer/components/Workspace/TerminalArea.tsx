@@ -23,6 +23,9 @@ type ExternalRunMeta = {
   completedAt?: number;
   autoStopAt?: number | null;
   autoStopMs?: number | null;
+  autoCloseAt?: number | null;
+  autoCloseMs?: number | null;
+  collapsed?: boolean;
   sessionId?: string | null;
 };
 
@@ -45,14 +48,41 @@ const formatTtl = (target?: number | null) => {
 const ExternalRunBadge = memo(({ meta }: { meta: ExternalRunMeta }) => {
   const [, setTick] = useState(0);
   useEffect(() => {
-    if (!meta.autoStopAt) return;
+    if (!meta.autoStopAt && !meta.autoCloseAt) return;
     const id = window.setInterval(() => setTick((v) => v + 1), 1000);
     return () => window.clearInterval(id);
-  }, [meta.autoStopAt]);
-  const ttl = formatTtl(meta.autoStopAt);
+  }, [meta.autoStopAt, meta.autoCloseAt]);
+  const stopTtl = formatTtl(meta.autoStopAt);
+  const closeTtl = formatTtl(meta.autoCloseAt);
   const provider = (meta.provider || 'agent').toUpperCase();
   const source = meta.source || 'external';
   const status = meta.status || 'starting';
+  if (meta.collapsed) {
+    return (
+      <div
+        style={{
+          position: 'absolute',
+          left: 12,
+          top: 10,
+          zIndex: 18,
+          width: 26,
+          height: 22,
+          borderRadius: 6,
+          border: '1px solid rgba(255,255,255,0.12)',
+          background: 'rgba(10,10,14,0.78)',
+          boxShadow: '0 10px 24px rgba(0,0,0,0.32)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          pointerEvents: 'none',
+          backdropFilter: 'blur(10px)',
+        }}
+        title={[provider, source, meta.conversationKey, status].filter(Boolean).join(' · ')}
+      >
+        <span style={{ width: 7, height: 7, borderRadius: 999, background: statusColor(status), boxShadow: `0 0 12px ${statusColor(status)}` }} />
+      </div>
+    );
+  }
   return (
     <div
       style={{
@@ -82,7 +112,8 @@ const ExternalRunBadge = memo(({ meta }: { meta: ExternalRunMeta }) => {
       <span style={{ fontWeight: 750, letterSpacing: 0 }}>{provider}</span>
       <span style={{ color: '#9ca3af', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 180 }}>{source}</span>
       <span style={{ color: '#cbd5e1' }}>{status}</span>
-      {ttl && <span style={{ color: '#fbbf24' }}>ttl {ttl}</span>}
+      {stopTtl && <span style={{ color: '#fbbf24' }}>stop {stopTtl}</span>}
+      {closeTtl && <span style={{ color: '#93c5fd' }}>tab {closeTtl}</span>}
     </div>
   );
 });

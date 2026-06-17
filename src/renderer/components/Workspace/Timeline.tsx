@@ -9,6 +9,8 @@ import { TAB_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStor
 import { generateTabTitleFromPrompt, isEligibleTabTitleEntry, trimTabTitlePrompt } from '../../utils/generateTabTitle';
 import { timelineSummaryKey, useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
+import { getHistoryAgentRuntime, type AgentHistoryTool } from '../../utils/historyAgentRuntimes';
+import { waitForClaudeStartupDefaultsReady } from '../../utils/claudeStartupDefaultsGate';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
 
@@ -551,6 +553,40 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     mode: RewindMode;
   } | null>(null);
   const [rewindLoadingMenu, setRewindLoadingMenu] = useState<{ x: number; y: number } | null>(null);
+
+  const createAgentReadyWait = useCallback((runtime: ReturnType<typeof getHistoryAgentRuntime>, timeoutMs = 30000) => {
+    let cleanup = () => {};
+    const promise = new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (err?: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (err) reject(err);
+        else resolve();
+      };
+      const timer = setTimeout(() => {
+        finish(new Error(runtime.label + ' did not become ready for rewind'));
+      }, timeoutMs);
+      const handler = (_event: any, data: { tabId?: string } = {}) => {
+        if (data?.tabId !== tabId) return;
+        finish();
+      };
+      cleanup = () => {
+        clearTimeout(timer);
+        if (runtime.readyEvent) ipcRenderer.removeListener(runtime.readyEvent, handler);
+      };
+      if (!runtime.readyEvent) {
+        finish();
+      } else {
+        ipcRenderer.on(runtime.readyEvent, handler);
+      }
+    });
+    return {
+      promise,
+      cancel: () => cleanup(),
+    };
+  }, [tabId]);
 
   // Edit Range state
   const [editRangeState, _setEditRangeState] = useState<{
@@ -3105,11 +3141,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // effect: isExpanded/isNoteEditing/deleteConfirmMode/postPromptMode → window click listener dismisses contextMenu, expanded tooltip, note editor, rangeActionMenu and selection range on outside click
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as Node | null;
+      if (target && (
+        contextMenuRef.current?.contains(target) ||
+        rangeActionMenuRef.current?.contains(target) ||
+        rewindLoadingMenuRef.current?.contains(target) ||
+        editRangeLoadingMenuRef.current?.contains(target)
+      )) {
+        return;
+      }
       setContextMenu(null);
       // Close expanded tooltip on outside click (skip if resize just ended)
       if (isExpanded && !isResizingTooltipRef.current) {
         // Skip if click target is inside tooltip (resize handle click → drag → mouseup → click)
-        if (tooltipContentRef.current?.contains(e.target as Node)) return;
+        if (target && tooltipContentRef.current?.contains(target)) return;
         setIsExpanded(false);
         setActiveTooltipIndex(null);
       }
@@ -3137,7 +3182,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         }
       }
       // Cancel range selection if clicking outside timeline
-      if (selectionStartIdRef.current && containerRef.current && !containerRef.current.contains(e.target as Node)) {
+      if (target && selectionStartIdRef.current && containerRef.current && !containerRef.current.contains(target)) {
         selectionStartIdRef.current = null;
         setSelectionStartId(null);
       }
@@ -3150,18 +3195,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // SECTION: REWIND PIPELINE — handleRewind (/rewind TUI menu, optional AI compact paste, scroll stabilization)
   // ════════════════════════════════════════════════════════════
 
-  const handleRewind = async (entry: TimelineEntry, mode: RewindMode = 'native', additionalPrompt?: string) => {
-    setContextMenu(null);
-    setRewindLoadingMenu(null);
-    rewindCancelledRef.current = false;
-    rewindCancelLoggedRef.current = false;
-    if (!sessionId) return;
-
+  const getRewindTargetContext = useCallback((entry: TimelineEntry) => {
     const entryIndex = entries.findIndex(e => e.uuid === entry.uuid);
-    if (entryIndex === -1) return;
+    if (entryIndex === -1) return null;
 
-    // Find the last compact/plan-mode boundary — Claude Rewind TUI only shows entries after it.
-    // Gemini/Codex don't have that boundary in our native selector, so all user entries are rewindable.
+    // Claude Rewind TUI only shows entries after the last compact/plan boundary.
+    // Codex/Gemini native selectors do not have that boundary in our model.
     let lastBoundaryIdx = -1;
     if (!isGemini && !isCodex) {
       for (let i = 0; i < entryIndex; i++) {
@@ -3172,16 +3211,45 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       }
     }
 
-    // Filter to rewindable user entries only (after last boundary)
-    const rewindableEntries = entries
-      .filter((e, i) => e.type === 'user' && i > lastBoundaryIdx);
+    const rewindableEntries = entries.filter((e, i) => e.type === 'user' && i > lastBoundaryIdx);
     const targetIndex = rewindableEntries.findIndex(e => e.uuid === entry.uuid);
-    if (targetIndex === -1) {
+    if (targetIndex === -1) return null;
+
+    return { entryIndex, rewindableEntries, targetIndex, lastBoundaryIdx };
+  }, [entries, isGemini, isCodex]);
+
+  const handleRewind = async (entry: TimelineEntry, mode: RewindMode = 'native', additionalPrompt?: string) => {
+    console.warn('[Restore:Rewind] handleRewind called',
+      'tool=' + toolType,
+      'mode=' + mode,
+      'tab=' + tabId.slice(-12),
+      'session=' + (sessionId ? sessionId.slice(0, 8) : 'none'),
+      'entry=' + entry.uuid.slice(0, 8));
+    setContextMenu(null);
+    setRewindLoadingMenu(null);
+    rewindCancelledRef.current = false;
+    rewindCancelLoggedRef.current = false;
+    if (!sessionId) {
+      console.warn('[Restore:Rewind] ABORT no sessionId at handler entry');
+      return;
+    }
+    console.warn('[Restore:Rewind] after session guard',
+      'entries=' + entries.length,
+      'entryType=' + entry.type,
+      'entryContent=' + JSON.stringify((entry.content || '').slice(0, 40)));
+
+    const targetContext = getRewindTargetContext(entry);
+    console.warn('[Restore:Rewind] targetContext',
+      targetContext
+        ? ('entryIndex=' + targetContext.entryIndex + ' targetIndex=' + targetContext.targetIndex + ' rewindable=' + targetContext.rewindableEntries.length)
+        : 'null');
+    if (!targetContext) {
       console.warn('[Restore:Rewind] Target is before compact/plan-mode boundary, cannot rewind');
       return;
     }
+    const { entryIndex, rewindableEntries, targetIndex, lastBoundaryIdx } = targetContext;
 
-    const normalizeRewindMatchKey = (text: string) => text.replace(/\s+/g, ' ').trim().substring(0, 180);
+    const normalizeRewindMatchKey = (text: string) => text.replace(/\s+/g, ' ').trim();
 
     // Count duplicate visible keys AFTER the target within rewindable range.
     // Short 40-char prefixes are ambiguous for adjacent prompts with the same opening.
@@ -3191,6 +3259,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       const ePrefix = normalizeRewindMatchKey(rewindableEntries[i].content);
       if (ePrefix === targetPrefix) skipDuplicates++;
     }
+    console.warn('[Restore:Rewind] duplicate scan done', 'skipDuplicates=' + skipDuplicates);
 
     console.warn('[Restore:Rewind] Starting rewind to entry', targetIndex, '/', rewindableEntries.length,
       '- uuid:', entry.uuid, 'skipDuplicates:', skipDuplicates, 'boundaryIdx:', lastBoundaryIdx,
@@ -3367,6 +3436,73 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       }
     }
 
+    const ensureAgentReadyForRewind = async () => {
+      if (isGemini) return;
+      if (toolType !== 'claude' && toolType !== 'codex') return;
+      const runtime = getHistoryAgentRuntime(toolType as AgentHistoryTool);
+      const describePresence = (presence: any) =>
+        'status=' + (presence?.status || 'unknown') +
+        ' inputReady=' + !!presence?.inputReady +
+        ' hasTerm=' + !!presence?.hasTerm +
+        ' busy=' + !!presence?.isBusy;
+      const waitStartupDefaultsIfNeeded = async () => {
+        if (toolType !== 'claude') return;
+        emitHistoryRewindLog('start', undefined, 'Claude Rewind: applying startup defaults...');
+        await waitForClaudeStartupDefaultsReady(tabId);
+        console.warn('[Restore:Rewind] Claude startup defaults gate passed');
+      };
+
+      let presence = await runtime.getPresence(tabId).catch((err: any) => {
+        console.warn('[Restore:Rewind] Presence check failed before resume:', err?.message || err);
+        return null;
+      });
+      console.warn('[Restore:Rewind] Presence before native rewind:', runtime.label, describePresence(presence));
+      if (presence?.status === 'busy') {
+        throw new Error(runtime.label + ' is busy; wait for the current turn before rewind');
+      }
+      if (presence?.status === 'active' && presence?.inputReady) {
+        await waitStartupDefaultsIfNeeded();
+        return;
+      }
+
+      const readyWait = createAgentReadyWait(runtime);
+      try {
+        if (!presence || presence.status === 'inactive') {
+          emitHistoryRewindLog('start', undefined, runtime.label + ' Rewind: starting session...');
+          const resumeResult = await runtime.resume({ tabId, sessionId, cwd });
+          if (resumeResult?.success === false) {
+            throw new Error(resumeResult.error || runtime.label + ' resume failed before rewind');
+          }
+          console.warn('[Restore:Rewind] Resume requested before native rewind:', runtime.label, JSON.stringify(resumeResult || {}));
+        } else {
+          emitHistoryRewindLog('start', undefined, runtime.label + ' Rewind: waiting for prompt...');
+        }
+
+        presence = await runtime.getPresence(tabId).catch(() => null);
+        if (presence?.status === 'busy') {
+          throw new Error(runtime.label + ' is busy; wait for the current turn before rewind');
+        }
+        if (presence?.status === 'active' && presence?.inputReady) {
+          readyWait.cancel();
+          await waitStartupDefaultsIfNeeded();
+          return;
+        }
+
+        await readyWait.promise;
+        if (rewindCancelledRef.current) throw new Error('rewind_cancelled');
+
+        presence = await runtime.getPresence(tabId).catch(() => null);
+        console.warn('[Restore:Rewind] Presence after resume wait:', runtime.label, describePresence(presence));
+        if (presence?.status !== 'active' || !presence?.inputReady) {
+          throw new Error(runtime.label + ' session is not ready for rewind');
+        }
+        await waitStartupDefaultsIfNeeded();
+      } catch (err) {
+        readyWait.cancel();
+        throw err;
+      }
+    };
+
     // Phase 2: Execute rewind in TUI + paste compact
     if (rewindCancelledRef.current) {
       finishCancelled();
@@ -3375,6 +3511,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setRewindState({ index: entryIndex, phase: 'rewinding' });
 
     try {
+      await ensureAgentReadyForRewind();
+      if (rewindCancelledRef.current) {
+        finishCancelled();
+        return;
+      }
       const rewindResult = await ipcRenderer.invoke(historyMenuChannel, {
         tabId,
         targetIndex,
@@ -5088,11 +5229,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   ipcRenderer.send('terminal:input', tabId, '\x03');
 
                   // Wait for "again to exit" detection (deterministic, no blind timeout)
-                  await new Promise<void>((resolve) => {
+                  await new Promise<void>((resolve, reject) => {
                     const timeout = setTimeout(() => {
-                      console.warn('[EditRange] DangerZone timeout, sending Ctrl+C #2 anyway');
+                      console.warn('[EditRange] DangerZone timeout, aborting edit-range before Ctrl+C #2');
                       ipcRenderer.removeListener('claude:ctrlc-danger-zone', handler);
-                      resolve();
+                      reject(new Error('Claude danger-zone did not appear before edit-range stop'));
                     }, 3000);
                     const handler = (_e: any, data: { tabId: string; active: boolean }) => {
                       if (data.tabId === tabId && data.active) {
@@ -5108,6 +5249,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   ipcRenderer.send('terminal:input', tabId, '\x03');
 
                   // Wait for isRunning=false (OSC 133 D = command finished)
+                  let commandFinished = false;
                   for (let i = 0; i < 30; i++) {
                     await new Promise(resolve => setTimeout(resolve, 300));
                     const state = await ipcRenderer.invoke('terminal:getCommandState', {
@@ -5118,10 +5260,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       ignoreBridgeAlive: true,
                     });
                     if (!state?.isRunning) {
+                      commandFinished = true;
                       console.warn('[EditRange] Command finished (OSC 133 D)');
                       break;
                     }
                     if (i === 29) console.warn('[EditRange] Exit timeout');
+                  }
+                  if (!commandFinished) {
+                    throw new Error('Claude did not stop before edit-range');
                   }
                   await new Promise(resolve => setTimeout(resolve, 300));
                 } else {
@@ -5146,11 +5292,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 // Step 3: Wait for a fresh shell prompt only after we actually stopped Claude.
                 if (waitForPromptReadyBeforeRestart) {
                   console.warn('[EditRange] Waiting for prompt-ready...');
-                  await new Promise<void>((resolve) => {
+                  await new Promise<void>((resolve, reject) => {
                     const timeout = setTimeout(() => {
-                      console.warn('[EditRange] prompt-ready timeout, proceeding anyway');
+                      console.warn('[EditRange] prompt-ready timeout, aborting restart');
                       ipcRenderer.removeListener('terminal:prompt-ready', handler);
-                      resolve();
+                      reject(new Error('Shell prompt did not become ready before Claude restart'));
                     }, 5000);
                     const handler = (_e: any, readyTabId: string) => {
                       if (readyTabId === tabId) {
@@ -5895,31 +6041,46 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </>
                   )}
                   {/* Rewind — left side native, right side Gemini compact + native rewind. */}
-                  <div className="border-t border-white/10 my-1" />
-                  <div className="flex rounded overflow-hidden">
-                    <button
-                      className={`flex-1 text-left px-3 py-2 text-xs rounded-l transition-colors ${isActive && !rewindState ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
-                      disabled={!isActive || !!rewindState}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        if (isActive && !rewindState) handleRewind(contextMenu.entry, 'native');
-                      }}
-                    >
-                      {rewindState ? (rewindState.phase === 'compacting' ? 'Gemini...' : rewindState.phase === 'rewinding' ? 'Rewind...' : 'Paste...') : 'Rewind'}
-                    </button>
-                    <Tooltip content="Rewind через AI">
-                      <button
-                        className={`px-2 py-2 text-[10px] font-bold tracking-wide rounded-r transition-colors border-l border-white/10 ${isActive && !rewindState ? 'text-amber-400/80 hover:bg-amber-600/30 hover:text-amber-300 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
-                        disabled={!isActive || !!rewindState}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          if (isActive && !rewindState) handleRewind(contextMenu.entry, 'ai');
-                        }}
-                      >
-                        AI
-                      </button>
-                    </Tooltip>
-                  </div>
+                  {(() => {
+                    const canStartRewind = !!sessionId && !rewindState && !!getRewindTargetContext(contextMenu.entry);
+                    return (
+                      <>
+                        <div className="border-t border-white/10 my-1" />
+                        <div className="flex rounded overflow-hidden">
+                          <button
+                            className={`flex-1 text-left px-3 py-2 text-xs rounded-l transition-colors ${canStartRewind ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
+                            disabled={!canStartRewind}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              console.warn('[Restore:Rewind] native button click',
+                                'canStart=' + canStartRewind,
+                                'session=' + (sessionId ? sessionId.slice(0, 8) : 'none'),
+                                'entry=' + contextMenu.entry.uuid.slice(0, 8));
+                              if (canStartRewind) handleRewind(contextMenu.entry, 'native');
+                            }}
+                          >
+                            {rewindState ? (rewindState.phase === 'compacting' ? 'Gemini...' : rewindState.phase === 'rewinding' ? 'Rewind...' : 'Paste...') : 'Rewind'}
+                          </button>
+                          <Tooltip content="Rewind через AI">
+                            <button
+                              className={`px-2 py-2 text-[10px] font-bold tracking-wide rounded-r transition-colors border-l border-white/10 ${canStartRewind ? 'text-amber-400/80 hover:bg-amber-600/30 hover:text-amber-300 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
+                              disabled={!canStartRewind}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                console.warn('[Restore:Rewind] ai button click',
+                                  'canStart=' + canStartRewind,
+                                  'session=' + (sessionId ? sessionId.slice(0, 8) : 'none'),
+                                  'entry=' + contextMenu.entry.uuid.slice(0, 8));
+                                if (canStartRewind) handleRewind(contextMenu.entry, 'ai');
+                              }}
+                            >
+                              AI
+                            </button>
+                          </Tooltip>
+                        </div>
+                      </>
+                    );
+                  })()}
                 </>
               ) : (
                 <button

@@ -77,6 +77,12 @@ import { terminalRegistry } from '../../utils/terminalRegistry';
 import { log } from '../../utils/logger';
 import { markPendingResume, clearPendingResume, isStaleAgainstPending, getPendingResume } from '../../utils/pendingResume';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
+import {
+  clearClaudeStartupDefaultsGate,
+  markClaudeStartupDefaultsFailed,
+  markClaudeStartupDefaultsPending,
+  markClaudeStartupDefaultsReady,
+} from '../../utils/claudeStartupDefaultsGate';
 
 const TIMELINE_COLLAPSED_SLOT_WIDTH = 32;
 const TERMINAL_THEME = {
@@ -141,6 +147,7 @@ const _modelSentForTab = new Map<string, { at: number; via: string; model: strin
 (window as any).__modelSentForTab = _modelSentForTab;
 
 const _claudeBridgeModelByTab = new Map<string, { model: string; at: number }>();
+const _claudeStartupDefaultsInflight = new Map<string, Promise<void>>();
 
 function _bridgeModelMatchesTarget(targetModel: string, bridgeModel: string | null | undefined): boolean {
   const target = String(targetModel || '').trim().toLowerCase();
@@ -527,6 +534,15 @@ function waitForClaudeStartupModelBridge(tabId: string, model: string, timeoutMs
   });
 }
 
+async function waitForClaudeStartupPromptBoundary(tabId: string, afterSeq: number, label: string) {
+  const seq = await terminalRegistry.waitForPromptBoundaryAfter(tabId, afterSeq, 3000);
+  console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' ' + label + ' promptBoundary=' + (seq === null ? 'timeout' : seq));
+  if (seq === null) {
+    throw new Error(label + ' did not return a prompt boundary');
+  }
+  return seq;
+}
+
 const terminalWarmQueue = new Map<string, () => void>();
 let terminalWarmScheduled: any = null;
 
@@ -759,6 +775,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         _effortSentForTab.delete(tabId);
         _modelSentForTab.delete(tabId);
         _claudeBridgeModelByTab.delete(tabId);
+        clearClaudeStartupDefaultsGate(tabId);
         finalizeAiLaunchSnapshot(tabId);
       }
     };
@@ -1089,6 +1106,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         _effortSentForTab.delete(tabId);
         _modelSentForTab.delete(tabId);
         _claudeBridgeModelByTab.delete(tabId);
+        clearClaudeStartupDefaultsGate(tabId);
       }
     };
 
@@ -1260,15 +1278,20 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             const result = await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model, {
               source: 'startup-defaults:bridge-model',
               stashFirst: false,
+              armPromptBoundaryOnSubmit: true,
             });
-            if (result?.success === false) throw new Error(result.error || 'send-command failed');
+            if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
             const bridgeWait = await waitForClaudeStartupModelBridge(tabId, model);
+            if (bridgeWait === 'timeout') {
+              throw new Error('/model ' + model + ' did not confirm through bridge');
+            }
             _effortDiag(tabId, '✅ MODEL COMPLETED', '/model ' + model + ' — bridgeWait=' + bridgeWait);
             console.warn('[Terminal:ModelInject] tab=' + tabId.slice(-12) + ' /model ' + model + ' bridgeWait=' + bridgeWait);
           } catch (e: unknown) {
             _effortDiag(tabId, '❌ MODEL FAILED', String(e));
             console.error('[Terminal:ModelInject] failed', e);
             _modelSentForTab.delete(tabId);
+            return;
           }
         }
       }
@@ -1308,6 +1331,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       }
       _effortSentForTab.set(tabId, { at: Date.now(), via: 'bridge-fresh', level: eff });
       _effortDiag(tabId, '🚀 INJECT FIRED', '/effort ' + eff + ' — sending to claude:send-command');
+      const promptSeqBeforeEffort = terminalRegistry.getLatestPromptBoundarySeq(tabId);
       // [EffortDiag2026-05] invoke-fire counter — written SYNCHRONOUSLY in the
       // same tick as the invoke. Pair with HANDLER-ENTRY: callN=K must equal
       // invokeN=K. If invokeN < handlerN, an early-return cut off the inject.
@@ -1315,15 +1339,20 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       const iCount = (_effortInjectCalls.get(tabId) || 0) + 1;
       _effortInjectCalls.set(tabId, iCount);
       console.warn('[EffortDiag2026-05][INVOKE-FIRE] tab=' + tabId.slice(-12) + ' invokeN=' + iCount + ' handlerN=' + (_effortHandlerCalls.get(tabId) || 0) + ' effort=' + eff + ' ts=' + Date.now());
-      ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff, {
-        source: 'startup-defaults:bridge-effort',
-        stashFirst: false,
-      }).then(() => {
+      try {
+        const result = await ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff, {
+          source: 'startup-defaults:bridge-effort',
+          stashFirst: false,
+          armPromptBoundaryOnSubmit: true,
+        });
+        if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
+        await waitForClaudeStartupPromptBoundary(tabId, promptSeqBeforeEffort, 'after /effort ' + eff + ' (bridge-fresh)');
         _effortDiag(tabId, '✅ INJECT COMPLETED', '/effort ' + eff + ' — Claude acknowledged');
-      }).catch((e: unknown) => {
+      } catch (e: unknown) {
         _effortDiag(tabId, '❌ INJECT FAILED', String(e));
         console.error('[Terminal:EffortInject] failed', e);
-      });
+        _effortSentForTab.delete(tabId);
+      }
     };
 
     // Early "Claude TUI ready" signal — fires the moment Claude renders ⏵ in
@@ -1332,50 +1361,89 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     // The sentinels make the later Bridge:Fresh path a no-op once this fires.
     const handleTuiReady = async (_: any, data: { tabId: string; ts: number }) => {
       if (data.tabId !== tabId) return;
-      const model = useUIStore.getState().defaultClaudeModel;
-      if (model && model !== 'none' && !_modelSentForTab.has(tabId)) {
-        _modelSentForTab.set(tabId, { at: Date.now(), via: 'tui-ready', model });
-        console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /model ' + model + ' (early path, before /effort)');
+      const existingStartup = _claudeStartupDefaultsInflight.get(tabId);
+      if (existingStartup) {
+        console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' startup defaults already running — join');
+        await existingStartup.catch(() => {});
+        return;
+      }
+      markClaudeStartupDefaultsPending(tabId, 'tui-ready');
+      const startupWork = (async () => {
+        const model = useUIStore.getState().defaultClaudeModel;
+        if (model && model !== 'none' && !_modelSentForTab.has(tabId)) {
+          const promptSeqBeforeModel = terminalRegistry.getLatestPromptBoundarySeq(tabId);
+          _modelSentForTab.set(tabId, { at: Date.now(), via: 'tui-ready', model });
+          console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /model ' + model + ' (early path, before /effort)');
+          try {
+            const result = await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model, {
+              source: 'startup-defaults:tui-model',
+              stashFirst: false,
+              armPromptBoundaryOnSubmit: true,
+            });
+            if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
+            const bridgeWait = await waitForClaudeStartupModelBridge(tabId, model);
+            if (bridgeWait === 'timeout') {
+              throw new Error('/model ' + model + ' did not confirm through bridge');
+            }
+            console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /model ' + model + ' bridgeWait=' + bridgeWait + ' — continuing to /effort');
+            if (useUIStore.getState().defaultClaudeEffort === 'none') {
+              await waitForClaudeStartupPromptBoundary(tabId, promptSeqBeforeModel, 'after /model ' + model);
+            }
+          } catch (e: unknown) {
+            console.error('[Terminal:TuiReady] model inject failed', e);
+            _modelSentForTab.delete(tabId); // allow Bridge:Fresh fallback to retry on fresh starts
+            throw e;
+          }
+        }
+        if (_effortSentForTab.has(tabId)) return; // already sent (manual click or earlier tui-ready)
+        const eff = useUIStore.getState().defaultClaudeEffort;
+        if (!eff || eff === 'none') return;
+        // NO resume guard here — this is the safe path to (re-)inject on --resume.
+        // Why resume needs re-inject at all: `claude --resume` is a FRESH process.
+        // Per decompiled Claude Code (main.tsx: `parseEffortValue(options.effort)
+        // ?? getInitialEffortSetting()`), with no --effort flag it falls back to
+        // settings.json's effortLevel — and `toPersistableEffort` STRIPS 'max' on
+        // read. So a resumed session silently loses max (and any session-scoped
+        // level). The old guard's premise ("effort preserved by Claude TUI state")
+        // was false — there is no surviving memory across a process restart.
+        // Why it's safe HERE specifically: tui-ready fires only once Claude has
+        // drawn the ⏵ prompt = the resume handshake is finished and the input is
+        // idle/ready. The 2026-05-21 paste-race (303 bytes of old prompt eaten by
+        // Ctrl+S stash) was on the Bridge:Fresh / process-started path, which
+        // fires DURING the handshake — that path keeps its resume guard below.
+        // The sentinel guarantees a single inject (tui-ready sets it ~2-6s before
+        // Bridge:Fresh, which then no-ops). See fact-claude-tui-control.md.
+        const promptSeqBeforeEffort = terminalRegistry.getLatestPromptBoundarySeq(tabId);
+        _effortSentForTab.set(tabId, { at: Date.now(), via: 'tui-ready', level: eff });
+        console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /effort ' + eff + ' (early path, before Bridge:Fresh)');
         try {
-          const result = await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model, {
-            source: 'startup-defaults:tui-model',
+          const result = await ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff, {
+            source: 'startup-defaults:tui-effort',
             stashFirst: false,
+            armPromptBoundaryOnSubmit: true,
           });
-          if (result?.success === false) throw new Error(result.error || 'send-command failed');
-          const bridgeWait = await waitForClaudeStartupModelBridge(tabId, model);
-          console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /model ' + model + ' bridgeWait=' + bridgeWait + ' — continuing to /effort');
+          if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
+          await waitForClaudeStartupPromptBoundary(tabId, promptSeqBeforeEffort, 'after /effort ' + eff);
+          console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /effort ' + eff + ' completed — startup defaults ready');
+          _effortDiag(tabId, '✅ INJECT COMPLETED', '/effort ' + eff + ' — Claude acknowledged');
         } catch (e: unknown) {
-          console.error('[Terminal:TuiReady] model inject failed', e);
-          _modelSentForTab.delete(tabId); // allow Bridge:Fresh fallback to retry on fresh starts
+          console.error('[Terminal:TuiReady] inject failed', e);
+          _effortSentForTab.delete(tabId); // allow Bridge:Fresh fallback to retry
+          throw e;
+        }
+      })();
+      _claudeStartupDefaultsInflight.set(tabId, startupWork);
+      try {
+        await startupWork;
+        markClaudeStartupDefaultsReady(tabId, 'tui-ready');
+      } catch (e: unknown) {
+        markClaudeStartupDefaultsFailed(tabId, 'tui-ready', e);
+        console.error('[Terminal:TuiReady] startup defaults failed', e);
+      } finally {
+        if (_claudeStartupDefaultsInflight.get(tabId) === startupWork) {
+          _claudeStartupDefaultsInflight.delete(tabId);
         }
       }
-      if (_effortSentForTab.has(tabId)) return; // already sent (manual click or earlier tui-ready)
-      const eff = useUIStore.getState().defaultClaudeEffort;
-      if (!eff || eff === 'none') return;
-      // NO resume guard here — this is the safe path to (re-)inject on --resume.
-      // Why resume needs re-inject at all: `claude --resume` is a FRESH process.
-      // Per decompiled Claude Code (main.tsx: `parseEffortValue(options.effort)
-      // ?? getInitialEffortSetting()`), with no --effort flag it falls back to
-      // settings.json's effortLevel — and `toPersistableEffort` STRIPS 'max' on
-      // read. So a resumed session silently loses max (and any session-scoped
-      // level). The old guard's premise ("effort preserved by Claude TUI state")
-      // was false — there is no surviving memory across a process restart.
-      // Why it's safe HERE specifically: tui-ready fires only once Claude has
-      // drawn the ⏵ prompt = the resume handshake is finished and the input is
-      // idle/ready. The 2026-05-21 paste-race (303 bytes of old prompt eaten by
-      // Ctrl+S stash) was on the Bridge:Fresh / process-started path, which
-      // fires DURING the handshake — that path keeps its resume guard below.
-      // The sentinel guarantees a single inject (tui-ready sets it ~2-6s before
-      // Bridge:Fresh, which then no-ops). See fact-claude-tui-control.md.
-      _effortSentForTab.set(tabId, { at: Date.now(), via: 'tui-ready', level: eff });
-      console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /effort ' + eff + ' (early path, before Bridge:Fresh)');
-      ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff, {
-        source: 'startup-defaults:tui-effort',
-        stashFirst: false,
-      }).catch((e: unknown) => {
-        console.error('[Terminal:TuiReady] inject failed', e);
-        _effortSentForTab.delete(tabId); // allow Bridge:Fresh fallback to retry
-      });
     };
 
     // /status interception: update session ID if not yet captured (no toast)

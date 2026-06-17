@@ -349,6 +349,9 @@ interface Tab {
     completedAt?: number;
     autoStopAt?: number | null;
     autoStopMs?: number | null;
+    autoCloseAt?: number | null;
+    autoCloseMs?: number | null;
+    collapsed?: boolean;
     sessionId?: string | null;
   };
   pendingAction?: PendingAction; // Action to execute when terminal is ready
@@ -389,6 +392,14 @@ interface Tab {
   completionNotificationArmed?: boolean;
   completionNotificationFired?: boolean;
   completionNotificationFiredAt?: number;
+  /**
+   * Restart-after-Codex trigger for ordinary terminal tabs.
+   * restartAfterTabId is the Codex tab whose loader completion should restart
+   * this tab. Target, one-shot armed state, and persistent mode survive restarts.
+   */
+  restartAfterTabId?: string;
+  restartAfterPersistent?: boolean;
+  restartAfterArmed?: boolean;
   groupId?: string; // One-level TabBar group membership. Separate from parentTabId (sub-agents).
   visualParentTabId?: string; // Visual-only tab nesting in TabBar. Never use for MCP sub-agents.
   isCollapsed?: boolean; // Collapsed tab — icon-only, for archiving completed sessions
@@ -602,8 +613,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; filePath?: string; background?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; filePath?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean; completionNotificationPersistent?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; filePath?: string; background?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; filePath?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean }) => Promise<boolean>;
   reopenLastClosedTab: (projectId: string) => Promise<{ tabId: string | null; reason?: 'empty' | 'error' }>;
   switchTab: (projectId: string, tabId: string) => void;
@@ -629,6 +640,11 @@ interface WorkspaceStore {
   setTabCompletionNotificationArmed: (projectId: string, tabId: string, armed: boolean) => void;
   setTabCompletionNotificationPersistent: (projectId: string, tabId: string, persistent: boolean) => void;
   clearTabCompletionNotification: (projectId: string, tabId: string, options?: { keepPersistent?: boolean }) => void;
+  setTabRestartAfterTarget: (projectId: string, tabId: string, triggerTabId: string | null) => void;
+  setTabRestartAfterArmed: (projectId: string, tabId: string, armed: boolean) => void;
+  setTabRestartAfterPersistent: (projectId: string, tabId: string, persistent: boolean) => void;
+  markRestartAfterTriggerBusy: (triggerTabId: string) => void;
+  consumeRestartAfterTriggerIdle: (triggerTabId: string, naturalEnd: boolean) => string[];
   setTabCommandType: (tabId: string, commandType: CommandType) => void; // Also sets auto-color on first run
   markAiLaunchAutoTitle: (tabId: string, toolType: AutoTabTitleTool) => void;
   markAiForkAutoTitle: (tabId: string, toolType: AutoTabTitleTool, sourceSessionId: string) => void;
@@ -676,6 +692,7 @@ interface WorkspaceStore {
   setCodexSessionId: (tabId: string, sessionId: string, reason?: CodexSessionWriteReason) => void;
   getCodexSessionId: (tabId: string) => string | null;
   updateCodexState: (tabId: string, state: Partial<Pick<Tab, 'codexModel' | 'codexEffort'>>) => void;
+  updateExternalRunMeta: (tabId: string, meta: Partial<NonNullable<Tab['externalRun']>>) => void;
 
   setClaudeActive: (tabId: string, alive: boolean) => void;
   setClaudeBusy: (tabId: string, busy: boolean) => void;
@@ -788,6 +805,7 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     codexSessionId: tab.codexSessionId,
     codexModel: tab.codexModel,
     codexEffort: tab.codexEffort,
+    externalRun: tab.externalRun,
     wasInterrupted: tab.wasInterrupted,
     overlayDismissed: tab.overlayDismissed,
     notes: tab.notes,
@@ -801,6 +819,9 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     isCollapsed: tab.isCollapsed,
     sessionStatus: tab.sessionStatus,
     completionNotificationPersistent: tab.completionNotificationPersistent,
+    restartAfterTabId: tab.restartAfterTabId,
+    restartAfterPersistent: tab.restartAfterPersistent,
+    restartAfterArmed: tab.restartAfterArmed,
     groupId: tab.groupId,
     visualParentTabId: tab.visualParentTabId,
     nameSetManually: tab.nameSetManually,
@@ -1034,6 +1055,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               codexSessionId: savedTab.codexSessionId,
               codexModel: savedTab.codexModel,
               codexEffort: savedTab.codexEffort,
+              externalRun: savedTab.externalRun,
               wasInterrupted: savedTab.wasInterrupted,
               overlayDismissed: savedTab.overlayDismissed,
               notes: savedTab.notes,
@@ -1046,6 +1068,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               visualParentTabId: savedTab.visualParentTabId,
               sessionStatus: savedTab.sessionStatus,
               completionNotificationPersistent: savedTab.completionNotificationPersistent,
+              restartAfterTabId: savedTab.restartAfterTabId,
+              restartAfterPersistent: savedTab.restartAfterPersistent,
+              restartAfterArmed: savedTab.restartAfterArmed,
               nameSetManually: savedTab.nameSetManually,
               restoreId: savedTab.tabId
             } as any);
@@ -1328,6 +1353,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               codexSessionId: savedTab.codexSessionId,
               codexModel: savedTab.codexModel,
               codexEffort: savedTab.codexEffort,
+              externalRun: savedTab.externalRun,
               wasInterrupted: savedTab.wasInterrupted,
               overlayDismissed: savedTab.overlayDismissed,
               notes: savedTab.notes,
@@ -1340,6 +1366,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               visualParentTabId: savedTab.visualParentTabId,
               sessionStatus: savedTab.sessionStatus,
               completionNotificationPersistent: savedTab.completionNotificationPersistent,
+              restartAfterTabId: savedTab.restartAfterTabId,
+              restartAfterPersistent: savedTab.restartAfterPersistent,
+              restartAfterArmed: savedTab.restartAfterArmed,
               nameSetManually: savedTab.nameSetManually,
               restoreId: savedTab.tabId
             } as any);
@@ -1535,7 +1564,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       visualParentTabId: options?.isUtility ? undefined : (options as any)?.visualParentTabId,
       nameSetManually: (options as any)?.nameSetManually,
       sessionStatus: (options as any)?.sessionStatus,
-      completionNotificationPersistent: (options as any)?.completionNotificationPersistent || undefined
+      completionNotificationPersistent: (options as any)?.completionNotificationPersistent || undefined,
+      restartAfterTabId: (options as any)?.restartAfterTabId || undefined,
+      restartAfterPersistent: (options as any)?.restartAfterPersistent || undefined,
+      restartAfterArmed: (options as any)?.restartAfterArmed || undefined
     };
 
     // Claude SDK and linked file tabs don't need a PTY process.
@@ -1672,7 +1704,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       nameSetManually: (options as any)?.nameSetManually,
       groupId: targetGroupId,
       visualParentTabId,
-      createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000)
+      createdAt: (options as any)?.createdAt || Math.floor(Date.now() / 1000),
+      restartAfterTabId: (options as any)?.restartAfterTabId || undefined,
+      restartAfterPersistent: (options as any)?.restartAfterPersistent || undefined,
+      restartAfterArmed: (options as any)?.restartAfterArmed || undefined
     };
 
     // Only pass initialCommand for shell-command type, not for internal commands
@@ -2349,6 +2384,103 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (!options?.keepPersistent) delete tab.completionNotificationPersistent;
     set({ openProjects: new Map(openProjects) });
     if (!options?.keepPersistent && hadPersistent) saveTabs(workspace.projectId, workspace.tabs);
+  },
+
+  setTabRestartAfterTarget: (projectId, tabId, triggerTabId) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+    const tab = workspace.tabs.get(tabId);
+    if (!tab) return;
+    if (triggerTabId) {
+      tab.restartAfterTabId = triggerTabId;
+    } else {
+      delete tab.restartAfterTabId;
+      delete tab.restartAfterArmed;
+      delete tab.restartAfterPersistent;
+    }
+    set({ openProjects: new Map(openProjects) });
+    saveTabs(workspace.projectId, workspace.tabs);
+  },
+
+  setTabRestartAfterArmed: (projectId, tabId, armed) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+    const tab = workspace.tabs.get(tabId);
+    if (!tab || !tab.restartAfterTabId) return;
+    if (armed) {
+      tab.restartAfterArmed = true;
+    } else {
+      delete tab.restartAfterArmed;
+    }
+    set({ openProjects: new Map(openProjects) });
+    saveTabs(workspace.projectId, workspace.tabs);
+  },
+
+  setTabRestartAfterPersistent: (projectId, tabId, persistent) => {
+    const { openProjects } = get();
+    const workspace = openProjects.get(projectId);
+    if (!workspace) return;
+    const tab = workspace.tabs.get(tabId);
+    if (!tab || !tab.restartAfterTabId) return;
+    if (persistent) {
+      tab.restartAfterPersistent = true;
+      tab.restartAfterArmed = true;
+    } else {
+      delete tab.restartAfterPersistent;
+    }
+    set({ openProjects: new Map(openProjects) });
+    saveTabs(workspace.projectId, workspace.tabs);
+  },
+
+  markRestartAfterTriggerBusy: (triggerTabId) => {
+    const { openProjects } = get();
+    let changed = false;
+    const changedProjectIds = new Set<string>();
+    for (const [, workspace] of openProjects) {
+      for (const tab of workspace.tabs.values()) {
+        if (tab.restartAfterTabId !== triggerTabId || !tab.restartAfterPersistent) continue;
+        if (tab.restartAfterArmed) continue;
+        tab.restartAfterArmed = true;
+        changed = true;
+        changedProjectIds.add(workspace.projectId);
+      }
+    }
+    if (changed) {
+      set({ openProjects: new Map(openProjects) });
+      for (const projectId of changedProjectIds) {
+        const workspace = openProjects.get(projectId);
+        if (workspace) saveTabs(workspace.projectId, workspace.tabs);
+      }
+    }
+  },
+
+  consumeRestartAfterTriggerIdle: (triggerTabId, naturalEnd) => {
+    const { openProjects } = get();
+    const restartTargetIds: string[] = [];
+    let changed = false;
+    const changedProjectIds = new Set<string>();
+    for (const [, workspace] of openProjects) {
+      for (const tab of workspace.tabs.values()) {
+        if (tab.restartAfterTabId !== triggerTabId) continue;
+        if (!tab.restartAfterArmed && !tab.restartAfterPersistent) continue;
+        if (naturalEnd) restartTargetIds.push(tab.id);
+        if (tab.restartAfterArmed) {
+          delete tab.restartAfterArmed;
+          changed = true;
+          changedProjectIds.add(workspace.projectId);
+        }
+      }
+    }
+    if (changed) {
+      set({ openProjects: new Map(openProjects) });
+      for (const projectId of changedProjectIds) {
+        const workspace = openProjects.get(projectId);
+        if (workspace) saveTabs(workspace.projectId, workspace.tabs);
+      }
+    }
+    return naturalEnd ? restartTargetIds : [];
   },
 
   setTabCommandType: (tabId, commandType) => {
@@ -3564,6 +3696,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     console.warn('[Store:updateSDKState] TAB NOT FOUND tabId=' + tabId);
   },
 
+  updateExternalRunMeta: (tabId, meta) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (!tab) continue;
+      tab.externalRun = { ...(tab.externalRun || {}), ...(meta || {}) };
+      set({ openProjects: new Map(openProjects) });
+      saveTabs(workspace.projectId, workspace.tabs);
+      return;
+    }
+    console.warn('[Store:updateExternalRunMeta] TAB NOT FOUND tabId=' + tabId);
+  },
+
   upsertBgTask: (tabId, taskId, patch) => {
     const { openProjects } = get();
     for (const [, workspace] of openProjects) {
@@ -3684,12 +3829,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           name: tab.name, cwd: tab.cwd, color: tab.color, isUtility: tab.isUtility,
           commandType: tab.commandType, claudeSessionId: tab.claudeSessionId,
           geminiSessionId: tab.geminiSessionId, codexSessionId: tab.codexSessionId,
-          codexModel: tab.codexModel, codexEffort: tab.codexEffort, sessionStatus: tab.sessionStatus, wasInterrupted: tab.wasInterrupted,
+          codexModel: tab.codexModel, codexEffort: tab.codexEffort, externalRun: tab.externalRun, sessionStatus: tab.sessionStatus, wasInterrupted: tab.wasInterrupted,
           overlayDismissed: tab.overlayDismissed, notes: tab.notes, tabType: tab.tabType,
           url: tab.url, filePath: tab.filePath, terminalId: tab.terminalId, terminalName: tab.terminalName,
           activeView: tab.activeView, createdAt: tab.createdAt, isCollapsed: tab.isCollapsed,
           groupId: tab.groupId, visualParentTabId: tab.visualParentTabId,
           completionNotificationPersistent: tab.completionNotificationPersistent,
+          restartAfterTabId: tab.restartAfterTabId,
+          restartAfterPersistent: tab.restartAfterPersistent,
+          restartAfterArmed: tab.restartAfterArmed,
           nameSetManually: tab.nameSetManually, tabId: tab.id
         }));
         ipcRenderer.sendSync('project:save-tabs-sync', { projectId: workspace.projectId, tabs: tabsArray });

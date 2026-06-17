@@ -1,5 +1,5 @@
-import React, { useState, useMemo, useEffect, useCallback } from 'react';
-import { Home, Minimize2, RotateCcw, Globe, PanelLeft, FileEdit, RefreshCw, Sparkles } from 'lucide-react';
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
+import { Home, Minimize2, RotateCcw, Globe, PanelLeft, FileEdit, RefreshCw, Sparkles, Settings2, Check } from 'lucide-react';
 import { VscVscode } from 'react-icons/vsc';
 import { useUIStore } from '../../store/useUIStore';
 import Tooltip from '../UI/Tooltip';
@@ -13,8 +13,22 @@ import DocsButton from './DocsButton';
 import ClaudeUsageButton from './ClaudeUsageButton';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
+import { isInboxProjectId } from '../../constants/systemProjects';
 
 const { ipcRenderer } = window.require('electron');
+const DEFAULT_EXTERNAL_AUTO_STOP_MS = 30_000;
+const DEFAULT_EXTERNAL_AUTO_CLOSE_MS = 15 * 60 * 1000;
+
+type ToolbarExternalRunMeta = {
+  tabId: string;
+  runId?: string;
+  provider?: string;
+  source?: string;
+  status?: string;
+  autoStopMs?: number | null;
+  autoCloseMs?: number | null;
+  collapsed?: boolean;
+};
 
 export default function ProjectToolbar({ isSystemProject = false }: { isSystemProject?: boolean }) {
   const showToast = useUIStore((state) => state.showToast);
@@ -47,8 +61,56 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
   const currentProjectPath = useProjectsStore((state) => (
     activeProjectId ? state.projects[activeProjectId]?.path : undefined
   ));
+  const activeExternalRunKey = useWorkspaceStore((state) => {
+    const projectId = state.activeProjectId;
+    if (!projectId) return '';
+    const workspace = state.openProjects.get(projectId);
+    if (!workspace) return '';
+    const effectiveId = state.getEffectiveTabId();
+    const tab = effectiveId ? workspace.tabs.get(effectiveId) : null;
+    const meta = (tab as any)?.externalRun;
+    if (!tab) return '';
+    const isInboxCodexTab = isInboxProjectId(projectId)
+      && tab.commandType === 'codex'
+      && String(tab.name || '').startsWith('Codex ·');
+    if (!meta && !isInboxCodexTab) return '';
+    const fallbackMeta = isInboxCodexTab
+      ? {
+        provider: 'codex',
+        source: 'inbox',
+        status: tab.codexSessionId ? 'idle' : 'starting',
+        autoStopMs: DEFAULT_EXTERNAL_AUTO_STOP_MS,
+        autoCloseMs: DEFAULT_EXTERNAL_AUTO_CLOSE_MS,
+        collapsed: false,
+      }
+      : {};
+    const resolvedMeta = { ...fallbackMeta, ...(meta || {}) };
+    return JSON.stringify({
+      tabId: tab.id,
+      runId: resolvedMeta.runId,
+      provider: resolvedMeta.provider,
+      source: resolvedMeta.source,
+      status: resolvedMeta.status,
+      autoStopMs: resolvedMeta.autoStopMs,
+      autoCloseMs: resolvedMeta.autoCloseMs,
+      collapsed: resolvedMeta.collapsed === true,
+    });
+  });
+  const activeExternalRun = useMemo<ToolbarExternalRunMeta | null>(() => {
+    if (!activeExternalRunKey) return null;
+    try {
+      return JSON.parse(activeExternalRunKey) as ToolbarExternalRunMeta;
+    } catch {
+      return null;
+    }
+  }, [activeExternalRunKey]);
 
   const [isCompressing, setIsCompressing] = useState(false);
+  const [externalSettingsOpen, setExternalSettingsOpen] = useState(false);
+  const [externalStopSeconds, setExternalStopSeconds] = useState('30');
+  const [externalCloseMinutes, setExternalCloseMinutes] = useState('15');
+  const [externalSettingsSaving, setExternalSettingsSaving] = useState(false);
+  const externalSettingsRef = useRef<HTMLDivElement | null>(null);
 
   const isHomeActive = currentView === 'home';
   const summaryTargetKey = useWorkspaceStore((state) => {
@@ -112,6 +174,66 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
     opacity: disabled ? 0.62 : 1,
     fontVariantNumeric: 'tabular-nums',
   });
+
+  useEffect(() => {
+    if (!activeExternalRun) {
+      setExternalSettingsOpen(false);
+      return;
+    }
+    const stopMs = Number.isFinite(Number(activeExternalRun.autoStopMs))
+      ? Number(activeExternalRun.autoStopMs)
+      : DEFAULT_EXTERNAL_AUTO_STOP_MS;
+    const closeMs = Number.isFinite(Number(activeExternalRun.autoCloseMs))
+      ? Number(activeExternalRun.autoCloseMs)
+      : DEFAULT_EXTERNAL_AUTO_CLOSE_MS;
+    setExternalStopSeconds(String(Math.max(0, Math.round(stopMs / 1000))));
+    setExternalCloseMinutes(String(Math.max(1, Math.round(closeMs / 60_000))));
+  }, [activeExternalRun?.tabId, activeExternalRun?.runId, activeExternalRun?.autoStopMs, activeExternalRun?.autoCloseMs]);
+
+  useEffect(() => {
+    if (!externalSettingsOpen) return;
+    const onMouseDown = (event: MouseEvent) => {
+      const root = externalSettingsRef.current;
+      if (root && !root.contains(event.target as Node)) setExternalSettingsOpen(false);
+    };
+    window.addEventListener('mousedown', onMouseDown, true);
+    return () => window.removeEventListener('mousedown', onMouseDown, true);
+  }, [externalSettingsOpen]);
+
+  const parseExternalStopMs = useCallback(() => {
+    const seconds = Number(externalStopSeconds);
+    if (!Number.isFinite(seconds)) return DEFAULT_EXTERNAL_AUTO_STOP_MS;
+    return Math.max(0, Math.min(24 * 60 * 60, Math.floor(seconds))) * 1000;
+  }, [externalStopSeconds]);
+
+  const parseExternalCloseMs = useCallback(() => {
+    const minutes = Number(externalCloseMinutes);
+    if (!Number.isFinite(minutes)) return DEFAULT_EXTERNAL_AUTO_CLOSE_MS;
+    return Math.max(1, Math.min(7 * 24 * 60, Math.floor(minutes))) * 60_000;
+  }, [externalCloseMinutes]);
+
+  const saveExternalRunSettings = useCallback(async (collapsed = activeExternalRun?.collapsed === true) => {
+    if (!activeExternalRun) return;
+    setExternalSettingsSaving(true);
+    try {
+      const result = await ipcRenderer.invoke('web:update-external-run-settings', {
+        tabId: activeExternalRun.tabId,
+        runId: activeExternalRun.runId,
+        autoStopMs: parseExternalStopMs(),
+        autoCloseMs: parseExternalCloseMs(),
+        collapsed,
+      });
+      if (result?.ok === false) {
+        showToast(`Codex settings: ${result.error || 'не удалось сохранить'}`, 'error');
+        return;
+      }
+      showToast('Настройки external Codex обновлены', 'success');
+    } catch (e: any) {
+      showToast(`Codex settings: ${e?.message || e}`, 'error');
+    } finally {
+      setExternalSettingsSaving(false);
+    }
+  }, [activeExternalRun, parseExternalStopMs, parseExternalCloseMs, showToast]);
 
   const handleRefreshPromptSummaries = useCallback(() => {
     if (!summaryTarget || summaryRunning) return;
@@ -439,6 +561,154 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
           </span>
         </button>
         </Tooltip>
+      )}
+
+      {activeExternalRun && (
+        <div
+          ref={externalSettingsRef}
+          style={{
+            position: 'relative',
+            display: 'flex',
+            alignItems: 'center',
+            padding: '0 6px',
+          }}
+        >
+          <Tooltip content="Настройки external Codex">
+            <button
+              onClick={() => setExternalSettingsOpen((value) => !value)}
+              style={{
+                height: 22,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                padding: '0 8px',
+                borderRadius: 6,
+                border: '1px solid rgba(255,255,255,0.12)',
+                background: externalSettingsOpen ? 'rgba(56,189,248,0.14)' : 'rgba(255,255,255,0.04)',
+                color: externalSettingsOpen ? '#bae6fd' : '#9ca3af',
+                fontSize: 11,
+                fontWeight: 700,
+                cursor: 'pointer',
+                outline: 'none',
+              }}
+            >
+              <Settings2 size={12} />
+              <span>Настройки</span>
+            </button>
+          </Tooltip>
+
+          {externalSettingsOpen && (
+            <div
+              style={{
+                position: 'absolute',
+                top: 28,
+                left: 6,
+                zIndex: 80,
+                width: 260,
+                padding: 10,
+                borderRadius: 8,
+                border: '1px solid rgba(255,255,255,0.14)',
+                background: 'rgba(16,16,20,0.96)',
+                boxShadow: '0 18px 42px rgba(0,0,0,0.42)',
+                color: '#e5e7eb',
+                fontSize: 11,
+                backdropFilter: 'blur(12px)',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 9 }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <span style={{ fontWeight: 800, color: '#f8fafc' }}>External Codex</span>
+                  <span style={{ color: '#8b8b91' }}>{activeExternalRun.source || 'external'} · {activeExternalRun.status || 'starting'}</span>
+                </div>
+                <button
+                  onClick={() => saveExternalRunSettings(!(activeExternalRun.collapsed === true))}
+                  disabled={externalSettingsSaving}
+                  style={{
+                    height: 22,
+                    padding: '0 8px',
+                    borderRadius: 6,
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    background: activeExternalRun.collapsed ? 'rgba(56,189,248,0.16)' : 'rgba(255,255,255,0.05)',
+                    color: activeExternalRun.collapsed ? '#bae6fd' : '#cbd5e1',
+                    fontSize: 10,
+                    fontWeight: 750,
+                    cursor: externalSettingsSaving ? 'default' : 'pointer',
+                  }}
+                >
+                  {activeExternalRun.collapsed ? 'Развернуть' : 'Свернуть'}
+                </button>
+              </div>
+
+              <label style={{ display: 'grid', gridTemplateColumns: '1fr 74px', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+                <span style={{ color: '#cbd5e1' }}>Стоп процесса, сек</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={24 * 60 * 60}
+                  value={externalStopSeconds}
+                  onChange={(e) => setExternalStopSeconds(e.target.value)}
+                  style={{
+                    height: 24,
+                    borderRadius: 6,
+                    border: '1px solid rgba(255,255,255,0.14)',
+                    background: 'rgba(255,255,255,0.06)',
+                    color: '#f8fafc',
+                    padding: '0 7px',
+                    outline: 'none',
+                    fontSize: 11,
+                    fontVariantNumeric: 'tabular-nums',
+                  }}
+                />
+              </label>
+
+              <label style={{ display: 'grid', gridTemplateColumns: '1fr 74px', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+                <span style={{ color: '#cbd5e1' }}>Закрыть вкладку, мин</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={7 * 24 * 60}
+                  value={externalCloseMinutes}
+                  onChange={(e) => setExternalCloseMinutes(e.target.value)}
+                  style={{
+                    height: 24,
+                    borderRadius: 6,
+                    border: '1px solid rgba(255,255,255,0.14)',
+                    background: 'rgba(255,255,255,0.06)',
+                    color: '#f8fafc',
+                    padding: '0 7px',
+                    outline: 'none',
+                    fontSize: 11,
+                    fontVariantNumeric: 'tabular-nums',
+                  }}
+                />
+              </label>
+
+              <button
+                onClick={() => saveExternalRunSettings()}
+                disabled={externalSettingsSaving}
+                style={{
+                  width: '100%',
+                  height: 24,
+                  borderRadius: 6,
+                  border: '1px solid rgba(56,189,248,0.28)',
+                  background: 'rgba(56,189,248,0.13)',
+                  color: '#bae6fd',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 6,
+                  fontSize: 11,
+                  fontWeight: 800,
+                  cursor: externalSettingsSaving ? 'default' : 'pointer',
+                  opacity: externalSettingsSaving ? 0.7 : 1,
+                }}
+              >
+                <Check size={12} />
+                {externalSettingsSaving ? 'Сохраняю' : 'Сохранить'}
+              </button>
+            </div>
+          )}
+        </div>
       )}
 
       {/* Flex spacer — pushes session-copy cluster to the right edge of the toolbar */}

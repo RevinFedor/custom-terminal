@@ -10,6 +10,7 @@ interface TerminalRegistryStore {
   viewportStates: Map<string, ViewportState>;
   entryMarkers: Map<string, Map<string, TrackedEntry>>;
   promptBoundaries: Map<string, Map<number, IMarker>>;
+  promptBoundaryWaiters: Map<string, Set<(seq: number) => void>>;
   searchCallbacks: Map<string, SearchResultsCallback>;
   viewportCallbacks: Map<string, ViewportCallback>;
 }
@@ -52,10 +53,12 @@ const registryStore = ((globalThis as TerminalRegistryGlobal).__notedTerminalReg
   viewportStates: new Map<string, ViewportState>(),
   entryMarkers: new Map<string, Map<string, TrackedEntry>>(),
   promptBoundaries: new Map<string, Map<number, IMarker>>(),
+  promptBoundaryWaiters: new Map<string, Set<(seq: number) => void>>(),
   searchCallbacks: new Map<string, SearchResultsCallback>(),
   viewportCallbacks: new Map<string, ViewportCallback>(),
 });
 registryStore.terminalWaiters ||= new Map<string, Set<(terminal: XTerminal | undefined) => void>>();
+registryStore.promptBoundaryWaiters ||= new Map<string, Set<(seq: number) => void>>();
 
 const terminals = registryStore.terminals;
 const terminalWaiters = registryStore.terminalWaiters;
@@ -64,6 +67,7 @@ const searchStates = registryStore.searchStates;
 const viewportStates = registryStore.viewportStates;
 const entryMarkers = registryStore.entryMarkers;
 const promptBoundaries = registryStore.promptBoundaries;
+const promptBoundaryWaiters = registryStore.promptBoundaryWaiters;
 const searchCallbacks = registryStore.searchCallbacks;
 const viewportCallbacks = registryStore.viewportCallbacks;
 
@@ -719,7 +723,44 @@ export const terminalRegistry = {
       tabBoundaries.set(seq, marker);
       marker.onDispose(() => tabBoundaries!.delete(seq));
       console.log('[terminalRegistry] Prompt boundary #' + seq + ' at line ' + marker.line);
+      const waiters = promptBoundaryWaiters.get(tabId);
+      if (waiters) {
+        for (const resolve of Array.from(waiters)) resolve(seq);
+      }
     }
+  },
+
+  getLatestPromptBoundarySeq(tabId: string): number {
+    const tabBoundaries = promptBoundaries.get(tabId);
+    if (!tabBoundaries || tabBoundaries.size === 0) return 0;
+    return Math.max(...Array.from(tabBoundaries.keys()));
+  },
+
+  waitForPromptBoundaryAfter(tabId: string, afterSeq: number, timeoutMs = 6000): Promise<number | null> {
+    const latest = this.getLatestPromptBoundarySeq(tabId);
+    if (latest > afterSeq) return Promise.resolve(latest);
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let waiters = promptBoundaryWaiters.get(tabId);
+      if (!waiters) {
+        waiters = new Set();
+        promptBoundaryWaiters.set(tabId, waiters);
+      }
+      const finish = (seq: number | null) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        waiters!.delete(onBoundary);
+        if (waiters!.size === 0) promptBoundaryWaiters.delete(tabId);
+        resolve(seq);
+      };
+      const onBoundary = (seq: number) => {
+        if (seq > afterSeq) finish(seq);
+      };
+      const timer = window.setTimeout(() => finish(null), timeoutMs);
+      waiters.add(onBoundary);
+    });
   },
 
   // Bind a timeline entry UUID to the Nth prompt boundary marker.

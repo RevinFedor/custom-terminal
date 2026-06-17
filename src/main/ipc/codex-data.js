@@ -1641,6 +1641,38 @@ function codexLogTimeMs(row) {
   return (Number(row?.ts) || 0) * 1000 + (Number(row?.ts_nanos) || 0) / 1_000_000;
 }
 
+function codexRateResetEpoch(rateLimits, bucketName) {
+  const bucket = rateLimits?.[bucketName];
+  if (!bucket || typeof bucket !== 'object') return 0;
+  const raw = bucket.reset_at ?? bucket.resets_at ?? bucket.resetAt ?? bucket.resetsAt;
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (/^\d+$/.test(trimmed)) return Number(trimmed);
+    const parsed = Date.parse(trimmed);
+    if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
+  }
+  return 0;
+}
+
+function compareCodexRateSnapshotFreshness(next, prev) {
+  if (!prev) return 1;
+  if (!next) return -1;
+
+  const nextWeeklyReset = codexRateResetEpoch(next.rateLimits, 'secondary');
+  const prevWeeklyReset = codexRateResetEpoch(prev.rateLimits, 'secondary');
+  if (nextWeeklyReset !== prevWeeklyReset) return nextWeeklyReset - prevWeeklyReset;
+
+  const nextFiveHourReset = codexRateResetEpoch(next.rateLimits, 'primary');
+  const prevFiveHourReset = codexRateResetEpoch(prev.rateLimits, 'primary');
+  if (nextFiveHourReset !== prevFiveHourReset) return nextFiveHourReset - prevFiveHourReset;
+
+  const nextTs = Number(next.ts) || 0;
+  const prevTs = Number(prev.ts) || 0;
+  if (nextTs !== prevTs) return nextTs - prevTs;
+  return (Number(next.tsNanos) || 0) - (Number(prev.tsNanos) || 0);
+}
+
 function closestCodexIdentity(rate, identities) {
   if (!rate || !Array.isArray(identities) || identities.length === 0) return null;
   let closest = null;
@@ -1673,6 +1705,7 @@ function buildCodexUsageAccount(raw, index) {
     accountIdHint: shortCodexId(raw.accountId),
     plan_type: usage.plan_type,
     timestamp: usage.timestamp,
+    sourceThreadId: raw.threadId || null,
     source: 'codex-log',
     usage,
   };
@@ -1765,15 +1798,17 @@ async function findLatestCodexUsageAccounts({ force = false } = {}) {
       const email = accountIdentity?.email || null;
       const identity = accountId || email || `thread:${ctx.threadId}`;
       const prev = latestByIdentity.get(identity);
-      if (!prev || rate.ts > prev.ts || (rate.ts === prev.ts && rate.tsNanos > prev.tsNanos)) {
-        latestByIdentity.set(identity, {
-          accountId,
-          email,
-          rateLimits: rate.rateLimits,
-          timestamp: rate.timestamp,
-          ts: rate.ts,
-          tsNanos: rate.tsNanos,
-        });
+      const candidate = {
+        accountId,
+        email,
+        rateLimits: rate.rateLimits,
+        timestamp: rate.timestamp,
+        threadId: ctx.threadId,
+        ts: rate.ts,
+        tsNanos: rate.tsNanos,
+      };
+      if (compareCodexRateSnapshotFreshness(candidate, prev) > 0) {
+        latestByIdentity.set(identity, candidate);
       }
     }
   }
@@ -1784,7 +1819,16 @@ async function findLatestCodexUsageAccounts({ force = false } = {}) {
     .filter(Boolean);
 
   console.log('[CodexData] usage accounts scanned count=' + accounts.length +
-    ' labels=' + accounts.map((a) => a.label + ':' + (a.plan_type || 'unknown')).join(','));
+    ' labels=' + accounts.map((a) => {
+      const weekly = a.usage?.seven_day || a.usage?.secondary || null;
+      const fiveHour = a.usage?.five_hour || a.usage?.primary || null;
+      return a.label + ':' + (a.plan_type || 'unknown') +
+        ':w=' + (weekly?.utilization ?? 'null') +
+        ':5h=' + (fiveHour?.utilization ?? 'null') +
+        ':wReset=' + (weekly?.resets_at || 'null') +
+        ':5hReset=' + (fiveHour?.resets_at || 'null') +
+        ':thread=' + (shortCodexId(a.sourceThreadId) || 'none');
+    }).join(','));
   usageAccountsCache = { ts: now, accounts };
   return accounts;
 }
@@ -2020,5 +2064,6 @@ module.exports = {
     latestCodexUsageInRecords,
     findLatestCodexUsage,
     findLatestCodexUsageAccounts,
+    compareCodexRateSnapshotFreshness,
   },
 };

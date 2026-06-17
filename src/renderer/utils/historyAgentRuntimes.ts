@@ -46,6 +46,8 @@ export interface AgentSendPromptOptions {
   source?: string;
   statusAtSend?: AgentPtyStatus;
   queue?: boolean;
+  model?: string;
+  effort?: string;
 }
 
 export interface HistoryAgentRuntime {
@@ -88,7 +90,7 @@ const INTERRUPT_DEDUP_MS = 700;
 const shortTab = (tabId: string) => String(tabId || '').slice(-12) || 'unknown';
 const errorText = (e: any) => String(e?.message || e);
 
-const findTabState = (tabId: string): { aiBusy?: boolean; commandType?: string; codexSessionId?: string } | null => {
+const findTabState = (tabId: string): { aiBusy?: boolean; commandType?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string } | null => {
   const store = useWorkspaceStore.getState();
   for (const [, workspace] of store.openProjects) {
     const tab = workspace.tabs.get(tabId);
@@ -160,7 +162,38 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
   }
   useWorkspaceStore.getState().clearInterruptedState?.(tabId);
   const queue = options.queue === true;
-  console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' submitIntent=enter chars=' + prompt.length);
+  const requestedModel = typeof options.model === 'string' ? options.model.trim() : '';
+  const requestedEffort = typeof options.effort === 'string' ? options.effort.trim() : '';
+  const tabState = findTabState(tabId);
+  const modelForPicker = requestedModel && requestedModel !== 'none' ? requestedModel : (tabState?.codexModel || '');
+  const effortForPicker = requestedEffort && requestedEffort !== 'none' ? requestedEffort : '';
+  console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' model=' + (modelForPicker || '-') + ' effort=' + (effortForPicker || '-') + ' submitIntent=enter chars=' + prompt.length);
+  if (options.statusAtSend !== 'busy' && modelForPicker) {
+    const currentModel = tabState?.codexModel || '';
+    const currentEffort = tabState?.codexEffort || '';
+    const needsPicker = modelForPicker !== currentModel || (!!effortForPicker && effortForPicker !== currentEffort);
+    if (needsPicker) {
+      const pickerResult = await ipcRenderer.invoke('codex:select-model-effort', {
+        tabId,
+        model: modelForPicker,
+        effort: effortForPicker || undefined,
+        hasDraft: false,
+        draftSource: 'external-send',
+        draftPreview: '',
+        visualHasDraft: false,
+        visualSource: 'external-send',
+        visualPreview: '',
+      });
+      if (pickerResult?.success === false) {
+        console.warn('[CodexHistoryActions:send] picker failed tab=' + shortTab(tabId) + ' error=' + (pickerResult?.error || 'unknown'));
+        return { success: false, error: pickerResult?.error || 'model effort switch failed' };
+      }
+      useWorkspaceStore.getState().updateCodexState(tabId, {
+        codexModel: pickerResult?.model || modelForPicker,
+        ...(effortForPicker ? { codexEffort: pickerResult?.effort || effortForPicker } : {}),
+      });
+    }
+  }
   const work = ipcRenderer.invoke('codex:send-command', tabId, prompt, {
     queue,
     handoffId: options.handoffId || null,

@@ -131,6 +131,7 @@ const pendingBridge = new Map();
 const externalRuns = new Map();      // runId -> run metadata
 const externalRunByTabId = new Map(); // tabId -> runId
 const externalRunByConversationKey = new Map(); // conversationKey -> runId
+const DEFAULT_EXTERNAL_AUTO_CLOSE_MS = 15 * 60 * 1000;
 
 function shortId(value, len = 8) {
   const s = value == null ? '' : String(value);
@@ -148,9 +149,35 @@ function clampAutoStopMs(value) {
   return Math.max(0, Math.min(24 * 60 * 60 * 1000, Math.floor(n)));
 }
 
+function clampAutoCloseMs(value) {
+  if (value == null || value === '') return DEFAULT_EXTERNAL_AUTO_CLOSE_MS;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return DEFAULT_EXTERNAL_AUTO_CLOSE_MS;
+  return Math.max(0, Math.min(7 * 24 * 60 * 60 * 1000, Math.floor(n)));
+}
+
 function setExternalRunMeta(tabId, meta) {
   if (!tabId || !meta) return;
   bridgeRequest('setExternalRunMeta', { tabId, meta }, 1500).catch(() => {});
+}
+
+function clearExternalRunTimer(run, key) {
+  if (!run?.[key]) return;
+  clearTimeout(run[key]);
+  run[key] = null;
+}
+
+function cleanupExternalRun(run) {
+  if (!run) return;
+  clearExternalRunTimer(run, 'stopTimer');
+  clearExternalRunTimer(run, 'closeTimer');
+  if (run.tabId && externalRunByTabId.get(run.tabId) === run.runId) {
+    externalRunByTabId.delete(run.tabId);
+  }
+  if (run.conversationKey && externalRunByConversationKey.get(run.conversationKey) === run.runId) {
+    externalRunByConversationKey.delete(run.conversationKey);
+  }
+  if (run.runId) externalRuns.delete(run.runId);
 }
 
 async function waitForAgentReady(tabId, timeoutMs = 20_000) {
@@ -206,7 +233,7 @@ function scheduleExternalRunStop(run, reason = 'auto-stop') {
   if (!run || !run.tabId) return;
   const autoStopMs = clampAutoStopMs(run.autoStopMs);
   if (autoStopMs < 0) return;
-  if (run.stopTimer) clearTimeout(run.stopTimer);
+  clearExternalRunTimer(run, 'stopTimer');
   const stopAt = Date.now() + autoStopMs;
   run.autoStopAt = stopAt;
   setExternalRunMeta(run.tabId, { status: run.status || 'done', autoStopAt: stopAt, autoStopMs });
@@ -223,6 +250,37 @@ function scheduleExternalRunStop(run, reason = 'auto-stop') {
       setExternalRunMeta(run.tabId, { status: 'stop_failed', autoStopAt: null, stopError: String(e.message || e) });
     }
   }, autoStopMs);
+}
+
+function scheduleExternalRunClose(run, reason = 'auto-close') {
+  if (!run || !run.tabId) return;
+  const autoCloseMs = clampAutoCloseMs(run.autoCloseMs);
+  clearExternalRunTimer(run, 'closeTimer');
+  if (autoCloseMs <= 0) {
+    run.autoCloseAt = null;
+    setExternalRunMeta(run.tabId, { autoCloseAt: null, autoCloseMs });
+    return;
+  }
+  const closeAt = Date.now() + autoCloseMs;
+  run.autoCloseAt = closeAt;
+  setExternalRunMeta(run.tabId, { autoCloseAt: closeAt, autoCloseMs });
+  run.closeTimer = setTimeout(async () => {
+    try {
+      run.status = 'closing';
+      setExternalRunMeta(run.tabId, { status: 'closing', autoCloseAt: null, autoCloseMs, closeReason: reason });
+      await bridgeRequest('closeTab', { tabId: run.tabId, aiBusyOverride: false }, 8000);
+      cleanupExternalRun(run);
+    } catch (e) {
+      run.status = 'close_failed';
+      setExternalRunMeta(run.tabId, { status: 'close_failed', autoCloseAt: null, closeError: String(e.message || e) });
+    }
+  }, autoCloseMs);
+}
+
+function scheduleExternalRunCompletionTimers(run, reason = 'turn-done') {
+  if (!run || !run.tabId) return;
+  scheduleExternalRunStop(run, reason);
+  scheduleExternalRunClose(run, reason);
 }
 
 function summarizeStreamMessage(message) {
@@ -1276,10 +1334,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const source = cleanOptionalString(body.source, 'external-api');
       const conversationKey = cleanOptionalString(body.conversationKey || body.chatId, '');
       const autoStopMs = clampAutoStopMs(body.autoStopMs);
+      const autoCloseMs = clampAutoCloseMs(body.autoCloseMs);
       const startupTimeoutMs = Math.max(5_000, Math.min(120_000, Number(body.startupTimeoutMs) || 20_000));
       const developerInstructions = cleanOptionalString(body.developerInstructions || body.systemPrompt, '');
       const startedAt = Date.now();
       const autoStopAt = autoStopMs > 0 ? null : null;
+      const autoCloseAt = null;
       await bridgeRequest('ensureInboxProject', {}, 5000);
       let tabId = null;
       let sessionId = null;
@@ -1289,10 +1349,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         const prevRun = externalRuns.get(prevRunId);
         if (prevRun?.tabId) {
           try {
-            if (prevRun.stopTimer) {
-              clearTimeout(prevRun.stopTimer);
-              prevRun.stopTimer = null;
-            }
+            clearExternalRunTimer(prevRun, 'stopTimer');
+            clearExternalRunTimer(prevRun, 'closeTimer');
             const prevStatus = await bridgeRequest('getClaudeTabStatus', { tabId: prevRun.tabId }, 2000);
             if (prevStatus?.toolType === 'codex') {
               tabId = prevRun.tabId;
@@ -1315,6 +1373,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         startedAt,
         autoStopAt,
         autoStopMs,
+        autoCloseAt,
+        autoCloseMs,
+        collapsed: body.collapsed === true,
       };
       if (!tabId) {
         const tab = await bridgeRequest('createAgentTab', {
@@ -1329,7 +1390,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         tabId = tab?.tabId;
         if (!tabId) return sendJson(res, 500, { error: 'failed to create tab' });
       }
-      const run = { ...externalRun, tabId, sessionId, stopTimer: null };
+      const run = { ...externalRun, tabId, sessionId, stopTimer: null, closeTimer: null };
       externalRuns.set(runId, run);
       externalRunByTabId.set(tabId, runId);
       if (conversationKey) externalRunByConversationKey.set(conversationKey, runId);
@@ -1345,10 +1406,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
       sessionId = status?.sessionId || status?.codexSessionId || sessionId || null;
       run.status = 'sending';
       run.sessionId = sessionId;
-      setExternalRunMeta(tabId, { status: 'sending', sessionId, autoStopAt: null });
+      setExternalRunMeta(tabId, { status: 'sending', sessionId, autoStopAt: null, autoCloseAt: null });
       const sendResult = await bridgeRequest('sendMessageAuto', {
         tabId,
         prompt,
+        model: cleanOptionalString(body.model, ''),
+        effort: cleanOptionalString(body.effort, ''),
         source: 'external:' + source,
         statusAtSend: status?.status || 'active',
         queue: body.queue === true,
@@ -1359,7 +1422,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         return sendJson(res, 409, { ok: false, runId, tabId, sessionId, error: sendResult.error || 'send failed' });
       }
       run.status = 'running';
-      setExternalRunMeta(tabId, { status: 'running', sessionId, autoStopAt: null, autoStopMs });
+      setExternalRunMeta(tabId, { status: 'running', sessionId, autoStopAt: null, autoStopMs, autoCloseAt: null, autoCloseMs });
       return sendJson(res, 200, {
         ok: true,
         runId,
@@ -1371,6 +1434,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         eventsUrl: '/api/events?tabId=' + encodeURIComponent(tabId),
         stopUrl: '/api/inbox/runs/' + encodeURIComponent(runId) + '/stop',
         autoStopMs,
+        autoCloseMs,
         reused,
       });
     } catch (e) {
@@ -1384,13 +1448,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const run = externalRuns.get(runId);
     if (!run?.tabId) return sendJson(res, 404, { error: 'run not found' });
     try {
-      if (run.stopTimer) clearTimeout(run.stopTimer);
+      clearExternalRunTimer(run, 'stopTimer');
       run.status = 'stopping';
       setExternalRunMeta(run.tabId, { status: 'stopping', autoStopAt: null });
       const data = await bridgeRequest('stopClaudeTab', { tabId: run.tabId }, 5000);
       run.status = 'stopped';
       run.stoppedAt = Date.now();
       setExternalRunMeta(run.tabId, { status: 'stopped', stoppedAt: run.stoppedAt, autoStopAt: null, stopReason: 'api' });
+      scheduleExternalRunClose(run, 'api-stop');
       return sendJson(res, 200, { ok: true, runId, tabId: run.tabId, stopped: true, ...data });
     } catch (e) {
       return sendJson(res, 500, { ok: false, runId, error: String(e.message || e) });
@@ -2048,6 +2113,7 @@ function webBroadcast(tabId, payload) {
           completedAt: run.completedAt,
           sessionId: run.sessionId || null,
           autoStopMs: run.autoStopMs,
+          autoCloseMs: run.autoCloseMs,
         });
       } else if (type === 'message' && run.status === 'sending') {
         run.status = 'running';
@@ -2078,7 +2144,7 @@ function webBroadcast(tabId, payload) {
   }
   if (run && type === 'done') {
     try {
-      scheduleExternalRunStop(run, 'turn-done');
+      scheduleExternalRunCompletionTimers(run, 'turn-done');
     } catch (e) {
       console.warn('[WebBcast:StopScheduleError] tab=' + shortId(tabId, 12) + ' run=' + runId + ' error=' + (e?.message || String(e)));
     }
@@ -2464,4 +2530,59 @@ function getInfo() {
   };
 }
 
-module.exports = { start, stop, webBroadcast, broadcastProjectActivity, getInfo, notifyClaudeSessionAvailable };
+function updateExternalRunSettings(payload = {}) {
+  const tabId = cleanOptionalString(payload.tabId, '');
+  const runId = cleanOptionalString(payload.runId, '') || (tabId ? externalRunByTabId.get(tabId) : '');
+  const run = runId ? externalRuns.get(runId) : null;
+  if (!run?.tabId) return { ok: false, error: 'run not found' };
+
+  if (Object.prototype.hasOwnProperty.call(payload, 'autoStopMs')) {
+    run.autoStopMs = clampAutoStopMs(payload.autoStopMs);
+  } else {
+    run.autoStopMs = clampAutoStopMs(run.autoStopMs);
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'autoCloseMs')) {
+    run.autoCloseMs = clampAutoCloseMs(payload.autoCloseMs);
+  } else {
+    run.autoCloseMs = clampAutoCloseMs(run.autoCloseMs);
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'collapsed')) {
+    run.collapsed = payload.collapsed === true;
+  }
+
+  clearExternalRunTimer(run, 'stopTimer');
+  clearExternalRunTimer(run, 'closeTimer');
+  run.autoStopAt = null;
+  run.autoCloseAt = null;
+
+  const meta = {
+    runId: run.runId,
+    tabId: run.tabId,
+    status: run.status,
+    autoStopMs: run.autoStopMs,
+    autoStopAt: null,
+    autoCloseMs: run.autoCloseMs,
+    autoCloseAt: null,
+    collapsed: !!run.collapsed,
+  };
+  setExternalRunMeta(run.tabId, meta);
+
+  if (run.status === 'done' || run.status === 'idle') {
+    scheduleExternalRunCompletionTimers(run, 'settings');
+  } else if (run.status === 'stopped' || run.status === 'stop_failed') {
+    scheduleExternalRunClose(run, 'settings');
+  }
+
+  return {
+    ok: true,
+    runId: run.runId,
+    tabId: run.tabId,
+    externalRun: {
+      ...meta,
+      autoStopAt: run.autoStopAt || null,
+      autoCloseAt: run.autoCloseAt || null,
+    },
+  };
+}
+
+module.exports = { start, stop, webBroadcast, broadcastProjectActivity, getInfo, updateExternalRunSettings, notifyClaudeSessionAvailable };

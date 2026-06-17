@@ -30,22 +30,24 @@
 
 ## Related Repositories
 
-- [AI Mac Electron](https://github.com/RevinFedor/ai-mac-electron) — macOS companion app for system dictation, desktop Gemini chat, prompt library, and the Voice Record REST/SSE API used by the iOS client.
+- [AI Mac Electron](https://github.com/RevinFedor/ai-mac-electron) — macOS companion app for system dictation, desktop Gemini chat, prompt library, and a Codex provider that delegates terminal execution to Noted Terminal Inbox.
 - [Main iOS App](https://github.com/RevinFedor/main-ios-app) — native iPhone control surface for Noted Terminal projects/tabs and AI Mac Electron chat/voice workflows.
 
 ---
 
 ## Что это
 
-Noted Terminal запускает настоящие локальные AI CLI в терминале и превращает их в управляемые сессии: внешний агент или мобильный клиент может создать вкладку, запустить Claude/Codex, отправить prompt, остановить turn/process, прочитать историю и сделать fork/edit без переписывания собственного terminal parser.
+Noted Terminal запускает настоящие локальные AI CLI в терминале и превращает их в управляемые сессии: внешний агент, мобильный клиент или другое desktop-приложение может создать вкладку, запустить Claude/Codex, отправить prompt, остановить turn/process, прочитать историю и сделать fork/edit без переписывания собственного terminal parser.
 
 Главная ценность не в UI-оболочке, а в готовом слое управления:
 
 - **PTY/TUI control:** безопасная доставка prompt/slash-команд в живой `claude`/`codex`, без `claude -p` как основного пути.
 - **Structured history:** Claude JSONL и Codex rollout парсятся в Timeline/History, а не в сырой terminal scrollback.
 - **MCP API:** внешние AI-клиенты управляют вкладками и читают/редактируют историю через MCP.
-- **Mobile REST/SSE API:** телефон и нативные клиенты используют тот же backend, что desktop UI.
+- **Mobile / external REST/SSE API:** телефон, Voice Record и нативные клиенты используют тот же backend, что desktop UI.
 - **Event-driven status:** завершение turn'а, prompt-ready, CWD, session id и context% берутся из событий/транскриптов; таймеры только fallback.
+
+Ключевая архитектурная философия: внешний клиент владеет своим UI и пользовательским transcript, а Noted Terminal владеет живым terminal runtime. Например, Voice Record может показать Codex как provider в обычном чате, но Codex-процесс, session id, rollout, Timeline/History, readiness и Stop/Continue живут в Noted Terminal Inbox. HTTP/SSE слой здесь не заменяет терминал SDK-обёрткой, а даёт control-plane над настоящей PTY-сессией. Поэтому completion для внешних клиентов — это событие `done` от Noted Terminal, а не локальная догадка по `busy:false` или таймеру.
 
 Подробнее по продуктовой рамке:
 
@@ -121,6 +123,9 @@ Mobile API уже используется web/mobile клиентами и на
 
 ```text
 GET  /api/projects
+GET  /api/inbox
+POST /api/inbox/runs                   # external Codex run in system Inbox
+POST /api/inbox/runs/:runId/stop
 GET  /api/projects/:id/tabs
 POST /api/projects/:id/agent-tabs        { toolType: "claude" | "codex" }
 POST /api/sdk-tabs/:tabId/send
@@ -158,7 +163,7 @@ the same Mac server and is not required for local testing.
 - REST/SSE backend: [src/main/web-server.js](src/main/web-server.js)
 - renderer bridge actions: [src/renderer/App.tsx](src/renderer/App.tsx)
 - mobile frontend: [mobile-web/](mobile-web/)
-- docs: [docs/knowledge/fact-mobile-web.md](docs/knowledge/fact-mobile-web.md), [docs/knowledge/fact-mobile-claude-pty.md](docs/knowledge/fact-mobile-claude-pty.md)
+- docs: [docs/knowledge/fact-mobile-web.md](docs/knowledge/fact-mobile-web.md), [docs/knowledge/fact-mobile-claude-pty.md](docs/knowledge/fact-mobile-claude-pty.md), [docs/knowledge/fact-codex.md](docs/knowledge/fact-codex.md)
 
 ### 4. Core source map
 
@@ -185,6 +190,8 @@ the same Mac server and is not required for local testing.
 3. Написать prompt в desktop History/agent input.
 4. Показать, что mobile side получает тот же turn через REST/SSE: user message, busy, assistant output, status/context.
 5. Нажать mobile interrupt/stop/resume или поменять params — desktop остаётся источником живого процесса, mobile только внешний клиент.
+
+Внешний desktop-клиент показывает тот же принцип без телефона: Voice Record отправляет Codex prompt в `/api/inbox/runs`, получает SSE и сохраняет ответ в своей истории, а Noted Terminal держит Inbox-вкладку, PTY, rollout и auto-stop. Это и есть intended split: внешний продукт может быть отдельным UX, но не должен становиться владельцем Codex internals.
 
 Это демонстрирует главное: API уже существует и используется реальным вторым клиентом. Мобилка не парсит терминальный экран и не запускает свой Claude; она ходит в backend Noted Terminal, который сам владеет PTY, JSONL/rollout parsing, session status и history.
 

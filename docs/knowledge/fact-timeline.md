@@ -327,6 +327,8 @@ Codex Timeline грузится через `codex:get-timeline`, а HistoryPanel
 4. **Preview:** HistoryPanel временно показывает историю как срез до выбранной точки + локальный жёлтый marker `I REWOUND`. Target user-row в этом preview не рендерится второй раз: он уже представлен marker'ом и текстом в textarea. Пока пользователь не отправил prompt из History input, JSONL не изменён и после restart/reopen вернётся полная исходная история.
 5. **AI-варианты:** AI compact и post-prompt кнопки используют тот же native selection handler, но добавляют явный post-action. Default `Откатиться` не запускает Gemini/compact и не делает auto-submit.
 
+Для Claude same-prefix prompts Timeline обязан передавать полный normalized target, а не только видимый prefix: TUI может показывать соседние записи одной строкой с одинаковым началом, и короткий ключ выберет неверный дубликат. Успех от main означает не «строка target подсвечена», а «доказана commit-позиция picker'а и post-grab text совпал с target». Если main возвращает restored-input mismatch/empty с `rollbackMayHaveApplied`, History перечитывает состояние и показывает failure, а не зелёный done marker.
+
 **Codex отличается:** Timeline тоже отдаёт действие в native TUI, но это backtrack overlay, а не Claude `/rewind` preview. Перед `Enter` main сравнивает выбранный overlay text с target prompt; при несовпадении закрывает overlay через `q`, потому что `Escape` внутри overlay может означать «edit prev». После успешного `thread_rolled_back` rollout JSONL уже откатан, поэтому History/Timeline перечитывают durable state и не держат постоянный `I REWOUND` marker как у Claude preview.
 
 **Scroll Stabilization (Авто-скролл):**

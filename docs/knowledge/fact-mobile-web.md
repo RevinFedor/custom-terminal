@@ -183,6 +183,26 @@ command, Codex rollout `task_started`, SDK query, Gemini busy); ordinary shell c
 находится в custom-terminal — его держит Voice Record, потому что `build:install` закрывает
 Noted Terminal и управляющий HTTP-сервер цели может исчезнуть в середине операции.
 
+Native iOS Terminal transcript не должен рендерить REST history как «готовый список строк».
+`/history` может вернуть 80 entries, но внутри будут tool results по 40k символов и compact
+summary по 200k; если положить этот raw text в row body/diff/measurement, телефон фризит даже
+без Timeline. Контракт native-клиента: сначала материализовать bounded display model
+(preview, stable id, line-count/raw length, display kind), а полный payload хранить side-store
+по entry id и доставать только для full sheet или явного раскрытия user prompt. Tool/bash/MCP
+rows в transcript остаются стабильной высоты и открывают full sheet по tap; user prompt может
+иметь inline `Show more`/`Show less`, но tap по самому prompt тоже открывает sheet с нативным
+выделением текста. Счётчик справа у tool rows — строки, не payload chars: пользователь решает
+«насколько большой вывод», а не отлаживает raw JSON size.
+
+Для длинной истории native iOS грузит хвост (`last=80`) и расширяет окно вверх
+инкрементально (`80 -> 160 -> 240...`). При таком prepend нельзя сохранять абсолютный
+`contentOffset`: новые rows появляются выше, и старый offset начинает указывать на другой
+логический текст. Перед reload клиент сохраняет первую видимую entry + delta от верхней
+границы viewport, после reload восстанавливает эту же entry в той же точке экрана и повторяет
+restore после self-sizing settle. Timeline в этом режиме префетчится при входе в чат; jump к
+старой точке может загрузить around-target slice, закрыть drawer, проскроллить table к anchor и
+коротко подсветить target row. Шрам и canary-логи: [`fix-ios-скролл-фриз.md`](fix-ios-скролл-фриз.md).
+
 ## Self-healing busy reconciliation (loader никогда не залипает навсегда)
 
 **Проблема.** Мобильный loader («thinking…») управляется SSE-событиями `busy`/`done`. Но если `busy:false`/`done` **потерялся** — turn закончился путём, который не сделал `_webBroadcast busy:false` (например: на десктопе юзер **отклонил** AskUserQuestion → «Request interrupted by user for tool use» → turn оборвался через aborted_streaming), SSE-фрейм дропнулся, ИЛИ баг в самом мобильном коде неверно затрекал busy — phone **залипает** на «thinking…» навсегда. Юзер: *«нажал ⏺ → declined → но на мобилке всё равно идёт thinking… хотя thinking нет; нужен фолбэк, чтобы мобилка подхватывала реальное состояние с продакшена»*.
