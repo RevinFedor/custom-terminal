@@ -9082,6 +9082,61 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     return String(text || '').replace(/\s+/g, ' ').trim();
   }
 
+  function stripCodexRewindOverlayChrome(clean) {
+    return normalizeCandidate(String(clean || '')
+      .replace(/\/\s*T\s*R\s*A\s*N\s*S\s*C\s*R\s*I\s*P\s*T\s*\/[\s/\\|_-]*/gi, ' ')
+      .replace(/[─━-]{10,}\s*\d+%\s*[─━-]{0,}/g, ' ')
+      .replace(/↑\/↓\s+to\s+scroll.*$/gmi, ' ')
+      .replace(/pgup\/pgdn\s+to\s+page.*$/gmi, ' ')
+      .replace(/home\/end\s+to\s+jump.*$/gmi, ' ')
+      .replace(/q\s+to\s+quit.*$/gmi, ' ')
+      .replace(/esc\/←\s+to\s+edit\s+prev.*$/gmi, ' ')
+      .replace(/→\s+to\s+edit\s+next.*$/gmi, ' ')
+      .replace(/enter\s+to\s+edit\s+message.*$/gmi, ' ')
+      .replace(/\bgpt-[^\n]*Context\s+\d+%[^\n]*/gi, ' '));
+  }
+
+  function buildCodexRewindAnchors(expectedText) {
+    const normalized = normalizeCandidate(expectedText);
+    const anchors = [];
+    const seen = new Set();
+    const push = (value) => {
+      const anchor = normalizeCandidate(value);
+      if (anchor.length < 24 || seen.has(anchor)) return;
+      seen.add(anchor);
+      anchors.push(anchor);
+    };
+    push(normalized.slice(0, 96));
+    push(normalized.slice(0, 56));
+    if (normalized.length <= 140) push(normalized);
+
+    const words = normalized.split(/\s+/).filter(Boolean);
+    for (const size of [12, 10, 8, 6]) {
+      if (words.length < size) continue;
+      const step = Math.max(2, Math.floor(size / 2));
+      for (let i = 0; i <= words.length - size; i += step) {
+        const phrase = words.slice(i, i + size).join(' ');
+        if (phrase.length >= 48) push(phrase);
+      }
+    }
+    return anchors;
+  }
+
+  function matchCodexRewindOverlayFrame(frame, expectedText) {
+    const clean = String(frame?.clean || '');
+    const visible = stripCodexRewindOverlayChrome(clean);
+    const anchors = buildCodexRewindAnchors(expectedText);
+    const matchedAnchor = anchors.find(anchor => visible.includes(anchor));
+    return {
+      matched: !!matchedAnchor,
+      anchor: matchedAnchor || '',
+      visiblePreview: visible.slice(0, 220),
+      targetPreview: normalizeCandidate(expectedText).slice(0, 220),
+      visibleLength: visible.length,
+      rawLength: String(frame?.raw || '').length,
+    };
+  }
+
   function codexFrameLooksLikePrompt(clean, raw) {
     return raw.includes(CODEX_SYNC_MARKER)
       || /Context\s+\d+%/i.test(clean)
@@ -9236,8 +9291,8 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       }
 
       const olderSteps = Math.max(0, count - 1 - idx);
-      const rollbackTurns = count - idx;
-      const escPressCount = 2 + olderSteps;
+      let rollbackTurns = count - idx;
+      let escPressCount = 2 + olderSteps;
       console.log('[Codex:Rewind] Starting native backtrack tab=' + String(tabId).slice(-12)
         + ' targetIndex=' + idx
         + ' count=' + count
@@ -9300,37 +9355,95 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         return { success: false, error: 'codex_rewind_transcript_not_observed', clean: openFrame.clean.slice(0, 800) };
       }
 
-      if (olderSteps > 0) {
-        console.log('[Codex:Rewind] Navigating older with Left Arrow x' + olderSteps);
-        let lastNavFrame = null;
-        for (let step = 0; step < olderSteps; step++) {
+      let selectedOlderSteps = null;
+      let selectedMatch = matchCodexRewindOverlayFrame(openFrame, targetInputText);
+      let duplicatesRemaining = Math.max(0, Number(skipDuplicates || 0));
+      const maxOlderSteps = Math.min(count - 1, Math.max(olderSteps + 8, olderSteps, duplicatesRemaining + 8));
+      console.log('[Codex:Rewind] overlay match step=0/' + maxOlderSteps
+        + ' matched=' + selectedMatch.matched
+        + ' duplicatesRemaining=' + duplicatesRemaining
+        + ' anchor=' + JSON.stringify(selectedMatch.anchor.slice(0, 80))
+        + ' visible=' + JSON.stringify(selectedMatch.visiblePreview.slice(0, 160))
+        + ' target=' + JSON.stringify(selectedMatch.targetPreview.slice(0, 160)));
+      if (selectedMatch.matched) {
+        if (duplicatesRemaining > 0) {
+          duplicatesRemaining--;
+          console.log('[Codex:Rewind] overlay target duplicate at step=0 skipped, remaining=' + duplicatesRemaining);
+        } else {
+          selectedOlderSteps = 0;
+        }
+      }
+
+      if (selectedOlderSteps === null && maxOlderSteps > 0) {
+        console.log('[Codex:Rewind] Navigating older with Left Arrow search max=' + maxOlderSteps + ' planned=' + olderSteps);
+        for (let step = 1; step <= maxOlderSteps; step++) {
           const navFrame = await sendCodexKeyAndCapture(
             term,
             '\x1b[D',
             2600,
-            '[Codex:Rewind:nav:left#' + (step + 1),
+            '[Codex:Rewind:nav:left#' + step,
             (clean, raw) => raw.includes(CODEX_SYNC_MARKER)
               || /enter to edit message|edit prev|edit next|Context\s+\d+%/i.test(clean)
           );
-          lastNavFrame = navFrame;
-          console.log('[Codex:Rewind] nav left step=' + (step + 1) + '/' + olderSteps
+          selectedMatch = matchCodexRewindOverlayFrame(navFrame, targetInputText);
+          console.log('[Codex:Rewind] nav left step=' + step + '/' + maxOlderSteps
+            + ' planned=' + olderSteps
             + ' timedOut=' + navFrame.timedOut
             + ' raw=' + navFrame.raw.length + 'B'
-            + ' clean=' + JSON.stringify(navFrame.clean.slice(0, 220)));
+            + ' matched=' + selectedMatch.matched
+            + ' duplicatesRemaining=' + duplicatesRemaining
+            + ' anchor=' + JSON.stringify(selectedMatch.anchor.slice(0, 80))
+            + ' visible=' + JSON.stringify(selectedMatch.visiblePreview.slice(0, 160)));
           if (navFrame.timedOut) {
             try { term.write('q'); } catch {}
             return {
               success: false,
               error: 'codex_rewind_navigation_timeout',
               rollbackTurns,
-              pressCount: escPressCount,
+              pressCount: 2 + step,
               clean: navFrame.clean.slice(0, 800),
+              rollbackMayHaveApplied: false,
             };
+          }
+          if (selectedMatch.matched) {
+            if (duplicatesRemaining > 0) {
+              duplicatesRemaining--;
+              console.log('[Codex:Rewind] overlay target duplicate at step=' + step + ' skipped, remaining=' + duplicatesRemaining);
+            } else {
+              selectedOlderSteps = step;
+              break;
+            }
           }
           await drainPtyData(term, 20, 120);
         }
-        console.log('[Codex:Rewind] nav complete lastClean=' + JSON.stringify(String(lastNavFrame?.clean || '').slice(0, 260)));
       }
+
+      if (selectedOlderSteps === null) {
+        console.warn('[Codex:Rewind] target not selected before Enter plannedOlderSteps=' + olderSteps
+          + ' searchedOlderSteps=' + maxOlderSteps
+          + ' visiblePreview=' + JSON.stringify(selectedMatch.visiblePreview)
+          + ' targetPreview=' + JSON.stringify(selectedMatch.targetPreview));
+        try {
+          term.write('q');
+          await drainPtyData(term, 120, 500);
+        } catch {}
+        return {
+          success: false,
+          error: 'codex_rewind_target_not_selected_before_enter',
+          rollbackTurns,
+          pressCount: 2 + maxOlderSteps,
+          rollbackMayHaveApplied: false,
+          visiblePreview: selectedMatch.visiblePreview,
+          targetPreview: selectedMatch.targetPreview,
+        };
+      }
+
+      rollbackTurns = selectedOlderSteps + 1;
+      escPressCount = 2 + selectedOlderSteps;
+      console.log('[Codex:Rewind] selected target before Enter olderSteps=' + selectedOlderSteps
+        + ' plannedOlderSteps=' + olderSteps
+        + ' rollbackTurns=' + rollbackTurns
+        + ' anchor=' + JSON.stringify(selectedMatch.anchor.slice(0, 120)));
 
       console.log('[Codex:Rewind] Confirming backtrack with Enter');
       const targetNeedle = normalizeCandidate(targetInputText).slice(0, 40);
