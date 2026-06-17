@@ -669,6 +669,7 @@ const geminiActiveTabs = new Set();        // tabs with active Gemini process (f
 const activityOpenIntervals = new Map();   // tabId \u2192 { startTs, engine, projectId, projectPath, projectName, tabName, sessionId }
 let projectActivityBroadcastTimer = null;
 const projectLayoutChangedIds = new Set();
+let projectOrderChanged = false;
 
 // Resolve a denormalized identity snapshot for a tab at this instant. Works for
 // PTY tabs (terminalProjectIds live map \u2192 SQLite fallback) and SDK tabs
@@ -976,6 +977,7 @@ function computeProjectActivity() {
       .filter((p) => p.count > 0 || p.streaming)
       .sort((a, b) => String(a.projectId).localeCompare(String(b.projectId))),
     layoutChangedProjectIds: Array.from(projectLayoutChangedIds),
+    projectOrderChanged,
     ts: Date.now(),
   };
 }
@@ -988,11 +990,17 @@ function scheduleProjectActivityBroadcast(reason = 'event') {
       require(path.join(srcMainDir, 'web-server')).broadcastProjectActivity(reason);
     } catch {}
     projectLayoutChangedIds.clear();
+    projectOrderChanged = false;
   }, 80);
 }
 
 function scheduleProjectLayoutBroadcast(projectId, reason = 'tab-layout') {
   if (projectId) projectLayoutChangedIds.add(projectId);
+  scheduleProjectActivityBroadcast(reason);
+}
+
+function scheduleProjectOrderBroadcast(reason = 'project-order') {
+  projectOrderChanged = true;
   scheduleProjectActivityBroadcast(reason);
 }
 
@@ -9041,8 +9049,9 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
 
 // Codex rewind through the native TUI backtrack flow.
 // Codex does not expose `/rewind`: Esc primes backtrack, the second Esc opens
-// the transcript overlay at the latest user prompt, further Esc presses step to
-// older user prompts, Enter submits `ThreadRollback { num_turns }`.
+// the transcript overlay at the latest user prompt. Inside the overlay Codex's
+// footer advertises "esc/← to edit prev" and "→ to edit next"; use Left Arrow
+// for programmatic navigation so Esc remains only the open/prime key.
 // After Codex prefills its composer, we move that text into History input via
 // the existing Ctrl+G grab path so terminal composer stays empty.
 ipcMain.handle('codex:open-history-menu', async (_event, {
@@ -9292,21 +9301,35 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       }
 
       if (olderSteps > 0) {
-        console.log('[Codex:Rewind] Navigating older with Esc x' + olderSteps);
-        const navCapture = captureCodexFrame(term, {
-          timeoutMs: Math.min(7000, Math.max(1800, olderSteps * 80)),
-          logPrefix: '[Codex:Rewind:nav]',
-          predicate: (clean, raw) => raw.includes(CODEX_SYNC_MARKER) || /Context\s+\d+%/i.test(clean),
-        });
-        let remaining = olderSteps;
-        while (remaining > 0) {
-          const batch = Math.min(remaining, 80);
-          term.write('\x1b'.repeat(batch));
-          remaining -= batch;
-          if (remaining > 0) await drainPtyData(term, 10, 80);
+        console.log('[Codex:Rewind] Navigating older with Left Arrow x' + olderSteps);
+        let lastNavFrame = null;
+        for (let step = 0; step < olderSteps; step++) {
+          const navFrame = await sendCodexKeyAndCapture(
+            term,
+            '\x1b[D',
+            2600,
+            '[Codex:Rewind:nav:left#' + (step + 1),
+            (clean, raw) => raw.includes(CODEX_SYNC_MARKER)
+              || /enter to edit message|edit prev|edit next|Context\s+\d+%/i.test(clean)
+          );
+          lastNavFrame = navFrame;
+          console.log('[Codex:Rewind] nav left step=' + (step + 1) + '/' + olderSteps
+            + ' timedOut=' + navFrame.timedOut
+            + ' raw=' + navFrame.raw.length + 'B'
+            + ' clean=' + JSON.stringify(navFrame.clean.slice(0, 220)));
+          if (navFrame.timedOut) {
+            try { term.write('q'); } catch {}
+            return {
+              success: false,
+              error: 'codex_rewind_navigation_timeout',
+              rollbackTurns,
+              pressCount: escPressCount,
+              clean: navFrame.clean.slice(0, 800),
+            };
+          }
+          await drainPtyData(term, 20, 120);
         }
-        const navFrame = await navCapture;
-        console.log('[Codex:Rewind] nav complete timedOut=' + navFrame.timedOut + ' raw=' + navFrame.raw.length + 'B clean=' + JSON.stringify(navFrame.clean.slice(0, 260)));
+        console.log('[Codex:Rewind] nav complete lastClean=' + JSON.stringify(String(lastNavFrame?.clean || '').slice(0, 260)));
       }
 
       console.log('[Codex:Rewind] Confirming backtrack with Enter');
@@ -9374,6 +9397,9 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         + ' matchedTarget=' + grabResult.matchedTarget
         + ' attempt=' + grabResult.attempt);
       if (!grabResult.matchedTarget) {
+        console.warn('[Codex:Rewind] restored input mismatch restoredPreview='
+          + JSON.stringify(String(grabResult.text || '').slice(0, 180))
+          + ' targetPreview=' + JSON.stringify(targetInputText.slice(0, 180)));
         if (hasPasteAfter) {
           const recovered = await recoverCodexAiPasteAfterFailedGrab(grabResult, 'mismatch');
           if (recovered?.success) {
@@ -10010,6 +10036,11 @@ ipcMain.handle('project:save-tab-groups', (event, { projectId, groups }) => {
 
 ipcMain.handle('project:layout-changed', (event, { projectId, reason }) => {
   scheduleProjectLayoutBroadcast(projectId, reason || 'tab-layout');
+  return { success: true };
+});
+
+ipcMain.handle('project:order-changed', (event, { reason } = {}) => {
+  scheduleProjectOrderBroadcast(reason || 'project-order');
   return { success: true };
 });
 
@@ -11545,11 +11576,8 @@ function useUIStore_freePortsToggle() {
   }
 }
 
-// Stop AI process (Claude/Gemini) in a tab WITHOUT closing the tab.
-// SIGTERM → 800ms grace → SIGKILL fallback. Shell stays alive.
-// Why not Ctrl+C in PTY: TUI state-dependent (dropdown/picker/danger-zone all
-// behave differently), and double Ctrl+C requires guessing prompt text "again
-// to exit". SIGTERM is independent of Ink state — kernel delivers it directly.
+// Stop AI process (Claude/Gemini/Codex) in a tab WITHOUT closing the tab.
+// Ctrl+C → SIGTERM → SIGKILL fallback. Shell stays alive.
 function getAiProcessNameFromCommand(cmd) {
   const text = String(cmd || '');
   if (/(^|[\/\s])claude(\s|$)/.test(text)) return 'claude';
@@ -11562,9 +11590,9 @@ async function stopAiProcessInTab(tabId) {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'tab not found' };
 
-  // BFS one level: find direct claude/gemini/codex child of our shell PID.
-  // We do NOT walk deeper — nested shells inside Claude (bash tool, mcp procs)
-  // should NOT be killed; killing the parent CLI cascades cleanup naturally.
+  // First try the direct Claude/Gemini/Codex child of our shell PID.
+  // For Codex, keep a descendant fallback: the process tree can be
+  // shell → node wrapper → vendor codex binary, depending on install path.
   let childPid = null;
   let processName = null;
   try {
@@ -11588,23 +11616,39 @@ async function stopAiProcessInTab(tabId) {
   }
 
   if (!childPid) {
+    try {
+      const codexCandidates = await findAiDescendantProcessesByTab(tabId, 'codex');
+      if (codexCandidates.length > 0) {
+        const candidate = [...codexCandidates].sort((a, b) => a.depth - b.depth || a.pid - b.pid)[0];
+        childPid = Number(candidate.pid);
+        processName = 'codex';
+        console.log('[StopAI] matched codex descendant fallback tab=' + tabId + ' pid=' + childPid + ' depth=' + candidate.depth + ' cmd=' + candidate.cmd);
+      }
+    } catch (err) {
+      console.log('[StopAI] codex descendant fallback failed for tab ' + tabId + ': ' + (err?.message || err));
+    }
+  }
+
+  if (!childPid) {
     console.log('[StopAI] no AI process found for tab ' + tabId + ' shellPid=' + term.pid);
     return { success: false, error: 'no AI process found' };
   }
 
   const _diagStopIdentity = resolveActivityIdentity(tabId, processName);
-	  const _diagStopSid = _diagStopIdentity.sessionId || bridgeKnownSessions.get(tabId) || codexKnownSessions.get(tabId) || null;
-  const _diagStopBusy = claudeTurnBusy.get(tabId) === true || claudeSpinnerBusy.get(tabId) === true;
+  const _diagStopSid = _diagStopIdentity.sessionId || bridgeKnownSessions.get(tabId) || codexKnownSessions.get(tabId) || null;
+  const _diagStopBusy = processName === 'codex'
+    ? codexTurnWatchers.get(tabId)?.busy === true
+    : claudeTurnBusy.get(tabId) === true || claudeSpinnerBusy.get(tabId) === true;
 
   // Hoist stopBusyState (declared further below) up so the Ctrl+C graceful
   // exit path can call it on success without referring to it before init.
-	  const stopBusyState = () => {
-	    if (processName === 'codex') {
-	      clearCodexKnownSession(tabId, 'manual-stop');
-	      closeCodexTurnWatcher(tabId, 'manual-stop');
-	      emitCodexBusy(tabId, false, 'manual-stop');
-	      return;
-	    }
+  const stopBusyState = () => {
+    if (processName === 'codex') {
+      clearCodexKnownSession(tabId, 'manual-stop');
+      closeCodexTurnWatcher(tabId, 'manual-stop');
+      emitCodexBusy(tabId, false, 'manual-stop');
+      return;
+    }
     if (processName === 'gemini') {
       clearTimeout(geminiSpinnerIdleTimers.get(tabId));
       geminiSpinnerIdleTimers.delete(tabId);

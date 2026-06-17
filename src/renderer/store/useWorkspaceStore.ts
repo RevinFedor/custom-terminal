@@ -803,8 +803,12 @@ const notifyProjectLayoutChanged = (projectId: string, reason: string) => {
   ipcRenderer.invoke('project:layout-changed', { projectId, reason }).catch(() => {});
 };
 
-const saveTabsThenNotifyProjectLayoutChanged = (projectId: string, tabs: Map<string, Tab>, reason: string) => {
-  saveTabs(projectId, tabs).then((result: any) => {
+const notifyProjectOrderChanged = (reason: string) => {
+  ipcRenderer.invoke('project:order-changed', { reason }).catch(() => {});
+};
+
+const saveTabsThenNotifyProjectLayoutChanged = (projectId: string, tabs: Map<string, Tab>, reason: string, forceCleanup = false) => {
+  saveTabs(projectId, tabs, forceCleanup).then((result: any) => {
     if (result?.success !== false) notifyProjectLayoutChanged(projectId, reason);
   });
 };
@@ -1570,7 +1574,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         openProjects: new Map(openProjects),
         pendingEditTabId: shouldEdit ? tabId : null,
       });
-      saveTabs(workspace.projectId, workspace.tabs);
+      saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-created');
     }
 
     console.log('[Store] createTab: Done, returning tabId:', tabId);
@@ -1737,7 +1741,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     });
 
     // Save tabs
-    saveTabs(workspace.projectId, workspace.tabs);
+    saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-created');
 
     return tabId;
   },
@@ -1922,7 +1926,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     });
 
     // Save tabs (forceCleanup when called from batch close)
-    saveTabs(workspace.projectId, workspace.tabs, options?.forceCleanup);
+    saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-closed', options?.forceCleanup);
     console.log('[CloseTab] state-updated tab=' + tabId.slice(-12) +
       ' remaining=' + workspace.tabs.size +
       ' active=' + (workspace.activeTabId ? workspace.activeTabId.slice(-12) : 'none') +
@@ -2020,7 +2024,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         entries.splice(clamped, 0, newEntry);
         after.tabs = new Map(entries);
         set({ openProjects: new Map(openProjects) });
-        saveTabs(after.projectId, after.tabs);
+        saveTabsThenNotifyProjectLayoutChanged(after.projectId, after.tabs, 'tab-reopened');
       }
       switchTab(projectId, newTabId);
     }
@@ -3400,6 +3404,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     set({ openProjects: newOpenProjects });
     saveSession();
+    notifyProjectOrderChanged('project-order');
   },
 
   // Browser tabs

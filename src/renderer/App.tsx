@@ -34,6 +34,8 @@ import { usePromptQueueWebSync } from './hooks/usePromptQueueWebSync';
 import { useMirrorStatusStore } from './store/useMirrorStatusStore';
 import { buildCodexRunPayload } from './utils/codexLaunch';
 import { getHistoryAgentRuntime, type AgentHistoryTool } from './utils/historyAgentRuntimes';
+import { terminalRegistry } from './utils/terminalRegistry';
+import { DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL } from './constants/codexSettings';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -56,6 +58,13 @@ function isAiForegroundProcess(info?: { hasProcess?: boolean; processName?: stri
   if (!info?.hasProcess) return false;
   const text = `${info.processName || ''} ${info.command || ''}`.toLowerCase();
   return /\b(claude|gemini|codex)\b/.test(text) || text.includes('@openai/codex');
+}
+
+function cleanDefaultSetting(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === 'none') return undefined;
+  return trimmed;
 }
 
 function getTimelineCopyFlagsFromStore() {
@@ -1691,10 +1700,13 @@ function App() {
                 const r = await ipcRenderer.invoke('tab:get-context-pct', { tabId });
                 if (typeof r?.pct === 'number' && r.pct > 0) contextPct = r.pct;
               } catch {}
+              const ui = useUIStore.getState();
+              const defaultModel = cleanDefaultSetting(ui.defaultCodexModel) || DEFAULT_CODEX_MODEL;
+              const defaultEffort = cleanDefaultSetting(ui.defaultCodexEffort) || DEFAULT_CODEX_EFFORT;
               return reply(true, {
                 tabId,
-                model: t.codexModel || 'default',
-                effort: t.codexEffort || 'xhigh',
+                model: t.codexModel || defaultModel,
+                effort: t.codexEffort || defaultEffort,
                 thinking: 'disabled',
                 contextPct,
               });
@@ -1758,15 +1770,75 @@ function App() {
             return reply(true, { tabId, model, effort, thinking });
           }
           if (tab.commandType === 'codex' && tab.tabType !== 'claude-sdk') {
-            const partial: any = {};
-            if (model !== undefined) partial.codexModel = model;
-            if (effort !== undefined) partial.codexEffort = effort;
-            if (Object.keys(partial).length > 0) state.updateCodexState(tabId, partial);
+            const ui = useUIStore.getState();
+            const defaultModel = cleanDefaultSetting(ui.defaultCodexModel) || DEFAULT_CODEX_MODEL;
+            const defaultEffort = cleanDefaultSetting(ui.defaultCodexEffort) || DEFAULT_CODEX_EFFORT;
+            const currentModel = tab.codexModel || defaultModel;
+            const currentEffort = tab.codexEffort || defaultEffort;
+            const requestedModel = model !== undefined ? model : currentModel;
+            const requestedEffort = effort !== undefined ? effort : currentEffort;
+            const futurePatch: any = {};
+            if (model !== undefined) futurePatch.codexModel = requestedModel;
+            if (effort !== undefined) futurePatch.codexEffort = requestedEffort;
+
+            const turnState = await ipcRenderer.invoke('codex:get-turn-state', tabId).catch(() => null);
+            const processInfo = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId).catch(() => null);
+            const processText = `${processInfo?.processName || ''} ${processInfo?.command || ''}`;
+            const hasLiveCodexProcess = processInfo?.hasProcess === true && /(\bcodex\b|@openai\/codex)/i.test(processText);
+            const terminal = terminalRegistry.get(tabId);
+            const hasLiveWatcher = turnState?.hasWatcher === true || hasLiveCodexProcess;
+
+            if (turnState?.busy === true) {
+              return reply(false, null, 'codex is busy');
+            }
+            if (hasLiveWatcher && !terminal) {
+              return reply(false, null, 'codex terminal is not mounted');
+            }
+            if (hasLiveWatcher && terminal) {
+              const draftState = terminalRegistry.getCodexDraftState(tabId);
+              console.log('[MobileBridge] codex-set-params live tab=' + String(tabId).slice(-12) + ' model=' + requestedModel + ' effort=' + requestedEffort + ' hasDraft=' + draftState.hasDraft + ' source=' + draftState.source);
+              if (draftState.hasDraft === null) {
+                return reply(false, null, 'codex input state unknown: ' + draftState.source);
+              }
+              const result = await ipcRenderer.invoke('codex:select-model-effort', {
+                tabId,
+                model: requestedModel,
+                effort: requestedEffort,
+                hasDraft: draftState.hasDraft,
+                draftSource: 'mobile:' + draftState.source,
+                draftPreview: draftState.preview,
+                visualHasDraft: draftState.hasDraft,
+                visualSource: draftState.source,
+                visualPreview: draftState.preview,
+              });
+              console.log('[MobileBridge] codex-set-params result tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(result || null));
+              if (!result?.success) {
+                return reply(false, null, result?.error || 'codex picker failed');
+              }
+              const appliedPatch: any = {};
+              if (model !== undefined || result.model) appliedPatch.codexModel = result.model || requestedModel;
+              if (effort !== undefined) {
+                if (!result.effortSkipped) appliedPatch.codexEffort = result.effort || requestedEffort;
+              } else if (model !== undefined && !result.effortSkipped) {
+                appliedPatch.codexEffort = result.effort || requestedEffort;
+              }
+              if (Object.keys(appliedPatch).length > 0) state.updateCodexState(tabId, appliedPatch);
+              return reply(true, {
+                tabId,
+                model: appliedPatch.codexModel ?? currentModel,
+                effort: appliedPatch.codexEffort ?? currentEffort,
+                thinking: 'disabled',
+                applied: true,
+              });
+            }
+
+            if (Object.keys(futurePatch).length > 0) state.updateCodexState(tabId, futurePatch);
             return reply(true, {
               tabId,
-              model: partial.codexModel ?? tab.codexModel ?? 'default',
-              effort: partial.codexEffort ?? tab.codexEffort ?? 'xhigh',
+              model: futurePatch.codexModel ?? currentModel,
+              effort: futurePatch.codexEffort ?? currentEffort,
               thinking: 'disabled',
+              applied: false,
             });
           }
           // SDK path
@@ -1957,16 +2029,19 @@ function App() {
           return reply(true, { tabId: newTabId, sessionId: fork.newSessionId, projectId, name: srcTab?.name });
         }
         if (action === 'closeTab') {
-          const { tabId } = payload || {};
+          const { tabId, aiBusyOverride } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
           for (const [projectId, ws] of state.openProjects) {
             if (ws.tabs.has(tabId)) {
               // skipProcessCheck so phone-driven close doesn't trigger desktop confirm dialog
-              await state.closeTab(projectId, tabId, { skipProcessCheck: true });
+              await state.closeTab(projectId, tabId, {
+                skipProcessCheck: true,
+                aiBusyOverride: typeof aiBusyOverride === 'boolean' ? aiBusyOverride : undefined
+              });
               return reply(true, { tabId, closed: true });
             }
           }
-          return reply(false, null, 'tab not open');
+          return reply(true, { tabId, closed: false, reason: 'already-closed' });
         }
         if (action === 'createClaudeTab') {
           // Create new PTY terminal tab with pendingAction='claude-new' — the
@@ -2075,9 +2150,16 @@ function App() {
           const { toolType, runtime } = describeAgentTab(tabId);
           if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
           try {
-            const result = runtime.inspectDraft
+            let result = runtime.inspectDraft
               ? runtime.inspectDraft(tabId)
               : { hasDraft: null, preview: '', source: 'unsupported' };
+            if (result?.source === 'no-terminal') {
+              result = {
+                ...(result || {}),
+                mountedForInspect: false,
+                debug: [result?.debug, 'mount=not-mounted focus=preserved'].filter(Boolean).join(' '),
+              };
+            }
             return reply(true, { tabId, toolType, ...(result || {}) });
           } catch (e: any) {
             console.log('[MobDraft:Bridge] inspect err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));

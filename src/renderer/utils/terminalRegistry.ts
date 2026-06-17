@@ -4,6 +4,7 @@ import { SearchAddon, ISearchOptions } from '@xterm/addon-search';
 // Global registry to access terminal instances from anywhere
 interface TerminalRegistryStore {
   terminals: Map<string, XTerminal>;
+  terminalWaiters: Map<string, Set<(terminal: XTerminal | undefined) => void>>;
   searchAddons: Map<string, SearchAddon>;
   searchStates: Map<string, SearchState>;
   viewportStates: Map<string, ViewportState>;
@@ -45,6 +46,7 @@ type ViewportCallback = (viewport: ViewportState) => void;
 
 const registryStore = ((globalThis as TerminalRegistryGlobal).__notedTerminalRegistryStore ||= {
   terminals: new Map<string, XTerminal>(),
+  terminalWaiters: new Map<string, Set<(terminal: XTerminal | undefined) => void>>(),
   searchAddons: new Map<string, SearchAddon>(),
   searchStates: new Map<string, SearchState>(),
   viewportStates: new Map<string, ViewportState>(),
@@ -53,8 +55,10 @@ const registryStore = ((globalThis as TerminalRegistryGlobal).__notedTerminalReg
   searchCallbacks: new Map<string, SearchResultsCallback>(),
   viewportCallbacks: new Map<string, ViewportCallback>(),
 });
+registryStore.terminalWaiters ||= new Map<string, Set<(terminal: XTerminal | undefined) => void>>();
 
 const terminals = registryStore.terminals;
+const terminalWaiters = registryStore.terminalWaiters;
 const searchAddons = registryStore.searchAddons;
 const searchStates = registryStore.searchStates;
 const viewportStates = registryStore.viewportStates;
@@ -217,6 +221,11 @@ export const terminalRegistry = {
 
   register(tabId: string, terminal: XTerminal, searchAddon?: SearchAddon) {
     terminals.set(tabId, terminal);
+    const waiters = terminalWaiters.get(tabId);
+    if (waiters) {
+      terminalWaiters.delete(tabId);
+      waiters.forEach((resolve) => resolve(terminal));
+    }
     if (searchAddon) {
       searchAddons.set(tabId, searchAddon);
 
@@ -249,6 +258,32 @@ export const terminalRegistry = {
 
   get(tabId: string): XTerminal | undefined {
     return terminals.get(tabId);
+  },
+
+  waitForTerminal(tabId: string, timeoutMs = 2500): Promise<XTerminal | undefined> {
+    const existing = terminals.get(tabId);
+    if (existing) return Promise.resolve(existing);
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (terminal: XTerminal | undefined) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        const waiters = terminalWaiters.get(tabId);
+        if (waiters) {
+          waiters.delete(finish);
+          if (waiters.size === 0) terminalWaiters.delete(tabId);
+        }
+        resolve(terminal);
+      };
+
+      const waiters = terminalWaiters.get(tabId) || new Set<(terminal: XTerminal | undefined) => void>();
+      waiters.add(finish);
+      terminalWaiters.set(tabId, waiters);
+      timer = setTimeout(() => finish(undefined), timeoutMs);
+    });
   },
 
   getCodexDraftState(tabId: string): CodexDraftState {

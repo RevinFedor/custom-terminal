@@ -261,7 +261,7 @@ Codex Timeline грузится через `codex:get-timeline`, а HistoryPanel
 - **Selection Persistence:** Выделение не пропадает при наведении на контекстное меню (Portal), благодаря использованию `selectionStartIdRef` и блокировке сброса `hoveredIndex` в режиме выбора.
 - **Якорь popup = entry второго клика, не `Math.max(start, end)`.** При выделении снизу-вверх popup раньше уезжал к нижней точке и был неудобен. Сейчас он центрируется по высоте entry под курсором. Размер popup `260×180` — намеренный safe-default под все режимы (обычный / postPrompt / deleteConfirm), используется как константа для clamp на 4 стороны viewport. Без 4-side clamp popup обрезался у верха/низа экрана, у близких к краю кликов.
 ### Edit Range (компактирование диапазона)
-Полный пайплайн: выделение → Gemini compact → JSONL edit → Claude restart.
+Полный пайплайн: выделение → Gemini compact → agent history rewrite → agent restart/continue.
 
 **Ограничение:** Редактирование работает **только в пределах текущего сегмента** (после последнего plan mode / compact boundary). Попытка редактирования через границы показывает тост с ошибкой. Мотивация: JSONL-файлы split по plan mode (каждый Clear Context = новый файл), edit-range работает с одним файлом.
 
@@ -269,8 +269,9 @@ Codex Timeline грузится через `codex:get-timeline`, а HistoryPanel
 1. Выбор диапазона → "Редактировать" → боковая панель `EditRangePanel`.
 2. Содержимое диапазона отправляется в Gemini API для генерации compact-summary.
 3. Пользователь может отредактировать compact или запросить уточнения через чат в панели.
-4. "Применить": exit Claude (DangerZone Ctrl+C) → `claude:edit-range` IPC → wait prompt-ready → restart Claude.
+4. "Применить" для Claude: exit Claude (DangerZone Ctrl+C) → `claude:edit-range` IPC → wait prompt-ready → restart Claude.
 5. `claude:edit-range`: backtrace → remove range entries → insert compact entry → relink parentUuid → atomic write.
+6. "Применить" для Codex: если `codex:get-turn-state.busy=true`, fail-closed без остановки процесса; если Codex жив, но idle, `terminal:stop-ai-process` делает graceful Ctrl+C-first stop → `codex:edit-range` создаёт новый локальный rollout fork → restart через `codex-c <newSessionId>`.
 
 **Пост-промпт (▶):** Split-button рядом с "Редактировать" и "Откатиться" — ▶ раскрывает inline textarea для дополнительной инструкции Gemini. Текст добавляется как `ПРИОРИТЕТНАЯ ИНСТРУКЦИЯ` перед основным rewind prompt. Мотивация: пользователь хочет направить фокус compact-сводки (например "сфокусируйся на коммитах, игнорируй обсуждение дизайна" или "перечисли только изменённые файлы"). Без пост-промпта единственный способ повлиять — редактировать результат вручную в EditRangePanel. Работает одинаково для Edit-range и Rewind.
 

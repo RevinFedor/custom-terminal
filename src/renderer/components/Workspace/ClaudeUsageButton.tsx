@@ -1803,6 +1803,8 @@ function CodexUsageChip() {
   const chipColor = colorForPct(weeklyPct);
   const fiveHourColor = colorForPct(fiveHourPct);
   const resetShort = formatResetShort(weekly?.resets_at);
+  const fiveHourResetShort = formatResetShort(fiveHour?.resets_at);
+  const resetTextColor = '#bbb';
   const accountLabel = selectedAccount?.label || null;
 
   const selectAccount = (account: CodexUsageAccount) => {
@@ -1825,7 +1827,7 @@ function CodexUsageChip() {
         onMouseEnter={() => setTriggerHover(true)}
         onMouseLeave={() => setTriggerHover(false)}
         title={weeklyPct != null
-          ? `Codex${accountLabel ? ` ${accountLabel}` : ''} weekly: ${formatPct(weeklyPct)} • 5-hour: ${formatPct(fiveHourPct)}${resetShort ? ` • weekly resets in ${resetShort}` : ''}`
+          ? `Codex${accountLabel ? ` ${accountLabel}` : ''} weekly: ${formatPct(weeklyPct)} • 5-hour: ${formatPct(fiveHourPct)}${resetShort ? ` • weekly resets in ${resetShort}` : ''}${fiveHourResetShort ? ` • 5-hour resets in ${fiveHourResetShort}` : ''}`
           : (error || 'Codex usage appears after Codex writes a token_count record')}
         style={{
           display: 'inline-flex',
@@ -1855,12 +1857,15 @@ function CodexUsageChip() {
         ) : (
           <>
             <CodexIcon size={15} muted={weeklyPct == null} />
-            <span>{formatPct(weeklyPct)}</span>
-            <span style={{ color: '#6b7280', fontWeight: 500 }}>/</span>
-            <span style={{ color: fiveHourPct != null ? fiveHourColor : '#6b7280' }}>{formatPct(fiveHourPct)}</span>
-            {resetShort && (
-              <span style={{ color: '#6b7280', fontWeight: 500 }}>{resetShort}</span>
-            )}
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              <span>{formatPct(weeklyPct)}</span>
+              {resetShort && <span style={{ color: resetTextColor, fontWeight: 500 }}>{resetShort}</span>}
+            </span>
+            <span style={{ color: resetTextColor, fontWeight: 500 }}>/</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              <span style={{ color: fiveHourPct != null ? fiveHourColor : '#6b7280' }}>{formatPct(fiveHourPct)}</span>
+              {fiveHourResetShort && <span style={{ color: resetTextColor, fontWeight: 500 }}>{fiveHourResetShort}</span>}
+            </span>
           </>
         )}
       </button>

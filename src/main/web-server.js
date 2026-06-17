@@ -179,7 +179,7 @@ function summarizeBroadcastPayload(payload) {
     const projects = Array.isArray(payload.projects) ? payload.projects : [];
     const active = projects.filter((p) => (Number(p?.count) || 0) > 0 || p?.streaming === true).length;
     const streaming = projects.filter((p) => p?.streaming === true).length;
-    return ' projects=' + projects.length + ' active=' + active + ' streaming=' + streaming;
+    return ' projects=' + projects.length + ' active=' + active + ' streaming=' + streaming + ' projectOrder=' + (payload.projectOrderChanged === true);
   }
   if (payload.type === 'snapshot') {
     return ' status=' + (payload.sessionStatus || '-') +
@@ -394,6 +394,7 @@ function projectActivitySnapshot(reason = 'snapshot') {
       type: 'project-activity',
       projects: Array.isArray(snap.projects) ? snap.projects : [],
       layoutChangedProjectIds: Array.isArray(snap.layoutChangedProjectIds) ? snap.layoutChangedProjectIds : [],
+      projectOrderChanged: snap.projectOrderChanged === true,
       ts: snap.ts || Date.now(),
       reason,
     };
@@ -1203,7 +1204,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
     try {
-      const data = await bridgeRequest('closeTab', { tabId });
+      const body = await readBody(req);
+      const data = await bridgeRequest('closeTab', {
+        tabId,
+        aiBusyOverride: body.aiBusy === true || body.streaming === true
+      });
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 409, { error: String(e.message) });
@@ -1288,7 +1293,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   if (m && req.method === 'GET') {
     const tabId = decId(m[1]);
     try {
-      const data = await bridgeRequest('inspectAgentDraft', { tabId }, 2000);
+      const data = await bridgeRequest('inspectAgentDraft', { tabId }, 5000);
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });

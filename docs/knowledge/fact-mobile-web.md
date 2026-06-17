@@ -134,6 +134,13 @@ App-level settings тоже принадлежат desktop app-state, а не к
 сортировать этот ответ: порядок project tabs — пользовательская навигационная раскладка,
 а не производная от времени последнего изменения проекта.
 
+Изменение этого порядка — отдельный live-сигнал, не tab layout. Renderer `reorderProjects`
+после `saveSession()` шлёт `project:order-changed`; следующий `project-activity` кадр несёт
+`projectOrderChanged:true`, и native клиент должен тихо перезагрузить `/api/projects` после
+своего quiet-window. Не пытайся кодировать новый порядок в `project-activity.projects`:
+этот массив остаётся runtime-агрегатом активных проектов, а source of truth порядка —
+свежий `/api/projects` через renderer bridge `getOpenProjectIds`.
+
 Создание новых PTY-агентов для native идёт через `/api/projects/:id/agent-tabs {toolType:'claude'|'codex'}`. Этот route намеренно делегирует в renderer `createAgentTab`, чтобы Claude и Codex стартовали тем же `pendingAction` path, что desktop. Не заводить на iOS отдельный launch-path, который сам пишет command в PTY: он обойдёт desktop guards, model/effort defaults и session detection.
 
 `GET /api/projects/:id/tabs` для native — это уже нормализованный layout snapshot, а не
@@ -190,7 +197,7 @@ GET  /api/projects/:id/tabs                    → tabs + groups + statuses + ti
 POST /api/projects/:id/sdk-tabs                → createSDKTab (через bridge)
 POST /api/sdk-tabs/:tabId/send                 → sendSDKMessage + dispatch external-prompt
 POST /api/sdk-tabs/:tabId/stop                 → query.close()
-POST /api/sdk-tabs/:tabId/close                → closeTab (через bridge)
+POST /api/sdk-tabs/:tabId/close                → closeTab (через bridge, body {aiBusy?})
 POST /api/sdk-tabs/:tabId/rename               → renameTab (через bridge)
 POST /api/sdk-tabs/:tabId/fork-to-sdk          → forkToSDK (через bridge → fork-from-session)
 POST /api/tabs/:tabId/fork-to-sdk              → ↑ alias для terminal табов
@@ -203,6 +210,7 @@ GET  /api/sdk-tabs/:tabId/params               → getSDKParams
 POST /api/sdk-tabs/:tabId/params               → setSDKParams
 POST /api/sdk-tabs/:tabId/interrupt            → soft interrupt текущего turn'а (PTY Esc / SDK close warm)
 GET  /api/sdk-tabs/:tabId/draft                → authoritative чтение TUI composer после interrupt
+GET  /api/sdk-tabs/:tabId/draft-state          → read-only preflight состояния TUI composer перед mobile send
 GET  /api/sdk-tabs/:tabId/queue                 → getPromptQueue (core + sibling aiTabs)
 POST /api/sdk-tabs/:tabId/queue                 → mutatePromptQueue ({op, args})
 GET  /api/sdk-tabs/:tabId/pending-question      → текущий AskUserQuestion (connect mid-question)
@@ -231,6 +239,16 @@ GET  /api/sdk-tabs/:tabId/status                → status строка (inactiv
 ```
 
 Для CLAUDE-табов (commandType='claude' && tabType!='claude-sdk') расширение mobile-web — см. `fact-mobile-claude-pty.md`. `/send` и `/stop` теперь sumарно роутятся: backend сам выбирает SDK путь или PTY+paste путь по `tab.commandType`.
+
+`/draft-state` — preflight только для защиты чужого текста в terminal composer, а не команда
+активации desktop UI. Если renderer видит mounted xterm, он инспектирует Claude/Codex input и
+возвращает `hasDraft=true/false`. Если вкладка скрыта и terminal-компонент не смонтирован,
+ответ должен быть `source:"no-terminal"` / `hasDraft:null`, без `showWorkspace`,
+`setProjectView` или `switchTab`: phone не имеет права переключать проект/вкладку на Mac ради
+проверки draft. Нативный iOS-клиент трактует этот случай как «draft неизвестен потому что
+поверхность не mounted» и может продолжить send без desktop draft-protection; ambiguous error
+или timeout остаются стоп-сигналом. Пользовательский симптом нарушенного контракта: отправка с
+iPhone внезапно переносит Mac в другой проект/таб.
 
 Все pathname-параметры (`:id`, `:tabId`) ОБЯЗАТЕЛЬНО прогоняются через `decId()` (`decodeURIComponent`) перед использованием — см. секцию «URL-encoded path параметры» ниже.
 
@@ -433,10 +451,17 @@ statusMarker, processBar и contextPct остаются ответственно
 project-activity патчит только `status/streaming`.
 
 Layout changes идут отдельным полем snapshot'а `layoutChangedProjectIds`. Renderer вызывает
-`project:layout-changed` при изменении групп, статусов или порядка; server добавляет id проекта
-в следующий project-activity кадр, чтобы native клиент запланировал `/tabs` reload после своего
-quiet-window. Это не license таскать полный tabs metadata в project-activity: activity остаётся
-маленьким runtime-каналом, а structural reload происходит отдельным путём.
+`project:layout-changed` при изменении структуры или metadata вкладок конкретного проекта:
+create, close, reopen, rename, изменение групп, статусов и tab-layout reorder. Server добавляет
+id проекта в следующий project-activity кадр, чтобы native клиент запланировал `/tabs` reload
+после своего quiet-window. Это не license таскать полный tabs metadata в project-activity:
+activity остаётся маленьким runtime-каналом, а structural reload происходит отдельным путём.
+
+Project order — соседний, но другой structural signal: `projectOrderChanged:true` означает
+«перезагрузи `/api/projects`», а не «перезагрузи `/tabs` выбранного проекта». Это нужно для
+симптома «на Mac поменял порядок проектов, на iPhone список остался старым»: per-project
+`layoutChangedProjectIds` здесь бессмысленен, потому что изменилась сама последовательность
+project rows, а не содержимое одного проекта.
 
 **Error-policy (важно):** ошибка сети показывается full-screen ТОЛЬКО когда показать
 нечего (`error && !data`). Если кэш есть — стейл-табы остаются, ошибка глотается, next

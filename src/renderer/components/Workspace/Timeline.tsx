@@ -4902,6 +4902,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   console.warn('[CodexEditRange] commandState:', JSON.stringify(cmdState));
 
                   if (cmdState?.isRunning) {
+                    const turnState = await ipcRenderer.invoke('codex:get-turn-state', tabId).catch((err: any) => {
+                      console.warn('[CodexEditRange] turn-state lookup failed:', err?.message || err);
+                      return null;
+                    });
+                    if (turnState?.busy === true) {
+                      throw new Error('Codex сейчас выполняет turn — дождитесь завершения перед Edit Range');
+                    }
                     console.warn('[CodexEditRange] Stopping Codex before local rollout rewrite...');
                     const stopResult = await ipcRenderer.invoke('terminal:stop-ai-process', tabId);
                     if (!stopResult?.success) {
