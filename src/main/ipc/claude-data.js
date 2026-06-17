@@ -100,7 +100,7 @@ function _classifyOrphanFlavor(entry) {
 
   return { flavor: t || 'unknown', short: t || 'неизвестно' };
 }
-// filePath → { size, mtimeMs, recordMap, lastRecord, bridgeSessionId, progressEntries }
+// filePath → { size, mtimeMs, recordMap, lastRecord, bridgeSessionId, progressEntries, queueOperations }
 
 // ========== SESSION CHAIN HELPERS ==========
 
@@ -444,10 +444,11 @@ function _trimTrailingEffortEntries(sessionId, cwd) {
 }
 
 // Parse JSONL lines into an existing recordMap (shared logic for full + incremental reads)
-function _parseJsonlLines(lines, sessionId, recordMap, progressEntries, startFileIndex, bridgeSessionIdIn) {
+function _parseJsonlLines(lines, sessionId, recordMap, progressEntries, queueOperations, startFileIndex, bridgeSessionIdIn, startQueueIndex = 0) {
   let lastRecord = null;
   let bridgeSessionId = bridgeSessionIdIn;
   let fileIndex = startFileIndex;
+  let queueIndex = startQueueIndex;
 
   for (const line of lines) {
     if (!line.trim()) continue;
@@ -455,6 +456,13 @@ function _parseJsonlLines(lines, sessionId, recordMap, progressEntries, startFil
       const entry = JSON.parse(line);
       if (entry.type === 'progress' && entry.data?.type === 'agent_progress' && entry.parentToolUseID) {
         progressEntries.push(entry);
+      }
+      if (entry.type === 'queue-operation') {
+        entry._fromFile = sessionId;
+        entry._queueSortIndex = fileIndex - 0.5;
+        entry._queueIndex = queueIndex++;
+        entry._queueId = 'queue-' + sessionId + '-' + entry._queueIndex + '-' + (entry.operation || 'op');
+        queueOperations.push(entry);
       }
       if (entry.uuid) {
         entry._fileIndex = fileIndex++;
@@ -471,7 +479,7 @@ function _parseJsonlLines(lines, sessionId, recordMap, progressEntries, startFil
     } catch {}
   }
 
-  return { lastRecord, bridgeSessionId, fileIndex };
+  return { lastRecord, bridgeSessionId, fileIndex, queueIndex };
 }
 
 // Load all records from a JSONL file into a Map (uuid → record)
@@ -483,7 +491,7 @@ async function loadJsonlRecords(filePath) {
   try {
     stat = fs.statSync(filePath);
   } catch {
-    return { recordMap: new Map(), lastRecord: null, bridgeSessionId: null, progressEntries: [] };
+    return { recordMap: new Map(), lastRecord: null, bridgeSessionId: null, progressEntries: [], queueOperations: [] };
   }
 
   const cached = _jsonlCache.get(filePath);
@@ -491,7 +499,7 @@ async function loadJsonlRecords(filePath) {
 
   // ── Case 1: File unchanged → return cached result immediately ──────────────
   if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
-    return { recordMap: cached.recordMap, lastRecord: cached.lastRecord, bridgeSessionId: cached.bridgeSessionId, progressEntries: cached.progressEntries };
+    return { recordMap: cached.recordMap, lastRecord: cached.lastRecord, bridgeSessionId: cached.bridgeSessionId, progressEntries: cached.progressEntries, queueOperations: cached.queueOperations || [] };
   }
 
   // ── Case 2: File grew (normal for active sessions) → read ONLY new bytes ──
@@ -503,6 +511,7 @@ async function loadJsonlRecords(filePath) {
     const prevLeftover = cached.leftover || '';
     const prevBridgeSessionId = cached.bridgeSessionId;
     const prevFileIndex = cached.fileIndex;
+    const prevQueueIndex = cached.queueIndex || (cached.queueOperations?.length || 0);
 
     const fd = await fs.promises.open(filePath, 'r');
     let newContent = '';
@@ -521,9 +530,10 @@ async function loadJsonlRecords(filePath) {
     // Last element may be incomplete (file written mid-line) — save as leftover
     const leftover = lines.pop();
 
-    const { lastRecord, bridgeSessionId, fileIndex } = _parseJsonlLines(
-      lines, sessionId, cached.recordMap, cached.progressEntries,
-      prevFileIndex, prevBridgeSessionId
+    const queueOperations = cached.queueOperations || [];
+    const { lastRecord, bridgeSessionId, fileIndex, queueIndex } = _parseJsonlLines(
+      lines, sessionId, cached.recordMap, cached.progressEntries, queueOperations,
+      prevFileIndex, prevBridgeSessionId, prevQueueIndex
     );
 
     const newLastRecord = lastRecord || cached.lastRecord;
@@ -535,11 +545,11 @@ async function loadJsonlRecords(filePath) {
         size: stat.size, mtimeMs: stat.mtimeMs, leftover: leftover || '',
         recordMap: cached.recordMap, lastRecord: newLastRecord,
         bridgeSessionId: newBridgeId, progressEntries: cached.progressEntries,
-        fileIndex
+        queueOperations, fileIndex, queueIndex
       });
     }
 
-    return { recordMap: cached.recordMap, lastRecord: newLastRecord, bridgeSessionId: newBridgeId, progressEntries: cached.progressEntries };
+    return { recordMap: cached.recordMap, lastRecord: newLastRecord, bridgeSessionId: newBridgeId, progressEntries: cached.progressEntries, queueOperations };
   }
 
   // ── Case 3: First read or file shrunk (shouldn't happen for JSONL) → full read ──
@@ -549,17 +559,65 @@ async function loadJsonlRecords(filePath) {
 
   const recordMap = new Map();
   const progressEntries = [];
-  const { lastRecord, bridgeSessionId, fileIndex } = _parseJsonlLines(
-    lines, sessionId, recordMap, progressEntries, 0, null
+  const queueOperations = [];
+  const { lastRecord, bridgeSessionId, fileIndex, queueIndex } = _parseJsonlLines(
+    lines, sessionId, recordMap, progressEntries, queueOperations, 0, null, 0
   );
 
   _jsonlCache.set(filePath, {
     size: stat.size, mtimeMs: stat.mtimeMs, leftover: leftover || '',
     recordMap, lastRecord, bridgeSessionId: bridgeSessionId || null,
-    progressEntries, fileIndex
+    progressEntries, queueOperations, fileIndex, queueIndex
   });
 
-  return { recordMap, lastRecord, bridgeSessionId: bridgeSessionId || null, progressEntries };
+  return { recordMap, lastRecord, bridgeSessionId: bridgeSessionId || null, progressEntries, queueOperations };
+}
+
+function _injectQueueOperationsIntoBranch(activeBranch, queueOperations) {
+  if (!Array.isArray(activeBranch) || activeBranch.length === 0 || !Array.isArray(queueOperations) || queueOperations.length === 0) {
+    return activeBranch;
+  }
+
+  const boundsByFile = new Map();
+  const fileOrder = new Map();
+  let nextFileOrder = 0;
+  for (const record of activeBranch) {
+    const fileId = record?._fromFile;
+    if (!fileId || typeof record._fileIndex !== 'number') continue;
+    if (!fileOrder.has(fileId)) fileOrder.set(fileId, nextFileOrder++);
+    const current = boundsByFile.get(fileId) || { min: Infinity, max: -Infinity };
+    current.min = Math.min(current.min, record._fileIndex);
+    current.max = Math.max(current.max, record._fileIndex);
+    boundsByFile.set(fileId, current);
+  }
+
+  const relevantQueueOps = [];
+  for (const op of queueOperations) {
+    if (!op || op.type !== 'queue-operation') continue;
+    const fileId = op._fromFile;
+    const bounds = boundsByFile.get(fileId);
+    if (!bounds) continue;
+    const sortIndex = typeof op._queueSortIndex === 'number' ? op._queueSortIndex : op._fileIndex;
+    if (typeof sortIndex !== 'number') continue;
+    // Queue ops are UUID-less meta lines. Keep only ops physically after the
+    // first active UUID and up through the live tail after the last active UUID.
+    if (sortIndex <= bounds.min || sortIndex > bounds.max + 1) continue;
+    relevantQueueOps.push(op);
+  }
+
+  if (relevantQueueOps.length === 0) return activeBranch;
+
+  const orderOf = (record) => {
+    const fileId = record?._fromFile;
+    const fileRank = fileOrder.has(fileId) ? fileOrder.get(fileId) : Number.MAX_SAFE_INTEGER;
+    const inFile = record?.type === 'queue-operation'
+      ? (typeof record._queueSortIndex === 'number' ? record._queueSortIndex : Number.MAX_SAFE_INTEGER)
+      : (typeof record?._fileIndex === 'number' ? record._fileIndex : Number.MAX_SAFE_INTEGER);
+    const tie = record?.type === 'queue-operation' ? (record._queueIndex || 0) / 1000000 : 0;
+    return fileRank * 1000000000 + inFile + tie;
+  };
+
+  return [...activeBranch, ...relevantQueueOps].sort((a, b) => orderOf(a) - orderOf(b));
 }
 
 // Resolve the full chain of JSONL files by following bridge entries backwards.
@@ -569,6 +627,7 @@ async function loadJsonlRecords(filePath) {
 async function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
   const mergedMap = new Map();
   const allProgressEntries = [];
+  const allQueueOperations = [];
   const sessionBoundaries = [];
   let currentSessionId = sessionId;
   let lastRecord = null;
@@ -581,9 +640,12 @@ async function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
       break;
     }
 
-    const { recordMap, lastRecord: fileLastRecord, bridgeSessionId, progressEntries } = await loadJsonlRecords(found.filePath);
+    const { recordMap, lastRecord: fileLastRecord, bridgeSessionId, progressEntries, queueOperations } = await loadJsonlRecords(found.filePath);
     if (progressEntries.length > 0) {
       allProgressEntries.push(...progressEntries);
+    }
+    if (queueOperations?.length > 0) {
+      allQueueOperations.push(...queueOperations);
     }
 
     // On the first file (newest), capture the lastRecord for backtrace start
@@ -638,7 +700,7 @@ async function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
     depth++;
   }
 
-  return { mergedMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries };
+  return { mergedMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries, queueOperations: allQueueOperations };
 }
 
 // Find the latest (tip) session in a chain starting from a given session.
@@ -3433,7 +3495,7 @@ function register({ projectManager, formatToolAction }) {
     }
 
     try {
-      const { mergedMap: recordMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries } = await resolveSessionChain(sessionId, cwd);
+      const { mergedMap: recordMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries, queueOperations: allQueueOperations } = await resolveSessionChain(sessionId, cwd);
 
       // Build progress entries index by parentToolUseID
       const progressByToolUseId = new Map();
@@ -3686,13 +3748,44 @@ function register({ projectManager, formatToolAction }) {
         entries.push({ uuid: 'fork-begin', role: 'fork', timestamp: '', content: 'FORK', sessionId: '' });
       }
 
-      for (let i = 0; i < activeBranch.length; i++) {
-        const entry = activeBranch[i];
+      const historyBranch = _injectQueueOperationsIntoBranch(activeBranch, allQueueOperations);
+      const pendingQueueEntries = [];
+      const normalizeQueuedText = (text) => String(text || '')
+        .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+        .replace(/\[200~/g, '').replace(/~\]/g, '').trim();
+      const shouldSkipPromptText = (text) => {
+        if (!text) return true;
+        if (text.startsWith('[Request interrupted') || text === '[User cancelled]') return true;
+        if (text.includes('<command-name>') || text.includes('<local-command-stdout>')) return true;
+        if (text.includes('<bash-notification>') || text.includes('<shell-id>')) return true;
+        if (text.includes('<user-prompt-submit-hook>') || text.includes('<task-notification>')) return true;
+        if (text.startsWith('Caveat: The messages below')) return true;
+        return false;
+      };
+      const dropMatchingQueuedEntry = (cleanContent) => {
+        const normalized = normalizeQueuedText(cleanContent);
+        let idx = -1;
+        for (let qIdx = pendingQueueEntries.length - 1; qIdx >= 0; qIdx--) {
+          if (normalizeQueuedText(pendingQueueEntries[qIdx].content) === normalized) {
+            idx = qIdx;
+            break;
+          }
+        }
+        if (idx < 0) return;
+        const queued = pendingQueueEntries[idx];
+        pendingQueueEntries.splice(idx, 1);
+        const renderedIdx = entries.findIndex(e => e.uuid === queued.uuid);
+        if (renderedIdx >= 0) entries.splice(renderedIdx, 1);
+      };
+
+      for (let i = 0; i < historyBranch.length; i++) {
+        const entry = historyBranch[i];
         if (entry.isSidechain || entry.type === 'summary') continue;
 
         // Plan mode / clear context boundary detection
         const entrySid = entry.sessionId || entry._fromFile;
-        if (prevSessionId && entrySid !== prevSessionId && !lastWasCompact) {
+        const isQueueOperation = entry.type === 'queue-operation';
+        if (!isQueueOperation && prevSessionId && entrySid !== prevSessionId && !lastWasCompact) {
           // Check if bridge-based transition (clear context) or fork
           // Skip after compact — compact already serves as the boundary marker
           let hasBridge = false;
@@ -3707,8 +3800,43 @@ function register({ projectManager, formatToolAction }) {
             sessionId: entrySid
           });
         }
-        lastWasCompact = (entry.type === 'system' && entry.subtype === 'compact_boundary');
-        prevSessionId = entrySid;
+        if (!isQueueOperation) {
+          lastWasCompact = (entry.type === 'system' && entry.subtype === 'compact_boundary');
+          prevSessionId = entrySid;
+        }
+
+        if (entry.type === 'queue-operation') {
+          if (entry.operation === 'enqueue') {
+            const cleanContent = normalizeQueuedText(entry.content || '');
+            if (shouldSkipPromptText(cleanContent)) continue;
+            const queuedEntry = {
+              uuid: entry._queueId || ('queue-' + (entry.sessionId || entry._fromFile || 'unknown') + '-' + (entry.timestamp || pendingQueueEntries.length)),
+              role: 'queued',
+              timestamp: entry.timestamp || '',
+              content: cleanContent,
+              queueStatus: 'queued',
+              sessionId: entrySid
+            };
+            pendingQueueEntries.push(queuedEntry);
+            entries.push(queuedEntry);
+          } else if (entry.operation === 'dequeue') {
+            const queued = pendingQueueEntries.find(q => q.queueStatus === 'queued');
+            if (queued) queued.queueStatus = 'sent';
+          } else if (entry.operation === 'remove') {
+            const idx = pendingQueueEntries.findIndex(q => q.queueStatus === 'queued');
+            if (idx >= 0) {
+              const queued = pendingQueueEntries[idx];
+              pendingQueueEntries.splice(idx, 1);
+              const renderedIdx = entries.findIndex(e => e.uuid === queued.uuid);
+              if (renderedIdx >= 0) entries.splice(renderedIdx, 1);
+            }
+          } else if (entry.operation === 'popAll') {
+            for (const queued of pendingQueueEntries) {
+              if (queued.queueStatus === 'queued') queued.queueStatus = 'sent';
+            }
+          }
+          continue;
+        }
 
         if (entry.type === 'user') {
           let rawContent = entry.message?.content;
@@ -3721,17 +3849,12 @@ function register({ projectManager, formatToolAction }) {
             }
           }
           if (!rawContent) continue;
-          if (rawContent.startsWith('[Request interrupted') || rawContent === '[User cancelled]') continue;
-          if (rawContent.includes('<command-name>') || rawContent.includes('<local-command-stdout>')) continue;
-          if (rawContent.includes('<bash-notification>') || rawContent.includes('<shell-id>')) continue;
-          if (rawContent.includes('<user-prompt-submit-hook>') || rawContent.includes('<task-notification>')) continue;
-          if (rawContent.startsWith('Caveat: The messages below')) continue;
+          if (shouldSkipPromptText(rawContent)) continue;
           if (entry.isMeta) continue;
 
-          let cleanContent = rawContent
-            .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
-            .replace(/\[200~/g, '').replace(/~\]/g, '').trim();
+          let cleanContent = normalizeQueuedText(rawContent);
           if (!cleanContent) continue;
+          dropMatchingQueuedEntry(cleanContent);
 
           const isContinued = cleanContent.startsWith('This session is being continued from a previous conversation');
 
@@ -3770,8 +3893,8 @@ function register({ projectManager, formatToolAction }) {
                 // answer) AND for the raw-tool carrier below (so the HistoryPanel
                 // package renderer can show Bash output / Read content / etc.).
                 const findToolResult = () => {
-                  for (let j = i + 1; j < activeBranch.length; j++) {
-                    const nextEntry = activeBranch[j];
+                  for (let j = i + 1; j < historyBranch.length; j++) {
+                    const nextEntry = historyBranch[j];
                     if (nextEntry.type === 'user' && Array.isArray(nextEntry.message?.content)) {
                       const res = nextEntry.message.content.find(c => c.type === 'tool_result' && c.tool_use_id === block.id);
                       if (res) {
@@ -3829,8 +3952,8 @@ function register({ projectManager, formatToolAction }) {
         } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
           // Look ahead for compact summary content
           let compactSummary = '';
-          for (let j = i + 1; j < activeBranch.length; j++) {
-            const next = activeBranch[j];
+          for (let j = i + 1; j < historyBranch.length; j++) {
+            const next = historyBranch[j];
             if (next.isCompactSummary && next.type === 'user') {
               const raw = typeof next.message?.content === 'string'
                 ? next.message.content

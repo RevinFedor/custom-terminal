@@ -6424,7 +6424,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           <div
             ref={contextMenuRef}
             data-tab-context-menu
-            className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px] rounded-md overflow-hidden"
+            className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px] rounded-md overflow-visible"
             style={{ left: contextMenuPos.x, top: contextMenuPos.y, zIndex: 100030 }}
             onClick={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}

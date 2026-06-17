@@ -92,3 +92,16 @@ Root `index.html` должен оставаться Vite source input:
 ```
 
 В source `index.html` не должно быть `/assets/index-*.js` и `/assets/index-*.css`. CSS приходит через import из renderer entrypoint (`main.tsx`), а hashed assets появляются только внутри `dist/` после сборки. После ручной CSP-правки проверяй оба инварианта сразу: CSP содержит нужные directives, но script entry остался `/src/renderer/main.tsx`.
+
+---
+
+## Часть 4: root `main-*.js` bundle попал в git и заблокировал push
+
+### Симптом
+`git push` отклоняется GitHub push protection / secret scanning, хотя текущий working tree уже не содержит ключей. В UI при этом счётчики ahead/behind выглядят пугающе (`150↑ 146↓`), потому что локальная история и удалённая ветка разошлись после force-update/rewrites.
+
+### Причина
+Случайно отслеженный root-level generated bundle вида `main-*.js` попал в историю. Такие файлы не являются source проекта: это большой minified артефакт сборки, в котором могут оказаться inline env/config фрагменты. Даже если файл удалён в текущем коммите, secret scanning проверяет всю pushed history и блокирует push до удаления записи из истории.
+
+### Решение
+Текущий source-fix — `/main-*.js` в `.gitignore`: root generated bundles не должны попадать в индекс. Если файл уже попал в pushed range и GitHub блокирует push, обычный follow-up commit с удалением недостаточен; нужно переписать историю (например, filter-branch/filter-repo по конкретным root bundle paths), затем force-push уже очищенную ветку. Перед force-push сделать backup branch и проверить, что текущий tracked tree больше не содержит секретного паттерна. Не переносить это правило на `dist/renderer/assets/main-*.js`: dist artifacts живут в своей папке и управляются build/release flow, проблема именно в root-level случайном bundle рядом с source-файлами.

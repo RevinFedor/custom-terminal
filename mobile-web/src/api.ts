@@ -77,6 +77,7 @@ export type TabInfo = {
   // default (faint translucent bg). Server may omit it (old build) → treated null.
   color?: string | null;
   cwd: string;
+  filePath?: string | null;
   claudeSessionId?: string;
   // Number of Timeline-relevant entries (user prompts + compact boundaries)
   // on the active branch. null = no Claude session attached.
@@ -188,6 +189,11 @@ export const Api = {
   listTabs: (projectId: string) =>
     api<{ project: { id: string; name: string; path: string }; tabs: TabInfo[]; statusMarker?: StatusMarkerCfg; processBar?: ProcessBarCfg }>(
       `/api/projects/${encodeURIComponent(projectId)}/tabs`,
+    ),
+  filePreview: (path: string) =>
+    api<{ path: string; name: string; ext: string; size: number; content: string }>(
+      '/api/file-preview',
+      { method: 'POST', body: JSON.stringify({ path }) },
     ),
   createSDKTab: (projectId: string) =>
     api<{ tabId: string; name: string; cwd: string; projectId: string }>(

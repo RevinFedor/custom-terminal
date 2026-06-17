@@ -62,6 +62,14 @@ Dedup для slash/compact работает через `entryUuid` — WS replay
 
 Весь визуал строки чата теперь рисует `@noted/claude-blocks::ChatMessage` (см. `fact-claude-blocks-package.md::ChatMessage`). Мобильный `EntryView` стал **тонким адаптером**: `uiToChatEntry(UiEntry) → <ChatMessage ctx={mobileRenderCtx}>`. Все прежние per-kind карточки (`UserText`/`ThinkingCard`/`ToolCard`/`CompactSummaryCard`/`CollapsibleText`/`Markdown`-wrapper, ~150 строк) **удалены** — их форма ушла в пакет. `mobileRenderCtx` инжектит collapse-контроллер: `isOpen` читает persist-карту `_entryExpanded`, `toggle` оборачивает в `stickToggle` (bottom-stick) + глобальный re-render через `bumpGlobalToggle`/`useGlobalToggle` (virtua держит в DOM только видимые ряды, перерисуются лишь они). Бабл юзера при переезде перекрашен `#1f3a5f` → Claude-оранж (canon — десктоп). Под капотом lifecycle (SSE/JSONL/kill) остаётся у мобилы — пакет его не касается.
 
+## File-tab Markdown preview bottom-sheet
+
+File-tabs на mobile — это не chat route. Если `tabType === 'file'`, tap по строке должен открыть read-only preview sheet поверх списка проекта, а не вести в `ChatView` с пустым сообщением «No Claude session attached». Это тот же mental model, что у attached-chip preview: пользователь хочет быстро подсмотреть документ и вернуться к списку табов.
+
+Контракт данных: `/api/projects/:id/tabs` отдаёт `filePath` для file-tab'ов. `cwd` остаётся рабочей директорией/legacy fallback и не должен использоваться как canonical file path, иначе сервер получит directory и вернёт `not a file`. Чтение файла идёт через `POST /api/file-preview {path}` прямо в `web-server.js`: absolute path required, `stat.isFile()`, cap 1MB, `utf8` read, ответ `{path,name,ext,size,content}`. Bridge в renderer тут не нужен — preview читает файловую систему, а не Zustand state; это быстрее и работает даже если renderer ещё не ответил на bridge.
+
+UI: `MarkdownFileSheet` — bottom-sheet с backdrop, drag handle и swipe-down dismiss (`dragY` threshold), header filename/path/size и внутренний scroll для body. Рендер Markdown на mobile использует `@noted/claude-blocks::Markdown`, а не desktop `@gt-editor/markdown-editor`: mobile уже тащит chat Markdown renderer, а desktop editor heavy/local-file dependency не нужна в phone bundle. Если file-tab принадлежит группе, отдельной логики не требуется: server уже отдаёт тот же tab row с `groupId`, а preview открывается по `filePath` независимо от группировки.
+
 ## ParamsSheet (model/effort/think) — close-on-select + invisible-intent источники
 
 Хедер-пилюля `model · effort ▾` открывает bottom-sheet `ParamsSheet` (SDK и
@@ -126,6 +134,19 @@ PTY-Claude табы). Три неочевидных факта:
 
 Создание новых PTY-агентов для native идёт через `/api/projects/:id/agent-tabs {toolType:'claude'|'codex'}`. Этот route намеренно делегирует в renderer `createAgentTab`, чтобы Claude и Codex стартовали тем же `pendingAction` path, что desktop. Не заводить на iOS отдельный launch-path, который сам пишет command в PTY: он обойдёт desktop guards, model/effort defaults и session detection.
 
+`GET /api/projects/:id/tabs` для native — это уже нормализованный layout snapshot, а не
+сырой список процессов: вместе с tabs приходят `groups`, `statuses`, `statusMarker`,
+`processBar`, `contextPct`, `filePath`, `groupId` и `visualParentTabId`. Нативный клиент
+должен переиспользовать эту модель как mirror desktop sidebar'а. Не заводить отдельную iOS
+схему групп, статусов или file-tab связей: иначе desktop DnD/status и phone list начнут
+расходиться на первом же `project:layout-changed`.
+
+Layout operations для native split'ятся от runtime activity. CRUD групп и статусы идут через
+`/tab-groups/*`, reorder — через `/tab-layout` с `orderedIds`, `groupAssignments` и
+`groupAnchorAssignments`; busy/loaders продолжают идти маленьким `project-activity`
+snapshot'ом. Если смешать эти оси и перезагружать `/tabs` ради каждого busy-edge, phone снова
+получит тяжёлые reload'ы во время навигации.
+
 Native iOS также использует `GET /api/active-loaders` как preflight перед удалённым
 `build:install`. Endpoint возвращает широкий snapshot live-состояний, но install UI блокирует
 только элементы со `status=busy|running`. Важная граница: idle-alive Claude/Codex CLI — это
@@ -163,7 +184,7 @@ setBusy(cur => cur !== authoritativeBusy ? authoritativeBusy : cur);
 GET  /api/me                                   → ping, проверка токена
 GET  /api/projects                             → SQLite + isOpen/isActive + project icon из renderer bridge
 POST /api/projects/:id/rename                  → renameProject (через bridge → updateProject{name} → project:save-metadata)
-GET  /api/projects/:id/tabs                    → tabs + timelineCount + live state + statusMarker
+GET  /api/projects/:id/tabs                    → tabs + groups + statuses + timelineCount + live state + statusMarker/processBar/contextPct
 POST /api/projects/:id/sdk-tabs                → createSDKTab (через bridge)
 POST /api/sdk-tabs/:tabId/send                 → sendSDKMessage + dispatch external-prompt
 POST /api/sdk-tabs/:tabId/stop                 → query.close()
@@ -185,6 +206,9 @@ POST /api/sdk-tabs/:tabId/queue                 → mutatePromptQueue ({op, args
 GET  /api/sdk-tabs/:tabId/pending-question      → текущий AskUserQuestion (connect mid-question)
 POST /api/sdk-tabs/:tabId/answer-question       → answerClaudeQuestion ({source, answers, stop})
 GET  /api/active-loaders                       → live loaders snapshot для external install preflight
+GET  /api/project-activity                     → full project activity snapshot для native project badges
+GET  /api/events?scope=projects                → SSE только project-activity, без tab transcript watcher'ов
+POST /api/file-preview                         → read-only file-tab preview по absolute path, cap 1MB
 GET  /api/prompts[?etag=X]                     → getPrompts + getPromptGroups (no bridge); ?etag match → { etag, unchanged: true }
 GET  /api/agent-models                         → { codex:[{id,label,efforts}], claude:[{id,label}] } каталог моделей (no bridge; codex из live `codex debug models`). Прямой роут до `let m` — см. «Гочи let m». Детали — fact-mobile-claude-pty.md::Контекст-% и список моделей
 POST /api/log/client                           → mobile diagnostic logs → console.log → dev.log
@@ -192,6 +216,12 @@ GET  /api/events?token=&tabId=                 → SSE (text/event-stream) — �
 WS   /ws?token=&tabId=                          → тот же набор events. Legacy-канал для permissive-браузеров; на Yandex/Chrome с Protect не работает (ws:// к private-IP режется молча).
 POST /api/projects/:id/claude-tabs              → создать PTY+Claude таб (Terminal.tsx сам spawn'ит Claude по pendingAction)
 POST /api/projects/:id/agent-tabs               → создать PTY+Claude/Codex таб; body {toolType:'claude'|'codex'}
+POST /api/projects/:id/tab-groups               → create group row через renderer bridge
+POST /api/projects/:id/tab-groups/:gid/rename   → rename group
+POST /api/projects/:id/tab-groups/:gid/toggle-collapsed → collapse/expand group
+POST /api/projects/:id/tab-groups/:gid/status   → assign/clear group session status
+POST /api/projects/:id/tab-groups/:gid/delete   → delete group container, keep tabs
+POST /api/projects/:id/tab-layout               → reorder tabs/groups + group assignments/anchors
 POST /api/sdk-tabs/:tabId/resume                → claude --resume <sid> в existing PTY
 GET  /api/sdk-tabs/:tabId/status                → status строка (inactive/starting/active/busy) + sessionId + commandType
 ```
@@ -368,6 +398,41 @@ Warm-cache путь: только одна фаза `?after=<cachedLastUuid>` �
   потом подтверждает сетью. Историю чата дальше красит свой IDB-кэш истории.
 
 Known edge 2026-06-14: если project-card loader на экране всех проектов не горит при уже активном desktop turn, но после захода в проект tab-row loader виден и после возврата project-card тоже начинает гореть, не чини Codex/Claude streaming заново. In-tab SSE уже жив; рассинхрон находится между child tab runtime/revalidation и parent `ProjectsView` aggregate/cache adoption. Симптом важен для поиска: «loader на проекте появляется только после открытия проекта».
+
+## Project activity snapshot для native iOS badges
+
+Для нативного iPhone Terminal project list нужен не transcript и не live-канал каждой вкладки,
+а маленький агрегированный снимок по проектам. Контракт: `GET /api/project-activity` отдаёт
+полный snapshot вида `{projects:[{projectId,count,streaming,tabs:[{tabId,status,streaming}]}],ts}`.
+Тот же payload летит первым событием и последующими обновлениями через
+`GET /api/events?scope=projects` (`projectActivity=1` оставлен как совместимый alias). Это
+отдельный subscriber topic, не `tabId`: scope=projects не запускает Claude JSONL watcher,
+не подписывается на N вкладок и не получает `message`/token events.
+
+Snapshot намеренно полный, а не дельты `+1/-1`. iOS может потерять событие, уйти в background
+или поймать zombie-SSE; следующий full snapshot исправляет count/loader без ручного захода в
+проект. Heartbeat остаётся обычным `: hb`, reconnect на клиенте всегда делает REST seed.
+Отсутствующий project или tab в snapshot означает inactive/zero, а не «оставь старое».
+
+`computeProjectActivity()` собирает агрегат из живых runtime maps: Claude PTY, Codex, Gemini,
+SDK и safety-net `activityOpenIntervals` на случай, когда edge уже открыт, а конкретный engine
+карта ещё не успела обновиться. Это не второй детектор busy-state: все входы всё равно идут от
+тех же lifecycle/busy send'ов, что рисуют desktop/mobile loaders и пишут Agent Activity.
+`broadcastProjectActivity(reason)` debounced (~80ms) и no-op без subscribers; триггеры —
+busy/done/snapshot, `_notifyClaudeSession`, `recordActivity` open/close. Не слать это событие
+на каждый token/message: project badge интересуют только переходы состояния.
+
+`tabs[]` в snapshot — компактный runtime patch для native project-tabs page. Он нужен, чтобы
+телефон, стоящий на списке вкладок проекта, увидел busy-loader без входа в chat и без
+фонового `/api/projects/:id/tabs` refresh во время свайпа. Полные tab metadata, порядок,
+statusMarker, processBar и contextPct остаются ответственностью `/api/projects/:id/tabs`;
+project-activity патчит только `status/streaming`.
+
+Layout changes идут отдельным полем snapshot'а `layoutChangedProjectIds`. Renderer вызывает
+`project:layout-changed` при изменении групп, статусов или порядка; server добавляет id проекта
+в следующий project-activity кадр, чтобы native клиент запланировал `/tabs` reload после своего
+quiet-window. Это не license таскать полный tabs metadata в project-activity: activity остаётся
+маленьким runtime-каналом, а structural reload происходит отдельным путём.
 
 **Error-policy (важно):** ошибка сети показывается full-screen ТОЛЬКО когда показать
 нечего (`error && !data`). Если кэш есть — стейл-табы остаются, ошибка глотается, next

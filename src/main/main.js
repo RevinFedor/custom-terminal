@@ -33,6 +33,17 @@ try {
   }
 } catch { /* .env optional */ }
 
+if (process.env.NOTED_USER_DATA_DIR) {
+  try {
+    const userDataDir = path.resolve(process.env.NOTED_USER_DATA_DIR);
+    fs.mkdirSync(userDataDir, { recursive: true });
+    app.setPath('userData', userDataDir);
+    console.log('[Startup] userData override:', userDataDir);
+  } catch (error) {
+    console.warn('[Startup] userData override failed:', error?.message || error);
+  }
+}
+
 // E2E test mode: suppress native error dialogs that block Playwright
 if (process.env.NOTED_E2E_TEST === 'true') {
   dialog.showErrorBox = (title, content) => {
@@ -65,7 +76,9 @@ process.env.CLAUDE_CODE_ATTRIBUTION_HEADER = '0';
 // уникален для этого проекта: sc-desktop=9223, gt-editor=9222). В prod не
 // открываем сокет, чтобы не давать сторонним процессам доступ к Electron.
 if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
-  app.commandLine.appendSwitch('remote-debugging-port', '9224');
+  const cdpPort = String(process.env.NOTED_CDP_PORT || '9224');
+  app.commandLine.appendSwitch('remote-debugging-port', cdpPort);
+  console.log('[Startup] remote-debugging-port:', cdpPort);
 }
 
 // Load modules from src/main (works for both dev and production)
@@ -655,6 +668,7 @@ const geminiActiveTabs = new Set();        // tabs with active Gemini process (f
 // denormalized into the row so it survives later tab/project deletion.
 const activityOpenIntervals = new Map();   // tabId \u2192 { startTs, engine, projectId, projectPath, projectName, tabName, sessionId }
 let projectActivityBroadcastTimer = null;
+const projectLayoutChangedIds = new Set();
 
 // Resolve a denormalized identity snapshot for a tab at this instant. Works for
 // PTY tabs (terminalProjectIds live map \u2192 SQLite fallback) and SDK tabs
@@ -960,6 +974,7 @@ function computeProjectActivity() {
     projects: Array.from(byProject.values())
       .filter((p) => p.count > 0 || p.streaming)
       .sort((a, b) => String(a.projectId).localeCompare(String(b.projectId))),
+    layoutChangedProjectIds: Array.from(projectLayoutChangedIds),
     ts: Date.now(),
   };
 }
@@ -971,7 +986,13 @@ function scheduleProjectActivityBroadcast(reason = 'event') {
     try {
       require(path.join(srcMainDir, 'web-server')).broadcastProjectActivity(reason);
     } catch {}
+    projectLayoutChangedIds.clear();
   }, 80);
+}
+
+function scheduleProjectLayoutBroadcast(projectId, reason = 'tab-layout') {
+  if (projectId) projectLayoutChangedIds.add(projectId);
+  scheduleProjectActivityBroadcast(reason);
 }
 
 function recordActivity(tabId, busy, engine) {
@@ -2467,59 +2488,84 @@ function startClaudeHookServer() {
         // detectable evidence instead of "feels wrong".
         if (event === 'UserPromptSubmit') {
           const audit = pendingPasteAudit.get(tabId);
+          console.log('[PasteAudit] UserPromptSubmit tab=' + tabId.slice(-12) + ' hasAudit=' + !!audit + ' handoff=' + (audit?.handoffId || '-') + ' source=' + (audit?.source || '-') + ' transcript=' + (transcript_path || '-'));
           if (audit && transcript_path) {
             // Best-effort, never block the hook ack. Read async, log result.
             (async () => {
               try {
                 const fsp = require('fs').promises;
                 const crypto = require('crypto');
-                const raw = await fsp.readFile(transcript_path, 'utf8');
-                // Walk from the end backwards looking for the last
-                // {type:"user", message:{role:"user", content:...}} entry.
-                const lines = raw.split('\n');
-                let actualText = null;
-                for (let li = lines.length - 1; li >= 0; li--) {
-                  const ln = lines[li].trim();
-                  if (!ln) continue;
-                  let rec;
-                  try { rec = JSON.parse(ln); } catch { continue; }
-                  if (rec.type !== 'user') continue;
-                  const m = rec.message;
-                  if (!m || m.role !== 'user') continue;
-                  if (typeof m.content === 'string') { actualText = m.content; break; }
-                  if (Array.isArray(m.content)) {
-                    const textPart = m.content.find(c => c && c.type === 'text');
-                    if (textPart && typeof textPart.text === 'string') { actualText = textPart.text; break; }
+                const readLastUserText = async () => {
+                  const raw = await fsp.readFile(transcript_path, 'utf8');
+                  // Walk from the end backwards looking for the last
+                  // {type:"user", message:{role:"user", content:...}} entry.
+                  const lines = raw.split('\n');
+                  for (let li = lines.length - 1; li >= 0; li--) {
+                    const ln = lines[li].trim();
+                    if (!ln) continue;
+                    let rec;
+                    try { rec = JSON.parse(ln); } catch { continue; }
+                    if (rec.type !== 'user') continue;
+                    const m = rec.message;
+                    if (!m || m.role !== 'user') continue;
+                    if (typeof m.content === 'string') return m.content;
+                    if (Array.isArray(m.content)) {
+                      const textPart = m.content.find(c => c && c.type === 'text');
+                      if (textPart && typeof textPart.text === 'string') return textPart.text;
+                    }
                   }
-                }
-                if (actualText === null) {
-                  console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' no user record found in transcript ' + transcript_path);
-                } else {
+                  return null;
+                };
+                const delays = [0, 80, 220, 520, 1000];
+                let finalText = null;
+                let finalHash = null;
+                let finalLen = 0;
+                for (let attempt = 0; attempt < delays.length; attempt++) {
+                  const delay = delays[attempt];
+                  if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+                  const actualText = await readLastUserText();
+                  if (actualText === null) {
+                    if (attempt === delays.length - 1) {
+                      console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' no user record found in transcript ' + transcript_path + ' attempts=' + delays.length);
+                    }
+                    continue;
+                  }
                   const actualLen = actualText.length;
                   const actualHash = crypto.createHash('sha1').update(actualText).digest('hex').slice(0, 16);
+                  finalText = actualText;
+                  finalHash = actualHash;
+                  finalLen = actualLen;
                   const match = actualLen === audit.expectedLen && actualHash === audit.expectedHash;
                   if (match) {
-                    console.log('[PasteAudit] tab=' + tabId.slice(-12) + ' ✅ match len=' + actualLen + ' hash=' + actualHash + ' (sent ' + (Date.now() - audit.sentAt) + 'ms ago)');
-                  } else {
-                    console.warn('[PasteAudit:MISMATCH] tab=' + tabId.slice(-12)
-                      + ' expectedLen=' + audit.expectedLen + ' actualLen=' + actualLen
-                      + ' Δ=' + (actualLen - audit.expectedLen)
-                      + ' expectedHash=' + audit.expectedHash + ' actualHash=' + actualHash
-                      + ' expectedHead=[' + audit.headPreview + ']'
-                      + ' actualHead=[' + actualText.substring(0, 80).replace(/\s+/g, ' ') + ']'
-                      + ' expectedTail=[' + audit.tailPreview + ']'
-                      + ' actualTail=[' + actualText.substring(Math.max(0, actualText.length - 80)).replace(/\s+/g, ' ') + ']'
-                      + ' transcript=' + transcript_path);
+                    console.log('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' ✅ match len=' + actualLen + ' hash=' + actualHash + ' attempt=' + (attempt + 1) + ' (sent ' + (Date.now() - audit.sentAt) + 'ms ago)');
+                    return;
+                  }
+                  if (attempt < delays.length - 1) {
+                    console.log('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' pending mismatch attempt=' + (attempt + 1) + ' expectedHash=' + audit.expectedHash + ' actualHash=' + actualHash + ' — retrying');
                   }
                 }
+                if (finalText !== null) {
+                  console.warn('[PasteAudit:MISMATCH] tab=' + tabId.slice(-12)
+                    + ' handoff=' + (audit.handoffId || '-')
+                    + ' source=' + (audit.source || '-')
+                    + ' expectedLen=' + audit.expectedLen + ' actualLen=' + finalLen
+                    + ' Δ=' + (finalLen - audit.expectedLen)
+                    + ' expectedHash=' + audit.expectedHash + ' actualHash=' + finalHash
+                    + ' expectedHead=[' + audit.headPreview + ']'
+                    + ' actualHead=[' + finalText.substring(0, 80).replace(/\s+/g, ' ') + ']'
+                    + ' expectedTail=[' + audit.tailPreview + ']'
+                    + ' actualTail=[' + finalText.substring(Math.max(0, finalText.length - 80)).replace(/\s+/g, ' ') + ']'
+                    + ' attempts=' + delays.length
+                    + ' transcript=' + transcript_path);
+                }
               } catch (e) {
-                console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' check failed: ' + e.message);
+                console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' check failed: ' + e.message);
               } finally {
-                pendingPasteAudit.delete(tabId);
+                if (pendingPasteAudit.get(tabId) === audit) pendingPasteAudit.delete(tabId);
               }
             })();
           } else if (audit && !transcript_path) {
-            console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' staged but transcript_path missing — cleared');
+            console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' staged but transcript_path missing — cleared');
             pendingPasteAudit.delete(tabId);
           }
         }
@@ -6306,7 +6352,9 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     // Build env with shell integration
     const shellEnv = {
       ...process.env,
+      TERM: 'xterm-256color',
       COLORTERM: 'truecolor',  // Enable 24-bit colors for Ink-based CLIs (gemini, claude)
+      CLICOLOR: '1',
       LANG: process.env.LANG || 'en_US.UTF-8',
       LC_ALL: process.env.LC_ALL || 'en_US.UTF-8',
       TERM_PROGRAM: 'vscode',  // Triggers xterm.js-optimized rendering in Claude Code's Ink
@@ -6364,6 +6412,14 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       // prefix bytes. See packages/claude-code-src/constants/system.ts:52.
       CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
     };
+
+    // Agent launchers can export NO_COLOR=1/FORCE_COLOR=0. Claude/Codex respect
+    // those variables and emit no ANSI colors, which makes the whole TUI
+    // monochrome even though xterm itself is configured for truecolor.
+    delete shellEnv.NO_COLOR;
+    if (shellEnv.FORCE_COLOR === '0') {
+      delete shellEnv.FORCE_COLOR;
+    }
 
     // Zsh: use ZDOTDIR to load our integration
     if (shellName === 'zsh') {
@@ -6853,6 +6909,24 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       // Strip OSC sequences (window title "✳ Claude Code" is branding, NOT thinking).
       // Then check stripped TUI content for spinner chars ✢✳✶✻✽.
       {
+        var isKnownCodexTab = codexTurnWatchers.has(tabId) || codexKnownSessions.has(tabId);
+        var isKnownGeminiTab = geminiActiveTabs.has(tabId);
+        var shouldDetectClaudeSpinner = !isKnownCodexTab && !isKnownGeminiTab && (
+          claudeCliActive.get(tabId) === true ||
+          bridgeKnownSessions.has(tabId) ||
+          claudeTurnBusy.get(tabId) === true ||
+          claudeLocalCommandWatchers.has(tabId) ||
+          claudeState.has(tabId)
+        );
+
+        if (!shouldDetectClaudeSpinner) {
+          if ((isKnownCodexTab || isKnownGeminiTab) && claudeSpinnerBusy.get(tabId)) {
+            clearTimeout(claudeSpinnerIdleTimer.get(tabId));
+            claudeSpinnerIdleTimer.delete(tabId);
+            claudeSpinnerBusy.delete(tabId);
+            claudeSpinnerLastSeenAt.delete(tabId);
+          }
+        } else {
         var dataNoOsc = data.replace(OSC_RE, '');
         var contentStripped = stripVTControlCharacters(dataNoOsc);
         var hasContentSpinner = CONTENT_SPINNER_RE.test(contentStripped);
@@ -6915,6 +6989,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
           if (compactOutputPhase === 'compacted' && claudeLocalCommandWatchers.get(tabId)?.command === '/compact') {
             completeClaudeLocalCommand(tabId, 'pty-output-compacted');
           }
+        }
         }
       }
       // ========== END CLAUDE BUSY DETECTION ==========
@@ -7215,8 +7290,12 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     stashFirst = false, // Send Ctrl+S to stash current user input (Claude restores after slash-cmd submit)
     dismissAutocomplete = false, // Send Esc after paste to close slash-cmd autocomplete dropdown
     logPrefix = '[safePaste]',
+    handoffId = null,
+    source = null,
     safetyTimeoutMs = 8000,
-    fast = false // Turbo mode for Gemini/Bash (skip render waits)
+    fast = false, // Turbo mode for Gemini/Bash (skip render waits)
+    submitSequence = '\r',
+    submitLabel = null
   } = options;
 
   // TTYHOG on macOS = 1024 bytes. Paste brackets = 12 bytes. Leave margin.
@@ -7276,7 +7355,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   }
 
   const t0 = Date.now();
-  console.log(logPrefix + ' 🚀 Start: "' + content.substring(0, 40) + '" (' + content.length + ' chars → ' + chunks.length + ' chunk(s), fast=' + fast + ', ctrlCFirst=' + ctrlCFirst + ', stashFirst=' + stashFirst + ')');
+  const resolvedSubmitLabel = submitLabel || (submitSequence === '\t' ? 'Tab' : (submitSequence === '\r' ? 'Enter' : JSON.stringify(submitSequence)));
+  console.log(logPrefix + ' 🚀 Start: "' + content.substring(0, 40) + '" (' + content.length + ' chars → ' + chunks.length + ' chunk(s), fast=' + fast + ', ctrlCFirst=' + ctrlCFirst + ', stashFirst=' + stashFirst + ', submit=' + resolvedSubmitLabel + ', handoff=' + (handoffId || '-') + ', source=' + (source || '-') + ')');
 
   // Optional: Ctrl+S to stash any user input — Claude pushes it to stash and
   // clears the prompt; after our slash-cmd submits, Claude auto-restores stash.
@@ -7414,6 +7494,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         const crypto = require('crypto');
         const expectedHash = crypto.createHash('sha1').update(content).digest('hex').slice(0, 16);
         pendingPasteAudit.set(broadcastTabId, {
+          handoffId: handoffId || null,
+          source: source || null,
           expectedLen: content.length,
           expectedHash,
           headPreview: content.substring(0, 80).replace(/\s+/g, ' '),
@@ -7421,7 +7503,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           sentAt: Date.now(),
           logPrefix,
         });
-        console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] staged expectedLen=' + content.length + ' hash=' + expectedHash);
+        console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] staged handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' expectedLen=' + content.length + ' hash=' + expectedHash);
       } catch (e) {
         console.warn(logPrefix + ' [PasteAudit] stage failed:', e.message);
       }
@@ -7429,7 +7511,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
 
     if (fast) {
       // Fast mode: fixed delay (Gemini/bash don't use Ink sync)
-      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Waiting 500ms before Enter (fast mode)...');
+      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Waiting 500ms before ' + resolvedSubmitLabel + ' (fast mode)...');
       await new Promise(r => setTimeout(r, 500));
     } else {
       // Slow mode: short drain for secondary React renders / re-layouts.
@@ -7438,14 +7520,14 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       // the same reason as the pre-paste drain above: if a submit lands while
       // the PTY is still streaming this debounce would never see 50ms of
       // silence; cap it so Enter isn't delayed for the rest of the turn.
-      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Draining PTY before Enter (slow mode)...');
+      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Draining PTY before ' + resolvedSubmitLabel + ' (slow mode)...');
       await drainPtyData(term, 50, 600);
     }
-    term.write('\r');
-    console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] ✅ Sent Enter (total: ' + (Date.now() - t0) + 'ms)');
+    term.write(submitSequence);
+    console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] ✅ Sent ' + resolvedSubmitLabel + ' handoff=' + (handoffId || '-') + ' (total: ' + (Date.now() - t0) + 'ms)');
   }
 
-  return { success: true, chunksTotal: chunks.length, renderTimeMs: renderTimes };
+  return { success: true, chunksTotal: chunks.length, renderTimeMs: renderTimes, submitKey: submit ? resolvedSubmitLabel : null };
 
   } finally {
     emitBusy(false);
@@ -7532,6 +7614,21 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
         ' lastEvent=' + (codexTurnState?.lastEventType || 'none') +
         ' lastEventTs=' + (codexTurnState?.lastEventTs || 'none') +
         ' commandRunning=' + (commandState?.isRunning === true)
+      );
+    }
+    const claudeSid = bridgeKnownSessions.get(tabId) || null;
+    if (claudeSid || findClaudePidByTab(tabId)) {
+      const audit = pendingPasteAudit.get(tabId) || null;
+      console.warn(
+        '[ClaudeInterruptInput]' +
+        ' tab=' + String(tabId).slice(-12) +
+        ' key=' + (data === '\x1b' ? 'Escape' : 'Ctrl+C') +
+        ' session=' + String(claudeSid || 'none').slice(0, 8) +
+        ' turnBusy=' + (claudeTurnBusy.get(tabId) === true) +
+        ' spinnerBusy=' + (claudeSpinnerBusy.get(tabId) === true) +
+        ' pendingAudit=' + !!audit +
+        ' handoff=' + (audit?.handoffId || '-') +
+        ' auditAgeMs=' + (audit ? Date.now() - audit.sentAt : 0)
       );
     }
     cancelClaudeLocalCommandFromInput(tabId, data);
@@ -7640,21 +7737,27 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
 
 // Programmatic paste (used for automated tools like Update Docs)
 // Uses safePasteAndSubmit to ensure Bracketed Paste Mode and avoid TTYHOG issues.
-ipcMain.handle('terminal:paste', async (event, { tabId, content, submit = true, fast = true }) => {
+ipcMain.handle('terminal:paste', async (event, { tabId, content, submit = true, fast = true, handoffId = null, source = null } = {}) => {
   const term = terminals.get(tabId);
   if (!term) {
     return { success: false, error: 'terminal not found' };
   }
 
-  console.log('[terminal:paste] Pasting ' + content.length + ' chars to tab ' + tabId + ' (submit=' + submit + ', fast=' + fast + ')');
+  console.log('[terminal:paste] Pasting ' + content.length + ' chars to tab ' + tabId + ' (submit=' + submit + ', fast=' + fast + ', handoff=' + (handoffId || '-') + ', source=' + (source || '-') + ')');
   
   try {
     const result = await safePasteAndSubmit(term, content, {
       submit,
       ctrlCFirst: false, // Don't clear by default
-      logPrefix: '[paste:' + tabId + ']',
+      logPrefix: '[paste:' + tabId + (handoffId ? ':' + handoffId : '') + ']',
+      handoffId,
+      source,
       fast // Enable fast mode by default for general paste
     });
+    if (result && typeof result === 'object') {
+      result.submitted = !!submit;
+      result.handoffId = handoffId || null;
+    }
     return result;
   } catch (error) {
     console.error('[terminal:paste] Error:', error);
@@ -7685,6 +7788,28 @@ ipcMain.handle('codex:save-clipboard-image', async (_event, { tabId } = {}) => {
   } catch (error) {
     console.warn('[codex:save-clipboard-image] failed:', error?.message || error);
     return { success: false, error: error?.code || 'save_failed' };
+  }
+});
+
+ipcMain.handle('codex:stage-image-path', async (_event, { tabId, filePath } = {}) => {
+  try {
+    const candidate = typeof filePath === 'string' ? filePath.trim() : '';
+    if (!candidate || !path.isAbsolute(candidate)) {
+      return { success: false, error: 'invalid_path' };
+    }
+    if (!/\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(candidate)) {
+      return { success: false, error: 'unsupported_image_path' };
+    }
+    const st = await fs.promises.stat(candidate).catch(() => null);
+    if (!st || !st.isFile()) {
+      return { success: false, error: 'image_path_missing' };
+    }
+    rememberCodexClipboardImagePath(tabId, candidate);
+    console.log('[codex:stage-image-path] tab=' + String(tabId || 'unknown').slice(-12) + ' path=' + candidate + ' bytes=' + st.size);
+    return { success: true, path: candidate, size: st.size };
+  } catch (error) {
+    console.warn('[codex:stage-image-path] failed:', error?.message || error);
+    return { success: false, error: error?.code || 'stage_failed' };
   }
 });
 // Send a slash command to Claude's Ink TUI (chunked paste + echo verification)
@@ -8249,7 +8374,9 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
 // Goes through safePasteAndSubmit so bracketed-paste + sync marker logic still
 // guarantees Ink ingests the chip atomically (no [Pasted text #N] fragments).
 ipcMain.handle('claude:append-input', async (event, tabId, text, options = {}) => {
-  console.log('[append-input] 📩 Received: tabId=' + tabId + ' chars=' + (text || '').length + ' ts=' + Date.now());
+  const handoffId = options && typeof options.handoffId === 'string' ? options.handoffId : null;
+  const source = options && typeof options.source === 'string' ? options.source : null;
+  console.log('[append-input] 📩 Received: tabId=' + tabId + ' chars=' + (text || '').length + ' submit=' + !!options?.submit + ' handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' ts=' + Date.now());
   const term = terminals.get(tabId);
   if (!term) {
     console.log('[append-input] ❌ Terminal not found for tabId=' + tabId);
@@ -8287,9 +8414,14 @@ ipcMain.handle('claude:append-input', async (event, tabId, text, options = {}) =
     submit: shouldSubmit,
     stashFirst: false, // never stash on replay — user wants append, not replace
     ctrlCFirst: false,
-    logPrefix: '[append-input:' + tabId + ']'
+    logPrefix: '[append-input:' + tabId + (handoffId ? ':' + handoffId : '') + ']',
+    handoffId,
+    source,
   });
-  if (result && typeof result === 'object') result.submitted = shouldSubmit;
+  if (result && typeof result === 'object') {
+    result.submitted = shouldSubmit;
+    result.handoffId = handoffId || null;
+  }
   return result;
 });
 
@@ -8506,324 +8638,587 @@ ipcMain.handle('claude:toggle-thinking', async (event, tabId) => {
   });
 });
 
-// Open Rewind menu, navigate to target entry with arrow keys
-// Uses specific color detection for reliability
-ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, targetText, skipDuplicates = 0, pasteAfter }) => {
+// Claude rewind through the native `/rewind` slash command.
+// Flow: preflight current input → stash if needed → `/rewind` → DOWN to target → Enter.
+// Native mode lets History own the selected prompt draft; after Claude restores it into
+// the TUI composer, we grab+clear that composer so there is a single input source.
+// Optional `pasteAfter` keeps the AI-assisted compact path, but it now shares the same rewind selector.
+ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, targetText, targetFullText, rewindableCount, skipDuplicates = 0, pasteAfter }) => {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
+  if (!hasLiveClaudeInTab(tabId)) return { success: false, error: 'no_claude_session' };
+  if (claudeTurnBusy.get(tabId) === true) return { success: false, error: 'claude_busy' };
 
-  const stripped = require('node:util').stripVTControlCharacters;
-
-  // Helper: clean raw PTY buffer → readable text
   function cleanBuffer(raw) {
-    const spaced = raw.replace(/\x1b\[(\d*)C/g, (_, n) => ' '.repeat(parseInt(n) || 1));
+    const spaced = String(raw || '').replace(/\x1b\[(\d*)C/g, (_, n) => ' '.repeat(parseInt(n) || 1));
     const normalized = spaced
       .replace(/\x1b\[\d*[ABD]/g, '')
-      .replace(/\x1b\[\d+;\d+H/g, '\n');
-    return stripped(normalized);
+      .replace(/\x1b\[\d+;\d+[Hf]/g, '\n');
+    return stripVTControlCharacters(normalized);
   }
 
-  // Helper: parse full Rewind menu (initial render) → { entries[], cursorIndex }
-  function parseMenu(cleanText) {
-    const allLines = cleanText.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
-    let cursorIndex = -1;
-    const entries = [];
-    for (const line of allLines) {
-      if (/^[─]+$/.test(line)) continue;
-      if (line === 'Rewind') continue;
-      if (line.startsWith('Restore and fork')) continue;
-      if (line.startsWith('Enter to continue')) continue;
-      if (line.startsWith('❯')) {
-        const text = line.replace(/^❯\s*/, '').replace(/^\(current\)\s*/, '').trim();
-        cursorIndex = entries.length;
-        if (text) entries.push(text);
-        continue;
-      }
-      if (line.length > 2) entries.push(line);
-    }
-    return { entries, cursorIndex };
+  function normalizeCandidate(text) {
+    return String(text || '')
+      .replace(/^[●❯]\s*/, '')
+      .replace(/^\(current\)\s*/, '')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 
-  // Helper: extract selected text from RAW PTY buffer
-  // Strategies:
-  // 1. Specific Lavender RGB color used by Claude Code TUI (most reliable)
-  // 2. Standard '❯' cursor
-  function extractSelectedText(raw) {
-    // Strategy 1: Look for the lavender color \x1b[38;2;177;185;249m
-    // This persists even when the '❯' cursor is not redrawn in diffs
-    const colorStart = '\x1b[38;2;177;185;249m';
-    const colorEnd = '\x1b[39m'; // Reset text color
-    
-    // Search from the end because diffs often append the newest state
-    const startIdx = raw.lastIndexOf(colorStart);
-    if (startIdx !== -1) {
-      let endIdx = raw.indexOf(colorEnd, startIdx);
-      if (endIdx === -1) endIdx = raw.length; // If no reset, take till end
-      
-      const coloredContent = raw.substring(startIdx + colorStart.length, endIdx);
-      // Clean up the content (remove nested codes or motion codes)
-      return cleanBuffer(coloredContent).trim();
-    }
-    
-    // Strategy 2: Fallback to '❯' if color not found (e.g. initial render)
-    const clean = cleanBuffer(raw);
-    const match = clean.match(/❯\s*(.*)/);
-    if (match) {
-        // Remove (current) label if present
-        return match[1].replace(/^\(current\)\s*/, '').trim();
-    }
-    
-    return null;
+  function isMenuChrome(text) {
+    const t = normalizeCandidate(text);
+    if (!t) return true;
+    return t === '●'
+      || t === '❯'
+      || t === 'Rewind'
+      || t === 'Do nothing'
+      || t === 'Rewind conversation'
+      || t.startsWith('Stay at current position')
+      || t.startsWith('Enter to continue')
+      || t.startsWith('Restore and fork');
   }
 
-  // Helper: check if cursor text matches target text (prefix comparison)
-  function textMatchesTarget(cursorText, targetPrefix) {
-    if (!cursorText || !targetPrefix) return false;
-    // Normalize spaces for comparison
-    // TRIM both to ensure leading spaces (indents) don't break match
-    const ct = cursorText.trim().replace(/\s+/g, ' ').substring(0, 50);
-    const tp = targetPrefix.trim().replace(/\s+/g, ' ').substring(0, 50);
-    
-    // Log for debugging failures
-    const match = ct.includes(tp) || tp.includes(ct);
-    if (!match) {
-        // Only log mismatches in verbose mode or if requested, to avoid spam
-        // console.log(`[Restore:Debug] Mismatch: TUI="${ct}" vs Target="${tp}"`);
-    } else {
-        console.log(`[Restore:Debug] MATCH: TUI="${ct}" vs Target="${tp}"`);
-    }
-    
-    return match;
-  }
-
-  // Helper: send key → wait for \x1b[?2026l → return RAW buffer
-  function sendAndCaptureRaw(key, timeout = 3000) {
-    return new Promise((resolve, reject) => {
-      let buf = '';
-      const sub = term.onData((data) => {
-        buf += data;
-        if (buf.includes('\x1b[?2026l')) {
-          sub.dispose();
-          resolve(buf);
-        }
-      });
-      term.write(key);
-      setTimeout(() => { sub.dispose(); reject(new Error('sync timeout')); }, timeout);
-    });
-  }
-
-  try {
-    // Step 0: Check DangerZone — if active, wait for it to clear (same pattern as toggle-thinking)
-    // Ctrl+C at idle prompt triggers DZ ("Press Ctrl-C again to exit"),
-    // and Escape cannot open the Rewind menu while DZ is active.
-    const dz = claudeCtrlCDangerZone.get(tabId);
-    if (dz) {
-      console.log('[Restore:History] ⚠️ DangerZone active — waiting for prompt return...');
-      await dz.promise;
-      console.log('[Restore:History] ✅ DangerZone cleared, proceeding');
-    }
-
-    // Step 1: Ctrl+C to cancel current input (only if Claude might be busy)
-    // Use sendAndCaptureRaw to properly wait for Ink re-render before next step
-    console.log('[Restore:History] Step 1: Ctrl+C');
-    try {
-      await sendAndCaptureRaw('\x03', 3000);
-    } catch (e) {
-      // Ctrl+C might not produce sync marker if Claude is already idle — that's OK
-      console.log('[Restore:History] Ctrl+C sync: ' + e.message + ' (OK, continuing)');
-    }
-
-    // Step 1.5: If Ctrl+C triggered DangerZone, wait for it to clear
-    const dzAfter = claudeCtrlCDangerZone.get(tabId);
-    if (dzAfter) {
-      console.log('[Restore:History] ⚠️ Ctrl+C triggered DangerZone — waiting for clear...');
-      await dzAfter.promise;
-      console.log('[Restore:History] ✅ DangerZone cleared after Ctrl+C');
-      // Drain any residual PTY data after DZ clear
-      await drainPtyData(term, 300);
-    }
-
-    // Step 2: First Escape (prep)
-    // Escape (\x1b) doesn't produce \x1b[?2026l sync markers — Ink needs ~200ms
-    // to distinguish standalone Escape from ANSI sequence start (\x1b[A etc.)
-    // So we use fixed delays instead of sendAndCaptureRaw.
-    console.log('[Restore:History] Step 2: First Escape');
-    term.write('\x1b');
-    await new Promise(r => setTimeout(r, 500));
-
-    // Step 3: Second Escape → Rewind menu should open
-    // Use drainPtyData to capture whatever Ink renders after the menu opens
-    console.log('[Restore:History] Step 3: Second Escape (menu)');
-    term.write('\x1b');
-    // Wait for Ink to process Escape (~200ms) + render the menu
-    const menuRaw = await drainPtyData(term, 800);
-
-    const menuClean = cleanBuffer(menuRaw);
-    const initialState = parseMenu(menuClean);
-    const knownEntries = initialState.entries;
-    let cursorPos = initialState.cursorIndex;
-
-    console.log('[Restore:History] Menu opened: ' + knownEntries.length + ' entries, cursor=' + cursorPos);
-    if (knownEntries.length > 0) {
-      console.log('[Restore:History] Menu entries: ' + knownEntries.map(e => e.substring(0, 40)).join(' | '));
-    } else {
-      console.log('[Restore:History] Menu raw (first 500): ' + menuRaw.substring(0, 500).replace(/[\x00-\x1f]/g, '.'));
-    }
-
-    // Step 4: Navigate to target entry
-    const targetPrefix = (targetText || '').substring(0, 40);
-    
-    // Check if target is currently visible in the initial menu render
-    let targetIdx = -1;
-    if (targetPrefix) {
-       targetIdx = knownEntries.findIndex(e => textMatchesTarget(e, targetPrefix));
-    }
-    
-    let maxPresses = 0;
-    
-    if (targetIdx !== -1) {
-        // CASE 1: Target is visible immediately. We can calculate exact steps.
-        const stepsNeeded = cursorPos - targetIdx;
-        maxPresses = stepsNeeded + 2; // +2 safety
-        console.log('[Restore:History] Target visible at relative index ' + targetIdx + '. Steps needed: ' + stepsNeeded);
-    } else {
-        // CASE 2: Target is NOT visible (scrolled out of view).
-        // We cannot rely on absolute 'targetIndex' because TUI might use different indexing.
-        // STRATEGY: Visual Search. Set a high limit and loop until we see the RGB match.
-        maxPresses = 50; 
-        console.log('[Restore:History] Target NOT visible initially. Starting visual search (max 50 steps) for: "' + targetPrefix + '..."');
-    }
-
-    let found = false;
-    let pressCount = 0;
-    let duplicatesRemaining = skipDuplicates; // Skip N newer duplicates before accepting match
-
-    console.log('[Restore:History] Navigation: maxPresses=' + maxPresses + ', skipDuplicates=' + skipDuplicates);
-
-    // Unified navigation loop: per-step Lavender RGB verification (see fix-rewind-navigation.md).
-    // Ink diff renders corrupt individual characters (cursor-movement artifacts in cleanBuffer),
-    // so we use exact match first, then fuzzy word-overlap as fallback.
-    for (let i = 0; i < maxPresses; i++) {
-      try {
-        const diffRaw = await sendAndCaptureRaw('\x1b[A', 1500);
-        pressCount++;
-        const selectedText = extractSelectedText(diffRaw);
-        console.log(`[Restore:History] UP #${pressCount} -> Selected: "${(selectedText || 'null').substring(0, 50)}..."`);
-
-        let matched = false;
-
-        // Exact match (works when diff render is clean)
-        if (selectedText && textMatchesTarget(selectedText, targetPrefix)) {
-          matched = true;
-        }
-
-        // Fuzzy fallback: Ink diff renders corrupt individual characters via cursor
-        // repositioning (\x1b[nC, \x1b[r;cH) that cleanBuffer can't simulate.
-        // Whole words survive though. Check ≥60% word overlap.
-        if (!matched && selectedText && targetPrefix) {
-          const targetWords = targetPrefix.trim().split(/\s+/).filter(w => w.length > 2);
-          const selectedNorm = selectedText.trim().replace(/\s+/g, ' ');
-          if (targetWords.length > 0) {
-            const matchedWords = targetWords.filter(w => selectedNorm.includes(w));
-            const ratio = matchedWords.length / targetWords.length;
-            if (ratio >= 0.6) {
-              console.log('[Restore:History] Fuzzy match (' + Math.round(ratio * 100) + '%, ' + matchedWords.length + '/' + targetWords.length + ' words)');
-              matched = true;
-            }
-          }
-        }
-
-        if (matched) {
-          if (duplicatesRemaining > 0) {
-            duplicatesRemaining--;
-            console.log('[Restore:History] ⏩ Skipping duplicate (' + duplicatesRemaining + ' remaining)');
+  function extractRgbCandidates(raw) {
+    const results = [];
+    const colorRe = /\x1b\[38;2;\d+;\d+;\d+m/g;
+    let match;
+    while ((match = colorRe.exec(raw)) !== null) {
+      let i = colorRe.lastIndex;
+      let text = '';
+      while (i < raw.length) {
+        const rest = raw.slice(i);
+        if (rest.startsWith('\x1b[39m') || rest.startsWith('\x1b[0m') || rest.startsWith('\x1b[38;2;')) break;
+        if (raw[i] === '\x1b') {
+          const esc = rest.match(/^\x1b\[[0-9;?]*[ -/]*[@-~]/);
+          if (esc) {
+            i += esc[0].length;
             continue;
           }
-          console.log('[Restore:History] ✅ Target matched!');
-          found = true;
-          break;
         }
-      } catch (e) {
-        console.log('[Restore:History] Error during navigation:', e.message);
+        text += raw[i];
+        i++;
+      }
+      const candidate = normalizeCandidate(cleanBuffer(text));
+      if (!isMenuChrome(candidate)) results.push(candidate);
+      colorRe.lastIndex = Math.max(i, colorRe.lastIndex);
+    }
+    return results;
+  }
+
+  function extractPointerCandidates(raw) {
+    const clean = cleanBuffer(raw);
+    const lines = clean.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
+    const results = [];
+    for (const line of lines) {
+      const m = line.match(/[●❯]\s*(.+)$/);
+      if (!m) continue;
+      const candidate = normalizeCandidate(m[1]);
+      if (!isMenuChrome(candidate)) results.push(candidate);
+    }
+    return results;
+  }
+
+  function extractSelectedCandidates(raw) {
+    const rgb = extractRgbCandidates(raw);
+    if (rgb.length > 0) return rgb;
+    return extractPointerCandidates(raw);
+  }
+
+  function textMatchesTarget(selectedText, targetPrefix) {
+    if (!selectedText || !targetPrefix) return false;
+    const st = normalizeCandidate(selectedText).substring(0, 80);
+    const tp = normalizeCandidate(targetPrefix).substring(0, 80);
+    if (!st || !tp) return false;
+    if (st.includes(tp) || tp.includes(st)) {
+      console.log('[Claude:Rewind] MATCH: TUI="' + st + '" vs Target="' + tp + '"');
+      return true;
+    }
+
+    const targetWords = tp.split(/\s+/).filter(w => w.length > 2);
+    if (targetWords.length === 0) return false;
+    const matchedWords = targetWords.filter(w => st.includes(w));
+    const ratio = matchedWords.length / targetWords.length;
+    if (ratio >= 0.6) {
+      console.log('[Claude:Rewind] Fuzzy match (' + Math.round(ratio * 100) + '%, ' + matchedWords.length + '/' + targetWords.length + ' words)');
+      return true;
+    }
+    return false;
+  }
+
+  async function writeAndWait(key, waitFor, timeoutMs, logPrefix) {
+    const wait = waitForPtyText(term, waitFor, timeoutMs, logPrefix);
+    term.write(key);
+    return await wait;
+  }
+
+  async function grabRestoredRewindInput(expectedText) {
+    const expected = normalizeCandidate(expectedText);
+    const delays = [0, 180, 420, 900];
+    let lastResult = null;
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      if (delays[attempt] > 0) await new Promise(resolve => setTimeout(resolve, delays[attempt]));
+      const result = await captureClaudeInput(tabId, 'grab');
+      lastResult = result;
+      const text = typeof result?.text === 'string' ? result.text : '';
+      const normalized = normalizeCandidate(text);
+      const matched = expected ? normalized === expected : normalized.length === 0;
+      console.log('[Claude:Rewind] Grab restored input attempt=' + (attempt + 1)
+        + ' success=' + (result?.success === true)
+        + ' chars=' + text.length
+        + ' matchedTarget=' + matched
+        + ' error=' + (result?.error || '-'));
+
+      if (result?.success && normalized.length > 0) {
+        return { success: true, text, attempt: attempt + 1, matchedTarget: matched };
+      }
+      if (result?.success && attempt === delays.length - 1) {
+        return { success: true, text, attempt: attempt + 1, matchedTarget: matched, empty: true };
+      }
+      if (!result?.success && !['already_in_progress', 'claude_busy', 'editor_not_wired'].includes(result?.error)) {
         break;
       }
     }
+    return {
+      success: false,
+      error: lastResult?.error || 'rewind_input_grab_failed',
+      text: typeof lastResult?.text === 'string' ? lastResult.text : '',
+      matchedTarget: false
+    };
+  }
 
-    if (!found) {
-        console.error('[Restore:History] ❌ Target NOT found in menu after ' + pressCount + ' steps. Aborting rewind.');
-        // GUARD: Close menu with Escape to avoid selecting wrong entry (which defaults to top/bottom)
-        try {
-            term.write('\x1b');
-            await new Promise(r => setTimeout(r, 200));
-        } catch (ign) {}
+  try {
+    return await withPtyWriteLock(term, async () => {
+      const dz = claudeCtrlCDangerZone.get(tabId);
+      if (dz) {
+        console.log('[Claude:Rewind] DangerZone active — waiting for prompt return...');
+        await dz.promise;
+        console.log('[Claude:Rewind] DangerZone cleared');
+      }
 
-        return { success: false, error: 'Target not found in Claude history menu', cursorIndex: cursorPos, targetIndex: targetIdx, pressCount, menuEntries: knownEntries.length };
-    }
+      const inputCheck = await captureClaudeInput(tabId, 'copy');
+      if (!inputCheck.success) {
+        console.log('[Claude:Rewind] Input preflight failed: ' + (inputCheck.error || 'unknown'));
+        return { success: false, error: inputCheck.error || 'input_check_failed' };
+      }
 
-    // Step 5: Confirm selection with Enter
-    const rewindStartTime = Date.now();
-    console.log('[Restore:History] Confirming selection with Enter...');
-    
-    // We expect a re-render. 
-    // Sometimes Enter doesn't produce an immediate sync marker if Claude is busy processing.
-    // We use a longer timeout.
-    const confirmRaw = await sendAndCaptureRaw('\r', 5000);
-    console.log('[Restore:History] Confirm response in ' + (Date.now() - rewindStartTime) + 'ms');
+      const copiedText = typeof inputCheck.text === 'string' ? inputCheck.text : '';
+      const imageCount = Number(inputCheck.images || 0);
+      const hasInput = copiedText.trim().length > 0 || imageCount > 0;
+      const alreadyStashed = hasStashedMarker(tabId);
+      console.log('[Claude:Rewind] Input preflight: hasInput=' + hasInput + ' chars=' + copiedText.length + ' images=' + imageCount + ' alreadyStashed=' + alreadyStashed);
 
-    // Step 6: Paste compact text if provided
-    if (pasteAfter && typeof pasteAfter === 'string' && pasteAfter.length > 0) {
-      const promptWaitStart = Date.now();
-      console.log('[Restore:History] Waiting for prompt to fully render...');
+      if (hasInput && alreadyStashed) {
+        return {
+          success: false,
+          error: 'input_not_empty_with_existing_stash',
+          message: 'Current input is not empty while Claude already has a stash'
+        };
+      }
 
-      let promptReady = false;
-      let renderCount = 0;
+      const targetPrefix = String(targetText || '').trim().substring(0, 40);
+      if (!targetPrefix) return { success: false, error: 'empty_target' };
+      const targetInputText = String(targetFullText || targetText || '').trim();
 
-      await new Promise((resolve) => {
-        let buf = '';
-        let resolved = false;
+      const menuReadyRe = /Stay at current position|Restore and fork|\x1b\[38;2;\d+;\d+;\d+m|[●❯]\s*\S/;
+      const menuWait = waitForPtyText(
+        term,
+        menuReadyRe,
+        7000,
+        '[Claude:Rewind:menu]'
+      );
 
-        const safetyTimer = setTimeout(() => {
-          if (resolved) return;
-          resolved = true;
-          sub.dispose();
-          console.log('[Restore:History] Prompt render timeout');
-          resolve();
-        }, 15000);
-
-        const sub = term.onData((data) => {
-          if (resolved) return;
-          buf += data;
-
-          while (buf.includes('\x1b[?2026l')) {
-            renderCount++;
-            // Prompt is ready when we see prompt symbols
-            if (buf.includes('\u2335') || buf.includes('\u23F5') || buf.includes('╰') || renderCount >= 5) {
-              promptReady = true;
-              resolved = true;
-              clearTimeout(safetyTimer);
-              sub.dispose();
-              resolve();
-              return;
-            }
-            buf = buf.split('\x1b[?2026l').slice(1).join('\x1b[?2026l');
-          }
-        });
-      });
-
-      console.log('[Restore:History] Pasting compact text (' + pasteAfter.length + ' chars)...');
-      await safePasteAndSubmit(term, pasteAfter, {
+      console.log('[Claude:Rewind] Sending /rewind via slash command');
+      const commandResult = await _safePasteAndSubmitInner(term, '/rewind', {
         submit: true,
-        ctrlCFirst: true,
-        logPrefix: '[Restore:History:paste]'
+        stashFirst: true,
+        ctrlCFirst: false,
+        dismissAutocomplete: true,
+        fast: false,
+        logPrefix: '[Claude:Rewind:command]'
       });
-    }
+      if (!commandResult || commandResult.success === false) {
+        return { success: false, error: commandResult?.error || 'rewind_command_failed' };
+      }
 
-    return { success: true, found, cursorIndex: cursorPos, targetIndex: targetIdx, pressCount };
+      const menuRaw = await menuWait;
+      const menuClean = cleanBuffer(menuRaw);
+      const initialCandidates = extractSelectedCandidates(menuRaw);
+      const menuLooksOpen = menuReadyRe.test(menuRaw) || menuClean.includes('Stay at current position') || menuClean.includes('Restore and fork');
+      if (!menuRaw || (!menuLooksOpen && initialCandidates.length === 0)) {
+        console.error('[Claude:Rewind] Menu did not open. raw=' + menuRaw.length + ' candidates=' + initialCandidates.length + ' clean="' + menuClean.substring(0, 240) + '"');
+        return { success: false, error: 'Rewind menu did not open' };
+      }
+      if (initialCandidates.length > 0) {
+        console.log('[Claude:Rewind] Menu opened initial="' + initialCandidates[initialCandidates.length - 1].substring(0, 70) + '"');
+      }
 
+      let found = false;
+      let pressCount = 0;
+      let maxPresses = 50;
+      const count = Number(rewindableCount);
+      const idx = Number(targetIndex);
+      if (Number.isFinite(count) && Number.isFinite(idx) && count > 0 && idx >= 0) {
+        maxPresses = Math.max(50, Math.min(500, count - idx + skipDuplicates + 6));
+      }
+
+      const hasDeterministicIndex = Number.isFinite(count) && Number.isFinite(idx) && count > 0 && idx >= 0 && idx < count;
+      if (hasDeterministicIndex) {
+        const targetSteps = Math.max(0, count - 1 - idx);
+        console.log('[Claude:Rewind] Navigating deterministic: target="' + targetPrefix + '" count=' + count + ' targetIndex=' + idx + ' DOWN steps=' + targetSteps + ' skipDuplicates=' + skipDuplicates);
+
+        if (targetSteps > 0) {
+          const navWait = waitForPtyText(
+            term,
+            /\x1b\[\?2026l|\x1b\[38;2;\d+;\d+;\d+m|[●❯]/,
+            Math.min(1500, Math.max(500, targetSteps * 40)),
+            '[Claude:Rewind:nav]'
+          );
+
+          let remaining = targetSteps;
+          while (remaining > 0) {
+            const batch = Math.min(remaining, 100);
+            term.write('\x1b[B'.repeat(batch));
+            pressCount += batch;
+            remaining -= batch;
+            if (remaining > 0) await drainPtyData(term, 10, 80);
+          }
+
+          const navRaw = await navWait;
+          const candidates = extractSelectedCandidates(navRaw);
+          const selectedText = candidates.length > 0 ? candidates[candidates.length - 1] : null;
+          console.log('[Claude:Rewind] DOWN burst #' + pressCount + ' -> "' + (selectedText || 'moved').substring(0, 70) + '" raw=' + (navRaw ? navRaw.length : 0) + 'B');
+          await drainPtyData(term, 80, Math.min(1000, 150 + targetSteps * 20));
+        }
+
+        found = true;
+      } else {
+        let duplicatesRemaining = skipDuplicates;
+        console.log('[Claude:Rewind] Navigating fallback: target="' + targetPrefix + '" maxPresses=' + maxPresses + ' skipDuplicates=' + skipDuplicates);
+
+        for (let i = 0; i < maxPresses; i++) {
+          const navRaw = await writeAndWait(
+            '\x1b[B',
+            /\x1b\[38;2;\d+;\d+;\d+m|[●❯]|\x1b\[\?2026l/,
+            2000,
+            '[Claude:Rewind:nav]'
+          );
+          pressCount++;
+
+          const candidates = extractSelectedCandidates(navRaw);
+          const selectedText = candidates.length > 0 ? candidates[candidates.length - 1] : null;
+          console.log('[Claude:Rewind] DOWN #' + pressCount + ' -> "' + (selectedText || 'null').substring(0, 70) + '"');
+
+          if (!selectedText) continue;
+          if (!textMatchesTarget(selectedText, targetPrefix)) continue;
+
+          if (duplicatesRemaining > 0) {
+            duplicatesRemaining--;
+            console.log('[Claude:Rewind] Skipping duplicate (' + duplicatesRemaining + ' remaining)');
+            continue;
+          }
+
+          found = true;
+          break;
+        }
+      }
+
+      if (!found) {
+        console.error('[Claude:Rewind] Target not found after ' + pressCount + ' presses. Closing menu.');
+        try {
+          term.write('\x1b');
+          await drainPtyData(term, 150, 500);
+        } catch {}
+        return { success: false, error: 'Target not found in Claude /rewind menu', pressCount };
+      }
+
+      console.log('[Claude:Rewind] Confirming target with Enter');
+      await writeAndWait('\r', /\x1b\[\?2026l|\x1b\]7777;prompt:|[⏵❯╰]/, 6000, '[Claude:Rewind:confirm]');
+      await waitForPtyText(term, /\x1b\]7777;prompt:|[⏵❯╰]|\x1b\[\?2026l/, 5000, '[Claude:Rewind:prompt]');
+
+      if (pasteAfter && typeof pasteAfter === 'string' && pasteAfter.length > 0) {
+        console.log('[Claude:Rewind] Pasting AI compact text (' + pasteAfter.length + ' chars)');
+        const pasteResult = await _safePasteAndSubmitInner(term, pasteAfter, {
+          submit: true,
+          ctrlCFirst: true,
+          stashFirst: false,
+          fast: false,
+          logPrefix: '[Claude:Rewind:paste]'
+        });
+        if (!pasteResult || pasteResult.success === false) {
+          return { success: false, error: pasteResult?.error || 'paste_after_failed', pressCount };
+        }
+      } else if (targetInputText) {
+        console.log('[Claude:Rewind] Moving clicked prompt out of terminal input into History draft (' + targetInputText.length + ' chars)');
+        const grabResult = await grabRestoredRewindInput(targetInputText);
+        if (!grabResult || grabResult.success === false) {
+          console.warn('[Claude:Rewind] Could not verify terminal input clear after native rewind: ' + (grabResult?.error || 'unknown'));
+        } else {
+          console.log('[Claude:Rewind] Terminal input grabbed+cleared chars=' + (grabResult.text ? grabResult.text.length : 0)
+            + ' matchedTarget=' + grabResult.matchedTarget
+            + ' attempt=' + grabResult.attempt);
+        }
+      }
+
+      return { success: true, found, targetIndex, pressCount, restoredInput: false, historyInputDraft: !pasteAfter && !!targetInputText };
+    });
   } catch (err) {
-    console.log('[Restore:History] Error:', err.message);
-    term.write('\x1b'); // try to close menu on error
+    console.log('[Claude:Rewind] Error:', err.message);
+    try { term.write('\x1b'); } catch {}
     return { success: false, error: err.message };
+  }
+});
+
+// Codex rewind through the native TUI backtrack flow.
+// Codex does not expose `/rewind`: Esc primes backtrack, the second Esc opens
+// the transcript overlay at the latest user prompt, further Esc presses step to
+// older user prompts, Enter submits `ThreadRollback { num_turns }`.
+// After Codex prefills its composer, we move that text into History input via
+// the existing Ctrl+G grab path so terminal composer stays empty.
+ipcMain.handle('codex:open-history-menu', async (_event, {
+  tabId,
+  targetIndex,
+  targetText,
+  targetFullText,
+  rewindableCount,
+  pasteAfter,
+}) => {
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'no_terminal' };
+
+  const candidates = await findAiDescendantProcessesByTab(tabId, 'codex');
+  if (candidates.length === 0) {
+    console.log('[Codex:Rewind] ❌ No live Codex process under shell pid=' + term.pid + ' tab=' + tabId);
+    return { success: false, error: 'no_codex_session' };
+  }
+
+  await ensureCodexTurnWatcher(tabId, null, terminalProjects.get(tabId));
+  const turnState = codexTurnWatchers.get(tabId);
+  if (turnState?.busy === true) {
+    console.log('[Codex:Rewind] Refusing while turn is busy tab=' + String(tabId).slice(-12));
+    return { success: false, error: 'codex_busy' };
+  }
+
+  if (pasteAfter && typeof pasteAfter === 'string' && pasteAfter.length > 0) {
+    console.log('[Codex:Rewind] pasteAfter is not supported for Codex native backtrack yet');
+    return { success: false, error: 'codex_rewind_paste_after_unsupported' };
+  }
+
+  function normalizeCandidate(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function codexFrameLooksLikePrompt(clean, raw) {
+    return raw.includes(CODEX_SYNC_MARKER)
+      || /Context\s+\d+%/i.test(clean)
+      || /›\s*/.test(clean)
+      || /No previous message to edit/i.test(clean);
+  }
+
+  async function grabRestoredCodexRewindInput(expectedText) {
+    const expected = normalizeCandidate(expectedText);
+    const delays = [0, 180, 420, 900];
+    let lastResult = null;
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      if (delays[attempt] > 0) await new Promise(resolve => setTimeout(resolve, delays[attempt]));
+      const result = await captureAgentInput(tabId, 'grab', 'codex');
+      lastResult = result;
+      const text = typeof result?.text === 'string' ? result.text : '';
+      const normalized = normalizeCandidate(text);
+      const matched = expected ? normalized === expected : normalized.length === 0;
+      console.log('[Codex:Rewind] Grab restored input attempt=' + (attempt + 1)
+        + ' success=' + (result?.success === true)
+        + ' chars=' + text.length
+        + ' matchedTarget=' + matched
+        + ' error=' + (result?.error || '-'));
+
+      if (result?.success && normalized.length > 0) {
+        return { success: true, text, attempt: attempt + 1, matchedTarget: matched };
+      }
+      if (result?.success && attempt === delays.length - 1) {
+        return { success: true, text, attempt: attempt + 1, matchedTarget: matched, empty: true };
+      }
+      if (!result?.success && !['already_in_progress', 'codex_ctrl_g_noop', 'editor_not_wired'].includes(result?.error)) {
+        break;
+      }
+    }
+    return {
+      success: false,
+      error: lastResult?.error || 'codex_rewind_input_grab_failed',
+      text: typeof lastResult?.text === 'string' ? lastResult.text : '',
+      matchedTarget: false,
+    };
+  }
+
+  try {
+    return await withPtyWriteLock(term, async () => {
+      const count = Number(rewindableCount);
+      const idx = Number(targetIndex);
+      if (!Number.isFinite(count) || !Number.isFinite(idx) || count <= 0 || idx < 0 || idx >= count) {
+        return { success: false, error: 'invalid_target_index', targetIndex, rewindableCount };
+      }
+
+      const targetInputText = String(targetFullText || targetText || '').trim();
+      if (!targetInputText) return { success: false, error: 'empty_target' };
+
+      const olderSteps = Math.max(0, count - 1 - idx);
+      const rollbackTurns = count - idx;
+      const escPressCount = 2 + olderSteps;
+      console.log('[Codex:Rewind] Starting native backtrack tab=' + String(tabId).slice(-12)
+        + ' targetIndex=' + idx
+        + ' count=' + count
+        + ' olderSteps=' + olderSteps
+        + ' rollbackTurns=' + rollbackTurns
+        + ' target=' + JSON.stringify(String(targetText || targetInputText).slice(0, 80)));
+
+      let primeFrame = await sendCodexKeyAndCapture(
+        term,
+        '\x1b',
+        2200,
+        '[Codex:Rewind:prime:initial]',
+        (clean) => /esc again to edit previous message/i.test(clean)
+      );
+      let hasPrimeHint = !primeFrame.timedOut && /esc again to edit previous message/i.test(primeFrame.clean || '');
+      console.log('[Codex:Rewind] prime initial timedOut=' + primeFrame.timedOut + ' hint=' + hasPrimeHint + ' clean=' + JSON.stringify(primeFrame.clean.slice(0, 220)));
+
+      if (!hasPrimeHint) {
+        console.log('[Codex:Rewind] Prime hint missing; trying input grab fallback before retry');
+        const inputCheck = await captureAgentInput(tabId, 'grab', 'codex');
+        const copiedText = typeof inputCheck?.text === 'string' ? inputCheck.text : '';
+        const imageCount = Number(inputCheck?.images || 0);
+        const hasInput = copiedText.trim().length > 0 || imageCount > 0;
+        console.log('[Codex:Rewind] Input grab fallback: success=' + (inputCheck?.success === true)
+          + ' clearedExisting=' + hasInput
+          + ' chars=' + copiedText.length
+          + ' images=' + imageCount
+          + ' error=' + (inputCheck?.error || '-'));
+        if (!inputCheck?.success && !['codex_ctrl_g_noop', 'editor_not_wired'].includes(inputCheck?.error)) {
+          return { success: false, error: inputCheck?.error || 'input_grab_failed' };
+        }
+        await drainPtyData(term, 180, 700);
+        primeFrame = await sendCodexKeyAndCapture(
+          term,
+          '\x1b',
+          2600,
+          '[Codex:Rewind:prime:after-grab]',
+          (clean) => /esc again to edit previous message/i.test(clean)
+        );
+        hasPrimeHint = !primeFrame.timedOut && /esc again to edit previous message/i.test(primeFrame.clean || '');
+        console.log('[Codex:Rewind] prime after-grab timedOut=' + primeFrame.timedOut + ' hint=' + hasPrimeHint + ' clean=' + JSON.stringify(primeFrame.clean.slice(0, 220)));
+      }
+
+      if (!hasPrimeHint) {
+        return { success: false, error: 'codex_rewind_prime_hint_not_observed', clean: primeFrame.clean.slice(0, 800) };
+      }
+
+      const openFrame = await sendCodexKeyAndCapture(
+        term,
+        '\x1b',
+        4000,
+        '[Codex:Rewind:open]',
+        (clean) => /No previous message to edit|T R A N S C R I P T|enter to edit message/i.test(clean)
+      );
+      console.log('[Codex:Rewind] open Esc timedOut=' + openFrame.timedOut + ' clean=' + JSON.stringify(openFrame.clean.slice(0, 260)));
+      if (/No previous message to edit/i.test(openFrame.clean)) {
+        return { success: false, error: 'no_previous_message' };
+      }
+      if (openFrame.timedOut || !/T R A N S C R I P T|enter to edit message/i.test(openFrame.clean || '')) {
+        return { success: false, error: 'codex_rewind_transcript_not_observed', clean: openFrame.clean.slice(0, 800) };
+      }
+
+      if (olderSteps > 0) {
+        console.log('[Codex:Rewind] Navigating older with Esc x' + olderSteps);
+        const navCapture = captureCodexFrame(term, {
+          timeoutMs: Math.min(7000, Math.max(1800, olderSteps * 80)),
+          logPrefix: '[Codex:Rewind:nav]',
+          predicate: (clean, raw) => raw.includes(CODEX_SYNC_MARKER) || /Context\s+\d+%/i.test(clean),
+        });
+        let remaining = olderSteps;
+        while (remaining > 0) {
+          const batch = Math.min(remaining, 80);
+          term.write('\x1b'.repeat(batch));
+          remaining -= batch;
+          if (remaining > 0) await drainPtyData(term, 10, 80);
+        }
+        const navFrame = await navCapture;
+        console.log('[Codex:Rewind] nav complete timedOut=' + navFrame.timedOut + ' raw=' + navFrame.raw.length + 'B clean=' + JSON.stringify(navFrame.clean.slice(0, 260)));
+      }
+
+      console.log('[Codex:Rewind] Confirming backtrack with Enter');
+      const targetNeedle = normalizeCandidate(targetInputText).slice(0, 40);
+      const confirmFrame = await sendCodexKeyAndCapture(
+        term,
+        '\r',
+        7000,
+        '[Codex:Rewind:confirm]',
+        (clean) => /Cannot rollback|ThreadRollbackFailed|rollback.*failed|requires persisted/i.test(clean)
+          || (targetNeedle.length > 0 && normalizeCandidate(clean).includes(targetNeedle))
+      );
+      const confirmClean = confirmFrame.clean || '';
+      console.log('[Codex:Rewind] confirm timedOut=' + confirmFrame.timedOut + ' clean=' + JSON.stringify(confirmClean.slice(0, 320)));
+      if (/Cannot rollback|ThreadRollbackFailed|rollback.*failed|requires persisted/i.test(confirmClean)) {
+        return { success: false, error: 'codex_thread_rollback_failed', clean: confirmClean.slice(0, 800) };
+      }
+      if (confirmFrame.timedOut || (targetNeedle.length > 0 && !normalizeCandidate(confirmClean).includes(targetNeedle))) {
+        return {
+          success: false,
+          error: 'codex_rewind_target_prefill_not_observed',
+          rollbackTurns,
+          pressCount: escPressCount,
+          clean: confirmClean.slice(0, 800),
+        };
+      }
+      await drainPtyData(term, 120, 700);
+
+      console.log('[Codex:Rewind] Moving clicked prompt out of terminal input into History draft (' + targetInputText.length + ' chars)');
+      const grabResult = await grabRestoredCodexRewindInput(targetInputText);
+      if (!grabResult || grabResult.success === false) {
+        console.warn('[Codex:Rewind] Could not verify terminal input clear after native backtrack: ' + (grabResult?.error || 'unknown'));
+        return {
+          success: false,
+          error: grabResult?.error || 'codex_rewind_restored_input_grab_failed',
+          rollbackTurns,
+          pressCount: escPressCount,
+          rollbackMayHaveApplied: true,
+        };
+      }
+      console.log('[Codex:Rewind] Terminal input grabbed+cleared chars=' + (grabResult.text ? grabResult.text.length : 0)
+        + ' matchedTarget=' + grabResult.matchedTarget
+        + ' attempt=' + grabResult.attempt);
+      if (!grabResult.matchedTarget) {
+        return {
+          success: false,
+          error: 'codex_rewind_restored_input_mismatch',
+          rollbackTurns,
+          pressCount: escPressCount,
+          rollbackMayHaveApplied: true,
+          restoredPreview: String(grabResult.text || '').slice(0, 160),
+          targetPreview: targetInputText.slice(0, 160),
+        };
+      }
+      if (grabResult.empty || !grabResult.text || normalizeCandidate(grabResult.text).length === 0) {
+        return {
+          success: false,
+          error: 'codex_rewind_restored_input_empty',
+          rollbackTurns,
+          pressCount: escPressCount,
+          rollbackMayHaveApplied: true,
+        };
+      }
+
+      return {
+        success: true,
+        targetIndex: idx,
+        rewindableCount: count,
+        rollbackTurns,
+        pressCount: escPressCount,
+        restoredInput: false,
+        historyInputDraft: true,
+      };
+    });
+  } catch (err) {
+    console.log('[Codex:Rewind] Error:', err?.message || String(err));
+    try { term.write('\x1b'); } catch {}
+    return { success: false, error: err?.message || String(err) };
   }
 });
 
@@ -9349,6 +9744,12 @@ ipcMain.handle('project:save-metadata', (event, { projectId, metadata }) => {
 
 ipcMain.handle('project:save-tab-groups', (event, { projectId, groups }) => {
   projectManager.saveProjectTabGroups(projectId, groups);
+  scheduleProjectLayoutBroadcast(projectId, 'tab-groups');
+  return { success: true };
+});
+
+ipcMain.handle('project:layout-changed', (event, { projectId, reason }) => {
+  scheduleProjectLayoutBroadcast(projectId, reason || 'tab-layout');
   return { success: true };
 });
 
@@ -13163,8 +13564,12 @@ ipcMain.on('codex:run-command', (event, { tabId, command, sessionId, cwd, model,
   term.write(cmdLine + '\r');
 });
 
-ipcMain.handle('codex:send-command', async (_event, tabId, command) => {
-  console.log('[codex:send-command] Received: tabId=' + tabId + ' command="' + command + '"');
+ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}) => {
+  const shouldQueue = !!(options && options.queue === true);
+  const handoffId = options && typeof options.handoffId === 'string' ? options.handoffId : null;
+  const source = options && typeof options.source === 'string' ? options.source : null;
+  const statusAtSend = options && typeof options.statusAtSend === 'string' ? options.statusAtSend : null;
+  console.log('[codex:send-command] Received: tabId=' + tabId + ' queue=' + shouldQueue + ' statusAtSend=' + (statusAtSend || '-') + ' handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' command="' + command + '"');
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no_terminal' };
   const candidates = await findAiDescendantProcessesByTab(tabId, 'codex');
@@ -13178,8 +13583,15 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command) => {
       submit: true,
       ctrlCFirst: false,
       fast: true,
+      submitSequence: shouldQueue ? '\t' : '\r',
+      submitLabel: shouldQueue ? 'Tab(queue)' : 'Enter',
+      handoffId,
+      source: source || (shouldQueue ? 'codex-history-queue' : 'codex-history-send'),
       logPrefix: '[codex:send-command:' + tabId + ']',
     });
+    if (result && typeof result === 'object') {
+      result.queued = shouldQueue;
+    }
     if (hasTurnWatcher && result && result.success === false) emitCodexBusy(tabId, false, 'send-command-failed');
     return result;
   } catch (error) {

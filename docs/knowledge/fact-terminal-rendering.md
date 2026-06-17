@@ -169,6 +169,10 @@ const term = new XTerminal({
 });
 ```
 
+#### 3. Единая palette для normal и lazy init
+
+Terminal component имеет больше одного пути инициализации: обычный mount активного tab'а и lazy/warm init фоновой вкладки. Палитра xterm должна приходить из одного `TERMINAL_THEME` constant в оба пути. Если lazy init получит только `background/foreground`, а active init — полный 16-color palette, пользователь увидит «почти чёрно-белый» Claude/Codex после restore/warm-init даже при корректных ANSI и `COLORTERM=truecolor`. Это не лечится на стороне CLI: CLI уже шлёт цвета, но renderer маппит их непредсказуемо из-за разных theme objects.
+
 ### Результат
 Текст стал более четким, тонким и профессиональным, сохраняя читаемость даже при мелком кегле.
 

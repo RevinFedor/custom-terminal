@@ -11,6 +11,8 @@
    - Если панель истории **закрыта**: терминал скроллится к месту промпта.
    - Если панель истории **открыта**: происходит переход к соответствующему сообщению внутри панели истории. Клик по самому терминалу в этом режиме игнорируется.
    - **Исключение (Compact/Continued):** Записи типов `compact` и `continued` (Context Overflow) не имеют физической позиции в терминале. Клик по их маркерам на Timeline работает **только** при открытой History Panel, выполняя скролл внутри ленты.
+5. **ПКМ по user-entry:** открывает single-entry context menu. Rewind-блок разделён на три действия: обычное `Откатиться` (native Claude `/rewind`, затем выбранный prompt переносится в History input без отправки, terminal composer очищается), AI-иконка (тот же выбор + AI compact path) и prompt-стрелка (тот же выбор + пользовательский post-prompt). Это намеренно не один общий «откат с AI»: default action должен быть быстрым и предсказуемым, а AI-work — явным вторым выбором.
+6. **Geometry context menu:** меню ПКМ якорится к координате правого клика и после mount измеряется/clamp'ится по `window.innerHeight`. Если клик пришёл низко в Timeline, меню не должно уходить за нижнюю границу: root получает `maxHeight: calc(100vh - pad)` и внутренний scroll, а не обрезается parent'ом. Глобальный принцип — `docs-global/ux-паттерны/tooltip-resize-modal.md::Dropdown и вложенное подменю`, но для Timeline важно не забыть root-menu, а не только вложенные submenu.
 
 ## 2. Behavior Specs
 - **Visibility (Range-based):** Timeline отображается всегда, когда в текущем табе есть активная сессия AI.
@@ -319,9 +321,10 @@ Codex Timeline грузится через `codex:get-timeline`, а HistoryPanel
 
 **User Flow:**
 1. **ПКМ по точке** → "Откатиться".
-2. **Фаза 1 (Компакт):** Система копирует все сообщения от выбранного до конца сессии (`claude:copy-range`), отправляет их в Gemini с промптом "Rewind (Откат)" для получения краткого резюме.
-3. **Фаза 2 (Откат):** Вызывается IPC `claude:open-history-menu`. Процесс имитирует `Esc`+`Esc` для открытия меню Claude, находит нужную запись по префиксу текста (Text-matching), навигирует стрелками и подтверждает выбор (`Enter`).
-4. **Фаза 3 (Вставка):** После перезапуска Claude система очищает инпут (`Ctrl+C`), вставляет сжатый контекст через `safePasteAndSubmit` (программный paste: чанки < 1024 байт + sync marker verification + автоматический `\r`). Это **программная** операция — текст идёт напрямую в PTY, минуя xterm.js. См. `knowledge/fact-fact-terminal-core.md`.
+2. **Native выбор:** Timeline вызывает `claude:open-history-menu`, который отправляет `/rewind`, дожидается родного Claude picker'а, навигирует к target по `rewindableCount`/`targetFullText` и подтверждает выбор (`Enter`). Source of truth — Claude TUI, не редактирование JSONL.
+3. **Перенос input:** выбранный prompt, который Claude восстановил в terminal composer, сразу забирается через `grab-input` и кладётся в History textarea; terminal composer после операции пустой. Это тот же ownership model, что у `+ clear`: текст не должен одновременно жить и слева, и справа.
+4. **Preview:** HistoryPanel временно показывает историю как срез до выбранной точки + локальный жёлтый marker `I REWOUND`. Target user-row в этом preview не рендерится второй раз: он уже представлен marker'ом и текстом в textarea. Пока пользователь не отправил prompt из History input, JSONL не изменён и после restart/reopen вернётся полная исходная история.
+5. **AI-варианты:** AI compact и post-prompt кнопки используют тот же native selection handler, но добавляют явный post-action. Default `Откатиться` не запускает Gemini/compact и не делает auto-submit.
 
 **Scroll Stabilization (Авто-скролл):**
 После отката Claude TUI часто вызывает "прыжки" скролла к началу буфера из-за интенсивной перерисовки. 
@@ -339,9 +342,9 @@ Codex Timeline грузится через `codex:get-timeline`, а HistoryPanel
 
 **Визуальная обратная связь (пульсация):**
 Во время процесса точка и диапазон пульсируют (`animate-pulse`), отражая текущую фазу:
-- **Янтарный:** Компактизация (Gemini работает).
+- **Янтарный:** Rewind preview / локальный marker ожидает дальнейшего Send.
 - **Фиолетовый:** Навигация в TUI (Откат).
-- **Зелёный (1.2с):** Успешная вставка и завершение.
+- **Зелёный (1.2с):** Успешный перенос target prompt в History input.
 
 **Три фазы визуальной обратной связи (Range Copy):**
 
@@ -357,7 +360,7 @@ Codex Timeline грузится через `codex:get-timeline`, а HistoryPanel
 - **Позиционирование:** Конкретное меню открывается справа-посередине от курсора (`x = cursor + 4px`, `y = cursor - height/2`). Высота меню вычисляется динамически на основе количества кнопок.
 - **Auto-close:** Меню автоматически закрывается при уходе курсора с его области (`onMouseLeave`).
 - **Portal Rule:** Кнопки в контекстном меню (Portal) обязательно используют `e.stopPropagation()` — см. `methodology/сценарии-багов-design.md::4.4. Portal-кнопка + handleClickOutside родителя`.
-- **Button Status:** Во время отката кнопка "Откатиться" заменяется на статус выполнения ("Компакт...", "Откат...", "Вставка...") и блокируется.
+- **Button Status:** Во время отката кнопка "Откатиться" заменяется на статус выполнения (`REWINDING...`/`I REWOUND`) и блокируется. AI compact/post-prompt статусы показываются только на соответствующих соседних кнопках, чтобы default action не выглядел как AI-операция.
 - **Копировать одиночную точку:** ПКМ по одной точке показывает «Копировать» (или «Копировать compact» для оранжевой точки) сразу — без необходимости выделять диапазон ≥2 элементов. Использует `claude:copy-range` с `startUuid = endUuid = entry.uuid`; backend forward-expand'ит до следующего user/compact (включает prompt + все ответы Claude). Скрыто для `continued`/`docs_edit`/`docs_search` (нет копируемого контента).
 - **Удалить user-mess:** ПКМ по точке user-prompt → пункт `Удалить user-mess` (красный, Trash2). Двухшаговый inline-confirm (первый клик → «Точно удалить?» с красной заливкой → второй клик вызывает `claude:delete-user-entry`). Физически удаляет одну запись из JSONL, перелинковывает `parentUuid` детей на родителя удалённой — chain остаётся валидным для `--resume`. Скрыто для Gemini, для `compact`/`continued` точек и для `isCompactSummary` (там нет одного «промпта»). Корневая запись сессии не удаляется (backend возвращает ошибку — у её детей parentUuid стал бы `null`). Реализация и edge cases — [`fix-delete-user-entry.md`](fix-delete-user-entry.md).
 - **Compact entry в `claude:copy-range`: подтягивается compactSummary, не заглушка.** Для `compact_boundary` записи backend ищет в полной активной ветке (`activeHistory`, не в обрезанном range) следующий entry с `isCompactSummary === true && type === 'user'` и вставляет его текст после заголовка `═══ HISTORY COMPACTED ═══`. Раньше выводилась только заглушка, потому что forward-expand range останавливается на user → summary entry никогда не попадал в range. Lookup ведётся по `activeHistory` напрямую, не по `range[]`.

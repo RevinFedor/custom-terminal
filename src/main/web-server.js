@@ -393,6 +393,7 @@ function projectActivitySnapshot(reason = 'snapshot') {
     return {
       type: 'project-activity',
       projects: Array.isArray(snap.projects) ? snap.projects : [],
+      layoutChangedProjectIds: Array.isArray(snap.layoutChangedProjectIds) ? snap.layoutChangedProjectIds : [],
       ts: snap.ts || Date.now(),
       reason,
     };
@@ -751,6 +752,35 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  // Read-only file preview for mobile file-tabs. The tab list already exposes
+  // filePath for tabType='file'; this endpoint returns the current file body so
+  // mobile can show the same Markdown document without depending on renderer
+  // Zustand/FilePreview state.
+  if (parsed.pathname === '/api/file-preview' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const filePath = String(body.path || '').trim();
+      if (!filePath) return sendJson(res, 400, { error: 'path required' });
+      if (!path.isAbsolute(filePath)) return sendJson(res, 400, { error: 'absolute path required' });
+      const stat = await fs.promises.stat(filePath);
+      if (!stat.isFile()) return sendJson(res, 400, { error: 'not a file' });
+      const MAX_FILE_PREVIEW_BYTES = 1024 * 1024;
+      if (stat.size > MAX_FILE_PREVIEW_BYTES) {
+        return sendJson(res, 413, { error: 'file too large for mobile preview' });
+      }
+      const content = await fs.promises.readFile(filePath, 'utf8');
+      return sendJson(res, 200, {
+        path: filePath,
+        name: path.basename(filePath),
+        ext: path.extname(filePath).toLowerCase(),
+        size: stat.size,
+        content,
+      });
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message || e) });
+    }
+  }
+
   // Prompts library (groups + items). Read-only — used by mobile composer
   // Insert-Prompt button. Schema:
   //   group: { id, name, position }
@@ -844,11 +874,15 @@ async function handleApi(req, res, parsed, sdkSessions) {
     // when the bridge is unavailable.
     let markerCfg = { shape: 'dot', sizePx: 8 };
     let processBarCfg = { colorA: '#155E75', shimmerColor: '#FFFFFF', shimmerSpacingPct: 50, shimmerOpacityPct: 55, position: 'left' };
+    let statusesForClient = [];
     let paletteById = new Map();
     try {
       const cfg = await bridgeRequest('getStatusMarkerConfig', {}, 1500);
       if (cfg?.shape) markerCfg = { shape: cfg.shape, sizePx: cfg.sizePx || 8 };
-      if (Array.isArray(cfg?.statuses)) for (const s of cfg.statuses) paletteById.set(s.id, s.color);
+      if (Array.isArray(cfg?.statuses)) {
+        statusesForClient = cfg.statuses.map(s => ({ id: s.id, color: s.color, label: s.label }));
+        for (const s of statusesForClient) paletteById.set(s.id, s);
+      }
       if (cfg?.processBar) processBarCfg = cfg.processBar;
     } catch (e) {
       // renderer not ready — phone renders runtime-only markers, no category tint
@@ -874,6 +908,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         commandType: t.commandType,
         color: t.color || null,   // desktop TabColor — drives row bg (mobile mirrors desktop)
         cwd: t.cwd,
+        filePath: t.filePath || null,
         claudeSessionId: t.claudeSessionId,
         codexSessionId: t.codexSessionId,
         geminiSessionId: t.geminiSessionId,
@@ -881,7 +916,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         sessionStatus: statusMap.get(t.tabId) || null,
         awaiting: awaitingMap.get(t.tabId) || false,
         statusId,
-        statusColor: statusId ? (paletteById.get(statusId) || null) : null,
+        statusColor: statusId ? (paletteById.get(statusId)?.color || null) : null,
+        groupId: t.groupId || null,
+        visualParentTabId: t.visualParentTabId || null,
         // Last-known context fill % (SQLite context_pct). Seeds the native/web
         // header pill on open so it shows a value before the next live
         // bridge-update/turn, instead of being blank until the first turn.
@@ -893,7 +930,109 @@ async function handleApi(req, res, parsed, sdkSessions) {
         } : null,
       };
     });
-    return sendJson(res, 200, { project: { id: project.id, name: project.name, path: project.path, icon: project.icon || null }, tabs, statusMarker: markerCfg, processBar: processBarCfg });
+    const groups = (project.tabGroups || []).map(g => ({
+      id: g.id,
+      name: g.name,
+      createdAt: g.createdAt || null,
+      anchorTabId: g.anchorTabId || null,
+      collapsed: !!g.collapsed,
+      color: g.color || null,
+      sessionStatus: g.sessionStatus || null,
+      statusColor: g.sessionStatus ? (paletteById.get(g.sessionStatus)?.color || null) : null,
+    }));
+    return sendJson(res, 200, {
+      project: { id: project.id, name: project.name, path: project.path, icon: project.icon || null },
+      tabs,
+      groups,
+      statusMarker: markerCfg,
+      statuses: statusesForClient,
+      processBar: processBarCfg,
+    });
+  }
+
+  // Create tab group in a project. Delegates to the renderer store so group
+  // anchors, activeGroupId semantics, persistence, and desktop UI stay single-source.
+  m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/tab-groups$/);
+  if (m && req.method === 'POST') {
+    const projectId = decId(m[1]);
+    try {
+      const body = await readBody(req);
+      const data = await bridgeRequest('createTabGroup', { projectId, name: body.name });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 409, { error: String(e.message) });
+    }
+  }
+
+  m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/tab-groups\/([^/]+)\/rename$/);
+  if (m && req.method === 'POST') {
+    const projectId = decId(m[1]);
+    const groupId = decId(m[2]);
+    try {
+      const body = await readBody(req);
+      const name = (body.name || '').trim();
+      if (!name) return sendJson(res, 400, { error: 'name required' });
+      const data = await bridgeRequest('renameTabGroup', { projectId, groupId, name });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 409, { error: String(e.message) });
+    }
+  }
+
+  m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/tab-groups\/([^/]+)\/toggle-collapsed$/);
+  if (m && req.method === 'POST') {
+    const projectId = decId(m[1]);
+    const groupId = decId(m[2]);
+    try {
+      const data = await bridgeRequest('toggleTabGroupCollapsed', { projectId, groupId });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 409, { error: String(e.message) });
+    }
+  }
+
+  m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/tab-groups\/([^/]+)\/status$/);
+  if (m && req.method === 'POST') {
+    const projectId = decId(m[1]);
+    const groupId = decId(m[2]);
+    try {
+      const body = await readBody(req);
+      const data = await bridgeRequest('setTabGroupSessionStatus', { projectId, groupId, status: body.status || null });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 409, { error: String(e.message) });
+    }
+  }
+
+  m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/tab-groups\/([^/]+)\/delete$/);
+  if (m && req.method === 'POST') {
+    const projectId = decId(m[1]);
+    const groupId = decId(m[2]);
+    try {
+      const data = await bridgeRequest('deleteTabGroup', { projectId, groupId });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 409, { error: String(e.message) });
+    }
+  }
+
+  m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/tab-layout$/);
+  if (m && req.method === 'POST') {
+    const projectId = decId(m[1]);
+    try {
+      const body = await readBody(req);
+      if (!Array.isArray(body.orderedIds)) return sendJson(res, 400, { error: 'orderedIds required' });
+      const data = await bridgeRequest('applyTabLayout', {
+        projectId,
+        orderedIds: body.orderedIds,
+        groupAssignments: body.groupAssignments || {},
+        visualParentAssignments: body.visualParentAssignments || {},
+        groupAnchorAssignments: body.groupAnchorAssignments || {},
+      });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 409, { error: String(e.message) });
+    }
   }
 
   // Create SDK tab in a project (delegates to renderer store)
@@ -1018,6 +1157,18 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const name = (body.name || '').trim();
       if (!name) return sendJson(res, 400, { error: 'name required' });
       const data = await bridgeRequest('renameTab', { tabId, name });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 409, { error: String(e.message) });
+    }
+  }
+
+  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/status$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]);
+    try {
+      const body = await readBody(req);
+      const data = await bridgeRequest('setTabSessionStatus', { tabId, status: body.status || null });
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 409, { error: String(e.message) });

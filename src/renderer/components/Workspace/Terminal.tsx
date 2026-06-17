@@ -79,6 +79,29 @@ import { markPendingResume, clearPendingResume, isStaleAgainstPending, getPendin
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 
 const TIMELINE_COLLAPSED_SLOT_WIDTH = 32;
+const TERMINAL_THEME = {
+  background: '#1a1a1a',
+  foreground: '#d4d4d4',
+  cursor: '#ffffff',
+  cursorAccent: '#1a1a1a',
+  selectionBackground: '#264f78',
+  black: '#000000',
+  red: '#cd3131',
+  green: '#0dbc79',
+  yellow: '#e5e510',
+  blue: '#2472c8',
+  magenta: '#bc3fbc',
+  cyan: '#11a8cd',
+  white: '#e5e5e5',
+  brightBlack: '#666666',
+  brightRed: '#f14c4c',
+  brightGreen: '#23d18b',
+  brightYellow: '#f5f543',
+  brightBlue: '#3b8eea',
+  brightMagenta: '#d670d6',
+  brightCyan: '#29b8db',
+  brightWhite: '#e5e5e5'
+};
 
 // ============================================================================
 // EffortInject TUI-readiness diagnostic instrumentation (temporary, May 2026)
@@ -454,8 +477,6 @@ const formatCodexImagePasteError = (value: unknown): string => {
     .trim()
     .slice(0, 120) || 'unknown';
 };
-
-const formatCodexImagePathPayload = (path: string): string => `[imagePath: ${path}]`;
 
 const normalizeLocalImagePathText = (text: string): string | null => {
   let trimmed = text.trim();
@@ -859,12 +880,15 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     try {
       const textPath = normalizeLocalImagePathText(clipboard.readText() || '');
       if (textPath) {
-        payload = formatCodexImagePathPayload(textPath);
+        const staged = await ipcRenderer.invoke('codex:stage-image-path', { tabId, filePath: textPath });
+        payload = staged?.success === false
+          ? `[imageError: ${formatCodexImagePasteError(staged?.error || 'stage_failed')}]`
+          : textPath;
         source = 'text-path';
       } else {
         const saved = await ipcRenderer.invoke('codex:save-clipboard-image', { tabId });
         if (saved?.success && typeof saved.path === 'string' && saved.path.length > 0) {
-          payload = formatCodexImagePathPayload(saved.path);
+          payload = saved.path;
           source = 'saved-bitmap';
         } else {
           payload = `[imageError: ${formatCodexImagePasteError(saved?.error || 'save_failed')}]`;
@@ -876,8 +900,9 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       source = 'exception';
     }
 
-    // Raw input + non-bare path on purpose: Codex treats a fast bare image path
-    // as a paste burst and rewrites it to [Image #N]. RunAuthor needs text.
+    // Raw bare path on purpose: Codex rewrites local image paths to its native
+    // [Image #N] composer chip. We stage the path in main so +grab/Run after can
+    // still recover the real file later if external-editor returns only the chip.
     console.warn('[CodexImagePaste:inject] tab=' + tabId.slice(-12) + ' source=' + source + ' len=' + payload.length + ' payload=' + payload);
     ipcRenderer.send('terminal:input', tabId, payload);
   }, [tabId]);
@@ -1436,29 +1461,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       const currentFontSize = useUIStore.getState().terminalFontSize;
 
       const term = new XTerminal({
-        theme: {
-          background: '#1a1a1a',
-          foreground: '#d4d4d4',
-          cursor: '#ffffff',
-          cursorAccent: '#1a1a1a',
-          selectionBackground: '#264f78',
-          black: '#000000',
-          red: '#cd3131',
-          green: '#0dbc79',
-          yellow: '#e5e510',
-          blue: '#2472c8',
-          magenta: '#bc3fbc',
-          cyan: '#11a8cd',
-          white: '#e5e5e5',
-          brightBlack: '#666666',
-          brightRed: '#f14c4c',
-          brightGreen: '#23d18b',
-          brightYellow: '#f5f543',
-          brightBlue: '#3b8eea',
-          brightMagenta: '#d670d6',
-          brightCyan: '#29b8db',
-          brightWhite: '#e5e5e5'
-        },
+        theme: TERMINAL_THEME,
         fontFamily: "'JetBrains Mono', 'JetBrainsMono NF', Menlo, Monaco, monospace",
         fontSize: currentFontSize,
         fontWeight: 'normal',
@@ -2122,21 +2125,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
         const currentFontSize = useUIStore.getState().terminalFontSize;
         const term = new XTerminal({
-          theme: {
-            background: '#1a1a1a',
-            foreground: '#d4d4d4',
-            cursor: '#ffffff',
-            cursorAccent: '#1a1a1a',
-            selectionBackground: '#264f78',
-            black: '#000000',
-            red: '#cd3131',
-            green: '#0dbc79',
-            yellow: '#e5e510',
-            blue: '#2472c8',
-            magenta: '#bc3fbc',
-            cyan: '#11a8cd',
-            white: '#e5e5e5'
-          },
+          theme: TERMINAL_THEME,
           fontFamily: "'JetBrains Mono', 'JetBrainsMono NF', Menlo, Monaco, monospace",
           fontSize: currentFontSize,
           fontWeight: 'normal',

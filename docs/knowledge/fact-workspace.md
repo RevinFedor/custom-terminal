@@ -39,6 +39,8 @@
     - `onPointerDown` → `onClick` для file selection — иначе drag (Atlaskit) вызывает open file. Браузер отменяет `click` при pointer movement > 3px (drag threshold), что естественно разделяет click и drag.
     - Drop на файл отключён (`return` вместо "fallback to parent") — gt-editor перемещал файл в родительскую папку при drop на файл, что приводило к неожиданным перемещениям. Оставлен только drop на папку.
     - `window.electronAPI` bridge создаётся в renderer (nodeIntegration: true) вместо preload, т.к. custom-terminal не использует contextIsolation.
+    - ПКМ по файлу содержит `Link File` submenu со списком текущих Claude/Codex/SDK-вкладок. Выбор не открывает editor внутри дерева, а создаёт `tabType='file'` рядом с выбранной вкладкой и связывает его через `visualParentTabId`. Это сделано для рабочего просмотра “нужный файл рядом с сессией”: пользователь не должен каждый раз открывать `Cmd+B`, если файл нужен как постоянный референс. Детали tab-side поведения — [`fact-tabs.md::Файловые вкладки как visual-child`](fact-tabs.md).
+    - `Link File` submenu — nested floating surface: root context menu clamp'ится к viewport, а submenu отдельно считает доступную высоту до нижней границы и при нехватке места раскрывается вверх/влево. Не полагайся на z-index как фикс обрезки — если пункт у нижнего края окна, нужна геометрия, а не слой.
 - **Empty State:** Если в проекте нет вкладок, отображаются быстрые кнопки (Claude, Gemini, New Tab).
 
 ## User Flow: Dashboard

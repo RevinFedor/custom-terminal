@@ -34,6 +34,10 @@
 
 Это **интерактивный** просмотрщик, в отличие от react-markdown, где всё было статичным HTML.
 
+### 2a. Mobile/native file-tab preview — параллельный reader, не desktop FilePreview
+
+Desktop linked file-tabs и sidebar preview остаются на `@gt-editor/markdown-editor` в `FilePreview.tsx`: это rich read-only editor с fold state, line numbers и shared font-size. Mobile/native file-tab preview intentionally не переиспользует этот компонент. Телефон открывает file-tab как bottom-sheet через `/api/file-preview`; mobile-web рендерит Markdown уже подключённым `@noted/claude-blocks::Markdown`, а native iOS переиспользует свой `GTFilePreviewSheet` с custom file-loader на тот же endpoint. Причина не в «другой визуал ради другого визуала»: phone surface — быстрый read-only inspection поверх списка, не полноценная editor-surface, и не должен зависеть от mounted desktop renderer/FilePreview state.
+
 ### 3. Почему не удалили react-markdown из dependencies
 
 `react-markdown` + `remark-gfm` + `react-syntax-highlighter` **ещё используются** в:

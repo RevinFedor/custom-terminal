@@ -5,6 +5,18 @@
 
 Проблема навигации по меню истории Claude Code (Rewind) и переход к "Visual Search".
 
+## Актуальность после native `/rewind` flow (2026-06)
+
+Этот файл описывает safety/fallback-логику навигации, а не основной путь Timeline Rewind. Текущий default action в Timeline отправляет Claude slash-команду `/rewind`, выбирает target в родном picker'е, затем переносит восстановленный prompt из terminal composer в History textarea через тот же `grab-input` path, которым пользуется `+ clear`; terminal composer после этого должен остаться пустым. AI compact-варианты включаются только отдельными кнопками. Visual Search Strategy ниже остаётся защитой для ситуаций, когда позиционное сопоставление меню не сработало, но не должна снова становиться primary-моделью и не должна автоматически нажимать Enter при не найденной цели.
+
+## Codex native backtrack: prime first, grab only as verification
+
+Codex откатывается не через `/rewind`, а через цепочку `Escape` → hint `esc again to edit previous message` → transcript overlay → `Escape` к старым prompt'ам → `Enter`. Не переносить сюда Claude/Gemini slash-command модель и не начинать с `Ctrl+G` как preflight. External-editor grab до первого prime-кадра сам меняет composer/TUI state и маскирует root cause: потом в логах видно только `codex_rewind_prime_hint_not_observed`, хотя реальная проблема в том что backtrack даже не был корректно открыт.
+
+Правильный порядок для диагностики: сначала добиться `prime initial timedOut=false hint=true`, потом увидеть transcript overlay, потом confirm-кадр с target prompt, и только после этого забирать восстановленный prompt через `codex:grab-input`. Grab здесь не способ открыть rewind, а verification/transfer step: доказать что Codex префиллил именно выбранный prompt и что terminal composer очищен перед передачей текста в History input. Логовая цепочка успешного случая: `[Codex:Rewind] prime initial ... hint=true` → `thread_rolled_back` в `codex:get-timeline/full-history` → `[Codex:Rewind] Terminal input grabbed+cleared ... matchedTarget=true`.
+
+Если после `Enter` rollback уже применился, а grab вернул пусто/другой текст, это не «почти успех». Возвращай `codex_rewind_restored_input_mismatch` / `codex_rewind_restored_input_empty` с `rollbackMayHaveApplied: true`: History должна перечитать rollout как durable source, но UI не имеет права утверждать что target prompt безопасно перенесён в textarea. Пользовательский симптом нарушения — справа история уже усечена или JSON поменялся, а в живом терминале prompt не появился/не очистился; это выглядит как рассинхрон terminal vs History.
+
 ## Проблема
 Изначально использовалась формула: `Steps = CurrentCursor - TargetIndex`.
 Это приводило к критическим ошибкам (`Steps = -17`), когда целевое сообщение находилось за пределами видимой области прокрутки (Virtual Scroll). TUI не знает о существовании элементов выше видимого окна.

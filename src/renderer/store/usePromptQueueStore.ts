@@ -121,6 +121,80 @@ export type QueuedPrompt = {
   createdAt: number;
 };
 
+function collectClaudeImageRefIds(text: string): Set<number> {
+  const ids = new Set<number>();
+  const re = /\[Image\s+#?(\d+)\]/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const id = Number(match[1]);
+    if (Number.isFinite(id)) ids.add(id);
+  }
+  return ids;
+}
+
+function retainImagePathsForText(text: string, imagePaths?: QueuedImageRef[]): QueuedImageRef[] | undefined {
+  if (!imagePaths || imagePaths.length === 0) return undefined;
+  const ids = collectClaudeImageRefIds(text);
+  if (ids.size === 0) return undefined;
+  const retained = imagePaths.filter((ref) => ids.has(ref.id));
+  return retained.length > 0 ? retained : undefined;
+}
+
+function mediaTypeFromPath(path: string): string {
+  const lower = path.toLowerCase();
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.bmp')) return 'image/bmp';
+  return 'image/png';
+}
+
+function normalizeImagePathMarkersForQueue(text: string, imagePaths?: QueuedImageRef[]): { text: string; imagePaths?: QueuedImageRef[] } {
+  const existing = imagePaths || [];
+  const existingByPath = new Map<string, QueuedImageRef>();
+  for (const ref of existing) existingByPath.set(ref.path, ref);
+
+  let maxId = 0;
+  for (const ref of existing) maxId = Math.max(maxId, ref.id);
+  for (const id of collectClaudeImageRefIds(text)) maxId = Math.max(maxId, id);
+
+  const additions: QueuedImageRef[] = [];
+  const normalizedText = text.replace(IMAGE_PATH_RE, (match, rawPath) => {
+    const path = String(rawPath || '').trim();
+    if (!path) return match;
+    const reused = existingByPath.get(path) || additions.find((ref) => ref.path === path);
+    if (reused) return `[Image #${reused.id}]`;
+    const ref: QueuedImageRef = {
+      id: ++maxId,
+      path,
+      mediaType: mediaTypeFromPath(path),
+      size: 0,
+    };
+    additions.push(ref);
+    return `[Image #${ref.id}]`;
+  });
+
+  const merged = additions.length > 0 ? [...existing, ...additions] : existing;
+  return {
+    text: normalizedText,
+    imagePaths: retainImagePathsForText(normalizedText, merged),
+  };
+}
+
+export function buildQueuedPromptPayload(item: Pick<QueuedPrompt, 'text' | 'imagePaths'>): string {
+  const imagePaths = item.imagePaths || [];
+  if (imagePaths.length === 0) return item.text;
+  const byId = new Map<number, QueuedImageRef>();
+  for (const ref of imagePaths) byId.set(ref.id, ref);
+
+  return item.text.replace(/\[Image\s+#?(\d+)\]/g, (_match, rawId) => {
+    const id = Number(rawId);
+    const resolved = byId.get(id);
+    if (!resolved?.path) return `[imageError: queued_image_path_unavailable #${rawId}]`;
+    return `[imagePath: ${resolved.path}]`;
+  });
+}
+
 export type TabQueue = {
   items: QueuedPrompt[];
   // When true, as soon as the current Claude turn ends (Stop hook fires) the next item
@@ -322,10 +396,13 @@ export function serializePromptQueueCore(q: TabQueue): PromptQueueCore {
   };
 }
 
-// Count image placeholders in raw input text. Claude TUI renders pasted images as
-// "[Image #N]" tokens. Pasted-text-chips like "[Pasted text #N +M lines]" are NOT
-// counted here — those are full-text expansions the editor view exposes verbatim.
+// Count image placeholders in queue text. Claude TUI renders pasted images as
+// "[Image #N]" tokens; Codex [imagePath: /full/path] markers are normalized to
+// the same short token when entering the queue. Pasted-text-chips like
+// "[Pasted text #N +M lines]" are NOT counted here — those are full-text
+// expansions the editor view exposes verbatim.
 const IMAGE_RE = /\[Image(?:\s+#?\d+)?\]/g;
+const IMAGE_PATH_RE = /\[imagePath:\s*([^\]\r\n]+?)\s*\]/gi;
 function countImages(text: string): number {
   const m = text.match(IMAGE_RE);
   return m ? m.length : 0;
@@ -348,7 +425,14 @@ export function countEnabledQueuedPrompts(items: QueuedPrompt[]): number {
 }
 
 function normalizeQueuedPrompt(item: QueuedPrompt): QueuedPrompt {
-  return { ...item, enabled: item.enabled !== false };
+  const normalized = normalizeImagePathMarkersForQueue(item.text, item.imagePaths);
+  return {
+    ...item,
+    enabled: item.enabled !== false,
+    text: normalized.text,
+    images: Math.max(item.images || 0, countImages(normalized.text), normalized.imagePaths?.length ?? 0),
+    imagePaths: normalized.imagePaths,
+  };
 }
 
 export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
@@ -370,8 +454,9 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       setAndPersist((state) => {
         const next = new Map(state.queues);
         const cur = next.get(tabId) ?? EMPTY;
-        const detectedImages = images ?? countImages(text);
-        const defaultTitle = makeDefaultPromptTitle(text);
+        const normalized = normalizeImagePathMarkersForQueue(text, imagePaths);
+        const detectedImages = Math.max(images ?? 0, countImages(normalized.text), normalized.imagePaths?.length ?? 0);
+        const defaultTitle = makeDefaultPromptTitle(normalized.text);
         const normalizedTitle = typeof title === 'string' ? title.trim() : '';
         const titleManual = normalizedTitle.length > 0 && normalizedTitle !== defaultTitle;
         const items = [...cur.items, {
@@ -379,9 +464,9 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           enabled: true,
           title: titleManual ? normalizedTitle : defaultTitle,
           titleManual,
-          text,
+          text: normalized.text,
           images: detectedImages,
-          imagePaths: (imagePaths && imagePaths.length > 0) ? imagePaths : undefined,
+          imagePaths: normalized.imagePaths,
           createdAt: Date.now(),
         }];
         // First-chip armed hint: only when transitioning empty → 1 AND auto-run
@@ -441,8 +526,14 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         const activeBefore = countEnabledQueuedPrompts(cur.items);
         const items = cur.items.map((p) => {
           if (p.id !== id) return p;
-          const text = typeof patch.text === 'string' ? patch.text : p.text;
-          const images = typeof patch.text === 'string' ? countImages(text) : p.images;
+          const normalized = typeof patch.text === 'string'
+            ? normalizeImagePathMarkersForQueue(patch.text, p.imagePaths)
+            : { text: p.text, imagePaths: p.imagePaths };
+          const text = normalized.text;
+          const images = typeof patch.text === 'string'
+            ? Math.max(countImages(text), normalized.imagePaths?.length ?? 0)
+            : p.images;
+          const imagePaths = normalized.imagePaths;
           const defaultTitle = makeDefaultPromptTitle(text);
           let titleManual = !!p.titleManual;
           let title = p.title || defaultTitle;
@@ -458,7 +549,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
             if (!titleManual) title = defaultTitle;
           }
           const enabled = typeof patch.enabled === 'boolean' ? patch.enabled : p.enabled;
-          return { ...p, enabled, text, images, title, titleManual };
+          return { ...p, enabled, text, images, imagePaths, title, titleManual };
         });
         const next = new Map(state.queues);
         const queueEmptied = activeBefore > 0 && countEnabledQueuedPrompts(items) === 0;
@@ -480,14 +571,17 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       setAndPersist((state) => {
         const cur = state.queues.get(tabId);
         if (!cur) return state;
-        const items = cur.items.map((p) => p.id === id
-          ? {
-              ...p,
-              text,
-              images: countImages(text),
-              title: p.titleManual ? p.title : makeDefaultPromptTitle(text),
-            }
-          : p);
+        const items = cur.items.map((p) => {
+          if (p.id !== id) return p;
+          const normalized = normalizeImagePathMarkersForQueue(text, p.imagePaths);
+          return {
+            ...p,
+            text: normalized.text,
+            images: Math.max(countImages(normalized.text), normalized.imagePaths?.length ?? 0),
+            imagePaths: normalized.imagePaths,
+            title: p.titleManual ? p.title : makeDefaultPromptTitle(normalized.text),
+          };
+        });
         const next = new Map(state.queues);
         next.set(tabId, { ...cur, items });
         return { queues: next };

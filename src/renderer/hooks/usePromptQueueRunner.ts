@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { countEnabledQueuedPrompts, isQueuedPromptEnabled, usePromptQueueStore, type TabQueue } from '../store/usePromptQueueStore';
+import { buildQueuedPromptPayload, countEnabledQueuedPrompts, isQueuedPromptEnabled, usePromptQueueStore, type TabQueue } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 
@@ -73,6 +73,15 @@ function getPromptQueueAgent(tabId: string): QueueAgent {
   return 'claude';
 }
 
+function getWorkspaceCommandType(tabId: string): string | null {
+  const state = useWorkspaceStore.getState();
+  for (const ws of state.openProjects.values()) {
+    const tab = ws.tabs.get(tabId);
+    if (tab) return tab.commandType || null;
+  }
+  return null;
+}
+
 function getPromptQueueAgentLabel(tabId: string): string {
   return getPromptQueueAgent(tabId) === 'codex' ? 'Codex' : 'Claude';
 }
@@ -123,6 +132,7 @@ const queueSendInflight = new Set<string>();
 // After send-command resolves successfully there is a short event gap before
 // the agent emits busy:true. Keep pivoted owners blocked through that gap.
 const queueAwaitingBusyStart = new Set<string>();
+const codexTriggerCheckInflight = new Set<string>();
 
 type BusyStatePayload = {
   tabId: string;
@@ -208,7 +218,7 @@ export function usePromptQueueRunner() {
       queueSendInflight.add(ownerTabId);
       queueAwaitingBusyStart.add(ownerTabId);
 
-      const payload = withPostPrompt(ownerTabId, head.text);
+      const payload = withPostPrompt(ownerTabId, buildQueuedPromptPayload(head));
       const arrow = ownerTabId === triggerTabId ? '↩' : '⇒';
       console.log('[PromptQueueRunner] fire owner=' + ownerTabId.slice(-8) + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8) + ' remaining=' + (beforePop - 1));
       sendQueueCommand(ownerTabId, payload).then((res: any) => {
@@ -282,6 +292,13 @@ export function usePromptQueueRunner() {
     const handleBusyState = (channel: 'claude' | 'gemini' | 'codex') =>
       (_: any, data: BusyStatePayload) => {
         const { tabId, busy, reason } = data;
+        if (channel === 'claude' && reason === 'spinner') {
+          const commandType = getWorkspaceCommandType(tabId);
+          if (commandType === 'codex' || commandType === 'gemini') {
+            console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=claude reason=spinner → IGNORE foreign spinner for ' + commandType);
+            return;
+          }
+        }
         const wasBusy = prevBusyRef.get(tabId) ?? false;
         prevBusyRef.set(tabId, busy);
 
@@ -520,7 +537,7 @@ export function usePromptQueueRunner() {
         if (head) {
           queueSendInflight.add(ownerTabId);
           queueAwaitingBusyStart.add(ownerTabId);
-          const payload = withPostPrompt(ownerTabId, head.text);
+          const payload = withPostPrompt(ownerTabId, buildQueuedPromptPayload(head));
           const arrow = ownerTabId === triggerTabId ? '↩' : '⇒';
           console.log('[PromptQueueRunner] cold-start owner=' + ownerTabId.slice(-8) + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8));
           sendQueueCommand(ownerTabId, payload).then((res: any) => {
@@ -547,6 +564,72 @@ export function usePromptQueueRunner() {
       } finally {
         firing = false;
       }
+    };
+
+    const ownerHasRunnableContinuationForColdStart = (ownerTabId: string): boolean => {
+      if (queueAwaitingBusyStart.has(ownerTabId) || queueSendInflight.has(ownerTabId)) return true;
+      const q = usePromptQueueStore.getState().getQueue(ownerTabId);
+      if (!q.autoRun || countEnabledQueuedPrompts(q.items) === 0) return false;
+      if (prevBusyRef.get(ownerTabId) === true) return false;
+      const effectiveTrigger = getEffectiveQueueTrigger(ownerTabId, q, { clearStaleTarget: true });
+      if (effectiveTrigger !== ownerTabId) return false;
+      if (!prevBusyRef.has(effectiveTrigger)) return false;
+      return prevBusyRef.get(effectiveTrigger) !== true;
+    };
+
+    const verifyCodexTriggerIdleThenFire = (ownerTabId: string, triggerTabId: string): boolean => {
+      if (getWorkspaceCommandType(triggerTabId) !== 'codex') return false;
+      const key = ownerTabId + '→' + triggerTabId;
+      if (codexTriggerCheckInflight.has(key)) return true;
+      codexTriggerCheckInflight.add(key);
+      ipcRenderer.invoke('codex:get-turn-state', triggerTabId).then((res: any) => {
+        if (res?.hasWatcher) {
+          prevBusyRef.set(triggerTabId, !!res.busy);
+          if (res.busy) {
+            useWorkspaceStore.getState().setAiBusy(triggerTabId, true, 'codex-turn-state');
+            console.log('[PromptQueueRunner] codex-turn-state trigger=' + triggerTabId.slice(-8) + ' busy=true → wait');
+            return;
+          }
+        }
+
+        const q2 = usePromptQueueStore.getState().getQueue(ownerTabId);
+        if (!q2.autoRun || countEnabledQueuedPrompts(q2.items) === 0) return;
+        if (queueSendInflight.has(ownerTabId) || queueAwaitingBusyStart.has(ownerTabId)) return;
+        if (prevBusyRef.get(ownerTabId) === true) return;
+
+        if (ownerTabId !== triggerTabId) {
+          if (ownerHasRunnableContinuationForColdStart(triggerTabId)) {
+            console.log('[PromptQueueRunner] codex-turn-state owner=' + ownerTabId.slice(-8) + ' target=' + triggerTabId.slice(-8) + ' has own continuation → wait for chain drain');
+            return;
+          }
+          fireHead(ownerTabId, triggerTabId);
+          return;
+        }
+
+        if (q2.firstDelayCountdownAt !== null) return;
+        if (q2.firstDelaySeconds > 0) {
+          const delayMs = q2.firstDelaySeconds * 1000;
+          usePromptQueueStore.getState().startFirstDelayCountdown(ownerTabId);
+          clearTimer(ownerTabId);
+          pendingTimers.set(ownerTabId, setTimeout(() => {
+            pendingTimers.delete(ownerTabId);
+            const q3 = usePromptQueueStore.getState().getQueue(ownerTabId);
+            if (!q3.autoRun || countEnabledQueuedPrompts(q3.items) === 0 || q3.firstDelayCountdownAt === null) {
+              usePromptQueueStore.getState().clearFirstDelayCountdown(ownerTabId);
+              return;
+            }
+            usePromptQueueStore.getState().consumeFirstDelayCountdown(ownerTabId);
+            fireHead(ownerTabId, ownerTabId);
+          }, delayMs));
+        } else {
+          fireHead(ownerTabId, ownerTabId);
+        }
+      }).catch((e: unknown) => {
+        console.warn('[PromptQueueRunner] codex-turn-state check failed owner=' + ownerTabId.slice(-8) + ' trigger=' + triggerTabId.slice(-8), e);
+      }).finally(() => {
+        codexTriggerCheckInflight.delete(key);
+      });
+      return true;
     };
 
     const evaluateQueues = (state: QueueStateSnapshot, prevState: QueueStateSnapshot) => {
@@ -611,6 +694,7 @@ export function usePromptQueueRunner() {
             // Target is busy right now — wait for its idle edge.
             continue;
           }
+          if (verifyCodexTriggerIdleThenFire(tabId, effectiveTrigger)) continue;
           if (ownerHasRunnableContinuation(effectiveTrigger)) {
             console.log('[PromptQueueRunner] cold-start owner=' + tabId.slice(-8) + ' target=' + effectiveTrigger.slice(-8) + ' has own continuation → wait for chain drain');
             continue;
@@ -623,6 +707,7 @@ export function usePromptQueueRunner() {
         }
 
         // Default own-tab cold-start (unchanged behaviour).
+        if (verifyCodexTriggerIdleThenFire(tabId, tabId)) continue;
         const isBusy = prevBusyRef.get(tabId) ?? false;
         if (isBusy) continue;
 

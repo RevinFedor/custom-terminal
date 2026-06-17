@@ -90,6 +90,10 @@ HistoryPanel send для обычного user prompt не должен вест
 
 History textarea draft привязан к tabId, а не к mount-cycle панели. Закрыть и снова открыть `Cmd+\` — это смена видимости, не пользовательский clear: введённый prompt обязан остаться до успешной отправки или явной очистки. Иначе пользователь теряет текст при обычном «посмотреть историю → вернуться к терминалу → снова открыть историю» без destructive-жеста.
 
+От момента клика Send/Enter до появления durable JSONL-записи HistoryPanel обязан держать локальный handoff-маркер, а не ждать секунду молча. Состояния `queued → sent` означают только что bytes/IPC ушли в runtime; они ещё не делают сообщение частью истории. Когда matching user entry появляется в активной ветке JSONL, локальная строка заменяется серверной entry. Если пользователь нажал Stop/Interrupt до durable materialization, локальный prompt не превращается во второй user bubble: он становится `cancelled`/нейтральным маркером отмены, а совпадающая JSONL-строка из abandoned tail, если Claude всё же успел её дописать, suppression-фильтром скрывается из History. Пользовательский симптом, который этот контракт ловит: prompt исчез из History сразу после Enter или наоборот появился как user-сообщение, хотя терминал его уже не выполняет.
+
+`handoffId` связывает renderer click, `terminal:paste`, `safePasteAndSubmit`, `PasteAudit` и interrupt recovery в логах. Без общего id быстрый сценарий «отправил и сразу Stop» выглядит как рассинхрон двух независимых подсистем: History видит optimistic row, main видит paste/interrupt, JSONL watcher позже видит хвостовую user entry. Handoff-id нужен не для бизнес-логики, а чтобы в логах доказать, какая именно попытка отправки была доставлена, отменена или подавлена.
+
 ### Кладбище идей: Esc после paste
 **Попытка №1** — в flow добавили `\x1b` (Esc) перед Enter, чтобы закрыть slash-autocomplete dropdown. Логика: при пасте `/model haiku` сначала появляется autocomplete, и `PromptInput.onSubmit` имеет early-return guard на `suggestionsState.suggestions.length > 0` (PromptInput.tsx::1074). Без закрытия dropdown — `\r` молча игнорируется.
 
@@ -144,21 +148,22 @@ Effort Level (уровень интенсивности размышлений) 
 ### Симптомы (при сбоях)
 При восстановлении истории слова могут слипаться в одну строку без пробелов (`каксейчасработает`), либо курсор навигации в TUI-меню "промахивается" мимо нужной записи, из-за чего сессия откатывается не в ту точку или закрывается с ошибкой.
 
-Для программного отката используется IPC `claude:open-history-menu`.
+Для программного отката используется IPC `claude:open-history-menu`, но основной путь больше не открывает legacy history menu через Ctrl+C/Esc. Timeline запускает **нативную Claude slash-команду** `/rewind` через тот же Stash Flow, что `/model` и `/compact`: перед командой классифицируется текущий composer, видимый draft защищается от потери, slash-команда отправляется как служебное действие, а не как пользовательский prompt.
 
-**Алгоритм навигации:**
-1. **Открытие:** Отправить `\x03` (Ctrl+C) → `\x1b` (Esc) → `\x1b` (Esc).
-2. **Парсинг:** Ждать sync marker, извлечь список записей.
-3. **Сопоставление (Text Match):** Найти нужную запись по префиксу текста сообщения.
-4. **Синхронная навигация:** Каждое нажатие `Arrow Up` верифицируется — система ждет новый кадр и проверяет, что курсор `❯` переместился на нужную строку.
-5. **Подтверждение:** Отправить `\r` (Enter) для выбора точки отката.
+**Алгоритм native Rewind:**
+1. **Preflight input:** `captureClaudeInput(tabId, 'copy')` проверяет, что можно безопасно временно забрать управление composer'ом. Неизвестное состояние лучше отказать, чем молча перетереть draft.
+2. **Открытие:** `safePasteAndSubmit('/rewind', { stashFirst:true, submit:true })` открывает родной Claude history picker. Это важно: source of truth для rewind — сам Claude TUI, не редактирование JSONL и не наша реконструкция меню.
+3. **Навигация:** Timeline передаёт `targetFullText` выбранной entry и `rewindableCount`. После sync marker меню навигация идёт к нужной записи по позиции в текущем rewindable диапазоне; если позиционный путь не сходится, остаётся visual/text fallback из старого фикса.
+4. **Подтверждение:** `\r` выбирает историю в Claude. Это ещё не пользовательский submit нового turn'а.
+5. **Transfer target input:** после возврата prompt-box'а (`╰`/`⏵` + sync marker) Claude уже восстановил выбранный prompt в terminal composer. Приложение сразу забирает его через `grab-input`, кладёт в History textarea и очищает terminal composer. Пользователь видит выбранный prompt в правом input и сам решает, жать ли Send/Enter; левый терминал остаётся пустым, потому что у текста должен быть один текущий владелец.
 
-**Очистка и вставка:**
-После отката Claude часто сохраняет старое сообщение в инпуте.
-1. **Wait for prompt:** Ждем полной отрисовки промпта (sync marker + `╰`).
-2. **Clear:** Отправить `\x03` (Ctrl+C).
-3. **safePasteAndSubmit:** Вставить сжатое резюме чанками по 900 байт, дожидаясь подтверждения отрисовки каждого чанка через sync marker.
-4. **Submit:** Отправить `\r`.
+**Два режима после выбора:**
+- **Обычный «Откатиться»:** только native `/rewind` + перенос target prompt в History input. Никакого `/compact`, AI-пересказа или auto-submit. History показывает локальный жёлтый marker `I REWOUND`, обрезает preview до выбранной точки и скрывает сам target user-row, чтобы он не дублировался рядом с marker'ом и textarea.
+- **AI compact / prompt-варианты:** используют тот же selection handler, но после выбора запускают дополнительный AI-путь (`pasteAfter`/compact instruction). Поэтому кнопки в Timeline context menu разделены: default action не делает AI-work, AI-иконка и prompt-стрелка делают.
+
+Rewind preview не является сохранённым состоянием JSONL. Если закрыть Claude/терминал до отправки нового prompt'а из History input и открыть сессию заново, полная история возвращается из исходного transcript. Только настоящий subsequent send создаёт новую durable ветку/хвост, который History сможет показывать как факт, а не preview.
+
+Legacy Visual Search Strategy в [`fix-rewind-navigation.md`](fix-rewind-navigation.md) остаётся safety/fallback для случаев, когда TUI-меню не удаётся позиционно сопоставить. Не возвращать старую модель «открыть меню Ctrl+C/Esc → найти lavender RGB → Enter → всегда вставить compact»: она смешивала два разных действия (выбор истории и AI-компактацию) и могла перетереть ожидаемый current input.
 
 ## Решение: safePasteAndSubmit (Programmatic Chunked Paste)
 

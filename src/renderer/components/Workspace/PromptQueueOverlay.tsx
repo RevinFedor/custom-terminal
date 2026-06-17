@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } fr
 import type { CSSProperties, WheelEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { CheckSquare, ChevronLeft, History, PanelRightClose, PanelRightOpen, Plus, RefreshCw, Square, Trash2 } from 'lucide-react';
-import { countEnabledQueuedPrompts, isQueuedPromptEnabled, makeDefaultPromptTitle, usePromptQueueStore, type QueuedPrompt } from '../../store/usePromptQueueStore';
+import { buildQueuedPromptPayload, countEnabledQueuedPrompts, isQueuedPromptEnabled, makeDefaultPromptTitle, usePromptQueueStore, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -867,11 +867,12 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   // touching stash. Normal click leaves it for review; Cmd+click also submits
   // immediately (same as user pressing Enter after paste). On success the chip
   // is removed from the queue (the prompt has "moved" into the agent input).
-  const replayChip = useCallback(async (id: string, text: string, opts?: { submit?: boolean }) => {
+  const replayChip = useCallback(async (id: string, item: QueuedPrompt, opts?: { submit?: boolean }) => {
     // Guard against double-click while the previous IPC roundtrip is still
     // in flight — second click would queue a second bracketed paste against
     // the same chip, then a second removePrompt against an already-gone id.
     if (replayingIdsRef.current.has(id)) return;
+    const payload = buildQueuedPromptPayload(item);
     replayingIdsRef.current.add(id);
     setReplayingIds((prev) => {
       if (prev.has(id)) return prev;
@@ -881,7 +882,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     });
     try {
       const submitNow = opts?.submit === true;
-      const res = await ipcRenderer.invoke(sessionType + ':append-input', tabId, text, {
+      const res = await ipcRenderer.invoke(sessionType + ':append-input', tabId, payload, {
         submit: submitNow,
       });
       if (!res || !res.success) {
@@ -1590,8 +1591,8 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                   disabled={replayingIds.has(it.id)}
                   onClick={(e) => {
                     e.stopPropagation();
-                    const latestText = usePromptQueueStore.getState().getQueue(tabId).items.find((p) => p.id === it.id)?.text ?? it.text;
-                    replayChip(it.id, latestText, { submit: e.metaKey || cmdPressedRef.current });
+                    const latestItem = usePromptQueueStore.getState().getQueue(tabId).items.find((p) => p.id === it.id) ?? it;
+                    replayChip(it.id, latestItem, { submit: e.metaKey || cmdPressedRef.current });
                   }}
                   title={
                     replayingIds.has(it.id)
@@ -2526,6 +2527,15 @@ function RunAfterTabPicker({ tabId, autoRun, runAfterTabId, setRunAfterTab, pane
   useEffect(() => {
     // Re-seed on (re)mount in case edges fired between initial state and effect.
     setBusyMap(getBusyTabsSnapshot());
+    const isNonClaudePtyAiTab = (tid: string): boolean => {
+      const state = useWorkspaceStore.getState();
+      for (const ws of state.openProjects.values()) {
+        const tab = ws.tabs.get(tid);
+        if (!tab) continue;
+        return tab.commandType === 'codex' || tab.commandType === 'gemini';
+      }
+      return false;
+    };
     const apply = (tid: string, busy: boolean) =>
       setBusyMap((prev) => {
         if (prev.get(tid) === busy) return prev;
@@ -2533,7 +2543,10 @@ function RunAfterTabPicker({ tabId, autoRun, runAfterTabId, setRunAfterTab, pane
         next.set(tid, busy);
         return next;
       });
-    const handleClaudeBusy = (_: any, { tabId: tid, busy }: { tabId: string; busy: boolean }) => apply(tid, busy);
+    const handleClaudeBusy = (_: any, { tabId: tid, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
+      if (reason === 'spinner' && isNonClaudePtyAiTab(tid)) return;
+      apply(tid, busy);
+    };
     const handleGeminiBusy = (_: any, { tabId: tid, busy }: { tabId: string; busy: boolean }) => apply(tid, busy);
     const handleCodexBusy = (_: any, { tabId: tid, busy }: { tabId: string; busy: boolean }) => apply(tid, busy);
     ipcRenderer.on('claude:busy-state', handleClaudeBusy);

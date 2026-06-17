@@ -220,9 +220,29 @@ Group-row — самостоятельная кликабельная строк
 
 Group-row поддерживает те же пользовательские visual metadata, что и обычная вкладка: `sessionStatus` рисуется тем же marker shape/size слева, `color` выбирает background/folder accent из `TAB_COLORS`. ПКМ по группе зеркалит tab-context menu для Status и Background: повторный клик по выбранному статусу снимает его, а пустой список статусов показывает тот же hint про Settings → Системные. Статусы групп живут в `tabGroups` JSON, а не в `tabs`/`tab_history`.
 
+Mobile/native клиенты не хранят свои группы. `/api/projects/:id/tabs` отдаёт тот же `tabGroups`
+JSON вместе со статусами и marker config, а `/api/projects/:id/tab-layout` принимает layout
+payload с `orderedIds`, `groupAssignments`, `groupAnchorAssignments`. Это защищает от двух
+разных sidebar-истин: desktop DnD, mobile reorder и project-activity layout reload должны
+сойтись на одном `tabGroups`/`tabs` состоянии. Delete Group в mobile-контракте соответствует
+desktop `Delete Group`: удаляет контейнер и очищает `groupId` у вкладок, но не закрывает tabs.
+
 `visualParentTabId` — только визуальная связь вкладка→вкладка для thread/fork-структуры. Visual-child остаётся обычной видимой вкладкой со своим session id (это отдельное поле, не путать с `parentTabId`). Split-стрелки в tab context menu привязывают вкладку к ближайшему видимому соседу сверху/снизу; `setTabVisualParent` защищает от циклов и нормализует `groupId` ребёнка под группу родителя. Ручной DnD повторяет модель групп: если пользователь тащит обычную вкладку рядом с уже существующим visual-child, drop в sibling-slot делает её ещё одним visual-child того же parent. Это убирает обязательность кликать стрелки для каждого fork и сохраняет ментальную модель «положил под ветку — стал частью этой ветки».
 
 Drag-семантика различает parent и child: перетаскивание parent-вкладки тянет её visual-children как один блок, а перетаскивание child отдельно отвязывает `visualParentTabId`. Несколько consecutive visual-children одного parent рисуют непрерывный vertical connector: между первым и вторым fork линия не должна прерываться, иначе пользователь видит две отдельные ветки вместо одной цепочки. Fork из текущей Claude/Codex/Gemini/SDK-вкладки создаёт fork как visual-child исходной вкладки, потому что пользователь хочет видеть причинную связь «из этой сессии родилась эта». Clipboard-fork по произвольному UUID остаётся плоским: source-tab может быть неизвестен, и привязка к активной вкладке была бы ложной.
+
+### Файловые вкладки как visual-child
+
+Файл, прикреплённый из file explorer через `Link File`, становится обычной видимой вкладкой `tabType='file'`, но не AI/terminal-сессией. Он создаётся рядом с выбранной Claude/Codex/SDK-вкладкой, наследует её `groupId` и получает `visualParentTabId=<targetTabId>`, чтобы читаться как рабочий артефакт этой сессии. Мотивация UX: пользователь хочет открыть нужный файл прямо из области вкладок и не возвращаться в дерево через `Cmd+B` только ради просмотра.
+
+File-tab участвует в тех же механиках порядка, группировки, DnD и visual-child стрелок, что и обычные вкладки. При этом его контекстное меню урезано по смыслу: остаются `Copy Path`, `Copy Content`, `Status` и `Unlink File`; `Обновить название`, Favorites, Stop/Restart и rename не показываются. `Unlink File` закрывает вкладку/связь, но **не удаляет файл с диска** — destructive file operation остаётся в file tree. Background/color editing отключены, потому что фиолетовый фон — semantic marker “это файл”, а не пользовательская раскраска сессии.
+
+Клик по file-tab открывает `FilePreview` справа поверх terminal area через тот же preview-surface, что Cmd+click/Sidebar file open. Повторный переход обратно должен возвращать пользователя к предыдущему рабочему табу/родителю, а не превращать file-tab в новый терминальный контекст. При правках этой зоны проверяй `Workspace` sync-effects: preview source `tab` не должен быть закрыт sidebar cleanup'ом, а sidebar source не должен переписать active file-tab preview.
+
+На mobile/native тот же принцип: file-tab остаётся row в списке групп/DnD/status, но tap по нему
+открывает read-only preview sheet через `/api/file-preview`, а не активирует chat route и не
+запускает tab SSE. Если клиент начинает трактовать file-tab как session tab, пользователь видит
+пустой чат вместо документа, а runtime/status state получает ложного владельца.
 
 Закрытая вкладка помнит `groupId` в `tab_history` и при Restore/Home/Shift+Cmd+T возвращается в группу только если group-row ещё существует. Если контейнер удалён через Delete/Close Group, restore деградирует в плоскую вкладку: история восстанавливает саму рабочую сессию, но не воскресает удалённую папку.
 

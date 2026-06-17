@@ -246,21 +246,30 @@ await safePasteAndSubmit(term, content, {
 
 1. **COLORTERM:** CLI проверяют эту переменную. Если она не равна `truecolor`, они переходят в режим совместимости.
 2. **LANG/LC_ALL:** Без явного указания UTF-8 локали, терминал может некорректно интерпретировать многобайтовые символы (кириллицу).
+3. **Inherited no-color flags:** dev Electron часто запускается из Claude/Codex tab, а родительский agent может держать `NO_COLOR=1` или `FORCE_COLOR=0`. Если без фильтра передать `...process.env` в PTY, Claude/Codex CLI честно отключают ANSI-цвета, даже при `COLORTERM=truecolor`. Симптом для пользователя — Claude/Codex TUI становится почти чёрно-белым, пропадает оранжевый/акцентный статус.
 
 ### Решение
-В файле `src/main/main.js` при создании PTY-процесса были принудительно установлены переменные окружения:
+В файле `src/main/main.js` при создании PTY-процесса принудительно задаются цвет/locale переменные и вычищаются родительские запреты цвета:
 
 ```javascript
+const shellEnv = {
+  ...process.env,
+  TERM: 'xterm-256color',
+  COLORTERM: 'truecolor',        // Включает яркие 24-bit цвета
+  CLICOLOR: '1',
+  LANG: process.env.LANG || 'en_US.UTF-8',
+  LC_ALL: process.env.LC_ALL || 'en_US.UTF-8' // Обеспечивает корректный ввод UTF-8
+};
+delete shellEnv.NO_COLOR;
+if (shellEnv.FORCE_COLOR === '0') delete shellEnv.FORCE_COLOR;
+
 const ptyProcess = pty.spawn(shell, [], {
   // ...
-  env: {
-    ...process.env,
-    COLORTERM: 'truecolor',        // Включает яркие 24-bit цвета
-    LANG: process.env.LANG || 'en_US.UTF-8',
-    LC_ALL: process.env.LC_ALL || 'en_US.UTF-8' // Обеспечивает корректный ввод UTF-8
-  }
+  env: shellEnv
 });
 ```
+
+Граница важна: `NO_COLOR` полезен внутри самой AI-сессии, но пользовательский PTY в Noted Terminal должен вести себя как нормальный терминал. Запрет цвета из управляющего процесса не является настройкой будущих вкладок.
 
 ### Дополнительно: Кэширование (Production)
 Для стабильности отображения изменений после сборки (Production build) в главный процесс добавлен флаг:
