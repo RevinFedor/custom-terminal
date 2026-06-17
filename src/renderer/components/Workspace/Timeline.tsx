@@ -505,9 +505,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const selectionStartIdRef = useRef<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, entry: TimelineEntry, source?: 'dot' | 'segment' } | null>(null);
-  const [rewindPostPromptMode, setRewindPostPromptMode] = useState(false);
-  const [rewindPostPromptText, setRewindPostPromptText] = useState('');
-  const rewindPostPromptRef = useRef<HTMLTextAreaElement>(null);
   const [sessionBoundaries, setSessionBoundaries] = useState<SessionBoundary[]>([]);
   // Boundary uuid from backend (= youngest entry of pre-orphan tail, set when
   // Generic CHAIN BREAK recovery fired). Used ONLY to detect post-compact
@@ -708,7 +705,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Re-clamp the context menu top using the menu's REAL post-render height.
   // The initial position (setContextMenu in openContextMenu) uses a hardcoded
   // `menuHeight` guess. That's wrong when the menu has more rows — e.g.
-  // rewind/post-prompt/delete-confirm states — and the bottom edge can slip
+  // rewind/delete-confirm states — and the bottom edge can slip
   // below the viewport. After every relevant content/position change we measure
   // the real rect and shift `top` up if needed.
   useLayoutEffect(() => {
@@ -725,7 +722,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     if (desired !== contextMenu.y) {
       setContextMenu({ ...contextMenu, y: desired });
     }
-  }, [contextMenu?.entry?.uuid, contextMenu?.y, selectionStartId, deleteEntryConfirmMode, rewindPostPromptMode]);
+  }, [contextMenu?.entry?.uuid, contextMenu?.y, selectionStartId, deleteEntryConfirmMode]);
 
   // Same clamp for the edit-range loading popup ("Прервать / Отмена").
   // Set from `e.clientY` raw, no height guess. When cursor was near the very
@@ -1737,7 +1734,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         setActiveTooltipIndex(null);
         setHoveredIndex(null);
         setPostPromptMode(false);
-        setRewindPostPromptMode(false);
         setUnreachableIndices(new Set());
         setVisibleEntryIndices(new Set());
         setResponseOnlyIndices(new Set());
@@ -3091,9 +3087,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   const handleRewind = async (entry: TimelineEntry, mode: RewindMode = 'native', additionalPrompt?: string) => {
     setContextMenu(null);
-    setRewindPostPromptMode(false);
     if (!sessionId) return;
-    if (isCodex && mode !== 'native') return;
 
     const entryIndex = entries.findIndex(e => e.uuid === entry.uuid);
     if (entryIndex === -1) return;
@@ -3133,7 +3127,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       'tool:', isGemini ? 'gemini' : isCodex ? 'codex' : 'claude', 'mode:', mode);
 
     const rewindOpId = Date.now().toString(36) + '-' + entry.uuid.slice(0, 8);
-    const emitHistoryRewindLog = (status: 'start' | 'done' | 'failed', error?: string) => {
+    const emitHistoryRewindLog = (status: 'start' | 'done' | 'failed', error?: string, message?: string) => {
       window.dispatchEvent(new CustomEvent('history-panel:rewind-log', {
         detail: {
           tabId,
@@ -3143,12 +3137,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           targetText: entry.content,
           mode,
           toolType,
-          persisted: isCodex && status === 'done',
+          persisted: isCodex && mode === 'native' && status === 'done',
           error,
+          message,
         }
       }));
     };
-    emitHistoryRewindLog('start');
+    emitHistoryRewindLog(
+      'start',
+      undefined,
+      mode === 'ai' ? 'Gemini Rewind: preparing transcript...' : undefined
+    );
 
     // IPC channel names based on tool type
     const copyRangeChannel = isCodex ? 'codex:copy-range' : isGemini ? 'gemini:copy-range' : 'claude:copy-range';
@@ -3157,19 +3156,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     // Phase 1: Optional AI compact of entries being lost (from clicked entry to end).
     // Native rewind intentionally skips this for the fast `/rewind` → arrows → Enter path.
     let compactText = '';
+    let compactError = '';
     if (mode === 'ai') {
       setRewindState({ index: entryIndex, phase: 'compacting' });
 
       try {
+        emitHistoryRewindLog('start', undefined, 'Gemini Rewind: copying range...');
         const rangeResult = await ipcRenderer.invoke(copyRangeChannel, {
           sessionId,
           cwd,
           startUuid: entry.uuid,
-          endUuid: entries[entries.length - 1].uuid
+          endUuid: entries[entries.length - 1].uuid,
+          ...copyFlags,
         });
 
         if (rangeResult.success && rangeResult.content) {
           console.warn('[Restore:Rewind] Range copied, length:', rangeResult.content.length);
+          emitHistoryRewindLog('start', undefined, 'Gemini Rewind: request to Gemini...');
 
           // Compact via Gemini API using rewind prompt
           const { getPromptById, rewindPromptId } = usePromptsStore.getState();
@@ -3222,18 +3225,35 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               if (data.candidates?.[0]?.content?.parts?.[0]?.text) {
                 compactText = data.candidates[0].content.parts[0].text;
                 console.warn('[Restore:Rewind] Compact ready, length:', compactText.length);
+                emitHistoryRewindLog('start', undefined, 'Gemini Rewind: response ready, opening native Rewind...');
               } else {
                 console.error('[Restore:Rewind] Gemini returned empty/blocked response');
+                compactError = response.status >= 400
+                  ? `Gemini ${response.status}: ${data.error?.message || data.error?.status || 'error'}`
+                  : 'Gemini returned empty response';
               }
             } catch (geminiErr) {
               console.error('[Restore:Rewind] Gemini compact failed:', geminiErr);
+              compactError = String((geminiErr as any)?.message || geminiErr);
             }
           } else {
             console.warn('[Restore:Rewind] No rewind prompt configured, skipping compact');
+            compactError = 'No Rewind prompt configured';
           }
+        } else {
+          compactError = rangeResult?.error || 'Copy range failed';
         }
       } catch (rangeErr) {
         console.error('[Restore:Rewind] Copy range failed:', rangeErr);
+        compactError = String((rangeErr as any)?.message || rangeErr);
+      }
+
+      if (!compactText.trim()) {
+        const error = compactError || 'Gemini Rewind produced empty text';
+        emitHistoryRewindLog('failed', error);
+        setRewindState(null);
+        useUIStore.getState().showToast('Gemini Rewind failed: ' + error, 'error', 4000);
+        return;
       }
     }
 
@@ -3286,11 +3306,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
       // Success flash
       setRewindState({ index: entryIndex, phase: 'done' });
-      if (isCodex) {
+      if (isCodex && mode === 'native') {
         const targetDraft = entry.content.trim();
         if (targetDraft) setHistoryPromptDraft(tabId, targetDraft);
       }
-      emitHistoryRewindLog('done');
+      emitHistoryRewindLog(
+        'done',
+        undefined,
+        mode === 'ai' ? 'Gemini Rewind: text inserted and submitted.' : undefined
+      );
       setTimeout(() => setRewindState(null), 1200);
 
     } catch (rewindErr) {
@@ -5611,108 +5635,32 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       )}
                     </>
                   )}
-                  {/* Rewind — native for Claude/Gemini/Codex; AI compact stays on Claude/Gemini. */}
+                  {/* Rewind — left side native, right side Gemini compact + native rewind. */}
                   <div className="border-t border-white/10 my-1" />
-                  {(!rewindPostPromptMode || isCodex ? (
-                    <div className="flex rounded overflow-hidden">
+                  <div className="flex rounded overflow-hidden">
+                    <button
+                      className={`flex-1 text-left px-3 py-2 text-xs rounded-l transition-colors ${isActive && !rewindState ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
+                      disabled={!isActive || !!rewindState}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (isActive && !rewindState) handleRewind(contextMenu.entry, 'native');
+                      }}
+                    >
+                      {rewindState ? (rewindState.phase === 'compacting' ? 'Gemini...' : rewindState.phase === 'rewinding' ? 'Rewind...' : 'Paste...') : 'Rewind'}
+                    </button>
+                    <Tooltip content="Rewind через AI">
                       <button
-                        className={`flex-1 text-left px-3 py-2 text-xs ${isCodex ? 'rounded' : 'rounded-l'} transition-colors ${isActive && !rewindState ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
+                        className={`px-2 py-2 text-[10px] font-bold tracking-wide rounded-r transition-colors border-l border-white/10 ${isActive && !rewindState ? 'text-amber-400/80 hover:bg-amber-600/30 hover:text-amber-300 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
                         disabled={!isActive || !!rewindState}
                         onClick={(e) => {
                           e.stopPropagation();
-                          if (isActive && !rewindState) handleRewind(contextMenu.entry, 'native');
+                          if (isActive && !rewindState) handleRewind(contextMenu.entry, 'ai');
                         }}
                       >
-                        {rewindState ? (rewindState.phase === 'compacting' ? 'Компакт...' : rewindState.phase === 'rewinding' ? 'Откат...' : 'Вставка...') : 'Откатиться'}
+                        AI
                       </button>
-                      {!isCodex && (
-                        <>
-                          <Tooltip content="Откатиться через AI compact">
-                            <button
-                              className={`px-2 py-2 text-xs transition-colors border-l border-white/10 ${isActive && !rewindState ? 'text-amber-400/70 hover:bg-amber-600/30 hover:text-amber-300 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
-                              disabled={!isActive || !!rewindState}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                if (isActive && !rewindState) handleRewind(contextMenu.entry, 'ai');
-                              }}
-                            >
-                              <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                <path d="M4 18V9a5 5 0 0 1 10 0v9" />
-                                <path d="M4 13h10" />
-                                <path d="M20 6v12" />
-                              </svg>
-                            </button>
-                          </Tooltip>
-                          <Tooltip content="Откатиться с инструкцией">
-                            <button
-                              className={`px-2 py-2 text-xs transition-colors cursor-pointer border-l border-white/10 ${isActive && !rewindState ? 'text-amber-400/60 hover:bg-amber-600/30 hover:text-amber-300' : 'text-white/20 cursor-not-allowed'}`}
-                              disabled={!isActive || !!rewindState}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                if (!isActive || rewindState) return;
-                                setRewindPostPromptMode(true);
-                                setRewindPostPromptText('');
-                                setTimeout(() => rewindPostPromptRef.current?.focus(), 50);
-                              }}
-                            >
-                              ▶
-                            </button>
-                          </Tooltip>
-                        </>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="p-1">
-                      <textarea
-                        ref={rewindPostPromptRef}
-                        value={rewindPostPromptText}
-                        onChange={(e) => setRewindPostPromptText(e.target.value)}
-                        placeholder="Инструкция для AI при откате..."
-                        className="w-full bg-[#252525] border border-[#444] rounded px-2 py-1.5 text-[11px] text-white/90 font-mono resize-none focus:outline-none focus:border-amber-500/50 placeholder:text-[#555]"
-                        style={{ minHeight: '28px', maxHeight: '110px', lineHeight: '1.4' }}
-                        rows={1}
-                        onInput={(e) => {
-                          const el = e.currentTarget;
-                          el.style.height = 'auto';
-                          el.style.height = Math.min(el.scrollHeight, 110) + 'px';
-                        }}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter' && e.metaKey && rewindPostPromptText.trim()) {
-                            e.preventDefault();
-                            const prompt = rewindPostPromptText.trim();
-                            setRewindPostPromptMode(false);
-                            setRewindPostPromptText('');
-                            handleRewind(contextMenu.entry, 'ai', prompt);
-                          } else if (e.key === 'Escape') {
-                            e.preventDefault();
-                            setRewindPostPromptMode(false);
-                            setRewindPostPromptText('');
-                          }
-                        }}
-                      />
-                      <div className="flex items-center justify-between mt-1">
-                        <span className="text-[9px] text-[#555]">⌘+Enter • Esc отмена</span>
-                        <button
-                          className="p-1 rounded transition-colors cursor-pointer"
-                          style={{
-                            color: rewindPostPromptText.trim() ? '#f59e0b' : '#555',
-                            backgroundColor: rewindPostPromptText.trim() ? 'rgba(245, 158, 11, 0.1)' : 'transparent',
-                          }}
-                          disabled={!rewindPostPromptText.trim()}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            if (!rewindPostPromptText.trim()) return;
-                            const prompt = rewindPostPromptText.trim();
-                            setRewindPostPromptMode(false);
-                            setRewindPostPromptText('');
-                            handleRewind(contextMenu.entry, 'ai', prompt);
-                          }}
-                        >
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-                        </button>
-                      </div>
-                    </div>
-                  ))}
+                    </Tooltip>
+                  </div>
                 </>
               ) : (
                 <button

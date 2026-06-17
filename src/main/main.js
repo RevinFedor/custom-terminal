@@ -9032,11 +9032,6 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     return { success: false, error: 'codex_busy' };
   }
 
-  if (pasteAfter && typeof pasteAfter === 'string' && pasteAfter.length > 0) {
-    console.log('[Codex:Rewind] pasteAfter is not supported for Codex native backtrack yet');
-    return { success: false, error: 'codex_rewind_paste_after_unsupported' };
-  }
-
   function normalizeCandidate(text) {
     return String(text || '').replace(/\s+/g, ' ').trim();
   }
@@ -9083,6 +9078,25 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     };
   }
 
+  async function waitForCodexBusyState(expectedBusy, timeoutMs, reason) {
+    const deadline = Date.now() + timeoutMs;
+    let lastBusy = codexTurnWatchers.get(tabId)?.busy === true;
+    let lastEvent = codexTurnWatchers.get(tabId)?.lastEventType || null;
+    while (Date.now() <= deadline) {
+      try { await scanCodexTurnAppend(tabId, reason); } catch (e) {
+        console.warn('[Codex:Rewind] turn scan failed during ' + reason + ': ' + (e?.message || String(e)));
+      }
+      const state = codexTurnWatchers.get(tabId);
+      lastBusy = state?.busy === true;
+      lastEvent = state?.lastEventType || lastEvent;
+      if (lastBusy === expectedBusy) {
+        return { success: true, busy: lastBusy, lastEvent };
+      }
+      await drainPtyData(term, 80, 220);
+    }
+    return { success: false, busy: lastBusy, lastEvent };
+  }
+
   try {
     return await withPtyWriteLock(term, async () => {
       const count = Number(rewindableCount);
@@ -9093,6 +9107,83 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
 
       const targetInputText = String(targetFullText || targetText || '').trim();
       if (!targetInputText) return { success: false, error: 'empty_target' };
+      const hasPasteAfter = typeof pasteAfter === 'string' && pasteAfter.length > 0;
+
+      async function pasteCodexRewindAiCompact(reason) {
+        console.log('[Codex:Rewind] Pasting AI compact text (' + pasteAfter.length + ' chars, reason=' + reason + ', preview=' + JSON.stringify(String(pasteAfter).slice(0, 120)) + ')');
+        const pasteResult = await _safePasteAndSubmitInner(term, pasteAfter, {
+          submit: true,
+          ctrlCFirst: false,
+          stashFirst: false,
+          fast: true,
+          submitSequence: '\r',
+          submitLabel: 'Enter',
+          source: 'codex-rewind-ai',
+          logPrefix: '[Codex:Rewind:paste]',
+        });
+        if (!pasteResult || pasteResult.success === false) {
+          return {
+            success: false,
+            error: pasteResult?.error || 'paste_after_failed',
+            rollbackMayHaveApplied: true,
+          };
+        }
+        return { success: true };
+      }
+
+      async function recoverCodexAiPasteAfterFailedGrab(grabResult, reason) {
+        const before = codexTurnWatchers.get(tabId);
+        console.warn('[Codex:Rewind] AI paste fallback: restored input unavailable reason=' + reason
+          + ' grabSuccess=' + (grabResult?.success === true)
+          + ' chars=' + (grabResult?.text ? grabResult.text.length : 0)
+          + ' matchedTarget=' + (grabResult?.matchedTarget === true)
+          + ' busyBefore=' + (before?.busy === true)
+          + ' lastEvent=' + (before?.lastEventType || '-'));
+
+        // For image/user-message rollbacks Codex may auto-start the restored
+        // prompt instead of exposing an editable composer. One Escape is both
+        // the documented interrupt while busy and a harmless prime hint at idle.
+        const abortFrame = await sendCodexKeyAndCapture(
+          term,
+          '\x1b',
+          5000,
+          '[Codex:Rewind:ai-fallback:esc]',
+          (clean, raw) => raw.includes(CODEX_SYNC_MARKER)
+            || /turn_aborted|aborted|interrupted/i.test(clean)
+            || /esc again to edit previous message/i.test(clean)
+            || codexFrameLooksLikePrompt(clean, raw)
+        );
+        console.log('[Codex:Rewind] AI paste fallback Esc timedOut=' + abortFrame.timedOut
+          + ' clean=' + JSON.stringify(String(abortFrame.clean || '').slice(0, 260)));
+
+        let busyAfterEsc = codexTurnWatchers.get(tabId)?.busy === true;
+        if (!busyAfterEsc) {
+          await drainPtyData(term, 120, 700);
+          try { await scanCodexTurnAppend(tabId, 'rewind-ai-fallback-post-esc'); } catch {}
+          busyAfterEsc = codexTurnWatchers.get(tabId)?.busy === true;
+        }
+        if (busyAfterEsc) {
+          const idle = await waitForCodexBusyState(false, 7000, 'rewind-ai-fallback-wait-idle');
+          console.log('[Codex:Rewind] AI paste fallback wait idle success=' + idle.success
+            + ' busy=' + idle.busy
+            + ' lastEvent=' + (idle.lastEvent || '-'));
+          if (!idle.success && idle.busy === true) {
+            return {
+              success: false,
+              error: 'codex_rewind_ai_abort_timeout',
+              rollbackMayHaveApplied: true,
+            };
+          }
+        }
+
+        const cleanup = await captureAgentInput(tabId, 'grab', 'codex');
+        console.log('[Codex:Rewind] AI paste fallback cleanup grab success=' + (cleanup?.success === true)
+          + ' chars=' + (cleanup?.text ? cleanup.text.length : 0)
+          + ' images=' + (cleanup?.images || 0)
+          + ' error=' + (cleanup?.error || '-'));
+
+        return await pasteCodexRewindAiCompact('fallback-' + reason);
+      }
 
       const olderSteps = Math.max(0, count - 1 - idx);
       const rollbackTurns = count - idx;
@@ -9203,10 +9294,33 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       }
       await drainPtyData(term, 120, 700);
 
-      console.log('[Codex:Rewind] Moving clicked prompt out of terminal input into History draft (' + targetInputText.length + ' chars)');
+      console.log('[Codex:Rewind] ' + (hasPasteAfter ? 'Clearing restored prompt before AI compact paste' : 'Moving clicked prompt out of terminal input into History draft') + ' (' + targetInputText.length + ' chars)');
       const grabResult = await grabRestoredCodexRewindInput(targetInputText);
       if (!grabResult || grabResult.success === false) {
         console.warn('[Codex:Rewind] Could not verify terminal input clear after native backtrack: ' + (grabResult?.error || 'unknown'));
+        if (hasPasteAfter) {
+          const recovered = await recoverCodexAiPasteAfterFailedGrab(grabResult, grabResult?.error || 'grab_failed');
+          if (recovered?.success) {
+            return {
+              success: true,
+              targetIndex: idx,
+              rewindableCount: count,
+              rollbackTurns,
+              pressCount: escPressCount,
+              restoredInput: false,
+              historyInputDraft: false,
+              compactPasted: true,
+              pasteAfterFallback: true,
+            };
+          }
+          return {
+            success: false,
+            error: recovered?.error || grabResult?.error || 'codex_rewind_restored_input_grab_failed',
+            rollbackTurns,
+            pressCount: escPressCount,
+            rollbackMayHaveApplied: true,
+          };
+        }
         return {
           success: false,
           error: grabResult?.error || 'codex_rewind_restored_input_grab_failed',
@@ -9219,6 +9333,31 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         + ' matchedTarget=' + grabResult.matchedTarget
         + ' attempt=' + grabResult.attempt);
       if (!grabResult.matchedTarget) {
+        if (hasPasteAfter) {
+          const recovered = await recoverCodexAiPasteAfterFailedGrab(grabResult, 'mismatch');
+          if (recovered?.success) {
+            return {
+              success: true,
+              targetIndex: idx,
+              rewindableCount: count,
+              rollbackTurns,
+              pressCount: escPressCount,
+              restoredInput: false,
+              historyInputDraft: false,
+              compactPasted: true,
+              pasteAfterFallback: true,
+            };
+          }
+          return {
+            success: false,
+            error: recovered?.error || 'codex_rewind_restored_input_mismatch',
+            rollbackTurns,
+            pressCount: escPressCount,
+            rollbackMayHaveApplied: true,
+            restoredPreview: String(grabResult.text || '').slice(0, 160),
+            targetPreview: targetInputText.slice(0, 160),
+          };
+        }
         return {
           success: false,
           error: 'codex_rewind_restored_input_mismatch',
@@ -9230,12 +9369,58 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         };
       }
       if (grabResult.empty || !grabResult.text || normalizeCandidate(grabResult.text).length === 0) {
+        if (hasPasteAfter) {
+          const recovered = await recoverCodexAiPasteAfterFailedGrab(grabResult, 'empty');
+          if (recovered?.success) {
+            return {
+              success: true,
+              targetIndex: idx,
+              rewindableCount: count,
+              rollbackTurns,
+              pressCount: escPressCount,
+              restoredInput: false,
+              historyInputDraft: false,
+              compactPasted: true,
+              pasteAfterFallback: true,
+            };
+          }
+          return {
+            success: false,
+            error: recovered?.error || 'codex_rewind_restored_input_empty',
+            rollbackTurns,
+            pressCount: escPressCount,
+            rollbackMayHaveApplied: true,
+          };
+        }
         return {
           success: false,
           error: 'codex_rewind_restored_input_empty',
           rollbackTurns,
           pressCount: escPressCount,
           rollbackMayHaveApplied: true,
+        };
+      }
+
+      if (hasPasteAfter) {
+        const pasteResult = await pasteCodexRewindAiCompact('after-grab');
+        if (!pasteResult?.success) {
+          return {
+            success: false,
+            error: pasteResult?.error || 'paste_after_failed',
+            rollbackTurns,
+            pressCount: escPressCount,
+            rollbackMayHaveApplied: true,
+          };
+        }
+        return {
+          success: true,
+          targetIndex: idx,
+          rewindableCount: count,
+          rollbackTurns,
+          pressCount: escPressCount,
+          restoredInput: false,
+          historyInputDraft: false,
+          compactPasted: true,
         };
       }
 
