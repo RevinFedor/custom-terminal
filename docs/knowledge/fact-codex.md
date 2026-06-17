@@ -82,6 +82,12 @@ Success path проверяется по детерминированным ка
 
 После confirm Codex временно префиллит target prompt в своём composer'е. Приложение забирает его через тот же `codex:grab-input` / Ctrl+G helper, что и ручной `+ clear`, и сверяет normalized text с target. `codex_rewind_restored_input_mismatch` или `codex_rewind_restored_input_empty` нельзя превращать в успешный UI-state: rollback мог уже примениться (`rollbackMayHaveApplied: true`), но terminal input не доказанно очищен или содержит не тот prompt. В этом случае History обязана перечитать rollout как source of truth, а не держаться за локальный marker.
 
+AI Rewind поверх Codex backtrack — отдельный post-action, а не вариант обычного preview. Сначала применяется native `thread_rolled_back`, потом диапазон user prompt + ответ до следующего user prompt или конца сессии отправляется в Gemini/Rewind prompt, и результат становится новым prompt'ом для Codex. Поэтому источник для Gemini должен быть durable History/rollout после rollback, а не terminal buffer: у Codex откат уже сохранён к моменту compact-запроса.
+
+Для вставки результата Gemini в Codex нельзя использовать fast paste path. Codex — crossterm TUI с explicit bracketed paste: large paste может визуально свернуться в `[Pasted Content N chars]`, но rollout должен получить полный `event_msg.user_message`. Прод-шрам: Gemini вернул полный markdown на ~1k+ символов, Claude принял его целиком, а Codex при fast multi-write записал в JSONL только хвост (prompt начинался с пунктов 4-5 списка). Byte-safe UTF-8 chunking сам по себе не чинит этот класс: проблема не в JSONL writer и не в разрыве кириллицы, а в submit до того как composer принял весь logical paste. `codex-rewind-ai` обязан идти TUI-safe путём: одна logical bracketed paste, sync/render marker, потом отдельный Enter. `CodexPasteAudit` сравнивает ожидаемый Gemini-текст с ближайшим rollout `user_message`; mismatch означает paste/composer regression, не ошибку Gemini.
+
+`codex app-server` (`thread/start|resume`, `thread/rollback`, `turn/start|steer`) существует как structured control-plane внутри Codex CLI, но для текущей архитектуры Noted Terminal это **не целевой путь**: это внешний для приложения experimental API/protocol, не наша локальная JSONL-архитектура. Новые rich Codex-действия, включая future middle-history replace, делать без app-server, пока пользователь явно не разрешит переход на этот dependency. Важно: даже app-server rollback по текущему протоколу удаляет только `numTurns` с конца thread'а, поэтому он сам по себе не решает замену диапазона в середине истории.
+
 ## Usage limits
 
 Внутри rollout JSONL авторитетный snapshot лимитов — `event_msg.payload.type === "token_count"` с `payload.rate_limits`: `primary` соответствует 5-hour бакету, `secondary` — weekly бакету; `resets_at` приходит epoch seconds и перед показом переводится в ISO/local time. Этот snapshot нужен Timeline/detail-панели: он отвечает «какой budget-state был у конкретного хода».
@@ -96,7 +102,7 @@ Toolbar usage-chip отвечает на другой вопрос — «как�
 
 Для текущего продукта Codex App Server **не обязателен**: loader'у не нужны дробные состояния «пишет ответ», «ждёт approval», «выполняет команду». Нужен один high-level факт — turn ещё продолжается или уже завершён/прерван. Rollout JSONL уже даёт этот уровень через `task_started`, `task_complete` и `turn_aborted`; задержка до первой записи меньше секунды допустима, потому что пользовательские Codex-turn'ы обычно длятся минуты, а критичный риск — не поздний старт loader'а, а ложный обрыв посреди работы.
 
-App Server остаётся future-path, если понадобится нативно вытаскивать approval/question UI, item-level tool lifecycle или официальный `turn/interrupt`. Не переносить Codex на App Server только ради loader'а, пока JSONL watcher стабильно держит busy=true на всём turn'е и сбрасывает его только по авторитетному завершению.
+App Server остаётся только explicit future-path, если пользователь отдельно согласится на зависимость от experimental Codex protocol ради нативного approval/question UI, item-level tool lifecycle или официального `turn/interrupt`. Не переносить Codex на App Server только ради loader'а, rewind/edit-range или удобства RPC, пока JSONL watcher стабильно держит busy=true на всём turn'е и сбрасывает его только по авторитетному завершению.
 
 ### Native iOS live stream
 

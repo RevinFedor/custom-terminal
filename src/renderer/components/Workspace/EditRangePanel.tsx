@@ -135,7 +135,7 @@ export default function EditRangePanel({
     setApplySteps([
       { label: 'Остановка сессии', status: 'active' },
       { label: 'Редактирование JSONL', status: 'pending' },
-      { label: 'Перезапуск Claude', status: 'pending' },
+      { label: 'Перезапуск агента', status: 'pending' },
     ]);
 
     try {

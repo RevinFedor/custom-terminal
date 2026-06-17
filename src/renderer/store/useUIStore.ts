@@ -545,6 +545,9 @@ interface UIStore {
   // Status bar debug toggles
   debugHoverBridges: boolean;
   setDebugHoverBridges: (v: boolean) => void;
+  // Streaming/privacy mode hides public remote-control hosts/IPs from chrome.
+  streamerMode: boolean;
+  setStreamerMode: (v: boolean) => void;
   // Diagnostic toggle: when true, Cmd-popups (tooltip/note/fork) stay open
   // after pointer leaves so user can inspect their inner DOM in devtools.
   freezeCmdPopups: boolean;
@@ -1139,6 +1142,34 @@ const initialDebugHoverBridges = loadDebugHoverBridges();
       if (useUIStore.getState().debugHoverBridges !== bool) {
         useUIStore.setState({ debugHoverBridges: bool });
         try { localStorage.setItem('noted-terminal-debug-hover-bridges', String(bool)); } catch {}
+      }
+    }
+  } catch {}
+})();
+
+const APP_STATE_KEY_STREAMER_MODE = 'streamerMode';
+const LOCAL_KEY_STREAMER_MODE = 'noted-terminal-streamer-mode';
+const loadStreamerMode = (): boolean => {
+  try { return localStorage.getItem(LOCAL_KEY_STREAMER_MODE) === 'true'; }
+  catch { return false; }
+};
+const saveStreamerMode = (v: boolean) => {
+  try { localStorage.setItem(LOCAL_KEY_STREAMER_MODE, String(v)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_STREAMER_MODE, value: v }).catch(() => {});
+  } catch {}
+};
+const initialStreamerMode = loadStreamerMode();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_STREAMER_MODE);
+    if (v !== null && v !== undefined) {
+      const bool = parsePersistedBool(v);
+      if (useUIStore.getState().streamerMode !== bool) {
+        useUIStore.setState({ streamerMode: bool });
+        try { localStorage.setItem(LOCAL_KEY_STREAMER_MODE, String(bool)); } catch {}
       }
     }
   } catch {}
@@ -2346,6 +2377,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
   // Status bar debug toggles
   debugHoverBridges: initialDebugHoverBridges,
   setDebugHoverBridges: (v) => { set({ debugHoverBridges: v }); saveDebugHoverBridges(v); },
+  streamerMode: initialStreamerMode,
+  setStreamerMode: (v) => { set({ streamerMode: v }); saveStreamerMode(v); },
   freezeCmdPopups: initialFreezeCmdPopups,
   setFreezeCmdPopups: (v) => { set({ freezeCmdPopups: v }); saveFreezeCmdPopups(v); },
   historyPinned: initialHistoryPinned,

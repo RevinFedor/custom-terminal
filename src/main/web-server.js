@@ -635,6 +635,27 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
   if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
 
+  if (parsed.pathname === '/api/app-settings' && req.method === 'GET') {
+    try {
+      const data = await bridgeRequest('getAppSettings', {}, 1500);
+      return sendJson(res, 200, { streamerMode: !!data?.streamerMode });
+    } catch (e) {
+      return sendJson(res, 200, { streamerMode: false });
+    }
+  }
+
+  if (parsed.pathname === '/api/app-settings' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const data = await bridgeRequest('setAppSettings', {
+        streamerMode: typeof body.streamerMode === 'boolean' ? body.streamerMode : undefined,
+      }, 1500);
+      return sendJson(res, 200, { streamerMode: !!data?.streamerMode });
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
   const projectManager = require('./project-manager');
 
   // Projects list (from SQLite — includes closed projects too)
@@ -1281,6 +1302,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const tabId = decId(m[1]);
     try {
       const body = await readBody(req);
+      const mode = body.mode === 'ai' ? 'ai' : 'native';
       const data = await bridgeRequest('rewindAgentTimeline', {
         tabId,
         targetIndex: body.targetIndex,
@@ -1288,7 +1310,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
         targetFullText: body.targetFullText,
         rewindableCount: body.rewindableCount,
         skipDuplicates: body.skipDuplicates || 0,
-      }, 20000);
+        mode,
+        startUuid: body.startUuid || body.targetUuid || null,
+        endUuid: body.endUuid || null,
+        additionalPrompt: body.additionalPrompt || null,
+      }, mode === 'ai' ? 180000 : 20000);
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });

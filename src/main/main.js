@@ -608,7 +608,7 @@ const claudePendingPrompt = new Map(); // tabId -> prompt string
 const claudeDebounceTimers = new Map(); // tabId -> debounce timer ID
 const claudeCtrlCDangerZone = new Map(); // tabId -> { resolve, promise, timer } (event-driven clear on prompt return)
 const claudeConfirmDialogCooldown = new Map(); // `${tabId}:${dialogType}` -> lastFireTs (ms). Prevents double-Enter on echo re-render.
-const codexCwdChooserAutoEnter = new Map(); // tabId -> one-shot state for Codex resume cwd picker
+const codexStartupAutoEnter = new Map(); // tabId -> one-shot state for Codex startup confirmation prompts
 let sessionManager; // Initialized after projectManager is ready
 let claudeManager; // Initialized with terminals map
 
@@ -6547,7 +6547,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
 
       // Parse OSC 133 for command lifecycle events (just spy, don't modify)
       parseOSC133AndEmit(tabId, data);
-      tryHandleCodexCwdChooserAutoEnter(tabId, data);
+      tryHandleCodexStartupAutoEnter(tabId, data);
 
       // ========== CLAUDE HANDSHAKE (Prompt Injection) ==========
       // Wait for prompt to appear, debounce UI settling, then send pending prompt.
@@ -7062,7 +7062,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
 	      claudeCliActive.delete(tabId);
 	      clearBridgeTab(tabId);
 	      clearCodexKnownSession(tabId, 'pty-exit');
-      clearCodexCwdChooserAutoEnter(tabId, 'pty-exit');
+      clearCodexStartupAutoEnter(tabId, 'pty-exit');
       clearTimeout(geminiSpinnerIdleTimers.get(tabId));
       geminiSpinnerBusy.delete(tabId);
       geminiSpinnerIdleTimers.delete(tabId);
@@ -7134,6 +7134,15 @@ function withPtyWriteLock(term, work) {
 // safePasteAndSubmit call) — chained queue items each get their own audit on
 // the next UserPromptSubmit.
 const pendingPasteAudit = new Map();
+const pendingCodexPasteAudit = new Map();
+
+function pasteAuditHash(text) {
+  return require('crypto').createHash('sha1').update(String(text || '')).digest('hex').slice(0, 16);
+}
+
+function pasteAuditPreview(text, start = 0) {
+  return String(text || '').substring(start, start + 80).replace(/\s+/g, ' ');
+}
 
 // Map of term → tabId for the busy broadcast. Filled lazily from `terminals`
 // Map on first paste-busy emit per term.
@@ -7337,6 +7346,23 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   // need per-chunk render confirmation. Slow-mode (Claude) writes the whole
   // payload as a single bracket pair — see "Single-write strategy" below.
   const CHUNK_MAX = 900;
+  const splitUtf8Chunks = (text, maxBytes) => {
+    const chunks = [];
+    let current = '';
+    let currentBytes = 0;
+    for (const char of String(text || '')) {
+      const charBytes = Buffer.byteLength(char, 'utf8');
+      if (current && currentBytes + charBytes > maxBytes) {
+        chunks.push(current);
+        current = '';
+        currentBytes = 0;
+      }
+      current += char;
+      currentBytes += charBytes;
+    }
+    if (current || chunks.length === 0) chunks.push(current);
+    return chunks;
+  };
 
   // Broadcast paste-busy so UI buttons (Compact/Model/Effort/Think) can grey
   // out while another caller is mid-paste. Belt-and-braces fix on top of the
@@ -7381,9 +7407,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   //   paste-stuck-queue.md for the 57s repro.
   const chunks = [];
   if (fast) {
-    for (let i = 0; i < content.length; i += CHUNK_MAX) {
-      chunks.push(content.substring(i, i + CHUNK_MAX));
-    }
+    chunks.push(...splitUtf8Chunks(content, CHUNK_MAX));
   } else {
     chunks.push(content); // Slow-mode = single chunk = single bracket pair = single write.
   }
@@ -7516,24 +7540,37 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       }
     }
 
-    // Stage paste audit BEFORE Enter so the UserPromptSubmit hook can compare
-    // what Claude actually saw against what we tried to send. Only meaningful
-    // for slow-mode (Claude TUI) — fast-mode targets Gemini/bash which don't
-    // run our hook. Length + sha-prefix is enough to spot truncation/corruption
-    // without writing the whole prompt to disk. Stored per-tab; overwritten by
-    // the next safePasteAndSubmit on the same tab so we always audit the most
-    // recent send. Consumed (deleted) by the hook handler post-comparison.
-    if (!fast && broadcastTabId) {
+    // Stage paste audit BEFORE Enter. Claude consumes this via UserPromptSubmit
+    // hook; Codex consumes the same shape from the next rollout user_message.
+    // Length + sha-prefix is enough to spot truncation/corruption without
+    // writing the whole prompt to disk.
+    if (broadcastTabId && source && String(source).startsWith('codex-') && typeof codexTurnWatchers !== 'undefined' && codexTurnWatchers.has(broadcastTabId)) {
       try {
-        const crypto = require('crypto');
-        const expectedHash = crypto.createHash('sha1').update(content).digest('hex').slice(0, 16);
+        const expectedHash = pasteAuditHash(content);
+        pendingCodexPasteAudit.set(broadcastTabId, {
+          handoffId: handoffId || null,
+          source: source || null,
+          expectedLen: content.length,
+          expectedHash,
+          headPreview: pasteAuditPreview(content),
+          tailPreview: pasteAuditPreview(content, Math.max(0, content.length - 80)),
+          sentAt: Date.now(),
+          logPrefix,
+        });
+        console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] staged source=' + (source || '-') + ' expectedLen=' + content.length + ' hash=' + expectedHash);
+      } catch (e) {
+        console.warn(logPrefix + ' [CodexPasteAudit] stage failed:', e.message);
+      }
+    } else if (!fast && broadcastTabId) {
+      try {
+        const expectedHash = pasteAuditHash(content);
         pendingPasteAudit.set(broadcastTabId, {
           handoffId: handoffId || null,
           source: source || null,
           expectedLen: content.length,
           expectedHash,
-          headPreview: content.substring(0, 80).replace(/\s+/g, ' '),
-          tailPreview: content.substring(Math.max(0, content.length - 80)).replace(/\s+/g, ' '),
+          headPreview: pasteAuditPreview(content),
+          tailPreview: pasteAuditPreview(content, Math.max(0, content.length - 80)),
           sentAt: Date.now(),
           logPrefix,
         });
@@ -9115,7 +9152,11 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           submit: true,
           ctrlCFirst: false,
           stashFirst: false,
-          fast: true,
+          // Codex is a crossterm TUI with explicit bracketed-paste events.
+          // Use the TUI-safe path: one complete bracketed paste, wait for the
+          // synchronized render marker, then Enter. Fast multi-write paste can
+          // make crossterm/Codex record only the tail of Cyrillic markdown.
+          fast: false,
           submitSequence: '\r',
           submitLabel: 'Enter',
           source: 'codex-rewind-ai',
@@ -12250,8 +12291,10 @@ const CODEX_WATCHER_TTL_MS = 10 * 60 * 1000;
 const CODEX_WATCHER_SCAN_MS = 1000;
 const CODEX_TURN_CATCHUP_BYTES = 8 * 1024 * 1024;
 const CODEX_SYNC_MARKER = '\x1b[?2026l';
-const CODEX_CWD_CHOOSER_AUTO_ENTER_TTL_MS = 45 * 1000;
-const CODEX_CWD_CHOOSER_BUFFER_LIMIT = 20 * 1024;
+const CODEX_STARTUP_AUTO_ENTER_TTL_MS = 45 * 1000;
+const CODEX_TRUST_PROMPT_AUTO_ENTER_TTL_MS = 15 * 1000;
+const CODEX_POST_TRUST_AUTO_ENTER_TTL_MS = 12 * 1000;
+const CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT = 20 * 1024;
 // Parser order matters: `xhigh` renders as "Extra high", so it must be matched
 // before plain `high` or the effort picker selects the wrong row.
 const CODEX_PICKER_EFFORT_CANDIDATES = ['minimal', 'low', 'medium', 'xhigh', 'high'];
@@ -12588,6 +12631,39 @@ function processCodexTurnLine(state, line) {
   }
   const event = codexEventType(record);
   if (!event) return;
+  if (event === 'user_message') {
+    const audit = pendingCodexPasteAudit.get(state.tabId);
+    if (audit) {
+      pendingCodexPasteAudit.delete(state.tabId);
+      try {
+        const actualText = record.payload?.message || extractCodexLiveText(record.payload?.content) || '';
+        const actualLen = actualText.length;
+        const actualHash = pasteAuditHash(actualText);
+        const match = actualLen === audit.expectedLen && actualHash === audit.expectedHash;
+        if (match) {
+          console.log('[CodexPasteAudit] tab=' + String(state.tabId).slice(-12)
+            + ' source=' + (audit.source || '-')
+            + ' ✅ match len=' + actualLen
+            + ' hash=' + actualHash
+            + ' (sent ' + (Date.now() - audit.sentAt) + 'ms ago)');
+        } else {
+          console.warn('[CodexPasteAudit:MISMATCH] tab=' + String(state.tabId).slice(-12)
+            + ' source=' + (audit.source || '-')
+            + ' expectedLen=' + audit.expectedLen
+            + ' actualLen=' + actualLen
+            + ' Δ=' + (actualLen - audit.expectedLen)
+            + ' expectedHash=' + audit.expectedHash
+            + ' actualHash=' + actualHash
+            + ' expectedHead=' + JSON.stringify(audit.headPreview)
+            + ' actualHead=' + JSON.stringify(pasteAuditPreview(actualText))
+            + ' expectedTail=' + JSON.stringify(audit.tailPreview)
+            + ' actualTail=' + JSON.stringify(pasteAuditPreview(actualText, Math.max(0, actualText.length - 80))));
+        }
+      } catch (e) {
+        console.warn('[CodexPasteAudit] compare failed tab=' + String(state.tabId).slice(-12) + ': ' + (e?.message || String(e)));
+      }
+    }
+  }
   if (event === 'token_count') {
     // Codex emits token_count on every assistant step (and a final one at
     // turn end) — this is the live feed for the context-window meter. Not a
@@ -12958,35 +13034,52 @@ function cleanCodexTuiFrame(raw) {
   return stripVTControlCharacters(normalized);
 }
 
-function clearCodexCwdChooserAutoEnter(tabId, reason = 'clear') {
-  const state = codexCwdChooserAutoEnter.get(tabId);
+function clearCodexStartupAutoEnter(tabId, reason = 'clear') {
+  const state = codexStartupAutoEnter.get(tabId);
   if (!state) return;
   if (state.timeout) clearTimeout(state.timeout);
-  codexCwdChooserAutoEnter.delete(tabId);
-  console.log('[CodexCwdChooser] clear tab=' + String(tabId).slice(-12) + ' reason=' + reason + ' fired=' + !!state.fired);
+  codexStartupAutoEnter.delete(tabId);
+  const firedTypes = state.firedTypes ? Array.from(state.firedTypes).join(',') : '';
+  console.log('[CodexStartupPrompt] clear tab=' + String(tabId).slice(-12) + ' reason=' + reason + ' fired=' + (!!state.fired || !!firedTypes) + (firedTypes ? ' types=' + firedTypes : ''));
 }
 
-function armCodexCwdChooserAutoEnter(tabId, { command, sessionId, cwd } = {}) {
+function scheduleCodexStartupAutoEnterTimeout(tabId, state, ttlMs) {
+  if (state.timeout) clearTimeout(state.timeout);
+  state.timeout = setTimeout(() => {
+    clearCodexStartupAutoEnter(tabId, 'ttl');
+  }, ttlMs);
+}
+
+function armCodexStartupAutoEnter(tabId, { command, sessionId, cwd } = {}) {
   if (!tabId) return;
-  clearCodexCwdChooserAutoEnter(tabId, 'rearm');
+  clearCodexStartupAutoEnter(tabId, 'rearm');
+  const normalizedCommand = command || 'codex';
+  const allowedPromptTypes = new Set(['trust-directory']);
+  if ((normalizedCommand === 'codex-c' || normalizedCommand === 'codex-f') && sessionId) {
+    allowedPromptTypes.add('cwd-chooser');
+  }
+  const ttlMs = allowedPromptTypes.has('cwd-chooser')
+    ? CODEX_STARTUP_AUTO_ENTER_TTL_MS
+    : CODEX_TRUST_PROMPT_AUTO_ENTER_TTL_MS;
   const state = {
     raw: '',
-    command: command || '',
+    command: normalizedCommand,
     sessionId: sessionId || null,
     cwd: cwd || null,
     armedAt: Date.now(),
+    allowedPromptTypes,
+    firedTypes: new Set(),
     fired: false,
     timeout: null,
   };
-  state.timeout = setTimeout(() => {
-    clearCodexCwdChooserAutoEnter(tabId, 'ttl');
-  }, CODEX_CWD_CHOOSER_AUTO_ENTER_TTL_MS);
-  codexCwdChooserAutoEnter.set(tabId, state);
-  console.log('[CodexCwdChooser] armed tab=' + String(tabId).slice(-12) +
+  codexStartupAutoEnter.set(tabId, state);
+  scheduleCodexStartupAutoEnterTimeout(tabId, state, ttlMs);
+  console.log('[CodexStartupPrompt] armed tab=' + String(tabId).slice(-12) +
     ' command=' + (state.command || 'unknown') +
     ' session=' + (state.sessionId ? String(state.sessionId).slice(0, 8) : 'none') +
     ' cwd=' + (state.cwd || 'n/a') +
-    ' ttlMs=' + CODEX_CWD_CHOOSER_AUTO_ENTER_TTL_MS);
+    ' prompts=' + Array.from(allowedPromptTypes).join(',') +
+    ' ttlMs=' + ttlMs);
 }
 
 function isCodexResumeCwdChooser(cleanText) {
@@ -13004,41 +13097,85 @@ function isCodexResumeCwdChooser(cleanText) {
     hasPhrase('press enter to continue');
 }
 
-function tryHandleCodexCwdChooserAutoEnter(tabId, data) {
-  const state = codexCwdChooserAutoEnter.get(tabId);
-  if (!state || state.fired) return;
+function isCodexTrustDirectoryPrompt(cleanText) {
+  const text = String(cleanText || '').replace(/\u00a0/g, ' ');
+  const compact = text.toLowerCase().replace(/\s+/g, ' ');
+  const squashed = compact.replace(/[^a-z0-9]+/g, '');
+  const hasPhrase = (phrase) => squashed.includes(String(phrase).toLowerCase().replace(/[^a-z0-9]+/g, ''));
+  const firstOptionSelected = /[›❯>]\s*1\.\s*Yes\s*,?\s*continue/i.test(text);
+  const secondOptionSelected = /[›❯>]\s*2\.\s*No\s*,?\s*quit/i.test(text);
+  if (!firstOptionSelected || secondOptionSelected) return false;
+  return hasPhrase('do you trust the contents of this directory') &&
+    hasPhrase('working with untrusted contents') &&
+    hasPhrase('higher risk of prompt injection') &&
+    hasPhrase('trusting the directory allows project local config hooks and exec policies to load') &&
+    hasPhrase('yes continue') &&
+    hasPhrase('no quit');
+}
+
+function detectCodexStartupAutoEnterPrompt(cleanText, state) {
+  const allowed = state?.allowedPromptTypes || new Set(['cwd-chooser']);
+  const fired = state?.firedTypes || new Set();
+  if (allowed.has('trust-directory') && !fired.has('trust-directory') && isCodexTrustDirectoryPrompt(cleanText)) {
+    return 'trust-directory';
+  }
+  if (allowed.has('cwd-chooser') && !fired.has('cwd-chooser') && isCodexResumeCwdChooser(cleanText)) {
+    return 'cwd-chooser';
+  }
+  return null;
+}
+
+function tryHandleCodexStartupAutoEnter(tabId, data) {
+  const state = codexStartupAutoEnter.get(tabId);
+  if (!state) return;
   const ageMs = Date.now() - state.armedAt;
-  if (ageMs > CODEX_CWD_CHOOSER_AUTO_ENTER_TTL_MS) {
-    clearCodexCwdChooserAutoEnter(tabId, 'expired-on-data');
+  if (ageMs > CODEX_STARTUP_AUTO_ENTER_TTL_MS) {
+    clearCodexStartupAutoEnter(tabId, 'expired-on-data');
     return;
   }
   state.raw += data;
-  if (state.raw.length > CODEX_CWD_CHOOSER_BUFFER_LIMIT) {
-    state.raw = state.raw.slice(-CODEX_CWD_CHOOSER_BUFFER_LIMIT);
+  if (state.raw.length > CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT) {
+    state.raw = state.raw.slice(-CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT);
   }
   const clean = cleanCodexTuiFrame(state.raw);
-  if (!isCodexResumeCwdChooser(clean)) return;
+  const promptType = detectCodexStartupAutoEnterPrompt(clean, state);
+  if (!promptType) return;
 
+  state.firedTypes.add(promptType);
   state.fired = true;
   const preview = clean.replace(/\s+/g, ' ').trim().slice(0, 260);
-  console.log('[CodexCwdChooser] detected tab=' + String(tabId).slice(-12) +
+  console.log('[CodexStartupPrompt] detected tab=' + String(tabId).slice(-12) +
     ' command=' + (state.command || 'unknown') +
+    ' prompt=' + promptType +
     ' session=' + (state.sessionId ? String(state.sessionId).slice(0, 8) : 'none') +
     ' ageMs=' + ageMs +
     ' rawBytes=' + state.raw.length +
     ' preview=' + JSON.stringify(preview) +
     ' — sending Enter in 120ms');
   setTimeout(() => {
-    const current = codexCwdChooserAutoEnter.get(tabId);
+    const current = codexStartupAutoEnter.get(tabId);
     if (current !== state) return;
     const term = terminals.get(tabId);
+    let wroteEnter = false;
     if (term) {
-      console.log('[CodexCwdChooser] writing Enter tab=' + String(tabId).slice(-12));
+      console.log('[CodexStartupPrompt] writing Enter tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
       term.write('\r');
+      wroteEnter = true;
     } else {
-      console.warn('[CodexCwdChooser] terminal missing before Enter tab=' + String(tabId).slice(-12));
+      console.warn('[CodexStartupPrompt] terminal missing before Enter tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
     }
-    clearCodexCwdChooserAutoEnter(tabId, 'confirmed');
+    if (!wroteEnter) {
+      clearCodexStartupAutoEnter(tabId, 'terminal-missing-' + promptType);
+      return;
+    }
+    if (promptType === 'trust-directory' && state.allowedPromptTypes.has('cwd-chooser')) {
+      state.raw = '';
+      state.armedAt = Date.now();
+      scheduleCodexStartupAutoEnterTimeout(tabId, state, CODEX_POST_TRUST_AUTO_ENTER_TTL_MS);
+      console.log('[CodexStartupPrompt] keep armed tab=' + String(tabId).slice(-12) + ' reason=await-cwd-chooser ttlMs=' + CODEX_POST_TRUST_AUTO_ENTER_TTL_MS);
+      return;
+    }
+    clearCodexStartupAutoEnter(tabId, 'confirmed-' + promptType);
   }, 120);
 }
 
@@ -13849,11 +13986,7 @@ ipcMain.on('codex:run-command', (event, { tabId, command, sessionId, cwd, model,
   const effectiveEffort = effort || readDefaultCodexSetting('defaultCodexEffort');
   console.log('[Codex Runner] Command:', command, 'tab:', tabId, 'session:', sessionId || 'new', 'cwd:', termCwd, 'model:', effectiveModel || 'default', 'effort:', effectiveEffort || 'default');
 
-  if ((command === 'codex-c' || command === 'codex-f') && sessionId) {
-    armCodexCwdChooserAutoEnter(tabId, { command, sessionId, cwd: termCwd });
-  } else {
-    clearCodexCwdChooserAutoEnter(tabId, 'not-resume-command');
-  }
+  armCodexStartupAutoEnter(tabId, { command: command || 'codex', sessionId, cwd: termCwd });
 
   if (command === 'codex-c' && sessionId) {
     closeCodexWatcher(tabId, 'resume-known-session');

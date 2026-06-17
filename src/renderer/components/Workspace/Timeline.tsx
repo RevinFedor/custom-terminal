@@ -8,6 +8,7 @@ import { useWorkspaceStore, type PendingAutoTabTitle } from '../../store/useWork
 import { TAB_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { generateTabTitleFromPrompt, isEligibleTabTitleEntry, trimTabTitlePrompt } from '../../utils/generateTabTitle';
 import { timelineSummaryKey, useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
+import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
 
@@ -450,6 +451,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const isCodex = toolType === 'codex';
   const usesTextSearchAnchors = isGemini || isCodex;
   const supportsClaudeTimelineActions = !isGemini && !isCodex;
+  const supportsEditRangeActions = supportsClaudeTimelineActions || isCodex;
   const summaryToolType: TimelineSummaryTool | null = isGemini ? null : (isCodex ? 'codex' : 'claude');
   const promptSummaries = useTimelineSummaryStore(state => state.summaries);
   const promptSummaryLoadingKeys = useTimelineSummaryStore(state => state.loadingKeys);
@@ -2894,13 +2896,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setPostPromptMode(false);
 
     if (mode === 'edit') {
-      // Edit-range works inside a single JSONL — block only cross-file bridges
-      // (compact_boundary / Context Overflow continued). SessionId variance within one
-      // file is fine (claude --resume layering, see crossesBoundary detector above).
+      // Edit-range works inside one local history representation. Claude can relink
+      // parentUuid; Codex uses a separate copy-on-write rollout rewrite and blocks
+      // compact markers because their encrypted compaction state is not editable.
       const rangeEntries = entries.slice(range.startIndex, range.endIndex + 1);
       const hasCompact = rangeEntries.some(e => e.type === 'compact');
       const hasContinued = rangeEntries.some(e => e.type === 'continued');
-      if (hasCompact || hasContinued) {
+      if (isCodex && hasCompact) {
+        useUIStore.getState().showToast(
+          'Codex Edit Range через compact пока недоступен',
+          'error', 3000
+        );
+        return;
+      }
+      if (!isCodex && (hasCompact || hasContinued)) {
         useUIStore.getState().showToast(
           hasCompact
             ? 'Нельзя редактировать диапазон с compact boundary'
@@ -2914,7 +2923,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       setEditRangeState({ range, phase: 'loading', sourceContent: '', compactText: '' });
 
       try {
-        const result = await ipcRenderer.invoke('claude:copy-range', {
+        const copyRangeChannel = isCodex ? 'codex:copy-range' : 'claude:copy-range';
+        const result = await ipcRenderer.invoke(copyRangeChannel, {
           sessionId,
           cwd,
           startUuid,
@@ -3127,7 +3137,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       'tool:', isGemini ? 'gemini' : isCodex ? 'codex' : 'claude', 'mode:', mode);
 
     const rewindOpId = Date.now().toString(36) + '-' + entry.uuid.slice(0, 8);
-    const emitHistoryRewindLog = (status: 'start' | 'done' | 'failed', error?: string, message?: string) => {
+    const emitHistoryRewindLog = (
+      status: 'start' | 'done' | 'failed',
+      error?: string,
+      message?: string,
+      options: { persisted?: boolean; historyInputDraft?: boolean } = {}
+    ) => {
       window.dispatchEvent(new CustomEvent('history-panel:rewind-log', {
         detail: {
           tabId,
@@ -3137,7 +3152,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           targetText: entry.content,
           mode,
           toolType,
-          persisted: isCodex && mode === 'native' && status === 'done',
+          persisted: options.persisted ?? (isCodex && mode === 'native' && status === 'done'),
+          historyInputDraft: options.historyInputDraft,
           error,
           message,
         }
@@ -3313,7 +3329,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       emitHistoryRewindLog(
         'done',
         undefined,
-        mode === 'ai' ? 'Gemini Rewind: text inserted and submitted.' : undefined
+        mode === 'ai' ? 'Gemini Rewind: text inserted and submitted.' : undefined,
+        {
+          persisted: mode === 'ai' || isCodex || isGemini,
+          historyInputDraft: mode === 'native' && rewindResult.historyInputDraft === true,
+        }
       );
       setTimeout(() => setRewindState(null), 1200);
 
@@ -4872,6 +4892,60 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 const startUuid = entries[range.startIndex].uuid;
                 const endUuid = entries[range.endIndex].uuid;
 
+                if (isCodex) {
+                  const cmdState = await ipcRenderer.invoke('terminal:getCommandState', {
+                    tabId,
+                    caller: 'Timeline.codexEditRange',
+                    expectedProcess: 'codex',
+                    allowProcessTreeLookup: true,
+                  });
+                  console.warn('[CodexEditRange] commandState:', JSON.stringify(cmdState));
+
+                  if (cmdState?.isRunning) {
+                    console.warn('[CodexEditRange] Stopping Codex before local rollout rewrite...');
+                    const stopResult = await ipcRenderer.invoke('terminal:stop-ai-process', tabId);
+                    if (!stopResult?.success) {
+                      throw new Error(stopResult?.error || 'Failed to stop Codex');
+                    }
+                  }
+
+                  console.warn('[CodexEditRange] Creating edited local rollout fork...');
+                  const result = await ipcRenderer.invoke('codex:edit-range', {
+                    sessionId, cwd, startUuid, endUuid, compactText,
+                  });
+
+                  if (!result.success) {
+                    throw new Error(result.error);
+                  }
+
+                  console.warn('[CodexEditRange] New session:', result.newSessionId?.slice(0, 8), 'replacementUuid:', result.replacementUuid);
+                  const doneState = editRangeState
+                    ? { ...editRangeState, phase: 'done' as const, compactUuid: result.replacementUuid || result.compactUuid }
+                    : null;
+                  if (doneState && result.newSessionId) {
+                    _savedEditRangeMap.set(result.newSessionId, doneState);
+                    if (_savedEditRangeMap.size > SAVED_MAP_MAX) {
+                      const first = _savedEditRangeMap.keys().next().value;
+                      if (first) _savedEditRangeMap.delete(first);
+                    }
+                  }
+
+                  if (result.newSessionId) {
+                    useWorkspaceStore.getState().setCodexSessionId(tabId, result.newSessionId, 'editRange');
+                    ipcRenderer.send('codex:run-command', buildCodexRunPayload({
+                      tabId,
+                      command: 'codex-c',
+                      sessionId: result.newSessionId,
+                      cwd,
+                    }));
+                    ipcRenderer.send('terminal:force-command-started', tabId);
+                  }
+
+                  setEditRangeState(doneState);
+                  useUIStore.getState().showToast('Codex Edit Range создан', 'success', 1500);
+                  return { removedCount: result.removedCount, removedUsers: result.removedUsers };
+                }
+
                 // Step 1: Exit Claude if command is running (same check as sidebar green border)
                 const cmdState = await ipcRenderer.invoke('terminal:getCommandState', tabId);
                 console.warn('[EditRange] commandState:', JSON.stringify(cmdState));
@@ -4966,6 +5040,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
                 // Show toast on success
                 useUIStore.getState().showToast('Rewind завершён', 'success', 1500);
+                setEditRangeState(prev => prev ? { ...prev, phase: 'done' } : null);
 
                 return { removedCount: result.removedCount, removedUsers: result.removedUsers };
               }}
@@ -5816,7 +5891,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   >
                     Копировать ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
                   </button>
-                  {supportsClaudeTimelineActions && (
+                  {supportsEditRangeActions && (
                     <div className="flex rounded overflow-hidden">
                       <button
                         className="flex-1 text-left px-3 py-2 text-xs text-pink-400 hover:bg-pink-600/20 transition-colors cursor-pointer"
@@ -5846,11 +5921,18 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         onClick={async (e) => {
                           e.stopPropagation();
                           const { range, startUuid, endUuid } = rangeActionMenu;
-                          // Validate same as edit mode (cross-file bridges only)
+                          // Validate same as edit mode.
                           const rangeEntries = entries.slice(range.startIndex, range.endIndex + 1);
                           const hasCompact = rangeEntries.some(en => en.type === 'compact');
                           const hasContinued = rangeEntries.some(en => en.type === 'continued');
-                          if (hasCompact || hasContinued) {
+                          if (isCodex && hasCompact) {
+                            useUIStore.getState().showToast(
+                              'Codex Edit Range через compact пока недоступен',
+                              'error', 3000
+                            );
+                            return;
+                          }
+                          if (!isCodex && (hasCompact || hasContinued)) {
                             useUIStore.getState().showToast(
                               hasCompact
                                 ? 'Нельзя редактировать диапазон с compact boundary'
@@ -5867,7 +5949,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                           // Open panel immediately with empty compactText — user types own prompt
                           if (!sessionId) return;
                           try {
-                            const result = await ipcRenderer.invoke('claude:copy-range', {
+                            const copyRangeChannel = isCodex ? 'codex:copy-range' : 'claude:copy-range';
+                            const result = await ipcRenderer.invoke(copyRangeChannel, {
                               sessionId, cwd, startUuid, endUuid,
                               ...copyFlags,
                             });
