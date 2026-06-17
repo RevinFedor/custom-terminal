@@ -2306,6 +2306,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     mode?: 'native' | 'ai';
     toolType?: string;
     persisted?: boolean;
+    historyInputDraft?: boolean;
     error?: string;
     message?: string;
   }) => {
@@ -2326,13 +2327,22 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         : 'Native /rewind';
 
     setRewindLock(status === 'start' ? { opId, targetText } : null);
-    if (status === 'done' && detail.persisted && targetText) {
+    const isDurableRewind =
+      status === 'done' && (
+        detail.persisted === true ||
+        detail.mode === 'ai' ||
+        detail.toolType === 'codex' ||
+        detail.toolType === 'gemini'
+      );
+    if (isDurableRewind) {
       setRewindPreview(null);
-      setHistoryPromptDraft(tabId, targetText);
+      if (targetText && detail.historyInputDraft === true) {
+        setHistoryPromptDraft(tabId, targetText);
+      }
       setEntries(prev => prev.filter(entry => entry.uuid !== uuid));
       return;
     }
-    if (status === 'done' && detail.mode === 'native' && detail.targetUuid && targetText) {
+    if (status === 'done' && detail.mode === 'native' && detail.targetUuid && targetText && (detail.toolType || toolType) === 'claude') {
       setRewindPreview({ opId, targetUuid: detail.targetUuid, targetText, startedAt: now });
       setHistoryPromptDraft(tabId, targetText);
     }
@@ -2355,7 +2365,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     if (isAtBottomRef.current) {
       setTimeout(() => scrollToBottom(true), 30);
     }
-  }, [scrollToBottom, sessionId, setHistoryPromptDraft, tabId]);
+  }, [scrollToBottom, sessionId, setHistoryPromptDraft, tabId, toolType]);
 
   useEffect(() => {
     const handler = (event: Event) => {

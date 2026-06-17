@@ -113,6 +113,10 @@ export type ProcessBarCfg = {
   position: 'left' | 'right';
 };
 
+export type AppSettings = {
+  streamerMode: boolean;
+};
+
 // ── Prompt Queue ("Run after") — mobile mirror of the desktop store ──────────
 // Mobile does NOT own the queue: it reads this core from the desktop store and
 // pushes mutation ops back; the desktop App-root runner fires the prompts. Live
@@ -137,7 +141,14 @@ export type QueueCore = {
   postPromptEnabled: boolean;
   postPromptText: string;
 };
-export type QueueAiTab = { id: string; name: string; kind: 'claude-pty' | 'claude-sdk' | 'gemini' | 'codex' };
+export type QueueAiTab = {
+  id: string;
+  name: string;
+  kind: 'claude-pty' | 'claude-sdk' | 'gemini' | 'codex';
+  projectId?: string;
+  projectName?: string;
+  isOwnerProject?: boolean;
+};
 export type QueueData = { tabId: string; queue: QueueCore; aiTabs: QueueAiTab[] };
 // Mutation ops — each maps 1:1 to a desktop store method.
 export type QueueOp =
@@ -185,6 +196,9 @@ export type TimelineEntry = {
 
 export const Api = {
   ping: () => api<{ ok: boolean; lanIp: string }>('/api/me'),
+  appSettings: () => api<AppSettings>('/api/app-settings'),
+  setAppSettings: (patch: Partial<AppSettings>) =>
+    api<AppSettings>('/api/app-settings', { method: 'POST', body: JSON.stringify(patch) }),
   listProjects: () => api<{ projects: ProjectInfo[] }>('/api/projects'),
   listTabs: (projectId: string) =>
     api<{ project: { id: string; name: string; path: string }; tabs: TabInfo[]; statusMarker?: StatusMarkerCfg; processBar?: ProcessBarCfg }>(

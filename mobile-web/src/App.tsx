@@ -19,7 +19,7 @@ import { Virtualizer, type VirtualizerHandle } from 'virtua';
 // localStorage cache (cache.ts) replaced by IndexedDB record store (idb.ts) —
 // see fact-mobile-web.md::IDB record store. The cache module is kept on disk
 // for now in case rollback is needed, but no longer imported.
-import { Api, bootstrapToken, clearToken, getToken, setToken, eventsUrl, type ProjectInfo, type TabInfo, type TimelineEntry, type StatusMarkerCfg, type ProcessBarCfg, type QueueData, type QueueCore, type QueueAiTab, type QueueOp, type PendingQuestion, type MobileQuestion } from './api';
+import { Api, bootstrapToken, clearToken, getToken, setToken, eventsUrl, type AppSettings, type ProjectInfo, type TabInfo, type TimelineEntry, type StatusMarkerCfg, type ProcessBarCfg, type QueueData, type QueueCore, type QueueAiTab, type QueueOp, type PendingQuestion, type MobileQuestion } from './api';
 import { createMessageReducer, type UiEntry } from './messages';
 import { streamHistory, type StreamMeta } from './streamHistory';
 import { readCachedHistory, writeFullHistory, dropSession, readKv, writeKv } from './idb';
@@ -745,6 +745,10 @@ function LoginView({ onLogin }: { onLogin: () => void }) {
 function ProjectsView({ onPick, onLogout }: { onPick: (p: ProjectInfo) => void; onLogout: () => void }) {
   const [projects, setProjects] = useState<ProjectInfo[] | null>(null);
   const [error, setError] = useState('');
+  const [settings, setSettings] = useState<AppSettings>({ streamerMode: false });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsBusy, setSettingsBusy] = useState(false);
+  const [settingsError, setSettingsError] = useState('');
 
   // STALE: paint the last cached project list immediately so returning to this
   // screen is instant (no "Loading projects…" wall). Network refresh overwrites.
@@ -754,6 +758,29 @@ function ProjectsView({ onPick, onLogout }: { onPick: (p: ProjectInfo) => void; 
       if (!cancelled && Array.isArray(hit?.payload)) setProjects((cur) => cur ?? hit!.payload);
     });
     return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    Api.appSettings()
+      .then((next) => { if (!cancelled) setSettings({ streamerMode: !!next.streamerMode }); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  const setStreamerMode = useCallback(async (next: boolean) => {
+    setSettingsError('');
+    setSettings((cur) => ({ ...cur, streamerMode: next }));
+    setSettingsBusy(true);
+    try {
+      const saved = await Api.setAppSettings({ streamerMode: next });
+      setSettings({ streamerMode: !!saved.streamerMode });
+    } catch (e: any) {
+      setSettings((cur) => ({ ...cur, streamerMode: !next }));
+      setSettingsError(e?.message || 'failed to save settings');
+    } finally {
+      setSettingsBusy(false);
+    }
   }, []);
 
   // REVALIDATE: refresh every 4s while view is mounted so live SDK / open-state
@@ -792,19 +819,25 @@ function ProjectsView({ onPick, onLogout }: { onPick: (p: ProjectInfo) => void; 
         subtitle={projects ? `${active.length} active · ${projects.length} total` : undefined}
         right={
           <button
-            onClick={onLogout}
-            title="Sign out"
-            style={{
-              padding: '6px 12px', borderRadius: 8,
-              background: 'transparent', border: '1px solid #2a2a2a',
-              color: '#888', fontSize: 11, cursor: 'pointer',
-              fontWeight: 500, letterSpacing: 0.3,
-            }}
+            className="noted-icon"
+            onClick={() => setSettingsOpen(true)}
+            title="Settings"
+            style={S.iconBtn}
           >
-            Sign out
+            ⚙
           </button>
         }
       />
+      {settingsOpen && (
+        <MobileSettingsSheet
+          settings={settings}
+          busy={settingsBusy}
+          error={settingsError}
+          onStreamerModeChange={setStreamerMode}
+          onClose={() => setSettingsOpen(false)}
+          onLogout={onLogout}
+        />
+      )}
       <div style={{ flex: 1, overflowY: 'auto', padding: '12px 12px 32px' }}>
         {/* Error only when we have NOTHING cached to show — otherwise keep the
             stale list visible and let the next 4s poll recover silently. */}
@@ -846,6 +879,111 @@ function ProjectsView({ onPick, onLogout }: { onPick: (p: ProjectInfo) => void; 
         )}
       </div>
     </div>
+  );
+}
+
+function MobileSettingsSheet({
+  settings,
+  busy,
+  error,
+  onStreamerModeChange,
+  onClose,
+  onLogout,
+}: {
+  settings: AppSettings;
+  busy: boolean;
+  error: string;
+  onStreamerModeChange: (next: boolean) => void;
+  onClose: () => void;
+  onLogout: () => void;
+}) {
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 1000,
+      background: 'rgba(0,0,0,0.48)',
+      display: 'flex', alignItems: 'flex-end',
+      padding: '0 10px calc(env(safe-area-inset-bottom) + 10px)',
+    }}>
+      <button
+        aria-label="Close settings"
+        onClick={onClose}
+        style={{ position: 'absolute', inset: 0, border: 0, background: 'transparent' }}
+      />
+      <div style={{
+        position: 'relative', width: '100%', maxWidth: 520, margin: '0 auto',
+        borderRadius: 18, overflow: 'hidden',
+        background: '#151515', border: '1px solid #2a2a2a',
+        boxShadow: '0 24px 80px rgba(0,0,0,0.55)',
+      }}>
+        <div style={{
+          height: 48, display: 'flex', alignItems: 'center',
+          justifyContent: 'space-between', padding: '0 14px',
+          borderBottom: '1px solid #242424',
+        }}>
+          <div style={{ fontSize: 14, fontWeight: 650, color: '#eee' }}>Settings</div>
+          <button className="noted-icon" onClick={onClose} style={S.iconBtn}>✕</button>
+        </div>
+        <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            gap: 12, padding: '12px 12px', borderRadius: 12,
+            background: '#101010', border: '1px solid #252525',
+          }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ color: '#ededed', fontSize: 13, fontWeight: 600 }}>Streamer mode</div>
+              <div style={{ color: '#777', fontSize: 11, marginTop: 3, lineHeight: 1.35 }}>
+                Hide remote-control host and IP while sharing the screen.
+              </div>
+            </div>
+            <MobileSwitch
+              checked={settings.streamerMode}
+              disabled={busy}
+              onChange={onStreamerModeChange}
+            />
+          </div>
+          {error && <div style={{ color: '#f38ba8', fontSize: 12, padding: '0 2px' }}>{error}</div>}
+          <button
+            onClick={onLogout}
+            style={{
+              height: 40, borderRadius: 10, border: '1px solid #3a2026',
+              background: 'rgba(243,139,168,0.08)', color: '#f38ba8',
+              fontSize: 13, fontWeight: 600,
+            }}
+          >
+            Sign out
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MobileSwitch({ checked, disabled, onChange }: { checked: boolean; disabled?: boolean; onChange: (next: boolean) => void }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      style={{
+        position: 'relative', flex: '0 0 auto',
+        width: 48, height: 28, borderRadius: 999,
+        border: 'none',
+        background: checked ? '#34a853' : '#3a3a3a',
+        boxShadow: checked ? 'inset 0 0 0 1px rgba(255,255,255,0.12)' : 'inset 0 0 0 1px rgba(255,255,255,0.08)',
+        opacity: disabled ? 0.72 : 1,
+        transition: 'background 0.16s ease',
+      }}
+    >
+      <span style={{
+        position: 'absolute', top: 3, left: checked ? 23 : 3,
+        width: 22, height: 22, borderRadius: '50%',
+        background: '#fff',
+        boxShadow: '0 1px 4px rgba(0,0,0,0.35)',
+        transition: 'left 0.16s ease',
+      }} />
+    </button>
   );
 }
 

@@ -58,6 +58,108 @@ function isAiForegroundProcess(info?: { hasProcess?: boolean; processName?: stri
   return /\b(claude|gemini|codex)\b/.test(text) || text.includes('@openai/codex');
 }
 
+function getTimelineCopyFlagsFromStore() {
+  const s = useUIStore.getState();
+  return {
+    includeEditing: s.copyIncludeEditing,
+    includeReading: s.copyIncludeReading,
+    includeUser: s.copyIncludeUser,
+    includeClaude: s.copyIncludeClaude,
+    includeText: s.copyIncludeText,
+    includeThinking: s.copyIncludeThinking,
+    includeBash: s.copyIncludeBash,
+    includeTools: s.copyIncludeTools,
+    includeWebSearch: s.copyIncludeWebSearch,
+    includeToolSearch: s.copyIncludeToolSearch,
+    includeOtherTools: s.copyIncludeOtherTools,
+    includeSubagentResult: s.copyIncludeSubagentResult,
+    includeSubagentHistory: s.copyIncludeSubagentHistory,
+  };
+}
+
+async function buildMobileAiRewindText(args: {
+  toolType: AgentHistoryTool;
+  sessionId: string;
+  cwd?: string;
+  startUuid?: string;
+  endUuid?: string;
+  additionalPrompt?: string;
+}) {
+  const { toolType, sessionId, cwd, startUuid, endUuid, additionalPrompt } = args;
+  if (!startUuid || !endUuid) throw new Error('AI Rewind range ids required');
+
+  const copyRangeChannel = toolType === 'codex' ? 'codex:copy-range' : 'claude:copy-range';
+  const rangeResult = await ipcRenderer.invoke(copyRangeChannel, {
+    sessionId,
+    cwd,
+    startUuid,
+    endUuid,
+    ...getTimelineCopyFlagsFromStore(),
+  });
+  if (!rangeResult?.success || !rangeResult.content) {
+    throw new Error(rangeResult?.error || 'Copy range failed');
+  }
+
+  let promptState = usePromptsStore.getState();
+  if (!promptState.isLoaded) {
+    await promptState.loadPrompts();
+    promptState = usePromptsStore.getState();
+  }
+
+  const promptConfig = promptState.getPromptById(promptState.rewindPromptId);
+  if (!promptConfig) throw new Error('No Rewind prompt configured');
+
+  let fileContentsBlock = '';
+  const filePaths = promptConfig.filePaths || [];
+  if (filePaths.length > 0) {
+    const filesResult = await ipcRenderer.invoke('ai-prompts:read-files', filePaths);
+    if (filesResult.success && filesResult.data.length > 0) {
+      fileContentsBlock = '\n\n' + filesResult.data.map((f: { path: string; content: string }) =>
+        `--- File: ${f.path} ---\n${f.content}`
+      ).join('\n\n');
+    }
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not set');
+
+  const model = promptConfig.model;
+  const promptPrefix = additionalPrompt
+    ? `ПРИОРИТЕТНАЯ ИНСТРУКЦИЯ (выполнить в первую очередь):\n${additionalPrompt}\n\n---\nОСНОВНОЙ ПРОМПТ:\n`
+    : '';
+  const fullPrompt = promptPrefix + promptConfig.content + fileContentsBlock + rangeResult.content;
+
+  const requestBody: any = {
+    contents: [{ parts: [{ text: fullPrompt }] }],
+    ...(model.includes('gemini-3') || model.includes('gemini-2.5') ? {
+      tools: [{ googleSearch: {} }]
+    } : {})
+  };
+
+  if (model.includes('gemini-3') && promptConfig.thinkingLevel !== 'NONE') {
+    requestBody.generationConfig = {
+      thinkingConfig: { thinkingLevel: promptConfig.thinkingLevel }
+    };
+  }
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody)
+    }
+  );
+  const data = await response.json();
+  const compactText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  if (!compactText.trim()) {
+    throw new Error(response.status >= 400
+      ? `Gemini ${response.status}: ${data.error?.message || data.error?.status || 'error'}`
+      : 'Gemini returned empty response');
+  }
+  return compactText;
+}
+
 type TabCompletionNotificationDetail = {
   projectId: string;
   tabId: string;
@@ -1267,6 +1369,18 @@ function App() {
           }
           return null;
         };
+        if (action === 'getAppSettings') {
+          const uiState = useUIStore.getState();
+          return reply(true, { streamerMode: !!uiState.streamerMode });
+        }
+        if (action === 'setAppSettings') {
+          const { streamerMode } = payload || {};
+          const uiState = useUIStore.getState();
+          if (typeof streamerMode === 'boolean') {
+            uiState.setStreamerMode(streamerMode);
+          }
+          return reply(true, { streamerMode: !!useUIStore.getState().streamerMode });
+        }
         if (action === 'getOpenProjectIds') {
           // Live snapshot of which projects are currently open in the desktop UI.
           // Used by /api/projects to split the mobile list into Active vs Other.
@@ -1361,6 +1475,7 @@ function App() {
             groups,
             statusMarker: { shape: uiState.statusMarker.shape, sizePx: uiState.statusMarker.sizePx },
             statuses: statusPalette.map((s: any) => ({ id: s.id, color: s.color, label: s.label })),
+            streamerMode: !!uiState.streamerMode,
             processBar: {
               colorA: uiState.processBar.colorA,
               shimmerColor: uiState.processBar.shimmerColor,
@@ -1382,6 +1497,7 @@ function App() {
             shape: uiState.statusMarker.shape,
             sizePx: uiState.statusMarker.sizePx,
             statuses: (uiState.sessionStatuses || []).map((s: any) => ({ id: s.id, color: s.color, label: s.label })),
+            streamerMode: !!uiState.streamerMode,
             processBar: {
               colorA: uiState.processBar.colorA,
               shimmerColor: uiState.processBar.shimmerColor,
@@ -1661,30 +1777,33 @@ function App() {
           state.updateSDKState(tabId, partial);
           return reply(true, { tabId, ...partial });
         }
-        if (action === 'getPromptQueue') {
-          // Mobile mirror of the desktop Prompt Queue ("Run after"). Mobile does
-          // NOT own a queue — it reads the live desktop store and pushes mutations
-          // back here; the App-root usePromptQueueRunner does all firing. So this
-          // returns the same PromptQueueCore the desktop overlay renders from, plus
-          // the list of sibling AI-tabs (for the "on tab" pivot picker) in the same
-          // order/kind the desktop RunAfterTabPicker shows.
-          const { tabId } = payload || {};
-          if (!tabId) return reply(false, null, 'tabId required');
-          // Locate the owning workspace so we can enumerate sibling AI-tabs.
-          let ws: ReturnType<typeof state.openProjects.get> | null = null;
-          for (const w of state.openProjects.values()) {
-            if (w.tabs.has(tabId)) { ws = w; break; }
+        const getPromptQueueAiTabs = (ownerTabId: string) => {
+          let ownerProjectId: string | null = null;
+          for (const [projectId, ws] of state.openProjects) {
+            if (ws.tabs.has(ownerTabId)) {
+              ownerProjectId = projectId;
+              break;
+            }
           }
-          const q = usePromptQueueStore.getState().getQueue(tabId);
-          const core = serializePromptQueueCore(q);
-          // Sibling AI-tabs — same predicate as RunAfterTabPicker: SDK tab, OR
-          // PTY-claude/codex/gemini with a sessionId. bash/run-dev
-          // tabs are excluded (no turn-end edge to wait on). Self is excluded.
-          const aiTabs: Array<{ id: string; name: string; kind: 'claude-pty' | 'claude-sdk' | 'gemini' | 'codex' }> = [];
-          if (ws) {
+
+          const projectLabel = (projectPath: string | undefined, projectId: string): string => {
+            const clean = (projectPath || '').replace(/[\\/]+$/, '');
+            return clean.split(/[\\/]/).filter(Boolean).pop() || projectId.slice(-8);
+          };
+
+          const aiTabs: Array<{
+            id: string;
+            name: string;
+            kind: 'claude-pty' | 'claude-sdk' | 'gemini' | 'codex';
+            projectId: string;
+            projectName: string;
+            isOwnerProject: boolean;
+          }> = [];
+
+          for (const [projectId, ws] of state.openProjects) {
             for (const t of ws.tabs.values()) {
               if (t.parentTabId) continue;
-              if (t.id === tabId) continue;
+              if (t.id === ownerTabId) continue;
               const isSDK = t.tabType === 'claude-sdk';
               const isClaudePTY = !isSDK && t.commandType === 'claude' && !!t.claudeSessionId;
               const isCodex = !isSDK && t.commandType === 'codex' && !!t.codexSessionId;
@@ -1695,10 +1814,32 @@ function App() {
               else if (isCodex) kind = 'codex';
               else if (isGemini) kind = 'gemini';
               if (!kind) continue;
-              aiTabs.push({ id: t.id, name: t.name || t.id.slice(-6), kind });
+              aiTabs.push({
+                id: t.id,
+                name: t.name || t.id.slice(-6),
+                kind,
+                projectId,
+                projectName: projectLabel(ws.projectPath, projectId),
+                isOwnerProject: projectId === ownerProjectId,
+              });
             }
           }
-          return reply(true, { tabId, queue: core, aiTabs });
+
+          return aiTabs;
+        };
+
+        if (action === 'getPromptQueue') {
+          // Mobile mirror of the desktop Prompt Queue ("Run after"). Mobile does
+          // NOT own a queue — it reads the live desktop store and pushes mutations
+          // back here; the App-root usePromptQueueRunner does all firing. So this
+          // returns the same PromptQueueCore the desktop overlay renders from, plus
+          // the list of sibling AI-tabs (for the "on tab" pivot picker) in the same
+          // order/kind the desktop RunAfterTabPicker shows.
+          const { tabId } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          const q = usePromptQueueStore.getState().getQueue(tabId);
+          const core = serializePromptQueueCore(q);
+          return reply(true, { tabId, queue: core, aiTabs: getPromptQueueAiTabs(tabId) });
         }
         if (action === 'mutatePromptQueue') {
           // Apply ONE mutation op to the desktop queue store. Every op maps to an
@@ -1737,7 +1878,11 @@ function App() {
           }
           // Echo the new core so the caller can render immediately without a
           // round-trip; the queue-update SSE event will also fan-out shortly.
-          return reply(true, { tabId, queue: serializePromptQueueCore(usePromptQueueStore.getState().getQueue(tabId)) });
+          return reply(true, {
+            tabId,
+            queue: serializePromptQueueCore(usePromptQueueStore.getState().getQueue(tabId)),
+            aiTabs: getPromptQueueAiTabs(tabId),
+          });
         }
         if (action === 'getTabSessionInfo') {
           const { tabId } = payload || {};
@@ -1947,13 +2092,32 @@ function App() {
             targetFullText,
             rewindableCount,
             skipDuplicates,
+            mode,
+            startUuid,
+            endUuid,
+            additionalPrompt,
           } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
-          const { toolType, runtime } = describeAgentTab(tabId);
+          const { tab, toolType, runtime, sessionId } = describeAgentTab(tabId);
           if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
           if (toolType !== 'claude' && toolType !== 'codex') return reply(false, null, 'rewind unsupported for tool');
+          if (!sessionId) return reply(false, null, 'no session to rewind');
+          const rewindMode = mode === 'ai' ? 'ai' : 'native';
           try {
             const channel = toolType === 'codex' ? 'codex:open-history-menu' : 'claude:open-history-menu';
+            let pasteAfter: string | undefined;
+            if (rewindMode === 'ai') {
+              console.log('[MobRewind:Bridge] AI compact begin tool=' + toolType + ' tab=' + String(tabId).slice(-12));
+              pasteAfter = await buildMobileAiRewindText({
+                toolType,
+                sessionId,
+                cwd: tab?.cwd,
+                startUuid,
+                endUuid,
+                additionalPrompt: typeof additionalPrompt === 'string' ? additionalPrompt : undefined,
+              });
+              console.log('[MobRewind:Bridge] AI compact ready tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' len=' + pasteAfter.length);
+            }
             const result = await ipcRenderer.invoke(channel, {
               tabId,
               targetIndex,
@@ -1961,9 +2125,10 @@ function App() {
               targetFullText,
               rewindableCount,
               skipDuplicates,
+              pasteAfter,
             });
             const ok = result?.success !== false;
-            return reply(ok, { tabId, toolType, ...(result || {}) }, ok ? undefined : result?.error);
+            return reply(ok, { tabId, toolType, mode: rewindMode, compactPasted: !!pasteAfter, compactLength: pasteAfter?.length || 0, ...(result || {}) }, ok ? undefined : result?.error);
           } catch (e: any) {
             console.log('[MobRewind:Bridge] err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
             return reply(false, null, String(e?.message || e));

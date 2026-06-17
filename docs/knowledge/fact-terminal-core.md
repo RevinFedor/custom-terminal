@@ -176,8 +176,8 @@ if (data.length > 1024) {
 Старая функция `writeToPtySafe` разбивала ВЕСЬ payload (включая escape-последовательности `\x1b[200~` и `\x1b[201~`) на чанки по 1KB. Это ломало bracketed paste — Ink TUI получал фрагментированные escape sequences и не мог их собрать.
 
 ### Алгоритм `safePasteAndSubmit(term, content, options)`:
-1. **Chunking:** Контент делится на чанки по 900 байт. Каждый чанк оборачивается в ПОЛНЫЙ bracketed paste (`\x1b[200~` + chunk + `\x1b[201~`), итого < 1024 байт — ядро не режет.
-2. **Sync Marker Verification:** После каждого чанка функция слушает PTY output и ждёт sync marker `\x1b[?2026l` (конец Ink render frame). Это подтверждает что Ink обработал paste и React state committed. (**НЕ** text echo — Ink коллапсирует вставки в `[Pasted text #N +M lines]`, поэтому текст не появляется в выводе.)
+1. **Chunking:** `fast=true` цели (Gemini/bash) режутся на UTF-8-safe чанки до 900 байт и пишутся back-to-back внутри одной logical bracketed paste. `fast=false` TUI-safe цели (Claude Ink, Codex AI Rewind) пишут весь payload одним `term.write()` и одной парой `\x1b[200~...\x1b[201~`. Не возвращать per-chunk bracket pairs: Ink/Codex увидят несколько отдельных paste-событий или submit успеет прочитать только хвост.
+2. **Sync Marker Verification:** В `fast=false` после закрывающего bracket функция слушает PTY output и ждёт sync marker `\x1b[?2026l` (конец render frame). Это подтверждает что TUI обработал paste и React/composer state committed. (**НЕ** text echo — Ink/Codex могут коллапсировать вставки в `[Pasted text #N +M lines]` / `[Pasted Content N chars]`, поэтому полный текст не обязан появиться в выводе.)
    - **Stale Marker Protection:** Введена фильтрация маркеров, приходящих < 15мс после записи. Это предотвращает ложные срабатывания от предыдущих циклов рендеринга (спиннеры, статус-бары). См. `knowledge/fix-stale-sync-markers.md`.
 3. **Submit:** `\r` отправляется ТОЛЬКО после подтверждения последнего чанка — гарантия что `onSubmit(value)` прочитает уже зафиксированный в стейте текст.
 
@@ -194,7 +194,7 @@ await safePasteAndSubmit(term, content, {
 
 ### Ключевые свойства
 - **Event-driven:** Никаких фиксированных таймаутов. Sync marker = факт render, не предположение.
-- **Любая длина:** Чанков может быть сколько угодно (900 байт каждый).
+- **Любая длина:** fast-path чанкуется по байтам без разрыва UTF-8 code point; TUI-safe path держит один logical paste и один render ACK.
 - **Только для программных операций:** Handshake, send-command, Rewind (Restore:History). **НЕ** для `terminal:input`.
 - **Safety timeout:** 8s — это не "подождать", а "что-то фатально сломалось, abort".
 

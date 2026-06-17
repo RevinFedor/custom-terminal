@@ -53,6 +53,7 @@ export type SessionWriteReason =
 export type CodexSessionWriteReason =
   | 'detected'
   | 'userIntercept'
+  | 'editRange'
   | 'unknown';
 
 export interface SessionHistoryEntry {
@@ -791,11 +792,21 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     nameSetManually: tab.nameSetManually,
     tabId: tab.id
   }));
-  ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray, forceCleanup });
+  return ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray, forceCleanup })
+    .catch((error: unknown) => {
+      console.warn('[Store:saveTabs] failed project=' + dndShortId(projectId) + ' error=' + (error instanceof Error ? error.message : String(error)));
+      return { success: false };
+    });
 };
 
 const notifyProjectLayoutChanged = (projectId: string, reason: string) => {
   ipcRenderer.invoke('project:layout-changed', { projectId, reason }).catch(() => {});
+};
+
+const saveTabsThenNotifyProjectLayoutChanged = (projectId: string, tabs: Map<string, Tab>, reason: string) => {
+  saveTabs(projectId, tabs).then((result: any) => {
+    if (result?.success !== false) notifyProjectLayoutChanged(projectId, reason);
+  });
 };
 
 const saveTabGroups = (projectId: string, groups: TabGroup[]) => {
@@ -2111,7 +2122,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         set({ openProjects: new Map(openProjects) });
 
         // Save tabs
-        saveTabs(workspace.projectId, workspace.tabs);
+        saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-rename');
       }
     }
   },
@@ -2152,7 +2163,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         if (options.markNameSetManually && !tab.nameSetManually) {
           tab.nameSetManually = true;
           set({ openProjects: new Map(openProjects) });
-          saveTabs(workspace.projectId, workspace.tabs);
+          saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-rename');
           console.warn('[Store:autoRenameTab] tab=' + tabId.slice(-8) + ' unchanged but marked manual ' + JSON.stringify(uniqueName));
           return true;
         }
@@ -2168,7 +2179,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // refresh can opt into nameSetManually so future automatic launch naming
       // still respects the user's intentional action.
       set({ openProjects: new Map(openProjects) });
-      saveTabs(workspace.projectId, workspace.tabs);
+      saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-rename');
       console.warn('[Store:autoRenameTab] tab=' + tabId.slice(-8) + ' ' + JSON.stringify(prevName) + ' → ' + JSON.stringify(uniqueName));
       return true;
     }

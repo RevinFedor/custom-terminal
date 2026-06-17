@@ -29,6 +29,8 @@ interface StatusBarProps {
 export default function StatusBar({ onOpenSettings }: StatusBarProps) {
   const debugHoverBridges = useUIStore((s) => s.debugHoverBridges);
   const setDebugHoverBridges = useUIStore((s) => s.setDebugHoverBridges);
+  const streamerMode = useUIStore((s) => s.streamerMode);
+  const setStreamerMode = useUIStore((s) => s.setStreamerMode);
   const freezeCmdPopups = useUIStore((s) => s.freezeCmdPopups);
   const setFreezeCmdPopups = useUIStore((s) => s.setFreezeCmdPopups);
   const historyPinned = useUIStore((s) => s.historyPinned);
@@ -87,7 +89,14 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
     >
       <div className="flex items-center gap-3">
         <McpActivityChip />
-        <WebServerChip />
+        <StatusToggle
+          label="stream"
+          title="Скрыть публичный remote-control URL/IP в интерфейсе на время стрима."
+          active={streamerMode}
+          onClick={() => setStreamerMode(!streamerMode)}
+          activeColor="#38bdf8"
+        />
+        <WebServerChip hidden={streamerMode} />
       </div>
       <div className="flex items-center gap-2">
         <EngineDefaultsSelector
@@ -844,7 +853,7 @@ function EngineOptionRow<T>({
 // shows the LAN URL as a clickable pill: click → opens in default OS browser
 // (so you can scan the address visually then scribe it onto your phone).
 // Right-click → copy full URL with token to clipboard.
-function WebServerChip() {
+function WebServerChip({ hidden = false }: { hidden?: boolean }) {
   const [info, setInfo] = useState<{ running: boolean; lanIp?: string; port?: number; token?: string } | null>(null);
   const [copied, setCopied] = useState(false);
 
@@ -866,6 +875,7 @@ function WebServerChip() {
   }, []);
 
   if (!info) return null;
+  if (hidden) return null;
   if (!info.running) {
     return <span style={{ color: '#666', fontSize: 11 }}>web: off</span>;
   }

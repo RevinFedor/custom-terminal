@@ -867,6 +867,365 @@ function removeLastCodexTurns(entries, numTurns) {
   }
 }
 
+function removeLastCodexRecordTurns(wrappers, numTurns) {
+  const requested = Number(numTurns || 1);
+  if (!requested || requested <= 0) return { removedTurns: [], removedRecords: 0 };
+  const turns = [];
+  for (let i = wrappers.length - 1; i >= 0; i--) {
+    const tid = wrappers[i]?.turnIndex;
+    if (typeof tid !== 'number') continue;
+    if (!turns.includes(tid)) turns.push(tid);
+    if (turns.length >= requested) break;
+  }
+  if (turns.length === 0) return { removedTurns: [], removedRecords: 0 };
+  const remove = new Set(turns);
+  let removedRecords = 0;
+  for (let i = wrappers.length - 1; i >= 0; i--) {
+    if (!remove.has(wrappers[i]?.turnIndex)) continue;
+    wrappers.splice(i, 1);
+    removedRecords += 1;
+  }
+  return { removedTurns: turns, removedRecords };
+}
+
+function maxCodexRecordTurnIndex(wrappers) {
+  let max = -1;
+  for (const wrapper of wrappers) {
+    if (typeof wrapper?.turnIndex === 'number' && wrapper.turnIndex > max) max = wrapper.turnIndex;
+  }
+  return max;
+}
+
+function normalizeCodexText(value) {
+  return String(value || '').replace(/\r\n/g, '\n').trim();
+}
+
+function isCodexPreUserRecord(record) {
+  const payload = record?.payload || {};
+  if (record?.type === 'event_msg' && payload.type === 'task_started') return true;
+  if (record?.type === 'turn_context') return true;
+  if (record?.type === 'response_item' && payload.type === 'message') {
+    return payload.role === 'user' || payload.role === 'developer';
+  }
+  return false;
+}
+
+function isCodexResponseUserRecord(record) {
+  const payload = record?.payload || {};
+  return record?.type === 'response_item' && payload.type === 'message' && payload.role === 'user';
+}
+
+function codexPendingStartForUserMessage(pending, message) {
+  const expected = normalizeCodexText(message);
+  if (!expected) return pending.length;
+  let duplicateIdx = -1;
+  for (let i = pending.length - 1; i >= 0; i--) {
+    const record = pending[i]?.record;
+    if (!isCodexResponseUserRecord(record)) continue;
+    const text = normalizeCodexText(extractTextContent(record.payload?.content));
+    if (text === expected) {
+      duplicateIdx = i;
+      break;
+    }
+  }
+  if (duplicateIdx < 0) return pending.length;
+  let start = duplicateIdx;
+  while (start > 0) {
+    const prev = pending[start - 1]?.record;
+    if (prev?.type === 'turn_context') {
+      start -= 1;
+      continue;
+    }
+    if (prev?.type === 'event_msg' && prev.payload?.type === 'task_started') {
+      start -= 1;
+      continue;
+    }
+    break;
+  }
+  return start;
+}
+
+function cloneCodexRecordForWrite(record) {
+  const cloned = JSON.parse(JSON.stringify(record || {}));
+  delete cloned.__line;
+  return cloned;
+}
+
+function pushCodexVisibleWrapper(wrappers, record, turnIndex, extra = {}) {
+  wrappers.push({
+    record,
+    turnIndex: typeof turnIndex === 'number' && turnIndex >= 0 ? turnIndex : null,
+    line: record?.__line,
+    ...extra,
+  });
+}
+
+function buildCodexVisibleRecordWrappers(records, sessionId) {
+  const wrappers = [];
+  const pending = [];
+  let currentTurnIndex = -1;
+  let lastTopLevelCompactLine = -Infinity;
+
+  const flushPending = (turnIndex) => {
+    while (pending.length > 0) {
+      const item = pending.shift();
+      pushCodexVisibleWrapper(wrappers, item.record, turnIndex);
+    }
+  };
+
+  for (const record of records) {
+    const payload = record?.payload || {};
+
+    if (record?.type === 'event_msg' && payload.type === 'thread_rolled_back') {
+      // Materialize the current visible thread: old rolled-back turns and the
+      // rollback event itself are intentionally omitted from rewritten files.
+      pending.length = 0;
+      removeLastCodexRecordTurns(wrappers, Number(payload.num_turns || payload.turns || 1));
+      currentTurnIndex = maxCodexRecordTurnIndex(wrappers);
+      continue;
+    }
+
+    if (record?.type === 'event_msg' && payload.type === 'user_message') {
+      const previousTurnIndex = currentTurnIndex;
+      currentTurnIndex += 1;
+      const text = payload.message || extractTextContent(payload.content) || '';
+      const turnStart = codexPendingStartForUserMessage(pending, text);
+      for (let i = 0; i < turnStart; i++) {
+        pushCodexVisibleWrapper(wrappers, pending[i].record, previousTurnIndex);
+      }
+      for (let i = turnStart; i < pending.length; i++) {
+        pushCodexVisibleWrapper(wrappers, pending[i].record, currentTurnIndex);
+      }
+      pending.length = 0;
+      pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
+        sourceUuid: stableUuid(sessionId, record.__line, 'codex-user'),
+        kind: 'user',
+      });
+      continue;
+    }
+
+    if (isCodexPreUserRecord(record)) {
+      pending.push({ record });
+      continue;
+    }
+
+    if (pending.length > 0) {
+      flushPending(currentTurnIndex);
+    }
+
+    if (record?.type === 'compacted') {
+      pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
+        sourceUuid: stableUuid(sessionId, record.__line, 'codex-compact'),
+        kind: 'compact',
+      });
+      lastTopLevelCompactLine = record.__line;
+      continue;
+    }
+
+    if (record?.type === 'event_msg' && isCompactPayload(payload)) {
+      const isTopLevelCompanion = record.__line <= lastTopLevelCompactLine + 3;
+      pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
+        sourceUuid: isTopLevelCompanion ? null : stableUuid(sessionId, record.__line, 'codex-compact'),
+        kind: isTopLevelCompanion ? undefined : 'compact',
+      });
+      continue;
+    }
+
+    pushCodexVisibleWrapper(wrappers, record, currentTurnIndex);
+  }
+
+  if (pending.length > 0) {
+    flushPending(currentTurnIndex);
+  }
+
+  return wrappers;
+}
+
+function codexRolloutTimestamp(date = new Date()) {
+  return date.toISOString().slice(0, 19).replace(/:/g, '-');
+}
+
+function codexDateParts(date = new Date()) {
+  return {
+    yyyy: String(date.getUTCFullYear()),
+    mm: String(date.getUTCMonth() + 1).padStart(2, '0'),
+    dd: String(date.getUTCDate()).padStart(2, '0'),
+  };
+}
+
+async function writeCodexEditedFork(records, sourceSessionId, cwd, outputRecords) {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const newSessionId = crypto.randomUUID();
+  const { yyyy, mm, dd } = codexDateParts(now);
+  const dir = path.join(CODEX_SESSIONS_DIR, yyyy, mm, dd);
+  await fs.promises.mkdir(dir, { recursive: true });
+
+  const metaIdx = outputRecords.findIndex((record) => record?.type === 'session_meta');
+  if (metaIdx >= 0) {
+    const meta = outputRecords[metaIdx];
+    meta.timestamp = nowIso;
+    meta.payload = { ...(meta.payload || {}) };
+    meta.payload.id = newSessionId;
+    meta.payload.timestamp = nowIso;
+    meta.payload.cwd = cwd || meta.payload.cwd || getSessionMeta(records).cwd || '';
+    meta.payload.forked_from_id = sourceSessionId;
+    if (!meta.payload.source) meta.payload.source = 'cli';
+    if (!meta.payload.thread_source) meta.payload.thread_source = 'user';
+  } else {
+    outputRecords.unshift({
+      timestamp: nowIso,
+      type: 'session_meta',
+      payload: {
+        id: newSessionId,
+        timestamp: nowIso,
+        cwd: cwd || '',
+        originator: 'noted-terminal',
+        source: 'cli',
+        thread_source: 'user',
+        forked_from_id: sourceSessionId,
+      },
+    });
+  }
+
+  let filePath = '';
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const suffix = attempt === 0 ? '' : '-' + attempt;
+    filePath = path.join(dir, `rollout-${codexRolloutTimestamp(now)}-${newSessionId}${suffix}.jsonl`);
+    try {
+      await fs.promises.writeFile(filePath, outputRecords.map((record) => JSON.stringify(record)).join('\n') + '\n', {
+        encoding: 'utf8',
+        flag: 'wx',
+      });
+      return { newSessionId, filePath };
+    } catch (error) {
+      if (error && error.code === 'EEXIST') continue;
+      throw error;
+    }
+  }
+  throw new Error('Could not allocate Codex edited fork path');
+}
+
+function createCodexReplacementRecords(compactText, timestamp = new Date().toISOString()) {
+  const text = String(compactText || '').trim();
+  return [
+    {
+      timestamp,
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text }],
+      },
+    },
+    {
+      timestamp,
+      type: 'event_msg',
+      payload: {
+        type: 'user_message',
+        message: text,
+        images: [],
+        local_images: [],
+        text_elements: [],
+      },
+    },
+  ];
+}
+
+async function editCodexRange({ sessionId, cwd, startUuid, endUuid, compactText }) {
+  const replacementText = String(compactText || '').trim();
+  if (!sessionId) return { success: false, error: 'sessionId required' };
+  if (!startUuid || !endUuid) return { success: false, error: 'startUuid/endUuid required' };
+  if (!replacementText) return { success: false, error: 'Replacement text required' };
+
+  const loaded = await loadSessionRecords(sessionId, cwd);
+  if (!loaded.success) return loaded;
+
+  const timeline = buildCodexTimeline(loaded.records, sessionId);
+  const startIndex = timeline.findIndex((entry) => entry.uuid === startUuid);
+  const endIndex = timeline.findIndex((entry) => entry.uuid === endUuid);
+  if (startIndex < 0 || endIndex < 0) {
+    return { success: false, error: 'Timeline range not found' };
+  }
+
+  const minIndex = Math.min(startIndex, endIndex);
+  const maxIndex = Math.max(startIndex, endIndex);
+  const selected = timeline.slice(minIndex, maxIndex + 1);
+  if (selected.some((entry) => entry.type === 'compact')) {
+    return { success: false, error: 'Codex edit across compact markers is not supported yet' };
+  }
+
+  const selectedTurns = new Set();
+  for (const entry of selected) {
+    if (typeof entry.turnIndex === 'number') selectedTurns.add(entry.turnIndex);
+  }
+  if (selectedTurns.size === 0) {
+    return { success: false, error: 'Selected range has no editable Codex turns' };
+  }
+
+  const wrappers = buildCodexVisibleRecordWrappers(loaded.records, sessionId);
+  const firstRemovalIndex = wrappers.findIndex((wrapper) => (
+    typeof wrapper.turnIndex === 'number' && selectedTurns.has(wrapper.turnIndex)
+  ));
+  if (firstRemovalIndex < 0) {
+    return { success: false, error: 'Selected Codex turns were not found in visible rollout records' };
+  }
+  let replacementTimestamp = new Date().toISOString();
+  if (firstRemovalIndex >= 0) {
+    for (let i = firstRemovalIndex + 1; i < wrappers.length; i++) {
+      const wrapper = wrappers[i];
+      if (typeof wrapper.turnIndex === 'number' && selectedTurns.has(wrapper.turnIndex)) continue;
+      const nextMs = Date.parse(wrapper.record?.timestamp || '');
+      if (Number.isFinite(nextMs)) {
+        replacementTimestamp = new Date(nextMs - 1).toISOString();
+        break;
+      }
+    }
+  }
+  const replacementRecords = createCodexReplacementRecords(replacementText, replacementTimestamp);
+  const outputRecords = [];
+  let inserted = false;
+  let removedRecords = 0;
+  let removedUsers = 0;
+
+  for (const wrapper of wrappers) {
+    const shouldRemove = typeof wrapper.turnIndex === 'number' && selectedTurns.has(wrapper.turnIndex);
+    if (shouldRemove) {
+      if (!inserted) {
+        for (const replacement of replacementRecords) outputRecords.push(replacement);
+        inserted = true;
+      }
+      removedRecords += 1;
+      const payload = wrapper.record?.payload || {};
+      if (wrapper.record?.type === 'event_msg' && payload.type === 'user_message') removedUsers += 1;
+      continue;
+    }
+    outputRecords.push(cloneCodexRecordForWrite(wrapper.record));
+  }
+
+  if (!inserted) {
+    for (const replacement of replacementRecords) outputRecords.push(replacement);
+  }
+
+  const replacementEventRecord = replacementRecords.find((record) => record.type === 'event_msg' && record.payload?.type === 'user_message');
+  const result = await writeCodexEditedFork(loaded.records, sessionId, cwd, outputRecords);
+  const finalLine = outputRecords.findIndex((record) => record === replacementEventRecord);
+  const replacementUuid = finalLine >= 0 ? stableUuid(result.newSessionId, finalLine, 'codex-user') : null;
+
+  return {
+    success: true,
+    newSessionId: result.newSessionId,
+    filePath: result.filePath,
+    sourceFilePath: loaded.filePath,
+    replacementUuid,
+    compactUuid: replacementUuid,
+    removedCount: removedRecords,
+    removedUsers,
+    selectedCount: selected.length,
+    selectedTurns: Array.from(selectedTurns),
+  };
+}
+
 function codexCopyOptions(params = {}) {
   const includeTools = params.includeTools ?? false;
   return {
@@ -1544,6 +1903,15 @@ function register() {
     }
   });
 
+  ipcMain.handle('codex:edit-range', async (_event, params = {}) => {
+    try {
+      return await editCodexRange(params);
+    } catch (error) {
+      console.error('[CodexData] edit-range error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
   ipcMain.handle('codex:list-models', async () => {
     try {
       const models = await listCodexModels();
@@ -1606,6 +1974,7 @@ module.exports = {
   buildCodexFullHistory,
   buildCodexCleanExport,
   buildCodexRangeExport,
+  editCodexRange,
   getTimelineSessionMeta,
   listCodexModels,
   _api: {
@@ -1616,6 +1985,8 @@ module.exports = {
     buildCodexCleanEntries,
     buildCodexCleanExport,
     buildCodexRangeExport,
+    buildCodexVisibleRecordWrappers,
+    editCodexRange,
     loadSessionRecords,
     buildCodexFullHistory,
     buildCodexTimeline,
