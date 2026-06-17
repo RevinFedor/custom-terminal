@@ -810,6 +810,7 @@ function computeActiveLoaders() {
       project: projectName,
       name: tabName || ('tab ' + String(tabId).slice(-6)),
       cwd: terminalProjects.get(tabId) || null,
+      commandType: row?.command_type || null,
     };
   };
 
@@ -4796,6 +4797,39 @@ function startMcpHttpServer() {
           if (activityId) {
             emitTerminalMcpActivity('restart_process', { id: activityId, status: 'error', error: e.message });
           }
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+
+    } else if (req.method === 'POST' && req.url === '/terminal/stop') {
+      // Stop the foreground script/devServer while keeping the tab/shell alive.
+      // External callers (Voice Record build-install preflight) need the same
+      // behavior as the desktop Stop button: deterministic child-process stop,
+      // not /terminal/kill which closes the PTY tab.
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const { tabId, parentProjectId } = JSON.parse(body || '{}');
+          if (!tabId) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'tabId is required' }));
+            return;
+          }
+
+          const projectReject = routeRejectsPinnedProject(tabId, parentProjectId, '/terminal/stop');
+          if (projectReject) {
+            res.writeHead(403);
+            res.end(JSON.stringify(projectReject));
+            return;
+          }
+
+          console.log('[MCP:Terminal] POST /terminal/stop tabId=' + tabId);
+          const result = await deterministicStopTerminal(tabId, false);
+          res.writeHead(result?.success ? 200 : 500);
+          res.end(JSON.stringify({ status: result?.success ? 'stopped' : 'error', tabId, ...result }));
+        } catch (e) {
           res.writeHead(500);
           res.end(JSON.stringify({ error: e.message }));
         }
@@ -10824,29 +10858,83 @@ async function findDescendantPids(rootPid) {
 // case where a previous run crashed/Electron force-quit left the port held.
 //
 // Detection sources (in priority order):
-// 1. vite.config.{ts,js,mjs} — server.port
-// 2. .env / .env.local — PORT=, BACKEND_PORT=, FRONTEND_PORT=, *_PORT=
-// 3. NestJS main.ts — `app.listen(process.env.PORT || NNNN)` fallback literal
-// 4. package.json — `notedTerminal.ports: [3000, 5173]` (manual override)
+// 1. package.json script env ignore-list — `NOTED_TERMINAL_IGNORE_PORTS=6379,9000 npm run dev`
+// 2. package.json script env override — `NOTED_TERMINAL_PORTS=3000,5173 npm run dev`
+// 3. package.json — `notedTerminal.ports: [3000, 5173]` (manual override)
+// 4. vite.config.{ts,js,mjs} — server.port
+// 5. .env / .env.local — app ports only: PORT=, BACKEND_PORT=, FRONTEND_PORT=
+//    Infra ports like REDIS_PORT/POSTGRES_PORT/MINIO_PORT are intentionally
+//    excluded: killing them can take down Docker/OrbStack port forwards.
+// 6. NestJS main.ts — `app.listen(process.env.PORT || NNNN)` fallback literal
 //
 // Recursive: scans `cwd` AND immediate subfolders (for monorepos like uav/agrofield_back).
 // Cached for 30s per cwd so repeated start→stop→start cycles don't re-grep.
 const projectPortsCache = new Map(); // cwd → { ports: number[], ts: number }
 const PROJECT_PORTS_CACHE_TTL = 30_000;
+const INFRA_PORT_ENV_RE = /(^|_)(REDIS|POSTGRES|POSTGRESQL|PG|DATABASE|DB|MYSQL|MARIADB|MONGO|MONGODB|MINIO|S3|AWS|RABBITMQ|AMQP|KAFKA|ZOOKEEPER|ELASTICSEARCH|ELASTIC|OPENSEARCH|QDRANT|MEILISEARCH|CLICKHOUSE|PROMETHEUS|GRAFANA|LOKI|SMTP|MAIL|MEMCACHED)(_|$)/;
+const PORT_ENV_KEY_RE = /([A-Z][A-Z0-9_]*_PORT|[A-Z][A-Z0-9_]*PORT|PORT)/;
 
-function extractPortsFromText(text) {
+function isInfraPortEnvKey(key) {
+  const normalized = String(key || '').trim().toUpperCase();
+  if (!normalized || normalized === 'PORT') return false;
+  return INFRA_PORT_ENV_RE.test(normalized);
+}
+
+function addValidProjectPort(ports, value) {
+  const p = Number(value);
+  if (p >= 1024 && p <= 65535) ports.add(p);
+}
+
+function addPortList(ports, value) {
+  String(value || '')
+    .split(/[,\s]+/)
+    .map(v => v.trim())
+    .filter(Boolean)
+    .forEach(v => addValidProjectPort(ports, v));
+}
+
+function extractScriptPortList(scripts, envName) {
+  const ports = new Set();
+  if (!scripts || typeof scripts !== 'object') return ports;
+
+  const re = new RegExp("\\b" + envName + "=(?:\"([^\"]+)\"|'([^']+)'|([0-9,\\s]+))", 'g');
+  for (const cmd of Object.values(scripts)) {
+    if (typeof cmd !== 'string') continue;
+    for (const m of cmd.matchAll(re)) {
+      addPortList(ports, m[1] || m[2] || m[3]);
+    }
+  }
+
+  return ports;
+}
+
+function extractPortsFromText(text, opts = {}) {
+  const {
+    configPorts = true,
+    envPorts = true,
+    listenPorts = true,
+  } = opts;
   const ports = new Set();
   // vite.config: server: { port: 5181 } / port: 5181
-  for (const m of text.matchAll(/\bport\s*:\s*(\d{2,5})\b/gi)) {
-    const p = Number(m[1]); if (p >= 1024 && p <= 65535) ports.add(p);
+  if (configPorts) {
+    for (const m of text.matchAll(/\bport\s*:\s*(\d{2,5})\b/gi)) {
+      addValidProjectPort(ports, m[1]);
+    }
   }
-  // .env: PORT=3000, FRONTEND_PORT=5173, BACKEND_PORT=3001
-  for (const m of text.matchAll(/^[A-Z][A-Z0-9_]*PORT\s*=\s*(\d{2,5})\b/gm)) {
-    const p = Number(m[1]); if (p >= 1024 && p <= 65535) ports.add(p);
+  // .env / inline script env: PORT=3000, FRONTEND_PORT=5173, BACKEND_PORT=3001.
+  // Do not include infra ports (REDIS_PORT, MINIO_PORT, etc.) in dev-server kill lists.
+  if (envPorts) {
+    const envPortRe = new RegExp('^' + PORT_ENV_KEY_RE.source + '\\s*=\\s*(\\d{2,5})\\b', 'gm');
+    for (const m of text.matchAll(envPortRe)) {
+      if (isInfraPortEnvKey(m[1])) continue;
+      addValidProjectPort(ports, m[2]);
+    }
   }
   // NestJS: app.listen(process.env.PORT || 3001) / app.listen(3001)
-  for (const m of text.matchAll(/\.listen\s*\(\s*(?:process\.env\.[A-Z_]+\s*\|\|\s*)?(\d{2,5})\b/g)) {
-    const p = Number(m[1]); if (p >= 1024 && p <= 65535) ports.add(p);
+  if (listenPorts) {
+    for (const m of text.matchAll(/\.listen\s*\(\s*(?:process\.env\.[A-Z_]+\s*\|\|\s*)?(\d{2,5})\b/g)) {
+      addValidProjectPort(ports, m[1]);
+    }
   }
   return Array.from(ports);
 }
@@ -10857,29 +10945,39 @@ function scanProjectPorts(rootCwd, depth = 0) {
   let entries = [];
   try { entries = fs.readdirSync(rootCwd, { withFileTypes: true }); } catch { return found; }
 
-  // 1. package.json — notedTerminal.ports override + inline env vars in scripts
+  // 1. package.json — explicit script ports, notedTerminal.ports override, inline env vars.
   if (depth === 0) {
     try {
       const pkgPath = path.join(rootCwd, 'package.json');
       if (fs.existsSync(pkgPath)) {
         const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+        const scripts = pkg?.scripts;
+        const ignoredScriptPorts = extractScriptPortList(scripts, 'NOTED_TERMINAL_IGNORE_PORTS');
+        const explicitScriptPorts = extractScriptPortList(scripts, 'NOTED_TERMINAL_PORTS');
+        if (explicitScriptPorts.size > 0) {
+          for (const p of ignoredScriptPorts) explicitScriptPorts.delete(p);
+          return explicitScriptPorts;
+        }
+
         if (Array.isArray(pkg?.notedTerminal?.ports)) {
           for (const p of pkg.notedTerminal.ports) {
-            if (Number.isInteger(p) && p >= 1024 && p <= 65535) found.add(p);
+            addValidProjectPort(found, p);
           }
+          for (const p of ignoredScriptPorts) found.delete(p);
+          return found;
         }
         // Inline env vars in scripts (e.g. `NOTED_WEB_PORT=7979 electron-vite dev`)
         // — common pattern when the same project serves multiple ports and only
         // one is in vite.config. Without this, "kill dev-ports" misses the
         // detached server (Electron window held on a env-only port survives the
         // PTY Ctrl+C → user sees a second Dock icon spawn on restart).
-        const scripts = pkg?.scripts;
         if (scripts && typeof scripts === 'object') {
           for (const cmd of Object.values(scripts)) {
             if (typeof cmd !== 'string') continue;
-            for (const m of cmd.matchAll(/\b[A-Z][A-Z0-9_]*PORT\s*=\s*(\d{2,5})\b/g)) {
-              const p = Number(m[1]);
-              if (p >= 1024 && p <= 65535) found.add(p);
+            const inlineEnvPortRe = new RegExp('\\b' + PORT_ENV_KEY_RE.source + '\\s*=\\s*(\\d{2,5})\\b', 'g');
+            for (const m of cmd.matchAll(inlineEnvPortRe)) {
+              if (isInfraPortEnvKey(m[1])) continue;
+              addValidProjectPort(found, m[2]);
             }
           }
         }
@@ -10891,28 +10989,42 @@ function scanProjectPorts(rootCwd, depth = 0) {
   const configFiles = [
     'vite.config.ts', 'vite.config.js', 'vite.config.mjs',
     'electron.vite.config.ts', 'electron.vite.config.js', 'electron.vite.config.mjs',
-    '.env', '.env.local', '.env.development',
   ];
   for (const f of configFiles) {
     try {
       const p = path.join(rootCwd, f);
       if (fs.existsSync(p)) {
         const txt = fs.readFileSync(p, 'utf8');
-        for (const port of extractPortsFromText(txt)) found.add(port);
+        for (const port of extractPortsFromText(txt, { envPorts: false, listenPorts: false })) found.add(port);
       }
     } catch {}
   }
 
-  // 3. NestJS main.ts pattern — `src/main.ts` if exists
-  try {
-    const mainTs = path.join(rootCwd, 'src', 'main.ts');
-    if (fs.existsSync(mainTs)) {
-      const txt = fs.readFileSync(mainTs, 'utf8');
-      for (const port of extractPortsFromText(txt)) found.add(port);
-    }
-  } catch {}
+  // 3. Env files: app ports only, not dependency/infra ports.
+  const envFiles = ['.env', '.env.local', '.env.development'];
+  for (const f of envFiles) {
+    try {
+      const p = path.join(rootCwd, f);
+      if (fs.existsSync(p)) {
+        const txt = fs.readFileSync(p, 'utf8');
+        for (const port of extractPortsFromText(txt, { configPorts: false, listenPorts: false })) found.add(port);
+      }
+    } catch {}
+  }
 
-  // 4. Recurse into immediate subfolders that look like monorepo apps
+  // 4. NestJS main.ts pattern — `src/main.ts` if exists.
+  // Only use listen() fallback when no explicit app port was found in package/config/env.
+  if (found.size === 0) {
+    try {
+      const mainTs = path.join(rootCwd, 'src', 'main.ts');
+      if (fs.existsSync(mainTs)) {
+        const txt = fs.readFileSync(mainTs, 'utf8');
+        for (const port of extractPortsFromText(txt, { envPorts: false, configPorts: false })) found.add(port);
+      }
+    } catch {}
+  }
+
+  // 5. Recurse into immediate subfolders that look like monorepo apps
   //    (skip node_modules, .git, dist, build, .next, etc.)
   if (depth === 0) {
     const skip = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.vite', 'release', 'out', '.cache', 'coverage']);
@@ -10921,6 +11033,17 @@ function scanProjectPorts(rootCwd, depth = 0) {
       const sub = path.join(rootCwd, ent.name);
       for (const p of scanProjectPorts(sub, depth + 1)) found.add(p);
     }
+  }
+
+  if (depth === 0) {
+    try {
+      const pkgPath = path.join(rootCwd, 'package.json');
+      if (fs.existsSync(pkgPath)) {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+        const ignoredScriptPorts = extractScriptPortList(pkg?.scripts, 'NOTED_TERMINAL_IGNORE_PORTS');
+        for (const p of ignoredScriptPorts) found.delete(p);
+      }
+    } catch {}
   }
 
   return found;
@@ -11034,8 +11157,7 @@ ipcMain.handle('system:free-project-ports', async (event, cwd) => {
 //      the previous command). PTY shell is never killed — only its children.
 //
 // Emits IPC `terminal:stop-progress` so the UI can lock the ↻ button until done.
-ipcMain.handle('terminal:deterministic-stop', async (event, args) => {
-  const { tabId, restart = false } = args || {};
+async function deterministicStopTerminal(tabId, restart = false) {
   if (!tabId) return { success: false, error: 'no tabId' };
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
@@ -11177,6 +11299,11 @@ ipcMain.handle('terminal:deterministic-stop', async (event, args) => {
   }
   emit('done', { killed: descendants, escalated, restarted });
   return { success: true, killed: descendants, escalated, restarted };
+}
+
+ipcMain.handle('terminal:deterministic-stop', async (_event, args) => {
+  const { tabId, restart = false } = args || {};
+  return deterministicStopTerminal(tabId, restart);
 });
 
 // Small accessor for the "kill dev-ports" toggle (lives in renderer state).

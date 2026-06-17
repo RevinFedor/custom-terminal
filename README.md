@@ -135,6 +135,24 @@ POST /api/sdk-tabs/:tabId/params
 GET  /api/events?token=&tabId=           # SSE live channel
 ```
 
+**Local LAN test, no hosting required:**
+
+```bash
+npm run dev                              # starts Noted Terminal with NOTED_WEB_PORT=7979
+ipconfig getifaddr en0                   # Mac Wi-Fi/LAN IP
+cat ~/.noted-terminal/web-token.txt      # bearer token
+```
+
+Open from an iPhone on the same network:
+
+```text
+http://<MAC_LAN_IP>:7979/?token=<TOKEN>
+```
+
+The installed app uses port `7878`; dev uses `7979`. The public
+`https://remote-control.f9922.tech:8443` URL is only a VPS/reverse-SSH tunnel to
+the same Mac server and is not required for local testing.
+
 Где смотреть:
 
 - REST/SSE backend: [src/main/web-server.js](src/main/web-server.js)

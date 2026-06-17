@@ -1054,13 +1054,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const tabId = decId(m[1]);
     try {
       const body = await readBody(req);
-      const { prompt, model, effort, thinking, cwd } = body;
+      const { prompt, model, effort, thinking, cwd, handoffId, source, statusAtSend, queue } = body;
       if (!prompt) return sendJson(res, 400, { error: 'prompt required' });
       // Single bridge round-trip — renderer dispatches by tab.tabType/commandType.
       // Earlier this endpoint did TWO round-trips (status check + send), adding
       // ~50ms per phone send on top of the actual PTY paste latency.
       const data = await bridgeRequest('sendMessageAuto', {
         tabId, prompt, model, effort, thinking, cwd,
+        handoffId, source, statusAtSend, queue: queue === true,
       });
       return sendJson(res, 200, data);
     } catch (e) {
@@ -1252,6 +1253,42 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const tabId = decId(m[1]);
     try {
       const data = await bridgeRequest('grabAgentDraft', { tabId }, 5000);
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
+  // Non-mutating terminal-composer probe. Codex uses this before History/mobile
+  // send: an empty dim-placeholder must not go through Ctrl+G/grab because that
+  // changes TUI state. Claude currently has no visual probe, so the renderer
+  // returns hasDraft:null and callers can fall back to the established grab path.
+  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/draft-state$/);
+  if (m && req.method === 'GET') {
+    const tabId = decId(m[1]);
+    try {
+      const data = await bridgeRequest('inspectAgentDraft', { tabId }, 2000);
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
+  // Native timeline rewind/backtrack for PTY Claude/Codex. The renderer routes
+  // by live tab tool type to the same IPC handlers desktop Timeline uses.
+  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/rewind$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]);
+    try {
+      const body = await readBody(req);
+      const data = await bridgeRequest('rewindAgentTimeline', {
+        tabId,
+        targetIndex: body.targetIndex,
+        targetText: body.targetText,
+        targetFullText: body.targetFullText,
+        rewindableCount: body.rewindableCount,
+        skipDuplicates: body.skipDuplicates || 0,
+      }, 20000);
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });
