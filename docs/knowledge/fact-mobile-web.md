@@ -72,8 +72,8 @@ UI: `MarkdownFileSheet` — bottom-sheet с backdrop, drag handle и swipe-down 
 
 ## ParamsSheet (model/effort/think) — close-on-select + invisible-intent источники
 
-Хедер-пилюля `model · effort ▾` открывает bottom-sheet `ParamsSheet` (SDK и
-PTY-Claude табы). Три неочевидных факта:
+Хедер-пилюля `model · effort ▾` открывает bottom-sheet `ParamsSheet` (SDK,
+PTY-Claude и PTY-Codex табы). Четыре неочевидных факта:
 
 - **Select = loader-in-pill → close по применению (НЕ по сырому тапу).** Тап по
   опции помечает её busy (спиннер на месте, `cursor: wait`), соседи тускнеют и
@@ -96,6 +96,14 @@ PTY-Claude табы). Три неочевидных факта:
   десктопным `toggleThink` И мобильным `setSDKParams`). Absent effort → `'?'`
   (а не врущее `high`). Это та же модель что десктопный ControlBar показывает в
   `effortLocal`/`thinkLocal` — единый cross-client источник, не пересчёт.
+- **Codex params = tab-scoped intent + safe live apply.** Для Codex `getSDKParams`
+  отдаёт `tab.codexModel/codexEffort` с fallback на app defaults, а `setSDKParams`
+  ведёт себя как desktop ControlBar: если живой Codex idle и xterm-probe безопасен,
+  применяет выбор через `codex:select-model-effort`; если Codex занят, input-state
+  неизвестен или picker не подтвердился — возвращает ошибку и НЕ меняет tab-state,
+  чтобы phone/desktop не показывали модель, которую TUI не получил. Если живого
+  Codex нет, запись сохраняется как future intent на вкладке и пойдёт в следующий
+  launch args.
 - **Think — одна toggle-пилюля, не on/off-пара.** Mirror десктопной Think-кнопки:
   `Think ON`/`Think OFF`, тап флипает. Для PTY каждая смена шлёт
   `claude:toggle-thinking` (meta+t флип), и **только** если запрошенное состояние
@@ -201,6 +209,8 @@ setBusy(cur => cur !== authoritativeBusy ? authoritativeBusy : cur);
 GET  /api/me                                   → ping, проверка токена
 GET  /api/projects                             → SQLite + isOpen/isActive + project icon из renderer bridge
 GET  /api/inbox                                → system Inbox project metadata
+POST /api/inbox/runs                           → внешний Codex run в system Inbox: create/reuse tab по conversationKey, wait TUI-ready, send prompt, return runId/tabId/eventsUrl
+POST /api/inbox/runs/:runId/stop               → остановка внешнего Codex run тем же stop-flow, что desktop/PTY Codex
 POST /api/projects/:id/rename                  → renameProject (через bridge → updateProject{name} → project:save-metadata)
 GET  /api/projects/:id/tabs                    → tabs + groups + statuses + timelineCount + live state + statusMarker/processBar/contextPct
 POST /api/inbox/sdk-tabs                       → createSDKTab в system Inbox, без projectId у клиента

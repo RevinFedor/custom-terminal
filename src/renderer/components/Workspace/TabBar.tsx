@@ -5943,14 +5943,13 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 const isPersistent = !!ctxTab.completionNotificationPersistent;
                 const oneShotActive = isArmed || isFired;
                 const tint = isFired ? '#ef4444' : (oneShotActive ? '#f87171' : '#888');
-                const label = 'Уведомления';
                 const notificationTitle = isFired
                   ? 'Уведомление готово'
                   : (oneShotActive ? 'Уведомление включено' : 'Активировать уведомления');
                 return (
-                  <div className="grid grid-cols-2 items-stretch w-full border-t border-[#3a3a3a]">
+                  <div className="flex items-stretch w-full border-t border-[#3a3a3a]">
                     <button
-                      className="min-w-0 text-left px-2 py-1.5 text-[13px] hover:bg-white/10 cursor-pointer flex items-center gap-1.5 whitespace-nowrap"
+                      className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[13px] hover:bg-white/10 cursor-pointer flex items-center justify-center whitespace-nowrap"
                       title={notificationTitle}
                       style={{
                         color: oneShotActive ? '#fecaca' : '#ccc',
@@ -5963,12 +5962,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                       }}
                     >
                       <Bell size={13} style={{ color: tint, flexShrink: 0 }} />
-                      <span className="truncate">{label}</span>
-                      {oneShotActive && <span className="ml-auto text-[#ef4444]">✓</span>}
                     </button>
                     <Tooltip content={isPersistent ? 'Постоянные уведомления включены' : 'Включать уведомление для каждого нового запроса'}>
                       <button
-                        className="min-w-0 px-2 py-1.5 text-[12px] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444]"
+                        className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444]"
                         style={{
                           color: isPersistent ? '#fecaca' : '#777',
                           backgroundColor: isPersistent ? 'rgba(239, 68, 68, 0.16)' : 'transparent',

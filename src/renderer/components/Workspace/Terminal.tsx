@@ -408,7 +408,12 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
       getSetTabCommandType()(tabId, 'codex');
       const codexCwd = getTabCwd(tabId);
       console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex" }');
-      ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex', cwd: codexCwd }));
+      ipcRenderer.send('codex:run-command', buildCodexRunPayload({
+        tabId,
+        command: 'codex',
+        cwd: codexCwd,
+        developerInstructions: pendingAction.developerInstructions,
+      }));
       break;
     }
 

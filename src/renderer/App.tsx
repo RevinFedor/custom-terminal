@@ -2108,16 +2108,23 @@ function App() {
           return reply(true, { tabId, name: tab?.name, cwd: tab?.cwd, projectId });
         }
         if (action === 'createAgentTab') {
-          const { projectId, toolType } = payload || {};
+          const { projectId, toolType, name, externalRun, codexDeveloperInstructions, codexModel, codexEffort } = payload || {};
           if (!projectId) return reply(false, null, 'projectId required');
           const agent: AgentHistoryTool = toolType === 'codex' ? 'codex' : 'claude';
           const ws = state.openProjects.get(projectId);
           if (!ws) return reply(false, null, 'project not open');
           const cwd = ws.projectPath && !ws.projectPath.startsWith('__unset__') ? ws.projectPath : undefined;
-          const tabId = await state.createTab(projectId, undefined, cwd, {
+          const pendingAction: any = { type: agent === 'codex' ? 'codex-new' : 'claude-new' };
+          if (agent === 'codex' && typeof codexDeveloperInstructions === 'string' && codexDeveloperInstructions.trim()) {
+            pendingAction.developerInstructions = codexDeveloperInstructions.trim();
+          }
+          const tabId = await state.createTab(projectId, typeof name === 'string' && name.trim() ? name.trim() : undefined, cwd, {
             commandType: agent,
             color: agent,
-            pendingAction: { type: agent === 'codex' ? 'codex-new' : 'claude-new' },
+            pendingAction,
+            codexModel: typeof codexModel === 'string' ? codexModel : undefined,
+            codexEffort: typeof codexEffort === 'string' ? codexEffort : undefined,
+            externalRun: externalRun && typeof externalRun === 'object' ? externalRun : undefined,
           } as any);
           const tab = ws.tabs.get(tabId);
           return reply(true, {
@@ -2129,6 +2136,18 @@ function App() {
             commandType: agent,
             color: tab?.color || agent,
           });
+        }
+        if (action === 'setExternalRunMeta') {
+          const { tabId, meta } = payload || {};
+          if (!tabId || !meta || typeof meta !== 'object') return reply(false, null, 'tabId+meta required');
+          for (const [projectId, ws] of useWorkspaceStore.getState().openProjects) {
+            const tab = ws.tabs.get(tabId) as any;
+            if (!tab) continue;
+            tab.externalRun = { ...(tab.externalRun || {}), ...meta };
+            useWorkspaceStore.setState((s: any) => ({ openProjects: new Map(s.openProjects) }));
+            return reply(true, { tabId, projectId, externalRun: tab.externalRun });
+          }
+          return reply(false, null, 'tab not open');
         }
         if (action === 'resumeClaudeTab') {
           const { tabId } = payload || {};
@@ -2333,15 +2352,18 @@ function App() {
           const { tab, toolType, runtime, sessionId } = describeAgentTab(tabId);
           if (!tab) return reply(true, { tabId, status: 'inactive', commandType: null, toolType: null, sessionId: null });
           let status: 'active' | 'busy' | 'inactive' | 'starting' = 'inactive';
+          let inputReady = false;
           if (runtime) {
             try {
               const p = await runtime.getPresence(tabId);
               status = p?.status || 'inactive';
+              inputReady = !!p?.inputReady;
             } catch { status = 'inactive'; }
           }
           return reply(true, {
             tabId,
             status,
+            inputReady,
             toolType,
             commandType: tab.commandType || null,
             sessionId,
@@ -2421,6 +2443,20 @@ function App() {
     };
     ipcRenderer.on('claude:paste-busy', handlePasteBusy);
 
+    const handleTerminalVisibleBufferRequest = (_: any, payload: { requestId?: string; tabId?: string; reason?: string }) => {
+      const requestId = payload?.requestId;
+      const tabId = payload?.tabId;
+      if (!requestId || !tabId) return;
+      const snapshot = terminalRegistry.getVisibleSnapshot(tabId);
+      ipcRenderer.send('terminal:visible-buffer-response', {
+        requestId,
+        tabId,
+        reason: payload?.reason || '',
+        ...snapshot,
+      });
+    };
+    ipcRenderer.on('terminal:visible-buffer-request', handleTerminalVisibleBufferRequest);
+
     // Cmd+Tab refocus: main process fires this on every BrowserWindow 'focus'
     // event. We re-broadcast it as a DOM CustomEvent so per-tab components
     // (Terminal.tsx, ClaudeSDKTab.tsx) can listen via window.addEventListener
@@ -2471,6 +2507,7 @@ function App() {
       claudeSpinnerVisualIdleTimersRef.current.clear();
       ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
       ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
+      ipcRenderer.removeListener('terminal:visible-buffer-request', handleTerminalVisibleBufferRequest);
       ipcRenderer.removeListener('claude:awaiting-input', handleAwaitingInput);
       ipcRenderer.removeListener('window:refocus-active', handleWindowRefocus);
       window.removeEventListener('keydown', handlePasteRefocus, true);

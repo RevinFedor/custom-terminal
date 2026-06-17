@@ -128,10 +128,101 @@ const subscribers = new Map();
 const PROJECT_ACTIVITY_TOPIC = '__project_activity__';
 // pending bridge requests to renderer: requestId → { resolve, reject, timer }
 const pendingBridge = new Map();
+const externalRuns = new Map();      // runId -> run metadata
+const externalRunByTabId = new Map(); // tabId -> runId
+const externalRunByConversationKey = new Map(); // conversationKey -> runId
 
 function shortId(value, len = 8) {
   const s = value == null ? '' : String(value);
   return s ? s.slice(-len) : 'nil';
+}
+
+function cleanOptionalString(value, fallback = '') {
+  const s = value == null ? '' : String(value).trim();
+  return s || fallback;
+}
+
+function clampAutoStopMs(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 30_000;
+  return Math.max(0, Math.min(24 * 60 * 60 * 1000, Math.floor(n)));
+}
+
+function setExternalRunMeta(tabId, meta) {
+  if (!tabId || !meta) return;
+  bridgeRequest('setExternalRunMeta', { tabId, meta }, 1500).catch(() => {});
+}
+
+async function waitForAgentReady(tabId, timeoutMs = 20_000) {
+  const limitMs = Math.max(1000, Math.min(60_000, Number(timeoutMs) || 20_000));
+  let last = null;
+  const readStatus = async () => {
+    try {
+      last = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
+      if (last && (last.status === 'active' || last.status === 'busy') && last.inputReady === true) {
+        return last;
+      }
+    } catch (e) {
+      last = { error: String(e.message || e) };
+    }
+    return null;
+  };
+
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    const finish = (err, status) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      ipcMain.removeListener('agent:tui-ready-internal', onReady);
+      if (err) reject(err);
+      else resolve(status);
+    };
+    const fail = () => {
+      const err = new Error('agent did not become ready');
+      err.status = last;
+      finish(err);
+    };
+    const check = () => {
+      readStatus()
+        .then((status) => { if (status) finish(null, status); })
+        .catch((e) => {
+          last = { error: String(e.message || e) };
+        });
+    };
+    const onReady = (_event, payload) => {
+      const readyTabId = typeof payload === 'string' ? payload : payload?.tabId;
+      if (readyTabId !== tabId) return;
+      check();
+    };
+    ipcMain.on('agent:tui-ready-internal', onReady);
+    timer = setTimeout(fail, limitMs);
+    check();
+  });
+}
+
+function scheduleExternalRunStop(run, reason = 'auto-stop') {
+  if (!run || !run.tabId) return;
+  const autoStopMs = clampAutoStopMs(run.autoStopMs);
+  if (autoStopMs < 0) return;
+  if (run.stopTimer) clearTimeout(run.stopTimer);
+  const stopAt = Date.now() + autoStopMs;
+  run.autoStopAt = stopAt;
+  setExternalRunMeta(run.tabId, { status: run.status || 'done', autoStopAt: stopAt, autoStopMs });
+  run.stopTimer = setTimeout(async () => {
+    try {
+      run.status = 'stopping';
+      setExternalRunMeta(run.tabId, { status: 'stopping', autoStopAt: null, autoStopMs });
+      await bridgeRequest('stopClaudeTab', { tabId: run.tabId }, 5000);
+      run.status = 'stopped';
+      run.stoppedAt = Date.now();
+      setExternalRunMeta(run.tabId, { status: 'stopped', autoStopAt: null, autoStopMs, stoppedAt: run.stoppedAt, stopReason: reason });
+    } catch (e) {
+      run.status = 'stop_failed';
+      setExternalRunMeta(run.tabId, { status: 'stop_failed', autoStopAt: null, stopError: String(e.message || e) });
+    }
+  }, autoStopMs);
 }
 
 function summarizeStreamMessage(message) {
@@ -340,6 +431,29 @@ function normalizeMobileTimelineEntries(entries, fullEntries = []) {
 async function sendInitialSnapshot(tabId, sink, sdkSessions) {
   const session = sdkSessions.get(tabId);
   const pendingQuestion = getClaudePendingQuestion ? getClaudePendingQuestion(tabId) : null;
+  const replayExternalRunTerminalEvent = () => {
+    const runId = externalRunByTabId.get(tabId);
+    if (!runId) return;
+    const run = externalRuns.get(runId);
+    if (!run) return;
+    if (run.status === 'done') {
+      sink.send(JSON.stringify({
+        type: 'done',
+        tabId,
+        runId,
+        sessionId: run.sessionId || null,
+        reason: 'snapshot-replay',
+        completedAt: run.completedAt || null,
+      }));
+    } else if (run.status === 'send_failed' || run.status === 'start_timeout') {
+      sink.send(JSON.stringify({
+        type: 'error',
+        tabId,
+        runId,
+        error: run.error || run.status,
+      }));
+    }
+  };
   if (session) {
     sink.send(JSON.stringify({
       type: 'snapshot',
@@ -353,6 +467,7 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       toolUseID: pendingQuestion?.toolUseID,
       questions: pendingQuestion?.questions,
     }));
+    replayExternalRunTerminalEvent();
     return;
   }
   try {
@@ -370,6 +485,7 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       toolUseID: pendingQuestion?.toolUseID,
       questions: pendingQuestion?.questions,
     }));
+    replayExternalRunTerminalEvent();
   } catch {
     sink.send(JSON.stringify({
       type: 'snapshot',
@@ -383,6 +499,7 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       toolUseID: pendingQuestion?.toolUseID,
       questions: pendingQuestion?.questions,
     }));
+    replayExternalRunTerminalEvent();
   }
 }
 
@@ -1148,6 +1265,138 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  if (parsed.pathname === '/api/inbox/runs' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const provider = body.provider === 'codex' ? 'codex' : null;
+      if (!provider) return sendJson(res, 400, { error: 'provider must be codex' });
+      const prompt = cleanOptionalString(body.prompt ?? body.text);
+      if (!prompt) return sendJson(res, 400, { error: 'prompt required' });
+      const runId = body.runId && String(body.runId).trim() ? String(body.runId).trim() : crypto.randomUUID();
+      const source = cleanOptionalString(body.source, 'external-api');
+      const conversationKey = cleanOptionalString(body.conversationKey || body.chatId, '');
+      const autoStopMs = clampAutoStopMs(body.autoStopMs);
+      const startupTimeoutMs = Math.max(5_000, Math.min(120_000, Number(body.startupTimeoutMs) || 20_000));
+      const developerInstructions = cleanOptionalString(body.developerInstructions || body.systemPrompt, '');
+      const startedAt = Date.now();
+      const autoStopAt = autoStopMs > 0 ? null : null;
+      await bridgeRequest('ensureInboxProject', {}, 5000);
+      let tabId = null;
+      let sessionId = null;
+      let reused = false;
+      if (conversationKey && externalRunByConversationKey.has(conversationKey)) {
+        const prevRunId = externalRunByConversationKey.get(conversationKey);
+        const prevRun = externalRuns.get(prevRunId);
+        if (prevRun?.tabId) {
+          try {
+            if (prevRun.stopTimer) {
+              clearTimeout(prevRun.stopTimer);
+              prevRun.stopTimer = null;
+            }
+            const prevStatus = await bridgeRequest('getClaudeTabStatus', { tabId: prevRun.tabId }, 2000);
+            if (prevStatus?.toolType === 'codex') {
+              tabId = prevRun.tabId;
+              sessionId = prevStatus.sessionId || prevStatus.codexSessionId || prevRun.sessionId || null;
+              reused = true;
+              if (prevStatus.status === 'inactive' && sessionId) {
+                await bridgeRequest('resumeClaudeTab', { tabId }, 5000);
+              }
+            }
+          } catch {}
+        }
+      }
+      const tabName = cleanOptionalString(body.name, conversationKey ? `Codex · ${conversationKey.slice(-8)}` : `Codex · ${source}`);
+      const externalRun = {
+        runId,
+        provider,
+        source,
+        conversationKey: conversationKey || undefined,
+        status: 'starting',
+        startedAt,
+        autoStopAt,
+        autoStopMs,
+      };
+      if (!tabId) {
+        const tab = await bridgeRequest('createAgentTab', {
+          projectId: INBOX_PROJECT_ID,
+          toolType: provider,
+          name: tabName,
+          externalRun,
+          codexDeveloperInstructions: developerInstructions || undefined,
+          codexModel: cleanOptionalString(body.model, ''),
+          codexEffort: cleanOptionalString(body.effort, ''),
+        }, 8000);
+        tabId = tab?.tabId;
+        if (!tabId) return sendJson(res, 500, { error: 'failed to create tab' });
+      }
+      const run = { ...externalRun, tabId, sessionId, stopTimer: null };
+      externalRuns.set(runId, run);
+      externalRunByTabId.set(tabId, runId);
+      if (conversationKey) externalRunByConversationKey.set(conversationKey, runId);
+      setExternalRunMeta(tabId, { ...externalRun, tabId });
+      let status = null;
+      try {
+        status = await waitForAgentReady(tabId, startupTimeoutMs);
+      } catch (e) {
+        run.status = 'start_timeout';
+        setExternalRunMeta(tabId, { status: 'start_timeout', error: String(e.message || e) });
+        return sendJson(res, 504, { ok: false, runId, tabId, error: 'agent did not become ready', status: e.status || null });
+      }
+      sessionId = status?.sessionId || status?.codexSessionId || sessionId || null;
+      run.status = 'sending';
+      run.sessionId = sessionId;
+      setExternalRunMeta(tabId, { status: 'sending', sessionId, autoStopAt: null });
+      const sendResult = await bridgeRequest('sendMessageAuto', {
+        tabId,
+        prompt,
+        source: 'external:' + source,
+        statusAtSend: status?.status || 'active',
+        queue: body.queue === true,
+      }, 60_000);
+      if (sendResult?.success === false) {
+        run.status = 'send_failed';
+        setExternalRunMeta(tabId, { status: 'send_failed', error: sendResult.error || 'send failed' });
+        return sendJson(res, 409, { ok: false, runId, tabId, sessionId, error: sendResult.error || 'send failed' });
+      }
+      run.status = 'running';
+      setExternalRunMeta(tabId, { status: 'running', sessionId, autoStopAt: null, autoStopMs });
+      return sendJson(res, 200, {
+        ok: true,
+        runId,
+        provider,
+        tabId,
+        sessionId,
+        source,
+        conversationKey: conversationKey || null,
+        eventsUrl: '/api/events?tabId=' + encodeURIComponent(tabId),
+        stopUrl: '/api/inbox/runs/' + encodeURIComponent(runId) + '/stop',
+        autoStopMs,
+        reused,
+      });
+    } catch (e) {
+      return sendJson(res, 500, { ok: false, error: String(e.message || e) });
+    }
+  }
+
+  m = parsed.pathname.match(/^\/api\/inbox\/runs\/([^/]+)\/stop$/);
+  if (m && req.method === 'POST') {
+    const runId = decId(m[1]);
+    const run = externalRuns.get(runId);
+    if (!run?.tabId) return sendJson(res, 404, { error: 'run not found' });
+    try {
+      if (run.stopTimer) clearTimeout(run.stopTimer);
+      run.status = 'stopping';
+      setExternalRunMeta(run.tabId, { status: 'stopping', autoStopAt: null });
+      const data = await bridgeRequest('stopClaudeTab', { tabId: run.tabId }, 5000);
+      run.status = 'stopped';
+      run.stoppedAt = Date.now();
+      setExternalRunMeta(run.tabId, { status: 'stopped', stoppedAt: run.stoppedAt, autoStopAt: null, stopReason: 'api' });
+      return sendJson(res, 200, { ok: true, runId, tabId: run.tabId, stopped: true, ...data });
+    } catch (e) {
+      return sendJson(res, 500, { ok: false, runId, error: String(e.message || e) });
+    }
+  }
+
   m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/agent-tabs$/);
   if (m && req.method === 'POST') {
     try {
@@ -1783,6 +2032,31 @@ const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'bridge-update', 'q
 function webBroadcast(tabId, payload) {
   const type = payload && payload.type;
   const loggable = BCAST_LOG_TYPES.has(type);
+  const runId = externalRunByTabId.get(tabId);
+  const run = runId ? externalRuns.get(runId) : null;
+  try {
+    if (run) {
+      if (type === 'busy') {
+        run.status = payload.busy ? 'running' : 'idle';
+        setExternalRunMeta(tabId, { status: run.status, sessionId: payload.sessionId || run.sessionId || null });
+      } else if (type === 'done') {
+        run.status = 'done';
+        run.completedAt = Date.now();
+        run.sessionId = payload.sessionId || run.sessionId || null;
+        setExternalRunMeta(tabId, {
+          status: 'done',
+          completedAt: run.completedAt,
+          sessionId: run.sessionId || null,
+          autoStopMs: run.autoStopMs,
+        });
+      } else if (type === 'message' && run.status === 'sending') {
+        run.status = 'running';
+        setExternalRunMeta(tabId, { status: 'running', sessionId: run.sessionId || null });
+      }
+    }
+  } catch (e) {
+    console.warn('[WebBcast:MetaError] tab=' + shortId(tabId, 12) + ' type=' + type + ' run=' + (runId || '-') + ' error=' + (e?.message || String(e)));
+  }
   const set = subscribers.get(tabId);
   if (!set || set.size === 0) {
     if (loggable || type === 'message') console.log('[WebBcast:DROP] tab=' + shortId(tabId, 12) + ' type=' + type + summarizeBroadcastPayload(payload) + ' noSubscribers (registered=' + subscribers.size + ')');
@@ -1801,6 +2075,13 @@ function webBroadcast(tabId, payload) {
   for (const d of dead) set.delete(d);
   if (loggable || type === 'message' || dead.length) {
     console.log('[WebBcast:SEND] tab=' + shortId(tabId, 12) + ' type=' + type + ' to=' + sent + '/' + (sent + dead.length) + summarizeBroadcastPayload(payload) + (dead.length ? ' (pruned ' + dead.length + ' dead)' : ''));
+  }
+  if (run && type === 'done') {
+    try {
+      scheduleExternalRunStop(run, 'turn-done');
+    } catch (e) {
+      console.warn('[WebBcast:StopScheduleError] tab=' + shortId(tabId, 12) + ' run=' + runId + ' error=' + (e?.message || String(e)));
+    }
   }
 }
 

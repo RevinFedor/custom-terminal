@@ -6,6 +6,7 @@ export interface CodexRunPayloadBase {
   command: string;
   sessionId?: string;
   cwd?: string;
+  developerInstructions?: string;
 }
 
 export interface CodexRunPayload extends CodexRunPayloadBase {

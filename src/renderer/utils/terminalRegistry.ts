@@ -260,6 +260,46 @@ export const terminalRegistry = {
     return terminals.get(tabId);
   },
 
+  getVisibleSnapshot(tabId: string): {
+    success: boolean;
+    error?: string;
+    rows?: number;
+    cols?: number;
+    baseY?: number;
+    viewportY?: number;
+    cursorX?: number;
+    cursorY?: number;
+    bufferType?: string;
+    lines?: { row: number; text: string; wrapped: boolean }[];
+  } {
+    const terminal = terminals.get(tabId);
+    if (!terminal) return { success: false, error: 'no-terminal' };
+    const buf = terminal.buffer.active;
+    const startLine = buf.viewportY;
+    const endLine = Math.min(startLine + terminal.rows, buf.length);
+    const lines: { row: number; text: string; wrapped: boolean }[] = [];
+    for (let i = startLine; i < endLine; i++) {
+      const line = buf.getLine(i);
+      if (!line) continue;
+      lines.push({
+        row: i,
+        text: line.translateToString(true),
+        wrapped: !!line.isWrapped,
+      });
+    }
+    return {
+      success: true,
+      rows: terminal.rows,
+      cols: terminal.cols,
+      baseY: buf.baseY,
+      viewportY: buf.viewportY,
+      cursorX: buf.cursorX,
+      cursorY: buf.cursorY,
+      bufferType: buf.type,
+      lines,
+    };
+  },
+
   waitForTerminal(tabId: string, timeoutMs = 2500): Promise<XTerminal | undefined> {
     const existing = terminals.get(tabId);
     if (existing) return Promise.resolve(existing);

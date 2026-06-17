@@ -263,7 +263,7 @@ Codex Timeline грузится через `codex:get-timeline`, а HistoryPanel
 ### Edit Range (компактирование диапазона)
 Полный пайплайн: выделение → Gemini compact → agent history rewrite → agent restart/continue.
 
-**Ограничение:** Редактирование работает **только в пределах текущего сегмента** (после последнего plan mode / compact boundary). Попытка редактирования через границы показывает тост с ошибкой. Мотивация: JSONL-файлы split по plan mode (каждый Clear Context = новый файл), edit-range работает с одним файлом.
+**Ограничение зависит от runtime.** Для Claude редактирование работает **только в пределах текущего сегмента** (после последнего plan mode / compact boundary). Попытка редактирования через границы показывает тост с ошибкой. Мотивация: JSONL-файлы split по plan mode (каждый Clear Context = новый файл), edit-range работает с одним файлом. Для Codex compact не является Old History boundary и `parentUuid`-DAG нет: middle-history range edit должен оставаться доступным через `codex:edit-range` и локальный rollout fork, даже если диапазон находится в середине длинной истории. Не гейтить Codex range popup через Claude-only `supportsClaudeTimelineActions`; отдельный gate для edit — Claude + Codex, а token estimate/breakdown остаётся Claude-only.
 
 **Flow:**
 1. Выбор диапазона → "Редактировать" → боковая панель `EditRangePanel`.
@@ -348,6 +348,8 @@ Codex Timeline грузится через `codex:get-timeline`, а HistoryPanel
 - **Янтарный:** Rewind preview / локальный marker ожидает дальнейшего Send.
 - **Фиолетовый:** Навигация в TUI (Откат).
 - **Зелёный (1.2с):** Успешный перенос target prompt в History input.
+
+**ПКМ по Rewind loader → Отмена.** Rewind/AI Rewind может зависнуть не в самой Timeline, а в внешнем TUI picker'е, Gemini request или paste/confirm шаге. Поэтому мигающий overlay во время `compacting`/`rewinding`/`pasting` является cancellable surface: правый клик открывает маленькое меню `Отмена`. Cancel закрывает меню, снимает Rewind state, пишет failed/cancelled entry в History log, abort'ит Gemini request если он активен и отправляет runtime-specific cancel в main (`Escape` для Claude picker, `q` для Codex transcript overlay). Это не success-state: после cancel History/Timeline должны перечитать durable source, а не держать локальный `I REWOUND`/done marker.
 
 **Три фазы визуальной обратной связи (Range Copy):**
 

@@ -108,7 +108,9 @@ async function getCodexPtyPresence(tabId: string): Promise<AgentPtyPresence> {
     }).catch(() => null),
     ipcRenderer.invoke('codex:get-turn-state', tabId).catch(() => null),
   ]);
+  const tuiReady = await ipcRenderer.invoke('codex:get-tui-ready', tabId).catch(() => null);
   const isRunning = !!state?.isRunning;
+  const inputReady = isRunning && !!tuiReady?.inputReady;
   const isBusy = turnState?.hasWatcher ? !!turnState.busy : !!tab?.aiBusy;
   if (tab && tab.aiBusy !== isBusy) {
     useWorkspaceStore.getState().setAiBusy(tabId, isBusy);
@@ -118,7 +120,7 @@ async function getCodexPtyPresence(tabId: string): Promise<AgentPtyPresence> {
     hasBridge: !!tab?.codexSessionId,
     isBusy,
     hasTerm: state?.error !== 'tab not found',
-    inputReady: isRunning,
+    inputReady,
     awaiting: false,
   };
 }
@@ -281,7 +283,7 @@ const CODEX_RUNTIME: HistoryAgentRuntime = {
   lowerLabel: 'codex',
   logPrefix: 'CodexHistoryControls',
   busyEvent: 'codex:busy-state',
-  readyEvent: 'codex:session-detected',
+  readyEvent: 'codex:tui-ready',
   supportsQuestions: false,
   supportsInterruptRecovery: true,
   interruptRecoveryReasons: ['turn_aborted'],

@@ -610,6 +610,8 @@ const claudeDebounceTimers = new Map(); // tabId -> debounce timer ID
 const claudeCtrlCDangerZone = new Map(); // tabId -> { resolve, promise, timer } (event-driven clear on prompt return)
 const claudeConfirmDialogCooldown = new Map(); // `${tabId}:${dialogType}` -> lastFireTs (ms). Prevents double-Enter on echo re-render.
 const codexStartupAutoEnter = new Map(); // tabId -> one-shot state for Codex startup confirmation prompts
+const codexTuiReadyTabs = new Set();     // tabIds whose current Codex TUI process rendered an input-ready frame
+const codexTuiReadyBuffers = new Map();  // tabId -> recent startup output for deterministic ready detection
 let sessionManager; // Initialized after projectManager is ready
 let claudeManager; // Initialized with terminals map
 
@@ -6558,6 +6560,9 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       // Parse OSC 133 for command lifecycle events (just spy, don't modify)
       parseOSC133AndEmit(tabId, data);
       tryHandleCodexStartupAutoEnter(tabId, data);
+      void tryEmitCodexTuiReady(tabId, data).catch((err) => {
+        console.warn('[CodexTuiReady] probe failed tab=' + String(tabId).slice(-12) + ' ' + (err?.message || String(err)));
+      });
 
       // ========== CLAUDE HANDSHAKE (Prompt Injection) ==========
       // Wait for prompt to appear, debounce UI settling, then send pending prompt.
@@ -6697,8 +6702,9 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
           // effort line appears. Bridge:Fresh stays as the fallback path.
           if (mainWindow && !mainWindow.isDestroyed()) {
             console.log('[TUI-Ready] tab=' + tabId.slice(-12) + ' — emitting claude:tui-ready (prompt rendered)');
-            mainWindow.webContents.send('claude:tui-ready', { tabId, ts: Date.now() });
-          }
+              mainWindow.webContents.send('claude:tui-ready', { tabId, ts: Date.now() });
+              ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'claude' });
+            }
 
           const timerId = setTimeout(async () => {
             console.log('[Claude Handshake] Tab ' + tabId + ': UI settled (' + DEBOUNCE_MS + 'ms silence). Sending prompt...');
@@ -7072,6 +7078,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
 	      claudeCliActive.delete(tabId);
 	      clearBridgeTab(tabId);
 	      clearCodexKnownSession(tabId, 'pty-exit');
+      clearCodexTuiReady(tabId, 'pty-exit');
       clearCodexStartupAutoEnter(tabId, 'pty-exit');
       clearTimeout(geminiSpinnerIdleTimers.get(tabId));
       geminiSpinnerBusy.delete(tabId);
@@ -7286,6 +7293,39 @@ function waitForPtyText(term, textOrRegex, timeoutMs = 5000, logPrefix = '') {
         resolve(buf);
       }
     });
+  });
+}
+
+function requestTerminalVisibleBufferSnapshot(webContents, tabId, reason, timeoutMs = 500) {
+  return new Promise((resolve) => {
+    if (!webContents || (typeof webContents.isDestroyed === 'function' && webContents.isDestroyed())) {
+      resolve({ success: false, error: 'no-webcontents', tabId, reason });
+      return;
+    }
+
+    const requestId = crypto.randomUUID();
+    let settled = false;
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      ipcMain.removeListener('terminal:visible-buffer-response', handler);
+      resolve(payload || { success: false, error: 'empty-response', requestId, tabId, reason });
+    };
+    const handler = (_event, payload) => {
+      if (!payload || payload.requestId !== requestId) return;
+      finish(payload);
+    };
+    const timer = setTimeout(() => {
+      finish({ success: false, error: 'timeout', requestId, tabId, reason });
+    }, timeoutMs);
+
+    ipcMain.on('terminal:visible-buffer-response', handler);
+    try {
+      webContents.send('terminal:visible-buffer-request', { requestId, tabId, reason });
+    } catch (err) {
+      finish({ success: false, error: err?.message || String(err), requestId, tabId, reason });
+    }
   });
 }
 
@@ -8721,13 +8761,38 @@ ipcMain.handle('claude:toggle-thinking', async (event, tabId) => {
 });
 
 // Claude rewind through the native `/rewind` slash command.
-// Flow: preflight current input → stash if needed → `/rewind` → DOWN to target → Enter.
+// Flow: preflight current input → stash if needed → `/rewind` → UP to target → Enter.
 // Native mode lets History own the selected prompt draft; after Claude restores it into
 // the TUI composer, we grab+clear that composer so there is a single input source.
 // Optional `pasteAfter` keeps the AI-assisted compact path, but it now shares the same rewind selector.
+const rewindCancelTabs = new Set();
+
+ipcMain.handle('rewind:cancel', async (_event, { tabId, toolType } = {}) => {
+  if (!tabId) return { success: false, error: 'no_tab_id' };
+  rewindCancelTabs.add(tabId);
+  const term = terminals.get(tabId);
+  if (term) {
+    try {
+      term.write(toolType === 'codex' ? 'q' : '\x1b');
+    } catch (err) {
+      console.warn('[Rewind:Cancel] write failed tab=' + String(tabId).slice(-12) + ' error=' + (err?.message || err));
+    }
+  }
+  console.log('[Rewind:Cancel] requested tab=' + String(tabId).slice(-12) + ' tool=' + (toolType || 'unknown') + ' hasTerm=' + !!term);
+  return { success: true };
+});
+
+function makeRewindCancelledError(stage) {
+  const err = new Error('rewind_cancelled');
+  err.code = 'rewind_cancelled';
+  err.stage = stage;
+  return err;
+}
+
 ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, targetText, targetFullText, rewindableCount, skipDuplicates = 0, pasteAfter }) => {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
+  rewindCancelTabs.delete(tabId);
   if (!hasLiveClaudeInTab(tabId)) return { success: false, error: 'no_claude_session' };
   if (claudeTurnBusy.get(tabId) === true) return { success: false, error: 'claude_busy' };
 
@@ -8749,15 +8814,20 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
 
   function isMenuChrome(text) {
     const t = normalizeCandidate(text);
+    const packed = t.replace(/\s+/g, '').toLowerCase();
     if (!t) return true;
     return t === '●'
       || t === '❯'
       || /^[─━╌═-]{5,}$/.test(t)
+      || /^[↑↓]\s*\d+\s*more\s*(above|below)$/i.test(t)
+      || /^\d+\s*more\s*(above|below)$/i.test(t)
       || t === 'Rewind'
       || t === 'Do nothing'
       || t === 'Rewind conversation'
       || t.startsWith('Stay at current position')
       || t.startsWith('Enter to continue')
+      || packed.startsWith('entertocontinue')
+      || packed.includes('esctocancel')
       || t.startsWith('Restore and fork');
   }
 
@@ -8807,31 +8877,99 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
     return extractPointerCandidates(raw);
   }
 
-  function textMatchesTarget(selectedText, targetPrefix) {
-    if (!selectedText || !targetPrefix) return false;
-    const st = normalizeCandidate(selectedText).substring(0, 80);
-    const tp = normalizeCandidate(targetPrefix).substring(0, 80);
-    if (!st || !tp) return false;
-    if (st.includes(tp) || tp.includes(st)) {
-      console.log('[Claude:Rewind] MATCH: TUI="' + st + '" vs Target="' + tp + '"');
-      return true;
+  function stripPickerSelectionMarker(text) {
+    return normalizeCandidate(text)
+      .replace(/^[●❯]\s*/u, '')
+      .trim();
+  }
+
+  function stripVisualTruncation(text) {
+    return stripPickerSelectionMarker(text)
+      .replace(/\s*(?:…|\.{3})\s*$/g, '')
+      .trim();
+  }
+
+  function compareSelectedToTarget(selectedText, targetText) {
+    const selected = stripVisualTruncation(selectedText);
+    const target = normalizeCandidate(targetText);
+    if (!selected || !target) return { matched: false, reason: 'empty', selected, target };
+
+    const selectedSnippet = selected;
+    const targetSnippet = target;
+    const shortLimit = 12;
+
+    if (selectedSnippet === targetSnippet) {
+      return { matched: true, reason: 'exact-snippet', selected: selectedSnippet, target: targetSnippet };
     }
 
-    const targetWords = tp.split(/\s+/).filter(w => w.length > 2);
-    if (targetWords.length === 0) return false;
-    const matchedWords = targetWords.filter(w => st.includes(w));
-    const ratio = matchedWords.length / targetWords.length;
-    if (ratio >= 0.6) {
-      console.log('[Claude:Rewind] Fuzzy match (' + Math.round(ratio * 100) + '%, ' + matchedWords.length + '/' + targetWords.length + ' words)');
-      return true;
+    if (targetSnippet.length <= shortLimit || selectedSnippet.length <= shortLimit) {
+      return { matched: selectedSnippet === targetSnippet, reason: 'short-exact', selected: selectedSnippet, target: targetSnippet };
     }
-    return false;
+
+    if (targetSnippet.startsWith(selectedSnippet)) {
+      return { matched: true, reason: 'selected-visible-prefix', selected: selectedSnippet, target: targetSnippet };
+    }
+    if (selectedSnippet.startsWith(targetSnippet)) {
+      return { matched: true, reason: 'target-prefix', selected: selectedSnippet, target: targetSnippet };
+    }
+
+    return { matched: false, reason: 'prefix-mismatch', selected: selectedSnippet, target: targetSnippet };
+  }
+
+  function textMatchesTarget(selectedText, targetText) {
+    const match = compareSelectedToTarget(selectedText, targetText);
+    if (match.matched) {
+      console.log('[Claude:Rewind] MATCH(' + match.reason + '): TUI="' + match.selected.substring(0, 100) + '" vs Target="' + match.target.substring(0, 100) + '"');
+    }
+    return match.matched;
+  }
+
+  function textMatchesTargetSilent(selectedText, targetText) {
+    return compareSelectedToTarget(selectedText, targetText).matched;
+  }
+
+  function snapshotLines(snapshot) {
+    if (!Array.isArray(snapshot?.lines)) return [];
+    return snapshot.lines
+      .map((line) => ({
+        row: Number(line?.row),
+        text: normalizeCandidate(String(line?.text || '')),
+        wrapped: !!line?.wrapped
+      }))
+      .filter(line => line.text && !/^[─━╌═-]{5,}$/.test(line.text));
+  }
+
+  function isRewindPickerItemLine(line) {
+    const text = stripPickerSelectionMarker(line?.text || '');
+    if (!text) return false;
+    if (/^[↑↓]\s*\d+\s*more\s*(above|below)$/i.test(text)) return false;
+    if (/^Enter\s+to\s+continue\b/i.test(text)) return false;
+    if (/^Esc\s+to\s+cancel\b/i.test(text)) return false;
+    return !isMenuChrome(text);
+  }
+
+  function extractSnapshotSelectedCandidates(snapshot) {
+    const results = [];
+    for (const line of snapshotLines(snapshot)) {
+      const m = line.text.match(/[●❯]\s*(.+)$/);
+      if (!m) continue;
+      const candidate = normalizeCandidate(m[1]);
+      if (!isMenuChrome(candidate)) results.push(candidate);
+    }
+    return results;
   }
 
   async function writeAndWait(key, waitFor, timeoutMs, logPrefix) {
     const wait = waitForPtyText(term, waitFor, timeoutMs, logPrefix);
     term.write(key);
     return await wait;
+  }
+
+  function throwIfRewindCancelled(stage) {
+    if (rewindCancelTabs.has(tabId)) {
+      console.log('[Claude:Rewind] Cancelled at stage=' + stage);
+      throw makeRewindCancelledError(stage);
+    }
   }
 
   async function grabRestoredRewindInput(expectedText) {
@@ -8849,6 +8987,11 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
         + ' success=' + (result?.success === true)
         + ' chars=' + text.length
         + ' matchedTarget=' + matched
+        + ' expectedHash=' + pasteAuditHash(expectedText)
+        + ' actualHash=' + pasteAuditHash(text)
+        + ' expectedHead="' + pasteAuditPreview(expectedText) + '"'
+        + ' actualHead="' + pasteAuditPreview(text) + '"'
+        + ' actualTail="' + pasteAuditPreview(text, Math.max(0, text.length - 80)) + '"'
         + ' error=' + (result?.error || '-'));
 
       if (result?.success && normalized.length > 0) {
@@ -8898,11 +9041,70 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
         };
       }
 
-      const targetPrefix = String(targetText || '').trim().substring(0, 40);
-      if (!targetPrefix) return { success: false, error: 'empty_target' };
       const targetInputText = String(targetFullText || targetText || '').trim();
+      const targetPrefix = normalizeCandidate(targetInputText || targetText);
+      if (!targetPrefix) return { success: false, error: 'empty_target' };
+      console.log('[Claude:Rewind] Target match key chars=' + targetPrefix.length
+        + ' fullChars=' + targetInputText.length
+        + ' hash=' + pasteAuditHash(targetInputText)
+        + ' head="' + pasteAuditPreview(targetInputText) + '"');
 
-      const menuReadyRe = /Stay at current position|Restore and fork|\x1b\[38;2;\d+;\d+;\d+m|[●❯]\s*\S/;
+      async function readRendererSelection(reason) {
+        const snapshot = await requestTerminalVisibleBufferSnapshot(event.sender, tabId, reason, 700);
+        const lines = snapshotLines(snapshot);
+        const selectedLine = [...lines].reverse().find(line => /^[●❯]\s*/u.test(line.text)) || null;
+        const itemLines = lines.filter(isRewindPickerItemLine);
+        const selectedItemIndex = selectedLine
+          ? itemLines.findIndex(line => line.row === selectedLine.row && line.text === selectedLine.text)
+          : -1;
+        const previousItemLine = selectedItemIndex > 0 ? itemLines[selectedItemIndex - 1] : null;
+        const targetBeforeSelected = !!previousItemLine && textMatchesTargetSilent(previousItemLine.text, targetPrefix);
+        const selectedCandidates = extractSnapshotSelectedCandidates(snapshot)
+          .slice(-5)
+          .map(candidate => normalizeCandidate(candidate).substring(0, 140));
+        const selectedText = selectedLine
+          ? stripPickerSelectionMarker(selectedLine.text)
+          : (selectedCandidates.length > 0 ? selectedCandidates[selectedCandidates.length - 1] : null);
+        const matchedTarget = textMatchesTarget(selectedText, targetPrefix);
+        const visibleTargetLines = lines
+          .filter(line => textMatchesTargetSilent(line.text, targetPrefix))
+          .slice(-5)
+          .map(line => ({ row: line.row, text: line.text.substring(0, 140), wrapped: line.wrapped }));
+        const visibleLines = lines
+          .slice(-16)
+          .map(line => ({ row: line.row, text: line.text.substring(0, 140), wrapped: line.wrapped }));
+        console.log('[Claude:Rewind:Snapshot] ' + JSON.stringify({
+          tab: String(tabId).slice(-12),
+          reason,
+          success: snapshot?.success === true,
+          error: snapshot?.error || null,
+          rows: snapshot?.rows,
+          cols: snapshot?.cols,
+          viewportY: snapshot?.viewportY,
+          baseY: snapshot?.baseY,
+          cursorX: snapshot?.cursorX,
+          cursorY: snapshot?.cursorY,
+          selectedCandidates,
+          selectedRow: selectedLine?.row ?? null,
+          selectedText: (selectedText || '').substring(0, 140),
+          matchedTarget,
+          targetBeforeSelected,
+          previousItemText: (previousItemLine?.text || '').substring(0, 140),
+          visibleTargetLines,
+          visibleLines
+        }));
+        return {
+          selectedText,
+          matchedTarget,
+          targetBeforeSelected,
+          selectedCandidates,
+          visibleTargetLines,
+          previousItemText: previousItemLine?.text || '',
+          snapshot
+        };
+      }
+
+      const menuReadyRe = /Stay\s*at\s*current\s*position|Restore\s*and\s*fork|Rewind\s*conversation|Do\s*nothing|Enter\s*to\s*continue|Esc\s*to\s*cancel|↑\s*\d+\s*more\s*above|↓\s*\d+\s*more\s*below/i;
       const menuWait = waitForPtyText(
         term,
         menuReadyRe,
@@ -8925,10 +9127,12 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
 
       const menuRaw = await menuWait;
       const menuClean = cleanBuffer(menuRaw);
+      const moreAboveMatch = menuClean.match(/↑\s*(\d+)\s*more\s*above/i);
+      const moreAboveCount = moreAboveMatch ? Number(moreAboveMatch[1]) : 0;
       const initialCandidates = extractSelectedCandidates(menuRaw);
-      const menuLooksOpen = menuReadyRe.test(menuRaw) || menuClean.includes('Stay at current position') || menuClean.includes('Restore and fork');
-      if (!menuRaw || (!menuLooksOpen && initialCandidates.length === 0)) {
-        console.error('[Claude:Rewind] Menu did not open. raw=' + menuRaw.length + ' candidates=' + initialCandidates.length + ' clean="' + menuClean.substring(0, 240) + '"');
+      const menuLooksOpen = menuReadyRe.test(menuClean);
+      if (!menuRaw || !menuLooksOpen) {
+        console.error('[Claude:Rewind] Menu did not open. raw=' + menuRaw.length + ' candidates=' + initialCandidates.length + ' menuLooksOpen=' + menuLooksOpen + ' clean="' + menuClean.substring(0, 240) + '"');
         return { success: false, error: 'Rewind menu did not open' };
       }
       if (initialCandidates.length > 0) {
@@ -8941,13 +9145,63 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       const count = Number(rewindableCount);
       const idx = Number(targetIndex);
       if (Number.isFinite(count) && Number.isFinite(idx) && count > 0 && idx >= 0) {
-        maxPresses = Math.max(50, Math.min(500, count - idx + skipDuplicates + 6));
+        maxPresses = Math.max(80, Math.min(1000, count - idx + skipDuplicates + (Number.isFinite(moreAboveCount) ? moreAboveCount : 0) + 20));
       }
 
       const hasDeterministicIndex = Number.isFinite(count) && Number.isFinite(idx) && count > 0 && idx >= 0 && idx < count;
+      function getScrollCount(clean, direction) {
+        const arrow = direction === 'above' ? '↑' : '↓';
+        const match = String(clean || '').match(new RegExp(arrow + '\\s*(\\d+)\\s*more\\s*' + direction, 'i'));
+        return match ? Number(match[1]) : 0;
+      }
+
+      function rewindFrameLines(clean) {
+        return String(clean || '')
+          .split(/[\r\n]+/)
+          .map(line => normalizeCandidate(line))
+          .filter(Boolean)
+          .filter(line => !/^[─━╌═-]{5,}$/.test(line))
+          .slice(-16)
+          .map(line => line.substring(0, 140));
+      }
+
+      function logRewindFrame(raw, reason, extra = {}) {
+        try {
+          const clean = cleanBuffer(raw || '');
+          const selectedCandidates = extractSelectedCandidates(raw || '')
+            .slice(-5)
+            .map(candidate => normalizeCandidate(candidate).substring(0, 140));
+          const payload = {
+            tab: String(tabId).slice(-12),
+            reason,
+            rawBytes: String(raw || '').length,
+            target: targetPrefix.substring(0, 80),
+            count,
+            targetIndex: idx,
+            skipDuplicates,
+            pressCount,
+            moreAbove: getScrollCount(clean, 'above'),
+            moreBelow: getScrollCount(clean, 'below'),
+            selectedCandidates,
+            visibleLines: rewindFrameLines(clean),
+            ...extra
+          };
+          console.log('[Claude:Rewind:Frame] ' + JSON.stringify(payload));
+        } catch (err) {
+          console.warn('[Claude:Rewind:Frame] log failed reason=' + reason + ' error=' + (err?.message || err));
+        }
+      }
+
+      logRewindFrame(menuRaw, 'menu-open', {
+        selectedText: (initialCandidates.length > 0 ? initialCandidates[initialCandidates.length - 1] : '').substring(0, 140),
+        menuLooksOpen,
+        moreAboveCount
+      });
+
       async function readCurrentSelection(reason) {
         const raw = await drainPtyData(term, 80, 250);
         let candidates = extractSelectedCandidates(raw);
+        let frameRaw = raw;
         if (candidates.length === 0 && raw.length === 0) {
           const probeRaw = await writeAndWait(
             '',
@@ -8955,32 +9209,89 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
             250,
             '[Claude:Rewind:probe]'
           );
+          frameRaw = probeRaw;
           candidates = extractSelectedCandidates(probeRaw);
         }
-        const selectedText = candidates.length > 0 ? candidates[candidates.length - 1] : null;
+        const ptySelectedText = candidates.length > 0 ? candidates[candidates.length - 1] : null;
+        const screenSelection = await readRendererSelection(reason);
+        const selectedText = screenSelection.selectedText || ptySelectedText;
+        const matchedTarget = screenSelection.selectedText
+          ? screenSelection.matchedTarget
+          : textMatchesTarget(ptySelectedText, targetPrefix);
+        logRewindFrame(frameRaw, 'selected-check:' + reason, {
+          ptySelectedText: (ptySelectedText || '').substring(0, 140),
+          screenSelectedText: (screenSelection.selectedText || '').substring(0, 140),
+          screenMatchedTarget: screenSelection.matchedTarget,
+          selectedText: (selectedText || '').substring(0, 140),
+          matchedTarget
+        });
         console.log('[Claude:Rewind] Selected check (' + reason + ') -> "' + (selectedText || 'null').substring(0, 70) + '"');
         return selectedText;
       }
 
-      async function scanDownForTarget(maxSteps, duplicateOffset, reason) {
+      async function scanForTarget(key, label, maxSteps, duplicateOffset, reason) {
         let duplicatesRemaining = duplicateOffset;
-        console.log('[Claude:Rewind] Navigating ' + reason + ': target="' + targetPrefix + '" maxPresses=' + maxSteps + ' skipDuplicates=' + duplicateOffset);
+        console.log('[Claude:Rewind] Navigating ' + reason + ': target="' + targetPrefix.substring(0, 180) + '" key=' + label + ' maxPresses=' + maxSteps + ' skipDuplicates=' + duplicateOffset);
 
         for (let i = 0; i < maxSteps; i++) {
+          throwIfRewindCancelled(reason + '#' + i);
           const navRaw = await writeAndWait(
-            '\x1b[B',
+            key,
             /\x1b\[38;2;\d+;\d+;\d+m|[●❯]|\x1b\[\?2026l/,
-            2000,
+            1200,
             '[Claude:Rewind:nav]'
           );
           pressCount++;
 
           const candidates = extractSelectedCandidates(navRaw);
-          const selectedText = candidates.length > 0 ? candidates[candidates.length - 1] : null;
-          console.log('[Claude:Rewind] DOWN #' + pressCount + ' -> "' + (selectedText || 'null').substring(0, 70) + '"');
+          const ptySelectedText = candidates.length > 0 ? candidates[candidates.length - 1] : null;
+          const screenSelection = await readRendererSelection(reason + ':' + label + '#' + pressCount);
+          const selectedText = screenSelection.selectedText || ptySelectedText;
+          const matchedTarget = screenSelection.selectedText
+            ? screenSelection.matchedTarget
+            : textMatchesTarget(ptySelectedText, targetPrefix);
+          logRewindFrame(navRaw, reason + ':' + label + '#' + pressCount, {
+            key: label,
+            ptySelectedText: (ptySelectedText || '').substring(0, 140),
+            screenSelectedText: (screenSelection.selectedText || '').substring(0, 140),
+            screenMatchedTarget: screenSelection.matchedTarget,
+            targetBeforeSelected: screenSelection.targetBeforeSelected,
+            previousItemText: (screenSelection.previousItemText || '').substring(0, 140),
+            visibleTargetLines: screenSelection.visibleTargetLines,
+            selectedText: (selectedText || '').substring(0, 140),
+            matchedTarget,
+            duplicatesRemaining
+          });
+          console.log('[Claude:Rewind] ' + label + ' #' + pressCount + ' -> "' + (selectedText || 'null').substring(0, 70) + '"');
 
           if (!selectedText) continue;
-          if (!textMatchesTarget(selectedText, targetPrefix)) continue;
+          if (!screenSelection.targetBeforeSelected) {
+            if (matchedTarget) {
+              console.warn('[Claude:Rewind] Target row is selected, but Claude /rewind commits the item above selected; stepping back to commit-position.');
+              const reverseKey = key === '\x1b[A' ? '\x1b[B' : '\x1b[A';
+              const reverseLabel = key === '\x1b[A' ? 'DOWN' : 'UP';
+              const reverseRaw = await writeAndWait(
+                reverseKey,
+                /\x1b\[38;2;\d+;\d+;\d+m|[●❯]|\x1b\[\?2026l/,
+                1200,
+                '[Claude:Rewind:nav-reverse]'
+              );
+              pressCount++;
+              const reverseSelection = await readRendererSelection(reason + ':' + reverseLabel + '#commit-position');
+              logRewindFrame(reverseRaw, reason + ':' + reverseLabel + '#commit-position', {
+                key: reverseLabel,
+                screenSelectedText: (reverseSelection.selectedText || '').substring(0, 140),
+                targetBeforeSelected: reverseSelection.targetBeforeSelected,
+                previousItemText: (reverseSelection.previousItemText || '').substring(0, 140),
+                visibleTargetLines: reverseSelection.visibleTargetLines,
+              });
+              if (reverseSelection.targetBeforeSelected) {
+                console.log('[Claude:Rewind] Commit-position verified after reverse step');
+                return true;
+              }
+            }
+            continue;
+          }
 
           if (duplicatesRemaining > 0) {
             duplicatesRemaining--;
@@ -8995,10 +9306,11 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
 
       if (hasDeterministicIndex) {
         const targetSteps = Math.max(0, count - 1 - idx);
-        console.log('[Claude:Rewind] Navigating deterministic: target="' + targetPrefix + '" count=' + count + ' targetIndex=' + idx + ' DOWN steps=' + targetSteps + ' skipDuplicates=' + skipDuplicates);
+        console.log('[Claude:Rewind] Navigating deterministic: target="' + targetPrefix.substring(0, 180) + '" count=' + count + ' targetIndex=' + idx + ' UP commit-position steps=' + targetSteps + ' skipDuplicates=' + skipDuplicates);
 
         let selectedText = initialCandidates.length > 0 ? initialCandidates[initialCandidates.length - 1] : null;
         if (targetSteps > 0) {
+          throwIfRewindCancelled('deterministic-before-burst');
           const navWait = waitForPtyText(
             term,
             /\x1b\[\?2026l|\x1b\[38;2;\d+;\d+;\d+m|[●❯]/,
@@ -9009,7 +9321,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
           let remaining = targetSteps;
           while (remaining > 0) {
             const batch = Math.min(remaining, 100);
-            term.write('\x1b[B'.repeat(batch));
+            term.write('\x1b[A'.repeat(batch));
             pressCount += batch;
             remaining -= batch;
             if (remaining > 0) await drainPtyData(term, 10, 80);
@@ -9017,20 +9329,37 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
 
           const navRaw = await navWait;
           const candidates = extractSelectedCandidates(navRaw);
-          selectedText = candidates.length > 0 ? candidates[candidates.length - 1] : selectedText;
-          console.log('[Claude:Rewind] DOWN burst #' + pressCount + ' -> "' + (selectedText || 'moved').substring(0, 70) + '" raw=' + (navRaw ? navRaw.length : 0) + 'B');
+          const ptySelectedText = candidates.length > 0 ? candidates[candidates.length - 1] : selectedText;
           await drainPtyData(term, 80, Math.min(1000, 150 + targetSteps * 20));
+          const screenSelection = await readRendererSelection('deterministic-burst');
+          selectedText = screenSelection.selectedText || ptySelectedText;
+          const matchedTarget = screenSelection.selectedText
+            ? screenSelection.matchedTarget
+            : textMatchesTarget(ptySelectedText, targetPrefix);
+          logRewindFrame(navRaw, 'deterministic-burst', {
+            targetSteps,
+            ptySelectedText: (ptySelectedText || '').substring(0, 140),
+            screenSelectedText: (screenSelection.selectedText || '').substring(0, 140),
+            screenMatchedTarget: screenSelection.matchedTarget,
+            targetBeforeSelected: screenSelection.targetBeforeSelected,
+            previousItemText: (screenSelection.previousItemText || '').substring(0, 140),
+            visibleTargetLines: screenSelection.visibleTargetLines,
+            selectedText: (selectedText || '').substring(0, 140),
+            matchedTarget
+          });
+          console.log('[Claude:Rewind] UP burst #' + pressCount + ' -> "' + (selectedText || 'moved').substring(0, 70) + '" raw=' + (navRaw ? navRaw.length : 0) + 'B');
         }
 
         if (!selectedText) selectedText = await readCurrentSelection('after deterministic');
-        if (textMatchesTarget(selectedText, targetPrefix)) {
+        const deterministicSelection = await readRendererSelection('after deterministic commit-position');
+        if (deterministicSelection.targetBeforeSelected) {
           found = true;
         } else {
-          console.warn('[Claude:Rewind] Deterministic selection mismatch; scanning by text. selected="' + (selectedText || 'null').substring(0, 100) + '" target="' + targetPrefix + '"');
-          found = await scanDownForTarget(maxPresses, skipDuplicates, 'fallback-after-deterministic');
+          console.warn('[Claude:Rewind] Deterministic commit-position mismatch; scanning by text. selected="' + (deterministicSelection.selectedText || selectedText || 'null').substring(0, 100) + '" previous="' + (deterministicSelection.previousItemText || '').substring(0, 100) + '" target="' + targetPrefix + '"');
+          found = await scanForTarget('\x1b[A', 'UP', maxPresses, skipDuplicates, 'fallback-after-deterministic');
         }
       } else {
-        found = await scanDownForTarget(maxPresses, skipDuplicates, 'fallback');
+        found = await scanForTarget('\x1b[A', 'UP', maxPresses, skipDuplicates, 'fallback');
       }
 
       if (!found) {
@@ -9063,6 +9392,28 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
         const grabResult = await grabRestoredRewindInput(targetInputText);
         if (!grabResult || grabResult.success === false) {
           console.warn('[Claude:Rewind] Could not verify terminal input clear after native rewind: ' + (grabResult?.error || 'unknown'));
+          return {
+            success: false,
+            error: grabResult?.error || 'claude_rewind_restored_input_grab_failed',
+            rollbackMayHaveApplied: true,
+            pressCount,
+          };
+        }
+        if (!grabResult.matchedTarget) {
+          console.error('[Claude:Rewind] Restored input mismatch after confirmed selection; refusing success. expectedHash='
+            + pasteAuditHash(targetInputText)
+            + ' actualHash=' + pasteAuditHash(grabResult.text || '')
+            + ' expectedHead="' + pasteAuditPreview(targetInputText) + '"'
+            + ' actualHead="' + pasteAuditPreview(grabResult.text || '') + '"');
+          return {
+            success: false,
+            error: grabResult.empty ? 'claude_rewind_restored_input_empty' : 'claude_rewind_restored_input_mismatch',
+            rollbackMayHaveApplied: true,
+            pressCount,
+            grabbedChars: grabResult.text ? grabResult.text.length : 0,
+            targetHash: pasteAuditHash(targetInputText),
+            grabbedHash: pasteAuditHash(grabResult.text || ''),
+          };
         } else {
           console.log('[Claude:Rewind] Terminal input grabbed+cleared chars=' + (grabResult.text ? grabResult.text.length : 0)
             + ' matchedTarget=' + grabResult.matchedTarget
@@ -9073,9 +9424,15 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       return { success: true, found, targetIndex, pressCount, restoredInput: false, historyInputDraft: !pasteAfter && !!targetInputText };
     });
   } catch (err) {
+    if (err?.code === 'rewind_cancelled') {
+      try { term.write('\x1b'); } catch {}
+      return { success: false, cancelled: true, error: 'rewind_cancelled', stage: err.stage };
+    }
     console.log('[Claude:Rewind] Error:', err.message);
     try { term.write('\x1b'); } catch {}
     return { success: false, error: err.message };
+  } finally {
+    rewindCancelTabs.delete(tabId);
   }
 });
 
@@ -9097,6 +9454,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
 }) => {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no_terminal' };
+  rewindCancelTabs.delete(tabId);
 
   const candidates = await findAiDescendantProcessesByTab(tabId, 'codex');
   if (candidates.length === 0) {
@@ -9175,6 +9533,13 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       || /Context\s+\d+%/i.test(clean)
       || /›\s*/.test(clean)
       || /No previous message to edit/i.test(clean);
+  }
+
+  function throwIfCodexRewindCancelled(stage) {
+    if (rewindCancelTabs.has(tabId)) {
+      console.log('[Codex:Rewind] Cancelled at stage=' + stage);
+      throw makeRewindCancelledError(stage);
+    }
   }
 
   async function grabRestoredCodexRewindInput(expectedText) {
@@ -9335,6 +9700,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         + ' rollbackTurns=' + rollbackTurns
         + ' target=' + JSON.stringify(String(targetText || targetInputText).slice(0, 80)));
 
+      throwIfCodexRewindCancelled('before-prime');
       let primeFrame = await sendCodexKeyAndCapture(
         term,
         '\x1b',
@@ -9413,6 +9779,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       if (selectedOlderSteps === null && maxOlderSteps > 0) {
         console.log('[Codex:Rewind] Navigating older with Left Arrow search max=' + maxOlderSteps + ' planned=' + olderSteps);
         for (let step = 1; step <= maxOlderSteps; step++) {
+          throwIfCodexRewindCancelled('nav-left#' + step);
           const navFrame = await sendCodexKeyAndCapture(
             term,
             '\x1b[D',
@@ -9482,6 +9849,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         + ' anchor=' + JSON.stringify(selectedMatch.anchor.slice(0, 120)));
 
       console.log('[Codex:Rewind] Confirming backtrack with Enter');
+      throwIfCodexRewindCancelled('before-confirm');
       const targetNeedle = normalizeCandidate(targetInputText).slice(0, 40);
       const confirmFrame = await sendCodexKeyAndCapture(
         term,
@@ -9652,9 +10020,15 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       };
     });
   } catch (err) {
+    if (err?.code === 'rewind_cancelled') {
+      try { term.write(codexRewindOverlayOpen ? 'q' : '\x1b'); } catch {}
+      return { success: false, cancelled: true, error: 'rewind_cancelled', stage: err.stage, rollbackMayHaveApplied: false };
+    }
     console.log('[Codex:Rewind] Error:', err?.message || String(err));
     try { term.write(codexRewindOverlayOpen ? 'q' : '\x1b'); } catch {}
     return { success: false, error: err?.message || String(err) };
+  } finally {
+    rewindCancelTabs.delete(tabId);
   }
 });
 
@@ -9746,6 +10120,7 @@ ipcMain.on('terminal:kill', async (event, tabId) => {
   clearTimeout(codexFinishDebounceTimers.get(tabId));
   codexFinishDebounceTimers.delete(tabId);
   clearCodexKnownSession(tabId, 'terminal-kill');
+  clearCodexTuiReady(tabId, 'terminal-kill');
   geminiActiveTabs.delete(tabId);
   geminiInputCharCount.delete(tabId);
   closeCodexWatcher(tabId, 'terminal-kill');
@@ -11800,6 +12175,7 @@ async function stopAiProcessInTab(tabId) {
   const stopBusyState = () => {
     if (processName === 'codex') {
       clearCodexKnownSession(tabId, 'manual-stop');
+      clearCodexTuiReady(tabId, 'manual-stop');
       closeCodexTurnWatcher(tabId, 'manual-stop');
       emitCodexBusy(tabId, false, 'manual-stop');
       return;
@@ -12486,6 +12862,7 @@ const geminiWatchers = new Map();
 const codexWatchers = new Map();
 const codexTurnWatchers = new Map();
 const codexPickerQueue = new Map();
+const codexTuiReadyProcessProbeTabs = new Set();
 const CODEX_WATCHER_TTL_MS = 10 * 60 * 1000;
 const CODEX_WATCHER_SCAN_MS = 1000;
 const CODEX_TURN_CATCHUP_BYTES = 8 * 1024 * 1024;
@@ -12497,6 +12874,67 @@ const CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT = 20 * 1024;
 // Parser order matters: `xhigh` renders as "Extra high", so it must be matched
 // before plain `high` or the effort picker selects the wrong row.
 const CODEX_PICKER_EFFORT_CANDIDATES = ['minimal', 'low', 'medium', 'xhigh', 'high'];
+
+function clearCodexTuiReady(tabId, reason = 'clear') {
+  if (!tabId) return;
+  const hadReady = codexTuiReadyTabs.delete(tabId);
+  codexTuiReadyBuffers.delete(tabId);
+  if (hadReady) {
+    console.log('[CodexTuiReady] clear tab=' + String(tabId).slice(-12) + ' reason=' + reason);
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('codex:tui-not-ready', { tabId, reason });
+  }
+}
+
+function isCodexInputReadyFrame(clean, raw) {
+  const text = String(clean || '').replace(/\u00a0/g, ' ');
+  const compact = text.replace(/\s+/g, ' ').trim();
+  if (!compact) return false;
+  if (isCodexTrustDirectoryPrompt(text)) return false;
+  if (inspectCodexCwdChooser(text).visible) return false;
+
+  const hasSynchronizedFrame = String(raw || '').includes(CODEX_SYNC_MARKER);
+  if (!hasSynchronizedFrame) return false;
+
+  const hasCodexUiText = /OpenAI Codex|Use \/skills|Full Access|esc to interrupt|Find and fix a bug|Explain this codebase|Ask Codex|Context \d+%|directory:\s*|permissions:\s*/i.test(text);
+  const hasComposerFrame = /[╭╰│]/.test(text) && hasCodexUiText;
+  return hasComposerFrame;
+}
+
+async function tryEmitCodexTuiReady(tabId, data) {
+  if (!tabId || codexTuiReadyTabs.has(tabId)) return;
+  const prev = codexTuiReadyBuffers.get(tabId) || '';
+  let raw = prev + String(data || '');
+  if (raw.length > CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT) {
+    raw = raw.slice(-CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT);
+  }
+  codexTuiReadyBuffers.set(tabId, raw);
+  const clean = cleanCodexTuiFrame(raw);
+  if (!isCodexInputReadyFrame(clean, raw)) return;
+  if (codexTuiReadyProcessProbeTabs.has(tabId)) return;
+  codexTuiReadyProcessProbeTabs.add(tabId);
+  let matches = [];
+  try {
+    matches = await findAiDescendantProcessesByTab(tabId, 'codex');
+  } finally {
+    codexTuiReadyProcessProbeTabs.delete(tabId);
+  }
+  if (codexTuiReadyTabs.has(tabId)) return;
+  if (matches.length === 0) {
+    console.log('[CodexTuiReady] text-ready but no live codex process tab=' + String(tabId).slice(-12));
+    return;
+  }
+
+  codexTuiReadyTabs.add(tabId);
+  codexTuiReadyBuffers.delete(tabId);
+  const preview = clean.replace(/\s+/g, ' ').trim().slice(0, 220);
+  console.log('[CodexTuiReady] tab=' + String(tabId).slice(-12) + ' input ready pids=' + matches.map(m => m.pid).join(',') + ' preview=' + JSON.stringify(preview));
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('codex:tui-ready', { tabId, ts: Date.now() });
+  }
+  ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'codex' });
+}
 
 function closeCodexWatcher(tabId, reason = 'close') {
   const state = codexWatchers.get(tabId);
@@ -12599,6 +13037,24 @@ ipcMain.handle('codex:get-turn-state', async (_event, tabId) => {
     lastEventType: state.lastEventType || null,
     lastEventTs: state.lastEventTs || null,
     liveTurnEvents: state.liveTurnEvents || 0,
+  };
+});
+
+ipcMain.handle('codex:get-tui-ready', async (_event, tabId) => {
+  const textReady = !!codexTuiReadyTabs.has(tabId);
+  let processReady = false;
+  if (textReady) {
+    try {
+      processReady = (await findAiDescendantProcessesByTab(tabId, 'codex')).length > 0;
+    } catch {
+      processReady = false;
+    }
+  }
+  return {
+    success: true,
+    inputReady: textReady && processReady,
+    textReady,
+    processReady,
   };
 });
 
@@ -12886,6 +13342,11 @@ function processCodexTurnLine(state, line) {
     state.busy = false;
     console.log('[CodexTurn] event tab=' + String(state.tabId).slice(-12) + ' session=' + state.sessionId + ' event=' + event + ' ts=' + (record.timestamp || 'n/a'));
     emitCodexBusy(state.tabId, false, event);
+    _webBroadcast(state.tabId, {
+      type: 'done',
+      sessionId: state.sessionId || codexKnownSessions.get(state.tabId) || null,
+      reason: event,
+    });
   }
 }
 
@@ -12962,6 +13423,13 @@ async function catchUpCodexTurnState(tabId, filePath, fileSize) {
     if (state.busy !== inferred.busy) {
       state.busy = inferred.busy;
       emitCodexBusy(tabId, inferred.busy, 'catch-up-' + inferred.event);
+    }
+    if (!inferred.busy) {
+      _webBroadcast(tabId, {
+        type: 'done',
+        sessionId: state.sessionId || codexKnownSessions.get(tabId) || null,
+        reason: 'catch-up-' + inferred.event,
+      });
     }
   } catch (e) {
     console.warn('[CodexTurn] catch-up failed tab=' + String(tabId).slice(-12) + ' file=' + filePath + ' error=' + (e?.message || String(e)));
@@ -13214,10 +13682,43 @@ function readDefaultCodexSetting(key) {
   }
 }
 
-function buildCodexCommand({ command, sessionId, model, effort }) {
+function tomlString(value) {
+  return JSON.stringify(String(value || ''));
+}
+
+function codexHomeDir() {
+  return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+}
+
+function codexProfileNameForTab(tabId) {
+  const digest = crypto.createHash('sha1').update(String(tabId || 'tab')).digest('hex').slice(0, 12);
+  return 'noted-terminal-' + digest;
+}
+
+async function writeCodexDeveloperInstructionsProfile(tabId, developerInstructions) {
+  const text = String(developerInstructions || '').trim();
+  if (!text) return null;
+  const profileName = codexProfileNameForTab(tabId);
+  const filePath = path.join(codexHomeDir(), profileName + '.config.toml');
+  const content = [
+    '# Auto-generated by Noted Terminal. Do not edit by hand.',
+    '# This profile is per PTY tab and only carries wrapper developer instructions.',
+    'developer_instructions = ' + tomlString(text),
+    '',
+  ].join('\n');
+  await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.promises.writeFile(filePath, content, 'utf8');
+  return profileName;
+}
+
+function buildCodexCommand({ command, sessionId, model, effort, developerInstructions, profile }) {
   const parts = ['command', 'codex', '--no-alt-screen', '--dangerously-bypass-approvals-and-sandbox'];
+  if (profile) parts.push('--profile', shellQuote(profile));
   if (model) parts.push('--model', shellQuote(model));
   if (effort) parts.push('-c', shellQuote('model_reasoning_effort="' + effort + '"'));
+  if (developerInstructions && String(developerInstructions).trim()) {
+    parts.push('-c', shellQuote('developer_instructions=' + tomlString(String(developerInstructions).trim())));
+  }
   if (command === 'codex-c' && sessionId) parts.push('resume', shellQuote(sessionId));
   if (command === 'codex-f' && sessionId) parts.push('fork', shellQuote(sessionId));
   return parts.join(' ');
@@ -14328,7 +14829,7 @@ ipcMain.on('codex:close-watcher', (_event, { tabId }) => {
   closeCodexWatcher(tabId);
 });
 
-ipcMain.on('codex:run-command', (event, { tabId, command, sessionId, cwd, model, effort }) => {
+ipcMain.on('codex:run-command', async (event, { tabId, command, sessionId, cwd, model, effort, developerInstructions }) => {
   const term = terminals.get(tabId);
   if (!term) {
     console.error('[Codex Runner] Terminal not found:', tabId);
@@ -14339,8 +14840,9 @@ ipcMain.on('codex:run-command', (event, { tabId, command, sessionId, cwd, model,
   const startedAt = Date.now();
   const effectiveModel = model || readDefaultCodexSetting('defaultCodexModel');
   const effectiveEffort = effort || readDefaultCodexSetting('defaultCodexEffort');
-  console.log('[Codex Runner] Command:', command, 'tab:', tabId, 'session:', sessionId || 'new', 'cwd:', termCwd, 'model:', effectiveModel || 'default', 'effort:', effectiveEffort || 'default');
+  console.log('[Codex Runner] Command:', command, 'tab:', tabId, 'session:', sessionId || 'new', 'cwd:', termCwd, 'model:', effectiveModel || 'default', 'effort:', effectiveEffort || 'default', 'developerInstructionsChars:', developerInstructions ? String(developerInstructions).length : 0);
 
+  clearCodexTuiReady(tabId, 'run-command');
   armCodexStartupAutoEnter(tabId, { command: command || 'codex', sessionId, cwd: termCwd });
 
   if (command === 'codex-c' && sessionId) {
@@ -14355,11 +14857,20 @@ ipcMain.on('codex:run-command', (event, { tabId, command, sessionId, cwd, model,
     startCodexSessionWatcher(event.sender, { tabId, cwd: termCwd, startedAt });
   }
 
+  let profile = null;
+  try {
+    profile = await writeCodexDeveloperInstructionsProfile(tabId, developerInstructions);
+  } catch (err) {
+    console.warn('[Codex Runner] failed to write developer profile tab=' + String(tabId).slice(-12) + ' ' + (err?.message || String(err)));
+  }
+
   const cmdLine = buildCodexCommand({
     command: command || 'codex',
     sessionId,
     model: effectiveModel,
     effort: effectiveEffort,
+    developerInstructions: profile ? '' : developerInstructions,
+    profile,
   });
   term.write(cmdLine + '\r');
 });
@@ -15274,7 +15785,11 @@ function loadGlobalMcpServers() {
 // Best-effort handle to web-server (lazy require — survives if module missing).
 // Same path resolution as the startup load — must use srcMainDir, not relative.
 function _webBroadcast(tabId, payload) {
-  try { require(path.join(srcMainDir, 'web-server')).webBroadcast(tabId, payload); } catch {}
+  try {
+    require(path.join(srcMainDir, 'web-server')).webBroadcast(tabId, payload);
+  } catch (err) {
+    console.warn('[WebBcast:MainError] tab=' + String(tabId || '').slice(-12) + ' type=' + (payload?.type || '-') + ' error=' + (err?.message || String(err)));
+  }
   const type = payload && payload.type;
   if (type === 'busy' || type === 'done' || type === 'snapshot') {
     scheduleProjectActivityBroadcast('tab-' + type);

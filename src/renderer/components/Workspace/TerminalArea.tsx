@@ -13,6 +13,80 @@ const { ipcRenderer } = window.require('electron');
 
 type InterruptedEngine = 'claude' | 'codex';
 
+type ExternalRunMeta = {
+  runId?: string;
+  provider?: string;
+  source?: string;
+  conversationKey?: string;
+  status?: string;
+  startedAt?: number;
+  completedAt?: number;
+  autoStopAt?: number | null;
+  autoStopMs?: number | null;
+  sessionId?: string | null;
+};
+
+const statusColor = (status?: string) => {
+  if (status === 'running' || status === 'sending' || status === 'starting') return '#d97706';
+  if (status === 'done' || status === 'idle') return '#22c55e';
+  if (status === 'stopped') return '#94a3b8';
+  if (status && status.includes('fail')) return '#ef4444';
+  return '#8b5cf6';
+};
+
+const formatTtl = (target?: number | null) => {
+  if (!target) return '';
+  const left = Math.max(0, Math.ceil((target - Date.now()) / 1000));
+  const m = Math.floor(left / 60);
+  const s = left % 60;
+  return m > 0 ? `${m}:${String(s).padStart(2, '0')}` : `${s}s`;
+};
+
+const ExternalRunBadge = memo(({ meta }: { meta: ExternalRunMeta }) => {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!meta.autoStopAt) return;
+    const id = window.setInterval(() => setTick((v) => v + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [meta.autoStopAt]);
+  const ttl = formatTtl(meta.autoStopAt);
+  const provider = (meta.provider || 'agent').toUpperCase();
+  const source = meta.source || 'external';
+  const status = meta.status || 'starting';
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        left: 12,
+        top: 10,
+        zIndex: 18,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        maxWidth: 'min(520px, calc(100% - 24px))',
+        padding: '6px 9px',
+        borderRadius: 8,
+        border: '1px solid rgba(255,255,255,0.12)',
+        background: 'rgba(10,10,14,0.78)',
+        boxShadow: '0 10px 24px rgba(0,0,0,0.32)',
+        color: '#e5e7eb',
+        fontSize: 11,
+        lineHeight: '14px',
+        pointerEvents: 'none',
+        backdropFilter: 'blur(10px)',
+        fontVariantNumeric: 'tabular-nums',
+      }}
+      title={[provider, source, meta.conversationKey, status].filter(Boolean).join(' · ')}
+    >
+      <span style={{ width: 7, height: 7, borderRadius: 999, background: statusColor(status), boxShadow: `0 0 12px ${statusColor(status)}` }} />
+      <span style={{ fontWeight: 750, letterSpacing: 0 }}>{provider}</span>
+      <span style={{ color: '#9ca3af', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 180 }}>{source}</span>
+      <span style={{ color: '#cbd5e1' }}>{status}</span>
+      {ttl && <span style={{ color: '#fbbf24' }}>ttl {ttl}</span>}
+    </div>
+  );
+});
+
 // Overlay for interrupted AI sessions
 const InterruptedSessionOverlay = memo(({ tabId, sessionId, engine, onContinue, onDismiss }: {
   tabId: string;
@@ -149,6 +223,11 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   const clearInterruptedState = useWorkspaceStore((state) => state.clearInterruptedState);
   const currentView = useWorkspaceStore((s) => s.openProjects.get(projectId)?.currentView || 'terminal');
   const activeTabId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.activeTabId ?? null);
+  const activeExternalRun = useWorkspaceStore((s) => {
+    const ws = s.openProjects.get(projectId);
+    if (!ws?.activeTabId) return null;
+    return ((ws.tabs.get(ws.activeTabId) as any)?.externalRun || null) as ExternalRunMeta | null;
+  });
 
   // DEBUG: Track render reason
   const renderCountRef = useRef(0);
@@ -370,6 +449,10 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     >
       {/* Render all terminals from all projects */}
       {terminals}
+
+      {currentView === 'terminal' && activeExternalRun && (
+        <ExternalRunBadge meta={activeExternalRun} />
+      )}
 
       {/* Orange border overlay when viewing sub-agent */}
       {isSubAgentVisible && (

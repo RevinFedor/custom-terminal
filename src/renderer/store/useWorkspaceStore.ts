@@ -314,6 +314,7 @@ export interface PendingAction {
   type: 'claude-fork' | 'claude-continue' | 'claude-new' | 'gemini-fork' | 'gemini-continue' | 'gemini-new' | 'codex-fork' | 'codex-continue' | 'codex-new' | 'shell-command';
   sessionId?: string;    // For AI fork/continue actions
   command?: string;      // For shell-command
+  developerInstructions?: string; // Codex external-run launch config
 }
 
 interface Tab {
@@ -338,6 +339,18 @@ interface Tab {
   codexSessionId?: string; // Active Codex CLI session ID (detected from ~/.codex/sessions JSONL)
   codexModel?: string; // Per-tab Codex model selection for ControlBar launches
   codexEffort?: string; // Per-tab Codex reasoning effort selection for ControlBar launches
+  externalRun?: {
+    runId?: string;
+    provider?: 'codex' | 'claude' | 'gemini' | string;
+    source?: string;
+    conversationKey?: string;
+    status?: string;
+    startedAt?: number;
+    completedAt?: number;
+    autoStopAt?: number | null;
+    autoStopMs?: number | null;
+    sessionId?: string | null;
+  };
   pendingAction?: PendingAction; // Action to execute when terminal is ready
   wasInterrupted?: boolean; // True if tab was closed with active AI session (show resume overlay)
   overlayDismissed?: boolean; // True if user dismissed the interrupted overlay (don't show again)
@@ -589,7 +602,7 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; filePath?: string; background?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; filePath?: string; background?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
   createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; filePath?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean; completionNotificationPersistent?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean }) => Promise<boolean>;
   reopenLastClosedTab: (projectId: string) => Promise<{ tabId: string | null; reason?: 'empty' | 'error' }>;
@@ -1509,6 +1522,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       codexSessionId: options?.codexSessionId,
       codexModel: options?.codexModel,
       codexEffort: options?.codexEffort,
+      externalRun: options?.externalRun,
       wasInterrupted: options?.wasInterrupted,
       overlayDismissed: options?.overlayDismissed,
       notes: options?.notes,

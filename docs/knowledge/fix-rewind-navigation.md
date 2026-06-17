@@ -9,6 +9,12 @@
 
 Этот файл описывает safety/fallback-логику навигации, а не основной путь Timeline Rewind. Текущий default action в Timeline отправляет Claude slash-команду `/rewind`, выбирает target в родном picker'е, затем переносит восстановленный prompt из terminal composer в History textarea через тот же `grab-input` path, которым пользуется `+ clear`; terminal composer после этого должен остаться пустым. AI compact-варианты включаются только отдельными кнопками. Visual Search Strategy ниже остаётся защитой для ситуаций, когда позиционное сопоставление меню не сработало, но не должна снова становиться primary-моделью и не должна автоматически нажимать Enter при не найденной цели.
 
+## Claude native `/rewind`: slash-команды в picker и малый viewport
+
+Открытый шрам 2026-06-17: Claude native picker показывает не только user prompts, но и slash-command wrappers из TUI/JSONL (`/effort max`, `/model ...`). Наш Timeline эти записи скрывает tag-filter'ом, поэтому `rewindableCount`/`targetIndex` из Timeline не обязаны совпадать с числом строк в picker. На маленькой высоте терминала picker может показывать только несколько строк и строку `↑ N more above`; пользовательский симптом — после запуска обычного Rewind виден список почти из одних `/effort max`, target prompt не попадает в видимый фрейм, автоматика уходит в самый верх и висит.
+
+Нельзя чинить это сменой формулы направления по чтению кода. Перед любым `Enter` должен быть доказательный лог текущего picker-frame: нормализованные видимые строки, какая строка выделена (`RGB`/`❯`), `more above/below`, нажатая клавиша, `targetPrefix`, `skipDuplicates`, и результат match. Если текущие логи не доказывают, почему выбранная строка не target, следующий шаг — добавить такие логи или прогнать воспроизводимый тест, а не менять `ArrowUp/ArrowDown` эвристику. До доказанного совпадения target операция обязана закрыть picker через `Escape` и вернуть failure; успешный UI-state без подтверждённой выбранной строки снова превращает старый баг в «откат в начало истории».
+
 ## Codex native backtrack: prime first, grab only as verification
 
 Codex откатывается не через `/rewind`, а через native backtrack: первый `Escape` должен показать hint `esc again to edit previous message`, второй `Escape` открывает transcript overlay, дальше к старым prompt'ам двигается `←` (footer Codex прямо пишет `esc/← to edit prev`, но для автоматики после открытия overlay безопаснее считать `Escape` не cancel-клавишей, а соседним жестом редактирования). Выход из открытого overlay без выбора — `q`, не `Escape`. Не переносить сюда Claude/Gemini slash-command модель и не начинать с `Ctrl+G` как preflight. External-editor grab до первого prime-кадра сам меняет composer/TUI state и маскирует root cause: потом в логах видно только `codex_rewind_prime_hint_not_observed`, хотя реальная проблема в том что backtrack даже не был корректно открыт.
@@ -29,7 +35,7 @@ Codex откатывается не через `/rewind`, а через native b
 
 Финальный контракт для `codex-rewind-ai`: использовать TUI-safe `safePasteAndSubmit(..., fast:false)`, то есть одна complete bracketed paste, ожидание sync/render marker после закрывающего `\x1b[201~`, короткий drain и только потом Enter. Перед Enter staging `CodexPasteAudit` обязателен: следующая запись rollout `event_msg.user_message` должна совпасть по длине/hash с Gemini result. Если audit показывает mismatch, сначала чинить paste/composer path; Gemini prompt и формат summary здесь вторичны.
 
-Архитектурная граница: это всё ещё PTY fallback. Если Rewind AI начнёт требовать больше structured control над Codex thread'ом, правильный путь — перейти на `codex app-server` и его `thread/rollback` + `turn/start`, а не наращивать эвристики вокруг TUI paste.
+Архитектурная граница: это всё ещё PTY fallback. `codex app-server` и его `thread/rollback` + `turn/start` существуют, но для текущей архитектуры Noted Terminal это нежелательный внешний experimental control-plane, не наша локальная JSONL/PTY-модель. Не переводить Rewind/Edit на app-server без явного разрешения пользователя: middle-history действия должны оставаться локальными (rollout JSONL + TUI-safe paste/backtrack) до отдельного архитектурного решения.
 
 ## Проблема
 Изначально использовалась формула: `Steps = CurrentCursor - TargetIndex`.
