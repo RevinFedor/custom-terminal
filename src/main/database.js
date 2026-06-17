@@ -3,6 +3,10 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { app } = require('electron');
+const INBOX_PROJECT_ID = '__noted_inbox__';
+const INBOX_PROJECT_NAME = 'Inbox';
+const INBOX_PROJECT_DESCRIPTION = 'System workspace for API-created and unassigned agent tabs.';
+const getInboxProjectPath = () => process.env.NOTED_INBOX_CWD || process.env.HOME || os.homedir() || '/';
 
 class DatabaseManager {
   constructor() {
@@ -16,6 +20,7 @@ class DatabaseManager {
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
     this.initTables();
+    this.ensureInboxProject();
     this.createDefaultPrompts();
     this.seedDefaultAIPrompts();
     this.ensureRewindPrompt();
@@ -591,6 +596,38 @@ class DatabaseManager {
 
   // ========== PROJECTS ========== 
 
+  ensureInboxProject() {
+    const inboxPath = getInboxProjectPath();
+    const existing = this.db.prepare('SELECT id, path, name, description FROM projects WHERE id = ?').get(INBOX_PROJECT_ID);
+
+    if (!existing) {
+      this.db.prepare(`
+        INSERT INTO projects (id, path, name, description, gemini_prompt, notes_global)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        INBOX_PROJECT_ID,
+        inboxPath,
+        INBOX_PROJECT_NAME,
+        INBOX_PROJECT_DESCRIPTION,
+        'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ',
+        `<h1>${INBOX_PROJECT_NAME}</h1>`
+      );
+      return;
+    }
+
+    if (
+      existing.path !== inboxPath ||
+      existing.name !== INBOX_PROJECT_NAME ||
+      existing.description !== INBOX_PROJECT_DESCRIPTION
+    ) {
+      this.db.prepare(`
+        UPDATE projects
+        SET path = ?, name = ?, description = ?
+        WHERE id = ?
+      `).run(inboxPath, INBOX_PROJECT_NAME, INBOX_PROJECT_DESCRIPTION, INBOX_PROJECT_ID);
+    }
+  }
+
   // Legacy helper - should be avoided in favor of getProjectById
   getProject(projectPath) {
     const normalizedPath = path.resolve(projectPath);
@@ -955,10 +992,16 @@ class DatabaseManager {
       // Step 4: Clean up tabs that exist in DB but NOT in the new set
       // Safety: only do this if tab count is stable (not losing more than 2 tabs)
       // forceCleanup bypasses the guard for intentional batch operations (moveTabsToProject, batch close)
-      if (newTabIds.length > 0 && (forceCleanup || newCount >= existingCount - 2)) {
+      if (newTabIds.length === 0) {
+        if (newCount === 0 && forceCleanup) {
+          this.db.prepare('DELETE FROM tabs WHERE project_id = ?').run(projectId);
+        } else if (existingCount > 0) {
+          console.error('[DB] saveTabs: SKIPPING empty cleanup — empty tab set without forceCleanup for project ' + projectId);
+        }
+      } else if (forceCleanup || newCount >= existingCount - 2) {
         const placeholders = newTabIds.map(() => '?').join(',');
         this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id IS NOT NULL AND tab_id NOT IN (' + placeholders + ')').run(projectId, ...newTabIds);
-      } else if (newTabIds.length > 0 && newCount < existingCount - 2) {
+      } else if (newCount < existingCount - 2) {
         console.error('[DB] saveTabs: SKIPPING cleanup — new set (' + newCount + ') is much smaller than DB (' + existingCount + '). Orphan tabs preserved to prevent data loss.');
       }
     });

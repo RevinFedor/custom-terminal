@@ -3,6 +3,7 @@ import { startTransition } from 'react';
 import { log } from '../utils/logger';
 import { setPrefetched } from '../utils/sdkHistoryPrefetch';
 import { usePromptQueueStore } from './usePromptQueueStore';
+import { getInboxProjectPath, isInboxProjectId } from '../constants/systemProjects';
 
 const { ipcRenderer } = window.require('electron');
 let tabGroupSaveSeq = 0;
@@ -584,7 +585,7 @@ interface WorkspaceStore {
   showWorkspace: (projectId: string) => void;
 
   // Project management
-  openProject: (projectId: string, projectPath: string, options?: { background?: boolean; draft?: boolean }) => void;
+  openProject: (projectId: string, projectPath: string, options?: { background?: boolean; draft?: boolean }) => Promise<void>;
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
@@ -944,6 +945,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           ` path=${proj.projectPath || 'unset'}` +
           ` activeIndex=${proj.activeTabIndex}`
         );
+        const isInbox = isInboxProjectId(proj.projectId);
         const projectData = await ipcRenderer.invoke('project:getById', proj.projectId);
         const savedTabs = projectData?.tabs || [];
         console.warn(
@@ -956,7 +958,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
         const newWorkspace: ProjectWorkspace = {
           projectId: proj.projectId,
-          projectPath: proj.projectPath,
+          projectPath: isInbox ? getInboxProjectPath() : proj.projectPath,
           tabs: new Map(),
           tabGroups: projectData?.tabGroups || [],
           activeTabId: null,
@@ -964,10 +966,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           selectedTabIds: [],
           tabHistory: [],
           tabCounter: 0,
-          sidebarOpen: projectData?.sidebarOpen || false,
-          openFilePath: projectData?.openFilePath || null,
-          sidebarExpandedDirs: projectData?.sidebarExpandedDirs || null,
-          currentView: 'terminal',
+          sidebarOpen: isInbox ? false : (projectData?.sidebarOpen || false),
+          openFilePath: isInbox ? null : (projectData?.openFilePath || null),
+          sidebarExpandedDirs: isInbox ? null : (projectData?.sidebarExpandedDirs || null),
+          currentView: isInbox && savedTabs.length === 0 ? 'home' : 'terminal',
           viewingSubAgentTabId: null
         };
         openProjects.set(proj.projectId, newWorkspace);
@@ -1044,7 +1046,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               ` stateWorkspaceTabs=${stateWorkspace?.tabs.size ?? -1}`
             );
           }
-        } else {
+        } else if (!isInbox) {
           console.warn(`[RestoreSession] noSavedTabs project=${restoreShortId(proj.projectId)} creatingDefault=true`);
           const createdTabId = await createTab(proj.projectId, 'Terminal 1', proj.projectPath);
           console.warn(
@@ -1052,6 +1054,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             ` returned=${restoreShortId(createdTabId)}` +
             ` workspaceTabs=${newWorkspace.tabs.size}`
           );
+        } else {
+          console.warn(`[RestoreSession] noSavedTabs project=${restoreShortId(proj.projectId)} inboxEmpty=true`);
         }
 
         // Set active tab by saved index
@@ -1246,9 +1250,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   openProject: async (projectId, projectPath, options) => {
+    const isInbox = isInboxProjectId(projectId);
     const background = options?.background ?? false;
     const draft = options?.draft ?? false;
-    console.log('[Store] openProject called:', { projectId, projectPath, background, draft });
+    const effectiveProjectPath = isInbox ? getInboxProjectPath() : projectPath;
+    console.log('[Store] openProject called:', { projectId, projectPath: effectiveProjectPath, background, draft });
     const { openProjects, createTab, saveSession, projectHistory } = get();
 
     // Update history
@@ -1265,7 +1271,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
       const newWorkspace: ProjectWorkspace = {
         projectId,
-        projectPath,
+        projectPath: effectiveProjectPath,
         tabs: new Map(),
         tabGroups: projectData?.tabGroups || [],
         activeTabId: null,
@@ -1273,10 +1279,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         selectedTabIds: [],
         tabHistory: [],
         tabCounter: 0, // Start from 0 for new projects
-        sidebarOpen: projectData?.sidebarOpen || false,
-        openFilePath: projectData?.openFilePath || null,
-        sidebarExpandedDirs: projectData?.sidebarExpandedDirs || null,
-        currentView: draft ? 'home' : 'terminal',
+        sidebarOpen: isInbox ? false : (projectData?.sidebarOpen || false),
+        openFilePath: isInbox ? null : (projectData?.openFilePath || null),
+        sidebarExpandedDirs: isInbox ? null : (projectData?.sidebarExpandedDirs || null),
+        currentView: draft || isInbox ? 'home' : 'terminal',
         viewingSubAgentTabId: null
       };
       openProjects.set(projectId, newWorkspace);
@@ -1325,9 +1331,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               restoreId: savedTab.tabId
             } as any);
           }
-        } else {
+        } else if (!isInbox) {
           // Create default tab
-          await createTab(projectId, 'Terminal 1', projectPath);
+          await createTab(projectId, 'Terminal 1', effectiveProjectPath);
         }
       }
 
@@ -1380,6 +1386,18 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   closeProject: async (projectId) => {
+    if (isInboxProjectId(projectId)) {
+      const { openProjects, saveSession } = get();
+      const workspace = openProjects.get(projectId);
+      if (workspace) {
+        workspace.sidebarOpen = false;
+        workspace.openFilePath = null;
+        set({ openProjects: new Map(openProjects) });
+        saveSession();
+      }
+      return;
+    }
+
     const { openProjects, activeProjectId, view, saveSession, projectHistory } = get();
     const workspace = openProjects.get(projectId);
 
@@ -1925,8 +1943,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       set({ openProjects: new Map(openProjects) });
     });
 
-    // Save tabs (forceCleanup when called from batch close)
-    saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-closed', options?.forceCleanup);
+    // Save tabs (forceCleanup when called from batch close, and when the last
+    // tab is intentionally closed so SQLite removes the final persisted row).
+    saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-closed', options?.forceCleanup || workspace.tabs.size === 0);
     console.log('[CloseTab] state-updated tab=' + tabId.slice(-12) +
       ' remaining=' + workspace.tabs.size +
       ' active=' + (workspace.activeTabId ? workspace.activeTabId.slice(-12) : 'none') +
@@ -3395,9 +3414,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     // Create new Map with correct order
     const newOpenProjects = new Map<string, ProjectWorkspace>();
+    const orderedSet = new Set(orderedProjectIds);
     for (const projectId of orderedProjectIds) {
       const workspace = openProjects.get(projectId);
       if (workspace) {
+        newOpenProjects.set(projectId, workspace);
+      }
+    }
+    for (const [projectId, workspace] of openProjects) {
+      if (!orderedSet.has(projectId)) {
         newOpenProjects.set(projectId, workspace);
       }
     }

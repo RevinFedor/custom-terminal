@@ -887,13 +887,16 @@ export default function ClaudeControlBar({
     };
   };
 
-  const canOpenCodexPicker = (draftState: Awaited<ReturnType<typeof getCodexDraftStateForPicker>>) => {
+  const canOpenCodexPicker = (
+    draftState: Awaited<ReturnType<typeof getCodexDraftStateForPicker>>,
+    actionLabel = 'picker',
+  ) => {
     if (draftState.hasDraft === false) return true;
     if (draftState.hasDraft === true) {
-      console.warn('[CodexControlBar] picker will stash composer draft tab=' + tabId.slice(-12) + ' source=' + draftState.source + ' preview=' + JSON.stringify(draftState.preview));
+      console.warn('[CodexControlBar] ' + actionLabel + ' will stash composer draft tab=' + tabId.slice(-12) + ' source=' + draftState.source + ' preview=' + JSON.stringify(draftState.preview));
       return true;
     }
-    console.warn('[CodexControlBar] picker blocked because composer state is unknown tab=' + tabId.slice(-12) + ' source=' + draftState.source + ' preview=' + JSON.stringify(draftState.preview));
+    console.warn('[CodexControlBar] ' + actionLabel + ' blocked because composer state is unknown tab=' + tabId.slice(-12) + ' source=' + draftState.source + ' preview=' + JSON.stringify(draftState.preview));
     return false;
   };
 
@@ -1090,7 +1093,26 @@ export default function ClaudeControlBar({
     if (!beginControlAction(actionReason)) return;
     setLocalBusy(true, actionReason);
     try {
-      const result = await ipcRenderer.invoke('codex:send-command', tabId, '/fast');
+      const draftState = await getCodexDraftStateForPicker();
+      if (codexTurnBusy && draftState.hasDraft === true) {
+        console.warn('[CodexControlBar] /fast skipped tab=' + tabId.slice(-12) + ' reason=busy-draft-unsafe source=' + draftState.source + ' preview=' + JSON.stringify(draftState.preview) + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
+        return;
+      }
+      if (!canOpenCodexPicker(draftState, '/fast')) {
+        console.warn('[CodexControlBar] /fast skipped tab=' + tabId.slice(-12) + ' reason=unsafe-input:' + draftState.source + ' preview=' + JSON.stringify(draftState.preview));
+        return;
+      }
+      const result = await ipcRenderer.invoke('codex:send-live-slash-command', {
+        tabId,
+        command: '/fast',
+        hasDraft: draftState.hasDraft,
+        draftSource: draftState.source,
+        draftPreview: draftState.preview,
+        visualHasDraft: draftState.visualHasDraft,
+        visualSource: draftState.visualSource,
+        visualPreview: draftState.visualPreview,
+        turnBusy: codexTurnBusy,
+      });
       console.log('[CodexControlBar] /fast result tab=' + tabId.slice(-12) + ' result=' + JSON.stringify(result || null));
       if (result?.success === false) throw new Error(result?.error || 'Codex /fast failed');
     } catch (e: any) {

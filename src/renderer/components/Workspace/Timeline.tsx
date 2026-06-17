@@ -2897,18 +2897,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
     if (mode === 'edit') {
       // Edit-range works inside one local history representation. Claude can relink
-      // parentUuid; Codex uses a separate copy-on-write rollout rewrite and blocks
-      // compact markers because their encrypted compaction state is not editable.
+      // parentUuid; Codex uses a separate copy-on-write rollout rewrite.
       const rangeEntries = entries.slice(range.startIndex, range.endIndex + 1);
       const hasCompact = rangeEntries.some(e => e.type === 'compact');
       const hasContinued = rangeEntries.some(e => e.type === 'continued');
-      if (isCodex && hasCompact) {
-        useUIStore.getState().showToast(
-          'Codex Edit Range через compact пока недоступен',
-          'error', 3000
-        );
-        return;
-      }
       if (!isCodex && (hasCompact || hasContinued)) {
         useUIStore.getState().showToast(
           hasCompact
@@ -4953,11 +4945,19 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   return { removedCount: result.removedCount, removedUsers: result.removedUsers };
                 }
 
-                // Step 1: Exit Claude if command is running (same check as sidebar green border)
-                const cmdState = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+                // Step 1: Exit Claude only when a real Claude process is still running.
+                let waitForPromptReadyBeforeRestart = false;
+                const cmdState = await ipcRenderer.invoke('terminal:getCommandState', {
+                  tabId,
+                  caller: 'Timeline.claudeEditRange',
+                  expectedProcess: 'claude',
+                  allowProcessTreeLookup: true,
+                  ignoreBridgeAlive: true,
+                });
                 console.warn('[EditRange] commandState:', JSON.stringify(cmdState));
 
                 if (cmdState?.isRunning) {
+                  waitForPromptReadyBeforeRestart = true;
                   console.warn('[EditRange] Sending Ctrl+C #1, waiting for DangerZone...');
                   ipcRenderer.send('terminal:input', tabId, '\x03');
 
@@ -4984,7 +4984,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   // Wait for isRunning=false (OSC 133 D = command finished)
                   for (let i = 0; i < 30; i++) {
                     await new Promise(resolve => setTimeout(resolve, 300));
-                    const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+                    const state = await ipcRenderer.invoke('terminal:getCommandState', {
+                      tabId,
+                      caller: 'Timeline.claudeEditRange.exitPoll',
+                      expectedProcess: 'claude',
+                      allowProcessTreeLookup: true,
+                      ignoreBridgeAlive: true,
+                    });
                     if (!state?.isRunning) {
                       console.warn('[EditRange] Command finished (OSC 133 D)');
                       break;
@@ -4992,6 +4998,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     if (i === 29) console.warn('[EditRange] Exit timeout');
                   }
                   await new Promise(resolve => setTimeout(resolve, 300));
+                } else {
+                  console.warn('[EditRange] Claude already stopped; skipping Ctrl+C exit');
                 }
 
                 // Step 2: Edit JSONL
@@ -5009,23 +5017,27 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 // Save compactUuid so overlay can anchor to it after timeline refresh
                 setEditRangeState(prev => prev ? { ...prev, compactUuid: result.compactUuid } : null);
 
-                // Step 3: Wait for shell prompt (OSC 133 A) then restart Claude
-                console.warn('[EditRange] Waiting for prompt-ready...');
-                await new Promise<void>((resolve) => {
-                  const timeout = setTimeout(() => {
-                    console.warn('[EditRange] prompt-ready timeout, proceeding anyway');
-                    ipcRenderer.removeListener('terminal:prompt-ready', handler);
-                    resolve();
-                  }, 5000);
-                  const handler = (_e: any, readyTabId: string) => {
-                    if (readyTabId === tabId) {
-                      clearTimeout(timeout);
+                // Step 3: Wait for a fresh shell prompt only after we actually stopped Claude.
+                if (waitForPromptReadyBeforeRestart) {
+                  console.warn('[EditRange] Waiting for prompt-ready...');
+                  await new Promise<void>((resolve) => {
+                    const timeout = setTimeout(() => {
+                      console.warn('[EditRange] prompt-ready timeout, proceeding anyway');
                       ipcRenderer.removeListener('terminal:prompt-ready', handler);
                       resolve();
-                    }
-                  };
-                  ipcRenderer.on('terminal:prompt-ready', handler);
-                });
+                    }, 5000);
+                    const handler = (_e: any, readyTabId: string) => {
+                      if (readyTabId === tabId) {
+                        clearTimeout(timeout);
+                        ipcRenderer.removeListener('terminal:prompt-ready', handler);
+                        resolve();
+                      }
+                    };
+                    ipcRenderer.on('terminal:prompt-ready', handler);
+                  });
+                } else {
+                  console.warn('[EditRange] Claude was already stopped; skipping prompt-ready wait');
+                }
 
                 console.warn('[EditRange] Restarting Claude with session:', sessionId?.slice(0, 8));
                 ipcRenderer.send('claude:run-command', {
@@ -5037,7 +5049,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 // Wait for Claude to start (isRunning = true = command running = sidebar green)
                 for (let i = 0; i < 30; i++) {
                   await new Promise(resolve => setTimeout(resolve, 300));
-                  const state = await ipcRenderer.invoke('terminal:getCommandState', tabId);
+                  const state = await ipcRenderer.invoke('terminal:getCommandState', {
+                    tabId,
+                    caller: 'Timeline.claudeEditRange.startPoll',
+                    expectedProcess: 'claude',
+                    allowProcessTreeLookup: true,
+                    ignoreBridgeAlive: true,
+                  });
                   if (state?.isRunning) {
                     console.warn('[EditRange] Claude running (sidebar green)');
                     break;
@@ -5932,13 +5950,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                           const rangeEntries = entries.slice(range.startIndex, range.endIndex + 1);
                           const hasCompact = rangeEntries.some(en => en.type === 'compact');
                           const hasContinued = rangeEntries.some(en => en.type === 'continued');
-                          if (isCodex && hasCompact) {
-                            useUIStore.getState().showToast(
-                              'Codex Edit Range через compact пока недоступен',
-                              'error', 3000
-                            );
-                            return;
-                          }
                           if (!isCodex && (hasCompact || hasContinued)) {
                             useUIStore.getState().showToast(
                               hasCompact

@@ -5636,7 +5636,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         <div
           ref={contextMenuRef}
           data-tab-context-menu
-          className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px]"
+          className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl w-[240px] max-w-[calc(100vw-16px)]"
           style={{ left: contextMenuPos.x, top: contextMenuPos.y, zIndex: 100030 }}
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
@@ -5743,9 +5743,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
             if (isFileTab) {
               return (
-                <div className="px-3 py-1.5 text-[13px] text-[#d8b4fe] flex items-center gap-2 border-b border-[#3a3a3a]">
+                <div
+                  className="px-3 py-1.5 text-[13px] text-[#d8b4fe] flex items-center gap-2 border-b border-[#3a3a3a] min-w-0"
+                  title={targetFileTab?.name || 'Linked File'}
+                >
                   <FileText size={13} className="text-[#a78bfa] flex-shrink-0" />
-                  <span className="truncate">{targetFileTab?.name || 'Linked File'}</span>
+                  <span className="min-w-0 flex-1 truncate">{targetFileTab?.name || 'Linked File'}</span>
                 </div>
               );
             }
@@ -5940,15 +5943,16 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 const isPersistent = !!ctxTab.completionNotificationPersistent;
                 const oneShotActive = isArmed || isFired;
                 const tint = isFired ? '#ef4444' : (oneShotActive ? '#f87171' : '#888');
-                const label = isFired
+                const label = 'Уведомления';
+                const notificationTitle = isFired
                   ? 'Уведомление готово'
                   : (oneShotActive ? 'Уведомление включено' : 'Активировать уведомления');
                 return (
-                  <div className="flex items-stretch w-full border-t border-[#3a3a3a]">
+                  <div className="grid grid-cols-2 items-stretch w-full border-t border-[#3a3a3a]">
                     <button
-                      className="min-w-0 text-left px-3 py-1.5 text-[13px] hover:bg-white/10 cursor-pointer flex items-center gap-2 whitespace-nowrap"
+                      className="min-w-0 text-left px-2 py-1.5 text-[13px] hover:bg-white/10 cursor-pointer flex items-center gap-1.5 whitespace-nowrap"
+                      title={notificationTitle}
                       style={{
-                        flex: '4 1 0%',
                         color: oneShotActive ? '#fecaca' : '#ccc',
                         backgroundColor: oneShotActive ? 'rgba(239, 68, 68, 0.10)' : 'transparent',
                       }}
@@ -5964,9 +5968,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     </button>
                     <Tooltip content={isPersistent ? 'Постоянные уведомления включены' : 'Включать уведомление для каждого нового запроса'}>
                       <button
-                        className="px-2 py-1.5 text-[12px] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444]"
+                        className="min-w-0 px-2 py-1.5 text-[12px] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444]"
                         style={{
-                          flex: '1 0 42px',
                           color: isPersistent ? '#fecaca' : '#777',
                           backgroundColor: isPersistent ? 'rgba(239, 68, 68, 0.16)' : 'transparent',
                         }}

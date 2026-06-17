@@ -42,6 +42,8 @@ const fs = require('fs');
 const crypto = require('crypto');
 const zlib = require('zlib');
 const { app, BrowserWindow, ipcMain } = require('electron');
+const INBOX_PROJECT_ID = '__noted_inbox__';
+const isInboxProjectId = (projectId) => projectId === INBOX_PROJECT_ID;
 // Lazy-require the helpers (loaded fresh each call so missing module just
 // disables the dependent endpoints, not the whole server).
 let findSessionFile = null;
@@ -659,6 +661,22 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
   const projectManager = require('./project-manager');
 
+  if (parsed.pathname === '/api/inbox' && req.method === 'GET') {
+    const inbox = projectManager.db.getProjectById(INBOX_PROJECT_ID);
+    if (!inbox) return sendJson(res, 500, { error: 'inbox project missing' });
+    return sendJson(res, 200, {
+      project: {
+        id: inbox.id,
+        name: inbox.name,
+        path: inbox.path,
+        icon: inbox.icon || null,
+        isSystem: true,
+        systemType: 'inbox',
+        tabCount: (inbox.tabs || []).length,
+      },
+    });
+  }
+
   // Projects list (from SQLite — includes closed projects too)
   if (parsed.pathname === '/api/projects' && req.method === 'GET') {
     // Ask renderer which projects are currently open in the desktop UI so the
@@ -698,9 +716,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
         isOpen: openIds.has(p.id),
         isActive: p.id === activeProjectId,
         hasAwaiting: awaitingIds.has(p.id),
+        isSystem: isInboxProjectId(p.id),
+        systemType: isInboxProjectId(p.id) ? 'inbox' : null,
       };
     });
     all.sort((a, b) => {
+      if (isInboxProjectId(a.id) !== isInboxProjectId(b.id)) return isInboxProjectId(a.id) ? -1 : 1;
       const aOpen = openOrder.has(a.id);
       const bOpen = openOrder.has(b.id);
       if (aOpen && bOpen) return openOrder.get(a.id) - openOrder.get(b.id);
@@ -1058,6 +1079,16 @@ async function handleApi(req, res, parsed, sdkSessions) {
   }
 
   // Create SDK tab in a project (delegates to renderer store)
+  if (parsed.pathname === '/api/inbox/sdk-tabs' && req.method === 'POST') {
+    try {
+      await bridgeRequest('ensureInboxProject', {}, 5000);
+      const data = await bridgeRequest('createSDKTab', { projectId: INBOX_PROJECT_ID });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
   m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/sdk-tabs$/);
   if (m && req.method === 'POST') {
     try {
@@ -1105,6 +1136,18 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // Create PTY agent tab in a project. Body: { toolType: 'claude' | 'codex' }.
   // Used by the native iOS "New Terminal" picker; keeps Claude/Codex creation
   // on the same renderer-owned pendingAction path as desktop.
+  if (parsed.pathname === '/api/inbox/agent-tabs' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const toolType = body.toolType === 'codex' ? 'codex' : 'claude';
+      await bridgeRequest('ensureInboxProject', {}, 5000);
+      const data = await bridgeRequest('createAgentTab', { projectId: INBOX_PROJECT_ID, toolType });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
   m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/agent-tabs$/);
   if (m && req.method === 'POST') {
     try {
@@ -1482,24 +1525,38 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const lastN = lastRaw != null ? Math.max(1, Math.min(20000, parseInt(String(lastRaw), 10) || 0)) : null;
     const afterUuid = typeof parsed.query.after === 'string' ? parsed.query.after : null;
     const beforeUuid = typeof parsed.query.before === 'string' ? parsed.query.before : null;
+    const aroundUuid = typeof parsed.query.around === 'string' ? parsed.query.around : null;
+    const radiusRaw = parsed.query.radius;
+    const aroundRadius = radiusRaw != null ? Math.max(1, Math.min(500, parseInt(String(radiusRaw), 10) || 80)) : 80;
     const wantHistoryEntries = parsed.query.view === 'history' || parsed.query.entries === '1';
     const wantNdjson = /\bapplication\/x-ndjson\b/.test(req.headers['accept'] || '') || parsed.query.ndjson === '1';
-    console.log(`[WebTiming] /history START tabId=${tabId.slice(0, 24)} last=${lastN || 'all'} after=${afterUuid ? afterUuid.slice(0, 8) : 'none'} before=${beforeUuid ? beforeUuid.slice(0, 8) : 'none'} view=${wantHistoryEntries ? 'history' : 'messages'} ndjson=${wantNdjson}`);
+    console.log(`[WebTiming] /history START tabId=${tabId.slice(0, 24)} last=${lastN || 'all'} after=${afterUuid ? afterUuid.slice(0, 8) : 'none'} before=${beforeUuid ? beforeUuid.slice(0, 8) : 'none'} around=${aroundUuid ? aroundUuid.slice(0, 8) : 'none'} radius=${aroundRadius} view=${wantHistoryEntries ? 'history' : 'messages'} ndjson=${wantNdjson}`);
     try {
       if (wantHistoryEntries) {
         const data = await bridgeRequest('loadAgentFullHistory', { tabId }, 5000);
         let entries = Array.isArray(data?.entries) ? data.entries : [];
         const total = entries.length;
         let dropped = 0;
-        if (afterUuid) {
+        if (aroundUuid) {
+          const idx = entries.findIndex((e) => e && e.uuid === aroundUuid);
+          if (idx >= 0) {
+            const start = Math.max(0, idx - aroundRadius);
+            const end = Math.min(entries.length, idx + aroundRadius + 1);
+            entries = entries.slice(start, end);
+            dropped = total - entries.length;
+          } else {
+            entries = [];
+            dropped = total;
+          }
+        } else if (afterUuid) {
           const idx = entries.findIndex((e) => e && e.uuid === afterUuid);
           entries = idx >= 0 ? entries.slice(idx + 1) : [];
         }
-        if (beforeUuid) {
+        if (!aroundUuid && beforeUuid) {
           const idx = entries.findIndex((e) => e && e.uuid === beforeUuid);
           entries = idx >= 0 ? entries.slice(0, idx) : [];
         }
-        if (lastN && entries.length > lastN) {
+        if (!aroundUuid && lastN && entries.length > lastN) {
           dropped = entries.length - lastN;
           entries = entries.slice(entries.length - lastN);
         }
@@ -1508,7 +1565,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         const lastUuid = entries.length ? (entries[entries.length - 1]?.uuid || null) : null;
         const etagSrc = entries.map((e) => e?.uuid || '').join('|');
         const etag = crypto.createHash('sha1').update(etagSrc).digest('hex').slice(0, 16);
-        console.log(`[WebTiming] /history DONE view=history tool=${data?.toolType || '-'} total=${total} returned=${entries.length} dropped=${dropped} ms=${Date.now()-t0}`);
+        console.log(`[WebTiming] /history DONE view=history tool=${data?.toolType || '-'} total=${total} returned=${entries.length} dropped=${dropped} around=${aroundUuid ? aroundUuid.slice(0, 8) : 'none'} ms=${Date.now()-t0}`);
         return sendJson(res, 200, { ...data, entries, total, truncated, dropped, etag, firstUuid, lastUuid });
       }
 

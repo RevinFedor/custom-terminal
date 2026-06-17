@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { isInboxProjectId } from '../constants/systemProjects';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -51,6 +52,7 @@ export const useProjectsStore = create<ProjectsStore>((set, get) => ({
   },
 
   updateProject: async (projectId, updates) => {
+    if (isInboxProjectId(projectId)) return;
     const { projects } = get();
     const project = projects[projectId];
     if (project) {

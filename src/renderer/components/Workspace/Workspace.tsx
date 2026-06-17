@@ -20,6 +20,7 @@ import FilePreview from './FilePreview';
 import TabNotesSlideout from './TabNotesSlideout';
 import HistoryPanel from './HistoryPanel';
 import ClaudeControlBar from './ClaudeControlBar';
+import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from '../../constants/systemProjects';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -51,6 +52,7 @@ export default function Workspace() {
 
   // Use selectors to avoid rerenders on unrelated store changes
   const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
+  const isInboxProject = isInboxProjectId(activeProjectId);
   const getActiveProject = useWorkspaceStore((s) => s.getActiveProject);
   const getSidebarState = useWorkspaceStore((s) => s.getSidebarState);
   const setSidebarOpen = useWorkspaceStore((s) => s.setSidebarOpen);
@@ -59,6 +61,7 @@ export default function Workspace() {
   const createTabAfterCurrent = useWorkspaceStore((s) => s.createTabAfterCurrent);
   // Subscribe to sidebarOpen so Workspace re-renders when sidebar toggles
   const sidebarOpenForRender = useWorkspaceStore((s) => {
+    if (isInboxProjectId(s.activeProjectId)) return false;
     const p = s.activeProjectId ? s.openProjects.get(s.activeProjectId) : null;
     return p?.sidebarOpen ?? false;
   });
@@ -126,7 +129,14 @@ export default function Workspace() {
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   const activeProject = getActiveProject();
-  const currentProject = activeProjectId ? projects[activeProjectId] : null;
+  const currentProject = activeProjectId
+    ? (projects[activeProjectId] || (isInboxProject ? {
+        id: INBOX_PROJECT_ID,
+        name: INBOX_PROJECT_NAME,
+        path: getInboxProjectPath(),
+        icon: null,
+      } : null))
+    : null;
 
   // Per-project currentView
   const currentView = activeProject?.currentView || 'terminal';
@@ -661,7 +671,7 @@ export default function Workspace() {
           Divider под тулбаром НЕ здесь — он рендерится внутри TabSidebar, чтобы линия
           обрывалась на границе сайдбара и не уходила в область терминала. */}
       <div className="h-[30px] shrink-0">
-        <ProjectToolbar />
+        <ProjectToolbar isSystemProject={isInboxProject} />
       </div>
 
       {/* MAIN ROW: two columns now — TabSidebar | Terminal. Right NotesPanel
@@ -819,6 +829,7 @@ export default function Workspace() {
       {/* Global Overlays */}
       {/* Sidebar File Explorer - opens in current terminal's directory */}
       {(() => {
+        if (isInboxProject) return null;
         if (!sidebarOpenForRender || !explorerPath) return null;
         const { sidebarExpandedDirs } = getSidebarState(activeProjectId);
         const sidebarWidth = useUIStore.getState().sidebarWidth || 280;

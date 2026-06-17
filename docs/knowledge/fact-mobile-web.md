@@ -134,6 +134,14 @@ App-level settings тоже принадлежат desktop app-state, а не к
 сортировать этот ответ: порядок project tabs — пользовательская навигационная раскладка,
 а не производная от времени последнего изменения проекта.
 
+`Inbox` приходит в том же списке как system project (`isSystem:true`, `systemType:'inbox'`) и
+сервер пинит его перед обычными проектами. После него обычные открытые проекты сохраняют
+renderer-order; закрытые остаются архивом по freshness. Клиент может визуально разделять
+`Active` и `All`, но внутри каждой группы обязан сохранять порядок, уже пришедший из API.
+Не сортировать active-блок по `isActive` или `updatedAt`: это даёт пользовательский симптом
+«на Mac порядок проектов нормальный, на телефоне другой», хотя bridge и `/api/projects`
+работают корректно.
+
 Изменение этого порядка — отдельный live-сигнал, не tab layout. Renderer `reorderProjects`
 после `saveSession()` шлёт `project:order-changed`; следующий `project-activity` кадр несёт
 `projectOrderChanged:true`, и native клиент должен тихо перезагрузить `/api/projects` после
@@ -192,8 +200,10 @@ setBusy(cur => cur !== authoritativeBusy ? authoritativeBusy : cur);
 ```
 GET  /api/me                                   → ping, проверка токена
 GET  /api/projects                             → SQLite + isOpen/isActive + project icon из renderer bridge
+GET  /api/inbox                                → system Inbox project metadata
 POST /api/projects/:id/rename                  → renameProject (через bridge → updateProject{name} → project:save-metadata)
 GET  /api/projects/:id/tabs                    → tabs + groups + statuses + timelineCount + live state + statusMarker/processBar/contextPct
+POST /api/inbox/sdk-tabs                       → createSDKTab в system Inbox, без projectId у клиента
 POST /api/projects/:id/sdk-tabs                → createSDKTab (через bridge)
 POST /api/sdk-tabs/:tabId/send                 → sendSDKMessage + dispatch external-prompt
 POST /api/sdk-tabs/:tabId/stop                 → query.close()
@@ -227,6 +237,7 @@ POST /api/log/client                           → mobile diagnostic logs → co
 GET  /api/events?token=&tabId=                 → SSE (text/event-stream) — ОСНОВНОЙ live-канал. snapshot/message/busy/done/bridge-update/queue-update/ask-question/question-cancelled. Не блокируется anti-tracker'ами как ws://. См. секцию «SSE transport».
 WS   /ws?token=&tabId=                          → тот же набор events. Legacy-канал для permissive-браузеров; на Yandex/Chrome с Protect не работает (ws:// к private-IP режется молча).
 POST /api/projects/:id/claude-tabs              → создать PTY+Claude таб (Terminal.tsx сам spawn'ит Claude по pendingAction)
+POST /api/inbox/agent-tabs                      → создать PTY+Claude/Codex таб в system Inbox; body {toolType}
 POST /api/projects/:id/agent-tabs               → создать PTY+Claude/Codex таб; body {toolType:'claude'|'codex'}
 POST /api/projects/:id/tab-groups               → create group row через renderer bridge
 POST /api/projects/:id/tab-groups/:gid/rename   → rename group

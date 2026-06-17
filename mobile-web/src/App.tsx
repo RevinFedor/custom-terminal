@@ -801,16 +801,6 @@ function ProjectsView({ onPick, onLogout }: { onPick: (p: ProjectInfo) => void; 
 
   const active = (projects || []).filter((p) => p.isOpen);
   const inactive = (projects || []).filter((p) => !p.isOpen);
-  // Active projects: most-recently active (the desktop-active one) on top, rest by updatedAt.
-  // updatedAt is a unix-seconds INTEGER from SQLite — sort numerically; fall back to 0 so
-  // a missing value doesn't NaN the comparator.
-  const ts = (p: ProjectInfo) => Number(p.updatedAt || 0);
-  active.sort((a, b) => {
-    if (a.isActive && !b.isActive) return -1;
-    if (!a.isActive && b.isActive) return 1;
-    return ts(b) - ts(a);
-  });
-  inactive.sort((a, b) => ts(b) - ts(a));
 
   return (
     <div style={S.page}>

@@ -5,6 +5,7 @@ import { useCmdKey, useCmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import ProjectCard from './ProjectCard';
 import Tooltip from '../UI/Tooltip';
 import { ChevronDown, ChevronRight, Square, X } from 'lucide-react';
+import { isInboxProjectId } from '../../constants/systemProjects';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -157,7 +158,7 @@ export default function Dashboard() {
   // Fetch history counts for all projects
   useEffect(() => {
     const fetchHistoryCounts = async () => {
-      const ids = Object.keys(projects);
+      const ids = Object.keys(projects).filter((id) => !isInboxProjectId(id));
       if (ids.length === 0) return;
       const counts = new Map<string, number>();
       await Promise.all(
@@ -292,7 +293,7 @@ export default function Dashboard() {
   };
 
   // Get ALL projects from DB, sorted by updated_at (most recent first)
-  const allProjects = Object.values(projects);
+  const allProjects = Object.values(projects).filter((project) => !isInboxProjectId(project.id));
 
   // Check if project is currently open
   const isProjectOpen = (projectId: string) => openProjects.has(projectId);

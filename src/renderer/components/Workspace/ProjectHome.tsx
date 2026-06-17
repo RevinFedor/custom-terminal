@@ -56,6 +56,7 @@ import {
   refreshGeneratedTabTitle,
   type RefreshTabTitleReason,
 } from '../../utils/generateTabTitle';
+import { INBOX_PROJECT_NAME, isInboxProjectId } from '../../constants/systemProjects';
 
 // Tooltip is still used for the small icon buttons in the project header
 // (Select/Change directory, Rename project). Cards themselves don't use it —
@@ -273,6 +274,7 @@ const TAB_COLORS: Record<TabColor, { bgColor: string; borderColor: string }> = {
 
 export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const renderStartedAt = performance.now();
+  const isSystemProject = isInboxProjectId(projectId);
   const switchTab = useWorkspaceStore((state) => state.switchTab);
   const createTab = useWorkspaceStore((state) => state.createTab);
   const closeTab = useWorkspaceStore((state) => state.closeTab);
@@ -797,7 +799,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     return () => { cancelled = true; };
   }, [projectId, tabs.length]);
 
-  const displayName = syncName || project?.name || '';
+  const displayName = syncName || project?.name || (isSystemProject ? INBOX_PROJECT_NAME : '');
 
   const handleCreateTab = async () => {
     if (project) {
@@ -820,6 +822,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   };
 
   const handleChangeDirectory = async () => {
+    if (isSystemProject) return;
     const selected = await ipcRenderer.invoke('app:select-directory');
     if (selected) {
       await updateProject(projectId, { path: selected });
@@ -1189,7 +1192,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
               </Tooltip>
             </div>
           </>
-        ) : isEditingName ? (
+        ) : isEditingName && !isSystemProject ? (
           /* Normal editing mode: inline rename */
           <>
             <input
@@ -1246,34 +1249,38 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
           <>
             <div className="flex items-center gap-2 mb-1">
               <h1 className="text-xl text-white font-medium">{displayName}</h1>
-              <Tooltip content="Rename project">
-              <button
-                onClick={() => {
-                  setDraftName(project.name);
-                  setIsEditingName(true);
-                  // Start editing in title bar too for sync
-                  window.dispatchEvent(new CustomEvent('project:edit-start', {
-                    detail: { projectId, name: project.name }
-                  }));
-                }}
-                className="text-[#555] hover:text-[#999] cursor-pointer transition-colors p-0.5"
-              >
-                <Pencil size={12} />
-              </button>
-              </Tooltip>
+              {!isSystemProject && (
+                <Tooltip content="Rename project">
+                <button
+                  onClick={() => {
+                    setDraftName(project.name);
+                    setIsEditingName(true);
+                    // Start editing in title bar too for sync
+                    window.dispatchEvent(new CustomEvent('project:edit-start', {
+                      detail: { projectId, name: project.name }
+                    }));
+                  }}
+                  className="text-[#555] hover:text-[#999] cursor-pointer transition-colors p-0.5"
+                >
+                  <Pencil size={12} />
+                </button>
+                </Tooltip>
+              )}
             </div>
-            <div className="flex items-center gap-2 text-[#666] text-sm">
-              <FolderOpen size={14} />
-              <span>{project.path.startsWith('__unset__') ? 'No path' : project.path}</span>
-              <Tooltip content="Change project directory">
-              <button
-                onClick={handleChangeDirectory}
-                className="text-[#666] hover:text-[#999] cursor-pointer transition-colors p-0.5"
-              >
-                <Pencil size={12} />
-              </button>
-              </Tooltip>
-            </div>
+            {!isSystemProject && (
+              <div className="flex items-center gap-2 text-[#666] text-sm">
+                <FolderOpen size={14} />
+                <span>{project.path.startsWith('__unset__') ? 'No path' : project.path}</span>
+                <Tooltip content="Change project directory">
+                <button
+                  onClick={handleChangeDirectory}
+                  className="text-[#666] hover:text-[#999] cursor-pointer transition-colors p-0.5"
+                >
+                  <Pencil size={12} />
+                </button>
+                </Tooltip>
+              </div>
+            )}
           </>
         )}
       </div>

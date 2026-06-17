@@ -3,6 +3,7 @@ import { ImagePlus, RotateCcw, Trash2 } from 'lucide-react';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import IconCropper from '../Workspace/IconCropper.jsx';
+import { isInboxProjectId } from '../../constants/systemProjects';
 
 type ProjectIconProject = {
   id: string;
@@ -55,9 +56,9 @@ export default function ProjectIconsSettings() {
   const openProjectIdSet = new Set(openProjectIds);
   const activeProjectRows = openProjectIds
     .map((id) => projects[id] as ProjectIconProject | undefined)
-    .filter((project): project is ProjectIconProject => Boolean(project));
+    .filter((project): project is ProjectIconProject => Boolean(project) && !isInboxProjectId(project.id));
   const restProjectRows = (Object.values(projects) as ProjectIconProject[])
-    .filter((project) => !openProjectIdSet.has(project.id))
+    .filter((project) => !openProjectIdSet.has(project.id) && !isInboxProjectId(project.id))
     .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
   const totalProjectCount = activeProjectRows.length + restProjectRows.length;
 

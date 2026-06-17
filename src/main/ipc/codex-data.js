@@ -951,6 +951,14 @@ function cloneCodexRecordForWrite(record) {
   return cloned;
 }
 
+function isCodexCompactRecord(record) {
+  const payload = record?.payload || {};
+  if (record?.type === 'compacted') return true;
+  if (record?.type === 'event_msg' && isCompactPayload(payload)) return true;
+  const payloadType = String(payload?.type || '').toLowerCase();
+  return record?.type === 'response_item' && payloadType.includes('compact');
+}
+
 function pushCodexVisibleWrapper(wrappers, record, turnIndex, extra = {}) {
   wrappers.push({
     record,
@@ -1151,22 +1159,39 @@ async function editCodexRange({ sessionId, cwd, startUuid, endUuid, compactText 
   const minIndex = Math.min(startIndex, endIndex);
   const maxIndex = Math.max(startIndex, endIndex);
   const selected = timeline.slice(minIndex, maxIndex + 1);
-  if (selected.some((entry) => entry.type === 'compact')) {
-    return { success: false, error: 'Codex edit across compact markers is not supported yet' };
-  }
 
   const selectedTurns = new Set();
+  const selectedCompacts = new Set();
   for (const entry of selected) {
-    if (typeof entry.turnIndex === 'number') selectedTurns.add(entry.turnIndex);
+    if (entry.type === 'compact') selectedCompacts.add(entry.uuid);
+    else if (typeof entry.turnIndex === 'number') selectedTurns.add(entry.turnIndex);
   }
-  if (selectedTurns.size === 0) {
+  if (selectedTurns.size === 0 && selectedCompacts.size === 0) {
     return { success: false, error: 'Selected range has no editable Codex turns' };
   }
 
   const wrappers = buildCodexVisibleRecordWrappers(loaded.records, sessionId);
-  const firstRemovalIndex = wrappers.findIndex((wrapper) => (
-    typeof wrapper.turnIndex === 'number' && selectedTurns.has(wrapper.turnIndex)
-  ));
+  const selectedCompactLines = new Set(
+    wrappers
+      .filter((wrapper) => wrapper.sourceUuid && selectedCompacts.has(wrapper.sourceUuid))
+      .map((wrapper) => Number(wrapper.line))
+      .filter((line) => Number.isFinite(line))
+  );
+  const isSelectedCompactCompanion = (wrapper) => {
+    if (!isCodexCompactRecord(wrapper.record)) return false;
+    const line = Number(wrapper.line);
+    if (!Number.isFinite(line)) return false;
+    for (const compactLine of selectedCompactLines) {
+      if (line > compactLine && line <= compactLine + 3) return true;
+    }
+    return false;
+  };
+  const shouldRemoveWrapper = (wrapper) => {
+    if (typeof wrapper.turnIndex === 'number' && selectedTurns.has(wrapper.turnIndex)) return true;
+    if (wrapper.sourceUuid && selectedCompacts.has(wrapper.sourceUuid)) return true;
+    return isSelectedCompactCompanion(wrapper);
+  };
+  const firstRemovalIndex = wrappers.findIndex(shouldRemoveWrapper);
   if (firstRemovalIndex < 0) {
     return { success: false, error: 'Selected Codex turns were not found in visible rollout records' };
   }
@@ -1174,7 +1199,7 @@ async function editCodexRange({ sessionId, cwd, startUuid, endUuid, compactText 
   if (firstRemovalIndex >= 0) {
     for (let i = firstRemovalIndex + 1; i < wrappers.length; i++) {
       const wrapper = wrappers[i];
-      if (typeof wrapper.turnIndex === 'number' && selectedTurns.has(wrapper.turnIndex)) continue;
+      if (shouldRemoveWrapper(wrapper)) continue;
       const nextMs = Date.parse(wrapper.record?.timestamp || '');
       if (Number.isFinite(nextMs)) {
         replacementTimestamp = new Date(nextMs - 1).toISOString();
@@ -1189,7 +1214,7 @@ async function editCodexRange({ sessionId, cwd, startUuid, endUuid, compactText 
   let removedUsers = 0;
 
   for (const wrapper of wrappers) {
-    const shouldRemove = typeof wrapper.turnIndex === 'number' && selectedTurns.has(wrapper.turnIndex);
+    const shouldRemove = shouldRemoveWrapper(wrapper);
     if (shouldRemove) {
       if (!inserted) {
         for (const replacement of replacementRecords) outputRecords.push(replacement);
@@ -1223,6 +1248,7 @@ async function editCodexRange({ sessionId, cwd, startUuid, endUuid, compactText 
     removedUsers,
     selectedCount: selected.length,
     selectedTurns: Array.from(selectedTurns),
+    selectedCompacts: Array.from(selectedCompacts),
   };
 }
 

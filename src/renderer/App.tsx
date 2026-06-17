@@ -36,6 +36,7 @@ import { buildCodexRunPayload } from './utils/codexLaunch';
 import { getHistoryAgentRuntime, type AgentHistoryTool } from './utils/historyAgentRuntimes';
 import { terminalRegistry } from './utils/terminalRegistry';
 import { DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL } from './constants/codexSettings';
+import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from './constants/systemProjects';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -215,6 +216,7 @@ interface ProjectTabItemProps {
   onTabDrop?: (tabId: string, sourceProjectId: string, selectedTabIds?: string[]) => void; // For dropping terminal tabs
   isAreaActive?: boolean;
   isProjectLoading?: boolean; // API request in progress (Update API, Research, etc.)
+  isPinnedSystem?: boolean;
 }
 
 const ProjectTabItem = memo(({
@@ -241,7 +243,8 @@ const ProjectTabItem = memo(({
   isAreaActive,
   isProjectBusy = false,
   isProjectAwaiting = false,
-  isProjectLoading = false
+  isProjectLoading = false,
+  isPinnedSystem = false
 }: ProjectTabItemProps) => {
   const ref = useRef<HTMLButtonElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -293,14 +296,7 @@ const ProjectTabItem = memo(({
     const element = ref.current;
     if (!element || isEditing) return;
 
-    return combine(
-      draggable({
-        element,
-        getInitialData: () => ({ type: 'PROJECT_TAB', id: projectId, index }),
-        onDragStart: () => setIsDragging(true),
-        onDrop: () => setIsDragging(false),
-      }),
-// ... existing dropTargetForElements code ...
+    const dndBehaviors = [
       dropTargetForElements({
         element,
         getData: ({ input, element }) => {
@@ -310,15 +306,15 @@ const ProjectTabItem = memo(({
           );
         },
         canDrop: ({ source }) => {
-          // Accept both PROJECT_TAB (for reordering) and TAB (terminal tabs)
-          return source.data.type === 'PROJECT_TAB' || source.data.type === 'TAB';
+          if (source.data.type === 'TAB') return true;
+          return !isPinnedSystem && source.data.type === 'PROJECT_TAB';
         },
         onDragEnter: ({ source, self }) => {
           if (source.data.type === 'TAB') {
             setIsTabDropTarget(true);
             return;
           }
-          if (source.data.id === projectId) return;
+          if (isPinnedSystem || source.data.id === projectId) return;
           setClosestEdge(extractClosestEdge(self.data) as Edge | null);
         },
         onDrag: ({ source, self }) => {
@@ -326,7 +322,7 @@ const ProjectTabItem = memo(({
             setIsTabDropTarget(true);
             return;
           }
-          if (source.data.id === projectId) {
+          if (isPinnedSystem || source.data.id === projectId) {
             setClosestEdge(null);
             return;
           }
@@ -347,9 +343,20 @@ const ProjectTabItem = memo(({
             }
           }
         },
-      })
-    );
-  }, [projectId, index, onTabDrop, isEditing]);
+      }),
+    ];
+
+    if (!isPinnedSystem) {
+      dndBehaviors.unshift(draggable({
+        element,
+        getInitialData: () => ({ type: 'PROJECT_TAB', id: projectId, index }),
+        onDragStart: () => setIsDragging(true),
+        onDrop: () => setIsDragging(false),
+      }));
+    }
+
+    return combine(...dndBehaviors);
+  }, [projectId, index, onTabDrop, isEditing, isPinnedSystem]);
 
   // Text color: active (selected) = black, has processes = white, idle = gray
   const textColor = isActive
@@ -377,10 +384,10 @@ const ProjectTabItem = memo(({
         borderRadius: isTabDropTarget ? '4px' : '2px', // Consistency with rounded-sm
       }}
       onClick={onClick}
-      onDoubleClick={onDoubleClick}
-      onContextMenu={onContextMenu}
+      onDoubleClick={isPinnedSystem ? undefined : onDoubleClick}
+      onContextMenu={isPinnedSystem ? undefined : onContextMenu}
       onAuxClick={(e) => {
-        if (e.button === 1) {
+        if (e.button === 1 && !isPinnedSystem) {
           e.preventDefault();
           onMiddleClick();
         }
@@ -432,14 +439,23 @@ const ProjectTabItem = memo(({
           />
         ) : (
           <>
-            {projectIcon && (
+            {projectIcon ? (
               <img
                 src={projectIcon}
                 alt=""
                 className="w-4 h-4 rounded-[3px] object-cover flex-shrink-0"
                 draggable={false}
               />
-            )}
+            ) : isPinnedSystem ? (
+              <span
+                className="w-4 h-4 rounded-[3px] border border-dashed flex-shrink-0"
+                style={{
+                  borderColor: isActive ? 'rgba(0,0,0,0.45)' : 'rgba(148,163,184,0.8)',
+                  background: isActive ? 'rgba(0,0,0,0.08)' : 'rgba(148,163,184,0.08)',
+                }}
+                aria-hidden
+              />
+            ) : null}
             <span className="max-w-[120px] truncate">{projectName}</span>
           </>
         )}
@@ -952,9 +968,19 @@ function App() {
 
   // Load projects, AI prompts, and restore session ONCE on mount
   useEffect(() => {
-    loadProjects();
-    restoreSession();
-    usePromptsStore.getState().loadPrompts();
+    let cancelled = false;
+    (async () => {
+      await loadProjects();
+      await restoreSession();
+      if (!cancelled) {
+        const state = useWorkspaceStore.getState();
+        if (!state.openProjects.has(INBOX_PROJECT_ID)) {
+          await state.openProject(INBOX_PROJECT_ID, getInboxProjectPath(), { background: true });
+        }
+      }
+      usePromptsStore.getState().loadPrompts();
+    })();
+    return () => { cancelled = true; };
   }, []); // Empty deps = only on mount
 
   // Sync apiSettings + docPrompt to main process (for MCP update_docs tool)
@@ -1389,6 +1415,26 @@ function App() {
             uiState.setStreamerMode(streamerMode);
           }
           return reply(true, { streamerMode: !!useUIStore.getState().streamerMode });
+        }
+        if (action === 'ensureInboxProject') {
+          const projectsState = useProjectsStore.getState();
+          if (!projectsState.projects?.[INBOX_PROJECT_ID]) {
+            await projectsState.loadProjects();
+          }
+          const latest = useWorkspaceStore.getState();
+          if (!latest.openProjects.has(INBOX_PROJECT_ID)) {
+            await latest.openProject(
+              INBOX_PROJECT_ID,
+              projectsState.projects?.[INBOX_PROJECT_ID]?.path || getInboxProjectPath(),
+              { background: true }
+            );
+          }
+          const inbox = useWorkspaceStore.getState().openProjects.get(INBOX_PROJECT_ID);
+          return reply(true, {
+            projectId: INBOX_PROJECT_ID,
+            path: inbox?.projectPath || getInboxProjectPath(),
+            isOpen: !!inbox,
+          });
         }
         if (action === 'getOpenProjectIds') {
           // Live snapshot of which projects are currently open in the desktop UI.
@@ -2743,7 +2789,7 @@ function App() {
       const isCmdB = e.code === 'KeyB';
       if (e.metaKey && isCmdB) {
         e.preventDefault();
-        if (view === 'workspace' && activeProjectId) {
+        if (view === 'workspace' && activeProjectId && !isInboxProjectId(activeProjectId)) {
           if (filePreview && filePreview.source !== 'tab') {
             closeFilePreview();
             setOpenFilePath(activeProjectId, null);
@@ -3088,7 +3134,37 @@ function App() {
     };
   }, [view, activeProjectId, filePreview, incrementAllFontSizes, decrementAllFontSizes, activeArea, openProjects, setActiveArea]);
 
-  const openProjectsList = Array.from(openProjects.entries());
+  const openProjectsList = Array.from(openProjects.entries()).filter(([projectId]) => !isInboxProjectId(projectId));
+  const inboxWorkspace = openProjects.get(INBOX_PROJECT_ID);
+  const getProjectTabIndicators = (projectId: string, workspace?: any) => {
+    let activeCount = 0;
+    let hasBusyTab = false;
+    let hasPasteBusyTab = false;
+    let hasAwaitingTab = false;
+    let completionNotificationCount = 0;
+    let interruptedCount = 0;
+
+    workspace?.tabs?.forEach((tab: any, tabId: string) => {
+      const hasLiveProcess = !!processStatus.get(tabId) || !!tab.sdkProcessAlive;
+      if (hasLiveProcess) activeCount++;
+      if (busyTabs.get(tabId)) hasBusyTab = true;
+      if (pasteBusyTabs.get(tabId)) hasPasteBusyTab = true;
+      if (awaitingTabs.get(tabId)) hasAwaitingTab = true;
+      if (tab.completionNotificationFired) completionNotificationCount++;
+      if (isTabInterrupted(tab)) interruptedCount++;
+    });
+
+    const isProjectLoading = apiLoadingProjects.has(projectId);
+    return {
+      activeCount,
+      hasAwaitingTab,
+      completionNotificationCount,
+      interruptedCount,
+      isProjectLoading,
+      hasProjectShimmer: hasBusyTab || hasPasteBusyTab || isProjectLoading,
+    };
+  };
+  const inboxIndicators = getProjectTabIndicators(INBOX_PROJECT_ID, inboxWorkspace);
 
   // Show loading screen while restoring session
   if (isRestoring) {
@@ -3165,6 +3241,41 @@ function App() {
             </Tooltip>
           )}
 
+          {/* Pinned Inbox workspace */}
+          <ProjectTabItem
+            key={INBOX_PROJECT_ID}
+            projectId={INBOX_PROJECT_ID}
+            projectName={projects[INBOX_PROJECT_ID]?.name || INBOX_PROJECT_NAME}
+            projectIcon={projects[INBOX_PROJECT_ID]?.icon || null}
+            index={-1}
+            isActive={view === 'workspace' && activeProjectId === INBOX_PROJECT_ID}
+            fontSize={projectTabsFontSize}
+            activeProcessCount={inboxIndicators.activeCount}
+            interruptedCount={inboxIndicators.interruptedCount}
+            completionNotificationCount={inboxIndicators.completionNotificationCount}
+            isProjectBusy={inboxIndicators.hasProjectShimmer}
+            isProjectAwaiting={inboxIndicators.hasAwaitingTab}
+            isProjectLoading={inboxIndicators.isProjectLoading}
+            isEditing={false}
+            editValue=""
+            onEditChange={() => {}}
+            onEditSubmit={() => {}}
+            onEditCancel={() => {}}
+            isAreaActive={activeArea === 'projects'}
+            isPinnedSystem
+            onClick={() => {
+              openProject(INBOX_PROJECT_ID, projects[INBOX_PROJECT_ID]?.path || getInboxProjectPath());
+            }}
+            onDoubleClick={() => {}}
+            onContextMenu={() => {}}
+            onMiddleClick={() => {}}
+            onTabDrop={(tabId, sourceProjectId, selectedTabIds) => {
+              const ids = selectedTabIds && selectedTabIds.length > 1 ? selectedTabIds : [tabId];
+              moveTabsToProject(sourceProjectId, ids, INBOX_PROJECT_ID);
+              openProject(INBOX_PROJECT_ID, projects[INBOX_PROJECT_ID]?.path || getInboxProjectPath());
+            }}
+          />
+
           {/* Separator */}
           {openProjectsList.length > 0 && (
             <div className="h-5 w-px bg-[#444] mx-1" />
@@ -3181,31 +3292,7 @@ function App() {
             const isActive = view === 'workspace' && activeProjectId === projectId;
             const isLast = index === openProjectsList.length - 1;
 
-            // Count active processes and busy tabs in this project
-            let activeCount = 0;
-            let hasBusyTab = false;
-            let hasPasteBusyTab = false;
-            let hasAwaitingTab = false;
-            let completionNotificationCount = 0;
-            workspace.tabs.forEach((tab, tabId) => {
-              const hasLiveProcess = !!processStatus.get(tabId) || !!(tab as any).sdkProcessAlive;
-              if (hasLiveProcess) {
-                activeCount++;
-              }
-              if (busyTabs.get(tabId)) hasBusyTab = true;
-              if (pasteBusyTabs.get(tabId)) hasPasteBusyTab = true;
-              if (awaitingTabs.get(tabId)) hasAwaitingTab = true;
-              if ((tab as any).completionNotificationFired) completionNotificationCount++;
-            });
-            const projectIsLoading = apiLoadingProjects.has(projectId);
-            const hasProjectShimmer = hasBusyTab || hasPasteBusyTab || projectIsLoading;
-
-            // Count interrupted (paused) sessions
-            // Count interrupted (paused) sessions using helper
-            let interruptedCount = 0;
-            workspace.tabs.forEach((tab) => {
-              if (isTabInterrupted(tab)) interruptedCount++;
-            });
+            const indicators = getProjectTabIndicators(projectId, workspace);
 
             return (
               <ProjectTabItem
@@ -3217,18 +3304,18 @@ function App() {
                 isActive={isActive}
                 fontSize={projectTabsFontSize}
                 forceRightIndicator={isLast && projectEmptyZoneHovered}
-                activeProcessCount={activeCount}
-                interruptedCount={interruptedCount}
-                completionNotificationCount={completionNotificationCount}
-                isProjectBusy={hasProjectShimmer}
-                isProjectAwaiting={hasAwaitingTab}
+                activeProcessCount={indicators.activeCount}
+                interruptedCount={indicators.interruptedCount}
+                completionNotificationCount={indicators.completionNotificationCount}
+                isProjectBusy={indicators.hasProjectShimmer}
+                isProjectAwaiting={indicators.hasAwaitingTab}
                 isEditing={editingProjectId === projectId}
                 editValue={projectEditValue}
                 onEditChange={setProjectEditValue}
                 onEditSubmit={handleSubmitProjectRename}
                 onEditCancel={handleCancelProjectRename}
                 isAreaActive={activeArea === 'projects'}
-                isProjectLoading={projectIsLoading}
+                isProjectLoading={indicators.isProjectLoading}
                 onClick={() => {
                   openProject(projectId, project.path);
                 }}
@@ -3239,8 +3326,8 @@ function App() {
                 }}
                 onMiddleClick={() => {
                   // Only warn if there are running processes (not just open terminals)
-                  if (activeCount > 0) {
-                    if (confirm(`Close "${project.name}"?\n\n${activeCount} running process(es) will be terminated.`)) {
+                  if (indicators.activeCount > 0) {
+                    if (confirm(`Close "${project.name}"?\n\n${indicators.activeCount} running process(es) will be terminated.`)) {
                       closeProject(projectId);
                     }
                   } else {

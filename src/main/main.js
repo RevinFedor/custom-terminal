@@ -11,6 +11,7 @@ const net = require('net');
 const readline = require('readline');
 const { performance: nodePerformance, monitorEventLoopDelay } = require('node:perf_hooks');
 const { spawn } = require('child_process');
+const isInboxProjectId = (projectId) => projectId === '__noted_inbox__';
 
 // Load .env file (works in both dev and packaged builds).
 // Production: prefer ~/.noted-terminal/.env (survives reinstall) and fall back
@@ -4981,7 +4982,8 @@ function startMcpHttpServer() {
             submit: submit !== false,
             ctrlCFirst: false,
             stashFirst: false,
-            fast: engine !== 'claude',
+            fast: engine !== 'claude' && engine !== 'codex',
+            source: engine === 'codex' ? 'codex-mcp-ai-prompt' : 'mcp-ai-prompt',
             logPrefix: '[MCP:Terminal:ai-prompt:' + engine + ':' + tabId + ']',
           });
           console.log('[MCP:Terminal] POST /terminal/ai-prompt tabId=' + tabId + ' engine=' + engine + ' submit=' + (submit !== false) + ' chars=' + prompt.length + ' success=' + (result?.success !== false));
@@ -8528,7 +8530,8 @@ ipcMain.handle('codex:append-input', async (_event, tabId, text, options = {}) =
     submit: shouldSubmit,
     stashFirst: false,
     ctrlCFirst: false,
-    fast: true,
+    fast: false,
+    source: 'codex-append-input',
     logPrefix: '[codex:append-input:' + tabId + ']',
   });
   if (result && typeof result === 'object') result.submitted = shouldSubmit;
@@ -8749,6 +8752,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
     if (!t) return true;
     return t === '●'
       || t === '❯'
+      || /^[─━╌═-]{5,}$/.test(t)
       || t === 'Rewind'
       || t === 'Do nothing'
       || t === 'Rewind conversation'
@@ -8941,40 +8945,28 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       }
 
       const hasDeterministicIndex = Number.isFinite(count) && Number.isFinite(idx) && count > 0 && idx >= 0 && idx < count;
-      if (hasDeterministicIndex) {
-        const targetSteps = Math.max(0, count - 1 - idx);
-        console.log('[Claude:Rewind] Navigating deterministic: target="' + targetPrefix + '" count=' + count + ' targetIndex=' + idx + ' DOWN steps=' + targetSteps + ' skipDuplicates=' + skipDuplicates);
-
-        if (targetSteps > 0) {
-          const navWait = waitForPtyText(
-            term,
-            /\x1b\[\?2026l|\x1b\[38;2;\d+;\d+;\d+m|[●❯]/,
-            Math.min(1500, Math.max(500, targetSteps * 40)),
-            '[Claude:Rewind:nav]'
+      async function readCurrentSelection(reason) {
+        const raw = await drainPtyData(term, 80, 250);
+        let candidates = extractSelectedCandidates(raw);
+        if (candidates.length === 0 && raw.length === 0) {
+          const probeRaw = await writeAndWait(
+            '',
+            /\x1b\[38;2;\d+;\d+;\d+m|[●❯]|\x1b\[\?2026l/,
+            250,
+            '[Claude:Rewind:probe]'
           );
-
-          let remaining = targetSteps;
-          while (remaining > 0) {
-            const batch = Math.min(remaining, 100);
-            term.write('\x1b[B'.repeat(batch));
-            pressCount += batch;
-            remaining -= batch;
-            if (remaining > 0) await drainPtyData(term, 10, 80);
-          }
-
-          const navRaw = await navWait;
-          const candidates = extractSelectedCandidates(navRaw);
-          const selectedText = candidates.length > 0 ? candidates[candidates.length - 1] : null;
-          console.log('[Claude:Rewind] DOWN burst #' + pressCount + ' -> "' + (selectedText || 'moved').substring(0, 70) + '" raw=' + (navRaw ? navRaw.length : 0) + 'B');
-          await drainPtyData(term, 80, Math.min(1000, 150 + targetSteps * 20));
+          candidates = extractSelectedCandidates(probeRaw);
         }
+        const selectedText = candidates.length > 0 ? candidates[candidates.length - 1] : null;
+        console.log('[Claude:Rewind] Selected check (' + reason + ') -> "' + (selectedText || 'null').substring(0, 70) + '"');
+        return selectedText;
+      }
 
-        found = true;
-      } else {
-        let duplicatesRemaining = skipDuplicates;
-        console.log('[Claude:Rewind] Navigating fallback: target="' + targetPrefix + '" maxPresses=' + maxPresses + ' skipDuplicates=' + skipDuplicates);
+      async function scanDownForTarget(maxSteps, duplicateOffset, reason) {
+        let duplicatesRemaining = duplicateOffset;
+        console.log('[Claude:Rewind] Navigating ' + reason + ': target="' + targetPrefix + '" maxPresses=' + maxSteps + ' skipDuplicates=' + duplicateOffset);
 
-        for (let i = 0; i < maxPresses; i++) {
+        for (let i = 0; i < maxSteps; i++) {
           const navRaw = await writeAndWait(
             '\x1b[B',
             /\x1b\[38;2;\d+;\d+;\d+m|[●❯]|\x1b\[\?2026l/,
@@ -8996,9 +8988,49 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
             continue;
           }
 
-          found = true;
-          break;
+          return true;
         }
+        return false;
+      }
+
+      if (hasDeterministicIndex) {
+        const targetSteps = Math.max(0, count - 1 - idx);
+        console.log('[Claude:Rewind] Navigating deterministic: target="' + targetPrefix + '" count=' + count + ' targetIndex=' + idx + ' DOWN steps=' + targetSteps + ' skipDuplicates=' + skipDuplicates);
+
+        let selectedText = initialCandidates.length > 0 ? initialCandidates[initialCandidates.length - 1] : null;
+        if (targetSteps > 0) {
+          const navWait = waitForPtyText(
+            term,
+            /\x1b\[\?2026l|\x1b\[38;2;\d+;\d+;\d+m|[●❯]/,
+            Math.min(1500, Math.max(500, targetSteps * 40)),
+            '[Claude:Rewind:nav]'
+          );
+
+          let remaining = targetSteps;
+          while (remaining > 0) {
+            const batch = Math.min(remaining, 100);
+            term.write('\x1b[B'.repeat(batch));
+            pressCount += batch;
+            remaining -= batch;
+            if (remaining > 0) await drainPtyData(term, 10, 80);
+          }
+
+          const navRaw = await navWait;
+          const candidates = extractSelectedCandidates(navRaw);
+          selectedText = candidates.length > 0 ? candidates[candidates.length - 1] : selectedText;
+          console.log('[Claude:Rewind] DOWN burst #' + pressCount + ' -> "' + (selectedText || 'moved').substring(0, 70) + '" raw=' + (navRaw ? navRaw.length : 0) + 'B');
+          await drainPtyData(term, 80, Math.min(1000, 150 + targetSteps * 20));
+        }
+
+        if (!selectedText) selectedText = await readCurrentSelection('after deterministic');
+        if (textMatchesTarget(selectedText, targetPrefix)) {
+          found = true;
+        } else {
+          console.warn('[Claude:Rewind] Deterministic selection mismatch; scanning by text. selected="' + (selectedText || 'null').substring(0, 100) + '" target="' + targetPrefix + '"');
+          found = await scanDownForTarget(maxPresses, skipDuplicates, 'fallback-after-deterministic');
+        }
+      } else {
+        found = await scanDownForTarget(maxPresses, skipDuplicates, 'fallback');
       }
 
       if (!found) {
@@ -9060,6 +9092,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
   targetText,
   targetFullText,
   rewindableCount,
+  skipDuplicates = 0,
   pasteAfter,
 }) => {
   const term = terminals.get(tabId);
@@ -9197,6 +9230,8 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     }
     return { success: false, busy: lastBusy, lastEvent };
   }
+
+  let codexRewindOverlayOpen = false;
 
   try {
     return await withPtyWriteLock(term, async () => {
@@ -9354,6 +9389,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       if (openFrame.timedOut || !/T R A N S C R I P T|enter to edit message/i.test(openFrame.clean || '')) {
         return { success: false, error: 'codex_rewind_transcript_not_observed', clean: openFrame.clean.slice(0, 800) };
       }
+      codexRewindOverlayOpen = true;
 
       let selectedOlderSteps = null;
       let selectedMatch = matchCodexRewindOverlayFrame(openFrame, targetInputText);
@@ -9457,6 +9493,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       );
       const confirmClean = confirmFrame.clean || '';
       console.log('[Codex:Rewind] confirm timedOut=' + confirmFrame.timedOut + ' clean=' + JSON.stringify(confirmClean.slice(0, 320)));
+      codexRewindOverlayOpen = false;
       if (/Cannot rollback|ThreadRollbackFailed|rollback.*failed|requires persisted/i.test(confirmClean)) {
         return { success: false, error: 'codex_thread_rollback_failed', clean: confirmClean.slice(0, 800) };
       }
@@ -9616,7 +9653,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     });
   } catch (err) {
     console.log('[Codex:Rewind] Error:', err?.message || String(err));
-    try { term.write('\x1b'); } catch {}
+    try { term.write(codexRewindOverlayOpen ? 'q' : '\x1b'); } catch {}
     return { success: false, error: err?.message || String(err) };
   }
 });
@@ -9833,6 +9870,7 @@ ipcMain.handle('terminal:getCommandState', async (event, request) => {
   const caller = requestOptions.caller || 'legacy';
   const expectedProcess = requestOptions.expectedProcess || 'codex';
   const allowProcessTreeLookup = requestOptions.allowProcessTreeLookup !== false;
+  const ignoreBridgeAlive = requestOptions.ignoreBridgeAlive === true;
   const startedAt = nodePerformance.now();
   const startAbs = nodePerformance.timeOrigin + startedAt;
   const opId = beginPerfOp('getCommandState', { tabId, source: caller });
@@ -9853,7 +9891,7 @@ ipcMain.handle('terminal:getCommandState', async (event, request) => {
   // process-tree fallback: if a real codex descendant is still under this PTY,
   // the prompt queue overlay/process strip should also treat the tab as alive.
   // This is not a busy signal; it only answers "is the AI process running?".
-  const bridgeAlive = bridgeKnownSessions.has(tabId);
+  const bridgeAlive = !ignoreBridgeAlive && bridgeKnownSessions.has(tabId);
   const oscRunning = !!(state && state.isRunning);
   let codexAlive = false;
   let codexLookupMs = 0;
@@ -9883,6 +9921,7 @@ ipcMain.handle('terminal:getCommandState', async (event, request) => {
       ' endAbs=' + (nodePerformance.timeOrigin + nodePerformance.now()).toFixed(1) +
       ' oscRunning=' + oscRunning +
       ' bridgeAlive=' + bridgeAlive +
+      ' ignoreBridgeAlive=' + ignoreBridgeAlive +
       ' allowProcessTreeLookup=' + allowProcessTreeLookup +
       ' expected=' + expectedProcess +
       ' codexLookup=' + didCodexLookup +
@@ -10168,6 +10207,9 @@ ipcMain.handle('project:save-sidebar-expanded-dirs', (event, { projectId, expand
 });
 
 ipcMain.handle('project:delete', (event, projectId) => {
+  if (isInboxProjectId(projectId)) {
+    return { success: false, error: 'system project cannot be deleted' };
+  }
   const result = projectManager.deleteProject(projectId);
   return { success: result };
 });
@@ -13239,19 +13281,54 @@ function armCodexStartupAutoEnter(tabId, { command, sessionId, cwd } = {}) {
     ' ttlMs=' + ttlMs);
 }
 
-function isCodexResumeCwdChooser(cleanText) {
+function inspectCodexCwdChooser(cleanText) {
   const text = String(cleanText || '').replace(/\u00a0/g, ' ');
   const compact = text.toLowerCase().replace(/\s+/g, ' ');
   const squashed = compact.replace(/[^a-z0-9]+/g, '');
   const hasPhrase = (phrase) => squashed.includes(String(phrase).toLowerCase().replace(/[^a-z0-9]+/g, ''));
+  const hasAny = (phrases) => phrases.some(hasPhrase);
+  const firstOptionSelected = /[›❯>]\s*1\.\s*Use\s+session\s+directory/i.test(text);
   const secondOptionSelected = /[›❯>]\s*2\.\s*Use\s+current\s+directory/i.test(text);
-  if (secondOptionSelected) return false;
-  return hasPhrase('directory to resume this session') &&
-    hasPhrase('session latest cwd recorded in the resumed session') &&
-    hasPhrase('current your current working directory') &&
-    hasPhrase('use session directory') &&
-    hasPhrase('use current directory') &&
-    hasPhrase('press enter to continue');
+  const checks = {
+    chooserTitle: hasAny(['directory to resume this session', 'directory to fork this session']),
+    sessionLine: hasAny([
+      'session latest cwd recorded in the resumed session',
+      'session latest cwd recorded in the forked session',
+    ]),
+    currentLine: hasPhrase('current your current working directory'),
+    sessionOption: hasPhrase('use session directory'),
+    currentOption: hasPhrase('use current directory'),
+    continueHint: hasPhrase('press enter to continue'),
+  };
+  const missing = Object.entries(checks)
+    .filter(([, ok]) => !ok)
+    .map(([key]) => key);
+  const visible = checks.chooserTitle || (checks.sessionOption && checks.currentOption && checks.continueHint);
+  const action = hasPhrase('directory to fork this session') ? 'fork'
+    : hasPhrase('directory to resume this session') ? 'resume'
+      : 'unknown';
+  const sessionDescriptor = hasPhrase('session latest cwd recorded in the forked session') ? 'forked'
+    : hasPhrase('session latest cwd recorded in the resumed session') ? 'resumed'
+      : 'unknown';
+  const canAutoEnter = visible && missing.length === 0 && firstOptionSelected && !secondOptionSelected;
+  let skipReason = null;
+  if (visible && missing.length > 0) skipReason = 'missing:' + missing.join(',');
+  else if (visible && secondOptionSelected) skipReason = 'current-directory-selected';
+  else if (visible && !firstOptionSelected) skipReason = 'session-directory-not-selected';
+  return {
+    visible,
+    canAutoEnter,
+    action,
+    sessionDescriptor,
+    firstOptionSelected,
+    secondOptionSelected,
+    missing,
+    skipReason,
+  };
+}
+
+function isCodexCwdChooser(cleanText) {
+  return inspectCodexCwdChooser(cleanText).canAutoEnter;
 }
 
 function isCodexTrustDirectoryPrompt(cleanText) {
@@ -13276,7 +13353,7 @@ function detectCodexStartupAutoEnterPrompt(cleanText, state) {
   if (allowed.has('trust-directory') && !fired.has('trust-directory') && isCodexTrustDirectoryPrompt(cleanText)) {
     return 'trust-directory';
   }
-  if (allowed.has('cwd-chooser') && !fired.has('cwd-chooser') && isCodexResumeCwdChooser(cleanText)) {
+  if (allowed.has('cwd-chooser') && !fired.has('cwd-chooser') && isCodexCwdChooser(cleanText)) {
     return 'cwd-chooser';
   }
   return null;
@@ -13296,6 +13373,32 @@ function tryHandleCodexStartupAutoEnter(tabId, data) {
   }
   const clean = cleanCodexTuiFrame(state.raw);
   const promptType = detectCodexStartupAutoEnterPrompt(clean, state);
+  if (!promptType && state.allowedPromptTypes?.has('cwd-chooser') && !state.firedTypes?.has('cwd-chooser')) {
+    const chooser = inspectCodexCwdChooser(clean);
+    if (chooser.visible) {
+      const rejectKey = [
+        chooser.action,
+        chooser.sessionDescriptor,
+        chooser.firstOptionSelected ? 'first' : 'first0',
+        chooser.secondOptionSelected ? 'second' : 'second0',
+        chooser.skipReason || 'unknown',
+      ].join(':');
+      if (state.lastCwdChooserRejectKey !== rejectKey) {
+        state.lastCwdChooserRejectKey = rejectKey;
+        const preview = clean.replace(/\s+/g, ' ').trim().slice(0, 260);
+        console.log('[CodexStartupPrompt] cwd-chooser visible but not confirmed tab=' + String(tabId).slice(-12) +
+          ' command=' + (state.command || 'unknown') +
+          ' session=' + (state.sessionId ? String(state.sessionId).slice(0, 8) : 'none') +
+          ' ageMs=' + ageMs +
+          ' action=' + chooser.action +
+          ' sessionDescriptor=' + chooser.sessionDescriptor +
+          ' firstSelected=' + chooser.firstOptionSelected +
+          ' secondSelected=' + chooser.secondOptionSelected +
+          ' reason=' + (chooser.skipReason || 'unknown') +
+          ' preview=' + JSON.stringify(preview));
+      }
+    }
+  }
   if (!promptType) return;
 
   state.firedTypes.add(promptType);
@@ -13471,7 +13574,12 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
   if (!text.startsWith('/')) {
     return { success: false, error: 'Codex command must start with /' };
   }
-  const { clearStrategy = 'line' } = options;
+  const {
+    clearStrategy = 'line',
+    waitForSubmitFrame = false,
+    submitTimeoutMs = 2500,
+    submitPredicate = null,
+  } = options;
   const t0 = Date.now();
   // Codex behaves like other Ink-style TUIs here: if text and Enter arrive in
   // the same raw write, Enter can be interpreted as a newline in the composer.
@@ -13489,11 +13597,30 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
   const frame = await inputFrame;
   if (frame.timedOut) {
     console.warn(logPrefix + ' slash input frame timed out for ' + JSON.stringify(text) + ' clean=' + JSON.stringify(frame.clean.slice(0, 500)));
-    return { success: false, error: 'Codex slash input frame timed out' };
+    return { success: false, error: 'Codex slash input frame timed out', submitted: false };
   }
+  const submitFramePromise = waitForSubmitFrame
+    ? captureCodexFrame(term, {
+      timeoutMs: submitTimeoutMs,
+      logPrefix: logPrefix + ':slash-submit',
+      predicate: submitPredicate,
+    })
+    : null;
   term.write('\r');
+  if (submitFramePromise) {
+    const submitFrame = await submitFramePromise;
+    console.log(logPrefix + ' submit frame timedOut=' + submitFrame.timedOut + ' clean=' + JSON.stringify(submitFrame.clean.slice(0, 240)));
+    if (submitFrame.timedOut) {
+      return {
+        success: false,
+        error: 'Codex slash submit frame timed out',
+        submitted: true,
+        submitClean: submitFrame.clean,
+      };
+    }
+  }
   console.log(logPrefix + ' sent slash command ' + JSON.stringify(text) + ' after render +' + (Date.now() - t0) + 'ms');
-  return { success: true };
+  return { success: true, submitted: true };
 }
 
 async function moveCodexPickerTo(term, state, targetIndex, logPrefix) {
@@ -13733,6 +13860,77 @@ async function selectCodexModelEffort(term, {
       if (slashSubmitted && outcome?.success !== true) {
         try { term.write('\x1b'); } catch {}
       }
+      await restoreCodexDraftAfterPicker(term, { logPrefix, slashSubmitted, expectedPreview: draftPreview });
+    }
+  }
+}
+
+async function sendCodexLiveSlashCommand(term, {
+  tabId,
+  command,
+  hasDraft = null,
+  draftSource = '',
+  draftPreview = '',
+  visualHasDraft = null,
+  visualSource = '',
+  visualPreview = '',
+  turnBusy = false,
+}) {
+  const logPrefix = '[Codex:Slash:' + tabId + ']';
+  const text = String(command || '').trim();
+  const liveTurnBusy = codexTurnWatchers.get(tabId)?.busy === true;
+  const effectiveTurnBusy = turnBusy === true || liveTurnBusy;
+  console.log(logPrefix + ' start command=' + JSON.stringify(text) + ' hasDraft=' + hasDraft + ' draftSource=' + (draftSource || 'n/a') + ' draftPreview=' + JSON.stringify(String(draftPreview || '').slice(0, 120)) + ' visualHasDraft=' + visualHasDraft + ' visualSource=' + (visualSource || 'n/a') + ' visualPreview=' + JSON.stringify(String(visualPreview || '').slice(0, 120)) + ' turnBusy=' + turnBusy + ' liveTurnBusy=' + liveTurnBusy);
+
+  if (!text.startsWith('/')) {
+    return { success: false, error: 'Codex command must start with /' };
+  }
+  if (hasDraft !== false && hasDraft !== true) {
+    return { success: false, error: 'Cannot determine Codex input state safely' };
+  }
+  if (effectiveTurnBusy && hasDraft === true) {
+    return {
+      success: false,
+      error: 'Cannot stash Codex draft during active turn safely',
+      code: 'busy_draft_unsafe',
+      draftSource,
+      draftPreview,
+    };
+  }
+
+  const shouldRestoreDraft = hasDraft === true;
+  let slashSubmitted = false;
+
+  if (shouldRestoreDraft) {
+    const stashResult = await stashCodexDraftForPicker(term, { logPrefix, draftPreview });
+    if (!stashResult.success) {
+      return {
+        success: false,
+        error: 'Codex draft stash did not confirm prompt state safely',
+        draftSource,
+        draftPreview,
+      };
+    }
+  } else {
+    console.log(logPrefix + ' skip Ctrl+C draft clear; slash command only runs after empty-composer probe');
+  }
+
+  try {
+    const slashResult = await sendCodexSlashCommand(term, text, logPrefix + ':command', {
+      clearStrategy: 'line',
+      waitForSubmitFrame: shouldRestoreDraft,
+      submitTimeoutMs: 2500,
+    });
+    if (slashResult.submitted === true) {
+      slashSubmitted = true;
+    }
+    if (!slashResult.success) {
+      return slashResult;
+    }
+    console.log(logPrefix + ' done command=' + JSON.stringify(text));
+    return slashResult;
+  } finally {
+    if (shouldRestoreDraft) {
       await restoreCodexDraftAfterPicker(term, { logPrefix, slashSubmitted, expectedPreview: draftPreview });
     }
   }
@@ -14170,8 +14368,11 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
   const shouldQueue = !!(options && options.queue === true);
   const handoffId = options && typeof options.handoffId === 'string' ? options.handoffId : null;
   const source = options && typeof options.source === 'string' ? options.source : null;
+  const codexSource = source
+    ? (source.startsWith('codex-') ? source : 'codex-' + source)
+    : (shouldQueue ? 'codex-history-queue' : 'codex-history-send');
   const statusAtSend = options && typeof options.statusAtSend === 'string' ? options.statusAtSend : null;
-  console.log('[codex:send-command] Received: tabId=' + tabId + ' queue=' + shouldQueue + ' statusAtSend=' + (statusAtSend || '-') + ' handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' command="' + command + '"');
+  console.log('[codex:send-command] Received: tabId=' + tabId + ' queue=' + shouldQueue + ' statusAtSend=' + (statusAtSend || '-') + ' handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' resolvedSource=' + codexSource + ' command="' + command + '"');
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no_terminal' };
   const candidates = await findAiDescendantProcessesByTab(tabId, 'codex');
@@ -14184,11 +14385,11 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
     const result = await safePasteAndSubmit(term, command, {
       submit: true,
       ctrlCFirst: false,
-      fast: true,
+      fast: false,
       submitSequence: shouldQueue ? '\t' : '\r',
       submitLabel: shouldQueue ? 'Tab(queue)' : 'Enter',
       handoffId,
-      source: source || (shouldQueue ? 'codex-history-queue' : 'codex-history-send'),
+      source: codexSource,
       logPrefix: '[codex:send-command:' + tabId + ']',
     });
     if (result && typeof result === 'object') {
@@ -14235,6 +14436,52 @@ ipcMain.handle('codex:select-model-effort', async (_event, {
       }));
     } catch (error) {
       console.error('[codex:select-model-effort] Error:', error);
+      try { term.write('\x1b'); } catch {}
+      return { success: false, error: error.message };
+    }
+  });
+  codexPickerQueue.set(tabId, next);
+  try {
+    return await next;
+  } finally {
+    if (codexPickerQueue.get(tabId) === next) codexPickerQueue.delete(tabId);
+  }
+});
+
+ipcMain.handle('codex:send-live-slash-command', async (_event, {
+  tabId,
+  command,
+  hasDraft = null,
+  draftSource = '',
+  draftPreview = '',
+  visualHasDraft = null,
+  visualSource = '',
+  visualPreview = '',
+  turnBusy = false,
+}) => {
+  console.log('[codex:send-live-slash-command] Received: tabId=' + tabId + ' command=' + JSON.stringify(command || '') + ' hasDraft=' + hasDraft + ' draftSource=' + (draftSource || 'n/a') + ' draftPreview=' + JSON.stringify(String(draftPreview || '').slice(0, 120)) + ' visualHasDraft=' + visualHasDraft + ' visualSource=' + (visualSource || 'n/a') + ' visualPreview=' + JSON.stringify(String(visualPreview || '').slice(0, 120)) + ' turnBusy=' + turnBusy);
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, error: 'terminal not found' };
+  if (!String(command || '').trim().startsWith('/')) {
+    return { success: false, error: 'slash command is required' };
+  }
+
+  const prev = codexPickerQueue.get(tabId) || Promise.resolve();
+  const next = prev.catch(() => {}).then(async () => {
+    try {
+      return await withPtyWriteLock(term, () => sendCodexLiveSlashCommand(term, {
+        tabId,
+        command,
+        hasDraft,
+        draftSource,
+        draftPreview,
+        visualHasDraft,
+        visualSource,
+        visualPreview,
+        turnBusy,
+      }));
+    } catch (error) {
+      console.error('[codex:send-live-slash-command] Error:', error);
       try { term.write('\x1b'); } catch {}
       return { success: false, error: error.message };
     }

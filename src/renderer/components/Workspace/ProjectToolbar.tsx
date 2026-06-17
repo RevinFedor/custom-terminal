@@ -16,7 +16,7 @@ import { useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/u
 
 const { ipcRenderer } = window.require('electron');
 
-export default function ProjectToolbar() {
+export default function ProjectToolbar({ isSystemProject = false }: { isSystemProject?: boolean }) {
   const showToast = useUIStore((state) => state.showToast);
   const activeProjectId = useWorkspaceStore((state) => state.activeProjectId);
   const currentView = useWorkspaceStore((state) => {
@@ -208,6 +208,7 @@ export default function ProjectToolbar() {
   }, [activeProjectId, currentProjectPath]);
 
   const handleOpenVSCode = useCallback(() => {
+    if (isSystemProject) return;
     const cwd = resolveProjectCwd();
     if (!cwd) {
       showToast('Не удалось определить директорию проекта', 'error');
@@ -219,13 +220,14 @@ export default function ProjectToolbar() {
         showToast('Не удалось открыть VS Code (нужен `code` в PATH)', 'error');
       }
     });
-  }, [resolveProjectCwd, showToast]);
+  }, [isSystemProject, resolveProjectCwd, showToast]);
 
   // Trampoline to GT Editor via custom `gteditor://open` URL scheme. macOS
   // LaunchServices routes to the already-running GT Editor.app (or cold-launches
   // it), and the receiving renderer adds the folder to its directory list if
   // missing — see gt-editor/docs/knowledge/fact-goto-modal.md.
   const handleOpenGTEditor = useCallback(() => {
+    if (isSystemProject) return;
     const cwd = resolveProjectCwd();
     if (!cwd) {
       showToast('Не удалось определить директорию проекта', 'error');
@@ -235,7 +237,7 @@ export default function ProjectToolbar() {
     shell.openExternal(`gteditor://open?folder=${encodeURIComponent(cwd)}`).catch((err: Error) => {
       showToast(`GT Editor: ${err.message}`, 'error');
     });
-  }, [resolveProjectCwd, showToast]);
+  }, [isSystemProject, resolveProjectCwd, showToast]);
 
   // Cmd+G — глобальный хоткей для «Открыть в GT Editor». Используем `e.code`
   // ('KeyG'), а не `e.key`, чтобы хоткей работал в кириллической раскладке
@@ -247,6 +249,7 @@ export default function ProjectToolbar() {
   // в браузерах, потенциальный конфликт).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (isSystemProject) return;
       if (!e.metaKey || e.shiftKey || e.altKey || e.ctrlKey) return;
       if (e.code !== 'KeyG') return;
       const target = e.target as HTMLElement | null;
@@ -258,7 +261,7 @@ export default function ProjectToolbar() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [handleOpenGTEditor]);
+  }, [handleOpenGTEditor, isSystemProject]);
 
   const handleCompressLogs = async () => {
     if (isCompressing) return;
@@ -322,19 +325,20 @@ export default function ProjectToolbar() {
     <div
       className="h-[30px] w-full bg-panel flex items-stretch"
     >
-      {/* File Explorer Toggle (Cmd+B) — was inside TabBar before the layout migration */}
-      <Tooltip content="Toggle file explorer">
-      <button
-        onClick={() => {
-          if (!activeProjectId) return;
-          const { sidebarOpen } = getSidebarState(activeProjectId);
-          setSidebarOpen(activeProjectId, !sidebarOpen);
-        }}
-        className="h-full flex items-center px-3 text-[#666] hover:text-white hover:bg-[rgba(255,255,255,0.05)] transition-all duration-150"
-      >
-        <PanelLeft size={14} />
-      </button>
-      </Tooltip>
+      {!isSystemProject && (
+        <Tooltip content="Toggle file explorer">
+        <button
+          onClick={() => {
+            if (!activeProjectId) return;
+            const { sidebarOpen } = getSidebarState(activeProjectId);
+            setSidebarOpen(activeProjectId, !sidebarOpen);
+          }}
+          className="h-full flex items-center px-3 text-[#666] hover:text-white hover:bg-[rgba(255,255,255,0.05)] transition-all duration-150"
+        >
+          <PanelLeft size={14} />
+        </button>
+        </Tooltip>
+      )}
 
       {/* Home Button */}
       <Tooltip content="Project Home">
@@ -363,54 +367,54 @@ export default function ProjectToolbar() {
       </button>
       </Tooltip>
 
-      {/* Browser Tab Button */}
-      <Tooltip content="Open browser tab">
-      <button
-        onClick={() => {
-          if (activeProjectId) {
-            createBrowserTab(activeProjectId);
-            setProjectView(activeProjectId, 'terminal');
-          }
-        }}
-        style={buttonStyle(false)}
-        onMouseEnter={(e) => handleMouseEnter(e, false)}
-        onMouseLeave={(e) => handleMouseLeave(e, false)}
-      >
-        <Globe size={14} />
-      </button>
-      </Tooltip>
+      {!isSystemProject && (
+        <>
+          <Tooltip content="Open browser tab">
+          <button
+            onClick={() => {
+              if (activeProjectId) {
+                createBrowserTab(activeProjectId);
+                setProjectView(activeProjectId, 'terminal');
+              }
+            }}
+            style={buttonStyle(false)}
+            onMouseEnter={(e) => handleMouseEnter(e, false)}
+            onMouseLeave={(e) => handleMouseLeave(e, false)}
+          >
+            <Globe size={14} />
+          </button>
+          </Tooltip>
 
-      {/* Open in VS Code Button */}
-      <Tooltip content="Открыть проект в VS Code">
-      <button
-        onClick={handleOpenVSCode}
-        style={buttonStyle(false)}
-        onMouseEnter={(e) => handleMouseEnter(e, false)}
-        onMouseLeave={(e) => handleMouseLeave(e, false)}
-      >
-        <VscVscode size={14} />
-      </button>
-      </Tooltip>
+          <Tooltip content="Открыть проект в VS Code">
+          <button
+            onClick={handleOpenVSCode}
+            style={buttonStyle(false)}
+            onMouseEnter={(e) => handleMouseEnter(e, false)}
+            onMouseLeave={(e) => handleMouseLeave(e, false)}
+          >
+            <VscVscode size={14} />
+          </button>
+          </Tooltip>
 
-      {/* Open in GT Editor Button */}
-      <Tooltip content="Открыть проект в GT Editor (⌘G)">
-      <button
-        onClick={handleOpenGTEditor}
-        style={buttonStyle(false)}
-        onMouseEnter={(e) => handleMouseEnter(e, false)}
-        onMouseLeave={(e) => handleMouseLeave(e, false)}
-      >
-        <FileEdit size={14} />
-      </button>
-      </Tooltip>
+          <Tooltip content="Открыть проект в GT Editor (⌘G)">
+          <button
+            onClick={handleOpenGTEditor}
+            style={buttonStyle(false)}
+            onMouseEnter={(e) => handleMouseEnter(e, false)}
+            onMouseLeave={(e) => handleMouseLeave(e, false)}
+          >
+            <FileEdit size={14} />
+          </button>
+          </Tooltip>
 
-      {/* Semantic Index Status */}
-      <SemanticIndexButton
-        onOpenSettings={() => {
-          // App.tsx слушает settings:open и открывает SettingsModal на нужном табе.
-          window.dispatchEvent(new CustomEvent('settings:open', { detail: { tab: 'colors' } }));
-        }}
-      />
+          <SemanticIndexButton
+            onOpenSettings={() => {
+              // App.tsx слушает settings:open и открывает SettingsModal на нужном табе.
+              window.dispatchEvent(new CustomEvent('settings:open', { detail: { tab: 'colors' } }));
+            }}
+          />
+        </>
+      )}
 
       {/* Resume All Interrupted Sessions Button - only shows when there are interrupted tabs */}
       {interruptedTabs.length > 0 && (
@@ -486,9 +490,11 @@ export default function ProjectToolbar() {
           pipeline). Pair-aligned with CopySessionWithChips popover: both anchor to
           their trigger's bottom-right edge so the two popovers share the same
           downward-opening direction. */}
-      <div className="flex items-center pr-2">
-        <DocsButton />
-      </div>
+      {!isSystemProject && (
+        <div className="flex items-center pr-2">
+          <DocsButton />
+        </div>
+      )}
 
       {/* CopySessionButton + chip-row — moved here from InfoPanel. Renders nothing
           when there's no active Claude/Gemini session, so the toolbar collapses
