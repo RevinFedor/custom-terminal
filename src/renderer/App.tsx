@@ -1924,15 +1924,65 @@ function App() {
             return reply(false, null, String(e?.message || e));
           }
         }
+        if (action === 'inspectAgentDraft') {
+          const { tabId } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          const { toolType, runtime } = describeAgentTab(tabId);
+          if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
+          try {
+            const result = runtime.inspectDraft
+              ? runtime.inspectDraft(tabId)
+              : { hasDraft: null, preview: '', source: 'unsupported' };
+            return reply(true, { tabId, toolType, ...(result || {}) });
+          } catch (e: any) {
+            console.log('[MobDraft:Bridge] inspect err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
+            return reply(false, null, String(e?.message || e));
+          }
+        }
+        if (action === 'rewindAgentTimeline') {
+          const {
+            tabId,
+            targetIndex,
+            targetText,
+            targetFullText,
+            rewindableCount,
+            skipDuplicates,
+          } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          const { toolType, runtime } = describeAgentTab(tabId);
+          if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
+          if (toolType !== 'claude' && toolType !== 'codex') return reply(false, null, 'rewind unsupported for tool');
+          try {
+            const channel = toolType === 'codex' ? 'codex:open-history-menu' : 'claude:open-history-menu';
+            const result = await ipcRenderer.invoke(channel, {
+              tabId,
+              targetIndex,
+              targetText,
+              targetFullText,
+              rewindableCount,
+              skipDuplicates,
+            });
+            const ok = result?.success !== false;
+            return reply(ok, { tabId, toolType, ...(result || {}) }, ok ? undefined : result?.error);
+          } catch (e: any) {
+            console.log('[MobRewind:Bridge] err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
+            return reply(false, null, String(e?.message || e));
+          }
+        }
         if (action === 'sendMessageAuto') {
           // Single dispatch entry for /api/sdk-tabs/:id/send — backend used
           // to do TWO bridge round-trips (status check + actual send). Now
           // the routing happens here, in the same call that does the work.
-          const { tabId, prompt, model, effort, thinking, cwd } = payload || {};
+          const { tabId, prompt, model, effort, thinking, cwd, handoffId, source, statusAtSend, queue } = payload || {};
           if (!tabId || !prompt) return reply(false, null, 'tabId+prompt required');
           const { tab, toolType, runtime } = describeAgentTab(tabId);
           if (runtime && toolType) {
-            const result = await runtime.sendPrompt(tabId, prompt);
+            const result = await runtime.sendPrompt(tabId, prompt, {
+              handoffId: typeof handoffId === 'string' ? handoffId : undefined,
+              source: typeof source === 'string' ? source : 'mobile-native',
+              statusAtSend: typeof statusAtSend === 'string' ? statusAtSend : undefined,
+              queue: queue === true,
+            });
             const ok = result?.success !== false;
             return reply(ok, { tabId, toolType, ...(result || {}) }, ok ? undefined : result?.error);
           }

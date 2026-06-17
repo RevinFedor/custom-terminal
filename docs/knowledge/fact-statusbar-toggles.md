@@ -32,12 +32,16 @@ lsof -ti:5181,3000 2>/dev/null | xargs -r kill -9 2>/dev/null; npm run dev
 
 ### Port autodetect
 `scanProjectPorts(cwd)` — рекурсия глубиной до 1 (immediate subfolders, для monorepo типа `uav/agrofield_back` + `uav/agrofield_front`). Источники в приоритете:
-1. **`package.json::notedTerminal.ports`** — manual override `{ "notedTerminal": { "ports": [3000, 5173] } }`
-2. **vite-конфиги** (`vite.config.{ts,js,mjs}`, `electron.vite.config.*`) — regex `\bport\s*:\s*(\d+)`
-3. **`.env / .env.local / .env.development`** — `^[A-Z_]*PORT\s*=\s*(\d+)`
-4. **NestJS `src/main.ts`** — `app.listen(process.env.PORT || NNNN)` fallback literal
+1. **`package.json::scripts` ignore env** — `NOTED_TERMINAL_IGNORE_PORTS=6379,9000,9001 npm run dev` / `NOTED_TERMINAL_IGNORE_PORTS=6379,9000,9001 ./scripts/dev.sh`. Preferred способ для сложных monorepo: проект не перечисляет какие app-порты надо убивать, а только объявляет инфраструктуру, которую трогать нельзя.
+2. **`package.json::scripts` explicit override** — `NOTED_TERMINAL_PORTS=3005,5175 npm run dev`. Использовать только когда автодетект принципиально невозможен; это не preferred путь, потому что заставляет сопровождать kill-list вручную.
+3. **`package.json::notedTerminal.ports`** — legacy/manual override `{ "notedTerminal": { "ports": [3000, 5173] } }`.
+4. **vite-конфиги** (`vite.config.{ts,js,mjs}`, `electron.vite.config.*`) — regex `\bport\s*:\s*(\d+)`.
+5. **`.env / .env.local / .env.development`** — app-порты `PORT=`, `BACKEND_PORT=`, `FRONTEND_PORT=`. Infra-порты (`REDIS_PORT`, `POSTGRES_PORT`, `MINIO_PORT`, `S3_PORT` и аналоги) дополнительно исключены, иначе `kill dev-ports` может убить Docker/OrbStack port-forward вместо старого dev-server.
+6. **NestJS `src/main.ts`** — `app.listen(process.env.PORT || NNNN)` fallback literal, только если более явный app-порт не найден.
 
 Cache `projectPortsCache` per-cwd, TTL 30s — иначе grep на каждый start/stop замедляет повторные циклы.
+
+Шрам 17.06.2026: в `uav/agrofield_back/.env` был `REDIS_PORT=6379`, scanner считал его dev-портом и visible shell-line превращалась в `lsof -ti:3001,5175,6379 | xargs kill -9; npm run dev`. На macOS `6379` держит OrbStack forwarder для Redis, поэтому kill ломал Docker/Redis перед стартом backend → `ECONNREFUSED 127.0.0.1:6379`. Fix: для `uav` root script объявляет только ignore-list `NOTED_TERMINAL_IGNORE_PORTS=6379,9000,9001 ./scripts/dev.sh`; scanner продолжает сам находить app-порты и после вычитания ignore-list отдаёт `[3005,5175]`.
 
 ### SIGKILL без grace, не SIGTERM
 Семантика toggle — *"make the port available NOW, не negotiate"*. Никаких 800ms grace period как у `terminal:stop-ai-process` (для Claude процессов). Если кто-то держит порт — он будет killed без объяснений. Acceptable: юзер явно включил toggle = принял этот контракт.

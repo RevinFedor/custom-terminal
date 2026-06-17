@@ -45,6 +45,7 @@ export interface AgentSendPromptOptions {
   handoffId?: string;
   source?: string;
   statusAtSend?: AgentPtyStatus;
+  queue?: boolean;
 }
 
 export interface HistoryAgentRuntime {
@@ -156,7 +157,7 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
     return existing;
   }
   useWorkspaceStore.getState().clearInterruptedState?.(tabId);
-  const queue = false;
+  const queue = options.queue === true;
   console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' submitIntent=enter chars=' + prompt.length);
   const work = ipcRenderer.invoke('codex:send-command', tabId, prompt, {
     queue,
