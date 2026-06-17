@@ -178,9 +178,11 @@ function describeCodexDraftProbeRow(buf: any, row: number): string {
 }
 
 function buildCodexProbeDebug(buf: any, terminal: XTerminal, cursorRows: number[], visibleStart: number, visibleEnd: number, reason: string): string {
+  const tailStart = Math.max(0, buf.length - Math.max(12, Math.min(terminal.rows || 12, 32)));
   const sampleRows = Array.from(new Set([
     ...cursorRows,
     ...Array.from({ length: Math.max(0, visibleEnd - visibleStart) }, (_, i) => visibleStart + i),
+    ...Array.from({ length: Math.max(0, buf.length - tailStart) }, (_, i) => tailStart + i),
   ])).filter((row) => row >= 0 && row < buf.length);
   return [
     `reason=${reason}`,
@@ -191,6 +193,7 @@ function buildCodexProbeDebug(buf: any, terminal: XTerminal, cursorRows: number[
     `cursorY=${buf.cursorY}`,
     `viewportY=${buf.viewportY}`,
     `visible=${visibleStart}-${visibleEnd}`,
+    `tail=${tailStart}-${buf.length}`,
     `cursorRows=${cursorRows.join(',') || 'none'}`,
     `samples=[${sampleRows.map((row) => describeCodexDraftProbeRow(buf, row)).join(' | ')}]`,
   ].join(' ');
@@ -279,6 +282,25 @@ export const terminalRegistry = {
           ? buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'viewport-empty-false')
           : undefined;
         return { ...parsed, source: 'viewport:' + row + (parsed.sourceSuffix || ''), debug };
+      }
+    }
+
+    // If the desktop terminal is scrolled away from bottom, viewport rows can be
+    // unrelated to the live Codex composer. The cursor row is normally enough,
+    // but after TUI redraws it can lag for one frame. Scan the buffer tail too:
+    // the prompt line lives there even when the visible viewport is stale.
+    const tailStart = Math.max(0, buf.length - Math.max(12, Math.min(terminal.rows || 12, 32)));
+    for (let row = buf.length - 1; row >= tailStart; row--) {
+      if (row >= visibleStart && row < visibleEnd) continue;
+      if (cursorRows.includes(row)) continue;
+      const snapshot = getLogicalLineSnapshotAt(buf, row);
+      if (!/[›❯]/.test(snapshot.text)) continue;
+      const parsed = extractCodexDraftFromLine(snapshot);
+      if (parsed.hasDraft !== null) {
+        const debug = parsed.hasDraft === false && !parsed.preview
+          ? buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'tail-empty-false')
+          : undefined;
+        return { ...parsed, source: 'tail:' + row + (parsed.sourceSuffix || ''), debug };
       }
     }
 

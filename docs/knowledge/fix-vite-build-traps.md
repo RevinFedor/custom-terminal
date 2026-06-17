@@ -95,7 +95,7 @@ Root `index.html` должен оставаться Vite source input:
 
 ---
 
-## Часть 4: root `main-*.js` bundle попал в git и заблокировал push
+## Часть 4: root `main-*.js` bundle или sensitive asset попал в git history
 
 ### Симптом
 `git push` отклоняется GitHub push protection / secret scanning, хотя текущий working tree уже не содержит ключей. В UI при этом счётчики ahead/behind выглядят пугающе (`150↑ 146↓`), потому что локальная история и удалённая ветка разошлись после force-update/rewrites.
@@ -103,5 +103,7 @@ Root `index.html` должен оставаться Vite source input:
 ### Причина
 Случайно отслеженный root-level generated bundle вида `main-*.js` попал в историю. Такие файлы не являются source проекта: это большой minified артефакт сборки, в котором могут оказаться inline env/config фрагменты. Даже если файл удалён в текущем коммите, secret scanning проверяет всю pushed history и блокирует push до удаления записи из истории.
 
+Тот же класс для binary assets: README/marketing screenshot может содержать public remote URL, token-like query или IP. Замазать текущий PNG недостаточно — старые binary blob'ы остаются достижимы через git history, fork/clone/cache и будут всплывать при аудитах или публикации старого commit'а.
+
 ### Решение
-Текущий source-fix — `/main-*.js` в `.gitignore`: root generated bundles не должны попадать в индекс. Если файл уже попал в pushed range и GitHub блокирует push, обычный follow-up commit с удалением недостаточен; нужно переписать историю (например, filter-branch/filter-repo по конкретным root bundle paths), затем force-push уже очищенную ветку. Перед force-push сделать backup branch и проверить, что текущий tracked tree больше не содержит секретного паттерна. Не переносить это правило на `dist/renderer/assets/main-*.js`: dist artifacts живут в своей папке и управляются build/release flow, проблема именно в root-level случайном bundle рядом с source-файлами.
+Текущий source-fix — `/main-*.js` в `.gitignore`: root generated bundles не должны попадать в индекс. Если файл уже попал в pushed range и GitHub блокирует push, обычный follow-up commit с удалением недостаточен; нужно переписать историю (например, filter-branch/filter-repo по конкретным root bundle paths), затем force-push уже очищенную ветку. Для чувствительных PNG/JPG лучше работать по blob ids (`git rev-list --objects --all -- <path>` → old blob ids → `git filter-repo --strip-blobs-with-ids <file>`), потому что path может сохраняться тем же, а содержимое должно замениться только на redacted current blob. Перед force-push сделать backup branch и проверить, что старые blob ids недоступны (`git cat-file -e <old>` должен падать). Не переносить это правило на `dist/renderer/assets/main-*.js`: dist artifacts живут в своей папке и управляются build/release flow, проблема именно в root-level случайном bundle рядом с source-файлами.

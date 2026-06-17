@@ -7,6 +7,13 @@ StatusBar по нижнему краю app — место для **глобал�
 - **Effort selector** — default `defaultClaudeEffort` для всех новых Claude сессий (см. `fact-claude-tui-control.md::Auto-inject /effort при запуске Claude`)
 - **kill dev-ports** — pre-kill портов перед npm-script start/restart/stop
 - **bridges** — подсветка hover-bridges debug overlay
+- **streamer mode** — visual redaction для remote-control URL в toolbar/mobile companion, чтобы public endpoint не попадал в screen-share
+
+## streamer mode — visual redaction remote URL
+
+Streamer mode — глобальный app-level toggle, не per-project и не per-tab. Он скрывает `WebServerChip` с `remote-control.f9922.tech:8443` / `local:<port>` из нижнего toolbar, но **не** останавливает web-server, autossh tunnel, SSE или bearer-token auth. Смысл — privacy для стрима/скриншота: пользователь продолжает управлять Terminal с телефона, просто endpoint не светится на экране.
+
+Toggle живёт слева рядом с remote chip, а не в Settings: это режим видимости текущей публичной поверхности, его надо включать одним жестом прямо перед демонстрацией. Persistence такая же origin-safe app-state модель, как у остальных global settings: synchronous local mirror для мгновенного init + authoritative `app:setState` в SQLite/main, чтобы dev vite-port shifts не сбрасывали режим. Mobile-web меняет тот же флаг через `/api/app-settings`; нативные клиенты, которые сами рисуют host, должны иметь эквивалентный redaction state. Переносимый принцип — `methodology/переносимый-дизайн.md::Privacy-toggle скрывает sensitive surface`.
 
 ## kill dev-ports — visible shell-line, не background IPC
 
@@ -60,7 +67,7 @@ Legacy mirror в localStorage сохраняется (для синхронно�
 
 ## Geometry: расположение в StatusBar
 
-Все toggles справа, разделены `gap-2`. Левая часть зарезервирована под status indicators (git/lints/etc — пока пусто).
+Большинство глобальных toggles справа, разделены `gap-2`. Исключение — streamer mode: он стоит слева рядом с `WebServerChip`, потому что меняет видимость именно соседнего remote URL и должен читаться как быстрый privacy switch перед stream/share.
 
 Между EffortSelector (specialised popover-toggle) и binary toggles — `gap-2` визуально достаточно, не нужен divider.
 
@@ -73,5 +80,6 @@ Legacy mirror в localStorage сохраняется (для синхронно�
 ## Связанные подсистемы
 
 - `fix-localstorage-origin.md` — почему SQLite, не localStorage
+- `fact-remote-access.md::Streamer mode` — что именно скрывается у public URL и что не выключается
 - `fact-claude-tui-control.md::Auto-inject /effort` — EffortSelector в той же StatusBar
 - `methodology/переносимый-дизайн.md::Visible side effect > silent IPC` — переносимый принцип

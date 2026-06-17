@@ -1,6 +1,7 @@
 // Claude usage limits chip for the project toolbar.
 //
-// Compact display: just the weekly utilization % colored by severity. Two
+// Compact display: weekly utilization % colored by severity, with Codex's
+// 5-hour % shown inline when available. Two
 // affordances per project convention (Cmd+Hover, design.md::Closing /
 // Cmd+Shift pin):
 //
@@ -1798,7 +1799,9 @@ function CodexUsageChip() {
   const weekly = usageData?.seven_day || usageData?.secondary || null;
   const fiveHour = usageData?.five_hour || usageData?.primary || null;
   const weeklyPct = weekly?.utilization ?? null;
+  const fiveHourPct = fiveHour?.utilization ?? null;
   const chipColor = colorForPct(weeklyPct);
+  const fiveHourColor = colorForPct(fiveHourPct);
   const resetShort = formatResetShort(weekly?.resets_at);
   const accountLabel = selectedAccount?.label || null;
 
@@ -1822,7 +1825,7 @@ function CodexUsageChip() {
         onMouseEnter={() => setTriggerHover(true)}
         onMouseLeave={() => setTriggerHover(false)}
         title={weeklyPct != null
-          ? `Codex${accountLabel ? ` ${accountLabel}` : ''} weekly: ${formatPct(weeklyPct)}${resetShort ? ` • resets in ${resetShort}` : ''}`
+          ? `Codex${accountLabel ? ` ${accountLabel}` : ''} weekly: ${formatPct(weeklyPct)} • 5-hour: ${formatPct(fiveHourPct)}${resetShort ? ` • weekly resets in ${resetShort}` : ''}`
           : (error || 'Codex usage appears after Codex writes a token_count record')}
         style={{
           display: 'inline-flex',
@@ -1853,6 +1856,8 @@ function CodexUsageChip() {
           <>
             <CodexIcon size={15} muted={weeklyPct == null} />
             <span>{formatPct(weeklyPct)}</span>
+            <span style={{ color: '#6b7280', fontWeight: 500 }}>/</span>
+            <span style={{ color: fiveHourPct != null ? fiveHourColor : '#6b7280' }}>{formatPct(fiveHourPct)}</span>
             {resetShort && (
               <span style={{ color: '#6b7280', fontWeight: 500 }}>{resetShort}</span>
             )}

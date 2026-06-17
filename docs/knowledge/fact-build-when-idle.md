@@ -67,7 +67,15 @@ GET /api/active-loaders   (Bearer-token, тот же ~/.noted-terminal/web-token
 Механика observe (`observeTerminalIdle` в voice-record `web-server.js`):
 - **Exclude-caller**: `returnTo.tabId` вычитается из списка блокеров. Вкладка-инициатор busy
   именно потому, что запустила rebuild — ждать её = вечный дедлок. iOS-путь без `returnTo`
-  ждёт полный idle (телефон уже сделал preflight, поэтому проходит за пару поллов).
+  больше не делает собственный blocking preflight: телефон показывает confirm/status, а
+  решение “что можно остановить, а что надо ждать” живёт здесь, в Mac-side Voice Record.
+- **Auto-stop только для обычных процессов**: перед wait endpoint пробует остановить blockers
+  `kind:"process"` / devServer через `POST /terminal/stop`. Это нужно для `npm run dev` и
+  похожих долгоживущих серверов, которые иначе держат install бесконечно. AI/Claude/Codex/
+  Gemini blockers никогда не auto-stop'ятся — их ждём, чтобы не убить turn посередине.
+  Результат пишется в `wait.autoStopped`/`job.autoStopped` для desktop и iOS status UI.
+  Если установленный прод ещё не знает `/terminal/stop`, Voice Record использует fallback
+  Ctrl+C через старый `/terminal/run` route.
 - **Discovery прода**: `web-server-<pid>.json` (живой PID) + авторитетный `isPackaged` из
   соседнего `mcp-port-<pid>` (тот же main PID пишет оба файла); фоллбэк — `ps`-маркер
   `/Applications/Noted Terminal.app`. Тот же stale-файл фильтр, что в wrapper'е.
