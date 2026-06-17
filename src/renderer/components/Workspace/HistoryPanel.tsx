@@ -19,6 +19,24 @@ import { ToolCallPart as CBToolCallPart, ThinkBlock as CBThinkBlock, Markdown as
 
 const { ipcRenderer } = window.require('electron');
 
+let historyRendererLogSeq = 0;
+const historyRendererBoot = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
+const historyDiag = (msg: string) => {
+  const line = '[HistoryHandoff] ' + msg;
+  console.warn(line);
+  try {
+    ipcRenderer.send('log:renderer', {
+      msg: line,
+      seq: ++historyRendererLogSeq,
+      boot: historyRendererBoot,
+      emitAbs: performance.timeOrigin + performance.now(),
+      emitIso: new Date().toISOString(),
+    });
+  } catch {
+    // best-effort diagnostics only
+  }
+};
+
 interface FileAction {
   tool: 'Edit' | 'Write' | 'Read';
   filePath: string;
@@ -50,9 +68,15 @@ const isTaskAction = (a: Action): a is TaskAction =>
 
 interface FullHistoryEntry {
   uuid: string;
-  role: 'user' | 'assistant' | 'compact' | 'fork' | 'plan-mode' | 'continued';
+  role: 'user' | 'assistant' | 'compact' | 'fork' | 'plan-mode' | 'continued' | 'queued' | 'rewind';
   timestamp: string;
   content: string;
+  queueStatus?: 'queued' | 'sent' | 'cancelled' | 'failed';
+  handoffId?: string;
+  statusReason?: string;
+  statusChangedAt?: number;
+  rewindStatus?: 'rewinding' | 'done' | 'failed';
+  optimisticAt?: number;
   thinking?: string;
   actions?: Action[];
   sessionId: string;
@@ -71,6 +95,131 @@ interface HistoryPanelProps {
   enableClaudePtyControls?: boolean;
   embedded?: boolean;
 }
+
+interface RewindPreviewState {
+  opId: string;
+  targetUuid: string;
+  targetText: string;
+  startedAt: number;
+}
+
+interface PromptHandoffMeta {
+  text: string;
+  submittedAt: number;
+}
+
+interface SuppressedPrompt {
+  handoffId: string;
+  text: string;
+  since: number;
+  until: number;
+  expiresAt: number;
+  reason: string;
+}
+
+const LOCAL_PROMPT_PREFIX = 'local-prompt-';
+const LOCAL_REWIND_PREFIX = 'local-rewind-';
+const LOCAL_PROMPT_FAILURE_TTL_MS = 15000;
+
+const normalizeHistoryPromptText = (text: string) => String(text || '')
+  .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+  .replace(/\[200~/g, '').replace(/~\]/g, '').trim();
+
+const promptPreview = (text: string, max = 80) =>
+  normalizeHistoryPromptText(text).replace(/\s+/g, ' ').slice(0, max);
+
+const createPromptHandoffId = () =>
+  Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+
+const entryMatchesSuppressedPrompt = (entry: FullHistoryEntry, suppressed: SuppressedPrompt) => {
+  if (isLocalPromptEntry(entry)) return false;
+  if (entry.role !== 'user' && entry.role !== 'queued') return false;
+  if (normalizeHistoryPromptText(entry.content) !== suppressed.text) return false;
+  const entryAt = Date.parse(entry.timestamp || '');
+  return !Number.isFinite(entryAt) || (entryAt >= suppressed.since && entryAt <= suppressed.until);
+};
+
+const filterSuppressedPromptEntries = (
+  entries: FullHistoryEntry[],
+  suppressions: Iterable<SuppressedPrompt>,
+) => {
+  const active = Array.from(suppressions);
+  if (active.length === 0) return { entries, hidden: 0 };
+  const filtered = entries.filter((entry) =>
+    !active.some((suppressed) => entryMatchesSuppressedPrompt(entry, suppressed))
+  );
+  return { entries: filtered, hidden: entries.length - filtered.length };
+};
+
+const isLocalPromptEntry = (entry: FullHistoryEntry) =>
+  entry.role === 'queued' && entry.uuid.startsWith(LOCAL_PROMPT_PREFIX);
+
+const isLocalRewindEntry = (entry: FullHistoryEntry) =>
+  entry.role === 'rewind' && entry.uuid.startsWith(LOCAL_REWIND_PREFIX);
+
+const serverHasPromptEntry = (serverEntries: FullHistoryEntry[], localEntry: FullHistoryEntry) => {
+  const normalized = normalizeHistoryPromptText(localEntry.content);
+  const localAt = localEntry.optimisticAt || Date.parse(localEntry.timestamp) || Date.now();
+  return serverEntries.some((entry) => {
+    if (entry.role !== 'user' && entry.role !== 'queued') return false;
+    if (normalizeHistoryPromptText(entry.content) !== normalized) return false;
+    const entryAt = Date.parse(entry.timestamp || '');
+    return !Number.isFinite(entryAt) || entryAt >= localAt - 5000;
+  });
+};
+
+const mergeServerAndLocalEntries = (serverEntries: FullHistoryEntry[], currentEntries: FullHistoryEntry[]) => {
+  const now = Date.now();
+  const locals = currentEntries.filter((entry) =>
+    (isLocalPromptEntry(entry) &&
+      !serverHasPromptEntry(serverEntries, entry) &&
+      (entry.queueStatus !== 'cancelled' && entry.queueStatus !== 'failed'
+        ? true
+        : now - (entry.statusChangedAt || entry.optimisticAt || Date.parse(entry.timestamp || '') || now) < LOCAL_PROMPT_FAILURE_TTL_MS)) ||
+    isLocalRewindEntry(entry)
+  );
+  return locals.length > 0 ? [...serverEntries, ...locals] : serverEntries;
+};
+
+const entryClockMs = (entry: FullHistoryEntry) => {
+  if (entry.optimisticAt && Number.isFinite(entry.optimisticAt)) return entry.optimisticAt;
+  const parsed = Date.parse(entry.timestamp || '');
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const shouldCarryAfterRewindTarget = (entry: FullHistoryEntry, preview: RewindPreviewState) => {
+  if (isLocalRewindEntry(entry) && entry.uuid.includes(preview.opId)) return true;
+  if (isLocalPromptEntry(entry)) return true;
+  return entryClockMs(entry) >= preview.startedAt - 1000;
+};
+
+const buildRewindPreviewEntries = (rawEntries: FullHistoryEntry[], preview: RewindPreviewState | null) => {
+  if (!preview) return { entries: rawEntries, hiddenCount: 0 };
+  const targetIndex = rawEntries.findIndex((entry) => entry.uuid === preview.targetUuid);
+  if (targetIndex < 0) return { entries: rawEntries, hiddenCount: 0 };
+
+  // Native rewind moves the selected user prompt into the History input and
+  // clears Claude's terminal composer. Until that draft is submitted again,
+  // the target user row is not part of the previewed active history; the local
+  // rewind marker represents it.
+  const entries = rawEntries.slice(0, targetIndex);
+  let hiddenCount = 1;
+  for (let i = targetIndex + 1; i < rawEntries.length; i++) {
+    const entry = rawEntries[i];
+    if (shouldCarryAfterRewindTarget(entry, preview)) entries.push(entry);
+    else hiddenCount++;
+  }
+  return { entries, hiddenCount };
+};
+
+const serverHistoryMaterializedRewindBranch = (serverEntries: FullHistoryEntry[], preview: RewindPreviewState) => {
+  const targetIndex = serverEntries.findIndex((entry) => entry.uuid === preview.targetUuid);
+  if (targetIndex < 0) return false;
+  const afterTarget = serverEntries.slice(targetIndex + 1);
+  const hasOldFuture = afterTarget.some((entry) => entryClockMs(entry) < preview.startedAt - 1000);
+  const hasNewUser = afterTarget.some((entry) => entry.role === 'user' && entryClockMs(entry) >= preview.startedAt - 1000);
+  return hasNewUser && !hasOldFuture;
+};
 
 // Thinking + markdown now render via @noted/claude-blocks (CBThinkBlock /
 // CBMarkdown) — the local ThinkingBlock and the MarkdownRenderer import were
@@ -315,6 +464,84 @@ const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolT
         fontSize: 12, color: '#8888cc', fontStyle: 'italic',
       }}>
         Session continued from previous conversation...
+      </div>
+    );
+  }
+
+  if (entry.role === 'queued') {
+    const status = entry.queueStatus || 'queued';
+    const queued = status === 'queued';
+    const sent = status === 'sent';
+    const cancelled = status === 'cancelled';
+    const failed = status === 'failed';
+    const label = queued ? 'QUEUED' : sent ? 'SENT' : cancelled ? 'CANCELLED BEFORE JSONL' : 'SEND FAILED';
+    const accent = failed ? '#ef4444' : cancelled ? '#a1a1aa' : queued ? '#d97706' : '#71717a';
+    const textColor = failed ? '#fca5a5' : queued ? '#fbbf24' : '#a1a1aa';
+    return (
+      <div style={{
+        padding: '8px 12px',
+        backgroundColor: failed ? 'rgba(239, 68, 68, 0.08)' : queued ? 'rgba(217, 119, 6, 0.08)' : 'rgba(113, 113, 122, 0.08)',
+        borderRadius: 6,
+        borderLeft: '3px solid ' + accent,
+      }}>
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+          fontSize: 10,
+          color: textColor,
+          marginBottom: 4,
+          fontWeight: 700,
+          letterSpacing: 0.6,
+        }}>
+          {(queued || sent) && <HistorySpinner size={10} />}
+          <span>{label}</span>
+          {entry.timestamp && (
+            <span style={{ marginLeft: 2, color: '#666', fontWeight: 500, letterSpacing: 0 }}>
+              {new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            </span>
+          )}
+        </div>
+        <div style={{ fontSize: 13, color: '#e0e0e0', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+          {entry.content}
+        </div>
+      </div>
+    );
+  }
+
+  if (entry.role === 'rewind') {
+    const status = entry.rewindStatus || 'rewinding';
+    const active = status === 'rewinding';
+    const failed = status === 'failed';
+    const label = failed ? 'REWIND FAILED' : active ? 'REWINDING' : 'I REWOUND';
+    return (
+      <div style={{
+        padding: '8px 12px',
+        backgroundColor: failed ? 'rgba(239, 68, 68, 0.08)' : 'rgba(217, 119, 6, 0.08)',
+        borderRadius: 6,
+        borderLeft: '3px solid ' + (failed ? 'rgba(239, 68, 68, 0.75)' : 'rgba(217, 119, 6, 0.75)'),
+      }}>
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+          fontSize: 10,
+          color: failed ? '#fca5a5' : '#fbbf24',
+          marginBottom: 4,
+          fontWeight: 700,
+          letterSpacing: 0.6,
+        }}>
+          {active && <HistorySpinner size={10} />}
+          <span>{label}</span>
+          {entry.timestamp && (
+            <span style={{ marginLeft: 2, color: '#666', fontWeight: 500, letterSpacing: 0 }}>
+              {new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            </span>
+          )}
+        </div>
+        <div style={{ fontSize: 13, color: '#e0e0e0', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+          {entry.content}
+        </div>
       </div>
     );
   }
@@ -876,12 +1103,22 @@ function AgentHistoryControls({
   cwd,
   toolType,
   onHistoryRefresh,
+  onPromptSubmitted,
+  onPromptStatusChange,
+  rewindLocked,
 }: {
   tabId: string;
   sessionId: string;
   cwd: string;
   toolType: AgentHistoryTool;
   onHistoryRefresh: () => void;
+  onPromptSubmitted: (
+    text: string,
+    queueStatus: 'queued' | 'sent',
+    meta: { handoffId: string; statusAtSend: AgentPtyStatus; submittedAt: number }
+  ) => void;
+  onPromptStatusChange: (handoffId: string, queueStatus: 'queued' | 'sent' | 'cancelled' | 'failed', reason: string) => void;
+  rewindLocked: boolean;
 }) {
   const runtime = useMemo(() => getHistoryAgentRuntime(toolType), [toolType]);
   const [status, setStatus] = useState<AgentPtyStatus>('inactive');
@@ -908,7 +1145,7 @@ function AgentHistoryControls({
   const pasteBusyRef = useRef(false);
   const pendingQuestionRef = useRef<AgentPendingQuestion | null>(null);
   const answeringQuestionRef = useRef(false);
-  const midstreamPromptRecoveryRef = useRef<{ text: string; at: number } | null>(null);
+  const midstreamPromptRecoveryRef = useRef<{ text: string; at: number; handoffId: string; statusAtSend: AgentPtyStatus } | null>(null);
   const interruptRecoveryInFlightRef = useRef(false);
   const interruptAwaitRef = useRef<{ tabId: string; seq: number; at: number } | null>(null);
   const emptyDraftNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1120,6 +1357,10 @@ function AgentHistoryControls({
       if (data?.tabId !== tabId || data.busy) return;
       if (isNonAuthoritativeBusyEvent(data)) return;
       console.log('[' + runtime.logPrefix + ':draft] interrupt-event tab=' + tabId.slice(-12) + ' reason=' + (data.reason || '-') + ' hasPending=' + !!midstreamPromptRecoveryRef.current);
+      historyDiag('INTERRUPT_EVENT tab=' + tabId.slice(-12) +
+        ' reason=' + (data.reason || '-') +
+        ' hasPending=' + !!midstreamPromptRecoveryRef.current +
+        ' pending=' + (midstreamPromptRecoveryRef.current?.handoffId || '-'));
       const recoveryReasons = runtime.interruptRecoveryReasons || ['interrupt'];
       if (!recoveryReasons.includes(data.reason || '')) {
         midstreamPromptRecoveryRef.current = null;
@@ -1147,6 +1388,12 @@ function AgentHistoryControls({
       const requestTabId = tabId;
       interruptRecoveryInFlightRef.current = true;
       console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery start tab=' + tabId.slice(-12) + ' ageMs=' + ageMs + ' sentChars=' + pending.text.length);
+      historyDiag('INTERRUPT_RECOVERY_START tab=' + tabId.slice(-12) +
+        ' handoff=' + pending.handoffId +
+        ' ageMs=' + ageMs +
+        ' statusAtSend=' + pending.statusAtSend +
+        ' chars=' + pending.text.length +
+        ' preview="' + promptPreview(pending.text) + '"');
       (async () => {
         const delays = [0, 160, 420, 900];
         for (let attempt = 0; attempt < delays.length; attempt++) {
@@ -1164,6 +1411,12 @@ function AgentHistoryControls({
             setPrompt((prev) => prependPromptTextOnce(prev, draft.text));
             setDraftWarning(runtime.label + ' returned an interrupted prompt; pulled it back from terminal input.');
             console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery restored tab=' + tabId.slice(-12) + ' source=terminal attempt=' + (attempt + 1) + ' chars=' + draft.text.length + ' images=' + draft.images);
+            onPromptStatusChange(pending.handoffId, 'cancelled', 'interrupt-restored-terminal-draft');
+            historyDiag('INTERRUPT_RECOVERY_RESTORED tab=' + tabId.slice(-12) +
+              ' handoff=' + pending.handoffId +
+              ' attempt=' + (attempt + 1) +
+              ' chars=' + draft.text.length +
+              ' images=' + draft.images);
             requestAnimationFrame(() => promptTextareaRef.current?.focus());
             return;
           } catch (e: any) {
@@ -1172,7 +1425,12 @@ function AgentHistoryControls({
         }
         if (tabIdRef.current !== requestTabId) return;
         showEmptyDraftNotice(runtime.label + ' cancellation confirmed; prompt was not returned by terminal input.');
+        onPromptStatusChange(pending.handoffId, 'cancelled', 'interrupt-no-terminal-draft');
         console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery not-restored tab=' + tabId.slice(-12) + ' reason=no-terminal-draft probes=' + delays.length + ' sentChars=' + pending.text.length);
+        historyDiag('INTERRUPT_RECOVERY_NOT_RESTORED tab=' + tabId.slice(-12) +
+          ' handoff=' + pending.handoffId +
+          ' reason=no-terminal-draft probes=' + delays.length +
+          ' sentChars=' + pending.text.length);
       })()
         .catch((e: any) => {
           console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
@@ -1190,7 +1448,7 @@ function AgentHistoryControls({
     return () => {
       ipcRenderer.removeListener(runtime.busyEvent, handleInterruptRecovery);
     };
-  }, [isNonAuthoritativeBusyEvent, readTerminalDraft, refreshPresence, runtime, showEmptyDraftNotice, tabId]);
+  }, [isNonAuthoritativeBusyEvent, onPromptStatusChange, readTerminalDraft, refreshPresence, runtime, showEmptyDraftNotice, tabId]);
 
   const pullTerminalDraft = useCallback(async () => {
     if (actionInFlightRef.current) {
@@ -1238,6 +1496,7 @@ function AgentHistoryControls({
   const runAction = useCallback(async (kind: 'resume' | 'send' | 'interrupt' | 'stop') => {
     if (actionInFlightRef.current) {
       console.log('[' + runtime.logPrefix + '] drop-action tab=' + tabId.slice(-12) + ' kind=' + kind + ' reason=inflight');
+      historyDiag('DROP_ACTION tab=' + tabId.slice(-12) + ' kind=' + kind + ' reason=inflight busyAction=' + (busyAction || 'none'));
       return;
     }
     if (kind === 'send' && pasteBusyRef.current) {
@@ -1280,22 +1539,53 @@ function AgentHistoryControls({
         } else {
           console.log('[' + runtime.logPrefix + ':draft] send-preflight skipped tab=' + tabId.slice(-12) + ' reason=busy-midstream');
         }
-        const result = await runtime.sendPrompt(tabId, text);
+        const handoffId = createPromptHandoffId();
+        const submittedAt = Date.now();
+        historyDiag('SEND_CLICK tab=' + tabId.slice(-12) +
+          ' handoff=' + handoffId +
+          ' statusAtSend=' + statusAtSend +
+          ' chars=' + text.length +
+          ' pasteBusy=' + pasteBusyRef.current +
+          ' preview="' + promptPreview(text) + '"');
+        const result = await runtime.sendPrompt(tabId, text, {
+          handoffId,
+          source: 'history-panel',
+          statusAtSend,
+        });
+        historyDiag('SEND_RESULT tab=' + tabId.slice(-12) +
+          ' handoff=' + handoffId +
+          ' success=' + (result?.success !== false) +
+          ' submitted=' + !!result?.submitted +
+          ' chunks=' + (result?.chunksTotal ?? 'na') +
+          ' error=' + (result?.error || '-'));
         if (result?.success === false) throw new Error(result?.error || 'Send failed');
         if (tabIdRef.current !== actionTabId) return;
-        midstreamPromptRecoveryRef.current = { text, at: Date.now() };
-        console.log('[' + runtime.logPrefix + ':draft] send tracked tab=' + tabId.slice(-12) + ' statusAtSend=' + statusAtSend + ' chars=' + text.length);
+        onPromptSubmitted(text, statusAtSend === 'busy' ? 'queued' : 'sent', { handoffId, statusAtSend, submittedAt });
+        midstreamPromptRecoveryRef.current = { text, at: Date.now(), handoffId, statusAtSend };
+        console.log('[' + runtime.logPrefix + ':draft] send tracked tab=' + tabId.slice(-12) + ' handoff=' + handoffId + ' statusAtSend=' + statusAtSend + ' chars=' + text.length);
         setPrompt('');
         setDraftWarning(null);
         if (runtime.optimisticBusyOnSend) {
           setStatusFrom('busy', 'send-click');
         } else {
-          refreshPresence();
+          setStatusFrom('busy', 'send-confirmed');
+          if (statusAtSend !== 'active') refreshPresence();
         }
         onHistoryRefresh();
       } else if (kind === 'interrupt') {
         const statusAtInterrupt = statusRef.current;
+        const pending = midstreamPromptRecoveryRef.current;
+        historyDiag('INTERRUPT_CLICK tab=' + tabId.slice(-12) +
+          ' status=' + statusAtInterrupt +
+          ' pending=' + (pending?.handoffId || '-') +
+          ' pendingAgeMs=' + (pending ? Date.now() - pending.at : 0) +
+          ' busyAction=' + (busyAction || 'none'));
         const result = runtime.interruptTurn(tabId);
+        historyDiag('INTERRUPT_RESULT tab=' + tabId.slice(-12) +
+          ' success=' + !!result.success +
+          ' interrupted=' + !!result.interrupted +
+          ' pending=' + (pending?.handoffId || '-') +
+          ' error=' + (result.error || '-'));
         if (!result.success) throw new Error(result.error || 'Stop failed');
         if (result.interrupted && tabIdRef.current === actionTabId) {
           if (statusAtInterrupt === 'busy') {
@@ -1330,7 +1620,7 @@ function AgentHistoryControls({
         if (tabIdRef.current === actionTabId) setBusyAction(null);
       }
     }
-  }, [cwd, onHistoryRefresh, prompt, readTerminalDraft, refreshPresence, runtime, sessionId, setStatusFrom, tabId]);
+  }, [busyAction, cwd, onHistoryRefresh, onPromptSubmitted, prompt, readTerminalDraft, refreshPresence, runtime, sessionId, setStatusFrom, tabId]);
 
   const answerPendingQuestion = useCallback(async (answers: Record<string, string>, stop = false) => {
     if (!runtime.answerQuestion) return;
@@ -1375,7 +1665,7 @@ function AgentHistoryControls({
 
   const meta = AGENT_STATUS_META[status];
   const isTurnBusy = status === 'busy';
-  const controlsLocked = !!busyAction || isPasteBusy || answeringQuestion;
+  const controlsLocked = !!busyAction || isPasteBusy || answeringQuestion || rewindLocked;
   const isCancellingTurn = busyAction === 'interrupt' || interruptAwaiting;
   const showThinkingChip = isTurnBusy && !isCancellingTurn && !pendingQuestion;
   const canAcceptPrompt = status === 'active' || (status === 'busy' && runtime.allowSendWhileBusy);
@@ -1385,7 +1675,7 @@ function AgentHistoryControls({
   const canResume = status === 'inactive' && !!sessionId && !busyAction;
   const canStopProcess = (status === 'active' || status === 'busy' || status === 'starting') && !busyAction;
   const draftNoticeMeta = draftWarning ? getDraftNoticeMeta(draftWarning) : null;
-  const promptIdleBorder = isCancellingTurn ? 'rgba(217, 119, 6, 0.65)' : '#333';
+  const promptIdleBorder = isCancellingTurn || rewindLocked ? 'rgba(217, 119, 6, 0.65)' : '#333';
 
   return (
     <div
@@ -1538,7 +1828,7 @@ function AgentHistoryControls({
               data-status={status}
               value={prompt}
               onChange={(e) => {
-                if (isCancellingTurn) return;
+                if (isCancellingTurn || rewindLocked) return;
                 setPrompt(e.target.value);
                 if (draftWarning) setDraftWarning(null);
               }}
@@ -1548,8 +1838,8 @@ function AgentHistoryControls({
                   if (canSend) runAction('send');
                 }
               }}
-              placeholder={isCancellingTurn ? 'Canceling... waiting for restored prompt' : status === 'inactive' ? 'Resume ' + runtime.label + ' to send' : status === 'starting' ? 'Waiting for prompt...' : 'Send a prompt...'}
-              readOnly={isCancellingTurn}
+              placeholder={rewindLocked ? 'Rewinding... input is locked' : isCancellingTurn ? 'Canceling... waiting for restored prompt' : status === 'inactive' ? 'Resume ' + runtime.label + ' to send' : status === 'starting' ? 'Waiting for prompt...' : 'Send a prompt...'}
+              readOnly={isCancellingTurn || rewindLocked}
               rows={3}
               style={{
                 flex: 1,
@@ -1557,10 +1847,10 @@ function AgentHistoryControls({
                 resize: 'vertical',
                 maxHeight: 120,
                 minHeight: 56,
-                backgroundColor: isCancellingTurn ? '#130f0a' : '#0f0f0f',
+                backgroundColor: isCancellingTurn || rewindLocked ? '#130f0a' : '#0f0f0f',
                 border: '1px solid ' + promptIdleBorder,
                 borderRadius: 5,
-                color: isCancellingTurn ? '#c7c7c7' : '#e5e5e5',
+                color: isCancellingTurn || rewindLocked ? '#c7c7c7' : '#e5e5e5',
                 outline: 'none',
                 padding: '7px 8px',
                 fontSize: 12,
@@ -1670,9 +1960,12 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const setHistoryScrollToUuid = useUIStore((s) => s.setHistoryScrollToUuid);
   const setHistoryVisibleUuids = useUIStore((s) => s.setHistoryVisibleUuids);
   const setHistoryScrollPosition = useUIStore((s) => s.setHistoryScrollPosition);
+  const setHistoryPromptDraft = useUIStore((s) => s.setHistoryPromptDraft);
   const closePanel = useCallback(() => setHistoryPanelOpen(tabId, false), [tabId, setHistoryPanelOpen]);
   const resetPanelWidth = useCallback(() => setHistoryPanelWidth(HISTORY_PANEL_DEFAULT_WIDTH), [setHistoryPanelWidth]);
   const panelRef = useRef<HTMLDivElement>(null);
+  const [rewindLock, setRewindLock] = useState<{ opId: string; targetText: string } | null>(null);
+  const [rewindPreview, setRewindPreview] = useState<RewindPreviewState | null>(null);
 
   // Save scroll position + clean up CSS highlights on unmount.
   // Virtuoso owns scrolling — the scrollTop we save belongs to the inner
@@ -1702,6 +1995,14 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
 
   const [entries, setEntries] = useState<FullHistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const promptHandoffMetaRef = useRef<Map<string, PromptHandoffMeta>>(new Map());
+  const suppressedPromptsRef = useRef<Map<string, SuppressedPrompt>>(new Map());
+  const rewindPreviewResult = useMemo(
+    () => buildRewindPreviewEntries(entries, rewindPreview),
+    [entries, rewindPreview],
+  );
+  const displayEntries = rewindPreviewResult.entries;
+  const rewindPreviewHiddenCount = rewindPreviewResult.hiddenCount;
   // Last entry uuid Claude's own backtrace reaches before stopping at the first
   // orphan. Any entry at index <= boundary is part of the chain-break zone:
   // visible in HistoryPanel through recovery, but unreachable by Claude's
@@ -1712,8 +2013,8 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const [claudeMemoryBoundaryUuid, setClaudeMemoryBoundaryUuid] = useState<string | null>(null);
   const claudeMemoryBoundaryIndex = useMemo(() => {
     if (!claudeMemoryBoundaryUuid) return -1;
-    return entries.findIndex(e => e.uuid === claudeMemoryBoundaryUuid);
-  }, [entries, claudeMemoryBoundaryUuid]);
+    return displayEntries.findIndex(e => e.uuid === claudeMemoryBoundaryUuid);
+  }, [displayEntries, claudeMemoryBoundaryUuid]);
   const scrollArrowRef = useRef<HTMLDivElement>(null);
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   const isResizing = useRef(false);
@@ -1744,16 +2045,16 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     if (!searchQuery || searchQuery.length < 2) return [];
     const q = searchQuery.toLowerCase();
     const positions: Array<{ entryIdx: number; entryUuid: string; offset: number }> = [];
-    for (let i = 0; i < entries.length; i++) {
-      const text = (entries[i].content || '').toLowerCase();
+    for (let i = 0; i < displayEntries.length; i++) {
+      const text = (displayEntries[i].content || '').toLowerCase();
       let idx = text.indexOf(q);
       while (idx !== -1) {
-        positions.push({ entryIdx: i, entryUuid: entries[i].uuid, offset: idx });
+        positions.push({ entryIdx: i, entryUuid: displayEntries[i].uuid, offset: idx });
         idx = text.indexOf(q, idx + 1);
       }
     }
     return positions;
-  }, [entries, searchQuery]);
+  }, [displayEntries, searchQuery]);
 
   // Reset current match when query changes and scroll to first match
   useEffect(() => {
@@ -1866,7 +2167,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       CSS_HL?.delete('hp-search');
       CSS_HL?.delete('hp-search-current');
     };
-  }, [searchQuery, matchPositions, currentMatchIdx, entries]);
+  }, [searchQuery, matchPositions, currentMatchIdx, displayEntries]);
 
   // Ctrl+F handler — scoped to history panel
   useEffect(() => {
@@ -1915,6 +2216,169 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     }
   }, []);
 
+  const appendLocalPromptEntry = useCallback((
+    text: string,
+    queueStatus: 'queued' | 'sent',
+    meta: { handoffId: string; statusAtSend: AgentPtyStatus; submittedAt: number }
+  ) => {
+    const cleanContent = normalizeHistoryPromptText(text);
+    if (!cleanContent) return;
+    const now = Date.now();
+    const handoffId = meta.handoffId || createPromptHandoffId();
+    const entry: FullHistoryEntry = {
+      uuid: LOCAL_PROMPT_PREFIX + tabId + '-' + handoffId,
+      role: 'queued',
+      queueStatus,
+      handoffId,
+      statusReason: 'send-result',
+      timestamp: new Date(now).toISOString(),
+      content: cleanContent,
+      sessionId,
+      optimisticAt: now,
+      statusChangedAt: now,
+    };
+    promptHandoffMetaRef.current.set(handoffId, { text: cleanContent, submittedAt: meta.submittedAt });
+    historyDiag('LOCAL_APPEND tab=' + tabId.slice(-12) +
+      ' handoff=' + handoffId +
+      ' queueStatus=' + queueStatus +
+      ' statusAtSend=' + meta.statusAtSend +
+      ' chars=' + cleanContent.length +
+      ' submittedLagMs=' + (now - meta.submittedAt) +
+      ' preview="' + promptPreview(cleanContent) + '"');
+    setEntries(prev => {
+      return [...prev, entry];
+    });
+    if (isAtBottomRef.current) {
+      setTimeout(() => scrollToBottom(true), 30);
+    }
+  }, [scrollToBottom, sessionId, tabId]);
+
+  const updateLocalPromptEntry = useCallback((
+    handoffId: string,
+    queueStatus: 'queued' | 'sent' | 'cancelled' | 'failed',
+    reason: string
+  ) => {
+    if (!handoffId) return;
+    const changedAt = Date.now();
+    const handoffMeta = promptHandoffMetaRef.current.get(handoffId) || null;
+    let suppression: SuppressedPrompt | null = null;
+    if ((queueStatus === 'cancelled' || queueStatus === 'failed') && handoffMeta?.text) {
+      suppression = {
+        handoffId,
+        text: handoffMeta.text,
+        since: handoffMeta.submittedAt - 5000,
+        until: changedAt + 10000,
+        expiresAt: changedAt + 5 * 60 * 1000,
+        reason,
+      };
+      suppressedPromptsRef.current.set(handoffId, suppression);
+      historyDiag('SUPPRESS_ARMED tab=' + tabId.slice(-12) +
+        ' handoff=' + handoffId +
+        ' reason=' + reason +
+        ' since=' + suppression.since +
+        ' until=' + suppression.until +
+        ' expiresAt=' + suppression.expiresAt +
+        ' preview="' + promptPreview(handoffMeta.text) + '"');
+    }
+    setEntries(prev => prev.map(entry => {
+      if (!isLocalPromptEntry(entry) || entry.handoffId !== handoffId) return entry;
+      historyDiag('LOCAL_STATUS tab=' + tabId.slice(-12) +
+        ' handoff=' + handoffId +
+        ' queueStatus=' + queueStatus +
+        ' reason=' + reason +
+        ' prev=' + (entry.queueStatus || 'queued') +
+        ' ageMs=' + (changedAt - (entry.optimisticAt || changedAt)));
+      return {
+        ...entry,
+        queueStatus,
+        statusReason: reason,
+        statusChangedAt: changedAt,
+      };
+    }).filter(entry => !suppression || !entryMatchesSuppressedPrompt(entry, suppression)));
+  }, [tabId]);
+
+  const upsertLocalRewindEntry = useCallback((detail: {
+    tabId?: string;
+    opId?: string;
+    status?: 'start' | 'done' | 'failed';
+    targetUuid?: string;
+    targetText?: string;
+    mode?: 'native' | 'ai';
+    toolType?: string;
+    persisted?: boolean;
+    error?: string;
+  }) => {
+    if (detail.tabId !== tabId) return;
+    const opId = detail.opId || String(Date.now());
+    const status = detail.status || 'start';
+    const targetText = normalizeHistoryPromptText(detail.targetText || '');
+    const now = Date.now();
+    const uuid = LOCAL_REWIND_PREFIX + tabId + '-' + opId;
+    const rewindStatus: FullHistoryEntry['rewindStatus'] =
+      status === 'failed' ? 'failed' : status === 'done' ? 'done' : 'rewinding';
+    const content = status === 'failed'
+      ? (detail.error ? 'Failed: ' + detail.error : 'Rewind failed')
+      : targetText
+        ? 'Target: ' + targetText
+        : 'Native /rewind';
+
+    setRewindLock(status === 'start' ? { opId, targetText } : null);
+    if (status === 'done' && detail.persisted && targetText) {
+      setRewindPreview(null);
+      setHistoryPromptDraft(tabId, targetText);
+      setEntries(prev => prev.filter(entry => entry.uuid !== uuid));
+      return;
+    }
+    if (status === 'done' && detail.mode === 'native' && detail.targetUuid && targetText) {
+      setRewindPreview({ opId, targetUuid: detail.targetUuid, targetText, startedAt: now });
+      setHistoryPromptDraft(tabId, targetText);
+    }
+    setEntries(prev => {
+      const idx = prev.findIndex(entry => entry.uuid === uuid);
+      const nextEntry: FullHistoryEntry = {
+        uuid,
+        role: 'rewind',
+        rewindStatus,
+        timestamp: new Date(now).toISOString(),
+        content,
+        sessionId,
+        optimisticAt: now,
+      };
+      if (idx < 0) return [...prev, nextEntry];
+      const next = [...prev];
+      next[idx] = { ...next[idx], ...nextEntry };
+      return next;
+    });
+    if (isAtBottomRef.current) {
+      setTimeout(() => scrollToBottom(true), 30);
+    }
+  }, [scrollToBottom, sessionId, setHistoryPromptDraft, tabId]);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      upsertLocalRewindEntry((event as CustomEvent).detail || {});
+    };
+    window.addEventListener('history-panel:rewind-log', handler);
+    return () => window.removeEventListener('history-panel:rewind-log', handler);
+  }, [upsertLocalRewindEntry]);
+
+  useEffect(() => {
+    setRewindLock(null);
+    setRewindPreview(null);
+  }, [tabId, sessionId]);
+
+  useEffect(() => {
+    const clearPreview = (_event: any, data: { tabId?: string }) => {
+      if (data?.tabId === tabId) setRewindPreview(null);
+    };
+    ipcRenderer.on('terminal:command-finished', clearPreview);
+    ipcRenderer.on('terminal:command-started', clearPreview);
+    return () => {
+      ipcRenderer.removeListener('terminal:command-finished', clearPreview);
+      ipcRenderer.removeListener('terminal:command-started', clearPreview);
+    };
+  }, [tabId]);
+
   // Load full history
   const loadHistory = useCallback(async (isRefresh = false) => {
     if (!sessionId) return;
@@ -1922,10 +2386,32 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       const ipcChannel = toolType === 'gemini' ? 'gemini:get-full-history' : toolType === 'codex' ? 'codex:get-full-history' : 'claude:get-full-history';
       const result = await ipcRenderer.invoke(ipcChannel, { sessionId, cwd });
       if (result.success) {
-        const newEntries: FullHistoryEntry[] = result.entries || [];
+        const now = Date.now();
+        for (const [handoffId, suppressed] of suppressedPromptsRef.current) {
+          if ((suppressed.expiresAt || suppressed.until) < now) {
+            suppressedPromptsRef.current.delete(handoffId);
+            promptHandoffMetaRef.current.delete(handoffId);
+            historyDiag('SUPPRESS_EXPIRED tab=' + tabId.slice(-12) +
+              ' handoff=' + handoffId +
+              ' reason=' + suppressed.reason);
+          }
+        }
+        const rawServerEntries: FullHistoryEntry[] = result.entries || [];
+        const suppressedResult = filterSuppressedPromptEntries(rawServerEntries, suppressedPromptsRef.current.values());
+        const serverEntries = suppressedResult.entries;
+        if (suppressedResult.hidden > 0) {
+          historyDiag('SUPPRESS_FILTERED tab=' + tabId.slice(-12) +
+            ' hidden=' + suppressedResult.hidden +
+            ' serverRaw=' + rawServerEntries.length +
+            ' server=' + serverEntries.length);
+        }
         setClaudeMemoryBoundaryUuid(result.claudeMemoryBoundaryUuid || null);
+        setRewindPreview((current) =>
+          current && serverHistoryMaterializedRewindBranch(serverEntries, current) ? null : current
+        );
 
         if (!isRefresh) {
+          const newEntries = serverEntries;
           console.warn(`[HP] initial load: ${newEntries.length} entries`);
           // startTransition: React 19 yields to browser between chunks,
           // keeping spinner animation smooth during heavy DOM renders
@@ -1935,9 +2421,34 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
           });
           // Starts at the top by default (no scrollToBottom on initial load)
         } else {
-          // Refresh: only update if count changed
+          // Refresh: update when count OR stable row state changed. Queue-operation
+          // rows can flip QUEUED → SENT without changing entries.length.
           setEntries(prev => {
-            if (newEntries.length === prev.length) return prev;
+            const localBefore = prev.filter(isLocalPromptEntry);
+            if (localBefore.length > 0) {
+              const localSummary = localBefore.map((entry) => {
+                const matched = serverHasPromptEntry(serverEntries, entry);
+                const ageMs = Date.now() - (entry.optimisticAt || Date.parse(entry.timestamp || '') || Date.now());
+                return (entry.handoffId || entry.uuid.slice(-8)) + ':' + (entry.queueStatus || 'queued') + ':matched=' + matched + ':age=' + ageMs;
+              }).join(',');
+              historyDiag('REFRESH_LOCALS tab=' + tabId.slice(-12) +
+                ' server=' + serverEntries.length +
+                ' locals=' + localBefore.length +
+                ' [' + localSummary + ']');
+            }
+            const newEntries = mergeServerAndLocalEntries(serverEntries, prev);
+            const sameEntries =
+              newEntries.length === prev.length &&
+              newEntries.every((entry, idx) => {
+                const old = prev[idx];
+                return old &&
+                  old.uuid === entry.uuid &&
+                  old.role === entry.role &&
+                  old.queueStatus === entry.queueStatus &&
+                  old.timestamp === entry.timestamp &&
+                  old.content === entry.content;
+              });
+            if (sameEntries) return prev;
             console.warn(`[HP] refresh: ${prev.length} → ${newEntries.length}`);
             if (isAtBottomRef.current && newEntries.length > prev.length) {
               setTimeout(() => scrollToBottom(true), 100);
@@ -1950,7 +2461,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       console.warn('[HistoryPanel] Load error:', e);
       if (!isRefresh) setLoading(false);
     }
-  }, [sessionId, cwd, scrollToBottom, toolType]);
+  }, [sessionId, cwd, scrollToBottom, tabId, toolType]);
 
   // Broadcast loading state to InfoPanel button
   useEffect(() => {
@@ -1963,6 +2474,9 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     initialLoadDoneRef.current = false;
     setLoading(true);
     setEntries([]);
+    setRewindPreview(null);
+    promptHandoffMetaRef.current.clear();
+    suppressedPromptsRef.current.clear();
     loadHistory(false);
   }, [sessionId, toolType]);
 
@@ -2025,9 +2539,9 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
 
   useEffect(() => {
     if (!historyScrollToUuid) return;
-    if (loading || entries.length === 0) return; // wait for entries; uuid stays in store
+    if (loading || displayEntries.length === 0) return; // wait for entries; uuid stays in store
     const targetUuid = historyScrollToUuid;
-    const idx = entries.findIndex((e) => e.uuid === targetUuid);
+    const idx = displayEntries.findIndex((e) => e.uuid === targetUuid);
     // Consume the store key immediately. The convergence loop is driven by the
     // ref-generation guard, NOT by this effect's cleanup, so clearing the key
     // (which re-runs the effect → early-return above) does not abort the loop.
@@ -2089,7 +2603,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       setTimeout(step, 40);
     };
     setTimeout(step, 0);
-  }, [historyScrollToUuid, loading, entries, tabId, setHistoryScrollToUuid]);
+  }, [historyScrollToUuid, loading, displayEntries, tabId, setHistoryScrollToUuid]);
 
   // Native scroll handler — runs on the Virtuoso scroller element via a
   // direct addEventListener (Virtuoso doesn't pass an onScroll prop through
@@ -2116,15 +2630,15 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   }, [tabId, setHistoryScrollPosition]);
 
   // Keep entries ref fresh for observer closure (avoids stale data if entries update with same length)
-  const entriesRef = useRef(entries);
-  entriesRef.current = entries;
+  const entriesRef = useRef(displayEntries);
+  entriesRef.current = displayEntries;
 
   // Build mapping: assistant/non-user UUID → preceding user UUID
   // So when an assistant response is visible, the parent user dot stays highlighted in Timeline.
   const assistantToUserMap = React.useMemo(() => {
     const map = new Map<string, string>();
     let lastUserUuid: string | null = null;
-    for (const e of entries) {
+    for (const e of displayEntries) {
       if (e.role === 'user') {
         lastUserUuid = e.uuid;
       } else if (lastUserUuid) {
@@ -2132,7 +2646,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       }
     }
     return map;
-  }, [entries]);
+  }, [displayEntries]);
 
   // Track visible entries for Timeline viewport indicator (UUID-based, no text search).
   //
@@ -2193,9 +2707,9 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
 
   // Recompute when entries change (incremental refresh adds rows → bottom range may shift)
   useEffect(() => {
-    lengthRef.current = entries.length;
+    lengthRef.current = displayEntries.length;
     recomputeVisibleUuids();
-  }, [entries, recomputeVisibleUuids]);
+  }, [displayEntries, recomputeVisibleUuids]);
 
   // Resize handle
   const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
@@ -2287,6 +2801,34 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
           <Search size={13} />
         </button>
         </Tooltip>
+        {!searchOpen && rewindPreview && (
+          <Tooltip content="Preview after native rewind. JSONL is not changed until you submit the restored prompt. Restarting Claude or reopening History shows the full transcript again.">
+            <div
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 5,
+                minWidth: 0,
+                maxWidth: 240,
+                height: 20,
+                padding: '0 7px',
+                borderRadius: 5,
+                border: '1px solid rgba(217, 119, 6, 0.42)',
+                backgroundColor: 'rgba(217, 119, 6, 0.13)',
+                color: '#fbbf24',
+                fontSize: 10,
+                fontWeight: 750,
+                letterSpacing: 0.2,
+                flexShrink: 1,
+              }}
+            >
+              <span style={{ whiteSpace: 'nowrap' }}>REWIND PREVIEW</span>
+              <span style={{ color: '#a1a1aa', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {rewindPreviewHiddenCount > 0 ? rewindPreviewHiddenCount + ' hidden' : 'unsaved'}
+              </span>
+            </div>
+          </Tooltip>
+        )}
         {searchOpen && (
           <>
             <input
@@ -2391,14 +2933,14 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
             <HistorySpinner size={16} />
             Loading...
           </div>
-        ) : entries.length === 0 ? (
+        ) : displayEntries.length === 0 ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#555', fontSize: 13 }}>
             No history entries
           </div>
         ) : (
           <Virtuoso
             ref={virtuosoRef}
-            data={entries}
+            data={displayEntries}
             // Stable row key from JSONL uuid — DOM nodes survive incremental
             // refreshes that re-emit the same entry with a new array reference,
             // and Cmd+F highlight Ranges don't tear when an entry scrolls back
@@ -2422,7 +2964,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
             increaseViewportBy={{ top: 600, bottom: 600 }}
             // Start at the tail by default — matches the prior behavior where
             // long sessions opened at the most-recent message.
-            initialTopMostItemIndex={entries.length > 0 ? entries.length - 1 : 0}
+            initialTopMostItemIndex={displayEntries.length > 0 ? displayEntries.length - 1 : 0}
             followOutput={() => (isAtBottomRef.current ? 'auto' : false)}
             style={{ height: '100%' }}
             itemContent={(_idx, entry) => {
@@ -2482,10 +3024,15 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
           cwd={cwd}
           toolType={toolType as AgentHistoryTool}
           onHistoryRefresh={() => loadHistory(true)}
+          onPromptSubmitted={appendLocalPromptEntry}
+          onPromptStatusChange={updateLocalPromptEntry}
+          rewindLocked={!!rewindLock}
         />
       )}
     </div>
   );
+
+  if (embedded) return panel;
 
   return (
     <>

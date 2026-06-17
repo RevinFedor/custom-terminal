@@ -145,6 +145,12 @@ requestAnimationFrame(() => requestAnimationFrame(() => {
 
 См. `knowledge/fact-mobile-web.md::Read-only view` (banner был убран, info переехало в header subtitle).
 
+## Preview-объект открывается bottom-sheet поверх списка
+
+На mobile tap по документу, attached chip, file-tab или похожему read-only объекту должен открывать временный preview поверх текущего списка, а не уводить пользователя в отдельный route как будто это чат/экран работы. Ментальная модель здесь «подсмотреть и вернуться»: список под sheet остаётся видимым и затемнённым, сверху у sheet есть drag handle, закрытие — свайп вниз или явная маленькая кнопка. Это сохраняет spatial context: пользователь помнит, какой row/chip породил preview, и не ищет Back после чтения.
+
+Если preview тяжёлый или потенциально длинный (Markdown, лог, большой prompt), sheet получает свой внутренний scroll и bounded height, а не растягивает страницу. Ошибка этого класса выглядит как file-tab, который открывается пустым read-only chat view или как fullscreen page без понятного способа вернуться к месту в списке. В custom-terminal это mobile Markdown preview для file-tabs: конкретика в `knowledge/fact-mobile-web.md::File-tab Markdown preview bottom-sheet`.
+
 ## Tail-first loading: показывай хвост сразу, prefix в фоне
 
 **Принцип:** mobile открывает heavy collection (чат с 5000+ сообщений, лента, лог) — **первый запрос отдаёт только хвост** (последние ~200 элементов). Остальная история подгружается **в фоне** после первого paint'а, не блокируя UI. Это применимо везде где «свежее интереснее старого».

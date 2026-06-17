@@ -41,6 +41,12 @@ export interface AgentResumeResult {
   error?: string;
 }
 
+export interface AgentSendPromptOptions {
+  handoffId?: string;
+  source?: string;
+  statusAtSend?: AgentPtyStatus;
+}
+
 export interface HistoryAgentRuntime {
   toolType: AgentHistoryTool;
   label: string;
@@ -58,7 +64,7 @@ export interface HistoryAgentRuntime {
   optimisticActiveOnInterrupt: boolean;
   getPresence: (tabId: string) => Promise<AgentPtyPresence>;
   resume: (args: { tabId: string; sessionId: string; cwd?: string }) => Promise<AgentResumeResult>;
-  sendPrompt: (tabId: string, prompt: string) => Promise<any>;
+  sendPrompt: (tabId: string, prompt: string, options?: AgentSendPromptOptions) => Promise<any>;
   interruptTurn: (tabId: string) => { success: boolean; interrupted?: boolean; error?: string };
   stopProcess: (tabId: string) => Promise<any>;
   grabDraft: (tabId: string) => Promise<AgentDraftGrabResult>;
@@ -141,19 +147,25 @@ async function resumeCodexSession({
   return { success: true, sessionId };
 }
 
-async function sendCodexPrompt(tabId: string, prompt: string): Promise<any> {
+async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSendPromptOptions = {}): Promise<any> {
   if (!tabId) return { success: false, error: 'tabId required' };
   if (!prompt.trim()) return { success: false, error: 'prompt required' };
   const existing = codexSendInflight.get(tabId);
   if (existing) {
-    console.log('[CodexHistoryActions:send] join-inflight tab=' + shortTab(tabId));
+    console.log('[CodexHistoryActions:send] join-inflight tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-'));
     return existing;
   }
   useWorkspaceStore.getState().clearInterruptedState?.(tabId);
-  console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' chars=' + prompt.length);
-  const work = ipcRenderer.invoke('codex:send-command', tabId, prompt)
+  const queue = false;
+  console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' submitIntent=enter chars=' + prompt.length);
+  const work = ipcRenderer.invoke('codex:send-command', tabId, prompt, {
+    queue,
+    handoffId: options.handoffId || null,
+    source: options.source || null,
+    statusAtSend: options.statusAtSend || null,
+  })
     .then((result: any) => {
-      console.log('[CodexHistoryActions:send] done tab=' + shortTab(tabId) + ' success=' + (result?.success !== false));
+      console.log('[CodexHistoryActions:send] done tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' success=' + (result?.success !== false) + ' queued=' + (result?.queued ? 'true' : 'false') + ' submitKey=' + (result?.submitKey || '-'));
       return result;
     })
     .catch((e: any) => {
@@ -176,8 +188,8 @@ function interruptCodexTurn(tabId: string): { success: boolean; interrupted?: bo
     return { success: true, interrupted: false };
   }
   codexLastInterruptAt.set(tabId, now);
-  console.log('[CodexHistoryActions:interrupt] ctrl-c tab=' + shortTab(tabId));
-  ipcRenderer.send('terminal:input', tabId, '\x03');
+  console.log('[CodexHistoryActions:interrupt] escape tab=' + shortTab(tabId));
+  ipcRenderer.send('terminal:input', tabId, '\x1b');
   return { success: true, interrupted: true };
 }
 
@@ -272,7 +284,7 @@ const CODEX_RUNTIME: HistoryAgentRuntime = {
   supportsQuestions: false,
   supportsInterruptRecovery: true,
   interruptRecoveryReasons: ['turn_aborted'],
-  allowSendWhileBusy: false,
+  allowSendWhileBusy: true,
   optimisticBusyOnSend: false,
   optimisticActiveOnInterrupt: false,
   getPresence: getCodexPtyPresence,

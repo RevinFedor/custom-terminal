@@ -946,6 +946,7 @@ function App() {
 
   // Track process status via OSC 133 events
   useEffect(() => {
+    let disposed = false;
     // Initial load: get state for all tabs
     const initProcessStatus = async () => {
       const allTabs: Array<{ tabId: string; commandType?: string }> = [];
@@ -974,6 +975,28 @@ function App() {
       setProcessStatus(newStatus);
     };
     initProcessStatus();
+
+    const syncCodexTurnBusy = async () => {
+      const codexTabIds: string[] = [];
+      openProjects.forEach((workspace) => {
+        workspace.tabs.forEach((tab: any, tabId) => {
+          if (tab?.commandType === 'codex' || tab?.codexSessionId) codexTabIds.push(tabId);
+        });
+      });
+      await Promise.all(codexTabIds.map(async (tabId) => {
+        const res = await ipcRenderer.invoke('codex:get-turn-state', tabId).catch(() => null);
+        if (disposed || !res?.hasWatcher) return;
+        const busy = res.busy === true;
+        useWorkspaceStore.getState().setAiBusy(tabId, busy, 'codex-turn-state');
+        setBusyTabs(prev => {
+          const next = new Map(prev);
+          if (busy) next.set(tabId, true);
+          else next.delete(tabId);
+          return next;
+        });
+      }));
+    };
+    syncCodexTurnBusy();
 
     // Listen for command start/finish
     const handleCommandStarted = (_: any, { tabId }: { tabId: string }) => {
@@ -1005,12 +1028,26 @@ function App() {
       setBusyTabs(prev => { const n = new Map(prev); if (busy) n.set(tabId, true); else n.delete(tabId); return n; });
     };
 
+    const isNonClaudePtyAiTab = (tabId: string): boolean => {
+      const state = useWorkspaceStore.getState();
+      for (const ws of state.openProjects.values()) {
+        const tab = ws.tabs.get(tabId);
+        if (!tab) continue;
+        return tab.commandType === 'codex' || tab.commandType === 'gemini';
+      }
+      return false;
+    };
+
     // Claude CLI spinner busy/idle → track on sub-agent tab + project badge.
     // reason:'spinner' is a PTY-frame heuristic. Delay its false edge so the
     // visual shimmer is not unmounted during 30-90ms gaps between spinner frames;
     // RunAfter still consumes the raw IPC edge and ignores it separately.
     const handleClaudeBusyState = (_: any, data: { tabId: string; busy: boolean; reason?: string }) => {
       console.warn('[App:BusyState] tabId=' + data.tabId.slice(-8) + ' busy=' + data.busy + (data.reason ? ' reason=' + data.reason : ''));
+      if (data.reason === 'spinner' && isNonClaudePtyAiTab(data.tabId)) {
+        console.warn('[App:BusyState] ignore claude spinner for non-claude AI tabId=' + data.tabId.slice(-8));
+        return;
+      }
       const timers = claudeSpinnerVisualIdleTimersRef.current;
       const pendingTimer = timers.get(data.tabId);
       if (pendingTimer !== undefined) {
@@ -1222,6 +1259,14 @@ function App() {
           const sessionId = sessionIdForTab(tab, toolType);
           return { tab, toolType, runtime, sessionId };
         };
+        const findTabProject = (tabId?: string): { projectId: string; tab: any } | null => {
+          if (!tabId) return null;
+          for (const [projectId, ws] of useWorkspaceStore.getState().openProjects) {
+            const tab = ws.tabs.get(tabId);
+            if (tab) return { projectId, tab };
+          }
+          return null;
+        };
         if (action === 'getOpenProjectIds') {
           // Live snapshot of which projects are currently open in the desktop UI.
           // Used by /api/projects to split the mobile list into Active vs Other.
@@ -1255,6 +1300,8 @@ function App() {
           // has no access to useUIStore where the palette lives.
           const uiState = useUIStore.getState();
           const statusPalette = uiState.sessionStatuses || [];
+          const statusColor = (statusId?: string | null) =>
+            statusId ? (statusPalette.find((s: any) => s.id === statusId)?.color || null) : null;
           const tabs = await Promise.all(Array.from(ws.tabs.values()).map(async (t: any) => {
             let sessionStatus: 'active' | 'busy' | 'inactive' | null = null;
             let awaiting = false;
@@ -1278,6 +1325,7 @@ function App() {
               commandType: t.commandType,
               color: t.color || null,   // desktop TabColor — drives row bg on mobile
               cwd: t.cwd,
+              filePath: t.filePath || null,
               claudeSessionId: t.claudeSessionId,
               codexSessionId: t.codexSessionId,
               geminiSessionId: t.geminiSessionId,
@@ -1285,10 +1333,22 @@ function App() {
               awaiting,
               statusId,
               statusColor: statusMeta?.color || null,
+              groupId: t.groupId || null,
+              visualParentTabId: t.visualParentTabId || null,
               // Seed last-known context % so the native/web header pill shows a
               // value on open (parity with the SQLite path in web-server.js).
               contextPct: (typeof t.contextPct === 'number' && isFinite(t.contextPct)) ? t.contextPct : null,
             };
+          }));
+          const groups = (ws.tabGroups || []).map((g: any) => ({
+            id: g.id,
+            name: g.name,
+            createdAt: g.createdAt || null,
+            anchorTabId: g.anchorTabId || null,
+            collapsed: !!g.collapsed,
+            color: g.color || null,
+            sessionStatus: g.sessionStatus || null,
+            statusColor: statusColor(g.sessionStatus),
           }));
           return reply(true, {
             project: {
@@ -1298,7 +1358,9 @@ function App() {
               icon: projectMeta?.icon || null,
             },
             tabs,
+            groups,
             statusMarker: { shape: uiState.statusMarker.shape, sizePx: uiState.statusMarker.sizePx },
+            statuses: statusPalette.map((s: any) => ({ id: s.id, color: s.color, label: s.label })),
             processBar: {
               colorA: uiState.processBar.colorA,
               shimmerColor: uiState.processBar.shimmerColor,
@@ -1390,6 +1452,59 @@ function App() {
           // updates the in-memory map the desktop UI + /api/projects read from.
           await projectsState.updateProject(projectId, { name });
           return reply(true, { projectId, name });
+        }
+        if (action === 'createTabGroup') {
+          const { projectId, name } = payload || {};
+          if (!projectId) return reply(false, null, 'projectId required');
+          const current = useWorkspaceStore.getState();
+          const groupId = current.createTabGroup(projectId, name);
+          if (!groupId) return reply(false, null, 'project not open in UI');
+          const group = current.openProjects.get(projectId)?.tabGroups.find((g: any) => g.id === groupId) || null;
+          return reply(true, { projectId, groupId, group });
+        }
+        if (action === 'renameTabGroup') {
+          const { projectId, groupId, name } = payload || {};
+          if (!projectId || !groupId || !name) return reply(false, null, 'projectId+groupId+name required');
+          useWorkspaceStore.getState().renameTabGroup(projectId, groupId, name);
+          return reply(true, { projectId, groupId, name });
+        }
+        if (action === 'toggleTabGroupCollapsed') {
+          const { projectId, groupId } = payload || {};
+          if (!projectId || !groupId) return reply(false, null, 'projectId+groupId required');
+          useWorkspaceStore.getState().toggleTabGroupCollapsed(projectId, groupId);
+          const group = useWorkspaceStore.getState().openProjects.get(projectId)?.tabGroups.find((g: any) => g.id === groupId) || null;
+          return reply(true, { projectId, groupId, collapsed: !!group?.collapsed });
+        }
+        if (action === 'setTabGroupSessionStatus') {
+          const { projectId, groupId, status } = payload || {};
+          if (!projectId || !groupId) return reply(false, null, 'projectId+groupId required');
+          useWorkspaceStore.getState().setTabGroupSessionStatus(projectId, groupId, status || null);
+          return reply(true, { projectId, groupId, status: status || null });
+        }
+        if (action === 'deleteTabGroup') {
+          const { projectId, groupId } = payload || {};
+          if (!projectId || !groupId) return reply(false, null, 'projectId+groupId required');
+          useWorkspaceStore.getState().deleteTabGroup(projectId, groupId);
+          return reply(true, { projectId, groupId });
+        }
+        if (action === 'setTabSessionStatus') {
+          const { tabId, status } = payload || {};
+          const found = findTabProject(tabId);
+          if (!found) return reply(false, null, 'tab not in any open project');
+          useWorkspaceStore.getState().setTabSessionStatus(found.projectId, tabId, status || null);
+          return reply(true, { tabId, status: status || null });
+        }
+        if (action === 'applyTabLayout') {
+          const { projectId, orderedIds, groupAssignments, visualParentAssignments, groupAnchorAssignments } = payload || {};
+          if (!projectId || !Array.isArray(orderedIds)) return reply(false, null, 'projectId+orderedIds required');
+          useWorkspaceStore.getState().applyTabLayout(
+            projectId,
+            orderedIds,
+            groupAssignments || {},
+            visualParentAssignments || {},
+            groupAnchorAssignments || {}
+          );
+          return reply(true, { projectId });
         }
         if (action === 'getSDKParams') {
           const { tabId } = payload || {};
@@ -1998,6 +2113,7 @@ function App() {
     window.addEventListener('keydown', handlePasteRefocus, true);
 
     return () => {
+      disposed = true;
       ipcRenderer.removeListener('terminal:mcp-restart', handleMcpRestart);
       ipcRenderer.removeListener('terminal:mcp-create', handleMcpCreate);
       ipcRenderer.removeListener('terminal:mcp-ai-tab', handleMcpAiTab);

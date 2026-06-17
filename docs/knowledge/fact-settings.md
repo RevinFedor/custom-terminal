@@ -139,25 +139,26 @@ inline preview внутри списка; сама перетаскиваема�
 ### Flat DnD: Gap Height для развёрнутых групп
 При перетаскивании группы в flat-списке, gap-preview должен занимать высоту всего контейнера (header + дочерние промпты), а не только header. Замер берётся от `[data-flat-container]`, а floating clone показывает только header. Без этого gap для развёрнутой группы с 5+ промптами будет в 10 раз меньше скрываемого пространства.
 
-## Sidebar Behavior (Cmd+/)
+## Sidebar Behavior (Cmd+B)
 
-Два toggle в Settings → Шрифты → блок «Сайдбар». Управляют поведением file explorer'а, открываемого через `Cmd+/`.
+Два toggle в Settings → Шрифты → блок «Сайдбар». Управляют поведением file explorer'а, открываемого через `Cmd+B`.
 
 ### Восстанавливать файл при открытии
-- **OFF (по умолчанию):** При закрытии sidebar `openFilePath` обнуляется в БД и в store. Следующий `Cmd+/` открывает только дерево, без восстановления последнего просмотренного файла.
+- **OFF (по умолчанию):** При закрытии sidebar `openFilePath` обнуляется в БД и в store. Следующий `Cmd+B` открывает только дерево, без восстановления последнего просмотренного файла.
 - **ON:** Старое поведение — путь сохраняется, при reopen файл подгружается.
 - **Мотивация дефолта OFF:** Sidebar используется как быстрый picker, не как long-running view. Восстановление файла при каждом открытии — лишний шаг (закрыть файл → выбрать другой). Если нужен дольгий просмотр одного файла — toggle включается.
 - **Store:** `useUIStore.sidebarPersistFile` / `localStorage('noted-terminal-sidebar-behavior')`.
 
 ### Закрывать кликом вне (overlay-режим)
-- **ON (по умолчанию):** Sidebar работает как overlay — клик в любом месте поверх терминала закрывает его. Клик внутри `[data-sidebar-portal]` или `[data-file-preview-root]` оставляет открытым.
-- **Почему FilePreview не закрывает:** sidebar и file preview — связанные слои. Пользователь читает файл из дерева; клики по preview не должны убирать дерево из-под него. Атрибут `data-file-preview-root` на корне FilePreview — anchor для этой проверки.
+- **ON (по умолчанию):** Sidebar работает как overlay — клик в любом месте вне самого `[data-sidebar-portal]` закрывает дерево. Клик по FilePreview справа тоже считается outside-click: пользователь уже ушёл из дерева в просмотр/редактор, поэтому дерево не должно оставаться поверх терминала.
+- **DOM + rect guard для самого дерева:** из-за Portal/z-index/canvas layering нельзя полагаться только на `target.closest('[data-sidebar-portal]')`. Guard дополнительно проверяет координаты `mousedown` внутри `getBoundingClientRect()` сайдбара; иначе клик по строке дерева может быть классифицирован как outside-click, и пользователь видит «внутри дерева файлы тупо не открываются».
 - **Capture-phase listener:** `mousedown` навешен с `useCapture=true`. Без capture canvas terminal (xterm) ловит событие первым через `pointer-events`, и обработчик на window не срабатывает. Известный pattern для overlay'ев поверх xterm — см. `methodology/сценарии-багов-design.md::6.3. UI поверх canvas: Portal или Layering Pattern`.
 - **Store:** `useUIStore.sidebarOverlayCloseOnClickOutside`.
 
 ### Связанная логика в Workspace
 - При `sidebarPersistFile=false` И закрытии sidebar — не только скрывается preview, но и `setOpenFilePath(activeProjectId, null)` пишется в БД. Без этого следующее открытие подтянуло бы старый путь из персиста.
-- `sidebarOpenForRender` toggle через `Cmd+/`. Слот `Cmd+E` исторически переходил: file-sidebar → prompt picker alias → toggle Tab Notes Slideout (с 16.05.2026). См. `fact-notes.md`.
+- `sidebarPersistFile=false` **не** означает “закрывать любой sidebar preview пока дерево открыто”. Это только запрет auto-restore на следующем reopen. Прямой клик по файлу должен открыть и удержать preview; иначе логи показывают `SidebarFileOpen read-result success`, а следующий sync-effect сразу делает `closeFilePreview()` и пользователь видит чёрную область/ничего не открылось.
+- `sidebarOpenForRender` toggle через `Cmd+B`. Слот `Cmd+E` исторически переходил: file-sidebar → prompt picker alias → toggle Tab Notes Slideout (с 16.05.2026). См. `fact-notes.md`.
 
 ## Close Button Identity
 Кнопки закрытия панелей редактирования выделены в отдельный визуальный класс:

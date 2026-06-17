@@ -794,6 +794,10 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
   ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray, forceCleanup });
 };
 
+const notifyProjectLayoutChanged = (projectId: string, reason: string) => {
+  ipcRenderer.invoke('project:layout-changed', { projectId, reason }).catch(() => {});
+};
+
 const saveTabGroups = (projectId: string, groups: TabGroup[]) => {
   const seq = ++tabGroupSaveSeq;
   const start = performance.now();
@@ -815,6 +819,7 @@ const saveTabGroups = (projectId: string, groups: TabGroup[]) => {
         ` durMs=${Math.round(performance.now() - start)}` +
         ` groups=${summarizeDndGroups(groups)}`
       );
+      notifyProjectLayoutChanged(projectId, 'tab-groups');
     })
     .catch((error: unknown) => {
       console.warn(
@@ -2244,6 +2249,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
     set({ openProjects: new Map(openProjects) });
     saveTabs(workspace.projectId, workspace.tabs);
+    notifyProjectLayoutChanged(workspace.projectId, 'tab-status');
   },
 
   setTabCompletionNotificationArmed: (projectId, tabId, armed) => {
@@ -2935,6 +2941,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({ openProjects: new Map(openProjects) });
     saveTabs(workspace.projectId, workspace.tabs);
     if (touchedGroups) saveTabGroups(workspace.projectId, workspace.tabGroups);
+    notifyProjectLayoutChanged(workspace.projectId, 'tab-layout');
   },
 
   updateTabCwd: (projectId, tabId, newCwd) => {

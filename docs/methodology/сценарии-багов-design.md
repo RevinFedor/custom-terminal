@@ -62,6 +62,12 @@ const showAbove = spaceBelow < 160;
 
 Status bar в самом низу. Использовать `bottom: window.innerHeight - chipRect.top + 4`, не `top: chipRect.bottom + …`. Детерминировано — smart-flip не нужен.
 
+### 1.4. Контекстное меню + submenu — два clamp-слоя
+
+Root context menu и вложенное submenu позиционируются независимо. Если root-menu уже влезает в viewport, это ничего не гарантирует для submenu: оно якорится к parent-row, может оказаться у нижнего края и обязано отдельно считать `spaceBelow`, `naturalHeight`, `maxHeight`, сторону раскрытия right/left и вертикальный offset. Симптом: ПКМ-меню видно, но список внутри `Link File` / `Status` / `Format` уходит за нижнюю границу приложения.
+
+Для многоуровневых меню не лечить это `z-index`: слой может быть поверх всех окон и всё равно быть физически за viewport. Фикс — измерить root после mount, clamp'нуть root к окну, затем измерить submenu trigger и отдельно fit'ить submenu в `window.innerHeight - pad`. Если список длинный, `overflow-y:auto` живёт внутри submenu, а не растягивает его за экран. Глобальный паттерн — `docs-global/ux-паттерны/tooltip-resize-modal.md::Dropdown и вложенное подменю`.
+
 ---
 
 ## 2. Hover-bridge: popup закрывается при движении к нему

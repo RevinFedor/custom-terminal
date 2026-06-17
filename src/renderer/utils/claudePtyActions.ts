@@ -42,6 +42,12 @@ export interface ClaudePtyDraftGrabResult {
   error?: string;
 }
 
+export interface ClaudePtySendOptions {
+  handoffId?: string;
+  source?: string;
+  statusAtSend?: string;
+}
+
 type ClaudePtyResumeResult = {
   success: boolean;
   sessionId?: string;
@@ -163,30 +169,40 @@ async function resumeClaudePtySessionInner({
   return { success: true, sessionId, repaired };
 }
 
-export async function sendClaudePtyPrompt(tabId: string, prompt: string): Promise<any> {
+export async function sendClaudePtyPrompt(tabId: string, prompt: string, options: ClaudePtySendOptions = {}): Promise<any> {
   if (!tabId) return { success: false, error: 'tabId required' };
   if (!prompt.trim()) return { success: false, error: 'prompt required' };
 
   const existing = sendInflight.get(tabId);
   if (existing) {
-    console.log('[ClaudePtyActions:send] join-inflight tab=' + shortTab(tabId));
+    console.log('[ClaudePtyActions:send] join-inflight tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-'));
     return existing;
   }
 
   useWorkspaceStore.getState().clearInterruptedState(tabId);
-  console.log('[ClaudePtyActions:send] start tab=' + shortTab(tabId) + ' chars=' + prompt.length);
+  console.log('[ClaudePtyActions:send] start tab=' + shortTab(tabId) +
+    ' handoff=' + (options.handoffId || '-') +
+    ' source=' + (options.source || '-') +
+    ' statusAtSend=' + (options.statusAtSend || '-') +
+    ' chars=' + prompt.length);
   const work = ipcRenderer.invoke('terminal:paste', {
       tabId,
       content: prompt,
       submit: true,
       fast: false,
+      handoffId: options.handoffId || null,
+      source: options.source || 'claude-pty-action',
     })
     .then((result: any) => {
-      console.log('[ClaudePtyActions:send] done tab=' + shortTab(tabId) + ' success=' + (result?.success !== false) + ' chunks=' + (result?.chunksTotal ?? 'na'));
+      console.log('[ClaudePtyActions:send] done tab=' + shortTab(tabId) +
+        ' handoff=' + (options.handoffId || '-') +
+        ' success=' + (result?.success !== false) +
+        ' submitted=' + !!result?.submitted +
+        ' chunks=' + (result?.chunksTotal ?? 'na'));
       return result;
     })
     .catch((e: any) => {
-      console.warn('[ClaudePtyActions:send] error tab=' + shortTab(tabId) + ': ' + errorText(e));
+      console.warn('[ClaudePtyActions:send] error tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ': ' + errorText(e));
       return { success: false, error: errorText(e) };
     })
     .finally(() => {

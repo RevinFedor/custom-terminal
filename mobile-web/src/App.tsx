@@ -85,6 +85,7 @@ function ProjectsRoute() {
 }
 
 type ProjectData = { project: { id: string; name: string; path: string }; tabs: TabInfo[]; statusMarker?: StatusMarkerCfg; processBar?: ProcessBarCfg };
+type MobileFilePreview = { path: string; name: string; ext: string; size: number; content: string };
 
 function ProjectRoute() {
   const { projectId } = useParams();
@@ -383,6 +384,93 @@ function ActionSheet({ title, subtitle, actions, onDismiss }: {
               {a.label}
             </button>
           ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MarkdownFileSheet({ file, onDismiss }: { file: MobileFilePreview; onDismiss: () => void }) {
+  const [dragY, setDragY] = useState(0);
+  const [dragging, setDragging] = useState(false);
+  const startY = useRef<number | null>(null);
+
+  const onPointerDown = (e: React.PointerEvent) => {
+    startY.current = e.clientY;
+    setDragging(true);
+  };
+  const onPointerMove = (e: React.PointerEvent) => {
+    if (startY.current == null) return;
+    setDragY(Math.max(0, e.clientY - startY.current));
+  };
+  const onPointerUp = () => {
+    if (dragY > 80) onDismiss();
+    else setDragY(0);
+    startY.current = null;
+    setDragging(false);
+  };
+
+  return (
+    <div
+      onClick={onDismiss}
+      style={{
+        position: 'fixed', inset: 0,
+        background: `rgba(0,0,0,${0.58 - Math.min(0.42, dragY / 420)})`,
+        zIndex: 1200,
+        display: 'flex', alignItems: 'flex-end', justifyContent: 'center',
+        animation: dragging ? 'none' : 'noted-fade-in 0.18s ease-out',
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: '100%', maxWidth: 560,
+          height: 'min(86vh, 760px)',
+          background: '#111111',
+          borderRadius: '18px 18px 0 0',
+          border: '1px solid #272727',
+          borderBottom: 'none',
+          overflow: 'hidden',
+          display: 'flex', flexDirection: 'column',
+          animation: dragging ? 'none' : 'noted-sheet-up 0.22s cubic-bezier(0.16, 1, 0.3, 1)',
+          transform: dragY > 0 ? `translateY(${dragY}px)` : undefined,
+          transition: dragging ? 'none' : 'transform 0.2s cubic-bezier(0.16, 1, 0.3, 1)',
+        }}
+      >
+        <div
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerUp}
+          style={{ padding: '8px 0 4px', cursor: 'grab', touchAction: 'none' }}
+        >
+          <div style={{ width: 36, height: 4, background: '#444', borderRadius: 999, margin: '0 auto 12px' }} />
+        </div>
+        <div style={{
+          padding: '4px 16px 12px',
+          borderBottom: '1px solid #242424',
+          display: 'flex', alignItems: 'center', gap: 10,
+        }}>
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div style={{ fontSize: 15, fontWeight: 700, color: '#f0f0f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{file.name}</div>
+            <div style={{ fontSize: 11, color: '#666', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {file.path} · {file.size.toLocaleString()} bytes
+            </div>
+          </div>
+          <button
+            className="noted-icon"
+            onClick={onDismiss}
+            style={{ ...S.iconBtn, color: '#888', background: '#1b1b1b' }}
+            aria-label="Close preview"
+          >×</button>
+        </div>
+        <div style={{
+          flex: 1,
+          overflowY: 'auto',
+          WebkitOverflowScrolling: 'touch',
+          padding: '14px 16px max(22px, env(safe-area-inset-bottom))',
+        }}>
+          <CBMarkdown text={file.content || ' '} />
         </div>
       </div>
     </div>
@@ -881,6 +969,8 @@ function ProjectView(props: {
   const [creating, setCreating] = useState(false);
   const [actionTarget, setActionTarget] = useState<{ tab: TabInfo; kind: 'sdk' | 'terminal' } | null>(null);
   const [renameTarget, setRenameTarget] = useState<TabInfo | null>(null);
+  const [filePreview, setFilePreview] = useState<MobileFilePreview | null>(null);
+  const [filePreviewLoading, setFilePreviewLoading] = useState<string | null>(null);
 
   // ONE flat list in DESKTOP ORDER (server returns tabs ORDER BY position) — no
   // grouping by type, no section headers. Whether a tab opens interactive (SDK /
@@ -888,6 +978,20 @@ function ProjectView(props: {
   // predicate, NOT a layout split — it only changes the onTap target + kind.
   const visibleTabs = tabs.filter((t) => t.tabId);
   const isInteractive = (t: TabInfo) => t.tabType === 'claude-sdk' || t.commandType === 'claude';
+
+  const openFilePreview = async (tab: TabInfo) => {
+    const filePath = tab.filePath || tab.cwd;
+    if (!filePath || filePreviewLoading) return;
+    setFilePreviewLoading(tab.tabId || filePath);
+    try {
+      const preview = await Api.filePreview(filePath);
+      setFilePreview(preview);
+    } catch (e: any) {
+      alert('File preview failed: ' + (e?.message || e));
+    } finally {
+      setFilePreviewLoading(null);
+    }
+  };
 
   const create = async () => {
     setCreating(true);
@@ -1007,12 +1111,31 @@ function ProjectView(props: {
               tab={t}
               marker={marker}
               processBar={procBar}
-              onTap={() => onOpenChat(t, interactive ? undefined : { readOnly: true })}
+              onTap={() => t.tabType === 'file' ? openFilePreview(t) : onOpenChat(t, interactive ? undefined : { readOnly: true })}
               onLongPress={() => setActionTarget({ tab: t, kind: t.tabType === 'claude-sdk' ? 'sdk' : 'terminal' })}
             />
           );
         })}
       </div>
+      {filePreviewLoading && (
+        <div style={{
+          position: 'fixed', left: '50%', bottom: 'calc(24px + env(safe-area-inset-bottom))',
+          transform: 'translateX(-50%)',
+          zIndex: 900,
+          padding: '8px 12px',
+          borderRadius: 999,
+          background: '#1a1a1a',
+          border: '1px solid #333',
+          color: '#aaa',
+          fontSize: 12,
+          display: 'flex',
+          gap: 8,
+          alignItems: 'center',
+        }}>
+          <InlineSpinner color="#FFB382" size={12} /> Preview…
+        </div>
+      )}
+      {filePreview && <MarkdownFileSheet file={filePreview} onDismiss={() => setFilePreview(null)} />}
 
       {actionTarget && actionTarget.kind === 'sdk' && (
         <ActionSheet
