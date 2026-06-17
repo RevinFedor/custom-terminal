@@ -2307,6 +2307,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     toolType?: string;
     persisted?: boolean;
     error?: string;
+    message?: string;
   }) => {
     if (detail.tabId !== tabId) return;
     const opId = detail.opId || String(Date.now());
@@ -2316,7 +2317,9 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     const uuid = LOCAL_REWIND_PREFIX + tabId + '-' + opId;
     const rewindStatus: FullHistoryEntry['rewindStatus'] =
       status === 'failed' ? 'failed' : status === 'done' ? 'done' : 'rewinding';
-    const content = status === 'failed'
+    const content = detail.message
+      ? detail.message
+      : status === 'failed'
       ? (detail.error ? 'Failed: ' + detail.error : 'Rewind failed')
       : targetText
         ? 'Target: ' + targetText
