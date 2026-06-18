@@ -2283,20 +2283,71 @@ function App() {
           // Single dispatch entry for /api/sdk-tabs/:id/send — backend used
           // to do TWO bridge round-trips (status check + actual send). Now
           // the routing happens here, in the same call that does the work.
-          const { tabId, prompt, model, effort, thinking, cwd, handoffId, source, statusAtSend, queue } = payload || {};
+          const { tabId, prompt, model, effort, thinking, cwd, handoffId, source, statusAtSend, queue, returnDraftOnConflict } = payload || {};
           if (!tabId || !prompt) return reply(false, null, 'tabId+prompt required');
           const { tab, toolType, runtime } = describeAgentTab(tabId);
           if (runtime && toolType) {
+            const statusForSend = typeof statusAtSend === 'string' ? statusAtSend : undefined;
+            if (statusForSend === 'active' && queue !== true && runtime.inspectDraft) {
+              const visual = runtime.inspectDraft(tabId);
+              if (visual?.hasDraft === true) {
+                let draftText = '';
+                let draftImages = 0;
+                if (returnDraftOnConflict === true) {
+                  const grabbed = await runtime.grabDraft(tabId);
+                  if (grabbed?.success === false) {
+                    return reply(true, {
+                      tabId,
+                      toolType,
+                      success: false,
+                      ok: false,
+                      code: 'terminal_draft_grab_failed',
+                      error: grabbed.error || 'terminal draft exists, but could not be returned',
+                      draftPreview: visual.preview || '',
+                      draftSource: visual.source || '',
+                      originalPrompt: prompt,
+                    });
+                  }
+                  draftText = typeof grabbed?.text === 'string' ? grabbed.text : '';
+                  draftImages = Number(grabbed?.images || 0);
+                }
+                return reply(true, {
+                  tabId,
+                  toolType,
+                  success: false,
+                  ok: false,
+                  code: 'terminal_draft_conflict',
+                  error: 'Terminal has an unsent draft',
+                  draftText,
+                  draftPreview: visual.preview || '',
+                  draftSource: visual.source || '',
+                  draftImages,
+                  originalPrompt: prompt,
+                });
+              }
+              if (visual?.hasDraft === null && visual.source !== 'no-terminal') {
+                return reply(true, {
+                  tabId,
+                  toolType,
+                  success: false,
+                  ok: false,
+                  code: 'terminal_draft_state_unknown',
+                  error: 'Terminal draft state is unknown; send stopped before touching input',
+                  draftPreview: visual.preview || '',
+                  draftSource: visual.source || '',
+                  originalPrompt: prompt,
+                });
+              }
+            }
             const result = await runtime.sendPrompt(tabId, prompt, {
               handoffId: typeof handoffId === 'string' ? handoffId : undefined,
               source: typeof source === 'string' ? source : 'mobile-native',
-              statusAtSend: typeof statusAtSend === 'string' ? statusAtSend : undefined,
+              statusAtSend: statusForSend,
               queue: queue === true,
               model: typeof model === 'string' ? model : undefined,
               effort: typeof effort === 'string' ? effort : undefined,
             });
-            const ok = result?.success !== false;
-            return reply(ok, { tabId, toolType, ...(result || {}) }, ok ? undefined : result?.error);
+            return reply(true, { tabId, toolType, ...(result || {}) });
           }
           // SDK path (default)
           const sendCwd = cwd || tab?.cwd;
@@ -2457,6 +2508,23 @@ function App() {
     };
     ipcRenderer.on('terminal:visible-buffer-request', handleTerminalVisibleBufferRequest);
 
+    const handleTerminalCodexDraftStateRequest = async (_: any, payload: { requestId?: string; tabId?: string; reason?: string; waitFor?: boolean; timeoutMs?: number }) => {
+      const requestId = payload?.requestId;
+      const tabId = payload?.tabId;
+      if (!requestId || !tabId) return;
+      const state = typeof payload?.waitFor === 'boolean'
+        ? await terminalRegistry.waitForCodexDraftState(tabId, payload.waitFor, Math.max(100, Math.min(Number(payload.timeoutMs) || 900, 2500)))
+        : terminalRegistry.getCodexDraftState(tabId);
+      ipcRenderer.send('terminal:codex-draft-state-response', {
+        requestId,
+        tabId,
+        reason: payload?.reason || '',
+        success: true,
+        ...state,
+      });
+    };
+    ipcRenderer.on('terminal:codex-draft-state-request', handleTerminalCodexDraftStateRequest);
+
     // Cmd+Tab refocus: main process fires this on every BrowserWindow 'focus'
     // event. We re-broadcast it as a DOM CustomEvent so per-tab components
     // (Terminal.tsx, ClaudeSDKTab.tsx) can listen via window.addEventListener
@@ -2508,6 +2576,7 @@ function App() {
       ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
       ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
       ipcRenderer.removeListener('terminal:visible-buffer-request', handleTerminalVisibleBufferRequest);
+      ipcRenderer.removeListener('terminal:codex-draft-state-request', handleTerminalCodexDraftStateRequest);
       ipcRenderer.removeListener('claude:awaiting-input', handleAwaitingInput);
       ipcRenderer.removeListener('window:refocus-active', handleWindowRefocus);
       window.removeEventListener('keydown', handlePasteRefocus, true);

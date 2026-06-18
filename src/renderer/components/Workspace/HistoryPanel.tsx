@@ -829,13 +829,32 @@ function HistoryThinkingChip({ label }: { label: string }) {
   );
 }
 
+const QUESTION_NAV_KEY = {
+  up: '\x1b[A',
+  down: '\x1b[B',
+  left: '\x1b[D',
+  right: '\x1b[C',
+  enter: '\r',
+  space: ' ',
+} as const;
+
+type QuestionTerminalCursor = {
+  questionIndex: number;
+  optionIndex: number;
+  submit: boolean;
+};
+
+const sleepQuestionNav = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 function ClaudeHistoryQuestionCard({
+  tabId,
   pending,
   answering,
   error,
   onAnswer,
   onStop,
 }: {
+  tabId: string;
   pending: AgentPendingQuestion;
   answering: boolean;
   error: string | null;
@@ -843,9 +862,16 @@ function ClaudeHistoryQuestionCard({
   onStop: () => void;
 }) {
   const questions = pending.questions || [];
+  const terminalDriven = pending.source === 'pty';
   const multiQuestion = questions.length > 1;
   const [selection, setSelection] = useState<Record<number, string[]>>({});
   const [questionIndex, setQuestionIndex] = useState(0);
+  const [optionIndex, setOptionIndex] = useState(0);
+  const [terminalSubmitReady, setTerminalSubmitReady] = useState(false);
+  const [terminalBusyTarget, setTerminalBusyTarget] = useState<string | null>(null);
+  const terminalBusyRef = useRef(false);
+  const terminalBusyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const terminalCursorRef = useRef<QuestionTerminalCursor>({ questionIndex: 0, optionIndex: 0, submit: false });
   const questionSignature = useMemo(
     () => questions.map((q) => q?.question || '').join('||'),
     [questions],
@@ -854,7 +880,22 @@ function ClaudeHistoryQuestionCard({
   useEffect(() => {
     setSelection({});
     setQuestionIndex(0);
+    setOptionIndex(0);
+    setTerminalSubmitReady(false);
+    setTerminalBusyTarget(null);
+    terminalBusyRef.current = false;
+    terminalCursorRef.current = { questionIndex: 0, optionIndex: 0, submit: false };
+    if (terminalBusyTimerRef.current) {
+      clearTimeout(terminalBusyTimerRef.current);
+      terminalBusyTimerRef.current = null;
+    }
   }, [pending.source, pending.toolUseID, questionSignature]);
+
+  useEffect(() => {
+    return () => {
+      if (terminalBusyTimerRef.current) clearTimeout(terminalBusyTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (questionIndex >= questions.length && questions.length > 0) setQuestionIndex(questions.length - 1);
@@ -877,9 +918,129 @@ function ClaudeHistoryQuestionCard({
   }, [questions]);
 
   const allAnswered = questions.length > 0 && questions.every((_q, i) => (selection[i]?.length || 0) > 0);
+  const controlsBusy = answering || !!terminalBusyTarget;
 
-  const pickOption = useCallback((label: string) => {
-    if (answering || !currentQuestion) return;
+  const writeTerminalKey = useCallback(async (seq: string, gap = 72) => {
+    ipcRenderer.send('terminal:input', tabId, seq);
+    await sleepQuestionNav(gap);
+  }, [tabId]);
+
+  const clearTerminalBusyLater = useCallback((target: string, delayMs = 140) => {
+    if (terminalBusyTimerRef.current) clearTimeout(terminalBusyTimerRef.current);
+    terminalBusyTimerRef.current = setTimeout(() => {
+      terminalBusyTimerRef.current = null;
+      terminalBusyRef.current = false;
+      setTerminalBusyTarget((current) => current === target ? null : current);
+    }, delayMs);
+  }, []);
+
+  const runTerminalQuestionAction = useCallback(async (
+    target: string,
+    action: () => Promise<void>,
+    settleMs = 140,
+  ) => {
+    if (!terminalDriven || terminalBusyRef.current || answering) return;
+    terminalBusyRef.current = true;
+    if (terminalBusyTimerRef.current) {
+      clearTimeout(terminalBusyTimerRef.current);
+      terminalBusyTimerRef.current = null;
+    }
+    setTerminalBusyTarget(target);
+    try {
+      await action();
+    } catch (e: any) {
+      console.warn('[ClaudeHistoryQuestion] terminal-nav failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
+    } finally {
+      clearTerminalBusyLater(target, settleMs);
+    }
+  }, [answering, clearTerminalBusyLater, tabId, terminalDriven]);
+
+  const navigateTerminalTo = useCallback(async (
+    targetQuestionIndex: number,
+    targetOptionIndex = 0,
+    targetSubmit = false,
+  ) => {
+    const lastQuestionIndex = Math.max(0, questions.length - 1);
+    const clampedQuestion = Math.max(0, Math.min(targetQuestionIndex, lastQuestionIndex));
+    const clampedOption = Math.max(0, targetOptionIndex);
+    const current = terminalCursorRef.current;
+    const currentTab = current.submit ? questions.length : current.questionIndex;
+    const targetTab = targetSubmit ? questions.length : clampedQuestion;
+    const tabDelta = targetTab - currentTab;
+
+    for (let i = 0; i < Math.abs(tabDelta); i++) {
+      await writeTerminalKey(tabDelta > 0 ? QUESTION_NAV_KEY.right : QUESTION_NAV_KEY.left, 82);
+    }
+
+    if (targetSubmit) {
+      terminalCursorRef.current = { questionIndex: lastQuestionIndex, optionIndex: 0, submit: true };
+      return;
+    }
+
+    const optionBase = tabDelta === 0 && !current.submit ? current.optionIndex : 0;
+    const optionDelta = clampedOption - optionBase;
+    for (let i = 0; i < Math.abs(optionDelta); i++) {
+      await writeTerminalKey(optionDelta > 0 ? QUESTION_NAV_KEY.down : QUESTION_NAV_KEY.up, 72);
+    }
+    terminalCursorRef.current = { questionIndex: clampedQuestion, optionIndex: clampedOption, submit: false };
+  }, [questions.length, writeTerminalKey]);
+
+  const focusQuestion = useCallback((index: number) => {
+    const nextIndex = Math.max(0, Math.min(index, Math.max(0, questions.length - 1)));
+    if (!terminalDriven) {
+      setQuestionIndex(nextIndex);
+      setOptionIndex(0);
+      return;
+    }
+    runTerminalQuestionAction('question:' + nextIndex, async () => {
+      await navigateTerminalTo(nextIndex, 0, false);
+      setQuestionIndex(nextIndex);
+      setOptionIndex(0);
+      setTerminalSubmitReady(false);
+    });
+  }, [navigateTerminalTo, questions.length, runTerminalQuestionAction, terminalDriven]);
+
+  const pickOption = useCallback((label: string, index: number) => {
+    if (controlsBusy || !currentQuestion) return;
+    setOptionIndex(index);
+
+    if (terminalDriven) {
+      const target = 'option:' + questionIndex + ':' + index;
+      runTerminalQuestionAction(target, async () => {
+        await navigateTerminalTo(questionIndex, index, false);
+        if (isMultiSelect) {
+          await writeTerminalKey(QUESTION_NAV_KEY.space, 90);
+          setSelection((prev) => {
+            const current = prev[questionIndex] || [];
+            const next = current.includes(label)
+              ? current.filter((item) => item !== label)
+              : [...current, label];
+            return { ...prev, [questionIndex]: next };
+          });
+          setTerminalSubmitReady(false);
+          return;
+        }
+
+        const nextSelection = { ...selection, [questionIndex]: [label] };
+        setSelection(nextSelection);
+        await writeTerminalKey(QUESTION_NAV_KEY.enter, 115);
+
+        if (multiQuestion) {
+          if (questionIndex < questions.length - 1) {
+            const nextQuestionIndex = questionIndex + 1;
+            terminalCursorRef.current = { questionIndex: nextQuestionIndex, optionIndex: 0, submit: false };
+            setQuestionIndex(nextQuestionIndex);
+            setOptionIndex(0);
+            setTerminalSubmitReady(false);
+          } else {
+            terminalCursorRef.current = { questionIndex, optionIndex: index, submit: true };
+            setTerminalSubmitReady(true);
+          }
+        }
+      }, multiQuestion || isMultiSelect ? 150 : 850);
+      return;
+    }
+
     if (isMultiSelect) {
       setSelection((prev) => {
         const current = prev[questionIndex] || [];
@@ -898,15 +1059,48 @@ function ClaudeHistoryQuestionCard({
     } else if (questionIndex < questions.length - 1) {
       setQuestionIndex(questionIndex + 1);
     }
-  }, [answering, buildAnswers, currentQuestion, isMultiSelect, multiQuestion, onAnswer, questionIndex, questions.length, selection]);
+  }, [
+    buildAnswers,
+    controlsBusy,
+    currentQuestion,
+    isMultiSelect,
+    multiQuestion,
+    navigateTerminalTo,
+    onAnswer,
+    questionIndex,
+    questions.length,
+    runTerminalQuestionAction,
+    selection,
+    terminalDriven,
+    writeTerminalKey,
+  ]);
 
   const submit = useCallback(() => {
-    if (answering || !allAnswered) return;
+    if (controlsBusy || !allAnswered) return;
+    if (terminalDriven) {
+      runTerminalQuestionAction('submit', async () => {
+        await navigateTerminalTo(Math.max(0, questions.length - 1), 0, true);
+        await writeTerminalKey(QUESTION_NAV_KEY.enter, 110);
+        setTerminalSubmitReady(false);
+      }, 850);
+      return;
+    }
     onAnswer(buildAnswers(selection));
-  }, [allAnswered, answering, buildAnswers, onAnswer, selection]);
+  }, [
+    allAnswered,
+    buildAnswers,
+    controlsBusy,
+    navigateTerminalTo,
+    onAnswer,
+    questions.length,
+    runTerminalQuestionAction,
+    selection,
+    terminalDriven,
+    writeTerminalKey,
+  ]);
 
   const headerLabel = questions.length > 0
-    ? 'QUESTION' + (multiQuestion ? ' ' + (questionIndex + 1) + '/' + questions.length : '')
+    ? (terminalSubmitReady ? 'SUBMIT' : 'QUESTION' + (multiQuestion ? ' ' + (questionIndex + 1) + '/' + questions.length : ''))
     : 'QUESTION';
 
   return (
@@ -939,7 +1133,7 @@ function ClaudeHistoryQuestionCard({
           </span>
         )}
         <div style={{ flex: 1 }} />
-        {answering && (
+        {(answering || terminalBusyTarget) && (
           <span style={{ color: QUESTION_PURPLE, flexShrink: 0 }}>
             <HistorySpinner size={13} />
           </span>
@@ -951,12 +1145,13 @@ function ClaudeHistoryQuestionCard({
           {questions.map((q, i) => {
             const answered = (selection[i]?.length || 0) > 0;
             const active = i === questionIndex;
+            const chipBusy = terminalBusyTarget === 'question:' + i;
             return (
               <button
                 key={i}
                 type="button"
-                onClick={() => setQuestionIndex(i)}
-                disabled={answering}
+                onClick={() => focusQuestion(i)}
+                disabled={controlsBusy}
                 style={{
                   borderRadius: 5,
                   border: '1px solid ' + (active ? QUESTION_PURPLE_BORDER : '#333'),
@@ -964,15 +1159,21 @@ function ClaudeHistoryQuestionCard({
                   color: active ? '#f3e8ff' : answered ? QUESTION_PURPLE : '#888',
                   padding: '3px 7px',
                   fontSize: 10,
-                  cursor: answering ? 'default' : 'pointer',
+                  cursor: controlsBusy ? 'default' : 'pointer',
                   maxWidth: 120,
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 5,
                 }}
                 title={q.question}
               >
-                {(answered ? 'OK ' : '') + (q.header || 'Q' + (i + 1))}
+                {chipBusy && <HistorySpinner size={10} />}
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {(answered ? 'OK ' : '') + (q.header || 'Q' + (i + 1))}
+                </span>
               </button>
             );
           })}
@@ -987,20 +1188,22 @@ function ClaudeHistoryQuestionCard({
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             {currentOptions.map((option, index) => {
               const checked = currentSelection.includes(option.label);
+              const focused = terminalDriven && index === optionIndex && !terminalSubmitReady;
+              const optionBusy = terminalBusyTarget === 'option:' + questionIndex + ':' + index;
               return (
                 <button
                   key={option.label + ':' + index}
                   type="button"
-                  onClick={() => pickOption(option.label)}
-                  disabled={answering}
+                  onClick={() => pickOption(option.label, index)}
+                  disabled={controlsBusy}
                   style={{
                     width: '100%',
                     textAlign: 'left',
                     borderRadius: 5,
-                    border: '1px solid ' + (checked ? QUESTION_PURPLE_BORDER : '#303030'),
-                    backgroundColor: checked ? QUESTION_PURPLE_BG : '#181818',
+                    border: '1px solid ' + ((checked || focused) ? QUESTION_PURPLE_BORDER : '#303030'),
+                    backgroundColor: focused ? 'rgba(168, 85, 247, 0.16)' : checked ? QUESTION_PURPLE_BG : '#181818',
                     color: '#e5e5e5',
-                    cursor: answering ? 'default' : 'pointer',
+                    cursor: controlsBusy ? 'default' : 'pointer',
                     padding: '8px 9px',
                     display: 'flex',
                     flexDirection: 'column',
@@ -1015,7 +1218,13 @@ function ClaudeHistoryQuestionCard({
                       border: '1px solid ' + (checked ? QUESTION_PURPLE : '#666'),
                       backgroundColor: checked ? QUESTION_PURPLE : 'transparent',
                       flexShrink: 0,
-                    }} />
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      color: QUESTION_PURPLE,
+                    }}>
+                      {optionBusy && <HistorySpinner size={10} />}
+                    </span>
                     <span style={{ fontSize: 12, fontWeight: checked ? 600 : 500, overflowWrap: 'anywhere' }}>
                       {option.label}
                     </span>
@@ -1058,11 +1267,11 @@ function ClaudeHistoryQuestionCard({
         <button
           type="button"
           onClick={onStop}
-          disabled={answering}
+          disabled={controlsBusy}
           style={{
             ...historyControlButtonBase,
             height: 28,
-            cursor: answering ? 'default' : 'pointer',
+            cursor: controlsBusy ? 'default' : 'pointer',
             color: '#aaa',
           }}
         >
@@ -1073,17 +1282,19 @@ function ClaudeHistoryQuestionCard({
           <button
             type="button"
             onClick={submit}
-            disabled={answering || !allAnswered}
+            disabled={controlsBusy || !allAnswered}
             style={{
               ...historyControlButtonBase,
               height: 28,
-              borderColor: allAnswered && !answering ? QUESTION_PURPLE_BORDER : '#343434',
-              backgroundColor: allAnswered && !answering ? QUESTION_PURPLE : '#242424',
-              color: allAnswered && !answering ? '#121212' : '#666',
-              cursor: allAnswered && !answering ? 'pointer' : 'default',
+              borderColor: allAnswered && !controlsBusy ? QUESTION_PURPLE_BORDER : '#343434',
+              backgroundColor: allAnswered && !controlsBusy ? QUESTION_PURPLE : '#242424',
+              color: allAnswered && !controlsBusy ? '#121212' : '#666',
+              cursor: allAnswered && !controlsBusy ? 'pointer' : 'default',
               fontWeight: 700,
+              gap: 6,
             }}
           >
+            {terminalBusyTarget === 'submit' && <HistorySpinner size={12} />}
             Submit{multiQuestion ? ' ' + Object.keys(selection).filter((key) => (selection[Number(key)]?.length || 0) > 0).length + '/' + questions.length : ''}
           </button>
         )}
@@ -1808,6 +2019,7 @@ function AgentHistoryControls({
       {pendingQuestion ? (
         <ClaudeHistoryQuestionCard
           key={(pendingQuestion.source || 'unknown') + ':' + (pendingQuestion.toolUseID || 'none') + ':' + (pendingQuestion.questions?.length || 0)}
+          tabId={tabId}
           pending={pendingQuestion}
           answering={answeringQuestion}
           error={questionError}

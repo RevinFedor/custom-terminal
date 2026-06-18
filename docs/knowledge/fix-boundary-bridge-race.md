@@ -37,6 +37,12 @@ if (bridgeKnownSessions.has(tabId)) { // ← задержка секунды
 if (claudeSpinnerBusy.has(tabId)) {   // ← мгновенно
 ```
 
+## Дополнение 2026-06-18: restart-счётчик и служебные slash-команды
+
+Поздний bridge был не единственным способом потерять boundary. В stopped-session Rewind Claude process умирает, но xterm buffer/renderer markers остаются жить в той же вкладке. Если `clearBridgeTab` сбрасывает `promptBoundarySeq`, следующий старт снова инжектит `prompt:1`; renderer уже видел marker #1 и не разбудит `waitForPromptBoundaryAfter(afterSeq)`. Пользовательский симптом: `/model` и `/effort` визуально прошли, но Rewind не стартует, потому что gate ждёт marker который main считает отправленным, а renderer считает старым.
+
+Второй слой — service slash-команды вроде `/model`/`/effort`: они могут вернуть prompt без content-spinner, поэтому state machine `idle → busy → idle` не сработает сама. Для таких команд caller обязан явно взвести boundary state в `busy` на submit. Это не optimistic success: marker всё равно появляется только когда PTY реально показал prompt glyph (`⏵`/`❯`/`›`/`╰`). Timeout после этого остаётся ошибкой detector'а/готовности, не разрешением продолжать цепочку.
+
 ## Дополнительные изменения
 
 ### Text-based Fallback (Timeline.tsx, computePositions)

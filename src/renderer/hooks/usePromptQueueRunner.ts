@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { buildQueuedPromptPayload, countEnabledQueuedPrompts, isQueuedPromptEnabled, usePromptQueueStore, type TabQueue } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
+import { terminalRegistry } from '../utils/terminalRegistry';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -89,7 +90,22 @@ function getPromptQueueAgentLabel(tabId: string): string {
 function sendQueueCommand(tabId: string, payload: string): Promise<unknown> {
   const agent = getPromptQueueAgent(tabId);
   const channel = agent === 'codex' ? 'codex:send-command' : 'claude:send-command';
-  return ipcRenderer.invoke(channel, tabId, payload);
+  const isSlashCommand = String(payload || '').trimStart().startsWith('/');
+  const options = {
+    source: 'prompt-queue',
+    awaitUserMessageAudit: agent === 'claude' && !isSlashCommand,
+  };
+  const term = terminalRegistry.get(tabId);
+  const before = typeof document !== 'undefined' ? document.activeElement?.tagName?.toLowerCase() || '-' : '-';
+  try { term?.focus(); } catch {}
+  const after = typeof document !== 'undefined' ? document.activeElement?.tagName?.toLowerCase() || '-' : '-';
+  console.log('[PromptQueueRunner] focus before send tab=' + tabId.slice(-8) + ' agent=' + agent + ' hadTerm=' + !!term + ' active=' + before + '→' + after + ' slash=' + isSlashCommand + ' awaitAudit=' + options.awaitUserMessageAudit);
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(() => {
+      try { terminalRegistry.get(tabId)?.focus(); } catch {}
+    });
+  }
+  return ipcRenderer.invoke(channel, tabId, payload, options);
 }
 
 type EffectiveTriggerOptions = { clearStaleTarget?: boolean };
@@ -107,6 +123,46 @@ function getEffectiveQueueTrigger(ownerTabId: string, queue: TabQueue, options: 
     usePromptQueueStore.getState().setRunAfterTab(ownerTabId, null);
   }
   return ownerTabId;
+}
+
+function shortQueueTabId(tabId: string | null | undefined): string {
+  return tabId ? String(tabId).slice(-8) : '-';
+}
+
+function describeQueueForLog(ownerTabId: string, queue: TabQueue, triggerTabId: string): string {
+  const enabled = countEnabledQueuedPrompts(queue.items);
+  const effectiveTrigger = getEffectiveQueueTrigger(ownerTabId, queue);
+  return [
+    'owner=' + shortQueueTabId(ownerTabId),
+    'auto=' + (queue.autoRun ? '1' : '0'),
+    'items=' + queue.items.length,
+    'enabled=' + enabled,
+    'target=' + shortQueueTabId(queue.runAfterTabId || ownerTabId),
+    'eff=' + shortQueueTabId(effectiveTrigger),
+    'matches=' + (effectiveTrigger === triggerTabId ? '1' : '0'),
+    'ownerBusy=' + (prevBusyRef.get(ownerTabId) === true ? '1' : '0'),
+    'triggerSeen=' + (prevBusyRef.has(effectiveTrigger) ? '1' : '0'),
+    'triggerBusy=' + (prevBusyRef.get(effectiveTrigger) === true ? '1' : '0'),
+    'inflight=' + (queueSendInflight.has(ownerTabId) ? '1' : '0'),
+    'awaitStart=' + (queueAwaitingBusyStart.has(ownerTabId) ? '1' : '0'),
+  ].join(',');
+}
+
+function describeQueuesForTriggerLog(triggerTabId: string): string {
+  const queues = usePromptQueueStore.getState().queues;
+  const parts: string[] = [];
+  for (const [ownerTabId, queue] of queues) {
+    if (
+      ownerTabId !== triggerTabId &&
+      queue.runAfterTabId !== triggerTabId &&
+      !queue.autoRun &&
+      queue.items.length === 0 &&
+      !queue.stopAfter &&
+      queue.firstDelayCountdownAt === null
+    ) continue;
+    parts.push(describeQueueForLog(ownerTabId, queue, triggerTabId));
+  }
+  return parts.length > 0 ? parts.join(' | ') : 'none';
 }
 
 // When the per-tab post-prompt toggle is ON and post-prompt text is non-empty,
@@ -313,6 +369,14 @@ export function usePromptQueueRunner() {
         // (false → true) doesn't trigger queue actions — user submitted manually
         // or our send-command IPC kicked it off.
         if (!(wasBusy && !busy)) return;
+
+        if (channel === 'codex') {
+          const ownersAtEdge = findOwnersWaitingOn(tabId);
+          console.log('[PromptQueueRunner] codex idle edge tab=' + tabId.slice(-12)
+            + ' reason=' + (reason || 'natural')
+            + ' owners=' + (ownersAtEdge.length ? ownersAtEdge.map(shortQueueTabId).join(',') : 'none')
+            + ' queues=' + describeQueuesForTriggerLog(tabId));
+        }
 
         // Skip auto-run/stop-after for any NON-NATURAL turn-end. Только чистый
         // успешный Stop (reason === undefined) должен запускать следующий промпт

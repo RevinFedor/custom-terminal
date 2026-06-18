@@ -102,6 +102,9 @@ interface CodexDraftState {
   preview: string;
   source: string;
   debug?: string;
+  success?: boolean;
+  timedOut?: boolean;
+  checks?: number;
 }
 
 function getLogicalLineSnapshotAt(buf: any, row: number): LogicalLineSnapshot {
@@ -173,6 +176,35 @@ function extractCodexDraftFromLine(snapshotOrLine: LogicalLineSnapshot | string)
   if (CODEX_NON_DRAFT_LINE_RE.test(normalizedClean.trim())) return { hasDraft: null, preview: normalizedClean.trim().slice(0, 120) };
 
   return { hasDraft: null, preview: normalizedClean.trim().slice(0, 120) };
+}
+
+function extractCodexDraftAfterEmptyPrompt(buf: any, promptRow: number): { hasDraft: true; preview: string; sourceSuffix: string } | null {
+  if (!buf || promptRow < 0 || promptRow >= buf.length) return null;
+  const end = Math.min(buf.length, promptRow + 9);
+  for (let row = promptRow + 1; row < end; row++) {
+    const line = buf.getLine(row);
+    if (!line) break;
+    if (line.isWrapped) continue;
+
+    const snapshot = getLogicalLineSnapshotAt(buf, row);
+    const normalized = String(snapshot.text || '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/[▌█]/g, '')
+      .trimEnd();
+    const withoutBorder = normalized.replace(/^\s*│\s?/, '');
+    const candidate = withoutBorder.trim();
+    if (!candidate) continue;
+    if (/^[╭╰]/.test(candidate)) return null;
+
+    const candidateCells = snapshot.cells
+      .filter((cell) => cell.ch.trim() && cell.ch !== '▌' && cell.ch !== '█' && cell.ch !== '│');
+    if (candidateCells.length > 0 && candidateCells.every((cell) => cell.dim)) return null;
+    if (CODEX_EMPTY_COMPOSER_HINT_RE.test(candidate)) return null;
+    if (CODEX_NON_DRAFT_LINE_RE.test(candidate)) return null;
+
+    return { hasDraft: true, preview: candidate.slice(0, 120), sourceSuffix: ':multiline-draft-row-' + row };
+  }
+  return null;
 }
 
 function describeCodexDraftProbeRow(buf: any, row: number): string {
@@ -345,6 +377,12 @@ export const terminalRegistry = {
     for (const row of cursorRows) {
       const parsed = extractCodexDraftFromLine(getLogicalLineSnapshotAt(buf, row));
       if (parsed.hasDraft !== null) {
+        const multilineDraft = parsed.hasDraft === false && !parsed.preview
+          ? extractCodexDraftAfterEmptyPrompt(buf, row)
+          : null;
+        if (multilineDraft) {
+          return { ...multilineDraft, source: 'cursor:' + row + multilineDraft.sourceSuffix };
+        }
         const debug = parsed.hasDraft === false && !parsed.preview
           ? buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'cursor-empty-false')
           : undefined;
@@ -357,6 +395,12 @@ export const terminalRegistry = {
       if (!/[›❯]/.test(snapshot.text)) continue;
       const parsed = extractCodexDraftFromLine(snapshot);
       if (parsed.hasDraft !== null) {
+        const multilineDraft = parsed.hasDraft === false && !parsed.preview
+          ? extractCodexDraftAfterEmptyPrompt(buf, row)
+          : null;
+        if (multilineDraft) {
+          return { ...multilineDraft, source: 'viewport:' + row + multilineDraft.sourceSuffix };
+        }
         const debug = parsed.hasDraft === false && !parsed.preview
           ? buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'viewport-empty-false')
           : undefined;
@@ -376,6 +420,12 @@ export const terminalRegistry = {
       if (!/[›❯]/.test(snapshot.text)) continue;
       const parsed = extractCodexDraftFromLine(snapshot);
       if (parsed.hasDraft !== null) {
+        const multilineDraft = parsed.hasDraft === false && !parsed.preview
+          ? extractCodexDraftAfterEmptyPrompt(buf, row)
+          : null;
+        if (multilineDraft) {
+          return { ...multilineDraft, source: 'tail:' + row + multilineDraft.sourceSuffix };
+        }
         const debug = parsed.hasDraft === false && !parsed.preview
           ? buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'tail-empty-false')
           : undefined;
@@ -385,6 +435,49 @@ export const terminalRegistry = {
 
     const debug = buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'no-definitive-codex-composer-row');
     return { hasDraft: null, preview: '', source: 'unknown', debug };
+  },
+
+  waitForCodexDraftState(tabId: string, expected: boolean, timeoutMs = 900): Promise<CodexDraftState> {
+    const terminal = terminals.get(tabId);
+    if (!terminal) {
+      return Promise.resolve({ success: false, hasDraft: null, preview: '', source: 'no-terminal', debug: 'reason=no-terminal' });
+    }
+
+    let checks = 0;
+    const read = () => {
+      checks += 1;
+      return this.getCodexDraftState(tabId);
+    };
+    const first = read();
+    if (first.hasDraft === expected) {
+      return Promise.resolve({ ...first, success: true, timedOut: false, checks });
+    }
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let sub: { dispose?: () => void } | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (state: CodexDraftState, timedOut: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        try { sub?.dispose?.(); } catch {}
+        resolve({ ...state, success: true, timedOut, checks });
+      };
+      const check = () => {
+        const state = read();
+        if (state.hasDraft === expected) finish(state, false);
+      };
+
+      const onWriteParsed = (terminal as any).onWriteParsed;
+      const onRender = (terminal as any).onRender;
+      if (typeof onWriteParsed === 'function') {
+        sub = onWriteParsed.call(terminal, check);
+      } else if (typeof onRender === 'function') {
+        sub = onRender.call(terminal, check);
+      }
+      timer = setTimeout(() => finish(read(), true), timeoutMs);
+    });
   },
 
   updateViewport(tabId: string, top: number, bottom: number, total: number) {

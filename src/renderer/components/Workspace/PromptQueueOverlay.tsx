@@ -1,19 +1,14 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
-import type { CSSProperties, WheelEvent } from 'react';
+import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
 import { CheckSquare, ChevronLeft, History, PanelRightClose, PanelRightOpen, Plus, RefreshCw, Square, Trash2 } from 'lucide-react';
 import { buildQueuedPromptPayload, countEnabledQueuedPrompts, isQueuedPromptEnabled, makeDefaultPromptTitle, usePromptQueueStore, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
-// Run-after picker SEEDS its busy map from this always-on snapshot on mount,
-// then keeps it live via the same claude/gemini/codex busy-state IPC
-// TabBar uses (see RunAfterTabPicker). Seeding is required because the overlay
-// mounts with the active AI tab and would otherwise miss the busy:true edge
-// that already fired on a background target tab.
-import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { generateTitleFromPromptWithConfig, trimTabTitlePrompt } from '../../utils/generateTabTitle';
+import { RunAfterTabPicker } from './RunAfterTabPicker';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -859,8 +854,15 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   // Helper: focus terminal so Ink's render loop stays hot and external-editor flow
   // (clear / grab tempfile re-read) completes in one frame instead of waiting for
   // user to click back into the terminal.
-  const focusActiveTerminal = useCallback(() => {
-    requestAnimationFrame(() => terminalRegistry.get(tabId)?.focus());
+  const focusActiveTerminal = useCallback((reason = 'queue') => {
+    const term = terminalRegistry.get(tabId);
+    const before = document.activeElement?.tagName?.toLowerCase() || '-';
+    try { term?.focus(); } catch {}
+    const after = document.activeElement?.tagName?.toLowerCase() || '-';
+    console.log('[PromptQueue] focus terminal tab=' + tabId.slice(-8) + ' reason=' + reason + ' hadTerm=' + !!term + ' active=' + before + '→' + after);
+    requestAnimationFrame(() => {
+      try { terminalRegistry.get(tabId)?.focus(); } catch {}
+    });
   }, [tabId]);
 
   // Replay handler — paste chip's text into the agent's current input WITHOUT
@@ -871,7 +873,10 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     // Guard against double-click while the previous IPC roundtrip is still
     // in flight — second click would queue a second bracketed paste against
     // the same chip, then a second removePrompt against an already-gone id.
-    if (replayingIdsRef.current.has(id)) return;
+    if (replayingIdsRef.current.has(id)) {
+      console.log('[PromptQueue] replay ignored inflight tab=' + tabId.slice(-8) + ' item=' + id.slice(-8));
+      return;
+    }
     const payload = buildQueuedPromptPayload(item);
     replayingIdsRef.current.add(id);
     setReplayingIds((prev) => {
@@ -882,8 +887,11 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     });
     try {
       const submitNow = opts?.submit === true;
+      console.log('[PromptQueue] replay start tab=' + tabId.slice(-8) + ' item=' + id.slice(-8) + ' agent=' + sessionType + ' submit=' + submitNow);
+      focusActiveTerminal(submitNow ? 'replay-submit-before-ipc' : 'replay-before-ipc');
       const res = await ipcRenderer.invoke(sessionType + ':append-input', tabId, payload, {
         submit: submitNow,
+        source: 'prompt-queue-replay',
       });
       if (!res || !res.success) {
         const err = res?.error || 'unknown';
@@ -892,13 +900,9 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
         return;
       }
       if (submitNow && res.submitted !== true) {
-        // Current dev main may still run the old append-input handler that
-        // ignores the submit option. It still returns only after the paste path
-        // finished, so send a separate Enter with the same conservative timing:
-        // Codex/Gemini-style fast paste needs the 500ms delay from safePaste,
-        // Claude slow paste has already waited for Ink's sync marker.
-        await new Promise((resolve) => window.setTimeout(resolve, sessionType === 'codex' ? 500 : 150));
-        ipcRenderer.send('terminal:input', tabId, '\r');
+        showToast('Replay send was not confirmed', 'error');
+        console.warn('[PromptQueue] replay submit not confirmed tab=' + tabId.slice(-8) + ' item=' + id.slice(-8) + ' agent=' + sessionType);
+        return;
       }
       // Paste succeeded — chip has effectively moved into agent input, drop
       // it from the queue so it cannot be double-fired by Run after later.
@@ -906,7 +910,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       // Focus terminal so the user sees the appended text immediately + can
       // submit with Enter. Without this, focus might be on the chip button
       // and the user has to click into the terminal first.
-      focusActiveTerminal();
+      focusActiveTerminal('replay-after-ipc');
     } catch (e: unknown) {
       const m = (e as { message?: string })?.message || String(e);
       showToast('Replay failed: ' + m, 'error');
@@ -951,7 +955,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
         const t = res.text.trim();
         if (!t) {
           showToast(agentLabel + ' input is empty', 'warning');
-          focusActiveTerminal();
+          focusActiveTerminal('grab-before-read');
           return;
         }
         const insertPromptTitle = await findSavedInsertPromptTitle(t);
@@ -968,7 +972,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
         // is its own confirmation; the toast was redundant noise (user request).
         // Refocus so the agent re-reads the (now empty) tempfile immediately — without
         // this the input visually keeps the old text until user clicks the terminal.
-        focusActiveTerminal();
+        focusActiveTerminal('grab-after-write');
       } else {
         const code = res?.error || 'timeout';
         const msg = GRAB_ERROR_TOASTS[code] || `Grab failed: ${code}`;
@@ -1586,13 +1590,23 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                     captures the gesture regardless of click target as long
                     as the user holds + moves rather than clicking. */}
                 <button
+                  type="button"
                   data-chip-action="replay"
                   ref={(el) => { if (el) replayButtonRefs.current.set(it.id, el); else replayButtonRefs.current.delete(it.id); }}
                   disabled={replayingIds.has(it.id)}
+                  onMouseDown={(e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    console.log('[PromptQueue] replay mousedown tab=' + tabId.slice(-8) + ' item=' + it.id.slice(-8) + ' meta=' + e.metaKey + ' disabled=' + replayingIds.has(it.id));
+                  }}
                   onClick={(e) => {
                     e.stopPropagation();
                     const latestItem = usePromptQueueStore.getState().getQueue(tabId).items.find((p) => p.id === it.id) ?? it;
-                    replayChip(it.id, latestItem, { submit: e.metaKey || cmdPressedRef.current });
+                    const submitNow = e.metaKey;
+                    cmdPressedRef.current = submitNow;
+                    setCmdPressed(submitNow);
+                    console.log('[PromptQueue] replay click tab=' + tabId.slice(-8) + ' item=' + it.id.slice(-8) + ' submit=' + submitNow + ' active=' + (document.activeElement?.tagName?.toLowerCase() || '-'));
+                    replayChip(it.id, latestItem, { submit: submitNow });
                   }}
                   title={
                     replayingIds.has(it.id)
@@ -1622,7 +1636,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                   onMouseEnter={(e) => {
                     if (replayingIds.has(it.id)) return;
                     setReplayHoverId(it.id);
-                    const effectiveCmd = e.metaKey || cmdPressedRef.current;
+                    const effectiveCmd = e.metaKey;
                     cmdPressedRef.current = effectiveCmd;
                     setCmdPressed(effectiveCmd);
                     openEditor(it.id, 'hover');
@@ -2338,664 +2352,4 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
       }}
     />
   );
-}
-
-// ─── RunAfterTabPicker ─────────────────────────────────────────────────────
-// Compact dropdown next to the "Run after" pill. Lets the user pick ANOTHER
-// AI tab from any open project — when that tab's loader (claude/gemini/sdk
-// busy signal) finishes, the queue's head fires here.
-//
-// Design choices:
-//  - Closed pill is width-clamped by the parent grid, but it no longer
-//    manually truncates names to 9 chars. The old manual slice cut selected
-//    targets in the middle even when the button had room.
-//  - Violet tint for the active state. Distinct from PULSE (used by Run after
-//    self-firing) so the two states read differently at a glance.
-//  - Status icon on the RIGHT of the name:
-//      • idle, active in its project    → no icon (we'll fire instantly on
-//                                          next busy→idle, nothing visual)
-//      • busy NOW                       → spinning loader (svg arc)
-//      • idle, INACTIVE in its project  → "!" — user must still activate the
-//                                          tab AND submit something there
-//                                          before the loader starts; only
-//                                          then do we wait for idle.
-//  - There is NO "no target" row. Clicking the selected row again clears the
-//    slot; this keeps the list semantically clean.
-//  - Project chips sit at the top. Current owner project is selected by
-//    default, but the user can pivot to loader tabs in other open projects.
-//  - Tabs are listed in original project order, color-dot shows their
-//    canonical AI runtime color.
-//  - Self-row hidden (selecting yourself = wait-forever loop; setRunAfterTab
-//    also coerces self→null defensively).
-
-type RunAfterTabPickerProps = {
-  tabId: string;
-  autoRun: boolean;
-  runAfterTabId: string | null;
-  setRunAfterTab: (tabId: string, target: string | null) => void;
-  // Ref to the overlay panel's outer container. Used to anchor the side
-  // slideout — `right: window.innerWidth - panelRect.left + gap` docks the
-  // slideout to the left edge of the panel, full-height. Walking up via
-  // `node.style.position === 'absolute'` was fragile (would land on BODY
-  // when inline style was stripped by HMR / when grid container interposed)
-  // and produced off-screen anchors that silently rendered the menu where
-  // nobody could see it — symptom was «меню не кликается». Passing the
-  // ref directly removes the ambiguity.
-  panelRef: React.RefObject<HTMLDivElement>;
-};
-
-// Distinct kind for each AI surface — affects the colour dot ONLY (PTY
-// claude saffron vs SDK claude terracotta, matching TabItem.tsx::colorConfig
-// line 425 + fact-tabs.md "SDK claude — distinct hue from PTY claude").
-// User explicitly called out that PTY and SDK rows must be visually
-// distinguishable in the dropdown.
-type AiTabKind = 'claude-pty' | 'claude-sdk' | 'gemini' | 'codex';
-const AI_KIND_COLOR: Record<AiTabKind, string> = {
-  'claude-pty': '#DA7756', // saffron orange — PTY claude
-  'claude-sdk': '#D28C5A', // terracotta — SDK claude
-  'gemini':     '#4E86F8', // blue — Gemini
-  'codex':      '#10A37F', // green — Codex
-};
-
-// Trigger spans the entire left column (width:100% of parent grid cell).
-// Column width is fixed by the parent grid `1fr 1fr` with `minWidth:0` on
-// children — so the trigger settles at the same pixel width as the input
-// below and the Run-after pill across the seam. Removing the old hardcoded
-// 90px constant was necessary to match the user's spec «ширина у инпута и
-// триггера одинаковая, и обе равны кнопкам справа».
-
-// One AI-tab option in the picker.
-type AiTab = {
-  id: string;
-  name: string;
-  kind: AiTabKind;
-  projectId: string;
-};
-
-type AiProjectGroup = {
-  projectId: string;
-  name: string;
-  isOwnerProject: boolean;
-  tabs: AiTab[];
-};
-
-function aiKindForTab(tab: {
-  tabType?: string;
-  commandType?: string;
-  claudeSessionId?: string;
-  codexSessionId?: string;
-  geminiSessionId?: string;
-}): AiTabKind | null {
-  const isSDK = tab.tabType === 'claude-sdk';
-  if (isSDK) return 'claude-sdk';
-  if (tab.commandType === 'claude' && !!tab.claudeSessionId) return 'claude-pty';
-  if (tab.commandType === 'codex' && !!tab.codexSessionId) return 'codex';
-  if (tab.commandType === 'gemini' && !!tab.geminiSessionId) return 'gemini';
-  return null;
-}
-
-function projectLabel(projectPath: string, projectId: string): string {
-  const clean = (projectPath || '').replace(/[\\/]+$/, '');
-  return clean.split(/[\\/]/).filter(Boolean).pop() || projectId.slice(-8);
-}
-
-function RunAfterTabPicker({ tabId, autoRun, runAfterTabId, setRunAfterTab, panelRef }: RunAfterTabPickerProps) {
-  // Fingerprint Pattern (CLAUDE.md / fix-performance-lags.md): селектор ОБЯЗАН
-  // вернуть примитив. Возврат свежего `{projectId, activeTabId, tabs}` каждый
-  // раз приводит к infinite loop через Object.is (Zustand сравнение).
-  // Сейчас селектор фильтрует AI-вкладки во всех открытых проектах (Claude PTY
-  // с активной сессией, Codex с активной сессией, Gemini с активной сессией,
-  // любой SDK-таб) и собирает компактный fingerprint-string из project+tab
-  // id/name/kind. Re-render только когда AI-инвентарь реально поменялся.
-  //
-  // Критерий AI-таба (user complaint *«отображаются терминалы, хотя внутри
-  // никакой Claude не запущен»* — без этого фильтра в выпадающем списке
-  // болтались bash/run-dev табы, которые никогда не дадут turn-end edge):
-  //   PTY claude: commandType === 'claude' && claudeSessionId   (= CLI был
-  //               запущен хотя бы раз — sessionId осталась даже после exit;
-  //               это достаточный сигнал, что таб «AI-предназначения»).
-  //   PTY codex:  commandType === 'codex' && codexSessionId
-  //   PTY gemini: commandType === 'gemini' && geminiSessionId
-  //   SDK:        tabType === 'claude-sdk'                       (по
-  //               определению AI-таб, sessionId может быть пуст до первой
-  //               отправки)
-  const fingerprint = useWorkspaceStore((state) => {
-    let ownerProjectId: string | null = null;
-    const parts: string[] = ['owner:'];
-    for (const [pid, ws] of state.openProjects) {
-      if (ws.tabs.has(tabId)) ownerProjectId = pid;
-      const projectBits: string[] = [pid, ws.projectPath || ''];
-      for (const t of ws.tabs.values()) {
-        if (t.parentTabId) continue;
-        const kind = aiKindForTab(t);
-        if (!kind) continue;
-        projectBits.push(t.id + ':' + (t.name || '') + ':' + kind);
-      }
-      parts.push(projectBits.join('~'));
-    }
-    parts[0] = 'owner:' + (ownerProjectId || '');
-    return parts.join('|');
-  });
-
-  const inventory = useMemo<{ groups: AiProjectGroup[]; ownerProjectId: string | null; selectedTargetProjectId: string | null }>(() => {
-    if (!fingerprint) return { groups: [], ownerProjectId: null, selectedTargetProjectId: null };
-    const state = useWorkspaceStore.getState();
-    let ownerProjectId: string | null = null;
-    let selectedTargetProjectId: string | null = null;
-    const groups: AiProjectGroup[] = [];
-    for (const [projectId, ws] of state.openProjects) {
-      const isOwnerProject = ws.tabs.has(tabId);
-      if (isOwnerProject) ownerProjectId = projectId;
-      const tabs: AiTab[] = [];
-      // Map.values() preserves insertion order — and the workspace store
-      // mutates the Map during reorder so this matches the user-visible tab
-      // order in the terminal sidebar.
-      for (const t of ws.tabs.values()) {
-        if (t.parentTabId) continue;
-        const kind = aiKindForTab(t);
-        if (!kind) continue;
-        const row = { id: t.id, name: t.name || t.id.slice(-6), kind, projectId };
-        tabs.push(row);
-        if (t.id === runAfterTabId) selectedTargetProjectId = projectId;
-      }
-      if (tabs.length > 0 || isOwnerProject) {
-        groups.push({
-          projectId,
-          name: projectLabel(ws.projectPath, projectId),
-          isOwnerProject,
-          tabs,
-        });
-      }
-    }
-    return { groups, ownerProjectId, selectedTargetProjectId };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fingerprint, tabId, runAfterTabId]);
-
-  // Live per-tab busy map — mirrors TabBar's provider busy maps. The
-  // status icon (spinner vs nothing) must update reactively for BACKGROUND
-  // tabs (the waited-on tab is by definition never the focused one), so we
-  // subscribe to the SAME focus-independent IPC broadcasts TabBar consumes
-  // and keep the result in React state. No polling: every busy edge → setState
-  // → re-render of the closed pill and every open row. Both engines write into
-  // one map keyed by tabId (we wait on a TAB, not a specific engine), exactly
-  // like the runner's unified prevBusyRef. The runner's prevBusyRef is left
-  // untouched — auto-run firing still depends on it.
-  // Seed from the always-on runner snapshot so a target that's ALREADY busy at
-  // mount shows its spinner immediately (the overlay mounts/unmounts with the
-  // active tab, so we can't rely on catching the busy:true edge ourselves).
-  const [busyMap, setBusyMap] = useState<Map<string, boolean>>(() => getBusyTabsSnapshot());
-  useEffect(() => {
-    // Re-seed on (re)mount in case edges fired between initial state and effect.
-    setBusyMap(getBusyTabsSnapshot());
-    const isNonClaudePtyAiTab = (tid: string): boolean => {
-      const state = useWorkspaceStore.getState();
-      for (const ws of state.openProjects.values()) {
-        const tab = ws.tabs.get(tid);
-        if (!tab) continue;
-        return tab.commandType === 'codex' || tab.commandType === 'gemini';
-      }
-      return false;
-    };
-    const apply = (tid: string, busy: boolean) =>
-      setBusyMap((prev) => {
-        if (prev.get(tid) === busy) return prev;
-        const next = new Map(prev);
-        next.set(tid, busy);
-        return next;
-      });
-    const handleClaudeBusy = (_: any, { tabId: tid, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
-      if (reason === 'spinner' && isNonClaudePtyAiTab(tid)) return;
-      apply(tid, busy);
-    };
-    const handleGeminiBusy = (_: any, { tabId: tid, busy }: { tabId: string; busy: boolean }) => apply(tid, busy);
-    const handleCodexBusy = (_: any, { tabId: tid, busy }: { tabId: string; busy: boolean }) => apply(tid, busy);
-    ipcRenderer.on('claude:busy-state', handleClaudeBusy);
-    ipcRenderer.on('gemini:busy-state', handleGeminiBusy);
-    ipcRenderer.on('codex:busy-state', handleCodexBusy);
-    return () => {
-      ipcRenderer.removeListener('claude:busy-state', handleClaudeBusy);
-      ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
-      ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
-    };
-  }, []);
-
-  const [open, setOpen] = useState(false);
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
-  const [showAllTabs, setShowAllTabs] = useState(false);
-  const [closeHover, setCloseHover] = useState(false);
-  const [countHover, setCountHover] = useState(false);
-  // Anchor coords for the side slideout — set on every open so it tracks
-  // viewport resizes mid-session.
-  const [anchor, setAnchor] = useState<{ top: number; right: number; height: number } | null>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const exists = selectedProjectId && inventory.groups.some((g) => g.projectId === selectedProjectId);
-    if (exists) return;
-    setSelectedProjectId(inventory.selectedTargetProjectId ?? inventory.ownerProjectId ?? inventory.groups[0]?.projectId ?? null);
-  }, [inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, selectedProjectId]);
-
-  // Outside-click + Esc → close.
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      const t = e.target as Node;
-      if (triggerRef.current?.contains(t)) return;
-      if (menuRef.current?.contains(t)) return;
-      setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
-    document.addEventListener('mousedown', onDown);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onDown);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [open]);
-
-  const handleOpen = useCallback(() => {
-    // Anchor like the editor slideout: docked LEFT of the overlay panel,
-    // full-height. panelRef points at the overlay's outer container — see
-    // RunAfterTabPickerProps.panelRef comment for why we don't walk up the
-    // DOM tree.
-    const panel = panelRef.current;
-    if (!panel) return;
-    const r = panel.getBoundingClientRect();
-    setAnchor({
-      top: r.top,
-      right: window.innerWidth - r.left + 6,
-      height: r.height,
-    });
-    setSelectedProjectId(inventory.selectedTargetProjectId ?? inventory.ownerProjectId ?? inventory.groups[0]?.projectId ?? null);
-    setShowAllTabs(false);
-    setOpen(true);
-  }, [inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, panelRef]);
-
-  const handleProjectWheel = useCallback((e: WheelEvent<HTMLDivElement>) => {
-    const el = e.currentTarget;
-    if (el.scrollWidth <= el.clientWidth) return;
-    const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
-    if (delta === 0) return;
-    const before = el.scrollLeft;
-    el.scrollLeft += delta;
-    if (el.scrollLeft !== before) e.preventDefault();
-  }, []);
-
-  // Status: drives the right-side icon both in the closed pill (for the
-  // selected target) and in each open-menu row. 2-state by design — a tab
-  // whose agent is actively thinking shows a spinner, anything else shows
-  // nothing. (The old 'inactive'=not-focused '!' badge was noise: it lit up
-  // on nearly every row because at most one tab equals the focused tab.)
-  type Status = 'busy' | 'idle';
-  const statusFor = (id: string): Status => (busyMap.get(id) === true ? 'busy' : 'idle');
-
-  const allAiTabs = useMemo(() => inventory.groups.flatMap((g) => g.tabs), [inventory.groups]);
-  const selectedTab = runAfterTabId
-    ? allAiTabs.find((t) => t.id === runAfterTabId) ?? null
-    : null;
-  const selectedStatus = selectedTab ? statusFor(selectedTab.id) : null;
-  const selectedProject = inventory.groups.find((g) => g.projectId === selectedProjectId) ?? inventory.groups[0] ?? null;
-  const targetTabs = selectedProject ? selectedProject.tabs.filter((t) => t.id !== tabId) : [];
-  const loaderCount = targetTabs.filter((t) => statusFor(t.id) === 'busy').length;
-  const visibleTabs = showAllTabs
-    ? targetTabs
-    : targetTabs.filter((t) => statusFor(t.id) === 'busy' || t.id === runAfterTabId);
-
-  // Selected target can stay while Run after is OFF. Purple means active wait;
-  // gray means "target remembered, not armed".
-  const hasSelectedTarget = !!selectedTab;
-  const activeTargetWait = hasSelectedTarget && autoRun;
-  const triggerBorder = open
-    ? 'rgba(190,190,190,0.36)'
-    : activeTargetWait
-      ? 'rgba(190,190,190,0.28)'
-      : hasSelectedTarget
-        ? 'rgba(180,180,180,0.24)'
-        : BORDER;
-  const triggerColor = (hasSelectedTarget || open) ? (activeTargetWait ? '#fff' : '#d8d8d8') : TEXT_MUTED;
-  const triggerBg = open
-    ? 'rgba(255,255,255,0.08)'
-    : activeTargetWait
-      ? `${DEEP_PULSE}33`
-      : hasSelectedTarget
-        ? 'rgba(255,255,255,0.07)'
-        : 'transparent';
-
-  return (
-    <>
-      <button
-        ref={triggerRef}
-        onClick={() => open ? setOpen(false) : handleOpen()}
-        title={
-          hasSelectedTarget && selectedTab
-            ? (
-              autoRun
-                ? `Run after tab "${selectedTab.name}" finishes`
-                : `Run after target saved: "${selectedTab.name}" (off)`
-            ) + (selectedStatus === 'busy' ? ' (busy now)' : '')
-            : 'Pick a tab to wait on (otherwise fires on own turn-end)'
-        }
-        style={{
-          width: '100%',           // fills parent column (1fr in 1fr 1fr grid)
-          minWidth: 0,             // allow grid to actually shrink the cell
-          padding: '2px 4px',
-          background: triggerBg,
-          border: `1px solid ${triggerBorder}`,
-          borderRadius: 4,
-          color: triggerColor,
-          cursor: 'pointer', fontSize: 9, letterSpacing: 0.3,
-          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 3,
-          whiteSpace: 'nowrap',
-          overflow: 'hidden',
-          boxSizing: 'border-box',
-          boxShadow: open ? '0 0 0 1px rgba(190,190,190,0.10)' : 'none',
-          transition: 'background 0.12s, border-color 0.12s, color 0.12s',
-        }}
-      >
-        {hasSelectedTarget && selectedTab ? (
-          <>
-            <span style={{
-              width: 5, height: 5, borderRadius: '50%',
-              background: AI_KIND_COLOR[selectedTab.kind],
-              flexShrink: 0,
-            }} />
-            <span style={{
-              flex: 1, minWidth: 0,
-              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-              textAlign: 'left',
-              fontSize: 11,  // +2px on the tab name (button base is 9) per user request
-            }}>{selectedTab.name}</span>
-            <StatusIcon status={selectedStatus!} color={activeTargetWait ? '#fff' : '#cfcfcf'} />
-          </>
-        ) : (
-          <>
-            <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
-              <path d="M6 9l6 6 6-6" />
-            </svg>
-            <span>on tab</span>
-          </>
-        )}
-      </button>
-
-      {open && anchor && createPortal(
-        (
-          // Portal to document.body — CRITICAL. The panel root has
-          // `backdropFilter: blur(8px)` which creates a new containing block
-          // for any `position: fixed` descendant (CSS spec: filter /
-          // backdrop-filter / transform / will-change all do this — see
-          // https://developer.mozilla.org/en-US/docs/Web/CSS/position#fixed).
-          // Rendering inline would make `top: anchor.top; right: anchor.right`
-          // resolve relative to the panel, not the viewport → slideout flies
-          // off-screen and silently swallows clicks (symptom was «menu не
-          // открывается» despite onClick firing on the trigger). Editor
-          // slideout already works because it's a sibling of the panel in
-          // the same JSX tree, not a descendant — but the picker lives
-          // INSIDE the header, so we have to escape the panel via portal.
-          <div
-            ref={menuRef}
-            style={{
-              position: 'fixed',
-              top: anchor.top,
-              right: anchor.right,
-              width: 240,
-              height: anchor.height,
-              background: PANEL_BG,
-              border: `1px solid ${BORDER}`,
-              borderRadius: 6,
-              boxShadow: '0 6px 20px rgba(0,0,0,0.45)',
-              backdropFilter: 'blur(8px)',
-              zIndex: FLOATING_OVERLAY_Z_INDEX,
-              display: 'flex', flexDirection: 'column',
-              overflow: 'hidden',
-            }}
-            onMouseDown={(e) => e.stopPropagation()}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div style={{
-              padding: '6px 8px 5px',
-              borderBottom: `1px solid ${BORDER}`,
-              display: 'flex', flexDirection: 'column', gap: 5,
-              fontSize: 10, color: TEXT_MUTED,
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
-                <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  Run after · pick a tab
-                </span>
-                <button
-                  onClick={() => setShowAllTabs((v) => !v)}
-                  onMouseEnter={() => setCountHover(true)}
-                  onMouseLeave={() => setCountHover(false)}
-                  title={showAllTabs ? 'Show only tabs with loader' : 'Show all AI tabs'}
-                  style={{
-                    flexShrink: 0,
-                    padding: '1px 5px',
-                    border: `1px solid ${showAllTabs ? 'rgba(255,255,255,0.38)' : BORDER}`,
-                    borderRadius: 999,
-                    background: countHover ? `${DEEP_PULSE}26` : (showAllTabs ? `${DEEP_PULSE}33` : 'transparent'),
-                    color: countHover || showAllTabs ? '#fff' : TEXT_DIM,
-                    cursor: 'pointer',
-                    fontSize: 9,
-                    lineHeight: 1.35,
-                  }}
-                >
-                  {loaderCount}/{targetTabs.length}
-                </button>
-                <button
-                  onClick={() => setOpen(false)}
-                  onMouseEnter={() => setCloseHover(true)}
-                  onMouseLeave={() => setCloseHover(false)}
-                  title="Close"
-                  style={{
-                    width: 18, height: 18,
-                    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-                    background: closeHover ? `${DELETE_RED}22` : 'transparent',
-                    border: `1px solid ${closeHover ? `${DELETE_RED}66` : 'transparent'}`,
-                    borderRadius: 5,
-                    color: closeHover ? '#fff' : TEXT_DIM,
-                    cursor: 'pointer',
-                    fontSize: 14,
-                    padding: 0,
-                    lineHeight: 1,
-                    transition: 'background 0.12s, border-color 0.12s, color 0.12s',
-                  }}
-                >×</button>
-              </div>
-
-              <div
-                className="scrollbar-hide"
-                onWheel={handleProjectWheel}
-                style={{
-                  display: 'flex',
-                  gap: 4,
-                  overflowX: 'auto',
-                  overflowY: 'hidden',
-                  paddingBottom: 1,
-                }}
-              >
-                {inventory.groups.map((g) => (
-                  <ProjectChip
-                    key={g.projectId}
-                    label={g.name}
-                    selected={g.projectId === selectedProject?.projectId}
-                    isOwner={g.isOwnerProject}
-                    count={g.tabs.filter((t) => t.id !== tabId && statusFor(t.id) === 'busy').length}
-                    total={g.tabs.filter((t) => t.id !== tabId).length}
-                    onClick={() => setSelectedProjectId(g.projectId)}
-                  />
-                ))}
-              </div>
-            </div>
-
-            <div className="scrollbar-thin" style={{ overflowY: 'auto', flex: 1, padding: 3 }}>
-              {!selectedProject && (
-                <div style={{ padding: '12px 8px', fontSize: 9, color: TEXT_DIM, textAlign: 'center', lineHeight: 1.4 }}>
-                  no open projects
-                </div>
-              )}
-              {selectedProject && targetTabs.length === 0 && (
-                <div style={{ padding: '12px 8px', fontSize: 9, color: TEXT_DIM, textAlign: 'center', lineHeight: 1.4 }}>
-                  no target AI tabs<br/>
-                  <span style={{ color: '#555' }}>start Claude / Codex / Gemini in another tab</span>
-                </div>
-              )}
-              {selectedProject && targetTabs.length > 0 && visibleTabs.length === 0 && (
-                <div style={{ padding: '12px 8px', fontSize: 9, color: TEXT_DIM, textAlign: 'center', lineHeight: 1.4 }}>
-                  no loader tabs<br/>
-                  <span style={{ color: '#555' }}>click {loaderCount}/{targetTabs.length} to show all</span>
-                </div>
-              )}
-              {visibleTabs.map((t) => {
-                const status = statusFor(t.id);
-                const isSelected = runAfterTabId === t.id;
-                return (
-                  <RunAfterRow
-                    key={t.id}
-                    label={t.name}
-                    colorDot={AI_KIND_COLOR[t.kind]}
-                    statusIcon={<StatusIcon status={status} color={autoRun ? '#fff' : '#cfcfcf'} />}
-                    selected={isSelected}
-                    active={autoRun}
-                    onClick={() => {
-                      // Toggle-off: clicking the already-selected row clears
-                      // the target. No separate "no target" row: selection
-                      // itself is the place where the inverse action lives.
-                      setRunAfterTab(tabId, isSelected ? null : t.id);
-                      setOpen(false);
-                    }}
-                  />
-                );
-              })}
-            </div>
-          </div>
-        ),
-        document.body
-      )}
-    </>
-  );
-}
-
-function ProjectChip({
-  label, selected, isOwner, count, total, onClick,
-}: {
-  label: string;
-  selected: boolean;
-  isOwner: boolean;
-  count: number;
-  total: number;
-  onClick: () => void;
-}) {
-  const [hover, setHover] = useState(false);
-  return (
-    <button
-      onClick={onClick}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      title={`${label}: ${count} loader / ${total} AI tabs`}
-      style={{
-        flex: '0 0 auto',
-        maxWidth: 118,
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 4,
-        padding: '2px 6px',
-        borderRadius: 999,
-        border: `1px solid ${selected ? 'rgba(255,255,255,0.5)' : (hover ? `${DEEP_PULSE}55` : BORDER)}`,
-        background: selected ? 'rgba(255,255,255,0.08)' : (hover ? `${DEEP_PULSE}1f` : 'transparent'),
-        color: selected ? '#fff' : (hover ? '#ddd' : TEXT_DIM),
-        cursor: 'pointer',
-        fontSize: 9,
-        lineHeight: 1.25,
-        whiteSpace: 'nowrap',
-        minWidth: 0,
-      }}
-    >
-      {isOwner && <span style={{ width: 4, height: 4, borderRadius: '50%', background: '#fff', opacity: 0.7, flexShrink: 0 }} />}
-      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
-      {count > 0 && (
-        <span style={{ color: selected ? '#fff' : PULSE, fontSize: 8, flexShrink: 0 }}>{count}</span>
-      )}
-    </button>
-  );
-}
-
-// One dropdown row. Centralised so spacing/hover stays uniform across all tab
-// rows and any future category header rows.
-function RunAfterRow({
-  label, colorDot, statusIcon, selected, active, onClick, muted,
-}: {
-  label: string;
-  colorDot: string;
-  statusIcon: React.ReactNode | null;
-  selected: boolean;
-  active: boolean;
-  onClick: () => void;
-  muted?: boolean;
-}) {
-  const [hover, setHover] = useState(false);
-  const selectedActive = selected && active;
-  const selectedInactive = selected && !active;
-  return (
-    <button
-      onClick={onClick}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      style={{
-        width: '100%',
-        padding: '4px 6px',
-        // Purple means active Run after wait; gray selected means remembered
-        // target while Run after itself is off.
-        background: selectedActive
-          ? `${DEEP_PULSE}40`
-          : selectedInactive
-            ? 'rgba(255,255,255,0.08)'
-            : (hover ? `${DEEP_PULSE}1a` : 'transparent'),
-        border: 'none',
-        borderRadius: 5,
-        color: muted ? TEXT_DIM : (selectedActive ? '#fff' : (selectedInactive ? '#d8d8d8' : '#ddd')),
-        cursor: 'pointer',
-        fontSize: 12,
-        lineHeight: 1.18,
-        display: 'flex', alignItems: 'center', gap: 6,
-        textAlign: 'left',
-      }}
-    >
-      <span style={{
-        width: 6, height: 6, borderRadius: '50%',
-        background: colorDot,
-        flexShrink: 0,
-      }} />
-      <span style={{
-        flex: 1, minWidth: 0,
-        overflow: 'visible',
-        whiteSpace: 'normal',
-        overflowWrap: 'anywhere',
-      }}>{label}</span>
-      {statusIcon}
-    </button>
-  );
-}
-
-// Status icon for one tab. busy = spinning loader (agent actively thinking),
-// idle = nothing. Spinner uses the global `pq-spin` keyframe defined in the
-// overlay's always-rendered <style> block (same rule as the Replay button).
-function StatusIcon({ status, color }: { status: 'busy' | 'idle'; color: string }) {
-  if (status === 'busy') {
-    return (
-      <span style={{ flexShrink: 0, display: 'inline-flex' }}>
-        <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="3" strokeLinecap="round" aria-hidden="true" style={{ animation: 'pq-spin 1.35s linear infinite' }}>
-          <path d="M12 2v4" />
-          <path d="M12 18v4" />
-          <path d="M4.93 4.93l2.83 2.83" />
-          <path d="M16.24 16.24l2.83 2.83" />
-          <path d="M2 12h4" />
-          <path d="M18 12h4" />
-          <path d="M4.93 19.07l2.83-2.83" />
-          <path d="M16.24 7.76l2.83-2.83" />
-        </svg>
-      </span>
-    );
-  }
-  // idle: render nothing (no badge, no layout shift).
-  return null;
 }

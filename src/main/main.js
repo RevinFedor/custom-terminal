@@ -612,6 +612,8 @@ const claudeConfirmDialogCooldown = new Map(); // `${tabId}:${dialogType}` -> la
 const codexStartupAutoEnter = new Map(); // tabId -> one-shot state for Codex startup confirmation prompts
 const codexTuiReadyTabs = new Set();     // tabIds whose current Codex TUI process rendered an input-ready frame
 const codexTuiReadyBuffers = new Map();  // tabId -> recent startup output for deterministic ready detection
+const codexTuiReadyQuietTimers = new Map(); // tabId -> debounce timer; ready only after TUI output settles
+const codexTuiReadyRejectKeys = new Map(); // tabId -> last logged not-ready reason/preview
 let sessionManager; // Initialized after projectManager is ready
 let claudeManager; // Initialized with terminals map
 
@@ -1729,7 +1731,17 @@ function clearBridgeTab(tabId) {
   clearTimeout(claudeTurnWatchdog.get(tabId));
   claudeTurnWatchdog.delete(tabId);
   claudeSpinnerLastSeenAt.delete(tabId);
-  pendingPasteAudit.delete(tabId);
+  const pendingAudit = pendingPasteAudit.get(tabId);
+  if (pendingAudit?.awaitUserMessage) {
+    finishClaudePasteAudit(tabId, pendingAudit, {
+      success: false,
+      error: 'claude_bridge_cleared_before_user_message',
+      expectedLen: pendingAudit.expectedLen,
+      expectedHash: pendingAudit.expectedHash,
+    });
+  } else {
+    pendingPasteAudit.delete(tabId);
+  }
   stopInterruptWatcher(tabId);
   stopClaudeLocalCommandWatcher(tabId, 'bridge-clear');
   claudeInputLineBuffers.delete(tabId);
@@ -2600,6 +2612,13 @@ function startClaudeHookServer() {
                   const match = actualLen === audit.expectedLen && actualHash === audit.expectedHash;
                   if (match) {
                     console.log('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' ✅ match len=' + actualLen + ' hash=' + actualHash + ' attempt=' + (attempt + 1) + ' (sent ' + (Date.now() - audit.sentAt) + 'ms ago)');
+                    finishClaudePasteAudit(tabId, audit, {
+                      success: true,
+                      actualLen,
+                      actualHash,
+                      expectedLen: audit.expectedLen,
+                      expectedHash: audit.expectedHash,
+                    });
                     return;
                   }
                   if (attempt < delays.length - 1) {
@@ -2619,16 +2638,43 @@ function startClaudeHookServer() {
                     + ' actualTail=[' + finalText.substring(Math.max(0, finalText.length - 80)).replace(/\s+/g, ' ') + ']'
                     + ' attempts=' + delays.length
                     + ' transcript=' + transcript_path);
+                  finishClaudePasteAudit(tabId, audit, {
+                    success: false,
+                    error: 'claude_user_message_audit_mismatch',
+                    expectedLen: audit.expectedLen,
+                    actualLen: finalLen,
+                    expectedHash: audit.expectedHash,
+                    actualHash: finalHash,
+                  });
+                } else {
+                  finishClaudePasteAudit(tabId, audit, {
+                    success: false,
+                    error: 'claude_user_message_audit_no_user_record',
+                    expectedLen: audit.expectedLen,
+                    expectedHash: audit.expectedHash,
+                  });
                 }
               } catch (e) {
                 console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' check failed: ' + e.message);
+                finishClaudePasteAudit(tabId, audit, {
+                  success: false,
+                  error: 'claude_user_message_audit_check_failed',
+                  message: e?.message || String(e),
+                  expectedLen: audit.expectedLen,
+                  expectedHash: audit.expectedHash,
+                });
               } finally {
-                if (pendingPasteAudit.get(tabId) === audit) pendingPasteAudit.delete(tabId);
+                if (pendingPasteAudit.get(tabId) === audit && !audit.awaitUserMessage) pendingPasteAudit.delete(tabId);
               }
             })();
           } else if (audit && !transcript_path) {
             console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' staged but transcript_path missing — cleared');
-            pendingPasteAudit.delete(tabId);
+            finishClaudePasteAudit(tabId, audit, {
+              success: false,
+              error: 'claude_user_message_audit_missing_transcript',
+              expectedLen: audit.expectedLen,
+              expectedHash: audit.expectedHash,
+            });
           }
         }
 
@@ -5001,7 +5047,12 @@ function startMcpHttpServer() {
               return;
             }
             if (submit !== false) {
-              await ensureCodexTurnWatcher(tabId, codexKnownSessions.get(tabId) || null, terminalProjects.get(tabId));
+              const hasTurnWatcher = await ensureCodexTurnWatcher(tabId, codexKnownSessions.get(tabId) || null, terminalProjects.get(tabId));
+              if (!hasTurnWatcher) {
+                res.writeHead(409);
+                res.end(JSON.stringify({ error: 'codex_turn_watcher_unavailable' }));
+                return;
+              }
             }
           } else if (engine === 'claude') {
             if (!hasLiveClaudeInTab(tabId)) {
@@ -5036,6 +5087,10 @@ function startMcpHttpServer() {
             stashFirst: false,
             fast: engine !== 'claude' && engine !== 'codex',
             source: engine === 'codex' ? 'codex-mcp-ai-prompt' : 'mcp-ai-prompt',
+            skipRenderWait: engine === 'codex' && submit !== false,
+            awaitCodexUserMessageAudit: engine === 'codex' && submit !== false,
+            codexAuditTimeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
+            verifyCodexVisibleDraftBeforeSubmit: engine === 'codex' && submit !== false,
             logPrefix: '[MCP:Terminal:ai-prompt:' + engine + ':' + tabId + ']',
           });
           console.log('[MCP:Terminal] POST /terminal/ai-prompt tabId=' + tabId + ' engine=' + engine + ' submit=' + (submit !== false) + ' chars=' + prompt.length + ' success=' + (result?.success !== false));
@@ -7213,6 +7268,8 @@ function withPtyWriteLock(term, work) {
 // the next UserPromptSubmit.
 const pendingPasteAudit = new Map();
 const pendingCodexPasteAudit = new Map();
+const CLAUDE_PASTE_AUDIT_TIMEOUT_MS = 8000;
+const CODEX_PASTE_AUDIT_TIMEOUT_MS = 8000;
 
 function pasteAuditHash(text) {
   return require('crypto').createHash('sha1').update(String(text || '')).digest('hex').slice(0, 16);
@@ -7220,6 +7277,77 @@ function pasteAuditHash(text) {
 
 function pasteAuditPreview(text, start = 0) {
   return String(text || '').substring(start, start + 80).replace(/\s+/g, ' ');
+}
+
+function finishClaudePasteAudit(tabId, audit, result) {
+  if (!audit) return;
+  if (audit.timer) clearTimeout(audit.timer);
+  if (pendingPasteAudit.get(tabId) === audit) pendingPasteAudit.delete(tabId);
+  if (typeof audit.resolve === 'function') {
+    audit.resolve(result);
+    audit.resolve = null;
+  }
+}
+
+function waitForClaudePasteAudit(tabId, audit, timeoutMs = CLAUDE_PASTE_AUDIT_TIMEOUT_MS) {
+  if (!audit) {
+    return Promise.resolve({ success: false, error: 'claude_audit_missing' });
+  }
+  return new Promise((resolve) => {
+    audit.resolve = resolve;
+    audit.timer = setTimeout(() => {
+      console.warn('[PasteAudit:TIMEOUT] tab=' + String(tabId).slice(-12)
+        + ' handoff=' + (audit.handoffId || '-')
+        + ' source=' + (audit.source || '-')
+        + ' expectedLen=' + audit.expectedLen
+        + ' expectedHash=' + audit.expectedHash
+        + ' expectedHead=' + JSON.stringify(audit.headPreview)
+        + ' expectedTail=' + JSON.stringify(audit.tailPreview)
+        + ' waited=' + timeoutMs + 'ms'
+        + ' sentAgeMs=' + (Date.now() - audit.sentAt));
+      finishClaudePasteAudit(tabId, audit, {
+        success: false,
+        error: 'claude_user_message_audit_timeout',
+        expectedLen: audit.expectedLen,
+        expectedHash: audit.expectedHash,
+      });
+    }, timeoutMs);
+  });
+}
+
+function finishCodexPasteAudit(tabId, audit, result) {
+  if (!audit) return;
+  if (audit.timer) clearTimeout(audit.timer);
+  if (pendingCodexPasteAudit.get(tabId) === audit) pendingCodexPasteAudit.delete(tabId);
+  if (typeof audit.resolve === 'function') {
+    audit.resolve(result);
+    audit.resolve = null;
+  }
+}
+
+function waitForCodexPasteAudit(tabId, audit, timeoutMs = CODEX_PASTE_AUDIT_TIMEOUT_MS) {
+  if (!audit) {
+    return Promise.resolve({ success: false, error: 'codex_audit_missing' });
+  }
+  return new Promise((resolve) => {
+    audit.resolve = resolve;
+    audit.timer = setTimeout(() => {
+      console.warn('[CodexPasteAudit:TIMEOUT] tab=' + String(tabId).slice(-12)
+        + ' source=' + (audit.source || '-')
+        + ' expectedLen=' + audit.expectedLen
+        + ' expectedHash=' + audit.expectedHash
+        + ' expectedHead=' + JSON.stringify(audit.headPreview)
+        + ' expectedTail=' + JSON.stringify(audit.tailPreview)
+        + ' waited=' + timeoutMs + 'ms'
+        + ' sentAgeMs=' + (Date.now() - audit.sentAt));
+      finishCodexPasteAudit(tabId, audit, {
+        success: false,
+        error: 'codex_user_message_audit_timeout',
+        expectedLen: audit.expectedLen,
+        expectedHash: audit.expectedHash,
+      });
+    }, timeoutMs);
+  });
 }
 
 // Map of term → tabId for the busy broadcast. Filled lazily from `terminals`
@@ -7390,6 +7518,45 @@ function requestTerminalVisibleBufferSnapshot(webContents, tabId, reason, timeou
   });
 }
 
+function requestTerminalCodexDraftState(webContents, tabId, reason, timeoutMs = 700, options = {}) {
+  return new Promise((resolve) => {
+    if (!webContents || (typeof webContents.isDestroyed === 'function' && webContents.isDestroyed())) {
+      resolve({ success: false, error: 'no-webcontents', tabId, reason });
+      return;
+    }
+
+    const requestId = crypto.randomUUID();
+    let settled = false;
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      ipcMain.removeListener('terminal:codex-draft-state-response', handler);
+      resolve(payload || { success: false, error: 'empty-response', requestId, tabId, reason });
+    };
+    const handler = (_event, payload) => {
+      if (!payload || payload.requestId !== requestId) return;
+      finish(payload);
+    };
+    const timer = setTimeout(() => {
+      finish({ success: false, error: 'timeout', requestId, tabId, reason });
+    }, timeoutMs);
+
+    ipcMain.on('terminal:codex-draft-state-response', handler);
+    try {
+      webContents.send('terminal:codex-draft-state-request', {
+        requestId,
+        tabId,
+        reason,
+        waitFor: typeof options.waitFor === 'boolean' ? options.waitFor : undefined,
+        timeoutMs: Number(options.waitTimeoutMs) || undefined,
+      });
+    } catch (err) {
+      finish({ success: false, error: err?.message || String(err), requestId, tabId, reason });
+    }
+  });
+}
+
 // Stash-detect helper. Claude TUI's chat:stash binding is bi-directional:
 //   - input has text + no existing stash  → Ctrl+S pushes input to stash, clears input
 //   - input is empty + existing stash     → Ctrl+S pops stash BACK INTO the input
@@ -7451,7 +7618,13 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     submitSequence = '\r',
     submitLabel = null,
     armPromptBoundaryOnSubmit = false,
-    promptBoundaryReason = null
+    promptBoundaryReason = null,
+    skipRenderWait = false,
+    awaitClaudeUserMessageAudit = false,
+    claudeAuditTimeoutMs = CLAUDE_PASTE_AUDIT_TIMEOUT_MS,
+    awaitCodexUserMessageAudit = false,
+    codexAuditTimeoutMs = CODEX_PASTE_AUDIT_TIMEOUT_MS,
+    verifyCodexVisibleDraftBeforeSubmit = false
   } = options;
 
   // TTYHOG on macOS = 1024 bytes. Paste brackets = 12 bytes. Leave margin.
@@ -7527,7 +7700,40 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
 
   const t0 = Date.now();
   const resolvedSubmitLabel = submitLabel || (submitSequence === '\t' ? 'Tab' : (submitSequence === '\r' ? 'Enter' : JSON.stringify(submitSequence)));
-  console.log(logPrefix + ' 🚀 Start: "' + content.substring(0, 40) + '" (' + content.length + ' chars → ' + chunks.length + ' chunk(s), fast=' + fast + ', ctrlCFirst=' + ctrlCFirst + ', stashFirst=' + stashFirst + ', submit=' + resolvedSubmitLabel + ', handoff=' + (handoffId || '-') + ', source=' + (source || '-') + ')');
+  let stagedClaudeAudit = null;
+  let stagedCodexAudit = null;
+  const isCodexPasteSource = !!(source && String(source).startsWith('codex-'));
+  const shouldVerifyCodexVisibleDraft = !!(verifyCodexVisibleDraftBeforeSubmit && submit && isCodexPasteSource && !fast && broadcastTabId);
+  console.log(logPrefix + ' 🚀 Start: "' + content.substring(0, 40) + '" (' + content.length + ' chars → ' + chunks.length + ' chunk(s), fast=' + fast + ', ctrlCFirst=' + ctrlCFirst + ', stashFirst=' + stashFirst + ', submit=' + resolvedSubmitLabel + ', handoff=' + (handoffId || '-') + ', source=' + (source || '-') + ', skipRenderWait=' + skipRenderWait + ', codexVisibleDraftGuard=' + shouldVerifyCodexVisibleDraft + ')');
+
+  if (shouldVerifyCodexVisibleDraft && mainWindow && !mainWindow.isDestroyed() && !ctrlCFirst && !stashFirst) {
+    const beforeDraft = await requestTerminalCodexDraftState(
+      mainWindow.webContents,
+      broadcastTabId,
+      'codex-pre-submit-before-paste',
+      700
+    );
+    console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexDraftGuard] before-paste success=' + !!beforeDraft?.success
+      + ' hasDraft=' + beforeDraft?.hasDraft
+      + ' source=' + (beforeDraft?.source || '-')
+      + ' preview=' + JSON.stringify(String(beforeDraft?.preview || '').slice(0, 120))
+      + (beforeDraft?.error ? ' error=' + beforeDraft.error : ''));
+    if (!beforeDraft?.success || beforeDraft.hasDraft !== false) {
+      const error = beforeDraft?.hasDraft === true
+        ? 'codex_existing_draft_before_paste'
+        : 'codex_draft_state_unknown_before_paste';
+      console.error(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexDraftGuard] ❌ refusing before paste error=' + error);
+      return {
+        success: false,
+        error,
+        submitted: false,
+        chunksTotal: chunks.length,
+        renderTimeMs: [],
+        submitKey: null,
+        codexDraftGuard: beforeDraft || null,
+      };
+    }
+  }
 
   // Optional: Ctrl+S to stash any user input — Claude pushes it to stash and
   // clears the prompt; after our slash-cmd submits, Claude auto-restores stash.
@@ -7630,7 +7836,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   // Enter will submit a complete prompt. Without this wait, large pastes (50 KB+)
   // can race Enter — Claude submits before the chip is fully rendered, leaving
   // half the bytes still in Ink's paste buffer.
-  if (!fast) {
+  if (!fast && skipRenderWait) {
+    console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Paste render wait skipped — relying on PTY byte order + user_message audit');
+  } else if (!fast) {
     const render = waitForRender(term, safetyTimeoutMs, logPrefix + ':paste');
     render.markWriteTime(); // baseline = post-write, not subscription-time
     const r = await render;
@@ -7644,6 +7852,38 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         chunksTotal: chunks.length,
         renderTimeMs: renderTimes,
         submitKey: null,
+      };
+    }
+  }
+
+  if (submit && shouldVerifyCodexVisibleDraft && mainWindow && !mainWindow.isDestroyed()) {
+    const afterDraft = await requestTerminalCodexDraftState(
+      mainWindow.webContents,
+      broadcastTabId,
+      'codex-pre-submit-after-paste',
+      1400,
+      { waitFor: true, waitTimeoutMs: 1200 }
+    );
+    console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexDraftGuard] after-paste success=' + !!afterDraft?.success
+      + ' hasDraft=' + afterDraft?.hasDraft
+      + ' source=' + (afterDraft?.source || '-')
+      + ' timedOut=' + !!afterDraft?.timedOut
+      + ' checks=' + (afterDraft?.checks ?? '-')
+      + ' preview=' + JSON.stringify(String(afterDraft?.preview || '').slice(0, 120))
+      + (afterDraft?.error ? ' error=' + afterDraft.error : ''));
+    if (!afterDraft?.success || afterDraft.hasDraft !== true) {
+      const error = afterDraft?.hasDraft === false
+        ? 'codex_paste_not_visible_before_submit'
+        : 'codex_draft_state_unknown_after_paste';
+      console.error(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexDraftGuard] ❌ refusing Enter error=' + error);
+      return {
+        success: false,
+        error,
+        submitted: false,
+        chunksTotal: chunks.length,
+        renderTimeMs: renderTimes,
+        submitKey: null,
+        codexDraftGuard: afterDraft || null,
       };
     }
   }
@@ -7668,10 +7908,20 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     // hook; Codex consumes the same shape from the next rollout user_message.
     // Length + sha-prefix is enough to spot truncation/corruption without
     // writing the whole prompt to disk.
-    if (broadcastTabId && source && String(source).startsWith('codex-') && typeof codexTurnWatchers !== 'undefined' && codexTurnWatchers.has(broadcastTabId)) {
+    if (broadcastTabId && isCodexPasteSource) {
       try {
         const expectedHash = pasteAuditHash(content);
-        pendingCodexPasteAudit.set(broadcastTabId, {
+        const previousAudit = pendingCodexPasteAudit.get(broadcastTabId);
+        if (previousAudit) {
+          console.warn(logPrefix + ' [CodexPasteAudit] replacing previous pending audit source=' + (previousAudit.source || '-') + ' expectedHash=' + (previousAudit.expectedHash || '-'));
+          finishCodexPasteAudit(broadcastTabId, previousAudit, {
+            success: false,
+            error: 'codex_audit_superseded',
+            expectedLen: previousAudit.expectedLen,
+            expectedHash: previousAudit.expectedHash,
+          });
+        }
+        stagedCodexAudit = {
           handoffId: handoffId || null,
           source: source || null,
           expectedLen: content.length,
@@ -7680,15 +7930,31 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           tailPreview: pasteAuditPreview(content, Math.max(0, content.length - 80)),
           sentAt: Date.now(),
           logPrefix,
-        });
-        console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] staged source=' + (source || '-') + ' expectedLen=' + content.length + ' hash=' + expectedHash);
+          awaitUserMessage: !!awaitCodexUserMessageAudit,
+          resolve: null,
+          timer: null,
+        };
+        pendingCodexPasteAudit.set(broadcastTabId, stagedCodexAudit);
+        console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] staged source=' + (source || '-') + ' expectedLen=' + content.length + ' hash=' + expectedHash + ' await=' + !!awaitCodexUserMessageAudit);
       } catch (e) {
         console.warn(logPrefix + ' [CodexPasteAudit] stage failed:', e.message);
       }
+    } else if (isCodexPasteSource) {
+      console.warn(logPrefix + ' [CodexPasteAudit] skipped: broadcastTab=' + (broadcastTabId || '-') + ' await=' + !!awaitCodexUserMessageAudit);
     } else if (!fast && broadcastTabId) {
       try {
         const expectedHash = pasteAuditHash(content);
-        pendingPasteAudit.set(broadcastTabId, {
+        const previousAudit = pendingPasteAudit.get(broadcastTabId);
+        if (previousAudit) {
+          console.warn(logPrefix + ' [PasteAudit] replacing previous pending audit source=' + (previousAudit.source || '-') + ' expectedHash=' + (previousAudit.expectedHash || '-'));
+          finishClaudePasteAudit(broadcastTabId, previousAudit, {
+            success: false,
+            error: 'claude_audit_superseded',
+            expectedLen: previousAudit.expectedLen,
+            expectedHash: previousAudit.expectedHash,
+          });
+        }
+        stagedClaudeAudit = {
           handoffId: handoffId || null,
           source: source || null,
           expectedLen: content.length,
@@ -7697,8 +7963,12 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           tailPreview: pasteAuditPreview(content, Math.max(0, content.length - 80)),
           sentAt: Date.now(),
           logPrefix,
-        });
-        console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] staged handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' expectedLen=' + content.length + ' hash=' + expectedHash);
+          awaitUserMessage: !!awaitClaudeUserMessageAudit,
+          resolve: null,
+          timer: null,
+        };
+        pendingPasteAudit.set(broadcastTabId, stagedClaudeAudit);
+        console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] staged handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' expectedLen=' + content.length + ' hash=' + expectedHash + ' await=' + !!awaitClaudeUserMessageAudit);
       } catch (e) {
         console.warn(logPrefix + ' [PasteAudit] stage failed:', e.message);
       }
@@ -7708,6 +7978,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       // Fast mode: fixed delay (Gemini/bash don't use Ink sync)
       console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Waiting 500ms before ' + resolvedSubmitLabel + ' (fast mode)...');
       await new Promise(r => setTimeout(r, 500));
+    } else if (skipRenderWait) {
+      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Skipping pre-' + resolvedSubmitLabel + ' render drain');
     } else {
       // Slow mode: short drain for secondary React renders / re-layouts.
       // 50ms is enough because waitForRender already confirmed the primary
@@ -7723,6 +7995,62 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       armPromptBoundaryForSubmittedCommand(broadcastTabId, promptBoundaryReason || logPrefix);
     }
     console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] ✅ Sent ' + resolvedSubmitLabel + ' handoff=' + (handoffId || '-') + ' (total: ' + (Date.now() - t0) + 'ms)');
+
+    if (stagedClaudeAudit && awaitClaudeUserMessageAudit && broadcastTabId) {
+      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] waiting for Claude UserPromptSubmit audit timeout=' + claudeAuditTimeoutMs + 'ms hash=' + stagedClaudeAudit.expectedHash);
+      const auditResult = await waitForClaudePasteAudit(broadcastTabId, stagedClaudeAudit, claudeAuditTimeoutMs);
+      if (!auditResult || auditResult.success !== true) {
+        console.error(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] ❌ failed error=' + (auditResult?.error || 'unknown') + ' submitted=true');
+        return {
+          success: false,
+          error: auditResult?.error || 'claude_user_message_audit_failed',
+          submitted: true,
+          chunksTotal: chunks.length,
+          renderTimeMs: renderTimes,
+          submitKey: resolvedSubmitLabel,
+          pasteAudit: auditResult || null,
+        };
+      }
+      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] ✅ confirmed Claude user message len=' + auditResult.actualLen + ' hash=' + auditResult.actualHash);
+    } else if (!isCodexPasteSource && awaitClaudeUserMessageAudit) {
+      console.warn(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] await requested but no Claude audit was staged broadcastTab=' + (broadcastTabId || '-'));
+      return {
+        success: false,
+        error: 'claude_user_message_audit_not_staged',
+        submitted: true,
+        chunksTotal: chunks.length,
+        renderTimeMs: renderTimes,
+        submitKey: resolvedSubmitLabel,
+      };
+    }
+
+    if (stagedCodexAudit && awaitCodexUserMessageAudit && broadcastTabId) {
+      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] waiting for rollout user_message timeout=' + codexAuditTimeoutMs + 'ms hash=' + stagedCodexAudit.expectedHash);
+      const auditResult = await waitForCodexPasteAudit(broadcastTabId, stagedCodexAudit, codexAuditTimeoutMs);
+      if (!auditResult || auditResult.success !== true) {
+        console.error(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] ❌ failed error=' + (auditResult?.error || 'unknown') + ' submitted=true');
+        return {
+          success: false,
+          error: auditResult?.error || 'codex_user_message_audit_failed',
+          submitted: true,
+          chunksTotal: chunks.length,
+          renderTimeMs: renderTimes,
+          submitKey: resolvedSubmitLabel,
+          codexAudit: auditResult || null,
+        };
+      }
+      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] ✅ confirmed user_message len=' + auditResult.actualLen + ' hash=' + auditResult.actualHash);
+    } else if (source && String(source).startsWith('codex-') && awaitCodexUserMessageAudit) {
+      console.warn(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] await requested but no audit was staged broadcastTab=' + (broadcastTabId || '-') + ' hasWatcher=' + (broadcastTabId && typeof codexTurnWatchers !== 'undefined' ? codexTurnWatchers.has(broadcastTabId) : false));
+      return {
+        success: false,
+        error: 'codex_user_message_audit_not_staged',
+        submitted: true,
+        chunksTotal: chunks.length,
+        renderTimeMs: renderTimes,
+        submitKey: resolvedSubmitLabel,
+      };
+    }
   }
 
   return { success: true, chunksTotal: chunks.length, renderTimeMs: renderTimes, submitKey: submit ? resolvedSubmitLabel : null };
@@ -8527,7 +8855,9 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
     : 'send-command';
   const stashFirst = sendOptions.stashFirst === false ? false : true;
   const armPromptBoundaryOnSubmit = sendOptions.armPromptBoundaryOnSubmit === true || source.startsWith('startup-defaults:');
-  console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" source=' + source + ' stashFirst=' + stashFirst + ' ts=' + Date.now());
+  const isSlashCommand = String(command || '').trimStart().startsWith('/');
+  const awaitClaudeUserMessageAudit = sendOptions.awaitUserMessageAudit === true && !isSlashCommand;
+  console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" source=' + source + ' stashFirst=' + stashFirst + ' awaitAudit=' + awaitClaudeUserMessageAudit + ' slash=' + isSlashCommand + ' ts=' + Date.now());
   const term = terminals.get(tabId);
   if (!term) { console.log('[send-command] ❌ Terminal not found for tabId=' + tabId); return { success: false, error: 'no_terminal' }; }
   if (!hasLiveClaudeInTab(tabId)) {
@@ -8560,6 +8890,8 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
     stashFirst,
     armPromptBoundaryOnSubmit,
     promptBoundaryReason: source + ':' + command,
+    awaitClaudeUserMessageAudit,
+    claudeAuditTimeoutMs: CLAUDE_PASTE_AUDIT_TIMEOUT_MS,
     // dismissAutocomplete intentionally OFF: slash-cmds with arguments (/model haiku,
     // /effort low) don't match any prefix beyond the slash — autocomplete is empty
     // by the time we send Enter, so PromptInput.onSubmit guard passes. Sending Esc
@@ -8611,10 +8943,14 @@ ipcMain.handle('claude:append-input', async (event, tabId, text, options = {}) =
     return { success: false, error: 'no_claude_session' };
   }
   const shouldSubmit = !!(options && options.submit === true);
+  const isSlashCommand = String(text || '').trimStart().startsWith('/');
+  const awaitClaudeUserMessageAudit = shouldSubmit && !isSlashCommand;
   const result = await safePasteAndSubmit(term, text, {
     submit: shouldSubmit,
     stashFirst: false, // never stash on replay — user wants append, not replace
     ctrlCFirst: false,
+    awaitClaudeUserMessageAudit,
+    claudeAuditTimeoutMs: CLAUDE_PASTE_AUDIT_TIMEOUT_MS,
     logPrefix: '[append-input:' + tabId + (handoffId ? ':' + handoffId : '') + ']',
     handoffId,
     source,
@@ -8631,7 +8967,12 @@ ipcMain.handle('claude:append-input', async (event, tabId, text, options = {}) =
 // refusal when there is no live Codex descendant under this PTY, otherwise a
 // queued chip could become a shell command.
 ipcMain.handle('codex:append-input', async (_event, tabId, text, options = {}) => {
-  console.log('[codex:append-input] 📩 Received: tabId=' + tabId + ' chars=' + (text || '').length + ' ts=' + Date.now());
+  const shouldSubmit = !!(options && options.submit === true);
+  const rawSource = options && typeof options.source === 'string' && options.source.trim()
+    ? options.source.trim()
+    : 'codex-append-input';
+  const codexSource = rawSource.startsWith('codex-') ? rawSource : 'codex-' + rawSource;
+  console.log('[codex:append-input] 📩 Received: tabId=' + tabId + ' chars=' + (text || '').length + ' submit=' + shouldSubmit + ' source=' + codexSource + ' ts=' + Date.now());
   const term = terminals.get(tabId);
   if (!term) {
     console.log('[codex:append-input] ❌ Terminal not found for tabId=' + tabId);
@@ -8645,13 +8986,24 @@ ipcMain.handle('codex:append-input', async (_event, tabId, text, options = {}) =
     console.log('[codex:append-input] ❌ No live Codex process under shell pid=' + term.pid + ' tab=' + tabId);
     return { success: false, error: 'no_codex_session' };
   }
-  const shouldSubmit = !!(options && options.submit === true);
+  const hasTurnWatcher = shouldSubmit
+    ? await ensureCodexTurnWatcher(tabId, null, terminalProjects.get(tabId))
+    : true;
+  const hasSessionWatcher = shouldSubmit && codexWatchers.has(tabId);
+  if (shouldSubmit && !hasTurnWatcher && !hasSessionWatcher) {
+    console.warn('[codex:append-input] ❌ No Codex turn watcher for tab=' + String(tabId).slice(-12) + ' — refusing unverified replay submit');
+    return { success: false, error: 'codex_turn_watcher_unavailable' };
+  }
   const result = await safePasteAndSubmit(term, text, {
     submit: shouldSubmit,
     stashFirst: false,
     ctrlCFirst: false,
     fast: false,
-    source: 'codex-append-input',
+    source: codexSource,
+    skipRenderWait: shouldSubmit,
+    awaitCodexUserMessageAudit: shouldSubmit,
+    codexAuditTimeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
+    verifyCodexVisibleDraftBeforeSubmit: shouldSubmit,
     logPrefix: '[codex:append-input:' + tabId + ']',
   });
   if (result && typeof result === 'object') result.submitted = shouldSubmit;
@@ -9460,6 +9812,12 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
   pasteAfter,
 }) => {
   const term = terminals.get(tabId);
+  console.log('[Codex:Rewind] handler enter tab=' + String(tabId || '').slice(-12)
+    + ' hasTerm=' + !!term
+    + ' targetIndex=' + targetIndex
+    + ' count=' + rewindableCount
+    + ' skipDuplicates=' + skipDuplicates
+    + ' pasteAfter=' + (typeof pasteAfter === 'string' ? pasteAfter.length : 0));
   if (!term) return { success: false, error: 'no_terminal' };
   rewindCancelTabs.delete(tabId);
 
@@ -9467,6 +9825,10 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
   if (candidates.length === 0) {
     console.log('[Codex:Rewind] ❌ No live Codex process under shell pid=' + term.pid + ' tab=' + tabId);
     return { success: false, error: 'no_codex_session' };
+  }
+  if (!codexTuiReadyTabs.has(tabId)) {
+    console.log('[Codex:Rewind] ❌ Codex process exists but TUI input-ready marker is missing tab=' + String(tabId).slice(-12));
+    return { success: false, error: 'codex_not_input_ready' };
   }
 
   await ensureCodexTurnWatcher(tabId, null, terminalProjects.get(tabId));
@@ -9540,13 +9902,6 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       && normalizeCandidate(match?.visiblePreview || '').length === 0;
   }
 
-  function codexFrameLooksLikePrompt(clean, raw) {
-    return raw.includes(CODEX_SYNC_MARKER)
-      || /Context\s+\d+%/i.test(clean)
-      || /›\s*/.test(clean)
-      || /No previous message to edit/i.test(clean);
-  }
-
   function codexPrimeHintObserved(clean) {
     return /esc\s+again\s+to\s+edit\s+previous\s+message/i.test(String(clean || ''));
   }
@@ -9593,25 +9948,6 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     };
   }
 
-  async function waitForCodexBusyState(expectedBusy, timeoutMs, reason) {
-    const deadline = Date.now() + timeoutMs;
-    let lastBusy = codexTurnWatchers.get(tabId)?.busy === true;
-    let lastEvent = codexTurnWatchers.get(tabId)?.lastEventType || null;
-    while (Date.now() <= deadline) {
-      try { await scanCodexTurnAppend(tabId, reason); } catch (e) {
-        console.warn('[Codex:Rewind] turn scan failed during ' + reason + ': ' + (e?.message || String(e)));
-      }
-      const state = codexTurnWatchers.get(tabId);
-      lastBusy = state?.busy === true;
-      lastEvent = state?.lastEventType || lastEvent;
-      if (lastBusy === expectedBusy) {
-        return { success: true, busy: lastBusy, lastEvent };
-      }
-      await drainPtyData(term, 80, 220);
-    }
-    return { success: false, busy: lastBusy, lastEvent };
-  }
-
   let codexRewindOverlayOpen = false;
 
   try {
@@ -9652,60 +9988,6 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         return { success: true };
       }
 
-      async function recoverCodexAiPasteAfterFailedGrab(grabResult, reason) {
-        const before = codexTurnWatchers.get(tabId);
-        console.warn('[Codex:Rewind] AI paste fallback: restored input unavailable reason=' + reason
-          + ' grabSuccess=' + (grabResult?.success === true)
-          + ' chars=' + (grabResult?.text ? grabResult.text.length : 0)
-          + ' matchedTarget=' + (grabResult?.matchedTarget === true)
-          + ' busyBefore=' + (before?.busy === true)
-          + ' lastEvent=' + (before?.lastEventType || '-'));
-
-        // For image/user-message rollbacks Codex may auto-start the restored
-        // prompt instead of exposing an editable composer. One Escape is both
-        // the documented interrupt while busy and a harmless prime hint at idle.
-        const abortFrame = await sendCodexKeyAndCapture(
-          term,
-          '\x1b',
-          5000,
-          '[Codex:Rewind:ai-fallback:esc]',
-          (clean, raw) => raw.includes(CODEX_SYNC_MARKER)
-            || /turn_aborted|aborted|interrupted/i.test(clean)
-            || codexPrimeHintObserved(clean)
-            || codexFrameLooksLikePrompt(clean, raw)
-        );
-        console.log('[Codex:Rewind] AI paste fallback Esc timedOut=' + abortFrame.timedOut
-          + ' clean=' + JSON.stringify(String(abortFrame.clean || '').slice(0, 260)));
-
-        let busyAfterEsc = codexTurnWatchers.get(tabId)?.busy === true;
-        if (!busyAfterEsc) {
-          await drainPtyData(term, 120, 700);
-          try { await scanCodexTurnAppend(tabId, 'rewind-ai-fallback-post-esc'); } catch {}
-          busyAfterEsc = codexTurnWatchers.get(tabId)?.busy === true;
-        }
-        if (busyAfterEsc) {
-          const idle = await waitForCodexBusyState(false, 7000, 'rewind-ai-fallback-wait-idle');
-          console.log('[Codex:Rewind] AI paste fallback wait idle success=' + idle.success
-            + ' busy=' + idle.busy
-            + ' lastEvent=' + (idle.lastEvent || '-'));
-          if (!idle.success && idle.busy === true) {
-            return {
-              success: false,
-              error: 'codex_rewind_ai_abort_timeout',
-              rollbackMayHaveApplied: true,
-            };
-          }
-        }
-
-        const cleanup = await captureAgentInput(tabId, 'grab', 'codex');
-        console.log('[Codex:Rewind] AI paste fallback cleanup grab success=' + (cleanup?.success === true)
-          + ' chars=' + (cleanup?.text ? cleanup.text.length : 0)
-          + ' images=' + (cleanup?.images || 0)
-          + ' error=' + (cleanup?.error || '-'));
-
-        return await pasteCodexRewindAiCompact('fallback-' + reason);
-      }
-
       const olderSteps = Math.max(0, count - 1 - idx);
       let rollbackTurns = count - idx;
       let escPressCount = 2 + olderSteps;
@@ -9726,32 +10008,6 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       );
       let hasPrimeHint = !primeFrame.timedOut && codexPrimeHintObserved(primeFrame.clean);
       console.log('[Codex:Rewind] prime initial timedOut=' + primeFrame.timedOut + ' hint=' + hasPrimeHint + ' clean=' + JSON.stringify(primeFrame.clean.slice(0, 220)));
-
-      if (!hasPrimeHint) {
-        console.log('[Codex:Rewind] Prime hint missing; trying input grab fallback before retry');
-        const inputCheck = await captureAgentInput(tabId, 'grab', 'codex');
-        const copiedText = typeof inputCheck?.text === 'string' ? inputCheck.text : '';
-        const imageCount = Number(inputCheck?.images || 0);
-        const hasInput = copiedText.trim().length > 0 || imageCount > 0;
-        console.log('[Codex:Rewind] Input grab fallback: success=' + (inputCheck?.success === true)
-          + ' clearedExisting=' + hasInput
-          + ' chars=' + copiedText.length
-          + ' images=' + imageCount
-          + ' error=' + (inputCheck?.error || '-'));
-        if (!inputCheck?.success && !['codex_ctrl_g_noop', 'editor_not_wired'].includes(inputCheck?.error)) {
-          return { success: false, error: inputCheck?.error || 'input_grab_failed' };
-        }
-        await drainPtyData(term, 180, 700);
-        primeFrame = await sendCodexKeyAndCapture(
-          term,
-          '\x1b',
-          2600,
-          '[Codex:Rewind:prime:after-grab]',
-          (clean) => codexPrimeHintObserved(clean)
-        );
-        hasPrimeHint = !primeFrame.timedOut && codexPrimeHintObserved(primeFrame.clean);
-        console.log('[Codex:Rewind] prime after-grab timedOut=' + primeFrame.timedOut + ' hint=' + hasPrimeHint + ' clean=' + JSON.stringify(primeFrame.clean.slice(0, 220)));
-      }
 
       if (!hasPrimeHint) {
         return { success: false, error: 'codex_rewind_prime_hint_not_observed', clean: primeFrame.clean.slice(0, 800) };
@@ -9899,29 +10155,6 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       const grabResult = await grabRestoredCodexRewindInput(targetInputText);
       if (!grabResult || grabResult.success === false) {
         console.warn('[Codex:Rewind] Could not verify terminal input clear after native backtrack: ' + (grabResult?.error || 'unknown'));
-        if (hasPasteAfter) {
-          const recovered = await recoverCodexAiPasteAfterFailedGrab(grabResult, grabResult?.error || 'grab_failed');
-          if (recovered?.success) {
-            return {
-              success: true,
-              targetIndex: idx,
-              rewindableCount: count,
-              rollbackTurns,
-              pressCount: escPressCount,
-              restoredInput: false,
-              historyInputDraft: false,
-              compactPasted: true,
-              pasteAfterFallback: true,
-            };
-          }
-          return {
-            success: false,
-            error: recovered?.error || grabResult?.error || 'codex_rewind_restored_input_grab_failed',
-            rollbackTurns,
-            pressCount: escPressCount,
-            rollbackMayHaveApplied: true,
-          };
-        }
         return {
           success: false,
           error: grabResult?.error || 'codex_rewind_restored_input_grab_failed',
@@ -9937,31 +10170,6 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         console.warn('[Codex:Rewind] restored input mismatch restoredPreview='
           + JSON.stringify(String(grabResult.text || '').slice(0, 180))
           + ' targetPreview=' + JSON.stringify(targetInputText.slice(0, 180)));
-        if (hasPasteAfter) {
-          const recovered = await recoverCodexAiPasteAfterFailedGrab(grabResult, 'mismatch');
-          if (recovered?.success) {
-            return {
-              success: true,
-              targetIndex: idx,
-              rewindableCount: count,
-              rollbackTurns,
-              pressCount: escPressCount,
-              restoredInput: false,
-              historyInputDraft: false,
-              compactPasted: true,
-              pasteAfterFallback: true,
-            };
-          }
-          return {
-            success: false,
-            error: recovered?.error || 'codex_rewind_restored_input_mismatch',
-            rollbackTurns,
-            pressCount: escPressCount,
-            rollbackMayHaveApplied: true,
-            restoredPreview: String(grabResult.text || '').slice(0, 160),
-            targetPreview: targetInputText.slice(0, 160),
-          };
-        }
         return {
           success: false,
           error: 'codex_rewind_restored_input_mismatch',
@@ -9973,29 +10181,6 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         };
       }
       if (grabResult.empty || !grabResult.text || normalizeCandidate(grabResult.text).length === 0) {
-        if (hasPasteAfter) {
-          const recovered = await recoverCodexAiPasteAfterFailedGrab(grabResult, 'empty');
-          if (recovered?.success) {
-            return {
-              success: true,
-              targetIndex: idx,
-              rewindableCount: count,
-              rollbackTurns,
-              pressCount: escPressCount,
-              restoredInput: false,
-              historyInputDraft: false,
-              compactPasted: true,
-              pasteAfterFallback: true,
-            };
-          }
-          return {
-            success: false,
-            error: recovered?.error || 'codex_rewind_restored_input_empty',
-            rollbackTurns,
-            pressCount: escPressCount,
-            rollbackMayHaveApplied: true,
-          };
-        }
         return {
           success: false,
           error: 'codex_rewind_restored_input_empty',
@@ -12890,6 +13075,7 @@ const CODEX_STARTUP_AUTO_ENTER_TTL_MS = 45 * 1000;
 const CODEX_TRUST_PROMPT_AUTO_ENTER_TTL_MS = 15 * 1000;
 const CODEX_POST_TRUST_AUTO_ENTER_TTL_MS = 12 * 1000;
 const CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT = 20 * 1024;
+const CODEX_TUI_READY_QUIET_MS = 350;
 // Parser order matters: `xhigh` renders as "Extra high", so it must be matched
 // before plain `high` or the effort picker selects the wrong row.
 const CODEX_PICKER_EFFORT_CANDIDATES = ['minimal', 'low', 'medium', 'xhigh', 'high'];
@@ -12897,7 +13083,11 @@ const CODEX_PICKER_EFFORT_CANDIDATES = ['minimal', 'low', 'medium', 'xhigh', 'hi
 function clearCodexTuiReady(tabId, reason = 'clear') {
   if (!tabId) return;
   const hadReady = codexTuiReadyTabs.delete(tabId);
+  const quietTimer = codexTuiReadyQuietTimers.get(tabId);
+  if (quietTimer) clearTimeout(quietTimer);
+  codexTuiReadyQuietTimers.delete(tabId);
   codexTuiReadyBuffers.delete(tabId);
+  codexTuiReadyRejectKeys.delete(tabId);
   if (hadReady) {
     console.log('[CodexTuiReady] clear tab=' + String(tabId).slice(-12) + ' reason=' + reason);
   }
@@ -12906,31 +13096,152 @@ function clearCodexTuiReady(tabId, reason = 'clear') {
   }
 }
 
-function isCodexInputReadyFrame(clean, raw) {
-  const text = String(clean || '').replace(/\u00a0/g, ' ');
-  const compact = text.replace(/\s+/g, ' ').trim();
-  if (!compact) return false;
-  if (isCodexTrustDirectoryPrompt(text)) return false;
-  if (inspectCodexCwdChooser(text).visible) return false;
-
-  const hasSynchronizedFrame = String(raw || '').includes(CODEX_SYNC_MARKER);
-  if (!hasSynchronizedFrame) return false;
-
-  const hasCodexUiText = /OpenAI Codex|Use \/skills|Full Access|esc to interrupt|Find and fix a bug|Explain this codebase|Ask Codex|Context \d+%|directory:\s*|permissions:\s*/i.test(text);
-  const hasComposerFrame = /[╭╰│]/.test(text) && hasCodexUiText;
-  return hasComposerFrame;
+function resetCodexTuiReadyDetection(tabId, reason = 'reset') {
+  if (!tabId) return;
+  const quietTimer = codexTuiReadyQuietTimers.get(tabId);
+  if (quietTimer) clearTimeout(quietTimer);
+  codexTuiReadyQuietTimers.delete(tabId);
+  codexTuiReadyBuffers.delete(tabId);
+  codexTuiReadyRejectKeys.delete(tabId);
+  if (codexTuiReadyTabs.delete(tabId)) {
+    console.log('[CodexTuiReady] clear tab=' + String(tabId).slice(-12) + ' reason=' + reason);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('codex:tui-not-ready', { tabId, reason });
+    }
+  }
 }
 
-async function tryEmitCodexTuiReady(tabId, data) {
-  if (!tabId || codexTuiReadyTabs.has(tabId)) return;
-  const prev = codexTuiReadyBuffers.get(tabId) || '';
-  let raw = prev + String(data || '');
-  if (raw.length > CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT) {
-    raw = raw.slice(-CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT);
+function inspectCodexInputReadyText(clean, raw, { requireSyncMarker = true, source = 'raw' } = {}) {
+  const text = String(clean || '').replace(/\u00a0/g, ' ');
+  const compact = text.replace(/\s+/g, ' ').trim();
+  if (!compact) return { ready: false, reason: 'empty', source };
+
+  const blockers = [];
+  if (inspectCodexUpdatePrompt(text).visible) blockers.push('update-prompt');
+  if (isCodexTrustDirectoryPrompt(text)) blockers.push('trust-directory');
+  if (inspectCodexCwdChooser(text).visible) blockers.push('cwd-chooser');
+  if (/Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|esc\s+to\s+interrupt/i.test(text)) {
+    blockers.push('mcp-startup');
   }
-  codexTuiReadyBuffers.set(tabId, raw);
+
+  const hasSynchronizedFrame = String(raw || '').includes(CODEX_SYNC_MARKER);
+  if (requireSyncMarker && !hasSynchronizedFrame) {
+    return { ready: false, reason: 'no-sync-marker', source, hasSynchronizedFrame };
+  }
+
+  const hasCodexUiText = /OpenAI Codex|Use \/skills|Full Access|Find and fix a bug|Explain this codebase|Ask Codex|Context \d+%|directory:\s*|permissions:\s*/i.test(text);
+  const hasPromptGlyph = /(?:^|\n)\s*[›❯>]\s*/.test(text);
+  const hasComposerFrame = (/[╭╰│]/.test(text) || hasPromptGlyph) && hasCodexUiText;
+
+  if (blockers.length > 0) {
+    return {
+      ready: false,
+      reason: 'blocked:' + blockers.join('+'),
+      source,
+      blockers,
+      hasSynchronizedFrame,
+      hasCodexUiText,
+      hasPromptGlyph,
+      hasComposerFrame,
+    };
+  }
+  if (!hasCodexUiText) {
+    return { ready: false, reason: 'no-codex-ui-text', source, hasSynchronizedFrame, hasPromptGlyph };
+  }
+  if (!hasComposerFrame) {
+    return { ready: false, reason: 'no-composer-frame', source, hasSynchronizedFrame, hasCodexUiText, hasPromptGlyph };
+  }
+  return {
+    ready: true,
+    reason: 'ready',
+    source,
+    hasSynchronizedFrame,
+    hasCodexUiText,
+    hasPromptGlyph,
+    hasComposerFrame,
+  };
+}
+
+function inspectCodexInputReadyFrame(clean, raw) {
+  return inspectCodexInputReadyText(clean, raw, { requireSyncMarker: true, source: 'raw' });
+}
+
+function inspectCodexInputReadyVisibleText(visibleText) {
+  return inspectCodexInputReadyText(visibleText, '', { requireSyncMarker: false, source: 'visible-buffer' });
+}
+
+function isCodexInputReadyFrame(clean, raw) {
+  return inspectCodexInputReadyFrame(clean, raw).ready;
+}
+
+function isCodexTuiReadyRelevantFrame(clean, raw) {
+  const text = String(clean || '').replace(/\u00a0/g, ' ');
+  return String(raw || '').includes(CODEX_SYNC_MARKER)
+    || /OpenAI Codex|Use \/skills|Full Access|Find and fix a bug|Explain this codebase|Ask Codex|Context \d+%|directory:\s*|permissions:\s*|Update available|Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|esc\s+to\s+interrupt|Do you trust the contents|directory to resume this session|directory to fork this session/i.test(text);
+}
+
+function logCodexTuiReadyNotReady(tabId, inspected, raw, clean, phase) {
+  if (!tabId || !inspected || inspected.ready) return;
+  const compact = String(clean || '').replace(/\s+/g, ' ').trim();
+  const previewTail = compact.slice(-260);
+  const key = [
+    phase || '-',
+    inspected.source || '-',
+    inspected.reason || '-',
+    inspected.hasSynchronizedFrame ? 'sync' : 'nosync',
+    inspected.hasCodexUiText ? 'ui' : 'noui',
+    inspected.hasPromptGlyph ? 'prompt' : 'noprompt',
+    previewTail.slice(-90),
+  ].join('|');
+  if (codexTuiReadyRejectKeys.get(tabId) === key) return;
+  codexTuiReadyRejectKeys.set(tabId, key);
+  console.log('[CodexTuiReady] not-ready tab=' + String(tabId).slice(-12)
+    + ' phase=' + (phase || '-')
+    + ' source=' + (inspected.source || '-')
+    + ' reason=' + (inspected.reason || '-')
+    + ' startupArmed=' + codexStartupAutoEnter.has(tabId)
+    + ' rawBytes=' + String(raw || '').length
+    + ' previewTail=' + JSON.stringify(previewTail));
+}
+
+async function emitCodexTuiReadyAfterQuiet(tabId) {
+  if (!tabId || codexTuiReadyTabs.has(tabId)) return;
+  const raw = codexTuiReadyBuffers.get(tabId) || '';
   const clean = cleanCodexTuiFrame(raw);
-  if (!isCodexInputReadyFrame(clean, raw)) return;
+  const rawInspect = inspectCodexInputReadyFrame(clean, raw);
+  let readyInspect = rawInspect;
+  let readyText = clean;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    const snapshot = await requestTerminalVisibleBufferSnapshot(
+      mainWindow.webContents,
+      tabId,
+      'codex-tui-ready',
+      700
+    );
+    if (snapshot?.success && Array.isArray(snapshot.lines)) {
+      const visibleText = snapshot.lines.map((line) => line?.text || '').join('\n');
+      tryHandleCodexStartupAutoEnter(tabId, '', {
+        cleanSnapshot: visibleText,
+        source: 'visible-buffer',
+      });
+      const visibleInspect = inspectCodexInputReadyVisibleText(visibleText);
+      if (!visibleInspect.ready) {
+        logCodexTuiReadyNotReady(tabId, visibleInspect, raw, visibleText, 'quiet-visible');
+        return;
+      }
+      readyInspect = visibleInspect;
+      readyText = visibleText;
+    } else if (!rawInspect.ready) {
+      console.log('[CodexTuiReady] visible-buffer unavailable tab=' + String(tabId).slice(-12)
+        + ' error=' + (snapshot?.error || 'bad-snapshot')
+        + ' rawReason=' + (rawInspect.reason || '-'));
+      logCodexTuiReadyNotReady(tabId, rawInspect, raw, clean, 'quiet-raw');
+      return;
+    }
+  } else if (!rawInspect.ready) {
+    logCodexTuiReadyNotReady(tabId, rawInspect, raw, clean, 'quiet-raw');
+    return;
+  }
   if (codexTuiReadyProcessProbeTabs.has(tabId)) return;
   codexTuiReadyProcessProbeTabs.add(tabId);
   let matches = [];
@@ -12947,12 +13258,43 @@ async function tryEmitCodexTuiReady(tabId, data) {
 
   codexTuiReadyTabs.add(tabId);
   codexTuiReadyBuffers.delete(tabId);
-  const preview = clean.replace(/\s+/g, ' ').trim().slice(0, 220);
-  console.log('[CodexTuiReady] tab=' + String(tabId).slice(-12) + ' input ready pids=' + matches.map(m => m.pid).join(',') + ' preview=' + JSON.stringify(preview));
+  codexTuiReadyRejectKeys.delete(tabId);
+  const preview = readyText.replace(/\s+/g, ' ').trim().slice(0, 220);
+  console.log('[CodexTuiReady] tab=' + String(tabId).slice(-12)
+    + ' input ready pids=' + matches.map(m => m.pid).join(',')
+    + ' quietMs=' + CODEX_TUI_READY_QUIET_MS
+    + ' source=' + (readyInspect.source || 'raw')
+    + ' preview=' + JSON.stringify(preview));
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('codex:tui-ready', { tabId, ts: Date.now() });
   }
   ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'codex' });
+}
+
+async function tryEmitCodexTuiReady(tabId, data) {
+  if (!tabId || codexTuiReadyTabs.has(tabId)) return;
+  const prev = codexTuiReadyBuffers.get(tabId) || '';
+  let raw = prev + String(data || '');
+  if (raw.length > CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT) {
+    raw = raw.slice(-CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT);
+  }
+  codexTuiReadyBuffers.set(tabId, raw);
+  const clean = cleanCodexTuiFrame(raw);
+  const inspected = inspectCodexInputReadyFrame(clean, raw);
+  if (!inspected.ready && !isCodexTuiReadyRelevantFrame(clean, raw)) return;
+  if (!inspected.ready) {
+    logCodexTuiReadyNotReady(tabId, inspected, raw, clean, 'stream');
+  }
+
+  const existingTimer = codexTuiReadyQuietTimers.get(tabId);
+  if (existingTimer) clearTimeout(existingTimer);
+  const quietTimer = setTimeout(() => {
+    codexTuiReadyQuietTimers.delete(tabId);
+    void emitCodexTuiReadyAfterQuiet(tabId).catch((err) => {
+      console.warn('[CodexTuiReady] quiet probe failed tab=' + String(tabId).slice(-12) + ' ' + (err?.message || String(err)));
+    });
+  }, CODEX_TUI_READY_QUIET_MS);
+  codexTuiReadyQuietTimers.set(tabId, quietTimer);
 }
 
 function closeCodexWatcher(tabId, reason = 'close') {
@@ -13039,6 +13381,21 @@ function closeCodexTurnWatcher(tabId, reason = 'close') {
   try { state.watcher?.close?.(); } catch {}
   if (state.interval) clearInterval(state.interval);
   codexTurnWatchers.delete(tabId);
+  const audit = pendingCodexPasteAudit.get(tabId);
+  if (audit?.awaitUserMessage) {
+    console.warn('[CodexPasteAudit] tab=' + String(tabId).slice(-12)
+      + ' source=' + (audit.source || '-')
+      + ' watcher closed reason=' + reason
+      + ' before matching user_message expectedLen=' + audit.expectedLen
+      + ' expectedHash=' + audit.expectedHash);
+    finishCodexPasteAudit(tabId, audit, {
+      success: false,
+      error: 'codex_turn_watcher_closed_before_user_message',
+      reason,
+      expectedLen: audit.expectedLen,
+      expectedHash: audit.expectedHash,
+    });
+  }
   if (state.busy) emitCodexBusy(tabId, false, reason);
   console.log('[CodexTurn] watcher closed tab=' + String(tabId).slice(-12) + ' session=' + (state.sessionId || 'unknown') + ' reason=' + reason);
 }
@@ -13308,7 +13665,6 @@ function processCodexTurnLine(state, line) {
   if (event === 'user_message') {
     const audit = pendingCodexPasteAudit.get(state.tabId);
     if (audit) {
-      pendingCodexPasteAudit.delete(state.tabId);
       try {
         const actualText = record.payload?.message || extractCodexLiveText(record.payload?.content) || '';
         const actualLen = actualText.length;
@@ -13320,6 +13676,13 @@ function processCodexTurnLine(state, line) {
             + ' ✅ match len=' + actualLen
             + ' hash=' + actualHash
             + ' (sent ' + (Date.now() - audit.sentAt) + 'ms ago)');
+          finishCodexPasteAudit(state.tabId, audit, {
+            success: true,
+            actualLen,
+            actualHash,
+            expectedLen: audit.expectedLen,
+            expectedHash: audit.expectedHash,
+          });
         } else {
           console.warn('[CodexPasteAudit:MISMATCH] tab=' + String(state.tabId).slice(-12)
             + ' source=' + (audit.source || '-')
@@ -13332,9 +13695,24 @@ function processCodexTurnLine(state, line) {
             + ' actualHead=' + JSON.stringify(pasteAuditPreview(actualText))
             + ' expectedTail=' + JSON.stringify(audit.tailPreview)
             + ' actualTail=' + JSON.stringify(pasteAuditPreview(actualText, Math.max(0, actualText.length - 80))));
+          finishCodexPasteAudit(state.tabId, audit, {
+            success: false,
+            error: 'codex_user_message_audit_mismatch',
+            expectedLen: audit.expectedLen,
+            actualLen,
+            expectedHash: audit.expectedHash,
+            actualHash,
+          });
         }
       } catch (e) {
         console.warn('[CodexPasteAudit] compare failed tab=' + String(state.tabId).slice(-12) + ': ' + (e?.message || String(e)));
+        finishCodexPasteAudit(state.tabId, audit, {
+          success: false,
+          error: 'codex_user_message_audit_compare_failed',
+          message: e?.message || String(e),
+          expectedLen: audit.expectedLen,
+          expectedHash: audit.expectedHash,
+        });
       }
     }
   }
@@ -13360,6 +13738,22 @@ function processCodexTurnLine(state, line) {
     state.liveTurnEvents = (state.liveTurnEvents || 0) + 1;
     state.busy = false;
     console.log('[CodexTurn] event tab=' + String(state.tabId).slice(-12) + ' session=' + state.sessionId + ' event=' + event + ' ts=' + (record.timestamp || 'n/a'));
+    const audit = pendingCodexPasteAudit.get(state.tabId);
+    if (audit?.awaitUserMessage) {
+      console.warn('[CodexPasteAudit] tab=' + String(state.tabId).slice(-12)
+        + ' source=' + (audit.source || '-')
+        + ' ended event=' + event
+        + ' before matching user_message expectedLen=' + audit.expectedLen
+        + ' expectedHash=' + audit.expectedHash);
+      finishCodexPasteAudit(state.tabId, audit, {
+        success: false,
+        error: event === 'turn_aborted'
+          ? 'codex_turn_aborted_before_user_message'
+          : 'codex_turn_completed_without_user_message',
+        expectedLen: audit.expectedLen,
+        expectedHash: audit.expectedHash,
+      });
+    }
     emitCodexBusy(state.tabId, false, event);
     _webBroadcast(state.tabId, {
       type: 'done',
@@ -13519,15 +13913,17 @@ async function scanCodexTurnAppend(tabId, reason = 'scan') {
   }
 }
 
-function startCodexTurnWatcher({ tabId, sessionId, filePath }) {
+function startCodexTurnWatcher({ tabId, sessionId, filePath, catchUpPendingAudit = false }) {
   if (!tabId || !sessionId || !filePath) return false;
   const existing = codexTurnWatchers.get(tabId);
   if (existing?.sessionId === sessionId && existing?.filePath === filePath) return true;
   closeCodexTurnWatcher(tabId, 'replace');
 
   let offset = 0;
+  let fileSize = 0;
   try {
-    offset = fs.statSync(filePath).size;
+    fileSize = fs.statSync(filePath).size;
+    offset = catchUpPendingAudit && pendingCodexPasteAudit.has(tabId) ? 0 : fileSize;
   } catch (e) {
     console.warn('[CodexTurn] cannot start watcher tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' file=' + filePath + ' error=' + e.message);
     return false;
@@ -13555,8 +13951,12 @@ function startCodexTurnWatcher({ tabId, sessionId, filePath }) {
     console.warn('[CodexTurn] fs.watch failed tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' error=' + e.message);
   }
   state.interval = setInterval(() => scanCodexTurnAppend(tabId, 'scan'), CODEX_WATCHER_SCAN_MS);
-  console.log('[CodexTurn] watcher started tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' file=' + filePath + ' offset=' + offset);
-  catchUpCodexTurnState(tabId, filePath, offset);
+  console.log('[CodexTurn] watcher started tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' file=' + filePath + ' offset=' + offset + ' fileSize=' + fileSize + ' catchUpPendingAudit=' + !!catchUpPendingAudit);
+  if (offset === 0 && fileSize > 0 && catchUpPendingAudit && pendingCodexPasteAudit.has(tabId)) {
+    setImmediate(() => scanCodexTurnAppend(tabId, 'pending-audit-catchup'));
+  } else {
+    catchUpCodexTurnState(tabId, filePath, offset);
+  }
   return true;
 }
 
@@ -13653,7 +14053,7 @@ function startCodexSessionWatcher(sender, { tabId, cwd, startedAt, sourceSession
         found = true;
         console.log('[Codex Watcher] session detected:', hit.sessionId, 'tab:', tabId, 'reason:', reason, 'file:', hit.filePath, 'cwd:', hit.cwd || 'n/a', 'cwdMatched:', !!hit.cwdMatched, 'sourceMatched:', !!hit.sourceMatched, 'source:', sourceSessionId || 'n/a', 'excludeCount:', excludeSessionIds.length);
         setCodexKnownSession(tabId, hit.sessionId, 'watcher-detected');
-        startCodexTurnWatcher({ tabId, sessionId: hit.sessionId, filePath: hit.filePath });
+        startCodexTurnWatcher({ tabId, sessionId: hit.sessionId, filePath: hit.filePath, catchUpPendingAudit: true });
         sender.send('codex:session-detected', { tabId, sessionId: hit.sessionId, cwd: hit.cwd || null });
         closeCodexWatcher(tabId, 'detected');
       } else if (detectCount <= 3 || detectCount % 10 === 0) {
@@ -13773,7 +14173,7 @@ function armCodexStartupAutoEnter(tabId, { command, sessionId, cwd } = {}) {
   if (!tabId) return;
   clearCodexStartupAutoEnter(tabId, 'rearm');
   const normalizedCommand = command || 'codex';
-  const allowedPromptTypes = new Set(['trust-directory']);
+  const allowedPromptTypes = new Set(['update-available', 'trust-directory']);
   if ((normalizedCommand === 'codex-c' || normalizedCommand === 'codex-f') && sessionId) {
     allowedPromptTypes.add('cwd-chooser');
   }
@@ -13851,6 +14251,45 @@ function isCodexCwdChooser(cleanText) {
   return inspectCodexCwdChooser(cleanText).canAutoEnter;
 }
 
+function inspectCodexUpdatePrompt(cleanText) {
+  const text = String(cleanText || '').replace(/\u00a0/g, ' ');
+  const compact = text.toLowerCase().replace(/\s+/g, ' ');
+  const squashed = compact.replace(/[^a-z0-9]+/g, '');
+  const hasPhrase = (phrase) => squashed.includes(String(phrase).toLowerCase().replace(/[^a-z0-9]+/g, ''));
+  const firstOptionSelected = /[›❯>]\s*1\.\s*Update\s+now/i.test(text);
+  const secondOptionSelected = /[›❯>]\s*2\.\s*Skip(?!\s+until)/i.test(text);
+  const thirdOptionSelected = /[›❯>]\s*3\.\s*Skip\s+until\s+next\s+version/i.test(text);
+  const checks = {
+    title: hasPhrase('update available'),
+    updateNow: hasPhrase('update now'),
+    skip: hasPhrase('skip'),
+    skipUntilNext: hasPhrase('skip until next version'),
+    continueHint: hasPhrase('press enter to continue'),
+  };
+  const missing = Object.entries(checks)
+    .filter(([, ok]) => !ok)
+    .map(([key]) => key);
+  const visible = checks.title && checks.updateNow && checks.skip && checks.skipUntilNext;
+  const canAutoSkip = visible && missing.length === 0 && (firstOptionSelected || secondOptionSelected) && !thirdOptionSelected;
+  let skipReason = null;
+  if (visible && missing.length > 0) skipReason = 'missing:' + missing.join(',');
+  else if (visible && thirdOptionSelected) skipReason = 'skip-until-next-selected';
+  else if (visible && !firstOptionSelected && !secondOptionSelected) skipReason = 'skip-option-not-reachable';
+  return {
+    visible,
+    canAutoSkip,
+    firstOptionSelected,
+    secondOptionSelected,
+    thirdOptionSelected,
+    missing,
+    skipReason,
+  };
+}
+
+function isCodexUpdatePrompt(cleanText) {
+  return inspectCodexUpdatePrompt(cleanText).canAutoSkip;
+}
+
 function isCodexTrustDirectoryPrompt(cleanText) {
   const text = String(cleanText || '').replace(/\u00a0/g, ' ');
   const compact = text.toLowerCase().replace(/\s+/g, ' ');
@@ -13870,6 +14309,9 @@ function isCodexTrustDirectoryPrompt(cleanText) {
 function detectCodexStartupAutoEnterPrompt(cleanText, state) {
   const allowed = state?.allowedPromptTypes || new Set(['cwd-chooser']);
   const fired = state?.firedTypes || new Set();
+  if (allowed.has('update-available') && !fired.has('update-available') && isCodexUpdatePrompt(cleanText)) {
+    return 'update-available';
+  }
   if (allowed.has('trust-directory') && !fired.has('trust-directory') && isCodexTrustDirectoryPrompt(cleanText)) {
     return 'trust-directory';
   }
@@ -13879,7 +14321,7 @@ function detectCodexStartupAutoEnterPrompt(cleanText, state) {
   return null;
 }
 
-function tryHandleCodexStartupAutoEnter(tabId, data) {
+function tryHandleCodexStartupAutoEnter(tabId, data, options = {}) {
   const state = codexStartupAutoEnter.get(tabId);
   if (!state) return;
   const ageMs = Date.now() - state.armedAt;
@@ -13887,11 +14329,20 @@ function tryHandleCodexStartupAutoEnter(tabId, data) {
     clearCodexStartupAutoEnter(tabId, 'expired-on-data');
     return;
   }
-  state.raw += data;
-  if (state.raw.length > CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT) {
-    state.raw = state.raw.slice(-CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT);
+  let clean;
+  let rawBytes;
+  const source = options?.source || 'raw';
+  if (typeof options?.cleanSnapshot === 'string') {
+    clean = options.cleanSnapshot;
+    rawBytes = clean.length;
+  } else {
+    state.raw += data;
+    if (state.raw.length > CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT) {
+      state.raw = state.raw.slice(-CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT);
+    }
+    clean = cleanCodexTuiFrame(state.raw);
+    rawBytes = state.raw.length;
   }
-  const clean = cleanCodexTuiFrame(state.raw);
   const promptType = detectCodexStartupAutoEnterPrompt(clean, state);
   if (!promptType && state.allowedPromptTypes?.has('cwd-chooser') && !state.firedTypes?.has('cwd-chooser')) {
     const chooser = inspectCodexCwdChooser(clean);
@@ -13909,12 +14360,37 @@ function tryHandleCodexStartupAutoEnter(tabId, data) {
         console.log('[CodexStartupPrompt] cwd-chooser visible but not confirmed tab=' + String(tabId).slice(-12) +
           ' command=' + (state.command || 'unknown') +
           ' session=' + (state.sessionId ? String(state.sessionId).slice(0, 8) : 'none') +
+          ' source=' + source +
           ' ageMs=' + ageMs +
           ' action=' + chooser.action +
           ' sessionDescriptor=' + chooser.sessionDescriptor +
           ' firstSelected=' + chooser.firstOptionSelected +
           ' secondSelected=' + chooser.secondOptionSelected +
           ' reason=' + (chooser.skipReason || 'unknown') +
+          ' preview=' + JSON.stringify(preview));
+      }
+    }
+  }
+  if (!promptType && state.allowedPromptTypes?.has('update-available') && !state.firedTypes?.has('update-available')) {
+    const updatePrompt = inspectCodexUpdatePrompt(clean);
+    if (updatePrompt.visible) {
+      const rejectKey = [
+        updatePrompt.firstOptionSelected ? 'first' : 'first0',
+        updatePrompt.secondOptionSelected ? 'second' : 'second0',
+        updatePrompt.thirdOptionSelected ? 'third' : 'third0',
+        updatePrompt.skipReason || 'unknown',
+      ].join(':');
+      if (state.lastUpdatePromptRejectKey !== rejectKey) {
+        state.lastUpdatePromptRejectKey = rejectKey;
+        const preview = clean.replace(/\s+/g, ' ').trim().slice(0, 260);
+        console.log('[CodexStartupPrompt] update prompt visible but not auto-skipped tab=' + String(tabId).slice(-12) +
+          ' command=' + (state.command || 'unknown') +
+          ' source=' + source +
+          ' ageMs=' + ageMs +
+          ' firstSelected=' + updatePrompt.firstOptionSelected +
+          ' secondSelected=' + updatePrompt.secondOptionSelected +
+          ' thirdSelected=' + updatePrompt.thirdOptionSelected +
+          ' reason=' + (updatePrompt.skipReason || 'unknown') +
           ' preview=' + JSON.stringify(preview));
       }
     }
@@ -13928,31 +14404,46 @@ function tryHandleCodexStartupAutoEnter(tabId, data) {
     ' command=' + (state.command || 'unknown') +
     ' prompt=' + promptType +
     ' session=' + (state.sessionId ? String(state.sessionId).slice(0, 8) : 'none') +
+    ' source=' + source +
     ' ageMs=' + ageMs +
-    ' rawBytes=' + state.raw.length +
+    ' rawBytes=' + rawBytes +
     ' preview=' + JSON.stringify(preview) +
     ' — sending Enter in 120ms');
   setTimeout(() => {
     const current = codexStartupAutoEnter.get(tabId);
     if (current !== state) return;
     const term = terminals.get(tabId);
-    let wroteEnter = false;
+    let wroteAction = false;
     if (term) {
-      console.log('[CodexStartupPrompt] writing Enter tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
-      term.write('\r');
-      wroteEnter = true;
+      if (promptType === 'update-available') {
+        const updatePrompt = inspectCodexUpdatePrompt(clean);
+        const sequence = updatePrompt.secondOptionSelected ? '\r' : '\x1b[B\r';
+        const action = updatePrompt.secondOptionSelected ? 'enter-skip' : 'down-enter-skip';
+        console.log('[CodexStartupPrompt] writing ' + action + ' tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
+        term.write(sequence);
+      } else {
+        console.log('[CodexStartupPrompt] writing Enter tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
+        term.write('\r');
+      }
+      resetCodexTuiReadyDetection(tabId, 'startup-prompt-' + promptType);
+      wroteAction = true;
     } else {
-      console.warn('[CodexStartupPrompt] terminal missing before Enter tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
+      console.warn('[CodexStartupPrompt] terminal missing before startup prompt action tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
     }
-    if (!wroteEnter) {
+    if (!wroteAction) {
       clearCodexStartupAutoEnter(tabId, 'terminal-missing-' + promptType);
       return;
     }
-    if (promptType === 'trust-directory' && state.allowedPromptTypes.has('cwd-chooser')) {
+    const remainingPromptTypes = Array.from(state.allowedPromptTypes || [])
+      .filter(type => !state.firedTypes?.has(type));
+    if (remainingPromptTypes.length > 0) {
       state.raw = '';
       state.armedAt = Date.now();
-      scheduleCodexStartupAutoEnterTimeout(tabId, state, CODEX_POST_TRUST_AUTO_ENTER_TTL_MS);
-      console.log('[CodexStartupPrompt] keep armed tab=' + String(tabId).slice(-12) + ' reason=await-cwd-chooser ttlMs=' + CODEX_POST_TRUST_AUTO_ENTER_TTL_MS);
+      const nextTtl = remainingPromptTypes.length === 1 && remainingPromptTypes[0] === 'cwd-chooser'
+        ? CODEX_POST_TRUST_AUTO_ENTER_TTL_MS
+        : CODEX_TRUST_PROMPT_AUTO_ENTER_TTL_MS;
+      scheduleCodexStartupAutoEnterTimeout(tabId, state, nextTtl);
+      console.log('[CodexStartupPrompt] keep armed tab=' + String(tabId).slice(-12) + ' reason=await-' + remainingPromptTypes.join(',') + ' ttlMs=' + nextTtl);
       return;
     }
     clearCodexStartupAutoEnter(tabId, 'confirmed-' + promptType);
@@ -14052,6 +14543,8 @@ function captureCodexFrame(term, { timeoutMs = 3000, predicate = null, logPrefix
     let sub = null;
     let timer = null;
     let quietTimer = null;
+    let firstFrameLogged = false;
+    const traceRewind = String(logPrefix || '').includes('Codex:Rewind');
     const finish = (timedOut) => {
       if (resolved) return;
       resolved = true;
@@ -14059,6 +14552,10 @@ function captureCodexFrame(term, { timeoutMs = 3000, predicate = null, logPrefix
       if (quietTimer) clearTimeout(quietTimer);
       try { sub?.dispose?.(); } catch {}
       const clean = cleanCodexTuiFrame(raw);
+      if (traceRewind) {
+        console.log(logPrefix + ' capture finish timedOut=' + timedOut
+          + ' raw=' + raw.length + 'B clean=' + JSON.stringify(clean.slice(0, 260)));
+      }
       resolve({ raw, clean, timedOut });
     };
     timer = setTimeout(() => {
@@ -14067,12 +14564,22 @@ function captureCodexFrame(term, { timeoutMs = 3000, predicate = null, logPrefix
     }, timeoutMs);
     sub = term.onData((data) => {
       raw += data;
+      if (traceRewind && !firstFrameLogged) {
+        firstFrameLogged = true;
+        const clean = cleanCodexTuiFrame(raw);
+        console.log(logPrefix + ' first frame chunk=' + String(data || '').length
+          + 'B raw=' + raw.length + 'B clean=' + JSON.stringify(clean.slice(0, 220)));
+      }
       if (!predicate) {
         if (quietTimer) clearTimeout(quietTimer);
         quietTimer = setTimeout(() => finish(false), 250);
       }
       const clean = cleanCodexTuiFrame(raw);
       if (predicate && predicate(clean, raw)) {
+        if (traceRewind) {
+          console.log(logPrefix + ' predicate matched raw=' + raw.length
+            + 'B clean=' + JSON.stringify(clean.slice(0, 220)));
+        }
         finish(false);
         return;
       }
@@ -14085,6 +14592,10 @@ function captureCodexFrame(term, { timeoutMs = 3000, predicate = null, logPrefix
 
 async function sendCodexKeyAndCapture(term, key, timeoutMs = 2500, logPrefix = '[Codex:Picker]', predicate = null) {
   const capture = captureCodexFrame(term, { timeoutMs, logPrefix, predicate });
+  if (String(logPrefix || '').includes('Codex:Rewind')) {
+    const keyLabel = key === '\x1b' ? 'Esc' : key === '\r' ? 'Enter' : key === '\x1b[D' ? 'Left' : JSON.stringify(key);
+    console.log(logPrefix + ' writing key=' + keyLabel + ' bytes=' + String(key || '').length);
+  }
   term.write(key);
   return await capture;
 }
@@ -14939,6 +15450,11 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
     return { success: false, error: 'no_codex_session' };
   }
   const hasTurnWatcher = await ensureCodexTurnWatcher(tabId, null, terminalProjects.get(tabId));
+  const hasSessionWatcher = codexWatchers.has(tabId);
+  if (!shouldQueue && !hasTurnWatcher && !hasSessionWatcher) {
+    console.warn('[codex:send-command] ❌ No Codex turn watcher for tab=' + String(tabId).slice(-12) + ' — refusing unverified Enter send');
+    return { success: false, error: 'codex_turn_watcher_unavailable' };
+  }
   try {
     const result = await safePasteAndSubmit(term, command, {
       submit: true,
@@ -14948,12 +15464,22 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
       submitLabel: shouldQueue ? 'Tab(queue)' : 'Enter',
       handoffId,
       source: codexSource,
+      skipRenderWait: !shouldQueue,
+      awaitCodexUserMessageAudit: !shouldQueue,
+      codexAuditTimeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
+      verifyCodexVisibleDraftBeforeSubmit: !shouldQueue,
       logPrefix: '[codex:send-command:' + tabId + ']',
     });
     if (result && typeof result === 'object') {
       result.queued = shouldQueue;
     }
-    if (hasTurnWatcher && result && result.success === false) emitCodexBusy(tabId, false, 'send-command-failed');
+    if (hasTurnWatcher && result && result.success === false) {
+      if (result.submitted === true) {
+        console.warn('[codex:send-command] send returned failure after submit tab=' + String(tabId).slice(-12) + ' error=' + (result.error || 'unknown') + ' — preserving Codex busy-state');
+      } else {
+        emitCodexBusy(tabId, false, 'send-command-failed');
+      }
+    }
     return result;
   } catch (error) {
     if (hasTurnWatcher) emitCodexBusy(tabId, false, 'send-command-error');

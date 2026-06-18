@@ -33,6 +33,24 @@
 
 Разница restart vs stop: `handleRestart` = `\x03` → 300ms → `!!\r` (Ctrl+C + повтор последней команды через `!!` bash). `handleStop` = только `\x03`.
 
+## Restart after AI completion
+
+Обычная terminal/devServer вкладка может быть привязана к завершению другой AI-вкладки через ПКМ → `Restart after`. Это не Prompt Queue и не отправка prompt'а: owner — обычная вкладка с процессом или script'ом, trigger — Claude/Gemini/Codex/SDK вкладка, у которой ждём штатный busy→idle edge.
+
+Контракт side effect:
+- выбран только trigger-tab → после natural completion target делает обычный deterministic restart (`Ctrl+C`/stop-flow, затем repeat command);
+- выбран trigger-tab + `Script` → target сначала controlled-stop'ит текущий процесс, потом отправляет выбранный `npm run <name>` или `./script.sh`;
+- если процесса в target сейчас нет, но выбран `Script`, restart-after просто стартует этот script с нуля; если script не выбран и процесса нет, обычный restart-path no-op'ит как пустой терминал;
+- `manual-stop`, `interrupt`, `error`, `watchdog`, Codex `turn_aborted`, Claude `spinner` и обычный `local-command` не запускают restart. Это те же смысловые границы что у Run after: side effect разрешён только после результата, а не после отмены/ошибки/визуального флапа.
+
+Выбор trigger-tab сам является активной подпиской. Отдельных restart-after bell-кнопок больше нет: старые `restartAfterArmed` / `restartAfterPersistent` — legacy-поля, которые очищаются при перевыборе/срабатывании. Это важная граница: `restartAfterTabId` без bell-флага всё равно обязан fire'ить. Реальный пользовательский симптом старой модели: target и `npm run dev` были сохранены, Codex loader завершился штатным `task_complete`, но ничего не произошло, потому что старый consume-path дополнительно требовал `armed/persistent`.
+
+`restartAfterTabId` и `restartAfterCommand` сохраняются в SQLite вместе с вкладкой. Сброс trigger'а удаляет и command: script без AI-триггера не имеет смысла, потому что неизвестно после какого события его запускать. В контекстном меню сброс — крестик справа от выбранного trigger'а; в vertical sidebar — `Cmd+click` по фиолетовой restart-кнопке. Если в этот момент открыт stop-mode живого devServer-процесса, тот же жест ещё и останавливает процесс; если процесса нет, жест только очищает подписку.
+
+Restart-after UI использует общий `RunAfterTabPicker`, но в purple-режиме показывает все AI-вкладки сразу (`showAllTabsOnOpen`) и открывает список вправо от tab context menu. Список берёт проекты, группы, порядок вкладок, статус-маркеры и loader из той же модели что TabSidebar; drag/drop в picker'е не работает, это read-only inventory для выбора trigger-source.
+
+Self-target (`triggerTabId === targetTabId`) всегда сбрасывается в `null`, даже если UI уже фильтрует текущую вкладку из picker'а. Это защитный слой против старого persisted state и программных вызовов store: вкладка не может дождаться собственного внешнего busy→idle edge для restart, поэтому такой target выглядел бы настроенным, но никогда не стрелял.
+
 ## 4. Code Map
 - **UI Компонент:** `src/renderer/components/Workspace/TabBar.tsx`
     - Контекстное меню → секция `{/* Scripts - submenu */}`

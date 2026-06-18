@@ -291,6 +291,14 @@ GET  /api/sdk-tabs/:tabId/status                → status строка (inactiv
 или timeout остаются стоп-сигналом. Пользовательский симптом нарушенного контракта: отправка с
 iPhone внезапно переносит Mac в другой проект/таб.
 
+`POST /api/sdk-tabs/:tabId/send` следует той же границе совместимости: при реальном
+terminal draft он возвращает `409 terminal_draft_conflict`, но не вызывает
+`grabAgentDraft` и не очищает TUI composer. Это важно для native iOS и старых
+project/tab-клиентов: они управляют конкретной вкладкой, поэтому источник текста остаётся
+в терминале до явного действия пользователя. Противоположный контракт только у
+`/api/inbox/runs`: Inbox-клиент владеет своим chat composer, поэтому Noted Terminal
+может забрать draft, очистить terminal input и вернуть `draftText` наружу для rollback.
+
 Все pathname-параметры (`:id`, `:tabId`) ОБЯЗАТЕЛЬНО прогоняются через `decId()` (`decodeURIComponent`) перед использованием — см. секцию «URL-encoded path параметры» ниже.
 
 Публичный URL вместо LAN-IP — см. [`fact-remote-access.md`](fact-remote-access.md). С phone'а через интернет endpoint-map тот же, отличается только хост в URL.

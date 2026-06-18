@@ -181,6 +181,8 @@ if (data.length > 1024) {
    - **Stale Marker Protection:** Введена фильтрация маркеров, приходящих < 15мс после записи. Это предотвращает ложные срабатывания от предыдущих циклов рендеринга (спиннеры, статус-бары). См. `knowledge/fix-stale-sync-markers.md`.
 3. **Submit:** `\r` отправляется ТОЛЬКО после подтверждения последнего чанка — гарантия что `onSubmit(value)` прочитает уже зафиксированный в стейте текст.
 
+Если sync marker не пришёл до safety timeout, programmatic paste обязан вернуть failure до Enter. Это не retry/fallback состояние: без render ACK неизвестно, попал ли text в composer, и submit может отправить пустой, хвостовой или чужой input.
+
 ```javascript
 await safePasteAndSubmit(term, content, {
   submit: true,         // отправить \r после всех чанков
@@ -229,6 +231,12 @@ await safePasteAndSubmit(term, content, {
 - **Timeline Integration:** Timeline использует эти маркеры для детерминированного определения позиций сообщений Claude. 
 - **First Entry Logic:** Первый entry в сессии (набранный до появления первого промпта с OSC-маркером) принудительно получает позицию 0, чтобы его диапазон видимости покрывал начало буфера.
 - **Persistence:** Маркеры xterm.js автоматически обновляют свой индекс `.line` при росте скроллбека, что делает скролл к ним атомарной операцией $O(1)$.
+
+### Lifetime `prompt:<seq>`
+
+`prompt:<seq>` монотонен на жизнь xterm buffer/tab, а не на жизнь Claude process. При `clearBridgeTab` нельзя сбрасывать `promptBoundarySeq`: renderer хранит уже зарегистрированные xterm markers, и новый `prompt:1` после restart выглядит как duplicate/stale marker. Симптом: stopped-session Rewind запускает Claude, `/model`/`/effort` визуально проходят, но gate ждёт boundary до timeout и `/rewind` не стартует.
+
+Prompt detector должен считать prompt glyph не только `⏵`/`❯`, но и `›`/`╰` — Claude TUI может менять видимый символ между версиями/темами. Для служебных slash-команд, которые не дают spinner-phase (`/model`, `/effort`), caller обязан перед submit взвести boundary state в `busy`; иначе state machine не увидит BUSY→IDLE и marker не появится.
 
 ---
 

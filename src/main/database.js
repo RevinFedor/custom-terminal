@@ -302,9 +302,10 @@ class DatabaseManager {
     // state is renderer-runtime only; this flag means "auto-arm on every new turn".
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN completion_notification_persistent INTEGER DEFAULT 0`); } catch (e) {}
 
-    // Migration: restart-after-Codex trigger for terminal/dev tabs.
+    // Migration: restart-after AI trigger for terminal/dev tabs.
     // Target, one-shot armed state, and repeat mode all survive app restarts.
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN restart_after_tab_id TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN restart_after_command TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN restart_after_armed INTEGER DEFAULT 0`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN restart_after_persistent INTEGER DEFAULT 0`); } catch (e) {}
 
@@ -712,6 +713,7 @@ class DatabaseManager {
         sessionStatus: t.session_status || undefined,
         completionNotificationPersistent: t.completion_notification_persistent === 1 || undefined,
         restartAfterTabId: t.restart_after_tab_id || undefined,
+        restartAfterCommand: t.restart_after_command || undefined,
         restartAfterArmed: t.restart_after_armed === 1 || undefined,
         restartAfterPersistent: t.restart_after_persistent === 1 || undefined,
         contextPct: (t.context_pct ?? undefined),
@@ -958,8 +960,8 @@ class DatabaseManager {
 
     const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, external_run, was_interrupted, overlay_dismissed, notes, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, restart_after_tab_id, restart_after_armed, restart_after_persistent, claude_session_history, provider_state, context_pct, cache_stats)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, external_run, was_interrupted, overlay_dismissed, notes, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, restart_after_tab_id, restart_after_command, restart_after_armed, restart_after_persistent, claude_session_history, provider_state, context_pct, cache_stats)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
@@ -1004,7 +1006,7 @@ class DatabaseManager {
         const cacheStatsJson = (tab.cacheStats && typeof tab.cacheStats === 'object')
           ? JSON.stringify(tab.cacheStats)
           : (cacheStatsSnapshot.has(tab.tabId) ? cacheStatsSnapshot.get(tab.tabId) : null);
-        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.codexSessionId || null, tab.codexModel || null, tab.codexEffort || null, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, tab.restartAfterTabId || null, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson);
+        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.codexSessionId || null, tab.codexModel || null, tab.codexEffort || null, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, tab.restartAfterTabId || null, tab.restartAfterCommand || null, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set

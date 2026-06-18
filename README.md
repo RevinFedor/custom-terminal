@@ -49,6 +49,8 @@ Noted Terminal запускает настоящие локальные AI CLI �
 
 Ключевая архитектурная философия: внешний клиент владеет своим UI и пользовательским transcript, а Noted Terminal владеет живым terminal runtime. Например, Voice Record может показать Codex как provider в обычном чате, но Codex-процесс, session id, rollout, Timeline/History, readiness и Stop/Continue живут в Noted Terminal Inbox. HTTP/SSE слой здесь не заменяет терминал SDK-обёрткой, а даёт control-plane над настоящей PTY-сессией. Поэтому completion для внешних клиентов — это событие `done` от Noted Terminal, а не локальная догадка по `busy:false` или таймеру.
 
+Из этого следует граница для будущих Rewind/streaming-доработок: terminal core меняется один раз, а поверхности только вызывают его. History и iOS остаются клиентами real project/tab API (`/api/sdk-tabs/:tabId/...`), потому что управляют конкретной вкладкой проекта. Inbox (`/api/inbox/runs`) нужен внешнему продукту, который владеет своим чатом и использует Noted Terminal как runtime-provider; он не заменяет mobile/project API. Если Inbox когда-нибудь получит Rewind, он должен вызвать тот же core-механизм и перевести результат в семантику внешнего чата, а не заводить второй Rewind.
+
 Подробнее по продуктовой рамке:
 
 - [docs/product/наш-терминал.md](docs/product/наш-терминал.md)
@@ -192,6 +194,8 @@ the same Mac server and is not required for local testing.
 5. Нажать mobile interrupt/stop/resume или поменять params — desktop остаётся источником живого процесса, mobile только внешний клиент.
 
 Внешний desktop-клиент показывает тот же принцип без телефона: Voice Record отправляет Codex prompt в `/api/inbox/runs`, получает SSE и сохраняет ответ в своей истории, а Noted Terminal держит Inbox-вкладку, PTY, rollout и auto-stop. Это и есть intended split: внешний продукт может быть отдельным UX, но не должен становиться владельцем Codex internals.
+
+Если во время такого external send в живом Codex composer уже есть ручной draft, Noted Terminal останавливает отправку и возвращает конфликт. Для Inbox-клиента draft передаётся наружу вместе с новым prompt'ом, чтобы внешний продукт восстановил input и не создал ghost-turn; для project/tab API draft остаётся в терминале и клиент получает `409`.
 
 Это демонстрирует главное: API уже существует и используется реальным вторым клиентом. Мобилка не парсит терминальный экран и не запускает свой Claude; она ходит в backend Noted Terminal, который сам владеет PTY, JSONL/rollout parsing, session status и history.
 

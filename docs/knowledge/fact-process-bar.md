@@ -83,6 +83,8 @@ Claude PTY spinner остаётся эвристикой: main эмитит `cla
 
 Причина: в vertical sidebar middle-click по всей вкладке уже имеет стандартную семантику close tab, а отдельная edge-hit-zone конкурировала с process-bar как чистым индикатором. Horizontal fallback всё ещё использует `RestartZone` с middle-click stop; vertical sidebar использует modifier-mode на inline reload button. Это локальное применение общего принципа `methodology/переносимый-дизайн.md::Modifier-mode на существующей action surface`.
 
+Та же кнопка показывает настроенный `Restart after`: если у вкладки есть `restartAfterTabId` или `restartAfterCommand`, она рендерится фиолетовой даже когда `hasProcess=false`. Это не live process-strip и не означает что dev-server сейчас запущен; это marker будущего автоперезапуска после AI-trigger. Обычный click запускает выбранный script/restart вручную, а `Cmd+click` очищает restart-after подписку. Если одновременно есть живой devServer и кнопка находится в stop-mode, `Cmd+click` делает оба действия: сбрасывает подписку и отправляет stop. Без живого процесса тот же жест просто очищает фиолетовый marker.
+
 ## Settings UI (правая колонка 2-column grid)
 
 - Compact превью полоски 32px высотой с реальной анимацией (использует локальные CSS-vars в `style={{['--process-bar-color-a' as any]: ...}}`, не зависит от :root — превью обновляется ДО того как App-effect синхронизирует root)

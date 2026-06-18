@@ -412,6 +412,22 @@ function sendJson(res, status, body) {
   }
 }
 
+function isSendFailure(data) {
+  return data && (data.success === false || data.ok === false);
+}
+
+function sendSendFailure(res, data, extra = {}) {
+  const code = data && typeof data.code === 'string' ? data.code : 'send_failed';
+  return sendJson(res, 409, {
+    ok: false,
+    success: false,
+    code,
+    error: (data && (data.error || data.message)) || 'send failed',
+    ...extra,
+    ...(data || {}),
+  });
+}
+
 function mobileTimelineColor(kind) {
   switch (kind) {
     case 'compact': return 'f59e0b';
@@ -1291,7 +1307,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
         tabId, prompt, model, effort, thinking, cwd,
         handoffId, source, statusAtSend, queue: queue === true,
       });
-      return sendJson(res, 200, data);
+      if (isSendFailure(data)) return sendSendFailure(res, data, { tabId });
+      return sendJson(res, 200, {
+        ok: true,
+        success: data?.success !== false,
+        status: data?.queued ? 'queued' : 'sent',
+        ...(data || {}),
+      });
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });
     }
@@ -1415,16 +1437,20 @@ async function handleApi(req, res, parsed, sdkSessions) {
         source: 'external:' + source,
         statusAtSend: status?.status || 'active',
         queue: body.queue === true,
+        returnDraftOnConflict: true,
       }, 60_000);
-      if (sendResult?.success === false) {
-        run.status = 'send_failed';
-        setExternalRunMeta(tabId, { status: 'send_failed', error: sendResult.error || 'send failed' });
-        return sendJson(res, 409, { ok: false, runId, tabId, sessionId, error: sendResult.error || 'send failed' });
+      if (isSendFailure(sendResult)) {
+        const failureCode = sendResult?.code || 'send_failed';
+        run.status = failureCode === 'terminal_draft_conflict' ? 'draft_conflict' : 'send_failed';
+        setExternalRunMeta(tabId, { status: run.status, error: sendResult.error || 'send failed' });
+        return sendSendFailure(res, sendResult, { runId, tabId, sessionId });
       }
       run.status = 'running';
       setExternalRunMeta(tabId, { status: 'running', sessionId, autoStopAt: null, autoStopMs, autoCloseAt: null, autoCloseMs });
       return sendJson(res, 200, {
         ok: true,
+        success: true,
+        status: sendResult?.queued ? 'queued' : 'sent',
         runId,
         provider,
         tabId,
