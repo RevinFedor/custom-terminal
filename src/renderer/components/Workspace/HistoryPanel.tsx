@@ -507,7 +507,7 @@ const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolT
           fontWeight: 700,
           letterSpacing: 0.6,
         }}>
-          {(sending || queued || sent) && <HistorySpinner size={10} />}
+          {(sending || queued) && <HistorySpinner size={10} />}
           <span>{label}</span>
           {entry.timestamp && (
             <span style={{ marginLeft: 2, color: '#666', fontWeight: 500, letterSpacing: 0 }}>

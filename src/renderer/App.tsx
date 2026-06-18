@@ -43,6 +43,7 @@ import {
   stopAgentProcessScenario,
 } from './utils/agentScenarios';
 import { terminalRegistry } from './utils/terminalRegistry';
+import { waitForClaudeStartupDefaultsReady } from './utils/claudeStartupDefaultsGate';
 import { DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL } from './constants/codexSettings';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from './constants/systemProjects';
 
@@ -2171,6 +2172,19 @@ function App() {
             return reply(false, null, String(e?.message || e));
           }
         }
+        if (action === 'waitAgentStartupDefaultsReady') {
+          const { tabId, timeoutMs } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          const { toolType } = describeAgentTab(tabId);
+          try {
+            if (toolType === 'claude') {
+              await waitForClaudeStartupDefaultsReady(tabId, Number(timeoutMs) || 15000);
+            }
+            return reply(true, { tabId, toolType, defaultsReady: true });
+          } catch (e: any) {
+            return reply(false, null, String(e?.message || e));
+          }
+        }
         if (action === 'stopClaudeTab' || action === 'stopAgentProcessScenario') {
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
@@ -2311,17 +2325,19 @@ function App() {
           return reply(!!result?.success, result, result?.error);
         }
         if (action === 'sendClaudeMessage') {
-          // PTY-paste via safePasteAndSubmit. CRITICAL: fast=false for Claude
-          // TUI — Ink renderer needs single bracket-pair + waitForRender
-          // between paste and Enter, otherwise Ink emits multiple [Pasted
-          // text #N] chips and sync markers race. fact-claude-tui-mechanics
-          // sections 2 & 4 + fix-claude-paste-race.md. The per-term mutex
-          // inside safePasteAndSubmit (WeakMap pasteInflight) serialises
-          // concurrent callers — if user is also clicking buttons in the
-          // desktop UI, both queue up properly.
           const { tabId, prompt } = payload || {};
           if (!tabId || !prompt) return reply(false, null, 'tabId+prompt required');
-          const result = await sendClaudePtyPrompt(tabId, prompt);
+          const { tab, toolType, runtime, sessionId } = describeAgentTab(tabId);
+          if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
+          const result = await sendAgentPromptScenario({
+            tabId,
+            toolType,
+            runtime,
+            sessionId,
+            cwd: tab?.cwd,
+            prompt,
+            source: 'legacy-sendClaudeMessage',
+          });
           const ok = result?.success !== false;
           return reply(ok, result || { tabId }, ok ? undefined : result?.error);
         }

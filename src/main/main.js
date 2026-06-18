@@ -4668,6 +4668,41 @@ function emitTerminalMcpActivity(action, details = {}) {
   return id;
 }
 
+function rendererBridgeRequestForMcp(action, payload, timeoutMs = 60_000) {
+  return new Promise((resolve, reject) => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      reject(new Error('renderer bridge unavailable'));
+      return;
+    }
+    const requestId = 'mcp-bridge-' + Date.now() + '-' + crypto.randomBytes(4).toString('hex');
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      ipcMain.removeListener('web:bridge-reply', onReply);
+    };
+    const finish = (err, data) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (err) reject(err);
+      else resolve(data);
+    };
+    const onReply = (_event, msg = {}) => {
+      if (!msg || msg.requestId !== requestId) return;
+      if (msg.ok === false) {
+        finish(new Error(msg.error || 'renderer bridge request failed'));
+      } else {
+        finish(null, msg.data);
+      }
+    };
+    const timer = setTimeout(() => {
+      finish(new Error('renderer bridge timeout for ' + action));
+    }, Math.max(1000, Number(timeoutMs) || 60_000));
+    ipcMain.on('web:bridge-reply', onReply);
+    mainWindow.webContents.send('web:bridge-request', { requestId, action, payload });
+  });
+}
+
 function startMcpHttpServer() {
   mcpHttpServer = http.createServer(async (req, res) => {
     // CORS headers for local requests
@@ -5104,6 +5139,36 @@ function startMcpHttpServer() {
             promptChars: prompt.length,
             sourceMeta: sourceMeta || null,
           });
+
+          if (engine === 'claude' && submit !== false) {
+            const result = await rendererBridgeRequestForMcp('sendAgentPromptScenario', {
+              tabId,
+              prompt,
+              source: 'mcp-ai-prompt',
+              queue: false,
+            }, 60_000);
+            const success = result?.success !== false;
+            const responseStatus = success ? (result?.queued ? 'queued' : 'sent') : 'failed';
+            console.log('[MCP:Terminal] POST /terminal/ai-prompt tabId=' + tabId + ' engine=claude submit=true chars=' + prompt.length + ' status=' + responseStatus + ' success=' + success + ' via=scenario');
+            emitTerminalMcpActivity('send_prompt', {
+              id: activityId,
+              status: success ? 'sent' : 'error',
+              tabId,
+              targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+              engine,
+              promptChars: prompt.length,
+              sourceMeta: sourceMeta || null,
+              error: success ? undefined : (result?.error || 'sendAgentPromptScenario failed'),
+            });
+            res.writeHead(success ? 200 : 500);
+            res.end(JSON.stringify({
+              status: responseStatus,
+              tabId,
+              engine,
+              result,
+            }));
+            return;
+          }
 
           const result = await safePasteAndSubmit(term, prompt, {
             submit: submit !== false,
@@ -9628,6 +9693,30 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
           text: line.text.substring(0, 120),
           wrapped: line.wrapped
         }))));
+
+      if (isClaudeRewindSlashHelpOpen(afterSlashClean) && !menuReadyRe.test(afterSlashClean)) {
+        console.warn('[Claude:Rewind] Slash help still visible after /rewind Enter; sending confirm Enter');
+        term.write('\r');
+        await drainPtyData(term, 80, 500);
+        const afterConfirmSnapshot = await requestTerminalVisibleBufferSnapshot(
+          event.sender,
+          tabId,
+          'claude-rewind-after-slash-confirm-enter',
+          700
+        );
+        const afterConfirmLines = snapshotLines(afterConfirmSnapshot).slice(-12);
+        const afterConfirmClean = afterConfirmLines.map(line => line.text).join('\n');
+        console.log('[Claude:Rewind:SlashConfirmEnter] success=' + (afterConfirmSnapshot?.success === true)
+          + ' error=' + (afterConfirmSnapshot?.error || '-')
+          + ' slashHelpOpen=' + isClaudeRewindSlashHelpOpen(afterConfirmClean)
+          + ' menuLooksOpen=' + menuReadyRe.test(afterConfirmClean)
+          + ' selectedCandidates=' + JSON.stringify(extractSnapshotSelectedCandidates(afterConfirmSnapshot).slice(-5))
+          + ' lines=' + JSON.stringify(afterConfirmLines.map(line => ({
+            row: line.row,
+            text: line.text.substring(0, 120),
+            wrapped: line.wrapped
+          }))));
+      }
 
       const menuRaw = await menuWait;
       const menuClean = cleanBuffer(menuRaw);

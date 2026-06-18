@@ -97,6 +97,12 @@ Fork делает `fs.copyFile` всего JSONL + перезаписывает 
 | `thinkingMetadata.level` | user entries | high/none — thinking mode status |
 | `message.usage` | assistant entries | Токены. **Внимание:** `input_tokens` — только uncached часть; полный контекст = `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`. Один ход Claude генерирует **несколько** assistant entries (thinking, tool_use, text) — `output_tokens` нужно суммировать |
 
+### Queue-operation как user-visible ввод
+
+`queue-operation` нельзя трактовать как служебный шум, который всегда исчезает после `remove`. В PTY Claude ввод, отправленный во время занятого turn'а или во время `AskUserQuestion`, может быть единственным user-visible следом в JSONL: `enqueue` добавляет текст в очередь, а `dequeue`/`popAll`/`remove` означает, что Claude этот queued prompt забрал из очереди. В нормальном midstream-пути позже может появиться matching `type:"user"` — тогда History заменяет синтетическую queue-row на durable user-row.
+
+Шрам 2026-06-19: во время `AskUserQuestion` пользователь отправил `стоп`; терминал показал порядок `User answered Claude's questions` → `стоп` → финальный ответ, но JSONL содержал только `queue-operation enqueue "стоп"` и потом `remove`, без обычной `type:"user"` записи для `стоп`. Если parser удаляет row на `remove`, History теряет видимый ввод; если держит spinner, создаёт вечное ожидание durable user-row, которой Claude не обязан писать. Правильное отображение: `remove` в этом флоу переводит synthetic row в финальный `SENT`; если matching `type:"user"` всё же появится позже, он заменит synthetic row.
+
 ## Скрытые env vars
 
 | Переменная | Описание |

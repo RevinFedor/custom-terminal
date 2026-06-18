@@ -1597,11 +1597,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
       }
       try {
         const status = await waitForAgentReady(tabId, startupTimeoutMs);
+        const defaults = await bridgeRequest('waitAgentStartupDefaultsReady', { tabId, timeoutMs: startupTimeoutMs }, Math.max(5000, startupTimeoutMs));
         return sendJson(res, 200, {
           ok: true,
           success: true,
           ready: true,
           ...(data || {}),
+          startupDefaultsReady: defaults?.defaultsReady === true,
           status: status?.status || 'active',
           inputReady: status?.inputReady === true,
         });
