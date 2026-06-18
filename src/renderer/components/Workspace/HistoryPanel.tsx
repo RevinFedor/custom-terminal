@@ -869,6 +869,7 @@ function ClaudeHistoryQuestionCard({
   const [optionIndex, setOptionIndex] = useState(0);
   const [terminalSubmitReady, setTerminalSubmitReady] = useState(false);
   const [terminalBusyTarget, setTerminalBusyTarget] = useState<string | null>(null);
+  const [choiceControlHover, setChoiceControlHover] = useState<string | null>(null);
   const terminalBusyRef = useRef(false);
   const terminalBusyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const terminalCursorRef = useRef<QuestionTerminalCursor>({ questionIndex: 0, optionIndex: 0, submit: false });
@@ -883,6 +884,7 @@ function ClaudeHistoryQuestionCard({
     setOptionIndex(0);
     setTerminalSubmitReady(false);
     setTerminalBusyTarget(null);
+    setChoiceControlHover(null);
     terminalBusyRef.current = false;
     terminalCursorRef.current = { questionIndex: 0, optionIndex: 0, submit: false };
     if (terminalBusyTimerRef.current) {
@@ -1000,14 +1002,30 @@ function ClaudeHistoryQuestionCard({
     });
   }, [navigateTerminalTo, questions.length, runTerminalQuestionAction, terminalDriven]);
 
-  const pickOption = useCallback((label: string, index: number) => {
+  const focusOption = useCallback((index: number) => {
+    if (controlsBusy || !currentQuestion) return;
+    const maxIndex = Math.max(0, (currentQuestion.options || []).length - 1);
+    const nextIndex = Math.max(0, Math.min(index, maxIndex));
+    if (!terminalDriven) {
+      setOptionIndex(nextIndex);
+      return;
+    }
+    const target = 'option-focus:' + questionIndex + ':' + nextIndex;
+    runTerminalQuestionAction(target, async () => {
+      await navigateTerminalTo(questionIndex, nextIndex, false);
+      setOptionIndex(nextIndex);
+      setTerminalSubmitReady(false);
+    }, 110);
+  }, [controlsBusy, currentQuestion, navigateTerminalTo, questionIndex, runTerminalQuestionAction, terminalDriven]);
+
+  const commitOption = useCallback((label: string, index: number) => {
     if (controlsBusy || !currentQuestion) return;
     setOptionIndex(index);
-
     if (terminalDriven) {
       const target = 'option:' + questionIndex + ':' + index;
       runTerminalQuestionAction(target, async () => {
         await navigateTerminalTo(questionIndex, index, false);
+        setOptionIndex(index);
         if (isMultiSelect) {
           await writeTerminalKey(QUESTION_NAV_KEY.space, 90);
           setSelection((prev) => {
@@ -1058,6 +1076,7 @@ function ClaudeHistoryQuestionCard({
       onAnswer(buildAnswers(nextSelection));
     } else if (questionIndex < questions.length - 1) {
       setQuestionIndex(questionIndex + 1);
+      setOptionIndex(0);
     }
   }, [
     buildAnswers,
@@ -1154,9 +1173,9 @@ function ClaudeHistoryQuestionCard({
                 disabled={controlsBusy}
                 style={{
                   borderRadius: 5,
-                  border: '1px solid ' + (active ? QUESTION_PURPLE_BORDER : '#333'),
-                  backgroundColor: active ? QUESTION_PURPLE_BG : '#191919',
-                  color: active ? '#f3e8ff' : answered ? QUESTION_PURPLE : '#888',
+                  border: '1px solid ' + (active ? QUESTION_PURPLE_BORDER : 'transparent'),
+                  backgroundColor: active ? QUESTION_PURPLE_BG : 'transparent',
+                  color: active ? '#f3e8ff' : '#8f8f96',
                   padding: '3px 7px',
                   fontSize: 10,
                   cursor: controlsBusy ? 'default' : 'pointer',
@@ -1166,13 +1185,35 @@ function ClaudeHistoryQuestionCard({
                   whiteSpace: 'nowrap',
                   display: 'inline-flex',
                   alignItems: 'center',
-                  gap: 5,
+                  gap: 6,
                 }}
                 title={q.question}
               >
-                {chipBusy && <HistorySpinner size={10} />}
+                <span
+                  aria-hidden
+                  style={{
+                    width: 12,
+                    height: 12,
+                    flexShrink: 0,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                >
+                  {chipBusy ? (
+                    <HistorySpinner size={10} />
+                  ) : answered ? (
+                    <span style={{
+                      width: 9,
+                      height: 9,
+                      borderRadius: 999,
+                      backgroundColor: QUESTION_PURPLE,
+                      boxShadow: '0 0 0 2px rgba(168, 85, 247, 0.18)',
+                    }} />
+                  ) : null}
+                </span>
                 <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {(answered ? 'OK ' : '') + (q.header || 'Q' + (i + 1))}
+                  {q.header || 'Q' + (i + 1)}
                 </span>
               </button>
             );
@@ -1188,20 +1229,28 @@ function ClaudeHistoryQuestionCard({
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             {currentOptions.map((option, index) => {
               const checked = currentSelection.includes(option.label);
-              const focused = terminalDriven && index === optionIndex && !terminalSubmitReady;
+              const focused = index === optionIndex && !terminalSubmitReady;
               const optionBusy = terminalBusyTarget === 'option:' + questionIndex + ':' + index;
+              const optionFocusBusy = terminalBusyTarget === 'option-focus:' + questionIndex + ':' + index;
+              const controlKey = questionIndex + ':' + index;
+              const controlHover = choiceControlHover === controlKey;
               return (
-                <button
+                <div
                   key={option.label + ':' + index}
-                  type="button"
-                  onClick={() => pickOption(option.label, index)}
-                  disabled={controlsBusy}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => focusOption(index)}
+                  onKeyDown={(e) => {
+                    if (e.key !== 'Enter' && e.key !== ' ') return;
+                    e.preventDefault();
+                    focusOption(index);
+                  }}
                   style={{
                     width: '100%',
                     textAlign: 'left',
                     borderRadius: 5,
-                    border: '1px solid ' + ((checked || focused) ? QUESTION_PURPLE_BORDER : '#303030'),
-                    backgroundColor: focused ? 'rgba(168, 85, 247, 0.16)' : checked ? QUESTION_PURPLE_BG : '#181818',
+                    border: '1px solid ' + (focused ? QUESTION_PURPLE_BORDER : '#303030'),
+                    backgroundColor: focused ? 'rgba(168, 85, 247, 0.16)' : '#181818',
                     color: '#e5e5e5',
                     cursor: controlsBusy ? 'default' : 'pointer',
                     padding: '8px 9px',
@@ -1211,21 +1260,58 @@ function ClaudeHistoryQuestionCard({
                   }}
                 >
                   <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                    <button
+                      type="button"
+                      aria-label={(checked ? 'Deselect ' : 'Select ') + option.label}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        commitOption(option.label, index);
+                      }}
+                      onMouseEnter={() => setChoiceControlHover(controlKey)}
+                      onMouseLeave={() => setChoiceControlHover((current) => current === controlKey ? null : current)}
+                      disabled={controlsBusy}
+                      style={{
+                        width: 24,
+                        height: 24,
+                        margin: '-5px -2px -5px -3px',
+                        padding: 0,
+                        border: '1px solid ' + (controlHover && !controlsBusy ? QUESTION_PURPLE_BORDER : 'transparent'),
+                        borderRadius: isMultiSelect ? 6 : 999,
+                        backgroundColor: controlHover && !controlsBusy ? 'rgba(168, 85, 247, 0.14)' : 'transparent',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        color: QUESTION_PURPLE,
+                        cursor: controlsBusy ? 'default' : 'pointer',
+                        flexShrink: 0,
+                      }}
+                    >
+                      <span style={{
+                        width: 10,
+                        height: 10,
+                        borderRadius: isMultiSelect ? 2 : 999,
+                        border: '1px solid ' + (checked ? QUESTION_PURPLE : '#666'),
+                        backgroundColor: checked ? QUESTION_PURPLE : 'transparent',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                      }}>
+                        {optionBusy && <HistorySpinner size={10} />}
+                      </span>
+                    </button>
                     <span style={{
-                      width: 10,
-                      height: 10,
-                      borderRadius: isMultiSelect ? 2 : 999,
-                      border: '1px solid ' + (checked ? QUESTION_PURPLE : '#666'),
-                      backgroundColor: checked ? QUESTION_PURPLE : 'transparent',
+                      width: 12,
+                      height: 12,
                       flexShrink: 0,
                       display: 'inline-flex',
                       alignItems: 'center',
                       justifyContent: 'center',
                       color: QUESTION_PURPLE,
+                      marginLeft: -6,
                     }}>
-                      {optionBusy && <HistorySpinner size={10} />}
+                      {optionFocusBusy && <HistorySpinner size={10} />}
                     </span>
-                    <span style={{ fontSize: 12, fontWeight: checked ? 600 : 500, overflowWrap: 'anywhere' }}>
+                    <span style={{ fontSize: 12, fontWeight: checked ? 600 : 500, overflowWrap: 'anywhere', minWidth: 0 }}>
                       {option.label}
                     </span>
                   </span>
@@ -1252,7 +1338,7 @@ function ClaudeHistoryQuestionCard({
                       {option.preview}
                     </pre>
                   )}
-                </button>
+                </div>
               );
             })}
           </div>

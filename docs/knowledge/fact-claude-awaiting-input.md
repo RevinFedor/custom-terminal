@@ -135,6 +135,16 @@ E2E проверено браузером на dev-инстансе: PTY-воп�
 
 См. [`fact-mobile-web.md`](fact-mobile-web.md) (wire-протокол `ask-question`/`question-cancelled`, self-healing reconcile) и [`fact-claude-sdk-tab.md`](fact-claude-sdk-tab.md) (SDK `canUseTool` сторона).
 
+## HistoryPanel: AskUserQuestion как пульт для Ink TUI
+
+HistoryPanel показывает тот же `AskUserQuestion` как интерактивную карточку, но для `source:'pty'` он **не резолвит вопрос напрямую**: единственный источник правды остаётся Ink TUI в терминале. UI справа отправляет в PTY такие же стрелки/`Space`/`Enter`, как если бы пользователь работал в терминале, чтобы слева сразу двигался настоящий cursor Claude Code. Это защищает презентационный сценарий: юзер кликает в History, а терминал синхронно показывает куда переместился выбор.
+
+Граница жестов обязательна: клик по question-chip только двигает активный вопрос (`←`/`→`), клик по option-card только двигает строковый cursor (`↑`/`↓`), и **не нажимает Enter**. Commit живёт только на маленьком radio/checkbox слева: single-select отправляет `Enter`, multiSelect отправляет `Space`. Старый паттерн "клик по карточке сразу выбирает" ломал mental model — пользователь хотел навести курсор, а получал ответ и переход дальше.
+
+После single-select внутри multi-question формы Ink сам переводит focus на следующий вопрос; HistoryPanel должен повторить это локально, иначе правая карточка остаётся на уже отвеченном вопросе, а настоящий TUI ушёл дальше. MultiSelect после `Space` остаётся на текущем вопросе, пока юзер явно не перейдёт question-chip'ом или `Submit`. Для 2+ вопросов Submit — отдельная финальная позиция: History-кнопка сначала ведёт TUI на submit-view (`→` сколько нужно), затем отправляет `Enter`.
+
+Визуально `focused/current` и `answered/checked` — разные состояния. Полный фиолетовый фон/рамка принадлежат только текущему question-chip или option-card, где стоит курсор. Отвеченный вопрос или выбранная опция без focus показывают только боковой фиолетовый marker (точка/чек), без заливки всей карточки: иначе checked-state читается как текущий cursor. Под marker/loader зарезервирован фиксированный слот, чтобы текст question-chip'а и ширина строки не прыгали когда появляется spinner или confirmed-dot. Переносимый принцип — `methodology/переносимый-дизайн.md::Фокус и commit — разные hit-area`.
+
 ## Связанные
 - [`fact-claude-stop-hook.md`](fact-claude-stop-hook.md) — базовая socket-архитектура (per-PID sock, ack, session_id→tabId), которую эта фича переиспользует целиком.
 - [`fix-claude-aborted-streaming-loader.md`](fix-claude-aborted-streaming-loader.md) — почему `busy:false` гарантированно приходит даже на Esc (JSONL-interrupt-watcher), что и кормит safety-net сброс awaiting.
