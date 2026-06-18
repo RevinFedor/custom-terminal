@@ -24,24 +24,29 @@ PTY+Claude-таб для phone имеет четыре состояния (ра�
 ```
 POST /api/projects/:id/claude-tabs           — создать PTY+Claude таб (Terminal.tsx сам spawn'ит claude по pendingAction)
 POST /api/projects/:id/agent-tabs            — generic PTY agent create; body {toolType:'claude'|'codex'}
-POST /api/sdk-tabs/:tabId/resume             — claude --resume <sid> в существующий PTY
-POST /api/sdk-tabs/:tabId/status             — GET тоже — текущий status + sessionId + commandType
-POST /api/sdk-tabs/:tabId/send               — sendMessageAuto (single dispatch) — backend сам роутит SDK vs PTY
-POST /api/sdk-tabs/:tabId/interrupt          — soft interrupt текущего turn'а (PTY Esc / SDK close warm)
-GET  /api/sdk-tabs/:tabId/draft              — authoritative чтение draft'а из TUI composer
-POST /api/sdk-tabs/:tabId/stop               — расширен: для PTY делает SIGTERM по claude-child-PID через stopClaudeTab bridge (terminal:stop-ai-process)
+POST /api/terminal-tabs/:tabId/resume             — claude --resume <sid> в существующий PTY; HTTP 200 только после input-ready/ready, readiness timeout = 504 success:false ready:false
+POST /api/terminal-tabs/:tabId/status             — GET тоже — текущий status + sessionId + commandType
+POST /api/terminal-tabs/:tabId/send               — sendAgentPromptScenario; backend сам ведёт Claude/Codex terminal runtime и draft ownership
+POST /api/terminal-tabs/:tabId/interrupt          — interruptAgentTurnScenario; soft interrupt текущего turn'а (PTY Esc / Codex abort signal)
+GET  /api/terminal-tabs/:tabId/draft              — grabAgentDraftScenario; authoritative чтение draft'а из TUI composer
+GET  /api/terminal-tabs/:tabId/draft-state        — inspectAgentDraftScenario; read-only preflight TUI composer
+POST /api/terminal-tabs/:tabId/rewind             — rewindAgentTimelineScenario; native `/rewind`/Codex backtrack с auto-resume
+GET  /api/terminal-tabs/:tabId/pending-question   — текущий AskUserQuestion, если клиент подключился mid-question
+POST /api/terminal-tabs/:tabId/answer-question    — ответить или stop на AskUserQuestion
+POST /api/terminal-tabs/:tabId/stop               — stopAgentProcessScenario; для PTY делает SIGTERM по AI-child-PID через terminal:stop-ai-process
 ```
 
 Все ID — через `decId()` (см. `fact-mobile-web.md::URL-encoded path параметры`).
 
 ## Bridge actions
 
-Renderer App.tsx::handleWebBridge новые actions для CLAUDE-PTY:
+Renderer App.tsx::handleWebBridge actions для PTY-agent табов:
 - `createClaudeTab` — `state.createTab` с `commandType:'claude', pendingAction:{type:'claude-new'}`. **Не зовёт** `claude:spawn-with-watcher` сам — Terminal.tsx mount'нется и обработает pendingAction. Двойной spawn ломал bridge fresh detection.
 - `createAgentTab` — generic версия для native iOS picker'а (`toolType:'claude'|'codex'`). Для Claude делает тот же `pendingAction:{type:'claude-new'}`, для Codex — `pendingAction:{type:'codex-new'}`, плюс ставит `color` равным агенту. Это важно: phone-кнопка "New Terminal" не должна сама писать `claude`/`codex` в PTY и обходить desktop launch defaults, session detection и future launch guards. Старый `createClaudeTab` остаётся как совместимый wrapper для mobile-web.
 - `resumeClaudeTab` — pre-check через `claude:get-presence`; если **active/busy** → refuse + return `alreadyRunning:true` (Ctrl+U стёр бы typed text на desktop). Иначе `markPendingResume` + `clearInterruptedState` + `\x15claude --dangerously-skip-permissions --resume <sid>\r` в PTY.
-- `stopClaudeTab` — `ipcRenderer.invoke('terminal:stop-ai-process', tabId)` (тот же handler что desktop Stop-кнопка). SIGTERM по claude-child-PID, через 800ms эскалация в SIGKILL. Shell PTY жив → Resume в этом же табе работает. Graveyard `\x03+\x03 setTimeout(250ms)` — Ink TUI redraws prompt между Ctrl+C, второй трактуется как новый первый, Claude не выходит. См. `fact-claude-tui-control.md::Mobile preserve-shell Stop`, `fix-claude-busy-detection.md::4`.
-- `sendMessageAuto` — единая точка для `/api/sdk-tabs/:id/send`. Раньше было 2 bridge round-trip'а (status check + send) = +50ms latency. Теперь dispatch внутри одного action: если `tab.commandType==='claude' && tab.tabType!=='claude-sdk'` → `terminal:paste {fast:false}`, иначе → `claude-sdk:send-message`.
+- `stopAgentProcessScenario` (`stopClaudeTab` legacy alias) — `ipcRenderer.invoke('terminal:stop-ai-process', tabId)` (тот же handler что desktop Stop-кнопка). SIGTERM по AI-child-PID, через 800ms эскалация в SIGKILL. Shell PTY жив → Resume в этом же табе работает. Graveyard `\x03+\x03 setTimeout(250ms)` — Ink TUI redraws prompt между Ctrl+C, второй трактуется как новый первый, Claude не выходит. См. `fact-claude-tui-control.md::Mobile preserve-shell Stop`, `fix-claude-busy-detection.md::4`.
+- `sendAgentPromptScenario` (`sendMessageAuto` legacy alias) — единая точка для `/api/terminal-tabs/:id/send`. Это уже не просто "paste": scenario сначала проверяет terminal draft ownership, при inactive session делает безопасный resume там где это допустимо, при busy решает queue/send-during-streaming по runtime, и только потом вызывает runtime-примитив. Если tab inactive и нет session id, scenario обязан вернуть ошибку **до** paste: fallback в shell создаёт пользовательский симптом «отправил с iOS, а запрос не появился в истории / терминал просто напечатал текст». Project/History/iOS клиенты при чужом draft получают конфликт и не очищают TUI; Inbox-клиент имеет отдельный contract, описанный в `fact-codex.md::External Inbox runs`.
+- `interruptAgentTurnScenario`, `grabAgentDraftScenario`, `inspectAgentDraftScenario`, `rewindAgentTimelineScenario` — общие terminal entrypoints для mobile, History и внешнего API. Старые action names оставлены только как совместимость, чтобы старый mobile-web/native build не умер после обновления desktop host.
 - `getClaudeTabStatus` / `getClaudeTabStatusBatch` — обёртки над `claude:get-presence` (одиночная и batch). Batch используется в `getProjectTabsLive` для списка табов в проекте.
 - `getProjectTabsLive` расширен — для PTY-agent табов отдаёт `sessionStatus` (active/busy/inactive/starting) через agent-runtime adapter, а не через Claude-only presence. В том же ответе передаются desktop `tab.color`, assigned status `statusColor`, project `icon` и `statusMarker` config — native/web клиенты не имеют доступа к `useUIStore`, поэтому сервер обязан отдать уже нормализованные поля.
 
@@ -73,6 +78,7 @@ Mobile-web Resume для CLAUDE-таба обязан соблюдать три 
 1. **Pre-check через `claude:get-presence`** — если status=active/busy, refuse слать `claude --resume`. Ctrl+U в живом Claude TUI стёр бы typed text desktop-пользователя И выкинул бы его из TUI. Юзер видит `alreadyRunning:true`, состояние не меняется.
 2. **`markPendingResume(tabId, sessionId)`** — без этого guard'а stale `~/.claude/bridge/<oldSid>.json` (Claude никогда не удаляет свои bridge-файлы) может в первые 15 секунд после Resume stomp sessionId на старый UUID. Mobile-web — пятый writer в реестре (см. `fix-bridge-stale-takeover.md::Layer 4`), наряду с AutoResume, Terminal.tsx Case 2/5, claude-f fork flow.
 3. **`state.clearInterruptedState(tabId)`** — Mobile Resume снимает «Сессия была прервана» overlay на desktop. Иначе пользователь увидит stale модалку поверх работающего Claude.
+4. **Ready proof перед HTTP 200.** `/api/terminal-tabs/:tabId/resume` не должен отвечать success сразу после `bridgeRequest('resumeClaudeTab')`: bridge-ack доказывает только что команда ушла в renderer, но не что Claude/Codex прошёл startup prompts и снова принимает ввод. 200 означает `ready/inputReady`; readiness miss возвращает `504 {success:false, ready:false}`, bridge failure — structured non-success. Иначе native iOS видит `starting` бесконечно или отправляет следующий prompt в chooser (`Choose working directory`, update prompt, MCP startup), хотя API уже сказал «готово».
 
 ## WS protocol — расширение для PTY+Claude
 
@@ -140,12 +146,12 @@ Graceful degrade — обязателен: старый prod-asar (до этих
 ## Composer Stop = turn-interrupt (Esc), навбар Stop = kill (SIGTERM)
 
 Две кнопки — **два разных действия**, не только разная видимость:
-- **Composer `stop()`** (App.tsx) → `Api.interrupt` → `POST /api/sdk-tabs/:id/interrupt` → bridge `interruptClaudeTurn` → **одиночный `\x1b` (Esc) в PTY** через `terminal:input`. Claude'ский нативный Esc-handler прерывает генерацию, возвращается к `⏵`-промпту, **процесс жив**. Single `\x1b`, НЕ `\x1b×2` (откроет Rewind-меню) и НЕ `\x03×2` (выйдет из Claude). main.js::`terminal:input` уже спец-обрабатывает single-`\x1b` mid-turn: `armInterruptIdleProbe` (safety net на случай если abort не fire'нет Stop hook — `fix-claude-aborted-streaming-loader.md`). Для SDK-таба `/interrupt` делает `query.close()` (процесс warm).
-- **Навбар `onHeaderStop()`** (App.tsx) → `Api.stop` → `POST /api/sdk-tabs/:id/stop` → bridge `stopClaudeTab` → `terminal:stop-ai-process` (Ctrl+C→300ms→SIGTERM→800ms→SIGKILL по claude-child-PID). **Убивает процесс**, shell жив → Resume.
+- **Composer `stop()`** (App.tsx) → `Api.interrupt` → `POST /api/terminal-tabs/:id/interrupt` → bridge `interruptClaudeTurn` → **одиночный `\x1b` (Esc) в PTY** через `terminal:input`. Claude'ский нативный Esc-handler прерывает генерацию, возвращается к `⏵`-промпту, **процесс жив**. Single `\x1b`, НЕ `\x1b×2` (откроет Rewind-меню) и НЕ `\x03×2` (выйдет из Claude). main.js::`terminal:input` уже спец-обрабатывает single-`\x1b` mid-turn: `armInterruptIdleProbe` (safety net на случай если abort не fire'нет Stop hook — `fix-claude-aborted-streaming-loader.md`). Для SDK-таба `/interrupt` делает `query.close()` (процесс warm).
+- **Навбар `onHeaderStop()`** (App.tsx) → `Api.stop` → `POST /api/terminal-tabs/:id/stop` → bridge `stopClaudeTab` → `terminal:stop-ai-process` (Ctrl+C→300ms→SIGTERM→800ms→SIGKILL по claude-child-PID). **Убивает процесс**, shell жив → Resume.
 
 Баг до фикса: composer `stop()` звал `Api.stop` (тот же что навбар) → **тап Stop под инпутом убивал всю Claude-сессию**, хотя должен был только прервать turn. Юзер: *«нажал отправить, потом нажал кнопку остановки, у меня остановилась вся сессия, хотя это должно влиять на отправку инпута»*. Десктоп-аналогия: на desktop PTY-Claude soft-interrupt — это **физический Esc** который юзер жмёт в TUI (нативный Claude), а Stop-кнопка ControlBar'а = kill; на мобиле физического Esc нет, поэтому composer Stop эмулирует Esc программно.
 
-После soft-interrupt мобильный клиент не имеет права возвращать в input последний отправленный prompt из памяти. Он ждёт детерминированный terminal event (`done.reason=interrupt` для Claude, `turn_aborted`/`catch-up-turn_aborted` для Codex), затем делает короткую серию probes `GET /api/sdk-tabs/:id/draft`. Только текст, реально вернувшийся в TUI composer, показывается как restored draft. Если `/draft` пустой, UI показывает нейтральное «отмена подтверждена; terminal input пустой»: это честнее, чем фабриковать prompt из last-sent и расходиться с тем, что увидит сам CLI при resume/reload. Та же логика уже закреплена в desktop `Cmd+\` History для Codex/Claude; mobile обязан переиспользовать этот contract, а не держать отдельную эвристику.
+После soft-interrupt мобильный клиент не имеет права возвращать в input последний отправленный prompt из памяти. Он ждёт детерминированный terminal event (`done.reason=interrupt` для Claude, `turn_aborted`/`catch-up-turn_aborted` для Codex), затем делает короткую серию probes `GET /api/terminal-tabs/:id/draft`. Только текст, реально вернувшийся в TUI composer, показывается как restored draft. Если `/draft` пустой, UI показывает нейтральное «отмена подтверждена; terminal input пустой»: это честнее, чем фабриковать prompt из last-sent и расходиться с тем, что увидит сам CLI при resume/reload. Та же логика уже закреплена в desktop `Cmd+\` History для Codex/Claude; mobile обязан переиспользовать этот contract, а не держать отдельную эвристику.
 
 **Hot-reload ловушка при отладке этого** (горело): правка в main.js / web-server.js (bridge action, REST route) **не подхватывается** живым dev-Electron'ом — main-процесс не hot-reload'ится, нужен рестарт dev-инстанса (НЕ хоста: хост = prod 55096 где живёт `mcp__terminal`; dev = отдельный на CDP 9224 / web 7979). А правка в `mobile-web/` **не видна в уже открытой вкладке браузера** пока не сделать hard-reload (`reload bypassCache`) — `navigate` на тот же URL оставляет старый бандл в памяти. Симптом-ловушка: проверяешь фикс, в браузере крутится `index-<СТАРЫЙ-хеш>.js`, в логах летит старое действие (`stopClaudeTab` вместо `interruptClaudeTurn`), думаешь «фикс не сработал» — а это stale bundle. Всегда сверяй `[...document.scripts].map(s=>s.src)` хеш с последним `npm run build`.
 
@@ -156,6 +162,8 @@ Graceful degrade — обязателен: старый prod-asar (до этих
 - Нажал Stop под инпутом на мобиле — убилась вся Claude-сессия, хотя должен был прерваться только текущий ответ
 - Composer Stop и навбар Stop делают одно и то же (оба kill) — composer должен soft-interrupt turn, навбар kill процесс
 - Создаю новый Claude-tab с мобилы — sessionId никогда не появляется, UI висит на «Starting Claude…»
+- Нажал Start/Resume с iOS — вкладка бесконечно показывает `starting`, хотя HTTP `/resume` уже вернул success
+- После Resume/Start следующий prompt попал в `Choose working directory` / update prompt вместо composer
 - Mobile composer не блокируется во время Claude turn → две одновременные отправки → одна теряется
 - Stop с мобилы убил весь таб целиком, Resume не возвращает Claude (Ctrl+D вместо Ctrl+C×2)
 - Открываю Claude-таб с мобилы, Claude простаивает (turn закончился) — кнопка отправки залипла в Stop, сообщение не отправить

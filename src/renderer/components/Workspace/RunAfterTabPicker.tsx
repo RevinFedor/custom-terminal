@@ -22,8 +22,8 @@ const TABBAR_PANEL_BG = `rgb(${TABBAR_PANEL_RGB.r}, ${TABBAR_PANEL_RGB.g}, ${TAB
 const BORDER = 'rgba(255,255,255,0.08)';
 const TEXT_MUTED = '#888';
 const TEXT_DIM = '#555';
-const DELETE_RED = '#ef4444';
 const FLOATING_OVERLAY_Z_INDEX = 130;
+const HOVER_CLOSE_TOLERANCE = 4;
 
 const TAB_COLORS: { color: TabColor; bgColor: string; borderColor: string }[] = [
   { color: 'default', bgColor: 'transparent', borderColor: '#666' },
@@ -229,6 +229,27 @@ function projectLabel(projectPath: string, projectId: string): string {
   return clean.split(/[\\/]/).filter(Boolean).pop() || projectId.slice(-8);
 }
 
+function pointInRect(rect: DOMRect, x: number, y: number, tolerance = HOVER_CLOSE_TOLERANCE): boolean {
+  return (
+    x >= rect.left - tolerance &&
+    x <= rect.right + tolerance &&
+    y >= rect.top - tolerance &&
+    y <= rect.bottom + tolerance
+  );
+}
+
+function pointInHoverBridge(triggerRect: DOMRect, menuRect: DOMRect, x: number, y: number, side: 'left' | 'right'): boolean {
+  const left = side === 'right'
+    ? Math.min(triggerRect.right, menuRect.left)
+    : Math.min(menuRect.right, triggerRect.left);
+  const right = side === 'right'
+    ? Math.max(triggerRect.right, menuRect.left)
+    : Math.max(menuRect.right, triggerRect.left);
+  const top = Math.min(triggerRect.top, menuRect.top) - HOVER_CLOSE_TOLERANCE;
+  const bottom = Math.max(triggerRect.bottom, menuRect.bottom) + HOVER_CLOSE_TOLERANCE;
+  return x >= left - HOVER_CLOSE_TOLERANCE && x <= right + HOVER_CLOSE_TOLERANCE && y >= top && y <= bottom;
+}
+
 export function RunAfterTabPicker({
   tabId,
   autoRun,
@@ -241,7 +262,7 @@ export function RunAfterTabPicker({
   triggerVariant = 'pill',
   triggerLabel = 'Run after',
   triggerIcon = null,
-  menuWidth = 240,
+  menuWidth = 252,
   zIndex = FLOATING_OVERLAY_Z_INDEX,
   side = 'left',
   accentColor = '#10A37F',
@@ -383,7 +404,6 @@ export function RunAfterTabPicker({
   const [open, setOpen] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [showAllTabs, setShowAllTabs] = useState(showAllTabsOnOpen);
-  const [closeHover, setCloseHover] = useState(false);
   const [countHover, setCountHover] = useState(false);
   const [triggerHover, setTriggerHover] = useState(false);
   const [portalContainer] = useState(() => {
@@ -429,19 +449,45 @@ export function RunAfterTabPicker({
     };
   }, [open]);
 
+  useEffect(() => {
+    if (!open || !openOnHover) return;
+    let frame = 0;
+    const onMove = (e: MouseEvent) => {
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const triggerRect = triggerRef.current?.getBoundingClientRect();
+        const menuRect = menuRef.current?.getBoundingClientRect();
+        if (!triggerRect || !menuRect) return;
+        const x = e.clientX;
+        const y = e.clientY;
+        if (pointInRect(triggerRect, x, y)) return;
+        if (pointInRect(menuRect, x, y)) return;
+        if (pointInHoverBridge(triggerRect, menuRect, x, y, side)) return;
+        setOpen(false);
+      });
+    };
+    window.addEventListener('mousemove', onMove, true);
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      window.removeEventListener('mousemove', onMove, true);
+    };
+  }, [open, openOnHover, side]);
+
   const handleOpen = useCallback(() => {
-    const panel = panelRef.current;
-    if (!panel) return;
-    const r = panel.getBoundingClientRect();
-    const top = Math.max(8, r.top);
+    const panelRect = panelRef.current?.getBoundingClientRect() ?? null;
+    const triggerRect = triggerRef.current?.getBoundingClientRect() ?? null;
+    const verticalRect = triggerVariant === 'context-row' && triggerRect ? triggerRect : panelRect;
+    const horizontalRect = panelRect ?? triggerRect;
+    if (!verticalRect || !horizontalRect) return;
+    const top = Math.max(8, verticalRect.top);
     const nextAnchor: PickerAnchor = {
       top,
       maxHeight: Math.max(180, window.innerHeight - top - 8),
     };
     if (side === 'right') {
-      nextAnchor.left = Math.max(8, Math.min(window.innerWidth - menuWidth - 8, r.right + 6));
+      nextAnchor.left = Math.max(8, Math.min(window.innerWidth - menuWidth - 8, horizontalRect.right + 6));
     } else {
-      nextAnchor.right = window.innerWidth - r.left + 6;
+      nextAnchor.right = window.innerWidth - horizontalRect.left + 6;
     }
     setAnchor({
       ...nextAnchor,
@@ -449,7 +495,7 @@ export function RunAfterTabPicker({
     setSelectedProjectId(inventory.selectedTargetProjectId ?? inventory.ownerProjectId ?? inventory.groups[0]?.projectId ?? null);
     setShowAllTabs(showAllTabsOnOpen);
     setOpen(true);
-  }, [inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, menuWidth, panelRef, showAllTabsOnOpen, side]);
+  }, [inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, menuWidth, panelRef, showAllTabsOnOpen, side, triggerVariant]);
 
   const handleProjectWheel = useCallback((e: WheelEvent<HTMLDivElement>) => {
     const el = e.currentTarget;
@@ -704,30 +750,6 @@ export function RunAfterTabPicker({
                   }}
                 >
                   {loaderCount}/{targetTabs.length}
-                </button>
-                <button
-                  onClick={() => setOpen(false)}
-                  onMouseEnter={() => setCloseHover(true)}
-                  onMouseLeave={() => setCloseHover(false)}
-                  title="Close"
-                  style={{
-                    width: 18,
-                    height: 18,
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    background: closeHover ? `${DELETE_RED}22` : 'transparent',
-                    border: `1px solid ${closeHover ? `${DELETE_RED}66` : 'transparent'}`,
-                    borderRadius: 5,
-                    color: closeHover ? '#fff' : TEXT_DIM,
-                    cursor: 'pointer',
-                    fontSize: 14,
-                    padding: 0,
-                    lineHeight: 1,
-                    transition: 'background 0.12s, border-color 0.12s, color 0.12s',
-                  }}
-                >
-                  x
                 </button>
               </div>
 

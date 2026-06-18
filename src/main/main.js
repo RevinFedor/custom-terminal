@@ -1809,14 +1809,16 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected') {
       ' prev=' + (prev ? String(prev).slice(0, 8) : 'none') +
       ' total=' + codexKnownSessions.size);
     const turn = codexTurnWatchers.get(tabId);
+    const isBusy = turn?.busy === true;
+    const inputReady = !isBusy && codexTuiReadyTabs.has(tabId);
     _webBroadcast(tabId, {
       type: 'snapshot',
       sessionId,
-      busy: turn?.busy === true,
-      sessionStatus: turn?.busy === true ? 'busy' : 'active',
+      busy: isBusy,
+      sessionStatus: isBusy ? 'busy' : (inputReady ? 'active' : 'starting'),
       toolType: 'codex',
       commandType: 'codex',
-      inputReady: true,
+      inputReady,
     });
   }
 }
@@ -5054,6 +5056,28 @@ function startMcpHttpServer() {
                 return;
               }
             }
+            if (submit !== false) {
+              const ready = await ensureCodexInputReadyForExternalPrompt(tabId, {
+                reason: 'mcp-ai-prompt',
+                timeoutMs: CODEX_EXTERNAL_PROMPT_READY_TIMEOUT_MS,
+              });
+              if (!ready?.success) {
+                console.log('[MCP:Terminal] POST /terminal/ai-prompt codex not ready tabId=' + tabId
+                  + ' reason=' + (ready?.reason || ready?.error || 'unknown')
+                  + ' waitedMs=' + (ready?.waitedMs ?? '-')
+                  + ' blockers=' + (Array.isArray(ready?.blockers) ? ready.blockers.join(',') : '-'));
+                res.writeHead(409);
+                res.end(JSON.stringify({
+                  status: 'not_ready',
+                  error: 'codex_not_input_ready',
+                  reason: ready?.reason || ready?.error || 'unknown',
+                  blockers: ready?.blockers || undefined,
+                  ready: ready?.ready || undefined,
+                  waitedMs: ready?.waitedMs || 0,
+                }));
+                return;
+              }
+            }
           } else if (engine === 'claude') {
             if (!hasLiveClaudeInTab(tabId)) {
               const candidates = await findAiDescendantProcessesByTab(tabId, 'claude');
@@ -5093,20 +5117,25 @@ function startMcpHttpServer() {
             verifyCodexVisibleDraftBeforeSubmit: engine === 'codex' && submit !== false,
             logPrefix: '[MCP:Terminal:ai-prompt:' + engine + ':' + tabId + ']',
           });
-          console.log('[MCP:Terminal] POST /terminal/ai-prompt tabId=' + tabId + ' engine=' + engine + ' submit=' + (submit !== false) + ' chars=' + prompt.length + ' success=' + (result?.success !== false));
+          const success = result?.success !== false;
+          const submittedUnverified = !success && result?.submitted === true;
+          const responseStatus = success
+            ? (submit === false ? 'pasted' : 'sent')
+            : (submittedUnverified ? 'submitted_unverified' : 'failed');
+          console.log('[MCP:Terminal] POST /terminal/ai-prompt tabId=' + tabId + ' engine=' + engine + ' submit=' + (submit !== false) + ' chars=' + prompt.length + ' status=' + responseStatus + ' success=' + success);
           emitTerminalMcpActivity('send_prompt', {
             id: activityId,
-            status: result?.success === false ? 'error' : (submit === false ? 'pasted' : 'sent'),
+            status: success ? (submit === false ? 'pasted' : 'sent') : (submittedUnverified ? 'sent' : 'error'),
             tabId,
             targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
             engine,
             promptChars: prompt.length,
             sourceMeta: sourceMeta || null,
-            error: result?.success === false ? (result?.error || 'safePasteAndSubmit failed') : undefined,
+            error: success ? undefined : (result?.error || 'safePasteAndSubmit failed'),
           });
-          res.writeHead(result?.success === false ? 500 : 200);
+          res.writeHead(success ? 200 : (submittedUnverified ? 202 : 500));
           res.end(JSON.stringify({
-            status: submit === false ? 'pasted' : 'sent',
+            status: responseStatus,
             tabId,
             engine,
             result,
@@ -7279,6 +7308,17 @@ function pasteAuditPreview(text, start = 0) {
   return String(text || '').substring(start, start + 80).replace(/\s+/g, ' ');
 }
 
+function codexCanonicalUserMessageMatch(audit, actualText) {
+  const expected = String(audit?.expectedText || '');
+  const actual = String(actualText || '');
+  if (!expected) return null;
+  const trimStartExpected = expected.replace(/^\s+/, '');
+  if (trimStartExpected !== expected && actual === trimStartExpected) {
+    return { reason: 'codex_trimmed_leading_whitespace' };
+  }
+  return null;
+}
+
 function finishClaudePasteAudit(tabId, audit, result) {
   if (!audit) return;
   if (audit.timer) clearTimeout(audit.timer);
@@ -7717,6 +7757,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       + ' hasDraft=' + beforeDraft?.hasDraft
       + ' source=' + (beforeDraft?.source || '-')
       + ' preview=' + JSON.stringify(String(beforeDraft?.preview || '').slice(0, 120))
+      + (beforeDraft?.debug ? ' debug=' + JSON.stringify(String(beforeDraft.debug).slice(0, 700)) : '')
       + (beforeDraft?.error ? ' error=' + beforeDraft.error : ''));
     if (!beforeDraft?.success || beforeDraft.hasDraft !== false) {
       const error = beforeDraft?.hasDraft === true
@@ -7870,6 +7911,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       + ' timedOut=' + !!afterDraft?.timedOut
       + ' checks=' + (afterDraft?.checks ?? '-')
       + ' preview=' + JSON.stringify(String(afterDraft?.preview || '').slice(0, 120))
+      + (afterDraft?.debug ? ' debug=' + JSON.stringify(String(afterDraft.debug).slice(0, 700)) : '')
       + (afterDraft?.error ? ' error=' + afterDraft.error : ''));
     if (!afterDraft?.success || afterDraft.hasDraft !== true) {
       const error = afterDraft?.hasDraft === false
@@ -7926,6 +7968,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           source: source || null,
           expectedLen: content.length,
           expectedHash,
+          expectedText: content,
           headPreview: pasteAuditPreview(content),
           tailPreview: pasteAuditPreview(content, Math.max(0, content.length - 80)),
           sentAt: Date.now(),
@@ -9860,15 +9903,19 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     const normalized = normalizeCandidate(expectedText);
     const anchors = [];
     const seen = new Set();
-    const push = (value) => {
+    const push = (value, options = {}) => {
       const anchor = normalizeCandidate(value);
-      if (anchor.length < 24 || seen.has(anchor)) return;
+      const words = anchor.split(/\s+/).filter(Boolean);
+      const allowShortFullTarget = options.allowShortFullTarget === true
+        && anchor.length >= 8
+        && words.length >= 2;
+      if ((!allowShortFullTarget && anchor.length < 24) || seen.has(anchor)) return;
       seen.add(anchor);
       anchors.push(anchor);
     };
     push(normalized.slice(0, 96));
     push(normalized.slice(0, 56));
-    if (normalized.length <= 140) push(normalized);
+    if (normalized.length <= 140) push(normalized, { allowShortFullTarget: true });
 
     const words = normalized.split(/\s+/).filter(Boolean);
     for (const size of [12, 10, 8, 6]) {
@@ -9890,6 +9937,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     return {
       matched: !!matchedAnchor,
       anchor: matchedAnchor || '',
+      anchorCount: anchors.length,
       visiblePreview: visible.slice(0, 220),
       targetPreview: normalizeCandidate(expectedText).slice(0, 220),
       visibleLength: visible.length,
@@ -9923,11 +9971,17 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       lastResult = result;
       const text = typeof result?.text === 'string' ? result.text : '';
       const normalized = normalizeCandidate(text);
-      const matched = expected ? normalized === expected : normalized.length === 0;
+      const extraChars = Math.max(0, normalized.length - expected.length);
+      const containsExpected = !!(expected && normalized.includes(expected));
+      const matched = expected
+        ? (normalized === expected || (containsExpected && extraChars <= Math.max(80, Math.floor(expected.length * 0.5))))
+        : normalized.length === 0;
       console.log('[Codex:Rewind] Grab restored input attempt=' + (attempt + 1)
         + ' success=' + (result?.success === true)
         + ' chars=' + text.length
         + ' matchedTarget=' + matched
+        + ' containsTarget=' + containsExpected
+        + ' extraChars=' + extraChars
         + ' error=' + (result?.error || '-'));
 
       if (result?.success && normalized.length > 0) {
@@ -10036,6 +10090,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       console.log('[Codex:Rewind] overlay match step=0/' + maxOlderSteps
         + ' matched=' + selectedMatch.matched
         + ' duplicatesRemaining=' + duplicatesRemaining
+        + ' anchors=' + selectedMatch.anchorCount
         + ' anchor=' + JSON.stringify(selectedMatch.anchor.slice(0, 80))
         + ' visible=' + JSON.stringify(selectedMatch.visiblePreview.slice(0, 160))
         + ' target=' + JSON.stringify(selectedMatch.targetPreview.slice(0, 160)));
@@ -10070,6 +10125,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
             + ' raw=' + navFrame.raw.length + 'B'
             + ' matched=' + selectedMatch.matched
             + ' duplicatesRemaining=' + duplicatesRemaining
+            + ' anchors=' + selectedMatch.anchorCount
             + ' anchor=' + JSON.stringify(selectedMatch.anchor.slice(0, 80))
             + ' visible=' + JSON.stringify(selectedMatch.visiblePreview.slice(0, 160)));
           if (navFrame.timedOut) {
@@ -10099,6 +10155,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       if (selectedOlderSteps === null) {
         console.warn('[Codex:Rewind] target not selected before Enter plannedOlderSteps=' + olderSteps
           + ' searchedOlderSteps=' + maxOlderSteps
+          + ' anchors=' + selectedMatch.anchorCount
           + ' visiblePreview=' + JSON.stringify(selectedMatch.visiblePreview)
           + ' targetPreview=' + JSON.stringify(selectedMatch.targetPreview));
         try {
@@ -10111,6 +10168,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           rollbackTurns,
           pressCount: 2 + maxOlderSteps,
           rollbackMayHaveApplied: false,
+          anchorCount: selectedMatch.anchorCount,
           visiblePreview: selectedMatch.visiblePreview,
           targetPreview: selectedMatch.targetPreview,
         };
@@ -13076,6 +13134,7 @@ const CODEX_TRUST_PROMPT_AUTO_ENTER_TTL_MS = 15 * 1000;
 const CODEX_POST_TRUST_AUTO_ENTER_TTL_MS = 12 * 1000;
 const CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT = 20 * 1024;
 const CODEX_TUI_READY_QUIET_MS = 350;
+const CODEX_EXTERNAL_PROMPT_READY_TIMEOUT_MS = 90 * 1000;
 // Parser order matters: `xhigh` renders as "Extra high", so it must be matched
 // before plain `high` or the effort picker selects the wrong row.
 const CODEX_PICKER_EFFORT_CANDIDATES = ['minimal', 'low', 'medium', 'xhigh', 'high'];
@@ -13315,6 +13374,7 @@ function emitCodexBusy(tabId, busy, reason) {
     mainWindow.webContents.send('codex:busy-state', { tabId, busy, reason });
   }
   const state = codexTurnWatchers.get(tabId);
+  const inputReady = !busy && codexTuiReadyTabs.has(tabId);
   _webBroadcast(tabId, {
     type: 'busy',
     busy,
@@ -13322,8 +13382,8 @@ function emitCodexBusy(tabId, busy, reason) {
     toolType: 'codex',
     commandType: 'codex',
     sessionId: state?.sessionId || codexKnownSessions.get(tabId) || null,
-    sessionStatus: busy ? 'busy' : 'active',
-    inputReady: true,
+    sessionStatus: busy ? 'busy' : (inputReady ? 'active' : 'starting'),
+    inputReady,
   });
   if (!busy) {
     _webBroadcast(tabId, {
@@ -13417,6 +13477,10 @@ ipcMain.handle('codex:get-turn-state', async (_event, tabId) => {
 });
 
 ipcMain.handle('codex:get-tui-ready', async (_event, tabId) => {
+  return getCodexTuiReadyState(tabId);
+});
+
+async function getCodexTuiReadyState(tabId) {
   const textReady = !!codexTuiReadyTabs.has(tabId);
   let processReady = false;
   if (textReady) {
@@ -13432,7 +13496,131 @@ ipcMain.handle('codex:get-tui-ready', async (_event, tabId) => {
     textReady,
     processReady,
   };
-});
+}
+
+async function pokeCodexStartupPromptFromVisibleBuffer(tabId, reason = 'external-prompt') {
+  if (!tabId || !mainWindow || mainWindow.isDestroyed()) {
+    return { success: false, error: 'no-main-window' };
+  }
+  const snapshot = await requestTerminalVisibleBufferSnapshot(
+    mainWindow.webContents,
+    tabId,
+    'codex-startup-' + reason,
+    1000
+  );
+  if (!snapshot?.success || !Array.isArray(snapshot.lines)) {
+    return { success: false, error: snapshot?.error || 'snapshot-unavailable' };
+  }
+  const visibleText = snapshot.lines.map((line) => line?.text || '').join('\n');
+  tryHandleCodexStartupAutoEnter(tabId, '', {
+    cleanSnapshot: visibleText,
+    source: 'visible-buffer:' + reason,
+  });
+  const inspected = inspectCodexInputReadyVisibleText(visibleText);
+  return {
+    success: true,
+    ready: inspected.ready,
+    reason: inspected.reason || null,
+    blockers: inspected.blockers || null,
+  };
+}
+
+async function markCodexTuiReadyFromVisibleProbe(tabId, reason = 'visible-probe') {
+  if (!tabId || codexTuiReadyTabs.has(tabId)) return false;
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  const snapshot = await requestTerminalVisibleBufferSnapshot(
+    mainWindow.webContents,
+    tabId,
+    'codex-ready-' + reason,
+    1000
+  );
+  if (!snapshot?.success || !Array.isArray(snapshot.lines)) return false;
+  const visibleText = snapshot.lines.map((line) => line?.text || '').join('\n');
+  const inspected = inspectCodexInputReadyVisibleText(visibleText);
+  if (!inspected.ready) return false;
+  let matches = [];
+  try {
+    matches = await findAiDescendantProcessesByTab(tabId, 'codex');
+  } catch {
+    matches = [];
+  }
+  if (matches.length === 0 || codexTuiReadyTabs.has(tabId)) return false;
+  codexTuiReadyTabs.add(tabId);
+  codexTuiReadyBuffers.delete(tabId);
+  codexTuiReadyRejectKeys.delete(tabId);
+  const preview = visibleText.replace(/\s+/g, ' ').trim().slice(0, 220);
+  console.log('[CodexTuiReady] tab=' + String(tabId).slice(-12)
+    + ' input ready via visible probe reason=' + reason
+    + ' pids=' + matches.map(m => m.pid).join(',')
+    + ' preview=' + JSON.stringify(preview));
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('codex:tui-ready', { tabId, ts: Date.now() });
+  }
+  ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'codex' });
+  return true;
+}
+
+async function ensureCodexInputReadyForExternalPrompt(tabId, {
+  timeoutMs = CODEX_EXTERNAL_PROMPT_READY_TIMEOUT_MS,
+  reason = 'external-prompt',
+} = {}) {
+  const initial = await getCodexTuiReadyState(tabId);
+  if (initial.inputReady) return { success: true, ready: initial, waitedMs: 0 };
+
+  if (!codexStartupAutoEnter.has(tabId)) {
+    armCodexStartupAutoEnter(tabId, {
+      command: reason,
+      sessionId: codexKnownSessions.get(tabId) || null,
+      cwd: terminalProjects.get(tabId) || null,
+    });
+  }
+  const poke = await pokeCodexStartupPromptFromVisibleBuffer(tabId, reason);
+  if (poke?.ready && await markCodexTuiReadyFromVisibleProbe(tabId, reason)) {
+    const ready = await getCodexTuiReadyState(tabId);
+    if (ready.inputReady) return { success: true, ready, waitedMs: 0, poke };
+  }
+  const afterPoke = await getCodexTuiReadyState(tabId);
+  if (afterPoke.inputReady) return { success: true, ready: afterPoke, waitedMs: 0, poke };
+
+  const startedAt = Date.now();
+  return await new Promise((resolve) => {
+    let settled = false;
+    const finish = async (payload) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      ipcMain.removeListener('agent:tui-ready-internal', onReady);
+      resolve(payload);
+    };
+    const onReady = async (_event, payload) => {
+      if (!payload || payload.tabId !== tabId || payload.toolType !== 'codex') return;
+      const state = await getCodexTuiReadyState(tabId);
+      if (state.inputReady) {
+        finish({ success: true, ready: state, waitedMs: Date.now() - startedAt, poke });
+      }
+    };
+    const timer = setTimeout(async () => {
+      const state = await getCodexTuiReadyState(tabId);
+      const lastPoke = await pokeCodexStartupPromptFromVisibleBuffer(tabId, reason + '-timeout');
+      if (lastPoke?.ready && await markCodexTuiReadyFromVisibleProbe(tabId, reason + '-timeout')) {
+        const ready = await getCodexTuiReadyState(tabId);
+        if (ready.inputReady) {
+          finish({ success: true, ready, waitedMs: Date.now() - startedAt, poke: lastPoke });
+          return;
+        }
+      }
+      finish({
+        success: false,
+        error: 'codex_not_input_ready',
+        reason: lastPoke?.reason || poke?.reason || 'timeout',
+        blockers: lastPoke?.blockers || poke?.blockers || null,
+        ready: state,
+        waitedMs: Date.now() - startedAt,
+      });
+    }, Math.max(1000, timeoutMs));
+    ipcMain.on('agent:tui-ready-internal', onReady);
+  });
+}
 
 function codexEventType(record) {
   if (!record || record.type !== 'event_msg') return null;
@@ -13684,6 +13872,27 @@ function processCodexTurnLine(state, line) {
             expectedHash: audit.expectedHash,
           });
         } else {
+          const canonicalMatch = codexCanonicalUserMessageMatch(audit, actualText);
+          if (canonicalMatch) {
+            console.warn('[CodexPasteAudit:CANONICAL_MATCH] tab=' + String(state.tabId).slice(-12)
+              + ' source=' + (audit.source || '-')
+              + ' reason=' + canonicalMatch.reason
+              + ' expectedLen=' + audit.expectedLen
+              + ' actualLen=' + actualLen
+              + ' Δ=' + (actualLen - audit.expectedLen)
+              + ' expectedHash=' + audit.expectedHash
+              + ' actualHash=' + actualHash);
+            finishCodexPasteAudit(state.tabId, audit, {
+              success: true,
+              canonicalized: true,
+              canonicalReason: canonicalMatch.reason,
+              actualLen,
+              actualHash,
+              expectedLen: audit.expectedLen,
+              expectedHash: audit.expectedHash,
+            });
+            return;
+          }
           console.warn('[CodexPasteAudit:MISMATCH] tab=' + String(state.tabId).slice(-12)
             + ' source=' + (audit.source || '-')
             + ' expectedLen=' + audit.expectedLen
@@ -13792,7 +14001,7 @@ function inferCodexBusyFromText(text) {
   return { inferred, lastTokenInfo };
 }
 
-async function catchUpCodexTurnState(tabId, filePath, fileSize) {
+async function catchUpCodexTurnState(tabId, filePath, fileSize, { suppressBusy = false, reason = 'catch-up' } = {}) {
   const readSize = Math.min(fileSize, CODEX_TURN_CATCHUP_BYTES);
   if (readSize <= 0) return;
   const start = Math.max(0, fileSize - readSize);
@@ -13827,6 +14036,16 @@ async function catchUpCodexTurnState(tabId, filePath, fileSize) {
       (!inferred.timestamp || !state.lastEventTs || inferred.timestamp <= state.lastEventTs)
     ) {
       console.log('[CodexTurn] catch-up skipped tab=' + String(tabId).slice(-12) + ' inferred=' + inferred.event + ' inferredTs=' + (inferred.timestamp || 'n/a') + ' live=' + state.lastEventType + ' liveTs=' + (state.lastEventTs || 'n/a'));
+      return;
+    }
+
+    if (suppressBusy && inferred.busy) {
+      console.log('[CodexTurn] catch-up suppressed tab=' + String(tabId).slice(-12)
+        + ' event=' + inferred.event
+        + ' ts=' + (inferred.timestamp || 'n/a')
+        + ' reason=' + reason
+        + ' bytes=' + bytesRead
+        + ' start=' + start);
       return;
     }
 
@@ -13913,7 +14132,7 @@ async function scanCodexTurnAppend(tabId, reason = 'scan') {
   }
 }
 
-function startCodexTurnWatcher({ tabId, sessionId, filePath, catchUpPendingAudit = false }) {
+function startCodexTurnWatcher({ tabId, sessionId, filePath, catchUpPendingAudit = false, suppressBusyCatchUp = false, catchUpReason = 'start' }) {
   if (!tabId || !sessionId || !filePath) return false;
   const existing = codexTurnWatchers.get(tabId);
   if (existing?.sessionId === sessionId && existing?.filePath === filePath) return true;
@@ -13951,11 +14170,14 @@ function startCodexTurnWatcher({ tabId, sessionId, filePath, catchUpPendingAudit
     console.warn('[CodexTurn] fs.watch failed tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' error=' + e.message);
   }
   state.interval = setInterval(() => scanCodexTurnAppend(tabId, 'scan'), CODEX_WATCHER_SCAN_MS);
-  console.log('[CodexTurn] watcher started tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' file=' + filePath + ' offset=' + offset + ' fileSize=' + fileSize + ' catchUpPendingAudit=' + !!catchUpPendingAudit);
+  console.log('[CodexTurn] watcher started tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' file=' + filePath + ' offset=' + offset + ' fileSize=' + fileSize + ' catchUpPendingAudit=' + !!catchUpPendingAudit + ' suppressBusyCatchUp=' + !!suppressBusyCatchUp);
   if (offset === 0 && fileSize > 0 && catchUpPendingAudit && pendingCodexPasteAudit.has(tabId)) {
     setImmediate(() => scanCodexTurnAppend(tabId, 'pending-audit-catchup'));
   } else {
-    catchUpCodexTurnState(tabId, filePath, offset);
+    catchUpCodexTurnState(tabId, filePath, offset, {
+      suppressBusy: !!suppressBusyCatchUp,
+      reason: catchUpReason,
+    });
   }
   return true;
 }
@@ -14003,7 +14225,7 @@ function getCodexWatcherExcludedSessionIds(tabId, sourceSessionId = null) {
   return Array.from(ids);
 }
 
-async function ensureCodexTurnWatcher(tabId, sessionId, cwd) {
+async function ensureCodexTurnWatcher(tabId, sessionId, cwd, options = {}) {
   const existing = codexTurnWatchers.get(tabId);
   if (existing && (!sessionId || existing.sessionId === sessionId)) return true;
   const resolvedSessionId = sessionId || codexSessionIdFromDb(tabId);
@@ -14017,7 +14239,13 @@ async function ensureCodexTurnWatcher(tabId, sessionId, cwd) {
       console.warn('[CodexTurn] session file not found tab=' + String(tabId).slice(-12) + ' session=' + resolvedSessionId);
       return false;
     }
-    return startCodexTurnWatcher({ tabId, sessionId: resolvedSessionId, filePath: found.filePath });
+    return startCodexTurnWatcher({
+      tabId,
+      sessionId: resolvedSessionId,
+      filePath: found.filePath,
+      suppressBusyCatchUp: !!options.suppressBusyCatchUp,
+      catchUpReason: options.catchUpReason || 'ensure',
+    });
   } catch (e) {
     console.warn('[CodexTurn] ensure failed tab=' + String(tabId).slice(-12) + ' error=' + e.message);
     return false;
@@ -14207,8 +14435,14 @@ function inspectCodexCwdChooser(cleanText) {
   const squashed = compact.replace(/[^a-z0-9]+/g, '');
   const hasPhrase = (phrase) => squashed.includes(String(phrase).toLowerCase().replace(/[^a-z0-9]+/g, ''));
   const hasAny = (phrases) => phrases.some(hasPhrase);
-  const firstOptionSelected = /[›❯>]\s*1\.\s*Use\s+session\s+directory/i.test(text);
-  const secondOptionSelected = /[›❯>]\s*2\.\s*Use\s+current\s+directory/i.test(text);
+  const firstOptionPattern = /[›❯>]\s*1\.?\s*Use\s+session\s+directory/i;
+  const secondOptionPattern = /[›❯>]\s*2\.?\s*Use\s+c\s*u?\s*rrent\s+directory/i;
+  const firstOptionSelected = firstOptionPattern.test(text);
+  const secondOptionSelected = secondOptionPattern.test(text);
+  const sessionOptionVisible = hasPhrase('use session directory') || /1\.?\s*Use\s+session\s+directory/i.test(text);
+  const currentOptionVisible = hasPhrase('use current directory')
+    || /2\.?\s*Use\s+c\s*u?\s*rrent\s+directory/i.test(text)
+    || (hasPhrase('current your current working directory') && /\b2\.?\s*Use\b/i.test(text));
   const checks = {
     chooserTitle: hasAny(['directory to resume this session', 'directory to fork this session']),
     sessionLine: hasAny([
@@ -14216,25 +14450,29 @@ function inspectCodexCwdChooser(cleanText) {
       'session latest cwd recorded in the forked session',
     ]),
     currentLine: hasPhrase('current your current working directory'),
-    sessionOption: hasPhrase('use session directory'),
-    currentOption: hasPhrase('use current directory'),
+    sessionOption: sessionOptionVisible,
+    currentOption: currentOptionVisible,
     continueHint: hasPhrase('press enter to continue'),
   };
   const missing = Object.entries(checks)
     .filter(([, ok]) => !ok)
     .map(([key]) => key);
-  const visible = checks.chooserTitle || (checks.sessionOption && checks.currentOption && checks.continueHint);
+  const visible = checks.chooserTitle || (checks.sessionOption && (checks.currentOption || checks.currentLine));
   const action = hasPhrase('directory to fork this session') ? 'fork'
     : hasPhrase('directory to resume this session') ? 'resume'
       : 'unknown';
   const sessionDescriptor = hasPhrase('session latest cwd recorded in the forked session') ? 'forked'
     : hasPhrase('session latest cwd recorded in the resumed session') ? 'resumed'
       : 'unknown';
-  const canAutoEnter = visible && missing.length === 0 && firstOptionSelected && !secondOptionSelected;
+  const safeDefaultSelected = firstOptionSelected
+    && !secondOptionSelected
+    && checks.sessionOption
+    && (checks.currentOption || checks.currentLine || checks.continueHint);
+  const canAutoEnter = visible && safeDefaultSelected;
   let skipReason = null;
-  if (visible && missing.length > 0) skipReason = 'missing:' + missing.join(',');
-  else if (visible && secondOptionSelected) skipReason = 'current-directory-selected';
+  if (visible && secondOptionSelected) skipReason = 'current-directory-selected';
   else if (visible && !firstOptionSelected) skipReason = 'session-directory-not-selected';
+  else if (visible && !safeDefaultSelected && missing.length > 0) skipReason = 'missing:' + missing.join(',');
   return {
     visible,
     canAutoEnter,
@@ -15407,7 +15645,10 @@ ipcMain.on('codex:run-command', async (event, { tabId, command, sessionId, cwd, 
     closeCodexWatcher(tabId, 'resume-known-session');
     setCodexKnownSession(tabId, sessionId, 'resume-known-session');
     event.sender.send('codex:session-detected', { tabId, sessionId });
-    ensureCodexTurnWatcher(tabId, sessionId, termCwd);
+    ensureCodexTurnWatcher(tabId, sessionId, termCwd, {
+      suppressBusyCatchUp: true,
+      catchUpReason: 'codex-c-resume',
+    });
   } else if (command === 'codex-f' && sessionId) {
     startCodexSessionWatcher(event.sender, { tabId, cwd: termCwd, startedAt, sourceSessionId: sessionId });
     console.log('[Codex Runner] Fork source session provided; waiting for watcher to capture the new fork session id');
@@ -15441,7 +15682,8 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
     ? (source.startsWith('codex-') ? source : 'codex-' + source)
     : (shouldQueue ? 'codex-history-queue' : 'codex-history-send');
   const statusAtSend = options && typeof options.statusAtSend === 'string' ? options.statusAtSend : null;
-  console.log('[codex:send-command] Received: tabId=' + tabId + ' queue=' + shouldQueue + ' statusAtSend=' + (statusAtSend || '-') + ' handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' resolvedSource=' + codexSource + ' command="' + command + '"');
+  const skipVisibleDraftGuard = !!(options && options.skipVisibleDraftGuard === true);
+  console.log('[codex:send-command] Received: tabId=' + tabId + ' queue=' + shouldQueue + ' statusAtSend=' + (statusAtSend || '-') + ' handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' resolvedSource=' + codexSource + ' skipVisibleDraftGuard=' + skipVisibleDraftGuard + ' command="' + command + '"');
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no_terminal' };
   const candidates = await findAiDescendantProcessesByTab(tabId, 'codex');
@@ -15467,7 +15709,7 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
       skipRenderWait: !shouldQueue,
       awaitCodexUserMessageAudit: !shouldQueue,
       codexAuditTimeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
-      verifyCodexVisibleDraftBeforeSubmit: !shouldQueue,
+      verifyCodexVisibleDraftBeforeSubmit: !shouldQueue && !skipVisibleDraftGuard,
       logPrefix: '[codex:send-command:' + tabId + ']',
     });
     if (result && typeof result === 'object') {

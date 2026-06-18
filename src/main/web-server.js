@@ -1,7 +1,7 @@
-// Mobile-web bridge: exposes Noted Terminal's SDK tabs over HTTP+WS so the
-// user can drive Claude SDK sessions from a phone browser. Backend runs in
-// Electron main; frontend (mobile-web/) is a separate Vite app served as static
-// files from this server. Authentication: single bearer token in
+// Mobile/web bridge: exposes Noted Terminal's project terminal tabs over
+// HTTP+SSE/WS so a phone or external client can drive Claude/Codex PTY sessions.
+// Backend runs in Electron main; frontend (mobile-web/) is a separate Vite app
+// served as static files from this server. Authentication: single bearer token in
 // ~/.noted-terminal/web-token.txt, regenerated only if missing.
 //
 // What's exposed:
@@ -9,11 +9,12 @@
 //   GET  /api/agent-models                        → { codex:[…], claude:[…] } model catalog
 //   GET  /api/projects                            → all projects from DB
 //   GET  /api/projects/:projectId/tabs            → tabs of one project (DB)
-//   POST /api/projects/:projectId/sdk-tabs        → ask renderer to create SDK tab
-//   POST /api/sdk-tabs/:tabId/send                → send prompt to SDK
-//   POST /api/sdk-tabs/:tabId/stop                → stop SDK stream
-//   GET  /api/sdk-tabs/:tabId/history             → load JSONL session history
-//   WS   /ws?token=...&tabId=...                  → live SDK message stream
+//   POST /api/projects/:projectId/agent-tabs       → create Claude/Codex terminal tab
+//   POST /api/projects/:projectId/sdk-tabs         → legacy Claude SDK tab creation
+//   POST /api/terminal-tabs/:tabId/send            → send prompt through scenario layer
+//   POST /api/terminal-tabs/:tabId/stop            → stop terminal runtime
+//   GET  /api/terminal-tabs/:tabId/history         → load JSONL/rollout session history
+//   GET  /api/events?token=...&tabId=...           → live terminal event stream
 //
 // WS protocol — server → client:
 //   { type:'snapshot',  tabId, messages, sessionId, busy }     (on subscribe)
@@ -25,10 +26,11 @@
 //   { type:'question-cancelled', tabId, source }               (question answered/aborted)
 //
 // State source: tabs come from SQLite (works for ALL projects, even closed),
-// because renderer's openProjects map only has currently-open ones. Live SDK
-// session metadata (sessionId, busy) comes from main's sdkSessions Map. SDK
-// tab creation needs the renderer (so the tab actually appears in the UI), so
-// we use a request/reply IPC bridge.
+// because renderer's openProjects map only has currently-open ones. Terminal
+// runtime state comes from the renderer/main scenario layer; legacy SDK session
+// metadata still comes from main's sdkSessions Map. Tab creation needs the
+// renderer (so the tab actually appears in the UI), so we use a request/reply
+// IPC bridge.
 //
 // Important: the WS protocol forwards the same payloads main already sends to
 // the local renderer via webContents.send('claude-sdk:message' / 'busy-state').
@@ -241,7 +243,7 @@ function scheduleExternalRunStop(run, reason = 'auto-stop') {
     try {
       run.status = 'stopping';
       setExternalRunMeta(run.tabId, { status: 'stopping', autoStopAt: null, autoStopMs });
-      await bridgeRequest('stopClaudeTab', { tabId: run.tabId }, 5000);
+      await runAgentStopScenario(run.tabId, 5000);
       run.status = 'stopped';
       run.stoppedAt = Date.now();
       setExternalRunMeta(run.tabId, { status: 'stopped', autoStopAt: null, autoStopMs, stoppedAt: run.stoppedAt, stopReason: reason });
@@ -426,6 +428,69 @@ function sendSendFailure(res, data, extra = {}) {
     ...extra,
     ...(data || {}),
   });
+}
+
+async function runAgentSendScenario({
+  tabId,
+  prompt,
+  model,
+  effort,
+  thinking,
+  cwd,
+  handoffId,
+  source,
+  statusAtSend,
+  queue,
+  ownership,
+  timeoutMs = 60_000,
+}) {
+  return await bridgeRequest('sendAgentPromptScenario', {
+    tabId,
+    prompt,
+    model,
+    effort,
+    thinking,
+    cwd,
+    handoffId,
+    source,
+    statusAtSend,
+    queue: queue === true,
+    // Project/History/iOS controls the terminal tab directly: leave a found
+    // terminal draft untouched and report conflict. External Inbox owns its
+    // own chat composer: atomically pull terminal draft out for caller rollback.
+    returnDraftOnConflict: ownership === 'external',
+  }, timeoutMs);
+}
+
+async function runAgentStopScenario(tabId, timeoutMs = 5000) {
+  return await bridgeRequest('stopAgentProcessScenario', { tabId }, timeoutMs);
+}
+
+async function runAgentInterruptScenario(tabId, timeoutMs = 2000) {
+  return await bridgeRequest('interruptAgentTurnScenario', { tabId }, timeoutMs);
+}
+
+async function runAgentGrabDraftScenario(tabId, timeoutMs = 5000) {
+  return await bridgeRequest('grabAgentDraftScenario', { tabId }, timeoutMs);
+}
+
+async function runAgentInspectDraftScenario(tabId, timeoutMs = 5000) {
+  return await bridgeRequest('inspectAgentDraftScenario', { tabId }, timeoutMs);
+}
+
+async function runAgentRewindScenario(tabId, payload, timeoutMs) {
+  return await bridgeRequest('rewindAgentTimelineScenario', { tabId, ...payload }, timeoutMs);
+}
+
+async function runAgentAnswerQuestionScenario(payload) {
+  if (!answerClaudeQuestion) {
+    return { success: false, error: 'answer handler not wired' };
+  }
+  return await answerClaudeQuestion(payload);
+}
+
+function getAgentPendingQuestionScenario(tabId) {
+  return getClaudePendingQuestion ? getClaudePendingQuestion(tabId) : null;
 }
 
 function mobileTimelineColor(kind) {
@@ -1290,10 +1355,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
-  // Send prompt to SDK tab — invokes the same handler the desktop UI uses.
-  // For PTY+Claude tabs (commandType==='claude') routes through safePasteAndSubmit
-  // instead. Mobile uses the same URL for both; routing is by tab type.
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/send$/);
+  // Send prompt to a project terminal tab. The scenario layer owns draft
+  // preflight, busy/send-during-streaming and stopped-session readiness. Legacy
+  // SDK tabs can still be routed by tab type, but the public endpoint is
+  // terminal-tabs because Claude/Codex PTY is the main API surface.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/send$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
     try {
@@ -1303,9 +1369,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
       // Single bridge round-trip — renderer dispatches by tab.tabType/commandType.
       // Earlier this endpoint did TWO round-trips (status check + send), adding
       // ~50ms per phone send on top of the actual PTY paste latency.
-      const data = await bridgeRequest('sendMessageAuto', {
+      const data = await runAgentSendScenario({
         tabId, prompt, model, effort, thinking, cwd,
         handoffId, source, statusAtSend, queue: queue === true,
+        ownership: 'project',
       });
       if (isSendFailure(data)) return sendSendFailure(res, data, { tabId });
       return sendJson(res, 200, {
@@ -1429,7 +1496,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       run.status = 'sending';
       run.sessionId = sessionId;
       setExternalRunMeta(tabId, { status: 'sending', sessionId, autoStopAt: null, autoCloseAt: null });
-      const sendResult = await bridgeRequest('sendMessageAuto', {
+      const sendResult = await runAgentSendScenario({
         tabId,
         prompt,
         model: cleanOptionalString(body.model, ''),
@@ -1437,8 +1504,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         source: 'external:' + source,
         statusAtSend: status?.status || 'active',
         queue: body.queue === true,
-        returnDraftOnConflict: true,
-      }, 60_000);
+        ownership: 'external',
+        timeoutMs: 60_000,
+      });
       if (isSendFailure(sendResult)) {
         const failureCode = sendResult?.code || 'send_failed';
         run.status = failureCode === 'terminal_draft_conflict' ? 'draft_conflict' : 'send_failed';
@@ -1477,7 +1545,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       clearExternalRunTimer(run, 'stopTimer');
       run.status = 'stopping';
       setExternalRunMeta(run.tabId, { status: 'stopping', autoStopAt: null });
-      const data = await bridgeRequest('stopClaudeTab', { tabId: run.tabId }, 5000);
+      const data = await runAgentStopScenario(run.tabId, 5000);
       run.status = 'stopped';
       run.stoppedAt = Date.now();
       setExternalRunMeta(run.tabId, { status: 'stopped', stoppedAt: run.stoppedAt, autoStopAt: null, stopReason: 'api' });
@@ -1501,20 +1569,54 @@ async function handleApi(req, res, parsed, sdkSessions) {
   }
 
   // Resume inactive Claude session (PTY tab whose `claude` process exited).
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/resume$/);
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/resume$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
     try {
-      const data = await bridgeRequest('resumeClaudeTab', { tabId });
-      return sendJson(res, 200, data);
+      const body = await readBody(req);
+      const startupTimeoutMs = Math.max(1000, Math.min(45_000, Number(body.startupTimeoutMs) || 30_000));
+      let data;
+      try {
+        data = await bridgeRequest('resumeClaudeTab', { tabId }, Math.max(5000, Math.min(15_000, startupTimeoutMs)));
+      } catch (bridgeErr) {
+        return sendJson(res, 409, {
+          ok: false,
+          success: false,
+          ready: false,
+          error: String(bridgeErr.message || bridgeErr),
+        });
+      }
+      if (data?.success === false || data?.ok === false) {
+        return sendJson(res, 409, { ...(data || {}), ok: false, success: false, ready: false });
+      }
+      try {
+        const status = await waitForAgentReady(tabId, startupTimeoutMs);
+        return sendJson(res, 200, {
+          ok: true,
+          success: true,
+          ready: true,
+          ...(data || {}),
+          status: status?.status || 'active',
+          inputReady: status?.inputReady === true,
+        });
+      } catch (readyErr) {
+        return sendJson(res, 504, {
+          ...(data || {}),
+          ok: false,
+          success: false,
+          ready: false,
+          error: String(readyErr.message || readyErr),
+          status: readyErr.status || null,
+        });
+      }
     } catch (e) {
-      return sendJson(res, 500, { error: String(e.message) });
+      return sendJson(res, 500, { ok: false, success: false, ready: false, error: String(e.message) });
     }
   }
 
   // Status snapshot for a PTY+Claude tab: active | busy | inactive.
   // Mobile polls this on chat-open to decide Resume-banner visibility.
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/status$/);
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/status$/);
   if (m && req.method === 'GET') {
     const tabId = decId(m[1]);
     const started = Date.now();
@@ -1539,7 +1641,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // ipcMain handler the desktop UI uses. After 200 OK the caller sends the new
   // prompt via /send (with original or edited text) and Claude resumes off the
   // truncated tip.
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/truncate$/);
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/truncate$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
     try {
@@ -1555,7 +1657,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
   // Rename tab (delegates to renderer store via bridge — only works for tabs
   // currently OPEN in the desktop). Returns 409 if the tab isn't open.
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/rename$/);
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/rename$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
     try {
@@ -1569,7 +1671,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/status$/);
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/status$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
     try {
@@ -1583,7 +1685,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
   // Close tab (delegates to renderer store — same constraint as rename:
   // closed-only-when-open).
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/close$/);
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/close$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
     try {
@@ -1612,8 +1714,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
-  // Stop SDK stream OR shut down PTY+Claude session (Ctrl+C Ctrl+C Ctrl+D).
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/stop$/);
+  // Stop terminal runtime (or legacy SDK stream when the tab is still SDK).
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/stop$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
     const session = sdkSessions.get(tabId);
@@ -1622,20 +1724,20 @@ async function handleApi(req, res, parsed, sdkSessions) {
       sdkSessions.delete(tabId);
       return sendJson(res, 200, { stopped: true });
     }
-    // Not an SDK tab — maybe it's PTY+Claude. Try stop via bridge.
+    // Normal path: Claude/Codex terminal tab. Try stop via scenario bridge.
     try {
-      const data = await bridgeRequest('stopClaudeTab', { tabId }, 2000);
+      const data = await runAgentStopScenario(tabId, 2000);
       return sendJson(res, 200, { stopped: true, ...data });
     } catch (e) {
       return sendJson(res, 200, { stopped: false, reason: 'no active session' });
     }
   }
 
-  // SOFT interrupt the CURRENT TURN (composer Stop button). SDK → query.close()
-  // (process stays warm). PTY+Claude → single Esc into the TUI via bridge —
-  // Claude stops generating, stays alive at the prompt. Distinct from /stop,
-  // which SIGTERMs the PTY-Claude process. See fact-mobile-claude-pty.md.
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/interrupt$/);
+  // SOFT interrupt the CURRENT TURN (composer Stop button). Claude/Codex PTY
+  // goes through the terminal scenario layer; legacy SDK still uses query.close()
+  // as a warm interrupt. Distinct from /stop, which kills the terminal process.
+  // See fact-mobile-claude-pty.md.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/interrupt$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
     const session = sdkSessions.get(tabId);
@@ -1647,7 +1749,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       return sendJson(res, 200, { interrupted: true, kind: 'sdk' });
     }
     try {
-      const data = await bridgeRequest('interruptClaudeTurn', { tabId }, 2000);
+      const data = await runAgentInterruptScenario(tabId, 2000);
       return sendJson(res, 200, { interrupted: true, kind: 'pty', ...data });
     } catch (e) {
       return sendJson(res, 200, { interrupted: false, reason: 'no active session' });
@@ -1657,11 +1759,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // Read the current terminal composer draft after a deterministic interrupt.
   // Mobile uses the same bridge action as desktop History instead of keeping a
   // local "last sent prompt" fallback.
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/draft$/);
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/draft$/);
   if (m && (req.method === 'GET' || req.method === 'POST')) {
     const tabId = decId(m[1]);
     try {
-      const data = await bridgeRequest('grabAgentDraft', { tabId }, 5000);
+      const data = await runAgentGrabDraftScenario(tabId, 5000);
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });
@@ -1672,11 +1774,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // send: an empty dim-placeholder must not go through Ctrl+G/grab because that
   // changes TUI state. Claude currently has no visual probe, so the renderer
   // returns hasDraft:null and callers can fall back to the established grab path.
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/draft-state$/);
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/draft-state$/);
   if (m && req.method === 'GET') {
     const tabId = decId(m[1]);
     try {
-      const data = await bridgeRequest('inspectAgentDraft', { tabId }, 5000);
+      const data = await runAgentInspectDraftScenario(tabId, 5000);
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });
@@ -1685,14 +1787,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
   // Native timeline rewind/backtrack for PTY Claude/Codex. The renderer routes
   // by live tab tool type to the same IPC handlers desktop Timeline uses.
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/rewind$/);
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/rewind$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
     try {
       const body = await readBody(req);
       const mode = body.mode === 'ai' ? 'ai' : 'native';
-      const data = await bridgeRequest('rewindAgentTimeline', {
-        tabId,
+      const data = await runAgentRewindScenario(tabId, {
         targetIndex: body.targetIndex,
         targetText: body.targetText,
         targetFullText: body.targetFullText,
@@ -1713,13 +1814,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
   //   { source:'pty'|'sdk', toolUseID, answers:{[questionText]:label|labels}, stop? }
   // Routes to main's answerClaudeQuestion (PTY → drive TUI keystrokes, SDK →
   // resolve the parked canUseTool Promise). No bridge — these run in main directly.
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/answer-question$/);
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/answer-question$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
-    if (!answerClaudeQuestion) return sendJson(res, 500, { error: 'answer handler not wired' });
     try {
       const body = await readBody(req);
-      const result = await answerClaudeQuestion({
+      const result = await runAgentAnswerQuestionScenario({
         tabId,
         source: body.source || 'pty',
         toolUseID: body.toolUseID,
@@ -1734,15 +1834,15 @@ async function handleApi(req, res, parsed, sdkSessions) {
   }
   // Current pending question for a tab (mobile fetches on mount in case it
   // connected mid-question and the ask-question broadcast already fired).
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/pending-question$/);
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/pending-question$/);
   if (m && req.method === 'GET') {
     const tabId = decId(m[1]);
-    const q = getClaudePendingQuestion ? getClaudePendingQuestion(tabId) : null;
+    const q = getAgentPendingQuestionScenario(tabId);
     return sendJson(res, 200, { pendingQuestion: q });
   }
 
   // SDK params (model/effort/thinking) for a tab — read & update.
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/params$/);
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/params$/);
   if (m && req.method === 'GET') {
     try {
       const data = await bridgeRequest('getSDKParams', { tabId: decId(m[1]) });
@@ -1762,7 +1862,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // does the firing. GET returns { queue, aiTabs }; POST body { op, args } maps
   // 1:1 to a store method (see App.tsx::mutatePromptQueue). Live deltas arrive
   // separately via the `queue-update` SSE event.
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/queue$/);
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/queue$/);
   if (m && req.method === 'GET') {
     try {
       const data = await bridgeRequest('getPromptQueue', { tabId: decId(m[1]) });
@@ -1780,7 +1880,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // Timeline entries for a tab (any tab — SDK or terminal — as long as it has
   // a Claude session). Goes through bridgeRequest → renderer reads tab.cwd +
   // claudeSessionId from the live store, then we call the IPC directly here.
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/timeline$/);
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/timeline$/);
   if (m && req.method === 'GET') {
     const tabId = decId(m[1]);
     const t0 = Date.now();
@@ -1857,7 +1957,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   //    backfill). Combined with phase 1 `?last=200` → phase 2 `?before=<firstTailUuid>`,
   //    the cold-open paint flow is: tail in 1s, prefix streams in behind it.
   // - `?last=N` returns the last N messages.
-  m = parsed.pathname.match(/^\/api\/sdk-tabs\/([^/]+)\/history$/);
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/history$/);
   if (m && req.method === 'GET') {
     const tabId = decId(m[1]);
     const t0 = Date.now();

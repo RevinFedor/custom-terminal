@@ -49,7 +49,9 @@ Noted Terminal запускает настоящие локальные AI CLI �
 
 Ключевая архитектурная философия: внешний клиент владеет своим UI и пользовательским transcript, а Noted Terminal владеет живым terminal runtime. Например, Voice Record может показать Codex как provider в обычном чате, но Codex-процесс, session id, rollout, Timeline/History, readiness и Stop/Continue живут в Noted Terminal Inbox. HTTP/SSE слой здесь не заменяет терминал SDK-обёрткой, а даёт control-plane над настоящей PTY-сессией. Поэтому completion для внешних клиентов — это событие `done` от Noted Terminal, а не локальная догадка по `busy:false` или таймеру.
 
-Из этого следует граница для будущих Rewind/streaming-доработок: terminal core меняется один раз, а поверхности только вызывают его. History и iOS остаются клиентами real project/tab API (`/api/sdk-tabs/:tabId/...`), потому что управляют конкретной вкладкой проекта. Inbox (`/api/inbox/runs`) нужен внешнему продукту, который владеет своим чатом и использует Noted Terminal как runtime-provider; он не заменяет mobile/project API. Если Inbox когда-нибудь получит Rewind, он должен вызвать тот же core-механизм и перевести результат в семантику внешнего чата, а не заводить второй Rewind.
+Из этого следует граница для будущих Rewind/streaming-доработок: terminal core меняется один раз, а поверхности только вызывают его. History и iOS остаются клиентами real project/tab API (`/api/terminal-tabs/:tabId/...`), потому что управляют конкретной вкладкой проекта. Inbox (`/api/inbox/runs`) нужен внешнему продукту, который владеет своим чатом и использует Noted Terminal как runtime-provider; он не заменяет mobile/project API. Если Inbox когда-нибудь получит Rewind, он должен вызвать тот же core-механизм и перевести результат в семантику внешнего чата, а не заводить второй Rewind.
+
+`/api/terminal-tabs/*` — canonical имя Project Terminal API для Claude/Codex PTY-вкладок. Старое `sdk-tabs` больше не используется для terminal-control; оставшиеся `/api/projects/:id/sdk-tabs` и `/api/inbox/sdk-tabs` относятся только к legacy Claude SDK tab creation.
 
 Подробнее по продуктовой рамке:
 
@@ -130,15 +132,15 @@ POST /api/inbox/runs                   # external Codex run in system Inbox
 POST /api/inbox/runs/:runId/stop
 GET  /api/projects/:id/tabs
 POST /api/projects/:id/agent-tabs        { toolType: "claude" | "codex" }
-POST /api/sdk-tabs/:tabId/send
-POST /api/sdk-tabs/:tabId/interrupt
-POST /api/sdk-tabs/:tabId/stop
-POST /api/sdk-tabs/:tabId/resume
-GET  /api/sdk-tabs/:tabId/status
-GET  /api/sdk-tabs/:tabId/history
-GET  /api/sdk-tabs/:tabId/timeline
-GET  /api/sdk-tabs/:tabId/params
-POST /api/sdk-tabs/:tabId/params
+POST /api/terminal-tabs/:tabId/send
+POST /api/terminal-tabs/:tabId/interrupt
+POST /api/terminal-tabs/:tabId/stop
+POST /api/terminal-tabs/:tabId/resume
+GET  /api/terminal-tabs/:tabId/status
+GET  /api/terminal-tabs/:tabId/history
+GET  /api/terminal-tabs/:tabId/timeline
+GET  /api/terminal-tabs/:tabId/params
+POST /api/terminal-tabs/:tabId/params
 GET  /api/events?token=&tabId=           # SSE live channel
 ```
 

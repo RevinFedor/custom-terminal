@@ -1,6 +1,8 @@
-# Fact: Mobile Web Access
+# Fact: Mobile / Project Terminal API
 
-Параллельный режим работы с SDK-табами через мобильный браузер. Сервер живёт в main process Electron (port 7878), фронт — отдельный мини-Vite SPA в `mobile-web/`, отдаётся как статика. Авторизация — bearer token в `~/.noted-terminal/web-token.txt`. Со смартфона можно создавать SDK-чаты, отправлять промпты, видеть стрим в реальном времени параллельно с десктопом.
+Этот файл про **общий REST/SSE contract Project Terminal API**, а не про актуальный React-клиент. `mobile-web/` — legacy SPA и сейчас не используется как пользовательский iOS-клиент; production iOS surface — нативный Habit Tracker Terminal mode (`/Users/fedor/Desktop/vs-code/habit-tracker`). Название файла историческое: здесь остаются серверные endpoint'ы, bridge-инварианты и legacy-шрамы, потому что ими пользуются и старый web-клиент, и native iOS.
+
+Параллельный режим работы с проектными terminal-вкладками через native iOS и старый mobile-web. Сервер живёт в main process Electron (port 7878), canonical REST для Claude/Codex PTY — `/api/terminal-tabs/:tabId/*`. Старые `/api/projects/:id/sdk-tabs` и `/api/inbox/sdk-tabs` относятся только к созданию legacy Claude SDK tab; они не являются именем Project Terminal API.
 
 ## Почему НЕ cloud-хостинг
 
@@ -11,14 +13,16 @@
 Часть REST-эндпоинтов требует **живого renderer state** (Zustand store с открытыми проектами и табами). Main не имеет доступа к store напрямую. Решение — request/reply IPC bridge:
 
 1. Main: `bridgeRequest(action, payload, timeoutMs=5000)` спавнит `requestId`, шлёт `web:bridge-request` в renderer, ждёт ответа на `web:bridge-reply` с тем же id.
-2. Renderer: один listener в `App.tsx` диспатчит по action — `getOpenProjectIds`, `createSDKTab`, `sendSDKMessage`, `loadSDKHistory`, `forkToSDK`, `closeTab`, `renameTab`, `renameProject` (мобильный rename проекта → `useProjectsStore.updateProject{name}`), `getSDKParams`, `setSDKParams`, `getTabSessionInfo`, `getAppSettings`, `setAppSettings`. Расширение для PTY+Claude/Codex: `createClaudeTab` (legacy wrapper), `createAgentTab` (generic PTY agent), `resumeClaudeTab`, `stopClaudeTab`, `interruptClaudeTurn` (soft interrupt текущего turn'а), `grabAgentDraft` (authoritative чтение TUI composer после interrupt), `sendMessageAuto` (единая точка `/send` — сам роутит SDK vs PTY), `getClaudeTabStatus`, `getClaudeTabStatusBatch`, `getProjectTabsLive` (отдаёт `sessionStatus`, project `icon`, `statusMarker`). Детали — `fact-mobile-claude-pty.md`.
+2. Renderer: один listener в `App.tsx` диспатчит по action — `getOpenProjectIds`, `createSDKTab`, `sendSDKMessage`, `loadSDKHistory`, `forkToSDK`, `closeTab`, `renameTab`, `renameProject` (мобильный rename проекта → `useProjectsStore.updateProject{name}`), `getSDKParams`, `setSDKParams`, `getTabSessionInfo`, `getAppSettings`, `setAppSettings`. Расширение для PTY+Claude/Codex: `createClaudeTab` (legacy wrapper), `createAgentTab` (generic PTY agent), `resumeClaudeTab`, scenario-actions `sendAgentPromptScenario` / `stopAgentProcessScenario` / `interruptAgentTurnScenario` / `grabAgentDraftScenario` / `inspectAgentDraftScenario` / `rewindAgentTimelineScenario` с legacy aliases (`sendMessageAuto`, `stopClaudeTab`, `interruptClaudeTurn`, `grabAgentDraft`, `inspectAgentDraft`, `rewindAgentTimeline`), `getClaudeTabStatus`, `getClaudeTabStatusBatch`, `getProjectTabsLive` (отдаёт `sessionStatus`, project `icon`, `statusMarker`). Детали — `fact-mobile-claude-pty.md`.
 3. На таймауте promise rejected — endpoint возвращает 409.
 
 **Критично:** bridge нужен ТОЛЬКО для actions, требующих store. Чисто-серверные operations (timeline parse через `parseTimelineEntries`, projects list из SQLite через `projectManager.db.getAllProjects()`) идут напрямую без bridge — это и быстрее, и работает даже если renderer mounted с задержкой.
 
+Слой terminal primitives остаётся ниже API: нажать клавишу, вставить текст, остановить процесс, прочитать TUI draft/JSONL. Project API (`/api/terminal-tabs/:tabId/*`), History/iOS и Inbox API не должны заново собирать send-during-streaming, stopped-session rewind или draft-conflict из этих примитивов; web-server вызывает scenario-action, а тот уже доказывает readiness, решает ownership draft и ждёт durable terminal signal. Это защищает будущий iOS/History переход: при смене парсинга xterm/PTY или момента JSONL-audit внешний контракт меняется только если меняются сами статусы/поля API, а не из-за внутренней механики отправки.
+
 ## Synthetic user-message broadcast
 
-Когда mobile шлёт `POST /api/sdk-tabs/:id/send` → main вызывает `sdkStartQuery`. Реальная user-запись в JSONL появляется **позже**, когда Claude Code SDK дойдёт до неё в потоке. Phone не должен ждать — bubble должен появиться мгновенно.
+Когда mobile шлёт `POST /api/terminal-tabs/:id/send`, main вызывает `sendAgentPromptScenario`. Для Claude/Codex PTY реальная user-запись в JSONL/rollout появляется **позже**, когда terminal runtime durable-примет prompt; для legacy SDK это всё ещё может пройти через `sdkStartQuery`. Phone не должен ждать durable-запись, чтобы показать локальный handoff, но durable JSONL/rollout остаётся источником истины для замены optimistic bubble.
 
 Решение: при старте query main **сам** бродкастит synthetic message всем WS-подписчикам tabId:
 ```js
@@ -36,6 +40,10 @@ _webBroadcast(tabId, {
 **Edge case:** когда отправка пришла **с phone**, десктоп `onNew` не вызвался. Renderer-bridge handler перед `claude-sdk:send-message` диспатчит CustomEvent `claude-sdk:external-prompt` — ClaudeSDKTab слушает и пушит свой user-bubble в локальный `setMessages`. Без этого десктоп показывал ответ Claude но не сам запрос.
 
 **Mobile-side guard:** phone reducer **игнорирует** `__webSynthetic: true` входящие messages — иначе на phone был бы дубль user-bubble (synthetic + real-record когда дойдёт). Phone получает мгновенный feedback через **локальный optimistic push** в `send()` — `reducer.apply({type:'user', message:..., __pendingLocal: true})` сразу. Когда real-record прилетит из WS, dedupe-функция `adoptOrPush` в reducer находит последний user-bubble без uuid с тем же текстом и **adopt'ит** real uuid в существующую entry, не создаёт новую.
+
+Тот же инвариант теперь обязателен для History и native iOS: локальная user-row появляется **до** ожидания `sendAgentPromptScenario`/JSONL audit со статусом `sending`, после принятия API может стать `sent/queued`, а durable JSONL/rollout row только adopt'ит её. Tool/MCP/thinking entries — это metadata следующего agent turn'а, не delivery feedback для пользовательского prompt'а. Пользовательский симптом нарушенного handoff'а: после Send первым видимым элементом становится `MCP`/`thinking`, а своего сообщения со статусом `sending` нет.
+
+Если между локальным `sending` и durable row приходит canonical `/history` reload, клиент обязан смерджить pending handoff обратно в publish. Иначе heavy reload стирает optimistic user-row, и UI выглядит так, будто prompt исчез или заменился tool-событием. Source of truth всё равно durable transcript: локальный handoff живёт только до matching user entry / failed / cancelled.
 
 ## History loader: НЕ getSessionMessages
 
@@ -129,7 +137,7 @@ PTY-Claude и PTY-Codex табы). Четыре неочевидных факт�
 
 ## Native clients share the REST/SSE contract
 
-`mobile-web` больше не единственный потребитель этого сервера. Нативный iOS-клиент Habit Tracker (`fact-voice-chat-tab.md::Terminal mode`) ходит в те же REST/SSE endpoints и рисует Terminal сам на SwiftUI. Это не вторая модель terminal-control: source of truth остаётся в custom-terminal renderer/main, а native app только отображает снапшоты и шлёт команды.
+`mobile-web` больше не основной потребитель этого сервера. Нативный iOS-клиент Habit Tracker (`fact-voice-chat-tab.md::Terminal mode`) ходит в те же REST/SSE endpoints и рисует Terminal сам на SwiftUI; React `mobile-web/` оставлен только как legacy/debug surface и не является целевым клиентом. Это не вторая модель terminal-control: source of truth остаётся в custom-terminal renderer/main, а native app только отображает снапшоты и шлёт команды.
 
 App-level settings тоже принадлежат desktop app-state, а не каждому клиенту отдельно. Mobile-web settings sheet читает/пишет `streamerMode` через `/api/app-settings` → renderer bridge `getAppSettings/setAppSettings`; это тот же флаг, который скрывает desktop remote URL chip. Клиент может иметь локальный redaction fallback для собственного host-label, но если он управляет Noted Terminal state, запись должна идти в desktop app-state, иначе phone и desktop начнут расходиться: на телефоне включён privacy, а desktop продолжает светить URL в stream.
 
@@ -235,26 +243,26 @@ POST /api/projects/:id/rename                  → renameProject (через bri
 GET  /api/projects/:id/tabs                    → tabs + groups + statuses + timelineCount + live state + statusMarker/processBar/contextPct
 POST /api/inbox/sdk-tabs                       → createSDKTab в system Inbox, без projectId у клиента
 POST /api/projects/:id/sdk-tabs                → createSDKTab (через bridge)
-POST /api/sdk-tabs/:tabId/send                 → sendSDKMessage + dispatch external-prompt
-POST /api/sdk-tabs/:tabId/stop                 → query.close()
-POST /api/sdk-tabs/:tabId/close                → closeTab (через bridge, body {aiBusy?})
-POST /api/sdk-tabs/:tabId/rename               → renameTab (через bridge)
-POST /api/sdk-tabs/:tabId/fork-to-sdk          → forkToSDK (через bridge → fork-from-session)
-POST /api/tabs/:tabId/fork-to-sdk              → ↑ alias для terminal табов
-GET  /api/sdk-tabs/:tabId/history              → JSON or NDJSON (Accept-driven)
+POST /api/terminal-tabs/:tabId/send                 → sendAgentPromptScenario; project ownership, TUI draft conflict не очищается
+POST /api/terminal-tabs/:tabId/stop                 → stopAgentProcessScenario; для legacy SDK fallback query.close()
+POST /api/terminal-tabs/:tabId/close                → closeTab (через bridge, body {aiBusy?})
+POST /api/terminal-tabs/:tabId/rename               → renameTab (через bridge)
+POST /api/tabs/:tabId/fork-to-sdk                   → forkToSDK (через bridge → fork-from-session); legacy route вне Project Terminal API
+GET  /api/terminal-tabs/:tabId/history              → JSON or NDJSON (Accept-driven)
                                                → query params: ?last=N (tail), ?after=<uuid> (delta sync), ?before=<uuid> (prefix backfill)
                                                → Accept: application/x-ndjson → streamed line-by-line, Brotli-4
-POST /api/sdk-tabs/:tabId/truncate              → drop everything ≥ targetUuid (Edit/Repeat)
-GET  /api/sdk-tabs/:tabId/timeline             → parseTimelineEntries
-GET  /api/sdk-tabs/:tabId/params               → getSDKParams
-POST /api/sdk-tabs/:tabId/params               → setSDKParams
-POST /api/sdk-tabs/:tabId/interrupt            → soft interrupt текущего turn'а (PTY Esc / SDK close warm)
-GET  /api/sdk-tabs/:tabId/draft                → authoritative чтение TUI composer после interrupt
-GET  /api/sdk-tabs/:tabId/draft-state          → read-only preflight состояния TUI composer перед mobile send
-GET  /api/sdk-tabs/:tabId/queue                 → getPromptQueue (core + sibling aiTabs)
-POST /api/sdk-tabs/:tabId/queue                 → mutatePromptQueue ({op, args})
-GET  /api/sdk-tabs/:tabId/pending-question      → текущий AskUserQuestion (connect mid-question)
-POST /api/sdk-tabs/:tabId/answer-question       → answerClaudeQuestion ({source, answers, stop})
+POST /api/terminal-tabs/:tabId/truncate              → drop everything ≥ targetUuid (Edit/Repeat)
+GET  /api/terminal-tabs/:tabId/timeline             → parseTimelineEntries
+POST /api/terminal-tabs/:tabId/rewind               → native rewind/backtrack через общий agent scenario; при stopped session сначала resume + readiness
+GET  /api/terminal-tabs/:tabId/params               → параметры модели/effort/think для agent tab
+POST /api/terminal-tabs/:tabId/params               → применить параметры через runtime-specific path
+POST /api/terminal-tabs/:tabId/interrupt            → soft interrupt текущего turn'а (PTY Esc / SDK close warm)
+GET  /api/terminal-tabs/:tabId/draft                → authoritative чтение TUI composer после interrupt
+GET  /api/terminal-tabs/:tabId/draft-state          → read-only preflight состояния TUI composer перед mobile send
+GET  /api/terminal-tabs/:tabId/queue                 → getPromptQueue (core + sibling aiTabs)
+POST /api/terminal-tabs/:tabId/queue                 → mutatePromptQueue ({op, args})
+GET  /api/terminal-tabs/:tabId/pending-question      → текущий AskUserQuestion (connect mid-question)
+POST /api/terminal-tabs/:tabId/answer-question       → answerClaudeQuestion ({source, answers, stop})
 GET  /api/active-loaders                       → live loaders snapshot для external install preflight
 GET  /api/project-activity                     → full project activity snapshot для native project badges
 GET  /api/events?scope=projects                → SSE только project-activity, без tab transcript watcher'ов
@@ -275,11 +283,13 @@ POST /api/projects/:id/tab-groups/:gid/toggle-collapsed → collapse/expand grou
 POST /api/projects/:id/tab-groups/:gid/status   → assign/clear group session status
 POST /api/projects/:id/tab-groups/:gid/delete   → delete group container, keep tabs
 POST /api/projects/:id/tab-layout               → reorder tabs/groups + group assignments/anchors
-POST /api/sdk-tabs/:tabId/resume                → claude --resume <sid> в existing PTY
-GET  /api/sdk-tabs/:tabId/status                → status строка (inactive/starting/active/busy) + sessionId + commandType
+POST /api/terminal-tabs/:tabId/resume                → resume в existing PTY; 200 только после input-ready/ready, timeout = 504 success:false ready:false
+GET  /api/terminal-tabs/:tabId/status                → status строка (inactive/starting/active/busy) + sessionId + commandType
 ```
 
-Для CLAUDE-табов (commandType='claude' && tabType!='claude-sdk') расширение mobile-web — см. `fact-mobile-claude-pty.md`. `/send` и `/stop` теперь sumарно роутятся: backend сам выбирает SDK путь или PTY+paste путь по `tab.commandType`.
+Для Claude/Codex PTY-табов расширение mobile-web — см. `fact-mobile-claude-pty.md`. `/send`, `/stop`, `/interrupt`, `/draft`, `/draft-state` и `/rewind` роутятся через общий scenario layer: backend сам выбирает Claude PTY/Codex PTY runtime, а endpoint остаётся Project Terminal API. Legacy SDK fallback существует только для старых SDK-табов, не как модель нового API.
+
+`/resume` — часть того же Project Terminal API, а не сырой bridge proxy. Успешный ответ доказывает готовность composer'а к следующей команде; bridge failure/readiness timeout возвращаются как non-success JSON. Native клиент после такой ошибки должен снять локальный `starting`, а не ждать следующего poll/SSE snapshot'а, потому что `starting busy=false` после failed resume часто является stale startup state.
 
 `/draft-state` — preflight только для защиты чужого текста в terminal composer, а не команда
 активации desktop UI. Если renderer видит mounted xterm, он инспектирует Claude/Codex input и
@@ -291,11 +301,15 @@ GET  /api/sdk-tabs/:tabId/status                → status строка (inactiv
 или timeout остаются стоп-сигналом. Пользовательский симптом нарушенного контракта: отправка с
 iPhone внезапно переносит Mac в другой проект/таб.
 
-`POST /api/sdk-tabs/:tabId/send` следует той же границе совместимости: при реальном
+`POST /api/terminal-tabs/:tabId/send` следует той же границе совместимости: при реальном
 terminal draft он возвращает `409 terminal_draft_conflict`, но не вызывает
-`grabAgentDraft` и не очищает TUI composer. Это важно для native iOS и старых
-project/tab-клиентов: они управляют конкретной вкладкой, поэтому источник текста остаётся
-в терминале до явного действия пользователя. Противоположный контракт только у
+`grabAgentDraft` и не очищает TUI composer. Если Codex-процесс уже active, sessionId известен,
+а renderer-terminal не смонтирован (`draft-state source:"no-terminal"`), send не должен ждать
+ручной фокус Mac-вкладки: он продолжает PTY/audit-путь без visible draft guard и сверяется
+уже по rollout/JSONL. Для fresh/resume сессий это послабление не действует — startup/readiness
+по-прежнему обязателен, иначе prompt можно отправить в экран запуска или MCP-confirmation.
+Это важно для native iOS и старых project/tab-клиентов: они управляют конкретной вкладкой,
+поэтому источник текста остаётся в терминале до явного действия пользователя. Противоположный контракт только у
 `/api/inbox/runs`: Inbox-клиент владеет своим chat composer, поэтому Noted Terminal
 может забрать draft, очистить terminal input и вернуть `draftText` наружу для rollback.
 

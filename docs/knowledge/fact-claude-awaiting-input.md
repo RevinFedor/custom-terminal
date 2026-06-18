@@ -111,7 +111,7 @@ PreToolUse(AskUserQuestion)  ──►  [человек думает, минут
 
 **Контент (PreToolUse → broadcast).** Хук `noted-turn-event.js` теперь форвардит `tool_input` в envelope (раньше только `tool_name`). В socket-handler'е на `PreToolUse(AskUserQuestion)`: `claudePendingQuestion.set(tabId, {questions, at})` + `_webBroadcast(tabId, {type:'ask-question', source:'pty', toolUseID:'pty', questions})`. На `Post/PostToolUseFailure` (и на turn-end safety-net по busy:false) — `delete` + `_webBroadcast({type:'question-cancelled', source:'pty'})`. SDK-путь шлёт тот же `ask-question`/`question-cancelled` но `source:'sdk'` + реальный `toolUseID`.
 
-**Ответ — два разных механизма по `source`** (`answerClaudeQuestionUnified` в main, дёргается web-server'ом `POST /api/sdk-tabs/:id/answer-question`):
+**Ответ — два разных механизма по `source`** (`answerClaudeQuestionUnified` в main, дёргается web-server'ом `POST /api/terminal-tabs/:id/answer-question`):
 - `source:'sdk'` → резолв припаркованного `canUseTool` Promise (как десктопный `SDKAskQuestion` через `claude-sdk:answer-question`).
 - `source:'pty'` → **драйвим Ink TUI клавишами** (`answerClaudeQuestionPTY`). IPC-пути ответа у PTY НЕТ — на десктопе юзер отвечает стрелками+Enter в xterm. Транслируем `{answers}` в keystroke-последовательность:
   - single-select: `↓`×(index выбранной опции) → `Enter` (`\r`) — picks + auto-advance.

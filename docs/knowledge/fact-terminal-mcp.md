@@ -39,6 +39,12 @@ Noted Terminal должен инициировать `npm run build:install` с�
 убита install-процессом, а readiness после рестарта определяется через MCP `/terminal/tabs`,
 не через таймаут.
 
+Completion prompt после rebuild — **одноразовая доставка**. Если Voice Record уже нашёл
+исходную tab/session и `/terminal/ai-prompt` начал handoff, дальнейший `submitted_unverified`
+или timeout не является разрешением повторить тот же prompt: целевая Codex/Claude TUI могла
+уже получить ввод, а доказательство могло сорваться на audit/readiness edge. Повтор здесь хуже
+ошибки статуса — пользователь получает несколько одинаковых команд в живой AI-сессии.
+
 Граница с Overseer: если нужно узнать, что агент уже сделал, читать session history через overseer. Если нужно заставить живую вкладку что-то сделать сейчас, использовать terminal MCP. Не пытаться реализовать Codex orchestration через rewrite rollout JSONL: Codex history append-only и не имеет Claude edit-range модели.
 
 ## MCP activity events

@@ -103,6 +103,19 @@ Terminal MCP tool `build_install_noted_terminal` передаёт задачу �
 позже самого окна. Статус callback виден в Voice Record `GET /api/terminal/build-install`
 (`returnTo`, `callback`, `logTail`).
 
+Callback delivery должен быть **idempotent-by-classification**, а не "retry until HTTP 200".
+`/terminal/ai-prompt` может ждать Codex startup prompts (`Update available`, directory chooser,
+MCP startup) дольше обычного HTTP timeout'а, а после paste может вернуть audit/turn-watcher
+ошибку уже **после того как Enter ушёл в TUI**. Voice Record поэтому ретраит только состояния,
+где terminal input точно не трогался (нет живого target / target ещё не восстановлен). Если
+ответ/ошибка говорит `submitted:true`, `submitted_unverified`, `codex_paste_not_visible_*`,
+`codex_draft_state_unknown_after_paste`, `codex_user_message_audit_mismatch`,
+`codex_turn_watcher_closed_before_user_message` или просто POST timeout после handoff'а,
+job фиксируется как `sent_unverified` и повторно тот же completion prompt не отправляется.
+Пользовательский симптом нарушенного контракта — после install в AI-вкладку много раз падает
+одна и та же строка `Build install completed...`; лечить это увеличением sleep нельзя, потому
+что причина не задержка, а неразличение "не доставлено" и "доставлено, но не доказано".
+
 ### Env-кнобы
 `POLL_MS=1000`, `IDLE_CONFIRM=2`, `NO_BUILD=1` (только наблюдать), `PORT=7878` (форсить порт, минуя discovery — для теста).
 

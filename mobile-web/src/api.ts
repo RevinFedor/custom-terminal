@@ -221,46 +221,46 @@ export const Api = {
     ),
   resumeClaudeTab: (tabId: string) =>
     api<{ tabId: string; sessionId: string; alreadyRunning?: boolean }>(
-      `/api/sdk-tabs/${encodeURIComponent(tabId)}/resume`,
+      `/api/terminal-tabs/${encodeURIComponent(tabId)}/resume`,
       { method: 'POST', body: '{}' },
     ),
   claudeStatus: (tabId: string) =>
     api<{ tabId: string; status: 'active' | 'busy' | 'inactive' | 'starting'; commandType: string | null; sessionId: string | null; cwd?: string }>(
-      `/api/sdk-tabs/${encodeURIComponent(tabId)}/status`,
+      `/api/terminal-tabs/${encodeURIComponent(tabId)}/status`,
     ),
   send: (tabId: string, prompt: string) =>
     api<{ success: boolean; error?: string }>(
-      `/api/sdk-tabs/${encodeURIComponent(tabId)}/send`,
+      `/api/terminal-tabs/${encodeURIComponent(tabId)}/send`,
       { method: 'POST', body: JSON.stringify({ prompt }) },
     ),
   // Drop everything ≥ targetUuid in the JSONL. Used by Repeat/Edit on a user
   // bubble — bridges to the same backend path desktop uses.
   truncate: (tabId: string, targetUuid: string) =>
     api<{ success: boolean; error?: string; removed?: number; kept?: number }>(
-      `/api/sdk-tabs/${encodeURIComponent(tabId)}/truncate`,
+      `/api/terminal-tabs/${encodeURIComponent(tabId)}/truncate`,
       { method: 'POST', body: JSON.stringify({ targetUuid }) },
     ),
   // Kill the process (navbar Stop ■). PTY → SIGTERM claude child; SDK → close query.
   stop: (tabId: string) =>
     api<{ stopped: boolean }>(
-      `/api/sdk-tabs/${encodeURIComponent(tabId)}/stop`,
+      `/api/terminal-tabs/${encodeURIComponent(tabId)}/stop`,
       { method: 'POST', body: '{}' },
     ),
   // Soft-interrupt the CURRENT TURN (composer Stop). PTY → single Esc into TUI
   // (Claude stops generating, stays alive); SDK → close query (process warm).
   interrupt: (tabId: string) =>
     api<{ interrupted: boolean; kind?: string }>(
-      `/api/sdk-tabs/${encodeURIComponent(tabId)}/interrupt`,
+      `/api/terminal-tabs/${encodeURIComponent(tabId)}/interrupt`,
       { method: 'POST', body: '{}' },
     ),
   rename: (tabId: string, name: string) =>
     api<{ tabId: string; name: string }>(
-      `/api/sdk-tabs/${encodeURIComponent(tabId)}/rename`,
+      `/api/terminal-tabs/${encodeURIComponent(tabId)}/rename`,
       { method: 'POST', body: JSON.stringify({ name }) },
     ),
   close: (tabId: string) =>
     api<{ closed: boolean }>(
-      `/api/sdk-tabs/${encodeURIComponent(tabId)}/close`,
+      `/api/terminal-tabs/${encodeURIComponent(tabId)}/close`,
       { method: 'POST', body: '{}' },
     ),
   forkToSDK: (sourceTabId: string) =>
@@ -273,38 +273,38 @@ export const Api = {
   history: (tabId: string, opts?: { last?: number }) => {
     const q = opts?.last ? `?last=${opts.last}` : '';
     return api<{ messages?: any[]; total?: number; truncated?: boolean; dropped?: number }>(
-      `/api/sdk-tabs/${encodeURIComponent(tabId)}/history${q}`,
+      `/api/terminal-tabs/${encodeURIComponent(tabId)}/history${q}`,
     );
   },
   timeline: (tabId: string) =>
     api<{ entries: TimelineEntry[]; sessionId?: string; count?: number }>(
-      `/api/sdk-tabs/${encodeURIComponent(tabId)}/timeline`,
+      `/api/terminal-tabs/${encodeURIComponent(tabId)}/timeline`,
     ),
   getParams: (tabId: string) =>
     api<{ tabId: string; model: string; effort: string; thinking: 'adaptive' | 'disabled' }>(
-      `/api/sdk-tabs/${encodeURIComponent(tabId)}/params`,
+      `/api/terminal-tabs/${encodeURIComponent(tabId)}/params`,
     ),
   setParams: (tabId: string, partial: { model?: string; effort?: string; thinking?: 'adaptive' | 'disabled' }) =>
     api<{ tabId: string }>(
-      `/api/sdk-tabs/${encodeURIComponent(tabId)}/params`,
+      `/api/terminal-tabs/${encodeURIComponent(tabId)}/params`,
       { method: 'POST', body: JSON.stringify(partial) },
     ),
   // Prompt-queue ("Run after") for a tab — read the live desktop core + the list
   // of sibling AI-tabs (for the "on tab" pivot picker). Returns null-safe shape.
   getQueue: (tabId: string) =>
-    api<QueueData>(`/api/sdk-tabs/${encodeURIComponent(tabId)}/queue`),
+    api<QueueData>(`/api/terminal-tabs/${encodeURIComponent(tabId)}/queue`),
   // Apply one mutation op. Returns the new core (echo) so the caller can paint
   // immediately; the queue-update SSE event will also fan-out shortly after.
   queueMutate: (tabId: string, body: QueueOp) =>
     api<{ tabId: string; queue: QueueCore }>(
-      `/api/sdk-tabs/${encodeURIComponent(tabId)}/queue`,
+      `/api/terminal-tabs/${encodeURIComponent(tabId)}/queue`,
       { method: 'POST', body: JSON.stringify(body) },
     ),
   // Current pending AskUserQuestion for a tab (mobile fetches on mount in case
   // it connected mid-question, before the live ask-question event fired).
   pendingQuestion: (tabId: string) =>
     api<{ pendingQuestion: PendingQuestion | null }>(
-      `/api/sdk-tabs/${encodeURIComponent(tabId)}/pending-question`,
+      `/api/terminal-tabs/${encodeURIComponent(tabId)}/pending-question`,
     ),
   // Answer (or stop) a pending question. answers keyed by question text; value
   // is a single label (single-select) or comma-joined labels (multiSelect).
@@ -314,7 +314,7 @@ export const Api = {
     body: { source: 'pty' | 'sdk'; toolUseID?: string; questions?: MobileQuestion[]; answers?: Record<string, string>; stop?: boolean },
   ) =>
     api<{ success: boolean; error?: string }>(
-      `/api/sdk-tabs/${encodeURIComponent(tabId)}/answer-question`,
+      `/api/terminal-tabs/${encodeURIComponent(tabId)}/answer-question`,
       { method: 'POST', body: JSON.stringify(body) },
     ),
   // Soniox temporary API key for browser-side mic dictation. Backend mints a

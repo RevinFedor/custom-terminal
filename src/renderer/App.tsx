@@ -34,6 +34,14 @@ import { usePromptQueueWebSync } from './hooks/usePromptQueueWebSync';
 import { useMirrorStatusStore } from './store/useMirrorStatusStore';
 import { buildCodexRunPayload } from './utils/codexLaunch';
 import { getHistoryAgentRuntime, type AgentHistoryTool } from './utils/historyAgentRuntimes';
+import {
+  grabAgentDraftScenario,
+  inspectAgentDraftScenario,
+  interruptAgentTurnScenario,
+  rewindAgentTimelineScenario,
+  sendAgentPromptScenario,
+  stopAgentProcessScenario,
+} from './utils/agentScenarios';
 import { terminalRegistry } from './utils/terminalRegistry';
 import { DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL } from './constants/codexSettings';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from './constants/systemProjects';
@@ -2163,73 +2171,64 @@ function App() {
             return reply(false, null, String(e?.message || e));
           }
         }
-        if (action === 'stopClaudeTab') {
+        if (action === 'stopClaudeTab' || action === 'stopAgentProcessScenario') {
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
           const { toolType, runtime } = describeAgentTab(tabId);
           if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
           console.log('[MobStop:Bridge] stopAgentTab begin tool=' + toolType + ' tab=' + String(tabId).slice(-12));
           try {
-            const r = await runtime.stopProcess(tabId);
+            const r = await stopAgentProcessScenario({ tabId, toolType, runtime });
             console.log('[MobStop:Bridge] stopAgentTab done tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(r));
-            return reply(!!r?.success, { tabId, toolType, stopped: !!r?.success, ...r });
+            return reply(!!r?.success, r);
           } catch (e: any) {
             console.log('[MobStop:Bridge] stopAgentTab err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
             return reply(false, null, String(e?.message || e));
           }
         }
-        if (action === 'interruptClaudeTurn') {
+        if (action === 'interruptClaudeTurn' || action === 'interruptAgentTurnScenario') {
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
           const { toolType, runtime } = describeAgentTab(tabId);
           if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
           console.log('[MobInterrupt:Bridge] interruptAgentTurn tool=' + toolType + ' tab=' + String(tabId).slice(-12));
           try {
-            const result = runtime.interruptTurn(tabId);
-            return reply(!!result.success, { tabId, toolType, interrupted: !!result.interrupted });
+            const result = interruptAgentTurnScenario({ tabId, toolType, runtime });
+            return reply(!!result.success, result);
           } catch (e: any) {
             console.log('[MobInterrupt:Bridge] err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
             return reply(false, null, String(e?.message || e));
           }
         }
-        if (action === 'grabAgentDraft') {
+        if (action === 'grabAgentDraft' || action === 'grabAgentDraftScenario') {
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
           const { toolType, runtime } = describeAgentTab(tabId);
           if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
           console.log('[MobDraft:Bridge] grabAgentDraft tool=' + toolType + ' tab=' + String(tabId).slice(-12));
           try {
-            const result = await runtime.grabDraft(tabId);
+            const result = await grabAgentDraftScenario({ tabId, toolType, runtime });
             const ok = result?.success !== false;
-            return reply(ok, { tabId, toolType, ...(result || {}) }, ok ? undefined : result?.error);
+            return reply(ok, result, ok ? undefined : result?.error);
           } catch (e: any) {
             console.log('[MobDraft:Bridge] err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
             return reply(false, null, String(e?.message || e));
           }
         }
-        if (action === 'inspectAgentDraft') {
+        if (action === 'inspectAgentDraft' || action === 'inspectAgentDraftScenario') {
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
           const { toolType, runtime } = describeAgentTab(tabId);
           if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
           try {
-            let result = runtime.inspectDraft
-              ? runtime.inspectDraft(tabId)
-              : { hasDraft: null, preview: '', source: 'unsupported' };
-            if (result?.source === 'no-terminal') {
-              result = {
-                ...(result || {}),
-                mountedForInspect: false,
-                debug: [result?.debug, 'mount=not-mounted focus=preserved'].filter(Boolean).join(' '),
-              };
-            }
-            return reply(true, { tabId, toolType, ...(result || {}) });
+            const result = inspectAgentDraftScenario({ tabId, toolType, runtime });
+            return reply(true, result);
           } catch (e: any) {
             console.log('[MobDraft:Bridge] inspect err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
             return reply(false, null, String(e?.message || e));
           }
         }
-        if (action === 'rewindAgentTimeline') {
+        if (action === 'rewindAgentTimeline' || action === 'rewindAgentTimelineScenario') {
           const {
             tabId,
             targetIndex,
@@ -2247,105 +2246,53 @@ function App() {
           if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
           if (toolType !== 'claude' && toolType !== 'codex') return reply(false, null, 'rewind unsupported for tool');
           if (!sessionId) return reply(false, null, 'no session to rewind');
-          const rewindMode = mode === 'ai' ? 'ai' : 'native';
           try {
-            const channel = toolType === 'codex' ? 'codex:open-history-menu' : 'claude:open-history-menu';
-            let pasteAfter: string | undefined;
-            if (rewindMode === 'ai') {
-              console.log('[MobRewind:Bridge] AI compact begin tool=' + toolType + ' tab=' + String(tabId).slice(-12));
-              pasteAfter = await buildMobileAiRewindText({
-                toolType,
-                sessionId,
-                cwd: tab?.cwd,
-                startUuid,
-                endUuid,
-                additionalPrompt: typeof additionalPrompt === 'string' ? additionalPrompt : undefined,
-              });
-              console.log('[MobRewind:Bridge] AI compact ready tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' len=' + pasteAfter.length);
-            }
-            const result = await ipcRenderer.invoke(channel, {
+            const result = await rewindAgentTimelineScenario({
               tabId,
+              tab,
+              toolType,
+              runtime,
+              sessionId,
+              mode,
               targetIndex,
               targetText,
               targetFullText,
               rewindableCount,
               skipDuplicates,
-              pasteAfter,
+              startUuid,
+              endUuid,
+              additionalPrompt,
+              buildAiRewindText: buildMobileAiRewindText,
             });
             const ok = result?.success !== false;
-            return reply(ok, { tabId, toolType, mode: rewindMode, compactPasted: !!pasteAfter, compactLength: pasteAfter?.length || 0, ...(result || {}) }, ok ? undefined : result?.error);
+            return reply(ok, result, ok ? undefined : result?.error);
           } catch (e: any) {
             console.log('[MobRewind:Bridge] err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
             return reply(false, null, String(e?.message || e));
           }
         }
-        if (action === 'sendMessageAuto') {
-          // Single dispatch entry for /api/sdk-tabs/:id/send — backend used
-          // to do TWO bridge round-trips (status check + actual send). Now
-          // the routing happens here, in the same call that does the work.
+        if (action === 'sendMessageAuto' || action === 'sendAgentPromptScenario') {
+          // Single dispatch entry for agent send. `sendMessageAuto` is the old
+          // bridge name kept for route compatibility; the implementation is now
+          // the shared scenario used by Project API and Inbox API.
           const { tabId, prompt, model, effort, thinking, cwd, handoffId, source, statusAtSend, queue, returnDraftOnConflict } = payload || {};
           if (!tabId || !prompt) return reply(false, null, 'tabId+prompt required');
-          const { tab, toolType, runtime } = describeAgentTab(tabId);
+          const { tab, toolType, runtime, sessionId } = describeAgentTab(tabId);
           if (runtime && toolType) {
-            const statusForSend = typeof statusAtSend === 'string' ? statusAtSend : undefined;
-            if (statusForSend === 'active' && queue !== true && runtime.inspectDraft) {
-              const visual = runtime.inspectDraft(tabId);
-              if (visual?.hasDraft === true) {
-                let draftText = '';
-                let draftImages = 0;
-                if (returnDraftOnConflict === true) {
-                  const grabbed = await runtime.grabDraft(tabId);
-                  if (grabbed?.success === false) {
-                    return reply(true, {
-                      tabId,
-                      toolType,
-                      success: false,
-                      ok: false,
-                      code: 'terminal_draft_grab_failed',
-                      error: grabbed.error || 'terminal draft exists, but could not be returned',
-                      draftPreview: visual.preview || '',
-                      draftSource: visual.source || '',
-                      originalPrompt: prompt,
-                    });
-                  }
-                  draftText = typeof grabbed?.text === 'string' ? grabbed.text : '';
-                  draftImages = Number(grabbed?.images || 0);
-                }
-                return reply(true, {
-                  tabId,
-                  toolType,
-                  success: false,
-                  ok: false,
-                  code: 'terminal_draft_conflict',
-                  error: 'Terminal has an unsent draft',
-                  draftText,
-                  draftPreview: visual.preview || '',
-                  draftSource: visual.source || '',
-                  draftImages,
-                  originalPrompt: prompt,
-                });
-              }
-              if (visual?.hasDraft === null && visual.source !== 'no-terminal') {
-                return reply(true, {
-                  tabId,
-                  toolType,
-                  success: false,
-                  ok: false,
-                  code: 'terminal_draft_state_unknown',
-                  error: 'Terminal draft state is unknown; send stopped before touching input',
-                  draftPreview: visual.preview || '',
-                  draftSource: visual.source || '',
-                  originalPrompt: prompt,
-                });
-              }
-            }
-            const result = await runtime.sendPrompt(tabId, prompt, {
-              handoffId: typeof handoffId === 'string' ? handoffId : undefined,
-              source: typeof source === 'string' ? source : 'mobile-native',
-              statusAtSend: statusForSend,
-              queue: queue === true,
-              model: typeof model === 'string' ? model : undefined,
-              effort: typeof effort === 'string' ? effort : undefined,
+            const result = await sendAgentPromptScenario({
+              tabId,
+              toolType,
+              runtime,
+              sessionId,
+              cwd: cwd || tab?.cwd,
+              prompt,
+              handoffId,
+              source,
+              statusAtSend,
+              queue,
+              model,
+              effort,
+              returnDraftOnConflict,
             });
             return reply(true, { tabId, toolType, ...(result || {}) });
           }

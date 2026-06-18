@@ -71,7 +71,7 @@ interface FullHistoryEntry {
   role: 'user' | 'assistant' | 'compact' | 'fork' | 'plan-mode' | 'continued' | 'queued' | 'rewind';
   timestamp: string;
   content: string;
-  queueStatus?: 'queued' | 'sent' | 'cancelled' | 'failed';
+  queueStatus?: 'sending' | 'queued' | 'sent' | 'cancelled' | 'failed';
   handoffId?: string;
   statusReason?: string;
   statusChangedAt?: number;
@@ -120,6 +120,8 @@ interface SuppressedPrompt {
 const LOCAL_PROMPT_PREFIX = 'local-prompt-';
 const LOCAL_REWIND_PREFIX = 'local-rewind-';
 const LOCAL_PROMPT_FAILURE_TTL_MS = 15000;
+const LOCAL_PROMPT_SENT_TTL_MS = 12000;
+const REWIND_BUSY_GUARD_RE = /\bis busy; wait for the current turn before rewind\b/i;
 
 const normalizeHistoryPromptText = (text: string) => String(text || '')
   .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
@@ -130,6 +132,9 @@ const promptPreview = (text: string, max = 80) =>
 
 const createPromptHandoffId = () =>
   Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+
+const isRewindBusyGuardMessage = (message: string) =>
+  REWIND_BUSY_GUARD_RE.test(message);
 
 const entryMatchesSuppressedPrompt = (entry: FullHistoryEntry, suppressed: SuppressedPrompt) => {
   if (isLocalPromptEntry(entry)) return false;
@@ -173,9 +178,16 @@ const mergeServerAndLocalEntries = (serverEntries: FullHistoryEntry[], currentEn
   const locals = currentEntries.filter((entry) =>
     (isLocalPromptEntry(entry) &&
       !serverHasPromptEntry(serverEntries, entry) &&
-      (entry.queueStatus !== 'cancelled' && entry.queueStatus !== 'failed'
-        ? true
-        : now - (entry.statusChangedAt || entry.optimisticAt || Date.parse(entry.timestamp || '') || now) < LOCAL_PROMPT_FAILURE_TTL_MS)) ||
+      (() => {
+        const ageMs = now - (entry.statusChangedAt || entry.optimisticAt || Date.parse(entry.timestamp || '') || now);
+        if (entry.queueStatus === 'cancelled' || entry.queueStatus === 'failed') {
+          return ageMs < LOCAL_PROMPT_FAILURE_TTL_MS;
+        }
+        if (entry.queueStatus === 'sent') {
+          return ageMs < LOCAL_PROMPT_SENT_TTL_MS;
+        }
+        return true;
+      })()) ||
     isLocalRewindEntry(entry)
   );
   return locals.length > 0 ? [...serverEntries, ...locals] : serverEntries;
@@ -470,17 +482,18 @@ const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolT
 
   if (entry.role === 'queued') {
     const status = entry.queueStatus || 'queued';
+    const sending = status === 'sending';
     const queued = status === 'queued';
     const sent = status === 'sent';
     const cancelled = status === 'cancelled';
     const failed = status === 'failed';
-    const label = queued ? 'QUEUED' : sent ? 'SENT' : cancelled ? 'CANCELLED BEFORE JSONL' : 'SEND FAILED';
-    const accent = failed ? '#ef4444' : cancelled ? '#a1a1aa' : queued ? '#d97706' : '#71717a';
-    const textColor = failed ? '#fca5a5' : queued ? '#fbbf24' : '#a1a1aa';
+    const label = sending ? 'SENDING' : queued ? 'QUEUED' : sent ? 'SENT' : cancelled ? 'CANCELLED BEFORE JSONL' : 'SEND FAILED';
+    const accent = failed ? '#ef4444' : '#71717a';
+    const textColor = failed ? '#fca5a5' : '#a1a1aa';
     return (
       <div style={{
         padding: '8px 12px',
-        backgroundColor: failed ? 'rgba(239, 68, 68, 0.08)' : queued ? 'rgba(217, 119, 6, 0.08)' : 'rgba(113, 113, 122, 0.08)',
+        backgroundColor: failed ? 'rgba(239, 68, 68, 0.08)' : 'rgba(113, 113, 122, 0.08)',
         borderRadius: 6,
         borderLeft: '3px solid ' + accent,
       }}>
@@ -494,7 +507,7 @@ const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolT
           fontWeight: 700,
           letterSpacing: 0.6,
         }}>
-          {(queued || sent) && <HistorySpinner size={10} />}
+          {(sending || queued || sent) && <HistorySpinner size={10} />}
           <span>{label}</span>
           {entry.timestamp && (
             <span style={{ marginLeft: 2, color: '#666', fontWeight: 500, letterSpacing: 0 }}>
@@ -792,9 +805,29 @@ const getDraftNoticeMeta = (message: string) => {
   };
 };
 
-function HistoryThinkingChip({ label }: { label: string }) {
+function HistoryThinkingChip({ label, text = 'THINKING' }: { label: string; text?: string }) {
+  const tooltip =
+    text === 'UPDATING' ? label + ' history is updating'
+    : text === 'REWINDING' ? label + ' rewind is running'
+    : label + ' turn is running';
+  const tone =
+    text === 'REWINDING'
+      ? {
+          border: 'rgba(168, 85, 247, 0.42)',
+          bg: 'rgba(168, 85, 247, 0.14)',
+          text: '#c4b5fd',
+          dot: '#a78bfa',
+          dotClass: 'animate-glow-purple',
+        }
+      : {
+          border: 'rgba(217, 119, 6, 0.38)',
+          bg: 'rgba(217, 119, 6, 0.12)',
+          text: '#fbbf24',
+          dot: '#d97706',
+          dotClass: 'animate-glow-yellow',
+        };
   return (
-    <Tooltip content={label + ' turn is running'}>
+    <Tooltip content={tooltip}>
       <div
         style={{
           display: 'inline-flex',
@@ -803,9 +836,9 @@ function HistoryThinkingChip({ label }: { label: string }) {
           height: 22,
           padding: '0 8px',
           borderRadius: 5,
-          border: '1px solid rgba(217, 119, 6, 0.38)',
-          backgroundColor: 'rgba(217, 119, 6, 0.12)',
-          color: '#fbbf24',
+          border: '1px solid ' + tone.border,
+          backgroundColor: tone.bg,
+          color: tone.text,
           fontSize: 10,
           fontWeight: 750,
           letterSpacing: 0,
@@ -813,17 +846,17 @@ function HistoryThinkingChip({ label }: { label: string }) {
         }}
       >
         <span
-          className="animate-glow-yellow"
+          className={tone.dotClass}
           aria-hidden
           style={{
             width: 8,
             height: 8,
             borderRadius: 999,
-            backgroundColor: '#d97706',
+            backgroundColor: tone.dot,
             flexShrink: 0,
           }}
         />
-        <span>THINKING</span>
+        <span>{text}</span>
       </div>
     </Tooltip>
   );
@@ -1408,10 +1441,10 @@ function AgentHistoryControls({
   sessionId: string;
   cwd: string;
   toolType: AgentHistoryTool;
-  onHistoryRefresh: () => void;
+  onHistoryRefresh: () => void | Promise<boolean | void>;
   onPromptSubmitted: (
     text: string,
-    queueStatus: 'queued' | 'sent',
+    queueStatus: 'sending' | 'queued' | 'sent',
     meta: { handoffId: string; statusAtSend: AgentPtyStatus; submittedAt: number }
   ) => void;
   onPromptStatusChange: (handoffId: string, queueStatus: 'queued' | 'sent' | 'cancelled' | 'failed', reason: string) => void;
@@ -1428,6 +1461,7 @@ function AgentHistoryControls({
   }, [setHistoryPromptDraft, tabId]);
   const [busyAction, setBusyAction] = useState<'resume' | 'send' | 'interrupt' | 'stop' | 'grab' | null>(null);
   const [isPasteBusy, setIsPasteBusy] = useState(false);
+  const [historyUpdating, setHistoryUpdating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [draftWarning, setDraftWarning] = useState<string | null>(null);
   const [interruptAwaiting, setInterruptAwaiting] = useState(false);
@@ -1439,6 +1473,7 @@ function AgentHistoryControls({
   const statusRef = useRef<AgentPtyStatus>('inactive');
   const actionInFlightRef = useRef(false);
   const actionSeqRef = useRef(0);
+  const historyUpdateSeqRef = useRef(0);
   const pasteBusyRef = useRef(false);
   const pendingQuestionRef = useRef<AgentPendingQuestion | null>(null);
   const answeringQuestionRef = useRef(false);
@@ -1521,6 +1556,21 @@ function AgentHistoryControls({
     }
   }, [refreshPendingQuestion, runtime, setPendingQuestionFrom, setStatusFrom, tabId]);
 
+  const refreshHistoryWithUpdating = useCallback((reason: string) => {
+    const seq = ++historyUpdateSeqRef.current;
+    setHistoryUpdating(true);
+    historyDiag('REFRESH_REQUEST tab=' + tabId.slice(-12) + ' reason=' + reason);
+    Promise.resolve(onHistoryRefresh())
+      .catch((e: any) => {
+        console.warn('[' + runtime.logPrefix + '] history refresh failed tab=' + tabId.slice(-12) + ' reason=' + reason + ': ' + String(e?.message || e));
+      })
+      .finally(() => {
+        if (historyUpdateSeqRef.current === seq && tabIdRef.current === tabId) {
+          setHistoryUpdating(false);
+        }
+      });
+  }, [onHistoryRefresh, runtime.logPrefix, tabId]);
+
   useEffect(() => {
     tabIdRef.current = tabId;
     actionSeqRef.current += 1;
@@ -1533,6 +1583,7 @@ function AgentHistoryControls({
     interruptAwaitRef.current = null;
     setBusyAction(null);
     setIsPasteBusy(false);
+    setHistoryUpdating(false);
     setError(null);
     setDraftWarning(null);
     setInterruptAwaiting(false);
@@ -1545,6 +1596,19 @@ function AgentHistoryControls({
       clearEmptyDraftNoticeTimer();
     };
   }, [clearEmptyDraftNoticeTimer, refreshPresence, setStatusFrom, tabId]);
+
+  useEffect(() => {
+    const handleAgentError = (event: Event) => {
+      const detail = ((event as CustomEvent).detail || {}) as { tabId?: string; message?: string; error?: string };
+      if (detail.tabId !== tabId) return;
+      const message = String(detail.message || detail.error || '').trim();
+      if (!message) return;
+      setError(message);
+      setDraftWarning(null);
+    };
+    window.addEventListener('history-panel:agent-error', handleAgentError);
+    return () => window.removeEventListener('history-panel:agent-error', handleAgentError);
+  }, [tabId]);
 
   useEffect(() => {
     const handleTuiReady = (_: any, data: { tabId?: string }) => {
@@ -1567,6 +1631,7 @@ function AgentHistoryControls({
       if (data.busy) setStatusFrom('busy', 'busy-state');
       else {
         if (pendingQuestionRef.current) setPendingQuestionFrom(null, 'busy-false');
+        refreshHistoryWithUpdating('busy-false:' + (data.reason || 'unknown'));
         refreshPresence();
       }
     };
@@ -1574,6 +1639,7 @@ function AgentHistoryControls({
       if (data?.tabId !== tabId) return;
       pasteBusyRef.current = false;
       setIsPasteBusy(false);
+      refreshHistoryWithUpdating('command-finished');
       refreshPresence();
     };
     const handleAwaitingInput = (_: any, data: { tabId?: string; awaiting?: boolean }) => {
@@ -1607,7 +1673,7 @@ function AgentHistoryControls({
       ipcRenderer.removeListener('terminal:command-started', handleStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleFinished);
     };
-  }, [refreshPendingQuestion, runtime, setPendingQuestionFrom, tabId, refreshPresence, setStatusFrom, isNonAuthoritativeBusyEvent]);
+  }, [refreshPendingQuestion, runtime, setPendingQuestionFrom, tabId, refreshPresence, setStatusFrom, isNonAuthoritativeBusyEvent, refreshHistoryWithUpdating]);
 
   const readTerminalDraft = useCallback(async (reason: string) => {
     const requestTabId = tabId;
@@ -1747,6 +1813,29 @@ function AgentHistoryControls({
     };
   }, [isNonAuthoritativeBusyEvent, onPromptStatusChange, readTerminalDraft, refreshPresence, runtime, showEmptyDraftNotice, tabId]);
 
+  useEffect(() => {
+    if (!interruptAwaiting || status === 'busy') return;
+    const waiting = interruptAwaitRef.current;
+    if (!waiting || waiting.tabId !== tabIdRef.current) return;
+    const timer = setTimeout(() => {
+      const current = interruptAwaitRef.current;
+      if (!current || current.tabId !== tabIdRef.current || statusRef.current === 'busy') return;
+      const ageMs = Date.now() - current.at;
+      console.log('[' + runtime.logPrefix + ':draft] interrupt-await clear tab=' + tabId.slice(-12) + ' reason=non-busy-status status=' + statusRef.current + ' ageMs=' + ageMs);
+      historyDiag('INTERRUPT_AWAIT_CLEAR tab=' + tabId.slice(-12) +
+        ' reason=non-busy-status' +
+        ' status=' + statusRef.current +
+        ' ageMs=' + ageMs);
+      interruptAwaitRef.current = null;
+      setInterruptAwaiting(false);
+      if (actionSeqRef.current === current.seq) {
+        actionInFlightRef.current = false;
+        setBusyAction((active) => active === 'interrupt' ? null : active);
+      }
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [interruptAwaiting, runtime.logPrefix, status, tabId]);
+
   const pullTerminalDraft = useCallback(async () => {
     if (actionInFlightRef.current) {
       console.log('[' + runtime.logPrefix + ':draft] drop-pull tab=' + tabId.slice(-12) + ' reason=inflight');
@@ -1802,6 +1891,8 @@ function AgentHistoryControls({
     }
     const actionTabId = tabId;
     const actionSeq = ++actionSeqRef.current;
+    let sendHandoffId: string | null = null;
+    let clearedPromptText: string | null = null;
     actionInFlightRef.current = true;
     setBusyAction(kind);
     setError(null);
@@ -1838,12 +1929,17 @@ function AgentHistoryControls({
         }
         const handoffId = createPromptHandoffId();
         const submittedAt = Date.now();
+        sendHandoffId = handoffId;
         historyDiag('SEND_CLICK tab=' + tabId.slice(-12) +
           ' handoff=' + handoffId +
           ' statusAtSend=' + statusAtSend +
           ' chars=' + text.length +
           ' pasteBusy=' + pasteBusyRef.current +
           ' preview="' + promptPreview(text) + '"');
+        onPromptSubmitted(text, 'sending', { handoffId, statusAtSend, submittedAt });
+        setPrompt('');
+        setDraftWarning(null);
+        clearedPromptText = text;
         const result = await runtime.sendPrompt(tabId, text, {
           handoffId,
           source: 'history-panel',
@@ -1857,18 +1953,16 @@ function AgentHistoryControls({
           ' error=' + (result?.error || '-'));
         if (result?.success === false) throw new Error(result?.error || 'Send failed');
         if (tabIdRef.current !== actionTabId) return;
-        onPromptSubmitted(text, statusAtSend === 'busy' ? 'queued' : 'sent', { handoffId, statusAtSend, submittedAt });
+        onPromptStatusChange(handoffId, statusAtSend === 'busy' ? 'queued' : 'sent', 'send-result');
         midstreamPromptRecoveryRef.current = { text, at: Date.now(), handoffId, statusAtSend };
         console.log('[' + runtime.logPrefix + ':draft] send tracked tab=' + tabId.slice(-12) + ' handoff=' + handoffId + ' statusAtSend=' + statusAtSend + ' chars=' + text.length);
-        setPrompt('');
-        setDraftWarning(null);
         if (runtime.optimisticBusyOnSend) {
           setStatusFrom('busy', 'send-click');
         } else {
           setStatusFrom('busy', 'send-confirmed');
           if (statusAtSend !== 'active') refreshPresence();
         }
-        onHistoryRefresh();
+        refreshHistoryWithUpdating('send-result');
       } else if (kind === 'interrupt') {
         const statusAtInterrupt = statusRef.current;
         const pending = midstreamPromptRecoveryRef.current;
@@ -1890,6 +1984,11 @@ function AgentHistoryControls({
             setInterruptAwaiting(true);
             setDraftWarning(null);
             console.log('[' + runtime.logPrefix + ':draft] interrupt-await start tab=' + tabId.slice(-12) + ' status=' + statusAtInterrupt);
+            setTimeout(() => {
+              if (tabIdRef.current === actionTabId && interruptAwaitRef.current?.seq === actionSeq) {
+                refreshPresence();
+              }
+            }, 700);
           } else if (runtime.optimisticActiveOnInterrupt) {
             setStatusFrom('active', 'interrupt-click');
           } else {
@@ -1905,6 +2004,13 @@ function AgentHistoryControls({
         setStatusFrom('inactive', 'stop-process-click');
       }
     } catch (e: any) {
+      if (kind === 'send' && sendHandoffId && tabIdRef.current === actionTabId) {
+        onPromptStatusChange(sendHandoffId, 'failed', 'send-error');
+        const restorePrompt = clearedPromptText;
+        if (restorePrompt) {
+          setPrompt((current) => current.trim() ? current : restorePrompt);
+        }
+      }
       if (tabIdRef.current === actionTabId) setError(String(e?.message || e));
       refreshPresence();
     } finally {
@@ -1917,7 +2023,7 @@ function AgentHistoryControls({
         if (tabIdRef.current === actionTabId) setBusyAction(null);
       }
     }
-  }, [busyAction, cwd, onHistoryRefresh, onPromptSubmitted, prompt, readTerminalDraft, refreshPresence, runtime, sessionId, setStatusFrom, tabId]);
+  }, [busyAction, cwd, onPromptStatusChange, onPromptSubmitted, prompt, readTerminalDraft, refreshHistoryWithUpdating, refreshPresence, runtime, sessionId, setStatusFrom, tabId]);
 
   const answerPendingQuestion = useCallback(async (answers: Record<string, string>, stop = false) => {
     if (!runtime.answerQuestion) return;
@@ -1946,7 +2052,7 @@ function AgentHistoryControls({
       if (tabIdRef.current !== actionTabId) return;
       setPendingQuestionFrom(null, stop ? 'respond-manually' : 'answered');
       if (!stop) setStatusFrom('busy', 'question-answered');
-      onHistoryRefresh();
+      refreshHistoryWithUpdating('question-answer');
     } catch (e: any) {
       if (tabIdRef.current === actionTabId) {
         const message = String(e?.message || e);
@@ -1958,13 +2064,15 @@ function AgentHistoryControls({
       if (tabIdRef.current === actionTabId) setAnsweringQuestion(false);
       answeringQuestionRef.current = false;
     }
-  }, [onHistoryRefresh, refreshPendingQuestion, runtime, setPendingQuestionFrom, setStatusFrom, tabId]);
+  }, [refreshHistoryWithUpdating, refreshPendingQuestion, runtime, setPendingQuestionFrom, setStatusFrom, tabId]);
 
   const meta = AGENT_STATUS_META[status];
   const isTurnBusy = status === 'busy';
   const controlsLocked = !!busyAction || isPasteBusy || answeringQuestion || rewindLocked;
   const isCancellingTurn = busyAction === 'interrupt' || interruptAwaiting;
   const showThinkingChip = isTurnBusy && !isCancellingTurn && !pendingQuestion;
+  const showRewindingChip = rewindLocked && !pendingQuestion;
+  const showUpdatingChip = historyUpdating && !isTurnBusy && !isCancellingTurn && !pendingQuestion && !rewindLocked;
   const canAcceptPrompt = status === 'active' || (status === 'busy' && runtime.allowSendWhileBusy);
   const canSend = canAcceptPrompt && prompt.trim().length > 0 && !pendingQuestion && !controlsLocked;
   const canGrabDraft = status === 'active' && !pendingQuestion && !controlsLocked;
@@ -2039,7 +2147,7 @@ function AgentHistoryControls({
           </Tooltip>
         )}
         {isCancellingTurn && !draftWarning && !error && (
-          <Tooltip content={'Waiting for ' + runtime.label + ' cancellation record and restored prompt'}>
+          <Tooltip content={'Waiting for ' + runtime.label + ' stop record and restored prompt'}>
             <div
               style={{
                 display: 'inline-flex',
@@ -2058,7 +2166,7 @@ function AgentHistoryControls({
               }}
             >
               <HistorySpinner size={11} />
-              <span>Canceling</span>
+              <span>Stopping</span>
             </div>
           </Tooltip>
         )}
@@ -2114,9 +2222,12 @@ function AgentHistoryControls({
         />
       ) : (
         <>
-          {showThinkingChip && (
+          {(showRewindingChip || showThinkingChip || showUpdatingChip) && (
             <div style={{ display: 'flex', alignItems: 'center', marginBottom: 6 }}>
-              <HistoryThinkingChip label={runtime.label} />
+              <HistoryThinkingChip
+                label={runtime.label}
+                text={showRewindingChip ? 'REWINDING' : showUpdatingChip ? 'UPDATING' : 'THINKING'}
+              />
             </div>
           )}
           <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6 }}>
@@ -2129,6 +2240,7 @@ function AgentHistoryControls({
                 if (isCancellingTurn || rewindLocked) return;
                 setPrompt(e.target.value);
                 if (draftWarning) setDraftWarning(null);
+                if (error) setError(null);
               }}
               onKeyDown={(e) => {
                 if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
@@ -2136,7 +2248,7 @@ function AgentHistoryControls({
                   if (canSend) runAction('send');
                 }
               }}
-              placeholder={rewindLocked ? 'Rewinding... input is locked' : isCancellingTurn ? 'Canceling... waiting for restored prompt' : status === 'inactive' ? 'Resume ' + runtime.label + ' to send' : status === 'starting' ? 'Waiting for prompt...' : 'Send a prompt...'}
+              placeholder={rewindLocked ? 'Rewinding... input is locked' : isCancellingTurn ? 'Stopping... waiting for restored prompt' : status === 'inactive' ? 'Resume ' + runtime.label + ' to send' : status === 'starting' ? 'Waiting for prompt...' : 'Send a prompt...'}
               readOnly={isCancellingTurn || rewindLocked}
               rows={3}
               style={{
@@ -2264,6 +2376,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const panelRef = useRef<HTMLDivElement>(null);
   const [rewindLock, setRewindLock] = useState<{ opId: string; targetText: string } | null>(null);
   const [rewindPreview, setRewindPreview] = useState<RewindPreviewState | null>(null);
+  const lastServerEntriesRef = useRef<FullHistoryEntry[]>([]);
 
   // Save scroll position + clean up CSS highlights on unmount.
   // Virtuoso owns scrolling — the scrollTop we save belongs to the inner
@@ -2295,6 +2408,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const [loading, setLoading] = useState(true);
   const promptHandoffMetaRef = useRef<Map<string, PromptHandoffMeta>>(new Map());
   const suppressedPromptsRef = useRef<Map<string, SuppressedPrompt>>(new Map());
+  const localPromptCleanupTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const rewindPreviewResult = useMemo(
     () => buildRewindPreviewEntries(entries, rewindPreview),
     [entries, rewindPreview],
@@ -2514,9 +2628,37 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     }
   }, []);
 
+  const clearLocalPromptCleanupTimer = useCallback((handoffId: string) => {
+    const timer = localPromptCleanupTimersRef.current.get(handoffId);
+    if (!timer) return;
+    clearTimeout(timer);
+    localPromptCleanupTimersRef.current.delete(handoffId);
+  }, []);
+
+  const armLocalPromptSentCleanup = useCallback((handoffId: string) => {
+    if (!handoffId) return;
+    clearLocalPromptCleanupTimer(handoffId);
+    const timer = setTimeout(() => {
+      localPromptCleanupTimersRef.current.delete(handoffId);
+      const now = Date.now();
+      setEntries(prev => prev.filter(entry => {
+        if (!isLocalPromptEntry(entry) || entry.handoffId !== handoffId || entry.queueStatus !== 'sent') return true;
+        const ageMs = now - (entry.statusChangedAt || entry.optimisticAt || Date.parse(entry.timestamp || '') || now);
+        if (ageMs < LOCAL_PROMPT_SENT_TTL_MS) return true;
+        historyDiag('LOCAL_EXPIRE_SENT tab=' + tabId.slice(-12) +
+          ' handoff=' + handoffId +
+          ' ageMs=' + ageMs +
+          ' preview="' + promptPreview(entry.content) + '"');
+        promptHandoffMetaRef.current.delete(handoffId);
+        return false;
+      }));
+    }, LOCAL_PROMPT_SENT_TTL_MS + 250);
+    localPromptCleanupTimersRef.current.set(handoffId, timer);
+  }, [clearLocalPromptCleanupTimer, tabId]);
+
   const appendLocalPromptEntry = useCallback((
     text: string,
-    queueStatus: 'queued' | 'sent',
+    queueStatus: 'sending' | 'queued' | 'sent',
     meta: { handoffId: string; statusAtSend: AgentPtyStatus; submittedAt: number }
   ) => {
     const cleanContent = normalizeHistoryPromptText(text);
@@ -2528,7 +2670,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       role: 'queued',
       queueStatus,
       handoffId,
-      statusReason: 'send-result',
+      statusReason: queueStatus === 'sending' ? 'send-start' : 'send-result',
       timestamp: new Date(now).toISOString(),
       content: cleanContent,
       sessionId,
@@ -2549,7 +2691,8 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     if (isAtBottomRef.current) {
       setTimeout(() => scrollToBottom(true), 30);
     }
-  }, [scrollToBottom, sessionId, tabId]);
+    if (queueStatus === 'sent') armLocalPromptSentCleanup(handoffId);
+  }, [armLocalPromptSentCleanup, scrollToBottom, sessionId, tabId]);
 
   const updateLocalPromptEntry = useCallback((
     handoffId: string,
@@ -2559,6 +2702,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     if (!handoffId) return;
     const changedAt = Date.now();
     const handoffMeta = promptHandoffMetaRef.current.get(handoffId) || null;
+    clearLocalPromptCleanupTimer(handoffId);
     let suppression: SuppressedPrompt | null = null;
     if ((queueStatus === 'cancelled' || queueStatus === 'failed') && handoffMeta?.text) {
       suppression = {
@@ -2593,7 +2737,8 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         statusChangedAt: changedAt,
       };
     }).filter(entry => !suppression || !entryMatchesSuppressedPrompt(entry, suppression)));
-  }, [tabId]);
+    if (queueStatus === 'sent') armLocalPromptSentCleanup(handoffId);
+  }, [armLocalPromptSentCleanup, clearLocalPromptCleanupTimer, tabId]);
 
   const upsertLocalRewindEntry = useCallback((detail: {
     tabId?: string;
@@ -2614,6 +2759,15 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     const targetText = normalizeHistoryPromptText(detail.targetText || '');
     const now = Date.now();
     const uuid = LOCAL_REWIND_PREFIX + tabId + '-' + opId;
+    const detailMessage = String(detail.error || detail.message || '');
+    if (status === 'failed' && isRewindBusyGuardMessage(detailMessage)) {
+      setRewindLock(null);
+      setEntries(prev => prev.filter(entry => entry.uuid !== uuid));
+      window.dispatchEvent(new CustomEvent('history-panel:agent-error', {
+        detail: { tabId, message: detailMessage }
+      }));
+      return;
+    }
     const rewindStatus: FullHistoryEntry['rewindStatus'] =
       status === 'failed' ? 'failed' : status === 'done' ? 'done' : 'rewinding';
     const content = detail.message
@@ -2625,6 +2779,9 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         : 'Native /rewind';
 
     setRewindLock(status === 'start' ? { opId, targetText } : null);
+    const removeLocalRewindEntry = () => {
+      setEntries(prev => prev.filter(entry => entry.uuid !== uuid));
+    };
     const isDurableRewind =
       status === 'done' && (
         detail.persisted === true ||
@@ -2637,12 +2794,16 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       if (targetText && detail.historyInputDraft === true) {
         setHistoryPromptDraft(tabId, targetText);
       }
-      setEntries(prev => prev.filter(entry => entry.uuid !== uuid));
+      removeLocalRewindEntry();
       return;
     }
     if (status === 'done' && detail.mode === 'native' && detail.targetUuid && targetText && (detail.toolType || toolType) === 'claude') {
       setRewindPreview({ opId, targetUuid: detail.targetUuid, targetText, startedAt: now });
       setHistoryPromptDraft(tabId, targetText);
+    }
+    if (status !== 'failed') {
+      removeLocalRewindEntry();
+      return;
     }
     setEntries(prev => {
       const idx = prev.findIndex(entry => entry.uuid === uuid);
@@ -2666,14 +2827,6 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   }, [scrollToBottom, sessionId, setHistoryPromptDraft, tabId, toolType]);
 
   useEffect(() => {
-    const handler = (event: Event) => {
-      upsertLocalRewindEntry((event as CustomEvent).detail || {});
-    };
-    window.addEventListener('history-panel:rewind-log', handler);
-    return () => window.removeEventListener('history-panel:rewind-log', handler);
-  }, [upsertLocalRewindEntry]);
-
-  useEffect(() => {
     setRewindLock(null);
     setRewindPreview(null);
   }, [tabId, sessionId]);
@@ -2692,7 +2845,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
 
   // Load full history
   const loadHistory = useCallback(async (isRefresh = false) => {
-    if (!sessionId) return;
+    if (!sessionId) return false;
     try {
       const ipcChannel = toolType === 'gemini' ? 'gemini:get-full-history' : toolType === 'codex' ? 'codex:get-full-history' : 'claude:get-full-history';
       const result = await ipcRenderer.invoke(ipcChannel, { sessionId, cwd });
@@ -2710,6 +2863,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         const rawServerEntries: FullHistoryEntry[] = result.entries || [];
         const suppressedResult = filterSuppressedPromptEntries(rawServerEntries, suppressedPromptsRef.current.values());
         const serverEntries = suppressedResult.entries;
+        lastServerEntriesRef.current = serverEntries;
         if (suppressedResult.hidden > 0) {
           historyDiag('SUPPRESS_FILTERED tab=' + tabId.slice(-12) +
             ' hidden=' + suppressedResult.hidden +
@@ -2767,12 +2921,80 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
             return newEntries;
           });
         }
+        return true;
       }
+      return false;
     } catch (e) {
       console.warn('[HistoryPanel] Load error:', e);
       if (!isRefresh) setLoading(false);
+      return false;
     }
   }, [sessionId, cwd, scrollToBottom, tabId, toolType]);
+
+  const waitForDurableRewindHistory = useCallback(async (detail: {
+    targetUuid?: string;
+    opId?: string;
+    toolType?: string;
+  }) => {
+    const targetUuid = detail.targetUuid || '';
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const ok = await loadHistory(true);
+      const serverEntries = lastServerEntriesRef.current || [];
+      const targetStillVisible = !!targetUuid && serverEntries.some((entry) => entry.uuid === targetUuid);
+      historyDiag('REWIND_REFRESH tab=' + tabId.slice(-12) +
+        ' op=' + (detail.opId || '-') +
+        ' attempt=' + (attempt + 1) +
+        ' ok=' + ok +
+        ' targetStillVisible=' + targetStillVisible +
+        ' server=' + serverEntries.length);
+      if (!targetStillVisible) return true;
+      await new Promise((resolve) => setTimeout(resolve, attempt < 2 ? 140 : 320));
+    }
+    return false;
+  }, [loadHistory, tabId]);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = ((event as CustomEvent).detail || {}) as {
+        tabId?: string;
+        opId?: string;
+        status?: 'start' | 'done' | 'failed';
+        targetUuid?: string;
+        targetText?: string;
+        mode?: 'native' | 'ai';
+        toolType?: string;
+        persisted?: boolean;
+        historyInputDraft?: boolean;
+        error?: string;
+        message?: string;
+      };
+      if (detail.tabId !== tabId) return;
+      const durableDone = detail.status === 'done' && (
+        detail.persisted === true ||
+        detail.mode === 'ai' ||
+        detail.toolType === 'codex' ||
+        detail.toolType === 'gemini'
+      );
+      if (!durableDone) {
+        upsertLocalRewindEntry(detail);
+        return;
+      }
+      upsertLocalRewindEntry({
+        ...detail,
+        status: 'start',
+        message: 'Updating history...',
+      });
+      waitForDurableRewindHistory(detail)
+        .catch((e: any) => {
+          console.warn('[HistoryPanel] rewind refresh wait failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
+        })
+        .finally(() => {
+          upsertLocalRewindEntry(detail);
+        });
+    };
+    window.addEventListener('history-panel:rewind-log', handler);
+    return () => window.removeEventListener('history-panel:rewind-log', handler);
+  }, [tabId, upsertLocalRewindEntry, waitForDurableRewindHistory]);
 
   // Broadcast loading state to InfoPanel button
   useEffect(() => {
@@ -2786,10 +3008,19 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     setLoading(true);
     setEntries([]);
     setRewindPreview(null);
+    for (const timer of localPromptCleanupTimersRef.current.values()) clearTimeout(timer);
+    localPromptCleanupTimersRef.current.clear();
     promptHandoffMetaRef.current.clear();
     suppressedPromptsRef.current.clear();
     loadHistory(false);
   }, [sessionId, toolType]);
+
+  useEffect(() => {
+    return () => {
+      for (const timer of localPromptCleanupTimersRef.current.values()) clearTimeout(timer);
+      localPromptCleanupTimersRef.current.clear();
+    };
+  }, []);
 
   // Restore saved scroll position after initial load completes.
   // Virtuoso owns the scroller, so we write into `virtuosoScrollerRef.current.scrollTop`

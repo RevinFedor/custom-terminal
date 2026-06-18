@@ -35,6 +35,18 @@ function warnTimelineTextSearchDiag(message: string) {
   }
 }
 
+const REWIND_BUSY_GUARD_RE = /\bis busy; wait for the current turn before rewind\b/i;
+
+function isRewindBusyGuardMessage(message: string): boolean {
+  return REWIND_BUSY_GUARD_RE.test(message);
+}
+
+function emitHistoryAgentError(tabId: string, message: string) {
+  window.dispatchEvent(new CustomEvent('history-panel:agent-error', {
+    detail: { tabId, message }
+  }));
+}
+
 // True when an entry is NOT a regular user prompt — currently 'compact', 'continued',
 // 'docs_edit', 'docs_search'. Used widely to skip non-user entries in nav/copy/visibility.
 // If a new attribute-style entry type is ever added, update this ONE place.
@@ -1099,6 +1111,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     for (const [, ws] of state.openProjects) {
       const t = ws.tabs.get(tabId);
       if (t) return t.tabType === 'claude-sdk';
+    }
+    return false;
+  });
+  const isTabAiBusy = useWorkspaceStore(state => {
+    for (const [, ws] of state.openProjects) {
+      const t = ws.tabs.get(tabId);
+      if (t) return !!(t.aiBusy || t.claudeBusy);
     }
     return false;
   });
@@ -3587,8 +3606,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         finishCancelled();
         return;
       }
+      const rewindErrorMessage = String((rewindErr as any)?.message || rewindErr);
       console.error('[Restore:Rewind] Rewind IPC failed:', rewindErr);
-      emitHistoryRewindLog('failed', String((rewindErr as any)?.message || rewindErr));
+      if (isRewindBusyGuardMessage(rewindErrorMessage)) {
+        emitHistoryAgentError(tabId, rewindErrorMessage);
+      } else {
+        emitHistoryRewindLog('failed', rewindErrorMessage);
+      }
       setRewindState(null);
       activeRewindRef.current = null;
     } finally {
@@ -6042,7 +6066,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   )}
                   {/* Rewind — left side native, right side Gemini compact + native rewind. */}
                   {(() => {
-                    const canStartRewind = !!sessionId && !rewindState && !!getRewindTargetContext(contextMenu.entry);
+                    const hasRewindTarget = !!getRewindTargetContext(contextMenu.entry);
+                    const canStartRewind = !!sessionId && !rewindState && !isTabAiBusy && hasRewindTarget;
+                    const rewindBusyTitle = isTabAiBusy
+                      ? 'Wait until the current loader finishes before rewind'
+                      : undefined;
                     return (
                       <>
                         <div className="border-t border-white/10 my-1" />
@@ -6050,6 +6078,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                           <button
                             className={`flex-1 text-left px-3 py-2 text-xs rounded-l transition-colors ${canStartRewind ? 'text-amber-400 hover:bg-amber-600/20 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
                             disabled={!canStartRewind}
+                            title={rewindBusyTitle}
                             onClick={(e) => {
                               e.stopPropagation();
                               console.warn('[Restore:Rewind] native button click',
@@ -6061,10 +6090,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                           >
                             {rewindState ? (rewindState.phase === 'compacting' ? 'Gemini...' : rewindState.phase === 'rewinding' ? 'Rewind...' : 'Paste...') : 'Rewind'}
                           </button>
-                          <Tooltip content="Rewind через AI">
+                          <Tooltip content={isTabAiBusy ? 'Wait until the current loader finishes before rewind' : 'Rewind через AI'}>
                             <button
                               className={`px-2 py-2 text-[10px] font-bold tracking-wide rounded-r transition-colors border-l border-white/10 ${canStartRewind ? 'text-amber-400/80 hover:bg-amber-600/30 hover:text-amber-300 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
                               disabled={!canStartRewind}
+                              title={rewindBusyTitle}
                               onClick={(e) => {
                                 e.stopPropagation();
                                 console.warn('[Restore:Rewind] ai button click',

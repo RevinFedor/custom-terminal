@@ -90,6 +90,12 @@ const INTERRUPT_DEDUP_MS = 700;
 const shortTab = (tabId: string) => String(tabId || '').slice(-12) || 'unknown';
 const errorText = (e: any) => String(e?.message || e);
 
+function isSubmittedCodexAuditTimeout(result: any): boolean {
+  return result?.success === false &&
+    result?.submitted === true &&
+    result?.error === 'codex_user_message_audit_timeout';
+}
+
 const findTabState = (tabId: string): { aiBusy?: boolean; commandType?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string } | null => {
   const store = useWorkspaceStore.getState();
   for (const [, workspace] of store.openProjects) {
@@ -118,7 +124,7 @@ async function getCodexPtyPresence(tabId: string): Promise<AgentPtyPresence> {
     useWorkspaceStore.getState().setAiBusy(tabId, isBusy);
   }
   return {
-    status: isRunning ? (isBusy ? 'busy' : 'active') : 'inactive',
+    status: isRunning ? (isBusy ? 'busy' : (inputReady ? 'active' : 'starting')) : 'inactive',
     hasBridge: !!tab?.codexSessionId,
     isBusy,
     hasTerm: state?.error !== 'tab not found',
@@ -167,7 +173,9 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
   const tabState = findTabState(tabId);
   const modelForPicker = requestedModel && requestedModel !== 'none' ? requestedModel : (tabState?.codexModel || '');
   const effortForPicker = requestedEffort && requestedEffort !== 'none' ? requestedEffort : '';
-  console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' model=' + (modelForPicker || '-') + ' effort=' + (effortForPicker || '-') + ' submitIntent=enter chars=' + prompt.length);
+  const draftStateForSend = terminalRegistry.getCodexDraftState(tabId);
+  const skipVisibleDraftGuard = draftStateForSend?.source === 'no-terminal';
+  console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' model=' + (modelForPicker || '-') + ' effort=' + (effortForPicker || '-') + ' submitIntent=enter chars=' + prompt.length + ' draftSource=' + (draftStateForSend?.source || '-') + ' skipVisibleDraftGuard=' + skipVisibleDraftGuard);
   if (options.statusAtSend !== 'busy' && modelForPicker) {
     const currentModel = tabState?.codexModel || '';
     const currentEffort = tabState?.codexEffort || '';
@@ -199,9 +207,15 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
     handoffId: options.handoffId || null,
     source: options.source || null,
     statusAtSend: options.statusAtSend || null,
+    skipVisibleDraftGuard,
   })
     .then((result: any) => {
-      console.log('[CodexHistoryActions:send] done tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' success=' + (result?.success !== false) + ' queued=' + (result?.queued ? 'true' : 'false') + ' submitKey=' + (result?.submitKey || '-'));
+      const auditTimeoutAfterSubmit = isSubmittedCodexAuditTimeout(result);
+      console.log('[CodexHistoryActions:send] done tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' success=' + (auditTimeoutAfterSubmit || result?.success !== false) + ' queued=' + (result?.queued ? 'true' : 'false') + ' submitKey=' + (result?.submitKey || '-') + ' auditSoft=' + auditTimeoutAfterSubmit);
+      if (auditTimeoutAfterSubmit) {
+        console.warn('[CodexHistoryActions:send] audit timeout after submitted Enter tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' - keeping local prompt as sent/queued; watcher logs remain authoritative for diagnosis');
+        return { ...result, success: true, auditWarning: result.error, userMessageAuditPending: true };
+      }
       return result;
     })
     .catch((e: any) => {

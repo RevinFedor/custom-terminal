@@ -180,29 +180,36 @@ function extractCodexDraftFromLine(snapshotOrLine: LogicalLineSnapshot | string)
 
 function extractCodexDraftAfterEmptyPrompt(buf: any, promptRow: number): { hasDraft: true; preview: string; sourceSuffix: string } | null {
   if (!buf || promptRow < 0 || promptRow >= buf.length) return null;
-  const end = Math.min(buf.length, promptRow + 9);
+  const end = Math.min(buf.length, promptRow + 18);
   for (let row = promptRow + 1; row < end; row++) {
     const line = buf.getLine(row);
     if (!line) break;
-    if (line.isWrapped) continue;
 
     const snapshot = getLogicalLineSnapshotAt(buf, row);
-    const normalized = String(snapshot.text || '')
+    const raw = String(line.translateToString?.(true) || '');
+    const normalized = (String(snapshot.text || '') || raw)
       .replace(/\u00a0/g, ' ')
       .replace(/[▌█]/g, '')
       .trimEnd();
-    const withoutBorder = normalized.replace(/^\s*│\s?/, '');
+    const rawNormalized = raw
+      .replace(/\u00a0/g, ' ')
+      .replace(/[▌█]/g, '')
+      .trimEnd();
+    const withoutBorder = normalized.replace(/^\s*[│┃║]\s?/, '');
+    const rawWithoutBorder = rawNormalized.replace(/^\s*[│┃║]\s?/, '');
     const candidate = withoutBorder.trim();
-    if (!candidate) continue;
-    if (/^[╭╰]/.test(candidate)) return null;
+    const rawCandidate = rawWithoutBorder.trim();
+    const effectiveCandidate = candidate || rawCandidate;
+    if (!effectiveCandidate) continue;
+    if (/^[╭╰]/.test(effectiveCandidate)) return null;
 
     const candidateCells = snapshot.cells
-      .filter((cell) => cell.ch.trim() && cell.ch !== '▌' && cell.ch !== '█' && cell.ch !== '│');
+      .filter((cell) => cell.ch.trim() && cell.ch !== '▌' && cell.ch !== '█' && !/[│┃║]/.test(cell.ch));
     if (candidateCells.length > 0 && candidateCells.every((cell) => cell.dim)) return null;
-    if (CODEX_EMPTY_COMPOSER_HINT_RE.test(candidate)) return null;
-    if (CODEX_NON_DRAFT_LINE_RE.test(candidate)) return null;
+    if (CODEX_EMPTY_COMPOSER_HINT_RE.test(effectiveCandidate)) return null;
+    if (CODEX_NON_DRAFT_LINE_RE.test(effectiveCandidate)) return null;
 
-    return { hasDraft: true, preview: candidate.slice(0, 120), sourceSuffix: ':multiline-draft-row-' + row };
+    return { hasDraft: true, preview: effectiveCandidate.slice(0, 120), sourceSuffix: ':multiline-draft-row-' + row };
   }
   return null;
 }

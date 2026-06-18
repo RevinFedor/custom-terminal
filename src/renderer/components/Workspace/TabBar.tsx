@@ -6098,7 +6098,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                           triggerVariant="context-row"
                           triggerLabel="Restart after"
                           triggerIcon={<RotateCw size={12} />}
-                          menuWidth={280}
+                          menuWidth={252}
                           zIndex={100040}
                           side="right"
                           accentColor="#8b5cf6"

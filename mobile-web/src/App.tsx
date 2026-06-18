@@ -1779,7 +1779,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
     (async () => {
       const t0 = performance.now();
       const tokenStr = (() => { try { return getToken() || ''; } catch { return ''; } })();
-      const baseUrl = '/api/sdk-tabs/' + encodeURIComponent(tabIdLocal!) + '/history';
+      const baseUrl = '/api/terminal-tabs/' + encodeURIComponent(tabIdLocal!) + '/history';
 
       // ─ Phase 0: hydrate from IDB (synchronous-ish, microseconds-fast) ─
       // sessionId in IDB is the Claude session UUID (stable across SDK
@@ -2863,7 +2863,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
 }
 
 // Center-of-header pill: shows current model + effort, click opens param sheet.
-// Loads from /api/sdk-tabs/:id/params on mount; updates locally + POST on save.
+// Loads from /api/terminal-tabs/:id/params on mount; updates locally + POST on save.
 // `adaptive`/`disabled` (thinking) sits as a tiny caption beneath.
 // Each entry's label is the SAME string used in both the Model picker pills
 // (sheet) and as the candidate header pill — single source of truth.

@@ -39,7 +39,7 @@ Step 4: DELETE WHERE tab_id NOT IN (new_set)      -- ТОЛЬКО если count
 Для intentional batch-операций (перенос 3+ табов между проектами, массовое закрытие) Safety Guard можно обойти через параметр `forceCleanup: true`:
 - `saveTabs(projectId, tabs, true)` — принудительно выполняет Step 4 cleanup
 - Используется в `moveTabsToProject` и batch close (`closeTab` с `{ forceCleanup: true }`)
-- Исключение из старого правила: намеренное закрытие **последней** вкладки проекта тоже должно идти с `forceCleanup`, потому что новый set пустой и SQL `NOT IN (new_set)` физически не из чего собрать. Без этого in-memory проект выглядит пустым, но старая строка остаётся в SQLite и после fresh start вкладка возвращается. Проверочный симптом: после `POST /api/sdk-tabs/:tabId/close` endpoint `/api/projects/:id/tabs` показывает `0`, а прямой `select count(*) from tabs where project_id=?` остаётся `1`.
+- Исключение из старого правила: намеренное закрытие **последней** вкладки проекта тоже должно идти с `forceCleanup`, потому что новый set пустой и SQL `NOT IN (new_set)` физически не из чего собрать. Без этого in-memory проект выглядит пустым, но старая строка остаётся в SQLite и после fresh start вкладка возвращается. Проверочный симптом: после `POST /api/terminal-tabs/:tabId/close` endpoint `/api/projects/:id/tabs` показывает `0`, а прямой `select count(*) from tabs where project_id=?` остаётся `1`.
 - **Не** передавай `forceCleanup` из restore/startup/частичных background snapshots. Single-tab close с оставшимися вкладками остаётся обычной операцией; force нужен только когда после намеренного удаления `workspace.tabs.size === 0` или это явный batch.
 
 ## Файлы
