@@ -121,7 +121,7 @@ const LOCAL_PROMPT_PREFIX = 'local-prompt-';
 const LOCAL_REWIND_PREFIX = 'local-rewind-';
 const LOCAL_PROMPT_FAILURE_TTL_MS = 15000;
 const LOCAL_PROMPT_SENT_TTL_MS = 12000;
-const REWIND_BUSY_GUARD_RE = /\bis busy; wait for the current turn before rewind\b/i;
+const REWIND_BUSY_GUARD_RE = /\bis (?:busy|starting); wait (?:for the current turn|until the current loader finishes) before rewind\b/i;
 
 const normalizeHistoryPromptText = (text: string) => String(text || '')
   .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')

@@ -5,7 +5,9 @@
 // Implements MCP JSON-RPC 2.0 over stdio (zero SDK dependencies).
 //
 // Tools: list_tabs, restart_process, run_command, start_ai, send_prompt,
-//        read_output, create_tab, kill_process, stop_ai, run_chain
+//        read_output, create_tab, kill_process, stop_ai, interrupt_ai,
+//        read_draft, draft_state, rewind_ai, get_pending_question,
+//        answer_question, run_chain
 // =============================================================================
 
 import { readFileSync, readdirSync, statSync } from 'fs';
@@ -75,6 +77,26 @@ function listLiveVoiceInstances() {
     const files = readdirSync(PORT_DIR).filter(f => /^voice-web-server-\d+\.json$/.test(f));
     for (const f of files) {
       const pid = parseInt(f.match(/^voice-web-server-(\d+)\.json$/)?.[1] || '', 10);
+      if (!pid) continue;
+      try { process.kill(pid, 0); } catch { continue; }
+      const full = join(PORT_DIR, f);
+      let payload;
+      try { payload = JSON.parse(readFileSync(full, 'utf-8').trim()); } catch { continue; }
+      if (!payload.port) continue;
+      const mtime = (() => { try { return statSync(full).mtimeMs; } catch { return 0; } })();
+      out.push({ ...payload, pid, mtime });
+    }
+  } catch {}
+  out.sort((a, b) => (b.updatedAt || b.mtime || 0) - (a.updatedAt || a.mtime || 0));
+  return out;
+}
+
+function listLiveWebInstances() {
+  const out = [];
+  try {
+    const files = readdirSync(PORT_DIR).filter(f => /^web-server-\d+\.json$/.test(f));
+    for (const f of files) {
+      const pid = parseInt(f.match(/^web-server-(\d+)\.json$/)?.[1] || '', 10);
       if (!pid) continue;
       try { process.kill(pid, 0); } catch { continue; }
       const full = join(PORT_DIR, f);
@@ -207,6 +229,7 @@ function projectHint(args = {}, tabId) {
     projectId,
     cwd: project?.path || cwd,
     port: project?.port || null,
+    pid: project?.pid || null,
   };
 }
 
@@ -223,7 +246,7 @@ function resolveExternalCreateTarget(args = {}) {
     const list = projects.map(p => '- ' + (p.name || p.path || p.id) + (p.id ? ' (projectId: ' + p.id + ')' : '') + (p.path ? ' — ' + p.path : '')).join('\n');
     throw new Error('Multiple Noted Terminal projects are open. Pass projectId or cwd.\n' + list);
   }
-  return { projectId: projects[0].id, cwd: projects[0].path || PROJECT_CWD, port: projects[0].port };
+  return { projectId: projects[0].id, cwd: projects[0].path || PROJECT_CWD, port: projects[0].port, pid: projects[0].pid || null };
 }
 
 function buildSourceMeta() {
@@ -234,6 +257,12 @@ function buildSourceMeta() {
     tabId: PARENT_TAB_ID || '',
     cwd: PROJECT_CWD,
   };
+}
+
+function simpleAgentCommand(command) {
+  const c = typeof command === 'string' ? command.trim().toLowerCase() : '';
+  if (c === 'claude' || c === 'codex') return c;
+  return null;
 }
 
 // tabId format: <base64(projectPath)>-tab-<N> for path-derived projects, or
@@ -282,6 +311,57 @@ async function httpPostOnPort(port, endpoint, body) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (json.error || text));
+  return json;
+}
+
+function pickWebInstance(target = {}) {
+  const instances = listLiveWebInstances();
+  if (!instances.length) throw new Error('Noted Terminal web server is not running (no live web-server-*.json in ' + PORT_DIR + ')');
+
+  const hintPid = parseInt(process.env.NOTED_MAIN_PID || '', 10);
+  if (hintPid) {
+    const pinned = instances.find(i => i.pid === hintPid);
+    if (pinned) return pinned;
+  }
+  if (target.pid) {
+    const pinned = instances.find(i => i.pid === target.pid);
+    if (pinned) return pinned;
+  }
+  return instances[0];
+}
+
+function apiAuthHeaders() {
+  const token = readSharedToken();
+  if (!token) throw new Error('Shared web token not found at ' + TOKEN_PATH);
+  return {
+    'Content-Type': 'application/json',
+    Authorization: 'Bearer ' + token,
+  };
+}
+
+async function httpApiGet(target, endpoint) {
+  const inst = pickWebInstance(target);
+  const res = await fetch('http://127.0.0.1:' + inst.port + endpoint, {
+    headers: apiAuthHeaders(),
+  });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (json.error || text));
+  return json;
+}
+
+async function httpApiPost(target, endpoint, body) {
+  const inst = pickWebInstance(target);
+  const res = await fetch('http://127.0.0.1:' + inst.port + endpoint, {
+    method: 'POST',
+    headers: apiAuthHeaders(),
+    body: JSON.stringify(body || {}),
   });
   const text = await res.text();
   let json;
@@ -385,13 +465,17 @@ const TOOLS = [
   },
   {
     name: 'send_prompt',
-    description: 'Send text to a live AI tab (Claude, Codex, or Gemini) using the correct TUI-safe path instead of a raw shell write. Default `submit=true` sends the prompt immediately. Pass `submit=false` to paste an editable draft into the agent input without pressing Enter. Use this for AI tabs; use run_command for generic shells.',
+    description: 'Send text to a live AI tab (Claude or Codex) through the Project API scenario layer. Default `submit=true` sends the prompt immediately and handles busy/readiness/draft preflight. Pass `submit=false` only to paste an editable draft into the agent input without pressing Enter. Use this for AI tabs; use run_command for generic shells.',
     inputSchema: {
       type: 'object',
       properties: {
         tabId: { type: 'string', description: 'AI tab ID from list_tabs' },
         prompt: { type: 'string', description: 'Prompt text to paste into the live AI session' },
         submit: { type: 'boolean', description: 'Default true. Set false to leave the prompt editable in the input box.' },
+        model: { type: 'string', description: 'Optional model override for scenario send.' },
+        effort: { type: 'string', description: 'Optional effort override for scenario send.' },
+        thinking: { type: 'string', description: 'Optional thinking mode override for scenario send.' },
+        queue: { type: 'boolean', description: 'When true, queue the prompt if the agent is busy instead of failing.' },
         projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Use when tabId is not path-derived.' },
       },
       required: ['tabId', 'prompt'],
@@ -439,6 +523,8 @@ const TOOLS = [
         command: { type: 'string', description: 'Command to run on creation (e.g. "npm run dev")' },
         color: { type: 'string', description: 'Tab color override' },
         background: { type: 'boolean', description: 'Default true. Keep MCP-created tabs in background; set false only when the user explicitly wants focus.' },
+        model: { type: 'string', description: 'Optional model override when command is "codex" or "claude" and the Project API supports it.' },
+        effort: { type: 'string', description: 'Optional effort override when command is "codex" and the Project API supports it.' },
         projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Required in external mode when multiple projects are open and cwd is omitted.' },
       },
     },
@@ -462,6 +548,93 @@ const TOOLS = [
       type: 'object',
       properties: {
         tabId: { type: 'string', description: 'AI tab ID from list_tabs' },
+        projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Use when tabId is not path-derived.' },
+      },
+      required: ['tabId'],
+    },
+  },
+  {
+    name: 'interrupt_ai',
+    description: 'Soft-interrupt the current Claude/Codex turn through the shared scenario layer. This matches the composer Stop button and is distinct from stop_ai, which stops the runtime.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'AI tab ID from list_tabs' },
+        projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Use when tabId is not path-derived.' },
+      },
+      required: ['tabId'],
+    },
+  },
+  {
+    name: 'read_draft',
+    description: 'Read the live terminal composer draft after interrupt/rollback through the shared scenario layer.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'AI tab ID from list_tabs' },
+        projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Use when tabId is not path-derived.' },
+      },
+      required: ['tabId'],
+    },
+  },
+  {
+    name: 'draft_state',
+    description: 'Probe whether a terminal composer has a draft without mutating TUI state. Prefer this before send/rollback decisions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'AI tab ID from list_tabs' },
+        projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Use when tabId is not path-derived.' },
+      },
+      required: ['tabId'],
+    },
+  },
+  {
+    name: 'rewind_ai',
+    description: 'Run native or AI rewind for a Claude/Codex terminal tab through the shared scenario layer. Use exact target fields from the history/timeline item when available.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'AI tab ID from list_tabs' },
+        mode: { type: 'string', enum: ['native', 'ai'], description: 'Default native. ai builds a compact/rewind prompt.' },
+        targetIndex: { type: 'integer', description: 'Timeline/history index to rewind to, when available.' },
+        targetText: { type: 'string', description: 'Short target text shown in the history UI.' },
+        targetFullText: { type: 'string', description: 'Full target prompt/assistant text, when available.' },
+        rewindableCount: { type: 'integer', description: 'Number of rewindable items visible to the caller.' },
+        skipDuplicates: { type: 'integer', description: 'Number of duplicate prompt entries to skip.' },
+        startUuid: { type: 'string', description: 'Start UUID for AI rewind range.' },
+        endUuid: { type: 'string', description: 'End UUID for AI rewind range.' },
+        targetUuid: { type: 'string', description: 'Fallback target UUID.' },
+        additionalPrompt: { type: 'string', description: 'Optional extra instruction for AI rewind.' },
+        projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Use when tabId is not path-derived.' },
+      },
+      required: ['tabId'],
+    },
+  },
+  {
+    name: 'get_pending_question',
+    description: 'Read the current AskUserQuestion pending on a Claude/Codex tab, if any.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'AI tab ID from list_tabs' },
+        projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Use when tabId is not path-derived.' },
+      },
+      required: ['tabId'],
+    },
+  },
+  {
+    name: 'answer_question',
+    description: 'Answer or stop an AskUserQuestion on a Claude/Codex tab through the shared scenario layer.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'AI tab ID from list_tabs' },
+        source: { type: 'string', enum: ['pty', 'sdk'], description: 'Question source. Default pty.' },
+        toolUseID: { type: 'string', description: 'Tool use id from get_pending_question, when available.' },
+        questions: { type: 'array', description: 'Questions payload from get_pending_question.', items: { type: 'object' } },
+        answers: { type: 'object', description: 'Map question text to selected label/value.' },
+        stop: { type: 'boolean', description: 'When true, cancel/stop the question instead of answering.' },
         projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Use when tabId is not path-derived.' },
       },
       required: ['tabId'],
@@ -688,6 +861,23 @@ async function callTool(name, args) {
 
     case 'send_prompt': {
       const target = projectHint(args, args.tabId);
+      if (args.submit !== false) {
+        const result = await httpApiPost(
+          target,
+          '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/send',
+          {
+            prompt: args.prompt,
+            model: args.model || undefined,
+            effort: args.effort || undefined,
+            thinking: args.thinking || undefined,
+            cwd: target.cwd || undefined,
+            source: 'terminal-mcp',
+            queue: args.queue === true,
+          },
+        );
+        return 'Prompt sent to tab ' + args.tabId + ' through Project API scenario layer. Status: ' + (result.status || 'sent') + (result.queued ? ' (queued)' : '');
+      }
+
       const body = {
         tabId: args.tabId,
         prompt: args.prompt,
@@ -698,7 +888,7 @@ async function callTool(name, args) {
       const result = target.port
         ? await httpPostOnPort(target.port, '/terminal/ai-prompt', body)
         : await httpPost('/terminal/ai-prompt', body, target.cwd);
-      return (args.submit === false ? 'Prompt pasted into tab ' : 'Prompt sent to tab ') + args.tabId + '. Status: ' + result.status;
+      return 'Prompt pasted as editable draft into tab ' + args.tabId + '. Status: ' + result.status;
     }
 
     case 'start_ai': {
@@ -737,6 +927,21 @@ async function callTool(name, args) {
     case 'create_tab': {
       const target = resolveExternalCreateTarget(args);
       const cwd = args.cwd || target.cwd || PROJECT_CWD;
+      const agent = simpleAgentCommand(args.command);
+      if (agent && target.projectId) {
+        const result = await httpApiPost(
+          target,
+          '/api/projects/' + encodeURIComponent(target.projectId) + '/agent-tabs',
+          {
+            toolType: agent,
+            name: args.name || undefined,
+            model: args.model || undefined,
+            effort: args.effort || undefined,
+          },
+        );
+        return agent[0].toUpperCase() + agent.slice(1) + ' agent tab created in background through Project API. Tab ID: ' + (result.tabId || '-');
+      }
+
       const body = {
         name: args.name || undefined,
         cwd,
@@ -767,15 +972,70 @@ async function callTool(name, args) {
 
     case 'stop_ai': {
       const target = projectHint(args, args.tabId);
-      const body = {
-        tabId: args.tabId,
-        parentProjectId: target.projectId || undefined,
-        sourceMeta: buildSourceMeta(),
-      };
-      const result = target.port
-        ? await httpPostOnPort(target.port, '/terminal/ai-stop', body)
-        : await httpPost('/terminal/ai-stop', body, target.cwd);
-      return 'AI stopped in tab ' + args.tabId + '. Status: ' + result.status;
+      const result = await httpApiPost(target, '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/stop', {});
+      if (result.stopped === false) {
+        return 'AI stop requested for tab ' + args.tabId + ', but no active session was stopped. Reason: ' + (result.reason || 'unknown');
+      }
+      return 'AI stop requested for tab ' + args.tabId + ' through Project API scenario layer.';
+    }
+
+    case 'interrupt_ai': {
+      const target = projectHint(args, args.tabId);
+      const result = await httpApiPost(target, '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/interrupt', {});
+      if (result.interrupted === false) {
+        return 'AI interrupt requested for tab ' + args.tabId + ', but no active turn was interrupted. Reason: ' + (result.reason || 'unknown');
+      }
+      return 'AI turn interrupted in tab ' + args.tabId + ' through Project API scenario layer.';
+    }
+
+    case 'read_draft': {
+      const target = projectHint(args, args.tabId);
+      const result = await httpApiGet(target, '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/draft');
+      const draft = result.draftText ?? result.text ?? result.draft ?? '';
+      if (typeof draft === 'string' && draft.length) {
+        return 'Draft from tab ' + args.tabId + ':\n\n' + draft;
+      }
+      return 'Draft result for tab ' + args.tabId + ':\n\n' + JSON.stringify(result, null, 2);
+    }
+
+    case 'draft_state': {
+      const target = projectHint(args, args.tabId);
+      const result = await httpApiGet(target, '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/draft-state');
+      return 'Draft state for tab ' + args.tabId + ':\n\n' + JSON.stringify(result, null, 2);
+    }
+
+    case 'rewind_ai': {
+      const target = projectHint(args, args.tabId);
+      const result = await httpApiPost(target, '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/rewind', {
+        mode: args.mode || 'native',
+        targetIndex: args.targetIndex,
+        targetText: args.targetText,
+        targetFullText: args.targetFullText,
+        rewindableCount: args.rewindableCount,
+        skipDuplicates: args.skipDuplicates || 0,
+        startUuid: args.startUuid || args.targetUuid || undefined,
+        endUuid: args.endUuid || undefined,
+        additionalPrompt: args.additionalPrompt || undefined,
+      });
+      return 'Rewind requested for tab ' + args.tabId + ':\n\n' + JSON.stringify(result, null, 2);
+    }
+
+    case 'get_pending_question': {
+      const target = projectHint(args, args.tabId);
+      const result = await httpApiGet(target, '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/pending-question');
+      return 'Pending question for tab ' + args.tabId + ':\n\n' + JSON.stringify(result.pendingQuestion || null, null, 2);
+    }
+
+    case 'answer_question': {
+      const target = projectHint(args, args.tabId);
+      const result = await httpApiPost(target, '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/answer-question', {
+        source: args.source || 'pty',
+        toolUseID: args.toolUseID || undefined,
+        questions: args.questions || undefined,
+        answers: args.answers || {},
+        stop: args.stop === true,
+      });
+      return 'Question action result for tab ' + args.tabId + ':\n\n' + JSON.stringify(result, null, 2);
     }
 
     case 'run_chain': {
@@ -844,7 +1104,7 @@ async function callTool(name, args) {
       if (returnTo) {
         text += '\nReturn target: tab=' + (returnTo.tabId || '-') + (sessionId ? ' session=' + sessionId : ' session=(not yet known)');
         if (tabName || commandType) text += ' (' + [tabName, commandType].filter(Boolean).join(', ') + ')';
-        text += '\nVoice Record will wait for Noted Terminal to reopen, for this tab/session to be restored, then it will send the completion prompt via /terminal/ai-prompt.';
+        text += '\nVoice Record will wait for Noted Terminal to reopen, for this tab/session to be restored, then it will send the completion prompt via the Project API scenario send path.';
       } else {
         text += '\nNo return target was available, so this is fire-and-forget with status only in Voice Record GET /api/terminal/build-install.';
       }

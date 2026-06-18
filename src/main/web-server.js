@@ -1561,7 +1561,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
     try {
       const body = await readBody(req);
       const toolType = body.toolType === 'codex' ? 'codex' : 'claude';
-      const data = await bridgeRequest('createAgentTab', { projectId: decId(m[1]), toolType });
+      const data = await bridgeRequest('createAgentTab', {
+        projectId: decId(m[1]),
+        toolType,
+        name: cleanOptionalString(body.name, ''),
+        codexModel: cleanOptionalString(body.model || body.codexModel, ''),
+        codexEffort: cleanOptionalString(body.effort || body.codexEffort, ''),
+      });
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });

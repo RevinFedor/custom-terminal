@@ -36,6 +36,13 @@ Noted Terminal — кастомный эмулятор терминала на �
 ## State Management
 - **ProjectWorkspace:** Хранит состояние вкладок, директорий и активных сессий проекта.
 
+## Agent API Boundary
+- **Terminal layer = primitives:** нажать клавишу, вставить текст, остановить процесс, прочитать TUI draft/JSONL. Не поднимай на этот уровень сценарии продукта.
+- **Project API / History / iOS / Inbox API / terminal MCP = сценарии поверх терминала:** отправка во время streaming, Stop/interrupt с возвратом draft, stopped-session Rewind, AskUserQuestion и readiness должны идти через общий scenario layer, а не дублироваться в клиентах.
+- **Project API и Inbox API отличаются ownership input:** project/tab-клиенты управляют конкретной вкладкой и не очищают чужой TUI draft; Inbox/внешний чат владеет своим composer и может получить `draftText` наружу для rollback.
+- `overseer MCP` не отправляет prompt и не стартует живой процесс: он читает/редактирует историю. Живое управление агентом (`send_prompt`, `start_ai`, `stop_ai`, `create_tab`) принадлежит `terminal MCP` и должно проверяться вместе с API/History/iOS.
+- При изменении Terminal API сначала читать `docs/knowledge/fact-mobile-web.md`, `docs/knowledge/fact-mobile-claude-pty.md`, `docs/knowledge/fact-codex.md`, `docs/knowledge/fact-terminal-mcp.md` и `docs/methodology/сценарии-багов.md` через `docs_search`; iOS/Voice Record не являются source of truth для этой механики.
+
 ## Navigation
 - **Home Button Toggle:** Кнопка 🏠 (Home) работает как переключатель. При нахождении на Dashboard повторный клик по 🏠 возвращает пользователя в контекст последнего активного проекта вместо перезагрузки Dashboard. Это сокращает время на навигацию при частом переходе между Dashboard и проектами.
 

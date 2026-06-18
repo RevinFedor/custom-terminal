@@ -3826,9 +3826,11 @@ function register({ projectManager, formatToolAction }) {
             const idx = pendingQueueEntries.findIndex(q => q.queueStatus === 'queued');
             if (idx >= 0) {
               const queued = pendingQueueEntries[idx];
-              pendingQueueEntries.splice(idx, 1);
-              const renderedIdx = entries.findIndex(e => e.uuid === queued.uuid);
-              if (renderedIdx >= 0) entries.splice(renderedIdx, 1);
+              // Claude can emit `remove` when a queued prompt is consumed after an
+              // interactive AskUserQuestion form without writing a normal user row.
+              // Keep it visible as sent; a later matching user row replaces it via
+              // dropMatchingQueuedEntry().
+              queued.queueStatus = 'sent';
             }
           } else if (entry.operation === 'popAll') {
             for (const queued of pendingQueueEntries) {

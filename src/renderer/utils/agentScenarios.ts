@@ -218,6 +218,17 @@ function createAgentReadyWait(tabId: string, runtime: HistoryAgentRuntime, timeo
   };
 }
 
+function isAgentRewindBlockedStatus(status?: AgentPtyStatus | null): boolean {
+  return status === 'busy' || status === 'starting';
+}
+
+function getAgentRewindBlockedMessage(runtime: HistoryAgentRuntime, status?: AgentPtyStatus | null): string {
+  if (status === 'starting') {
+    return runtime.label + ' is starting; wait until the current loader finishes before rewind';
+  }
+  return runtime.label + ' is busy; wait for the current turn before rewind';
+}
+
 async function ensureAgentReadyForRewind({
   tabId,
   toolType,
@@ -243,8 +254,8 @@ async function ensureAgentReadyForRewind({
     + ' status=' + (presence?.status || 'unknown')
     + ' inputReady=' + !!presence?.inputReady
     + ' busy=' + !!presence?.isBusy);
-  if (presence?.status === 'busy') {
-    throw new Error(runtime.label + ' is busy; wait for the current turn before rewind');
+  if (isAgentRewindBlockedStatus(presence?.status)) {
+    throw new Error(getAgentRewindBlockedMessage(runtime, presence?.status));
   }
   if (presence?.status === 'active' && presence?.inputReady) {
     await waitStartupDefaultsIfNeeded();
@@ -253,6 +264,7 @@ async function ensureAgentReadyForRewind({
 
   const readyWait = createAgentReadyWait(tabId, runtime);
   try {
+    const resumedForRewind = !presence || presence.status === 'inactive';
     if (!presence || presence.status === 'inactive') {
       console.log('[AgentScenario:rewind] resume before rewind tool=' + toolType + ' tab=' + String(tabId).slice(-12));
       const resumeResult = await runtime.resume({ tabId, sessionId, cwd });
@@ -262,8 +274,8 @@ async function ensureAgentReadyForRewind({
     }
 
     presence = await runtime.getPresence(tabId).catch(() => null);
-    if (presence?.status === 'busy') {
-      throw new Error(runtime.label + ' is busy; wait for the current turn before rewind');
+    if (presence?.status === 'busy' || (presence?.status === 'starting' && !resumedForRewind)) {
+      throw new Error(getAgentRewindBlockedMessage(runtime, presence?.status));
     }
     if (presence?.status === 'active' && presence?.inputReady) {
       readyWait.cancel();
@@ -278,6 +290,9 @@ async function ensureAgentReadyForRewind({
       + ' status=' + (presence?.status || 'unknown')
       + ' inputReady=' + !!presence?.inputReady
       + ' busy=' + !!presence?.isBusy);
+    if (isAgentRewindBlockedStatus(presence?.status)) {
+      throw new Error(getAgentRewindBlockedMessage(runtime, presence?.status));
+    }
     if (presence?.status !== 'active' || !presence?.inputReady) {
       throw new Error(runtime.label + ' session is not ready for rewind');
     }

@@ -9586,6 +9586,10 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       }
 
       const menuReadyRe = /Stay\s*at\s*current\s*position|Restore\s*and\s*fork|Rewind\s*conversation|Do\s*nothing|Enter\s*to\s*continue|Esc\s*to\s*cancel|↑\s*\d+\s*more\s*above|↓\s*\d+\s*more\s*below/i;
+      function isClaudeRewindSlashHelpOpen(clean) {
+        const text = String(clean || '');
+        return /\/rewind\s+Restore\s+the\s+code\s+and\/or\s+conversation/i.test(text);
+      }
       const menuWait = waitForPtyText(
         term,
         menuReadyRe,
@@ -9606,14 +9610,34 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
         return { success: false, error: commandResult?.error || 'rewind_command_failed' };
       }
 
+      const afterSlashSnapshot = await requestTerminalVisibleBufferSnapshot(
+        event.sender,
+        tabId,
+        'claude-rewind-after-slash-enter',
+        700
+      );
+      const afterSlashLines = snapshotLines(afterSlashSnapshot).slice(-12);
+      const afterSlashClean = afterSlashLines.map(line => line.text).join('\n');
+      console.log('[Claude:Rewind:SlashAfterEnter] success=' + (afterSlashSnapshot?.success === true)
+        + ' error=' + (afterSlashSnapshot?.error || '-')
+        + ' slashHelpOpen=' + isClaudeRewindSlashHelpOpen(afterSlashClean)
+        + ' menuLooksOpen=' + menuReadyRe.test(afterSlashClean)
+        + ' selectedCandidates=' + JSON.stringify(extractSnapshotSelectedCandidates(afterSlashSnapshot).slice(-5))
+        + ' lines=' + JSON.stringify(afterSlashLines.map(line => ({
+          row: line.row,
+          text: line.text.substring(0, 120),
+          wrapped: line.wrapped
+        }))));
+
       const menuRaw = await menuWait;
       const menuClean = cleanBuffer(menuRaw);
       const moreAboveMatch = menuClean.match(/↑\s*(\d+)\s*more\s*above/i);
       const moreAboveCount = moreAboveMatch ? Number(moreAboveMatch[1]) : 0;
       const initialCandidates = extractSelectedCandidates(menuRaw);
       const menuLooksOpen = menuReadyRe.test(menuClean);
+      const slashHelpOpen = isClaudeRewindSlashHelpOpen(menuClean);
       if (!menuRaw || !menuLooksOpen) {
-        console.error('[Claude:Rewind] Menu did not open. raw=' + menuRaw.length + ' candidates=' + initialCandidates.length + ' menuLooksOpen=' + menuLooksOpen + ' clean="' + menuClean.substring(0, 240) + '"');
+        console.error('[Claude:Rewind] Menu did not open. raw=' + menuRaw.length + ' candidates=' + initialCandidates.length + ' menuLooksOpen=' + menuLooksOpen + ' slashHelpOpen=' + slashHelpOpen + ' clean="' + menuClean.substring(0, 240) + '"');
         return { success: false, error: 'Rewind menu did not open' };
       }
       if (initialCandidates.length > 0) {
@@ -9929,19 +9953,173 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     return anchors;
   }
 
+  function buildCodexShortRewindAnchors(expectedText) {
+    const normalized = normalizeCandidate(expectedText);
+    const words = normalized.split(/\s+/).filter(Boolean);
+    if (normalized.length < 2 || normalized.length > 32 || words.length > 4) return [];
+    return [normalized];
+  }
+
+  function findCodexOverlayAnchorRole(visible, anchor) {
+    const normalizedAnchor = normalizeCandidate(anchor);
+    if (!normalizedAnchor) return null;
+    if (!visible.includes(normalizedAnchor)) return null;
+    // Codex transcript overlay uses `›` as the prompt/cursor marker. Dev logs
+    // from 019edc60 show a valid selected target rendered as `› <target>`, so
+    // `›` must not be treated as proof that the target is only the next row.
+    return { selected: true, nextPrompt: false };
+  }
+
   function matchCodexRewindOverlayFrame(frame, expectedText) {
     const clean = String(frame?.clean || '');
     const visible = stripCodexRewindOverlayChrome(clean);
     const anchors = buildCodexRewindAnchors(expectedText);
-    const matchedAnchor = anchors.find(anchor => visible.includes(anchor));
+    const shortAnchors = buildCodexShortRewindAnchors(expectedText);
+    let matchedAnchor = '';
+    let nextPromptAnchor = '';
+    for (const anchor of anchors) {
+      const role = findCodexOverlayAnchorRole(visible, anchor);
+      if (!role) continue;
+      if (role.selected && !matchedAnchor) matchedAnchor = anchor;
+      if (role.nextPrompt && !nextPromptAnchor) nextPromptAnchor = anchor;
+      if (matchedAnchor) break;
+    }
+    const matchedShortAnchor = matchedAnchor
+      ? ''
+      : shortAnchors.find(anchor => {
+        const role = findCodexOverlayAnchorRole(visible, anchor);
+        if (role?.selected) return true;
+        if (role?.nextPrompt && !nextPromptAnchor) nextPromptAnchor = anchor;
+        return false;
+      });
     return {
-      matched: !!matchedAnchor,
-      anchor: matchedAnchor || '',
-      anchorCount: anchors.length,
+      matched: !!(matchedAnchor || matchedShortAnchor),
+      anchor: matchedAnchor || matchedShortAnchor || '',
+      anchorCount: anchors.length + shortAnchors.length,
+      anchorMode: matchedAnchor ? 'long' : (matchedShortAnchor ? 'short-prompt' : 'none'),
+      targetAfterSelected: !!nextPromptAnchor && !(matchedAnchor || matchedShortAnchor),
+      nextPromptAnchor,
       visiblePreview: visible.slice(0, 220),
+      visibleText: visible,
       targetPreview: normalizeCandidate(expectedText).slice(0, 220),
       visibleLength: visible.length,
       rawLength: String(frame?.raw || '').length,
+    };
+  }
+
+  function matchCodexRewindActivePromptSnapshot(snapshot, expectedText) {
+    const active = snapshot?.codexActivePrompt || null;
+    const activeText = normalizeCandidate(active?.text || '');
+    const anchors = buildCodexRewindAnchors(expectedText);
+    const shortAnchors = buildCodexShortRewindAnchors(expectedText);
+    const matchedAnchor = anchors.find(anchor => activeText.includes(normalizeCandidate(anchor))) || '';
+    const matchedShortAnchor = matchedAnchor
+      ? ''
+      : shortAnchors.find(anchor => activeText.includes(normalizeCandidate(anchor))) || '';
+    return {
+      success: snapshot?.success === true,
+      error: snapshot?.error || '',
+      matched: !!(matchedAnchor || matchedShortAnchor),
+      anchor: matchedAnchor || matchedShortAnchor || '',
+      anchorCount: anchors.length + shortAnchors.length,
+      anchorMode: matchedAnchor ? 'active-long' : (matchedShortAnchor ? 'active-short-prompt' : 'active-none'),
+      targetAfterSelected: false,
+      nextPromptAnchor: '',
+      activePromptRow: active?.row ?? null,
+      activePromptPreview: activeText.slice(0, 220),
+      activePromptStyles: Array.isArray(active?.styles) ? active.styles.slice(0, 4) : [],
+    };
+  }
+
+  function getCodexPromptRowsFromSnapshot(snapshot) {
+    const lines = Array.isArray(snapshot?.lines) ? snapshot.lines : [];
+    return lines
+      .filter(line => /[›❯]/.test(String(line?.text || '')))
+      .map(line => ({
+        row: line?.row ?? null,
+        text: normalizeCandidate(line?.text || '').slice(0, 120),
+        firstTextStyle: String(line?.firstTextStyle || ''),
+        styles: Array.isArray(line?.styles) ? line.styles.slice(0, 4) : [],
+      }))
+      .slice(-12);
+  }
+
+  async function matchCodexRewindSelection(frame, expectedText, reason) {
+    const rawMatch = matchCodexRewindOverlayFrame(frame, expectedText);
+    const snapshot = await requestTerminalVisibleBufferSnapshot(
+      _event.sender,
+      tabId,
+      'codex-rewind-' + reason,
+      700
+    );
+    const activeMatch = matchCodexRewindActivePromptSnapshot(snapshot, expectedText);
+    const promptRows = getCodexPromptRowsFromSnapshot(snapshot);
+    console.log('[Codex:Rewind:ActiveSnapshot] reason=' + reason
+      + ' success=' + activeMatch.success
+      + ' error=' + (activeMatch.error || '-')
+      + ' matched=' + activeMatch.matched
+      + ' row=' + (activeMatch.activePromptRow ?? 'none')
+      + ' mode=' + activeMatch.anchorMode
+      + ' anchor=' + JSON.stringify(String(activeMatch.anchor || '').slice(0, 80))
+      + ' active=' + JSON.stringify(activeMatch.activePromptPreview.slice(0, 160))
+      + ' styles=' + JSON.stringify(activeMatch.activePromptStyles)
+      + ' rawMatched=' + rawMatch.matched
+      + ' rawAfter=' + rawMatch.targetAfterSelected
+      + ' prompts=' + JSON.stringify(promptRows));
+    if (activeMatch.success) {
+      let targetAfterActive = false;
+      let targetBeforeActive = false;
+      if (!activeMatch.matched && rawMatch.matched) {
+        const visible = normalizeCandidate(rawMatch.visibleText || rawMatch.visiblePreview || '');
+        const active = normalizeCandidate(activeMatch.activePromptPreview || '');
+        const target = normalizeCandidate(expectedText);
+        const targetAnchors = [
+          target,
+          ...buildCodexShortRewindAnchors(expectedText),
+          ...buildCodexRewindAnchors(expectedText),
+        ].map(normalizeCandidate).filter(Boolean);
+        const activePos = active ? visible.indexOf(active) : -1;
+        let targetPos = -1;
+        for (const anchor of targetAnchors) {
+          targetPos = visible.indexOf(anchor);
+          if (targetPos >= 0) break;
+        }
+        targetAfterActive = activePos >= 0 && targetPos > activePos;
+        targetBeforeActive = activePos >= 0 && targetPos >= 0 && targetPos < activePos;
+        console.log('[Codex:Rewind:VisibleTargetHint] reason=' + reason
+          + ' activePos=' + activePos
+          + ' targetPos=' + targetPos
+          + ' targetAfterActive=' + targetAfterActive
+          + ' targetBeforeActive=' + targetBeforeActive
+          + ' active=' + JSON.stringify(active.slice(0, 80))
+          + ' target=' + JSON.stringify(target.slice(0, 80))
+          + ' visible=' + JSON.stringify(visible.slice(0, 180)));
+      }
+      return {
+        ...rawMatch,
+        matched: activeMatch.matched,
+        anchor: activeMatch.anchor,
+        anchorCount: activeMatch.anchorCount,
+        anchorMode: activeMatch.anchorMode,
+        targetAfterSelected: targetAfterActive,
+        targetBeforeSelected: targetBeforeActive,
+        nextPromptAnchor: '',
+        activePromptRow: activeMatch.activePromptRow,
+        activePromptPreview: activeMatch.activePromptPreview,
+        activePromptStyles: activeMatch.activePromptStyles,
+        promptRows,
+        rawMatched: rawMatch.matched,
+        rawTargetAfterSelected: rawMatch.targetAfterSelected,
+      };
+    }
+    return {
+      ...rawMatch,
+      activePromptRow: null,
+      activePromptPreview: '',
+      activePromptStyles: [],
+      promptRows,
+      targetBeforeSelected: false,
+      snapshotError: activeMatch.error || 'snapshot-unavailable',
     };
   }
 
@@ -9963,7 +10141,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
 
   async function grabRestoredCodexRewindInput(expectedText) {
     const expected = normalizeCandidate(expectedText);
-    const delays = [0, 180, 420, 900];
+    const delays = [0, 180, 420, 900, 1600, 2600];
     let lastResult = null;
     for (let attempt = 0; attempt < delays.length; attempt++) {
       if (delays[attempt] > 0) await new Promise(resolve => setTimeout(resolve, delays[attempt]));
@@ -10084,14 +10262,17 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       codexRewindOverlayOpen = true;
 
       let selectedOlderSteps = null;
-      let selectedMatch = matchCodexRewindOverlayFrame(openFrame, targetInputText);
+      let selectedMatch = await matchCodexRewindSelection(openFrame, targetInputText, 'open');
       let duplicatesRemaining = Math.max(0, Number(skipDuplicates || 0));
-      const maxOlderSteps = Math.min(count - 1, Math.max(olderSteps + 8, olderSteps, duplicatesRemaining + 8));
+      const maxOlderSteps = Math.min(60, Math.max(count + 8, olderSteps + 12, duplicatesRemaining + 8));
       console.log('[Codex:Rewind] overlay match step=0/' + maxOlderSteps
         + ' matched=' + selectedMatch.matched
+        + ' targetAfterSelected=' + selectedMatch.targetAfterSelected
         + ' duplicatesRemaining=' + duplicatesRemaining
         + ' anchors=' + selectedMatch.anchorCount
+        + ' mode=' + selectedMatch.anchorMode
         + ' anchor=' + JSON.stringify(selectedMatch.anchor.slice(0, 80))
+        + ' nextPromptAnchor=' + JSON.stringify(String(selectedMatch.nextPromptAnchor || '').slice(0, 80))
         + ' visible=' + JSON.stringify(selectedMatch.visiblePreview.slice(0, 160))
         + ' target=' + JSON.stringify(selectedMatch.targetPreview.slice(0, 160)));
       if (selectedMatch.matched) {
@@ -10101,6 +10282,8 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         } else {
           selectedOlderSteps = 0;
         }
+      } else if (selectedMatch.targetAfterSelected) {
+        console.warn('[Codex:Rewind] target appears as next prompt at step=0; refusing to commit without selectable target');
       } else if (olderSteps === 0 && codexOverlayFrameHasNoSelectableText(selectedMatch)) {
         selectedOlderSteps = 0;
         console.log('[Codex:Rewind] overlay initial frame has no selectable text; using latest prompt position and verifying restored composer after Enter');
@@ -10118,15 +10301,18 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
             (clean, raw) => raw.includes(CODEX_SYNC_MARKER)
               || /enter to edit message|edit prev|edit next|Context\s+\d+%/i.test(clean)
           );
-          selectedMatch = matchCodexRewindOverlayFrame(navFrame, targetInputText);
+          selectedMatch = await matchCodexRewindSelection(navFrame, targetInputText, 'left#' + step);
           console.log('[Codex:Rewind] nav left step=' + step + '/' + maxOlderSteps
             + ' planned=' + olderSteps
             + ' timedOut=' + navFrame.timedOut
             + ' raw=' + navFrame.raw.length + 'B'
             + ' matched=' + selectedMatch.matched
+            + ' targetAfterSelected=' + selectedMatch.targetAfterSelected
             + ' duplicatesRemaining=' + duplicatesRemaining
             + ' anchors=' + selectedMatch.anchorCount
+            + ' mode=' + selectedMatch.anchorMode
             + ' anchor=' + JSON.stringify(selectedMatch.anchor.slice(0, 80))
+            + ' nextPromptAnchor=' + JSON.stringify(String(selectedMatch.nextPromptAnchor || '').slice(0, 80))
             + ' visible=' + JSON.stringify(selectedMatch.visiblePreview.slice(0, 160)));
           if (navFrame.timedOut) {
             try { term.write('q'); } catch {}
@@ -10145,6 +10331,62 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
               console.log('[Codex:Rewind] overlay target duplicate at step=' + step + ' skipped, remaining=' + duplicatesRemaining);
             } else {
               selectedOlderSteps = step;
+              break;
+            }
+          } else if (selectedMatch.targetAfterSelected) {
+            if (duplicatesRemaining > 0) {
+              duplicatesRemaining--;
+              console.log('[Codex:Rewind] overlay next-prompt target duplicate at step=' + step + ' skipped, remaining=' + duplicatesRemaining);
+            } else if (step > 0) {
+              const correctedOlderSteps = step - 1;
+              console.log('[Codex:Rewind] target is next prompt after selected row; moving Right once to commit target correctedOlderSteps=' + correctedOlderSteps + ' fromStep=' + step);
+              const rightFrame = await sendCodexKeyAndCapture(
+                term,
+                '\x1b[C',
+                2600,
+                '[Codex:Rewind:nav:right#1',
+                (clean, raw) => raw.includes(CODEX_SYNC_MARKER)
+                  || /enter to edit message|edit prev|edit next|Context\s+\d+%/i.test(clean)
+              );
+              if (rightFrame.timedOut) {
+                try { term.write('q'); } catch {}
+                return {
+                  success: false,
+                  error: 'codex_rewind_navigation_timeout',
+                  rollbackTurns,
+                  pressCount: 2 + step + 1,
+                  clean: rightFrame.clean.slice(0, 800),
+                  rollbackMayHaveApplied: false,
+                };
+              }
+              const correctedMatch = await matchCodexRewindSelection(rightFrame, targetInputText, 'right#1');
+              console.log('[Codex:Rewind] nav right correction done correctedOlderSteps=' + correctedOlderSteps
+                + ' matched=' + correctedMatch.matched
+                + ' targetAfterSelected=' + correctedMatch.targetAfterSelected
+                + ' anchors=' + correctedMatch.anchorCount
+                + ' mode=' + correctedMatch.anchorMode
+                + ' anchor=' + JSON.stringify(correctedMatch.anchor.slice(0, 80))
+                + ' nextPromptAnchor=' + JSON.stringify(String(correctedMatch.nextPromptAnchor || '').slice(0, 80))
+                + ' visible=' + JSON.stringify(correctedMatch.visiblePreview.slice(0, 160)));
+              if (!correctedMatch.matched) {
+                try {
+                  term.write('q');
+                  await drainPtyData(term, 120, 500);
+                } catch {}
+                return {
+                  success: false,
+                  error: 'codex_rewind_target_not_selected_before_enter',
+                  rollbackTurns,
+                  pressCount: 2 + step + 1,
+                  rollbackMayHaveApplied: false,
+                  anchorCount: correctedMatch.anchorCount,
+                  visiblePreview: correctedMatch.visiblePreview,
+                  targetPreview: correctedMatch.targetPreview,
+                  correctionFailed: true,
+                };
+              }
+              selectedOlderSteps = correctedOlderSteps;
+              selectedMatch = correctedMatch;
               break;
             }
           }
@@ -10187,7 +10429,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       const confirmFrame = await sendCodexKeyAndCapture(
         term,
         '\r',
-        7000,
+        3200,
         '[Codex:Rewind:confirm]',
         (clean) => /Cannot rollback|ThreadRollbackFailed|rollback.*failed|requires persisted/i.test(clean)
           || (targetNeedle.length > 0 && normalizeCandidate(clean).includes(targetNeedle))
@@ -10195,17 +10437,30 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       const confirmClean = confirmFrame.clean || '';
       console.log('[Codex:Rewind] confirm timedOut=' + confirmFrame.timedOut + ' clean=' + JSON.stringify(confirmClean.slice(0, 320)));
       codexRewindOverlayOpen = false;
+      if (/Update available|directory to resume this session|directory to fork this session|Starting\s+MCP\s+servers|MCP\s+startup\s+interrupted|esc\s+to\s+interrupt/i.test(confirmClean)) {
+        const hadReady = codexTuiReadyTabs.delete(tabId);
+        codexTuiReadyBuffers.set(tabId, String(confirmFrame.raw || '').slice(-CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT));
+        console.warn('[Codex:Rewind] confirm exposed startup frame; cleared input-ready tab=' + String(tabId).slice(-12)
+          + ' hadReady=' + hadReady
+          + ' preview=' + JSON.stringify(confirmClean.replace(/\s+/g, ' ').trim().slice(0, 220)));
+        _webBroadcast(tabId, {
+          type: 'snapshot',
+          sessionId: codexKnownSessions.get(tabId) || null,
+          busy: false,
+          sessionStatus: 'starting',
+          toolType: 'codex',
+          commandType: 'codex',
+          inputReady: false,
+        });
+      }
       if (/Cannot rollback|ThreadRollbackFailed|rollback.*failed|requires persisted/i.test(confirmClean)) {
         return { success: false, error: 'codex_thread_rollback_failed', clean: confirmClean.slice(0, 800) };
       }
       if (confirmFrame.timedOut || (targetNeedle.length > 0 && !normalizeCandidate(confirmClean).includes(targetNeedle))) {
-        return {
-          success: false,
-          error: 'codex_rewind_target_prefill_not_observed',
-          rollbackTurns,
-          pressCount: escPressCount,
-          clean: confirmClean.slice(0, 800),
-        };
+        console.warn('[Codex:Rewind] confirm frame did not include target prefill; verifying composer via grab'
+          + ' timedOut=' + confirmFrame.timedOut
+          + ' targetNeedle=' + JSON.stringify(targetNeedle)
+          + ' clean=' + JSON.stringify(confirmClean.slice(0, 220)));
       }
       await drainPtyData(term, 120, 700);
 
@@ -14831,7 +15086,15 @@ function captureCodexFrame(term, { timeoutMs = 3000, predicate = null, logPrefix
 async function sendCodexKeyAndCapture(term, key, timeoutMs = 2500, logPrefix = '[Codex:Picker]', predicate = null) {
   const capture = captureCodexFrame(term, { timeoutMs, logPrefix, predicate });
   if (String(logPrefix || '').includes('Codex:Rewind')) {
-    const keyLabel = key === '\x1b' ? 'Esc' : key === '\r' ? 'Enter' : key === '\x1b[D' ? 'Left' : JSON.stringify(key);
+    const keyLabel = key === '\x1b'
+      ? 'Esc'
+      : key === '\r'
+        ? 'Enter'
+        : key === '\x1b[D'
+          ? 'Left'
+          : key === '\x1b[C'
+            ? 'Right'
+            : JSON.stringify(key);
     console.log(logPrefix + ' writing key=' + keyLabel + ' bytes=' + String(key || '').length);
   }
   term.write(key);

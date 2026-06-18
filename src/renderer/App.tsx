@@ -2441,10 +2441,15 @@ function App() {
     };
     ipcRenderer.on('claude:paste-busy', handlePasteBusy);
 
-    const handleTerminalVisibleBufferRequest = (_: any, payload: { requestId?: string; tabId?: string; reason?: string }) => {
+    const handleTerminalVisibleBufferRequest = async (_: any, payload: { requestId?: string; tabId?: string; reason?: string }) => {
       const requestId = payload?.requestId;
       const tabId = payload?.tabId;
       if (!requestId || !tabId) return;
+      if (String(payload?.reason || '').startsWith('codex-rewind-')) {
+        await new Promise<void>((resolve) => {
+          window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
+        });
+      }
       const snapshot = terminalRegistry.getVisibleSnapshot(tabId);
       ipcRenderer.send('terminal:visible-buffer-response', {
         requestId,

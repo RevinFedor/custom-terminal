@@ -212,6 +212,29 @@ function _effortDiagScan(tabId: string, data: string) {
   }
 }
 
+const CODEX_OVERLAY_STYLE_LOG_KEYS = new Set(['Escape', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Enter']);
+
+function isCodexTabForStyleProbe(tabId: string): boolean {
+  const state = useWorkspaceStore.getState();
+  for (const workspace of state.openProjects.values()) {
+    const tab = workspace.tabs.get(tabId);
+    if (!tab) continue;
+    return tab.commandType === 'codex' || !!tab.codexSessionId;
+  }
+  return false;
+}
+
+function scheduleCodexOverlayStyleProbe(tabId: string, event: KeyboardEvent, source: string): void {
+  if (event.type !== 'keydown') return;
+  if (!CODEX_OVERLAY_STYLE_LOG_KEYS.has(event.key)) return;
+  if (!isCodexTabForStyleProbe(tabId)) return;
+  window.requestAnimationFrame(() => {
+    window.setTimeout(() => {
+      terminalRegistry.logCodexOverlayStyleSnapshot(tabId, source + ':key=' + event.key);
+    }, 80);
+  });
+}
+
 // Guard for the AUTOMATIC (deferred) terminal focus calls fired after a tab
 // mounts/activates: setTimeout(100)/rAF in the init + activate effects. These
 // must NOT steal focus from a real UI text field. The canonical victim is the
@@ -1688,6 +1711,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       // Intercept Enter key to replace claude/claude-c/claude-f with explicit --resume
       // Commands: claude (new), claude-c (continue), claude-f (fork)
       term.attachCustomKeyEventHandler((event) => {
+        scheduleCodexOverlayStyleProbe(tabId, event, 'initTerminal');
         // Cmd+ArrowDown — scroll terminal to the most recent output. Handled here
         // (not in the global window listener) so xterm.js consumes the event and
         // doesn't pass the Down-arrow byte to the PTY (which would feed it as
@@ -2285,6 +2309,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
         // === INPUT INTERCEPTION for Claude Commands (same as initTerminal) ===
         term.attachCustomKeyEventHandler((event) => {
+          scheduleCodexOverlayStyleProbe(tabId, event, 'reattach');
           // Cmd+ArrowDown — scroll-to-bottom (mirrors the primary handler above).
           if (event.metaKey && event.type === 'keydown' && event.key === 'ArrowDown') {
             event.preventDefault();

@@ -9,7 +9,7 @@ import { TAB_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStor
 import { generateTabTitleFromPrompt, isEligibleTabTitleEntry, trimTabTitlePrompt } from '../../utils/generateTabTitle';
 import { timelineSummaryKey, useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
-import { getHistoryAgentRuntime, type AgentHistoryTool } from '../../utils/historyAgentRuntimes';
+import { getHistoryAgentRuntime, type AgentHistoryTool, type AgentPtyStatus } from '../../utils/historyAgentRuntimes';
 import { waitForClaudeStartupDefaultsReady } from '../../utils/claudeStartupDefaultsGate';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
@@ -565,6 +565,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     mode: RewindMode;
   } | null>(null);
   const [rewindLoadingMenu, setRewindLoadingMenu] = useState<{ x: number; y: number } | null>(null);
+  const [rewindAgentStatus, setRewindAgentStatus] = useState<AgentPtyStatus | null>(null);
 
   const createAgentReadyWait = useCallback((runtime: ReturnType<typeof getHistoryAgentRuntime>, timeoutMs = 30000) => {
     let cleanup = () => {};
@@ -599,6 +600,25 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       cancel: () => cleanup(),
     };
   }, [tabId]);
+
+  useEffect(() => {
+    if (!contextMenu || (toolType !== 'claude' && toolType !== 'codex')) {
+      setRewindAgentStatus(null);
+      return;
+    }
+    let cancelled = false;
+    const runtime = getHistoryAgentRuntime(toolType as AgentHistoryTool);
+    runtime.getPresence(tabId)
+      .then((presence) => {
+        if (!cancelled) setRewindAgentStatus(presence?.status || null);
+      })
+      .catch(() => {
+        if (!cancelled) setRewindAgentStatus(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [contextMenu?.entry.uuid, tabId, toolType]);
 
   // Edit Range state
   const [editRangeState, _setEditRangeState] = useState<{
@@ -3464,6 +3484,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         ' inputReady=' + !!presence?.inputReady +
         ' hasTerm=' + !!presence?.hasTerm +
         ' busy=' + !!presence?.isBusy;
+      const isBlockedStatus = (status?: AgentPtyStatus | null) => status === 'busy' || status === 'starting';
+      const blockedMessage = (status?: AgentPtyStatus | null) =>
+        status === 'starting'
+          ? runtime.label + ' is starting; wait until the current loader finishes before rewind'
+          : runtime.label + ' is busy; wait for the current turn before rewind';
       const waitStartupDefaultsIfNeeded = async () => {
         if (toolType !== 'claude') return;
         emitHistoryRewindLog('start', undefined, 'Claude Rewind: applying startup defaults...');
@@ -3476,8 +3501,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         return null;
       });
       console.warn('[Restore:Rewind] Presence before native rewind:', runtime.label, describePresence(presence));
-      if (presence?.status === 'busy') {
-        throw new Error(runtime.label + ' is busy; wait for the current turn before rewind');
+      if (isBlockedStatus(presence?.status)) {
+        throw new Error(blockedMessage(presence?.status));
       }
       if (presence?.status === 'active' && presence?.inputReady) {
         await waitStartupDefaultsIfNeeded();
@@ -3486,6 +3511,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
       const readyWait = createAgentReadyWait(runtime);
       try {
+        const resumedForRewind = !presence || presence.status === 'inactive';
         if (!presence || presence.status === 'inactive') {
           emitHistoryRewindLog('start', undefined, runtime.label + ' Rewind: starting session...');
           const resumeResult = await runtime.resume({ tabId, sessionId, cwd });
@@ -3498,8 +3524,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         }
 
         presence = await runtime.getPresence(tabId).catch(() => null);
-        if (presence?.status === 'busy') {
-          throw new Error(runtime.label + ' is busy; wait for the current turn before rewind');
+        if (presence?.status === 'busy' || (presence?.status === 'starting' && !resumedForRewind)) {
+          throw new Error(blockedMessage(presence?.status));
         }
         if (presence?.status === 'active' && presence?.inputReady) {
           readyWait.cancel();
@@ -3512,6 +3538,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
         presence = await runtime.getPresence(tabId).catch(() => null);
         console.warn('[Restore:Rewind] Presence after resume wait:', runtime.label, describePresence(presence));
+        if (isBlockedStatus(presence?.status)) {
+          throw new Error(blockedMessage(presence?.status));
+        }
         if (presence?.status !== 'active' || !presence?.inputReady) {
           throw new Error(runtime.label + ' session is not ready for rewind');
         }
@@ -6067,8 +6096,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   {/* Rewind — left side native, right side Gemini compact + native rewind. */}
                   {(() => {
                     const hasRewindTarget = !!getRewindTargetContext(contextMenu.entry);
-                    const canStartRewind = !!sessionId && !rewindState && !isTabAiBusy && hasRewindTarget;
-                    const rewindBusyTitle = isTabAiBusy
+                    const isRewindStarting = rewindAgentStatus === 'starting';
+                    const isRewindBlocked = isTabAiBusy || isRewindStarting;
+                    const canStartRewind = !!sessionId && !rewindState && !isRewindBlocked && hasRewindTarget;
+                    const rewindBusyTitle = isRewindBlocked
                       ? 'Wait until the current loader finishes before rewind'
                       : undefined;
                     return (
@@ -6083,6 +6114,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                               e.stopPropagation();
                               console.warn('[Restore:Rewind] native button click',
                                 'canStart=' + canStartRewind,
+                                'agentStatus=' + (rewindAgentStatus || 'unknown'),
                                 'session=' + (sessionId ? sessionId.slice(0, 8) : 'none'),
                                 'entry=' + contextMenu.entry.uuid.slice(0, 8));
                               if (canStartRewind) handleRewind(contextMenu.entry, 'native');
@@ -6090,7 +6122,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                           >
                             {rewindState ? (rewindState.phase === 'compacting' ? 'Gemini...' : rewindState.phase === 'rewinding' ? 'Rewind...' : 'Paste...') : 'Rewind'}
                           </button>
-                          <Tooltip content={isTabAiBusy ? 'Wait until the current loader finishes before rewind' : 'Rewind через AI'}>
+                          <Tooltip content={isRewindBlocked ? 'Wait until the current loader finishes before rewind' : 'Rewind через AI'}>
                             <button
                               className={`px-2 py-2 text-[10px] font-bold tracking-wide rounded-r transition-colors border-l border-white/10 ${canStartRewind ? 'text-amber-400/80 hover:bg-amber-600/30 hover:text-amber-300 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
                               disabled={!canStartRewind}
@@ -6099,6 +6131,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                                 e.stopPropagation();
                                 console.warn('[Restore:Rewind] ai button click',
                                   'canStart=' + canStartRewind,
+                                  'agentStatus=' + (rewindAgentStatus || 'unknown'),
                                   'session=' + (sessionId ? sessionId.slice(0, 8) : 'none'),
                                   'entry=' + contextMenu.entry.uuid.slice(0, 8));
                                 if (canStartRewind) handleRewind(contextMenu.entry, 'ai');
