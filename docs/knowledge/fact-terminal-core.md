@@ -177,13 +177,13 @@ if (data.length > 1024) {
 
 ### Алгоритм `safePasteAndSubmit(term, content, options)`:
 1. **Chunking:** `fast=true` цели (Gemini/bash) режутся на UTF-8-safe чанки до 900 байт и пишутся back-to-back внутри одной logical bracketed paste. `fast=false` TUI-safe цели (Claude Ink, Codex AI Rewind) пишут весь payload одним `term.write()` и одной парой `\x1b[200~...\x1b[201~`. Не возвращать per-chunk bracket pairs: Ink/Codex увидят несколько отдельных paste-событий или submit успеет прочитать только хвост.
-2. **Sync Marker Verification:** В `fast=false` после закрывающего bracket функция слушает PTY output и ждёт sync marker `\x1b[?2026l` (конец render frame). Это подтверждает что TUI обработал paste и закоммитил новый кадр composer'а. Это **не** product-level событие «Codex принял вставку» и **не** text echo: Ink/Codex могут коллапсировать вставки в `[Pasted text #N +M lines]` / `[Pasted Content N chars]`, поэтому полный текст не обязан появиться в выводе.
+2. **Sync Marker Verification:** В обычном `fast=false` после закрывающего bracket функция слушает PTY output и ждёт sync marker `\x1b[?2026l` (конец render frame). Это подтверждает что TUI обработал paste и закоммитил новый кадр composer'а. Это **не** product-level событие «Codex принял вставку» и **не** text echo: Ink/Codex могут коллапсировать вставки в `[Pasted text #N +M lines]` / `[Pasted Content N chars]`, поэтому полный текст не обязан появиться в выводе.
    - **Stale Marker Protection:** Введена фильтрация маркеров, приходящих < 3мс после записи. Это предотвращает ложные срабатывания от предыдущих циклов рендеринга (спиннеры, статус-бары). См. `knowledge/fix-stale-sync-markers.md`.
 3. **Submit:** `\r` отправляется ТОЛЬКО после подтверждения последнего чанка — гарантия что `onSubmit(value)` прочитает уже зафиксированный в стейте текст.
 
-Если sync marker не пришёл до safety timeout, programmatic paste обязан вернуть failure до Enter. Это не retry/fallback состояние: без render ACK неизвестно, попал ли text в composer, и submit может отправить пустой, хвостовой или чужой input.
+Если sync marker не пришёл до safety timeout, programmatic paste по умолчанию обязан вернуть failure до Enter. Это не retry/fallback состояние: без render ACK неизвестно, попал ли text в composer, и submit может отправить пустой, хвостовой или чужой input.
 
-Для Codex внешний submit не должен заменять этот render ACK post-paste проверкой видимого renderer-draft: hidden/background renderer может не проснуться вовремя, хотя PTY уже получил paste. Render ACK остаётся pre-Enter gate'ом, а точное совпадение текста доказывается только после Enter через ближайший rollout `user_message` audit.
+Codex external submit — сознательное исключение из этого правила. У Codex CLI нет детерминированного pre-Enter ACK: hidden renderer может не проснуться, PTY render marker может быть stale или не прийти, а текст уже принят composer'ом. Поэтому Codex send paths пропускают post-paste render wait (`skipRenderWait:true`), пишут paste+Enter в один упорядоченный PTY-поток и доказывают доставку только после Enter через rollout `user_message` audit. До paste остаётся отдельный guard от перетирания чужого draft.
 
 ```javascript
 await safePasteAndSubmit(term, content, {
@@ -194,11 +194,11 @@ await safePasteAndSubmit(term, content, {
 });
 ```
 
-**Почему sync markers критичны именно здесь:** Код отправляет текст и `\r` с минимальным разрывом. Без sync marker verification React может не успеть закоммитить state, и `onSubmit` увидит пустую строку.
+**Почему sync markers критичны именно здесь:** для Ink/Claude код отправляет текст и `\r` с минимальным разрывом; без sync marker verification React может не успеть закоммитить state, и `onSubmit` увидит пустую строку. Для Codex эта проверка не считается авторитетной, поэтому переносится на post-Enter rollout audit.
 
 ### Ключевые свойства
 - **Event-driven:** Никаких фиксированных таймаутов. Sync marker = факт render, не предположение.
-- **Любая длина:** fast-path чанкуется по байтам без разрыва UTF-8 code point; TUI-safe path держит один logical paste и один render ACK.
+- **Любая длина:** fast-path чанкуется по байтам без разрыва UTF-8 code point; TUI-safe path держит один logical paste. Render ACK обязателен для обычного slow path, но Codex external submit подтверждается rollout audit'ом.
 - **Только для программных операций:** Handshake, send-command, Rewind (Restore:History). **НЕ** для `terminal:input`.
 - **Safety timeout:** 8s — это не "подождать", а "что-то фатально сломалось, abort".
 

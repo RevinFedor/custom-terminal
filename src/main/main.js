@@ -612,6 +612,7 @@ const claudeConfirmDialogCooldown = new Map(); // `${tabId}:${dialogType}` -> la
 const codexStartupAutoEnter = new Map(); // tabId -> one-shot state for Codex startup confirmation prompts
 const codexMcpStartupWatchdogs = new Map(); // tabId -> MCP startup restart watchdog state, independent of prompt TTL
 const codexTuiReadyTabs = new Set();     // tabIds whose current Codex TUI process rendered an input-ready frame
+const codexTuiReadyMeta = new Map();     // tabId -> { at, source, reason, preview } for Rewind/readiness forensics
 const codexTuiReadyBuffers = new Map();  // tabId -> recent startup output for deterministic ready detection
 const codexTuiReadyQuietTimers = new Map(); // tabId -> debounce timer; ready only after TUI output settles
 const codexTuiReadyRejectKeys = new Map(); // tabId -> last logged not-ready reason/preview
@@ -5185,7 +5186,7 @@ function startMcpHttpServer() {
             stashFirst: false,
             fast: engine !== 'claude' && engine !== 'codex',
             source: engine === 'codex' ? 'codex-mcp-ai-prompt' : 'mcp-ai-prompt',
-            skipRenderWait: false,
+            skipRenderWait: engine === 'codex',
             awaitCodexUserMessageAudit: engine === 'codex' && submit !== false,
             codexAuditTimeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
             verifyCodexVisibleDraftBeforeSubmit: engine === 'codex' && submit !== false,
@@ -7974,7 +7975,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   }
 
   if (submit && shouldVerifyCodexVisibleDraft && mainWindow && !mainWindow.isDestroyed()) {
-    if (pasteRenderAck && pasteRenderAck.timedOut === false) {
+    if (isCodexPasteSource && skipRenderWait) {
+      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexDraftGuard] after-paste UI guard skipped — Codex submit relies on ordered PTY write + rollout user_message audit');
+    } else if (pasteRenderAck && pasteRenderAck.timedOut === false) {
       console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexDraftGuard] after-paste satisfied by main render ACK elapsed=' + (pasteRenderAck.elapsedMs || 'n/a') + 'ms');
     } else {
       const afterDraft = await requestTerminalCodexDraftState(
@@ -9145,7 +9148,7 @@ ipcMain.handle('codex:append-input', async (_event, tabId, text, options = {}) =
     ctrlCFirst: false,
     fast: false,
     source: codexSource,
-    skipRenderWait: false,
+    skipRenderWait: true,
     awaitCodexUserMessageAudit: shouldSubmit,
     codexAuditTimeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
     verifyCodexVisibleDraftBeforeSubmit: shouldSubmit,
@@ -10023,6 +10026,13 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     console.log('[Codex:Rewind] ❌ Codex process exists but TUI input-ready marker is missing tab=' + String(tabId).slice(-12));
     return { success: false, error: 'codex_not_input_ready' };
   }
+  const readyMeta = codexTuiReadyMeta.get(tabId) || null;
+  console.log('[Codex:Rewind] readiness before prime tab=' + String(tabId).slice(-12)
+    + ' readyAgeMs=' + (readyMeta?.at ? Date.now() - readyMeta.at : 'unknown')
+    + ' readySource=' + (readyMeta?.source || '-')
+    + ' readyReason=' + (readyMeta?.reason || '-')
+    + ' readyPreview=' + JSON.stringify(String(readyMeta?.preview || '').slice(0, 180))
+    + ' pids=' + candidates.map(p => p.pid).join(','));
 
   await ensureCodexTurnWatcher(tabId, null, terminalProjects.get(tabId));
   const turnState = codexTurnWatchers.get(tabId);
@@ -10382,6 +10392,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           toolType: 'codex',
           commandType: 'codex',
           inputReady: false,
+          reason: 'codex-rewind-prime-hint-missing',
         });
         return { success: false, error: 'codex_rewind_prime_hint_not_observed', clean: primeFrame.clean.slice(0, 800) };
       }
@@ -10598,6 +10609,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       codexRewindOverlayOpen = false;
       if (/Update available|directory to resume this session|directory to fork this session|Starting\s+MCP\s+servers|MCP\s+startup\s+interrupted|esc\s+to\s+interrupt/i.test(confirmClean)) {
         const hadReady = codexTuiReadyTabs.delete(tabId);
+        codexTuiReadyMeta.delete(tabId);
         codexTuiReadyBuffers.set(tabId, String(confirmFrame.raw || '').slice(-CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT));
         console.warn('[Codex:Rewind] confirm exposed startup frame; cleared input-ready tab=' + String(tabId).slice(-12)
           + ' hadReady=' + hadReady
@@ -10610,6 +10622,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           toolType: 'codex',
           commandType: 'codex',
           inputReady: false,
+          reason: 'codex-rewind-confirm-startup-frame',
         });
       }
       if (/Cannot rollback|ThreadRollbackFailed|rollback.*failed|requires persisted/i.test(confirmClean)) {
@@ -13567,6 +13580,7 @@ function clearCodexTuiReady(tabId, reason = 'clear') {
   codexTuiReadyBuffers.delete(tabId);
   codexTuiReadyRejectKeys.delete(tabId);
   codexTuiReadyLastNotReady.delete(tabId);
+  codexTuiReadyMeta.delete(tabId);
   clearCodexMcpStartupWatchdog(tabId, reason);
   if (hadReady) {
     console.log('[CodexTuiReady] clear tab=' + String(tabId).slice(-12) + ' reason=' + reason);
@@ -13584,6 +13598,7 @@ function resetCodexTuiReadyDetection(tabId, reason = 'reset') {
   codexTuiReadyBuffers.delete(tabId);
   codexTuiReadyRejectKeys.delete(tabId);
   codexTuiReadyLastNotReady.delete(tabId);
+  codexTuiReadyMeta.delete(tabId);
   if (codexTuiReadyTabs.delete(tabId)) {
     console.log('[CodexTuiReady] clear tab=' + String(tabId).slice(-12) + ' reason=' + reason);
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -13976,10 +13991,17 @@ async function emitCodexTuiReadyAfterQuiet(tabId) {
   codexTuiReadyRejectKeys.delete(tabId);
   clearCodexMcpStartupWatchdog(tabId, 'tui-ready');
   const preview = readyText.replace(/\s+/g, ' ').trim().slice(0, 220);
+  const readySource = readyInspect.source || 'raw';
+  codexTuiReadyMeta.set(tabId, {
+    at: Date.now(),
+    source: readySource,
+    reason: readyInspect.reason || '',
+    preview,
+  });
   console.log('[CodexTuiReady] tab=' + String(tabId).slice(-12)
     + ' input ready pids=' + matches.map(m => m.pid).join(',')
     + ' quietMs=' + CODEX_TUI_READY_QUIET_MS
-    + ' source=' + (readyInspect.source || 'raw')
+    + ' source=' + readySource
     + ' preview=' + JSON.stringify(preview));
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('codex:tui-ready', { tabId, ts: Date.now() });
@@ -14141,6 +14163,7 @@ ipcMain.handle('codex:get-tui-ready', async (_event, tabId) => {
 async function getCodexTuiReadyState(tabId) {
   const textReady = !!codexTuiReadyTabs.has(tabId);
   const lastNotReady = codexTuiReadyLastNotReady.get(tabId) || null;
+  const readyMeta = codexTuiReadyMeta.get(tabId) || null;
   let processReady = false;
   if (textReady) {
     try {
@@ -14155,6 +14178,10 @@ async function getCodexTuiReadyState(tabId) {
     textReady,
     processReady,
     lastNotReady,
+    readyMeta: readyMeta ? {
+      ...readyMeta,
+      ageMs: readyMeta.at ? Date.now() - readyMeta.at : null,
+    } : null,
   };
 }
 
@@ -14177,6 +14204,12 @@ async function markCodexTuiReadyAfterVerifiedComposer(tabId, reason = 'verified-
   codexTuiReadyRejectKeys.delete(tabId);
   codexTuiReadyLastNotReady.delete(tabId);
   clearCodexMcpStartupWatchdog(tabId, reason);
+  codexTuiReadyMeta.set(tabId, {
+    at: Date.now(),
+    source: 'verified-composer',
+    reason,
+    preview: '',
+  });
   console.log('[CodexTuiReady] tab=' + String(tabId).slice(-12)
     + ' input ready via verified composer reason=' + reason
     + ' hadReady=' + hadReady
@@ -14249,6 +14282,12 @@ async function markCodexTuiReadyFromVisibleProbe(tabId, reason = 'visible-probe'
   codexTuiReadyRejectKeys.delete(tabId);
   clearCodexMcpStartupWatchdog(tabId, reason);
   const preview = visibleText.replace(/\s+/g, ' ').trim().slice(0, 220);
+  codexTuiReadyMeta.set(tabId, {
+    at: Date.now(),
+    source: 'visible-probe',
+    reason,
+    preview,
+  });
   console.log('[CodexTuiReady] tab=' + String(tabId).slice(-12)
     + ' input ready via visible probe reason=' + reason
     + ' pids=' + matches.map(m => m.pid).join(',')
@@ -16442,7 +16481,7 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
       submitLabel: shouldQueue ? 'Tab(queue)' : 'Enter',
       handoffId,
       source: codexSource,
-      skipRenderWait: false,
+      skipRenderWait: true,
       awaitCodexUserMessageAudit: !shouldQueue,
       codexAuditTimeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
       verifyCodexVisibleDraftBeforeSubmit: !shouldQueue && !skipVisibleDraftGuard,
