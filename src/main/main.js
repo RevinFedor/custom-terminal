@@ -596,6 +596,8 @@ const PROCESS_TREE_SNAPSHOT_TTL_MS = 750;
 let processTreeSnapshotCache = null;
 let processTreeSnapshotInflight = null;
 let processTreeSnapshotWaiters = 0;
+const AI_PROCESS_LOOKUP_CACHE_MS = 2000;
+const aiProcessLookupCache = new Map(); // `${tabId}:${expectedName}` -> { at, matches }
 const terminalProjectIds = new Map(); // tabId -> projectId (authoritative parent project for MCP routing)
 const terminalCommandState = new Map(); // tabId -> { isRunning: boolean, lastExitCode: number }
 const codexFinishDebounceTimers = new Map(); // tabId -> timeout; suppress shell D→B blips inside Codex TUI
@@ -618,6 +620,7 @@ const codexTuiReadyQuietTimers = new Map(); // tabId -> debounce timer; ready on
 const codexTuiReadyRejectKeys = new Map(); // tabId -> last logged not-ready reason/preview
 const codexTuiReadyLastNotReady = new Map(); // tabId -> last deterministic not-ready diagnosis
 const codexLastRunCommandPayload = new Map(); // tabId -> last Codex launch payload, used by MCP startup watchdog retry
+let codexLaunchSeq = 0;
 let sessionManager; // Initialized after projectManager is ready
 let claudeManager; // Initialized with terminals map
 
@@ -944,6 +947,15 @@ function computeProjectActivity() {
   }
 
   for (const tabId of codexKnownSessions.keys()) {
+    const state = codexTurnWatchers.get(tabId);
+    const busy = state?.busy === true || activityOpenIntervals.has(tabId);
+    mark(tabId, {
+      live: terminals.has(tabId),
+      busy,
+      status: codexTuiReadyTabs.has(tabId) ? 'active' : 'starting',
+    });
+  }
+  for (const tabId of codexLastRunCommandPayload.keys()) {
     const state = codexTurnWatchers.get(tabId);
     const busy = state?.busy === true || activityOpenIntervals.has(tabId);
     mark(tabId, {
@@ -1841,6 +1853,17 @@ function clearCodexKnownSession(tabId, reason = 'clear') {
     ' session=' + String(sid).slice(0, 8) +
     ' reason=' + reason +
     ' remaining=' + codexKnownSessions.size);
+}
+
+function clearCodexLaunchPayload(tabId, reason = 'clear') {
+  if (!tabId || !codexLastRunCommandPayload.has(tabId)) return;
+  const payload = codexLastRunCommandPayload.get(tabId);
+  codexLastRunCommandPayload.delete(tabId);
+  console.log('[Codex Runner] launch payload clear tab=' + String(tabId).slice(-12)
+    + ' reason=' + reason
+    + ' launch=' + (payload?.launchId || '-')
+    + ' command=' + (payload?.command || '-')
+    + ' session=' + (payload?.sessionId ? String(payload.sessionId).slice(0, 8) : 'new'));
 }
 
 function getInterruptedAiSessionEntries() {
@@ -3170,6 +3193,7 @@ function parseOSC133AndEmit(tabId, data) {
             if (activityOpenIntervals.get(tabId)?.engine === 'codex') {
               recordActivity(tabId, false, 'codex');
             }
+            clearCodexLaunchPayload(tabId, 'command-finished');
             clearCodexKnownSession(tabId, 'command-finished');
             closeCodexTurnWatcher(tabId, 'command-finished');
             if (mainWindow && !mainWindow.isDestroyed()) {
@@ -3195,6 +3219,7 @@ function parseOSC133AndEmit(tabId, data) {
               ' reason=command-finished shutdown=true');
           }
         } else {
+          clearCodexLaunchPayload(tabId, 'command-finished');
           clearCodexKnownSession(tabId, 'command-finished');
         }
         closeCodexTurnWatcher(tabId, 'command-finished');
@@ -7295,6 +7320,8 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       codexFinishDebounceTimers.delete(tabId);
       terminalInitialCommand.delete(tabId);
       terminalOutputBuffer.delete(tabId);
+      invalidateAiProcessLookupCache(tabId);
+      clearCodexLaunchPayload(tabId, 'pty-exit');
 	      claudeCliActive.delete(tabId);
 	      clearBridgeTab(tabId);
 	      clearCodexKnownSession(tabId, 'pty-exit');
@@ -8820,6 +8847,34 @@ async function findAiDescendantProcessesByTab(tabId, expectedName) {
     endPerfOp(opId);
   }
   return [];
+}
+
+function aiProcessLookupCacheKey(tabId, expectedName) {
+  return String(tabId || '') + ':' + String(expectedName || 'any');
+}
+
+function invalidateAiProcessLookupCache(tabId, expectedName = null) {
+  if (!tabId) return;
+  if (expectedName) {
+    aiProcessLookupCache.delete(aiProcessLookupCacheKey(tabId, expectedName));
+    return;
+  }
+  const prefix = String(tabId) + ':';
+  for (const key of aiProcessLookupCache.keys()) {
+    if (key.startsWith(prefix)) aiProcessLookupCache.delete(key);
+  }
+}
+
+async function findAiDescendantProcessesByTabCached(tabId, expectedName, maxAgeMs = AI_PROCESS_LOOKUP_CACHE_MS) {
+  const key = aiProcessLookupCacheKey(tabId, expectedName);
+  const now = nodePerformance.now();
+  const cached = aiProcessLookupCache.get(key);
+  if (cached && (now - cached.at) < maxAgeMs) {
+    return cached.matches || [];
+  }
+  const matches = await findAiDescendantProcessesByTab(tabId, expectedName);
+  aiProcessLookupCache.set(key, { at: nodePerformance.now(), matches });
+  return matches;
 }
 
 // Shared by claude/codex grab/copy/restore input operations. All fire Ctrl+G
@@ -10811,6 +10866,8 @@ ipcMain.on('terminal:kill', async (event, tabId) => {
   clearBridgeTab(tabId);
   clearTimeout(codexFinishDebounceTimers.get(tabId));
   codexFinishDebounceTimers.delete(tabId);
+  invalidateAiProcessLookupCache(tabId);
+  clearCodexLaunchPayload(tabId, 'terminal-kill');
   clearCodexKnownSession(tabId, 'terminal-kill');
   clearCodexTuiReady(tabId, 'terminal-kill');
   geminiActiveTabs.delete(tabId);
@@ -10967,7 +11024,7 @@ ipcMain.handle('terminal:getCommandState', async (event, request) => {
   if (!oscRunning && !bridgeAlive && allowProcessTreeLookup) {
     didCodexLookup = true;
     const lookupStartedAt = nodePerformance.now();
-    const matches = await findAiDescendantProcessesByTab(tabId, expectedProcess);
+    const matches = await findAiDescendantProcessesByTabCached(tabId, expectedProcess);
     codexLookupMs = nodePerformance.now() - lookupStartedAt;
     codexMatches = matches.length;
     codexAlive = codexMatches > 0;
@@ -12808,7 +12865,9 @@ function getAiProcessNameFromCommand(cmd) {
   return null;
 }
 
-async function stopAiProcessInTab(tabId) {
+async function stopAiProcessInTab(tabId, options = {}) {
+  const stopReason = options?.reason || 'manual-stop';
+  const preserveCodexLaunchPayload = options?.preserveCodexLaunchPayload === true;
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'tab not found' };
 
@@ -12853,6 +12912,26 @@ async function stopAiProcessInTab(tabId) {
 
   if (!childPid) {
     console.log('[StopAI] no AI process found for tab ' + tabId + ' shellPid=' + term.pid);
+    const rowCommandType = (() => {
+      try {
+        return projectManager?.db?.db?.prepare('SELECT command_type FROM tabs WHERE tab_id = ? LIMIT 1').get(tabId)?.command_type || '';
+      } catch {
+        return '';
+      }
+    })();
+    const isCodexRuntime = rowCommandType === 'codex'
+      || codexLastRunCommandPayload.has(tabId)
+      || codexKnownSessions.has(tabId)
+      || codexTurnWatchers.has(tabId)
+      || codexTuiReadyTabs.has(tabId);
+    if (isCodexRuntime && !preserveCodexLaunchPayload) {
+      clearCodexLaunchPayload(tabId, stopReason);
+      clearCodexKnownSession(tabId, stopReason);
+      clearCodexTuiReady(tabId, stopReason);
+      closeCodexTurnWatcher(tabId, stopReason);
+      emitCodexBusy(tabId, false, stopReason);
+      return { success: true, processName: 'codex', noProcess: true };
+    }
     return { success: false, error: 'no AI process found' };
   }
 
@@ -12866,10 +12945,11 @@ async function stopAiProcessInTab(tabId) {
   // exit path can call it on success without referring to it before init.
   const stopBusyState = () => {
     if (processName === 'codex') {
-      clearCodexKnownSession(tabId, 'manual-stop');
-      clearCodexTuiReady(tabId, 'manual-stop');
-      closeCodexTurnWatcher(tabId, 'manual-stop');
-      emitCodexBusy(tabId, false, 'manual-stop');
+      if (!preserveCodexLaunchPayload) clearCodexLaunchPayload(tabId, stopReason);
+      clearCodexKnownSession(tabId, stopReason);
+      clearCodexTuiReady(tabId, stopReason);
+      closeCodexTurnWatcher(tabId, stopReason);
+      emitCodexBusy(tabId, false, stopReason);
       return;
     }
     if (processName === 'gemini') {
@@ -13721,6 +13801,42 @@ function getCodexMcpStartupWatchdogState(tabId, inspected, clean) {
   };
 }
 
+function getCodexMcpStartupStatus(tabId) {
+  const state = codexMcpStartupWatchdogs.get(tabId);
+  if (!state || !state.mcpStartupFirstSeenAt) return null;
+  return {
+    ts: state.mcpStartupLastSeenAt || state.mcpStartupFirstSeenAt,
+    phase: 'mcp-startup',
+    source: 'pty-raw',
+    reason: 'blocked:mcp-startup',
+    blockers: ['mcp-startup'],
+    sampleMode: state.mcpStartupSampleMode || '-',
+    startupArmed: codexStartupAutoEnter.has(tabId),
+    previewTail: state.mcpStartupPreview || '',
+    firstSeenAgeMs: Date.now() - state.mcpStartupFirstSeenAt,
+    lastSeenAgeMs: Date.now() - (state.mcpStartupLastSeenAt || state.mcpStartupFirstSeenAt),
+    restartSent: !!state.mcpStartupRestarting,
+  };
+}
+
+function broadcastCodexStartingSnapshot(tabId, reason = 'starting') {
+  if (!tabId) return;
+  const turn = codexTurnWatchers.get(tabId);
+  const sessionId = turn?.sessionId || codexKnownSessions.get(tabId) || codexLastRunCommandPayload.get(tabId)?.sessionId || null;
+  _webBroadcast(tabId, {
+    type: 'snapshot',
+    sessionId,
+    busy: false,
+    sessionStatus: 'starting',
+    starting: true,
+    inputReady: false,
+    toolType: 'codex',
+    commandType: 'codex',
+    lastNotReady: getCodexMcpStartupStatus(tabId),
+    reason,
+  });
+}
+
 async function restartCodexAfterMcpStartupWatchdog(tabId, state, mcpInfo) {
   const current = codexMcpStartupWatchdogs.get(tabId);
   if (!current || current !== state || current.mcpStartupRestarting) return;
@@ -13728,17 +13844,15 @@ async function restartCodexAfterMcpStartupWatchdog(tabId, state, mcpInfo) {
     clearCodexMcpStartupWatchdog(tabId, 'tui-ready-before-restart');
     return;
   }
-  const lastSeenAgeMs = Date.now() - (state.mcpStartupLastSeenAt || 0);
-  if (lastSeenAgeMs > 5000) {
-    console.log('[CodexMcpStartupWatchdog] skip restart tab=' + String(tabId).slice(-12)
-      + ' reason=stale-mcp-frame lastSeenAgeMs=' + lastSeenAgeMs);
-    return;
-  }
+  const lastSeenAgeMs = Date.now() - (state.mcpStartupLastSeenAt || state.mcpStartupFirstSeenAt || Date.now());
   const storedPayload = codexLastRunCommandPayload.get(tabId);
   const payload = storedPayload ? { ...storedPayload } : null;
   if (!payload) {
     console.warn('[CodexMcpStartupWatchdog] cannot restart tab=' + String(tabId).slice(-12) + ' reason=no-last-run-payload');
     return;
+  }
+  if (!payload.launchId) {
+    payload.launchId = 'legacy-' + Date.now() + '-' + (++codexLaunchSeq);
   }
   const detectedSessionId = codexKnownSessions.get(tabId) || null;
   if (payload.command === 'codex-f' && detectedSessionId && detectedSessionId !== payload.sessionId) {
@@ -13764,12 +13878,16 @@ async function restartCodexAfterMcpStartupWatchdog(tabId, state, mcpInfo) {
   console.warn('[CodexMcpStartupWatchdog] restart begin tab=' + String(tabId).slice(-12)
     + ' attempt=' + attempt + '/' + CODEX_MCP_STARTUP_MAX_RESTARTS
     + ' ageMs=' + ageMs
+    + ' lastSeenAgeMs=' + lastSeenAgeMs
     + ' command=' + (payload.command || 'codex')
     + ' session=' + (payload.sessionId ? String(payload.sessionId).slice(0, 8) : 'new')
     + ' cwd=' + (payload.cwd || 'n/a')
     + ' preview=' + JSON.stringify(mcpInfo?.preview || state.mcpStartupPreview || ''));
   try {
-    const stopResult = await stopAiProcessInTab(tabId);
+    const stopResult = await stopAiProcessInTab(tabId, {
+      reason: 'mcp-startup-watchdog',
+      preserveCodexLaunchPayload: true,
+    });
     console.warn('[CodexMcpStartupWatchdog] stop done tab=' + String(tabId).slice(-12)
       + ' attempt=' + attempt
       + ' success=' + !!stopResult?.success
@@ -13777,6 +13895,16 @@ async function restartCodexAfterMcpStartupWatchdog(tabId, state, mcpInfo) {
   } catch (err) {
     console.warn('[CodexMcpStartupWatchdog] stop error tab=' + String(tabId).slice(-12)
       + ' attempt=' + attempt + ' ' + (err?.message || String(err)));
+  }
+
+  const latestPayload = codexLastRunCommandPayload.get(tabId);
+  if (!latestPayload || latestPayload.launchId !== payload.launchId) {
+    console.warn('[CodexMcpStartupWatchdog] restart aborted tab=' + String(tabId).slice(-12)
+      + ' attempt=' + attempt
+      + ' reason=launch-payload-cancelled'
+      + ' expected=' + (payload.launchId || '-')
+      + ' actual=' + (latestPayload?.launchId || 'none'));
+    return;
   }
 
   const sender = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : payload.sender;
@@ -13834,6 +13962,10 @@ function maybeArmCodexMcpStartupWatchdog(tabId, inspected, clean, phase) {
   }
   state.mcpStartupLastSeenAt = now;
   state.mcpStartupPreview = mcpInfo.preview || state.mcpStartupPreview || '';
+  state.mcpStartupSampleMode = mcpInfo.sampleMode || state.mcpStartupSampleMode || '-';
+  if (state.mcpStartupFirstSeenAt === now) {
+    broadcastCodexStartingSnapshot(tabId, 'mcp-startup-seen');
+  }
   const bucket = Math.floor((now - state.mcpStartupFirstSeenAt) / 5000);
   if (state.mcpStartupLastLogBucket !== bucket) {
     state.mcpStartupLastLogBucket = bucket;
@@ -13929,7 +14061,7 @@ async function emitCodexTuiReadyAfterQuiet(tabId) {
       const visibleInspect = inspectCodexInputReadyVisibleText(visibleText);
       if (!visibleInspect.ready) {
         const visibleBlockers = Array.isArray(visibleInspect.blockers) ? visibleInspect.blockers : [];
-        if (visibleBlockers.length > 0) {
+        if (!rawInspect.ready && visibleBlockers.length > 0) {
           logCodexTuiReadyNotReady(tabId, visibleInspect, raw, visibleText, 'quiet-visible');
           maybeArmCodexMcpStartupWatchdog(tabId, visibleInspect, visibleText, 'quiet-visible');
           maybeArmCodexMcpStartupWatchdog(tabId, rawInspect, clean, 'quiet-raw');
@@ -13947,7 +14079,7 @@ async function emitCodexTuiReadyAfterQuiet(tabId) {
           + ' sample=' + (rawInspect.sampleMode || '-')
           + ' sampleBytes=' + (rawInspect.sampleBytes || 0)
           + ' totalBytes=' + (rawInspect.totalBytes || raw.length)
-          + ' — accepting raw ready for hidden/background tab');
+          + ' — accepting raw PTY ready; visible buffer is diagnostic only');
       } else {
         readyInspect = visibleInspect;
         readyText = visibleText;
@@ -13985,6 +14117,7 @@ async function emitCodexTuiReadyAfterQuiet(tabId) {
     console.log('[CodexTuiReady] text-ready but no live codex process tab=' + String(tabId).slice(-12));
     return;
   }
+  aiProcessLookupCache.set(aiProcessLookupCacheKey(tabId, 'codex'), { at: nodePerformance.now(), matches });
 
   codexTuiReadyTabs.add(tabId);
   codexTuiReadyBuffers.delete(tabId);
@@ -14162,12 +14295,13 @@ ipcMain.handle('codex:get-tui-ready', async (_event, tabId) => {
 
 async function getCodexTuiReadyState(tabId) {
   const textReady = !!codexTuiReadyTabs.has(tabId);
-  const lastNotReady = codexTuiReadyLastNotReady.get(tabId) || null;
+  const mcpStartup = getCodexMcpStartupStatus(tabId);
+  const lastNotReady = codexTuiReadyLastNotReady.get(tabId) || mcpStartup || null;
   const readyMeta = codexTuiReadyMeta.get(tabId) || null;
   let processReady = false;
   if (textReady) {
     try {
-      processReady = (await findAiDescendantProcessesByTab(tabId, 'codex')).length > 0;
+      processReady = (await findAiDescendantProcessesByTabCached(tabId, 'codex')).length > 0;
     } catch {
       processReady = false;
     }
@@ -14178,6 +14312,7 @@ async function getCodexTuiReadyState(tabId) {
     textReady,
     processReady,
     lastNotReady,
+    mcpStartup,
     readyMeta: readyMeta ? {
       ...readyMeta,
       ageMs: readyMeta.at ? Date.now() - readyMeta.at : null,
@@ -14198,6 +14333,7 @@ async function markCodexTuiReadyAfterVerifiedComposer(tabId, reason = 'verified-
       + ' reason=' + reason + ' no-live-process');
     return false;
   }
+  aiProcessLookupCache.set(aiProcessLookupCacheKey(tabId, 'codex'), { at: nodePerformance.now(), matches });
   const hadReady = codexTuiReadyTabs.has(tabId);
   codexTuiReadyTabs.add(tabId);
   codexTuiReadyBuffers.delete(tabId);
@@ -14277,6 +14413,7 @@ async function markCodexTuiReadyFromVisibleProbe(tabId, reason = 'visible-probe'
     matches = [];
   }
   if (matches.length === 0 || codexTuiReadyTabs.has(tabId)) return false;
+  aiProcessLookupCache.set(aiProcessLookupCacheKey(tabId, 'codex'), { at: nodePerformance.now(), matches });
   codexTuiReadyTabs.add(tabId);
   codexTuiReadyBuffers.delete(tabId);
   codexTuiReadyRejectKeys.delete(tabId);
@@ -14299,6 +14436,76 @@ async function markCodexTuiReadyFromVisibleProbe(tabId, reason = 'visible-probe'
   return true;
 }
 
+function probeCodexStartupFromRawBuffer(tabId, reason = 'raw-probe') {
+  const raw = codexTuiReadyBuffers.get(tabId) || '';
+  if (!raw) {
+    return { success: false, error: 'no-pty-buffer', ready: false, reason: 'no-pty-buffer' };
+  }
+  const clean = cleanCodexTuiFrame(raw);
+  tryHandleCodexStartupAutoEnter(tabId, '', {
+    cleanSnapshot: clean,
+    source: 'raw-buffer:' + reason,
+  });
+  const inspected = inspectCodexInputReadyFrame(clean, raw);
+  if (!inspected.ready) {
+    logCodexTuiReadyNotReady(tabId, inspected, raw, clean, 'raw-probe-' + reason);
+    maybeArmCodexMcpStartupWatchdog(tabId, inspected, clean, 'raw-probe-' + reason);
+  }
+  return {
+    success: true,
+    ready: inspected.ready,
+    reason: inspected.reason || null,
+    blockers: inspected.blockers || null,
+    inspected,
+    clean,
+    raw,
+  };
+}
+
+async function markCodexTuiReadyFromRawProbe(tabId, reason = 'raw-probe') {
+  if (!tabId || codexTuiReadyTabs.has(tabId)) return false;
+  const probe = probeCodexStartupFromRawBuffer(tabId, reason);
+  if (!probe.success || !probe.ready) return false;
+  let matches = [];
+  try {
+    matches = await findAiDescendantProcessesByTab(tabId, 'codex');
+  } catch {
+    matches = [];
+  }
+  if (matches.length === 0 || codexTuiReadyTabs.has(tabId)) return false;
+  aiProcessLookupCache.set(aiProcessLookupCacheKey(tabId, 'codex'), { at: nodePerformance.now(), matches });
+  codexTuiReadyTabs.add(tabId);
+  codexTuiReadyBuffers.delete(tabId);
+  codexTuiReadyRejectKeys.delete(tabId);
+  codexTuiReadyLastNotReady.delete(tabId);
+  clearCodexMcpStartupWatchdog(tabId, reason);
+  const preview = String(probe.clean || '').replace(/\s+/g, ' ').trim().slice(0, 220);
+  codexTuiReadyMeta.set(tabId, {
+    at: Date.now(),
+    source: 'raw-probe',
+    reason,
+    preview,
+  });
+  console.log('[CodexTuiReady] tab=' + String(tabId).slice(-12)
+    + ' input ready via raw probe reason=' + reason
+    + ' pids=' + matches.map(m => m.pid).join(',')
+    + ' preview=' + JSON.stringify(preview));
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('codex:tui-ready', { tabId, ts: Date.now(), reason });
+  }
+  ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'codex' });
+  _webBroadcast(tabId, {
+    type: 'snapshot',
+    sessionId: codexKnownSessions.get(tabId) || null,
+    busy: false,
+    sessionStatus: 'active',
+    toolType: 'codex',
+    commandType: 'codex',
+    inputReady: true,
+  });
+  return true;
+}
+
 async function ensureCodexInputReadyForExternalPrompt(tabId, {
   timeoutMs = CODEX_EXTERNAL_PROMPT_READY_TIMEOUT_MS,
   reason = 'external-prompt',
@@ -14313,8 +14520,8 @@ async function ensureCodexInputReadyForExternalPrompt(tabId, {
       cwd: terminalProjects.get(tabId) || null,
     });
   }
-  const poke = await pokeCodexStartupPromptFromVisibleBuffer(tabId, reason);
-  if (poke?.ready && await markCodexTuiReadyFromVisibleProbe(tabId, reason)) {
+  const poke = probeCodexStartupFromRawBuffer(tabId, reason);
+  if (poke?.ready && await markCodexTuiReadyFromRawProbe(tabId, reason)) {
     const ready = await getCodexTuiReadyState(tabId);
     if (ready.inputReady) return { success: true, ready, waitedMs: 0, poke };
   }
@@ -14340,8 +14547,8 @@ async function ensureCodexInputReadyForExternalPrompt(tabId, {
     };
     const timer = setTimeout(async () => {
       const state = await getCodexTuiReadyState(tabId);
-      const lastPoke = await pokeCodexStartupPromptFromVisibleBuffer(tabId, reason + '-timeout');
-      if (lastPoke?.ready && await markCodexTuiReadyFromVisibleProbe(tabId, reason + '-timeout')) {
+      const lastPoke = probeCodexStartupFromRawBuffer(tabId, reason + '-timeout');
+      if (lastPoke?.ready && await markCodexTuiReadyFromRawProbe(tabId, reason + '-timeout')) {
         const ready = await getCodexTuiReadyState(tabId);
         if (ready.inputReady) {
           finish({ success: true, ready, waitedMs: Date.now() - startedAt, poke: lastPoke });
@@ -16393,7 +16600,9 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
   const effectiveEffort = effort || readDefaultCodexSetting('defaultCodexEffort');
   const restartReason = payload.restartReason || 'direct';
   const mcpStartupRestartAttempts = Number(payload.mcpStartupRestartAttempts) || 0;
+  const launchId = payload.launchId || ('codex-' + Date.now() + '-' + (++codexLaunchSeq));
   codexLastRunCommandPayload.set(tabId, {
+    launchId,
     tabId,
     command: command || 'codex',
     sessionId,
@@ -16403,10 +16612,18 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
     developerInstructions,
     mcpStartupRestartAttempts,
   });
-  console.log('[Codex Runner] Command:', command, 'tab:', tabId, 'session:', sessionId || 'new', 'cwd:', termCwd, 'model:', effectiveModel || 'default', 'effort:', effectiveEffort || 'default', 'developerInstructionsChars:', developerInstructions ? String(developerInstructions).length : 0, 'restartReason:', restartReason, 'mcpStartupRestarts:', mcpStartupRestartAttempts);
+  console.log('[Codex Runner] Command:', command, 'tab:', tabId, 'session:', sessionId || 'new', 'cwd:', termCwd, 'model:', effectiveModel || 'default', 'effort:', effectiveEffort || 'default', 'developerInstructionsChars:', developerInstructions ? String(developerInstructions).length : 0, 'restartReason:', restartReason, 'mcpStartupRestarts:', mcpStartupRestartAttempts, 'launchId:', launchId);
 
+  invalidateAiProcessLookupCache(tabId, 'codex');
+  const commandState = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
+  commandState.isRunning = true;
+  terminalCommandState.set(tabId, commandState);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('terminal:command-started', { tabId, commandType: 'codex' });
+  }
   clearCodexTuiReady(tabId, 'run-command');
   armCodexStartupAutoEnter(tabId, { command: command || 'codex', sessionId, cwd: termCwd });
+  broadcastCodexStartingSnapshot(tabId, 'codex-run-command');
 
   if (command === 'codex-c' && sessionId) {
     closeCodexWatcher(tabId, 'resume-known-session');

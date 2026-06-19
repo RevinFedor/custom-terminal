@@ -521,6 +521,18 @@ prompt, `/model`/`/effort` defaults или Codex MCP readiness. Нельзя и 
 по одному `starting` tab: список проектов и History должны оставаться доступными, меняется
 только статус конкретной вкладки.
 
+У Codex `starting` может появиться до rollout session id: `codex:run-command` сразу seed'ит
+runtime/project-activity из launch payload, чтобы iOS/API не показывали `input` или `Resume`
+пока hidden tab проходит update/trust/directory/MCP startup. Этот payload не является
+персистентным статусом и должен исчезать на stop/kill/exit/command-finished; иначе старый
+launch переживёт ручное вмешательство и вернёт вкладку в ложный `starting`.
+
+`commandRunning=true` у AI-вкладки в mobile/control-bar логах означает «жив процесс или
+стартовый process strip», а не обязательно busy-loader пользовательского turn'а. Для
+`/active-loaders` AI-вкладка блокирует install/deploy только по deterministic busy-сигналам
+или обычному shell-процессу; `starting`/process strip нужен для видимости состояния вкладки,
+но не должен превращаться в глобальный install blocker.
+
 Layout changes идут отдельным полем snapshot'а `layoutChangedProjectIds`. Renderer вызывает
 `project:layout-changed` при изменении структуры или metadata вкладок конкретного проекта:
 create, close, reopen, rename, изменение групп, статусов и tab-layout reorder. Server добавляет
