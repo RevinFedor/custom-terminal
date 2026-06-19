@@ -165,7 +165,7 @@ async function resumeClaudePtySessionInner({
   markPendingResume(tabId, sessionId);
   console.log('[ClaudePtyActions:resume] pending-marked-and-write tab=' + shortTab(tabId) + ' sid=' + shortSid(sessionId));
   ipcRenderer.send('terminal:input', tabId, '\x15claude --dangerously-skip-permissions --resume ' + sessionId + '\r');
-  ipcRenderer.send('terminal:force-command-started', tabId);
+  ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude', sessionId });
   return { success: true, sessionId, repaired };
 }
 

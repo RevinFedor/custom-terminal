@@ -590,15 +590,31 @@ const ProjectEmptyDropZone = memo(({ onDrop, onHoverChange, onDoubleClick, onMou
   );
 });
 
-// Global loading screen during session restore
-const RestoreLoader = memo(() => (
-  <div className="h-screen w-screen flex flex-col items-center justify-center bg-bg-main text-white">
-    <div className="flex flex-col items-center gap-4">
-      <div className="w-8 h-8 border-2 border-white/20 border-t-white rounded-full animate-spin" />
-      <span className="text-sm text-[#888]">Restoring session...</span>
+// Global loading screen during structural session restore only.
+const RestoreLoader = memo(({
+  label = 'Restoring session...',
+  detail,
+}: {
+  label?: string;
+  detail?: string;
+}) => {
+  useEffect(() => {
+    console.warn('[RestoreLoader] show label=' + label + ' detail=' + (detail || '-'));
+    return () => {
+      console.warn('[RestoreLoader] hide label=' + label + ' detail=' + (detail || '-'));
+    };
+  }, [label, detail]);
+
+  return (
+    <div className="h-screen w-screen flex flex-col items-center justify-center bg-bg-main text-white">
+      <div className="flex flex-col items-center gap-4">
+        <div className="w-8 h-8 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+        <span className="text-sm text-[#888]">{label}</span>
+        {detail ? <span className="text-xs text-[#666]">{detail}</span> : null}
+      </div>
     </div>
-  </div>
-));
+  );
+});
 
 function App() {
   // Mount the prompt-queue auto-runner at app root. It's a tab-independent listener
@@ -1481,14 +1497,18 @@ function App() {
           const statusColor = (statusId?: string | null) =>
             statusId ? (statusPalette.find((s: any) => s.id === statusId)?.color || null) : null;
           const tabs = await Promise.all(Array.from(ws.tabs.values()).map(async (t: any) => {
-            let sessionStatus: 'active' | 'busy' | 'inactive' | null = null;
+            let sessionStatus: 'active' | 'busy' | 'inactive' | 'starting' | null = null;
             let awaiting = false;
+            let inputReady: boolean | null = null;
+            let lastNotReady: any = null;
             const toolType = toolForTab(t);
             if (toolType) {
               try {
                 const p = await getHistoryAgentRuntime(toolType).getPresence(t.tabId);
                 sessionStatus = p?.status || 'inactive';
                 awaiting = toolType === 'claude' && !!p?.awaiting;
+                inputReady = typeof p?.inputReady === 'boolean' ? p.inputReady : null;
+                lastNotReady = (p as any)?.lastNotReady || null;
               } catch { sessionStatus = 'inactive'; }
             }
             // Assigned category status (dev/bugfix/knowledge/custom) — id stored
@@ -1508,6 +1528,9 @@ function App() {
               codexSessionId: t.codexSessionId,
               geminiSessionId: t.geminiSessionId,
               sessionStatus,
+              starting: sessionStatus === 'starting',
+              inputReady,
+              lastNotReady,
               awaiting,
               statusId,
               statusColor: statusMeta?.color || null,
@@ -2345,6 +2368,8 @@ function App() {
           const { tabIds } = payload || {};
           if (!Array.isArray(tabIds)) return reply(false, null, 'tabIds required');
           const statuses: Record<string, 'active' | 'busy' | 'inactive' | 'starting'> = {};
+          const inputReady: Record<string, boolean> = {};
+          const lastNotReady: Record<string, any> = {};
           // awaiting (Claude blocked on AskUserQuestion) per tab — drives the
           // mobile tab-list purple dot. Same presence call, extra field.
           const awaiting: Record<string, boolean> = {};
@@ -2353,12 +2378,15 @@ function App() {
               const { toolType, runtime } = describeAgentTab(tid);
               const p = runtime ? await runtime.getPresence(tid) : null;
               statuses[tid] = p?.status || 'inactive';
+              inputReady[tid] = !!p?.inputReady;
+              if ((p as any)?.lastNotReady) lastNotReady[tid] = (p as any).lastNotReady;
               if (toolType === 'claude' && p?.awaiting) awaiting[tid] = true;
             } catch {
               statuses[tid] = 'inactive';
+              inputReady[tid] = false;
             }
           }
-          return reply(true, { statuses, awaiting });
+          return reply(true, { statuses, inputReady, lastNotReady, awaiting });
         }
         if (action === 'getClaudeTabStatus') {
           const { tabId } = payload || {};
@@ -2367,17 +2395,21 @@ function App() {
           if (!tab) return reply(true, { tabId, status: 'inactive', commandType: null, toolType: null, sessionId: null });
           let status: 'active' | 'busy' | 'inactive' | 'starting' = 'inactive';
           let inputReady = false;
+          let lastNotReady: any = null;
           if (runtime) {
             try {
               const p = await runtime.getPresence(tabId);
               status = p?.status || 'inactive';
               inputReady = !!p?.inputReady;
+              lastNotReady = (p as any)?.lastNotReady || null;
             } catch { status = 'inactive'; }
           }
           return reply(true, {
             tabId,
             status,
+            starting: status === 'starting',
             inputReady,
+            lastNotReady,
             toolType,
             commandType: tab.commandType || null,
             sessionId,
@@ -2571,6 +2603,50 @@ function App() {
   // restoreSession() into one update — useEffect never sees isRestoring=true.
   // subscribe() fires synchronously on each set(), catching both transitions.
   useEffect(() => {
+    const AUTO_RESUME_SETTLE_LOG_TIMEOUT_MS = 45_000;
+    const AUTO_RESUME_INACTIVE_GRACE_MS = 5_000;
+    const AUTO_RESUME_POLL_MS = 1000;
+    const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+    const waitForAutoResumeSettled = async (item: { tabId: string; engine: 'claude' | 'codex'; sessionId: string }) => {
+      const runtime = getHistoryAgentRuntime(item.engine);
+      const startedAt = Date.now();
+      let last = 'unknown';
+      let sawRuntimeStart = false;
+      while (Date.now() - startedAt < AUTO_RESUME_SETTLE_LOG_TIMEOUT_MS) {
+        try {
+          const presence = await runtime.getPresence(item.tabId);
+          const elapsed = Date.now() - startedAt;
+          last = `${presence.status}:inputReady=${!!presence.inputReady}`;
+          if (presence.status === 'starting') {
+            sawRuntimeStart = true;
+          }
+          if (presence.status === 'active' && presence.inputReady) {
+            sawRuntimeStart = true;
+            console.warn('[AutoResume] settled ready tab=' + item.tabId.slice(-12) + ' engine=' + item.engine + ' ms=' + elapsed);
+            return { ok: true, status: 'ready', ms: elapsed, tabId: item.tabId, engine: item.engine };
+          }
+          if (presence.status === 'busy') {
+            sawRuntimeStart = true;
+            console.warn('[AutoResume] settled busy tab=' + item.tabId.slice(-12) + ' engine=' + item.engine + ' ms=' + elapsed);
+            return { ok: true, status: 'busy', ms: elapsed, tabId: item.tabId, engine: item.engine };
+          }
+          if (presence.status === 'inactive') {
+            if (!sawRuntimeStart && elapsed < AUTO_RESUME_INACTIVE_GRACE_MS) {
+              console.warn('[AutoResume] waiting launch tab=' + item.tabId.slice(-12) + ' engine=' + item.engine + ' ms=' + elapsed + ' status=inactive');
+            } else {
+              console.warn('[AutoResume] settled inactive tab=' + item.tabId.slice(-12) + ' engine=' + item.engine + ' sawStart=' + sawRuntimeStart + ' ms=' + elapsed);
+              return { ok: false, status: 'inactive', ms: elapsed, tabId: item.tabId, engine: item.engine };
+            }
+          }
+        } catch (e: any) {
+          last = 'error:' + (e?.message || String(e));
+        }
+        await sleep(AUTO_RESUME_POLL_MS);
+      }
+      console.warn('[AutoResume] settle timeout tab=' + item.tabId.slice(-12) + ' engine=' + item.engine + ' last=' + last + ' ms=' + AUTO_RESUME_SETTLE_LOG_TIMEOUT_MS);
+      return { ok: false, status: 'timeout:' + last, ms: AUTO_RESUME_SETTLE_LOG_TIMEOUT_MS, tabId: item.tabId, engine: item.engine };
+    };
+
     let sawTrue = false;
     let triggered = false;
     const unsub = useWorkspaceStore.subscribe((state, prev) => {
@@ -2602,56 +2678,71 @@ function App() {
               }
             }
             if (tabs.length === 0) { console.warn('[AutoResume] No interrupted tabs'); return; }
-            console.warn('[AutoResume] Resuming', tabs.length, 'sessions');
-            for (const { tabId, sessionId, engine, cwd } of tabs) {
-              s.clearInterruptedState(tabId);
-              s.setTabCommandType(tabId, engine);
-              if (engine === 'codex') {
-                ipcRenderer.send('codex:run-command', buildCodexRunPayload({
-                  tabId,
-                  command: 'codex-c',
-                  sessionId,
-                  cwd,
-                }));
-                console.warn('[AutoResume] Resumed codex', tabId, sessionId.substring(0, 8));
-                continue;
-              }
-              // Reserve sessionId BEFORE writing to PTY: SessionBridge fires
-              // claude:session-detected within ~1-2 sec, and any stale bridge
-              // file (Claude CLI keeps months-old bridge JSONs around) racing
-              // ahead of the real resume would stomp this tab. The flag stops
-              // exactly that race. See utils/pendingResume.ts.
-              markPendingResume(tabId, sessionId);
-              // Repair dangling parentUuid in JSONL before resume so Claude CLI
-              // backtrace doesn't truncate history at first orphan (slash-command
-              // assistant or attachment virtual parent never written to disk).
-              // When repair returns repaired > 0 — surface to user: this is the
-              // moment we ACTUALLY saved history that Claude TUI would have lost.
+            console.warn('[AutoResume] Starting ' + tabs.length + ' sessions concurrently; per-tab command state is the loader source');
+
+            const startOne = async (item: { tabId: string; sessionId: string; engine: 'claude' | 'codex'; cwd?: string }) => {
+              const { tabId, sessionId, engine, cwd } = item;
               try {
-                const repairRes = await ipcRenderer.invoke('claude:repair-jsonl-before-resume', { sessionId, cwd });
-                const fixedCount = repairRes?.repaired || 0;
-                if (fixedCount > 0) {
-                  showToast(
-                    `Перед открытием сессии починили ${fixedCount} orphan${fixedCount === 1 ? '' : 's'} parentUuid — без этого Claude обрезал бы историю.`,
-                    'info',
-                    8000,
-                    false,
-                    undefined,
-                    undefined,
-                    undefined,
-                    tabId
-                  );
+                s.clearInterruptedState(tabId);
+                s.setTabCommandType(tabId, engine);
+                if (engine === 'codex') {
+                  ipcRenderer.send('codex:run-command', buildCodexRunPayload({
+                    tabId,
+                    command: 'codex-c',
+                    sessionId,
+                    cwd,
+                  }));
+                  ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'codex', sessionId });
+                  console.warn('[AutoResume] Resumed codex', tabId, sessionId.substring(0, 8));
+                  return { ok: true, item };
                 }
-              } catch (e: any) { console.warn('[AutoResume] JSONL repair skipped:', e?.message || String(e)); }
-              ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + sessionId + '\r');
-              // BARE string tabId — main's handler does terminalCommandState.get(tabId)
-              // and rebroadcasts terminal:command-started {tabId}; an object key never
-              // matches the string-keyed state, so the immediate process-alive signal
-              // was silently lost on AutoResume (other caller at :1394 already passes a
-              // string). See pty-streaming audit.
-              ipcRenderer.send('terminal:force-command-started', tabId);
-              console.warn('[AutoResume] Resumed claude', tabId, sessionId.substring(0, 8));
-            }
+                // Reserve sessionId BEFORE writing to PTY: SessionBridge fires
+                // claude:session-detected within ~1-2 sec, and any stale bridge
+                // file (Claude CLI keeps months-old bridge JSONs around) racing
+                // ahead of the real resume would stomp this tab. The flag stops
+                // exactly that race. See utils/pendingResume.ts.
+                markPendingResume(tabId, sessionId);
+                // Repair dangling parentUuid in JSONL before resume so Claude CLI
+                // backtrace doesn't truncate history at first orphan (slash-command
+                // assistant or attachment virtual parent never written to disk).
+                // When repair returns repaired > 0 — surface to user: this is the
+                // moment we ACTUALLY saved history that Claude TUI would have lost.
+                try {
+                  const repairRes = await ipcRenderer.invoke('claude:repair-jsonl-before-resume', { sessionId, cwd });
+                  const fixedCount = repairRes?.repaired || 0;
+                  if (fixedCount > 0) {
+                    showToast(
+                      `Перед открытием сессии починили ${fixedCount} orphan${fixedCount === 1 ? '' : 's'} parentUuid — без этого Claude обрезал бы историю.`,
+                      'info',
+                      8000,
+                      false,
+                      undefined,
+                      undefined,
+                      undefined,
+                      tabId
+                    );
+                  }
+                } catch (e: any) { console.warn('[AutoResume] JSONL repair skipped:', e?.message || String(e)); }
+                ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + sessionId + '\r');
+                ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude', sessionId });
+                console.warn('[AutoResume] Resumed claude', tabId, sessionId.substring(0, 8));
+                return { ok: true, item };
+              } catch (e: any) {
+                console.warn('[AutoResume] start failed tab=' + tabId.slice(-12) + ' engine=' + engine + ' error=' + (e?.message || String(e)));
+                return { ok: false, item, error: e?.message || String(e) };
+              }
+            };
+
+            const startResults = await Promise.all(tabs.map(startOne));
+            const started = startResults.filter((r) => r.ok).map((r) => r.item);
+            console.warn('[AutoResume] launch pass done started=' + started.length + '/' + tabs.length +
+              ' failed=' + (tabs.length - started.length));
+            void Promise.all(started.map(waitForAutoResumeSettled)).then((results) => {
+              const summary = results.map((r) => r.tabId.slice(-12) + ':' + r.status + ':' + r.ms).join(',');
+              console.warn('[AutoResume] settle summary total=' + results.length + ' results=' + summary);
+            }).catch((e: any) => {
+              console.warn('[AutoResume] settle monitor failed:', e?.message || String(e));
+            });
           } catch (e: any) {
             console.warn('[AutoResume] Error:', e?.message || String(e));
           }

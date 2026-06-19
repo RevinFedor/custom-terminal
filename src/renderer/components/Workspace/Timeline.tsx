@@ -5257,7 +5257,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       sessionId: result.newSessionId,
                       cwd,
                     }));
-                    ipcRenderer.send('terminal:force-command-started', tabId);
+                    ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'codex', sessionId: result.newSessionId });
                   }
 
                   setEditRangeState(doneState);

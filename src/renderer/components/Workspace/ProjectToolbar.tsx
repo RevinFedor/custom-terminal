@@ -292,6 +292,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
           sessionId: tab.codexSessionId,
           cwd: tab.cwd,
         }));
+        ipcRenderer.send('terminal:force-command-started', { tabId: tab.id, commandType: 'codex', sessionId: tab.codexSessionId });
       } else if (tab.claudeSessionId) {
         setTabCommandType(tab.id, 'claude');
         // Arm the per-tab stale-bridge guard before each resume write. Bulk-resume
@@ -300,7 +301,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
         markPendingResume(tab.id, tab.claudeSessionId);
         const cmd = `claude --dangerously-skip-permissions --resume ${tab.claudeSessionId}\r`;
         ipcRenderer.send('terminal:input', tab.id, cmd);
-        ipcRenderer.send('terminal:force-command-started', tab.id);
+        ipcRenderer.send('terminal:force-command-started', { tabId: tab.id, commandType: 'claude', sessionId: tab.claudeSessionId });
       } else if (tab.geminiSessionId) {
         setTabCommandType(tab.id, 'gemini');
         const cmd = `gemini -s ${tab.geminiSessionId}\r`;
@@ -314,6 +315,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
           sessionId: tab.codexSessionId,
           cwd: tab.cwd,
         }));
+        ipcRenderer.send('terminal:force-command-started', { tabId: tab.id, commandType: 'codex', sessionId: tab.codexSessionId });
       }
     });
 

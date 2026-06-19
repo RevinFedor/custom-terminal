@@ -76,6 +76,16 @@ Codex не имеет Claude bridge-файла, поэтому для shutdown r
 
 ---
 
+## AutoResume startup: global batch-loader был неверной абстракцией (fix 2026-06)
+
+Первый пользовательский симптом был похож на CSS/React-баг: после restart/build-install приложение сразу показывало обычный терминал, global loader `Starting AI sessions...` не был виден, но Codex/Claude сессии фактически ещё стартовали в фоне. Прод-лог выглядел как `[AutoResume] Resuming ...`, затем `settled inactive ... ms=3/55` и почти мгновенный hide loader'а; пользователь видел зависший Resume только пока вручную не переходил на нужный project/tab.
+
+Первая корневая причина действительно была не в CSS loader'а. AutoResume запускал `codex-c`, но Codex-ветка не эмитила `terminal:force-command-started`, а `waitForAutoResumeSettled` считал первый `presence.status='inactive'` завершением batch. Между отправкой `codex:run-command` и первыми runtime-сигналами есть короткое окно, где PTY launch уже инициирован, но presence ещё не успел стать `starting/busy/ready`. Для только что отправленной команды такой `inactive` означает «старт ещё не наблюдали», а не «восстановление завершилось».
+
+Но следующий лог показал более важный архитектурный провал batch-модели: одна скрытая Codex-вкладка `YXY=-tab-337` зависла на `Starting MCP servers (0/3)`, visible buffer был недоступен (`no-terminal`), и весь global loader ждал её до timeout, хотя остальные сессии могли стартовать независимо. Поэтому финальная модель — не «дробить batch мельче», а убрать global blocker: все AutoResume-вкладки запускаются независимо, `terminal:force-command-started` поднимает per-tab `starting`, `/api/projects/:id/tabs` и `project-activity` транслируют этот runtime status наружу, а desktop блокирует клики только локальным overlay поверх конкретного Terminal. `Starting MCP servers ...` чинится в Codex readiness/watchdog layer одним controlled restart через сохранённый launch payload; iOS/History/API не должны строить свои retry или ждать весь workspace.
+
+---
+
 ## Порядок операций: пометка ДО обрываемого шага (fix 2026-05-26)
 
 ### Симптом

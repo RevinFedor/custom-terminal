@@ -8,10 +8,19 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { markPendingResume } from '../../utils/pendingResume';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
+import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 
 const { ipcRenderer } = window.require('electron');
 
 type InterruptedEngine = 'claude' | 'codex';
+
+type SessionStartingState = {
+  tabId: string;
+  engine: InterruptedEngine;
+  sessionId?: string | null;
+  since: number;
+  lastNotReady?: any;
+};
 
 type ExternalRunMeta = {
   runId?: string;
@@ -114,6 +123,60 @@ const ExternalRunBadge = memo(({ meta }: { meta: ExternalRunMeta }) => {
       <span style={{ color: '#cbd5e1' }}>{status}</span>
       {stopTtl && <span style={{ color: '#fbbf24' }}>stop {stopTtl}</span>}
       {closeTtl && <span style={{ color: '#93c5fd' }}>tab {closeTtl}</span>}
+    </div>
+  );
+});
+
+const SessionStartingOverlay = memo(({ state }: { state: SessionStartingState }) => {
+  const ref = useRef<HTMLDivElement>(null);
+  const engineLabel = state.engine === 'codex' ? 'CODEX' : 'CLAUDE';
+  const sessionLabel = state.sessionId ? state.sessionId.slice(0, 8) : null;
+  const blocker = state.lastNotReady?.reason || '';
+
+  useEffect(() => {
+    ref.current?.focus();
+  }, [state.tabId, state.since]);
+
+  const block = (event: React.SyntheticEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+  };
+
+  return (
+    <div
+      ref={ref}
+      tabIndex={-1}
+      className="absolute inset-0 z-40 flex items-center justify-center outline-none"
+      onMouseDown={block}
+      onMouseUp={block}
+      onClick={block}
+      onDoubleClick={block}
+      onContextMenu={block}
+      onKeyDown={block}
+      onKeyUp={block}
+      onPaste={block}
+      style={{ pointerEvents: 'auto' }}
+    >
+      <div className="absolute inset-0 bg-black/55 backdrop-blur-sm" />
+      <div
+        className="relative z-10 flex flex-col items-center gap-4 rounded-xl border border-white/10 bg-[#111116]/95 px-8 py-7 shadow-2xl"
+        style={{ minWidth: 320, maxWidth: 'min(420px, calc(100% - 32px))' }}
+      >
+        <div className="w-9 h-9 border-2 border-white/20 border-t-[#60a5fa] rounded-full animate-spin" />
+        <div className="flex flex-col items-center gap-1 text-center">
+          <div className="text-sm font-bold tracking-widest text-white">
+            RESUMING {engineLabel}...
+          </div>
+          <div className="text-xs text-[#8b8b91]">
+            Waiting for prompt{sessionLabel ? ` · ${sessionLabel}` : ''}
+          </div>
+          {blocker ? (
+            <div className="mt-1 text-[10px] text-[#666]">
+              {blocker}
+            </div>
+          ) : null}
+        </div>
+      </div>
     </div>
   );
 });
@@ -259,6 +322,150 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     if (!ws?.activeTabId) return null;
     return ((ws.tabs.get(ws.activeTabId) as any)?.externalRun || null) as ExternalRunMeta | null;
   });
+  const activeAgentStartingKey = useWorkspaceStore((s) => {
+    const ws = s.openProjects.get(projectId);
+    if (!ws?.activeTabId || ws.currentView !== 'terminal') return '';
+    const tab = ws.tabs.get(ws.activeTabId);
+    if (!tab || tab.tabType === 'claude-sdk') return '';
+    const engine: InterruptedEngine | null =
+      tab.commandType === 'codex' ? 'codex'
+      : tab.commandType === 'claude' ? 'claude'
+      : tab.codexSessionId ? 'codex'
+      : tab.claudeSessionId ? 'claude'
+      : null;
+    if (!engine) return '';
+    const sessionId = engine === 'codex' ? (tab.codexSessionId || '') : (tab.claudeSessionId || '');
+    return `${tab.id}|${engine}|${sessionId}`;
+  });
+  const activeAgentStartingInfo = useMemo(() => {
+    if (!activeAgentStartingKey) return null;
+    const [tabId, engine, sessionId] = activeAgentStartingKey.split('|');
+    if (!tabId || (engine !== 'claude' && engine !== 'codex')) return null;
+    return {
+      tabId,
+      engine: engine as InterruptedEngine,
+      sessionId: sessionId || null,
+    };
+  }, [activeAgentStartingKey]);
+  const activeAgentStartingInfoRef = useRef(activeAgentStartingInfo);
+  const startingProbeSeqRef = useRef(0);
+  const [sessionStarting, setSessionStarting] = useState<SessionStartingState | null>(null);
+
+  useEffect(() => {
+    activeAgentStartingInfoRef.current = activeAgentStartingInfo;
+  }, [activeAgentStartingInfo]);
+
+  const refreshSessionStarting = useCallback(async (reason: string) => {
+    const info = activeAgentStartingInfoRef.current;
+    const seq = ++startingProbeSeqRef.current;
+    if (!info || currentView !== 'terminal') {
+      setSessionStarting(null);
+      return;
+    }
+    try {
+      const presence = await getHistoryAgentRuntime(info.engine).getPresence(info.tabId);
+      if (seq !== startingProbeSeqRef.current) return;
+      const latest = activeAgentStartingInfoRef.current;
+      if (!latest || latest.tabId !== info.tabId || latest.engine !== info.engine) return;
+      if (presence.status === 'starting') {
+        setSessionStarting((prev) => {
+          if (prev?.tabId === info.tabId && prev.engine === info.engine) {
+            return { ...prev, sessionId: info.sessionId, lastNotReady: presence.lastNotReady };
+          }
+          console.warn('[SessionStartingOverlay] show tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason);
+          return {
+            tabId: info.tabId,
+            engine: info.engine,
+            sessionId: info.sessionId,
+            since: Date.now(),
+            lastNotReady: presence.lastNotReady,
+          };
+        });
+      } else {
+        setSessionStarting((prev) => {
+          if (prev?.tabId === info.tabId) {
+            console.warn('[SessionStartingOverlay] hide tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason + ' status=' + presence.status);
+          }
+          return prev?.tabId === info.tabId ? null : prev;
+        });
+      }
+    } catch (e: any) {
+      if (seq !== startingProbeSeqRef.current) return;
+      console.warn('[SessionStartingOverlay] presence failed tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason + ' error=' + (e?.message || String(e)));
+    }
+  }, [currentView]);
+
+  useEffect(() => {
+    if (!activeAgentStartingInfo || currentView !== 'terminal') {
+      startingProbeSeqRef.current++;
+      setSessionStarting(null);
+      return;
+    }
+    void refreshSessionStarting('active-tab');
+    const interval = window.setInterval(() => {
+      void refreshSessionStarting('poll');
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [activeAgentStartingKey, activeAgentStartingInfo, currentView, refreshSessionStarting]);
+
+  useEffect(() => {
+    const showFromEvent = (tabId: string, reason: string) => {
+      const info = activeAgentStartingInfoRef.current;
+      if (!info || info.tabId !== tabId || currentView !== 'terminal') return;
+      console.warn('[SessionStartingOverlay] event-start tab=' + tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason);
+      setSessionStarting((prev) => prev?.tabId === tabId ? prev : {
+        tabId,
+        engine: info.engine,
+        sessionId: info.sessionId,
+        since: Date.now(),
+      });
+      void refreshSessionStarting(reason);
+    };
+    const hideFromEvent = (tabId: string, reason: string) => {
+      const info = activeAgentStartingInfoRef.current;
+      if (!info || info.tabId !== tabId) return;
+      setSessionStarting((prev) => {
+        if (prev?.tabId === tabId) {
+          console.warn('[SessionStartingOverlay] event-hide tab=' + tabId.slice(-12) + ' reason=' + reason);
+          return null;
+        }
+        return prev;
+      });
+    };
+    const onCommandStarted = (_: any, data: { tabId: string; commandType?: string | null }) => {
+      if (data.commandType === 'claude' || data.commandType === 'codex') {
+        showFromEvent(data.tabId, 'command-started');
+      } else {
+        void refreshSessionStarting('command-started');
+      }
+    };
+    const onCommandFinished = (_: any, data: { tabId: string }) => hideFromEvent(data.tabId, 'command-finished');
+    const onClaudeReady = (_: any, data: { tabId: string }) => hideFromEvent(data.tabId, 'claude-tui-ready');
+    const onCodexReady = (_: any, data: { tabId: string }) => hideFromEvent(data.tabId, 'codex-tui-ready');
+    const onClaudeBusy = (_: any, data: { tabId: string; busy: boolean }) => {
+      if (data.busy) hideFromEvent(data.tabId, 'claude-busy');
+      else void refreshSessionStarting('claude-busy-idle');
+    };
+    const onCodexBusy = (_: any, data: { tabId: string; busy: boolean }) => {
+      if (data.busy) hideFromEvent(data.tabId, 'codex-busy');
+      else void refreshSessionStarting('codex-busy-idle');
+    };
+
+    ipcRenderer.on('terminal:command-started', onCommandStarted);
+    ipcRenderer.on('terminal:command-finished', onCommandFinished);
+    ipcRenderer.on('claude:tui-ready', onClaudeReady);
+    ipcRenderer.on('codex:tui-ready', onCodexReady);
+    ipcRenderer.on('claude:busy-state', onClaudeBusy);
+    ipcRenderer.on('codex:busy-state', onCodexBusy);
+    return () => {
+      ipcRenderer.removeListener('terminal:command-started', onCommandStarted);
+      ipcRenderer.removeListener('terminal:command-finished', onCommandFinished);
+      ipcRenderer.removeListener('claude:tui-ready', onClaudeReady);
+      ipcRenderer.removeListener('codex:tui-ready', onCodexReady);
+      ipcRenderer.removeListener('claude:busy-state', onClaudeBusy);
+      ipcRenderer.removeListener('codex:busy-state', onCodexBusy);
+    };
+  }, [currentView, refreshSessionStarting]);
 
   // DEBUG: Track render reason
   const renderCountRef = useRef(0);
@@ -301,6 +508,10 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   const activeTabIdForOverlay = activeTabId;
   const isRestoring = useWorkspaceStore((s) => s.isRestoring);
   const showInterruptedOverlay = !!activeTabInterruptedEngine && !!activeTabSessionId && currentView === 'terminal' && !isRestoring;
+  const showSessionStartingOverlay = !!sessionStarting
+    && currentView === 'terminal'
+    && !showInterruptedOverlay
+    && activeTabIdForOverlay === sessionStarting.tabId;
 
   
   // Handle continuing interrupted AI session (use fresh state from getState)
@@ -326,6 +537,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
         const cwd = ws?.tabs.get(tabId)?.cwd;
         console.log('[TerminalArea] Sending codex:run-command codex-c:', targetSessionId);
         ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: targetSessionId, cwd }));
+        ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'codex', sessionId: targetSessionId });
       } else {
         // Arm the 15s stale-bridge guard BEFORE the resume write (см.
         // fix-bridge-stale-takeover.md layer 4/5) — иначе протухший bridge.json
@@ -334,7 +546,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
         const cmd = `claude --dangerously-skip-permissions --resume ${targetSessionId}\r`;
         console.log('[TerminalArea] Sending terminal:input:', cmd);
         ipcRenderer.send('terminal:input', tabId, cmd);
-        ipcRenderer.send('terminal:force-command-started', tabId);
+        ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude', sessionId: targetSessionId });
       }
     } else {
       console.log('[TerminalArea] handleContinueSession: Missing activeTab, engine or sessionId!');
@@ -496,6 +708,17 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
           }}
         />
       )}
+
+      {/* Local per-tab resume/start overlay: terminal keeps running underneath,
+          but user mouse/keyboard input is blocked until the agent prompt is ready. */}
+      <AnimatePresence>
+        {showSessionStartingOverlay && sessionStarting && (
+          <SessionStartingOverlay
+            key={`${sessionStarting.tabId}:${sessionStarting.since}`}
+            state={sessionStarting}
+          />
+        )}
+      </AnimatePresence>
 
       {/* Interrupted session overlay */}
       <AnimatePresence>

@@ -30,6 +30,7 @@ export interface AgentPtyPresence {
   hasTerm?: boolean;
   inputReady?: boolean;
   awaiting?: boolean;
+  lastNotReady?: any;
 }
 
 export interface AgentResumeResult {
@@ -130,6 +131,7 @@ async function getCodexPtyPresence(tabId: string): Promise<AgentPtyPresence> {
     hasTerm: state?.error !== 'tab not found',
     inputReady,
     awaiting: false,
+    lastNotReady: tuiReady?.lastNotReady || null,
   };
 }
 
@@ -154,7 +156,7 @@ async function resumeCodexSession({
     sessionId,
     cwd,
   }));
-  ipcRenderer.send('terminal:force-command-started', tabId);
+  ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'codex', sessionId });
   return { success: true, sessionId };
 }
 

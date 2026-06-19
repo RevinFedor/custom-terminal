@@ -141,7 +141,7 @@ PTY-Claude и PTY-Codex табы). Четыре неочевидных факт�
 
 App-level settings тоже принадлежат desktop app-state, а не каждому клиенту отдельно. Mobile-web settings sheet читает/пишет `streamerMode` через `/api/app-settings` → renderer bridge `getAppSettings/setAppSettings`; это тот же флаг, который скрывает desktop remote URL chip. Клиент может иметь локальный redaction fallback для собственного host-label, но если он управляет Noted Terminal state, запись должна идти в desktop app-state, иначе phone и desktop начнут расходиться: на телефоне включён privacy, а desktop продолжает светить URL в stream.
 
-Следствие для контракта: всё, что native UI не может честно вывести из файлов на диске, должно приходить по API уже нормализованным. Project icon (`project.icon`), назначенный status marker (`statusId/statusColor`) и форма/размер marker (`statusMarker:{shape,sizePx}`) передаются сервером, потому что palette и настройка живут в desktop `useUIStore`, недоступном iOS. Runtime `sessionStatus` остаётся отдельным полем: это busy/active/inactive процесса, а не user-assigned категория. Клиент может по-своему резервировать место в строке или менять icon layout, но не должен смешивать эти две оси.
+Следствие для контракта: всё, что native UI не может честно вывести из файлов на диске, должно приходить по API уже нормализованным. Project icon (`project.icon`), назначенный status marker (`statusId/statusColor`) и форма/размер marker (`statusMarker:{shape,sizePx}`) передаются сервером, потому что palette и настройка живут в desktop `useUIStore`, недоступном iOS. Runtime `sessionStatus` остаётся отдельным полем: это busy/active/inactive/starting процесса, а не user-assigned категория. `starting` — first-class runtime status: вкладка уже поднимает Claude/Codex, но composer ещё не input-ready, поэтому native не должен показывать обычный input или вручную выводить Resume. Клиент может по-своему резервировать место в строке или менять icon layout, но не должен смешивать эти две оси.
 
 `GET /api/projects` для native клиентов отдаёт не просто SQLite `updated_at DESC`.
 Открытые проекты сортируются по порядку `openProjects` из renderer — это тот же порядок,
@@ -512,6 +512,14 @@ busy/done/snapshot, `_notifyClaudeSession`, `recordActivity` open/close. Не с
 фонового `/api/projects/:id/tabs` refresh во время свайпа. Полные tab metadata, порядок,
 statusMarker, processBar и contextPct остаются ответственностью `/api/projects/:id/tabs`;
 project-activity патчит только `status/streaming`.
+
+`starting` в project-activity — тоже runtime patch, а не layout metadata. Вкладка в `starting`
+считается live для project badge/count, но `streaming=false`: процесс запускается или
+восстанавливается, пользовательский turn ещё не идёт. Нельзя сворачивать это в `active` до
+input-ready — иначе iOS показывает composer/input для вкладки, где desktop ещё ждёт startup
+prompt, `/model`/`/effort` defaults или Codex MCP readiness. Нельзя и делать global blocker
+по одному `starting` tab: список проектов и History должны оставаться доступными, меняется
+только статус конкретной вкладки.
 
 Layout changes идут отдельным полем snapshot'а `layoutChangedProjectIds`. Renderer вызывает
 `project:layout-changed` при изменении структуры или metadata вкладок конкретного проекта:

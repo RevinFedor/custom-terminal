@@ -600,6 +600,8 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       sessionId: session.sessionId || null,
       busy: true,
       sessionStatus: 'busy',
+      starting: false,
+      inputReady: true,
       commandType: 'claude-sdk',
       toolType: 'claude',
       source: pendingQuestion?.source,
@@ -617,9 +619,11 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       sessionId: status?.sessionId || null,
       busy: status?.status === 'busy',
       sessionStatus: status?.status || 'inactive',
+      starting: status?.status === 'starting',
       commandType: status?.commandType || null,
       toolType: status?.toolType || null,
-      inputReady: status?.status === 'active' || status?.status === 'busy',
+      inputReady: status?.inputReady === true,
+      lastNotReady: status?.lastNotReady || null,
       source: pendingQuestion?.source,
       toolUseID: pendingQuestion?.toolUseID,
       questions: pendingQuestion?.questions,
@@ -632,6 +636,8 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       sessionId: null,
       busy: false,
       sessionStatus: 'inactive',
+      starting: false,
+      inputReady: false,
       commandType: null,
       toolType: null,
       source: pendingQuestion?.source,
@@ -1152,6 +1158,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
     // renderer holds the live runtime adapters. SDK tabs have no
     // sessionStatus concept here; we keep null for them.
     let statusMap = new Map();
+    let inputReadyMap = new Map();
+    let lastNotReadyMap = new Map();
     let awaitingMap = new Map();
     const ptyAgentIds = (project.tabs || [])
       .filter(t => (t.commandType === 'claude' || t.commandType === 'codex') && (t.tabType || 'terminal') !== 'claude-sdk')
@@ -1160,6 +1168,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
       try {
         const data = await bridgeRequest('getClaudeTabStatusBatch', { tabIds: ptyAgentIds }, 1500);
         if (data?.statuses) for (const [id, st] of Object.entries(data.statuses)) statusMap.set(id, st);
+        if (data?.inputReady) for (const [id, ready] of Object.entries(data.inputReady)) inputReadyMap.set(id, !!ready);
+        if (data?.lastNotReady) for (const [id, value] of Object.entries(data.lastNotReady)) lastNotReadyMap.set(id, value);
         if (data?.awaiting) for (const [id, aw] of Object.entries(data.awaiting)) if (aw) awaitingMap.set(id, true);
       } catch (e) {
         // Bridge unavailable — every PTY agent tab will show no badge until
@@ -1200,6 +1210,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       // Assigned-category status (DB column session_status holds the palette id;
       // distinct from runtime sessionStatus which drives the loader/background).
       const statusId = t.sessionStatus || null;
+      const runtimeStatus = statusMap.get(t.tabId) || null;
       return {
         tabId: t.tabId,
         name: t.name,
@@ -1212,7 +1223,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
         codexSessionId: t.codexSessionId,
         geminiSessionId: t.geminiSessionId,
         timelineCount,
-        sessionStatus: statusMap.get(t.tabId) || null,
+        sessionStatus: runtimeStatus,
+        starting: runtimeStatus === 'starting',
+        inputReady: inputReadyMap.has(t.tabId) ? inputReadyMap.get(t.tabId) : null,
+        lastNotReady: lastNotReadyMap.get(t.tabId) || null,
         awaiting: awaitingMap.get(t.tabId) || false,
         statusId,
         statusColor: statusId ? (paletteById.get(statusId)?.color || null) : null,
@@ -1605,6 +1619,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           ...(data || {}),
           startupDefaultsReady: defaults?.defaultsReady === true,
           status: status?.status || 'active',
+          starting: status?.status === 'starting',
           inputReady: status?.inputReady === true,
         });
       } catch (readyErr) {

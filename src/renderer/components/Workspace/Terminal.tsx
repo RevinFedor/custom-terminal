@@ -1846,7 +1846,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             console.log('[Claude-c] Sending command: claude --resume', existingSessionId);
             ipcRenderer.send('terminal:input', tabId, '\x15claude --dangerously-skip-permissions --resume ' + existingSessionId + '\r');
             // Signal command started immediately for Timeline visibility (don't wait for OSC 133)
-            ipcRenderer.send('terminal:force-command-started', tabId);
+            ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude', sessionId: existingSessionId });
             return false;
           } else {
             event.preventDefault();
@@ -2541,7 +2541,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
               console.log('[Claude-c] Sending command: claude --resume', existingSessionId);
               ipcRenderer.send('terminal:input', tabId, '\x15claude --dangerously-skip-permissions --resume ' + existingSessionId + '\r');
               // Signal command started immediately for Timeline visibility
-              ipcRenderer.send('terminal:force-command-started', tabId);
+              ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude', sessionId: existingSessionId });
               return false;
             } else {
               event.preventDefault();
