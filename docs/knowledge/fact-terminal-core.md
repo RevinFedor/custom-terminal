@@ -177,11 +177,13 @@ if (data.length > 1024) {
 
 ### Алгоритм `safePasteAndSubmit(term, content, options)`:
 1. **Chunking:** `fast=true` цели (Gemini/bash) режутся на UTF-8-safe чанки до 900 байт и пишутся back-to-back внутри одной logical bracketed paste. `fast=false` TUI-safe цели (Claude Ink, Codex AI Rewind) пишут весь payload одним `term.write()` и одной парой `\x1b[200~...\x1b[201~`. Не возвращать per-chunk bracket pairs: Ink/Codex увидят несколько отдельных paste-событий или submit успеет прочитать только хвост.
-2. **Sync Marker Verification:** В `fast=false` после закрывающего bracket функция слушает PTY output и ждёт sync marker `\x1b[?2026l` (конец render frame). Это подтверждает что TUI обработал paste и React/composer state committed. (**НЕ** text echo — Ink/Codex могут коллапсировать вставки в `[Pasted text #N +M lines]` / `[Pasted Content N chars]`, поэтому полный текст не обязан появиться в выводе.)
-   - **Stale Marker Protection:** Введена фильтрация маркеров, приходящих < 15мс после записи. Это предотвращает ложные срабатывания от предыдущих циклов рендеринга (спиннеры, статус-бары). См. `knowledge/fix-stale-sync-markers.md`.
+2. **Sync Marker Verification:** В `fast=false` после закрывающего bracket функция слушает PTY output и ждёт sync marker `\x1b[?2026l` (конец render frame). Это подтверждает что TUI обработал paste и закоммитил новый кадр composer'а. Это **не** product-level событие «Codex принял вставку» и **не** text echo: Ink/Codex могут коллапсировать вставки в `[Pasted text #N +M lines]` / `[Pasted Content N chars]`, поэтому полный текст не обязан появиться в выводе.
+   - **Stale Marker Protection:** Введена фильтрация маркеров, приходящих < 3мс после записи. Это предотвращает ложные срабатывания от предыдущих циклов рендеринга (спиннеры, статус-бары). См. `knowledge/fix-stale-sync-markers.md`.
 3. **Submit:** `\r` отправляется ТОЛЬКО после подтверждения последнего чанка — гарантия что `onSubmit(value)` прочитает уже зафиксированный в стейте текст.
 
 Если sync marker не пришёл до safety timeout, programmatic paste обязан вернуть failure до Enter. Это не retry/fallback состояние: без render ACK неизвестно, попал ли text в composer, и submit может отправить пустой, хвостовой или чужой input.
+
+Для Codex внешний submit не должен заменять этот render ACK post-paste проверкой видимого renderer-draft: hidden/background renderer может не проснуться вовремя, хотя PTY уже получил paste. Render ACK остаётся pre-Enter gate'ом, а точное совпадение текста доказывается только после Enter через ближайший rollout `user_message` audit.
 
 ```javascript
 await safePasteAndSubmit(term, content, {
@@ -208,7 +210,7 @@ await safePasteAndSubmit(term, content, {
 **Важно:** `\r` для submit отправляется **после** закрывающего тега И подтверждения sync marker.
 
 ## Код
-Реализовано в `src/main/main.js`: функции `safePasteAndSubmit()`, `waitForRender()`. Применяется для Handshake, `claude:send-command`, Rewind (`claude:open-history-menu`). User paste (Ctrl+V) обрабатывается отдельным simple chunking в `terminal:input`.
+Реализовано в `src/main/main.js`: функции `safePasteAndSubmit()`, `waitForRender()`. Применяется для Handshake, `claude:send-command`, Codex external submit (`codex:send-command`, `codex:append-input`, MCP `/terminal/ai-prompt`) и Rewind (`claude:open-history-menu`). User paste (Ctrl+V) обрабатывается отдельным simple chunking в `terminal:input`.
 
 ---
 

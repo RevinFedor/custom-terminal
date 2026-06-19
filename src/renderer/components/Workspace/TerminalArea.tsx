@@ -127,8 +127,10 @@ const ExternalRunBadge = memo(({ meta }: { meta: ExternalRunMeta }) => {
   );
 });
 
-const SessionStartingOverlay = memo(({ state }: { state: SessionStartingState }) => {
+const SessionStartingOverlay = memo(({ state, onDismiss }: { state: SessionStartingState; onDismiss: () => void }) => {
   const ref = useRef<HTMLDivElement>(null);
+  const flashTimerRef = useRef<number | null>(null);
+  const [closeFlash, setCloseFlash] = useState(false);
   const engineLabel = state.engine === 'codex' ? 'CODEX' : 'CLAUDE';
   const sessionLabel = state.sessionId ? state.sessionId.slice(0, 8) : null;
   const blocker = state.lastNotReady?.reason || '';
@@ -137,9 +139,28 @@ const SessionStartingOverlay = memo(({ state }: { state: SessionStartingState })
     ref.current?.focus();
   }, [state.tabId, state.since]);
 
+  useEffect(() => () => {
+    if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
+  }, []);
+
   const block = (event: React.SyntheticEvent) => {
     event.preventDefault();
     event.stopPropagation();
+  };
+
+  const flashCloseButton = (event: React.SyntheticEvent) => {
+    block(event);
+    if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
+    setCloseFlash(false);
+    window.requestAnimationFrame(() => {
+      setCloseFlash(true);
+      flashTimerRef.current = window.setTimeout(() => setCloseFlash(false), 420);
+    });
+  };
+
+  const handleClose = (event: React.SyntheticEvent) => {
+    block(event);
+    onDismiss();
   };
 
   return (
@@ -147,21 +168,48 @@ const SessionStartingOverlay = memo(({ state }: { state: SessionStartingState })
       ref={ref}
       tabIndex={-1}
       className="absolute inset-0 z-40 flex items-center justify-center outline-none"
-      onMouseDown={block}
+      onMouseDown={flashCloseButton}
       onMouseUp={block}
       onClick={block}
-      onDoubleClick={block}
+      onDoubleClick={flashCloseButton}
       onContextMenu={block}
       onKeyDown={block}
       onKeyUp={block}
       onPaste={block}
       style={{ pointerEvents: 'auto' }}
     >
-      <div className="absolute inset-0 bg-black/55 backdrop-blur-sm" />
       <div
-        className="relative z-10 flex flex-col items-center gap-4 rounded-xl border border-white/10 bg-[#111116]/95 px-8 py-7 shadow-2xl"
-        style={{ minWidth: 320, maxWidth: 'min(420px, calc(100% - 32px))' }}
+        className="absolute inset-0"
+        style={{
+          background: 'rgba(0,0,0,0.14)',
+          backdropFilter: 'blur(1px)',
+        }}
+      />
+      <div
+        className="relative z-10 flex flex-col items-center gap-4 rounded-xl border border-white/10 bg-[#111116]/88 px-8 py-7 shadow-2xl"
+        style={{
+          minWidth: 320,
+          maxWidth: 'min(420px, calc(100% - 32px))',
+          backdropFilter: 'blur(6px)',
+        }}
+        onMouseDown={block}
+        onDoubleClick={block}
       >
+        <button
+          type="button"
+          aria-label="Close starting overlay"
+          className="absolute top-3 right-3 flex h-7 w-7 items-center justify-center rounded-md border text-lg leading-none transition-colors"
+          onMouseDown={handleClose}
+          onClick={block}
+          style={{
+            color: closeFlash ? '#fecaca' : '#9ca3af',
+            borderColor: closeFlash ? 'rgba(239,68,68,0.78)' : 'rgba(255,255,255,0.12)',
+            background: closeFlash ? 'rgba(239,68,68,0.32)' : 'rgba(255,255,255,0.06)',
+            boxShadow: closeFlash ? '0 0 0 3px rgba(239,68,68,0.18), 0 0 22px rgba(239,68,68,0.38)' : 'none',
+          }}
+        >
+          ×
+        </button>
         <div className="w-9 h-9 border-2 border-white/20 border-t-[#60a5fa] rounded-full animate-spin" />
         <div className="flex flex-col items-center gap-1 text-center">
           <div className="text-sm font-bold tracking-widest text-white">
@@ -349,7 +397,12 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   }, [activeAgentStartingKey]);
   const activeAgentStartingInfoRef = useRef(activeAgentStartingInfo);
   const startingProbeSeqRef = useRef(0);
+  const dismissedStartingKeysRef = useRef<Set<string>>(new Set());
   const [sessionStarting, setSessionStarting] = useState<SessionStartingState | null>(null);
+
+  const startingDismissKey = useCallback((info: { tabId: string; engine: InterruptedEngine; sessionId?: string | null }) => (
+    `${info.tabId}|${info.engine}|${info.sessionId || ''}`
+  ), []);
 
   useEffect(() => {
     activeAgentStartingInfoRef.current = activeAgentStartingInfo;
@@ -368,6 +421,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       const latest = activeAgentStartingInfoRef.current;
       if (!latest || latest.tabId !== info.tabId || latest.engine !== info.engine) return;
       if (presence.status === 'starting') {
+        if (dismissedStartingKeysRef.current.has(startingDismissKey(info))) return;
         setSessionStarting((prev) => {
           if (prev?.tabId === info.tabId && prev.engine === info.engine) {
             return { ...prev, sessionId: info.sessionId, lastNotReady: presence.lastNotReady };
@@ -382,6 +436,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
           };
         });
       } else {
+        dismissedStartingKeysRef.current.delete(startingDismissKey(info));
         setSessionStarting((prev) => {
           if (prev?.tabId === info.tabId) {
             console.warn('[SessionStartingOverlay] hide tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason + ' status=' + presence.status);
@@ -393,7 +448,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       if (seq !== startingProbeSeqRef.current) return;
       console.warn('[SessionStartingOverlay] presence failed tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason + ' error=' + (e?.message || String(e)));
     }
-  }, [currentView]);
+  }, [currentView, startingDismissKey]);
 
   useEffect(() => {
     if (!activeAgentStartingInfo || currentView !== 'terminal') {
@@ -412,6 +467,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     const showFromEvent = (tabId: string, reason: string) => {
       const info = activeAgentStartingInfoRef.current;
       if (!info || info.tabId !== tabId || currentView !== 'terminal') return;
+      dismissedStartingKeysRef.current.delete(startingDismissKey(info));
       console.warn('[SessionStartingOverlay] event-start tab=' + tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason);
       setSessionStarting((prev) => prev?.tabId === tabId ? prev : {
         tabId,
@@ -465,7 +521,16 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       ipcRenderer.removeListener('claude:busy-state', onClaudeBusy);
       ipcRenderer.removeListener('codex:busy-state', onCodexBusy);
     };
-  }, [currentView, refreshSessionStarting]);
+  }, [currentView, refreshSessionStarting, startingDismissKey]);
+
+  const handleDismissSessionStarting = useCallback(() => {
+    const current = sessionStarting;
+    if (current) {
+      dismissedStartingKeysRef.current.add(startingDismissKey(current));
+      console.warn('[SessionStartingOverlay] dismissed tab=' + current.tabId.slice(-12) + ' engine=' + current.engine);
+    }
+    setSessionStarting(null);
+  }, [sessionStarting, startingDismissKey]);
 
   // DEBUG: Track render reason
   const renderCountRef = useRef(0);
@@ -716,6 +781,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
           <SessionStartingOverlay
             key={`${sessionStarting.tabId}:${sessionStarting.since}`}
             state={sessionStarting}
+            onDismiss={handleDismissSessionStarting}
           />
         )}
       </AnimatePresence>
