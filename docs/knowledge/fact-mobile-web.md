@@ -45,6 +45,10 @@ _webBroadcast(tabId, {
 
 Если между локальным `sending` и durable row приходит canonical `/history` reload, клиент обязан смерджить pending handoff обратно в publish. Иначе heavy reload стирает optimistic user-row, и UI выглядит так, будто prompt исчез или заменился tool-событием. Source of truth всё равно durable transcript: локальный handoff живёт только до matching user entry / failed / cancelled.
 
+Busy-send и Stop во время streaming имеют ещё один промежуточный случай: сервер может прислать queue-operation / handoff-ack раньше, чем canonical history reload увидит durable user-row. Для iOS это не момент снятия `queued/sending` с локальной строки. Маркер остаётся на месте до matching durable row, проверенного consumed-state или явного cancel; иначе пользователь видит старый prompt уже без очереди, а через секунду он "телепортируется" в конец истории. Логовая строка `handoff materialized` на queue-operation сама по себе означает только, что handoff принят сценарным слоем, а не что визуальная история уже догнала JSONL/rollout.
+
+`thinking` — отдельная семантическая строка, а не tool-card. Pending `tool_use` без результата можно скрыть или дождаться результата, но нельзя на один кадр превращать thinking в `MCP thinking` с badge, chevron или раскрытием справа. Completed tool rows могут быть отдельными раскрываемыми карточками; этот contract не распространяется на thinking, потому что для пользователя это статус размышления агента, а не объект инструмента.
+
 ## History loader: НЕ getSessionMessages
 
 `getSessionMessages` из Anthropic SDK возвращает **другой набор записей** чем `parseTimelineEntries` — uuids не пересекаются. Если history грузить через SDK-helper, GoTo из timeline (использует timeline uuids как anchors) никогда не находит цель. См. [`fix-mobile-history-uuid-mismatch.md`](fix-mobile-history-uuid-mismatch.md).
@@ -319,6 +323,7 @@ main/headless draft proof; если он доказал empty composer, send п�
 сверяется уже по rollout/JSONL. Если proof неизвестен, это ambiguity/error для клиента, а не
 повод переключать desktop UI или фокусить вкладку на Mac. Для fresh/resume сессий это послабление
 не действует — startup/readiness по-прежнему обязателен, иначе prompt можно отправить в экран запуска или MCP-confirmation.
+Нормальная отправка с native iOS не должна перед этим вызывать destructive `GET /draft` как обязательный gate: `/draft` нужен после interrupt/Rewind или явного "забрать input", а не как проверка "можно ли отправлять". Такой preflight дублирует scenario layer и даёт ложный `claude_busy` в момент, когда `/send` сам умеет решить busy/queue/draft-conflict. Если клиенту нужна только защита от чужого текста, использовать read-only `/draft-state`; окончательное решение всё равно принимает `/send`.
 Это важно для native iOS и старых project/tab-клиентов: они управляют конкретной вкладкой,
 поэтому источник текста остаётся в терминале до явного действия пользователя. Противоположный контракт только у
 `/api/inbox/runs`: Inbox-клиент владеет своим chat composer, поэтому Noted Terminal
