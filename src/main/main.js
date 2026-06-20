@@ -10676,12 +10676,16 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       const confirmClean = confirmFrame.clean || '';
       console.log('[Codex:Rewind] confirm timedOut=' + confirmFrame.timedOut + ' clean=' + JSON.stringify(confirmClean.slice(0, 320)));
       codexRewindOverlayOpen = false;
-      if (/Update available|directory to resume this session|directory to fork this session|Starting\s+MCP\s+servers|MCP\s+startup\s+interrupted|esc\s+to\s+interrupt/i.test(confirmClean)) {
+      const confirmStartupBlockers = inspectCodexStartupBlockersText(confirmClean);
+      const confirmExposedStartupFrame = confirmStartupBlockers.length > 0;
+      const surfaceConfirmStartupFrameIfUnrecovered = (reason = 'codex-rewind-confirm-startup-frame-unrecovered') => {
+        if (!confirmExposedStartupFrame) return false;
         const hadReady = codexTuiReadyTabs.delete(tabId);
         codexTuiReadyMeta.delete(tabId);
         codexTuiReadyBuffers.set(tabId, String(confirmFrame.raw || '').slice(-CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT));
-        console.warn('[Codex:Rewind] confirm exposed startup frame; cleared input-ready tab=' + String(tabId).slice(-12)
+        console.warn('[Codex:Rewind] confirm startup frame unrecovered; cleared input-ready tab=' + String(tabId).slice(-12)
           + ' hadReady=' + hadReady
+          + ' blockers=' + confirmStartupBlockers.join('+')
           + ' preview=' + JSON.stringify(confirmClean.replace(/\s+/g, ' ').trim().slice(0, 220)));
         _webBroadcast(tabId, {
           type: 'snapshot',
@@ -10691,10 +10695,17 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           toolType: 'codex',
           commandType: 'codex',
           inputReady: false,
-          reason: 'codex-rewind-confirm-startup-frame',
+          reason,
         });
+        return true;
+      };
+      if (confirmExposedStartupFrame) {
+        console.warn('[Codex:Rewind] confirm exposed startup-like frame; deferring input-ready clear until grab outcome tab=' + String(tabId).slice(-12)
+          + ' blockers=' + confirmStartupBlockers.join('+')
+          + ' preview=' + JSON.stringify(confirmClean.replace(/\s+/g, ' ').trim().slice(0, 220)));
       }
       if (/Cannot rollback|ThreadRollbackFailed|rollback.*failed|requires persisted/i.test(confirmClean)) {
+        surfaceConfirmStartupFrameIfUnrecovered('codex-rewind-confirm-thread-rollback-failed-startup-frame');
         return { success: false, error: 'codex_thread_rollback_failed', clean: confirmClean.slice(0, 800) };
       }
       if (confirmFrame.timedOut || (targetNeedle.length > 0 && !normalizeCandidate(confirmClean).includes(targetNeedle))) {
@@ -10709,6 +10720,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       const grabResult = await grabRestoredCodexRewindInput(targetInputText);
       if (!grabResult || grabResult.success === false) {
         console.warn('[Codex:Rewind] Could not verify terminal input clear after native backtrack: ' + (grabResult?.error || 'unknown'));
+        surfaceConfirmStartupFrameIfUnrecovered('codex-rewind-confirm-grab-failed-startup-frame');
         return {
           success: false,
           error: grabResult?.error || 'codex_rewind_restored_input_grab_failed',
@@ -10736,6 +10748,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         };
       }
       if (grabResult.empty || !grabResult.text || normalizeCandidate(grabResult.text).length === 0) {
+        surfaceConfirmStartupFrameIfUnrecovered('codex-rewind-confirm-empty-grab-startup-frame');
         return {
           success: false,
           error: 'codex_rewind_restored_input_empty',
@@ -13728,6 +13741,13 @@ function inspectCodexStartupBlockersText(cleanText) {
 
 function invalidateCodexTuiReadyForStartupBlocker(tabId, source, preview, blockers) {
   if (!tabId || !Array.isArray(blockers) || blockers.length === 0) return false;
+  if (hasCodexPromptOrTurnInFlight(tabId)) {
+    console.log('[CodexTuiReady] skip startup-blocker invalidation tab=' + String(tabId).slice(-12)
+      + ' source=' + (source || '-')
+      + ' reason=prompt-or-turn-in-flight'
+      + ' blockers=' + blockers.join('+'));
+    return false;
+  }
   const hadReady = codexTuiReadyTabs.delete(tabId);
   codexTuiReadyMeta.delete(tabId);
   const previewTail = String(preview || '').replace(/\s+/g, ' ').trim().slice(-260);
@@ -13912,6 +13932,7 @@ function getCodexStartupNoStateTimeout(tabId) {
   const startedAt = Number(payload?.startedAt || 0);
   if (!tabId || !payload || !startedAt) return null;
   if (codexTuiReadyTabs.has(tabId)) return null;
+  if (hasCodexPromptOrTurnInFlight(tabId)) return null;
   const ageMs = Date.now() - startedAt;
   if (ageMs < CODEX_STARTUP_NO_STATE_TIMEOUT_MS) return null;
   const blockerState = codexTuiReadyLastNotReady.get(tabId) || getCodexMcpStartupStatus(tabId) || null;
@@ -14310,7 +14331,7 @@ async function tryEmitCodexTuiReady(tabId, data) {
   const inspected = inspectCodexInputReadyFrame(clean, raw);
   if (codexTuiReadyTabs.has(tabId)) {
     if (!inspected.ready && Array.isArray(inspected.blockers) && inspected.blockers.length > 0) {
-      if (isOnlyCodexMcpStartupBlocker(inspected.blockers) && hasCodexPromptOrTurnInFlight(tabId)) {
+      if (hasCodexPromptOrTurnInFlight(tabId)) {
         return;
       }
       invalidateCodexTuiReadyForStartupBlocker(tabId, 'stream-after-ready', inspected.sampleText || clean, inspected.blockers);
@@ -14487,7 +14508,7 @@ async function getCodexTuiReadyState(tabId) {
   if (textReady && readyMeta?.preview) {
     const blockers = inspectCodexStartupBlockersText(readyMeta.preview);
     if (blockers.length > 0) {
-      if (!(isOnlyCodexMcpStartupBlocker(blockers) && hasCodexPromptOrTurnInFlight(tabId))) {
+      if (!hasCodexPromptOrTurnInFlight(tabId)) {
         invalidateCodexTuiReadyForStartupBlocker(tabId, 'get-state-ready-preview', readyMeta.preview, blockers);
         textReady = false;
       }

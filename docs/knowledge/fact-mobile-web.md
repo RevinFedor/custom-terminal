@@ -143,6 +143,8 @@ App-level settings тоже принадлежат desktop app-state, а не к
 
 Следствие для контракта: всё, что native UI не может честно вывести из файлов на диске, должно приходить по API уже нормализованным. Project icon (`project.icon`), назначенный status marker (`statusId/statusColor`) и форма/размер marker (`statusMarker:{shape,sizePx}`) передаются сервером, потому что palette и настройка живут в desktop `useUIStore`, недоступном iOS. Runtime `sessionStatus` остаётся отдельным полем: это busy/active/inactive/starting процесса, а не user-assigned категория. `starting` — first-class runtime status: вкладка уже поднимает Claude/Codex, но composer ещё не input-ready, поэтому native не должен показывать обычный input или вручную выводить Resume. Клиент может по-своему резервировать место в строке или менять icon layout, но не должен смешивать эти две оси.
 
+Для Codex `status` и SSE snapshot должны быть привязаны к актуальной runtime session после resume/start, а не к старому `sessionId`, который остался в layout metadata. Диагностический шрам 2026-06-20: iOS корректно показал `active`, потому что `/status` и SSE сами отдавали `active` для старой session, а desktop startup уже работал с новой Codex-сессией; после failed Rewind тот же API переключился в `starting`. Если native логи показывают такую цепочку, чинить нужно main/API session-binding и readiness, не iOS UI.
+
 `GET /api/projects` для native клиентов отдаёт не просто SQLite `updated_at DESC`.
 Открытые проекты сортируются по порядку `openProjects` из renderer — это тот же порядок,
 в котором desktop project tabs стоят слева направо; телефон показывает его сверху вниз.
@@ -290,6 +292,8 @@ GET  /api/terminal-tabs/:tabId/status                → status строка (in
 Для Claude/Codex PTY-табов расширение mobile-web — см. `fact-mobile-claude-pty.md`. `/send`, `/stop`, `/interrupt`, `/draft`, `/draft-state` и `/rewind` роутятся через общий scenario layer: backend сам выбирает Claude PTY/Codex PTY runtime, а endpoint остаётся Project Terminal API. Legacy SDK fallback существует только для старых SDK-табов, не как модель нового API.
 
 `/resume` — часть того же Project Terminal API, а не сырой bridge proxy. Успешный ответ доказывает готовность composer'а к следующей команде; bridge failure/readiness timeout возвращаются как non-success JSON. Native клиент после такой ошибки должен снять локальный `starting`, а не ждать следующего poll/SSE snapshot'а, потому что `starting busy=false` после failed resume часто является stale startup state.
+
+Если resume/startup завершился ошибкой, API обязан вернуть/разослать явный failure-state, который клиент может показать в той же blocking-поверхности. Пропажа resume-overlay без успеха недопустима: для пользователя исчезновение окна означает «готово», а не «ошибка ушла в лог». Поэтому ошибка readiness/watchdog должна быть видимой (`startupError`/non-success JSON/SSE), пока пользователь не закроет или не повторит действие.
 
 `/draft-state` — preflight только для защиты чужого текста в terminal composer, а не команда
 активации desktop UI. Если renderer видит mounted xterm, он инспектирует Claude/Codex input и
