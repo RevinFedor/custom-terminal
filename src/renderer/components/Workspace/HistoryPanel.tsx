@@ -1944,6 +1944,7 @@ function AgentHistoryControls({
           handoffId,
           source: 'history-panel',
           statusAtSend,
+          queue: statusAtSend === 'busy',
         });
         historyDiag('SEND_RESULT tab=' + tabId.slice(-12) +
           ' handoff=' + handoffId +

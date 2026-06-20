@@ -20,6 +20,8 @@ type SessionStartingState = {
   sessionId?: string | null;
   since: number;
   lastNotReady?: any;
+  startupFailed?: boolean;
+  startupError?: string | null;
 };
 
 type ExternalRunMeta = {
@@ -134,6 +136,10 @@ const SessionStartingOverlay = memo(({ state, onDismiss }: { state: SessionStart
   const engineLabel = state.engine === 'codex' ? 'CODEX' : 'CLAUDE';
   const sessionLabel = state.sessionId ? state.sessionId.slice(0, 8) : null;
   const blocker = state.lastNotReady?.reason || '';
+  const isError = state.startupFailed === true || state.lastNotReady?.phase === 'startup-timeout' || String(blocker || '').includes('startup-timeout');
+  const title = isError ? `ERROR RESUMING ${engineLabel}` : `RESUMING ${engineLabel}...`;
+  const subtitle = isError ? 'Startup did not reach prompt' : `Waiting for prompt${sessionLabel ? ` · ${sessionLabel}` : ''}`;
+  const detail = state.startupError || blocker;
 
   useEffect(() => {
     ref.current?.focus();
@@ -210,17 +216,32 @@ const SessionStartingOverlay = memo(({ state, onDismiss }: { state: SessionStart
         >
           ×
         </button>
-        <div className="w-9 h-9 border-2 border-white/20 border-t-[#60a5fa] rounded-full animate-spin" />
+        {isError ? (
+          <div
+            className="flex h-9 w-9 items-center justify-center rounded-full border-2 text-lg font-black"
+            style={{ borderColor: 'rgba(239,68,68,0.9)', color: '#fecaca', background: 'rgba(239,68,68,0.16)' }}
+          >
+            !
+          </div>
+        ) : (
+          <div className="w-9 h-9 border-2 border-white/20 border-t-[#60a5fa] rounded-full animate-spin" />
+        )}
         <div className="flex flex-col items-center gap-1 text-center">
-          <div className="text-sm font-bold tracking-widest text-white">
-            RESUMING {engineLabel}...
+          <div
+            className="text-sm font-bold tracking-widest"
+            style={{ color: isError ? '#fecaca' : '#ffffff' }}
+          >
+            {title}
           </div>
-          <div className="text-xs text-[#8b8b91]">
-            Waiting for prompt{sessionLabel ? ` · ${sessionLabel}` : ''}
+          <div className="text-xs" style={{ color: isError ? '#fca5a5' : '#8b8b91' }}>
+            {subtitle}
           </div>
-          {blocker ? (
-            <div className="mt-1 text-[10px] text-[#666]">
-              {blocker}
+          {detail ? (
+            <div
+              className="mt-1 text-[10px]"
+              style={{ color: isError ? '#ef4444' : '#666' }}
+            >
+              {detail}
             </div>
           ) : null}
         </div>
@@ -424,7 +445,13 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
         if (dismissedStartingKeysRef.current.has(startingDismissKey(info))) return;
         setSessionStarting((prev) => {
           if (prev?.tabId === info.tabId && prev.engine === info.engine) {
-            return { ...prev, sessionId: info.sessionId, lastNotReady: presence.lastNotReady };
+            return {
+              ...prev,
+              sessionId: info.sessionId,
+              lastNotReady: presence.lastNotReady,
+              startupFailed: presence.startupFailed,
+              startupError: presence.startupError,
+            };
           }
           console.warn('[SessionStartingOverlay] show tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason);
           return {
@@ -433,6 +460,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
             sessionId: info.sessionId,
             since: Date.now(),
             lastNotReady: presence.lastNotReady,
+            startupFailed: presence.startupFailed,
+            startupError: presence.startupError,
           };
         });
       } else {

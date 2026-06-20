@@ -613,6 +613,7 @@ const claudeCtrlCDangerZone = new Map(); // tabId -> { resolve, promise, timer }
 const claudeConfirmDialogCooldown = new Map(); // `${tabId}:${dialogType}` -> lastFireTs (ms). Prevents double-Enter on echo re-render.
 const codexStartupAutoEnter = new Map(); // tabId -> one-shot state for Codex startup confirmation prompts
 const codexMcpStartupWatchdogs = new Map(); // tabId -> MCP startup restart watchdog state, independent of prompt TTL
+const codexStartupNoStateTimeoutTabs = new Set(); // tabIds that already surfaced generic startup timeout
 const codexTuiReadyTabs = new Set();     // tabIds whose current Codex TUI process rendered an input-ready frame
 const codexTuiReadyMeta = new Map();     // tabId -> { at, source, reason, preview } for Rewind/readiness forensics
 const codexTuiReadyBuffers = new Map();  // tabId -> recent startup output for deterministic ready detection
@@ -13660,6 +13661,7 @@ const CODEX_TUI_READY_QUIET_MS = 350;
 const CODEX_EXTERNAL_PROMPT_READY_TIMEOUT_MS = 90 * 1000;
 const CODEX_MCP_STARTUP_RESTART_MS = 15 * 1000;
 const CODEX_MCP_STARTUP_MAX_RESTARTS = 1;
+const CODEX_STARTUP_NO_STATE_TIMEOUT_MS = 15 * 1000;
 // Parser order matters: `xhigh` renders as "Extra high", so it must be matched
 // before plain `high` or the effort picker selects the wrong row.
 const CODEX_PICKER_EFFORT_CANDIDATES = ['minimal', 'low', 'medium', 'xhigh', 'high'];
@@ -13674,6 +13676,7 @@ function clearCodexTuiReady(tabId, reason = 'clear') {
   codexTuiReadyRejectKeys.delete(tabId);
   codexTuiReadyLastNotReady.delete(tabId);
   codexTuiReadyMeta.delete(tabId);
+  codexStartupNoStateTimeoutTabs.delete(tabId);
   clearCodexMcpStartupWatchdog(tabId, reason);
   if (hadReady) {
     console.log('[CodexTuiReady] clear tab=' + String(tabId).slice(-12) + ' reason=' + reason);
@@ -13692,6 +13695,7 @@ function resetCodexTuiReadyDetection(tabId, reason = 'reset') {
   codexTuiReadyRejectKeys.delete(tabId);
   codexTuiReadyLastNotReady.delete(tabId);
   codexTuiReadyMeta.delete(tabId);
+  codexStartupNoStateTimeoutTabs.delete(tabId);
   if (codexTuiReadyTabs.delete(tabId)) {
     console.log('[CodexTuiReady] clear tab=' + String(tabId).slice(-12) + ' reason=' + reason);
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -13706,7 +13710,8 @@ function inspectCodexStartupBlockersText(cleanText) {
   if (!compact) return [];
   const blockers = [];
   const has = (re) => re.test(compact);
-  if (has(/Update\s+available!?|Update\s+now|Skip\s+until\s+next\s+version|@?openai[\/\s-]*codex\s+to\s+update/i)) {
+  const updatePrompt = inspectCodexUpdatePrompt(text);
+  if (updatePrompt.interactiveVisible) {
     blockers.push('update-prompt');
   }
   if (has(/Do\s+you\s+trust\s+the\s+contents|Working\s+with\s+untrusted\s+contents|Yes\s*,?\s*continue|No\s*,?\s*quit/i)) {
@@ -13715,7 +13720,7 @@ function inspectCodexStartupBlockersText(cleanText) {
   if (has(/directory\s+to\s+(?:resume|fork)\s+this\s+session|Use\s+session\s+directory|Use\s+current\s+directory/i)) {
     blockers.push('cwd-chooser');
   }
-  if (has(/Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|esc\s+to\s+interrupt/i)) {
+  if (has(/Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|MCP\s+servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)|servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)/i)) {
     blockers.push('mcp-startup');
   }
   return Array.from(new Set(blockers));
@@ -13850,12 +13855,12 @@ function inspectCodexMcpStartupText(cleanText) {
   const text = String(cleanText || '').replace(/\u00a0/g, ' ');
   const compact = text.replace(/\s+/g, ' ').trim();
   if (!compact) return { visible: false, canInterrupt: false, preview: '' };
-  const hasStartupText = /Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup|esc\s+to\s+interrupt/i.test(compact);
+  const hasStartupText = /Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup/i.test(compact);
   const hasProgressText = /MCP\s+servers?|servers\s*\(\s*\d+\s*\/\s*\d+\s*\)|\(\s*\d+\s*\/\s*\d+\s*\)\s*:/i.test(compact);
   const visible = hasStartupText || hasProgressText;
   return {
     visible,
-    canInterrupt: /esc\s+to\s+interrupt/i.test(compact) || hasProgressText,
+    canInterrupt: visible && (/esc\s+to\s+interrupt/i.test(compact) || hasProgressText),
     preview: compact.slice(-260),
   };
 }
@@ -13891,6 +13896,71 @@ function getCodexMcpStartupStatus(tabId) {
   };
 }
 
+function hasCodexPromptOrTurnInFlight(tabId) {
+  if (!tabId) return false;
+  const turnState = codexTurnWatchers.get(tabId);
+  const audit = pendingCodexPasteAudit.get(tabId);
+  return turnState?.busy === true || activityOpenIntervals.has(tabId) || audit?.awaitUserMessage === true;
+}
+
+function isOnlyCodexMcpStartupBlocker(blockers) {
+  return Array.isArray(blockers) && blockers.length === 1 && blockers[0] === 'mcp-startup';
+}
+
+function getCodexStartupNoStateTimeout(tabId) {
+  const payload = codexLastRunCommandPayload.get(tabId) || null;
+  const startedAt = Number(payload?.startedAt || 0);
+  if (!tabId || !payload || !startedAt) return null;
+  if (codexTuiReadyTabs.has(tabId)) return null;
+  const ageMs = Date.now() - startedAt;
+  if (ageMs < CODEX_STARTUP_NO_STATE_TIMEOUT_MS) return null;
+  const blockerState = codexTuiReadyLastNotReady.get(tabId) || getCodexMcpStartupStatus(tabId) || null;
+  if (Array.isArray(blockerState?.blockers) && blockerState.blockers.length > 0) return null;
+  const previewTail = blockerState?.previewTail || '';
+  return {
+    ts: Date.now(),
+    phase: 'startup-timeout',
+    source: 'main-startup-watchdog',
+    reason: 'startup-timeout:no-ready-signal',
+    blockers: [],
+    sampleMode: blockerState?.sampleMode || '-',
+    sampleBytes: blockerState?.sampleBytes || 0,
+    totalBytes: blockerState?.totalBytes || 0,
+    startupArmed: codexStartupAutoEnter.has(tabId),
+    previewTail,
+    firstSeenAgeMs: ageMs,
+    lastSeenAgeMs: ageMs,
+    timeoutMs: CODEX_STARTUP_NO_STATE_TIMEOUT_MS,
+    command: payload.command || 'codex',
+    sessionId: payload.sessionId || null,
+  };
+}
+
+function maybeSurfaceCodexStartupNoStateTimeout(tabId, status) {
+  if (!tabId || !status) return;
+  codexTuiReadyLastNotReady.set(tabId, status);
+  if (codexStartupNoStateTimeoutTabs.has(tabId)) return;
+  codexStartupNoStateTimeoutTabs.add(tabId);
+  console.warn('[CodexStartupTimeout] tab=' + String(tabId).slice(-12)
+    + ' reason=' + status.reason
+    + ' ageMs=' + status.firstSeenAgeMs
+    + ' command=' + (status.command || '-')
+    + ' session=' + (status.sessionId ? String(status.sessionId).slice(0, 8) : 'none'));
+  _webBroadcast(tabId, {
+    type: 'snapshot',
+    sessionId: getCodexRuntimeSessionId(tabId),
+    busy: false,
+    sessionStatus: 'starting',
+    starting: true,
+    inputReady: false,
+    toolType: 'codex',
+    commandType: 'codex',
+    lastNotReady: status,
+    startupError: status.reason,
+    reason: 'codex-startup-timeout',
+  });
+}
+
 function broadcastCodexStartingSnapshot(tabId, reason = 'starting') {
   if (!tabId) return;
   const sessionId = getCodexRuntimeSessionId(tabId);
@@ -13913,6 +13983,17 @@ async function restartCodexAfterMcpStartupWatchdog(tabId, state, mcpInfo) {
   if (!current || current !== state || current.mcpStartupRestarting) return;
   if (codexTuiReadyTabs.has(tabId)) {
     clearCodexMcpStartupWatchdog(tabId, 'tui-ready-before-restart');
+    return;
+  }
+  if (hasCodexPromptOrTurnInFlight(tabId)) {
+    const turnState = codexTurnWatchers.get(tabId);
+    const audit = pendingCodexPasteAudit.get(tabId);
+    clearCodexMcpStartupWatchdog(tabId, 'prompt-or-turn-in-flight-before-restart');
+    console.warn('[CodexMcpStartupWatchdog] skip restart tab=' + String(tabId).slice(-12)
+      + ' reason=prompt-or-turn-in-flight'
+      + ' session=' + (turnState?.sessionId ? String(turnState.sessionId).slice(0, 8) : 'none')
+      + ' audit=' + (audit?.awaitUserMessage ? 'await-user-message' : '-')
+      + ' preview=' + JSON.stringify(mcpInfo?.preview || state.mcpStartupPreview || ''));
     return;
   }
   const lastSeenAgeMs = Date.now() - (state.mcpStartupLastSeenAt || state.mcpStartupFirstSeenAt || Date.now());
@@ -14000,6 +14081,10 @@ function clearCodexMcpStartupWatchdog(tabId, reason = 'clear') {
 
 function maybeArmCodexMcpStartupWatchdog(tabId, inspected, clean, phase) {
   if (!tabId || codexTuiReadyTabs.has(tabId)) return;
+  if (hasCodexPromptOrTurnInFlight(tabId)) {
+    clearCodexMcpStartupWatchdog(tabId, 'prompt-or-turn-in-flight:' + (phase || 'probe'));
+    return;
+  }
   const mcpInfo = getCodexMcpStartupWatchdogState(tabId, inspected, clean);
   if (!mcpInfo?.visible) return;
   const startupState = codexStartupAutoEnter.get(tabId) || null;
@@ -14132,7 +14217,7 @@ async function emitCodexTuiReadyAfterQuiet(tabId) {
       const visibleInspect = inspectCodexInputReadyVisibleText(visibleText);
       if (!visibleInspect.ready) {
         const visibleBlockers = Array.isArray(visibleInspect.blockers) ? visibleInspect.blockers : [];
-        if (!rawInspect.ready && visibleBlockers.length > 0) {
+        if (visibleBlockers.length > 0) {
           logCodexTuiReadyNotReady(tabId, visibleInspect, raw, visibleText, 'quiet-visible');
           maybeArmCodexMcpStartupWatchdog(tabId, visibleInspect, visibleText, 'quiet-visible');
           maybeArmCodexMcpStartupWatchdog(tabId, rawInspect, clean, 'quiet-raw');
@@ -14214,7 +14299,7 @@ async function emitCodexTuiReadyAfterQuiet(tabId) {
 }
 
 async function tryEmitCodexTuiReady(tabId, data) {
-  if (!tabId || codexTuiReadyTabs.has(tabId)) return;
+  if (!tabId) return;
   const prev = codexTuiReadyBuffers.get(tabId) || '';
   let raw = prev + String(data || '');
   if (raw.length > CODEX_STARTUP_AUTO_ENTER_BUFFER_LIMIT) {
@@ -14223,6 +14308,17 @@ async function tryEmitCodexTuiReady(tabId, data) {
   codexTuiReadyBuffers.set(tabId, raw);
   const clean = cleanCodexTuiFrame(raw);
   const inspected = inspectCodexInputReadyFrame(clean, raw);
+  if (codexTuiReadyTabs.has(tabId)) {
+    if (!inspected.ready && Array.isArray(inspected.blockers) && inspected.blockers.length > 0) {
+      if (isOnlyCodexMcpStartupBlocker(inspected.blockers) && hasCodexPromptOrTurnInFlight(tabId)) {
+        return;
+      }
+      invalidateCodexTuiReadyForStartupBlocker(tabId, 'stream-after-ready', inspected.sampleText || clean, inspected.blockers);
+      logCodexTuiReadyNotReady(tabId, inspected, raw, clean, 'stream-after-ready');
+      maybeArmCodexMcpStartupWatchdog(tabId, inspected, clean, 'stream-after-ready');
+    }
+    return;
+  }
   if (!inspected.ready && !isCodexTuiReadyRelevantFrame(clean, raw)) return;
   if (!inspected.ready) {
     logCodexTuiReadyNotReady(tabId, inspected, raw, clean, 'stream');
@@ -14253,6 +14349,9 @@ function closeCodexWatcher(tabId, reason = 'close') {
 function emitCodexBusy(tabId, busy, reason) {
   if (!tabId) return;
   console.log('[CodexTurn] busy tab=' + String(tabId).slice(-12) + ' busy=' + busy + ' reason=' + reason);
+  if (busy) {
+    clearCodexMcpStartupWatchdog(tabId, 'turn-busy:' + (reason || 'busy'));
+  }
   recordActivity(tabId, busy, 'codex');
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('codex:busy-state', { tabId, busy, reason });
@@ -14388,9 +14487,32 @@ async function getCodexTuiReadyState(tabId) {
   if (textReady && readyMeta?.preview) {
     const blockers = inspectCodexStartupBlockersText(readyMeta.preview);
     if (blockers.length > 0) {
-      invalidateCodexTuiReadyForStartupBlocker(tabId, 'get-state-ready-preview', readyMeta.preview, blockers);
-      textReady = false;
+      if (!(isOnlyCodexMcpStartupBlocker(blockers) && hasCodexPromptOrTurnInFlight(tabId))) {
+        invalidateCodexTuiReadyForStartupBlocker(tabId, 'get-state-ready-preview', readyMeta.preview, blockers);
+        textReady = false;
+      }
     }
+  }
+  if (!textReady) {
+    const visibleProbe = await probeCodexReadyFromVisibleBuffer(tabId, 'get-state').catch((err) => ({
+      success: false,
+      ready: false,
+      error: err?.message || String(err),
+    }));
+    const visibleBlockers = Array.isArray(visibleProbe?.blockers) ? visibleProbe.blockers : [];
+    if (visibleProbe?.ready) {
+      await markCodexTuiReadyFromVisibleProbe(tabId, 'get-state');
+    } else if (visibleBlockers.length === 0) {
+      const rawProbe = probeCodexStartupFromRawBuffer(tabId, 'get-state');
+      if (rawProbe?.ready) {
+        await markCodexTuiReadyFromRawProbe(tabId, 'get-state');
+      }
+    }
+    textReady = !!codexTuiReadyTabs.has(tabId);
+  }
+  const startupTimeout = !textReady ? getCodexStartupNoStateTimeout(tabId) : null;
+  if (startupTimeout) {
+    maybeSurfaceCodexStartupNoStateTimeout(tabId, startupTimeout);
   }
   const lastNotReady = codexTuiReadyLastNotReady.get(tabId) || mcpStartup || null;
   let processReady = false;
@@ -14412,6 +14534,8 @@ async function getCodexTuiReadyState(tabId) {
       ...readyMeta,
       ageMs: readyMeta.at ? Date.now() - readyMeta.at : null,
     } : null,
+    startupFailed: !!startupTimeout,
+    startupError: startupTimeout?.reason || null,
   };
 }
 
@@ -14485,6 +14609,39 @@ async function pokeCodexStartupPromptFromVisibleBuffer(tabId, reason = 'external
     ready: inspected.ready,
     reason: inspected.reason || null,
     blockers: inspected.blockers || null,
+  };
+}
+
+async function probeCodexReadyFromVisibleBuffer(tabId, reason = 'visible-probe') {
+  if (!tabId || !mainWindow || mainWindow.isDestroyed()) {
+    return { success: false, error: 'no-main-window', ready: false };
+  }
+  const snapshot = await requestTerminalVisibleBufferSnapshot(
+    mainWindow.webContents,
+    tabId,
+    'codex-ready-' + reason,
+    700
+  );
+  if (!snapshot?.success || !Array.isArray(snapshot.lines)) {
+    return { success: false, error: snapshot?.error || 'snapshot-unavailable', ready: false };
+  }
+  const visibleText = snapshot.lines.map((line) => line?.text || '').join('\n');
+  tryHandleCodexStartupAutoEnter(tabId, '', {
+    cleanSnapshot: visibleText,
+    source: 'visible-buffer:' + reason,
+  });
+  const inspected = inspectCodexInputReadyVisibleText(visibleText);
+  if (!inspected.ready) {
+    logCodexTuiReadyNotReady(tabId, inspected, '', visibleText, 'visible-probe-' + reason);
+    maybeArmCodexMcpStartupWatchdog(tabId, inspected, visibleText, 'visible-probe-' + reason);
+  }
+  return {
+    success: true,
+    ready: inspected.ready,
+    reason: inspected.reason || null,
+    blockers: inspected.blockers || null,
+    inspected,
+    visibleText,
   };
 }
 
@@ -16706,6 +16863,7 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
     effort: effectiveEffort,
     developerInstructions,
     mcpStartupRestartAttempts,
+    startedAt,
   });
   console.log('[Codex Runner] Command:', command, 'tab:', tabId, 'session:', sessionId || 'new', 'cwd:', termCwd, 'model:', effectiveModel || 'default', 'effort:', effectiveEffort || 'default', 'developerInstructionsChars:', developerInstructions ? String(developerInstructions).length : 0, 'restartReason:', restartReason, 'mcpStartupRestarts:', mcpStartupRestartAttempts, 'launchId:', launchId);
 
@@ -16762,13 +16920,13 @@ ipcMain.on('codex:run-command', async (event, payload) => {
 });
 
 ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}) => {
-  const shouldQueue = !!(options && options.queue === true);
+  const statusAtSend = options && typeof options.statusAtSend === 'string' ? options.statusAtSend : null;
+  const shouldQueue = !!(options && (options.queue === true || statusAtSend === 'busy'));
   const handoffId = options && typeof options.handoffId === 'string' ? options.handoffId : null;
   const source = options && typeof options.source === 'string' ? options.source : null;
   const codexSource = source
     ? (source.startsWith('codex-') ? source : 'codex-' + source)
     : (shouldQueue ? 'codex-history-queue' : 'codex-history-send');
-  const statusAtSend = options && typeof options.statusAtSend === 'string' ? options.statusAtSend : null;
   const skipVisibleDraftGuard = !!(options && options.skipVisibleDraftGuard === true);
   console.log('[codex:send-command] Received: tabId=' + tabId + ' queue=' + shouldQueue + ' statusAtSend=' + (statusAtSend || '-') + ' handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' resolvedSource=' + codexSource + ' skipVisibleDraftGuard=' + skipVisibleDraftGuard + ' command="' + command + '"');
   const term = terminals.get(tabId);

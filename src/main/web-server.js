@@ -1181,6 +1181,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
     let lastNotReadyMap = new Map();
     let awaitingMap = new Map();
     let runtimeSessionMap = new Map();
+    let startupFailedMap = new Map();
+    let startupErrorMap = new Map();
     const ptyAgentIds = (project.tabs || [])
       .filter(t => (t.commandType === 'claude' || t.commandType === 'codex') && (t.tabType || 'terminal') !== 'claude-sdk')
       .map(t => t.tabId);
@@ -1192,6 +1194,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         if (data?.lastNotReady) for (const [id, value] of Object.entries(data.lastNotReady)) lastNotReadyMap.set(id, value);
         if (data?.awaiting) for (const [id, aw] of Object.entries(data.awaiting)) if (aw) awaitingMap.set(id, true);
         if (data?.sessions) for (const [id, sid] of Object.entries(data.sessions)) if (sid) runtimeSessionMap.set(id, sid);
+        if (data?.startupFailed) for (const [id, value] of Object.entries(data.startupFailed)) if (value) startupFailedMap.set(id, true);
+        if (data?.startupError) for (const [id, value] of Object.entries(data.startupError)) if (value) startupErrorMap.set(id, value);
       } catch (e) {
         // Bridge unavailable — every PTY agent tab will show no badge until
         // user opens it (per-tab GET /status still works on demand).
@@ -1249,6 +1253,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         starting: runtimeStatus === 'starting',
         inputReady: inputReadyMap.has(t.tabId) ? inputReadyMap.get(t.tabId) : null,
         lastNotReady: lastNotReadyMap.get(t.tabId) || null,
+        startupFailed: startupFailedMap.get(t.tabId) || false,
+        startupError: startupErrorMap.get(t.tabId) || null,
         awaiting: awaitingMap.get(t.tabId) || false,
         statusId,
         statusColor: statusId ? (paletteById.get(statusId)?.color || null) : null,

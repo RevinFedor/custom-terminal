@@ -31,6 +31,8 @@ export interface AgentPtyPresence {
   inputReady?: boolean;
   awaiting?: boolean;
   lastNotReady?: any;
+  startupFailed?: boolean;
+  startupError?: string | null;
 }
 
 export interface AgentResumeResult {
@@ -120,18 +122,21 @@ async function getCodexPtyPresence(tabId: string): Promise<AgentPtyPresence> {
   const tuiReady = await ipcRenderer.invoke('codex:get-tui-ready', tabId).catch(() => null);
   const isRunning = !!state?.isRunning;
   const inputReady = isRunning && !!tuiReady?.inputReady;
+  const startupFailed = tuiReady?.startupFailed === true;
   const isBusy = turnState?.hasWatcher ? !!turnState.busy : !!tab?.aiBusy;
   if (tab && tab.aiBusy !== isBusy) {
     useWorkspaceStore.getState().setAiBusy(tabId, isBusy);
   }
   return {
-    status: isRunning ? (isBusy ? 'busy' : (inputReady ? 'active' : 'starting')) : 'inactive',
+    status: startupFailed ? 'starting' : (isRunning ? (isBusy ? 'busy' : (inputReady ? 'active' : 'starting')) : 'inactive'),
     hasBridge: !!tab?.codexSessionId,
     isBusy,
     hasTerm: state?.error !== 'tab not found',
     inputReady,
     awaiting: false,
     lastNotReady: tuiReady?.lastNotReady || null,
+    startupFailed,
+    startupError: tuiReady?.startupError || null,
   };
 }
 
@@ -169,7 +174,7 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
     return existing;
   }
   useWorkspaceStore.getState().clearInterruptedState?.(tabId);
-  const queue = options.queue === true;
+  const queue = options.queue === true || options.statusAtSend === 'busy';
   const requestedModel = typeof options.model === 'string' ? options.model.trim() : '';
   const requestedEffort = typeof options.effort === 'string' ? options.effort.trim() : '';
   const tabState = findTabState(tabId);
@@ -177,7 +182,7 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
   const effortForPicker = requestedEffort && requestedEffort !== 'none' ? requestedEffort : '';
   const draftStateForSend = terminalRegistry.getCodexDraftState(tabId);
   const skipVisibleDraftGuard = draftStateForSend?.source === 'no-terminal';
-  console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' model=' + (modelForPicker || '-') + ' effort=' + (effortForPicker || '-') + ' submitIntent=enter chars=' + prompt.length + ' draftSource=' + (draftStateForSend?.source || '-') + ' skipVisibleDraftGuard=' + skipVisibleDraftGuard);
+  console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' model=' + (modelForPicker || '-') + ' effort=' + (effortForPicker || '-') + ' submitIntent=' + (queue ? 'tab-queue' : 'enter') + ' chars=' + prompt.length + ' draftSource=' + (draftStateForSend?.source || '-') + ' skipVisibleDraftGuard=' + skipVisibleDraftGuard);
   if (options.statusAtSend !== 'busy' && modelForPicker) {
     const currentModel = tabState?.codexModel || '';
     const currentEffort = tabState?.codexEffort || '';

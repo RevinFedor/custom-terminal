@@ -1502,6 +1502,8 @@ function App() {
             let inputReady: boolean | null = null;
             let lastNotReady: any = null;
             let effectiveCodexSessionId = t.codexSessionId;
+            let startupFailed = false;
+            let startupError: string | null = null;
             const toolType = toolForTab(t);
             if (toolType) {
               try {
@@ -1510,6 +1512,8 @@ function App() {
                 awaiting = toolType === 'claude' && !!p?.awaiting;
                 inputReady = typeof p?.inputReady === 'boolean' ? p.inputReady : null;
                 lastNotReady = (p as any)?.lastNotReady || null;
+                startupFailed = (p as any)?.startupFailed === true;
+                startupError = (p as any)?.startupError || null;
                 if (toolType === 'codex') {
                   const runtimeSession = await ipcRenderer.invoke('codex:get-runtime-session', t.tabId).catch(() => null);
                   if (runtimeSession?.sessionId) {
@@ -1538,6 +1542,8 @@ function App() {
               starting: sessionStatus === 'starting',
               inputReady,
               lastNotReady,
+              startupFailed,
+              startupError,
               awaiting,
               statusId,
               statusColor: statusMeta?.color || null,
@@ -2378,6 +2384,8 @@ function App() {
           const inputReady: Record<string, boolean> = {};
           const lastNotReady: Record<string, any> = {};
           const sessions: Record<string, string | null> = {};
+          const startupFailed: Record<string, boolean> = {};
+          const startupError: Record<string, string | null> = {};
           // awaiting (Claude blocked on AskUserQuestion) per tab — drives the
           // mobile tab-list purple dot. Same presence call, extra field.
           const awaiting: Record<string, boolean> = {};
@@ -2388,6 +2396,8 @@ function App() {
               statuses[tid] = p?.status || 'inactive';
               inputReady[tid] = !!p?.inputReady;
               if ((p as any)?.lastNotReady) lastNotReady[tid] = (p as any).lastNotReady;
+              if ((p as any)?.startupFailed) startupFailed[tid] = true;
+              if ((p as any)?.startupError) startupError[tid] = (p as any).startupError;
               if (toolType === 'claude' && p?.awaiting) awaiting[tid] = true;
               if (toolType === 'codex') {
                 const runtimeSession = await ipcRenderer.invoke('codex:get-runtime-session', tid).catch(() => null);
@@ -2398,7 +2408,7 @@ function App() {
               inputReady[tid] = false;
             }
           }
-          return reply(true, { statuses, inputReady, lastNotReady, awaiting, sessions });
+          return reply(true, { statuses, inputReady, lastNotReady, awaiting, sessions, startupFailed, startupError });
         }
         if (action === 'getClaudeTabStatus') {
           const { tabId } = payload || {};
@@ -2408,6 +2418,8 @@ function App() {
           let status: 'active' | 'busy' | 'inactive' | 'starting' = 'inactive';
           let inputReady = false;
           let lastNotReady: any = null;
+          let startupFailed = false;
+          let startupError: string | null = null;
           let effectiveSessionId = sessionId;
           let effectiveCodexSessionId = tab.codexSessionId || null;
           if (runtime) {
@@ -2416,6 +2428,8 @@ function App() {
               status = p?.status || 'inactive';
               inputReady = !!p?.inputReady;
               lastNotReady = (p as any)?.lastNotReady || null;
+              startupFailed = (p as any)?.startupFailed === true;
+              startupError = (p as any)?.startupError || null;
             } catch { status = 'inactive'; }
           }
           if (toolType === 'codex') {
@@ -2434,6 +2448,8 @@ function App() {
             starting: status === 'starting',
             inputReady,
             lastNotReady,
+            startupFailed,
+            startupError,
             toolType,
             commandType: tab.commandType || null,
             sessionId: effectiveSessionId,
