@@ -140,6 +140,24 @@ function shortId(value, len = 8) {
   return s ? s.slice(-len) : 'nil';
 }
 
+function bridgePayloadLabel(payload) {
+  if (!payload || typeof payload !== 'object') return '';
+  const parts = [];
+  if (payload.tabId) parts.push('tab=' + shortId(payload.tabId, 12));
+  if (payload.projectId) parts.push('project=' + shortId(payload.projectId, 12));
+  if (payload.targetIndex != null) parts.push('targetIndex=' + payload.targetIndex);
+  if (payload.mode) parts.push('mode=' + payload.mode);
+  return parts.length ? ' ' + parts.join(' ') : '';
+}
+
+function startRoutePendingLog(prefix, startedAt, afterMs = 10_000) {
+  const timer = setTimeout(() => {
+    console.log(prefix + ' STILL_PENDING ms=' + (Date.now() - startedAt));
+  }, afterMs);
+  if (typeof timer.unref === 'function') timer.unref();
+  return () => clearTimeout(timer);
+}
+
 function cleanOptionalString(value, fallback = '') {
   const s = value == null ? '' : String(value).trim();
   return s || fallback;
@@ -695,18 +713,19 @@ function bridgeRequest(action, payload, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
     const wins = BrowserWindow.getAllWindows();
     const win = wins[0];
+    const label = bridgePayloadLabel(payload);
     if (!win || win.isDestroyed()) {
-      console.log('[BridgeDiag] NO_WINDOW action=' + action + ' wins=' + wins.length);
+      console.log('[BridgeDiag] NO_WINDOW action=' + action + label + ' wins=' + wins.length);
       return reject(new Error('No window'));
     }
     const requestId = crypto.randomBytes(8).toString('hex');
     const timer = setTimeout(() => {
       pendingBridge.delete(requestId);
-      console.log('[BridgeDiag] TIMEOUT action=' + action + ' rid=' + requestId + ' afterMs=' + timeoutMs);
+      console.log('[BridgeDiag] TIMEOUT action=' + action + label + ' rid=' + requestId + ' afterMs=' + timeoutMs);
       reject(new Error('Bridge timeout: ' + action));
     }, timeoutMs);
-    pendingBridge.set(requestId, { resolve, reject, timer, action, sentAt: Date.now() });
-    console.log('[BridgeDiag] SEND action=' + action + ' rid=' + requestId + ' wins=' + wins.length);
+    pendingBridge.set(requestId, { resolve, reject, timer, action, label, sentAt: Date.now() });
+    console.log('[BridgeDiag] SEND action=' + action + label + ' rid=' + requestId + ' wins=' + wins.length);
     win.webContents.send('web:bridge-request', { requestId, action, payload });
   });
 }
@@ -760,7 +779,7 @@ function registerBridgeReplyHandler() {
       return;
     }
     const elapsed = Date.now() - pending.sentAt;
-    console.log('[BridgeDiag] REPLY action=' + pending.action + ' rid=' + requestId + ' ok=' + ok + ' elapsedMs=' + elapsed + ' err=' + (error || '-'));
+    console.log('[BridgeDiag] REPLY action=' + pending.action + (pending.label || '') + ' rid=' + requestId + ' ok=' + ok + ' elapsedMs=' + elapsed + ' err=' + (error || '-'));
     clearTimeout(pending.timer);
     pendingBridge.delete(requestId);
     if (ok) pending.resolve(data);
@@ -1161,6 +1180,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
     let inputReadyMap = new Map();
     let lastNotReadyMap = new Map();
     let awaitingMap = new Map();
+    let runtimeSessionMap = new Map();
     const ptyAgentIds = (project.tabs || [])
       .filter(t => (t.commandType === 'claude' || t.commandType === 'codex') && (t.tabType || 'terminal') !== 'claude-sdk')
       .map(t => t.tabId);
@@ -1171,6 +1191,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         if (data?.inputReady) for (const [id, ready] of Object.entries(data.inputReady)) inputReadyMap.set(id, !!ready);
         if (data?.lastNotReady) for (const [id, value] of Object.entries(data.lastNotReady)) lastNotReadyMap.set(id, value);
         if (data?.awaiting) for (const [id, aw] of Object.entries(data.awaiting)) if (aw) awaitingMap.set(id, true);
+        if (data?.sessions) for (const [id, sid] of Object.entries(data.sessions)) if (sid) runtimeSessionMap.set(id, sid);
       } catch (e) {
         // Bridge unavailable — every PTY agent tab will show no badge until
         // user opens it (per-tab GET /status still works on demand).
@@ -1211,6 +1232,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       // distinct from runtime sessionStatus which drives the loader/background).
       const statusId = t.sessionStatus || null;
       const runtimeStatus = statusMap.get(t.tabId) || null;
+      const runtimeCodexSessionId = runtimeSessionMap.get(t.tabId) || null;
       return {
         tabId: t.tabId,
         name: t.name,
@@ -1220,7 +1242,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         cwd: t.cwd,
         filePath: t.filePath || null,
         claudeSessionId: t.claudeSessionId,
-        codexSessionId: t.codexSessionId,
+        codexSessionId: runtimeCodexSessionId || t.codexSessionId,
         geminiSessionId: t.geminiSessionId,
         timelineCount,
         sessionStatus: runtimeStatus,
@@ -1643,9 +1665,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
   if (m && req.method === 'GET') {
     const tabId = decId(m[1]);
     const started = Date.now();
+    const statusPrefix = '[WebStatus] tab=' + shortId(tabId, 12);
+    const clearPending = startRoutePendingLog(statusPrefix, started);
+    console.log(statusPrefix + ' START');
     try {
       const data = await bridgeRequest('getClaudeTabStatus', { tabId });
-      console.log('[WebStatus] tab=' + shortId(tabId, 12) +
+      clearPending();
+      console.log(statusPrefix +
         ' status=' + (data?.status || '-') +
         ' busy=' + (data?.busy == null ? '-' : data.busy) +
         ' session=' + shortId(data?.sessionId) +
@@ -1654,7 +1680,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ' ms=' + (Date.now() - started));
       return sendJson(res, 200, data);
     } catch (e) {
-      console.warn('[WebStatus] tab=' + shortId(tabId, 12) + ' error=' + String(e.message || e) + ' ms=' + (Date.now() - started));
+      clearPending();
+      console.warn(statusPrefix + ' error=' + String(e.message || e) + ' ms=' + (Date.now() - started));
       return sendJson(res, 500, { error: String(e.message) });
     }
   }
@@ -1813,9 +1840,20 @@ async function handleApi(req, res, parsed, sdkSessions) {
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/rewind$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
+    const started = Date.now();
+    const rewindPrefix = '[WebRewind] tab=' + shortId(tabId, 12);
+    const clearPending = startRoutePendingLog(rewindPrefix, started);
+    console.log(rewindPrefix + ' START');
     try {
       const body = await readBody(req);
       const mode = body.mode === 'ai' ? 'ai' : 'native';
+      const timeoutMs = mode === 'ai' ? 180000 : 20000;
+      console.log(rewindPrefix +
+        ' BODY mode=' + mode +
+        ' targetIndex=' + (body.targetIndex == null ? '-' : body.targetIndex) +
+        ' rewindable=' + (body.rewindableCount == null ? '-' : body.rewindableCount) +
+        ' skipDuplicates=' + (body.skipDuplicates || 0) +
+        ' timeoutMs=' + timeoutMs);
       const data = await runAgentRewindScenario(tabId, {
         targetIndex: body.targetIndex,
         targetText: body.targetText,
@@ -1826,9 +1864,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
         startUuid: body.startUuid || body.targetUuid || null,
         endUuid: body.endUuid || null,
         additionalPrompt: body.additionalPrompt || null,
-      }, mode === 'ai' ? 180000 : 20000);
+      }, timeoutMs);
+      clearPending();
+      console.log(rewindPrefix + ' DONE mode=' + mode + ' ms=' + (Date.now() - started));
       return sendJson(res, 200, data);
     } catch (e) {
+      clearPending();
+      console.warn(rewindPrefix + ' ERROR ' + String(e.message || e) + ' ms=' + (Date.now() - started));
       return sendJson(res, 500, { error: String(e.message) });
     }
   }
@@ -1907,7 +1949,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
   if (m && req.method === 'GET') {
     const tabId = decId(m[1]);
     const t0 = Date.now();
-    console.log(`[WebTiming] /timeline START tabId=${tabId.slice(0, 24)}`);
+    const requestId = crypto.randomBytes(4).toString('hex');
+    const timelinePrefix = `[WebTiming] /timeline rid=${requestId} tab=${shortId(tabId, 12)}`;
+    const clearPending = startRoutePendingLog(timelinePrefix, t0);
+    console.log(`${timelinePrefix} START`);
     try {
       const tBridge = Date.now();
       const info = await resolveAgentSessionInfo(tabId, 1500);
@@ -1915,14 +1960,19 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const cwd = info?.cwd || null;
       const toolType = info?.toolType || null;
       if (!sessionId || !toolType) {
-        console.log(`[WebTiming] /timeline NO_SESSION bridge=${tBridge-t0}ms total=${Date.now()-t0}ms`);
+        clearPending();
+        console.log(`${timelinePrefix} NO_SESSION bridge=${tBridge-t0}ms total=${Date.now()-t0}ms`);
         return sendJson(res, 200, { entries: [] });
       }
       if (toolType === 'codex') {
-        if (!loadCodexSessionRecords || !buildCodexTimeline) return sendJson(res, 500, { error: 'codex timeline parser not loaded' });
+        if (!loadCodexSessionRecords || !buildCodexTimeline) {
+          clearPending();
+          return sendJson(res, 500, { error: 'codex timeline parser not loaded' });
+        }
         const loaded = await loadCodexSessionRecords(sessionId, cwd);
         if (!loaded?.success) {
-          console.log(`[WebTiming] /timeline CODEX_NO_FILE bridge=${tBridge-t0}ms total=${Date.now()-t0}ms`);
+          clearPending();
+          console.log(`${timelinePrefix} CODEX_NO_FILE bridge=${tBridge-t0}ms total=${Date.now()-t0}ms`);
           return sendJson(res, 200, { entries: [], sessionId, toolType });
         }
         const entries = buildCodexTimeline(loaded.records || [], sessionId);
@@ -1937,13 +1987,18 @@ async function handleApi(req, res, parsed, sdkSessions) {
         }
         const mobileEntries = normalizeMobileTimelineEntries(entries, fullEntries);
         const tParse = Date.now();
-        console.log(`[WebTiming] /timeline DONE tool=codex entries=${mobileEntries.length} bridge=${tBridge-t0}ms parse=${tParse-tBridge}ms total=${tParse-t0}ms`);
+        clearPending();
+        console.log(`${timelinePrefix} DONE tool=codex entries=${mobileEntries.length} bridge=${tBridge-t0}ms parse=${tParse-tBridge}ms total=${tParse-t0}ms`);
         return sendJson(res, 200, { entries: mobileEntries, sessionId, toolType, count: mobileEntries.length });
       }
-      if (!parseTimelineEntries || !findSessionFile) return sendJson(res, 500, { error: 'timeline parser not loaded' });
+      if (!parseTimelineEntries || !findSessionFile) {
+        clearPending();
+        return sendJson(res, 500, { error: 'timeline parser not loaded' });
+      }
       const found = findSessionFile(sessionId, cwd);
       if (!found) {
-        console.log(`[WebTiming] /timeline NO_FILE bridge=${tBridge-t0}ms total=${Date.now()-t0}ms`);
+        clearPending();
+        console.log(`${timelinePrefix} NO_FILE bridge=${tBridge-t0}ms total=${Date.now()-t0}ms`);
         return sendJson(res, 200, { entries: [], sessionId, toolType });
       }
       const tFind = Date.now();
@@ -1959,10 +2014,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
       }
       const mobileEntries = normalizeMobileTimelineEntries(entries, fullEntries);
       const tParse = Date.now();
-      console.log(`[WebTiming] /timeline DONE tool=claude entries=${mobileEntries.length} bridge=${tBridge-t0}ms find=${tFind-tBridge}ms parse=${tParse-tFind}ms total=${tParse-t0}ms`);
+      clearPending();
+      console.log(`${timelinePrefix} DONE tool=claude entries=${mobileEntries.length} bridge=${tBridge-t0}ms find=${tFind-tBridge}ms parse=${tParse-tFind}ms total=${tParse-t0}ms`);
       return sendJson(res, 200, { entries: mobileEntries, sessionId, toolType, count: mobileEntries.length });
     } catch (e) {
-      console.log(`[WebTiming] /timeline ERROR ${String(e.message)} total=${Date.now()-t0}ms`);
+      clearPending();
+      console.log(`${timelinePrefix} ERROR ${String(e.message)} total=${Date.now()-t0}ms`);
       return sendJson(res, 500, { error: String(e.message) });
     }
   }

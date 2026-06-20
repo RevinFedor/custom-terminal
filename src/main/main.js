@@ -1824,6 +1824,9 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected') {
   if (!tabId || !sessionId) return;
   const prev = codexKnownSessions.get(tabId) || null;
   codexKnownSessions.set(tabId, sessionId);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('terminal:mcp-ai-tab', { tabId, engine: 'codex', sessionId });
+  }
   if (prev !== sessionId) {
     console.log('[Codex:Known] set tab=' + String(tabId).slice(-12) +
       ' session=' + String(sessionId).slice(0, 8) +
@@ -1864,6 +1867,16 @@ function clearCodexLaunchPayload(tabId, reason = 'clear') {
     + ' launch=' + (payload?.launchId || '-')
     + ' command=' + (payload?.command || '-')
     + ' session=' + (payload?.sessionId ? String(payload.sessionId).slice(0, 8) : 'new'));
+}
+
+function getCodexRuntimeSessionId(tabId) {
+  if (!tabId) return null;
+  const turn = codexTurnWatchers.get(tabId);
+  return turn?.sessionId
+    || codexKnownSessions.get(tabId)
+    || codexLastRunCommandPayload.get(tabId)?.sessionId
+    || codexSessionIdFromDb(tabId)
+    || null;
 }
 
 function getInterruptedAiSessionEntries() {
@@ -4148,7 +4161,7 @@ async function handleOverseerRequest(rawUrl) {
       const tabId = r.tab_id;
       const isCodex = r.command_type === 'codex' || !!r.codex_session_id || codexKnownSessions.has(tabId);
       const sessionId = isCodex
-        ? (codexKnownSessions.get(tabId) || r.codex_session_id || null)
+        ? (getCodexRuntimeSessionId(tabId) || r.codex_session_id || null)
         : (bridgeKnownSessions.get(tabId) || r.claude_session_id || null);
       if (!sessionId) continue;
       const isLive = terminals.has(tabId);
@@ -4847,7 +4860,7 @@ function startMcpHttpServer() {
             const cmdState = terminalCommandState.get(tabId);
             const commandType = t.command_type || 'generic';
             const claudeSessionId = bridgeKnownSessions.get(tabId) || t.claude_session_id || null;
-            const codexSessionId = codexKnownSessions.get(tabId) || t.codex_session_id || null;
+            const codexSessionId = getCodexRuntimeSessionId(tabId) || t.codex_session_id || null;
             const geminiSessionId = t.gemini_session_id || null;
             const sessionId = commandType === 'codex'
               ? codexSessionId
@@ -5119,7 +5132,7 @@ function startMcpHttpServer() {
               return;
             }
             if (submit !== false) {
-              const hasTurnWatcher = await ensureCodexTurnWatcher(tabId, codexKnownSessions.get(tabId) || null, terminalProjects.get(tabId));
+              const hasTurnWatcher = await ensureCodexTurnWatcher(tabId, getCodexRuntimeSessionId(tabId), terminalProjects.get(tabId));
               if (!hasTurnWatcher) {
                 res.writeHead(409);
                 res.end(JSON.stringify({ error: 'codex_turn_watcher_unavailable' }));
@@ -10441,7 +10454,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           + ' rawBytes=' + String(primeFrame.raw || '').length);
         _webBroadcast(tabId, {
           type: 'snapshot',
-          sessionId: codexKnownSessions.get(tabId) || null,
+          sessionId: getCodexRuntimeSessionId(tabId),
           busy: false,
           sessionStatus: 'starting',
           toolType: 'codex',
@@ -10671,7 +10684,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           + ' preview=' + JSON.stringify(confirmClean.replace(/\s+/g, ' ').trim().slice(0, 220)));
         _webBroadcast(tabId, {
           type: 'snapshot',
-          sessionId: codexKnownSessions.get(tabId) || null,
+          sessionId: getCodexRuntimeSessionId(tabId),
           busy: false,
           sessionStatus: 'starting',
           toolType: 'codex',
@@ -13687,18 +13700,77 @@ function resetCodexTuiReadyDetection(tabId, reason = 'reset') {
   }
 }
 
+function inspectCodexStartupBlockersText(cleanText) {
+  const text = String(cleanText || '').replace(/\u00a0/g, ' ');
+  const compact = text.replace(/\s+/g, ' ').trim();
+  if (!compact) return [];
+  const blockers = [];
+  const has = (re) => re.test(compact);
+  if (has(/Update\s+available!?|Update\s+now|Skip\s+until\s+next\s+version|@?openai[\/\s-]*codex\s+to\s+update/i)) {
+    blockers.push('update-prompt');
+  }
+  if (has(/Do\s+you\s+trust\s+the\s+contents|Working\s+with\s+untrusted\s+contents|Yes\s*,?\s*continue|No\s*,?\s*quit/i)) {
+    blockers.push('trust-directory');
+  }
+  if (has(/directory\s+to\s+(?:resume|fork)\s+this\s+session|Use\s+session\s+directory|Use\s+current\s+directory/i)) {
+    blockers.push('cwd-chooser');
+  }
+  if (has(/Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|esc\s+to\s+interrupt/i)) {
+    blockers.push('mcp-startup');
+  }
+  return Array.from(new Set(blockers));
+}
+
+function invalidateCodexTuiReadyForStartupBlocker(tabId, source, preview, blockers) {
+  if (!tabId || !Array.isArray(blockers) || blockers.length === 0) return false;
+  const hadReady = codexTuiReadyTabs.delete(tabId);
+  codexTuiReadyMeta.delete(tabId);
+  const previewTail = String(preview || '').replace(/\s+/g, ' ').trim().slice(-260);
+  codexTuiReadyLastNotReady.set(tabId, {
+    ts: Date.now(),
+    phase: source || 'startup-blocker',
+    source: source || '-',
+    reason: 'blocked:' + blockers.join('+'),
+    blockers: blockers.slice(),
+    sampleMode: 'ready-preview',
+    sampleBytes: previewTail.length,
+    totalBytes: previewTail.length,
+    startupArmed: codexStartupAutoEnter.has(tabId),
+    previewTail,
+  });
+  if (hadReady) {
+    console.warn('[CodexTuiReady] invalidated ready tab=' + String(tabId).slice(-12)
+      + ' source=' + (source || '-')
+      + ' blockers=' + blockers.join('+')
+      + ' preview=' + JSON.stringify(previewTail));
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('codex:tui-not-ready', {
+        tabId,
+        reason: 'startup-blocker:' + blockers.join('+'),
+      });
+    }
+    _webBroadcast(tabId, {
+      type: 'snapshot',
+      sessionId: getCodexRuntimeSessionId(tabId),
+      busy: false,
+      sessionStatus: 'starting',
+      starting: true,
+      inputReady: false,
+      toolType: 'codex',
+      commandType: 'codex',
+      lastNotReady: codexTuiReadyLastNotReady.get(tabId) || null,
+      reason: 'codex-ready-startup-blocker',
+    });
+  }
+  return hadReady;
+}
+
 function inspectCodexInputReadyText(clean, raw, { requireSyncMarker = true, source = 'raw' } = {}) {
   const text = String(clean || '').replace(/\u00a0/g, ' ');
   const compact = text.replace(/\s+/g, ' ').trim();
   if (!compact) return { ready: false, reason: 'empty', source };
 
-  const blockers = [];
-  if (inspectCodexUpdatePrompt(text).visible) blockers.push('update-prompt');
-  if (isCodexTrustDirectoryPrompt(text)) blockers.push('trust-directory');
-  if (inspectCodexCwdChooser(text).visible) blockers.push('cwd-chooser');
-  if (/Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|esc\s+to\s+interrupt/i.test(text)) {
-    blockers.push('mcp-startup');
-  }
+  const blockers = inspectCodexStartupBlockersText(text);
 
   const hasSynchronizedFrame = String(raw || '').includes(CODEX_SYNC_MARKER);
   if (requireSyncMarker && !hasSynchronizedFrame) {
@@ -13821,8 +13893,7 @@ function getCodexMcpStartupStatus(tabId) {
 
 function broadcastCodexStartingSnapshot(tabId, reason = 'starting') {
   if (!tabId) return;
-  const turn = codexTurnWatchers.get(tabId);
-  const sessionId = turn?.sessionId || codexKnownSessions.get(tabId) || codexLastRunCommandPayload.get(tabId)?.sessionId || null;
+  const sessionId = getCodexRuntimeSessionId(tabId);
   _webBroadcast(tabId, {
     type: 'snapshot',
     sessionId,
@@ -14188,13 +14259,14 @@ function emitCodexBusy(tabId, busy, reason) {
   }
   const state = codexTurnWatchers.get(tabId);
   const inputReady = !busy && codexTuiReadyTabs.has(tabId);
+  const sessionId = getCodexRuntimeSessionId(tabId);
   _webBroadcast(tabId, {
     type: 'busy',
     busy,
     reason,
     toolType: 'codex',
     commandType: 'codex',
-    sessionId: state?.sessionId || codexKnownSessions.get(tabId) || null,
+    sessionId,
     sessionStatus: busy ? 'busy' : (inputReady ? 'active' : 'starting'),
     inputReady,
   });
@@ -14204,7 +14276,7 @@ function emitCodexBusy(tabId, busy, reason) {
       reason,
       toolType: 'codex',
       commandType: 'codex',
-      sessionId: state?.sessionId || codexKnownSessions.get(tabId) || null,
+      sessionId,
     });
   }
 }
@@ -14289,15 +14361,38 @@ ipcMain.handle('codex:get-turn-state', async (_event, tabId) => {
   };
 });
 
+ipcMain.handle('codex:get-runtime-session', async (_event, tabId) => {
+  const turn = codexTurnWatchers.get(tabId);
+  const payload = codexLastRunCommandPayload.get(tabId) || null;
+  const dbSessionId = codexSessionIdFromDb(tabId);
+  const sessionId = getCodexRuntimeSessionId(tabId);
+  return {
+    success: true,
+    sessionId,
+    turnSessionId: turn?.sessionId || null,
+    knownSessionId: codexKnownSessions.get(tabId) || null,
+    launchSessionId: payload?.sessionId || null,
+    dbSessionId,
+    hasLaunchPayload: !!payload,
+  };
+});
+
 ipcMain.handle('codex:get-tui-ready', async (_event, tabId) => {
   return getCodexTuiReadyState(tabId);
 });
 
 async function getCodexTuiReadyState(tabId) {
-  const textReady = !!codexTuiReadyTabs.has(tabId);
+  let textReady = !!codexTuiReadyTabs.has(tabId);
   const mcpStartup = getCodexMcpStartupStatus(tabId);
-  const lastNotReady = codexTuiReadyLastNotReady.get(tabId) || mcpStartup || null;
   const readyMeta = codexTuiReadyMeta.get(tabId) || null;
+  if (textReady && readyMeta?.preview) {
+    const blockers = inspectCodexStartupBlockersText(readyMeta.preview);
+    if (blockers.length > 0) {
+      invalidateCodexTuiReadyForStartupBlocker(tabId, 'get-state-ready-preview', readyMeta.preview, blockers);
+      textReady = false;
+    }
+  }
+  const lastNotReady = codexTuiReadyLastNotReady.get(tabId) || mcpStartup || null;
   let processReady = false;
   if (textReady) {
     try {
@@ -14356,7 +14451,7 @@ async function markCodexTuiReadyAfterVerifiedComposer(tabId, reason = 'verified-
   ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'codex' });
   _webBroadcast(tabId, {
     type: 'snapshot',
-    sessionId: codexKnownSessions.get(tabId) || null,
+    sessionId: getCodexRuntimeSessionId(tabId),
     busy: false,
     sessionStatus: 'active',
     toolType: 'codex',
@@ -14496,7 +14591,7 @@ async function markCodexTuiReadyFromRawProbe(tabId, reason = 'raw-probe') {
   ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'codex' });
   _webBroadcast(tabId, {
     type: 'snapshot',
-    sessionId: codexKnownSessions.get(tabId) || null,
+    sessionId: getCodexRuntimeSessionId(tabId),
     busy: false,
     sessionStatus: 'active',
     toolType: 'codex',
@@ -14516,7 +14611,7 @@ async function ensureCodexInputReadyForExternalPrompt(tabId, {
   if (!codexStartupAutoEnter.has(tabId)) {
     armCodexStartupAutoEnter(tabId, {
       command: reason,
-      sessionId: codexKnownSessions.get(tabId) || null,
+      sessionId: getCodexRuntimeSessionId(tabId),
       cwd: terminalProjects.get(tabId) || null,
     });
   }
@@ -15005,7 +15100,7 @@ async function catchUpCodexTurnState(tabId, filePath, fileSize, { suppressBusy =
     if (!inferred.busy) {
       _webBroadcast(tabId, {
         type: 'done',
-        sessionId: state.sessionId || codexKnownSessions.get(tabId) || null,
+        sessionId: state.sessionId || getCodexRuntimeSessionId(tabId),
         reason: 'catch-up-' + inferred.event,
       });
     }

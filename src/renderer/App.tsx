@@ -1501,6 +1501,7 @@ function App() {
             let awaiting = false;
             let inputReady: boolean | null = null;
             let lastNotReady: any = null;
+            let effectiveCodexSessionId = t.codexSessionId;
             const toolType = toolForTab(t);
             if (toolType) {
               try {
@@ -1509,6 +1510,12 @@ function App() {
                 awaiting = toolType === 'claude' && !!p?.awaiting;
                 inputReady = typeof p?.inputReady === 'boolean' ? p.inputReady : null;
                 lastNotReady = (p as any)?.lastNotReady || null;
+                if (toolType === 'codex') {
+                  const runtimeSession = await ipcRenderer.invoke('codex:get-runtime-session', t.tabId).catch(() => null);
+                  if (runtimeSession?.sessionId) {
+                    effectiveCodexSessionId = runtimeSession.sessionId;
+                  }
+                }
               } catch { sessionStatus = 'inactive'; }
             }
             // Assigned category status (dev/bugfix/knowledge/custom) — id stored
@@ -1525,7 +1532,7 @@ function App() {
               cwd: t.cwd,
               filePath: t.filePath || null,
               claudeSessionId: t.claudeSessionId,
-              codexSessionId: t.codexSessionId,
+              codexSessionId: effectiveCodexSessionId,
               geminiSessionId: t.geminiSessionId,
               sessionStatus,
               starting: sessionStatus === 'starting',
@@ -2370,6 +2377,7 @@ function App() {
           const statuses: Record<string, 'active' | 'busy' | 'inactive' | 'starting'> = {};
           const inputReady: Record<string, boolean> = {};
           const lastNotReady: Record<string, any> = {};
+          const sessions: Record<string, string | null> = {};
           // awaiting (Claude blocked on AskUserQuestion) per tab — drives the
           // mobile tab-list purple dot. Same presence call, extra field.
           const awaiting: Record<string, boolean> = {};
@@ -2381,12 +2389,16 @@ function App() {
               inputReady[tid] = !!p?.inputReady;
               if ((p as any)?.lastNotReady) lastNotReady[tid] = (p as any).lastNotReady;
               if (toolType === 'claude' && p?.awaiting) awaiting[tid] = true;
+              if (toolType === 'codex') {
+                const runtimeSession = await ipcRenderer.invoke('codex:get-runtime-session', tid).catch(() => null);
+                if (runtimeSession?.sessionId) sessions[tid] = runtimeSession.sessionId;
+              }
             } catch {
               statuses[tid] = 'inactive';
               inputReady[tid] = false;
             }
           }
-          return reply(true, { statuses, inputReady, lastNotReady, awaiting });
+          return reply(true, { statuses, inputReady, lastNotReady, awaiting, sessions });
         }
         if (action === 'getClaudeTabStatus') {
           const { tabId } = payload || {};
@@ -2396,6 +2408,8 @@ function App() {
           let status: 'active' | 'busy' | 'inactive' | 'starting' = 'inactive';
           let inputReady = false;
           let lastNotReady: any = null;
+          let effectiveSessionId = sessionId;
+          let effectiveCodexSessionId = tab.codexSessionId || null;
           if (runtime) {
             try {
               const p = await runtime.getPresence(tabId);
@@ -2403,6 +2417,16 @@ function App() {
               inputReady = !!p?.inputReady;
               lastNotReady = (p as any)?.lastNotReady || null;
             } catch { status = 'inactive'; }
+          }
+          if (toolType === 'codex') {
+            const runtimeSession = await ipcRenderer.invoke('codex:get-runtime-session', tabId).catch(() => null);
+            if (runtimeSession?.sessionId) {
+              effectiveSessionId = runtimeSession.sessionId;
+              effectiveCodexSessionId = runtimeSession.sessionId;
+              if (tab.codexSessionId !== runtimeSession.sessionId) {
+                useWorkspaceStore.getState().setCodexSessionId(tabId, runtimeSession.sessionId, 'runtime-status');
+              }
+            }
           }
           return reply(true, {
             tabId,
@@ -2412,9 +2436,9 @@ function App() {
             lastNotReady,
             toolType,
             commandType: tab.commandType || null,
-            sessionId,
+            sessionId: effectiveSessionId,
             claudeSessionId: tab.claudeSessionId || null,
-            codexSessionId: tab.codexSessionId || null,
+            codexSessionId: effectiveCodexSessionId,
             cwd: tab.cwd,
           });
         }
