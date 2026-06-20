@@ -694,6 +694,7 @@ const AGENT_STATUS_META: Record<AgentPtyStatus, { label: string; color: string }
   busy: { label: 'BUSY', color: '#d97706' },
   inactive: { label: 'STOPPED', color: '#777' },
   starting: { label: 'STARTING', color: '#60a5fa' },
+  stopping: { label: 'STOPPING', color: '#f59e0b' },
 };
 
 const historyControlButtonBase: React.CSSProperties = {
@@ -1436,6 +1437,8 @@ function AgentHistoryControls({
   onPromptSubmitted,
   onPromptStatusChange,
   rewindLocked,
+  rewindPreviewActive,
+  rewindPreviewHiddenCount,
 }: {
   tabId: string;
   sessionId: string;
@@ -1449,6 +1452,8 @@ function AgentHistoryControls({
   ) => void;
   onPromptStatusChange: (handoffId: string, queueStatus: 'queued' | 'sent' | 'cancelled' | 'failed', reason: string) => void;
   rewindLocked: boolean;
+  rewindPreviewActive: boolean;
+  rewindPreviewHiddenCount: number;
 }) {
   const runtime = useMemo(() => getHistoryAgentRuntime(toolType), [toolType]);
   const [status, setStatus] = useState<AgentPtyStatus>('inactive');
@@ -2069,7 +2074,7 @@ function AgentHistoryControls({
 
   const meta = AGENT_STATUS_META[status];
   const isTurnBusy = status === 'busy';
-  const controlsLocked = !!busyAction || isPasteBusy || answeringQuestion || rewindLocked;
+  const controlsLocked = !!busyAction || isPasteBusy || answeringQuestion || rewindLocked || status === 'stopping';
   const isCancellingTurn = busyAction === 'interrupt' || interruptAwaiting;
   const showThinkingChip = isTurnBusy && !isCancellingTurn && !pendingQuestion;
   const showRewindingChip = rewindLocked && !pendingQuestion;
@@ -2081,7 +2086,7 @@ function AgentHistoryControls({
   const canResume = status === 'inactive' && !!sessionId && !busyAction;
   const canStopProcess = (status === 'active' || status === 'busy' || status === 'starting') && !busyAction;
   const draftNoticeMeta = draftWarning ? getDraftNoticeMeta(draftWarning) : null;
-  const promptIdleBorder = isCancellingTurn || rewindLocked ? 'rgba(217, 119, 6, 0.65)' : '#333';
+  const promptIdleBorder = isCancellingTurn || rewindLocked || status === 'stopping' ? 'rgba(217, 119, 6, 0.65)' : '#333';
 
   return (
     <div
@@ -2171,6 +2176,34 @@ function AgentHistoryControls({
             </div>
           </Tooltip>
         )}
+        {rewindPreviewActive && !error && (
+          <Tooltip content="Preview after native rewind. JSONL is not changed until you submit the restored prompt. Restarting Claude or reopening History shows the full transcript again.">
+            <div
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 5,
+                minWidth: 0,
+                maxWidth: 260,
+                height: 20,
+                padding: '0 7px',
+                borderRadius: 5,
+                border: '1px solid rgba(217, 119, 6, 0.42)',
+                backgroundColor: 'rgba(217, 119, 6, 0.13)',
+                color: '#fbbf24',
+                fontSize: 10,
+                fontWeight: 750,
+                letterSpacing: 0,
+                flexShrink: 1,
+              }}
+            >
+              <span style={{ whiteSpace: 'nowrap' }}>REWIND PREVIEW</span>
+              <span style={{ color: '#a1a1aa', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {rewindPreviewHiddenCount > 0 ? rewindPreviewHiddenCount + ' hidden' : 'unsaved'}
+              </span>
+            </div>
+          </Tooltip>
+        )}
         <div style={{ flex: 1 }} />
         {status === 'inactive' && (
           <Tooltip content={'Resume ' + runtime.label + ' session'}>
@@ -2249,8 +2282,8 @@ function AgentHistoryControls({
                   if (canSend) runAction('send');
                 }
               }}
-              placeholder={rewindLocked ? 'Rewinding... input is locked' : isCancellingTurn ? 'Stopping... waiting for restored prompt' : status === 'inactive' ? 'Resume ' + runtime.label + ' to send' : status === 'starting' ? 'Waiting for prompt...' : 'Send a prompt...'}
-              readOnly={isCancellingTurn || rewindLocked}
+              placeholder={rewindLocked ? 'Rewinding... input is locked' : isCancellingTurn || status === 'stopping' ? 'Stopping...' : status === 'inactive' ? 'Resume ' + runtime.label + ' to send' : status === 'starting' ? 'Waiting for prompt...' : 'Send a prompt...'}
+              readOnly={isCancellingTurn || rewindLocked || status === 'stopping'}
               rows={3}
               style={{
                 flex: 1,
@@ -2258,17 +2291,17 @@ function AgentHistoryControls({
                 resize: 'vertical',
                 maxHeight: 120,
                 minHeight: 56,
-                backgroundColor: isCancellingTurn || rewindLocked ? '#130f0a' : '#0f0f0f',
+                backgroundColor: isCancellingTurn || rewindLocked || status === 'stopping' ? '#130f0a' : '#0f0f0f',
                 border: '1px solid ' + promptIdleBorder,
                 borderRadius: 5,
-                color: isCancellingTurn || rewindLocked ? '#c7c7c7' : '#e5e5e5',
+                color: isCancellingTurn || rewindLocked || status === 'stopping' ? '#c7c7c7' : '#e5e5e5',
                 outline: 'none',
                 padding: '7px 8px',
                 fontSize: 12,
                 lineHeight: 1.35,
                 fontFamily: 'inherit',
               }}
-              onFocus={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = isCancellingTurn ? '#d97706' : '#DA7756'; }}
+              onFocus={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = isCancellingTurn || status === 'stopping' ? '#d97706' : '#DA7756'; }}
               onBlur={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = promptIdleBorder; }}
             />
             <Tooltip content={canGrabDraft ? 'Pull terminal draft' : runtime.label + ' must be ready to pull draft'}>
@@ -3344,34 +3377,6 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
           <Search size={13} />
         </button>
         </Tooltip>
-        {!searchOpen && rewindPreview && (
-          <Tooltip content="Preview after native rewind. JSONL is not changed until you submit the restored prompt. Restarting Claude or reopening History shows the full transcript again.">
-            <div
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 5,
-                minWidth: 0,
-                maxWidth: 240,
-                height: 20,
-                padding: '0 7px',
-                borderRadius: 5,
-                border: '1px solid rgba(217, 119, 6, 0.42)',
-                backgroundColor: 'rgba(217, 119, 6, 0.13)',
-                color: '#fbbf24',
-                fontSize: 10,
-                fontWeight: 750,
-                letterSpacing: 0.2,
-                flexShrink: 1,
-              }}
-            >
-              <span style={{ whiteSpace: 'nowrap' }}>REWIND PREVIEW</span>
-              <span style={{ color: '#a1a1aa', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {rewindPreviewHiddenCount > 0 ? rewindPreviewHiddenCount + ' hidden' : 'unsaved'}
-              </span>
-            </div>
-          </Tooltip>
-        )}
         {searchOpen && (
           <>
             <input
@@ -3570,6 +3575,8 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
           onPromptSubmitted={appendLocalPromptEntry}
           onPromptStatusChange={updateLocalPromptEntry}
           rewindLocked={!!rewindLock}
+          rewindPreviewActive={!!rewindPreview}
+          rewindPreviewHiddenCount={rewindPreviewHiddenCount}
         />
       )}
     </div>

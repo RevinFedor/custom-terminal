@@ -202,6 +202,12 @@ await safePasteAndSubmit(term, content, {
 - **Только для программных операций:** Handshake, send-command, Rewind (Restore:History). **НЕ** для `terminal:input`.
 - **Safety timeout:** 8s — это не "подождать", а "что-то фатально сломалось, abort".
 
+### Main-side headless xterm mirror для фонового proof
+
+Main process держит lightweight `@xterm/headless` mirror на tab, который получает тот же PTY stream, что и renderer. Это не новый UI renderer и не замена Canvas: mirror нужен для proof-операций, которые могут идти из фоновой вкладки или API без mounted React terminal. Общие запросы visible snapshot и Codex draft-state сначала читают headless mirror, а renderer `terminalRegistry` остаётся fallback/debug каналом.
+
+Критичная граница: если action должен работать из History, mobile/iOS, Inbox или stopped-session Rewind, он не имеет права требовать mounted renderer xterm. Иначе баг выглядит как «сработало только после клика по вкладке» или как пропущенный draft guard. Mirror должен получать данные синхронно в PTY output path, resize'иться вместе с PTY и очищаться на exit/kill; `await` внутри high-frequency `onData` всё ещё запрещён.
+
 ### Bracketed Paste Mode
 Данные оборачиваются в escape-последовательности:
 - Начало: `\x1b[200~`

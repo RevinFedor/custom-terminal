@@ -3484,10 +3484,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         ' inputReady=' + !!presence?.inputReady +
         ' hasTerm=' + !!presence?.hasTerm +
         ' busy=' + !!presence?.isBusy;
-      const isBlockedStatus = (status?: AgentPtyStatus | null) => status === 'busy' || status === 'starting';
+      const isBlockedStatus = (status?: AgentPtyStatus | null) => status === 'busy' || status === 'starting' || status === 'stopping';
       const blockedMessage = (status?: AgentPtyStatus | null) =>
         status === 'starting'
           ? runtime.label + ' is starting; wait until the current loader finishes before rewind'
+          : status === 'stopping'
+          ? runtime.label + ' is stopping; wait until the current loader finishes before rewind'
           : runtime.label + ' is busy; wait for the current turn before rewind';
       const waitStartupDefaultsIfNeeded = async () => {
         if (toolType !== 'claude') return;

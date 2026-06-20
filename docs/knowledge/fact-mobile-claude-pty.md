@@ -6,17 +6,19 @@
 
 ## Lifecycle states
 
-PTY+Claude-таб для phone имеет четыре состояния (расширены поверх trivial busy/idle SDK):
+PTY+Claude-таб для phone имеет пять состояний (расширены поверх trivial busy/idle SDK):
 
 - **`inactive`** — PTY жив, но внутри shell, не Claude. Либо Claude exit'нулся (Ctrl+C×2, crash, app restart), либо изначально не запускался. JSONL на диске есть (если когда-то была сессия). UI: Resume-баннер вместо composer, серый dot.
 - **`starting`** — Claude процесс существует (bridge.json есть, `bridgeKnownSessions.has(tabId)`), но TUI **ещё не отрендерил prompt-символ `⏵`**. Между этими событиями 1-6 секунд. UI: «Starting Claude…» strip вместо composer.
 - **`active`** — Claude TUI готов принимать ввод (`⏵` отрендерён хотя бы раз = `claudePromptReady.has(tabId)`). UI: composer открыт, зелёная dot.
 - **`busy`** — Claude в середине turn'а (`claudeSpinnerBusy` или `claudeTurnBusy`). UI: composer disabled, янтарная dot, Stop кнопка в header.
+- **`stopping`** — пользователь/API уже попросил убить Claude/Codex process, kill-ladder идёт, но shell/PTY ещё не подтвердил exit. UI: blocking `STOPPING` вместо composer; send/resume/rewind/edit запрещены до финального `inactive`. Это не `busy`: `busy` = агент думает и может вернуть prompt, `stopping` = runtime tearing down.
 
 Переходы между состояниями — **только** event-driven, без polling:
 - `inactive → starting` — Bridge:Fresh (StatusLine bridge.json) → `notifyClaudeSessionAvailable(tabId)`
 - `starting → active` — детектор `⏵` в PTY-выводе → `claudePromptReady.add(tabId)` + WS snapshot
 - `active ↔ busy` — Stop hook (UserPromptSubmit / Stop / StopFailure) → `claude:busy-state` → WS broadcast
+- `active|busy|starting → stopping` — `terminal:stop-ai-process` / `agent:stopping-state` сразу после stop intent, до SIGTERM/SIGKILL outcome
 - `* → inactive` — PTY exit / terminal:kill / clearBridgeTab → WS snapshot + reset обоих Set'ов
 
 ## REST endpoints (расширение mobile-web)
@@ -44,11 +46,11 @@ Renderer App.tsx::handleWebBridge actions для PTY-agent табов:
 - `createClaudeTab` — `state.createTab` с `commandType:'claude', pendingAction:{type:'claude-new'}`. **Не зовёт** `claude:spawn-with-watcher` сам — Terminal.tsx mount'нется и обработает pendingAction. Двойной spawn ломал bridge fresh detection.
 - `createAgentTab` — generic версия для native iOS picker'а (`toolType:'claude'|'codex'`). Для Claude делает тот же `pendingAction:{type:'claude-new'}`, для Codex — `pendingAction:{type:'codex-new'}`, плюс ставит `color` равным агенту. Это важно: phone-кнопка "New Terminal" не должна сама писать `claude`/`codex` в PTY и обходить desktop launch defaults, session detection и future launch guards. Старый `createClaudeTab` остаётся как совместимый wrapper для mobile-web.
 - `resumeClaudeTab` — pre-check через `claude:get-presence`; если **active/busy** → refuse + return `alreadyRunning:true` (Ctrl+U стёр бы typed text на desktop). Иначе `markPendingResume` + `clearInterruptedState` + `\x15claude --dangerously-skip-permissions --resume <sid>\r` в PTY.
-- `stopAgentProcessScenario` (`stopClaudeTab` legacy alias) — `ipcRenderer.invoke('terminal:stop-ai-process', tabId)` (тот же handler что desktop Stop-кнопка). SIGTERM по AI-child-PID, через 800ms эскалация в SIGKILL. Shell PTY жив → Resume в этом же табе работает. Graveyard `\x03+\x03 setTimeout(250ms)` — Ink TUI redraws prompt между Ctrl+C, второй трактуется как новый первый, Claude не выходит. См. `fact-claude-tui-control.md::Mobile preserve-shell Stop`, `fix-claude-busy-detection.md::4`.
+- `stopAgentProcessScenario` (`stopClaudeTab` legacy alias) — вызывает тот же `terminal:stop-ai-process` что desktop Stop-кнопка, с явным `toolType` (`claude`/`codex`). Сразу публикуется `stopping` в renderer/API/SSE, затем SIGTERM по AI-child-PID, через 800ms эскалация в SIGKILL. Shell PTY жив → Resume в этом же табе работает. Graveyard `\x03+\x03 setTimeout(250ms)` — Ink TUI redraws prompt между Ctrl+C, второй трактуется как новый первый, Claude не выходит. См. `fact-claude-tui-control.md::Mobile preserve-shell Stop`, `fix-claude-busy-detection.md::4`.
 - `sendAgentPromptScenario` (`sendMessageAuto` legacy alias) — единая точка для `/api/terminal-tabs/:id/send`. Это уже не просто "paste": scenario сначала проверяет terminal draft ownership, при inactive session делает безопасный resume там где это допустимо, при busy решает queue/send-during-streaming по runtime, и только потом вызывает runtime-примитив. Если tab inactive и нет session id, scenario обязан вернуть ошибку **до** paste: fallback в shell создаёт пользовательский симптом «отправил с iOS, а запрос не появился в истории / терминал просто напечатал текст». Project/History/iOS клиенты при чужом draft получают конфликт и не очищают TUI; Inbox-клиент имеет отдельный contract, описанный в `fact-codex.md::External Inbox runs`.
 - `interruptAgentTurnScenario`, `grabAgentDraftScenario`, `inspectAgentDraftScenario`, `rewindAgentTimelineScenario` — общие terminal entrypoints для mobile, History и внешнего API. Старые action names оставлены только как совместимость, чтобы старый mobile-web/native build не умер после обновления desktop host.
 - `getClaudeTabStatus` / `getClaudeTabStatusBatch` — обёртки над `claude:get-presence` (одиночная и batch). Batch используется в `getProjectTabsLive` для списка табов в проекте.
-- `getProjectTabsLive` расширен — для PTY-agent табов отдаёт `sessionStatus` (active/busy/inactive/starting) через agent-runtime adapter, а не через Claude-only presence. В том же ответе передаются desktop `tab.color`, assigned status `statusColor`, project `icon` и `statusMarker` config — native/web клиенты не имеют доступа к `useUIStore`, поэтому сервер обязан отдать уже нормализованные поля.
+- `getProjectTabsLive` расширен — для PTY-agent табов отдаёт `sessionStatus` (active/busy/inactive/starting/stopping) через agent-runtime adapter, а не через Claude-only presence. В том же ответе передаются desktop `tab.color`, assigned status `statusColor`, project `icon` и `statusMarker` config — native/web клиенты не имеют доступа к `useUIStore`, поэтому сервер обязан отдать уже нормализованные поля.
 
 ## fs.watch JSONL tail для live-сообщений
 
@@ -84,7 +86,7 @@ Mobile-web Resume для CLAUDE-таба обязан соблюдать три 
 
 Поверх существующих SDK событий (`snapshot/message/busy/done`) добавлены поля и события:
 
-- `{type:'snapshot', sessionId, busy, sessionStatus, inputReady}` — `sessionStatus` строка из четырёх состояний, `inputReady` булев флаг (приходит когда `claudePromptReady` flag flip'нулся).
+- `{type:'snapshot', sessionId, busy, sessionStatus, inputReady}` — `sessionStatus` строка из пяти состояний, `inputReady` булев флаг (приходит когда `claudePromptReady` flag flip'нулся). Для `stopping` всегда считать `inputReady=false`, даже если последний prompt был виден до клика Stop.
 - `{type:'bridge-update', sessionId, model, contextPct}` — main зеркалит `claude:bridge-update` IPC из StatusLine bridge.json (model + context %). Mobile back-derives `usedTokens = window * contextPct / 100`, header pill обновляется live без polling.
 - `{type:'busy'/done', busy, sessionId}` — main зеркалит Stop hook в `_webBroadcast` для PTY-табов тоже (раньше только SDK). Без этого composer не блокировался на mobile во время turn'а → race при двойном Send.
 
@@ -92,7 +94,7 @@ Mobile-web Resume для CLAUDE-таба обязан соблюдать три 
 
 В header чата для CLAUDE-PTY-табов появляются те же контролы что у SDK:
 - **Pill «model · effort»** в центре — `SDKParamsButton` переиспользован. `canParams` open только когда status=active/busy (slash-commands нужен живой prompt).
-- **Stop ■** справа от ☰ — красная, видна только когда status=active/busy. Под капотом `Api.stop` который роутит через `stopClaudeTab` bridge → `terminal:stop-ai-process` (SIGTERM по PID, тот же путь что desktop Stop).
+- **Stop ■** справа от ☰ — красная, видна только когда status=active/busy/starting. Под капотом `Api.stop` который роутит через `stopClaudeTab` bridge → `terminal:stop-ai-process` (SIGTERM по PID, тот же путь что desktop Stop). После клика status становится `stopping`; кнопка и composer блокируются до `inactive`.
 - **Context%** под именем таба слева — через `bridge-update` WS event.
 - **Resume-баннер** вместо composer когда `claudeSessionId && status==='inactive'`.
 
@@ -109,7 +111,7 @@ Mobile-web Resume для CLAUDE-таба обязан соблюдать три 
 В строке вкладки (project tab list) **две независимые оси состояния**, которые легко спутать, потому что desktop и mobile исторически назвали их одинаково `sessionStatus`:
 
 1. **Назначенная категория** (`fact-session-status.md`) — user-assigned маркер dev/bugfix/knowledge/custom. На desktop это `Tab.sessionStatus` = **id** из палитры `useUIStore.sessionStatuses`, цвет резолвится lookup'ом, форма (dot/square) + размер — глобальный `useUIStore.statusMarker`. Хранится в SQLite колонке `tabs.session_status`.
-2. **Runtime-состояние** процесса (active/busy/inactive/starting) — из `claude:get-presence`. На mobile поле `tab.sessionStatus` исторически держало **именно это** (runtime), не категорию.
+2. **Runtime-состояние** процесса (active/busy/inactive/starting/stopping) — из `claude:get-presence` / generic agent presence. На mobile поле `tab.sessionStatus` исторически держало **именно это** (runtime), не категорию.
 
 Mobile-web — отдельный SPA, у него **нет** доступа к `useUIStore`/localStorage, где живут палитра и shape. Поэтому оба передаются по проводу из main:
 - `GET /api/projects/:id/tabs` теперь отдаёт top-level `statusMarker:{shape,sizePx}` + per-tab `statusId` + **`statusColor`** (хекс, уже зарезолвленный из палитры server-side — телефон не должен знать про палитру). Два пути дают это: DB-path (web-server.js) через bridge-action `getStatusMarkerConfig`, live-Zustand-path (App.tsx `getProjectTabsLive`) — напрямую из `useUIStore.getState()`.
@@ -124,7 +126,7 @@ Graceful degrade — обязателен: старый prod-asar (до этих
 
 ## Presence: composer busy = turn, не spinner и не alive
 
-`claude:get-presence` (main.js) — **основной** источник `sessionStatus` для mobile (4 call sites в App.tsx bridge: getProjectTabsLive, resume pre-check, getClaudeTabStatus single/batch). Маппинг: `!hasTerm → inactive`; иначе `hasBridge ? (isBusy ? busy : inputReady ? active : starting) : inactive`. Этот `busy` доезжает до телефона через watcher initial-snapshot (`busy: status.status === 'busy'`, web-server.js) и управляет **composer Send↔Stop swap** — кнопка справа от инпута это **turn/loader-контрол**, не process-контрол. (Не **единственный** эмиттер `busy` на телефон — есть второй, `⏵`-детектор; см. ниже «Второй busy-эмиттер».)
+`claude:get-presence` (main.js) — **основной** источник `sessionStatus` для mobile (4 call sites в App.tsx bridge: getProjectTabsLive, resume pre-check, getClaudeTabStatus single/batch). Маппинг: если `agent:get-stopping-state` говорит stopping → `stopping`; иначе `!hasTerm → inactive`; иначе `hasBridge ? (isBusy ? busy : inputReady ? active : starting) : inactive`. Этот `busy` доезжает до телефона через watcher initial-snapshot (`busy: status.status === 'busy'`, web-server.js) и управляет **composer Send↔Stop swap** — кнопка справа от инпута это **turn/loader-контрол**, не process-контрол. (Не **единственный** эмиттер `busy` на телефон — есть второй, `⏵`-детектор; см. ниже «Второй busy-эмиттер».)
 
 `isBusy = claudeTurnBusy` **и только он** (Stop-hook pipeline, `fact-claude-stop-hook.md`: UserPromptSubmit→true / Stop→false). Это эволюция через два бага:
 
@@ -164,6 +166,7 @@ Graceful degrade — обязателен: старый prod-asar (до этих
 - Создаю новый Claude-tab с мобилы — sessionId никогда не появляется, UI висит на «Starting Claude…»
 - Нажал Start/Resume с iOS — вкладка бесконечно показывает `starting`, хотя HTTP `/resume` уже вернул success
 - После Resume/Start следующий prompt попал в `Choose working directory` / update prompt вместо composer
+- Нажал Stop/Close на Claude/Codex, но iOS/History сразу показывает input или Resume до реального exit — пропущен runtime `stopping`
 - Mobile composer не блокируется во время Claude turn → две одновременные отправки → одна теряется
 - Stop с мобилы убил весь таб целиком, Resume не возвращает Claude (Ctrl+D вместо Ctrl+C×2)
 - Открываю Claude-таб с мобилы, Claude простаивает (turn закончился) — кнопка отправки залипла в Stop, сообщение не отправить

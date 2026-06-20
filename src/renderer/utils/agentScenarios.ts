@@ -21,7 +21,7 @@ export interface SendAgentPromptScenarioArgs {
 }
 
 const normalizeStatus = (value: unknown): AgentPtyStatus | undefined => {
-  return value === 'active' || value === 'busy' || value === 'inactive' || value === 'starting'
+  return value === 'active' || value === 'busy' || value === 'inactive' || value === 'starting' || value === 'stopping'
     ? value
     : undefined;
 };
@@ -219,12 +219,15 @@ function createAgentReadyWait(tabId: string, runtime: HistoryAgentRuntime, timeo
 }
 
 function isAgentRewindBlockedStatus(status?: AgentPtyStatus | null): boolean {
-  return status === 'busy' || status === 'starting';
+  return status === 'busy' || status === 'starting' || status === 'stopping';
 }
 
 function getAgentRewindBlockedMessage(runtime: HistoryAgentRuntime, status?: AgentPtyStatus | null): string {
   if (status === 'starting') {
     return runtime.label + ' is starting; wait until the current loader finishes before rewind';
+  }
+  if (status === 'stopping') {
+    return runtime.label + ' is stopping; wait until the current loader finishes before rewind';
   }
   return runtime.label + ' is busy; wait for the current turn before rewind';
 }
@@ -274,7 +277,7 @@ async function ensureAgentReadyForRewind({
     }
 
     presence = await runtime.getPresence(tabId).catch(() => null);
-    if (presence?.status === 'busy' || (presence?.status === 'starting' && !resumedForRewind)) {
+    if (presence?.status === 'stopping' || presence?.status === 'busy' || (presence?.status === 'starting' && !resumedForRewind)) {
       throw new Error(getAgentRewindBlockedMessage(runtime, presence?.status));
     }
     if (presence?.status === 'active' && presence?.inputReady) {
@@ -328,6 +331,9 @@ async function ensureAgentReadyForSend({
     + ' status=' + (presence?.status || 'unknown')
     + ' inputReady=' + !!presence?.inputReady
     + ' busy=' + !!presence?.isBusy);
+  if (presence?.status === 'stopping') {
+    throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
+  }
   if (presence?.status === 'busy') return 'busy';
   if (presence?.status === 'active' && presence?.inputReady) {
     await waitStartupDefaultsIfNeeded();
@@ -357,6 +363,9 @@ async function ensureAgentReadyForSend({
     }
 
     presence = await runtime.getPresence(tabId).catch(() => null);
+    if (presence?.status === 'stopping') {
+      throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
+    }
     if (presence?.status === 'busy') return 'busy';
     if (presence?.status === 'active' && presence?.inputReady) {
       readyWait.cancel();

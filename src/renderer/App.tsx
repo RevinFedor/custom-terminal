@@ -1497,7 +1497,7 @@ function App() {
           const statusColor = (statusId?: string | null) =>
             statusId ? (statusPalette.find((s: any) => s.id === statusId)?.color || null) : null;
           const tabs = await Promise.all(Array.from(ws.tabs.values()).map(async (t: any) => {
-            let sessionStatus: 'active' | 'busy' | 'inactive' | 'starting' | null = null;
+            let sessionStatus: 'active' | 'busy' | 'inactive' | 'starting' | 'stopping' | null = null;
             let awaiting = false;
             let inputReady: boolean | null = null;
             let lastNotReady: any = null;
@@ -1540,6 +1540,7 @@ function App() {
               geminiSessionId: t.geminiSessionId,
               sessionStatus,
               starting: sessionStatus === 'starting',
+              stopping: sessionStatus === 'stopping',
               inputReady,
               lastNotReady,
               startupFailed,
@@ -1876,17 +1877,19 @@ function App() {
             const processInfo = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId).catch(() => null);
             const processText = `${processInfo?.processName || ''} ${processInfo?.command || ''}`;
             const hasLiveCodexProcess = processInfo?.hasProcess === true && /(\bcodex\b|@openai\/codex)/i.test(processText);
-            const terminal = terminalRegistry.get(tabId);
             const hasLiveWatcher = turnState?.hasWatcher === true || hasLiveCodexProcess;
 
             if (turnState?.busy === true) {
               return reply(false, null, 'codex is busy');
             }
-            if (hasLiveWatcher && !terminal) {
-              return reply(false, null, 'codex terminal is not mounted');
-            }
-            if (hasLiveWatcher && terminal) {
-              const draftState = terminalRegistry.getCodexDraftState(tabId);
+            if (hasLiveWatcher) {
+              const draftState = await ipcRenderer.invoke('codex:get-draft-state', tabId, {
+                reason: 'mobile-codex-set-params',
+                timeoutMs: 700,
+              }).catch((error: any) => {
+                console.warn('[MobileBridge] codex-set-params draft probe failed tab=' + String(tabId).slice(-12) + ': ' + (error?.message || String(error)));
+                return terminalRegistry.getCodexDraftState(tabId);
+              });
               console.log('[MobileBridge] codex-set-params live tab=' + String(tabId).slice(-12) + ' model=' + requestedModel + ' effort=' + requestedEffort + ' hasDraft=' + draftState.hasDraft + ' source=' + draftState.source);
               if (draftState.hasDraft === null) {
                 return reply(false, null, 'codex input state unknown: ' + draftState.source);
@@ -2380,7 +2383,7 @@ function App() {
         if (action === 'getClaudeTabStatusBatch') {
           const { tabIds } = payload || {};
           if (!Array.isArray(tabIds)) return reply(false, null, 'tabIds required');
-          const statuses: Record<string, 'active' | 'busy' | 'inactive' | 'starting'> = {};
+          const statuses: Record<string, 'active' | 'busy' | 'inactive' | 'starting' | 'stopping'> = {};
           const inputReady: Record<string, boolean> = {};
           const lastNotReady: Record<string, any> = {};
           const sessions: Record<string, string | null> = {};
@@ -2415,7 +2418,7 @@ function App() {
           if (!tabId) return reply(false, null, 'tabId required');
           const { tab, toolType, runtime, sessionId } = describeAgentTab(tabId);
           if (!tab) return reply(true, { tabId, status: 'inactive', commandType: null, toolType: null, sessionId: null });
-          let status: 'active' | 'busy' | 'inactive' | 'starting' = 'inactive';
+          let status: 'active' | 'busy' | 'inactive' | 'starting' | 'stopping' = 'inactive';
           let inputReady = false;
           let lastNotReady: any = null;
           let startupFailed = false;
@@ -2446,6 +2449,7 @@ function App() {
             tabId,
             status,
             starting: status === 'starting',
+            stopping: status === 'stopping',
             inputReady,
             lastNotReady,
             startupFailed,
@@ -2736,19 +2740,17 @@ function App() {
                   console.warn('[AutoResume] Resumed codex', tabId, sessionId.substring(0, 8));
                   return { ok: true, item };
                 }
-                // Reserve sessionId BEFORE writing to PTY: SessionBridge fires
-                // claude:session-detected within ~1-2 sec, and any stale bridge
-                // file (Claude CLI keeps months-old bridge JSONs around) racing
-                // ahead of the real resume would stomp this tab. The flag stops
-                // exactly that race. See utils/pendingResume.ts.
-                markPendingResume(tabId, sessionId);
                 // Repair dangling parentUuid in JSONL before resume so Claude CLI
                 // backtrace doesn't truncate history at first orphan (slash-command
                 // assistant or attachment virtual parent never written to disk).
                 // When repair returns repaired > 0 — surface to user: this is the
                 // moment we ACTUALLY saved history that Claude TUI would have lost.
                 try {
-                  const repairRes = await ipcRenderer.invoke('claude:repair-jsonl-before-resume', { sessionId, cwd });
+                  const repairRes = await ipcRenderer.invoke('claude:repair-jsonl-before-resume', { sessionId, cwd, tabId });
+                  if (repairRes?.success === false) {
+                    console.warn('[AutoResume] JSONL repair blocked tab=' + tabId.slice(-12) + ' sid=' + sessionId.substring(0, 8) + ': ' + (repairRes?.error || repairRes?.reason || 'unknown'));
+                    return { ok: false, item, error: repairRes?.error || repairRes?.reason || 'JSONL repair blocked' };
+                  }
                   const fixedCount = repairRes?.repaired || 0;
                   if (fixedCount > 0) {
                     showToast(
@@ -2763,6 +2765,12 @@ function App() {
                     );
                   }
                 } catch (e: any) { console.warn('[AutoResume] JSONL repair skipped:', e?.message || String(e)); }
+                // Reserve sessionId immediately before writing to PTY: SessionBridge fires
+                // claude:session-detected within ~1-2 sec, and any stale bridge
+                // file (Claude CLI keeps months-old bridge JSONs around) racing
+                // ahead of the real resume would stomp this tab. The flag stops
+                // exactly that race. See utils/pendingResume.ts.
+                markPendingResume(tabId, sessionId);
                 ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + sessionId + '\r');
                 ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude', sessionId });
                 console.warn('[AutoResume] Resumed claude', tabId, sessionId.substring(0, 8));

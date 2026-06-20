@@ -269,10 +269,19 @@ function describeXtermCellStyle(cell: any): string {
   return parts.join(',');
 }
 
-function summarizeXtermLineStyles(line: any): { styles: string[]; firstTextStyle: string } {
-  if (!line) return { styles: [], firstTextStyle: 'none' };
+function xtermStyleHasNonDefaultBg(style: string): boolean {
+  const match = /bg=([^,\s]+)/.exec(style);
+  if (!match) return false;
+  const bg = match[1];
+  return bg !== '0:-1' && bg !== '-:-' && bg !== '-:-1' && bg !== 'none';
+}
+
+function summarizeXtermLineStyles(line: any): { styles: string[]; firstTextStyle: string; hasInverse: boolean; hasNonDefaultBg: boolean } {
+  if (!line) return { styles: [], firstTextStyle: 'none', hasInverse: false, hasNonDefaultBg: false };
   const counts = new Map<string, number>();
   let firstTextStyle = 'none';
+  let hasInverse = false;
+  let hasNonDefaultBg = false;
   for (let x = 0; x < line.length; x++) {
     const cell = line.getCell(x);
     if (!cell || cell.getWidth?.() === 0) continue;
@@ -280,13 +289,15 @@ function summarizeXtermLineStyles(line: any): { styles: string[]; firstTextStyle
     if (!String(ch).trim()) continue;
     const style = describeXtermCellStyle(cell);
     if (firstTextStyle === 'none') firstTextStyle = style;
+    if (style.includes('inverse')) hasInverse = true;
+    if (xtermStyleHasNonDefaultBg(style)) hasNonDefaultBg = true;
     counts.set(style, (counts.get(style) || 0) + 1);
   }
   const styles = Array.from(counts.entries())
     .sort((a, b) => b[1] - a[1])
     .slice(0, 6)
     .map(([style, count]) => style + ' x' + count);
-  return { styles, firstTextStyle };
+  return { styles, firstTextStyle, hasInverse, hasNonDefaultBg };
 }
 
 export const terminalRegistry = {
@@ -356,16 +367,16 @@ export const terminalRegistry = {
     cursorX?: number;
     cursorY?: number;
     bufferType?: string;
-    lines?: { row: number; text: string; wrapped: boolean; firstTextStyle?: string; styles?: string[] }[];
-    codexActivePrompt?: { row: number; text: string; firstTextStyle: string; styles: string[] } | null;
+    lines?: { row: number; text: string; wrapped: boolean; firstTextStyle?: string; styles?: string[]; hasInverse?: boolean; hasNonDefaultBg?: boolean; activeByInverse?: boolean }[];
+    codexActivePrompt?: { row: number; text: string; firstTextStyle: string; styles: string[]; hasInverse?: boolean; hasNonDefaultBg?: boolean } | null;
   } {
     const terminal = terminals.get(tabId);
     if (!terminal) return { success: false, error: 'no-terminal' };
     const buf = terminal.buffer.active;
     const startLine = buf.viewportY;
     const endLine = Math.min(startLine + terminal.rows, buf.length);
-    const lines: { row: number; text: string; wrapped: boolean; firstTextStyle?: string; styles?: string[] }[] = [];
-    let codexActivePrompt: { row: number; text: string; firstTextStyle: string; styles: string[] } | null = null;
+    const lines: { row: number; text: string; wrapped: boolean; firstTextStyle?: string; styles?: string[]; hasInverse?: boolean; hasNonDefaultBg?: boolean; activeByInverse?: boolean }[] = [];
+    let codexActivePrompt: { row: number; text: string; firstTextStyle: string; styles: string[]; hasInverse?: boolean; hasNonDefaultBg?: boolean } | null = null;
     for (let i = startLine; i < endLine; i++) {
       const line = buf.getLine(i);
       if (!line) continue;
@@ -381,8 +392,10 @@ export const terminalRegistry = {
       const last = lines[lines.length - 1];
       last.firstTextStyle = summary.firstTextStyle;
       last.styles = summary.styles;
-      const isActivePrompt = summary.firstTextStyle.includes('inverse')
-        || summary.styles.some((style) => style.includes('inverse'));
+      last.hasInverse = summary.hasInverse;
+      last.hasNonDefaultBg = summary.hasNonDefaultBg;
+      const isActivePrompt = summary.hasInverse;
+      last.activeByInverse = isActivePrompt;
       if (isActivePrompt) {
         const logical = getLogicalLineSnapshotAt(buf, i);
         codexActivePrompt = {
@@ -390,6 +403,8 @@ export const terminalRegistry = {
           text: logical.text || text,
           firstTextStyle: summary.firstTextStyle,
           styles: summary.styles,
+          hasInverse: summary.hasInverse,
+          hasNonDefaultBg: summary.hasNonDefaultBg,
         };
       }
     }
@@ -423,6 +438,8 @@ export const terminalRegistry = {
       text: string;
       firstTextStyle: string;
       styles: string[];
+      hasInverse: boolean;
+      hasNonDefaultBg: boolean;
     }> = [];
 
     for (let i = startLine; i < endLine; i++) {
@@ -439,6 +456,8 @@ export const terminalRegistry = {
         text: compactText.slice(0, 180),
         firstTextStyle: summary.firstTextStyle,
         styles: summary.styles,
+        hasInverse: summary.hasInverse,
+        hasNonDefaultBg: summary.hasNonDefaultBg,
       });
     }
 

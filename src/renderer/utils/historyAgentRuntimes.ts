@@ -18,7 +18,7 @@ import {
 const { ipcRenderer } = window.require('electron');
 
 export type AgentHistoryTool = 'claude' | 'codex';
-export type AgentPtyStatus = 'active' | 'busy' | 'inactive' | 'starting';
+export type AgentPtyStatus = 'active' | 'busy' | 'inactive' | 'starting' | 'stopping';
 export type AgentDraftGrabResult = ClaudePtyDraftGrabResult;
 export type AgentPendingQuestion = ClaudePendingQuestion;
 export type AgentQuestion = ClaudeQuestion;
@@ -119,6 +119,7 @@ async function getCodexPtyPresence(tabId: string): Promise<AgentPtyPresence> {
     }).catch(() => null),
     ipcRenderer.invoke('codex:get-turn-state', tabId).catch(() => null),
   ]);
+  const stopping = await ipcRenderer.invoke('agent:get-stopping-state', tabId).catch(() => null);
   const tuiReady = await ipcRenderer.invoke('codex:get-tui-ready', tabId).catch(() => null);
   const isRunning = !!state?.isRunning;
   const inputReady = isRunning && !!tuiReady?.inputReady;
@@ -127,12 +128,15 @@ async function getCodexPtyPresence(tabId: string): Promise<AgentPtyPresence> {
   if (tab && tab.aiBusy !== isBusy) {
     useWorkspaceStore.getState().setAiBusy(tabId, isBusy);
   }
+  const status: AgentPtyStatus = stopping?.stopping
+    ? 'stopping'
+    : (startupFailed ? 'starting' : (isRunning ? (isBusy ? 'busy' : (inputReady ? 'active' : 'starting')) : 'inactive'));
   return {
-    status: startupFailed ? 'starting' : (isRunning ? (isBusy ? 'busy' : (inputReady ? 'active' : 'starting')) : 'inactive'),
+    status,
     hasBridge: !!tab?.codexSessionId,
     isBusy,
     hasTerm: state?.error !== 'tab not found',
-    inputReady,
+    inputReady: status === 'stopping' ? false : inputReady,
     awaiting: false,
     lastNotReady: tuiReady?.lastNotReady || null,
     startupFailed,
@@ -180,9 +184,14 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
   const tabState = findTabState(tabId);
   const modelForPicker = requestedModel && requestedModel !== 'none' ? requestedModel : (tabState?.codexModel || '');
   const effortForPicker = requestedEffort && requestedEffort !== 'none' ? requestedEffort : '';
-  const draftStateForSend = terminalRegistry.getCodexDraftState(tabId);
-  const skipVisibleDraftGuard = draftStateForSend?.source === 'no-terminal';
-  console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' model=' + (modelForPicker || '-') + ' effort=' + (effortForPicker || '-') + ' submitIntent=' + (queue ? 'tab-queue' : 'enter') + ' chars=' + prompt.length + ' draftSource=' + (draftStateForSend?.source || '-') + ' skipVisibleDraftGuard=' + skipVisibleDraftGuard);
+  const draftStateForSend = await ipcRenderer.invoke('codex:get-draft-state', tabId, {
+    reason: 'history-send-preflight',
+    timeoutMs: 700,
+  }).catch((error: any) => {
+    console.warn('[CodexHistoryActions:send] main draft probe failed tab=' + shortTab(tabId) + ': ' + errorText(error));
+    return terminalRegistry.getCodexDraftState(tabId);
+  });
+  console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' model=' + (modelForPicker || '-') + ' effort=' + (effortForPicker || '-') + ' submitIntent=' + (queue ? 'tab-queue' : 'enter') + ' chars=' + prompt.length + ' draftSource=' + (draftStateForSend?.source || '-') + ' skipVisibleDraftGuard=false');
   if (options.statusAtSend !== 'busy' && modelForPicker) {
     const currentModel = tabState?.codexModel || '';
     const currentEffort = tabState?.codexEffort || '';
@@ -214,7 +223,7 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
     handoffId: options.handoffId || null,
     source: options.source || null,
     statusAtSend: options.statusAtSend || null,
-    skipVisibleDraftGuard,
+    skipVisibleDraftGuard: false,
   })
     .then((result: any) => {
       const auditTimeoutAfterSubmit = isSubmittedCodexAuditTimeout(result);
@@ -258,7 +267,7 @@ async function stopCodexProcess(tabId: string): Promise<any> {
     return existing;
   }
   console.log('[CodexHistoryActions:stop-process] start tab=' + shortTab(tabId));
-  const work = ipcRenderer.invoke('terminal:stop-ai-process', tabId)
+  const work = ipcRenderer.invoke('terminal:stop-ai-process', { tabId, toolType: 'codex' })
     .then((result: any) => {
       console.log('[CodexHistoryActions:stop-process] done tab=' + shortTab(tabId) + ' success=' + !!result?.success + ' error=' + (result?.error || '-'));
       return result;

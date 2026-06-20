@@ -557,13 +557,87 @@ function waitForClaudeStartupModelBridge(tabId: string, model: string, timeoutMs
   });
 }
 
-async function waitForClaudeStartupPromptBoundary(tabId: string, afterSeq: number, label: string) {
-  const seq = await terminalRegistry.waitForPromptBoundaryAfter(tabId, afterSeq, 3000);
+async function waitForClaudeStartupPromptBoundaryResult(tabId: string, afterSeq: number, label: string, timeoutMs = 3000) {
+  const seq = await terminalRegistry.waitForPromptBoundaryAfter(tabId, afterSeq, timeoutMs);
   console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' ' + label + ' promptBoundary=' + (seq === null ? 'timeout' : seq));
-  if (seq === null) {
+  return seq === null ? 'timeout' : 'prompt-boundary:' + seq;
+}
+
+async function waitForClaudeStartupPromptBoundary(tabId: string, afterSeq: number, label: string) {
+  const result = await waitForClaudeStartupPromptBoundaryResult(tabId, afterSeq, label);
+  if (result === 'timeout') {
     throw new Error(label + ' did not return a prompt boundary');
   }
-  return seq;
+  return result;
+}
+
+async function waitForClaudeStartupPromptBoundaryWithRecovery(tabId: string, afterSeq: number, command: string, label: string) {
+  let result = await waitForClaudeStartupPromptBoundaryResult(tabId, afterSeq, label);
+  if (result === 'timeout') {
+    result = await retryStuckClaudeStartupSlashCommand(
+      tabId,
+      command,
+      label,
+      () => waitForClaudeStartupPromptBoundaryResult(tabId, afterSeq, label + ':retry', 3500)
+    );
+  }
+  if (result === 'timeout') {
+    throw new Error(label + ' did not return a prompt boundary');
+  }
+  return result;
+}
+
+const normalizeStartupSlashText = (text: unknown) => String(text || '').replace(/\u00a0/g, ' ').trim();
+
+async function copyClaudeStartupInput(tabId: string, label: string) {
+  try {
+    const result = await ipcRenderer.invoke('claude:copy-input', tabId);
+    const text = normalizeStartupSlashText(result?.text);
+    console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' copy-input label=' + label +
+      ' success=' + (result?.success === true) +
+      ' chars=' + text.length +
+      ' text="' + text.slice(0, 80) + '"' +
+      ' error=' + (result?.error || '-'));
+    return { success: result?.success === true, text, error: result?.error || null };
+  } catch (e: any) {
+    console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' copy-input label=' + label + ' threw ' + (e?.message || String(e)));
+    return { success: false, text: '', error: e?.message || String(e) };
+  }
+}
+
+async function clearClaudeStartupInputIfStill(tabId: string, command: string, label: string) {
+  const expected = normalizeStartupSlashText(command);
+  const current = await copyClaudeStartupInput(tabId, label + ':before-clear');
+  if (!current.success || current.text !== expected) return false;
+  try {
+    const clear = await ipcRenderer.invoke('claude:clear-input', tabId);
+    console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' clear stuck ' + label +
+      ' success=' + (clear?.success === true) +
+      ' error=' + (clear?.error || '-'));
+    return clear?.success === true;
+  } catch (e: any) {
+    console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' clear stuck ' + label + ' threw ' + (e?.message || String(e)));
+    return false;
+  }
+}
+
+async function retryStuckClaudeStartupSlashCommand(
+  tabId: string,
+  command: string,
+  label: string,
+  confirm: () => Promise<string>
+) {
+  const expected = normalizeStartupSlashText(command);
+  const current = await copyClaudeStartupInput(tabId, label + ':timeout');
+  if (current.success && current.text === expected) {
+    console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' retry Enter for stuck ' + label + ' command="' + expected + '"');
+    ipcRenderer.send('terminal:input', tabId, '\r');
+    const retryConfirm = await confirm().catch(() => 'timeout');
+    console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' retry result ' + label + '=' + retryConfirm);
+    if (retryConfirm !== 'timeout') return retryConfirm;
+  }
+  await clearClaudeStartupInputIfStill(tabId, command, label);
+  return 'timeout';
 }
 
 const terminalWarmQueue = new Map<string, () => void>();
@@ -1304,7 +1378,15 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
               armPromptBoundaryOnSubmit: true,
             });
             if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
-            const bridgeWait = await waitForClaudeStartupModelBridge(tabId, model);
+            let bridgeWait = await waitForClaudeStartupModelBridge(tabId, model);
+            if (bridgeWait === 'timeout') {
+              bridgeWait = await retryStuckClaudeStartupSlashCommand(
+                tabId,
+                '/model ' + model,
+                'bridge-model',
+                () => waitForClaudeStartupModelBridge(tabId, model, 3500)
+              );
+            }
             if (bridgeWait === 'timeout') {
               throw new Error('/model ' + model + ' did not confirm through bridge');
             }
@@ -1369,7 +1451,12 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           armPromptBoundaryOnSubmit: true,
         });
         if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
-        await waitForClaudeStartupPromptBoundary(tabId, promptSeqBeforeEffort, 'after /effort ' + eff + ' (bridge-fresh)');
+        await waitForClaudeStartupPromptBoundaryWithRecovery(
+          tabId,
+          promptSeqBeforeEffort,
+          '/effort ' + eff,
+          'after /effort ' + eff + ' (bridge-fresh)'
+        );
         _effortDiag(tabId, '✅ INJECT COMPLETED', '/effort ' + eff + ' — Claude acknowledged');
       } catch (e: unknown) {
         _effortDiag(tabId, '❌ INJECT FAILED', String(e));
@@ -1404,7 +1491,15 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
               armPromptBoundaryOnSubmit: true,
             });
             if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
-            const bridgeWait = await waitForClaudeStartupModelBridge(tabId, model);
+            let bridgeWait = await waitForClaudeStartupModelBridge(tabId, model);
+            if (bridgeWait === 'timeout') {
+              bridgeWait = await retryStuckClaudeStartupSlashCommand(
+                tabId,
+                '/model ' + model,
+                'tui-model',
+                () => waitForClaudeStartupModelBridge(tabId, model, 3500)
+              );
+            }
             if (bridgeWait === 'timeout') {
               throw new Error('/model ' + model + ' did not confirm through bridge');
             }
@@ -1446,7 +1541,12 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             armPromptBoundaryOnSubmit: true,
           });
           if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
-          await waitForClaudeStartupPromptBoundary(tabId, promptSeqBeforeEffort, 'after /effort ' + eff);
+          await waitForClaudeStartupPromptBoundaryWithRecovery(
+            tabId,
+            promptSeqBeforeEffort,
+            '/effort ' + eff,
+            'after /effort ' + eff
+          );
           console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /effort ' + eff + ' completed — startup defaults ready');
           _effortDiag(tabId, '✅ INJECT COMPLETED', '/effort ' + eff + ' — Claude acknowledged');
         } catch (e: unknown) {

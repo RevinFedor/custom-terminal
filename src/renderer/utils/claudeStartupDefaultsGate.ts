@@ -14,6 +14,13 @@ function getGate(tabId: string): GateState | null {
   return gates.get(tabId) || null;
 }
 
+function emitGateEvent(tabId: string, status: GateStatus, reason: string, error?: string) {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(new CustomEvent('claude-startup-defaults-gate', {
+    detail: { tabId, status, reason, error, at: Date.now() },
+  }));
+}
+
 export function markClaudeStartupDefaultsPending(tabId: string, reason: string) {
   if (!tabId) return;
   const existing = getGate(tabId);
@@ -24,6 +31,7 @@ export function markClaudeStartupDefaultsPending(tabId: string, reason: string) 
     reason,
     waiters: new Set(),
   });
+  emitGateEvent(tabId, 'pending', reason);
 }
 
 export function markClaudeStartupDefaultsReady(tabId: string, reason: string) {
@@ -37,6 +45,7 @@ export function markClaudeStartupDefaultsReady(tabId: string, reason: string) {
     waiters: new Set(),
   });
   for (const resolve of waiters) resolve();
+  emitGateEvent(tabId, 'ready', reason);
 }
 
 export function markClaudeStartupDefaultsFailed(tabId: string, reason: string, error?: unknown) {
@@ -55,6 +64,7 @@ export function markClaudeStartupDefaultsFailed(tabId: string, reason: string, e
   });
   const err = new Error(message || reason || 'Claude startup defaults failed');
   for (const resolve of waiters) resolve(err);
+  emitGateEvent(tabId, 'failed', reason, message);
 }
 
 export function clearClaudeStartupDefaultsGate(tabId: string) {
@@ -65,6 +75,7 @@ export function clearClaudeStartupDefaultsGate(tabId: string) {
     for (const resolve of existing.waiters) resolve(err);
   }
   gates.delete(tabId);
+  emitGateEvent(tabId, 'ready', 'cleared');
 }
 
 export async function waitForClaudeStartupDefaultsReady(tabId: string, timeoutMs = 15000) {

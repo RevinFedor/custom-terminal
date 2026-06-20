@@ -3,7 +3,7 @@ import { markPendingResume } from './pendingResume';
 
 const { ipcRenderer } = window.require('electron');
 
-export type ClaudePtyStatus = 'active' | 'busy' | 'inactive' | 'starting';
+export type ClaudePtyStatus = 'active' | 'busy' | 'inactive' | 'starting' | 'stopping';
 
 export interface ClaudePtyPresence {
   status: ClaudePtyStatus;
@@ -132,6 +132,10 @@ async function resumeClaudePtySessionInner({
     console.warn('[ClaudePtyActions:resume] presence failed tab=' + shortTab(tabId) + ': ' + errorText(e));
   }
 
+  if (presence?.status === 'stopping') {
+    console.log('[ClaudePtyActions:resume] blocked tab=' + shortTab(tabId) + ' status=stopping');
+    return { success: false, sessionId, status: 'stopping', error: 'Claude is stopping' };
+  }
   if (presence?.status === 'active' || presence?.status === 'busy' || presence?.status === 'starting') {
     store.clearInterruptedState(tabId);
     console.log('[ClaudePtyActions:resume] already-running tab=' + shortTab(tabId) + ' status=' + presence.status);
@@ -148,10 +152,11 @@ async function resumeClaudePtySessionInner({
   let repaired = 0;
   if (repair) {
     try {
-      const repairRes = await ipcRenderer.invoke('claude:repair-jsonl-before-resume', { sessionId, cwd });
+      const repairRes = await ipcRenderer.invoke('claude:repair-jsonl-before-resume', { sessionId, cwd, tabId });
       repaired = Number(repairRes?.repaired || 0);
       if (repairRes?.success === false) {
         console.warn('[ClaudePtyActions:resume] JSONL repair reported failure tab=' + shortTab(tabId) + ' sid=' + shortSid(sessionId) + ': ' + (repairRes?.error || 'unknown'));
+        return { success: false, sessionId, error: repairRes?.error || 'JSONL repair failed' };
       } else {
         console.log('[ClaudePtyActions:resume] repair-done tab=' + shortTab(tabId) + ' sid=' + shortSid(sessionId) + ' repaired=' + repaired);
       }
@@ -234,7 +239,7 @@ export async function stopClaudePtyProcess(tabId: string): Promise<any> {
     return existing;
   }
   console.log('[ClaudePtyActions:stop-process] start tab=' + shortTab(tabId));
-  const work = ipcRenderer.invoke('terminal:stop-ai-process', tabId)
+  const work = ipcRenderer.invoke('terminal:stop-ai-process', { tabId, toolType: 'claude' })
     .then((result: any) => {
       console.log('[ClaudePtyActions:stop-process] done tab=' + shortTab(tabId) + ' success=' + !!result?.success + ' error=' + (result?.error || '-'));
       return result;

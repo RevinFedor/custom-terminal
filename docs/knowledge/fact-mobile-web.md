@@ -141,7 +141,7 @@ PTY-Claude и PTY-Codex табы). Четыре неочевидных факт�
 
 App-level settings тоже принадлежат desktop app-state, а не каждому клиенту отдельно. Mobile-web settings sheet читает/пишет `streamerMode` через `/api/app-settings` → renderer bridge `getAppSettings/setAppSettings`; это тот же флаг, который скрывает desktop remote URL chip. Клиент может иметь локальный redaction fallback для собственного host-label, но если он управляет Noted Terminal state, запись должна идти в desktop app-state, иначе phone и desktop начнут расходиться: на телефоне включён privacy, а desktop продолжает светить URL в stream.
 
-Следствие для контракта: всё, что native UI не может честно вывести из файлов на диске, должно приходить по API уже нормализованным. Project icon (`project.icon`), назначенный status marker (`statusId/statusColor`) и форма/размер marker (`statusMarker:{shape,sizePx}`) передаются сервером, потому что palette и настройка живут в desktop `useUIStore`, недоступном iOS. Runtime `sessionStatus` остаётся отдельным полем: это busy/active/inactive/starting процесса, а не user-assigned категория. `starting` — first-class runtime status: вкладка уже поднимает Claude/Codex, но composer ещё не input-ready, поэтому native не должен показывать обычный input или вручную выводить Resume. Клиент может по-своему резервировать место в строке или менять icon layout, но не должен смешивать эти две оси.
+Следствие для контракта: всё, что native UI не может честно вывести из файлов на диске, должно приходить по API уже нормализованным. Project icon (`project.icon`), назначенный status marker (`statusId/statusColor`) и форма/размер marker (`statusMarker:{shape,sizePx}`) передаются сервером, потому что palette и настройка живут в desktop `useUIStore`, недоступном iOS. Runtime `sessionStatus` остаётся отдельным полем: это busy/active/inactive/starting/stopping процесса, а не user-assigned категория. `starting` — first-class runtime status: вкладка уже поднимает Claude/Codex, но composer ещё не input-ready, поэтому native не должен показывать обычный input или вручную выводить Resume. `stopping` — такой же first-class transitional status: stop уже принят, но exit ещё не доказан, поэтому native не должен показывать обычный input, Resume или Rewind до `inactive`. Клиент может по-своему резервировать место в строке или менять icon layout, но не должен смешивать эти две оси.
 
 Для Codex `status` и SSE snapshot должны быть привязаны к актуальной runtime session после resume/start, а не к старому `sessionId`, который остался в layout metadata. Диагностический шрам 2026-06-20: iOS корректно показал `active`, потому что `/status` и SSE сами отдавали `active` для старой session, а desktop startup уже работал с новой Codex-сессией; после failed Rewind тот же API переключился в `starting`. Если native логи показывают такую цепочку, чинить нужно main/API session-binding и readiness, не iOS UI.
 
@@ -286,7 +286,7 @@ POST /api/projects/:id/tab-groups/:gid/status   → assign/clear group session s
 POST /api/projects/:id/tab-groups/:gid/delete   → delete group container, keep tabs
 POST /api/projects/:id/tab-layout               → reorder tabs/groups + group assignments/anchors
 POST /api/terminal-tabs/:tabId/resume                → resume в existing PTY; 200 только после input-ready/ready, timeout = 504 success:false ready:false
-GET  /api/terminal-tabs/:tabId/status                → status строка (inactive/starting/active/busy) + sessionId + commandType
+GET  /api/terminal-tabs/:tabId/status                → status строка (inactive/starting/active/busy/stopping) + sessionId + commandType
 ```
 
 Для Claude/Codex PTY-табов расширение mobile-web — см. `fact-mobile-claude-pty.md`. `/send`, `/stop`, `/interrupt`, `/draft`, `/draft-state` и `/rewind` роутятся через общий scenario layer: backend сам выбирает Claude PTY/Codex PTY runtime, а endpoint остаётся Project Terminal API. Legacy SDK fallback существует только для старых SDK-табов, не как модель нового API.
@@ -300,18 +300,25 @@ GET  /api/terminal-tabs/:tabId/status                → status строка (in
 возвращает `hasDraft=true/false`. Если вкладка скрыта и terminal-компонент не смонтирован,
 ответ должен быть `source:"no-terminal"` / `hasDraft:null`, без `showWorkspace`,
 `setProjectView` или `switchTab`: phone не имеет права переключать проект/вкладку на Mac ради
-проверки draft. Нативный iOS-клиент трактует этот случай как «draft неизвестен потому что
-поверхность не mounted» и может продолжить send без desktop draft-protection; ambiguous error
-или timeout остаются стоп-сигналом. Пользовательский симптом нарушенного контракта: отправка с
-iPhone внезапно переносит Mac в другой проект/таб.
+проверки draft. Для runtime без main-side proof нативный iOS-клиент трактует этот случай как
+«draft неизвестен потому что поверхность не mounted» и может продолжить send без desktop
+draft-protection; ambiguous error или timeout остаются стоп-сигналом. Пользовательский симптом
+нарушенного контракта: отправка с iPhone внезапно переносит Mac в другой проект/таб.
+
+Для Codex это правило после 2026-06-20 стало строже: скрытая вкладка не должна автоматически
+давать `source:"no-terminal"`, пока main-side headless xterm mirror может классифицировать
+composer. Renderer bridge action обязан сначала вызвать общий `codex:get-draft-state`, который
+читает main/headless proof и только потом переходит к mounted renderer. `no-terminal` для
+живого Codex теперь означает «оба proof-канала не смогли дать ответ», а не разрешение молча
+пропустить guard. Это сохраняет background Rewind/History/API без фокуса Mac-вкладки.
 
 `POST /api/terminal-tabs/:tabId/send` следует той же границе совместимости: при реальном
 terminal draft он возвращает `409 terminal_draft_conflict`, но не вызывает
-`grabAgentDraft` и не очищает TUI composer. Если Codex-процесс уже active, sessionId известен,
-а renderer-terminal не смонтирован (`draft-state source:"no-terminal"`), send не должен ждать
-ручной фокус Mac-вкладки: он продолжает PTY/audit-путь без visible draft guard и сверяется
-уже по rollout/JSONL. Для fresh/resume сессий это послабление не действует — startup/readiness
-по-прежнему обязателен, иначе prompt можно отправить в экран запуска или MCP-confirmation.
+`grabAgentDraft` и не очищает TUI composer. Для Codex active/send path сначала пытается получить
+main/headless draft proof; если он доказал empty composer, send продолжает PTY/audit-путь и
+сверяется уже по rollout/JSONL. Если proof неизвестен, это ambiguity/error для клиента, а не
+повод переключать desktop UI или фокусить вкладку на Mac. Для fresh/resume сессий это послабление
+не действует — startup/readiness по-прежнему обязателен, иначе prompt можно отправить в экран запуска или MCP-confirmation.
 Это важно для native iOS и старых project/tab-клиентов: они управляют конкретной вкладкой,
 поэтому источник текста остаётся в терминале до явного действия пользователя. Противоположный контракт только у
 `/api/inbox/runs`: Inbox-клиент владеет своим chat composer, поэтому Noted Terminal
@@ -584,6 +591,8 @@ poll восстановит. Иначе мигающий «Failed» поверх
 - Resume: `setResuming(true)` на клик, HTTP-ответ (~15ms) loader НЕ гасит. Гаснет `useEffect` когда `claudeStatus → active|busy` (SSE snapshot от `Bridge:Fresh`/`ClaudePromptReady`, ~1.1s). Edge: bridge вернул `alreadyRunning:true` (Claude уже жив, stale mobile-статус) → нового snapshot не будет → гасим loader сразу в `onResume` + `setClaudeStatus('active')`, иначе вечный спиннер.
 - Stop: `setStopping(true)` на клик, гаснет когда `claudeStatus → inactive` (SSE snapshot от `clearBridgeTab` после реальной смерти процесса, ~500ms). Edge: `stop` вернул `{stopped:false}` (процесса уже не было) → нет PTY-exit → гасим loader сразу + `setClaudeStatus('inactive')`.
 - `InlineSpinner` — `transform:rotate` (не opacity), UPPERCASE лейбл «RESUMING…»/«STOPPING» — детектируется на видеозаписи (CLAUDE.md::AI-Optimized UI).
+
+После 2026-06-20 Stop loader опирается не только на локальный mobile flag: server публикует `sessionStatus:'stopping'` сразу после `terminal:stop-ai-process`, до финального `inactive`. Это нужно для native iOS, History и внешних API-клиентов, которые не нажимали кнопку в mobile-web и не имеют локального `setStopping(true)`. Любой клиент, увидевший `stopping`, обязан блокировать send/resume/rewind и ждать следующего lifecycle snapshot; `busy:false` при этом не означает готовность composer'а.
 
 **Регрессия-canary:** `[WebSSE:Open/Close]`, `[WebSub:Subscribe/Unsubscribe]`, `[WebBcast:SEND/DROP]` (metadata-only для lifecycle/message), `[MobResume]/[MobStop] click/reply-ok/loader-cleared`, `[MobWS] snapshot/busy/done` (имя `MobWS` историческое, канал теперь SSE). Если loader виснет — grep `loader-cleared` отсутствует → SSE-событие смены статуса не пришло (проверь `[WebBcast:SEND] to=N/N` на сервере и `EventSource` readyState на клиенте).
 

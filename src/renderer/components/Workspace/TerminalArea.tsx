@@ -20,8 +20,17 @@ type SessionStartingState = {
   sessionId?: string | null;
   since: number;
   lastNotReady?: any;
+  holdUntilReady?: boolean;
+  startupPending?: boolean;
   startupFailed?: boolean;
   startupError?: string | null;
+};
+
+type AgentStoppingState = {
+  tabId: string;
+  engine: InterruptedEngine;
+  since: number;
+  reason?: string | null;
 };
 
 type ExternalRunMeta = {
@@ -41,7 +50,7 @@ type ExternalRunMeta = {
 };
 
 const statusColor = (status?: string) => {
-  if (status === 'running' || status === 'sending' || status === 'starting') return '#d97706';
+  if (status === 'running' || status === 'sending' || status === 'starting' || status === 'stopping') return '#d97706';
   if (status === 'done' || status === 'idle') return '#22c55e';
   if (status === 'stopped') return '#94a3b8';
   if (status && status.includes('fail')) return '#ef4444';
@@ -137,7 +146,8 @@ const SessionStartingOverlay = memo(({ state, onDismiss }: { state: SessionStart
   const sessionLabel = state.sessionId ? state.sessionId.slice(0, 8) : null;
   const blocker = state.lastNotReady?.reason || '';
   const isError = state.startupFailed === true || state.lastNotReady?.phase === 'startup-timeout' || String(blocker || '').includes('startup-timeout');
-  const title = isError ? `ERROR RESUMING ${engineLabel}` : `RESUMING ${engineLabel}...`;
+  const actionLabel = state.sessionId ? 'RESUMING' : 'STARTING';
+  const title = isError ? `ERROR ${actionLabel} ${engineLabel}` : `${actionLabel} ${engineLabel}...`;
   const subtitle = isError ? 'Startup did not reach prompt' : `Waiting for prompt${sessionLabel ? ` · ${sessionLabel}` : ''}`;
   const detail = state.startupError || blocker;
 
@@ -242,6 +252,73 @@ const SessionStartingOverlay = memo(({ state, onDismiss }: { state: SessionStart
               style={{ color: isError ? '#ef4444' : '#666' }}
             >
               {detail}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+});
+
+const AgentStoppingOverlay = memo(({ state }: { state: AgentStoppingState }) => {
+  const ref = useRef<HTMLDivElement>(null);
+  const engineLabel = state.engine === 'codex' ? 'CODEX' : 'CLAUDE';
+
+  useEffect(() => {
+    ref.current?.focus();
+  }, [state.tabId, state.since]);
+
+  const block = (event: React.SyntheticEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+  };
+
+  return (
+    <div
+      ref={ref}
+      tabIndex={-1}
+      className="absolute inset-0 z-50 flex items-center justify-center outline-none"
+      onMouseDown={block}
+      onMouseUp={block}
+      onClick={block}
+      onDoubleClick={block}
+      onContextMenu={block}
+      onKeyDown={block}
+      onKeyUp={block}
+      onPaste={block}
+      style={{ pointerEvents: 'auto' }}
+    >
+      <div
+        className="absolute inset-0"
+        style={{
+          background: 'rgba(0,0,0,0.16)',
+          backdropFilter: 'blur(1px)',
+        }}
+      />
+      <div
+        className="relative z-10 flex flex-col items-center gap-4 rounded-xl border border-amber-500/25 bg-[#111116]/90 px-8 py-7 shadow-2xl"
+        style={{
+          minWidth: 320,
+          maxWidth: 'min(420px, calc(100% - 32px))',
+          backdropFilter: 'blur(6px)',
+        }}
+        onMouseDown={block}
+        onDoubleClick={block}
+      >
+        <div
+          className="w-9 h-9 border-2 border-white/20 border-t-[#d97706] rounded-full animate-spin"
+          style={{ boxShadow: '0 0 18px rgba(217,119,6,0.22)' }}
+        />
+        <div className="flex flex-col items-center gap-1 text-center">
+          <div className="text-sm font-bold tracking-widest" style={{ color: '#ffffff' }}>
+            STOPPING {engineLabel}...
+          </div>
+          <div className="text-xs" style={{ color: '#9ca3af' }}>
+            Waiting for process to exit
+          </div>
+          {state.reason ? (
+            <div className="mt-1 text-[10px]" style={{ color: '#6b7280' }}>
+              {state.reason}
             </div>
           ) : null}
         </div>
@@ -420,6 +497,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   const startingProbeSeqRef = useRef(0);
   const dismissedStartingKeysRef = useRef<Set<string>>(new Set());
   const [sessionStarting, setSessionStarting] = useState<SessionStartingState | null>(null);
+  const [agentStopping, setAgentStopping] = useState<AgentStoppingState | null>(null);
 
   const startingDismissKey = useCallback((info: { tabId: string; engine: InterruptedEngine; sessionId?: string | null }) => (
     `${info.tabId}|${info.engine}|${info.sessionId || ''}`
@@ -428,6 +506,39 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   useEffect(() => {
     activeAgentStartingInfoRef.current = activeAgentStartingInfo;
   }, [activeAgentStartingInfo]);
+
+  useEffect(() => {
+    if (!activeTabId || currentView !== 'terminal') {
+      setAgentStopping(null);
+      return;
+    }
+    let cancelled = false;
+    ipcRenderer.invoke('agent:get-stopping-state', activeTabId)
+      .then((state: any) => {
+        if (cancelled) return;
+        if (state?.stopping) {
+          const engine = state.toolType === 'codex' ? 'codex' : 'claude';
+          setAgentStopping((prev) => {
+            if (prev?.tabId === activeTabId && prev.engine === engine) {
+              return { ...prev, reason: state.reason || prev.reason || null };
+            }
+            console.warn('[AgentStoppingOverlay] hydrate tab=' + activeTabId.slice(-12) + ' engine=' + engine + ' reason=' + (state.reason || '-'));
+            return {
+              tabId: activeTabId,
+              engine,
+              since: state.since || Date.now(),
+              reason: state.reason || null,
+            };
+          });
+        } else {
+          setAgentStopping((prev) => prev?.tabId === activeTabId ? null : prev);
+        }
+      })
+      .catch((e: any) => {
+        if (!cancelled) console.warn('[AgentStoppingOverlay] hydrate failed tab=' + activeTabId.slice(-12) + ' error=' + (e?.message || String(e)));
+      });
+    return () => { cancelled = true; };
+  }, [activeTabId, currentView]);
 
   const refreshSessionStarting = useCallback(async (reason: string) => {
     const info = activeAgentStartingInfoRef.current;
@@ -449,6 +560,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
               ...prev,
               sessionId: info.sessionId,
               lastNotReady: presence.lastNotReady,
+              holdUntilReady: prev.holdUntilReady,
+              startupPending: prev.startupPending,
               startupFailed: presence.startupFailed,
               startupError: presence.startupError,
             };
@@ -467,6 +580,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       } else {
         dismissedStartingKeysRef.current.delete(startingDismissKey(info));
         setSessionStarting((prev) => {
+          if (prev?.tabId === info.tabId && (prev.startupFailed || prev.startupPending || prev.holdUntilReady)) return prev;
           if (prev?.tabId === info.tabId) {
             console.warn('[SessionStartingOverlay] hide tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason + ' status=' + presence.status);
           }
@@ -502,14 +616,15 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
         tabId,
         engine: info.engine,
         sessionId: info.sessionId,
+        holdUntilReady: true,
         since: Date.now(),
       });
-      void refreshSessionStarting(reason);
     };
-    const hideFromEvent = (tabId: string, reason: string) => {
+    const hideFromEvent = (tabId: string, reason: string, force = false) => {
       const info = activeAgentStartingInfoRef.current;
       if (!info || info.tabId !== tabId) return;
       setSessionStarting((prev) => {
+        if (!force && prev?.tabId === tabId && (prev.startupFailed || prev.startupPending || prev.holdUntilReady)) return prev;
         if (prev?.tabId === tabId) {
           console.warn('[SessionStartingOverlay] event-hide tab=' + tabId.slice(-12) + ' reason=' + reason);
           return null;
@@ -524,16 +639,86 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
         void refreshSessionStarting('command-started');
       }
     };
-    const onCommandFinished = (_: any, data: { tabId: string }) => hideFromEvent(data.tabId, 'command-finished');
-    const onClaudeReady = (_: any, data: { tabId: string }) => hideFromEvent(data.tabId, 'claude-tui-ready');
-    const onCodexReady = (_: any, data: { tabId: string }) => hideFromEvent(data.tabId, 'codex-tui-ready');
+    const onCommandFinished = (_: any, data: { tabId: string }) => hideFromEvent(data.tabId, 'command-finished', true);
+    const onClaudeReady = (_: any, data: { tabId: string }) => {
+      const info = activeAgentStartingInfoRef.current;
+      if (info?.tabId === data.tabId && info.engine === 'claude') return;
+      hideFromEvent(data.tabId, 'claude-tui-ready');
+    };
+    const onCodexReady = (_: any, data: { tabId: string }) => hideFromEvent(data.tabId, 'codex-tui-ready', true);
     const onClaudeBusy = (_: any, data: { tabId: string; busy: boolean }) => {
-      if (data.busy) hideFromEvent(data.tabId, 'claude-busy');
-      else void refreshSessionStarting('claude-busy-idle');
+      if (!data.busy) return;
     };
     const onCodexBusy = (_: any, data: { tabId: string; busy: boolean }) => {
-      if (data.busy) hideFromEvent(data.tabId, 'codex-busy');
-      else void refreshSessionStarting('codex-busy-idle');
+      if (!data.busy) return;
+    };
+    const onAgentStopping = (_: any, data: {
+      tabId?: string;
+      toolType?: string | null;
+      stopping?: boolean;
+      reason?: string | null;
+      since?: number;
+    }) => {
+      const eventTabId = data?.tabId || '';
+      if (!eventTabId) return;
+      const engine: InterruptedEngine = data.toolType === 'codex' ? 'codex' : 'claude';
+      if (data.stopping) {
+        if (eventTabId !== activeTabId || currentView !== 'terminal') return;
+        setSessionStarting(null);
+        setAgentStopping((prev) => {
+          if (prev?.tabId === eventTabId && prev.engine === engine) {
+            return { ...prev, reason: data.reason || prev.reason || null };
+          }
+          console.warn('[AgentStoppingOverlay] show tab=' + eventTabId.slice(-12) + ' engine=' + engine + ' reason=' + (data.reason || '-'));
+          return {
+            tabId: eventTabId,
+            engine,
+            since: data.since || Date.now(),
+            reason: data.reason || null,
+          };
+        });
+      } else {
+        setAgentStopping((prev) => {
+          if (prev?.tabId === eventTabId) {
+            console.warn('[AgentStoppingOverlay] hide tab=' + eventTabId.slice(-12) + ' reason=' + (data.reason || '-'));
+            return null;
+          }
+          return prev;
+        });
+      }
+    };
+    const onClaudeStartupGate = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        tabId?: string;
+        status?: string;
+        reason?: string;
+        error?: string | null;
+      }>).detail || {};
+      const gateTabId = detail.tabId || '';
+      const info = activeAgentStartingInfoRef.current;
+      if (!gateTabId || !info || info.tabId !== gateTabId || info.engine !== 'claude' || currentView !== 'terminal') return;
+      if (detail.status === 'ready') {
+        setSessionStarting((prev) => {
+          if (prev?.tabId === gateTabId) console.warn('[SessionStartingOverlay] gate-ready tab=' + gateTabId.slice(-12) + ' reason=' + (detail.reason || '-'));
+          return prev?.tabId === gateTabId ? null : prev;
+        });
+        return;
+      }
+      if (detail.status === 'pending' || detail.status === 'failed') {
+        dismissedStartingKeysRef.current.delete(startingDismissKey(info));
+        setSessionStarting((prev) => {
+          console.warn('[SessionStartingOverlay] gate-' + detail.status + ' tab=' + gateTabId.slice(-12) + ' reason=' + (detail.reason || '-') + ' error=' + (detail.error || '-'));
+          return {
+            tabId: gateTabId,
+            engine: 'claude',
+            sessionId: info.sessionId,
+            since: prev?.tabId === gateTabId ? prev.since : Date.now(),
+            startupPending: detail.status === 'pending',
+            startupFailed: detail.status === 'failed',
+            startupError: detail.status === 'failed' ? (detail.error || detail.reason || 'Claude startup defaults failed') : null,
+          };
+        });
+      }
     };
 
     ipcRenderer.on('terminal:command-started', onCommandStarted);
@@ -542,6 +727,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     ipcRenderer.on('codex:tui-ready', onCodexReady);
     ipcRenderer.on('claude:busy-state', onClaudeBusy);
     ipcRenderer.on('codex:busy-state', onCodexBusy);
+    ipcRenderer.on('agent:stopping-state', onAgentStopping);
+    window.addEventListener('claude-startup-defaults-gate', onClaudeStartupGate);
     return () => {
       ipcRenderer.removeListener('terminal:command-started', onCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', onCommandFinished);
@@ -549,8 +736,10 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       ipcRenderer.removeListener('codex:tui-ready', onCodexReady);
       ipcRenderer.removeListener('claude:busy-state', onClaudeBusy);
       ipcRenderer.removeListener('codex:busy-state', onCodexBusy);
+      ipcRenderer.removeListener('agent:stopping-state', onAgentStopping);
+      window.removeEventListener('claude-startup-defaults-gate', onClaudeStartupGate);
     };
-  }, [currentView, refreshSessionStarting, startingDismissKey]);
+  }, [activeTabId, currentView, refreshSessionStarting, startingDismissKey]);
 
   const handleDismissSessionStarting = useCallback(() => {
     const current = sessionStarting;
@@ -601,9 +790,17 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
   }, [activeTabInterruptedKey]);
   const activeTabIdForOverlay = activeTabId;
   const isRestoring = useWorkspaceStore((s) => s.isRestoring);
-  const showInterruptedOverlay = !!activeTabInterruptedEngine && !!activeTabSessionId && currentView === 'terminal' && !isRestoring;
+  const showAgentStoppingOverlay = !!agentStopping
+    && currentView === 'terminal'
+    && activeTabIdForOverlay === agentStopping.tabId;
+  const showInterruptedOverlay = !!activeTabInterruptedEngine
+    && !!activeTabSessionId
+    && currentView === 'terminal'
+    && !isRestoring
+    && !showAgentStoppingOverlay;
   const showSessionStartingOverlay = !!sessionStarting
     && currentView === 'terminal'
+    && !showAgentStoppingOverlay
     && !showInterruptedOverlay
     && activeTabIdForOverlay === sessionStarting.tabId;
 
@@ -805,6 +1002,15 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
 
       {/* Local per-tab resume/start overlay: terminal keeps running underneath,
           but user mouse/keyboard input is blocked until the agent prompt is ready. */}
+      <AnimatePresence>
+        {showAgentStoppingOverlay && agentStopping && (
+          <AgentStoppingOverlay
+            key={`${agentStopping.tabId}:${agentStopping.since}`}
+            state={agentStopping}
+          />
+        )}
+      </AnimatePresence>
+
       <AnimatePresence>
         {showSessionStartingOverlay && sessionStarting && (
           <SessionStartingOverlay

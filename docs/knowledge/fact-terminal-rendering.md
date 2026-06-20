@@ -244,6 +244,12 @@ if (xtermInstance.current) {
 - **Результат:** В Ink-based CLI (Gemini) это намертво ломает позицию курсора. Курсор остается на строке ввода, но Ink продолжает считать, что он в другом месте, что приводит к "фантомным" строкам при каждом обновлении TUI.
 - **Вывод:** Используйте только `_renderService.clear()` и `refresh()`. Это не трогает логические размеры терминала и курсор, но принудительно обновляет визуальный слой Canvas.
 
+### 11.3. Renderer canvas не source of truth для background automation
+
+Canvas/xterm в renderer отвечает за видимый terminal UI; он может быть hidden, not mounted, stale после view switch или сброшен dev-HMR. Поэтому фоновые сценарии не должны читать composer/status только из renderer registry. Для API/History/Rewind main-side headless xterm mirror является proof-слоем: он хранит xterm buffer/cell-style без зависимости от активной вкладки, а renderer snapshot используется только как fallback или визуальная диагностика.
+
+Если фиксим баг с `no-terminal`, нельзя чинить его отказом от background-flow. Правильный вопрос: какой source of truth доступен в main для того же PTY stream? Этот шрам проявился на Codex Rewind/History/iOS, но класс общий для любой automation, которая должна работать без фокуса Mac-вкладки.
+
 ---
 
 ## 19. Idempotent Resize (SIGWINCH Storm Protection)

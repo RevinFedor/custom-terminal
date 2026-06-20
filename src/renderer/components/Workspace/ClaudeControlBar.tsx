@@ -1192,6 +1192,7 @@ export default function ClaudeControlBar({
       store.setTabCommandType(tabId, 'claude');
       store.markAiLaunchAutoTitle(tabId, 'claude');
       ipcRenderer.send('claude:run-command', { tabId, command: 'claude' });
+      ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude' });
     }
   };
 
@@ -1213,6 +1214,7 @@ export default function ClaudeControlBar({
       // вызвать markPendingResume. См. fix-bridge-stale-takeover.md layer 4/5.
       if (claudeSessionId) markPendingResume(tabId, claudeSessionId);
       ipcRenderer.send('claude:run-command', { tabId, command: 'claude-c', sessionId: claudeSessionId });
+      ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude', sessionId: claudeSessionId });
     } else if (sessionType === 'gemini') {
       store.setTabCommandType(tabId, 'gemini');
       terminalRegistry.get(tabId)?.scrollToBottom();

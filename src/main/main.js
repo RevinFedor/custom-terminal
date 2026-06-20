@@ -11,6 +11,12 @@ const net = require('net');
 const readline = require('readline');
 const { performance: nodePerformance, monitorEventLoopDelay } = require('node:perf_hooks');
 const { spawn } = require('child_process');
+let HeadlessXTerminal = null;
+try {
+  ({ Terminal: HeadlessXTerminal } = require('@xterm/headless'));
+} catch (err) {
+  console.warn('[HeadlessXterm] unavailable: ' + (err?.message || String(err)));
+}
 const isInboxProjectId = (projectId) => projectId === '__noted_inbox__';
 
 // Load .env file (works in both dev and packaged builds).
@@ -604,6 +610,517 @@ const codexFinishDebounceTimers = new Map(); // tabId -> timeout; suppress shell
 const terminalInitialCommand = new Map(); // tabId -> initialCommand string (for restart)
 const terminalOutputBuffer = new Map();  // tabId -> { lines: string[], maxLines: 500 }
 const TERMINAL_OUTPUT_MAX_LINES = 500;
+const terminalHeadlessMirrors = new Map(); // tabId -> { terminal, pending, writeSeq, flushedSeq, failed }
+const HEADLESS_XTERM_SCROLLBACK = 10000;
+const HEADLESS_XTERM_FLUSH_TIMEOUT_MS = 900;
+const CODEX_NON_DRAFT_LINE_RE = /(OpenAI Codex|model:|directory:|permissions:|Use \/skills|Full Access|Context \d+%|weekly \d+%|Starting MCP|esc to interrupt|Select Model|Tip:|Model changed|^╭|^╰|^│)/i;
+const CODEX_EMPTY_COMPOSER_HINT_RE = /Use \/skills to list available skills/i;
+
+function createHeadlessTerminalMirror(tabId, cols = 80, rows = 24) {
+  if (!tabId || !HeadlessXTerminal) return null;
+  const existing = terminalHeadlessMirrors.get(tabId);
+  if (existing && !existing.failed) return existing;
+  try {
+    const safeCols = Math.max(2, Number(cols) || 80);
+    const safeRows = Math.max(2, Number(rows) || 24);
+    const terminal = new HeadlessXTerminal({
+      cols: safeCols,
+      rows: safeRows,
+      scrollback: HEADLESS_XTERM_SCROLLBACK,
+      allowProposedApi: true,
+    });
+    const state = {
+      terminal,
+      pending: Promise.resolve(),
+      writeSeq: 0,
+      flushedSeq: 0,
+      failed: false,
+      lastErrorAt: 0,
+      cols: safeCols,
+      rows: safeRows,
+    };
+    terminalHeadlessMirrors.set(tabId, state);
+    console.log('[HeadlessXterm] create tab=' + String(tabId).slice(-12) + ' cols=' + safeCols + ' rows=' + safeRows);
+    return state;
+  } catch (err) {
+    console.warn('[HeadlessXterm] create failed tab=' + String(tabId).slice(-12) + ' ' + (err?.message || String(err)));
+    terminalHeadlessMirrors.delete(tabId);
+    return null;
+  }
+}
+
+function getHeadlessTerminalMirror(tabId) {
+  const state = terminalHeadlessMirrors.get(tabId);
+  if (!state || state.failed) return null;
+  return state;
+}
+
+function logHeadlessTerminalMirrorError(tabId, state, reason, err) {
+  const now = Date.now();
+  if (state && now - (state.lastErrorAt || 0) < 5000) return;
+  if (state) state.lastErrorAt = now;
+  console.warn('[HeadlessXterm] ' + reason + ' tab=' + String(tabId).slice(-12) + ' ' + (err?.message || String(err)));
+}
+
+function writeHeadlessTerminalMirror(tabId, data) {
+  if (!data) return;
+  const state = getHeadlessTerminalMirror(tabId);
+  if (!state) return;
+  const seq = ++state.writeSeq;
+  try {
+    state.pending = new Promise((resolve) => {
+      try {
+        state.terminal.write(String(data), () => {
+          state.flushedSeq = Math.max(state.flushedSeq || 0, seq);
+          resolve();
+        });
+      } catch (err) {
+        state.failed = true;
+        logHeadlessTerminalMirrorError(tabId, state, 'write failed', err);
+        resolve();
+      }
+    });
+  } catch (err) {
+    state.failed = true;
+    logHeadlessTerminalMirrorError(tabId, state, 'write setup failed', err);
+  }
+}
+
+async function flushHeadlessTerminalMirror(tabId, timeoutMs = HEADLESS_XTERM_FLUSH_TIMEOUT_MS) {
+  const state = getHeadlessTerminalMirror(tabId);
+  if (!state) return { success: false, error: 'no-headless-mirror' };
+  const pending = state.pending || Promise.resolve();
+  let timedOut = false;
+  await Promise.race([
+    pending.catch((err) => {
+      state.failed = true;
+      logHeadlessTerminalMirrorError(tabId, state, 'flush failed', err);
+    }),
+    new Promise((resolve) => setTimeout(() => {
+      timedOut = true;
+      resolve();
+    }, timeoutMs)),
+  ]);
+  if (timedOut) {
+    return {
+      success: false,
+      error: 'headless-flush-timeout',
+      writeSeq: state.writeSeq,
+      flushedSeq: state.flushedSeq,
+    };
+  }
+  return { success: true };
+}
+
+function resizeHeadlessTerminalMirror(tabId, cols, rows) {
+  const state = getHeadlessTerminalMirror(tabId) || createHeadlessTerminalMirror(tabId, cols, rows);
+  if (!state) return;
+  const safeCols = Math.max(2, Number(cols) || state.cols || 80);
+  const safeRows = Math.max(2, Number(rows) || state.rows || 24);
+  if (state.cols === safeCols && state.rows === safeRows) return;
+  try {
+    state.terminal.resize(safeCols, safeRows);
+    state.cols = safeCols;
+    state.rows = safeRows;
+  } catch (err) {
+    state.failed = true;
+    logHeadlessTerminalMirrorError(tabId, state, 'resize failed', err);
+  }
+}
+
+function disposeHeadlessTerminalMirror(tabId, reason = 'dispose') {
+  const state = terminalHeadlessMirrors.get(tabId);
+  if (!state) return;
+  terminalHeadlessMirrors.delete(tabId);
+  try { state.terminal.dispose?.(); } catch {}
+  console.log('[HeadlessXterm] dispose tab=' + String(tabId).slice(-12) + ' reason=' + reason);
+}
+
+function describeXtermCellStyle(cell) {
+  if (!cell) return 'empty';
+  const read = (name) => {
+    const value = cell?.[name];
+    return typeof value === 'function' ? value.call(cell) : value;
+  };
+  const parts = [];
+  const fgMode = read('getFgColorMode');
+  const fgColor = read('getFgColor');
+  const bgMode = read('getBgColorMode');
+  const bgColor = read('getBgColor');
+  parts.push('fg=' + (fgMode ?? '-') + ':' + (fgColor ?? '-'));
+  parts.push('bg=' + (bgMode ?? '-') + ':' + (bgColor ?? '-'));
+  if (read('isInverse')) parts.push('inverse');
+  if (read('isBold')) parts.push('bold');
+  if (read('isDim')) parts.push('dim');
+  if (read('isItalic')) parts.push('italic');
+  if (read('isUnderline')) parts.push('underline');
+  if (read('isBlink')) parts.push('blink');
+  if (read('isInvisible')) parts.push('invisible');
+  return parts.join(',');
+}
+
+function xtermStyleHasNonDefaultBg(style) {
+  const match = /bg=([^,\s]+)/.exec(String(style || ''));
+  if (!match) return false;
+  const bg = match[1];
+  return bg !== '0:-1' && bg !== '-:-' && bg !== '-:-1' && bg !== 'none';
+}
+
+function xtermStyleHasNonDefaultFg(style) {
+  const match = /fg=([^,\s]+)/.exec(String(style || ''));
+  if (!match) return false;
+  const fg = match[1];
+  return fg !== '0:-1' && fg !== '-:-' && fg !== '-:-1' && fg !== 'none';
+}
+
+function summarizeXtermLineStyles(line) {
+  if (!line) return { styles: [], firstTextStyle: 'none', hasInverse: false, hasNonDefaultBg: false, hasNonDefaultFg: false };
+  const counts = new Map();
+  let firstTextStyle = 'none';
+  let hasInverse = false;
+  let hasNonDefaultBg = false;
+  let hasNonDefaultFg = false;
+  for (let x = 0; x < line.length; x++) {
+    const cell = line.getCell(x);
+    if (!cell || cell.getWidth?.() === 0) continue;
+    const ch = cell.getChars?.() || ' ';
+    if (!String(ch).trim()) continue;
+    const style = describeXtermCellStyle(cell);
+    if (firstTextStyle === 'none') firstTextStyle = style;
+    if (style.includes('inverse')) hasInverse = true;
+    if (xtermStyleHasNonDefaultBg(style)) hasNonDefaultBg = true;
+    if (xtermStyleHasNonDefaultFg(style)) hasNonDefaultFg = true;
+    counts.set(style, (counts.get(style) || 0) + 1);
+  }
+  const styles = Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([style, count]) => style + ' x' + count);
+  return { styles, firstTextStyle, hasInverse, hasNonDefaultBg, hasNonDefaultFg };
+}
+
+function getLogicalLineSnapshotAt(buf, row) {
+  if (!buf || row < 0 || row >= buf.length) return { text: '', cells: [] };
+  let start = row;
+  let line = buf.getLine(start);
+  while (line?.isWrapped && start > 0) {
+    start -= 1;
+    line = buf.getLine(start);
+  }
+
+  const cells = [];
+  for (let i = start; i < buf.length; i++) {
+    const current = buf.getLine(i);
+    if (!current) break;
+
+    for (let x = 0; x < current.length; x++) {
+      const cell = current.getCell(x);
+      if (!cell || cell.getWidth?.() === 0) continue;
+      const ch = cell.getChars?.() || ' ';
+      cells.push({
+        ch: ch || ' ',
+        dim: !!cell.isDim?.(),
+      });
+    }
+    const next = buf.getLine(i + 1);
+    if (!next?.isWrapped) break;
+  }
+
+  while (cells.length > 0 && !String(cells[cells.length - 1].ch || '').trim()) cells.pop();
+  return { text: cells.map((cell) => cell.ch).join(''), cells };
+}
+
+function extractCodexDraftFromLine(snapshotOrLine) {
+  const snapshot = typeof snapshotOrLine === 'string'
+    ? { text: snapshotOrLine, cells: [] }
+    : (snapshotOrLine || { text: '', cells: [] });
+  const normalized = String(snapshot.text || '')
+    .replace(/\u00a0/g, ' ')
+    .trimEnd();
+  const normalizedClean = normalized.replace(/[▌█]/g, '');
+  if (!normalizedClean.trim()) return { hasDraft: false, preview: '' };
+
+  const promptIdx = Math.max(normalized.lastIndexOf('›'), normalized.lastIndexOf('❯'));
+  if (promptIdx >= 0) {
+    const afterPrompt = normalized.slice(promptIdx + 1).replace(/[▌█]/g, '').trim();
+    if (!afterPrompt) return { hasDraft: false, preview: '' };
+    const afterPromptCells = (snapshot.cells || [])
+      .slice(promptIdx + 1)
+      .filter((cell) => String(cell.ch || '').trim() && cell.ch !== '▌' && cell.ch !== '█');
+    if (afterPromptCells.length > 0 && afterPromptCells.every((cell) => cell.dim)) {
+      return { hasDraft: false, preview: afterPrompt.slice(0, 120), sourceSuffix: ':dim-hint' };
+    }
+    if (CODEX_EMPTY_COMPOSER_HINT_RE.test(afterPrompt)) {
+      return { hasDraft: false, preview: afterPrompt.slice(0, 120), sourceSuffix: ':idle-hint' };
+    }
+    if (CODEX_NON_DRAFT_LINE_RE.test(afterPrompt)) return { hasDraft: null, preview: afterPrompt.slice(0, 120) };
+    return { hasDraft: true, preview: afterPrompt.slice(0, 120) };
+  }
+
+  const nonBlankCells = (snapshot.cells || [])
+    .filter((cell) => String(cell.ch || '').trim() && cell.ch !== '▌' && cell.ch !== '█');
+  if (nonBlankCells.length > 0 && nonBlankCells.every((cell) => cell.dim)) {
+    return { hasDraft: false, preview: normalizedClean.trim().slice(0, 120), sourceSuffix: ':dim-hint' };
+  }
+  if (CODEX_EMPTY_COMPOSER_HINT_RE.test(normalizedClean.trim())) {
+    return { hasDraft: false, preview: normalizedClean.trim().slice(0, 120), sourceSuffix: ':idle-hint' };
+  }
+  if (CODEX_NON_DRAFT_LINE_RE.test(normalizedClean.trim())) {
+    return { hasDraft: null, preview: normalizedClean.trim().slice(0, 120) };
+  }
+
+  return { hasDraft: null, preview: normalizedClean.trim().slice(0, 120) };
+}
+
+function extractCodexDraftAfterEmptyPrompt(buf, promptRow) {
+  if (!buf || promptRow < 0 || promptRow >= buf.length) return null;
+  const end = Math.min(buf.length, promptRow + 18);
+  for (let row = promptRow + 1; row < end; row++) {
+    const line = buf.getLine(row);
+    if (!line) break;
+
+    const snapshot = getLogicalLineSnapshotAt(buf, row);
+    const raw = String(line.translateToString?.(true) || '');
+    const normalized = (String(snapshot.text || '') || raw)
+      .replace(/\u00a0/g, ' ')
+      .replace(/[▌█]/g, '')
+      .trimEnd();
+    const rawNormalized = raw
+      .replace(/\u00a0/g, ' ')
+      .replace(/[▌█]/g, '')
+      .trimEnd();
+    const withoutBorder = normalized.replace(/^\s*[│┃║]\s?/, '');
+    const rawWithoutBorder = rawNormalized.replace(/^\s*[│┃║]\s?/, '');
+    const candidate = withoutBorder.trim();
+    const rawCandidate = rawWithoutBorder.trim();
+    const effectiveCandidate = candidate || rawCandidate;
+    if (!effectiveCandidate) continue;
+    if (/^[╭╰]/.test(effectiveCandidate)) return null;
+
+    const candidateCells = (snapshot.cells || [])
+      .filter((cell) => String(cell.ch || '').trim() && cell.ch !== '▌' && cell.ch !== '█' && !/[│┃║]/.test(cell.ch));
+    if (candidateCells.length > 0 && candidateCells.every((cell) => cell.dim)) return null;
+    if (CODEX_EMPTY_COMPOSER_HINT_RE.test(effectiveCandidate)) return null;
+    if (CODEX_NON_DRAFT_LINE_RE.test(effectiveCandidate)) return null;
+
+    return { hasDraft: true, preview: effectiveCandidate.slice(0, 120), sourceSuffix: ':multiline-draft-row-' + row };
+  }
+  return null;
+}
+
+function describeCodexDraftProbeRow(buf, row) {
+  if (!buf || row < 0 || row >= buf.length) return 'row=' + row + ':out-of-range';
+  const raw = String(buf.getLine(row)?.translateToString?.(true) || '').replace(/\s+/g, ' ').slice(0, 140);
+  const snapshot = getLogicalLineSnapshotAt(buf, row);
+  const parsed = extractCodexDraftFromLine(snapshot);
+  const text = String(snapshot.text || '').replace(/\s+/g, ' ').slice(0, 180);
+  const hasPrompt = /[›❯]/.test(String(snapshot.text || ''));
+  return 'row=' + row + ':prompt=' + hasPrompt + ':parsed=' + parsed.hasDraft + ':suffix=' + (parsed.sourceSuffix || '') + ':raw=' + JSON.stringify(raw) + ':logical=' + JSON.stringify(text);
+}
+
+function buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, reason) {
+  const tailStart = Math.max(0, buf.length - Math.max(12, Math.min(terminal.rows || 12, 32)));
+  const sampleRows = Array.from(new Set([
+    ...cursorRows,
+    ...Array.from({ length: Math.max(0, visibleEnd - visibleStart) }, (_, i) => visibleStart + i),
+    ...Array.from({ length: Math.max(0, buf.length - tailStart) }, (_, i) => tailStart + i),
+  ])).filter((row) => row >= 0 && row < buf.length);
+  return [
+    'reason=' + reason,
+    'rows=' + terminal.rows,
+    'cols=' + terminal.cols,
+    'bufLength=' + buf.length,
+    'baseY=' + buf.baseY,
+    'cursorY=' + buf.cursorY,
+    'viewportY=' + buf.viewportY,
+    'visible=' + visibleStart + '-' + visibleEnd,
+    'tail=' + tailStart + '-' + buf.length,
+    'cursorRows=' + (cursorRows.join(',') || 'none'),
+    'samples=[' + sampleRows.map((row) => describeCodexDraftProbeRow(buf, row)).join(' | ') + ']',
+  ].join(' ');
+}
+
+function getHeadlessCodexDraftState(tabId, reason = 'headless-draft') {
+  const state = getHeadlessTerminalMirror(tabId);
+  if (!state) {
+    return { success: false, hasDraft: null, preview: '', source: 'no-headless-mirror', debug: 'reason=no-headless-mirror:' + reason };
+  }
+  try {
+    const terminal = state.terminal;
+    const buf = terminal.buffer.active;
+    const visibleEnd = Math.min(buf.viewportY + terminal.rows, buf.length);
+    const visibleStart = Math.max(buf.viewportY, visibleEnd - 10);
+    const cursorRows = Array.from(new Set([
+      buf.baseY + buf.cursorY,
+      buf.cursorY,
+    ])).filter((row) => row >= 0 && row < buf.length);
+    const withSource = (parsed, source) => ({
+      ...parsed,
+      success: true,
+      source: 'headless-main:' + source,
+    });
+
+    for (const row of cursorRows) {
+      const parsed = extractCodexDraftFromLine(getLogicalLineSnapshotAt(buf, row));
+      if (parsed.hasDraft !== null) {
+        const multilineDraft = parsed.hasDraft === false && !parsed.preview
+          ? extractCodexDraftAfterEmptyPrompt(buf, row)
+          : null;
+        if (multilineDraft) return withSource(multilineDraft, 'cursor:' + row + multilineDraft.sourceSuffix);
+        const debug = parsed.hasDraft === false && !parsed.preview
+          ? buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'cursor-empty-false')
+          : undefined;
+        return withSource({ ...parsed, debug }, 'cursor:' + row + (parsed.sourceSuffix || ''));
+      }
+    }
+
+    for (let row = visibleEnd - 1; row >= visibleStart; row--) {
+      const snapshot = getLogicalLineSnapshotAt(buf, row);
+      if (!/[›❯]/.test(snapshot.text)) continue;
+      const parsed = extractCodexDraftFromLine(snapshot);
+      if (parsed.hasDraft !== null) {
+        const multilineDraft = parsed.hasDraft === false && !parsed.preview
+          ? extractCodexDraftAfterEmptyPrompt(buf, row)
+          : null;
+        if (multilineDraft) return withSource(multilineDraft, 'viewport:' + row + multilineDraft.sourceSuffix);
+        const debug = parsed.hasDraft === false && !parsed.preview
+          ? buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'viewport-empty-false')
+          : undefined;
+        return withSource({ ...parsed, debug }, 'viewport:' + row + (parsed.sourceSuffix || ''));
+      }
+    }
+
+    const tailStart = Math.max(0, buf.length - Math.max(12, Math.min(terminal.rows || 12, 32)));
+    for (let row = buf.length - 1; row >= tailStart; row--) {
+      if (row >= visibleStart && row < visibleEnd) continue;
+      if (cursorRows.includes(row)) continue;
+      const snapshot = getLogicalLineSnapshotAt(buf, row);
+      if (!/[›❯]/.test(snapshot.text)) continue;
+      const parsed = extractCodexDraftFromLine(snapshot);
+      if (parsed.hasDraft !== null) {
+        const multilineDraft = parsed.hasDraft === false && !parsed.preview
+          ? extractCodexDraftAfterEmptyPrompt(buf, row)
+          : null;
+        if (multilineDraft) return withSource(multilineDraft, 'tail:' + row + multilineDraft.sourceSuffix);
+        const debug = parsed.hasDraft === false && !parsed.preview
+          ? buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'tail-empty-false')
+          : undefined;
+        return withSource({ ...parsed, debug }, 'tail:' + row + (parsed.sourceSuffix || ''));
+      }
+    }
+
+    const debug = buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'no-definitive-codex-composer-row');
+    return { success: true, hasDraft: null, preview: '', source: 'headless-main:unknown', debug };
+  } catch (err) {
+    state.failed = true;
+    logHeadlessTerminalMirrorError(tabId, state, 'draft probe failed', err);
+    return { success: false, hasDraft: null, preview: '', source: 'headless-main:error', error: err?.message || String(err), debug: 'reason=exception:' + reason };
+  }
+}
+
+async function waitForHeadlessCodexDraftState(tabId, expected, timeoutMs = 900, reason = 'headless-draft-wait') {
+  const state = getHeadlessTerminalMirror(tabId);
+  if (!state) {
+    return { success: false, hasDraft: null, preview: '', source: 'no-headless-mirror', debug: 'reason=no-headless-mirror:' + reason };
+  }
+  let checks = 0;
+  const read = () => {
+    checks += 1;
+    return getHeadlessCodexDraftState(tabId, reason);
+  };
+  const first = read();
+  if (first.hasDraft === expected) {
+    return { ...first, success: true, timedOut: false, checks };
+  }
+
+  return await new Promise((resolve) => {
+    let settled = false;
+    let sub = null;
+    let timer = null;
+    const finish = (draftState, timedOut) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      try { sub?.dispose?.(); } catch {}
+      resolve({ ...draftState, success: true, timedOut, checks });
+    };
+    const check = () => {
+      const draftState = read();
+      if (draftState.hasDraft === expected) finish(draftState, false);
+    };
+    const onWriteParsed = state.terminal?.onWriteParsed;
+    if (typeof onWriteParsed === 'function') {
+      sub = onWriteParsed.call(state.terminal, check);
+    }
+    timer = setTimeout(() => finish(read(), true), timeoutMs);
+  });
+}
+
+function getHeadlessVisibleBufferSnapshot(tabId, reason) {
+  const state = getHeadlessTerminalMirror(tabId);
+  if (!state) return { success: false, error: 'no-headless-mirror', tabId, reason, source: 'headless-main' };
+  try {
+    const terminal = state.terminal;
+    const buf = terminal.buffer.active;
+    const startLine = buf.viewportY;
+    const endLine = Math.min(startLine + terminal.rows, buf.length);
+    const lines = [];
+    let codexActivePrompt = null;
+    for (let i = startLine; i < endLine; i++) {
+      const line = buf.getLine(i);
+      if (!line) continue;
+      const text = line.translateToString(true);
+      const isPromptLine = /[›❯]/.test(text);
+      const row = {
+        row: i,
+        text,
+        wrapped: !!line.isWrapped,
+      };
+      if (String(text || '').trim()) {
+        const summary = summarizeXtermLineStyles(line);
+        row.firstTextStyle = summary.firstTextStyle;
+        row.styles = summary.styles;
+        row.hasInverse = summary.hasInverse;
+        row.hasNonDefaultBg = summary.hasNonDefaultBg;
+        row.hasNonDefaultFg = summary.hasNonDefaultFg;
+        row.activeByInverse = isPromptLine && summary.hasInverse;
+        if (isPromptLine && summary.hasInverse) {
+          const logical = getLogicalLineSnapshotAt(buf, i);
+          codexActivePrompt = {
+            row: i,
+            text: logical.text || text,
+            firstTextStyle: summary.firstTextStyle,
+            styles: summary.styles,
+            hasInverse: summary.hasInverse,
+            hasNonDefaultBg: summary.hasNonDefaultBg,
+          };
+        }
+      }
+      lines.push(row);
+    }
+    return {
+      success: true,
+      source: 'headless-main',
+      tabId,
+      reason,
+      rows: terminal.rows,
+      cols: terminal.cols,
+      baseY: buf.baseY,
+      viewportY: buf.viewportY,
+      cursorX: buf.cursorX,
+      cursorY: buf.cursorY,
+      bufferType: buf.type,
+      lines,
+      codexActivePrompt,
+      writeSeq: state.writeSeq,
+      flushedSeq: state.flushedSeq,
+    };
+  } catch (err) {
+    state.failed = true;
+    logHeadlessTerminalMirrorError(tabId, state, 'snapshot failed', err);
+    return { success: false, error: err?.message || String(err), tabId, reason, source: 'headless-main' };
+  }
+}
 // Claude Handshake: prompt injection with debounce (thinking handled by alwaysThinkingEnabled)
 // States: 'WAITING_PROMPT' -> 'DEBOUNCE_PROMPT' -> send prompt -> done
 const claudeState = new Map(); // tabId -> state string | null
@@ -828,6 +1345,12 @@ function computeActiveLoaders() {
     };
   };
 
+  for (const [tabId, state] of aiStoppingTabs) {
+    if (seen.has(tabId)) continue;
+    loaders.push({ tabId, kind: state.toolType || 'agent', status: 'stopping', ...labelFor(tabId) });
+    seen.add(tabId);
+  }
+
   // 1) PTY Claude. bridgeKnownSessions = "CLI alive in this tab" (persists until
   //    terminal killed). Skip if the PTY is already gone — that mirrors
   //    get-presence returning 'inactive' (no loader) for a stale bridge entry.
@@ -921,7 +1444,7 @@ function computeProjectActivity() {
       item = { projectId, count: 0, streaming: false, tabs: [] };
       byProject.set(projectId, item);
     }
-    const runtimeStatus = busy ? 'busy' : (status || 'active');
+    const runtimeStatus = status === 'stopping' ? 'stopping' : (busy ? 'busy' : (status || 'active'));
     if (!seenTabs.has(tabId)) {
       item.count += 1;
       seenTabs.add(tabId);
@@ -929,12 +1452,20 @@ function computeProjectActivity() {
     } else if (busy) {
       const existing = item.tabs.find((t) => t.tabId === tabId);
       if (existing) {
-        existing.status = 'busy';
+        existing.status = status === 'stopping' ? 'stopping' : 'busy';
         existing.streaming = true;
       }
     }
     if (busy) item.streaming = true;
   };
+
+  for (const [tabId] of aiStoppingTabs) {
+    mark(tabId, {
+      live: terminals.has(tabId),
+      busy: true,
+      status: 'stopping',
+    });
+  }
 
   for (const tabId of bridgeKnownSessions.keys()) {
     const busy = claudeTurnBusy.get(tabId) === true ||
@@ -1155,6 +1686,31 @@ function hasClaudePromptGlyph(text) {
     String(text || '').includes('\u276F') ||      // ❯
     String(text || '').includes('\u203A') ||      // ›
     String(text || '').includes('\u2570');        // ╰
+}
+
+function hasClaudeComposerPromptGlyph(text) {
+  return String(text || '').includes('\u23F5') || // ⏵
+    String(text || '').includes('\u2570');        // ╰
+}
+
+function hasClaudeAsciiComposerPrompt(text) {
+  const clean = stripVTControlCharacters(String(text || ''))
+    .replace(/\u00a0/g, ' ');
+  const lines = clean
+    .split(/[\r\n]+/)
+    .map(line => line.trim())
+    .filter(Boolean);
+  return lines.slice(-8).some(line => /^>\s*(?:$|\S)/.test(line));
+}
+
+function looksLikeClaudeRewindMenuText(text) {
+  const normalized = stripVTControlCharacters(String(text || ''))
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!normalized) return false;
+  return /(Restore\s+and\s+fork|Stay\s+at\s+current\s+position|Enter\s+to\s+continue|Esc\s+to\s+cancel|Rewind\s+conversation|Do\s+nothing)/i.test(normalized)
+    && /([●❯›]\s*\S|↑\s*\d+\s*more\s*above|↓\s*\d+\s*more\s*below)/i.test(normalized);
 }
 
 function armPromptBoundaryForSubmittedCommand(tabId, reason = 'command-submit') {
@@ -1490,13 +2046,159 @@ startProxyOnPort(4001);
 const bridgeDir = path.join(os.homedir(), '.claude', 'bridge');
 const bridgeKnownSessions = new Map(); // tabId → sessionId
 const codexKnownSessions = new Map(); // tabId → sessionId; Codex TUI alive in this PTY
+const aiStoppingTabs = new Map(); // tabId → { toolType, reason, since, sessionId }
 const bridgeMetadata = new Map(); // tabId → { model, contextPct }
 const bridgePidCache = new Map(); // claudePid → tabId
 const bridgeFileMtimes = new Map(); // filename → mtimeMs
 const bridgeStaleLogged = new Set(); // filenames we've already warned about (dedupe spam)
 const BRIDGE_STALE_SECONDS = 600; // bridge.json older than this = stale process, skip
+const CLAUDE_PENDING_JSONL_OWNER_TTL_MS = 30 * 1000;
+const claudePendingJsonlOwners = new Map(); // lowerSessionId → { tabId, since, source }
+const CLAUDE_RESUME_COMMAND_RE = /\b(?:command\s+)?claude\b[^\r\n]*(?:^|[^\w-])--resume(?:=|\s+)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
 let bridgeWatcher = null;
 let bridgePollInterval = null;
+
+function claudeSessionKey(sessionId) {
+  return sessionId ? String(sessionId).toLowerCase() : null;
+}
+
+function pruneClaudePendingJsonlOwners(now = Date.now()) {
+  for (const [sid, owner] of claudePendingJsonlOwners) {
+    if (!owner || (now - owner.since) > CLAUDE_PENDING_JSONL_OWNER_TTL_MS || !terminals.has(owner.tabId)) {
+      claudePendingJsonlOwners.delete(sid);
+    }
+  }
+}
+
+function markClaudePendingJsonlOwner(sessionId, tabId, source) {
+  const key = claudeSessionKey(sessionId);
+  if (!key || !tabId) return false;
+  pruneClaudePendingJsonlOwners();
+  const prev = claudePendingJsonlOwners.get(key);
+  if (prev && prev.tabId !== tabId) {
+    console.warn('[ClaudeJsonlOwner] pending collision session=' + key.slice(0, 8) +
+      ' existingTab=' + String(prev.tabId).slice(-12) +
+      ' newTab=' + String(tabId).slice(-12) +
+      ' source=' + (source || 'unknown'));
+    return false;
+  }
+  claudePendingJsonlOwners.set(key, { tabId, since: Date.now(), source: source || 'unknown' });
+  if (!prev || prev.tabId !== tabId) {
+    console.log('[ClaudeJsonlOwner] pending session=' + key.slice(0, 8) + ' tab=' + String(tabId).slice(-12) + ' source=' + (source || 'unknown'));
+  }
+  return true;
+}
+
+function clearClaudePendingJsonlOwner(sessionId, tabId, reason) {
+  const key = claudeSessionKey(sessionId);
+  if (!key) return;
+  const owner = claudePendingJsonlOwners.get(key);
+  if (!owner) return;
+  if (tabId && owner.tabId !== tabId) return;
+  claudePendingJsonlOwners.delete(key);
+  console.log('[ClaudeJsonlOwner] pending cleared session=' + key.slice(0, 8) + ' tab=' + String(owner.tabId).slice(-12) + ' reason=' + (reason || 'unknown'));
+}
+
+function clearClaudePendingJsonlOwnersForTab(tabId, reason) {
+  if (!tabId) return;
+  for (const [sid, owner] of claudePendingJsonlOwners) {
+    if (owner?.tabId === tabId) {
+      claudePendingJsonlOwners.delete(sid);
+      console.log('[ClaudeJsonlOwner] pending cleared session=' + sid.slice(0, 8) + ' tab=' + String(tabId).slice(-12) + ' reason=' + (reason || 'unknown'));
+    }
+  }
+}
+
+function isClaudeProcessRunningInTab(tabId) {
+  if (!tabId) return false;
+  const commandState = terminalCommandState.get(tabId) || null;
+  return claudeCliActive.get(tabId) === true
+    || !!findClaudePidByTab(tabId)
+    || (bridgeKnownSessions.has(tabId) && commandState?.isRunning === true);
+}
+
+function getClaudeJsonlLiveOwner(sessionId, callerTabId = null) {
+  const target = claudeSessionKey(sessionId);
+  if (!target) return null;
+  pruneClaudePendingJsonlOwners();
+  const pending = claudePendingJsonlOwners.get(target);
+  if (pending) {
+    return { tabId: pending.tabId, reason: 'pending-resume', source: pending.source, since: pending.since };
+  }
+  for (const [ownerTabId, sid] of bridgeKnownSessions) {
+    if (claudeSessionKey(sid) === target && isClaudeProcessRunningInTab(ownerTabId)) {
+      return { tabId: ownerTabId, reason: 'live-bridge' };
+    }
+  }
+  for (const [ownerTabId, state] of aiStoppingTabs) {
+    if (state?.toolType === 'claude' && claudeSessionKey(state?.sessionId) === target) {
+      return { tabId: ownerTabId, reason: 'stopping' };
+    }
+  }
+  if (callerTabId && isClaudeProcessRunningInTab(callerTabId)) {
+    return { tabId: callerTabId, reason: 'caller-process-active' };
+  }
+  return null;
+}
+
+function looksLikeClaudeProcessCommand(commandLine) {
+  const command = String(commandLine || '');
+  return /(^|[\/\s])claude(\b|[^a-zA-Z])/i.test(command) || /node\b.*claude/i.test(command);
+}
+
+async function getClaudeJsonlExternalOwner(sessionId, cwd = null) {
+  const target = claudeSessionKey(sessionId);
+  if (!target) return null;
+
+  // Cross-process guard #1: a live CLI whose argv still contains --resume <sid>.
+  // This catches another Noted Terminal instance and manual shell starts before
+  // this instance has any bridgeKnownSessions state.
+  try {
+    const psOut = await execAsync('ps -axo pid=,ppid=,command=', 1500);
+    for (const rawLine of String(psOut || '').split('\n')) {
+      const line = rawLine.trim();
+      if (!line || !line.toLowerCase().includes(target)) continue;
+      const m = line.match(/^(\d+)\s+(\d+)\s+(.+)$/);
+      if (!m) continue;
+      const pid = Number(m[1]);
+      const ppid = Number(m[2]);
+      const command = m[3] || '';
+      if (!looksLikeClaudeProcessCommand(command)) continue;
+      return { tabId: null, reason: 'external-ps-resume', pid, ppid };
+    }
+  } catch (e) {
+    console.warn('[ClaudeJsonlOwner] external ps check failed session=' + target.slice(0, 8) + ': ' + (e?.message || String(e)));
+  }
+
+  // Cross-process guard #2: Claude statusline bridge is global under ~/.claude.
+  // If a fresh bridge file for this session points at a live Claude PID, another
+  // process owns the JSONL even if argv parsing missed it.
+  try {
+    const files = await fs.promises.readdir(bridgeDir);
+    const nowSec = Math.floor(Date.now() / 1000);
+    for (const filename of files) {
+      if (!filename.endsWith('.json') || filename.startsWith('_')) continue;
+      const filePath = path.join(bridgeDir, filename);
+      let data = null;
+      try { data = JSON.parse(await fs.promises.readFile(filePath, 'utf8')); } catch { continue; }
+      if (claudeSessionKey(data?.session_id) !== target) continue;
+      if (data.transcript_path && !fs.existsSync(data.transcript_path)) continue;
+      if (typeof data.updated_at === 'number' && (nowSec - data.updated_at) > BRIDGE_STALE_SECONDS) continue;
+      const pid = Number(data.ppid);
+      if (!Number.isFinite(pid) || pid <= 0) continue;
+      try {
+        const command = await execAsync('ps -p ' + pid + ' -o command=', 800);
+        if (looksLikeClaudeProcessCommand(command)) {
+          return { tabId: null, reason: 'external-bridge', pid, bridgeFile: filename };
+        }
+      } catch {}
+    }
+  } catch (e) {
+    console.warn('[ClaudeJsonlOwner] external bridge check failed session=' + target.slice(0, 8) + ': ' + (e?.message || String(e)));
+  }
+
+  return null;
+}
 
 function startSessionBridge() {
   try { fs.mkdirSync(bridgeDir, { recursive: true }); } catch {}
@@ -1665,6 +2367,7 @@ function startSessionBridge() {
       if (oldSessionId === data.session_id) return;
 
       bridgeKnownSessions.set(tabId, data.session_id);
+      clearClaudePendingJsonlOwner(data.session_id, tabId, 'bridge-detected');
       console.log('[Bridge] Tab', tabId, '-> session:', data.session_id.substring(0, 8) + '...', '(model:', data.model + ', ctx:', data.context_pct + '%)');
       emitClaudeTuiReadyFromVisibleBuffer(tabId, 'bridge-fresh').catch((err) => {
         console.log('[TUI-Ready] tab=' + String(tabId).slice(-12) +
@@ -1726,6 +2429,7 @@ function clearBridgeTab(tabId) {
   const wasSpinnerBusy = claudeSpinnerBusy.get(tabId) === true;
   const wasLocalBusy = claudeLocalCommandWatchers.has(tabId);
   bridgeKnownSessions.delete(tabId);
+  clearClaudePendingJsonlOwnersForTab(tabId, 'bridge-clear');
   // Claude TUI gone — prompt is no longer rendered. Mobile should flip back
   // to "inactive" so the Resume banner shows and the composer/busy spinner
   // resets. Broadcast on ANY transition out of a known-session state — not
@@ -1807,10 +2511,13 @@ async function emitClaudeTuiReadyFromVisibleBuffer(tabId, source) {
     return false;
   }
   const visibleText = snapshot.lines.map((line) => line?.text || '').join('\n');
-  if (!hasClaudePromptGlyph(visibleText) && !visibleText.includes('>')) {
+  const rewindMenuVisible = looksLikeClaudeRewindMenuText(visibleText);
+  const composerReady = hasClaudeComposerPromptGlyph(visibleText) || (hasClaudeAsciiComposerPrompt(visibleText) && !rewindMenuVisible);
+  if (!composerReady) {
     console.log('[TUI-Ready] tab=' + String(tabId).slice(-12) +
       ' — visible-buffer fallback saw no prompt source=' + source +
-      ' lines=' + snapshot.lines.length);
+      ' lines=' + snapshot.lines.length +
+      ' rewindMenuVisible=' + rewindMenuVisible);
     return false;
   }
   claudePromptReady.add(tabId);
@@ -1878,6 +2585,82 @@ function getCodexRuntimeSessionId(tabId) {
     || codexLastRunCommandPayload.get(tabId)?.sessionId
     || codexSessionIdFromDb(tabId)
     || null;
+}
+
+function resolveAiToolTypeForTab(tabId, fallback = null) {
+  if (fallback === 'claude' || fallback === 'codex' || fallback === 'gemini') return fallback;
+  if (codexKnownSessions.has(tabId) || codexLastRunCommandPayload.has(tabId) || codexTurnWatchers.has(tabId) || codexTuiReadyTabs.has(tabId)) return 'codex';
+  if (bridgeKnownSessions.has(tabId) || claudePromptReady.has(tabId) || claudeTurnBusy.has(tabId) || claudeSpinnerBusy.has(tabId) || claudeLocalCommandWatchers.has(tabId)) return 'claude';
+  if (geminiActiveTabs.has(tabId) || geminiSpinnerBusy.has(tabId)) return 'gemini';
+  try {
+    const row = projectManager?.db?.db?.prepare('SELECT command_type FROM tabs WHERE tab_id = ? LIMIT 1').get(tabId);
+    const type = row?.command_type || '';
+    if (type === 'claude' || type === 'codex' || type === 'gemini') return type;
+  } catch {}
+  return null;
+}
+
+function getAiRuntimeSessionId(tabId, toolType) {
+  if (toolType === 'codex') return getCodexRuntimeSessionId(tabId);
+  if (toolType === 'claude') return bridgeKnownSessions.get(tabId) || null;
+  return null;
+}
+
+function broadcastAiRuntimeStatus(tabId, toolType, sessionStatus, reason) {
+  if (!tabId || (toolType !== 'claude' && toolType !== 'codex')) return;
+  const sessionId = sessionStatus === 'inactive' ? null : getAiRuntimeSessionId(tabId, toolType);
+  _webBroadcast(tabId, {
+    type: 'snapshot',
+    sessionId,
+    busy: sessionStatus === 'stopping',
+    sessionStatus,
+    starting: sessionStatus === 'starting',
+    stopping: sessionStatus === 'stopping',
+    inputReady: false,
+    toolType,
+    commandType: toolType,
+    reason,
+  });
+}
+
+function markAiStopping(tabId, toolType, reason = 'manual-stop') {
+  const resolvedTool = resolveAiToolTypeForTab(tabId, toolType);
+  if (!tabId || !resolvedTool) return null;
+  const prev = aiStoppingTabs.get(tabId) || null;
+  const state = {
+    toolType: resolvedTool,
+    reason,
+    since: prev?.since || Date.now(),
+    sessionId: getAiRuntimeSessionId(tabId, resolvedTool),
+  };
+  aiStoppingTabs.set(tabId, state);
+  console.log('[AgentStopping] start tab=' + String(tabId).slice(-12) +
+    ' tool=' + resolvedTool +
+    ' reason=' + reason +
+    ' session=' + (state.sessionId ? String(state.sessionId).slice(0, 8) : 'none'));
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('agent:stopping-state', { tabId, toolType: resolvedTool, stopping: true, reason, since: state.since });
+  }
+  broadcastAiRuntimeStatus(tabId, resolvedTool, 'stopping', reason);
+  return state;
+}
+
+function clearAiStopping(tabId, reason = 'clear', options = {}) {
+  const state = aiStoppingTabs.get(tabId) || null;
+  const toolType = resolveAiToolTypeForTab(tabId, options.toolType || state?.toolType || null);
+  if (state) {
+    aiStoppingTabs.delete(tabId);
+    console.log('[AgentStopping] clear tab=' + String(tabId).slice(-12) +
+      ' tool=' + (state.toolType || toolType || '-') +
+      ' reason=' + reason +
+      ' ageMs=' + (Date.now() - state.since));
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('agent:stopping-state', { tabId, toolType: toolType || state.toolType || null, stopping: false, reason });
+    }
+  }
+  if (options.broadcastInactive && toolType) {
+    broadcastAiRuntimeStatus(tabId, toolType, 'inactive', reason);
+  }
 }
 
 function getInterruptedAiSessionEntries() {
@@ -3253,6 +4036,7 @@ function parseOSC133AndEmit(tabId, data) {
             clearBridgeTab(tabId);
           }
         }
+        clearClaudePendingJsonlOwnersForTab(tabId, 'command-finished');
         break;
     }
   }
@@ -6642,6 +7426,9 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     const existingPty = terminals.get(tabId);
     if (existingPty) {
       console.log('[terminal:create] PTY already exists for ' + tabId + ' (pid=' + existingPty.pid + '), reusing');
+      if (!getHeadlessTerminalMirror(tabId)) {
+        createHeadlessTerminalMirror(tabId, cols || 80, rows || 24);
+      }
       return { pid: existingPty.pid, cwd: terminalProjects.get(tabId) };
     }
 
@@ -6768,6 +7555,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     terminalCommandState.set(tabId, { isRunning: false, lastExitCode: 0 });
     if (initialCommand) terminalInitialCommand.set(tabId, initialCommand);
     terminalOutputBuffer.set(tabId, { lines: [], maxLines: TERMINAL_OUTPUT_MAX_LINES });
+    createHeadlessTerminalMirror(tabId, cols || 80, rows || 24);
 
     // If initialCommand provided, wait for shell-integration's first OSC 133;A
     // (prompt ready) and then write the command. This guarantees:
@@ -6912,10 +7700,11 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       // Cheap path: skip the stripVT call when the flag is already set OR when
       // there's no Claude process for this tab.
       let emittedGlobalTuiReady = false;
-      if (!claudePromptReady.has(tabId) && bridgeKnownSessions.has(tabId)) {
+      if (!claudePromptReady.has(tabId) && bridgeKnownSessions.has(tabId) && !aiStoppingTabs.has(tabId)) {
         const checked = currentState ? null : stripVTControlCharacters(data);
         const hayStack = checked != null ? checked : data;
-        if (hasClaudePromptGlyph(hayStack) || hayStack.includes('>')) {
+        const rewindMenuFrame = looksLikeClaudeRewindMenuText(hayStack);
+        if (hasClaudeComposerPromptGlyph(hayStack) || (hasClaudeAsciiComposerPrompt(hayStack) && !rewindMenuFrame)) {
           claudePromptReady.add(tabId);
           console.log('[ClaudePromptReady] Tab ' + tabId.slice(-12) + ' — input ready (⏵ rendered)');
           if (mainWindow && !mainWindow.isDestroyed()) {
@@ -6949,7 +7738,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
 
         // STEP 1: WAITING_PROMPT -> See prompt char -> Start debounce
         // Claude v2.1.32+ uses ⏵ (U+23F5) instead of >
-        if (currentState === 'WAITING_PROMPT' && (hasClaudePromptGlyph(stripped) || stripped.includes('>'))) {
+        if (currentState === 'WAITING_PROMPT' && (hasClaudeComposerPromptGlyph(stripped) || hasClaudeAsciiComposerPrompt(stripped))) {
           console.log('[Claude Handshake] Tab ' + tabId + ': Prompt detected. Starting debounce...');
           claudeState.set(tabId, 'DEBOUNCE_PROMPT');
           // Early "TUI is ready for input" signal — fires as soon as Claude
@@ -7306,6 +8095,10 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       // Colorize UUIDs (MCP Task IDs) with purple before sending to renderer
       data = colorizeUUIDs(data);
 
+      // Keep an authoritative xterm buffer in main. Background/API flows must
+      // not depend on a mounted renderer terminal to prove the current TUI row.
+      writeHeadlessTerminalMirror(tabId, data);
+
       // Send data to renderer - xterm.js handles OSC sequences itself
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('terminal:data', { pid: ptyProcess.pid, tabId, data });
@@ -7334,7 +8127,9 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       codexFinishDebounceTimers.delete(tabId);
       terminalInitialCommand.delete(tabId);
       terminalOutputBuffer.delete(tabId);
+      disposeHeadlessTerminalMirror(tabId, 'pty-exit');
       invalidateAiProcessLookupCache(tabId);
+      clearAiStopping(tabId, 'pty-exit');
       clearCodexLaunchPayload(tabId, 'pty-exit');
 	      claudeCliActive.delete(tabId);
 	      clearBridgeTab(tabId);
@@ -7641,10 +8436,30 @@ function waitForPtyText(term, textOrRegex, timeoutMs = 5000, logPrefix = '') {
   });
 }
 
-function requestTerminalVisibleBufferSnapshot(webContents, tabId, reason, timeoutMs = 500) {
+async function requestTerminalVisibleBufferSnapshot(webContents, tabId, reason, timeoutMs = 500) {
+  const mirror = getHeadlessTerminalMirror(tabId);
+  if (mirror) {
+    const flush = await flushHeadlessTerminalMirror(tabId, Math.min(timeoutMs, HEADLESS_XTERM_FLUSH_TIMEOUT_MS));
+    if (flush.success) {
+      const snapshot = getHeadlessVisibleBufferSnapshot(tabId, reason);
+      if (snapshot?.success) return snapshot;
+      console.warn('[VisibleSnapshot] headless snapshot failed tab=' + String(tabId).slice(-12)
+        + ' reason=' + reason
+        + ' error=' + (snapshot?.error || 'unknown')
+        + ' — falling back to renderer');
+    } else {
+      console.warn('[VisibleSnapshot] headless flush failed tab=' + String(tabId).slice(-12)
+        + ' reason=' + reason
+        + ' error=' + (flush?.error || 'unknown')
+        + ' writeSeq=' + (flush?.writeSeq ?? '-')
+        + ' flushedSeq=' + (flush?.flushedSeq ?? '-')
+        + ' — falling back to renderer');
+    }
+  }
+
   return new Promise((resolve) => {
     if (!webContents || (typeof webContents.isDestroyed === 'function' && webContents.isDestroyed())) {
-      resolve({ success: false, error: 'no-webcontents', tabId, reason });
+      resolve({ success: false, error: 'no-webcontents', tabId, reason, source: 'renderer' });
       return;
     }
 
@@ -7655,7 +8470,7 @@ function requestTerminalVisibleBufferSnapshot(webContents, tabId, reason, timeou
       settled = true;
       clearTimeout(timer);
       ipcMain.removeListener('terminal:visible-buffer-response', handler);
-      resolve(payload || { success: false, error: 'empty-response', requestId, tabId, reason });
+      resolve({ ...(payload || { success: false, error: 'empty-response' }), requestId, tabId, reason, source: 'renderer' });
     };
     const handler = (_event, payload) => {
       if (!payload || payload.requestId !== requestId) return;
@@ -7674,10 +8489,45 @@ function requestTerminalVisibleBufferSnapshot(webContents, tabId, reason, timeou
   });
 }
 
-function requestTerminalCodexDraftState(webContents, tabId, reason, timeoutMs = 700, options = {}) {
+async function requestTerminalCodexDraftState(webContents, tabId, reason, timeoutMs = 700, options = {}) {
+  const headless = getHeadlessTerminalMirror(tabId);
+  if (headless) {
+    const expected = typeof options.waitFor === 'boolean' ? options.waitFor : null;
+    const waitTimeoutMs = Math.max(100, Math.min(Number(options.waitTimeoutMs) || timeoutMs || 900, 2500));
+    const flush = await flushHeadlessTerminalMirror(tabId, Math.min(timeoutMs, HEADLESS_XTERM_FLUSH_TIMEOUT_MS));
+    if (flush.success) {
+      const headlessState = expected === null
+        ? getHeadlessCodexDraftState(tabId, reason)
+        : await waitForHeadlessCodexDraftState(tabId, expected, waitTimeoutMs, reason);
+      if (headlessState?.success && (headlessState.hasDraft !== null || expected === null)) {
+        if (headlessState.hasDraft !== null || !webContents || (typeof webContents.isDestroyed === 'function' && webContents.isDestroyed())) {
+          return { requestId: null, tabId, reason, ...headlessState };
+        }
+        console.warn('[CodexDraftState] headless unknown tab=' + String(tabId).slice(-12)
+          + ' reason=' + reason
+          + ' source=' + (headlessState.source || '-')
+          + ' — falling back to renderer');
+      } else if (headlessState?.success && expected !== null && headlessState.hasDraft !== expected) {
+        console.warn('[CodexDraftState] headless wait unresolved tab=' + String(tabId).slice(-12)
+          + ' reason=' + reason
+          + ' expected=' + expected
+          + ' actual=' + headlessState.hasDraft
+          + ' timedOut=' + !!headlessState.timedOut
+          + ' — falling back to renderer');
+      }
+    } else {
+      console.warn('[CodexDraftState] headless flush failed tab=' + String(tabId).slice(-12)
+        + ' reason=' + reason
+        + ' error=' + (flush?.error || 'unknown')
+        + ' writeSeq=' + (flush?.writeSeq ?? '-')
+        + ' flushedSeq=' + (flush?.flushedSeq ?? '-')
+        + ' — falling back to renderer');
+    }
+  }
+
   return new Promise((resolve) => {
     if (!webContents || (typeof webContents.isDestroyed === 'function' && webContents.isDestroyed())) {
-      resolve({ success: false, error: 'no-webcontents', tabId, reason });
+      resolve({ success: false, error: 'no-webcontents', tabId, reason, source: 'renderer' });
       return;
     }
 
@@ -7688,7 +8538,7 @@ function requestTerminalCodexDraftState(webContents, tabId, reason, timeoutMs = 
       settled = true;
       clearTimeout(timer);
       ipcMain.removeListener('terminal:codex-draft-state-response', handler);
-      resolve(payload || { success: false, error: 'empty-response', requestId, tabId, reason });
+      resolve({ ...(payload || { success: false, error: 'empty-response' }), requestId, tabId, reason, source: payload?.source || 'renderer' });
     };
     const handler = (_event, payload) => {
       if (!payload || payload.requestId !== requestId) return;
@@ -8235,6 +9085,7 @@ ipcMain.on('terminal:force-command-started', (event, payload) => {
   const tabId = request.tabId;
   if (!tabId) return;
   console.log('[Force Command Started] Tab:', tabId, 'commandType:', request.commandType || '-');
+  clearAiStopping(tabId, 'command-started');
   const state = terminalCommandState.get(tabId) || { isRunning: false, lastCommand: null };
   state.isRunning = true;
   terminalCommandState.set(tabId, state);
@@ -8242,12 +9093,15 @@ ipcMain.on('terminal:force-command-started', (event, payload) => {
     || (codexKnownSessions.has(tabId) || codexLastRunCommandPayload.has(tabId) ? 'codex' : null)
     || (bridgeKnownSessions.has(tabId) || findClaudePidByTab(tabId) ? 'claude' : null);
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('terminal:command-started', { tabId, commandType: request.commandType || null });
+    mainWindow.webContents.send('terminal:command-started', { tabId, commandType: commandType || null });
   }
   if (commandType === 'claude' || commandType === 'codex') {
     const sessionId = request.sessionId
       || (commandType === 'codex' ? codexKnownSessions.get(tabId) : bridgeKnownSessions.get(tabId))
       || null;
+    if (commandType === 'claude' && sessionId) {
+      markClaudePendingJsonlOwner(sessionId, tabId, 'force-command-started');
+    }
     _webBroadcast(tabId, {
       type: 'snapshot',
       sessionId,
@@ -8366,6 +9220,42 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
       inputPreview += cc < 32 || cc === 127 ? '\\x' + cc.toString(16).padStart(2, '0') : data[ci];
     }
     console.log(`[terminal:input] tabId=${tabId} len=${data.length} endsWithR=${endsWithR} endsWithN=${endsWithN} hasNewline=${hasNewline} content="${inputPreview}"${data.length > 60 ? '...' : ''}`);
+  }
+
+  // Last-line defense for direct renderer/manual resume paths. Some surfaces
+  // write `claude --resume <sid>` straight through terminal:input instead of
+  // going through `claude:run-command` / `claude:repair-jsonl-before-resume`.
+  // Tail-trim is safe only before a new Claude process starts; if a Claude child
+  // is currently alive in this tab, skip rather than touching a file it may own.
+  try {
+    const resumeMatch = typeof data === 'string'
+      ? data.match(CLAUDE_RESUME_COMMAND_RE)
+      : null;
+    if (resumeMatch) {
+      const resumeSessionId = resumeMatch[1];
+      const liveOwner = getClaudeJsonlLiveOwner(resumeSessionId, tabId)
+        || await getClaudeJsonlExternalOwner(resumeSessionId, terminalProjects.get(tabId));
+      if (liveOwner) {
+        console.warn('[terminal:input] BLOCKED duplicate claude resume session=' + resumeSessionId.slice(0, 8) +
+          ' tab=' + String(tabId).slice(-12) +
+          ' ownerTab=' + String(liveOwner.tabId || '').slice(-12) +
+          ' reason=' + liveOwner.reason);
+        return;
+      }
+      const r = trimTrailingEffortEntries(resumeSessionId, terminalProjects.get(tabId));
+      if (r?.trimmed > 0) {
+        console.log('[terminal:input] pre-resume trimmed ' + r.trimmed +
+          ' trailing startup slash line(s) session=' + resumeSessionId.slice(0, 8) +
+          ' (model=' + (r.model || 0) + ', effort=' + (r.effort || 0) + ')');
+      }
+      if (!markClaudePendingJsonlOwner(resumeSessionId, tabId, 'terminal-input-resume')) {
+        console.warn('[terminal:input] BLOCKED claude resume pending-lock session=' + resumeSessionId.slice(0, 8) +
+          ' tab=' + String(tabId).slice(-12));
+        return;
+      }
+    }
+  } catch (e) {
+    console.warn('[terminal:input] pre-resume startup slash trim failed (non-fatal): ' + (e?.message || String(e)));
   }
 
   // ========== GEMINI INPUT STATE TRACKING ==========
@@ -8574,30 +9464,86 @@ ipcMain.handle('claude:get-presence', (event, tabId) => {
   const isBusy = !!claudeTurnBusy.get(tabId) || claudeLocalCommandWatchers.has(tabId);
   const hasTerm = terminals.has(tabId);
   const inputReady = claudePromptReady.has(tabId);
+  const stopping = aiStoppingTabs.get(tabId);
   // awaiting = Claude is blocked on an AskUserQuestion (purple "needs answer"
   // marker). Surfaced so the mobile tab list can dot the tab the way the desktop
   // glows it. Only meaningful while the process is alive.
   const awaiting = !!claudeAwaitingInput.get(tabId);
   let status;
-  if (!hasTerm) status = 'inactive';
+  if (stopping?.toolType === 'claude') status = 'stopping';
+  else if (!hasTerm) status = 'inactive';
   else if (hasBridge) {
     if (isBusy) status = 'busy';
     else if (inputReady) status = 'active';
     else status = 'starting'; // Claude process exists but TUI hasn't drawn the prompt yet
   } else status = 'inactive';
-  return { status, hasBridge, isBusy, hasTerm, inputReady, awaiting };
+  return { status, hasBridge, isBusy, hasTerm, inputReady: status === 'stopping' ? false : inputReady, awaiting };
 });
 
-// Repair dangling parentUuid in a JSONL file so `claude --resume` and the
+ipcMain.handle('agent:get-stopping-state', async (_event, tabId) => {
+  const state = aiStoppingTabs.get(tabId) || null;
+  return {
+    success: true,
+    stopping: !!state,
+    toolType: state?.toolType || null,
+    reason: state?.reason || null,
+    since: state?.since || null,
+    sessionId: state?.sessionId || null,
+  };
+});
+
+// Prepare a JSONL file before `claude --resume`: first trim safe tail-only
+// startup slash wrappers, then repair dangling parentUuid so Claude CLI and the
 // history panel render full pre-orphan history. Called BEFORE writing
 // `claude --resume <sid>\r` to the PTY — see AutoResume in renderer/App.tsx.
-ipcMain.handle('claude:repair-jsonl-before-resume', async (event, { sessionId, cwd }) => {
+ipcMain.handle('claude:repair-jsonl-before-resume', async (event, { sessionId, cwd, tabId }) => {
   if (!sessionId) return { success: false, error: 'sessionId required' };
+  let trimResult = { success: true, trimmed: 0 };
+  const liveOwner = getClaudeJsonlLiveOwner(sessionId, tabId)
+    || await getClaudeJsonlExternalOwner(sessionId, cwd);
+  if (!liveOwner) {
+    try {
+      trimResult = trimTrailingEffortEntries(sessionId, cwd);
+      if (trimResult?.trimmed > 0) {
+        console.log('[ClaudePrepareResume] Trimmed ' + trimResult.trimmed +
+          ' trailing startup slash line(s) before repair/resume of ' + sessionId.slice(0, 8) +
+          ' tab=' + String(tabId).slice(-12) +
+          ' (model=' + (trimResult.model || 0) + ', effort=' + (trimResult.effort || 0) + ')');
+      }
+    } catch (e) {
+      trimResult = { success: false, trimmed: 0, error: e.message };
+      console.warn('[ClaudePrepareResume] trimTrailingEffortEntries failed (non-fatal): ' + e.message);
+    }
+  } else {
+    trimResult = {
+      success: false,
+      trimmed: 0,
+      skipped: true,
+      reason: 'claude-jsonl-owner-alive',
+      ownerTabId: liveOwner.tabId,
+      ownerReason: liveOwner.reason
+    };
+    console.warn('[ClaudePrepareResume] block trim+repair for session=' + sessionId.slice(0, 8) +
+      ' tab=' + String(tabId || '').slice(-12) +
+      ': JSONL owner alive tab=' + String(liveOwner.tabId || '').slice(-12) +
+      ' reason=' + liveOwner.reason);
+    return {
+      success: false,
+      repaired: 0,
+      trimmed: 0,
+      trim: trimResult,
+      skipped: true,
+      reason: trimResult.reason,
+      error: 'Claude session is already starting/running',
+      ownerTabId: liveOwner.tabId,
+      ownerReason: liveOwner.reason
+    };
+  }
   try {
     const result = await repairJsonlChainBreaks(sessionId, cwd);
-    return { success: true, ...result };
+    return { success: true, trimmed: trimResult.trimmed || 0, trim: trimResult, ...result };
   } catch (e) {
-    return { success: false, error: e.message };
+    return { success: false, trimmed: trimResult.trimmed || 0, trim: trimResult, error: e.message };
   }
 });
 
@@ -9450,6 +10396,9 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
   rewindCancelTabs.delete(tabId);
   if (!hasLiveClaudeInTab(tabId)) return { success: false, error: 'no_claude_session' };
   if (claudeTurnBusy.get(tabId) === true) return { success: false, error: 'claude_busy' };
+  const selectionMarkerRe = /^[●❯›]\s*/u;
+  const selectionMarkerAnywhereRe = /^\s*[●❯›]\s*(.+)$/u;
+  const selectionSignalRe = /\x1b\[38;2;\d+;\d+;\d+m|[●❯›]|\x1b\[\?2026l/;
 
   function cleanBuffer(raw) {
     const spaced = String(raw || '').replace(/\x1b\[(\d*)C/g, (_, n) => ' '.repeat(parseInt(n) || 1));
@@ -9461,7 +10410,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
 
   function normalizeCandidate(text) {
     return String(text || '')
-      .replace(/^[●❯]\s*/, '')
+      .replace(selectionMarkerRe, '')
       .replace(/^\(current\)\s*/, '')
       .replace(/\s+/g, ' ')
       .trim();
@@ -9473,6 +10422,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
     if (!t) return true;
     return t === '●'
       || t === '❯'
+      || t === '›'
       || /^[─━╌═-]{5,}$/.test(t)
       || /^[↑↓]\s*\d+\s*more\s*(above|below)$/i.test(t)
       || /^\d+\s*more\s*(above|below)$/i.test(t)
@@ -9518,7 +10468,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
     const lines = clean.split(/[\r\n]+/).map(l => l.trim()).filter(Boolean);
     const results = [];
     for (const line of lines) {
-      const m = line.match(/[●❯]\s*(.+)$/);
+      const m = line.match(selectionMarkerAnywhereRe);
       if (!m) continue;
       const candidate = normalizeCandidate(m[1]);
       if (!isMenuChrome(candidate)) results.push(candidate);
@@ -9534,7 +10484,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
 
   function stripPickerSelectionMarker(text) {
     return normalizeCandidate(text)
-      .replace(/^[●❯]\s*/u, '')
+      .replace(selectionMarkerRe, '')
       .trim();
   }
 
@@ -9586,11 +10536,22 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
   function snapshotLines(snapshot) {
     if (!Array.isArray(snapshot?.lines)) return [];
     return snapshot.lines
-      .map((line) => ({
-        row: Number(line?.row),
-        text: normalizeCandidate(String(line?.text || '')),
-        wrapped: !!line?.wrapped
-      }))
+      .map((line) => {
+        const rawText = String(line?.text || '')
+          .replace(/\u00a0/g, ' ')
+          .trim();
+        return {
+          row: Number(line?.row),
+          rawText,
+          text: normalizeCandidate(rawText),
+          wrapped: !!line?.wrapped,
+          firstTextStyle: line?.firstTextStyle || '',
+          styles: Array.isArray(line?.styles) ? line.styles : [],
+          hasInverse: !!line?.hasInverse,
+          hasNonDefaultBg: !!line?.hasNonDefaultBg,
+          hasNonDefaultFg: !!line?.hasNonDefaultFg,
+        };
+      })
       .filter(line => line.text && !/^[─━╌═-]{5,}$/.test(line.text));
   }
 
@@ -9603,10 +10564,15 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
     return !isMenuChrome(text);
   }
 
+  function isClaudeSlashCommandRow(text) {
+    const clean = normalizeCandidate(stripPickerSelectionMarker(text || ''));
+    return /^\/[A-Za-z][\w:-]*(?:\s|$)/.test(clean);
+  }
+
   function extractSnapshotSelectedCandidates(snapshot) {
     const results = [];
     for (const line of snapshotLines(snapshot)) {
-      const m = line.text.match(/[●❯]\s*(.+)$/);
+      const m = String(line.rawText || line.text || '').match(selectionMarkerAnywhereRe);
       if (!m) continue;
       const candidate = normalizeCandidate(m[1]);
       if (!isMenuChrome(candidate)) results.push(candidate);
@@ -9707,27 +10673,46 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       async function readRendererSelection(reason) {
         const snapshot = await requestTerminalVisibleBufferSnapshot(event.sender, tabId, reason, 700);
         const lines = snapshotLines(snapshot);
-        const selectedLine = [...lines].reverse().find(line => /^[●❯]\s*/u.test(line.text)) || null;
+        const isSelectedLine = (line) =>
+          selectionMarkerRe.test(String(line?.rawText || '')) ||
+          line?.hasInverse === true ||
+          line?.hasNonDefaultBg === true;
         const itemLines = lines.filter(isRewindPickerItemLine);
+        const markerOrBgSelectedLine = [...itemLines].reverse().find(isSelectedLine) || null;
+        const fgHighlightedItemLines = itemLines.filter(line => line.hasNonDefaultFg === true);
+        const colorOnlySelectedLine = fgHighlightedItemLines.length === 1 ? fgHighlightedItemLines[0] : null;
+        const selectedLine = markerOrBgSelectedLine || colorOnlySelectedLine || null;
         const selectedItemIndex = selectedLine
           ? itemLines.findIndex(line => line.row === selectedLine.row && line.text === selectedLine.text)
           : -1;
         const previousItemLine = selectedItemIndex > 0 ? itemLines[selectedItemIndex - 1] : null;
-        const targetBeforeSelected = !!previousItemLine && textMatchesTargetSilent(previousItemLine.text, targetPrefix);
+        const selectedIsSlashCommand = !!selectedLine && isClaudeSlashCommandRow(selectedLine.rawText || selectedLine.text);
+        const targetBeforeSelectedRaw = !!previousItemLine && textMatchesTargetSilent(previousItemLine.text, targetPrefix);
+        const targetBeforeSelected = targetBeforeSelectedRaw && !selectedIsSlashCommand;
         const selectedCandidates = extractSnapshotSelectedCandidates(snapshot)
           .slice(-5)
           .map(candidate => normalizeCandidate(candidate).substring(0, 140));
         const selectedText = selectedLine
-          ? stripPickerSelectionMarker(selectedLine.text)
+          ? stripPickerSelectionMarker(selectedLine.rawText || selectedLine.text)
           : (selectedCandidates.length > 0 ? selectedCandidates[selectedCandidates.length - 1] : null);
-        const matchedTarget = textMatchesTarget(selectedText, targetPrefix);
+        const selectedMatchesTarget = textMatchesTarget(selectedText, targetPrefix);
+        const matchedTarget = selectedMatchesTarget || targetBeforeSelected;
         const visibleTargetLines = lines
           .filter(line => textMatchesTargetSilent(line.text, targetPrefix))
           .slice(-5)
           .map(line => ({ row: line.row, text: line.text.substring(0, 140), wrapped: line.wrapped }));
         const visibleLines = lines
           .slice(-16)
-          .map(line => ({ row: line.row, text: line.text.substring(0, 140), wrapped: line.wrapped }));
+          .map(line => ({
+            row: line.row,
+            rawText: String(line.rawText || '').substring(0, 140),
+            text: line.text.substring(0, 140),
+            wrapped: line.wrapped,
+            firstTextStyle: line.firstTextStyle || undefined,
+            hasInverse: line.hasInverse || undefined,
+            hasNonDefaultBg: line.hasNonDefaultBg || undefined,
+            hasNonDefaultFg: line.hasNonDefaultFg || undefined,
+          }));
         console.log('[Claude:Rewind:Snapshot] ' + JSON.stringify({
           tab: String(tabId).slice(-12),
           reason,
@@ -9741,17 +10726,28 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
           cursorY: snapshot?.cursorY,
           selectedCandidates,
           selectedRow: selectedLine?.row ?? null,
+          selectedRawText: (selectedLine?.rawText || '').substring(0, 140),
           selectedText: (selectedText || '').substring(0, 140),
+          selectedMatchesTarget,
           matchedTarget,
           targetBeforeSelected,
+          targetBeforeSelectedRaw,
+          selectedIsSlashCommand,
           previousItemText: (previousItemLine?.text || '').substring(0, 140),
+          selectedFirstTextStyle: selectedLine?.firstTextStyle || null,
+          selectedStyles: selectedLine?.styles || [],
+          selectedByColorOnly: !!colorOnlySelectedLine && !markerOrBgSelectedLine,
+          fgHighlightedRows: fgHighlightedItemLines.map(line => ({ row: line.row, text: line.text.substring(0, 80) })),
           visibleTargetLines,
           visibleLines
         }));
         return {
           selectedText,
+          selectedMatchesTarget,
           matchedTarget,
           targetBeforeSelected,
+          targetBeforeSelectedRaw,
+          selectedIsSlashCommand,
           selectedCandidates,
           visibleTargetLines,
           previousItemText: previousItemLine?.text || '',
@@ -9908,7 +10904,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
         if (candidates.length === 0 && raw.length === 0) {
           const probeRaw = await writeAndWait(
             '',
-            /\x1b\[38;2;\d+;\d+;\d+m|[●❯]|\x1b\[\?2026l/,
+            selectionSignalRe,
             250,
             '[Claude:Rewind:probe]'
           );
@@ -9925,6 +10921,10 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
           ptySelectedText: (ptySelectedText || '').substring(0, 140),
           screenSelectedText: (screenSelection.selectedText || '').substring(0, 140),
           screenMatchedTarget: screenSelection.matchedTarget,
+          selectedMatchesTarget: screenSelection.selectedMatchesTarget,
+          targetBeforeSelected: screenSelection.targetBeforeSelected,
+          targetBeforeSelectedRaw: screenSelection.targetBeforeSelectedRaw,
+          selectedIsSlashCommand: screenSelection.selectedIsSlashCommand,
           selectedText: (selectedText || '').substring(0, 140),
           matchedTarget
         });
@@ -9940,7 +10940,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
           throwIfRewindCancelled(reason + '#' + i);
           const navRaw = await writeAndWait(
             key,
-            /\x1b\[38;2;\d+;\d+;\d+m|[●❯]|\x1b\[\?2026l/,
+            selectionSignalRe,
             1200,
             '[Claude:Rewind:nav]'
           );
@@ -9958,7 +10958,10 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
             ptySelectedText: (ptySelectedText || '').substring(0, 140),
             screenSelectedText: (screenSelection.selectedText || '').substring(0, 140),
             screenMatchedTarget: screenSelection.matchedTarget,
+            selectedMatchesTarget: screenSelection.selectedMatchesTarget,
             targetBeforeSelected: screenSelection.targetBeforeSelected,
+            targetBeforeSelectedRaw: screenSelection.targetBeforeSelectedRaw,
+            selectedIsSlashCommand: screenSelection.selectedIsSlashCommand,
             previousItemText: (screenSelection.previousItemText || '').substring(0, 140),
             visibleTargetLines: screenSelection.visibleTargetLines,
             selectedText: (selectedText || '').substring(0, 140),
@@ -10245,8 +11248,46 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         text: normalizeCandidate(line?.text || '').slice(0, 120),
         firstTextStyle: String(line?.firstTextStyle || ''),
         styles: Array.isArray(line?.styles) ? line.styles.slice(0, 4) : [],
+        hasInverse: line?.hasInverse === true,
+        hasNonDefaultBg: line?.hasNonDefaultBg === true,
+        activeByInverse: line?.activeByInverse === true,
       }))
       .slice(-12);
+  }
+
+  function getCodexTargetRowsFromSnapshot(snapshot, expectedText) {
+    const lines = Array.isArray(snapshot?.lines) ? snapshot.lines : [];
+    const target = normalizeCandidate(expectedText);
+    const targetPrefix = target.slice(0, Math.min(90, target.length));
+    const anchors = [
+      targetPrefix,
+      ...buildCodexShortRewindAnchors(expectedText),
+      ...buildCodexRewindAnchors(expectedText),
+    ]
+      .map(anchor => normalizeCandidate(anchor).replace(/^[›❯]\s*/, ''))
+      .filter(anchor => anchor.length >= 2);
+    return lines
+      .filter(line => /[›❯]/.test(String(line?.text || '')))
+      .map(line => {
+        const text = normalizeCandidate(line?.text || '');
+        const promptText = text.replace(/^[›❯]\s*/, '');
+        const matchesTarget = anchors.some(anchor => (
+          promptText.includes(anchor)
+          || anchor.includes(promptText.slice(0, Math.min(90, promptText.length)))
+        ));
+        return {
+          row: line?.row ?? null,
+          text: text.slice(0, 180),
+          firstTextStyle: String(line?.firstTextStyle || ''),
+          styles: Array.isArray(line?.styles) ? line.styles.slice(0, 6) : [],
+          hasInverse: line?.hasInverse === true,
+          hasNonDefaultBg: line?.hasNonDefaultBg === true,
+          activeByInverse: line?.activeByInverse === true,
+          matchesTarget,
+        };
+      })
+      .filter(row => row.matchesTarget || row.hasInverse || row.hasNonDefaultBg)
+      .slice(-16);
   }
 
   async function matchCodexRewindSelection(frame, expectedText, reason) {
@@ -10259,6 +11300,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     );
     const activeMatch = matchCodexRewindActivePromptSnapshot(snapshot, expectedText);
     const promptRows = getCodexPromptRowsFromSnapshot(snapshot);
+    const targetRows = getCodexTargetRowsFromSnapshot(snapshot, expectedText);
     console.log('[Codex:Rewind:ActiveSnapshot] reason=' + reason
       + ' success=' + activeMatch.success
       + ' error=' + (activeMatch.error || '-')
@@ -10270,8 +11312,14 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       + ' styles=' + JSON.stringify(activeMatch.activePromptStyles)
       + ' rawMatched=' + rawMatch.matched
       + ' rawAfter=' + rawMatch.targetAfterSelected
-      + ' prompts=' + JSON.stringify(promptRows));
+      + ' prompts=' + JSON.stringify(promptRows)
+      + ' targetRows=' + JSON.stringify(targetRows));
     if (activeMatch.success) {
+      if (activeMatch.activePromptRow == null && rawMatch.matched) {
+        console.log('[Codex:Rewind:ActiveSnapshot] raw match ignored because snapshot has no active prompt row'
+          + ' reason=' + reason
+          + ' visible=' + JSON.stringify(String(rawMatch.visiblePreview || rawMatch.visibleText || '').slice(0, 160)));
+      }
       let targetAfterActive = false;
       let targetBeforeActive = false;
       if (!activeMatch.matched && rawMatch.matched) {
@@ -10811,6 +11859,7 @@ ipcMain.on('terminal:resize', (event, tabId, cols, rows) => {
   const term = terminals.get(tabId);
   if (term) {
     console.log('[terminal:resize] tabId=' + tabId + ' cols=' + cols + ' rows=' + rows + ' ts=' + Date.now());
+    resizeHeadlessTerminalMirror(tabId, cols, rows);
     term.resize(cols, rows);
   }
 });
@@ -10891,8 +11940,10 @@ ipcMain.on('terminal:kill', async (event, tabId) => {
       ' durMs=' + (Date.now() - startedAt));
   }
   clearBridgeTab(tabId);
+  clearAiStopping(tabId, 'terminal-kill');
   clearTimeout(codexFinishDebounceTimers.get(tabId));
   codexFinishDebounceTimers.delete(tabId);
+  disposeHeadlessTerminalMirror(tabId, 'terminal-kill');
   invalidateAiProcessLookupCache(tabId);
   clearCodexLaunchPayload(tabId, 'terminal-kill');
   clearCodexKnownSession(tabId, 'terminal-kill');
@@ -12897,12 +13948,21 @@ async function stopAiProcessInTab(tabId, options = {}) {
   const preserveCodexLaunchPayload = options?.preserveCodexLaunchPayload === true;
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'tab not found' };
+  const requestedToolType = resolveAiToolTypeForTab(tabId, options?.toolType || null);
+  if (requestedToolType) markAiStopping(tabId, requestedToolType, stopReason);
+  const finishStop = (result, broadcastInactive = false) => {
+    clearAiStopping(tabId, result?.success === false ? 'stop-failed' : stopReason, {
+      broadcastInactive,
+      toolType: result?.processName || requestedToolType,
+    });
+    return result;
+  };
 
   // First try the direct Claude/Gemini/Codex child of our shell PID.
   // For Codex, keep a descendant fallback: the process tree can be
   // shell → node wrapper → vendor codex binary, depending on install path.
   let childPid = null;
-  let processName = null;
+  let processName = requestedToolType || null;
   try {
     const psOut = await execAsync('ps -eo pid,ppid,command', 2000);
     for (const line of (psOut || '').split('\n').filter(Boolean)) {
@@ -12915,6 +13975,7 @@ async function stopAiProcessInTab(tabId, options = {}) {
       if (Number(ppid) === term.pid) {
         childPid = Number(pid);
         processName = aiName;
+        markAiStopping(tabId, processName, stopReason);
         console.log('[StopAI] matched direct child tab=' + tabId + ' pid=' + childPid + ' name=' + processName + ' cmd=' + cmd);
         break;
       }
@@ -12930,6 +13991,7 @@ async function stopAiProcessInTab(tabId, options = {}) {
         const candidate = [...codexCandidates].sort((a, b) => a.depth - b.depth || a.pid - b.pid)[0];
         childPid = Number(candidate.pid);
         processName = 'codex';
+        markAiStopping(tabId, processName, stopReason);
         console.log('[StopAI] matched codex descendant fallback tab=' + tabId + ' pid=' + childPid + ' depth=' + candidate.depth + ' cmd=' + candidate.cmd);
       }
     } catch (err) {
@@ -12957,9 +14019,9 @@ async function stopAiProcessInTab(tabId, options = {}) {
       clearCodexTuiReady(tabId, stopReason);
       closeCodexTurnWatcher(tabId, stopReason);
       emitCodexBusy(tabId, false, stopReason);
-      return { success: true, processName: 'codex', noProcess: true };
+      return finishStop({ success: true, processName: 'codex', noProcess: true }, true);
     }
-    return { success: false, error: 'no AI process found' };
+    return finishStop({ success: false, error: 'no AI process found' }, false);
   }
 
   const _diagStopIdentity = resolveActivityIdentity(tabId, processName);
@@ -13018,6 +14080,8 @@ async function stopAiProcessInTab(tabId, options = {}) {
       });
     }
     stopInterruptWatcher(tabId);
+    claudeCliActive.delete(tabId);
+    clearBridgeTab(tabId);
   };
 
   // Graceful Ctrl+C first — Ink (Claude Code TUI) listens for \x03 through its
@@ -13055,7 +14119,7 @@ async function stopAiProcessInTab(tabId, options = {}) {
   if (ctrlCExited) {
     console.log('[StopAI] Tab ' + tabId + ': ' + processName + ' exited gracefully via Ctrl+C');
     stopBusyState();
-    return { success: true, processName, escalated: false, graceful: 'ctrl-c' };
+    return finishStop({ success: true, processName, escalated: false, graceful: 'ctrl-c' }, true);
   }
 
   console.log('[StopAI] Tab ' + tabId + ': SIGTERM → pid=' + childPid + ' (Ctrl+C ignored 300ms)');
@@ -13063,7 +14127,7 @@ async function stopAiProcessInTab(tabId, options = {}) {
     process.kill(childPid, 'SIGTERM');
   } catch (err) {
     console.log('[StopAI] SIGTERM failed: ' + err.message);
-    return { success: false, error: err.message };
+    return finishStop({ success: false, processName, error: err.message }, false);
   }
 
   // stopBusyState declared above (hoisted) so the Ctrl+C path can call it.
@@ -13078,7 +14142,7 @@ async function stopAiProcessInTab(tabId, options = {}) {
           console.log('[JsonlChainDiag:StopAI:SIGKILL] tabId=' + tabId + ' childPid=' + childPid + ' — SIGTERM ignored 800ms, escalating to SIGKILL — JSONL flush GUARANTEED lost for in-flight write');
           try { process.kill(childPid, 'SIGKILL'); } catch {}
           stopBusyState();
-          resolve({ success: true, processName, escalated: true });
+          resolve(finishStop({ success: true, processName, escalated: true }, true));
           return;
         }
         setTimeout(check, 80);
@@ -13086,15 +14150,19 @@ async function stopAiProcessInTab(tabId, options = {}) {
         // ESRCH = process gone
         console.log('[StopAI] Tab ' + tabId + ': ' + processName + ' exited cleanly in ' + (Date.now() - start) + 'ms');
         stopBusyState();
-        resolve({ success: true, processName, escalated: false });
+        resolve(finishStop({ success: true, processName, escalated: false }, true));
       }
     };
     setTimeout(check, 80);
   });
 }
 
-ipcMain.handle('terminal:stop-ai-process', async (_event, tabId) => {
-  return stopAiProcessInTab(tabId);
+ipcMain.handle('terminal:stop-ai-process', async (_event, request) => {
+  const payload = request && typeof request === 'object' ? request : { tabId: request };
+  return stopAiProcessInTab(payload.tabId, {
+    toolType: payload.toolType || null,
+    reason: payload.reason || 'manual-stop',
+  });
 });
 
 // Execute quick action command in terminal (fire-and-forget version)
@@ -14162,8 +15230,8 @@ function maybeArmCodexMcpStartupWatchdog(tabId, inspected, clean, phase) {
   }, delayMs);
 }
 
-function inspectCodexInputReadyVisibleText(visibleText) {
-  return inspectCodexInputReadyText(visibleText, '', { requireSyncMarker: false, source: 'visible-buffer' });
+function inspectCodexInputReadyVisibleText(visibleText, source = 'visible-buffer') {
+  return inspectCodexInputReadyText(visibleText, '', { requireSyncMarker: false, source });
 }
 
 function isCodexInputReadyFrame(clean, raw) {
@@ -14230,12 +15298,13 @@ async function emitCodexTuiReadyAfterQuiet(tabId) {
       700
     );
     if (snapshot?.success && Array.isArray(snapshot.lines)) {
+      const snapshotSource = snapshot.source || 'visible-buffer';
       const visibleText = snapshot.lines.map((line) => line?.text || '').join('\n');
       tryHandleCodexStartupAutoEnter(tabId, '', {
         cleanSnapshot: visibleText,
-        source: 'visible-buffer',
+        source: snapshotSource,
       });
-      const visibleInspect = inspectCodexInputReadyVisibleText(visibleText);
+      const visibleInspect = inspectCodexInputReadyVisibleText(visibleText, snapshotSource);
       if (!visibleInspect.ready) {
         const visibleBlockers = Array.isArray(visibleInspect.blockers) ? visibleInspect.blockers : [];
         if (visibleBlockers.length > 0) {
@@ -14250,7 +15319,8 @@ async function emitCodexTuiReadyAfterQuiet(tabId) {
           maybeArmCodexMcpStartupWatchdog(tabId, rawInspect, clean, 'quiet-raw');
           return;
         }
-        console.log('[CodexTuiReady] visible-buffer not ready but raw frame ready tab=' + String(tabId).slice(-12)
+        console.log('[CodexTuiReady] screen snapshot not ready but raw frame ready tab=' + String(tabId).slice(-12)
+          + ' snapshotSource=' + snapshotSource
           + ' visibleReason=' + (visibleInspect.reason || '-')
           + ' visibleBlockers=' + (Array.isArray(visibleInspect.blockers) ? visibleInspect.blockers.join('+') : '-')
           + ' sample=' + (rawInspect.sampleMode || '-')
@@ -14501,6 +15571,19 @@ ipcMain.handle('codex:get-tui-ready', async (_event, tabId) => {
   return getCodexTuiReadyState(tabId);
 });
 
+ipcMain.handle('codex:get-draft-state', async (_event, tabId, options = {}) => {
+  return requestTerminalCodexDraftState(
+    mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    tabId,
+    typeof options?.reason === 'string' ? options.reason : 'codex-get-draft-state',
+    Number(options?.timeoutMs) || 700,
+    {
+      waitFor: typeof options?.waitFor === 'boolean' ? options.waitFor : undefined,
+      waitTimeoutMs: Number(options?.waitTimeoutMs) || undefined,
+    }
+  );
+});
+
 async function getCodexTuiReadyState(tabId) {
   let textReady = !!codexTuiReadyTabs.has(tabId);
   const mcpStartup = getCodexMcpStartupStatus(tabId);
@@ -14594,15 +15677,17 @@ async function markCodexTuiReadyAfterVerifiedComposer(tabId, reason = 'verified-
     mainWindow.webContents.send('codex:tui-ready', { tabId, ts: Date.now(), reason });
   }
   ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'codex' });
-  _webBroadcast(tabId, {
-    type: 'snapshot',
-    sessionId: getCodexRuntimeSessionId(tabId),
-    busy: false,
-    sessionStatus: 'active',
-    toolType: 'codex',
-    commandType: 'codex',
-    inputReady: true,
-  });
+  if (!aiStoppingTabs.has(tabId)) {
+    _webBroadcast(tabId, {
+      type: 'snapshot',
+      sessionId: getCodexRuntimeSessionId(tabId),
+      busy: false,
+      sessionStatus: 'active',
+      toolType: 'codex',
+      commandType: 'codex',
+      inputReady: true,
+    });
+  }
   return true;
 }
 
@@ -14619,12 +15704,13 @@ async function pokeCodexStartupPromptFromVisibleBuffer(tabId, reason = 'external
   if (!snapshot?.success || !Array.isArray(snapshot.lines)) {
     return { success: false, error: snapshot?.error || 'snapshot-unavailable' };
   }
+  const snapshotSource = snapshot.source || 'visible-buffer';
   const visibleText = snapshot.lines.map((line) => line?.text || '').join('\n');
   tryHandleCodexStartupAutoEnter(tabId, '', {
     cleanSnapshot: visibleText,
-    source: 'visible-buffer:' + reason,
+    source: snapshotSource + ':' + reason,
   });
-  const inspected = inspectCodexInputReadyVisibleText(visibleText);
+  const inspected = inspectCodexInputReadyVisibleText(visibleText, snapshotSource);
   return {
     success: true,
     ready: inspected.ready,
@@ -14646,12 +15732,13 @@ async function probeCodexReadyFromVisibleBuffer(tabId, reason = 'visible-probe')
   if (!snapshot?.success || !Array.isArray(snapshot.lines)) {
     return { success: false, error: snapshot?.error || 'snapshot-unavailable', ready: false };
   }
+  const snapshotSource = snapshot.source || 'visible-buffer';
   const visibleText = snapshot.lines.map((line) => line?.text || '').join('\n');
   tryHandleCodexStartupAutoEnter(tabId, '', {
     cleanSnapshot: visibleText,
-    source: 'visible-buffer:' + reason,
+    source: snapshotSource + ':' + reason,
   });
-  const inspected = inspectCodexInputReadyVisibleText(visibleText);
+  const inspected = inspectCodexInputReadyVisibleText(visibleText, snapshotSource);
   if (!inspected.ready) {
     logCodexTuiReadyNotReady(tabId, inspected, '', visibleText, 'visible-probe-' + reason);
     maybeArmCodexMcpStartupWatchdog(tabId, inspected, visibleText, 'visible-probe-' + reason);
@@ -14676,8 +15763,9 @@ async function markCodexTuiReadyFromVisibleProbe(tabId, reason = 'visible-probe'
     1000
   );
   if (!snapshot?.success || !Array.isArray(snapshot.lines)) return false;
+  const snapshotSource = snapshot.source || 'visible-buffer';
   const visibleText = snapshot.lines.map((line) => line?.text || '').join('\n');
-  const inspected = inspectCodexInputReadyVisibleText(visibleText);
+  const inspected = inspectCodexInputReadyVisibleText(visibleText, snapshotSource);
   if (!inspected.ready) return false;
   let matches = [];
   try {
@@ -14767,15 +15855,17 @@ async function markCodexTuiReadyFromRawProbe(tabId, reason = 'raw-probe') {
     mainWindow.webContents.send('codex:tui-ready', { tabId, ts: Date.now(), reason });
   }
   ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'codex' });
-  _webBroadcast(tabId, {
-    type: 'snapshot',
-    sessionId: getCodexRuntimeSessionId(tabId),
-    busy: false,
-    sessionStatus: 'active',
-    toolType: 'codex',
-    commandType: 'codex',
-    inputReady: true,
-  });
+  if (!aiStoppingTabs.has(tabId)) {
+    _webBroadcast(tabId, {
+      type: 'snapshot',
+      sessionId: getCodexRuntimeSessionId(tabId),
+      busy: false,
+      sessionStatus: 'active',
+      toolType: 'codex',
+      commandType: 'codex',
+      inputReady: true,
+    });
+  }
   return true;
 }
 
@@ -17465,7 +18555,7 @@ function readClaudeSessionCwdFromFile(filePath) {
   return null;
 }
 
-ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessionId, prompt, cdTo }) => {
+ipcMain.on('claude:run-command', async (event, { tabId, command, sessionId, forkSessionId, prompt, cdTo }) => {
   console.log('[Claude Runner] Command:', command, 'Tab:', tabId, 'Prompt:', prompt ? `${prompt.slice(0, 50)}...` : 'none');
 
   const term = terminals.get(tabId);
@@ -17505,6 +18595,15 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
       // Continue session
       if (sessionId) {
         console.log('[Claude Runner] Continuing session:', sessionId, cdTo ? '(cd ' + cdTo + ')' : '');
+        const tabCwd = terminalProjects.get(tabId);
+        const liveOwner = getClaudeJsonlLiveOwner(sessionId, tabId)
+          || await getClaudeJsonlExternalOwner(sessionId, tabCwd);
+        if (liveOwner) {
+          console.warn('[Claude Runner] BLOCKED duplicate claude-c resume of ' + sessionId.slice(0, 8) +
+            ': owner tab=' + String(liveOwner.tabId || '').slice(-12) +
+            ' reason=' + liveOwner.reason);
+          break;
+        }
         // Enable thinking mode detection (will send Tab when '>' prompt appears)
         claudeState.set(tabId, 'WAITING_PROMPT');
 
@@ -17514,18 +18613,17 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
           console.log('[Claude Runner] Resume prompt queued, will send after prompt detected');
         }
 
-        // Trim accumulated trailing `/effort` from JSONL BEFORE resume. Safe here
+        // Trim accumulated trailing startup slash commands from JSONL BEFORE resume. Safe here
         // (and ONLY here): the previous claude process is dead — nobody will append
         // a child to the record we truncate, so the phantom-parentUuid race that
         // killed the old live EffortCleanup watcher cannot occur. Strict suffix-match:
-        // only fires when `/effort` is literally the file tail with no real message
+        // only fires when `/model`/`/effort` is literally the file tail with no real message
         // after it. See claude-data.js::_trimTrailingEffortEntries and
-        // fact-claude-tui-control.md::On-restart trailing /effort trim.
+        // fact-claude-tui-control.md::On-restart trailing startup slash trim.
         try {
-          const tabCwd = terminalProjects.get(tabId);
           const r = trimTrailingEffortEntries(sessionId, tabCwd);
           if (r && r.trimmed > 0) {
-            console.log('[Claude Runner] Trimmed ' + r.trimmed + ' trailing /effort line(s) before resume of ' + sessionId.slice(0, 8));
+            console.log('[Claude Runner] Trimmed ' + r.trimmed + ' trailing startup slash line(s) before resume of ' + sessionId.slice(0, 8) + ' (model=' + (r.model || 0) + ', effort=' + (r.effort || 0) + ')');
           }
         } catch (e) {
           console.warn('[Claude Runner] trimTrailingEffortEntries failed (non-fatal): ' + e.message);
@@ -17541,13 +18639,18 @@ ipcMain.on('claude:run-command', (event, { tabId, command, sessionId, forkSessio
           const safe = cdTo.replace(/'/g, "'\\''");
           cmdLine = `cd '${safe}' && ${cmdLine}`;
         }
+        if (!markClaudePendingJsonlOwner(sessionId, tabId, 'claude-c')) {
+          console.warn('[Claude Runner] BLOCKED claude-c pending-lock session=' + sessionId.slice(0, 8) +
+            ' tab=' + String(tabId).slice(-12));
+          break;
+        }
         term.write(cmdLine + '\r');
         claudeCliActive.set(tabId, true);
         console.log('[Claude Runner] claudeCliActive SET for tab', tabId, '(claude-c)');
 
         // Signal that command started (for Timeline visibility)
         if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('terminal:command-started', { tabId });
+          mainWindow.webContents.send('terminal:command-started', { tabId, commandType: 'claude' });
         }
       } else {
         console.error('[Claude Runner] No sessionId for claude-c');
@@ -17890,7 +18993,9 @@ function _notifyClaudeSession(tabId, sessionId) {
   // Mobile subscribers also need the sessionId itself for their snapshot —
   // sending it through the WS protocol lets the phone update without waiting
   // for the next /status poll.
-  _webBroadcast(tabId, { type: 'snapshot', sessionId, busy: false, sessionStatus: 'active' });
+  if (!aiStoppingTabs.has(tabId)) {
+    _webBroadcast(tabId, { type: 'snapshot', sessionId, busy: false, sessionStatus: 'active' });
+  }
 }
 
 // Validate that a session UUID actually has a resumable conversation in

@@ -188,6 +188,7 @@ function readSessionCwdFromFile(filePath) {
 // у них ещё нет (Claude не успел продолжить turn — мы стартанули cleanup сразу
 // после fs.watch event'а о появлении wrapper'а в JSONL).
 const TAIL_BYTES = 16 * 1024; // 16 KB достаточно для 2-3 последних записей claude
+const STARTUP_SLASH_TRIM_TAIL_BYTES = 512 * 1024; // покрывает десятки хвостовых /model + /effort блоков без full-file parse
 
 async function _deleteEffortEntries(sessionId, cwd, projectManager) {
   if (!sessionId) return { success: false, error: 'No sessionId' };
@@ -314,39 +315,34 @@ async function _deleteEffortEntries(sessionId, cwd, projectManager) {
   }
 }
 
-// ─── On-restart trailing `/effort` trim (sync, called BEFORE claude --resume) ───
+// ─── On-restart trailing startup slash-command trim (sync, called BEFORE claude --resume) ───
 //
-// Назначение: убрать накопившиеся `/effort` slash-команды из ХВОСТА JSONL перед
-// тем как заново открыть сессию. Каждый запуск Claude авто-инжектит `/effort max`
-// (max нельзя держать в settings.json — Claude его сбрасывает, см.
-// fact-claude-tui-control.md). Без чистки после N перезапусков подряд в хвосте
-// копится N пар `/effort` wrapper+stdout, видимых в Claude TUI scrollback и
-// rewind-меню (в нашем Timeline они и так скрыты tag-фильтром).
+// Назначение: убрать накопившиеся `/model` и `/effort` slash-команды из ХВОСТА
+// JSONL перед тем как заново открыть сессию. Каждый запуск Claude может
+// авто-инжектить `/model <default>` и `/effort <default>`. Без чистки после N
+// перезапусков подряд в хвосте копится N пар wrapper+stdout, видимых в Claude TUI
+// scrollback и rewind-меню (в нашем Timeline они и так скрыты tag-фильтром).
 //
 // ПОЧЕМУ ЭТО НЕ ТОТ САМЫЙ phantom-баг (важно): удалённый EffortCleanup watcher
-// чистил `/effort` пока Claude ЖИВ — и через 40 сек юзер дописывал prompt с
+// чистил slash-command пока Claude ЖИВ — и через 40 сек юзер дописывал prompt с
 // parentUuid на стёртую запись → phantom. Здесь чистка идёт ТОЛЬКО в момент
 // claude-c перед `term.write(--resume)`, когда старый процесс УЖЕ МЁРТВ. Никто
 // не допишет ребёнка к удаляемой записи. Phantom физически невозможен.
 //
-// ПОЧЕМУ ТОЛЬКО ХВОСТ И ТОЛЬКО ЕСЛИ /effort = последнее: parentUuid всегда
-// указывает НАЗАД. Если после `/effort` есть реальное сообщение — у `/effort`
+// ПОЧЕМУ ТОЛЬКО ХВОСТ И ТОЛЬКО ЕСЛИ slash-command = последнее: parentUuid всегда
+// указывает НАЗАД. Если после `/model`/`/effort` есть реальное сообщение — у команды
 // появился потомок, и резать нельзя (порвём цепочку). Поэтому строгий suffix-match:
 // режем только когда максимальный хвост это [caveat? wrapper stdout trailing-meta*]
-// и НИЧЕГО реального после. Если после `/effort` хоть одна real-запись — no-op.
+// и НИЧЕГО реального после. Если после команды хоть одна real-запись — no-op.
 // Никакого re-append, никакого relink — чистый truncate. Verified dry-run на 455
 // сессиях: срабатывает редко, remaining-refs-into-deleted всегда NONE.
-function _trimTrailingEffortEntries(sessionId, cwd) {
-  if (!sessionId) return { success: false, error: 'No sessionId' };
+function _trimTrailingStartupSlashEntriesFromFile(filePath, sessionId = 'unknown') {
   try {
-    const found = findSessionFile(sessionId, cwd);
-    if (!found) return { success: true, trimmed: 0 }; // fresh session, no file yet
-    const filePath = found.filePath;
     const stat = fs.statSync(filePath);
     const fileSize = stat.size;
     if (fileSize === 0) return { success: true, trimmed: 0 };
 
-    const readSize = Math.min(TAIL_BYTES, fileSize);
+    const readSize = Math.min(STARTUP_SLASH_TRIM_TAIL_BYTES, fileSize);
     const startOffset = fileSize - readSize;
     const fd = fs.openSync(filePath, 'r');
     const buf = Buffer.alloc(readSize);
@@ -383,49 +379,93 @@ function _trimTrailingEffortEntries(sessionId, cwd) {
     }
     if (lines.length === 0) return { success: true, trimmed: 0 };
 
+    const entryText = (rec) => {
+      const c = rec?.message?.content;
+      if (typeof c === 'string') return c;
+      if (Array.isArray(c)) {
+        return c.map((block) => {
+          if (!block || typeof block !== 'object') return '';
+          if (typeof block.text === 'string') return block.text;
+          if (typeof block.content === 'string') return block.content;
+          return '';
+        }).join('\n');
+      }
+      return '';
+    };
     const classify = (rec) => {
       if (!rec) return 'unparseable';
       if (!rec.uuid) return 'meta'; // last-prompt / permission-mode / ai-title / queue-operation
+      const text = entryText(rec);
+      if (rec.type === 'assistant' && text.trim() === 'No response requested.') {
+        return 'startup-ack';
+      }
       const c = rec.message && rec.message.content;
       if (typeof c === 'string') {
-        const s = c.trim();
-        if (s.startsWith('<command-name>/effort')) return 'effort-wrapper';
-        if (s.startsWith('<local-command-stdout>Set effort level')) return 'effort-stdout';
+        const s = text.trim();
+        if (s.startsWith('<command-name>/effort')) return { kind: 'wrapper', command: 'effort' };
+        if (s.startsWith('<command-name>/model')) return { kind: 'wrapper', command: 'model' };
+        if (s.startsWith('<local-command-stdout>Set effort level')) return { kind: 'stdout', command: 'effort' };
+        if (s.startsWith('<local-command-stdout>Set model to')) return { kind: 'stdout', command: 'model' };
         if (s.startsWith('<local-command-caveat>')) return 'caveat';
       }
       return 'real';
     };
+    const classKind = (line) => {
+      const c = classify(line.rec);
+      return typeof c === 'string' ? c : c.kind;
+    };
+    const classCommand = (line) => {
+      const c = classify(line.rec);
+      return typeof c === 'string' ? null : c.command;
+    };
 
-    // Strict suffix walk from the end. The tail may contain SEVERAL `/effort`
-    // blocks back-to-back (user restarted the session N times with no real
-    // message in between — each restart injects a fresh `/effort`). We peel them
-    // one block at a time in a loop, so all consecutive trailing `/effort` blocks
-    // collapse in one pass. Each block (from the end) matches:
-    //   [trailing meta]*  effort-stdout  effort-wrapper  [one caveat]?
-    // followed optionally by more meta + another block. We STOP at the first
-    // record that isn't part of an `/effort` block (a real user/assistant
-    // message) — its descendant chain must stay intact (no phantom).
+    // Strict suffix walk from the end. The tail may contain SEVERAL startup
+    // `/model` or `/effort` blocks from repeated launches with no real prompt in
+    // between. Claude inserts an assistant "No response requested." after local
+    // slash commands; for this suffix-only cleanup it is part of startup noise,
+    // not a real conversation barrier. We peel blocks one at a time and STOP at
+    // the first real user/assistant record so no remaining parentUuid can point
+    // into deleted tail records.
     //
     // An unparseable trailing line (torn write) bails immediately — never
     // truncate next to corrupted bytes.
     let i = lines.length - 1;
-    if (classify(lines[i].rec) === 'unparseable') return { success: true, trimmed: 0 };
+    if (classKind(lines[i]) === 'unparseable') return { success: true, trimmed: 0 };
     let cutIdx = -1; // lowest index we will truncate from; -1 = nothing matched yet
+    const removedByCommand = { model: 0, effort: 0 };
+    const skipIgnorable = (fromIdx, allowStartupAck) => {
+      let j = fromIdx;
+      while (j >= 0) {
+        const kind = classKind(lines[j]);
+        if (kind === 'meta' || (allowStartupAck && kind === 'startup-ack')) {
+          j--;
+          continue;
+        }
+        break;
+      }
+      return j;
+    };
     while (i >= 0) {
-      // skip trailing/inter-block meta
-      let j = i;
-      while (j >= 0 && classify(lines[j].rec) === 'meta') j--;
-      // expect effort-stdout then effort-wrapper
-      if (j < 0 || classify(lines[j].rec) !== 'effort-stdout') break;
+      // Skip trailing/inter-block metadata and assistant "No response requested.".
+      // A lone ack at file tail still stays intact: we only truncate after a
+      // full stdout+wrapper startup slash block is found behind it.
+      let j = skipIgnorable(i, true);
+      // expect stdout(command=X) then wrapper(command=X)
+      if (j < 0 || classKind(lines[j]) !== 'stdout') break;
+      const stdoutIdx = j;
+      const command = classCommand(lines[j]);
       j--;
-      if (j < 0 || classify(lines[j].rec) !== 'effort-wrapper') break;
+      j = skipIgnorable(j, false);
+      if (j < 0 || classKind(lines[j]) !== 'wrapper' || classCommand(lines[j]) !== command) break;
       let blockStart = j; // wrapper
       // optional single caveat right before the wrapper
-      if (j - 1 >= 0 && lines[j - 1].rec && classify(lines[j - 1].rec) === 'caveat') {
-        blockStart = j - 1;
+      j = skipIgnorable(j - 1, false);
+      if (j >= 0 && lines[j].rec && classKind(lines[j]) === 'caveat') {
+        blockStart = j;
       }
+      if (command === 'model' || command === 'effort') removedByCommand[command] += (stdoutIdx - blockStart + 1);
       cutIdx = blockStart;     // extend the cut down to this block's start
-      i = blockStart - 1;      // continue: maybe another /effort block precedes it
+      i = blockStart - 1;      // continue: maybe another startup slash block precedes it
     }
 
     if (cutIdx === -1) return { success: true, trimmed: 0 };
@@ -435,12 +475,19 @@ function _trimTrailingEffortEntries(sessionId, cwd) {
     _jsonlCache.delete(filePath);
 
     const removed = lines.length - cutIdx;
-    console.log('[TrimEffort] session=' + sessionId.slice(0, 8) + ' trimmed trailing /effort block (' + removed + ' lines) at offset ' + truncateAt);
-    return { success: true, trimmed: removed };
+    console.log('[TrimStartupSlash] session=' + String(sessionId).slice(0, 8) + ' trimmed trailing startup slash blocks (' + removed + ' lines, model=' + removedByCommand.model + ', effort=' + removedByCommand.effort + ') at offset ' + truncateAt);
+    return { success: true, trimmed: removed, model: removedByCommand.model, effort: removedByCommand.effort };
   } catch (error) {
-    console.error('[TrimEffort] Error:', error.message);
+    console.error('[TrimStartupSlash] Error:', error.message);
     return { success: false, error: error.message };
   }
+}
+
+function _trimTrailingEffortEntries(sessionId, cwd) {
+  if (!sessionId) return { success: false, error: 'No sessionId' };
+  const found = findSessionFile(sessionId, cwd);
+  if (!found) return { success: true, trimmed: 0 }; // fresh session, no file yet
+  return _trimTrailingStartupSlashEntriesFromFile(found.filePath, sessionId);
 }
 
 // Parse JSONL lines into an existing recordMap (shared logic for full + incremental reads)
@@ -4278,4 +4325,4 @@ async function repairJsonlChainBreaks(sessionId, cwd) {
   }
 }
 
-module.exports = { register, findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, deleteEffortEntries: _deleteEffortEntries, trimTrailingEffortEntries: _trimTrailingEffortEntries, repairJsonlChainBreaks, _api };
+module.exports = { register, findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, deleteEffortEntries: _deleteEffortEntries, trimTrailingEffortEntries: _trimTrailingEffortEntries, trimTrailingStartupSlashEntriesFromFile: _trimTrailingStartupSlashEntriesFromFile, repairJsonlChainBreaks, _api };

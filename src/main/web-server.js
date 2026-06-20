@@ -619,6 +619,7 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       busy: true,
       sessionStatus: 'busy',
       starting: false,
+      stopping: false,
       inputReady: true,
       commandType: 'claude-sdk',
       toolType: 'claude',
@@ -638,6 +639,7 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       busy: status?.status === 'busy',
       sessionStatus: status?.status || 'inactive',
       starting: status?.status === 'starting',
+      stopping: status?.status === 'stopping',
       commandType: status?.commandType || null,
       toolType: status?.toolType || null,
       inputReady: status?.inputReady === true,
@@ -655,6 +657,7 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       busy: false,
       sessionStatus: 'inactive',
       starting: false,
+      stopping: false,
       inputReady: false,
       commandType: null,
       toolType: null,
@@ -1251,6 +1254,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         timelineCount,
         sessionStatus: runtimeStatus,
         starting: runtimeStatus === 'starting',
+        stopping: runtimeStatus === 'stopping',
         inputReady: inputReadyMap.has(t.tabId) ? inputReadyMap.get(t.tabId) : null,
         lastNotReady: lastNotReadyMap.get(t.tabId) || null,
         startupFailed: startupFailedMap.get(t.tabId) || false,
@@ -1648,6 +1652,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           startupDefaultsReady: defaults?.defaultsReady === true,
           status: status?.status || 'active',
           starting: status?.status === 'starting',
+          stopping: status?.status === 'stopping',
           inputReady: status?.inputReady === true,
         });
       } catch (readyErr) {
@@ -2490,7 +2495,14 @@ async function startClaudeTabWatcher(tabId) {
   };
 
   // Send initial snapshot — phone needs current sessionStatus right after connect.
-  webBroadcast(tabId, { type: 'snapshot', sessionId: status.sessionId, busy: status.status === 'busy', sessionStatus: status.status });
+  webBroadcast(tabId, {
+    type: 'snapshot',
+    sessionId: status.sessionId,
+    busy: status.status === 'busy',
+    sessionStatus: status.status,
+    starting: status.status === 'starting',
+    stopping: status.status === 'stopping',
+  });
 
   const readDelta = () => {
     // Inflight guard: fs.watch on macOS can fire multiple times between our
