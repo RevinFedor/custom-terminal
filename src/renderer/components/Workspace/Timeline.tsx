@@ -10,7 +10,7 @@ import { generateTabTitleFromPrompt, isEligibleTabTitleEntry, trimTabTitlePrompt
 import { timelineSummaryKey, useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { getHistoryAgentRuntime, type AgentHistoryTool, type AgentPtyStatus } from '../../utils/historyAgentRuntimes';
-import { waitForClaudeStartupDefaultsReady } from '../../utils/claudeStartupDefaultsGate';
+import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from '../../utils/claudeStartupDefaultsReady';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
 
@@ -36,6 +36,7 @@ function warnTimelineTextSearchDiag(message: string) {
 }
 
 const REWIND_BUSY_GUARD_RE = /\bis busy; wait for the current turn before rewind\b/i;
+const HISTORY_SCROLL_SAFETY_TIMEOUT_MS = 8000;
 
 function isRewindBusyGuardMessage(message: string): boolean {
   return REWIND_BUSY_GUARD_RE.test(message);
@@ -449,7 +450,6 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
 // Module-level: survives component remount (project switch destroys Timeline instance)
 const _savedEditRangeMap = new Map<string, any>();
 const SAVED_MAP_MAX = 20;
-let _timelinePollSeq = 0;
 const _autoTabTitleAttempted = new Set<string>();
 const _autoTabTitleInFlight = new Set<string>();
 
@@ -539,7 +539,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const [lastBoundaryIndex, setLastBoundaryIndex] = useState(-1);
   const [clickedState, setClickedState] = useState<{ index: number; status: 'loading' | 'failed' } | null>(null);
   // Tracks an in-flight history-panel scroll triggered by Cmd+click / click-when-open.
-  // Cleared by 'history-panel:scrolled-to' event (success) or the safety timeout (4s).
+  // Cleared by 'history-panel:scrolled-to' event (success) or the safety timeout.
   const pendingHistoryScrollRef = useRef<{ uuid: string; index: number } | null>(null);
   const historyClickTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Failed-click flash for non-clickable strip markers (fork, plan-mode, last-boundary
@@ -1456,10 +1456,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // effect: HistoryPanel scrolled-to → clear dot spinner (Cmd+click / open-panel click path).
   useEffect(() => {
     const onScrolledTo = (e: Event) => {
-      const detail = (e as CustomEvent).detail as { tabId?: string; uuid?: string; found?: boolean } | undefined;
+      const detail = (e as CustomEvent).detail as { tabId?: string; uuid?: string; found?: boolean; reason?: string } | undefined;
       if (!detail || detail.tabId !== tabId) return;
       const pending = pendingHistoryScrollRef.current;
       if (!pending || pending.uuid !== detail.uuid) return;
+      console.warn('[Timeline:HistoryScroll] ack tab=' + tabId.slice(-12) +
+        ' uuid=' + String(detail.uuid || '').slice(0, 8) +
+        ' found=' + detail.found +
+        ' reason=' + (detail.reason || '-') +
+        ' index=' + pending.index);
       pendingHistoryScrollRef.current = null;
       if (historyClickTimeoutRef.current) {
         clearTimeout(historyClickTimeoutRef.current);
@@ -1577,7 +1582,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           setClaudeMemoryBoundaryUuid(null);
         }
       } else if (isCodex) {
-        const timelineResult = await ipcRenderer.invoke('codex:get-timeline', { sessionId, cwd, ...callerContext });
+        const timelineResult = await ipcRenderer.invoke('agent-transcript:get-timeline', { toolType: 'codex', sessionId, cwd, tabId, ...callerContext });
         if (timelineResult.success) {
           setEntries(timelineResult.entries);
           setSessionBoundaries([]);
@@ -2118,15 +2123,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     })();
   }, [entries, sessionId, tabId, toolType, forkMarkers, forkMarkerLastSnapIndex, codexSessionMeta]);
 
-  // effect: sessionId/loadTimeline/isVisible + document.visibilitychange → 2s setInterval(loadTimeline) (paused while tab hidden; PERF: avoids IPC round-trips in background — Timeline:PollPaused/Resumed logs)
+  // effect: subscribe to main-process transcript watcher. UI refreshes on
+  // durable JSONL/rollout changes; visibility resume does one reconciliation
+  // refresh instead of running a permanent polling loop.
   useEffect(() => {
-    if (!sessionId || !isVisible) {
+    if (!sessionId || isGemini) {
       console.warn(
-        '[Timeline:PollInactive]' +
+        '[Timeline:TranscriptInactive]' +
         ' inst=' + timelineInstanceIdRef.current +
         ' tab=' + tabId.slice(-8) +
         ' session=' + (sessionId ? sessionId.substring(0, 8) : 'none') +
-        ' reason=' + (!sessionId ? 'no-session' : 'isVisible-false') +
+        ' reason=' + (!sessionId ? 'no-session' : 'gemini') +
         ' visible=' + isVisible +
         ' doc=' + document.visibilityState +
         ' abs=' + perfAbsNow().toFixed(1)
@@ -2134,75 +2141,92 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       return;
     }
 
-    let interval: ReturnType<typeof setInterval> | null = null;
-    let intervalId: number | null = null;
-    const start = () => {
-      if (interval) return;
-      intervalId = ++_timelinePollSeq;
-      console.warn(
-        '[Timeline:PollStart]' +
-        ' inst=' + timelineInstanceIdRef.current +
-        ' interval=' + intervalId +
-        ' tab=' + tabId.slice(-8) +
-        ' session=' + sessionId.substring(0, 8) +
-        ' visible=' + isVisibleRef.current +
-        ' doc=' + document.visibilityState +
-        ' abs=' + perfAbsNow().toFixed(1)
-      );
-      interval = setInterval(() => {
+    const consumerId = 'timeline:' + tabId;
+    let disposed = false;
+    let refreshQueued = false;
+    const queueRefresh = (reason: string) => {
+      if (refreshQueued || disposed) return;
+      refreshQueued = true;
+      requestAnimationFrame(() => {
+        refreshQueued = false;
+        if (disposed) return;
         console.warn(
-          '[Timeline:PollTick]' +
+          '[Timeline:TranscriptRefresh]' +
           ' inst=' + timelineInstanceIdRef.current +
-          ' interval=' + (intervalId ?? 'none') +
           ' tab=' + tabId.slice(-8) +
           ' session=' + sessionId.substring(0, 8) +
+          ' reason=' + reason +
           ' visible=' + isVisibleRef.current +
           ' doc=' + document.visibilityState +
           ' abs=' + perfAbsNow().toFixed(1)
         );
-        loadTimeline('poll');
-      }, 2000);
+        loadTimeline(reason);
+      });
     };
-    const stop = (reason: string) => {
-      if (!interval) return;
-      clearInterval(interval);
-      interval = null;
+
+    const onTranscriptChanged = (_event: any, detail: any) => {
+      if (detail?.sessionId !== sessionId) return;
+      if (detail?.toolType && detail.toolType !== toolType) return;
+      if (document.visibilityState !== 'visible' || !isVisibleRef.current) {
+        console.warn(
+          '[Timeline:TranscriptDeferred]' +
+          ' inst=' + timelineInstanceIdRef.current +
+          ' tab=' + tabId.slice(-8) +
+          ' session=' + sessionId.substring(0, 8) +
+          ' reason=' + (detail?.reason || 'changed') +
+          ' visible=' + isVisibleRef.current +
+          ' doc=' + document.visibilityState +
+          ' abs=' + perfAbsNow().toFixed(1)
+        );
+        return;
+      }
+      queueRefresh('transcript-change');
+    };
+
+    ipcRenderer.on('agent-transcript:changed', onTranscriptChanged);
+    ipcRenderer.invoke('agent-transcript:subscribe', {
+      consumerId,
+      tabId,
+      toolType,
+      sessionId,
+      cwd,
+    }).then((result: any) => {
       console.warn(
-        '[Timeline:PollStop]' +
+        '[Timeline:TranscriptSubscribe]' +
         ' inst=' + timelineInstanceIdRef.current +
-        ' interval=' + (intervalId ?? 'none') +
         ' tab=' + tabId.slice(-8) +
         ' session=' + sessionId.substring(0, 8) +
-        ' reason=' + reason +
+        ' success=' + (result?.success ? '1' : '0') +
+        ' file=' + (result?.filePath ? '1' : '0') +
         ' visible=' + isVisibleRef.current +
         ' doc=' + document.visibilityState +
         ' abs=' + perfAbsNow().toFixed(1)
       );
-      console.warn(`[Timeline:PollPaused] sessionId=${sessionId.substring(0,8)} reason=${reason}`);
-    };
-
-    if (document.visibilityState === 'visible') {
-      start();
-    } else {
-      console.warn(`[Timeline:PollPaused] sessionId=${sessionId.substring(0,8)} reason=hidden-on-mount`);
-    }
+    }).catch((err: any) => {
+      console.warn('[Timeline:TranscriptSubscribe] failed tab=' + tabId.slice(-8) + ' session=' + sessionId.substring(0, 8) + ' err=' + String(err?.message || err));
+    });
 
     const onVis = () => {
       if (document.visibilityState === 'visible') {
-        console.warn(`[Timeline:PollResumed] sessionId=${sessionId.substring(0,8)}`);
-        loadTimeline('visibility-resume'); // refresh immediately so user sees fresh data on return
-        start();
-      } else {
-        stop('visibility-hidden');
+        ipcRenderer.invoke('agent-transcript:refresh', {
+          tabId,
+          toolType,
+          sessionId,
+          cwd,
+          reason: 'visibility-resume',
+        }).catch(() => {});
+        queueRefresh('visibility-resume');
       }
     };
     document.addEventListener('visibilitychange', onVis);
 
     return () => {
+      disposed = true;
       document.removeEventListener('visibilitychange', onVis);
-      stop('effect-cleanup');
+      ipcRenderer.removeListener('agent-transcript:changed', onTranscriptChanged);
+      ipcRenderer.invoke('agent-transcript:unsubscribe', { consumerId }).catch(() => {});
     };
-  }, [sessionId, loadTimeline, isVisible]);
+  }, [sessionId, cwd, tabId, toolType, isGemini, loadTimeline]);
 
   // ════════════════════════════════════════════════════════════
   // SECTION: NOTES + REWIND MARKERS + CONTINUE — window event listeners for cross-component triggers
@@ -2705,14 +2729,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       if (!isHistoryOpen) setHistoryPanelOpen(tabId, true);
       setHistoryScrollToUuid(entry.uuid);
       // Spinner on dot — HistoryPanel emits 'history-panel:scrolled-to' when done.
-      // Safety: clear after 4s in case the panel never mounts (no session).
+      // Safety: clear in case the panel never mounts (no session).
+      console.warn('[Timeline:HistoryScroll] request tab=' + tabId.slice(-12) +
+        ' uuid=' + entry.uuid.slice(0, 8) +
+        ' index=' + index +
+        ' entries=' + entries.length +
+        ' mode=cmd-click open=' + isHistoryOpen);
       setClickedState({ index, status: 'loading' });
       pendingHistoryScrollRef.current = { uuid: entry.uuid, index };
       if (historyClickTimeoutRef.current) clearTimeout(historyClickTimeoutRef.current);
       historyClickTimeoutRef.current = setTimeout(() => {
+        console.warn('[Timeline:HistoryScroll] timeout tab=' + tabId.slice(-12) +
+          ' uuid=' + entry.uuid.slice(0, 8) +
+          ' index=' + index +
+          ' ms=' + HISTORY_SCROLL_SAFETY_TIMEOUT_MS);
         pendingHistoryScrollRef.current = null;
         setClickedState((s) => (s?.index === index ? null : s));
-      }, 4000);
+      }, HISTORY_SCROLL_SAFETY_TIMEOUT_MS);
       return;
     }
 
@@ -2720,13 +2753,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     // This includes compact/continued entries which have no terminal position but DO exist in history panel
     if (isHistoryOpen) {
       setHistoryScrollToUuid(entry.uuid);
+      console.warn('[Timeline:HistoryScroll] request tab=' + tabId.slice(-12) +
+        ' uuid=' + entry.uuid.slice(0, 8) +
+        ' index=' + index +
+        ' entries=' + entries.length +
+        ' mode=history-open');
       setClickedState({ index, status: 'loading' });
       pendingHistoryScrollRef.current = { uuid: entry.uuid, index };
       if (historyClickTimeoutRef.current) clearTimeout(historyClickTimeoutRef.current);
       historyClickTimeoutRef.current = setTimeout(() => {
+        console.warn('[Timeline:HistoryScroll] timeout tab=' + tabId.slice(-12) +
+          ' uuid=' + entry.uuid.slice(0, 8) +
+          ' index=' + index +
+          ' ms=' + HISTORY_SCROLL_SAFETY_TIMEOUT_MS);
         pendingHistoryScrollRef.current = null;
         setClickedState((s) => (s?.index === index ? null : s));
-      }, 4000);
+      }, HISTORY_SCROLL_SAFETY_TIMEOUT_MS);
       return;
     }
 
@@ -3333,6 +3375,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         }
       }));
     };
+    const showRewindFailureFeedback = (message: string) => {
+      const cleanMessage = String(message || 'Rewind failed').trim();
+      setClickedState({ index: entryIndex, status: 'failed' });
+      setTimeout(() => setClickedState((s) => (s?.index === entryIndex ? null : s)), 1600);
+      if (!isHistoryOpen) {
+        useUIStore.getState().showToast(
+          cleanMessage.toLowerCase().startsWith('rewind failed')
+            ? cleanMessage
+            : 'Rewind failed: ' + cleanMessage,
+          'error',
+          5000
+        );
+      }
+    };
     emitHistoryRewindLog(
       'start',
       undefined,
@@ -3494,7 +3550,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       const waitStartupDefaultsIfNeeded = async () => {
         if (toolType !== 'claude') return;
         emitHistoryRewindLog('start', undefined, 'Claude Rewind: applying startup defaults...');
-        await waitForClaudeStartupDefaultsReady(tabId);
+        await waitForClaudeStartupDefaultsReadyWithVisibleFallback(tabId, 15000, 'timeline-rewind');
         console.warn('[Restore:Rewind] Claude startup defaults gate passed');
       };
 
@@ -3583,8 +3639,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         'pressCount:', rewindResult.pressCount,
         'compactPasted:', !!compactText);
       if (!rewindResult.success) {
-        console.error('[Restore:Rewind] Rewind failed:', rewindResult.error || rewindResult.message || rewindResult);
-        emitHistoryRewindLog('failed', rewindResult.error || rewindResult.message || 'Rewind failed');
+        const rewindFailureMessage = String(rewindResult.error || rewindResult.message || 'Rewind failed');
+        console.error('[Restore:Rewind] Rewind failed:', rewindFailureMessage);
+        emitHistoryRewindLog('failed', rewindFailureMessage);
+        showRewindFailureFeedback(rewindFailureMessage);
         setRewindState(null);
         activeRewindRef.current = null;
         return;
@@ -3644,6 +3702,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       } else {
         emitHistoryRewindLog('failed', rewindErrorMessage);
       }
+      showRewindFailureFeedback(rewindErrorMessage);
       setRewindState(null);
       activeRewindRef.current = null;
     } finally {
@@ -5198,9 +5257,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               anchorHeight={anchorHeight}
               rightOffset={rightOffset}
               autoEditInitial={editRangeState.autoEditInitial}
-              onApply={async (compactText) => {
+              onApply={async (compactText, onProgress) => {
                 console.warn('[EditRange] Applying, compact length:', compactText.length);
                 setEditRangeState(prev => prev ? { ...prev, phase: 'applying' } : null);
+                onProgress?.('stopping');
 
                 const range = editRangeState!.range;
                 const startUuid = entries[range.startIndex].uuid;
@@ -5230,6 +5290,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     }
                   }
 
+                  onProgress?.('editing');
                   console.warn('[CodexEditRange] Creating edited local rollout fork...');
                   const result = await ipcRenderer.invoke('codex:edit-range', {
                     sessionId, cwd, startUuid, endUuid, compactText,
@@ -5252,6 +5313,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   }
 
                   if (result.newSessionId) {
+                    onProgress?.('restarting');
                     useWorkspaceStore.getState().setCodexSessionId(tabId, result.newSessionId, 'editRange');
                     ipcRenderer.send('codex:run-command', buildCodexRunPayload({
                       tabId,
@@ -5269,6 +5331,37 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
                 // Step 1: Exit Claude only when a real Claude process is still running.
                 let waitForPromptReadyBeforeRestart = false;
+                let promptReadyWait: { promise: Promise<boolean>; cancel: () => void } | null = null;
+                const createShellPromptReadyWait = (timeoutMs = 15000) => {
+                  let cleanup = () => {};
+                  const promise = new Promise<boolean>((resolve) => {
+                    let settled = false;
+                    const finish = (ready: boolean) => {
+                      if (settled) return;
+                      settled = true;
+                      cleanup();
+                      resolve(ready);
+                    };
+                    const timeout = setTimeout(() => {
+                      console.warn('[EditRange] prompt-ready timeout while waiting for shell prompt');
+                      finish(false);
+                    }, timeoutMs);
+                    const handler = (_e: any, readyTabId: string) => {
+                      if (readyTabId !== tabId) return;
+                      console.warn('[EditRange] prompt-ready captured');
+                      finish(true);
+                    };
+                    cleanup = () => {
+                      clearTimeout(timeout);
+                      ipcRenderer.removeListener('terminal:prompt-ready', handler);
+                    };
+                    ipcRenderer.on('terminal:prompt-ready', handler);
+                  });
+                  return {
+                    promise,
+                    cancel: cleanup,
+                  };
+                };
                 const cmdState = await ipcRenderer.invoke('terminal:getCommandState', {
                   tabId,
                   caller: 'Timeline.claudeEditRange',
@@ -5280,6 +5373,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
                 if (cmdState?.isRunning) {
                   waitForPromptReadyBeforeRestart = true;
+                  // Arm before Ctrl+C: OSC 133 A can arrive between command-finished
+                  // detection and JSONL edit, before the old post-edit listener existed.
+                  promptReadyWait = createShellPromptReadyWait();
                   console.warn('[EditRange] Sending Ctrl+C #1, waiting for DangerZone...');
                   ipcRenderer.send('terminal:input', tabId, '\x03');
 
@@ -5330,6 +5426,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 }
 
                 // Step 2: Edit JSONL
+                onProgress?.('editing');
                 console.warn('[EditRange] Editing JSONL...');
                 const result = await ipcRenderer.invoke('claude:edit-range', {
                   sessionId, cwd, startUuid, endUuid, compactText,
@@ -5347,25 +5444,26 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 // Step 3: Wait for a fresh shell prompt only after we actually stopped Claude.
                 if (waitForPromptReadyBeforeRestart) {
                   console.warn('[EditRange] Waiting for prompt-ready...');
-                  await new Promise<void>((resolve, reject) => {
-                    const timeout = setTimeout(() => {
-                      console.warn('[EditRange] prompt-ready timeout, aborting restart');
-                      ipcRenderer.removeListener('terminal:prompt-ready', handler);
-                      reject(new Error('Shell prompt did not become ready before Claude restart'));
-                    }, 5000);
-                    const handler = (_e: any, readyTabId: string) => {
-                      if (readyTabId === tabId) {
-                        clearTimeout(timeout);
-                        ipcRenderer.removeListener('terminal:prompt-ready', handler);
-                        resolve();
-                      }
-                    };
-                    ipcRenderer.on('terminal:prompt-ready', handler);
-                  });
+                  const promptReadySeen = promptReadyWait ? await promptReadyWait.promise : false;
+                  promptReadyWait = null;
+                  if (!promptReadySeen) {
+                    const state = await ipcRenderer.invoke('terminal:getCommandState', {
+                      tabId,
+                      caller: 'Timeline.claudeEditRange.promptReadyFallback',
+                      expectedProcess: 'claude',
+                      allowProcessTreeLookup: true,
+                      ignoreBridgeAlive: true,
+                    });
+                    if (state?.isRunning) {
+                      throw new Error('Shell prompt did not become ready before Claude restart');
+                    }
+                    console.warn('[EditRange] prompt-ready was not observed, but Claude is stopped; continuing restart');
+                  }
                 } else {
                   console.warn('[EditRange] Claude was already stopped; skipping prompt-ready wait');
                 }
 
+                onProgress?.('restarting');
                 console.warn('[EditRange] Restarting Claude with session:', sessionId?.slice(0, 8));
                 ipcRenderer.send('claude:run-command', {
                   tabId,
@@ -5395,6 +5493,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 setEditRangeState(prev => prev ? { ...prev, phase: 'done' } : null);
 
                 return { removedCount: result.removedCount, removedUsers: result.removedUsers };
+              }}
+              onApplyError={(error) => {
+                const message = error instanceof Error ? error.message : String(error || 'unknown error');
+                setEditRangeState(prev => {
+                  if (!prev) return null;
+                  if (prev.compactUuid) return { ...prev, phase: 'done' as const };
+                  return { ...prev, phase: 'ready' as const };
+                });
+                useUIStore.getState().showToast('Edit Range failed: ' + message, 'error', 5000);
               }}
               onClose={() => setEditRangeState(null)}
             />

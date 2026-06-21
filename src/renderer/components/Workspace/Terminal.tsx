@@ -79,10 +79,12 @@ import { markPendingResume, clearPendingResume, isStaleAgainstPending, getPendin
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import {
   clearClaudeStartupDefaultsGate,
+  getClaudeStartupDefaultsGateSnapshot,
   markClaudeStartupDefaultsFailed,
   markClaudeStartupDefaultsPending,
   markClaudeStartupDefaultsReady,
 } from '../../utils/claudeStartupDefaultsGate';
+import { isClaudeStartupPromptReadyByVisiblePrompt } from '../../utils/claudeStartupDefaultsReady';
 
 const TIMELINE_COLLAPSED_SLOT_WIDTH = 32;
 const TERMINAL_THEME = {
@@ -148,6 +150,7 @@ const _modelSentForTab = new Map<string, { at: number; via: string; model: strin
 
 const _claudeBridgeModelByTab = new Map<string, { model: string; at: number }>();
 const _claudeStartupDefaultsInflight = new Map<string, Promise<void>>();
+const _claudeStartupDefaultsRecoveryInflight = new Map<string, Promise<void>>();
 
 function _bridgeModelMatchesTarget(targetModel: string, bridgeModel: string | null | undefined): boolean {
   const target = String(targetModel || '').trim().toLowerCase();
@@ -566,6 +569,9 @@ async function waitForClaudeStartupPromptBoundaryResult(tabId: string, afterSeq:
 async function waitForClaudeStartupPromptBoundary(tabId: string, afterSeq: number, label: string) {
   const result = await waitForClaudeStartupPromptBoundaryResult(tabId, afterSeq, label);
   if (result === 'timeout') {
+    if (await isClaudeStartupPromptReadyByVisiblePrompt(tabId, label + ':prompt-visible-fallback')) {
+      return 'visible-prompt-fallback';
+    }
     throw new Error(label + ' did not return a prompt boundary');
   }
   return result;
@@ -582,9 +588,78 @@ async function waitForClaudeStartupPromptBoundaryWithRecovery(tabId: string, aft
     );
   }
   if (result === 'timeout') {
+    if (await isClaudeStartupPromptReadyByVisiblePrompt(tabId, label + ':prompt-visible-fallback')) {
+      return 'visible-prompt-fallback';
+    }
     throw new Error(label + ' did not return a prompt boundary');
   }
   return result;
+}
+
+function maybeRecoverClaudeStartupDefaultsAfterLateModelBridge(tabId: string, liveModel: string) {
+  const existing = _claudeStartupDefaultsRecoveryInflight.get(tabId);
+  if (existing) return;
+  const gate = getClaudeStartupDefaultsGateSnapshot(tabId);
+  if (gate?.status !== 'failed') return;
+  const gateText = String(gate.error || gate.reason || '');
+  if (!/\/model\s+\S+\s+did not confirm through bridge/i.test(gateText)) return;
+
+  const model = useUIStore.getState().defaultClaudeModel;
+  if (!model || model === 'none' || !_bridgeModelMatchesTarget(model, liveModel)) return;
+
+  const work = (async () => {
+    _modelSentForTab.set(tabId, { at: Date.now(), via: 'bridge-late', model });
+    const eff = useUIStore.getState().defaultClaudeEffort;
+    if (!eff || eff === 'none' || _effortSentForTab.has(tabId)) {
+      console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12)
+        + ' late bridge model recovered gate model=' + liveModel
+        + ' effort=' + (eff || 'none')
+        + ' effortSent=' + _effortSentForTab.has(tabId));
+      markClaudeStartupDefaultsReady(tabId, 'bridge-late-model-confirmed');
+      return;
+    }
+
+    const presence = await ipcRenderer.invoke('claude:get-presence', tabId).catch(() => null);
+    if (presence?.status !== 'active' || presence?.inputReady !== true) {
+      console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12)
+        + ' late bridge model recovered gate while not idle; status=' + (presence?.status || 'unknown')
+        + ' inputReady=' + !!presence?.inputReady
+        + ' effort=' + eff);
+      markClaudeStartupDefaultsReady(tabId, 'bridge-late-model-confirmed-not-idle');
+      return;
+    }
+
+    const promptSeqBeforeEffort = terminalRegistry.getLatestPromptBoundarySeq(tabId);
+    _effortSentForTab.set(tabId, { at: Date.now(), via: 'bridge-late', level: eff });
+    try {
+      const result = await ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff, {
+        source: 'startup-defaults:bridge-late-effort',
+        stashFirst: false,
+        armPromptBoundaryOnSubmit: true,
+      });
+      if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
+      await waitForClaudeStartupPromptBoundaryWithRecovery(
+        tabId,
+        promptSeqBeforeEffort,
+        '/effort ' + eff,
+        'after /effort ' + eff + ' (bridge-late)'
+      );
+      console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12)
+        + ' late bridge model recovered gate and effort completed');
+      markClaudeStartupDefaultsReady(tabId, 'bridge-late-model-confirmed-effort');
+    } catch (e: unknown) {
+      _effortSentForTab.delete(tabId);
+      console.error('[Terminal:StartupDefaults] late bridge effort recovery failed', e);
+      markClaudeStartupDefaultsFailed(tabId, 'bridge-late-model-confirmed-effort', e);
+    }
+  })();
+
+  _claudeStartupDefaultsRecoveryInflight.set(tabId, work);
+  work.finally(() => {
+    if (_claudeStartupDefaultsRecoveryInflight.get(tabId) === work) {
+      _claudeStartupDefaultsRecoveryInflight.delete(tabId);
+    }
+  });
 }
 
 const normalizeStartupSlashText = (text: unknown) => String(text || '').replace(/\u00a0/g, ' ').trim();
@@ -1580,7 +1655,9 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
     const handleBridgeUpdate = (_: any, data: { tabId: string; model?: string }) => {
       if (data.tabId !== tabId) return;
-      _claudeBridgeModelByTab.set(tabId, { model: data.model || 'unknown', at: Date.now() });
+      const liveModel = data.model || 'unknown';
+      _claudeBridgeModelByTab.set(tabId, { model: liveModel, at: Date.now() });
+      maybeRecoverClaudeStartupDefaultsAfterLateModelBridge(tabId, liveModel);
     };
 
     // Gemini Sniper Watcher: receive session ID when Gemini creates it

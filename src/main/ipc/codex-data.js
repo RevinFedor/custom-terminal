@@ -14,6 +14,8 @@ const USAGE_ACCOUNTS_CACHE_TTL_MS = 60 * 1000;
 let modelCache = null;
 let usageAccountsCache = null;
 const loggedRollbackKeys = new Set();
+const _codexJsonlCache = new Map();
+const _codexJsonlInflight = new Map();
 
 function compactPreview(value, max = 120) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
@@ -226,9 +228,90 @@ async function walkJsonlFiles(rootDir, maxFiles = 4000) {
 }
 
 async function parseJsonlFile(filePath) {
+  const inflight = _codexJsonlInflight.get(filePath);
+  if (inflight) {
+    const records = await inflight;
+    return records.slice();
+  }
+  const load = _parseJsonlFileIncremental(filePath);
+  _codexJsonlInflight.set(filePath, load);
+  try {
+    const records = await load;
+    return records.slice();
+  } finally {
+    if (_codexJsonlInflight.get(filePath) === load) {
+      _codexJsonlInflight.delete(filePath);
+    }
+  }
+}
+
+async function _parseJsonlFileIncremental(filePath) {
+  let stat;
+  try {
+    stat = await fs.promises.stat(filePath);
+  } catch {
+    _codexJsonlCache.delete(filePath);
+    return [];
+  }
+
+  const cached = _codexJsonlCache.get(filePath);
+  if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+    return cached.records;
+  }
+
+  if (cached && stat.size > cached.size) {
+    const prevSize = cached.size;
+    const prevLineCount = cached.lineCount || 0;
+    const prevLeftover = cached.leftover || '';
+    const fd = await fs.promises.open(filePath, 'r');
+    let newContent = '';
+    try {
+      const newByteCount = stat.size - prevSize;
+      const buf = Buffer.allocUnsafe(newByteCount);
+      await fd.read(buf, 0, newByteCount, prevSize);
+      newContent = buf.toString('utf8');
+    } finally {
+      await fd.close();
+    }
+
+    const content = prevLeftover + newContent;
+    const lines = content.split('\n');
+    const leftover = lines.pop() || '';
+    const records = cached.records;
+    let parsed = 0;
+    let errors = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      try {
+        const record = JSON.parse(line);
+        records.push({ ...record, __line: prevLineCount + i });
+        parsed += 1;
+      } catch {
+        errors += 1;
+      }
+    }
+    _codexJsonlCache.set(filePath, {
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      lineCount: prevLineCount + lines.length,
+      leftover,
+      records,
+    });
+    console.log('[CodexJsonlCache] append file=' + path.basename(filePath) +
+      ' bytes=' + (stat.size - prevSize) +
+      ' parsed=' + parsed +
+      ' errors=' + errors +
+      ' total=' + records.length +
+      ' leftover=' + leftover.length);
+    return records;
+  }
+
   const text = await fs.promises.readFile(filePath, 'utf8');
   const records = [];
   const lines = text.split('\n');
+  const leftover = lines.pop() || '';
+  let errors = 0;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
@@ -237,9 +320,28 @@ async function parseJsonlFile(filePath) {
       records.push({ ...record, __line: i });
     } catch {
       // Ignore partial/corrupt trailing lines. Codex appends JSONL while running.
+      errors += 1;
     }
   }
+  _codexJsonlCache.set(filePath, {
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    lineCount: lines.length,
+    leftover,
+    records,
+  });
+  console.log('[CodexJsonlCache] full file=' + path.basename(filePath) +
+    ' sizeKB=' + Math.round(stat.size / 1024) +
+    ' records=' + records.length +
+    ' errors=' + errors +
+    ' leftover=' + leftover.length +
+    (cached ? ' reason=rewrite-or-shrink' : ' reason=first-read'));
   return records;
+}
+
+function invalidateCodexJsonlCache(filePath) {
+  if (!filePath) return;
+  _codexJsonlCache.delete(filePath);
 }
 
 function getSessionMeta(records) {
@@ -2047,11 +2149,13 @@ module.exports = {
   editCodexRange,
   getTimelineSessionMeta,
   listCodexModels,
+  invalidateCodexJsonlCache,
   _api: {
     listCodexModels,
     findCodexSessionFile,
     findLatestCodexSession,
     parseJsonlFile,
+    invalidateJsonlCache: invalidateCodexJsonlCache,
     buildCodexCleanEntries,
     buildCodexCleanExport,
     buildCodexRangeExport,

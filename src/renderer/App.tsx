@@ -43,7 +43,7 @@ import {
   stopAgentProcessScenario,
 } from './utils/agentScenarios';
 import { terminalRegistry } from './utils/terminalRegistry';
-import { waitForClaudeStartupDefaultsReady } from './utils/claudeStartupDefaultsGate';
+import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './utils/claudeStartupDefaultsReady';
 import { DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL } from './constants/codexSettings';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from './constants/systemProjects';
 
@@ -1711,6 +1711,15 @@ function App() {
           useWorkspaceStore.getState().setTabSessionStatus(found.projectId, tabId, status || null);
           return reply(true, { tabId, status: status || null });
         }
+        if (action === 'setCodexSessionId') {
+          const { tabId, sessionId, reason } = payload || {};
+          if (!tabId || !sessionId) return reply(false, null, 'tabId+sessionId required');
+          const found = findTabProject(tabId);
+          if (!found) return reply(false, null, 'tab not in any open project');
+          if (found.tab?.commandType !== 'codex') return reply(false, null, 'tab is not Codex');
+          useWorkspaceStore.getState().setCodexSessionId(tabId, sessionId, reason || 'api-edit-range');
+          return reply(true, { tabId, sessionId });
+        }
         if (action === 'applyTabLayout') {
           const { projectId, orderedIds, groupAssignments, visualParentAssignments, groupAnchorAssignments } = payload || {};
           if (!projectId || !Array.isArray(orderedIds)) return reply(false, null, 'projectId+orderedIds required');
@@ -2217,7 +2226,7 @@ function App() {
           const { toolType } = describeAgentTab(tabId);
           try {
             if (toolType === 'claude') {
-              await waitForClaudeStartupDefaultsReady(tabId, Number(timeoutMs) || 15000);
+              await waitForClaudeStartupDefaultsReadyWithVisibleFallback(tabId, Number(timeoutMs) || 15000, 'web-bridge');
             }
             return reply(true, { tabId, toolType, defaultsReady: true });
           } catch (e: any) {

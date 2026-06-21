@@ -96,6 +96,7 @@ const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
 const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCache, getGeminiProjectsJson, calculateGeminiHash } = require(path.join(srcMainDir, 'gemini-utils'));
 const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, deleteEffortEntries, trimTrailingEffortEntries, repairJsonlChainBreaks, _api: claudeDataApi } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
 const codexDataModule = require(path.join(srcMainDir, 'ipc', 'codex-data'));
+const { createSessionTranscriptService } = require(path.join(srcMainDir, 'session-transcript-service'));
 
 // SDK session registry — declared early so the mobile-web server can receive
 // the same Map by reference at startup (web-server.start({sdkSessions})).
@@ -596,6 +597,12 @@ if (process.platform === 'darwin') {
 }
 
 let mainWindow;
+const transcriptService = createSessionTranscriptService({
+  getMainWindow: () => mainWindow,
+  webBroadcast: (tabId, payload) => _webBroadcast(tabId, payload),
+  claudeData: require(path.join(srcMainDir, 'ipc', 'claude-data')),
+  codexData: codexDataModule,
+});
 const terminals = new Map(); // tabId -> ptyProcess
 const terminalProjects = new Map(); // tabId -> cwd path
 const PROCESS_TREE_SNAPSHOT_TTL_MS = 750;
@@ -2047,6 +2054,7 @@ const bridgeDir = path.join(os.homedir(), '.claude', 'bridge');
 const bridgeKnownSessions = new Map(); // tabId → sessionId
 const codexKnownSessions = new Map(); // tabId → sessionId; Codex TUI alive in this PTY
 const aiStoppingTabs = new Map(); // tabId → { toolType, reason, since, sessionId }
+const claudeStartupIntents = new Map(); // tabId → { sessionId, at, reason }
 const bridgeMetadata = new Map(); // tabId → { model, contextPct }
 const bridgePidCache = new Map(); // claudePid → tabId
 const bridgeFileMtimes = new Map(); // filename → mtimeMs
@@ -2364,9 +2372,13 @@ function startSessionBridge() {
 
       // Check for session change
       const oldSessionId = bridgeKnownSessions.get(tabId);
-      if (oldSessionId === data.session_id) return;
+      if (oldSessionId === data.session_id) {
+        claudeStartupIntents.delete(tabId);
+        return;
+      }
 
       bridgeKnownSessions.set(tabId, data.session_id);
+      claudeStartupIntents.delete(tabId);
       clearClaudePendingJsonlOwner(data.session_id, tabId, 'bridge-detected');
       console.log('[Bridge] Tab', tabId, '-> session:', data.session_id.substring(0, 8) + '...', '(model:', data.model + ', ctx:', data.context_pct + '%)');
       emitClaudeTuiReadyFromVisibleBuffer(tabId, 'bridge-fresh').catch((err) => {
@@ -2429,6 +2441,7 @@ function clearBridgeTab(tabId) {
   const wasSpinnerBusy = claudeSpinnerBusy.get(tabId) === true;
   const wasLocalBusy = claudeLocalCommandWatchers.has(tabId);
   bridgeKnownSessions.delete(tabId);
+  claudeStartupIntents.delete(tabId);
   clearClaudePendingJsonlOwnersForTab(tabId, 'bridge-clear');
   // Claude TUI gone — prompt is no longer rendered. Mobile should flip back
   // to "inactive" so the Resume banner shows and the composer/busy spinner
@@ -6822,6 +6835,7 @@ app.whenReady().then(() => {
       // parked canUseTool Promise) + snapshot read for connect-mid-question.
       answerClaudeQuestion: answerClaudeQuestionUnified,
       getClaudePendingQuestion,
+      transcriptService,
     });
     console.log('[Startup] Mobile WebServer OK');
 
@@ -9099,8 +9113,11 @@ ipcMain.on('terminal:force-command-started', (event, payload) => {
     const sessionId = request.sessionId
       || (commandType === 'codex' ? codexKnownSessions.get(tabId) : bridgeKnownSessions.get(tabId))
       || null;
-    if (commandType === 'claude' && sessionId) {
-      markClaudePendingJsonlOwner(sessionId, tabId, 'force-command-started');
+    if (commandType === 'claude') {
+      claudeStartupIntents.set(tabId, { sessionId, at: Date.now(), reason: 'force-command-started' });
+      if (sessionId) {
+        markClaudePendingJsonlOwner(sessionId, tabId, 'force-command-started');
+      }
     }
     _webBroadcast(tabId, {
       type: 'snapshot',
@@ -9465,6 +9482,11 @@ ipcMain.handle('claude:get-presence', (event, tabId) => {
   const hasTerm = terminals.has(tabId);
   const inputReady = claudePromptReady.has(tabId);
   const stopping = aiStoppingTabs.get(tabId);
+  const startupIntent = claudeStartupIntents.get(tabId);
+  const startupIntentFresh = !!startupIntent && (Date.now() - startupIntent.at) < 45_000;
+  if (startupIntent && !startupIntentFresh) {
+    claudeStartupIntents.delete(tabId);
+  }
   // awaiting = Claude is blocked on an AskUserQuestion (purple "needs answer"
   // marker). Surfaced so the mobile tab list can dot the tab the way the desktop
   // glows it. Only meaningful while the process is alive.
@@ -9476,7 +9498,8 @@ ipcMain.handle('claude:get-presence', (event, tabId) => {
     if (isBusy) status = 'busy';
     else if (inputReady) status = 'active';
     else status = 'starting'; // Claude process exists but TUI hasn't drawn the prompt yet
-  } else status = 'inactive';
+  } else if (startupIntentFresh) status = 'starting';
+  else status = 'inactive';
   return { status, hasBridge, isBusy, hasTerm, inputReady: status === 'stopping' ? false : inputReady, awaiting };
 });
 
@@ -10390,12 +10413,14 @@ function makeRewindCancelledError(stage) {
   return err;
 }
 
-ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, targetText, targetFullText, rewindableCount, skipDuplicates = 0, pasteAfter }) => {
+ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, targetText, targetFullText, rewindableCount, skipDuplicates = 0, pasteAfter, deadlineMs }) => {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
   rewindCancelTabs.delete(tabId);
   if (!hasLiveClaudeInTab(tabId)) return { success: false, error: 'no_claude_session' };
   if (claudeTurnBusy.get(tabId) === true) return { success: false, error: 'claude_busy' };
+  const rewindDeadlineAt = Date.now() + Math.max(3000, Math.min(180000, Number(deadlineMs) || 18000));
+  let rewindDeadlineHit = false;
   const selectionMarkerRe = /^[●❯›]\s*/u;
   const selectionMarkerAnywhereRe = /^\s*[●❯›]\s*(.+)$/u;
   const selectionSignalRe = /\x1b\[38;2;\d+;\d+;\d+m|[●❯›]|\x1b\[\?2026l/;
@@ -10580,6 +10605,55 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
     return results;
   }
 
+  function rewindMenuScope(lines) {
+    if (!Array.isArray(lines) || lines.length === 0) {
+      return { scopedLines: [], scopeFound: false, scopeStartRow: null, scopeEndRow: null };
+    }
+
+    let headerIndex = -1;
+    for (let i = 0; i < lines.length; i++) {
+      const text = stripPickerSelectionMarker(lines[i]?.text || '');
+      if (
+        text === 'Rewind' ||
+        text.startsWith('Restore and fork') ||
+        /^[↑↓]\s*\d+\s*more\s*(above|below)$/i.test(text)
+      ) {
+        headerIndex = i;
+      }
+    }
+
+    let footerIndex = -1;
+    for (let i = headerIndex + 1; i < lines.length; i++) {
+      const text = stripPickerSelectionMarker(lines[i]?.text || '');
+      if (/^Enter\s+to\s+continue\b/i.test(text) || /^Esc\s+to\s+cancel\b/i.test(text)) {
+        footerIndex = i;
+        break;
+      }
+    }
+
+    const scopeFound = headerIndex >= 0 || footerIndex >= 0;
+    const start = headerIndex >= 0 ? headerIndex + 1 : 0;
+    const end = footerIndex >= 0 ? footerIndex : lines.length;
+    const scopedLines = lines.slice(start, Math.max(start, end));
+    return {
+      scopedLines,
+      scopeFound,
+      scopeStartRow: Number.isFinite(lines[start]?.row) ? lines[start].row : null,
+      scopeEndRow: Number.isFinite(lines[end - 1]?.row) ? lines[end - 1].row : null,
+    };
+  }
+
+  function extractScopedSelectedCandidates(lines) {
+    const results = [];
+    for (const line of lines || []) {
+      const m = String(line.rawText || line.text || '').match(selectionMarkerAnywhereRe);
+      if (!m) continue;
+      const candidate = normalizeCandidate(m[1]);
+      if (!isMenuChrome(candidate)) results.push(candidate);
+    }
+    return results;
+  }
+
   async function writeAndWait(key, waitFor, timeoutMs, logPrefix) {
     const wait = waitForPtyText(term, waitFor, timeoutMs, logPrefix);
     term.write(key);
@@ -10591,6 +10665,13 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       console.log('[Claude:Rewind] Cancelled at stage=' + stage);
       throw makeRewindCancelledError(stage);
     }
+  }
+
+  function hasRewindDeadlineExpired(stage) {
+    if (Date.now() < rewindDeadlineAt) return false;
+    rewindDeadlineHit = true;
+    console.warn('[Claude:Rewind] Deadline expired stage=' + stage);
+    return true;
   }
 
   async function grabRestoredRewindInput(expectedText) {
@@ -10673,11 +10754,13 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       async function readRendererSelection(reason) {
         const snapshot = await requestTerminalVisibleBufferSnapshot(event.sender, tabId, reason, 700);
         const lines = snapshotLines(snapshot);
+        const menuScope = rewindMenuScope(lines);
+        const selectionLines = menuScope.scopeFound ? menuScope.scopedLines : lines;
         const isSelectedLine = (line) =>
           selectionMarkerRe.test(String(line?.rawText || '')) ||
           line?.hasInverse === true ||
           line?.hasNonDefaultBg === true;
-        const itemLines = lines.filter(isRewindPickerItemLine);
+        const itemLines = selectionLines.filter(isRewindPickerItemLine);
         const markerOrBgSelectedLine = [...itemLines].reverse().find(isSelectedLine) || null;
         const fgHighlightedItemLines = itemLines.filter(line => line.hasNonDefaultFg === true);
         const colorOnlySelectedLine = fgHighlightedItemLines.length === 1 ? fgHighlightedItemLines[0] : null;
@@ -10688,18 +10771,29 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
         const previousItemLine = selectedItemIndex > 0 ? itemLines[selectedItemIndex - 1] : null;
         const selectedIsSlashCommand = !!selectedLine && isClaudeSlashCommandRow(selectedLine.rawText || selectedLine.text);
         const targetBeforeSelectedRaw = !!previousItemLine && textMatchesTargetSilent(previousItemLine.text, targetPrefix);
-        const targetBeforeSelected = targetBeforeSelectedRaw && !selectedIsSlashCommand;
-        const selectedCandidates = extractSnapshotSelectedCandidates(snapshot)
+        const selectedCandidates = (menuScope.scopeFound
+          ? extractScopedSelectedCandidates(selectionLines)
+          : extractSnapshotSelectedCandidates(snapshot))
           .slice(-5)
           .map(candidate => normalizeCandidate(candidate).substring(0, 140));
         const selectedText = selectedLine
           ? stripPickerSelectionMarker(selectedLine.rawText || selectedLine.text)
           : (selectedCandidates.length > 0 ? selectedCandidates[selectedCandidates.length - 1] : null);
+        const selectedTextForBeforeMatch = normalizeCandidate(selectedText || '');
+        const targetBeforeSelected = targetBeforeSelectedRaw && !selectedIsSlashCommand && selectedTextForBeforeMatch.length === 0;
         const selectedMatchesTarget = textMatchesTarget(selectedText, targetPrefix);
         const matchedTarget = selectedMatchesTarget || targetBeforeSelected;
-        const visibleTargetLines = lines
+        const visibleTargetLineObjects = selectionLines
           .filter(line => textMatchesTargetSilent(line.text, targetPrefix))
-          .slice(-5)
+          .slice(-5);
+        const selectedRow = Number.isFinite(selectedLine?.row) ? selectedLine.row : null;
+        const targetAfterSelected = selectedRow != null
+          && visibleTargetLineObjects.some(line => Number.isFinite(line.row) && line.row > selectedRow);
+        const hasMoreAbove = selectionLines.some(line => /^[↑]\s*\d+\s*more\s*above$/i.test(stripPickerSelectionMarker(line.text || '')));
+        const hasMoreBelow = selectionLines.some(line => /^[↓]\s*\d+\s*more\s*below$/i.test(stripPickerSelectionMarker(line.text || '')));
+        const selectedAtFirstItem = selectedItemIndex === 0;
+        const selectedAtLastItem = selectedItemIndex >= 0 && selectedItemIndex === itemLines.length - 1;
+        const visibleTargetLines = visibleTargetLineObjects
           .map(line => ({ row: line.row, text: line.text.substring(0, 140), wrapped: line.wrapped }));
         const visibleLines = lines
           .slice(-16)
@@ -10722,17 +10816,26 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
           cols: snapshot?.cols,
           viewportY: snapshot?.viewportY,
           baseY: snapshot?.baseY,
+          menuScopeFound: menuScope.scopeFound,
+          menuScopeStartRow: menuScope.scopeStartRow,
+          menuScopeEndRow: menuScope.scopeEndRow,
           cursorX: snapshot?.cursorX,
           cursorY: snapshot?.cursorY,
           selectedCandidates,
-          selectedRow: selectedLine?.row ?? null,
+          selectedRow,
           selectedRawText: (selectedLine?.rawText || '').substring(0, 140),
           selectedText: (selectedText || '').substring(0, 140),
           selectedMatchesTarget,
           matchedTarget,
           targetBeforeSelected,
           targetBeforeSelectedRaw,
+          targetAfterSelected,
           selectedIsSlashCommand,
+          selectedAtFirstItem,
+          selectedAtLastItem,
+          itemCount: itemLines.length,
+          hasMoreAbove,
+          hasMoreBelow,
           previousItemText: (previousItemLine?.text || '').substring(0, 140),
           selectedFirstTextStyle: selectedLine?.firstTextStyle || null,
           selectedStyles: selectedLine?.styles || [],
@@ -10747,7 +10850,13 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
           matchedTarget,
           targetBeforeSelected,
           targetBeforeSelectedRaw,
+          targetAfterSelected,
+          menuScopeFound: menuScope.scopeFound,
           selectedIsSlashCommand,
+          selectedAtFirstItem,
+          selectedAtLastItem,
+          hasMoreAbove,
+          hasMoreBelow,
           selectedCandidates,
           visibleTargetLines,
           previousItemText: previousItemLine?.text || '',
@@ -10840,11 +10949,20 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
 
       let found = false;
       let pressCount = 0;
-      let maxPresses = 50;
+      let maxPresses = 40;
       const count = Number(rewindableCount);
       const idx = Number(targetIndex);
       if (Number.isFinite(count) && Number.isFinite(idx) && count > 0 && idx >= 0) {
-        maxPresses = Math.max(80, Math.min(1000, count - idx + skipDuplicates + (Number.isFinite(moreAboveCount) ? moreAboveCount : 0) + 20));
+        const duplicateSkipCount = Math.max(0, Number(skipDuplicates) || 0);
+        const expectedDistance = Math.max(0, count - idx);
+        const slashCommandSlack = Math.min(24, count + 12);
+        maxPresses = Math.max(
+          12,
+          Math.min(
+            120,
+            expectedDistance + duplicateSkipCount + (Number.isFinite(moreAboveCount) ? moreAboveCount : 0) + slashCommandSlack
+          )
+        );
       }
 
       const hasDeterministicIndex = Number.isFinite(count) && Number.isFinite(idx) && count > 0 && idx >= 0 && idx < count;
@@ -10913,8 +11031,8 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
         }
         const ptySelectedText = candidates.length > 0 ? candidates[candidates.length - 1] : null;
         const screenSelection = await readRendererSelection(reason);
-        const selectedText = screenSelection.selectedText || ptySelectedText;
-        const matchedTarget = screenSelection.selectedText
+        const selectedText = screenSelection.menuScopeFound ? screenSelection.selectedText : (screenSelection.selectedText || ptySelectedText);
+        const matchedTarget = screenSelection.menuScopeFound || screenSelection.selectedText
           ? screenSelection.matchedTarget
           : textMatchesTarget(ptySelectedText, targetPrefix);
         logRewindFrame(frameRaw, 'selected-check:' + reason, {
@@ -10925,6 +11043,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
           targetBeforeSelected: screenSelection.targetBeforeSelected,
           targetBeforeSelectedRaw: screenSelection.targetBeforeSelectedRaw,
           selectedIsSlashCommand: screenSelection.selectedIsSlashCommand,
+            menuScopeFound: screenSelection.menuScopeFound,
           selectedText: (selectedText || '').substring(0, 140),
           matchedTarget
         });
@@ -10934,14 +11053,23 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
 
       async function scanForTarget(key, label, maxSteps, duplicateOffset, reason) {
         let duplicatesRemaining = duplicateOffset;
+        let navKey = key;
+        let navLabel = label;
+        let suppressReverseAfterSkippedDuplicate = false;
         console.log('[Claude:Rewind] Navigating ' + reason + ': target="' + targetPrefix.substring(0, 180) + '" key=' + label + ' maxPresses=' + maxSteps + ' skipDuplicates=' + duplicateOffset);
 
         for (let i = 0; i < maxSteps; i++) {
           throwIfRewindCancelled(reason + '#' + i);
+          if (hasRewindDeadlineExpired(reason + '#' + i)) break;
+          const remainingMs = rewindDeadlineAt - Date.now();
+          if (remainingMs < 250) {
+            hasRewindDeadlineExpired(reason + '#remaining');
+            break;
+          }
           const navRaw = await writeAndWait(
-            key,
+            navKey,
             selectionSignalRe,
-            1200,
+            Math.min(1200, remainingMs),
             '[Claude:Rewind:nav]'
           );
           pressCount++;
@@ -10949,33 +11077,61 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
           const candidates = extractSelectedCandidates(navRaw);
           const ptySelectedText = candidates.length > 0 ? candidates[candidates.length - 1] : null;
           const screenSelection = await readRendererSelection(reason + ':' + label + '#' + pressCount);
-          const selectedText = screenSelection.selectedText || ptySelectedText;
-          const matchedTarget = screenSelection.selectedText
+          const selectedText = screenSelection.menuScopeFound ? screenSelection.selectedText : (screenSelection.selectedText || ptySelectedText);
+          const matchedTarget = screenSelection.menuScopeFound || screenSelection.selectedText
             ? screenSelection.matchedTarget
             : textMatchesTarget(ptySelectedText, targetPrefix);
           logRewindFrame(navRaw, reason + ':' + label + '#' + pressCount, {
-            key: label,
+            key: navLabel,
             ptySelectedText: (ptySelectedText || '').substring(0, 140),
             screenSelectedText: (screenSelection.selectedText || '').substring(0, 140),
             screenMatchedTarget: screenSelection.matchedTarget,
             selectedMatchesTarget: screenSelection.selectedMatchesTarget,
             targetBeforeSelected: screenSelection.targetBeforeSelected,
             targetBeforeSelectedRaw: screenSelection.targetBeforeSelectedRaw,
+            targetAfterSelected: screenSelection.targetAfterSelected,
             selectedIsSlashCommand: screenSelection.selectedIsSlashCommand,
+            menuScopeFound: screenSelection.menuScopeFound,
+            selectedAtFirstItem: screenSelection.selectedAtFirstItem,
+            selectedAtLastItem: screenSelection.selectedAtLastItem,
+            hasMoreAbove: screenSelection.hasMoreAbove,
+            hasMoreBelow: screenSelection.hasMoreBelow,
             previousItemText: (screenSelection.previousItemText || '').substring(0, 140),
             visibleTargetLines: screenSelection.visibleTargetLines,
             selectedText: (selectedText || '').substring(0, 140),
             matchedTarget,
             duplicatesRemaining
           });
-          console.log('[Claude:Rewind] ' + label + ' #' + pressCount + ' -> "' + (selectedText || 'null').substring(0, 70) + '"');
+          console.log('[Claude:Rewind] ' + navLabel + ' #' + pressCount + ' -> "' + (selectedText || 'null').substring(0, 70) + '"');
 
           if (!selectedText) continue;
+          if (!matchedTarget && screenSelection.targetAfterSelected && navKey !== '\x1b[B' && !suppressReverseAfterSkippedDuplicate) {
+            navKey = '\x1b[B';
+            navLabel = 'DOWN';
+            console.warn('[Claude:Rewind] target is visible below selected row; switching direction to DOWN');
+            continue;
+          }
+          if (!matchedTarget && navKey === '\x1b[A' && screenSelection.selectedAtFirstItem && !screenSelection.hasMoreAbove) {
+            navKey = '\x1b[B';
+            navLabel = 'DOWN';
+            duplicatesRemaining = 0;
+            suppressReverseAfterSkippedDuplicate = false;
+            console.warn('[Claude:Rewind] reached top of rewind menu without target; switching direction to DOWN and clearing duplicate skip');
+            continue;
+          }
+          if (!matchedTarget && navKey === '\x1b[B' && screenSelection.selectedAtLastItem && !screenSelection.hasMoreBelow) {
+            navKey = '\x1b[A';
+            navLabel = 'UP';
+            suppressReverseAfterSkippedDuplicate = false;
+            console.warn('[Claude:Rewind] reached bottom of rewind menu without target; switching direction to UP');
+            continue;
+          }
           if (!matchedTarget) continue;
 
           if (duplicatesRemaining > 0) {
             duplicatesRemaining--;
-            console.log('[Claude:Rewind] Skipping duplicate (' + duplicatesRemaining + ' remaining)');
+            suppressReverseAfterSkippedDuplicate = true;
+            console.log('[Claude:Rewind] Skipping duplicate (' + duplicatesRemaining + ' remaining); keeping scan direction to avoid re-selecting skipped duplicate');
             continue;
           }
 
@@ -10990,12 +11146,15 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       found = await scanForTarget('\x1b[A', 'UP', maxPresses, skipDuplicates, hasDeterministicIndex ? 'text-scan-index-advisory' : 'fallback');
 
       if (!found) {
-        console.error('[Claude:Rewind] Target not found after ' + pressCount + ' presses. Closing menu.');
+        const notFoundError = rewindDeadlineHit
+          ? 'Target not found in Claude /rewind menu before deadline'
+          : 'Target not found in Claude /rewind menu';
+        console.error('[Claude:Rewind] Target not found after ' + pressCount + ' presses. Closing menu. deadlineHit=' + rewindDeadlineHit);
         try {
           term.write('\x1b');
           await drainPtyData(term, 150, 500);
         } catch {}
-        return { success: false, error: 'Target not found in Claude /rewind menu', pressCount };
+        return { success: false, error: notFoundError, pressCount, deadlineHit: rewindDeadlineHit };
       }
 
       console.log('[Claude:Rewind] Confirming target with Enter');
@@ -14464,6 +14623,7 @@ require(path.join(srcMainDir, 'ipc', 'semantic-search')).register({ projectManag
 // claude:get-timeline, claude:export-clean-session, claude:get-full-history → ipc/claude-data.js
 require(path.join(srcMainDir, 'ipc', 'claude-data')).register({ projectManager, formatToolAction });
 codexDataModule.register();
+transcriptService.registerIpc();
 
 // semantic-index:watch, semantic-index:rebuild, semantic-index:status → ipc/semantic-index-status.js
 require(path.join(srcMainDir, 'ipc', 'semantic-index-status')).register({ getMainWindow: () => mainWindow });

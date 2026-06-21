@@ -1,5 +1,5 @@
 import type { AgentHistoryTool, AgentPtyStatus, HistoryAgentRuntime } from './historyAgentRuntimes';
-import { waitForClaudeStartupDefaultsReady } from './claudeStartupDefaultsGate';
+import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './claudeStartupDefaultsReady';
 import { terminalRegistry } from './terminalRegistry';
 
 const { ipcRenderer } = window.require('electron');
@@ -246,7 +246,7 @@ async function ensureAgentReadyForRewind({
   cwd?: string;
 }): Promise<AgentPtyStatus | undefined> {
   const waitStartupDefaultsIfNeeded = async () => {
-    if (toolType === 'claude') await waitForClaudeStartupDefaultsReady(tabId);
+    if (toolType === 'claude') await waitForClaudeStartupDefaultsReadyWithVisibleFallback(tabId, 15000, 'agent-rewind');
   };
   let presence = await runtime.getPresence(tabId).catch((err: any) => {
     console.warn('[AgentScenario:rewind] presence failed before resume tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' ' + (err?.message || err));
@@ -320,7 +320,7 @@ async function ensureAgentReadyForSend({
   cwd?: string;
 }) {
   const waitStartupDefaultsIfNeeded = async () => {
-    if (toolType === 'claude') await waitForClaudeStartupDefaultsReady(tabId);
+    if (toolType === 'claude') await waitForClaudeStartupDefaultsReadyWithVisibleFallback(tabId, 15000, 'agent-send');
   };
   let presence = await runtime.getPresence(tabId).catch((err: any) => {
     console.warn('[AgentScenario:send] presence failed before send tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' ' + (err?.message || err));
@@ -463,6 +463,7 @@ export async function rewindAgentTimelineScenario({
     rewindableCount,
     skipDuplicates,
     pasteAfter,
+    deadlineMs: rewindMode === 'ai' ? 170_000 : 16_000,
   });
   return {
     tabId,

@@ -14,6 +14,8 @@
 //   POST /api/terminal-tabs/:tabId/send            → send prompt through scenario layer
 //   POST /api/terminal-tabs/:tabId/stop            → stop terminal runtime
 //   GET  /api/terminal-tabs/:tabId/history         → load JSONL/rollout session history
+//   POST /api/terminal-tabs/:tabId/edit-range      → Claude JSONL / Codex rollout middle compact
+//   POST /api/terminal-tabs/:tabId/delete-range    → Claude JSONL middle delete
 //   GET  /api/events?token=...&tabId=...           → live terminal event stream
 //
 // WS protocol — server → client:
@@ -51,19 +53,23 @@ const isInboxProjectId = (projectId) => projectId === INBOX_PROJECT_ID;
 let findSessionFile = null;
 let parseTimelineUuids = null;
 let parseTimelineEntries = null;
+let claudeDataApi = null;
 let loadCodexSessionRecords = null;
 let buildCodexTimeline = null;
 let listCodexModels = null;
+let codexDataApi = null;
 try {
   const cd = require(path.join(__dirname, 'ipc', 'claude-data'));
   findSessionFile = cd.findSessionFile;
   parseTimelineUuids = cd.parseTimelineUuids;
   parseTimelineEntries = cd.parseTimelineEntries;
+  claudeDataApi = cd._api || null;
 } catch (e) {
   console.warn('[WebServer] claude-data helpers not loaded:', e.message);
 }
 try {
   const codex = require(path.join(__dirname, 'ipc', 'codex-data'));
+  codexDataApi = codex._api || null;
   loadCodexSessionRecords = codex._api?.loadSessionRecords || null;
   buildCodexTimeline = codex._api?.buildCodexTimeline || codex.buildCodexTimeline || null;
   listCodexModels = codex.listCodexModels || codex._api?.listCodexModels || null;
@@ -119,6 +125,7 @@ let computeProjectActivity = null;
 // getClaudePendingQuestion reads the live pending question for the SSE snapshot.
 let answerClaudeQuestion = null;
 let getClaudePendingQuestion = null;
+let transcriptService = null;
 // tabId → Set<Sink>. A Sink is the common interface for both transports:
 //   { kind:'ws'|'sse', send(str):void, isAlive():bool, close():void }
 // WebSocket and SSE both register here so webBroadcast() fans out to either
@@ -247,6 +254,132 @@ async function waitForAgentReady(tabId, timeoutMs = 20_000) {
     timer = setTimeout(fail, limitMs);
     check();
   });
+}
+
+async function resolveClaudeHistoryMutationTarget(tabId, body = {}) {
+  if (!claudeDataApi || !claudeDataApi.editRange || !claudeDataApi.deleteRange) {
+    const err = new Error('claude history mutation API is not initialised');
+    err.statusCode = 500;
+    throw err;
+  }
+
+  let status = null;
+  try {
+    status = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
+  } catch (e) {
+    const err = new Error('tab is not open or status is unavailable: ' + String(e.message || e));
+    err.statusCode = 409;
+    throw err;
+  }
+
+  const toolType = status?.toolType || status?.commandType;
+  if (toolType !== 'claude' && status?.commandType !== 'claude') {
+    const err = new Error('history range mutation is Claude-only for terminal-tabs API');
+    err.statusCode = 400;
+    err.details = { commandType: status?.commandType || null, toolType: status?.toolType || null };
+    throw err;
+  }
+  if (status?.status === 'stopping' || status?.stopping === true) {
+    const err = new Error('tab is stopping; history range mutation is not allowed');
+    err.statusCode = 409;
+    err.details = { status: status?.status || null };
+    throw err;
+  }
+
+  const statusSessionId = cleanOptionalString(status?.sessionId || status?.claudeSessionId, '');
+  const requestedSessionId = cleanOptionalString(body.sessionId, '');
+  const sessionId = requestedSessionId || statusSessionId;
+  if (!sessionId) {
+    const err = new Error('Claude session id is required');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (requestedSessionId && statusSessionId && requestedSessionId !== statusSessionId) {
+    const err = new Error('body.sessionId does not match tab sessionId');
+    err.statusCode = 409;
+    err.details = { requestedSessionId, tabSessionId: statusSessionId };
+    throw err;
+  }
+
+  const cwd = cleanOptionalString(body.cwd, '') || cleanOptionalString(status?.cwd, '');
+  const startUuid = cleanOptionalString(body.startUuid || body.targetUuid, '');
+  const endUuid = cleanOptionalString(body.endUuid, '');
+  if (!startUuid || !endUuid) {
+    const err = new Error('startUuid and endUuid required');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  return { status, sessionId, cwd, startUuid, endUuid };
+}
+
+async function resolveEditRangeMutationTarget(tabId, body = {}) {
+  let status = null;
+  try {
+    status = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
+  } catch (e) {
+    const err = new Error('tab is not open or status is unavailable: ' + String(e.message || e));
+    err.statusCode = 409;
+    throw err;
+  }
+
+  const toolType = status?.toolType || status?.commandType;
+  if (toolType !== 'claude' && toolType !== 'codex') {
+    const err = new Error('history edit-range is supported only for Claude/Codex terminal tabs');
+    err.statusCode = 400;
+    err.details = { commandType: status?.commandType || null, toolType: status?.toolType || null };
+    throw err;
+  }
+  if (status?.status === 'stopping' || status?.stopping === true) {
+    const err = new Error('tab is stopping; history range mutation is not allowed');
+    err.statusCode = 409;
+    err.details = { status: status?.status || null, toolType };
+    throw err;
+  }
+  if (toolType === 'codex' && status?.status !== 'inactive') {
+    const err = new Error('Codex edit-range requires an inactive tab; stop Codex before mutating rollout history');
+    err.statusCode = 409;
+    err.details = { status: status?.status || null, toolType };
+    throw err;
+  }
+  if (toolType === 'claude' && (!claudeDataApi || !claudeDataApi.editRange)) {
+    const err = new Error('claude history mutation API is not initialised');
+    err.statusCode = 500;
+    throw err;
+  }
+  if (toolType === 'codex' && !codexDataApi?.editCodexRange) {
+    const err = new Error('codex history mutation API is not initialised');
+    err.statusCode = 500;
+    throw err;
+  }
+
+  const statusSessionId = toolType === 'codex'
+    ? cleanOptionalString(status?.sessionId || status?.codexSessionId, '')
+    : cleanOptionalString(status?.sessionId || status?.claudeSessionId, '');
+  const requestedSessionId = cleanOptionalString(body.sessionId, '');
+  const sessionId = requestedSessionId || statusSessionId;
+  if (!sessionId) {
+    const err = new Error((toolType === 'codex' ? 'Codex' : 'Claude') + ' session id is required');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (requestedSessionId && statusSessionId && requestedSessionId !== statusSessionId) {
+    const err = new Error('body.sessionId does not match tab sessionId');
+    err.statusCode = 409;
+    err.details = { requestedSessionId, tabSessionId: statusSessionId, toolType };
+    throw err;
+  }
+
+  const cwd = cleanOptionalString(body.cwd, '') || cleanOptionalString(status?.cwd, '');
+  const startUuid = cleanOptionalString(body.startUuid || body.targetUuid, '');
+  const endUuid = cleanOptionalString(body.endUuid, '');
+  if (!startUuid || !endUuid) {
+    const err = new Error('startUuid and endUuid required');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  return { status, toolType, sessionId, cwd, startUuid, endUuid };
 }
 
 function scheduleExternalRunStop(run, reason = 'auto-stop') {
@@ -900,6 +1033,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       // immediately without waiting for the next broadcast.
       sendInitialSnapshot(tabId, sink, sdkSessions).catch(() => {});
       startClaudeTabWatcher(tabId).catch(() => {});
+      startTranscriptSubscriptionForTab(tabId).catch(() => {});
     }
 
     // Heartbeat: SSE connections die silently behind some proxies/radios.
@@ -913,6 +1047,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       clearInterval(hb);
       unsubscribeAll(sink);
       if (!isProjectActivity) releaseClaudeWatchersIfOrphan();
+      if (!isProjectActivity) releaseTranscriptSubscriptionsIfOrphan();
       console.log('[WebSSE:Close] tab=' + shortId(topic, 12) + ' scope=' + (isProjectActivity ? 'projects' : 'tab') + ' sent=' + sink.sent + ' errors=' + sink.errors);
     };
     req.on('close', cleanup);
@@ -1643,17 +1778,38 @@ async function handleApi(req, res, parsed, sdkSessions) {
       }
       try {
         const status = await waitForAgentReady(tabId, startupTimeoutMs);
-        const defaults = await bridgeRequest('waitAgentStartupDefaultsReady', { tabId, timeoutMs: startupTimeoutMs }, Math.max(5000, startupTimeoutMs));
+        let defaultsReady = false;
+        let defaultsError = null;
+        let liveStatus = status;
+        try {
+          const defaults = await bridgeRequest('waitAgentStartupDefaultsReady', { tabId, timeoutMs: startupTimeoutMs }, Math.max(5000, startupTimeoutMs));
+          defaultsReady = defaults?.defaultsReady === true;
+        } catch (defaultsErr) {
+          defaultsError = String(defaultsErr.message || defaultsErr);
+          try {
+            liveStatus = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000) || status;
+          } catch {
+            liveStatus = status;
+          }
+          const liveReady = liveStatus
+            && (liveStatus.status === 'active' || liveStatus.status === 'busy')
+            && liveStatus.inputReady === true;
+          if (!liveReady) throw defaultsErr;
+          console.warn('[MobResume] startup defaults failed after live resume tab=' + shortId(tabId, 12)
+            + ' status=' + (liveStatus?.status || '-')
+            + ' error=' + defaultsError);
+        }
         return sendJson(res, 200, {
           ok: true,
           success: true,
           ready: true,
           ...(data || {}),
-          startupDefaultsReady: defaults?.defaultsReady === true,
-          status: status?.status || 'active',
-          starting: status?.status === 'starting',
-          stopping: status?.status === 'stopping',
-          inputReady: status?.inputReady === true,
+          startupDefaultsReady: defaultsReady,
+          startupDefaultsError: defaultsError,
+          status: liveStatus?.status || 'active',
+          starting: liveStatus?.status === 'starting',
+          stopping: liveStatus?.status === 'stopping',
+          inputReady: liveStatus?.inputReady === true,
         });
       } catch (readyErr) {
         return sendJson(res, 504, {
@@ -1713,6 +1869,133 @@ async function handleApi(req, res, parsed, sdkSessions) {
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
+  // Middle history compact-edit for Claude JSONL / Codex rollout. This is NOT
+  // native `/rewind`: it calls the same core edit-range implementation as
+  // desktop Timeline. It does not run Gemini or stop/restart a live agent.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/edit-range$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]);
+    const started = Date.now();
+    const prefix = '[WebEditRange] tab=' + shortId(tabId, 12);
+    const clearPending = startRoutePendingLog(prefix, started);
+    console.log(prefix + ' START');
+    try {
+      const body = await readBody(req);
+      const compactText = cleanOptionalString(body.compactText, '').trim();
+      if (!compactText) {
+        clearPending();
+        return sendJson(res, 400, { ok: false, success: false, error: 'compactText required' });
+      }
+      const target = await resolveEditRangeMutationTarget(tabId, body);
+      console.log(prefix + ' BODY tool=' + target.toolType +
+        ' sid=' + shortId(target.sessionId) +
+        ' start=' + shortId(target.startUuid) +
+        ' end=' + shortId(target.endUuid) +
+        ' status=' + (target.status?.status || '-') +
+        ' compactChars=' + compactText.length);
+      const result = target.toolType === 'codex'
+        ? await codexDataApi.editCodexRange({
+          sessionId: target.sessionId,
+          cwd: target.cwd,
+          startUuid: target.startUuid,
+          endUuid: target.endUuid,
+          compactText,
+        })
+        : await claudeDataApi.editRange({
+          sessionId: target.sessionId,
+          cwd: target.cwd,
+          startUuid: target.startUuid,
+          endUuid: target.endUuid,
+          compactText,
+        });
+      let adoptedSessionId = null;
+      let adoptionError = null;
+      if (target.toolType === 'codex' && result?.success !== false && result?.newSessionId) {
+        try {
+          await bridgeRequest('setCodexSessionId', {
+            tabId,
+            sessionId: result.newSessionId,
+            reason: 'api-edit-range',
+          }, 3000);
+          adoptedSessionId = result.newSessionId;
+        } catch (adoptErr) {
+          adoptionError = String(adoptErr.message || adoptErr);
+          console.warn(prefix + ' ADOPT_FAILED newSid=' + shortId(result.newSessionId) + ' error=' + adoptionError);
+        }
+      }
+      clearPending();
+      console.log(prefix + ' DONE tool=' + target.toolType +
+        ' success=' + (result?.success === true) +
+        ' removed=' + (result?.removedCount == null ? '-' : result.removedCount) +
+        ' newSid=' + shortId(result?.newSessionId) +
+        ' adopted=' + shortId(adoptedSessionId) +
+        ' ms=' + (Date.now() - started));
+      const statusCode = result?.success === false ? 409 : 200;
+      return sendJson(res, statusCode, {
+        ok: result?.success !== false,
+        mode: 'compact',
+        toolType: target.toolType,
+        tabId,
+        sessionId: target.sessionId,
+        adoptedSessionId,
+        adoptionError,
+        startUuid: target.startUuid,
+        endUuid: target.endUuid,
+        ...result,
+      });
+    } catch (e) {
+      clearPending();
+      const statusCode = e.statusCode || 500;
+      console.warn(prefix + ' ERROR ' + String(e.message || e) + ' ms=' + (Date.now() - started));
+      return sendJson(res, statusCode, { ok: false, success: false, error: String(e.message || e), ...(e.details || {}) });
+    }
+  }
+
+  // Middle history deletion for Claude JSONL. Unlike /truncate, this removes an
+  // arbitrary active-branch range and relinks entryAfter to entryBefore.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/delete-range$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]);
+    const started = Date.now();
+    const prefix = '[WebDeleteRange] tab=' + shortId(tabId, 12);
+    const clearPending = startRoutePendingLog(prefix, started);
+    console.log(prefix + ' START');
+    try {
+      const body = await readBody(req);
+      const target = await resolveClaudeHistoryMutationTarget(tabId, body);
+      console.log(prefix + ' BODY sid=' + shortId(target.sessionId) +
+        ' start=' + shortId(target.startUuid) +
+        ' end=' + shortId(target.endUuid) +
+        ' status=' + (target.status?.status || '-'));
+      const result = await claudeDataApi.deleteRange({
+        sessionId: target.sessionId,
+        cwd: target.cwd,
+        startUuid: target.startUuid,
+        endUuid: target.endUuid,
+      });
+      clearPending();
+      console.log(prefix + ' DONE success=' + (result?.success === true) +
+        ' removed=' + (result?.removedCount == null ? '-' : result.removedCount) +
+        ' fileDeleted=' + (result?.fileDeleted === true) +
+        ' ms=' + (Date.now() - started));
+      const statusCode = result?.success === false ? 409 : 200;
+      return sendJson(res, statusCode, {
+        ok: result?.success !== false,
+        mode: 'delete',
+        tabId,
+        sessionId: target.sessionId,
+        startUuid: target.startUuid,
+        endUuid: target.endUuid,
+        ...result,
+      });
+    } catch (e) {
+      clearPending();
+      const statusCode = e.statusCode || 500;
+      console.warn(prefix + ' ERROR ' + String(e.message || e) + ' ms=' + (Date.now() - started));
+      return sendJson(res, statusCode, { ok: false, success: false, error: String(e.message || e), ...(e.details || {}) });
     }
   }
 
@@ -1975,6 +2258,34 @@ async function handleApi(req, res, parsed, sdkSessions) {
         console.log(`${timelinePrefix} NO_SESSION bridge=${tBridge-t0}ms total=${Date.now()-t0}ms`);
         return sendJson(res, 200, { entries: [] });
       }
+      if (transcriptService && (toolType === 'codex' || toolType === 'claude')) {
+        const timelineResult = await transcriptService.getTimeline({ tabId, toolType, sessionId, cwd });
+        if (!timelineResult?.success) {
+          clearPending();
+          console.log(`${timelinePrefix} TRANSCRIPT_NO_TIMELINE tool=${toolType} bridge=${tBridge-t0}ms total=${Date.now()-t0}ms error=${String(timelineResult?.error || '-')}`);
+          return sendJson(res, 200, { entries: [], sessionId, toolType });
+        }
+        const entries = timelineResult.entries || [];
+        let fullEntries = [];
+        if (entries.some(e => e?.type === 'compact' || e?.role === 'compact' || e?.kind === 'compact')) {
+          try {
+            if (toolType === 'codex') {
+              const full = await transcriptService.getHistory({ tabId, toolType, sessionId, cwd });
+              fullEntries = Array.isArray(full?.entries) ? full.entries : [];
+            } else {
+              const full = await bridgeRequest('loadAgentFullHistory', { tabId }, 5000);
+              fullEntries = Array.isArray(full?.entries) ? full.entries : [];
+            }
+          } catch (summaryErr) {
+            console.log(`[WebTiming] /timeline TRANSCRIPT_COMPACT_SUMMARY_SKIP ${String(summaryErr.message)}`);
+          }
+        }
+        const mobileEntries = normalizeMobileTimelineEntries(entries, fullEntries);
+        const tParse = Date.now();
+        clearPending();
+        console.log(`${timelinePrefix} DONE tool=${toolType} source=transcript entries=${mobileEntries.length} bridge=${tBridge-t0}ms parse=${tParse-tBridge}ms total=${tParse-t0}ms`);
+        return sendJson(res, 200, { entries: mobileEntries, sessionId, toolType, count: mobileEntries.length });
+      }
       if (toolType === 'codex') {
         if (!loadCodexSessionRecords || !buildCodexTimeline) {
           clearPending();
@@ -2064,7 +2375,28 @@ async function handleApi(req, res, parsed, sdkSessions) {
     console.log(`[WebTiming] /history START tabId=${tabId.slice(0, 24)} last=${lastN || 'all'} after=${afterUuid ? afterUuid.slice(0, 8) : 'none'} before=${beforeUuid ? beforeUuid.slice(0, 8) : 'none'} around=${aroundUuid ? aroundUuid.slice(0, 8) : 'none'} radius=${aroundRadius} view=${wantHistoryEntries ? 'history' : 'messages'} ndjson=${wantNdjson}`);
     try {
       if (wantHistoryEntries) {
-        const data = await bridgeRequest('loadAgentFullHistory', { tabId }, 5000);
+        let data = null;
+        if (transcriptService) {
+          try {
+            const info = await resolveAgentSessionInfo(tabId, 1500);
+            if (info?.toolType === 'codex' && info?.sessionId) {
+              data = await transcriptService.getHistory({
+                tabId,
+                toolType: info.toolType,
+                sessionId: info.sessionId,
+                cwd: info.cwd || null,
+              });
+              if (data?.success) {
+                data = { ...data, toolType: info.toolType, commandType: info.toolType, sessionId: info.sessionId };
+              } else {
+                data = null;
+              }
+            }
+          } catch (e) {
+            console.log(`[WebTiming] /history TRANSCRIPT_HISTORY_SKIP ${String(e.message)}`);
+          }
+        }
+        if (!data) data = await bridgeRequest('loadAgentFullHistory', { tabId }, 5000);
         let entries = Array.isArray(data?.entries) ? data.entries : [];
         const total = entries.length;
         let dropped = 0;
@@ -2100,7 +2432,28 @@ async function handleApi(req, res, parsed, sdkSessions) {
         return sendJson(res, 200, { ...data, entries, total, truncated, dropped, etag, firstUuid, lastUuid });
       }
 
-      const data = await bridgeRequest('loadSDKHistory', { tabId });
+      let data = null;
+      if (transcriptService) {
+        try {
+          const info = await resolveAgentSessionInfo(tabId, 1500);
+          if (info?.toolType === 'codex' && info?.sessionId) {
+            data = await transcriptService.getMessages({
+              tabId,
+              toolType: info.toolType,
+              sessionId: info.sessionId,
+              cwd: info.cwd || null,
+            });
+            if (data?.success) {
+              data = { ...data, toolType: info.toolType, commandType: info.toolType, sessionId: info.sessionId };
+            } else {
+              data = null;
+            }
+          }
+        } catch (e) {
+          console.log(`[WebTiming] /history TRANSCRIPT_MESSAGES_SKIP ${String(e.message)}`);
+        }
+      }
+      if (!data) data = await bridgeRequest('loadSDKHistory', { tabId });
       const allMsgs = data?.messages || [];
       const total = allMsgs.length;
 
@@ -2302,6 +2655,17 @@ function releaseClaudeWatchersIfOrphan() {
   }
 }
 
+function releaseTranscriptSubscriptionsIfOrphan() {
+  if (!transcriptService) return;
+  for (const [tid, consumerId] of webTranscriptSubscriptions) {
+    const set = subscribers.get(tid);
+    const hasLiveSubscriber = set && Array.from(set).some((sink) => sink?.isAlive?.());
+    if (hasLiveSubscriber) continue;
+    webTranscriptSubscriptions.delete(tid);
+    transcriptService.unsubscribe({ consumerId }).catch(() => {});
+  }
+}
+
 // Called from main.js when SDK/PTY fires events. Cheap O(n) over clients
 // subscribed to that specific tabId — usually 0-1 phone connected. Transport
 // (ws/sse) is opaque here; each Sink knows how to write itself.
@@ -2387,6 +2751,7 @@ function broadcastProjectActivity(reason = 'event') {
 //
 // tabId -> { sessionId, filePath, offset, watcher, leftover, timer, inflight, attempts }
 const claudeTabWatchers = new Map();
+const webTranscriptSubscriptions = new Map();
 // Tabs whose WS is subscribed but Claude hasn't produced a sessionId yet.
 // When sessionId arrives via main's `claude:session-detected` IPC path we
 // promote them to live watchers — no polling, no timeouts. The set is also
@@ -2408,6 +2773,36 @@ function notifyClaudeSessionAvailable(tabId) {
   startClaudeTabWatcher(tabId).catch((e) => {
     console.warn('[ClaudeWatcher] late-start failed for', shortId(tabId, 12), e?.message);
   });
+}
+
+async function startTranscriptSubscriptionForTab(tabId) {
+  if (!transcriptService || !tabId) return;
+  let status;
+  try {
+    status = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
+  } catch (e) {
+    console.warn('[TranscriptWebSub] status failed tabId=' + shortId(tabId, 12) + ' err=' + (e?.message || e));
+    return;
+  }
+  const toolType = status?.toolType || status?.commandType;
+  const sessionId = status?.sessionId || status?.claudeSessionId || status?.codexSessionId;
+  if (!sessionId || (toolType !== 'claude' && toolType !== 'codex')) return;
+  const consumerId = 'web:' + tabId;
+  try {
+    await transcriptService.subscribe({
+      tabId,
+      consumerId,
+      toolType,
+      sessionId,
+      cwd: status.cwd || null,
+    });
+    webTranscriptSubscriptions.set(tabId, consumerId);
+  } catch (e) {
+    console.warn('[TranscriptWebSub] subscribe failed tabId=' + shortId(tabId, 12) +
+      ' tool=' + toolType +
+      ' session=' + shortId(sessionId) +
+      ' err=' + (e?.message || e));
+  }
 }
 
 async function startClaudeTabWatcher(tabId) {
@@ -2648,6 +3043,7 @@ function attachWebSocket(server, sdkSessions) {
         sendInitialSnapshot(tabId, sink, sdkSessions).catch(() => {});
         // Start fs-watch on PTY+Claude tab's JSONL (no-op for SDK tabs).
         startClaudeTabWatcher(tabId).catch(() => {});
+        startTranscriptSubscriptionForTab(tabId).catch(() => {});
       }
       ws.on('message', (raw) => {
         try {
@@ -2656,18 +3052,19 @@ function attachWebSocket(server, sdkSessions) {
             subscribe(msg.tabId, sink);
             sendInitialSnapshot(msg.tabId, sink, sdkSessions).catch(() => {});
             startClaudeTabWatcher(msg.tabId).catch(() => {});
+            startTranscriptSubscriptionForTab(msg.tabId).catch(() => {});
           }
         } catch {}
       });
-      ws.on('close', () => { unsubscribeAll(sink); releaseClaudeWatchersIfOrphan(); });
-      ws.on('error', () => { unsubscribeAll(sink); releaseClaudeWatchersIfOrphan(); });
+      ws.on('close', () => { unsubscribeAll(sink); releaseClaudeWatchersIfOrphan(); releaseTranscriptSubscriptionsIfOrphan(); });
+      ws.on('error', () => { unsubscribeAll(sink); releaseClaudeWatchersIfOrphan(); releaseTranscriptSubscriptionsIfOrphan(); });
     });
   });
 }
 
 // ───────── lifecycle ─────────
 
-function start({ sdkSessions, computeActiveLoaders: computeFn, computeProjectActivity: computeProjectActivityFn, answerClaudeQuestion: answerFn, getClaudePendingQuestion: getQFn }) {
+function start({ sdkSessions, computeActiveLoaders: computeFn, computeProjectActivity: computeProjectActivityFn, answerClaudeQuestion: answerFn, getClaudePendingQuestion: getQFn, transcriptService: transcriptServiceFn }) {
   if (httpServer) {
     console.log('[WebServer] already started');
     return;
@@ -2677,6 +3074,7 @@ function start({ sdkSessions, computeActiveLoaders: computeFn, computeProjectAct
   computeProjectActivity = computeProjectActivityFn || null;
   answerClaudeQuestion = answerFn || null;
   getClaudePendingQuestion = getQFn || null;
+  transcriptService = transcriptServiceFn || null;
   token = loadOrCreateToken();
   registerBridgeReplyHandler();
 
@@ -2736,12 +3134,19 @@ function stop() {
   if (wss) try { wss.close(); } catch {}
   if (httpServer) try { httpServer.close(); } catch {}
   try { fs.unlinkSync(DISCOVERY_FILE); } catch {}
+  if (transcriptService) {
+    for (const consumerId of webTranscriptSubscriptions.values()) {
+      transcriptService.unsubscribe({ consumerId }).catch(() => {});
+    }
+    webTranscriptSubscriptions.clear();
+  }
   httpServer = null;
   wss = null;
   computeActiveLoaders = null;
   computeProjectActivity = null;
   answerClaudeQuestion = null;
   getClaudePendingQuestion = null;
+  transcriptService = null;
   subscribers.clear();
 }
 

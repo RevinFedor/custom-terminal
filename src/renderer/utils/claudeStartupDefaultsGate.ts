@@ -78,6 +78,17 @@ export function clearClaudeStartupDefaultsGate(tabId: string) {
   emitGateEvent(tabId, 'ready', 'cleared');
 }
 
+export function getClaudeStartupDefaultsGateSnapshot(tabId: string) {
+  const existing = getGate(tabId);
+  if (!existing) return null;
+  return {
+    status: existing.status,
+    at: existing.at,
+    reason: existing.reason,
+    error: existing.error,
+  };
+}
+
 export async function waitForClaudeStartupDefaultsReady(tabId: string, timeoutMs = 15000) {
   const existing = getGate(tabId);
   if (!existing || existing.status === 'ready') return;

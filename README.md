@@ -139,6 +139,8 @@ POST /api/terminal-tabs/:tabId/resume
 GET  /api/terminal-tabs/:tabId/status
 GET  /api/terminal-tabs/:tabId/history
 GET  /api/terminal-tabs/:tabId/timeline
+POST /api/terminal-tabs/:tabId/edit-range    { startUuid, endUuid, compactText }
+POST /api/terminal-tabs/:tabId/delete-range  { startUuid, endUuid }
 GET  /api/terminal-tabs/:tabId/params
 POST /api/terminal-tabs/:tabId/params
 GET  /api/events?token=&tabId=           # SSE live channel

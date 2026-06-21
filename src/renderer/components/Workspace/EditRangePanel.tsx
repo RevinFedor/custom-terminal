@@ -23,9 +23,26 @@ interface Message {
 }
 
 interface ApplyStep {
+  key: ApplyStage;
   label: string;
   status: 'pending' | 'active' | 'done';
 }
+
+type ApplyStage = 'stopping' | 'editing' | 'restarting';
+
+const APPLY_STAGES: Array<{ key: ApplyStage; label: string }> = [
+  { key: 'stopping', label: 'Останавливаю агента' },
+  { key: 'editing', label: 'Обновляю историю' },
+  { key: 'restarting', label: 'Запускаю агента' },
+];
+
+const buildApplySteps = (activeStage: ApplyStage): ApplyStep[] => {
+  const activeIndex = APPLY_STAGES.findIndex((stage) => stage.key === activeStage);
+  return APPLY_STAGES.map((stage, index) => ({
+    ...stage,
+    status: index < activeIndex ? 'done' : index === activeIndex ? 'active' : 'pending',
+  }));
+};
 
 interface EditRangePanelProps {
   sourceContent: string;
@@ -34,7 +51,11 @@ interface EditRangePanelProps {
   anchorHeight: number;
   rightOffset: number;
   autoEditInitial?: boolean;
-  onApply: (compactText: string) => Promise<{ removedCount: number; removedUsers?: number; removedAssistants?: number }>;
+  onApply: (
+    compactText: string,
+    onProgress?: (stage: ApplyStage) => void,
+  ) => Promise<{ removedCount: number; removedUsers?: number; removedAssistants?: number }>;
+  onApplyError?: (error: unknown) => void;
   onClose: () => void;
 }
 
@@ -46,6 +67,7 @@ export default function EditRangePanel({
   rightOffset,
   autoEditInitial,
   onApply,
+  onApplyError,
   onClose,
 }: EditRangePanelProps) {
   const { getPromptById, rewindPromptId, savePrompt } = usePromptsStore();
@@ -132,24 +154,28 @@ export default function EditRangePanel({
     }
 
     setApplyPhase('running');
-    setApplySteps([
-      { label: 'Остановка сессии', status: 'active' },
-      { label: 'Редактирование JSONL', status: 'pending' },
-      { label: 'Перезапуск агента', status: 'pending' },
-    ]);
+    setApplySteps(buildApplySteps('stopping'));
 
     try {
       // Step 1 → 2 → 3 happen inside onApply
-      const result = await onApply(lastAssistant);
+      const result = await onApply(lastAssistant, (stage) => {
+        setApplySteps(buildApplySteps(stage));
+      });
 
       setApplyResult(result);
       setApplyPhase('done');
+      onClose();
     } catch (err: any) {
       console.error('[EditRange] Apply failed:', err);
+      if (onApplyError) {
+        onApplyError(err);
+      } else {
+        showToast(err?.message || 'Edit Range apply failed', 'error', 4000);
+      }
       setApplyPhase('idle');
       setApplySteps([]);
     }
-  }, [lastAssistant, isLoading, applyPhase, onApply, onClose]);
+  }, [lastAssistant, isLoading, applyPhase, onApply, onApplyError, onClose, showToast]);
 
   const handleSend = useCallback(async () => {
     const trimmed = inputValue.trim();
@@ -429,7 +455,7 @@ export default function EditRangePanel({
             <div style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: '#ec4899', animation: 'bounce 1s infinite', animationDelay: '-0.15s' }} />
             <div style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: '#ec4899', animation: 'bounce 1s infinite' }} />
           </div>
-          <span style={{ fontSize: '12px', fontWeight: 600, color: '#ec4899' }}>Применение...</span>
+          <span style={{ fontSize: '12px', fontWeight: 600, color: '#ec4899' }}>Применяю откат...</span>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '8px' }}>
             {applySteps.map((step, i) => (
               <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>

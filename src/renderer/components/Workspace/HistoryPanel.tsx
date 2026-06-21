@@ -1611,9 +1611,25 @@ function AgentHistoryControls({
       setError(message);
       setDraftWarning(null);
     };
+    const handleStartupGate = (event: Event) => {
+      const detail = ((event as CustomEvent).detail || {}) as { tabId?: string; status?: string; reason?: string; error?: string };
+      if (detail.tabId !== tabId) return;
+      if (detail.status === 'failed') {
+        const message = String(detail.error || detail.reason || 'Claude startup failed').trim();
+        setError(message);
+        setDraftWarning(null);
+        refreshPresence();
+      } else if (detail.status === 'ready') {
+        refreshPresence();
+      }
+    };
     window.addEventListener('history-panel:agent-error', handleAgentError);
-    return () => window.removeEventListener('history-panel:agent-error', handleAgentError);
-  }, [tabId]);
+    window.addEventListener('claude-startup-defaults-gate', handleStartupGate);
+    return () => {
+      window.removeEventListener('history-panel:agent-error', handleAgentError);
+      window.removeEventListener('claude-startup-defaults-gate', handleStartupGate);
+    };
+  }, [refreshPresence, tabId]);
 
   useEffect(() => {
     const handleTuiReady = (_: any, data: { tabId?: string }) => {
@@ -2448,6 +2464,13 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     [entries, rewindPreview],
   );
   const displayEntries = rewindPreviewResult.entries;
+  const pendingInitialHistoryIndex = useMemo(() => {
+    if (!historyScrollToUuid || displayEntries.length === 0) return -1;
+    return displayEntries.findIndex((entry) => entry.uuid === historyScrollToUuid);
+  }, [historyScrollToUuid, displayEntries]);
+  const initialTopMostItemIndex = pendingInitialHistoryIndex >= 0
+    ? { index: pendingInitialHistoryIndex, align: 'center' as const, behavior: 'auto' as const }
+    : (displayEntries.length > 0 ? displayEntries.length - 1 : 0);
   const rewindPreviewHiddenCount = rewindPreviewResult.hiddenCount;
   // Last entry uuid Claude's own backtrace reaches before stopping at the first
   // orphan. Any entry at index <= boundary is part of the chain-break zone:
@@ -2479,6 +2502,10 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   // without depending on `entries` (which would invalidate downstream effects
   // on every refresh).
   const lengthRef = useRef(0);
+  const panelDiagContextRef = useRef('');
+  panelDiagContextRef.current = ' open=' + (isOpen ? 1 : 0) +
+    ' embedded=' + (embedded ? 1 : 0) +
+    ' tool=' + toolType;
 
   // ========== SEARCH ==========
   const [searchOpen, setSearchOpen] = useState(false);
@@ -2881,8 +2908,8 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const loadHistory = useCallback(async (isRefresh = false) => {
     if (!sessionId) return false;
     try {
-      const ipcChannel = toolType === 'gemini' ? 'gemini:get-full-history' : toolType === 'codex' ? 'codex:get-full-history' : 'claude:get-full-history';
-      const result = await ipcRenderer.invoke(ipcChannel, { sessionId, cwd });
+      const ipcChannel = toolType === 'gemini' ? 'gemini:get-full-history' : toolType === 'codex' ? 'agent-transcript:get-history' : 'claude:get-full-history';
+      const result = await ipcRenderer.invoke(ipcChannel, { toolType, sessionId, cwd, tabId });
       if (result.success) {
         const now = Date.now();
         for (const [handoffId, suppressed] of suppressedPromptsRef.current) {
@@ -3077,11 +3104,57 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     }
   }, [loading, tabId]);
 
-  // Incremental refresh every 3s
+  // Event-driven transcript refresh. The main process watches JSONL/rollout
+  // changes and emits a lightweight invalidation; HistoryPanel keeps its own
+  // merge/local-prompt logic by reusing loadHistory(true).
   useEffect(() => {
-    const interval = setInterval(() => loadHistory(true), 3000);
-    return () => clearInterval(interval);
-  }, [loadHistory]);
+    if (!sessionId || toolType === 'gemini') return;
+    const consumerId = 'history:' + tabId;
+    let disposed = false;
+    let refreshQueued = false;
+    const queueRefresh = (reason: string) => {
+      if (refreshQueued || disposed) return;
+      refreshQueued = true;
+      requestAnimationFrame(() => {
+        refreshQueued = false;
+        if (disposed) return;
+        historyDiag('TRANSCRIPT_REFRESH tab=' + tabId.slice(-12) +
+          ' session=' + sessionId.substring(0, 8) +
+          ' tool=' + toolType +
+          ' reason=' + reason);
+        loadHistory(true);
+      });
+    };
+    const onChanged = (_event: any, detail: any) => {
+      if (detail?.sessionId !== sessionId) return;
+      if (detail?.toolType && detail.toolType !== toolType) return;
+      queueRefresh(detail?.reason || 'transcript-change');
+    };
+    ipcRenderer.on('agent-transcript:changed', onChanged);
+    ipcRenderer.invoke('agent-transcript:subscribe', {
+      consumerId,
+      tabId,
+      toolType,
+      sessionId,
+      cwd,
+    }).then((result: any) => {
+      historyDiag('TRANSCRIPT_SUBSCRIBE tab=' + tabId.slice(-12) +
+        ' session=' + sessionId.substring(0, 8) +
+        ' tool=' + toolType +
+        ' ok=' + (result?.success ? '1' : '0') +
+        ' file=' + (result?.filePath ? '1' : '0'));
+    }).catch((e: any) => {
+      historyDiag('TRANSCRIPT_SUBSCRIBE_ERROR tab=' + tabId.slice(-12) +
+        ' session=' + sessionId.substring(0, 8) +
+        ' tool=' + toolType +
+        ' error=' + String(e?.message || e));
+    });
+    return () => {
+      disposed = true;
+      ipcRenderer.removeListener('agent-transcript:changed', onChanged);
+      ipcRenderer.invoke('agent-transcript:unsubscribe', { consumerId }).catch(() => {});
+    };
+  }, [sessionId, cwd, tabId, toolType, loadHistory]);
 
   // Listen for scroll-to-bottom from Timeline arrow button
   useEffect(() => {
@@ -3111,7 +3184,71 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   // the loop must survive the re-render caused by clearing historyScrollToUuid.
   const scrollGenRef = useRef(0);
   const scrollMountedRef = useRef(true);
-  useEffect(() => () => { scrollMountedRef.current = false; scrollGenRef.current++; }, []);
+  const historyScrollInFlightRef = useRef<{
+    uuid: string;
+    gen: number;
+    startedAt: number;
+    attempts: number;
+  } | null>(null);
+  const lastProgrammaticHistoryScrollRef = useRef<{
+    uuid: string;
+    doneAt: number;
+    reason: string;
+    scrollTop: number;
+    userIntentLogged: boolean;
+    scrollEventLogged: boolean;
+  } | null>(null);
+  useEffect(() => () => {
+    scrollMountedRef.current = false;
+    historyScrollInFlightRef.current = null;
+    scrollGenRef.current++;
+  }, []);
+
+  const cancelHistoryScrollFromUser = useCallback((reason: string) => {
+    const inFlight = historyScrollInFlightRef.current;
+    if (!inFlight) return false;
+    if (!scrollMountedRef.current || scrollGenRef.current !== inFlight.gen) {
+      historyScrollInFlightRef.current = null;
+      return false;
+    }
+    scrollGenRef.current++;
+    historyScrollInFlightRef.current = null;
+    setFlashUuid(null);
+    const scroller = virtuosoScrollerRef.current;
+    historyDiag('SCROLL_TO_CANCEL tab=' + tabId.slice(-12) +
+      ' uuid=' + inFlight.uuid.slice(0, 8) +
+      panelDiagContextRef.current +
+      ' reason=' + reason +
+      ' attempts=' + inFlight.attempts +
+      ' elapsedMs=' + Math.round(performance.now() - inFlight.startedAt) +
+      ' range=' + visibleRangeRef.current.start + '-' + visibleRangeRef.current.end +
+      ' scrollTop=' + Math.round(scroller?.scrollTop || 0) +
+      ' scrollHeight=' + Math.round(scroller?.scrollHeight || 0));
+    window.dispatchEvent(
+      new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: inFlight.uuid, found: true, reason } }),
+    );
+    return true;
+  }, [tabId]);
+
+  const handleUserScrollIntent = useCallback((event: Event) => {
+    const reason = event.type === 'touchmove' ? 'user-touchmove' : 'user-wheel';
+    if (cancelHistoryScrollFromUser(reason)) return;
+    const lastJump = lastProgrammaticHistoryScrollRef.current;
+    if (!lastJump || lastJump.userIntentLogged) return;
+    const ageMs = performance.now() - lastJump.doneAt;
+    if (ageMs > 1500) return;
+    lastJump.userIntentLogged = true;
+    const scroller = virtuosoScrollerRef.current;
+    historyDiag('USER_SCROLL_AFTER_JUMP tab=' + tabId.slice(-12) +
+      ' uuid=' + lastJump.uuid.slice(0, 8) +
+      panelDiagContextRef.current +
+      ' type=' + event.type +
+      ' ageMs=' + Math.round(ageMs) +
+      ' doneReason=' + lastJump.reason +
+      ' range=' + visibleRangeRef.current.start + '-' + visibleRangeRef.current.end +
+      ' scrollTop=' + Math.round(scroller?.scrollTop || 0) +
+      ' jumpScrollTop=' + Math.round(lastJump.scrollTop));
+  }, [cancelHistoryScrollFromUser, tabId]);
 
   useEffect(() => {
     if (!historyScrollToUuid) return;
@@ -3123,36 +3260,73 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     // (which re-runs the effect → early-return above) does not abort the loop.
     setHistoryScrollToUuid(null);
     if (idx < 0) {
+      historyDiag('SCROLL_TO_MISS tab=' + tabId.slice(-12) +
+        ' uuid=' + targetUuid.slice(0, 8) +
+        panelDiagContextRef.current +
+        ' entries=' + displayEntries.length +
+        ' reason=uuid-not-in-display');
       // entry doesn't exist in this session — acknowledge so the dot spinner clears
       window.dispatchEvent(
-        new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: targetUuid, found: false } }),
+        new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: targetUuid, found: false, reason: 'uuid-not-in-display' } }),
       );
       return;
     }
 
-    // Variable-height virtualization race. When the panel was just opened
-    // (closed→open — the Cmd+click path), Virtuoso mounts at the tail
-    // (initialTopMostItemIndex = last) and a single scrollToIndex fired in the
-    // same tick lands on an ESTIMATED offset — the rows above the target aren't
-    // measured yet, so the farther the target the larger the error (user:
-    // «на длинных дистанциях скроллится не к тому юзерпромпту»). When the panel
-    // was already open the rows are measured and one call is accurate.
-    // Fix: re-issue scrollToIndex across frames until the target row's real DOM
-    // rect stops moving (Virtuoso has honored the scroll AND finished measuring),
-    // then flash + emit the done-event. Stability — not a fixed delay — is the
-    // signal, so it self-adapts to short vs long distances.
+    // Variable-height virtualization race. On the closed→open Cmd+click path
+    // the list now mounts at the target index when possible, but rows above the
+    // target are still estimated until Virtuoso measures them. Re-issue
+    // scrollToIndex across frames until the target row's real DOM rect stops
+    // moving (Virtuoso has honored the scroll AND finished measuring), then
+    // flash + emit the done-event. Stability is the signal.
     const myGen = ++scrollGenRef.current;
+    const startedAt = performance.now();
     let attempts = 0;
     let stable = 0;
     let lastTop: number | null = null;
-    const MAX_ATTEMPTS = 40; // ~40 × 40ms ≈ 1.6s ceiling
+    let sawNode = false;
+    const MAX_ATTEMPTS = 240; // rAF bounded; long variable-height sessions may need many measurements
+    historyScrollInFlightRef.current = { uuid: targetUuid, gen: myGen, startedAt, attempts: 0 };
 
-    const finish = () => {
+    historyDiag('SCROLL_TO_START tab=' + tabId.slice(-12) +
+      ' uuid=' + targetUuid.slice(0, 8) +
+      panelDiagContextRef.current +
+      ' idx=' + idx +
+      ' entries=' + displayEntries.length +
+      ' initialIdx=' + pendingInitialHistoryIndex +
+      ' range=' + visibleRangeRef.current.start + '-' + visibleRangeRef.current.end +
+      ' scrollTop=' + Math.round(virtuosoScrollerRef.current?.scrollTop || 0));
+
+    const finish = (found: boolean, reason: string) => {
       if (!scrollMountedRef.current || scrollGenRef.current !== myGen) return;
-      setFlashUuid(targetUuid);
+      const scroller = virtuosoScrollerRef.current;
+      historyScrollInFlightRef.current = null;
+      historyDiag('SCROLL_TO_DONE tab=' + tabId.slice(-12) +
+        ' uuid=' + targetUuid.slice(0, 8) +
+        panelDiagContextRef.current +
+        ' found=' + found +
+        ' reason=' + reason +
+        ' attempts=' + attempts +
+        ' sawNode=' + sawNode +
+        ' stable=' + stable +
+        ' elapsedMs=' + Math.round(performance.now() - startedAt) +
+        ' range=' + visibleRangeRef.current.start + '-' + visibleRangeRef.current.end +
+        ' scrollTop=' + Math.round(scroller?.scrollTop || 0) +
+        ' scrollHeight=' + Math.round(scroller?.scrollHeight || 0));
+      if (found) {
+        lastProgrammaticHistoryScrollRef.current = {
+          uuid: targetUuid,
+          doneAt: performance.now(),
+          reason,
+          scrollTop: scroller?.scrollTop || 0,
+          userIntentLogged: false,
+          scrollEventLogged: false,
+        };
+        setFlashUuid(targetUuid);
+      }
       window.dispatchEvent(
-        new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: targetUuid, found: true } }),
+        new CustomEvent('history-panel:scrolled-to', { detail: { tabId, uuid: targetUuid, found, reason } }),
       );
+      if (!found) return;
       setTimeout(() => {
         if (scrollMountedRef.current && scrollGenRef.current === myGen) setFlashUuid(null);
       }, 600);
@@ -3160,11 +3334,20 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
 
     const step = () => {
       if (!scrollMountedRef.current || scrollGenRef.current !== myGen) return; // superseded / unmounted
-      virtuosoRef.current?.scrollToIndex({ index: idx, align: 'center', behavior: 'auto' });
+      const currentIdx = entriesRef.current.findIndex((e) => e.uuid === targetUuid);
+      if (currentIdx < 0) {
+        finish(false, 'target-disappeared');
+        return;
+      }
+      virtuosoRef.current?.scrollToIndex({ index: currentIdx, align: 'center', behavior: 'auto' });
       attempts++;
+      if (historyScrollInFlightRef.current?.gen === myGen) {
+        historyScrollInFlightRef.current.attempts = attempts;
+      }
       const scroller = virtuosoScrollerRef.current;
       const node = scroller?.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`) as HTMLElement | null;
       if (node && scroller) {
+        sawNode = true;
         // Offset of the row relative to the scroller's own viewport — immune to
         // the panel's slide-in transform (both translate together), so this only
         // moves when the INTERNAL scroll position is still settling.
@@ -3173,13 +3356,16 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         lastTop = top;
         // Mounted + position unchanged for 2 consecutive frames, after at least
         // a few scrollToIndex calls → Virtuoso has settled on the target row.
-        if (stable >= 2 && attempts >= 3) { finish(); return; }
+        if (stable >= 2 && attempts >= 3) { finish(true, 'stable-mounted'); return; }
       }
-      if (attempts >= MAX_ATTEMPTS) { finish(); return; }
-      setTimeout(step, 40);
+      if (attempts >= MAX_ATTEMPTS) {
+        finish(sawNode, sawNode ? 'max-attempts-mounted' : 'max-attempts-unmounted');
+        return;
+      }
+      requestAnimationFrame(step);
     };
-    setTimeout(step, 0);
-  }, [historyScrollToUuid, loading, displayEntries, tabId, setHistoryScrollToUuid]);
+    requestAnimationFrame(step);
+  }, [historyScrollToUuid, loading, displayEntries, pendingInitialHistoryIndex, tabId, setHistoryScrollToUuid]);
 
   // Native scroll handler — runs on the Virtuoso scroller element via a
   // direct addEventListener (Virtuoso doesn't pass an onScroll prop through
@@ -3192,6 +3378,23 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const handleScroll = useCallback(() => {
     const el = virtuosoScrollerRef.current;
     if (!el) return;
+    const deltaTop = el.scrollTop - lastScrollTopRef.current;
+    const lastJump = lastProgrammaticHistoryScrollRef.current;
+    if (lastJump && !lastJump.scrollEventLogged) {
+      const ageMs = performance.now() - lastJump.doneAt;
+      if (ageMs <= 1500) {
+        lastJump.scrollEventLogged = true;
+        historyDiag('SCROLL_EVENT_AFTER_JUMP tab=' + tabId.slice(-12) +
+          ' uuid=' + lastJump.uuid.slice(0, 8) +
+          panelDiagContextRef.current +
+          ' ageMs=' + Math.round(ageMs) +
+          ' deltaTop=' + Math.round(deltaTop) +
+          ' doneReason=' + lastJump.reason +
+          ' range=' + visibleRangeRef.current.start + '-' + visibleRangeRef.current.end +
+          ' scrollTop=' + Math.round(el.scrollTop) +
+          ' jumpScrollTop=' + Math.round(lastJump.scrollTop));
+      }
+    }
     const distFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight);
     isAtBottomRef.current = distFromBottom < 150;
     if (scrollArrowRef.current) {
@@ -3498,9 +3701,18 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
             // FAB toggle / position-save stays identical to pre-virtuoso behavior.
             scrollerRef={(el) => {
               const prev = virtuosoScrollerRef.current;
-              if (prev && prev !== el) prev.removeEventListener('scroll', handleScroll);
+              if (prev && prev !== el) {
+                prev.removeEventListener('scroll', handleScroll);
+                prev.removeEventListener('wheel', handleUserScrollIntent);
+                prev.removeEventListener('touchmove', handleUserScrollIntent);
+              }
               virtuosoScrollerRef.current = el as HTMLElement | null;
-              if (el) (el as HTMLElement).addEventListener('scroll', handleScroll, { passive: true });
+              if (el) {
+                const scroller = el as HTMLElement;
+                scroller.addEventListener('scroll', handleScroll, { passive: true });
+                scroller.addEventListener('wheel', handleUserScrollIntent, { passive: true });
+                scroller.addEventListener('touchmove', handleUserScrollIntent, { passive: true });
+              }
             }}
             rangeChanged={(range) => {
               visibleRangeRef.current = { start: range.startIndex, end: range.endIndex };
@@ -3510,9 +3722,10 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
             // and Cmd+F treeWalker include the immediate neighborhood (Virtuoso
             // would otherwise unmount items just past the viewport).
             increaseViewportBy={{ top: 600, bottom: 600 }}
-            // Start at the tail by default — matches the prior behavior where
-            // long sessions opened at the most-recent message.
-            initialTopMostItemIndex={displayEntries.length > 0 ? displayEntries.length - 1 : 0}
+            // Start at the requested Timeline target when Cmd+click opened the
+            // panel; otherwise start at the tail, matching the usual History
+            // open behavior for long sessions.
+            initialTopMostItemIndex={initialTopMostItemIndex}
             followOutput={() => (isAtBottomRef.current ? 'auto' : false)}
             style={{ height: '100%' }}
             itemContent={(_idx, entry) => {
