@@ -267,7 +267,10 @@ export default function TabPreviewPopover({
   // Финальная ширина popover'а: max между notesBox.width и шириной meta-карточки.
   // Если есть только metadata (split=false и hasNotes=false) — даём metaRows
   // занять до previewWidth и определиться по контенту.
-  const popoverWidth = notesBox?.width ?? Math.min(previewWidth, 320);
+  const metadataOnlyWidth = source?.startsWith('home-')
+    ? Math.min(420, Math.max(240, window.innerWidth - VIEWPORT_MARGIN * 2))
+    : Math.min(previewWidth, 320);
+  const popoverWidth = notesBox?.width ?? metadataOnlyWidth;
 
   // Placement резолвится так: явный prop `placement` (новый API) > legacy `split/forceAbove`
   // (Home above-режим) > `smartPosition` > дефолт ниже. `'right'` рендерит сбоку справа от
@@ -488,10 +491,11 @@ function MetaList({ rows }: { rows: MetaRow[] }) {
         <div
           key={idx}
           style={{
-            wordBreak: row.wrap === false ? 'normal' : 'break-all',
+            wordBreak: row.wrap === false ? 'normal' : 'break-word',
             color: row.muted ? '#888' : '#ccc',
             whiteSpace: row.wrap === false ? 'nowrap' : 'normal',
             overflow: row.wrap === false ? 'hidden' : 'visible',
+            overflowWrap: row.wrap === false ? 'normal' : 'anywhere',
             textOverflow: row.wrap === false ? 'ellipsis' : 'clip',
           }}
         >

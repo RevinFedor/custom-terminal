@@ -1,7 +1,7 @@
 # Feature: Semantic Search (Session History)
 
 ## Intro
-Поиск по истории сессий Claude через embedding-based cosine similarity. Основная подсистема индексирует JSONL-файлы сессий в SQLite и ищет по смыслу внутри Q+A чанков ("проблемы с вставкой" → найдёт "TTYHOG limit 1024 bytes"). Отдельно существует лёгкий title-only поиск для ProjectHome: он индексирует только названия закрытых вкладок и не заменяет transcript search.
+Поиск по истории сессий Claude через embedding-based cosine similarity. Основная подсистема индексирует JSONL-файлы сессий в SQLite и ищет по смыслу внутри Q+A чанков ("проблемы с вставкой" → найдёт "TTYHOG limit 1024 bytes"). Отдельно существуют два лёгких поиска для ProjectHome: title-only индекс по названиям закрытых вкладок и iteration-index по user-итерациям сохранённых Claude/Codex сессий. Они не заменяют full transcript search по `session_chunks`.
 
 ## Архитектура
 
@@ -23,11 +23,21 @@
 
 ### Title-only поиск на ProjectHome
 
-Home top-search разделён на два режима: instant local filter по `tab_history.name` и RAG по отдельному индексу `tab_history_title_index`. Этот индекс намеренно хранит только названия вкладок (`history_id`, `project_id`, `name_hash`, `embedding`) и использует ту же embedding-модель (`gemini-embedding-001`, 768 dims), но не читает JSONL transcript'ы и не создаёт `session_chunks`.
+Home top input сейчас работает как instant local filter по `tab_history.name`. Отдельный индекс `tab_history_title_index` всё ещё существует, но это maintenance/search substrate для названий вкладок, а не текущая семантика видимой кнопки `RAG`. Индекс намеренно хранит только названия вкладок (`history_id`, `project_id`, `name_hash`, `embedding`) и использует ту же embedding-модель (`gemini-embedding-001`, 768 dims), но не читает JSONL transcript'ы и не создаёт `session_chunks`.
 
-Причина разделения — latency и mental model. Пользователь печатает в верхнем поиске Home, чтобы найти вкладку по названию; поэтому обычный ввод должен реагировать мгновенно без Gemini/API. `Cmd+Enter`/кнопка `RAG` — отдельный semantic step поверх уже построенного title index. Если title index пустой, semantic search возвращает пусто без запроса к Gemini; сначала нужно нажать `Index`.
+Причина разделения — latency и mental model. Пользователь печатает в верхнем поиске Home, чтобы найти вкладку по названию; поэтому обычный ввод должен реагировать мгновенно без Gemini/API. Видимая кнопка `RAG` и `Cmd+Enter` в текущем Home запускают iteration-search по user-сообщениям. Если title semantic path возвращается в UI, он должен иметь отдельный режим/чип и не делить affordance с iteration-search. Если title index пустой, title semantic search возвращает пусто без запроса к Gemini; сначала нужно нажать `Index`.
 
 Индексация title-only rows маленькая и показывается прямо в кнопке `Index` (`current/total`). Не добавлять отдельный тяжёлый progress panel в Home: это служебное действие на несколько сотен/тысяч коротких строк, а не full transcript rebuild.
+
+### Iteration search на ProjectHome
+
+Кнопка `RAG` в Home запускает не title-only RAG, а semantic search по user-итерациям. Индекс хранится в `tab_history_iteration_index`: `history_id`, `project_id`, `tool_type`, `session_id`, `entry_uuid`, `iteration_index`, optional summary/content, hash и embedding. Parser нельзя писать заново: Claude берётся через существующий `parseTimelineEntries`, Codex через существующий Codex timeline builder, чтобы `entry_uuid` совпадал с HistoryPanel/Timeline.
+
+Stats умеют работать по диапазону `dateFrom`: для уже распарсенных histories total = discovered user-iterations, для ещё не распарсенных histories approximate total временно берётся из `tab_history.message_count`. При `dateFrom` все stats/search/reindex фильтруются по `tab_history.closed_at >= dateFrom`.
+
+У iteration index есть отдельная scan-отметка per history. Она нужна не для поиска, а для честного `new/total`: history может не дать ни одной user-итерации, потому что transcript удалён, cwd больше не существует или parser вернул пустой список. Без scan-отметки такая history навсегда остаётся в approximate tail через `message_count`, и пользователь видит один и тот же результат после полного reindex, например `520/1981` → повторный Index → снова `520/1981`. После `Full`-прохода stats должны считать approximate total только для history без index-rows и без scan-row; всё просмотренное схлопывается к реально discovered итерациям.
+
+Progress iteration index состоит из двух фаз: scan histories и embed pending iterations. Renderer получает события после каждой обработанной history и после каждого embedding batch; между sync-парсингом rows main process отдаёт event loop, чтобы кнопка не висела на `0/N` до финального скачка.
 
 ### Stats path на ProjectHome
 
@@ -49,6 +59,9 @@ SCAN session_chunks USING INDEX idx_chunks_embedding_present
 ### Текущее решение
 `gemini-embedding-001` с `outputDimensionality: 768` — truncated Matryoshka embedding. Качество поиска сохраняется, размер базы ~230MB на 74K чанков. Модель бесплатная (free tier: 1500 RPM, 1M tok/min).
 
+### Usage logging в Settings
+Embedding-вызовы пишутся в общий Settings → AI → Statistics журнал как модель `gemini-embedding-001`: transcript index/query, title index/query, iteration index/query. Логировать нужно **операцию**, а не каждый `batchEmbedContents`: пользователь хочет видеть "одна цельная индексация = одна строка", иначе history превращается в шум из десятков batch-строк. У embedding API нет такой же `usageMetadata`, как у generateContent, поэтому input/total в статистике — приблизительная оценка по фактически отправленным символам после `MAX_CHUNK_CHARS`-обрезки (`ceil(chars / 4)`); output/thinking остаются нулевыми. Эти строки участвуют в totals/by model/history, но не в by prompt, потому что у embedding нет настраиваемого prompt.
+
 ### Hash + Embedding Guard
 При первой индексации модель была сломана → 74K чанков сохранились без embeddings (только FTS). При повторном Index `isFileIndexed()` проверял только file hash и пропускал файлы. **Решение**: проверять `hash match AND embedding IS NOT NULL`. Без этого re-index после смены модели не работает.
 
@@ -68,7 +81,8 @@ Gemini сессии хранятся в другом формате и не ин
 
 ## Симптомы типичных проблем
 - **"Search возвращает 0 результатов"** → чанки без embeddings (проверить `SELECT COUNT(*) FROM session_chunks WHERE embedding IS NOT NULL`). Причина: индексация прошла со сломанной моделью. Решение: нажать Index повторно.
-- **"RAG по Home вкладкам возвращает 0 результатов"** → проверить `tab_history_title_index`, а не `session_chunks`. Title-only поиск не индексирует transcript'ы; для него нужен `tab-title-index:reindex`.
+- **"Title semantic по Home вкладкам возвращает 0 результатов"** → проверить `tab_history_title_index`, а не `session_chunks`. Title-only поиск не индексирует transcript'ы; для него нужен `tab-title-index:reindex`. Видимый `RAG` в Home сейчас относится к iteration-search, поэтому не диагностировать его через title index.
+- **"RAG по Home iteration возвращает 0 результатов"** → проверить `tab_history_iteration_index`, date range в Home и наличие embeddings. Результаты должны содержать `entryUuid`; без него preview не сможет перейти к найденной итерации.
 - **"Одинаковые результаты в выдаче"** → форкнутые сессии. См. "Дубликаты из форкнутых сессий".
 - **"Indexing зависает"** → rate limit Gemini API. Уменьшить лимит сессий в настройках.
 - **"Только что закрытая большая сессия не ищется"** → auto-index на close был пропущен по размеру файла (>5MB). Это ожидаемо; запустить ручной Index.

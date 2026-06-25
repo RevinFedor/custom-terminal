@@ -18,7 +18,7 @@ export default function ToastContainer() {
         position: 'fixed',
         top: '52px',
         right: '16px',
-        zIndex: 9999,
+        zIndex: 30000,
         pointerEvents: 'none',
         display: 'flex',
         flexDirection: 'column',

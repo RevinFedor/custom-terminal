@@ -95,6 +95,8 @@ interface HistoryPanelProps {
   toolType?: 'claude' | 'gemini' | 'codex';
   enableClaudePtyControls?: boolean;
   embedded?: boolean;
+  embeddedFill?: boolean;
+  previewMode?: boolean;
 }
 
 interface RewindPreviewState {
@@ -2586,7 +2588,7 @@ function AgentHistoryControls({
 }
 
 
-function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, toolType = 'claude', enableClaudePtyControls = false, embedded = false }: HistoryPanelProps) {
+function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, toolType = 'claude', enableClaudePtyControls = false, embedded = false, embeddedFill = false, previewMode = false }: HistoryPanelProps) {
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const setHistoryPanelWidth = useUIStore((s) => s.setHistoryPanelWidth);
   const historyScrollToUuid = useUIStore((s) => s.historyScrollToUuid);
@@ -3703,6 +3705,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       }
     };
     const handleMouseUp = () => {
+      if (previewMode || embeddedFill) return;
       if (isResizing.current) {
         isResizing.current = false;
         document.body.style.cursor = '';
@@ -3715,7 +3718,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
     };
-  }, [notesPanelWidth, setHistoryPanelWidth]);
+  }, [embeddedFill, notesPanelWidth, previewMode, setHistoryPanelWidth]);
 
   const handleResizeDoubleClick = useCallback(() => {
     closePanel();
@@ -3729,30 +3732,32 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         top: 0,
         bottom: 0,
         right: 0,
-        width: embedded ? (slideIn ? width : 0) : width,
+        width: embedded ? (embeddedFill ? '100%' : (slideIn ? width : 0)) : width,
         height: '100%',
         flexShrink: 0,
         overflow: 'hidden',
         backgroundColor: '#1a1a1a',
-        borderLeft: embedded && !slideIn ? 'none' : '1px solid #333',
+        borderLeft: embedded && (!slideIn || previewMode) ? 'none' : '1px solid #333',
         zIndex: 101,
         display: 'flex',
         flexDirection: 'column',
         transform: embedded ? 'none' : (slideIn ? 'translateX(0)' : 'translateX(100%)'),
-        transition: embedded ? 'width 50ms ease-out' : 'transform 50ms ease-out',
+        transition: embedded ? (embeddedFill ? 'none' : 'width 50ms ease-out') : 'transform 50ms ease-out',
       }}
     >
       {/* Resize handle (left edge) */}
-      <div
-        onMouseDown={handleResizeMouseDown}
-        onDoubleClick={handleResizeDoubleClick}
-        style={{
-          position: 'absolute', left: 0, top: 0, bottom: 0, width: 4,
-          cursor: 'col-resize', zIndex: 10, backgroundColor: 'transparent',
-        }}
-        onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.backgroundColor = '#5b9cf5'; }}
-        onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.backgroundColor = 'transparent'; }}
-      />
+      {!previewMode && !embeddedFill && (
+        <div
+          onMouseDown={handleResizeMouseDown}
+          onDoubleClick={handleResizeDoubleClick}
+          style={{
+            position: 'absolute', left: 0, top: 0, bottom: 0, width: 4,
+            cursor: 'col-resize', zIndex: 10, backgroundColor: 'transparent',
+          }}
+          onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.backgroundColor = '#5b9cf5'; }}
+          onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.backgroundColor = 'transparent'; }}
+        />
+      )}
 
       {/* Header */}
       <div
@@ -3820,56 +3825,60 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
           </>
         )}
         {!searchOpen && <div style={{ flex: 1 }} />}
-        <button
-          aria-label="Reset History panel width"
-          onClick={resetPanelWidth}
-          style={{
-            background: 'none',
-            border: 'none',
-            color: width === HISTORY_PANEL_DEFAULT_WIDTH ? '#444' : '#666',
-            cursor: 'pointer',
-            padding: 2,
-            width: 22,
-            height: 22,
-            display: 'inline-flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            position: 'relative',
-            flexShrink: 0,
-          }}
-          onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
-          onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = width === HISTORY_PANEL_DEFAULT_WIDTH ? '#444' : '#666'; }}
-        >
-          <RotateCcw size={15} />
-          <span
-            aria-hidden
-            style={{
-              position: 'absolute',
-              left: 0,
-              right: 0,
-              top: '50%',
-              transform: 'translateY(-48%)',
-              textAlign: 'center',
-              fontSize: 7,
-              fontWeight: 800,
-              lineHeight: 1,
-              pointerEvents: 'none',
-            }}
-          >
-            W
-          </span>
-        </button>
-        <button
-          onClick={closePanel}
-          style={{
-            background: 'none', border: 'none', color: '#666',
-            cursor: 'pointer', padding: 2, display: 'flex', alignItems: 'center', flexShrink: 0,
-          }}
-          onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
-          onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#666'; }}
-        >
-          <X size={14} />
-        </button>
+        {!previewMode && (
+          <>
+            <button
+              aria-label="Reset History panel width"
+              onClick={resetPanelWidth}
+              style={{
+                background: 'none',
+                border: 'none',
+                color: width === HISTORY_PANEL_DEFAULT_WIDTH ? '#444' : '#666',
+                cursor: 'pointer',
+                padding: 2,
+                width: 22,
+                height: 22,
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                position: 'relative',
+                flexShrink: 0,
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = width === HISTORY_PANEL_DEFAULT_WIDTH ? '#444' : '#666'; }}
+            >
+              <RotateCcw size={15} />
+              <span
+                aria-hidden
+                style={{
+                  position: 'absolute',
+                  left: 0,
+                  right: 0,
+                  top: '50%',
+                  transform: 'translateY(-48%)',
+                  textAlign: 'center',
+                  fontSize: 7,
+                  fontWeight: 800,
+                  lineHeight: 1,
+                  pointerEvents: 'none',
+                }}
+              >
+                W
+              </span>
+            </button>
+            <button
+              onClick={closePanel}
+              style={{
+                background: 'none', border: 'none', color: '#666',
+                cursor: 'pointer', padding: 2, display: 'flex', alignItems: 'center', flexShrink: 0,
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#fff'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#666'; }}
+            >
+              <X size={14} />
+            </button>
+          </>
+        )}
       </div>
 
       {/* Content */}

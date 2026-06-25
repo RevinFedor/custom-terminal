@@ -183,6 +183,30 @@ function trimError(error: unknown) {
   return String(error || 'Unknown error').replace(/\s+/g, ' ').trim().slice(0, 240);
 }
 
+function basenameFromPath(filePath: string) {
+  const parts = filePath.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || filePath;
+}
+
+function makeRepository(repoPath: string, projectPath?: string | null, home = false): GitRepository {
+  const root = String(projectPath || '').replace(/[\\/]+$/, '');
+  const rel = root && repoPath !== root && (repoPath.startsWith(root + '/') || repoPath.startsWith(root + '\\'))
+    ? repoPath.slice(root.length + 1)
+    : '';
+  return {
+    path: repoPath,
+    name: basenameFromPath(repoPath),
+    relativePath: rel || (home ? '' : repoPath),
+    home,
+  };
+}
+
+function makeHomeRepositories(repoPath?: string | null): GitRepository[] {
+  const repoPathValue = String(repoPath || '').trim();
+  if (!repoPathValue) return [];
+  return [makeRepository(repoPathValue, repoPathValue, true)];
+}
+
 export default function GitStatusButton({ projectId, projectName, projectPath }: Props) {
   const showToast = useUIStore((state) => state.showToast);
   const activeTabMetaKey = useWorkspaceStore((state) => {
@@ -195,7 +219,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   });
 
   const [status, setStatus] = useState<GitStatus | null>(null);
-  const [statusLoading, setStatusLoading] = useState(false);
+  const [statusLoading, setStatusLoading] = useState(() => Boolean(projectPath));
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
@@ -210,7 +234,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [repoSelectorOpen, setRepoSelectorOpen] = useState(false);
   const [repoSelectorTab, setRepoSelectorTab] = useState<'repos' | 'favorites'>('repos');
   const [repoSearch, setRepoSearch] = useState('');
-  const [repositories, setRepositories] = useState<GitRepository[]>([]);
+  const [repositories, setRepositories] = useState<GitRepository[]>(() => makeHomeRepositories(projectPath));
+  const [repositoriesProjectPath, setRepositoriesProjectPath] = useState('');
   const [repoFavorites, setRepoFavorites] = useState<string[]>([]);
   const [repositoriesLoading, setRepositoriesLoading] = useState(false);
   const [repoContextMenu, setRepoContextMenu] = useState<{ x: number; y: number; repo: GitRepository } | null>(null);
@@ -235,8 +260,12 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [generationMeta, setGenerationMeta] = useState<any>(null);
   const [fileDiff, setFileDiff] = useState<GitFileDiff | null>(null);
   const [fileDiffLoading, setFileDiffLoading] = useState(false);
+  const [resizeHover, setResizeHover] = useState<'left' | 'bottom' | 'left-bottom' | null>(null);
+  const [statusVersion, setStatusVersion] = useState(0);
   const fsDebounceRef = useRef<number | null>(null);
   const saveDebounceRef = useRef<number | null>(null);
+  const statusRequestRef = useRef(0);
+  const latestProjectPathRef = useRef(projectPath || '');
   const hydratedStateKeyRef = useRef('');
   const selectionInitializedKeyRef = useRef('');
 
@@ -247,8 +276,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     const [tabId, tabName] = activeTabMetaKey.split('\0');
     return [tabId || null, tabName || null];
   }, [activeTabMetaKey]);
-  const statusFileKey = useMemo(() => status?.files.map((file) => file.path).join('\0') || '', [status?.files]);
-  const effectiveRepoPath = selectedRepoPath || projectPath || '';
+  const statusFileKey = useMemo(() => status?.files.map((file) => `${file.xy}:${file.path}`).join('\0') || '', [status?.files]);
   const panelStateKey = useMemo(
     () => gitPanelStateKey(projectId, undefined, projectPath),
     [projectId, projectPath]
@@ -265,15 +293,28 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     if (!q) return historyItems;
     return historyItems.filter((commit) => `${commit.hash} ${commit.subject} ${commit.date}`.toLowerCase().includes(q));
   }, [historyItems, historySearch]);
-  const repositoryByPath = useMemo(() => new Map(repositories.map((repo) => [repo.path, repo])), [repositories]);
+  const hydratedForCurrentProject = hydratedStateKeyRef.current === panelStateKey;
+  const effectiveRepoPath = (hydratedForCurrentProject ? selectedRepoPath : (projectPath || '')) || projectPath || '';
+  const homeRepositories = useMemo(() => makeHomeRepositories(projectPath), [projectPath]);
+  const currentRepositories = useMemo(
+    () => repositoriesProjectPath === (projectPath || '') ? repositories : homeRepositories,
+    [homeRepositories, projectPath, repositories, repositoriesProjectPath]
+  );
+  const repositoryByPath = useMemo(() => {
+    const map = new Map(currentRepositories.map((repo) => [repo.path, repo]));
+    for (const repoPath of repoFavorites) {
+      if (!map.has(repoPath)) map.set(repoPath, makeRepository(repoPath, projectPath));
+    }
+    return map;
+  }, [currentRepositories, projectPath, repoFavorites]);
   const filteredRepositories = useMemo(() => {
     const q = repoSearch.trim().toLowerCase();
-    const home = repositories.find((repo) => repo.home) || null;
+    const home = currentRepositories.find((repo) => repo.home) || null;
     const matches = (repo: GitRepository) => !q || `${repo.name} ${repo.relativePath} ${repo.path}`.toLowerCase().includes(q);
-    const rest = repositories.filter((repo) => !repo.home && matches(repo));
+    const rest = currentRepositories.filter((repo) => !repo.home && matches(repo));
     if (home && matches(home)) return [home, ...rest];
     return rest;
-  }, [repositories, repoSearch]);
+  }, [currentRepositories, repoSearch]);
   const favoriteRepositories = useMemo(() => {
     const q = repoSearch.trim().toLowerCase();
     return repoFavorites
@@ -282,16 +323,24 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       .filter((repo) => !q || `${repo.name} ${repo.relativePath} ${repo.path}`.toLowerCase().includes(q));
   }, [repoFavorites, repositoryByPath, repoSearch]);
 
+  const currentStatusRoot = status?.repoRoot || '';
+  const hasCurrentStatus = Boolean(status?.isRepo);
+
   const loadStatus = useCallback(async (visible = false) => {
-    if (!effectiveRepoPath) {
+    const requestPath = effectiveRepoPath;
+    const requestId = ++statusRequestRef.current;
+    if (!requestPath) {
       setStatus(null);
+      setStatusLoading(false);
       return;
     }
-    if (visible) setStatusLoading(true);
+    const showProbe = visible || !hasCurrentStatus || (currentStatusRoot && requestPath !== currentStatusRoot);
+    if (showProbe) setStatusLoading(true);
     try {
-      const result = await ipcRenderer.invoke('git:status', { projectPath: effectiveRepoPath });
+      const result = await ipcRenderer.invoke('git:status', { projectPath: requestPath });
+      if (statusRequestRef.current !== requestId) return;
       if (!result?.success || !result?.isRepo) {
-        if (projectPath && effectiveRepoPath !== projectPath) {
+        if (projectPath && requestPath !== projectPath) {
           setSelectedRepoPath(projectPath);
           return;
         }
@@ -299,13 +348,15 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         return;
       }
       setStatus(result as GitStatus);
+      setStatusVersion((value) => value + 1);
     } catch (error: any) {
+      if (statusRequestRef.current !== requestId) return;
       if (visible) showToast('Git status: ' + trimError(error?.message || error), 'error');
       setStatus(null);
     } finally {
-      if (visible) setStatusLoading(false);
+      if (statusRequestRef.current === requestId && showProbe) setStatusLoading(false);
     }
-  }, [effectiveRepoPath, projectPath, showToast]);
+  }, [currentStatusRoot, effectiveRepoPath, hasCurrentStatus, projectPath, showToast]);
 
   const loadHistory = useCallback(async () => {
     if (!effectiveRepoPath) return;
@@ -364,20 +415,47 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   }, [effectiveRepoPath, showToast]);
 
   const loadRepositories = useCallback(async () => {
-    if (!projectPath) return;
+    const requestProjectPath = projectPath || '';
+    if (!requestProjectPath) return;
     setRepositoriesLoading(true);
     try {
-      const result = await ipcRenderer.invoke('git:list-repositories', { projectPath });
+      const result = await ipcRenderer.invoke('git:list-repositories', { projectPath: requestProjectPath });
+      if (latestProjectPathRef.current !== requestProjectPath) return;
       if (!result?.success) throw new Error(result?.error || 'git repositories failed');
       const list = Array.isArray(result.repositories) ? result.repositories : [];
       setRepositories(list);
-      setRepoFavorites((prev) => prev.filter((repoPath) => list.some((repo: GitRepository) => repo.path === repoPath)));
+      setRepositoriesProjectPath(requestProjectPath);
     } catch (error: any) {
+      if (latestProjectPathRef.current !== requestProjectPath) return;
       showToast('Git repos: ' + trimError(error?.message || error), 'error');
     } finally {
-      setRepositoriesLoading(false);
+      if (latestProjectPathRef.current === requestProjectPath) setRepositoriesLoading(false);
     }
   }, [projectPath, showToast]);
+
+  useEffect(() => {
+    const nextProjectPath = projectPath || '';
+    latestProjectPathRef.current = nextProjectPath;
+    statusRequestRef.current += 1;
+    setStatus(null);
+    setStatusLoading(Boolean(nextProjectPath));
+    setSelectedRepoPath(nextProjectPath);
+    setRepositories(makeHomeRepositories(nextProjectPath));
+    setRepositoriesProjectPath('');
+    setRepositoriesLoading(false);
+    setRepoSelectorOpen(false);
+    setRepoSearch('');
+    setRepoContextMenu(null);
+    setDragRepoPath('');
+    setBranchesOpen(false);
+    setPushMenuOpen(false);
+    setActiveFilePath('');
+    setActiveCommitHash('');
+    setActiveCommitFilePath('');
+    setCommitDetails(null);
+    setFileDiff(null);
+    setGenerationMeta(null);
+  }, [panelStateKey, projectPath]);
 
   useEffect(() => {
     loadStatus(false);
@@ -472,8 +550,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   useEffect(() => {
     if (!open) return;
     loadStatus(true);
-    if (panelTab === 'history') loadHistory();
-  }, [open, panelTab, loadStatus, loadHistory]);
+  }, [open, loadStatus]);
 
   useEffect(() => {
     if (panelTab === 'history' && open) loadHistory();
@@ -492,8 +569,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   }, [branchesOpen, loadBranches]);
 
   useEffect(() => {
-    if (open) loadRepositories();
-  }, [open, loadRepositories]);
+    if (repoSelectorOpen && projectPath && repositoriesProjectPath !== projectPath) loadRepositories();
+  }, [repoSelectorOpen, projectPath, repositoriesProjectPath, loadRepositories]);
 
   useEffect(() => {
     const files = status?.files || [];
@@ -526,23 +603,31 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       return;
     }
     let cancelled = false;
+    let started = false;
     setFileDiffLoading(true);
-    ipcRenderer.invoke('git:file-diff', { projectPath: effectiveRepoPath, filePath: activeFilePath })
-      .then((result: GitFileDiff) => {
-        if (cancelled) return;
-        if (!result?.success) throw new Error(result?.error || 'git diff failed');
-        setFileDiff(result);
-      })
-      .catch((error: any) => {
-        if (!cancelled) setFileDiff({ success: false, diff: '', additions: 0, deletions: 0, error: trimError(error?.message || error) });
-      })
-      .finally(() => {
-        if (!cancelled) setFileDiffLoading(false);
-      });
+    const timer = window.setTimeout(() => {
+      started = true;
+      ipcRenderer.invoke('git:file-diff', { projectPath: effectiveRepoPath, filePath: activeFilePath })
+        .then((result: GitFileDiff) => {
+          if (cancelled) return;
+          if (!result?.success) throw new Error(result?.error || 'git diff failed');
+          setFileDiff(result);
+        })
+        .catch((error: any) => {
+          if (!cancelled) setFileDiff({ success: false, diff: '', additions: 0, deletions: 0, error: trimError(error?.message || error) });
+        })
+        .finally(() => {
+          if (!cancelled) setFileDiffLoading(false);
+        });
+    }, 120);
     return () => {
       cancelled = true;
+      if (!started) {
+        window.clearTimeout(timer);
+        setFileDiffLoading(false);
+      }
     };
-  }, [open, panelTab, effectiveRepoPath, activeFilePath, statusFileKey]);
+  }, [open, panelTab, effectiveRepoPath, activeFilePath, statusFileKey, statusVersion]);
 
   useEffect(() => {
     const onFocus = () => loadStatus(false);
@@ -621,6 +706,23 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     setRepoContextMenu(null);
   };
 
+  const addRepositoryToProject = async () => {
+    try {
+      const selectedPath = await ipcRenderer.invoke('app:select-directory');
+      if (!selectedPath) return;
+      const result = await ipcRenderer.invoke('git:status', { projectPath: selectedPath });
+      if (!result?.success || !result?.isRepo || !result.repoRoot) {
+        showToast('Selected folder is not a Git repository', 'warning');
+        return;
+      }
+      addRepoFavorite(result.repoRoot);
+      setRepoSelectorTab('favorites');
+      setRepoSearch('');
+    } catch (error: any) {
+      showToast('Add repository: ' + trimError(error?.message || error), 'error');
+    }
+  };
+
   const removeRepoFavorite = (repoPath: string) => {
     setRepoFavorites((prev) => prev.filter((item) => item !== repoPath));
     setRepoContextMenu(null);
@@ -638,7 +740,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     });
   };
 
-  const startPanelResize = (edge: 'left' | 'bottom', event: React.MouseEvent) => {
+  const startPanelResize = (edge: 'left' | 'bottom' | 'left-bottom', event: React.MouseEvent) => {
     event.preventDefault();
     event.stopPropagation();
     const startX = event.clientX;
@@ -646,12 +748,12 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     const startSize = panelSize;
     const oldCursor = document.body.style.cursor;
     const oldUserSelect = document.body.style.userSelect;
-    document.body.style.cursor = edge === 'left' ? 'ew-resize' : 'ns-resize';
+    document.body.style.cursor = edge === 'left' ? 'ew-resize' : edge === 'bottom' ? 'ns-resize' : 'nesw-resize';
     document.body.style.userSelect = 'none';
     const onMove = (moveEvent: MouseEvent) => {
       const next = {
-        width: edge === 'left' ? startSize.width + (startX - moveEvent.clientX) : startSize.width,
-        height: edge === 'bottom' ? startSize.height + (moveEvent.clientY - startY) : startSize.height,
+        width: edge === 'left' || edge === 'left-bottom' ? startSize.width + (startX - moveEvent.clientX) : startSize.width,
+        height: edge === 'bottom' || edge === 'left-bottom' ? startSize.height + (moveEvent.clientY - startY) : startSize.height,
       };
       setPanelSize(normalizePanelSize(next));
     };
@@ -783,7 +885,31 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     }
   };
 
-  if (!status?.isRepo) return null;
+  if (!status?.isRepo) {
+    if (projectPath && (statusLoading || hydratedStateKeyRef.current !== panelStateKey)) {
+      return (
+        <button
+          disabled
+          title="Checking Git repository"
+          className="inline-flex items-center gap-1 rounded transition-colors"
+          style={{
+            height: 26,
+            padding: '0 9px',
+            fontSize: 11,
+            color: '#9ca3af',
+            backgroundColor: 'transparent',
+            border: '1px solid rgba(255,255,255,0.10)',
+            maxWidth: 156,
+            cursor: 'default',
+          }}
+        >
+          <Loader2 size={12} className="animate-spin" />
+          <span style={{ fontWeight: 700 }}>Git</span>
+        </button>
+      );
+    }
+    return null;
+  }
 
   const compactText = status.changedCount > 0 ? String(status.changedCount) : 'clean';
   const remoteHint = status.ahead || status.behind
@@ -795,6 +921,16 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       height: Math.max(MIN_PANEL_SIZE.height, Math.min(panelSize.height, window.innerHeight - pos.top - PANEL_MARGIN)),
     }
     : panelSize;
+  const remoteTitle = remoteBusy === 'fetch'
+    ? 'Fetching'
+    : remoteBusy === 'push'
+      ? 'Pushing'
+      : pushLabel + ' branch';
+  const remoteSubtitle = remoteBusy === 'fetch'
+    ? 'Fetching latest changes'
+    : remoteBusy === 'push'
+      ? (status.upstream ? 'Pushing to origin' : 'Publishing branch')
+      : (status.upstream ? 'Push changes to origin' : 'Publish this branch to ...');
 
   return (
     <>
@@ -865,13 +1001,24 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
           >
             <div
               onMouseDown={(event) => startPanelResize('left', event)}
+              onMouseEnter={() => setResizeHover('left')}
+              onMouseLeave={() => setResizeHover(null)}
               title="Resize"
-              style={leftResizeHandleStyle}
+              style={leftResizeHandleStyle(resizeHover === 'left')}
             />
             <div
               onMouseDown={(event) => startPanelResize('bottom', event)}
+              onMouseEnter={() => setResizeHover('bottom')}
+              onMouseLeave={() => setResizeHover(null)}
               title="Resize"
-              style={bottomResizeHandleStyle}
+              style={bottomResizeHandleStyle(resizeHover === 'bottom')}
+            />
+            <div
+              onMouseDown={(event) => startPanelResize('left-bottom', event)}
+              onMouseEnter={() => setResizeHover('left-bottom')}
+              onMouseLeave={() => setResizeHover(null)}
+              title="Resize"
+              style={leftBottomResizeHandleStyle(resizeHover === 'left-bottom')}
             />
             {settingsOpen ? (
               <SettingsView
@@ -885,23 +1032,24 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                   <div style={{ minWidth: 0, flex: 1, position: 'relative' }}>
                     <button
                       onClick={() => {
-                        setRepoSelectorOpen((value) => !value);
+                        const willOpen = !repoSelectorOpen;
+                        setRepoSelectorOpen(willOpen);
                         setRepoContextMenu(null);
-                        if (!repositories.length) loadRepositories();
+                        if (willOpen && projectPath && repositoriesProjectPath !== projectPath) loadRepositories();
                       }}
                       style={repoSelectButtonStyle}
                       title={status.repoRoot}
                     >
-                      <FileText size={15} style={{ flexShrink: 0, color: '#cbd5e1' }} />
+                      <FileText size={14} style={{ flexShrink: 0, color: '#cbd5e1' }} />
                       <span style={{ minWidth: 0, flex: 1 }}>
-                        <span style={{ display: 'block', fontSize: 11, color: '#8b949e', fontWeight: 760, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left' }}>
+                        <span style={{ display: 'block', fontSize: 10, color: '#8b949e', fontWeight: 760, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left' }}>
                           Current Repository
                         </span>
-                        <span style={{ display: 'block', fontSize: 13, color: '#f8fafc', fontWeight: 850, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 2, textAlign: 'left' }}>
+                        <span style={{ display: 'block', fontSize: 12, color: '#f8fafc', fontWeight: 850, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1, textAlign: 'left' }}>
                           {status.repoName}
                         </span>
                       </span>
-                      <ChevronDown size={14} style={{ flexShrink: 0, color: '#9ca3af' }} />
+                      <ChevronDown size={13} style={{ flexShrink: 0, color: '#9ca3af', transform: repoSelectorOpen ? 'rotate(180deg)' : 'none', transition: 'transform 120ms ease' }} />
                     </button>
                     {repoSelectorOpen && (
                       <RepositoryMenu
@@ -920,6 +1068,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                         onContextMenu={setRepoContextMenu}
                         onAddFavorite={addRepoFavorite}
                         onRemoveFavorite={removeRepoFavorite}
+                        onRefresh={loadRepositories}
+                        onAddRepository={addRepositoryToProject}
                         onDragPathChange={setDragRepoPath}
                         onMoveFavorite={moveFavoriteRepo}
                       />
@@ -933,16 +1083,16 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                       onClick={() => setBranchesOpen((value) => !value)}
                       style={branchHeaderButtonStyle}
                     >
-                      <GitBranch size={15} style={{ flexShrink: 0 }} />
+                      <GitBranch size={14} style={{ flexShrink: 0 }} />
                       <span style={{ minWidth: 0, flex: 1 }}>
-                        <span style={{ display: 'block', fontSize: 11, color: '#8b949e', fontWeight: 760, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left' }}>
+                        <span style={{ display: 'block', fontSize: 10, color: '#8b949e', fontWeight: 760, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left' }}>
                           Current Branch
                         </span>
-                        <span style={{ display: 'block', fontSize: 13, color: '#f8fafc', fontWeight: 850, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 2, textAlign: 'left' }}>
+                        <span style={{ display: 'block', fontSize: 12, color: '#f8fafc', fontWeight: 850, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1, textAlign: 'left' }}>
                           {status.branch}
                         </span>
                       </span>
-                      <ChevronDown size={14} />
+                      <ChevronDown size={13} style={{ transform: branchesOpen ? 'rotate(180deg)' : 'none', transition: 'transform 120ms ease' }} />
                     </button>
                     {branchesOpen && (
                       <div style={branchMenuStyle}>
@@ -973,15 +1123,15 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                     <button
                       onClick={() => handleRemote('push')}
                       disabled={remoteBusy !== null}
-                      style={{ ...remoteHeaderButtonStyle, borderTopRightRadius: 0, borderBottomRightRadius: 0, minWidth: 168 }}
+                      style={{ ...remoteHeaderButtonStyle, borderTopRightRadius: 0, borderBottomRightRadius: 0, minWidth: 154 }}
                     >
-                      {remoteBusy === 'push' ? <Loader2 size={15} className="animate-spin" /> : <Upload size={15} />}
+                      {remoteBusy ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />}
                       <span style={{ minWidth: 0, textAlign: 'left' }}>
-                        <span style={{ display: 'block', fontSize: 13, fontWeight: 850, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          {remoteBusy === 'push' ? 'Pushing' : pushLabel + ' branch'}
+                        <span style={{ display: 'block', fontSize: 12, fontWeight: 850, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {remoteTitle}
                         </span>
-                        <span style={{ display: 'block', fontSize: 11, color: '#8b949e', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          {status.upstream ? 'Push changes to origin' : 'Publish this branch to ...'}
+                        <span style={{ display: 'block', fontSize: 10, color: '#8b949e', marginTop: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {remoteSubtitle}
                         </span>
                       </span>
                     </button>
@@ -989,9 +1139,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                       onClick={() => setPushMenuOpen((value) => !value)}
                       disabled={remoteBusy !== null}
                       title="More remote actions"
-                      style={{ ...remoteHeaderButtonStyle, borderLeft: '1px solid rgba(255,255,255,0.10)', borderTopLeftRadius: 0, borderBottomLeftRadius: 0, width: 44, padding: 0 }}
+                      style={{ ...remoteHeaderButtonStyle, borderLeft: '1px solid rgba(255,255,255,0.10)', borderTopLeftRadius: 0, borderBottomLeftRadius: 0, width: 36, padding: 0 }}
                     >
-                      <ChevronDown size={14} />
+                      <ChevronDown size={13} style={{ transform: pushMenuOpen ? 'rotate(180deg)' : 'none', transition: 'transform 120ms ease' }} />
                     </button>
                     {pushMenuOpen && (
                       <div style={remoteMenuStyle}>
@@ -1005,11 +1155,19 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                 </div>
 
                 <div style={gitTabsLeftStyle}>
-                  <TabButton active={panelTab === 'changes'} onClick={() => setPanelTab('changes')}>
+                  <TabButton active={panelTab === 'changes'} onClick={() => {
+                    setBranchesOpen(false);
+                    setPushMenuOpen(false);
+                    setPanelTab('changes');
+                  }}>
                     Changes
                     <span style={countPillStyle}>{status.changedCount}</span>
                   </TabButton>
-                  <TabButton active={panelTab === 'history'} onClick={() => setPanelTab('history')}>
+                  <TabButton active={panelTab === 'history'} onClick={() => {
+                    setBranchesOpen(false);
+                    setPushMenuOpen(false);
+                    setPanelTab('history');
+                  }}>
                     History
                   </TabButton>
                 </div>
@@ -1194,7 +1352,7 @@ function TabButton({ active, children, onClick }: { active: boolean; children: R
     <button
       onClick={onClick}
       style={{
-        height: 36,
+        height: 28,
         flex: 1,
         border: 'none',
         borderBottom: active ? '2px solid #3b82f6' : '2px solid transparent',
@@ -1203,8 +1361,8 @@ function TabButton({ active, children, onClick }: { active: boolean; children: R
         display: 'inline-flex',
         alignItems: 'center',
         justifyContent: 'center',
-        gap: 6,
-        fontSize: 12,
+        gap: 5,
+        fontSize: 11.5,
         fontWeight: 750,
         cursor: 'pointer',
       }}
@@ -1230,6 +1388,8 @@ function RepositoryMenu({
   onContextMenu,
   onAddFavorite,
   onRemoveFavorite,
+  onRefresh,
+  onAddRepository,
   onDragPathChange,
   onMoveFavorite,
 }: {
@@ -1248,6 +1408,8 @@ function RepositoryMenu({
   onContextMenu: (menu: { x: number; y: number; repo: GitRepository } | null) => void;
   onAddFavorite: (repoPath: string) => void;
   onRemoveFavorite: (repoPath: string) => void;
+  onRefresh: () => void;
+  onAddRepository: () => void;
   onDragPathChange: (repoPath: string) => void;
   onMoveFavorite: (sourcePath: string, targetPath: string) => void;
 }) {
@@ -1275,11 +1437,19 @@ function RepositoryMenu({
             autoFocus
           />
         </div>
+        <div style={repoActionBarStyle}>
+          <button onClick={onRefresh} disabled={loading} style={repoActionButtonStyle(loading)}>
+            <RefreshCw size={12} className={loading ? 'animate-spin' : ''} />
+            Update
+          </button>
+          <button onClick={onAddRepository} style={repoActionButtonStyle(false)}>
+            <Plus size={12} />
+            Add
+          </button>
+        </div>
 
         <div style={repoListStyle}>
-          {loading ? (
-            <div style={emptyLineStyle}><Loader2 size={13} className="animate-spin" /> Loading repositories</div>
-          ) : rows.length ? rows.map((repo) => (
+          {rows.length ? rows.map((repo) => (
             <button
               key={repo.path}
               onClick={() => onSelect(repo.path)}
@@ -1323,9 +1493,12 @@ function RepositoryMenu({
               {favoritePaths.includes(repo.path) && tab !== 'favorites' ? <Star size={12} style={{ color: '#facc15', flexShrink: 0 }} /> : null}
               {tab === 'favorites' ? <GripVertical size={14} style={{ color: '#6b7280', flexShrink: 0, cursor: 'grab' }} /> : null}
             </button>
-          )) : (
+          )) : null}
+          {loading ? (
+            <div style={emptyLineStyle}><Loader2 size={13} className="animate-spin" /> Loading repositories</div>
+          ) : !rows.length ? (
             <div style={emptyLineStyle}>{tab === 'favorites' ? 'No favorites for this project' : 'No repositories'}</div>
-          )}
+          ) : null}
         </div>
       </div>
 
@@ -1547,17 +1720,19 @@ function DiffPreview({
   return (
     <div style={diffPaneStyle}>
       <div style={diffHeaderStyle}>
-        <div style={{ minWidth: 0, flex: 1 }}>
-          <div style={{ fontSize: 12, color: '#f8fafc', fontWeight: 800, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {file ? file.path : 'No file selected'}
-          </div>
+        <div style={{ minWidth: 0, flex: 1, display: 'flex', alignItems: 'center', gap: 8 }}>
+          {file && <StatusGlyph file={file} />}
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 11, color: '#cbd5e1', fontWeight: 760, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {file ? file.label || statusKind(file.xy) : 'Diff preview'}
+            </div>
           {file?.oldPath && (
             <div style={{ fontSize: 10, color: '#8b949e', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               renamed from {file.oldPath}
             </div>
           )}
+          </div>
         </div>
-        {file && <StatusGlyph file={file} />}
         {diff && diff.success !== false && (
           <div style={diffStatStyle}>
             <span style={{ color: '#86efac' }}>+{diff.additions || 0}</span>
@@ -1645,15 +1820,15 @@ function HistoryCommitPreview({
       <div style={historyDetailHeaderStyle}>
         <div style={{ minWidth: 0, flex: 1 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-            <span style={{ color: '#f8fafc', fontSize: 13, fontWeight: 850, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {details.subject || details.shortHash}
+            <span style={{ color: '#f8fafc', fontSize: 12, fontWeight: 820, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {details.author || 'Unknown author'}
             </span>
             <span style={{ color: '#8b949e', fontSize: 11, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', flexShrink: 0 }}>
               {details.shortHash}
             </span>
           </div>
           <div style={{ marginTop: 4, color: '#8b949e', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {details.author || 'Unknown author'} · {details.date}
+            {details.date}
           </div>
         </div>
         <div style={diffStatStyle}>
@@ -1773,8 +1948,31 @@ const repoSearchInputStyle: React.CSSProperties = {
   fontSize: 11.5,
 };
 
+const repoActionBarStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 6,
+  padding: '0 6px 6px',
+};
+
+const repoActionButtonStyle = (disabled: boolean): React.CSSProperties => ({
+  height: 24,
+  borderRadius: 6,
+  border: '1px solid rgba(255,255,255,0.10)',
+  background: 'rgba(255,255,255,0.035)',
+  color: disabled ? '#6b7280' : '#cbd5e1',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: 5,
+  padding: '0 8px',
+  fontSize: 10.5,
+  fontWeight: 760,
+  cursor: disabled ? 'default' : 'pointer',
+});
+
 const repoListStyle: React.CSSProperties = {
-  maxHeight: 282,
+  maxHeight: 252,
   overflowY: 'auto',
   padding: '0 4px 5px',
 };
@@ -1830,32 +2028,51 @@ const repoContextMenuItemStyle: React.CSSProperties = {
   textAlign: 'left',
 };
 
-const leftResizeHandleStyle: React.CSSProperties = {
+const leftResizeHandleStyle = (active: boolean): React.CSSProperties => ({
   position: 'absolute',
   left: -3,
   top: 0,
   bottom: 0,
   width: 8,
   cursor: 'ew-resize',
-  zIndex: 4,
-};
+  zIndex: 100,
+  background: active ? 'rgba(96,165,250,0.24)' : 'rgba(96,165,250,0.01)',
+  transition: 'background 100ms ease',
+});
 
-const bottomResizeHandleStyle: React.CSSProperties = {
+const bottomResizeHandleStyle = (active: boolean): React.CSSProperties => ({
   position: 'absolute',
   left: 0,
   right: 0,
   bottom: -3,
   height: 8,
   cursor: 'ns-resize',
-  zIndex: 4,
-};
+  zIndex: 100,
+  background: active ? 'rgba(96,165,250,0.24)' : 'rgba(96,165,250,0.01)',
+  transition: 'background 100ms ease',
+});
+
+const leftBottomResizeHandleStyle = (active: boolean): React.CSSProperties => ({
+  position: 'absolute',
+  left: 0,
+  bottom: 0,
+  width: 18,
+  height: 18,
+  cursor: 'nesw-resize',
+  zIndex: 101,
+  borderLeft: active ? '2px solid rgba(96,165,250,0.75)' : '2px solid transparent',
+  borderBottom: active ? '2px solid rgba(96,165,250,0.75)' : '2px solid transparent',
+  background: active ? 'rgba(96,165,250,0.08)' : 'rgba(96,165,250,0.01)',
+  borderBottomLeftRadius: 7,
+  transition: 'border-color 100ms ease',
+});
 
 const gitPanelGridStyle: React.CSSProperties = {
   flex: 1,
   minHeight: 0,
   display: 'grid',
   gridTemplateColumns: 'minmax(380px, 43%) minmax(0, 1fr)',
-  gridTemplateRows: '80px 44px minmax(0, 1fr)',
+  gridTemplateRows: '52px 30px minmax(0, 1fr)',
   overflow: 'hidden',
 };
 
@@ -1921,8 +2138,8 @@ const branchHeaderButtonStyle: React.CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'space-between',
-  gap: 12,
-  padding: '0 18px',
+  gap: 9,
+  padding: '0 13px',
   cursor: 'pointer',
   minWidth: 0,
 };
@@ -1936,9 +2153,9 @@ const remoteHeaderButtonStyle: React.CSSProperties = {
   display: 'inline-flex',
   alignItems: 'center',
   justifyContent: 'center',
-  gap: 12,
-  padding: '0 18px',
-  fontSize: 12,
+  gap: 9,
+  padding: '0 13px',
+  fontSize: 11.5,
   fontWeight: 800,
   cursor: 'pointer',
 };
@@ -2008,6 +2225,7 @@ const historyListStyle: React.CSSProperties = {
 };
 
 const diffPaneStyle: React.CSSProperties = {
+  height: '100%',
   minWidth: 0,
   minHeight: 0,
   display: 'flex',
@@ -2016,13 +2234,13 @@ const diffPaneStyle: React.CSSProperties = {
 };
 
 const diffHeaderStyle: React.CSSProperties = {
-  height: 44,
+  height: 34,
   flexShrink: 0,
   borderBottom: '1px solid rgba(255,255,255,0.08)',
   display: 'flex',
   alignItems: 'center',
-  gap: 9,
-  padding: '0 12px',
+  gap: 8,
+  padding: '0 10px',
 };
 
 const diffStatStyle: React.CSSProperties = {
@@ -2042,8 +2260,10 @@ const diffStatStyle: React.CSSProperties = {
 
 const diffBodyStyle: React.CSSProperties = {
   flex: 1,
+  minWidth: 0,
   minHeight: 0,
   overflow: 'auto',
+  overscrollBehavior: 'contain',
   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
   fontSize: 11.5,
   lineHeight: '18px',
@@ -2069,13 +2289,18 @@ const diffMarkerStyle = (type: RenderedDiffLine['type']): React.CSSProperties =>
 });
 
 const diffTextStyle = (type: RenderedDiffLine['type']): React.CSSProperties => ({
+  display: 'inline-block',
   whiteSpace: 'pre',
+  width: 'max-content',
   color: type === 'meta' ? '#8b949e' : type === 'hunk' ? '#79c0ff' : type === 'add' ? '#d2f8d2' : type === 'del' ? '#ffd7d7' : '#c9d1d9',
   paddingRight: 12,
+  flexShrink: 0,
 });
 
 const diffLineStyle = (type: RenderedDiffLine['type']): React.CSSProperties => ({
   minHeight: 18,
+  minWidth: '100%',
+  width: 'max-content',
   display: 'flex',
   alignItems: 'stretch',
   background:
@@ -2208,7 +2433,7 @@ const historyDetailShellStyle: React.CSSProperties = {
 };
 
 const historyDetailHeaderStyle: React.CSSProperties = {
-  minHeight: 58,
+  minHeight: 46,
   flexShrink: 0,
   display: 'flex',
   alignItems: 'center',
@@ -2264,9 +2489,10 @@ const commitFileRowStyle = (active: boolean): React.CSSProperties => ({
 
 const branchMenuStyle: React.CSSProperties = {
   position: 'absolute',
-  top: 78,
+  top: 'calc(100% + 4px)',
   left: 0,
-  right: 0,
+  width: 340,
+  maxWidth: 'min(340px, calc(100vw - 32px))',
   zIndex: 6,
   maxHeight: 220,
   overflowY: 'auto',
@@ -2305,7 +2531,7 @@ const emptyLineStyle: React.CSSProperties = {
 
 const remoteMenuStyle: React.CSSProperties = {
   position: 'absolute',
-  top: 78,
+  top: 'calc(100% + 4px)',
   right: 0,
   zIndex: 6,
   minWidth: 142,

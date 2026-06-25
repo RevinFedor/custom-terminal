@@ -1424,11 +1424,13 @@ class DatabaseManager {
       totals.totalTokens += row.total_tokens || 0;
       if (row.status === 'error') totals.errors += 1;
       bump(byModel, row.model, row);
-      const promptKey = row.prompt_id || row.task_type || 'unknown';
-      const before = byPrompt.get(promptKey);
-      bump(byPrompt, promptKey, row);
-      const after = byPrompt.get(promptKey);
-      if (!before && after) after.name = row.prompt_name || row.task_type || promptKey;
+      if (row.prompt_id) {
+        const promptKey = row.prompt_id;
+        const before = byPrompt.get(promptKey);
+        bump(byPrompt, promptKey, row);
+        const after = byPrompt.get(promptKey);
+        if (!before && after) after.name = row.prompt_name || promptKey;
+      }
     }
 
     return {

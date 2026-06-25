@@ -662,6 +662,15 @@ const parseRestoreError = (err: any, fallbackCwd?: string) => {
   };
 };
 
+const isPlaceholderProjectPath = (projectPath?: string | null) => {
+  return !projectPath || projectPath.startsWith('__unset__');
+};
+
+const projectPathExists = async (projectPath?: string | null) => {
+  if (isPlaceholderProjectPath(projectPath)) return true;
+  return ipcRenderer.invoke('app:check-path-exists', projectPath).catch(() => false);
+};
+
 const createBrokenRestoredTab = (workspace: ProjectWorkspace, savedTab: any, err: any): Tab => {
   const tabId = savedTab.tabId || `${workspace.projectId}-tab-${workspace.tabCounter++}`;
   return {
@@ -717,9 +726,26 @@ const isAiBusyTab = (tab?: Pick<Tab, 'aiBusy' | 'claudeBusy' | 'sdkState'> | nul
   return !!(tab?.aiBusy || tab?.claudeBusy || isSdkBusyState(tab));
 };
 
-const emitTabCompletionNotification = (detail: { projectId: string; tabId: string; tabName: string }) => {
+const makeDefaultSavedTab = (workspace: ProjectWorkspace, cwd?: string | null, tabId?: string) => ({
+  tabId: tabId || `${workspace.projectId}-tab-${workspace.tabCounter++}`,
+  name: 'Terminal 1',
+  cwd: cwd || workspace.projectPath || '',
+  tabType: 'terminal',
+  commandType: undefined,
+});
+
+const emitTabCompletionNotification = (detail: { projectId: string; tabId: string; tabName: string; fired?: boolean; firedAt?: number; persistent?: boolean }) => {
+  try {
+    if (detail.fired) ipcRenderer.send('tab-notification:fired', detail);
+  } catch {}
   try {
     window.dispatchEvent(new CustomEvent('tab-completion-notification', { detail }));
+  } catch {}
+};
+
+const emitTabCompletionNotificationCleared = (detail: { projectId: string; tabId: string }) => {
+  try {
+    ipcRenderer.send('tab-notification:cleared', detail);
   } catch {}
 };
 
@@ -1140,15 +1166,26 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         const projectData = await ipcRenderer.invoke('project:getById', proj.projectId);
         const savedTabs = projectData?.tabs || [];
         const restoredProjectPath = isInbox ? getInboxProjectPath() : (projectData?.path || proj.projectPath);
+        const restoredProjectPathExists = isInbox || await projectPathExists(restoredProjectPath);
         console.warn(
           `[RestoreSession] projectData project=${restoreShortId(proj.projectId)}` +
           ` found=${!!projectData}` +
           ` dbPath=${projectData?.path || 'unset'}` +
           ` sessionPath=${proj.projectPath || 'unset'}` +
+          ` pathExists=${restoredProjectPathExists ? '1' : '0'}` +
           ` savedTabs=${savedTabs.length}` +
           ` groups=${projectData?.tabGroups?.length || 0}` +
           ` tabIds=${restoreTabsSummary(savedTabs)}`
         );
+
+        if (!projectData && !restoredProjectPathExists) {
+          console.warn(
+            `[RestoreSession] projectSkipMissingPath project=${restoreShortId(proj.projectId)}` +
+            ` path=${restoredProjectPath || 'unset'} reason=missing-db-row-and-cwd`
+          );
+          openProjects.delete(proj.projectId);
+          continue;
+        }
 
         const newWorkspace: ProjectWorkspace = {
           projectId: proj.projectId,
@@ -1239,7 +1276,26 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           }
         } else if (!isInbox) {
           console.warn(`[RestoreSession] noSavedTabs project=${restoreShortId(proj.projectId)} creatingDefault=true`);
-          const createdTabId = await createTab(proj.projectId, 'Terminal 1', restoredProjectPath);
+          let createdTabId = '';
+          try {
+            createdTabId = await createTab(proj.projectId, 'Terminal 1', restoredProjectPath);
+          } catch (err: any) {
+            const fallbackTabId = `${proj.projectId}-tab-${Math.max(0, newWorkspace.tabCounter - 1)}`;
+            const brokenTab = createBrokenRestoredTab(newWorkspace, makeDefaultSavedTab(newWorkspace, restoredProjectPath, fallbackTabId), err);
+            newWorkspace.tabs.set(brokenTab.id, brokenTab);
+            const liveWorkspace = get().openProjects.get(proj.projectId);
+            if (liveWorkspace && liveWorkspace !== newWorkspace) {
+              liveWorkspace.tabs.set(brokenTab.id, brokenTab);
+            }
+            createdTabId = brokenTab.id;
+            console.error(
+              `[RestoreSession] defaultTabFailed project=${restoreShortId(proj.projectId)}` +
+              ` cwd=${restoredProjectPath || 'unset'}` +
+              ` errorType=${brokenTab.restoreError?.type}` +
+              ` errorCwd=${brokenTab.restoreError?.cwd || 'unset'}`,
+              err?.stack || err?.message || err
+            );
+          }
           console.warn(
             `[RestoreSession] defaultTabEnd project=${restoreShortId(proj.projectId)}` +
             ` returned=${restoreShortId(createdTabId)}` +
@@ -1426,6 +1482,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       delete activeTab.completionNotificationArmed;
       delete activeTab.completionNotificationFired;
       delete activeTab.completionNotificationFiredAt;
+      emitTabCompletionNotificationCleared({ projectId, tabId: activeTab.id });
     }
 
     // Use startTransition for smooth project switching
@@ -1515,7 +1572,20 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           }
         } else if (!isInbox) {
           // Create default tab
-          await createTab(projectId, 'Terminal 1', workspaceProjectPath);
+          try {
+            await createTab(projectId, 'Terminal 1', workspaceProjectPath);
+          } catch (err: any) {
+            const fallbackTabId = `${projectId}-tab-${Math.max(0, newWorkspace.tabCounter - 1)}`;
+            const brokenTab = createBrokenRestoredTab(newWorkspace, makeDefaultSavedTab(newWorkspace, workspaceProjectPath, fallbackTabId), err);
+            newWorkspace.tabs.set(brokenTab.id, brokenTab);
+            console.error(
+              `[OpenProject] defaultTabFailed project=${restoreShortId(projectId)}` +
+              ` cwd=${workspaceProjectPath || 'unset'}` +
+              ` errorType=${brokenTab.restoreError?.type}` +
+              ` errorCwd=${brokenTab.restoreError?.cwd || 'unset'}`,
+              err?.stack || err?.message || err
+            );
+          }
         }
       }
 
@@ -1550,6 +1620,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         delete activeTab.completionNotificationArmed;
         delete activeTab.completionNotificationFired;
         delete activeTab.completionNotificationFiredAt;
+        emitTabCompletionNotificationCleared({ projectId, tabId: activeTab.id });
       }
       set({
         activeProjectId: projectId,
@@ -2261,6 +2332,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         delete targetTab.completionNotificationArmed;
         delete targetTab.completionNotificationFired;
         delete targetTab.completionNotificationFiredAt;
+        emitTabCompletionNotificationCleared({ projectId, tabId });
       }
       workspace.activeTabId = tabId;
       workspace.activeGroupId = null;
@@ -2487,10 +2559,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       tab.completionNotificationArmed = true;
       delete tab.completionNotificationFired;
       delete tab.completionNotificationFiredAt;
+      emitTabCompletionNotificationCleared({ projectId, tabId });
     } else {
       delete tab.completionNotificationArmed;
       delete tab.completionNotificationFired;
       delete tab.completionNotificationFiredAt;
+      emitTabCompletionNotificationCleared({ projectId, tabId });
     }
     set({ openProjects: new Map(openProjects) });
   },
@@ -2506,6 +2580,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       tab.completionNotificationArmed = true;
       delete tab.completionNotificationFired;
       delete tab.completionNotificationFiredAt;
+      emitTabCompletionNotificationCleared({ projectId, tabId });
     } else {
       delete tab.completionNotificationPersistent;
     }
@@ -2524,6 +2599,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     delete tab.completionNotificationFired;
     delete tab.completionNotificationFiredAt;
     if (!options?.keepPersistent) delete tab.completionNotificationPersistent;
+    emitTabCompletionNotificationCleared({ projectId, tabId });
     set({ openProjects: new Map(openProjects) });
     if (!options?.keepPersistent && hadPersistent) saveTabs(workspace.projectId, workspace.tabs);
   },
@@ -3541,6 +3617,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           if (tab.completionNotificationFired) {
             delete tab.completionNotificationFired;
             delete tab.completionNotificationFiredAt;
+            emitTabCompletionNotificationCleared({ projectId: workspace.projectId, tabId });
           }
         } else if (wasBusy && (tab.completionNotificationArmed || tab.completionNotificationPersistent)) {
           const isVisibleTarget =
@@ -3551,10 +3628,18 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           delete tab.completionNotificationFired;
           delete tab.completionNotificationFiredAt;
           if (isNaturalCompletionNotificationEnd(reason)) {
-            notificationDetail = { projectId: workspace.projectId, tabId, tabName: tab.name || 'Terminal' };
+            const firedAt = Date.now();
+            notificationDetail = {
+              projectId: workspace.projectId,
+              tabId,
+              tabName: tab.name || 'Terminal',
+              persistent: !!tab.completionNotificationPersistent,
+              fired: !isVisibleTarget,
+              firedAt,
+            };
             if (!isVisibleTarget) {
               tab.completionNotificationFired = true;
-              tab.completionNotificationFiredAt = Date.now();
+              tab.completionNotificationFiredAt = firedAt;
             }
           }
         }

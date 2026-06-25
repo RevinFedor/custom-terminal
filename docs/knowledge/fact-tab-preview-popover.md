@@ -18,6 +18,8 @@
 - `tabPreviewMaxHeight` (default 250px, 80-900px) — потолок высоты, до которого коробка растёт построчно; дальше внутренний scroll. Активно редактируется в Settings.
 - `ratio` удалён полностью (см. graveyard).
 
+Metadata-only popover на Home имеет собственный readable width floor и не наследует `tabPreviewMaxWidth`. Эта настройка принадлежит markdown notes; если пользователь ужал notes-preview до 120px, поля `Closed / Created / Path / Type` превращаются в узкую колонку и path/date переносятся посередине. Notes по-прежнему используют пользовательскую resize-ширину, metadata-only блок стартует от читаемого минимума и только clamp'ится viewport'ом.
+
 Алгоритм (`useLayoutEffect`, `measureAt(w)` через единый hidden probe-DOM):
 1. Замер natural-width контента при `width: max-content + max-width: previewWidth`.
 2. **Ширина** = `clamp(naturalW, NOTES_MIN_WIDTH, previewWidth)`. Контент короче потолка (заметка в одну строку) → коробка ужимается до natural-width — **нет пустого места справа**. Контент шире → ширина = потолок, текст переносится.
@@ -47,6 +49,8 @@ MarkdownEditor (react-markdown) рендерит markdown-блоки **асин�
 **TabBar vertical mode (TabSidebar)**: popover открывается **справа от таба** (`placement='right'`), вертикально центрирован относительно середины таба (`top: rect.top + rect.height/2; transform: translateY(-50%); paddingLeft: 6px`). Fallback — flip-left когда viewport справа меньше popover-width (`rect.right + width > viewport.width`). Юзер: *«при наведении и зажатии в CMD у нас открывается модалка с описанием заметки. Ее нужно теперь, чтобы она открывалась справа по центру»*. `data-cmd-hover-popover` атрибут сохраняется на wrapper'е — закреп Cmd+Shift работает идентично below/above режимам.
 
 **ProjectHome split-mode** (CMD+hover на Active/History карточках): **два независимых wrapper'а** вокруг карточки. Верхний — notes выше карточки через `top: rect.top + translateY(-100%)`. Нижний — metadata block ниже карточки через `top: rect.bottom`. Оба используют общий `popoverProps` (onMouseEnter/Leave) — переход курсором с одной части на другую через карточку держит popover открытым, уход куда-то ещё закрывает обе одновременно. Mental model: «заметка вверху, описание внизу относительно карточки».
+
+Iteration-results в ProjectHome не используют `TabPreviewPopover`: там Cmd+hover означает «прочитать полный найденный user prompt», а не «metadata/notes + Resume». Для них нужен простой текстовый popover шириной карточки и высотой около 2× карточки со scroll; иначе Cmd начинает одновременно обещать preview, чтение и restore.
 
 **Empty-notes skip**: верхний wrapper не рендерится если у вкладки нет заметки. Без этой проверки выше карточки появлялась тонкая полоска от `border: 1px + padding` пустой card — выглядела как баг. Условие: split → `hasNotes`; single → `hasNotes || metaRows`.
 

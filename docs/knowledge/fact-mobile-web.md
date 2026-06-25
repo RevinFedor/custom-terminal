@@ -564,6 +564,33 @@ busy/done/snapshot, `_notifyClaudeSession`, `recordActivity` open/close. Не с
 statusMarker, processBar и contextPct остаются ответственностью `/api/projects/:id/tabs`;
 project-activity патчит только `status/streaming`.
 
+Completion notification использует тот же project-activity канал, но это отдельная ось от
+busy. Если desktop bell сработал на скрытой AI-вкладке, snapshot включает
+`notificationCount` на project item и компактные tab-поля
+`completionNotificationFired/FiredAt/Mode`; проект остаётся в `projects[]` даже когда
+`count=0` и `streaming=false`. `GET /api/projects` дублирует агрегат как
+`completionNotificationCount`, а `GET /api/projects/:id/tabs` отдаёт per-tab
+`completionNotificationPersistent/Armed/Fired/FiredAt`, чтобы native мог показать root badge,
+project glow и tab glow без захода в transcript.
+
+Foreground/local notification и background/locked notification — разные каналы. Если native
+iOS уже держит `project-activity` SSE/REST, он сам создаёт local notification и дедупит её по
+`tabId:firedAt`. Когда app свернут, suspended или телефон заблокирован, этот stream нельзя
+считать delivery-механизмом: desktop `tab-notification:fired` должен параллельно отправить
+remote APNs alert по зарегистрированным iOS token'ам. Push payload несёт тот же canonical
+`kind=terminal-completion`, `projectId`, `tabId`, `tabName`, `firedAt`, `mode`; iOS применяет
+его в local unread-state до навигации. Если APNs credentials или iOS token отсутствуют,
+сервер только логирует причину и сохраняет обычный foreground путь через project-activity.
+Это сознательный fallback, не доказательство что locked-phone flow работает.
+
+`POST /api/terminal-tabs/:tabId/completion-notification/clear` — idempotent acknowledgement
+для native: повторный clear или уже закрытая вкладка возвращают success, потому что тап по
+iOS notification может догнать desktop clear/reload. Endpoint чистит fired/armed mirror, но
+не обязан выключать persistent watch (`keepPersistent`): persistent — подписка на будущие
+busy-edge, а acknowledgement относится к уже сработавшему unread. Пустой
+`project-activity.projects` после clear означает authoritative zero; native не должен
+оставлять старый badge из прошлого `/api/projects` seed.
+
 `starting` в project-activity — тоже runtime patch, а не layout metadata. Вкладка в `starting`
 считается live для project badge/count, но `streaming=false`: процесс запускается или
 восстанавливается, пользовательский turn ещё не идёт. Нельзя сворачивать это в `active` до

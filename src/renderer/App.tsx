@@ -183,6 +183,9 @@ type TabCompletionNotificationDetail = {
   projectId: string;
   tabId: string;
   tabName: string;
+  fired?: boolean;
+  firedAt?: number;
+  persistent?: boolean;
 };
 
 // Drop Indicator Line for project tabs
@@ -1510,18 +1513,27 @@ function App() {
           // awaitingIds = projects with ≥1 claude tab blocked on AskUserQuestion —
           // drives the rotating purple ring on the mobile project card.
           const awaitingIds: string[] = [];
+          const completionNotificationCounts: Record<string, number> = {};
           for (const [projId, ws] of state.openProjects) {
             let anyAwaiting = false;
+            let completionCount = 0;
             for (const t of ws.tabs.values()) {
+              if ((t as any).completionNotificationFired) completionCount++;
               if (t.commandType !== 'claude') continue;
               try {
                 const p = await ipcRenderer.invoke('claude:get-presence', t.tabId);
-                if (p?.awaiting) { anyAwaiting = true; break; }
+                if (p?.awaiting) anyAwaiting = true;
               } catch {}
             }
             if (anyAwaiting) awaitingIds.push(projId);
+            if (completionCount > 0) completionNotificationCounts[projId] = completionCount;
           }
-          return reply(true, { ids: Array.from(state.openProjects.keys()), activeProjectId: state.activeProjectId || null, awaitingIds });
+          return reply(true, {
+            ids: Array.from(state.openProjects.keys()),
+            activeProjectId: state.activeProjectId || null,
+            awaitingIds,
+            completionNotificationCounts,
+          });
         }
         if (action === 'getProjectTabsLive') {
           // Live tabs from an open project in renderer Zustand. Used by
@@ -1591,6 +1603,10 @@ function App() {
               awaiting,
               statusId,
               statusColor: statusMeta?.color || null,
+              completionNotificationPersistent: !!t.completionNotificationPersistent,
+              completionNotificationArmed: !!t.completionNotificationArmed,
+              completionNotificationFired: !!t.completionNotificationFired,
+              completionNotificationFiredAt: t.completionNotificationFiredAt || null,
               groupId: t.groupId || null,
               visualParentTabId: t.visualParentTabId || null,
               // Seed last-known context % so the native/web header pill shows a
@@ -1628,6 +1644,36 @@ function App() {
               position: uiState.processBar.position,
             },
           });
+        }
+        if (action === 'getProjectCompletionNotifications') {
+          const { projectId } = payload || {};
+          if (!projectId) return reply(false, null, 'projectId required');
+          const ws = state.openProjects.get(projectId);
+          if (!ws) return reply(true, { tabs: {}, count: 0 });
+          const tabs: Record<string, any> = {};
+          let count = 0;
+          for (const t of ws.tabs.values()) {
+            const info = {
+              completionNotificationPersistent: !!t.completionNotificationPersistent,
+              completionNotificationArmed: !!t.completionNotificationArmed,
+              completionNotificationFired: !!t.completionNotificationFired,
+              completionNotificationFiredAt: t.completionNotificationFiredAt || null,
+            };
+            if (info.completionNotificationFired) count++;
+            tabs[t.tabId || t.id] = info;
+          }
+          return reply(true, { tabs, count });
+        }
+        if (action === 'clearTabCompletionNotification') {
+          const { tabId, keepPersistent = true } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          for (const [projectId, ws] of state.openProjects) {
+            if (ws.tabs.has(tabId)) {
+              state.clearTabCompletionNotification(projectId, tabId, { keepPersistent: keepPersistent !== false });
+              return reply(true, { projectId, tabId });
+            }
+          }
+          return reply(true, { tabId, notFound: true });
         }
         if (action === 'getStatusMarkerConfig') {
           // Mobile-web reads the desktop's status-marker palette + shape/size AND

@@ -39,6 +39,7 @@
 // every WS client subscribed to that tabId. No business logic on the WS layer.
 
 const http = require('http');
+const http2 = require('http2');
 const url = require('url');
 const path = require('path');
 const fs = require('fs');
@@ -108,10 +109,12 @@ let resolvedPort = PORT_PREFERRED;
 const TOKEN_PATH = path.join(require('os').homedir(), '.noted-terminal', 'web-token.txt');
 const DISCOVERY_DIR = path.join(require('os').homedir(), '.noted-terminal');
 const DISCOVERY_FILE = path.join(DISCOVERY_DIR, 'web-server-' + process.pid + '.json');
+const IOS_PUSH_TOKENS_PATH = path.join(DISCOVERY_DIR, 'ios-push-tokens.json');
 
 let httpServer = null;
 let wss = null;
 let token = null;
+let apnsJwtCache = null;
 // Injected from main at start() — reads the live busy/running Maps (the same
 // ones that drive the per-tab UI loader). Used by GET /api/active-loaders.
 let computeActiveLoaders = null;
@@ -523,6 +526,199 @@ function loadOrCreateToken() {
   const fresh = crypto.randomBytes(24).toString('hex');
   fs.writeFileSync(TOKEN_PATH, fresh + '\n', { mode: 0o600 });
   return fresh;
+}
+
+function readIosPushTokens() {
+  try {
+    if (!fs.existsSync(IOS_PUSH_TOKENS_PATH)) return [];
+    const parsed = JSON.parse(fs.readFileSync(IOS_PUSH_TOKENS_PATH, 'utf-8'));
+    return Array.isArray(parsed?.tokens) ? parsed.tokens : [];
+  } catch (e) {
+    console.warn('[APNs] token store read failed:', e?.message || e);
+    return [];
+  }
+}
+
+function writeIosPushTokens(tokens) {
+  fs.mkdirSync(path.dirname(IOS_PUSH_TOKENS_PATH), { recursive: true });
+  fs.writeFileSync(IOS_PUSH_TOKENS_PATH, JSON.stringify({ tokens, updatedAt: Date.now() }, null, 2) + '\n', { mode: 0o600 });
+}
+
+function registerIosPushToken(payload = {}) {
+  const rawToken = String(payload.token || '').trim().replace(/[^a-fA-F0-9]/g, '').toLowerCase();
+  if (!rawToken || rawToken.length < 32) return { ok: false, error: 'invalid token' };
+  const environment = payload.environment === 'production' ? 'production' : 'development';
+  const bundleId = String(payload.bundleId || process.env.NOTED_APNS_BUNDLE_ID || 'com.habittracker.swift').trim();
+  const now = Date.now();
+  const existing = readIosPushTokens().filter((item) => String(item.token || '').toLowerCase() !== rawToken);
+  existing.push({
+    token: rawToken,
+    environment,
+    bundleId,
+    deviceName: String(payload.deviceName || '').slice(0, 120),
+    platform: String(payload.platform || 'ios').slice(0, 40),
+    registeredAt: now,
+    lastSeenAt: now,
+  });
+  writeIosPushTokens(existing);
+  console.log('[APNs] registered token env=' + environment + ' bundle=' + bundleId + ' suffix=' + rawToken.slice(-10) + ' total=' + existing.length);
+  return { ok: true, count: existing.length, environment, bundleId };
+}
+
+function base64url(input) {
+  return Buffer.from(input)
+    .toString('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
+
+function derToJose(signature) {
+  const buf = Buffer.from(signature);
+  let offset = 0;
+  if (buf[offset++] !== 0x30) throw new Error('APNs JWT signature is not DER sequence');
+  let seqLen = buf[offset++];
+  if (seqLen & 0x80) {
+    const bytes = seqLen & 0x7f;
+    seqLen = 0;
+    for (let i = 0; i < bytes; i++) seqLen = (seqLen << 8) | buf[offset++];
+  }
+  const readInt = () => {
+    if (buf[offset++] !== 0x02) throw new Error('APNs JWT signature integer missing');
+    let len = buf[offset++];
+    let value = buf.subarray(offset, offset + len);
+    offset += len;
+    while (value.length > 0 && value[0] === 0) value = value.subarray(1);
+    if (value.length > 32) value = value.subarray(value.length - 32);
+    if (value.length < 32) value = Buffer.concat([Buffer.alloc(32 - value.length), value]);
+    return value;
+  };
+  return base64url(Buffer.concat([readInt(), readInt()]));
+}
+
+function apnsConfigFor(envOverride) {
+  const keyId = process.env.NOTED_APNS_KEY_ID || process.env.APNS_KEY_ID || '';
+  const teamId = process.env.NOTED_APNS_TEAM_ID || process.env.APNS_TEAM_ID || '';
+  const keyPath = process.env.NOTED_APNS_KEY_PATH || process.env.APNS_KEY_PATH || '';
+  const inlineKey = process.env.NOTED_APNS_PRIVATE_KEY || process.env.APNS_PRIVATE_KEY || '';
+  let privateKey = inlineKey ? inlineKey.replace(/\\n/g, '\n') : '';
+  if (!privateKey && keyPath) {
+    privateKey = fs.readFileSync(path.resolve(keyPath), 'utf-8');
+  }
+  const forcedEnv = process.env.NOTED_APNS_ENV || process.env.APNS_ENV || '';
+  const environment = forcedEnv === 'production' || forcedEnv === 'development'
+    ? forcedEnv
+    : (envOverride === 'production' ? 'production' : 'development');
+  if (!keyId || !teamId || !privateKey) {
+    return { configured: false, missing: ['KEY_ID', 'TEAM_ID', 'PRIVATE_KEY'].filter((name) => {
+      if (name === 'KEY_ID') return !keyId;
+      if (name === 'TEAM_ID') return !teamId;
+      return !privateKey;
+    }) };
+  }
+  return { configured: true, keyId, teamId, privateKey, environment };
+}
+
+function apnsJwt(config) {
+  const now = Math.floor(Date.now() / 1000);
+  const cacheKey = config.keyId + ':' + config.teamId;
+  if (apnsJwtCache && apnsJwtCache.cacheKey === cacheKey && now - apnsJwtCache.issuedAt < 45 * 60) {
+    return apnsJwtCache.jwt;
+  }
+  const header = base64url(JSON.stringify({ alg: 'ES256', kid: config.keyId }));
+  const claims = base64url(JSON.stringify({ iss: config.teamId, iat: now }));
+  const signingInput = header + '.' + claims;
+  const signature = crypto.sign('sha256', Buffer.from(signingInput), crypto.createPrivateKey(config.privateKey));
+  const jwt = signingInput + '.' + derToJose(signature);
+  apnsJwtCache = { cacheKey, issuedAt: now, jwt };
+  return jwt;
+}
+
+function sendApnsNotification(tokenRecord, payload) {
+  return new Promise((resolve) => {
+    const config = apnsConfigFor(tokenRecord.environment);
+    if (!config.configured) {
+      console.warn('[APNs] skip not configured missing=' + config.missing.join(',') + ' token=' + String(tokenRecord.token || '').slice(-10));
+      resolve({ ok: false, skipped: true, reason: 'not_configured' });
+      return;
+    }
+    const host = config.environment === 'production' ? 'https://api.push.apple.com' : 'https://api.sandbox.push.apple.com';
+    const bundleId = tokenRecord.bundleId || process.env.NOTED_APNS_BUNDLE_ID || 'com.habittracker.swift';
+    const client = http2.connect(host);
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      try { client.close(); } catch {}
+      resolve(result);
+    };
+    client.on('error', (e) => finish({ ok: false, error: e?.message || String(e) }));
+    const req = client.request({
+      ':method': 'POST',
+      ':path': '/3/device/' + tokenRecord.token,
+      authorization: 'bearer ' + apnsJwt(config),
+      'apns-topic': bundleId,
+      'apns-push-type': 'alert',
+      'apns-priority': '10',
+      'apns-expiration': String(Math.floor(Date.now() / 1000) + 86400),
+    });
+    let status = 0;
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('response', (headers) => { status = Number(headers[':status'] || 0); });
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => finish({ ok: status >= 200 && status < 300, status, body }));
+    req.on('error', (e) => finish({ ok: false, error: e?.message || String(e) }));
+    req.end(JSON.stringify(payload));
+  });
+}
+
+async function sendTabCompletionPush(detail = {}) {
+  const projectId = String(detail.projectId || '').trim();
+  const tabId = String(detail.tabId || '').trim();
+  if (!projectId || !tabId) return { ok: false, error: 'projectId/tabId required' };
+  const tokens = readIosPushTokens();
+  if (tokens.length === 0) {
+    console.log('[APNs] no registered iOS tokens for tab notification tab=' + tabId.slice(-10));
+    return { ok: true, sent: 0, total: 0 };
+  }
+  const firedAt = Number(detail.firedAt) || Date.now();
+  const tabName = String(detail.tabName || 'Terminal').slice(0, 160);
+  const mode = detail.persistent === true ? 'persistent' : 'oneshot';
+  const payload = {
+    aps: {
+      alert: { title: 'Terminal', body: tabName },
+      sound: 'default',
+      'content-available': 1,
+    },
+    kind: 'terminal-completion',
+    projectId,
+    tabId,
+    tabName,
+    firedAt,
+    mode,
+  };
+  console.log('[APNs] send terminal completion project=' + projectId.slice(-10) + ' tab=' + tabId.slice(-10) + ' tokens=' + tokens.length + ' mode=' + mode);
+  const results = [];
+  for (const tokenRecord of tokens) {
+    // Sequential sends keep logs readable and avoid opening a burst of HTTP/2 sessions.
+    // Expected device count is tiny for this personal companion app.
+    // eslint-disable-next-line no-await-in-loop
+    const result = await sendApnsNotification(tokenRecord, payload);
+    results.push({ token: String(tokenRecord.token || ''), tokenSuffix: String(tokenRecord.token || '').slice(-10), env: tokenRecord.environment, ...result });
+    console.log('[APNs] result token=' + String(tokenRecord.token || '').slice(-10) + ' env=' + tokenRecord.environment + ' ok=' + !!result.ok + ' status=' + (result.status || '-') + ' reason=' + (result.reason || result.body || result.error || '-'));
+  }
+  const invalidReasons = new Set(['BadDeviceToken', 'Unregistered', 'DeviceTokenNotForTopic']);
+  const invalid = new Set(results.filter((r) => {
+    if (!r.body) return false;
+    try { return invalidReasons.has(JSON.parse(r.body).reason); } catch { return false; }
+  }).map((r) => r.token));
+  if (invalid.size > 0) {
+    const kept = tokens.filter((item) => !invalid.has(String(item.token || '')));
+    writeIosPushTokens(kept);
+    console.warn('[APNs] removed invalid tokens count=' + invalid.size + ' remaining=' + kept.length);
+  }
+  return { ok: true, sent: results.filter((r) => r.ok).length, total: tokens.length, results };
 }
 
 function getLanIp() {
@@ -983,6 +1179,32 @@ async function handleApi(req, res, parsed, sdkSessions) {
     return sendJson(res, 200, { ok: true, lanIp: getLanIp() });
   }
 
+  if (parsed.pathname === '/api/ios/push-token' && req.method === 'POST') {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    const body = await readBody(req);
+    const result = registerIosPushToken(body);
+    return sendJson(res, result.ok ? 200 : 400, result);
+  }
+
+  if (parsed.pathname === '/api/ios/push-status' && req.method === 'GET') {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    const tokens = readIosPushTokens();
+    const config = apnsConfigFor();
+    return sendJson(res, 200, {
+      ok: true,
+      configured: config.configured === true,
+      missing: config.configured ? [] : config.missing,
+      tokenCount: tokens.length,
+      tokens: tokens.map((item) => ({
+        environment: item.environment,
+        bundleId: item.bundleId,
+        deviceName: item.deviceName,
+        tokenSuffix: String(item.token || '').slice(-10),
+        lastSeenAt: item.lastSeenAt,
+      })),
+    });
+  }
+
   // Active-loaders snapshot — every tab across every project that is still
   // "working" (AI turn/loader, SDK streaming, Gemini busy, or a non-AI running
   // shell process). AI CLI liveness by itself is not a loader: idle Claude/Codex
@@ -1144,6 +1366,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
     let openIds = new Set();
     let activeProjectId = null;
     let awaitingIds = new Set();
+    let completionNotificationCounts = {};
     try {
       const data = await bridgeRequest('getOpenProjectIds', {}, 1500);
       if (Array.isArray(data?.ids)) {
@@ -1152,6 +1375,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
       }
       activeProjectId = data?.activeProjectId || null;
       if (Array.isArray(data?.awaitingIds)) awaitingIds = new Set(data.awaitingIds);
+      if (data?.completionNotificationCounts && typeof data.completionNotificationCounts === 'object') {
+        completionNotificationCounts = data.completionNotificationCounts;
+      }
     } catch {}
 
     const openOrder = new Map(openProjectIds.map((id, index) => [id, index]));
@@ -1173,6 +1399,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         isOpen: openIds.has(p.id),
         isActive: p.id === activeProjectId,
         hasAwaiting: awaitingIds.has(p.id),
+        completionNotificationCount: Number(completionNotificationCounts[p.id]) || 0,
         isSystem: isInboxProjectId(p.id),
         systemType: isInboxProjectId(p.id) ? 'inbox' : null,
       };
@@ -1359,6 +1586,16 @@ async function handleApi(req, res, parsed, sdkSessions) {
     let runtimeSessionMap = new Map();
     let startupFailedMap = new Map();
     let startupErrorMap = new Map();
+    let completionNotificationMap = new Map();
+    try {
+      const data = await bridgeRequest('getProjectCompletionNotifications', { projectId }, 1500);
+      if (data?.tabs && typeof data.tabs === 'object') {
+        for (const [id, info] of Object.entries(data.tabs)) completionNotificationMap.set(id, info || {});
+      }
+    } catch (e) {
+      // Runtime-only notification state lives in renderer; closed projects just
+      // expose the persisted "persistent" arm flag below.
+    }
     const ptyAgentIds = (project.tabs || [])
       .filter(t => (t.commandType === 'claude' || t.commandType === 'codex') && (t.tabType || 'terminal') !== 'claude-sdk')
       .map(t => t.tabId);
@@ -1413,6 +1650,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const statusId = t.sessionStatus || null;
       const runtimeStatus = statusMap.get(t.tabId) || null;
       const runtimeCodexSessionId = runtimeSessionMap.get(t.tabId) || null;
+      const notification = completionNotificationMap.get(t.tabId) || {};
       return {
         tabId: t.tabId,
         name: t.name,
@@ -1435,6 +1673,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
         awaiting: awaitingMap.get(t.tabId) || false,
         statusId,
         statusColor: statusId ? (paletteById.get(statusId)?.color || null) : null,
+        completionNotificationPersistent: notification.completionNotificationPersistent === true || t.completionNotificationPersistent === true,
+        completionNotificationArmed: notification.completionNotificationArmed === true,
+        completionNotificationFired: notification.completionNotificationFired === true,
+        completionNotificationFiredAt: notification.completionNotificationFiredAt || null,
         groupId: t.groupId || null,
         visualParentTabId: t.visualParentTabId || null,
         // Last-known context fill % (SQLite context_pct). Seeds the native/web
@@ -1581,6 +1823,17 @@ async function handleApi(req, res, parsed, sdkSessions) {
       });
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/completion-notification\/clear$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]);
+    try {
+      const data = await bridgeRequest('clearTabCompletionNotification', { tabId, keepPersistent: true }, 1500);
+      return sendJson(res, 200, { ok: true, success: true, ...(data || {}) });
+    } catch (e) {
+      return sendTerminalBridgeError(res, e);
     }
   }
 
@@ -3244,4 +3497,4 @@ function updateExternalRunSettings(payload = {}) {
   };
 }
 
-module.exports = { start, stop, webBroadcast, broadcastProjectActivity, getInfo, updateExternalRunSettings, notifyClaudeSessionAvailable };
+module.exports = { start, stop, webBroadcast, broadcastProjectActivity, getInfo, updateExternalRunSettings, notifyClaudeSessionAvailable, sendTabCompletionPush };

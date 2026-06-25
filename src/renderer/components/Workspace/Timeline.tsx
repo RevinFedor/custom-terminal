@@ -183,6 +183,7 @@ interface TimelineProps {
   isOpen?: boolean; // CMD+] toggle — controls slide in/out
   toolType?: 'claude' | 'gemini' | 'codex'; // Which AI tool this timeline is for
   pinned?: boolean; // When true, expanded Timeline reserves layout width instead of overlaying terminal
+  readOnly?: boolean; // Home preview: Timeline only navigates HistoryPanel
 }
 
 interface CodexTimelineSessionMeta {
@@ -460,12 +461,12 @@ function perfAbsNow(): number {
 // ════════════════════════════════════════════════════════════
 // SECTION: COMPONENT SETUP — props, UIStore subscriptions, state, ref declarations
 // ════════════════════════════════════════════════════════════
-function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, isOpen = true, toolType = 'claude', pinned = false }: TimelineProps) {
+function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, isOpen = true, toolType = 'claude', pinned = false, readOnly = false }: TimelineProps) {
   const isGemini = toolType === 'gemini';
   const isCodex = toolType === 'codex';
   const usesTextSearchAnchors = isGemini || isCodex;
-  const supportsClaudeTimelineActions = !isGemini && !isCodex;
-  const supportsEditRangeActions = supportsClaudeTimelineActions || isCodex;
+  const supportsClaudeTimelineActions = !readOnly && !isGemini && !isCodex;
+  const supportsEditRangeActions = !readOnly && (supportsClaudeTimelineActions || isCodex);
   const summaryToolType: TimelineSummaryTool | null = isGemini ? null : (isCodex ? 'codex' : 'claude');
   const promptSummaries = useTimelineSummaryStore(state => state.summaries);
   const promptSummaryLoadingKeys = useTimelineSummaryStore(state => state.loadingKeys);
@@ -1074,8 +1075,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const timelineLineClamp = useUIStore(state => state.timelineLineClamp);
   // treeMode IS the expanded layout (chip + preview text). Old 160px tree-with-labels
   // visualisation is replaced. Width drag-resizable in expanded mode.
-  const isExpandedLayout = treeMode;
-  const effectiveWidth = treeMode ? timelineWidth : 32;
+  const isExpandedLayout = readOnly ? false : treeMode;
+  const effectiveWidth = isExpandedLayout ? timelineWidth : 32;
   const intrinsicPreviewFontSize = Math.max(timelineFontSize, timelineSummaryFontSize);
   // Measured CSS `right:` value (px) that anchors popups to Timeline's left edge.
   // Computed from real DOM rect — robust to HistoryPanel open/close, treeMode, window resize.
@@ -2651,6 +2652,26 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // ════════════════════════════════════════════════════════════
 
   const handleEntryClick = (entry: TimelineEntry, e?: React.MouseEvent) => {
+    if (readOnly) {
+      const index = entries.findIndex(e => e.uuid === entry.uuid);
+      if (e) e.stopPropagation();
+      if (!isHistoryOpen) setHistoryPanelOpen(tabId, true);
+      setHistoryScrollToUuid(entry.uuid);
+      console.warn('[Timeline:HistoryScroll] request tab=' + tabId.slice(-12) +
+        ' uuid=' + entry.uuid.slice(0, 8) +
+        ' index=' + index +
+        ' entries=' + entries.length +
+        ' mode=read-only-preview open=' + isHistoryOpen);
+      setClickedState({ index, status: 'loading' });
+      pendingHistoryScrollRef.current = { uuid: entry.uuid, index };
+      if (historyClickTimeoutRef.current) clearTimeout(historyClickTimeoutRef.current);
+      historyClickTimeoutRef.current = setTimeout(() => {
+        pendingHistoryScrollRef.current = null;
+        setClickedState((s) => (s?.index === index ? null : s));
+      }, HISTORY_SCROLL_SAFETY_TIMEOUT_MS);
+      return;
+    }
+
     // Если режим выделения активен — показываем меню выбора действия
     if (selectionStartIdRef.current) {
       if (selectionStartIdRef.current === entry.uuid) {
@@ -2908,6 +2929,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   };
 
   const handleEntryDoubleClick = (entry: TimelineEntry) => {
+    if (readOnly) return;
     if (clickTimerRef.current) {
       clearTimeout(clickTimerRef.current);
       clickTimerRef.current = null;
@@ -2920,6 +2942,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const handleRightClick = (e: React.MouseEvent, entry: TimelineEntry, _source?: 'dot' | 'segment') => {
     e.preventDefault();
     e.stopPropagation();
+    if (readOnly) return;
 
     // Position: anchor popup's RIGHT edge to Timeline's LEFT edge (mirrors note tooltip).
     // X is no longer derived from cursor — vertical position follows the dot, horizontal is

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode, RefObject, WheelEvent } from 'react';
 import { createPortal } from 'react-dom';
-import { ChevronDown, Folder } from 'lucide-react';
+import { ChevronDown, Folder, X } from 'lucide-react';
 import { useWorkspaceStore, type TabColor, type TabGroup } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
@@ -561,6 +561,8 @@ export function RunAfterTabPicker({
     <button
       ref={triggerRef}
       onClick={() => open ? setOpen(false) : handleOpen()}
+      onMouseEnter={() => setTriggerHover(true)}
+      onMouseLeave={() => setTriggerHover(false)}
       title={
         hasSelectedTarget && selectedTab
           ? (
@@ -594,7 +596,41 @@ export function RunAfterTabPicker({
     >
       {hasSelectedTarget && selectedTab ? (
         <>
-          <span style={{ width: 5, height: 5, borderRadius: '50%', background: AI_KIND_COLOR[selectedTab.kind], flexShrink: 0 }} />
+          <span
+            role="button"
+            aria-label="Clear selected Run after tab"
+            title="Clear selected tab"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setRunAfterTab(tabId, null);
+              setOpen(false);
+            }}
+            style={{
+              width: 13,
+              height: 13,
+              borderRadius: 4,
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              flexShrink: 0,
+              color: triggerHover ? '#f3f4f6' : 'transparent',
+              background: triggerHover ? 'rgba(255,255,255,0.12)' : 'transparent',
+              cursor: triggerHover ? 'pointer' : 'default',
+              pointerEvents: triggerHover ? 'auto' : 'none',
+              transition: 'background 0.12s, color 0.12s',
+            }}
+          >
+            {triggerHover ? (
+              <X size={10} strokeWidth={2.4} aria-hidden="true" />
+            ) : (
+              <span style={{ width: 5, height: 5, borderRadius: '50%', background: AI_KIND_COLOR[selectedTab.kind] }} />
+            )}
+          </span>
           <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left', fontSize: 11 }}>
             {selectedTab.name}
           </span>

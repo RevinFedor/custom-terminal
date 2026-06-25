@@ -15,6 +15,70 @@ const MAX_BATCH_SIZE = 100; // Gemini limit per batch request
 const MAX_CHUNK_TOKENS = 2048; // Gemini embedding input limit
 const MAX_CHUNK_CHARS = MAX_CHUNK_TOKENS * 4; // ~4 chars per token
 
+function yieldToEventLoop() {
+  return new Promise(resolve => setImmediate(resolve));
+}
+
+function estimateEmbeddingUsage(texts) {
+  const items = Array.isArray(texts) ? texts : [texts];
+  let sourceChars = 0;
+  for (const text of items) {
+    sourceChars += String(text || '').slice(0, MAX_CHUNK_CHARS).length;
+  }
+  const promptTokens = Math.ceil(sourceChars / 4);
+  return { sourceChars, promptTokens, totalTokens: promptTokens };
+}
+
+function mergeEmbeddingUsage(target, usage) {
+  if (!usage) return target;
+  target.sourceChars += Number(usage.sourceChars || 0);
+  target.promptTokens += Number(usage.promptTokens || 0);
+  target.totalTokens += Number(usage.totalTokens || 0);
+  return target;
+}
+
+function getProjectUsageMeta(db, projectId) {
+  if (!projectId) return {};
+  try {
+    const row = db.prepare('SELECT id, name, path FROM projects WHERE id = ?').get(projectId);
+    if (!row) return {};
+    return { projectId: row.id, projectName: row.name || null, projectPath: row.path || null };
+  } catch {
+    return { projectId };
+  }
+}
+
+function logEmbeddingUsage(projectManager, db, payload) {
+  const usage = payload?.usage;
+  if (!projectManager?.logAIPromptCall || !usage || Number(usage.sourceChars || 0) <= 0) return;
+  try {
+    const projectMeta = getProjectUsageMeta(db, payload.projectId);
+    projectManager.logAIPromptCall({
+      promptId: null,
+      taskType: payload.taskType || 'Embedding',
+      model: GEMINI_EMBED_MODEL,
+      thinkingLevel: null,
+      promptTokens: Number(usage.promptTokens || 0),
+      candidateTokens: 0,
+      thoughtTokens: 0,
+      totalTokens: Number(usage.totalTokens || 0),
+      status: payload.status || 'success',
+      error: payload.error ? String(payload.error).slice(0, 500) : null,
+      sourceChars: Number(usage.sourceChars || 0),
+      outputChars: 0,
+      ...projectMeta,
+      tabId: payload.tabId || null,
+      tabName: payload.tabName || null,
+      toolType: 'embedding',
+      sessionId: payload.sessionId || null,
+      entryUuid: payload.entryUuid || null,
+      iterationIndex: null,
+    });
+  } catch (err) {
+    console.warn('[SemanticSearch] failed to log embedding usage:', err.message);
+  }
+}
+
 /**
  * Embed an array of texts via Gemini batchEmbedContents.
  * Returns array of Float32Array (768 dims each).
@@ -314,6 +378,55 @@ function initTabTitleSearchTables(db) {
   `);
 }
 
+function initTabIterationSearchTables(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS tab_history_iteration_index (
+      history_id INTEGER NOT NULL,
+      project_id TEXT NOT NULL,
+      tool_type TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      entry_uuid TEXT NOT NULL,
+      iteration_index INTEGER NOT NULL,
+      summary TEXT DEFAULT NULL,
+      content TEXT NOT NULL,
+      text_hash TEXT NOT NULL,
+      embedding BLOB,
+      indexed_at INTEGER DEFAULT (strftime('%s', 'now')),
+      PRIMARY KEY (history_id, entry_uuid),
+      FOREIGN KEY(history_id) REFERENCES tab_history(id) ON DELETE CASCADE
+    )
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_tab_iteration_index_project
+    ON tab_history_iteration_index(project_id)
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_tab_iteration_index_session
+    ON tab_history_iteration_index(tool_type, session_id)
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_tab_iteration_index_project_history
+    ON tab_history_iteration_index(project_id, history_id, iteration_index)
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS tab_history_iteration_scan (
+      history_id INTEGER PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      tool_type TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      iteration_count INTEGER DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'scanned',
+      error TEXT DEFAULT NULL,
+      scanned_at INTEGER DEFAULT (strftime('%s', 'now')),
+      FOREIGN KEY(history_id) REFERENCES tab_history(id) ON DELETE CASCADE
+    )
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_tab_iteration_scan_project
+    ON tab_history_iteration_scan(project_id)
+  `);
+}
+
 /**
  * Compute SHA256 hash of a file.
  */
@@ -362,11 +475,14 @@ async function indexSessionFile(db, filePath, sessionId, projectSlug) {
   }
 
   // Embed all chunks
+  const embeddingUsage = estimateEmbeddingUsage(chunks.map(c => c.text));
   let embeddings;
+  let embeddingError = null;
   try {
     embeddings = await embedTexts(chunks.map(c => c.text));
   } catch (err) {
     console.error('[SemanticSearch] Embedding failed, storing chunks without vectors:', err.message);
+    embeddingError = err.message;
     embeddings = null;
   }
 
@@ -405,7 +521,13 @@ async function indexSessionFile(db, filePath, sessionId, projectSlug) {
 
   insertAll();
 
-  return { chunked: chunks.length, embedded: embeddings ? chunks.length : 0, skipped: false };
+  return {
+    chunked: chunks.length,
+    embedded: embeddings ? chunks.length : 0,
+    skipped: false,
+    embeddingUsage,
+    embeddingError,
+  };
 }
 
 /**
@@ -457,7 +579,8 @@ async function indexAllSessions(db, progressCb, limit = 0) {
     files = files.slice(0, limit);
   }
   const total = files.length;
-  let indexed = 0, skipped = 0, failed = 0;
+  let indexed = 0, skipped = 0, failed = 0, embeddingErrors = 0;
+  const embeddingUsage = { sourceChars: 0, promptTokens: 0, totalTokens: 0 };
 
   for (let i = 0; i < files.length; i++) {
     const { filePath, sessionId, projectSlug } = files[i];
@@ -467,6 +590,8 @@ async function indexAllSessions(db, progressCb, limit = 0) {
         skipped++;
       } else {
         indexed++;
+        mergeEmbeddingUsage(embeddingUsage, result.embeddingUsage);
+        if (result.embeddingError) embeddingErrors++;
         console.log(`[SemanticSearch] Indexed ${sessionId} (${result.chunked} chunks)`);
       }
     } catch (err) {
@@ -476,7 +601,7 @@ async function indexAllSessions(db, progressCb, limit = 0) {
     if (progressCb) progressCb(i + 1, total, { indexed, skipped, failed });
   }
 
-  return { total, indexed, skipped, failed };
+  return { total, indexed, skipped, failed, embeddingErrors, embeddingUsage };
 }
 
 // ========== TAB NAME ENRICHMENT ==========
@@ -531,10 +656,13 @@ async function searchSessions(db, query, opts = {}) {
 
   // Step 1: Embed the query
   let queryVec;
+  const queryUsage = estimateEmbeddingUsage([query]);
   try {
     queryVec = await embedQuery(query);
+    if (opts.onEmbeddingCall) opts.onEmbeddingCall({ usage: queryUsage, status: 'success' });
   } catch (err) {
     console.error('[SemanticSearch] Query embedding failed, falling back to FTS:', err.message);
+    if (opts.onEmbeddingCall) opts.onEmbeddingCall({ usage: queryUsage, status: 'error', error: err.message });
     return ftsSearch(db, query, opts);
   }
 
@@ -648,10 +776,22 @@ function getIndexStats(db) {
 
 let _indexingInProgress = false;
 let _titleIndexingInProgress = false;
+let _iterationIndexingInProgress = false;
 
 function cleanupTabTitleIndex(db) {
   db.prepare(`
     DELETE FROM tab_history_title_index
+     WHERE history_id NOT IN (SELECT id FROM tab_history)
+  `).run();
+}
+
+function cleanupTabIterationIndex(db) {
+  db.prepare(`
+    DELETE FROM tab_history_iteration_index
+     WHERE history_id NOT IN (SELECT id FROM tab_history)
+  `).run();
+  db.prepare(`
+    DELETE FROM tab_history_iteration_scan
      WHERE history_id NOT IN (SELECT id FROM tab_history)
   `).run();
 }
@@ -678,6 +818,11 @@ function getTabTitleIndexStats(db, projectId) {
   };
 }
 
+function clearTabTitleIndex(db, projectId) {
+  const result = db.prepare('DELETE FROM tab_history_title_index WHERE project_id = ?').run(projectId);
+  return { deleted: result.changes || 0, stats: getTabTitleIndexStats(db, projectId) };
+}
+
 async function indexTabTitles(db, projectId, progressCb, force = false) {
   cleanupTabTitleIndex(db);
   const rows = db.prepare(`
@@ -699,11 +844,12 @@ async function indexTabTitles(db, projectId, progressCb, force = false) {
   const total = pending.length;
   if (total === 0) {
     if (progressCb) progressCb(0, 0);
-    return { total: rows.length, indexed: 0, skipped: rows.length, failed: 0 };
+    return { total: rows.length, indexed: 0, skipped: rows.length, failed: 0, embeddingUsage: estimateEmbeddingUsage([]) };
   }
 
   let indexed = 0;
   let failed = 0;
+  const embeddingUsage = estimateEmbeddingUsage(pending.map((row) => row.name));
   const upsert = db.prepare(`
     INSERT INTO tab_history_title_index (history_id, project_id, name, name_hash, embedding, indexed_at)
     VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))
@@ -740,6 +886,7 @@ async function indexTabTitles(db, projectId, progressCb, force = false) {
     indexed,
     skipped: rows.length - pending.length,
     failed,
+    embeddingUsage,
   };
 }
 
@@ -758,7 +905,15 @@ async function searchTabTitles(db, projectId, query, opts = {}) {
   `).all(projectId);
   if (rows.length === 0) return [];
 
-  const queryVec = await embedQuery(text);
+  const queryUsage = estimateEmbeddingUsage([text]);
+  let queryVec;
+  try {
+    queryVec = await embedQuery(text);
+    if (opts.onEmbeddingCall) opts.onEmbeddingCall({ usage: queryUsage, status: 'success' });
+  } catch (err) {
+    if (opts.onEmbeddingCall) opts.onEmbeddingCall({ usage: queryUsage, status: 'error', error: err.message });
+    throw err;
+  }
 
   const scored = [];
   for (const row of rows) {
@@ -771,17 +926,392 @@ async function searchTabTitles(db, projectId, query, opts = {}) {
   return scored.slice(0, maxResults);
 }
 
-function register({ projectManager, mainWindow }) {
+function getHistoryIterationTarget(row) {
+  if (!row) return null;
+  if (row.command_type === 'codex' && row.codex_session_id) {
+    return { toolType: 'codex', sessionId: row.codex_session_id };
+  }
+  if (row.command_type === 'claude' && row.claude_session_id) {
+    return { toolType: 'claude', sessionId: row.claude_session_id };
+  }
+  if (row.codex_session_id) return { toolType: 'codex', sessionId: row.codex_session_id };
+  if (row.claude_session_id) return { toolType: 'claude', sessionId: row.claude_session_id };
+  return null;
+}
+
+function truncateIterationText(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, MAX_CHUNK_CHARS);
+}
+
+function normalizeDateFrom(dateFrom) {
+  const raw = String(dateFrom || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+  const ts = Math.floor(new Date(`${raw}T00:00:00`).getTime() / 1000);
+  return Number.isFinite(ts) ? ts : null;
+}
+
+function getPromptSummaries(db, toolType, sessionId) {
+  const rows = db.prepare(`
+    SELECT entry_uuid, summary
+      FROM timeline_prompt_summaries
+     WHERE tool_type = ?
+       AND session_id = ?
+  `).all(toolType, sessionId);
+  const map = new Map();
+  for (const row of rows) {
+    if (row.entry_uuid && row.summary) map.set(row.entry_uuid, row.summary);
+  }
+  return map;
+}
+
+async function loadHistoryIterations(row, claudeData, codexData) {
+  const target = getHistoryIterationTarget(row);
+  if (!target) return [];
+
+  if (target.toolType === 'codex') {
+    const loaded = await codexData?._api?.loadSessionRecords?.(target.sessionId, row.cwd);
+    if (!loaded?.success) return [];
+    return (codexData?._api?.buildCodexTimeline?.(loaded.records || [], target.sessionId) || [])
+      .filter((entry) => entry?.type === 'user' && entry.uuid && String(entry.content || '').trim())
+      .map((entry, index) => ({
+        uuid: entry.uuid,
+        content: String(entry.content || ''),
+        iterationIndex: Number.isFinite(entry.turnIndex) ? entry.turnIndex : index,
+      }));
+  }
+
+  const found = claudeData?.findSessionFile?.(target.sessionId, row.cwd);
+  if (!found?.filePath) return [];
+  return (claudeData?.parseTimelineEntries?.(found.filePath) || [])
+    .filter((entry) => entry?.kind === 'user' && entry.uuid && String(entry.full || entry.preview || '').trim())
+    .map((entry, index) => ({
+      uuid: entry.uuid,
+      content: String(entry.full || entry.preview || ''),
+      iterationIndex: index,
+    }));
+}
+
+function getTabIterationIndexStats(db, projectId, opts = {}) {
+  cleanupTabIterationIndex(db);
+  const dateFromTs = normalizeDateFrom(opts.dateFrom);
+  const dateWhere = dateFromTs ? ' AND h.closed_at >= ?' : '';
+  const indexParams = dateFromTs ? [projectId, dateFromTs] : [projectId];
+  const missingApprox = db.prepare(`
+    SELECT COALESCE(SUM(CASE WHEN message_count IS NULL THEN 0 ELSE message_count END), 0) AS count
+      FROM tab_history h
+     WHERE h.project_id = ?
+       AND (claude_session_id IS NOT NULL OR codex_session_id IS NOT NULL)
+       ${dateWhere}
+       AND id NOT IN (
+         SELECT DISTINCT history_id
+           FROM tab_history_iteration_index
+          WHERE project_id = ?
+       )
+       AND id NOT IN (
+         SELECT history_id
+           FROM tab_history_iteration_scan
+          WHERE project_id = ?
+       )
+  `).get(...(dateFromTs ? [projectId, dateFromTs, projectId, projectId] : [projectId, projectId, projectId]))?.count || 0;
+  const indexed = db.prepare(`
+    SELECT COUNT(*) AS count
+      FROM tab_history_iteration_index
+      JOIN tab_history h ON h.id = tab_history_iteration_index.history_id
+     WHERE tab_history_iteration_index.project_id = ?
+       ${dateWhere}
+       AND embedding IS NOT NULL
+  `).get(...indexParams)?.count || 0;
+  const discovered = db.prepare(`
+    SELECT COUNT(*) AS count
+      FROM tab_history_iteration_index
+      JOIN tab_history h ON h.id = tab_history_iteration_index.history_id
+     WHERE tab_history_iteration_index.project_id = ?
+       ${dateWhere}
+  `).get(...indexParams)?.count || 0;
+  const total = Math.max(discovered + (Number(missingApprox) || 0), indexed, discovered);
+  return {
+    total,
+    indexed,
+    discovered,
+    unindexed: Math.max(0, total - indexed),
+    model: GEMINI_EMBED_MODEL,
+    dims: EMBEDDING_DIMS,
+    inProgress: _iterationIndexingInProgress,
+  };
+}
+
+function clearTabIterationIndex(db, projectId) {
+  const result = db.prepare('DELETE FROM tab_history_iteration_index WHERE project_id = ?').run(projectId);
+  db.prepare('DELETE FROM tab_history_iteration_scan WHERE project_id = ?').run(projectId);
+  return { deleted: result.changes || 0, stats: getTabIterationIndexStats(db, projectId) };
+}
+
+async function indexTabIterations(db, projectId, progressCb, force = false, claudeData, codexData, opts = {}) {
+  cleanupTabIterationIndex(db);
+  const dateFromTs = normalizeDateFrom(opts.dateFrom);
+  const dateWhere = dateFromTs ? ' AND h.closed_at >= ?' : '';
+  const rowParams = dateFromTs ? [projectId, dateFromTs] : [projectId];
+  const rows = db.prepare(`
+    SELECT h.*, i.entry_uuid AS indexed_entry_uuid
+      FROM tab_history h
+      LEFT JOIN tab_history_iteration_index i ON i.history_id = h.id
+     WHERE h.project_id = ?
+       AND (h.claude_session_id IS NOT NULL OR h.codex_session_id IS NOT NULL)
+       ${dateWhere}
+     GROUP BY h.id
+     ORDER BY h.closed_at DESC, h.id DESC
+  `).all(...rowParams);
+
+  if (force) {
+    if (dateFromTs) {
+      db.prepare(`
+        DELETE FROM tab_history_iteration_index
+         WHERE project_id = ?
+           AND history_id IN (
+             SELECT id FROM tab_history
+              WHERE project_id = ?
+                AND closed_at >= ?
+           )
+      `).run(projectId, projectId, dateFromTs);
+      db.prepare(`
+        DELETE FROM tab_history_iteration_scan
+         WHERE project_id = ?
+           AND history_id IN (
+             SELECT id FROM tab_history
+              WHERE project_id = ?
+                AND closed_at >= ?
+           )
+      `).run(projectId, projectId, dateFromTs);
+    } else {
+      db.prepare('DELETE FROM tab_history_iteration_index WHERE project_id = ?').run(projectId);
+      db.prepare('DELETE FROM tab_history_iteration_scan WHERE project_id = ?').run(projectId);
+    }
+  }
+
+  const existingRows = db.prepare(`
+    SELECT i.history_id, i.entry_uuid, i.text_hash, i.embedding
+      FROM tab_history_iteration_index i
+      JOIN tab_history h ON h.id = i.history_id
+     WHERE i.project_id = ?
+       ${dateWhere}
+  `).all(...rowParams);
+  const existing = new Map();
+  for (const row of existingRows) {
+    existing.set(`${row.history_id}:${row.entry_uuid}`, row);
+  }
+
+  const pending = [];
+  let parsedRows = 0;
+  let failed = 0;
+  const upsertScan = db.prepare(`
+    INSERT INTO tab_history_iteration_scan (
+      history_id, project_id, tool_type, session_id, iteration_count, status, error, scanned_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+    ON CONFLICT(history_id) DO UPDATE SET
+      project_id = excluded.project_id,
+      tool_type = excluded.tool_type,
+      session_id = excluded.session_id,
+      iteration_count = excluded.iteration_count,
+      status = excluded.status,
+      error = excluded.error,
+      scanned_at = excluded.scanned_at
+  `);
+
+  if (progressCb) {
+    progressCb(0, rows.length, { phase: 'scan', parsedRows, pending: 0, failed });
+    await yieldToEventLoop();
+  }
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const target = getHistoryIterationTarget(row);
+    if (!target) continue;
+    try {
+      const summaries = getPromptSummaries(db, target.toolType, target.sessionId);
+      const iterations = await loadHistoryIterations(row, claudeData, codexData);
+      parsedRows += 1;
+      upsertScan.run(row.id, row.project_id, target.toolType, target.sessionId, iterations.length, iterations.length > 0 ? 'scanned' : 'empty', null);
+      for (let j = 0; j < iterations.length; j++) {
+        const iteration = iterations[j];
+        const summary = String(summaries.get(iteration.uuid) || '').trim();
+        const content = truncateIterationText(iteration.content);
+        if (!content) continue;
+        const embedText = truncateIterationText(summary ? `${summary}\n\n${content}` : content);
+        const hash = textHash(embedText);
+        const key = `${row.id}:${iteration.uuid}`;
+        const prev = existing.get(key);
+        if (!force && prev?.text_hash === hash && prev?.embedding) continue;
+        pending.push({
+          historyId: row.id,
+          projectId: row.project_id,
+          toolType: target.toolType,
+          sessionId: target.sessionId,
+          entryUuid: iteration.uuid,
+          iterationIndex: Number.isFinite(iteration.iterationIndex) ? iteration.iterationIndex : j,
+          summary: summary || null,
+          content,
+          embedText,
+          hash,
+        });
+      }
+    } catch (err) {
+      failed += 1;
+      upsertScan.run(row.id, row.project_id, target.toolType, target.sessionId, 0, 'error', String(err?.message || err).slice(0, 500));
+      console.error('[TabIterationSearch] load failed historyId=' + row.id + ':', err.message);
+    }
+    if (progressCb) {
+      progressCb(i + 1, rows.length, { phase: 'scan', parsedRows, pending: pending.length, failed });
+      await yieldToEventLoop();
+    }
+  }
+
+  const upsert = db.prepare(`
+    INSERT INTO tab_history_iteration_index (
+      history_id, project_id, tool_type, session_id, entry_uuid, iteration_index,
+      summary, content, text_hash, embedding, indexed_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+    ON CONFLICT(history_id, entry_uuid) DO UPDATE SET
+      project_id = excluded.project_id,
+      tool_type = excluded.tool_type,
+      session_id = excluded.session_id,
+      iteration_index = excluded.iteration_index,
+      summary = excluded.summary,
+      content = excluded.content,
+      text_hash = excluded.text_hash,
+      embedding = excluded.embedding,
+      indexed_at = excluded.indexed_at
+  `);
+
+  let indexed = 0;
+  let processedEmbeddings = 0;
+  const embeddingUsage = estimateEmbeddingUsage(pending.map((row) => row.embedText));
+  if (progressCb && pending.length > 0) {
+    progressCb(0, pending.length, { phase: 'embed', parsedRows, indexed, failed, pending: pending.length });
+    await yieldToEventLoop();
+  }
+  for (let i = 0; i < pending.length; i += MAX_BATCH_SIZE) {
+    const batch = pending.slice(i, i + MAX_BATCH_SIZE);
+    try {
+      const embeddings = await embedTexts(batch.map((row) => row.embedText));
+      const tx = db.transaction(() => {
+        for (let j = 0; j < batch.length; j++) {
+          const row = batch[j];
+          const embedding = embeddings[j] ? embeddingToBlob(embeddings[j]) : null;
+          upsert.run(
+            row.historyId,
+            row.projectId,
+            row.toolType,
+            row.sessionId,
+            row.entryUuid,
+            row.iterationIndex,
+            row.summary,
+            row.content,
+            row.hash,
+            embedding
+          );
+        }
+      });
+      tx();
+      indexed += batch.length;
+    } catch (err) {
+      failed += batch.length;
+      console.error('[TabIterationSearch] embedding batch failed:', err.message);
+    }
+    processedEmbeddings += batch.length;
+    if (progressCb) {
+      progressCb(processedEmbeddings, pending.length, {
+        phase: 'embed',
+        parsedRows,
+        indexed,
+        failed,
+        pending: Math.max(0, pending.length - i - batch.length),
+      });
+      await yieldToEventLoop();
+    }
+  }
+
+  return {
+    totalHistories: rows.length,
+    parsedRows,
+    indexed,
+    skipped: Math.max(0, existingRows.length - pending.length),
+    failed,
+    embeddingUsage,
+  };
+}
+
+async function searchTabIterations(db, projectId, query, opts = {}) {
+  const text = String(query || '').trim();
+  if (text.length === 0) return [];
+  const maxResults = opts.maxResults || 80;
+  const minScore = opts.minScore ?? 0.34;
+  const dateFromTs = normalizeDateFrom(opts.dateFrom);
+  const dateWhere = dateFromTs ? ' AND h.closed_at >= ?' : '';
+  const rowParams = dateFromTs ? [projectId, dateFromTs] : [projectId];
+  const rows = db.prepare(`
+    SELECT h.*, i.tool_type, i.session_id, i.entry_uuid, i.iteration_index,
+           i.summary, i.content, i.embedding
+      FROM tab_history_iteration_index i
+      JOIN tab_history h ON h.id = i.history_id
+     WHERE i.project_id = ?
+       AND i.embedding IS NOT NULL
+       ${dateWhere}
+     ORDER BY h.closed_at DESC, i.iteration_index ASC
+  `).all(...rowParams);
+  if (rows.length === 0) return [];
+
+  const queryUsage = estimateEmbeddingUsage([text]);
+  let queryVec;
+  try {
+    queryVec = await embedQuery(text);
+    if (opts.onEmbeddingCall) opts.onEmbeddingCall({ usage: queryUsage, status: 'success' });
+  } catch (err) {
+    if (opts.onEmbeddingCall) opts.onEmbeddingCall({ usage: queryUsage, status: 'error', error: err.message });
+    throw err;
+  }
+  const scored = [];
+  for (const row of rows) {
+    const score = cosineSimilarity(queryVec, blobToEmbedding(row.embedding));
+    if (score < minScore) continue;
+    const { embedding, tool_type, session_id, entry_uuid, iteration_index, summary, content, ...entry } = row;
+    scored.push({
+      ...entry,
+      toolType: tool_type,
+      sessionId: session_id,
+      entryUuid: entry_uuid,
+      iterationIndex: iteration_index,
+      summary,
+      content,
+      score,
+    });
+  }
+  scored.sort((a, b) => b.score - a.score || b.closed_at - a.closed_at || a.iterationIndex - b.iterationIndex);
+  return scored.slice(0, maxResults);
+}
+
+function register({ projectManager, mainWindow, claudeData, codexData }) {
   const db = projectManager.db.db; // Access raw better-sqlite3 instance
 
   // Initialize tables on startup
   initSearchTables(db);
   initTabTitleSearchTables(db);
+  initTabIterationSearchTables(db);
 
   // Search sessions
   ipcMain.handle('search:query', async (event, { query, maxResults, minScore, projectSlug, dateFrom, dateTo }) => {
     try {
-      const results = await searchSessions(db, query, { maxResults, minScore, projectSlug, dateFrom, dateTo });
+      const results = await searchSessions(db, query, {
+        maxResults,
+        minScore,
+        projectSlug,
+        dateFrom,
+        dateTo,
+        onEmbeddingCall: (call) => logEmbeddingUsage(projectManager, db, {
+          taskType: 'Embedding: transcript query',
+          ...call,
+        }),
+      });
       return { success: true, data: results };
     } catch (error) {
       console.error('[SemanticSearch] Search error:', error.message);
@@ -793,6 +1323,13 @@ function register({ projectManager, mainWindow }) {
   ipcMain.handle('search:index-session', async (event, { filePath, sessionId, projectSlug }) => {
     try {
       const result = await indexSessionFile(db, filePath, sessionId, projectSlug);
+      logEmbeddingUsage(projectManager, db, {
+        taskType: 'Embedding: transcript index',
+        usage: result.embeddingUsage,
+        status: result.embeddingError ? 'error' : 'success',
+        error: result.embeddingError,
+        sessionId,
+      });
       console.log(`[SemanticSearch] Indexed session ${sessionId}: ${result.chunked} chunks`);
       return { success: true, ...result };
     } catch (error) {
@@ -815,6 +1352,14 @@ function register({ projectManager, mainWindow }) {
           mainWindow.webContents.send('search:index-progress', { current, total, ...stats });
         }
       }, limit);
+      logEmbeddingUsage(projectManager, db, {
+        taskType: 'Embedding: transcript bulk index',
+        usage: result.embeddingUsage,
+        status: result.failed || result.embeddingErrors ? 'error' : 'success',
+        error: result.failed || result.embeddingErrors
+          ? `${result.failed || 0} file(s) failed, ${result.embeddingErrors || 0} embedding file(s) without vectors`
+          : null,
+      });
       console.log(`[SemanticSearch] Bulk index complete: ${result.indexed} indexed, ${result.skipped} skipped, ${result.failed} failed`);
       return { success: true, ...result };
     } catch (error) {
@@ -863,6 +1408,13 @@ function register({ projectManager, mainWindow }) {
           });
         }
       }, !!force);
+      logEmbeddingUsage(projectManager, db, {
+        taskType: 'Embedding: title index',
+        usage: result.embeddingUsage,
+        status: result.failed ? 'error' : 'success',
+        error: result.failed ? `${result.failed} title row(s) failed` : null,
+        projectId,
+      });
       return { success: true, ...result, stats: getTabTitleIndexStats(db, projectId) };
     } catch (error) {
       console.error('[TabTitleSearch] reindex error:', error.message);
@@ -872,12 +1424,95 @@ function register({ projectManager, mainWindow }) {
     }
   });
 
+  ipcMain.handle('tab-title-index:clear', async (event, { projectId }) => {
+    try {
+      return { success: true, ...clearTabTitleIndex(db, projectId) };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
   ipcMain.handle('tab-title-search:semantic', async (event, { projectId, query, maxResults, minScore }) => {
     try {
-      const results = await searchTabTitles(db, projectId, query, { maxResults, minScore });
+      const results = await searchTabTitles(db, projectId, query, {
+        maxResults,
+        minScore,
+        onEmbeddingCall: (call) => logEmbeddingUsage(projectManager, db, {
+          taskType: 'Embedding: title query',
+          projectId,
+          ...call,
+        }),
+      });
       return { success: true, data: results };
     } catch (error) {
       console.error('[TabTitleSearch] query error:', error.message);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('tab-iteration-index:stats', async (event, { projectId, dateFrom }) => {
+    try {
+      return { success: true, data: getTabIterationIndexStats(db, projectId, { dateFrom }) };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('tab-iteration-index:reindex', async (event, { projectId, force, dateFrom }) => {
+    if (_iterationIndexingInProgress) {
+      return { success: false, error: 'Tab iteration indexing already in progress' };
+    }
+    _iterationIndexingInProgress = true;
+    try {
+      const result = await indexTabIterations(db, projectId, (current, total, stats) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('tab-iteration-index:progress', {
+            projectId,
+            current,
+            total,
+            ...stats,
+          });
+        }
+      }, !!force, claudeData, codexData, { dateFrom });
+      logEmbeddingUsage(projectManager, db, {
+        taskType: 'Embedding: iteration index',
+        usage: result.embeddingUsage,
+        status: result.failed ? 'error' : 'success',
+        error: result.failed ? `${result.failed} iteration row(s) failed` : null,
+        projectId,
+      });
+      return { success: true, ...result, stats: getTabIterationIndexStats(db, projectId, { dateFrom }) };
+    } catch (error) {
+      console.error('[TabIterationSearch] reindex error:', error.message);
+      return { success: false, error: error.message };
+    } finally {
+      _iterationIndexingInProgress = false;
+    }
+  });
+
+  ipcMain.handle('tab-iteration-index:clear', async (event, { projectId }) => {
+    try {
+      return { success: true, ...clearTabIterationIndex(db, projectId) };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('tab-iteration-search:semantic', async (event, { projectId, query, maxResults, minScore, dateFrom }) => {
+    try {
+      const results = await searchTabIterations(db, projectId, query, {
+        maxResults,
+        minScore,
+        dateFrom,
+        onEmbeddingCall: (call) => logEmbeddingUsage(projectManager, db, {
+          taskType: 'Embedding: iteration query',
+          projectId,
+          ...call,
+        }),
+      });
+      return { success: true, data: results };
+    } catch (error) {
+      console.error('[TabIterationSearch] query error:', error.message);
       return { success: false, error: error.message };
     }
   });

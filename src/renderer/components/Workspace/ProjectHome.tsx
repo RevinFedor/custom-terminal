@@ -10,47 +10,31 @@ import Tooltip from '../UI/Tooltip';
 const CARD_W = 100;        // History + Favorites
 const ACTIVE_CARD_W = 100; // Active row — same width for visual consistency
 
-// Right-column width is drag-resizable. Persisted GLOBALLY across machines via
+// Left history-column width is drag-resizable. Persisted GLOBALLY across machines via
 // the localStorage ↔ SQLite mirror (see utils/persistedStorage.ts). The mirror
 // only fires for keys with prefix `noted-terminal-` или `sidebarWidth`, поэтому
-// ключ префиксуется `noted-terminal-`. Старый ключ `project-home:right-col-width`
-// мигрируется автоматически при первом чтении (read old → write new → delete old).
-// Default sized for two 100px cards per row (2×100 + 8 gap + 12 padding) — anything
-// wider creates dead space. Double-click the divider to reset.
-const RIGHT_COL_STORAGE_KEY = 'noted-terminal-project-home-right-col-width';
-const RIGHT_COL_LEGACY_KEY = 'project-home:right-col-width';
-const RIGHT_COL_DEFAULT = 220;
-const RIGHT_COL_MIN = 140;
-const RIGHT_COL_MAX = 480;
+// ключ префиксуется `noted-terminal-`. Старый pre-split key ignored: the new
+// layout stores the left column, not the removed right card rail.
+const RIGHT_COL_STORAGE_KEY = 'noted-terminal-project-home-list-col-width';
+const RIGHT_COL_DEFAULT = 420;
+const RIGHT_COL_MIN = 300;
+const RIGHT_COL_MAX = 620;
+const ITERATION_RANGE_LOADER_MIN_MS = 350;
 const loadRightColWidth = (): number => {
   try {
-    // Migration: read from new key first; fall back to legacy key и сразу
-    // переписываем под новый prefix (после этого mirror зеркалит в SQLite).
     let raw = localStorage.getItem(RIGHT_COL_STORAGE_KEY);
-    if (raw == null) {
-      const legacy = localStorage.getItem(RIGHT_COL_LEGACY_KEY);
-      if (legacy != null) {
-        try {
-          localStorage.setItem(RIGHT_COL_STORAGE_KEY, legacy);
-          localStorage.removeItem(RIGHT_COL_LEGACY_KEY);
-        } catch {}
-        raw = legacy;
-      }
-    }
     const n = raw ? parseInt(raw, 10) : NaN;
     if (!Number.isFinite(n)) return RIGHT_COL_DEFAULT;
-    if (n >= 320) {
-      try { localStorage.removeItem(RIGHT_COL_STORAGE_KEY); } catch {}
-      return RIGHT_COL_DEFAULT;
-    }
     return Math.max(RIGHT_COL_MIN, Math.min(RIGHT_COL_MAX, n));
   } catch { return RIGHT_COL_DEFAULT; }
 };
 import { useUIStore } from '../../store/useUIStore';
 import { useCmdKey, useCmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import TabPreviewPopover from './TabPreviewPopover';
+import HistoryPanel from './HistoryPanel';
+import Timeline from './Timeline';
 import { Virtuoso } from 'react-virtuoso';
-import { FolderOpen, Clock, Trash2, Pencil, Search, Database, Loader2, RotateCw } from 'lucide-react';
+import { FolderOpen, Clock, Trash2, Pencil, Search, Database, Loader2, RotateCw, X, Check, ChevronDown } from 'lucide-react';
 import {
   generateTabTitleFromSession,
   refreshGeneratedTabTitle,
@@ -119,6 +103,36 @@ interface TabTitleIndexStats {
   dims: number;
   inProgress: boolean;
 }
+
+interface TabIterationIndexStats extends TabTitleIndexStats {
+  discovered: number;
+}
+
+type IterationSearchResult = ScoredTabHistoryEntry & {
+  toolType: 'claude' | 'codex';
+  sessionId: string;
+  entryUuid: string;
+  iterationIndex: number;
+  summary?: string | null;
+  content: string;
+};
+
+type PreviewToolType = 'claude' | 'gemini' | 'codex';
+type IterationToolFilter = 'all' | 'codex' | 'claude';
+
+type PersistedHomeState = {
+  version: 1;
+  historyQuery?: string;
+  iterationQuery?: string;
+  iterationResults?: IterationSearchResult[];
+  iterationToolFilter?: IterationToolFilter;
+};
+
+type PreviewSelection = {
+  entry: TabHistoryEntry;
+  targetUuid?: string | null;
+  source: 'history' | 'iteration';
+} | null;
 
 type ContextMenuState = {
   x: number;
@@ -218,6 +232,39 @@ function formatTimestamp(unix: number): string {
   });
 }
 
+function formatDateInput(unix: number): string {
+  const date = new Date(unix * 1000);
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function todayDateInput(): string {
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function daysAgoDateInput(days: number): string {
+  const date = new Date();
+  date.setDate(date.getDate() - days);
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function nextAnimationFrame(): Promise<void> {
+  return new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 function normalizeSearchText(value: string): string {
   return value.toLocaleLowerCase().replace(/\s+/g, ' ').trim();
 }
@@ -261,6 +308,26 @@ function getHistoryTitleTarget(entry: TabHistoryEntry): { toolType: 'claude' | '
   return null;
 }
 
+function getHistoryPreviewTarget(entry: TabHistoryEntry): { toolType: PreviewToolType; sessionId: string } | null {
+  if (entry.command_type === 'codex' && entry.codex_session_id) {
+    return { toolType: 'codex', sessionId: entry.codex_session_id };
+  }
+  if (entry.command_type === 'gemini' && entry.gemini_session_id) {
+    return { toolType: 'gemini', sessionId: entry.gemini_session_id };
+  }
+  if (entry.command_type === 'claude' && entry.claude_session_id) {
+    return { toolType: 'claude', sessionId: entry.claude_session_id };
+  }
+  if (entry.codex_session_id) return { toolType: 'codex', sessionId: entry.codex_session_id };
+  if (entry.gemini_session_id) return { toolType: 'gemini', sessionId: entry.gemini_session_id };
+  if (entry.claude_session_id) return { toolType: 'claude', sessionId: entry.claude_session_id };
+  return null;
+}
+
+function makeHomePreviewTabId(projectId: string, historyId: number): string {
+  return `home-preview:${projectId}:${historyId}`;
+}
+
 // Color configs matching TabBar
 const TAB_COLORS: Record<TabColor, { bgColor: string; borderColor: string }> = {
   default: { bgColor: 'rgba(255,255,255,0.05)', borderColor: '#666' },
@@ -273,6 +340,68 @@ const TAB_COLORS: Record<TabColor, { bgColor: string; borderColor: string }> = {
   gemini: { bgColor: 'rgba(78, 134, 248, 0.2)', borderColor: '#4E86F8' },
   codex: { bgColor: 'rgba(16, 163, 127, 0.18)', borderColor: '#10A37F' },
 };
+
+function withAlpha(color: string, alpha: number): string {
+  const rgba = color.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+  if (rgba) return `rgba(${rgba[1]}, ${rgba[2]}, ${rgba[3]}, ${alpha})`;
+  const hex = color.match(/^#([0-9a-f]{6})$/i);
+  if (hex) {
+    const n = parseInt(hex[1], 16);
+    return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
+  }
+  return color;
+}
+
+function selectedCardBg(colorConfig: { bgColor: string; borderColor: string }): string {
+  const isDefault = colorConfig.borderColor === '#666';
+  return withAlpha(isDefault ? colorConfig.borderColor : colorConfig.bgColor, isDefault ? 0.14 : 0.34);
+}
+
+function hoverCardBg(colorConfig: { bgColor: string; borderColor: string }): string {
+  const isDefault = colorConfig.borderColor === '#666';
+  return withAlpha(isDefault ? colorConfig.borderColor : colorConfig.bgColor, isDefault ? 0.18 : 0.42);
+}
+
+function makeIterationHoverKey(entry: IterationSearchResult): string {
+  return `${entry.id}:${entry.entryUuid}`;
+}
+
+function homeStateStorageKey(projectId: string): string {
+  return `noted-terminal-project-home-state:${projectId}`;
+}
+
+function isIterationToolFilter(value: unknown): value is IterationToolFilter {
+  return value === 'all' || value === 'codex' || value === 'claude';
+}
+
+function loadPersistedHomeState(projectId: string): PersistedHomeState {
+  try {
+    const raw = localStorage.getItem(homeStateStorageKey(projectId));
+    if (!raw) return { version: 1 };
+    const parsed = JSON.parse(raw);
+    return {
+      version: 1,
+      historyQuery: typeof parsed?.historyQuery === 'string' ? parsed.historyQuery : '',
+      iterationQuery: typeof parsed?.iterationQuery === 'string' ? parsed.iterationQuery : '',
+      iterationResults: Array.isArray(parsed?.iterationResults) ? parsed.iterationResults.slice(0, 120) : [],
+      iterationToolFilter: isIterationToolFilter(parsed?.iterationToolFilter) ? parsed.iterationToolFilter : 'all',
+    };
+  } catch {
+    return { version: 1 };
+  }
+}
+
+function savePersistedHomeState(projectId: string, state: PersistedHomeState): void {
+  try {
+    localStorage.setItem(homeStateStorageKey(projectId), JSON.stringify({
+      version: 1,
+      historyQuery: state.historyQuery || '',
+      iterationQuery: state.iterationQuery || '',
+      iterationResults: Array.isArray(state.iterationResults) ? state.iterationResults.slice(0, 120) : [],
+      iterationToolFilter: state.iterationToolFilter || 'all',
+    }));
+  } catch {}
+}
 
 export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const renderStartedAt = performance.now();
@@ -313,6 +442,8 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const project = useProjectsStore((state) => state.projects[projectId]);
   const updateProject = useProjectsStore((state) => state.updateProject);
   const showToast = useUIStore((state) => state.showToast);
+  const setHistoryPanelOpen = useUIStore((state) => state.setHistoryPanelOpen);
+  const setHistoryScrollToUuid = useUIStore((state) => state.setHistoryScrollToUuid);
   const tabTitleNamingIds = useWorkspaceStore((state) => state.tabTitleNamingIds);
   const setTabTitleNaming = useWorkspaceStore((state) => state.setTabTitleNaming);
   // Status-marker palette + shape/size. Granular selectors — re-rendered только когда
@@ -326,16 +457,28 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const [favorites, setFavorites] = useState<FavoriteEntry[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
   const [historyQuery, setHistoryQuery] = useState('');
-  const [semanticQuery, setSemanticQuery] = useState('');
-  const [semanticResults, setSemanticResults] = useState<ScoredTabHistoryEntry[]>([]);
-  const [semanticSearching, setSemanticSearching] = useState(false);
+  const [iterationQuery, setIterationQuery] = useState('');
+  const [iterationResults, setIterationResults] = useState<IterationSearchResult[]>([]);
+  const [iterationToolFilter, setIterationToolFilter] = useState<IterationToolFilter>('all');
+  const [iterationSearching, setIterationSearching] = useState(false);
   const [titleSearchError, setTitleSearchError] = useState<string | null>(null);
+  const [iterationSearchError, setIterationSearchError] = useState<string | null>(null);
   const [titleIndexStats, setTitleIndexStats] = useState<TabTitleIndexStats | null>(null);
+  const [iterationIndexStats, setIterationIndexStats] = useState<TabIterationIndexStats | null>(null);
   const [titleIndexing, setTitleIndexing] = useState(false);
+  const [iterationIndexing, setIterationIndexing] = useState(false);
   const [titleRefreshInFlight, setTitleRefreshInFlight] = useState<Set<string>>(new Set());
   const [titleIndexProgress, setTitleIndexProgress] = useState<{ current: number; total: number } | null>(null);
+  const [iterationIndexProgress, setIterationIndexProgress] = useState<{ current: number; total: number } | null>(null);
+  const [selectedPreview, setSelectedPreview] = useState<PreviewSelection>(null);
+  const [iterationRangeOpen, setIterationRangeOpen] = useState(false);
+  const [iterationDateFrom, setIterationDateFrom] = useState('');
+  const [iterationDateDraft, setIterationDateDraft] = useState('');
+  const [iterationDateApplying, setIterationDateApplying] = useState(false);
+  const [previewScrollPending, setPreviewScrollPending] = useState<{ tabId: string; uuid: string } | null>(null);
   const [visibleRange, setVisibleRange] = useState<{ startIndex: number; endIndex: number }>({ startIndex: 0, endIndex: 0 });
   const historyLoadProjectRef = useRef<string | null>(null);
+  const homeStateReadyRef = useRef(false);
   const restoreInFlightRef = useRef<Set<number>>(new Set());
   const renderSeqRef = useRef(0);
   const pendingReadyRef = useRef<{
@@ -355,8 +498,8 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   // intentional: ProjectHome unmounts when user switches back to terminal, so
   // the subscription dies with it and we don't pay the cost when not visible.
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
-  // Right-column width — drag the vertical divider to resize. Wider = more
-  // room for Active/Favorites cards per row; narrower = more room for history.
+  // Left history-column width — drag the vertical divider to resize. Wider =
+  // more room for titles; narrower = more room for the preview.
   const [rightColWidth, setRightColWidth] = useState<number>(() => loadRightColWidth());
   const dragStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
 
@@ -371,10 +514,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     const onMove = (ev: PointerEvent) => {
       const st = dragStateRef.current;
       if (!st) return;
-      // Dragging LEFT increases right-column width (we want it intuitive: drag
-      // left = give more space to active+favorites; drag right = give more to
-      // history). Sign chosen so the divider follows the cursor.
-      const delta = st.startX - ev.clientX;
+      const delta = ev.clientX - st.startX;
       const w = Math.max(RIGHT_COL_MIN, Math.min(RIGHT_COL_MAX, st.startWidth + delta));
       setRightColWidth(w);
     };
@@ -398,6 +538,38 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const rightColWidthRef = useRef(rightColWidth);
   useEffect(() => { rightColWidthRef.current = rightColWidth; }, [rightColWidth]);
   const [homeContextMenu, setHomeContextMenu] = useState<ContextMenuState>(null);
+
+  useEffect(() => {
+    homeStateReadyRef.current = false;
+    const saved = loadPersistedHomeState(projectId);
+    setHistoryQuery(saved.historyQuery || '');
+    setIterationQuery(saved.iterationQuery || '');
+    setIterationResults(saved.iterationResults || []);
+    setIterationToolFilter(saved.iterationToolFilter || 'all');
+    setSelectedPreview(null);
+    setPreviewScrollPending(null);
+    const key = `noted-terminal-project-home-iteration-date-from:${projectId}`;
+    let stored = '';
+    try { stored = localStorage.getItem(key) || ''; } catch {}
+    setIterationDateFrom(stored);
+    setIterationDateDraft(stored);
+    setIterationRangeOpen(false);
+    const frame = window.requestAnimationFrame(() => {
+      homeStateReadyRef.current = true;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!homeStateReadyRef.current) return;
+    savePersistedHomeState(projectId, {
+      version: 1,
+      historyQuery,
+      iterationQuery,
+      iterationResults,
+      iterationToolFilter,
+    });
+  }, [historyQuery, iterationQuery, iterationResults, iterationToolFilter, projectId]);
 
   // Draft mode detection — check if this project was just created
   const [isDraft, setIsDraft] = useState(false);
@@ -518,6 +690,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   // user already has the muscle memory of "hold Cmd to peek details".
   const isCmdPressed = useCmdKey();
   const historyPopover = useCmdHoverPopover<number>(isCmdPressed);
+  const iterationPopover = useCmdHoverPopover<string>(isCmdPressed, 180);
 
   // Close context menu on mousedown outside
   const contextMenuRef = useRef<HTMLDivElement>(null);
@@ -722,6 +895,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       if (!background) setProjectView(projectId, 'terminal');
       await ipcRenderer.invoke('project:delete-tab-history-entry', { id: entry.id });
       setHistory(prev => prev.filter(h => h.id !== entry.id));
+      setSelectedPreview(prev => (prev?.entry.id === entry.id ? null : prev));
       if (restoreCwd.fallbackFrom) {
         showToast(`Оригинальная папка удалена. Открыто в ${restoreCwd.cwd}`, 'warning', 6500, false, restoreCwd.fallbackFrom);
       }
@@ -873,12 +1047,14 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const handleClearHistory = async () => {
     await ipcRenderer.invoke('project:clear-tab-history', { projectId });
     setHistory([]);
+    setSelectedPreview(null);
   };
 
   const handleClearExceptNotes = async () => {
     await ipcRenderer.invoke('project:clear-tab-history-except-notes', { projectId });
     const data = await ipcRenderer.invoke('project:get-tab-history', { projectId });
     setHistory(data || []);
+    setSelectedPreview(null);
   };
 
   const handleChangeDirectory = async () => {
@@ -944,6 +1120,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const deleteHistoryEntry = async (id: number) => {
     await ipcRenderer.invoke('project:delete-tab-history-entry', { id });
     setHistory(prev => prev.filter(h => h.id !== id));
+    setSelectedPreview(prev => (prev?.entry.id === id ? null : prev));
   };
 
   const refreshTitleIndexStats = useCallback(async () => {
@@ -957,6 +1134,21 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       setTitleSearchError(err?.message || 'Failed to load title index stats');
     }
   }, [projectId]);
+
+  const refreshIterationIndexStats = useCallback(async () => {
+    try {
+      const res = await ipcRenderer.invoke('tab-iteration-index:stats', {
+        projectId,
+        dateFrom: iterationDateFrom || null,
+      });
+      if (res?.success) {
+        setIterationIndexStats(res.data);
+        setIterationIndexing(!!res.data?.inProgress);
+      }
+    } catch (err: any) {
+      setIterationSearchError(err?.message || 'Failed to load iteration index stats');
+    }
+  }, [iterationDateFrom, projectId]);
 
   const setTitleRefreshKey = useCallback((key: string, active: boolean) => {
     setTitleRefreshInFlight(prev => {
@@ -1041,7 +1233,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       setHistory(prev => prev.map(item => (
         item.id === entry.id ? { ...item, name: result.title! } : item
       )));
-      setSemanticResults(prev => prev.map(item => (
+      setIterationResults(prev => prev.map(item => (
         item.id === entry.id ? { ...item, name: result.title! } : item
       )));
       refreshTitleIndexStats();
@@ -1058,7 +1250,8 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   useEffect(() => {
     if (!isLoaded) return;
     refreshTitleIndexStats();
-  }, [isLoaded, history.length, refreshTitleIndexStats]);
+    refreshIterationIndexStats();
+  }, [isLoaded, history.length, refreshIterationIndexStats, refreshTitleIndexStats]);
 
   useEffect(() => {
     const handler = (_: any, data: any) => {
@@ -1067,6 +1260,15 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     };
     ipcRenderer.on('tab-title-index:progress', handler);
     return () => { ipcRenderer.removeListener('tab-title-index:progress', handler); };
+  }, [projectId]);
+
+  useEffect(() => {
+    const handler = (_: any, data: any) => {
+      if (data?.projectId !== projectId) return;
+      setIterationIndexProgress({ current: data.current || 0, total: data.total || 0 });
+    };
+    ipcRenderer.on('tab-iteration-index:progress', handler);
+    return () => { ipcRenderer.removeListener('tab-iteration-index:progress', handler); };
   }, [projectId]);
 
   const handleReindexTitles = useCallback(async () => {
@@ -1089,12 +1291,131 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     }
   }, [projectId, refreshTitleIndexStats]);
 
+  const handleClearTitleIndex = useCallback(async () => {
+    setTitleSearchError(null);
+    try {
+      const res = await ipcRenderer.invoke('tab-title-index:clear', { projectId });
+      if (res?.success) {
+        setTitleIndexStats(res.stats || null);
+      } else {
+        setTitleSearchError(res?.error || 'Title index clear failed');
+      }
+    } catch (err: any) {
+      setTitleSearchError(err?.message || 'Title index clear failed');
+    } finally {
+      refreshTitleIndexStats();
+    }
+  }, [projectId, refreshTitleIndexStats]);
+
+  const handleReindexIterations = useCallback(async () => {
+    setIterationIndexing(true);
+    setIterationIndexProgress(null);
+    setIterationSearchError(null);
+    try {
+      const res = await ipcRenderer.invoke('tab-iteration-index:reindex', {
+        projectId,
+        force: false,
+        dateFrom: iterationDateFrom || null,
+      });
+      if (res?.success) {
+        setIterationIndexStats(res.stats || null);
+      } else {
+        setIterationSearchError(res?.error || 'Iteration indexing failed');
+      }
+    } catch (err: any) {
+      setIterationSearchError(err?.message || 'Iteration indexing failed');
+    } finally {
+      setIterationIndexing(false);
+      setIterationIndexProgress(null);
+      refreshIterationIndexStats();
+    }
+  }, [iterationDateFrom, projectId, refreshIterationIndexStats]);
+
+  const handleClearIterationIndex = useCallback(async () => {
+    setIterationSearchError(null);
+    try {
+      const res = await ipcRenderer.invoke('tab-iteration-index:clear', { projectId });
+      if (res?.success) {
+        setIterationIndexStats(res.stats || null);
+        setIterationResults([]);
+        setIterationQuery('');
+      } else {
+        setIterationSearchError(res?.error || 'Iteration index clear failed');
+      }
+    } catch (err: any) {
+      setIterationSearchError(err?.message || 'Iteration index clear failed');
+    } finally {
+      refreshIterationIndexStats();
+    }
+  }, [projectId, refreshIterationIndexStats]);
+
+  const applyIterationDateRange = useCallback(async (nextDate: string) => {
+    const startedAt = performance.now();
+    const normalized = /^\d{4}-\d{2}-\d{2}$/.test(nextDate) ? nextDate : '';
+    setIterationDateApplying(true);
+    setIterationSearchError(null);
+    setIterationDateFrom(normalized);
+    setIterationDateDraft(normalized);
+    setIterationResults([]);
+    setIterationQuery('');
+    try {
+      const key = `noted-terminal-project-home-iteration-date-from:${projectId}`;
+      if (normalized) localStorage.setItem(key, normalized);
+      else localStorage.removeItem(key);
+    } catch {}
+    await nextAnimationFrame();
+    try {
+      const res = await ipcRenderer.invoke('tab-iteration-index:stats', {
+        projectId,
+        dateFrom: normalized || null,
+      });
+      if (res?.success) {
+        setIterationIndexStats(res.data);
+        setIterationIndexing(!!res.data?.inProgress);
+      } else {
+        setIterationSearchError(res?.error || 'Iteration range failed');
+      }
+    } catch (err: any) {
+      setIterationSearchError(err?.message || 'Iteration range failed');
+    } finally {
+      await nextAnimationFrame();
+      const remaining = ITERATION_RANGE_LOADER_MIN_MS - (performance.now() - startedAt);
+      if (remaining > 0) await delay(remaining);
+      setIterationDateApplying(false);
+    }
+  }, [projectId]);
+
+  const toggleIterationRange = useCallback(() => {
+    if (iterationRangeOpen) {
+      setIterationRangeOpen(false);
+      void applyIterationDateRange(iterationDateDraft);
+    } else {
+      setIterationDateDraft(iterationDateFrom);
+      setIterationRangeOpen(true);
+    }
+  }, [applyIterationDateRange, iterationDateDraft, iterationDateFrom, iterationRangeOpen]);
+
   const titleIndexButtonLabel = useMemo(() => {
     if (!titleIndexing) return 'Index';
     const total = titleIndexProgress?.total ?? titleIndexStats?.unindexed ?? 0;
     const current = titleIndexProgress?.current ?? 0;
     return total > 0 ? `${Math.min(current, total)}/${total}` : 'Indexing';
   }, [titleIndexing, titleIndexProgress, titleIndexStats?.unindexed]);
+
+  const iterationIndexButtonLabel = useMemo(() => {
+    if (!iterationIndexing) return 'Index';
+    const total = iterationIndexProgress?.total ?? iterationIndexStats?.unindexed ?? 0;
+    const current = iterationIndexProgress?.current ?? 0;
+    return total > 0 ? `${Math.min(current, total)}/${total}` : 'Indexing';
+  }, [iterationIndexing, iterationIndexProgress, iterationIndexStats?.unindexed]);
+
+  const iterationRangeLabel = iterationDateFrom ? `${iterationDateFrom} - today` : 'Full';
+  const iterationDateMin = useMemo(() => {
+    const rows = history.filter(entry => entry.claude_session_id || entry.codex_session_id);
+    if (rows.length === 0) return '';
+    return formatDateInput(Math.min(...rows.map(entry => entry.closed_at)));
+  }, [history]);
+  const iterationDateMax = useMemo(() => todayDateInput(), []);
 
   const localFilteredHistory = useMemo(() => {
     const q = normalizeSearchText(historyQuery);
@@ -1106,12 +1427,27 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     });
   }, [history, historyQuery]);
 
-  const semanticModeActive = Boolean(
-    semanticQuery.trim() &&
-    normalizeSearchText(semanticQuery) === normalizeSearchText(historyQuery)
-  );
+  const iterationModeActive = Boolean(iterationQuery.trim());
 
-  const displayedHistory = semanticModeActive ? semanticResults : localFilteredHistory;
+  const displayedHistory = localFilteredHistory;
+  const displayedIterations = useMemo(() => {
+    if (iterationToolFilter === 'all') return iterationResults;
+    return iterationResults.filter((entry) => entry.toolType === iterationToolFilter);
+  }, [iterationResults, iterationToolFilter]);
+  const iterationToolCounts = useMemo(() => {
+    let codex = 0;
+    let claude = 0;
+    for (const entry of iterationResults) {
+      if (entry.toolType === 'codex') codex += 1;
+      if (entry.toolType === 'claude') claude += 1;
+    }
+    return { all: iterationResults.length, codex, claude };
+  }, [iterationResults]);
+
+  useEffect(() => {
+    if (iterationModeActive) historyPopover.close();
+    else iterationPopover.close();
+  }, [iterationModeActive, historyPopover.close, iterationPopover.close]);
 
   const displayedMeta = useMemo(() => {
     const counts = new Map<TimeGroup, number>();
@@ -1154,31 +1490,95 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     Math.max(displayedMeta.length - 1, 0),
   )];
 
-  const handleSemanticTitleSearch = useCallback(async () => {
+  const handleIterationSearch = useCallback(async () => {
     const query = historyQuery.trim();
     if (query.length < 2) return;
-    setSemanticSearching(true);
-    setTitleSearchError(null);
+    setIterationSearching(true);
+    setIterationSearchError(null);
     try {
-      const res = await ipcRenderer.invoke('tab-title-search:semantic', {
+      const res = await ipcRenderer.invoke('tab-iteration-search:semantic', {
         projectId,
         query,
         maxResults: 120,
-        minScore: 0.38,
+        minScore: 0.32,
+        dateFrom: iterationDateFrom || null,
       });
       if (res?.success) {
-        setSemanticQuery(query);
-        setSemanticResults(res.data || []);
+        setIterationQuery(query);
+        setIterationResults(res.data || []);
         setVisibleRange({ startIndex: 0, endIndex: 0 });
       } else {
-        setTitleSearchError(res?.error || 'Semantic title search failed');
+        setIterationSearchError(res?.error || 'Iteration search failed');
       }
     } catch (err: any) {
-      setTitleSearchError(err?.message || 'Semantic title search failed');
+      setIterationSearchError(err?.message || 'Iteration search failed');
     } finally {
-      setSemanticSearching(false);
+      setIterationSearching(false);
     }
-  }, [historyQuery, projectId]);
+  }, [historyQuery, iterationDateFrom, projectId]);
+
+  const selectPreview = useCallback((entry: TabHistoryEntry, targetUuid?: string | null, source: 'history' | 'iteration' = 'history') => {
+    const previewTarget = getHistoryPreviewTarget(entry);
+    if (!previewTarget) {
+      setSelectedPreview({ entry, targetUuid: null, source });
+      setPreviewScrollPending(null);
+      return;
+    }
+    const previewTabId = makeHomePreviewTabId(projectId, entry.id);
+    setHistoryPanelOpen(previewTabId, true);
+    setSelectedPreview({ entry, targetUuid: targetUuid || null, source });
+    if (targetUuid) {
+      setPreviewScrollPending({ tabId: previewTabId, uuid: targetUuid });
+      requestAnimationFrame(() => setHistoryScrollToUuid(targetUuid));
+    } else {
+      setPreviewScrollPending(null);
+    }
+  }, [projectId, setHistoryPanelOpen, setHistoryScrollToUuid]);
+
+  useEffect(() => {
+    if (!previewScrollPending) return;
+    const startedAt = performance.now();
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent).detail || {};
+      if (detail.tabId !== previewScrollPending.tabId) return;
+      if (detail.uuid !== previewScrollPending.uuid) return;
+      setPreviewScrollPending(null);
+    };
+    const timer = window.setTimeout(() => {
+      setPreviewScrollPending(prev => {
+        if (!prev) return prev;
+        if (prev.tabId !== previewScrollPending.tabId || prev.uuid !== previewScrollPending.uuid) return prev;
+        console.warn('[ProjectHome:PreviewScroll] timeout tab=' + prev.tabId.slice(-12) +
+          ' uuid=' + prev.uuid.slice(0, 8) +
+          ' elapsedMs=' + Math.round(performance.now() - startedAt));
+        return null;
+      });
+    }, 8000);
+    window.addEventListener('history-panel:scrolled-to', handler);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('history-panel:scrolled-to', handler);
+    };
+  }, [previewScrollPending]);
+
+  useEffect(() => {
+    setSelectedPreview(prev => {
+      if (!prev) return prev;
+      const updated = history.find(entry => entry.id === prev.entry.id);
+      return updated ? { ...prev, entry: updated } : null;
+    });
+  }, [history]);
+
+  useEffect(() => {
+    if (!selectedPreview) return;
+    const previewTarget = getHistoryPreviewTarget(selectedPreview.entry);
+    if (!previewTarget) return;
+    const previewTabId = makeHomePreviewTabId(projectId, selectedPreview.entry.id);
+    setHistoryPanelOpen(previewTabId, true);
+    if (selectedPreview.targetUuid) {
+      requestAnimationFrame(() => setHistoryScrollToUuid(selectedPreview.targetUuid!));
+    }
+  }, [projectId, selectedPreview, setHistoryPanelOpen, setHistoryScrollToUuid]);
 
   if (!workspace || !project) {
     return (
@@ -1213,10 +1613,21 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     setHomeContextMenu({ x: e.clientX, y: e.clientY, type: type!, itemId });
   };
 
+  const searchError = iterationSearchError || titleSearchError;
+  const previewTarget = selectedPreview ? getHistoryPreviewTarget(selectedPreview.entry) : null;
+  const previewTabId = selectedPreview ? makeHomePreviewTabId(projectId, selectedPreview.entry.id) : '';
+  const previewDate = selectedPreview ? formatShortStamp(selectedPreview.entry.closed_at) : null;
+  const previewScrollLoading = Boolean(
+    previewScrollPending &&
+    selectedPreview?.targetUuid &&
+    previewScrollPending.tabId === previewTabId &&
+    previewScrollPending.uuid === selectedPreview.targetUuid,
+  );
+
   return (
     <div className="h-full bg-bg-main p-6 overflow-hidden flex flex-col" style={{ position: 'relative' }}>
       {/* Project Header */}
-      <div className="mb-5 w-full max-w-[680px] mx-auto flex-shrink-0">
+      <div className="mb-5 w-full flex-shrink-0">
         {isDraft ? (
           /* Draft mode: inline input for naming */
           <>
@@ -1346,7 +1757,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       </div>
 
       {!isLoaded && (
-        <div className="flex-1 min-h-0 w-full max-w-[680px] mx-auto space-y-3">
+        <div className="flex-1 min-h-0 w-full space-y-3">
           <div className="h-8 w-full bg-white/[0.04] rounded animate-pulse" />
           <div className="h-7 w-64 bg-white/[0.04] rounded animate-pulse" />
           {Array.from({ length: 10 }).map((_, i) => (
@@ -1356,85 +1767,319 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       )}
 
       {isLoaded && (
-        <div className="flex-1 min-h-0 w-full max-w-[680px] mx-auto flex flex-col">
-          <div className="flex items-center gap-2 mb-3 flex-shrink-0">
-            <div className="relative flex-1 min-w-0">
-              <Search size={14} className="absolute left-2 top-1/2 -translate-y-1/2 text-[#666]" />
-              <input
-                value={historyQuery}
-                onChange={(e) => {
-                  setHistoryQuery(e.target.value);
-                  setTitleSearchError(null);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-                    e.preventDefault();
-                    handleSemanticTitleSearch();
-                  }
-                }}
-                placeholder="Search tab titles..."
-                className="w-full h-8 bg-[#151515] border border-[#2a2a2a] rounded px-8 text-[12px] text-white outline-none focus:border-[#555]"
-              />
-              {semanticSearching && (
-                <Loader2 size={13} className="absolute right-2 top-1/2 -translate-y-1/2 text-[#818cf8] animate-spin" />
-              )}
-            </div>
-            <button
-              onClick={handleSemanticTitleSearch}
-              disabled={semanticSearching || historyQuery.trim().length < 2}
-              className="h-8 px-3 rounded border border-[#333] text-[12px] text-[#ccc] hover:text-white hover:border-[#555] disabled:opacity-40 disabled:hover:text-[#ccc] disabled:hover:border-[#333] cursor-pointer disabled:cursor-default flex items-center gap-1.5"
-              title="Cmd+Enter"
-            >
-              <Search size={13} />
-              RAG
-            </button>
-            <div className="h-8 px-2 rounded border border-[#2a2a2a] bg-[#111] text-[11px] text-[#888] flex items-center gap-1.5">
-              <Database size={12} className={titleIndexStats?.unindexed ? 'text-[#d97706]' : 'text-[#666]'} />
-              <span>{titleIndexStats?.unindexed ?? 0} new</span>
-            </div>
-            <button
-              onClick={handleReindexTitles}
-              disabled={titleIndexing || !titleIndexStats?.unindexed}
-              className={`h-8 min-w-[72px] px-2 rounded border text-[11px] flex items-center justify-center gap-1.5 ${
-                titleIndexing
-                  ? 'border-[#3a3a52] bg-[#151528] text-[#d7d7ff] cursor-default'
-                  : titleIndexStats?.unindexed
-                    ? 'border-[#333] text-[#aaa] hover:text-white hover:border-[#555] cursor-pointer'
-                    : 'border-[#333] text-[#aaa] opacity-40 cursor-default'
-              }`}
-            >
-              {titleIndexing ? (
-                <Loader2 size={12} className="animate-spin text-[#818cf8]" />
-              ) : (
-                <Database size={12} />
-              )}
-              {titleIndexButtonLabel}
-            </button>
-            <button
-              onClick={() => handleClearHistory()}
-              className="h-8 px-2 rounded text-[11px] text-[#666] hover:text-[#999] cursor-pointer flex items-center gap-1"
-              title="Clear history"
-            >
-              <Trash2 size={12} />
-            </button>
-          </div>
-
-          <div className="flex items-center justify-between mb-2 flex-shrink-0 text-[11px]">
-            <div className="text-[#666]">
-              {semanticModeActive ? 'RAG results' : 'Instant title filter'} · {displayedHistory.length}/{history.length}
-              {titleIndexStats ? <span className="text-[#4b5563]"> · indexed {titleIndexStats.indexed}/{titleIndexStats.total}</span> : null}
-            </div>
-            {titleSearchError && <div className="text-[#DA7756] truncate max-w-[50%]">{titleSearchError}</div>}
-          </div>
-
-          <div className="flex-1 min-h-0 border border-[#242424] rounded bg-[#0f0f0f] overflow-hidden">
-            {displayedHistory.length === 0 ? (
-              <div className="h-full flex items-center justify-center text-[#555] text-xs">
-                {history.length === 0 ? 'Нет закрытых вкладок в истории.' : 'Ничего не найдено.'}
+        <div className="flex-1 min-h-0 w-full flex">
+          <div
+            className="min-w-0 flex-shrink-0 flex flex-col pr-3"
+            style={{ width: rightColWidth }}
+          >
+            <div className="grid grid-cols-2 items-start gap-2 mb-2 flex-shrink-0 pt-2">
+              <div className="relative mt-3 rounded border border-[#242424] bg-[#111] p-2 pt-3 min-w-0">
+                <div className="absolute -top-[7px] left-2 px-1.5 rounded bg-[#111] text-[10px] leading-none text-[#aaa] font-medium">
+                  Title
+                </div>
+                <div className="absolute -top-[7px] right-2 px-1.5 rounded bg-[#111] text-[10px] leading-none text-[#666] font-mono">
+                  {titleIndexStats?.indexed ?? 0}/{titleIndexStats?.total ?? history.length}
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <div className="h-7 min-w-0 flex-1 px-2 rounded border border-[#2a2a2a] bg-[#0d0d0d] text-[11px] text-[#888] flex items-center gap-1.5">
+                    <Database size={12} className={titleIndexStats?.unindexed ? 'text-[#d97706]' : 'text-[#666]'} />
+                    <span className="truncate">{titleIndexStats?.unindexed ?? 0} new</span>
+                  </div>
+                  <button
+                    onClick={handleReindexTitles}
+                    disabled={titleIndexing || !titleIndexStats?.unindexed}
+                    className={`h-7 min-w-[62px] px-2 rounded border text-[11px] flex items-center justify-center gap-1 ${
+                      titleIndexing
+                        ? 'border-[#3a3a52] bg-[#151528] text-[#d7d7ff] cursor-default'
+                        : titleIndexStats?.unindexed
+                          ? 'border-[#333] text-[#aaa] hover:text-white hover:border-[#555] cursor-pointer'
+                          : 'border-[#333] text-[#aaa] opacity-40 cursor-default'
+                    }`}
+                  >
+                    {titleIndexing ? <Loader2 size={12} className="animate-spin text-[#818cf8]" /> : <Database size={12} />}
+                    {titleIndexButtonLabel}
+                  </button>
+                  <button
+                    onClick={handleClearTitleIndex}
+                    disabled={!titleIndexStats?.indexed}
+                    className="h-7 w-7 rounded border border-[#333] text-[#666] hover:text-[#aaa] hover:border-[#555] disabled:opacity-35 disabled:hover:text-[#666] disabled:hover:border-[#333] cursor-pointer disabled:cursor-default flex items-center justify-center"
+                    title="Clear title index"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
               </div>
-            ) : (
-              <div className="h-full min-h-0 flex flex-col">
-                <div className="h-8 px-3 bg-[#151515]/95 border-b border-[#2a2a2a] flex items-center justify-between text-[11px] flex-shrink-0">
+
+              <div className="relative rounded border border-[#242424] bg-[#111] p-2 pt-3 min-w-0">
+                <div className="absolute -top-[7px] left-2 px-1.5 rounded bg-[#111] text-[10px] leading-none text-[#aaa] font-medium">
+                  Iterations
+                </div>
+                <span className="absolute -top-[8px] right-2 px-1.5 rounded bg-[#111] text-[10px] leading-none text-[#666] font-mono flex items-center justify-end min-w-[52px] h-[14px]">
+                  {iterationIndexing || iterationDateApplying ? (
+                    <Loader2 size={11} className="animate-spin text-[#818cf8]" />
+                  ) : (
+                    `${iterationIndexStats?.indexed ?? 0}/${iterationIndexStats?.total ?? 0}`
+                  )}
+                </span>
+                <div className="flex items-center gap-1.5 mb-2">
+                  <button
+                    onClick={toggleIterationRange}
+                    className="h-7 min-w-0 flex-1 px-2 rounded border border-[#2a2a2a] bg-[#0d0d0d] text-[11px] text-[#aaa] hover:text-white hover:border-[#444] cursor-pointer flex items-center justify-between gap-1"
+                    title="Iteration date range"
+                  >
+                    <span className="truncate text-[#777]">{iterationRangeLabel}</span>
+                    <ChevronDown
+                      size={12}
+                      className={`flex-shrink-0 text-[#666] transition-transform ${iterationRangeOpen ? 'rotate-180' : ''}`}
+                    />
+                  </button>
+                </div>
+                {iterationRangeOpen && (
+                  <div className="flex items-center gap-1.5 mb-2">
+                    <div className="relative group flex-shrink-0">
+                      <button
+                        type="button"
+                        className="h-7 w-7 rounded border border-[#2a2a2a] bg-[#0d0d0d] text-[#777] hover:text-[#ddd] hover:border-[#444] cursor-pointer flex items-center justify-center"
+                        title="Date presets"
+                      >
+                        <Clock size={12} />
+                      </button>
+                      <div className="hidden group-hover:block absolute left-0 top-full z-50 pt-1">
+                        <div className="w-[88px] rounded border border-[#333] bg-[#151515] p-1 shadow-xl">
+                          <button
+                            type="button"
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => setIterationDateDraft(daysAgoDateInput(7))}
+                            className="w-full h-6 px-2 rounded text-left text-[11px] text-[#bbb] hover:bg-[#242424] hover:text-white"
+                          >
+                            за неделю
+                          </button>
+                          <button
+                            type="button"
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => setIterationDateDraft(daysAgoDateInput(30))}
+                            className="w-full h-6 px-2 rounded text-left text-[11px] text-[#bbb] hover:bg-[#242424] hover:text-white"
+                          >
+                            за месяц
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      value={iterationDateDraft}
+                      maxLength={10}
+                      placeholder="YYYY-MM-DD"
+                      onChange={(e) => {
+                        setIterationDateDraft(e.target.value.replace(/[^\d-]/g, '').slice(0, 10));
+                      }}
+                      className="h-7 w-[112px] flex-shrink-0 rounded border border-[#2a2a2a] bg-[#0d0d0d] px-2 text-[11px] text-[#ccc] outline-none focus:border-[#555] font-mono"
+                      title={iterationDateMin ? `From ${iterationDateMin} to ${iterationDateMax}` : `Up to ${iterationDateMax}`}
+                    />
+                    <button
+                      onClick={() => {
+                        setIterationRangeOpen(false);
+                        void applyIterationDateRange(iterationDateDraft);
+                      }}
+                      className="h-7 w-7 rounded border border-[#164e3f] bg-[#071b16] text-[#89d8c1] hover:border-[#10A37F] hover:text-white cursor-pointer flex items-center justify-center"
+                      title="Apply range"
+                    >
+                      <Check size={13} />
+                    </button>
+                  </div>
+                )}
+                <div className="flex items-center gap-1.5">
+                  <div className="h-7 min-w-0 flex-1 px-2 rounded border border-[#2a2a2a] bg-[#0d0d0d] text-[11px] text-[#888] flex items-center gap-1.5">
+                    <Database size={12} className={iterationIndexStats?.unindexed ? 'text-[#d97706]' : 'text-[#666]'} />
+                    <span className="truncate">{iterationIndexStats?.unindexed ?? 0} new</span>
+                  </div>
+                  <button
+                    onClick={handleReindexIterations}
+                    disabled={iterationIndexing || !iterationIndexStats?.unindexed}
+                    className={`h-7 min-w-[62px] px-2 rounded border text-[11px] flex items-center justify-center gap-1 ${
+                      iterationIndexing
+                        ? 'border-[#3a3a52] bg-[#151528] text-[#d7d7ff] cursor-default'
+                        : iterationIndexStats?.unindexed
+                          ? 'border-[#333] text-[#aaa] hover:text-white hover:border-[#555] cursor-pointer'
+                          : 'border-[#333] text-[#aaa] opacity-40 cursor-default'
+                    }`}
+                  >
+                    {iterationIndexing ? <Loader2 size={12} className="animate-spin text-[#818cf8]" /> : <Database size={12} />}
+                    {iterationIndexButtonLabel}
+                  </button>
+                  <button
+                    onClick={handleClearIterationIndex}
+                    disabled={!iterationIndexStats?.indexed}
+                    className="h-7 w-7 rounded border border-[#333] text-[#666] hover:text-[#aaa] hover:border-[#555] disabled:opacity-35 disabled:hover:text-[#666] disabled:hover:border-[#333] cursor-pointer disabled:cursor-default flex items-center justify-center"
+                    title="Clear iteration index"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 mb-2 flex-shrink-0">
+              <div className="relative flex-1 min-w-0">
+                <Search size={14} className="absolute left-2 top-1/2 -translate-y-1/2 text-[#666]" />
+                <input
+                  value={historyQuery}
+                  onChange={(e) => {
+                    setHistoryQuery(e.target.value);
+                    setTitleSearchError(null);
+                    setIterationSearchError(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                      e.preventDefault();
+                      handleIterationSearch();
+                    }
+                  }}
+                  placeholder="Search tab titles..."
+                  className="w-full h-8 bg-[#151515] border border-[#2a2a2a] rounded px-8 text-[12px] text-white outline-none focus:border-[#555]"
+                />
+                {iterationSearching && (
+                  <Loader2 size={13} className="absolute right-2 top-1/2 -translate-y-1/2 text-[#10A37F] animate-spin" />
+                )}
+              </div>
+              <button
+                onClick={handleIterationSearch}
+                disabled={iterationSearching || historyQuery.trim().length < 2}
+                className="h-8 px-3 rounded border border-[#333] text-[12px] text-[#ccc] hover:text-white hover:border-[#555] disabled:opacity-40 disabled:hover:text-[#ccc] disabled:hover:border-[#333] cursor-pointer disabled:cursor-default flex items-center gap-1.5"
+                title="Search iterations (Cmd+Enter)"
+              >
+                <Search size={13} />
+                RAG
+              </button>
+            </div>
+
+            {iterationModeActive && (
+              <div className="mb-2 flex-shrink-0">
+                <button
+                  onClick={() => {
+                    setIterationQuery('');
+                    setIterationResults([]);
+                  }}
+                  className="max-w-full h-6 pl-2 pr-1 rounded border border-[#164e3f] bg-[#071b16] text-[11px] text-[#89d8c1] hover:border-[#10A37F] cursor-pointer inline-flex items-center gap-1.5"
+                  title="Back to title filter"
+                >
+                  <span className="truncate">RAG: {iterationQuery}</span>
+                  <X size={12} className="flex-shrink-0" />
+                </button>
+              </div>
+            )}
+
+            <div className="flex items-center justify-between mb-2 flex-shrink-0 text-[11px]">
+              <div className="text-[#666] truncate">
+                {iterationModeActive
+                  ? `Iteration RAG · ${displayedIterations.length}`
+                  : `Instant title filter · ${displayedHistory.length}/${history.length}`}
+              </div>
+              <div className="flex items-center gap-2 min-w-0">
+                {searchError && <div className="text-[#DA7756] truncate max-w-[210px]">{searchError}</div>}
+                <button
+                  onClick={() => handleClearHistory()}
+                  className="h-6 w-6 rounded text-[#555] hover:text-[#999] cursor-pointer flex items-center justify-center"
+                  title="Clear history"
+                >
+                  <Trash2 size={12} />
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 min-h-0 border border-[#242424] rounded bg-[#0f0f0f] overflow-hidden">
+              {iterationModeActive ? (
+                displayedIterations.length === 0 ? (
+                  <div className="h-full flex items-center justify-center text-[#555] text-xs px-4 text-center">
+                    {iterationSearching ? 'Идёт поиск по итерациям...' : 'Итерации не найдены.'}
+                  </div>
+                ) : (
+                  <div className="h-full min-h-0 flex flex-col">
+                    <div className="h-8 px-3 bg-[#151515]/95 border-b border-[#2a2a2a] flex items-center justify-between gap-2 text-[11px] flex-shrink-0">
+                      <div className="flex items-center gap-2 text-[#888] min-w-0">
+                        <Search size={13} className="text-[#10A37F] flex-shrink-0" />
+                        <span className="truncate">Iteration results</span>
+                      </div>
+                      <div className="flex items-center gap-1 flex-shrink-0">
+                        {(['all', 'codex', 'claude'] as const).map((filter) => {
+                          const active = iterationToolFilter === filter;
+                          const label = filter === 'all' ? 'all' : filter;
+                          return (
+                            <button
+                              key={filter}
+                              type="button"
+                              onClick={() => setIterationToolFilter(filter)}
+                              className={`h-5 px-1.5 rounded text-[10px] leading-none transition-colors ${
+                                active
+                                  ? 'bg-[#252525] text-[#e6e6e6]'
+                                  : 'text-[#666] hover:text-[#aaa] hover:bg-[#1d1d1d]'
+                              }`}
+                              title={`${label}: ${iterationToolCounts[filter]}`}
+                            >
+                              {label}
+                            </button>
+                          );
+                        })}
+                        <div className="text-[#666] font-mono min-w-[22px] text-right">{displayedIterations.length}</div>
+                      </div>
+                    </div>
+                    <Virtuoso
+                      style={{ height: '100%' }}
+                      data={displayedIterations}
+                      itemContent={(index, entry) => {
+                        const color = (entry.color || 'default') as TabColor;
+                        const colorConfig = TAB_COLORS[color];
+                        const { date, time } = formatShortStamp(entry.closed_at);
+                        const selected = selectedPreview?.entry.id === entry.id && selectedPreview?.targetUuid === entry.entryUuid;
+                        const hoverKey = makeIterationHoverKey(entry);
+                        const cmdHover = isCmdPressed && iterationPopover.hoveredItem?.id === hoverKey;
+                        const previewText = (entry.summary || entry.content || '').trim();
+                        return (
+                          <div
+                            className="px-2 py-[3px]"
+                            {...iterationPopover.triggerProps(hoverKey)}
+                            onContextMenu={(e) => handleCardContextMenu(e, 'history', entry.id)}
+                          >
+                            <div
+                              className="relative cursor-pointer transition-opacity hover:opacity-90"
+                              onClick={(e) => {
+                                selectPreview(entry, entry.entryUuid, 'iteration');
+                              }}
+                              style={{
+                                minHeight: 46,
+                                padding: '6px 8px',
+                                backgroundColor: cmdHover ? hoverCardBg(colorConfig) : selected ? selectedCardBg(colorConfig) : colorConfig.bgColor,
+                                borderRadius: 5,
+                                borderLeft: `2px solid ${colorConfig.borderColor}`,
+                                outline: cmdHover ? `1px solid ${withAlpha(colorConfig.borderColor, 0.55)}` : selected ? `1px solid ${withAlpha(colorConfig.borderColor, 0.42)}` : 'none',
+                                opacity: cmdHover || selected ? 0.98 : 0.7,
+                              }}
+                            >
+                              <div className="text-[12px] leading-[16px] text-[#d9fff3] line-clamp-2 break-words">
+                                {previewText || 'Empty iteration'}
+                              </div>
+                              <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-[#888] font-mono">
+                                <span className="min-w-0 truncate text-[#aaa]">#{entry.iterationIndex + 1} · {entry.name}</span>
+                                <span className="flex-shrink-0">
+                                  {typeof entry.score === 'number' && <span className="text-[#10A37F] mr-2">{entry.score.toFixed(2)}</span>}
+                                  {date}<span style={{ color: '#555', margin: '0 2px' }}>|</span>{time}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      }}
+                    />
+                  </div>
+                )
+              ) : displayedHistory.length === 0 ? (
+                <div className="h-full flex items-center justify-center text-[#555] text-xs">
+                  {history.length === 0 ? 'Нет закрытых вкладок в истории.' : 'Ничего не найдено.'}
+                </div>
+              ) : (
+                <div className="h-full min-h-0 flex flex-col">
+                  <div className="h-8 px-3 bg-[#151515]/95 border-b border-[#2a2a2a] flex items-center justify-between text-[11px] flex-shrink-0">
                     <div className="flex items-center gap-2 text-[#888] min-w-0">
                       <Clock size={13} className="text-[#777] flex-shrink-0" />
                       <span className="truncate">{currentScrollMeta?.label || 'История'}</span>
@@ -1443,100 +2088,191 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                       {currentScrollMeta ? `${currentScrollMeta.indexInGroup + 1}/${currentScrollMeta.groupCount}` : `0/${displayedHistory.length}`}
                     </div>
                   </div>
-                <Virtuoso
-                  style={{ height: '100%' }}
-                  data={displayedHistory}
-                  rangeChanged={(range) => setVisibleRange((prev) => (
-                    prev.startIndex === range.startIndex && prev.endIndex === range.endIndex
-                      ? prev
-                      : { startIndex: range.startIndex, endIndex: range.endIndex }
-                  ))}
-                  itemContent={(index, entry) => {
-                    const color = (entry.color || 'default') as TabColor;
-                    const colorConfig = TAB_COLORS[color];
-                    const meta = entry.session_status
-                      ? sessionStatuses.find((s) => s.id === entry.session_status)
-                      : null;
-                    const { date, time } = formatShortStamp(entry.closed_at);
-                    const iterationCount = entry.message_count == null ? NaN : Number(entry.message_count);
-                    const iterationLabel = Number.isFinite(iterationCount) ? `${iterationCount} it` : null;
-                    return (
-                      <div
-                        className="px-2 py-[3px]"
-                        {...historyPopover.triggerProps(entry.id)}
-                        onContextMenu={(e) => handleCardContextMenu(e, 'history', entry.id)}
-                      >
+                  <Virtuoso
+                    style={{ height: '100%' }}
+                    data={displayedHistory}
+                    rangeChanged={(range) => setVisibleRange((prev) => (
+                      prev.startIndex === range.startIndex && prev.endIndex === range.endIndex
+                        ? prev
+                        : { startIndex: range.startIndex, endIndex: range.endIndex }
+                    ))}
+                    itemContent={(index, entry) => {
+                      const color = (entry.color || 'default') as TabColor;
+                      const colorConfig = TAB_COLORS[color];
+                      const meta = entry.session_status
+                        ? sessionStatuses.find((s) => s.id === entry.session_status)
+                        : null;
+                      const { date, time } = formatShortStamp(entry.closed_at);
+                      const iterationCount = entry.message_count == null ? NaN : Number(entry.message_count);
+                      const iterationLabel = Number.isFinite(iterationCount) ? `${iterationCount} it` : null;
+                      const selected = selectedPreview?.entry.id === entry.id && !selectedPreview?.targetUuid;
+                      const cmdHover = isCmdPressed && historyPopover.hoveredItem?.id === entry.id;
+                      return (
                         <div
-                          className="relative cursor-pointer transition-opacity hover:opacity-75"
-                          onClick={() => restoreTab(entry)}
-                          onMouseDown={(e) => {
-                            if (e.button === 1) {
-                              e.preventDefault();
-                              e.stopPropagation();
-                              restoreTabBackground(entry);
-                            }
-                          }}
-                          onAuxClick={(e) => {
-                            if (e.button === 1) {
-                              e.preventDefault();
-                              e.stopPropagation();
-                            }
-                          }}
-                          style={{
-                            minHeight: 32,
-                            padding: '5px 8px',
-                            backgroundColor: colorConfig.bgColor,
-                            borderRadius: 5,
-                            borderLeft: `2px solid ${colorConfig.borderColor}`,
-                            opacity: 0.62,
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: 8,
-                          }}
+                          className="px-2 py-[3px]"
+                          {...historyPopover.triggerProps(entry.id)}
+                          onContextMenu={(e) => handleCardContextMenu(e, 'history', entry.id)}
                         >
-                          {meta && (
-                            <span
-                              title={meta.label}
-                              style={{
-                                flexShrink: 0,
-                                width: `${statusMarkerSize}px`,
-                                height: `${statusMarkerSize}px`,
-                                borderRadius: statusMarkerShape === 'square' ? '2px' : '50%',
-                                backgroundColor: meta.color,
-                                border: '1px solid rgba(0,0,0,0.4)',
-                              }}
-                            />
-                          )}
-                          <div className="min-w-0 flex-1 text-[12px] leading-[16px] text-white break-words">
-                            {entry.name}
-                          </div>
-                          <div className="flex-shrink-0 flex items-center gap-2 text-[10px] text-[#888] font-mono">
-                            {semanticModeActive && typeof entry.score === 'number' && (
-                              <span className="text-[#818cf8]">{entry.score.toFixed(2)}</span>
+                          <div
+                            className="relative cursor-pointer transition-opacity hover:opacity-90"
+                            onClick={(e) => {
+                              if (e.metaKey || e.ctrlKey) {
+                                void restoreTab(entry);
+                                return;
+                              }
+                              selectPreview(entry);
+                            }}
+                            onMouseDown={(e) => {
+                              if (e.button === 1) {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                restoreTabBackground(entry);
+                              }
+                            }}
+                            onAuxClick={(e) => {
+                              if (e.button === 1) {
+                                e.preventDefault();
+                                e.stopPropagation();
+                              }
+                            }}
+                            style={{
+                              minHeight: 32,
+                              padding: '5px 8px',
+                              backgroundColor: cmdHover ? 'rgba(16, 163, 127, 0.2)' : selected ? selectedCardBg(colorConfig) : colorConfig.bgColor,
+                              borderRadius: 5,
+                              borderLeft: `2px solid ${cmdHover ? '#10A37F' : colorConfig.borderColor}`,
+                              outline: cmdHover ? '1px solid rgba(16, 163, 127, 0.55)' : selected ? `1px solid ${withAlpha(colorConfig.borderColor, 0.42)}` : 'none',
+                              opacity: cmdHover || selected ? 0.96 : 0.62,
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 8,
+                            }}
+                          >
+                            {meta && (
+                              <span
+                                title={meta.label}
+                                style={{
+                                  flexShrink: 0,
+                                  width: `${statusMarkerSize}px`,
+                                  height: `${statusMarkerSize}px`,
+                                  borderRadius: statusMarkerShape === 'square' ? '2px' : '50%',
+                                  backgroundColor: meta.color,
+                                  border: '1px solid rgba(0,0,0,0.4)',
+                                }}
+                              />
                             )}
-                            {iterationLabel && (
-                              <span className="text-[#b8a75f]">{iterationLabel}</span>
+                            <div className="min-w-0 flex-1 text-[12px] leading-[16px] text-white break-words">
+                              {entry.name}
+                            </div>
+                            <div className="flex-shrink-0 flex items-center gap-2 text-[10px] text-[#888] font-mono">
+                              {iterationLabel && (
+                                <span className="text-[#b8a75f]">{iterationLabel}</span>
+                              )}
+                              <span>{date}<span style={{ color: '#555', margin: '0 2px' }}>|</span>{time}</span>
+                            </div>
+                            {isCmdPressed && entry.notes && (
+                              <span
+                                style={{
+                                  position: 'absolute',
+                                  top: 5,
+                                  right: 5,
+                                  width: 5,
+                                  height: 5,
+                                  borderRadius: '50%',
+                                  backgroundColor: '#DA7756',
+                                }}
+                              />
                             )}
-                            <span>{date}<span style={{ color: '#555', margin: '0 2px' }}>|</span>{time}</span>
+                            {cmdHover && (
+                              <div className="absolute right-2 top-1/2 -translate-y-1/2 rounded border border-[#10A37F]/45 bg-[#05231c] px-2 py-0.5 text-[10px] text-[#9be6cf] shadow-lg">
+                                Resume
+                              </div>
+                            )}
                           </div>
-                          {isCmdPressed && entry.notes && (
-                            <span
-                              style={{
-                                position: 'absolute',
-                                top: 5,
-                                right: 5,
-                                width: 5,
-                                height: 5,
-                                borderRadius: '50%',
-                                backgroundColor: '#DA7756',
-                              }}
-                            />
-                          )}
                         </div>
+                      );
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div
+            className="w-[7px] mx-1 flex-shrink-0 cursor-col-resize rounded hover:bg-[#333]"
+            onPointerDown={handleDividerPointerDown}
+            onDoubleClick={() => setRightColWidth(RIGHT_COL_DEFAULT)}
+            title="Resize preview"
+          />
+
+          <div className="flex-1 min-w-0 min-h-0 border border-[#242424] rounded bg-[#101010] overflow-hidden flex flex-col">
+            {selectedPreview && previewTarget ? (
+              <>
+                <div className="h-9 px-3 border-b border-[#2a2a2a] bg-[#151515] flex items-center justify-between gap-3 flex-shrink-0">
+                  <div className="min-w-0">
+                    <div className="text-[12px] text-white truncate">{selectedPreview.entry.name}</div>
+                    <div className="text-[10px] text-[#777] font-mono truncate">
+                      {previewTarget.toolType} · {previewDate ? `${previewDate.date} | ${previewDate.time}` : ''}
+                    </div>
+                  </div>
+                  {selectedPreview.source === 'iteration' && selectedPreview.targetUuid && (
+                    <div className="flex-shrink-0 text-[10px] text-[#10A37F] font-mono">iteration</div>
+                  )}
+                </div>
+                <div className="flex-1 min-h-0 flex relative">
+                  <div className="flex-1 min-w-0">
+                    <HistoryPanel
+                      tabId={previewTabId}
+                      sessionId={previewTarget.sessionId}
+                      cwd={selectedPreview.entry.cwd}
+                      width={420}
+                      notesPanelWidth={0}
+                      isOpen={true}
+                      toolType={previewTarget.toolType}
+                      enableClaudePtyControls={false}
+                      embedded
+                      embeddedFill
+                      previewMode
+                    />
+                  </div>
+                  <div className="w-[33px] flex-shrink-0 border-l border-[#2a2a2a] bg-[#141414] relative overflow-hidden">
+                    <Timeline
+                      tabId={previewTabId}
+                      sessionId={previewTarget.sessionId}
+                      cwd={selectedPreview.entry.cwd}
+                      isActive={false}
+                      isVisible={true}
+                      isOpen={true}
+                      toolType={previewTarget.toolType}
+                      readOnly
+                    />
+                  </div>
+                  {previewScrollLoading && (
+                    <div className="absolute inset-0 z-20 bg-[#101010] flex items-center justify-center">
+                      <div className="flex items-center gap-2 text-[12px] text-[#818cf8]">
+                        <Loader2 size={16} className="animate-spin" />
+                        <span>Loading iteration...</span>
                       </div>
-                    );
-                  }}
-                />
+                    </div>
+                  )}
+                </div>
+                <div className="h-10 px-3 border-t border-[#2a2a2a] bg-[#151515] flex items-center justify-between flex-shrink-0">
+                  <div className="text-[11px] text-[#777] truncate">{selectedPreview.entry.cwd}</div>
+                  <button
+                    onClick={() => restoreTab(selectedPreview.entry)}
+                    className="h-7 px-3 rounded border border-[#164e3f] bg-[#071b16] text-[12px] text-[#9be6cf] hover:border-[#10A37F] hover:text-white cursor-pointer"
+                  >
+                    Resume
+                  </button>
+                </div>
+              </>
+            ) : selectedPreview ? (
+              <div className="h-full flex items-center justify-center text-[#555] text-xs px-6 text-center">
+                У этой записи нет сохранённой AI-сессии для предпросмотра.
+              </div>
+            ) : (
+              <div className="h-full flex items-center justify-center text-[#555] text-xs px-6 text-center">
+                Выбери вкладку слева, чтобы посмотреть History и Timeline без открытия терминала.
               </div>
             )}
           </div>
@@ -1738,6 +2474,48 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
             isLocked={historyPopover.isLocked}
             source="home-history"
           />
+        );
+      })()}
+
+      {iterationPopover.isVisible && iterationPopover.hoveredItem && (() => {
+        const hovered = displayedIterations.find(entry => makeIterationHoverKey(entry) === iterationPopover.hoveredItem!.id);
+        if (!hovered) return null;
+        const rect = iterationPopover.hoveredItem.rect;
+        const width = Math.max(220, Math.min(rect.width, window.innerWidth - 16));
+        const height = Math.max(96, Math.min(rect.height * 2, 260, window.innerHeight - 16));
+        const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+        const aboveTop = rect.top - height - 6;
+        const top = aboveTop >= 8
+          ? aboveTop
+          : Math.max(8, Math.min(rect.bottom + 6, window.innerHeight - height - 8));
+        const text = String(hovered.content || hovered.summary || '').trim() || 'Empty iteration';
+        return (
+          <div
+            style={{
+              position: 'fixed',
+              left,
+              top,
+              width,
+              height,
+              zIndex: 120,
+              background: '#151515',
+              border: `1px solid ${withAlpha(TAB_COLORS[(hovered.color || 'default') as TabColor].borderColor, 0.55)}`,
+              borderRadius: 6,
+              boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+              padding: 10,
+              color: '#ddd',
+              fontSize: 12,
+              lineHeight: '18px',
+              overflowY: 'auto',
+              whiteSpace: 'pre-wrap',
+              overflowWrap: 'anywhere',
+            }}
+            onMouseEnter={iterationPopover.popoverProps.onMouseEnter}
+            onMouseLeave={iterationPopover.popoverProps.onMouseLeave}
+            data-cmd-hover-popover
+          >
+            {text}
+          </div>
         );
       })()}
 

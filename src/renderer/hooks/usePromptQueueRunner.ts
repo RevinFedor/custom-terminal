@@ -212,6 +212,14 @@ function isSuccessfulCompactLocalCommandEnd(data: BusyStatePayload): boolean {
     SUCCESSFUL_COMPACT_LOCAL_COMMAND_REASONS.has(data.localCommandReason || '');
 }
 
+function clearRunAfterTargetAfterPivotFire(ownerTabId: string, triggerTabId: string): void {
+  if (ownerTabId === triggerTabId) return;
+  const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
+  if (queue.runAfterTabId !== triggerTabId) return;
+  usePromptQueueStore.getState().setRunAfterTab(ownerTabId, null);
+  console.log('[PromptQueueRunner] clear runAfter target after pivot fire owner=' + ownerTabId.slice(-8) + ' trigger=' + triggerTabId.slice(-8));
+}
+
 // Public accessor — the overlay reads this to render the "target tab is busy
 // now" spinner inside the Run-after dropdown. Not used by the runner itself.
 export function isTabBusyNow(tabId: string): boolean {
@@ -286,6 +294,7 @@ export function usePromptQueueRunner() {
           return;
         }
         const committed = commitSentHead(ownerTabId, head.id);
+        if (committed.removed) clearRunAfterTargetAfterPivotFire(ownerTabId, triggerTabId);
         if (committed.removed && committed.beforeCount === 1) setAutoRun(ownerTabId, false);
       }).catch((e: unknown) => {
         queueAwaitingBusyStart.delete(ownerTabId);
@@ -378,10 +387,11 @@ export function usePromptQueueRunner() {
             + ' queues=' + describeQueuesForTriggerLog(tabId));
         }
 
-        // Skip auto-run/stop-after for any NON-NATURAL turn-end. Только чистый
-        // успешный Stop (reason === undefined) должен запускать следующий промпт
-        // очереди. Все остальные исходы — это не «Claude закончил ход», а обрыв,
-        // и заливать следующий промпт в сломанный/прерванный turn нельзя:
+        // Own-tab Run-after / Stop-after still skip any NON-NATURAL turn-end.
+        // Только чистый успешный Stop (reason === undefined) должен запускать
+        // следующий промпт той же очереди. Все остальные исходы для owner-tab —
+        // это не «Claude закончил ход», а обрыв, и заливать следующий промпт в
+        // сломанный/прерванный turn нельзя:
         //   - 'manual-stop' — юзер нажал Stop chip / context-menu Stop / двойной Esc
         //     (main.js::terminal:stop-ai-process). Auto-run создал бы петлю
         //     «выключил → процесс снова запустился из очереди».
@@ -392,12 +402,13 @@ export function usePromptQueueRunner() {
         //     event==='InterruptStop'). Юзер прервал намеренно.
         //   - 'watchdog'    — Stop так и не пришёл за 60 мин, turn завис/мёртв
         //     (main.js CLAUDE_TURN_WATCHDOG_MS). Состояние неизвестно.
-        // Stop-after тоже пропускаем во всех этих случаях — terminal уже мёртв либо
-        // в неопределённом состоянии, повторный SIGTERM вернёт ошибку.
+        // Stop-after тоже пропускаем во всех этих случаях — terminal уже мёртв
+        // либо в неопределённом состоянии, повторный SIGTERM вернёт ошибку.
         //
-        // Гард стоит ВЫШЕ обоих путей (step-1 pivot и step-2 own-tab), поэтому он
-        // покрывает и pivoted-очереди: если ТРИГГЕР-таб упал/прерван, очередь
-        // owner'а тоже НЕ стреляет (триггер не закончил ход естественно).
+        // Pivot is different: if another owner tab explicitly waits on this
+        // trigger, manual Stop / Escape / error is still the observed completion
+        // event. That owner is allowed to fire below; only the stopped tab's own
+        // queue is disarmed here.
         //
         // Additive: busy:false уже записан в prevBusyRef выше (loader гасится у
         // всех консьюмеров, которые читают только {tabId,busy}); reason — это
@@ -424,7 +435,10 @@ export function usePromptQueueRunner() {
 
         // Natural reason-less paths still fire: authoritative Stop hook,
         // SDK-forward claude-sdk:busy-state, Gemini spinner idle, PTY-exit
-        // cleanup. Non-natural reasoned paths below disarm.
+        // cleanup. Non-natural reasoned paths below disarm the trigger tab's
+        // own queue, but a DIFFERENT owner waiting on this tab is still allowed
+        // to fire: for pivot mode, "the watched tab stopped/errored/was
+        // interrupted" is still the completion event the owner subscribed to.
         // DISARM (не просто skip) on any non-natural turn-end. Юзер: «если я
         // нажал Escape чтобы вмешаться, run-after должен ВЫКЛЮЧИТЬСЯ, а не молча
         // продолжить на следующем штатном ответе». Skip-once было недостаточно:
@@ -458,11 +472,13 @@ export function usePromptQueueRunner() {
             console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + ' → SKIP disarm while workspace restores');
             return;
           }
-          // Disarm EVERY owner queue this turn-end affects: the trigger tab's own
-          // queue AND any pivoted queue waiting on this tab as its target — same
-          // fan-out the firing path uses, so a target abort disarms the owner too.
+          // Disarm only the trigger tab's OWN queue. Pivoted owners waiting on
+          // this tab are not disarmed here; they continue into the firing path
+          // below so external "Run after tab X" works even when X is stopped by
+          // Escape, Stop, Codex turn_aborted, or an error.
           const { setAutoRun, setStopAfter, clearFirstDelayCountdown } = usePromptQueueStore.getState();
           const queues = usePromptQueueStore.getState().queues;
+          let pivotOwnersKept = 0;
           for (const [ownerTabId, q] of queues) {
             if (!tabExists(ownerTabId)) {
               usePromptQueueStore.getState().cleanupClosedTab(ownerTabId);
@@ -470,16 +486,17 @@ export function usePromptQueueRunner() {
             }
             if (!q.autoRun && !q.stopAfter && q.firstDelayCountdownAt === null) continue;
             const effectiveTrigger = getEffectiveQueueTrigger(ownerTabId, q, { clearStaleTarget: true });
-            if (ownerTabId !== tabId && effectiveTrigger !== tabId) continue;
+            if (ownerTabId !== tabId && effectiveTrigger === tabId) {
+              if (q.autoRun && countEnabledQueuedPrompts(q.items) > 0) pivotOwnersKept += 1;
+              continue;
+            }
+            if (ownerTabId !== tabId) continue;
             if (q.autoRun) setAutoRun(ownerTabId, false);
             if (q.stopAfter) setStopAfter(ownerTabId, false); // cascades closeAfter→false (closeAfter⟹stopAfter, so this always runs when closeAfter was set)
             if (q.firstDelayCountdownAt !== null) clearFirstDelayCountdown(ownerTabId); // freeze the "секундомер" (first-delay countdown)
-            if (ownerTabId !== tabId) {
-              console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + ' → DISARM pivoted owner=' + ownerTabId.slice(-12));
-            }
           }
-          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + ' → DISARM auto-run/stop-after (non-natural turn-end)');
-          return;
+          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + ' → DISARM own auto-run/stop-after; pivotOwnersKept=' + pivotOwnersKept);
+          if (pivotOwnersKept === 0) return;
         }
 
         // Step 1: target tab's OWN continuation wins over external owners.
@@ -613,6 +630,7 @@ export function usePromptQueueRunner() {
               return;
             }
             const committed = usePromptQueueStore.getState().commitSentHead(ownerTabId, head.id);
+            if (committed.removed) clearRunAfterTargetAfterPivotFire(ownerTabId, triggerTabId);
             if (committed.removed && committed.beforeCount === 1) usePromptQueueStore.getState().setAutoRun(ownerTabId, false);
           }).catch((e: unknown) => {
             queueAwaitingBusyStart.delete(ownerTabId);

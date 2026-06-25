@@ -111,6 +111,7 @@ const sdkSessions = new Map(); // tabId → { query, abortController, sessionId,
 // No timeout — the SDK awaits canUseTool indefinitely (event-driven, per
 // fact-claude-sdk-tab.md::AskUserQuestion via canUseTool).
 const pendingQuestions = new Map(); // `${tabId}:${toolUseID}` → { resolve, tabId, signal, onAbort }
+const tabCompletionNotifications = new Map(); // tabId -> { projectId, tabName, firedAt, persistent }
 
 const isDev = !app.isPackaged;
 
@@ -1582,16 +1583,23 @@ function computeProjectActivity() {
     null
   );
 
+  const itemForProject = (projectId) => {
+    let item = byProject.get(projectId);
+    if (!item) {
+      item = { projectId, count: 0, streaming: false, notificationCount: 0, tabs: [] };
+      byProject.set(projectId, item);
+    } else if (typeof item.notificationCount !== 'number') {
+      item.notificationCount = 0;
+    }
+    return item;
+  };
+
   const mark = (tabId, { live = true, busy = false, status = null, projectIdHint = null } = {}) => {
     if (!tabId || !live) return;
     const row = tabRowFor(tabId);
     const projectId = projectIdFor(tabId, row, projectIdHint);
     if (!projectId) return;
-    let item = byProject.get(projectId);
-    if (!item) {
-      item = { projectId, count: 0, streaming: false, tabs: [] };
-      byProject.set(projectId, item);
-    }
+    const item = itemForProject(projectId);
     const runtimeStatus = status === 'stopping' ? 'stopping' : (busy ? 'busy' : (status || 'active'));
     if (!seenTabs.has(tabId)) {
       item.count += 1;
@@ -1679,9 +1687,34 @@ function computeProjectActivity() {
     mark(tabId, { live: true, busy: true, projectIdHint: open?.projectId || null });
   }
 
+  for (const [tabId, note] of tabCompletionNotifications) {
+    const row = tabRowFor(tabId);
+    const projectId = projectIdFor(tabId, row, note?.projectId || null);
+    if (!projectId) continue;
+    const item = itemForProject(projectId);
+    item.notificationCount += 1;
+    const existing = item.tabs.find((t) => t.tabId === tabId);
+    const payload = {
+      completionNotificationFired: true,
+      completionNotificationFiredAt: note?.firedAt || null,
+      completionNotificationMode: note?.persistent ? 'persistent' : 'oneshot',
+      name: note?.tabName || null,
+    };
+    if (existing) {
+      Object.assign(existing, payload);
+    } else {
+      item.tabs.push({
+        tabId,
+        status: 'completed',
+        streaming: false,
+        ...payload,
+      });
+    }
+  }
+
   return {
     projects: Array.from(byProject.values())
-      .filter((p) => p.count > 0 || p.streaming)
+      .filter((p) => p.count > 0 || p.streaming || p.notificationCount > 0)
       .sort((a, b) => String(a.projectId).localeCompare(String(b.projectId))),
     layoutChangedProjectIds: Array.from(projectLayoutChangedIds),
     projectOrderChanged,
@@ -4568,8 +4601,31 @@ function createWindow() {
     }
   });
 
+  const rendererOrigins = new Set();
+  try {
+    if (process.env.ELECTRON_RENDERER_URL) {
+      rendererOrigins.add(new URL(process.env.ELECTRON_RENDERER_URL).origin);
+    }
+  } catch {}
+  if (isDev) {
+    rendererOrigins.add('http://localhost:5182');
+    rendererOrigins.add('http://127.0.0.1:5182');
+  }
+  const isRendererUrl = (url) => {
+    try {
+      return rendererOrigins.has(new URL(url).origin);
+    } catch {
+      return false;
+    }
+  };
+
   // Prevent the main window from navigating away (kills the renderer)
   mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (isRendererUrl(url)) {
+      console.log('[Window] Ignored renderer-origin navigation:', url);
+      event.preventDefault();
+      return;
+    }
     console.log('[Window] Blocked navigation to:', url);
     event.preventDefault();
     shell.openExternal(url);
@@ -4578,6 +4634,9 @@ function createWindow() {
   // Intercept new window requests (target="_blank", window.open) → open in default browser
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     console.log('[Window] Intercepted new-window request:', url);
+    if (isRendererUrl(url)) {
+      return { action: 'deny' };
+    }
     if (url.startsWith('http://') || url.startsWith('https://')) {
       shell.openExternal(url);
     }
@@ -13184,6 +13243,42 @@ ipcMain.on('tab-notification:play-sound', () => {
   }
 });
 
+ipcMain.on('tab-notification:fired', (_event, detail = {}) => {
+  try {
+    const tabId = String(detail.tabId || '');
+    const projectId = String(detail.projectId || '');
+    if (!tabId || !projectId) return;
+    tabCompletionNotifications.set(tabId, {
+      projectId,
+      tabName: String(detail.tabName || 'Terminal'),
+      firedAt: Number(detail.firedAt) || Date.now(),
+      persistent: detail.persistent === true,
+    });
+    scheduleProjectActivityBroadcast('tab-notification');
+    try {
+      require(path.join(srcMainDir, 'web-server')).sendTabCompletionPush?.(detail).catch((e) => {
+        console.warn('[TabNotification] APNs push failed: ' + (e?.message || e));
+      });
+    } catch (e) {
+      console.warn('[TabNotification] APNs push unavailable: ' + (e?.message || e));
+    }
+  } catch (e) {
+    console.warn('[TabNotification] fired sync failed: ' + (e?.message || e));
+  }
+});
+
+ipcMain.on('tab-notification:cleared', (_event, detail = {}) => {
+  try {
+    const tabId = String(detail.tabId || '');
+    if (!tabId) return;
+    if (tabCompletionNotifications.delete(tabId)) {
+      scheduleProjectActivityBroadcast('tab-notification-clear');
+    }
+  } catch (e) {
+    console.warn('[TabNotification] clear sync failed: ' + (e?.message || e));
+  }
+});
+
 ipcMain.handle('project:save-metadata', (event, { projectId, metadata }) => {
   projectManager.saveProjectMetadata(projectId, metadata);
   return { success: true };
@@ -15408,7 +15503,12 @@ require(path.join(srcMainDir, 'ipc', 'docs')).register();
 require(path.join(srcMainDir, 'ipc', 'git')).register({ projectManager });
 
 // search:query, search:index-session, search:index-all, search:stats → ipc/semantic-search.js
-require(path.join(srcMainDir, 'ipc', 'semantic-search')).register({ projectManager, mainWindow });
+require(path.join(srcMainDir, 'ipc', 'semantic-search')).register({
+  projectManager,
+  mainWindow,
+  claudeData: require(path.join(srcMainDir, 'ipc', 'claude-data')),
+  codexData: codexDataModule,
+});
 
 // claude:copy-range, claude:fork-session-file, claude:get-fork-markers,
 // claude:get-timeline, claude:export-clean-session, claude:get-full-history → ipc/claude-data.js
@@ -17815,7 +17915,7 @@ function startCodexSessionWatcher(sender, { tabId, cwd, startedAt, sourceSession
           return;
         }
         found = true;
-        console.log('[Codex Watcher] session detected:', hit.sessionId, 'tab:', tabId, 'reason:', reason, 'file:', hit.filePath, 'cwd:', hit.cwd || 'n/a', 'cwdMatched:', !!hit.cwdMatched, 'sourceMatched:', !!hit.sourceMatched, 'source:', sourceSessionId || 'n/a', 'excludeCount:', excludeSessionIds.length);
+        console.log('[Codex Watcher] session detected:', hit.sessionId, 'tab:', tabId, 'reason:', reason, 'file:', hit.filePath, 'cwd:', hit.cwd || 'n/a', 'cwdMatched:', !!hit.cwdMatched, 'sourceMatched:', !!hit.sourceMatched, 'source:', sourceSessionId || 'n/a', 'threadSource:', hit.threadSource || 'n/a', 'parent:', hit.parentThreadId || 'n/a', 'forkedFrom:', hit.forkedFromId || 'n/a', 'originator:', hit.originator || 'n/a', 'excludeCount:', excludeSessionIds.length);
         setCodexKnownSession(tabId, hit.sessionId, 'watcher-detected');
         startCodexTurnWatcher({ tabId, sessionId: hit.sessionId, filePath: hit.filePath, catchUpPendingAudit: true });
         sender.send('codex:session-detected', { tabId, sessionId: hit.sessionId, cwd: hit.cwd || null });
