@@ -1121,26 +1121,6 @@ function ProjectView(props: {
     }
   };
 
-  const create = async () => {
-    setCreating(true);
-    try {
-      // Backend returns { tabId, name, cwd, projectId } — use it to navigate
-      // straight into the new tab. Mobile UX: every "create" is followed by
-      // "now I want to talk to it", so the extra tap on the project list was
-      // pure friction. Refresh tabs list AFTER navigation so when user comes
-      // back via Back button the list is fresh.
-      const r = await Api.createSDKTab(project.id);
-      await onCreated();
-      const fresh = await Api.listTabs(project.id);
-      const newTab = fresh.tabs.find(x => x.tabId === r.tabId);
-      if (newTab) onOpenChat(newTab);
-    } catch (e: any) {
-      alert('Create failed: ' + e.message);
-    } finally {
-      setCreating(false);
-    }
-  };
-
   const createClaude = async () => {
     setCreating(true);
     try {
@@ -1220,9 +1200,6 @@ function ProjectView(props: {
         right={revalidating ? <InlineSpinner color="#666" size={12} /> : undefined}
       />
       <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <button onClick={create} disabled={creating} style={S.primaryBtn}>
-          {creating ? 'Creating…' : '+ New SDK chat'}
-        </button>
         <button onClick={createClaude} disabled={creating} style={S.primaryBtn}>
           {creating ? 'Creating…' : '+ New Claude terminal'}
         </button>

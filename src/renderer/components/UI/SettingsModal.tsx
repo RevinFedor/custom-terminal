@@ -2996,7 +2996,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        zIndex: 1000
+        zIndex: 20000
       }}
       onMouseDown={(e) => { if (e.target === e.currentTarget) (e.currentTarget as HTMLElement).dataset.mouseDownOnOverlay = 'true'; }}
       onClick={(e) => { if (e.target === e.currentTarget && (e.currentTarget as HTMLElement).dataset.mouseDownOnOverlay === 'true') onClose(); (e.currentTarget as HTMLElement).dataset.mouseDownOnOverlay = ''; }}
@@ -3342,11 +3342,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               </div>
 
               {/* Семантическая индексация — единственная честно «системная» настройка
-                  с runtime-эффектом. Управляет --parallel флагом, который main
-                  передаёт build-index.sh при запуске. Выше 20 параллельных claude'ов
-                  Anthropic жёстко 429-ит; ниже 4 — индексация N=70 файлов начинает
-                  занимать минуты. Default 10 выбран как ровно тот же default, что
-                  стоит в самом скрипте (MAX_PARALLEL=10) — UI и CLI consistency.
+                  с runtime-эффектом. Управляет parallel параметром MCP docs_reindex.
+                  Выше 20 воркеров UI не даёт выставить, чтобы не плодить слишком
+                  много одновременных Codex exec процессов; ниже 4 — индексация N=70
+                  файлов начинает занимать минуты. Default 10 сохраняет прежний UX.
                   Все визуальные настройки (статусы вкладок, полоска процесса) переехали
                   в «Размеры» — они влияют на UI, а не на админ-инфраструктуру. */}
               <div style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
@@ -3355,7 +3354,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 </div>
                 <FontSizeSlider
                   label="Параллельные воркеры"
-                  description="Сколько claude/Haiku одновременно при запуске индексации"
+                  description="Сколько Codex worker'ов одновременно при запуске docs_reindex"
                   value={semanticIndexParallelism}
                   onChange={setSemanticIndexParallelism}
                   min={1}

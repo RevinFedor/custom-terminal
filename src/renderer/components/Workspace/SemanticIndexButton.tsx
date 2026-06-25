@@ -244,7 +244,7 @@ export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexBut
 
   if (!status.indexExists) {
     return (
-      <Tooltip content="Семантический индекс не создан. Клик — собрать индекс через scripts/ai/build-index.sh. ПКМ — настройки.">
+      <Tooltip content="Семантический индекс не создан. Клик — собрать индекс через Codex. ПКМ — настройки.">
         <button
           onClick={handleClick}
           onContextMenu={handleContextMenu}
@@ -263,7 +263,7 @@ export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexBut
   const tooltipText =
     `Индекс: ${status.fresh} актуальных, ${status.stale} устаревших, ${status.new} новых\n` +
     `Файлов в docs/: ${status.docsTotal}, записей в индексе: ${status.indexedTotal}\n` +
-    (outdated > 0 ? 'Клик — переиндексировать (запуск scripts/ai/build-index.sh в фоне)' : 'Индекс актуален') +
+    (outdated > 0 ? 'Клик — переиндексировать через Codex в фоне' : 'Индекс актуален') +
     '\nПКМ — открыть настройки.';
 
   return (

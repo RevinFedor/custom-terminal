@@ -184,7 +184,7 @@ export function inspectAgentDraftScenario({
   return { tabId, toolType, ...(result || {}) };
 }
 
-function createAgentReadyWait(tabId: string, runtime: HistoryAgentRuntime, timeoutMs = 30000) {
+function createAgentReadyWait(tabId: string, runtime: HistoryAgentRuntime, timeoutMs = 30000, purpose = 'ready') {
   let cleanup = () => {};
   const promise = new Promise<void>((resolve, reject) => {
     let settled = false;
@@ -196,7 +196,7 @@ function createAgentReadyWait(tabId: string, runtime: HistoryAgentRuntime, timeo
       else resolve();
     };
     const timer = setTimeout(() => {
-      finish(new Error(runtime.label + ' did not become ready for rewind'));
+      finish(new Error(runtime.label + ' did not become ready for ' + purpose));
     }, timeoutMs);
     const handler = (_event: any, data: { tabId?: string } = {}) => {
       if (data?.tabId !== tabId) return;
@@ -265,7 +265,7 @@ async function ensureAgentReadyForRewind({
     return;
   }
 
-  const readyWait = createAgentReadyWait(tabId, runtime);
+  const readyWait = createAgentReadyWait(tabId, runtime, 30000, 'rewind');
   try {
     const resumedForRewind = !presence || presence.status === 'inactive';
     if (!presence || presence.status === 'inactive') {
@@ -348,17 +348,21 @@ async function ensureAgentReadyForSend({
     }
   }
 
-  const readyWait = createAgentReadyWait(tabId, runtime);
+  const readyWait = createAgentReadyWait(tabId, runtime, 30000, 'send');
   try {
     if (!presence || presence.status === 'inactive') {
-      if (!sessionId) {
+      const hasSession = typeof sessionId === 'string' && sessionId.length > 0;
+      const actionLabel = hasSession ? 'resume' : 'start-fresh';
+      if (!hasSession && !runtime.startFresh) {
         readyWait.cancel();
-        throw new Error(runtime.label + ' session is inactive and has no session id to resume');
+        throw new Error(runtime.label + ' session is inactive and cannot start fresh');
       }
-      console.log('[AgentScenario:send] resume before send tool=' + toolType + ' tab=' + String(tabId).slice(-12));
-      const resumeResult = await runtime.resume({ tabId, sessionId, cwd });
+      console.log('[AgentScenario:send] ' + actionLabel + ' before send tool=' + toolType + ' tab=' + String(tabId).slice(-12));
+      const resumeResult = hasSession
+        ? await runtime.resume({ tabId, sessionId, cwd })
+        : await runtime.startFresh!({ tabId, cwd });
       if (resumeResult?.success === false) {
-        throw new Error(resumeResult.error || runtime.label + ' resume failed before send');
+        throw new Error(resumeResult.error || runtime.label + ' ' + actionLabel + ' failed before send');
       }
     }
 

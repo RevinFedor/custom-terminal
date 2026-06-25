@@ -4,8 +4,8 @@
 //   1) fs.watch по docs/**/*.md и .semantic-index.json — рекурсивный.
 //      На FS-событие (debounced 300ms) пересчитываем fresh / stale / new.
 //   2) IPC push 'semantic-index:status' { projectId, fresh, stale, new }.
-//   3) IPC handle 'semantic-index:rebuild' — spawn build-index.sh,
-//      стримим прогресс в 'semantic-index:progress'.
+//   3) IPC handle 'semantic-index:rebuild' — calls knowledge MCP docs_reindex
+//      with this project's path and pushes running/final state to renderer.
 //
 // Watcher запускается по 'semantic-index:watch' (с указанием projectId+path)
 // и снимается по 'semantic-index:unwatch'. Один watcher на проект.
@@ -140,7 +140,7 @@ function startWatching(projectId, projectPath, mainWindow) {
 
   const onEvent = () => scheduleRecompute(state, mainWindow, projectId);
 
-  // 1) Watch the index file itself (atomic rewrite by build-index.sh)
+  // 1) Watch the index file itself (atomic rewrite by docs_reindex)
   try {
     const indexPath = path.join(projectPath, INDEX_FILE_NAME);
     const w = fs.watch(path.dirname(indexPath), { persistent: true }, (_evt, filename) => {
@@ -196,6 +196,147 @@ function stopWatching(projectId) {
   console.log('[SemanticIndexStatus] Stopped watching:', projectId);
 }
 
+function buildToolPath() {
+  const homeDir = os.homedir();
+  const extraPaths = [
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    path.join(homeDir, '.local', 'bin'),
+    path.join(homeDir, '.codex', 'bin'),
+  ];
+  return [...extraPaths, process.env.PATH || ''].filter(Boolean).join(':');
+}
+
+function extractMcpTextResult(msg) {
+  const content = msg?.result?.content;
+  if (!Array.isArray(content)) return '';
+  const part = content.find((item) => item && item.type === 'text' && typeof item.text === 'string');
+  return part?.text || '';
+}
+
+function parseReindexSummary(summary) {
+  const text = String(summary || '');
+  const m = text.match(/Files indexed:\s+(\d+)\/(\d+)\s+\(cached:\s+(\d+),\s+skip:\s+(\d+),\s+warn:\s+(\d+),\s+err:\s+(\d+)\)/);
+  if (!m) return null;
+  return {
+    indexed: parseInt(m[1], 10),
+    total: parseInt(m[2], 10),
+    cached: parseInt(m[3], 10),
+    skipped: parseInt(m[4], 10),
+    warnings: parseInt(m[5], 10),
+    errors: parseInt(m[6], 10),
+  };
+}
+
+function callKnowledgeDocsReindex(projectPath, parallelism, onProcess) {
+  return new Promise((resolve, reject) => {
+    const serverPath = process.env.KNOWLEDGE_MCP_SERVER
+      || path.join(os.homedir(), '.claude', 'mcp', 'knowledge-server.mjs');
+    if (!fs.existsSync(serverPath)) {
+      reject(new Error(`knowledge MCP server not found: ${serverPath}`));
+      return;
+    }
+
+    const proc = spawn('node', [serverPath, '--project', projectPath], {
+      cwd: projectPath,
+      env: {
+        ...process.env,
+        FORCE_COLOR: '0',
+        PATH: buildToolPath(),
+        KNOWLEDGE_DISABLE_GEMINI: 'true',
+        KNOWLEDGE_DISABLE_CLAUDE_P: 'true',
+        KNOWLEDGE_ROUTER_PROVIDER: 'codex',
+        KNOWLEDGE_INDEX_PROVIDER: 'codex',
+        KNOWLEDGE_CODEX_MODEL: process.env.KNOWLEDGE_CODEX_MODEL || 'gpt-5.4-mini',
+        KNOWLEDGE_CODEX_EFFORT: process.env.KNOWLEDGE_CODEX_EFFORT || 'low',
+      },
+    });
+    if (typeof onProcess === 'function') onProcess(proc);
+
+    let settled = false;
+    let stdoutBuf = '';
+    let stderrTail = '';
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { proc.kill('SIGTERM'); } catch {}
+      reject(new Error(`docs_reindex timed out after 15 minutes${stderrTail ? ` — ${stderrTail.trim().slice(-1000)}` : ''}`));
+    }, 15 * 60 * 1000);
+
+    const finish = (err, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      try { proc.kill('SIGTERM'); } catch {}
+      if (err) reject(err);
+      else resolve(result);
+    };
+
+    proc.stdout.on('data', (chunk) => {
+      stdoutBuf += chunk.toString('utf8');
+      let nl;
+      while ((nl = stdoutBuf.indexOf('\n')) !== -1) {
+        const line = stdoutBuf.slice(0, nl);
+        stdoutBuf = stdoutBuf.slice(nl + 1);
+        if (!line.trim()) continue;
+        let msg;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (msg.id !== 2) continue;
+        if (msg.error) {
+          finish(new Error(msg.error.message || JSON.stringify(msg.error)));
+          return;
+        }
+        const text = extractMcpTextResult(msg);
+        try {
+          finish(null, JSON.parse(text));
+        } catch (err) {
+          finish(new Error(`docs_reindex returned non-JSON result: ${err.message}`));
+        }
+      }
+    });
+
+    proc.stderr.on('data', (chunk) => {
+      stderrTail = (stderrTail + chunk.toString('utf8')).slice(-4000);
+    });
+
+    proc.on('error', (err) => finish(err));
+    proc.on('exit', (code, signal) => {
+      if (settled) return;
+      const reason = signal ? `signal ${signal}` : `exit code ${code}`;
+      finish(new Error(`knowledge MCP exited before docs_reindex response (${reason})${stderrTail ? ` — ${stderrTail.trim().slice(-1000)}` : ''}`));
+    });
+
+    proc.stdin.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'noted-terminal', version: '1.0.0' },
+      },
+    }) + '\n');
+    proc.stdin.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: {
+        name: 'docs_reindex',
+        arguments: {
+          projectPath,
+          parallel: parallelism,
+          provider: 'codex',
+        },
+      },
+    }) + '\n');
+    proc.stdin.end();
+  });
+}
+
 function rebuildIndex(projectId, mainWindow, opts = {}) {
   const state = watchedProjects.get(projectId);
   if (!state) {
@@ -205,17 +346,6 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
     return { success: false, error: 'Rebuild already in progress' };
   }
 
-  const scriptPath = path.join(state.projectPath, 'scripts', 'ai', 'build-index.sh');
-  if (!fs.existsSync(scriptPath)) {
-    return { success: false, error: 'scripts/ai/build-index.sh not found' };
-  }
-
-  // Pre-flight: warn if CLAUDE.md.bak left over from a crashed previous run.
-  const claudeBak = path.join(state.projectPath, 'CLAUDE.md.bak');
-  if (fs.existsSync(claudeBak)) {
-    return { success: false, error: 'CLAUDE.md.bak exists — delete it before rebuilding (previous run crashed)' };
-  }
-
   state.isRebuilding = true;
 
   // Parallelism — приходит из renderer (Settings → Системные). Не доверяем raw,
@@ -223,68 +353,13 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
   const rawN = Number(opts.parallelism);
   const parallelism = Number.isFinite(rawN) ? Math.max(1, Math.min(20, Math.round(rawN))) : 10;
 
-  // Compute how many files are actually outdated BEFORE spawning, so the UI shows
-  // the real total (`0/3`) from the first frame instead of `…`, and the ×N chip
-  // reflects EFFECTIVE workers = min(configured, outdated). With 3 outdated files
-  // and parallelism 5, only 3 workers ever run → show ×3, not ×5. The script is
-  // still spawned with the configured N (it never launches more jobs than there
-  // are files anyway), so a mid-run estimate drift only affects the cosmetic chip,
-  // never throughput.
   const preStatus = computeStatus(state.projectPath);
   const outdatedAtStart = (preStatus.stale || 0) + (preStatus.new || 0);
   const displayParallelism = outdatedAtStart > 0 ? Math.min(parallelism, outdatedAtStart) : parallelism;
   state.rebuildParallelism = displayParallelism;
 
-  // PATH augment — production Electron на macOS наследует launchd PATH
-  // (`/usr/bin:/bin:/usr/sbin:/sbin`), без homebrew и без user-local. Скрипт
-  // build-index.sh делает `command -v claude` / `command -v jq` → not found →
-  // `echo -e ${RED}ERROR${NC}` на STDOUT + exit 1. stderr пустой, юзер видит
-  // «Индексация не удалась: exit code 1» без причины. Это [Bug 6] — повторяющийся
-  // failure 8+ раз в production.log при пустых stderr.
-  //
-  // Добавляем стандартные locations где обычно живут claude / jq / node:
-  //   /opt/homebrew/bin       — Apple Silicon Homebrew
-  //   /usr/local/bin          — Intel Homebrew + node global
-  //   ~/.local/bin            — pip --user / pipx
-  //   ~/.claude/local/bin     — Claude Code CLI alternate install location
-  // ПЕРЕД оригинальным PATH, чтобы наши версии победили над launchd-stubs.
-  const homeDir = os.homedir();
-  const extraPaths = [
-    '/opt/homebrew/bin',
-    '/usr/local/bin',
-    path.join(homeDir, '.local', 'bin'),
-    path.join(homeDir, '.claude', 'local', 'bin'),
-  ];
-  const augmentedPath = [...extraPaths, process.env.PATH || ''].filter(Boolean).join(':');
-  const proc = spawn('bash', [scriptPath, '--parallel', String(parallelism)], {
-    cwd: state.projectPath,
-    env: { ...process.env, FORCE_COLOR: '0', PATH: augmentedPath },
-  });
-  state.rebuildProc = proc;
-
-  let total = 0;          // total files the script will look at
-  let completed = 0;      // all file-done events (incl. cached) — kept for debugging
-  let currentFile = '';
-  let stderrTail = '';
-  // Tail stdout тоже — скрипт пишет ошибки через `echo -e ${RED}...` на STDOUT,
-  // не stderr. Если упал до summary (claude CLI missing / jq missing / mktemp
-  // fail) — без буферизации stdout мы получаем `exit code 1` БЕЗ stderr, юзер
-  // в продакшене видит «Индексация не удалась: exit code 1» без причины.
-  // Это [Bug 6] — failure без stderr 8+ раз в production.log.
-  let stdoutTail = '';
-  // Outdated tracking: how many files were actually re-indexed (not cached).
-  // outdatedTotal grows as we see [launched ...] events; outdatedCompleted grows
-  // when a launched file reports its result. Cached files never go into either.
-  const launchedFiles = new Set();
   let outdatedTotal = outdatedAtStart;   // seeded from computeStatus; grows if more files launch than estimated
   let outdatedCompleted = 0;
-  // Strict success validation — never claim success unless we positively observed it.
-  // build-index.sh ALWAYS exits 0 even when N files failed, so exit code is not enough.
-  let sawSummary = false;
-  let summaryErrors = 0;
-  let summaryWarnings = 0;
-  let perFileBad = 0;        // counts error|missing|wrapped events
-  const failedFiles = [];    // names of files that failed
 
   const send = (event, payload) => {
     // Persist a snapshot of the latest progress on the state so that a renderer
@@ -309,241 +384,78 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
   };
 
   send('semantic-index:rebuild-started', { parallelism: displayParallelism, outdatedTotal });
-  // Seed progress immediately so the live counter AND a mid-run tab-switch
-  // (get-status → rebuildProgress) both have the real total before any file
-  // finishes — UI shows `0/3` from frame one instead of `…`.
-  send('semantic-index:progress', { phase: 'init', total, completed: 0, outdatedTotal, outdatedCompleted: 0 });
+  send('semantic-index:progress', {
+    phase: 'mcp-docs-reindex',
+    total: preStatus.docsTotal || 0,
+    completed: 0,
+    outdatedTotal,
+    outdatedCompleted: 0,
+  });
 
-  const handleLine = (line) => {
-    // Strip ANSI escape codes (\e[XXm) — script uses them via $RED/$GREEN/etc.
-    const stripped = line.replace(/\x1b\[[0-9;]*m/g, '').trim();
-    if (!stripped) return;
-
-    // "Found 90 files to index" / "Found 90 files to index (incremental mode)" / "(force reindex)"
-    let m = stripped.match(/^Found\s+(\d+)\s+files? to index/);
-    if (m) {
-      total = parseInt(m[1], 10);
-      send('semantic-index:progress', { phase: 'start', total, completed: 0, outdatedTotal: 0, outdatedCompleted: 0 });
-      return;
-    }
-
-    // "[launched 5/90] docs/knowledge/..." — these are the files that will actually be
-    // re-indexed (cached ones never appear here). Add to the launchedFiles set so we can
-    // distinguish their completion from cached completions.
-    m = stripped.match(/^\[launched\s+(\d+)\/(\d+)\]\s+(.+)$/);
-    if (m) {
-      currentFile = m[3];
-      launchedFiles.add(currentFile);
-      // Grow the total if more files end up launched than the up-front estimate
-      // (e.g. a doc was edited between computeStatus and spawn). Never shrink it.
-      outdatedTotal = Math.max(outdatedTotal, launchedFiles.size);
-      send('semantic-index:progress', {
-        phase: 'launched',
-        launched: parseInt(m[1], 10),
-        total: parseInt(m[2], 10),
-        file: currentFile,
-        completed,
-        outdatedTotal,
-        outdatedCompleted,
-      });
-      return;
-    }
-
-    // "[done] docs/..." — real-time completion pulse from inside a worker, emitted
-    // the instant it finishes (success OR failure), BEFORE the merge loop. This is
-    // the ONLY signal that arrives during actual work: the ok/cached/wrapped lines
-    // below are all printed together in the post-`wait` merge phase, so they can't
-    // drive a live counter (that's why it used to read 0/N the whole run then jump
-    // to N/N). [done] owns outdatedCompleted; the merge lines only do error/warn
-    // accounting. cached files never emit [done] (they're handled inline, skipped).
-    m = stripped.match(/^\[done\]\s+(.+)$/);
-    if (m) {
-      const file = m[1];
-      currentFile = file;
-      outdatedCompleted += 1;
-      if (outdatedCompleted > outdatedTotal) outdatedTotal = outdatedCompleted;
-      send('semantic-index:progress', {
-        phase: 'done',
-        file,
-        completed,
-        total,
-        outdatedTotal,
-        outdatedCompleted,
-      });
-      return;
-    }
-
-    // "  ok docs/... [3s]" / "  cached docs/..." / "  wrapped docs/... [Ns]" / "  error docs/..." / "  missing docs/..."
-    m = stripped.match(/^(ok|cached|wrapped|error|missing)\s+(.+?)(?:\s+\[[^\]]+\])?$/);
-    if (m) {
-      const kind = m[1];
-      const file = m[2];
-      completed += 1;
-      currentFile = file;
-      // NOTE: outdatedCompleted is NOT touched here — these lines are printed in
-      // the merge loop, all at once at the end, after every worker is already done.
-      // The live [done] handler above owns the counter. Here we only track per-file
-      // failures for the strict success check at exit.
-      if (kind === 'error' || kind === 'missing' || kind === 'wrapped') {
-        perFileBad += 1;
-        if (failedFiles.length < 10) failedFiles.push(`${kind}:${file}`);
-      }
-      send('semantic-index:progress', {
-        phase: 'file-done',
-        kind,
-        file,
-        completed,
-        total,
-        outdatedTotal,
-        outdatedCompleted,
-      });
-      return;
-    }
-
-    // "Files indexed: 87/90 (cached: 80, skip: 0, warn: 0, err: 3)"
-    m = stripped.match(/^Files indexed:\s+(\d+)\/(\d+)\s+\(cached:\s+(\d+),\s+skip:\s+(\d+),\s+warn:\s+(\d+),\s+err:\s+(\d+)\)/);
-    if (m) {
-      sawSummary = true;
-      summaryWarnings = parseInt(m[5], 10);
-      summaryErrors = parseInt(m[6], 10);
-      // Safety net: if a worker crashed without emitting [done] (RESULT_FILE
-      // missing → "missing" in merge), the live counter could end below total.
-      // The run is over by the time summary prints, so snap to 100%.
-      if (outdatedTotal > 0) outdatedCompleted = outdatedTotal;
+  callKnowledgeDocsReindex(state.projectPath, parallelism, (proc) => {
+    state.rebuildProc = proc;
+  }).then((result) => {
+    state.isRebuilding = false;
+    state.rebuildProc = null;
+    const summaryStats = parseReindexSummary(result?.summary);
+    const summaryErrors = summaryStats?.errors || 0;
+    const summaryWarnings = summaryStats?.warnings || 0;
+    const failedFiles = Array.isArray(result?.failures)
+      ? result.failures.map((failure) => `${failure.path || 'unknown'}:${failure.error || 'failed'}`).slice(0, 10)
+      : [];
+    const success = !!result?.success;
+    if (success) {
+      outdatedCompleted = outdatedTotal;
       send('semantic-index:progress', {
         phase: 'summary',
-        indexed: parseInt(m[1], 10),
-        total: parseInt(m[2], 10),
-        cached: parseInt(m[3], 10),
-        skipped: parseInt(m[4], 10),
-        warnings: summaryWarnings,
-        errors: summaryErrors,
+        ...(summaryStats || {}),
         outdatedTotal,
         outdatedCompleted,
       });
-      return;
     }
-  };
-
-  let stdoutBuf = '';
-  proc.stdout.on('data', (chunk) => {
-    const s = chunk.toString('utf8');
-    stdoutTail = (stdoutTail + s).slice(-2000);
-    stdoutBuf += s;
-    let nl;
-    while ((nl = stdoutBuf.indexOf('\n')) !== -1) {
-      const line = stdoutBuf.slice(0, nl);
-      stdoutBuf = stdoutBuf.slice(nl + 1);
-      handleLine(line);
-    }
-  });
-
-  proc.stderr.on('data', (chunk) => {
-    const s = chunk.toString('utf8');
-    stderrTail = (stderrTail + s).slice(-2000);
-  });
-
-  proc.on('error', (err) => {
-    console.error('[SemanticIndexStatus] Spawn error:', err.message);
-    state.isRebuilding = false;
-    state.rebuildProc = null;
-    send('semantic-index:rebuild-done', { success: false, error: err.message });
-  });
-
-  proc.on('exit', (code, signal) => {
-    state.isRebuilding = false;
-    state.rebuildProc = null;
-
-    // Strict, deterministic success check — never claim success unless we positively
-    // observed all of these signals. build-index.sh exits 0 even when many files
-    // failed (the script "completed", but did not actually index them), so exit code
-    // is necessary but not sufficient.
-    const reasons = [];
-    if (code !== 0) reasons.push(`exit code ${code}`);
-    if (signal) reasons.push(`killed by signal ${signal}`);
-    if (code === 0 && !signal) {
-      if (!sawSummary) reasons.push('summary line missing (script aborted before merge)');
-      if (summaryErrors > 0) reasons.push(`${summaryErrors} file error(s) in summary`);
-      if (summaryWarnings > 0) reasons.push(`${summaryWarnings} wrapped file(s) in summary`);
-      if (perFileBad > 0) reasons.push(`${perFileBad} per-file failure(s): ${failedFiles.slice(0, 5).join(', ')}`);
-    }
-    const success = reasons.length === 0;
-
-    // Стрим stderr+stdout в наш единый лог при любом ненулевом exit / ненулевом stderr.
-     // Иначе юзер видит «exit code 1» в тосте без указания где упало (CLAUDE.md.bak,
-    // claude/jq missing, GEMINI_API_KEY, set -u и т.п.). build-index.sh пишет
-    // ошибки через `echo -e ${RED}...` на STDOUT (не stderr), поэтому буферим оба.
-    if (!success || stderrTail.trim() || stdoutTail.trim()) {
-      const stderrPreview = stderrTail.trim().slice(-1200);
-      // ANSI-strip + последние 3 непустые строки stdout — обычно тут «ERROR: ...».
-      const stdoutPreview = stdoutTail
-        .replace(/\x1b\[[0-9;]*m/g, '')
-        .trim()
-        .split('\n')
-        .map(l => l.trim())
-        .filter(Boolean)
-        .slice(-3)
-        .join(' · ')
-        .slice(-1200);
-      console.log(
-        '[SemanticIndexStatus] Rebuild', projectId,
-        'exit code', code, 'signal', signal,
-        'sawSummary=', sawSummary,
-        'summaryErr=', summaryErrors,
-        'summaryWarn=', summaryWarnings,
-        'perFileBad=', perFileBad,
-        'success=', success,
-        reasons.length ? `reasons=[${reasons.join('; ')}]` : '',
-        stderrPreview ? `stderr=<<<${stderrPreview}>>>` : '',
-        stdoutPreview ? `stdout=<<<${stdoutPreview}>>>` : ''
-      );
-    } else {
-      console.log(
-        '[SemanticIndexStatus] Rebuild', projectId,
-        'exit code', code, 'signal', signal,
-        'success=', success
-      );
-    }
-
-    // Toast в renderer — clean tail из stderr+stdout добавляем к reasons, чтобы
-    // юзер видел реальную причину (CLAUDE.md.bak exists / claude CLI missing /
-    // jq missing / etc), а не сухое «exit code 1». build-index.sh пишет ошибки
-    // на STDOUT через `echo -e ${RED}...`, поэтому stdoutTail имеет смысл
-    // лить в toast наравне со stderr.
-    const ansiStrip = (s) => s
-      .replace(/\x1b\[[0-9;]*m/g, '')   // ANSI colors
-      .trim()
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .slice(-3)
-      .join(' · ');
-    const stderrClean = ansiStrip(stderrTail);
-    const stdoutClean = ansiStrip(stdoutTail);
-    // Берём ту струю, в которой есть «ERROR» / непустой контент. Обе пустые →
-    // оставляем reasons как есть. Обе непустые → склеиваем через ` · `.
-    const sourceLine = [stderrClean, stdoutClean].filter(Boolean).join(' · ');
-    const combinedError = success
-      ? null
-      : [reasons.join('; '), sourceLine].filter(Boolean).join(' — ') || 'unknown failure';
-
+    console.log(
+      '[SemanticIndexStatus] Rebuild via docs_reindex',
+      projectId,
+      'success=', success,
+      'summaryErr=', summaryErrors,
+      'summaryWarn=', summaryWarnings,
+      result?.error ? `error=${result.error}` : ''
+    );
     send('semantic-index:rebuild-done', {
       success,
-      code,
-      signal,
-      error: combinedError,
+      code: success ? 0 : 1,
+      signal: null,
+      error: success ? null : (result?.error || 'docs_reindex failed'),
       stats: {
-        sawSummary,
+        sawSummary: !!summaryStats,
         summaryErrors,
         summaryWarnings,
-        perFileBad,
+        perFileBad: failedFiles.length,
         outdatedTotal,
         outdatedCompleted,
-        failedFiles: failedFiles.slice(0, 10),
+        failedFiles,
       },
     });
-    // Watcher will pick up new .semantic-index.json and emit fresh status on its own.
-    // Force one more recompute defensively (in case fs.watch missed the rewrite).
+    scheduleRecompute(state, mainWindow, projectId);
+  }).catch((err) => {
+    console.error('[SemanticIndexStatus] docs_reindex error:', err.message);
+    state.isRebuilding = false;
+    state.rebuildProc = null;
+    send('semantic-index:rebuild-done', {
+      success: false,
+      code: 1,
+      signal: null,
+      error: err.message,
+      stats: {
+        sawSummary: false,
+        summaryErrors: 1,
+        summaryWarnings: 0,
+        perFileBad: 0,
+        outdatedTotal,
+        outdatedCompleted,
+        failedFiles: [],
+      },
+    });
     scheduleRecompute(state, mainWindow, projectId);
   });
 

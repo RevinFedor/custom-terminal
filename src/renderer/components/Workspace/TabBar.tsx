@@ -7,6 +7,7 @@ import { useCmdKey, useCmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import TabPreviewPopover from './TabPreviewPopover';
 import { RunAfterTabPicker } from './RunAfterTabPicker';
 import { refreshGeneratedTabTitle, type RefreshTabTitleReason } from '../../utils/generateTabTitle';
+import { terminalRegistry } from '../../utils/terminalRegistry';
 import '@gt-editor/markdown-editor/styles.css';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
@@ -20,7 +21,7 @@ import {
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, PanelLeft, Plus, StickyNote, RotateCw, Folder, ArrowUp, ArrowDown, Square, Bell, BellRing, FileText, X } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, PanelLeft, Plus, StickyNote, RotateCw, Folder, ArrowUp, ArrowDown, Square, Bell, BellRing, FileText, X, Copy } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -217,6 +218,9 @@ const shortDndId = (id?: string | null) => {
   if (!id) return '-';
   return id.length > 12 ? id.slice(-12) : id;
 };
+
+const getTabSessionUuid = (tab?: { claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string } | null) =>
+  tab?.claudeSessionId || tab?.geminiSessionId || tab?.codexSessionId || null;
 
 const shortVerticalRowKey = (key?: string | null) => {
   if (!key) return '-';
@@ -689,6 +693,7 @@ interface TabItemProps {
   commandType?: string; // Type of command running (devServer, claude, gemini, generic)
   onRestart?: (tabId: string) => void; // Restart process (deterministic stop + !!)
   onStop?: (tabId: string) => void; // Stop process (deterministic stop only)
+  onRunLastProjectCommand?: (tabId: string) => void; // Cmd+peek empty notes slot → run latest project shell command
   isStopping?: boolean; // Deterministic-stop is mid-cycle; lock the click + spin icon
   isInterrupted?: boolean; // Tab has an interrupted AI session
   draggingGroupIds?: string[]; // IDs of tabs being dragged as a group
@@ -751,6 +756,7 @@ const TabItem = memo(({
   commandType,
   onRestart,
   onStop,
+  onRunLastProjectCommand,
   isStopping = false,
   isInterrupted = false,
   draggingGroupIds = [],
@@ -1874,8 +1880,63 @@ const TabItem = memo(({
               static-кнопки в том же flex'е. См. fact-notes.md::Z-index над AI-pulse.
               Mutex: если этот же таб зелёный с активным процессом — место занимает Restart-кнопка
               выше, notes не рендерится. */}
-          {isVerticalMode && tab.tabType !== 'file' && !(tab.color === 'green' && hasProcess) && (slideoutOpenHere || showNotesPeek || (isActive && !anySlideoutOpen && !cmdPeekMode)) && (() => {
+          {isVerticalMode && tab.tabType !== 'file' && !(tab.color === 'green' && hasProcess) && (() => {
             const hasNotes = !!(tab.notes && tab.notes.trim().length > 0);
+            const isAiRuntimeTab = tab.tabType === 'claude-sdk'
+              || commandType === 'claude'
+              || commandType === 'codex'
+              || commandType === 'gemini'
+              || !!tab.claudeSessionId
+              || !!tab.geminiSessionId
+              || !!tab.codexSessionId;
+            const hasAiTabState = isAiRuntimeTab || !!hasSession || !!tab.wasInterrupted || !!tab.aiClosing;
+            const isPlainTerminalTab = !tab.tabType || tab.tabType === 'terminal';
+            const canRunLastCommandHere = isPlainTerminalTab && !isAiRuntimeTab && !hasProcess && !sdkProcessAlive && !isBusy;
+            const showLastCommandPlay = cmdPeekMode && (isActive || effectiveHovered) && !hasNotes && !slideoutOpenHere && !!onRunLastProjectCommand && canRunLastCommandHere;
+            const showNotesButton = slideoutOpenHere || showNotesPeek || (isActive && !anySlideoutOpen && !cmdPeekMode && (hasNotes || hasAiTabState));
+            if (!showLastCommandPlay && !showNotesButton) return null;
+            if (showLastCommandPlay) {
+              return (
+                <button
+                  data-no-tab-drag
+                  data-tab-id={tab.id}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRunLastProjectCommand?.(tab.id);
+                  }}
+                  onDoubleClick={(e) => e.stopPropagation()}
+                  title="Run last command in this directory"
+                  className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer transition-colors"
+                  style={{
+                    position: 'relative',
+                    zIndex: 1,
+                    width: 20,
+                    height: 18,
+                    marginLeft: 6,
+                    padding: 0,
+                    borderRadius: 4,
+                    backgroundColor: '#1e1e2e',
+                    color: '#86efac',
+                    border: '1px solid rgba(34,197,94,0.25)',
+                  }}
+                  onMouseEnter={(e) => {
+                    const lock = isTabbarDragVisualLockActive();
+                    if (isAnyDragging || lock) return;
+                    const el = e.currentTarget as HTMLButtonElement;
+                    el.style.backgroundColor = 'rgba(34,197,94,0.18)';
+                    el.style.color = '#bbf7d0';
+                  }}
+                  onMouseLeave={(e) => {
+                    const el = e.currentTarget as HTMLButtonElement;
+                    el.style.backgroundColor = '#1e1e2e';
+                    el.style.color = '#86efac';
+                  }}
+                >
+                  <Play size={11} strokeWidth={2.2} />
+                </button>
+              );
+            }
             const dim = !slideoutOpenHere && !hasNotes;
             const baseBg = slideoutOpenHere ? '#6366f1' : '#1e1e2e';
             const baseColor = slideoutOpenHere
@@ -2822,6 +2883,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const isVerticalLayout = layout === 'vertical';
   // Use individual selectors to minimize re-renders
   const openProjects = useWorkspaceStore((state) => state.openProjects);
+  const activeProjectId = useWorkspaceStore((state) => state.activeProjectId);
   const pendingEditTabId = useWorkspaceStore((state) => state.pendingEditTabId);
   const createTab = useWorkspaceStore((state) => state.createTab);
   const createTabAfterCurrent = useWorkspaceStore((state) => state.createTabAfterCurrent);
@@ -2949,8 +3011,44 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const workspace = openProjects.get(projectId);
   const viewingSubAgentTabId = workspace?.viewingSubAgentTabId ?? null;
   const viewingSubAgentParentId = viewingSubAgentTabId ? workspace?.tabs.get(viewingSubAgentTabId)?.parentTabId ?? null : null;
-  const project = projects[projectId];
+  const project = projects[projectId] || (workspace ? {
+    id: workspace.projectId,
+    name: workspace.projectPath?.split('/').filter(Boolean).pop() || 'Project',
+    path: workspace.projectPath,
+    icon: null,
+  } : null);
   const currentView = workspace?.currentView || 'terminal';
+  const activeTabId = workspace?.activeTabId || null;
+  const activeTabCompletionNotificationFired = !!(
+    activeProjectId === projectId &&
+    currentView === 'terminal' &&
+    activeTabId &&
+    workspace?.tabs.get(activeTabId)?.completionNotificationFired
+  );
+
+  useEffect(() => {
+    if (!activeTabId || !activeTabCompletionNotificationFired) return;
+
+    const clearActiveTabNotificationOnPointerMove = () => {
+      const state = useWorkspaceStore.getState();
+      const liveWorkspace = state.openProjects.get(projectId);
+      if (
+        state.activeProjectId !== projectId ||
+        liveWorkspace?.currentView !== 'terminal' ||
+        liveWorkspace?.activeTabId !== activeTabId
+      ) {
+        return;
+      }
+      const liveTab = liveWorkspace.tabs.get(activeTabId);
+      if (!liveTab?.completionNotificationFired) return;
+      state.setTabCompletionNotificationArmed(projectId, activeTabId, false);
+    };
+
+    window.addEventListener('pointermove', clearActiveTabNotificationOnPointerMove, { capture: true, passive: true });
+    return () => {
+      window.removeEventListener('pointermove', clearActiveTabNotificationOnPointerMove, { capture: true });
+    };
+  }, [activeTabCompletionNotificationFired, activeTabId, projectId]);
 
   // Selection state
   const selectedTabIds = workspace?.selectedTabIds || [];
@@ -4502,6 +4600,53 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     return false;
   };
 
+  const normalizeShellPromptCommand = (line: string): string => {
+    let text = String(line || '').replace(/^\x15+/, '').trim();
+    const promptMatch = text.match(/^[^"'`]*@[^"'`]*(?:\s[%$#]|[❯➜])\s+(.+)$/);
+    if (promptMatch) text = promptMatch[1].trim();
+    text = text.replace(/^lsof\s+-ti:[^;]+;\s*/i, '').trim();
+    if (!text || text === '!!') return '';
+    if (/^\[[0-?]*[ -/]*[@-~]$/.test(text)) return '';
+    if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text)) return '';
+    if (text.includes('\x1b[200~') || text.includes('\x1b[201~')) return '';
+    return text;
+  };
+
+  const getLogicalTerminalLine = (buf: any, row: number): string => {
+    if (!buf || row < 0 || row >= buf.length) return '';
+    let start = row;
+    while (start > 0 && buf.getLine(start)?.isWrapped) start -= 1;
+    const parts: string[] = [];
+    for (let i = start; i < buf.length; i++) {
+      const line = buf.getLine(i);
+      if (!line) break;
+      parts.push(String(line.translateToString?.(true) || ''));
+      const next = i + 1 < buf.length ? buf.getLine(i + 1) : null;
+      if (!next?.isWrapped) break;
+    }
+    return parts.join('').replace(/\u00a0/g, ' ').trimEnd();
+  };
+
+  const findLastShellPromptCommandInBuffer = (tabId: string): string => {
+    const term = terminalRegistry.get(tabId);
+    const buf = term?.buffer?.active;
+    if (!buf) return '';
+    const seenStarts = new Set<number>();
+    const start = Math.max(0, buf.length - 1500);
+    for (let row = buf.length - 1; row >= start; row -= 1) {
+      let logicalStart = row;
+      while (logicalStart > 0 && buf.getLine(logicalStart)?.isWrapped) logicalStart -= 1;
+      if (seenStarts.has(logicalStart)) continue;
+      seenStarts.add(logicalStart);
+      const line = getLogicalTerminalLine(buf, logicalStart);
+      if (!line) continue;
+      if (!/^[^"'`]*@[^"'`]*(?:\s[%$#]|[❯➜])\s+/.test(line.trim())) continue;
+      const command = normalizeShellPromptCommand(line);
+      if (command) return command;
+    }
+    return '';
+  };
+
   // Restart / Stop — deterministic, event-driven, no setTimeout guesses.
   //
   // The legacy flow ("Ctrl+C → setTimeout(300) → kill+!!") was broken in two ways:
@@ -4586,6 +4731,35 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       return;
     }
     await runDeterministicStop(tabId, false);
+  };
+
+  const handleRunLastProjectCommand = async (tabId: string) => {
+    try {
+      const tab = useWorkspaceStore.getState().openProjects.get(projectId)?.tabs.get(tabId);
+      const liveCwd = await ipcRenderer.invoke('terminal:getCwd', tabId).catch(() => null);
+      const result = await ipcRenderer.invoke('terminal:get-last-project-command', {
+        projectId,
+        cwd: liveCwd || tab?.cwd || null,
+      });
+      let command = String(result?.command || '').trim();
+      if (!result?.success || !command) {
+        command = findLastShellPromptCommandInBuffer(tabId);
+        if (command) {
+          ipcRenderer.send('terminal:remember-detected-command', { tabId, command });
+        } else {
+          useUIStore.getState().showToast?.('No previous command in this directory', 'info');
+          return;
+        }
+      }
+      const killPrefix = await buildKillPortsPrefix(tabId);
+      ipcRenderer.send('terminal:input', tabId, `${killPrefix}${command}\r`);
+      if (isDevRestartCommand(command)) {
+        useWorkspaceStore.getState().setTabCommandType(tabId, 'devServer');
+      }
+    } catch (e: any) {
+      console.error('[TabBar] run-last-project-command failed', e);
+      useUIStore.getState().showToast?.(`Run last command failed: ${e?.message || e}`, 'error');
+    }
   };
 
   // After rename closes via an EXPLICIT keyboard action (Enter/Escape), hand
@@ -5079,6 +5253,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     sdkProcessAlive={!!tab.sdkProcessAlive}
                     onRestart={handleRestart}
                     onStop={handleStop}
+                    onRunLastProjectCommand={handleRunLastProjectCommand}
                     isStopping={restartInFlight.has(tab.id)}
                     isInterrupted={isTabInterrupted(tab)}
                     draggingGroupIds={draggingGroupIds}
@@ -5396,6 +5571,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                   sdkProcessAlive={!!tab.sdkProcessAlive}
                   onRestart={handleRestart}
                   onStop={handleStop}
+                  onRunLastProjectCommand={handleRunLastProjectCommand}
                   isStopping={restartInFlight.has(tab.id)}
                   isInterrupted={isTabInterrupted(tab)}
                   draggingGroupIds={draggingGroupIds}
@@ -5576,6 +5752,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         sdkProcessAlive={!!tab.sdkProcessAlive}
                         onRestart={handleRestart}
                         onStop={handleStop}
+                        onRunLastProjectCommand={handleRunLastProjectCommand}
                         isStopping={restartInFlight.has(tab.id)}
                         isInterrupted={isTabInterrupted(tab)}
                         draggingGroupIds={draggingGroupIds}
@@ -5665,6 +5842,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     sdkProcessAlive={!!tab.sdkProcessAlive}
                     onRestart={handleRestart}
                     onStop={handleStop}
+                    onRunLastProjectCommand={handleRunLastProjectCommand}
                     isStopping={restartInFlight.has(tab.id)}
                     isInterrupted={isTabInterrupted(tab)}
                     draggingGroupIds={draggingGroupIds}
@@ -6428,6 +6606,19 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               </button>
               <button
                 className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                onClick={() => {
+                  const tab = contextMenu ? workspace.tabs.get(contextMenu.tabId) : null;
+                  const filePath = tab?.filePath || tab?.cwd || '';
+                  if (filePath) {
+                    window.require('electron').shell.showItemInFolder(filePath);
+                  }
+                  setContextMenu(null);
+                }}
+              >
+                Open in Finder
+              </button>
+              <button
+                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
                 onClick={async () => {
                   const tab = contextMenu ? workspace.tabs.get(contextMenu.tabId) : null;
                   const filePath = tab?.filePath;
@@ -6457,39 +6648,72 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 Unlink File
               </button>
             </>
-          ) : (
-            <button
-              className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
-              onClick={() => {
-                if (isMultiSelect) {
-                  // Copy all selected tabs' session IDs + cwds
-                  const lines: string[] = [];
-                  selectedTabIds.forEach(tabId => {
-                    const tab = workspace.tabs.get(tabId);
-                    if (tab) {
-                      const sessionId = tab.claudeSessionId || tab.geminiSessionId || tab.codexSessionId || 'no-session';
-                      const path = tab.cwd || project?.path || '/';
-                      lines.push(`${sessionId}\ncwd: ${path}`);
-                    }
-                  });
-                  navigator.clipboard.writeText(lines.join('\n\n'));
-                  showToast(`Copied ${selectedTabIds.length} sessions`, 'success');
-                } else {
-                  const tab = workspace.tabs.get(contextMenu.tabId);
-                  if (tab) {
-                    const sessionId = tab.claudeSessionId || tab.geminiSessionId || tab.codexSessionId || 'no-session';
-                    const path = tab.cwd || project?.path || '/';
-                    const text = `${sessionId}\ncwd: ${path}`;
-                    navigator.clipboard.writeText(text);
-                    showToast('Session ID copied', 'success');
-                  }
-                }
-                setContextMenu(null);
-              }}
-            >
-              {isMultiSelect ? `Copy ${selectedTabIds.length} Sessions` : 'Copy ID/Path'}
-            </button>
-          )}
+          ) : (() => {
+            const targetTabs = (isMultiSelect ? selectedTabIds : [contextMenu.tabId])
+              .map(tabId => workspace.tabs.get(tabId))
+              .filter((tab): tab is NonNullable<typeof tab> => !!tab);
+            const uuidRows: Array<{ tab: (typeof targetTabs)[number]; uuid: string }> = [];
+            targetTabs.forEach(tab => {
+              const uuid = getTabSessionUuid(tab);
+              if (uuid) uuidRows.push({ tab, uuid });
+            });
+            const hasTabIds = targetTabs.length > 0;
+            const hasUuid = uuidRows.length > 0;
+            const missingCount = targetTabs.length - uuidRows.length;
+            const tabIdTitle = isMultiSelect
+              ? `ID-Tab: ${targetTabs.length}`
+              : 'ID-Tab';
+            const disabledTitle = 'У вкладки нет UUID сессии';
+            const uuidPathTitle = isMultiSelect
+              ? `UUID + пути: ${uuidRows.length}${missingCount > 0 ? `, без UUID: ${missingCount}` : ''}`
+              : 'UUID сессии + путь';
+            const copyButtonClass = (enabled: boolean, withDivider = false) =>
+              [
+                'flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] flex items-center justify-center gap-1.5 whitespace-nowrap',
+                withDivider ? 'border-l border-[#444]' : '',
+                enabled ? 'text-[#ccc] hover:bg-white/10 cursor-pointer' : 'text-[#555] cursor-not-allowed',
+              ].filter(Boolean).join(' ');
+            const copyTabId = (e: React.MouseEvent) => {
+              e.stopPropagation();
+              if (!hasTabIds) return;
+              window.require('electron').clipboard.writeText(targetTabs.map(tab => tab.id).join('\n'));
+              showToast(isMultiSelect ? `Скопировано ID-Tab: ${targetTabs.length}` : 'ID-Tab скопирован', 'success');
+              setContextMenu(null);
+            };
+            const copyUuidWithPath = (e: React.MouseEvent) => {
+              e.stopPropagation();
+              if (!hasUuid) return;
+              const lines = uuidRows.map(({ tab, uuid }) => {
+                const path = tab.cwd || project?.path || '/';
+                return `${uuid}\ncwd: ${path}`;
+              });
+              window.require('electron').clipboard.writeText(lines.join('\n\n'));
+              showToast(isMultiSelect ? `Скопировано UUID + путей: ${uuidRows.length}` : 'UUID + путь скопированы', 'success');
+              setContextMenu(null);
+            };
+            return (
+              <div className="flex items-stretch w-full">
+                <button
+                  className={copyButtonClass(hasTabIds)}
+                  title={tabIdTitle}
+                  disabled={!hasTabIds}
+                  onClick={copyTabId}
+                >
+                  <Copy size={12} className="flex-shrink-0" />
+                  <span>ID-Tab</span>
+                </button>
+                <button
+                  className={copyButtonClass(hasUuid, true)}
+                  title={hasUuid ? uuidPathTitle : disabledTitle}
+                  disabled={!hasUuid}
+                  onClick={copyUuidWithPath}
+                >
+                  <Copy size={12} className="flex-shrink-0" />
+                  <span>UUID + Path</span>
+                </button>
+              </div>
+            );
+          })()}
 
           {/* Revert Session — submenu shown only for claude tabs with rotation history.
               Safety-net for accidental overwrites by bridge watcher / AutoResume / Timeline

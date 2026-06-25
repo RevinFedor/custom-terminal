@@ -33,6 +33,16 @@
 
 Разница restart vs stop: `handleRestart` = `\x03` → 300ms → `!!\r` (Ctrl+C + повтор последней команды через `!!` bash). `handleStop` = только `\x03`.
 
+## Run last command из пустого tab-slot
+
+В vertical sidebar у plain terminal-вкладки без live process, без AI runtime/session-state и без заметки notes-slot при `Cmd+hover` пустой slot превращается в Play. Active tab показывает Play как раньше; inactive tab показывает его только когда сама строка hovered — target определяется наведённой вкладкой, а не глобальным active tab. Это не scripts-menu и не project-wide history: кнопка запускает последнюю сохранённую shell-команду для **текущего cwd** вкладки. Перед lookup renderer спрашивает live cwd через `terminal:getCwd`; main сравнивает сначала in-memory `terminalCommandState.lastCommandCwd`, потом persisted SQLite app-state keyed by cwd.
+
+Граница важна из-за пользовательского сценария «в одной директории `npm run dev`, в другой `./deploy.sh`»: одна Project Workspace может содержать несколько cwd, поэтому ключ "projectId → last command" был бы неверным. Если команда была сохранена в cwd A, а пользователь потом сделал `cd B`, она не должна переехать вслед за табом — для этого у in-memory записи хранится `lastCommandCwd`.
+
+Capture берёт только реальные shell input lines из plain terminal: когда активен Claude/Gemini/Codex runtime, line-buffer очищается и не обучается на TUI output. ANSI CSI вроде `ArrowUp` (`\x1b[A`) не считается командой, persisted мусор типа `[A` отфильтровывается при чтении, bracketed paste не участвует в этом feature. Kill-port prefix, который добавляется перед restart/run (`lsof -ti:...;`), при сохранении отбрасывается, чтобы Play повторял пользовательскую команду, а не служебный preflight.
+
+Важный edge: команда, запущенная через shell history (`↑` + Enter), не проходит через main как текст команды — `terminal:input` видит только escape-код стрелки. Поэтому renderer `CmdDetect` после Enter отправляет в main полный prompt-line, а main уже нормализует его так же как typed input. Если команда была видна в scrollback до появления этой логики и ещё не сохранена в SQLite, Cmd+Play делает одноразовый fallback: сканирует tail текущего xterm-буфера, берёт последнюю строку с shell prompt, нормализует, сохраняет и запускает. Это не замена persisted store, а recovery для живой старой вкладки.
+
 ## Restart after AI completion
 
 Обычная terminal/devServer вкладка может быть привязана к завершению другой AI-вкладки через ПКМ → `Restart after`. Это не Prompt Queue и не отправка prompt'а: owner — обычная вкладка с процессом или script'ом, trigger — Claude/Gemini/Codex/SDK вкладка, у которой ждём штатный busy→idle edge.

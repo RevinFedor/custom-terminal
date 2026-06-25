@@ -617,6 +617,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                       const effectiveDefault = claudeDefaultPromptEnabled ? claudeDefaultPrompt : '';
                       const finalPrompt = [effectiveDefault, claudeExtraPrompt].filter(Boolean).join('\n\n');
                       setTabCommandType(activeTabId, 'claude');
+                      useWorkspaceStore.getState().markAiLaunchAutoTitle(activeTabId, 'claude');
                       ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude', prompt: finalPrompt || undefined });
                     }}
                   >claude</code>

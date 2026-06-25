@@ -99,10 +99,11 @@ ipcRenderer.on('terminal:data', (event, tabId, data) => {
 
 #### 2. Персистентные слои (Persistent Layers)
 В приложении используется стратегия «Смонтирован навсегда» для всех тяжелых компонентов:
--   **Terminal:** Рендерим терминалы **всех** открытых проектов одновременно. Используем `visibility: active ? 'inherit' : 'hidden'`.
+-   **Terminal:** Рендерим терминалы **всех** открытых проектов одновременно. PTY/xterm живут в фоне; визуальная видимость управляется отдельно на внешнем terminal-layer: active -> `visibility: inherit`, `opacity: 1`, `pointer-events: auto`; inactive -> `visibility: hidden`, `opacity: 0`, `pointer-events: none`. Внутренняя `.terminal-instance` только наследует `visibility`, не ставит `visible` сама.
 -   **Workspace:** Компонент `Workspace` в `App.tsx` остается смонтированным при переходе на Dashboard. Скрытие управляется через `visibility`.
 -   **Почему:** Любой unmount `xterm.js` приводит к потере WebGL-контекста и визуального буфера. Пересоздание занимает 1-3с, что неприемлемо для быстрого переключения.
 -   **Важно:** Используем именно `visibility: hidden`, а не `display: none`, так как `display: none` схлопывает контейнер в 0x0, что приводит к потере текстур в `xterm.js`. См. также раздел 11.1 про ловушку `visible`.
+-   **Контракт фона:** скрытие терминала не должно убивать PTY, xterm buffer или main/headless mirror. Mobile/API/History могут управлять скрытой вкладкой, поэтому stale-screen баги чинятся только визуальным слоем, а не unmount/kill/suspend терминала.
 
 ---
 
@@ -237,6 +238,7 @@ if (xtermInstance.current) {
 Если дочерний элемент имеет стиль `visibility: visible`, он **перекрывает** `visibility: hidden` родителя.
 - **Проблема:** При переходе на Dashboard весь Workspace скрывался через `hidden`, но терминалы (имея `visible`) продолжали «просвечивать» поверх главного экрана.
 - **Решение:** Использовать `visibility: inherit` (или `visibility: visible` только при условии видимости родителя). Это заставляет детей подчиняться состоянию верхнего слоя.
+- **Симптом 2026-06:** при переключении таба/проекта или после переноса окна между мониторами меняются title/Timeline/status, но центр остаётся на старом Codex `Process completed`/shell prompt. Это stale painted layer, а не доказательство что active tab/session state не переключился. Диагностика: `[Terminal:VisibleSetInvariant]`; чинить через внешний terminal-layer, не через остановку фонового PTY.
 
 ### ⚠️ ОПАСНО: Resize Cycle (Trap)
 Попытка форсировать пересчет через `term.resize(cols-1)` -> `term.resize(cols)` является **ловушкой**.

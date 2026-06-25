@@ -266,6 +266,71 @@ const logAutoTabTitleArmSkip = (
   );
 };
 
+const shouldAttemptAutoTabTitleArmForSessionWrite = (reason: string): boolean => {
+  return ![
+    'autoResume',
+    'userIntercept',
+    'userManual',
+    'timelineChain',
+    'restoredFromDb',
+    'userRevert',
+    'editRange',
+    'api-edit-range',
+  ].includes(reason);
+};
+
+const maybeArmPendingAutoTabTitle = (
+  tabId: string,
+  toolType: AutoTabTitleTool,
+  prevSessionId: string | undefined,
+  nextSessionId: string,
+  tabNameSetManually: boolean,
+  reason: string
+): void => {
+  if (!shouldAttemptAutoTabTitleArmForSessionWrite(reason)) return;
+
+  const snapshot = aiLaunchSnapshots.get(tabId);
+  const intent = getAutoTabTitleIntent(tabId, toolType);
+  if ((!snapshot || snapshot.sessionType !== toolType) && !intent) return;
+
+  const armSkipReason = getAutoTabTitleArmSkipReason(tabId, toolType, prevSessionId, nextSessionId);
+  if (armSkipReason === null) {
+    armPendingAutoTabTitle(tabId, toolType, nextSessionId, {
+      mode: snapshot?.autoTitleMode || 'fresh',
+      sourceSessionId: snapshot?.autoTitleSourceSessionId,
+    });
+    console.warn(
+      '[Store:AutoTabTitle] arm-via-session-write tab=' + tabId.slice(-8) +
+      ' type=' + toolType +
+      ' sid=' + nextSessionId.slice(0, 8) +
+      ' reason=' + reason
+    );
+    return;
+  }
+
+  if ((armSkipReason === 'no-snapshot' || armSkipReason === 'not-eligible')
+      && intent
+      && !prevSessionId
+      && !tabNameSetManually) {
+    armPendingAutoTabTitle(tabId, toolType, nextSessionId, {
+      mode: intent.mode,
+      sourceSessionId: intent.sourceSessionId,
+    });
+    console.warn(
+      '[Store:AutoTabTitle] arm-via-intent tab=' + tabId.slice(-8) +
+      ' type=' + toolType +
+      ' sid=' + nextSessionId.slice(0, 8) +
+      ' mode=' + intent.mode +
+      (intent.sourceSessionId ? ' source=' + intent.sourceSessionId.slice(0, 8) : '') +
+      ' originalSkip=' + armSkipReason +
+      ' reason=' + reason
+    );
+    return;
+  }
+
+  logAutoTabTitleArmSkip(tabId, toolType, prevSessionId, nextSessionId, armSkipReason + ':session-write-' + reason);
+};
+
 const getPendingAutoTabTitle = (tabId: string, toolType: AutoTabTitleTool, sessionId: string): PendingAutoTabTitle | null => {
   const pending = pendingAutoTabTitles.get(tabId);
   if (!pending) return null;
@@ -358,6 +423,12 @@ interface Tab {
   wasInterrupted?: boolean; // True if tab was closed with active AI session (show resume overlay)
   overlayDismissed?: boolean; // True if user dismissed the interrupted overlay (don't show again)
   notes?: string; // Tab-specific notes
+  restoreError?: {
+    type: 'working_directory_missing' | 'terminal_create_failed';
+    message: string;
+    cwd?: string;
+    at: number;
+  };
   /**
    * Recent sessionId rotation log (most-recent-first, capped at 5 entries).
    * Used as a safety-net for accidental overwrites — user can revert via the
@@ -542,6 +613,91 @@ interface ProjectWorkspace {
   viewingSubAgentTabId: string | null; // When viewing a sub-agent, points to the Claude sub-agent tab
 }
 
+const restoreTabOptions = (savedTab: any) => ({
+  color: savedTab.color,
+  isUtility: savedTab.isUtility,
+  commandType: savedTab.commandType,
+  claudeSessionId: savedTab.claudeSessionId,
+  geminiSessionId: savedTab.geminiSessionId,
+  codexSessionId: savedTab.codexSessionId,
+  codexModel: savedTab.codexModel,
+  codexEffort: savedTab.codexEffort,
+  externalRun: savedTab.externalRun,
+  wasInterrupted: savedTab.wasInterrupted,
+  overlayDismissed: savedTab.overlayDismissed,
+  notes: savedTab.notes,
+  tabType: savedTab.tabType,
+  url: savedTab.url,
+  filePath: savedTab.filePath,
+  createdAt: savedTab.createdAt,
+  isCollapsed: savedTab.isCollapsed,
+  groupId: savedTab.groupId,
+  visualParentTabId: savedTab.visualParentTabId,
+  sessionStatus: savedTab.sessionStatus,
+  completionNotificationPersistent: savedTab.completionNotificationPersistent,
+  restartAfterTabId: savedTab.restartAfterTabId,
+  restartAfterCommand: savedTab.restartAfterCommand,
+  restartAfterPersistent: savedTab.restartAfterPersistent,
+  restartAfterArmed: savedTab.restartAfterArmed,
+  nameSetManually: savedTab.nameSetManually,
+  restoreId: savedTab.tabId
+} as any);
+
+const parseRestoreError = (err: any, fallbackCwd?: string) => {
+  const raw = String(err?.message || err?.stack || err || '');
+  const missingMatch = raw.match(/working_directory_missing:([^\n]+)/);
+  if (missingMatch) {
+    return {
+      type: 'working_directory_missing' as const,
+      message: 'Working directory no longer exists',
+      cwd: missingMatch[1].trim() || fallbackCwd,
+      at: Date.now(),
+    };
+  }
+  return {
+    type: 'terminal_create_failed' as const,
+    message: raw.slice(0, 300) || 'Terminal restore failed',
+    cwd: fallbackCwd,
+    at: Date.now(),
+  };
+};
+
+const createBrokenRestoredTab = (workspace: ProjectWorkspace, savedTab: any, err: any): Tab => {
+  const tabId = savedTab.tabId || `${workspace.projectId}-tab-${workspace.tabCounter++}`;
+  return {
+    id: tabId,
+    name: savedTab.name || 'Restore failed',
+    cwd: savedTab.cwd || workspace.projectPath || '',
+    color: savedTab.color,
+    isUtility: savedTab.isUtility,
+    commandType: savedTab.commandType,
+    claudeSessionId: savedTab.claudeSessionId,
+    geminiSessionId: savedTab.geminiSessionId,
+    codexSessionId: savedTab.codexSessionId,
+    codexModel: savedTab.codexModel,
+    codexEffort: savedTab.codexEffort,
+    externalRun: savedTab.externalRun,
+    wasInterrupted: savedTab.wasInterrupted,
+    overlayDismissed: savedTab.overlayDismissed,
+    notes: savedTab.notes,
+    tabType: savedTab.tabType || 'terminal',
+    url: savedTab.url,
+    filePath: savedTab.filePath,
+    createdAt: savedTab.createdAt || Math.floor(Date.now() / 1000),
+    isCollapsed: savedTab.isCollapsed,
+    groupId: savedTab.isUtility ? undefined : savedTab.groupId,
+    visualParentTabId: savedTab.isUtility ? undefined : savedTab.visualParentTabId,
+    nameSetManually: savedTab.nameSetManually,
+    sessionStatus: savedTab.sessionStatus,
+    completionNotificationPersistent: savedTab.completionNotificationPersistent || undefined,
+    restartAfterTabId: savedTab.restartAfterTabId || undefined,
+    restartAfterCommand: savedTab.restartAfterCommand || undefined,
+    restartAfterPersistent: savedTab.restartAfterPersistent || undefined,
+    restartAfterArmed: savedTab.restartAfterArmed || undefined,
+    restoreError: parseRestoreError(err, savedTab.cwd || workspace.projectPath),
+  };
+};
+
 const resolveExistingTabGroupId = (workspace: ProjectWorkspace | undefined, rawGroupId: unknown): string | undefined => {
   const groupId = typeof rawGroupId === 'string' && rawGroupId ? rawGroupId : undefined;
   if (!groupId || !workspace?.tabGroups?.some(group => group.id === groupId)) return undefined;
@@ -615,9 +771,9 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; filePath?: string; background?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterCommand?: string; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; filePath?: string; nameSetManually?: boolean; background?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterCommand?: string; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
   createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; filePath?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterCommand?: string; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
-  closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean }) => Promise<boolean>;
+  closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean }) => Promise<boolean>;
   reopenLastClosedTab: (projectId: string) => Promise<{ tabId: string | null; reason?: 'empty' | 'error' }>;
   switchTab: (projectId: string, tabId: string) => void;
   setActiveTabGroup: (projectId: string, groupId: string | null) => void;
@@ -983,9 +1139,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         const isInbox = isInboxProjectId(proj.projectId);
         const projectData = await ipcRenderer.invoke('project:getById', proj.projectId);
         const savedTabs = projectData?.tabs || [];
+        const restoredProjectPath = isInbox ? getInboxProjectPath() : (projectData?.path || proj.projectPath);
         console.warn(
           `[RestoreSession] projectData project=${restoreShortId(proj.projectId)}` +
           ` found=${!!projectData}` +
+          ` dbPath=${projectData?.path || 'unset'}` +
+          ` sessionPath=${proj.projectPath || 'unset'}` +
           ` savedTabs=${savedTabs.length}` +
           ` groups=${projectData?.tabGroups?.length || 0}` +
           ` tabIds=${restoreTabsSummary(savedTabs)}`
@@ -993,7 +1152,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
         const newWorkspace: ProjectWorkspace = {
           projectId: proj.projectId,
-          projectPath: isInbox ? getInboxProjectPath() : proj.projectPath,
+          projectPath: restoredProjectPath,
           tabs: new Map(),
           tabGroups: projectData?.tabGroups || [],
           activeTabId: null,
@@ -1047,35 +1206,27 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               ` command=${savedTab.commandType || 'generic'}` +
               ` cwd=${savedTab.cwd || 'unset'}`
             );
-            const createdTabId = await createTab(proj.projectId, savedTab.name, savedTab.cwd, {
-              color: savedTab.color,
-              isUtility: savedTab.isUtility,
-              commandType: savedTab.commandType,
-              claudeSessionId: savedTab.claudeSessionId,
-              geminiSessionId: savedTab.geminiSessionId,
-              codexSessionId: savedTab.codexSessionId,
-              codexModel: savedTab.codexModel,
-              codexEffort: savedTab.codexEffort,
-              externalRun: savedTab.externalRun,
-              wasInterrupted: savedTab.wasInterrupted,
-              overlayDismissed: savedTab.overlayDismissed,
-              notes: savedTab.notes,
-              tabType: savedTab.tabType,
-              url: savedTab.url,
-              filePath: savedTab.filePath,
-              createdAt: savedTab.createdAt,
-              isCollapsed: savedTab.isCollapsed,
-              groupId: savedTab.groupId,
-              visualParentTabId: savedTab.visualParentTabId,
-              sessionStatus: savedTab.sessionStatus,
-              completionNotificationPersistent: savedTab.completionNotificationPersistent,
-              restartAfterTabId: savedTab.restartAfterTabId,
-              restartAfterCommand: savedTab.restartAfterCommand,
-              restartAfterPersistent: savedTab.restartAfterPersistent,
-              restartAfterArmed: savedTab.restartAfterArmed,
-              nameSetManually: savedTab.nameSetManually,
-              restoreId: savedTab.tabId
-            } as any);
+            let createdTabId = '';
+            try {
+              createdTabId = await createTab(proj.projectId, savedTab.name, savedTab.cwd, restoreTabOptions(savedTab));
+            } catch (err: any) {
+              const brokenTab = createBrokenRestoredTab(newWorkspace, savedTab, err);
+              newWorkspace.tabs.set(brokenTab.id, brokenTab);
+              const liveWorkspace = get().openProjects.get(proj.projectId);
+              if (liveWorkspace && liveWorkspace !== newWorkspace) {
+                liveWorkspace.tabs.set(brokenTab.id, brokenTab);
+              }
+              createdTabId = brokenTab.id;
+              console.error(
+                `[RestoreSession] tabRestoreFailed project=${restoreShortId(proj.projectId)}` +
+                ` idx=${i + 1}/${savedTabs.length}` +
+                ` tab=${restoreShortId(savedTab.tabId)}` +
+                ` cwd=${savedTab.cwd || 'unset'}` +
+                ` errorType=${brokenTab.restoreError?.type}` +
+                ` errorCwd=${brokenTab.restoreError?.cwd || 'unset'}`,
+                err?.stack || err?.message || err
+              );
+            }
             const stateWorkspace = get().openProjects.get(proj.projectId);
             console.warn(
               `[RestoreSession] tabRestoreEnd project=${restoreShortId(proj.projectId)}` +
@@ -1088,7 +1239,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           }
         } else if (!isInbox) {
           console.warn(`[RestoreSession] noSavedTabs project=${restoreShortId(proj.projectId)} creatingDefault=true`);
-          const createdTabId = await createTab(proj.projectId, 'Terminal 1', proj.projectPath);
+          const createdTabId = await createTab(proj.projectId, 'Terminal 1', restoredProjectPath);
           console.warn(
             `[RestoreSession] defaultTabEnd project=${restoreShortId(proj.projectId)}` +
             ` returned=${restoreShortId(createdTabId)}` +
@@ -1307,11 +1458,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const projectData = await ipcRenderer.invoke('project:getById', projectId);
       console.log('[Store] project:getById returned:', projectData);
       const savedTabs = projectData?.tabs || [];
+      const workspaceProjectPath = isInbox ? getInboxProjectPath() : (projectData?.path || effectiveProjectPath);
       console.log('[Store] savedTabs:', savedTabs);
 
       const newWorkspace: ProjectWorkspace = {
         projectId,
-        projectPath: effectiveProjectPath,
+        projectPath: workspaceProjectPath,
         tabs: new Map(),
         tabGroups: projectData?.tabGroups || [],
         activeTabId: null,
@@ -1346,39 +1498,24 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           }
           newWorkspace.tabCounter = maxTabNum;
           for (const savedTab of savedTabs) {
-            await createTab(projectId, savedTab.name, savedTab.cwd, {
-              color: savedTab.color,
-              isUtility: savedTab.isUtility,
-              commandType: savedTab.commandType,
-              claudeSessionId: savedTab.claudeSessionId,
-              geminiSessionId: savedTab.geminiSessionId,
-              codexSessionId: savedTab.codexSessionId,
-              codexModel: savedTab.codexModel,
-              codexEffort: savedTab.codexEffort,
-              externalRun: savedTab.externalRun,
-              wasInterrupted: savedTab.wasInterrupted,
-              overlayDismissed: savedTab.overlayDismissed,
-              notes: savedTab.notes,
-              tabType: savedTab.tabType,
-              url: savedTab.url,
-              filePath: savedTab.filePath,
-              createdAt: savedTab.createdAt,
-              isCollapsed: savedTab.isCollapsed,
-              groupId: savedTab.groupId,
-              visualParentTabId: savedTab.visualParentTabId,
-              sessionStatus: savedTab.sessionStatus,
-              completionNotificationPersistent: savedTab.completionNotificationPersistent,
-              restartAfterTabId: savedTab.restartAfterTabId,
-              restartAfterCommand: savedTab.restartAfterCommand,
-              restartAfterPersistent: savedTab.restartAfterPersistent,
-              restartAfterArmed: savedTab.restartAfterArmed,
-              nameSetManually: savedTab.nameSetManually,
-              restoreId: savedTab.tabId
-            } as any);
+            try {
+              await createTab(projectId, savedTab.name, savedTab.cwd, restoreTabOptions(savedTab));
+            } catch (err: any) {
+              const brokenTab = createBrokenRestoredTab(newWorkspace, savedTab, err);
+              newWorkspace.tabs.set(brokenTab.id, brokenTab);
+              console.error(
+                `[OpenProject] tabRestoreFailed project=${restoreShortId(projectId)}` +
+                ` tab=${restoreShortId(savedTab.tabId)}` +
+                ` cwd=${savedTab.cwd || 'unset'}` +
+                ` errorType=${brokenTab.restoreError?.type}` +
+                ` errorCwd=${brokenTab.restoreError?.cwd || 'unset'}`,
+                err?.stack || err?.message || err
+              );
+            }
           }
         } else if (!isInbox) {
           // Create default tab
-          await createTab(projectId, 'Terminal 1', effectiveProjectPath);
+          await createTab(projectId, 'Terminal 1', workspaceProjectPath);
         }
       }
 
@@ -1934,7 +2071,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     clearTerminalBuffer(tabId); // Clean up serialized buffer
 
     // Archive tab to history (fire-and-forget)
-    if (tab) {
+    if (tab && options?.archive !== false) {
       ipcRenderer.invoke('project:archive-tab', {
         projectId,
         tab: {
@@ -3219,36 +3356,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           tab.claudeSessionHistory = hist.slice(0, 5);
         }
 
-        if (reason === 'bridge' || reason === 'fork') {
-          const armSkipReason = getAutoTabTitleArmSkipReason(tabId, 'claude', prev, sessionId);
-          if (armSkipReason === null) {
-            const snapshot = aiLaunchSnapshots.get(tabId);
-            armPendingAutoTabTitle(tabId, 'claude', sessionId, {
-              mode: snapshot?.autoTitleMode || 'fresh',
-              sourceSessionId: snapshot?.autoTitleSourceSessionId,
-            });
-          } else {
-            const intent = getAutoTabTitleIntent(tabId, 'claude');
-            if ((armSkipReason === 'no-snapshot' || armSkipReason === 'not-eligible')
-                && intent
-                && !prev
-                && !tab.nameSetManually) {
-              armPendingAutoTabTitle(tabId, 'claude', sessionId, {
-                mode: intent.mode,
-                sourceSessionId: intent.sourceSessionId,
-              });
-              console.warn(
-                '[Store:AutoTabTitle] arm-via-intent tab=' + tabId.slice(-8) +
-                ' type=claude sid=' + sessionId.slice(0, 8) +
-                ' mode=' + intent.mode +
-                (intent.sourceSessionId ? ' source=' + intent.sourceSessionId.slice(0, 8) : '') +
-                ' originalSkip=' + armSkipReason
-              );
-            } else {
-              logAutoTabTitleArmSkip(tabId, 'claude', prev, sessionId, armSkipReason);
-            }
-          }
-        } else if (!sessionId || (prev && prev !== sessionId)) {
+        maybeArmPendingAutoTabTitle(tabId, 'claude', prev, sessionId, tab.nameSetManually === true, reason);
+        if (!sessionId || (prev && prev !== sessionId)) {
           clearPendingAutoTabTitle(tabId, !sessionId ? 'claude-session-cleared' : 'claude-session-changed');
         }
 
@@ -3323,36 +3432,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (tab) {
         if (tab.codexSessionId === sessionId) return;
         const prev = tab.codexSessionId;
-        if (reason === 'detected') {
-          const armSkipReason = getAutoTabTitleArmSkipReason(tabId, 'codex', prev, sessionId);
-          if (armSkipReason === null) {
-            const snapshot = aiLaunchSnapshots.get(tabId);
-            armPendingAutoTabTitle(tabId, 'codex', sessionId, {
-              mode: snapshot?.autoTitleMode || 'fresh',
-              sourceSessionId: snapshot?.autoTitleSourceSessionId,
-            });
-          } else {
-            const intent = getAutoTabTitleIntent(tabId, 'codex');
-            if ((armSkipReason === 'no-snapshot' || armSkipReason === 'not-eligible')
-                && intent
-                && !prev
-                && !tab.nameSetManually) {
-              armPendingAutoTabTitle(tabId, 'codex', sessionId, {
-                mode: intent.mode,
-                sourceSessionId: intent.sourceSessionId,
-              });
-              console.warn(
-                '[Store:AutoTabTitle] arm-via-intent tab=' + tabId.slice(-8) +
-                ' type=codex sid=' + sessionId.slice(0, 8) +
-                ' mode=' + intent.mode +
-                (intent.sourceSessionId ? ' source=' + intent.sourceSessionId.slice(0, 8) : '') +
-                ' originalSkip=' + armSkipReason
-              );
-            } else {
-              logAutoTabTitleArmSkip(tabId, 'codex', prev, sessionId, armSkipReason);
-            }
-          }
-        } else if (!sessionId || (prev && prev !== sessionId)) {
+        maybeArmPendingAutoTabTitle(tabId, 'codex', prev, sessionId, tab.nameSetManually === true, reason);
+        if (!sessionId || (prev && prev !== sessionId)) {
           clearPendingAutoTabTitle(tabId, !sessionId ? 'codex-session-cleared' : 'codex-session-changed');
         }
         tab.codexSessionId = sessionId;

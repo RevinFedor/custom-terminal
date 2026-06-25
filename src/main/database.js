@@ -28,6 +28,7 @@ class DatabaseManager {
     this.ensureTabTitlePrompt();
     this.ensureRunAfterTitlePrompt();
     this.ensurePromptSummaryPrompt();
+    this.ensureGitCommitPrompt();
   }
 
   initTables() {
@@ -1534,6 +1535,17 @@ class DatabaseManager {
         is_built_in: 1,
         show_in_context_menu: 0,
         position: 7
+      },
+      {
+        id: 'git-commit',
+        name: 'Git Commit',
+        content: 'You write concise Git commit messages for local commits.\nReturn only JSON with keys "summary" and "description".\n\nRules:\n- The summary must be one line, imperative mood when possible, no trailing period, under 72 characters.\n- The description may be empty. If non-empty, use 1-4 short lines with concrete facts.\n- Do not mention files that are not present in the provided changes.\n- If docs/ changed, base the commit message on changed docs files only when the prompt data says docs-only context was applied.\n- If docs/ did not change, use all included changes.',
+        model: 'gemini-3.1-flash-lite',
+        thinking_level: 'NONE',
+        color: '#facc15',
+        is_built_in: 1,
+        show_in_context_menu: 0,
+        position: 8
       }
     ];
 
@@ -1661,6 +1673,30 @@ class DatabaseManager {
     } else if (oldDefaults.includes(exists.content)) {
       this.db.prepare('UPDATE ai_prompts SET content = ? WHERE id = ? AND is_built_in = 1').run(nextDefault, 'prompt-summary');
       console.log('[DB] Migrated: updated prompt-summary prompt content');
+    }
+  }
+
+  // Ensure built-in prompt for Git commit summary generation exists.
+  // User edits are preserved; only missing row is inserted.
+  ensureGitCommitPrompt() {
+    const content = 'You write concise Git commit messages for local commits.\nReturn only JSON with keys "summary" and "description".\n\nRules:\n- The summary must be one line, imperative mood when possible, no trailing period, under 72 characters.\n- The description may be empty. If non-empty, use 1-4 short lines with concrete facts.\n- Do not mention files that are not present in the provided changes.\n- If docs/ changed, base the commit message on changed docs files only when the prompt data says docs-only context was applied.\n- If docs/ did not change, use all included changes.';
+    const exists = this.db.prepare('SELECT id FROM ai_prompts WHERE id = ?').get('git-commit');
+    if (!exists) {
+      this.db.prepare(`
+        INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        'git-commit',
+        'Git Commit',
+        content,
+        'gemini-3.1-flash-lite',
+        'NONE',
+        '#facc15',
+        1,
+        0,
+        8
+      );
+      console.log('[DB] Migrated: added git-commit prompt');
     }
   }
 

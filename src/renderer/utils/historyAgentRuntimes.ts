@@ -33,6 +33,8 @@ export interface AgentPtyPresence {
   lastNotReady?: any;
   startupFailed?: boolean;
   startupError?: string | null;
+  manualActionRequired?: boolean;
+  manualActionType?: string | null;
 }
 
 export interface AgentResumeResult {
@@ -69,6 +71,7 @@ export interface HistoryAgentRuntime {
   optimisticBusyOnSend: boolean;
   optimisticActiveOnInterrupt: boolean;
   getPresence: (tabId: string) => Promise<AgentPtyPresence>;
+  startFresh?: (args: { tabId: string; cwd?: string }) => Promise<AgentResumeResult>;
   resume: (args: { tabId: string; sessionId: string; cwd?: string }) => Promise<AgentResumeResult>;
   sendPrompt: (tabId: string, prompt: string, options?: AgentSendPromptOptions) => Promise<any>;
   interruptTurn: (tabId: string) => { success: boolean; interrupted?: boolean; error?: string };
@@ -108,6 +111,22 @@ const findTabState = (tabId: string): { aiBusy?: boolean; commandType?: string; 
   return null;
 };
 
+async function startFreshClaudePtySession({
+  tabId,
+}: {
+  tabId: string;
+  cwd?: string;
+}): Promise<AgentResumeResult> {
+  if (!tabId) return { success: false, error: 'tabId required' };
+  const store = useWorkspaceStore.getState();
+  store.setTabCommandType(tabId, 'claude');
+  store.markAiLaunchAutoTitle(tabId, 'claude');
+  store.clearInterruptedState?.(tabId);
+  console.log('[ClaudePtyActions:startFresh] start tab=' + shortTab(tabId));
+  ipcRenderer.send('claude:run-command', { tabId, command: 'claude' });
+  return { success: true, status: 'starting' };
+}
+
 async function getCodexPtyPresence(tabId: string): Promise<AgentPtyPresence> {
   const tab = findTabState(tabId);
   const [state, turnState] = await Promise.all([
@@ -124,13 +143,14 @@ async function getCodexPtyPresence(tabId: string): Promise<AgentPtyPresence> {
   const isRunning = !!state?.isRunning;
   const inputReady = isRunning && !!tuiReady?.inputReady;
   const startupFailed = tuiReady?.startupFailed === true;
+  const manualActionRequired = tuiReady?.manualActionRequired === true;
   const isBusy = turnState?.hasWatcher ? !!turnState.busy : !!tab?.aiBusy;
   if (tab && tab.aiBusy !== isBusy) {
     useWorkspaceStore.getState().setAiBusy(tabId, isBusy);
   }
   const status: AgentPtyStatus = stopping?.stopping
     ? 'stopping'
-    : (startupFailed ? 'starting' : (isRunning ? (isBusy ? 'busy' : (inputReady ? 'active' : 'starting')) : 'inactive'));
+    : (manualActionRequired ? 'inactive' : (startupFailed ? 'starting' : (isRunning ? (isBusy ? 'busy' : (inputReady ? 'active' : 'starting')) : 'inactive')));
   return {
     status,
     hasBridge: !!tab?.codexSessionId,
@@ -141,6 +161,8 @@ async function getCodexPtyPresence(tabId: string): Promise<AgentPtyPresence> {
     lastNotReady: tuiReady?.lastNotReady || null,
     startupFailed,
     startupError: tuiReady?.startupError || null,
+    manualActionRequired,
+    manualActionType: tuiReady?.manualActionType || null,
   };
 }
 
@@ -159,14 +181,42 @@ async function resumeCodexSession({
   store.setTabCommandType(tabId, 'codex');
   store.clearInterruptedState?.(tabId);
   console.log('[CodexHistoryActions:resume] start tab=' + shortTab(tabId) + ' sid=' + sessionId.slice(0, 8));
-  ipcRenderer.send('codex:run-command', buildCodexRunPayload({
+  const runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
     tabId,
     command: 'codex-c',
     sessionId,
     cwd,
-  }));
+  })).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
+  if (runResult?.success === false) {
+    return { success: false, error: runResult.error || 'Codex resume failed' };
+  }
   ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'codex', sessionId });
   return { success: true, sessionId };
+}
+
+async function startFreshCodexSession({
+  tabId,
+  cwd,
+}: {
+  tabId: string;
+  cwd?: string;
+}): Promise<AgentResumeResult> {
+  if (!tabId) return { success: false, error: 'tabId required' };
+  const store = useWorkspaceStore.getState();
+  store.setTabCommandType(tabId, 'codex');
+  store.markAiLaunchAutoTitle(tabId, 'codex');
+  store.clearInterruptedState?.(tabId);
+  console.log('[CodexHistoryActions:startFresh] start tab=' + shortTab(tabId));
+  const runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
+    tabId,
+    command: 'codex',
+    cwd,
+  })).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
+  if (runResult?.success === false) {
+    return { success: false, error: runResult.error || 'Codex start failed' };
+  }
+  ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'codex' });
+  return { success: true, status: 'starting' };
 }
 
 async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSendPromptOptions = {}): Promise<any> {
@@ -331,6 +381,7 @@ const CLAUDE_RUNTIME: HistoryAgentRuntime = {
   optimisticBusyOnSend: false,
   optimisticActiveOnInterrupt: true,
   getPresence: getClaudePtyPresence,
+  startFresh: startFreshClaudePtySession,
   resume: resumeClaudePtySession,
   sendPrompt: sendClaudePtyPrompt,
   interruptTurn: interruptClaudePtyTurn,
@@ -354,6 +405,7 @@ const CODEX_RUNTIME: HistoryAgentRuntime = {
   optimisticBusyOnSend: false,
   optimisticActiveOnInterrupt: false,
   getPresence: getCodexPtyPresence,
+  startFresh: startFreshCodexSession,
   resume: resumeCodexSession,
   sendPrompt: sendCodexPrompt,
   interruptTurn: interruptCodexTurn,

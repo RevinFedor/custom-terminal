@@ -15,9 +15,7 @@
     "build:markdown": "cd ../gt-editor/packages/markdown-editor && npm run build && rsync -a --delete dist/ ../../../custom-terminal/node_modules/@gt-editor/markdown-editor/dist/ && rm -rf ../../../custom-terminal/node_modules/.vite && echo '[build:markdown] gt-editor → custom-terminal node_modules synced, vite cache cleared'",
     "_rebuild": "NODE_GYP_FORCE_PYTHON=/Users/fedor/.node-gyp-py/bin/python electron-rebuild -f -w node-pty",
     "_test:e2e": "cd runtime-tests && npx playwright test",
-    "_test:e2e:headed": "cd runtime-tests && npx playwright test --headed",
-    "index": "bash scripts/ai/build-index.sh",
-    "index:force": "bash scripts/ai/build-index.sh --force"
+    "_test:e2e:headed": "cd runtime-tests && npx playwright test --headed"
   },
   "build": {
     "appId": "com.noted.terminal",

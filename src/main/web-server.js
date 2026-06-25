@@ -10,7 +10,6 @@
 //   GET  /api/projects                            → all projects from DB
 //   GET  /api/projects/:projectId/tabs            → tabs of one project (DB)
 //   POST /api/projects/:projectId/agent-tabs       → create Claude/Codex terminal tab
-//   POST /api/projects/:projectId/sdk-tabs         → legacy Claude SDK tab creation
 //   POST /api/terminal-tabs/:tabId/send            → send prompt through scenario layer
 //   POST /api/terminal-tabs/:tabId/stop            → stop terminal runtime
 //   GET  /api/terminal-tabs/:tabId/history         → load JSONL/rollout session history
@@ -210,13 +209,26 @@ function cleanupExternalRun(run) {
 async function waitForAgentReady(tabId, timeoutMs = 20_000) {
   const limitMs = Math.max(1000, Math.min(60_000, Number(timeoutMs) || 20_000));
   let last = null;
+  const isManualActionRequiredStatus = (status) => {
+    if (!status) return false;
+    if (status.manualActionRequired === true) return true;
+    const blockers = Array.isArray(status.lastNotReady?.blockers) ? status.lastNotReady.blockers : [];
+    return blockers.includes('auth-required');
+  };
   const readStatus = async () => {
     try {
       last = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
+      if (isManualActionRequiredStatus(last)) {
+        const err = new Error('codex_auth_required');
+        err.code = 'codex_auth_required';
+        err.status = last;
+        throw err;
+      }
       if (last && (last.status === 'active' || last.status === 'busy') && last.inputReady === true) {
         return last;
       }
     } catch (e) {
+      if (e?.code === 'codex_auth_required') throw e;
       last = { error: String(e.message || e) };
     }
     return null;
@@ -243,6 +255,7 @@ async function waitForAgentReady(tabId, timeoutMs = 20_000) {
         .then((status) => { if (status) finish(null, status); })
         .catch((e) => {
           last = { error: String(e.message || e) };
+          if (e?.code === 'codex_auth_required') finish(e);
         });
     };
     const onReady = (_event, payload) => {
@@ -563,6 +576,31 @@ function sendJson(res, status, body) {
     res.writeHead(status, headers);
     res.end(json);
   }
+}
+
+function sendTerminalBridgeError(res, error) {
+  const message = String(error?.message || error || 'unknown error');
+  const missingPrefix = 'working_directory_missing:';
+  const missingIndex = message.indexOf(missingPrefix);
+  if (missingIndex !== -1) {
+    const cwd = message.slice(missingIndex + missingPrefix.length).trim();
+    return sendJson(res, 409, {
+      ok: false,
+      error: 'working_directory_missing',
+      message: 'Project folder does not exist' + (cwd ? ': ' + cwd : ''),
+      cwd: cwd || null,
+    });
+  }
+  const lowerMessage = message.toLowerCase();
+  if (lowerMessage.includes('launch_not_accepted') || lowerMessage.includes('start failed')) {
+    return sendJson(res, 409, {
+      ok: false,
+      success: false,
+      error: lowerMessage.includes('codex') ? 'codex_launch_not_accepted' : 'agent_launch_not_accepted',
+      message,
+    });
+  }
+  return sendJson(res, 500, { ok: false, error: message });
 }
 
 function isSendFailure(data) {
@@ -1515,27 +1553,6 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
-  // Create SDK tab in a project (delegates to renderer store)
-  if (parsed.pathname === '/api/inbox/sdk-tabs' && req.method === 'POST') {
-    try {
-      await bridgeRequest('ensureInboxProject', {}, 5000);
-      const data = await bridgeRequest('createSDKTab', { projectId: INBOX_PROJECT_ID });
-      return sendJson(res, 200, data);
-    } catch (e) {
-      return sendJson(res, 500, { error: String(e.message) });
-    }
-  }
-
-  m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/sdk-tabs$/);
-  if (m && req.method === 'POST') {
-    try {
-      const data = await bridgeRequest('createSDKTab', { projectId: decId(m[1]) });
-      return sendJson(res, 200, data);
-    } catch (e) {
-      return sendJson(res, 500, { error: String(e.message) });
-    }
-  }
-
   // Send prompt to a project terminal tab. The scenario layer owns draft
   // preflight, busy/send-during-streaming and stopped-session readiness. Legacy
   // SDK tabs can still be routed by tab type, but the public endpoint is
@@ -1567,29 +1584,35 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
-  // Create PTY+Claude tab in a project (mobile button "+ New Claude terminal").
+  // Legacy Claude-only alias. Keep it on the same native-safe path as
+  // /agent-tabs: API clients may never mount the desktop Terminal component,
+  // so pendingAction alone is not enough to start the CLI.
   m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/claude-tabs$/);
   if (m && req.method === 'POST') {
     try {
-      const data = await bridgeRequest('createClaudeTab', { projectId: decId(m[1]) });
+      const data = await bridgeRequest('createAgentTab', {
+        projectId: decId(m[1]),
+        toolType: 'claude',
+        startNow: true,
+      }, 12_000);
       return sendJson(res, 200, data);
     } catch (e) {
-      return sendJson(res, 500, { error: String(e.message) });
+      return sendTerminalBridgeError(res, e);
     }
   }
 
   // Create PTY agent tab in a project. Body: { toolType: 'claude' | 'codex' }.
-  // Used by the native iOS "New Terminal" picker; keeps Claude/Codex creation
-  // on the same renderer-owned pendingAction path as desktop.
+  // Native/API clients do not necessarily mount the desktop Terminal component,
+  // so the bridge starts the agent immediately after the PTY is created.
   if (parsed.pathname === '/api/inbox/agent-tabs' && req.method === 'POST') {
     try {
       const body = await readBody(req);
       const toolType = body.toolType === 'codex' ? 'codex' : 'claude';
       await bridgeRequest('ensureInboxProject', {}, 5000);
-      const data = await bridgeRequest('createAgentTab', { projectId: INBOX_PROJECT_ID, toolType });
+      const data = await bridgeRequest('createAgentTab', { projectId: INBOX_PROJECT_ID, toolType, startNow: true }, 12_000);
       return sendJson(res, 200, data);
     } catch (e) {
-      return sendJson(res, 500, { error: String(e.message) });
+      return sendTerminalBridgeError(res, e);
     }
   }
 
@@ -1652,6 +1675,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           projectId: INBOX_PROJECT_ID,
           toolType: provider,
           name: tabName,
+          startNow: true,
           externalRun,
           codexDeveloperInstructions: developerInstructions || undefined,
           codexModel: cleanOptionalString(body.model, ''),
@@ -1669,6 +1693,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
       try {
         status = await waitForAgentReady(tabId, startupTimeoutMs);
       } catch (e) {
+        if (e?.code === 'codex_auth_required') {
+          run.status = 'auth_required';
+          setExternalRunMeta(tabId, { status: 'auth_required', error: 'codex_auth_required' });
+          return sendJson(res, 409, { ok: false, runId, tabId, error: 'codex_auth_required', status: e.status || null });
+        }
         run.status = 'start_timeout';
         setExternalRunMeta(tabId, { status: 'start_timeout', error: String(e.message || e) });
         return sendJson(res, 504, { ok: false, runId, tabId, error: 'agent did not become ready', status: e.status || null });
@@ -1745,13 +1774,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const data = await bridgeRequest('createAgentTab', {
         projectId: decId(m[1]),
         toolType,
+        startNow: true,
         name: cleanOptionalString(body.name, ''),
         codexModel: cleanOptionalString(body.model || body.codexModel, ''),
         codexEffort: cleanOptionalString(body.effort || body.codexEffort, ''),
-      });
+      }, 12_000);
       return sendJson(res, 200, data);
     } catch (e) {
-      return sendJson(res, 500, { error: String(e.message) });
+      return sendTerminalBridgeError(res, e);
     }
   }
 
@@ -1812,7 +1842,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           inputReady: liveStatus?.inputReady === true,
         });
       } catch (readyErr) {
-        return sendJson(res, 504, {
+        return sendJson(res, readyErr?.code === 'codex_auth_required' ? 409 : 504, {
           ...(data || {}),
           ok: false,
           success: false,

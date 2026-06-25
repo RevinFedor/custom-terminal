@@ -78,6 +78,8 @@ export default function Workspace() {
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const timelineTreeModeTabs = useUIStore((s) => s.timelineTreeModeTabs);
   const setTimelineTreeMode = useUIStore((s) => s.setTimelineTreeMode);
+  const sidebarWidth = useUIStore((s) => s.sidebarWidth);
+  const sidebarFontSize = useUIStore((s) => s.sidebarFontSize);
   const historyPinned = useUIStore((s) => s.historyPinned);
   const timelinePinned = useUIStore((s) => s.timelinePinned);
   const setProjectView = useWorkspaceStore((s) => s.setProjectView);
@@ -135,35 +137,33 @@ export default function Workspace() {
         name: INBOX_PROJECT_NAME,
         path: getInboxProjectPath(),
         icon: null,
+      } : activeProject ? {
+        id: activeProject.projectId,
+        name: path.basename(activeProject.projectPath || '') || 'Project',
+        path: activeProject.projectPath,
+        icon: null,
       } : null))
     : null;
 
   // Per-project currentView
   const currentView = activeProject?.currentView || 'terminal';
 
-  const fileLinkTargets = useMemo(() => {
-    if (!activeProject) return [];
-    return Array.from(activeProject.tabs.values())
-      .filter((tab: any) => {
-        if (tab.parentTabId || tab.isUtility || tab.tabType === 'file') return false;
-        return tab.tabType === 'claude-sdk' || tab.commandType === 'claude' || tab.commandType === 'codex';
-      })
-      .map((tab: any) => ({
-        id: tab.id,
-        name: tab.name || 'Untitled',
-        kind: tab.commandType === 'codex' ? 'Codex' : (tab.tabType === 'claude-sdk' ? 'SDK' : 'Claude'),
-      }));
-  }, [activeProject]);
-
   const handleLinkFileToTab = useCallback(async (filePath: string, targetTabId: string) => {
-    if (!activeProjectId) return;
-    const workspace = useWorkspaceStore.getState().openProjects.get(activeProjectId);
-    const targetTab = workspace?.tabs.get(targetTabId);
-    if (!workspace || !targetTab) return;
+    const state = useWorkspaceStore.getState();
+    let targetProjectId: string | null = null;
+    let targetTab: any = null;
+    for (const [projectId, workspace] of state.openProjects) {
+      const candidate = workspace.tabs.get(targetTabId);
+      if (!candidate) continue;
+      targetProjectId = projectId;
+      targetTab = candidate;
+      break;
+    }
+    if (!targetProjectId || !targetTab) return;
 
     const fileName = path.basename(filePath);
     const fileDir = path.dirname(filePath);
-    await createTabAfterCurrent(activeProjectId, fileName, targetTab.cwd || fileDir, {
+    await createTabAfterCurrent(targetProjectId, fileName, targetTab.cwd || fileDir, {
       tabType: 'file',
       filePath,
       color: 'purple',
@@ -174,7 +174,7 @@ export default function Workspace() {
       groupId: targetTab.groupId,
     } as any);
     useUIStore.getState().showToast(`Linked ${fileName}`, 'success');
-  }, [activeProjectId, createTabAfterCurrent]);
+  }, [createTabAfterCurrent]);
 
   // Get active tab early for process checking
   const activeTab = activeProject?.activeTabId
@@ -210,6 +210,63 @@ export default function Workspace() {
     }
     return activeTab;
   }, [viewingSubAgentTabId, activeProject, activeTab]);
+  const projectRootPath = useMemo(() => {
+    const projectPath = currentProject?.path || '';
+    return projectPath && !projectPath.startsWith('__unset__') ? projectPath : '';
+  }, [currentProject?.path]);
+  const rawExplorerPath = useMemo(() => {
+    if (!effectiveTab) return projectRootPath;
+    if (effectiveTab.tabType === 'file') {
+      const parentCwd = effectiveTab.visualParentTabId
+        ? activeProject?.tabs.get(effectiveTab.visualParentTabId)?.cwd
+        : '';
+      return parentCwd || projectRootPath || effectiveTab.cwd || '';
+    }
+    return effectiveTab.cwd || projectRootPath;
+  }, [
+    activeProject,
+    effectiveTab?.id,
+    effectiveTab?.cwd,
+    effectiveTab?.tabType,
+    effectiveTab?.visualParentTabId,
+    projectRootPath,
+  ]);
+  const [resolvedExplorerPath, setResolvedExplorerPath] = useState('');
+  useEffect(() => {
+    const candidates: string[] = [];
+    const pushCandidate = (candidate?: string | null) => {
+      if (!candidate || candidate.startsWith('__unset__') || candidates.includes(candidate)) return;
+      candidates.push(candidate);
+    };
+    pushCandidate(rawExplorerPath);
+    pushCandidate(projectRootPath);
+
+    if (!sidebarOpenForRender) {
+      setResolvedExplorerPath(candidates[0] || '');
+      return;
+    }
+    if (candidates.length === 0) {
+      setResolvedExplorerPath('');
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      for (const candidate of candidates) {
+        try {
+          const exists = await ipcRenderer.invoke('app:check-path-exists', candidate);
+          if (cancelled) return;
+          if (exists) {
+            setResolvedExplorerPath(candidate);
+            return;
+          }
+        } catch {}
+      }
+      if (!cancelled) setResolvedExplorerPath(candidates[0] || '');
+    })();
+
+    return () => { cancelled = true; };
+  }, [rawExplorerPath, projectRootPath, sidebarOpenForRender]);
   const activeFileTab = currentView === 'terminal' && effectiveTab?.tabType === 'file'
     ? effectiveTab
     : null;
@@ -339,16 +396,18 @@ export default function Workspace() {
 
   // Click outside the sidebar closes it (when toggle is on). Captures mousedown
   // on window so we don't fight terminal canvas pointer-events; check whether the
-  // event target lives inside [data-sidebar-portal]. We also let clicks inside the
-  // file preview (it sits next to the sidebar) close the sidebar too: the file
-  // tree behaves as an overlay even when the editor occupies the rest of screen.
+  // event target lives inside [data-sidebar-portal]. FilePreview belongs to this
+  // overlay flow: selecting text or pressing preview toolbar buttons must not
+  // close the sidebar first, because sidebar close also hides sidebar-sourced
+  // previews in the sync effect below.
   useEffect(() => {
     if (!sidebarOpenForRender || !activeProjectId) return;
     const onDown = (e: MouseEvent) => {
       const { sidebarOverlayCloseOnClickOutside } = useUIStore.getState();
       if (!sidebarOverlayCloseOnClickOutside) return;
-      const target = e.target as HTMLElement | null;
+      const target = e.target instanceof Element ? e.target as HTMLElement : null;
       if (!target) return;
+      if (target.closest('[data-run-after-picker-menu], [data-run-after-picker-portal]')) return;
       const sidebarEl = document.querySelector('[data-sidebar-portal]') as HTMLElement | null;
       const sidebarRect = sidebarEl?.getBoundingClientRect();
       const insideSidebarDom = !!target.closest('[data-sidebar-portal]');
@@ -359,9 +418,9 @@ export default function Workspace() {
         e.clientY <= sidebarRect.bottom;
       const insideFilePreview = !!target.closest('[data-file-preview-root]');
       const targetLabel = `${target.tagName.toLowerCase()}${target.className ? '.' + String(target.className).replace(/\s+/g, '.') : ''}`;
-      if (insideSidebarDom || insideSidebarRect) {
+      if (insideSidebarDom || insideSidebarRect || insideFilePreview) {
         console.warn('[SidebarOverlayClose] keep-open', {
-          reason: insideSidebarDom ? 'inside-sidebar-dom' : 'inside-sidebar-rect',
+          reason: insideFilePreview ? 'inside-file-preview' : (insideSidebarDom ? 'inside-sidebar-dom' : 'inside-sidebar-rect'),
           target: targetLabel,
           x: e.clientX,
           y: e.clientY,
@@ -623,8 +682,8 @@ export default function Workspace() {
     return <div className="flex-1 bg-bg-main" />;
   }
 
-  // Get current tab's cwd for FileExplorer (fallback to project path)
-  const explorerPath = effectiveTab?.cwd || (currentProject.path?.startsWith('__unset__') ? '' : currentProject.path);
+  // Get current tab's cwd for FileExplorer (fallback to project path).
+  const explorerPath = resolvedExplorerPath || rawExplorerPath || projectRootPath;
 
   // Session IDs come from fine-grained selectors (top of component) — not effectiveTab.
   // This ensures Workspace re-renders when Bridge updates session ID via set({}).
@@ -832,19 +891,19 @@ export default function Workspace() {
         if (isInboxProject) return null;
         if (!sidebarOpenForRender || !explorerPath) return null;
         const { sidebarExpandedDirs } = getSidebarState(activeProjectId);
-        const sidebarWidth = useUIStore.getState().sidebarWidth || 280;
+        const effectiveSidebarWidth = sidebarWidth || 280;
         return ReactDOM.createPortal(
-          <div data-sidebar-portal style={{ position: 'fixed', left: 0, top: 70, bottom: 0, width: sidebarWidth, zIndex: 2147482000, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
+          <div data-sidebar-portal style={{ position: 'fixed', left: 0, top: 70, bottom: 0, width: effectiveSidebarWidth, zIndex: 2147482000, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
             <Sidebar
               folderPath={explorerPath}
-              width={sidebarWidth}
-              fontSize={useUIStore.getState().sidebarFontSize || 13}
+              width={effectiveSidebarWidth}
+              fontSize={sidebarFontSize || 13}
               onFocus={() => {}}
               onCollapse={() => setSidebarOpen(activeProjectId, false)}
               activeFilePath={filePreview?.path || null}
               initialExpandedDirs={sidebarExpandedDirs}
               onExpandedDirsChange={(expandedDirs: Record<string, boolean>) => setSidebarExpandedDirs(activeProjectId, expandedDirs)}
-              linkTargets={fileLinkTargets}
+              linkOwnerProjectId={activeProjectId}
               onLinkFile={handleLinkFileToTab}
               onFileSelect={(filePath: string, isDir: boolean) => {
                 console.warn('[SidebarFileOpen] select', {

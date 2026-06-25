@@ -73,12 +73,14 @@ interface TabHistoryEntry {
   id: number;
   project_id: string;
   name: string;
+  name_set_manually?: number | null;
   cwd: string;
   color: string | null;
   notes: string | null;
   command_type: string | null;
   tab_type: string;
   url: string | null;
+  file_path?: string | null;
   created_at: number;
   closed_at: number;
   claude_session_id: string | null;
@@ -334,6 +336,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const [titleIndexProgress, setTitleIndexProgress] = useState<{ current: number; total: number } | null>(null);
   const [visibleRange, setVisibleRange] = useState<{ startIndex: number; endIndex: number }>({ startIndex: 0, endIndex: 0 });
   const historyLoadProjectRef = useRef<string | null>(null);
+  const restoreInFlightRef = useRef<Set<number>>(new Set());
   const renderSeqRef = useRef(0);
   const pendingReadyRef = useRef<{
     id: number;
@@ -530,6 +533,21 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   }, [homeContextMenu]);
 
   useEffect(() => {
+    const handleMessageCountUpdated = (_event: any, payload: { id?: number; message_count?: number }) => {
+      const id = Number(payload?.id);
+      const messageCount = Number(payload?.message_count);
+      if (!Number.isFinite(id) || !Number.isFinite(messageCount)) return;
+      setHistory(prev => prev.map(entry => (
+        entry.id === id ? { ...entry, message_count: messageCount } : entry
+      )));
+    };
+    ipcRenderer.on('tab-history:message-count-updated', handleMessageCountUpdated);
+    return () => {
+      ipcRenderer.removeListener('tab-history:message-count-updated', handleMessageCountUpdated);
+    };
+  }, []);
+
+  useEffect(() => {
     const handleSync = (e: any) => {
       if (e.detail.projectId === projectId && e.detail.source !== 'home') {
         setSyncName(e.detail.name);
@@ -608,8 +626,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     });
   }, [isLoaded, history, favorites, tabs.length, projectId, collapsedGroups]);
 
-  // Restore a closed tab from history
-  const restoreTab = async (entry: TabHistoryEntry) => {
+  const buildHistoryPendingAction = (entry: TabHistoryEntry): PendingAction | undefined => {
     let pendingAction: PendingAction | undefined;
     if (entry.command_type === 'claude') {
       if (entry.claude_session_id) {
@@ -630,70 +647,113 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         pendingAction = { type: 'codex-new' };
       }
     }
+    return pendingAction;
+  };
 
-    setProjectView(projectId, 'terminal');
-    await createTab(projectId, entry.name, entry.cwd, {
-      color: (entry.color || undefined) as TabColor | undefined,
-      notes: entry.notes || undefined,
-      commandType: entry.command_type as any || undefined,
-      tabType: (entry.tab_type || 'terminal') as TabType,
-      url: entry.url || undefined,
-      pendingAction,
-      claudeSessionId: entry.claude_session_id || undefined,
-      geminiSessionId: entry.gemini_session_id || undefined,
-      codexSessionId: entry.codex_session_id || undefined,
-      codexModel: entry.codex_model || undefined,
-      codexEffort: entry.codex_effort || undefined,
-      sessionStatus: entry.session_status || undefined,
-      groupId: resolveHistoryGroupId(entry),
-    });
+  const restoreErrorText = (entry: TabHistoryEntry, err: any): string => {
+    const raw = String(err?.message || err?.stack || err || '');
+    const missing = raw.match(/working_directory_missing:([^\n]+)/);
+    if (missing) return `Папка вкладки больше не существует: ${missing[1].trim() || entry.cwd}`;
+    return 'Не удалось восстановить вкладку';
+  };
 
-    await ipcRenderer.invoke('project:delete-tab-history-entry', { id: entry.id });
-    setHistory(prev => prev.filter(h => h.id !== entry.id));
+  const resolveHistoryRestoreCwd = async (entry: TabHistoryEntry): Promise<{ cwd: string; fallbackFrom?: string }> => {
+    const originalCwd = entry.cwd || project?.path || '/';
+    if (entry.command_type !== 'codex') return { cwd: originalCwd };
+
+    try {
+      const result = await ipcRenderer.invoke('app:nearest-existing-directory', originalCwd);
+      const resolved = typeof result?.path === 'string' && result.path ? result.path : originalCwd;
+      if (result?.path && result.exact === false) {
+        return { cwd: resolved, fallbackFrom: originalCwd };
+      }
+      return { cwd: resolved };
+    } catch (err: any) {
+      console.warn('[ProjectHome:Restore] cwd preflight failed historyId=' + entry.id + ' cwd=' + originalCwd + ' err=' + (err?.message || String(err)));
+      return { cwd: originalCwd };
+    }
+  };
+
+  // Restore a closed tab from history. Foreground restore switches away from Home
+  // only after successful PTY creation; otherwise a missing cwd would make Home
+  // disappear even though no tab opened.
+  const restoreTab = async (entry: TabHistoryEntry, mode: 'foreground' | 'background' = 'foreground') => {
+    if (restoreInFlightRef.current.has(entry.id)) {
+      console.warn('[ProjectHome:Restore] duplicate-skip historyId=' + entry.id + ' mode=' + mode);
+      return;
+    }
+    restoreInFlightRef.current.add(entry.id);
+    const started = performance.now();
+    const background = mode === 'background';
+    const pendingAction = buildHistoryPendingAction(entry);
+    const sessionId = entry.claude_session_id || entry.gemini_session_id || entry.codex_session_id || '';
+    console.warn(
+      '[ProjectHome:Restore] start' +
+      ' mode=' + mode +
+      ' project=' + projectId.slice(-12) +
+      ' historyId=' + entry.id +
+      ' name=' + JSON.stringify(entry.name || '') +
+      ' cwd=' + (entry.cwd || 'unset') +
+      ' cmd=' + (entry.command_type || 'none') +
+      ' sid=' + (sessionId ? sessionId.slice(0, 8) : 'none')
+    );
+
+    try {
+      const restoreCwd = await resolveHistoryRestoreCwd(entry);
+      const tabId = await createTab(projectId, entry.name, restoreCwd.cwd, {
+        color: (entry.color || undefined) as TabColor | undefined,
+        notes: entry.notes || undefined,
+        commandType: entry.command_type as any || undefined,
+        tabType: (entry.tab_type || 'terminal') as TabType,
+        url: entry.url || undefined,
+        filePath: entry.file_path || undefined,
+        pendingAction,
+        claudeSessionId: entry.claude_session_id || undefined,
+        geminiSessionId: entry.gemini_session_id || undefined,
+        codexSessionId: entry.codex_session_id || undefined,
+        codexModel: entry.codex_model || undefined,
+        codexEffort: entry.codex_effort || undefined,
+        sessionStatus: entry.session_status || undefined,
+        nameSetManually: entry.name_set_manually === 1,
+        groupId: resolveHistoryGroupId(entry),
+        background,
+      });
+
+      if (!background) setProjectView(projectId, 'terminal');
+      await ipcRenderer.invoke('project:delete-tab-history-entry', { id: entry.id });
+      setHistory(prev => prev.filter(h => h.id !== entry.id));
+      if (restoreCwd.fallbackFrom) {
+        showToast(`Оригинальная папка удалена. Открыто в ${restoreCwd.cwd}`, 'warning', 6500, false, restoreCwd.fallbackFrom);
+      }
+      console.warn(
+        '[ProjectHome:Restore] success' +
+        ' mode=' + mode +
+        ' project=' + projectId.slice(-12) +
+        ' historyId=' + entry.id +
+        ' tab=' + String(tabId || '').slice(-12) +
+        (restoreCwd.fallbackFrom ? ' cwdFallback=' + restoreCwd.fallbackFrom + '->' + restoreCwd.cwd : '') +
+        ' durMs=' + (performance.now() - started).toFixed(1)
+      );
+    } catch (err: any) {
+      console.error(
+        '[ProjectHome:Restore] failed' +
+        ' mode=' + mode +
+        ' project=' + projectId.slice(-12) +
+        ' historyId=' + entry.id +
+        ' name=' + JSON.stringify(entry.name || '') +
+        ' cwd=' + (entry.cwd || 'unset') +
+        ' durMs=' + (performance.now() - started).toFixed(1),
+        err?.stack || err?.message || err
+      );
+      showToast(restoreErrorText(entry, err), 'error', 4500);
+    } finally {
+      restoreInFlightRef.current.delete(entry.id);
+    }
   };
 
   // Restore a history tab in the background (middle-click) — no view switch, no activation
   const restoreTabBackground = async (entry: TabHistoryEntry) => {
-    let pendingAction: PendingAction | undefined;
-    if (entry.command_type === 'claude') {
-      if (entry.claude_session_id) {
-        pendingAction = { type: 'claude-continue', sessionId: entry.claude_session_id };
-      } else {
-        pendingAction = { type: 'claude-new' };
-      }
-    } else if (entry.command_type === 'gemini') {
-      if (entry.gemini_session_id) {
-        pendingAction = { type: 'gemini-continue', sessionId: entry.gemini_session_id };
-      } else {
-        pendingAction = { type: 'gemini-new' };
-      }
-    } else if (entry.command_type === 'codex') {
-      if (entry.codex_session_id) {
-        pendingAction = { type: 'codex-continue', sessionId: entry.codex_session_id };
-      } else {
-        pendingAction = { type: 'codex-new' };
-      }
-    }
-
-    await createTab(projectId, entry.name, entry.cwd, {
-      color: (entry.color || undefined) as TabColor | undefined,
-      notes: entry.notes || undefined,
-      commandType: entry.command_type as any || undefined,
-      tabType: (entry.tab_type || 'terminal') as TabType,
-      url: entry.url || undefined,
-      pendingAction,
-      claudeSessionId: entry.claude_session_id || undefined,
-      geminiSessionId: entry.gemini_session_id || undefined,
-      codexSessionId: entry.codex_session_id || undefined,
-      codexModel: entry.codex_model || undefined,
-      codexEffort: entry.codex_effort || undefined,
-      sessionStatus: entry.session_status || undefined,
-      groupId: resolveHistoryGroupId(entry),
-      background: true,
-    });
-
-    await ipcRenderer.invoke('project:delete-tab-history-entry', { id: entry.id });
-    setHistory(prev => prev.filter(h => h.id !== entry.id));
+    await restoreTab(entry, 'background');
   };
 
   // Restore from favorite (creates new tab, does NOT delete favorite)
@@ -1398,6 +1458,8 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                       ? sessionStatuses.find((s) => s.id === entry.session_status)
                       : null;
                     const { date, time } = formatShortStamp(entry.closed_at);
+                    const iterationCount = entry.message_count == null ? NaN : Number(entry.message_count);
+                    const iterationLabel = Number.isFinite(iterationCount) ? `${iterationCount} it` : null;
                     return (
                       <div
                         className="px-2 py-[3px]"
@@ -1407,10 +1469,17 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                         <div
                           className="relative cursor-pointer transition-opacity hover:opacity-75"
                           onClick={() => restoreTab(entry)}
+                          onMouseDown={(e) => {
+                            if (e.button === 1) {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              restoreTabBackground(entry);
+                            }
+                          }}
                           onAuxClick={(e) => {
                             if (e.button === 1) {
                               e.preventDefault();
-                              restoreTabBackground(entry);
+                              e.stopPropagation();
                             }
                           }}
                           style={{
@@ -1444,6 +1513,9 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                           <div className="flex-shrink-0 flex items-center gap-2 text-[10px] text-[#888] font-mono">
                             {semanticModeActive && typeof entry.score === 'number' && (
                               <span className="text-[#818cf8]">{entry.score.toFixed(2)}</span>
+                            )}
+                            {iterationLabel && (
+                              <span className="text-[#b8a75f]">{iterationLabel}</span>
                             )}
                             <span>{date}<span style={{ color: '#555', margin: '0 2px' }}>|</span>{time}</span>
                           </div>

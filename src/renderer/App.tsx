@@ -1414,12 +1414,55 @@ function App() {
           if (!tab || !toolType) return null;
           return toolType === 'codex' ? (tab.codexSessionId || null) : (tab.claudeSessionId || null);
         };
+        const waitForAgentLaunchAccepted = async (tabId: string, toolType: 'claude' | 'codex') => {
+          return ipcRenderer.invoke('agent:get-launch-accepted', {
+            tabId,
+            toolType,
+            timeoutMs: 5000,
+            reason: 'web:createAgentTab',
+          }).catch((err: any) => ({
+            success: false,
+            accepted: false,
+            error: String(err?.message || err),
+          }));
+        };
         const describeAgentTab = (tabId?: string) => {
           const tab = findTab(tabId);
           const toolType = toolForTab(tab);
           const runtime = toolType ? getHistoryAgentRuntime(toolType) : null;
           const sessionId = sessionIdForTab(tab, toolType);
           return { tab, toolType, runtime, sessionId };
+        };
+        const ensureProjectWorkspace = async (projectId?: string) => {
+          if (!projectId) return null;
+          let projectData: any = null;
+          try {
+            projectData = await ipcRenderer.invoke('project:getById', projectId);
+          } catch {}
+          let ws = useWorkspaceStore.getState().openProjects.get(projectId);
+          if (!ws) {
+            const projectsState = useProjectsStore.getState();
+            if (!projectsState.projects?.[projectId]) {
+              await projectsState.loadProjects();
+            }
+            const projectPath = projectData?.path || projectsState.projects?.[projectId]?.path;
+            if (!projectPath) return null;
+            await useWorkspaceStore.getState().openProject(projectId, projectPath, { background: true });
+            ws = useWorkspaceStore.getState().openProjects.get(projectId) || null;
+          }
+          const dbPath = projectData?.path;
+          if (ws && dbPath && ws.projectPath !== dbPath) {
+            console.warn(
+              '[BridgeDiag:R] refresh project path project=' + projectId.slice(-12) +
+              ' old=' + (ws.projectPath || 'unset') +
+              ' db=' + dbPath
+            );
+            ws.projectPath = dbPath;
+            useWorkspaceStore.setState({
+              openProjects: new Map(useWorkspaceStore.getState().openProjects)
+            });
+          }
+          return useWorkspaceStore.getState().openProjects.get(projectId) || null;
         };
         const findTabProject = (tabId?: string): { projectId: string; tab: any } | null => {
           if (!tabId) return null;
@@ -1607,15 +1650,6 @@ function App() {
               position: uiState.processBar.position,
             },
           });
-        }
-        if (action === 'createSDKTab') {
-          const { projectId } = payload || {};
-          if (!projectId) return reply(false, null, 'projectId required');
-          const tabId = await state.createSDKTab(projectId);
-          // Find the actual tab to return its full descriptor
-          const ws = state.openProjects.get(projectId);
-          const tab = ws?.tabs.get(tabId);
-          return reply(true, { tabId, name: tab?.name, cwd: tab?.cwd, projectId });
         }
         if (action === 'sendSDKMessage') {
           const { tabId, prompt, model, effort, thinking, cwd } = payload || {};
@@ -2154,7 +2188,7 @@ function App() {
           // Terminal.tsx and start Claude twice in the same PTY.
           const { projectId } = payload || {};
           if (!projectId) return reply(false, null, 'projectId required');
-          const ws = state.openProjects.get(projectId);
+          const ws = await ensureProjectWorkspace(projectId);
           if (!ws) return reply(false, null, 'project not open');
           const cwd = ws.projectPath && !ws.projectPath.startsWith('__unset__') ? ws.projectPath : undefined;
           const tabId = await state.createTab(projectId, undefined, cwd, {
@@ -2165,25 +2199,53 @@ function App() {
           return reply(true, { tabId, name: tab?.name, cwd: tab?.cwd, projectId });
         }
         if (action === 'createAgentTab') {
-          const { projectId, toolType, name, externalRun, codexDeveloperInstructions, codexModel, codexEffort } = payload || {};
+          const { projectId, toolType, name, externalRun, codexDeveloperInstructions, codexModel, codexEffort, startNow } = payload || {};
           if (!projectId) return reply(false, null, 'projectId required');
           const agent: AgentHistoryTool = toolType === 'codex' ? 'codex' : 'claude';
-          const ws = state.openProjects.get(projectId);
+          const ws = await ensureProjectWorkspace(projectId);
           if (!ws) return reply(false, null, 'project not open');
           const cwd = ws.projectPath && !ws.projectPath.startsWith('__unset__') ? ws.projectPath : undefined;
           const pendingAction: any = { type: agent === 'codex' ? 'codex-new' : 'claude-new' };
           if (agent === 'codex' && typeof codexDeveloperInstructions === 'string' && codexDeveloperInstructions.trim()) {
             pendingAction.developerInstructions = codexDeveloperInstructions.trim();
           }
-          const tabId = await state.createTab(projectId, typeof name === 'string' && name.trim() ? name.trim() : undefined, cwd, {
+          const shouldStartNow = startNow === true;
+          const explicitName = typeof name === 'string' && name.trim() ? name.trim() : undefined;
+          const tabId = await state.createTab(projectId, explicitName, cwd, {
             commandType: agent,
             color: agent,
-            pendingAction,
+            pendingAction: shouldStartNow ? undefined : pendingAction,
+            nameSetManually: !!explicitName,
             codexModel: typeof codexModel === 'string' ? codexModel : undefined,
             codexEffort: typeof codexEffort === 'string' ? codexEffort : undefined,
             externalRun: externalRun && typeof externalRun === 'object' ? externalRun : undefined,
           } as any);
           const tab = ws.tabs.get(tabId);
+          let launchAccepted: any = null;
+          if (shouldStartNow) {
+            state.setTabCommandType(tabId, agent);
+            state.markAiLaunchAutoTitle(tabId, agent);
+            if (agent === 'codex') {
+              const runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
+                tabId,
+                command: 'codex',
+                cwd: tab?.cwd || cwd,
+                developerInstructions: typeof codexDeveloperInstructions === 'string' ? codexDeveloperInstructions.trim() : undefined,
+              })).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
+              if (runResult?.success === false || runResult?.accepted === false) {
+                await state.closeTab(projectId, tabId, { skipProcessCheck: true, forceCleanup: true, archive: false } as any).catch(() => false);
+                return reply(false, null, runResult.error || 'Codex start failed');
+              }
+              launchAccepted = runResult;
+            } else {
+              ipcRenderer.send('claude:run-command', { tabId, command: 'claude' });
+              launchAccepted = await waitForAgentLaunchAccepted(tabId, 'claude');
+              if (!launchAccepted?.accepted) {
+                await state.closeTab(projectId, tabId, { skipProcessCheck: true, forceCleanup: true, archive: false } as any).catch(() => false);
+                return reply(false, null, launchAccepted?.error || launchAccepted?.reason || 'Claude start failed');
+              }
+            }
+          }
           return reply(true, {
             tabId,
             name: tab?.name,
@@ -2192,6 +2254,10 @@ function App() {
             toolType: agent,
             commandType: agent,
             color: tab?.color || agent,
+            starting: shouldStartNow,
+            launchAccepted: shouldStartNow ? true : undefined,
+            launchId: launchAccepted?.launchId || null,
+            pid: launchAccepted?.pid || null,
           });
         }
         if (action === 'setExternalRunMeta') {
@@ -2398,6 +2464,8 @@ function App() {
           const sessions: Record<string, string | null> = {};
           const startupFailed: Record<string, boolean> = {};
           const startupError: Record<string, string | null> = {};
+          const manualActionRequired: Record<string, boolean> = {};
+          const manualActionType: Record<string, string | null> = {};
           // awaiting (Claude blocked on AskUserQuestion) per tab — drives the
           // mobile tab-list purple dot. Same presence call, extra field.
           const awaiting: Record<string, boolean> = {};
@@ -2410,6 +2478,8 @@ function App() {
               if ((p as any)?.lastNotReady) lastNotReady[tid] = (p as any).lastNotReady;
               if ((p as any)?.startupFailed) startupFailed[tid] = true;
               if ((p as any)?.startupError) startupError[tid] = (p as any).startupError;
+              if ((p as any)?.manualActionRequired) manualActionRequired[tid] = true;
+              if ((p as any)?.manualActionType) manualActionType[tid] = (p as any).manualActionType;
               if (toolType === 'claude' && p?.awaiting) awaiting[tid] = true;
               if (toolType === 'codex') {
                 const runtimeSession = await ipcRenderer.invoke('codex:get-runtime-session', tid).catch(() => null);
@@ -2420,7 +2490,7 @@ function App() {
               inputReady[tid] = false;
             }
           }
-          return reply(true, { statuses, inputReady, lastNotReady, awaiting, sessions, startupFailed, startupError });
+          return reply(true, { statuses, inputReady, lastNotReady, awaiting, sessions, startupFailed, startupError, manualActionRequired, manualActionType });
         }
         if (action === 'getClaudeTabStatus') {
           const { tabId } = payload || {};
@@ -2432,6 +2502,8 @@ function App() {
           let lastNotReady: any = null;
           let startupFailed = false;
           let startupError: string | null = null;
+          let manualActionRequired = false;
+          let manualActionType: string | null = null;
           let effectiveSessionId = sessionId;
           let effectiveCodexSessionId = tab.codexSessionId || null;
           if (runtime) {
@@ -2442,6 +2514,8 @@ function App() {
               lastNotReady = (p as any)?.lastNotReady || null;
               startupFailed = (p as any)?.startupFailed === true;
               startupError = (p as any)?.startupError || null;
+              manualActionRequired = (p as any)?.manualActionRequired === true;
+              manualActionType = (p as any)?.manualActionType || null;
             } catch { status = 'inactive'; }
           }
           if (toolType === 'codex') {
@@ -2463,6 +2537,8 @@ function App() {
             lastNotReady,
             startupFailed,
             startupError,
+            manualActionRequired,
+            manualActionType,
             toolType,
             commandType: tab.commandType || null,
             sessionId: effectiveSessionId,

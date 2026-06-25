@@ -17,6 +17,7 @@
 | *— flex spacer —* |  | Дальнейшие кнопки прижаты к правому краю. |
 | External run settings | `Settings` (lucide) | Появляется только на активной Inbox-вкладке, созданной внешним Codex run. Управляет видимостью бейджа, auto-stop процесса и auto-close вкладки. |
 | Docs | `BookOpen` (lucide) | Popover с `ActionsPanel embedded` (Update Docs / Update API → Haiku pipeline). Раньше жил в InfoPanel-сайдбаре `КОМАНДЫ`-блоком — после удаления правой колонки переехал сюда. |
+| Git | `GitBranch` (lucide) | Появляется только в Git-репозитории, показывает `branch + changed count`; клик открывает project-level панель commit/history/branches/push. Детали: [`fact-git-коммиты.md`](fact-git-коммиты.md). |
 | Copy session + chips | `Copy` + 9-chip row | `CopySessionButton` + ряд чипов выбора секций (👤/✦/answer/thinking/read/edit/bash/mcp/⑂fork/sub-pill) в **две** строки чтобы не растягивать toolbar по высоте. Рендерится ТОЛЬКО когда у активной вкладки есть Claude/Gemini-сессия — toolbar collapses gracefully на Home / browser-табах. |
 
 **Pair-aligned popover'ы.** Оба popover'а (Docs и Copy-session) открываются downward-right-aligned относительно триггера: `top: bRect.bottom + 6, right: window.innerWidth - bRect.right`. Это сохраняет одну нижнюю горизонталь между двумя popover'ами, и убирает зависимость от viewport-left-edge (раньше Copy popover открывался центр-влево от триггера — на правом краю окна он мог вылетать за viewport). Статичное правило, а не runtime-расчёт «куда умещается»: проще для предсказуемого muscle memory, минус один источник позиционных багов.
@@ -61,57 +62,39 @@ Stop процесса и close вкладки — разные оси. Stop за
 
 Lifecycle:
 - App.tsx подписан на `useWorkspaceStore` + `useProjectsStore` (Zustand subscribe, не useEffect — иначе теряется реактивность на mid-cycle add/remove). При появлении нового projectId в `openProjects` keys → IPC `semantic-index:watch`. При исчезновении → `semantic-index:unwatch`.
-- В main `startWatching` рекурсивно walk'ает `docs/` (исключая `tmp/`, `.dot-папки`) и навешивает `fs.watch` на каждую директорию + ещё один на корень проекта (ловит ре-запись `.semantic-index.json` атомарным `>` из build-index.sh).
+- В main `startWatching` рекурсивно walk'ает `docs/` (исключая `tmp/`, `.dot-папки`) и навешивает `fs.watch` на каждую директорию + ещё один на корень проекта (ловит ре-запись `.semantic-index.json` после MCP `docs_reindex`).
 - Debounce 300ms перед recompute (избегает 90 пересчётов когда индексатор переписывает индекс одним write).
 - При quit'е процесса — `process.on('exit', cleanupAll)` снимает все watcher'ы.
 
 **Trade-off:** одновременно 5 проектов = 5 × N директорий watcher'ов. У `fs.watch` на macOS лимит FSEvents практически бесконечный (тысячи), для 5-10 проектов с 3-5 поддиректориями каждая — это десятки, не сотни.
 
-## Rebuild validation
+## Rebuild via MCP
 
-`build-index.sh` всегда экзитит **0**, даже если внутри половина файлов упали (haiku 429, malformed JSON, timeout). Поэтому success-валидация в `semantic-index-status.js::rebuildIndex` собирает 6 сигналов:
+SemanticIndexButton не запускает repo-local shell script. Клик идёт так:
 
 ```
-success = code===0
-       && !signal
-       && sawSummary
-       && summaryErrors===0
-       && summaryWarnings===0
-       && perFileBad===0
+SemanticIndexButton
+  → ipcRenderer.invoke('semantic-index:rebuild', { projectId, parallelism })
+  → semantic-index-status.js::rebuildIndex()
+  → node ~/.claude/mcp/knowledge-server.mjs
+  → MCP tools/call docs_reindex({ projectPath, parallel, provider: 'codex' })
 ```
 
-Где:
-- `sawSummary` — поймали строку `Files indexed: X/Y (cached: ..., err: N)`. Если её нет — скрипт прервался посреди процесса (типичная причина: `CLAUDE.md.bak уже существует` early exit).
-- `summaryErrors` — `err:` поле в summary.
-- `summaryWarnings` — `warn:` поле (это «wrapped» — Claude отдал не-JSON, файл записан с пустыми `implicit:[]`, де-факто бесполезен для роутера).
-- `perFileBad` — счётчик `error|missing|wrapped` событий из stdout (дублирует summary, страховка от случая, когда summary врёт о собственных полях).
+Source of truth для индексации — knowledge MCP. Repo-local shell-индексатор удалён из проектов, чтобы не было второго индексатора с отдельными лимитами/моделями. MCP `docs_reindex` по умолчанию использует `codex exec` (`gpt-5.4-mini`, effort `low`) и при включённых kill-switch'ах коэрсит Gemini/Claude provider/model в Codex.
 
-См. `methodology/переносимый-дизайн.md::Success ≠ exit code: валидация по содержимому, не по факту завершения`.
+`semantic-index-status.js` сам является маленьким MCP JSON-RPC клиентом: спавнит `knowledge-server.mjs`, отправляет `initialize`, затем `tools/call docs_reindex`, парсит text-result как JSON и уже из `success/error/summary/failures` строит toast. Старый контракт stdout-regex'ов больше не используется.
 
-**Pre-flight гарда:** перед spawn'ом проверяем `CLAUDE.md.bak` в корне. Если существует — отказываемся стартовать с тостом «delete it before rebuilding (previous run crashed)». Без этой проверки скрипт сам бы вышел с `exit 1` (там есть свой check), но в UI это бы выглядело как «короткий лоадер → красный тост `exit code 1`» без понятной причины — пользователь не должен открывать лог чтобы выяснить почему.
+**PATH augmentation для production spawn:** production `.app` запускается launchd'ом с минимальным PATH `/usr/bin:/bin:/usr/sbin:/sbin` — без Homebrew (`/opt/homebrew/bin`, `/usr/local/bin`) и user-local (`~/.local/bin`, `~/.codex/bin`). MCP path добавляет эти директории перед оригинальным PATH, чтобы найти `node` и `codex`.
 
-**PATH augmentation для production spawn:** production `.app` запускается launchd'ом с минимальным PATH `/usr/bin:/bin:/usr/sbin:/sbin` — без Homebrew (`/opt/homebrew/bin`, `/usr/local/bin`), без user-local (`~/.local/bin`, `~/.claude/local/bin`). `build-index.sh` делает `command -v claude` / `command -v jq` → not found → `echo -e ${RED}ERROR${NC}` + exit 1. В dev все эти пути есть (process унаследован от shell юзера) — баг невидим до выкатки. В production.log за месяц нашли 8+ failure'ов с пустым stderr и `reasons=[exit code 1]` без указания причины. Лечение — `env: { ...process.env, PATH: [...extraPaths, process.env.PATH].join(':') }` перед `spawn()`, extraPaths кладутся **впереди** оригинального, иначе stub'ы из `/usr/bin` могут победить (`/usr/bin/node` без правильных tool versions). Список нужных путей — `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.claude/local/bin`. Принцип переносим — см. `methodology/переносимый-дизайн.md::Production Electron на macOS наследует launchd PATH`.
-
-**STDOUT-буфер для ошибок без stderr:** `build-index.sh` пишет ошибки через `echo -e ${RED}ERROR: claude CLI not found${NC}` на **STDOUT**, не stderr. `echo` без `>&2` идёт в stdout по умолчанию. Если main парсит только stdout по regex'ам для прогресса и буферит **только stderr** для финального отчёта — ошибки пропадают: regex'ы их не матчат, stderr пустой, юзер видит `exit code 1` без причины. Лечение — `stdoutTail = (stdoutTail + chunk).slice(-2000)` параллельно с stderrTail, при non-zero exit включать обе строки в combined error toast (`ANSI strip → split('\n') → filter empty → slice(-3) → join(' · ')`). Принцип «success ≠ exit code» в `methodology/переносимый-дизайн.md::Success ≠ exit code` дополняется наблюдением «ERROR на STDOUT — не из злого умысла, `echo` по дефолту туда».
+**Failure semantics:** success берётся из результата `docs_reindex`, не из exit code MCP process. Если MCP вернул `success:false`, renderer получает красный toast с `result.error`; `.semantic-index.json` не должен перезаписываться частичным/битым индексом.
 
 **Parallelism wiring (Settings → Системные → Параллельные воркеры):**
 
 - `useUIStore.semanticIndexParallelism` (localStorage-only, 1..20, default 10).
 - При клике на SemanticIndexButton renderer передаёт значение в `semantic-index:rebuild` IPC.
-- `rebuildIndex(projectId, mw, { parallelism })` в main clamp'ит к [1, 20], сохраняет в `state.rebuildParallelism` и спавнит `bash scripts/ai/build-index.sh --parallel <N>`.
+- `rebuildIndex(projectId, mw, { parallelism })` в main clamp'ит к [1, 20], сохраняет в `state.rebuildParallelism` и передаёт `parallel` в MCP `docs_reindex`.
 - `rebuild-started` IPC payload включает `parallelism` — renderer показывает фиолетовый чип сразу, без ожидания `get-status`.
 - `get-status` возвращает `rebuildParallelism` — переключение проекта mid-rebuild не теряет чип.
 - Не доверяем raw значению из renderer (вдруг кто-то bypass'ит UI) — clamp на main-стороне обязателен.
-
-## stdout-маркеры скрипта
-
-Прогресс парсится из stdout по 4 regex-ам — это публичный контракт между `build-index.sh` и main. Менять формат строк нельзя без синхронной правки regex-ов:
-
-| stdout-строка | Используется для |
-|---|---|
-| `Found <N> files to index[...]` | Установить `total` (общий объём). |
-| `[launched <i>/<N>] <relpath>` | `outdatedTotal++`, добавить файл в `launchedFiles` Set. |
-| `<kind> <relpath> [<time>]` где kind ∈ {`ok`,`cached`,`wrapped`,`error`,`missing`} | Если kind ≠ `cached` И файл был в launchedFiles → `outdatedCompleted++`. |
-| `Files indexed: <X>/<Y> (cached: <C>, skip: <S>, warn: <W>, err: <E>)` | `sawSummary=true`, `summaryWarnings=W`, `summaryErrors=E`. |
 
 ANSI escape codes (`\x1b[0;32m` и т.п.) стрипаются регексом перед матчингом.

@@ -18,6 +18,8 @@
 
 **Критично:** bridge нужен ТОЛЬКО для actions, требующих store. Чисто-серверные operations (timeline parse через `parseTimelineEntries`, projects list из SQLite через `projectManager.db.getAllProjects()`) идут напрямую без bridge — это и быстрее, и работает даже если renderer mounted с задержкой.
 
+Transcript operations теперь отдельный pure-server слой: Timeline/History snapshots и Codex mobile messages идут через `SessionTranscriptService`, а не через renderer bridge и не через per-client polling. Bridge остаётся для tab/store actions; durable transcript read/invalidation принадлежит main process, потому что тем же данным пользуются desktop Timeline, Cmd+\ HistoryPanel, Project Terminal API и native iOS. См. `fact-transcript-сервис.md`.
+
 Слой terminal primitives остаётся ниже API: нажать клавишу, вставить текст, остановить процесс, прочитать TUI draft/JSONL. Project API (`/api/terminal-tabs/:tabId/*`), History/iOS и Inbox API не должны заново собирать send-during-streaming, stopped-session rewind или draft-conflict из этих примитивов; web-server вызывает scenario-action, а тот уже доказывает readiness, решает ownership draft и ждёт durable terminal signal. Это защищает будущий iOS/History переход: при смене парсинга xterm/PTY или момента JSONL-audit внешний контракт меняется только если меняются сами статусы/поля API, а не из-за внутренней механики отправки.
 
 ## Synthetic user-message broadcast
@@ -171,7 +173,9 @@ renderer-order; закрытые остаются архивом по freshness.
 этот массив остаётся runtime-агрегатом активных проектов, а source of truth порядка —
 свежий `/api/projects` через renderer bridge `getOpenProjectIds`.
 
-Создание новых PTY-агентов для native идёт через `/api/projects/:id/agent-tabs {toolType:'claude'|'codex'}`. Этот route намеренно делегирует в renderer `createAgentTab`, чтобы Claude и Codex стартовали тем же `pendingAction` path, что desktop. Не заводить на iOS отдельный launch-path, который сам пишет command в PTY: он обойдёт desktop guards, model/effort defaults и session detection.
+Создание новых PTY-агентов для native идёт через `/api/projects/:id/agent-tabs {toolType:'claude'|'codex'}`. Этот route намеренно делегирует в renderer `createAgentTab`, но для native/API передаёт `startNow:true`: внешний клиент может никогда не смонтировать desktop `Terminal.tsx`, поэтому один `pendingAction` не запустит CLI и первый `/send` увидит `inactive/no session id`. Не заводить на iOS отдельный launch-path, который сам пишет command в PTY: запуск должен идти через общий renderer/main route, где применяются desktop guards, model/effort defaults, `starting` snapshot и session detection.
+
+`startNow:true` означает не "tab row создан", а "PTY создан и agent launch принят". Если `terminal:create` не может открыть рабочую папку (например, проект всё ещё указывает на удалённый `/Users/fedor/Desktop/cli-tools`), route обязан вернуть structured failure (`409 working_directory_missing`) и не оставлять новый tab как будто он живой. Старый симптом: iOS открывал fresh Codex tab, видел `inactive/no session`, показывал обычный composer, первый send создавал optimistic user-row, а сервер переводил вкладку в fake `starting` без процесса. Для native fresh-agent composer разрешается только после runtime `active/inputReady`; до этого это экран запуска, а не готовый чат.
 
 `GET /api/projects/:id/tabs` для native — это уже нормализованный layout snapshot, а не
 сырой список процессов: вместе с tabs приходят `groups`, `statuses`, `statusMarker`,
@@ -216,6 +220,37 @@ rows в transcript остаются стабильной высоты и отк�
 restore после self-sizing settle. Timeline в этом режиме префетчится при входе в чат; jump к
 старой точке может загрузить around-target slice, закрыть drawer, проскроллить table к anchor и
 коротко подсветить target row. Шрам и canary-логи: [`fix-ios-скролл-фриз.md`](fix-ios-скролл-фриз.md).
+
+## Native iOS validation via Simulator/WDA
+
+Simulator/WDA smoke не должен тестировать «красоту SwiftUI» отдельно от Project Terminal API:
+ценность проверки в том, что один сценарий проходит через native gesture, REST/SSE contract,
+runtime status и durable transcript. Рабочий baseline 2026-06-24: WDA создал Codex tab через
+`/api/projects/:id/agent-tabs`, дождался `starting → active`, отправил первый prompt, увидел
+`busy` в header и `In progress` loader, затем проверил completion через visible answer и
+overseer/rollout. Для rollout-дедупа считать только conversation messages
+(`response_item.payload.type === "message"` с role `user|assistant`); Codex `event_msg.user_message`
+дублирует prompt как служебный event и не является второй строкой visible history.
+
+Pull-to-refresh на native projects/tabs доказывается не одним screenshots. Минимальная цепочка:
+`begin-drag` → `pull threshold armed=true` → `refresh begin`/`refresh pin` →
+`GET /api/projects` или `/api/projects/:id/tabs` со статусом 200 →
+`TerminalProjectSSE rest snapshot reason=pull-*` → `refresh end before` →
+`refresh end next`. После `end-refresh` UIKit может ещё логировать `armed=true` и затем
+`end-drag shouldRefresh=false` из-за deceleration/adjusted inset; это не второй refresh и не
+ошибка само по себе, пока есть единственный `refresh begin` и корректный `refresh end`.
+
+Foreground catch-up проверяется только пока turn ещё реально busy. Короткий prompt успевает
+завершиться в фоне и не доказывает loader recovery. Надёжный smoke: отправить Codex prompt,
+который выполняет `sleep 20`, увести Simulator в Settings на несколько секунд и вернуть
+`com.habittracker.swift`. Сразу после foreground native должен показать `busy`, loader/Stop и
+disabled model/effort controls; логи должны содержать `history load done reason=foreground-scene-active`
+и `foreground catch-up done ... status=busy`, а после `task_complete` — `status=active`.
+
+Если тесту нужны свежие native logs, сначала пробуй in-app `Copy Terminal and AI Chat log`.
+Файлы `~/Library/Logs/voice-record/ios-chat.log` и repo-local `logs/ios-chat-latest.log` могут
+быть устаревшими относительно текущего Simulator buffer; stale tail нельзя использовать как
+отрицательное доказательство отсутствия `TerminalScroll`/`TerminalSSE` событий.
 
 ## Self-healing busy reconciliation (loader никогда не залипает навсегда)
 
@@ -280,7 +315,7 @@ POST /api/app-settings                         → mutate app-level settings (`s
 POST /api/log/client                           → mobile diagnostic logs → console.log → dev.log
 GET  /api/events?token=&tabId=                 → SSE (text/event-stream) — ОСНОВНОЙ live-канал. snapshot/message/busy/done/bridge-update/queue-update/ask-question/question-cancelled. Не блокируется anti-tracker'ами как ws://. См. секцию «SSE transport».
 WS   /ws?token=&tabId=                          → тот же набор events. Legacy-канал для permissive-браузеров; на Yandex/Chrome с Protect не работает (ws:// к private-IP режется молча).
-POST /api/projects/:id/claude-tabs              → создать PTY+Claude таб (Terminal.tsx сам spawn'ит Claude по pendingAction)
+POST /api/projects/:id/claude-tabs              → legacy alias на native-safe `/agent-tabs` для Claude; тоже стартует CLI без ожидания mounted Terminal
 POST /api/inbox/agent-tabs                      → создать PTY+Claude/Codex таб в system Inbox; body {toolType}
 POST /api/projects/:id/agent-tabs               → создать PTY+Claude/Codex таб; body {toolType:'claude'|'codex'}
 POST /api/projects/:id/tab-groups               → create group row через renderer bridge
@@ -587,6 +622,8 @@ poll восстановит. Иначе мигающий «Failed» поверх
 - `webBroadcast(tabId, payload)` фанит на оба транспорта одинаково — main.js не знает какой транспорт у клиента. **WS-эндпоинт оставлен** для permissive-браузеров (десктоп, Safari) — оба регистрируются в один реестр.
 - SSE-route: `Content-Type: text/event-stream`, `X-Accel-Buffering: no` (отрубить прокси-буфер), `retry: 2000` (EventSource auto-reconnect), heartbeat-комментарий `: hb\n\n` каждые 25s (держит сокет тёплым за радиомодемами), `req.on('close')` → `unsubscribeAll(sink) + releaseClaudeWatchersIfOrphan()`.
 - **gzip не трогает SSE** — `sendJson` (где gzip) не вызывается, route пишет `res.write` напрямую. Глобального gzip-middleware в `createServer` нет.
+
+При subscribe на tab transcript web-server также регистрирует consumer в `SessionTranscriptService` и освобождает его, когда у tab больше нет WS/SSE subscribers. Сервис шлёт `transcript-changed` как invalidation; для Codex live `message` отсюда не фанится. Единственный live-владелец Codex rows — CodexTurn watcher в `main.js`, а Transcript Service остаётся snapshot/invalidation layer. Шрам 2026-06-21: когда оба слоя слали `message`, native iOS показывал отправленный с desktop prompt дважды; второй event имел другой uuid и часто `session=nil blocks=0 textLen=0`, потому что пришёл из другой нормализации. Claude PTY live tail watcher из `fact-mobile-claude-pty.md` пока остаётся отдельным каналом live-message; общий сервис не должен ломать его guards по `entry.inflight/leftover`.
 
 Клиент: `EventSource` имеет **встроенный** auto-reconnect — рукодельный backoff/watchdog/visibilitychange (которые были у WS) удалены, браузер сам реконнектит. `esRef`, `eventsUrl()` в `api.ts`. Парсинг сообщений тот же (общий JSON-envelope).
 

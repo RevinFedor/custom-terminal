@@ -10,6 +10,7 @@ interface Toast {
   copyText?: string;
   actionLabel?: string;
   onAction?: () => void;
+  actionIcon?: 'github-desktop';
   // When set, toast is only rendered while this tab is the effective active tab.
   // Used for tab-scoped notifications (e.g. "history chain recovered" in Timeline).
   tabId?: string;
@@ -414,7 +415,7 @@ interface UIStore {
 
   toasts: Toast[];
 
-  showToast: (message: string, type?: Toast['type'], duration?: number, persistent?: boolean, copyText?: string, actionLabel?: string, onAction?: () => void, tabId?: string) => void;
+  showToast: (message: string, type?: Toast['type'], duration?: number, persistent?: boolean, copyText?: string, actionLabel?: string, onAction?: () => void, tabId?: string, actionIcon?: Toast['actionIcon']) => void;
 
   removeToast: (id: string) => void;
 
@@ -666,9 +667,8 @@ interface UIStore {
   postCheckPrompt: string;
   setPostCheckPrompt: (text: string) => void;
 
-  // Параллелизм семантической индексации — сколько параллельных claude/Haiku воркеров
-  // запускает scripts/ai/build-index.sh. Default 10 (совпадает с дефолтом в скрипте).
-  // Диапазон 1-20 — выше Anthropic начнёт жёстко 429-ить.
+  // Параллелизм семантической индексации — сколько Codex worker'ов запускает
+  // MCP docs_reindex. Default 10, диапазон 1-20.
   semanticIndexParallelism: number;
   setSemanticIndexParallelism: (n: number) => void;
 
@@ -2055,10 +2055,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
   // Toast Notifications
   toasts: [],
-  showToast: (message, type = 'success', duration = 2500, persistent = false, copyText, actionLabel, onAction, tabId) => {
+  showToast: (message, type = 'success', duration = 2500, persistent = false, copyText, actionLabel, onAction, tabId, actionIcon) => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     set((state) => ({
-      toasts: [...state.toasts, { id, message, type, persistent, copyText, actionLabel, onAction, tabId }]
+      toasts: [...state.toasts, { id, message, type, persistent, copyText, actionLabel, onAction, tabId, actionIcon }]
     }));
 
     if (!persistent) {
@@ -2702,7 +2702,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
     localStorage.setItem('noted-terminal-post-check-prompt', text);
   },
 
-  // Параллелизм семантической индексации (build-index.sh --parallel N).
+  // Параллелизм семантической индексации (MCP docs_reindex parallel=N).
   // localStorage-only — никакого SQLite-зеркала, настройка хост-локальна и легковесна.
   semanticIndexParallelism: (() => {
     try {

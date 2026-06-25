@@ -138,6 +138,34 @@ const ExternalRunBadge = memo(({ meta }: { meta: ExternalRunMeta }) => {
   );
 });
 
+const RestoredTerminalError = memo(({ tabId, ownerProjectId, cwd, error }: { tabId: string; ownerProjectId: string; cwd: string; error: any }) => {
+  const visible = useWorkspaceStore((s) => {
+    const ws = s.openProjects.get(ownerProjectId);
+    return s.activeProjectId === ownerProjectId && ws?.activeTabId === tabId && ws?.currentView === 'terminal';
+  });
+  const isMissingCwd = error?.type === 'working_directory_missing';
+  return (
+    <div className={`absolute inset-0 ${visible ? 'flex' : 'hidden'} items-center justify-center bg-[#111113] text-[#d4d4d4]`}>
+      <div className="max-w-[720px] rounded-lg border border-red-500/30 bg-red-950/20 px-6 py-5 shadow-2xl">
+        <div className="text-sm font-semibold uppercase tracking-wide text-red-300">
+          Cannot restore terminal
+        </div>
+        <div className="mt-3 text-[15px] leading-6 text-[#e5e7eb]">
+          {isMissingCwd
+            ? 'The saved working directory no longer exists.'
+            : 'The saved terminal failed before PTY creation.'}
+        </div>
+        <div className="mt-3 break-all rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-sm text-[#fca5a5]">
+          {error?.cwd || cwd || 'unknown cwd'}
+        </div>
+        <div className="mt-3 text-sm text-[#a1a1aa]">
+          Close this tab or recreate it in an existing folder. Other tabs and projects can still restore.
+        </div>
+      </div>
+    </div>
+  );
+});
+
 const SessionStartingOverlay = memo(({ state, onDismiss }: { state: SessionStartingState; onDismiss: () => void }) => {
   const ref = useRef<HTMLDivElement>(null);
   const flashTimerRef = useRef<number | null>(null);
@@ -580,7 +608,10 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       } else {
         dismissedStartingKeysRef.current.delete(startingDismissKey(info));
         setSessionStarting((prev) => {
-          if (prev?.tabId === info.tabId && (prev.startupFailed || prev.startupPending || prev.holdUntilReady)) return prev;
+          const keepHoldingForCommandStartRace = prev?.holdUntilReady
+            && presence.status === 'inactive'
+            && !presence.manualActionRequired;
+          if (prev?.tabId === info.tabId && (prev.startupFailed || prev.startupPending || keepHoldingForCommandStartRace)) return prev;
           if (prev?.tabId === info.tabId) {
             console.warn('[SessionStartingOverlay] hide tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason + ' status=' + presence.status);
           }
@@ -622,14 +653,12 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     };
     const hideFromEvent = (tabId: string, reason: string, force = false) => {
       const info = activeAgentStartingInfoRef.current;
-      if (!info || info.tabId !== tabId) return;
+      if (info?.tabId === tabId) dismissedStartingKeysRef.current.delete(startingDismissKey(info));
       setSessionStarting((prev) => {
+        if (prev?.tabId !== tabId) return prev;
         if (!force && prev?.tabId === tabId && (prev.startupFailed || prev.startupPending || prev.holdUntilReady)) return prev;
-        if (prev?.tabId === tabId) {
-          console.warn('[SessionStartingOverlay] event-hide tab=' + tabId.slice(-12) + ' reason=' + reason);
-          return null;
-        }
-        return prev;
+        console.warn('[SessionStartingOverlay] event-hide tab=' + tabId.slice(-12) + ' reason=' + reason + ' engine=' + prev.engine);
+        return null;
       });
     };
     const onCommandStarted = (_: any, data: { tabId: string; commandType?: string | null }) => {
@@ -865,7 +894,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
         : '';
       parts.push(`${projId}${subAgentPart}`);
       workspace.tabs.forEach((tab) => {
-        parts.push(`${tab.id}:${tab.tabType || 'terminal'}`);
+        parts.push(`${tab.id}:${tab.tabType || 'terminal'}:${(tab as any).restoreError ? 'restore-error' : 'ok'}`);
       });
     });
     return parts.join(',');
@@ -909,6 +938,17 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
           // Linked file tabs render through the global FilePreview overlay in Workspace.
           // They are real tabs for grouping/DnD/status, but they have no PTY layer.
           return;
+        } else if ((tab as any).restoreError) {
+          totalCount++;
+          result.push(
+            <RestoredTerminalError
+              key={tab.id}
+              tabId={tab.id}
+              ownerProjectId={projId}
+              cwd={tab.cwd}
+              error={(tab as any).restoreError}
+            />
+          );
         } else {
           totalCount++;
           result.push(

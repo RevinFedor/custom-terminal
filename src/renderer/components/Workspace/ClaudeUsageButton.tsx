@@ -182,6 +182,11 @@ interface CodexUsageResponse {
   data?: CodexUsageData | null;
   accounts?: CodexUsageAccount[];
   selectedAccountKey?: string | null;
+  source?: string | null;
+  refreshing?: boolean;
+  stale?: boolean;
+  cacheAgeMs?: number | null;
+  lastAttemptAt?: number | null;
 }
 
 const CODEX_USAGE_ACCOUNT_STORAGE_KEY = 'noted.codexUsage.accountKey';
@@ -1661,23 +1666,38 @@ function CodexUsageChip() {
   const [selectedAccountKey, setSelectedAccountKey] = useState<string | null>(() => loadStoredCodexUsageAccountKey());
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [backgroundRefreshing, setBackgroundRefreshing] = useState(false);
   const [activity, setActivity] = useState<ActivityResponse | null>(null);
   const [activityLoading, setActivityLoading] = useState(false);
   const [activityExpanded, setActivityExpanded] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const refreshRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshSeqRef = useRef(0);
 
   const refresh = useCallback(async (force = false) => {
+    const seq = ++refreshSeqRef.current;
     setLoading(true);
     try {
       const res: CodexUsageResponse = await ipcRenderer.invoke('codex:get-usage', {
         accountKey: selectedAccountKey,
         force,
       });
+      if (seq !== refreshSeqRef.current) return;
       if (res?.success) {
         const nextAccounts = Array.isArray(res.accounts) ? res.accounts : [];
-        setAccounts(nextAccounts);
-        setData(res.data || null);
-        setError(null);
+        const isRefreshing = !!res.refreshing;
+        setBackgroundRefreshing(isRefreshing);
+        if (nextAccounts.length > 0 || !isRefreshing) {
+          setAccounts(nextAccounts);
+        }
+        if (res.data || !isRefreshing) {
+          setData(res.data || null);
+        }
+        if (res.error && !res.data && nextAccounts.length === 0) {
+          setError(res.error);
+        } else {
+          setError(null);
+        }
         const nextKey = res.selectedAccountKey || nextAccounts[0]?.accountKey || null;
         if (nextAccounts.length > 0 && nextKey !== selectedAccountKey) {
           setSelectedAccountKey(nextKey);
@@ -1688,19 +1708,44 @@ function CodexUsageChip() {
         const weeklyPct = usage?.seven_day?.utilization ?? usage?.secondary?.utilization ?? null;
         const fiveHourPct = usage?.five_hour?.utilization ?? usage?.primary?.utilization ?? null;
         console.log(
-          `[CodexUsage] refresh ok account=${selected?.label || 'latest'} accounts=${nextAccounts.length} weekly=${weeklyPct ?? 'null'} fiveHour=${fiveHourPct ?? 'null'} force=${force}`
+          `[CodexUsage] refresh ok source=${res.source || 'unknown'} account=${selected?.label || 'latest'} accounts=${nextAccounts.length} weekly=${weeklyPct ?? 'null'} fiveHour=${fiveHourPct ?? 'null'} refreshing=${isRefreshing ? 1 : 0} stale=${res.stale ? 1 : 0} force=${force}`
         );
+        if (!isRefreshing && refreshRetryRef.current) {
+          clearTimeout(refreshRetryRef.current);
+          refreshRetryRef.current = null;
+        }
+        if (isRefreshing && !refreshRetryRef.current) {
+          refreshRetryRef.current = setTimeout(() => {
+            refreshRetryRef.current = null;
+            if (document.visibilityState === 'visible') {
+              refresh(false);
+            }
+          }, 1500);
+        }
       } else {
+        setBackgroundRefreshing(false);
         setError(res?.error || 'Failed to read Codex usage');
         console.warn(`[CodexUsage] refresh failed error=${res?.error || 'unknown'} force=${force}`);
       }
     } catch (e: any) {
+      setBackgroundRefreshing(false);
       setError(e?.message || String(e));
       console.warn(`[CodexUsage] refresh exception error=${e?.message || String(e)} force=${force}`);
     } finally {
-      setLoading(false);
+      if (seq === refreshSeqRef.current) {
+        setLoading(false);
+      }
     }
   }, [selectedAccountKey]);
+
+  useEffect(() => {
+    return () => {
+      if (refreshRetryRef.current) {
+        clearTimeout(refreshRetryRef.current);
+        refreshRetryRef.current = null;
+      }
+    };
+  }, []);
 
   const refreshActivity = useCallback(async () => {
     setActivityLoading(true);
@@ -1806,6 +1851,7 @@ function CodexUsageChip() {
   const fiveHourResetShort = formatResetShort(fiveHour?.resets_at);
   const resetTextColor = '#bbb';
   const accountLabel = selectedAccount?.label || null;
+  const refreshVisualLoading = loading || backgroundRefreshing;
 
   const selectAccount = (account: CodexUsageAccount) => {
     if (!account?.accountKey) return;
@@ -1827,8 +1873,8 @@ function CodexUsageChip() {
         onMouseEnter={() => setTriggerHover(true)}
         onMouseLeave={() => setTriggerHover(false)}
         title={weeklyPct != null
-          ? `Codex${accountLabel ? ` ${accountLabel}` : ''} weekly: ${formatPct(weeklyPct)} • 5-hour: ${formatPct(fiveHourPct)}${resetShort ? ` • weekly resets in ${resetShort}` : ''}${fiveHourResetShort ? ` • 5-hour resets in ${fiveHourResetShort}` : ''}`
-          : (error || 'Codex usage appears after Codex writes a token_count record')}
+          ? `Codex${accountLabel ? ` ${accountLabel}` : ''} weekly: ${formatPct(weeklyPct)} • 5-hour: ${formatPct(fiveHourPct)}${resetShort ? ` • weekly resets in ${resetShort}` : ''}${fiveHourResetShort ? ` • 5-hour resets in ${fiveHourResetShort}` : ''}${backgroundRefreshing ? ' • updating' : ''}`
+          : (backgroundRefreshing ? 'Codex usage is updating' : (error || 'Codex usage appears after Codex writes a token_count record'))}
         style={{
           display: 'inline-flex',
           alignItems: 'center',
@@ -1847,8 +1893,11 @@ function CodexUsageChip() {
           transition: 'background-color 0.12s, color 0.12s, border-color 0.12s',
         }}
       >
-        {loading && !usageData ? (
-          '…'
+        {refreshVisualLoading && !usageData ? (
+          <>
+            <CodexIcon size={15} muted />
+            <span>…</span>
+          </>
         ) : error && !usageData ? (
           <>
             <CodexIcon size={15} muted />
@@ -1987,7 +2036,7 @@ function CodexUsageChip() {
               style={{
                 background: 'transparent',
                 border: 'none',
-                color: loading ? '#555' : '#888',
+                color: loading ? '#555' : (backgroundRefreshing ? '#aaa' : '#888'),
                 cursor: loading ? 'default' : 'pointer',
                 padding: 2,
                 display: 'inline-flex',
@@ -1997,8 +2046,8 @@ function CodexUsageChip() {
               }}
               title="Refresh Codex usage"
             >
-              <RefreshCw size={11} style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />
-              refresh
+              <RefreshCw size={11} style={{ animation: refreshVisualLoading ? 'spin 1s linear infinite' : 'none' }} />
+              {backgroundRefreshing && !loading ? 'updating' : 'refresh'}
             </button>
           </div>
 

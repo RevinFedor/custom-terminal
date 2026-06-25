@@ -43,6 +43,12 @@ if (claudeSpinnerBusy.has(tabId)) {   // ← мгновенно
 
 Второй слой — service slash-команды вроде `/model`/`/effort`: они могут вернуть prompt без content-spinner, поэтому state machine `idle → busy → idle` не сработает сама. Для таких команд caller обязан явно взвести boundary state в `busy` на submit. Это не optimistic success: marker всё равно появляется только когда PTY реально показал prompt glyph (`⏵`/`❯`/`›`/`╰`). Timeout после этого остаётся ошибкой detector'а/готовности, не разрешением продолжать цепочку.
 
+## Дополнение 2026-06-21: direct prompt-boundary, не только xterm marker
+
+Третий слой — источник доказательства для `waitForPromptBoundaryAfter`. Продовый шрам: `/model haiku` применился, `/effort low` был вставлен и Claude визуально вернулся в готовый prompt; main уже залогировал `[BoundaryMarker] ... Injected prompt #19`, но renderer-side wait всё равно дошёл до timeout и показал ошибку resume. Причина не в том, что Claude не был готов, а в том, что completion-gate зависел от того, что hidden OSC 7777 marker пройдёт через xterm parser и зарегистрирует line marker.
+
+Фикс: в момент той же main-side детекции prompt glyph main теперь шлёт прямой `claude:prompt-boundary { tabId, seq }` в renderer. `terminalRegistry` хранит последний seq отдельно от xterm markers и будит waiters по direct event; xterm marker остаётся для Timeline/scroll anchors, но больше не является единственным source of truth для `/effort` gate. Диагностическая пара в логах: `[BoundaryMarker] ... Injected prompt #N` → `[BoundaryMarkerAck] ... seq=N source=renderer-direct`. Если первая строка есть, а ack нет — проблема доставки IPC/listener; если обе есть, boundary wait не должен падать по timeout из-за xterm parser.
+
 ## Дополнительные изменения
 
 ### Text-based Fallback (Timeline.tsx, computePositions)

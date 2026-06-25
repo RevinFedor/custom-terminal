@@ -10,9 +10,13 @@ const CODEX_SESSIONS_DIR = path.join(CODEX_HOME, 'sessions');
 const CODEX_LOGS_DB = path.join(CODEX_HOME, 'logs_2.sqlite');
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const USAGE_ACCOUNTS_CACHE_TTL_MS = 60 * 1000;
+const USAGE_ACCOUNTS_FOREGROUND_BUDGET_MS = 1200;
 
 let modelCache = null;
 let usageAccountsCache = null;
+let usageAccountsRefreshInFlight = null;
+let usageAccountsLastAttemptAt = null;
+let usageAccountsLastError = null;
 const loggedRollbackKeys = new Set();
 const _codexJsonlCache = new Map();
 const _codexJsonlInflight = new Map();
@@ -1813,14 +1817,8 @@ function buildCodexUsageAccount(raw, index) {
   };
 }
 
-async function findLatestCodexUsageAccounts({ force = false } = {}) {
-  const now = Date.now();
-  if (!force && usageAccountsCache && now - usageAccountsCache.ts < USAGE_ACCOUNTS_CACHE_TTL_MS) {
-    return usageAccountsCache.accounts;
-  }
-
+async function scanLatestCodexUsageAccounts() {
   if (!fs.existsSync(CODEX_LOGS_DB)) {
-    usageAccountsCache = { ts: now, accounts: [] };
     return [];
   }
 
@@ -1853,14 +1851,7 @@ async function findLatestCodexUsageAccounts({ force = false } = {}) {
     LIMIT 12000;
   `;
 
-  let rows;
-  try {
-    rows = await runSqliteJson(CODEX_LOGS_DB, sql);
-  } catch (error) {
-    console.warn('[CodexData] usage accounts log scan failed: ' + error.message);
-    usageAccountsCache = { ts: now, accounts: [] };
-    return [];
-  }
+  const rows = await runSqliteJson(CODEX_LOGS_DB, sql);
 
   const byThread = new Map();
   for (const row of Array.isArray(rows) ? rows : []) {
@@ -1931,8 +1922,131 @@ async function findLatestCodexUsageAccounts({ force = false } = {}) {
         ':5hReset=' + (fiveHour?.resets_at || 'null') +
         ':thread=' + (shortCodexId(a.sourceThreadId) || 'none');
     }).join(','));
-  usageAccountsCache = { ts: now, accounts };
   return accounts;
+}
+
+function resolveAfterBudget(promise, budgetMs, timeoutValue) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve(timeoutValue);
+    }, budgetMs);
+
+    promise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(timeoutValue);
+      }
+    );
+  });
+}
+
+function startCodexUsageAccountsRefresh({ force = false, reason = 'refresh' } = {}) {
+  if (usageAccountsRefreshInFlight) {
+    console.log('[CodexData] usage accounts refresh join reason=' + reason);
+    return usageAccountsRefreshInFlight;
+  }
+
+  const startedAt = Date.now();
+  usageAccountsLastAttemptAt = startedAt;
+  console.log('[CodexData] usage accounts refresh start reason=' + reason +
+    ' force=' + (force ? '1' : '0') +
+    ' cache=' + (usageAccountsCache ? 'hit' : 'empty'));
+
+  usageAccountsRefreshInFlight = scanLatestCodexUsageAccounts()
+    .then((accounts) => {
+      usageAccountsCache = { ts: Date.now(), accounts };
+      usageAccountsLastError = null;
+      console.log('[CodexData] usage accounts refresh done count=' + accounts.length +
+        ' durMs=' + (Date.now() - startedAt));
+      return accounts;
+    })
+    .catch((error) => {
+      usageAccountsLastError = error?.message || String(error);
+      if (!usageAccountsCache) {
+        usageAccountsCache = { ts: Date.now(), accounts: [] };
+      }
+      console.warn('[CodexData] usage accounts refresh failed durMs=' + (Date.now() - startedAt) +
+        ' error=' + usageAccountsLastError);
+      return usageAccountsCache.accounts;
+    })
+    .finally(() => {
+      usageAccountsRefreshInFlight = null;
+    });
+
+  return usageAccountsRefreshInFlight;
+}
+
+async function getCodexUsageAccountsFast({ force = false, reason = 'ipc' } = {}) {
+  const now = Date.now();
+  const cache = usageAccountsCache;
+  const cacheAgeMs = cache ? now - cache.ts : null;
+
+  if (!force && cache && cacheAgeMs < USAGE_ACCOUNTS_CACHE_TTL_MS) {
+    return {
+      accounts: cache.accounts,
+      stale: false,
+      refreshing: !!usageAccountsRefreshInFlight,
+      cacheAgeMs,
+      lastAttemptAt: usageAccountsLastAttemptAt,
+      error: usageAccountsLastError,
+    };
+  }
+
+  const refreshPromise = startCodexUsageAccountsRefresh({ force, reason });
+  if (cache) {
+    return {
+      accounts: cache.accounts,
+      stale: true,
+      refreshing: true,
+      cacheAgeMs,
+      lastAttemptAt: usageAccountsLastAttemptAt,
+      error: usageAccountsLastError,
+    };
+  }
+
+  const quickAccounts = await resolveAfterBudget(
+    refreshPromise,
+    USAGE_ACCOUNTS_FOREGROUND_BUDGET_MS,
+    null
+  );
+  if (quickAccounts) {
+    return {
+      accounts: quickAccounts,
+      stale: false,
+      refreshing: false,
+      cacheAgeMs: 0,
+      lastAttemptAt: usageAccountsLastAttemptAt,
+      error: usageAccountsLastError,
+    };
+  }
+
+  return {
+    accounts: [],
+    stale: false,
+    refreshing: true,
+    cacheAgeMs: null,
+    lastAttemptAt: usageAccountsLastAttemptAt,
+    error: usageAccountsLastError,
+  };
+}
+
+async function findLatestCodexUsageAccounts({ force = false } = {}) {
+  const result = await getCodexUsageAccountsFast({ force, reason: 'direct' });
+  if (result.refreshing && usageAccountsRefreshInFlight) {
+    return usageAccountsRefreshInFlight;
+  }
+  return result.accounts;
 }
 
 function normalizeCodexModel(raw) {
@@ -2095,7 +2209,11 @@ function register() {
 
   ipcMain.handle('codex:get-usage', async (_event, opts = {}) => {
     try {
-      const accountUsages = await findLatestCodexUsageAccounts({ force: !!opts?.force });
+      const accountResult = await getCodexUsageAccountsFast({
+        force: !!opts?.force,
+        reason: opts?.force ? 'ipc-force' : 'ipc',
+      });
+      const accountUsages = accountResult.accounts || [];
       const selectedAccount = opts?.accountKey
         ? accountUsages.find((account) => account.accountKey === opts.accountKey)
         : null;
@@ -2103,16 +2221,19 @@ function register() {
       let selectedAccountKey = selectedAccount?.accountKey || accountUsages[0]?.accountKey || null;
       let source = usage ? 'account-log' : 'none';
 
-      if (!usage && opts?.sessionId) {
+      if (!usage && !accountResult.refreshing && opts?.sessionId) {
         const loaded = await loadSessionRecords(opts.sessionId, opts.cwd);
         if (loaded.success) {
           usage = latestCodexUsageInRecords(loaded.records, loaded.filePath);
           source = usage ? 'active-session-rollout' : source;
         }
       }
-      if (!usage) {
+      if (!usage && !accountResult.refreshing) {
         usage = await findLatestCodexUsage();
         source = usage ? 'latest-rollout' : source;
+      }
+      if (!usage && accountResult.refreshing) {
+        source = 'account-refreshing';
       }
 
       const weekly = usage?.seven_day?.utilization ?? usage?.secondary?.utilization ?? null;
@@ -2123,13 +2244,23 @@ function register() {
         ' selected=' + accountLabel +
         ' weekly=' + (weekly ?? 'null') +
         ' fiveHour=' + (fiveHour ?? 'null') +
-        ' session=' + (opts?.sessionId ? String(opts.sessionId).slice(0, 8) : 'none'));
+        ' refreshing=' + (accountResult.refreshing ? '1' : '0') +
+        ' stale=' + (accountResult.stale ? '1' : '0') +
+        ' cacheAgeMs=' + (accountResult.cacheAgeMs ?? 'none') +
+        ' session=' + (opts?.sessionId ? String(opts.sessionId).slice(0, 8) : 'none') +
+        ' error=' + (accountResult.error ? compactPreview(accountResult.error, 120) : 'none'));
 
       return {
         success: true,
         data: usage,
         accounts: accountUsages,
         selectedAccountKey,
+        source,
+        refreshing: accountResult.refreshing,
+        stale: accountResult.stale,
+        cacheAgeMs: accountResult.cacheAgeMs,
+        lastAttemptAt: accountResult.lastAttemptAt,
+        error: !usage && accountResult.error ? accountResult.error : null,
       };
     } catch (error) {
       console.error('[CodexData] get-usage error:', error);
@@ -2168,6 +2299,7 @@ module.exports = {
     latestCodexUsageInRecords,
     findLatestCodexUsage,
     findLatestCodexUsageAccounts,
+    getCodexUsageAccountsFast,
     compareCodexRateSnapshotFreshness,
   },
 };

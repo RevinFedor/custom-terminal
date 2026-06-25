@@ -11,6 +11,7 @@ import SemanticIndexButton from './SemanticIndexButton';
 import CopySessionWithChips from './CopySessionWithChips';
 import DocsButton from './DocsButton';
 import ClaudeUsageButton from './ClaudeUsageButton';
+import GitStatusButton from './GitStatusButton';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
 import { isInboxProjectId } from '../../constants/systemProjects';
@@ -58,9 +59,18 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
   const setProjectView = useWorkspaceStore((state) => state.setProjectView);
   const getSidebarState = useWorkspaceStore((state) => state.getSidebarState);
   const setSidebarOpen = useWorkspaceStore((state) => state.setSidebarOpen);
-  const currentProjectPath = useProjectsStore((state) => (
+  const currentProjectMetaPath = useProjectsStore((state) => (
     activeProjectId ? state.projects[activeProjectId]?.path : undefined
   ));
+  const currentProjectName = useProjectsStore((state) => (
+    activeProjectId ? state.projects[activeProjectId]?.name : undefined
+  ));
+  const currentWorkspaceProjectPath = useWorkspaceStore((state) => {
+    const projectId = state.activeProjectId;
+    if (!projectId) return undefined;
+    return state.openProjects.get(projectId)?.projectPath;
+  });
+  const currentProjectPath = currentProjectMetaPath || currentWorkspaceProjectPath;
   const activeExternalRunKey = useWorkspaceStore((state) => {
     const projectId = state.activeProjectId;
     if (!projectId) return '';
@@ -771,9 +781,19 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
       {/* CopySessionButton + chip-row — moved here from InfoPanel. Renders nothing
           when there's no active Claude/Gemini session, so the toolbar collapses
           gracefully on Home / generic tabs. */}
-      <div className="flex items-center pr-3">
+      <div className="flex items-center pr-2">
         <CopySessionWithChips />
       </div>
+
+      {!isSystemProject && currentProjectPath && (
+        <div className="flex items-center pr-3">
+          <GitStatusButton
+            projectId={activeProjectId}
+            projectName={currentProjectName}
+            projectPath={currentProjectPath}
+          />
+        </div>
+      )}
     </div>
   );
 }

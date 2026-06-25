@@ -10,6 +10,7 @@ interface TerminalRegistryStore {
   viewportStates: Map<string, ViewportState>;
   entryMarkers: Map<string, Map<string, TrackedEntry>>;
   promptBoundaries: Map<string, Map<number, IMarker>>;
+  promptBoundaryLatestSeq: Map<string, number>;
   promptBoundaryWaiters: Map<string, Set<(seq: number) => void>>;
   searchCallbacks: Map<string, SearchResultsCallback>;
   viewportCallbacks: Map<string, ViewportCallback>;
@@ -53,12 +54,14 @@ const registryStore = ((globalThis as TerminalRegistryGlobal).__notedTerminalReg
   viewportStates: new Map<string, ViewportState>(),
   entryMarkers: new Map<string, Map<string, TrackedEntry>>(),
   promptBoundaries: new Map<string, Map<number, IMarker>>(),
+  promptBoundaryLatestSeq: new Map<string, number>(),
   promptBoundaryWaiters: new Map<string, Set<(seq: number) => void>>(),
   searchCallbacks: new Map<string, SearchResultsCallback>(),
   viewportCallbacks: new Map<string, ViewportCallback>(),
 });
 registryStore.terminalWaiters ||= new Map<string, Set<(terminal: XTerminal | undefined) => void>>();
 registryStore.promptBoundaryWaiters ||= new Map<string, Set<(seq: number) => void>>();
+registryStore.promptBoundaryLatestSeq ||= new Map<string, number>();
 
 const terminals = registryStore.terminals;
 const terminalWaiters = registryStore.terminalWaiters;
@@ -67,6 +70,7 @@ const searchStates = registryStore.searchStates;
 const viewportStates = registryStore.viewportStates;
 const entryMarkers = registryStore.entryMarkers;
 const promptBoundaries = registryStore.promptBoundaries;
+const promptBoundaryLatestSeq = registryStore.promptBoundaryLatestSeq;
 const promptBoundaryWaiters = registryStore.promptBoundaryWaiters;
 const searchCallbacks = registryStore.searchCallbacks;
 const viewportCallbacks = registryStore.viewportCallbacks;
@@ -934,8 +938,19 @@ export const terminalRegistry = {
   // === Prompt Boundary API (OSC 7777 markers from main.js) ===
 
   // Register a prompt boundary marker at the current cursor position.
-  // Called from OSC 7777 handler when main.js injects prompt:<seq> into PTY stream.
+  // Called from the direct main-process event and, separately, from OSC 7777
+  // when xterm registers a line marker for timeline navigation.
   registerPromptBoundary(tabId: string, seq: number): void {
+    if (!tabId || !Number.isFinite(seq)) return;
+    const previousLatest = promptBoundaryLatestSeq.get(tabId) || 0;
+    if (seq > previousLatest) {
+      promptBoundaryLatestSeq.set(tabId, seq);
+      const waiters = promptBoundaryWaiters.get(tabId);
+      if (waiters) {
+        for (const resolve of Array.from(waiters)) resolve(seq);
+      }
+    }
+
     const terminal = terminals.get(tabId);
     if (!terminal) return;
 
@@ -953,17 +968,14 @@ export const terminalRegistry = {
       tabBoundaries.set(seq, marker);
       marker.onDispose(() => tabBoundaries!.delete(seq));
       console.log('[terminalRegistry] Prompt boundary #' + seq + ' at line ' + marker.line);
-      const waiters = promptBoundaryWaiters.get(tabId);
-      if (waiters) {
-        for (const resolve of Array.from(waiters)) resolve(seq);
-      }
     }
   },
 
   getLatestPromptBoundarySeq(tabId: string): number {
+    const latestSeq = promptBoundaryLatestSeq.get(tabId) || 0;
     const tabBoundaries = promptBoundaries.get(tabId);
-    if (!tabBoundaries || tabBoundaries.size === 0) return 0;
-    return Math.max(...Array.from(tabBoundaries.keys()));
+    if (!tabBoundaries || tabBoundaries.size === 0) return latestSeq;
+    return Math.max(latestSeq, ...Array.from(tabBoundaries.keys()));
   },
 
   waitForPromptBoundaryAfter(tabId: string, afterSeq: number, timeoutMs = 6000): Promise<number | null> {

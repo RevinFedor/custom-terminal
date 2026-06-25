@@ -27,9 +27,25 @@ function getRecordUuid(record, sessionId, index) {
   return `codex-record-${sessionId || 'unknown'}-${index == null ? 'unknown' : index}`;
 }
 
+function isCodexUserMessageRecord(record) {
+  return record?.type === 'event_msg' && record?.payload?.type === 'user_message';
+}
+
+function isCodexLiveMessageRecord(record) {
+  if (isCodexUserMessageRecord(record)) return true;
+  if (record?.type !== 'response_item') return false;
+  const payloadType = record?.payload?.type;
+  return payloadType === 'message' ||
+    payloadType === 'reasoning' ||
+    payloadType === 'function_call' ||
+    payloadType === 'custom_tool_call' ||
+    payloadType === 'function_call_output' ||
+    payloadType === 'custom_tool_call_output';
+}
+
 function codexRecordToMobileMessage(record, sessionId) {
   const payload = record?.payload || {};
-  if (record?.type === 'event_msg' && payload.type === 'user_message') {
+  if (isCodexUserMessageRecord(record)) {
     return {
       type: 'user',
       uuid: getRecordUuid(record, sessionId, record.__line),
@@ -366,6 +382,8 @@ class SessionTranscriptService {
     state.leftover = lines.pop() || '';
     let sent = 0;
     let parsed = 0;
+    let skippedLiveUsers = 0;
+    let suppressedLiveMessages = 0;
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
       if (!line) continue;
@@ -377,19 +395,21 @@ class SessionTranscriptService {
       } catch {
         continue;
       }
-      const message = codexRecordToMobileMessage(record, state.sessionId);
-      if (!message) continue;
-      this._webBroadcast(state, {
-        type: 'message',
-        sessionId: state.sessionId,
-        message,
-      });
-      sent += 1;
+      if (isCodexLiveMessageRecord(record)) {
+        // CodexTurn watcher is the only live-message owner for Codex. This
+        // transcript watcher keeps snapshots fresh via transcript-changed; sending
+        // response items here creates a second, differently-normalized stream.
+        if (isCodexUserMessageRecord(record)) skippedLiveUsers += 1;
+        suppressedLiveMessages += 1;
+        continue;
+      }
     }
     console.log('[TranscriptService:CodexDelta] session=' + shortId(state.sessionId) +
       ' bytes=' + (state.size - start) +
       ' parsed=' + parsed +
       ' sent=' + sent +
+      ' skippedLiveUsers=' + skippedLiveUsers +
+      ' suppressedLiveMessages=' + suppressedLiveMessages +
       ' leftover=' + state.leftover.length);
   }
 

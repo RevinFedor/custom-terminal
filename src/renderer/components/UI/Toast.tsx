@@ -1,4 +1,5 @@
 import React from 'react';
+import { Github } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useDictationSnapshot } from '../../utils/dictationManager';
@@ -80,13 +81,29 @@ export default function ToastContainer() {
             {toast.message}
             {toast.actionLabel && (
               <span
-                className="cursor-pointer underline decoration-white/50 hover:decoration-white ml-1"
+                className="cursor-pointer underline decoration-white/50 hover:decoration-white ml-1 inline-flex items-center gap-1 align-middle"
                 onClick={(e) => {
                   e.stopPropagation();
                   if (toast.onAction) toast.onAction();
                   removeToast(toast.id);
                 }}
               >
+                {toast.actionIcon === 'github-desktop' && (
+                  <span
+                    aria-hidden
+                    className="inline-flex items-center justify-center"
+                    style={{
+                      width: 16,
+                      height: 16,
+                      borderRadius: 4,
+                      background: '#6e40c9',
+                      color: '#fff',
+                      verticalAlign: 'middle',
+                    }}
+                  >
+                    <Github size={11} strokeWidth={2.4} />
+                  </span>
+                )}
                 {toast.actionLabel}
               </span>
             )}

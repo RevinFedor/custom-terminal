@@ -76,6 +76,26 @@ Codex не имеет Claude bridge-файла, поэтому для shutdown r
 
 ---
 
+## Runtime Stop без процесса: stale commandRunning (fix 2026-06-21)
+
+Продовый симптом был не похож на shutdown: пользователь вручную остановил Codex, ушёл на другую вкладку, вернулся — поверх уже закрытой сессии снова висел `Resuming Codex`; `Continue` на полсекунды показывал `Stopping`, затем `Resuming`, но в терминале не появлялась команда запуска. Форензика по session `019ed0bc-f921-7330-b14d-e5523916b004` показала разъезд: process-tree lookup давал `matches=0`, а tab status всё ещё нёс `commandRunning=true`. Это не живой Codex и не новый launch — это stale projection общего terminal command state.
+
+Корень: no-process ветка `terminal:stop-ai-process` чистила Codex-specific state (`knownSession`, launch payload, TUI-ready/watchers), но не форсила общий `terminal:command-finished` и не сбрасывала `terminalCommandState`. Дальше `getCommandState` доверял `isRunning=true` раньше дорогого process-tree fallback, поэтому UI/API считали вкладку живой и рисовали `Resuming`. 15-секундный startup guard здесь не обязан был сработать: fresh launch payload уже не существовал, значит это был не startup lifecycle, а stale runtime state.
+
+Фикс именно в teardown, не в новом timeout: manual Stop для AI обязан финализировать terminal command state даже если OS-процесс уже умер или не найден. No-process Codex stop теперь эмитит финальный `command-finished`, инвалидирует process cache, чистит launch payload/session/TUI/watchers и публикует `inactive`. Natural `command-finished` после Codex exit делает тот же cleanup хвоста (`TUI-ready`, cache, inactive snapshot), кроме специального `_gracefulShutdownInProgress` окна из предыдущей секции.
+
+---
+
+## Delayed Codex D после Ctrl+C: stale commandRunning (fix 2026-06-24)
+
+Похожий пользовательский симптом повторился без stop endpoint: пользователь завершил Codex через Ctrl+C, ушёл на другую вкладку и через несколько минут вернулся к session `019ef4ec-0e93-7e70-a35a-ccb3289dc1e6`; overlay `Resuming Codex` появился снова, хотя Start/Continue не нажимали. Логи 24 июня по `...-tab-375` показали: в 17:27:37 MSK два Ctrl+C дали OSC `D` (`exitCode=0`, затем `130`), delayed Codex-cleanup увидел `codex-descendant-alive matches=2` и вернул вкладку в `command-started`; в 17:36/17:41 UI всё ещё читал `commandRunning=true`.
+
+Корень отличался от no-process stop: descendant guard был правильным как временная защита от преждевременного cleanup живого Codex, но после того как эти два процесса исчезли, нового shell `D` уже не могло прийти — shell-level finish уже произошёл. Значит fallback «оставить live пока descendants есть» обязан сам владеть финальным событием, иначе stale running живёт до закрытия вкладки/приложения.
+
+Фикс: ветка `codex-descendant-alive` теперь ставит process-tree recheck. Пока `matches>0`, вкладка остаётся live; первый `matches=0` вызывает тот же финальный cleanup, что normal `command-finished`: сброс command state, cache invalidation, clear launch/session/TUI/watchers, runtime `inactive` и `terminal:command-finished`. Recheck отменяется на новом command-start, force-start, PTY exit и terminal kill, чтобы старый финализатор не погасил новый запуск. Логи следующего расследования: `[CodexExitRecheck] arm/still-alive/finalized/clear/stop`.
+
+---
+
 ## AutoResume startup: global batch-loader был неверной абстракцией (fix 2026-06)
 
 Первый пользовательский симптом был похож на CSS/React-баг: после restart/build-install приложение сразу показывало обычный терминал, global loader `Starting AI sessions...` не был виден, но Codex/Claude сессии фактически ещё стартовали в фоне. Прод-лог выглядел как `[AutoResume] Resuming ...`, затем `settled inactive ... ms=3/55` и почти мгновенный hide loader'а; пользователь видел зависший Resume только пока вручную не переходил на нужный project/tab.
@@ -83,6 +103,16 @@ Codex не имеет Claude bridge-файла, поэтому для shutdown r
 Первая корневая причина действительно была не в CSS loader'а. AutoResume запускал `codex-c`, но Codex-ветка не эмитила `terminal:force-command-started`, а `waitForAutoResumeSettled` считал первый `presence.status='inactive'` завершением batch. Между отправкой `codex:run-command` и первыми runtime-сигналами есть короткое окно, где PTY launch уже инициирован, но presence ещё не успел стать `starting/busy/ready`. Для только что отправленной команды такой `inactive` означает «старт ещё не наблюдали», а не «восстановление завершилось».
 
 Но следующий лог показал более важный архитектурный провал batch-модели: одна скрытая Codex-вкладка `YXY=-tab-337` зависла на `Starting MCP servers (0/3)`, visible buffer был недоступен (`no-terminal`), и весь global loader ждал её до timeout, хотя остальные сессии могли стартовать независимо. Поэтому финальная модель — не «дробить batch мельче», а убрать global blocker: все AutoResume-вкладки запускаются независимо, `terminal:force-command-started` поднимает per-tab `starting`, `/api/projects/:id/tabs` и `project-activity` транслируют этот runtime status наружу, а desktop блокирует клики только локальным overlay поверх конкретного Terminal. `Starting MCP servers ...` чинится в Codex readiness/watchdog layer одним controlled restart через сохранённый launch payload; iOS/History/API не должны строить свои retry или ждать весь workspace.
+
+---
+
+## SessionStartingOverlay на неактивной вкладке: ready-event не должен зависеть от active tab (fix 2026-06-25)
+
+Продовый симптом 25 июня был обратным к stale process-state: Codex уже стал готов, input был доступен, но при возврате на вкладку `...-tab-1423` пользователь всё ещё видел `Resuming Codex` и закрыл overlay вручную. Логи по session `019efacc-3dab-7883-9e3d-5736e26fba46` дали детерминированную цепочку: `event-start` overlay пришёл в 19:10:37 UTC, `CodexTuiReady input ready` и cleanup startup lifecycle пришли в 19:10:40 UTC, но активной в этот момент была другая вкладка (`...-tab-1438`). В логах до ручного close был только `dismissed`, без `event-hide`.
+
+Корень был не в Codex readiness и не в process detection. `SessionStartingOverlay` хранится как renderer state конкретной вкладки, но путь скрытия по `codex:tui-ready`/`command-finished` сначала сверялся с текущей active tab. Если ready-event приходил пока пользователь смотрел другую вкладку, событие игнорировалось, а при возврате stale overlay снова монтировался поверх уже готового терминала. Дополнительная ловушка: polling `refreshSessionStarting` продолжал уважать `holdUntilReady` даже когда presence уже стал `active`/`busy`, поэтому пропущенный event-hide не восстанавливался следующим poll'ом.
+
+Фикс: hide-event чистит `sessionStarting` по `tabId` события, а не по active tab; active-tab ref используется только чтобы снять dismissed-key для той же вкладки. `holdUntilReady` теперь удерживает overlay только в ранней гонке `presence=inactive` сразу после `command-started`; как только presence стал `active`, `busy` или `manualActionRequired`, poll имеет право скрыть/переклассифицировать overlay. При следующем расследовании этого класса искать цепочку `[SessionStartingOverlay] event-start` → `[CodexTuiReady] input ready` → отсутствие `[SessionStartingOverlay] event-hide` при смене activeTab.
 
 ---
 

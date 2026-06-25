@@ -259,11 +259,11 @@ return state.activeProjectId === projId && workspace.activeTabId === tabId;
 ### Регрессия-сигнал
 В каждом Terminal в useEffect ведётся регистрация в модульный `_visibleTerminals: Set<string>`. После каждого изменения rAF-debounce проверяет инвариант "ровно 1 терминал visible":
 ```
-[Terminal:VisibleSetInvariant] count=2 tabs=[...] (VIOLATION — z-index fight, user sees wrong terminal)
+[Terminal:VisibleSetInvariant] count=N expectedTab=... paintedTabs=[...]
 ```
 - `count=1` — норма (логи не пишутся).
-- `count=0` — нормально briefly во время transition.
-- `count>=2` устойчиво ≥1 rAF — регрессия. Селектор сломан.
+- `count=0` briefly допустим только во время transition; устойчиво или на active tab — регрессия, пользователь видит пустой/необновлённый центр.
+- `count>=2` или expected-tab mismatch устойчиво ≥1 rAF — регрессия: виден лишний/не тот terminal layer, часто как старый `Process completed` поверх новой вкладки.
 
 ---
 
@@ -320,7 +320,7 @@ parts.push(`${tab.id}:${tab.tabType || 'terminal'}`);
 |---|---|---|
 | `[Perf:ProjectSwitch] durMs=N` | <50ms | >200ms = что-то синхронно блокирует main thread |
 | `[Perf:TabSwitch] durMs=N` | <50ms | >150ms = TerminalArea пересчитывает useMemo |
-| `[Terminal:VisibleSetInvariant] count=N` | не появляется (count=1 silent) | `count>=2 VIOLATION` = z-index fight (см. секцию 5) |
+| `[Terminal:VisibleSetInvariant] count=N` | не появляется (count=1 silent) | `count!=1` или expected-tab mismatch = виден лишний/не тот terminal layer; см. `fact-terminal-rendering.md::Персистентные слои` |
 | `[TerminalArea:useMemo RECALCULATING]` | редко — add/remove/type | на каждый switch = fingerprint регрессировал |
 | `[Timeline:PollPaused] reason=...` / `[Timeline:PollResumed]` | 1:1 пары при visibility-changes | rогда poll не паузится при свёрнутом окне → 99% IPC впустую |
 | `[DB:ForkCache] stats hit=X miss=Y` | hit:miss ≥ 100:1 | низкий ratio = cache invalidation слишком агрессивная или вызовы с разными sessionId |
@@ -341,7 +341,7 @@ parts.push(`${tab.id}:${tab.tabType || 'terminal'}`);
 ### Команды для быстрой диагностики
 ```bash
 # "Замороженный" терминал?
-grep "Terminal:VisibleSetInvariant" ~/Library/Logs/noted-terminal/production.log | grep VIOLATION | tail -5
+grep "Terminal:VisibleSetInvariant" ~/Library/Logs/noted-terminal/production.log | tail -10
 
 # Тормозит переключение?
 grep -E "Perf:(Project|Tab)Switch" ~/Library/Logs/noted-terminal/production.log | \

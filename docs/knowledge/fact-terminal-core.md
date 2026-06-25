@@ -30,7 +30,7 @@ term.onLineFeed(() => {
   // если подключен соответствующий парсер или аддон.
 });
 ```
-В нашем случае, `ipcRenderer` в Main-процессе перехватывает данные, либо Renderer парсит их и обновляет `tab.cwd` в `useWorkspaceStore`.
+В нашем случае Renderer парсит OSC 7 и обновляет `tab.cwd` в `useWorkspaceStore`, а затем отправляет main-процессу тот же cwd через `terminal:updateCwd`. Main принимает этот IPC только для живого PTY (`terminals.has(tabId)`), поэтому canonical cwd для `terminalProjects` остаётся PTY-owned: его нельзя обновлять из stale bridge-файлов или произвольного persisted state. Эта же копия cwd нужна не только UI/persistence, но и фоновым main-сценариям — CwdGuard сравнивает bridge cwd с `terminalProjects`, а запуск последней shell-команды ищет persisted command по точному cwd.
 
 ## Преимущества
 - **Мгновенность:** Путь обновляется ровно в момент выполнения команды `cd`.

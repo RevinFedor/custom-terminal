@@ -368,7 +368,9 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
       break;
 
     case 'claude-new': {
-      getSetTabCommandType()(tabId, 'claude');
+      const store = useWorkspaceStore.getState();
+      store.setTabCommandType(tabId, 'claude');
+      store.markAiLaunchAutoTitle(tabId, 'claude');
       console.log('[RESTORE] 12. Sending IPC claude:run-command { command: "claude", tabId:', tabId, '}');
       ipcRenderer.send('claude:run-command', { tabId, command: 'claude' });
       break;
@@ -438,7 +440,9 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
       break;
 
     case 'codex-new': {
-      getSetTabCommandType()(tabId, 'codex');
+      const store = useWorkspaceStore.getState();
+      store.setTabCommandType(tabId, 'codex');
+      store.markAiLaunchAutoTitle(tabId, 'codex');
       const codexCwd = getTabCwd(tabId);
       console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex" }');
       ipcRenderer.send('codex:run-command', buildCodexRunPayload({
@@ -502,6 +506,53 @@ function getCurrentCommand(term: XTerminal): string {
 }
 
 const { ipcRenderer, clipboard } = window.require('electron');
+
+let lastVisibleSetInvariantLogAt = 0;
+
+type TerminalLayerSnapshot = {
+  tabId: string;
+  ownerProjectId: string;
+  active: string;
+  visibility: string;
+  opacity: string;
+  zIndex: string;
+  pointerEvents: string;
+  display: string;
+  rect: string;
+};
+
+const collectTerminalLayerSnapshots = (): TerminalLayerSnapshot[] => {
+  return Array.from(document.querySelectorAll<HTMLElement>('[data-terminal-layer-tab-id]')).map((el) => {
+    const cs = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return {
+      tabId: el.dataset.terminalLayerTabId || '',
+      ownerProjectId: el.dataset.terminalLayerOwnerProject || '',
+      active: el.dataset.terminalLayerActive || '',
+      visibility: cs.visibility,
+      opacity: cs.opacity,
+      zIndex: cs.zIndex,
+      pointerEvents: cs.pointerEvents,
+      display: cs.display,
+      rect: `${Math.round(rect.width)}x${Math.round(rect.height)}@${Math.round(rect.left)},${Math.round(rect.top)}`,
+    };
+  });
+};
+
+const isPaintedTerminalLayer = (layer: TerminalLayerSnapshot): boolean => {
+  const opacity = Number.parseFloat(layer.opacity || '1');
+  return layer.display !== 'none'
+    && layer.visibility !== 'hidden'
+    && opacity > 0.01
+    && !layer.rect.startsWith('0x0@');
+};
+
+const rememberDetectedShellCommand = (tabId: string, fullLine: string, claudeAlive: boolean) => {
+  if (claudeAlive) return;
+  const command = fullLine.trim();
+  if (!command) return;
+  ipcRenderer.send('terminal:remember-detected-command', { tabId, command });
+};
 
 const formatCodexImagePasteError = (value: unknown): string => {
   const raw = typeof value === 'string'
@@ -985,6 +1036,32 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
   // Effective active = tab is active AND we're in terminal view AND workspace is visible (not Dashboard)
   // This prevents focus/fit/repaint when terminals are hidden behind Dashboard or ProjectHome
   const effectiveActive = active && projectCurrentView === 'terminal' && workspaceView === 'workspace';
+
+  useEffect(() => {
+    if (!effectiveActive || !isVisible) return;
+
+    const frameId = requestAnimationFrame(() => {
+      const layers = collectTerminalLayerSnapshots();
+      const painted = layers.filter(isPaintedTerminalLayer);
+      const ok = painted.length === 1 && painted[0]?.tabId === tabId;
+      if (ok) return;
+
+      const now = Date.now();
+      if (now - lastVisibleSetInvariantLogAt < 1000) return;
+      lastVisibleSetInvariantLogAt = now;
+
+      console.warn('[Terminal:VisibleSetInvariant] count=' + painted.length
+        + ' expected=' + tabId.slice(-12)
+        + ' VIOLATION '
+        + JSON.stringify({
+          ownerProjectId: ownerProjectId || null,
+          painted,
+          sample: layers.slice(0, 16),
+        }));
+    });
+
+    return () => cancelAnimationFrame(frameId);
+  }, [effectiveActive, isVisible, ownerProjectId, tabId]);
 
   // Keep activeRef in sync for ResizeObserver closure
   useEffect(() => {
@@ -1685,12 +1762,21 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       });
     };
 
+    const handleClaudePromptBoundary = (_: any, data: { tabId: string; seq: number }) => {
+      if (data?.tabId !== tabId) return;
+      const seq = Number(data.seq);
+      console.warn('[Terminal:PromptBoundary] direct tab=' + tabId.slice(-12) + ' seq=' + seq);
+      terminalRegistry.registerPromptBoundary(tabId, seq);
+      ipcRenderer.send('claude:prompt-boundary-ack', { tabId, seq });
+    };
+
     // Register IPC listeners synchronously
     ipcRenderer.on('terminal:data', handleData);
     ipcRenderer.on('terminal:exit', handleExit);
     ipcRenderer.on('claude:session-detected', handleSessionDetected);
     ipcRenderer.on('claude:process-started', handleProcessStarted);
     ipcRenderer.on('claude:tui-ready', handleTuiReady);
+    ipcRenderer.on('claude:prompt-boundary', handleClaudePromptBoundary);
     ipcRenderer.on('claude:status-session-detected', handleStatusSessionDetected);
     ipcRenderer.on('claude:bridge-update', handleBridgeUpdate);
     ipcRenderer.on('gemini:session-detected', handleGeminiSessionDetected);
@@ -1788,6 +1874,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           if (newCwd && newCwd.startsWith('/')) {
             console.log('[Terminal] OSC 7 cwd update:', newCwd);
             getUpdateTabCwd()(tabId, newCwd);
+            ipcRenderer.send('terminal:updateCwd', { tabId, cwd: newCwd });
           }
         } catch (e) {
           console.error('[Terminal] OSC 7 parse error:', e);
@@ -1971,6 +2058,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           const preview = fullLine.length > 80 ? fullLine.slice(0, 80) + '…' : fullLine;
           console.warn('[CmdDetect:initTerminal] tab=' + tabId.slice(-8) + ' match=' + detectedCommandType + ' bufType=' + term.buffer.active.type + ' claudeAlive=' + claudeAliveNow + ' claudeSess=' + (claudeSess ? claudeSess.slice(0, 8) : 'null') + ' fullLine="' + preview.replace(/"/g, '\\"') + '"');
         }
+        rememberDetectedShellCommand(tabId, fullLine, claudeAliveNow);
 
         if (!claudeAliveNow) {
           if (detectedCommandType === 'codex') {
@@ -2321,6 +2409,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
       ipcRenderer.removeListener('claude:process-started', handleProcessStarted);
       ipcRenderer.removeListener('claude:tui-ready', handleTuiReady);
+      ipcRenderer.removeListener('claude:prompt-boundary', handleClaudePromptBoundary);
       ipcRenderer.removeListener('claude:status-session-detected', handleStatusSessionDetected);
       ipcRenderer.removeListener('claude:bridge-update', handleBridgeUpdate);
       ipcRenderer.removeListener('gemini:session-detected', handleGeminiSessionDetected);
@@ -2447,6 +2536,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             if (newCwd && newCwd.startsWith('/')) {
               console.log('[Terminal] OSC 7 cwd update:', newCwd);
               getUpdateTabCwd()(tabId, newCwd);
+              ipcRenderer.send('terminal:updateCwd', { tabId, cwd: newCwd });
             }
           } catch (e) {
             console.error('[Terminal] OSC 7 parse error:', e);
@@ -2553,6 +2643,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             const preview = fullLine.length > 80 ? fullLine.slice(0, 80) + '…' : fullLine;
             console.warn('[CmdDetect:reattach] tab=' + tabId.slice(-8) + ' match=' + detectedCommandType + ' bufType=' + term.buffer.active.type + ' claudeAlive=' + claudeAliveNow + ' claudeSess=' + (claudeSess ? claudeSess.slice(0, 8) : 'null') + ' fullLine="' + preview.replace(/"/g, '\\"') + '"');
           }
+          rememberDetectedShellCommand(tabId, fullLine, claudeAliveNow);
 
           if (!claudeAliveNow) {
             if (detectedCommandType === 'codex') {
@@ -2943,13 +3034,31 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
   useEffect(() => {
     const term = xtermInstance.current;
     if (!term) return;
+    if ((term as any)._isDisposed) return;
 
-    // Update font size
     term.options.fontSize = terminalFontSize;
 
-    // Refit terminal after font size change
+    const repaint = () => {
+      try {
+        const core = (term as any)._core;
+        core?._charSizeService?.measure?.();
+        core?._renderService?.clear?.();
+        if (term.rows > 0) {
+          term.refresh(0, term.rows - 1);
+        }
+      } catch (e) {
+        console.warn('[Terminal:font-size] repaint failed:', e);
+      }
+    };
+
+    repaint();
     requestAnimationFrame(() => {
       safeFit();
+      repaint();
+      requestAnimationFrame(() => {
+        safeFit();
+        repaint();
+      });
     });
   }, [terminalFontSize]);
 
@@ -2998,16 +3107,27 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
   return (
     <>
-      <div className="absolute inset-0" style={{ zIndex: effectiveActive ? 1 : -1, isolation: 'isolate' }}>
+      <div
+        className="absolute inset-0"
+        data-terminal-layer-tab-id={tabId}
+        data-terminal-layer-owner-project={ownerProjectId || ''}
+        data-terminal-layer-active={effectiveActive ? '1' : '0'}
+        style={{
+          zIndex: effectiveActive ? 1 : 0,
+          isolation: 'isolate',
+          visibility: effectiveActive ? 'inherit' : 'hidden',
+          opacity: effectiveActive && isVisible ? 1 : 0,
+          pointerEvents: effectiveActive ? 'auto' : 'none',
+          transition: effectiveActive ? 'opacity 0.05s ease-in' : 'none',
+        }}
+      >
 
         {/* Layer 1: Terminal (Lower) */}
         <div
           ref={terminalRef}
           className="terminal-instance w-full h-full"
           style={{
-            visibility: effectiveActive ? 'visible' : 'hidden',
-            opacity: isVisible ? 1 : 0,
-            transition: 'opacity 0.05s ease-in'
+            visibility: 'inherit',
           }}
           onClick={handleClick}
           onContextMenu={handleContextMenu}

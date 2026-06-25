@@ -107,11 +107,11 @@ Claude Code CLI **не предоставляет** прямого механи�
 StatusLine Bridge определяет `tabId` через PID tree: `bridge.ppid (Claude PID) → parent shell PID → match to PTY`. PID-резолв даёт точную привязку к табу, но **не сверяет cwd**. Если Claude всё-таки запустился (нашёл JSONL в slug соответствующем cwd сессии, не текущему cwd таба) — bridge получит `data.session_id = <foreign>` и `data.cwd = <other-project>`, но tabId резолвится по PID правильный → `setClaudeSessionId(tabId, foreign)` → перезапись.
 
 ### Решение
-В `processFile()` сразу после tabId resolve: если `data.cwd && tabCwd && data.cwd !== tabCwd` — `return` без emit `claude:session-detected`. Лог `[Bridge:CwdGuard] Skip overwrite: tab cwd=X but bridge cwd=Y`.
+В `processFile()` сразу после tabId resolve сравнивается `data.cwd` и `terminalProjects.get(tabId)`. Если пути unrelated, CwdGuard блокирует только main-side takeover vectors: не вызываются `terminalProjects.set` и `bridgeKnownSessions.set`, но renderer-side `claude:session-detected` может быть отправлен один раз для нового sessionId, потому что PID tree уже доказал, что live Claude parented этим PTY. Если пути related (ancestor/descendant), событие принимается для текущего апдейта, но canonical cwd таба всё равно не переписывается из bridge.
 
 ### Edge cases
-- Пользователь делает `cd /other-project && claude` в табе → PTY cwd обновляется через OSC 7 → `terminalProjects.set(tabId, newCwd)` → bridge.cwd = новый cwd → match → sessionId записывается. Работает.
-- Конфликт: таб привязан к hh-tool, юзер делает `cd /tmp && claude --resume <hh-toolSid>` — bridge.cwd = `/Desktop/hh-tool` (cwd сессии), tabCwd = `/tmp` → mismatch → guard блокирует. Это сознательный выбор — sessionId привязывается к cwd, не к табу.
+- Пользователь делает `cd /other-project && claude` в табе → renderer получает OSC 7 от live PTY → main принимает `terminal:updateCwd` только для живого `tabId` → `terminalProjects` становится новым cwd → bridge.cwd = новый cwd → match → sessionId записывается. Это не bridge-mutate path: `processFile()` не должен переписывать canonical cwd из `bridge.cwd`.
+- Конфликт: таб привязан к hh-tool, юзер делает `cd /tmp && claude --resume <hh-toolSid>` — bridge.cwd = `/Desktop/hh-tool` (cwd сессии), tabCwd = `/tmp` → unrelated mismatch. Main-side caches не мутируются, чтобы чужой bridge не захватил tab; renderer-side persistence может получить sessionId только как восстановление конкретного live PTY после PID-resolution, без ослабления `terminalProjects`.
 
 ## Fix: Dead session_links + chain resolve trap
 

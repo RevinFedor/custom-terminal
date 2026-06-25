@@ -3,6 +3,7 @@ import PragmaticFileTree from './PragmaticFileTree/PragmaticFileTree'
 import { flattenTree } from './PragmaticFileTree/utils'
 import Tooltip from '../UI/Tooltip'
 import IconCropper from './IconCropper'
+import { RunAfterTabPicker } from './RunAfterTabPicker'
 import { getValue, setValue } from '../../utils/storage'
 
 // --- Sort Comparator ---
@@ -15,6 +16,14 @@ const SORT_MODES = [
   { id: 'birthtime-desc', label: 'By created (newest)' },
   { id: 'birthtime-asc', label: 'By created (oldest)' },
 ]
+
+function isRunAfterPickerEvent(e) {
+  const selector = '[data-run-after-picker-menu], [data-run-after-picker-portal]'
+  const target = e.target
+  if (target instanceof Element && target.closest(selector)) return true
+  const path = typeof e.composedPath === 'function' ? e.composedPath() : []
+  return path.some((node) => node instanceof Element && node.matches(selector))
+}
 
 function getSortComparator(sortMode) {
   return (a, b) => {
@@ -255,19 +264,13 @@ function IconPicker({ item, onSelect, onClose, onReset, onResetToVsc, existingIc
   )
 }
 
-function ContextMenu({ x, y, node, onClose, onCopyPath, onCopyContent, onRename, onChooseIcon, onNewFile, onNewFolder, onDelete, onLinkFile, linkTargets = [], multiSelectCount = 0 }) {
+function ContextMenu({ x, y, node, onClose, onCopyPath, onOpenInFinder, onCopyContent, onRename, onChooseIcon, onNewFile, onNewFolder, onDelete, onLinkFile, linkOwnerProjectId = null, multiSelectCount = 0 }) {
   const menuRef = useRef(null)
-  const linkItemRef = useRef(null)
   const [position, setPosition] = useState({ left: x, top: y })
-  const [linkSubmenuStyle, setLinkSubmenuStyle] = useState({
-    top: -4,
-    maxHeight: 300,
-    left: 'calc(100% - 4px)',
-    right: 'auto',
-  })
 
   useEffect(() => {
     const handleClickOutside = (e) => {
+      if (isRunAfterPickerEvent(e)) return
       if (menuRef.current && !menuRef.current.contains(e.target)) {
         onClose()
       }
@@ -308,65 +311,43 @@ function ContextMenu({ x, y, node, onClose, onCopyPath, onCopyContent, onRename,
     if (next.left !== position.left || next.top !== position.top) {
       setPosition(next)
     }
-  }, [x, y, node, linkTargets.length, multiSelectCount, position.left, position.top])
-
-  useLayoutEffect(() => {
-    const trigger = linkItemRef.current
-    if (!trigger) return
-    const rect = trigger.getBoundingClientRect()
-    const pad = 8
-    const itemHeight = 31
-    const naturalHeight = Math.min(300, Math.max(40, (linkTargets.length || 1) * itemHeight + 8))
-    const bottomLimit = window.innerHeight - pad
-    let top = -4
-    if (rect.top + top + naturalHeight > bottomLimit) {
-      top = bottomLimit - rect.top - naturalHeight
-    }
-    if (rect.top + top < pad) {
-      top = pad - rect.top
-    }
-    const availableHeight = Math.max(80, bottomLimit - (rect.top + top))
-    const openLeft = rect.right + 220 > window.innerWidth - pad
-    setLinkSubmenuStyle({
-      top,
-      maxHeight: Math.min(300, availableHeight),
-      left: openLeft ? 'auto' : 'calc(100% - 4px)',
-      right: openLeft ? 'calc(100% - 4px)' : 'auto',
-    })
-  }, [position.left, position.top, linkTargets.length, node])
+  }, [x, y, node, multiSelectCount, position.left, position.top])
 
   return (
     <div ref={menuRef} className="context-menu" style={{ left: position.left, top: position.top }}>
       {node && (
         <>
           <div className="context-menu-item" onClick={() => { onCopyPath(node.id); onClose() }}>Copy Path</div>
+          <div className="context-menu-item" onClick={() => { onOpenInFinder(node.id); onClose() }}>Open in Finder</div>
           {!node.isDirectory && (
             <div className="context-menu-item" onClick={() => { onCopyContent(node.id); onClose() }}>Copy Content</div>
           )}
           {!node.isDirectory && multiSelectCount <= 1 && onLinkFile && (
-            <div ref={linkItemRef} className="context-menu-item context-menu-submenu">
-              <span>Link File</span>
-              <span className="context-menu-arrow">›</span>
-              <div className="context-menu-submenu-panel" style={linkSubmenuStyle}>
-                {linkTargets.length === 0 && (
-                  <div className="context-menu-submenu-empty">No Claude/Codex tabs</div>
-                )}
-                {linkTargets.map((target) => (
-                  <div
-                    key={target.id}
-                    className="context-menu-submenu-item"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      onLinkFile(node.id, target.id)
-                      onClose()
-                    }}
-                  >
-                    <span className="context-menu-submenu-kind">{target.kind}</span>
-                    <span className="context-menu-submenu-title">{target.name}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
+            <RunAfterTabPicker
+              tabId={node.id}
+              ownerProjectId={linkOwnerProjectId}
+              autoRun={false}
+              runAfterTabId={null}
+              setRunAfterTab={(_ownerId, targetTabId) => {
+                if (!targetTabId) return
+                onLinkFile(node.id, targetTabId)
+                onClose()
+              }}
+              panelRef={menuRef}
+              title="Link file - pick a tab"
+              emptyLabel=""
+              showAllTabsOnOpen
+              triggerVariant="context-row"
+              triggerLabel="Link File"
+              menuWidth={252}
+              zIndex={2147482101}
+              side="right"
+              accentColor="#8b5cf6"
+              accentTextColor="#ddd6fe"
+              showRuntimeDot={false}
+              showTargetSummary={false}
+              openOnHover
+            />
           )}
           {multiSelectCount <= 1 && (
             <div className="context-menu-item" onClick={handleRenameClick}>Rename</div>
@@ -425,7 +406,7 @@ function Sidebar({
   onCollapse,
   initialExpandedDirs,
   onExpandedDirsChange,
-  linkTargets = [],
+  linkOwnerProjectId = null,
   onLinkFile,
 }) {
   const [treeData, setTreeData] = useState([])
@@ -599,10 +580,12 @@ function Sidebar({
     if (!folderPath) return
 
     console.log('[sidebar]','=== TREE LOAD ===', { folderPath, externalRefreshTrigger })
+    let cancelled = false
 
     const loadTree = async () => {
       try {
         const nodes = await loadTreeRecursive(folderPath, openStateRef.current)
+        if (cancelled) return
         console.log('[sidebar]','Tree loaded, root items:', nodes.length)
         // Clean stale entries: keep only paths that exist in the loaded tree
         const allDirPaths = new Set()
@@ -626,11 +609,13 @@ function Sidebar({
         setTreeData(nodes)
         setExpandedSnapshot({ ...openStateRef.current })
       } catch (err) {
+        if (cancelled) return
         console.log('[sidebar]','Error loading tree:', err)
       }
     }
 
     loadTree()
+    return () => { cancelled = true }
   }, [folderPath, externalRefreshTrigger, loadTreeRecursive, saveExpandedDirs])
 
   // Sync expansion state from PragmaticFileTree
@@ -1225,6 +1210,7 @@ function Sidebar({
           node={contextMenu.node}
           onClose={() => setContextMenu(null)}
           onCopyPath={(p) => window.require('electron').clipboard.writeText(p)}
+          onOpenInFinder={(p) => window.require('electron').shell.showItemInFolder(p)}
           onCopyContent={async (p) => {
             const content = await window.electronAPI.readFile(p)
             if (content !== null) window.require('electron').clipboard.writeText(content)
@@ -1235,7 +1221,7 @@ function Sidebar({
           onNewFolder={handleNewFolder}
           onDelete={handleDelete}
           onLinkFile={onLinkFile}
-          linkTargets={linkTargets}
+          linkOwnerProjectId={linkOwnerProjectId}
           multiSelectCount={multiSelected.size}
         />
       )}

@@ -83,6 +83,7 @@ export type RunAfterTabPickerProps = {
   runAfterTabId: string | null;
   setRunAfterTab: (tabId: string, target: string | null) => void;
   panelRef: RefObject<HTMLDivElement>;
+  ownerProjectId?: string | null;
   title?: string;
   emptyLabel?: string;
   showAllTabsOnOpen?: boolean;
@@ -95,6 +96,7 @@ export type RunAfterTabPickerProps = {
   accentColor?: string;
   accentTextColor?: string;
   showRuntimeDot?: boolean;
+  showTargetSummary?: boolean;
   openOnHover?: boolean;
 };
 
@@ -256,6 +258,7 @@ export function RunAfterTabPicker({
   runAfterTabId,
   setRunAfterTab,
   panelRef,
+  ownerProjectId: ownerProjectIdProp = null,
   title = 'Run after - pick a tab',
   emptyLabel = 'on tab',
   showAllTabsOnOpen = false,
@@ -268,6 +271,7 @@ export function RunAfterTabPicker({
   accentColor = '#10A37F',
   accentTextColor = '#a7f3d0',
   showRuntimeDot = true,
+  showTargetSummary = true,
   openOnHover = false,
 }: RunAfterTabPickerProps) {
   const toggleTabGroupCollapsed = useWorkspaceStore((state) => state.toggleTabGroupCollapsed);
@@ -282,7 +286,7 @@ export function RunAfterTabPicker({
     let ownerProjectId: string | null = null;
     const parts: string[] = ['owner:'];
     for (const [pid, ws] of state.openProjects) {
-      if (ws.tabs.has(tabId)) ownerProjectId = pid;
+      if (ws.tabs.has(tabId) || pid === ownerProjectIdProp) ownerProjectId = pid;
       const projectBits: string[] = [pid, ws.projectPath || ''];
       for (const group of ws.tabGroups || []) {
         projectBits.push([
@@ -320,13 +324,13 @@ export function RunAfterTabPicker({
   const inventory = useMemo<{ groups: AiProjectGroup[]; ownerProjectId: string | null; selectedTargetProjectId: string | null }>(() => {
     if (!fingerprint) return { groups: [], ownerProjectId: null, selectedTargetProjectId: null };
     const state = useWorkspaceStore.getState();
-    let ownerProjectId: string | null = null;
+    let ownerProjectId: string | null = ownerProjectIdProp;
     let selectedTargetProjectId: string | null = null;
     const groups: AiProjectGroup[] = [];
 
     for (const [projectId, ws] of state.openProjects) {
-      const isOwnerProject = ws.tabs.has(tabId);
-      if (isOwnerProject) ownerProjectId = projectId;
+      const isOwnerProject = ws.tabs.has(tabId) || projectId === ownerProjectIdProp;
+      if (ws.tabs.has(tabId)) ownerProjectId = projectId;
       const tabs: AiTab[] = [];
       for (const t of ws.tabs.values()) {
         if (t.parentTabId) continue;
@@ -360,7 +364,7 @@ export function RunAfterTabPicker({
     }
 
     return { groups, ownerProjectId, selectedTargetProjectId };
-  }, [fingerprint, tabId, runAfterTabId]);
+  }, [fingerprint, ownerProjectIdProp, tabId, runAfterTabId]);
 
   const [busyMap, setBusyMap] = useState<Map<string, boolean>>(() => getBusyTabsSnapshot());
   useEffect(() => {
@@ -660,26 +664,32 @@ export function RunAfterTabPicker({
         </span>
       )}
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0, flexShrink: 0 }}>
-        <span style={{ display: 'inline-flex', color: hasSelectedTarget ? accentColor : '#666', flexShrink: 0 }}>
-          {triggerIcon}
-        </span>
+        {triggerIcon && (
+          <span style={{ display: 'inline-flex', color: hasSelectedTarget ? accentColor : '#666', flexShrink: 0 }}>
+            {triggerIcon}
+          </span>
+        )}
         <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{triggerLabel}</span>
       </span>
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1, justifyContent: 'flex-end' }}>
-        {showRuntimeDot && selectedTab && (
-          <span style={{ width: 6, height: 6, borderRadius: '50%', background: AI_KIND_COLOR[selectedTab.kind], flexShrink: 0 }} />
+        {showTargetSummary && (
+          <>
+            {showRuntimeDot && selectedTab && (
+              <span style={{ width: 6, height: 6, borderRadius: '50%', background: AI_KIND_COLOR[selectedTab.kind], flexShrink: 0 }} />
+            )}
+            <span
+              style={{
+                color: hasSelectedTarget ? accentTextColor : '#666',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                maxWidth: 116,
+              }}
+            >
+              {selectedTab?.name || (runAfterTabId ? 'Missing tab' : emptyLabel)}
+            </span>
+          </>
         )}
-        <span
-          style={{
-            color: hasSelectedTarget ? accentTextColor : '#666',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-            maxWidth: 116,
-          }}
-        >
-          {selectedTab?.name || (runAfterTabId ? 'Missing tab' : emptyLabel)}
-        </span>
         <span style={{ color: '#666', flexShrink: 0 }}>{'>'}</span>
       </span>
     </button>

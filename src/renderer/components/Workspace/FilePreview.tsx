@@ -11,7 +11,7 @@ export default function FilePreview() {
   const { filePreview, closeFilePreview, showToast } = useUIStore();
   const filePreviewFontSize = useUIStore((s) => s.filePreviewFontSize);
   const setFilePreviewFontSize = useUIStore((s) => s.setFilePreviewFontSize);
-  const { activeProjectId, getSidebarState, setOpenFilePath, closeTab } = useWorkspaceStore();
+  const { activeProjectId, getSidebarState, setOpenFilePath, switchTab, setProjectView } = useWorkspaceStore();
   const { sidebarOpen } = activeProjectId ? getSidebarState(activeProjectId) : { sidebarOpen: false };
   const [copied, setCopied] = useState(false);
   const [openingSublime, setOpeningSublime] = useState(false);
@@ -45,8 +45,29 @@ export default function FilePreview() {
 
   const handleClose = () => {
     if (filePreview?.source === 'tab' && filePreview.sourceTabId && activeProjectId) {
+      const state = useWorkspaceStore.getState();
+      const workspace = state.openProjects.get(activeProjectId);
+      const sourceTabId = filePreview.sourceTabId;
+      const fileTab = workspace?.tabs.get(sourceTabId);
+      const historyTargetId = workspace
+        ? [...(workspace.tabHistory || [])].reverse().find((id) => {
+            const candidate = workspace.tabs.get(id);
+            return id !== sourceTabId && !!candidate && !candidate.isUtility && candidate.tabType !== 'file';
+          })
+        : null;
+      const fallbackParentId = workspace && fileTab?.visualParentTabId && workspace.tabs.has(fileTab.visualParentTabId)
+        ? fileTab.visualParentTabId
+        : null;
+      const fallbackTabId = workspace
+        ? Array.from(workspace.tabs.values()).find((tab) => tab.id !== sourceTabId && !tab.isUtility && tab.tabType !== 'file')?.id
+        : null;
+      const returnTargetId = historyTargetId || fallbackParentId || fallbackTabId || null;
+
+      if (returnTargetId) {
+        switchTab(activeProjectId, returnTargetId);
+        setProjectView(activeProjectId, 'terminal');
+      }
       closeFilePreview();
-      closeTab(activeProjectId, filePreview.sourceTabId, { skipProcessCheck: true }).catch(() => {});
       return;
     }
     closeFilePreview();

@@ -209,11 +209,6 @@ export const Api = {
       '/api/file-preview',
       { method: 'POST', body: JSON.stringify({ path }) },
     ),
-  createSDKTab: (projectId: string) =>
-    api<{ tabId: string; name: string; cwd: string; projectId: string }>(
-      `/api/projects/${encodeURIComponent(projectId)}/sdk-tabs`,
-      { method: 'POST', body: '{}' },
-    ),
   createClaudeTab: (projectId: string) =>
     api<{ tabId: string; name: string; cwd: string; projectId: string }>(
       `/api/projects/${encodeURIComponent(projectId)}/claude-tabs`,
