@@ -14,6 +14,7 @@ import {
   Minus,
   Plus,
   RefreshCw,
+  RotateCcw,
   Search,
   Settings,
   Sparkles,
@@ -29,6 +30,8 @@ const DOCS_ONLY_STORAGE_KEY = 'noted-terminal.git.docsOnlyAiContext';
 const DEFAULT_PANEL_SIZE = { width: 1040, height: 640 };
 const MIN_PANEL_SIZE = { width: 760, height: 420 };
 const PANEL_MARGIN = 16;
+const MIN_LEFT_PANE_WIDTH = 320;
+const MIN_RIGHT_PANE_WIDTH = 380;
 
 type GitFile = {
   path: string;
@@ -60,6 +63,7 @@ type GitCommit = {
   hash: string;
   date: string;
   subject: string;
+  unpushed?: boolean;
 };
 
 type GitCommitDetails = {
@@ -110,6 +114,7 @@ type GitPanelPersistedState = {
   activeFilePath?: string;
   selectedPaths?: string[];
   panelSize?: { width?: number; height?: number };
+  splitLeftWidth?: number;
   docsOnlyWhenPresent?: boolean;
   selectedRepoPath?: string;
   repoSelectorTab?: 'repos' | 'favorites';
@@ -174,6 +179,13 @@ function normalizePanelSize(size?: { width?: number; height?: number } | null) {
   };
 }
 
+function normalizeSplitLeftWidth(value: number | undefined | null, panelWidth: number) {
+  const fallback = Math.round(panelWidth * 0.43);
+  const width = Math.round(Number(value || fallback));
+  const max = Math.max(MIN_LEFT_PANE_WIDTH, panelWidth - MIN_RIGHT_PANE_WIDTH);
+  return Math.max(MIN_LEFT_PANE_WIDTH, Math.min(max, Number.isFinite(width) ? width : fallback));
+}
+
 function gitPanelStateKey(projectId?: string | null, repoRoot?: string, projectPath?: string) {
   const raw = projectId || repoRoot || projectPath || '';
   return raw ? 'noted-terminal.git.panel.' + raw : '';
@@ -230,6 +242,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [search, setSearch] = useState('');
   const [activeFilePath, setActiveFilePath] = useState('');
   const [panelSize, setPanelSize] = useState(() => normalizePanelSize(DEFAULT_PANEL_SIZE));
+  const [splitLeftWidth, setSplitLeftWidth] = useState(() => normalizeSplitLeftWidth(undefined, DEFAULT_PANEL_SIZE.width));
   const [selectedRepoPath, setSelectedRepoPath] = useState(projectPath || '');
   const [repoSelectorOpen, setRepoSelectorOpen] = useState(false);
   const [repoSelectorTab, setRepoSelectorTab] = useState<'repos' | 'favorites'>('repos');
@@ -252,6 +265,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [activeCommitFilePath, setActiveCommitFilePath] = useState('');
   const [commitDetails, setCommitDetails] = useState<GitCommitDetails | null>(null);
   const [commitDetailsLoading, setCommitDetailsLoading] = useState(false);
+  const [historyContextMenu, setHistoryContextMenu] = useState<{ x: number; y: number; commit: GitCommit } | null>(null);
+  const [undoingCommitHash, setUndoingCommitHash] = useState('');
   const [branchesOpen, setBranchesOpen] = useState(false);
   const [branchesLoading, setBranchesLoading] = useState(false);
   const [branches, setBranches] = useState<GitBranchInfo[]>([]);
@@ -261,6 +276,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [fileDiff, setFileDiff] = useState<GitFileDiff | null>(null);
   const [fileDiffLoading, setFileDiffLoading] = useState(false);
   const [resizeHover, setResizeHover] = useState<'left' | 'bottom' | 'left-bottom' | null>(null);
+  const [splitResizeHover, setSplitResizeHover] = useState(false);
   const [statusVersion, setStatusVersion] = useState(0);
   const fsDebounceRef = useRef<number | null>(null);
   const saveDebounceRef = useRef<number | null>(null);
@@ -449,6 +465,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     setDragRepoPath('');
     setBranchesOpen(false);
     setPushMenuOpen(false);
+    setHistoryContextMenu(null);
+    setUndoingCommitHash('');
     setActiveFilePath('');
     setActiveCommitHash('');
     setActiveCommitFilePath('');
@@ -492,7 +510,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         setActiveFilePath(typeof next?.activeFilePath === 'string' ? next.activeFilePath : '');
         setActiveCommitHash(typeof next?.activeCommitHash === 'string' ? next.activeCommitHash : '');
         setActiveCommitFilePath(typeof next?.activeCommitFilePath === 'string' ? next.activeCommitFilePath : '');
-        setPanelSize(normalizePanelSize(next?.panelSize));
+        const nextPanelSize = normalizePanelSize(next?.panelSize);
+        setPanelSize(nextPanelSize);
+        setSplitLeftWidth(normalizeSplitLeftWidth(next?.splitLeftWidth, nextPanelSize.width));
         setSelectedRepoPath(typeof next?.selectedRepoPath === 'string' && next.selectedRepoPath ? next.selectedRepoPath : (projectPath || ''));
         setRepoSelectorTab(next?.repoSelectorTab === 'favorites' ? 'favorites' : 'repos');
         setRepoFavorites(Array.isArray(next?.repoFavorites) ? next.repoFavorites.filter((item) => typeof item === 'string') : []);
@@ -535,6 +555,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         activeCommitFilePath,
         selectedPaths: Array.from(selectedPaths),
         panelSize,
+        splitLeftWidth,
         docsOnlyWhenPresent,
         selectedRepoPath,
         repoSelectorTab,
@@ -545,7 +566,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     return () => {
       if (saveDebounceRef.current) window.clearTimeout(saveDebounceRef.current);
     };
-  }, [panelStateKey, open, panelTab, summary, description, search, historySearch, activeFilePath, activeCommitHash, activeCommitFilePath, selectedPaths, panelSize, docsOnlyWhenPresent, selectedRepoPath, repoSelectorTab, repoFavorites]);
+  }, [panelStateKey, open, panelTab, summary, description, search, historySearch, activeFilePath, activeCommitHash, activeCommitFilePath, selectedPaths, panelSize, splitLeftWidth, docsOnlyWhenPresent, selectedRepoPath, repoSelectorTab, repoFavorites]);
 
   useEffect(() => {
     if (!open) return;
@@ -687,6 +708,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     setSelectedRepoPath(repoPath);
     setRepoSelectorOpen(false);
     setRepoContextMenu(null);
+    setHistoryContextMenu(null);
     setBranchesOpen(false);
     setPushMenuOpen(false);
     setActiveFilePath('');
@@ -756,6 +778,28 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         height: edge === 'bottom' || edge === 'left-bottom' ? startSize.height + (moveEvent.clientY - startY) : startSize.height,
       };
       setPanelSize(normalizePanelSize(next));
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = oldCursor;
+      document.body.style.userSelect = oldUserSelect;
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  };
+
+  const startSplitResize = (event: React.MouseEvent, panelWidth: number) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const startX = event.clientX;
+    const startWidth = normalizeSplitLeftWidth(splitLeftWidth, panelWidth);
+    const oldCursor = document.body.style.cursor;
+    const oldUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = 'ew-resize';
+    document.body.style.userSelect = 'none';
+    const onMove = (moveEvent: MouseEvent) => {
+      setSplitLeftWidth(normalizeSplitLeftWidth(startWidth + (moveEvent.clientX - startX), panelWidth));
     };
     const onUp = () => {
       document.removeEventListener('mousemove', onMove);
@@ -845,6 +889,33 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     }
   };
 
+  const handleUndoCommit = async (commit: GitCommit) => {
+    if (!effectiveRepoPath || !commit?.hash) return;
+    if (historyItems[0]?.hash !== commit.hash) {
+      showToast('Only the latest commit can be undone', 'warning');
+      return;
+    }
+    setUndoingCommitHash(commit.hash);
+    setHistoryContextMenu(null);
+    try {
+      const result = await ipcRenderer.invoke('git:undo-last-commit', {
+        projectPath: effectiveRepoPath,
+        hash: commit.hash,
+      });
+      if (!result?.success) throw new Error(result?.error || 'git undo failed');
+      showToast('Commit undone', 'success');
+      setActiveCommitHash('');
+      setActiveCommitFilePath('');
+      setCommitDetails(null);
+      await loadStatus(true);
+      await loadHistory();
+    } catch (error: any) {
+      showToast('Undo commit: ' + trimError(error?.message || error), 'error', 5000);
+    } finally {
+      setUndoingCommitHash('');
+    }
+  };
+
   const handleRemote = async (type: 'push' | 'fetch') => {
     if (!effectiveRepoPath) return;
     setRemoteBusy(type);
@@ -859,6 +930,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       }
       showToast(type === 'push' ? 'Pushed' : 'Fetched origin', 'success');
       await loadStatus(true);
+      if (panelTab === 'history') await loadHistory();
     } catch (error: any) {
       showToast((type === 'push' ? 'Push: ' : 'Fetch: ') + trimError(error?.message || error), 'error');
     } finally {
@@ -878,6 +950,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       showToast('Branch: ' + branch, 'success');
       setBranchesOpen(false);
       await loadStatus(true);
+      if (panelTab === 'history') await loadHistory();
     } catch (error: any) {
       showToast('Checkout: ' + trimError(error?.message || error), 'error', 5000);
     } finally {
@@ -921,6 +994,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       height: Math.max(MIN_PANEL_SIZE.height, Math.min(panelSize.height, window.innerHeight - pos.top - PANEL_MARGIN)),
     }
     : panelSize;
+  const renderedSplitLeftWidth = normalizeSplitLeftWidth(splitLeftWidth, renderedPanelSize.width);
   const remoteTitle = remoteBusy === 'fetch'
     ? 'Fetching'
     : remoteBusy === 'push'
@@ -1027,7 +1101,23 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                 onToggleDocsOnly={toggleDocsOnly}
               />
             ) : (
-              <div style={gitPanelGridStyle}>
+              <div
+                style={{
+                  ...gitPanelGridStyle,
+                  gridTemplateColumns: `${renderedSplitLeftWidth}px minmax(0, 1fr)`,
+                }}
+                onMouseDown={() => {
+                  setHistoryContextMenu(null);
+                  setRepoContextMenu(null);
+                }}
+              >
+                <div
+                  onMouseDown={(event) => startSplitResize(event, renderedPanelSize.width)}
+                  onMouseEnter={() => setSplitResizeHover(true)}
+                  onMouseLeave={() => setSplitResizeHover(false)}
+                  title="Resize columns"
+                  style={splitResizeHandleStyle(renderedSplitLeftWidth, splitResizeHover)}
+                />
                 <div style={gitHeaderLeftStyle}>
                   <div style={{ minWidth: 0, flex: 1, position: 'relative' }}>
                     <button
@@ -1158,6 +1248,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                   <TabButton active={panelTab === 'changes'} onClick={() => {
                     setBranchesOpen(false);
                     setPushMenuOpen(false);
+                    setHistoryContextMenu(null);
                     setPanelTab('changes');
                   }}>
                     Changes
@@ -1166,6 +1257,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                   <TabButton active={panelTab === 'history'} onClick={() => {
                     setBranchesOpen(false);
                     setPushMenuOpen(false);
+                    setHistoryContextMenu(null);
                     setPanelTab('history');
                   }}>
                     History
@@ -1176,8 +1268,16 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                   <div style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, fontWeight: 800, color: '#f8fafc' }}>
                     {panelTab === 'changes' ? (activeFile?.path || 'No file selected') : (commitDetails?.subject || 'Select a commit')}
                   </div>
-                  <button onClick={() => loadStatus(true)} disabled={statusLoading} title="Refresh" style={iconButtonStyle}>
-                    <RefreshCw size={13} className={statusLoading ? 'animate-spin' : ''} />
+                  <button
+                    onClick={async () => {
+                      await loadStatus(true);
+                      if (panelTab === 'history') await loadHistory();
+                    }}
+                    disabled={statusLoading || historyLoading}
+                    title="Refresh"
+                    style={iconButtonStyle}
+                  >
+                    <RefreshCw size={13} className={statusLoading || historyLoading ? 'animate-spin' : ''} />
                   </button>
                   <button onClick={() => setSettingsOpen(true)} title="Git settings" style={iconButtonStyle}>
                     <Settings size={13} />
@@ -1304,20 +1404,46 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                           onClick={() => {
                             setActiveCommitHash(commit.hash);
                             setActiveCommitFilePath('');
+                            setHistoryContextMenu(null);
+                          }}
+                          onContextMenu={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            setActiveCommitHash(commit.hash);
+                            setActiveCommitFilePath('');
+                            setHistoryContextMenu({ x: event.clientX, y: event.clientY, commit });
                           }}
                           style={historyRowStyle(commit.hash === activeCommitHash)}
                         >
                           <span style={{ minWidth: 0, flex: 1, textAlign: 'left' }}>
                             <span style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, fontWeight: 800, color: '#f1f5f9' }}>{commit.subject}</span>
-                            <span style={{ display: 'block', color: '#8b949e', fontSize: 10.5, marginTop: 2 }}>
+                            <span style={{ display: 'block', color: '#8b949e', fontSize: 10.5, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                               {commit.hash} · {commit.date}
                             </span>
                           </span>
+                          {undoingCommitHash === commit.hash ? (
+                            <span style={historyPushBadgeStyle} title="Undoing commit">
+                              <Loader2 size={13} className="animate-spin" />
+                            </span>
+                          ) : commit.unpushed ? (
+                            <span style={historyPushBadgeStyle} title="Not pushed">
+                              <Upload size={13} />
+                            </span>
+                          ) : null}
                         </button>
                       )) : (
                         <div style={emptyStateStyle}>{historyItems.length ? 'No commits match search' : 'No commits yet'}</div>
                       )}
                     </div>
+                    {historyContextMenu && (
+                      <HistoryCommitContextMenu
+                        x={historyContextMenu.x}
+                        y={historyContextMenu.y}
+                        canUndo={historyItems[0]?.hash === historyContextMenu.commit.hash}
+                        undoing={undoingCommitHash === historyContextMenu.commit.hash}
+                        onUndo={() => handleUndoCommit(historyContextMenu.commit)}
+                      />
+                    )}
                   </div>
                 )}
                 </div>
@@ -1522,6 +1648,39 @@ function RepositoryMenu({
         </div>
       )}
     </>
+  );
+}
+
+function HistoryCommitContextMenu({
+  x,
+  y,
+  canUndo,
+  undoing,
+  onUndo,
+}: {
+  x: number;
+  y: number;
+  canUndo: boolean;
+  undoing: boolean;
+  onUndo: () => void;
+}) {
+  const disabled = !canUndo || undoing;
+  return (
+    <div
+      style={{ ...historyContextMenuStyle, left: x, top: y }}
+      onMouseDown={(event) => event.stopPropagation()}
+      onClick={(event) => event.stopPropagation()}
+    >
+      <button
+        onClick={onUndo}
+        disabled={disabled}
+        title={canUndo ? 'Undo latest commit' : 'Only the latest commit can be undone'}
+        style={historyContextMenuItemStyle(disabled)}
+      >
+        {undoing ? <Loader2 size={12} className="animate-spin" /> : <RotateCcw size={12} />}
+        Undo Commit
+      </button>
+    </div>
   );
 }
 
@@ -2028,6 +2187,34 @@ const repoContextMenuItemStyle: React.CSSProperties = {
   textAlign: 'left',
 };
 
+const historyContextMenuStyle: React.CSSProperties = {
+  position: 'fixed',
+  zIndex: 10002,
+  minWidth: 142,
+  borderRadius: 7,
+  border: '1px solid rgba(255,255,255,0.12)',
+  background: '#111318',
+  boxShadow: '0 10px 24px rgba(0,0,0,0.55)',
+  padding: 4,
+};
+
+const historyContextMenuItemStyle = (disabled: boolean): React.CSSProperties => ({
+  width: '100%',
+  height: 26,
+  borderRadius: 5,
+  border: 'none',
+  background: 'transparent',
+  color: disabled ? '#6b7280' : '#e5e7eb',
+  display: 'flex',
+  alignItems: 'center',
+  gap: 7,
+  padding: '0 7px',
+  fontSize: 11,
+  fontWeight: 750,
+  cursor: disabled ? 'default' : 'pointer',
+  textAlign: 'left',
+});
+
 const leftResizeHandleStyle = (active: boolean): React.CSSProperties => ({
   position: 'absolute',
   left: -3,
@@ -2067,6 +2254,20 @@ const leftBottomResizeHandleStyle = (active: boolean): React.CSSProperties => ({
   transition: 'border-color 100ms ease',
 });
 
+const splitResizeHandleStyle = (leftWidth: number, active: boolean): React.CSSProperties => ({
+  position: 'absolute',
+  top: 0,
+  bottom: 0,
+  left: leftWidth - 4,
+  width: 8,
+  zIndex: 20,
+  cursor: 'ew-resize',
+  background: active ? 'rgba(96,165,250,0.24)' : 'rgba(96,165,250,0.01)',
+  borderLeft: active ? '1px solid rgba(96,165,250,0.72)' : '1px solid transparent',
+  borderRight: active ? '1px solid rgba(96,165,250,0.38)' : '1px solid transparent',
+  transition: 'background 100ms ease, border-color 100ms ease',
+});
+
 const gitPanelGridStyle: React.CSSProperties = {
   flex: 1,
   minHeight: 0,
@@ -2074,6 +2275,7 @@ const gitPanelGridStyle: React.CSSProperties = {
   gridTemplateColumns: 'minmax(380px, 43%) minmax(0, 1fr)',
   gridTemplateRows: '52px 30px minmax(0, 1fr)',
   overflow: 'hidden',
+  position: 'relative',
 };
 
 const gitHeaderLeftStyle: React.CSSProperties = {
@@ -2423,6 +2625,18 @@ const historyRowStyle = (active: boolean): React.CSSProperties => ({
   padding: '7px 10px',
   cursor: 'pointer',
 });
+
+const historyPushBadgeStyle: React.CSSProperties = {
+  width: 24,
+  height: 24,
+  borderRadius: 999,
+  background: 'rgba(148,163,184,0.28)',
+  color: '#f8fafc',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  flexShrink: 0,
+};
 
 const historyDetailShellStyle: React.CSSProperties = {
   height: '100%',

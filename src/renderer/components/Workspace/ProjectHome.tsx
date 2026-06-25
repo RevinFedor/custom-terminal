@@ -1922,7 +1922,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
 
             <div className="flex items-center gap-2 mb-2 flex-shrink-0">
               <div className="relative flex-1 min-w-0">
-                <Search size={14} className="absolute left-2 top-1/2 -translate-y-1/2 text-[#666]" />
                 <input
                   value={historyQuery}
                   onChange={(e) => {
@@ -1937,10 +1936,25 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                     }
                   }}
                   placeholder="Search tab titles..."
-                  className="w-full h-8 bg-[#151515] border border-[#2a2a2a] rounded px-8 text-[12px] text-white outline-none focus:border-[#555]"
+                  className="w-full h-8 bg-[#151515] border border-[#2a2a2a] rounded pl-2 pr-8 text-[12px] text-white outline-none focus:border-[#555]"
                 />
                 {iterationSearching && (
                   <Loader2 size={13} className="absolute right-2 top-1/2 -translate-y-1/2 text-[#10A37F] animate-spin" />
+                )}
+                {!iterationSearching && historyQuery && (
+                  <button
+                    type="button"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => {
+                      setHistoryQuery('');
+                      setTitleSearchError(null);
+                      setIterationSearchError(null);
+                    }}
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2 h-5 w-5 rounded text-[#666] hover:text-[#bbb] hover:bg-[#242424] flex items-center justify-center"
+                    title="Clear input"
+                  >
+                    <X size={12} />
+                  </button>
                 )}
               </div>
               <button
@@ -1958,6 +1972,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
               <div className="mb-2 flex-shrink-0">
                 <button
                   onClick={() => {
+                    setHistoryQuery('');
                     setIterationQuery('');
                     setIterationResults([]);
                   }}

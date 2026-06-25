@@ -256,6 +256,8 @@ return state.activeProjectId === projId && workspace.activeTabId === tabId;
 
 Селектор обязан проверять **И** projectId, **И** tabId. Невидимый контекст: AI без этого комментария может в рефакторинге убрать `state.activeProjectId === projId &&` как "избыточный" — оба компонента и так подписаны на свой `tabId`.
 
+Финальный контракт после прод-регрессии 2026-06: активность terminal-layer не должна жить только внутри `Terminal`/`BrowserTab`/`ClaudeSDKTab`. `TerminalArea` оставляет структурный fingerprint для mount/unmount, но отдельно подписывается на `activeLayerKey` (`view + activeProjectId + activeTabId + currentView + viewingSubAgentTabId`) и передаёт `active/isActiveProject` вниз props-ами. Это сохраняет xterm-состояние без remount, но не даёт старому проекту оставить в DOM `active=1 opacity=1` после перехода на другой проект.
+
 ### Регрессия-сигнал
 В каждом Terminal в useEffect ведётся регистрация в модульный `_visibleTerminals: Set<string>`. После каждого изменения rAF-debounce проверяет инвариант "ровно 1 терминал visible":
 ```
@@ -273,13 +275,14 @@ return state.activeProjectId === projId && workspace.activeTabId === tabId;
 До рефакторинга 2026-04-21 fingerprint содержал `${projId}:${workspace.activeTabId}` для **каждого** проекта. Любая смена `activeTabId` в **любом** проекте триггерила пересчёт `useMemo`, который создавал React-элементы для всех 40+ табов всех проектов. На каждый таб шёл `useEffect([effectiveActive])` → `[Terminal:deactivate]` × 13. Переключение проектов лагало.
 
 ### Решение
-Каждый Terminal/BrowserTab/ClaudeSDKTab сам подписывается на свой active-флаг (см. секцию 5). Fingerprint в `TerminalArea` стал **структурным**:
+Fingerprint в `TerminalArea` остаётся **структурным**, но активная пара проект/таб теперь вынесена в отдельный `activeLayerKey` (см. секцию 5). Структурная часть:
 ```tsx
 parts.push(projId === projectId ? `${projId}${hostActivePart}` : projId);
-parts.push(`${tab.id}:${tab.tabType || 'terminal'}`);
+parts.push(`${tab.id}:${tab.tabType || 'terminal'}:${tab.activeView || ''}:${tab.terminalId || ''}`);
 ```
 - `projId` других проектов — без `activeTabId`. Переключение там не задевает host.
 - `tab.id` + `tabType` — для add/remove/retype. Если таб сменил тип `terminal → browser`, useMemo пересоберёт элементы (другой компонент).
+- `activeView`/`terminalId` для browser-таба — это не project/tab switch, а смена собственной поверхности browser ↔ embedded terminal; её надо прокидывать в props, иначе внутренний терминал browser-таба получает stale `activeView`.
 
 ### Исключение: Sub-agent Override
 `activeTabId` host-проекта попадает в fingerprint **только** когда `viewingSubAgentTabId` armed. Тогда useMemo вынужден пересчитать `activeOverride` для двух tab IDs (sub-agent → активен, parent Gemini → неактивен). В норме это редкий случай.
@@ -288,8 +291,8 @@ parts.push(`${tab.id}:${tab.tabType || 'terminal'}`);
 ```
 [TerminalArea:useMemo] RECALCULATING count=N projectId=... durMs=... (structural: add/remove/type/sub-agent)
 ```
-- На переключение **между проектами** или **между табами одного проекта** — НЕ должно появляться.
-- Должно появляться только при: создании/закрытии таба, смене tabType, активации/деактивации sub-agent override.
+- На переключение **между проектами** или **между табами одного проекта** может появляться из-за `activeLayerKey`, но без remount xterm: это нормально если `durMs` малый и `[Terminal:VisibleSetInvariant]` не показывает mismatch.
+- Структурная часть fingerprint по-прежнему должна меняться только при создании/закрытии таба, смене tabType/activeView/terminalId, restore-error или sub-agent override. Не возвращать `activeTabId` всех проектов в structural fingerprint: это снова смешает «пересобрать список слоёв» и «поменять видимый слой».
 - Если появляется на каждом TabBar:click — кто-то вернул `activeTabId` других проектов в fingerprint.
 
 ---
@@ -321,7 +324,7 @@ parts.push(`${tab.id}:${tab.tabType || 'terminal'}`);
 | `[Perf:ProjectSwitch] durMs=N` | <50ms | >200ms = что-то синхронно блокирует main thread |
 | `[Perf:TabSwitch] durMs=N` | <50ms | >150ms = TerminalArea пересчитывает useMemo |
 | `[Terminal:VisibleSetInvariant] count=N` | не появляется (count=1 silent) | `count!=1` или expected-tab mismatch = виден лишний/не тот terminal layer; см. `fact-terminal-rendering.md::Персистентные слои` |
-| `[TerminalArea:useMemo RECALCULATING]` | редко — add/remove/type | на каждый switch = fingerprint регрессировал |
+| `[TerminalArea:useMemo RECALCULATING]` | add/remove/type/activeLayerKey, durMs малый | высокий durMs или xterm remount на switch = fingerprint снова смешал структуру и видимость |
 | `[Timeline:PollPaused] reason=...` / `[Timeline:PollResumed]` | 1:1 пары при visibility-changes | rогда poll не паузится при свёрнутом окне → 99% IPC впустую |
 | `[DB:ForkCache] stats hit=X miss=Y` | hit:miss ≥ 100:1 | низкий ratio = cache invalidation слишком агрессивная или вызовы с разными sessionId |
 | `[Spinner:DIAG]` | 0 в prod | если появилось в `~/Library/Logs/...` — gate за `isDev` сломан |

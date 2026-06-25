@@ -2141,8 +2141,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
     clearTerminalBuffer(tabId); // Clean up serialized buffer
 
-    // Archive tab to history (fire-and-forget)
-    if (tab && options?.archive !== false) {
+    // File tabs are linked document previews, not restorable terminal/AI sessions.
+    const shouldArchiveToHistory = tab.tabType !== 'file' && options?.archive !== false;
+    if (tab && shouldArchiveToHistory) {
       ipcRenderer.invoke('project:archive-tab', {
         projectId,
         tab: {
@@ -2172,6 +2173,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }).catch((err: any) => {
         console.warn('[CloseTab] archive failed tab=' + tabId.slice(-12) + ': ' + (err?.message || err));
       });
+    } else if (tab.tabType === 'file') {
+      console.log('[CloseTab] archive skipped file tab=' + tabId.slice(-12));
     }
 
     workspace.tabs.delete(tabId);

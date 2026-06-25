@@ -245,6 +245,8 @@ File-tab участвует в тех же механиках порядка, г
 
 Клик по file-tab открывает `FilePreview` справа поверх terminal area через тот же preview-surface, что Cmd+click/Sidebar file open. Повторный переход обратно должен возвращать пользователя к предыдущему рабочему табу/родителю, а не превращать file-tab в новый терминальный контекст. При правках этой зоны проверяй `Workspace` sync-effects: preview source `tab` не должен быть закрыт sidebar cleanup'ом, а sidebar source не должен переписать active file-tab preview.
 
+File-tab не архивируется в `tab_history` при закрытии и не участвует в Home, Shift+Cmd+T, title-search и iteration-search индексах. Фиолетовая linked-file строка в History выглядит как восстановимая сессия, хотя restore вернул бы только документ-превью без терминального состояния; поэтому фильтр должен идти по `tabType='file'`, а не по цвету `purple`, чтобы не заблокировать будущие обычные вкладки с пользовательским фиолетовым фоном. Старые polluted history-строки с `tab_type='file'` игнорируются на чтении/индексации.
+
 На mobile/native тот же принцип: file-tab остаётся row в списке групп/DnD/status, но tap по нему
 открывает read-only preview sheet через `/api/file-preview`, а не активирует chat route и не
 запускает tab SSE. Если клиент начинает трактовать file-tab как session tab, пользователь видит

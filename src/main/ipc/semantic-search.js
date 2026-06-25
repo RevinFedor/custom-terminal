@@ -777,11 +777,14 @@ function getIndexStats(db) {
 let _indexingInProgress = false;
 let _titleIndexingInProgress = false;
 let _iterationIndexingInProgress = false;
+const NON_FILE_HISTORY_PREDICATE = "(h.tab_type IS NULL OR h.tab_type != 'file')";
+const NON_FILE_HISTORY_PREDICATE_UNALIASED = "(tab_type IS NULL OR tab_type != 'file')";
 
 function cleanupTabTitleIndex(db) {
   db.prepare(`
     DELETE FROM tab_history_title_index
      WHERE history_id NOT IN (SELECT id FROM tab_history)
+        OR history_id IN (SELECT id FROM tab_history WHERE tab_type = 'file')
   `).run();
 }
 
@@ -789,23 +792,26 @@ function cleanupTabIterationIndex(db) {
   db.prepare(`
     DELETE FROM tab_history_iteration_index
      WHERE history_id NOT IN (SELECT id FROM tab_history)
+        OR history_id IN (SELECT id FROM tab_history WHERE tab_type = 'file')
   `).run();
   db.prepare(`
     DELETE FROM tab_history_iteration_scan
      WHERE history_id NOT IN (SELECT id FROM tab_history)
+        OR history_id IN (SELECT id FROM tab_history WHERE tab_type = 'file')
   `).run();
 }
 
 function getTabTitleIndexStats(db, projectId) {
   cleanupTabTitleIndex(db);
   const total = db.prepare(
-    'SELECT COUNT(*) AS count FROM tab_history WHERE project_id = ?'
+    `SELECT COUNT(*) AS count FROM tab_history WHERE project_id = ? AND ${NON_FILE_HISTORY_PREDICATE_UNALIASED}`
   ).get(projectId)?.count || 0;
   const indexed = db.prepare(`
     SELECT COUNT(*) AS count
       FROM tab_history h
       JOIN tab_history_title_index i ON i.history_id = h.id
      WHERE h.project_id = ?
+       AND ${NON_FILE_HISTORY_PREDICATE}
        AND i.embedding IS NOT NULL
   `).get(projectId)?.count || 0;
   return {
@@ -830,6 +836,7 @@ async function indexTabTitles(db, projectId, progressCb, force = false) {
       FROM tab_history h
       LEFT JOIN tab_history_title_index i ON i.history_id = h.id
      WHERE h.project_id = ?
+       AND ${NON_FILE_HISTORY_PREDICATE}
      ORDER BY h.closed_at DESC, h.id DESC
   `).all(projectId);
 
@@ -900,6 +907,7 @@ async function searchTabTitles(db, projectId, query, opts = {}) {
       FROM tab_history h
       JOIN tab_history_title_index i ON i.history_id = h.id
      WHERE h.project_id = ?
+       AND ${NON_FILE_HISTORY_PREDICATE}
        AND i.embedding IS NOT NULL
      ORDER BY h.closed_at DESC, h.id DESC
   `).all(projectId);
@@ -1000,6 +1008,7 @@ function getTabIterationIndexStats(db, projectId, opts = {}) {
     SELECT COALESCE(SUM(CASE WHEN message_count IS NULL THEN 0 ELSE message_count END), 0) AS count
       FROM tab_history h
      WHERE h.project_id = ?
+       AND ${NON_FILE_HISTORY_PREDICATE}
        AND (claude_session_id IS NOT NULL OR codex_session_id IS NOT NULL)
        ${dateWhere}
        AND id NOT IN (
@@ -1018,6 +1027,7 @@ function getTabIterationIndexStats(db, projectId, opts = {}) {
       FROM tab_history_iteration_index
       JOIN tab_history h ON h.id = tab_history_iteration_index.history_id
      WHERE tab_history_iteration_index.project_id = ?
+       AND ${NON_FILE_HISTORY_PREDICATE}
        ${dateWhere}
        AND embedding IS NOT NULL
   `).get(...indexParams)?.count || 0;
@@ -1026,6 +1036,7 @@ function getTabIterationIndexStats(db, projectId, opts = {}) {
       FROM tab_history_iteration_index
       JOIN tab_history h ON h.id = tab_history_iteration_index.history_id
      WHERE tab_history_iteration_index.project_id = ?
+       AND ${NON_FILE_HISTORY_PREDICATE}
        ${dateWhere}
   `).get(...indexParams)?.count || 0;
   const total = Math.max(discovered + (Number(missingApprox) || 0), indexed, discovered);
@@ -1056,6 +1067,7 @@ async function indexTabIterations(db, projectId, progressCb, force = false, clau
       FROM tab_history h
       LEFT JOIN tab_history_iteration_index i ON i.history_id = h.id
      WHERE h.project_id = ?
+       AND ${NON_FILE_HISTORY_PREDICATE}
        AND (h.claude_session_id IS NOT NULL OR h.codex_session_id IS NOT NULL)
        ${dateWhere}
      GROUP BY h.id
@@ -1093,6 +1105,7 @@ async function indexTabIterations(db, projectId, progressCb, force = false, clau
       FROM tab_history_iteration_index i
       JOIN tab_history h ON h.id = i.history_id
      WHERE i.project_id = ?
+       AND ${NON_FILE_HISTORY_PREDICATE}
        ${dateWhere}
   `).all(...rowParams);
   const existing = new Map();
@@ -1255,6 +1268,7 @@ async function searchTabIterations(db, projectId, query, opts = {}) {
       FROM tab_history_iteration_index i
       JOIN tab_history h ON h.id = i.history_id
      WHERE i.project_id = ?
+       AND ${NON_FILE_HISTORY_PREDICATE}
        AND i.embedding IS NOT NULL
        ${dateWhere}
      ORDER BY h.closed_at DESC, i.iteration_index ASC

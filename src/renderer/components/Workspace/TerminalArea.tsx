@@ -138,11 +138,12 @@ const ExternalRunBadge = memo(({ meta }: { meta: ExternalRunMeta }) => {
   );
 });
 
-const RestoredTerminalError = memo(({ tabId, ownerProjectId, cwd, error }: { tabId: string; ownerProjectId: string; cwd: string; error: any }) => {
-  const visible = useWorkspaceStore((s) => {
+const RestoredTerminalError = memo(({ tabId, ownerProjectId, cwd, error, visible: visibleProp }: { tabId: string; ownerProjectId: string; cwd: string; error: any; visible?: boolean }) => {
+  const visibleFromStore = useWorkspaceStore((s) => {
     const ws = s.openProjects.get(ownerProjectId);
     return s.activeProjectId === ownerProjectId && ws?.activeTabId === tabId && ws?.currentView === 'terminal';
   });
+  const visible = visibleProp ?? visibleFromStore;
   const isMissingCwd = error?.type === 'working_directory_missing';
   return (
     <div className={`absolute inset-0 ${visible ? 'flex' : 'hidden'} items-center justify-center bg-[#111113] text-[#d4d4d4]`}>
@@ -883,9 +884,9 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     }
   };
 
-  // Stable string selector — re-renders only when tab structure changes.
-  // Active-tab state is local to Terminal/BrowserTab/ClaudeSDKTab; including
-  // activeTabId here recreates all persistent terminal layers on every tab click.
+  // Stable string selector — re-renders only when tab structure changes or a
+  // tab changes its own rendered surface. Active project/tab visibility is
+  // tracked separately below so project switches do not remount xterm.
   const terminalFingerprint = useWorkspaceStore((s) => {
     const parts: string[] = [];
     s.openProjects.forEach((workspace, projId) => {
@@ -894,21 +895,61 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
         : '';
       parts.push(`${projId}${subAgentPart}`);
       workspace.tabs.forEach((tab) => {
-        parts.push(`${tab.id}:${tab.tabType || 'terminal'}:${(tab as any).restoreError ? 'restore-error' : 'ok'}`);
+        parts.push(`${tab.id}:${tab.tabType || 'terminal'}:${tab.activeView || ''}:${tab.terminalId || ''}:${(tab as any).restoreError ? 'restore-error' : 'ok'}`);
       });
     });
     return parts.join(',');
   });
 
+  // Active layer is intentionally separate from the structural fingerprint.
+  // Terminals stay mounted across project switches, but the visible DOM layer
+  // must be driven by one fresh store snapshot so an old project cannot keep
+  // `active=1`/opacity=1 after the active project changes.
+  const activeLayerKey = useWorkspaceStore((s) => {
+    const activeProjectId = s.activeProjectId || '';
+    const workspace = activeProjectId ? s.openProjects.get(activeProjectId) : null;
+    return [
+      s.view,
+      activeProjectId,
+      workspace?.activeTabId || '',
+      workspace?.currentView || '',
+      workspace?.viewingSubAgentTabId || '',
+    ].join('|');
+  });
+
   const terminals = useMemo(() => {
     const t0 = Date.now();
     const result: React.ReactNode[] = [];
-    const currentOpenProjects = useWorkspaceStore.getState().openProjects;
+    const state = useWorkspaceStore.getState();
+    const currentOpenProjects = state.openProjects;
+    const activeProjectId = state.activeProjectId;
+    const appView = state.view;
     let sdkCount = 0;
     let totalCount = 0;
 
+    const isActiveProjectForLayer = (projId: string) => (
+      appView === 'workspace' && activeProjectId === projId
+    );
+
+    const isActiveTerminalLayer = (projId: string, tabId: string) => {
+      if (!isActiveProjectForLayer(projId)) return false;
+      const workspace = currentOpenProjects.get(projId);
+      if (!workspace || workspace.currentView !== 'terminal') return false;
+
+      if (workspace.viewingSubAgentTabId) {
+        const viewedTab = workspace.tabs.get(workspace.viewingSubAgentTabId);
+        if (viewedTab && viewedTab.parentTabId === workspace.activeTabId) {
+          return tabId === workspace.viewingSubAgentTabId;
+        }
+      }
+
+      return workspace.activeTabId === tabId;
+    };
+
     currentOpenProjects.forEach((workspace, projId) => {
       workspace.tabs.forEach((tab) => {
+        const isActiveProject = isActiveProjectForLayer(projId);
+        const active = isActiveTerminalLayer(projId, tab.id);
         if (tab.tabType === 'claude-sdk') {
           sdkCount++;
           totalCount++;
@@ -918,6 +959,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
               tabId={tab.id}
               cwd={tab.cwd}
               ownerProjectId={projId}
+              active={active}
+              isActiveProject={isActiveProject}
             />
           );
         } else if (tab.tabType === 'browser') {
@@ -931,6 +974,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
               terminalName={tab.terminalName}
               activeView={tab.activeView || 'browser'}
               cwd={tab.cwd}
+              active={active}
+              isActiveProject={isActiveProject}
             />
           );
         } else if (tab.tabType === 'file') {
@@ -947,6 +992,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
               ownerProjectId={projId}
               cwd={tab.cwd}
               error={(tab as any).restoreError}
+              visible={active}
             />
           );
         } else {
@@ -957,6 +1003,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
               tabId={tab.id}
               cwd={tab.cwd}
               ownerProjectId={projId}
+              active={active}
+              isActiveProject={isActiveProject}
             />
           );
         }
@@ -966,7 +1014,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     const durMs = Date.now() - t0;
     console.warn(`[TerminalArea:useMemo] RECALCULATING projectId=${projectId.slice(-12)} total=${totalCount} sdk=${sdkCount} durMs=${durMs}`);
     return result;
-  }, [terminalFingerprint, projectId]);
+  }, [terminalFingerprint, activeLayerKey, projectId]);
 
   // Listen for Claude fork completion to create new tab with command
   useEffect(() => {

@@ -59,6 +59,11 @@ External Codex run metadata (`externalRun`) — не runtime-only. Она хра
 
 **Emergency save**: на `beforeunload` используется `sendSync` вместо `invoke` — гарантия записи до закрытия окна, даже при ценой UI-блока на 50мс.
 
+### Startup restore и мёртвые project paths
+`workspace-session` может пережить удаление временной папки или строки проекта в SQLite: dev/E2E сценарий оставил открытый проект `/tmp/noted-git-panel-test`, затем папку удалили, а startup всё ещё пытался создать default terminal для stale project. Симптом для пользователя — запуск падает в restore с `working_directory_missing:<path>`, хотя реальных tabs/projects по этому пути уже нет.
+
+Restore обязан различать два случая. Если project row уже отсутствует и path из `workspace-session` тоже не существует — stale project пропускается и не попадает в `openProjects`. Если project row существует, но cwd таба умер — создаётся broken restored tab с `restoreError`, а не обрывается весь startup. Нельзя чинить это простым удалением всех missing-cwd tabs: пользователь должен увидеть, какая сохранённая рабочая папка пропала, если сам проект ещё реален.
+
 ### Safe saveTabs — targeted DELETE + INSERT
 Метод `saveTabs` использует **точечный DELETE по `tab_id`** вместо `DELETE ALL + re-INSERT`. Защита от потери данных если in-memory Map неполный (race conditions, параллельные IPC). Для batch-операций (перенос 3+ табов, массовое закрытие) флаг `forceCleanup` обходит safety guard. Детали: [`fix-save-tabs-data-loss.md`](fix-save-tabs-data-loss.md).
 

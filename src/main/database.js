@@ -1033,6 +1033,10 @@ class DatabaseManager {
   // ========== TAB HISTORY (CLOSED TABS ARCHIVE) ==========
 
   archiveTab(projectId, tab) {
+    const tabType = tab?.tabType || tab?.tab_type || 'terminal';
+    if (tabType === 'file') {
+      return null;
+    }
     const now = Math.floor(Date.now() / 1000);
     const info = this.db.prepare(`
       INSERT INTO tab_history (project_id, name, name_set_manually, cwd, color, notes, command_type, tab_type, url, file_path, created_at, closed_at, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, message_count, position, process_was_running, session_status, group_id)
@@ -1045,7 +1049,7 @@ class DatabaseManager {
       tab.color || null,
       tab.notes || null,
       tab.commandType || null,
-      tab.tabType || 'terminal',
+      tabType,
       tab.url || null,
       tab.filePath || null,
       tab.createdAt || now,
@@ -1068,7 +1072,7 @@ class DatabaseManager {
   // Returns the row and deletes it atomically so repeated calls walk backwards.
   popLatestTabHistory(projectId) {
     const row = this.db.prepare(
-      'SELECT * FROM tab_history WHERE project_id = ? ORDER BY closed_at DESC, id DESC LIMIT 1'
+      "SELECT * FROM tab_history WHERE project_id = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC LIMIT 1"
     ).get(projectId);
     if (!row) return null;
     this.db.prepare('DELETE FROM tab_history WHERE id = ?').run(row.id);
@@ -1078,17 +1082,17 @@ class DatabaseManager {
   getTabHistory(projectId, limit = 0) {
     if (limit && limit > 0) {
       return this.db.prepare(
-        'SELECT * FROM tab_history WHERE project_id = ? ORDER BY closed_at DESC, id DESC LIMIT ?'
+        "SELECT * FROM tab_history WHERE project_id = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC LIMIT ?"
       ).all(projectId, limit);
     }
     return this.db.prepare(
-      'SELECT * FROM tab_history WHERE project_id = ? ORDER BY closed_at DESC, id DESC'
+      "SELECT * FROM tab_history WHERE project_id = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC"
     ).all(projectId);
   }
 
   getTabHistoryCount(projectId) {
     const row = this.db.prepare(
-      'SELECT COUNT(*) as count FROM tab_history WHERE project_id = ?'
+      "SELECT COUNT(*) as count FROM tab_history WHERE project_id = ? AND (tab_type IS NULL OR tab_type != 'file')"
     ).get(projectId);
     return row ? row.count : 0;
   }

@@ -1257,35 +1257,39 @@
   },
   {
     "path": "docs/knowledge/fact-git-коммиты.md",
-    "hash": "ebc4fe065d72b8e2f56ee10a63da83523344e0112b195a50b45ca89572b0a872",
+    "hash": "fb15f2b2dd85370289942a186e469c8ad1769e1d530583ffc41ca646243759e7",
     "type": "fact",
     "explicit": [
-      "Git commits",
-      "project-level Git integration",
-      "toolbar status",
+      "git integration in workspace",
+      "project-level control",
+      "toolbar status contract",
       "repository selector",
       "commit workflow",
+      "history tab",
       "AI commit message generation",
-      "remote authentication recovery",
-      "branch selection",
-      "push/publish/fetch actions",
-      "docs-only AI context"
+      "remote auth recovery"
     ],
     "implicit": [
-      "project toolbar",
-      "workspace-scoped repo selection",
-      "nested .git repositories",
-      "project-scoped state persistence",
-      "diff preview panel",
-      "commit file selection checkbox",
-      "staged and unstaged path separation",
-      "split-button push control",
+      "project-scoped git state",
+      "toolbar branch status chip",
+      "changed-file count badge",
+      "workspace .git detection",
+      "nested repository discovery",
+      "project-scoped repo selection persistence",
+      "changes preview panel",
+      "diff preview split view",
+      "commit-selected-paths semantics",
+      "upstream detection",
+      "origin fallback comparison",
+      "soft reset undo commit",
+      "split-button push publish",
       "stable AI prompt id git-commit",
-      "Settings AI prompt configuration",
-      "GitHub Desktop login fallback"
+      "Docs-only AI context toggle",
+      "GitHub Desktop handoff",
+      "persistent auth toast"
     ],
     "symptoms": [
-      "When the Git button is missing outside a repository or appears only as a compact branch and change-count status in the toolbar. When a developer needs to confirm how the Git panel is anchored, resized, and restored without causing layout jumps. When a monorepo or nested repository is being selected and the app must remember the chosen repo per project. When clicking a changed file should open a diff preview instead of silently changing the commit set. When a commit accidentally includes unrelated already-staged files and the selection logic needs to be fixed. When AI-generated commit messages need the correct prompt source, model, thinking mode, or docs-only context behavior. When push or fetch authorization fails and the app should fall back to GitHub Desktop instead of starting an in-app login flow."
+      "When the Git button should appear only in Git repositories and the toolbar needs a compact branch plus changed-file status instead of a full workflow. When a developer is wiring repo selection for monorepos or nested .git folders and the chosen repo must persist per project. When commit selection, file preview, and staged-file behavior need to stay separate so clicks do not silently change the commit set. When History must mark unpublished commits correctly even without an upstream branch. When AI commit message generation needs the right prompt source, usage logging, or docs-only context trimming. When push or fetch fails because GitHub auth is missing and the app should recover through GitHub Desktop instead of an in-panel login flow."
     ],
     "related_components": []
   },
@@ -1736,7 +1740,7 @@
   },
   {
     "path": "docs/knowledge/fact-project-home.md",
-    "hash": "665547740581781655768098391c3ea9aeda88716bb3ee0cad713e9304b8ff13",
+    "hash": "4b6fe88db2ee31de1d9c187f542ae532ddcf299e08c97f92efca26196d6008c9",
     "type": "fact",
     "explicit": [
       "project home view",
@@ -1744,41 +1748,36 @@
       "read-only preview",
       "title search",
       "iteration search",
-      "favorites surface removed from home",
-      "context menu actions",
-      "directory management",
-      "restore behavior",
-      "home layout",
-      "virtualized history list"
+      "restore flow",
+      "favorites de-emphasis",
+      "virtualized history list",
+      "sticky progress header",
+      "project toolbar home button"
     ],
     "implicit": [
       "ProjectToolbar",
       "project:get-tab-history",
       "project:archive-tab",
+      "tab_history",
       "tab_history_title_index",
       "parseTimelineEntries",
       "HistoryPanel",
       "Timeline",
-      "resume restore",
-      "Cmd+hover popover",
-      "RAG iteration-search",
-      "closed_at DESC",
-      "SQLite",
-      "electron IPC",
-      "virtualized list",
-      "sticky progress header",
-      "project:name-sync"
+      "Codex restore",
+      "Claude restore",
+      "Cmd+hover",
+      "Shift+Cmd+T",
+      "SQLite"
     ],
     "symptoms": [
-      "When the Home button opens a single-column history view instead of a dashboard, this file explains the intended layout and flow. When a closed tab must be found by name, date, or iteration without reopening the terminal, this file describes the search surfaces. When restore works only through Resume, Cmd/Ctrl-click, or context menu, this file clarifies which action should preview and which should actually reopen the tab. When a restore fails because the saved working directory no longer exists, this file defines the expected toast and fallback behavior. When a developer sees Favorites or Active Tabs missing from Home, this file confirms that the omission is intentional. When title filtering, RAG search, and iteration results seem to overlap, this file separates the distinct search modes and their persistence rules."
+      "You need this when the Home screen opens but the layout or data flow no longer matches the current project-history-centered design.",
+      "Use this when closed tabs are showing as grouped sections, wrap-grid cards, or a mini-dashboard instead of one long recoverable history list.",
+      "Use this when clicking a history row only previews content and the restore action must happen through Resume, Cmd/Ctrl-click, or context menu.",
+      "Use this when title filtering is instant but iteration search should be a separate semantic action triggered by RAG or Cmd+Enter.",
+      "Use this when restore appears to fail because the saved working directory is missing, or when Codex should fall back to the nearest existing parent folder.",
+      "Use this when history index counts, progress, or backfilled message counts are stale and the Home view needs a refresh without reloading the whole list."
     ],
-    "related_components": [
-      "ProjectToolbar",
-      "HistoryPanel",
-      "Timeline",
-      "parseTimelineEntries",
-      "tab_history_title_index"
-    ]
+    "related_components": []
   },
   {
     "path": "docs/knowledge/fact-project-toolbar.md",
@@ -2532,30 +2531,26 @@
   },
   {
     "path": "docs/knowledge/fact-tabs.md",
-    "hash": "ef3ebddd05d50e0176be5dbf8c1a71cafa3d7a94a6f35aa3d2c5720f94ff9f97",
+    "hash": "d09627b05b65d295d14db0060ec039265633bde6a2b3f9ef6791b17e40395794",
     "type": "fact",
     "explicit": [
       "tab management",
-      "vertical sidebar layout",
+      "vertical tab sidebar",
       "tab naming patterns",
-      "manual naming persistence",
+      "auto-generated names",
+      "manual name persistence",
       "AI auto-title",
       "tab lifecycle",
-      "project tab behavior",
-      "multi-select",
+      "multi-select tabs",
+      "project tabs",
+      "context menu actions",
       "tab history restore",
-      "session status markers",
-      "revert session submenu",
-      "notification controls",
-      "horizontal scroll behavior",
-      "auto-scroll",
-      "drag and drop",
-      "group rows",
+      "vertical drag and drop",
+      "tab groups",
       "visual parent tabs",
       "file tabs",
-      "collapse and expand",
-      "empty drop zone",
-      "multi-select persistence"
+      "completion notifications",
+      "wheel scrolling behavior"
     ],
     "implicit": [
       "TabSidebar",
@@ -2568,31 +2563,20 @@
       "autoTitleEligible",
       "claudeSessionId",
       "codexSessionId",
-      "setTabCommandType",
-      "createTabAfterCurrent",
+      "geminiSessionId",
+      "useWorkspaceStore",
+      "tab_history",
+      "archiveTab",
       "moveTabsToProject",
-      "project:add-favorite",
-      "project:get-favorites",
-      "project:delete-favorite",
-      "Terminal.tsx",
-      "InfoPanel.tsx",
-      "ActionsPanel.tsx",
-      "tabGroups",
-      "visualParentTabId",
-      "anchorTabId",
-      "completionNotificationPersistent",
-      "completionNotificationFired",
       "captureVerticalDragGeometry",
       "resolveStaticVerticalPreview",
-      "data-keep-selection"
+      "data-keep-selection",
+      "ProjectEmptyDropZone",
+      "tab-process-bar-static",
+      "tab-process-bar-ai-shimmer-overlay"
     ],
     "symptoms": [
-      "When a left sidebar tab list stops scrolling with the mouse wheel, this file explains the vertical-mode wheel handler behavior and the early return guard.",
-      "When a fresh Claude or Codex tab keeps a generic name after the first prompt, this file explains auto-title eligibility, pending arm/consume rules, and manual-name precedence.",
-      "When restoring closed tabs or reopening after restart changes names or colors unexpectedly, this file explains which state is persistent and which auto-title triggers must not run.",
-      "When a tab shows the wrong AI color, wrong command type, or the run-overlay disappears, this file explains tab command promotion and AI-vs-devServer detection rules.",
-      "When group drag and drop, collapsed groups, or visual child chains behave oddly, this file explains the static vertical DnD geometry model and group/container semantics.",
-      "When notification badges or stop/close split actions look inconsistent across tab types, this file explains the tab action layout, process badges, and notification state model."
+      "When a tab is renamed from the inline editor and the name should stay protected from AI auto-title, this file explains the ownership rules. When a Claude or Codex launch should produce a human-readable tab title only on the first real user prompt, this file describes the eligibility and pending-consume flow. When a restored tab, reopened history entry, or resume session is incorrectly renamed again, this file shows why restore must not arm auto-title. When the left tab sidebar does not scroll with the mouse wheel, this file contains the vertical-mode wheel handler gotcha. When multi-select should survive clicks inside side panels, this file explains the `data-keep-selection` exclusion rule. When drag-and-drop in the sidebar jumps near group boundaries or collapsed groups, this file documents the snapshot-based vertical DnD model. When a file tab, visual-child tab, group row, or completion badge behaves unexpectedly, this file maps the sidebar-specific tab semantics."
     ],
     "related_components": [
       "src/renderer/components/Workspace/TabBar.tsx",

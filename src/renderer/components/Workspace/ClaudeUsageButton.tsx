@@ -1,7 +1,7 @@
 // Claude usage limits chip for the project toolbar.
 //
-// Compact display: weekly utilization % colored by severity, with Codex's
-// 5-hour % shown inline when available. Two
+// Compact display: Claude shows weekly utilization %, Codex shows remaining %
+// to match its statusline; both are colored by used-percent severity. Two
 // affordances per project convention (Cmd+Hover, design.md::Closing /
 // Cmd+Shift pin):
 //
@@ -239,6 +239,11 @@ function formatPct(p: number | null | undefined): string {
   return `${Math.round(p)}%`;
 }
 
+function pctRemaining(usedPct: number | null | undefined): number | null {
+  if (usedPct == null || !Number.isFinite(usedPct)) return null;
+  return Math.max(0, Math.min(100, 100 - usedPct));
+}
+
 function colorForPct(p: number | null | undefined): string {
   if (p == null) return '#888';
   if (p < 50) return '#4ade80';
@@ -327,9 +332,21 @@ const MODEL_LABEL: Record<string, string> = {
   unknown: 'Other',
 };
 
-function ProgressRow({ label, pct, resetsAt }: { label: string; pct?: number | null; resetsAt?: string | null }) {
+function ProgressRow({
+  label,
+  pct,
+  resetsAt,
+  displayPct,
+  colorPct,
+}: {
+  label: string;
+  pct?: number | null;
+  resetsAt?: string | null;
+  displayPct?: number | null;
+  colorPct?: number | null;
+}) {
   const v = Math.max(0, Math.min(100, pct ?? 0));
-  const color = colorForPct(pct);
+  const color = colorForPct(colorPct ?? pct);
   return (
     <div style={{ padding: '8px 12px' }}>
       <div style={{
@@ -341,7 +358,7 @@ function ProgressRow({ label, pct, resetsAt }: { label: string; pct?: number | n
       }}>
         <span style={{ color: '#ddd' }}>{label}</span>
         <span style={{ fontVariantNumeric: 'tabular-nums', color }}>
-          {formatPct(pct)}
+          {formatPct(displayPct ?? pct)}
           {resetsAt && (
             <span style={{ color: '#666', marginLeft: 8, fontSize: 10 }}>
               resets {formatResetDateTime(resetsAt)}
@@ -1843,10 +1860,12 @@ function CodexUsageChip() {
   const usageData = selectedAccount?.usage || data;
   const weekly = usageData?.seven_day || usageData?.secondary || null;
   const fiveHour = usageData?.five_hour || usageData?.primary || null;
-  const weeklyPct = weekly?.utilization ?? null;
-  const fiveHourPct = fiveHour?.utilization ?? null;
-  const chipColor = colorForPct(weeklyPct);
-  const fiveHourColor = colorForPct(fiveHourPct);
+  const weeklyUsedPct = weekly?.utilization ?? null;
+  const fiveHourUsedPct = fiveHour?.utilization ?? null;
+  const weeklyLeftPct = pctRemaining(weeklyUsedPct);
+  const fiveHourLeftPct = pctRemaining(fiveHourUsedPct);
+  const chipColor = colorForPct(weeklyUsedPct);
+  const fiveHourColor = colorForPct(fiveHourUsedPct);
   const resetShort = formatResetShort(weekly?.resets_at);
   const fiveHourResetShort = formatResetShort(fiveHour?.resets_at);
   const resetTextColor = '#bbb';
@@ -1872,8 +1891,8 @@ function CodexUsageChip() {
         onClick={() => setClicked(v => !v)}
         onMouseEnter={() => setTriggerHover(true)}
         onMouseLeave={() => setTriggerHover(false)}
-        title={weeklyPct != null
-          ? `Codex${accountLabel ? ` ${accountLabel}` : ''} weekly: ${formatPct(weeklyPct)} • 5-hour: ${formatPct(fiveHourPct)}${resetShort ? ` • weekly resets in ${resetShort}` : ''}${fiveHourResetShort ? ` • 5-hour resets in ${fiveHourResetShort}` : ''}${backgroundRefreshing ? ' • updating' : ''}`
+        title={weeklyUsedPct != null
+          ? `Codex${accountLabel ? ` ${accountLabel}` : ''} weekly left: ${formatPct(weeklyLeftPct)} (used ${formatPct(weeklyUsedPct)}) • 5-hour left: ${formatPct(fiveHourLeftPct)} (used ${formatPct(fiveHourUsedPct)})${resetShort ? ` • weekly resets in ${resetShort}` : ''}${fiveHourResetShort ? ` • 5-hour resets in ${fiveHourResetShort}` : ''}${backgroundRefreshing ? ' • updating' : ''}`
           : (backgroundRefreshing ? 'Codex usage is updating' : (error || 'Codex usage appears after Codex writes a token_count record'))}
         style={{
           display: 'inline-flex',
@@ -1883,7 +1902,7 @@ function CodexUsageChip() {
           minWidth: 76,
           padding: '0 7px',
           background: showPopover ? `${chipColor}0A` : 'transparent',
-          color: weeklyPct != null ? chipColor : '#888',
+          color: weeklyUsedPct != null ? chipColor : '#888',
           border: `1px solid ${showPopover ? `${chipColor}33` : 'rgba(255,255,255,0.12)'}`,
           borderRadius: 4,
           fontSize: 11,
@@ -1905,14 +1924,14 @@ function CodexUsageChip() {
           </>
         ) : (
           <>
-            <CodexIcon size={15} muted={weeklyPct == null} />
+            <CodexIcon size={15} muted={weeklyUsedPct == null} />
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-              <span>{formatPct(weeklyPct)}</span>
+              <span>{formatPct(weeklyLeftPct)}</span>
               {resetShort && <span style={{ color: resetTextColor, fontWeight: 500 }}>{resetShort}</span>}
             </span>
             <span style={{ color: resetTextColor, fontWeight: 500 }}>/</span>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-              <span style={{ color: fiveHourPct != null ? fiveHourColor : '#6b7280' }}>{formatPct(fiveHourPct)}</span>
+              <span style={{ color: fiveHourUsedPct != null ? fiveHourColor : '#6b7280' }}>{formatPct(fiveHourLeftPct)}</span>
               {fiveHourResetShort && <span style={{ color: resetTextColor, fontWeight: 500 }}>{fiveHourResetShort}</span>}
             </span>
           </>
@@ -1956,14 +1975,16 @@ function CodexUsageChip() {
               }}>
                 {accounts.map((account, idx) => {
                   const active = account.accountKey === (selectedAccount?.accountKey || selectedAccountKey);
-                  const accountWeekly = account.usage?.seven_day?.utilization ?? account.usage?.secondary?.utilization ?? null;
-                  const accountFiveHour = account.usage?.five_hour?.utilization ?? account.usage?.primary?.utilization ?? null;
-                  const color = colorForPct(accountWeekly);
+                  const accountWeeklyUsed = account.usage?.seven_day?.utilization ?? account.usage?.secondary?.utilization ?? null;
+                  const accountFiveHourUsed = account.usage?.five_hour?.utilization ?? account.usage?.primary?.utilization ?? null;
+                  const accountWeeklyLeft = pctRemaining(accountWeeklyUsed);
+                  const accountFiveHourLeft = pctRemaining(accountFiveHourUsed);
+                  const color = colorForPct(accountWeeklyUsed);
                   return (
                     <button
                       key={account.accountKey || idx}
                       onClick={(e) => { e.stopPropagation(); selectAccount(account); }}
-                      title={`${account.label} • weekly ${formatPct(accountWeekly)} • 5-hour ${formatPct(accountFiveHour)}${account.plan_type ? ` • ${account.plan_type}` : ''}`}
+                      title={`${account.label} • weekly left ${formatPct(accountWeeklyLeft)} (used ${formatPct(accountWeeklyUsed)}) • 5-hour left ${formatPct(accountFiveHourLeft)} (used ${formatPct(accountFiveHourUsed)})${account.plan_type ? ` • ${account.plan_type}` : ''}`}
                       style={{
                         height: 20,
                         maxWidth: 132,
@@ -2062,8 +2083,20 @@ function CodexUsageChip() {
 
           {usageData ? (
             <>
-              <ProgressRow label="Weekly (Codex)" pct={weekly?.utilization} resetsAt={weekly?.resets_at} />
-              <ProgressRow label="5-hour" pct={fiveHour?.utilization} resetsAt={fiveHour?.resets_at} />
+              <ProgressRow
+                label="Weekly left (Codex)"
+                pct={weeklyUsedPct}
+                displayPct={weeklyLeftPct}
+                colorPct={weeklyUsedPct}
+                resetsAt={weekly?.resets_at}
+              />
+              <ProgressRow
+                label="5-hour left"
+                pct={fiveHourUsedPct}
+                displayPct={fiveHourLeftPct}
+                colorPct={fiveHourUsedPct}
+                resetsAt={fiveHour?.resets_at}
+              />
               {(usageData.plan_type || usageData.limit_id || usageData.timestamp) && (
                 <div style={{
                   padding: '6px 12px',

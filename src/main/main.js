@@ -13549,6 +13549,13 @@ function scheduleArchiveSideEffects(projectId, tab, historyId) {
 
 ipcMain.handle('project:archive-tab', (event, { projectId, tab }) => {
   const started = Date.now();
+  const tabType = tab?.tabType || tab?.tab_type || 'terminal';
+  if (tabType === 'file') {
+    console.log('[Archive:Close] skipped file tab project=' + String(projectId).slice(-12) +
+      ' tabName=' + JSON.stringify(tab?.name || '') +
+      ' durMs=' + (Date.now() - started));
+    return { success: true, skipped: true, historyId: null };
+  }
   const historyId = projectManager.db.archiveTab(projectId, tab);
   const durMs = Date.now() - started;
   const sessionId = tab?.claudeSessionId || tab?.geminiSessionId || tab?.codexSessionId || null;

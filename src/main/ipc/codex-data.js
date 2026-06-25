@@ -11,6 +11,7 @@ const CODEX_LOGS_DB = path.join(CODEX_HOME, 'logs_2.sqlite');
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const USAGE_ACCOUNTS_CACHE_TTL_MS = 60 * 1000;
 const USAGE_ACCOUNTS_FOREGROUND_BUDGET_MS = 1200;
+const CODEX_RESET_DRIFT_TOLERANCE_SECONDS = 10 * 60;
 
 let modelCache = null;
 let usageAccountsCache = null;
@@ -19,6 +20,7 @@ let usageAccountsLastAttemptAt = null;
 let usageAccountsLastError = null;
 const loggedRollbackKeys = new Set();
 const _codexJsonlCache = new Map();
+const _codexSessionSelectSkipLogged = new Set();
 const _codexJsonlInflight = new Map();
 
 function compactPreview(value, max = 120) {
@@ -406,7 +408,59 @@ function getSessionMetas(records) {
 
 function recordsReferenceSession(records, sessionId) {
   if (!sessionId) return false;
-  return getSessionMetas(records).some((meta) => meta?.id === sessionId);
+  return getSessionMetas(records).some((meta) => {
+    if (meta?.id === sessionId) return true;
+    if (meta?.forked_from_id === sessionId) return true;
+    return false;
+  });
+}
+
+function isCodexSubagentSession(meta) {
+  if (!meta) return false;
+  if (meta.thread_source === 'subagent') return true;
+  if (meta.parent_thread_id) return true;
+  if (meta.source && typeof meta.source === 'object' && meta.source.subagent) return true;
+  return false;
+}
+
+function isCodexTuiSession(meta) {
+  if (!meta) return false;
+  if (meta.originator && meta.originator !== 'codex-tui') return false;
+  if (meta.source === 'exec') return false;
+  return true;
+}
+
+function isFreshCodexLaunchSession(meta) {
+  if (!isCodexTuiSession(meta)) return false;
+  if (isCodexSubagentSession(meta)) return false;
+  if (meta.thread_source && meta.thread_source !== 'user') return false;
+  return true;
+}
+
+function codexSessionSkipReason(meta, { sourceSessionId }) {
+  if (sourceSessionId) {
+    return 'source-mismatch';
+  }
+  if (!isCodexTuiSession(meta)) return 'not-tui-session';
+  if (isCodexSubagentSession(meta)) return 'subagent-session';
+  if (meta.thread_source && meta.thread_source !== 'user') return 'non-user-thread';
+  return null;
+}
+
+function logCodexSessionCandidateSkip(meta, filePath, reason, { sourceSessionId }) {
+  const sessionId = meta?.id || 'unknown';
+  const key = [sessionId, path.basename(filePath || ''), reason, sourceSessionId || 'fresh'].join(':');
+  if (_codexSessionSelectSkipLogged.has(key)) return;
+  _codexSessionSelectSkipLogged.add(key);
+  console.log('[CodexSessionSelect] skip session=' + sessionId +
+    ' reason=' + reason +
+    ' file=' + path.basename(filePath || '') +
+    ' cwd=' + (meta?.cwd || 'n/a') +
+    ' threadSource=' + (meta?.thread_source || 'n/a') +
+    ' parent=' + (meta?.parent_thread_id || 'n/a') +
+    ' forkedFrom=' + (meta?.forked_from_id || 'n/a') +
+    ' originator=' + (meta?.originator || 'n/a') +
+    ' source=' + (sourceSessionId || 'n/a'));
 }
 
 async function findCodexSessionFile(sessionId, cwd) {
@@ -475,6 +529,24 @@ async function findLatestCodexSession({ cwd, sinceMs = 0, sourceSessionId = null
     const cwdMatched = !normalizedCwd || (metaCwd && metaCwd === normalizedCwd);
     const cwdRelated = !normalizedCwd || (metaCwd && pathsAreSameOrNested(metaCwd, normalizedCwd));
     const sourceMatched = !!sourceSessionId && recordsReferenceSession(records, sourceSessionId);
+    if (sourceSessionId && !sourceMatched) {
+      if (cwdMatched || cwdRelated) {
+        logCodexSessionCandidateSkip(meta, candidate.filePath, codexSessionSkipReason(meta, { sourceSessionId }), { sourceSessionId });
+      }
+      continue;
+    }
+    if (sourceSessionId && !isFreshCodexLaunchSession(meta)) {
+      if (cwdMatched || cwdRelated || sourceMatched) {
+        logCodexSessionCandidateSkip(meta, candidate.filePath, codexSessionSkipReason(meta, { sourceSessionId: null }), { sourceSessionId });
+      }
+      continue;
+    }
+    if (!sourceSessionId && !isFreshCodexLaunchSession(meta)) {
+      if (cwdMatched || cwdRelated) {
+        logCodexSessionCandidateSkip(meta, candidate.filePath, codexSessionSkipReason(meta, { sourceSessionId }), { sourceSessionId });
+      }
+      continue;
+    }
     if (!cwdMatched && !sourceMatched) {
       if (cwdRelated) {
         relatedFallbacks.push({
@@ -484,6 +556,10 @@ async function findLatestCodexSession({ cwd, sinceMs = 0, sourceSessionId = null
           cwdMatched: false,
           cwdRelated: true,
           sourceMatched,
+          threadSource: meta.thread_source || null,
+          parentThreadId: meta.parent_thread_id || null,
+          forkedFromId: meta.forked_from_id || null,
+          originator: meta.originator || null,
         });
       }
       continue;
@@ -495,6 +571,10 @@ async function findLatestCodexSession({ cwd, sinceMs = 0, sourceSessionId = null
       cwdMatched,
       cwdRelated,
       sourceMatched,
+      threadSource: meta.thread_source || null,
+      parentThreadId: meta.parent_thread_id || null,
+      forkedFromId: meta.forked_from_id || null,
+      originator: meta.originator || null,
     };
   }
   return relatedFallbacks[0] || null;
@@ -1761,17 +1841,23 @@ function codexRateResetEpoch(rateLimits, bucketName) {
   return 0;
 }
 
+function compareCodexResetGeneration(next, prev, bucketName) {
+  const nextReset = codexRateResetEpoch(next.rateLimits, bucketName);
+  const prevReset = codexRateResetEpoch(prev.rateLimits, bucketName);
+  const diff = nextReset - prevReset;
+  if (Math.abs(diff) <= CODEX_RESET_DRIFT_TOLERANCE_SECONDS) return 0;
+  return diff;
+}
+
 function compareCodexRateSnapshotFreshness(next, prev) {
   if (!prev) return 1;
   if (!next) return -1;
 
-  const nextWeeklyReset = codexRateResetEpoch(next.rateLimits, 'secondary');
-  const prevWeeklyReset = codexRateResetEpoch(prev.rateLimits, 'secondary');
-  if (nextWeeklyReset !== prevWeeklyReset) return nextWeeklyReset - prevWeeklyReset;
+  const weeklyGeneration = compareCodexResetGeneration(next, prev, 'secondary');
+  if (weeklyGeneration !== 0) return weeklyGeneration;
 
-  const nextFiveHourReset = codexRateResetEpoch(next.rateLimits, 'primary');
-  const prevFiveHourReset = codexRateResetEpoch(prev.rateLimits, 'primary');
-  if (nextFiveHourReset !== prevFiveHourReset) return nextFiveHourReset - prevFiveHourReset;
+  const fiveHourGeneration = compareCodexResetGeneration(next, prev, 'primary');
+  if (fiveHourGeneration !== 0) return fiveHourGeneration;
 
   const nextTs = Number(next.ts) || 0;
   const prevTs = Number(prev.ts) || 0;
@@ -1920,6 +2006,7 @@ async function scanLatestCodexUsageAccounts() {
         ':5h=' + (fiveHour?.utilization ?? 'null') +
         ':wReset=' + (weekly?.resets_at || 'null') +
         ':5hReset=' + (fiveHour?.resets_at || 'null') +
+        ':sample=' + (a.timestamp || 'null') +
         ':thread=' + (shortCodexId(a.sourceThreadId) || 'none');
     }).join(','));
   return accounts;

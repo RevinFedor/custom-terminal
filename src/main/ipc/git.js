@@ -43,9 +43,9 @@ function runGit(cwd, args, options = {}) {
   });
 }
 
-async function getRepoRoot(projectPath) {
+async function getRepoRoot(projectPath, options = {}) {
   const cwd = safeProjectPath(projectPath);
-  const result = await runGit(cwd, ['rev-parse', '--show-toplevel']);
+  const result = await runGit(cwd, ['rev-parse', '--show-toplevel'], options);
   if (!result.success) return null;
   return result.stdout.trim();
 }
@@ -265,6 +265,11 @@ function parseNumstat(stdout) {
   return { additions, deletions };
 }
 
+function addRepository(found, repoPath, source) {
+  if (!repoPath || found.has(repoPath)) return;
+  found.set(repoPath, { path: repoPath, source });
+}
+
 async function listRepositories(projectPath) {
   const homeRoot = await getRepoRoot(projectPath);
   const scanRoot = safeProjectPath(projectPath);
@@ -272,8 +277,8 @@ async function listRepositories(projectPath) {
     '.git', 'node_modules', 'dist', 'build', 'out', 'release', '.next', '.vite',
     '.cache', 'coverage', 'tmp', '.venv', 'venv',
   ]);
-  const found = new Set();
-  if (homeRoot) found.add(homeRoot);
+  const found = new Map();
+  if (homeRoot) addRepository(found, homeRoot, 'home');
 
   async function walk(dir, depth) {
     if (found.size >= 300 || depth > 5) return;
@@ -285,7 +290,7 @@ async function listRepositories(projectPath) {
     }
     const hasGit = entries.some((entry) => entry.name === '.git');
     if (hasGit) {
-      found.add(dir);
+      addRepository(found, dir, dir === homeRoot ? 'home' : 'nested');
       if (dir !== scanRoot) return;
     }
     for (const entry of entries) {
@@ -296,16 +301,24 @@ async function listRepositories(projectPath) {
   }
 
   await walk(scanRoot, 0);
-  const roots = Array.from(found).sort((a, b) => {
-    if (a === homeRoot) return -1;
-    if (b === homeRoot) return 1;
-    return a.localeCompare(b);
+  const roots = Array.from(found.values()).sort((a, b) => {
+    if (a.path === homeRoot) return -1;
+    if (b.path === homeRoot) return 1;
+    const rank = { nested: 0, home: -1 };
+    const ar = rank[a.source] ?? 2;
+    const br = rank[b.source] ?? 2;
+    if (ar !== br) return ar - br;
+    return a.path.localeCompare(b.path);
   });
-  return roots.map((repoPath) => ({
-    path: repoPath,
-    name: path.basename(repoPath),
-    relativePath: repoPath === homeRoot ? '' : path.relative(scanRoot, repoPath) || path.basename(repoPath),
-    home: repoPath === homeRoot,
+  return roots.map((repo) => ({
+    path: repo.path,
+    name: path.basename(repo.path),
+    relativePath: repo.path === homeRoot
+      ? ''
+      : (repo.path.startsWith(scanRoot + path.sep)
+        ? path.relative(scanRoot, repo.path)
+        : repo.path),
+    home: repo.path === homeRoot,
   }));
 }
 
@@ -481,9 +494,42 @@ function register({ projectManager }) {
       const count = Math.max(1, Math.min(100, Number(limit) || 30));
       const result = await runGit(root, ['log', '--date=relative', '--pretty=format:%h%x09%cr%x09%s', '-n', String(count)]);
       if (!result.success) return { success: true, commits: [] };
+      const upstream = await hasUpstream(root);
+      const unpushedHashes = new Set();
+      if (upstream) {
+        const aheadResult = await runGit(root, ['log', '--pretty=format:%h', `${upstream}..HEAD`, '-n', String(count)]);
+        if (aheadResult.success) {
+          for (const line of aheadResult.stdout.split(/\r?\n/)) {
+            const hash = line.trim();
+            if (hash) unpushedHashes.add(hash);
+          }
+        }
+      } else {
+        const branch = await currentBranch(root);
+        if (branch && branch !== 'HEAD') {
+          const originBranch = await runGit(root, ['rev-parse', '--verify', '--quiet', `origin/${branch}`]);
+          if (originBranch.success) {
+            const aheadResult = await runGit(root, ['log', '--pretty=format:%h', `origin/${branch}..HEAD`, '-n', String(count)]);
+            if (aheadResult.success) {
+              for (const line of aheadResult.stdout.split(/\r?\n/)) {
+                const hash = line.trim();
+                if (hash) unpushedHashes.add(hash);
+              }
+            }
+          } else {
+            const localResult = await runGit(root, ['log', '--pretty=format:%h', '-n', String(count)]);
+            if (localResult.success) {
+              for (const line of localResult.stdout.split(/\r?\n/)) {
+                const hash = line.trim();
+                if (hash) unpushedHashes.add(hash);
+              }
+            }
+          }
+        }
+      }
       const commits = result.stdout.split(/\r?\n/).filter(Boolean).map((line) => {
         const [hash, date, ...subjectParts] = line.split('\t');
-        return { hash, date, subject: subjectParts.join('\t') };
+        return { hash, date, subject: subjectParts.join('\t'), unpushed: unpushedHashes.has(hash) };
       });
       return { success: true, commits };
     } catch (error) {
@@ -718,6 +764,45 @@ function register({ projectManager }) {
       }
       const hash = await runGit(root, ['rev-parse', '--short', 'HEAD']);
       return { success: true, hash: hash.success ? hash.stdout.trim() : '', output: commitResult.stdout };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('git:undo-last-commit', async (event, { projectPath, hash }) => {
+    try {
+      const root = await getRepoRoot(projectPath);
+      if (!root) throw new Error('Not a Git repository');
+      const targetHash = String(hash || '').trim();
+      if (!targetHash) throw new Error('Commit hash is required');
+      const head = await runGit(root, ['rev-parse', '--short', 'HEAD']);
+      if (!head.success) throw new Error(head.stderr || head.error || 'Unable to read HEAD');
+      if (head.stdout.trim() !== targetHash) throw new Error('Only the latest commit can be undone');
+      const parents = await runGit(root, ['rev-list', '--parents', '-n', '1', 'HEAD']);
+      if (!parents.success) throw new Error(parents.stderr || parents.error || 'Unable to inspect commit parents');
+      if (parents.stdout.trim().split(/\s+/).length < 2) {
+        throw new Error('Cannot undo the initial commit from this panel');
+      }
+      const upstream = await hasUpstream(root);
+      let protectRef = upstream;
+      if (!protectRef) {
+        const branch = await currentBranch(root);
+        if (branch && branch !== 'HEAD') {
+          const originBranch = await runGit(root, ['rev-parse', '--verify', '--quiet', `origin/${branch}`]);
+          if (originBranch.success) protectRef = `origin/${branch}`;
+        }
+      }
+      if (protectRef) {
+        const pushedCheck = await runGit(root, ['merge-base', '--is-ancestor', 'HEAD', protectRef]);
+        if (pushedCheck.success) {
+          throw new Error('Latest commit is already pushed');
+        }
+      }
+      const result = await runGit(root, ['reset', '--soft', 'HEAD~1']);
+      if (!result.success) {
+        return { success: false, error: result.stderr || result.error || 'git reset failed' };
+      }
+      return { success: true };
     } catch (error) {
       return { success: false, error: error.message };
     }

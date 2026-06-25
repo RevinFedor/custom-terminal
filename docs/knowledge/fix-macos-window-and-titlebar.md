@@ -93,3 +93,16 @@ mainWindow.once('ready-to-show', () => {
 ### Файлы
 - `src/renderer/App.tsx` — Title Bar, ProjectTabItem, ProjectEmptyDropZone
 - `src/renderer/styles/globals.css` — `.title-bar`, `.window-controls-placeholder`
+
+---
+
+## Часть 3: Dev stack links открывают браузер по умолчанию
+
+### Симптом
+При клике по ссылке из dev overlay / stack trace вроде `http://localhost:5182/src/renderer/App.tsx:962:7` открывается новая вкладка в браузере по умолчанию. Это выглядит так, будто Yandex сам реагирует на правки, но реальная причина в Electron main window navigation guard.
+
+### Причина
+Глобальный `will-navigate`/`setWindowOpenHandler` перехватывал любую навигацию и для всех `http(s)` делал `shell.openExternal(url)`. Для внешних ссылок это правильно, но dev renderer-origin (`localhost:5182`) — внутренняя ссылка приложения. Если отправлять её в `openExternal`, она уходит в Yandex/Chrome; если просто разрешить навигацию внутри Electron, главное окно уезжает со SPA на source-файл и renderer ломается.
+
+### Решение
+Renderer-origin URL в dev нужно гасить: `event.preventDefault()` и без `shell.openExternal`. В `setWindowOpenHandler` для того же origin возвращать `deny`. Внешние `http(s)` ссылки продолжают открываться во внешнем браузере.
