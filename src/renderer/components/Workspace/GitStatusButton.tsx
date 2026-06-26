@@ -226,6 +226,10 @@ function makeHomeRepositories(repoPath?: string | null): GitRepository[] {
   return [makeRepository(repoPathValue, repoPathValue, true)];
 }
 
+function gitStatusPreviewSignature(status?: GitStatus | null): string {
+  return status?.files?.map((file) => `${file.xy}:${file.path}`).join('\0') || '';
+}
+
 export default function GitStatusButton({ projectId, projectName, projectPath }: Props) {
   const showToast = useUIStore((state) => state.showToast);
   const activeTabMetaKey = useWorkspaceStore((state) => {
@@ -289,18 +293,19 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const fsDebounceRef = useRef<number | null>(null);
   const saveDebounceRef = useRef<number | null>(null);
   const statusRequestRef = useRef(0);
+  const statusRef = useRef<GitStatus | null>(null);
+  const statusPreviewSignatureRef = useRef('');
   const latestProjectPathRef = useRef(projectPath || '');
   const hydratedStateKeyRef = useRef('');
   const selectionInitializedKeyRef = useRef('');
 
   const selectedCount = selectedPaths.size;
   const allSelected = status?.files.length ? selectedCount === status.files.length : false;
-  const pushLabel = status?.upstream ? 'Push' : 'Publish';
   const [activeTabId, activeTabName] = useMemo(() => {
     const [tabId, tabName] = activeTabMetaKey.split('\0');
     return [tabId || null, tabName || null];
   }, [activeTabMetaKey]);
-  const statusFileKey = useMemo(() => status?.files.map((file) => `${file.xy}:${file.path}`).join('\0') || '', [status?.files]);
+  const statusFileKey = useMemo(() => gitStatusPreviewSignature(status), [status?.files]);
   const panelStateKey = useMemo(
     () => gitPanelStateKey(projectId, undefined, projectPath),
     [projectId, projectPath]
@@ -347,17 +352,19 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       .filter((repo) => !q || `${repo.name} ${repo.relativePath} ${repo.path}`.toLowerCase().includes(q));
   }, [repoFavorites, repositoryByPath, repoSearch]);
 
-  const currentStatusRoot = status?.repoRoot || '';
-  const hasCurrentStatus = Boolean(status?.isRepo);
-
-  const loadStatus = useCallback(async (visible = false) => {
+  const loadStatus = useCallback(async (visible = false, refreshPreview = visible) => {
     const requestPath = effectiveRepoPath;
     const requestId = ++statusRequestRef.current;
     if (!requestPath) {
+      statusRef.current = null;
+      statusPreviewSignatureRef.current = '';
       setStatus(null);
       setStatusLoading(false);
       return;
     }
+    const currentStatus = statusRef.current;
+    const currentStatusRoot = currentStatus?.repoRoot || '';
+    const hasCurrentStatus = Boolean(currentStatus?.isRepo);
     const showProbe = visible || !hasCurrentStatus || (currentStatusRoot && requestPath !== currentStatusRoot);
     if (showProbe) setStatusLoading(true);
     try {
@@ -368,19 +375,28 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
           setSelectedRepoPath(projectPath);
           return;
         }
+        statusRef.current = null;
+        statusPreviewSignatureRef.current = '';
         setStatus(null);
         return;
       }
-      setStatus(result as GitStatus);
-      setStatusVersion((value) => value + 1);
+      const nextStatus = result as GitStatus;
+      const nextPreviewSignature = gitStatusPreviewSignature(nextStatus);
+      const shouldRefreshPreview = refreshPreview || nextPreviewSignature !== statusPreviewSignatureRef.current;
+      statusRef.current = nextStatus;
+      statusPreviewSignatureRef.current = nextPreviewSignature;
+      setStatus(nextStatus);
+      if (shouldRefreshPreview) setStatusVersion((value) => value + 1);
     } catch (error: any) {
       if (statusRequestRef.current !== requestId) return;
       if (visible) showToast('Git status: ' + trimError(error?.message || error), 'error');
+      statusRef.current = null;
+      statusPreviewSignatureRef.current = '';
       setStatus(null);
     } finally {
       if (statusRequestRef.current === requestId && showProbe) setStatusLoading(false);
     }
-  }, [currentStatusRoot, effectiveRepoPath, hasCurrentStatus, projectPath, showToast]);
+  }, [effectiveRepoPath, projectPath, showToast]);
 
   const loadHistory = useCallback(async () => {
     if (!effectiveRepoPath) return;
@@ -461,6 +477,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     const nextProjectPath = projectPath || '';
     latestProjectPathRef.current = nextProjectPath;
     statusRequestRef.current += 1;
+    statusRef.current = null;
+    statusPreviewSignatureRef.current = '';
     setStatus(null);
     setStatusLoading(Boolean(nextProjectPath));
     setSelectedRepoPath(nextProjectPath);
@@ -673,7 +691,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     const onFsChange = (_event: any, payload: any) => {
       if (!status?.repoRoot || !payload?.path || !String(payload.path).startsWith(status.repoRoot)) return;
       if (fsDebounceRef.current) window.clearTimeout(fsDebounceRef.current);
-      fsDebounceRef.current = window.setTimeout(() => loadStatus(false), 350);
+      fsDebounceRef.current = window.setTimeout(() => loadStatus(false, true), 350);
     };
     ipcRenderer.on('fs:change', onFsChange);
     return () => {
@@ -1012,12 +1030,13 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     ? 'Fetching'
     : remoteBusy === 'push'
       ? 'Pushing'
-      : pushLabel + ' branch';
+      : (status.upstream ? 'Push origin' : 'Publish branch');
   const remoteSubtitle = remoteBusy === 'fetch'
     ? 'Fetching latest changes'
     : remoteBusy === 'push'
       ? (status.upstream ? 'Pushing to origin' : 'Publishing branch')
       : (status.upstream ? 'Push changes to origin' : 'Publish this branch to ...');
+  const remoteAheadCount = Math.max(0, Number(status.ahead) || 0);
 
   return (
     <>
@@ -1228,10 +1247,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                     <button
                       onClick={() => handleRemote('push')}
                       disabled={remoteBusy !== null}
-                      style={{ ...remoteHeaderButtonStyle, borderTopRightRadius: 0, borderBottomRightRadius: 0, minWidth: 154 }}
+                      style={{ ...remoteHeaderButtonStyle, borderTopRightRadius: 0, borderBottomRightRadius: 0, minWidth: remoteAheadCount ? 174 : 154 }}
                     >
                       {remoteBusy ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />}
-                      <span style={{ minWidth: 0, textAlign: 'left' }}>
+                      <span style={{ minWidth: 0, flex: 1, textAlign: 'left' }}>
                         <span style={{ display: 'block', fontSize: 12, fontWeight: 850, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                           {remoteTitle}
                         </span>
@@ -1239,6 +1258,12 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                           {remoteSubtitle}
                         </span>
                       </span>
+                      {remoteBusy === null && remoteAheadCount > 0 ? (
+                        <span style={remoteAheadBadgeStyle} title={`${remoteAheadCount} unpushed commit${remoteAheadCount === 1 ? '' : 's'}`}>
+                          {remoteAheadCount}
+                          <Upload size={10} />
+                        </span>
+                      ) : null}
                     </button>
                     <button
                       onClick={() => setPushMenuOpen((value) => !value)}
@@ -2469,6 +2494,23 @@ const remoteHeaderButtonStyle: React.CSSProperties = {
   fontSize: 11.5,
   fontWeight: 800,
   cursor: 'pointer',
+};
+
+const remoteAheadBadgeStyle: React.CSSProperties = {
+  minWidth: 34,
+  height: 22,
+  padding: '0 8px',
+  borderRadius: 999,
+  background: 'rgba(148,163,184,0.30)',
+  color: '#f8fafc',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: 4,
+  fontSize: 11,
+  fontWeight: 850,
+  fontVariantNumeric: 'tabular-nums',
+  flexShrink: 0,
 };
 
 const changesSidebarStyle: React.CSSProperties = {

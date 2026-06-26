@@ -1304,6 +1304,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const tabPreviewMaxHeight = useUIStore((s) => s.tabPreviewMaxHeight);
   const setTabPreviewMaxHeight = useUIStore((s) => s.setTabPreviewMaxHeight);
   const semanticIndexParallelism = useUIStore((s) => s.semanticIndexParallelism);
+  const semanticAutoIndexTitles = useUIStore((s) => s.semanticAutoIndexTitles);
+  const setSemanticAutoIndexTitles = useUIStore((s) => s.setSemanticAutoIndexTitles);
+  const semanticAutoIndexIterations = useUIStore((s) => s.semanticAutoIndexIterations);
+  const setSemanticAutoIndexIterations = useUIStore((s) => s.setSemanticAutoIndexIterations);
   const claudeCodeSettings = useUIStore((s) => s.claudeCodeSettings);
   const setClaudeCodeSettings = useUIStore((s) => s.setClaudeCodeSettings);
   const claudeMdMirrorEnabled = useUIStore((s) => s.claudeMdMirrorEnabled);
@@ -3351,6 +3355,22 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               <div style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
                 <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', marginBottom: '10px', textTransform: 'uppercase' }}>
                   Семантическая индексация
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 8, marginBottom: 12 }}>
+                  <LineNumbersToggle
+                    checked={semanticAutoIndexTitles}
+                    onChange={setSemanticAutoIndexTitles}
+                    label="Auto Title"
+                    description="Автоматически индексировать названия новых закрытых вкладок"
+                    tooltip="Работает только для history-записей, созданных после включения."
+                  />
+                  <LineNumbersToggle
+                    checked={semanticAutoIndexIterations}
+                    onChange={setSemanticAutoIndexIterations}
+                    label="Auto Iterations"
+                    description="Автоматически индексировать новые user-итерации после включения"
+                    tooltip="Индексирует новые history-записи после закрытия Claude/Codex вкладки; старый архив не догоняет."
+                  />
                 </div>
                 <FontSizeSlider
                   label="Параллельные воркеры"

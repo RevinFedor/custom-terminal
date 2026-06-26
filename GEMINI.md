@@ -11,8 +11,8 @@
     - Используй MCP `docs_search` для поиска шрамов и фактов по подсистеме: это primary-канал проектной документации перед `rg docs/` и ручным чтением файлов. 
         - В том случае, если ты сейчас работаешь после компакта, Или в начале сессии уже использовал DocsSearch, то не нужно его использовать по новой. Если ты в процессе реализации какой-то длительной фичи, и ты не обновлял по ней документацию, то не надо просто так вызывать DocsSearch.
     - Если используешь `docs_search` по другой директории/`projectPath`, сначала прочитай `CLAUDE.md` этой директории (fallback: `AGENTS.md`/`GEMINI.md`), потому что там лежат project-specific инструкции, включая логирование, деплой и anti-patterns
-    - Если задача из этой директории касается iOS/iPhone/Simulator/HabitTracker/Terminal Control mobile UI — это связанный iOS-клиент в `/Users/fedor/Desktop/vs-code/habit-tracker`. Перед кодом или тестами прочитай `/Users/fedor/Desktop/vs-code/habit-tracker/CLAUDE.md`, затем используй `docs_search` с `projectPath=/Users/fedor/Desktop/vs-code/habit-tracker` по iOS-симптому. Не опирайся только на документацию custom-terminal: Mac Terminal API здесь source of truth для серверной механики, но iOS UI/деплой/логирование живут в HabitTracker.
     - Запрос в `docs_search` формулируй по действию/симптому подсистемы; если MCP пустой или недоступен — явно зафиксируй это и только потом переходи к `rg`/Read как fallback
+    - Переиндексация документации выполняется только через MCP `docs_reindex` с явным `projectPath` для нужного проекта. Не запускай и не создавай repo-local shell-индексатор: индексатор является частью knowledge MCP, а не отдельным скриптом каждого репозитория.
   </step>
  
   <step index="3">

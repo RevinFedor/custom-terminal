@@ -20,6 +20,7 @@
 - **Автоматический**: background-задача после `project:archive-tab`, но только для небольших transcript'ов. Close-path сначала быстро архивирует таб в SQLite, а auto-index стартует с задержкой ~5s, чтобы не подвешивать жест закрытия.
 - **Большие Claude-сессии (`>5MB`)**: auto-index на close сознательно пропускается (`reason=avoid-close-freeze`). Такие архивы индексируются вручную через кнопку Index в Home.
 - **Ручной**: кнопка Index на ProjectHome с настраиваемым лимитом сессий (от последних)
+- **ProjectHome auto Title/Iterations**: отдельные Settings toggles индексируют только новые `tab_history` rows после включения. Title auto-index эмбеддит имя одной history-записи. Iteration auto-index targeted-парсит один `history_id` и фильтрует user prompts по timestamp включения toggle. Это не full transcript `session_chunks` auto-index и не live watcher активной вкладки.
 
 ### Title-only поиск на ProjectHome
 
@@ -28,6 +29,8 @@ Home top input сейчас работает как instant local filter по `t
 Причина разделения — latency и mental model. Пользователь печатает в верхнем поиске Home, чтобы найти вкладку по названию; поэтому обычный ввод должен реагировать мгновенно без Gemini/API. Видимая кнопка `RAG` и `Cmd+Enter` в текущем Home запускают iteration-search по user-сообщениям. Если title semantic path возвращается в UI, он должен иметь отдельный режим/чип и не делить affordance с iteration-search. Если title index пустой, title semantic search возвращает пусто без запроса к Gemini; сначала нужно нажать `Index`.
 
 Индексация title-only rows маленькая и показывается прямо в кнопке `Index` (`current/total`). Не добавлять отдельный тяжёлый progress panel в Home: это служебное действие на несколько сотен/тысяч коротких строк, а не full transcript rebuild.
+
+Auto Title использует targeted path по одному `history_id`, а не `tab-title-index:reindex`: если у проекта уже есть 800 старых `new`, включение toggle не должно внезапно запускать backlog. Backlog остаётся ручным действием через Index.
 
 ### Iteration search на ProjectHome
 
@@ -38,6 +41,8 @@ Stats умеют работать по диапазону `dateFrom`: для у�
 У iteration index есть отдельная scan-отметка per history. Она нужна не для поиска, а для честного `new/total`: history может не дать ни одной user-итерации, потому что transcript удалён, cwd больше не существует или parser вернул пустой список. Без scan-отметки такая history навсегда остаётся в approximate tail через `message_count`, и пользователь видит один и тот же результат после полного reindex, например `520/1981` → повторный Index → снова `520/1981`. После `Full`-прохода stats должны считать approximate total только для history без index-rows и без scan-row; всё просмотренное схлопывается к реально discovered итерациям.
 
 Progress iteration index состоит из двух фаз: scan histories и embed pending iterations. Renderer получает события после каждой обработанной history и после каждого embedding batch; между sync-парсингом rows main process отдаёт event loop, чтобы кнопка не висела на `0/N` до финального скачка.
+
+Auto Iterations использует тот же parser/upsert path, но с `historyId` и `minEntryTs`. Старые prompts из сессии, начатой до включения toggle, не индексируются автоматом; если пользователь хочет весь архив, это ручной `Full`/date-range Index. Не переносить auto-mode на `fs.watch` JSONL без смены схемы: текущая таблица `tab_history_iteration_index` имеет foreign key на `tab_history(id)`, поэтому активная незакрытая вкладка не имеет корректного ключа для результата Home.
 
 ### Stats path на ProjectHome
 

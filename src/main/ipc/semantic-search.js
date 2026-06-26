@@ -897,6 +897,46 @@ async function indexTabTitles(db, projectId, progressCb, force = false) {
   };
 }
 
+async function indexTabTitleHistory(db, projectId, historyId) {
+  cleanupTabTitleIndex(db);
+  const row = db.prepare(`
+    SELECT h.id, h.project_id, h.name, i.name_hash, i.embedding
+      FROM tab_history h
+      LEFT JOIN tab_history_title_index i ON i.history_id = h.id
+     WHERE h.project_id = ?
+       AND h.id = ?
+       AND ${NON_FILE_HISTORY_PREDICATE}
+  `).get(projectId, historyId);
+  if (!row) return { total: 0, indexed: 0, skipped: 0, failed: 0, embeddingUsage: estimateEmbeddingUsage([]) };
+
+  const name = String(row.name || 'tab').trim() || 'tab';
+  const hash = textHash(name);
+  if (row.name_hash === hash && row.embedding) {
+    return { total: 1, indexed: 0, skipped: 1, failed: 0, embeddingUsage: estimateEmbeddingUsage([]) };
+  }
+
+  const embeddingUsage = estimateEmbeddingUsage([name]);
+  const upsert = db.prepare(`
+    INSERT INTO tab_history_title_index (history_id, project_id, name, name_hash, embedding, indexed_at)
+    VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))
+    ON CONFLICT(history_id) DO UPDATE SET
+      project_id = excluded.project_id,
+      name = excluded.name,
+      name_hash = excluded.name_hash,
+      embedding = excluded.embedding,
+      indexed_at = excluded.indexed_at
+  `);
+
+  try {
+    const [embedding] = await embedTexts([name]);
+    upsert.run(row.id, row.project_id, name, hash, embedding ? embeddingToBlob(embedding) : null);
+    return { total: 1, indexed: 1, skipped: 0, failed: 0, embeddingUsage };
+  } catch (err) {
+    console.error('[TabTitleSearch] auto title index failed historyId=' + historyId + ':', err.message);
+    return { total: 1, indexed: 0, skipped: 0, failed: 1, embeddingUsage };
+  }
+}
+
 async function searchTabTitles(db, projectId, query, opts = {}) {
   const text = String(query || '').trim();
   if (text.length === 0) return [];
@@ -958,6 +998,19 @@ function normalizeDateFrom(dateFrom) {
   return Number.isFinite(ts) ? ts : null;
 }
 
+function normalizeTimestampSeconds(value) {
+  if (value == null || value === '') return null;
+  if (typeof value === 'number') {
+    const seconds = value > 9999999999 ? Math.floor(value / 1000) : Math.floor(value);
+    return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+  }
+  const raw = String(value).trim();
+  if (/^\d+$/.test(raw)) return normalizeTimestampSeconds(Number(raw));
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.floor(parsed / 1000);
+}
+
 function getPromptSummaries(db, toolType, sessionId) {
   const rows = db.prepare(`
     SELECT entry_uuid, summary
@@ -985,6 +1038,7 @@ async function loadHistoryIterations(row, claudeData, codexData) {
         uuid: entry.uuid,
         content: String(entry.content || ''),
         iterationIndex: Number.isFinite(entry.turnIndex) ? entry.turnIndex : index,
+        ts: entry.timestamp || null,
       }));
   }
 
@@ -996,6 +1050,7 @@ async function loadHistoryIterations(row, claudeData, codexData) {
       uuid: entry.uuid,
       content: String(entry.full || entry.preview || ''),
       iterationIndex: index,
+      ts: entry.ts || null,
     }));
 }
 
@@ -1060,8 +1115,13 @@ function clearTabIterationIndex(db, projectId) {
 async function indexTabIterations(db, projectId, progressCb, force = false, claudeData, codexData, opts = {}) {
   cleanupTabIterationIndex(db);
   const dateFromTs = normalizeDateFrom(opts.dateFrom);
+  const targetHistoryId = Number(opts.historyId || 0);
+  const minEntryTs = normalizeTimestampSeconds(opts.minEntryTs);
   const dateWhere = dateFromTs ? ' AND h.closed_at >= ?' : '';
-  const rowParams = dateFromTs ? [projectId, dateFromTs] : [projectId];
+  const historyWhere = targetHistoryId > 0 ? ' AND h.id = ?' : '';
+  const rowParams = [projectId];
+  if (dateFromTs) rowParams.push(dateFromTs);
+  if (targetHistoryId > 0) rowParams.push(targetHistoryId);
   const rows = db.prepare(`
     SELECT h.*, i.entry_uuid AS indexed_entry_uuid
       FROM tab_history h
@@ -1070,12 +1130,16 @@ async function indexTabIterations(db, projectId, progressCb, force = false, clau
        AND ${NON_FILE_HISTORY_PREDICATE}
        AND (h.claude_session_id IS NOT NULL OR h.codex_session_id IS NOT NULL)
        ${dateWhere}
+       ${historyWhere}
      GROUP BY h.id
      ORDER BY h.closed_at DESC, h.id DESC
   `).all(...rowParams);
 
   if (force) {
-    if (dateFromTs) {
+    if (targetHistoryId > 0) {
+      db.prepare('DELETE FROM tab_history_iteration_index WHERE project_id = ? AND history_id = ?').run(projectId, targetHistoryId);
+      db.prepare('DELETE FROM tab_history_iteration_scan WHERE project_id = ? AND history_id = ?').run(projectId, targetHistoryId);
+    } else if (dateFromTs) {
       db.prepare(`
         DELETE FROM tab_history_iteration_index
          WHERE project_id = ?
@@ -1107,6 +1171,7 @@ async function indexTabIterations(db, projectId, progressCb, force = false, clau
      WHERE i.project_id = ?
        AND ${NON_FILE_HISTORY_PREDICATE}
        ${dateWhere}
+       ${historyWhere}
   `).all(...rowParams);
   const existing = new Map();
   for (const row of existingRows) {
@@ -1146,6 +1211,8 @@ async function indexTabIterations(db, projectId, progressCb, force = false, clau
       upsertScan.run(row.id, row.project_id, target.toolType, target.sessionId, iterations.length, iterations.length > 0 ? 'scanned' : 'empty', null);
       for (let j = 0; j < iterations.length; j++) {
         const iteration = iterations[j];
+        const iterationTs = normalizeTimestampSeconds(iteration.ts);
+        if (minEntryTs && (!iterationTs || iterationTs < minEntryTs)) continue;
         const summary = String(summaries.get(iteration.uuid) || '').trim();
         const content = truncateIterationText(iteration.content);
         if (!content) continue;
@@ -1532,4 +1599,38 @@ function register({ projectManager, mainWindow, claudeData, codexData }) {
   });
 }
 
-module.exports = { register, indexSessionFile };
+async function autoIndexTabTitle(projectManager, db, projectId, historyId) {
+  const result = await indexTabTitleHistory(db, projectId, historyId);
+  logEmbeddingUsage(projectManager, db, {
+    taskType: 'Embedding: title auto index',
+    usage: result.embeddingUsage,
+    status: result.failed ? 'error' : 'success',
+    error: result.failed ? `${result.failed} title row(s) failed` : null,
+    projectId,
+  });
+  return result;
+}
+
+async function autoIndexTabIterations(projectManager, db, projectId, historyId, claudeData, codexData, opts = {}) {
+  const result = await indexTabIterations(db, projectId, null, false, claudeData, codexData, {
+    historyId,
+    minEntryTs: opts.minEntryTs,
+  });
+  logEmbeddingUsage(projectManager, db, {
+    taskType: 'Embedding: iteration auto index',
+    usage: result.embeddingUsage,
+    status: result.failed ? 'error' : 'success',
+    error: result.failed ? `${result.failed} iteration row(s) failed` : null,
+    projectId,
+  });
+  return result;
+}
+
+module.exports = {
+  register,
+  indexSessionFile,
+  autoIndexTabTitle,
+  autoIndexTabIterations,
+  indexTabTitleHistory,
+  indexTabIterations,
+};

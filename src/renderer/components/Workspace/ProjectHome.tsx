@@ -1265,11 +1265,29 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   useEffect(() => {
     const handler = (_: any, data: any) => {
       if (data?.projectId !== projectId) return;
+      refreshTitleIndexStats();
+    };
+    ipcRenderer.on('tab-title-index:changed', handler);
+    return () => { ipcRenderer.removeListener('tab-title-index:changed', handler); };
+  }, [projectId, refreshTitleIndexStats]);
+
+  useEffect(() => {
+    const handler = (_: any, data: any) => {
+      if (data?.projectId !== projectId) return;
       setIterationIndexProgress({ current: data.current || 0, total: data.total || 0 });
     };
     ipcRenderer.on('tab-iteration-index:progress', handler);
     return () => { ipcRenderer.removeListener('tab-iteration-index:progress', handler); };
   }, [projectId]);
+
+  useEffect(() => {
+    const handler = (_: any, data: any) => {
+      if (data?.projectId !== projectId) return;
+      refreshIterationIndexStats();
+    };
+    ipcRenderer.on('tab-iteration-index:changed', handler);
+    return () => { ipcRenderer.removeListener('tab-iteration-index:changed', handler); };
+  }, [projectId, refreshIterationIndexStats]);
 
   const handleReindexTitles = useCallback(async () => {
     setTitleIndexing(true);

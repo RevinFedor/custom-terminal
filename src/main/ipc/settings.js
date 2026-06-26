@@ -293,4 +293,4 @@ function register({ projectManager }) {
 
 }
 
-module.exports = { register };
+module.exports = { register, sanitizeFileForPrompt };

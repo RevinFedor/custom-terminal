@@ -58,6 +58,7 @@ let loadCodexSessionRecords = null;
 let buildCodexTimeline = null;
 let listCodexModels = null;
 let codexDataApi = null;
+let sanitizeFileForPrompt = null;
 try {
   const cd = require(path.join(__dirname, 'ipc', 'claude-data'));
   findSessionFile = cd.findSessionFile;
@@ -75,6 +76,11 @@ try {
   listCodexModels = codex.listCodexModels || codex._api?.listCodexModels || null;
 } catch (e) {
   console.warn('[WebServer] codex-data helpers not loaded:', e.message);
+}
+try {
+  sanitizeFileForPrompt = require(path.join(__dirname, 'ipc', 'settings')).sanitizeFileForPrompt || null;
+} catch (e) {
+  console.warn('[WebServer] prompt file sanitizer not loaded:', e.message);
 }
 
 // Claude model list for native/web clients. Mirror of the renderer source of
@@ -173,6 +179,7 @@ function cleanOptionalString(value, fallback = '') {
 }
 
 const MOBILE_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
+const MOBILE_ATTACHMENT_PREVIEW_MAX_BYTES = 12 * 1024 * 1024;
 const mobileAttachmentIndex = new Map();
 
 function mobileAttachmentRoot() {
@@ -191,6 +198,18 @@ function normalizeMobileAttachmentKind(kind, mimeType) {
   const k = String(kind || '').toLowerCase();
   if (k === 'image' || k === 'file') return k;
   return String(mimeType || '').startsWith('image/') ? 'image' : 'file';
+}
+
+function inferMobileAttachmentMimeType(filePath, fallback = 'application/octet-stream') {
+  const ext = path.extname(String(filePath || '')).toLowerCase();
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.png') return 'image/png';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.heic' || ext === '.heif') return 'image/heic';
+  if (ext === '.pdf') return 'application/pdf';
+  if (ext === '.txt' || ext === '.md') return 'text/plain';
+  return fallback;
 }
 
 function safeMobileAttachmentPath(id, name) {
@@ -260,7 +279,9 @@ async function storeMobileAttachment(payload) {
   await fs.promises.writeFile(filePath, buffer);
   const item = { id, kind, name, mimeType, size: buffer.length, path: filePath, dir, createdAt: Date.now() };
   mobileAttachmentIndex.set(id, item);
-  cleanupMobileAttachments();
+  // Sent chat history keeps preview references to this Mac-local file. Do not
+  // age-clean uploads here; explicit composer removal is the only immediate
+  // delete path.
   return item;
 }
 
@@ -283,13 +304,54 @@ function normalizeSendAttachments(attachments) {
   });
 }
 
+async function readMobileAttachmentPreview(payload) {
+  const rawPath = String(payload?.path || payload?.filePath || '').trim();
+  if (!rawPath || !path.isAbsolute(rawPath)) {
+    const err = new Error('absolute attachment path required');
+    err.statusCode = 400;
+    throw err;
+  }
+  const root = path.resolve(mobileAttachmentRoot());
+  const resolved = path.resolve(rawPath);
+  if (!resolved.startsWith(root + path.sep)) {
+    const err = new Error('attachment path outside mobile temp root');
+    err.statusCode = 403;
+    throw err;
+  }
+  const stat = await fs.promises.stat(resolved);
+  if (!stat.isFile()) {
+    const err = new Error('attachment path is not a file');
+    err.statusCode = 400;
+    throw err;
+  }
+  const rel = path.relative(root, resolved);
+  const id = rel.split(path.sep)[0] || '';
+  const known = id ? mobileAttachmentIndex.get(id) : null;
+  const mimeType = cleanOptionalString(known?.mimeType, inferMobileAttachmentMimeType(resolved));
+  const kind = normalizeMobileAttachmentKind(known?.kind, mimeType);
+  const result = {
+    id,
+    kind,
+    name: sanitizeMobileAttachmentName(known?.name || path.basename(resolved)),
+    mimeType,
+    size: stat.size,
+    path: resolved,
+  };
+  if (kind === 'image' && stat.size <= MOBILE_ATTACHMENT_PREVIEW_MAX_BYTES) {
+    const buffer = await fs.promises.readFile(resolved);
+    result.dataBase64 = buffer.toString('base64');
+  }
+  return result;
+}
+
 function appendAttachmentsToPrompt(prompt, attachments) {
   const cleanPrompt = String(prompt || '').trim();
   const normalized = normalizeSendAttachments(attachments);
   if (!normalized.length) return { prompt: cleanPrompt, attachments: [] };
   const lines = normalized.map((att) => {
     const sizePart = att.size ? ', ' + Math.ceil(att.size / 1024) + ' KB' : '';
-    return '- [' + att.kind + '] ' + att.name + ': ' + att.path + ' (' + att.mimeType + sizePart + ')';
+    const meta = [att.kind, att.mimeType].filter(Boolean).join(', ');
+    return '- [' + (meta || 'file') + '] ' + att.name + ': ' + att.path + sizePart;
   });
   const attachmentBlock = [
     'Attached files from iOS are already uploaded to this Mac. Read them from these local paths if relevant:',
@@ -1483,6 +1545,17 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  if (parsed.pathname === '/api/mobile-attachments/preview' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const item = await readMobileAttachmentPreview(body);
+      return sendJson(res, 200, { ok: true, attachment: item });
+    } catch (e) {
+      const status = Number(e?.statusCode) || 500;
+      return sendJson(res, status, { ok: false, error: String(e?.message || e) });
+    }
+  }
+
   let attachmentMatch = parsed.pathname.match(/^\/api\/mobile-attachments\/([^/]+)$/);
   if (attachmentMatch && req.method === 'DELETE') {
     try {
@@ -1684,14 +1757,39 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  async function resolveMobilePromptRow(prompt) {
+    const parts = [];
+    const own = String(prompt?.content || '').trim();
+    if (own) parts.push(own);
+
+    const filePaths = Array.isArray(prompt?.file_paths) ? prompt.file_paths : [];
+    for (const fp of filePaths) {
+      const filePath = typeof fp === 'string' ? fp.trim() : '';
+      if (!filePath) continue;
+      try {
+        const raw = await fs.promises.readFile(filePath, 'utf8');
+        const clean = sanitizeFileForPrompt ? sanitizeFileForPrompt(raw, filePath) : raw;
+        const trimmed = String(clean || '').trim();
+        if (trimmed) parts.push(trimmed);
+      } catch (e) {
+        console.warn('[WebServer] /api/prompts failed to read prompt file:', filePath, e.message);
+      }
+    }
+
+    return {
+      ...prompt,
+      resolvedText: parts.join('\n\n'),
+    };
+  }
+
   // Prompts library (groups + items). Read-only — used by mobile composer
   // Insert-Prompt button. Schema:
   //   group: { id, name, position }
-  //   prompt: { id, title, content, group_id?, position, file_paths[] }
+  //   prompt: { id, title, content, group_id?, position, file_paths[], resolvedText }
   if (parsed.pathname === '/api/prompts' && req.method === 'GET') {
     try {
       const groups = projectManager.getPromptGroups();
-      const prompts = projectManager.getPrompts();
+      const prompts = await Promise.all(projectManager.getPrompts().map(resolveMobilePromptRow));
       // Cheap content fingerprint — client passes ?etag=<previous> to skip the
       // body when nothing changed. SHA-1 of the canonical JSON, hex-truncated
       // to 16 chars (~10^19 keys, plenty for a never-evicted cache).

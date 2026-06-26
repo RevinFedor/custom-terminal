@@ -13375,8 +13375,32 @@ const ARCHIVE_MESSAGE_COUNT_DELAY_MS = 1000;
 const ARCHIVE_MESSAGE_COUNT_MAX_BYTES = 256 * 1024 * 1024;
 const ARCHIVE_AUTO_INDEX_DELAY_MS = 5000;
 const ARCHIVE_AUTO_INDEX_MAX_BYTES = 5 * 1024 * 1024;
+const ARCHIVE_HOME_INDEX_DELAY_MS = 1500;
+const APP_STATE_KEY_SEMANTIC_AUTO_TITLES = 'semanticAutoIndexTitles';
+const APP_STATE_KEY_SEMANTIC_AUTO_TITLES_SINCE = 'semanticAutoIndexTitlesSince';
+const APP_STATE_KEY_SEMANTIC_AUTO_ITERATIONS = 'semanticAutoIndexIterations';
+const APP_STATE_KEY_SEMANTIC_AUTO_ITERATIONS_SINCE = 'semanticAutoIndexIterationsSince';
 const HISTORY_COUNT_BACKFILL_LIMIT = 8;
 const historyCountBackfillInFlight = new Set();
+const archiveHomeIndexInFlight = new Set();
+
+function readAppBoolState(key) {
+  try {
+    const value = projectManager?.db?.getAppState?.(key);
+    return value === true || value === 1 || value === '1' || value === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function readAppNumberState(key) {
+  try {
+    const value = Number(projectManager?.db?.getAppState?.(key) || 0);
+    return Number.isFinite(value) ? value : 0;
+  } catch {
+    return 0;
+  }
+}
 
 function formatBytesShort(bytes) {
   if (!Number.isFinite(bytes)) return 'unknown';
@@ -13533,9 +13557,81 @@ function scheduleHistoryMessageCountBackfill(rows) {
   });
 }
 
+function shouldAutoIndexArchivedHistory(enabledKey, sinceKey, closedAt) {
+  if (!readAppBoolState(enabledKey)) return false;
+  const since = readAppNumberState(sinceKey);
+  return !since || closedAt >= since;
+}
+
+function scheduleArchiveHomeIndexSideEffects(projectId, tab, historyId) {
+  if (!projectId || !historyId) return;
+  const closedAt = Math.floor(Date.now() / 1000);
+  const titleEnabled = shouldAutoIndexArchivedHistory(
+    APP_STATE_KEY_SEMANTIC_AUTO_TITLES,
+    APP_STATE_KEY_SEMANTIC_AUTO_TITLES_SINCE,
+    closedAt
+  );
+  const iterationSince = readAppNumberState(APP_STATE_KEY_SEMANTIC_AUTO_ITERATIONS_SINCE);
+  const iterationEnabled = shouldAutoIndexArchivedHistory(
+    APP_STATE_KEY_SEMANTIC_AUTO_ITERATIONS,
+    APP_STATE_KEY_SEMANTIC_AUTO_ITERATIONS_SINCE,
+    closedAt
+  );
+  if (!titleEnabled && !iterationEnabled) return;
+
+  const key = `${projectId}:${historyId}`;
+  if (archiveHomeIndexInFlight.has(key)) return;
+  archiveHomeIndexInFlight.add(key);
+
+  setTimeout(async () => {
+    const started = Date.now();
+    try {
+      const semanticSearch = require(path.join(srcMainDir, 'ipc', 'semantic-search'));
+      if (titleEnabled) {
+        const result = await semanticSearch.autoIndexTabTitle?.(projectManager, projectManager.db.db, projectId, historyId);
+        console.log('[ProjectHome:AutoTitleIndex] historyId=' + historyId +
+          ' indexed=' + (result?.indexed || 0) +
+          ' skipped=' + (result?.skipped || 0) +
+          ' failed=' + (result?.failed || 0) +
+          ' durMs=' + (Date.now() - started));
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('tab-title-index:changed', { projectId, historyId, reason: 'auto-archive' });
+        }
+      }
+
+      if (iterationEnabled && tab?.cwd && (tab?.claudeSessionId || tab?.codexSessionId)) {
+        const result = await semanticSearch.autoIndexTabIterations?.(
+          projectManager,
+          projectManager.db.db,
+          projectId,
+          historyId,
+          require(path.join(srcMainDir, 'ipc', 'claude-data')),
+          codexDataModule,
+          { minEntryTs: iterationSince || 0 }
+        );
+        console.log('[ProjectHome:AutoIterationIndex] historyId=' + historyId +
+          ' parsed=' + (result?.parsedRows || 0) +
+          ' indexed=' + (result?.indexed || 0) +
+          ' skipped=' + (result?.skipped || 0) +
+          ' failed=' + (result?.failed || 0) +
+          ' minEntryTs=' + (iterationSince || 0) +
+          ' durMs=' + (Date.now() - started));
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('tab-iteration-index:changed', { projectId, historyId, reason: 'auto-archive' });
+        }
+      }
+    } catch (e) {
+      console.warn('[ProjectHome:AutoIndex] failed historyId=' + historyId + ': ' + (e?.message || String(e)));
+    } finally {
+      archiveHomeIndexInFlight.delete(key);
+    }
+  }, ARCHIVE_HOME_INDEX_DELAY_MS);
+}
+
 function scheduleArchiveSideEffects(projectId, tab, historyId) {
   const sessionId = tab?.claudeSessionId || null;
   const cwd = tab?.cwd || null;
+  scheduleArchiveHomeIndexSideEffects(projectId, tab, historyId);
   if (!cwd || !historyId) return;
 
   if (!sessionId) {

@@ -84,11 +84,19 @@ File-tabs на mobile — это не chat route. Если `tabType === 'file'`,
 
 UI: `MarkdownFileSheet` — bottom-sheet с backdrop, drag handle и swipe-down dismiss (`dragY` threshold), header filename/path/size и внутренний scroll для body. Рендер Markdown на mobile использует `@noted/claude-blocks::Markdown`, а не desktop `@gt-editor/markdown-editor`: mobile уже тащит chat Markdown renderer, а desktop editor heavy/local-file dependency не нужна в phone bundle. Если file-tab принадлежит группе, отдельной логики не требуется: server уже отдаёт тот же tab row с `groupId`, а preview открывается по `filePath` независимо от группировки.
 
+## Terminal prompt library для native iOS
+
+`GET /api/prompts` отдаёт `resolvedText` для каждого context-menu prompt'а: сначала собственный `content`, затем содержимое `file_paths`, прочитанное на Mac и очищенное тем же `sanitizeFileForPrompt`, что desktop `ai-prompts:read-files`. Это не дублирование renderer-логики, а мобильный контракт: телефон не может сам прочитать Mac paths, а desktop picker делает это в момент вставки через IPC.
+
+Пользовательский симптом без `resolvedText`: prompt с файлами виден в списке, tap по нему выглядит как выбор, но native iOS отбрасывает его как empty и chip не появляется; другой prompt с обычным `content` при этом работает. Поэтому etag `/api/prompts` считается уже по response с `resolvedText`, чтобы изменение файла за prompt'ом обновляло мобильный кэш даже без изменения SQLite row.
+
 ## Mobile upload attachments: камера / галерея / файлы
 
-Terminal Control на iOS прикрепляет реальные фото/файлы не как base64 в prompt и не как iOS sandbox URL, а как предварительный upload на Mac. Причина: после выбора из Photos/FileImporter ссылка живёт в sandbox телефона, а Claude/Codex исполняются на Mac и должны читать локальный path. `/api/mobile-attachments` принимает `{name, kind, mimeType, dataBase64}`, кладёт файл в `app.getPath('temp')/noted-terminal-mobile-attachments/<id>/<sanitized-name>`, режет payload по 25MB и чистит старые temp-директории старше 24 часов. `DELETE /api/mobile-attachments/:id` — best-effort cleanup при удалении chip до отправки.
+Terminal Control на iOS прикрепляет реальные фото/файлы не как base64 в prompt и не как iOS sandbox URL, а как предварительный upload на Mac. Причина: после выбора из Photos/FileImporter ссылка живёт в sandbox телефона, а Claude/Codex исполняются на Mac и должны читать локальный path. `/api/mobile-attachments` принимает `{name, kind, mimeType, dataBase64}`, кладёт файл в `app.getPath('temp')/noted-terminal-mobile-attachments/<id>/<sanitized-name>` и режет payload по 25MB. После успешного Send temp-файл остаётся жить для sent history preview: upload-route не запускает age-cleanup, а `DELETE /api/mobile-attachments/:id` — только best-effort cleanup при удалении chip до отправки. Если понадобится автоматическая уборка, она должна быть history-aware, иначе iOS reload теряет preview отправленного изображения.
 
 `POST /api/terminal-tabs/:tabId/send` принимает `attachments` отдельно от `prompt`, заново валидирует что каждый path absolute и лежит внутри temp-root, а затем добавляет в prompt блок `Attached files from iOS are already uploaded to this Mac...` со списком local paths. Это намеренно дублируется с visible text, который iOS уже показывает пользователю: агент получает обычный текстовый контракт «прочитай эти path», а API response возвращает нормализованные attachments для аудита. Если такой блок уже есть в prompt, сервер не добавляет второй. GT file chips остаются другой моделью: они path-only ссылки на уже существующие файлы проекта, а mobile upload attachments — временные копии пользовательских файлов/фото.
+
+Path-block в prompt — машинный контракт для Mac agent, а не UI-текст истории. iOS обязан распарсить строки вида `[image, image/jpeg] name: /tmp/...` в sent attachment chips и скрыть сам блок из transcript/copy/full-prompt view; если агент случайно эхо'ит этот блок в assistant content, native transcript тоже фильтрует его из видимого ответа. Иначе пользователь видит raw temp path вместо того же chip'а, который только что отправлял. `POST /api/mobile-attachments/preview` существует только для восстановления preview после history reload: он принимает temp path, проверяет что файл всё ещё внутри mobile-attachments root, и отдаёт base64 только для image-файлов до 12MB. Для произвольных документов preview не пытается читать содержимое — достаточно имени/иконки/path в chip/detail sheet.
 
 ## ParamsSheet (model/effort/think) — close-on-select + invisible-intent источники
 
@@ -314,9 +322,10 @@ GET  /api/active-loaders                       → live loaders snapshot для 
 GET  /api/project-activity                     → full project activity snapshot для native project badges
 GET  /api/events?scope=projects                → SSE только project-activity, без tab transcript watcher'ов
 POST /api/mobile-attachments                   → upload iOS camera/gallery/file bytes в Mac temp, cap 25MB
+POST /api/mobile-attachments/preview           → восстановить preview temp upload по absolute path, image cap 12MB
 DELETE /api/mobile-attachments/:id             → удалить temp upload, если chip убрали до send
 POST /api/file-preview                         → read-only file-tab preview по absolute path, cap 1MB
-GET  /api/prompts[?etag=X]                     → getPrompts + getPromptGroups (no bridge); ?etag match → { etag, unchanged: true }
+GET  /api/prompts[?etag=X]                     → getPrompts + getPromptGroups + `resolvedText` (content + sanitized file_paths, no bridge); ?etag match → { etag, unchanged: true }
 GET  /api/agent-models                         → { codex:[{id,label,efforts}], claude:[{id,label}] } каталог моделей (no bridge; codex из live `codex debug models`). Прямой роут до `let m` — см. «Гочи let m». Детали — fact-mobile-claude-pty.md::Контекст-% и список моделей
 GET  /api/app-settings                         → app-level settings через renderer bridge (`streamerMode`)
 POST /api/app-settings                         → mutate app-level settings (`streamerMode`) через desktop source of truth

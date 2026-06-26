@@ -671,6 +671,10 @@ interface UIStore {
   // MCP docs_reindex. Default 10, диапазон 1-20.
   semanticIndexParallelism: number;
   setSemanticIndexParallelism: (n: number) => void;
+  semanticAutoIndexTitles: boolean;
+  setSemanticAutoIndexTitles: (on: boolean) => void;
+  semanticAutoIndexIterations: boolean;
+  setSemanticAutoIndexIterations: (on: boolean) => void;
 
   // CLAUDE.md mirror toggle. ON = main process переписывает AGENTS.md/GEMINI.md
   // в корне каждого открытого проекта при правке CLAUDE.md, и обратно перезатирает
@@ -1325,6 +1329,61 @@ const initialHistoryPinned = loadHistoryPinned();
       if (useUIStore.getState().historyPinned !== bool) {
         useUIStore.setState({ historyPinned: bool });
         try { localStorage.setItem('noted-terminal-history-pinned', String(bool)); } catch {}
+      }
+    }
+  } catch {}
+})();
+
+const APP_STATE_KEY_SEMANTIC_AUTO_TITLES = 'semanticAutoIndexTitles';
+const APP_STATE_KEY_SEMANTIC_AUTO_TITLES_SINCE = 'semanticAutoIndexTitlesSince';
+const APP_STATE_KEY_SEMANTIC_AUTO_ITERATIONS = 'semanticAutoIndexIterations';
+const APP_STATE_KEY_SEMANTIC_AUTO_ITERATIONS_SINCE = 'semanticAutoIndexIterationsSince';
+const LS_SEMANTIC_AUTO_TITLES = 'noted-terminal-semantic-auto-title-index';
+const LS_SEMANTIC_AUTO_TITLES_SINCE = 'noted-terminal-semantic-auto-title-index-since';
+const LS_SEMANTIC_AUTO_ITERATIONS = 'noted-terminal-semantic-auto-iteration-index';
+const LS_SEMANTIC_AUTO_ITERATIONS_SINCE = 'noted-terminal-semantic-auto-iteration-index-since';
+
+const nowSeconds = () => Math.floor(Date.now() / 1000);
+const saveSemanticAutoIndexSetting = (key: string, sinceKey: string, localKey: string, localSinceKey: string, on: boolean) => {
+  const since = on ? nowSeconds() : 0;
+  try { localStorage.setItem(localSinceKey, String(since)); } catch {}
+  try { localStorage.setItem(localKey, String(on)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: sinceKey, value: since }).catch(() => {});
+    ipcRenderer.invoke('app:setState', { key, value: on }).catch(() => {});
+  } catch {}
+};
+const initialSemanticAutoIndexTitles = (() => {
+  try { return localStorage.getItem(LS_SEMANTIC_AUTO_TITLES) === 'true'; }
+  catch { return false; }
+})();
+const initialSemanticAutoIndexIterations = (() => {
+  try { return localStorage.getItem(LS_SEMANTIC_AUTO_ITERATIONS) === 'true'; }
+  catch { return false; }
+})();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_SEMANTIC_AUTO_TITLES);
+    if (v !== null && v !== undefined) {
+      const bool = parsePersistedBool(v);
+      if (useUIStore.getState().semanticAutoIndexTitles !== bool) {
+        useUIStore.setState({ semanticAutoIndexTitles: bool });
+        try { localStorage.setItem(LS_SEMANTIC_AUTO_TITLES, String(bool)); } catch {}
+      }
+    }
+  } catch {}
+})();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_SEMANTIC_AUTO_ITERATIONS);
+    if (v !== null && v !== undefined) {
+      const bool = parsePersistedBool(v);
+      if (useUIStore.getState().semanticAutoIndexIterations !== bool) {
+        useUIStore.setState({ semanticAutoIndexIterations: bool });
+        try { localStorage.setItem(LS_SEMANTIC_AUTO_ITERATIONS, String(bool)); } catch {}
       }
     }
   } catch {}
@@ -2715,6 +2774,28 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(1, Math.min(20, Math.round(n)));
     set({ semanticIndexParallelism: clamped });
     try { localStorage.setItem('noted-terminal-semantic-index-parallelism', String(clamped)); } catch {}
+  },
+  semanticAutoIndexTitles: initialSemanticAutoIndexTitles,
+  setSemanticAutoIndexTitles: (on) => {
+    set({ semanticAutoIndexTitles: on });
+    saveSemanticAutoIndexSetting(
+      APP_STATE_KEY_SEMANTIC_AUTO_TITLES,
+      APP_STATE_KEY_SEMANTIC_AUTO_TITLES_SINCE,
+      LS_SEMANTIC_AUTO_TITLES,
+      LS_SEMANTIC_AUTO_TITLES_SINCE,
+      on
+    );
+  },
+  semanticAutoIndexIterations: initialSemanticAutoIndexIterations,
+  setSemanticAutoIndexIterations: (on) => {
+    set({ semanticAutoIndexIterations: on });
+    saveSemanticAutoIndexSetting(
+      APP_STATE_KEY_SEMANTIC_AUTO_ITERATIONS,
+      APP_STATE_KEY_SEMANTIC_AUTO_ITERATIONS_SINCE,
+      LS_SEMANTIC_AUTO_ITERATIONS,
+      LS_SEMANTIC_AUTO_ITERATIONS_SINCE,
+      on
+    );
   },
 
   // Focus Area

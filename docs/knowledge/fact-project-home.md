@@ -38,6 +38,8 @@ Title-only index хранится в SQLite (`tab_history_title_index`) как `
 
 Во время индексации progress показывается в той же кнопке (`current/total`) со spinner'ом; отдельный большой progress panel не нужен. Это частный случай `methodology/переносимый-дизайн.md::Async single-select` — индикатор живёт там, где был жест.
 
+Settings → Системные может включить `Auto Title`: тогда новая history-запись после закрытия вкладки индексируется targeted по своему `history_id`, без полного прохода по старым unindexed rows. Переключатель действует только вперёд с момента включения, чтобы пользователь не получал внезапный backlog API-вызовов.
+
 ## Iteration Search
 
 Вторая колонка контролов Home отвечает за поиск по user-итерациям внутри сохранённых Claude/Codex сессий. Кнопка `RAG` рядом с верхним input и `Cmd+Enter` используют текущий текст input как semantic query для iteration-search, а обычный ввод в input остаётся instant title-filter до явного запуска. Результат iteration-search заменяет обычный history stream: карточка сначала показывает найденную итерацию, затем имя вкладки, номер iteration, дату и score. Клик по результату открывает preview той же вкладки и просит HistoryPanel перейти к найденному `entryUuid`; Timeline остаётся read-only и не раскрывается в tree-layout.
@@ -55,6 +57,8 @@ Iteration index живёт отдельно от title index и использу
 Состояние Home восстанавливается по проекту: title query, активный iteration query, найденные iteration results и фильтр `all/codex/claude` переживают переключение между проектами. Иначе пользователь запускает дорогой RAG-поиск, переходит в другой проект на секунду и возвращается в пустой Home, хотя смысловой результат уже был получен.
 
 При клике по iteration-result правый preview закрывает History/Timeline оверлеем loader'а до события `history-panel:scrolled-to` для нужного uuid. HistoryPanel всё равно монтируется и скроллит за оверлеем; цель — скрыть промежуточный пустой state и дёрганье внутреннего scrollbar'а, а не заменить event-driven scroll фиксированным timeout. Safety timeout только снимает overlay если событие не пришло.
+
+Settings → Системные может включить `Auto Iterations`: при archive новой Claude/Codex history-записи индексатор targeted-парсит только этот `history_id` и эмбеддит user-итерации с timestamp после момента включения. Live JSONL watcher для активной вкладки сюда не добавлен намеренно: текущий search/result shape опирается на `tab_history.history_id`, а активная вкладка ещё не является history item.
 
 ## Context Menu (ProjectHome)
 Все элементы на Home View (Active, Favorite, History) поддерживают контекстное меню по правому клику:
