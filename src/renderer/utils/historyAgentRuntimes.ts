@@ -241,7 +241,7 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
     console.warn('[CodexHistoryActions:send] main draft probe failed tab=' + shortTab(tabId) + ': ' + errorText(error));
     return terminalRegistry.getCodexDraftState(tabId);
   });
-  console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' model=' + (modelForPicker || '-') + ' effort=' + (effortForPicker || '-') + ' submitIntent=' + (queue ? 'tab-queue' : 'enter') + ' chars=' + prompt.length + ' draftSource=' + (draftStateForSend?.source || '-') + ' skipVisibleDraftGuard=false');
+  console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' model=' + (modelForPicker || '-') + ' effort=' + (effortForPicker || '-') + ' submitIntent=' + (queue ? 'enter-busy' : 'enter') + ' chars=' + prompt.length + ' draftSource=' + (draftStateForSend?.source || '-') + ' skipVisibleDraftGuard=false');
   if (options.statusAtSend !== 'busy' && modelForPicker) {
     const currentModel = tabState?.codexModel || '';
     const currentEffort = tabState?.codexEffort || '';

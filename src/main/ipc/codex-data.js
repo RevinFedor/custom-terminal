@@ -12,12 +12,14 @@ const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const USAGE_ACCOUNTS_CACHE_TTL_MS = 60 * 1000;
 const USAGE_ACCOUNTS_FOREGROUND_BUDGET_MS = 1200;
 const CODEX_RESET_DRIFT_TOLERANCE_SECONDS = 10 * 60;
+const CODEX_ACTIVE_USAGE_OVERRIDE_TTL_MS = 30 * 60 * 1000;
 
 let modelCache = null;
 let usageAccountsCache = null;
 let usageAccountsRefreshInFlight = null;
 let usageAccountsLastAttemptAt = null;
 let usageAccountsLastError = null;
+const codexActiveUsageOverrides = new Map();
 const loggedRollbackKeys = new Set();
 const _codexJsonlCache = new Map();
 const _codexSessionSelectSkipLogged = new Set();
@@ -1779,6 +1781,20 @@ function hashCodexAccountKey(raw) {
   return crypto.createHash('sha256').update(String(raw || 'unknown')).digest('hex').slice(0, 16);
 }
 
+function codexAccountIdentityKey(identity) {
+  if (!identity || typeof identity !== 'object') return null;
+  return identity.accountId || identity.email || null;
+}
+
+function codexAccountKeyFromIdentity(identity) {
+  const key = codexAccountIdentityKey(identity);
+  return key ? hashCodexAccountKey(key) : null;
+}
+
+function sqlString(value) {
+  return String(value || '').replace(/'/g, "''");
+}
+
 function extractCodexThreadId(body) {
   if (!body || typeof body !== 'string') return null;
   return (body.match(/thread_id=([0-9a-f-]+)/) || [])[1]
@@ -1865,6 +1881,35 @@ function compareCodexRateSnapshotFreshness(next, prev) {
   return (Number(next.tsNanos) || 0) - (Number(prev.tsNanos) || 0);
 }
 
+function codexUsageTimestampParts(usage) {
+  const ms = parseTimestampMs(usage?.timestamp);
+  if (!Number.isFinite(ms)) return { ts: 0, tsNanos: 0 };
+  return {
+    ts: Math.floor(ms / 1000),
+    tsNanos: Math.floor((ms % 1000) * 1_000_000),
+  };
+}
+
+function codexUsageFreshnessCandidate(usage) {
+  if (!usage) return null;
+  const { ts, tsNanos } = codexUsageTimestampParts(usage);
+  return {
+    rateLimits: {
+      primary: usage.primary || usage.five_hour || null,
+      secondary: usage.secondary || usage.seven_day || null,
+    },
+    ts,
+    tsNanos,
+  };
+}
+
+function compareCodexUsageFreshness(nextUsage, prevUsage) {
+  return compareCodexRateSnapshotFreshness(
+    codexUsageFreshnessCandidate(nextUsage),
+    codexUsageFreshnessCandidate(prevUsage)
+  );
+}
+
 function closestCodexIdentity(rate, identities) {
   if (!rate || !Array.isArray(identities) || identities.length === 0) return null;
   let closest = null;
@@ -1885,7 +1930,7 @@ function codexAccountLabel({ email, accountId }, index) {
 }
 
 function buildCodexUsageAccount(raw, index) {
-  const identity = raw.accountId || raw.email || `unknown-${index}`;
+  const identity = codexAccountIdentityKey(raw) || `unknown-${index}`;
   const accountKey = hashCodexAccountKey(identity);
   const label = codexAccountLabel(raw, index);
   const usage = buildCodexUsageFromRateLimits(raw.rateLimits, raw.timestamp, raw.filePath);
@@ -1901,6 +1946,124 @@ function buildCodexUsageAccount(raw, index) {
     source: 'codex-log',
     usage,
   };
+}
+
+function buildCodexActiveUsageAccount(identity, usage, threadId) {
+  if (!usage) return null;
+  const accountKey = codexAccountKeyFromIdentity(identity);
+  if (!accountKey) return null;
+  return {
+    accountKey,
+    label: codexAccountLabel(identity, 0),
+    accountHint: identity.email ? maskCodexEmail(identity.email) : shortCodexId(identity.accountId),
+    accountIdHint: shortCodexId(identity.accountId),
+    plan_type: usage.plan_type,
+    timestamp: usage.timestamp,
+    sourceThreadId: threadId || null,
+    source: 'active-session-rollout',
+    usage,
+  };
+}
+
+function mergeCodexActiveUsageIntoAccounts(accounts, selectedAccountKey, activeUsage, sessionId) {
+  if (!Array.isArray(accounts) || !selectedAccountKey || !activeUsage) return accounts;
+  let changed = false;
+  const merged = accounts.map((account) => {
+    if (account?.accountKey !== selectedAccountKey) return account;
+    changed = true;
+    return {
+      ...account,
+      usage: activeUsage,
+      timestamp: activeUsage.timestamp,
+      plan_type: activeUsage.plan_type || account.plan_type,
+      source: 'active-session-rollout',
+      sourceThreadId: sessionId || account.sourceThreadId || null,
+    };
+  });
+  return changed ? merged : accounts;
+}
+
+function codexUsagePercentSummary(usage) {
+  const weekly = usage?.seven_day || usage?.secondary || null;
+  const fiveHour = usage?.five_hour || usage?.primary || null;
+  return 'weekly=' + (weekly?.utilization ?? 'null') +
+    ' fiveHour=' + (fiveHour?.utilization ?? 'null');
+}
+
+function codexAccountTimestampMs(account) {
+  const ms = parseTimestampMs(account?.timestamp);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function pruneCodexActiveUsageOverrides(now = Date.now()) {
+  for (const [accountKey, entry] of codexActiveUsageOverrides) {
+    if (!entry?.account?.usage || now - (entry.updatedAt || 0) > CODEX_ACTIVE_USAGE_OVERRIDE_TTL_MS) {
+      codexActiveUsageOverrides.delete(accountKey);
+    }
+  }
+}
+
+function rememberCodexActiveUsageOverride(identity, usage, sessionId) {
+  const account = buildCodexActiveUsageAccount(identity, usage, sessionId);
+  if (!account) return null;
+  const now = Date.now();
+  pruneCodexActiveUsageOverrides(now);
+
+  const existing = codexActiveUsageOverrides.get(account.accountKey);
+  if (existing?.account?.usage && compareCodexUsageFreshness(existing.account.usage, account.usage) >= 0) {
+    return existing.account;
+  }
+
+  codexActiveUsageOverrides.set(account.accountKey, { account, updatedAt: now });
+  console.log('[CodexData] usage active override remember account=' + account.label +
+    ' session=' + (shortCodexId(sessionId) || 'none') +
+    ' ' + codexUsagePercentSummary(usage));
+  return account;
+}
+
+function mergeCodexActiveOverridesIntoAccounts(accounts, { includeMissing = true, reason = 'merge' } = {}) {
+  pruneCodexActiveUsageOverrides();
+  if (codexActiveUsageOverrides.size === 0) return Array.isArray(accounts) ? accounts : [];
+
+  const next = Array.isArray(accounts) ? [...accounts] : [];
+  let changed = false;
+  for (const entry of codexActiveUsageOverrides.values()) {
+    const activeAccount = entry?.account;
+    if (!activeAccount?.accountKey || !activeAccount?.usage) continue;
+
+    const idx = next.findIndex((account) => account?.accountKey === activeAccount.accountKey);
+    if (idx >= 0) {
+      const prev = next[idx];
+      if (compareCodexUsageFreshness(activeAccount.usage, prev?.usage) > 0) {
+        next[idx] = {
+          ...prev,
+          usage: activeAccount.usage,
+          timestamp: activeAccount.timestamp,
+          plan_type: activeAccount.plan_type || prev.plan_type,
+          source: 'active-session-rollout',
+          sourceThreadId: activeAccount.sourceThreadId || prev.sourceThreadId || null,
+        };
+        changed = true;
+        console.log('[CodexData] usage active override apply reason=' + reason +
+          ' account=' + (prev.label || activeAccount.label || 'unknown') +
+          ' session=' + (shortCodexId(activeAccount.sourceThreadId) || 'none') +
+          ' ' + codexUsagePercentSummary(activeAccount.usage));
+      }
+      continue;
+    }
+
+    if (includeMissing) {
+      next.push(activeAccount);
+      changed = true;
+      console.log('[CodexData] usage active override add reason=' + reason +
+        ' account=' + (activeAccount.label || 'unknown') +
+        ' session=' + (shortCodexId(activeAccount.sourceThreadId) || 'none') +
+        ' ' + codexUsagePercentSummary(activeAccount.usage));
+    }
+  }
+
+  if (!changed) return Array.isArray(accounts) ? accounts : [];
+  return next.sort((a, b) => codexAccountTimestampMs(b) - codexAccountTimestampMs(a));
 }
 
 async function scanLatestCodexUsageAccounts() {
@@ -2012,6 +2175,39 @@ async function scanLatestCodexUsageAccounts() {
   return accounts;
 }
 
+async function findCodexAccountIdentityForThread(threadId) {
+  if (!threadId || !fs.existsSync(CODEX_LOGS_DB)) return null;
+  const sql = `
+    SELECT
+      ts,
+      ts_nanos,
+      thread_id,
+      CASE
+        WHEN instr(feedback_log_body, 'user.account_id=') > 0
+          THEN substr(feedback_log_body, instr(feedback_log_body, 'user.account_id='), 900)
+        WHEN instr(feedback_log_body, 'user.email=') > 0
+          THEN substr(feedback_log_body, instr(feedback_log_body, 'user.email='), 900)
+        ELSE ''
+      END AS body
+    FROM logs
+    WHERE ts > strftime('%s','now','-10 days')
+      AND thread_id = '${sqlString(threadId)}'
+      AND (
+        feedback_log_body LIKE '%user.account_id=%'
+        OR feedback_log_body LIKE '%user.email=%'
+      )
+    ORDER BY ts DESC, ts_nanos DESC
+    LIMIT 20;
+  `;
+
+  const rows = await runSqliteJson(CODEX_LOGS_DB, sql);
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const identity = parseCodexAccountIdentityLog(row?.body || '');
+    if (identity.accountId || identity.email) return identity;
+  }
+  return null;
+}
+
 function resolveAfterBudget(promise, budgetMs, timeoutValue) {
   return new Promise((resolve) => {
     let settled = false;
@@ -2052,11 +2248,12 @@ function startCodexUsageAccountsRefresh({ force = false, reason = 'refresh' } = 
 
   usageAccountsRefreshInFlight = scanLatestCodexUsageAccounts()
     .then((accounts) => {
-      usageAccountsCache = { ts: Date.now(), accounts };
+      const mergedAccounts = mergeCodexActiveOverridesIntoAccounts(accounts, { reason });
+      usageAccountsCache = { ts: Date.now(), accounts: mergedAccounts };
       usageAccountsLastError = null;
-      console.log('[CodexData] usage accounts refresh done count=' + accounts.length +
+      console.log('[CodexData] usage accounts refresh done count=' + mergedAccounts.length +
         ' durMs=' + (Date.now() - startedAt));
-      return accounts;
+      return mergedAccounts;
     })
     .catch((error) => {
       usageAccountsLastError = error?.message || String(error);
@@ -2080,8 +2277,10 @@ async function getCodexUsageAccountsFast({ force = false, reason = 'ipc' } = {})
   const cacheAgeMs = cache ? now - cache.ts : null;
 
   if (!force && cache && cacheAgeMs < USAGE_ACCOUNTS_CACHE_TTL_MS) {
+    const accounts = mergeCodexActiveOverridesIntoAccounts(cache.accounts, { reason: 'cache-hit' });
+    if (accounts !== cache.accounts) usageAccountsCache = { ...cache, accounts };
     return {
-      accounts: cache.accounts,
+      accounts,
       stale: false,
       refreshing: !!usageAccountsRefreshInFlight,
       cacheAgeMs,
@@ -2092,8 +2291,10 @@ async function getCodexUsageAccountsFast({ force = false, reason = 'ipc' } = {})
 
   const refreshPromise = startCodexUsageAccountsRefresh({ force, reason });
   if (cache) {
+    const accounts = mergeCodexActiveOverridesIntoAccounts(cache.accounts, { reason: force ? 'force-stale-cache' : 'stale-cache' });
+    if (accounts !== cache.accounts) usageAccountsCache = { ...cache, accounts };
     return {
-      accounts: cache.accounts,
+      accounts,
       stale: true,
       refreshing: true,
       cacheAgeMs,
@@ -2300,20 +2501,69 @@ function register() {
         force: !!opts?.force,
         reason: opts?.force ? 'ipc-force' : 'ipc',
       });
-      const accountUsages = accountResult.accounts || [];
-      const selectedAccount = opts?.accountKey
+      let accountUsages = accountResult.accounts || [];
+
+      let activeUsage = null;
+      let activeIdentity = null;
+      let activeAccountKey = null;
+      if (opts?.sessionId) {
+        try {
+          const [identity, loaded] = await Promise.all([
+            findCodexAccountIdentityForThread(opts.sessionId).catch(() => null),
+            loadSessionRecords(opts.sessionId, opts.cwd).catch((error) => ({ success: false, error: error?.message || String(error) })),
+          ]);
+          activeIdentity = identity;
+          activeAccountKey = codexAccountKeyFromIdentity(activeIdentity);
+          if (loaded?.success) {
+            activeUsage = latestCodexUsageInRecords(loaded.records, loaded.filePath);
+          }
+        } catch {}
+      }
+      if (activeUsage && activeIdentity) {
+        rememberCodexActiveUsageOverride(activeIdentity, activeUsage, opts.sessionId);
+        accountUsages = mergeCodexActiveOverridesIntoAccounts(accountUsages, { reason: 'ipc-active' });
+        if (usageAccountsCache) {
+          const cachedAccounts = mergeCodexActiveOverridesIntoAccounts(usageAccountsCache.accounts, { reason: 'ipc-cache' });
+          if (cachedAccounts !== usageAccountsCache.accounts) {
+            usageAccountsCache = { ...usageAccountsCache, accounts: cachedAccounts };
+          }
+        }
+      }
+
+      let selectedAccount = opts?.accountKey
         ? accountUsages.find((account) => account.accountKey === opts.accountKey)
         : null;
-      let usage = selectedAccount?.usage || accountUsages[0]?.usage || null;
-      let selectedAccountKey = selectedAccount?.accountKey || accountUsages[0]?.accountKey || null;
-      let source = usage ? 'account-log' : 'none';
+      if (!selectedAccount && activeAccountKey) {
+        selectedAccount = accountUsages.find((account) => account.accountKey === activeAccountKey) || null;
+      }
+      if (!selectedAccount) selectedAccount = accountUsages[0] || null;
 
-      if (!usage && !accountResult.refreshing && opts?.sessionId) {
-        const loaded = await loadSessionRecords(opts.sessionId, opts.cwd);
-        if (loaded.success) {
-          usage = latestCodexUsageInRecords(loaded.records, loaded.filePath);
-          source = usage ? 'active-session-rollout' : source;
+      let usage = selectedAccount?.usage || null;
+      let selectedAccountKey = selectedAccount?.accountKey || null;
+      let source = selectedAccount?.source === 'active-session-rollout'
+        ? 'active-session-rollout'
+        : (usage ? 'account-log' : 'none');
+
+      const activeMatchesSelected = !!activeUsage && (
+        !selectedAccountKey ||
+        (activeAccountKey && activeAccountKey === selectedAccountKey) ||
+        (!!opts?.sessionId && selectedAccount?.sourceThreadId === opts.sessionId) ||
+        (!activeAccountKey && accountUsages.length <= 1)
+      );
+      if (activeMatchesSelected && (!usage || compareCodexUsageFreshness(activeUsage, usage) > 0)) {
+        if (!selectedAccountKey && activeAccountKey) {
+          const activeAccount = buildCodexActiveUsageAccount(activeIdentity, activeUsage, opts.sessionId);
+          if (activeAccount) {
+            accountUsages = [activeAccount];
+            selectedAccount = activeAccount;
+            selectedAccountKey = activeAccount.accountKey;
+          }
+        } else if (selectedAccountKey) {
+          accountUsages = mergeCodexActiveUsageIntoAccounts(accountUsages, selectedAccountKey, activeUsage, opts.sessionId);
+          selectedAccount = accountUsages.find((account) => account.accountKey === selectedAccountKey) || selectedAccount;
         }
+        usage = activeUsage;
+        source = 'active-session-rollout';
       }
       if (!usage && !accountResult.refreshing) {
         usage = await findLatestCodexUsage();
@@ -2388,5 +2638,10 @@ module.exports = {
     findLatestCodexUsageAccounts,
     getCodexUsageAccountsFast,
     compareCodexRateSnapshotFreshness,
+    compareCodexUsageFreshness,
+    findCodexAccountIdentityForThread,
+    codexAccountKeyFromIdentity,
+    rememberCodexActiveUsageOverride,
+    mergeCodexActiveOverridesIntoAccounts,
   },
 };

@@ -174,6 +174,7 @@ interface CodexUsageAccount {
   plan_type?: string | null;
   timestamp?: string | null;
   source?: string | null;
+  sourceThreadId?: string | null;
   usage: CodexUsageData;
 }
 interface CodexUsageResponse {
@@ -1691,6 +1692,24 @@ function CodexUsageChip() {
   const refreshRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const refreshSeqRef = useRef(0);
 
+  const activeTabId = useWorkspaceStore((s) => s.getEffectiveTabId());
+  const activeCodexSessionId = useWorkspaceStore((s) => {
+    if (!activeTabId) return null;
+    for (const [, ws] of s.openProjects) {
+      const t = ws.tabs.get(activeTabId);
+      if (t?.codexSessionId) return t.codexSessionId;
+    }
+    return null;
+  });
+  const activeCodexCwd = useWorkspaceStore((s) => {
+    if (!activeTabId) return null;
+    for (const [, ws] of s.openProjects) {
+      const t = ws.tabs.get(activeTabId);
+      if (t?.codexSessionId) return t.cwd || null;
+    }
+    return null;
+  });
+
   const refresh = useCallback(async (force = false) => {
     const seq = ++refreshSeqRef.current;
     setLoading(true);
@@ -1698,6 +1717,8 @@ function CodexUsageChip() {
       const res: CodexUsageResponse = await ipcRenderer.invoke('codex:get-usage', {
         accountKey: selectedAccountKey,
         force,
+        sessionId: activeCodexSessionId || undefined,
+        cwd: activeCodexCwd || undefined,
       });
       if (seq !== refreshSeqRef.current) return;
       if (res?.success) {
@@ -1725,7 +1746,7 @@ function CodexUsageChip() {
         const weeklyPct = usage?.seven_day?.utilization ?? usage?.secondary?.utilization ?? null;
         const fiveHourPct = usage?.five_hour?.utilization ?? usage?.primary?.utilization ?? null;
         console.log(
-          `[CodexUsage] refresh ok source=${res.source || 'unknown'} account=${selected?.label || 'latest'} accounts=${nextAccounts.length} weekly=${weeklyPct ?? 'null'} fiveHour=${fiveHourPct ?? 'null'} refreshing=${isRefreshing ? 1 : 0} stale=${res.stale ? 1 : 0} force=${force}`
+          `[CodexUsage] refresh ok source=${res.source || 'unknown'} account=${selected?.label || 'latest'} accounts=${nextAccounts.length} weekly=${weeklyPct ?? 'null'} fiveHour=${fiveHourPct ?? 'null'} refreshing=${isRefreshing ? 1 : 0} stale=${res.stale ? 1 : 0} force=${force} session=${activeCodexSessionId ? activeCodexSessionId.slice(0, 8) : 'none'}`
         );
         if (!isRefreshing && refreshRetryRef.current) {
           clearTimeout(refreshRetryRef.current);
@@ -1753,7 +1774,7 @@ function CodexUsageChip() {
         setLoading(false);
       }
     }
-  }, [selectedAccountKey]);
+  }, [selectedAccountKey, activeCodexSessionId, activeCodexCwd]);
 
   useEffect(() => {
     return () => {

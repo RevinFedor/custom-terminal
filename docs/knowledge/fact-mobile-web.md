@@ -47,7 +47,7 @@ _webBroadcast(tabId, {
 
 Если между локальным `sending` и durable row приходит canonical `/history` reload, клиент обязан смерджить pending handoff обратно в publish. Иначе heavy reload стирает optimistic user-row, и UI выглядит так, будто prompt исчез или заменился tool-событием. Source of truth всё равно durable transcript: локальный handoff живёт только до matching user entry / failed / cancelled.
 
-Busy-send и Stop во время streaming имеют ещё один промежуточный случай: сервер может прислать queue-operation / handoff-ack раньше, чем canonical history reload увидит durable user-row. Для iOS это не момент снятия `queued/sending` с локальной строки. Маркер остаётся на месте до matching durable row, проверенного consumed-state или явного cancel; иначе пользователь видит старый prompt уже без очереди, а через секунду он "телепортируется" в конец истории. Логовая строка `handoff materialized` на queue-operation сама по себе означает только, что handoff принят сценарным слоем, а не что визуальная история уже догнала JSONL/rollout.
+Busy-send и Stop во время streaming имеют ещё один промежуточный случай: сервер может прислать queue-operation / HTTP handoff-ack / `submitted_unverified` раньше, чем canonical history reload увидит durable user-row. Для iOS это не момент снятия `queued/sending` с локальной строки. В Codex busy-send `queued` означает local pending marker после Enter-submit, а не native `Tab` queue. Маркер остаётся на месте до matching durable row, проверенного consumed-state или явного cancel; иначе пользователь видит старый prompt уже без очереди, а через секунду он "телепортируется" в конец истории. Логовая строка `handoff materialized` на queue-operation сама по себе означает только, что handoff принят сценарным слоем, а не что визуальная история уже догнала JSONL/rollout.
 
 `thinking` — отдельная семантическая строка, а не tool-card. Pending `tool_use` без результата можно скрыть или дождаться результата, но нельзя на один кадр превращать thinking в `MCP thinking` с badge, chevron или раскрытием справа. Completed tool rows могут быть отдельными раскрываемыми карточками; этот contract не распространяется на thinking, потому что для пользователя это статус размышления агента, а не объект инструмента.
 
@@ -83,6 +83,12 @@ File-tabs на mobile — это не chat route. Если `tabType === 'file'`,
 Контракт данных: `/api/projects/:id/tabs` отдаёт `filePath` для file-tab'ов. `cwd` остаётся рабочей директорией/legacy fallback и не должен использоваться как canonical file path, иначе сервер получит directory и вернёт `not a file`. Чтение файла идёт через `POST /api/file-preview {path}` прямо в `web-server.js`: absolute path required, `stat.isFile()`, cap 1MB, `utf8` read, ответ `{path,name,ext,size,content}`. Bridge в renderer тут не нужен — preview читает файловую систему, а не Zustand state; это быстрее и работает даже если renderer ещё не ответил на bridge.
 
 UI: `MarkdownFileSheet` — bottom-sheet с backdrop, drag handle и swipe-down dismiss (`dragY` threshold), header filename/path/size и внутренний scroll для body. Рендер Markdown на mobile использует `@noted/claude-blocks::Markdown`, а не desktop `@gt-editor/markdown-editor`: mobile уже тащит chat Markdown renderer, а desktop editor heavy/local-file dependency не нужна в phone bundle. Если file-tab принадлежит группе, отдельной логики не требуется: server уже отдаёт тот же tab row с `groupId`, а preview открывается по `filePath` независимо от группировки.
+
+## Mobile upload attachments: камера / галерея / файлы
+
+Terminal Control на iOS прикрепляет реальные фото/файлы не как base64 в prompt и не как iOS sandbox URL, а как предварительный upload на Mac. Причина: после выбора из Photos/FileImporter ссылка живёт в sandbox телефона, а Claude/Codex исполняются на Mac и должны читать локальный path. `/api/mobile-attachments` принимает `{name, kind, mimeType, dataBase64}`, кладёт файл в `app.getPath('temp')/noted-terminal-mobile-attachments/<id>/<sanitized-name>`, режет payload по 25MB и чистит старые temp-директории старше 24 часов. `DELETE /api/mobile-attachments/:id` — best-effort cleanup при удалении chip до отправки.
+
+`POST /api/terminal-tabs/:tabId/send` принимает `attachments` отдельно от `prompt`, заново валидирует что каждый path absolute и лежит внутри temp-root, а затем добавляет в prompt блок `Attached files from iOS are already uploaded to this Mac...` со списком local paths. Это намеренно дублируется с visible text, который iOS уже показывает пользователю: агент получает обычный текстовый контракт «прочитай эти path», а API response возвращает нормализованные attachments для аудита. Если такой блок уже есть в prompt, сервер не добавляет второй. GT file chips остаются другой моделью: они path-only ссылки на уже существующие файлы проекта, а mobile upload attachments — временные копии пользовательских файлов/фото.
 
 ## ParamsSheet (model/effort/think) — close-on-select + invisible-intent источники
 
@@ -307,6 +313,8 @@ POST /api/terminal-tabs/:tabId/answer-question       → answerClaudeQuestion ({
 GET  /api/active-loaders                       → live loaders snapshot для external install preflight
 GET  /api/project-activity                     → full project activity snapshot для native project badges
 GET  /api/events?scope=projects                → SSE только project-activity, без tab transcript watcher'ов
+POST /api/mobile-attachments                   → upload iOS camera/gallery/file bytes в Mac temp, cap 25MB
+DELETE /api/mobile-attachments/:id             → удалить temp upload, если chip убрали до send
 POST /api/file-preview                         → read-only file-tab preview по absolute path, cap 1MB
 GET  /api/prompts[?etag=X]                     → getPrompts + getPromptGroups (no bridge); ?etag match → { etag, unchanged: true }
 GET  /api/agent-models                         → { codex:[{id,label,efforts}], claude:[{id,label}] } каталог моделей (no bridge; codex из live `codex debug models`). Прямой роут до `let m` — см. «Гочи let m». Детали — fact-mobile-claude-pty.md::Контекст-% и список моделей
@@ -582,6 +590,11 @@ remote APNs alert по зарегистрированным iOS token'ам. Push
 его в local unread-state до навигации. Если APNs credentials или iOS token отсутствуют,
 сервер только логирует причину и сохраняет обычный foreground путь через project-activity.
 Это сознательный fallback, не доказательство что locked-phone flow работает.
+
+`firedAt` нормализуется один раз на desktop fire-edge и дальше используется тем же объектом для
+`tabCompletionNotifications`, `project-activity` snapshot и APNs payload. Не пересчитывать timestamp
+отдельно по каналам: native dedupe держится на `tabId:firedAt`, и разные значения превращают один
+завершившийся turn в два баннера или два unread-state.
 
 `POST /api/terminal-tabs/:tabId/completion-notification/clear` — idempotent acknowledgement
 для native: повторный clear или уже закрытая вкладка возвращают success, потому что тап по

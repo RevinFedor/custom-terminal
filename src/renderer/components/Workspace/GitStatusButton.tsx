@@ -73,6 +73,7 @@ type GitCommitDetails = {
   author: string;
   date: string;
   subject: string;
+  description: string;
   files: GitFile[];
   activeFilePath: string;
   diff: string;
@@ -122,6 +123,7 @@ type GitPanelPersistedState = {
   historySearch?: string;
   activeCommitHash?: string;
   activeCommitFilePath?: string;
+  commitDescriptionLines?: number;
 };
 
 type Props = {
@@ -186,6 +188,11 @@ function normalizeSplitLeftWidth(value: number | undefined | null, panelWidth: n
   return Math.max(MIN_LEFT_PANE_WIDTH, Math.min(max, Number.isFinite(width) ? width : fallback));
 }
 
+function normalizeCommitDescriptionLines(value: number | undefined | null) {
+  const lines = Math.round(Number(value || 3));
+  return Math.max(1, Math.min(6, Number.isFinite(lines) ? lines : 3));
+}
+
 function gitPanelStateKey(projectId?: string | null, repoRoot?: string, projectPath?: string) {
   const raw = projectId || repoRoot || projectPath || '';
   return raw ? 'noted-terminal.git.panel.' + raw : '';
@@ -243,6 +250,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [activeFilePath, setActiveFilePath] = useState('');
   const [panelSize, setPanelSize] = useState(() => normalizePanelSize(DEFAULT_PANEL_SIZE));
   const [splitLeftWidth, setSplitLeftWidth] = useState(() => normalizeSplitLeftWidth(undefined, DEFAULT_PANEL_SIZE.width));
+  const [commitDescriptionLines, setCommitDescriptionLines] = useState(() => normalizeCommitDescriptionLines(undefined));
   const [selectedRepoPath, setSelectedRepoPath] = useState(projectPath || '');
   const [repoSelectorOpen, setRepoSelectorOpen] = useState(false);
   const [repoSelectorTab, setRepoSelectorTab] = useState<'repos' | 'favorites'>('repos');
@@ -410,7 +418,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         return result.activeFilePath || files[0]?.path || '';
       });
     } catch (error: any) {
-      setCommitDetails({ success: false, hash: commitHash, shortHash: commitHash, author: '', date: '', subject: '', files: [], activeFilePath: '', diff: '', additions: 0, deletions: 0, totalAdditions: 0, totalDeletions: 0, error: trimError(error?.message || error) });
+      setCommitDetails({ success: false, hash: commitHash, shortHash: commitHash, author: '', date: '', subject: '', description: '', files: [], activeFilePath: '', diff: '', additions: 0, deletions: 0, totalAdditions: 0, totalDeletions: 0, error: trimError(error?.message || error) });
     } finally {
       setCommitDetailsLoading(false);
     }
@@ -513,6 +521,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         const nextPanelSize = normalizePanelSize(next?.panelSize);
         setPanelSize(nextPanelSize);
         setSplitLeftWidth(normalizeSplitLeftWidth(next?.splitLeftWidth, nextPanelSize.width));
+        setCommitDescriptionLines(normalizeCommitDescriptionLines(next?.commitDescriptionLines));
         setSelectedRepoPath(typeof next?.selectedRepoPath === 'string' && next.selectedRepoPath ? next.selectedRepoPath : (projectPath || ''));
         setRepoSelectorTab(next?.repoSelectorTab === 'favorites' ? 'favorites' : 'repos');
         setRepoFavorites(Array.isArray(next?.repoFavorites) ? next.repoFavorites.filter((item) => typeof item === 'string') : []);
@@ -556,6 +565,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         selectedPaths: Array.from(selectedPaths),
         panelSize,
         splitLeftWidth,
+        commitDescriptionLines,
         docsOnlyWhenPresent,
         selectedRepoPath,
         repoSelectorTab,
@@ -566,11 +576,14 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     return () => {
       if (saveDebounceRef.current) window.clearTimeout(saveDebounceRef.current);
     };
-  }, [panelStateKey, open, panelTab, summary, description, search, historySearch, activeFilePath, activeCommitHash, activeCommitFilePath, selectedPaths, panelSize, splitLeftWidth, docsOnlyWhenPresent, selectedRepoPath, repoSelectorTab, repoFavorites]);
+  }, [panelStateKey, open, panelTab, summary, description, search, historySearch, activeFilePath, activeCommitHash, activeCommitFilePath, selectedPaths, panelSize, splitLeftWidth, commitDescriptionLines, docsOnlyWhenPresent, selectedRepoPath, repoSelectorTab, repoFavorites]);
 
   useEffect(() => {
     if (!open) return;
-    loadStatus(true);
+    // Opening the panel should use stale-while-revalidate: render cached Git
+    // status immediately and refresh in the background. Explicit actions
+    // (Refresh/Commit/Push/Checkout) still call loadStatus(true).
+    loadStatus(false);
   }, [open, loadStatus]);
 
   useEffect(() => {
@@ -1097,8 +1110,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
             {settingsOpen ? (
               <SettingsView
                 docsOnlyWhenPresent={docsOnlyWhenPresent}
+                commitDescriptionLines={commitDescriptionLines}
                 onBack={() => setSettingsOpen(false)}
                 onToggleDocsOnly={toggleDocsOnly}
+                onCommitDescriptionLinesChange={setCommitDescriptionLines}
               />
             ) : (
               <div
@@ -1459,6 +1474,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                       details={commitDetails}
                       loading={commitDetailsLoading}
                       activeFilePath={activeCommitFilePath}
+                      descriptionLines={commitDescriptionLines}
                       onSelectFile={setActiveCommitFilePath}
                     />
                   )}
@@ -1712,13 +1728,18 @@ function RepoTabButton({ active, children, onClick }: { active: boolean; childre
 
 function SettingsView({
   docsOnlyWhenPresent,
+  commitDescriptionLines,
   onBack,
   onToggleDocsOnly,
+  onCommitDescriptionLinesChange,
 }: {
   docsOnlyWhenPresent: boolean;
+  commitDescriptionLines: number;
   onBack: () => void;
   onToggleDocsOnly: () => void;
+  onCommitDescriptionLinesChange: (lines: number) => void;
 }) {
+  const normalizedLines = normalizeCommitDescriptionLines(commitDescriptionLines);
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 280 }}>
       <div style={{ height: 46, display: 'flex', alignItems: 'center', gap: 8, padding: '0 12px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
@@ -1779,6 +1800,33 @@ function SettingsView({
             />
           </span>
         </button>
+        <div style={{ ...settingsRowStyle, marginTop: 10 }}>
+          <span style={{ minWidth: 0 }}>
+            <span style={{ display: 'block', fontSize: 12, fontWeight: 750, color: '#f8fafc' }}>Commit description lines</span>
+            <span style={{ display: 'block', fontSize: 10.5, color: '#8b949e', marginTop: 3, lineHeight: 1.35 }}>
+              Limit the selected commit description in History preview.
+            </span>
+          </span>
+          <span style={stepperStyle}>
+            <button
+              onClick={() => onCommitDescriptionLinesChange(normalizeCommitDescriptionLines(normalizedLines - 1))}
+              disabled={normalizedLines <= 1}
+              style={stepperButtonStyle(normalizedLines <= 1)}
+              title="Show fewer lines"
+            >
+              <Minus size={12} />
+            </button>
+            <span style={stepperValueStyle}>{normalizedLines}</span>
+            <button
+              onClick={() => onCommitDescriptionLinesChange(normalizeCommitDescriptionLines(normalizedLines + 1))}
+              disabled={normalizedLines >= 6}
+              style={stepperButtonStyle(normalizedLines >= 6)}
+              title="Show more lines"
+            >
+              <Plus size={12} />
+            </button>
+          </span>
+        </div>
       </div>
     </div>
   );
@@ -1933,11 +1981,13 @@ function HistoryCommitPreview({
   details,
   loading,
   activeFilePath,
+  descriptionLines,
   onSelectFile,
 }: {
   details: GitCommitDetails | null;
   loading: boolean;
   activeFilePath: string;
+  descriptionLines: number;
   onSelectFile: (filePath: string) => void;
 }) {
   const activeFile = details?.files.find((file) => file.path === activeFilePath) || details?.files[0] || null;
@@ -1978,16 +2028,22 @@ function HistoryCommitPreview({
     <div style={historyDetailShellStyle}>
       <div style={historyDetailHeaderStyle}>
         <div style={{ minWidth: 0, flex: 1 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-            <span style={{ color: '#f8fafc', fontSize: 12, fontWeight: 820, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          <div style={commitSubjectStyle}>{details.subject || 'Untitled commit'}</div>
+          {details.description ? (
+            <div style={commitDescriptionStyle(normalizeCommitDescriptionLines(descriptionLines))}>
+              {details.description}
+            </div>
+          ) : null}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, marginTop: details.description ? 7 : 4 }}>
+            <span style={{ color: '#8b949e', fontSize: 11, fontWeight: 650, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {details.author || 'Unknown author'}
             </span>
             <span style={{ color: '#8b949e', fontSize: 11, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', flexShrink: 0 }}>
               {details.shortHash}
             </span>
-          </div>
-          <div style={{ marginTop: 4, color: '#8b949e', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {details.date}
+            <span style={{ color: '#8b949e', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {details.date}
+            </span>
           </div>
         </div>
         <div style={diffStatStyle}>
@@ -2214,6 +2270,59 @@ const historyContextMenuItemStyle = (disabled: boolean): React.CSSProperties => 
   cursor: disabled ? 'default' : 'pointer',
   textAlign: 'left',
 });
+
+const settingsRowStyle: React.CSSProperties = {
+  width: '100%',
+  minHeight: 58,
+  borderRadius: 8,
+  border: '1px solid rgba(255,255,255,0.10)',
+  background: 'rgba(255,255,255,0.04)',
+  color: '#e5e7eb',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'space-between',
+  gap: 12,
+  padding: '10px 11px',
+  boxSizing: 'border-box',
+  textAlign: 'left',
+};
+
+const stepperStyle: React.CSSProperties = {
+  height: 24,
+  borderRadius: 7,
+  border: '1px solid rgba(255,255,255,0.12)',
+  background: '#111318',
+  display: 'inline-flex',
+  alignItems: 'center',
+  overflow: 'hidden',
+  flexShrink: 0,
+};
+
+const stepperButtonStyle = (disabled: boolean): React.CSSProperties => ({
+  width: 25,
+  height: 24,
+  border: 'none',
+  background: 'transparent',
+  color: disabled ? '#4b5563' : '#cbd5e1',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  cursor: disabled ? 'default' : 'pointer',
+});
+
+const stepperValueStyle: React.CSSProperties = {
+  minWidth: 24,
+  height: 24,
+  borderLeft: '1px solid rgba(255,255,255,0.08)',
+  borderRight: '1px solid rgba(255,255,255,0.08)',
+  color: '#f8fafc',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  fontSize: 11,
+  fontWeight: 800,
+  fontVariantNumeric: 'tabular-nums',
+};
 
 const leftResizeHandleStyle = (active: boolean): React.CSSProperties => ({
   position: 'absolute',
@@ -2647,15 +2756,38 @@ const historyDetailShellStyle: React.CSSProperties = {
 };
 
 const historyDetailHeaderStyle: React.CSSProperties = {
-  minHeight: 46,
+  minHeight: 58,
   flexShrink: 0,
   display: 'flex',
-  alignItems: 'center',
+  alignItems: 'flex-start',
   gap: 10,
   padding: '8px 12px',
   borderBottom: '1px solid rgba(255,255,255,0.08)',
   background: '#141820',
 };
+
+const commitSubjectStyle: React.CSSProperties = {
+  color: '#f8fafc',
+  fontSize: 12.5,
+  fontWeight: 760,
+  lineHeight: '17px',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+};
+
+const commitDescriptionStyle = (lines: number): React.CSSProperties => ({
+  marginTop: 4,
+  color: '#a6adbb',
+  fontSize: 12,
+  fontWeight: 520,
+  lineHeight: '16px',
+  overflow: 'hidden',
+  display: '-webkit-box',
+  WebkitBoxOrient: 'vertical',
+  WebkitLineClamp: lines,
+  whiteSpace: 'pre-wrap',
+});
 
 const historyDetailBodyStyle: React.CSSProperties = {
   minHeight: 0,

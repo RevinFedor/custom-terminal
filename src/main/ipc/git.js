@@ -252,6 +252,15 @@ function parseCommitNameStatus(stdout) {
   };
 }
 
+function commitDescriptionFromBody(bodyText, subject) {
+  const lines = String(bodyText || '').replace(/\r\n/g, '\n').split('\n');
+  if (!lines.length) return '';
+  if ((lines[0] || '').trim() === String(subject || '').trim()) lines.shift();
+  while (lines.length && !lines[0].trim()) lines.shift();
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  return lines.join('\n').trim();
+}
+
 function parseNumstat(stdout) {
   let additions = 0;
   let deletions = 0;
@@ -556,6 +565,8 @@ function register({ projectManager }) {
       ], { maxBuffer: GIT_MAX_BUFFER });
       if (!meta.success) throw new Error(meta.stderr || meta.error || 'git show failed');
       const details = parseCommitNameStatus(meta.stdout);
+      const body = await runGit(root, ['show', '-s', '--format=%B', commitHash], { maxBuffer: GIT_MAX_BUFFER });
+      const commitDescription = body.success ? commitDescriptionFromBody(body.stdout, details.subject) : '';
       const requestedPath = String(filePath || '').trim();
       const activeFile = details.files.find((file) => file.path === requestedPath)
         || details.files[0]
@@ -585,6 +596,7 @@ function register({ projectManager }) {
         author: details.author,
         date: details.date,
         subject: details.subject,
+        description: commitDescription,
         files: details.files,
         activeFilePath: activeFile?.path || '',
         diff: limited.text,

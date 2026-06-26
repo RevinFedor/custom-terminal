@@ -3134,29 +3134,41 @@ let claudeHookServer = null;
 const grabInputPending = new Map(); // tabId → { resolve, timer }
 const grabInputPidToTab = new Map(); // cliPid → tabId, used by non-Claude external-editor grabs
 const codexSavedClipboardImagesByTab = new Map(); // tabId → [{ path, at }]
+const CODEX_STAGED_IMAGE_RETENTION_MS = 12 * 60 * 60 * 1000;
+const CODEX_STAGED_IMAGE_LIMIT = 96;
+
+function pruneCodexClipboardImagePaths(tabId, now = Date.now()) {
+  if (!tabId) return [];
+  const prev = codexSavedClipboardImagesByTab.get(tabId) || [];
+  const next = prev
+    .filter((entry) => entry && typeof entry.path === 'string' && now - Number(entry.at || 0) < CODEX_STAGED_IMAGE_RETENTION_MS)
+    .slice(-CODEX_STAGED_IMAGE_LIMIT);
+  if (next.length > 0) codexSavedClipboardImagesByTab.set(tabId, next);
+  else codexSavedClipboardImagesByTab.delete(tabId);
+  return next;
+}
 
 function rememberCodexClipboardImagePath(tabId, filePath) {
   if (!tabId || !filePath) return;
   const now = Date.now();
-  const prev = codexSavedClipboardImagesByTab.get(tabId) || [];
-  const next = prev
-    .filter((entry) => entry && typeof entry.path === 'string' && now - Number(entry.at || 0) < 5 * 60 * 1000)
+  const next = pruneCodexClipboardImagePaths(tabId, now)
     .concat({ path: filePath, at: now })
-    .slice(-12);
+    .slice(-CODEX_STAGED_IMAGE_LIMIT);
   codexSavedClipboardImagesByTab.set(tabId, next);
 }
 
-function takeRecentCodexClipboardImagePaths(tabId, count) {
+function peekRecentCodexClipboardImagePaths(tabId, count) {
   if (!tabId || count <= 0) return [];
+  return pruneCodexClipboardImagePaths(tabId).slice(-count);
+}
+
+function describeCodexClipboardImagePaths(tabId) {
   const now = Date.now();
-  const prev = codexSavedClipboardImagesByTab.get(tabId) || [];
-  const fresh = prev.filter((entry) => entry && typeof entry.path === 'string' && now - Number(entry.at || 0) < 5 * 60 * 1000);
-  const chosen = fresh.slice(-count);
-  const chosenSet = new Set(chosen);
-  const remaining = fresh.filter((entry) => !chosenSet.has(entry)).slice(-12);
-  if (remaining.length > 0) codexSavedClipboardImagesByTab.set(tabId, remaining);
-  else codexSavedClipboardImagesByTab.delete(tabId);
-  return chosen;
+  const entries = pruneCodexClipboardImagePaths(tabId, now);
+  if (entries.length === 0) return 'stored=0';
+  const oldestAgeSec = Math.round((now - Number(entries[0]?.at || now)) / 1000);
+  const newestAgeSec = Math.round((now - Number(entries[entries.length - 1]?.at || now)) / 1000);
+  return 'stored=' + entries.length + ' oldestAgeSec=' + oldestAgeSec + ' newestAgeSec=' + newestAgeSec;
 }
 
 function findTabIdBySession(sessionId) {
@@ -3615,7 +3627,7 @@ function startClaudeHookServer() {
               if (agent === 'codex') {
                 let replaced = 0;
                 let pathResolved = 0;
-                const recentImagePaths = takeRecentCodexClipboardImagePaths(tabId, images);
+                const recentImagePaths = peekRecentCodexClipboardImagePaths(tabId, images);
                 resolvedText = text.replace(/\[Image(?:\s+#?(\d+))?\]/g, (_match, id) => {
                   const staged = recentImagePaths[replaced];
                   replaced += 1;
@@ -3626,7 +3638,7 @@ function startClaudeHookServer() {
                   return '[imageError: codex_image_path_unavailable' + (id ? ' #' + id : '') + ']';
                 });
                 imageCountForQueue = 0;
-                console.warn('[GrabImages:Codex] tab=' + tabId.slice(-12) + ' refs=' + images + ' replaced=' + replaced + ' pathResolved=' + pathResolved + ' reason=external-editor-returned-placeholder');
+                console.warn('[GrabImages:Codex] tab=' + tabId.slice(-12) + ' refs=' + images + ' replaced=' + replaced + ' pathResolved=' + pathResolved + ' reason=external-editor-returned-placeholder ' + describeCodexClipboardImagePaths(tabId));
               } else {
                 const sid = bridgeKnownSessions.get(tabId) || null;
                 const resolved = resolveGrabbedImagePaths(sid, text);
@@ -9868,25 +9880,55 @@ ipcMain.handle('codex:save-clipboard-image', async (_event, { tabId } = {}) => {
   }
 });
 
+async function stageCodexImagePathForTab(tabId, filePath) {
+  const candidate = typeof filePath === 'string' ? filePath.trim() : '';
+  if (!candidate || !path.isAbsolute(candidate)) {
+    return { success: false, error: 'invalid_path', path: candidate || null };
+  }
+  if (!/\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(candidate)) {
+    return { success: false, error: 'unsupported_image_path', path: candidate };
+  }
+  const st = await fs.promises.stat(candidate).catch(() => null);
+  if (!st || !st.isFile()) {
+    return { success: false, error: 'image_path_missing', path: candidate };
+  }
+  rememberCodexClipboardImagePath(tabId, candidate);
+  return { success: true, path: candidate, size: st.size };
+}
+
 ipcMain.handle('codex:stage-image-path', async (_event, { tabId, filePath } = {}) => {
   try {
-    const candidate = typeof filePath === 'string' ? filePath.trim() : '';
-    if (!candidate || !path.isAbsolute(candidate)) {
-      return { success: false, error: 'invalid_path' };
+    const result = await stageCodexImagePathForTab(tabId, filePath);
+    if (result.success) {
+      console.log('[codex:stage-image-path] tab=' + String(tabId || 'unknown').slice(-12) + ' path=' + result.path + ' bytes=' + result.size);
     }
-    if (!/\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(candidate)) {
-      return { success: false, error: 'unsupported_image_path' };
-    }
-    const st = await fs.promises.stat(candidate).catch(() => null);
-    if (!st || !st.isFile()) {
-      return { success: false, error: 'image_path_missing' };
-    }
-    rememberCodexClipboardImagePath(tabId, candidate);
-    console.log('[codex:stage-image-path] tab=' + String(tabId || 'unknown').slice(-12) + ' path=' + candidate + ' bytes=' + st.size);
-    return { success: true, path: candidate, size: st.size };
+    return result;
   } catch (error) {
     console.warn('[codex:stage-image-path] failed:', error?.message || error);
     return { success: false, error: error?.code || 'stage_failed' };
+  }
+});
+
+ipcMain.handle('codex:stage-image-paths', async (_event, { tabId, filePaths } = {}) => {
+  try {
+    const candidates = Array.isArray(filePaths) ? filePaths : [];
+    if (candidates.length === 0) {
+      return { success: false, error: 'no_paths', paths: [], results: [] };
+    }
+    const results = [];
+    for (const filePath of candidates) {
+      results.push(await stageCodexImagePathForTab(tabId, filePath));
+    }
+    const paths = results.filter((result) => result?.success && result.path);
+    const success = paths.length === results.length;
+    const error = paths.length === 0
+      ? (results.find((result) => result?.error)?.error || 'stage_failed')
+      : undefined;
+    console.log('[codex:stage-image-paths] tab=' + String(tabId || 'unknown').slice(-12) + ' requested=' + candidates.length + ' staged=' + paths.length + (error ? ' error=' + error : ''));
+    return { success, error, paths, results };
+  } catch (error) {
+    console.warn('[codex:stage-image-paths] failed:', error?.message || error);
+    return { success: false, error: error?.code || 'stage_failed', paths: [], results: [] };
   }
 });
 // Send a slash command to Claude's Ink TUI (chunked paste + echo verification)
@@ -13248,15 +13290,24 @@ ipcMain.on('tab-notification:fired', (_event, detail = {}) => {
     const tabId = String(detail.tabId || '');
     const projectId = String(detail.projectId || '');
     if (!tabId || !projectId) return;
+    const firedAt = Number(detail.firedAt) || Date.now();
+    const normalizedDetail = {
+      ...detail,
+      projectId,
+      tabId,
+      tabName: String(detail.tabName || 'Terminal'),
+      firedAt,
+      persistent: detail.persistent === true,
+    };
     tabCompletionNotifications.set(tabId, {
       projectId,
-      tabName: String(detail.tabName || 'Terminal'),
-      firedAt: Number(detail.firedAt) || Date.now(),
-      persistent: detail.persistent === true,
+      tabName: normalizedDetail.tabName,
+      firedAt,
+      persistent: normalizedDetail.persistent,
     });
     scheduleProjectActivityBroadcast('tab-notification');
     try {
-      require(path.join(srcMainDir, 'web-server')).sendTabCompletionPush?.(detail).catch((e) => {
+      require(path.join(srcMainDir, 'web-server')).sendTabCompletionPush?.(normalizedDetail).catch((e) => {
         console.warn('[TabNotification] APNs push failed: ' + (e?.message || e));
       });
     } catch (e) {
@@ -19329,6 +19380,7 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
   });
   console.log('[Codex Runner] Command:', command, 'tab:', tabId, 'session:', sessionId || 'new', 'cwd:', termCwd, 'model:', effectiveModel || 'default', 'effort:', effectiveEffort || 'default', 'developerInstructionsChars:', developerInstructions ? String(developerInstructions).length : 0, 'restartReason:', restartReason, 'mcpStartupRestarts:', mcpStartupRestartAttempts, 'launchId:', launchId);
 
+  codexSavedClipboardImagesByTab.delete(tabId);
   invalidateAiProcessLookupCache(tabId, 'codex');
   const commandState = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
   commandState.isRunning = true;
@@ -19438,6 +19490,9 @@ ipcMain.handle('codex:run-command', async (event, payload) => {
 
 ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}) => {
   const statusAtSend = options && typeof options.statusAtSend === 'string' ? options.statusAtSend : null;
+  // `shouldQueue` is a UI/API handoff state: the prompt was submitted while
+  // Codex was busy, so clients keep the local row marked queued until rollout
+  // materializes it. It is NOT a request to press Codex's native Tab queue key.
   const shouldQueue = !!(options && (options.queue === true || statusAtSend === 'busy'));
   const handoffId = options && typeof options.handoffId === 'string' ? options.handoffId : null;
   const source = options && typeof options.source === 'string' ? options.source : null;
@@ -19455,7 +19510,7 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
   }
   const hasTurnWatcher = await ensureCodexTurnWatcher(tabId, null, terminalProjects.get(tabId));
   const hasSessionWatcher = codexWatchers.has(tabId);
-  if (!shouldQueue && !hasTurnWatcher && !hasSessionWatcher) {
+  if (!hasTurnWatcher && !hasSessionWatcher) {
     console.warn('[codex:send-command] ❌ No Codex turn watcher for tab=' + String(tabId).slice(-12) + ' — refusing unverified Enter send');
     return { success: false, error: 'codex_turn_watcher_unavailable' };
   }
@@ -19464,14 +19519,14 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
       submit: true,
       ctrlCFirst: false,
       fast: false,
-      submitSequence: shouldQueue ? '\t' : '\r',
-      submitLabel: shouldQueue ? 'Tab(queue)' : 'Enter',
+      submitSequence: '\r',
+      submitLabel: shouldQueue ? 'Enter(busy)' : 'Enter',
       handoffId,
       source: codexSource,
       skipRenderWait: true,
-      awaitCodexUserMessageAudit: !shouldQueue,
+      awaitCodexUserMessageAudit: true,
       codexAuditTimeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
-      verifyCodexVisibleDraftBeforeSubmit: !shouldQueue && !skipVisibleDraftGuard,
+      verifyCodexVisibleDraftBeforeSubmit: !skipVisibleDraftGuard,
       logPrefix: '[codex:send-command:' + tabId + ']',
     });
     if (result && typeof result === 'object') {

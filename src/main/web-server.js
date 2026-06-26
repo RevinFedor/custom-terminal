@@ -172,6 +172,138 @@ function cleanOptionalString(value, fallback = '') {
   return s || fallback;
 }
 
+const MOBILE_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
+const mobileAttachmentIndex = new Map();
+
+function mobileAttachmentRoot() {
+  return path.join(app.getPath('temp'), 'noted-terminal-mobile-attachments');
+}
+
+function sanitizeMobileAttachmentName(name, fallback = 'attachment') {
+  const raw = String(name || fallback).trim() || fallback;
+  return raw
+    .replace(/[\/\\:\0]/g, '-')
+    .replace(/\s+/g, ' ')
+    .slice(0, 160) || fallback;
+}
+
+function normalizeMobileAttachmentKind(kind, mimeType) {
+  const k = String(kind || '').toLowerCase();
+  if (k === 'image' || k === 'file') return k;
+  return String(mimeType || '').startsWith('image/') ? 'image' : 'file';
+}
+
+function safeMobileAttachmentPath(id, name) {
+  const safeId = String(id || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!safeId) return null;
+  return path.join(mobileAttachmentRoot(), safeId, sanitizeMobileAttachmentName(name));
+}
+
+async function removeMobileAttachment(id) {
+  const cleanId = String(id || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!cleanId) return false;
+  const known = mobileAttachmentIndex.get(cleanId);
+  const dir = known?.dir || path.join(mobileAttachmentRoot(), cleanId);
+  await fs.promises.rm(dir, { recursive: true, force: true });
+  mobileAttachmentIndex.delete(cleanId);
+  return true;
+}
+
+async function cleanupMobileAttachments() {
+  const root = mobileAttachmentRoot();
+  try {
+    const entries = await fs.promises.readdir(root, { withFileTypes: true });
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    await Promise.all(entries
+      .filter((entry) => entry.isDirectory())
+      .map(async (entry) => {
+        const dir = path.join(root, entry.name);
+        try {
+          const stat = await fs.promises.stat(dir);
+          if (stat.mtimeMs < cutoff) await fs.promises.rm(dir, { recursive: true, force: true });
+        } catch {}
+      }));
+  } catch {}
+}
+
+async function storeMobileAttachment(payload) {
+  const name = sanitizeMobileAttachmentName(payload?.name, payload?.kind === 'image' ? 'image.jpg' : 'attachment');
+  const mimeType = cleanOptionalString(payload?.mimeType, 'application/octet-stream');
+  const kind = normalizeMobileAttachmentKind(payload?.kind, mimeType);
+  const dataBase64 = typeof payload?.dataBase64 === 'string' ? payload.dataBase64 : '';
+  if (!dataBase64) {
+    const err = new Error('dataBase64 required');
+    err.statusCode = 400;
+    throw err;
+  }
+  const estimatedBytes = Math.floor((dataBase64.length * 3) / 4);
+  if (estimatedBytes > MOBILE_ATTACHMENT_MAX_BYTES) {
+    const err = new Error('attachment too large');
+    err.statusCode = 413;
+    throw err;
+  }
+  const buffer = Buffer.from(dataBase64, 'base64');
+  if (!buffer.length || buffer.length > MOBILE_ATTACHMENT_MAX_BYTES) {
+    const err = new Error('attachment too large');
+    err.statusCode = 413;
+    throw err;
+  }
+  const id = crypto.randomUUID();
+  const dir = path.join(mobileAttachmentRoot(), id);
+  const filePath = safeMobileAttachmentPath(id, name);
+  if (!filePath) {
+    const err = new Error('invalid attachment id');
+    err.statusCode = 500;
+    throw err;
+  }
+  await fs.promises.mkdir(dir, { recursive: true });
+  await fs.promises.writeFile(filePath, buffer);
+  const item = { id, kind, name, mimeType, size: buffer.length, path: filePath, dir, createdAt: Date.now() };
+  mobileAttachmentIndex.set(id, item);
+  cleanupMobileAttachments();
+  return item;
+}
+
+function normalizeSendAttachments(attachments) {
+  if (!Array.isArray(attachments)) return [];
+  const root = mobileAttachmentRoot();
+  return attachments.flatMap((item) => {
+    const id = typeof item?.id === 'string' ? item.id : '';
+    const known = id ? mobileAttachmentIndex.get(id) : null;
+    const rawPath = String(item?.path || item?.filePath || known?.path || '').trim();
+    if (!rawPath || !path.isAbsolute(rawPath)) return [];
+    const resolved = path.resolve(rawPath);
+    if (!resolved.startsWith(path.resolve(root) + path.sep)) return [];
+    if (!fs.existsSync(resolved)) return [];
+    const name = sanitizeMobileAttachmentName(item?.name || known?.name || path.basename(resolved));
+    const mimeType = cleanOptionalString(item?.mimeType || known?.mimeType, 'application/octet-stream');
+    const kind = normalizeMobileAttachmentKind(item?.kind || known?.kind, mimeType);
+    const size = Number(item?.size || known?.size || 0) || 0;
+    return [{ id, kind, name, mimeType, size, path: resolved }];
+  });
+}
+
+function appendAttachmentsToPrompt(prompt, attachments) {
+  const cleanPrompt = String(prompt || '').trim();
+  const normalized = normalizeSendAttachments(attachments);
+  if (!normalized.length) return { prompt: cleanPrompt, attachments: [] };
+  const lines = normalized.map((att) => {
+    const sizePart = att.size ? ', ' + Math.ceil(att.size / 1024) + ' KB' : '';
+    return '- [' + att.kind + '] ' + att.name + ': ' + att.path + ' (' + att.mimeType + sizePart + ')';
+  });
+  const attachmentBlock = [
+    'Attached files from iOS are already uploaded to this Mac. Read them from these local paths if relevant:',
+    ...lines,
+  ].join('\n');
+  if (cleanPrompt.includes('Attached files from iOS are already uploaded to this Mac')) {
+    return { prompt: cleanPrompt, attachments: normalized };
+  }
+  return {
+    prompt: [cleanPrompt, attachmentBlock].filter(Boolean).join('\n\n'),
+    attachments: normalized,
+  };
+}
+
 function clampAutoStopMs(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 30_000;
@@ -602,8 +734,13 @@ function apnsConfigFor(envOverride) {
   const keyPath = process.env.NOTED_APNS_KEY_PATH || process.env.APNS_KEY_PATH || '';
   const inlineKey = process.env.NOTED_APNS_PRIVATE_KEY || process.env.APNS_PRIVATE_KEY || '';
   let privateKey = inlineKey ? inlineKey.replace(/\\n/g, '\n') : '';
+  let keyReadError = '';
   if (!privateKey && keyPath) {
-    privateKey = fs.readFileSync(path.resolve(keyPath), 'utf-8');
+    try {
+      privateKey = fs.readFileSync(path.resolve(keyPath), 'utf-8');
+    } catch (e) {
+      keyReadError = e?.message || String(e);
+    }
   }
   const forcedEnv = process.env.NOTED_APNS_ENV || process.env.APNS_ENV || '';
   const environment = forcedEnv === 'production' || forcedEnv === 'development'
@@ -614,7 +751,7 @@ function apnsConfigFor(envOverride) {
       if (name === 'KEY_ID') return !keyId;
       if (name === 'TEAM_ID') return !teamId;
       return !privateKey;
-    }) };
+    }), error: keyReadError };
   }
   return { configured: true, keyId, teamId, privateKey, environment };
 }
@@ -638,8 +775,15 @@ function sendApnsNotification(tokenRecord, payload) {
   return new Promise((resolve) => {
     const config = apnsConfigFor(tokenRecord.environment);
     if (!config.configured) {
-      console.warn('[APNs] skip not configured missing=' + config.missing.join(',') + ' token=' + String(tokenRecord.token || '').slice(-10));
-      resolve({ ok: false, skipped: true, reason: 'not_configured' });
+      console.warn('[APNs] skip not configured missing=' + config.missing.join(',') + ' token=' + String(tokenRecord.token || '').slice(-10) + (config.error ? ' error=' + config.error : ''));
+      resolve({ ok: false, skipped: true, reason: 'not_configured', error: config.error || undefined });
+      return;
+    }
+    let jwt = '';
+    try {
+      jwt = apnsJwt(config);
+    } catch (e) {
+      resolve({ ok: false, error: 'jwt: ' + (e?.message || String(e)) });
       return;
     }
     const host = config.environment === 'production' ? 'https://api.push.apple.com' : 'https://api.sandbox.push.apple.com';
@@ -656,7 +800,7 @@ function sendApnsNotification(tokenRecord, payload) {
     const req = client.request({
       ':method': 'POST',
       ':path': '/3/device/' + tokenRecord.token,
-      authorization: 'bearer ' + apnsJwt(config),
+      authorization: 'bearer ' + jwt,
       'apns-topic': bundleId,
       'apns-push-type': 'alert',
       'apns-priority': '10',
@@ -1194,6 +1338,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       ok: true,
       configured: config.configured === true,
       missing: config.configured ? [] : config.missing,
+      error: config.error || null,
       tokenCount: tokens.length,
       tokens: tokens.map((item) => ({
         environment: item.environment,
@@ -1316,6 +1461,37 @@ async function handleApi(req, res, parsed, sdkSessions) {
   }
 
   if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+
+  if (parsed.pathname === '/api/mobile-attachments' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const item = await storeMobileAttachment(body);
+      return sendJson(res, 200, {
+        ok: true,
+        attachment: {
+          id: item.id,
+          kind: item.kind,
+          name: item.name,
+          mimeType: item.mimeType,
+          size: item.size,
+          path: item.path,
+        },
+      });
+    } catch (e) {
+      const status = Number(e?.statusCode) || 500;
+      return sendJson(res, status, { ok: false, error: String(e?.message || e) });
+    }
+  }
+
+  let attachmentMatch = parsed.pathname.match(/^\/api\/mobile-attachments\/([^/]+)$/);
+  if (attachmentMatch && req.method === 'DELETE') {
+    try {
+      await removeMobileAttachment(decId(attachmentMatch[1]));
+      return sendJson(res, 200, { ok: true });
+    } catch (e) {
+      return sendJson(res, 500, { ok: false, error: String(e?.message || e) });
+    }
+  }
 
   if (parsed.pathname === '/api/app-settings' && req.method === 'GET') {
     try {
@@ -1804,13 +1980,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const tabId = decId(m[1]);
     try {
       const body = await readBody(req);
-      const { prompt, model, effort, thinking, cwd, handoffId, source, statusAtSend, queue } = body;
+      const { prompt, model, effort, thinking, cwd, handoffId, source, statusAtSend, queue, attachments } = body;
       if (!prompt) return sendJson(res, 400, { error: 'prompt required' });
+      const sendPayload = appendAttachmentsToPrompt(prompt, attachments);
       // Single bridge round-trip — renderer dispatches by tab.tabType/commandType.
       // Earlier this endpoint did TWO round-trips (status check + send), adding
       // ~50ms per phone send on top of the actual PTY paste latency.
       const data = await runAgentSendScenario({
-        tabId, prompt, model, effort, thinking, cwd,
+        tabId, prompt: sendPayload.prompt, model, effort, thinking, cwd,
         handoffId, source, statusAtSend, queue: queue === true,
         ownership: 'project',
       });
@@ -1819,6 +1996,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ok: true,
         success: data?.success !== false,
         status: data?.queued ? 'queued' : 'sent',
+        attachments: sendPayload.attachments,
         ...(data || {}),
       });
     } catch (e) {

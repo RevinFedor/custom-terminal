@@ -567,21 +567,77 @@ const formatCodexImagePasteError = (value: unknown): string => {
     .slice(0, 120) || 'unknown';
 };
 
-const normalizeLocalImagePathText = (text: string): string | null => {
-  let trimmed = text.trim();
-  if (!trimmed || trimmed.includes('\n')) return null;
-  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
-    trimmed = trimmed.slice(1, -1);
-  }
+const CODEX_LOCAL_IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|tiff?)$/i;
+const CODEX_LOCAL_IMAGE_EXT_BOUNDARY_RE = /\.(png|jpe?g|gif|webp|bmp|tiff?)(?=$|\s+(?:file:\/\/|\/))/ig;
+
+const isCodexImagePathStart = (value: string, index: number): boolean => (
+  value[index] === '/' || value.slice(index, index + 7).toLowerCase() === 'file://'
+);
+
+const skipCodexPathWhitespace = (value: string, index: number): number => {
+  let i = index;
+  while (i < value.length && /\s/.test(value[i])) i += 1;
+  return i;
+};
+
+const normalizeLocalImagePathToken = (token: string): string | null => {
+  const trimmed = token.trim();
+  if (!trimmed) return null;
   let pathText = trimmed;
-  if (trimmed.startsWith('file://')) {
+  if (trimmed.toLowerCase().startsWith('file://')) {
     try {
-      pathText = decodeURIComponent(trimmed.replace(/^file:\/\//, ''));
+      pathText = decodeURIComponent(trimmed.replace(/^file:\/\//i, ''));
     } catch {
-      pathText = trimmed.replace(/^file:\/\//, '');
+      pathText = trimmed.replace(/^file:\/\//i, '');
     }
   }
   return /^\/.+\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(pathText) ? pathText : null;
+};
+
+const readUnquotedLocalImagePathToken = (value: string, start: number): { token: string; end: number } | null => {
+  CODEX_LOCAL_IMAGE_EXT_BOUNDARY_RE.lastIndex = start;
+  let match: RegExpExecArray | null;
+  while ((match = CODEX_LOCAL_IMAGE_EXT_BOUNDARY_RE.exec(value)) !== null) {
+    const end = CODEX_LOCAL_IMAGE_EXT_BOUNDARY_RE.lastIndex;
+    const next = skipCodexPathWhitespace(value, end);
+    if (next >= value.length || isCodexImagePathStart(value, next)) {
+      return { token: value.slice(start, end), end };
+    }
+  }
+  return null;
+};
+
+const normalizeLocalImagePathTexts = (text: string): string[] => {
+  const value = text.trim();
+  if (!value) return [];
+
+  const paths: string[] = [];
+  let index = 0;
+  while (index < value.length) {
+    index = skipCodexPathWhitespace(value, index);
+    if (index >= value.length) break;
+
+    const quote = value[index];
+    let token = '';
+    if (quote === '"' || quote === "'") {
+      const end = value.indexOf(quote, index + 1);
+      if (end < 0) return [];
+      token = value.slice(index + 1, end);
+      index = end + 1;
+    } else {
+      if (!isCodexImagePathStart(value, index)) return [];
+      const read = readUnquotedLocalImagePathToken(value, index);
+      if (!read) return [];
+      token = read.token;
+      index = read.end;
+    }
+
+    const normalized = normalizeLocalImagePathToken(token);
+    if (!normalized || !CODEX_LOCAL_IMAGE_EXT_RE.test(normalized)) return [];
+    paths.push(normalized);
+  }
+
+  return paths;
 };
 
 function waitForClaudeStartupModelBridge(tabId: string, model: string, timeoutMs = 6000): Promise<string> {
@@ -1130,9 +1186,9 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
     try {
       const text = clipboard.readText();
-      const textPath = typeof text === 'string' ? normalizeLocalImagePathText(text) : null;
-      if (textPath) {
-        console.warn(logPrefix + ' decision=intercept-text-path textLen=' + text.length + ' path=' + textPath);
+      const textPaths = typeof text === 'string' ? normalizeLocalImagePathTexts(text) : [];
+      if (textPaths.length > 0) {
+        console.warn(logPrefix + ' decision=intercept-text-path textLen=' + text.length + ' paths=' + textPaths.length + ' first=' + textPaths[0]);
         return true;
       }
       const image = clipboard.readImage();
@@ -1149,13 +1205,22 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     let payload = '';
     let source = 'unknown';
     try {
-      const textPath = normalizeLocalImagePathText(clipboard.readText() || '');
-      if (textPath) {
-        const staged = await ipcRenderer.invoke('codex:stage-image-path', { tabId, filePath: textPath });
-        payload = staged?.success === false
+      const textPaths = normalizeLocalImagePathTexts(clipboard.readText() || '');
+      if (textPaths.length > 0) {
+        const staged = textPaths.length === 1
+          ? await ipcRenderer.invoke('codex:stage-image-path', { tabId, filePath: textPaths[0] })
+          : await ipcRenderer.invoke('codex:stage-image-paths', { tabId, filePaths: textPaths });
+        const stagedPaths = textPaths.length === 1
+          ? (staged?.success && typeof staged.path === 'string' ? [staged.path] : [])
+          : (Array.isArray(staged?.paths)
+            ? staged.paths
+                .map((entry: { path?: unknown }) => typeof entry?.path === 'string' ? entry.path : '')
+                .filter((path: string) => path.length > 0)
+            : []);
+        payload = stagedPaths.length === 0
           ? `[imageError: ${formatCodexImagePasteError(staged?.error || 'stage_failed')}]`
-          : textPath;
-        source = 'text-path';
+          : stagedPaths.join(textPaths.length > 1 ? '\n' : '');
+        source = textPaths.length > 1 ? 'text-paths' : 'text-path';
       } else {
         const saved = await ipcRenderer.invoke('codex:save-clipboard-image', { tabId });
         if (saved?.success && typeof saved.path === 'string' && saved.path.length > 0) {
