@@ -126,6 +126,18 @@ type GitPanelPersistedState = {
   commitDescriptionLines?: number;
 };
 
+function commitDetailsMatchHash(details: GitCommitDetails | null, hash: string) {
+  const activeHash = String(hash || '').trim();
+  if (!details || !activeHash) return false;
+  if (details.hash === activeHash || details.shortHash === activeHash) return true;
+  const minPrefixLength = Math.max(7, String(details.shortHash || '').length || 7);
+  return /^[0-9a-f]+$/i.test(activeHash) && activeHash.length >= minPrefixLength && details.hash.startsWith(activeHash);
+}
+
+function commitDetailsRequestKey(repoPath: string, hash: string, filePath?: string) {
+  return `${repoPath || ''}\0${hash || ''}\0${filePath || ''}`;
+}
+
 type Props = {
   projectId?: string | null;
   projectName?: string;
@@ -272,16 +284,20 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [remoteBusy, setRemoteBusy] = useState<'push' | 'fetch' | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyItems, setHistoryItems] = useState<GitCommit[]>([]);
+  const [historyRepoPath, setHistoryRepoPath] = useState('');
   const [historySearch, setHistorySearch] = useState('');
   const [activeCommitHash, setActiveCommitHash] = useState('');
   const [activeCommitFilePath, setActiveCommitFilePath] = useState('');
   const [commitDetails, setCommitDetails] = useState<GitCommitDetails | null>(null);
+  const [commitDetailsRepoPath, setCommitDetailsRepoPath] = useState('');
   const [commitDetailsLoading, setCommitDetailsLoading] = useState(false);
+  const [commitDetailsLoadingKey, setCommitDetailsLoadingKey] = useState('');
   const [historyContextMenu, setHistoryContextMenu] = useState<{ x: number; y: number; commit: GitCommit } | null>(null);
   const [undoingCommitHash, setUndoingCommitHash] = useState('');
   const [branchesOpen, setBranchesOpen] = useState(false);
   const [branchesLoading, setBranchesLoading] = useState(false);
   const [branches, setBranches] = useState<GitBranchInfo[]>([]);
+  const [branchesRepoPath, setBranchesRepoPath] = useState('');
   const [branchSwitching, setBranchSwitching] = useState('');
   const [pushMenuOpen, setPushMenuOpen] = useState(false);
   const [generationMeta, setGenerationMeta] = useState<any>(null);
@@ -293,6 +309,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const fsDebounceRef = useRef<number | null>(null);
   const saveDebounceRef = useRef<number | null>(null);
   const statusRequestRef = useRef(0);
+  const historyRequestRef = useRef(0);
+  const commitDetailsRequestRef = useRef(0);
+  const branchesRequestRef = useRef(0);
   const statusRef = useRef<GitStatus | null>(null);
   const statusPreviewSignatureRef = useRef('');
   const latestProjectPathRef = useRef(projectPath || '');
@@ -351,6 +370,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       .filter((repo): repo is GitRepository => !!repo)
       .filter((repo) => !q || `${repo.name} ${repo.relativePath} ${repo.path}`.toLowerCase().includes(q));
   }, [repoFavorites, repositoryByPath, repoSearch]);
+  const historyReadyForRepo = Boolean(effectiveRepoPath) && historyRepoPath === effectiveRepoPath;
+  const visibleHistoryItems = historyReadyForRepo ? filteredHistoryItems : [];
+  const branchesReadyForRepo = Boolean(effectiveRepoPath) && branchesRepoPath === effectiveRepoPath;
+  const visibleBranches = branchesReadyForRepo ? branches : [];
 
   const loadStatus = useCallback(async (visible = false, refreshPreview = visible) => {
     const requestPath = effectiveRepoPath;
@@ -372,6 +395,21 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       if (statusRequestRef.current !== requestId) return;
       if (!result?.success || !result?.isRepo) {
         if (projectPath && requestPath !== projectPath) {
+          historyRequestRef.current += 1;
+          commitDetailsRequestRef.current += 1;
+          branchesRequestRef.current += 1;
+          setHistoryItems([]);
+          setHistoryRepoPath('');
+          setHistoryLoading(false);
+          setActiveCommitHash('');
+          setActiveCommitFilePath('');
+          setCommitDetails(null);
+          setCommitDetailsRepoPath('');
+          setCommitDetailsLoading(false);
+          setCommitDetailsLoadingKey('');
+          setBranches([]);
+          setBranchesRepoPath('');
+          setBranchesLoading(false);
           setSelectedRepoPath(projectPath);
           return;
         }
@@ -399,34 +437,62 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   }, [effectiveRepoPath, projectPath, showToast]);
 
   const loadHistory = useCallback(async () => {
-    if (!effectiveRepoPath) return;
+    const requestPath = effectiveRepoPath;
+    const requestId = ++historyRequestRef.current;
+    if (!requestPath) {
+      setHistoryRepoPath('');
+      setHistoryItems([]);
+      setHistoryLoading(false);
+      return;
+    }
     setHistoryLoading(true);
     try {
-      const result = await ipcRenderer.invoke('git:history', { projectPath: effectiveRepoPath, limit: 40 });
+      const result = await ipcRenderer.invoke('git:history', { projectPath: requestPath, limit: 40 });
+      if (historyRequestRef.current !== requestId) return;
       if (!result?.success) throw new Error(result?.error || 'git history failed');
       const commits = Array.isArray(result.commits) ? result.commits : [];
+      setHistoryRepoPath(requestPath);
       setHistoryItems(commits);
       setActiveCommitHash((prev) => commits.some((commit: GitCommit) => commit.hash === prev) ? prev : (commits[0]?.hash || ''));
+      if (!commits.length) {
+        commitDetailsRequestRef.current += 1;
+        setActiveCommitFilePath('');
+        setCommitDetails(null);
+        setCommitDetailsRepoPath('');
+        setCommitDetailsLoading(false);
+        setCommitDetailsLoadingKey('');
+      }
     } catch (error: any) {
+      if (historyRequestRef.current !== requestId) return;
+      setHistoryRepoPath(requestPath);
       showToast('Git history: ' + trimError(error?.message || error), 'error');
     } finally {
-      setHistoryLoading(false);
+      if (historyRequestRef.current === requestId) setHistoryLoading(false);
     }
   }, [effectiveRepoPath, showToast]);
 
   const loadCommitDetails = useCallback(async (commitHash: string, filePath?: string) => {
-    if (!effectiveRepoPath || !commitHash) {
+    const requestId = ++commitDetailsRequestRef.current;
+    const requestPath = effectiveRepoPath;
+    const requestKey = commitDetailsRequestKey(requestPath, commitHash, filePath);
+    if (!requestPath || !commitHash) {
       setCommitDetails(null);
+      setCommitDetailsRepoPath('');
+      setCommitDetailsLoading(false);
+      setCommitDetailsLoadingKey('');
       return;
     }
     setCommitDetailsLoading(true);
+    setCommitDetailsLoadingKey(requestKey);
     try {
       const result = await ipcRenderer.invoke('git:commit-details', {
-        projectPath: effectiveRepoPath,
+        projectPath: requestPath,
         hash: commitHash,
         filePath: filePath || undefined,
       });
+      if (commitDetailsRequestRef.current !== requestId) return;
       if (!result?.success) throw new Error(result?.error || 'git commit details failed');
+      setCommitDetailsRepoPath(requestPath);
       setCommitDetails(result as GitCommitDetails);
       setActiveCommitFilePath((prev) => {
         const files = Array.isArray(result.files) ? result.files : [];
@@ -434,23 +500,39 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         return result.activeFilePath || files[0]?.path || '';
       });
     } catch (error: any) {
+      if (commitDetailsRequestRef.current !== requestId) return;
+      setCommitDetailsRepoPath(requestPath);
       setCommitDetails({ success: false, hash: commitHash, shortHash: commitHash, author: '', date: '', subject: '', description: '', files: [], activeFilePath: '', diff: '', additions: 0, deletions: 0, totalAdditions: 0, totalDeletions: 0, error: trimError(error?.message || error) });
     } finally {
-      setCommitDetailsLoading(false);
+      if (commitDetailsRequestRef.current === requestId) {
+        setCommitDetailsLoading(false);
+        setCommitDetailsLoadingKey('');
+      }
     }
   }, [effectiveRepoPath]);
 
   const loadBranches = useCallback(async () => {
-    if (!effectiveRepoPath) return;
+    const requestPath = effectiveRepoPath;
+    const requestId = ++branchesRequestRef.current;
+    if (!requestPath) {
+      setBranchesRepoPath('');
+      setBranches([]);
+      setBranchesLoading(false);
+      return;
+    }
     setBranchesLoading(true);
     try {
-      const result = await ipcRenderer.invoke('git:branches', { projectPath: effectiveRepoPath });
+      const result = await ipcRenderer.invoke('git:branches', { projectPath: requestPath });
+      if (branchesRequestRef.current !== requestId) return;
       if (!result?.success) throw new Error(result?.error || 'git branches failed');
+      setBranchesRepoPath(requestPath);
       setBranches(Array.isArray(result.branches) ? result.branches : []);
     } catch (error: any) {
+      if (branchesRequestRef.current !== requestId) return;
+      setBranchesRepoPath(requestPath);
       showToast('Git branches: ' + trimError(error?.message || error), 'error');
     } finally {
-      setBranchesLoading(false);
+      if (branchesRequestRef.current === requestId) setBranchesLoading(false);
     }
   }, [effectiveRepoPath, showToast]);
 
@@ -477,6 +559,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     const nextProjectPath = projectPath || '';
     latestProjectPathRef.current = nextProjectPath;
     statusRequestRef.current += 1;
+    historyRequestRef.current += 1;
+    commitDetailsRequestRef.current += 1;
+    branchesRequestRef.current += 1;
     statusRef.current = null;
     statusPreviewSignatureRef.current = '';
     setStatus(null);
@@ -490,13 +575,22 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     setRepoContextMenu(null);
     setDragRepoPath('');
     setBranchesOpen(false);
+    setBranches([]);
+    setBranchesRepoPath('');
+    setBranchesLoading(false);
     setPushMenuOpen(false);
     setHistoryContextMenu(null);
+    setHistoryItems([]);
+    setHistoryRepoPath('');
+    setHistoryLoading(false);
     setUndoingCommitHash('');
     setActiveFilePath('');
     setActiveCommitHash('');
     setActiveCommitFilePath('');
     setCommitDetails(null);
+    setCommitDetailsRepoPath('');
+    setCommitDetailsLoading(false);
+    setCommitDetailsLoadingKey('');
     setFileDiff(null);
     setGenerationMeta(null);
   }, [panelStateKey, projectPath]);
@@ -609,12 +703,13 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   }, [panelTab, open, loadHistory]);
 
   useEffect(() => {
-    if (!open || panelTab !== 'history' || !activeCommitHash) {
-      if (panelTab !== 'history') setCommitDetails(null);
-      return;
+    if (!open || panelTab !== 'history' || !activeCommitHash) return;
+    if (commitDetailsRepoPath === effectiveRepoPath && commitDetailsMatchHash(commitDetails, activeCommitHash)) {
+      const loadedFilePath = commitDetails?.activeFilePath || '';
+      if (!activeCommitFilePath || loadedFilePath === activeCommitFilePath) return;
     }
     loadCommitDetails(activeCommitHash, activeCommitFilePath);
-  }, [open, panelTab, activeCommitHash, activeCommitFilePath, loadCommitDetails]);
+  }, [open, panelTab, activeCommitHash, activeCommitFilePath, commitDetails, commitDetailsRepoPath, effectiveRepoPath, loadCommitDetails]);
 
   useEffect(() => {
     if (branchesOpen) loadBranches();
@@ -736,17 +831,28 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
 
   const selectRepository = (repoPath: string) => {
     if (!repoPath) return;
+    historyRequestRef.current += 1;
+    commitDetailsRequestRef.current += 1;
+    branchesRequestRef.current += 1;
     setSelectedRepoPath(repoPath);
     setRepoSelectorOpen(false);
     setRepoContextMenu(null);
     setHistoryContextMenu(null);
     setBranchesOpen(false);
+    setBranches([]);
+    setBranchesRepoPath('');
+    setBranchesLoading(false);
     setPushMenuOpen(false);
     setActiveFilePath('');
     setActiveCommitHash('');
     setActiveCommitFilePath('');
     setCommitDetails(null);
+    setCommitDetailsRepoPath('');
+    setCommitDetailsLoading(false);
+    setCommitDetailsLoadingKey('');
     setHistoryItems([]);
+    setHistoryRepoPath('');
+    setHistoryLoading(false);
     setSelectedPaths(new Set());
     setSummary('');
     setDescription('');
@@ -1037,6 +1143,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       ? (status.upstream ? 'Pushing to origin' : 'Publishing branch')
       : (status.upstream ? 'Push changes to origin' : 'Publish this branch to ...');
   const remoteAheadCount = Math.max(0, Number(status.ahead) || 0);
+  const visibleCommitDetails = commitDetailsRepoPath === effectiveRepoPath && commitDetailsMatchHash(commitDetails, activeCommitHash) ? commitDetails : null;
+  const activeCommitDetailsLoadingKey = commitDetailsRequestKey(effectiveRepoPath, activeCommitHash, activeCommitFilePath);
+  const historyPreviewLoading = Boolean(commitDetailsLoading && commitDetailsLoadingKey === activeCommitDetailsLoadingKey);
 
   return (
     <>
@@ -1220,9 +1329,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                     </button>
                     {branchesOpen && (
                       <div style={branchMenuStyle}>
-                        {branchesLoading ? (
+                        {!branchesReadyForRepo || (branchesLoading && !visibleBranches.length) ? (
                           <div style={emptyLineStyle}><Loader2 size={13} className="animate-spin" /> Loading branches</div>
-                        ) : branches.length ? branches.map((branch) => (
+                        ) : visibleBranches.length ? visibleBranches.map((branch) => (
                           <button
                             key={branch.name}
                             onClick={() => handleBranchCheckout(branch.name)}
@@ -1306,7 +1415,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
 
                 <div style={gitRightToolbarStyle}>
                   <div style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, fontWeight: 800, color: '#f8fafc' }}>
-                    {panelTab === 'changes' ? (activeFile?.path || 'No file selected') : (commitDetails?.subject || 'Select a commit')}
+                    {panelTab === 'changes' ? (activeFile?.path || 'No file selected') : (visibleCommitDetails?.subject || 'Select a commit')}
                   </div>
                   <button
                     onClick={async () => {
@@ -1436,9 +1545,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                       />
                     </div>
                     <div style={historyListStyle}>
-                      {historyLoading ? (
+                      {!historyReadyForRepo || (historyLoading && !visibleHistoryItems.length) ? (
                         <div style={emptyStateStyle}><Loader2 size={15} className="animate-spin" /> Loading history</div>
-                      ) : filteredHistoryItems.length ? filteredHistoryItems.map((commit) => (
+                      ) : visibleHistoryItems.length ? visibleHistoryItems.map((commit) => (
                         <button
                           key={commit.hash}
                           onClick={() => {
@@ -1496,8 +1605,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                     />
                   ) : (
                     <HistoryCommitPreview
-                      details={commitDetails}
-                      loading={commitDetailsLoading}
+                      details={visibleCommitDetails}
+                      loading={historyPreviewLoading}
                       activeFilePath={activeCommitFilePath}
                       descriptionLines={commitDescriptionLines}
                       onSelectFile={setActiveCommitFilePath}

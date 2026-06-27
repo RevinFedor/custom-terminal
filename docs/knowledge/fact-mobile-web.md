@@ -311,6 +311,7 @@ GET  /api/terminal-tabs/:tabId/timeline             → parseTimelineEntries
 POST /api/terminal-tabs/:tabId/rewind               → native rewind/backtrack через общий agent scenario; при stopped session сначала resume + readiness
 GET  /api/terminal-tabs/:tabId/params               → параметры модели/effort/think для agent tab
 POST /api/terminal-tabs/:tabId/params               → применить параметры через runtime-specific path
+POST /api/terminal-tabs/:tabId/codex/fast           → одноразовая live-команда `/fast` для Codex PTY, НЕ persistent params; успех может вернуть `serviceTier`/`notice` из TUI submit-frame
 POST /api/terminal-tabs/:tabId/interrupt            → soft interrupt текущего turn'а (PTY Esc / SDK close warm)
 GET  /api/terminal-tabs/:tabId/draft                → authoritative чтение TUI composer после interrupt
 GET  /api/terminal-tabs/:tabId/draft-state          → read-only preflight состояния TUI composer перед mobile send
@@ -380,6 +381,8 @@ main/headless draft proof; если он доказал empty composer, send п�
 поэтому источник текста остаётся в терминале до явного действия пользователя. Противоположный контракт только у
 `/api/inbox/runs`: Inbox-клиент владеет своим chat composer, поэтому Noted Terminal
 может забрать draft, очистить terminal input и вернуть `draftText` наружу для rollback.
+
+Codex `/fast` намеренно вынесен в отдельный `POST /api/terminal-tabs/:tabId/codex/fast`, а не добавлен флагом в `/params`. Это live slash-command, которая не меняет `codexModel`/`codexEffort`, не сохраняется в SQLite и не имеет честного `true/false` состояния для следующего открытия. Регресс, который нельзя возвращать: mobile шлёт `{fast:true}` в `setSDKParams`, UI начинает выглядеть как persistent toggle, а будущий разработчик ищет где хранится несуществующий Fast-mode. Перед отправкой bridge использует тот же `codex:get-draft-state` guard что desktop `/fast`: неизвестный composer fail-closed, busy+draft запрещён. Если Codex TUI после Enter вернул `Service tier set to priority/default`, endpoint пробрасывает `notice` (`Fast applied` / `Default applied`) наружу; это immediate action feedback, не состояние вкладки.
 
 Все pathname-параметры (`:id`, `:tabId`) ОБЯЗАТЕЛЬНО прогоняются через `decId()` (`decodeURIComponent`) перед использованием — см. секцию «URL-encoded path параметры» ниже.
 

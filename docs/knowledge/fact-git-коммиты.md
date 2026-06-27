@@ -12,6 +12,8 @@ Git-кнопка стоит в самом правом краю project toolbar,
 
 Фоновый refresh не должен инвалидировать правый diff-preview, если porcelain-signature файлов (`xy:path`) не изменилась. Иначе после открытия сначала виден cached preview, затем тот же файл remount'ится от фонового `git:status` и пользователь видит постфактум-мигание. Preview-version можно bump'ать на явных действиях, `fs:change` и реальном изменении списка файлов; обычный open/focus refresh обновляет только status-state.
 
+Тот же cache-key нужен для левой колонки и dropdown'ов: History list и Branch menu помнят, для какого repo они загружены. При переключении `Changes ↔ History` или повторном раскрытии веток cached список текущего repo остаётся видимым, а фоновые `git:history` / `git:branches` не подменяют его пустым состоянием `No commits yet` / `No branches` или transient loader'ом. При смене repo/project cache-key сбрасывается, чтобы не показать список чужого репозитория.
+
 ## Repository selector
 
 Git-панель привязана к текущему проекту, но выбранный Git-репозиторий внутри неё может быть другим: монорепозиторий и вложенные `.git`-папки живут в одном workspace. По умолчанию открывается репозиторий текущего проекта; если пользователь уже выбирал другой repo для этого проекта, выбор восстанавливается из project-scoped state. Это важно не оптимизировать в «всегда project path»: иначе пользователь в монорепе каждый раз будет заново искать нужный пакет.
@@ -31,6 +33,8 @@ Changes-tab показывает изменённые файлы слева и d
 History-tab показывает журнал последних commit'ов слева и diff выбранного commit'а справа. Unpushed commit'ы помечаются compact upload-иконкой в правой части строки: если upstream настроен, источник истины — `upstream..HEAD`; если upstream нет, но есть `origin/<branch>`, сравнение идёт с ним; если remote branch тоже нет, локальная ветка считается unpublished и видимые commit'ы получают marker. Это защищает UI от ложного «всё запушено» на локальных ветках без upstream.
 
 Правый preview выбранного commit'а показывает subject и body commit message отдельно: subject остаётся плотным заголовком, body идёт ниже менее жирным текстом. Длинное описание режется по настройке Git-панели `Commit description lines` (1..6, default 3), потому что History preview должен оставаться scan-панелью перед diff, а не вытеснять список файлов и сам diff большим commit body.
+
+History list хранит hash из `git log %h` как короткий SHA, а `git:commit-details` возвращает полный `hash` плюс `shortHash`. Preview-guard обязан быть repo-scoped и матчить full/short/валидный hex-prefix длиной не меньше `shortHash`, иначе успешный ответ details выглядит как stale для UI: заголовок остаётся `Select a commit`, а body висит на `Loading commit` без новых Git-логов.
 
 `Undo Commit` доступен только через правый клик в History и только для верхнего commit'а, то есть текущего `HEAD`. Действие делает soft reset, чтобы изменения вернулись в Changes и пользователь мог поправить message/selection. Уже запушенный HEAD не откатывается из панели: это rewrite-history сценарий, его нельзя прятать за тем же жестом что локальный undo. Branch dropdown переключает локальные ветки из той же панели; push-кнопка сделана split-button'ом: основное действие — `Push` или `Publish` в зависимости от upstream, дополнительное меню содержит `Fetch origin`.
 

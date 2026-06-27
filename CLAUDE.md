@@ -1,5 +1,3 @@
-# Noted Terminal
-
 <!-- @deploy-start -->
 <instructions>
   <step index="1">
@@ -21,6 +19,8 @@
   </step>
 </instructions>
 <!-- @deploy-end -->
+
+# Noted Terminal
 
 ## Обзор
 Noted Terminal — кастомный эмулятор терминала на базе Electron с глубокой интеграцией AI-агентов (Claude Code — PTY + Agent SDK, Codex CLI) и управлением проектами. Любая вкладка может читать и редактировать историю любой другой сессии через overseer MCP (cross-session access поверх полного парсинга JSONL обоих агентов).

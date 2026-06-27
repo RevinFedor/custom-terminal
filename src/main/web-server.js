@@ -2775,6 +2775,16 @@ async function handleApi(req, res, parsed, sdkSessions) {
     } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
   }
 
+  // One-shot Codex PTY actions. This is intentionally separate from `/params`:
+  // `/fast` is a live slash command, not persistent model/effort state.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/codex\/fast$/);
+  if (m && req.method === 'POST') {
+    try {
+      const data = await bridgeRequest('sendCodexFast', { tabId: decId(m[1]) });
+      return sendJson(res, 200, data);
+    } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
+  }
+
   // Prompt-queue ("Run after") for a tab — read live core + sibling AI-tabs, or
   // apply one mutation op. Mobile mirrors the desktop store; the desktop runner
   // does the firing. GET returns { queue, aiTabs }; POST body { op, args } maps

@@ -1903,6 +1903,63 @@ function App() {
           }
           return reply(false, null, 'tab not open');
         }
+        if (action === 'sendCodexFast') {
+          const { tabId } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          const found = findTabProject(tabId);
+          if (!found) return reply(false, null, 'tab not open');
+          const tab: any = found.tab;
+          if (tab.commandType !== 'codex' || tab.tabType === 'claude-sdk') {
+            return reply(false, null, 'tab is not Codex PTY');
+          }
+
+          const turnState = await ipcRenderer.invoke('codex:get-turn-state', tabId).catch(() => null);
+          const processInfo = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId).catch(() => null);
+          const processText = `${processInfo?.processName || ''} ${processInfo?.command || ''}`;
+          const hasLiveCodexProcess = processInfo?.hasProcess === true && /(\bcodex\b|@openai\/codex)/i.test(processText);
+          const hasLiveWatcher = turnState?.hasWatcher === true || hasLiveCodexProcess;
+          if (!hasLiveWatcher) {
+            return reply(false, null, 'codex /fast requires a live Codex process');
+          }
+
+          const draftState = await ipcRenderer.invoke('codex:get-draft-state', tabId, {
+            reason: 'mobile-codex-fast',
+            timeoutMs: 700,
+          }).catch((error: any) => {
+            console.warn('[MobileBridge] codex-fast draft probe failed tab=' + String(tabId).slice(-12) + ': ' + (error?.message || String(error)));
+            return terminalRegistry.getCodexDraftState(tabId);
+          });
+          console.log('[MobileBridge] codex-fast live tab=' + String(tabId).slice(-12) + ' hasDraft=' + draftState.hasDraft + ' source=' + draftState.source + ' turnBusy=' + (turnState?.busy === true));
+          if (turnState?.busy === true && draftState.hasDraft === true) {
+            return reply(false, null, 'codex /fast blocked while busy composer has draft');
+          }
+          if (draftState.hasDraft === null) {
+            return reply(false, null, 'codex input state unknown: ' + draftState.source);
+          }
+
+          const result = await ipcRenderer.invoke('codex:send-live-slash-command', {
+            tabId,
+            command: '/fast',
+            hasDraft: draftState.hasDraft,
+            draftSource: 'mobile:' + draftState.source,
+            draftPreview: draftState.preview,
+            visualHasDraft: draftState.hasDraft,
+            visualSource: draftState.source,
+            visualPreview: draftState.preview,
+            turnBusy: turnState?.busy === true,
+          });
+          console.log('[MobileBridge] codex-fast result tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(result || null));
+          if (!result?.success) {
+            return reply(false, null, result?.error || 'codex /fast failed');
+          }
+          return reply(true, {
+            tabId,
+            applied: true,
+            serviceTier: result.serviceTier || null,
+            serviceTierSource: result.serviceTierSource || null,
+            notice: result.notice || null,
+          });
+        }
         if (action === 'setSDKParams') {
           const { tabId, model, effort, thinking } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');

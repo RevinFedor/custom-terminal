@@ -18709,9 +18709,25 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
         submitClean: submitFrame.clean,
       };
     }
+    console.log(logPrefix + ' submit frame confirmed clean=' + JSON.stringify(submitFrame.clean.slice(0, 240)));
+    const result = { success: true, submitted: true, submitClean: submitFrame.clean };
+    const serviceTier = parseCodexServiceTierFeedback(submitFrame.clean);
+    if (serviceTier) Object.assign(result, serviceTier);
+    return result;
   }
   console.log(logPrefix + ' sent slash command ' + JSON.stringify(text) + ' after render +' + (Date.now() - t0) + 'ms');
   return { success: true, submitted: true };
+}
+
+function parseCodexServiceTierFeedback(text) {
+  const match = String(text || '').replace(/\s+/g, ' ').match(/Service tier set to\s+(priority|default)/i);
+  if (!match) return null;
+  const serviceTier = match[1].toLowerCase();
+  return {
+    serviceTier,
+    notice: serviceTier === 'priority' ? 'Fast applied' : 'Default applied',
+    serviceTierSource: 'tui',
+  };
 }
 
 async function moveCodexPickerTo(term, state, targetIndex, logPrefix) {
@@ -19035,10 +19051,14 @@ async function sendCodexLiveSlashCommand(term, {
   }
 
   try {
+    const isFastCommand = /^\/fast(?:\s|$)/i.test(text);
     const slashResult = await sendCodexSlashCommand(term, text, logPrefix + ':command', {
       clearStrategy: 'line',
-      waitForSubmitFrame: shouldRestoreDraft,
-      submitTimeoutMs: 2500,
+      waitForSubmitFrame: shouldRestoreDraft || isFastCommand,
+      submitTimeoutMs: isFastCommand ? 3500 : 2500,
+      submitPredicate: isFastCommand
+        ? (clean) => !!parseCodexServiceTierFeedback(clean)
+        : null,
     });
     if (slashResult.submitted === true) {
       slashSubmitted = true;
