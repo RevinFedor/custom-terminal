@@ -1119,9 +1119,29 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   };
   const setHistoryScrollToUuid = useUIStore(state => state.setHistoryScrollToUuid);
   const setHistoryPromptDraft = useUIStore(state => state.setHistoryPromptDraft);
+  const setHistoryRewindPreview = useUIStore(state => state.setHistoryRewindPreview);
   const isHistoryOpen = useUIStore(state => state.historyPanelOpenTabs[tabId] ?? false);
   const setHistoryPanelOpen = useUIStore(state => state.setHistoryPanelOpen);
   const historyVisibleUuids = useUIStore(state => state.historyVisibleUuids[tabId]);
+  const rewindPreviewSessionKeyRef = useRef(tabId + ':' + sessionId);
+  useEffect(() => {
+    const sessionKey = tabId + ':' + sessionId;
+    if (rewindPreviewSessionKeyRef.current !== sessionKey) {
+      rewindPreviewSessionKeyRef.current = sessionKey;
+      setHistoryRewindPreview(tabId, null);
+    }
+  }, [sessionId, setHistoryRewindPreview, tabId]);
+  useEffect(() => {
+    const clearPreview = (_event: any, data: { tabId?: string } = {}) => {
+      if (data?.tabId === tabId) setHistoryRewindPreview(tabId, null);
+    };
+    ipcRenderer.on('terminal:command-finished', clearPreview);
+    ipcRenderer.on('terminal:command-started', clearPreview);
+    return () => {
+      ipcRenderer.removeListener('terminal:command-finished', clearPreview);
+      ipcRenderer.removeListener('terminal:command-started', clearPreview);
+    };
+  }, [setHistoryRewindPreview, tabId]);
   // SDK tabs render the FULL chat history in-place (assistant-ui virtualized
   // thread), so pre-compact entries are reachable in their own chat — the
   // Timeline "Old History Zone" red background is misleading there. Same idea
@@ -3382,6 +3402,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       message?: string,
       options: { persisted?: boolean; historyInputDraft?: boolean } = {}
     ) => {
+      if (status === 'done') {
+        const targetDraft = entry.content.trim();
+        const durable = options.persisted === true || mode === 'ai' || isCodex || isGemini;
+        if (durable) {
+          setHistoryRewindPreview(tabId, null);
+        } else if (mode === 'native' && toolType === 'claude' && options.historyInputDraft === true && targetDraft) {
+          setHistoryPromptDraft(tabId, targetDraft);
+          setHistoryRewindPreview(tabId, {
+            opId: rewindOpId,
+            targetUuid: entry.uuid,
+            targetText: targetDraft,
+            startedAt: Date.now(),
+            sessionId,
+          });
+        }
+      }
       window.dispatchEvent(new CustomEvent('history-panel:rewind-log', {
         detail: {
           tabId,

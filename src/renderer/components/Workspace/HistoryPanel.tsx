@@ -1,8 +1,7 @@
 import React, { useEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
-import { flushSync } from 'react-dom';
 import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, Send, Square, RotateCcw, Power, AlertTriangle } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
-import { HISTORY_PANEL_DEFAULT_WIDTH, useUIStore } from '../../store/useUIStore';
+import { HISTORY_PANEL_DEFAULT_WIDTH, useUIStore, type HistoryRewindPreview } from '../../store/useUIStore';
 import Tooltip from '../UI/Tooltip';
 import {
   getHistoryAgentRuntime,
@@ -99,13 +98,6 @@ interface HistoryPanelProps {
   previewMode?: boolean;
 }
 
-interface RewindPreviewState {
-  opId: string;
-  targetUuid: string;
-  targetText: string;
-  startedAt: number;
-}
-
 interface PromptHandoffMeta {
   text: string;
   submittedAt: number;
@@ -124,8 +116,6 @@ const LOCAL_PROMPT_PREFIX = 'local-prompt-';
 const LOCAL_REWIND_PREFIX = 'local-rewind-';
 const LOCAL_PROMPT_FAILURE_TTL_MS = 15000;
 const LOCAL_PROMPT_SENT_TTL_MS = 12000;
-const HISTORY_ENTRY_COLLAPSE_THRESHOLD = 600;
-const HISTORY_ENTRY_COLLAPSED_CHARS = 400;
 const HISTORY_SCROLL_PIXEL_CAP_WARN_PX = 16_000_000;
 const REWIND_BUSY_GUARD_RE = /\bis (?:busy|starting); wait (?:for the current turn|until the current loader finishes) before rewind\b/i;
 
@@ -205,13 +195,13 @@ const entryClockMs = (entry: FullHistoryEntry) => {
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
-const shouldCarryAfterRewindTarget = (entry: FullHistoryEntry, preview: RewindPreviewState) => {
+const shouldCarryAfterRewindTarget = (entry: FullHistoryEntry, preview: HistoryRewindPreview) => {
   if (isLocalRewindEntry(entry) && entry.uuid.includes(preview.opId)) return true;
   if (isLocalPromptEntry(entry)) return true;
   return entryClockMs(entry) >= preview.startedAt - 1000;
 };
 
-const buildRewindPreviewEntries = (rawEntries: FullHistoryEntry[], preview: RewindPreviewState | null) => {
+const buildRewindPreviewEntries = (rawEntries: FullHistoryEntry[], preview: HistoryRewindPreview | null) => {
   if (!preview) return { entries: rawEntries, hiddenCount: 0 };
   const targetIndex = rawEntries.findIndex((entry) => entry.uuid === preview.targetUuid);
   if (targetIndex < 0) return { entries: rawEntries, hiddenCount: 0 };
@@ -230,7 +220,7 @@ const buildRewindPreviewEntries = (rawEntries: FullHistoryEntry[], preview: Rewi
   return { entries, hiddenCount };
 };
 
-const serverHistoryMaterializedRewindBranch = (serverEntries: FullHistoryEntry[], preview: RewindPreviewState) => {
+const serverHistoryMaterializedRewindBranch = (serverEntries: FullHistoryEntry[], preview: HistoryRewindPreview) => {
   const targetIndex = serverEntries.findIndex((entry) => entry.uuid === preview.targetUuid);
   if (targetIndex < 0) return false;
   const afterTarget = serverEntries.slice(targetIndex + 1);
@@ -448,175 +438,6 @@ const CompactBlock = memo(({ entry }: { entry: FullHistoryEntry }) => {
           {entry.compactSummary}
         </div>
       )}
-    </div>
-  );
-});
-
-const getActionCollapseText = (action: Action): string => {
-  if (typeof action === 'string') return action;
-  if (isRawAction(action)) {
-    const raw = action.rawTool || {};
-    const parts = [raw.toolName, raw.args ? JSON.stringify(raw.args) : '', raw.result || ''];
-    return parts.filter(Boolean).join('\n');
-  }
-  if (isTaskAction(action)) {
-    const historyText = (action.history || [])
-      .map(turn => [turn.type, turn.content, ...(turn.tools || [])].filter(Boolean).join(' '))
-      .join('\n');
-    return [action.description, action.result, historyText].filter(Boolean).join('\n');
-  }
-  if (isFileAction(action)) {
-    return [action.tool, action.filePath, action.oldString, action.newString, action.content]
-      .filter(Boolean)
-      .join('\n');
-  }
-  return '';
-};
-
-const getActionCollapseLabel = (action: Action): string => {
-  if (typeof action === 'string') return action.slice(0, 60);
-  if (isRawAction(action)) return action.rawTool?.toolName || 'tool';
-  if (isTaskAction(action)) return action.description || 'Task';
-  if (isFileAction(action)) return action.tool + ' ' + shortPath(action.filePath);
-  return 'action';
-};
-
-const getHistoryEntryCollapseText = (entry: FullHistoryEntry): string => [
-  entry.content,
-  entry.thinking,
-  ...(entry.actions || []).map(getActionCollapseText),
-].filter(Boolean).join('\n');
-
-const buildCollapsedHistoryEntry = (entry: FullHistoryEntry, collapseText: string): FullHistoryEntry => {
-  const actionLabels = (entry.actions || []).slice(0, 3).map(getActionCollapseLabel).filter(Boolean);
-  const actionSuffix = entry.actions && entry.actions.length > actionLabels.length
-    ? ' +' + (entry.actions.length - actionLabels.length)
-    : '';
-  const fallbackPreview = actionLabels.length
-    ? 'Действия: ' + actionLabels.join(', ') + actionSuffix
-    : collapseText;
-  const previewSource = entry.content || fallbackPreview;
-  const preview = previewSource.length > HISTORY_ENTRY_COLLAPSED_CHARS
-    ? previewSource.slice(0, HISTORY_ENTRY_COLLAPSED_CHARS).trimEnd() + '...'
-    : previewSource;
-  const hidden: string[] = [];
-  if (entry.thinking) hidden.push('размышление');
-  if (entry.actions?.length) hidden.push('действий: ' + entry.actions.length);
-  const hiddenLine = hidden.length ? 'Свернуто: ' + hidden.join(', ') + '.' : '';
-  return {
-    ...entry,
-    content: [preview, hiddenLine].filter(Boolean).join('\n\n'),
-    thinking: undefined,
-    actions: undefined,
-  };
-};
-
-function findHistoryScrollParent(el: HTMLElement | null): HTMLElement | null {
-  let cur: HTMLElement | null = el?.parentElement || null;
-  while (cur) {
-    const oy = getComputedStyle(cur).overflowY;
-    if ((oy === 'auto' || oy === 'scroll') && cur.scrollHeight > cur.clientHeight) return cur;
-    cur = cur.parentElement;
-  }
-  return null;
-}
-
-const HISTORY_BOTTOM_PIN_PX = 4;
-function useStableHistoryCollapseToggle(
-  anchorRef: React.RefObject<HTMLElement | null>,
-  toggle: () => void,
-) {
-  return useCallback(() => {
-    const el = anchorRef.current;
-    const scroller = findHistoryScrollParent(el);
-    if (!el || !scroller) {
-      toggle();
-      return;
-    }
-    const anchorTopBefore = el.getBoundingClientRect().top;
-    const scrollerTopBefore = scroller.getBoundingClientRect().top;
-    const targetOffsetFromScroller = anchorTopBefore - scrollerTopBefore;
-    const wasAtBottom = (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight) <= HISTORY_BOTTOM_PIN_PX;
-    flushSync(() => { toggle(); });
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        const el2 = anchorRef.current;
-        if (!el2) return;
-        if (wasAtBottom) {
-          scroller.scrollTop = scroller.scrollHeight;
-          return;
-        }
-        const newAnchorTop = el2.getBoundingClientRect().top;
-        const newScrollerTop = scroller.getBoundingClientRect().top;
-        const delta = (newAnchorTop - newScrollerTop) - targetOffsetFromScroller;
-        if (Math.abs(delta) > 0.5) scroller.scrollTop += delta;
-      });
-    });
-  }, [anchorRef, toggle]);
-}
-
-const CollapsibleHistoryEntry = memo(({
-  entry,
-  toolType,
-  forceExpanded,
-}: {
-  entry: FullHistoryEntry;
-  toolType?: 'claude' | 'gemini' | 'codex';
-  forceExpanded?: boolean;
-}) => {
-  const [expanded, setExpanded] = useState(false);
-  const anchorRef = useRef<HTMLDivElement>(null);
-  const collapseText = useMemo(() => getHistoryEntryCollapseText(entry), [entry]);
-  const shouldCollapse = collapseText.length > HISTORY_ENTRY_COLLAPSE_THRESHOLD;
-  const visibleEntry = useMemo(
-    () => shouldCollapse && !expanded ? buildCollapsedHistoryEntry(entry, collapseText) : entry,
-    [collapseText, entry, expanded, shouldCollapse],
-  );
-  const onToggle = useStableHistoryCollapseToggle(anchorRef, () => setExpanded(prev => !prev));
-
-  useEffect(() => {
-    setExpanded(false);
-  }, [entry.uuid]);
-
-  useEffect(() => {
-    if (forceExpanded && shouldCollapse) setExpanded(true);
-  }, [entry.uuid, forceExpanded, shouldCollapse]);
-
-  if (!shouldCollapse) return <HistoryEntry entry={entry} toolType={toolType} />;
-
-  const ToggleButton = (
-    <button
-      type="button"
-      onClick={onToggle}
-      onMouseDown={(e) => e.preventDefault()}
-      style={{
-        width: '100%',
-        marginTop: 4,
-        padding: '5px 8px',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        gap: 5,
-        border: '1px solid rgba(167, 139, 250, 0.18)',
-        borderRadius: 5,
-        backgroundColor: 'rgba(24, 24, 27, 0.92)',
-        color: '#a1a1aa',
-        fontSize: 11,
-        cursor: 'pointer',
-      }}
-    >
-      {expanded ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
-      {expanded
-        ? 'Свернуть'
-        : 'Раскрыть полностью (' + collapseText.split('\n').length.toLocaleString() + ' строк)'}
-    </button>
-  );
-
-  return (
-    <div ref={anchorRef}>
-      {expanded && <div style={{ marginBottom: 4 }}>{ToggleButton}</div>}
-      <HistoryEntry entry={visibleEntry} toolType={toolType} />
-      <div style={{ marginTop: 4 }}>{ToggleButton}</div>
     </div>
   );
 });
@@ -2596,12 +2417,17 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const setHistoryVisibleUuids = useUIStore((s) => s.setHistoryVisibleUuids);
   const setHistoryScrollPosition = useUIStore((s) => s.setHistoryScrollPosition);
   const setHistoryPromptDraft = useUIStore((s) => s.setHistoryPromptDraft);
+  const setHistoryRewindPreview = useUIStore((s) => s.setHistoryRewindPreview);
+  const storedRewindPreview = useUIStore((s) => s.historyRewindPreviews[tabId] || null);
   const closePanel = useCallback(() => setHistoryPanelOpen(tabId, false), [tabId, setHistoryPanelOpen]);
   const resetPanelWidth = useCallback(() => setHistoryPanelWidth(HISTORY_PANEL_DEFAULT_WIDTH), [setHistoryPanelWidth]);
   const panelRef = useRef<HTMLDivElement>(null);
   const [rewindLock, setRewindLock] = useState<{ opId: string; targetText: string } | null>(null);
-  const [rewindPreview, setRewindPreview] = useState<RewindPreviewState | null>(null);
+  const rewindPreview = storedRewindPreview && (!storedRewindPreview.sessionId || storedRewindPreview.sessionId === sessionId)
+    ? storedRewindPreview
+    : null;
   const lastServerEntriesRef = useRef<FullHistoryEntry[]>([]);
+  const previewSessionKeyRef = useRef(tabId + ':' + sessionId);
 
   // Save scroll position + clean up CSS highlights on unmount.
   // Virtuoso owns scrolling — the scrollTop we save belongs to the inner
@@ -3026,7 +2852,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         detail.toolType === 'gemini'
       );
     if (isDurableRewind) {
-      setRewindPreview(null);
+      setHistoryRewindPreview(tabId, null);
       if (targetText && detail.historyInputDraft === true) {
         setHistoryPromptDraft(tabId, targetText);
       }
@@ -3034,7 +2860,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       return;
     }
     if (status === 'done' && detail.mode === 'native' && detail.targetUuid && targetText && (detail.toolType || toolType) === 'claude') {
-      setRewindPreview({ opId, targetUuid: detail.targetUuid, targetText, startedAt: now });
+      setHistoryRewindPreview(tabId, { opId, targetUuid: detail.targetUuid, targetText, startedAt: now, sessionId });
       setHistoryPromptDraft(tabId, targetText);
     }
     if (status !== 'failed') {
@@ -3060,16 +2886,20 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     if (isAtBottomRef.current) {
       setTimeout(() => scrollToBottom(true), 30);
     }
-  }, [scrollToBottom, sessionId, setHistoryPromptDraft, tabId, toolType]);
+  }, [scrollToBottom, sessionId, setHistoryPromptDraft, setHistoryRewindPreview, tabId, toolType]);
 
   useEffect(() => {
+    const sessionKey = tabId + ':' + sessionId;
+    if (previewSessionKeyRef.current !== sessionKey) {
+      previewSessionKeyRef.current = sessionKey;
+      setHistoryRewindPreview(tabId, null);
+    }
     setRewindLock(null);
-    setRewindPreview(null);
-  }, [tabId, sessionId]);
+  }, [tabId, sessionId, setHistoryRewindPreview]);
 
   useEffect(() => {
     const clearPreview = (_event: any, data: { tabId?: string }) => {
-      if (data?.tabId === tabId) setRewindPreview(null);
+      if (data?.tabId === tabId) setHistoryRewindPreview(tabId, null);
     };
     ipcRenderer.on('terminal:command-finished', clearPreview);
     ipcRenderer.on('terminal:command-started', clearPreview);
@@ -3077,7 +2907,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       ipcRenderer.removeListener('terminal:command-finished', clearPreview);
       ipcRenderer.removeListener('terminal:command-started', clearPreview);
     };
-  }, [tabId]);
+  }, [tabId, setHistoryRewindPreview]);
 
   // Load full history
   const loadHistory = useCallback(async (isRefresh = false) => {
@@ -3107,9 +2937,10 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
             ' server=' + serverEntries.length);
         }
         setClaudeMemoryBoundaryUuid(result.claudeMemoryBoundaryUuid || null);
-        setRewindPreview((current) =>
-          current && serverHistoryMaterializedRewindBranch(serverEntries, current) ? null : current
-        );
+        const currentPreview = useUIStore.getState().historyRewindPreviews[tabId] || null;
+        if (currentPreview && serverHistoryMaterializedRewindBranch(serverEntries, currentPreview)) {
+          setHistoryRewindPreview(tabId, null);
+        }
 
         if (!isRefresh) {
           const newEntries = serverEntries;
@@ -3165,7 +2996,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       if (!isRefresh) setLoading(false);
       return false;
     }
-  }, [sessionId, cwd, scrollToBottom, tabId, toolType]);
+  }, [sessionId, cwd, scrollToBottom, setHistoryRewindPreview, tabId, toolType]);
 
   const waitForDurableRewindHistory = useCallback(async (detail: {
     targetUuid?: string;
@@ -3243,13 +3074,16 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     initialLoadDoneRef.current = false;
     setLoading(true);
     setEntries([]);
-    setRewindPreview(null);
+    const currentPreview = useUIStore.getState().historyRewindPreviews[tabId] || null;
+    if (currentPreview?.sessionId && currentPreview.sessionId !== sessionId) {
+      setHistoryRewindPreview(tabId, null);
+    }
     for (const timer of localPromptCleanupTimersRef.current.values()) clearTimeout(timer);
     localPromptCleanupTimersRef.current.clear();
     promptHandoffMetaRef.current.clear();
     suppressedPromptsRef.current.clear();
     loadHistory(false);
-  }, [sessionId, toolType]);
+  }, [loadHistory, sessionId, setHistoryRewindPreview, tabId, toolType]);
 
   useEffect(() => {
     return () => {
@@ -3950,11 +3784,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
                     ...(flashUuid === entry.uuid ? { animation: 'hp-flash 500ms ease-in-out' } : undefined),
                   }}
                 >
-                  <CollapsibleHistoryEntry
-                    entry={entry}
-                    toolType={toolType}
-                    forceExpanded={matchPositions[currentMatchIdx]?.entryUuid === entry.uuid}
-                  />
+                  <HistoryEntry entry={entry} toolType={toolType} />
                 </div>
               );
             }}

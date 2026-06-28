@@ -42,6 +42,14 @@ import type { DefaultCodexEffort, DefaultCodexModel } from '../constants/codexSe
 export const HISTORY_PANEL_DEFAULT_WIDTH = 580;
 export const HISTORY_PANEL_MIN_WIDTH = 280;
 
+export interface HistoryRewindPreview {
+  opId: string;
+  targetUuid: string;
+  targetText: string;
+  startedAt: number;
+  sessionId?: string;
+}
+
 export interface ApiSettings {
   claudeModel: ApiClaudeModel;
   claudeThinking: ThinkingLevel;
@@ -441,12 +449,14 @@ interface UIStore {
   historyVisibleUuids: Record<string, string[]>;
   historyScrollPositions: Record<string, number>;
   historyPromptDrafts: Record<string, string>;
+  historyRewindPreviews: Record<string, HistoryRewindPreview>;
   setHistoryPanelOpen: (tabId: string, open: boolean) => void;
   setHistoryPanelWidth: (width: number) => void;
   setHistoryScrollToUuid: (uuid: string | null) => void;
   setHistoryVisibleUuids: (tabId: string, uuids: string[]) => void;
   setHistoryScrollPosition: (tabId: string, scrollTop: number) => void;
   setHistoryPromptDraft: (tabId: string, draft: string) => void;
+  setHistoryRewindPreview: (tabId: string, preview: HistoryRewindPreview | null) => void;
 
   // Timeline panel visibility (per-tab state, default open)
   timelinePanelOpenTabs: Record<string, boolean>;
@@ -2163,6 +2173,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
   historyVisibleUuids: {},
   historyScrollPositions: {},
   historyPromptDrafts: {},
+  historyRewindPreviews: {},
   setHistoryPanelOpen: (tabId, open) => set(state => ({
     historyPanelOpenTabs: { ...state.historyPanelOpenTabs, [tabId]: open }
   })),
@@ -2178,6 +2189,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
     if (draft) next[tabId] = draft;
     else delete next[tabId];
     return { historyPromptDrafts: next };
+  }),
+  setHistoryRewindPreview: (tabId, preview) => set(state => {
+    const next = { ...state.historyRewindPreviews };
+    if (preview) next[tabId] = preview;
+    else delete next[tabId];
+    return { historyRewindPreviews: next };
   }),
 
   timelinePanelOpenTabs: {},

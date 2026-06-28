@@ -114,6 +114,7 @@ type GitPanelPersistedState = {
   search?: string;
   activeFilePath?: string;
   selectedPaths?: string[];
+  selectedPathsManual?: boolean;
   panelSize?: { width?: number; height?: number };
   splitLeftWidth?: number;
   docsOnlyWhenPresent?: boolean;
@@ -259,6 +260,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
+  const [selectedPathsManual, setSelectedPathsManual] = useState(false);
   const [panelTab, setPanelTab] = useState<'changes' | 'history'>('changes');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [docsOnlyWhenPresent, setDocsOnlyWhenPresent] = useState(loadDocsOnlySetting);
@@ -316,7 +318,6 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const statusPreviewSignatureRef = useRef('');
   const latestProjectPathRef = useRef(projectPath || '');
   const hydratedStateKeyRef = useRef('');
-  const selectionInitializedKeyRef = useRef('');
 
   const selectedCount = selectedPaths.size;
   const allSelected = status?.files.length ? selectedCount === status.files.length : false;
@@ -566,6 +567,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     statusPreviewSignatureRef.current = '';
     setStatus(null);
     setStatusLoading(Boolean(nextProjectPath));
+    setSelectedPathsManual(false);
     setSelectedRepoPath(nextProjectPath);
     setRepositories(makeHomeRepositories(nextProjectPath));
     setRepositoriesProjectPath('');
@@ -615,7 +617,6 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     if (!panelStateKey) return;
     let cancelled = false;
     hydratedStateKeyRef.current = '';
-    selectionInitializedKeyRef.current = '';
     ipcRenderer.invoke('app:getState', panelStateKey)
       .then((saved: GitPanelPersistedState | null) => {
         if (cancelled) return;
@@ -644,6 +645,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         } else {
           setSelectedPaths(new Set());
         }
+        setSelectedPathsManual(next?.selectedPathsManual === true);
         if (typeof next?.docsOnlyWhenPresent === 'boolean') {
           setDocsOnlyWhenPresent(next.docsOnlyWhenPresent);
         } else {
@@ -675,6 +677,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         activeCommitHash,
         activeCommitFilePath,
         selectedPaths: Array.from(selectedPaths),
+        selectedPathsManual,
         panelSize,
         splitLeftWidth,
         commitDescriptionLines,
@@ -688,7 +691,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     return () => {
       if (saveDebounceRef.current) window.clearTimeout(saveDebounceRef.current);
     };
-  }, [panelStateKey, open, panelTab, summary, description, search, historySearch, activeFilePath, activeCommitHash, activeCommitFilePath, selectedPaths, panelSize, splitLeftWidth, commitDescriptionLines, docsOnlyWhenPresent, selectedRepoPath, repoSelectorTab, repoFavorites]);
+  }, [panelStateKey, open, panelTab, summary, description, search, historySearch, activeFilePath, activeCommitHash, activeCommitFilePath, selectedPaths, selectedPathsManual, panelSize, splitLeftWidth, commitDescriptionLines, docsOnlyWhenPresent, selectedRepoPath, repoSelectorTab, repoFavorites]);
 
   useEffect(() => {
     if (!open) return;
@@ -724,24 +727,20 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     const allowed = new Set(files.map((file) => file.path));
     if (!files.length) {
       setSelectedPaths(new Set());
+      setSelectedPathsManual(false);
       setActiveFilePath('');
       setFileDiff(null);
       setGenerationMeta(null);
       return;
     }
 
-    const selectionKey = `${panelStateKey || 'default'}\0${status?.repoRoot || effectiveRepoPath}`;
     setSelectedPaths((prev) => {
       const filtered = Array.from(prev).filter((filePath) => allowed.has(filePath));
-      if (selectionInitializedKeyRef.current !== selectionKey) {
-        selectionInitializedKeyRef.current = selectionKey;
-        return new Set(filtered.length ? filtered : files.map((file) => file.path));
-      }
-      return new Set(filtered);
+      return selectedPathsManual ? new Set(filtered) : new Set(files.map((file) => file.path));
     });
     setActiveFilePath((prev) => allowed.has(prev) ? prev : files[0].path);
     setGenerationMeta(null);
-  }, [statusFileKey, panelStateKey, status?.files, status?.repoRoot, effectiveRepoPath]);
+  }, [statusFileKey, status?.files, selectedPathsManual]);
 
   useEffect(() => {
     if (!open || panelTab !== 'changes' || !effectiveRepoPath || !activeFilePath) {
@@ -816,6 +815,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   };
 
   const togglePath = (filePath: string) => {
+    setSelectedPathsManual(true);
     setSelectedPaths((prev) => {
       const next = new Set(prev);
       if (next.has(filePath)) next.delete(filePath);
@@ -826,6 +826,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
 
   const toggleAll = () => {
     if (!status) return;
+    setSelectedPathsManual(true);
     setSelectedPaths(allSelected ? new Set() : new Set(status.files.map((file) => file.path)));
   };
 
@@ -834,6 +835,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     historyRequestRef.current += 1;
     commitDetailsRequestRef.current += 1;
     branchesRequestRef.current += 1;
+    setSelectedPathsManual(false);
     setSelectedRepoPath(repoPath);
     setRepoSelectorOpen(false);
     setRepoContextMenu(null);

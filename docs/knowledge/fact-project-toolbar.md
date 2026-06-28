@@ -39,11 +39,11 @@ Stop процесса и close вкладки — разные оси. Stop за
 | Состояние | Иконка | Цвет | Текст |
 |---|---|---|---|
 | Idle, всё актуально | `CircleCheck` зелёный | `#22c55e` | `<fresh>` (одно число) |
-| Idle, есть устаревшие/новые | `CircleCheck` зелёный + `AlertTriangle` амбер | `#22c55e` + `#d97706` | `<fresh>` ⚠ `<stale+new>` |
+| Idle, есть устаревшие/новые/удалённые | `CircleCheck` зелёный + `AlertTriangle` амбер | `#22c55e` + `#d97706` | `<fresh>` ⚠ `<stale+new+removed>` |
 | Idle, индекса нет | `AlertTriangle` амбер | `#d97706` | `no index` |
 | Running | `Loader2` амбер (вращение) + фиолетовый чип параллелизма | `#d97706` + `#a855f7` | `<done>/<outdated_total>` ×`<parallelism>` |
 
-**Третий чип (фиолетовый ×N) появляется только в Running.** Берётся из `rebuild-started` payload (зеркалит реально работающее N воркеров), а не из текущего значения `useUIStore.semanticIndexParallelism`. При смене настройки mid-rebuild чип остаётся прежним — новое N применится к следующему запуску.
+**Третий чип (фиолетовый ×N) появляется только в Running.** Стартует как `×1`, затем обновляется из live MCP progress (`active` воркеры). На scan-фазе `workerLimit` может быть больше 1, но чип не поднимается до `×2/×3`, пока MCP реально не запустил столько Codex-процессов одновременно. При смене настройки mid-rebuild чип остаётся привязан к текущему progress — новое N применится к следующему запуску.
 
 **ПКМ на кнопке → открывает Settings на вкладке «Системные».** Реализовано через `window.dispatchEvent(new CustomEvent('settings:open', { detail: { tab: 'colors' } }))`; App.tsx слушает событие, выставляет `settingsInitialTab` и открывает модалку. Mechanism work for всех состояний кнопки (idle/no-index/running). Без этого юзеру пришлось бы помнить путь Cmd+, → таб «Системные».
 
@@ -51,7 +51,7 @@ Stop процесса и close вкладки — разные оси. Stop за
 
 **Почему cached не считается в running-счётчике** — см. `methodology/переносимый-дизайн.md::Прогресс-индикатор показывает active work, не total volume`. Кратко: cached пролетают за миллисекунды, и `5/90` создаёт иллюзию «осталось много» там, где реально осталось 5.
 
-**Tooltip разбивка** — показывает все три числа отдельно (`fresh / stale / new`) плюс `docsTotal` / `indexedTotal` для отладки. В running-режиме — `currentFile` (последний файл, который скрипт начал индексировать).
+**Tooltip разбивка** — показывает числа отдельно (`fresh / stale / new / removed`) плюс `docsTotal` / `indexedTotal` для отладки. В running-режиме — `activeWorkers/workerLimit` и `currentFile` (последний файл, который MCP начал индексировать).
 
 ## Watcher lifecycle (main)
 
@@ -82,7 +82,7 @@ SemanticIndexButton
 
 Source of truth для индексации — knowledge MCP. Repo-local shell-индексатор удалён из проектов, чтобы не было второго индексатора с отдельными лимитами/моделями. MCP `docs_reindex` по умолчанию использует `codex exec` (`gpt-5.4-mini`, effort `low`) и при включённых kill-switch'ах коэрсит Gemini/Claude provider/model в Codex.
 
-`semantic-index-status.js` сам является маленьким MCP JSON-RPC клиентом: спавнит `knowledge-server.mjs`, отправляет `initialize`, затем `tools/call docs_reindex`, парсит text-result как JSON и уже из `success/error/summary/failures` строит toast. Старый контракт stdout-regex'ов больше не используется.
+`semantic-index-status.js` сам является маленьким MCP JSON-RPC клиентом: спавнит `knowledge-server.mjs`, отправляет `initialize`, затем `tools/call docs_reindex`, парсит text-result как JSON и уже из `success/error/summary/failures` строит toast. Старый контракт stdout-regex'ов больше не используется. Live progress идёт отдельными строками stderr с marker `__KNOWLEDGE_REINDEX_PROGRESS__`; это side-channel, финальный JSON-RPC result остаётся source of truth.
 
 **PATH augmentation для production spawn:** production `.app` запускается launchd'ом с минимальным PATH `/usr/bin:/bin:/usr/sbin:/sbin` — без Homebrew (`/opt/homebrew/bin`, `/usr/local/bin`) и user-local (`~/.local/bin`, `~/.codex/bin`). MCP path добавляет эти директории перед оригинальным PATH, чтобы найти `node` и `codex`.
 
@@ -92,8 +92,9 @@ Source of truth для индексации — knowledge MCP. Repo-local shell-
 
 - `useUIStore.semanticIndexParallelism` (localStorage-only, 1..20, default 10).
 - При клике на SemanticIndexButton renderer передаёт значение в `semantic-index:rebuild` IPC.
-- `rebuildIndex(projectId, mw, { parallelism })` в main clamp'ит к [1, 20], сохраняет в `state.rebuildParallelism` и передаёт `parallel` в MCP `docs_reindex`.
-- `rebuild-started` IPC payload включает `parallelism` — renderer показывает фиолетовый чип сразу, без ожидания `get-status`.
+- `rebuildIndex(projectId, mw, { parallelism })` в main clamp'ит к [1, 20], сохраняет live snapshot и передаёт `parallel` в MCP `docs_reindex`.
+- `rebuild-started` IPC payload сидит на `parallelism: 1` и `workerLimit`; renderer показывает `0/N ×1` сразу, без ожидания `get-status`.
+- `semantic-index:progress` обновляет `outdatedCompleted`, `activeWorkers`, `workerLimit` и live `parallelism` по MCP marker'ам.
 - `get-status` возвращает `rebuildParallelism` — переключение проекта mid-rebuild не теряет чип.
 - Не доверяем raw значению из renderer (вдруг кто-то bypass'ит UI) — clamp на main-стороне обязателен.
 

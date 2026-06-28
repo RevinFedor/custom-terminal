@@ -2,8 +2,8 @@
 // открытых проектов. Состоит из трёх частей:
 //
 //   1) fs.watch по docs/**/*.md и .semantic-index.json — рекурсивный.
-//      На FS-событие (debounced 300ms) пересчитываем fresh / stale / new.
-//   2) IPC push 'semantic-index:status' { projectId, fresh, stale, new }.
+//      На FS-событие (debounced 300ms) пересчитываем fresh / stale / new / removed.
+//   2) IPC push 'semantic-index:status' { projectId, fresh, stale, new, removed }.
 //   3) IPC handle 'semantic-index:rebuild' — calls knowledge MCP docs_reindex
 //      with this project's path and pushes running/final state to renderer.
 //
@@ -19,6 +19,7 @@ const { spawn } = require('child_process');
 
 const INDEX_FILE_NAME = '.semantic-index.json';
 const DOCS_SUBDIR = 'docs';
+const REINDEX_PROGRESS_MARKER = '__KNOWLEDGE_REINDEX_PROGRESS__';
 
 // projectId → {
 //   projectPath, watchers: fs.FSWatcher[], debounceTimer,
@@ -62,6 +63,14 @@ function listDocsFiles(projectPath) {
   return out;
 }
 
+function isManagedDocIndexPath(relPath) {
+  if (typeof relPath !== 'string') return false;
+  if (!relPath.startsWith(`${DOCS_SUBDIR}/`)) return false;
+  if (!relPath.endsWith('.md')) return false;
+  if (relPath.split('/').includes('tmp')) return false;
+  return path.basename(relPath) !== '_intro.md';
+}
+
 function computeStatus(projectPath) {
   const indexPath = path.join(projectPath, INDEX_FILE_NAME);
   let indexedByPath = new Map();
@@ -84,9 +93,11 @@ function computeStatus(projectPath) {
   let fresh = 0;
   let stale = 0;
   let neu = 0;
+  const currentDocPaths = new Set();
 
   for (const fullPath of docsFiles) {
     const relPath = path.relative(projectPath, fullPath);
+    currentDocPaths.add(relPath);
     const onDiskHash = shaFile(fullPath);
     if (!onDiskHash) continue;
 
@@ -100,10 +111,18 @@ function computeStatus(projectPath) {
     }
   }
 
+  let removed = 0;
+  for (const relPath of indexedByPath.keys()) {
+    if (isManagedDocIndexPath(relPath) && !currentDocPaths.has(relPath)) {
+      removed += 1;
+    }
+  }
+
   return {
     fresh,
     stale,
     new: neu,
+    removed,
     indexExists: fs.existsSync(indexPath),
     docsTotal: docsFiles.length,
     indexedTotal: indexedByPath.size,
@@ -228,7 +247,24 @@ function parseReindexSummary(summary) {
   };
 }
 
-function callKnowledgeDocsReindex(projectPath, parallelism, onProcess) {
+function parseReindexProgressLine(line) {
+  const idx = line.indexOf(REINDEX_PROGRESS_MARKER);
+  if (idx === -1) return null;
+  const raw = line.slice(idx + REINDEX_PROGRESS_MARKER.length).trim();
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function numberOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(0, Math.round(n)) : null;
+}
+
+function callKnowledgeDocsReindex(projectPath, parallelism, onProcess, onProgress) {
   return new Promise((resolve, reject) => {
     const serverPath = process.env.KNOWLEDGE_MCP_SERVER
       || path.join(os.homedir(), '.claude', 'mcp', 'knowledge-server.mjs');
@@ -255,6 +291,7 @@ function callKnowledgeDocsReindex(projectPath, parallelism, onProcess) {
 
     let settled = false;
     let stdoutBuf = '';
+    let stderrBuf = '';
     let stderrTail = '';
     const timeout = setTimeout(() => {
       if (settled) return;
@@ -300,7 +337,18 @@ function callKnowledgeDocsReindex(projectPath, parallelism, onProcess) {
     });
 
     proc.stderr.on('data', (chunk) => {
-      stderrTail = (stderrTail + chunk.toString('utf8')).slice(-4000);
+      const text = chunk.toString('utf8');
+      stderrTail = (stderrTail + text).slice(-4000);
+      stderrBuf += text;
+      let nl;
+      while ((nl = stderrBuf.indexOf('\n')) !== -1) {
+        const line = stderrBuf.slice(0, nl);
+        stderrBuf = stderrBuf.slice(nl + 1);
+        const progress = parseReindexProgressLine(line);
+        if (progress && typeof onProgress === 'function') {
+          onProgress(progress);
+        }
+      }
     });
 
     proc.on('error', (err) => finish(err));
@@ -354,9 +402,10 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
   const parallelism = Number.isFinite(rawN) ? Math.max(1, Math.min(20, Math.round(rawN))) : 10;
 
   const preStatus = computeStatus(state.projectPath);
-  const outdatedAtStart = (preStatus.stale || 0) + (preStatus.new || 0);
+  const outdatedAtStart = (preStatus.stale || 0) + (preStatus.new || 0) + (preStatus.removed || 0);
   const displayParallelism = outdatedAtStart > 0 ? Math.min(parallelism, outdatedAtStart) : parallelism;
-  state.rebuildParallelism = displayParallelism;
+  const initialParallelism = outdatedAtStart > 0 ? 1 : Math.min(1, parallelism);
+  state.rebuildParallelism = initialParallelism;
 
   let outdatedTotal = outdatedAtStart;   // seeded from computeStatus; grows if more files launch than estimated
   let outdatedCompleted = 0;
@@ -372,9 +421,20 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
         outdatedTotal: payload.outdatedTotal ?? state.rebuildProgress?.outdatedTotal ?? 0,
         outdatedCompleted: payload.outdatedCompleted ?? state.rebuildProgress?.outdatedCompleted ?? 0,
         currentFile: payload.file ?? state.rebuildProgress?.currentFile ?? '',
+        activeWorkers: payload.activeWorkers ?? state.rebuildProgress?.activeWorkers ?? 0,
+        workerLimit: payload.workerLimit ?? state.rebuildProgress?.workerLimit ?? null,
       };
+      if (typeof payload.parallelism === 'number') {
+        state.rebuildParallelism = payload.parallelism;
+      }
     } else if (event === 'semantic-index:rebuild-started') {
-      state.rebuildProgress = { outdatedTotal: 0, outdatedCompleted: 0, currentFile: '' };
+      state.rebuildProgress = {
+        outdatedTotal: payload.outdatedTotal ?? 0,
+        outdatedCompleted: 0,
+        currentFile: '',
+        activeWorkers: 0,
+        workerLimit: payload.workerLimit ?? null,
+      };
     } else if (event === 'semantic-index:rebuild-done') {
       state.rebuildProgress = null;
     }
@@ -383,17 +443,51 @@ function rebuildIndex(projectId, mainWindow, opts = {}) {
     }
   };
 
-  send('semantic-index:rebuild-started', { parallelism: displayParallelism, outdatedTotal });
+  send('semantic-index:rebuild-started', {
+    parallelism: initialParallelism,
+    workerLimit: displayParallelism,
+    outdatedTotal,
+  });
   send('semantic-index:progress', {
     phase: 'mcp-docs-reindex',
     total: preStatus.docsTotal || 0,
     completed: 0,
     outdatedTotal,
     outdatedCompleted: 0,
+    activeWorkers: 0,
+    workerLimit: displayParallelism,
+    parallelism: initialParallelism,
   });
 
   callKnowledgeDocsReindex(state.projectPath, parallelism, (proc) => {
     state.rebuildProc = proc;
+  }, (progress) => {
+    const workTotal = numberOrNull(progress.workTotal);
+    const completed = numberOrNull(progress.completed);
+    const activeWorkers = numberOrNull(progress.active);
+    const workerLimit = numberOrNull(progress.workerLimit ?? progress.parallelism);
+    const totalDocs = numberOrNull(progress.total);
+
+    if (workTotal !== null) {
+      outdatedTotal = Math.max(outdatedTotal, workTotal);
+    }
+    if (completed !== null) {
+      outdatedCompleted = Math.min(outdatedTotal, Math.max(0, completed));
+    }
+
+    const liveParallelism = activeWorkers && activeWorkers > 0 ? activeWorkers : 1;
+
+    send('semantic-index:progress', {
+      phase: progress.phase || 'mcp-docs-reindex',
+      total: totalDocs ?? preStatus.docsTotal ?? 0,
+      completed: completed ?? 0,
+      outdatedTotal,
+      outdatedCompleted,
+      file: progress.file,
+      activeWorkers: activeWorkers ?? 0,
+      workerLimit: workerLimit ?? displayParallelism,
+      parallelism: liveParallelism,
+    });
   }).then((result) => {
     state.isRebuilding = false;
     state.rebuildProc = null;

@@ -1,6 +1,7 @@
 import type { AgentHistoryTool, AgentPtyStatus, HistoryAgentRuntime } from './historyAgentRuntimes';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './claudeStartupDefaultsReady';
 import { terminalRegistry } from './terminalRegistry';
+import { useUIStore } from '../store/useUIStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -469,6 +470,35 @@ export async function rewindAgentTimelineScenario({
     pasteAfter,
     deadlineMs: rewindMode === 'ai' ? 170_000 : 16_000,
   });
+  if (result?.success && rewindMode === 'native' && toolType === 'claude' && result.historyInputDraft === true) {
+    const targetDraft = String(targetFullText || targetText || '').trim();
+    if (targetDraft) {
+      const store = useUIStore.getState();
+      store.setHistoryPromptDraft(tabId, targetDraft);
+      if (typeof startUuid === 'string' && startUuid.trim()) {
+        const opId = Date.now().toString(36) + '-' + startUuid.slice(0, 8);
+        store.setHistoryRewindPreview(tabId, {
+          opId,
+          targetUuid: startUuid,
+          targetText: targetDraft,
+          startedAt: Date.now(),
+          sessionId,
+        });
+        window.dispatchEvent(new CustomEvent('history-panel:rewind-log', {
+          detail: {
+            tabId,
+            opId,
+            status: 'done',
+            targetUuid: startUuid,
+            targetText: targetDraft,
+            mode: rewindMode,
+            toolType,
+            historyInputDraft: true,
+          },
+        }));
+      }
+    }
+  }
   return {
     tabId,
     toolType,

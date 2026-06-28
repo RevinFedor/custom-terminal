@@ -10,6 +10,7 @@ interface IndexStatus {
   fresh: number;
   stale: number;
   new: number;
+  removed: number;
   indexExists: boolean;
   docsTotal: number;
   indexedTotal: number;
@@ -19,6 +20,8 @@ interface ProgressState {
   outdatedTotal: number;
   outdatedCompleted: number;
   currentFile: string;
+  activeWorkers: number;
+  workerLimit: number | null;
 }
 
 interface SemanticIndexButtonProps {
@@ -34,12 +37,17 @@ export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexBut
 
   const [status, setStatus] = useState<IndexStatus | null>(null);
   const [isRunning, setIsRunning] = useState(false);
-  // Параллелизм, с которым запущен текущий ребилд. Берётся из rebuild-started
-  // payload, не из store — чтобы при mid-rebuild смене настройки чип
-  // продолжал показывать реальное N работающих воркеров, а не текущее значение
-  // настройки (которое применится к следующему запуску).
+  // Live worker chip for the current rebuild. Seeded from rebuild-started and
+  // then updated by MCP progress, so a settings change mid-run does not rewrite
+  // the visible state of an already running indexer.
   const [runningParallelism, setRunningParallelism] = useState<number | null>(null);
-  const [progress, setProgress] = useState<ProgressState>({ outdatedTotal: 0, outdatedCompleted: 0, currentFile: '' });
+  const [progress, setProgress] = useState<ProgressState>({
+    outdatedTotal: 0,
+    outdatedCompleted: 0,
+    currentFile: '',
+    activeWorkers: 0,
+    workerLimit: null,
+  });
   const activeProjectIdRef = useRef(activeProjectId);
   activeProjectIdRef.current = activeProjectId;
 
@@ -53,7 +61,7 @@ export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexBut
     setStatus(null);
     setIsRunning(false);
     setRunningParallelism(null);
-    setProgress({ outdatedTotal: 0, outdatedCompleted: 0, currentFile: '' });
+    setProgress({ outdatedTotal: 0, outdatedCompleted: 0, currentFile: '', activeWorkers: 0, workerLimit: null });
 
     if (!activeProjectId) return;
 
@@ -79,6 +87,8 @@ export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexBut
                   outdatedTotal: r.rebuildProgress.outdatedTotal ?? 0,
                   outdatedCompleted: r.rebuildProgress.outdatedCompleted ?? 0,
                   currentFile: r.rebuildProgress.currentFile ?? '',
+                  activeWorkers: r.rebuildProgress.activeWorkers ?? 0,
+                  workerLimit: r.rebuildProgress.workerLimit ?? null,
                 });
               }
             }
@@ -96,28 +106,45 @@ export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexBut
         fresh: payload.fresh,
         stale: payload.stale,
         new: payload.new,
+        removed: payload.removed || 0,
         indexExists: payload.indexExists,
         docsTotal: payload.docsTotal,
         indexedTotal: payload.indexedTotal,
       });
     };
 
-    const onRebuildStarted = (_e: any, payload: { projectId: string; parallelism?: number; outdatedTotal?: number }) => {
+    const onRebuildStarted = (_e: any, payload: {
+      projectId: string;
+      parallelism?: number;
+      workerLimit?: number;
+      outdatedTotal?: number;
+    }) => {
       if (payload.projectId !== activeProjectIdRef.current) return;
       setIsRunning(true);
       setRunningParallelism(typeof payload.parallelism === 'number' ? payload.parallelism : null);
       // Seed the total from the start payload so the counter reads `0/3` (real
       // outdated count) immediately, not `…`. main computed it via computeStatus
       // before spawning the script.
-      setProgress({ outdatedTotal: payload.outdatedTotal ?? 0, outdatedCompleted: 0, currentFile: '' });
+      setProgress({
+        outdatedTotal: payload.outdatedTotal ?? 0,
+        outdatedCompleted: 0,
+        currentFile: '',
+        activeWorkers: 0,
+        workerLimit: payload.workerLimit ?? null,
+      });
     };
 
     const onProgress = (_e: any, payload: any) => {
       if (payload.projectId !== activeProjectIdRef.current) return;
+      if (typeof payload.parallelism === 'number') {
+        setRunningParallelism(payload.parallelism);
+      }
       setProgress((prev) => ({
         outdatedTotal: payload.outdatedTotal ?? prev.outdatedTotal,
         outdatedCompleted: payload.outdatedCompleted ?? prev.outdatedCompleted,
         currentFile: payload.file ?? prev.currentFile,
+        activeWorkers: payload.activeWorkers ?? prev.activeWorkers,
+        workerLimit: payload.workerLimit ?? prev.workerLimit,
       }));
     };
 
@@ -207,16 +234,18 @@ export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexBut
   // === Running state ===
   // Показываем только реально переиндексируемые файлы — кэшированные не считаются
   // (нет смысла показывать "5/90" если 85 из них cached и пролетают мгновенно).
-  // Третий параметр — параллелизм (фиолетовый чип), берётся из rebuild-started
-  // payload (runningParallelism) и зеркалит реально работающее N воркеров,
-  // а не текущее значение Settings.
+  // Третий параметр — live worker chip. На scan-фазе он остаётся ×1; если MCP
+  // реально запускает несколько Codex-процессов одновременно, progress поднимет
+  // его до ×2/×3.
   if (isRunning) {
-    const { outdatedTotal, outdatedCompleted, currentFile } = progress;
+    const { outdatedTotal, outdatedCompleted, currentFile, activeWorkers, workerLimit } = progress;
     const counter = outdatedTotal > 0 ? `${outdatedCompleted}/${outdatedTotal}` : '…';
     const parallelismLabel = runningParallelism ?? semanticIndexParallelism;
     const tooltipParts = [
       `Переиндексация: ${counter}`,
-      `Параллелизм: ${parallelismLabel} (Settings → Системные)`,
+      workerLimit
+        ? `Воркеры: ${activeWorkers}/${workerLimit} (лимит из Settings)`
+        : `Параллелизм: ${parallelismLabel} (Settings → Системные)`,
     ];
     if (currentFile) tooltipParts.push(currentFile);
     const tooltipText = tooltipParts.join('\n');
@@ -259,9 +288,10 @@ export default function SemanticIndexButton({ onOpenSettings }: SemanticIndexBut
     );
   }
 
-  const outdated = status.stale + status.new;
+  const removed = status.removed || 0;
+  const outdated = status.stale + status.new + removed;
   const tooltipText =
-    `Индекс: ${status.fresh} актуальных, ${status.stale} устаревших, ${status.new} новых\n` +
+    `Индекс: ${status.fresh} актуальных, ${status.stale} устаревших, ${status.new} новых, ${removed} удалённых\n` +
     `Файлов в docs/: ${status.docsTotal}, записей в индексе: ${status.indexedTotal}\n` +
     (outdated > 0 ? 'Клик — переиндексировать через Codex в фоне' : 'Индекс актуален') +
     '\nПКМ — открыть настройки.';
