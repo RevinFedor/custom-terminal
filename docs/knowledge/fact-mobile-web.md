@@ -518,6 +518,8 @@ Mount ChatView
 
 Warm-cache путь: только одна фаза `?after=<cachedLastUuid>` — сервер вернёт пустой стрим (silent revalidation) или дельту с момента последнего mount'а.
 
+Editable-last-prompt overlay: для `view=history` сервер может добавить к выбранной user-entry `deliveryStatus:'editable-last-prompt'` и top-level `editableLastPromptStatus`, когда native Claude Rewind успешно вернул этот prompt в редактируемое состояние в живой вкладке. Это не меняет JSONL и не скрывает запись; это UI/API-статус «последний prompt можно заменить следующим Send». `etag` для history-view обязан учитывать этот статус, иначе клиентский cache пропустит смену визуального состояния без нового uuid.
+
 **NDJSON wire format:**
 - `Accept: application/x-ndjson` → server отвечает `Content-Type: application/x-ndjson`, `Content-Encoding: br` (если accepted)
 - Line 1: `{"type":"meta", total, returned, truncated, dropped, sessionId, etag, firstUuid, lastUuid}`

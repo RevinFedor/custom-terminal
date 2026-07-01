@@ -2995,7 +2995,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         const truncated = dropped > 0;
         const firstUuid = entries.length ? (entries[0]?.uuid || null) : null;
         const lastUuid = entries.length ? (entries[entries.length - 1]?.uuid || null) : null;
-        const etagSrc = entries.map((e) => e?.uuid || '').join('|');
+        const etagSrc = entries.map((e) => `${e?.uuid || ''}:${e?.queueStatus || ''}:${e?.deliveryStatus || ''}`).join('|');
         const etag = crypto.createHash('sha1').update(etagSrc).digest('hex').slice(0, 16);
         console.log(`[WebTiming] /history DONE view=history tool=${data?.toolType || '-'} total=${total} returned=${entries.length} dropped=${dropped} around=${aroundUuid ? aroundUuid.slice(0, 8) : 'none'} ms=${Date.now()-t0}`);
         return sendJson(res, 200, { ...data, entries, total, truncated, dropped, etag, firstUuid, lastUuid });

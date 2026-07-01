@@ -8,11 +8,14 @@ const { execFile } = require('child_process');
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const CODEX_SESSIONS_DIR = path.join(CODEX_HOME, 'sessions');
 const CODEX_LOGS_DB = path.join(CODEX_HOME, 'logs_2.sqlite');
+const CODEX_AUTH_JSON = path.join(CODEX_HOME, 'auth.json');
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const USAGE_ACCOUNTS_CACHE_TTL_MS = 60 * 1000;
 const USAGE_ACCOUNTS_FOREGROUND_BUDGET_MS = 1200;
 const CODEX_RESET_DRIFT_TOLERANCE_SECONDS = 10 * 60;
 const CODEX_ACTIVE_USAGE_OVERRIDE_TTL_MS = 30 * 60 * 1000;
+const CODEX_USAGE_SCAN_DAYS = 10;
+const CODEX_USAGE_RATE_ROWS_LIMIT = 5000;
 
 let modelCache = null;
 let usageAccountsCache = null;
@@ -65,6 +68,17 @@ function safeJsonParse(value, fallback = null) {
     return JSON.parse(value);
   } catch {
     return fallback;
+  }
+}
+
+function decodeBase64UrlJson(value) {
+  if (!value || typeof value !== 'string') return null;
+  try {
+    const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+    return JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+  } catch {
+    return null;
   }
 }
 
@@ -1795,6 +1809,16 @@ function sqlString(value) {
   return String(value || '').replace(/'/g, "''");
 }
 
+function sqlStringList(values) {
+  return values.map((value) => `'${sqlString(value)}'`).join(',');
+}
+
+function arrayChunks(values, size) {
+  const chunks = [];
+  for (let i = 0; i < values.length; i += size) chunks.push(values.slice(i, i + size));
+  return chunks;
+}
+
 function extractCodexThreadId(body) {
   if (!body || typeof body !== 'string') return null;
   return (body.match(/thread_id=([0-9a-f-]+)/) || [])[1]
@@ -1833,6 +1857,7 @@ function parseCodexRateLimitLog(body) {
 
 function parseCodexAccountIdentityLog(body) {
   if (!body || typeof body !== 'string') return { accountId: null, email: null };
+  if (!body.includes('terminal.type=')) return { accountId: null, email: null };
   return {
     accountId: (body.match(/user\.account_id="([^"]+)"/) || [])[1] || null,
     email: (body.match(/user\.email="([^"]+)"/) || [])[1] || null,
@@ -1908,6 +1933,41 @@ function compareCodexUsageFreshness(nextUsage, prevUsage) {
     codexUsageFreshnessCandidate(nextUsage),
     codexUsageFreshnessCandidate(prevUsage)
   );
+}
+
+function readCurrentCodexAuthIdentity() {
+  if (!fs.existsSync(CODEX_AUTH_JSON)) return null;
+  const raw = safeJsonParse(fs.readFileSync(CODEX_AUTH_JSON, 'utf8'), null);
+  const tokens = raw?.tokens || {};
+  const accessPayload = decodeBase64UrlJson(String(tokens.access_token || '').split('.')[1]);
+  const idPayload = decodeBase64UrlJson(String(tokens.id_token || '').split('.')[1]);
+  const authClaims = accessPayload?.['https://api.openai.com/auth']
+    || idPayload?.['https://api.openai.com/auth']
+    || {};
+  const profileClaims = accessPayload?.['https://api.openai.com/profile']
+    || idPayload?.['https://api.openai.com/profile']
+    || {};
+  const accountId = tokens.account_id || authClaims.chatgpt_account_id || null;
+  const email = profileClaims.email || idPayload?.email || accessPayload?.email || null;
+  if (!accountId && !email) return null;
+  return {
+    accountId,
+    email,
+    refreshedAtMs: parseTimestampMs(raw?.last_refresh),
+  };
+}
+
+function currentCodexAuthIdentityForUsage(usage) {
+  const identity = readCurrentCodexAuthIdentity();
+  if (!identity) return null;
+  const refreshedAtMs = identity.refreshedAtMs;
+  const usageMs = parseTimestampMs(usage?.timestamp);
+  // Auth.json is global state. Only use it for active rollouts newer than the
+  // current auth snapshot; older resurrected sessions must rely on log identity.
+  if (Number.isFinite(refreshedAtMs) && Number.isFinite(usageMs) && usageMs + 30 * 1000 < refreshedAtMs) {
+    return null;
+  }
+  return identity;
 }
 
 function closestCodexIdentity(rate, identities) {
@@ -2071,53 +2131,32 @@ async function scanLatestCodexUsageAccounts() {
     return [];
   }
 
-  // Extract only the useful slices from the large Codex log rows. Full rows can
-  // contain prompts/instructions and can be very large; these substr() windows
-  // keep the query lightweight and prevent leaking content into this process.
-  const sql = `
+  // Extract only the useful slices from the large Codex log rows. Do not mix
+  // identity rows and rate rows under one global LIMIT: a busy account can
+  // otherwise push a quieter account out of the scan window completely.
+  const rateSql = `
     SELECT
       ts,
       ts_nanos,
       thread_id,
       substr(feedback_log_body, 1, 260) || ' ' ||
-      CASE
-        WHEN instr(feedback_log_body, 'websocket event: {"type":"codex.rate_limits"') > 0
-          THEN substr(feedback_log_body, instr(feedback_log_body, 'websocket event: {"type":"codex.rate_limits"'), 5000)
-        WHEN instr(feedback_log_body, 'user.account_id=') > 0
-          THEN substr(feedback_log_body, instr(feedback_log_body, 'user.account_id='), 900)
-        WHEN instr(feedback_log_body, 'user.email=') > 0
-          THEN substr(feedback_log_body, instr(feedback_log_body, 'user.email='), 900)
-        ELSE ''
-      END AS body
+      substr(feedback_log_body, instr(feedback_log_body, 'websocket event: {"type":"codex.rate_limits"'), 5000) AS body
     FROM logs
-    WHERE ts > strftime('%s','now','-10 days')
-      AND (
-        feedback_log_body LIKE '%websocket event: {"type":"codex.rate_limits"%'
-        OR feedback_log_body LIKE '%user.account_id=%'
-        OR feedback_log_body LIKE '%user.email=%'
-      )
+    WHERE ts > strftime('%s','now','-${CODEX_USAGE_SCAN_DAYS} days')
+      AND target = 'codex_api::endpoint::responses_websocket'
+      AND feedback_log_body LIKE '%websocket event: {"type":"codex.rate_limits"%'
     ORDER BY ts DESC, ts_nanos DESC
-    LIMIT 12000;
+    LIMIT ${CODEX_USAGE_RATE_ROWS_LIMIT};
   `;
 
-  const rows = await runSqliteJson(CODEX_LOGS_DB, sql);
+  const rateRows = await runSqliteJson(CODEX_LOGS_DB, rateSql);
 
   const byThread = new Map();
-  for (const row of Array.isArray(rows) ? rows : []) {
+  for (const row of Array.isArray(rateRows) ? rateRows : []) {
     const body = row?.body || '';
     const threadId = row?.thread_id || extractCodexThreadId(body);
     if (!threadId) continue;
     const ctx = byThread.get(threadId) || { threadId, identities: [], rates: [] };
-    const { accountId, email } = parseCodexAccountIdentityLog(body);
-    if (accountId || email) {
-      ctx.identities.push({
-        ts: Number(row.ts) || 0,
-        tsNanos: Number(row.ts_nanos) || 0,
-        timeMs: codexLogTimeMs(row),
-        accountId,
-        email,
-      });
-    }
     const rateLimits = parseCodexRateLimitLog(body);
     if (rateLimits) {
       ctx.rates.push({
@@ -2129,6 +2168,49 @@ async function scanLatestCodexUsageAccounts() {
       });
     }
     byThread.set(threadId, ctx);
+  }
+
+  const threadIds = [...byThread.keys()];
+  for (const chunk of arrayChunks(threadIds, 400)) {
+    if (chunk.length === 0) continue;
+    const identitySql = `
+      SELECT
+        ts,
+        ts_nanos,
+        thread_id,
+        CASE
+          WHEN instr(feedback_log_body, 'user.account_id=') > 0
+            THEN substr(feedback_log_body, instr(feedback_log_body, 'user.account_id='), 900)
+          WHEN instr(feedback_log_body, 'user.email=') > 0
+            THEN substr(feedback_log_body, instr(feedback_log_body, 'user.email='), 900)
+          ELSE ''
+        END AS body
+      FROM logs
+      WHERE ts > strftime('%s','now','-${CODEX_USAGE_SCAN_DAYS} days')
+        AND target = 'codex_otel.log_only'
+        AND thread_id IN (${sqlStringList(chunk)})
+        AND (
+          feedback_log_body LIKE '%user.account_id=%'
+          OR feedback_log_body LIKE '%user.email=%'
+        );
+    `;
+    const identityRows = await runSqliteJson(CODEX_LOGS_DB, identitySql);
+    for (const row of Array.isArray(identityRows) ? identityRows : []) {
+      const body = row?.body || '';
+      const threadId = row?.thread_id || extractCodexThreadId(body);
+      if (!threadId) continue;
+      const ctx = byThread.get(threadId);
+      if (!ctx) continue;
+      const { accountId, email } = parseCodexAccountIdentityLog(body);
+      if (!accountId && !email) continue;
+      ctx.identities.push({
+        ts: Number(row.ts) || 0,
+        tsNanos: Number(row.ts_nanos) || 0,
+        timeMs: codexLogTimeMs(row),
+        accountId,
+        email,
+      });
+    }
   }
 
   const latestByIdentity = new Map();
@@ -2191,6 +2273,7 @@ async function findCodexAccountIdentityForThread(threadId) {
       END AS body
     FROM logs
     WHERE ts > strftime('%s','now','-10 days')
+      AND target = 'codex_otel.log_only'
       AND thread_id = '${sqlString(threadId)}'
       AND (
         feedback_log_body LIKE '%user.account_id=%'
@@ -2513,10 +2596,19 @@ function register() {
             loadSessionRecords(opts.sessionId, opts.cwd).catch((error) => ({ success: false, error: error?.message || String(error) })),
           ]);
           activeIdentity = identity;
-          activeAccountKey = codexAccountKeyFromIdentity(activeIdentity);
           if (loaded?.success) {
             activeUsage = latestCodexUsageInRecords(loaded.records, loaded.filePath);
           }
+          if (!activeIdentity && activeUsage) {
+            activeIdentity = currentCodexAuthIdentityForUsage(activeUsage);
+            if (activeIdentity) {
+              console.log('[CodexData] usage active identity from auth account=' +
+                (maskCodexEmail(activeIdentity.email) || shortCodexId(activeIdentity.accountId) || 'unknown') +
+                ' session=' + (shortCodexId(opts.sessionId) || 'none') +
+                ' sample=' + (activeUsage.timestamp || 'null'));
+            }
+          }
+          activeAccountKey = codexAccountKeyFromIdentity(activeIdentity);
         } catch {}
       }
       if (activeUsage && activeIdentity) {
@@ -2547,8 +2639,7 @@ function register() {
       const activeMatchesSelected = !!activeUsage && (
         !selectedAccountKey ||
         (activeAccountKey && activeAccountKey === selectedAccountKey) ||
-        (!!opts?.sessionId && selectedAccount?.sourceThreadId === opts.sessionId) ||
-        (!activeAccountKey && accountUsages.length <= 1)
+        (!!opts?.sessionId && selectedAccount?.sourceThreadId === opts.sessionId)
       );
       if (activeMatchesSelected && (!usage || compareCodexUsageFreshness(activeUsage, usage) > 0)) {
         if (!selectedAccountKey && activeAccountKey) {
@@ -2641,6 +2732,7 @@ module.exports = {
     compareCodexUsageFreshness,
     findCodexAccountIdentityForThread,
     codexAccountKeyFromIdentity,
+    currentCodexAuthIdentityForUsage,
     rememberCodexActiveUsageOverride,
     mergeCodexActiveOverridesIntoAccounts,
   },

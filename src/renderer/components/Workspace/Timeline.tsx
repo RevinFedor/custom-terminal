@@ -1354,7 +1354,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     const channel = isCodex ? 'codex:get-full-history' : 'claude:get-full-history';
     (async () => {
       try {
-        const result = await ipcRenderer.invoke(channel, { sessionId, cwd });
+        const result = await ipcRenderer.invoke(channel, { sessionId, cwd, tabId });
         if (cancelled) return;
         const fullEntry = Array.isArray(result?.entries)
           ? result.entries.find((item: any) => item?.uuid === entry.uuid)
@@ -3686,6 +3686,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         targetIndex,
         targetText: targetPrefix,
         targetFullText: entry.content.trim(),
+        targetUuid: entry.uuid,
         rewindableCount: rewindableEntries.length,
         skipDuplicates,
         pasteAfter: compactText || undefined

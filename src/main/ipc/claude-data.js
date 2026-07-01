@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const { performance: nodePerformance } = require('node:perf_hooks');
 
 let _projectManager = null;
+let _getClaudeEditableLastPromptState = null;
 
 let _localPerfOpSeq = 0;
 function _beginPerfOp(kind, detail = {}) {
@@ -964,8 +965,33 @@ const _api = {
   deleteRange: null,       // ({sessionId, cwd, startUuid, endUuid}) → {success, removedCount, fileDeleted}
 };
 
-function register({ projectManager, formatToolAction }) {
+function _normalizePromptStatusText(text) {
+  return String(text || '')
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function _applyEditableLastPromptStatus(entries, promptState) {
+  if (!Array.isArray(entries) || promptState?.status !== 'editable-last-prompt') return null;
+  const targetUuid = String(promptState.targetUuid || '');
+  if (!targetUuid) return null;
+  const matchedEntry = entries.find(entry => entry && entry.role === 'user' && entry.uuid === targetUuid) || null;
+  if (!matchedEntry) return null;
+  if (_normalizePromptStatusText(promptState.targetText || '') &&
+      _normalizePromptStatusText(promptState.targetText || '') !== _normalizePromptStatusText(matchedEntry.content || '')) {
+    return null;
+  }
+  matchedEntry.deliveryStatus = 'editable-last-prompt';
+  matchedEntry.statusReason = 'claude-native-rewind';
+  matchedEntry.deliveryStatusSource = promptState.source || 'unknown';
+  return matchedEntry;
+}
+
+function register({ projectManager, formatToolAction, getClaudeEditableLastPromptState }) {
   _projectManager = projectManager;
+  _getClaudeEditableLastPromptState = typeof getClaudeEditableLastPromptState === 'function' ? getClaudeEditableLastPromptState : null;
 
   // Export a range of messages from Claude session
   ipcMain.handle('claude:copy-range', async (event, {
@@ -3536,7 +3562,7 @@ function register({ projectManager, formatToolAction }) {
   });
 
   // Get full chat history for History Panel (structured entries, not markdown)
-  ipcMain.handle('claude:get-full-history', async (event, { sessionId, cwd }) => {
+  ipcMain.handle('claude:get-full-history', async (event, { sessionId, cwd, tabId }) => {
     if (!sessionId) {
       return { success: false, error: 'No session ID provided' };
     }
@@ -4034,7 +4060,30 @@ function register({ projectManager, formatToolAction }) {
 
       const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
 
-      return { success: true, entries, latestSessionId, claudeMemoryBoundaryUuid: _firstOrphanRecoveredFromUuid };
+      let editableLastPromptStatus = null;
+      if (tabId && _getClaudeEditableLastPromptState) {
+        try {
+          const promptState = await _getClaudeEditableLastPromptState(tabId, 'claude-get-full-history');
+          const matched = _applyEditableLastPromptStatus(entries, promptState);
+          if (matched) {
+            editableLastPromptStatus = {
+              uuid: matched.uuid,
+              status: matched.deliveryStatus,
+              source: matched.deliveryStatusSource || null,
+            };
+            console.log('[FullHistory:EditableLastPrompt] tab=' + String(tabId).slice(-12)
+              + ' session=' + String(sessionId).slice(0, 8)
+              + ' uuid=' + String(matched.uuid || '').slice(0, 8)
+              + ' source=' + (matched.deliveryStatusSource || '-'));
+          }
+        } catch (e) {
+          console.warn('[FullHistory:EditableLastPrompt] failed tab=' + String(tabId).slice(-12)
+            + ' session=' + String(sessionId).slice(0, 8)
+            + ' error=' + (e?.message || e));
+        }
+      }
+
+      return { success: true, entries, latestSessionId, claudeMemoryBoundaryUuid: _firstOrphanRecoveredFromUuid, editableLastPromptStatus };
     } catch (error) {
       console.error('[Claude FullHistory] Error:', error);
       return { success: false, error: error.message };

@@ -465,6 +465,7 @@ export async function rewindAgentTimelineScenario({
     targetIndex,
     targetText,
     targetFullText,
+    targetUuid: startUuid,
     rewindableCount,
     skipDuplicates,
     pasteAfter,

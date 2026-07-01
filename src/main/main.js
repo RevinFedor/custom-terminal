@@ -1268,6 +1268,170 @@ function getHeadlessVisibleBufferSnapshot(tabId, reason) {
     return { success: false, error: err?.message || String(err), tabId, reason, source: 'headless-main' };
   }
 }
+
+const CLAUDE_EMPTY_COMPOSER_HINT_RE = /^\s*Try\s+"[^"]+"/i;
+
+function cleanClaudeComposerText(text) {
+  return String(text || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[▌█]/g, '')
+    .replace(/\s+Image in clipboard\b.*$/i, '')
+    .trimEnd();
+}
+
+function isClaudeComposerStopLine(text) {
+  const trimmed = cleanClaudeComposerText(text).trim();
+  if (!trimmed) return true;
+  if (/^[─━]{8,}$/.test(trimmed)) return true;
+  if (/^\[[^\]]+\]\s+\d+%/.test(trimmed)) return true;
+  if (/^⏵⏵\s+/.test(trimmed)) return true;
+  if (/^[✢✳✶✻✽·]\s*/.test(trimmed)) return true;
+  if (/^[╭╰│┃║]/.test(trimmed)) return true;
+  if (/^\s*Press Ctrl-C again to exit\b/i.test(trimmed)) return true;
+  return false;
+}
+
+function parseClaudeDraftFromVisibleSnapshot(snapshot) {
+  const lines = Array.isArray(snapshot?.lines) ? snapshot.lines : [];
+  const withSource = (payload, source) => ({
+    success: true,
+    hasDraft: payload.hasDraft,
+    text: payload.text || '',
+    preview: String(payload.text || '').replace(/\s+/g, ' ').slice(0, 160),
+    source: (snapshot?.source || 'visible-buffer') + ':claude-composer:' + source,
+  });
+
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const raw = cleanClaudeComposerText(lines[i]?.text || '');
+    const promptIdx = Math.max(raw.lastIndexOf('❯'), raw.lastIndexOf('›'));
+    if (promptIdx < 0) continue;
+
+    const first = cleanClaudeComposerText(raw.slice(promptIdx + 1)).trim();
+    const parts = [];
+    if (first && !CLAUDE_EMPTY_COMPOSER_HINT_RE.test(first)) parts.push(first);
+
+    for (let j = i + 1; j < lines.length; j++) {
+      const continuation = cleanClaudeComposerText(lines[j]?.text || '');
+      const trimmed = continuation.trim();
+      if (isClaudeComposerStopLine(continuation)) break;
+      if (CLAUDE_EMPTY_COMPOSER_HINT_RE.test(trimmed)) break;
+      parts.push(trimmed);
+    }
+
+    const text = parts.join('\n').trim();
+    if (!text || CLAUDE_EMPTY_COMPOSER_HINT_RE.test(text)) {
+      return withSource({ hasDraft: false, text: '' }, 'prompt-empty-row-' + (lines[i]?.row ?? i));
+    }
+    return withSource({ hasDraft: true, text }, 'prompt-row-' + (lines[i]?.row ?? i));
+  }
+
+  return {
+    success: true,
+    hasDraft: null,
+    text: '',
+    preview: '',
+    source: (snapshot?.source || 'visible-buffer') + ':claude-composer:unknown',
+  };
+}
+
+async function requestTerminalClaudeDraftState(webContents, tabId, reason, timeoutMs = 700) {
+  if (!tabId || !terminals.has(tabId) || !bridgeKnownSessions.has(tabId) || aiStoppingTabs.get(tabId)?.toolType === 'claude') {
+    return {
+      success: true,
+      hasDraft: null,
+      text: '',
+      preview: '',
+      source: 'claude-composer:presence-not-live',
+    };
+  }
+
+  const snapshot = await requestTerminalVisibleBufferSnapshot(
+    webContents,
+    tabId,
+    typeof reason === 'string' ? reason : 'claude-draft-state',
+    Math.max(100, Math.min(Number(timeoutMs) || 700, 2500))
+  );
+  if (!snapshot?.success) {
+    return {
+      success: false,
+      hasDraft: null,
+      text: '',
+      preview: '',
+      source: snapshot?.source || 'visible-buffer',
+      error: snapshot?.error || 'snapshot_failed',
+    };
+  }
+  return { tabId, ...parseClaudeDraftFromVisibleSnapshot(snapshot) };
+}
+
+const claudeEditableLastPromptByTab = new Map();
+
+function normalizeEditableLastPromptText(text) {
+  return String(text || '')
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function clearClaudeEditableLastPrompt(tabId, reason = 'clear') {
+  if (!tabId || !claudeEditableLastPromptByTab.has(tabId)) return;
+  const prev = claudeEditableLastPromptByTab.get(tabId);
+  claudeEditableLastPromptByTab.delete(tabId);
+  console.log('[ClaudeEditableLastPrompt] clear tab=' + String(tabId).slice(-12)
+    + ' reason=' + reason
+    + ' uuid=' + String(prev?.targetUuid || '').slice(0, 8));
+}
+
+function markClaudeEditableLastPrompt(tabId, payload = {}) {
+  const targetUuid = String(payload.targetUuid || '').trim();
+  const targetText = normalizeEditableLastPromptText(payload.targetText || '');
+  if (!tabId || !targetUuid || !targetText) return null;
+  const liveSessionId = bridgeKnownSessions.get(tabId) || null;
+  const state = {
+    status: 'editable-last-prompt',
+    tabId,
+    sessionId: payload.sessionId || liveSessionId || null,
+    targetUuid,
+    targetText,
+    startedAt: Date.now(),
+    source: payload.source || 'claude-native-rewind',
+  };
+  claudeEditableLastPromptByTab.set(tabId, state);
+  console.log('[ClaudeEditableLastPrompt] mark tab=' + String(tabId).slice(-12)
+    + ' session=' + String(state.sessionId || '').slice(0, 8)
+    + ' uuid=' + targetUuid.slice(0, 8)
+    + ' chars=' + targetText.length
+    + ' source=' + state.source);
+  return state;
+}
+
+function getClaudeEditableLastPromptState(tabId, reason = 'get') {
+  const state = tabId ? claudeEditableLastPromptByTab.get(tabId) : null;
+  if (!state) {
+    return { success: true, status: null, hasEditableLastPrompt: false, source: 'editable-last-prompt:none', reason };
+  }
+  if (!terminals.has(tabId) || !bridgeKnownSessions.has(tabId) || aiStoppingTabs.get(tabId)?.toolType === 'claude') {
+    clearClaudeEditableLastPrompt(tabId, 'not-live:' + reason);
+    return { success: true, status: null, hasEditableLastPrompt: false, source: 'editable-last-prompt:not-live', reason };
+  }
+  const liveSessionId = bridgeKnownSessions.get(tabId) || null;
+  if (state.sessionId && liveSessionId && state.sessionId !== liveSessionId) {
+    clearClaudeEditableLastPrompt(tabId, 'session-changed:' + reason);
+    return { success: true, status: null, hasEditableLastPrompt: false, source: 'editable-last-prompt:session-changed', reason };
+  }
+  return {
+    success: true,
+    status: 'editable-last-prompt',
+    hasEditableLastPrompt: true,
+    targetUuid: state.targetUuid,
+    targetText: state.targetText,
+    sessionId: state.sessionId || liveSessionId || null,
+    startedAt: state.startedAt,
+    source: state.source,
+    reason,
+  };
+}
 // Claude Handshake: prompt injection with debounce (thinking handled by alwaysThinkingEnabled)
 // States: 'WAITING_PROMPT' -> 'DEBOUNCE_PROMPT' -> send prompt -> done
 const claudeState = new Map(); // tabId -> state string | null
@@ -2614,6 +2778,7 @@ function clearBridgeTab(tabId) {
   const wasTurnBusy = claudeTurnBusy.get(tabId) === true;
   const wasSpinnerBusy = claudeSpinnerBusy.get(tabId) === true;
   const wasLocalBusy = claudeLocalCommandWatchers.has(tabId);
+  clearClaudeEditableLastPrompt(tabId, 'bridge-clear');
   bridgeKnownSessions.delete(tabId);
   claudeStartupIntents.delete(tabId);
   clearClaudePendingJsonlOwnersForTab(tabId, 'bridge-clear');
@@ -3715,6 +3880,7 @@ function startClaudeHookServer() {
         // (TTYHOG truncation, ANSI corruption, single-write data loss) leave
         // detectable evidence instead of "feels wrong".
         if (event === 'UserPromptSubmit') {
+          clearClaudeEditableLastPrompt(tabId, 'user-prompt-submit');
           const audit = pendingPasteAudit.get(tabId);
           console.log('[PasteAudit] UserPromptSubmit tab=' + tabId.slice(-12) + ' hasAudit=' + !!audit + ' handoff=' + (audit?.handoffId || '-') + ' source=' + (audit?.source || '-') + ' transcript=' + (transcript_path || '-'));
           if (audit && transcript_path) {
@@ -4348,6 +4514,7 @@ function parseOSC133AndEmit(tabId, data) {
       case 'B': // Command start - user pressed Enter
         console.log(`[OSC 133] Tab ${tabId}: Command STARTED (B)`);
         console.warn(`[RunAfterDiag] B tab=${tabId.slice(-8)} claudeCliActive=${claudeCliActive.has(tabId)} spinnerBusy=${claudeSpinnerBusy.get(tabId) === true}`);
+        clearClaudeEditableLastPrompt(tabId, 'osc-command-started');
         if (codexFinishDebounceTimers.has(tabId)) {
           clearTimeout(codexFinishDebounceTimers.get(tabId));
           codexFinishDebounceTimers.delete(tabId);
@@ -4370,6 +4537,7 @@ function parseOSC133AndEmit(tabId, data) {
         state.isRunning = false;
         state.lastExitCode = param ? parseInt(param, 10) : 0;
         console.log(`[OSC 133] Tab ${tabId}: Command FINISHED (D) exitCode=${state.lastExitCode}`);
+        clearClaudeEditableLastPrompt(tabId, 'osc-command-finished');
         // [RunAfterDiag] Correlate D markers with Claude liveness. If a D fires
         // while claudeCliActive/claudeSpinnerBusy is true, the shell is claiming
         // "command finished" while Claude is actually still running → alive flips
@@ -9563,6 +9731,7 @@ ipcMain.on('terminal:force-command-started', (event, payload) => {
   const tabId = request.tabId;
   if (!tabId) return;
   console.log('[Force Command Started] Tab:', tabId, 'commandType:', request.commandType || '-');
+  clearClaudeEditableLastPrompt(tabId, 'force-command-started');
   clearAiStopping(tabId, 'command-started');
   clearCodexDescendantExitRecheck(tabId, 'force-command-started');
   const state = terminalCommandState.get(tabId) || { isRunning: false, lastCommand: null };
@@ -10991,7 +11160,7 @@ function makeRewindCancelledError(stage) {
   return err;
 }
 
-ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, targetText, targetFullText, rewindableCount, skipDuplicates = 0, pasteAfter, deadlineMs }) => {
+ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, targetText, targetFullText, targetUuid, rewindableCount, skipDuplicates = 0, pasteAfter, deadlineMs }) => {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
   rewindCancelTabs.delete(tabId);
@@ -11784,10 +11953,25 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
           console.log('[Claude:Rewind] Terminal input grabbed+cleared chars=' + (grabResult.text ? grabResult.text.length : 0)
             + ' matchedTarget=' + grabResult.matchedTarget
             + ' attempt=' + grabResult.attempt);
+          markClaudeEditableLastPrompt(tabId, {
+            sessionId: bridgeKnownSessions.get(tabId) || null,
+            targetUuid,
+            targetText: targetInputText,
+            source: 'claude-native-rewind',
+          });
         }
       }
 
-      return { success: true, found, targetIndex, pressCount, restoredInput: false, historyInputDraft: !pasteAfter && !!targetInputText };
+      return {
+        success: true,
+        found,
+        targetIndex,
+        targetUuid: targetUuid || null,
+        pressCount,
+        restoredInput: false,
+        historyInputDraft: !pasteAfter && !!targetInputText,
+        deliveryStatus: !pasteAfter && !!targetInputText ? 'editable-last-prompt' : undefined,
+      };
     });
   } catch (err) {
     if (err?.code === 'rewind_cancelled') {
@@ -12652,6 +12836,7 @@ ipcMain.on('terminal:resize', (event, tabId, cols, rows) => {
 ipcMain.on('terminal:kill', async (event, tabId) => {
   const startedAt = Date.now();
   const term = terminals.get(tabId);
+  clearClaudeEditableLastPrompt(tabId, 'terminal-kill');
   const bridgeSessionId = bridgeKnownSessions.get(tabId) || null;
   const turnBusyAtKill = claudeTurnBusy.get(tabId) === true;
   const spinnerBusyAtKill = claudeSpinnerBusy.get(tabId) === true;
@@ -15666,7 +15851,12 @@ require(path.join(srcMainDir, 'ipc', 'semantic-search')).register({
 
 // claude:copy-range, claude:fork-session-file, claude:get-fork-markers,
 // claude:get-timeline, claude:export-clean-session, claude:get-full-history → ipc/claude-data.js
-require(path.join(srcMainDir, 'ipc', 'claude-data')).register({ projectManager, formatToolAction });
+require(path.join(srcMainDir, 'ipc', 'claude-data')).register({
+  projectManager,
+  formatToolAction,
+  getClaudeEditableLastPromptState: (tabId, reason) =>
+    getClaudeEditableLastPromptState(tabId, reason || 'claude-full-history-editable-last-prompt'),
+});
 codexDataModule.register();
 transcriptService.registerIpc();
 
@@ -16987,6 +17177,15 @@ ipcMain.handle('codex:get-draft-state', async (_event, tabId, options = {}) => {
       waitFor: typeof options?.waitFor === 'boolean' ? options.waitFor : undefined,
       waitTimeoutMs: Number(options?.waitTimeoutMs) || undefined,
     }
+  );
+});
+
+ipcMain.handle('claude:get-draft-state', async (_event, tabId, options = {}) => {
+  return requestTerminalClaudeDraftState(
+    mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    tabId,
+    typeof options?.reason === 'string' ? options.reason : 'claude-get-draft-state',
+    Number(options?.timeoutMs) || 700
   );
 });
 

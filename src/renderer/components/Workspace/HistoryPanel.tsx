@@ -72,6 +72,7 @@ interface FullHistoryEntry {
   timestamp: string;
   content: string;
   queueStatus?: 'sending' | 'queued' | 'sent' | 'cancelled' | 'failed';
+  deliveryStatus?: 'editable-last-prompt';
   handoffId?: string;
   statusReason?: string;
   statusChangedAt?: number;
@@ -206,12 +207,18 @@ const buildRewindPreviewEntries = (rawEntries: FullHistoryEntry[], preview: Hist
   const targetIndex = rawEntries.findIndex((entry) => entry.uuid === preview.targetUuid);
   if (targetIndex < 0) return { entries: rawEntries, hiddenCount: 0 };
 
-  // Native rewind moves the selected user prompt into the History input and
-  // clears Claude's terminal composer. Until that draft is submitted again,
-  // the target user row is not part of the previewed active history; the local
-  // rewind marker represents it.
   const entries = rawEntries.slice(0, targetIndex);
-  let hiddenCount = 1;
+  const targetEntry = rawEntries[targetIndex];
+  if (targetEntry) {
+    entries.push(targetEntry.role === 'user'
+      ? {
+          ...targetEntry,
+          deliveryStatus: 'editable-last-prompt',
+          statusReason: targetEntry.statusReason || 'rewind-preview',
+        }
+      : targetEntry);
+  }
+  let hiddenCount = 0;
   for (let i = targetIndex + 1; i < rawEntries.length; i++) {
     const entry = rawEntries[i];
     if (shouldCarryAfterRewindTarget(entry, preview)) entries.push(entry);
@@ -556,16 +563,22 @@ const HistoryEntry = memo(({ entry, toolType }: { entry: FullHistoryEntry; toolT
   }
 
   if (entry.role === 'user') {
+    const editableLastPrompt = entry.deliveryStatus === 'editable-last-prompt';
     return (
       <div style={{
         padding: '8px 12px',
-        backgroundColor: 'rgba(255, 255, 255, 0.04)', borderRadius: 6,
-        borderLeft: '3px solid rgba(255, 255, 255, 0.2)',
+        backgroundColor: editableLastPrompt ? 'rgba(217, 119, 6, 0.08)' : 'rgba(255, 255, 255, 0.04)', borderRadius: 6,
+        borderLeft: '3px solid ' + (editableLastPrompt ? 'rgba(217, 119, 6, 0.75)' : 'rgba(255, 255, 255, 0.2)'),
       }}>
-        <div style={{ fontSize: 10, color: '#666', marginBottom: 4 }}>
+        <div style={{ fontSize: 10, color: editableLastPrompt ? '#fbbf24' : '#666', marginBottom: 4, fontWeight: editableLastPrompt ? 700 : 400, letterSpacing: editableLastPrompt ? 0.4 : 0 }}>
           USER
-          {entry.timestamp && (
+          {editableLastPrompt && (
             <span style={{ marginLeft: 8 }}>
+              EDITABLE LAST PROMPT
+            </span>
+          )}
+          {entry.timestamp && (
+            <span style={{ marginLeft: 8, color: editableLastPrompt ? '#8a6a25' : undefined, fontWeight: 400, letterSpacing: 0 }}>
               {new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
             </span>
           )}
@@ -2977,6 +2990,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
                   old.uuid === entry.uuid &&
                   old.role === entry.role &&
                   old.queueStatus === entry.queueStatus &&
+                  old.deliveryStatus === entry.deliveryStatus &&
                   old.timestamp === entry.timestamp &&
                   old.content === entry.content;
               });

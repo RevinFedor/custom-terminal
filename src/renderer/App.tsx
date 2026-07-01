@@ -46,6 +46,7 @@ import { terminalRegistry } from './utils/terminalRegistry';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './utils/claudeStartupDefaultsReady';
 import { DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL } from './constants/codexSettings';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from './constants/systemProjects';
+import { generateTabTitleFromSession } from './utils/generateTabTitle';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -1436,6 +1437,45 @@ function App() {
           const sessionId = sessionIdForTab(tab, toolType);
           return { tab, toolType, runtime, sessionId };
         };
+        const maybeAutoTitleAfterMobileSend = (tabId: string, toolType: AgentHistoryTool, cwd?: string | null) => {
+          const delays = [0, 700, 1800, 4000];
+          const attempt = async (index: number) => {
+            const latestStore = useWorkspaceStore.getState();
+            let latestTab: any = null;
+            for (const ws of latestStore.openProjects.values()) {
+              const candidate = ws.tabs.get(tabId);
+              if (candidate) {
+                latestTab = candidate;
+                break;
+              }
+            }
+            if (!latestTab || latestTab.nameSetManually) return;
+            const latestSessionId = toolType === 'codex' ? latestTab.codexSessionId : latestTab.claudeSessionId;
+            if (!latestSessionId) {
+              if (index + 1 < delays.length) window.setTimeout(() => void attempt(index + 1), delays[index + 1]);
+              return;
+            }
+            const pending = latestStore.getPendingAutoTabTitle(tabId, toolType, latestSessionId);
+            if (!pending) return;
+            const result = await generateTabTitleFromSession({
+              toolType,
+              sessionId: latestSessionId,
+              cwd: latestTab.cwd || cwd || undefined,
+              tabId,
+              source: 'mobile-send-auto-title',
+              reason: 'mobile-send',
+            });
+            if (result.ok && result.title) {
+              latestStore.autoRenameTab(tabId, result.title, { toolType, sessionId: latestSessionId });
+              latestStore.consumePendingAutoTabTitle(tabId, toolType, latestSessionId);
+              return;
+            }
+            if ((result.reason === 'no-user-prompt' || result.reason === 'timeline-error') && index + 1 < delays.length) {
+              window.setTimeout(() => void attempt(index + 1), delays[index + 1]);
+            }
+          };
+          void attempt(0);
+        };
         const ensureProjectWorkspace = async (projectId?: string) => {
           if (!projectId) return null;
           let projectData: any = null;
@@ -2297,6 +2337,7 @@ function App() {
           const tabId = await state.createTab(projectId, undefined, cwd, {
             commandType: 'claude',
             pendingAction: { type: 'claude-new' },
+            skipInitialRename: true,
           });
           const tab = ws.tabs.get(tabId);
           return reply(true, { tabId, name: tab?.name, cwd: tab?.cwd, projectId });
@@ -2319,6 +2360,7 @@ function App() {
             color: agent,
             pendingAction: shouldStartNow ? undefined : pendingAction,
             nameSetManually: !!explicitName,
+            skipInitialRename: true,
             codexModel: typeof codexModel === 'string' ? codexModel : undefined,
             codexEffort: typeof codexEffort === 'string' ? codexEffort : undefined,
             externalRun: externalRun && typeof externalRun === 'object' ? externalRun : undefined,
@@ -2525,6 +2567,9 @@ function App() {
               effort,
               returnDraftOnConflict,
             });
+            if (result?.success !== false) {
+              maybeAutoTitleAfterMobileSend(tabId, toolType, cwd || tab?.cwd);
+            }
             return reply(true, { tabId, toolType, ...(result || {}) });
           }
           // SDK path (default)
@@ -2677,7 +2722,7 @@ function App() {
             return reply(true, { entries: [], sessionId: null, toolType: toolType || null });
           }
           const ipcChannel = toolType === 'codex' ? 'codex:get-full-history' : 'claude:get-full-history';
-          const result = await ipcRenderer.invoke(ipcChannel, { sessionId, cwd: tab.cwd });
+          const result = await ipcRenderer.invoke(ipcChannel, { sessionId, cwd: tab.cwd, tabId });
           return reply(!!result?.success, {
             ...(result || {}),
             toolType,
