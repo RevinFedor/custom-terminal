@@ -693,8 +693,10 @@ function buildCodexTimeline(records, sessionId) {
         type: 'compact',
         timestamp: recordTimestamp(record),
         content: compactEventTitle(payload),
+        sourceLine: record.__line,
         preTokens: Number(last.total_tokens || last.input_tokens || 0) || undefined,
         sessionId,
+        turnIndex: currentTurnIndex,
       });
       lastTopLevelCompactLine = record.__line;
       continue;
@@ -788,6 +790,7 @@ function buildCodexTimeline(records, sessionId) {
           sourceLine: record.__line,
           preTokens: Number(last.total_tokens || last.input_tokens || 0) || undefined,
           sessionId,
+          turnIndex: currentTurnIndex,
         });
       }
       continue;

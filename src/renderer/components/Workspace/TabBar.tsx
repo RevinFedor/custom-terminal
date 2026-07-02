@@ -31,6 +31,12 @@ const TABBAR_DRAG_VISUAL_LOCK_ATTR = 'data-tabbar-drag-visual-lock';
 const GROUP_COLLAPSE_FLIP_SUPPRESS_MS = 320;
 const isNaturalRestartAfterEnd = (reason?: string) => !reason || reason === 'task_complete';
 
+type RestartAfterScriptRunState = {
+  command: string;
+  running: boolean;
+  pendingCommand: string | null;
+};
+
 let forcedDragCursorDepth = 0;
 let forcedDragCursorStyleEl: HTMLStyleElement | null = null;
 
@@ -2971,6 +2977,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const [geminiBusyMap, setGeminiBusyMap] = useState<Map<string, boolean>>(new Map());
   const [codexBusyMap, setCodexBusyMap] = useState<Map<string, boolean>>(new Map());
   const restartAfterBusyRef = useRef<Map<string, boolean>>(new Map());
+  const restartAfterScriptRunsRef = useRef<Map<string, RestartAfterScriptRunState>>(new Map());
   const [pasteBusyMap, setPasteBusyMap] = useState<Map<string, boolean>>(new Map());
   const claudeSpinnerVisualIdleTimersRef = useRef<Map<string, number>>(new Map());
   // Awaiting-user-input: Claude called AskUserQuestion and is blocked waiting for
@@ -3152,6 +3159,17 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
     const handleCommandFinished = (_: any, { tabId }: { tabId: string }) => {
       console.warn('[TabBar:ProcessStatus] tabId=' + tabId.slice(-8) + ' running=false source=command-finished');
+      const restartAfterRun = restartAfterScriptRunsRef.current.get(tabId);
+      if (restartAfterRun?.running) {
+        const pendingCommand = restartAfterRun.pendingCommand;
+        restartAfterScriptRunsRef.current.delete(tabId);
+        if (pendingCommand) {
+          console.warn('[TabBar:RestartAfter] draining-pending target=' + tabId.slice(-8) + ' command=' + JSON.stringify(pendingCommand));
+          void runRestartAfterAction(tabId, pendingCommand, { coalesceFiniteScript: true });
+        } else {
+          console.warn('[TabBar:RestartAfter] script-finished target=' + tabId.slice(-8) + ' command=' + JSON.stringify(restartAfterRun.command));
+        }
+      }
       setProcessStatus(prev => {
         const next = new Map(prev);
         next.set(tabId, false);
@@ -3191,7 +3209,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       for (const target of restartTargets) {
         if (target.tabId === triggerTabId) continue;
         console.warn('[TabBar:RestartAfter] trigger=' + triggerTabId.slice(-8) + ' target=' + target.tabId.slice(-8) + ' command=' + JSON.stringify(target.command || '') + ' reason=' + (reason || 'natural'));
-        void runRestartAfterAction(target.tabId, target.command);
+        void runRestartAfterAction(target.tabId, target.command, { coalesceFiniteScript: true });
       }
     };
 
@@ -4691,16 +4709,50 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     }
   }
 
-  const runRestartAfterAction = async (tabId: string, command?: string) => {
+  const runRestartAfterAction = async (
+    tabId: string,
+    command?: string,
+    options?: { coalesceFiniteScript?: boolean }
+  ) => {
     const cleanCommand = command?.trim();
     if (!cleanCommand) {
       await runDeterministicStop(tabId, true);
       return;
     }
+    const coalesceFiniteScript = !!options?.coalesceFiniteScript && !isDevRestartCommand(cleanCommand);
+    if (coalesceFiniteScript) {
+      const existing = restartAfterScriptRunsRef.current.get(tabId);
+      if (existing) {
+        existing.pendingCommand = cleanCommand;
+        console.warn('[TabBar:RestartAfter] queued-pending target=' + tabId.slice(-8) + ' command=' + JSON.stringify(cleanCommand) + ' running=' + existing.running);
+        return;
+      }
+      restartAfterScriptRunsRef.current.set(tabId, {
+        command: cleanCommand,
+        running: false,
+        pendingCommand: null,
+      });
+    } else {
+      restartAfterScriptRunsRef.current.delete(tabId);
+    }
     const stopAccepted = await runDeterministicStop(tabId, false);
-    if (!stopAccepted) return;
+    if (!stopAccepted) {
+      if (coalesceFiniteScript) {
+        const existing = restartAfterScriptRunsRef.current.get(tabId);
+        if (existing?.command === cleanCommand && !existing.running) {
+          restartAfterScriptRunsRef.current.delete(tabId);
+        }
+      }
+      return;
+    }
     const killPrefix = await buildKillPortsPrefix(tabId);
     ipcRenderer.send('terminal:input', tabId, `${killPrefix}${cleanCommand}\r`);
+    if (coalesceFiniteScript) {
+      const existing = restartAfterScriptRunsRef.current.get(tabId);
+      if (existing?.command === cleanCommand) {
+        existing.running = true;
+      }
+    }
     if (isDevRestartCommand(cleanCommand)) {
       useWorkspaceStore.getState().setTabCommandType(tabId, 'devServer');
     }

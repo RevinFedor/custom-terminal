@@ -135,7 +135,7 @@ Claude после нашего exit'а перечитывает файл → в�
 **Маппинг ppid → tabId:** через `bridgePidCache` (заполняется SessionBridge'ем, Claude PID → tabId).
 
 **Caveats:**
-- Image attachments дропаются — Claude передаёт через editor только `[Image #N]` placeholder'ы, binary остаётся в его React state и сбрасывается после empty re-read. Мы считаем плейсхолдеры и показываем 📎N на чипе.
+- Image attachments через editor всё ещё приходят как `[Image #N]` placeholder'ы, но это не plain text: main резолвит файл в `~/.claude/image-cache/<sessionId>/<N>.<ext>` и сохраняет image-slot рядом с History draft. Если файл найден, History показывает семантический `[Image #N]` и блокирует тихую отправку как обычного текста; если файл потерян, в draft остаётся явный `imageError`. Не возвращать поведение «просто вставить placeholder и считать prompt восстановленным».
 - Имя скрипта **должно начинаться с "code"** (`noted-code-grab`) — Claude classifies basename: если содержит `code|cursor|windsurf|codium|subl|atom`, GUI-path (silent), иначе alt-screen flash. См. `editor.ts:20-30` в декомпиле.
 - `getExternalEditor` в Claude **memoize'ан** — EDITOR должен быть установлен ДО spawn'а Claude. Существующие табы запущенные до изменения env не получат фичу до рестарта Claude процесса.
 - `getExternalEditor` проверяет `VISUAL` ПЕРЕД `EDITOR` — мы инжектим оба для надёжности.

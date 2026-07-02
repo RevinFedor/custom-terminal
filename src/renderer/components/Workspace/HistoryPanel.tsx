@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, Send, Square, RotateCcw, Power, AlertTriangle } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
-import { HISTORY_PANEL_DEFAULT_WIDTH, useUIStore, type HistoryRewindPreview } from '../../store/useUIStore';
+import { HISTORY_PANEL_DEFAULT_WIDTH, useUIStore, type HistoryPromptDraftImageRef, type HistoryRewindPreview } from '../../store/useUIStore';
 import Tooltip from '../UI/Tooltip';
 import {
   getHistoryAgentRuntime,
@@ -126,6 +126,45 @@ const normalizeHistoryPromptText = (text: string) => String(text || '')
 
 const promptPreview = (text: string, max = 80) =>
   normalizeHistoryPromptText(text).replace(/\s+/g, ' ').slice(0, max);
+
+const collectHistoryDraftImageIds = (text: string): Set<number> => {
+  const ids = new Set<number>();
+  const re = /\[Image\s+#?(\d+)\]/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const id = Number(match[1]);
+    if (Number.isFinite(id)) ids.add(id);
+  }
+  return ids;
+};
+
+const hasHistoryDraftImageError = (text: string) =>
+  /\[imageError:\s*[^\]\r\n]+?\]/i.test(String(text || ''));
+
+const retainHistoryDraftImages = (
+  text: string,
+  images?: HistoryPromptDraftImageRef[]
+): HistoryPromptDraftImageRef[] => {
+  if (!images?.length) return [];
+  const ids = collectHistoryDraftImageIds(text);
+  if (ids.size === 0) return [];
+  return images.filter((ref) => ids.has(Number(ref.id)) && typeof ref.path === 'string' && ref.path.trim());
+};
+
+const historyDraftImageWarning = (
+  toolType: AgentHistoryTool,
+  text: string,
+  images?: HistoryPromptDraftImageRef[]
+): string | null => {
+  if (toolType !== 'claude') return null;
+  if (hasHistoryDraftImageError(text)) {
+    return 'Claude Rewind вернул prompt с картинкой, но файл картинки уже недоступен. Удали imageError или восстанови вложение вручную перед отправкой.';
+  }
+  if (retainHistoryDraftImages(text, images).length > 0) {
+    return 'Claude Rewind вернул prompt с картинкой. History сохранила маркер, но не отправит его как обычный текст; убери маркер или восстанови вложение вручную.';
+  }
+  return null;
+};
 
 const createPromptHandoffId = () =>
   Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
@@ -803,7 +842,7 @@ const getDraftNoticeMeta = (message: string) => {
       tone: 'warning' as const,
     };
   }
-  if (/image placeholder/i.test(message)) {
+  if (/image placeholder|imageError|картинк|вложени/i.test(message)) {
     return {
       label: 'Draft moved · images',
       tone: 'warning' as const,
@@ -1467,11 +1506,15 @@ function AgentHistoryControls({
   const runtime = useMemo(() => getHistoryAgentRuntime(toolType), [toolType]);
   const [status, setStatus] = useState<AgentPtyStatus>('inactive');
   const prompt = useUIStore(useCallback((s) => s.historyPromptDrafts[tabId] || '', [tabId]));
+  const draftImages = useUIStore(useCallback((s) => s.historyPromptDraftImages[tabId] || [], [tabId]));
   const setHistoryPromptDraft = useUIStore((s) => s.setHistoryPromptDraft);
-  const setPrompt = useCallback((next: string | ((prev: string) => string)) => {
+  const setPrompt = useCallback((
+    next: string | ((prev: string) => string),
+    options: { images?: HistoryPromptDraftImageRef[] | null; preserveImages?: boolean } = { preserveImages: true }
+  ) => {
     const current = useUIStore.getState().historyPromptDrafts[tabId] || '';
     const value = typeof next === 'function' ? next(current) : next;
-    setHistoryPromptDraft(tabId, value);
+    setHistoryPromptDraft(tabId, value, options);
   }, [setHistoryPromptDraft, tabId]);
   const [busyAction, setBusyAction] = useState<'resume' | 'send' | 'interrupt' | 'stop' | 'grab' | null>(null);
   const [isPasteBusy, setIsPasteBusy] = useState(false);
@@ -1711,7 +1754,7 @@ function AgentHistoryControls({
     if (visualState) {
       console.log('[' + runtime.logPrefix + ':draft] preflight tab=' + tabId.slice(-12) + ' reason=' + reason + ' hasDraft=' + visualState.hasDraft + ' source=' + visualState.source);
       if (visualState.hasDraft === false) {
-        return { stale: false, text: '', images: 0 };
+        return { stale: false, text: '', images: 0, imagePaths: [] as HistoryPromptDraftImageRef[] };
       }
       if (visualState.hasDraft === null) {
         throw new Error(runtime.label + ' terminal draft state is unknown; send stopped before touching terminal input.');
@@ -1719,7 +1762,7 @@ function AgentHistoryControls({
     }
     console.log('[' + runtime.logPrefix + ':draft] grab-request tab=' + tabId.slice(-12) + ' reason=' + reason);
     const result = await runtime.grabDraft(tabId);
-    if (tabIdRef.current !== requestTabId) return { stale: true, text: '', images: 0 };
+    if (tabIdRef.current !== requestTabId) return { stale: true, text: '', images: 0, imagePaths: [] as HistoryPromptDraftImageRef[] };
     if (!result?.success) {
       const message = draftGrabErrorText(result);
       console.warn('[' + runtime.logPrefix + ':draft] grab-failed tab=' + tabId.slice(-12) + ' reason=' + reason + ' error=' + (result?.error || 'unknown'));
@@ -1727,8 +1770,9 @@ function AgentHistoryControls({
     }
     const text = typeof result.text === 'string' ? result.text.trim() : '';
     const images = Number(result.images || 0);
+    const imagePaths = Array.isArray(result.imagePaths) ? result.imagePaths : [];
     console.log('[' + runtime.logPrefix + ':draft] grab-ok tab=' + tabId.slice(-12) + ' reason=' + reason + ' chars=' + text.length + ' images=' + images);
-    return { stale: false, text, images };
+    return { stale: false, text, images, imagePaths };
   }, [runtime, tabId]);
 
   useEffect(() => {
@@ -1801,7 +1845,13 @@ function AgentHistoryControls({
               console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery empty tab=' + tabId.slice(-12) + ' attempt=' + (attempt + 1));
               continue;
             }
-            setPrompt((prev) => prependPromptTextOnce(prev, draft.text));
+            const current = useUIStore.getState().historyPromptDrafts[requestTabId] || '';
+            const nextText = prependPromptTextOnce(current, draft.text);
+            const mergedImages = retainHistoryDraftImages(nextText, [
+              ...(useUIStore.getState().historyPromptDraftImages[requestTabId] || []),
+              ...(Array.isArray(draft.imagePaths) ? draft.imagePaths : []),
+            ]);
+            setHistoryPromptDraft(requestTabId, nextText, mergedImages.length > 0 ? { images: mergedImages } : { preserveImages: true });
             setDraftWarning(runtime.label + ' returned an interrupted prompt; pulled it back from terminal input.');
             console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery restored tab=' + tabId.slice(-12) + ' source=terminal attempt=' + (attempt + 1) + ' chars=' + draft.text.length + ' images=' + draft.images);
             onPromptStatusChange(pending.handoffId, 'cancelled', 'interrupt-restored-terminal-draft');
@@ -1841,7 +1891,7 @@ function AgentHistoryControls({
     return () => {
       ipcRenderer.removeListener(runtime.busyEvent, handleInterruptRecovery);
     };
-  }, [isNonAuthoritativeBusyEvent, onPromptStatusChange, readTerminalDraft, refreshPresence, runtime, showEmptyDraftNotice, tabId]);
+  }, [isNonAuthoritativeBusyEvent, onPromptStatusChange, readTerminalDraft, refreshPresence, runtime, setHistoryPromptDraft, showEmptyDraftNotice, tabId]);
 
   useEffect(() => {
     if (!interruptAwaiting || status === 'busy') return;
@@ -1893,9 +1943,19 @@ function AgentHistoryControls({
         showEmptyDraftNotice(runtime.label + ' terminal input is empty');
         return;
       }
-      setPrompt((prev) => prependPromptText(prev, draft.text));
+      const current = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
+      const nextText = prependPromptText(current, draft.text);
+      const mergedImages = retainHistoryDraftImages(nextText, [
+        ...(useUIStore.getState().historyPromptDraftImages[actionTabId] || []),
+        ...(Array.isArray(draft.imagePaths) ? draft.imagePaths : []),
+      ]);
+      setHistoryPromptDraft(actionTabId, nextText, mergedImages.length > 0 ? { images: mergedImages } : { preserveImages: true });
       if (draft.images > 0) {
-        setDraftWarning('Pulled text contains ' + draft.images + ' image placeholder' + (draft.images === 1 ? '' : 's') + '; images are not attached in this History input.');
+        setDraftWarning(
+          mergedImages.length > 0
+            ? 'Pulled text contains ' + draft.images + ' image placeholder' + (draft.images === 1 ? '' : 's') + '; History will keep the marker but will not send it as plain text.'
+            : 'Pulled text contains ' + draft.images + ' image placeholder' + (draft.images === 1 ? '' : 's') + '; images are not attached in this History input.'
+        );
       }
       requestAnimationFrame(() => promptTextareaRef.current?.focus());
     } catch (e: any) {
@@ -1907,7 +1967,7 @@ function AgentHistoryControls({
         if (tabIdRef.current === actionTabId) setBusyAction(null);
       }
     }
-  }, [readTerminalDraft, refreshPresence, runtime.label, showEmptyDraftNotice, tabId]);
+  }, [readTerminalDraft, refreshPresence, runtime.label, setHistoryPromptDraft, showEmptyDraftNotice, tabId]);
 
   const runAction = useCallback(async (kind: 'resume' | 'send' | 'interrupt' | 'stop') => {
     if (actionInFlightRef.current) {
@@ -1923,6 +1983,7 @@ function AgentHistoryControls({
     const actionSeq = ++actionSeqRef.current;
     let sendHandoffId: string | null = null;
     let clearedPromptText: string | null = null;
+    let clearedPromptImages: HistoryPromptDraftImageRef[] = [];
     actionInFlightRef.current = true;
     setBusyAction(kind);
     setError(null);
@@ -1937,6 +1998,14 @@ function AgentHistoryControls({
         let text = prompt.trim();
         if (!text) return;
         if (pendingQuestionRef.current) throw new Error(runtime.label + ' is waiting for a question answer');
+        const currentDraftImages = useUIStore.getState().historyPromptDraftImages[actionTabId] || [];
+        const sendDraftImages = retainHistoryDraftImages(text, currentDraftImages);
+        if (runtime.toolType === 'claude' && (hasHistoryDraftImageError(text) || sendDraftImages.length > 0)) {
+          setHistoryPromptDraft(actionTabId, text, sendDraftImages.length > 0 ? { images: sendDraftImages } : { images: [] });
+          setDraftWarning(historyDraftImageWarning(runtime.toolType, text, sendDraftImages) || 'Claude History draft contains an unresolved image marker; remove it or restore the image manually before sending.');
+          requestAnimationFrame(() => promptTextareaRef.current?.focus());
+          return;
+        }
         const statusAtSend = statusRef.current;
         const acceptsBusyPrompt = statusAtSend === 'busy' && runtime.allowSendWhileBusy;
         if (statusAtSend !== 'active' && !acceptsBusyPrompt) throw new Error(runtime.label + ' is not ready (' + statusAtSend + ')');
@@ -1945,7 +2014,11 @@ function AgentHistoryControls({
           if (terminalDraft.stale || tabIdRef.current !== actionTabId) return;
           if (terminalDraft.text) {
             text = prependPromptText(text, terminalDraft.text);
-            setPrompt(text);
+            const mergedImages = retainHistoryDraftImages(text, [
+              ...(useUIStore.getState().historyPromptDraftImages[actionTabId] || []),
+              ...(Array.isArray(terminalDraft.imagePaths) ? terminalDraft.imagePaths : []),
+            ]);
+            setHistoryPromptDraft(actionTabId, text, mergedImages.length > 0 ? { images: mergedImages } : { preserveImages: true });
             setDraftWarning('Terminal draft found — send stopped, text moved to top.');
             console.log('[' + runtime.logPrefix + ':draft] send-preflight blocked tab=' + tabId.slice(-12) + ' chars=' + terminalDraft.text.length + ' images=' + terminalDraft.images);
             requestAnimationFrame(() => promptTextareaRef.current?.focus());
@@ -1967,6 +2040,7 @@ function AgentHistoryControls({
           ' pasteBusy=' + pasteBusyRef.current +
           ' preview="' + promptPreview(text) + '"');
         onPromptSubmitted(text, 'sending', { handoffId, statusAtSend, submittedAt });
+        clearedPromptImages = sendDraftImages;
         setPrompt('');
         setDraftWarning(null);
         clearedPromptText = text;
@@ -2039,7 +2113,10 @@ function AgentHistoryControls({
         onPromptStatusChange(sendHandoffId, 'failed', 'send-error');
         const restorePrompt = clearedPromptText;
         if (restorePrompt) {
-          setPrompt((current) => current.trim() ? current : restorePrompt);
+          const current = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
+          if (!current.trim()) {
+            setHistoryPromptDraft(actionTabId, restorePrompt, clearedPromptImages.length > 0 ? { images: clearedPromptImages } : undefined);
+          }
         }
       }
       if (tabIdRef.current === actionTabId) setError(String(e?.message || e));
@@ -2054,7 +2131,7 @@ function AgentHistoryControls({
         if (tabIdRef.current === actionTabId) setBusyAction(null);
       }
     }
-  }, [busyAction, cwd, onPromptStatusChange, onPromptSubmitted, prompt, readTerminalDraft, refreshHistoryWithUpdating, refreshPresence, runtime, sessionId, setStatusFrom, tabId]);
+  }, [busyAction, cwd, onPromptStatusChange, onPromptSubmitted, prompt, readTerminalDraft, refreshHistoryWithUpdating, refreshPresence, runtime, sessionId, setHistoryPromptDraft, setStatusFrom, tabId]);
 
   const answerPendingQuestion = useCallback(async (answers: Record<string, string>, stop = false) => {
     if (!runtime.answerQuestion) return;
@@ -2110,7 +2187,12 @@ function AgentHistoryControls({
   const canInterruptTurn = isTurnBusy && !controlsLocked;
   const canResume = status === 'inactive' && !!sessionId && !busyAction;
   const canStopProcess = (status === 'active' || status === 'busy' || status === 'starting') && !busyAction;
-  const draftNoticeMeta = draftWarning ? getDraftNoticeMeta(draftWarning) : null;
+  const derivedDraftWarning = useMemo(
+    () => historyDraftImageWarning(toolType, prompt, draftImages),
+    [draftImages, prompt, toolType]
+  );
+  const visibleDraftWarning = draftWarning || derivedDraftWarning;
+  const draftNoticeMeta = visibleDraftWarning ? getDraftNoticeMeta(visibleDraftWarning) : null;
   const promptIdleBorder = isCancellingTurn || rewindLocked || status === 'stopping' ? 'rgba(217, 119, 6, 0.65)' : '#333';
 
   return (
@@ -2149,8 +2231,8 @@ function AgentHistoryControls({
           />
           <span>{meta.label}</span>
         </div>
-        {draftWarning && !error && draftNoticeMeta && (
-          <Tooltip content={draftWarning}>
+        {visibleDraftWarning && !error && draftNoticeMeta && (
+          <Tooltip content={visibleDraftWarning}>
             <div
               style={{
                 display: 'inline-flex',
@@ -2177,7 +2259,7 @@ function AgentHistoryControls({
             </div>
           </Tooltip>
         )}
-        {isCancellingTurn && !draftWarning && !error && (
+        {isCancellingTurn && !visibleDraftWarning && !error && (
           <Tooltip content={'Waiting for ' + runtime.label + ' stop record and restored prompt'}>
             <div
               style={{
@@ -2821,6 +2903,9 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     status?: 'start' | 'done' | 'failed';
     targetUuid?: string;
     targetText?: string;
+    historyDraftText?: string;
+    historyDraftImages?: HistoryPromptDraftImageRef[];
+    historyDraftWarning?: string;
     mode?: 'native' | 'ai';
     toolType?: string;
     persisted?: boolean;
@@ -2832,6 +2917,8 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     const opId = detail.opId || String(Date.now());
     const status = detail.status || 'start';
     const targetText = normalizeHistoryPromptText(detail.targetText || '');
+    const historyDraftText = normalizeHistoryPromptText(detail.historyDraftText || targetText);
+    const historyDraftImages = Array.isArray(detail.historyDraftImages) ? detail.historyDraftImages : [];
     const now = Date.now();
     const uuid = LOCAL_REWIND_PREFIX + tabId + '-' + opId;
     const detailMessage = String(detail.error || detail.message || '');
@@ -2866,15 +2953,17 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       );
     if (isDurableRewind) {
       setHistoryRewindPreview(tabId, null);
-      if (targetText && detail.historyInputDraft === true) {
-        setHistoryPromptDraft(tabId, targetText);
+      if (historyDraftText && detail.historyInputDraft === true) {
+        setHistoryPromptDraft(tabId, historyDraftText, historyDraftImages.length > 0 ? { images: historyDraftImages } : undefined);
+        if (detail.historyDraftWarning) setDraftWarning(detail.historyDraftWarning);
       }
       removeLocalRewindEntry();
       return;
     }
     if (status === 'done' && detail.mode === 'native' && detail.targetUuid && targetText && (detail.toolType || toolType) === 'claude') {
       setHistoryRewindPreview(tabId, { opId, targetUuid: detail.targetUuid, targetText, startedAt: now, sessionId });
-      setHistoryPromptDraft(tabId, targetText);
+      setHistoryPromptDraft(tabId, historyDraftText || targetText, historyDraftImages.length > 0 ? { images: historyDraftImages } : undefined);
+      if (detail.historyDraftWarning) setDraftWarning(detail.historyDraftWarning);
     }
     if (status !== 'failed') {
       removeLocalRewindEntry();
@@ -3042,6 +3131,9 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         status?: 'start' | 'done' | 'failed';
         targetUuid?: string;
         targetText?: string;
+        historyDraftText?: string;
+        historyDraftImages?: HistoryPromptDraftImageRef[];
+        historyDraftWarning?: string;
         mode?: 'native' | 'ai';
         toolType?: string;
         persisted?: boolean;

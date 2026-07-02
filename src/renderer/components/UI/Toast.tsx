@@ -1,16 +1,43 @@
 import React from 'react';
-import { Github } from 'lucide-react';
+import { ChevronDown, ChevronRight, Github } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useDictationSnapshot } from '../../utils/dictationManager';
 
 export default function ToastContainer() {
   const { toasts, removeToast } = useUIStore();
+  const [expandedToastIds, setExpandedToastIds] = React.useState<Set<string>>(() => new Set());
+  const animatedToastIdsRef = React.useRef<Set<string>>(new Set());
   // Tab-scoped toasts (toast.tabId set) only render while their tab is the
   // effective active one — switching tabs hides the toast, switching back shows
   // it again. Global toasts (no tabId) render always.
   const effectiveTabId = useWorkspaceStore((s) => s.getEffectiveTabId());
   const visibleToasts = toasts.filter((t) => !t.tabId || t.tabId === effectiveTabId);
+  const liveToastIds = React.useMemo(() => new Set(toasts.map((t) => t.id)), [toasts]);
+
+  React.useEffect(() => {
+    setExpandedToastIds((current) => {
+      let changed = false;
+      const next = new Set<string>();
+      current.forEach((id) => {
+        if (liveToastIds.has(id)) next.add(id);
+        else changed = true;
+      });
+      return changed ? next : current;
+    });
+    animatedToastIdsRef.current.forEach((id) => {
+      if (!liveToastIds.has(id)) animatedToastIdsRef.current.delete(id);
+    });
+  }, [liveToastIds]);
+
+  const toggleToastDetails = React.useCallback((id: string) => {
+    setExpandedToastIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
 
   return (
     <div
@@ -23,111 +50,159 @@ export default function ToastContainer() {
         display: 'flex',
         flexDirection: 'column',
         gap: '8px',
-        maxWidth: '340px'
+        maxWidth: '420px'
       }}
     >
-      {visibleToasts.map((toast) => (
-        <div
-          key={toast.id}
-          className={`pointer-events-auto flex items-center gap-2 px-3 py-2 rounded-lg shadow-lg backdrop-blur-sm transform transition-all duration-300 ease-out animate-slide-in ${
-            toast.persistent ? '' : 'cursor-pointer'
-          } ${
-            toast.type === 'success' ? 'bg-[#22c55e]/90 text-white' :
-            toast.type === 'error' ? 'bg-[#ef4444]/90 text-white' :
-            toast.type === 'warning' ? 'bg-[#f59e0b]/90 text-white' :
-            toast.type === 'pink' ? 'bg-[#ec4899]/90 text-white' :
-            'bg-[#3b82f6]/90 text-white'
-          }`}
-          style={toast.persistent ? {
-            borderLeft: '3px solid rgba(255,255,255,0.5)',
-            paddingRight: '8px',
-          } : undefined}
-          onClick={() => !toast.persistent && !toast.onAction && removeToast(toast.id)}
-        >
-          {/* ✕ close button — left side for persistent toasts */}
-          {toast.persistent && (
-            <span
-              className="shrink-0 cursor-pointer rounded-full flex items-center justify-center transition-colors"
-              style={{
-                width: '18px',
-                height: '18px',
-                fontSize: '11px',
-                lineHeight: 1,
-                opacity: 0.95,
-                background: 'rgba(0,0,0,0.28)',
-                border: '1px solid rgba(255,255,255,0.35)',
-                color: '#fff',
-              }}
-              onMouseEnter={(e) => {
-                e.currentTarget.style.background = 'rgba(0,0,0,0.5)';
-                e.currentTarget.style.borderColor = 'rgba(255,255,255,0.7)';
-              }}
-              onMouseLeave={(e) => {
-                e.currentTarget.style.background = 'rgba(0,0,0,0.28)';
-                e.currentTarget.style.borderColor = 'rgba(255,255,255,0.35)';
-              }}
-              onClick={(e) => { e.stopPropagation(); removeToast(toast.id); }}
-            >
-              ✕
-            </span>
-          )}
-          <span className="text-sm shrink-0">
-            {toast.type === 'success' ? '✓' :
-             toast.type === 'error' ? '✗' :
-             toast.type === 'warning' ? '⚠' :
-             toast.type === 'pink' ? '✦' : 'ℹ'}
-          </span>
-          <span className="text-xs font-medium flex-1">
-            {toast.message}
-            {toast.actionLabel && (
-              <span
-                className="cursor-pointer underline decoration-white/50 hover:decoration-white ml-1 inline-flex items-center gap-1 align-middle"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (toast.onAction) toast.onAction();
-                  removeToast(toast.id);
-                }}
-              >
-                {toast.actionIcon === 'github-desktop' && (
+      {visibleToasts.map((toast) => {
+        const details = String(toast.details || '').trim();
+        const hasDetails = details.length > 0;
+        const expanded = hasDetails && expandedToastIds.has(toast.id);
+        const shouldAnimate = !animatedToastIdsRef.current.has(toast.id);
+        return (
+          <div
+            key={toast.id}
+            ref={() => {
+              if (!shouldAnimate) return;
+              animatedToastIdsRef.current.add(toast.id);
+            }}
+            className={`pointer-events-auto px-3 py-2 rounded-lg shadow-lg backdrop-blur-sm transform transition-all duration-300 ease-out ${shouldAnimate ? 'animate-slide-in' : ''} ${
+              hasDetails || (!toast.persistent && !toast.onAction) ? 'cursor-pointer' : ''
+            } ${
+              toast.type === 'success' ? 'bg-[#22c55e]/90 text-white' :
+              toast.type === 'error' ? 'bg-[#ef4444]/90 text-white' :
+              toast.type === 'warning' ? 'bg-[#f59e0b]/90 text-white' :
+              toast.type === 'pink' ? 'bg-[#ec4899]/90 text-white' :
+              'bg-[#3b82f6]/90 text-white'
+            }`}
+            style={toast.persistent ? {
+              borderLeft: '3px solid rgba(255,255,255,0.5)',
+              paddingRight: '8px',
+            } : undefined}
+            onClick={() => {
+              if (hasDetails) {
+                toggleToastDetails(toast.id);
+                return;
+              }
+              if (!toast.persistent && !toast.onAction) removeToast(toast.id);
+            }}
+          >
+            <div className="flex items-start gap-2">
+              {/* ✕ close button — left side for persistent toasts */}
+              {toast.persistent && (
+                <span
+                  className="shrink-0 cursor-pointer rounded-full flex items-center justify-center transition-colors"
+                  style={{
+                    width: '18px',
+                    height: '18px',
+                    fontSize: '11px',
+                    lineHeight: 1,
+                    opacity: 0.95,
+                    background: 'rgba(0,0,0,0.28)',
+                    border: '1px solid rgba(255,255,255,0.35)',
+                    color: '#fff',
+                    marginTop: '1px',
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = 'rgba(0,0,0,0.5)';
+                    e.currentTarget.style.borderColor = 'rgba(255,255,255,0.7)';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = 'rgba(0,0,0,0.28)';
+                    e.currentTarget.style.borderColor = 'rgba(255,255,255,0.35)';
+                  }}
+                  onClick={(e) => { e.stopPropagation(); removeToast(toast.id); }}
+                >
+                  ✕
+                </span>
+              )}
+              {!toast.persistent && (
+                <span className="text-sm shrink-0 leading-none" style={{ marginTop: '2px' }}>
+                  {toast.type === 'success' ? '✓' :
+                   toast.type === 'error' ? '✗' :
+                   toast.type === 'warning' ? '⚠' :
+                   toast.type === 'pink' ? '✦' : 'ℹ'}
+                </span>
+              )}
+              <span className="text-xs font-medium flex-1 leading-snug">
+                {toast.message}
+                {toast.actionLabel && (
                   <span
-                    aria-hidden
-                    className="inline-flex items-center justify-center"
-                    style={{
-                      width: 16,
-                      height: 16,
-                      borderRadius: 4,
-                      background: '#6e40c9',
-                      color: '#fff',
-                      verticalAlign: 'middle',
+                    className="cursor-pointer underline decoration-white/50 hover:decoration-white ml-1 inline-flex items-center gap-1 align-middle"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (toast.onAction) toast.onAction();
+                      removeToast(toast.id);
                     }}
                   >
-                    <Github size={11} strokeWidth={2.4} />
+                    {toast.actionIcon === 'github-desktop' && (
+                      <span
+                        aria-hidden
+                        className="inline-flex items-center justify-center"
+                        style={{
+                          width: 16,
+                          height: 16,
+                          borderRadius: 4,
+                          background: '#6e40c9',
+                          color: '#fff',
+                          verticalAlign: 'middle',
+                        }}
+                      >
+                        <Github size={11} strokeWidth={2.4} />
+                      </span>
+                    )}
+                    {toast.actionLabel}
                   </span>
                 )}
-                {toast.actionLabel}
               </span>
+              {hasDetails && (
+                <span
+                  aria-label={expanded ? 'Свернуть детали' : 'Показать детали'}
+                  aria-expanded={expanded}
+                  className="shrink-0 rounded flex items-center justify-center hover:bg-white/20 transition-colors"
+                  style={{
+                    width: '20px',
+                    height: '20px',
+                    border: '1px solid rgba(255,255,255,0.3)',
+                    opacity: 0.86,
+                  }}
+                >
+                  {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                </span>
+              )}
+              {/* Copy button — right side, only if toast has copyText */}
+              {toast.copyText && (
+                <span
+                  className="shrink-0 cursor-pointer rounded flex items-center justify-center hover:bg-white/20 transition-colors"
+                  style={{ padding: '2px 5px', fontSize: '10px', opacity: 0.7, border: '1px solid rgba(255,255,255,0.3)', borderRadius: '4px' }}
+                  onMouseEnter={(e) => { e.currentTarget.style.opacity = '1'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.opacity = '0.7'; }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const { clipboard } = window.require('electron');
+                    clipboard.writeText(toast.copyText!);
+                    e.currentTarget.textContent = 'ok';
+                    setTimeout(() => { if (e.currentTarget) e.currentTarget.textContent = 'copy'; }, 800);
+                  }}
+                >
+                  copy
+                </span>
+              )}
+            </div>
+            {expanded && (
+              <div
+                className="mt-2 text-xs leading-snug"
+                style={{
+                  paddingTop: '8px',
+                  borderTop: '1px solid rgba(255,255,255,0.22)',
+                  color: 'rgba(255,255,255,0.92)',
+                }}
+              >
+                {details}
+              </div>
             )}
-          </span>
-          {/* Copy button — right side, only if toast has copyText */}
-          {toast.copyText && (
-            <span
-              className="shrink-0 cursor-pointer rounded flex items-center justify-center hover:bg-white/20 transition-colors"
-              style={{ padding: '2px 5px', fontSize: '10px', opacity: 0.7, border: '1px solid rgba(255,255,255,0.3)', borderRadius: '4px' }}
-              onMouseEnter={(e) => { e.currentTarget.style.opacity = '1'; }}
-              onMouseLeave={(e) => { e.currentTarget.style.opacity = '0.7'; }}
-              onClick={(e) => {
-                e.stopPropagation();
-                const { clipboard } = window.require('electron');
-                clipboard.writeText(toast.copyText!);
-                e.currentTarget.textContent = 'ok';
-                setTimeout(() => { if (e.currentTarget) e.currentTarget.textContent = 'copy'; }, 800);
-              }}
-            >
-              copy
-            </span>
-          )}
-        </div>
-      ))}
+          </div>
+        );
+      })}
       <DictationBackgroundStatus />
     </div>
   );

@@ -8863,7 +8863,47 @@ function codexCanonicalUserMessageMatch(audit, actualText) {
   if (trimStartExpected !== expected && actual === trimStartExpected) {
     return { reason: 'codex_trimmed_leading_whitespace' };
   }
+  const payload = audit?.actualPayload || null;
+  const imagePaths = collectCodexPayloadImagePaths(payload);
+  if ((imagePaths.length > 0 || codexPromptHasImageMarker(expected) || codexPromptHasImageMarker(actual))
+    && normalizeCodexPromptImageSlots(expected, imagePaths) === normalizeCodexPromptImageSlots(actual, imagePaths)) {
+    return { reason: 'codex_image_placeholder_canonical' };
+  }
   return null;
+}
+
+function collectCodexPayloadImagePaths(payload) {
+  const paths = [];
+  const add = (value) => {
+    if (typeof value !== 'string') return;
+    const trimmed = value.trim();
+    if (trimmed) paths.push(trimmed);
+  };
+  if (payload && typeof payload === 'object') {
+    if (Array.isArray(payload.local_images)) payload.local_images.forEach(add);
+    if (Array.isArray(payload.images)) payload.images.forEach(add);
+  }
+  return paths;
+}
+
+function codexPromptHasImageMarker(text) {
+  return /\[(?:Image(?:\s+#?\d+)?|imagePath:\s*[^\]\r\n]+?|imageError:\s*[^\]\r\n]+?|image:\s*[^\]\r\n]+?)\]/i.test(String(text || ''));
+}
+
+function normalizeCodexPromptImageSlots(text, imagePaths = []) {
+  let value = String(text || '');
+  const sortedPaths = [...new Set((imagePaths || []).filter(Boolean))]
+    .sort((a, b) => String(b).length - String(a).length);
+  for (const imagePath of sortedPaths) {
+    value = value.split(String(imagePath)).join(' [Image] ');
+  }
+  return value
+    .replace(/\[imagePath:\s*[^\]\r\n]+?\s*\]/gi, ' [Image] ')
+    .replace(/\[imageError:\s*[^\]\r\n]+?\s*\]/gi, ' [Image] ')
+    .replace(/\[image:\s*[^\]\r\n]+?\s*\]/gi, ' [Image] ')
+    .replace(/\[Image(?:\s+#?\d+)?\]/gi, ' [Image] ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function finishClaudePasteAudit(tabId, audit, result) {
@@ -9298,6 +9338,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   // it — but a disabled button gives the user immediate feedback that nothing
   // will happen mid-stream.
   const broadcastTabId = findTabIdForTerm(term);
+  const isCodexPasteSource = !!(source && String(source).startsWith('codex-'));
   let codexPromptInFlightState = null;
   const emitBusy = (busy) => {
     if (!broadcastTabId) {
@@ -9311,6 +9352,24 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   };
   emitBusy(true);
   try {
+  if (isCodexPasteSource) {
+    const prepared = prepareCodexImagePathMarkersForPaste(broadcastTabId, content, source || 'codex-paste');
+    if (prepared.replaced > 0 || prepared.missing.length > 0) {
+      console.log(logPrefix + ' [CodexImagePathPaste] markers=' + prepared.replaced
+        + ' staged=' + prepared.staged.length
+        + ' missing=' + prepared.missing.length
+        + ' source=' + (source || '-'));
+    }
+    if (prepared.missing.length > 0) {
+      return {
+        success: false,
+        error: 'codex_image_path_unavailable',
+        submitted: false,
+        imagePathErrors: prepared.missing,
+      };
+    }
+    content = prepared.text;
+  }
 
   // Chunking strategy:
   //   fast=true  (Gemini/bash) — split by CHUNK_MAX, write back-to-back, no waits.
@@ -9345,7 +9404,6 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   const resolvedSubmitLabel = submitLabel || (submitSequence === '\t' ? 'Tab' : (submitSequence === '\r' ? 'Enter' : JSON.stringify(submitSequence)));
   let stagedClaudeAudit = null;
   let stagedCodexAudit = null;
-  const isCodexPasteSource = !!(source && String(source).startsWith('codex-'));
   const shouldVerifyCodexVisibleDraft = !!(verifyCodexVisibleDraftBeforeSubmit && submit && isCodexPasteSource && !fast && broadcastTabId);
   codexPromptInFlightState = submit && isCodexPasteSource && broadcastTabId && submitSequence !== '\t'
     ? beginCodexPromptInFlight(broadcastTabId, 'safe-paste-submit', { source, handoffId })
@@ -10063,6 +10121,47 @@ async function stageCodexImagePathForTab(tabId, filePath) {
   }
   rememberCodexClipboardImagePath(tabId, candidate);
   return { success: true, path: candidate, size: st.size };
+}
+
+function stageCodexImagePathForPasteSync(tabId, filePath) {
+  const candidate = typeof filePath === 'string' ? filePath.trim() : '';
+  if (!candidate || !path.isAbsolute(candidate)) {
+    return { success: false, error: 'invalid_path', path: candidate || null };
+  }
+  if (!/\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(candidate)) {
+    return { success: false, error: 'unsupported_image_path', path: candidate };
+  }
+  let st = null;
+  try { st = fs.statSync(candidate); } catch {}
+  if (!st || !st.isFile()) {
+    return { success: false, error: 'image_path_missing', path: candidate };
+  }
+  rememberCodexClipboardImagePath(tabId, candidate);
+  return { success: true, path: candidate, size: st.size };
+}
+
+function prepareCodexImagePathMarkersForPaste(tabId, text, source = 'codex-paste') {
+  const staged = [];
+  const missing = [];
+  let replaced = 0;
+  const prepared = String(text || '').replace(/\[imagePath:\s*([^\]\r\n]+?)\s*\]/gi, (match, rawPath) => {
+    replaced += 1;
+    const result = stageCodexImagePathForPasteSync(tabId, rawPath);
+    if (result.success) {
+      staged.push({ path: result.path, size: result.size });
+      return result.path;
+    }
+    missing.push({ path: result.path || String(rawPath || '').trim(), error: result.error || 'stage_failed' });
+    return match;
+  });
+  if (replaced > 0) {
+    console.log('[codex:image-path-paste] tab=' + String(tabId || 'unknown').slice(-12)
+      + ' source=' + source
+      + ' markers=' + replaced
+      + ' staged=' + staged.length
+      + ' missing=' + missing.length);
+  }
+  return { text: prepared, replaced, staged, missing };
 }
 
 ipcMain.handle('codex:stage-image-path', async (_event, { tabId, filePath } = {}) => {
@@ -11188,6 +11287,88 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       .trim();
   }
 
+  function claudePromptHasImageMarker(text) {
+    return /\[(?:Image(?:\s+#?\d+)?|imageError:\s*[^\]\r\n]+?)\]/i.test(String(text || ''));
+  }
+
+  function normalizeClaudePromptImageSlots(text) {
+    return normalizeCandidate(String(text || '')
+      .replace(/\[imageError:\s*[^\]\r\n]+?\]/gi, ' [Image] ')
+      .replace(/\[Image(?:\s+#?\d+)?\]/gi, ' [Image] '));
+  }
+
+  function buildClaudeHistoryDraftFromGrab(text, imagePaths = []) {
+    const resolvedById = new Map();
+    for (const ref of Array.isArray(imagePaths) ? imagePaths : []) {
+      const id = Number(ref?.id);
+      if (Number.isFinite(id) && ref?.path) resolvedById.set(id, ref);
+    }
+    let imageCount = 0;
+    let resolvedImages = 0;
+    let missingImages = 0;
+    const draftText = String(text || '').replace(/\[Image\s+#?(\d+)\]/g, (match, rawId) => {
+      imageCount += 1;
+      const id = Number(rawId);
+      if (Number.isFinite(id) && resolvedById.has(id)) {
+        resolvedImages += 1;
+        return match;
+      }
+      missingImages += 1;
+      return '[imageError: claude_image_path_unavailable #' + rawId + ']';
+    });
+    const draftImages = [...resolvedById.values()].filter((ref) => draftText.includes('[Image #' + ref.id + ']'));
+    return {
+      text: draftText,
+      images: draftImages,
+      imageCount,
+      resolvedImages,
+      missingImages,
+      warning: missingImages > 0
+        ? 'Claude Rewind вернул prompt с картинкой, но файл картинки уже недоступен. В draft оставлен imageError вместо тихой отправки текста.'
+        : imageCount > 0
+          ? 'Claude Rewind вернул prompt с картинкой. History сохранила маркер, но не отправит его как обычный текст; проверь вложение перед отправкой.'
+          : '',
+    };
+  }
+
+  function compareClaudeRestoredPrompt(expectedText, restoredText, grabResult) {
+    const expected = normalizeCandidate(expectedText);
+    const restored = normalizeCandidate(restoredText);
+    const draft = buildClaudeHistoryDraftFromGrab(restoredText, grabResult?.imagePaths || []);
+    if (expected && restored === expected) {
+      return {
+        matched: true,
+        mode: draft.imageCount > 0 ? 'exact-with-image-slots' : 'exact',
+        historyDraftText: draft.text,
+        historyDraftImages: draft.images,
+        historyDraftWarning: draft.warning,
+      };
+    }
+    const hasImageShape = claudePromptHasImageMarker(expectedText)
+      || claudePromptHasImageMarker(restoredText)
+      || draft.imageCount > 0;
+    if (hasImageShape) {
+      const expectedImageIdentity = normalizeClaudePromptImageSlots(expectedText);
+      const restoredImageIdentity = normalizeClaudePromptImageSlots(restoredText);
+      if (expectedImageIdentity && expectedImageIdentity === restoredImageIdentity) {
+        return {
+          matched: true,
+          mode: draft.resolvedImages > 0 ? 'image-slot-with-cache-path' : 'image-slot',
+          historyDraftText: draft.text,
+          historyDraftImages: draft.images,
+          historyDraftWarning: draft.warning,
+        };
+      }
+    }
+    return {
+      matched: !expected && restored.length === 0,
+      mode: !expected && restored.length === 0 ? 'empty' : 'mismatch',
+      historyDraftText: draft.text,
+      historyDraftImages: draft.images,
+      historyDraftWarning: draft.warning,
+    };
+  }
+
   function isMenuChrome(text) {
     const t = normalizeCandidate(text);
     const packed = t.replace(/\s+/g, '').toLowerCase();
@@ -11422,7 +11603,6 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
   }
 
   async function grabRestoredRewindInput(expectedText) {
-    const expected = normalizeCandidate(expectedText);
     const delays = [0, 180, 420, 900];
     let lastResult = null;
     for (let attempt = 0; attempt < delays.length; attempt++) {
@@ -11431,11 +11611,15 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       lastResult = result;
       const text = typeof result?.text === 'string' ? result.text : '';
       const normalized = normalizeCandidate(text);
-      const matched = expected ? normalized === expected : normalized.length === 0;
+      const comparison = compareClaudeRestoredPrompt(expectedText, text, result);
+      const matched = comparison.matched;
       console.log('[Claude:Rewind] Grab restored input attempt=' + (attempt + 1)
         + ' success=' + (result?.success === true)
         + ' chars=' + text.length
         + ' matchedTarget=' + matched
+        + ' matchMode=' + (comparison.mode || '-')
+        + ' images=' + Number(result?.images || 0)
+        + ' imagePaths=' + (Array.isArray(result?.imagePaths) ? result.imagePaths.length : 0)
         + ' expectedHash=' + pasteAuditHash(expectedText)
         + ' actualHash=' + pasteAuditHash(text)
         + ' expectedHead="' + pasteAuditPreview(expectedText) + '"'
@@ -11444,10 +11628,29 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
         + ' error=' + (result?.error || '-'));
 
       if (result?.success && normalized.length > 0) {
-        return { success: true, text, attempt: attempt + 1, matchedTarget: matched };
+        return {
+          success: true,
+          text,
+          attempt: attempt + 1,
+          matchedTarget: matched,
+          matchMode: comparison.mode,
+          historyDraftText: comparison.historyDraftText,
+          historyDraftImages: comparison.historyDraftImages,
+          historyDraftWarning: comparison.historyDraftWarning,
+        };
       }
       if (result?.success && attempt === delays.length - 1) {
-        return { success: true, text, attempt: attempt + 1, matchedTarget: matched, empty: true };
+        return {
+          success: true,
+          text,
+          attempt: attempt + 1,
+          matchedTarget: matched,
+          empty: true,
+          matchMode: comparison.mode,
+          historyDraftText: comparison.historyDraftText,
+          historyDraftImages: comparison.historyDraftImages,
+          historyDraftWarning: comparison.historyDraftWarning,
+        };
       }
       if (!result?.success && !['already_in_progress', 'claude_busy', 'editor_not_wired'].includes(result?.error)) {
         break;
@@ -11910,6 +12113,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       await writeAndWait('\r', /\x1b\[\?2026l|\x1b\]7777;prompt:|[⏵❯╰]/, 6000, '[Claude:Rewind:confirm]');
       await waitForPtyText(term, /\x1b\]7777;prompt:|[⏵❯╰]|\x1b\[\?2026l/, 5000, '[Claude:Rewind:prompt]');
 
+      let restoredHistoryDraft = null;
       if (pasteAfter && typeof pasteAfter === 'string' && pasteAfter.length > 0) {
         console.log('[Claude:Rewind] Pasting AI compact text (' + pasteAfter.length + ' chars)');
         const pasteResult = await _safePasteAndSubmitInner(term, pasteAfter, {
@@ -11952,7 +12156,9 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
         } else {
           console.log('[Claude:Rewind] Terminal input grabbed+cleared chars=' + (grabResult.text ? grabResult.text.length : 0)
             + ' matchedTarget=' + grabResult.matchedTarget
+            + ' matchMode=' + (grabResult.matchMode || '-')
             + ' attempt=' + grabResult.attempt);
+          restoredHistoryDraft = grabResult;
           markClaudeEditableLastPrompt(tabId, {
             sessionId: bridgeKnownSessions.get(tabId) || null,
             targetUuid,
@@ -11971,6 +12177,10 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
         restoredInput: false,
         historyInputDraft: !pasteAfter && !!targetInputText,
         deliveryStatus: !pasteAfter && !!targetInputText ? 'editable-last-prompt' : undefined,
+        historyDraftText: restoredHistoryDraft?.historyDraftText || restoredHistoryDraft?.text || targetInputText,
+        historyDraftImages: Array.isArray(restoredHistoryDraft?.historyDraftImages) ? restoredHistoryDraft.historyDraftImages : undefined,
+        historyDraftWarning: restoredHistoryDraft?.historyDraftWarning || '',
+        restoredMatchMode: restoredHistoryDraft?.matchMode || '',
       };
     });
   } catch (err) {
@@ -11998,6 +12208,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
   targetIndex,
   targetText,
   targetFullText,
+  targetUuid,
   rewindableCount,
   skipDuplicates = 0,
   pasteAfter,
@@ -12038,6 +12249,120 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
 
   function normalizeCandidate(text) {
     return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function codexUserUuidForRecord(sessionId, record) {
+    return 'codex-user-' + (sessionId || 'unknown') + '-' + record.__line;
+  }
+
+  async function loadCodexRewindTargetPayload() {
+    const resolvedSessionId = getCodexRuntimeSessionId(tabId) || codexSessionIdFromDb(tabId);
+    if (!resolvedSessionId || !targetUuid) return null;
+    const cwd = terminalProjects.get(tabId);
+    try {
+      const loaded = await codexDataModule._api.loadSessionRecords(resolvedSessionId, cwd);
+      if (!loaded?.success) {
+        console.warn('[Codex:Rewind] target payload load failed session=' + String(resolvedSessionId).slice(0, 8)
+          + ' error=' + (loaded?.error || 'unknown'));
+        return null;
+      }
+      for (const record of loaded.records || []) {
+        const payload = record?.payload || {};
+        if (record?.type !== 'event_msg' || payload.type !== 'user_message') continue;
+        if (codexUserUuidForRecord(resolvedSessionId, record) === targetUuid) {
+          const imagePaths = collectCodexPayloadImagePaths(payload);
+          console.log('[Codex:Rewind] target payload found uuid=' + String(targetUuid).slice(0, 48)
+            + ' line=' + record.__line
+            + ' messageLen=' + String(payload.message || '').length
+            + ' images=' + imagePaths.length
+            + ' textElements=' + (Array.isArray(payload.text_elements) ? payload.text_elements.length : 0));
+          return { sessionId: resolvedSessionId, sourceLine: record.__line, payload };
+        }
+      }
+      console.warn('[Codex:Rewind] target payload not found uuid=' + String(targetUuid).slice(0, 80)
+        + ' session=' + String(resolvedSessionId).slice(0, 8));
+    } catch (error) {
+      console.warn('[Codex:Rewind] target payload lookup error:', error?.message || error);
+    }
+    return null;
+  }
+
+  function buildCodexHistoryDraftFromPayload(payload, fallbackText) {
+    const baseText = String(payload?.message || fallbackText || '');
+    const imagePaths = collectCodexPayloadImagePaths(payload);
+    let seen = 0;
+    let resolved = 0;
+    let missing = 0;
+    let text = baseText.replace(/\[Image(?:\s+#?(\d+))?\]/gi, (match, rawId) => {
+      const explicitIndex = rawId ? Number(rawId) - 1 : NaN;
+      const pathIndex = Number.isFinite(explicitIndex) && explicitIndex >= 0 ? explicitIndex : seen;
+      const imagePath = imagePaths[pathIndex] || imagePaths[seen] || '';
+      seen += 1;
+      const staged = stageCodexImagePathForPasteSync(tabId, imagePath);
+      if (staged.success) {
+        resolved += 1;
+        return '[imagePath: ' + staged.path + ']';
+      }
+      missing += 1;
+      return '[imageError: codex_image_path_unavailable' + (rawId ? ' #' + rawId : '') + ']';
+    });
+    if (imagePaths.length > seen) {
+      const extra = [];
+      for (let i = seen; i < imagePaths.length; i++) {
+        const staged = stageCodexImagePathForPasteSync(tabId, imagePaths[i]);
+        if (staged.success) {
+          resolved += 1;
+          extra.push('[imagePath: ' + staged.path + ']');
+        } else {
+          missing += 1;
+          extra.push('[imageError: codex_image_path_unavailable #' + (i + 1) + ']');
+        }
+      }
+      if (extra.length > 0) text = [text, ...extra].filter(Boolean).join('\n');
+    }
+    return {
+      text,
+      imageCount: Math.max(imagePaths.length, seen),
+      resolvedImages: resolved,
+      missingImages: missing,
+    };
+  }
+
+  function compareCodexRestoredPrompt(expectedText, restoredText, targetPayload) {
+    const expected = normalizeCandidate(expectedText);
+    const restored = normalizeCandidate(restoredText);
+    const extraChars = Math.max(0, restored.length - expected.length);
+    const containsExpected = !!(expected && restored.includes(expected));
+    if (expected && restored === expected) {
+      return { matched: true, mode: 'exact', containsExpected, extraChars };
+    }
+    if (expected && containsExpected && extraChars <= Math.max(80, Math.floor(expected.length * 0.5))) {
+      return { matched: true, mode: 'contains-target', containsExpected, extraChars };
+    }
+
+    const expectedImageIdentity = normalizeCodexPromptImageSlots(expectedText, collectCodexPayloadImagePaths(targetPayload));
+    const restoredImageIdentity = normalizeCodexPromptImageSlots(restoredText, collectCodexPayloadImagePaths(targetPayload));
+    const hasImageShape = codexPromptHasImageMarker(expectedText)
+      || codexPromptHasImageMarker(restoredText)
+      || collectCodexPayloadImagePaths(targetPayload).length > 0;
+    if (hasImageShape && expectedImageIdentity && expectedImageIdentity === restoredImageIdentity) {
+      const draft = buildCodexHistoryDraftFromPayload(targetPayload, expectedText);
+      return {
+        matched: true,
+        mode: draft.resolvedImages > 0 ? 'image-slot-with-rollout-path' : 'image-slot',
+        containsExpected,
+        extraChars,
+        historyDraftText: draft.text,
+        historyDraftWarning: draft.missingImages > 0
+          ? 'Codex вернул prompt с картинкой, но сохранённый путь картинки недоступен. В draft оставлен явный imageError.'
+          : '',
+        imageCount: draft.imageCount,
+        resolvedImages: draft.resolvedImages,
+        missingImages: draft.missingImages,
+      };
+    }
+
+    return { matched: false, mode: 'mismatch', containsExpected, extraChars };
   }
 
   function stripCodexRewindOverlayChrome(clean) {
@@ -12145,10 +12470,17 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     const expected = normalizeCandidate(expectedText);
     const anchors = buildCodexRewindAnchors(expectedText);
     const shortAnchors = buildCodexShortRewindAnchors(expectedText);
-    const matchedAnchor = anchors.find(anchor => activeText.includes(normalizeCandidate(anchor))) || '';
+    const activePrefix = activePromptText.slice(0, Math.min(96, activePromptText.length)).trim();
+    const activePrefixWords = activePrefix.split(/\s+/).filter(Boolean);
+    const prefixContradictsTarget = activePrefix.length >= 16
+      && activePrefixWords.length >= 3
+      && !expected.startsWith(activePrefix);
+    const matchedAnchor = prefixContradictsTarget
+      ? ''
+      : anchors.find(anchor => activeText.includes(normalizeCandidate(anchor))) || '';
     const matchedShortAnchor = matchedAnchor
       ? ''
-      : shortAnchors.find(anchor => activeText.includes(normalizeCandidate(anchor))) || '';
+      : (prefixContradictsTarget ? '' : shortAnchors.find(anchor => activeText.includes(normalizeCandidate(anchor))) || '');
     const activeWords = activePromptText.split(/\s+/).filter(Boolean);
     const matchedVisibleLineAnchor = (matchedAnchor || matchedShortAnchor)
       ? ''
@@ -12162,15 +12494,16 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     return {
       success: snapshot?.success === true,
       error: snapshot?.error || '',
-      matched: !!(matchedAnchor || matchedShortAnchor || matchedVisibleLineAnchor),
+      matched: !prefixContradictsTarget && !!(matchedAnchor || matchedShortAnchor || matchedVisibleLineAnchor),
       anchor: matchedAnchor || matchedShortAnchor || matchedVisibleLineAnchor || '',
       anchorCount: anchors.length + shortAnchors.length,
-      anchorMode: matchedAnchor ? 'active-long' : (matchedShortAnchor ? 'active-short-prompt' : (matchedVisibleLineAnchor ? 'active-visible-prefix' : 'active-none')),
+      anchorMode: prefixContradictsTarget ? 'active-prefix-contradicts-target' : (matchedAnchor ? 'active-long' : (matchedShortAnchor ? 'active-short-prompt' : (matchedVisibleLineAnchor ? 'active-visible-prefix' : 'active-none'))),
       targetAfterSelected: false,
       nextPromptAnchor: '',
       activePromptRow: active?.row ?? null,
       activePromptPreview: activeText.slice(0, 220),
       activePromptStyles: Array.isArray(active?.styles) ? active.styles.slice(0, 4) : [],
+      prefixContradictsTarget,
     };
   }
 
@@ -12345,6 +12678,110 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     return /esc\s+again\s+to\s+edit\s+previous\s+message/i.test(String(clean || ''));
   }
 
+  function codexTranscriptOverlayObserved(clean) {
+    return /No previous message to edit|T R A N S C R I P T|enter to edit message/i.test(String(clean || ''));
+  }
+
+  function codexRewindProtocolChromeObserved(clean) {
+    const compact = normalizeCandidate(clean).toLowerCase();
+    if (!compact) return false;
+    return codexPrimeHintObserved(clean)
+      || codexTranscriptOverlayObserved(clean)
+      || compact === 'q'
+      || /^q\s+to\s+quit\b/i.test(compact)
+      || /edit prev|edit next|esc\/←|enter to edit message/i.test(compact);
+  }
+
+  function getCodexSnapshotVisibleText(snapshot) {
+    const lines = Array.isArray(snapshot?.lines) ? snapshot.lines : [];
+    return lines.map(line => String(line?.text || '')).join('\n');
+  }
+
+  async function probeCodexRewindStartState(reason) {
+    const snapshot = await requestTerminalVisibleBufferSnapshot(
+      _event.sender,
+      tabId,
+      'codex-rewind-start-' + reason,
+      700
+    );
+    const visibleText = snapshot?.success ? getCodexSnapshotVisibleText(snapshot) : '';
+    const readyInspection = visibleText
+      ? inspectCodexInputReadyVisibleText(visibleText, 'codex-rewind-start-' + reason)
+      : null;
+    const hasTranscript = codexTranscriptOverlayObserved(visibleText);
+    const hasPrimeHint = codexPrimeHintObserved(visibleText);
+    const hasProtocolChrome = codexRewindProtocolChromeObserved(visibleText);
+    const state = !snapshot?.success
+      ? 'snapshot-unavailable'
+      : hasTranscript
+        ? 'rewind-overlay'
+        : (hasPrimeHint || hasProtocolChrome)
+          ? 'rewind-protocol'
+          : readyInspection?.ready === true
+            ? 'clean-composer'
+            : 'not-ready';
+    return {
+      state,
+      snapshotSuccess: snapshot?.success === true,
+      snapshotError: snapshot?.error || '',
+      snapshotSource: snapshot?.source || '',
+      ready: readyInspection?.ready === true,
+      readyReason: readyInspection?.reason || '',
+      blockers: Array.isArray(readyInspection?.blockers) ? readyInspection.blockers.slice() : [],
+      hasTranscript,
+      hasPrimeHint,
+      hasProtocolChrome,
+      preview: normalizeCandidate(visibleText).slice(0, 260),
+    };
+  }
+
+  async function closeCodexRewindProtocolUi(reason) {
+    console.log('[Codex:Rewind] closing stale protocol UI with q reason=' + reason);
+    try { term.write('q'); } catch {}
+    const raw = await drainPtyData(term, 120, 600);
+    console.log('[Codex:Rewind] close protocol UI done reason=' + reason + ' rawBytes=' + String(raw || '').length);
+  }
+
+  async function ensureCodexRewindCleanStart(reason) {
+    let startState = await probeCodexRewindStartState(reason);
+    console.log('[Codex:Rewind] start-state reason=' + reason
+      + ' state=' + startState.state
+      + ' snapshot=' + startState.snapshotSuccess
+      + ' source=' + (startState.snapshotSource || '-')
+      + ' ready=' + startState.ready
+      + ' readyReason=' + (startState.readyReason || '-')
+      + ' blockers=' + (startState.blockers.length ? startState.blockers.join('+') : '-')
+      + ' preview=' + JSON.stringify(startState.preview));
+    if (startState.state === 'rewind-overlay' || startState.state === 'rewind-protocol') {
+      await closeCodexRewindProtocolUi('preflight-' + reason);
+      startState = await probeCodexRewindStartState(reason + '-after-close');
+      console.log('[Codex:Rewind] start-state after close reason=' + reason
+        + ' state=' + startState.state
+        + ' snapshot=' + startState.snapshotSuccess
+        + ' source=' + (startState.snapshotSource || '-')
+        + ' ready=' + startState.ready
+        + ' readyReason=' + (startState.readyReason || '-')
+        + ' preview=' + JSON.stringify(startState.preview));
+    }
+    if (startState.state === 'snapshot-unavailable') {
+      console.warn('[Codex:Rewind] start-state snapshot unavailable; falling back to first-Esc proof tab=' + String(tabId).slice(-12)
+        + ' error=' + (startState.snapshotError || '-'));
+      return { success: true, startState };
+    }
+    if (startState.state !== 'clean-composer') {
+      return {
+        success: false,
+        error: 'codex_rewind_start_state_not_clean',
+        startState: startState.state,
+        readyReason: startState.readyReason,
+        blockers: startState.blockers,
+        preview: startState.preview,
+        rollbackMayHaveApplied: false,
+      };
+    }
+    return { success: true, startState };
+  }
+
   function throwIfCodexRewindCancelled(stage) {
     if (rewindCancelTabs.has(tabId)) {
       console.log('[Codex:Rewind] Cancelled at stage=' + stage);
@@ -12352,7 +12789,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     }
   }
 
-  async function grabRestoredCodexRewindInput(expectedText) {
+  async function grabRestoredCodexRewindInput(expectedText, targetPayload) {
     const expected = normalizeCandidate(expectedText);
     const delays = [0, 180, 420, 900, 1600, 2600];
     let lastResult = null;
@@ -12362,24 +12799,44 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       lastResult = result;
       const text = typeof result?.text === 'string' ? result.text : '';
       const normalized = normalizeCandidate(text);
-      const extraChars = Math.max(0, normalized.length - expected.length);
-      const containsExpected = !!(expected && normalized.includes(expected));
-      const matched = expected
-        ? (normalized === expected || (containsExpected && extraChars <= Math.max(80, Math.floor(expected.length * 0.5))))
-        : normalized.length === 0;
+      const comparison = expected
+        ? compareCodexRestoredPrompt(expectedText, text, targetPayload)
+        : { matched: normalized.length === 0, mode: normalized.length === 0 ? 'empty-expected' : 'mismatch', containsExpected: false, extraChars: normalized.length };
+      const matched = comparison.matched === true;
       console.log('[Codex:Rewind] Grab restored input attempt=' + (attempt + 1)
         + ' success=' + (result?.success === true)
         + ' chars=' + text.length
         + ' matchedTarget=' + matched
-        + ' containsTarget=' + containsExpected
-        + ' extraChars=' + extraChars
+        + ' mode=' + (comparison.mode || '-')
+        + ' containsTarget=' + !!comparison.containsExpected
+        + ' extraChars=' + (comparison.extraChars || 0)
+        + ' images=' + (comparison.imageCount || 0)
+        + ' resolvedImages=' + (comparison.resolvedImages || 0)
+        + ' missingImages=' + (comparison.missingImages || 0)
         + ' error=' + (result?.error || '-'));
 
       if (result?.success && normalized.length > 0) {
-        return { success: true, text, attempt: attempt + 1, matchedTarget: matched };
+        return {
+          success: true,
+          text,
+          attempt: attempt + 1,
+          matchedTarget: matched,
+          matchMode: comparison.mode,
+          historyDraftText: comparison.historyDraftText,
+          historyDraftWarning: comparison.historyDraftWarning,
+        };
       }
       if (result?.success && attempt === delays.length - 1) {
-        return { success: true, text, attempt: attempt + 1, matchedTarget: matched, empty: true };
+        return {
+          success: true,
+          text,
+          attempt: attempt + 1,
+          matchedTarget: matched,
+          matchMode: comparison.mode,
+          historyDraftText: comparison.historyDraftText,
+          historyDraftWarning: comparison.historyDraftWarning,
+          empty: true,
+        };
       }
       if (!result?.success && !['already_in_progress', 'codex_ctrl_g_noop', 'editor_not_wired'].includes(result?.error)) {
         break;
@@ -12406,6 +12863,8 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       const targetInputText = String(targetFullText || targetText || '').trim();
       if (!targetInputText) return { success: false, error: 'empty_target' };
       const hasPasteAfter = typeof pasteAfter === 'string' && pasteAfter.length > 0;
+      const targetPayloadContext = await loadCodexRewindTargetPayload();
+      const targetPayload = targetPayloadContext?.payload || null;
 
       async function pasteCodexRewindAiCompact(reason) {
         console.log('[Codex:Rewind] Pasting AI compact text (' + pasteAfter.length + ' chars, reason=' + reason + ', preview=' + JSON.stringify(String(pasteAfter).slice(0, 120)) + ')');
@@ -12443,51 +12902,96 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         + ' rollbackTurns=' + rollbackTurns
         + ' target=' + JSON.stringify(String(targetText || targetInputText).slice(0, 80)));
 
-      throwIfCodexRewindCancelled('before-prime');
-      let primeFrame = await sendCodexKeyAndCapture(
-        term,
-        '\x1b',
-        2200,
-        '[Codex:Rewind:prime:initial]',
-        (clean) => codexPrimeHintObserved(clean)
-      );
-      let hasPrimeHint = !primeFrame.timedOut && codexPrimeHintObserved(primeFrame.clean);
-      console.log('[Codex:Rewind] prime initial timedOut=' + primeFrame.timedOut + ' hint=' + hasPrimeHint + ' clean=' + JSON.stringify(primeFrame.clean.slice(0, 220)));
+      const initialStartState = await ensureCodexRewindCleanStart('before-prime');
+      if (!initialStartState.success) return initialStartState;
 
-      if (!hasPrimeHint) {
-        const hadReady = codexTuiReadyTabs.has(tabId);
-        clearCodexTuiReady(tabId, 'codex-rewind-prime-hint-missing');
-        console.warn('[Codex:Rewind] prime hint missing; cleared input-ready tab=' + String(tabId).slice(-12)
-          + ' hadReady=' + hadReady
+      async function openCodexRewindOverlayFromComposer(attemptLabel) {
+        throwIfCodexRewindCancelled('before-prime-' + attemptLabel);
+        const primeFrame = await sendCodexKeyAndCapture(
+          term,
+          '\x1b',
+          2200,
+          '[Codex:Rewind:prime:' + attemptLabel + ']',
+          (clean) => codexPrimeHintObserved(clean)
+            || codexTranscriptOverlayObserved(clean)
+            || codexRewindProtocolChromeObserved(clean)
+        );
+        const hasPrimeHint = !primeFrame.timedOut && codexPrimeHintObserved(primeFrame.clean);
+        const openedDirectly = !primeFrame.timedOut && codexTranscriptOverlayObserved(primeFrame.clean);
+        const protocolChrome = codexRewindProtocolChromeObserved(primeFrame.clean);
+        console.log('[Codex:Rewind] prime ' + attemptLabel
           + ' timedOut=' + primeFrame.timedOut
-          + ' rawBytes=' + String(primeFrame.raw || '').length);
-        _webBroadcast(tabId, {
-          type: 'snapshot',
-          sessionId: getCodexRuntimeSessionId(tabId),
-          busy: false,
-          sessionStatus: 'starting',
-          toolType: 'codex',
-          commandType: 'codex',
-          inputReady: false,
-          reason: 'codex-rewind-prime-hint-missing',
-        });
-        return { success: false, error: 'codex_rewind_prime_hint_not_observed', clean: primeFrame.clean.slice(0, 800) };
+          + ' hint=' + hasPrimeHint
+          + ' directOpen=' + openedDirectly
+          + ' protocolChrome=' + protocolChrome
+          + ' clean=' + JSON.stringify(primeFrame.clean.slice(0, 220)));
+
+        if (/No previous message to edit/i.test(primeFrame.clean)) {
+          return { success: false, error: 'no_previous_message', rollbackMayHaveApplied: false };
+        }
+        if (openedDirectly) {
+          return { success: true, openFrame: primeFrame, directOpen: true };
+        }
+        if (!hasPrimeHint) {
+          console.warn('[Codex:Rewind] prime hint missing without clearing Codex readiness tab=' + String(tabId).slice(-12)
+            + ' attempt=' + attemptLabel
+            + ' timedOut=' + primeFrame.timedOut
+            + ' protocolChrome=' + protocolChrome
+            + ' rawBytes=' + String(primeFrame.raw || '').length);
+          return {
+            success: false,
+            error: 'codex_rewind_prime_hint_not_observed',
+            clean: primeFrame.clean.slice(0, 800),
+            protocolChrome,
+            rollbackMayHaveApplied: false,
+          };
+        }
+
+        const openFrame = await sendCodexKeyAndCapture(
+          term,
+          '\x1b',
+          4000,
+          '[Codex:Rewind:open:' + attemptLabel + ']',
+          (clean) => codexTranscriptOverlayObserved(clean)
+        );
+        console.log('[Codex:Rewind] open Esc ' + attemptLabel + ' timedOut=' + openFrame.timedOut + ' clean=' + JSON.stringify(openFrame.clean.slice(0, 260)));
+        if (/No previous message to edit/i.test(openFrame.clean)) {
+          return { success: false, error: 'no_previous_message', rollbackMayHaveApplied: false };
+        }
+        if (openFrame.timedOut || !codexTranscriptOverlayObserved(openFrame.clean || '')) {
+          if (codexRewindProtocolChromeObserved(openFrame.clean)) {
+            await closeCodexRewindProtocolUi('transcript-not-observed-' + attemptLabel);
+          }
+          return {
+            success: false,
+            error: 'codex_rewind_transcript_not_observed',
+            clean: openFrame.clean.slice(0, 800),
+            rollbackMayHaveApplied: false,
+          };
+        }
+        return { success: true, openFrame };
       }
 
-      const openFrame = await sendCodexKeyAndCapture(
-        term,
-        '\x1b',
-        4000,
-        '[Codex:Rewind:open]',
-        (clean) => /No previous message to edit|T R A N S C R I P T|enter to edit message/i.test(clean)
-      );
-      console.log('[Codex:Rewind] open Esc timedOut=' + openFrame.timedOut + ' clean=' + JSON.stringify(openFrame.clean.slice(0, 260)));
-      if (/No previous message to edit/i.test(openFrame.clean)) {
-        return { success: false, error: 'no_previous_message' };
+      let openAttempt = await openCodexRewindOverlayFromComposer('initial');
+      if (!openAttempt.success
+        && openAttempt.error === 'codex_rewind_prime_hint_not_observed'
+        && openAttempt.protocolChrome === true) {
+        await closeCodexRewindProtocolUi('prime-missing-initial');
+        const retryStartState = await ensureCodexRewindCleanStart('before-prime-retry');
+        if (!retryStartState.success) {
+          return {
+            ...retryStartState,
+            success: false,
+            error: 'codex_rewind_start_state_unstable',
+            cause: retryStartState.error,
+            rollbackMayHaveApplied: false,
+          };
+        }
+        openAttempt = await openCodexRewindOverlayFromComposer('retry');
       }
-      if (openFrame.timedOut || !/T R A N S C R I P T|enter to edit message/i.test(openFrame.clean || '')) {
-        return { success: false, error: 'codex_rewind_transcript_not_observed', clean: openFrame.clean.slice(0, 800) };
-      }
+      if (!openAttempt.success) return openAttempt;
+
+      const openFrame = openAttempt.openFrame;
       codexRewindOverlayOpen = true;
 
       let selectedOlderSteps = null;
@@ -12725,7 +13229,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       await drainPtyData(term, 120, 700);
 
       console.log('[Codex:Rewind] ' + (hasPasteAfter ? 'Clearing restored prompt before AI compact paste' : 'Moving clicked prompt out of terminal input into History draft') + ' (' + targetInputText.length + ' chars)');
-      const grabResult = await grabRestoredCodexRewindInput(targetInputText);
+      const grabResult = await grabRestoredCodexRewindInput(targetInputText, targetPayload);
       if (!grabResult || grabResult.success === false) {
         console.warn('[Codex:Rewind] Could not verify terminal input clear after native backtrack: ' + (grabResult?.error || 'unknown'));
         surfaceConfirmStartupFrameIfUnrecovered('codex-rewind-confirm-grab-failed-startup-frame');
@@ -12739,6 +13243,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       }
       console.log('[Codex:Rewind] Terminal input grabbed+cleared chars=' + (grabResult.text ? grabResult.text.length : 0)
         + ' matchedTarget=' + grabResult.matchedTarget
+        + ' matchMode=' + (grabResult.matchMode || '-')
         + ' attempt=' + grabResult.attempt);
       if (!grabResult.matchedTarget) {
         console.warn('[Codex:Rewind] restored input mismatch restoredPreview='
@@ -12799,6 +13304,11 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         pressCount: escPressCount,
         restoredInput: false,
         historyInputDraft: true,
+        historyDraftText: typeof grabResult.historyDraftText === 'string' && grabResult.historyDraftText.trim()
+          ? grabResult.historyDraftText
+          : targetInputText,
+        historyDraftWarning: grabResult.historyDraftWarning || '',
+        restoredMatchMode: grabResult.matchMode || '',
       };
     });
   } catch (err) {
@@ -17849,7 +18359,7 @@ function processCodexTurnLine(state, line) {
             expectedHash: audit.expectedHash,
           });
         } else {
-          const canonicalMatch = codexCanonicalUserMessageMatch(audit, actualText);
+          const canonicalMatch = codexCanonicalUserMessageMatch({ ...audit, actualPayload: record.payload || null }, actualText);
           if (canonicalMatch) {
             console.warn('[CodexPasteAudit:CANONICAL_MATCH] tab=' + String(state.tabId).slice(-12)
               + ' source=' + (audit.source || '-')

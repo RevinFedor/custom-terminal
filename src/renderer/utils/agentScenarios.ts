@@ -1,7 +1,7 @@
 import type { AgentHistoryTool, AgentPtyStatus, HistoryAgentRuntime } from './historyAgentRuntimes';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './claudeStartupDefaultsReady';
 import { terminalRegistry } from './terminalRegistry';
-import { useUIStore } from '../store/useUIStore';
+import { useUIStore, type HistoryPromptDraftImageRef } from '../store/useUIStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -472,10 +472,13 @@ export async function rewindAgentTimelineScenario({
     deadlineMs: rewindMode === 'ai' ? 170_000 : 16_000,
   });
   if (result?.success && rewindMode === 'native' && toolType === 'claude' && result.historyInputDraft === true) {
-    const targetDraft = String(targetFullText || targetText || '').trim();
+    const targetDraft = String(result.historyDraftText || targetFullText || targetText || '').trim();
     if (targetDraft) {
       const store = useUIStore.getState();
-      store.setHistoryPromptDraft(tabId, targetDraft);
+      const historyDraftImages: HistoryPromptDraftImageRef[] = Array.isArray(result.historyDraftImages)
+        ? result.historyDraftImages
+        : [];
+      store.setHistoryPromptDraft(tabId, targetDraft, historyDraftImages.length > 0 ? { images: historyDraftImages } : undefined);
       if (typeof startUuid === 'string' && startUuid.trim()) {
         const opId = Date.now().toString(36) + '-' + startUuid.slice(0, 8);
         store.setHistoryRewindPreview(tabId, {
@@ -495,6 +498,9 @@ export async function rewindAgentTimelineScenario({
             mode: rewindMode,
             toolType,
             historyInputDraft: true,
+            historyDraftText: targetDraft,
+            historyDraftImages,
+            historyDraftWarning: typeof result.historyDraftWarning === 'string' ? result.historyDraftWarning : undefined,
           },
         }));
       }

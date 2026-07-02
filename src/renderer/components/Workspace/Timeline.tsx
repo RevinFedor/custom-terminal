@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
 import { terminalRegistry } from '../../utils/terminalRegistry';
-import { useUIStore } from '../../store/useUIStore';
+import { useUIStore, type HistoryPromptDraftImageRef } from '../../store/useUIStore';
 import { useWorkspaceStore, type PendingAutoTabTitle } from '../../store/useWorkspaceStore';
 import { TAB_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { generateTabTitleFromPrompt, isEligibleTabTitleEntry, trimTabTitlePrompt } from '../../utils/generateTabTitle';
@@ -3400,15 +3400,29 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       status: 'start' | 'done' | 'failed',
       error?: string,
       message?: string,
-      options: { persisted?: boolean; historyInputDraft?: boolean } = {}
+      options: {
+        persisted?: boolean;
+        historyInputDraft?: boolean;
+        historyDraftText?: string;
+        historyDraftImages?: HistoryPromptDraftImageRef[];
+        historyDraftWarning?: string;
+      } = {}
     ) => {
       if (status === 'done') {
-        const targetDraft = entry.content.trim();
+        const targetDraft = typeof options.historyDraftText === 'string' && options.historyDraftText.trim()
+          ? options.historyDraftText.trim()
+          : entry.content.trim();
         const durable = options.persisted === true || mode === 'ai' || isCodex || isGemini;
         if (durable) {
           setHistoryRewindPreview(tabId, null);
         } else if (mode === 'native' && toolType === 'claude' && options.historyInputDraft === true && targetDraft) {
-          setHistoryPromptDraft(tabId, targetDraft);
+          setHistoryPromptDraft(
+            tabId,
+            targetDraft,
+            Array.isArray(options.historyDraftImages) && options.historyDraftImages.length > 0
+              ? { images: options.historyDraftImages }
+              : undefined
+          );
           setHistoryRewindPreview(tabId, {
             opId: rewindOpId,
             targetUuid: entry.uuid,
@@ -3429,6 +3443,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           toolType,
           persisted: options.persisted ?? (isCodex && mode === 'native' && status === 'done'),
           historyInputDraft: options.historyInputDraft,
+          historyDraftText: options.historyDraftText,
+          historyDraftImages: options.historyDraftImages,
+          historyDraftWarning: options.historyDraftWarning,
           error,
           message,
         }
@@ -3436,9 +3453,46 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     };
     const showRewindFailureFeedback = (message: string) => {
       const cleanMessage = String(message || 'Rewind failed').trim();
+      const codexToast = (() => {
+        if (!isCodex) return null;
+        if (/codex_rewind_restored_input_mismatch/i.test(cleanMessage)) {
+          return {
+            title: 'Rewind остановлен: Codex вернул другой prompt',
+            details: 'Rollback уже мог примениться в истории, но в поле ввода вернулся текст, который не совпал с выбранной строкой. История перечитывается из сохранённого лога, а Rewind не отмечается успешным, чтобы не скрыть расхождение.',
+          };
+        }
+        if (/codex_rewind_prime_hint_not_observed|codex_rewind_start_state_not_clean|codex_rewind_start_state_unstable|codex_rewind_transcript_not_observed/i.test(cleanMessage)) {
+          return {
+            title: 'Rewind не стартовал: Codex не подтвердил режим отката',
+            details: 'Codex мог быть готов к обычному вводу, но не показал состояние Rewind после первого шага. История не менялась; операция остановлена до подтверждения, чтобы не откатить не туда.',
+          };
+        }
+        if (/codex_rewind_target_not_selected_before_enter/i.test(cleanMessage)) {
+          return {
+            title: 'Rewind остановлен: выбранный prompt не подтверждён',
+            details: 'Codex открыл историю, но подсвеченная строка не совпала с выбранным prompt. Enter не нажимается, история не меняется, и нужно повторить Rewind с нужной строки.',
+          };
+        }
+        return null;
+      })();
       setClickedState({ index: entryIndex, status: 'failed' });
       setTimeout(() => setClickedState((s) => (s?.index === entryIndex ? null : s)), 1600);
       if (!isHistoryOpen) {
+        if (codexToast) {
+          useUIStore.getState().showToast(
+            codexToast.title,
+            'error',
+            0,
+            true,
+            undefined,
+            undefined,
+            undefined,
+            tabId,
+            undefined,
+            codexToast.details
+          );
+          return;
+        }
         useUIStore.getState().showToast(
           cleanMessage.toLowerCase().startsWith('rewind failed')
             ? cleanMessage
@@ -3735,8 +3789,24 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       // Success flash
       setRewindState({ index: entryIndex, phase: 'done' });
       if (isCodex && mode === 'native') {
-        const targetDraft = entry.content.trim();
+        const targetDraft = typeof rewindResult.historyDraftText === 'string' && rewindResult.historyDraftText.trim()
+          ? rewindResult.historyDraftText.trim()
+          : entry.content.trim();
         if (targetDraft) setHistoryPromptDraft(tabId, targetDraft);
+        if (rewindResult.historyDraftWarning) {
+          useUIStore.getState().showToast(
+            'Rewind выполнен: проверь картинку',
+            'warning',
+            7000,
+            true,
+            undefined,
+            undefined,
+            undefined,
+            tabId,
+            undefined,
+            String(rewindResult.historyDraftWarning)
+          );
+        }
       }
       emitHistoryRewindLog(
         'done',
@@ -3745,6 +3815,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         {
           persisted: mode === 'ai' || isCodex || isGemini,
           historyInputDraft: mode === 'native' && rewindResult.historyInputDraft === true,
+          historyDraftText: typeof rewindResult.historyDraftText === 'string' ? rewindResult.historyDraftText : undefined,
+          historyDraftImages: Array.isArray(rewindResult.historyDraftImages) ? rewindResult.historyDraftImages : undefined,
+          historyDraftWarning: typeof rewindResult.historyDraftWarning === 'string' ? rewindResult.historyDraftWarning : undefined,
         }
       );
       setTimeout(() => setRewindState(null), 1200);

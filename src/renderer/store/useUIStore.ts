@@ -8,6 +8,7 @@ interface Toast {
   type: 'success' | 'error' | 'info' | 'warning' | 'pink';
   persistent?: boolean;
   copyText?: string;
+  details?: string;
   actionLabel?: string;
   onAction?: () => void;
   actionIcon?: 'github-desktop';
@@ -48,6 +49,18 @@ export interface HistoryRewindPreview {
   targetText: string;
   startedAt: number;
   sessionId?: string;
+}
+
+export interface HistoryPromptDraftImageRef {
+  id: number;
+  path: string;
+  mediaType?: string | null;
+  size?: number;
+}
+
+export interface HistoryPromptDraftWriteOptions {
+  images?: HistoryPromptDraftImageRef[] | null;
+  preserveImages?: boolean;
 }
 
 export interface ApiSettings {
@@ -423,7 +436,7 @@ interface UIStore {
 
   toasts: Toast[];
 
-  showToast: (message: string, type?: Toast['type'], duration?: number, persistent?: boolean, copyText?: string, actionLabel?: string, onAction?: () => void, tabId?: string, actionIcon?: Toast['actionIcon']) => void;
+  showToast: (message: string, type?: Toast['type'], duration?: number, persistent?: boolean, copyText?: string, actionLabel?: string, onAction?: () => void, tabId?: string, actionIcon?: Toast['actionIcon'], details?: string) => void;
 
   removeToast: (id: string) => void;
 
@@ -449,13 +462,14 @@ interface UIStore {
   historyVisibleUuids: Record<string, string[]>;
   historyScrollPositions: Record<string, number>;
   historyPromptDrafts: Record<string, string>;
+  historyPromptDraftImages: Record<string, HistoryPromptDraftImageRef[]>;
   historyRewindPreviews: Record<string, HistoryRewindPreview>;
   setHistoryPanelOpen: (tabId: string, open: boolean) => void;
   setHistoryPanelWidth: (width: number) => void;
   setHistoryScrollToUuid: (uuid: string | null) => void;
   setHistoryVisibleUuids: (tabId: string, uuids: string[]) => void;
   setHistoryScrollPosition: (tabId: string, scrollTop: number) => void;
-  setHistoryPromptDraft: (tabId: string, draft: string) => void;
+  setHistoryPromptDraft: (tabId: string, draft: string, options?: HistoryPromptDraftWriteOptions) => void;
   setHistoryRewindPreview: (tabId: string, preview: HistoryRewindPreview | null) => void;
 
   // Timeline panel visibility (per-tab state, default open)
@@ -2124,10 +2138,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
   // Toast Notifications
   toasts: [],
-  showToast: (message, type = 'success', duration = 2500, persistent = false, copyText, actionLabel, onAction, tabId, actionIcon) => {
+  showToast: (message, type = 'success', duration = 2500, persistent = false, copyText, actionLabel, onAction, tabId, actionIcon, details) => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     set((state) => ({
-      toasts: [...state.toasts, { id, message, type, persistent, copyText, actionLabel, onAction, tabId, actionIcon }]
+      toasts: [...state.toasts, { id, message, type, persistent, copyText, details, actionLabel, onAction, tabId, actionIcon }]
     }));
 
     if (!persistent) {
@@ -2173,6 +2187,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
   historyVisibleUuids: {},
   historyScrollPositions: {},
   historyPromptDrafts: {},
+  historyPromptDraftImages: {},
   historyRewindPreviews: {},
   setHistoryPanelOpen: (tabId, open) => set(state => ({
     historyPanelOpenTabs: { ...state.historyPanelOpenTabs, [tabId]: open }
@@ -2184,11 +2199,20 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setHistoryScrollPosition: (tabId, scrollTop) => set(state => ({
     historyScrollPositions: { ...state.historyScrollPositions, [tabId]: scrollTop }
   })),
-  setHistoryPromptDraft: (tabId, draft) => set(state => {
+  setHistoryPromptDraft: (tabId, draft, options = {}) => set(state => {
     const next = { ...state.historyPromptDrafts };
     if (draft) next[tabId] = draft;
     else delete next[tabId];
-    return { historyPromptDrafts: next };
+    const shouldTouchImages = !draft || !options.preserveImages || Object.prototype.hasOwnProperty.call(options, 'images');
+    if (!shouldTouchImages) return { historyPromptDrafts: next };
+
+    const nextImages = { ...state.historyPromptDraftImages };
+    const images = Array.isArray(options.images)
+      ? options.images.filter((ref) => ref && Number.isFinite(Number(ref.id)) && typeof ref.path === 'string' && ref.path.trim())
+      : [];
+    if (draft && images.length > 0) nextImages[tabId] = images;
+    else delete nextImages[tabId];
+    return { historyPromptDrafts: next, historyPromptDraftImages: nextImages };
   }),
   setHistoryRewindPreview: (tabId, preview) => set(state => {
     const next = { ...state.historyRewindPreviews };

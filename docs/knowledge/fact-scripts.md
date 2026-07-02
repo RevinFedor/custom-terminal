@@ -50,6 +50,8 @@ Capture берёт только реальные shell input lines из plain te
 Контракт side effect:
 - выбран только trigger-tab → после natural completion target делает обычный deterministic restart (`Ctrl+C`/stop-flow, затем repeat command);
 - выбран trigger-tab + `Script` → target сначала controlled-stop'ит текущий процесс, потом отправляет выбранный `npm run <name>` или `./script.sh`;
+- если выбран конечный `Script` уже запущен этой фичей и ещё не завершился, следующий natural completion trigger-tab'а не stop'ит его и не запускает второй экземпляр: ставится один pending rerun, который стартует после `terminal:command-finished` целевой вкладки; несколько trigger'ов пока скрипт идёт схлопываются в один повтор с последней выбранной командой;
+- `dev`/`start`/`serve`/`watch`-команды остаются restart-командами: они обычно не завершаются сами, поэтому для них сохраняется прежний controlled stop/restart path вместо ожидания `command-finished`;
 - если процесса в target сейчас нет, но выбран `Script`, restart-after просто стартует этот script с нуля; если script не выбран и процесса нет, обычный restart-path no-op'ит как пустой терминал;
 - `manual-stop`, `interrupt`, `error`, `watchdog`, Codex `turn_aborted`, Claude `spinner` и обычный `local-command` не запускают restart. Это те же смысловые границы что у Run after: side effect разрешён только после результата, а не после отмены/ошибки/визуального флапа.
 
