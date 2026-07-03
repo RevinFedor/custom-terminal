@@ -71,6 +71,14 @@ function isAiForegroundProcess(info?: { hasProcess?: boolean; processName?: stri
   return /\b(claude|gemini|codex)\b/.test(text) || text.includes('@openai/codex');
 }
 
+function isAiRuntimeTabLike(tab?: { commandType?: string; tabType?: string } | null): boolean {
+  return !!tab && (tab.tabType === 'claude-sdk' || tab.commandType === 'claude' || tab.commandType === 'gemini' || tab.commandType === 'codex');
+}
+
+function isSdkBusyStateLike(tab?: { sdkState?: string } | null): boolean {
+  return tab?.sdkState === 'fetching' || tab?.sdkState === 'thinking' || tab?.sdkState === 'tool_use';
+}
+
 function cleanDefaultSetting(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
@@ -835,6 +843,57 @@ function App() {
   // Feeds the project-tab purple glow. Bracketed by claude:awaiting-input (main.js).
   const [awaitingTabs, setAwaitingTabs] = useState<Map<string, boolean>>(new Map());
   const [apiLoadingProjects, setApiLoadingProjects] = useState<Set<string>>(new Set()); // projectIds with active API requests
+
+  const getProjectStopTargetIds = useCallback((projectId: string) => {
+    const workspace = useWorkspaceStore.getState().openProjects.get(projectId) || openProjects.get(projectId);
+    if (!workspace) return [];
+    return Array.from(workspace.tabs.entries())
+      .filter(([tabId, tab]: [string, any]) => {
+        if (!tab || tab.tabType === 'file') return false;
+        if (tab.tabType === 'claude-sdk') {
+          return !!(busyTabs.get(tabId) || tab.sdkProcessAlive || isSdkBusyStateLike(tab));
+        }
+        return !!processStatus.get(tabId);
+      })
+      .map(([tabId]) => tabId);
+  }, [openProjects, processStatus, busyTabs]);
+
+  const stopProjectRunningTabs = useCallback(async (projectId: string) => {
+    const tabIds = getProjectStopTargetIds(projectId);
+    if (tabIds.length === 0) return;
+    const startedAt = performance.now();
+    console.warn(
+      '[Perf:StopProjectTabsBatch] start' +
+      ' project=' + projectId.slice(-12) +
+      ' count=' + tabIds.length +
+      ' source=project-context-menu' +
+      ' startAbs=' + (performance.timeOrigin + startedAt).toFixed(1)
+    );
+
+    await Promise.all(tabIds.map(async (id) => {
+      const latestWorkspace = useWorkspaceStore.getState().openProjects.get(projectId);
+      const tab = latestWorkspace?.tabs.get(id) as any;
+      if (!tab) return null;
+
+      if (tab.tabType === 'claude-sdk') {
+        window.dispatchEvent(new CustomEvent('claude-sdk:was-stopped', { detail: { tabId: id } }));
+        return ipcRenderer.invoke('claude-sdk:stop', { tabId: id });
+      }
+
+      if (isAiRuntimeTabLike(tab)) {
+        return ipcRenderer.invoke('terminal:stop-ai-process', { tabId: id, toolType: tab.commandType || null });
+      }
+
+      return ipcRenderer.invoke('terminal:deterministic-stop', { tabId: id, restart: false });
+    }));
+
+    console.warn(
+      '[Perf:StopProjectTabsBatch] done' +
+      ' project=' + projectId.slice(-12) +
+      ' count=' + tabIds.length +
+      ' durMs=' + (performance.now() - startedAt).toFixed(1)
+    );
+  }, [getProjectStopTargetIds]);
 
   // Listen for project API loading events from ActionsPanel
   useEffect(() => {
@@ -3581,6 +3640,7 @@ function App() {
   }, [view, activeProjectId, filePreview, incrementAllFontSizes, decrementAllFontSizes, activeArea, openProjects, setActiveArea]);
 
   const openProjectsList = Array.from(openProjects.entries()).filter(([projectId]) => !isInboxProjectId(projectId));
+  const projectContextStopCount = projectContextMenu ? getProjectStopTargetIds(projectContextMenu.projectId).length : 0;
   const inboxWorkspace = openProjects.get(INBOX_PROJECT_ID);
   const getProjectTabIndicators = (projectId: string, workspace?: any) => {
     let activeCount = 0;
@@ -3925,6 +3985,31 @@ function App() {
               }}
             >
               Copy Path
+            </button>
+            <button
+              disabled={projectContextStopCount === 0}
+              className={`w-full px-4 py-2 text-sm border-t border-[#3a3a3a] flex items-center justify-end gap-2 ${
+                projectContextStopCount === 0
+                  ? 'text-[#666] cursor-not-allowed'
+                  : 'text-[#10A37F] hover:bg-[#10A37F]/15 cursor-pointer'
+              }`}
+              onClick={() => {
+                if (!projectContextMenu || projectContextStopCount === 0) return;
+                const projectId = projectContextMenu.projectId;
+                setProjectContextMenu(null);
+                void stopProjectRunningTabs(projectId);
+              }}
+            >
+              <span
+                style={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: 2,
+                  backgroundColor: projectContextStopCount === 0 ? '#444' : '#10A37F',
+                  display: 'inline-block',
+                }}
+              />
+              {projectContextStopCount > 0 ? `Stop ${projectContextStopCount}` : 'Stop'}
             </button>
           </div>
         </>

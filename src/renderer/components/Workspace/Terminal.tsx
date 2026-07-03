@@ -11,8 +11,11 @@ const isHttpUrl = (uri: string) => /^https?:\/\//i.test(uri);
 
 const suppressLinkEvent = (event: MouseEvent) => {
   event.preventDefault();
-  event.stopPropagation();
+  // Do not stop propagation here: xterm's selection service clears its
+  // mouse-down drag state from a document-level mouseup listener.
 };
+
+const isLinkActivationEvent = (event: MouseEvent) => event.metaKey;
 
 const openExternalUrl = (uri: string) => {
   console.log('[Link] Opening URL in browser:', uri);
@@ -25,9 +28,16 @@ const openExternalUrl = (uri: string) => {
 const handleLinkActivation = (
   event: MouseEvent,
   uri: string,
-  onLinkClick?: (url: string) => void
+  onLinkClick?: (url: string) => void,
+  term?: XTerminal | null
 ) => {
+  if (!isLinkActivationEvent(event)) {
+    return;
+  }
+
   suppressLinkEvent(event);
+  try { term?.clearSelection(); } catch {}
+  try { term?.focus(); } catch {}
 
   if (isHttpUrl(uri)) {
     if (onLinkClick) {
@@ -1897,7 +1907,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         allowProposedApi: true, // Required for SearchAddon
         linkHandler: {
           activate: (event: MouseEvent, uri: string) => {
-            handleLinkActivation(event, uri, onLinkClickRef.current);
+            handleLinkActivation(event, uri, onLinkClickRef.current, xtermInstance.current);
           },
           allowNonHttpProtocols: false,
         },
@@ -1920,7 +1930,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       term.loadAddon(serializeAddon);
       term.loadAddon(searchAddon);
       term.loadAddon(new WebLinksAddon((event, uri) => {
-        handleLinkActivation(event, uri, onLinkClickRef.current);
+        handleLinkActivation(event, uri, onLinkClickRef.current, xtermInstance.current);
       }));
 
       term.open(containerRef);
@@ -2565,7 +2575,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           allowProposedApi: true, // Required for SearchAddon
           linkHandler: {
             activate: (event: MouseEvent, uri: string) => {
-              handleLinkActivation(event, uri, onLinkClickRef.current);
+              handleLinkActivation(event, uri, onLinkClickRef.current, xtermInstance.current);
             },
             allowNonHttpProtocols: false,
           },
@@ -2583,7 +2593,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         term.loadAddon(serializeAddon);
         term.loadAddon(searchAddon);
         term.loadAddon(new WebLinksAddon((event, uri) => {
-          handleLinkActivation(event, uri, onLinkClickRef.current);
+          handleLinkActivation(event, uri, onLinkClickRef.current, xtermInstance.current);
         }));
 
         term.open(terminalRef.current);

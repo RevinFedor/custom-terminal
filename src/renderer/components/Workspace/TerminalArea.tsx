@@ -591,8 +591,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
               lastNotReady: presence.lastNotReady,
               holdUntilReady: prev.holdUntilReady,
               startupPending: prev.startupPending,
-              startupFailed: presence.startupFailed,
-              startupError: presence.startupError,
+              startupFailed: prev.startupFailed || presence.startupFailed,
+              startupError: prev.startupError || presence.startupError,
             };
           }
           console.warn('[SessionStartingOverlay] show tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason);
@@ -657,6 +657,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       if (info?.tabId === tabId) dismissedStartingKeysRef.current.delete(startingDismissKey(info));
       setSessionStarting((prev) => {
         if (prev?.tabId !== tabId) return prev;
+        if (prev.startupFailed) return prev;
         if (!force && prev?.tabId === tabId && (prev.startupFailed || prev.startupPending || prev.holdUntilReady)) return prev;
         console.warn('[SessionStartingOverlay] event-hide tab=' + tabId.slice(-12) + ' reason=' + reason + ' engine=' + prev.engine);
         return null;

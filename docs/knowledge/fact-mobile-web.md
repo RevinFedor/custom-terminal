@@ -572,6 +572,14 @@ Snapshot намеренно полный, а не дельты `+1/-1`. iOS мо
 проект. Heartbeat остаётся обычным `: hb`, reconnect на клиенте всегда делает REST seed.
 Отсутствующий project или tab в snapshot означает inactive/zero, а не «оставь старое».
 
+Строка `status` в этом payload — проекция runtime, а не самостоятельный источник правды.
+Реальный владелец состояния остаётся на Mac: жив ли процесс, готов ли Codex/Claude к вводу,
+идёт ли turn, доказан ли exit. HTTP-ответ на `/resume` или `/stop` подтверждает контракт
+действия, но не заменяет runtime-событие для списков: `ready/inputReady` сильнее устаревшего
+`starting`, `busy` сильнее ready, а отсутствие tab после stop — уже финальный ноль. Не
+переноси mobile-side локальные фазы (`resuming`, `stopping`) обратно в server truth: клиент
+может держать их только до первого авторитетного runtime snapshot.
+
 `computeProjectActivity()` собирает агрегат из живых runtime maps: Claude PTY, Codex, Gemini,
 SDK и safety-net `activityOpenIntervals` на случай, когда edge уже открыт, а конкретный engine
 карта ещё не успела обновиться. Это не второй детектор busy-state: все входы всё равно идут от

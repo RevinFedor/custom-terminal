@@ -1787,13 +1787,45 @@ function computeProjectActivity() {
     });
   }
 
+  const claudeBusyForTab = (tabId) => (
+    claudeTurnBusy.get(tabId) === true ||
+    claudeLocalCommandWatchers.has(tabId) ||
+    activityOpenIntervals.has(tabId)
+  );
+
+  for (const tabId of claudePromptReady) {
+    if (claudeCliActive.get(tabId) !== true && !bridgeKnownSessions.has(tabId)) continue;
+    mark(tabId, {
+      live: terminals.has(tabId),
+      busy: claudeBusyForTab(tabId),
+      status: 'active',
+    });
+  }
+
   for (const tabId of bridgeKnownSessions.keys()) {
-    const busy = claudeTurnBusy.get(tabId) === true ||
-      claudeLocalCommandWatchers.has(tabId) ||
-      activityOpenIntervals.has(tabId);
+    const busy = claudeBusyForTab(tabId);
     mark(tabId, {
       live: terminals.has(tabId),
       busy,
+      status: claudePromptReady.has(tabId) ? 'active' : 'starting',
+    });
+  }
+
+  const now = Date.now();
+  for (const [tabId, intent] of claudeStartupIntents) {
+    if (!intent || (now - intent.at) >= 45_000) continue;
+    mark(tabId, {
+      live: terminals.has(tabId),
+      busy: claudeBusyForTab(tabId),
+      status: claudePromptReady.has(tabId) ? 'active' : 'starting',
+    });
+  }
+
+  for (const [tabId, active] of claudeCliActive) {
+    if (active !== true) continue;
+    mark(tabId, {
+      live: terminals.has(tabId),
+      busy: claudeBusyForTab(tabId),
       status: claudePromptReady.has(tabId) ? 'active' : 'starting',
     });
   }
@@ -1822,6 +1854,20 @@ function computeProjectActivity() {
       live: terminals.has(tabId),
       busy,
       status: codexTuiReadyTabs.has(tabId) ? 'active' : 'starting',
+    });
+  }
+  for (const tabId of codexTuiReadyTabs) {
+    const hasCodexRuntime = codexKnownSessions.has(tabId) ||
+      codexLastRunCommandPayload.has(tabId) ||
+      codexTurnWatchers.has(tabId) ||
+      activityOpenIntervals.get(tabId)?.engine === 'codex';
+    if (!hasCodexRuntime) continue;
+    const state = codexTurnWatchers.get(tabId);
+    const busy = state?.busy === true || activityOpenIntervals.has(tabId);
+    mark(tabId, {
+      live: terminals.has(tabId),
+      busy,
+      status: 'active',
     });
   }
 
@@ -1897,6 +1943,11 @@ function scheduleProjectActivityBroadcast(reason = 'event') {
     projectOrderChanged = false;
   }, 80);
 }
+
+ipcMain.on('agent:tui-ready-internal', (_event, payload = {}) => {
+  const toolType = payload?.toolType || 'agent';
+  scheduleProjectActivityBroadcast(toolType + '-ready');
+});
 
 function scheduleProjectLayoutBroadcast(projectId, reason = 'tab-layout') {
   if (projectId) projectLayoutChangedIds.add(projectId);
@@ -2872,11 +2923,29 @@ async function emitClaudeTuiReadyFromVisibleBuffer(tabId, source) {
       ' rewindMenuVisible=' + rewindMenuVisible);
     return false;
   }
+  publishClaudePromptReady(tabId, 'visible-buffer ' + source);
+  return true;
+}
+
+function publishClaudePromptReady(tabId, reason = 'prompt-ready') {
+  if (!tabId || claudePromptReady.has(tabId)) return false;
   claudePromptReady.add(tabId);
+  const turnBusy = !!claudeTurnBusy.get(tabId);
   console.log('[TUI-Ready] tab=' + String(tabId).slice(-12) +
-    ' — emitting claude:tui-ready (visible-buffer ' + source + ')');
-  mainWindow.webContents.send('claude:tui-ready', { tabId, ts: Date.now() });
+    ' — emitting claude:tui-ready (' + reason + ')');
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('claude:tui-ready', { tabId, ts: Date.now() });
+  }
   ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'claude' });
+  _webBroadcast(tabId, {
+    type: 'snapshot',
+    sessionId: bridgeKnownSessions.get(tabId) || null,
+    busy: turnBusy,
+    sessionStatus: turnBusy ? 'busy' : 'active',
+    inputReady: true,
+    toolType: 'claude',
+    commandType: 'claude',
+  });
   return true;
 }
 
@@ -4624,11 +4693,25 @@ function parseOSC133AndEmit(tabId, data) {
         // Clear bridge + claudeCliActive when command finishes (shell regained control = Claude not running)
         // Guard: handshake only — shell fires D during init BEFORE Claude starts
         if (!claudeState.has(tabId) && !claudePendingPrompt.has(tabId)) {
+          const hadPromptReady = claudePromptReady.delete(tabId);
           if (claudeCliActive.has(tabId)) {
             claudeCliActive.delete(tabId);
           }
           if (bridgeKnownSessions.has(tabId)) {
             clearBridgeTab(tabId);
+          } else if (hadPromptReady) {
+            console.log('[MobBcast] busy+snapshot tab=' + String(tabId).slice(-12) + ' busy=false status=inactive src=command-finished-no-bridge');
+            _webBroadcast(tabId, { type: 'busy', busy: false });
+            _webBroadcast(tabId, {
+              type: 'snapshot',
+              sessionId: null,
+              busy: false,
+              sessionStatus: 'inactive',
+              inputReady: false,
+              toolType: 'claude',
+              commandType: 'claude',
+            });
+            scheduleProjectActivityBroadcast('claude-command-finished-no-bridge');
           }
         }
         clearClaudePendingJsonlOwnersForTab(tabId, 'command-finished');
@@ -8337,14 +8420,8 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
         const hayStack = checked != null ? checked : data;
         const rewindMenuFrame = looksLikeClaudeRewindMenuText(hayStack);
         if (hasClaudeComposerPromptGlyph(hayStack) || (hasClaudeAsciiComposerPrompt(hayStack) && !rewindMenuFrame)) {
-          claudePromptReady.add(tabId);
           console.log('[ClaudePromptReady] Tab ' + tabId.slice(-12) + ' — input ready (⏵ rendered)');
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            console.log('[TUI-Ready] tab=' + tabId.slice(-12) + ' — emitting claude:tui-ready (global prompt-ready)');
-            mainWindow.webContents.send('claude:tui-ready', { tabId, ts: Date.now() });
-            ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'claude' });
-            emittedGlobalTuiReady = true;
-          }
+          emittedGlobalTuiReady = publishClaudePromptReady(tabId, 'global prompt-ready');
           // BUSY here must be the AUTHORITATIVE turn flag (claudeTurnBusy, the
           // Stop-hook), NOT claudeSpinnerBusy. On Resume the PTY replays old
           // scrollback containing a stale spinner glyph (`✻ Cooked for 13s`),
@@ -8353,14 +8430,6 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
           // Stop until a manual refresh. Same conflation fixed in get-presence;
           // this is the second broadcast path that bypassed it. See
           // fact-mobile-claude-pty.md::Composer busy = turn, not spinner/alive.
-          const turnBusy = !!claudeTurnBusy.get(tabId);
-          _webBroadcast(tabId, {
-            type: 'snapshot',
-            sessionId: bridgeKnownSessions.get(tabId) || null,
-            busy: turnBusy,
-            sessionStatus: turnBusy ? 'busy' : 'active',
-            inputReady: true,
-          });
         }
       }
 
@@ -8380,11 +8449,9 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
           // resolve). Renderer uses this for auto /effort inject so the user
           // doesn't sit looking at a ready prompt for 3+ seconds before the
           // effort line appears. Bridge:Fresh stays as the fallback path.
-          if (!emittedGlobalTuiReady && mainWindow && !mainWindow.isDestroyed()) {
-            console.log('[TUI-Ready] tab=' + tabId.slice(-12) + ' — emitting claude:tui-ready (prompt rendered)');
-              mainWindow.webContents.send('claude:tui-ready', { tabId, ts: Date.now() });
-              ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'claude' });
-            }
+          if (!emittedGlobalTuiReady) {
+            publishClaudePromptReady(tabId, 'prompt rendered');
+          }
 
           const timerId = setTimeout(async () => {
             console.log('[Claude Handshake] Tab ' + tabId + ': UI settled (' + DEBOUNCE_MS + 'ms silence). Sending prompt...');
@@ -10259,6 +10326,7 @@ ipcMain.handle('claude:get-presence', (event, tabId) => {
   let status;
   if (stopping?.toolType === 'claude') status = 'stopping';
   else if (!hasTerm) status = 'inactive';
+  else if (inputReady && claudeCliActive.get(tabId) === true) status = isBusy ? 'busy' : 'active';
   else if (hasBridge) {
     if (isBusy) status = 'busy';
     else if (inputReady) status = 'active';
@@ -10382,6 +10450,10 @@ function findClaudePidByTab(tabId) {
 // refused, so the anti-rm-rf intent is preserved.
 function hasLiveClaudeInTab(tabId) {
   if (bridgeKnownSessions.has(tabId)) return true;
+  // Fresh Claude can render the input prompt before StatusLine bridge metadata
+  // writes the first session file. That state is still safe for slash commands:
+  // the TUI is on-screen and the process was launched by our Claude runner.
+  if (terminals.has(tabId) && claudeCliActive.get(tabId) === true && claudePromptReady.has(tabId)) return true;
   const pid = findClaudePidByTab(tabId);
   if (!pid) return false;
   try { process.kill(pid, 0); return true; } catch { return false; }
@@ -15852,6 +15924,8 @@ async function stopAiProcessInTab(tabId, options = {}) {
   // shell → node wrapper → vendor codex binary, depending on install path.
   let childPid = null;
   let processName = requestedToolType || null;
+  const directChildrenForDiag = [];
+  const aiCandidatesForDiag = [];
   try {
     const psOut = await execAsync('ps -eo pid,ppid,command', 2000);
     for (const line of (psOut || '').split('\n').filter(Boolean)) {
@@ -15859,8 +15933,21 @@ async function stopAiProcessInTab(tabId, options = {}) {
       if (!m) continue;
       const [, pid, ppid, cmd] = m;
       if (cmd.includes('Electron') || cmd.includes('electron')) continue;
+      if (Number(ppid) === term.pid) {
+        directChildrenForDiag.push({
+          pid: Number(pid),
+          cmd: String(cmd || '').replace(/\s+/g, ' ').slice(0, 220),
+        });
+      }
       const aiName = getAiProcessNameFromCommand(cmd);
       if (!aiName) continue;
+      aiCandidatesForDiag.push({
+        pid: Number(pid),
+        ppid: Number(ppid),
+        name: aiName,
+        direct: Number(ppid) === term.pid,
+        cmd: String(cmd || '').replace(/\s+/g, ' ').slice(0, 220),
+      });
       if (Number(ppid) === term.pid) {
         childPid = Number(pid);
         processName = aiName;
@@ -15889,7 +15976,6 @@ async function stopAiProcessInTab(tabId, options = {}) {
   }
 
   if (!childPid) {
-    console.log('[StopAI] no AI process found for tab ' + tabId + ' shellPid=' + term.pid);
     const rowCommandType = (() => {
       try {
         return projectManager?.db?.db?.prepare('SELECT command_type FROM tabs WHERE tab_id = ? LIMIT 1').get(tabId)?.command_type || '';
@@ -15902,6 +15988,49 @@ async function stopAiProcessInTab(tabId, options = {}) {
       || codexKnownSessions.has(tabId)
       || codexTurnWatchers.has(tabId)
       || codexTuiReadyTabs.has(tabId);
+    let descendantsForDiag = [];
+    let descendantDiagError = null;
+    try {
+      const snapshot = await getProcessTreeSnapshot();
+      const stack = [{ pid: term.pid, depth: 0 }];
+      const seen = new Set();
+      while (stack.length > 0) {
+        const cur = stack.pop();
+        if (!cur || seen.has(cur.pid)) continue;
+        seen.add(cur.pid);
+        const kids = snapshot.children.get(cur.pid) || [];
+        for (const child of kids) {
+          const depth = cur.depth + 1;
+          descendantsForDiag.push({
+            depth,
+            pid: child.pid,
+            ppid: child.ppid,
+            ai: getAiProcessNameFromCommand(child.cmd) || null,
+            cmd: String(child.cmd || '').replace(/\s+/g, ' ').slice(0, 220),
+          });
+          stack.push({ pid: child.pid, depth });
+        }
+      }
+    } catch (err) {
+      descendantDiagError = err?.message || String(err);
+    }
+    const commandState = terminalCommandState.get(tabId) || null;
+    console.log('[StopAI:NoProcessDiag] tab=' + String(tabId).slice(-12)
+      + ' shellPid=' + term.pid
+      + ' requested=' + (requestedToolType || '-')
+      + ' rowCommandType=' + (rowCommandType || '-')
+      + ' commandRunning=' + (commandState?.isRunning === true)
+      + ' bridge=' + ((bridgeKnownSessions.get(tabId) || '').slice(0, 8) || '-')
+      + ' claudeCliActive=' + claudeCliActive.has(tabId)
+      + ' claudePromptReady=' + claudePromptReady.has(tabId)
+      + ' claudeTurnBusy=' + (claudeTurnBusy.get(tabId) === true)
+      + ' claudeSpinnerBusy=' + (claudeSpinnerBusy.get(tabId) === true)
+      + ' directChildren=' + JSON.stringify(directChildrenForDiag)
+      + ' aiCandidates=' + JSON.stringify(aiCandidatesForDiag.slice(0, 12))
+      + ' descendants=' + JSON.stringify(descendantsForDiag.slice(0, 20))
+      + ' descendantsTotal=' + descendantsForDiag.length
+      + ' descendantError=' + (descendantDiagError || '-'));
+    console.log('[StopAI] no AI process found for tab ' + tabId + ' shellPid=' + term.pid);
     if (isCodexRuntime && !preserveCodexLaunchPayload) {
       clearCodexLaunchPayload(tabId, stopReason);
       clearCodexKnownSession(tabId, stopReason);
@@ -17118,6 +17247,23 @@ function broadcastCodexStartingSnapshot(tabId, reason = 'starting') {
   });
 }
 
+function broadcastCodexReadySnapshot(tabId, reason = 'tui-ready') {
+  if (!tabId || aiStoppingTabs.has(tabId)) return;
+  const turn = codexTurnWatchers.get(tabId);
+  const busy = turn?.busy === true;
+  _webBroadcast(tabId, {
+    type: 'snapshot',
+    sessionId: getCodexRuntimeSessionId(tabId),
+    busy,
+    sessionStatus: busy ? 'busy' : 'active',
+    starting: false,
+    inputReady: !busy && codexTuiReadyTabs.has(tabId),
+    toolType: 'codex',
+    commandType: 'codex',
+    reason,
+  });
+}
+
 async function restartCodexAfterMcpStartupWatchdog(tabId, state, mcpInfo) {
   const current = codexMcpStartupWatchdogs.get(tabId);
   if (!current || current !== state || current.mcpStartupRestarting) return;
@@ -17259,6 +17405,7 @@ function markCodexTuiReadyFromTurnEnd(tabId, reason = 'turn-end') {
       mainWindow.webContents.send('codex:tui-ready', { tabId, ts: Date.now(), reason });
     }
     ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'codex' });
+    broadcastCodexReadySnapshot(tabId, reason);
   }
   return true;
 }
@@ -17492,6 +17639,7 @@ async function emitCodexTuiReadyAfterQuiet(tabId) {
     mainWindow.webContents.send('codex:tui-ready', { tabId, ts: Date.now() });
   }
   ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'codex' });
+  broadcastCodexReadySnapshot(tabId, 'tui-ready');
 }
 
 async function tryEmitCodexTuiReady(tabId, data) {
@@ -17809,17 +17957,7 @@ async function markCodexTuiReadyAfterVerifiedComposer(tabId, reason = 'verified-
     mainWindow.webContents.send('codex:tui-ready', { tabId, ts: Date.now(), reason });
   }
   ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'codex' });
-  if (!aiStoppingTabs.has(tabId)) {
-    _webBroadcast(tabId, {
-      type: 'snapshot',
-      sessionId: getCodexRuntimeSessionId(tabId),
-      busy: false,
-      sessionStatus: 'active',
-      toolType: 'codex',
-      commandType: 'codex',
-      inputReady: true,
-    });
-  }
+  broadcastCodexReadySnapshot(tabId, reason);
   return true;
 }
 
@@ -17926,6 +18064,7 @@ async function markCodexTuiReadyFromVisibleProbe(tabId, reason = 'visible-probe'
     mainWindow.webContents.send('codex:tui-ready', { tabId, ts: Date.now() });
   }
   ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'codex' });
+  broadcastCodexReadySnapshot(tabId, reason);
   return true;
 }
 
@@ -17987,17 +18126,7 @@ async function markCodexTuiReadyFromRawProbe(tabId, reason = 'raw-probe') {
     mainWindow.webContents.send('codex:tui-ready', { tabId, ts: Date.now(), reason });
   }
   ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'codex' });
-  if (!aiStoppingTabs.has(tabId)) {
-    _webBroadcast(tabId, {
-      type: 'snapshot',
-      sessionId: getCodexRuntimeSessionId(tabId),
-      busy: false,
-      sessionStatus: 'active',
-      toolType: 'codex',
-      commandType: 'codex',
-      inputReady: true,
-    });
-  }
+  broadcastCodexReadySnapshot(tabId, reason);
   return true;
 }
 
