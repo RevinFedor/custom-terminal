@@ -1,7 +1,7 @@
 # Fact: `build:i-obs` — ребилд, ждущий пока приложение освободится
 
 ## Задача
-`npm run build:install` сначала гасит приложение (`graceful-quit.sh` → AppleScript quit → before-quit). Если в этот момент в проде идёт активная работа (открыты Claude-табы, крутится `npm run dev`, стримит Gemini), ребилд прервёт её. Нужна команда, которую запускают **в стороннем терминале** (не внутри Noted Terminal), которая **ждёт** пока всё во всех проектах не станет idle, показывает прогресс, и только потом дёргает `build:install`.
+`npm run build:install` сначала гасит приложение (`graceful-quit.sh` → AppleScript quit → before-quit). Если в этот момент в проде идёт активная AI-работа или shell-команда, запущенная через `Restart after`, ребилд прервёт её. Нужна команда, которую запускают **в стороннем терминале** (не внутри Noted Terminal), которая **ждёт** пока такие blocker'ы во всех проектах не станут idle, показывает прогресс, и только потом дёргает `build:install`.
 
 Команда: **`npm run build:i-obs`** (`i` = install, `obs` = observe). Реализация — `scripts/build-when-idle.js` (чистый Node, без зависимостей).
 
@@ -14,20 +14,20 @@
 | SDK Claude | `sdkSessions` | одна запись = один in-flight `query()` → `busy` |
 | Gemini | `geminiSpinnerBusy` | `busy` только при `=== true` |
 | Codex | `codexTurnWatchers` | блокирует только rollout `task_started → task_complete/turn_aborted`; живой idle Codex CLI не blocker |
-| Любой non-AI процесс | `terminalCommandState.isRunning` | `running`. **ЛЮБОЙ** non-AI `isRunning` блокирует, не только `commandType==='devServer'` — юзер просил «npm run dev тоже считается». AI CLI tabs исключены из этой ветки, потому что их PTY-процесс может быть живым и idle |
+| Restart-after non-AI процесс | `terminalCommandState.isRunning` + `activeCommandSource === 'restart-after'` + `tabs.restart_after_tab_id` | `running`. Ручные shell-команды (`npm run dev`, `npm run build`, `./deploy.sh`) сами по себе **не блокируют** `build:i-obs`; blocker'ом становится только команда, которую реально запустил `Restart after`, пока подписка на trigger-tab ещё активна. AI CLI tabs исключены из этой ветки, потому что их PTY-процесс может быть живым и idle |
 
 Дедупликация по `tabId` (один таб = максимум один loader; claude-ветка выигрывает у process-ветки для того же таба).
 
 Идемпотентно для idle-определения: `idle === (loaders.length === 0)`.
 
-Шрам mobile install preflight: если `terminalCommandState.isRunning` применять ко всем вкладкам без фильтра AI, `/api/active-loaders` возвращает десятки `kind:"process", status:"running"` для idle Claude/Codex табов. На iOS это выглядит как ложный alert «Terminal занят, остановите вкладки где идёт streaming/loader», хотя loader нигде не идёт. Разделитель: AI tabs блокируют install только через свои deterministic busy-сигналы выше; обычные shell-команды блокируют через `terminalCommandState.isRunning`.
+Шрам mobile install preflight: если `terminalCommandState.isRunning` применять ко всем вкладкам без фильтра AI, `/api/active-loaders` возвращает десятки `kind:"process", status:"running"` для idle Claude/Codex табов. На iOS это выглядит как ложный alert «Terminal занят, остановите вкладки где идёт streaming/loader», хотя loader нигде не идёт. Разделитель: AI tabs блокируют install только через свои deterministic busy-сигналы выше; обычные shell-команды не блокируют install, кроме случая `kind:"restart-after"` — команда была запущена `Restart after` и её надо дождаться как AI-turn.
 
 ## Транспорт: переиспользует mobile web-server
 Не отдельный сервер. Эндпоинт добавлен в существующий `src/main/web-server.js` (тот же что обслуживает mobile-web на порту 7878):
 
 ```
 GET /api/active-loaders   (Bearer-token, тот же ~/.noted-terminal/web-token.txt)
-→ { idle:bool, count:int, loaders:[{tabId,kind,status,project,name,cwd,command?}], ts }
+→ { idle:bool, count:int, loaders:[{tabId,kind,status,project,name,cwd,command?,source?}], ts }
 ```
 
 `computeActiveLoaders` **инжектится** в `web-server.start({ sdkSessions, computeActiveLoaders })` (не импортируется) — web-server остаётся leaf-модулем без back-reference в main. Считается в main против live-Map'ов, поэтому отвечает корректно **даже когда renderer перезагружается/расфокушен** (в отличие от bridgeRequest-пути `getClaudeTabStatusBatch`, который ходит в renderer).
@@ -69,10 +69,11 @@ GET /api/active-loaders   (Bearer-token, тот же ~/.noted-terminal/web-token
   именно потому, что запустила rebuild — ждать её = вечный дедлок. iOS-путь без `returnTo`
   больше не делает собственный blocking preflight: телефон показывает confirm/status, а
   решение “что можно остановить, а что надо ждать” живёт здесь, в Mac-side Voice Record.
-- **Auto-stop только для обычных процессов**: перед wait endpoint пробует остановить blockers
-  `kind:"process"` / devServer через `POST /terminal/stop`. Это нужно для `npm run dev` и
-  похожих долгоживущих серверов, которые иначе держат install бесконечно. AI/Claude/Codex/
-  Gemini blockers никогда не auto-stop'ятся — их ждём, чтобы не убить turn посередине.
+- **Auto-stop только для обычных процессов**: исторически endpoint пробовал остановить blockers
+  `kind:"process"` / devServer через `POST /terminal/stop`. Новый `/api/active-loaders` не
+  возвращает ручные shell-команды как blockers, а restart-after-owned процессы отдаёт отдельным
+  `kind:"restart-after"` — их нужно ждать, а не auto-stop'ить. AI/Claude/Codex/Gemini blockers
+  также никогда не auto-stop'ятся, чтобы не убить turn посередине.
   Результат пишется в `wait.autoStopped`/`job.autoStopped` для desktop и iOS status UI.
   Если установленный прод ещё не знает `/terminal/stop`, Voice Record использует fallback
   Ctrl+C через старый `/terminal/run` route.

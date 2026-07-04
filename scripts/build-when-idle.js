@@ -4,7 +4,7 @@
 //
 // Polls the PRODUCTION app's local web API (GET /api/active-loaders) and waits
 // until every tab across every project has gone idle — no live Claude (PTY or
-// SDK), no busy Gemini, no running process (npm run dev counts). Then it runs
+// SDK), no busy Gemini, no restart-after-owned shell process. Then it runs
 // `npm run build:install`, which gracefully quits the app, rebuilds, reinstalls
 // and reopens it.
 //
@@ -118,6 +118,7 @@ const KIND_LABEL = {
   'claude-sdk': C.cyan + 'claude-sdk' + C.reset,
   gemini: C.magenta + 'gemini' + C.reset,
   process: C.yellow + 'process' + C.reset,
+  'restart-after': C.yellow + 'restart-after' + C.reset,
 };
 // Stable per-tab description used both in the live list and in the closed/idle
 // announcements, so "what appeared" and "what went idle" read identically.

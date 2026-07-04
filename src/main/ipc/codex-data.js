@@ -817,10 +817,41 @@ function buildCodexFullHistory(records, sessionId) {
   let currentTurnIndex = -1;
   let pendingThinking = '';
   let latestTokenCountInfo = null;
+  let lastDisplayedModel = null;
+  let lastDisplayedEffort = null;
   let lastTopLevelCompactLine = -Infinity;
 
   for (const record of records) {
     const payload = record.payload || {};
+
+    if (record.type === 'turn_context') {
+      const model = typeof payload.model === 'string' ? payload.model.trim() : '';
+      const effort = typeof payload.effort === 'string' ? payload.effort.trim() : '';
+      const nextTurnIndex = currentTurnIndex + 1;
+      if (model && model !== lastDisplayedModel) {
+        entries.push({
+          uuid: stableUuid(sessionId, record.__line, 'codex-model'),
+          role: 'slash',
+          timestamp: recordTimestamp(record),
+          content: `/model ${model}`,
+          sessionId,
+          turnIndex: nextTurnIndex,
+        });
+        lastDisplayedModel = model;
+      }
+      if (effort && effort !== lastDisplayedEffort) {
+        entries.push({
+          uuid: stableUuid(sessionId, record.__line, 'codex-effort'),
+          role: 'slash',
+          timestamp: recordTimestamp(record),
+          content: `/effort ${effort}`,
+          sessionId,
+          turnIndex: nextTurnIndex,
+        });
+        lastDisplayedEffort = effort;
+      }
+      continue;
+    }
 
     if (record.type === 'compacted') {
       const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};

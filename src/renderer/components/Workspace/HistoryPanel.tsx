@@ -3299,7 +3299,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
-      if (detail?.tabId === tabId) scrollToBottom(true);
+      if (detail?.tabId === tabId) scrollToBottom(false);
     };
     window.addEventListener('history-panel:scroll-to-bottom', handler);
     return () => window.removeEventListener('history-panel:scroll-to-bottom', handler);

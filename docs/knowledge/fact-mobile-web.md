@@ -221,7 +221,8 @@ Native iOS также использует `GET /api/active-loaders` как pref
 иначе iOS показывает ложный alert «Terminal занят» при полностью idle вкладках. AI tabs
 блокируют install только через свои deterministic busy-сигналы (`claudeTurnBusy`/spinner/local
 command, Codex rollout `task_started`, SDK query, Gemini busy); ordinary shell commands
-блокируют через `terminalCommandState.isRunning`. Сам install endpoint при этом **не**
+блокируют только если `/api/active-loaders` отдаёт `kind:"restart-after"` — команду реально
+запустил `Restart after`. Сам install endpoint при этом **не**
 находится в custom-terminal — его держит Voice Record, потому что `build:install` закрывает
 Noted Terminal и управляющий HTTP-сервер цели может исчезнуть в середине операции.
 
@@ -654,8 +655,8 @@ launch переживёт ручное вмешательство и вернё�
 
 `commandRunning=true` у AI-вкладки в mobile/control-bar логах означает «жив процесс или
 стартовый process strip», а не обязательно busy-loader пользовательского turn'а. Для
-`/active-loaders` AI-вкладка блокирует install/deploy только по deterministic busy-сигналам
-или обычному shell-процессу; `starting`/process strip нужен для видимости состояния вкладки,
+`/active-loaders` AI-вкладка блокирует install/deploy только по deterministic busy-сигналам,
+а ordinary shell-процесс — только если он запущен `Restart after`; `starting`/process strip нужен для видимости состояния вкладки,
 но не должен превращаться в глобальный install blocker.
 
 Layout changes идут отдельным полем snapshot'а `layoutChangedProjectIds`. Renderer вызывает

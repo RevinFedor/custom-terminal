@@ -4340,12 +4340,12 @@ function App() {
         <>
           {/* Backdrop */}
           <div
-            className="fixed inset-0 z-[99]"
+            className="fixed inset-0 z-[10000]"
             onClick={() => setProjectContextMenu(null)}
           />
           {/* Menu */}
           <div
-            className="fixed bg-[#252526] border border-[#444] rounded-lg shadow-xl py-1 min-w-[140px] z-[100]"
+            className="fixed bg-[#252526] border border-[#444] rounded-lg shadow-xl py-1 min-w-[140px] z-[10001]"
             style={{ left: projectContextMenu.x, top: projectContextMenu.y }}
           >
             <button

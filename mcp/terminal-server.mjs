@@ -670,7 +670,7 @@ const TOOLS = [
   },
   {
     name: 'build_install_noted_terminal',
-    description: 'Ask the external Voice Record app to run Noted Terminal `npm run build:install`. Use this instead of run_command/build:i when the caller is inside Noted Terminal: the app will quit/reinstall/reopen, while Voice Record survives and sends a completion prompt back to the originating AI tab after the original tab/session is restored. This tool returns as soon as Voice Record accepts the job; it does not wait for the build. Before spawning the build, Voice Record OBSERVES the running prod app via GET /api/active-loaders and waits until every OTHER session (neighbour tabs/projects with a live Claude/Codex/Gemini turn or a running process like `npm run dev`) goes idle — the caller\'s own tab is excluded so it never deadlocks on itself. Because build:install pkills the whole app, this protects residual neighbour work; the wait can be long if a neighbour project is mid-turn. Progress (current blockers / phase pending→observing→building→finished) is visible in Voice Record GET /api/terminal/build-install under job.phase and job.wait.',
+    description: 'Ask the external Voice Record app to run Noted Terminal `npm run build:install`. Use this instead of run_command/build:i when the caller is inside Noted Terminal: the app will quit/reinstall/reopen, while Voice Record survives and sends a completion prompt back to the originating AI tab after the original tab/session is restored. This tool returns as soon as Voice Record accepts the job; it does not wait for the build. Before spawning the build, Voice Record OBSERVES the running prod app via GET /api/active-loaders and waits until every OTHER blocker goes idle: live Claude/Codex/Gemini turns and shell commands that were actually launched by Restart after. Manual shell commands like `npm run dev`, `npm run build`, or `./deploy.sh` are not blockers by themselves. The caller\'s own tab is excluded so it never deadlocks on itself. Progress (current blockers / phase pending→observing→building→finished) is visible in Voice Record GET /api/terminal/build-install under job.phase and job.wait.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1100,7 +1100,7 @@ async function callTool(name, args) {
       let text = 'Voice Record accepted Noted Terminal build:install.';
       text += '\nVoice Record: pid=' + result.pid + ' port=' + result.port;
       if (job.id) text += '\nJob: ' + job.id;
-      text += '\nVoice Record will first WAIT for every other Noted Terminal session (neighbour tabs/projects mid-turn or running a process) to go idle before spawning the build; your own tab' + (returnToTabId ? ' (' + returnToTabId + ')' : '') + ' is excluded from that wait. Live blockers + phase are in GET /api/terminal/build-install (job.phase / job.wait).';
+      text += '\nVoice Record will first WAIT for every other Noted Terminal blocker (neighbour tabs/projects mid-turn or a Restart-after-owned shell command) to go idle before spawning the build; your own tab' + (returnToTabId ? ' (' + returnToTabId + ')' : '') + ' is excluded from that wait. Manual shell commands are not blockers by themselves. Live blockers + phase are in GET /api/terminal/build-install (job.phase / job.wait).';
       if (returnTo) {
         text += '\nReturn target: tab=' + (returnTo.tabId || '-') + (sessionId ? ' session=' + sessionId : ' session=(not yet known)');
         if (tabName || commandType) text += ' (' + [tabName, commandType].filter(Boolean).join(', ') + ')';

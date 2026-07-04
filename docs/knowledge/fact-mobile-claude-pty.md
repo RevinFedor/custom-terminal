@@ -176,6 +176,7 @@ Graceful degrade — обязателен: старый prod-asar (до этих
 - Нажал Start/Resume с iOS — вкладка бесконечно показывает `starting`, хотя HTTP `/resume` уже вернул success
 - Остановил Claude до первого prompt — iPhone показывает Resume или copy-id, хотя сохранённого разговора нет
 - После `New → Claude` на iPhone `/model` или `/effort` мелькает в истории и исчезает после reload
+- В History на iPhone slash-команда видна слитно (`/modelHaiku`, `/effortLow`) вместо `/model haiku` / `/effort low`
 - После ответа Claude thinking пропал, но assistant-текст появился только через секунду — `done` перепутали с published history
 - После Resume/Start следующий prompt попал в `Choose working directory` / update prompt вместо composer
 - Нажал Stop/Close на Claude/Codex, но iOS/History сразу показывает input или Resume до реального exit — пропущен runtime `stopping`

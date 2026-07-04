@@ -120,10 +120,7 @@ function formatSlashCommandDisplay(name, args = '') {
   if (!cleanName) return null;
   const cleanArgs = String(args || '').trim();
   if (!cleanArgs) return '/' + cleanName;
-  const parts = cleanArgs.split(/\s+/).filter(Boolean);
-  const compactArgs = parts.length > 0 && parts.length <= 3 && parts.every((part) => /^[A-Za-z0-9_-]+$/.test(part));
-  if (!compactArgs) return '/' + cleanName + ' ' + cleanArgs;
-  return '/' + cleanName + parts.map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join('');
+  return '/' + cleanName + ' ' + cleanArgs;
 }
 
 function slashCommandDisplayFromText(text) {
@@ -1141,6 +1138,28 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         return { success: false, error: 'Selected range not found in active history' };
       }
 
+      if (startUuid === endUuid) {
+        const selected = activeHistory[startIndex];
+        if (selected?.type === 'user' && selected.isCompactSummary) {
+          let rawContent = selected.message?.content;
+          if (Array.isArray(rawContent)) {
+            rawContent = rawContent.find(item => item.type === 'text')?.text || '';
+          }
+          const compactSummary = typeof rawContent === 'string'
+            ? rawContent
+              .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+              .replace(/\[200~/g, '')
+              .replace(/~\]/g, '')
+              .trim()
+            : '';
+          let output = `# Claude Session Export (Range)\nSession: ${sessionId}\n\n---\n\n`;
+          output += '\n═══ HISTORY COMPACTED ═══\n';
+          if (compactSummary) output += '\n' + compactSummary + '\n';
+          output += '\n';
+          return { success: true, content: output };
+        }
+      }
+
       const minIdx = Math.min(startIndex, endIndex);
       let maxIdx = Math.max(startIndex, endIndex);
 
@@ -1209,7 +1228,6 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         if (entry.isSidechain || entry.type === 'summary') continue;
 
         if (entry.type === 'user') {
-          if (!includeUser) continue;
           let rawContent = entry.message?.content;
           if (Array.isArray(rawContent)) {
             if (rawContent.some(item => item.type === 'tool_result')) continue;
@@ -1222,6 +1240,27 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
             rawContent = textBlock?.text || '';
           }
           if (!rawContent || typeof rawContent !== 'string') continue;
+
+          if (entry.isCompactSummary) {
+            let pairedCompactBoundaryUuid = null;
+            const idxInHistory = activeHistory.findIndex(e => e.uuid === entry.uuid);
+            for (let j = idxInHistory - 1; j >= 0; j--) {
+              const prev = activeHistory[j];
+              if (!prev || prev.isSidechain || prev.type === 'summary') continue;
+              if (prev.type === 'system' && prev.subtype === 'compact_boundary') {
+                pairedCompactBoundaryUuid = prev.uuid;
+              }
+              break;
+            }
+            const pairedBoundaryAlreadyInRange = !!pairedCompactBoundaryUuid
+              && range.some(e => e.uuid === pairedCompactBoundaryUuid);
+            if (!pairedBoundaryAlreadyInRange) {
+              output += '\n═══ HISTORY COMPACTED ═══\n';
+              output += '\n' + rawContent.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').replace(/\[200~/g, '').replace(/~\]/g, '').trim() + '\n\n';
+            }
+            continue;
+          }
+
           if (rawContent.includes('[Request interrupted')) continue;
           if (rawContent.includes('<command-name>') ||
               rawContent.includes('<command-message>') ||
@@ -1229,6 +1268,8 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
               rawContent.includes('<system-reminder>') ||
               rawContent.includes('<bash-notification>') ||
               rawContent.startsWith('Caveat: The messages below')) continue;
+
+          if (!includeUser) continue;
 
           output += '## User\n' + rawContent.replace(/\[200~/g, '').replace(/~\]/g, '').trim() + '\n\n';
         }
@@ -3884,7 +3925,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       const shouldSkipPromptText = (text) => {
         if (!text) return true;
         if (text.startsWith('[Request interrupted') || text === '[User cancelled]') return true;
-        if (text.includes('<local-command-stdout>')) return true;
+        if (text.includes('<local-command-stdout>') || text.includes('<local-command-caveat>')) return true;
         if (text.includes('<bash-notification>') || text.includes('<shell-id>')) return true;
         if (text.includes('<user-prompt-submit-hook>') || text.includes('<task-notification>')) return true;
         if (text.startsWith('Caveat: The messages below')) return true;
@@ -3943,7 +3984,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
           } else {
             entries.push({
               uuid: entry.uuid,
-              role: 'queued',
+              role: 'user',
               timestamp: entry.timestamp || '',
               content: cleanContent,
               queueStatus: 'sent',
@@ -4002,15 +4043,37 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
           if (shouldSkipPromptText(rawContent)) continue;
           if (entry.isMeta) continue;
 
+          let cleanContent = normalizeQueuedText(rawContent);
+          if (!cleanContent) continue;
+          dropMatchingQueuedEntry(cleanContent);
+
+          if (entry.isCompactSummary) {
+            let pairedWithCompactBoundary = false;
+            for (let j = i - 1; j >= 0; j--) {
+              const prev = historyBranch[j];
+              if (!prev || prev.isSidechain || prev.type === 'summary') continue;
+              pairedWithCompactBoundary = prev.type === 'system' && prev.subtype === 'compact_boundary';
+              break;
+            }
+            if (pairedWithCompactBoundary) {
+              continue;
+            }
+            entries.push({
+              uuid: entry.uuid,
+              role: 'compact',
+              timestamp: entry.timestamp || '',
+              content: 'COMPACTED',
+              compactSummary: cleanContent,
+              sessionId: entrySid
+            });
+            continue;
+          }
+
           const slashEntry = slashCommandEntryFromText(rawContent, entry.uuid, entry.timestamp, entrySid);
           if (slashEntry) {
             entries.push(slashEntry);
             continue;
           }
-
-          let cleanContent = normalizeQueuedText(rawContent);
-          if (!cleanContent) continue;
-          dropMatchingQueuedEntry(cleanContent);
 
           const isContinued = cleanContent.startsWith('This session is being continued from a previous conversation');
 

@@ -4684,14 +4684,18 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   //
   // While the call is in-flight, restartInFlight contains tabId; render layer
   // uses it to grey-out both buttons (no double-fire while polling).
-  async function runDeterministicStop(tabId: string, restart: boolean): Promise<boolean> {
+  async function runDeterministicStop(
+    tabId: string,
+    restart: boolean,
+    commandMeta?: { source: 'restart-after'; command?: string }
+  ): Promise<boolean> {
     if (restartInFlightRef.current.has(tabId)) return false;
     const refNext = new Set(restartInFlightRef.current);
     refNext.add(tabId);
     restartInFlightRef.current = refNext;
     setRestartInFlight(new Set(refNext));
     try {
-      const res = await ipcRenderer.invoke('terminal:deterministic-stop', { tabId, restart });
+      const res = await ipcRenderer.invoke('terminal:deterministic-stop', { tabId, restart, commandMeta });
       if (!res?.success) {
         console.warn('[TabBar] deterministic-stop residual', res);
       }
@@ -4716,7 +4720,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   ) => {
     const cleanCommand = command?.trim();
     if (!cleanCommand) {
-      await runDeterministicStop(tabId, true);
+      await runDeterministicStop(tabId, true, { source: 'restart-after' });
       return;
     }
     const coalesceFiniteScript = !!options?.coalesceFiniteScript && !isDevRestartCommand(cleanCommand);
@@ -4746,7 +4750,10 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       return;
     }
     const killPrefix = await buildKillPortsPrefix(tabId);
-    ipcRenderer.send('terminal:input', tabId, `${killPrefix}${cleanCommand}\r`);
+    ipcRenderer.send('terminal:input', tabId, `${killPrefix}${cleanCommand}\r`, {
+      source: 'restart-after',
+      command: cleanCommand,
+    });
     if (coalesceFiniteScript) {
       const existing = restartAfterScriptRunsRef.current.get(tabId);
       if (existing?.command === cleanCommand) {

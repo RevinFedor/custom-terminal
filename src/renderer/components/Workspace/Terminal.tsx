@@ -177,6 +177,18 @@ function _bridgeModelMatchesTarget(targetModel: string, bridgeModel: string | nu
   return needles.some((needle) => live.includes(needle));
 }
 
+function getClaudeVisibleStatusModel(tabId: string): string | null {
+  const visible = terminalRegistry.getVisibleText(tabId).replace(/\u00a0/g, ' ');
+  const matches = Array.from(visible.matchAll(/\[([^\]\n]{2,80})\]\s*\d+%/g));
+  const last = matches[matches.length - 1]?.[1];
+  return last ? last.trim() : null;
+}
+
+function visibleClaudeModelMatchesTarget(tabId: string, targetModel: string): string | null {
+  const liveModel = getClaudeVisibleStatusModel(tabId);
+  return liveModel && _bridgeModelMatchesTarget(targetModel, liveModel) ? liveModel : null;
+}
+
 function detectClaudeSettingsDialogFromVisibleText(text: string): 'ModelDialog' | 'EffortDialog' | null {
   const normalized = String(text || '').replace(/\u00a0/g, ' ');
   if (!normalized.trim()) return null;
@@ -702,14 +714,18 @@ function waitForClaudeStartupModelBridge(tabId: string, model: string, timeoutMs
   if (current && _bridgeModelMatchesTarget(model, current.model)) {
     return Promise.resolve('already:' + current.model);
   }
+  const visibleModel = visibleClaudeModelMatchesTarget(tabId, model);
+  if (visibleModel) return Promise.resolve('visible:' + visibleModel);
 
   return new Promise((resolve) => {
     let done = false;
     let timer: number | undefined;
+    let visibleTimer: number | undefined;
     const finish = (reason: string) => {
       if (done) return;
       done = true;
       if (timer !== undefined) window.clearTimeout(timer);
+      if (visibleTimer !== undefined) window.clearInterval(visibleTimer);
       ipcRenderer.removeListener('claude:bridge-update', handler);
       resolve(reason);
     };
@@ -720,6 +736,10 @@ function waitForClaudeStartupModelBridge(tabId: string, model: string, timeoutMs
       if (_bridgeModelMatchesTarget(model, liveModel)) finish('matched:' + liveModel);
     };
     timer = window.setTimeout(() => finish('timeout'), timeoutMs);
+    visibleTimer = window.setInterval(() => {
+      const liveModel = visibleClaudeModelMatchesTarget(tabId, model);
+      if (liveModel) finish('visible:' + liveModel);
+    }, 250);
     ipcRenderer.on('claude:bridge-update', handler);
   });
 }
@@ -798,7 +818,7 @@ function maybeRecoverClaudeStartupDefaultsAfterLateModelBridge(tabId: string, li
     try {
       const result = await ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff, {
         source: 'startup-defaults:bridge-late-effort',
-        stashFirst: false,
+        stashFirst: true,
         armPromptBoundaryOnSubmit: true,
       });
       if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
@@ -1661,7 +1681,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           try {
             const result = await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model, {
               source: 'startup-defaults:bridge-model',
-              stashFirst: false,
+              stashFirst: true,
               armPromptBoundaryOnSubmit: true,
             });
             if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
@@ -1742,7 +1762,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       try {
         const result = await ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff, {
           source: 'startup-defaults:bridge-effort',
-          stashFirst: false,
+          stashFirst: true,
           armPromptBoundaryOnSubmit: true,
         });
         if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
@@ -1786,7 +1806,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           try {
             const result = await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model, {
               source: 'startup-defaults:tui-model',
-              stashFirst: false,
+              stashFirst: true,
               armPromptBoundaryOnSubmit: true,
             });
             if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
@@ -1844,7 +1864,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         try {
           const result = await ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff, {
             source: 'startup-defaults:tui-effort',
-            stashFirst: false,
+            stashFirst: true,
             armPromptBoundaryOnSubmit: true,
           });
           if (result?.success !== true) throw new Error(result?.error || 'send-command failed');

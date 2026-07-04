@@ -717,7 +717,8 @@ ipcMain.handle('dock:set-icon-data-url', (_event, payload = {}) => {
 });
 
 ipcMain.handle('dock:reset-icon', () => ({ success: resetDockIcon() }));
-const terminalCommandState = new Map(); // tabId -> { isRunning: boolean, lastExitCode: number, lastCommand?: string, lastCommandAt?: number, lastCommandCwd?: string }
+const terminalCommandState = new Map(); // tabId -> { isRunning: boolean, lastExitCode: number, lastCommand?: string, lastCommandAt?: number, lastCommandCwd?: string, activeCommandSource?: string, activeCommand?: string }
+const terminalPendingCommandMeta = new Map(); // tabId -> metadata for the next OSC 133;B command-start
 const terminalInputLineBuffers = new Map(); // tabId -> best-effort shell input line for "run last project command"
 const terminalInputEscapeStates = new Map(); // tabId -> pending ANSI input sequence state
 const codexFinishDebounceTimers = new Map(); // tabId -> timeout; suppress shell D→B blips inside Codex TUI
@@ -727,6 +728,8 @@ const terminalOutputBuffer = new Map();  // tabId -> { lines: string[], maxLines
 const TERMINAL_OUTPUT_MAX_LINES = 500;
 const LAST_COMMANDS_BY_CWD_KEY = 'terminal:last-command-by-cwd';
 const LAST_COMMANDS_BY_CWD_LIMIT = 200;
+const TERMINAL_COMMAND_META_TTL_MS = 15000;
+const RESTART_AFTER_COMMAND_SOURCE = 'restart-after';
 const terminalHeadlessMirrors = new Map(); // tabId -> { terminal, pending, writeSeq, flushedSeq, failed }
 const HEADLESS_XTERM_SCROLLBACK = 10000;
 const HEADLESS_XTERM_FLUSH_TIMEOUT_MS = 900;
@@ -763,6 +766,65 @@ function rememberDetectedTerminalCommand(tabId, command) {
   if (!tabId || !terminals.has(tabId)) return;
   if (!shouldCaptureShellInputLine(tabId)) return;
   rememberTerminalLastCommand(tabId, command);
+}
+
+function normalizeTerminalCommandMeta(meta) {
+  if (!meta || typeof meta !== 'object') return null;
+  const source = typeof meta.source === 'string' ? meta.source.trim() : '';
+  if (source !== RESTART_AFTER_COMMAND_SOURCE) return null;
+  const rawCommand = typeof meta.command === 'string' ? meta.command.trim() : '';
+  const command = normalizeRememberedShellCommand(rawCommand) || rawCommand;
+  return {
+    source,
+    command: command || null,
+    at: Date.now(),
+  };
+}
+
+function queueTerminalCommandMeta(tabId, meta) {
+  if (!tabId) return;
+  const normalized = normalizeTerminalCommandMeta(meta);
+  if (!normalized) return;
+  terminalPendingCommandMeta.set(tabId, normalized);
+  console.log('[CommandOrigin] queued tab=' + String(tabId).slice(-12) + ' source=' + normalized.source + ' command=' + JSON.stringify(normalized.command || ''));
+}
+
+function clearTerminalActiveCommandMeta(state) {
+  if (!state) return;
+  delete state.activeCommandSource;
+  delete state.activeCommand;
+  delete state.activeCommandStartedAt;
+}
+
+function applyTerminalCommandStartMeta(tabId, state) {
+  const pending = terminalPendingCommandMeta.get(tabId) || null;
+  terminalPendingCommandMeta.delete(tabId);
+  if (pending && Date.now() - pending.at <= TERMINAL_COMMAND_META_TTL_MS) {
+    state.activeCommandSource = pending.source;
+    state.activeCommand = pending.command || null;
+    state.activeCommandStartedAt = Date.now();
+    console.log('[CommandOrigin] active tab=' + String(tabId).slice(-12) + ' source=' + pending.source + ' command=' + JSON.stringify(pending.command || ''));
+    return;
+  }
+  clearTerminalActiveCommandMeta(state);
+}
+
+function clearTerminalCommandOrigin(tabId, state, reason = 'clear') {
+  if (!tabId || !state) return;
+  if (state.activeCommandSource) {
+    console.log('[CommandOrigin] clear tab=' + String(tabId).slice(-12) + ' source=' + state.activeCommandSource + ' reason=' + reason);
+  }
+  clearTerminalActiveCommandMeta(state);
+  terminalPendingCommandMeta.delete(tabId);
+}
+
+function queueRestartRerunCommandMeta(tabId, meta) {
+  if (!meta || typeof meta !== 'object') return;
+  const state = terminalCommandState.get(tabId) || null;
+  const command = typeof meta.command === 'string' && meta.command.trim()
+    ? meta.command.trim()
+    : (state?.lastCommand || terminalInitialCommand.get(tabId) || '');
+  queueTerminalCommandMeta(tabId, { ...meta, command });
 }
 
 async function rememberTerminalLastCommandForCwd(tabId, command, at = Date.now(), knownCwd = null) {
@@ -1682,10 +1744,11 @@ function resolveActivityIdentity(tabId, engine) {
 //   • SDK Claude   → sdkSessions (one entry per in-flight query())
 //   • Gemini       → geminiSpinnerBusy
 //   • Codex        → rollout watcher task_started/task_complete busy
-//   • devServer /  → terminalCommandState.isRunning  (OSC 133 B/D), excluding
-//     any process      AI CLI tabs whose PTY process is merely alive at prompt
+//   • restart-after shell command → terminalCommandState.isRunning + command
+//                    origin metadata (OSC 133 B/D), excluding AI CLI tabs whose
+//                    PTY process is merely alive at prompt
 // Consumed by the external `build:i-obs` poller via GET /api/active-loaders so
-// a rebuild waits until every Claude / Gemini / SDK / running process across
+// a rebuild waits until every Claude / Gemini / SDK / restart-after process across
 // the app has gone idle. Runs in main (not via the renderer bridge) so it still
 // answers correctly while the renderer is mid-reload or unfocused.
 function computeActiveLoaders() {
@@ -1701,7 +1764,7 @@ function computeActiveLoaders() {
     if (projectManager?.db?.db) {
       try {
         row = projectManager.db.db.prepare(
-          'SELECT project_id, name, command_type, tab_type, claude_session_id, codex_session_id, gemini_session_id FROM tabs WHERE tab_id = ? LIMIT 1'
+          'SELECT project_id, name, command_type, tab_type, claude_session_id, codex_session_id, gemini_session_id, restart_after_tab_id, restart_after_command FROM tabs WHERE tab_id = ? LIMIT 1'
         ).get(tabId) || null;
       } catch {}
     }
@@ -1804,17 +1867,20 @@ function computeActiveLoaders() {
     seen.add(tabId);
   }
 
-  // 5) Any non-AI running process (npm run dev, build scripts, long shell
-  //    commands). The user asked that "npm run dev тоже считается" — so any
-  //    non-AI isRunning tab blocks, not only commandType==='devServer'. AI CLI
-  //    tabs are excluded here: their process can be alive and idle at the prompt,
-  //    while install is allowed to close them gracefully. They block only through
-  //    their own deterministic busy/loader signals above.
+  // 5) Restart-after-owned non-AI process. Manual shell commands (`npm run dev`,
+  //    `npm run build`, `./deploy.sh`) are not install blockers by themselves:
+  //    they are ordinary terminal state. A shell command blocks the rebuild only
+  //    when it was launched by Restart after and that subscription is still set on
+  //    the tab. AI CLI tabs are excluded here; they block only through deterministic
+  //    busy/loader signals above.
   for (const [tabId, st] of terminalCommandState) {
     if (!st?.isRunning || seen.has(tabId)) continue;
     if (isAiRuntimeTab(tabId)) continue;
-    const cmd = terminalInitialCommand.get(tabId) || null;
-    loaders.push({ tabId, kind: 'process', status: 'running', command: cmd, ...labelFor(tabId) });
+    if (st.activeCommandSource !== RESTART_AFTER_COMMAND_SOURCE) continue;
+    const row = tabRowFor(tabId);
+    if (!row?.restart_after_tab_id) continue;
+    const cmd = st.activeCommand || row?.restart_after_command || terminalInitialCommand.get(tabId) || null;
+    loaders.push({ tabId, kind: 'restart-after', status: 'running', source: RESTART_AFTER_COMMAND_SOURCE, command: cmd, ...labelFor(tabId) });
     seen.add(tabId);
   }
 
@@ -4687,6 +4753,7 @@ function finalizeCodexCommandFinished(tabId, exitCode = 0, reason = 'command-fin
     isRunning: false,
     lastExitCode: Number.isFinite(Number(exitCode)) ? Number(exitCode) : 0,
   });
+  clearTerminalCommandOrigin(tabId, terminalCommandState.get(tabId), reason);
 
   if (activityOpenIntervals.get(tabId)?.engine === 'codex') {
     recordActivity(tabId, false, 'codex');
@@ -4805,6 +4872,7 @@ function parseOSC133AndEmit(tabId, data) {
         }
         clearCodexDescendantExitRecheck(tabId, 'osc-b');
         state.isRunning = true;
+        applyTerminalCommandStartMeta(tabId, state);
         terminalCommandState.set(tabId, state);
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('terminal:command-started', { tabId });
@@ -4819,6 +4887,7 @@ function parseOSC133AndEmit(tabId, data) {
       case 'D': // Command finished
         state.isRunning = false;
         state.lastExitCode = param ? parseInt(param, 10) : 0;
+        clearTerminalCommandOrigin(tabId, state, 'osc-d');
         console.log(`[OSC 133] Tab ${tabId}: Command FINISHED (D) exitCode=${state.lastExitCode}`);
         clearClaudeEditableLastPrompt(tabId, 'osc-command-finished');
         // [RunAfterDiag] Correlate D markers with Claude liveness. If a D fires
@@ -4848,6 +4917,7 @@ function parseOSC133AndEmit(tabId, data) {
             if (liveCodex.length > 0) {
               const liveState = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: exitCode };
               liveState.isRunning = true;
+              clearTerminalCommandOrigin(tabId, liveState, 'codex-descendant-alive');
               terminalCommandState.set(tabId, liveState);
               console.warn(
                 '[CodexTurn] keep delayed command-finished tab=' + tabId.slice(-8) +
@@ -7117,6 +7187,7 @@ function startMcpHttpServer() {
           state.isRunning = true;
           state.lastCommand = commandText;
           state.lastCommandAt = Date.now();
+          clearTerminalCommandOrigin(tabId, state, 'terminal-mcp-start-ai');
           terminalCommandState.set(tabId, state);
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('terminal:command-started', { tabId });
@@ -10086,6 +10157,7 @@ ipcMain.on('terminal:force-command-started', (event, payload) => {
   clearCodexDescendantExitRecheck(tabId, 'force-command-started');
   const state = terminalCommandState.get(tabId) || { isRunning: false, lastCommand: null };
   state.isRunning = true;
+  clearTerminalCommandOrigin(tabId, state, 'force-command-started');
   terminalCommandState.set(tabId, state);
   const commandType = request.commandType
     || (codexKnownSessions.has(tabId) || codexLastRunCommandPayload.has(tabId) ? 'codex' : null)
@@ -10137,7 +10209,7 @@ ipcMain.on('log:renderer', (event, payload) => {
   console.log('[R] [RendererLogMeta] legacy=1 wc=' + event.sender.id + ' ' + String(payload || ''));
 });
 
-ipcMain.on('terminal:input', async (event, tabId, data) => {
+ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
   const term = terminals.get(tabId);
   if (!term) {
     console.error('[main] Terminal not found for tabId:', tabId);
@@ -10259,6 +10331,7 @@ ipcMain.on('terminal:input', async (event, tabId, data) => {
     console.warn('[terminal:input] pre-resume startup slash trim failed (non-fatal): ' + (e?.message || String(e)));
   }
 
+  queueTerminalCommandMeta(tabId, meta);
   captureTerminalInputForLastCommand(tabId, data);
 
   // ========== GEMINI INPUT STATE TRACKING ==========
@@ -11212,6 +11285,7 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
   const stashFirst = sendOptions.stashFirst === false ? false : true;
   const armPromptBoundaryOnSubmit = sendOptions.armPromptBoundaryOnSubmit === true || source.startsWith('startup-defaults:');
   const isSlashCommand = String(command || '').trimStart().startsWith('/');
+  const shouldDismissAutocomplete = sendOptions.dismissAutocomplete === true;
   const awaitClaudeUserMessageAudit = sendOptions.awaitUserMessageAudit === true && !isSlashCommand;
   console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" source=' + source + ' stashFirst=' + stashFirst + ' awaitAudit=' + awaitClaudeUserMessageAudit + ' slash=' + isSlashCommand + ' ts=' + Date.now());
   const term = terminals.get(tabId);
@@ -11225,9 +11299,9 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
   }
   // Stash flow: Ctrl+S clears current input by pushing it to Claude's stash;
   // after our slash-cmd submits, Claude auto-restores the user's prompt.
-  // Bracketed-paste short commands (<800 chars) open Claude's slash autocomplete
-  // dropdown — Esc dismisses it so the following Enter actually submits
-  // (otherwise hits PromptInput.onSubmit early-return guard on suggestions.length).
+  // Esc dismissal is opt-in only. Slash commands with arguments are handled by
+  // stash flow; forcing Esc here was a failed startup-defaults hypothesis and
+  // can leave extra TUI state around the command.
   // Danger zone (Press Ctrl-C again to exit) is no longer reachable since we
   // never send Ctrl+C from this path, but we still clear any stale DZ state.
   const dz = claudeCtrlCDangerZone.get(tabId);
@@ -11248,10 +11322,7 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
     promptBoundaryReason: source + ':' + command,
     awaitClaudeUserMessageAudit,
     claudeAuditTimeoutMs: CLAUDE_PASTE_AUDIT_TIMEOUT_MS,
-    // dismissAutocomplete intentionally OFF: slash-cmds with arguments (/model haiku,
-    // /effort low) don't match any prefix beyond the slash — autocomplete is empty
-    // by the time we send Enter, so PromptInput.onSubmit guard passes. Sending Esc
-    // here triggers Claude's "Esc again to clear" hint, visible briefly under input.
+    dismissAutocomplete: shouldDismissAutocomplete,
     logPrefix: '[send-command:' + tabId + (source !== 'send-command' ? ':' + source : '') + ']'
   });
 });
@@ -15956,7 +16027,7 @@ ipcMain.handle('system:free-project-ports', async (event, cwd) => {
 //      the previous command). PTY shell is never killed — only its children.
 //
 // Emits IPC `terminal:stop-progress` so the UI can lock the ↻ button until done.
-async function deterministicStopTerminal(tabId, restart = false) {
+async function deterministicStopTerminal(tabId, restart = false, options = {}) {
   if (!tabId) return { success: false, error: 'no tabId' };
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
@@ -15987,8 +16058,15 @@ async function deterministicStopTerminal(tabId, restart = false) {
   console.log('[DetermStop] tab=' + tabId + ' descendants=[' + descendants.join(',') + ']');
 
   if (descendants.length === 0 && ports.length === 0) {
+    const state = terminalCommandState.get(tabId);
+    if (state) {
+      state.isRunning = false;
+      clearTerminalCommandOrigin(tabId, state, 'deterministic-stop-empty');
+      terminalCommandState.set(tabId, state);
+    }
     emit('done', { killed: [], escalated: false, restarted: false });
     if (restart) {
+      queueRestartRerunCommandMeta(tabId, options.commandMeta);
       try { term.write('!!\r'); } catch {}
     }
     return { success: true, killed: [], escalated: false, restarted: !!restart };
@@ -16086,12 +16164,19 @@ async function deterministicStopTerminal(tabId, restart = false) {
   }
 
   console.log('[DetermStop] tab=' + tabId + ' clean: all descendants dead, all ports free' + (escalated ? ' (after SIGKILL)' : ''));
+  const stoppedState = terminalCommandState.get(tabId);
+  if (stoppedState) {
+    stoppedState.isRunning = false;
+    clearTerminalCommandOrigin(tabId, stoppedState, 'deterministic-stop');
+    terminalCommandState.set(tabId, stoppedState);
+  }
 
   // Restart in the SAME shell — `!!` re-executes whatever was last typed.
   // Shell is untouched throughout: we never killed term.pid itself, only its
   // children. Bash/zsh history is intact, prompt is at fresh state.
   let restarted = false;
   if (restart) {
+    queueRestartRerunCommandMeta(tabId, options.commandMeta);
     try { term.write('!!\r'); restarted = true; } catch (e) {
       console.log('[DetermStop] write !! failed: ' + e.message);
     }
@@ -16101,8 +16186,8 @@ async function deterministicStopTerminal(tabId, restart = false) {
 }
 
 ipcMain.handle('terminal:deterministic-stop', async (_event, args) => {
-  const { tabId, restart = false } = args || {};
-  return deterministicStopTerminal(tabId, restart);
+  const { tabId, restart = false, commandMeta = null } = args || {};
+  return deterministicStopTerminal(tabId, restart, { commandMeta });
 });
 
 // Small accessor for the "kill dev-ports" toggle (lives in renderer state).
@@ -17047,6 +17132,7 @@ ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
     claudeStartupIntents.set(tabId, { sessionId: null, at: Date.now(), reason: 'claude-spawn-with-watcher' });
     const state = terminalCommandState.get(tabId) || { isRunning: false, lastCommand: null };
     state.isRunning = true;
+    clearTerminalCommandOrigin(tabId, state, 'claude-spawn-with-watcher');
     terminalCommandState.set(tabId, state);
     claudeCliActive.set(tabId, true);
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -20653,6 +20739,7 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
   invalidateAiProcessLookupCache(tabId, 'codex');
   const commandState = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
   commandState.isRunning = true;
+  clearTerminalCommandOrigin(tabId, commandState, 'codex-run-command');
   terminalCommandState.set(tabId, commandState);
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('terminal:command-started', { tabId, commandType: 'codex' });
@@ -21320,6 +21407,7 @@ ipcMain.on('claude:run-command', async (event, { tabId, command, sessionId, fork
       claudeCliActive.set(tabId, true);
       const commandState = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
       commandState.isRunning = true;
+      clearTerminalCommandOrigin(tabId, commandState, 'claude-run-command');
       terminalCommandState.set(tabId, commandState);
       claudeStartupIntents.set(tabId, { sessionId: null, at: Date.now(), reason: 'claude-run-command' });
       if (mainWindow && !mainWindow.isDestroyed()) {

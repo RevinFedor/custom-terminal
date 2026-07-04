@@ -48,10 +48,12 @@ function emitHistoryAgentError(tabId: string, message: string) {
   }));
 }
 
-// True when an entry is NOT a regular user prompt — currently 'compact', 'continued',
-// 'docs_edit', 'docs_search'. Used widely to skip non-user entries in nav/copy/visibility.
+// True when an entry is NOT a regular user prompt. `isCompactSummary` can still
+// arrive as type:"user" in Claude JSONL, but it is the visible compact body,
+// not a terminal prompt with its own scroll/boundary position.
 // If a new attribute-style entry type is ever added, update this ONE place.
-function isAttributeEntry(entry: { type?: string }): boolean {
+function isAttributeEntry(entry: { type?: string; isCompactSummary?: boolean }): boolean {
+  if (entry.isCompactSummary) return true;
   return entry.type === 'compact' || entry.type === 'continued'
     || entry.type === 'docs_edit' || entry.type === 'docs_search';
 }
@@ -688,7 +690,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     x: number; y: number;
     range: { startIndex: number; endIndex: number };
     startUuid: string; endUuid: string;
-    crossesBoundary: boolean;  // range hit a compact or plan-mode boundary; popup keeps visual range and only Delete confirm auto-extends to 0
+    crossesBoundary: boolean;  // range hit compact/isCompactSummary/continued; Delete confirm can auto-extend to safe boundary
   } | null>(null);
   const [postPromptMode, setPostPromptMode] = useState(false);
   const [postPromptText, setPostPromptText] = useState('');
@@ -1181,7 +1183,19 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   // Custom scroll indicator + scroll-down arrow — DOM refs for direct update (no re-render on scroll)
   const thumbRef = useRef<HTMLDivElement>(null);
-  const arrowRef = useRef<HTMLDivElement>(null);
+  const arrowRef = useRef<HTMLButtonElement>(null);
+  const jumpTimelineToBottom = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, []);
+  const jumpTimelineToBottomAfterLayout = useCallback(() => {
+    jumpTimelineToBottom();
+    requestAnimationFrame(() => {
+      jumpTimelineToBottom();
+      requestAnimationFrame(jumpTimelineToBottom);
+    });
+  }, [jumpTimelineToBottom]);
 
   // CMD key state for tooltip activation
   const [isCmdHeld, setIsCmdHeld] = useState(false);
@@ -1264,6 +1278,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
     return false;
   }, [groupMap]);
+
+  // Claude can write one semantic compact as two JSONL records:
+  // system/compact_boundary, then an isCompactSummary user record. The boundary
+  // is the technical edge; the summary record is the user-facing compact content.
+  // Keep both records in Timeline entries for ranges/copy and old-history math,
+  // but hide the paired boundary dot. HistoryPanel renders the boundary row and
+  // embeds the summary there.
+  const hiddenCompactBoundaryIndices = useMemo(() => {
+    const indices = new Set<number>();
+    entries.forEach((entry, index) => {
+      const next = index + 1 < entries.length ? entries[index + 1] : null;
+      if (entry.type === 'compact' && next?.isCompactSummary) {
+        indices.add(index);
+      }
+    });
+    return indices;
+  }, [entries]);
 
   // ════════════════════════════════════════════════════════════
   // SECTION: CUSTOM SCROLLBAR — thumbRef/arrowRef direct DOM updates (avoid re-render on scroll)
@@ -1930,9 +1961,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // scrollHeight and never re-scrolled after loadTimeline replaced entries (its guard
   // `sessionId !== prevSessionRef` was already satisfied). Fix: ARM a pending flag on
   // key change, then CONSUME it on the first NON-EMPTY `entries` reference change (the
-  // post-load commit). The 2s poll also changes `entries`, but it always lands AFTER
-  // the pending flag was cleared → it never scrolls → manual scroll-up is preserved
-  // (see fact-timeline.md::Auto-Scroll при продолжении сессии — "не sticky-scroll").
+  // post-load commit). Separately, a real append (entries.length increase) always
+  // jumps to bottom; metadata-only refreshes with the same length do not.
   // Timing-independent: no setTimeout window to outrun a slow IPC load.
   const scrollKeyRef = useRef<string | null>(null);
   const pendingBottomRef = useRef(false);
@@ -1945,16 +1975,27 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   }, [tabId, sessionId]);
 
-  // effect: first non-empty `entries` commit after arming → jump scroll to bottom (double-rAF survives content-visibility:auto height correction), then disarm so poll updates don't fight manual scroll
+  // effect: first non-empty `entries` commit after arming → jump scroll to bottom (double-rAF survives content-visibility:auto height correction)
   useEffect(() => {
     if (!pendingBottomRef.current || entries.length === 0) return;
     pendingBottomRef.current = false;
-    const jump = () => {
-      const el = scrollRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
-    };
-    requestAnimationFrame(() => { jump(); requestAnimationFrame(jump); });
-  }, [entries]);
+    jumpTimelineToBottomAfterLayout();
+  }, [entries, jumpTimelineToBottomAfterLayout]);
+
+  // Desktop Timeline follows newly appended entries unconditionally. This is
+  // intentionally stronger than the old "preserve manual scroll during refresh"
+  // rule: if the transcript gained a new Timeline entry, the rail should land
+  // on the latest point immediately.
+  const lastTimelineAppendRef = useRef<{ key: string; length: number } | null>(null);
+  useEffect(() => {
+    const key = `${tabId}::${sessionId || ''}`;
+    const prev = lastTimelineAppendRef.current;
+    lastTimelineAppendRef.current = { key, length: entries.length };
+    if (!prev || prev.key !== key || entries.length === 0) return;
+    if (entries.length > prev.length) {
+      jumpTimelineToBottomAfterLayout();
+    }
+  }, [tabId, sessionId, entries.length, jumpTimelineToBottomAfterLayout]);
 
   // Auto-generate a tab title once the first real user prompt is materialized
   // in the transcript. Uses Timeline entries instead of raw terminal input so
@@ -2333,7 +2374,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       const uuidSet = historyVisibleUuids ? new Set(historyVisibleUuids) : new Set<string>();
       const newVisible = new Set<number>();
       entries.forEach((entry, index) => {
-        if (uuidSet.has(entry.uuid)) newVisible.add(index);
+        if (uuidSet.has(entry.uuid)) {
+          newVisible.add(index);
+        } else if (entry.isCompactSummary && index > 0 && uuidSet.has(entries[index - 1].uuid)) {
+          newVisible.add(index);
+        }
       });
       setVisibleEntryIndices(prev => {
         if (prev.size === newVisible.size && [...prev].every(i => newVisible.has(i))) return prev;
@@ -2353,7 +2398,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       for (let i = 0; i < entries.length; i++) {
         const e = entries[i];
         if (e.type === 'compact' || e.isPlan) {
-          lastBoundaryIdx = i;
+          lastBoundaryIdx = e.type === 'compact' && entries[i + 1]?.isCompactSummary ? i + 1 : i;
         }
       }
     }
@@ -2514,9 +2559,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         }
       });
 
-      // Inherit unreachable for compact/continued/plan/docs_edit/docs_search entries from next regular entry
+      // Inherit unreachable for attribute entries (compact/summary/continued/docs/plan) from next regular entry
       entries.forEach((entry, index) => {
-        if (entry.type !== 'compact' && entry.type !== 'continued' && entry.type !== 'docs_edit' && entry.type !== 'docs_search' && !entry.isPlan) return;
+        if (!isAttributeEntry(entry) && !entry.isPlan) return;
         if (index <= lastBoundaryIdx) {
           newUnreachable.add(index);
           return;
@@ -2667,6 +2712,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   const justSetRangeMenuRef = useRef(false);
 
+  const getHistoryPanelTargetUuid = useCallback((entry: TimelineEntry, index: number): string => {
+    // In Claude JSONL one semantic compact can be {compact_boundary, isCompactSummary user}.
+    // HistoryPanel renders the compact block at the boundary UUID and embeds the summary there,
+    // while Timeline shows only the summary dot. Route history-scroll clicks to the rendered row.
+    if (entry.isCompactSummary && index > 0 && entries[index - 1]?.type === 'compact') {
+      return entries[index - 1].uuid;
+    }
+    return entry.uuid;
+  }, [entries]);
+
   // ════════════════════════════════════════════════════════════
   // SECTION: CLICK DISPATCH — single/double/right-click + range-selection start; routes to terminal scroll, history-panel scroll, or range action menu
   // ════════════════════════════════════════════════════════════
@@ -2674,16 +2729,18 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const handleEntryClick = (entry: TimelineEntry, e?: React.MouseEvent) => {
     if (readOnly) {
       const index = entries.findIndex(e => e.uuid === entry.uuid);
+      const targetUuid = getHistoryPanelTargetUuid(entry, index);
       if (e) e.stopPropagation();
       if (!isHistoryOpen) setHistoryPanelOpen(tabId, true);
-      setHistoryScrollToUuid(entry.uuid);
+      setHistoryScrollToUuid(targetUuid);
       console.warn('[Timeline:HistoryScroll] request tab=' + tabId.slice(-12) +
-        ' uuid=' + entry.uuid.slice(0, 8) +
+        ' uuid=' + targetUuid.slice(0, 8) +
+        ' entryUuid=' + entry.uuid.slice(0, 8) +
         ' index=' + index +
         ' entries=' + entries.length +
         ' mode=read-only-preview open=' + isHistoryOpen);
       setClickedState({ index, status: 'loading' });
-      pendingHistoryScrollRef.current = { uuid: entry.uuid, index };
+      pendingHistoryScrollRef.current = { uuid: targetUuid, index };
       if (historyClickTimeoutRef.current) clearTimeout(historyClickTimeoutRef.current);
       historyClickTimeoutRef.current = setTimeout(() => {
         pendingHistoryScrollRef.current = null;
@@ -2718,7 +2775,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         // Our claude:fork-session-file rewrites all sessionIds in the copy, so forks don't
         // create this case in the first place.
         const sliced = entries.slice(range.startIndex, range.endIndex + 1);
-        const crossesBoundary = sliced.some(en => en.type === 'compact' || en.type === 'continued');
+        const crossesBoundary = sliced.some(en => en.type === 'compact' || en.type === 'continued' || en.isCompactSummary);
 
         // Position popup vertically centred on the SECOND click (the entry the user just
         // clicked on). Horizontal anchor is `right:` CSS at render time (popup hugs Timeline
@@ -2760,6 +2817,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
     const index = entries.findIndex(e => e.uuid === entry.uuid);
     const clickIsOldHistory = !isCodex && lastBoundaryIndex >= 0 && index <= lastBoundaryIndex;
+    const historyPanelTargetUuid = getHistoryPanelTargetUuid(entry, index);
 
     // Cmd+Click (macOS) / Ctrl+Click (other) → принудительно открыть History Panel и
     // проскроллить к этой записи. Обычный клик скроллит в терминале. Mental model
@@ -2768,20 +2826,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     // кликом при isHistoryOpen (scroll-in-history), Cmd просто гарантирует открытие.
     if (e && (e.metaKey || e.ctrlKey)) {
       if (!isHistoryOpen) setHistoryPanelOpen(tabId, true);
-      setHistoryScrollToUuid(entry.uuid);
+      setHistoryScrollToUuid(historyPanelTargetUuid);
       // Spinner on dot — HistoryPanel emits 'history-panel:scrolled-to' when done.
       // Safety: clear in case the panel never mounts (no session).
       console.warn('[Timeline:HistoryScroll] request tab=' + tabId.slice(-12) +
-        ' uuid=' + entry.uuid.slice(0, 8) +
+        ' uuid=' + historyPanelTargetUuid.slice(0, 8) +
+        ' entryUuid=' + entry.uuid.slice(0, 8) +
         ' index=' + index +
         ' entries=' + entries.length +
         ' mode=cmd-click open=' + isHistoryOpen);
       setClickedState({ index, status: 'loading' });
-      pendingHistoryScrollRef.current = { uuid: entry.uuid, index };
+      pendingHistoryScrollRef.current = { uuid: historyPanelTargetUuid, index };
       if (historyClickTimeoutRef.current) clearTimeout(historyClickTimeoutRef.current);
       historyClickTimeoutRef.current = setTimeout(() => {
         console.warn('[Timeline:HistoryScroll] timeout tab=' + tabId.slice(-12) +
-          ' uuid=' + entry.uuid.slice(0, 8) +
+          ' uuid=' + historyPanelTargetUuid.slice(0, 8) +
+          ' entryUuid=' + entry.uuid.slice(0, 8) +
           ' index=' + index +
           ' ms=' + HISTORY_SCROLL_SAFETY_TIMEOUT_MS);
         pendingHistoryScrollRef.current = null;
@@ -2793,18 +2853,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     // If history panel is open — scroll to entry in history only, skip terminal scroll
     // This includes compact/continued entries which have no terminal position but DO exist in history panel
     if (isHistoryOpen) {
-      setHistoryScrollToUuid(entry.uuid);
+      setHistoryScrollToUuid(historyPanelTargetUuid);
       console.warn('[Timeline:HistoryScroll] request tab=' + tabId.slice(-12) +
-        ' uuid=' + entry.uuid.slice(0, 8) +
+        ' uuid=' + historyPanelTargetUuid.slice(0, 8) +
+        ' entryUuid=' + entry.uuid.slice(0, 8) +
         ' index=' + index +
         ' entries=' + entries.length +
         ' mode=history-open');
       setClickedState({ index, status: 'loading' });
-      pendingHistoryScrollRef.current = { uuid: entry.uuid, index };
+      pendingHistoryScrollRef.current = { uuid: historyPanelTargetUuid, index };
       if (historyClickTimeoutRef.current) clearTimeout(historyClickTimeoutRef.current);
       historyClickTimeoutRef.current = setTimeout(() => {
         console.warn('[Timeline:HistoryScroll] timeout tab=' + tabId.slice(-12) +
-          ' uuid=' + entry.uuid.slice(0, 8) +
+          ' uuid=' + historyPanelTargetUuid.slice(0, 8) +
+          ' entryUuid=' + entry.uuid.slice(0, 8) +
           ' index=' + index +
           ' ms=' + HISTORY_SCROLL_SAFETY_TIMEOUT_MS);
         pendingHistoryScrollRef.current = null;
@@ -2882,7 +2944,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           // Walk backwards to find the closest previous entry with a locatable position
           for (let pi = index - 1; pi >= 0; pi--) {
             const prevEntry = entries[pi];
-            if (prevEntry.type === 'compact') continue;
+            if (isAttributeEntry(prevEntry)) continue;
             const prevLines = getSearchLines(prevEntry.content);
             if (prevLines.length === 0) continue;
 
@@ -3122,7 +3184,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       // Edit-range works inside one local history representation. Claude can relink
       // parentUuid; Codex uses a separate copy-on-write rollout rewrite.
       const rangeEntries = entries.slice(range.startIndex, range.endIndex + 1);
-      const hasCompact = rangeEntries.some(e => e.type === 'compact');
+      const hasCompact = rangeEntries.some(e => e.type === 'compact' || e.isCompactSummary);
       const hasContinued = rangeEntries.some(e => e.type === 'continued');
       if (!isCodex && (hasCompact || hasContinued)) {
         useUIStore.getState().showToast(
@@ -4095,6 +4157,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // ════════════════════════════════════════════════════════════
 
   const currentActiveEntry = activeTooltipIndex !== null ? entries[activeTooltipIndex] : null;
+  const currentActiveEntryIndex = activeTooltipIndex ?? -1;
+  const currentActiveEntryIsCompactSummary = !!currentActiveEntry?.isCompactSummary;
+  const currentActiveEntryDisplaysAsCompact = !!currentActiveEntry
+    && (currentActiveEntry.type === 'compact' || currentActiveEntryIsCompactSummary);
+  const currentActiveCompactBoundaryEntry = currentActiveEntryIsCompactSummary
+    && currentActiveEntryIndex > 0
+    && entries[currentActiveEntryIndex - 1]?.type === 'compact'
+    ? entries[currentActiveEntryIndex - 1]
+    : currentActiveEntry;
 
   const getCodexUsageTotal = (entry: TimelineEntry): number | null => {
     const u = entry.codexUsage;
@@ -4445,9 +4516,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         className="relative flex flex-col group"
         style={{
           width: slideIn ? `${effectiveWidth}px` : '0px',
-          backgroundColor: isExpandedLayout ? 'rgba(0, 0, 0, 0.85)' : 'rgba(0, 0, 0, 0.2)',
+          backgroundColor: '#1a1a1a',
           backdropFilter: 'blur(8px)',
-          borderLeft: slideIn ? '1px solid rgba(255, 255, 255, 0.05)' : 'none',
+          borderLeft: 'none',
           height: '100%',
           zIndex: 40,
           visibility: isVisible ? 'inherit' : 'hidden',
@@ -4587,6 +4658,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             const active = isSelected(entry, index);
             const isCompacted = entry.type === 'compact';
             const isLastEntry = index === entries.length - 1;
+            const isHiddenCompactBoundary = hiddenCompactBoundaryIndices.has(index);
+            if (isHiddenCompactBoundary) {
+              return <div key={entry.uuid} ref={el => segmentRefs.current[index] = el} style={{ display: 'none' }} />;
+            }
+            const isCompactSummaryMarker = !!entry.isCompactSummary;
+            const displaysAsCompact = isCompacted || isCompactSummaryMarker;
             // Fork marker at this position — only the SINGLE last snapshot UUID renders
             // the blue stripe (forkMarkerLastSnapIndex). Previously this used edge
             // detection (entry ∈ snap, next ∉ snap), which fired on every gap when the
@@ -4655,7 +4732,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               claudeMemoryBoundaryIndex >= 0 &&
               index <= claudeMemoryBoundaryIndex;
 
-            if (isCompacted) {
+            if (displaysAsCompact) {
               dotColor = isHovered ? '#fbbf24' : '#a67c1a';
               dotGlow = isHovered ? '0 0 10px rgba(251, 191, 36, 0.5)' : 'none';
             } else if (isContinued) {
@@ -4695,17 +4772,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             }
 
             // ── Dot size ──
-            const dotWidth = isCompacted
-              ? (isInViewport ? '12px' : '14px')
+            const dotWidth = displaysAsCompact
+              ? (isHovered ? '10px' : '7px')
               : showAsChild
                 ? (isHovered ? '8px' : (isInViewport ? '8px' : '4px'))
                 : (isHovered ? '10px' : (isInViewport ? '10px' : '5px'));
-            const dotHeight = isCompacted
-              ? (isInViewport ? '4px' : '3px')
+            const dotHeight = displaysAsCompact
+              ? (isHovered ? '10px' : '7px')
               : showAsChild
                 ? (isHovered ? '8px' : (isInViewport ? '3px' : '4px'))
                 : (isHovered ? '10px' : (isInViewport ? '3px' : '5px'));
-            const dotRadius = (isCompacted || (isInViewport && !isHovered)) ? '1px' : '50%';
+            const dotRadius = displaysAsCompact ? '50%' : (isInViewport && !isHovered ? '1px' : '50%');
 
             // Expanded group header: render toggle bar THEN the entry as child
             const isExpandedHeader = !!(groupInfo?.isGroupHeader && isGroupExpanded);
@@ -4863,7 +4940,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         // - pre-compact old-history — Claude-only. Suppressed
                         //   when HistoryPanel open OR SDK tab (those render
                         //   full chat themselves so it'd be redundant).
-                        : (isChainBreakZone && !isGroupMeta && !isCompacted)
+                        : (isChainBreakZone && !isGroupMeta && !displaysAsCompact)
                           ? 'rgba(239, 68, 68, 0.06)'
                           : (isOldHistory && !isGroupMeta && !isHistoryOpen && !isSdkTab
                               ? 'rgba(239, 68, 68, 0.06)'
@@ -4880,9 +4957,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     /* Dot lives in a narrow gutter vertically centred in the entry.
                        No size growth on hover — row bg changes instead so text doesn't shift. */
                     (() => {
-                      const expW = isCompacted ? '8px' : (showAsChild ? '6px' : '8px');
-                      const expH = isCompacted ? '3px' : (showAsChild ? '6px' : '8px');
-                      const expR = isCompacted ? '1px' : '50%';
+                      const expW = displaysAsCompact ? '8px' : (showAsChild ? '6px' : '8px');
+                      const expH = displaysAsCompact ? '8px' : (showAsChild ? '6px' : '8px');
+                      const expR = '50%';
                       return (
                         <div
                           className="flex items-center justify-center shrink-0"
@@ -4894,8 +4971,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                               width: expW,
                               height: expH,
                               borderRadius: expR,
-                              backgroundColor: isUnreachable && !isCompacted ? 'transparent' : dotColor,
-                              border: isUnreachable && !isCompacted ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#9333ea' : dotColor}` : 'none',
+                              backgroundColor: isUnreachable && !displaysAsCompact ? 'transparent' : dotColor,
+                              border: isUnreachable && !displaysAsCompact ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#9333ea' : dotColor}` : 'none',
                               boxShadow: dotGlow,
                               boxSizing: 'border-box',
                               pointerEvents: 'auto',
@@ -4912,8 +4989,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         width: dotWidth,
                         height: dotHeight,
                         borderRadius: dotRadius,
-                        backgroundColor: isUnreachable && !isHovered && !isCompacted ? 'transparent' : dotColor,
-                        border: isUnreachable && !isHovered && !isCompacted ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#9333ea' : dotColor}` : 'none',
+                        backgroundColor: isUnreachable && !isHovered && !displaysAsCompact ? 'transparent' : dotColor,
+                        border: isUnreachable && !isHovered && !displaysAsCompact ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#9333ea' : dotColor}` : 'none',
                         boxShadow: dotGlow,
                         boxSizing: 'border-box',
                         pointerEvents: 'auto',
@@ -4924,11 +5001,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
                   {/* Expanded layout: N-line preview text only (type is conveyed by dot color) */}
                   {isExpandedLayout && !isExpandedHeader && (() => {
-                    let previewText = (isCompacted ? 'Conversation compacted' : (entry.content || '')).trim();
+                    let previewText = (displaysAsCompact ? 'Conversation compacted' : (entry.content || '')).trim();
                     let previewColor = 'rgba(255, 255, 255, 0.85)';
                     let previewStyle: React.CSSProperties = {};
                     let isSummaryPreview = false;
-                    if (!isCompacted && summaryToolType && sessionId && isEligibleTabTitleEntry(entry)) {
+                    if (!displaysAsCompact && summaryToolType && sessionId && isEligibleTabTitleEntry(entry)) {
                       const key = timelineSummaryKey(summaryToolType, sessionId, entry.uuid);
                       const row = promptSummaries[key];
                       if (row?.summary) {
@@ -4964,7 +5041,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                           wordBreak: 'break-word',
                           ...previewStyle,
                         }}
-                        title={!isCompacted && previewText !== (entry.content || '').trim() ? (entry.content || '') : undefined}
+                        title={!displaysAsCompact && previewText !== (entry.content || '').trim() ? (entry.content || '') : undefined}
                       >
                         {isSummaryPreview ? renderSingleStarHighlights(previewText) : previewText}
                       </div>
@@ -5846,18 +5923,25 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     document.addEventListener('mouseup', onUp);
                   }}
                 />
-                {currentActiveEntry.type === 'compact' ? (() => {
-                  const cached = compactSummaryCache[currentActiveEntry.uuid];
-                  const compactText = currentActiveEntry.compactSummary || cached || '';
-                  const isLoadingCompact = !currentActiveEntry.compactSummary && cached === undefined;
+                {currentActiveEntryDisplaysAsCompact ? (() => {
+                  const cached = currentActiveEntry.type === 'compact'
+                    ? compactSummaryCache[currentActiveEntry.uuid]
+                    : undefined;
+                  const compactText = currentActiveEntryIsCompactSummary
+                    ? currentActiveEntry.content
+                    : (currentActiveEntry.compactSummary || cached || '');
+                  const isLoadingCompact = currentActiveEntry.type === 'compact'
+                    && !currentActiveEntry.compactSummary
+                    && cached === undefined;
                   const displayText = compactText || (isLoadingCompact ? 'Загружаю compact summary...' : 'Compact summary не найден');
                   const canCopyCompact = !!compactText;
+                  const compactPreTokens = currentActiveCompactBoundaryEntry?.preTokens || currentActiveEntry.preTokens;
                   return (
                     <>
                       <div className="flex items-center gap-2 shrink-0">
-                        <div style={{ width: '12px', height: '3px', borderRadius: '1px', backgroundColor: '#f59e0b', flexShrink: 0 }} />
+                        <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#f59e0b', flexShrink: 0 }} />
                         <span className="text-amber-400 font-medium text-[11px]">
-                          History Compacted ({currentActiveEntry.preTokens ? `${Math.round(currentActiveEntry.preTokens / 1000)}k` : '?'} tokens)
+                          History Compacted ({compactPreTokens ? `${Math.round(compactPreTokens / 1000)}k` : '?'} tokens)
                         </span>
                       </div>
                       <div
@@ -6310,8 +6394,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               {!selectionStartId ? (
                 <>
                   {/* "Копировать" — все entries с копируемым контентом:
-                      user (промпт + ответы), compact (summary), continued (Context Overflow Recovery — содержит bridge text).
-                      Цвета дотов: compact=янтарь #fbbf24, continued=янтарь #f59e0b — оба оранжевые. */}
+                      user (промпт + ответы), compact/isCompactSummary (summary),
+                      standalone continued (Context Overflow Recovery bridge text). */}
                   {(contextMenu.entry.type === 'user' || contextMenu.entry.type === 'compact' || contextMenu.entry.type === 'continued') && (
                     <>
                       <button
@@ -6322,7 +6406,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         }}
                       >
                         <Copy size={12} />
-                        {contextMenu.entry.type === 'compact'
+                        {contextMenu.entry.type === 'compact' || contextMenu.entry.isCompactSummary
                           ? 'Копировать compact'
                           : contextMenu.entry.type === 'continued'
                             ? 'Копировать continued'
@@ -6611,7 +6695,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                           const { range, startUuid, endUuid } = rangeActionMenu;
                           // Validate same as edit mode.
                           const rangeEntries = entries.slice(range.startIndex, range.endIndex + 1);
-                          const hasCompact = rangeEntries.some(en => en.type === 'compact');
+                          const hasCompact = rangeEntries.some(en => en.type === 'compact' || en.isCompactSummary);
                           const hasContinued = rangeEntries.some(en => en.type === 'continued');
                           if (!isCodex && (hasCompact || hasContinued)) {
                             useUIStore.getState().showToast(
@@ -7193,29 +7277,36 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         {/* Scroll-to-bottom arrow — always mounted, visibility toggled via ref (no re-render on scroll) */}
         {isVisible && (
           <Tooltip content="Scroll to bottom">
-          <div
-            ref={arrowRef}
-            className="absolute left-1/2 -translate-x-1/2 cursor-pointer z-50 flex items-center justify-center"
-            onClick={() => {
-              if (isHistoryOpen) {
-                // History panel is open — scroll history to bottom instead of timeline
-                window.dispatchEvent(new CustomEvent('history-panel:scroll-to-bottom', { detail: { tabId } }));
-              }
-              scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-            }}
-            style={{
-              display: 'none',
-              bottom: '9px',
-              width: '24px',
-              height: '24px',
-              borderRadius: '6px',
-              backgroundColor: '#323237',
-              border: '1px solid rgba(167, 139, 250, 0.3)',
-              boxShadow: '0 2px 8px rgba(0, 0, 0, 0.5)',
-            }}
-          >
-            <ChevronDown size={16} color="#a78bfa" strokeWidth={2.5} />
-          </div>
+            <button
+              type="button"
+              ref={arrowRef}
+              className="absolute cursor-pointer z-50 flex items-center justify-center"
+              onClick={() => {
+                if (isHistoryOpen) {
+                  // History panel is open — scroll history to bottom instead of timeline
+                  window.dispatchEvent(new CustomEvent('history-panel:scroll-to-bottom', { detail: { tabId } }));
+                }
+                jumpTimelineToBottomAfterLayout();
+              }}
+              style={{
+                display: 'none',
+                left: 0,
+                right: 0,
+                bottom: 0,
+                width: '100%',
+                height: '26px',
+                borderRadius: 0,
+                backgroundColor: '#323237',
+                border: 'none',
+                borderTop: '1px solid rgba(167, 139, 250, 0.3)',
+                boxShadow: '0 -2px 8px rgba(0, 0, 0, 0.45)',
+                padding: 0,
+                appearance: 'none',
+                transition: 'none',
+              }}
+            >
+              <ChevronDown size={16} color="#a78bfa" strokeWidth={2.5} />
+            </button>
           </Tooltip>
         )}
 

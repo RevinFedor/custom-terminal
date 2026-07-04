@@ -19,9 +19,11 @@ Project Terminal API добавляет к live `type:'message'` совмест�
 Классификация по пользовательскому смыслу:
 - обычный user prompt → History + Timeline + может materialize conversation;
 - `attachment.queued_command` с обычным prompt → queued/sent user-row в History, Timeline и materialization после durable proof;
-- `<command-name>` slash command → history-only управляющая строка, если это пользовательская команда; startup defaults `/model`/`/effort` не должны на секунду появляться в live history, если canonical `/history` их фильтрует;
+- `<command-name>` slash command → history-only управляющая строка. Startup defaults `/model`/`/effort` видны в History как фиолетовые служебные строки, но не становятся Timeline turn'ами и не materialize conversation;
 - `thinking` без текста/tool-result → ephemeral turn-state, не durable history row;
 - `tool_result`, `<local-command-stdout>`, `<system-reminder>`, caveat/stdout wrappers → service-noise, не History и не Timeline.
+
+Команда и аргумент рендерятся раздельно (`/model haiku`, `/effort low`), а не склеиваются в camel-case (`/modelHaiku`). Источник ввода тоже не часть display-семантики: если manual slash и auto/default slash дают одну и ту же durable-запись, History показывает их одинаково. Route (`manual`, startup defaults, iOS, History) можно логировать как source для диагностики, но нельзя делать по нему другой UI.
 
 Старый шрам: во время streaming пользователь отправил `Stop`, а iOS показал это слово как часть assistant-ответа, потому что live SSE классифицировал raw `tool_result`/queued payload не по пользовательскому смыслу. Обратный шрам: `/model haiku` и `/effort low` на fresh Claude появлялись как фиолетовые строки и исчезали после reload, потому что live-путь и `/history` фильтровали по-разному. Любое новое display-событие должно пройти один server-side projection path, иначе iOS, Inbox и History снова начнут расходиться.
 
