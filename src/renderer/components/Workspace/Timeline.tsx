@@ -37,6 +37,10 @@ function warnTimelineTextSearchDiag(message: string) {
 
 const REWIND_BUSY_GUARD_RE = /\bis busy; wait for the current turn before rewind\b/i;
 const HISTORY_SCROLL_SAFETY_TIMEOUT_MS = 8000;
+const EXPANDED_PREVIEW_CHARS_PER_LINE = 180;
+const EXPANDED_PREVIEW_MIN_CHARS = 240;
+const EXPANDED_PREVIEW_MAX_CHARS = 1800;
+const EXPANDED_PREVIEW_TITLE_MAX_CHARS = 2000;
 
 function isRewindBusyGuardMessage(message: string): boolean {
   return REWIND_BUSY_GUARD_RE.test(message);
@@ -46,6 +50,25 @@ function emitHistoryAgentError(tabId: string, message: string) {
   window.dispatchEvent(new CustomEvent('history-panel:agent-error', {
     detail: { tabId, message }
   }));
+}
+
+function expandedPreviewCharLimit(lineClamp: number): number {
+  const n = Number.isFinite(lineClamp) ? Math.max(1, Math.floor(lineClamp)) : 3;
+  return Math.max(
+    EXPANDED_PREVIEW_MIN_CHARS,
+    Math.min(EXPANDED_PREVIEW_MAX_CHARS, n * EXPANDED_PREVIEW_CHARS_PER_LINE)
+  );
+}
+
+function truncateTimelinePreviewText(text: string, maxChars: number): string {
+  if (!text) return '';
+  const startMatch = /\S/.exec(text);
+  if (!startMatch) return '';
+  const start = startMatch.index;
+  if (text.length - start <= maxChars) {
+    return text.slice(start).trimEnd();
+  }
+  return text.slice(start, start + maxChars).trimEnd() + '…';
 }
 
 // True when an entry is NOT a regular user prompt. `isCompactSummary` can still
@@ -523,7 +546,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const [selectionStartId, setSelectionStartId] = useState<string | null>(null);
   const selectionStartIdRef = useRef<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [contextMenu, setContextMenu] = useState<{ x: number, y: number, entry: TimelineEntry, source?: 'dot' | 'segment' } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number, y: number, entry: TimelineEntry, source?: 'dot' | 'segment', anchorY?: number } | null>(null);
   const [sessionBoundaries, setSessionBoundaries] = useState<SessionBoundary[]>([]);
   // Boundary uuid from backend (= youngest entry of pre-orphan tail, set when
   // Generic CHAIN BREAK recovery fired). Used ONLY to detect post-compact
@@ -712,6 +735,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   // Ref to context-menu root so we can measure its rect for the hover-bridge test.
   const contextMenuRef = useRef<HTMLDivElement>(null);
+  const [contextMenuMeasuredH, setContextMenuMeasuredH] = useState(0);
+  const contextMenuMeasuredRef = useRef(0);
   // Refs to the other two fixed popups so we can re-clamp them post-mount when
   // the cursor was near the bottom of the screen (otherwise their bottom edge
   // slips below the viewport — same issue we fixed for contextMenu).
@@ -821,27 +846,26 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     return () => document.removeEventListener('mousemove', onMove);
   }, [contextMenu]);
 
-  // Re-clamp the context menu top using the menu's REAL post-render height.
-  // The initial position (setContextMenu in openContextMenu) uses a hardcoded
-  // `menuHeight` guess. That's wrong when the menu has more rows — e.g.
-  // rewind/delete-confirm states — and the bottom edge can slip
-  // below the viewport. After every relevant content/position change we measure
-  // the real rect and shift `top` up if needed.
+  // Measure context menu height after render. Position is derived from the entry
+  // anchor during render (same mental model as Cmd-hover), so this effect must not
+  // write a corrected `top` back into state — doing that creates a visible jump for
+  // bottom entries.
   useLayoutEffect(() => {
-    if (!contextMenu) return;
+    if (!contextMenu) {
+      if (contextMenuMeasuredRef.current !== 0) {
+        contextMenuMeasuredRef.current = 0;
+        setContextMenuMeasuredH(0);
+      }
+      return;
+    }
     const el = contextMenuRef.current;
     if (!el) return;
-    const r = el.getBoundingClientRect();
-    const margin = 10;
-    let desired = contextMenu.y;
-    if (r.top + r.height > window.innerHeight - margin) {
-      desired = window.innerHeight - r.height - margin;
+    const h = el.getBoundingClientRect().height;
+    if (Math.abs(h - contextMenuMeasuredRef.current) > 1) {
+      contextMenuMeasuredRef.current = h;
+      setContextMenuMeasuredH(h);
     }
-    if (desired < margin) desired = margin;
-    if (desired !== contextMenu.y) {
-      setContextMenu({ ...contextMenu, y: desired });
-    }
-  }, [contextMenu?.entry?.uuid, contextMenu?.y, selectionStartId, deleteEntryConfirmMode]);
+  }, [contextMenu?.entry?.uuid, selectionStartId, deleteEntryConfirmMode]);
 
   // Same clamp for the edit-range loading popup ("Прервать / Отмена").
   // Set from `e.clientY` raw, no height guess. When cursor was near the very
@@ -1079,6 +1103,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // visualisation is replaced. Width drag-resizable in expanded mode.
   const isExpandedLayout = readOnly ? false : treeMode;
   const effectiveWidth = isExpandedLayout ? timelineWidth : 32;
+  const [widthTransitionTabKey, setWidthTransitionTabKey] = useState(tabId);
+  const widthTransitionEnabled = widthTransitionTabKey === tabId;
+  useLayoutEffect(() => {
+    if (widthTransitionTabKey === tabId) return;
+    const raf = requestAnimationFrame(() => setWidthTransitionTabKey(tabId));
+    return () => cancelAnimationFrame(raf);
+  }, [tabId, widthTransitionTabKey]);
   const intrinsicPreviewFontSize = Math.max(timelineFontSize, timelineSummaryFontSize);
   // Measured CSS `right:` value (px) that anchors popups to Timeline's left edge.
   // Computed from real DOM rect — robust to HistoryPanel open/close, treeMode, window resize.
@@ -1359,6 +1390,28 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     if (!el) return 0;
     const rect = el.getBoundingClientRect();
     return rect.top + rect.height / 2;
+  };
+
+  const getEntryAnchoredPopupTop = (
+    index: number,
+    contentHeight: number,
+    estimatedHeight: number,
+    fallbackCenterY?: number
+  ) => {
+    const centerY = index >= 0 ? getElementCenterY(index) : (fallbackCenterY ?? window.innerHeight / 2);
+    const topMargin = 40;
+    const bottomMargin = 0;
+    const estimate = Math.max(1, estimatedHeight);
+    const height = Math.max(1, contentHeight || estimate);
+    const idealTop = centerY - estimate / 2;
+
+    if (idealTop < topMargin) {
+      return topMargin;
+    }
+    if (idealTop + estimate > window.innerHeight - bottomMargin) {
+      return Math.max(topMargin, window.innerHeight - height - bottomMargin);
+    }
+    return centerY - height / 2;
   };
 
   // effect: activeTooltipIndex changes → reset isExpanded + tooltipCopied (each new tooltip starts collapsed/un-copied)
@@ -1996,6 +2049,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       jumpTimelineToBottomAfterLayout();
     }
   }, [tabId, sessionId, entries.length, jumpTimelineToBottomAfterLayout]);
+
+  // Cmd+] changes the Timeline from dot rail to expanded preview layout. The
+  // browser may keep/reset the old scrollTop while entry heights are being
+  // recomputed, so opening the expanded Timeline has its own bottom-jump trigger.
+  const expandedLayoutScrollKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const key = `${tabId}::${sessionId || ''}::${isExpandedLayout ? 'expanded' : 'rail'}`;
+    if (!isVisible || !isExpandedLayout) {
+      expandedLayoutScrollKeyRef.current = key;
+      return;
+    }
+    if (entries.length === 0) return;
+    if (expandedLayoutScrollKeyRef.current === key) return;
+    expandedLayoutScrollKeyRef.current = key;
+    jumpTimelineToBottomAfterLayout();
+  }, [tabId, sessionId, isVisible, isExpandedLayout, entries.length, jumpTimelineToBottomAfterLayout]);
 
   // Auto-generate a tab title once the first real user prompt is materialized
   // in the transcript. Uses Timeline entries instead of raw terminal input so
@@ -3032,16 +3101,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     // right half of the 32px-wide dot. We store x=0 and rely on `right:` CSS at render time
     // (see context-menu Portal); y is centred on the clicked dot.
     const menuHeight = selectionStartIdRef.current ? 44 : 220;
-    const targetEl = segmentRefs.current[entries.findIndex(en => en.uuid === entry.uuid)];
+    const targetIndex = entries.findIndex(en => en.uuid === entry.uuid);
+    const targetEl = segmentRefs.current[targetIndex];
     const targetRect = targetEl?.getBoundingClientRect();
-    let y = targetRect ? targetRect.top + targetRect.height / 2 - menuHeight / 2 : e.pageY - menuHeight / 2;
-
-    // Clamp to viewport top/bottom
-    if (y + menuHeight > window.innerHeight - 10) y = window.innerHeight - menuHeight - 10;
-    if (y < 10) y = 10;
+    const anchorY = targetRect ? targetRect.top + targetRect.height / 2 : e.clientY;
+    const y = getEntryAnchoredPopupTop(targetIndex, menuHeight, menuHeight, anchorY);
 
     // x stays 0 — render layer reads `right` from notesPanelWidth + timeline width.
-    setContextMenu({ x: 0, y, entry });
+    setContextMenu({ x: 0, y, entry, anchorY });
   };
 
   const startRangeSelection = (entry: TimelineEntry) => {
@@ -4492,6 +4559,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     return { clampedTop, wTop, wH: wBottom - wTop, offset: clampedTop - wTop };
   })() : null;
 
+  const contextMenuTop = contextMenu ? (() => {
+    const estimatedH = selectionStartId ? 44 : 220;
+    const h = contextMenuMeasuredH > 0 ? contextMenuMeasuredH : estimatedH;
+    const index = entries.findIndex(e => e.uuid === contextMenu.entry.uuid);
+    return getEntryAnchoredPopupTop(index, h, estimatedH, contextMenu.anchorY ?? contextMenu.y + estimatedH / 2);
+  })() : 0;
+
   // ════════════════════════════════════════════════════════════
   // SECTION: JSX RENDER — Timeline container, scroll layer, segment loop, overlays, portals
   // ════════════════════════════════════════════════════════════
@@ -4506,7 +4580,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           height: '100%',
           flexShrink: 0,
           position: 'relative',
-          transition: 'width 50ms ease-out',
+          transition: widthTransitionEnabled ? 'width 50ms ease-out' : 'none',
         }}
       >
       {/* ──── CONTAINER (Timeline outer wrapper, absolute-anchored right) ──── */}
@@ -4530,7 +4604,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           right: isExpandedLayout && !pinned ? 0 : undefined,
           // Font-size root for em-based descendants (chip + preview text).
           fontSize: `${timelineFontSize}px`,
-          transition: 'width 50ms ease-out',
+          transition: widthTransitionEnabled ? 'width 50ms ease-out' : 'none',
         }}
       >
         {/* Drag handle for width — only when expanded layout is on.
@@ -5001,7 +5075,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
                   {/* Expanded layout: N-line preview text only (type is conveyed by dot color) */}
                   {isExpandedLayout && !isExpandedHeader && (() => {
-                    let previewText = (displaysAsCompact ? 'Conversation compacted' : (entry.content || '')).trim();
+                    const rawEntryContent = entry.content || '';
+                    const previewLimit = expandedPreviewCharLimit(timelineLineClamp);
+                    let previewText = displaysAsCompact ? 'Conversation compacted' : rawEntryContent;
                     let previewColor = 'rgba(255, 255, 255, 0.85)';
                     let previewStyle: React.CSSProperties = {};
                     let isSummaryPreview = false;
@@ -5026,7 +5102,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         };
                       }
                     }
+                    previewText = truncateTimelinePreviewText(previewText, previewLimit);
                     if (!previewText) return null;
+                    const previewTitle = !displaysAsCompact && previewText !== rawEntryContent
+                      ? truncateTimelinePreviewText(rawEntryContent, EXPANDED_PREVIEW_TITLE_MAX_CHARS)
+                      : undefined;
                     return (
                       <div
                         className="flex-1 min-w-0 pointer-events-none"
@@ -5041,7 +5121,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                           wordBreak: 'break-word',
                           ...previewStyle,
                         }}
-                        title={!displaysAsCompact && previewText !== (entry.content || '').trim() ? (entry.content || '') : undefined}
+                        title={previewTitle}
                       >
                         {isSummaryPreview ? renderSingleStarHighlights(previewText) : previewText}
                       </div>
@@ -6379,14 +6459,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 // Right edge of menu pinned to left edge of Timeline (-8px overlap, matches note tooltip).
                 // Same anchor regardless of where cursor clicked inside the 32px-wide dot.
                 right: `${popupRightPx}px`,
-                top: contextMenu.y,
+                top: contextMenuTop,
                 backgroundColor: '#1a1a1a',
                 border: '1px solid #333',
                 borderRadius: '4px',
                 padding: '4px',
                 zIndex: 10001,
                 minWidth: '160px',
-                maxHeight: 'calc(100vh - 20px)',
+                maxHeight: 'calc(100vh - 40px)',
                 overflowY: 'auto',
                 boxShadow: '0 4px 12px rgba(0,0,0,0.5)'
               }}

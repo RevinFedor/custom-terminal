@@ -677,8 +677,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   useEffect(() => {
     if (!open || !triggerRef.current) return;
     const place = () => {
-      const r = triggerRef.current!.getBoundingClientRect();
-      setPos({ top: Math.max(PANEL_MARGIN, r.bottom + 6), right: Math.max(PANEL_MARGIN, window.innerWidth - r.right) });
+      const toolbar = triggerRef.current!.closest('[data-project-toolbar]') as HTMLElement | null;
+      const anchorRect = toolbar?.getBoundingClientRect() || triggerRef.current!.getBoundingClientRect();
+      setPos({ top: Math.max(0, Math.round(anchorRect.bottom)), right: 0 });
       setPanelSize((prev) => normalizePanelSize(prev));
     };
     place();
@@ -1242,12 +1243,13 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
           title="Checking Git repository"
           className="inline-flex items-center gap-1 rounded transition-colors"
           style={{
-            height: 26,
+            height: '100%',
             padding: '0 9px',
             fontSize: 11,
             color: '#9ca3af',
             backgroundColor: 'transparent',
             border: '1px solid rgba(255,255,255,0.10)',
+            borderRadius: 0,
             maxWidth: 156,
             cursor: 'default',
           }}
@@ -1313,12 +1315,13 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         title={`${status.repoName}: ${status.branch} · ${status.changedCount} changed${remoteHint}`}
         className="inline-flex items-center gap-1 rounded cursor-pointer hover:opacity-90 transition-colors"
         style={{
-          height: 26,
+          height: '100%',
           padding: '0 9px',
           fontSize: 11,
           color: open ? '#fff' : '#cbd5e1',
           backgroundColor: open ? 'rgba(56,189,248,0.12)' : 'transparent',
           border: '1px solid ' + (open ? 'rgba(56,189,248,0.35)' : 'rgba(255,255,255,0.10)'),
+          borderRadius: 0,
           maxWidth: 156,
         }}
       >
@@ -1365,7 +1368,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
               overflow: 'hidden',
               backgroundColor: '#181a1f',
               border: '1px solid #373b44',
-              borderRadius: 8,
+              borderRadius: '0 0 0 8px',
               boxShadow: '0 14px 38px rgba(0,0,0,0.62)',
               color: '#e5e7eb',
               display: 'flex',

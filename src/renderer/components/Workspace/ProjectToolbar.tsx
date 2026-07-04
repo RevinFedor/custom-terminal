@@ -463,6 +463,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
 
   return (
     <div
+      data-project-toolbar
       className="h-[30px] w-full bg-panel flex items-stretch"
     >
       {!isSystemProject && (
@@ -798,7 +799,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
       </div>
 
       {!isSystemProject && currentProjectPath && (
-        <div className="flex items-center pr-3">
+        <div className="flex items-stretch h-full">
           <GitStatusButton
             projectId={activeProjectId}
             projectName={currentProjectName}
