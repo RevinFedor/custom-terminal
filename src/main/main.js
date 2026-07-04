@@ -1868,19 +1868,33 @@ function computeProjectActivity() {
     const projectId = projectIdFor(tabId, row, projectIdHint);
     if (!projectId) return;
     const item = itemForProject(projectId);
-    const runtimeStatus = status === 'stopping' ? 'stopping' : (busy ? 'busy' : (status || 'active'));
+    const gate = claudeStartupDefaultsGateByTab.get(tabId) || null;
+    const gateBlocksReady = (row?.command_type === 'claude' || row?.tool_type === 'claude' || bridgeKnownSessions.has(tabId) || claudeCliActive.get(tabId) === true)
+      && (gate?.status === 'pending' || gate?.status === 'failed');
+    const runtimeStatus = status === 'stopping'
+      ? 'stopping'
+      : (gateBlocksReady ? 'starting' : (busy ? 'busy' : (status || 'active')));
+    const extra = gate ? {
+      startupDefaultsPending: gate.status === 'pending',
+      startupDefaultsReady: gate.status === 'ready',
+      startupDefaultsError: gate.status === 'failed' ? (gate.error || gate.reason || 'startup-defaults-failed') : null,
+    } : null;
     if (!seenTabs.has(tabId)) {
       item.count += 1;
       seenTabs.add(tabId);
-      item.tabs.push({ tabId, status: runtimeStatus, streaming: !!busy });
+      item.tabs.push({ tabId, status: runtimeStatus, streaming: gateBlocksReady ? false : !!busy, ...(extra || {}) });
     } else if (busy) {
       const existing = item.tabs.find((t) => t.tabId === tabId);
       if (existing) {
-        existing.status = status === 'stopping' ? 'stopping' : 'busy';
-        existing.streaming = true;
+        existing.status = runtimeStatus;
+        existing.streaming = gateBlocksReady ? false : true;
+        if (extra) Object.assign(existing, extra);
       }
+    } else if (extra) {
+      const existing = item.tabs.find((t) => t.tabId === tabId);
+      if (existing) Object.assign(existing, extra);
     }
-    if (busy) item.streaming = true;
+    if (busy && !gateBlocksReady) item.streaming = true;
   };
 
   for (const [tabId] of aiStoppingTabs) {
@@ -2058,6 +2072,7 @@ ipcMain.on('claude:startup-defaults-gate', (_event, payload = {}) => {
   if (!tabId) return;
   if (payload?.status === 'cleared') {
     const reason = 'startup-defaults-cleared';
+    claudeStartupDefaultsGateByTab.delete(tabId);
     console.log('[ClaudeStartupDefaultsGate] tab=' + String(tabId).slice(-12)
       + ' status=cleared session=nil reason=' + String(payload?.reason || '-')
       + ' error=-');
@@ -2075,6 +2090,12 @@ ipcMain.on('claude:startup-defaults-gate', (_event, payload = {}) => {
   const status = payload?.status === 'ready'
     ? 'ready'
     : (payload?.status === 'failed' ? 'failed' : 'pending');
+  claudeStartupDefaultsGateByTab.set(tabId, {
+    status,
+    reason: String(payload?.reason || ''),
+    error: payload?.error ? String(payload.error) : null,
+    at: Date.now(),
+  });
   const sessionId = bridgeKnownSessions.get(tabId) || null;
   const snapshotStatus = status === 'ready' ? 'active' : 'starting';
   const reason = 'startup-defaults-' + status;
@@ -2604,6 +2625,7 @@ const bridgeKnownSessions = new Map(); // tabId → sessionId
 const codexKnownSessions = new Map(); // tabId → sessionId; Codex TUI alive in this PTY
 const aiStoppingTabs = new Map(); // tabId → { toolType, reason, since, sessionId }
 const claudeStartupIntents = new Map(); // tabId → { sessionId, at, reason }
+const claudeStartupDefaultsGateByTab = new Map(); // tabId → { status, reason, error, at }
 const bridgeMetadata = new Map(); // tabId → { model, contextPct }
 const bridgePidCache = new Map(); // claudePid → tabId
 const bridgeFileMtimes = new Map(); // filename → mtimeMs
@@ -2992,6 +3014,7 @@ function clearBridgeTab(tabId) {
   clearClaudeEditableLastPrompt(tabId, 'bridge-clear');
   bridgeKnownSessions.delete(tabId);
   claudeStartupIntents.delete(tabId);
+  claudeStartupDefaultsGateByTab.delete(tabId);
   clearClaudePendingJsonlOwnersForTab(tabId, 'bridge-clear');
   // Claude TUI gone — prompt is no longer rendered. Mobile should flip back
   // to "inactive" so the Resume banner shows and the composer/busy spinner
@@ -10046,6 +10069,17 @@ ipcMain.on('terminal:force-command-started', (event, payload) => {
   const request = payload && typeof payload === 'object' ? payload : { tabId: payload };
   const tabId = request.tabId;
   if (!tabId) return;
+  if (request.commandType === 'claude' && request.sessionId) {
+    const owner = getClaudeJsonlLiveOwner(request.sessionId, tabId);
+    const ownPending = owner?.reason === 'pending-resume' && owner.tabId === tabId;
+    if (owner && !ownPending) {
+      console.warn('[Force Command Started] BLOCKED claude resume start tab=' + String(tabId).slice(-12)
+        + ' session=' + String(request.sessionId).slice(0, 8)
+        + ' ownerTab=' + String(owner.tabId || '').slice(-12)
+        + ' reason=' + owner.reason);
+      return;
+    }
+  }
   console.log('[Force Command Started] Tab:', tabId, 'commandType:', request.commandType || '-');
   clearClaudeEditableLastPrompt(tabId, 'force-command-started');
   clearAiStopping(tabId, 'command-started');
@@ -17057,7 +17091,7 @@ const CODEX_TUI_READY_QUIET_MS = 350;
 const CODEX_EXTERNAL_PROMPT_READY_TIMEOUT_MS = 90 * 1000;
 const CODEX_MCP_STARTUP_RESTART_MS = 15 * 1000;
 const CODEX_MCP_STARTUP_MAX_RESTARTS = 1;
-const CODEX_STARTUP_NO_STATE_TIMEOUT_MS = 15 * 1000;
+const CODEX_STARTUP_NO_STATE_TIMEOUT_MS = 60 * 1000;
 const CODEX_STARTUP_LIFECYCLE_TTL_MS = 90 * 1000;
 const CODEX_PROMPT_IN_FLIGHT_TTL_MS = 120 * 1000;
 // Parser order matters: `xhigh` renders as "Extra high", so it must be matched

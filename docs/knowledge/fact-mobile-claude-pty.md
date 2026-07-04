@@ -8,7 +8,7 @@
 
 PTY+Claude-таб для phone имеет пять состояний (расширены поверх trivial busy/idle SDK):
 
-- **`inactive`** — PTY жив, но внутри shell, не Claude. Либо Claude exit'нулся (Ctrl+C×2, crash, app restart), либо изначально не запускался. JSONL на диске есть (если когда-то была сессия). UI: Resume-баннер вместо composer, серый dot.
+- **`inactive`** — PTY жив, но внутри shell, не Claude. Либо Claude exit'нулся (Ctrl+C×2, crash, app restart), либо изначально не запускался. JSONL на диске может быть полезным разговором или пустым техническим контейнером. UI: Resume только при `canResume=true`, иначе Start/empty stopped-state вместо composer, серый dot.
 - **`starting`** — Claude процесс существует (bridge.json есть, `bridgeKnownSessions.has(tabId)`), но TUI **ещё не отрендерил prompt-символ `⏵`**. Между этими событиями 1-6 секунд. UI: «Starting Claude…» strip вместо composer.
 - **`active`** — Claude TUI готов принимать ввод (`⏵` отрендерён хотя бы раз = `claudePromptReady.has(tabId)`). UI: composer открыт, зелёная dot.
 - **`busy`** — Claude в середине turn'а (`claudeSpinnerBusy` или `claudeTurnBusy`). UI: composer disabled, янтарная dot, Stop кнопка в header.
@@ -26,7 +26,8 @@ PTY+Claude-таб для phone имеет пять состояний (расш�
 ```
 POST /api/projects/:id/claude-tabs           — создать PTY+Claude таб (Terminal.tsx сам spawn'ит claude по pendingAction)
 POST /api/projects/:id/agent-tabs            — generic PTY agent create; body {toolType:'claude'|'codex'}
-POST /api/terminal-tabs/:tabId/resume             — claude --resume <sid> в существующий PTY; HTTP 200 только после input-ready/ready, readiness timeout = 504 success:false ready:false
+POST /api/terminal-tabs/:tabId/start              — fresh Claude/Codex runtime в существующей PTY-вкладке, когда сохранённого разговора ещё нет
+POST /api/terminal-tabs/:tabId/resume             — claude --resume <sid> в существующий PTY; HTTP 200 доказывает live runtime ready, startup defaults едут отдельными полями
 POST /api/terminal-tabs/:tabId/status             — GET тоже — текущий status + sessionId + commandType
 POST /api/terminal-tabs/:tabId/send               — sendAgentPromptScenario; backend сам ведёт Claude/Codex terminal runtime и draft ownership
 POST /api/terminal-tabs/:tabId/interrupt          — interruptAgentTurnScenario; soft interrupt текущего turn'а (PTY Esc / Codex abort signal)
@@ -39,6 +40,14 @@ POST /api/terminal-tabs/:tabId/stop               — stopAgentProcessScenario; 
 ```
 
 Все ID — через `decId()` (см. `fact-mobile-web.md::URL-encoded path параметры`).
+
+## Runtime, startup defaults и materialized conversation
+
+Нельзя использовать один `sessionId` как доказательство всех прав вкладки. Claude может создать технический UUID и маленький JSONL-файл только со служебными строками (`mode`, `permission-mode`, startup `/model`/`/effort`), но для продукта это ещё не сохранённый разговор. Доказанный контрпример из сессии 2026-07-03: JSONL существовал, Timeline видел `entries=0`, а попытка Resume выглядела как продолжение сессии, которой пользовательски не было.
+
+Поэтому API отдаёт две оси: runtime (`starting/active/busy/stopping/inactive`, `inputReady`) и transcript materialization (`conversationMaterialized`, `timelineCount`, `materializationReason`, `canResume`, `canCopySessionId`). Fresh Claude до первого prompt может быть `active/inputReady` и принимать первое сообщение, но `conversationMaterialized=false`: copy-id скрыт/disabled, Timeline пустой без ошибки, Resume после Stop не предлагается. Первый содержательный user/assistant turn переводит transcript в materialized; только после этого stopped tab показывает Resume и полезный copy-id.
+
+Startup defaults (`/model`, `/effort`) — третий слой поверх live runtime. Для Claude они могут ещё выполняться после первого prompt-ready кадра, поэтому iOS/API держит запуск в blocking state до `startupDefaultsReady` или явной `startupDefaultsError`. Если runtime уже жив и input-ready, но defaults failed, `/start`/`/resume` не должны возвращать 504 как будто Claude не запустился: ответ остаётся success/ready для процесса и отдельно несёт `startupDefaultsReady=false` + ошибку defaults. Настоящий 504 — только когда сам runtime не дошёл до ready.
 
 ## Bridge actions
 
@@ -80,7 +89,7 @@ Mobile-web Resume для CLAUDE-таба обязан соблюдать три 
 1. **Pre-check через `claude:get-presence`** — если status=active/busy, refuse слать `claude --resume`. Ctrl+U в живом Claude TUI стёр бы typed text desktop-пользователя И выкинул бы его из TUI. Юзер видит `alreadyRunning:true`, состояние не меняется.
 2. **`markPendingResume(tabId, sessionId)`** — без этого guard'а stale `~/.claude/bridge/<oldSid>.json` (Claude никогда не удаляет свои bridge-файлы) может в первые 15 секунд после Resume stomp sessionId на старый UUID. Mobile-web — пятый writer в реестре (см. `fix-bridge-stale-takeover.md::Layer 4`), наряду с AutoResume, Terminal.tsx Case 2/5, claude-f fork flow.
 3. **`state.clearInterruptedState(tabId)`** — Mobile Resume снимает «Сессия была прервана» overlay на desktop. Иначе пользователь увидит stale модалку поверх работающего Claude.
-4. **Ready proof перед HTTP 200.** `/api/terminal-tabs/:tabId/resume` не должен отвечать success сразу после `bridgeRequest('resumeClaudeTab')`: bridge-ack доказывает только что команда ушла в renderer, но не что Claude/Codex прошёл startup prompts и снова принимает ввод. 200 означает `ready/inputReady`; readiness miss возвращает `504 {success:false, ready:false}`, bridge failure — structured non-success. Иначе native iOS видит `starting` бесконечно или отправляет следующий prompt в chooser (`Choose working directory`, update prompt, MCP startup), хотя API уже сказал «готово».
+4. **Ready proof перед HTTP 200.** `/api/terminal-tabs/:tabId/resume` не должен отвечать success сразу после `bridgeRequest('resumeClaudeTab')`: bridge-ack доказывает только что команда ушла в renderer, но не что Claude/Codex прошёл startup prompts и снова принимает ввод. 200 означает live runtime `ready/inputReady`; runtime readiness miss возвращает `504 {success:false, ready:false}`, bridge failure — structured non-success. Для Claude startup defaults не равны runtime readiness: если процесс уже жив, но `/model`/`/effort` failed, ответ остаётся ready с отдельными `startupDefaultsReady=false`/`startupDefaultsError`. Иначе native iOS видит `starting` бесконечно или отправляет следующий prompt в chooser (`Choose working directory`, update prompt, MCP startup), хотя API уже сказал «готово».
 
 ## WS protocol — расширение для PTY+Claude
 
@@ -96,7 +105,7 @@ Mobile-web Resume для CLAUDE-таба обязан соблюдать три 
 - **Pill «model · effort»** в центре — `SDKParamsButton` переиспользован. `canParams` open только когда status=active/busy (slash-commands нужен живой prompt).
 - **Stop ■** справа от ☰ — красная, видна только когда status=active/busy/starting. Под капотом `Api.stop` который роутит через `stopClaudeTab` bridge → `terminal:stop-ai-process` (SIGTERM по PID, тот же путь что desktop Stop). После клика status становится `stopping`; кнопка и composer блокируются до `inactive`.
 - **Context%** под именем таба слева — через `bridge-update` WS event.
-- **Resume-баннер** вместо composer когда `claudeSessionId && status==='inactive'`.
+- **Resume-баннер** вместо composer только когда server сказал `canResume=true` (`conversationMaterialized=true` + runtime inactive). Если runtime inactive, но разговор ещё не materialized, показывается Start Claude/Start Codex в стиле Resume: это fresh runtime start, а не восстановление пустого технического UUID.
 
 `getSDKParams` / `setSDKParams` bridge actions расширены — для PTY-таба читают `bridgeMetadata` (model) + `tab.claudeEffortLocal` (effort), пишут через `claude:send-command` (`/model X`, `/effort Y`). Думать/Think кнопки у SDK на mobile нет, у PTY тоже не добавляем.
 
@@ -165,6 +174,9 @@ Graceful degrade — обязателен: старый prod-asar (до этих
 - Composer Stop и навбар Stop делают одно и то же (оба kill) — composer должен soft-interrupt turn, навбар kill процесс
 - Создаю новый Claude-tab с мобилы — sessionId никогда не появляется, UI висит на «Starting Claude…»
 - Нажал Start/Resume с iOS — вкладка бесконечно показывает `starting`, хотя HTTP `/resume` уже вернул success
+- Остановил Claude до первого prompt — iPhone показывает Resume или copy-id, хотя сохранённого разговора нет
+- После `New → Claude` на iPhone `/model` или `/effort` мелькает в истории и исчезает после reload
+- После ответа Claude thinking пропал, но assistant-текст появился только через секунду — `done` перепутали с published history
 - После Resume/Start следующий prompt попал в `Choose working directory` / update prompt вместо composer
 - Нажал Stop/Close на Claude/Codex, но iOS/History сразу показывает input или Resume до реального exit — пропущен runtime `stopping`
 - Mobile composer не блокируется во время Claude turn → две одновременные отправки → одна теряется

@@ -57,8 +57,14 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
   const setTabCommandType = useWorkspaceStore((state) => state.setTabCommandType);
   const createBrowserTab = useWorkspaceStore((state) => state.createBrowserTab);
   const setProjectView = useWorkspaceStore((state) => state.setProjectView);
-  const getSidebarState = useWorkspaceStore((state) => state.getSidebarState);
   const setSidebarOpen = useWorkspaceStore((state) => state.setSidebarOpen);
+  const sidebarOpenForRender = useWorkspaceStore((state) => {
+    const projectId = state.activeProjectId;
+    if (!projectId || isInboxProjectId(projectId)) return false;
+    return state.openProjects.get(projectId)?.sidebarOpen ?? false;
+  });
+  const sidebarWidth = useUIStore((state) => state.sidebarWidth);
+  const effectiveSidebarWidth = sidebarWidth || 280;
   const currentProjectMetaPath = useProjectsStore((state) => (
     activeProjectId ? state.projects[activeProjectId]?.path : undefined
   ));
@@ -462,12 +468,18 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
       {!isSystemProject && (
         <Tooltip content="Toggle file explorer">
         <button
+          data-sidebar-toggle-trigger
+          aria-pressed={sidebarOpenForRender}
           onClick={() => {
             if (!activeProjectId) return;
-            const { sidebarOpen } = getSidebarState(activeProjectId);
-            setSidebarOpen(activeProjectId, !sidebarOpen);
+            setSidebarOpen(activeProjectId, !sidebarOpenForRender);
           }}
           className="h-full flex items-center px-3 text-[#666] hover:text-white hover:bg-[rgba(255,255,255,0.05)] transition-all duration-150"
+          style={{
+            marginLeft: sidebarOpenForRender ? effectiveSidebarWidth : 0,
+            color: sidebarOpenForRender ? '#fff' : undefined,
+            backgroundColor: sidebarOpenForRender ? 'rgba(255,255,255,0.08)' : undefined,
+          }}
         >
           <PanelLeft size={14} />
         </button>

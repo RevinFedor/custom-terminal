@@ -1137,15 +1137,6 @@ function Sidebar({
           </svg>
         </button>
         </Tooltip>
-        {/* Collapse sidebar */}
-        <Tooltip content="Collapse sidebar">
-        <button className="sidebar-toolbar-btn sidebar-collapse-btn" onClick={onCollapse}>
-          <svg width="16" height="16" viewBox="0 0 16 16">
-            <path d="M2 2v12M6 4l-3 4 3 4M7 2h7v12H7" stroke="currentColor" strokeWidth="1.2" fill="none" strokeLinecap="round" strokeLinejoin="round"/>
-          </svg>
-        </button>
-        </Tooltip>
-
         {dirDropdownOpen && (
           <div className="directory-dropdown">
             {directories.map(dir => (

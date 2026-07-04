@@ -51,6 +51,16 @@ Busy-send и Stop во время streaming имеют ещё один пром�
 
 `thinking` — отдельная семантическая строка, а не tool-card. Pending `tool_use` без результата можно скрыть или дождаться результата, но нельзя на один кадр превращать thinking в `MCP thinking` с badge, chevron или раскрытием справа. Completed tool rows могут быть отдельными раскрываемыми карточками; этот contract не распространяется на thinking, потому что для пользователя это статус размышления агента, а не объект инструмента.
 
+## Project Terminal API: action response, runtime и transcript projection
+
+Внешний API не должен быть сырой шиной внутренних событий. Native iOS, legacy mobile-web и Inbox не знают, какая строка JSONL/rollout является видимой историей, какая только служебной настройкой, а какая transient-state turn'а. Серверная модель делит три факта:
+
+- HTTP action response (`/send`, `/start`, `/resume`, `/stop`) говорит, принято ли действие и какой следующий state ожидается, но не материализует историю сам по себе.
+- Runtime snapshot/SSE (`sessionStatus`, `inputReady`, `busy`, `stopping`, `startupDefaults*`) говорит, что происходит с живым процессом.
+- Transcript projection (`projection.transcript`, `entryId`, `kind`, `ephemeral`) говорит, можно ли событие класть в видимую историю и использовать для materialization/Timeline.
+
+Старый симптом смешения: iPhone получал `done/busy=false`, гасил thinking, но финальная assistant-строка появлялась только после следующего `/history`; пользователь видел пустой зазор между loader и ответом. Другой симптом — startup `/model` или `/effort` мелькал как user-row, а canonical `/history` тут же удалял его. Правило: UI-событие считается опубликованной историей только после transcript projection или canonical history reload; runtime `done` означает конец turn'а, а не то, что все display rows уже доставлены.
+
 ## History loader: НЕ getSessionMessages
 
 `getSessionMessages` из Anthropic SDK возвращает **другой набор записей** чем `parseTimelineEntries` — uuids не пересекаются. Если history грузить через SDK-helper, GoTo из timeline (использует timeline uuids как anchors) никогда не находит цель. См. [`fix-mobile-history-uuid-mismatch.md`](fix-mobile-history-uuid-mismatch.md).
@@ -299,6 +309,7 @@ GET  /api/projects/:id/tabs                    → tabs + groups + statuses + ti
 POST /api/inbox/sdk-tabs                       → createSDKTab в system Inbox, без projectId у клиента
 POST /api/projects/:id/sdk-tabs                → createSDKTab (через bridge)
 POST /api/terminal-tabs/:tabId/send                 → sendAgentPromptScenario; project ownership, TUI draft conflict не очищается
+POST /api/terminal-tabs/:tabId/start                → fresh Claude/Codex runtime в existing PTY, когда Resume недоступен
 POST /api/terminal-tabs/:tabId/stop                 → stopAgentProcessScenario; для legacy SDK fallback query.close()
 POST /api/terminal-tabs/:tabId/close                → closeTab (через bridge, body {aiBusy?})
 POST /api/terminal-tabs/:tabId/rename               → renameTab (через bridge)
@@ -342,13 +353,14 @@ POST /api/projects/:id/tab-groups/:gid/toggle-collapsed → collapse/expand grou
 POST /api/projects/:id/tab-groups/:gid/status   → assign/clear group session status
 POST /api/projects/:id/tab-groups/:gid/delete   → delete group container, keep tabs
 POST /api/projects/:id/tab-layout               → reorder tabs/groups + group assignments/anchors
-POST /api/terminal-tabs/:tabId/resume                → resume в existing PTY; 200 только после input-ready/ready, timeout = 504 success:false ready:false
+POST /api/terminal-tabs/:tabId/start                 → fresh runtime start в existing PTY, когда сохранённого разговора ещё нет
+POST /api/terminal-tabs/:tabId/resume                → resume в existing PTY; 200 только после live runtime ready, startup defaults отдельными полями
 GET  /api/terminal-tabs/:tabId/status                → status строка (inactive/starting/active/busy/stopping) + sessionId + commandType
 ```
 
 Для Claude/Codex PTY-табов расширение mobile-web — см. `fact-mobile-claude-pty.md`. `/send`, `/stop`, `/interrupt`, `/draft`, `/draft-state` и `/rewind` роутятся через общий scenario layer: backend сам выбирает Claude PTY/Codex PTY runtime, а endpoint остаётся Project Terminal API. Legacy SDK fallback существует только для старых SDK-табов, не как модель нового API.
 
-`/resume` — часть того же Project Terminal API, а не сырой bridge proxy. Успешный ответ доказывает готовность composer'а к следующей команде; bridge failure/readiness timeout возвращаются как non-success JSON. Native клиент после такой ошибки должен снять локальный `starting`, а не ждать следующего poll/SSE snapshot'а, потому что `starting busy=false` после failed resume часто является stale startup state.
+`/start` и `/resume` — часть того же Project Terminal API, а не сырой bridge proxy. Успешный ответ доказывает готовность live runtime/composer'а к следующей команде; bridge failure/runtime readiness timeout возвращаются как non-success JSON. Ошибка Claude startup defaults после живого runtime не равна failed resume: ответ несёт `startupDefaultsReady=false`/`startupDefaultsError`, а клиент показывает warning/error gate без вечного `starting`. Native клиент после настоящей action-ошибки должен снять локальный `starting`, а не ждать следующего poll/SSE snapshot'а, потому что `starting busy=false` после failed resume часто является stale startup state.
 
 Если resume/startup завершился ошибкой, API обязан вернуть/разослать явный failure-state, который клиент может показать в той же blocking-поверхности. Пропажа resume-overlay без успеха недопустима: для пользователя исчезновение окна означает «готово», а не «ошибка ушла в лог». Поэтому ошибка readiness/watchdog должна быть видимой (`startupError`/non-success JSON/SSE), пока пользователь не закроет или не повторит действие.
 

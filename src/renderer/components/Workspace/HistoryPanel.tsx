@@ -2124,6 +2124,7 @@ function AgentHistoryControls({
           }
         }
       } else if (kind === 'stop') {
+        setStatusFrom('stopping', 'stop-process-click-start');
         const result = await runtime.stopProcess(tabId);
         if (result?.success === false) throw new Error(result?.error || 'Stop failed');
         if (tabIdRef.current !== actionTabId) return;

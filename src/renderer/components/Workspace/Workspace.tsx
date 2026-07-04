@@ -407,6 +407,7 @@ export default function Workspace() {
       if (!sidebarOverlayCloseOnClickOutside) return;
       const target = e.target instanceof Element ? e.target as HTMLElement : null;
       if (!target) return;
+      if (target.closest('[data-sidebar-toggle-trigger]')) return;
       if (target.closest('[data-run-after-picker-menu], [data-run-after-picker-portal]')) return;
       const sidebarEl = document.querySelector('[data-sidebar-portal]') as HTMLElement | null;
       const sidebarRect = sidebarEl?.getBoundingClientRect();

@@ -11,6 +11,8 @@ const MAX_UNTRACKED_FILE_CHARS = 48 * 1024;
 const MAX_PREVIEW_DIFF_CHARS = 320 * 1024;
 const GIT_COMMIT_PROMPT_ID = 'git-commit';
 const DEFAULT_GIT_COMMIT_SYSTEM_PROMPT = 'You write concise Git commit messages for local commits.\nReturn only JSON with keys "summary" and "description".\n\nRules:\n- The summary must be one line, imperative mood when possible, no trailing period, under 72 characters.\n- The description may be empty. If non-empty, use 1-4 short lines with concrete facts.\n- Do not mention files that are not present in the provided changes.\n- If docs/ changed, base the commit message on changed docs files only when the prompt data says docs-only context was applied.\n- If docs/ did not change, use all included changes.';
+const GIT_STATUS_WATCH_DEBOUNCE_MS = 300;
+const gitStatusWatchers = new Map();
 
 function safeProjectPath(projectPath) {
   if (!projectPath || typeof projectPath !== 'string') {
@@ -568,6 +570,31 @@ async function hasUpstream(root) {
   return result.success && result.stdout.trim();
 }
 
+function gitWatchKey(sender, projectPath) {
+  return String(sender?.id || 'unknown') + ':' + path.resolve(projectPath);
+}
+
+function shouldIgnoreGitWatchPath(filePath) {
+  const normalized = String(filePath || '').split(path.sep).join('/');
+  if (!normalized) return false;
+  return normalized.includes('/node_modules/')
+    || normalized.startsWith('node_modules/')
+    || normalized.includes('/.cache/')
+    || normalized.startsWith('.cache/')
+    || normalized.includes('/dist/')
+    || normalized.startsWith('dist/')
+    || normalized.includes('/release/')
+    || normalized.startsWith('release/');
+}
+
+function stopGitStatusWatcher(key) {
+  const state = gitStatusWatchers.get(key);
+  if (!state) return;
+  if (state.timer) clearTimeout(state.timer);
+  try { state.watcher?.close?.(); } catch {}
+  gitStatusWatchers.delete(key);
+}
+
 function register({ projectManager }) {
   ipcMain.handle('git:status', async (event, { projectPath }) => {
     try {
@@ -710,6 +737,63 @@ function register({ projectManager }) {
       return { success: true, repositories: await listRepositories(projectPath) };
     } catch (error) {
       return { success: false, error: error.message, repositories: [] };
+    }
+  });
+
+  ipcMain.handle('git:watch-status', async (event, { projectPath }) => {
+    try {
+      const requestPath = safeProjectPath(projectPath);
+      const root = await getRepoRoot(requestPath);
+      if (!root) return { success: false, error: 'Not a Git repository' };
+      const key = gitWatchKey(event.sender, requestPath);
+      if (gitStatusWatchers.has(key)) {
+        return { success: true, repoRoot: root, projectPath: requestPath, reused: true };
+      }
+
+      const state = {
+        watcher: null,
+        timer: null,
+      };
+      const notify = (eventType, filename) => {
+        const rel = String(filename || '');
+        if (shouldIgnoreGitWatchPath(rel)) return;
+        if (state.timer) clearTimeout(state.timer);
+        state.timer = setTimeout(() => {
+          state.timer = null;
+          if (event.sender.isDestroyed()) {
+            stopGitStatusWatcher(key);
+            return;
+          }
+          event.sender.send('git:status-changed', {
+            eventType,
+            path: rel ? path.join(root, rel) : root,
+            repoRoot: root,
+            projectPath: requestPath,
+          });
+        }, GIT_STATUS_WATCH_DEBOUNCE_MS);
+      };
+
+      try {
+        state.watcher = fs.watch(root, { recursive: true, persistent: false }, notify);
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+
+      gitStatusWatchers.set(key, state);
+      event.sender.once('destroyed', () => stopGitStatusWatcher(key));
+      return { success: true, repoRoot: root, projectPath: requestPath };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('git:unwatch-status', async (event, { projectPath }) => {
+    try {
+      if (!projectPath) return { success: true };
+      stopGitStatusWatcher(gitWatchKey(event.sender, safeProjectPath(projectPath)));
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error.message };
     }
   });
 

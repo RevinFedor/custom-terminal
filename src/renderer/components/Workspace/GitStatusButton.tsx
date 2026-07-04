@@ -325,6 +325,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [commitDescriptionLines, setCommitDescriptionLines] = useState(() => normalizeCommitDescriptionLines(undefined));
   const [selectedRepoPath, setSelectedRepoPath] = useState(projectPath || '');
   const [repoSelectorOpen, setRepoSelectorOpen] = useState(false);
+  const [repoSelectorExpanded, setRepoSelectorExpanded] = useState(false);
   const [repoSearch, setRepoSearch] = useState('');
   const [repositories, setRepositories] = useState<GitRepository[]>(() => makeHomeRepositories(projectPath));
   const [repositoriesProjectPath, setRepositoriesProjectPath] = useState('');
@@ -641,6 +642,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     setRepositoriesProjectPath('');
     setRepositoriesLoading(false);
     setRepoSelectorOpen(false);
+    setRepoSelectorExpanded(false);
     setRepoSearch('');
     setRepoContextMenu(null);
     setDragRepoPath('');
@@ -709,6 +711,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         setSelectedRepoPath(typeof next?.selectedRepoPath === 'string' && next.selectedRepoPath ? next.selectedRepoPath : (projectPath || ''));
         setRepoFavorites(Array.isArray(next?.repoFavorites) ? next.repoFavorites.filter((item) => typeof item === 'string') : []);
         setRepoSelectorOpen(false);
+        setRepoSelectorExpanded(false);
         setRepoContextMenu(null);
         setRemoteSettingsOpen(false);
         if (Array.isArray(next?.selectedPaths)) {
@@ -867,6 +870,23 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   }, [loadStatus]);
 
   useEffect(() => {
+    if (!effectiveRepoPath || hydratedStateKeyRef.current !== panelStateKey) return;
+    const watchedPath = effectiveRepoPath;
+    ipcRenderer.invoke('git:watch-status', { projectPath: watchedPath }).catch(() => {});
+    const onGitStatusChanged = (_event: any, payload: any) => {
+      if (!payload?.projectPath || payload.projectPath !== watchedPath) return;
+      if (fsDebounceRef.current) window.clearTimeout(fsDebounceRef.current);
+      fsDebounceRef.current = window.setTimeout(() => loadStatus(false, true), 220);
+    };
+    ipcRenderer.on('git:status-changed', onGitStatusChanged);
+    return () => {
+      ipcRenderer.removeListener('git:status-changed', onGitStatusChanged);
+      ipcRenderer.invoke('git:unwatch-status', { projectPath: watchedPath }).catch(() => {});
+      if (fsDebounceRef.current) window.clearTimeout(fsDebounceRef.current);
+    };
+  }, [effectiveRepoPath, panelStateKey, loadStatus]);
+
+  useEffect(() => {
     const onFsChange = (_event: any, payload: any) => {
       if (!status?.repoRoot || !payload?.path || !String(payload.path).startsWith(status.repoRoot)) return;
       if (fsDebounceRef.current) window.clearTimeout(fsDebounceRef.current);
@@ -920,6 +940,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     if (!repoPath) return;
     if (repoPath === effectiveRepoPath || repoPath === status?.requestPath || repoPath === status?.repoRoot) {
       setRepoSelectorOpen(false);
+      setRepoSelectorExpanded(false);
       setRepoContextMenu(null);
       return;
     }
@@ -930,6 +951,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     setSelectedRepoPath(repoPath);
     setStatusLoading(true);
     setRepoSelectorOpen(false);
+    setRepoSelectorExpanded(false);
     setRepoContextMenu(null);
     setHistoryContextMenu(null);
     setBranchesOpen(false);
@@ -1470,6 +1492,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                       onClick={() => {
                         const willOpen = !repoSelectorOpen;
                         setRepoSelectorOpen(willOpen);
+                        setRepoSelectorExpanded(false);
                         setRepoContextMenu(null);
                         if (willOpen && projectPath && repositoriesProjectPath !== projectPath) loadRepositories();
                       }}
@@ -1812,6 +1835,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                     favorites={favoriteRepositories}
                     favoritePaths={repoFavorites}
                     activePath={currentRepoIdentityPath}
+                    expanded={repoSelectorExpanded}
                     search={repoSearch}
                     loading={repositoriesLoading}
                     contextMenu={repoContextMenu}
@@ -1823,6 +1847,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                     onRemoveFavorite={removeRepoFavorite}
                     onRefresh={loadRepositories}
                     onAddRepository={addRepositoryToProject}
+                    onExpandedChange={setRepoSelectorExpanded}
                     onDragPathChange={setDragRepoPath}
                     onMoveFavorite={moveFavoriteRepo}
                   />
@@ -1869,6 +1894,7 @@ function RepositoryMenu({
   favorites,
   favoritePaths,
   activePath,
+  expanded,
   search,
   loading,
   contextMenu,
@@ -1880,6 +1906,7 @@ function RepositoryMenu({
   onRemoveFavorite,
   onRefresh,
   onAddRepository,
+  onExpandedChange,
   onDragPathChange,
   onMoveFavorite,
 }: {
@@ -1889,6 +1916,7 @@ function RepositoryMenu({
   favorites: GitRepository[];
   favoritePaths: string[];
   activePath: string;
+  expanded: boolean;
   search: string;
   loading: boolean;
   contextMenu: { x: number; y: number; repo: GitRepository } | null;
@@ -1900,6 +1928,7 @@ function RepositoryMenu({
   onRemoveFavorite: (repoPath: string) => void;
   onRefresh: () => void;
   onAddRepository: () => void;
+  onExpandedChange: (expanded: boolean) => void;
   onDragPathChange: (repoPath: string) => void;
   onMoveFavorite: (sourcePath: string, targetPath: string) => void;
 }) {
@@ -1954,7 +1983,10 @@ function RepositoryMenu({
     );
   };
   const hasPinnedRows = Boolean(homeRepository) || favorites.length > 0;
-  const hasRegularRows = repositories.length > 0 || loading;
+  const regularCount = repositories.length;
+  const showRegularRows = expanded || Boolean(search.trim());
+  const hasRegularRows = showRegularRows && (regularCount > 0 || loading);
+  const showShowAllButton = !showRegularRows && regularCount > 0;
   return (
     <>
       <div style={repoMenuStyle(leftWidth)} onMouseDown={(event) => event.stopPropagation()}>
@@ -1982,11 +2014,21 @@ function RepositoryMenu({
         <div style={repoListStyle}>
           {homeRepository ? renderRepoRow(homeRepository, 'home') : null}
           {favorites.map((repo) => renderRepoRow(repo, 'favorite'))}
-          {hasPinnedRows && hasRegularRows ? <div style={repoListDividerStyle} /> : null}
-          {repositories.map((repo) => renderRepoRow(repo, 'repository'))}
-          {loading ? (
+          {hasPinnedRows && (hasRegularRows || showShowAllButton) ? <div style={repoListDividerStyle} /> : null}
+          {showShowAllButton ? (
+            <button onClick={() => onExpandedChange(true)} style={repoListToggleStyle}>
+              Show all ({regularCount})
+            </button>
+          ) : null}
+          {showRegularRows ? repositories.map((repo) => renderRepoRow(repo, 'repository')) : null}
+          {showRegularRows && regularCount > 0 ? (
+            <button onClick={() => onExpandedChange(false)} style={repoListToggleStyle}>
+              Collapse ({regularCount})
+            </button>
+          ) : null}
+          {showRegularRows && loading ? (
             <div style={emptyLineStyle}><Loader2 size={13} className="animate-spin" /> Loading repositories</div>
-          ) : !homeRepository && !favorites.length && !repositories.length ? (
+          ) : !homeRepository && !favorites.length && !regularCount ? (
             <div style={emptyLineStyle}>No repositories</div>
           ) : null}
         </div>
@@ -2526,6 +2568,22 @@ const repoListDividerStyle: React.CSSProperties = {
   height: 1,
   margin: '2px 8px',
   background: 'rgba(255,255,255,0.08)',
+};
+
+const repoListToggleStyle: React.CSSProperties = {
+  width: '100%',
+  height: 28,
+  border: 'none',
+  borderRadius: 6,
+  background: 'transparent',
+  color: '#93c5fd',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'flex-start',
+  padding: '0 25px',
+  fontSize: 10.5,
+  fontWeight: 760,
+  cursor: 'pointer',
 };
 
 const repoIconSlotStyle: React.CSSProperties = {

@@ -1359,6 +1359,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [insertionFileInputs, setInsertionFileInputs] = useState<{ value: string; valid: boolean | null }[]>([]);
   const [savedInsertionFlash, setSavedInsertionFlash] = useState<'title' | 'content' | null>(null);
   const savedInsertionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [textInsertCopied, setTextInsertCopied] = useState(false);
+  const [textInsertCopying, setTextInsertCopying] = useState(false);
+  const textInsertCopiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   dragVisualStateRef.current = { prompts, promptGroups };
   if (!pointerDragRef.current?.active) {
     latestPromptStateRef.current = { prompts, promptGroups };
@@ -1593,6 +1596,13 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
 
   const promptPos = (p: Prompt, fallback: number) => Number.isFinite(Number(p.position)) ? Number(p.position) : fallback;
 
+  const markdownFence = (value: string, lang = 'text') => {
+    const text = String(value || '').replace(/\r\n/g, '\n').trimEnd();
+    const maxFence = (text.match(/`{3,}/g) || []).reduce((max, item) => Math.max(max, item.length), 2);
+    const fence = '`'.repeat(Math.max(3, maxFence + 1));
+    return `${fence}${lang}\n${text || '(empty)'}\n${fence}`;
+  };
+
   // Build flat items: groups and ungrouped prompts interleaved by position
   const flatItemsFor = (state: PromptDragState): FlatItem[] => {
     const items: FlatItem[] = [];
@@ -1606,6 +1616,102 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   };
 
   const buildFlatItems = () => flatItemsFor({ prompts, promptGroups });
+
+  const buildPromptExportText = async (state: PromptDragState) => {
+    const filePaths = Array.from(new Set(
+      state.prompts.flatMap(p => (Array.isArray(p.file_paths) ? p.file_paths : []))
+        .map(fp => String(fp || '').trim())
+        .filter(Boolean)
+    ));
+    const fileContentByPath = new Map<string, string>();
+    if (filePaths.length > 0) {
+      const filesResult = await ipcRenderer.invoke('ai-prompts:read-files', filePaths).catch((err: any) => {
+        console.warn('[SettingsPrompts] read prompt files failed:', err?.message || err);
+        return null;
+      });
+      if (filesResult?.success && Array.isArray(filesResult.data)) {
+        filesResult.data.forEach((file: { path: string; content: string }) => {
+          if (file?.path) fileContentByPath.set(file.path, file.content || '');
+        });
+      }
+    }
+
+    const renderPrompt = (prompt: Prompt) => {
+      const lines: string[] = [];
+      const title = (prompt.title || '').trim() || 'Untitled';
+      lines.push(`### Prompt: ${title}`);
+      lines.push('');
+      lines.push('Definition:');
+      lines.push(markdownFence(prompt.content || ''));
+      const promptFiles = (Array.isArray(prompt.file_paths) ? prompt.file_paths : [])
+        .map(fp => String(fp || '').trim())
+        .filter(Boolean);
+      if (promptFiles.length > 0) {
+        lines.push('');
+        lines.push('Files:');
+        promptFiles.forEach((fp) => {
+          lines.push('');
+          lines.push(`#### File: ${fp}`);
+          lines.push(markdownFence(fileContentByPath.has(fp) ? fileContentByPath.get(fp)! : '(file could not be read)'));
+        });
+      }
+      return lines.join('\n');
+    };
+
+    const parts: string[] = [
+      '# Text Insertions',
+      '',
+      `Total prompts: ${state.prompts.length}`,
+    ];
+
+    let ungroupedOpen = false;
+    flatItemsFor(state).forEach((item) => {
+      if (item.type === 'group') {
+        ungroupedOpen = false;
+        const groupPrompts = state.prompts
+          .map((p, i) => ({ ...p, _idx: i }))
+          .filter(p => p.group_id === item.group.id)
+          .sort((a, b) => promptPos(a, a._idx) - promptPos(b, b._idx));
+        parts.push('');
+        parts.push(`## Group: ${(item.group.name || '').trim() || 'Untitled group'}`);
+        if (groupPrompts.length === 0) {
+          parts.push('');
+          parts.push('_No prompts_');
+        } else {
+          groupPrompts.forEach((prompt) => {
+            parts.push('');
+            parts.push(renderPrompt(prompt));
+          });
+        }
+      } else {
+        if (!ungroupedOpen) {
+          parts.push('');
+          parts.push('## Ungrouped');
+          ungroupedOpen = true;
+        }
+        parts.push('');
+        parts.push(renderPrompt(item.prompt));
+      }
+    });
+
+    return parts.join('\n').replace(/\n{4,}/g, '\n\n\n').trimEnd() + '\n';
+  };
+
+  const copyTextInsertions = async () => {
+    if (textInsertCopying || prompts.length === 0) return;
+    setTextInsertCopying(true);
+    try {
+      const text = await buildPromptExportText(promptStateWithLocalDrafts());
+      clipboard.writeText(text);
+      setTextInsertCopied(true);
+      if (textInsertCopiedTimer.current) clearTimeout(textInsertCopiedTimer.current);
+      textInsertCopiedTimer.current = setTimeout(() => setTextInsertCopied(false), 1400);
+    } catch (err: any) {
+      showToast('Copy failed: ' + (err?.message || err), 'error');
+    } finally {
+      setTextInsertCopying(false);
+    }
+  };
 
   const sameDragItem = (a: DragItem, b: DragItem) =>
     a.type === b.type && (a.type === 'group' ? a.id === (b as { type: 'group'; id: number }).id : a.index === (b as { type: 'prompt'; index: number }).index);
@@ -2190,9 +2296,26 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 34%) minmax(360px, 1fr)', gap: 12, height: '100%', minHeight: 0 }}>
         <div style={{ minHeight: 0, display: 'flex', flexDirection: 'column', background: '#17171a', border: `1px solid ${VR_BORDER}`, borderRadius: 10, overflow: 'hidden' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 10px', borderBottom: `1px solid ${VR_BORDER}` }}>
-            <span style={{ fontSize: 11, fontWeight: 750, letterSpacing: 0.4, color: VR_DIM, textTransform: 'uppercase' }}>Текстовые вставки</span>
             <VRTag>{prompts.length}</VRTag>
             <div style={{ flex: 1 }} />
+            <button
+              onClick={copyTextInsertions}
+              disabled={prompts.length === 0 || textInsertCopying}
+              title="Copy text insertions"
+              style={{
+                ...vrSmallBtnStyle('neutral'),
+                width: 92,
+                justifyContent: 'center',
+                borderColor: textInsertCopied ? 'rgba(34,197,94,0.45)' : VR_BORDER,
+                background: textInsertCopied ? 'rgba(34,197,94,0.14)' : VR_FIELD,
+                color: textInsertCopied ? '#86efac' : '#c9c9cd',
+                opacity: prompts.length === 0 ? 0.5 : 1,
+                cursor: prompts.length === 0 || textInsertCopying ? 'default' : 'pointer',
+              }}
+            >
+              {textInsertCopied ? <VRCheckIcon /> : <VRCopyIcon />}
+              <span style={{ width: 42, textAlign: 'left' }}>{textInsertCopied ? 'Copied' : textInsertCopying ? 'Copying' : 'Copy'}</span>
+            </button>
             <button onClick={addPromptGroup} style={vrSmallBtnStyle('neutral')}><VRFolderIcon /> Группа</button>
             <button onClick={() => addPrompt()} style={vrSmallBtnStyle('accent')}><VRPlusIcon small /> Промпт</button>
           </div>
@@ -3572,6 +3695,17 @@ const VRTrashIcon = ({ small }: { small?: boolean }) => (
     <path d="M3 6h18" />
     <path d="M8 6V4h8v2" />
     <path d="M6 6l1 15h10l1-15" />
+  </svg>
+);
+const VRCopyIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+  </svg>
+);
+const VRCheckIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M20 6 9 17l-5-5" />
   </svg>
 );
 const VRFolderIcon = () => (

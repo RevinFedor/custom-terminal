@@ -757,6 +757,35 @@ function isNonTranscriptServiceText(text) {
     || trimmed.startsWith('<tool_result>');
 }
 
+function extractQueuedCommandProjectionText(prompt) {
+  if (typeof prompt === 'string') return prompt;
+  if (Array.isArray(prompt)) {
+    return prompt.map((item) => {
+      if (!item) return '';
+      if (typeof item === 'string') return item;
+      if (typeof item.text === 'string') return item.text;
+      if (typeof item.content === 'string') return item.content;
+      if (typeof item.message === 'string') return item.message;
+      return '';
+    }).filter(Boolean).join('\n');
+  }
+  if (prompt && typeof prompt === 'object') {
+    if (typeof prompt.text === 'string') return prompt.text;
+    if (typeof prompt.content === 'string') return prompt.content;
+    if (typeof prompt.message === 'string') return prompt.message;
+  }
+  return '';
+}
+
+function queuedCommandProjectionText(message) {
+  if (message?.type !== 'attachment' || message?.attachment?.type !== 'queued_command') return '';
+  return extractQueuedCommandProjectionText(message.attachment.prompt).trim();
+}
+
+function isSlashCommandText(text) {
+  return String(text || '').trim().startsWith('/');
+}
+
 function deriveMessageProjection(payload) {
   if (!payload || payload.type !== 'message') return null;
   if (payload.projection && typeof payload.projection === 'object') return payload.projection;
@@ -780,7 +809,14 @@ function deriveMessageProjection(payload) {
     const hasToolResult = blocks.some((b) => b?.type === 'tool_result');
     const hasThinking = blocks.some((b) => b?.type === 'thinking' && String(b?.thinking || '').trim());
     const text = streamMessageText(message);
-    if (message?.type === 'assistant' && hasThinking && !hasText && !hasToolUse) {
+    const queuedText = queuedCommandProjectionText(message);
+    if (queuedText) {
+      kind = isSlashCommandText(queuedText) ? 'slash' : 'queued';
+      role = 'user';
+      transcript = true;
+      ephemeral = false;
+      timeline = !isSlashCommandText(queuedText);
+    } else if (message?.type === 'assistant' && hasThinking && !hasText && !hasToolUse) {
       kind = 'thinking';
       role = 'assistant';
       transcript = false;
@@ -800,7 +836,8 @@ function deriveMessageProjection(payload) {
       timeline = false;
     } else if (hasToolResult) {
       kind = 'tool_result';
-      transcript = true;
+      transcript = false;
+      ephemeral = true;
       timeline = false;
     } else {
       transcript = true;
@@ -2514,7 +2551,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const tabId = decId(m[1]);
     try {
       const body = await readBody(req);
-      const startupTimeoutMs = Math.max(1000, Math.min(45_000, Number(body.startupTimeoutMs) || 30_000));
+      const startupTimeoutMs = Math.max(1000, Math.min(60_000, Number(body.startupTimeoutMs) || 60_000));
       let data;
       try {
         data = await bridgeRequest('startAgentTab', { tabId }, Math.max(5000, Math.min(15_000, startupTimeoutMs)));
@@ -2593,7 +2630,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const tabId = decId(m[1]);
     try {
       const body = await readBody(req);
-      const startupTimeoutMs = Math.max(1000, Math.min(45_000, Number(body.startupTimeoutMs) || 30_000));
+      const startupTimeoutMs = Math.max(1000, Math.min(60_000, Number(body.startupTimeoutMs) || 60_000));
       let data;
       try {
         data = await bridgeRequest('resumeClaudeTab', { tabId }, Math.max(5000, Math.min(15_000, startupTimeoutMs)));

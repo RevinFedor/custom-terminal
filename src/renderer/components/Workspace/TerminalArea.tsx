@@ -658,7 +658,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       setSessionStarting((prev) => {
         if (prev?.tabId !== tabId) return prev;
         if (prev.startupFailed) return prev;
-        if (!force && prev?.tabId === tabId && (prev.startupFailed || prev.startupPending || prev.holdUntilReady)) return prev;
+        if (prev?.tabId === tabId && (prev.startupPending || prev.holdUntilReady)) return prev;
         console.warn('[SessionStartingOverlay] event-hide tab=' + tabId.slice(-12) + ' reason=' + reason + ' engine=' + prev.engine);
         return null;
       });
