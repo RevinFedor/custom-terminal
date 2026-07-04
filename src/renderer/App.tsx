@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, memo } from 'react';
+import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo } from 'react';
 import { useWorkspaceStore, isTabInterrupted } from './store/useWorkspaceStore';
 import { useProjectsStore } from './store/useProjectsStore';
 import { useUIStore } from './store/useUIStore';
@@ -44,6 +44,7 @@ import {
 } from './utils/agentScenarios';
 import { terminalRegistry } from './utils/terminalRegistry';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './utils/claudeStartupDefaultsReady';
+import { getClaudeStartupDefaultsGateSnapshot } from './utils/claudeStartupDefaultsGate';
 import { DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL } from './constants/codexSettings';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from './constants/systemProjects';
 import { generateTabTitleFromSession } from './utils/generateTabTitle';
@@ -52,6 +53,56 @@ const { ipcRenderer } = window.require('electron');
 
 const CLAUDE_SPINNER_VISUAL_IDLE_GRACE_MS = 300;
 const COMPLETION_NOTIFICATION_DISMISS_MS = 420;
+type AgentRuntimeStatus = 'active' | 'busy' | 'inactive' | 'starting' | 'stopping';
+
+function projectClaudeStatusThroughStartupDefaults(
+  tabId: string,
+  status: AgentRuntimeStatus | null,
+  inputReady: boolean | null,
+  lastNotReady: any,
+  startupFailed: boolean,
+  startupError: string | null,
+) {
+  const gate = getClaudeStartupDefaultsGateSnapshot(tabId);
+  const baseStatus: AgentRuntimeStatus = status || 'inactive';
+  const result = {
+    status: baseStatus,
+    inputReady: inputReady === true,
+    lastNotReady,
+    startupFailed,
+    startupError,
+    startupDefaultsPending: false,
+    startupDefaultsReady: gate?.status === 'ready',
+    startupDefaultsError: gate?.status === 'failed' ? (gate.error || gate.reason || 'startup-defaults-failed') : null,
+  };
+
+  if (gate?.status === 'pending') {
+    const blockers = Array.isArray(lastNotReady?.blockers) ? [...lastNotReady.blockers] : [];
+    if (!blockers.includes('startup-defaults')) blockers.push('startup-defaults');
+    return {
+      ...result,
+      status: baseStatus === 'stopping' || baseStatus === 'inactive' ? baseStatus : 'starting' as AgentRuntimeStatus,
+      inputReady: false,
+      lastNotReady: {
+        ...(lastNotReady || {}),
+        reason: 'startup-defaults',
+        blockers,
+        gateReason: gate.reason,
+      },
+      startupDefaultsPending: true,
+    };
+  }
+
+  if (gate?.status === 'failed') {
+    return {
+      ...result,
+      startupFailed: true,
+      startupError: gate.error || startupError || 'startup-defaults-failed',
+    };
+  }
+
+  return result;
+}
 
 function hexToRgbTriplet(hex: string, fallback = '255, 255, 255') {
   const v = (hex || '').trim().replace(/^#/, '');
@@ -63,6 +114,94 @@ function hexToRgbTriplet(hex: string, fallback = '255, 255, 255') {
 function opacityPctToAlpha(pct: number, fallback = 55) {
   const safe = Number.isFinite(pct) ? pct : fallback;
   return Math.max(5, Math.min(100, Math.round(safe))) / 100;
+}
+
+const DOCK_BUSY_ICON_SIZE = 512;
+const DOCK_BUSY_BADGE_SIZE = 154;
+let dockBaseIconDataUrlPromise: Promise<string | null> | null = null;
+let dockBaseIconImagePromise: Promise<HTMLImageElement | null> | null = null;
+const dockBusyIconCache = new Map<string, Promise<string | null>>();
+
+function loadDockBaseIconDataUrl() {
+  if (!dockBaseIconDataUrlPromise) {
+    dockBaseIconDataUrlPromise = ipcRenderer.invoke('dock:get-base-icon-data-url')
+      .then((result: any) => result?.success && typeof result.dataUrl === 'string' ? result.dataUrl : null)
+      .catch(() => null);
+  }
+  return dockBaseIconDataUrlPromise;
+}
+
+function loadDockBaseIconImage() {
+  if (!dockBaseIconImagePromise) {
+    dockBaseIconImagePromise = loadDockBaseIconDataUrl().then((dataUrl) => new Promise<HTMLImageElement | null>((resolve) => {
+      if (!dataUrl) return resolve(null);
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => resolve(null);
+      image.src = dataUrl;
+    }));
+  }
+  return dockBaseIconImagePromise;
+}
+
+function drawDockBusyIcon(baseImage: HTMLImageElement, displayCount: string) {
+  const canvas = document.createElement('canvas');
+  canvas.width = DOCK_BUSY_ICON_SIZE;
+  canvas.height = DOCK_BUSY_ICON_SIZE;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  ctx.clearRect(0, 0, DOCK_BUSY_ICON_SIZE, DOCK_BUSY_ICON_SIZE);
+  ctx.drawImage(baseImage, 0, 0, DOCK_BUSY_ICON_SIZE, DOCK_BUSY_ICON_SIZE);
+
+  const radius = DOCK_BUSY_BADGE_SIZE / 2;
+  const cx = DOCK_BUSY_ICON_SIZE - radius - 26;
+  const cy = DOCK_BUSY_ICON_SIZE - radius - 24;
+
+  ctx.save();
+  ctx.shadowColor = 'rgba(0, 0, 0, 0.34)';
+  ctx.shadowBlur = 18;
+  ctx.shadowOffsetY = 8;
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius + 12, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.fillStyle = '#4ade80';
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.lineWidth = 9;
+  ctx.strokeStyle = 'rgba(5, 46, 22, 0.28)';
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius - 4, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.fillStyle = '#052e16';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `700 ${displayCount.length >= 3 ? 54 : displayCount.length === 2 ? 68 : 82}px -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif`;
+  ctx.fillText(displayCount, cx, cy + 3);
+
+  return canvas.toDataURL('image/png');
+}
+
+async function getDockBusyIconDataUrl(count: number) {
+  const displayCount = count > 99 ? '99+' : String(Math.max(0, Math.floor(count)));
+  const cached = dockBusyIconCache.get(displayCount);
+  if (cached) return cached;
+
+  const promise = (async () => {
+    const baseImage = await loadDockBaseIconImage();
+    if (!baseImage) return null;
+
+    return drawDockBusyIcon(baseImage, displayCount);
+  })();
+
+  dockBusyIconCache.set(displayCount, promise);
+  return promise;
 }
 
 function isAiForegroundProcess(info?: { hasProcess?: boolean; processName?: string; command?: string } | null) {
@@ -1496,6 +1635,42 @@ function App() {
           const sessionId = sessionIdForTab(tab, toolType);
           return { tab, toolType, runtime, sessionId };
         };
+        const readClaudeMaterialization = async (tab: any | null) => {
+          const sessionId = tab?.claudeSessionId || null;
+          if (!sessionId) {
+            return {
+              materialized: false,
+              conversationMaterialized: false,
+              timelineCount: 0,
+              canCopySessionId: false,
+              materializationReason: 'no-session-id',
+            };
+          }
+          try {
+            const result = await ipcRenderer.invoke('claude:session-materialization', {
+              sessionId,
+              cwd: tab?.cwd || undefined,
+            });
+            const materialized = result?.materialized === true || result?.conversationMaterialized === true;
+            return {
+              ...(result || {}),
+              materialized,
+              conversationMaterialized: materialized,
+              timelineCount: typeof result?.timelineCount === 'number' ? result.timelineCount : null,
+              canCopySessionId: materialized,
+              materializationReason: result?.reason || null,
+            };
+          } catch (e: any) {
+            return {
+              materialized: false,
+              conversationMaterialized: false,
+              timelineCount: null,
+              canCopySessionId: false,
+              materializationReason: 'materialization-check-failed',
+              error: String(e?.message || e),
+            };
+          }
+        };
         const maybeAutoTitleAfterMobileSend = (tabId: string, toolType: AgentHistoryTool, cwd?: string | null) => {
           const delays = [0, 700, 1800, 4000];
           const attempt = async (index: number) => {
@@ -1657,24 +1832,52 @@ function App() {
             let lastNotReady: any = null;
             let effectiveCodexSessionId = t.codexSessionId;
             let startupFailed = false;
-            let startupError: string | null = null;
-            const toolType = toolForTab(t);
-            if (toolType) {
-              try {
-                const p = await getHistoryAgentRuntime(toolType).getPresence(t.tabId);
-                sessionStatus = p?.status || 'inactive';
+	            let startupError: string | null = null;
+	            const toolType = toolForTab(t);
+	            const claudeMaterialization = toolType === 'claude'
+	              ? await readClaudeMaterialization(t)
+	              : null;
+	            if (toolType) {
+	              try {
+	                const p = await getHistoryAgentRuntime(toolType).getPresence(t.tabId);
+	                sessionStatus = p?.status || 'inactive';
                 awaiting = toolType === 'claude' && !!p?.awaiting;
                 inputReady = typeof p?.inputReady === 'boolean' ? p.inputReady : null;
                 lastNotReady = (p as any)?.lastNotReady || null;
-                startupFailed = (p as any)?.startupFailed === true;
-                startupError = (p as any)?.startupError || null;
-                if (toolType === 'codex') {
-                  const runtimeSession = await ipcRenderer.invoke('codex:get-runtime-session', t.tabId).catch(() => null);
+	                startupFailed = (p as any)?.startupFailed === true;
+	                startupError = (p as any)?.startupError || null;
+	                if (toolType === 'claude' && claudeMaterialization && (p as any)?.conversationMaterialized === true) {
+	                  claudeMaterialization.conversationMaterialized = true;
+	                  claudeMaterialization.materialized = true;
+	                }
+	                if (toolType === 'codex') {
+	                  const runtimeSession = await ipcRenderer.invoke('codex:get-runtime-session', t.tabId).catch(() => null);
                   if (runtimeSession?.sessionId) {
                     effectiveCodexSessionId = runtimeSession.sessionId;
                   }
                 }
               } catch { sessionStatus = 'inactive'; }
+            }
+            let startupDefaultsPending = false;
+            let startupDefaultsReady = toolType !== 'claude';
+            let startupDefaultsError: string | null = null;
+            if (toolType === 'claude') {
+              const projected = projectClaudeStatusThroughStartupDefaults(
+                t.tabId,
+                sessionStatus,
+                inputReady,
+                lastNotReady,
+                startupFailed,
+                startupError,
+              );
+              sessionStatus = projected.status;
+              inputReady = projected.inputReady;
+              lastNotReady = projected.lastNotReady;
+              startupFailed = projected.startupFailed;
+              startupError = projected.startupError;
+              startupDefaultsPending = projected.startupDefaultsPending;
+              startupDefaultsReady = projected.startupDefaultsReady;
+              startupDefaultsError = projected.startupDefaultsError;
             }
             // Assigned category status (dev/bugfix/knowledge/custom) — id stored
             // on the tab, color looked up in the palette. Distinct from the
@@ -1689,16 +1892,24 @@ function App() {
               color: t.color || null,   // desktop TabColor — drives row bg on mobile
               cwd: t.cwd,
               filePath: t.filePath || null,
-              claudeSessionId: t.claudeSessionId,
-              codexSessionId: effectiveCodexSessionId,
-              geminiSessionId: t.geminiSessionId,
-              sessionStatus,
+	              claudeSessionId: t.claudeSessionId,
+	              codexSessionId: effectiveCodexSessionId,
+	              geminiSessionId: t.geminiSessionId,
+	              conversationMaterialized: toolType === 'claude' ? claudeMaterialization?.conversationMaterialized === true : !!(effectiveCodexSessionId || t.geminiSessionId),
+	              canResume: toolType === 'claude' && sessionStatus === 'inactive' && claudeMaterialization?.conversationMaterialized === true,
+	              canCopySessionId: toolType === 'claude' ? claudeMaterialization?.conversationMaterialized === true : !!(effectiveCodexSessionId || t.geminiSessionId),
+	              timelineCount: toolType === 'claude' ? claudeMaterialization?.timelineCount ?? null : null,
+	              materializationReason: toolType === 'claude' ? claudeMaterialization?.materializationReason || claudeMaterialization?.reason || null : null,
+	              sessionStatus,
               starting: sessionStatus === 'starting',
               stopping: sessionStatus === 'stopping',
               inputReady,
               lastNotReady,
               startupFailed,
               startupError,
+              startupDefaultsPending,
+              startupDefaultsReady,
+              startupDefaultsError,
               awaiting,
               statusId,
               statusColor: statusMeta?.color || null,
@@ -2458,6 +2669,16 @@ function App() {
             toolType: agent,
             commandType: agent,
             color: tab?.color || agent,
+            sessionStatus: shouldStartNow ? 'starting' : 'inactive',
+            inputReady: false,
+            conversationMaterialized: false,
+            canResume: false,
+            canCopySessionId: false,
+            timelineCount: 0,
+            materializationReason: shouldStartNow ? 'launch-pending' : 'not-started',
+            startupDefaultsPending: false,
+            startupDefaultsReady: agent !== 'claude',
+            startupDefaultsError: null,
             starting: shouldStartNow,
             launchAccepted: shouldStartNow ? true : undefined,
             launchId: launchAccepted?.launchId || null,
@@ -2477,16 +2698,90 @@ function App() {
         if (action === 'resumeClaudeTab') {
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
-          const { tab, toolType, runtime, sessionId } = describeAgentTab(tabId);
-          if (!tab || !runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
-          if (!sessionId) return reply(false, null, 'no session to resume');
-          console.log('[MobResume:Bridge] resumeAgentTab begin tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' sid=' + String(sessionId).slice(0, 8));
+		          const { tab, toolType, runtime, sessionId } = describeAgentTab(tabId);
+		          if (!tab || !runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
+	          if (!sessionId) return reply(false, null, 'no session to resume');
+	          if (toolType === 'claude') {
+	            const materialization = await readClaudeMaterialization(tab);
+	            if (materialization.conversationMaterialized !== true) {
+	              console.warn('[MobResume:Bridge] blocked-empty-session tab=' + String(tabId).slice(-12)
+	                + ' sid=' + String(sessionId).slice(0, 8)
+	                + ' reason=' + (materialization.materializationReason || materialization.reason || '-')
+	                + ' timelineCount=' + (materialization.timelineCount ?? 'null'));
+	              return reply(true, {
+	                success: false,
+	                ok: false,
+	                tabId,
+	                toolType,
+	                sessionId,
+	                conversationMaterialized: false,
+	                canResume: false,
+	                canCopySessionId: false,
+	                timelineCount: materialization.timelineCount ?? null,
+	                materializationReason: materialization.materializationReason || materialization.reason || null,
+	                error: 'session_not_materialized',
+	              });
+	            }
+	          }
+	          console.log('[MobResume:Bridge] resumeAgentTab begin tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' sid=' + String(sessionId).slice(0, 8));
           try {
             const result = await runtime.resume({ tabId, sessionId, cwd: tab.cwd });
             console.log('[MobResume:Bridge] resumeAgentTab done tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(result));
             return reply(!!result.success, { tabId, toolType, sessionId, ...result }, result.error);
           } catch (e: any) {
             console.log('[MobResume:Bridge] resumeAgentTab err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
+	            return reply(false, null, String(e?.message || e));
+	          }
+	        }
+        if (action === 'startAgentTab') {
+          const { tabId } = payload || {};
+          if (!tabId) return reply(false, null, 'tabId required');
+          const { tab, toolType } = describeAgentTab(tabId);
+          if (!tab || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
+          console.log('[MobStart:Bridge] startAgentTab begin tool=' + toolType + ' tab=' + String(tabId).slice(-12));
+          try {
+            state.setTabCommandType(tabId, toolType);
+            state.markAiLaunchAutoTitle(tabId, toolType);
+            let launchAccepted: any = null;
+            if (toolType === 'codex') {
+              const runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
+                tabId,
+                command: 'codex',
+                cwd: tab.cwd,
+              })).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
+              if (runResult?.success === false || runResult?.accepted === false) {
+                return reply(false, null, runResult.error || 'Codex start failed');
+              }
+              launchAccepted = runResult;
+            } else {
+              ipcRenderer.send('claude:run-command', { tabId, command: 'claude' });
+              launchAccepted = await waitForAgentLaunchAccepted(tabId, 'claude');
+              if (!launchAccepted?.accepted) {
+                return reply(false, null, launchAccepted?.error || launchAccepted?.reason || 'Claude start failed');
+              }
+            }
+            console.log('[MobStart:Bridge] startAgentTab accepted tool=' + toolType + ' tab=' + String(tabId).slice(-12));
+            return reply(true, {
+              tabId,
+              toolType,
+              success: true,
+              ok: true,
+              status: 'starting',
+              inputReady: false,
+              conversationMaterialized: false,
+              canResume: false,
+              canCopySessionId: false,
+              timelineCount: 0,
+              materializationReason: 'launch-pending',
+              startupDefaultsPending: toolType === 'claude',
+              startupDefaultsReady: toolType !== 'claude',
+              startupDefaultsError: null,
+              launchAccepted: true,
+              launchId: launchAccepted?.launchId || null,
+              pid: launchAccepted?.pid || null,
+            });
+          } catch (e: any) {
+            console.log('[MobStart:Bridge] startAgentTab err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
             return reply(false, null, String(e?.message || e));
           }
         }
@@ -2670,25 +2965,62 @@ function App() {
           const lastNotReady: Record<string, any> = {};
           const sessions: Record<string, string | null> = {};
           const startupFailed: Record<string, boolean> = {};
-          const startupError: Record<string, string | null> = {};
-          const manualActionRequired: Record<string, boolean> = {};
-          const manualActionType: Record<string, string | null> = {};
-          // awaiting (Claude blocked on AskUserQuestion) per tab — drives the
+	          const startupError: Record<string, string | null> = {};
+	          const startupDefaultsPending: Record<string, boolean> = {};
+	          const startupDefaultsReady: Record<string, boolean> = {};
+	          const startupDefaultsError: Record<string, string | null> = {};
+	          const manualActionRequired: Record<string, boolean> = {};
+	          const manualActionType: Record<string, string | null> = {};
+	          const conversationMaterialized: Record<string, boolean> = {};
+	          const timelineCount: Record<string, number | null> = {};
+	          const canResume: Record<string, boolean> = {};
+	          const canCopySessionId: Record<string, boolean> = {};
+	          const materializationReason: Record<string, string | null> = {};
+	          // awaiting (Claude blocked on AskUserQuestion) per tab — drives the
           // mobile tab-list purple dot. Same presence call, extra field.
           const awaiting: Record<string, boolean> = {};
           for (const tid of tabIds) {
             try {
               const { toolType, runtime } = describeAgentTab(tid);
               const p = runtime ? await runtime.getPresence(tid) : null;
-              statuses[tid] = p?.status || 'inactive';
-              inputReady[tid] = !!p?.inputReady;
-              if ((p as any)?.lastNotReady) lastNotReady[tid] = (p as any).lastNotReady;
-              if ((p as any)?.startupFailed) startupFailed[tid] = true;
-              if ((p as any)?.startupError) startupError[tid] = (p as any).startupError;
-              if ((p as any)?.manualActionRequired) manualActionRequired[tid] = true;
-              if ((p as any)?.manualActionType) manualActionType[tid] = (p as any).manualActionType;
-              if (toolType === 'claude' && p?.awaiting) awaiting[tid] = true;
-              if (toolType === 'codex') {
+              let status = (p?.status || 'inactive') as AgentRuntimeStatus;
+              let ready = !!p?.inputReady;
+              let notReady = (p as any)?.lastNotReady || null;
+              let failed = (p as any)?.startupFailed === true;
+              let failedError = (p as any)?.startupError || null;
+              if (toolType === 'claude') {
+                const projected = projectClaudeStatusThroughStartupDefaults(tid, status, ready, notReady, failed, failedError);
+                status = projected.status;
+                ready = projected.inputReady;
+                notReady = projected.lastNotReady;
+                failed = projected.startupFailed;
+                failedError = projected.startupError;
+                startupDefaultsPending[tid] = projected.startupDefaultsPending;
+                startupDefaultsReady[tid] = projected.startupDefaultsReady;
+                startupDefaultsError[tid] = projected.startupDefaultsError;
+              } else {
+                startupDefaultsPending[tid] = false;
+                startupDefaultsReady[tid] = true;
+                startupDefaultsError[tid] = null;
+              }
+              statuses[tid] = status;
+              inputReady[tid] = ready;
+              if (notReady) lastNotReady[tid] = notReady;
+              if (failed) startupFailed[tid] = true;
+	              if (failedError) startupError[tid] = failedError;
+	              if ((p as any)?.manualActionRequired) manualActionRequired[tid] = true;
+	              if ((p as any)?.manualActionType) manualActionType[tid] = (p as any).manualActionType;
+	              if (toolType === 'claude') {
+	                const tab = findTab(tid);
+	                const materialization = await readClaudeMaterialization(tab);
+	                conversationMaterialized[tid] = materialization.conversationMaterialized === true;
+	                timelineCount[tid] = materialization.timelineCount ?? null;
+	                canResume[tid] = statuses[tid] === 'inactive' && materialization.conversationMaterialized === true;
+	                canCopySessionId[tid] = materialization.conversationMaterialized === true;
+	                materializationReason[tid] = materialization.materializationReason || materialization.reason || null;
+	                if (p?.awaiting) awaiting[tid] = true;
+	              }
+	              if (toolType === 'codex') {
                 const runtimeSession = await ipcRenderer.invoke('codex:get-runtime-session', tid).catch(() => null);
                 if (runtimeSession?.sessionId) sessions[tid] = runtimeSession.sessionId;
               }
@@ -2697,7 +3029,7 @@ function App() {
               inputReady[tid] = false;
             }
           }
-          return reply(true, { statuses, inputReady, lastNotReady, awaiting, sessions, startupFailed, startupError, manualActionRequired, manualActionType });
+	          return reply(true, { statuses, inputReady, lastNotReady, awaiting, sessions, startupFailed, startupError, startupDefaultsPending, startupDefaultsReady, startupDefaultsError, manualActionRequired, manualActionType, conversationMaterialized, timelineCount, canResume, canCopySessionId, materializationReason });
         }
         if (action === 'getClaudeTabStatus') {
           const { tabId } = payload || {};
@@ -2709,23 +3041,43 @@ function App() {
           let lastNotReady: any = null;
           let startupFailed = false;
           let startupError: string | null = null;
-          let manualActionRequired = false;
-          let manualActionType: string | null = null;
-          let effectiveSessionId = sessionId;
-          let effectiveCodexSessionId = tab.codexSessionId || null;
-          if (runtime) {
-            try {
-              const p = await runtime.getPresence(tabId);
+	          let manualActionRequired = false;
+	          let manualActionType: string | null = null;
+	          let effectiveSessionId = sessionId;
+	          let effectiveCodexSessionId = tab.codexSessionId || null;
+	          let materialization: any = null;
+	          if (runtime) {
+	            try {
+	              const p = await runtime.getPresence(tabId);
               status = p?.status || 'inactive';
               inputReady = !!p?.inputReady;
               lastNotReady = (p as any)?.lastNotReady || null;
               startupFailed = (p as any)?.startupFailed === true;
               startupError = (p as any)?.startupError || null;
-              manualActionRequired = (p as any)?.manualActionRequired === true;
-              manualActionType = (p as any)?.manualActionType || null;
-            } catch { status = 'inactive'; }
-          }
-          if (toolType === 'codex') {
+	              manualActionRequired = (p as any)?.manualActionRequired === true;
+	              manualActionType = (p as any)?.manualActionType || null;
+	            } catch { status = 'inactive'; }
+	          }
+	          if (toolType === 'claude') {
+	            materialization = await readClaudeMaterialization(tab);
+	            const projected = projectClaudeStatusThroughStartupDefaults(
+	              tabId,
+	              status,
+	              inputReady,
+	              lastNotReady,
+	              startupFailed,
+	              startupError,
+	            );
+	            status = projected.status;
+	            inputReady = projected.inputReady;
+	            lastNotReady = projected.lastNotReady;
+	            startupFailed = projected.startupFailed;
+	            startupError = projected.startupError;
+	            (materialization ||= {}).startupDefaultsPending = projected.startupDefaultsPending;
+	            materialization.startupDefaultsReady = projected.startupDefaultsReady;
+	            materialization.startupDefaultsError = projected.startupDefaultsError;
+	          }
+	          if (toolType === 'codex') {
             const runtimeSession = await ipcRenderer.invoke('codex:get-runtime-session', tabId).catch(() => null);
             if (runtimeSession?.sessionId) {
               effectiveSessionId = runtimeSession.sessionId;
@@ -2744,15 +3096,23 @@ function App() {
             lastNotReady,
             startupFailed,
             startupError,
+            startupDefaultsPending: toolType === 'claude' ? materialization?.startupDefaultsPending === true : false,
+            startupDefaultsReady: toolType === 'claude' ? materialization?.startupDefaultsReady === true : true,
+            startupDefaultsError: toolType === 'claude' ? materialization?.startupDefaultsError || null : null,
             manualActionRequired,
             manualActionType,
             toolType,
             commandType: tab.commandType || null,
-            sessionId: effectiveSessionId,
-            claudeSessionId: tab.claudeSessionId || null,
-            codexSessionId: effectiveCodexSessionId,
-            cwd: tab.cwd,
-          });
+	            sessionId: effectiveSessionId,
+	            claudeSessionId: tab.claudeSessionId || null,
+	            codexSessionId: effectiveCodexSessionId,
+	            conversationMaterialized: toolType === 'claude' ? materialization?.conversationMaterialized === true : !!effectiveSessionId,
+	            canResume: toolType === 'claude' ? (status === 'inactive' && materialization?.conversationMaterialized === true) : (status === 'inactive' && !!effectiveSessionId),
+	            canCopySessionId: toolType === 'claude' ? materialization?.conversationMaterialized === true : !!effectiveSessionId,
+	            timelineCount: toolType === 'claude' ? materialization?.timelineCount ?? null : null,
+	            materializationReason: toolType === 'claude' ? materialization?.materializationReason || materialization?.reason || null : null,
+	            cwd: tab.cwd,
+	          });
         }
         if (action === 'loadSDKHistory') {
           const { tabId } = payload || {};
@@ -3671,6 +4031,56 @@ function App() {
     };
   };
   const inboxIndicators = getProjectTabIndicators(INBOX_PROJECT_ID, inboxWorkspace);
+  const dockBusyTabCount = useMemo(() => {
+    const busyTabIds = new Set<string>();
+    openProjects.forEach((workspace: any) => {
+      workspace?.tabs?.forEach((tab: any, tabId: string) => {
+        if (!tab || tab.tabType === 'file') return;
+        if (busyTabs.get(tabId) || pasteBusyTabs.get(tabId)) busyTabIds.add(tabId);
+      });
+    });
+    return busyTabIds.size;
+  }, [openProjects, busyTabs, pasteBusyTabs]);
+
+  useEffect(() => {
+    const isMacDock = /Mac/i.test(navigator.platform || '');
+    if (!isMacDock) return () => {};
+
+    let disposed = false;
+
+    const stopCustomDockBadge = async (reason: string) => {
+      console.warn('[DockBusyBadge] custom icon unavailable; clearing dock badge reason=' + reason);
+      await ipcRenderer.invoke('dock:reset-icon').catch(() => {});
+    };
+
+    const reset = () => {
+      ipcRenderer.invoke('dock:reset-icon').catch(() => {});
+    };
+
+    if (dockBusyTabCount <= 0) {
+      reset();
+      return () => {};
+    }
+
+    (async () => {
+      try {
+        const dataUrl = await getDockBusyIconDataUrl(dockBusyTabCount);
+        if (disposed) return;
+        if (dataUrl) {
+          const result = await ipcRenderer.invoke('dock:set-icon-data-url', { dataUrl, count: dockBusyTabCount });
+          if (result?.success === false) await stopCustomDockBadge(result?.error || 'set-icon-failed');
+        } else {
+          await stopCustomDockBadge('draw-failed');
+        }
+      } catch {
+        if (!disposed) await stopCustomDockBadge('paint-exception');
+      }
+    })();
+
+    return () => {
+      disposed = true;
+    };
+  }, [dockBusyTabCount]);
 
   // Show loading screen while restoring session
   if (isRestoring) {

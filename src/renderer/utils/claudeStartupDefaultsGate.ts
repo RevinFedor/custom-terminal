@@ -1,4 +1,4 @@
-type GateStatus = 'pending' | 'ready' | 'failed';
+type GateStatus = 'pending' | 'ready' | 'failed' | 'cleared';
 
 type GateState = {
   status: GateStatus;
@@ -19,6 +19,10 @@ function emitGateEvent(tabId: string, status: GateStatus, reason: string, error?
   window.dispatchEvent(new CustomEvent('claude-startup-defaults-gate', {
     detail: { tabId, status, reason, error, at: Date.now() },
   }));
+  try {
+    const ipcRenderer = (window as any).require?.('electron')?.ipcRenderer;
+    ipcRenderer?.send?.('claude:startup-defaults-gate', { tabId, status, reason, error });
+  } catch {}
 }
 
 export function markClaudeStartupDefaultsPending(tabId: string, reason: string) {
@@ -75,7 +79,7 @@ export function clearClaudeStartupDefaultsGate(tabId: string) {
     for (const resolve of existing.waiters) resolve(err);
   }
   gates.delete(tabId);
-  emitGateEvent(tabId, 'ready', 'cleared');
+  emitGateEvent(tabId, 'cleared', 'cleared');
 }
 
 export function getClaudeStartupDefaultsGateSnapshot(tabId: string) {

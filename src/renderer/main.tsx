@@ -184,7 +184,15 @@ class ErrorBoundary extends React.Component<
   }
 
   componentDidCatch(error: Error, info: React.ErrorInfo) {
-    _origError('[ErrorBoundary]', error, info.componentStack);
+    const message = error?.message || String(error);
+    const stack = error?.stack || '';
+    const componentStack = info.componentStack || '';
+    _sendRendererLog(
+      '[ErrorBoundary] message=' + message.slice(0, 1000)
+      + ' stack=' + stack.slice(0, 4000).replace(/\s+/g, ' ')
+      + ' componentStack=' + componentStack.slice(0, 4000).replace(/\s+/g, ' ')
+    );
+    console.error('[ErrorBoundary]', message, stack, componentStack);
   }
 
   render() {

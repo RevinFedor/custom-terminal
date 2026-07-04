@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -193,24 +193,9 @@ export default function ClaudeControlBar({
     : commandType === 'codex' ? 'codex'
     : 'claude';
   const sessionId = claudeSessionId || geminiSessionId || codexSessionId;
-  const hasAnySession = !!sessionId;
   const [sessionCopied, setSessionCopied] = useState(false);
   const [sessionCopyHover, setSessionCopyHover] = useState(false);
   const [sessionCopyRect, setSessionCopyRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
-  const copySessionId = () => {
-    if (!sessionId) return;
-    // Electron clipboard, не navigator.clipboard — последний в renderer тихо
-    // отваливается без HTTPS/permissions, юзер видит как «даже логов нет».
-    // См. CLAUDE.md anti-pattern «Не используй navigator.clipboard в renderer».
-    try {
-      const { clipboard } = window.require('electron');
-      clipboard.writeText(sessionId);
-      setSessionCopied(true);
-      setTimeout(() => setSessionCopied(false), 1000);
-    } catch (e) {
-      console.error('[ClaudeControlBar] copySessionId failed:', e);
-    }
-  };
   // Per-field primitive selectors. A single composite-object selector returned a
   // fresh `{}` on every render → Zustand fires re-renders forever → Maximum
   // update depth. Anti-pattern documented in CLAUDE.md ("Zustand: Не подписывайся
@@ -288,6 +273,172 @@ export default function ClaudeControlBar({
   const isSDKTab = tabType === 'claude-sdk';
   const isCodex = sessionType === 'codex';
   const codexTurnBusy = isCodex && tabAiBusy;
+  const isClaudePtySession = sessionType === 'claude' && !isSDKTab;
+  const [claudeMaterialization, setClaudeMaterialization] = useState<{
+    sessionId: string | null;
+    conversationMaterialized: boolean | null;
+    timelineCount: number | null;
+    reason: string | null;
+  }>({ sessionId: null, conversationMaterialized: null, timelineCount: null, reason: null });
+  const claudeMaterializationRequestRef = useRef(0);
+
+  const refreshClaudeMaterialization = useCallback(async (
+    checkReason: string,
+    options: { markChecking?: boolean } = {},
+  ) => {
+    if (!isClaudePtySession || !claudeSessionId) {
+      claudeMaterializationRequestRef.current += 1;
+      setClaudeMaterialization({ sessionId: null, conversationMaterialized: null, timelineCount: null, reason: null });
+      return null;
+    }
+
+    const requestSeq = ++claudeMaterializationRequestRef.current;
+    if (options.markChecking) {
+      setClaudeMaterialization({ sessionId: claudeSessionId, conversationMaterialized: null, timelineCount: null, reason: 'checking' });
+    }
+
+    try {
+      const result = await ipcRenderer.invoke('claude:session-materialization', { sessionId: claudeSessionId, cwd: launchCwd });
+      if (requestSeq !== claudeMaterializationRequestRef.current) return null;
+      const materialized = result?.materialized === true || result?.conversationMaterialized === true;
+      const timelineCount = typeof result?.timelineCount === 'number' ? result.timelineCount : null;
+      const reason = result?.reason || result?.materializationReason || null;
+      console.log('[ClaudeControlBar:Materialization] tab=' + tabId.slice(-12)
+        + ' sid=' + claudeSessionId.slice(0, 8)
+        + ' materialized=' + materialized
+        + ' timelineCount=' + (timelineCount ?? 'null')
+        + ' reason=' + (reason || '-')
+        + ' check=' + checkReason);
+      const snapshot = { sessionId: claudeSessionId, conversationMaterialized: materialized, timelineCount, reason };
+      setClaudeMaterialization(snapshot);
+      return snapshot;
+    } catch (e: any) {
+      if (requestSeq !== claudeMaterializationRequestRef.current) return null;
+      console.warn('[ClaudeControlBar:Materialization] failed tab=' + tabId.slice(-12)
+        + ' sid=' + claudeSessionId.slice(0, 8)
+        + ' check=' + checkReason
+        + ': ' + String(e?.message || e));
+      const snapshot = { sessionId: claudeSessionId, conversationMaterialized: false, timelineCount: null, reason: 'materialization-check-failed' };
+      setClaudeMaterialization(snapshot);
+      return snapshot;
+    }
+  }, [claudeSessionId, isClaudePtySession, launchCwd, tabId]);
+
+  useEffect(() => {
+    void refreshClaudeMaterialization('initial', { markChecking: true });
+  }, [refreshClaudeMaterialization]);
+
+  useEffect(() => {
+    if (!isClaudePtySession || !claudeSessionId) return;
+
+    const consumerId = 'controlbar-materialization:' + tabId;
+    let disposed = false;
+    let refreshQueued = false;
+    const queueRefresh = (reason: string) => {
+      if (refreshQueued || disposed) return;
+      refreshQueued = true;
+      requestAnimationFrame(() => {
+        refreshQueued = false;
+        if (disposed) return;
+        void refreshClaudeMaterialization(reason);
+      });
+    };
+
+    const onTranscriptChanged = (_event: any, detail: any) => {
+      if (detail?.sessionId !== claudeSessionId) return;
+      if (detail?.toolType && detail.toolType !== 'claude') return;
+      queueRefresh(detail?.reason || 'transcript-change');
+    };
+
+    ipcRenderer.on('agent-transcript:changed', onTranscriptChanged);
+    ipcRenderer.invoke('agent-transcript:subscribe', {
+      consumerId,
+      tabId,
+      toolType: 'claude',
+      sessionId: claudeSessionId,
+      cwd: launchCwd,
+    }).then((result: any) => {
+      console.log('[ClaudeControlBar:TranscriptSubscribe] tab=' + tabId.slice(-12)
+        + ' sid=' + claudeSessionId.slice(0, 8)
+        + ' success=' + (result?.success ? '1' : '0')
+        + ' file=' + (result?.filePath ? '1' : '0'));
+    }).catch((e: any) => {
+      console.warn('[ClaudeControlBar:TranscriptSubscribe] failed tab=' + tabId.slice(-12)
+        + ' sid=' + claudeSessionId.slice(0, 8)
+        + ' error=' + String(e?.message || e));
+    });
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return;
+      ipcRenderer.invoke('agent-transcript:refresh', {
+        tabId,
+        toolType: 'claude',
+        sessionId: claudeSessionId,
+        cwd: launchCwd,
+        reason: 'controlbar-visibility-resume',
+      }).catch(() => {});
+      queueRefresh('visibility-resume');
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    return () => {
+      disposed = true;
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      ipcRenderer.removeListener('agent-transcript:changed', onTranscriptChanged);
+      ipcRenderer.invoke('agent-transcript:unsubscribe', { consumerId }).catch(() => {});
+    };
+  }, [claudeSessionId, isClaudePtySession, launchCwd, refreshClaudeMaterialization, tabId]);
+
+  const claudeConversationMaterialized =
+    !isClaudePtySession
+      ? true
+      : !!claudeSessionId
+        && claudeMaterialization.sessionId === claudeSessionId
+        && claudeMaterialization.conversationMaterialized === true;
+  const hasArtifactSession = !!sessionId && (!isClaudePtySession || claudeConversationMaterialized);
+  const hasAnySession = hasArtifactSession || (!!sessionId && isCommandRunning);
+
+  const ensureClaudeArtifactSession = async (reason: string): Promise<boolean> => {
+    if (!isClaudePtySession || !claudeSessionId) return true;
+    if (claudeConversationMaterialized) return true;
+    try {
+      const result = await ipcRenderer.invoke('claude:session-materialization', { sessionId: claudeSessionId, cwd: launchCwd });
+      const materialized = result?.materialized === true || result?.conversationMaterialized === true;
+      const timelineCount = typeof result?.timelineCount === 'number' ? result.timelineCount : null;
+      const materializationReason = result?.reason || result?.materializationReason || null;
+      setClaudeMaterialization({ sessionId: claudeSessionId, conversationMaterialized: materialized, timelineCount, reason: materializationReason });
+      if (materialized) return true;
+      console.warn('[ClaudeControlBar:Materialization] blocked ' + reason
+        + ' tab=' + tabId.slice(-12)
+        + ' sid=' + claudeSessionId.slice(0, 8)
+        + ' timelineCount=' + (timelineCount ?? 'null')
+        + ' reason=' + (materializationReason || '-'));
+    } catch (e: any) {
+      setClaudeMaterialization({ sessionId: claudeSessionId, conversationMaterialized: false, timelineCount: null, reason: 'materialization-check-failed' });
+      console.warn('[ClaudeControlBar:Materialization] blocked ' + reason
+        + ' tab=' + tabId.slice(-12)
+        + ' sid=' + claudeSessionId.slice(0, 8)
+        + ' error=' + String(e?.message || e));
+    }
+    showToast('У этой вкладки ещё нет сохранённой беседы Claude', 'warning');
+    return false;
+  };
+
+  const copySessionId = async () => {
+    if (!sessionId) return;
+    if (!(await ensureClaudeArtifactSession('copy-session-id'))) return;
+    // Electron clipboard, не navigator.clipboard — последний в renderer тихо
+    // отваливается без HTTPS/permissions, юзер видит как «даже логов нет».
+    // См. CLAUDE.md anti-pattern «Не используй navigator.clipboard в renderer».
+    try {
+      const { clipboard } = window.require('electron');
+      clipboard.writeText(sessionId);
+      setSessionCopied(true);
+      setTimeout(() => setSessionCopied(false), 1000);
+    } catch (e) {
+      console.error('[ClaudeControlBar] copySessionId failed:', e);
+    }
+  };
 
   // Live bridge data (PTY only): model name + context %.
   const [claudeModel, setClaudeModel] = useState<string | null>(null);
@@ -763,7 +914,7 @@ export default function ClaudeControlBar({
   const [hoveredTrigger, setHoveredTrigger] = useState<PopupKey | null>(null);
   const [hoveredPopup, setHoveredPopup] = useState<PopupKey | null>(null);
   const isCmdPressed = useCmdKey();
-  const showSessionIdTooltip = isCmdPressed && sessionCopyHover && hasAnySession && !!sessionCopyRect;
+  const showSessionIdTooltip = isCmdPressed && sessionCopyHover && hasArtifactSession && !!sessionCopyRect;
 
   useEffect(() => {
     if (!codexKnobsDisabled) return;
@@ -1196,7 +1347,7 @@ export default function ClaudeControlBar({
     }
   };
 
-  const onContinue = () => {
+  const onContinue = async () => {
     if (!tabId) return;
     if (isSDKTab) {
       window.dispatchEvent(new CustomEvent('claude-sdk:focus-composer', { detail: { tabId } }));
@@ -1204,6 +1355,7 @@ export default function ClaudeControlBar({
     }
     const store = useWorkspaceStore.getState();
     if (sessionType === 'claude') {
+      if (!(await ensureClaudeArtifactSession('continue-session'))) return;
       store.setTabCommandType(tabId, 'claude');
       terminalRegistry.get(tabId)?.scrollToBottom();
       focusTerminal();
@@ -1370,6 +1522,7 @@ export default function ClaudeControlBar({
   // valid for clipboard `*-F` chips on a pristine PTY tab.
   const forkToTab = async () => {
     if (!sessionId || !tabId || !sessionType) return;
+    if (!(await ensureClaudeArtifactSession('fork-to-tab'))) return;
     const state = useWorkspaceStore.getState();
     for (const [projectId, workspace] of state.openProjects) {
       const tab = workspace.tabs.get(tabId);
@@ -1549,6 +1702,7 @@ export default function ClaudeControlBar({
   // PTY target.
   const forkToSDK = async () => {
     if (!sessionId || !tabId || sessionType !== 'claude') return;
+    if (!(await ensureClaudeArtifactSession('fork-to-sdk'))) return;
     const state = useWorkspaceStore.getState();
     for (const [projectId, workspace] of state.openProjects) {
       const tab = workspace.tabs.get(tabId);
@@ -1722,7 +1876,7 @@ export default function ClaudeControlBar({
   // ============================================================================
   //
   // КАРТА ВИДИМОСТИ КНОПОК — по двум осям: tabType (PTY vs SDK) и состояние
-  // (hasAnySession / isCommandRunning / isSDKTab / sessionId). Если меняешь
+  // (hasArtifactSession / isCommandRunning / isSDKTab / sessionId). Если меняешь
   // ЛЮБОЙ guard ниже — обнови эту таблицу, чтобы следующий разработчик мог
   // понять без чтения 1000 строк JSX.
   //
@@ -1731,11 +1885,11 @@ export default function ClaudeControlBar({
   //                              | session)| process)    | БД, claude  | session)| активен)    | turn'ами)
   //                              |         |             | мёртв)      |         |             |
   // -----------------------------+---------+-------------+-------------+---------+-------------+----------
-  // ⎘ copy-session-id            | -       | + (если sid)| +           | -       | + (если sid)| + (если sid)
+  // ⎘ copy-session-id            | -       | + если saved| + saved     | -       | + (если sid)| + (если sid)
   // SessionActionChip            | "Start" | "Stop" hover| "Continue"  | "Claude"| "Stop" hover| "Claude"
-  // ↻ refresh-timeline           | -       | +           | +           | -       | +           | +
-  // ⑂→▭ forkToTab (PTY)          | -       | +           | +           | -       | +           | +
-  // ⑂→SDK forkToSDK              | -       | + (Claude)  | + (Claude)  | -       | -           | -
+  // ↻ refresh-timeline           | -       | + saved     | + saved     | -       | +           | +
+  // ⑂→▭ forkToTab (PTY)          | -       | + saved     | + saved     | -       | +           | +
+  // ⑂→SDK forkToSDK              | -       | + saved     | + saved     | -       | -           | -
   // SDK startNewSDKTab           | + 1)    | -           | -           | -       | -           | -
   // Claude-F (from clipboard)    | + 1)    | -           | -           | -       | -           | -
   // SDK-F (from clipboard)       | + 1)    | -           | -           | -       | -           | -
@@ -1748,7 +1902,7 @@ export default function ClaudeControlBar({
   // Right cluster Provider/Model | hidden  | enabled     | dimmed      | enabled | shimmer     | enabled
   //   /Effort/Think              |         |             |             |         |             |
   //
-  // 1) Claude-F / SDK / SDK-F / Codex / Codex-F появляются ТОЛЬКО когда нет sessionId И нет
+  // 1) Claude-F / SDK / SDK-F / Codex / Codex-F появляются ТОЛЬКО когда нет сохранённой сессии И нет
   //    живого процесса (`!hasAnySession && !isSDKTab && !isCommandRunning`).
   //    Раньше guard был `!hasAnySession && !isSDKTab` — кнопки показывались
   //    в окне «процесс стартанул, sessionId ещё не записался в Tab». Юзер
@@ -1761,8 +1915,11 @@ export default function ClaudeControlBar({
   //              SDK-busy получаем отдельно через subscriber на
   //              claude:busy-state (forward'ится main'ом из claude-sdk:busy-state).
   //
-  //   hasAnySession — `!!sessionId`. Для PTY = bridge записал sessionId в
-  //              Tab.claudeSessionId. Для SDK = после первой SSE-записи в JSONL.
+  //   hasArtifactSession — для Claude PTY это не `!!sessionId`, а
+  //              materialized JSONL: user-visible Timeline entries уже есть.
+  //              Технический UUID pre-prompt Claude-процесса не включает
+  //              Copy/Resume/Fork. Для SDK/Codex/Gemini sessionId остаётся
+  //              артефактом сессии.
   //
   //   isCommandRunning — OSC 133 D/B от PTY shell. Для SDK всегда false.
   //
@@ -1805,11 +1962,11 @@ export default function ClaudeControlBar({
           className="inline-flex items-center rounded overflow-hidden"
           style={{
             gap: 0,
-            border: hasAnySession ? '1px solid rgba(255,255,255,0.10)' : 'none',
+            border: hasArtifactSession ? '1px solid rgba(255,255,255,0.10)' : 'none',
             flexShrink: 0,
           }}
         >
-          {hasAnySession && (
+          {hasArtifactSession && (
             <span
               className="cursor-pointer flex-shrink-0 inline-flex items-center justify-center transition-colors"
               style={{
@@ -1911,7 +2068,7 @@ export default function ClaudeControlBar({
               onStop={onStop}
             />
           )}
-          {hasAnySession && (
+          {hasArtifactSession && (
             <button
               className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer transition-colors"
               style={{
@@ -1974,7 +2131,7 @@ export default function ClaudeControlBar({
             — единственное осмысленное действие в этом слоте при пустой
             сессии. На SDK-табе вариант «открыть SDK» не показываем — юзер
             уже в SDK. */}
-        {hasAnySession && (
+        {hasArtifactSession && (
           <button
             className="text-[10px] px-1.5 py-0.5 rounded text-[#999] hover:text-white cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
             style={{
@@ -1988,7 +2145,7 @@ export default function ClaudeControlBar({
             title="Fork в новую вкладку"
           >⑂→<span style={{ fontSize: '11px' }}>▭</span></button>
         )}
-        {sessionType === 'claude' && sessionId && (
+        {sessionType === 'claude' && sessionId && hasArtifactSession && (
           <button
             className="text-[10px] px-1.5 py-0.5 rounded cursor-pointer leading-none transition-colors"
             style={{
@@ -2003,9 +2160,9 @@ export default function ClaudeControlBar({
             title="Fork в новый SDK таб"
           >⑂→SDK</button>
         )}
-        {/* Pristine-PTY guard: видно только в новой PTY-вкладке (нет sessionId
-            И нет живого процесса). hasAnySession false + isCommandRunning true
-            = окно «процесс стартанул, sessionId ещё не записался в Tab» — там
+        {/* Pristine-PTY guard: видно только в новой PTY-вкладке (нет сохранённой
+            сессии И нет живого процесса). hasAnySession false + isCommandRunning true
+            = окно «процесс стартанул, но беседа ещё не материализована» — там
             Claude-F/SDK/SDK-F/Codex/Codex-F НЕ показываем, иначе юзер видит
             fork/start-кнопки одновременно с живым claude/codex процессом. */}
         {/* Clipboard fork chips — видны только на пустом PTY-табе (новая вкладка).

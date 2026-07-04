@@ -12,6 +12,12 @@ export interface ClaudePtyPresence {
   hasTerm?: boolean;
   inputReady?: boolean;
   awaiting?: boolean;
+  sessionId?: string | null;
+  conversationMaterialized?: boolean;
+  canResume?: boolean;
+  canCopySessionId?: boolean;
+  timelineCount?: number | null;
+  materializationReason?: string | null;
 }
 
 export interface ClaudeQuestionOption {
@@ -54,6 +60,10 @@ type ClaudePtyResumeResult = {
   alreadyRunning?: boolean;
   status?: ClaudePtyStatus;
   repaired?: number;
+  conversationMaterialized?: boolean;
+  canResume?: boolean;
+  timelineCount?: number | null;
+  materializationReason?: string | null;
   error?: string;
 };
 
@@ -78,7 +88,35 @@ export async function getClaudePtyPresence(tabId: string): Promise<ClaudePtyPres
     hasTerm: !!presence?.hasTerm,
     inputReady: !!presence?.inputReady,
     awaiting: !!presence?.awaiting,
+    sessionId: presence?.sessionId || null,
+    conversationMaterialized: presence?.conversationMaterialized === true,
+    canResume: presence?.canResume === true,
+    canCopySessionId: presence?.canCopySessionId === true,
+    timelineCount: typeof presence?.timelineCount === 'number' ? presence.timelineCount : null,
+    materializationReason: presence?.materializationReason || null,
   };
+}
+
+async function readClaudeSessionMaterialization(sessionId: string, cwd?: string) {
+  try {
+    const result = await ipcRenderer.invoke('claude:session-materialization', { sessionId, cwd });
+    const materialized = result?.materialized === true || result?.conversationMaterialized === true;
+    return {
+      ...(result || {}),
+      materialized,
+      conversationMaterialized: materialized,
+      timelineCount: typeof result?.timelineCount === 'number' ? result.timelineCount : null,
+      materializationReason: result?.reason || null,
+    };
+  } catch (e: any) {
+    return {
+      materialized: false,
+      conversationMaterialized: false,
+      timelineCount: null,
+      materializationReason: 'materialization-check-failed',
+      error: errorText(e),
+    };
+  }
 }
 
 export async function resumeClaudePtySession({
@@ -145,6 +183,23 @@ async function resumeClaudePtySessionInner({
   if (presence && presence.hasTerm === false) {
     console.warn('[ClaudePtyActions:resume] no-terminal tab=' + shortTab(tabId) + ' sid=' + shortSid(sessionId));
     return { success: false, sessionId, status: presence.status, error: 'terminal not ready' };
+  }
+
+  const materialization = await readClaudeSessionMaterialization(sessionId, cwd);
+  if (materialization.conversationMaterialized !== true) {
+    console.warn('[ClaudePtyActions:resume] blocked-empty-session tab=' + shortTab(tabId)
+      + ' sid=' + shortSid(sessionId)
+      + ' reason=' + (materialization.materializationReason || materialization.reason || '-')
+      + ' timelineCount=' + (materialization.timelineCount ?? 'null'));
+    return {
+      success: false,
+      sessionId,
+      conversationMaterialized: false,
+      canResume: false,
+      timelineCount: materialization.timelineCount ?? null,
+      materializationReason: materialization.materializationReason || materialization.reason || null,
+      error: 'session_not_materialized',
+    };
   }
 
   store.clearInterruptedState(tabId);

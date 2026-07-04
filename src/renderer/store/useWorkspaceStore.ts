@@ -832,7 +832,7 @@ interface WorkspaceStore {
   markAiForkAutoTitle: (tabId: string, toolType: AutoTabTitleTool, sourceSessionId: string) => void;
   getAiLaunchSnapshot: (tabId: string) => AiLaunchSnapshot | null;
   clearAiLaunchSnapshot: (tabId: string, reason?: string) => void;
-  rollbackUnmaterializedAiLaunch: (tabId: string, reason: string) => boolean;
+  discardUnmaterializedAiLaunchSession: (tabId: string, reason: string) => boolean;
   toggleTabUtility: (projectId: string, tabId: string) => void;
   toggleTabCollapsed: (projectId: string, tabId: string) => void;
 
@@ -2531,7 +2531,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           tab.colorSetManually = true; // User changed color - prevent auto-override
         }
         set({ openProjects: new Map(openProjects) });
-        saveTabs(workspace.projectId, workspace.tabs);
+        saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-color');
       }
     }
   },
@@ -2753,7 +2753,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         }
 
         set({ openProjects: new Map(openProjects) });
-        saveTabs(workspace.projectId, workspace.tabs);
+        saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-command-type');
         break;
       }
     }
@@ -2800,10 +2800,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     console.warn('[Store:AiLaunchSnapshot] clear tab=' + tabId.slice(-8) + ' type=' + snap.sessionType + ' reason=' + reason);
   },
 
-  rollbackUnmaterializedAiLaunch: (tabId, reason) => {
+  discardUnmaterializedAiLaunchSession: (tabId, reason) => {
     const snap = aiLaunchSnapshots.get(tabId);
     if (!snap) {
-      console.warn('[Store:AiLaunchRollback] skip tab=' + tabId.slice(-8) + ' reason=' + reason + ' no-snapshot');
+      console.warn('[Store:AiLaunchDiscard] skip tab=' + tabId.slice(-8) + ' reason=' + reason + ' no-snapshot');
       return false;
     }
 
@@ -2812,40 +2812,30 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const tab = workspace.tabs.get(tabId);
       if (!tab) continue;
 
-      if (snap.commandType) tab.commandType = snap.commandType;
-      else delete tab.commandType;
+      // A launched AI runtime remains a Claude/Codex tab even if the provider
+      // never materialized a resumable conversation. Clear only the stale
+      // session artifact; do not restore the old bash identity/name/color.
+      if (!tab.commandType) tab.commandType = snap.sessionType;
+      if (snap.sessionType === 'claude') {
+        delete tab.claudeSessionId;
+      } else if (snap.sessionType === 'codex') {
+        delete tab.codexSessionId;
+      }
 
-      tab.name = snap.name;
-      if (snap.color) tab.color = snap.color;
-      else delete tab.color;
-
-      if (snap.colorSetManually === undefined) delete tab.colorSetManually;
-      else tab.colorSetManually = snap.colorSetManually;
-
-      if (snap.nameSetManually === undefined) delete tab.nameSetManually;
-      else tab.nameSetManually = snap.nameSetManually;
-
-      if (snap.claudeSessionId) tab.claudeSessionId = snap.claudeSessionId;
-      else delete tab.claudeSessionId;
-      if (snap.geminiSessionId) tab.geminiSessionId = snap.geminiSessionId;
-      else delete tab.geminiSessionId;
-      if (snap.codexSessionId) tab.codexSessionId = snap.codexSessionId;
-      else delete tab.codexSessionId;
-
-      clearPendingAutoTabTitle(tabId, 'ai-launch-rollback');
+      clearPendingAutoTabTitle(tabId, 'ai-launch-discard');
       autoTabTitleIntents.delete(tabId);
-      tab.wasInterrupted = !!snap.wasInterrupted;
-      tab.overlayDismissed = !!snap.overlayDismissed;
+      tab.wasInterrupted = false;
+      tab.overlayDismissed = false;
 
       aiLaunchSnapshots.delete(tabId);
-      console.warn('[Store:AiLaunchRollback] tab=' + tabId.slice(-8) + ' type=' + snap.sessionType + ' reason=' + reason + ' restoreCommand=' + (snap.commandType || 'null') + ' name=' + JSON.stringify(snap.name) + ' color=' + (snap.color || 'null'));
+      console.warn('[Store:AiLaunchDiscard] tab=' + tabId.slice(-8) + ' type=' + snap.sessionType + ' reason=' + reason + ' keepCommand=' + (tab.commandType || 'null') + ' clearSessionArtifact=true');
 
       set({ openProjects: new Map(openProjects) });
-      saveTabs(workspace.projectId, workspace.tabs);
+      saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'ai-launch-unmaterialized');
       return true;
     }
 
-    console.warn('[Store:AiLaunchRollback] skip tab=' + tabId.slice(-8) + ' reason=' + reason + ' tab-not-found');
+    console.warn('[Store:AiLaunchDiscard] skip tab=' + tabId.slice(-8) + ' reason=' + reason + ' tab-not-found');
     aiLaunchSnapshots.delete(tabId);
     autoTabTitleIntents.delete(tabId);
     return false;
@@ -3444,8 +3434,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         // Reset overlay flags when new session starts (so overlay shows again if interrupted)
         tab.wasInterrupted = false;
         tab.overlayDismissed = false;
-        // Save to database so session persists across restarts
-        saveTabs(workspace.projectId, workspace.tabs);
+        // Save to database so session persists across restarts and native
+        // clients reload tab-level Resume/Copy capabilities.
+        saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'claude-session-id');
         // Trigger Zustand re-render so Workspace/Timeline pick up the new sessionId.
         // Guard above ensures this only fires on actual changes, not repeated Bridge polls.
         set({});
@@ -3483,7 +3474,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         tab.wasInterrupted = false;
         tab.overlayDismissed = false;
         console.log(`[Workspace] Gemini session set for tab ${tabId}: ${sessionId} (reset overlay flags)`);
-        saveTabs(workspace.projectId, workspace.tabs);
+        saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'gemini-session-id');
         set({});
         return;
       }
@@ -3519,7 +3510,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         tab.wasInterrupted = false;
         tab.overlayDismissed = false;
         console.log(`[Workspace] Codex session set for tab ${tabId}: ${sessionId} (reason=${reason}, reset overlay flags)`);
-        saveTabs(workspace.projectId, workspace.tabs);
+        saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'codex-session-id');
         set({});
         return;
       }
@@ -3829,7 +3820,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         // mapping on Electron restart (UI shows "Waiting for session" even
         // though JSONL exists on disk). Mirrors setClaudeSessionId; ephemeral
         // state (sdkState / sdkMessages) skip the disk write.
-        if (sidChanged) saveTabs(workspace.projectId, workspace.tabs);
+        if (sidChanged) saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'sdk-session-id');
         set({}); // Trigger Zustand notify — primitive selectors detect change
         return;
       }

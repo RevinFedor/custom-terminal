@@ -898,9 +898,11 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
       // perceives this as «my queued message vanished after reload».
       if (m.type === 'attachment' && m.attachment && m.attachment.type === 'queued_command') {
         const prompt = m.attachment.prompt;
-        const text = Array.isArray(prompt) && prompt[0] && typeof prompt[0].text === 'string'
-          ? prompt[0].text
-          : '';
+        const text = typeof prompt === 'string'
+          ? prompt
+          : Array.isArray(prompt)
+            ? prompt.map((item: any) => typeof item === 'string' ? item : (typeof item?.text === 'string' ? item.text : '')).filter(Boolean).join('\n')
+            : (typeof prompt?.text === 'string' ? prompt.text : '');
         // The orange "↑ QUEUED" badge discriminator on user bubbles checks
         // `msgId` against `/^user-queued-/`, not the wasQueued boolean —
         // because assistant-ui drops unknown extra fields when re-importing

@@ -82,10 +82,19 @@ export type TabInfo = {
   // Number of Timeline-relevant entries (user prompts + compact boundaries)
   // on the active branch. null = no Claude session attached.
   timelineCount?: number | null;
+  // For PTY+Claude tabs: a technical session UUID is not enough to Resume/Copy.
+  // true means the JSONL contains user-visible Timeline entries.
+  conversationMaterialized?: boolean;
+  canResume?: boolean;
+  canCopySessionId?: boolean;
+  materializationReason?: string | null;
+  startupDefaultsPending?: boolean;
+  startupDefaultsReady?: boolean;
+  startupDefaultsError?: string | null;
   live?: { sessionId?: string; cwd: string } | null;
   // For PTY+Claude tabs only: lifecycle of the embedded `claude` process.
   // null for SDK tabs and bare-shell tabs. Drives the loader + row glow.
-  sessionStatus?: 'active' | 'busy' | 'inactive' | null;
+  sessionStatus?: 'active' | 'busy' | 'inactive' | 'starting' | 'stopping' | null;
   // True when Claude is blocked on an AskUserQuestion in this tab — the tab list
   // shows a pulsing purple dot ("needs your answer"), mirroring the desktop glow.
   awaiting?: boolean;
@@ -215,12 +224,37 @@ export const Api = {
       { method: 'POST', body: '{}' },
     ),
   resumeClaudeTab: (tabId: string) =>
-    api<{ tabId: string; sessionId: string; alreadyRunning?: boolean }>(
+    api<{
+      tabId: string;
+      sessionId: string;
+      alreadyRunning?: boolean;
+      ready?: boolean;
+      status?: 'active' | 'busy' | 'inactive' | 'starting' | 'stopping';
+      inputReady?: boolean;
+      startupDefaultsPending?: boolean;
+      startupDefaultsReady?: boolean;
+      startupDefaultsError?: string | null;
+    }>(
       `/api/terminal-tabs/${encodeURIComponent(tabId)}/resume`,
       { method: 'POST', body: '{}' },
     ),
   claudeStatus: (tabId: string) =>
-    api<{ tabId: string; status: 'active' | 'busy' | 'inactive' | 'starting'; commandType: string | null; sessionId: string | null; cwd?: string }>(
+    api<{
+      tabId: string;
+      status: 'active' | 'busy' | 'inactive' | 'starting' | 'stopping';
+      inputReady?: boolean;
+      commandType: string | null;
+      sessionId: string | null;
+      cwd?: string;
+      conversationMaterialized?: boolean;
+      canResume?: boolean;
+      canCopySessionId?: boolean;
+      timelineCount?: number | null;
+      materializationReason?: string | null;
+      startupDefaultsPending?: boolean;
+      startupDefaultsReady?: boolean;
+      startupDefaultsError?: string | null;
+    }>(
       `/api/terminal-tabs/${encodeURIComponent(tabId)}/status`,
     ),
   send: (tabId: string, prompt: string) =>

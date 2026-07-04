@@ -5,11 +5,13 @@ import {
   Check,
   ChevronDown,
   Circle,
-  FileText,
+  Copy,
+  ExternalLink,
   GitBranch,
   GripVertical,
   History,
   Home,
+  KeyRound,
   Loader2,
   Minus,
   Plus,
@@ -24,7 +26,7 @@ import {
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 
-const { ipcRenderer } = window.require('electron');
+const { ipcRenderer, clipboard } = window.require('electron');
 
 const DOCS_ONLY_STORAGE_KEY = 'noted-terminal.git.docsOnlyAiContext';
 const DEFAULT_PANEL_SIZE = { width: 1040, height: 640 };
@@ -46,9 +48,14 @@ type GitFile = {
 type GitStatus = {
   success: boolean;
   isRepo: boolean;
+  requestPath?: string;
   repoRoot: string;
   repoName: string;
   remote: string;
+  remoteInfo?: GitRemoteInfo;
+  userName?: string;
+  userEmail?: string;
+  credentialHelper?: string;
   branch: string;
   upstream: string;
   ahead: number;
@@ -57,6 +64,16 @@ type GitStatus = {
   changedCount: number;
   hasDocsChanges: boolean;
   error?: string;
+};
+
+type GitRemoteInfo = {
+  provider: 'github' | 'gitlab' | 'git' | 'none';
+  providerLabel: string;
+  protocol: string;
+  host: string;
+  path: string;
+  displayUrl: string;
+  webUrl: string;
 };
 
 type GitCommit = {
@@ -119,7 +136,6 @@ type GitPanelPersistedState = {
   splitLeftWidth?: number;
   docsOnlyWhenPresent?: boolean;
   selectedRepoPath?: string;
-  repoSelectorTab?: 'repos' | 'favorites';
   repoFavorites?: string[];
   historySearch?: string;
   activeCommitHash?: string;
@@ -206,6 +222,44 @@ function normalizeCommitDescriptionLines(value: number | undefined | null) {
   return Math.max(1, Math.min(6, Number.isFinite(lines) ? lines : 3));
 }
 
+function remoteProtocolLabel(protocol?: string) {
+  const value = String(protocol || '').toLowerCase();
+  if (value === 'ssh') return 'SSH';
+  if (value === 'https') return 'HTTPS';
+  if (value === 'http') return 'HTTP';
+  return value ? value.toUpperCase() : 'No remote';
+}
+
+function remoteProviderLabel(remoteInfo?: GitRemoteInfo | null) {
+  if (!remoteInfo?.host) return 'No remote';
+  return remoteInfo.providerLabel || 'Git remote';
+}
+
+function shortRemotePath(remoteInfo?: GitRemoteInfo | null) {
+  const repoPath = String(remoteInfo?.path || '').replace(/^\/+/, '');
+  if (!repoPath) return '';
+  if (repoPath.length <= 38) return repoPath;
+  const parts = repoPath.split('/').filter(Boolean);
+  if (parts.length <= 2) return '...' + repoPath.slice(-35);
+  return parts[0] + '/.../' + parts.slice(-2).join('/');
+}
+
+function gitAuthorLabel(status?: GitStatus | null) {
+  const name = String(status?.userName || '').trim();
+  const email = String(status?.userEmail || '').trim();
+  if (name && email) return `${name} <${email}>`;
+  return name || email || 'No git author';
+}
+
+function gitCredentialLabel(status?: GitStatus | null) {
+  const protocol = remoteProtocolLabel(status?.remoteInfo?.protocol);
+  if (status?.remoteInfo?.protocol === 'ssh') return 'SSH key';
+  const helper = String(status?.credentialHelper || '').trim();
+  if (/osxkeychain/i.test(helper)) return `${protocol} · macOS Keychain`;
+  if (helper) return `${protocol} · ${helper}`;
+  return protocol;
+}
+
 function gitPanelStateKey(projectId?: string | null, repoRoot?: string, projectPath?: string) {
   const raw = projectId || repoRoot || projectPath || '';
   return raw ? 'noted-terminal.git.panel.' + raw : '';
@@ -271,7 +325,6 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [commitDescriptionLines, setCommitDescriptionLines] = useState(() => normalizeCommitDescriptionLines(undefined));
   const [selectedRepoPath, setSelectedRepoPath] = useState(projectPath || '');
   const [repoSelectorOpen, setRepoSelectorOpen] = useState(false);
-  const [repoSelectorTab, setRepoSelectorTab] = useState<'repos' | 'favorites'>('repos');
   const [repoSearch, setRepoSearch] = useState('');
   const [repositories, setRepositories] = useState<GitRepository[]>(() => makeHomeRepositories(projectPath));
   const [repositoriesProjectPath, setRepositoriesProjectPath] = useState('');
@@ -302,8 +355,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [branchesRepoPath, setBranchesRepoPath] = useState('');
   const [branchSwitching, setBranchSwitching] = useState('');
   const [pushMenuOpen, setPushMenuOpen] = useState(false);
+  const [remoteSettingsOpen, setRemoteSettingsOpen] = useState(false);
   const [generationMeta, setGenerationMeta] = useState<any>(null);
   const [fileDiff, setFileDiff] = useState<GitFileDiff | null>(null);
+  const [fileDiffKey, setFileDiffKey] = useState('');
   const [fileDiffLoading, setFileDiffLoading] = useState(false);
   const [resizeHover, setResizeHover] = useState<'left' | 'bottom' | 'left-bottom' | null>(null);
   const [splitResizeHover, setSplitResizeHover] = useState(false);
@@ -356,25 +411,28 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     }
     return map;
   }, [currentRepositories, projectPath, repoFavorites]);
+  const homeRepository = useMemo(() => currentRepositories.find((repo) => repo.home) || null, [currentRepositories]);
   const filteredRepositories = useMemo(() => {
     const q = repoSearch.trim().toLowerCase();
-    const home = currentRepositories.find((repo) => repo.home) || null;
+    const favoriteSet = new Set(repoFavorites);
     const matches = (repo: GitRepository) => !q || `${repo.name} ${repo.relativePath} ${repo.path}`.toLowerCase().includes(q);
-    const rest = currentRepositories.filter((repo) => !repo.home && matches(repo));
-    if (home && matches(home)) return [home, ...rest];
-    return rest;
-  }, [currentRepositories, repoSearch]);
+    return currentRepositories.filter((repo) => !repo.home && !favoriteSet.has(repo.path) && matches(repo));
+  }, [currentRepositories, repoFavorites, repoSearch]);
   const favoriteRepositories = useMemo(() => {
     const q = repoSearch.trim().toLowerCase();
+    const homePath = homeRepository?.path || '';
     return repoFavorites
       .map((repoPath) => repositoryByPath.get(repoPath))
       .filter((repo): repo is GitRepository => !!repo)
+      .filter((repo) => repo.path !== homePath)
       .filter((repo) => !q || `${repo.name} ${repo.relativePath} ${repo.path}`.toLowerCase().includes(q));
-  }, [repoFavorites, repositoryByPath, repoSearch]);
+  }, [homeRepository?.path, repoFavorites, repositoryByPath, repoSearch]);
   const historyReadyForRepo = Boolean(effectiveRepoPath) && historyRepoPath === effectiveRepoPath;
   const visibleHistoryItems = historyReadyForRepo ? filteredHistoryItems : [];
   const branchesReadyForRepo = Boolean(effectiveRepoPath) && branchesRepoPath === effectiveRepoPath;
   const visibleBranches = branchesReadyForRepo ? branches : [];
+  const statusReadyForRepo = Boolean(status?.requestPath) && status.requestPath === effectiveRepoPath;
+  const currentRepoDisplay = repositoryByPath.get(effectiveRepoPath) || makeRepository(effectiveRepoPath, projectPath, effectiveRepoPath === projectPath);
 
   const loadStatus = useCallback(async (visible = false, refreshPreview = visible) => {
     const requestPath = effectiveRepoPath;
@@ -388,8 +446,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     }
     const currentStatus = statusRef.current;
     const currentStatusRoot = currentStatus?.repoRoot || '';
+    const currentStatusPath = currentStatus?.requestPath || currentStatusRoot;
     const hasCurrentStatus = Boolean(currentStatus?.isRepo);
-    const showProbe = visible || !hasCurrentStatus || (currentStatusRoot && requestPath !== currentStatusRoot);
+    const showProbe = visible || !hasCurrentStatus || (currentStatusPath && requestPath !== currentStatusPath);
     if (showProbe) setStatusLoading(true);
     try {
       const result = await ipcRenderer.invoke('git:status', { projectPath: requestPath });
@@ -411,15 +470,21 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
           setBranches([]);
           setBranchesRepoPath('');
           setBranchesLoading(false);
+          setFileDiff(null);
+          setFileDiffKey('');
+          setFileDiffLoading(false);
           setSelectedRepoPath(projectPath);
           return;
         }
         statusRef.current = null;
         statusPreviewSignatureRef.current = '';
         setStatus(null);
+        setFileDiff(null);
+        setFileDiffKey('');
+        setFileDiffLoading(false);
         return;
       }
-      const nextStatus = result as GitStatus;
+      const nextStatus = { ...(result as GitStatus), requestPath };
       const nextPreviewSignature = gitStatusPreviewSignature(nextStatus);
       const shouldRefreshPreview = refreshPreview || nextPreviewSignature !== statusPreviewSignatureRef.current;
       statusRef.current = nextStatus;
@@ -432,6 +497,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       statusRef.current = null;
       statusPreviewSignatureRef.current = '';
       setStatus(null);
+      setFileDiff(null);
+      setFileDiffKey('');
+      setFileDiffLoading(false);
     } finally {
       if (statusRequestRef.current === requestId && showProbe) setStatusLoading(false);
     }
@@ -581,6 +649,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     setBranchesRepoPath('');
     setBranchesLoading(false);
     setPushMenuOpen(false);
+    setRemoteSettingsOpen(false);
     setHistoryContextMenu(null);
     setHistoryItems([]);
     setHistoryRepoPath('');
@@ -594,6 +663,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     setCommitDetailsLoading(false);
     setCommitDetailsLoadingKey('');
     setFileDiff(null);
+    setFileDiffKey('');
+    setFileDiffLoading(false);
     setGenerationMeta(null);
   }, [panelStateKey, projectPath]);
 
@@ -636,10 +707,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         setSplitLeftWidth(normalizeSplitLeftWidth(next?.splitLeftWidth, nextPanelSize.width));
         setCommitDescriptionLines(normalizeCommitDescriptionLines(next?.commitDescriptionLines));
         setSelectedRepoPath(typeof next?.selectedRepoPath === 'string' && next.selectedRepoPath ? next.selectedRepoPath : (projectPath || ''));
-        setRepoSelectorTab(next?.repoSelectorTab === 'favorites' ? 'favorites' : 'repos');
         setRepoFavorites(Array.isArray(next?.repoFavorites) ? next.repoFavorites.filter((item) => typeof item === 'string') : []);
         setRepoSelectorOpen(false);
         setRepoContextMenu(null);
+        setRemoteSettingsOpen(false);
         if (Array.isArray(next?.selectedPaths)) {
           setSelectedPaths(new Set(next.selectedPaths.filter((item) => typeof item === 'string')));
         } else {
@@ -683,7 +754,6 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         commitDescriptionLines,
         docsOnlyWhenPresent,
         selectedRepoPath,
-        repoSelectorTab,
         repoFavorites,
       };
       ipcRenderer.invoke('app:setState', { key: panelStateKey, value: payload }).catch(() => {});
@@ -691,7 +761,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     return () => {
       if (saveDebounceRef.current) window.clearTimeout(saveDebounceRef.current);
     };
-  }, [panelStateKey, open, panelTab, summary, description, search, historySearch, activeFilePath, activeCommitHash, activeCommitFilePath, selectedPaths, selectedPathsManual, panelSize, splitLeftWidth, commitDescriptionLines, docsOnlyWhenPresent, selectedRepoPath, repoSelectorTab, repoFavorites]);
+  }, [panelStateKey, open, panelTab, summary, description, search, historySearch, activeFilePath, activeCommitHash, activeCommitFilePath, selectedPaths, selectedPathsManual, panelSize, splitLeftWidth, commitDescriptionLines, docsOnlyWhenPresent, selectedRepoPath, repoFavorites]);
 
   useEffect(() => {
     if (!open) return;
@@ -730,6 +800,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       setSelectedPathsManual(false);
       setActiveFilePath('');
       setFileDiff(null);
+      setFileDiffKey('');
       setGenerationMeta(null);
       return;
     }
@@ -743,8 +814,18 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   }, [statusFileKey, status?.files, selectedPathsManual]);
 
   useEffect(() => {
-    if (!open || panelTab !== 'changes' || !effectiveRepoPath || !activeFilePath) {
+    if (!open || !effectiveRepoPath || !activeFilePath) {
       setFileDiff(null);
+      setFileDiffKey('');
+      setFileDiffLoading(false);
+      return;
+    }
+    if (panelTab !== 'changes') {
+      setFileDiffLoading(false);
+      return;
+    }
+    const requestKey = `${effectiveRepoPath}\0${activeFilePath}\0${statusFileKey}\0${statusVersion}`;
+    if (fileDiffKey === requestKey && fileDiff) {
       setFileDiffLoading(false);
       return;
     }
@@ -758,9 +839,13 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
           if (cancelled) return;
           if (!result?.success) throw new Error(result?.error || 'git diff failed');
           setFileDiff(result);
+          setFileDiffKey(requestKey);
         })
         .catch((error: any) => {
-          if (!cancelled) setFileDiff({ success: false, diff: '', additions: 0, deletions: 0, error: trimError(error?.message || error) });
+          if (!cancelled) {
+            setFileDiff({ success: false, diff: '', additions: 0, deletions: 0, error: trimError(error?.message || error) });
+            setFileDiffKey(requestKey);
+          }
         })
         .finally(() => {
           if (!cancelled) setFileDiffLoading(false);
@@ -773,7 +858,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         setFileDiffLoading(false);
       }
     };
-  }, [open, panelTab, effectiveRepoPath, activeFilePath, statusFileKey, statusVersion]);
+  }, [open, panelTab, effectiveRepoPath, activeFilePath, statusFileKey, statusVersion, fileDiffKey, fileDiff]);
 
   useEffect(() => {
     const onFocus = () => loadStatus(false);
@@ -798,13 +883,14 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     if (!open) return;
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
-        if (settingsOpen) setSettingsOpen(false);
+        if (remoteSettingsOpen) setRemoteSettingsOpen(false);
+        else if (settingsOpen) setSettingsOpen(false);
         else setOpen(false);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [open, settingsOpen]);
+  }, [open, remoteSettingsOpen, settingsOpen]);
 
   const selectedList = useMemo(() => Array.from(selectedPaths), [selectedPaths]);
 
@@ -832,11 +918,17 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
 
   const selectRepository = (repoPath: string) => {
     if (!repoPath) return;
+    if (repoPath === effectiveRepoPath || repoPath === status?.requestPath || repoPath === status?.repoRoot) {
+      setRepoSelectorOpen(false);
+      setRepoContextMenu(null);
+      return;
+    }
     historyRequestRef.current += 1;
     commitDetailsRequestRef.current += 1;
     branchesRequestRef.current += 1;
     setSelectedPathsManual(false);
     setSelectedRepoPath(repoPath);
+    setStatusLoading(true);
     setRepoSelectorOpen(false);
     setRepoContextMenu(null);
     setHistoryContextMenu(null);
@@ -845,6 +937,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     setBranchesRepoPath('');
     setBranchesLoading(false);
     setPushMenuOpen(false);
+    setRemoteSettingsOpen(false);
     setActiveFilePath('');
     setActiveCommitHash('');
     setActiveCommitFilePath('');
@@ -856,6 +949,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     setHistoryRepoPath('');
     setHistoryLoading(false);
     setSelectedPaths(new Set());
+    setFileDiff(null);
+    setFileDiffKey('');
+    setFileDiffLoading(false);
     setSummary('');
     setDescription('');
     setGenerationMeta(null);
@@ -877,7 +973,6 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         return;
       }
       addRepoFavorite(result.repoRoot);
-      setRepoSelectorTab('favorites');
       setRepoSearch('');
     } catch (error: any) {
       showToast('Add repository: ' + trimError(error?.message || error), 'error');
@@ -950,20 +1045,39 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     document.addEventListener('mouseup', onUp);
   };
 
-  const showGithubAuthToast = (error: string) => {
+  const handleOpenRemote = async () => {
+    const result = await ipcRenderer.invoke('git:open-remote', { projectPath: effectiveRepoPath });
+    if (!result?.success) showToast('Open remote: ' + trimError(result?.error), 'error');
+  };
+
+  const handleCopyRemote = () => {
+    const value = status?.remoteInfo?.displayUrl || status?.remote || '';
+    if (!value) {
+      showToast('No remote URL', 'warning');
+      return;
+    }
+    clipboard.writeText(value);
+    showToast('Remote URL copied', 'success');
+  };
+
+  const showRemoteAuthToast = (error: string) => {
+    const provider = remoteProviderLabel(status?.remoteInfo);
+    const isGithub = status?.remoteInfo?.provider === 'github';
     showToast(
-      'GitHub не принял доступ',
+      `${provider} не принял доступ`,
       'pink',
       0,
       true,
       error,
-      'GitHub Desktop',
-      async () => {
-        const result = await ipcRenderer.invoke('git:open-github-desktop', { projectPath: effectiveRepoPath });
-        if (!result?.success) showToast('GitHub Desktop: ' + trimError(result?.error), 'error');
-      },
+      isGithub ? 'GitHub Desktop' : 'Open remote',
+      isGithub
+        ? async () => {
+          const result = await ipcRenderer.invoke('git:open-github-desktop', { projectPath: effectiveRepoPath });
+          if (!result?.success) showToast('GitHub Desktop: ' + trimError(result?.error), 'error');
+        }
+        : handleOpenRemote,
       undefined,
-      'github-desktop'
+      isGithub ? 'github-desktop' : undefined
     );
   };
 
@@ -1059,11 +1173,12 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     if (!effectiveRepoPath) return;
     setRemoteBusy(type);
     setPushMenuOpen(false);
+    setRemoteSettingsOpen(false);
     try {
       const result = await ipcRenderer.invoke(type === 'push' ? 'git:push' : 'git:fetch', { projectPath: effectiveRepoPath });
       if (!result?.success) {
         const error = result?.error || (type === 'push' ? 'git push failed' : 'git fetch failed');
-        if (result?.authError) showGithubAuthToast(error);
+        if (result?.authError) showRemoteAuthToast(error);
         else showToast((type === 'push' ? 'Push: ' : 'Fetch: ') + trimError(error), 'error', 5000, false, String(error));
         return;
       }
@@ -1145,6 +1260,25 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       ? (status.upstream ? 'Pushing to origin' : 'Publishing branch')
       : (status.upstream ? 'Push changes to origin' : 'Publish this branch to ...');
   const remoteAheadCount = Math.max(0, Number(status.ahead) || 0);
+  const remoteInfo = status.remoteInfo || null;
+  const remoteProvider = remoteProviderLabel(remoteInfo);
+  const remoteRepoPath = shortRemotePath(remoteInfo);
+  const remoteCredential = gitCredentialLabel(status);
+  const remoteAuthor = gitAuthorLabel(status);
+  const remoteStatusTitle = remoteInfo?.host
+    ? `${remoteProvider} · ${remoteInfo.host}${remoteRepoPath ? '/' + remoteRepoPath : ''}`
+    : 'No remote configured';
+  const remoteStatusSubtitle = remoteInfo?.host
+    ? `${remoteCredential} · ${remoteAuthor}`
+    : 'Push requires origin remote';
+  const currentRepoIdentityPath = effectiveRepoPath;
+  const currentRepoIsHome = homeRepository?.path === currentRepoIdentityPath;
+  const currentRepoIsFavorite = !currentRepoIsHome && repoFavorites.includes(currentRepoIdentityPath);
+  const currentRepoIcon = currentRepoIsHome
+    ? <Home size={14} style={{ flexShrink: 0, color: '#cbd5e1' }} />
+    : currentRepoIsFavorite
+      ? <Star size={14} style={{ flexShrink: 0, color: '#facc15' }} />
+      : null;
   const visibleCommitDetails = commitDetailsRepoPath === effectiveRepoPath && commitDetailsMatchHash(commitDetails, activeCommitHash) ? commitDetails : null;
   const activeCommitDetailsLoadingKey = commitDetailsRequestKey(effectiveRepoPath, activeCommitHash, activeCommitFilePath);
   const historyPreviewLoading = Boolean(commitDetailsLoading && commitDetailsLoadingKey === activeCommitDetailsLoadingKey);
@@ -1254,6 +1388,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                 onMouseDown={() => {
                   setHistoryContextMenu(null);
                   setRepoContextMenu(null);
+                  setRemoteSettingsOpen(false);
                 }}
               >
                 <div
@@ -1263,6 +1398,72 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                   title="Resize columns"
                   style={splitResizeHandleStyle(renderedSplitLeftWidth, splitResizeHover)}
                 />
+                <div style={remoteStatusBarStyle}>
+                  <div style={remoteStatusIdentityStyle} title={`${remoteStatusTitle} · ${remoteStatusSubtitle}`}>
+                    <span style={remoteProviderPillStyle(remoteInfo?.provider || 'none')}>{remoteProvider}</span>
+                    <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: '#cbd5e1', fontWeight: 760 }}>
+                      {remoteInfo?.host ? remoteInfo.host : 'No origin'}
+                    </span>
+                    {remoteRepoPath ? (
+                      <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: '#8b949e' }}>
+                        /{remoteRepoPath}
+                      </span>
+                    ) : null}
+                    <span style={remoteProtocolPillStyle}>{remoteCredential}</span>
+                  </div>
+                  <div style={remoteAuthorStyle} title={remoteAuthor}>
+                    {remoteAuthor}
+                  </div>
+                  <div style={{ position: 'relative', flexShrink: 0 }}>
+                    <button
+                      onClick={() => {
+                        setBranchesOpen(false);
+                        setPushMenuOpen(false);
+                        setRemoteSettingsOpen((value) => !value);
+                      }}
+                      title="Remote settings"
+                      style={iconButtonStyle}
+                    >
+                      <Settings size={13} />
+                    </button>
+                    {remoteSettingsOpen ? (
+                      <div
+                        style={remoteSettingsMenuStyle}
+                        onMouseDown={(event) => event.stopPropagation()}
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        {remoteInfo?.webUrl ? (
+                          <button onClick={() => { setRemoteSettingsOpen(false); handleOpenRemote(); }} style={remoteMenuItemStyle}>
+                            <ExternalLink size={13} />
+                            Open remote
+                          </button>
+                        ) : null}
+                        <button onClick={() => { setRemoteSettingsOpen(false); handleCopyRemote(); }} style={remoteMenuItemStyle}>
+                          <Copy size={13} />
+                          Copy remote URL
+                        </button>
+                        {remoteInfo?.provider === 'github' ? (
+                          <button
+                            onClick={async () => {
+                              setRemoteSettingsOpen(false);
+                              const result = await ipcRenderer.invoke('git:open-github-desktop', { projectPath: effectiveRepoPath });
+                              if (!result?.success) showToast('GitHub Desktop: ' + trimError(result?.error), 'error');
+                            }}
+                            style={remoteMenuItemStyle}
+                          >
+                            <KeyRound size={13} />
+                            GitHub Desktop
+                          </button>
+                        ) : null}
+                        <button onClick={() => { setRemoteSettingsOpen(false); setSettingsOpen(true); }} style={remoteMenuItemStyle}>
+                          <Settings size={13} />
+                          Git settings
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+
                 <div style={gitHeaderLeftStyle}>
                   <div style={{ minWidth: 0, flex: 1, position: 'relative' }}>
                     <button
@@ -1273,51 +1474,31 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                         if (willOpen && projectPath && repositoriesProjectPath !== projectPath) loadRepositories();
                       }}
                       style={repoSelectButtonStyle}
-                      title={status.repoRoot}
+                      title={effectiveRepoPath}
                     >
-                      <FileText size={14} style={{ flexShrink: 0, color: '#cbd5e1' }} />
+                      <span style={currentRepoIconSlotStyle}>{currentRepoIcon}</span>
                       <span style={{ minWidth: 0, flex: 1 }}>
                         <span style={{ display: 'block', fontSize: 10, color: '#8b949e', fontWeight: 760, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left' }}>
                           Current Repository
                         </span>
                         <span style={{ display: 'block', fontSize: 12, color: '#f8fafc', fontWeight: 850, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1, textAlign: 'left' }}>
-                          {status.repoName}
+                          {currentRepoDisplay.name || status.repoName}
                         </span>
                       </span>
                       <ChevronDown size={13} style={{ flexShrink: 0, color: '#9ca3af', transform: repoSelectorOpen ? 'rotate(180deg)' : 'none', transition: 'transform 120ms ease' }} />
                     </button>
-                    {repoSelectorOpen && (
-                      <RepositoryMenu
-                        repositories={filteredRepositories}
-                        favorites={favoriteRepositories}
-                        favoritePaths={repoFavorites}
-                        activePath={status.repoRoot}
-                        tab={repoSelectorTab}
-                        search={repoSearch}
-                        loading={repositoriesLoading}
-                        contextMenu={repoContextMenu}
-                        dragRepoPath={dragRepoPath}
-                        onTabChange={setRepoSelectorTab}
-                        onSearchChange={setRepoSearch}
-                        onSelect={selectRepository}
-                        onContextMenu={setRepoContextMenu}
-                        onAddFavorite={addRepoFavorite}
-                        onRemoveFavorite={removeRepoFavorite}
-                        onRefresh={loadRepositories}
-                        onAddRepository={addRepositoryToProject}
-                        onDragPathChange={setDragRepoPath}
-                        onMoveFavorite={moveFavoriteRepo}
-                      />
-                    )}
                   </div>
                 </div>
 
-                <div style={gitHeaderRightStyle}>
-                  <div style={{ position: 'relative', minWidth: 0, flex: 1 }}>
-                    <button
-                      onClick={() => setBranchesOpen((value) => !value)}
-                      style={branchHeaderButtonStyle}
-                    >
+	                <div style={gitHeaderRightStyle}>
+	                  <div style={{ position: 'relative', minWidth: 0, flex: 1 }}>
+	                    <button
+	                      onClick={() => {
+	                        setRemoteSettingsOpen(false);
+	                        setBranchesOpen((value) => !value);
+	                      }}
+	                      style={branchHeaderButtonStyle}
+	                    >
                       <GitBranch size={14} style={{ flexShrink: 0 }} />
                       <span style={{ minWidth: 0, flex: 1 }}>
                         <span style={{ display: 'block', fontSize: 10, color: '#8b949e', fontWeight: 760, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left' }}>
@@ -1354,7 +1535,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                     )}
                   </div>
 
-                  <div style={{ display: 'inline-flex', position: 'relative', height: '100%' }}>
+	                  <div style={{ display: 'inline-flex', position: 'relative', height: '100%' }}>
                     <button
                       onClick={() => handleRemote('push')}
                       disabled={remoteBusy !== null}
@@ -1376,8 +1557,11 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                         </span>
                       ) : null}
                     </button>
-                    <button
-                      onClick={() => setPushMenuOpen((value) => !value)}
+	                    <button
+	                      onClick={() => {
+	                        setRemoteSettingsOpen(false);
+	                        setPushMenuOpen((value) => !value);
+	                      }}
                       disabled={remoteBusy !== null}
                       title="More remote actions"
                       style={{ ...remoteHeaderButtonStyle, borderLeft: '1px solid rgba(255,255,255,0.10)', borderTopLeftRadius: 0, borderBottomLeftRadius: 0, width: 36, padding: 0 }}
@@ -1392,13 +1576,14 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                         </button>
                       </div>
                     )}
-                  </div>
-                </div>
+	                  </div>
+	                </div>
 
                 <div style={gitTabsLeftStyle}>
                   <TabButton active={panelTab === 'changes'} onClick={() => {
                     setBranchesOpen(false);
                     setPushMenuOpen(false);
+                    setRemoteSettingsOpen(false);
                     setHistoryContextMenu(null);
                     setPanelTab('changes');
                   }}>
@@ -1408,6 +1593,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                   <TabButton active={panelTab === 'history'} onClick={() => {
                     setBranchesOpen(false);
                     setPushMenuOpen(false);
+                    setRemoteSettingsOpen(false);
                     setHistoryContextMenu(null);
                     setPanelTab('history');
                   }}>
@@ -1430,14 +1616,15 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                   >
                     <RefreshCw size={13} className={statusLoading || historyLoading ? 'animate-spin' : ''} />
                   </button>
-                  <button onClick={() => setSettingsOpen(true)} title="Git settings" style={iconButtonStyle}>
-                    <Settings size={13} />
-                  </button>
                 </div>
 
                 <div style={gitLeftBodyStyle}>
                 {panelTab === 'changes' ? (
                   <div style={changesSidebarStyle}>
+                    {!statusReadyForRepo ? (
+                      <div style={emptyStateStyle}><Loader2 size={15} className="animate-spin" /> Loading repository</div>
+                    ) : (
+                      <>
                       <div style={searchBoxStyle}>
                         <Search size={13} style={{ color: '#7d8590', flexShrink: 0 }} />
                         <input
@@ -1534,6 +1721,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                           </button>
                         </div>
                       </div>
+                      </>
+                    )}
                   </div>
                 ) : (
                   <div style={historyPaneStyle}>
@@ -1615,6 +1804,29 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                     />
                   )}
                 </div>
+                {repoSelectorOpen && (
+                  <RepositoryMenu
+                    leftWidth={renderedSplitLeftWidth}
+                    homeRepository={homeRepository}
+                    repositories={filteredRepositories}
+                    favorites={favoriteRepositories}
+                    favoritePaths={repoFavorites}
+                    activePath={currentRepoIdentityPath}
+                    search={repoSearch}
+                    loading={repositoriesLoading}
+                    contextMenu={repoContextMenu}
+                    dragRepoPath={dragRepoPath}
+                    onSearchChange={setRepoSearch}
+                    onSelect={selectRepository}
+                    onContextMenu={setRepoContextMenu}
+                    onAddFavorite={addRepoFavorite}
+                    onRemoveFavorite={removeRepoFavorite}
+                    onRefresh={loadRepositories}
+                    onAddRepository={addRepositoryToProject}
+                    onDragPathChange={setDragRepoPath}
+                    onMoveFavorite={moveFavoriteRepo}
+                  />
+                )}
               </div>
             )}
           </div>
@@ -1651,16 +1863,16 @@ function TabButton({ active, children, onClick }: { active: boolean; children: R
 }
 
 function RepositoryMenu({
+  leftWidth,
+  homeRepository,
   repositories,
   favorites,
   favoritePaths,
   activePath,
-  tab,
   search,
   loading,
   contextMenu,
   dragRepoPath,
-  onTabChange,
   onSearchChange,
   onSelect,
   onContextMenu,
@@ -1671,16 +1883,16 @@ function RepositoryMenu({
   onDragPathChange,
   onMoveFavorite,
 }: {
+  leftWidth: number;
+  homeRepository: GitRepository | null;
   repositories: GitRepository[];
   favorites: GitRepository[];
   favoritePaths: string[];
   activePath: string;
-  tab: 'repos' | 'favorites';
   search: string;
   loading: boolean;
   contextMenu: { x: number; y: number; repo: GitRepository } | null;
   dragRepoPath: string;
-  onTabChange: (tab: 'repos' | 'favorites') => void;
   onSearchChange: (value: string) => void;
   onSelect: (repoPath: string) => void;
   onContextMenu: (menu: { x: number; y: number; repo: GitRepository } | null) => void;
@@ -1691,20 +1903,61 @@ function RepositoryMenu({
   onDragPathChange: (repoPath: string) => void;
   onMoveFavorite: (sourcePath: string, targetPath: string) => void;
 }) {
-  const rows = tab === 'favorites' ? favorites : repositories;
+  const renderRepoRow = (repo: GitRepository, zone: 'home' | 'favorite' | 'repository') => {
+    const favorite = zone === 'favorite';
+    const active = repo.path === activePath;
+    return (
+      <button
+        key={`${zone}:${repo.path}`}
+        onClick={() => onSelect(repo.path)}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (zone === 'home') return;
+          onContextMenu({ x: event.clientX, y: event.clientY, repo });
+        }}
+        draggable={favorite}
+        onDragStart={(event) => {
+          if (!favorite) return;
+          onDragPathChange(repo.path);
+          event.dataTransfer.effectAllowed = 'move';
+          event.dataTransfer.setData('text/plain', repo.path);
+        }}
+        onDragOver={(event) => {
+          if (!favorite || !dragRepoPath || dragRepoPath === repo.path) return;
+          event.preventDefault();
+          event.dataTransfer.dropEffect = 'move';
+        }}
+        onDrop={(event) => {
+          if (!favorite) return;
+          event.preventDefault();
+          onMoveFavorite(dragRepoPath || event.dataTransfer.getData('text/plain'), repo.path);
+          onDragPathChange('');
+        }}
+        onDragEnd={() => onDragPathChange('')}
+        style={repoRowStyle(active, dragRepoPath === repo.path)}
+        title={repo.path}
+      >
+        <span style={repoIconSlotStyle}>
+          {zone === 'home' ? <Home size={13} /> : favorite ? <Star size={13} style={{ color: '#facc15' }} /> : active ? <Check size={13} /> : null}
+        </span>
+        <span style={{ minWidth: 0, flex: 1, textAlign: 'left' }}>
+          <span style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11.5, fontWeight: 760, color: '#f1f5f9' }}>
+            {repo.name}
+          </span>
+          <span style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 10, color: '#7d8590', marginTop: 1 }}>
+            {repo.relativePath || repo.path}
+          </span>
+        </span>
+        {favorite ? <GripVertical size={14} style={{ color: '#6b7280', flexShrink: 0, cursor: 'grab' }} /> : null}
+      </button>
+    );
+  };
+  const hasPinnedRows = Boolean(homeRepository) || favorites.length > 0;
+  const hasRegularRows = repositories.length > 0 || loading;
   return (
     <>
-      <div style={repoMenuStyle} onMouseDown={(event) => event.stopPropagation()}>
-        <div style={repoTabsStyle}>
-          <RepoTabButton active={tab === 'repos'} onClick={() => onTabChange('repos')}>
-            <GitBranch size={12} />
-            Repos
-          </RepoTabButton>
-          <RepoTabButton active={tab === 'favorites'} onClick={() => onTabChange('favorites')}>
-            <Star size={12} />
-            This Project
-          </RepoTabButton>
-        </div>
+      <div style={repoMenuStyle(leftWidth)} onMouseDown={(event) => event.stopPropagation()}>
         <div style={repoSearchStyle}>
           <Search size={12} style={{ color: '#7d8590', flexShrink: 0 }} />
           <input
@@ -1727,55 +1980,14 @@ function RepositoryMenu({
         </div>
 
         <div style={repoListStyle}>
-          {rows.length ? rows.map((repo) => (
-            <button
-              key={repo.path}
-              onClick={() => onSelect(repo.path)}
-              onContextMenu={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                onContextMenu({ x: event.clientX, y: event.clientY, repo });
-              }}
-              draggable={tab === 'favorites'}
-              onDragStart={(event) => {
-                if (tab !== 'favorites') return;
-                onDragPathChange(repo.path);
-                event.dataTransfer.effectAllowed = 'move';
-                event.dataTransfer.setData('text/plain', repo.path);
-              }}
-              onDragOver={(event) => {
-                if (tab !== 'favorites' || !dragRepoPath || dragRepoPath === repo.path) return;
-                event.preventDefault();
-                event.dataTransfer.dropEffect = 'move';
-              }}
-              onDrop={(event) => {
-                event.preventDefault();
-                onMoveFavorite(dragRepoPath || event.dataTransfer.getData('text/plain'), repo.path);
-                onDragPathChange('');
-              }}
-              onDragEnd={() => onDragPathChange('')}
-              style={repoRowStyle(repo.path === activePath, dragRepoPath === repo.path)}
-              title={repo.path}
-            >
-              <span style={repoIconSlotStyle}>
-                {repo.home ? <Home size={13} /> : repo.path === activePath ? <Check size={13} /> : null}
-              </span>
-              <span style={{ minWidth: 0, flex: 1, textAlign: 'left' }}>
-                <span style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11.5, fontWeight: 760, color: '#f1f5f9' }}>
-                  {repo.name}
-                </span>
-                <span style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 10, color: '#7d8590', marginTop: 1 }}>
-                  {repo.relativePath || repo.path}
-                </span>
-              </span>
-              {favoritePaths.includes(repo.path) && tab !== 'favorites' ? <Star size={12} style={{ color: '#facc15', flexShrink: 0 }} /> : null}
-              {tab === 'favorites' ? <GripVertical size={14} style={{ color: '#6b7280', flexShrink: 0, cursor: 'grab' }} /> : null}
-            </button>
-          )) : null}
+          {homeRepository ? renderRepoRow(homeRepository, 'home') : null}
+          {favorites.map((repo) => renderRepoRow(repo, 'favorite'))}
+          {hasPinnedRows && hasRegularRows ? <div style={repoListDividerStyle} /> : null}
+          {repositories.map((repo) => renderRepoRow(repo, 'repository'))}
           {loading ? (
             <div style={emptyLineStyle}><Loader2 size={13} className="animate-spin" /> Loading repositories</div>
-          ) : !rows.length ? (
-            <div style={emptyLineStyle}>{tab === 'favorites' ? 'No favorites for this project' : 'No repositories'}</div>
+          ) : !homeRepository && !favorites.length && !repositories.length ? (
+            <div style={emptyLineStyle}>No repositories</div>
           ) : null}
         </div>
       </div>
@@ -1833,32 +2045,6 @@ function HistoryCommitContextMenu({
         Undo Commit
       </button>
     </div>
-  );
-}
-
-function RepoTabButton({ active, children, onClick }: { active: boolean; children: React.ReactNode; onClick: () => void }) {
-  return (
-    <button
-      onClick={onClick}
-      style={{
-        height: 26,
-        flex: 1,
-        border: 'none',
-        borderBottom: active ? '2px solid #3b82f6' : '2px solid transparent',
-        background: active ? 'rgba(59,130,246,0.10)' : 'transparent',
-        color: active ? '#f8fafc' : '#9ca3af',
-        display: 'inline-flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        gap: 5,
-        fontSize: 11,
-        fontWeight: 800,
-        cursor: 'pointer',
-        padding: 0,
-      }}
-    >
-      {children}
-    </button>
   );
 }
 
@@ -2257,25 +2443,32 @@ const repoSelectButtonStyle: React.CSSProperties = {
   cursor: 'pointer',
 };
 
-const repoMenuStyle: React.CSSProperties = {
-  position: 'absolute',
-  top: 40,
-  left: 0,
-  width: 380,
-  maxWidth: 'calc(100vw - 48px)',
-  zIndex: 5,
-  borderRadius: 8,
-  border: '1px solid rgba(255,255,255,0.12)',
-  background: '#111318',
-  boxShadow: '0 16px 34px rgba(0,0,0,0.58)',
-  overflow: 'hidden',
+const currentRepoIconSlotStyle: React.CSSProperties = {
+  width: 14,
+  minWidth: 14,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  flexShrink: 0,
 };
 
-const repoTabsStyle: React.CSSProperties = {
+const repoMenuStyle = (leftWidth: number): React.CSSProperties => ({
+  position: 'absolute',
+  top: 82,
+  bottom: 0,
+  left: 0,
+  width: leftWidth,
+  zIndex: 15,
   display: 'flex',
-  height: 28,
-  borderBottom: '1px solid rgba(255,255,255,0.08)',
-};
+  flexDirection: 'column',
+  borderRadius: 0,
+  border: '1px solid rgba(255,255,255,0.12)',
+  borderLeft: 'none',
+  borderBottom: 'none',
+  background: '#111318',
+  boxShadow: '10px 0 24px rgba(0,0,0,0.34)',
+  overflow: 'hidden',
+});
 
 const repoSearchStyle: React.CSSProperties = {
   height: 30,
@@ -2323,9 +2516,16 @@ const repoActionButtonStyle = (disabled: boolean): React.CSSProperties => ({
 });
 
 const repoListStyle: React.CSSProperties = {
-  maxHeight: 252,
+  flex: 1,
+  minHeight: 0,
   overflowY: 'auto',
   padding: '0 4px 5px',
+};
+
+const repoListDividerStyle: React.CSSProperties = {
+  height: 1,
+  margin: '2px 8px',
+  background: 'rgba(255,255,255,0.08)',
 };
 
 const repoIconSlotStyle: React.CSSProperties = {
@@ -2518,7 +2718,7 @@ const gitPanelGridStyle: React.CSSProperties = {
   minHeight: 0,
   display: 'grid',
   gridTemplateColumns: 'minmax(380px, 43%) minmax(0, 1fr)',
-  gridTemplateRows: '52px 30px minmax(0, 1fr)',
+  gridTemplateRows: '30px 52px 30px minmax(0, 1fr)',
   overflow: 'hidden',
   position: 'relative',
 };
@@ -2540,6 +2740,71 @@ const gitHeaderRightStyle: React.CSSProperties = {
   alignItems: 'stretch',
   borderBottom: '1px solid rgba(255,255,255,0.08)',
   background: '#15181d',
+};
+
+const remoteStatusBarStyle: React.CSSProperties = {
+  gridColumn: '1 / -1',
+  minWidth: 0,
+  minHeight: 0,
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  padding: '0 8px 0 12px',
+  borderBottom: '1px solid rgba(255,255,255,0.08)',
+  background: '#171b21',
+};
+
+const remoteStatusIdentityStyle: React.CSSProperties = {
+  minWidth: 0,
+  flex: 1,
+  display: 'flex',
+  alignItems: 'center',
+  gap: 6,
+  fontSize: 10.5,
+};
+
+const remoteProviderPillStyle = (provider: string): React.CSSProperties => ({
+  height: 18,
+  padding: '0 7px',
+  borderRadius: 999,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  border: '1px solid rgba(255,255,255,0.10)',
+  background: provider === 'gitlab'
+    ? 'rgba(249,115,22,0.16)'
+    : provider === 'github'
+      ? 'rgba(148,163,184,0.18)'
+      : 'rgba(59,130,246,0.14)',
+  color: provider === 'gitlab' ? '#fdba74' : '#dbeafe',
+  fontSize: 10,
+  fontWeight: 850,
+  flexShrink: 0,
+});
+
+const remoteProtocolPillStyle: React.CSSProperties = {
+  height: 18,
+  padding: '0 7px',
+  borderRadius: 999,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  background: 'rgba(255,255,255,0.045)',
+  color: '#9ca3af',
+  fontSize: 10,
+  fontWeight: 760,
+  flexShrink: 0,
+};
+
+const remoteAuthorStyle: React.CSSProperties = {
+  maxWidth: 230,
+  minWidth: 0,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+  color: '#9ca3af',
+  fontSize: 10.5,
+  fontWeight: 700,
 };
 
 const gitTabsLeftStyle: React.CSSProperties = {
@@ -3039,6 +3304,11 @@ const remoteMenuStyle: React.CSSProperties = {
   background: '#111318',
   boxShadow: '0 12px 28px rgba(0,0,0,0.5)',
   padding: 4,
+};
+
+const remoteSettingsMenuStyle: React.CSSProperties = {
+  ...remoteMenuStyle,
+  minWidth: 168,
 };
 
 const remoteMenuItemStyle: React.CSSProperties = {

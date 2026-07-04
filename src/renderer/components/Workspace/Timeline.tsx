@@ -1050,7 +1050,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     const margin = 10;
     const spaceBelow = window.innerHeight - chipRect.bottom - margin;
     setSingleBreakdownFlipUp(spaceBelow < popHeight && chipRect.top > popHeight + margin);
-  }, [singleBreakdownOpen, singleTokenEstimate, singleChipEl, breakdownMode]);
+  }, [singleBreakdownOpen, singleTokenEstimate, singleTokenUuid, entries, singleChipEl, breakdownMode]);
 
   // Phase 2: Collapsible groups
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
@@ -4096,57 +4096,147 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   const currentActiveEntry = activeTooltipIndex !== null ? entries[activeTooltipIndex] : null;
 
-  // Codex-only per-turn usage block in the detail panel. Renders directly from the
-  // entry fields attached in buildCodexTimeline (source), no estimate backend call.
-  // Two facts surfaced honestly from last_token_usage:
-  //   • Input: uncached / cached (cache-read) — the "был ли кэш" signal, post-hoc per turn.
-  //   • Output: answer / reasoning — Codex splits thinking tokens out; Claude doesn't here.
-  // Plus the subscription quota snapshot (5h / weekly) at this turn.
-  // Numbers are DETERMINISTIC (not user-chosen) → neutral grey, no severity colours.
-  const renderCodexUsageBlock = (entry: TimelineEntry) => {
-    if (!isCodex) return null;
+  const getCodexUsageTotal = (entry: TimelineEntry): number | null => {
+    const u = entry.codexUsage;
+    if (!u) return null;
+    return Math.max(0, u.inputUncached)
+      + Math.max(0, u.inputCached)
+      + Math.max(0, u.outputAnswer)
+      + Math.max(0, u.outputReasoning);
+  };
+
+  const hasCodexBreakdown = (entry: TimelineEntry): boolean => {
+    return isCodex && !!(entry.codexUsage || entry.codexLimits);
+  };
+
+  const canShowSingleEntryBreakdown = (entry: TimelineEntry): boolean => {
+    return supportsClaudeTimelineActions || hasCodexBreakdown(entry);
+  };
+
+  const singleEntryTokenCount = (entry: TimelineEntry): number => {
+    if (isCodex) {
+      const codexTotal = getCodexUsageTotal(entry);
+      if (codexTotal !== null) return codexTotal;
+    }
+    if (singleTokenEstimate && singleTokenUuid === entry.uuid) {
+      return singleTokenEstimate.total;
+    }
+    return Math.ceil(entry.content.length / 3.5);
+  };
+
+  const formatCodexReset = (iso: string | null): string => {
+    if (!iso) return '';
+    const t = Date.parse(iso);
+    if (Number.isNaN(t)) return '';
+    const ms = t - Date.now();
+    if (ms <= 0) return 'now';
+    const m = Math.floor(ms / 60000);
+    if (m < 60) return `${m}m`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ${m % 60}m`;
+    return `${Math.floor(h / 24)}d ${h % 24}h`;
+  };
+
+  const renderSingleTokenChip = (entry: TimelineEntry) => {
+    const interactive = canShowSingleEntryBreakdown(entry);
+    return (
+      <span
+        className="flex items-center gap-1 ml-2 text-[10px]"
+        onMouseEnter={(e) => {
+          if (!interactive) return;
+          setSingleChipEl(e.currentTarget);
+          setSingleTokenUuid(entry.uuid);
+          setSingleBreakdownOpen(true);
+        }}
+        style={{
+          color: '#e8a955',
+          cursor: interactive ? 'help' : 'default',
+          textDecoration: interactive ? 'underline dotted rgba(232,169,85,0.4)' : 'none',
+          textUnderlineOffset: '2px',
+        }}
+      >
+        <Zap size={10} />
+        <span>{formatTokenCount(singleEntryTokenCount(entry))}</span>
+      </span>
+    );
+  };
+
+  // Codex usage stays out of the main entry tooltip: it is secondary detail behind
+  // the small token chip, matching Claude's JSONL/API breakdown popover.
+  const renderCodexBreakdownBody = (entry: TimelineEntry) => {
     const u = entry.codexUsage;
     const lim = entry.codexLimits;
-    if (!u && !lim) return null;
-    const fmtReset = (iso: string | null): string => {
-      if (!iso) return '';
-      const t = Date.parse(iso);
-      if (Number.isNaN(t)) return '';
-      const ms = t - Date.now();
-      if (ms <= 0) return 'now';
-      const m = Math.floor(ms / 60000);
-      if (m < 60) return `${m}m`;
-      const h = Math.floor(m / 60);
-      if (h < 24) return `${h}h ${m % 60}m`;
-      return `${Math.floor(h / 24)}d ${h % 24}h`;
-    };
+    const inputTotal = u ? u.inputUncached + u.inputCached : 0;
+    const total = getCodexUsageTotal(entry);
+    const TabBtn = ({ mode, children }: { mode: 'jsonl' | 'api'; children: React.ReactNode }) => (
+      <button
+        onClick={(e) => { e.stopPropagation(); setBreakdownMode(mode); }}
+        className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded transition-colors cursor-pointer"
+        style={{
+          color: breakdownMode === mode ? '#e8a955' : 'rgba(255,255,255,0.4)',
+          backgroundColor: breakdownMode === mode ? 'rgba(232,169,85,0.08)' : 'transparent',
+        }}
+      >{children}</button>
+    );
     const Row = ({ label, value, dim }: { label: string; value: string; dim?: boolean }) => (
-      <div className="flex items-center justify-between leading-snug">
-        <span style={{ color: dim ? 'rgba(255,255,255,0.35)' : 'rgba(255,255,255,0.5)' }}>{label}</span>
-        <span className="font-mono" style={{ color: dim ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.8)' }}>{value}</span>
+      <div className="flex items-center justify-between text-[11px]">
+        <span style={{ color: dim ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.6)' }}>{label}</span>
+        <span className="font-mono" style={{ color: dim ? 'rgba(255,255,255,0.6)' : 'rgba(255,255,255,0.8)' }}>{value}</span>
       </div>
     );
-    return (
-      <div className="mt-1 pt-1 border-t border-white/5 text-[10px] shrink-0" style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-        {u && (
-          <>
-            <Row label="вход" value={formatTokenCount(u.inputUncached)} />
-            <Row label="↳ из кэша" value={formatTokenCount(u.inputCached)} dim />
-            <Row label="ответ" value={formatTokenCount(u.outputAnswer)} />
-            {u.outputReasoning > 0 && <Row label="↳ размышление" value={formatTokenCount(u.outputReasoning)} dim />}
-          </>
+    const limitRows = lim && (lim.fiveHourPct != null || lim.weeklyPct != null) ? (
+      <div className="mt-1.5 pt-1 border-t border-white/10 flex flex-col gap-0.5">
+        {lim.fiveHourPct != null && (
+          <Row
+            label="5-hour limit"
+            value={`${Math.round(lim.fiveHourPct)}%${lim.fiveHourResetsAt ? ` · ${formatCodexReset(lim.fiveHourResetsAt)}` : ''}`}
+            dim
+          />
         )}
-        {lim && (lim.fiveHourPct != null || lim.weeklyPct != null) && (
-          <div className="mt-1 pt-1 border-t border-white/5" style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-            {lim.fiveHourPct != null && (
-              <Row label="лимит 5ч" value={`${Math.round(lim.fiveHourPct)}%${lim.fiveHourResetsAt ? ` · ${fmtReset(lim.fiveHourResetsAt)}` : ''}`} dim />
-            )}
-            {lim.weeklyPct != null && (
-              <Row label="лимит неделя" value={`${Math.round(lim.weeklyPct)}%${lim.weeklyResetsAt ? ` · ${fmtReset(lim.weeklyResetsAt)}` : ''}`} dim />
-            )}
-          </div>
+        {lim.weeklyPct != null && (
+          <Row
+            label="Weekly limit"
+            value={`${Math.round(lim.weeklyPct)}%${lim.weeklyResetsAt ? ` · ${formatCodexReset(lim.weeklyResetsAt)}` : ''}`}
+            dim
+          />
         )}
       </div>
+    ) : null;
+
+    return (
+      <>
+        <div className="flex items-center gap-0.5 mb-1.5">
+          <TabBtn mode="jsonl">JSONL</TabBtn>
+          <TabBtn mode="api">API</TabBtn>
+        </div>
+        {u ? (
+          breakdownMode === 'jsonl' ? (
+            <>
+              <div className="flex flex-col gap-0.5">
+                <Row label="Input" value={formatTokenCount(inputTotal)} />
+                {u.inputCached > 0 && <Row label="↳ cached" value={formatTokenCount(u.inputCached)} dim />}
+                <Row label="Codex · answer" value={formatTokenCount(u.outputAnswer)} />
+                {u.outputReasoning > 0 && <Row label="Codex · reasoning" value={formatTokenCount(u.outputReasoning)} dim />}
+              </div>
+              <div className="mt-1.5 pt-1 border-t border-white/10 flex items-center justify-between text-[11px]">
+                <span className="text-white/50">В JSONL</span>
+                <span className="font-mono font-semibold" style={{ color: '#e8a955' }}>{formatTokenCount(total || 0)}</span>
+              </div>
+            </>
+          ) : (
+            <div className="flex flex-col gap-0.5">
+              <Row label="Input billed" value={formatTokenCount(u.inputUncached)} />
+              {u.inputCached > 0 && <Row label="↳ cached" value={formatTokenCount(u.inputCached)} dim />}
+              <Row label="Input (total)" value={formatTokenCount(inputTotal)} dim />
+              <Row label="Output" value={formatTokenCount(u.outputAnswer)} />
+              {u.outputReasoning > 0 && <Row label="↳ reasoning" value={formatTokenCount(u.outputReasoning)} dim />}
+            </div>
+          )
+        ) : (
+          <div className="text-[11px] text-white/40">No token usage sample</div>
+        )}
+        {limitRows}
+      </>
     );
   };
 
@@ -5889,24 +5979,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                     <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      <span
-                        className="flex items-center gap-1 ml-2 text-[10px]"
-                        onMouseEnter={(e) => {
-                          if (!supportsClaudeTimelineActions) return;
-                          setSingleChipEl(e.currentTarget);
-                          setSingleTokenUuid(currentActiveEntry.uuid);
-                          setSingleBreakdownOpen(true);
-                        }}
-                        style={{
-                          color: '#e8a955',
-                          cursor: supportsClaudeTimelineActions ? 'help' : 'default',
-                          textDecoration: supportsClaudeTimelineActions ? 'underline dotted rgba(232,169,85,0.4)' : 'none',
-                          textUnderlineOffset: '2px',
-                        }}
-                      >
-                        <Zap size={10} />
-                        <span>{formatTokenCount(singleTokenEstimate && singleTokenUuid === currentActiveEntry.uuid ? singleTokenEstimate.total : Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
-                      </span>
+                      {renderSingleTokenChip(currentActiveEntry)}
                       <div className="flex-1" />
                       <button
                         onClick={(e) => {
@@ -5941,24 +6014,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                     <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      <span
-                        className="flex items-center gap-1 ml-2 text-[10px]"
-                        onMouseEnter={(e) => {
-                          if (!supportsClaudeTimelineActions) return;
-                          setSingleChipEl(e.currentTarget);
-                          setSingleTokenUuid(currentActiveEntry.uuid);
-                          setSingleBreakdownOpen(true);
-                        }}
-                        style={{
-                          color: '#e8a955',
-                          cursor: supportsClaudeTimelineActions ? 'help' : 'default',
-                          textDecoration: supportsClaudeTimelineActions ? 'underline dotted rgba(232,169,85,0.4)' : 'none',
-                          textUnderlineOffset: '2px',
-                        }}
-                      >
-                        <Zap size={10} />
-                        <span>{formatTokenCount(singleTokenEstimate && singleTokenUuid === currentActiveEntry.uuid ? singleTokenEstimate.total : Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
-                      </span>
+                      {renderSingleTokenChip(currentActiveEntry)}
                       <div className="flex-1" />
                       <button
                         onClick={(e) => {
@@ -6096,24 +6152,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     </div>
                     <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
                       <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>
-                      <span
-                        className="flex items-center gap-1 ml-2 text-[10px]"
-                        onMouseEnter={(e) => {
-                          if (!supportsClaudeTimelineActions) return;
-                          setSingleChipEl(e.currentTarget);
-                          setSingleTokenUuid(currentActiveEntry.uuid);
-                          setSingleBreakdownOpen(true);
-                        }}
-                        style={{
-                          color: '#e8a955',
-                          cursor: supportsClaudeTimelineActions ? 'help' : 'default',
-                          textDecoration: supportsClaudeTimelineActions ? 'underline dotted rgba(232,169,85,0.4)' : 'none',
-                          textUnderlineOffset: '2px',
-                        }}
-                      >
-                        <Zap size={10} />
-                        <span>{formatTokenCount(singleTokenEstimate && singleTokenUuid === currentActiveEntry.uuid ? singleTokenEstimate.total : Math.ceil(currentActiveEntry.content.length / 3.5))}</span>
-                      </span>
+                      {renderSingleTokenChip(currentActiveEntry)}
                       <div className="flex-1" />
                       <button
                         onClick={(e) => {
@@ -6151,7 +6190,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         </Tooltip>
                       );
                     })()}
-                    {renderCodexUsageBlock(currentActiveEntry)}
                   </>
                 )}
               </div>
@@ -6766,14 +6804,18 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             Cmd+hover entry tooltip (not the range action menu). Positioned via the chip's
             getBoundingClientRect() since the chip lives in a sibling portal — flips up
             near viewport bottom. Stays open while cursor is over chip OR popover. */}
-        {isVisible && singleBreakdownOpen && singleTokenEstimate && singleChipEl && (() => {
+        {isVisible && singleBreakdownOpen && singleChipEl && (() => {
+          const codexEntry = singleTokenUuid
+            ? entries.find(e => e.uuid === singleTokenUuid && hasCodexBreakdown(e))
+            : null;
+          if (!singleTokenEstimate && !codexEntry) return null;
           const chipRect = singleChipEl.getBoundingClientRect();
           const top = singleBreakdownFlipUp ? chipRect.top : chipRect.bottom;
           const transform = singleBreakdownFlipUp ? 'translateY(-100%)' : 'none';
           const paddingTop = singleBreakdownFlipUp ? 0 : 4;
           const paddingBottom = singleBreakdownFlipUp ? 4 : 0;
 
-          const rows: Array<{ key: string; label: string; value: number }> = [
+          const rows: Array<{ key: string; label: string; value: number }> = singleTokenEstimate ? [
             { key: 'user', label: 'User', value: singleTokenEstimate.categories.user },
             { key: 'claudeText', label: 'Claude · answer', value: singleTokenEstimate.categories.claudeText },
             { key: 'claudeThinking', label: 'Claude · thinking', value: singleTokenEstimate.categories.claudeThinking },
@@ -6784,7 +6826,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             { key: 'subagentResult', label: 'Субагент · result', value: singleTokenEstimate.categories.subagentResult },
             { key: 'subagentHistory', label: 'Субагент · history', value: singleTokenEstimate.categories.subagentHistory },
             { key: 'compact', label: 'Compact summary', value: singleTokenEstimate.categories.compact },
-          ].filter(r => r.value > 0);
+          ].filter(r => r.value > 0) : [];
 
           // Anchor: left edge of the chip itself (entry tooltip lives next to Timeline,
           // so we lean against its left side too; no popupRightPx because chip is not
@@ -6818,7 +6860,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     boxShadow: '0 4px 16px rgba(0,0,0,0.6)',
                   }}
                 >
-                  {renderBreakdownBody(singleTokenEstimate, rows)}
+                  {codexEntry ? renderCodexBreakdownBody(codexEntry) : renderBreakdownBody(singleTokenEstimate!, rows)}
                 </div>
               </div>
             </TooltipPortal>

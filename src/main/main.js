@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, Menu, dialog, shell, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, dialog, shell, clipboard, nativeImage } = require('electron');
 const path = require('path');
 const pty = require('node-pty');
 const fs = require('fs');
@@ -94,7 +94,7 @@ const projectManager = require(path.join(srcMainDir, 'project-manager'));
 const SessionManager = require(path.join(srcMainDir, 'session-manager'));
 const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
 const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCache, getGeminiProjectsJson, calculateGeminiHash } = require(path.join(srcMainDir, 'gemini-utils'));
-const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, deleteEffortEntries, trimTrailingEffortEntries, repairJsonlChainBreaks, _api: claudeDataApi } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
+const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, getSessionMaterialization, deleteEffortEntries, trimTrailingEffortEntries, repairJsonlChainBreaks, _api: claudeDataApi } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
 const codexDataModule = require(path.join(srcMainDir, 'ipc', 'codex-data'));
 const { createSessionTranscriptService } = require(path.join(srcMainDir, 'session-transcript-service'));
 
@@ -598,6 +598,8 @@ if (process.platform === 'darwin') {
 }
 
 let mainWindow;
+let dockBaseIconDataUrlCache = null;
+let dockBaseIconPathCache = null;
 const transcriptService = createSessionTranscriptService({
   getMainWindow: () => mainWindow,
   webBroadcast: (tabId, payload) => _webBroadcast(tabId, payload),
@@ -613,6 +615,108 @@ let processTreeSnapshotWaiters = 0;
 const AI_PROCESS_LOOKUP_CACHE_MS = 2000;
 const aiProcessLookupCache = new Map(); // `${tabId}:${expectedName}` -> { at, matches }
 const terminalProjectIds = new Map(); // tabId -> projectId (authoritative parent project for MCP routing)
+
+function getDockBaseIconCandidates() {
+  return [
+    ...(isDev ? [
+      path.join(__dirname, '..', '..', 'build-resources', 'icon-dev.png'),
+      path.join(__dirname, '..', '..', 'build-resources', 'icon.png'),
+    ] : []),
+    path.join(app.getAppPath(), 'build-resources', isDev ? 'icon-dev.png' : 'icon.png'),
+    path.join(__dirname, '..', '..', 'build-resources', isDev ? 'icon-dev.png' : 'icon.png'),
+    path.join(__dirname, '..', '..', 'build-resources', 'icon.png'),
+    path.join(process.resourcesPath || '', 'icon.png'),
+    path.join(process.resourcesPath || '', 'icon.icns'),
+  ].filter(Boolean);
+}
+
+function getDockBaseIconImage() {
+  for (const candidate of getDockBaseIconCandidates()) {
+    try {
+      if (!candidate || !fs.existsSync(candidate)) continue;
+      const image = nativeImage.createFromPath(candidate);
+      if (!image || image.isEmpty()) continue;
+      dockBaseIconPathCache = candidate;
+      return image;
+    } catch {}
+  }
+  return null;
+}
+
+function getDockBaseIconDataUrl() {
+  if (dockBaseIconDataUrlCache) return dockBaseIconDataUrlCache;
+  for (const candidate of getDockBaseIconCandidates()) {
+    try {
+      if (!candidate || !fs.existsSync(candidate)) continue;
+      const image = nativeImage.createFromPath(candidate);
+      if (!image || image.isEmpty()) continue;
+      const normalized = image.resize({ width: 512, height: 512, quality: 'best' });
+      const dataUrl = (normalized && !normalized.isEmpty() ? normalized : image).toDataURL();
+      if (typeof dataUrl === 'string' && dataUrl.startsWith('data:image/')) {
+        dockBaseIconPathCache = candidate;
+        dockBaseIconDataUrlCache = dataUrl;
+        console.log('[DockBadge] base icon loaded from ' + candidate);
+        return dockBaseIconDataUrlCache;
+      }
+    } catch (error) {
+      console.warn('[DockBadge] base icon data-url failed path=' + candidate + ' error=' + (error?.message || error));
+    }
+  }
+  return null;
+}
+
+function resetDockIcon() {
+  if (process.platform !== 'darwin' || !app.dock) return false;
+  try { app.setBadgeCount(0); } catch {}
+  try { app.dock.setBadge(''); } catch {}
+  try {
+    const baseImage = getDockBaseIconImage();
+    if (baseImage && !baseImage.isEmpty()) {
+      app.dock.setIcon(baseImage);
+      return true;
+    }
+    if (dockBaseIconPathCache) {
+      app.dock.setIcon(dockBaseIconPathCache);
+      return true;
+    }
+  } catch (error) {
+    console.warn('[DockBadge] reset failed:', error?.message || error);
+  }
+  return false;
+}
+
+ipcMain.handle('dock:get-base-icon-data-url', () => {
+  if (process.platform !== 'darwin' || !app.dock) {
+    return { success: false, unavailable: true };
+  }
+  const dataUrl = getDockBaseIconDataUrl();
+  return dataUrl
+    ? { success: true, dataUrl }
+    : { success: false, error: 'base-icon-unavailable' };
+});
+
+ipcMain.handle('dock:set-icon-data-url', (_event, payload = {}) => {
+  if (process.platform !== 'darwin' || !app.dock) {
+    return { success: false, unavailable: true };
+  }
+  const dataUrl = typeof payload.dataUrl === 'string' ? payload.dataUrl : '';
+  if (!dataUrl.startsWith('data:image/')) {
+    return { success: false, error: 'invalid-data-url' };
+  }
+  try {
+    const image = nativeImage.createFromDataURL(dataUrl);
+    if (!image || image.isEmpty()) return { success: false, error: 'empty-image' };
+    try { app.setBadgeCount(0); } catch {}
+    try { app.dock.setBadge(''); } catch {}
+    app.dock.setIcon(image);
+    return { success: true };
+  } catch (error) {
+    console.warn('[DockBadge] set icon failed:', error?.message || error);
+    return { success: false, error: String(error?.message || error) };
+  }
+});
+
+ipcMain.handle('dock:reset-icon', () => ({ success: resetDockIcon() }));
 const terminalCommandState = new Map(); // tabId -> { isRunning: boolean, lastExitCode: number, lastCommand?: string, lastCommandAt?: number, lastCommandCwd?: string }
 const terminalInputLineBuffers = new Map(); // tabId -> best-effort shell input line for "run last project command"
 const terminalInputEscapeStates = new Map(); // tabId -> pending ANSI input sequence state
@@ -1949,6 +2053,62 @@ ipcMain.on('agent:tui-ready-internal', (_event, payload = {}) => {
   scheduleProjectActivityBroadcast(toolType + '-ready');
 });
 
+ipcMain.on('claude:startup-defaults-gate', (_event, payload = {}) => {
+  const tabId = String(payload?.tabId || '');
+  if (!tabId) return;
+  if (payload?.status === 'cleared') {
+    const reason = 'startup-defaults-cleared';
+    console.log('[ClaudeStartupDefaultsGate] tab=' + String(tabId).slice(-12)
+      + ' status=cleared session=nil reason=' + String(payload?.reason || '-')
+      + ' error=-');
+    try {
+      const persisted = projectManager?.db?.db?.prepare(
+        'SELECT project_id FROM tabs WHERE tab_id = ? LIMIT 1'
+      ).get(tabId) || null;
+      if (persisted?.project_id) scheduleProjectLayoutBroadcast(persisted.project_id, reason);
+      else scheduleProjectActivityBroadcast(reason);
+    } catch {
+      scheduleProjectActivityBroadcast(reason);
+    }
+    return;
+  }
+  const status = payload?.status === 'ready'
+    ? 'ready'
+    : (payload?.status === 'failed' ? 'failed' : 'pending');
+  const sessionId = bridgeKnownSessions.get(tabId) || null;
+  const snapshotStatus = status === 'ready' ? 'active' : 'starting';
+  const reason = 'startup-defaults-' + status;
+  console.log('[ClaudeStartupDefaultsGate] tab=' + String(tabId).slice(-12)
+    + ' status=' + status
+    + ' session=' + (sessionId ? String(sessionId).slice(0, 8) : 'nil')
+    + ' reason=' + String(payload?.reason || '-')
+    + ' error=' + String(payload?.error || '-'));
+  _webBroadcast(tabId, {
+    type: 'snapshot',
+    sessionId,
+    busy: false,
+    sessionStatus: snapshotStatus,
+    starting: snapshotStatus === 'starting',
+    stopping: false,
+    inputReady: status === 'ready',
+    toolType: 'claude',
+    commandType: 'claude',
+    startupDefaultsPending: status === 'pending',
+    startupDefaultsReady: status === 'ready',
+    startupDefaultsError: status === 'failed' ? String(payload?.error || payload?.reason || 'startup-defaults-failed') : null,
+    reason,
+  });
+  try {
+    const persisted = projectManager?.db?.db?.prepare(
+      'SELECT project_id FROM tabs WHERE tab_id = ? LIMIT 1'
+    ).get(tabId) || null;
+    if (persisted?.project_id) scheduleProjectLayoutBroadcast(persisted.project_id, reason);
+    else scheduleProjectActivityBroadcast(reason);
+  } catch {
+    scheduleProjectActivityBroadcast(reason);
+  }
+});
+
 function scheduleProjectLayoutBroadcast(projectId, reason = 'tab-layout') {
   if (projectId) projectLayoutChangedIds.add(projectId);
   scheduleProjectActivityBroadcast(reason);
@@ -3139,7 +3299,37 @@ function getAiRuntimeSessionId(tabId, toolType) {
 
 function broadcastAiRuntimeStatus(tabId, toolType, sessionStatus, reason) {
   if (!tabId || (toolType !== 'claude' && toolType !== 'codex')) return;
-  const sessionId = sessionStatus === 'inactive' ? null : getAiRuntimeSessionId(tabId, toolType);
+  let sessionId = sessionStatus === 'inactive' ? null : getAiRuntimeSessionId(tabId, toolType);
+  let transcriptState = {};
+  if (toolType === 'claude') {
+    let persisted = null;
+    try {
+      persisted = projectManager?.db?.db?.prepare(
+        'SELECT project_id, claude_session_id, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
+      ).get(tabId) || null;
+    } catch {}
+    const materializationSessionId = persisted?.claude_session_id || bridgeKnownSessions.get(tabId) || null;
+    let materialization = null;
+    if (materializationSessionId && getSessionMaterialization) {
+      try {
+        materialization = getSessionMaterialization(materializationSessionId, persisted?.cwd || process.cwd());
+      } catch (err) {
+        console.warn('[AiRuntimeStatus] materialization check failed tab=' + String(tabId).slice(-12) + ' session=' + String(materializationSessionId).slice(0, 8) + ' err=' + (err?.message || String(err)));
+      }
+    }
+    const conversationMaterialized = materialization?.materialized === true;
+    if (!sessionId && materializationSessionId) sessionId = materializationSessionId;
+    transcriptState = {
+      conversationMaterialized,
+      canResume: sessionStatus === 'inactive' && conversationMaterialized,
+      canCopySessionId: conversationMaterialized,
+      timelineCount: typeof materialization?.timelineCount === 'number' ? materialization.timelineCount : null,
+      materializationReason: materialization?.reason || null,
+    };
+    if (sessionStatus === 'inactive' && persisted?.project_id) {
+      scheduleProjectLayoutBroadcast(persisted.project_id, 'claude-runtime-inactive');
+    }
+  }
   _webBroadcast(tabId, {
     type: 'snapshot',
     sessionId,
@@ -3151,6 +3341,7 @@ function broadcastAiRuntimeStatus(tabId, toolType, sessionStatus, reason) {
     toolType,
     commandType: toolType,
     reason,
+    ...transcriptState,
   });
 }
 
@@ -10290,6 +10481,15 @@ ipcMain.handle('claude:get-bridge-metadata', (event, tabId) => {
 
 ipcMain.handle('claude:get-presence', (event, tabId) => {
   const hasBridge = bridgeKnownSessions.has(tabId);
+  const persisted = (() => {
+    try {
+      return projectManager?.db?.db?.prepare(
+        'SELECT claude_session_id, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
+      ).get(tabId) || null;
+    } catch {
+      return null;
+    }
+  })();
   // BUSY = "Claude is generating a turn right now", NOT "Claude is alive" and
   // NOT "the glyph-spinner blinked". This status drives the MOBILE COMPOSER's
   // Send↔Stop swap — the button is a TURN/loader control, so busy must be the
@@ -10333,7 +10533,25 @@ ipcMain.handle('claude:get-presence', (event, tabId) => {
     else status = 'starting'; // Claude process exists but TUI hasn't drawn the prompt yet
   } else if (startupIntentFresh) status = 'starting';
   else status = 'inactive';
-  return { status, hasBridge, isBusy, hasTerm, inputReady: status === 'stopping' ? false : inputReady, awaiting };
+  const materializationSessionId = persisted?.claude_session_id || bridgeKnownSessions.get(tabId) || null;
+  const materialization = materializationSessionId && getSessionMaterialization
+    ? getSessionMaterialization(materializationSessionId, persisted?.cwd || null)
+    : null;
+  const conversationMaterialized = materialization?.materialized === true;
+  return {
+    status,
+    hasBridge,
+    isBusy,
+    hasTerm,
+    inputReady: status === 'stopping' ? false : inputReady,
+    awaiting,
+    sessionId: materializationSessionId,
+    conversationMaterialized,
+    canResume: status === 'inactive' && conversationMaterialized,
+    canCopySessionId: conversationMaterialized,
+    timelineCount: typeof materialization?.timelineCount === 'number' ? materialization.timelineCount : null,
+    materializationReason: materialization?.reason || null,
+  };
 });
 
 ipcMain.handle('agent:get-stopping-state', async (_event, tabId) => {
@@ -16040,6 +16258,49 @@ async function stopAiProcessInTab(tabId, options = {}) {
       finalizeStoppedAiCommandState(tabId, stopReason, { processName: 'codex', forceEvent: true });
       return finishStop({ success: true, processName: 'codex', noProcess: true }, true);
     }
+    const isClaudeRuntime = requestedToolType === 'claude'
+      || rowCommandType === 'claude'
+      || bridgeKnownSessions.has(tabId)
+      || claudeCliActive.has(tabId)
+      || claudePromptReady.has(tabId)
+      || claudeStartupIntents.has(tabId)
+      || claudeTurnBusy.get(tabId) === true
+      || claudeSpinnerBusy.get(tabId) === true
+      || claudeLocalCommandWatchers.has(tabId);
+    if (isClaudeRuntime) {
+      const wasBusy = claudeSpinnerBusy.get(tabId) === true
+        || claudeTurnBusy.get(tabId) === true
+        || claudeLocalCommandWatchers.has(tabId);
+      clearTimeout(claudeSpinnerIdleTimer.get(tabId));
+      claudeSpinnerIdleTimer.delete(tabId);
+      clearTimeout(claudeTurnWatchdog.get(tabId));
+      claudeTurnWatchdog.delete(tabId);
+      claudeSpinnerLastSeenAt.delete(tabId);
+      stopClaudeLocalCommandWatcher(tabId, stopReason);
+      claudeSpinnerBusy.set(tabId, false);
+      claudeTurnBusy.set(tabId, false);
+      claudeHookLastEvent.set(tabId, {
+        event: 'ManualStopNoProcess',
+        ts: Date.now(),
+        sessionId: bridgeKnownSessions.get(tabId) || null,
+      });
+      recordActivity(tabId, false, 'claude');
+      if (wasBusy && mainWindow && !mainWindow.isDestroyed()) {
+        console.log('[StopAI] Tab ' + tabId + ': Claude no-process busy-state cleanup → false');
+        mainWindow.webContents.send('claude:busy-state', { tabId, busy: false, reason: 'manual-stop' });
+        mainWindow.webContents.send('claude:turn-state', {
+          tabId,
+          sessionId: bridgeKnownSessions.get(tabId) || null,
+          event: 'ManualStopNoProcess',
+          busy: false, success: false, lastAssistantMessage: null,
+        });
+      }
+      stopInterruptWatcher(tabId);
+      claudeCliActive.delete(tabId);
+      clearBridgeTab(tabId);
+      finalizeStoppedAiCommandState(tabId, stopReason, { processName: 'claude', forceEvent: true });
+      return finishStop({ success: true, processName: 'claude', noProcess: true }, true);
+    }
     return finishStop({ success: false, error: 'no AI process found' }, false);
   }
 
@@ -16747,6 +17008,26 @@ ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
   if (term) {
     // Enable thinking mode detection (will send Tab when '>' prompt appears)
     claudeState.set(tabId, 'WAITING_PROMPT');
+    clearClaudeEditableLastPrompt(tabId, 'claude-spawn-with-watcher');
+    clearAiStopping(tabId, 'claude-spawn-with-watcher');
+    claudeStartupIntents.set(tabId, { sessionId: null, at: Date.now(), reason: 'claude-spawn-with-watcher' });
+    const state = terminalCommandState.get(tabId) || { isRunning: false, lastCommand: null };
+    state.isRunning = true;
+    terminalCommandState.set(tabId, state);
+    claudeCliActive.set(tabId, true);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('terminal:command-started', { tabId, commandType: 'claude' });
+    }
+    _webBroadcast(tabId, {
+      type: 'snapshot',
+      sessionId: null,
+      busy: false,
+      sessionStatus: 'starting',
+      starting: true,
+      inputReady: false,
+      toolType: 'claude',
+      commandType: 'claude',
+    });
     term.write('claude --dangerously-skip-permissions\r');
   }
   // Session ID will be detected by SessionBridge (via StatusLine)
@@ -21426,7 +21707,37 @@ function _notifyClaudeSession(tabId, sessionId) {
   // sending it through the WS protocol lets the phone update without waiting
   // for the next /status poll.
   if (!aiStoppingTabs.has(tabId)) {
-    _webBroadcast(tabId, { type: 'snapshot', sessionId, busy: false, sessionStatus: 'active' });
+    let persisted = null;
+    try {
+      persisted = projectManager?.db?.db?.prepare(
+        'SELECT cwd FROM tabs WHERE tab_id = ? LIMIT 1'
+      ).get(tabId) || null;
+    } catch {}
+    let materialization = null;
+    try {
+      materialization = getSessionMaterialization(sessionId, persisted?.cwd || process.cwd());
+    } catch (err) {
+      console.warn('[ClaudeSessionNotify] materialization check failed tab=' + String(tabId).slice(-12) + ' session=' + String(sessionId).slice(0, 8) + ' err=' + (err?.message || String(err)));
+    }
+    const conversationMaterialized = materialization?.materialized === true;
+    const busy = claudeTurnBusy.get(tabId) === true || claudeLocalCommandWatchers.has(tabId);
+    const promptReady = claudePromptReady.has(tabId);
+    const sessionStatus = busy ? 'busy' : (promptReady ? 'active' : 'starting');
+    _webBroadcast(tabId, {
+      type: 'snapshot',
+      sessionId,
+      busy,
+      sessionStatus,
+      starting: sessionStatus === 'starting',
+      inputReady: promptReady && !busy,
+      toolType: 'claude',
+      commandType: 'claude',
+      conversationMaterialized,
+      canResume: false,
+      canCopySessionId: conversationMaterialized,
+      timelineCount: typeof materialization?.timelineCount === 'number' ? materialization.timelineCount : null,
+      materializationReason: materialization?.reason || null,
+    });
   }
 }
 
@@ -21442,32 +21753,11 @@ function _notifyClaudeSession(tabId, sessionId) {
 function isResumableSession(sessionUuid, cwd) {
   if (!sessionUuid) return false;
   try {
-    // Use existing findSessionFile — it knows Claude's slug rules and also
-    // scans ALL projects when the cwd-based slug doesn't match (handles
-    // moved/renamed project paths). Hand-rolling slug as `'-' + cwd.replace(/\//g, '-')`
-    // produced a DOUBLE leading dash (`--Users-fedor-...`), which never matched
-    // any real project dir → every resume check failed → every turn started
-    // fresh → infinite loop of zero-context sessions. Logs showed:
-    //   sessionId captured: ee6e0db6
-    //   send-message resume=ee6e0db6 → "stale" → starting fresh
-    //   sessionId captured: 5acd120b
-    //   send-message resume=5acd120b → "stale" → starting fresh
-    // Even though both JSONLs existed AND contained user/assistant records.
-    const found = findSessionFile(sessionUuid, cwd || process.cwd());
-    if (!found) return false;
-    // Cheap read: stop after first user/assistant line. Files we ourselves
-    // wrote (ai-title/last-prompt/queue-operation only) are not resumable
-    // for SDK — Claude needs at least one user OR assistant record.
-    const data = fs.readFileSync(found.filePath, 'utf8');
-    const lines = data.split('\n');
-    for (const line of lines) {
-      if (!line) continue;
-      try {
-        const obj = JSON.parse(line);
-        if (obj && (obj.type === 'user' || obj.type === 'assistant')) return true;
-      } catch { /* skip malformed */ }
-    }
-    return false;
+    // Use the same materialization contract as PTY/mobile: a UUID or JSONL file
+    // is not enough. Resume is allowed only after user-visible Timeline entries
+    // exist, which filters out pre-prompt mode/permission metadata files.
+    const materialization = getSessionMaterialization(sessionUuid, cwd || process.cwd());
+    return materialization?.materialized === true;
   } catch (err) {
     console.warn('[ClaudeSDK] isResumableSession check failed:', err.message);
     return false;

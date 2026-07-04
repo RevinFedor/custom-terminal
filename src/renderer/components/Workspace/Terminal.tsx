@@ -161,6 +161,7 @@ const _modelSentForTab = new Map<string, { at: number; via: string; model: strin
 const _claudeBridgeModelByTab = new Map<string, { model: string; at: number }>();
 const _claudeStartupDefaultsInflight = new Map<string, Promise<void>>();
 const _claudeStartupDefaultsRecoveryInflight = new Map<string, Promise<void>>();
+const _claudeVisibleSettingsDialogConfirmCooldown = new Map<string, number>();
 
 function _bridgeModelMatchesTarget(targetModel: string, bridgeModel: string | null | undefined): boolean {
   const target = String(targetModel || '').trim().toLowerCase();
@@ -174,6 +175,52 @@ function _bridgeModelMatchesTarget(targetModel: string, bridgeModel: string | nu
   const needles = [target, option?.label?.toLowerCase()]
     .filter((v): v is string => !!v && v !== 'default');
   return needles.some((needle) => live.includes(needle));
+}
+
+function detectClaudeSettingsDialogFromVisibleText(text: string): 'ModelDialog' | 'EffortDialog' | null {
+  const normalized = String(text || '').replace(/\u00a0/g, ' ');
+  if (!normalized.trim()) return null;
+  const compact = normalized.replace(/\s+/g, '');
+  if (/Changeeffortlevel\?/i.test(compact)) return 'EffortDialog';
+  if (/Switchmodel\?/i.test(compact)) return 'ModelDialog';
+  if (/(?:❯|>)1\.Yes,?switchto/i.test(compact)) return 'ModelDialog';
+  return null;
+}
+
+function confirmClaudeSettingsDialogFromVisibleText(tabId: string, label: string): boolean {
+  const text = terminalRegistry.getVisibleText(tabId);
+  const dialogType = detectClaudeSettingsDialogFromVisibleText(text);
+  if (!dialogType) return false;
+
+  const now = Date.now();
+  const key = tabId + ':' + dialogType;
+  const last = _claudeVisibleSettingsDialogConfirmCooldown.get(key) || 0;
+  if (now - last < 8000) return true;
+
+  _claudeVisibleSettingsDialogConfirmCooldown.set(key, now);
+  const preview = text.replace(/\s+/g, ' ').trim().slice(-180);
+  console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12)
+    + ' visible ' + dialogType
+    + ' confirm label=' + label
+    + ' preview=' + preview);
+  ipcRenderer.send('terminal:input', tabId, '\r');
+  return true;
+}
+
+async function withClaudeVisibleSettingsDialogAutoConfirm<T>(
+  tabId: string,
+  label: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  confirmClaudeSettingsDialogFromVisibleText(tabId, label + ':initial');
+  const timer = window.setInterval(() => {
+    confirmClaudeSettingsDialogFromVisibleText(tabId, label + ':poll');
+  }, 250);
+  try {
+    return await work();
+  } finally {
+    window.clearInterval(timer);
+  }
 }
 
 function _effortDiag(tabId: string, label: string, extra?: string) {
@@ -755,11 +802,15 @@ function maybeRecoverClaudeStartupDefaultsAfterLateModelBridge(tabId: string, li
         armPromptBoundaryOnSubmit: true,
       });
       if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
-      await waitForClaudeStartupPromptBoundaryWithRecovery(
+      await withClaudeVisibleSettingsDialogAutoConfirm(
         tabId,
-        promptSeqBeforeEffort,
-        '/effort ' + eff,
-        'after /effort ' + eff + ' (bridge-late)'
+        'bridge-late-effort',
+        () => waitForClaudeStartupPromptBoundaryWithRecovery(
+          tabId,
+          promptSeqBeforeEffort,
+          '/effort ' + eff,
+          'after /effort ' + eff + ' (bridge-late)'
+        )
       );
       console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12)
         + ' late bridge model recovered gate and effort completed');
@@ -895,8 +946,8 @@ async function finalizeAiLaunchSnapshot(tabId: string) {
       console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=codex result=no-session-id → keep (watcher may still detect rollout)');
       return;
     }
-    console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=' + snapshot.sessionType + ' result=no-session-id → rollback');
-    store.rollbackUnmaterializedAiLaunch(tabId, 'no-session-id-after-finish');
+    console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=' + snapshot.sessionType + ' result=no-session-id → discard session artifact');
+    store.discardUnmaterializedAiLaunchSession(tabId, 'no-session-id-after-finish');
     return;
   }
 
@@ -913,7 +964,8 @@ async function finalizeAiLaunchSnapshot(tabId: string) {
     const entries = Array.isArray(result?.entries) ? result.entries.length : -1;
     console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=' + snapshot.sessionType + ' sid=' + tabInfo.sessionId.slice(0, 8) + ' success=' + !!result?.success + ' entries=' + entries + (result?.error ? ' error=' + result.error : ''));
     if (result?.success && entries === 0) {
-      store.rollbackUnmaterializedAiLaunch(tabId, 'empty-timeline-after-finish');
+      console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=' + snapshot.sessionType + ' result=empty-timeline → discard session artifact');
+      store.discardUnmaterializedAiLaunchSession(tabId, 'empty-timeline-after-finish');
     } else {
       store.clearAiLaunchSnapshot(tabId, 'timeline-entries=' + entries);
     }
@@ -1047,6 +1099,12 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     };
     const onFinished = (_: any, data: { tabId: string }) => {
       if (data.tabId === tabId) {
+        const wasAlive = claudeProcessAliveRef.current;
+        const launchSnapshot = useWorkspaceStore.getState().getAiLaunchSnapshot(tabId);
+        if (!wasAlive && launchSnapshot) {
+          console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' command-finished ignored before alive for launch snapshot type=' + launchSnapshot.sessionType);
+          return;
+        }
         console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' command-finished → alive=false');
         claudeProcessAliveRef.current = false;
         setClaudeProcessAlive(false);
@@ -1430,6 +1488,8 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         _effortSentForTab.delete(tabId);
         _modelSentForTab.delete(tabId);
         _claudeBridgeModelByTab.delete(tabId);
+        _claudeVisibleSettingsDialogConfirmCooldown.delete(tabId + ':ModelDialog');
+        _claudeVisibleSettingsDialogConfirmCooldown.delete(tabId + ':EffortDialog');
         clearClaudeStartupDefaultsGate(tabId);
       }
     };
@@ -1605,13 +1665,21 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
               armPromptBoundaryOnSubmit: true,
             });
             if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
-            let bridgeWait = await waitForClaudeStartupModelBridge(tabId, model);
+            let bridgeWait = await withClaudeVisibleSettingsDialogAutoConfirm(
+              tabId,
+              'bridge-model',
+              () => waitForClaudeStartupModelBridge(tabId, model)
+            );
             if (bridgeWait === 'timeout') {
               bridgeWait = await retryStuckClaudeStartupSlashCommand(
                 tabId,
                 '/model ' + model,
                 'bridge-model',
-                () => waitForClaudeStartupModelBridge(tabId, model, 3500)
+                () => withClaudeVisibleSettingsDialogAutoConfirm(
+                  tabId,
+                  'bridge-model:retry',
+                  () => waitForClaudeStartupModelBridge(tabId, model, 3500)
+                )
               );
             }
             if (bridgeWait === 'timeout') {
@@ -1678,11 +1746,15 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           armPromptBoundaryOnSubmit: true,
         });
         if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
-        await waitForClaudeStartupPromptBoundaryWithRecovery(
+        await withClaudeVisibleSettingsDialogAutoConfirm(
           tabId,
-          promptSeqBeforeEffort,
-          '/effort ' + eff,
-          'after /effort ' + eff + ' (bridge-fresh)'
+          'bridge-effort',
+          () => waitForClaudeStartupPromptBoundaryWithRecovery(
+            tabId,
+            promptSeqBeforeEffort,
+            '/effort ' + eff,
+            'after /effort ' + eff + ' (bridge-fresh)'
+          )
         );
         _effortDiag(tabId, '✅ INJECT COMPLETED', '/effort ' + eff + ' — Claude acknowledged');
       } catch (e: unknown) {
@@ -1718,13 +1790,21 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
               armPromptBoundaryOnSubmit: true,
             });
             if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
-            let bridgeWait = await waitForClaudeStartupModelBridge(tabId, model);
+            let bridgeWait = await withClaudeVisibleSettingsDialogAutoConfirm(
+              tabId,
+              'tui-model',
+              () => waitForClaudeStartupModelBridge(tabId, model)
+            );
             if (bridgeWait === 'timeout') {
               bridgeWait = await retryStuckClaudeStartupSlashCommand(
                 tabId,
                 '/model ' + model,
                 'tui-model',
-                () => waitForClaudeStartupModelBridge(tabId, model, 3500)
+                () => withClaudeVisibleSettingsDialogAutoConfirm(
+                  tabId,
+                  'tui-model:retry',
+                  () => waitForClaudeStartupModelBridge(tabId, model, 3500)
+                )
               );
             }
             if (bridgeWait === 'timeout') {
@@ -1768,11 +1848,15 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             armPromptBoundaryOnSubmit: true,
           });
           if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
-          await waitForClaudeStartupPromptBoundaryWithRecovery(
+          await withClaudeVisibleSettingsDialogAutoConfirm(
             tabId,
-            promptSeqBeforeEffort,
-            '/effort ' + eff,
-            'after /effort ' + eff
+            'tui-effort',
+            () => waitForClaudeStartupPromptBoundaryWithRecovery(
+              tabId,
+              promptSeqBeforeEffort,
+              '/effort ' + eff,
+              'after /effort ' + eff
+            )
           );
           console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /effort ' + eff + ' completed — startup defaults ready');
           _effortDiag(tabId, '✅ INJECT COMPLETED', '/effort ' + eff + ' — Claude acknowledged');

@@ -1,4 +1,4 @@
-const { ipcMain } = require('electron');
+const { ipcMain, shell } = require('electron');
 const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -132,12 +132,20 @@ async function getStatusForRoot(root) {
   if (!statusResult.success) throw new Error(statusResult.stderr || statusResult.error || 'git status failed');
   const parsed = parseStatus(statusResult.stdout);
   const remoteResult = await runGit(root, ['config', '--get', 'remote.origin.url']);
+  const userNameResult = await runGit(root, ['config', '--get', 'user.name']);
+  const userEmailResult = await runGit(root, ['config', '--get', 'user.email']);
+  const credentialHelperResult = await runGit(root, ['config', '--get', 'credential.helper']);
+  const remote = remoteResult.success ? remoteResult.stdout.trim() : '';
   const repoName = path.basename(root);
   return {
     isRepo: true,
     repoRoot: root,
     repoName,
-    remote: remoteResult.success ? remoteResult.stdout.trim() : '',
+    remote,
+    remoteInfo: parseRemoteInfo(remote),
+    userName: userNameResult.success ? userNameResult.stdout.trim() : '',
+    userEmail: userEmailResult.success ? userEmailResult.stdout.trim() : '',
+    credentialHelper: credentialHelperResult.success ? credentialHelperResult.stdout.trim() : '',
     branch: parsed.branch,
     upstream: parsed.upstream,
     ahead: parsed.ahead,
@@ -452,6 +460,82 @@ function usageTotal(usage) {
 
 function authError(stderrOrError) {
   return /Authentication failed|Permission denied|could not read Username|Repository not found|password authentication|terminal prompts disabled|access denied|publickey|not authorized|403|401/i.test(String(stderrOrError || ''));
+}
+
+function trimGitSuffix(value) {
+  return String(value || '').replace(/\/+$/, '').replace(/\.git$/i, '');
+}
+
+function remoteProvider(host) {
+  const normalized = String(host || '').toLowerCase();
+  if (normalized.includes('github.')) return { key: 'github', label: 'GitHub' };
+  if (normalized.includes('gitlab')) return { key: 'gitlab', label: 'GitLab' };
+  return { key: normalized ? 'git' : 'none', label: normalized ? 'Git remote' : 'No remote' };
+}
+
+function sanitizeRemoteUrl(remoteUrl) {
+  const raw = String(remoteUrl || '').trim();
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    parsed.username = '';
+    parsed.password = '';
+    return parsed.toString().replace(/\/$/, '');
+  } catch (_) {
+    return raw.replace(/:\/\/[^/@]+@/, '://').replace(/^([^@\s]+)@([^:\s]+):/, '$2:');
+  }
+}
+
+function parseRemoteInfo(remoteUrl) {
+  const raw = String(remoteUrl || '').trim();
+  if (!raw) {
+    return {
+      provider: 'none',
+      providerLabel: 'No remote',
+      protocol: '',
+      host: '',
+      path: '',
+      displayUrl: '',
+      webUrl: '',
+    };
+  }
+
+  const safeUrl = sanitizeRemoteUrl(raw);
+  let protocol = 'git';
+  let host = '';
+  let repoPath = '';
+  let webUrl = '';
+
+  try {
+    const parsed = new URL(raw);
+    protocol = parsed.protocol.replace(/:$/, '').toLowerCase();
+    host = parsed.hostname;
+    repoPath = decodeURIComponent(trimGitSuffix(parsed.pathname.replace(/^\/+/, '')));
+    if (host && repoPath && (protocol === 'http' || protocol === 'https' || protocol === 'ssh' || protocol === 'git')) {
+      webUrl = `https://${host}/${repoPath}`;
+    }
+  } catch (_) {
+    const scpLike = raw.match(/^(?:([^@\s]+)@)?([^:\s]+):(.+)$/);
+    if (scpLike) {
+      protocol = 'ssh';
+      host = scpLike[2];
+      repoPath = trimGitSuffix(scpLike[3]);
+      webUrl = host && repoPath ? `https://${host}/${repoPath}` : '';
+    } else {
+      repoPath = trimGitSuffix(raw);
+    }
+  }
+
+  const provider = remoteProvider(host);
+  return {
+    provider: provider.key,
+    providerLabel: provider.label,
+    protocol,
+    host,
+    path: repoPath,
+    displayUrl: safeUrl,
+    webUrl,
+  };
 }
 
 async function listBranches(root) {
@@ -863,6 +947,21 @@ function register({ projectManager }) {
         });
       });
       return result;
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('git:open-remote', async (event, { projectPath }) => {
+    try {
+      const root = await getRepoRoot(projectPath);
+      if (!root) throw new Error('Not a Git repository');
+      const remoteResult = await runGit(root, ['config', '--get', 'remote.origin.url']);
+      const remote = remoteResult.success ? remoteResult.stdout.trim() : '';
+      const info = parseRemoteInfo(remote);
+      if (!info.webUrl) throw new Error('Remote URL is not openable');
+      await shell.openExternal(info.webUrl);
+      return { success: true, url: info.webUrl };
     } catch (error) {
       return { success: false, error: error.message };
     }

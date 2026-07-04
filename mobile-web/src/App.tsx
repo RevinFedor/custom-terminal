@@ -1370,12 +1370,53 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
   // For PTY+Claude tabs only: lifecycle of the Claude CLI process inside the PTY.
   // null = SDK tab (status concept doesn't apply). Polled on mount + after every
   // /resume + after /stop. WS snapshot also updates it on connect.
-  const [claudeStatus, setClaudeStatus] = useState<'active' | 'busy' | 'inactive' | 'starting' | null>(
+  const [claudeStatus, setClaudeStatus] = useState<'active' | 'busy' | 'inactive' | 'starting' | 'stopping' | null>(
     tab.commandType === 'claude' ? (tab.sessionStatus || null) : null,
   );
   const [resuming, setResuming] = useState(false);
   const [stopping, setStopping] = useState(false);
   const isClaudePtyTab = tab.commandType === 'claude' && tab.tabType !== 'claude-sdk';
+  const initialClaudeConversationMaterialized =
+    tab.conversationMaterialized === true
+    || tab.canResume === true
+    || tab.canCopySessionId === true
+    || (typeof tab.timelineCount === 'number' && tab.timelineCount > 0);
+  const [claudeConversationMaterialized, setClaudeConversationMaterialized] = useState(initialClaudeConversationMaterialized);
+  const [claudeMaterializationReason, setClaudeMaterializationReason] = useState<string | null>(tab.materializationReason || null);
+  const hasClaudeSessionId = !!(tab.claudeSessionId || sessionId);
+  const hasClaudeSessionArtifact = isClaudePtyTab && hasClaudeSessionId && claudeConversationMaterialized;
+  const showClaudeResumeBanner = !readOnly && hasClaudeSessionArtifact && (claudeStatus === 'inactive' || resuming);
+
+  const applyClaudeMaterialization = useCallback((payload: any, source: string) => {
+    if (!isClaudePtyTab || !payload) return;
+    const hasMaterializationField =
+      Object.prototype.hasOwnProperty.call(payload, 'conversationMaterialized')
+      || Object.prototype.hasOwnProperty.call(payload, 'canResume')
+      || Object.prototype.hasOwnProperty.call(payload, 'canCopySessionId')
+      || Object.prototype.hasOwnProperty.call(payload, 'timelineCount');
+    if (!hasMaterializationField) return;
+    const materialized =
+      payload.conversationMaterialized === true
+      || payload.canResume === true
+      || payload.canCopySessionId === true
+      || (typeof payload.timelineCount === 'number' && payload.timelineCount > 0);
+    const reason = payload.materializationReason || null;
+    setClaudeConversationMaterialized(materialized);
+    setClaudeMaterializationReason(reason);
+    Api.log('MobMaterialization', source, {
+      tabId: (tab.tabId || '').slice(-12),
+      materialized,
+      canResume: payload.canResume === true,
+      canCopySessionId: payload.canCopySessionId === true,
+      timelineCount: typeof payload.timelineCount === 'number' ? payload.timelineCount : null,
+      reason,
+    });
+  }, [isClaudePtyTab, tab.tabId]);
+
+  useEffect(() => {
+    setClaudeConversationMaterialized(initialClaudeConversationMaterialized);
+    setClaudeMaterializationReason(tab.materializationReason || null);
+  }, [initialClaudeConversationMaterialized, tab.materializationReason, tab.tabId]);
 
   // ── Prompt Queue ("Run after") — mobile mirror ───────────────────────────
   // We do NOT own the queue: `queue` is the live desktop core, refreshed on
@@ -1493,6 +1534,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
     const poll = () => Api.claudeStatus(tab.tabId!).then((d) => {
       if (cancelled || !d?.status) return;
       setClaudeStatus(d.status);
+      applyClaudeMaterialization(d, 'status-poll');
       // Reconcile the loader: the authoritative status says whether a turn is
       // actually in flight. Only force-correct on disagreement so we don't
       // fight an in-flight optimistic update on the same frame.
@@ -1503,21 +1545,13 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
     const id = setInterval(poll, 4000);
     return () => { cancelled = true; clearInterval(id); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab.tabId, isClaudePtyTab, sessionId]);
+  }, [tab.tabId, isClaudePtyTab, sessionId, applyClaudeMaterialization]);
 
-  // Resume/Stop loaders are driven by the SSE-sourced claudeStatus, NOT by the
-  // HTTP reply (which returns in ~20ms, long before Claude is actually up). No
-  // timeouts: the loader holds until the real lifecycle event arrives.
-  //   • Resume in flight → clears when status flips to active|busy (Claude TUI
-  //     rendered ⏵, broadcast via clearBridgeTab/ClaudePromptReady snapshot).
-  //   • Stop in flight   → clears when status flips to inactive (PTY-exit /
-  //     clearBridgeTab snapshot after the process actually died).
-  useEffect(() => {
-    if (resuming && (claudeStatus === 'active' || claudeStatus === 'busy')) {
-      Api.log('MobResume', 'loader-cleared', { tabId: (tab.tabId || '').slice(-12), status: claudeStatus });
-      setResuming(false);
-    }
-  }, [resuming, claudeStatus, tab.tabId]);
+  // Resume is cleared by the `/resume` response, not by the first `active` SSE.
+  // The server waits for runtime readiness AND Claude startup defaults
+  // (`/model` then `/effort`). A raw `active/inputReady` snapshot can arrive
+  // while those slash commands are still being applied, so treating it as final
+  // makes the composer and green markers appear too early.
   useEffect(() => {
     if (stopping && claudeStatus === 'inactive') {
       Api.log('MobStop', 'loader-cleared', { tabId: (tab.tabId || '').slice(-12), status: claudeStatus });
@@ -1527,24 +1561,44 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
 
   const onResume = async () => {
     if (!tab.tabId || resuming) return;
-    Api.log('MobResume', 'click', { tabId: tab.tabId.slice(-12), status: claudeStatus, ssid: (tab.claudeSessionId || sessionId || '').slice(0, 8) });
+    if (!hasClaudeSessionArtifact) {
+      Api.log('MobResume', 'blocked-empty-session', {
+        tabId: tab.tabId.slice(-12),
+        status: claudeStatus,
+        ssid: (tab.claudeSessionId || sessionId || '').slice(0, 8),
+        materialized: claudeConversationMaterialized,
+        reason: claudeMaterializationReason,
+      });
+      return;
+    }
+    Api.log('MobResume', 'click', { tabId: tab.tabId.slice(-12), status: claudeStatus, ssid: (tab.claudeSessionId || sessionId || '').slice(0, 8), materialized: claudeConversationMaterialized });
     setResuming(true);
     const t0 = performance.now();
     try {
       const r = await Api.resumeClaudeTab(tab.tabId);
-      Api.log('MobResume', 'reply-ok', { tabId: tab.tabId.slice(-12), elapsedMs: Math.round(performance.now() - t0), alreadyRunning: !!r?.alreadyRunning });
-      if (r?.alreadyRunning) {
-        // Claude was already live (mobile's SSE-derived status was stale vs the
-        // bridge's authoritative presence check). No fresh active-snapshot will
-        // arrive because the status never changed — clear the loader here and
-        // sync the local status, else the spinner would hang forever.
-        setClaudeStatus('active');
-        setResuming(false);
+      Api.log('MobResume', 'reply-ok', {
+        tabId: tab.tabId.slice(-12),
+        elapsedMs: Math.round(performance.now() - t0),
+        alreadyRunning: !!r?.alreadyRunning,
+        ready: r?.ready === true,
+        status: r?.status || null,
+        inputReady: r?.inputReady === true,
+        defaultsReady: r?.startupDefaultsReady === true,
+        defaultsPending: r?.startupDefaultsPending === true,
+        defaultsError: r?.startupDefaultsError || null,
+      });
+      if (r?.status) {
+        setClaudeStatus(r.status);
+        setBusy(r.status === 'busy');
       }
-      // Otherwise loader stays ON — cleared by the claudeStatus→active|busy
-      // effect when the SSE snapshot says Claude is really up.
+      applyClaudeMaterialization(r, 'resume-response');
+      setResuming(false);
     } catch (e: any) {
       Api.log('MobResume', 'reply-err', { tabId: tab.tabId.slice(-12), msg: String(e?.message || e) });
+      if (String(e?.message || e).includes('session_not_materialized')) {
+        setClaudeConversationMaterialized(false);
+        setClaudeMaterializationReason('session_not_materialized');
+      }
       setResuming(false); // HTTP itself failed — no lifecycle event will come
       alert('Resume failed: ' + e.message);
     }
@@ -2115,14 +2169,25 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
               innerType: inner?.type,
               role: inner?.message?.role,
               hasContent: Array.isArray(inner?.message?.content) ? inner.message.content.length : 0,
+              projection: m.projection?.kind,
+              transcript: m.projection?.transcript,
             });
           } else if (m.type === 'busy' || m.type === 'done') {
             scrollDiag('ws-msg', { type: m.type, busy: m.busy });
           }
           if (m.type === 'snapshot') {
-            Api.log('MobWS', 'snapshot', { tab: (tab.tabId || '').slice(-12), busy: !!m.busy, sessionStatus: m.sessionStatus, sid: (m.sessionId || '').slice(0, 8) });
+            Api.log('MobWS', 'snapshot', {
+              tab: (tab.tabId || '').slice(-12),
+              busy: !!m.busy,
+              sessionStatus: m.sessionStatus,
+              sid: (m.sessionId || '').slice(0, 8),
+              materialized: m.conversationMaterialized === true,
+              canResume: m.canResume === true,
+              timelineCount: typeof m.timelineCount === 'number' ? m.timelineCount : null,
+            });
             if (m.sessionId) setSessionId(m.sessionId);
             setBusy(!!m.busy);
+            applyClaudeMaterialization(m, 'sse-snapshot');
             // sessionStatus is set by the CLAUDE-tab fs-watcher snapshot when
             // a PTY+Claude tab is opened — gives the phone immediate truth
             // about active/busy/inactive without waiting for the periodic poll.
@@ -2168,14 +2233,32 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
           } else if (m.type === 'done') {
             Api.log('MobWS', 'done', { tab: (tab.tabId || '').slice(-12), sid: (m.sessionId || '').slice(0, 8) });
             setBusy(false);
-            if (m.sessionId) setSessionId(m.sessionId);
+            if (m.sessionId) {
+              setSessionId(m.sessionId);
+            }
             if (isClaudePtyTab) setClaudeStatus('active');
             // Turn ended naturally — clear in-flight refs so a later stop()
             // (no-op at this point) doesn't try to restore an old prompt.
             pendingPromptRef.current = null;
             assistantStartedThisTurnRef.current = false;
           } else if (m.type === 'message') {
-            if (m.sessionId) setSessionId(m.sessionId);
+            const isTranscriptMessage = m.projection?.transcript !== false;
+            if (m.sessionId) {
+              setSessionId(m.sessionId);
+              if (isClaudePtyTab && isTranscriptMessage) {
+                setClaudeConversationMaterialized(true);
+                setClaudeMaterializationReason(null);
+              }
+            }
+            if (!isTranscriptMessage) {
+              Api.log('MobWS', 'message-skip-projection', {
+                tab: (tab.tabId || '').slice(-12),
+                kind: m.projection?.kind,
+                entry: (m.projection?.entryId || '').slice(-8),
+                source: m.projection?.source,
+              });
+              return;
+            }
             const inner = m.message;
             if (inner?.message?.model) setResolvedModel(inner.message.model);
             if (inner?.message?.usage) {
@@ -2698,7 +2781,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
           resume we just kicked off is still coming up (resuming holds the
           banner+spinner through the inactive→starting→active transition so the
           loader doesn't blink out mid-launch). Cleared by the SSE status event. */}
-      {!readOnly && isClaudePtyTab && (tab.claudeSessionId || sessionId) && (claudeStatus === 'inactive' || resuming) && (
+      {showClaudeResumeBanner && (
         <div style={{
           borderTop: '1px solid #1f1f1f',
           background: '#0e0e0e',
@@ -2711,7 +2794,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
           )}
           <button
             onClick={onResume}
-            disabled={resuming || !tab.claudeSessionId}
+            disabled={resuming || !hasClaudeSessionArtifact}
             style={{
               width: '100%', padding: '14px 18px',
               borderRadius: 14, border: 'none',
@@ -2740,7 +2823,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
           carry their own progress UI). */}
       {!readOnly && busy && !pendingQuestion
         && !(isClaudePtyTab && claudeStatus === 'starting' && !resuming)
-        && !(isClaudePtyTab && (tab.claudeSessionId || sessionId) && (claudeStatus === 'inactive' || resuming)) && (
+        && !showClaudeResumeBanner && (
         <div style={{
           display: 'flex', alignItems: 'center', gap: 6,
           padding: '4px 16px 0', background: 'transparent',
@@ -2761,7 +2844,7 @@ function ChatView({ tab, onBack, readOnly = false }: { tab: TabInfo; onBack: () 
           onStop={() => answerQuestion({}, true)}
         />
       )}
-      {!readOnly && !pendingQuestion && !(isClaudePtyTab && claudeStatus === 'starting' && !resuming) && !(isClaudePtyTab && (tab.claudeSessionId || sessionId) && (claudeStatus === 'inactive' || resuming)) && (
+      {!readOnly && !pendingQuestion && !(isClaudePtyTab && claudeStatus === 'starting' && !resuming) && !showClaudeResumeBanner && (
         <Composer
           text={text}
           setText={setText}

@@ -119,6 +119,7 @@ const LOCAL_PROMPT_FAILURE_TTL_MS = 15000;
 const LOCAL_PROMPT_SENT_TTL_MS = 12000;
 const HISTORY_SCROLL_PIXEL_CAP_WARN_PX = 16_000_000;
 const REWIND_BUSY_GUARD_RE = /\bis (?:busy|starting); wait (?:for the current turn|until the current loader finishes) before rewind\b/i;
+const EMPTY_HISTORY_DRAFT_IMAGES: HistoryPromptDraftImageRef[] = [];
 
 const normalizeHistoryPromptText = (text: string) => String(text || '')
   .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
@@ -1506,7 +1507,10 @@ function AgentHistoryControls({
   const runtime = useMemo(() => getHistoryAgentRuntime(toolType), [toolType]);
   const [status, setStatus] = useState<AgentPtyStatus>('inactive');
   const prompt = useUIStore(useCallback((s) => s.historyPromptDrafts[tabId] || '', [tabId]));
-  const draftImages = useUIStore(useCallback((s) => s.historyPromptDraftImages[tabId] || [], [tabId]));
+  // Zustand/React store snapshots must be referentially stable. Returning `[]`
+  // here when the tab has no images creates a new snapshot on every read and
+  // can crash History with React #185 when AgentHistoryControls mounts.
+  const draftImages = useUIStore(useCallback((s) => s.historyPromptDraftImages[tabId] || EMPTY_HISTORY_DRAFT_IMAGES, [tabId]));
   const setHistoryPromptDraft = useUIStore((s) => s.setHistoryPromptDraft);
   const setPrompt = useCallback((
     next: string | ((prev: string) => string),
@@ -1525,6 +1529,8 @@ function AgentHistoryControls({
   const [pendingQuestion, setPendingQuestion] = useState<AgentPendingQuestion | null>(null);
   const [answeringQuestion, setAnsweringQuestion] = useState(false);
   const [questionError, setQuestionError] = useState<string | null>(null);
+  const [resumeMaterialized, setResumeMaterialized] = useState<boolean | null>(toolType === 'claude' ? null : true);
+  const [resumeUnavailableReason, setResumeUnavailableReason] = useState<string | null>(null);
   const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const tabIdRef = useRef(tabId);
   const statusRef = useRef<AgentPtyStatus>('inactive');
@@ -1601,6 +1607,14 @@ function AgentHistoryControls({
       const presence = await runtime.getPresence(tabId);
       if (tabIdRef.current !== requestTabId) return;
       setStatusFrom(presence.status, 'presence');
+      if (runtime.toolType === 'claude') {
+        const materialized = presence.conversationMaterialized === true || presence.canResume === true;
+        setResumeMaterialized(materialized);
+        setResumeUnavailableReason(materialized ? null : (presence.materializationReason || 'session_not_materialized'));
+      } else {
+        setResumeMaterialized(true);
+        setResumeUnavailableReason(null);
+      }
       if (presence.awaiting) {
         refreshPendingQuestion('presence-awaiting');
       } else if (pendingQuestionRef.current) {
@@ -1647,12 +1661,14 @@ function AgentHistoryControls({
     setPendingQuestion(null);
     setAnsweringQuestion(false);
     setQuestionError(null);
+    setResumeMaterialized(toolType === 'claude' ? null : true);
+    setResumeUnavailableReason(null);
     setStatusFrom('inactive', 'tab-bind');
     refreshPresence();
     return () => {
       clearEmptyDraftNoticeTimer();
     };
-  }, [clearEmptyDraftNoticeTimer, refreshPresence, setStatusFrom, tabId]);
+  }, [clearEmptyDraftNoticeTimer, refreshPresence, setStatusFrom, tabId, toolType]);
 
   useEffect(() => {
     const handleAgentError = (event: Event) => {
@@ -1991,7 +2007,14 @@ function AgentHistoryControls({
       if (kind === 'resume') {
         setStatusFrom('starting', 'resume-click');
         const result = await runtime.resume({ tabId, sessionId, cwd });
-        if (!result.success) throw new Error(result.error || 'Resume failed');
+        if (!result.success) {
+          if (runtime.toolType === 'claude' && result.error === 'session_not_materialized') {
+            setResumeMaterialized(false);
+            setResumeUnavailableReason(result.materializationReason || 'session_not_materialized');
+            throw new Error('Claude has no saved conversation yet');
+          }
+          throw new Error(result.error || 'Resume failed');
+        }
         if (tabIdRef.current !== actionTabId) return;
         if (result.alreadyRunning && result.status) setStatusFrom(result.status, 'resume-already-running');
       } else if (kind === 'send') {
@@ -2185,7 +2208,7 @@ function AgentHistoryControls({
   const canSend = canAcceptPrompt && prompt.trim().length > 0 && !pendingQuestion && !controlsLocked;
   const canGrabDraft = status === 'active' && !pendingQuestion && !controlsLocked;
   const canInterruptTurn = isTurnBusy && !controlsLocked;
-  const canResume = status === 'inactive' && !!sessionId && !busyAction;
+  const canResume = status === 'inactive' && !!sessionId && (runtime.toolType !== 'claude' || resumeMaterialized === true) && !busyAction;
   const canStopProcess = (status === 'active' || status === 'busy' || status === 'starting') && !busyAction;
   const derivedDraftWarning = useMemo(
     () => historyDraftImageWarning(toolType, prompt, draftImages),
@@ -2313,7 +2336,7 @@ function AgentHistoryControls({
         )}
         <div style={{ flex: 1 }} />
         {status === 'inactive' && (
-          <Tooltip content={'Resume ' + runtime.label + ' session'}>
+          <Tooltip content={canResume ? ('Resume ' + runtime.label + ' session') : (resumeUnavailableReason ? 'No saved Claude conversation yet' : 'Resume unavailable')}>
             <button
               aria-label={'Resume ' + runtime.label + ' session'}
               onClick={() => runAction('resume')}

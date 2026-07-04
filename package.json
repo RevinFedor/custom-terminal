@@ -35,6 +35,8 @@
     "files": [
       "dist/**/*",
       "src/main/**/*",
+      "build-resources/icon.png",
+      "build-resources/icon-dev.png",
       "mobile-web/dist/**/*",
       "package.json",
       "!logs/**"

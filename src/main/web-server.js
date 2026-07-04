@@ -53,6 +53,7 @@ const isInboxProjectId = (projectId) => projectId === INBOX_PROJECT_ID;
 let findSessionFile = null;
 let parseTimelineUuids = null;
 let parseTimelineEntries = null;
+let getClaudeSessionMaterialization = null;
 let claudeDataApi = null;
 let loadCodexSessionRecords = null;
 let buildCodexTimeline = null;
@@ -64,6 +65,7 @@ try {
   findSessionFile = cd.findSessionFile;
   parseTimelineUuids = cd.parseTimelineUuids;
   parseTimelineEntries = cd.parseTimelineEntries;
+  getClaudeSessionMaterialization = cd.getSessionMaterialization;
   claudeDataApi = cd._api || null;
 } catch (e) {
   console.warn('[WebServer] claude-data helpers not loaded:', e.message);
@@ -176,6 +178,36 @@ function startRoutePendingLog(prefix, startedAt, afterMs = 10_000) {
 function cleanOptionalString(value, fallback = '') {
   const s = value == null ? '' : String(value).trim();
   return s || fallback;
+}
+
+function claudeMaterializationFor(sessionId, cwd) {
+  if (!sessionId || !getClaudeSessionMaterialization) {
+    return {
+      materialized: false,
+      conversationMaterialized: false,
+      timelineCount: sessionId ? null : 0,
+      fileFound: false,
+      reason: sessionId ? 'materialization-helper-unavailable' : 'no-session-id',
+    };
+  }
+  try {
+    const result = getClaudeSessionMaterialization(sessionId, cwd);
+    return {
+      ...result,
+      materialized: result?.materialized === true,
+      conversationMaterialized: result?.materialized === true,
+      timelineCount: typeof result?.timelineCount === 'number' ? result.timelineCount : null,
+    };
+  } catch (e) {
+    return {
+      materialized: false,
+      conversationMaterialized: false,
+      timelineCount: null,
+      fileFound: false,
+      reason: 'materialization-check-failed',
+      error: String(e?.message || e),
+    };
+  }
 }
 
 const MOBILE_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
@@ -434,14 +466,15 @@ async function waitForAgentReady(tabId, timeoutMs = 20_000) {
   return await new Promise((resolve, reject) => {
     let settled = false;
     let timer = null;
-    const finish = (err, status) => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      ipcMain.removeListener('agent:tui-ready-internal', onReady);
-      if (err) reject(err);
-      else resolve(status);
-    };
+	    const finish = (err, status) => {
+	      if (settled) return;
+	      settled = true;
+	      if (timer) clearTimeout(timer);
+	      ipcMain.removeListener('agent:tui-ready-internal', onReady);
+	      ipcMain.removeListener('claude:startup-defaults-gate', onStartupDefaultsGate);
+	      if (err) reject(err);
+	      else resolve(status);
+	    };
     const fail = () => {
       const err = new Error('agent did not become ready');
       err.status = last;
@@ -455,16 +488,24 @@ async function waitForAgentReady(tabId, timeoutMs = 20_000) {
           if (e?.code === 'codex_auth_required') finish(e);
         });
     };
-    const onReady = (_event, payload) => {
-      const readyTabId = typeof payload === 'string' ? payload : payload?.tabId;
-      if (readyTabId !== tabId) return;
-      check();
-    };
-    ipcMain.on('agent:tui-ready-internal', onReady);
-    timer = setTimeout(fail, limitMs);
-    check();
-  });
-}
+	    const onReady = (_event, payload) => {
+	      const readyTabId = typeof payload === 'string' ? payload : payload?.tabId;
+	      if (readyTabId !== tabId) return;
+	      check();
+	    };
+	    const onStartupDefaultsGate = (_event, payload = {}) => {
+	      if (payload?.tabId !== tabId) return;
+	      console.log('[WebReadyWait] wake tab=' + shortId(tabId, 12)
+	        + ' source=startup-defaults status=' + (payload?.status || '-')
+	        + ' reason=' + (payload?.reason || '-'));
+	      check();
+	    };
+	    ipcMain.on('agent:tui-ready-internal', onReady);
+	    ipcMain.on('claude:startup-defaults-gate', onStartupDefaultsGate);
+	    timer = setTimeout(fail, limitMs);
+	    check();
+	  });
+	}
 
 async function resolveClaudeHistoryMutationTarget(tabId, body = {}) {
   if (!claudeDataApi || !claudeDataApi.editRange || !claudeDataApi.deleteRange) {
@@ -686,9 +727,118 @@ function summarizeStreamMessage(message) {
     ' queued=' + (message?.__wasQueued === true);
 }
 
+function streamMessageBlocks(message) {
+  const msg = message?.message && typeof message.message === 'object' ? message.message : null;
+  return Array.isArray(msg?.content) ? msg.content : [];
+}
+
+function streamMessageText(message) {
+  const msg = message?.message && typeof message.message === 'object' ? message.message : null;
+  if (typeof msg?.content === 'string') return msg.content;
+  const out = [];
+  for (const block of streamMessageBlocks(message)) {
+    if (!block || typeof block !== 'object') continue;
+    if (block.type === 'text' && typeof block.text === 'string') out.push(block.text);
+  }
+  return out.join('\n');
+}
+
+function isSlashCommandTranscriptText(text) {
+  const trimmed = String(text || '').trim();
+  return trimmed.startsWith('<command-name>');
+}
+
+function isNonTranscriptServiceText(text) {
+  const trimmed = String(text || '').trim();
+  return trimmed.startsWith('<local-command-stdout>')
+    || trimmed.startsWith('<local-command-caveat>')
+    || trimmed.startsWith('<system-reminder>')
+    || trimmed === '[tool_result]'
+    || trimmed.startsWith('<tool_result>');
+}
+
+function deriveMessageProjection(payload) {
+  if (!payload || payload.type !== 'message') return null;
+  if (payload.projection && typeof payload.projection === 'object') return payload.projection;
+  const message = payload.message || {};
+  const msg = message?.message && typeof message.message === 'object' ? message.message : null;
+  const blocks = streamMessageBlocks(message);
+  const entryId = message?.uuid || msg?.id || message?.id || null;
+  const source = message?.__projectionSource
+    || (message?.__webSynthetic === true ? 'synthetic-web-broadcast' : null)
+    || (String(entryId || '').startsWith('codex-live-') ? 'codex-rollout-live' : null)
+    || 'agent-live';
+  let kind = message?.type || msg?.role || 'unknown';
+  let role = msg?.role || (message?.type === 'user' ? 'user' : message?.type === 'assistant' ? 'assistant' : null);
+  let transcript = message?.__projectionTranscript;
+  let ephemeral = message?.__projectionEphemeral === true;
+  let timeline = message?.__projectionTimeline;
+
+  if (transcript == null) {
+    const hasText = blocks.some((b) => b?.type === 'text' && String(b?.text || '').trim());
+    const hasToolUse = blocks.some((b) => b?.type === 'tool_use');
+    const hasToolResult = blocks.some((b) => b?.type === 'tool_result');
+    const hasThinking = blocks.some((b) => b?.type === 'thinking' && String(b?.thinking || '').trim());
+    const text = streamMessageText(message);
+    if (message?.type === 'assistant' && hasThinking && !hasText && !hasToolUse) {
+      kind = 'thinking';
+      role = 'assistant';
+      transcript = false;
+      ephemeral = true;
+      timeline = false;
+    } else if (message?.type === 'user' && isSlashCommandTranscriptText(text)) {
+      kind = 'slash';
+      role = 'user';
+      transcript = true;
+      ephemeral = false;
+      timeline = false;
+    } else if (message?.type === 'user' && isNonTranscriptServiceText(text)) {
+      kind = 'service';
+      role = 'user';
+      transcript = false;
+      ephemeral = true;
+      timeline = false;
+    } else if (hasToolResult) {
+      kind = 'tool_result';
+      transcript = true;
+      timeline = false;
+    } else {
+      transcript = true;
+      if (timeline == null) timeline = message?.type === 'user';
+    }
+  }
+
+  return {
+    version: 1,
+    source,
+    entryId,
+    kind,
+    role,
+    transcript: transcript === true,
+    timeline: timeline === true,
+    ephemeral,
+  };
+}
+
+function withMessageProjection(payload) {
+  if (!payload || payload.type !== 'message') return payload;
+  const projection = deriveMessageProjection(payload);
+  return projection ? { ...payload, projection } : payload;
+}
+
 function summarizeBroadcastPayload(payload) {
   if (!payload || typeof payload !== 'object') return '';
-  if (payload.type === 'message') return summarizeStreamMessage(payload.message);
+  if (payload.type === 'message') {
+    const projection = payload.projection || deriveMessageProjection(payload);
+    const projectionPart = projection
+      ? ' projection=' + (projection.transcript === false ? 'skip' : 'transcript') +
+        '/' + (projection.timeline === false ? 'no-timeline' : 'timeline') +
+        '/' + (projection.kind || '-') +
+        ' entry=' + shortId(projection.entryId) +
+        ' source=' + (projection.source || '-')
+      : '';
+    return summarizeStreamMessage(payload.message) + projectionPart;
+  }
   if (payload.type === 'project-activity') {
     const projects = Array.isArray(payload.projects) ? payload.projects : [];
     const active = projects.filter((p) => (Number(p?.count) || 0) > 0 || p?.streaming === true).length;
@@ -1216,6 +1366,14 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       commandType: status?.commandType || null,
       toolType: status?.toolType || null,
       inputReady: status?.inputReady === true,
+      conversationMaterialized: status?.conversationMaterialized === true,
+      canResume: status?.canResume === true,
+      canCopySessionId: status?.canCopySessionId === true,
+      timelineCount: typeof status?.timelineCount === 'number' ? status.timelineCount : null,
+      materializationReason: status?.materializationReason || null,
+      startupDefaultsPending: status?.startupDefaultsPending === true,
+      startupDefaultsReady: status?.startupDefaultsReady === true,
+      startupDefaultsError: status?.startupDefaultsError || null,
       lastNotReady: status?.lastNotReady || null,
       source: pendingQuestion?.source,
       toolUseID: pendingQuestion?.toolUseID,
@@ -1860,6 +2018,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
     let runtimeSessionMap = new Map();
     let startupFailedMap = new Map();
     let startupErrorMap = new Map();
+    let startupDefaultsPendingMap = new Map();
+    let startupDefaultsReadyMap = new Map();
+    let startupDefaultsErrorMap = new Map();
     let completionNotificationMap = new Map();
     try {
       const data = await bridgeRequest('getProjectCompletionNotifications', { projectId }, 1500);
@@ -1883,6 +2044,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         if (data?.sessions) for (const [id, sid] of Object.entries(data.sessions)) if (sid) runtimeSessionMap.set(id, sid);
         if (data?.startupFailed) for (const [id, value] of Object.entries(data.startupFailed)) if (value) startupFailedMap.set(id, true);
         if (data?.startupError) for (const [id, value] of Object.entries(data.startupError)) if (value) startupErrorMap.set(id, value);
+        if (data?.startupDefaultsPending) for (const [id, value] of Object.entries(data.startupDefaultsPending)) if (value) startupDefaultsPendingMap.set(id, true);
+        if (data?.startupDefaultsReady) for (const [id, value] of Object.entries(data.startupDefaultsReady)) if (value) startupDefaultsReadyMap.set(id, true);
+        if (data?.startupDefaultsError) for (const [id, value] of Object.entries(data.startupDefaultsError)) if (value) startupDefaultsErrorMap.set(id, value);
       } catch (e) {
         // Bridge unavailable — every PTY agent tab will show no badge until
         // user opens it (per-tab GET /status still works on demand).
@@ -1909,21 +2073,22 @@ async function handleApi(req, res, parsed, sdkSessions) {
       // renderer not ready — phone renders runtime-only markers, no category tint
     }
     const tabs = (project.tabs || []).map(t => {
-      // Cheap timeline-count: only computed if the tab has a session file we
-      // can find. parseTimelineUuids reads the JSONL once and returns the
-      // active-branch user-prompt UUIDs — its length = "messages on Timeline".
-      let timelineCount = null;
-      if (t.claudeSessionId && parseTimelineUuids && findSessionFile) {
-        try {
-          const found = findSessionFile(t.claudeSessionId, t.cwd);
-          if (found) timelineCount = parseTimelineUuids(found.filePath).length;
-        } catch {}
-      }
+      // Materialized conversation is a separate axis from "Claude wrote a UUID".
+      // A pre-prompt Claude process can create a JSONL with only mode/permission
+      // records; that UUID is not resumable and must not enable Copy/Resume.
+      const claudeMaterialization = t.claudeSessionId
+        ? claudeMaterializationFor(t.claudeSessionId, t.cwd)
+        : null;
+      const timelineCount = typeof claudeMaterialization?.timelineCount === 'number'
+        ? claudeMaterialization.timelineCount
+        : null;
+      const conversationMaterialized = claudeMaterialization?.materialized === true;
       // Assigned-category status (DB column session_status holds the palette id;
       // distinct from runtime sessionStatus which drives the loader/background).
       const statusId = t.sessionStatus || null;
       const runtimeStatus = statusMap.get(t.tabId) || null;
       const runtimeCodexSessionId = runtimeSessionMap.get(t.tabId) || null;
+      const isPtyAgent = (t.commandType === 'claude' || t.commandType === 'codex') && (t.tabType || 'terminal') !== 'claude-sdk';
       const notification = completionNotificationMap.get(t.tabId) || {};
       return {
         tabId: t.tabId,
@@ -1937,6 +2102,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
         codexSessionId: runtimeCodexSessionId || t.codexSessionId,
         geminiSessionId: t.geminiSessionId,
         timelineCount,
+        conversationMaterialized,
+        canResume: t.commandType === 'claude' && runtimeStatus === 'inactive' && conversationMaterialized,
+        canCopySessionId: t.commandType === 'claude' ? conversationMaterialized : !!(t.codexSessionId || t.geminiSessionId),
+        materializationReason: claudeMaterialization?.reason || null,
         sessionStatus: runtimeStatus,
         starting: runtimeStatus === 'starting',
         stopping: runtimeStatus === 'stopping',
@@ -1944,6 +2113,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         lastNotReady: lastNotReadyMap.get(t.tabId) || null,
         startupFailed: startupFailedMap.get(t.tabId) || false,
         startupError: startupErrorMap.get(t.tabId) || null,
+        startupDefaultsPending: t.commandType === 'claude' ? (startupDefaultsPendingMap.get(t.tabId) || false) : false,
+        startupDefaultsReady: t.commandType === 'claude' ? (startupDefaultsReadyMap.get(t.tabId) || false) : (isPtyAgent ? true : false),
+        startupDefaultsError: startupDefaultsErrorMap.get(t.tabId) || null,
         awaiting: awaitingMap.get(t.tabId) || false,
         statusId,
         statusColor: statusId ? (paletteById.get(statusId)?.color || null) : null,
@@ -2297,20 +2469,121 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
   m = parsed.pathname.match(/^\/api\/projects\/([^/]+)\/agent-tabs$/);
   if (m && req.method === 'POST') {
+    const started = Date.now();
+    const projectId = decId(m[1]);
     try {
       const body = await readBody(req);
       const toolType = body.toolType === 'codex' ? 'codex' : 'claude';
+      console.log('[WebAgentTabs] START project=' + shortId(projectId, 12)
+        + ' tool=' + toolType
+        + ' model=' + (cleanOptionalString(body.model || body.codexModel, '') || '-')
+        + ' effort=' + (cleanOptionalString(body.effort || body.codexEffort, '') || '-'));
       const data = await bridgeRequest('createAgentTab', {
-        projectId: decId(m[1]),
+        projectId,
         toolType,
         startNow: true,
         name: cleanOptionalString(body.name, ''),
         codexModel: cleanOptionalString(body.model || body.codexModel, ''),
         codexEffort: cleanOptionalString(body.effort || body.codexEffort, ''),
       }, 12_000);
+      console.log('[WebAgentTabs] OK project=' + shortId(projectId, 12)
+        + ' tool=' + toolType
+        + ' tab=' + shortId(data?.tabId, 12)
+        + ' status=' + (data?.sessionStatus || (data?.starting ? 'starting' : '-'))
+        + ' session=' + shortId(data?.claudeSessionId || data?.codexSessionId || data?.sessionId)
+        + ' materialized=' + (data?.conversationMaterialized === true)
+        + ' canResume=' + (data?.canResume === true)
+        + ' canCopy=' + (data?.canCopySessionId === true)
+        + ' defaultsPending=' + (data?.startupDefaultsPending === true)
+        + ' defaultsReady=' + (data?.startupDefaultsReady === true)
+        + ' ms=' + (Date.now() - started));
       return sendJson(res, 200, data);
     } catch (e) {
+      console.warn('[WebAgentTabs] ERR project=' + shortId(projectId, 12)
+        + ' error=' + String(e?.message || e)
+        + ' ms=' + (Date.now() - started));
       return sendTerminalBridgeError(res, e);
+    }
+  }
+
+  // Start a fresh agent runtime in an existing PTY tab. This is intentionally
+  // separate from /resume: an unmaterialized Claude tab has no saved
+  // conversation to resume, but it still needs a way to launch Claude again.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/start$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]);
+    try {
+      const body = await readBody(req);
+      const startupTimeoutMs = Math.max(1000, Math.min(45_000, Number(body.startupTimeoutMs) || 30_000));
+      let data;
+      try {
+        data = await bridgeRequest('startAgentTab', { tabId }, Math.max(5000, Math.min(15_000, startupTimeoutMs)));
+      } catch (bridgeErr) {
+        return sendJson(res, 409, {
+          ok: false,
+          success: false,
+          ready: false,
+          error: String(bridgeErr.message || bridgeErr),
+        });
+      }
+      if (data?.success === false || data?.ok === false) {
+        return sendJson(res, 409, { ...(data || {}), ok: false, success: false, ready: false });
+      }
+      try {
+        const status = await waitForAgentReady(tabId, startupTimeoutMs);
+        const startedTool = data?.toolType || status?.toolType || status?.commandType || data?.commandType;
+        const needsStartupDefaults = startedTool === 'claude';
+        let defaultsReady = !needsStartupDefaults;
+        let defaultsError = null;
+        let liveStatus = status;
+        if (needsStartupDefaults) {
+          try {
+            const defaults = await bridgeRequest('waitAgentStartupDefaultsReady', { tabId, timeoutMs: startupTimeoutMs }, Math.max(5000, startupTimeoutMs));
+            defaultsReady = defaults?.defaultsReady === true;
+            defaultsError = defaults?.error || defaults?.reason || null;
+          } catch (defaultsErr) {
+            defaultsError = String(defaultsErr.message || defaultsErr);
+            try {
+              liveStatus = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000) || status;
+            } catch {
+              liveStatus = status;
+            }
+            console.warn('[MobStart] startup defaults not ready after fresh start tab=' + shortId(tabId, 12)
+              + ' runtimeStatus=' + (status?.status || '-')
+              + ' projectedStatus=' + (liveStatus?.status || '-')
+              + ' error=' + defaultsError
+              + ' continuingWithLiveRuntime=true');
+          }
+        }
+        return sendJson(res, 200, {
+          ok: true,
+          success: true,
+          ready: true,
+          ...(data || {}),
+          startupDefaultsReady: defaultsReady,
+          startupDefaultsError: defaultsError,
+          status: liveStatus?.status || 'active',
+          starting: liveStatus?.status === 'starting',
+          stopping: liveStatus?.status === 'stopping',
+          inputReady: liveStatus?.inputReady === true,
+          conversationMaterialized: false,
+          canResume: false,
+          canCopySessionId: false,
+          timelineCount: 0,
+          materializationReason: 'timeline-empty',
+        });
+      } catch (readyErr) {
+        return sendJson(res, readyErr?.code === 'codex_auth_required' ? 409 : 504, {
+          ...(data || {}),
+          ok: false,
+          success: false,
+          ready: false,
+          error: String(readyErr.message || readyErr),
+          status: readyErr.status || null,
+        });
+      }
+    } catch (e) {
+      return sendJson(res, 500, { ok: false, success: false, ready: false, error: String(e.message) });
     }
   }
 
@@ -2343,6 +2616,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         try {
           const defaults = await bridgeRequest('waitAgentStartupDefaultsReady', { tabId, timeoutMs: startupTimeoutMs }, Math.max(5000, startupTimeoutMs));
           defaultsReady = defaults?.defaultsReady === true;
+          defaultsError = defaults?.error || defaults?.reason || null;
         } catch (defaultsErr) {
           defaultsError = String(defaultsErr.message || defaultsErr);
           try {
@@ -2350,13 +2624,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
           } catch {
             liveStatus = status;
           }
-          const liveReady = liveStatus
-            && (liveStatus.status === 'active' || liveStatus.status === 'busy')
-            && liveStatus.inputReady === true;
-          if (!liveReady) throw defaultsErr;
-          console.warn('[MobResume] startup defaults failed after live resume tab=' + shortId(tabId, 12)
-            + ' status=' + (liveStatus?.status || '-')
-            + ' error=' + defaultsError);
+          console.warn('[MobResume] startup defaults not ready after live resume tab=' + shortId(tabId, 12)
+            + ' runtimeStatus=' + (status?.status || '-')
+            + ' projectedStatus=' + (liveStatus?.status || '-')
+            + ' error=' + defaultsError
+            + ' continuingWithLiveRuntime=true');
         }
         return sendJson(res, 200, {
           ok: true,
@@ -2401,6 +2673,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ' status=' + (data?.status || '-') +
         ' busy=' + (data?.busy == null ? '-' : data.busy) +
         ' session=' + shortId(data?.sessionId) +
+        ' materialized=' + (data?.conversationMaterialized === true) +
+        ' timelineCount=' + (data?.timelineCount == null ? '-' : data.timelineCount) +
+        ' canResume=' + (data?.canResume === true) +
+        ' defaultsPending=' + (data?.startupDefaultsPending === true) +
+        ' defaultsReady=' + (data?.startupDefaultsReady === true) +
+        ' defaultsError=' + (data?.startupDefaultsError || '-') +
         ' command=' + (data?.commandType || '-') +
         ' tool=' + (data?.toolType || '-') +
         ' ms=' + (Date.now() - started));
@@ -3245,6 +3523,7 @@ function releaseTranscriptSubscriptionsIfOrphan() {
 // without dumping chat text or spamming desktop-only sessions with message drops.
 const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'bridge-update', 'queue-update', 'ask-question', 'question-cancelled', 'project-activity']);
 function webBroadcast(tabId, payload) {
+  payload = withMessageProjection(payload);
   const type = payload && payload.type;
   const loggable = BCAST_LOG_TYPES.has(type);
   const runId = externalRunByTabId.get(tabId);

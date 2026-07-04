@@ -101,6 +101,39 @@ function _classifyOrphanFlavor(entry) {
 
   return { flavor: t || 'unknown', short: t || 'неизвестно' };
 }
+
+function extractQueuedCommandPromptText(prompt) {
+  if (typeof prompt === 'string') return prompt;
+  if (Array.isArray(prompt)) {
+    return prompt.map((item) => {
+      if (typeof item === 'string') return item;
+      if (item && typeof item.text === 'string') return item.text;
+      return '';
+    }).filter(Boolean).join('\n');
+  }
+  if (prompt && typeof prompt.text === 'string') return prompt.text;
+  return '';
+}
+
+function formatSlashCommandDisplay(name, args = '') {
+  const cleanName = String(name || '').trim().replace(/^\/+/, '');
+  if (!cleanName) return null;
+  const cleanArgs = String(args || '').trim();
+  if (!cleanArgs) return '/' + cleanName;
+  const parts = cleanArgs.split(/\s+/).filter(Boolean);
+  const compactArgs = parts.length > 0 && parts.length <= 3 && parts.every((part) => /^[A-Za-z0-9_-]+$/.test(part));
+  if (!compactArgs) return '/' + cleanName + ' ' + cleanArgs;
+  return '/' + cleanName + parts.map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join('');
+}
+
+function slashCommandDisplayFromText(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed.startsWith('<command-name>')) return null;
+  const name = (trimmed.match(/<command-name>([^<]+)<\/command-name>/)?.[1] || '').trim();
+  const args = (trimmed.match(/<command-args>([^<]*)/)?.[1] || '').trim();
+  const content = formatSlashCommandDisplay(name, args);
+  return content ? { content, name, args } : null;
+}
 // filePath → { size, mtimeMs, recordMap, lastRecord, bridgeSessionId, progressEntries, queueOperations }
 
 // ========== SESSION CHAIN HELPERS ==========
@@ -928,7 +961,12 @@ function parseTimelineUuids(sourcePath) {
     for (const entry of activeBranch) {
       if (entry.isSidechain || entry.type === 'summary') continue;
 
-      if (entry.type === 'user') {
+      if (entry.type === 'attachment' && entry.attachment?.type === 'queued_command') {
+        const rawContent = extractQueuedCommandPromptText(entry.attachment.prompt).trim();
+        if (!rawContent || entry.isMeta) continue;
+        if (slashCommandDisplayFromText(rawContent)) continue;
+        uuids.push(entry.uuid);
+      } else if (entry.type === 'user') {
         let rawContent = entry.message?.content;
         if (Array.isArray(rawContent)) {
           if (rawContent.some(item => item.type === 'tool_result')) continue;
@@ -940,6 +978,8 @@ function parseTimelineUuids(sourcePath) {
         if (rawContent.includes('<command-name>') ||
             rawContent.includes('<system-reminder>') ||
             rawContent.includes('<task-notification>') ||
+            rawContent.includes('<local-command-stdout>') ||
+            rawContent.includes('<local-command-stderr>') ||
             rawContent.startsWith('[Request interrupted')) continue;
 
         uuids.push(entry.uuid);
@@ -2515,6 +2555,10 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
     }
   });
 
+  ipcMain.handle('claude:session-materialization', async (event, { sessionId, cwd }) => {
+    return getSessionMaterialization(sessionId, cwd);
+  });
+
   // Get Claude session timeline for navigation
   // Reads JSONL file and returns filtered entries for Timeline component
   // Uses BACKTRACE algorithm to handle Escape/Undo branches correctly
@@ -3826,10 +3870,21 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       const normalizeQueuedText = (text) => String(text || '')
         .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
         .replace(/\[200~/g, '').replace(/~\]/g, '').trim();
+      const slashCommandEntryFromText = (text, uuid, timestamp, entrySid) => {
+        const slash = slashCommandDisplayFromText(text);
+        if (!slash) return null;
+        return {
+          uuid,
+          role: 'slash',
+          timestamp: timestamp || '',
+          content: slash.content,
+          sessionId: entrySid
+        };
+      };
       const shouldSkipPromptText = (text) => {
         if (!text) return true;
         if (text.startsWith('[Request interrupted') || text === '[User cancelled]') return true;
-        if (text.includes('<command-name>') || text.includes('<local-command-stdout>')) return true;
+        if (text.includes('<local-command-stdout>')) return true;
         if (text.includes('<bash-notification>') || text.includes('<shell-id>')) return true;
         if (text.includes('<user-prompt-submit-hook>') || text.includes('<task-notification>')) return true;
         if (text.startsWith('Caveat: The messages below')) return true;
@@ -3876,6 +3931,26 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         if (!isQueueOperation) {
           lastWasCompact = (entry.type === 'system' && entry.subtype === 'compact_boundary');
           prevSessionId = entrySid;
+        }
+
+        if (entry.type === 'attachment' && entry.attachment?.type === 'queued_command') {
+          const cleanContent = normalizeQueuedText(extractQueuedCommandPromptText(entry.attachment.prompt));
+          if (!cleanContent || shouldSkipPromptText(cleanContent)) continue;
+          dropMatchingQueuedEntry(cleanContent);
+          const slashEntry = slashCommandEntryFromText(cleanContent, entry.uuid, entry.timestamp, entrySid);
+          if (slashEntry) {
+            entries.push(slashEntry);
+          } else {
+            entries.push({
+              uuid: entry.uuid,
+              role: 'queued',
+              timestamp: entry.timestamp || '',
+              content: cleanContent,
+              queueStatus: 'sent',
+              sessionId: entrySid
+            });
+          }
+          continue;
         }
 
         if (entry.type === 'queue-operation') {
@@ -3926,6 +4001,12 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
           if (!rawContent) continue;
           if (shouldSkipPromptText(rawContent)) continue;
           if (entry.isMeta) continue;
+
+          const slashEntry = slashCommandEntryFromText(rawContent, entry.uuid, entry.timestamp, entrySid);
+          if (slashEntry) {
+            entries.push(slashEntry);
+            continue;
+          }
 
           let cleanContent = normalizeQueuedText(rawContent);
           if (!cleanContent) continue;
@@ -4220,7 +4301,21 @@ function parseTimelineEntries(sourcePath) {
     for (const entry of branch) {
       if (entry.isSidechain || entry.type === 'summary') continue;
 
-      if (entry.type === 'user') {
+      if (entry.type === 'attachment' && entry.attachment?.type === 'queued_command') {
+        const raw = extractQueuedCommandPromptText(entry.attachment.prompt).trim();
+        if (!raw || entry.isMeta) continue;
+        if (slashCommandDisplayFromText(raw)) continue;
+        out.push({
+          uuid: entry.uuid,
+          kind: 'user',
+          color: '#a6e3a1',
+          preview: raw.slice(0, 220),
+          full: raw,
+          truncated: raw.length > 220,
+          ts: entry.timestamp || null,
+          tools: [],
+        });
+      } else if (entry.type === 'user') {
         let raw = entry.message?.content;
         if (Array.isArray(raw)) {
           if (raw.some(i => i.type === 'tool_result')) continue; // tool result, not a prompt
@@ -4267,6 +4362,60 @@ function parseTimelineEntries(sourcePath) {
   } catch (e) {
     console.error('[parseTimelineEntries] Error:', e.message);
     return [];
+  }
+}
+
+function getSessionMaterialization(sessionId, cwd) {
+  if (!sessionId) {
+    return {
+      success: true,
+      sessionId: null,
+      materialized: false,
+      conversationMaterialized: false,
+      timelineCount: 0,
+      fileFound: false,
+      reason: 'no-session-id',
+    };
+  }
+  try {
+    const found = findSessionFile(sessionId, cwd);
+    if (!found) {
+      return {
+        success: true,
+        sessionId,
+        materialized: false,
+        conversationMaterialized: false,
+        timelineCount: 0,
+        fileFound: false,
+        reason: 'session-file-not-found',
+      };
+    }
+    const entries = parseTimelineEntries(found.filePath);
+    const timelineCount = Array.isArray(entries) ? entries.length : 0;
+    let fileSize = 0;
+    try { fileSize = fs.statSync(found.filePath).size; } catch {}
+    return {
+      success: true,
+      sessionId,
+      materialized: timelineCount > 0,
+      conversationMaterialized: timelineCount > 0,
+      timelineCount,
+      fileFound: true,
+      filePath: found.filePath,
+      fileSize,
+      reason: timelineCount > 0 ? 'timeline-has-entries' : 'timeline-empty',
+    };
+  } catch (e) {
+    return {
+      success: false,
+      sessionId,
+      materialized: false,
+      conversationMaterialized: false,
+      timelineCount: 0,
+      fileFound: false,
+      error: e.message,
+      reason: 'materialization-check-failed',
+    };
   }
 }
 
@@ -4374,4 +4523,4 @@ async function repairJsonlChainBreaks(sessionId, cwd) {
   }
 }
 
-module.exports = { register, findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, deleteEffortEntries: _deleteEffortEntries, trimTrailingEffortEntries: _trimTrailingEffortEntries, trimTrailingStartupSlashEntriesFromFile: _trimTrailingStartupSlashEntriesFromFile, repairJsonlChainBreaks, _api };
+module.exports = { register, findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, getSessionMaterialization, deleteEffortEntries: _deleteEffortEntries, trimTrailingEffortEntries: _trimTrailingEffortEntries, trimTrailingStartupSlashEntriesFromFile: _trimTrailingStartupSlashEntriesFromFile, repairJsonlChainBreaks, _api };

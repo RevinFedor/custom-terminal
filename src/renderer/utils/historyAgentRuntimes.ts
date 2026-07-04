@@ -35,6 +35,12 @@ export interface AgentPtyPresence {
   startupError?: string | null;
   manualActionRequired?: boolean;
   manualActionType?: string | null;
+  sessionId?: string | null;
+  conversationMaterialized?: boolean;
+  canResume?: boolean;
+  canCopySessionId?: boolean;
+  timelineCount?: number | null;
+  materializationReason?: string | null;
 }
 
 export interface AgentResumeResult {
@@ -43,6 +49,10 @@ export interface AgentResumeResult {
   alreadyRunning?: boolean;
   status?: AgentPtyStatus;
   repaired?: number;
+  conversationMaterialized?: boolean;
+  canResume?: boolean;
+  timelineCount?: number | null;
+  materializationReason?: string | null;
   error?: string;
 }
 
