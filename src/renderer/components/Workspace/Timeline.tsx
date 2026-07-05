@@ -1110,6 +1110,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     const raf = requestAnimationFrame(() => setWidthTransitionTabKey(tabId));
     return () => cancelAnimationFrame(raf);
   }, [tabId, widthTransitionTabKey]);
+  const handlePinnedSlotTransitionEnd = useCallback((event: React.TransitionEvent<HTMLDivElement>) => {
+    if (event.target !== event.currentTarget || event.propertyName !== 'width') return;
+    if (!pinned) return;
+    window.dispatchEvent(new CustomEvent('timeline:pinned-layout-settled', {
+      detail: { tabId, expanded: isExpandedLayout },
+    }));
+  }, [isExpandedLayout, pinned, tabId]);
   const intrinsicPreviewFontSize = Math.max(timelineFontSize, timelineSummaryFontSize);
   // Measured CSS `right:` value (px) that anchors popups to Timeline's left edge.
   // Computed from real DOM rect — robust to HistoryPanel open/close, treeMode, window resize.
@@ -4575,6 +4582,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       {/* ──── OUTER SLOT — unpinned expanded mode reserves only the 32px rail and
             overlays left; pinned mode reserves the full expanded width. ──── */}
       <div
+        onTransitionEnd={handlePinnedSlotTransitionEnd}
         style={{
           width: slideIn ? (pinned ? `${effectiveWidth}px` : '32px') : '0px',
           height: '100%',

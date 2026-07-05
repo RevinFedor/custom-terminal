@@ -780,6 +780,78 @@ async function waitForClaudeStartupPromptBoundaryWithRecovery(tabId: string, aft
   return result;
 }
 
+const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+type ClaudeStartupSlashProof = {
+  success?: boolean;
+  reason?: string;
+  timestamp?: string | null;
+  wrapperSeen?: boolean;
+  stdoutSeen?: boolean;
+  sessionId?: string | null;
+  file?: string;
+  error?: string;
+};
+
+async function waitForClaudeStartupSlashProofResult(
+  tabId: string,
+  command: string,
+  afterMs: number,
+  label: string,
+  timeoutMs = 6500,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let last: ClaudeStartupSlashProof | null = null;
+  while (Date.now() <= deadline) {
+    const result = await ipcRenderer.invoke('claude:startup-slash-proof', {
+      tabId,
+      command,
+      afterMs,
+      label,
+    }).catch((e: any) => ({ success: false, reason: 'ipc-error', error: e?.message || String(e) }));
+    last = result || null;
+    if (result?.success === true) {
+      const proof = 'jsonl-stdout:' + (result.timestamp || 'no-ts');
+      console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12)
+        + ' ' + label
+        + ' slashProof=' + proof
+        + ' command=' + JSON.stringify(command)
+        + ' file=' + (result.file || '-'));
+      return { status: proof, last };
+    }
+    await sleep(180);
+  }
+  console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12)
+    + ' ' + label
+    + ' slashProof=timeout command=' + JSON.stringify(command)
+    + ' last=' + JSON.stringify(last || null));
+  return { status: 'timeout', last };
+}
+
+async function waitForClaudeStartupSlashProofWithRecovery(tabId: string, command: string, afterMs: number, label: string) {
+  let result = await waitForClaudeStartupSlashProofResult(tabId, command, afterMs, label);
+  if (result.status === 'timeout') {
+    const retryResult = await retryStuckClaudeStartupSlashCommand(
+      tabId,
+      command,
+      label,
+      async () => (await waitForClaudeStartupSlashProofResult(tabId, command, afterMs, label + ':retry', 3500)).status
+    );
+    if (retryResult !== 'timeout') return retryResult;
+    result = await waitForClaudeStartupSlashProofResult(tabId, command, afterMs, label + ':final', 800);
+  }
+  if (result.status === 'timeout') {
+    const last = result.last || {};
+    throw new Error(command + ' did not produce local-command stdout proof; reason='
+      + (last.reason || 'timeout')
+      + ' wrapperSeen=' + !!last.wrapperSeen
+      + ' stdoutSeen=' + !!last.stdoutSeen
+      + ' file=' + (last.file || '-')
+      + ' error=' + (last.error || '-'));
+  }
+  return result.status;
+}
+
 function maybeRecoverClaudeStartupDefaultsAfterLateModelBridge(tabId: string, liveModel: string) {
   const existing = _claudeStartupDefaultsRecoveryInflight.get(tabId);
   if (existing) return;
@@ -813,7 +885,7 @@ function maybeRecoverClaudeStartupDefaultsAfterLateModelBridge(tabId: string, li
       return;
     }
 
-    const promptSeqBeforeEffort = terminalRegistry.getLatestPromptBoundarySeq(tabId);
+    const effortProofAfterMs = Date.now();
     _effortSentForTab.set(tabId, { at: Date.now(), via: 'bridge-late', level: eff });
     try {
       const result = await ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + eff, {
@@ -825,10 +897,10 @@ function maybeRecoverClaudeStartupDefaultsAfterLateModelBridge(tabId: string, li
       await withClaudeVisibleSettingsDialogAutoConfirm(
         tabId,
         'bridge-late-effort',
-        () => waitForClaudeStartupPromptBoundaryWithRecovery(
+        () => waitForClaudeStartupSlashProofWithRecovery(
           tabId,
-          promptSeqBeforeEffort,
           '/effort ' + eff,
+          effortProofAfterMs,
           'after /effort ' + eff + ' (bridge-late)'
         )
       );
@@ -1046,6 +1118,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
   onLinkClickRef.current = onLinkClick;
   const claudeSessionDetected = useRef<string | null>(null); // Track detected Claude session UUID
   const pendingActionExecuted = useRef(false); // Track if pendingAction was executed
+  const pinnedTimelineSettleRafRef = useRef<number | null>(null);
 
   const terminalFontSize = useUIStore((state) => state.terminalFontSize);
   const historyPanelOpen = useUIStore((state) => state.historyPanelOpenTabs[tabId] ?? false);
@@ -1453,6 +1526,35 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
   };
 
   useEffect(() => {
+    const handlePinnedTimelineLayoutSettled = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId?: string }>).detail;
+      if (detail?.tabId !== tabId) return;
+      if (!activeRef.current || !xtermInstance.current) return;
+
+      if (pinnedTimelineSettleRafRef.current !== null) {
+        cancelAnimationFrame(pinnedTimelineSettleRafRef.current);
+      }
+      pinnedTimelineSettleRafRef.current = requestAnimationFrame(() => {
+        safeFit();
+        pinnedTimelineSettleRafRef.current = requestAnimationFrame(() => {
+          pinnedTimelineSettleRafRef.current = null;
+          safeFit();
+          scrollToBottom();
+        });
+      });
+    };
+
+    window.addEventListener('timeline:pinned-layout-settled', handlePinnedTimelineLayoutSettled);
+    return () => {
+      window.removeEventListener('timeline:pinned-layout-settled', handlePinnedTimelineLayoutSettled);
+      if (pinnedTimelineSettleRafRef.current !== null) {
+        cancelAnimationFrame(pinnedTimelineSettleRafRef.current);
+        pinnedTimelineSettleRafRef.current = null;
+      }
+    };
+  }, [scrollToBottom, tabId]);
+
+  useEffect(() => {
     if (isInitialized.current || !terminalRef.current) {
       return;
     }
@@ -1751,7 +1853,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       }
       _effortSentForTab.set(tabId, { at: Date.now(), via: 'bridge-fresh', level: eff });
       _effortDiag(tabId, '🚀 INJECT FIRED', '/effort ' + eff + ' — sending to claude:send-command');
-      const promptSeqBeforeEffort = terminalRegistry.getLatestPromptBoundarySeq(tabId);
+      const effortProofAfterMs = Date.now();
       // [EffortDiag2026-05] invoke-fire counter — written SYNCHRONOUSLY in the
       // same tick as the invoke. Pair with HANDLER-ENTRY: callN=K must equal
       // invokeN=K. If invokeN < handlerN, an early-return cut off the inject.
@@ -1769,10 +1871,10 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         await withClaudeVisibleSettingsDialogAutoConfirm(
           tabId,
           'bridge-effort',
-          () => waitForClaudeStartupPromptBoundaryWithRecovery(
+          () => waitForClaudeStartupSlashProofWithRecovery(
             tabId,
-            promptSeqBeforeEffort,
             '/effort ' + eff,
+            effortProofAfterMs,
             'after /effort ' + eff + ' (bridge-fresh)'
           )
         );
@@ -1858,7 +1960,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         // fires DURING the handshake — that path keeps its resume guard below.
         // The sentinel guarantees a single inject (tui-ready sets it ~2-6s before
         // Bridge:Fresh, which then no-ops). See fact-claude-tui-control.md.
-        const promptSeqBeforeEffort = terminalRegistry.getLatestPromptBoundarySeq(tabId);
+        const effortProofAfterMs = Date.now();
         _effortSentForTab.set(tabId, { at: Date.now(), via: 'tui-ready', level: eff });
         console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /effort ' + eff + ' (early path, before Bridge:Fresh)');
         try {
@@ -1871,10 +1973,10 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           await withClaudeVisibleSettingsDialogAutoConfirm(
             tabId,
             'tui-effort',
-            () => waitForClaudeStartupPromptBoundaryWithRecovery(
+            () => waitForClaudeStartupSlashProofWithRecovery(
               tabId,
-              promptSeqBeforeEffort,
               '/effort ' + eff,
+              effortProofAfterMs,
               'after /effort ' + eff
             )
           );

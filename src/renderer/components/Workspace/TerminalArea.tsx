@@ -658,7 +658,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       setSessionStarting((prev) => {
         if (prev?.tabId !== tabId) return prev;
         if (prev.startupFailed) return prev;
-        if (prev?.tabId === tabId && (prev.startupPending || prev.holdUntilReady)) return prev;
+        if (prev?.tabId === tabId && (prev.startupPending || (!force && prev.holdUntilReady))) return prev;
         console.warn('[SessionStartingOverlay] event-hide tab=' + tabId.slice(-12) + ' reason=' + reason + ' engine=' + prev.engine);
         return null;
       });
@@ -673,8 +673,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     const onCommandFinished = (_: any, data: { tabId: string }) => hideFromEvent(data.tabId, 'command-finished', true);
     const onClaudeReady = (_: any, data: { tabId: string }) => {
       const info = activeAgentStartingInfoRef.current;
-      if (info?.tabId === data.tabId && info.engine === 'claude') return;
-      hideFromEvent(data.tabId, 'claude-tui-ready');
+      if (info?.tabId === data.tabId && info.engine !== 'claude') return;
+      hideFromEvent(data.tabId, 'claude-tui-ready', true);
     };
     const onCodexReady = (_: any, data: { tabId: string }) => hideFromEvent(data.tabId, 'codex-tui-ready', true);
     const onClaudeBusy = (_: any, data: { tabId: string; busy: boolean }) => {

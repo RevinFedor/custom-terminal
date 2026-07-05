@@ -23,6 +23,7 @@ import {
 } from '../../utils/dictationManager';
 import { useCmdKey } from '../../hooks/useCmdHoverPopover';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
+import { getHistoryAgentRuntime, type AgentPtyStatus } from '../../utils/historyAgentRuntimes';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -50,6 +51,8 @@ interface Props {
 // not the whole bar. Hidden entirely when not Anthropic (DeepSeek/Zen have no
 // cache → parent passes show=false) or when no turn has touched the cache yet.
 const CACHE_TTL_MIN = 60; // server-side 1h TTL (see fact-provider-proxy.md)
+type PtyTransitionEngine = 'claude' | 'codex';
+type SessionActionBlockedStatus = Extract<AgentPtyStatus, 'starting' | 'stopping'> | null;
 
 function CacheCooldownChip({
   data,
@@ -674,6 +677,41 @@ export default function ClaudeControlBar({
   const isBusy = isPasteBusy || isLocalBusy;
   const busySnapshotRef = useRef({ paste: false, local: false });
   const controlActionInFlightRef = useRef<string | null>(null);
+  const ptyTransitionEngine = useMemo<PtyTransitionEngine | null>(() => {
+    if (isSDKTab) return null;
+    if (commandType === 'codex' || codexSessionId) return 'codex';
+    if (commandType === 'claude' || claudeSessionId) return 'claude';
+    return null;
+  }, [claudeSessionId, codexSessionId, commandType, isSDKTab]);
+  const [sessionActionBlockedStatus, setSessionActionBlockedStatus] = useState<SessionActionBlockedStatus>(null);
+  const sessionActionProbeSeqRef = useRef(0);
+  const setSessionActionBlockedStatusIfChanged = useCallback((next: SessionActionBlockedStatus, reason: string) => {
+    setSessionActionBlockedStatus((prev) => {
+      if (prev === next) return prev;
+      console.log('[SessionActionChip] blocked-status tab=' + tabId.slice(-12) + ' type=' + sessionType + ' ' + (prev || 'none') + '→' + (next || 'none') + ' reason=' + reason);
+      return next;
+    });
+  }, [sessionType, tabId]);
+  const refreshSessionActionBlockedStatus = useCallback(async (reason: string) => {
+    const engine = ptyTransitionEngine;
+    const seq = ++sessionActionProbeSeqRef.current;
+    if (!engine || !tabId) {
+      setSessionActionBlockedStatusIfChanged(null, reason + ':no-engine');
+      return;
+    }
+    try {
+      const presence = await getHistoryAgentRuntime(engine).getPresence(tabId);
+      if (seq !== sessionActionProbeSeqRef.current) return;
+      const next: SessionActionBlockedStatus =
+        presence.status === 'starting' || presence.status === 'stopping'
+          ? presence.status
+          : null;
+      setSessionActionBlockedStatusIfChanged(next, reason + ':' + presence.status);
+    } catch (e: any) {
+      if (seq !== sessionActionProbeSeqRef.current) return;
+      console.warn('[SessionActionChip] presence failed tab=' + tabId.slice(-12) + ' type=' + (engine || '-') + ' reason=' + reason + ' error=' + String(e?.message || e));
+    }
+  }, [ptyTransitionEngine, setSessionActionBlockedStatusIfChanged, tabId]);
   const setLocalBusy = (busy: boolean, reason: string) => {
     console.log('[ControlBarLoader] local-set tab=' + tabId.slice(-12) + ' type=' + sessionType + ' reason=' + reason + ' busy=' + busy + ' paste=' + isPasteBusy + ' local=' + isLocalBusy + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
     setIsLocalBusy(busy);
@@ -694,6 +732,74 @@ export default function ClaudeControlBar({
     else if (existing) console.warn('[ControlBarAction] end-mismatch tab=' + tabId.slice(-12) + ' reason=' + reason + ' existing=' + existing);
     console.log('[ControlBarAction] end tab=' + tabId.slice(-12) + ' type=' + sessionType + ' reason=' + reason);
   };
+  const beginSessionLifecycleAction = (reason: string) => {
+    if (!beginControlAction(reason)) return false;
+    setLocalBusy(true, reason);
+    return true;
+  };
+  const clearSessionLifecycleAction = (reason: string) => {
+    setLocalBusy(false, reason);
+    endControlAction(reason.replace(/:clear$/, ''));
+  };
+  useEffect(() => {
+    if (!ptyTransitionEngine) {
+      sessionActionProbeSeqRef.current += 1;
+      setSessionActionBlockedStatusIfChanged(null, 'bind:no-engine');
+      return;
+    }
+    void refreshSessionActionBlockedStatus('bind');
+    const interval = window.setInterval(() => {
+      void refreshSessionActionBlockedStatus('poll');
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [ptyTransitionEngine, refreshSessionActionBlockedStatus, setSessionActionBlockedStatusIfChanged]);
+
+  useEffect(() => {
+    if (!ptyTransitionEngine) return;
+    const eventBelongsHere = (eventTabId?: string, eventType?: string | null) => {
+      if (eventTabId !== tabId) return false;
+      return !eventType || eventType === ptyTransitionEngine;
+    };
+    const onCommandStarted = (_: any, data: { tabId?: string; commandType?: string | null }) => {
+      if (!eventBelongsHere(data?.tabId, data?.commandType || null)) return;
+      setSessionActionBlockedStatusIfChanged('starting', 'command-started');
+      void refreshSessionActionBlockedStatus('command-started');
+    };
+    const onCommandFinished = (_: any, data: { tabId?: string }) => {
+      if (data?.tabId !== tabId) return;
+      setSessionActionBlockedStatusIfChanged(null, 'command-finished');
+    };
+    const onClaudeReady = (_: any, data: { tabId?: string }) => {
+      if (ptyTransitionEngine !== 'claude' || data?.tabId !== tabId) return;
+      setSessionActionBlockedStatusIfChanged(null, 'claude-ready');
+      void refreshSessionActionBlockedStatus('claude-ready');
+    };
+    const onCodexReady = (_: any, data: { tabId?: string }) => {
+      if (ptyTransitionEngine !== 'codex' || data?.tabId !== tabId) return;
+      setSessionActionBlockedStatusIfChanged(null, 'codex-ready');
+      void refreshSessionActionBlockedStatus('codex-ready');
+    };
+    const onAgentStopping = (_: any, data: { tabId?: string; toolType?: string | null; stopping?: boolean }) => {
+      if (!eventBelongsHere(data?.tabId, data?.toolType || null)) return;
+      if (data?.stopping) {
+        setSessionActionBlockedStatusIfChanged('stopping', 'agent-stopping');
+      } else {
+        void refreshSessionActionBlockedStatus('agent-stopping-clear');
+      }
+    };
+    ipcRenderer.on('terminal:command-started', onCommandStarted);
+    ipcRenderer.on('terminal:command-finished', onCommandFinished);
+    ipcRenderer.on('claude:tui-ready', onClaudeReady);
+    ipcRenderer.on('codex:tui-ready', onCodexReady);
+    ipcRenderer.on('agent:stopping-state', onAgentStopping);
+    return () => {
+      ipcRenderer.removeListener('terminal:command-started', onCommandStarted);
+      ipcRenderer.removeListener('terminal:command-finished', onCommandFinished);
+      ipcRenderer.removeListener('claude:tui-ready', onClaudeReady);
+      ipcRenderer.removeListener('codex:tui-ready', onCodexReady);
+      ipcRenderer.removeListener('agent:stopping-state', onAgentStopping);
+    };
+  }, [ptyTransitionEngine, refreshSessionActionBlockedStatus, setSessionActionBlockedStatusIfChanged, tabId]);
   useEffect(() => {
     busySnapshotRef.current = { paste: isPasteBusy, local: isLocalBusy };
     console.log('[ControlBarLoader] state tab=' + tabId.slice(-12) + ' type=' + sessionType + ' paste=' + isPasteBusy + ' local=' + isLocalBusy + ' busy=' + isBusy + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
@@ -734,7 +840,11 @@ export default function ClaudeControlBar({
       const match = data.tabId === tabId;
       const before = busySnapshotRef.current;
       console.log('[ControlBarLoader] lifecycle-clear active=' + tabId.slice(-12) + ' event=' + String(data.tabId || '').slice(-12) + ' match=' + match + ' reason=' + reason + ' beforePaste=' + before.paste + ' beforeLocal=' + before.local);
-      if (match) { setIsPasteBusy(false); setIsLocalBusy(false); }
+      if (match) {
+        controlActionInFlightRef.current = null;
+        setIsPasteBusy(false);
+        setIsLocalBusy(false);
+      }
     };
     ipcRenderer.on('claude:paste-busy', handler);
     const clearOnStarted = clearOnLifecycle('process-started');
@@ -846,6 +956,15 @@ export default function ClaudeControlBar({
   // so it stayed true the whole session → the chip was frozen on the busy `●`
   // dot and never showed the "60м" countdown the SDK chip shows.
   const cacheBusy = sdkBusy;
+  const sessionActionName = sessionType === 'codex' ? 'Codex' : sessionType === 'gemini' ? 'Gemini' : 'Claude';
+  const sessionActionDisabled = !isSDKTab && (isBusy || sessionActionBlockedStatus != null);
+  const sessionActionDisabledTitle = sessionActionBlockedStatus === 'starting'
+    ? `${sessionActionName} запускается — дождитесь готовности терминала`
+    : sessionActionBlockedStatus === 'stopping'
+      ? `${sessionActionName} останавливается — дождитесь завершения`
+      : isBusy
+        ? 'Другое действие панели ещё выполняется'
+        : undefined;
 
   useEffect(() => {
     cancelPendingEnterRef.current = false;
@@ -1329,21 +1448,28 @@ export default function ClaudeControlBar({
       window.dispatchEvent(new CustomEvent('claude-sdk:focus-composer', { detail: { tabId } }));
       return;
     }
+    const actionReason = 'session-start:' + sessionType;
+    if (!beginSessionLifecycleAction(actionReason)) return;
     const store = useWorkspaceStore.getState();
-    terminalRegistry.get(tabId)?.scrollToBottom();
-    focusTerminal();
-    if (sessionType === 'codex') {
-      store.setTabCommandType(tabId, 'codex');
-      store.markAiLaunchAutoTitle(tabId, 'codex');
-      ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex', cwd: launchCwd }));
-    } else if (sessionType === 'gemini') {
-      store.setTabCommandType(tabId, 'gemini');
-      ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd: launchCwd, yesMode: true });
-    } else {
-      store.setTabCommandType(tabId, 'claude');
-      store.markAiLaunchAutoTitle(tabId, 'claude');
-      ipcRenderer.send('claude:run-command', { tabId, command: 'claude' });
-      ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude' });
+    try {
+      terminalRegistry.get(tabId)?.scrollToBottom();
+      focusTerminal();
+      if (sessionType === 'codex') {
+        store.setTabCommandType(tabId, 'codex');
+        store.markAiLaunchAutoTitle(tabId, 'codex');
+        ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex', cwd: launchCwd }));
+      } else if (sessionType === 'gemini') {
+        store.setTabCommandType(tabId, 'gemini');
+        ipcRenderer.send('gemini:spawn-with-watcher', { tabId, cwd: launchCwd, yesMode: true });
+      } else {
+        store.setTabCommandType(tabId, 'claude');
+        store.markAiLaunchAutoTitle(tabId, 'claude');
+        ipcRenderer.send('claude:run-command', { tabId, command: 'claude' });
+        ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude' });
+      }
+    } catch (e) {
+      clearSessionLifecycleAction(actionReason + ':clear');
+      throw e;
     }
   };
 
@@ -1353,32 +1479,42 @@ export default function ClaudeControlBar({
       window.dispatchEvent(new CustomEvent('claude-sdk:focus-composer', { detail: { tabId } }));
       return;
     }
+    const actionReason = 'session-continue:' + sessionType;
+    if (!beginSessionLifecycleAction(actionReason)) return;
     const store = useWorkspaceStore.getState();
-    if (sessionType === 'claude') {
-      if (!(await ensureClaudeArtifactSession('continue-session'))) return;
-      store.setTabCommandType(tabId, 'claude');
-      terminalRegistry.get(tabId)?.scrollToBottom();
-      focusTerminal();
-      window.dispatchEvent(new CustomEvent('timeline:scroll-to-bottom', { detail: { tabId } }));
-      // Arm the 15s stale-bridge guard BEFORE writing resume — без этого протухший
-      // ~/.claude/bridge/*.json (PID reuse) перезапишет sessionId таба на мёртвый
-      // UUID в окне resume. Contract: любой путь, пишущий `claude --resume`, обязан
-      // вызвать markPendingResume. См. fix-bridge-stale-takeover.md layer 4/5.
-      if (claudeSessionId) markPendingResume(tabId, claudeSessionId);
-      ipcRenderer.send('claude:run-command', { tabId, command: 'claude-c', sessionId: claudeSessionId });
-      ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude', sessionId: claudeSessionId });
-    } else if (sessionType === 'gemini') {
-      store.setTabCommandType(tabId, 'gemini');
-      terminalRegistry.get(tabId)?.scrollToBottom();
-      focusTerminal();
-      window.dispatchEvent(new CustomEvent('timeline:scroll-to-bottom', { detail: { tabId } }));
-      ipcRenderer.send('gemini:run-command', { tabId, command: 'gemini-c', sessionId: geminiSessionId });
-    } else if (sessionType === 'codex') {
-      store.setTabCommandType(tabId, 'codex');
-      terminalRegistry.get(tabId)?.scrollToBottom();
-      focusTerminal();
-      window.dispatchEvent(new CustomEvent('timeline:scroll-to-bottom', { detail: { tabId } }));
-      ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex-c', sessionId: codexSessionId || undefined, cwd: launchCwd }));
+    try {
+      if (sessionType === 'claude') {
+        if (!(await ensureClaudeArtifactSession('continue-session'))) {
+          clearSessionLifecycleAction(actionReason + ':clear');
+          return;
+        }
+        store.setTabCommandType(tabId, 'claude');
+        terminalRegistry.get(tabId)?.scrollToBottom();
+        focusTerminal();
+        window.dispatchEvent(new CustomEvent('timeline:scroll-to-bottom', { detail: { tabId } }));
+        // Arm the 15s stale-bridge guard BEFORE writing resume — без этого протухший
+        // ~/.claude/bridge/*.json (PID reuse) перезапишет sessionId таба на мёртвый
+        // UUID в окне resume. Contract: любой путь, пишущий `claude --resume`, обязан
+        // вызвать markPendingResume. См. fix-bridge-stale-takeover.md layer 4/5.
+        if (claudeSessionId) markPendingResume(tabId, claudeSessionId);
+        ipcRenderer.send('claude:run-command', { tabId, command: 'claude-c', sessionId: claudeSessionId });
+        ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude', sessionId: claudeSessionId });
+      } else if (sessionType === 'gemini') {
+        store.setTabCommandType(tabId, 'gemini');
+        terminalRegistry.get(tabId)?.scrollToBottom();
+        focusTerminal();
+        window.dispatchEvent(new CustomEvent('timeline:scroll-to-bottom', { detail: { tabId } }));
+        ipcRenderer.send('gemini:run-command', { tabId, command: 'gemini-c', sessionId: geminiSessionId });
+      } else if (sessionType === 'codex') {
+        store.setTabCommandType(tabId, 'codex');
+        terminalRegistry.get(tabId)?.scrollToBottom();
+        focusTerminal();
+        window.dispatchEvent(new CustomEvent('timeline:scroll-to-bottom', { detail: { tabId } }));
+        ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex-c', sessionId: codexSessionId || undefined, cwd: launchCwd }));
+      }
+    } catch (e) {
+      clearSessionLifecycleAction(actionReason + ':clear');
+      throw e;
     }
   };
 
@@ -1394,10 +1530,18 @@ export default function ClaudeControlBar({
       } catch (e: any) { console.error('[SDKStop] error', e); }
       return;
     }
+    const actionReason = 'session-stop:' + sessionType;
+    if (!beginSessionLifecycleAction(actionReason)) return;
     try {
       const res = await ipcRenderer.invoke('terminal:stop-ai-process', tabId);
-      if (!res?.success) console.warn('[SessionStop] failed:', res?.error);
-    } catch (e: any) { console.error('[SessionStop] error', e); }
+      if (!res?.success) {
+        console.warn('[SessionStop] failed:', res?.error);
+        clearSessionLifecycleAction(actionReason + ':clear');
+      }
+    } catch (e: any) {
+      clearSessionLifecycleAction(actionReason + ':clear');
+      console.error('[SessionStop] error', e);
+    }
   };
 
   // HARD kill — terminate the SDK process AND all its background agents. Bound
@@ -1688,12 +1832,19 @@ export default function ClaudeControlBar({
 
   const startCodexTab = () => {
     if (!tabId) return;
+    const actionReason = 'session-start:codex';
+    if (!beginSessionLifecycleAction(actionReason)) return;
     const store = useWorkspaceStore.getState();
-    store.setTabCommandType(tabId, 'codex');
-    store.markAiLaunchAutoTitle(tabId, 'codex');
-    terminalRegistry.get(tabId)?.scrollToBottom();
-    focusTerminal();
-    ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex', cwd: launchCwd }));
+    try {
+      store.setTabCommandType(tabId, 'codex');
+      store.markAiLaunchAutoTitle(tabId, 'codex');
+      terminalRegistry.get(tabId)?.scrollToBottom();
+      focusTerminal();
+      ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex', cwd: launchCwd }));
+    } catch (e) {
+      clearSessionLifecycleAction(actionReason + ':clear');
+      throw e;
+    }
   };
 
   // Fork current Claude session into SDK. This is a branch action FROM a tab
@@ -1887,6 +2038,7 @@ export default function ClaudeControlBar({
   // -----------------------------+---------+-------------+-------------+---------+-------------+----------
   // ⎘ copy-session-id            | -       | + если saved| + saved     | -       | + (если sid)| + (если sid)
   // SessionActionChip            | "Start" | "Stop" hover| "Continue"  | "Claude"| "Stop" hover| "Claude"
+  //   transition/loader          | disabled during PTY starting/stopping and local control-action in-flight
   // ↻ refresh-timeline           | -       | + saved     | + saved     | -       | +           | +
   // ⑂→▭ forkToTab (PTY)          | -       | + saved     | + saved     | -       | +           | +
   // ⑂→SDK forkToSDK              | -       | + saved     | + saved     | -       | -           | -
@@ -2063,6 +2215,8 @@ export default function ClaudeControlBar({
               mode="pty"
               isCommandRunning={isCommandRunning}
               hasAnySession={hasAnySession}
+              disabled={sessionActionDisabled}
+              disabledTitle={sessionActionDisabledTitle}
               onStart={onStart}
               onContinue={onContinue}
               onStop={onStop}
@@ -2222,6 +2376,8 @@ export default function ClaudeControlBar({
               mode="pty"
               isCommandRunning={false}
               hasAnySession={false}
+              disabled={sessionActionDisabled}
+              disabledTitle={sessionActionDisabledTitle}
               onStart={startCodexTab}
               onContinue={startCodexTab}
               onStop={() => {}}

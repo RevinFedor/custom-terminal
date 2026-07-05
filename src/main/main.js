@@ -3203,7 +3203,7 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected') {
   const prev = codexKnownSessions.get(tabId) || null;
   codexKnownSessions.set(tabId, sessionId);
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('terminal:mcp-ai-tab', { tabId, engine: 'codex', sessionId });
+    mainWindow.webContents.send('terminal:mcp-ai-tab', { tabId, engine: 'codex', sessionId, reason });
   }
   if (prev !== sessionId) {
     console.log('[Codex:Known] set tab=' + String(tabId).slice(-12) +
@@ -3417,6 +3417,28 @@ function broadcastAiRuntimeStatus(tabId, toolType, sessionStatus, reason) {
     };
     if (sessionStatus === 'inactive' && persisted?.project_id) {
       scheduleProjectLayoutBroadcast(persisted.project_id, 'claude-runtime-inactive');
+    }
+  } else if (toolType === 'codex') {
+    let persisted = null;
+    try {
+      persisted = projectManager?.db?.db?.prepare(
+        'SELECT project_id, codex_session_id, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
+      ).get(tabId) || null;
+    } catch {}
+    const materializationSessionId = getCodexRuntimeSessionId(tabId)
+      || persisted?.codex_session_id
+      || null;
+    if (!sessionId && materializationSessionId) sessionId = materializationSessionId;
+    const conversationMaterialized = !!materializationSessionId;
+    transcriptState = {
+      conversationMaterialized,
+      canResume: sessionStatus === 'inactive' && conversationMaterialized,
+      canCopySessionId: conversationMaterialized,
+      timelineCount: null,
+      materializationReason: conversationMaterialized ? 'codex-session-id' : 'no-session-id',
+    };
+    if (sessionStatus === 'inactive' && persisted?.project_id) {
+      scheduleProjectLayoutBroadcast(persisted.project_id, 'codex-runtime-inactive');
     }
   }
   _webBroadcast(tabId, {
@@ -3698,6 +3720,110 @@ function resolveClaudeSessionFileForTab(tabId, sessionId = bridgeKnownSessions.g
   const cwd = terminalProjects.get(tabId);
   const located = findSessionFile(sessionId, cwd);
   return located?.filePath || null;
+}
+
+const CLAUDE_STARTUP_SLASH_PROOF_TAIL_BYTES = 512 * 1024;
+
+function normalizeClaudeLocalCommandText(text) {
+  return String(text || '')
+    .replace(/\u001b\[[0-9;]*m/g, '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseClaudeStartupSlashCommand(command) {
+  const text = String(command || '').trim();
+  const match = text.match(/^\/(model|effort)\s+(.+)$/i);
+  if (!match) return null;
+  return {
+    kind: match[1].toLowerCase(),
+    value: match[2].trim().toLowerCase(),
+  };
+}
+
+function claudeStartupSlashRecordKind(rec, target) {
+  const content = rec?.message?.content;
+  if (typeof content !== 'string') return null;
+  const text = normalizeClaudeLocalCommandText(content);
+  if (target.kind === 'effort') {
+    if (text.startsWith('<command-name>/effort</command-name>')) return 'wrapper';
+    if (/^<local-command-stdout>Set effort level to\b/i.test(text)
+      && text.toLowerCase().includes('set effort level to ' + target.value)) return 'stdout';
+  }
+  if (target.kind === 'model') {
+    if (text.startsWith('<command-name>/model</command-name>')) return 'wrapper';
+    if (/^<local-command-stdout>Set model to\b/i.test(text)) return 'stdout';
+  }
+  return null;
+}
+
+function scanClaudeStartupSlashProof(tabId, command, afterMs) {
+  const target = parseClaudeStartupSlashCommand(command);
+  if (!target) return { success: false, reason: 'unsupported-command' };
+  const sessionId = bridgeKnownSessions.get(tabId) || null;
+  const filePath = resolveClaudeSessionFileForTab(tabId, sessionId);
+  if (!filePath) {
+    return { success: false, reason: 'session-file-missing', sessionId };
+  }
+
+  try {
+    const stat = fs.statSync(filePath);
+    const readSize = Math.min(CLAUDE_STARTUP_SLASH_PROOF_TAIL_BYTES, stat.size);
+    if (readSize <= 0) return { success: false, reason: 'empty-file', sessionId, fileSize: stat.size };
+    const startOffset = stat.size - readSize;
+    const fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(readSize);
+    try { fs.readSync(fd, buf, 0, readSize, startOffset); }
+    finally { fs.closeSync(fd); }
+
+    const tail = buf.toString('utf8');
+    const rawLines = tail.split('\n');
+    const lines = startOffset > 0 ? rawLines.slice(1) : rawLines;
+    const minTs = Number(afterMs || 0) > 0 ? Number(afterMs) - 1000 : 0;
+    let wrapperSeen = false;
+    let stdoutSeen = false;
+    let latestTs = 0;
+    let latestKind = null;
+
+    for (const line of lines) {
+      if (!line || line[0] !== '{') continue;
+      let rec;
+      try { rec = JSON.parse(line); } catch { continue; }
+      const ts = Date.parse(rec.timestamp || '');
+      if (minTs > 0 && (!Number.isFinite(ts) || ts < minTs)) continue;
+      const kind = claudeStartupSlashRecordKind(rec, target);
+      if (!kind) continue;
+      latestTs = Number.isFinite(ts) ? ts : latestTs;
+      latestKind = kind;
+      if (kind === 'wrapper') wrapperSeen = true;
+      if (kind === 'stdout') {
+        stdoutSeen = true;
+        return {
+          success: true,
+          reason: 'jsonl-stdout',
+          sessionId,
+          timestamp: rec.timestamp || null,
+          wrapperSeen,
+          stdoutSeen,
+          file: filePath.replace(os.homedir(), '~'),
+        };
+      }
+    }
+
+    return {
+      success: false,
+      reason: stdoutSeen ? 'stdout-unmatched' : 'stdout-not-found',
+      sessionId,
+      wrapperSeen,
+      stdoutSeen,
+      latestTs,
+      latestKind,
+      file: filePath.replace(os.homedir(), '~'),
+    };
+  } catch (error) {
+    return { success: false, reason: 'scan-error', error: error.message, sessionId };
+  }
 }
 
 function emitClaudeBusyState(tabId, busy, reason, meta = null) {
@@ -7122,7 +7248,6 @@ function startMcpHttpServer() {
               res.end(JSON.stringify({ error: 'Codex fork requires sessionId' }));
               return;
             }
-            _markTerminalAsAiTab(tabId, engine, mode === 'new' ? null : (sessionId || null));
             const startedAt = Date.now();
             const command = mode === 'fork'
               ? 'codex-f'
@@ -7131,6 +7256,24 @@ function startMcpHttpServer() {
                 : sessionId
                 ? 'codex-c'
                 : 'codex';
+            const boundSessionId = getCodexBoundSessionId(tabId);
+            if (command === 'codex' && !sessionId && boundSessionId) {
+              console.warn('[MCP:Terminal] /terminal/ai-start blocked plain Codex start over bound session tab=' + String(tabId).slice(-12)
+                + ' oldSession=' + String(boundSessionId).slice(0, 8)
+                + ' mode=' + (mode || '-')
+                + ' cwd=' + (termCwd || 'n/a'));
+              res.writeHead(409);
+              res.end(JSON.stringify({
+                error: 'tab_has_resumable_session',
+                reason: 'plain_codex_start_blocked_by_bound_session',
+                tabId,
+                engine: 'codex',
+                sessionId: boundSessionId,
+                canResume: true,
+              }));
+              return;
+            }
+            _markTerminalAsAiTab(tabId, engine, mode === 'new' ? null : (sessionId || null));
             const effectiveModel = model || readDefaultCodexSetting('defaultCodexModel');
             const effectiveEffort = effort || readDefaultCodexSetting('defaultCodexEffort');
             if (command === 'codex-c') {
@@ -8599,10 +8742,13 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
 
       // Parse OSC 133 for command lifecycle events (just spy, don't modify)
       parseOSC133AndEmit(tabId, data);
-      tryHandleCodexStartupAutoEnter(tabId, data);
-      void tryEmitCodexTuiReady(tabId, data).catch((err) => {
-        console.warn('[CodexTuiReady] probe failed tab=' + String(tabId).slice(-12) + ' ' + (err?.message || String(err)));
-      });
+      const outputToolType = bridgeKnownSessions.has(tabId) ? 'claude' : resolveAiToolTypeForTab(tabId);
+      if (outputToolType !== 'claude') {
+        tryHandleCodexStartupAutoEnter(tabId, data);
+        void tryEmitCodexTuiReady(tabId, data).catch((err) => {
+          console.warn('[CodexTuiReady] probe failed tab=' + String(tabId).slice(-12) + ' ' + (err?.message || String(err)));
+        });
+      }
 
       // ========== CLAUDE HANDSHAKE (Prompt Injection) ==========
       // Wait for prompt to appear, debounce UI settling, then send pending prompt.
@@ -10659,6 +10805,27 @@ ipcMain.handle('claude:get-presence', (event, tabId) => {
     timelineCount: typeof materialization?.timelineCount === 'number' ? materialization.timelineCount : null,
     materializationReason: materialization?.reason || null,
   };
+});
+
+ipcMain.handle('claude:startup-slash-proof', (event, payload = {}) => {
+  const tabId = String(payload?.tabId || '');
+  const command = String(payload?.command || '');
+  const afterMs = Number(payload?.afterMs || 0);
+  const label = String(payload?.label || 'startup-slash-proof');
+  if (!tabId || !command) return { success: false, reason: 'missing-args' };
+  const result = scanClaudeStartupSlashProof(tabId, command, afterMs);
+  console.log('[ClaudeStartupSlashProof] tab=' + tabId.slice(-12)
+    + ' label=' + label
+    + ' command=' + JSON.stringify(command)
+    + ' afterMs=' + (afterMs || 0)
+    + ' success=' + (result.success === true)
+    + ' reason=' + (result.reason || '-')
+    + ' wrapperSeen=' + !!result.wrapperSeen
+    + ' stdoutSeen=' + !!result.stdoutSeen
+    + ' session=' + (result.sessionId ? String(result.sessionId).slice(0, 8) : '-')
+    + ' file=' + (result.file || '-')
+    + ' error=' + (result.error || '-'));
+  return result;
 });
 
 ipcMain.handle('agent:get-stopping-state', async (_event, tabId) => {
@@ -19221,6 +19388,14 @@ function codexSessionIdFromDb(tabId) {
   }
 }
 
+function getCodexBoundSessionId(tabId) {
+  if (!tabId) return null;
+  return codexTurnWatchers.get(tabId)?.sessionId
+    || codexKnownSessions.get(tabId)
+    || codexSessionIdFromDb(tabId)
+    || null;
+}
+
 function getCodexSessionOwner(sessionId, exceptTabId = null) {
   if (!sessionId) return null;
   for (const [knownTabId, knownSessionId] of codexKnownSessions) {
@@ -19307,9 +19482,29 @@ function startCodexSessionWatcher(sender, { tabId, cwd, startedAt, sourceSession
           console.warn('[Codex Watcher] duplicate session skipped:', hit.sessionId, 'candidateTab:', tabId, 'ownerTab:', owner.tabId, 'ownerSource:', owner.source, 'reason:', reason);
           return;
         }
+        const boundSessionId = getCodexBoundSessionId(tabId);
+        const strictLink = !!sourceSessionId && (
+          hit.sourceMatched === true
+          || hit.parentThreadId === sourceSessionId
+          || hit.forkedFromId === sourceSessionId
+        );
+        if (boundSessionId && boundSessionId !== hit.sessionId && !strictLink) {
+          console.warn('[Codex Watcher] adoption rejected: tab=' + String(tabId).slice(-12)
+            + ' oldSession=' + String(boundSessionId).slice(0, 8)
+            + ' newSession=' + String(hit.sessionId).slice(0, 8)
+            + ' reason=' + reason
+            + ' cwdMatched=' + !!hit.cwdMatched
+            + ' sourceMatched=' + !!hit.sourceMatched
+            + ' source=' + (sourceSessionId || 'n/a')
+            + ' parent=' + (hit.parentThreadId || 'n/a')
+            + ' forkedFrom=' + (hit.forkedFromId || 'n/a')
+            + ' originator=' + (hit.originator || 'n/a')
+            + ' threadSource=' + (hit.threadSource || 'n/a'));
+          return;
+        }
         found = true;
         console.log('[Codex Watcher] session detected:', hit.sessionId, 'tab:', tabId, 'reason:', reason, 'file:', hit.filePath, 'cwd:', hit.cwd || 'n/a', 'cwdMatched:', !!hit.cwdMatched, 'sourceMatched:', !!hit.sourceMatched, 'source:', sourceSessionId || 'n/a', 'threadSource:', hit.threadSource || 'n/a', 'parent:', hit.parentThreadId || 'n/a', 'forkedFrom:', hit.forkedFromId || 'n/a', 'originator:', hit.originator || 'n/a', 'excludeCount:', excludeSessionIds.length);
-        setCodexKnownSession(tabId, hit.sessionId, 'watcher-detected');
+        setCodexKnownSession(tabId, hit.sessionId, sourceSessionId ? 'watcher-detected-linked' : 'watcher-detected');
         startCodexTurnWatcher({ tabId, sessionId: hit.sessionId, filePath: hit.filePath, catchUpPendingAudit: true });
         sender.send('codex:session-detected', { tabId, sessionId: hit.sessionId, cwd: hit.cwd || null });
         closeCodexWatcher(tabId, 'detected');
@@ -20715,6 +20910,27 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
   }
 
   const termCwd = cwd || terminalProjects.get(tabId);
+  const normalizedCommand = command || 'codex';
+  const boundSessionId = getCodexBoundSessionId(tabId);
+  if (normalizedCommand === 'codex' && !sessionId && boundSessionId && payload.allowNewOverExisting !== true) {
+    console.warn('[Codex Runner] blocked plain start over bound session tab=' + String(tabId).slice(-12)
+      + ' oldSession=' + String(boundSessionId).slice(0, 8)
+      + ' cwd=' + (termCwd || 'n/a')
+      + ' restartReason=' + (payload.restartReason || 'direct'));
+    return {
+      success: false,
+      accepted: false,
+      error: 'tab_has_resumable_session',
+      reason: 'plain_codex_start_blocked_by_bound_session',
+      tabId,
+      command: normalizedCommand,
+      sessionId: boundSessionId,
+      conversationMaterialized: true,
+      canResume: true,
+      canCopySessionId: true,
+      materializationReason: 'codex-session-bound',
+    };
+  }
   const startedAt = Date.now();
   const effectiveModel = model || readDefaultCodexSetting('defaultCodexModel');
   const effectiveEffort = effort || readDefaultCodexSetting('defaultCodexEffort');
@@ -20724,7 +20940,7 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
   codexLastRunCommandPayload.set(tabId, {
     launchId,
     tabId,
-    command: command || 'codex',
+    command: normalizedCommand,
     sessionId,
     cwd: termCwd,
     model: effectiveModel,
@@ -20733,7 +20949,7 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
     mcpStartupRestartAttempts,
     startedAt,
   });
-  console.log('[Codex Runner] Command:', command, 'tab:', tabId, 'session:', sessionId || 'new', 'cwd:', termCwd, 'model:', effectiveModel || 'default', 'effort:', effectiveEffort || 'default', 'developerInstructionsChars:', developerInstructions ? String(developerInstructions).length : 0, 'restartReason:', restartReason, 'mcpStartupRestarts:', mcpStartupRestartAttempts, 'launchId:', launchId);
+  console.log('[Codex Runner] Command:', normalizedCommand, 'tab:', tabId, 'session:', sessionId || 'new', 'cwd:', termCwd, 'model:', effectiveModel || 'default', 'effort:', effectiveEffort || 'default', 'developerInstructionsChars:', developerInstructions ? String(developerInstructions).length : 0, 'restartReason:', restartReason, 'mcpStartupRestarts:', mcpStartupRestartAttempts, 'launchId:', launchId);
 
   codexSavedClipboardImagesByTab.delete(tabId);
   invalidateAiProcessLookupCache(tabId, 'codex');
@@ -20745,10 +20961,10 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
     mainWindow.webContents.send('terminal:command-started', { tabId, commandType: 'codex' });
   }
   clearCodexTuiReady(tabId, 'run-command');
-  armCodexStartupAutoEnter(tabId, { command: command || 'codex', sessionId, cwd: termCwd });
+  armCodexStartupAutoEnter(tabId, { command: normalizedCommand, sessionId, cwd: termCwd });
   broadcastCodexStartingSnapshot(tabId, 'codex-run-command');
 
-  if (command === 'codex-c' && sessionId) {
+  if (normalizedCommand === 'codex-c' && sessionId) {
     closeCodexWatcher(tabId, 'resume-known-session');
     setCodexKnownSession(tabId, sessionId, 'resume-known-session');
     const notifyTarget = sender || (mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null);
@@ -20759,7 +20975,7 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
       suppressBusyCatchUp: true,
       catchUpReason: 'codex-c-resume',
     });
-  } else if (command === 'codex-f' && sessionId) {
+  } else if (normalizedCommand === 'codex-f' && sessionId) {
     startCodexSessionWatcher(sender, { tabId, cwd: termCwd, startedAt, sourceSessionId: sessionId });
     console.log('[Codex Runner] Fork source session provided; waiting for watcher to capture the new fork session id');
   } else {
@@ -20774,7 +20990,7 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
   }
 
   const cmdLine = buildCodexCommand({
-    command: command || 'codex',
+    command: normalizedCommand,
     sessionId,
     cwd: termCwd,
     model: effectiveModel,
@@ -20791,7 +21007,7 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
   if (!accepted.accepted) {
     console.error(
       '[Codex Runner] launch not accepted tab=' + String(tabId).slice(-12) +
-      ' command=' + (command || 'codex') +
+      ' command=' + normalizedCommand +
       ' reason=' + (accepted.reason || accepted.error || 'unknown')
     );
     clearCodexLaunchPayload(tabId, 'launch-not-accepted');
@@ -20821,7 +21037,7 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
       error: accepted.error || 'codex_launch_not_accepted',
       reason: accepted.reason || null,
       tabId,
-      command: command || 'codex',
+      command: normalizedCommand,
       sessionId: sessionId || null,
     };
   }
@@ -20831,7 +21047,7 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
     launchId,
     pid: accepted.pid || null,
     tabId,
-    command: command || 'codex',
+    command: normalizedCommand,
     sessionId: sessionId || null,
   };
 }

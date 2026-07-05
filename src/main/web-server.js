@@ -2116,15 +2116,22 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const claudeMaterialization = t.claudeSessionId
         ? claudeMaterializationFor(t.claudeSessionId, t.cwd)
         : null;
-      const timelineCount = typeof claudeMaterialization?.timelineCount === 'number'
+      const runtimeCodexSessionId = runtimeSessionMap.get(t.tabId) || null;
+      const codexSessionId = runtimeCodexSessionId || t.codexSessionId || null;
+      const isCodex = t.commandType === 'codex';
+      const isClaude = t.commandType === 'claude';
+      const timelineCount = isClaude && typeof claudeMaterialization?.timelineCount === 'number'
         ? claudeMaterialization.timelineCount
         : null;
-      const conversationMaterialized = claudeMaterialization?.materialized === true;
+      const conversationMaterialized = isClaude
+        ? claudeMaterialization?.materialized === true
+        : isCodex
+          ? !!codexSessionId
+          : false;
       // Assigned-category status (DB column session_status holds the palette id;
       // distinct from runtime sessionStatus which drives the loader/background).
       const statusId = t.sessionStatus || null;
       const runtimeStatus = statusMap.get(t.tabId) || null;
-      const runtimeCodexSessionId = runtimeSessionMap.get(t.tabId) || null;
       const isPtyAgent = (t.commandType === 'claude' || t.commandType === 'codex') && (t.tabType || 'terminal') !== 'claude-sdk';
       const notification = completionNotificationMap.get(t.tabId) || {};
       return {
@@ -2136,13 +2143,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
         cwd: t.cwd,
         filePath: t.filePath || null,
         claudeSessionId: t.claudeSessionId,
-        codexSessionId: runtimeCodexSessionId || t.codexSessionId,
+        codexSessionId,
         geminiSessionId: t.geminiSessionId,
         timelineCount,
         conversationMaterialized,
-        canResume: t.commandType === 'claude' && runtimeStatus === 'inactive' && conversationMaterialized,
-        canCopySessionId: t.commandType === 'claude' ? conversationMaterialized : !!(t.codexSessionId || t.geminiSessionId),
-        materializationReason: claudeMaterialization?.reason || null,
+        canResume: (isClaude || isCodex) && runtimeStatus === 'inactive' && conversationMaterialized,
+        canCopySessionId: isClaude ? conversationMaterialized : !!(codexSessionId || t.geminiSessionId),
+        materializationReason: isClaude ? (claudeMaterialization?.reason || null) : (isCodex ? (codexSessionId ? 'codex-session-id' : 'no-session-id') : null),
         sessionStatus: runtimeStatus,
         starting: runtimeStatus === 'starting',
         stopping: runtimeStatus === 'stopping',
@@ -2552,6 +2559,42 @@ async function handleApi(req, res, parsed, sdkSessions) {
     try {
       const body = await readBody(req);
       const startupTimeoutMs = Math.max(1000, Math.min(60_000, Number(body.startupTimeoutMs) || 60_000));
+      let beforeStatus = null;
+      try {
+        beforeStatus = await bridgeRequest('getClaudeTabStatus', { tabId }, 1500);
+      } catch (statusErr) {
+        console.warn('[MobStart] preflight status failed tab=' + shortId(tabId, 12)
+          + ' error=' + String(statusErr?.message || statusErr));
+      }
+      console.log('[MobStart] request tab=' + shortId(tabId, 12)
+        + ' status=' + (beforeStatus?.status || '-')
+        + ' tool=' + (beforeStatus?.toolType || beforeStatus?.commandType || '-')
+        + ' session=' + shortId(beforeStatus?.sessionId || beforeStatus?.codexSessionId || beforeStatus?.claudeSessionId)
+        + ' materialized=' + (beforeStatus?.conversationMaterialized === true)
+        + ' canResume=' + (beforeStatus?.canResume === true)
+        + ' bodyAction=start');
+      if ((beforeStatus?.toolType === 'codex' || beforeStatus?.commandType === 'codex')
+        && beforeStatus?.canResume === true
+        && (beforeStatus?.sessionId || beforeStatus?.codexSessionId)) {
+        return sendJson(res, 409, {
+          ok: false,
+          success: false,
+          ready: false,
+          error: 'tab_has_resumable_session',
+          reason: 'start_blocked_by_codex_resume_state',
+          tabId,
+          toolType: 'codex',
+          commandType: 'codex',
+          sessionId: beforeStatus.sessionId || beforeStatus.codexSessionId,
+          codexSessionId: beforeStatus.codexSessionId || beforeStatus.sessionId,
+          status: beforeStatus.status || 'inactive',
+          conversationMaterialized: true,
+          canResume: true,
+          canCopySessionId: true,
+          timelineCount: beforeStatus.timelineCount ?? null,
+          materializationReason: beforeStatus.materializationReason || 'codex-session-bound',
+        });
+      }
       let data;
       try {
         data = await bridgeRequest('startAgentTab', { tabId }, Math.max(5000, Math.min(15_000, startupTimeoutMs)));

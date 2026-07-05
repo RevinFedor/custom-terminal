@@ -1569,14 +1569,23 @@ function App() {
       } as any);
     };
 
-    const handleMcpAiTab = (_: any, data: { tabId: string; engine: 'claude' | 'codex' | 'gemini'; sessionId?: string }) => {
+    const handleMcpAiTab = (_: any, data: { tabId: string; engine: 'claude' | 'codex' | 'gemini'; sessionId?: string; reason?: string }) => {
       if (!data?.tabId || !data?.engine) return;
       const store = useWorkspaceStore.getState();
       store.setTabCommandType(data.tabId, data.engine as any);
       if (data.engine === 'claude' && data.sessionId) {
         store.setClaudeSessionId(data.tabId, data.sessionId, 'unknown');
       } else if (data.engine === 'codex' && data.sessionId) {
-        store.setCodexSessionId(data.tabId, data.sessionId, 'unknown');
+        const current = store.getCodexSessionId?.(data.tabId) || null;
+        const reason = data.reason || 'unknown';
+        if (current && current !== data.sessionId && reason === 'watcher-detected') {
+          console.warn('[CodexSessionGuard:R] reject unlinked session replace tab=' + String(data.tabId).slice(-12)
+            + ' old=' + current.slice(0, 8)
+            + ' next=' + data.sessionId.slice(0, 8)
+            + ' reason=' + reason);
+          return;
+        }
+        store.setCodexSessionId(data.tabId, data.sessionId, reason);
       }
     };
 
@@ -1892,15 +1901,23 @@ function App() {
               color: t.color || null,   // desktop TabColor — drives row bg on mobile
               cwd: t.cwd,
               filePath: t.filePath || null,
-	              claudeSessionId: t.claudeSessionId,
-	              codexSessionId: effectiveCodexSessionId,
-	              geminiSessionId: t.geminiSessionId,
-	              conversationMaterialized: toolType === 'claude' ? claudeMaterialization?.conversationMaterialized === true : !!(effectiveCodexSessionId || t.geminiSessionId),
-	              canResume: toolType === 'claude' && sessionStatus === 'inactive' && claudeMaterialization?.conversationMaterialized === true,
-	              canCopySessionId: toolType === 'claude' ? claudeMaterialization?.conversationMaterialized === true : !!(effectiveCodexSessionId || t.geminiSessionId),
-	              timelineCount: toolType === 'claude' ? claudeMaterialization?.timelineCount ?? null : null,
-	              materializationReason: toolType === 'claude' ? claudeMaterialization?.materializationReason || claudeMaterialization?.reason || null : null,
-	              sessionStatus,
+              claudeSessionId: t.claudeSessionId,
+              codexSessionId: effectiveCodexSessionId,
+              geminiSessionId: t.geminiSessionId,
+              conversationMaterialized: toolType === 'claude' ? claudeMaterialization?.conversationMaterialized === true : !!(effectiveCodexSessionId || t.geminiSessionId),
+              canResume: toolType === 'claude'
+                ? sessionStatus === 'inactive' && claudeMaterialization?.conversationMaterialized === true
+                : toolType === 'codex'
+                  ? sessionStatus === 'inactive' && !!effectiveCodexSessionId
+                  : false,
+              canCopySessionId: toolType === 'claude' ? claudeMaterialization?.conversationMaterialized === true : !!(effectiveCodexSessionId || t.geminiSessionId),
+              timelineCount: toolType === 'claude' ? claudeMaterialization?.timelineCount ?? null : null,
+              materializationReason: toolType === 'claude'
+                ? claudeMaterialization?.materializationReason || claudeMaterialization?.reason || null
+                : toolType === 'codex'
+                  ? (effectiveCodexSessionId ? 'codex-session-id' : 'no-session-id')
+                  : null,
+              sessionStatus,
               starting: sessionStatus === 'starting',
               stopping: sessionStatus === 'stopping',
               inputReady,
@@ -2736,9 +2753,28 @@ function App() {
         if (action === 'startAgentTab') {
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
-          const { tab, toolType } = describeAgentTab(tabId);
+          const { tab, toolType, sessionId } = describeAgentTab(tabId);
           if (!tab || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
-          console.log('[MobStart:Bridge] startAgentTab begin tool=' + toolType + ' tab=' + String(tabId).slice(-12));
+          if (toolType === 'codex' && sessionId) {
+            console.warn('[MobStart:Bridge] blocked resumable Codex tab=' + String(tabId).slice(-12)
+              + ' oldSession=' + String(sessionId).slice(0, 8));
+            return reply(false, {
+              tabId,
+              toolType,
+              sessionId,
+              success: false,
+              ok: false,
+              status: 'inactive',
+              inputReady: false,
+              conversationMaterialized: true,
+              canResume: true,
+              canCopySessionId: true,
+              timelineCount: null,
+              materializationReason: 'codex-session-bound',
+              error: 'tab_has_resumable_session',
+            }, 'tab_has_resumable_session');
+          }
+          console.log('[MobStart:Bridge] startAgentTab begin tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' oldSession=' + (sessionId ? String(sessionId).slice(0, 8) : 'none'));
           try {
             state.setTabCommandType(tabId, toolType);
             state.markAiLaunchAutoTitle(tabId, toolType);
@@ -3007,29 +3043,35 @@ function App() {
               inputReady[tid] = ready;
               if (notReady) lastNotReady[tid] = notReady;
               if (failed) startupFailed[tid] = true;
-	              if (failedError) startupError[tid] = failedError;
-	              if ((p as any)?.manualActionRequired) manualActionRequired[tid] = true;
-	              if ((p as any)?.manualActionType) manualActionType[tid] = (p as any).manualActionType;
-	              if (toolType === 'claude') {
-	                const tab = findTab(tid);
-	                const materialization = await readClaudeMaterialization(tab);
-	                conversationMaterialized[tid] = materialization.conversationMaterialized === true;
-	                timelineCount[tid] = materialization.timelineCount ?? null;
-	                canResume[tid] = statuses[tid] === 'inactive' && materialization.conversationMaterialized === true;
-	                canCopySessionId[tid] = materialization.conversationMaterialized === true;
-	                materializationReason[tid] = materialization.materializationReason || materialization.reason || null;
-	                if (p?.awaiting) awaiting[tid] = true;
-	              }
-	              if (toolType === 'codex') {
+              if (failedError) startupError[tid] = failedError;
+              if ((p as any)?.manualActionRequired) manualActionRequired[tid] = true;
+              if ((p as any)?.manualActionType) manualActionType[tid] = (p as any).manualActionType;
+              if (toolType === 'claude') {
+                const tab = findTab(tid);
+                const materialization = await readClaudeMaterialization(tab);
+                conversationMaterialized[tid] = materialization.conversationMaterialized === true;
+                timelineCount[tid] = materialization.timelineCount ?? null;
+                canResume[tid] = statuses[tid] === 'inactive' && materialization.conversationMaterialized === true;
+                canCopySessionId[tid] = materialization.conversationMaterialized === true;
+                materializationReason[tid] = materialization.materializationReason || materialization.reason || null;
+                if (p?.awaiting) awaiting[tid] = true;
+              }
+              if (toolType === 'codex') {
                 const runtimeSession = await ipcRenderer.invoke('codex:get-runtime-session', tid).catch(() => null);
-                if (runtimeSession?.sessionId) sessions[tid] = runtimeSession.sessionId;
+                const codexSessionId = runtimeSession?.sessionId || findTab(tid)?.codexSessionId || null;
+                if (codexSessionId) sessions[tid] = codexSessionId;
+                conversationMaterialized[tid] = !!codexSessionId;
+                canResume[tid] = statuses[tid] === 'inactive' && !!codexSessionId;
+                canCopySessionId[tid] = !!codexSessionId;
+                timelineCount[tid] = null;
+                materializationReason[tid] = codexSessionId ? 'codex-session-id' : 'no-session-id';
               }
             } catch {
               statuses[tid] = 'inactive';
               inputReady[tid] = false;
             }
           }
-	          return reply(true, { statuses, inputReady, lastNotReady, awaiting, sessions, startupFailed, startupError, startupDefaultsPending, startupDefaultsReady, startupDefaultsError, manualActionRequired, manualActionType, conversationMaterialized, timelineCount, canResume, canCopySessionId, materializationReason });
+          return reply(true, { statuses, inputReady, lastNotReady, awaiting, sessions, startupFailed, startupError, startupDefaultsPending, startupDefaultsReady, startupDefaultsError, manualActionRequired, manualActionType, conversationMaterialized, timelineCount, canResume, canCopySessionId, materializationReason });
         }
         if (action === 'getClaudeTabStatus') {
           const { tabId } = payload || {};
