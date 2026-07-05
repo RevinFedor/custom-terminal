@@ -120,6 +120,39 @@ function isDocsPath(filePath) {
   return filePath === 'docs' || filePath.startsWith('docs/');
 }
 
+function uniqueNonEmptyStrings(items) {
+  const seen = new Set();
+  const result = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    const value = String(item || '').trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    result.push(value);
+  }
+  return result;
+}
+
+function normalizeSelectedChangedPaths(status, selectedPaths) {
+  const files = Array.isArray(status?.files) ? status.files : [];
+  const allowed = new Set(files.map((file) => file.path));
+  const selected = Array.isArray(selectedPaths) && selectedPaths.length
+    ? uniqueNonEmptyStrings(selectedPaths)
+    : files.map((file) => file.path);
+  const paths = [];
+  const invalid = [];
+  for (const filePath of selected) {
+    if (allowed.has(filePath)) paths.push(filePath);
+    else invalid.push(filePath);
+  }
+  return { paths, invalid };
+}
+
+function staleSelectionError(invalidPaths) {
+  const preview = invalidPaths.slice(0, 3).join(', ');
+  const suffix = invalidPaths.length > 3 ? ` and ${invalidPaths.length - 3} more` : '';
+  return `Selected files changed. Refresh Changes and select files again${preview ? `: ${preview}${suffix}` : ''}`;
+}
+
 function trimText(text, maxChars) {
   if (!text || text.length <= maxChars) return { text: text || '', truncated: false };
   const head = text.slice(0, maxChars);
@@ -866,7 +899,11 @@ function register({ projectManager }) {
       if (!root) throw new Error('Not a Git repository');
       const status = await getStatusForRoot(root);
       if (!status.files.length) throw new Error('No changed files');
-      const diffBundle = await collectDiffForPrompt(root, status, payload?.selectedPaths, docsOnlyWhenPresent);
+      const selection = normalizeSelectedChangedPaths(status, payload?.selectedPaths);
+      if (selection.invalid.length) {
+        return { success: false, staleSelection: true, error: staleSelectionError(selection.invalid) };
+      }
+      const diffBundle = await collectDiffForPrompt(root, status, selection.paths, docsOnlyWhenPresent);
       if (!diffBundle.includedPaths.length) throw new Error('No selected files');
       const promptConfig = getGitCommitPromptConfig(projectManager);
       model = promptConfig.model;
@@ -928,12 +965,24 @@ function register({ projectManager }) {
     try {
       const root = await getRepoRoot(projectPath);
       if (!root) throw new Error('Not a Git repository');
-      const paths = Array.isArray(selectedPaths) ? selectedPaths.filter(Boolean) : [];
+      const status = await getStatusForRoot(root);
+      if (!status.files.length) throw new Error('No changed files');
+      const selection = normalizeSelectedChangedPaths(status, selectedPaths);
+      if (selection.invalid.length) {
+        return { success: false, staleSelection: true, error: staleSelectionError(selection.invalid) };
+      }
+      const paths = selection.paths;
       if (!paths.length) throw new Error('Select at least one changed file');
       const cleanSummary = String(summary || '').trim();
       if (!cleanSummary) throw new Error('Commit summary is required');
       const addResult = await runGit(root, ['add', '--', ...paths]);
-      if (!addResult.success) return { success: false, error: addResult.stderr || addResult.error || 'git add failed' };
+      if (!addResult.success) {
+        const addError = addResult.stderr || addResult.error || 'git add failed';
+        if (/pathspec.+did not match any files/i.test(addError)) {
+          return { success: false, staleSelection: true, error: staleSelectionError(paths) };
+        }
+        return { success: false, error: addError };
+      }
       const commitArgs = ['commit', '--only', '-m', cleanSummary];
       const cleanDescription = String(description || '').trim();
       if (cleanDescription) commitArgs.push('-m', cleanDescription);

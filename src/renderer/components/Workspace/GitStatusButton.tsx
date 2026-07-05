@@ -1122,7 +1122,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         tabId: activeTabId,
         tabName: activeTabName,
       });
-      if (!result?.success) throw new Error(result?.error || 'AI commit message failed');
+      if (!result?.success) {
+        if (result?.staleSelection) await loadStatus(true);
+        throw new Error(result?.error || 'AI commit message failed');
+      }
       setSummary(result.message.summary || '');
       setDescription(result.message.description || '');
       setGenerationMeta(result.meta || null);
@@ -1152,7 +1155,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         summary,
         description,
       });
-      if (!result?.success) throw new Error(result?.error || 'git commit failed');
+      if (!result?.success) {
+        if (result?.staleSelection) await loadStatus(true);
+        throw new Error(result?.error || 'git commit failed');
+      }
       showToast(result.hash ? 'Committed ' + result.hash : 'Committed', 'success');
       setSummary('');
       setDescription('');
