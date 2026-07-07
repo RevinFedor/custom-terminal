@@ -4360,8 +4360,32 @@ function parseTimelineEntries(sourcePath) {
       }
     }
 
+    const compactSummaryText = (entry) => {
+      const raw = entry?.message?.content;
+      if (typeof raw === 'string') return raw.trim();
+      if (Array.isArray(raw)) {
+        return raw
+          .map((item) => item?.type === 'text' && typeof item.text === 'string' ? item.text : '')
+          .filter(Boolean)
+          .join('\n')
+          .trim();
+      }
+      return '';
+    };
+    const findPairedCompactSummary = (boundaryIndex) => {
+      for (let i = boundaryIndex + 1; i < Math.min(branch.length, boundaryIndex + 5); i++) {
+        const candidate = branch[i];
+        if (candidate?.type === 'user' && candidate.isCompactSummary) {
+          return compactSummaryText(candidate);
+        }
+        if (candidate?.type === 'user') break;
+      }
+      return '';
+    };
+
     const out = [];
-    for (const entry of branch) {
+    for (let idx = 0; idx < branch.length; idx++) {
+      const entry = branch[idx];
       if (entry.isSidechain || entry.type === 'summary') continue;
 
       if (entry.type === 'attachment' && entry.attachment?.type === 'queued_command') {
@@ -4379,6 +4403,7 @@ function parseTimelineEntries(sourcePath) {
           tools: [],
         });
       } else if (entry.type === 'user') {
+        if (entry.isCompactSummary) continue;
         let raw = entry.message?.content;
         if (Array.isArray(raw)) {
           if (raw.some(i => i.type === 'tool_result')) continue; // tool result, not a prompt
@@ -4405,12 +4430,13 @@ function parseTimelineEntries(sourcePath) {
           tools: [],
         });
       } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+        const summary = entry.summary || findPairedCompactSummary(idx) || 'Conversation compacted';
         out.push({
           uuid: entry.uuid,
           kind: 'compact',
           color: '#cba6f7',
-          preview: entry.summary || 'Conversation compacted',
-          full: entry.summary || 'Conversation compacted',
+          preview: summary,
+          full: summary,
           truncated: false,
           ts: entry.timestamp || null,
           tools: [],

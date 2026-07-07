@@ -81,8 +81,9 @@ export type RunAfterTabPickerProps = {
   tabId: string;
   autoRun: boolean;
   runAfterTabId: string | null;
+  runAfterTabIds?: string[];
   setRunAfterTab: (tabId: string, target: string | null) => void;
-  panelRef: RefObject<HTMLDivElement>;
+  panelRef: RefObject<HTMLDivElement | null>;
   ownerProjectId?: string | null;
   title?: string;
   emptyLabel?: string;
@@ -98,6 +99,14 @@ export type RunAfterTabPickerProps = {
   showRuntimeDot?: boolean;
   showTargetSummary?: boolean;
   openOnHover?: boolean;
+  onTriggerClick?: () => boolean | void;
+  multiSelect?: boolean;
+  closeOnSelect?: boolean;
+  hideTrigger?: boolean;
+  externalTriggerRef?: RefObject<HTMLElement | null>;
+  openRequestKey?: number;
+  closeRequestKey?: number;
+  modalOverlay?: boolean;
 };
 
 const adjustRgbaAlpha = (rgba: string, delta: number): string => {
@@ -256,6 +265,7 @@ export function RunAfterTabPicker({
   tabId,
   autoRun,
   runAfterTabId,
+  runAfterTabIds,
   setRunAfterTab,
   panelRef,
   ownerProjectId: ownerProjectIdProp = null,
@@ -273,6 +283,14 @@ export function RunAfterTabPicker({
   showRuntimeDot = true,
   showTargetSummary = true,
   openOnHover = false,
+  onTriggerClick,
+  multiSelect = false,
+  closeOnSelect = true,
+  hideTrigger = false,
+  externalTriggerRef,
+  openRequestKey = 0,
+  closeRequestKey = 0,
+  modalOverlay = false,
 }: RunAfterTabPickerProps) {
   const toggleTabGroupCollapsed = useWorkspaceStore((state) => state.toggleTabGroupCollapsed);
   const sessionStatuses = useUIStore((state) => state.sessionStatuses);
@@ -281,6 +299,15 @@ export function RunAfterTabPicker({
   const processBarPosition = useUIStore((state) => state.processBar.position);
   const tabGeo = useUIStore((state) => state.tabGeometry);
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
+  const selectedInputIds = useMemo(() => {
+    const raw = multiSelect && Array.isArray(runAfterTabIds)
+      ? runAfterTabIds
+      : (runAfterTabId ? [runAfterTabId] : []);
+    return Array.from(new Set(raw
+      .map((id) => typeof id === 'string' ? id.trim() : '')
+      .filter((id) => id.length > 0)));
+  }, [multiSelect, runAfterTabId, runAfterTabIds]);
+  const selectedInputKey = selectedInputIds.join('|');
 
   const fingerprint = useWorkspaceStore((state) => {
     let ownerProjectId: string | null = null;
@@ -348,7 +375,7 @@ export function RunAfterTabPicker({
           sessionStatus: t.sessionStatus,
         };
         tabs.push(row);
-        if (t.id === runAfterTabId) selectedTargetProjectId = projectId;
+        if (!selectedTargetProjectId && selectedInputIds.includes(t.id)) selectedTargetProjectId = projectId;
       }
       const orderedTabs = orderTabsWithVisualChildren(tabs);
       const rows = buildPickerRows(orderedTabs, ws.tabGroups || []);
@@ -364,7 +391,7 @@ export function RunAfterTabPicker({
     }
 
     return { groups, ownerProjectId, selectedTargetProjectId };
-  }, [fingerprint, ownerProjectIdProp, tabId, runAfterTabId]);
+  }, [fingerprint, ownerProjectIdProp, tabId, selectedInputKey]);
 
   const [busyMap, setBusyMap] = useState<Map<string, boolean>>(() => getBusyTabsSnapshot());
   useEffect(() => {
@@ -416,8 +443,12 @@ export function RunAfterTabPicker({
     return el;
   });
   const [anchor, setAnchor] = useState<PickerAnchor | null>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
+  const internalTriggerRef = useRef<HTMLButtonElement>(null);
+  const triggerRef = externalTriggerRef || internalTriggerRef;
   const menuRef = useRef<HTMLDivElement>(null);
+  const projectStripRef = useRef<HTMLDivElement>(null);
+  const lastOpenRequestKeyRef = useRef(0);
+  const lastCloseRequestKeyRef = useRef(0);
 
   useEffect(() => {
     document.body.appendChild(portalContainer);
@@ -480,8 +511,9 @@ export function RunAfterTabPicker({
   const handleOpen = useCallback(() => {
     const panelRect = panelRef.current?.getBoundingClientRect() ?? null;
     const triggerRect = triggerRef.current?.getBoundingClientRect() ?? null;
-    const verticalRect = triggerVariant === 'context-row' && triggerRect ? triggerRect : panelRect;
-    const horizontalRect = panelRect ?? triggerRect;
+    const useTriggerRect = !!externalTriggerRef || triggerVariant === 'context-row';
+    const verticalRect = useTriggerRect && triggerRect ? triggerRect : panelRect;
+    const horizontalRect = externalTriggerRef && triggerRect ? triggerRect : (panelRect ?? triggerRect);
     if (!verticalRect || !horizontalRect) return;
     const top = Math.max(8, verticalRect.top);
     const nextAnchor: PickerAnchor = {
@@ -499,7 +531,21 @@ export function RunAfterTabPicker({
     setSelectedProjectId(inventory.selectedTargetProjectId ?? inventory.ownerProjectId ?? inventory.groups[0]?.projectId ?? null);
     setShowAllTabs(showAllTabsOnOpen);
     setOpen(true);
-  }, [inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, menuWidth, panelRef, showAllTabsOnOpen, side, triggerVariant]);
+  }, [externalTriggerRef, inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, menuWidth, panelRef, showAllTabsOnOpen, side, triggerRef, triggerVariant]);
+
+  useEffect(() => {
+    if (!openRequestKey) return;
+    if (lastOpenRequestKeyRef.current === openRequestKey) return;
+    lastOpenRequestKeyRef.current = openRequestKey;
+    handleOpen();
+  }, [handleOpen, openRequestKey]);
+
+  useEffect(() => {
+    if (!closeRequestKey) return;
+    if (lastCloseRequestKeyRef.current === closeRequestKey) return;
+    lastCloseRequestKeyRef.current = closeRequestKey;
+    setOpen(false);
+  }, [closeRequestKey]);
 
   const handleProjectWheel = useCallback((e: WheelEvent<HTMLDivElement>) => {
     const el = e.currentTarget;
@@ -515,15 +561,35 @@ export function RunAfterTabPicker({
   const statusFor = (id: string): Status => (busyMap.get(id) === true ? 'busy' : 'idle');
 
   const allAiTabs = useMemo(() => inventory.groups.flatMap((g) => g.tabs), [inventory.groups]);
-  const selectedTab = runAfterTabId ? allAiTabs.find((t) => t.id === runAfterTabId) ?? null : null;
-  const selectedStatus = selectedTab ? statusFor(selectedTab.id) : null;
+  const selectedIdSet = useMemo(() => new Set(selectedInputIds), [selectedInputKey]);
+  const selectedTabs = useMemo(() => selectedInputIds
+    .map((id) => allAiTabs.find((t) => t.id === id) ?? null)
+    .filter((t): t is AiTab => !!t), [allAiTabs, selectedInputKey]);
+  const selectedTab = selectedTabs[0] ?? null;
+  const selectedStatus = selectedTabs.some((t) => statusFor(t.id) === 'busy') ? 'busy' : (selectedTab ? 'idle' : null);
   const selectedProject = inventory.groups.find((g) => g.projectId === selectedProjectId) ?? inventory.groups[0] ?? null;
   const targetTabs = selectedProject ? selectedProject.tabs.filter((t) => t.id !== tabId) : [];
   const loaderCount = targetTabs.filter((t) => statusFor(t.id) === 'busy').length;
+
+  useEffect(() => {
+    if (!open || !selectedProject?.projectId) return;
+    const frame = requestAnimationFrame(() => {
+      const strip = projectStripRef.current;
+      if (!strip || strip.scrollWidth <= strip.clientWidth) return;
+      const target = Array.from(strip.querySelectorAll<HTMLElement>('[data-run-after-project-chip]'))
+        .find((el) => el.dataset.runAfterProjectChip === selectedProject.projectId);
+      if (!target) return;
+      const centeredLeft = target.offsetLeft + target.offsetWidth / 2 - strip.clientWidth / 2;
+      const maxLeft = Math.max(0, strip.scrollWidth - strip.clientWidth);
+      strip.scrollLeft = Math.max(0, Math.min(maxLeft, centeredLeft));
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [open, selectedProject?.projectId, inventory.groups.length]);
+
   const isVisibleTab = useCallback((t: AiTab) => {
     if (t.id === tabId) return false;
-    return showAllTabs || statusFor(t.id) === 'busy' || t.id === runAfterTabId;
-  }, [runAfterTabId, showAllTabs, tabId, busyMap]);
+    return showAllTabs || statusFor(t.id) === 'busy' || selectedIdSet.has(t.id);
+  }, [showAllTabs, tabId, busyMap, selectedIdSet]);
   const visibleRows = useMemo(() => {
     if (!selectedProject) return [];
     const rows: PickerRow[] = [];
@@ -539,7 +605,10 @@ export function RunAfterTabPicker({
     return rows;
   }, [isVisibleTab, selectedProject]);
 
-  const hasSelectedTarget = !!selectedTab;
+  const hasSelectedTarget = selectedInputIds.length > 0;
+  const selectedSummaryText = multiSelect && selectedInputIds.length > 1
+    ? `${selectedInputIds.length} tabs`
+    : (selectedTab?.name || (hasSelectedTarget ? 'Missing tab' : emptyLabel));
   const activeTargetWait = hasSelectedTarget && autoRun;
   const triggerBorder = open
     ? 'rgba(190,190,190,0.36)'
@@ -559,16 +628,16 @@ export function RunAfterTabPicker({
 
   const renderPillTrigger = () => (
     <button
-      ref={triggerRef}
+      ref={internalTriggerRef}
       onClick={() => open ? setOpen(false) : handleOpen()}
       onMouseEnter={() => setTriggerHover(true)}
       onMouseLeave={() => setTriggerHover(false)}
       title={
-        hasSelectedTarget && selectedTab
+        hasSelectedTarget
           ? (
             autoRun
-              ? `Run after tab "${selectedTab.name}" finishes`
-              : `Run after target saved: "${selectedTab.name}" (off)`
+              ? `Run after ${selectedSummaryText} finishes`
+              : `Run after target saved: ${selectedSummaryText} (off)`
           ) + (selectedStatus === 'busy' ? ' (busy now)' : '')
           : 'Pick a tab to wait on'
       }
@@ -594,7 +663,7 @@ export function RunAfterTabPicker({
         transition: 'background 0.12s, border-color 0.12s, color 0.12s',
       }}
     >
-      {hasSelectedTarget && selectedTab ? (
+      {hasSelectedTarget ? (
         <>
           <span
             role="button"
@@ -628,13 +697,13 @@ export function RunAfterTabPicker({
             {triggerHover ? (
               <X size={10} strokeWidth={2.4} aria-hidden="true" />
             ) : (
-              <span style={{ width: 5, height: 5, borderRadius: '50%', background: AI_KIND_COLOR[selectedTab.kind] }} />
+              <span style={{ width: 5, height: 5, borderRadius: '50%', background: selectedTab ? AI_KIND_COLOR[selectedTab.kind] : accentColor }} />
             )}
           </span>
           <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left', fontSize: 11 }}>
-            {selectedTab.name}
+            {selectedSummaryText}
           </span>
-          <StatusIcon status={selectedStatus!} color={activeTargetWait ? '#fff' : '#cfcfcf'} />
+          {selectedStatus && <StatusIcon status={selectedStatus} color={activeTargetWait ? '#fff' : '#cfcfcf'} />}
         </>
       ) : (
         <>
@@ -649,9 +718,10 @@ export function RunAfterTabPicker({
 
   const renderContextRowTrigger = () => (
     <button
-      ref={triggerRef}
+      ref={internalTriggerRef}
       onClick={(e) => {
         e.stopPropagation();
+        if (onTriggerClick?.()) return;
         if (openOnHover) {
           if (!open) handleOpen();
           return;
@@ -663,7 +733,7 @@ export function RunAfterTabPicker({
         if (openOnHover && !open) handleOpen();
       }}
       onMouseLeave={() => setTriggerHover(false)}
-      title={hasSelectedTarget && selectedTab ? `Selected trigger: ${selectedTab.name}` : 'Pick a trigger tab'}
+      title={hasSelectedTarget ? `Selected trigger: ${selectedSummaryText}` : 'Pick a trigger tab'}
       style={{
         width: '100%',
         position: 'relative',
@@ -722,7 +792,7 @@ export function RunAfterTabPicker({
                 maxWidth: 116,
               }}
             >
-              {selectedTab?.name || (runAfterTabId ? 'Missing tab' : emptyLabel)}
+              {selectedSummaryText}
             </span>
           </>
         )}
@@ -738,32 +808,50 @@ export function RunAfterTabPicker({
           to { transform: rotate(360deg); }
         }
       `}</style>
-      {triggerVariant === 'context-row' ? renderContextRowTrigger() : renderPillTrigger()}
+      {!hideTrigger && (triggerVariant === 'context-row' ? renderContextRowTrigger() : renderPillTrigger())}
 
       {open && anchor && createPortal(
         (
-          <div
-            ref={menuRef}
-            data-run-after-picker-menu
-            style={{
-              position: 'fixed',
-              top: anchor.top,
-              ...(anchor.left !== undefined ? { left: anchor.left } : { right: anchor.right }),
-              width: menuWidth,
-              maxHeight: anchor.maxHeight,
-              background: TABBAR_PANEL_BG,
-              border: `1px solid ${BORDER}`,
-              borderRadius: 6,
-              boxShadow: '0 6px 20px rgba(0,0,0,0.45)',
-              backdropFilter: 'blur(8px)',
-              zIndex,
-              display: 'flex',
-              flexDirection: 'column',
-              overflow: 'hidden',
-            }}
-            onMouseDown={(e) => e.stopPropagation()}
-            onClick={(e) => e.stopPropagation()}
-          >
+          <>
+            {modalOverlay && (
+              <div
+                data-run-after-picker-overlay
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setOpen(false);
+                }}
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  position: 'fixed',
+                  inset: 0,
+                  zIndex: zIndex - 1,
+                  background: 'transparent',
+                }}
+              />
+            )}
+            <div
+              ref={menuRef}
+              data-run-after-picker-menu
+              style={{
+                position: 'fixed',
+                top: anchor.top,
+                ...(anchor.left !== undefined ? { left: anchor.left } : { right: anchor.right }),
+                width: menuWidth,
+                maxHeight: anchor.maxHeight,
+                background: TABBAR_PANEL_BG,
+                border: `1px solid ${BORDER}`,
+                borderRadius: 6,
+                boxShadow: '0 6px 20px rgba(0,0,0,0.45)',
+                backdropFilter: 'blur(8px)',
+                zIndex,
+                display: 'flex',
+                flexDirection: 'column',
+                overflow: 'hidden',
+              }}
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+            >
             <div style={{
               padding: '6px 8px 5px',
               borderBottom: `1px solid ${BORDER}`,
@@ -800,6 +888,7 @@ export function RunAfterTabPicker({
               </div>
 
               <div
+                ref={projectStripRef}
                 className="scrollbar-hide"
                 onWheel={handleProjectWheel}
                 style={{
@@ -813,6 +902,7 @@ export function RunAfterTabPicker({
                 {inventory.groups.map((g) => (
                   <ProjectChip
                     key={g.projectId}
+                    projectId={g.projectId}
                     label={g.name}
                     selected={g.projectId === selectedProject?.projectId}
                     isOwner={g.isOwnerProject}
@@ -844,7 +934,7 @@ export function RunAfterTabPicker({
               )}
               {selectedProject && visibleRows.map((row) => {
                 if (row.type === 'tab') {
-                  const isSelected = runAfterTabId === row.tab.id;
+                  const isSelected = selectedIdSet.has(row.tab.id);
                   return (
                     <PickerTabRow
                       key={row.tab.id}
@@ -859,8 +949,8 @@ export function RunAfterTabPicker({
                       tabGeo={tabGeo}
                       fontSize={tabsFontSize}
                       onClick={() => {
-                        setRunAfterTab(tabId, isSelected ? null : row.tab.id);
-                        setOpen(false);
+                        setRunAfterTab(tabId, multiSelect ? row.tab.id : (isSelected ? null : row.tab.id));
+                        if (closeOnSelect) setOpen(false);
                       }}
                     />
                   );
@@ -873,6 +963,7 @@ export function RunAfterTabPicker({
                     tabs={row.tabs}
                     active={autoRun}
                     selectedTabId={runAfterTabId}
+                    selectedTabIds={selectedIdSet}
                     statusFor={statusFor}
                     sessionStatuses={sessionStatuses}
                     statusMarkerShape={statusMarkerShape}
@@ -882,14 +973,15 @@ export function RunAfterTabPicker({
                     fontSize={tabsFontSize}
                     onToggle={() => toggleTabGroupCollapsed(selectedProject.projectId, row.group.id)}
                     onSelect={(targetId, isSelected) => {
-                      setRunAfterTab(tabId, isSelected ? null : targetId);
-                      setOpen(false);
+                      setRunAfterTab(tabId, multiSelect ? targetId : (isSelected ? null : targetId));
+                      if (closeOnSelect) setOpen(false);
                     }}
                   />
                 );
               })}
             </div>
-          </div>
+            </div>
+          </>
         ),
         portalContainer
       )}
@@ -898,6 +990,7 @@ export function RunAfterTabPicker({
 }
 
 function ProjectChip({
+  projectId,
   label,
   selected,
   isOwner,
@@ -905,6 +998,7 @@ function ProjectChip({
   total,
   onClick,
 }: {
+  projectId: string;
   label: string;
   selected: boolean;
   isOwner: boolean;
@@ -915,6 +1009,7 @@ function ProjectChip({
   const [hover, setHover] = useState(false);
   return (
     <button
+      data-run-after-project-chip={projectId}
       onClick={onClick}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
@@ -955,6 +1050,7 @@ function PickerGroupRow({
   tabs,
   active,
   selectedTabId,
+  selectedTabIds,
   statusFor,
   sessionStatuses,
   statusMarkerShape,
@@ -970,6 +1066,7 @@ function PickerGroupRow({
   tabs: AiTab[];
   active: boolean;
   selectedTabId: string | null;
+  selectedTabIds?: Set<string>;
   statusFor: (id: string) => 'busy' | 'idle';
   sessionStatuses: SessionStatusLike[];
   statusMarkerShape: MarkerShape;
@@ -1083,7 +1180,7 @@ function PickerGroupRow({
       >
         <div style={{ minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column', gap: 3, paddingTop: collapsed ? 0 : 3 }}>
           {tabs.map((tab) => {
-            const isSelected = selectedTabId === tab.id;
+            const isSelected = selectedTabIds?.has(tab.id) ?? selectedTabId === tab.id;
             return (
               <PickerTabRow
                 key={tab.id}

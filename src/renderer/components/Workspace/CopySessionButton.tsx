@@ -4,6 +4,7 @@ import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useCmdKey } from '../../hooks/useCmdHoverPopover';
 import HoverBridgeDebug from '../HoverBridgeDebug';
+import { User as UserIcon } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -83,6 +84,43 @@ function CopyCategoryLabel({ title, tools, hint }: { title: string; tools?: stri
   );
 }
 
+function MiniChip({
+  active,
+  children,
+  onClick,
+  title,
+  color,
+  italic = false,
+}: {
+  active: boolean;
+  children: React.ReactNode;
+  onClick: () => void;
+  title: string;
+  color: string;
+  italic?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      className="cursor-pointer hover:opacity-85 transition-opacity inline-flex items-center"
+      style={{
+        background: 'transparent',
+        border: 'none',
+        padding: 0,
+        color: active ? color : '#555',
+        fontSize: 10,
+        fontFamily: 'ui-monospace, SFMono-Regular, monospace',
+        fontStyle: italic ? 'italic' : 'normal',
+        lineHeight: 1.2,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
 interface CopySessionButtonProps {
   activeTabId: string | null;
   sessionType: 'claude' | 'gemini' | 'codex' | null;
@@ -127,6 +165,7 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
   const [inputPopupHovered, setInputPopupHovered] = useState(false);
   const [customId, setCustomId] = useState('');
   const [isCopying, setIsCopying] = useState(false);
+  const [subPreferred, setSubPreferred] = useState<'result' | 'full'>('result');
   const inputRef = useRef<HTMLInputElement>(null);
   const settingsPopupRef = useRef<HTMLDivElement>(null);
 
@@ -157,6 +196,10 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
   const accent = isGemini ? '#4E86F8' : isCodex ? '#10A37F' : '#DA7756';
   const accentRgba = isGemini ? 'rgba(78,134,248,' : isCodex ? 'rgba(16,163,127,' : 'rgba(218,119,86,';
   const toggleColor = isCodex ? 'bg-[#10A37F]' : 'bg-[#DA7756]';
+  const miniDot = <span style={{ color: '#3f3f46', fontSize: 10, lineHeight: 1.2 }}>·</span>;
+  const subOn = includeSubagentResult || includeSubagentHistory;
+  const subFull = includeSubagentHistory;
+  const subLabel = subOn ? (subFull ? 'full' : 'result') : subPreferred;
 
   const selectedTabs = activeProjectId ? getSelectedTabs(activeProjectId) : [];
   const isMultiSelect = selectedTabs.length > 1;
@@ -349,6 +392,189 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
               >
                 <div style={{ fontSize: '9px', textTransform: 'uppercase', fontWeight: 700, color: '#777', borderBottom: '1px solid #2a2a2a', paddingBottom: 6, marginBottom: 4, letterSpacing: '0.05em' }}>
                   Настройки копирования
+                </div>
+                <div
+                  style={{
+                    borderBottom: '1px solid #2a2a2a',
+                    paddingBottom: 7,
+                    marginBottom: 5,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 4,
+                  }}
+                >
+                  <div className="flex items-center" style={{ gap: '2px 5px', minWidth: 0 }}>
+                    <MiniChip
+                      active={includeUser}
+                      color={accent}
+                      onClick={() => setIncludeUser(!includeUser)}
+                      title="Промпты пользователя"
+                    >
+                      <UserIcon size={11} strokeWidth={2} />
+                    </MiniChip>
+                    {miniDot}
+                    <MiniChip
+                      active={includeClaude}
+                      color={accent}
+                      onClick={() => setIncludeClaude(!includeClaude)}
+                      title={isCodex ? 'Сообщения Codex' : 'Сообщения Claude'}
+                    >
+                      {isCodex ? 'Codex' : <ClaudeSparkle size={11} color={includeClaude ? accent : '#555'} />}
+                    </MiniChip>
+                    {miniDot}
+                    <MiniChip
+                      italic
+                      active={includeClaude && includeText}
+                      color={accent}
+                      onClick={() => { if (!includeClaude) setIncludeClaude(true); setIncludeText(!(includeClaude && includeText)); }}
+                      title="Ответ агента"
+                    >
+                      answer
+                    </MiniChip>
+                    {!isCodex && (
+                      <>
+                        {miniDot}
+                        <MiniChip
+                          italic
+                          active={includeClaude && includeThinking}
+                          color={accent}
+                          onClick={() => { if (!includeClaude) setIncludeClaude(true); setIncludeThinking(!(includeClaude && includeThinking)); }}
+                          title="Ход рассуждения"
+                        >
+                          thinking
+                        </MiniChip>
+                      </>
+                    )}
+                  </div>
+
+                  <div className="flex items-center" style={{ gap: '2px 5px', minWidth: 0, flexWrap: 'wrap' }}>
+                    {!isCodex && (
+                      <>
+                        <MiniChip
+                          active={includeClaude && includeReading}
+                          color={accent}
+                          onClick={() => { if (!includeClaude) setIncludeClaude(true); setIncludeReading(!(includeClaude && includeReading)); }}
+                          title="Чтение файлов"
+                        >
+                          read
+                        </MiniChip>
+                        {miniDot}
+                      </>
+                    )}
+                    <MiniChip
+                      active={includeClaude && includeEditing}
+                      color={accent}
+                      onClick={() => { if (!includeClaude) setIncludeClaude(true); setIncludeEditing(!(includeClaude && includeEditing)); }}
+                      title="Правки файлов"
+                    >
+                      {isCodex ? 'files' : 'edit'}
+                    </MiniChip>
+                    {miniDot}
+                    <MiniChip
+                      active={includeClaude && includeBash}
+                      color={accent}
+                      onClick={() => { if (!includeClaude) setIncludeClaude(true); setIncludeBash(!(includeClaude && includeBash)); }}
+                      title="Shell-команды"
+                    >
+                      {isCodex ? 'shell' : 'bash'}
+                    </MiniChip>
+                    {miniDot}
+                    <MiniChip
+                      active={includeClaude && includeTools}
+                      color={accent}
+                      onClick={() => { if (!includeClaude) setIncludeClaude(true); setIncludeTools(!(includeClaude && includeTools)); }}
+                      title="MCP-инструменты"
+                    >
+                      mcp
+                    </MiniChip>
+                    {miniDot}
+                    <MiniChip
+                      active={includeClaude && includeWebSearch}
+                      color={accent}
+                      onClick={() => { if (!includeClaude) setIncludeClaude(true); setIncludeWebSearch(!(includeClaude && includeWebSearch)); }}
+                      title="Web-поиск"
+                    >
+                      web
+                    </MiniChip>
+                    {miniDot}
+                    {isCodex && (
+                      <>
+                        <MiniChip
+                          active={includeClaude && includeToolSearch}
+                          color={accent}
+                          onClick={() => { if (!includeClaude) setIncludeClaude(true); setIncludeToolSearch(!(includeClaude && includeToolSearch)); }}
+                          title="Поиск доступных tools"
+                        >
+                          catalog
+                        </MiniChip>
+                        {miniDot}
+                      </>
+                    )}
+                    <MiniChip
+                      active={includeClaude && includeOtherTools}
+                      color={accent}
+                      onClick={() => { if (!includeClaude) setIncludeClaude(true); setIncludeOtherTools(!(includeClaude && includeOtherTools)); }}
+                      title="Прочие инструменты"
+                    >
+                      other
+                    </MiniChip>
+                    {miniDot}
+                    {!isCodex && (
+                      <>
+                        <MiniChip
+                          active={!fromStart}
+                          color="#3b82f6"
+                          onClick={() => setFromStart(!fromStart)}
+                          title="Копировать от fork-точки"
+                        >
+                          <span style={{ fontSize: 10, lineHeight: 1 }}>⑂</span>
+                          <span style={{ marginLeft: 3 }}>fork</span>
+                        </MiniChip>
+                        {miniDot}
+                      </>
+                    )}
+                    <span className="inline-flex items-center" style={{ fontSize: 10, fontFamily: 'ui-monospace, SFMono-Regular, monospace', lineHeight: 1.2 }}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (subOn) {
+                            setIncludeSubagentResult(false);
+                            setIncludeSubagentHistory(false);
+                          } else if (subPreferred === 'full') {
+                            setIncludeSubagentHistory(true);
+                            setIncludeSubagentResult(false);
+                          } else {
+                            setIncludeSubagentResult(true);
+                            setIncludeSubagentHistory(false);
+                          }
+                        }}
+                        className="cursor-pointer hover:opacity-85 transition-opacity"
+                        style={{ background: 'transparent', border: 'none', padding: 0, color: subOn ? accent : '#555', fontFamily: 'inherit', lineHeight: 1.2 }}
+                      >
+                        sub-
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (!subOn) {
+                            setSubPreferred(subPreferred === 'result' ? 'full' : 'result');
+                          } else if (subFull) {
+                            setIncludeSubagentHistory(false);
+                            setIncludeSubagentResult(true);
+                            setSubPreferred('result');
+                          } else {
+                            setIncludeSubagentResult(false);
+                            setIncludeSubagentHistory(true);
+                            setSubPreferred('full');
+                          }
+                        }}
+                        className="cursor-pointer hover:opacity-85 transition-opacity"
+                        style={{ background: 'transparent', border: 'none', padding: 0, color: subOn ? accent : '#555', fontFamily: 'inherit', lineHeight: 1.2 }}
+                      >
+                        {subLabel}
+                      </button>
+                    </span>
+                  </div>
                 </div>
                 <ToggleRow label="👤 User" active={includeUser} color={toggleColor} onToggle={() => setIncludeUser(!includeUser)} />
                 <ToggleRow

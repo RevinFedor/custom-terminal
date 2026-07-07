@@ -21,7 +21,7 @@ import {
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, PanelLeft, Plus, StickyNote, RotateCw, Folder, ArrowUp, ArrowDown, Square, Bell, BellRing, FileText, X, Copy } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, StickyNote, RotateCw, Folder, ArrowUp, ArrowDown, Square, Bell, BellRing, FileText, X, Copy } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -30,6 +30,32 @@ const COMPLETION_NOTIFICATION_DISMISS_MS = 420;
 const TABBAR_DRAG_VISUAL_LOCK_ATTR = 'data-tabbar-drag-visual-lock';
 const GROUP_COLLAPSE_FLIP_SUPPRESS_MS = 320;
 const isNaturalRestartAfterEnd = (reason?: string) => !reason || reason === 'task_complete';
+const isAiLaunchCommand = (command: string): boolean => {
+  const text = command.trim();
+  if (!text) return false;
+  if (/(^|[;&|]\s*)(?:command\s+)?(?:codex|claude|gemini)(?=\s|$)/i.test(text)) return true;
+  if (/(^|[;&|]\s*)(?:npx|pnpm\s+dlx|bunx)\s+@openai\/codex(?=\s|$)/i.test(text)) return true;
+  return false;
+};
+const formatRestartAfterCommandLabel = (command?: string | null) => {
+  const clean = String(command || '').trim();
+  const npmRunMatch = clean.match(/^npm\s+run(?:-script)?\s+(.+)$/);
+  return (npmRunMatch ? npmRunMatch[1] : clean).trim();
+};
+const getRestartAfterTriggerIds = (tab: { id?: string; restartAfterTabId?: string; restartAfterTabIds?: string[] } | null | undefined): string[] => {
+  if (!tab) return [];
+  const out: string[] = [];
+  const push = (value: unknown) => {
+    const id = typeof value === 'string' ? value.trim() : '';
+    if (!id || id === tab.id || out.includes(id)) return;
+    out.push(id);
+  };
+  if (Array.isArray(tab.restartAfterTabIds)) {
+    for (const id of tab.restartAfterTabIds) push(id);
+  }
+  push(tab.restartAfterTabId);
+  return out;
+};
 
 type RestartAfterScriptRunState = {
   command: string;
@@ -115,7 +141,9 @@ interface TabData {
   completionNotificationArmed?: boolean;
   completionNotificationFired?: boolean;
   restartAfterTabId?: string;
+  restartAfterTabIds?: string[];
   restartAfterCommand?: string;
+  restartAfterPaused?: boolean;
   restartAfterPersistent?: boolean;
   restartAfterArmed?: boolean;
 }
@@ -549,7 +577,7 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
   hasSession?: boolean;
   isBusy?: boolean;
   // Deterministic stop/restart is mid-cycle for this tab. While true: clicks are
-  // ignored (cursor stays as wait), and the ↻ icon rotates to signal that the
+  // ignored, and the ↻ icon rotates to signal that the
   // system is busy killing descendants and waiting for ports to release.
   // Cleared by terminal:stop-progress { phase: 'done' } in the parent.
   isStopping?: boolean;
@@ -573,7 +601,7 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
         alignItems: 'center',
         justifyContent: 'center',
         zIndex: 10,
-        cursor: isStopping ? 'wait' : undefined,
+        cursor: isStopping ? 'default' : undefined,
       }}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
@@ -593,7 +621,7 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
     >
       {hasProcess ? (
         isStopping && showRestart ? (
-          // Deterministic-stop in flight: spinning ↻ icon, cursor:wait. The
+          // Deterministic-stop in flight: spinning ↻ icon. The
           // animation runs whether or not the mouse is over the zone, so the
           // user sees that a stop is actually happening even after moving away.
           <Tooltip content="Stopping…">
@@ -734,6 +762,7 @@ interface TabItemProps {
   completionNotificationArmed?: boolean;
   completionNotificationFired?: boolean;
   completionNotificationPersistent?: boolean;
+  restartAfterFallbackCommand?: string | null;
 }
 
 const TabItem = memo(({
@@ -783,6 +812,7 @@ const TabItem = memo(({
   sessionStatus,
   completionNotificationArmed = false,
   completionNotificationFired = false,
+  restartAfterFallbackCommand = null,
 }: TabItemProps) => {
   const ref = useRef<HTMLDivElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
@@ -1197,7 +1227,11 @@ const TabItem = memo(({
   // position — left|right (юзер выбирает в Settings). Цвет полоски и shimmer
   // читаются через CSS-переменные на :root (App.tsx синхронизирует).
   const processBarPosition = useUIStore((s) => s.processBar.position);
-  const restartAfterConfigured = !!tab.restartAfterTabId || !!tab.restartAfterCommand;
+  const restartAfterTriggerIds = getRestartAfterTriggerIds(tab);
+  const restartAfterConfigured = restartAfterTriggerIds.length > 0 || !!tab.restartAfterCommand;
+  const restartAfterCommandLabel = formatRestartAfterCommandLabel(tab.restartAfterCommand)
+    || (restartAfterTriggerIds.length > 0 ? formatRestartAfterCommandLabel(restartAfterFallbackCommand) : '');
+  const restartAfterPaused = !!tab.restartAfterPaused;
   const canShowVerticalRestartButton = isVerticalMode && (
     (tab.color === 'green' && hasProcess) || restartAfterConfigured
   );
@@ -1205,27 +1239,72 @@ const TabItem = memo(({
     && hasProcess
     && isRestartButtonHovered
     && cmdPeekMode
+    && !restartAfterConfigured
     && commandType === 'devServer'
     && !!onStop
+    && !isStopping;
+  const verticalRestartClearMode = canShowVerticalRestartButton
+    && restartAfterConfigured
+    && isRestartButtonHovered
+    && cmdPeekMode
     && !isStopping;
   const verticalRestartHoverActive = canShowVerticalRestartButton && isRestartButtonHovered && !isStopping;
   const verticalRestartButtonBackground = verticalRestartStopMode
     ? 'rgba(248, 113, 113, 0.16)'
+    : verticalRestartClearMode
+      ? 'rgba(248, 113, 113, 0.16)'
     : restartAfterConfigured
-      ? (verticalRestartHoverActive ? 'rgba(139, 92, 246, 0.24)' : 'rgba(139, 92, 246, 0.13)')
+      ? (restartAfterPaused
+        ? (verticalRestartHoverActive ? 'rgba(113, 113, 122, 0.26)' : 'rgba(113, 113, 122, 0.14)')
+        : (verticalRestartHoverActive ? 'rgba(139, 92, 246, 0.24)' : 'rgba(139, 92, 246, 0.13)'))
       : (verticalRestartHoverActive ? 'rgba(34,197,94,0.18)' : '#1e1e2e');
   const verticalRestartButtonColor = isStopping
     ? '#666'
     : verticalRestartStopMode
       ? '#f87171'
+      : verticalRestartClearMode
+        ? '#fca5a5'
       : restartAfterConfigured
-        ? (verticalRestartHoverActive ? '#ede9fe' : '#c4b5fd')
+        ? (restartAfterPaused
+          ? (verticalRestartHoverActive ? '#e4e4e7' : '#a1a1aa')
+          : (verticalRestartHoverActive ? '#ede9fe' : '#c4b5fd'))
         : (verticalRestartHoverActive ? '#bbf7d0' : '#86efac');
   const verticalRestartButtonBorder = verticalRestartStopMode
     ? '1px solid rgba(248, 113, 113, 0.35)'
+    : verticalRestartClearMode
+      ? '1px solid rgba(248, 113, 113, 0.35)'
     : restartAfterConfigured
-      ? '1px solid rgba(139, 92, 246, 0.45)'
+      ? (restartAfterPaused ? '1px solid rgba(113, 113, 122, 0.42)' : '1px solid rgba(139, 92, 246, 0.45)')
       : '1px solid rgba(34,197,94,0.25)';
+  const verticalRestartPauseButtonBackground = restartAfterPaused
+    ? 'rgba(113, 113, 122, 0.24)'
+    : 'rgba(113, 113, 122, 0.10)';
+  const verticalRestartPauseButtonColor = restartAfterPaused ? '#e4e4e7' : '#a1a1aa';
+  const verticalRestartPauseButtonBorder = restartAfterPaused
+    ? '1px solid rgba(161, 161, 170, 0.45)'
+    : '1px solid rgba(161, 161, 170, 0.24)';
+  const verticalActionHasNotes = !!(tab.notes && tab.notes.trim().length > 0);
+  const verticalActionIsAiRuntimeTab = tab.tabType === 'claude-sdk'
+    || commandType === 'claude'
+    || commandType === 'codex'
+    || commandType === 'gemini'
+    || !!tab.claudeSessionId
+    || !!tab.geminiSessionId
+    || !!tab.codexSessionId;
+  const verticalActionHasAiTabState = verticalActionIsAiRuntimeTab || !!hasSession || !!tab.wasInterrupted || !!tab.aiClosing;
+  const verticalActionIsPlainTerminalTab = !tab.tabType || tab.tabType === 'terminal';
+  const canShowVerticalActionSlot = isVerticalMode && tab.tabType !== 'file' && !(tab.color === 'green' && hasProcess);
+  const canRunLastCommandHere = verticalActionIsPlainTerminalTab && !verticalActionIsAiRuntimeTab && !hasProcess && !sdkProcessAlive && !isBusy;
+  const showVerticalLastCommandPlay = canShowVerticalActionSlot
+    && cmdPeekMode
+    && (isActive || effectiveHovered)
+    && !verticalActionHasNotes
+    && !slideoutOpenHere
+    && !!onRunLastProjectCommand
+    && canRunLastCommandHere;
+  const showVerticalNotesButton = canShowVerticalActionSlot
+    && (slideoutOpenHere || showNotesPeek || (isActive && !anySlideoutOpen && !cmdPeekMode && (verticalActionHasNotes || verticalActionHasAiTabState)));
+  const hasVerticalRightActionCluster = showVerticalLastCommandPlay || showVerticalNotesButton || restartAfterConfigured || canShowVerticalRestartButton;
   // Settings → форма маркера статуса (круг или квадрат) + размер в px.
   const statusMarkerShape = useUIStore((s) => s.statusMarker.shape);
   const statusMarkerSize = useUIStore((s) => s.statusMarker.sizePx);
@@ -1754,9 +1833,10 @@ const TabItem = memo(({
             />
           ) : (
             <span
-              className="select-none whitespace-nowrap overflow-hidden text-ellipsis flex items-center gap-1"
+              className="select-none whitespace-nowrap overflow-hidden text-ellipsis flex items-center gap-1 min-w-0"
               style={{
                 flex: isHorizontal ? 'none' : 1,
+                minWidth: 0,
                 color: tab.aiClosing ? '#8a8a8a' : undefined,
                 fontStyle: tab.aiClosing ? 'italic' : undefined,
               }}
@@ -1782,110 +1862,47 @@ const TabItem = memo(({
                   <span className="tab-title-naming-ghost">{tab.name}</span>
                   <span className="tab-title-naming-text">naming...</span>
                 </span>
-              ) : tab.name}
+              ) : (
+                <>
+                  <span className="truncate min-w-0">{tab.name}</span>
+                  {restartAfterCommandLabel && (
+                    <span
+                      className="ml-auto flex-shrink-0 truncate max-w-[112px]"
+                      title={restartAfterCommandLabel}
+                      style={{
+                        color: restartAfterPaused ? '#8a8a8a' : '#c4b5fd',
+                        fontSize: '0.92em',
+                        fontStyle: restartAfterPaused ? 'italic' : undefined,
+                      }}
+                    >
+                      {restartAfterCommandLabel}
+                    </span>
+                  )}
+                </>
+              )}
             </span>
           )}
 
-          {/* Restart button — для зелёных (devServer) вкладок с активным процессом
-                занимает место notes-кнопки. Логика: зелёный таб обычно = npm run dev,
-                заметок там почти не пишут, зато перезапуск из меню вкладки нужен часто.
-                Mutex с notes: если рендерится restart — notes не рендерится. Кнопка
-                делегирует в onRestart (детерминистический stop+!! в одном IPC);
-                Cmd+hover превращает эту же кнопку в Stop (красный square, без
-                отдельной hit-zone на полоске процесса).
-                Пока stop в полёте — иконка крутится, click заблокирован. */}
-          {canShowVerticalRestartButton && (
-            <button
-              type="button"
-              data-no-tab-drag
-              onClick={(e) => {
-                e.stopPropagation();
-                if (isStopping) return;
-                if (restartAfterConfigured && (cmdPeekMode || e.metaKey)) {
-                  useWorkspaceStore.getState().setTabRestartAfterTarget(projectId, tab.id, null);
-                  if (verticalRestartStopMode) {
-                    onStop?.(tab.id);
-                  }
-                  return;
-                }
-                if (verticalRestartStopMode) {
-                  onStop?.(tab.id);
-                } else {
-                  onRestart?.(tab.id);
-                }
-              }}
-              onMouseDown={(e) => e.stopPropagation()}
-              onDoubleClick={(e) => e.stopPropagation()}
-              title={isStopping
-                ? 'Stopping…'
-                : (verticalRestartStopMode
-                  ? 'Stop process (Cmd+click)'
-                  : restartAfterConfigured
-                    ? (tab.restartAfterCommand
-                      ? `Restart-after script: ${tab.restartAfterCommand}. Cmd+click clears it`
-                      : 'Restart after configured. Cmd+click clears it')
-                    : 'Restart process (kill descendants + ports, then re-run)')}
-              aria-label={verticalRestartStopMode ? 'Stop running dev process' : (restartAfterConfigured ? 'Restart after configured' : 'Restart process')}
-              className="flex-shrink-0 inline-flex items-center justify-center transition-colors"
-              style={{
-                width: 20,
-                height: 18,
-                marginLeft: 6,
-                padding: 0,
-                borderRadius: 4,
-                backgroundColor: verticalRestartButtonBackground,
-                color: verticalRestartButtonColor,
-                border: verticalRestartButtonBorder,
-                cursor: isStopping ? 'wait' : 'pointer',
-              }}
-              onMouseEnter={() => {
-                const lock = isTabbarDragVisualLockActive();
-                if (isStopping || isAnyDragging || lock) {
-                  setIsRestartButtonHovered(false);
-                  console.log(
-                    `[TabDnd:bg] kind=tab-child phase=mouseenter child=restart tab=${shortDndId(tab.id)}` +
-                    ` action=suppress stopping=${isStopping ? 1 : 0}` +
-                    ` lock=${lock ? 1 : 0}` +
-                    ` anyDragging=${isAnyDragging ? 1 : 0}`
-                  );
-                  return;
-                }
-                console.log(
-                  `[TabDnd:bg] kind=tab-child phase=mouseenter child=restart tab=${shortDndId(tab.id)}` +
-                  ` action=accept lock=0 anyDragging=0`
-                );
-                setIsRestartButtonHovered(true);
-              }}
-              onMouseLeave={() => setIsRestartButtonHovered(false)}
+          {hasVerticalRightActionCluster && (
+            <div
+              className="flex-shrink-0 inline-flex items-center"
+              style={{ gap: 1 }}
             >
-              {verticalRestartStopMode ? (
-                <Square size={9} fill="currentColor" strokeWidth={1.9} aria-hidden />
-              ) : (
-                <RotateCw
-                  size={11}
-                  strokeWidth={2.2}
-                  style={isStopping ? { animation: 'tab-dot-spin 0.8s linear infinite' } : undefined}
-                  aria-hidden
-                />
-              )}
-            </button>
-          )}
-
-          {/* Open notes — peek-button. Three visibility rules:
-                1. slideoutOpenHere — slideout is anchored to this tab (solid-indigo, always visible).
-                2. showNotesPeek — Cmd is held, cursor in TabBar, tab has notes (Cmd-hover peek).
-                3. Default-on-active — active tab in vertical mode, but ONLY when (a) no slideout
-                   is open on another tab AND (b) we're NOT in peek-mode. Peek-mode means "buttons
-                   only where there are notes" — keeping the default-on-active button on an empty
-                   active tab during peek would break that rule.
-              Empty vs filled: tab.notes пустой → тусклый dim-grey стиль (юзер видит «здесь нет
-              заметок, но кнопка чтобы создать»), notes есть → indigo-tinted (заметка ждёт). При
-              slideoutOpenHere — solid-indigo всегда (anchor-индикатор сильнее семантики empty).
-              position:relative + zIndex:1 нужны чтобы AI-busy-фон вкладки (zIndex:0, absolute) не
-              перекрасил кнопку — без явного stacking context positioned-sibling рисуется поверх
-              static-кнопки в том же flex'е. См. fact-notes.md::Z-index над AI-pulse.
-              Mutex: если этот же таб зелёный с активным процессом — место занимает Restart-кнопка
-              выше, notes не рендерится. */}
+              {/* Open notes — peek-button. Three visibility rules:
+                    1. slideoutOpenHere — slideout is anchored to this tab (solid-indigo, always visible).
+                    2. showNotesPeek — Cmd is held, cursor in TabBar, tab has notes (Cmd-hover peek).
+                    3. Default-on-active — active tab in vertical mode, but ONLY when (a) no slideout
+                       is open on another tab AND (b) we're NOT in peek-mode. Peek-mode means "buttons
+                       only where there are notes" — keeping the default-on-active button on an empty
+                       active tab during peek would break that rule.
+                  Empty vs filled: tab.notes пустой → тусклый dim-grey стиль (юзер видит «здесь нет
+                  заметок, но кнопка чтобы создать»), notes есть → indigo-tinted (заметка ждёт). При
+                  slideoutOpenHere — solid-indigo всегда (anchor-индикатор сильнее семантики empty).
+                  position:relative + zIndex:1 нужны чтобы AI-busy-фон вкладки (zIndex:0, absolute) не
+                  перекрасил кнопку — без явного stacking context positioned-sibling рисуется поверх
+                  static-кнопки в том же flex'е. См. fact-notes.md::Z-index над AI-pulse.
+                  Mutex: если этот же таб зелёный с активным процессом — notes не рендерится,
+                  а rightmost-слот занимает Restart-кнопка ниже. */}
           {isVerticalMode && tab.tabType !== 'file' && !(tab.color === 'green' && hasProcess) && (() => {
             const hasNotes = !!(tab.notes && tab.notes.trim().length > 0);
             const isAiRuntimeTab = tab.tabType === 'claude-sdk'
@@ -1919,7 +1936,7 @@ const TabItem = memo(({
                     zIndex: 1,
                     width: 20,
                     height: 18,
-                    marginLeft: 6,
+                    marginLeft: 0,
                     padding: 0,
                     borderRadius: 4,
                     backgroundColor: '#1e1e2e',
@@ -1972,7 +1989,7 @@ const TabItem = memo(({
                   zIndex: 1,
                   width: 20,
                   height: 18,
-                  marginLeft: 6,
+                  marginLeft: 0,
                   padding: 0,
                   borderRadius: 4,
                   backgroundColor: baseBg,
@@ -2009,6 +2026,149 @@ const TabItem = memo(({
               </button>
             );
           })()}
+
+          {restartAfterConfigured && !showVerticalLastCommandPlay && !showVerticalNotesButton && (
+            <span
+              aria-hidden
+              className="flex-shrink-0"
+              style={{
+                width: 20,
+                height: 18,
+                visibility: 'hidden',
+                pointerEvents: 'none',
+              }}
+            />
+          )}
+
+          {restartAfterConfigured && (
+            <button
+              type="button"
+              data-no-tab-drag
+              onClick={(e) => {
+                e.stopPropagation();
+                useWorkspaceStore.getState().setTabRestartAfterPaused(projectId, tab.id, !restartAfterPaused);
+              }}
+              onMouseDown={(e) => e.stopPropagation()}
+              onDoubleClick={(e) => e.stopPropagation()}
+              title={restartAfterPaused ? 'Resume restart after' : 'Pause restart after'}
+              aria-label={restartAfterPaused ? 'Resume restart after' : 'Pause restart after'}
+              className="flex-shrink-0 inline-flex items-center justify-center transition-colors"
+              style={{
+                width: 20,
+                height: 18,
+                marginLeft: 0,
+                padding: 0,
+                borderRadius: 4,
+                backgroundColor: verticalRestartPauseButtonBackground,
+                color: verticalRestartPauseButtonColor,
+                border: verticalRestartPauseButtonBorder,
+                cursor: 'pointer',
+                position: 'relative',
+              }}
+            >
+              <Pause size={10} strokeWidth={2.2} aria-hidden />
+              {restartAfterPaused && (
+                <span
+                  aria-hidden
+                  style={{
+                    position: 'absolute',
+                    left: '50%',
+                    top: '50%',
+                    width: 11,
+                    height: 1.5,
+                    borderRadius: 999,
+                    backgroundColor: 'currentColor',
+                    transform: 'translate(-50%, -50%) rotate(-38deg)',
+                    opacity: 0.95,
+                  }}
+                />
+              )}
+            </button>
+          )}
+
+          {/* Restart button — right-anchored in vertical mode. For restart-after tabs
+                it stays in the rightmost slot; optional Play/notes and Pause render to
+                its left so Cmd-peek controls do not shove it sideways. Cmd-hover on
+                restart-after shows Clear; Cmd-hover on plain devServer shows Stop. */}
+          {canShowVerticalRestartButton && (
+            <button
+              type="button"
+              data-no-tab-drag
+              onClick={(e) => {
+                e.stopPropagation();
+                if (isStopping) return;
+                if (restartAfterConfigured && (cmdPeekMode || e.metaKey)) {
+                  useWorkspaceStore.getState().setTabRestartAfterTarget(projectId, tab.id, null);
+                  return;
+                }
+                if (verticalRestartStopMode) {
+                  onStop?.(tab.id);
+                } else {
+                  onRestart?.(tab.id);
+                }
+              }}
+              onMouseDown={(e) => e.stopPropagation()}
+              onDoubleClick={(e) => e.stopPropagation()}
+              title={isStopping
+                ? 'Stopping…'
+                : (verticalRestartClearMode
+                  ? 'Clear restart after'
+                  : verticalRestartStopMode
+                    ? 'Stop process (Cmd+click)'
+                    : restartAfterConfigured
+                      ? (tab.restartAfterCommand
+                        ? `Restart-after script: ${formatRestartAfterCommandLabel(tab.restartAfterCommand)}. Cmd+click clears it`
+                        : (restartAfterPaused ? 'Restart after paused. Cmd+click clears it' : 'Restart after configured. Cmd+click clears it'))
+                      : 'Restart process (kill descendants + ports, then re-run)')}
+              aria-label={verticalRestartClearMode ? 'Clear restart after' : (verticalRestartStopMode ? 'Stop running dev process' : (restartAfterConfigured ? 'Restart after configured' : 'Restart process'))}
+              className="flex-shrink-0 inline-flex items-center justify-center transition-colors"
+              style={{
+                width: 20,
+                height: 18,
+                marginLeft: 0,
+                padding: 0,
+                borderRadius: 4,
+                backgroundColor: verticalRestartButtonBackground,
+                color: verticalRestartButtonColor,
+                border: verticalRestartButtonBorder,
+                cursor: isStopping ? 'default' : 'pointer',
+              }}
+              onMouseEnter={() => {
+                const lock = isTabbarDragVisualLockActive();
+                if (isStopping || isAnyDragging || lock) {
+                  setIsRestartButtonHovered(false);
+                  console.log(
+                    `[TabDnd:bg] kind=tab-child phase=mouseenter child=restart tab=${shortDndId(tab.id)}` +
+                    ` action=suppress stopping=${isStopping ? 1 : 0}` +
+                    ` lock=${lock ? 1 : 0}` +
+                    ` anyDragging=${isAnyDragging ? 1 : 0}`
+                  );
+                  return;
+                }
+                console.log(
+                  `[TabDnd:bg] kind=tab-child phase=mouseenter child=restart tab=${shortDndId(tab.id)}` +
+                  ` action=accept lock=0 anyDragging=0`
+                );
+                setIsRestartButtonHovered(true);
+              }}
+              onMouseLeave={() => setIsRestartButtonHovered(false)}
+            >
+              {verticalRestartClearMode ? (
+                <X size={12} strokeWidth={2.4} aria-hidden />
+              ) : verticalRestartStopMode ? (
+                <Square size={9} fill="currentColor" strokeWidth={1.9} aria-hidden />
+              ) : (
+                <RotateCw
+                  size={11}
+                  strokeWidth={2.2}
+                  style={isStopping ? { animation: 'tab-dot-spin 0.8s linear infinite' } : undefined}
+                  aria-hidden
+                />
+              )}
+            </button>
+          )}
+            </div>
+          )}
         </>
       )}
 
@@ -2908,6 +3068,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const setTabCompletionNotificationPersistent = useWorkspaceStore((state) => state.setTabCompletionNotificationPersistent);
   const setTabRestartAfterTarget = useWorkspaceStore((state) => state.setTabRestartAfterTarget);
   const setTabRestartAfterCommand = useWorkspaceStore((state) => state.setTabRestartAfterCommand);
+  const setTabRestartAfterPaused = useWorkspaceStore((state) => state.setTabRestartAfterPaused);
   const toggleTabUtility = useWorkspaceStore((state) => state.toggleTabUtility);
   const reorderInZone = useWorkspaceStore((state) => state.reorderInZone);
   const moveTabToZone = useWorkspaceStore((state) => state.moveTabToZone);
@@ -2944,6 +3105,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const [emptyContextMenu, setEmptyContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [contextScripts, setContextScripts] = useState<string[]>([]);
   const [contextShScripts, setContextShScripts] = useState<string[]>([]);
+  const [contextLastCommand, setContextLastCommand] = useState<{ tabId: string; command: string } | null>(null);
+  const [restartAfterFallbackCommands, setRestartAfterFallbackCommands] = useState<Map<string, string>>(new Map());
   const [contextFavoriteId, setContextFavoriteId] = useState<number | null>(null);
   const [utilityExpanded, setUtilityExpanded] = useState(false);
   const [utilityOpenedManually, setUtilityOpenedManually] = useState(false); // Track if opened by click vs hover
@@ -3032,6 +3195,91 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     activeTabId &&
     workspace?.tabs.get(activeTabId)?.completionNotificationFired
   );
+  const resolveTabProjectContext = useCallback((tabId: string): { projectId: string; tab?: TabData } => {
+    const state = useWorkspaceStore.getState();
+    for (const [candidateProjectId, candidateWorkspace] of state.openProjects) {
+      const tab = candidateWorkspace.tabs.get(tabId) as TabData | undefined;
+      if (tab) {
+        return { projectId: candidateWorkspace.projectId || candidateProjectId, tab };
+      }
+    }
+    return {
+      projectId,
+      tab: state.openProjects.get(projectId)?.tabs.get(tabId) as TabData | undefined,
+    };
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!workspace) {
+      setRestartAfterFallbackCommands((previous) => previous.size > 0 ? new Map() : previous);
+      return;
+    }
+
+    const candidates = Array.from(workspace.tabs.values()).filter((tab) =>
+      tab.tabType !== 'file'
+      && getRestartAfterTriggerIds(tab).length > 0
+      && !tab.restartAfterCommand
+    );
+    const candidateIds = new Set(candidates.map((tab) => tab.id));
+
+    if (candidates.length === 0) {
+      setRestartAfterFallbackCommands((previous) => {
+        if (previous.size === 0) return previous;
+        const next = new Map(previous);
+        let changed = false;
+        for (const key of Array.from(next.keys())) {
+          next.delete(key);
+          changed = true;
+        }
+        return changed ? next : previous;
+      });
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      const loaded: Array<[string, string]> = await Promise.all(candidates.map(async (tab): Promise<[string, string]> => {
+        try {
+          const liveCwd = await ipcRenderer.invoke('terminal:getCwd', tab.id).catch(() => null);
+          const cwd = liveCwd || tab.cwd || null;
+          if (!cwd) return [tab.id, ''];
+          const owner = resolveTabProjectContext(tab.id);
+          const result = await ipcRenderer.invoke('terminal:get-last-project-command', { projectId: owner.projectId, tabId: tab.id, cwd });
+          const command = String(result?.command || '').trim();
+          return [tab.id, result?.success && command && !isAiLaunchCommand(command) ? command : ''];
+        } catch {
+          return [tab.id, ''];
+        }
+      }));
+      if (cancelled) return;
+
+      setRestartAfterFallbackCommands((previous) => {
+        const next = new Map(previous);
+        let changed = false;
+        for (const key of Array.from(next.keys())) {
+          if (candidateIds.has(key)) continue;
+          next.delete(key);
+          changed = true;
+        }
+        for (const [tabId, command] of loaded) {
+          if (command) {
+            if (next.get(tabId) !== command) {
+              next.set(tabId, command);
+              changed = true;
+            }
+          } else if (next.has(tabId)) {
+            next.delete(tabId);
+            changed = true;
+          }
+        }
+        return changed ? next : previous;
+      });
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, resolveTabProjectContext, workspace?.tabs]);
 
   useEffect(() => {
     if (!activeTabId || !activeTabCompletionNotificationFired) return;
@@ -3164,6 +3412,18 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         const pendingCommand = restartAfterRun.pendingCommand;
         restartAfterScriptRunsRef.current.delete(tabId);
         if (pendingCommand) {
+          let paused = false;
+          for (const ws of useWorkspaceStore.getState().openProjects.values()) {
+            const targetTab = ws.tabs.get(tabId);
+            if (targetTab) {
+              paused = !!targetTab.restartAfterPaused;
+              break;
+            }
+          }
+          if (paused) {
+            console.warn('[TabBar:RestartAfter] skip-pending-paused target=' + tabId.slice(-8) + ' command=' + JSON.stringify(pendingCommand));
+            return;
+          }
           console.warn('[TabBar:RestartAfter] draining-pending target=' + tabId.slice(-8) + ' command=' + JSON.stringify(pendingCommand));
           void runRestartAfterAction(tabId, pendingCommand, { coalesceFiniteScript: true });
         } else {
@@ -4524,11 +4784,13 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     setEmptyContextMenu(null);
     setContextMenuPos({ x: e.clientX, y: e.clientY });
     setContextMenu({ x: e.clientX, y: e.clientY, tabId });
+    setContextLastCommand(null);
 
     const targetTab = workspace.tabs.get(tabId);
     if (targetTab?.tabType === 'file') {
       setContextScripts([]);
       setContextShScripts([]);
+      setContextLastCommand(null);
       setContextFavoriteId(null);
       return;
     }
@@ -4539,6 +4801,34 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         const cwd = await ipcRenderer.invoke('terminal:getCwd', tabId);
         const tabCwd = cwd || workspace.tabs.get(tabId)?.cwd || '';
         if (!tabCwd) { setContextScripts([]); setContextShScripts([]); return; }
+
+        const owner = resolveTabProjectContext(tabId);
+        ipcRenderer.invoke('terminal:get-last-project-command', { projectId: owner.projectId, tabId, cwd: tabCwd })
+          .then((result: any) => {
+            const command = String(result?.command || '').trim();
+            const hasCommand = !!(result?.success && command);
+            setContextLastCommand(hasCommand ? { tabId, command } : null);
+            setRestartAfterFallbackCommands((previous) => {
+              const next = new Map(previous);
+              if (hasCommand) {
+                if (next.get(tabId) === command) return previous;
+                next.set(tabId, command);
+                return next;
+              }
+              if (!next.has(tabId)) return previous;
+              next.delete(tabId);
+              return next;
+            });
+          })
+          .catch(() => {
+            setContextLastCommand(null);
+            setRestartAfterFallbackCommands((previous) => {
+              if (!previous.has(tabId)) return previous;
+              const next = new Map(previous);
+              next.delete(tabId);
+              return next;
+            });
+          });
 
         // npm scripts
         try {
@@ -4665,6 +4955,22 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     return '';
   };
 
+  const resolveRestartAfterFallbackCommand = async (tabId: string): Promise<{ command: string; reason: string; cwd?: string | null; projectId?: string | null; sourceTabId?: string | null; rejectedCommand?: string }> => {
+    const owner = resolveTabProjectContext(tabId);
+    const tab = owner.tab;
+    const liveCwd = await ipcRenderer.invoke('terminal:getCwd', tabId).catch(() => null);
+    const cwd = liveCwd || tab?.cwd || null;
+    if (!cwd) return { command: '', reason: 'no-cwd', cwd: null, projectId: owner.projectId };
+
+    const result = await ipcRenderer.invoke('terminal:get-last-project-command', { projectId: owner.projectId, tabId, cwd });
+    const command = String(result?.command || '').trim();
+    if (!result?.success || !command) return { command: '', reason: 'no-last-command', cwd, projectId: owner.projectId };
+    if (isAiLaunchCommand(command)) {
+      return { command: '', reason: 'last-command-ai', cwd, projectId: result?.projectId || owner.projectId, sourceTabId: result?.tabId || null, rejectedCommand: command };
+    }
+    return { command, reason: 'last-cwd-command', cwd: result?.cwd || cwd, projectId: result?.projectId || owner.projectId, sourceTabId: result?.tabId || null };
+  };
+
   // Restart / Stop — deterministic, event-driven, no setTimeout guesses.
   //
   // The legacy flow ("Ctrl+C → setTimeout(300) → kill+!!") was broken in two ways:
@@ -4718,10 +5024,34 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     command?: string,
     options?: { coalesceFiniteScript?: boolean }
   ) => {
-    const cleanCommand = command?.trim();
+    let cleanCommand = command?.trim() || '';
     if (!cleanCommand) {
-      await runDeterministicStop(tabId, true, { source: 'restart-after' });
-      return;
+      const resolved = await resolveRestartAfterFallbackCommand(tabId);
+      if (!resolved.command) {
+        console.warn(
+          '[TabBar:RestartAfter] skip-empty-command target=' + tabId.slice(-8)
+          + ' reason=' + resolved.reason
+          + ' project=' + (resolved.projectId || projectId || '-')
+          + ' cwd=' + JSON.stringify(resolved.cwd || '')
+          + (resolved.sourceTabId ? ' sourceTab=' + resolved.sourceTabId.slice(-8) : '')
+          + (resolved.rejectedCommand ? ' rejected=' + JSON.stringify(resolved.rejectedCommand) : '')
+        );
+        return;
+      }
+      cleanCommand = resolved.command;
+      setRestartAfterFallbackCommands((previous) => {
+        if (previous.get(tabId) === cleanCommand) return previous;
+        const next = new Map(previous);
+        next.set(tabId, cleanCommand);
+        return next;
+      });
+      console.warn(
+        '[TabBar:RestartAfter] resolved-last-command target=' + tabId.slice(-8)
+        + ' project=' + (resolved.projectId || projectId || '-')
+        + ' cwd=' + JSON.stringify(resolved.cwd || '')
+        + (resolved.sourceTabId ? ' sourceTab=' + resolved.sourceTabId.slice(-8) : '')
+        + ' command=' + JSON.stringify(cleanCommand)
+      );
     }
     const coalesceFiniteScript = !!options?.coalesceFiniteScript && !isDevRestartCommand(cleanCommand);
     if (coalesceFiniteScript) {
@@ -4766,8 +5096,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   };
 
   const handleRestart = async (tabId: string) => {
-    const tab = useWorkspaceStore.getState().openProjects.get(projectId)?.tabs.get(tabId);
-    if (tab?.restartAfterCommand) {
+    const tab = resolveTabProjectContext(tabId).tab;
+    if (tab?.restartAfterCommand || getRestartAfterTriggerIds(tab).length > 0) {
       await runRestartAfterAction(tabId, tab.restartAfterCommand);
       return;
     }
@@ -4794,10 +5124,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 
   const handleRunLastProjectCommand = async (tabId: string) => {
     try {
-      const tab = useWorkspaceStore.getState().openProjects.get(projectId)?.tabs.get(tabId);
+      const owner = resolveTabProjectContext(tabId);
+      const tab = owner.tab;
       const liveCwd = await ipcRenderer.invoke('terminal:getCwd', tabId).catch(() => null);
       const result = await ipcRenderer.invoke('terminal:get-last-project-command', {
-        projectId,
+        projectId: owner.projectId,
+        tabId,
         cwd: liveCwd || tab?.cwd || null,
       });
       let command = String(result?.command || '').trim();
@@ -4810,6 +5142,12 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           return;
         }
       }
+      setRestartAfterFallbackCommands((previous) => {
+        if (previous.get(tabId) === command) return previous;
+        const next = new Map(previous);
+        next.set(tabId, command);
+        return next;
+      });
       const killPrefix = await buildKillPortsPrefix(tabId);
       ipcRenderer.send('terminal:input', tabId, `${killPrefix}${command}\r`);
       if (isDevRestartCommand(command)) {
@@ -5274,10 +5612,11 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 const index = mainTabsForDisplay.findIndex(t => t.id === tab.id);
                 const visualDepth = Math.max(0, visualDepthById.get(tab.id) || 0);
                 const tabNode = (
-                  <TabItem
-                    key={tab.id}
-                    tab={tab}
-                    index={index}
+	                  <TabItem
+	                    key={tab.id}
+	                    tab={tab}
+	                    restartAfterFallbackCommand={restartAfterFallbackCommands.get(tab.id) || null}
+	                    index={index}
                     groupId={groupId}
                     groupIndex={groupIndex}
                     zone="main"
@@ -5595,10 +5934,11 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           <ZoneDropTarget zone="utility" isEmpty={false}>
             <div className="flex flex-col max-h-[40%] overflow-y-auto scrollbar-hide" style={{ gap: `${tabSidebarGap}px`, padding: `${tabSidebarGap}px` }}>
               {utilityTabs.map((tab, index) => (
-                <TabItem
-                  key={tab.id}
-                  tab={tab}
-                  index={index}
+	                <TabItem
+	                  key={tab.id}
+	                  tab={tab}
+	                  restartAfterFallbackCommand={restartAfterFallbackCommands.get(tab.id) || null}
+	                  index={index}
                   zone="utility"
                   projectId={projectId}
                   orientation="vertical"
@@ -5773,10 +6113,11 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 ) : (
                   <div className="flex flex-col gap-[1px]">
                     {utilityTabs.map((tab, index) => (
-                      <TabItem
-                        key={tab.id}
-                        tab={tab}
-                        index={index}
+	                      <TabItem
+	                        key={tab.id}
+	                        tab={tab}
+	                        restartAfterFallbackCommand={restartAfterFallbackCommands.get(tab.id) || null}
+	                        index={index}
                         zone="utility"
                         projectId={projectId}
                         isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
@@ -5865,10 +6206,11 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               /* Tabs */
               <div className="flex items-stretch h-full flex-shrink-0 gap-[1px]">
                 {mainTabs.map((tab, index) => (
-                  <TabItem
-                    key={tab.id}
-                    tab={tab}
-                    index={index}
+	                  <TabItem
+	                    key={tab.id}
+	                    tab={tab}
+	                    restartAfterFallbackCommand={restartAfterFallbackCommands.get(tab.id) || null}
+	                    index={index}
                     zone="main"
                     projectId={projectId}
                     isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
@@ -6310,9 +6652,18 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 const ctxTabId = contextMenu.tabId;
                 if (ctxTab.tabType && ctxTab.tabType !== 'terminal') return null;
                 if (ctxTab.commandType === 'claude' || ctxTab.commandType === 'gemini' || ctxTab.commandType === 'codex') return null;
-                const selectedTriggerId = ctxTab.restartAfterTabId || null;
-                const hasSelection = !!selectedTriggerId;
+                const selectedTriggerIds = getRestartAfterTriggerIds(ctxTab);
+                const selectedTriggerId = selectedTriggerIds[0] || null;
+                const hasSelection = selectedTriggerIds.length > 0;
+                const restartAfterPaused = !!ctxTab.restartAfterPaused;
                 const selectedCommand = ctxTab.restartAfterCommand || null;
+                const selectedCommandLabel = formatRestartAfterCommandLabel(selectedCommand);
+                const fallbackCommand = contextLastCommand?.tabId === ctxTabId && !isAiLaunchCommand(contextLastCommand.command)
+                  ? contextLastCommand.command
+                  : null;
+                const fallbackCommandLabel = selectedCommand ? '' : formatRestartAfterCommandLabel(fallbackCommand);
+                const displayedCommandLabel = selectedCommandLabel || fallbackCommandLabel || 'Choose';
+                const displayedCommandIsFallback = !selectedCommand && !!fallbackCommandLabel;
                 const scriptTargets = [
                   ...contextScripts.map((script) => ({ key: `npm:${script}`, kind: 'npm', label: script, command: `npm run ${script}` })),
                   ...contextShScripts.map((file) => ({ key: `sh:${file}`, kind: 'sh', label: `./${file}`, command: `./${file}` })),
@@ -6320,13 +6671,19 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 return (
                   <div className="border-t border-[#3a3a3a]">
                     <div className="flex items-stretch w-full">
-                      <div className="flex-1 min-w-0">
+                      <div className="flex-1 min-w-0" style={{ opacity: restartAfterPaused ? 0.58 : 1 }}>
                         <RunAfterTabPicker
-                          tabId={ctxTabId}
-                          autoRun={hasSelection}
-                          runAfterTabId={selectedTriggerId}
-                          setRunAfterTab={(ownerTabId, targetTabId) => {
-                            setTabRestartAfterTarget(projectId, ownerTabId, targetTabId);
+	                          tabId={ctxTabId}
+	                          autoRun={hasSelection && !restartAfterPaused}
+	                          runAfterTabId={selectedTriggerId}
+	                          runAfterTabIds={selectedTriggerIds}
+	                          setRunAfterTab={(ownerTabId, targetTabId) => {
+	                            setTabRestartAfterTarget(projectId, ownerTabId, targetTabId);
+	                          }}
+                          onTriggerClick={() => {
+                            if (!hasSelection) return false;
+                            setTabRestartAfterPaused(projectId, ctxTabId, !restartAfterPaused);
+                            return true;
                           }}
                           panelRef={contextMenuRef}
                           title="Restart after - pick a tab"
@@ -6338,11 +6695,13 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                           menuWidth={252}
                           zIndex={100040}
                           side="right"
-                          accentColor="#8b5cf6"
-                          accentTextColor="#ddd6fe"
-                          showRuntimeDot={false}
-                          openOnHover
-                        />
+                          accentColor={restartAfterPaused ? '#71717a' : '#8b5cf6'}
+                          accentTextColor={restartAfterPaused ? '#a1a1aa' : '#ddd6fe'}
+	                          showRuntimeDot={false}
+	                          multiSelect
+	                          closeOnSelect={false}
+	                          openOnHover
+	                        />
                       </div>
                       {hasSelection && (
                         <button
@@ -6361,18 +6720,21 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     {hasSelection && (
                       <div className="px-3 pb-2">
                         <div className="relative group/restart-script -mx-3 mb-1">
-                          <div className="w-full px-3 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 flex items-center gap-2">
+                          <div className={`w-full px-3 py-1.5 text-[13px] hover:bg-white/10 flex items-center gap-2 ${restartAfterPaused ? 'text-[#777]' : 'text-[#ccc]'}`}>
                             <button
                               className="flex-1 min-w-0 text-left cursor-pointer flex items-center justify-between gap-2"
                               onClick={(e) => e.stopPropagation()}
                             >
                               <span className="flex items-center gap-2 min-w-0">
-                                <Play size={12} className={selectedCommand ? 'text-[#8b5cf6]' : 'text-[#666]'} />
+                                <Play size={12} className={selectedCommand && !restartAfterPaused ? 'text-[#8b5cf6]' : 'text-[#666]'} />
                                 <span className="truncate">Script</span>
                               </span>
                               <span className="flex items-center gap-1.5 min-w-0 text-[12px]">
-                                <span className={selectedCommand ? 'text-[#ddd6fe] truncate max-w-[118px]' : 'text-[#666]'}>
-                                  {selectedCommand || 'Choose'}
+                                <span className={selectedCommand
+                                  ? (restartAfterPaused ? 'text-[#888] truncate max-w-[118px]' : 'text-[#ddd6fe] truncate max-w-[118px]')
+                                  : (displayedCommandIsFallback ? 'text-[#777] truncate max-w-[118px]' : 'text-[#666]')}
+                                >
+                                  {displayedCommandLabel}
                                 </span>
                                 <span className="text-[#666]">{'\u203A'}</span>
                               </span>
@@ -6403,7 +6765,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                                     className="context-menu-submenu-item w-full"
                                     onClick={(e) => {
                                       e.stopPropagation();
-                                      setTabRestartAfterCommand(projectId, ctxTabId, target.command);
+                                      setTabRestartAfterCommand(projectId, ctxTabId, isSelected ? null : target.command);
                                     }}
                                   >
                                     <span className="context-menu-submenu-kind">{target.kind}</span>

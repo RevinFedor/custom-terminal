@@ -1306,6 +1306,24 @@ function normalizeMobileTimelineEntries(entries, fullEntries = []) {
     .filter(entry => entry && typeof entry.uuid === 'string')
     .map((entry) => {
       const fullEntry = fullByUuid.get(entry.uuid) || {};
+      const rawKind = String(entry.kind || entry.type || entry.role || 'entry');
+      const compactSummary = entry.compactSummary || fullEntry.compactSummary || '';
+      const isCompact = rawKind === 'compact' || entry.isCompactSummary === true || fullEntry.isCompactSummary === true;
+      if (isCompact) {
+        const full = compactSummary || entry.full || fullEntry.full || entry.preview || fullEntry.content || 'Conversation compacted';
+        const preview = mobileTimelinePreview(entry.preview || full || 'Conversation compacted');
+        return {
+          uuid: entry.uuid,
+          kind: 'compact',
+          color: entry.color || '#cba6f7',
+          preview: preview || 'Conversation compacted',
+          full: full || undefined,
+          ts: mobileTimelineTs(entry.ts || entry.timestamp || fullEntry.ts || fullEntry.timestamp),
+          preTokens: entry.preTokens || fullEntry.preTokens || undefined,
+          truncated: entry.truncated || undefined,
+          tools: entry.tools || undefined,
+        };
+      }
       if (entry.kind && (entry.preview || entry.full)) {
         const kind = String(entry.kind || 'entry');
         const full = entry.full || fullEntry.full || entry.preview || '';
@@ -1323,7 +1341,6 @@ function normalizeMobileTimelineEntries(entries, fullEntries = []) {
         };
       }
       const kind = String(entry.type || entry.role || 'entry');
-      const compactSummary = entry.compactSummary || fullEntry.compactSummary || '';
       const content = entry.content || fullEntry.content || '';
       const full = kind === 'compact'
         ? (compactSummary || content || 'Conversation compacted')
@@ -1566,6 +1583,34 @@ function decId(s) {
   try { return decodeURIComponent(s); } catch { return s; }
 }
 
+let activeLoadersLogSignature = null;
+function logActiveLoadersSnapshot(snapshot, status = 200, error = null) {
+  const loaders = Array.isArray(snapshot?.loaders) ? snapshot.loaders : [];
+  const kinds = loaders.reduce((acc, loader) => {
+    const key = loader?.kind || 'unknown';
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const signature = JSON.stringify({
+    status,
+    idle: snapshot?.idle === true,
+    count: Number(snapshot?.count || loaders.length || 0),
+    kinds,
+    error: error || null,
+  });
+  if (signature === activeLoadersLogSignature) return;
+  activeLoadersLogSignature = signature;
+  const tabs = loaders.slice(0, 8).map((loader) =>
+    String(loader?.tabId || '').slice(-12) + ':' + (loader?.kind || '-') + ':' + (loader?.status || '-')
+  ).join(',');
+  console.log('[ActiveLoaders] status=' + status +
+    ' idle=' + (snapshot?.idle === true) +
+    ' count=' + Number(snapshot?.count || loaders.length || 0) +
+    ' kinds=' + JSON.stringify(kinds) +
+    ' tabs=' + (tabs || '-') +
+    (error ? ' error=' + error : ''));
+}
+
 // ───────── REST handlers ─────────
 
 async function handleApi(req, res, parsed, sdkSessions) {
@@ -1608,21 +1653,26 @@ async function handleApi(req, res, parsed, sdkSessions) {
   }
 
   // Active-loaders snapshot — every tab across every project that is still
-  // "working" (AI turn/loader, SDK streaming, Gemini busy, or a non-AI running
-  // shell process). AI CLI liveness by itself is not a loader: idle Claude/Codex
-  // tabs are allowed to be closed by build:install. Computed in main against
-  // the live Maps that already drive the UI loader — no separate busy notion.
+  // "working" (AI turn/loader, SDK streaming, Gemini busy, or a Restart-after
+  // owned non-AI shell process). Manual shell commands are not install blockers.
+  // AI CLI liveness by itself is not a loader: idle Claude/Codex tabs are
+  // allowed to be closed by build:install. Computed in main against the live
+  // Maps that already drive the UI loader — no separate busy notion.
   // See computeActiveLoaders() in main.js.
   if (parsed.pathname === '/api/active-loaders' && req.method === 'GET') {
     if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
     if (!computeActiveLoaders) {
       // Fail SAFE: if the injection is missing we must NOT report idle — that
       // would green-light a rebuild mid-work. Signal the poller to keep waiting.
+      logActiveLoadersSnapshot({ idle: false, count: 0, loaders: [] }, 503, 'unavailable');
       return sendJson(res, 503, { error: 'active-loaders unavailable', idle: false });
     }
     try {
-      return sendJson(res, 200, computeActiveLoaders());
+      const snapshot = computeActiveLoaders();
+      logActiveLoadersSnapshot(snapshot, 200);
+      return sendJson(res, 200, snapshot);
     } catch (e) {
+      logActiveLoadersSnapshot({ idle: false, count: 0, loaders: [] }, 500, String(e.message || e));
       return sendJson(res, 500, { error: String(e.message), idle: false });
     }
   }

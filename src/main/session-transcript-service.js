@@ -68,17 +68,7 @@ function codexRecordToMobileMessage(record, sessionId) {
         },
       };
     }
-    if (payload.type === 'reasoning') {
-      return {
-        type: 'assistant',
-        uuid: getRecordUuid(record, sessionId, record.__line),
-        timestamp: record.timestamp || null,
-        message: {
-          role: 'assistant',
-          content: [{ type: 'thinking', thinking: payload.summary || payload.content || '' }],
-        },
-      };
-    }
+    if (payload.type === 'reasoning') return null;
     if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
       return {
         type: 'assistant',
@@ -95,22 +85,7 @@ function codexRecordToMobileMessage(record, sessionId) {
         },
       };
     }
-    if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
-      return {
-        type: 'user',
-        uuid: getRecordUuid(record, sessionId, record.__line),
-        timestamp: record.timestamp || null,
-        message: {
-          role: 'user',
-          content: [{
-            type: 'tool_result',
-            tool_use_id: payload.call_id || payload.id || '',
-            content: typeof payload.output === 'string' ? payload.output : JSON.stringify(payload.output || ''),
-            is_error: !!payload.is_error,
-          }],
-        },
-      };
-    }
+    if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') return null;
   }
   return null;
 }

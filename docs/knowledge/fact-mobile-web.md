@@ -80,6 +80,8 @@ Mobile receiver получает тот же поток raw SDK-сообщени
 
 Dedup для slash/compact работает через `entryUuid` — WS replay после optimistic local apply не плодит дубликаты.
 
+Серверный mobile timeline (`parseTimelineEntries` → `normalizeMobileTimelineEntries`) держит тот же смысл: `compact_boundary` и следующая `isCompactSummary` user-запись являются одной логической точкой compact. Boundary рендерится как compact-маркер с текстом summary, а сама `isCompactSummary` не выходит отдельным user-prompt'ом. Это важно для native iOS/REST snapshot: live reducer и reload не должны превращать один compact в две точки или в пользовательский input.
+
 ## Paste-chip flow на мобилке + EntryView как адаптер к пакету
 
 Мобилка получила **полный paste-chip flow** — зеркало desktop SDK (порог 500, чип-бар над композером, tap → preview, `<pasted_content>`-обёртка каждого чипа при отправке, `UserText`-разбор обёртки в user-бабле). Раньше мобильный composer не имел `onPaste` вообще: длинный текст вваливался в textarea, `send()` слал сырьё, бабл рендерил его без разбора. Send активен при наличии чипа даже с пустым текстом (bare-paste = валидный промпт, как на десктопе).

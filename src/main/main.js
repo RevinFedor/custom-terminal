@@ -18,6 +18,7 @@ try {
   console.warn('[HeadlessXterm] unavailable: ' + (err?.message || String(err)));
 }
 const isInboxProjectId = (projectId) => projectId === '__noted_inbox__';
+let gitIpcModule = null;
 
 // Load .env file (works in both dev and packaged builds).
 // Production: prefer ~/.noted-terminal/.env (survives reinstall) and fall back
@@ -748,9 +749,21 @@ function normalizeRememberedShellCommand(command) {
   return text;
 }
 
+function isAiLaunchShellCommand(command) {
+  const text = String(command || '').trim();
+  if (!text) return false;
+  if (/(^|[;&|]\s*)(?:command\s+)?(?:codex|claude|gemini)(?=\s|$)/i.test(text)) return true;
+  if (/(^|[;&|]\s*)(?:npx|pnpm\s+dlx|bunx)\s+@openai\/codex(?=\s|$)/i.test(text)) return true;
+  return false;
+}
+
 function rememberTerminalLastCommand(tabId, command) {
   const normalized = normalizeRememberedShellCommand(command);
   if (!normalized) return;
+  if (isAiLaunchShellCommand(normalized)) {
+    console.log('[LastCommand] skip-ai tab=' + String(tabId).slice(-12) + ' command=' + JSON.stringify(normalized));
+    return;
+  }
   const state = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
   const at = Date.now();
   const cwd = terminalProjects.get(tabId) || null;
@@ -759,7 +772,7 @@ function rememberTerminalLastCommand(tabId, command) {
   state.lastCommandCwd = cwd;
   terminalCommandState.set(tabId, state);
   rememberTerminalLastCommandForCwd(tabId, normalized, at, cwd);
-  console.log('[LastCommand] tab=' + String(tabId).slice(-12) + ' command=' + JSON.stringify(normalized));
+  console.log('[LastCommand] tab=' + String(tabId).slice(-12) + ' project=' + (terminalProjectIds.get(tabId) || '-') + ' cwd=' + JSON.stringify(cwd || '') + ' command=' + JSON.stringify(normalized));
 }
 
 function rememberDetectedTerminalCommand(tabId, command) {
@@ -1754,6 +1767,17 @@ function resolveActivityIdentity(tabId, engine) {
 function computeActiveLoaders() {
   const loaders = [];
   const seen = new Set(); // tabId — one tab contributes at most one loader
+  const hasRestartAfterSubscription = (row) => {
+    if (!row) return false;
+    if (row.restart_after_tab_id) return true;
+    if (!row.restart_after_tab_ids) return false;
+    try {
+      const ids = JSON.parse(row.restart_after_tab_ids);
+      return Array.isArray(ids) && ids.some((id) => typeof id === 'string' && id.trim());
+    } catch {
+      return false;
+    }
+  };
 
   // tabId → DB row. Reused both for labels and for separating "AI CLI alive"
   // from an ordinary shell command running in a terminal tab.
@@ -1764,7 +1788,7 @@ function computeActiveLoaders() {
     if (projectManager?.db?.db) {
       try {
         row = projectManager.db.db.prepare(
-          'SELECT project_id, name, command_type, tab_type, claude_session_id, codex_session_id, gemini_session_id, restart_after_tab_id, restart_after_command FROM tabs WHERE tab_id = ? LIMIT 1'
+          'SELECT project_id, name, command_type, tab_type, claude_session_id, codex_session_id, gemini_session_id, restart_after_tab_id, restart_after_tab_ids, restart_after_command, restart_after_paused FROM tabs WHERE tab_id = ? LIMIT 1'
         ).get(tabId) || null;
       } catch {}
     }
@@ -1878,10 +1902,20 @@ function computeActiveLoaders() {
     if (isAiRuntimeTab(tabId)) continue;
     if (st.activeCommandSource !== RESTART_AFTER_COMMAND_SOURCE) continue;
     const row = tabRowFor(tabId);
-    if (!row?.restart_after_tab_id) continue;
+    if (!hasRestartAfterSubscription(row)) continue;
+    if (row.restart_after_paused === 1) continue;
     const cmd = st.activeCommand || row?.restart_after_command || terminalInitialCommand.get(tabId) || null;
     loaders.push({ tabId, kind: 'restart-after', status: 'running', source: RESTART_AFTER_COMMAND_SOURCE, command: cmd, ...labelFor(tabId) });
     seen.add(tabId);
+  }
+
+  const gitOperations = typeof gitIpcModule?.getActiveOperations === 'function'
+    ? gitIpcModule.getActiveOperations()
+    : [];
+  for (const operation of gitOperations) {
+    if (!operation?.tabId || seen.has(operation.tabId)) continue;
+    loaders.push(operation);
+    seen.add(operation.tabId);
   }
 
   return { idle: loaders.length === 0, count: loaders.length, loaders, ts: Date.now() };
@@ -7328,8 +7362,9 @@ function startMcpHttpServer() {
 
           const state = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
           state.isRunning = true;
-          state.lastCommand = commandText;
-          state.lastCommandAt = Date.now();
+          // AI launches are runtime ownership, not reusable shell scripts. Keep the
+          // previous plain-shell lastCommand so Restart-after / Cmd+Play can still
+          // resolve the last non-AI command for this cwd.
           clearTerminalCommandOrigin(tabId, state, 'terminal-mcp-start-ai');
           terminalCommandState.set(tabId, state);
           if (mainWindow && !mainWindow.isDestroyed()) {
@@ -14206,7 +14241,8 @@ ipcMain.handle('terminal:getCommandState', async (event, request) => {
 });
 
 ipcMain.handle('terminal:get-last-project-command', async (event, request = {}) => {
-  const projectId = request?.projectId || null;
+  const requestedProjectId = typeof request?.projectId === 'string' && request.projectId ? request.projectId : null;
+  const ownerTabId = typeof request?.tabId === 'string' && request.tabId ? request.tabId : null;
   const cwd = typeof request?.cwd === 'string' && request.cwd ? request.cwd : null;
   let best = null;
 
@@ -14221,10 +14257,22 @@ ipcMain.handle('terminal:get-last-project-command', async (event, request = {}) 
     }
   };
 
+  const ownerProjectId = ownerTabId ? resolveProjectId(ownerTabId) : null;
+  const projectId = ownerProjectId || requestedProjectId;
+  if (ownerProjectId && requestedProjectId && ownerProjectId !== requestedProjectId) {
+    console.warn(
+      '[LastCommand] project-mismatch tab=' + String(ownerTabId).slice(-12)
+      + ' requested=' + requestedProjectId
+      + ' owner=' + ownerProjectId
+      + ' cwd=' + JSON.stringify(cwd || '')
+    );
+  }
+
   const consider = (candidate) => {
     if (!candidate?.command) return;
     const command = normalizeRememberedShellCommand(candidate.command);
     if (!command) return;
+    if (isAiLaunchShellCommand(command)) return;
     const at = Number(candidate.at || candidate.lastCommandAt || 0);
     if (!best || at > best.at) {
       best = {
@@ -17025,7 +17073,8 @@ require(path.join(srcMainDir, 'ipc', 'settings')).register({ projectManager });
 require(path.join(srcMainDir, 'ipc', 'docs')).register();
 
 // git:status, git:commit, git:push, git:fetch → ipc/git.js
-require(path.join(srcMainDir, 'ipc', 'git')).register({ projectManager });
+gitIpcModule = require(path.join(srcMainDir, 'ipc', 'git'));
+gitIpcModule.register({ projectManager });
 
 // search:query, search:index-session, search:index-all, search:stats → ipc/semantic-search.js
 require(path.join(srcMainDir, 'ipc', 'semantic-search')).register({

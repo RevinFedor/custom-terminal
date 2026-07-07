@@ -202,7 +202,7 @@ async function main() {
       firstSnap = false;
       const pidStr = server.pid ? 'pid ' + server.pid : server.cmd;
       feed(C.gray + 'Connected — ' + pidStr + ' · port ' + server.port + C.reset);
-      if (snap.idle) feed(C.green + '✓ already idle — nothing running' + C.reset);
+      if (snap.idle) feed(C.green + '✓ no install blockers' + C.reset);
       else printActiveList(snap);
     } else {
       // Delta announcements against the previous poll.

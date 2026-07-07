@@ -13,6 +13,28 @@ const GIT_COMMIT_PROMPT_ID = 'git-commit';
 const DEFAULT_GIT_COMMIT_SYSTEM_PROMPT = 'You write concise Git commit messages for local commits.\nReturn only JSON with keys "summary" and "description".\n\nRules:\n- The summary must be one line, imperative mood when possible, no trailing period, under 72 characters.\n- The description may be empty. If non-empty, use 1-4 short lines with concrete facts.\n- Do not mention files that are not present in the provided changes.\n- If docs/ changed, base the commit message on changed docs files only when the prompt data says docs-only context was applied.\n- If docs/ did not change, use all included changes.';
 const GIT_STATUS_WATCH_DEBOUNCE_MS = 300;
 const gitStatusWatchers = new Map();
+const activeGitOperations = new Map();
+let activeGitOperationSeq = 0;
+
+function startGitOperation(status, root) {
+  const id = `git:${Date.now()}:${++activeGitOperationSeq}`;
+  const repoName = root ? path.basename(root) : 'Git';
+  activeGitOperations.set(id, {
+    tabId: id,
+    kind: 'git',
+    status,
+    project: repoName,
+    name: `Git ${status}`,
+    cwd: root || null,
+    command: status,
+    startedAt: Date.now(),
+  });
+  return () => activeGitOperations.delete(id);
+}
+
+function getActiveOperations() {
+  return Array.from(activeGitOperations.values());
+}
 
 function safeProjectPath(projectPath) {
   if (!projectPath || typeof projectPath !== 'string') {
@@ -877,11 +899,16 @@ function register({ projectManager }) {
       const root = await getRepoRoot(projectPath);
       if (!root) throw new Error('Not a Git repository');
       if (!branch || typeof branch !== 'string') throw new Error('Branch is required');
-      const result = await runGit(root, ['checkout', branch]);
-      if (!result.success) {
-        return { success: false, error: result.stderr || result.error || 'git checkout failed' };
+      const finishGitOperation = startGitOperation('checkout', root);
+      try {
+        const result = await runGit(root, ['checkout', branch]);
+        if (!result.success) {
+          return { success: false, error: result.stderr || result.error || 'git checkout failed' };
+        }
+        return { success: true };
+      } finally {
+        finishGitOperation();
       }
-      return { success: true };
     } catch (error) {
       return { success: false, error: error.message };
     }
@@ -897,49 +924,54 @@ function register({ projectManager }) {
     try {
       const root = await getRepoRoot(projectPath);
       if (!root) throw new Error('Not a Git repository');
-      const status = await getStatusForRoot(root);
-      if (!status.files.length) throw new Error('No changed files');
-      const selection = normalizeSelectedChangedPaths(status, payload?.selectedPaths);
-      if (selection.invalid.length) {
-        return { success: false, staleSelection: true, error: staleSelectionError(selection.invalid) };
+      const finishGitOperation = startGitOperation('generate', root);
+      try {
+        const status = await getStatusForRoot(root);
+        if (!status.files.length) throw new Error('No changed files');
+        const selection = normalizeSelectedChangedPaths(status, payload?.selectedPaths);
+        if (selection.invalid.length) {
+          return { success: false, staleSelection: true, error: staleSelectionError(selection.invalid) };
+        }
+        const diffBundle = await collectDiffForPrompt(root, status, selection.paths, docsOnlyWhenPresent);
+        if (!diffBundle.includedPaths.length) throw new Error('No selected files');
+        const promptConfig = getGitCommitPromptConfig(projectManager);
+        model = promptConfig.model;
+        thinking = promptConfig.thinking;
+        const built = buildCommitPrompt(status, diffBundle, promptConfig.content);
+        prompt = built.prompt;
+        const response = await callGeminiApi(built.system, built.prompt, model, thinking);
+        output = response.text || '';
+
+        projectManager?.logAIPromptCall?.({
+          promptId: GIT_COMMIT_PROMPT_ID,
+          taskType: 'Git commit message',
+          model,
+          thinkingLevel: thinking,
+          promptTokens: Number(response.usage?.input_tokens || 0),
+          candidateTokens: Number(response.usage?.output_tokens || 0),
+          totalTokens: usageTotal(response.usage),
+          status: response.success ? 'success' : 'error',
+          error: response.success ? null : response.error,
+          sourceChars: prompt.length,
+          outputChars: output.length,
+          projectId: payload?.projectId,
+          projectName: payload?.projectName,
+          projectPath,
+          tabId: payload?.tabId,
+          tabName: payload?.tabName,
+          toolType: 'git',
+        });
+
+        if (!response.success) {
+          return { success: false, error: response.error || 'AI request failed', meta: diffBundle };
+        }
+
+        const message = parseCommitMessage(response.text);
+        if (!message.summary) return { success: false, error: 'AI response did not include a commit summary', raw: response.text, meta: diffBundle };
+        return { success: true, message, raw: response.text, meta: diffBundle, usage: response.usage };
+      } finally {
+        finishGitOperation();
       }
-      const diffBundle = await collectDiffForPrompt(root, status, selection.paths, docsOnlyWhenPresent);
-      if (!diffBundle.includedPaths.length) throw new Error('No selected files');
-      const promptConfig = getGitCommitPromptConfig(projectManager);
-      model = promptConfig.model;
-      thinking = promptConfig.thinking;
-      const built = buildCommitPrompt(status, diffBundle, promptConfig.content);
-      prompt = built.prompt;
-      const response = await callGeminiApi(built.system, built.prompt, model, thinking);
-      output = response.text || '';
-
-      projectManager?.logAIPromptCall?.({
-        promptId: GIT_COMMIT_PROMPT_ID,
-        taskType: 'Git commit message',
-        model,
-        thinkingLevel: thinking,
-        promptTokens: Number(response.usage?.input_tokens || 0),
-        candidateTokens: Number(response.usage?.output_tokens || 0),
-        totalTokens: usageTotal(response.usage),
-        status: response.success ? 'success' : 'error',
-        error: response.success ? null : response.error,
-        sourceChars: prompt.length,
-        outputChars: output.length,
-        projectId: payload?.projectId,
-        projectName: payload?.projectName,
-        projectPath,
-        tabId: payload?.tabId,
-        tabName: payload?.tabName,
-        toolType: 'git',
-      });
-
-      if (!response.success) {
-        return { success: false, error: response.error || 'AI request failed', meta: diffBundle };
-      }
-
-      const message = parseCommitMessage(response.text);
-      if (!message.summary) return { success: false, error: 'AI response did not include a commit summary', raw: response.text, meta: diffBundle };
-      return { success: true, message, raw: response.text, meta: diffBundle, usage: response.usage };
     } catch (error) {
       projectManager?.logAIPromptCall?.({
         promptId: GIT_COMMIT_PROMPT_ID,
@@ -965,34 +997,39 @@ function register({ projectManager }) {
     try {
       const root = await getRepoRoot(projectPath);
       if (!root) throw new Error('Not a Git repository');
-      const status = await getStatusForRoot(root);
-      if (!status.files.length) throw new Error('No changed files');
-      const selection = normalizeSelectedChangedPaths(status, selectedPaths);
-      if (selection.invalid.length) {
-        return { success: false, staleSelection: true, error: staleSelectionError(selection.invalid) };
-      }
-      const paths = selection.paths;
-      if (!paths.length) throw new Error('Select at least one changed file');
-      const cleanSummary = String(summary || '').trim();
-      if (!cleanSummary) throw new Error('Commit summary is required');
-      const addResult = await runGit(root, ['add', '--', ...paths]);
-      if (!addResult.success) {
-        const addError = addResult.stderr || addResult.error || 'git add failed';
-        if (/pathspec.+did not match any files/i.test(addError)) {
-          return { success: false, staleSelection: true, error: staleSelectionError(paths) };
+      const finishGitOperation = startGitOperation('commit', root);
+      try {
+        const status = await getStatusForRoot(root);
+        if (!status.files.length) throw new Error('No changed files');
+        const selection = normalizeSelectedChangedPaths(status, selectedPaths);
+        if (selection.invalid.length) {
+          return { success: false, staleSelection: true, error: staleSelectionError(selection.invalid) };
         }
-        return { success: false, error: addError };
+        const paths = selection.paths;
+        if (!paths.length) throw new Error('Select at least one changed file');
+        const cleanSummary = String(summary || '').trim();
+        if (!cleanSummary) throw new Error('Commit summary is required');
+        const addResult = await runGit(root, ['add', '--', ...paths]);
+        if (!addResult.success) {
+          const addError = addResult.stderr || addResult.error || 'git add failed';
+          if (/pathspec.+did not match any files/i.test(addError)) {
+            return { success: false, staleSelection: true, error: staleSelectionError(paths) };
+          }
+          return { success: false, error: addError };
+        }
+        const commitArgs = ['commit', '--only', '-m', cleanSummary];
+        const cleanDescription = String(description || '').trim();
+        if (cleanDescription) commitArgs.push('-m', cleanDescription);
+        commitArgs.push('--', ...paths);
+        const commitResult = await runGit(root, commitArgs);
+        if (!commitResult.success) {
+          return { success: false, error: commitResult.stderr || commitResult.error || 'git commit failed' };
+        }
+        const hash = await runGit(root, ['rev-parse', '--short', 'HEAD']);
+        return { success: true, hash: hash.success ? hash.stdout.trim() : '', output: commitResult.stdout };
+      } finally {
+        finishGitOperation();
       }
-      const commitArgs = ['commit', '--only', '-m', cleanSummary];
-      const cleanDescription = String(description || '').trim();
-      if (cleanDescription) commitArgs.push('-m', cleanDescription);
-      commitArgs.push('--', ...paths);
-      const commitResult = await runGit(root, commitArgs);
-      if (!commitResult.success) {
-        return { success: false, error: commitResult.stderr || commitResult.error || 'git commit failed' };
-      }
-      const hash = await runGit(root, ['rev-parse', '--short', 'HEAD']);
-      return { success: true, hash: hash.success ? hash.stdout.trim() : '', output: commitResult.stdout };
     } catch (error) {
       return { success: false, error: error.message };
     }
@@ -1002,36 +1039,41 @@ function register({ projectManager }) {
     try {
       const root = await getRepoRoot(projectPath);
       if (!root) throw new Error('Not a Git repository');
-      const targetHash = String(hash || '').trim();
-      if (!targetHash) throw new Error('Commit hash is required');
-      const head = await runGit(root, ['rev-parse', '--short', 'HEAD']);
-      if (!head.success) throw new Error(head.stderr || head.error || 'Unable to read HEAD');
-      if (head.stdout.trim() !== targetHash) throw new Error('Only the latest commit can be undone');
-      const parents = await runGit(root, ['rev-list', '--parents', '-n', '1', 'HEAD']);
-      if (!parents.success) throw new Error(parents.stderr || parents.error || 'Unable to inspect commit parents');
-      if (parents.stdout.trim().split(/\s+/).length < 2) {
-        throw new Error('Cannot undo the initial commit from this panel');
-      }
-      const upstream = await hasUpstream(root);
-      let protectRef = upstream;
-      if (!protectRef) {
-        const branch = await currentBranch(root);
-        if (branch && branch !== 'HEAD') {
-          const originBranch = await runGit(root, ['rev-parse', '--verify', '--quiet', `origin/${branch}`]);
-          if (originBranch.success) protectRef = `origin/${branch}`;
+      const finishGitOperation = startGitOperation('undo', root);
+      try {
+        const targetHash = String(hash || '').trim();
+        if (!targetHash) throw new Error('Commit hash is required');
+        const head = await runGit(root, ['rev-parse', '--short', 'HEAD']);
+        if (!head.success) throw new Error(head.stderr || head.error || 'Unable to read HEAD');
+        if (head.stdout.trim() !== targetHash) throw new Error('Only the latest commit can be undone');
+        const parents = await runGit(root, ['rev-list', '--parents', '-n', '1', 'HEAD']);
+        if (!parents.success) throw new Error(parents.stderr || parents.error || 'Unable to inspect commit parents');
+        if (parents.stdout.trim().split(/\s+/).length < 2) {
+          throw new Error('Cannot undo the initial commit from this panel');
         }
-      }
-      if (protectRef) {
-        const pushedCheck = await runGit(root, ['merge-base', '--is-ancestor', 'HEAD', protectRef]);
-        if (pushedCheck.success) {
-          throw new Error('Latest commit is already pushed');
+        const upstream = await hasUpstream(root);
+        let protectRef = upstream;
+        if (!protectRef) {
+          const branch = await currentBranch(root);
+          if (branch && branch !== 'HEAD') {
+            const originBranch = await runGit(root, ['rev-parse', '--verify', '--quiet', `origin/${branch}`]);
+            if (originBranch.success) protectRef = `origin/${branch}`;
+          }
         }
+        if (protectRef) {
+          const pushedCheck = await runGit(root, ['merge-base', '--is-ancestor', 'HEAD', protectRef]);
+          if (pushedCheck.success) {
+            throw new Error('Latest commit is already pushed');
+          }
+        }
+        const result = await runGit(root, ['reset', '--soft', 'HEAD~1']);
+        if (!result.success) {
+          return { success: false, error: result.stderr || result.error || 'git reset failed' };
+        }
+        return { success: true };
+      } finally {
+        finishGitOperation();
       }
-      const result = await runGit(root, ['reset', '--soft', 'HEAD~1']);
-      if (!result.success) {
-        return { success: false, error: result.stderr || result.error || 'git reset failed' };
-      }
-      return { success: true };
     } catch (error) {
       return { success: false, error: error.message };
     }
@@ -1041,15 +1083,20 @@ function register({ projectManager }) {
     try {
       const root = await getRepoRoot(projectPath);
       if (!root) throw new Error('Not a Git repository');
-      const branch = await currentBranch(root);
-      const upstream = await hasUpstream(root);
-      const args = upstream ? ['push'] : ['push', '-u', 'origin', branch || 'HEAD'];
-      const result = await runGit(root, args, { timeout: 120 * 1000 });
-      if (!result.success) {
-        const err = result.stderr || result.error || 'git push failed';
-        return { success: false, error: err, authError: authError(err) };
+      const finishGitOperation = startGitOperation('push', root);
+      try {
+        const branch = await currentBranch(root);
+        const upstream = await hasUpstream(root);
+        const args = upstream ? ['push'] : ['push', '-u', 'origin', branch || 'HEAD'];
+        const result = await runGit(root, args, { timeout: 120 * 1000 });
+        if (!result.success) {
+          const err = result.stderr || result.error || 'git push failed';
+          return { success: false, error: err, authError: authError(err) };
+        }
+        return { success: true, output: result.stdout || result.stderr };
+      } finally {
+        finishGitOperation();
       }
-      return { success: true, output: result.stdout || result.stderr };
     } catch (error) {
       return { success: false, error: error.message, authError: authError(error.message) };
     }
@@ -1059,12 +1106,17 @@ function register({ projectManager }) {
     try {
       const root = await getRepoRoot(projectPath);
       if (!root) throw new Error('Not a Git repository');
-      const result = await runGit(root, ['fetch', 'origin', '--prune'], { timeout: 120 * 1000 });
-      if (!result.success) {
-        const err = result.stderr || result.error || 'git fetch failed';
-        return { success: false, error: err, authError: authError(err) };
+      const finishGitOperation = startGitOperation('fetch', root);
+      try {
+        const result = await runGit(root, ['fetch', 'origin', '--prune'], { timeout: 120 * 1000 });
+        if (!result.success) {
+          const err = result.stderr || result.error || 'git fetch failed';
+          return { success: false, error: err, authError: authError(err) };
+        }
+        return { success: true, output: result.stdout || result.stderr };
+      } finally {
+        finishGitOperation();
       }
-      return { success: true, output: result.stdout || result.stderr };
     } catch (error) {
       return { success: false, error: error.message, authError: authError(error.message) };
     }
@@ -1101,4 +1153,4 @@ function register({ projectManager }) {
   });
 }
 
-module.exports = { register };
+module.exports = { register, getActiveOperations };

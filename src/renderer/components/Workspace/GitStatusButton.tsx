@@ -23,8 +23,10 @@ import {
   Star,
   Upload,
 } from 'lucide-react';
+import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { RunAfterTabPicker } from './RunAfterTabPicker';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -161,6 +163,9 @@ type Props = {
   projectPath?: string;
 };
 
+type GitRunAfterAction = 'generate' | 'generate-commit';
+type GitRunAfterStatusPhase = 'idle' | 'waiting' | 'running' | 'success';
+
 function loadDocsOnlySetting() {
   try {
     return window.localStorage.getItem(DOCS_ONLY_STORAGE_KEY) === 'true';
@@ -269,6 +274,10 @@ function trimError(error: unknown) {
   return String(error || 'Unknown error').replace(/\s+/g, ' ').trim().slice(0, 240);
 }
 
+function gitRunAfterActionLabel(action: GitRunAfterAction) {
+  return action === 'generate-commit' ? 'Generate and commit' : 'Generate';
+}
+
 function basenameFromPath(filePath: string) {
   const parts = filePath.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] || filePath;
@@ -312,6 +321,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [statusLoading, setStatusLoading] = useState(() => Boolean(projectPath));
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const generateButtonRef = useRef<HTMLButtonElement>(null);
+  const generateCommitButtonRef = useRef<HTMLButtonElement>(null);
   const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
   const [selectedPathsManual, setSelectedPathsManual] = useState(false);
@@ -337,6 +349,14 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [description, setDescription] = useState('');
   const [generating, setGenerating] = useState(false);
   const [committing, setCommitting] = useState(false);
+  const [runAfterAction, setRunAfterAction] = useState<GitRunAfterAction | null>(null);
+  const [runAfterTargetTabId, setRunAfterTargetTabId] = useState<string | null>(null);
+  const [runAfterPickerAction, setRunAfterPickerAction] = useState<GitRunAfterAction>('generate-commit');
+  const [runAfterPickerKey, setRunAfterPickerKey] = useState(0);
+  const [runAfterPickerCloseKey, setRunAfterPickerCloseKey] = useState(0);
+  const [runAfterFlashAction, setRunAfterFlashAction] = useState<GitRunAfterAction | null>(null);
+  const [runAfterRunningAction, setRunAfterRunningAction] = useState<GitRunAfterAction | null>(null);
+  const [runAfterSuccessAction, setRunAfterSuccessAction] = useState<GitRunAfterAction | null>(null);
   const [remoteBusy, setRemoteBusy] = useState<'push' | 'fetch' | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyItems, setHistoryItems] = useState<GitCommit[]>([]);
@@ -374,6 +394,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const statusPreviewSignatureRef = useRef('');
   const latestProjectPathRef = useRef(projectPath || '');
   const hydratedStateKeyRef = useRef('');
+  const runAfterBusyRef = useRef<Map<string, boolean>>(new Map());
+  const runAfterFireRef = useRef(false);
+  const runAfterFlashTimerRef = useRef<number | null>(null);
+  const runAfterSuccessTimerRef = useRef<number | null>(null);
 
   const selectedCount = selectedPaths.size;
   const allSelected = status?.files.length ? selectedCount === status.files.length : false;
@@ -398,6 +422,17 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     if (!q) return historyItems;
     return historyItems.filter((commit) => `${commit.hash} ${commit.subject} ${commit.date}`.toLowerCase().includes(q));
   }, [historyItems, historySearch]);
+  const runAfterTargetLabel = useWorkspaceStore((state) => {
+    if (!runAfterTargetTabId) return '';
+    for (const [pid, ws] of state.openProjects) {
+      const tab = ws.tabs.get(runAfterTargetTabId);
+      if (!tab) continue;
+      const tabName = tab.name || runAfterTargetTabId.slice(-8);
+      const projectLabel = basenameFromPath(ws.projectPath || pid);
+      return projectLabel ? `${tabName} · ${projectLabel}` : tabName;
+    }
+    return 'Missing tab';
+  });
   const hydratedForCurrentProject = hydratedStateKeyRef.current === panelStateKey;
   const effectiveRepoPath = (hydratedForCurrentProject ? selectedRepoPath : (projectPath || '')) || projectPath || '';
   const homeRepositories = useMemo(() => makeHomeRepositories(projectPath), [projectPath]);
@@ -1104,11 +1139,11 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     );
   };
 
-  const handleGenerate = async () => {
-    if (!effectiveRepoPath || !status) return;
+  const generateCommitMessage = useCallback(async (showSuccessToast = true): Promise<{ summary: string; description: string } | null> => {
+    if (!effectiveRepoPath || !status) return null;
     if (!selectedList.length) {
       showToast('Select files for commit message', 'warning');
-      return;
+      return null;
     }
     setGenerating(true);
     setGenerationMeta(null);
@@ -1126,34 +1161,40 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         if (result?.staleSelection) await loadStatus(true);
         throw new Error(result?.error || 'AI commit message failed');
       }
-      setSummary(result.message.summary || '');
-      setDescription(result.message.description || '');
+      const nextMessage = {
+        summary: result.message.summary || '',
+        description: result.message.description || '',
+      };
+      setSummary(nextMessage.summary);
+      setDescription(nextMessage.description);
       setGenerationMeta(result.meta || null);
-      showToast('Commit description generated', 'success');
+      if (showSuccessToast) showToast('Commit description generated', 'success');
+      return nextMessage;
     } catch (error: any) {
       showToast('Commit AI: ' + trimError(error?.message || error), 'error');
+      return null;
     } finally {
       setGenerating(false);
     }
-  };
+  }, [activeTabId, activeTabName, docsOnlyWhenPresent, effectiveRepoPath, loadStatus, projectId, projectName, selectedList, showToast, status]);
 
-  const handleCommit = async () => {
-    if (!effectiveRepoPath) return;
+  const commitChanges = useCallback(async (summaryText: string, descriptionText: string): Promise<boolean> => {
+    if (!effectiveRepoPath) return false;
     if (!selectedList.length) {
       showToast('Select files to commit', 'warning');
-      return;
+      return false;
     }
-    if (!summary.trim()) {
+    if (!summaryText.trim()) {
       showToast('Summary is required', 'warning');
-      return;
+      return false;
     }
     setCommitting(true);
     try {
       const result = await ipcRenderer.invoke('git:commit', {
         projectPath: effectiveRepoPath,
         selectedPaths: selectedList,
-        summary,
-        description,
+        summary: summaryText,
+        description: descriptionText,
       });
       if (!result?.success) {
         if (result?.staleSelection) await loadStatus(true);
@@ -1164,12 +1205,129 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       setDescription('');
       await loadStatus(true);
       if (panelTab === 'history') await loadHistory();
+      return true;
     } catch (error: any) {
       showToast('Commit: ' + trimError(error?.message || error), 'error', 5000);
+      return false;
     } finally {
       setCommitting(false);
     }
-  };
+  }, [effectiveRepoPath, loadHistory, loadStatus, panelTab, selectedList, showToast]);
+
+  const handleGenerate = useCallback(async () => {
+    return Boolean(await generateCommitMessage(true));
+  }, [generateCommitMessage]);
+
+  const handleCommit = useCallback(async () => {
+    await commitChanges(summary, description);
+  }, [commitChanges, description, summary]);
+
+  const handleGenerateAndCommit = useCallback(async () => {
+    const message = await generateCommitMessage(false);
+    if (!message?.summary) return false;
+    return commitChanges(message.summary, message.description);
+  }, [commitChanges, generateCommitMessage]);
+
+  const flashRunAfterSuccess = useCallback((action: GitRunAfterAction) => {
+    if (runAfterSuccessTimerRef.current) window.clearTimeout(runAfterSuccessTimerRef.current);
+    setRunAfterSuccessAction(action);
+    runAfterSuccessTimerRef.current = window.setTimeout(() => {
+      setRunAfterSuccessAction(null);
+      runAfterSuccessTimerRef.current = null;
+    }, 1200);
+  }, []);
+
+  const openGitRunAfterPicker = useCallback((event: React.MouseEvent, action: GitRunAfterAction) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (runAfterFlashTimerRef.current) window.clearTimeout(runAfterFlashTimerRef.current);
+    setRunAfterFlashAction(action);
+    runAfterFlashTimerRef.current = window.setTimeout(() => {
+      setRunAfterFlashAction(null);
+      runAfterFlashTimerRef.current = null;
+    }, 220);
+    setRunAfterPickerAction(action);
+    setRunAfterPickerKey((key) => key + 1);
+  }, []);
+
+  const setGitRunAfterTab = useCallback((_ownerTabId: string, targetTabId: string | null) => {
+    const target = typeof targetTabId === 'string' && targetTabId.trim() ? targetTabId.trim() : null;
+    if (!target) {
+      setRunAfterTargetTabId(null);
+      setRunAfterAction(null);
+      setRunAfterRunningAction(null);
+      showToast('Git run after cleared', 'success', 1200);
+      return;
+    }
+    const action = runAfterPickerAction;
+    const busySnapshot = getBusyTabsSnapshot();
+    const busy = busySnapshot.get(target) === true;
+    runAfterBusyRef.current.set(target, busy);
+    setRunAfterAction(action);
+    setRunAfterTargetTabId(target);
+    showToast(`${gitRunAfterActionLabel(action)} after selected tab`, 'success', 1800);
+  }, [runAfterPickerAction, showToast]);
+
+  useEffect(() => () => {
+    if (runAfterFlashTimerRef.current) window.clearTimeout(runAfterFlashTimerRef.current);
+    if (runAfterSuccessTimerRef.current) window.clearTimeout(runAfterSuccessTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (!open) setRunAfterPickerCloseKey((key) => key + 1);
+  }, [open]);
+
+  useEffect(() => {
+    if (!runAfterTargetTabId || !runAfterAction) return;
+    const target = runAfterTargetTabId;
+    const currentSnapshot = getBusyTabsSnapshot();
+    if (!runAfterBusyRef.current.has(target)) {
+      runAfterBusyRef.current.set(target, currentSnapshot.get(target) === true);
+    }
+
+    const applyBusyState = async (tid: string, busy: boolean) => {
+      if (!tid || tid !== target) return;
+      const wasBusy = runAfterBusyRef.current.get(tid) === true;
+      runAfterBusyRef.current.set(tid, busy);
+      if (!wasBusy || busy || runAfterFireRef.current) return;
+
+      const action = runAfterAction;
+      runAfterFireRef.current = true;
+      setRunAfterTargetTabId(null);
+      setRunAfterAction(null);
+      showToast(`${gitRunAfterActionLabel(action)} started`, 'success', 1400);
+      setRunAfterRunningAction(action);
+      let succeeded = false;
+      try {
+        succeeded = action === 'generate-commit'
+          ? await handleGenerateAndCommit()
+          : await handleGenerate();
+      } finally {
+        setRunAfterRunningAction(null);
+        runAfterFireRef.current = false;
+      }
+      if (succeeded) flashRunAfterSuccess(action);
+    };
+
+    const handleClaudeBusy = (_: unknown, payload: { tabId: string; busy: boolean }) => {
+      void applyBusyState(payload?.tabId, payload?.busy === true);
+    };
+    const handleGeminiBusy = (_: unknown, payload: { tabId: string; busy: boolean }) => {
+      void applyBusyState(payload?.tabId, payload?.busy === true);
+    };
+    const handleCodexBusy = (_: unknown, payload: { tabId: string; busy: boolean }) => {
+      void applyBusyState(payload?.tabId, payload?.busy === true);
+    };
+
+    ipcRenderer.on('claude:busy-state', handleClaudeBusy);
+    ipcRenderer.on('gemini:busy-state', handleGeminiBusy);
+    ipcRenderer.on('codex:busy-state', handleCodexBusy);
+    return () => {
+      ipcRenderer.removeListener('claude:busy-state', handleClaudeBusy);
+      ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
+      ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
+    };
+  }, [flashRunAfterSuccess, handleGenerate, handleGenerateAndCommit, runAfterAction, runAfterTargetTabId, showToast]);
 
   const handleUndoCommit = async (commit: GitCommit) => {
     if (!effectiveRepoPath || !commit?.hash) return;
@@ -1312,13 +1470,32 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const visibleCommitDetails = commitDetailsRepoPath === effectiveRepoPath && commitDetailsMatchHash(commitDetails, activeCommitHash) ? commitDetails : null;
   const activeCommitDetailsLoadingKey = commitDetailsRequestKey(effectiveRepoPath, activeCommitHash, activeCommitFilePath);
   const historyPreviewLoading = Boolean(commitDetailsLoading && commitDetailsLoadingKey === activeCommitDetailsLoadingKey);
+  const generateDisabled = generating || committing || selectedCount === 0 || status.changedCount === 0;
+  const commitDisabled = committing || selectedCount === 0 || !summary.trim();
+  const gitRunAfterOwnerTabId = `git-panel:${projectId || projectPath || effectiveRepoPath || 'repo'}`;
+  const gitRunAfterStatusAction = runAfterAction || runAfterRunningAction || runAfterSuccessAction;
+  const gitRunAfterLabel = gitRunAfterStatusAction ? gitRunAfterActionLabel(gitRunAfterStatusAction) : '';
+  const gitRunAfterStatusPhase: GitRunAfterStatusPhase = runAfterRunningAction
+    ? 'running'
+    : runAfterTargetTabId
+      ? 'waiting'
+      : runAfterSuccessAction
+        ? 'success'
+        : 'idle';
+  const gitRunAfterPreviewTitle = gitRunAfterStatusPhase === 'waiting'
+    ? `${gitRunAfterLabel} waits for ${runAfterTargetLabel || runAfterTargetTabId?.slice(-8) || 'selected tab'}`
+    : gitRunAfterStatusPhase === 'running'
+      ? `${gitRunAfterLabel} is running`
+      : gitRunAfterStatusPhase === 'success'
+        ? `${gitRunAfterLabel} completed`
+        : '';
 
   return (
     <>
       <button
         ref={triggerRef}
         onClick={() => setOpen((value) => !value)}
-        title={`${status.repoName}: ${status.branch} · ${status.changedCount} changed${remoteHint}`}
+        title={`${status.repoName}: ${status.branch} · ${status.changedCount} changed${remoteHint}${gitRunAfterPreviewTitle ? ' · ' + gitRunAfterPreviewTitle : ''}`}
         className="inline-flex items-center gap-1 rounded cursor-pointer hover:opacity-90 transition-colors"
         style={{
           height: '100%',
@@ -1334,6 +1511,13 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         <GitBranch size={12} />
         <span style={{ maxWidth: 72, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 700 }}>
           {status.branch}
+        </span>
+        <span style={gitToolbarRunAfterStatusStyle(gitRunAfterStatusPhase)}>
+          {gitRunAfterStatusPhase === 'success' ? (
+            <Check size={11} strokeWidth={2.5} />
+          ) : gitRunAfterStatusPhase === 'waiting' || gitRunAfterStatusPhase === 'running' ? (
+            <Loader2 size={11} className="animate-spin" />
+          ) : null}
         </span>
         <span
           style={{
@@ -1362,6 +1546,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
             style={{ position: 'fixed', inset: 0, zIndex: 9998, background: 'transparent' }}
           />
           <div
+            ref={panelRef}
             onMouseDown={(event) => event.stopPropagation()}
             onClick={(event) => event.stopPropagation()}
             style={{
@@ -1735,23 +1920,130 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                           style={{ ...inputStyle, height: 72, resize: 'vertical', paddingTop: 8 }}
                         />
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                          <button
-                            onClick={handleGenerate}
-                            disabled={generating || committing || selectedCount === 0 || status.changedCount === 0}
-                            style={secondaryButtonStyle(generating || committing || selectedCount === 0 || status.changedCount === 0)}
+                          <div
+                            style={{
+                              flex: 1,
+                              minWidth: 0,
+                              height: 30,
+                              display: 'inline-flex',
+                              alignItems: 'stretch',
+                              borderRadius: 7,
+                              border: '1px solid rgba(255,255,255,0.12)',
+                              background: 'rgba(255,255,255,0.05)',
+                              overflow: 'hidden',
+                              opacity: generateDisabled ? 0.55 : 1,
+                            }}
                           >
-                            {generating ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
-                            {generating ? 'Generating' : 'Generate'}
-                          </button>
+                            <button
+                              ref={generateCommitButtonRef}
+                              onClick={handleGenerateAndCommit}
+                              onContextMenu={(event) => openGitRunAfterPicker(event, 'generate-commit')}
+                              disabled={generateDisabled}
+                              title="Generate and commit. Right-click to run after a tab."
+                              style={splitGeneratePartStyle(generateDisabled, false, runAfterFlashAction === 'generate-commit')}
+                            >
+                              {generating || committing ? (
+                                <Loader2 size={13} className="animate-spin" />
+                              ) : (
+                                <>
+                                  <Sparkles size={13} />
+                                  <Check size={12} />
+                                  <span>Generate & Commit</span>
+                                </>
+                              )}
+                            </button>
+                            <span style={{ width: 1, background: 'rgba(255,255,255,0.13)', flexShrink: 0 }} />
+                            <button
+                              ref={generateButtonRef}
+                              onClick={handleGenerate}
+                              onContextMenu={(event) => openGitRunAfterPicker(event, 'generate')}
+                              disabled={generateDisabled}
+                              title="Generate commit message. Right-click to run after a tab."
+                              style={splitGeneratePartStyle(generateDisabled, true, runAfterFlashAction === 'generate')}
+                            >
+                              {generating ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+                            </button>
+                          </div>
                           <button
                             onClick={handleCommit}
-                            disabled={committing || selectedCount === 0 || !summary.trim()}
-                            style={{ ...primaryButtonStyle, flex: 1, opacity: committing || selectedCount === 0 || !summary.trim() ? 0.55 : 1 }}
+                            disabled={commitDisabled}
+                            style={{
+                              ...primaryButtonStyle,
+                              flex: '0 0 auto',
+                              minWidth: 88,
+                              padding: '0 9px',
+                              opacity: commitDisabled ? 0.55 : 1,
+                            }}
                           >
                             {committing ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
                             {committing ? 'Committing' : `Commit ${selectedCount || ''}`.trim()}
                           </button>
                         </div>
+                        <div style={gitRunAfterStatusStyle(gitRunAfterStatusPhase !== 'idle')}>
+                          {gitRunAfterStatusPhase !== 'idle' && (
+                            <>
+                              {gitRunAfterStatusPhase === 'success' ? (
+                                <Check size={11} strokeWidth={2.5} style={{ color: '#86efac', flexShrink: 0 }} />
+                              ) : (
+                                <Loader2
+                                  size={11}
+                                  className="animate-spin"
+                                  style={{ color: gitRunAfterStatusPhase === 'running' ? '#60a5fa' : '#94a3b8', flexShrink: 0 }}
+                                />
+                              )}
+                              <span
+                                style={{
+                                  color: gitRunAfterStatusPhase === 'running'
+                                    ? '#bfdbfe'
+                                    : gitRunAfterStatusPhase === 'success'
+                                      ? '#bbf7d0'
+                                      : '#94a3b8',
+                                  flexShrink: 0,
+                                }}
+                              >
+                                {gitRunAfterLabel} {gitRunAfterStatusPhase === 'waiting' ? 'after' : gitRunAfterStatusPhase === 'running' ? 'running' : 'done'}
+                              </span>
+                              {gitRunAfterStatusPhase === 'waiting' && runAfterTargetTabId && (
+                                <>
+                                  <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: '#e5e7eb' }}>
+                                    {runAfterTargetLabel || runAfterTargetTabId.slice(-8)}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() => setGitRunAfterTab(gitRunAfterOwnerTabId, null)}
+                                    title="Clear Git run after"
+                                    style={gitRunAfterClearStyle}
+                                  >
+                                    ×
+                                  </button>
+                                </>
+                              )}
+                            </>
+                          )}
+                        </div>
+                        <RunAfterTabPicker
+                          tabId={gitRunAfterOwnerTabId}
+                          ownerProjectId={projectId || null}
+                          autoRun={Boolean(runAfterTargetTabId)}
+                          runAfterTabId={runAfterTargetTabId}
+                          setRunAfterTab={setGitRunAfterTab}
+                          panelRef={panelRef}
+                          title={runAfterPickerAction === 'generate-commit' ? 'After tab: generate and commit' : 'After tab: generate'}
+                          emptyLabel="after tab"
+                          showAllTabsOnOpen
+                          menuWidth={274}
+                          zIndex={10050}
+                          side="right"
+                          accentColor="#facc15"
+                          accentTextColor="#fde68a"
+                          showRuntimeDot={false}
+                          showTargetSummary={false}
+                          hideTrigger
+                          externalTriggerRef={runAfterPickerAction === 'generate-commit' ? generateCommitButtonRef : generateButtonRef}
+                          openRequestKey={runAfterPickerKey}
+                          closeRequestKey={runAfterPickerCloseKey}
+                          modalOverlay
+                        />
                       </div>
                       </>
                     )}
@@ -3123,22 +3415,79 @@ const primaryButtonStyle: React.CSSProperties = {
   cursor: 'pointer',
 };
 
-const secondaryButtonStyle = (disabled: boolean): React.CSSProperties => ({
-  height: 30,
-  borderRadius: 7,
-  border: '1px solid rgba(255,255,255,0.12)',
-  background: 'rgba(255,255,255,0.05)',
+const splitGeneratePartStyle = (disabled: boolean, iconOnly: boolean, flash = false): React.CSSProperties => ({
+  height: '100%',
+  border: 'none',
+  background: flash ? 'rgba(250,204,21,0.24)' : 'transparent',
   color: '#dbeafe',
   display: 'inline-flex',
   alignItems: 'center',
   justifyContent: 'center',
-  gap: 6,
-  padding: '0 11px',
+  gap: iconOnly ? 2 : 5,
+  padding: iconOnly ? '0 9px' : '0 11px',
+  minWidth: iconOnly ? 42 : 0,
+  flex: iconOnly ? '0 0 auto' : '1 1 auto',
   fontSize: 12,
   fontWeight: 750,
   cursor: disabled ? 'default' : 'pointer',
-  opacity: disabled ? 0.55 : 1,
+  overflow: 'hidden',
+  whiteSpace: 'nowrap',
+  transition: 'background 0.18s ease, color 0.12s ease',
 });
+
+const gitToolbarRunAfterStatusStyle = (phase: GitRunAfterStatusPhase): React.CSSProperties => {
+  const active = phase !== 'idle';
+  const running = phase === 'running';
+  const success = phase === 'success';
+  return {
+    width: 18,
+    height: 16,
+    borderRadius: 999,
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+    opacity: active ? 1 : 0,
+    color: success ? '#86efac' : running ? '#60a5fa' : '#94a3b8',
+    background: success
+      ? 'rgba(34,197,94,0.18)'
+      : running
+        ? 'rgba(59,130,246,0.18)'
+        : 'rgba(148,163,184,0.12)',
+    transition: 'opacity 0.12s ease, color 0.12s ease, background 0.12s ease',
+    pointerEvents: 'none',
+  };
+};
+
+const gitRunAfterStatusStyle = (visible: boolean): React.CSSProperties => ({
+  height: 18,
+  display: 'flex',
+  alignItems: 'center',
+  gap: 5,
+  minWidth: 0,
+  padding: '0 2px',
+  fontSize: 10.5,
+  opacity: visible ? 1 : 0,
+  pointerEvents: visible ? 'auto' : 'none',
+  transition: 'opacity 0.12s ease',
+});
+
+const gitRunAfterClearStyle: React.CSSProperties = {
+  width: 16,
+  height: 16,
+  borderRadius: 4,
+  border: 'none',
+  background: 'rgba(255,255,255,0.08)',
+  color: '#94a3b8',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  fontSize: 13,
+  lineHeight: 1,
+  cursor: 'pointer',
+  flexShrink: 0,
+  padding: 0,
+};
 
 const countPillStyle: React.CSSProperties = {
   minWidth: 18,

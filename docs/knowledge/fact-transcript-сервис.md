@@ -20,8 +20,10 @@ Project Terminal API добавляет к live `type:'message'` совмест�
 - обычный user prompt → History + Timeline + может materialize conversation;
 - `attachment.queued_command` с обычным prompt → queued/sent user-row в History, Timeline и materialization после durable proof;
 - `<command-name>` slash command → history-only управляющая строка. Startup defaults `/model`/`/effort` видны в History как фиолетовые служебные строки, но не становятся Timeline turn'ами и не materialize conversation;
-- `thinking` без текста/tool-result → ephemeral turn-state, не durable history row;
-- `tool_result`, `<local-command-stdout>`, `<system-reminder>`, caveat/stdout wrappers → service-noise, не History и не Timeline.
+- `thinking`/Codex `reasoning` без обычного assistant-message → ephemeral turn-state, не durable history row;
+- `tool_result`, Codex `function_call_output`/`custom_tool_call_output`, `<local-command-stdout>`, `<system-reminder>`, caveat/stdout wrappers → service-noise, не History и не Timeline.
+
+Шрам 2026-07: live Codex projection уже считал `reasoning` и tool output transient, но REST `getMessages` возвращал их как обычные сообщения. После reload/iOS snapshot History видел строки, которых live-путь не показывал. Правило: REST snapshot обязан применять ту же display-классификацию, что live SSE; reasoning/tool-output можно логировать как процесс выполнения, но нельзя превращать в пользовательскую историю.
 
 Команда и аргумент рендерятся раздельно (`/model haiku`, `/effort low`), а не склеиваются в camel-case (`/modelHaiku`). Источник ввода тоже не часть display-семантики: если manual slash и auto/default slash дают одну и ту же durable-запись, History показывает их одинаково. Route (`manual`, startup defaults, iOS, History) можно логировать как source для диагностики, но нельзя делать по нему другой UI.
 
