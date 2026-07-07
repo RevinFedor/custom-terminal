@@ -194,6 +194,24 @@ export async function stopActiveDictation(): Promise<void> {
   }, 4000);
 }
 
+export async function cancelActiveDictation(): Promise<void> {
+  if (!snapshot.recording && !snapshot.stopping) return;
+  const session = sessionRef;
+  const owner = snapshot.owner;
+  if (session) {
+    finalizedSessionRef = session;
+    sessionRef = null;
+  }
+
+  ipcRenderer.send('log:renderer', '[DictationManager] cancel tab=' + (owner?.tabId || 'unknown'));
+  flushSubmitRequests({ success: true, delivered: false, hadText: false });
+  publishOwnerIdle(owner);
+  emitState(IDLE_SNAPSHOT);
+  if (session) {
+    await session.cancel();
+  }
+}
+
 function respondNoActiveRequest(tabId: string, requestId: string) {
   window.dispatchEvent(new CustomEvent(DICTATION_DELIVERED_EVENT, {
     detail: { tabId, requestId, success: true, delivered: false, hadText: false },

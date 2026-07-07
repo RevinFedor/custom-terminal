@@ -676,6 +676,7 @@ export default function ClaudeControlBar({
   const [isLocalBusy, setIsLocalBusy] = useState(false);
   const isBusy = isPasteBusy || isLocalBusy;
   const busySnapshotRef = useRef({ paste: false, local: false });
+  const localBusyReasonRef = useRef<string | null>(null);
   const controlActionInFlightRef = useRef<string | null>(null);
   const ptyTransitionEngine = useMemo<PtyTransitionEngine | null>(() => {
     if (isSDKTab) return null;
@@ -714,6 +715,7 @@ export default function ClaudeControlBar({
   }, [ptyTransitionEngine, setSessionActionBlockedStatusIfChanged, tabId]);
   const setLocalBusy = (busy: boolean, reason: string) => {
     console.log('[ControlBarLoader] local-set tab=' + tabId.slice(-12) + ' type=' + sessionType + ' reason=' + reason + ' busy=' + busy + ' paste=' + isPasteBusy + ' local=' + isLocalBusy + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
+    localBusyReasonRef.current = busy ? reason : null;
     setIsLocalBusy(busy);
   };
   const beginControlAction = (reason: string) => {
@@ -817,16 +819,19 @@ export default function ClaudeControlBar({
   //     after the user reloads the tab or kills the Claude process.
   // Fix: on every tabId change, hard-reset both flags so a freshly-bound tab
   // starts clean; the live listener then reflects only THIS tab's paste state.
-  // Also clear on the two process-lifecycle edges (fresh spawn / process death)
-  // — when Claude starts or is killed there is no live TUI mid-paste, so any
-  // lingering indicator is stale by definition. This is what makes "я убил
-  // процесс клода, а лоудер не сбросился" recover. See
+  // Also clear on the process/readiness lifecycle edges (fresh spawn, TUI ready,
+  // process death) — once the agent input is ready, a Start/Continue action is
+  // complete even though the long-lived agent process keeps running. Waiting only
+  // for command-finished left Codex Start/Continue stuck on the right-cluster
+  // shimmer until manual reset. This is what makes "я убил процесс клода, а
+  // лоудер не сбросился" recover. See
   // fact-claude-control-bar.md::Busy-state tab binding.
   useEffect(() => {
     // Reset synchronously on bind to a new tab — never inherit the previous
     // tab's busy state.
     console.log('[ControlBarLoader] bind-reset tab=' + tabId.slice(-12) + ' type=' + sessionType + ' paste=' + isPasteBusy + ' local=' + isLocalBusy + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
     busySnapshotRef.current = { paste: false, local: false };
+    localBusyReasonRef.current = null;
     controlActionInFlightRef.current = null;
     setIsPasteBusy(false);
     setIsLocalBusy(false);
@@ -836,11 +841,24 @@ export default function ClaudeControlBar({
       console.log('[ControlBarLoader] paste-event active=' + tabId.slice(-12) + ' event=' + String(data.tabId || '').slice(-12) + ' match=' + match + ' busy=' + data.busy + ' beforePaste=' + before.paste + ' beforeLocal=' + before.local);
       if (match) setIsPasteBusy(data.busy);
     };
-    const clearOnLifecycle = (reason: string) => (_: any, data: { tabId: string }) => {
+    const isSessionLifecycleLocalBusy = () => {
+      const reason = localBusyReasonRef.current || controlActionInFlightRef.current || '';
+      return reason.startsWith('session-start:') || reason.startsWith('session-continue:');
+    };
+    const clearOnLifecycle = (
+      reason: string,
+      options: { onlySessionLifecycle?: boolean } = {},
+    ) => (_: any, data: { tabId: string }) => {
       const match = data.tabId === tabId;
       const before = busySnapshotRef.current;
-      console.log('[ControlBarLoader] lifecycle-clear active=' + tabId.slice(-12) + ' event=' + String(data.tabId || '').slice(-12) + ' match=' + match + ' reason=' + reason + ' beforePaste=' + before.paste + ' beforeLocal=' + before.local);
+      const localReason = localBusyReasonRef.current || 'none';
+      console.log('[ControlBarLoader] lifecycle-clear active=' + tabId.slice(-12) + ' event=' + String(data.tabId || '').slice(-12) + ' match=' + match + ' reason=' + reason + ' beforePaste=' + before.paste + ' beforeLocal=' + before.local + ' localReason=' + localReason);
       if (match) {
+        if (options.onlySessionLifecycle && !isSessionLifecycleLocalBusy()) {
+          console.log('[ControlBarLoader] lifecycle-clear skipped active=' + tabId.slice(-12) + ' reason=' + reason + ' localReason=' + localReason + ' gate=session-lifecycle-only');
+          return;
+        }
+        localBusyReasonRef.current = null;
         controlActionInFlightRef.current = null;
         setIsPasteBusy(false);
         setIsLocalBusy(false);
@@ -848,12 +866,18 @@ export default function ClaudeControlBar({
     };
     ipcRenderer.on('claude:paste-busy', handler);
     const clearOnStarted = clearOnLifecycle('process-started');
+    const clearOnClaudeReady = clearOnLifecycle('claude-tui-ready', { onlySessionLifecycle: true });
+    const clearOnCodexReady = clearOnLifecycle('codex-tui-ready', { onlySessionLifecycle: true });
     const clearOnFinished = clearOnLifecycle('command-finished');
     ipcRenderer.on('claude:process-started', clearOnStarted);
+    ipcRenderer.on('claude:tui-ready', clearOnClaudeReady);
+    ipcRenderer.on('codex:tui-ready', clearOnCodexReady);
     ipcRenderer.on('terminal:command-finished', clearOnFinished);
     return () => {
       ipcRenderer.removeListener('claude:paste-busy', handler);
       ipcRenderer.removeListener('claude:process-started', clearOnStarted);
+      ipcRenderer.removeListener('claude:tui-ready', clearOnClaudeReady);
+      ipcRenderer.removeListener('codex:tui-ready', clearOnCodexReady);
       ipcRenderer.removeListener('terminal:command-finished', clearOnFinished);
     };
   }, [tabId]);

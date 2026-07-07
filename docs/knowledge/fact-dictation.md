@@ -73,7 +73,7 @@ Soniox реально шлёт synthetic-токены `<end>` (endpoint detectio
 
 Фиксированная высота 110px (~6 строк @ 13px/1.42 line-height) — **не растёт с контентом**. Переполнение → внутренний скролл. Юзер: *«начальная высота должна оставаться, по мере того как печатается должен скролл, не высота»*.
 
-Header — высота 22px, padding=0 по вертикали (только padding'и кнопок), горизонтальный padding 8px. STOP-кнопка справа с маленьким спиннером во время `stopping`.
+Header — высота 22px, padding=0 по вертикали (только padding'и кнопок), горизонтальный padding 8px. Справа две кнопки с зазором 1px: `X` отменяет диктовку полностью (закрывает stream/window, не пишет историю и не доставляет текст), `STOP` финализирует и доставляет текст в owner-tab; во время `stopping` у STOP маленький спиннер.
 
 Final tokens — белый `#e0e0e0`, partial — серый italic `#aaa`. Auto-scroll к bottom на каждом update.
 
@@ -95,6 +95,8 @@ Final tokens — белый `#e0e0e0`, partial — серый italic `#aaa`. Aut
 - Если `ws.readyState === OPEN` — шлёт пустой ArrayBuffer (Soniox flush'ит финалы и закрывает) + safety 3-секундный таймер на случай зависшего WebSocket.
 - Если `ws` в CONNECTING / null — отсоединяет handlers ПЕРЕД `close()` (иначе async `onerror`/`onclose` triggered `close()`-ом на half-opened сокете показал бы юзеру toast «socket error» после его же STOP-клика).
 - `MicButton.stop()` дополнительно ставит 4-секундный fallback на случай если `onStopped` не пришёл вовсе.
+
+`cancel()` — отдельный от STOP путь: UI сразу публикует owner idle и сбрасывает snapshot, pending Enter получает `delivered=false`, а `DictationSession.cancel()` закрывает WebSocket/mic с отсоединёнными handlers и suppress'ит `onStopped`. Это нужно, чтобы крестик в floating-окне был именно «полная отмена», а не короткая форма STOP.
 
 ## Production env: `~/.noted-terminal/.env`
 

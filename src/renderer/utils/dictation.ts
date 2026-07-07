@@ -142,6 +142,7 @@ export class DictationSession {
   private partialText = '';
   private opts: DictationOptions;
   private stopped = false;
+  private cancelled = false;
   private stoppedFired = false;
   private forceStopTimer: any = null;
   private acRate = 48000;
@@ -154,6 +155,7 @@ export class DictationSession {
     if (this.stoppedFired) return;
     this.stoppedFired = true;
     if (this.forceStopTimer) { clearTimeout(this.forceStopTimer); this.forceStopTimer = null; }
+    if (this.cancelled) return;
     try { this.opts.onStopped?.(); } catch {}
   }
 
@@ -169,6 +171,12 @@ export class DictationSession {
         audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
       });
       dlog('mic ok tracks=' + this.stream.getTracks().length);
+      if (this.stopped) {
+        dlog('start() aborted after mic');
+        await this.cleanup();
+        this.fireStopped();
+        return;
+      }
     } catch (e: any) {
       dlog('mic error: ' + (e?.name || '') + ' ' + (e?.message || String(e)));
       this.opts.onError('mic: ' + (e?.message || String(e)));
@@ -239,6 +247,12 @@ export class DictationSession {
         };
       }
       dlog('audio ok rate=' + this.acRate + ' capture=' + (usingWorklet ? 'worklet' : 'spn'));
+      if (this.stopped) {
+        dlog('start() aborted after audio');
+        await this.cleanup();
+        this.fireStopped();
+        return;
+      }
     } catch (e: any) {
       dlog('audio error: ' + (e?.name || '') + ' ' + (e?.message || String(e)));
       this.opts.onError('audio: ' + (e?.message || String(e)));
@@ -365,6 +379,19 @@ export class DictationSession {
       await this.cleanup();
       this.fireStopped();
     }
+  }
+
+  async cancel(): Promise<void> {
+    if (this.cancelled) return;
+    this.cancelled = true;
+    this.stopped = true;
+    dlog('cancel() called, ws.readyState=' + (this.ws?.readyState ?? 'null'));
+    if (this.forceStopTimer) { clearTimeout(this.forceStopTimer); this.forceStopTimer = null; }
+    if (this.ws) {
+      try { this.ws.onopen = null; this.ws.onmessage = null; this.ws.onerror = null; this.ws.onclose = null; } catch {}
+      try { this.ws.close(); } catch {}
+    }
+    await this.cleanup();
   }
 
   /** Full transcript captured so far (final + partial tail). */

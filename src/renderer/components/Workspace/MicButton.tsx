@@ -22,9 +22,11 @@
 
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { X } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import {
+  cancelActiveDictation,
   type DictationMode,
   startDictation,
   stopActiveDictation,
@@ -105,6 +107,11 @@ export default function MicButton({ tabId }: Props) {
   const stop = async () => {
     if (stopping || !isOwner) return;
     await stopActiveDictation();
+  };
+
+  const cancel = async () => {
+    if (!isOwner) return;
+    await cancelActiveDictation();
   };
 
   const onClick = (e: React.MouseEvent) => {
@@ -188,6 +195,7 @@ export default function MicButton({ tabId }: Props) {
           final={dictation.final}
           partial={dictation.partial}
           stopping={stopping}
+          onCancel={cancel}
           onStop={stop}
         />
       )}
@@ -233,11 +241,12 @@ function MicIcon({ recording }: { recording: boolean }) {
 // portal so overflow:hidden on the control bar doesn't clip it; position is
 // recomputed every animation frame while recording so it follows the button
 // if the window is resized.
-function FloatingTranscript({ anchorRef, final, partial, stopping, onStop }: {
+function FloatingTranscript({ anchorRef, final, partial, stopping, onCancel, onStop }: {
   anchorRef: React.RefObject<HTMLButtonElement>;
   final: string;
   partial: string;
   stopping: boolean;
+  onCancel: () => void;
   onStop: () => void;
 }) {
   // Position state — read once on mount, re-read on every rAF tick so it
@@ -326,33 +335,56 @@ function FloatingTranscript({ anchorRef, final, partial, stopping, onStop }: {
           }} />
           {stopping ? 'STOPPING…' : 'DICTATING'}
         </span>
-        <button
-          onClick={onStop}
-          disabled={stopping}
-          style={{
-            background: 'transparent',
-            border: '1px solid rgba(255,255,255,0.22)',
-            borderRadius: 4,
-            color: stopping ? '#666' : '#ddd',
-            fontSize: 10,
-            padding: '2px 10px',
-            cursor: stopping ? 'default' : 'pointer',
-            letterSpacing: 0.3,
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 5,
-          }}
-          title={stopping ? 'Finalizing…' : 'Stop & deliver to input'}
-        >
-          {stopping && (
-            <svg width="9" height="9" viewBox="0 0 24 24" fill="none"
-                 stroke="currentColor" strokeWidth={2.6} strokeLinecap="round"
-                 style={{ animation: 'mic-spin 0.7s linear infinite' }}>
-              <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-            </svg>
-          )}
-          STOP
-        </button>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 1 }}>
+          <button
+            onClick={onCancel}
+            style={{
+              background: 'transparent',
+              border: '1px solid rgba(255,255,255,0.22)',
+              borderRadius: 4,
+              color: '#ddd',
+              width: 24,
+              height: 20,
+              padding: 0,
+              cursor: 'pointer',
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+            title="Cancel dictation"
+            aria-label="Cancel dictation"
+          >
+            <X size={13} strokeWidth={2.4} />
+          </button>
+          <button
+            onClick={onStop}
+            disabled={stopping}
+            style={{
+              background: 'transparent',
+              border: '1px solid rgba(255,255,255,0.22)',
+              borderRadius: 4,
+              color: stopping ? '#666' : '#ddd',
+              fontSize: 10,
+              height: 20,
+              padding: '0 10px',
+              cursor: stopping ? 'default' : 'pointer',
+              letterSpacing: 0.3,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 5,
+            }}
+            title={stopping ? 'Finalizing…' : 'Stop & deliver to input'}
+          >
+            {stopping && (
+              <svg width="9" height="9" viewBox="0 0 24 24" fill="none"
+                   stroke="currentColor" strokeWidth={2.6} strokeLinecap="round"
+                   style={{ animation: 'mic-spin 0.7s linear infinite' }}>
+                <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+              </svg>
+            )}
+            STOP
+          </button>
+        </span>
       </div>
       <div
         ref={scrollRef}
