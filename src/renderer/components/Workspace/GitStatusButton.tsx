@@ -166,6 +166,7 @@ type Props = {
 };
 
 type GitRunAfterAction = 'generate' | 'generate-commit';
+type GitToolbarAction = GitRunAfterAction | 'commit' | 'push' | 'fetch' | 'undo' | 'checkout';
 type GitRunAfterStatusPhase = 'idle' | 'waiting' | 'running' | 'success';
 
 function loadDocsOnlySetting() {
@@ -280,6 +281,15 @@ function gitRunAfterActionLabel(action: GitRunAfterAction) {
   return action === 'generate-commit' ? 'Generate and commit' : 'Generate';
 }
 
+function gitToolbarActionLabel(action: GitToolbarAction) {
+  if (action === 'commit') return 'Commit';
+  if (action === 'push') return 'Push';
+  if (action === 'fetch') return 'Fetch';
+  if (action === 'undo') return 'Undo commit';
+  if (action === 'checkout') return 'Checkout';
+  return gitRunAfterActionLabel(action);
+}
+
 function mergeHistoryCommits(current: GitCommit[], incoming: GitCommit[]) {
   const seen = new Set(current.map((commit) => commit.hash));
   const merged = [...current];
@@ -370,6 +380,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [runAfterFlashAction, setRunAfterFlashAction] = useState<GitRunAfterAction | null>(null);
   const [runAfterRunningAction, setRunAfterRunningAction] = useState<GitRunAfterAction | null>(null);
   const [runAfterSuccessAction, setRunAfterSuccessAction] = useState<GitRunAfterAction | null>(null);
+  const [gitToolbarRunningAction, setGitToolbarRunningAction] = useState<GitToolbarAction | null>(null);
+  const [gitToolbarSuccessAction, setGitToolbarSuccessAction] = useState<GitToolbarAction | null>(null);
   const [remoteBusy, setRemoteBusy] = useState<'push' | 'fetch' | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
@@ -414,6 +426,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const runAfterFireRef = useRef(false);
   const runAfterFlashTimerRef = useRef<number | null>(null);
   const runAfterSuccessTimerRef = useRef<number | null>(null);
+  const gitToolbarSuccessTimerRef = useRef<number | null>(null);
 
   const selectedCount = selectedPaths.size;
   const allSelected = status?.files.length ? selectedCount === status.files.length : false;
@@ -1258,7 +1271,6 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         if (result?.staleSelection) await loadStatus(true);
         throw new Error(result?.error || 'git commit failed');
       }
-      showToast(result.hash ? 'Committed ' + result.hash : 'Committed', 'success');
       setSummary('');
       setDescription('');
       await loadStatus(true);
@@ -1272,19 +1284,49 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     }
   }, [effectiveRepoPath, loadHistory, loadStatus, panelTab, selectedList, showToast]);
 
-  const handleGenerate = useCallback(async () => {
-    return Boolean(await generateCommitMessage(true));
+  const flashGitToolbarSuccess = useCallback((action: GitToolbarAction) => {
+    if (gitToolbarSuccessTimerRef.current) window.clearTimeout(gitToolbarSuccessTimerRef.current);
+    setGitToolbarSuccessAction(action);
+    gitToolbarSuccessTimerRef.current = window.setTimeout(() => {
+      setGitToolbarSuccessAction(null);
+      gitToolbarSuccessTimerRef.current = null;
+    }, 1200);
+  }, []);
+
+  const runGitToolbarAction = useCallback(async (action: GitToolbarAction, task: () => Promise<boolean>) => {
+    setGitToolbarSuccessAction(null);
+    setGitToolbarRunningAction(action);
+    let succeeded = false;
+    try {
+      succeeded = await task();
+      return succeeded;
+    } finally {
+      setGitToolbarRunningAction(null);
+      if (succeeded) flashGitToolbarSuccess(action);
+    }
+  }, [flashGitToolbarSuccess]);
+
+  const runGenerate = useCallback(async () => {
+    return Boolean(await generateCommitMessage(false));
   }, [generateCommitMessage]);
 
-  const handleCommit = useCallback(async () => {
-    await commitChanges(summary, description);
-  }, [commitChanges, description, summary]);
+  const handleGenerate = useCallback(async () => {
+    return runGitToolbarAction('generate', async () => Boolean(await generateCommitMessage(false)));
+  }, [generateCommitMessage, runGitToolbarAction]);
 
-  const handleGenerateAndCommit = useCallback(async () => {
+  const handleCommit = useCallback(async () => {
+    return runGitToolbarAction('commit', () => commitChanges(summary, description));
+  }, [commitChanges, description, runGitToolbarAction, summary]);
+
+  const runGenerateAndCommit = useCallback(async () => {
     const message = await generateCommitMessage(false);
     if (!message?.summary) return false;
     return commitChanges(message.summary, message.description);
   }, [commitChanges, generateCommitMessage]);
+
+  const handleGenerateAndCommit = useCallback(async () => {
+    return runGitToolbarAction('generate-commit', runGenerateAndCommit);
+  }, [runGenerateAndCommit, runGitToolbarAction]);
 
   const flashRunAfterSuccess = useCallback((action: GitRunAfterAction) => {
     if (runAfterSuccessTimerRef.current) window.clearTimeout(runAfterSuccessTimerRef.current);
@@ -1329,6 +1371,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   useEffect(() => () => {
     if (runAfterFlashTimerRef.current) window.clearTimeout(runAfterFlashTimerRef.current);
     if (runAfterSuccessTimerRef.current) window.clearTimeout(runAfterSuccessTimerRef.current);
+    if (gitToolbarSuccessTimerRef.current) window.clearTimeout(gitToolbarSuccessTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -1353,13 +1396,12 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       runAfterFireRef.current = true;
       setRunAfterTargetTabId(null);
       setRunAfterAction(null);
-      showToast(`${gitRunAfterActionLabel(action)} started`, 'success', 1400);
       setRunAfterRunningAction(action);
       let succeeded = false;
       try {
         succeeded = action === 'generate-commit'
-          ? await handleGenerateAndCommit()
-          : await handleGenerate();
+          ? await runGenerateAndCommit()
+          : await runGenerate();
       } finally {
         setRunAfterRunningAction(null);
         runAfterFireRef.current = false;
@@ -1385,7 +1427,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
       ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
     };
-  }, [flashRunAfterSuccess, handleGenerate, handleGenerateAndCommit, runAfterAction, runAfterTargetTabId, showToast]);
+  }, [flashRunAfterSuccess, runAfterAction, runAfterTargetTabId, runGenerate, runGenerateAndCommit]);
 
   const handleUndoCommit = async (commit: GitCommit) => {
     if (!effectiveRepoPath || !commit?.hash) return;
@@ -1395,46 +1437,52 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     }
     setUndoingCommitHash(commit.hash);
     setHistoryContextMenu(null);
-    try {
-      const result = await ipcRenderer.invoke('git:undo-last-commit', {
-        projectPath: effectiveRepoPath,
-        hash: commit.hash,
-      });
-      if (!result?.success) throw new Error(result?.error || 'git undo failed');
-      showToast('Commit undone', 'success');
-      setActiveCommitHash('');
-      setActiveCommitFilePath('');
-      setCommitDetails(null);
-      await loadStatus(true);
-      await loadHistory();
-    } catch (error: any) {
-      showToast('Undo commit: ' + trimError(error?.message || error), 'error', 5000);
-    } finally {
-      setUndoingCommitHash('');
-    }
+    await runGitToolbarAction('undo', async () => {
+      try {
+        const result = await ipcRenderer.invoke('git:undo-last-commit', {
+          projectPath: effectiveRepoPath,
+          hash: commit.hash,
+        });
+        if (!result?.success) throw new Error(result?.error || 'git undo failed');
+        setActiveCommitHash('');
+        setActiveCommitFilePath('');
+        setCommitDetails(null);
+        await loadStatus(true);
+        await loadHistory();
+        return true;
+      } catch (error: any) {
+        showToast('Undo commit: ' + trimError(error?.message || error), 'error', 5000);
+        return false;
+      } finally {
+        setUndoingCommitHash('');
+      }
+    });
   };
 
   const handleRemote = async (type: 'push' | 'fetch') => {
     if (!effectiveRepoPath) return;
-    setRemoteBusy(type);
-    setPushMenuOpen(false);
-    setRemoteSettingsOpen(false);
-    try {
-      const result = await ipcRenderer.invoke(type === 'push' ? 'git:push' : 'git:fetch', { projectPath: effectiveRepoPath });
-      if (!result?.success) {
-        const error = result?.error || (type === 'push' ? 'git push failed' : 'git fetch failed');
-        if (result?.authError) showRemoteAuthToast(error);
-        else showToast((type === 'push' ? 'Push: ' : 'Fetch: ') + trimError(error), 'error', 5000, false, String(error));
-        return;
+    await runGitToolbarAction(type, async () => {
+      setRemoteBusy(type);
+      setPushMenuOpen(false);
+      setRemoteSettingsOpen(false);
+      try {
+        const result = await ipcRenderer.invoke(type === 'push' ? 'git:push' : 'git:fetch', { projectPath: effectiveRepoPath });
+        if (!result?.success) {
+          const error = result?.error || (type === 'push' ? 'git push failed' : 'git fetch failed');
+          if (result?.authError) showRemoteAuthToast(error);
+          else showToast((type === 'push' ? 'Push: ' : 'Fetch: ') + trimError(error), 'error', 5000, false, String(error));
+          return false;
+        }
+        await loadStatus(true);
+        if (panelTab === 'history') await loadHistory();
+        return true;
+      } catch (error: any) {
+        showToast((type === 'push' ? 'Push: ' : 'Fetch: ') + trimError(error?.message || error), 'error');
+        return false;
+      } finally {
+        setRemoteBusy(null);
       }
-      showToast(type === 'push' ? 'Pushed' : 'Fetched origin', 'success');
-      await loadStatus(true);
-      if (panelTab === 'history') await loadHistory();
-    } catch (error: any) {
-      showToast((type === 'push' ? 'Push: ' : 'Fetch: ') + trimError(error?.message || error), 'error');
-    } finally {
-      setRemoteBusy(null);
-    }
+    });
   };
 
   const handleBranchCheckout = async (branch: string) => {
@@ -1443,18 +1491,21 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       return;
     }
     setBranchSwitching(branch);
-    try {
-      const result = await ipcRenderer.invoke('git:checkout', { projectPath: effectiveRepoPath, branch });
-      if (!result?.success) throw new Error(result?.error || 'git checkout failed');
-      showToast('Branch: ' + branch, 'success');
-      setBranchesOpen(false);
-      await loadStatus(true);
-      if (panelTab === 'history') await loadHistory();
-    } catch (error: any) {
-      showToast('Checkout: ' + trimError(error?.message || error), 'error', 5000);
-    } finally {
-      setBranchSwitching('');
-    }
+    await runGitToolbarAction('checkout', async () => {
+      try {
+        const result = await ipcRenderer.invoke('git:checkout', { projectPath: effectiveRepoPath, branch });
+        if (!result?.success) throw new Error(result?.error || 'git checkout failed');
+        setBranchesOpen(false);
+        await loadStatus(true);
+        if (panelTab === 'history') await loadHistory();
+        return true;
+      } catch (error: any) {
+        showToast('Checkout: ' + trimError(error?.message || error), 'error', 5000);
+        return false;
+      } finally {
+        setBranchSwitching('');
+      }
+    });
   };
 
   if (!status?.isRepo) {
@@ -1540,12 +1591,30 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       : runAfterSuccessAction
         ? 'success'
         : 'idle';
-  const gitRunAfterPreviewTitle = gitRunAfterStatusPhase === 'waiting'
+  const gitNavbarStatusPhase: GitRunAfterStatusPhase = gitToolbarRunningAction || runAfterRunningAction
+    ? 'running'
+    : runAfterTargetTabId
+      ? 'waiting'
+      : gitToolbarSuccessAction || runAfterSuccessAction
+        ? 'success'
+        : 'idle';
+  const gitNavbarStatusLabel = gitToolbarRunningAction
+    ? gitToolbarActionLabel(gitToolbarRunningAction)
+    : runAfterRunningAction
+      ? gitRunAfterActionLabel(runAfterRunningAction)
+      : runAfterTargetTabId && runAfterAction
+        ? gitRunAfterActionLabel(runAfterAction)
+        : gitToolbarSuccessAction
+          ? gitToolbarActionLabel(gitToolbarSuccessAction)
+          : runAfterSuccessAction
+            ? gitRunAfterActionLabel(runAfterSuccessAction)
+            : '';
+  const gitNavbarPreviewTitle = gitNavbarStatusPhase === 'waiting'
     ? `${gitRunAfterLabel} waits for ${runAfterTargetLabel || runAfterTargetTabId?.slice(-8) || 'selected tab'}`
-    : gitRunAfterStatusPhase === 'running'
-      ? `${gitRunAfterLabel} is running`
-      : gitRunAfterStatusPhase === 'success'
-        ? `${gitRunAfterLabel} completed`
+    : gitNavbarStatusPhase === 'running'
+      ? `${gitNavbarStatusLabel} is running`
+      : gitNavbarStatusPhase === 'success'
+        ? `${gitNavbarStatusLabel} completed`
         : '';
 
   return (
@@ -1553,7 +1622,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       <button
         ref={triggerRef}
         onClick={() => setOpen((value) => !value)}
-        title={`${status.repoName}: ${status.branch} · ${status.changedCount} changed${remoteHint}${gitRunAfterPreviewTitle ? ' · ' + gitRunAfterPreviewTitle : ''}`}
+        title={`${status.repoName}: ${status.branch} · ${status.changedCount} changed${remoteHint}${gitNavbarPreviewTitle ? ' · ' + gitNavbarPreviewTitle : ''}`}
         className="inline-flex items-center gap-1 rounded cursor-pointer hover:opacity-90 transition-colors"
         style={{
           height: '100%',
@@ -1570,10 +1639,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         <span style={{ maxWidth: 72, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 700 }}>
           {status.branch}
         </span>
-        <span style={gitToolbarRunAfterStatusStyle(gitRunAfterStatusPhase)}>
-          {gitRunAfterStatusPhase === 'success' ? (
+        <span style={gitToolbarRunAfterStatusStyle(gitNavbarStatusPhase)}>
+          {gitNavbarStatusPhase === 'success' ? (
             <Check size={11} strokeWidth={2.5} />
-          ) : gitRunAfterStatusPhase === 'waiting' || gitRunAfterStatusPhase === 'running' ? (
+          ) : gitNavbarStatusPhase === 'waiting' || gitNavbarStatusPhase === 'running' ? (
             <Loader2 size={11} className="animate-spin" />
           ) : null}
         </span>

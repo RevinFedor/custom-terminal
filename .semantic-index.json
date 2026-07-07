@@ -1292,47 +1292,42 @@
   },
   {
     "path": "docs/knowledge/fact-git-коммиты.md",
-    "hash": "cd17064671ec9f29084fe53253f16cdad3a27d088030351ef7f3b801966a8d9a",
+    "hash": "4b779e5a8c9384bfc7c348bad1f1217934310e31913ee5a3411e1d3001e9c535",
     "type": "fact",
     "explicit": [
-      "git commits",
-      "project-level Git control",
-      "toolbar status chip",
-      "repository selector",
-      "Changes tab",
-      "History tab",
-      "commit message generation",
+      "Git commits in the project workspace",
+      "project-level Git toolbar",
+      "Git repository selector",
+      "commit workflow",
+      "history tab",
       "remote auth recovery",
-      "GitHub Desktop recovery",
-      "favorite repositories",
-      "nested .git repositories",
-      "stale-while-revalidate refresh",
-      "paged git log history",
-      "unpushed commit markers"
+      "AI commit message generation",
+      "collapsed Git status",
+      "diff preview",
+      "branch and changed file count"
     ],
     "implicit": [
-      "workspace project toolbar",
+      "project toolbar",
+      "workspace-level Git integration",
       "git status watcher",
-      "file watch debounce",
+      ".git metadata",
+      "stale-while-revalidate cache",
       "porcelain signature",
-      "diff preview cache key",
-      "repo-scoped state",
+      "git log --skip pagination",
       "upstream comparison",
-      "origin branch fallback",
-      "soft reset undo commit",
-      "split button generate commit",
-      "AI prompt usage log",
+      "branch dropdown",
+      "split-button push/publish",
+      "commit message prompt",
       "docs-only AI context toggle",
-      "stable id git-commit",
-      "workspace-scoped favorites",
-      "commit workflow panel"
+      "shared AI prompt usage log",
+      "soft reset undo commit",
+      "self-hosted GitLab",
+      "GitHub Desktop recovery"
     ],
     "symptoms": [
-      "When the Git button should appear only for real repositories and show branch plus changed-file count in the project toolbar. When the collapsed Git chip must update without opening the panel after files change. When opening Git should reuse cached status first and refresh in the background instead of flashing a loader. When a diff preview or history list keeps resetting after a background refresh or tab switch. When a developer needs to understand how selection, commit, push, and undo commit behave in the Git panel. When push or fetch fails and the UI should route the user to recovery actions instead of embedding a login flow."
+      "When the Git button is missing outside a repository or the toolbar appears in projects without a `.git` folder, this file explains the intended visibility rules. When the compact Git chip does not show changed-file counts until the panel is opened, this file describes the background watcher contract. When opening Git causes a loader flash even though cached data already exists, this file explains the stale-while-revalidate behavior. When the right-side diff preview remounts or flickers after a background refresh, this file covers the preview cache key and signature rules. When switching between Changes and History clears the visible list or shows empty-state placeholders too early, this file explains the repo-scoped cache behavior. When commit selection behaves inconsistently after manual selection versus automatic selection, this file defines how selection mode should work. When push or fetch fails because of auth, but local commits should still work, this file describes the recovery flow and the separation between local Git and remote access."
     ],
-    "related_components": [
-      "docs/methodology/переносимый-дизайн.md"
-    ]
+    "related_components": []
   },
   {
     "path": "docs/knowledge/fact-global-dictation.md",
