@@ -1292,48 +1292,46 @@
   },
   {
     "path": "docs/knowledge/fact-git-коммиты.md",
-    "hash": "127013d629b22e9e10e3f4cf12c02325b441261457d5ae99d267f1b25f099011",
+    "hash": "cd17064671ec9f29084fe53253f16cdad3a27d088030351ef7f3b801966a8d9a",
     "type": "fact",
     "explicit": [
-      "Git commits",
-      "project-level Git integration",
-      "toolbar contract",
+      "git commits",
+      "project-level Git control",
+      "toolbar status chip",
       "repository selector",
-      "commit workflow",
-      "history view",
-      "changes view",
-      "AI commit message",
-      "remote auth recovery"
+      "Changes tab",
+      "History tab",
+      "commit message generation",
+      "remote auth recovery",
+      "GitHub Desktop recovery",
+      "favorite repositories",
+      "nested .git repositories",
+      "stale-while-revalidate refresh",
+      "paged git log history",
+      "unpushed commit markers"
     ],
     "implicit": [
-      "project toolbar",
+      "workspace project toolbar",
       "git status watcher",
-      "git porcelain signature",
-      "stale-while-revalidate",
+      "file watch debounce",
+      "porcelain signature",
       "diff preview cache key",
       "repo-scoped state",
-      "branch dropdown",
-      "split button",
-      "upstream..HEAD",
-      "origin/<branch>",
-      "git log %h",
-      "soft reset",
-      "GitHub Desktop",
-      "credential helper",
-      "SSH key",
-      "HTTPS Keychain"
+      "upstream comparison",
+      "origin branch fallback",
+      "soft reset undo commit",
+      "split button generate commit",
+      "AI prompt usage log",
+      "docs-only AI context toggle",
+      "stable id git-commit",
+      "workspace-scoped favorites",
+      "commit workflow panel"
     ],
     "symptoms": [
-      "When the Git button should appear only for projects that actually have a .git repository, this file explains the toolbar rules. When the collapsed Git chip shows stale file counts or updates only after opening the panel, this file describes the watcher and cache behavior to check. When the diff preview or history list flickers or resets after a background refresh, this file explains which keys must stay stable. When a developer needs to understand why selected files, commit generation, and local commit behavior are separated, this file gives the workflow contract. When push or fetch hits an auth problem, this file describes the intended recovery path instead of an in-app login flow. When a monorepo needs a nested repository selection or favorites behavior, this file explains the repository picker rules."
+      "When the Git button should appear only for real repositories and show branch plus changed-file count in the project toolbar. When the collapsed Git chip must update without opening the panel after files change. When opening Git should reuse cached status first and refresh in the background instead of flashing a loader. When a diff preview or history list keeps resetting after a background refresh or tab switch. When a developer needs to understand how selection, commit, push, and undo commit behave in the Git panel. When push or fetch fails and the UI should route the user to recovery actions instead of embedding a login flow."
     ],
     "related_components": [
-      "src/main/main.js",
-      "src/main/web-server.js",
-      "src/renderer/components/project-toolbar",
-      "src/renderer/components/git-panel",
-      "src/renderer/components/history-panel",
-      "src/renderer/components/changes-panel",
-      "src/renderer/components/repo-selector"
+      "docs/methodology/переносимый-дизайн.md"
     ]
   },
   {

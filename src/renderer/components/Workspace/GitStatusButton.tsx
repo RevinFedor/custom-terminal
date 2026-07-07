@@ -36,6 +36,8 @@ const MIN_PANEL_SIZE = { width: 760, height: 420 };
 const PANEL_MARGIN = 16;
 const MIN_LEFT_PANE_WIDTH = 320;
 const MIN_RIGHT_PANE_WIDTH = 380;
+const HISTORY_PAGE_SIZE = 60;
+const HISTORY_LOAD_MORE_THRESHOLD_PX = 180;
 
 type GitFile = {
   path: string;
@@ -278,6 +280,17 @@ function gitRunAfterActionLabel(action: GitRunAfterAction) {
   return action === 'generate-commit' ? 'Generate and commit' : 'Generate';
 }
 
+function mergeHistoryCommits(current: GitCommit[], incoming: GitCommit[]) {
+  const seen = new Set(current.map((commit) => commit.hash));
+  const merged = [...current];
+  for (const commit of incoming) {
+    if (!commit?.hash || seen.has(commit.hash)) continue;
+    seen.add(commit.hash);
+    merged.push(commit);
+  }
+  return merged;
+}
+
 function basenameFromPath(filePath: string) {
   const parts = filePath.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] || filePath;
@@ -359,6 +372,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [runAfterSuccessAction, setRunAfterSuccessAction] = useState<GitRunAfterAction | null>(null);
   const [remoteBusy, setRemoteBusy] = useState<'push' | 'fetch' | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
   const [historyItems, setHistoryItems] = useState<GitCommit[]>([]);
   const [historyRepoPath, setHistoryRepoPath] = useState('');
   const [historySearch, setHistorySearch] = useState('');
@@ -388,6 +403,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const saveDebounceRef = useRef<number | null>(null);
   const statusRequestRef = useRef(0);
   const historyRequestRef = useRef(0);
+  const historyListRef = useRef<HTMLDivElement>(null);
   const commitDetailsRequestRef = useRef(0);
   const branchesRequestRef = useRef(0);
   const statusRef = useRef<GitStatus | null>(null);
@@ -497,6 +513,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
           setHistoryItems([]);
           setHistoryRepoPath('');
           setHistoryLoading(false);
+          setHistoryLoadingMore(false);
+          setHistoryHasMore(false);
           setActiveCommitHash('');
           setActiveCommitFilePath('');
           setCommitDetails(null);
@@ -541,25 +559,41 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     }
   }, [effectiveRepoPath, projectPath, showToast]);
 
-  const loadHistory = useCallback(async () => {
+  const loadHistory = useCallback(async (append = false) => {
     const requestPath = effectiveRepoPath;
+    if (append && (historyLoading || historyLoadingMore || !historyHasMore || historyRepoPath !== requestPath)) return;
     const requestId = ++historyRequestRef.current;
     if (!requestPath) {
       setHistoryRepoPath('');
       setHistoryItems([]);
       setHistoryLoading(false);
+      setHistoryLoadingMore(false);
+      setHistoryHasMore(false);
       return;
     }
-    setHistoryLoading(true);
+    const skip = append ? historyItems.length : 0;
+    if (append) setHistoryLoadingMore(true);
+    else {
+      setHistoryLoading(true);
+      setHistoryLoadingMore(false);
+    }
     try {
-      const result = await ipcRenderer.invoke('git:history', { projectPath: requestPath, limit: 40 });
+      const result = await ipcRenderer.invoke('git:history', {
+        projectPath: requestPath,
+        limit: HISTORY_PAGE_SIZE,
+        skip,
+      });
       if (historyRequestRef.current !== requestId) return;
       if (!result?.success) throw new Error(result?.error || 'git history failed');
       const commits = Array.isArray(result.commits) ? result.commits : [];
+      const nextCommits = append
+        ? mergeHistoryCommits(historyItems, commits)
+        : commits;
       setHistoryRepoPath(requestPath);
-      setHistoryItems(commits);
-      setActiveCommitHash((prev) => commits.some((commit: GitCommit) => commit.hash === prev) ? prev : (commits[0]?.hash || ''));
-      if (!commits.length) {
+      setHistoryItems(nextCommits);
+      setHistoryHasMore(Boolean(result.hasMore));
+      setActiveCommitHash((prev) => nextCommits.some((commit: GitCommit) => commit.hash === prev) ? prev : (nextCommits[0]?.hash || ''));
+      if (!nextCommits.length) {
         commitDetailsRequestRef.current += 1;
         setActiveCommitFilePath('');
         setCommitDetails(null);
@@ -572,9 +606,24 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       setHistoryRepoPath(requestPath);
       showToast('Git history: ' + trimError(error?.message || error), 'error');
     } finally {
-      if (historyRequestRef.current === requestId) setHistoryLoading(false);
+      if (historyRequestRef.current === requestId) {
+        if (append) setHistoryLoadingMore(false);
+        else setHistoryLoading(false);
+      }
     }
-  }, [effectiveRepoPath, showToast]);
+  }, [effectiveRepoPath, historyHasMore, historyItems, historyLoading, historyLoadingMore, historyRepoPath, showToast]);
+
+  const maybeLoadMoreHistory = useCallback((element?: HTMLDivElement | null) => {
+    if (panelTab !== 'history' || !open || !historyReadyForRepo || historyLoading || historyLoadingMore || !historyHasMore) return;
+    const listEl = element || historyListRef.current;
+    if (!listEl) return;
+    const distanceToBottom = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight;
+    if (distanceToBottom <= HISTORY_LOAD_MORE_THRESHOLD_PX) void loadHistory(true);
+  }, [historyHasMore, historyLoading, historyLoadingMore, historyReadyForRepo, loadHistory, open, panelTab]);
+
+  const handleHistoryScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
+    maybeLoadMoreHistory(event.currentTarget);
+  }, [maybeLoadMoreHistory]);
 
   const loadCommitDetails = useCallback(async (commitHash: string, filePath?: string) => {
     const requestId = ++commitDetailsRequestRef.current;
@@ -691,6 +740,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     setHistoryItems([]);
     setHistoryRepoPath('');
     setHistoryLoading(false);
+    setHistoryLoadingMore(false);
+    setHistoryHasMore(false);
     setUndoingCommitHash('');
     setActiveFilePath('');
     setActiveCommitHash('');
@@ -812,7 +863,12 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
 
   useEffect(() => {
     if (panelTab === 'history' && open) loadHistory();
-  }, [panelTab, open, loadHistory]);
+  }, [effectiveRepoPath, panelTab, open]);
+
+  useEffect(() => {
+    if (historySearch.trim()) return;
+    maybeLoadMoreHistory();
+  }, [historySearch, maybeLoadMoreHistory, visibleHistoryItems.length]);
 
   useEffect(() => {
     if (!open || panelTab !== 'history' || !activeCommitHash) return;
@@ -1006,6 +1062,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     setHistoryItems([]);
     setHistoryRepoPath('');
     setHistoryLoading(false);
+    setHistoryLoadingMore(false);
+    setHistoryHasMore(false);
     setSelectedPaths(new Set());
     setFileDiff(null);
     setFileDiffKey('');
@@ -2059,43 +2117,53 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
                         style={searchInputStyle}
                       />
                     </div>
-                    <div style={historyListStyle}>
+                    <div ref={historyListRef} onScroll={handleHistoryScroll} style={historyListStyle}>
                       {!historyReadyForRepo || (historyLoading && !visibleHistoryItems.length) ? (
                         <div style={emptyStateStyle}><Loader2 size={15} className="animate-spin" /> Loading history</div>
-                      ) : visibleHistoryItems.length ? visibleHistoryItems.map((commit) => (
-                        <button
-                          key={commit.hash}
-                          onClick={() => {
-                            setActiveCommitHash(commit.hash);
-                            setActiveCommitFilePath('');
-                            setHistoryContextMenu(null);
-                          }}
-                          onContextMenu={(event) => {
-                            event.preventDefault();
-                            event.stopPropagation();
-                            setActiveCommitHash(commit.hash);
-                            setActiveCommitFilePath('');
-                            setHistoryContextMenu({ x: event.clientX, y: event.clientY, commit });
-                          }}
-                          style={historyRowStyle(commit.hash === activeCommitHash)}
-                        >
-                          <span style={{ minWidth: 0, flex: 1, textAlign: 'left' }}>
-                            <span style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, fontWeight: 800, color: '#f1f5f9' }}>{commit.subject}</span>
-                            <span style={{ display: 'block', color: '#8b949e', fontSize: 10.5, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {commit.hash} · {commit.date}
-                            </span>
-                          </span>
-                          {undoingCommitHash === commit.hash ? (
-                            <span style={historyPushBadgeStyle} title="Undoing commit">
+                      ) : visibleHistoryItems.length ? (
+                        <>
+                          {visibleHistoryItems.map((commit) => (
+                            <button
+                              key={commit.hash}
+                              onClick={() => {
+                                setActiveCommitHash(commit.hash);
+                                setActiveCommitFilePath('');
+                                setHistoryContextMenu(null);
+                              }}
+                              onContextMenu={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                setActiveCommitHash(commit.hash);
+                                setActiveCommitFilePath('');
+                                setHistoryContextMenu({ x: event.clientX, y: event.clientY, commit });
+                              }}
+                              style={historyRowStyle(commit.hash === activeCommitHash)}
+                            >
+                              <span style={{ minWidth: 0, flex: 1, textAlign: 'left' }}>
+                                <span style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, fontWeight: 800, color: '#f1f5f9' }}>{commit.subject}</span>
+                                <span style={{ display: 'block', color: '#8b949e', fontSize: 10.5, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {commit.hash} · {commit.date}
+                                </span>
+                              </span>
+                              {undoingCommitHash === commit.hash ? (
+                                <span style={historyPushBadgeStyle} title="Undoing commit">
+                                  <Loader2 size={13} className="animate-spin" />
+                                </span>
+                              ) : commit.unpushed ? (
+                                <span style={historyPushBadgeStyle} title="Not pushed">
+                                  <Upload size={13} />
+                                </span>
+                              ) : null}
+                            </button>
+                          ))}
+                          {historyLoadingMore && (
+                            <div style={historyLoadMoreStyle}>
                               <Loader2 size={13} className="animate-spin" />
-                            </span>
-                          ) : commit.unpushed ? (
-                            <span style={historyPushBadgeStyle} title="Not pushed">
-                              <Upload size={13} />
-                            </span>
-                          ) : null}
-                        </button>
-                      )) : (
+                              Loading more commits
+                            </div>
+                          )}
+                        </>
+                      ) : (
                         <div style={emptyStateStyle}>{historyItems.length ? 'No commits match search' : 'No commits yet'}</div>
                       )}
                     </div>
@@ -3310,6 +3378,17 @@ const historyListStyle: React.CSSProperties = {
   overflowY: 'auto',
   minHeight: 0,
   flex: 1,
+};
+
+const historyLoadMoreStyle: React.CSSProperties = {
+  height: 34,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: 7,
+  color: '#8b949e',
+  fontSize: 11,
+  borderTop: '1px solid rgba(255,255,255,0.06)',
 };
 
 const diffPaneStyle: React.CSSProperties = {

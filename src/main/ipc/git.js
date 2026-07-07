@@ -662,17 +662,30 @@ function register({ projectManager }) {
     }
   });
 
-  ipcMain.handle('git:history', async (event, { projectPath, limit = 30 }) => {
+  ipcMain.handle('git:history', async (event, { projectPath, limit = 30, skip = 0 }) => {
     try {
       const root = await getRepoRoot(projectPath);
-      if (!root) return { success: true, commits: [] };
+      if (!root) return { success: true, commits: [], hasMore: false, skip: 0, limit: 0 };
       const count = Math.max(1, Math.min(100, Number(limit) || 30));
-      const result = await runGit(root, ['log', '--date=relative', '--pretty=format:%h%x09%cr%x09%s', '-n', String(count)]);
-      if (!result.success) return { success: true, commits: [] };
+      const offset = Math.max(0, Number(skip) || 0);
+      const result = await runGit(root, [
+        'log',
+        '--date=relative',
+        '--pretty=format:%h%x09%cr%x09%s',
+        '--skip',
+        String(offset),
+        '-n',
+        String(count + 1),
+      ]);
+      if (!result.success) return { success: true, commits: [], hasMore: false, skip: offset, limit: count };
+      const pageLines = result.stdout.split(/\r?\n/).filter(Boolean);
+      const hasMore = pageLines.length > count;
+      const visibleLines = pageLines.slice(0, count);
       const upstream = await hasUpstream(root);
       const unpushedHashes = new Set();
+      let markAllVisibleUnpushed = false;
       if (upstream) {
-        const aheadResult = await runGit(root, ['log', '--pretty=format:%h', `${upstream}..HEAD`, '-n', String(count)]);
+        const aheadResult = await runGit(root, ['log', '--pretty=format:%h', `${upstream}..HEAD`]);
         if (aheadResult.success) {
           for (const line of aheadResult.stdout.split(/\r?\n/)) {
             const hash = line.trim();
@@ -684,7 +697,7 @@ function register({ projectManager }) {
         if (branch && branch !== 'HEAD') {
           const originBranch = await runGit(root, ['rev-parse', '--verify', '--quiet', `origin/${branch}`]);
           if (originBranch.success) {
-            const aheadResult = await runGit(root, ['log', '--pretty=format:%h', `origin/${branch}..HEAD`, '-n', String(count)]);
+            const aheadResult = await runGit(root, ['log', '--pretty=format:%h', `origin/${branch}..HEAD`]);
             if (aheadResult.success) {
               for (const line of aheadResult.stdout.split(/\r?\n/)) {
                 const hash = line.trim();
@@ -692,21 +705,15 @@ function register({ projectManager }) {
               }
             }
           } else {
-            const localResult = await runGit(root, ['log', '--pretty=format:%h', '-n', String(count)]);
-            if (localResult.success) {
-              for (const line of localResult.stdout.split(/\r?\n/)) {
-                const hash = line.trim();
-                if (hash) unpushedHashes.add(hash);
-              }
-            }
+            markAllVisibleUnpushed = true;
           }
         }
       }
-      const commits = result.stdout.split(/\r?\n/).filter(Boolean).map((line) => {
+      const commits = visibleLines.map((line) => {
         const [hash, date, ...subjectParts] = line.split('\t');
-        return { hash, date, subject: subjectParts.join('\t'), unpushed: unpushedHashes.has(hash) };
+        return { hash, date, subject: subjectParts.join('\t'), unpushed: markAllVisibleUnpushed || unpushedHashes.has(hash) };
       });
-      return { success: true, commits };
+      return { success: true, commits, hasMore, skip: offset, limit: count };
     } catch (error) {
       return { success: false, error: error.message };
     }
