@@ -319,9 +319,16 @@ function parseCommitNameStatus(stdout) {
 
 function commitDescriptionFromBody(bodyText, subject) {
   const lines = String(bodyText || '').replace(/\r\n/g, '\n').split('\n');
+  const normalizedSubject = String(subject || '').replace(/\s+/g, ' ').trim();
   if (!lines.length) return '';
-  if ((lines[0] || '').trim() === String(subject || '').trim()) lines.shift();
-  while (lines.length && !lines[0].trim()) lines.shift();
+  while (lines.length) {
+    const first = (lines[0] || '').replace(/\s+/g, ' ').trim();
+    if (!first || (normalizedSubject && first === normalizedSubject)) {
+      lines.shift();
+      continue;
+    }
+    break;
+  }
   while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
   return lines.join('\n').trim();
 }

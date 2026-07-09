@@ -21,7 +21,7 @@ import {
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, StickyNote, RotateCw, Folder, ArrowUp, ArrowDown, Square, Bell, BellRing, FileText, X, Copy } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, StickyNote, RotateCw, Folder, ArrowUp, ArrowDown, Square, Bell, BellRing, FileText, X, Copy, Info } from 'lucide-react';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -41,6 +41,25 @@ const formatRestartAfterCommandLabel = (command?: string | null) => {
   const clean = String(command || '').trim();
   const npmRunMatch = clean.match(/^npm\s+run(?:-script)?\s+(.+)$/);
   return (npmRunMatch ? npmRunMatch[1] : clean).trim();
+};
+const COMMAND_HISTORY_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+type CommandRunHistoryEntry = {
+  id?: string;
+  command: string;
+  at: number;
+  source?: string;
+  cwd?: string | null;
+};
+const formatCommandRunHistoryLabel = (command?: string | null) => formatRestartAfterCommandLabel(command);
+const formatCommandRunHistoryTime = (at?: number | null) => {
+  const date = new Date(Number(at || 0));
+  if (!Number.isFinite(date.getTime())) return '';
+  const dd = String(date.getDate()).padStart(2, '0');
+  const mon = COMMAND_HISTORY_MONTHS[date.getMonth()] || '---';
+  const yy = String(date.getFullYear() % 100).padStart(2, '0');
+  const hh = String(date.getHours()).padStart(2, '0');
+  const mm = String(date.getMinutes()).padStart(2, '0');
+  return `${dd}-${mon}-${yy} ${hh}:${mm}`;
 };
 const getRestartAfterTriggerIds = (tab: { id?: string; restartAfterTabId?: string; restartAfterTabIds?: string[] } | null | undefined): string[] => {
   if (!tab) return [];
@@ -763,6 +782,7 @@ interface TabItemProps {
   completionNotificationFired?: boolean;
   completionNotificationPersistent?: boolean;
   restartAfterFallbackCommand?: string | null;
+  onCommandHistoryOpen?: (e: React.MouseEvent, tabId: string) => void;
 }
 
 const TabItem = memo(({
@@ -813,6 +833,7 @@ const TabItem = memo(({
   completionNotificationArmed = false,
   completionNotificationFired = false,
   restartAfterFallbackCommand = null,
+  onCommandHistoryOpen,
 }: TabItemProps) => {
   const ref = useRef<HTMLDivElement>(null);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
@@ -1231,6 +1252,9 @@ const TabItem = memo(({
   const restartAfterConfigured = restartAfterTriggerIds.length > 0 || !!tab.restartAfterCommand;
   const restartAfterCommandLabel = formatRestartAfterCommandLabel(tab.restartAfterCommand)
     || (restartAfterTriggerIds.length > 0 ? formatRestartAfterCommandLabel(restartAfterFallbackCommand) : '');
+  const restartAfterCommandDisplayLabel = restartAfterCommandLabel
+    ? `${restartAfterCommandLabel}${restartAfterTriggerIds.length > 0 ? ` [${restartAfterTriggerIds.length}]` : ''}`
+    : '';
   const restartAfterPaused = !!tab.restartAfterPaused;
   const canShowVerticalRestartButton = isVerticalMode && (
     (tab.color === 'green' && hasProcess) || restartAfterConfigured
@@ -1865,18 +1889,29 @@ const TabItem = memo(({
               ) : (
                 <>
                   <span className="truncate min-w-0">{tab.name}</span>
-                  {restartAfterCommandLabel && (
-                    <span
-                      className="ml-auto flex-shrink-0 truncate max-w-[112px]"
-                      title={restartAfterCommandLabel}
+                  {restartAfterCommandDisplayLabel && (
+                    <button
+                      className="ml-auto flex-shrink-0 truncate max-w-[132px]"
+                      title={restartAfterCommandDisplayLabel}
                       style={{
+                        appearance: 'none',
+                        background: 'transparent',
+                        border: 0,
+                        padding: 0,
+                        cursor: 'pointer',
                         color: restartAfterPaused ? '#8a8a8a' : '#c4b5fd',
                         fontSize: '0.92em',
                         fontStyle: restartAfterPaused ? 'italic' : undefined,
                       }}
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        onCommandHistoryOpen?.(e, tab.id);
+                      }}
                     >
-                      {restartAfterCommandLabel}
-                    </span>
+                      {restartAfterCommandDisplayLabel}
+                    </button>
                   )}
                 </>
               )}
@@ -3106,6 +3141,8 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const [contextScripts, setContextScripts] = useState<string[]>([]);
   const [contextShScripts, setContextShScripts] = useState<string[]>([]);
   const [contextLastCommand, setContextLastCommand] = useState<{ tabId: string; command: string } | null>(null);
+  const [commandHistoryByTab, setCommandHistoryByTab] = useState<Map<string, CommandRunHistoryEntry[]>>(new Map());
+  const [commandHistoryPopover, setCommandHistoryPopover] = useState<{ tabId: string; x: number; y: number } | null>(null);
   const [restartAfterFallbackCommands, setRestartAfterFallbackCommands] = useState<Map<string, string>>(new Map());
   const [contextFavoriteId, setContextFavoriteId] = useState<number | null>(null);
   const [utilityExpanded, setUtilityExpanded] = useState(false);
@@ -3208,6 +3245,24 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       tab: state.openProjects.get(projectId)?.tabs.get(tabId) as TabData | undefined,
     };
   }, [projectId]);
+
+  const loadCommandRunHistory = useCallback(async (tabId: string) => {
+    const owner = resolveTabProjectContext(tabId);
+    const liveCwd = await ipcRenderer.invoke('terminal:getCwd', tabId).catch(() => null);
+    const cwd = liveCwd || owner.tab?.cwd || null;
+    const result = await ipcRenderer.invoke('terminal:get-command-run-history', {
+      tabId,
+      projectId: owner.projectId,
+      cwd,
+      limit: 20,
+    }).catch(() => null);
+    const rows = Array.isArray(result?.history) ? result.history : [];
+    setCommandHistoryByTab((previous) => {
+      const next = new Map(previous);
+      next.set(tabId, rows);
+      return next;
+    });
+  }, [resolveTabProjectContext]);
 
   useEffect(() => {
     if (!workspace) {
@@ -4299,19 +4354,21 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   }, [pendingEditTabId, projectId]);
 
   useEffect(() => {
-    if (!contextMenu && !emptyContextMenu && !groupContextMenu) return;
+    if (!contextMenu && !emptyContextMenu && !groupContextMenu && !commandHistoryPopover) return;
     const handleClose = (e: MouseEvent) => {
       // Don't close if clicking inside the context menu itself
       if ((e.target as HTMLElement).closest('[data-tab-context-menu]')) return;
       if ((e.target as HTMLElement).closest('[data-run-after-picker-menu]')) return;
+      if ((e.target as HTMLElement).closest('[data-command-history-popover]')) return;
       setContextMenu(null);
       setEmptyContextMenu(null);
       setGroupContextMenu(null);
+      setCommandHistoryPopover(null);
     };
     // Use mousedown instead of click — xterm.js canvas swallows click events
     document.addEventListener('mousedown', handleClose);
     return () => document.removeEventListener('mousedown', handleClose);
-  }, [contextMenu, emptyContextMenu, groupContextMenu]);
+  }, [contextMenu, emptyContextMenu, groupContextMenu, commandHistoryPopover]);
 
   // Clamp context menu position to viewport (same pattern as Timeline tooltip)
   useLayoutEffect(() => {
@@ -4782,9 +4839,11 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     e.stopPropagation();
     setGroupContextMenu(null);
     setEmptyContextMenu(null);
+    setCommandHistoryPopover(null);
     setContextMenuPos({ x: e.clientX, y: e.clientY });
     setContextMenu({ x: e.clientX, y: e.clientY, tabId });
     setContextLastCommand(null);
+    void loadCommandRunHistory(tabId);
 
     const targetTab = workspace.tabs.get(tabId);
     if (targetTab?.tabType === 'file') {
@@ -4873,6 +4932,17 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       } catch { /* ignore */ }
     })();
   };
+
+  const handleCommandHistoryOpen = useCallback((e: React.MouseEvent, tabId: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    void loadCommandRunHistory(tabId);
+    const width = 280;
+    const height = 260;
+    const x = Math.min(Math.max(8, e.clientX + 8), Math.max(8, window.innerWidth - width - 8));
+    const y = Math.min(Math.max(8, e.clientY + 8), Math.max(8, window.innerHeight - height - 8));
+    setCommandHistoryPopover({ tabId, x, y });
+  }, [loadCommandRunHistory]);
 
   // Build a "kill leaked port holders" shell prefix for the SCRIPT LAUNCH path
   // (Scripts submenu → click `npm run X`). This is NOT the stop path — here the
@@ -5566,6 +5636,31 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     return () => scrollContainer.removeEventListener('wheel', handleWheel);
   }, [isVerticalLayout]);
 
+  const renderCommandHistoryRows = (tabId: string) => {
+    const rows = commandHistoryByTab.get(tabId) || [];
+    if (rows.length === 0) {
+      return (
+        <div className="px-3 py-2 text-[12px] text-[#777] whitespace-nowrap">
+          No command history
+        </div>
+      );
+    }
+    return rows.map((row, index) => {
+      const label = formatCommandRunHistoryLabel(row.command) || row.command;
+      const time = formatCommandRunHistoryTime(row.at);
+      return (
+        <div
+          key={row.id || `${row.at}-${index}`}
+          className="px-3 py-1.5 text-[12px] text-[#ccc] flex items-center gap-3 min-w-0"
+          title={`${label}${time ? ` · ${time}` : ''}`}
+        >
+          <span className="min-w-0 flex-1 truncate text-[#ddd]">{label}</span>
+          <span className="flex-shrink-0 tabular-nums text-[#8a8a8a]">{time}</span>
+        </div>
+      );
+    });
+  };
+
   // Vertical sidebar layout — left column, list runs top→bottom, main scrolls
   // vertically, utility is inline below with a divider. Reuses ALL the state &
   // handlers from above (drag-drop, context menu, multi-select, busy maps,
@@ -5616,6 +5711,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 	                    key={tab.id}
 	                    tab={tab}
 	                    restartAfterFallbackCommand={restartAfterFallbackCommands.get(tab.id) || null}
+	                    onCommandHistoryOpen={handleCommandHistoryOpen}
 	                    index={index}
                     groupId={groupId}
                     groupIndex={groupIndex}
@@ -5938,6 +6034,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 	                  key={tab.id}
 	                  tab={tab}
 	                  restartAfterFallbackCommand={restartAfterFallbackCommands.get(tab.id) || null}
+	                  onCommandHistoryOpen={handleCommandHistoryOpen}
 	                  index={index}
                   zone="utility"
                   projectId={projectId}
@@ -6117,6 +6214,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 	                        key={tab.id}
 	                        tab={tab}
 	                        restartAfterFallbackCommand={restartAfterFallbackCommands.get(tab.id) || null}
+	                        onCommandHistoryOpen={handleCommandHistoryOpen}
 	                        index={index}
                         zone="utility"
                         projectId={projectId}
@@ -6210,6 +6308,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
 	                    key={tab.id}
 	                    tab={tab}
 	                    restartAfterFallbackCommand={restartAfterFallbackCommands.get(tab.id) || null}
+	                    onCommandHistoryOpen={handleCommandHistoryOpen}
 	                    index={index}
                     zone="main"
                     projectId={projectId}
@@ -7006,6 +7105,32 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             </div>
           )}
 
+          {!isMultiSelect && !isContextFileTab && contextMenu && (
+            <div className="relative group/command-info">
+              <button
+                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+                onMouseEnter={() => {
+                  if (contextMenu) void loadCommandRunHistory(contextMenu.tabId);
+                }}
+              >
+                <span className="flex items-center gap-2 min-w-0">
+                  <Info size={12} className="text-[#888] flex-shrink-0" />
+                  <span className="truncate">Info</span>
+                  <span className="text-[10px] text-[#555]">{commandHistoryByTab.get(contextMenu.tabId)?.length || 0}</span>
+                </span>
+                <span className="text-[#666]">{'\u203A'}</span>
+              </button>
+              <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/command-info:block">
+                <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 w-[280px] max-h-[300px] overflow-y-auto">
+                  <div className="px-3 py-1.5 text-[11px] text-[#888] border-b border-[#333]">
+                    Command history
+                  </div>
+                  {renderCommandHistoryRows(contextMenu.tabId)}
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Separator */}
           <div className="my-1 border-t border-[#444]" />
 
@@ -7420,6 +7545,21 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           </div>
         );
       })()}
+
+      {commandHistoryPopover && (
+        <div
+          data-command-history-popover
+          className="fixed bg-[#202020] border border-[#444] rounded-md shadow-2xl py-1 w-[280px] max-h-[260px] overflow-y-auto"
+          style={{ left: commandHistoryPopover.x, top: commandHistoryPopover.y, zIndex: 100060 }}
+          onClick={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <div className="px-3 py-1.5 text-[11px] text-[#888] border-b border-[#333]">
+            Command history
+          </div>
+          {renderCommandHistoryRows(commandHistoryPopover.tabId)}
+        </div>
+      )}
 
       {/* Empty space context menu */}
       {emptyContextMenu && (

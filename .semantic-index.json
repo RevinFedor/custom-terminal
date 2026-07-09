@@ -1310,42 +1310,49 @@
   },
   {
     "path": "docs/knowledge/fact-git-коммиты.md",
-    "hash": "4b779e5a8c9384bfc7c348bad1f1217934310e31913ee5a3411e1d3001e9c535",
+    "hash": "228451cf6fd443aa3acf0e67fd63db3c211f6576a08cf0a7adf01081fd7efdca",
     "type": "fact",
     "explicit": [
       "Git commits in the project workspace",
-      "project-level Git toolbar",
-      "Git repository selector",
+      "Git toolbar contract",
+      "repository selector",
       "commit workflow",
-      "history tab",
-      "remote auth recovery",
+      "history view",
       "AI commit message generation",
-      "collapsed Git status",
-      "diff preview",
-      "branch and changed file count"
+      "remote authentication recovery"
     ],
     "implicit": [
-      "project toolbar",
-      "workspace-level Git integration",
-      "git status watcher",
-      ".git metadata",
-      "stale-while-revalidate cache",
-      "porcelain signature",
-      "git log --skip pagination",
-      "upstream comparison",
-      "branch dropdown",
-      "split-button push/publish",
-      "commit message prompt",
-      "docs-only AI context toggle",
-      "shared AI prompt usage log",
+      "project-level git control",
+      "branch and changed-file status badge",
+      "project toolbar persistent status slot",
+      "stale-while-revalidate git status refresh",
+      "git watcher on repository path",
+      ".git metadata watching",
+      "porcelain-signature diff preview cache",
+      "repo-scoped history cache",
+      "repo-scoped branch cache",
+      "project-scoped favorite repositories",
+      "monorepo nested .git selection",
+      "selected-files automatic vs manual mode",
+      "split-button generate and commit",
+      "upstream comparison for unpublished commits",
       "soft reset undo commit",
-      "self-hosted GitLab",
-      "GitHub Desktop recovery"
+      "git commit message prompt id git-commit",
+      "docs-only AI context toggle",
+      "GitHub Desktop recovery action"
     ],
     "symptoms": [
-      "When the Git button is missing outside a repository or the toolbar appears in projects without a `.git` folder, this file explains the intended visibility rules. When the compact Git chip does not show changed-file counts until the panel is opened, this file describes the background watcher contract. When opening Git causes a loader flash even though cached data already exists, this file explains the stale-while-revalidate behavior. When the right-side diff preview remounts or flickers after a background refresh, this file covers the preview cache key and signature rules. When switching between Changes and History clears the visible list or shows empty-state placeholders too early, this file explains the repo-scoped cache behavior. When commit selection behaves inconsistently after manual selection versus automatic selection, this file defines how selection mode should work. When push or fetch fails because of auth, but local commits should still work, this file describes the recovery flow and the separation between local Git and remote access."
+      "The Git button is missing in a project that is not a Git repository.",
+      "The toolbar shows a branch but the changed-file count updates only after opening the panel.",
+      "Opening Git causes a loader flash even though the repository state was already cached.",
+      "Changing tabs or reopening the panel clears the file list, history, or branch list unexpectedly.",
+      "A file preview remounts or flickers after a background git status refresh even though the selected file did not change.",
+      "New changed files do not auto-appear after refresh, or stale selected paths are sent into commit.",
+      "Push or fetch fails on authentication, but local commits should still continue working."
     ],
-    "related_components": []
+    "related_components": [
+      "docs/methodology/переносимый-дизайн.md"
+    ]
   },
   {
     "path": "docs/knowledge/fact-global-dictation.md",
@@ -2179,55 +2186,51 @@
   },
   {
     "path": "docs/knowledge/fact-scripts.md",
-    "hash": "3d9a1b072d7ea7436bfdcbbedd21c96d396803527a50a7d335c1f9d796633005",
+    "hash": "33086f6ccc246e0a6df6b57564bd3748946755a667886912e6835fa44a8eb3dd",
     "type": "fact",
     "explicit": [
       "terminal scripts",
-      "npm scripts from package.json",
-      "shell scripts from CWD root",
-      "tab context menu Scripts submenu",
-      "dynamic script loading",
-      "private script filtering",
-      "dev server auto-detection",
+      "npm script launch",
       "shell script launch",
-      "stop running process with Ctrl+C",
-      "restart vs stop behavior",
-      "run last command from empty terminal slot",
+      "context menu submenu",
+      "dev-server auto-detection",
+      "script stop behavior",
       "restart after AI completion",
-      "OSC 133 command state",
-      "command type devServer"
+      "last command per cwd",
+      "command run history"
     ],
     "implicit": [
       "package.json",
-      ".sh files",
+      "sh files in cwd",
       "terminal:getCwd",
       "setTabCommandType",
+      "devServer",
       "RestartZone",
-      "group-hover/scripts",
       "terminalCommandState",
-      "IPC context-menu-command",
-      "terminal:input",
-      "node-pty",
       "OSC 133",
       "Ctrl+C",
-      "command-started",
-      "command-finished",
-      "restartAfterTabIds",
-      "restartAfterPaused"
+      "main.js",
+      "TabBar.tsx",
+      "terminal:input",
+      "terminal:get-command-run-history",
+      "app_state",
+      "SQLite",
+      "RunAfterTabPicker"
     ],
     "symptoms": [
-      "When a developer needs to add or debug the Scripts submenu in the tab context menu, especially if scripts are missing, duplicated, or loaded from the wrong working directory.",
-      "When running `npm run dev`, `start`, `serve`, or `watch` does not turn the tab green or expose the restart control.",
-      "When stopping a script or dev server closes the process incorrectly, kills the PID directly, or leaves the terminal state inconsistent.",
-      "When `.sh` scripts should appear next to npm scripts but hidden files or underscore-prefixed commands are leaking into the UI.",
-      "When the Play action in an empty terminal slot starts the wrong command because the last saved command was taken from the wrong cwd or from AI CLI history.",
-      "When restart-after automation should trigger after an AI tab finishes but nothing happens, or a pending rerun starts/stops at the wrong time."
+      "When right-clicking a tab and the Scripts submenu is empty or stale, this file explains that scripts are loaded dynamically from the tab's current cwd.",
+      "When a script starts but the tab does not turn green or expose restart controls, this file explains the dev-server name detection and where it must run in both menu paths.",
+      "When stopping a running script should keep the shell alive, this file explains why the UI sends Ctrl+C instead of killing the PID.",
+      "When the tab context menu and terminal context menu behave differently, this file explains that script launch and stop logic exists in two separate code paths that must stay aligned.",
+      "When Cmd+hover on an empty terminal slot should replay the last shell command, this file explains the cwd-scoped lookup and why AI CLI runs are filtered out.",
+      "When restart-after triggers do nothing after an AI session finishes, this file explains the trigger/target contract and the persisted state that drives the rerun."
     ],
     "related_components": [
       "src/renderer/components/Workspace/TabBar.tsx",
       "src/main/main.js",
       "src/renderer/components/Workspace/Terminal.tsx",
-      "src/renderer/App.tsx"
+      "src/renderer/App.tsx",
+      "src/main/main.js:show-terminal-context-menu"
     ]
   },
   {

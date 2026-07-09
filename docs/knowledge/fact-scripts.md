@@ -43,6 +43,12 @@ Capture берёт только реальные shell input lines из plain te
 
 Важный edge: команда, запущенная через shell history (`↑` + Enter), не проходит через main как текст команды — `terminal:input` видит только escape-код стрелки. Поэтому renderer `CmdDetect` после Enter отправляет в main полный prompt-line, а main уже нормализует его так же как typed input. Если команда была видна в scrollback до появления этой логики и ещё не сохранена в SQLite, Cmd+Play делает одноразовый fallback: сканирует tail текущего xterm-буфера, берёт последнюю строку с shell prompt, нормализует, сохраняет и запускает. Это не замена persisted store, а recovery для живой старой вкладки.
 
+## Command run history
+
+Main хранит короткую историю фактических запусков shell-команд в SQLite `app_state` (`terminal:command-run-history`). Запись добавляется на авторитетный `OSC 133;B` command-start, а не на клик по UI: меню или кнопка могут только попросить запуск, но история должна показывать то, что shell реально начал выполнять. Команда нормализуется тем же фильтром что last-command: kill-port prefix отбрасывается, AI CLI (`codex`/`claude`/`gemini`) не попадает в историю. Для защиты от пустых/служебных `OSC B` last-command fallback берётся только если он свежий; выбранный restart-after script приходит через `activeCommandSource: "restart-after"` и пишется явно.
+
+UI читает историю через `terminal:get-command-run-history` по `tabId` + live cwd. Формат строки намеренно короткий: название команды (`npm run build:install` показывается как `build:install`) и локальное время `DD-Mon-YY HH:mm`. История доступна из ПКМ вкладки → `Info` submenu даже когда `Restart after` выключен; когда на vertical tab есть фиолетовый restart-after command label (`build:install [3]`), сам label кликабелен и открывает тот же список.
+
 ## Restart after AI completion
 
 Обычная terminal/devServer вкладка может быть привязана к завершению одной или нескольких AI-вкладок через ПКМ → `Restart after`. Это не Prompt Queue и не отправка prompt'а: owner — обычная вкладка с процессом или script'ом, triggers — Claude/Gemini/Codex/SDK вкладки, у которых ждём штатный busy→idle edge. Любой выбранный trigger может запустить side effect в owner-вкладке.

@@ -729,6 +729,9 @@ const terminalOutputBuffer = new Map();  // tabId -> { lines: string[], maxLines
 const TERMINAL_OUTPUT_MAX_LINES = 500;
 const LAST_COMMANDS_BY_CWD_KEY = 'terminal:last-command-by-cwd';
 const LAST_COMMANDS_BY_CWD_LIMIT = 200;
+const COMMAND_RUN_HISTORY_KEY = 'terminal:command-run-history';
+const COMMAND_RUN_HISTORY_PER_TAB_LIMIT = 25;
+const COMMAND_RUN_HISTORY_TOTAL_LIMIT = 500;
 const TERMINAL_COMMAND_META_TTL_MS = 15000;
 const RESTART_AFTER_COMMAND_SOURCE = 'restart-after';
 const terminalHeadlessMirrors = new Map(); // tabId -> { terminal, pending, writeSeq, flushedSeq, failed }
@@ -773,6 +776,47 @@ function rememberTerminalLastCommand(tabId, command) {
   terminalCommandState.set(tabId, state);
   rememberTerminalLastCommandForCwd(tabId, normalized, at, cwd);
   console.log('[LastCommand] tab=' + String(tabId).slice(-12) + ' project=' + (terminalProjectIds.get(tabId) || '-') + ' cwd=' + JSON.stringify(cwd || '') + ' command=' + JSON.stringify(normalized));
+}
+
+function rememberTerminalCommandRun(tabId, command, source = 'shell', at = Date.now()) {
+  const normalized = normalizeRememberedShellCommand(command);
+  if (!tabId || !normalized || isAiLaunchShellCommand(normalized)) return;
+  const cwd = terminalProjects.get(tabId) || null;
+  const projectId = terminalProjectIds.get(tabId) || null;
+  try {
+    const current = projectManager?.db?.getAppState?.(COMMAND_RUN_HISTORY_KEY);
+    const map = current && typeof current === 'object' && !Array.isArray(current) ? { ...current } : {};
+    const existing = Array.isArray(map[tabId]) ? map[tabId] : [];
+    const first = existing[0] || null;
+    if (first?.command === normalized && Math.abs(Number(first.at || 0) - at) < 1500) return;
+    const row = {
+      id: `${at}:${tabId}`,
+      tabId,
+      projectId,
+      cwd,
+      command: normalized,
+      source: source || 'shell',
+      at,
+    };
+    map[tabId] = [row, ...existing].slice(0, COMMAND_RUN_HISTORY_PER_TAB_LIMIT);
+
+    const rows = Object.values(map)
+      .flatMap((items) => Array.isArray(items) ? items : [])
+      .sort((a, b) => Number(b?.at || 0) - Number(a?.at || 0))
+      .slice(0, COMMAND_RUN_HISTORY_TOTAL_LIMIT);
+    const pruned = {};
+    for (const item of rows) {
+      if (!item?.tabId) continue;
+      if (!pruned[item.tabId]) pruned[item.tabId] = [];
+      if (pruned[item.tabId].length < COMMAND_RUN_HISTORY_PER_TAB_LIMIT) {
+        pruned[item.tabId].push(item);
+      }
+    }
+    projectManager?.db?.setAppState?.(COMMAND_RUN_HISTORY_KEY, pruned);
+    console.log('[CommandRunHistory] tab=' + String(tabId).slice(-12) + ' project=' + (projectId || '-') + ' cwd=' + JSON.stringify(cwd || '') + ' source=' + (source || 'shell') + ' command=' + JSON.stringify(normalized));
+  } catch (e) {
+    console.warn('[CommandRunHistory] persist failed tab=' + String(tabId).slice(-12) + ': ' + (e?.message || e));
+  }
 }
 
 function rememberDetectedTerminalCommand(tabId, command) {
@@ -5033,6 +5077,16 @@ function parseOSC133AndEmit(tabId, data) {
         clearCodexDescendantExitRecheck(tabId, 'osc-b');
         state.isRunning = true;
         applyTerminalCommandStartMeta(tabId, state);
+        const startedAt = Date.now();
+        const freshLastCommand = state.lastCommand && (!state.lastCommandAt || startedAt - state.lastCommandAt < 15000)
+          ? state.lastCommand
+          : '';
+        rememberTerminalCommandRun(
+          tabId,
+          state.activeCommand || freshLastCommand || terminalInitialCommand.get(tabId) || '',
+          state.activeCommandSource || 'shell',
+          startedAt
+        );
         terminalCommandState.set(tabId, state);
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('terminal:command-started', { tabId });
@@ -14322,6 +14376,39 @@ ipcMain.handle('terminal:get-last-project-command', async (event, request = {}) 
   return best
     ? { success: true, ...best }
     : { success: false, error: 'no-last-command' };
+});
+
+ipcMain.handle('terminal:get-command-run-history', async (event, request = {}) => {
+  const tabId = typeof request?.tabId === 'string' && request.tabId ? request.tabId : null;
+  const cwd = typeof request?.cwd === 'string' && request.cwd ? request.cwd : null;
+  const projectId = typeof request?.projectId === 'string' && request.projectId ? request.projectId : null;
+  const limit = Math.max(1, Math.min(50, Number(request?.limit || 20)));
+  try {
+    const saved = projectManager?.db?.getAppState?.(COMMAND_RUN_HISTORY_KEY);
+    const map = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+    let rows = tabId
+      ? (Array.isArray(map[tabId]) ? map[tabId] : [])
+      : Object.values(map).flatMap((items) => Array.isArray(items) ? items : []);
+    rows = rows
+      .filter((row) => row && typeof row.command === 'string' && row.command.trim())
+      .filter((row) => !cwd || row.cwd === cwd)
+      .filter((row) => !projectId || !row.projectId || row.projectId === projectId)
+      .sort((a, b) => Number(b?.at || 0) - Number(a?.at || 0))
+      .slice(0, limit)
+      .map((row) => ({
+        id: row.id || `${row.at || 0}:${row.tabId || ''}`,
+        tabId: row.tabId || null,
+        projectId: row.projectId || null,
+        cwd: row.cwd || null,
+        command: normalizeRememberedShellCommand(row.command) || row.command,
+        source: row.source || 'shell',
+        at: Number(row.at || 0),
+      }));
+    return { success: true, history: rows };
+  } catch (e) {
+    console.warn('[CommandRunHistory] read failed: ' + (e?.message || e));
+    return { success: false, error: e?.message || String(e), history: [] };
+  }
 });
 
 // Test introspection: get/set claudeCliActive for E2E tests

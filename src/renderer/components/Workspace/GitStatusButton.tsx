@@ -329,6 +329,19 @@ function gitStatusPreviewSignature(status?: GitStatus | null): string {
   return status?.files?.map((file) => `${file.xy}:${file.path}`).join('\0') || '';
 }
 
+function normalizeFsPath(value?: string | null): string {
+  return String(value || '').replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+function changedPathMatchesRepoFile(repoPath?: string | null, filePath?: string | null, changedPath?: string | null): boolean {
+  const repo = normalizeFsPath(repoPath);
+  const file = normalizeFsPath(filePath).replace(/^\/+/, '');
+  const changed = normalizeFsPath(changedPath);
+  if (!repo || !file || !changed) return false;
+  const absoluteFilePath = `${repo}/${file}`;
+  return changed === absoluteFilePath || changed.startsWith(`${absoluteFilePath}/`);
+}
+
 export default function GitStatusButton({ projectId, projectName, projectPath }: Props) {
   const showToast = useUIStore((state) => state.showToast);
   const activeTabMetaKey = useWorkspaceStore((state) => {
@@ -410,7 +423,6 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [fileDiffLoading, setFileDiffLoading] = useState(false);
   const [resizeHover, setResizeHover] = useState<'left' | 'bottom' | 'left-bottom' | null>(null);
   const [splitResizeHover, setSplitResizeHover] = useState(false);
-  const [statusVersion, setStatusVersion] = useState(0);
   const fsDebounceRef = useRef<number | null>(null);
   const saveDebounceRef = useRef<number | null>(null);
   const statusRequestRef = useRef(0);
@@ -419,8 +431,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const commitDetailsRequestRef = useRef(0);
   const branchesRequestRef = useRef(0);
   const statusRef = useRef<GitStatus | null>(null);
-  const statusPreviewSignatureRef = useRef('');
   const latestProjectPathRef = useRef(projectPath || '');
+  const openRef = useRef(open);
+  const panelTabRef = useRef(panelTab);
+  const activeFilePathRef = useRef(activeFilePath);
   const hydratedStateKeyRef = useRef('');
   const runAfterBusyRef = useRef<Map<string, boolean>>(new Map());
   const runAfterFireRef = useRef(false);
@@ -499,12 +513,24 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const statusReadyForRepo = Boolean(status?.requestPath) && status.requestPath === effectiveRepoPath;
   const currentRepoDisplay = repositoryByPath.get(effectiveRepoPath) || makeRepository(effectiveRepoPath, projectPath, effectiveRepoPath === projectPath);
 
-  const loadStatus = useCallback(async (visible = false, refreshPreview = visible) => {
+  useEffect(() => {
+    openRef.current = open;
+    panelTabRef.current = panelTab;
+    activeFilePathRef.current = activeFilePath;
+  }, [open, panelTab, activeFilePath]);
+
+  const markActiveFileDiffStale = useCallback((repoPath: string, changedPath: string) => {
+    const filePath = activeFilePathRef.current;
+    if (!openRef.current || panelTabRef.current !== 'changes' || !changedPathMatchesRepoFile(repoPath, filePath, changedPath)) return;
+    const selectionKey = `${repoPath}\0${filePath}\0`;
+    setFileDiffKey((current) => current.startsWith(selectionKey) ? `${selectionKey}stale:${Date.now()}` : '');
+  }, []);
+
+  const loadStatus = useCallback(async (visible = false) => {
     const requestPath = effectiveRepoPath;
     const requestId = ++statusRequestRef.current;
     if (!requestPath) {
       statusRef.current = null;
-      statusPreviewSignatureRef.current = '';
       setStatus(null);
       setStatusLoading(false);
       return;
@@ -544,7 +570,6 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
           return;
         }
         statusRef.current = null;
-        statusPreviewSignatureRef.current = '';
         setStatus(null);
         setFileDiff(null);
         setFileDiffKey('');
@@ -552,17 +577,12 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         return;
       }
       const nextStatus = { ...(result as GitStatus), requestPath };
-      const nextPreviewSignature = gitStatusPreviewSignature(nextStatus);
-      const shouldRefreshPreview = refreshPreview || nextPreviewSignature !== statusPreviewSignatureRef.current;
       statusRef.current = nextStatus;
-      statusPreviewSignatureRef.current = nextPreviewSignature;
       setStatus(nextStatus);
-      if (shouldRefreshPreview) setStatusVersion((value) => value + 1);
     } catch (error: any) {
       if (statusRequestRef.current !== requestId) return;
       if (visible) showToast('Git status: ' + trimError(error?.message || error), 'error');
       statusRef.current = null;
-      statusPreviewSignatureRef.current = '';
       setStatus(null);
       setFileDiff(null);
       setFileDiffKey('');
@@ -730,7 +750,6 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     commitDetailsRequestRef.current += 1;
     branchesRequestRef.current += 1;
     statusRef.current = null;
-    statusPreviewSignatureRef.current = '';
     setStatus(null);
     setStatusLoading(Boolean(nextProjectPath));
     setSelectedPathsManual(false);
@@ -932,14 +951,16 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       setFileDiffLoading(false);
       return;
     }
-    const requestKey = `${effectiveRepoPath}\0${activeFilePath}\0${statusFileKey}\0${statusVersion}`;
+    const selectionKey = `${effectiveRepoPath}\0${activeFilePath}\0`;
+    const requestKey = `${selectionKey}${statusFileKey}`;
     if (fileDiffKey === requestKey && fileDiff) {
       setFileDiffLoading(false);
       return;
     }
+    const hasVisibleDiffForSelection = Boolean(fileDiff && fileDiffKey.startsWith(selectionKey));
     let cancelled = false;
     let started = false;
-    setFileDiffLoading(true);
+    setFileDiffLoading(!hasVisibleDiffForSelection);
     const timer = window.setTimeout(() => {
       started = true;
       ipcRenderer.invoke('git:file-diff', { projectPath: effectiveRepoPath, filePath: activeFilePath })
@@ -951,8 +972,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         })
         .catch((error: any) => {
           if (!cancelled) {
-            setFileDiff({ success: false, diff: '', additions: 0, deletions: 0, error: trimError(error?.message || error) });
-            setFileDiffKey(requestKey);
+            if (!hasVisibleDiffForSelection) {
+              setFileDiff({ success: false, diff: '', additions: 0, deletions: 0, error: trimError(error?.message || error) });
+              setFileDiffKey(requestKey);
+            }
           }
         })
         .finally(() => {
@@ -966,7 +989,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
         setFileDiffLoading(false);
       }
     };
-  }, [open, panelTab, effectiveRepoPath, activeFilePath, statusFileKey, statusVersion, fileDiffKey, fileDiff]);
+  }, [open, panelTab, effectiveRepoPath, activeFilePath, statusFileKey, fileDiffKey, fileDiff]);
 
   useEffect(() => {
     const onFocus = () => loadStatus(false);
@@ -980,8 +1003,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     ipcRenderer.invoke('git:watch-status', { projectPath: watchedPath }).catch(() => {});
     const onGitStatusChanged = (_event: any, payload: any) => {
       if (!payload?.projectPath || payload.projectPath !== watchedPath) return;
+      markActiveFileDiffStale(watchedPath, payload.path);
       if (fsDebounceRef.current) window.clearTimeout(fsDebounceRef.current);
-      fsDebounceRef.current = window.setTimeout(() => loadStatus(false, true), 220);
+      fsDebounceRef.current = window.setTimeout(() => loadStatus(false), 220);
     };
     ipcRenderer.on('git:status-changed', onGitStatusChanged);
     return () => {
@@ -989,20 +1013,21 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       ipcRenderer.invoke('git:unwatch-status', { projectPath: watchedPath }).catch(() => {});
       if (fsDebounceRef.current) window.clearTimeout(fsDebounceRef.current);
     };
-  }, [effectiveRepoPath, panelStateKey, loadStatus]);
+  }, [effectiveRepoPath, panelStateKey, loadStatus, markActiveFileDiffStale]);
 
   useEffect(() => {
     const onFsChange = (_event: any, payload: any) => {
       if (!status?.repoRoot || !payload?.path || !String(payload.path).startsWith(status.repoRoot)) return;
+      markActiveFileDiffStale(effectiveRepoPath, payload.path);
       if (fsDebounceRef.current) window.clearTimeout(fsDebounceRef.current);
-      fsDebounceRef.current = window.setTimeout(() => loadStatus(false, true), 350);
+      fsDebounceRef.current = window.setTimeout(() => loadStatus(false), 350);
     };
     ipcRenderer.on('fs:change', onFsChange);
     return () => {
       ipcRenderer.removeListener('fs:change', onFsChange);
       if (fsDebounceRef.current) window.clearTimeout(fsDebounceRef.current);
     };
-  }, [loadStatus, status?.repoRoot]);
+  }, [loadStatus, status?.repoRoot, effectiveRepoPath, markActiveFileDiffStale]);
 
   useEffect(() => {
     if (!open) return;
@@ -1579,6 +1604,13 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const visibleCommitDetails = commitDetailsRepoPath === effectiveRepoPath && commitDetailsMatchHash(commitDetails, activeCommitHash) ? commitDetails : null;
   const activeCommitDetailsLoadingKey = commitDetailsRequestKey(effectiveRepoPath, activeCommitHash, activeCommitFilePath);
   const historyPreviewLoading = Boolean(commitDetailsLoading && commitDetailsLoadingKey === activeCommitDetailsLoadingKey);
+  const rightToolbarTitle = panelTab === 'changes'
+    ? (activeFile?.path || 'No file selected')
+    : activeCommitFilePath
+      ? activeCommitFilePath
+      : activeCommitHash
+        ? 'Commit preview'
+        : 'Select a commit';
   const generateDisabled = generating || committing || selectedCount === 0 || status.changedCount === 0;
   const commitDisabled = committing || selectedCount === 0 || !summary.trim();
   const gitRunAfterOwnerTabId = `git-panel:${projectId || projectPath || effectiveRepoPath || 'repo'}`;
@@ -1947,19 +1979,8 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
 
                 <div style={gitRightToolbarStyle}>
                   <div style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, fontWeight: 800, color: '#f8fafc' }}>
-                    {panelTab === 'changes' ? (activeFile?.path || 'No file selected') : (visibleCommitDetails?.subject || 'Select a commit')}
+                    {rightToolbarTitle}
                   </div>
-                  <button
-                    onClick={async () => {
-                      await loadStatus(true);
-                      if (panelTab === 'history') await loadHistory();
-                    }}
-                    disabled={statusLoading || historyLoading}
-                    title="Refresh"
-                    style={iconButtonStyle}
-                  >
-                    <RefreshCw size={13} className={statusLoading || historyLoading ? 'animate-spin' : ''} />
-                  </button>
                 </div>
 
                 <div style={gitLeftBodyStyle}>
