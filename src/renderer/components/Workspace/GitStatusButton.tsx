@@ -23,7 +23,11 @@ import {
   Star,
   Upload,
 } from 'lucide-react';
-import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
+import {
+  gitRunAfterProjectKey,
+  useGitRunAfterStore,
+  type GitRunAfterAction,
+} from '../../store/useGitRunAfterStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { RunAfterTabPicker } from './RunAfterTabPicker';
@@ -165,7 +169,6 @@ type Props = {
   projectPath?: string;
 };
 
-type GitRunAfterAction = 'generate' | 'generate-commit';
 type GitToolbarAction = GitRunAfterAction | 'commit' | 'push' | 'fetch' | 'undo' | 'checkout';
 type GitRunAfterStatusPhase = 'idle' | 'waiting' | 'running' | 'success';
 
@@ -385,14 +388,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [description, setDescription] = useState('');
   const [generating, setGenerating] = useState(false);
   const [committing, setCommitting] = useState(false);
-  const [runAfterAction, setRunAfterAction] = useState<GitRunAfterAction | null>(null);
-  const [runAfterTargetTabId, setRunAfterTargetTabId] = useState<string | null>(null);
   const [runAfterPickerAction, setRunAfterPickerAction] = useState<GitRunAfterAction>('generate-commit');
   const [runAfterPickerKey, setRunAfterPickerKey] = useState(0);
   const [runAfterPickerCloseKey, setRunAfterPickerCloseKey] = useState(0);
   const [runAfterFlashAction, setRunAfterFlashAction] = useState<GitRunAfterAction | null>(null);
-  const [runAfterRunningAction, setRunAfterRunningAction] = useState<GitRunAfterAction | null>(null);
-  const [runAfterSuccessAction, setRunAfterSuccessAction] = useState<GitRunAfterAction | null>(null);
   const [gitToolbarRunningAction, setGitToolbarRunningAction] = useState<GitToolbarAction | null>(null);
   const [gitToolbarSuccessAction, setGitToolbarSuccessAction] = useState<GitToolbarAction | null>(null);
   const [remoteBusy, setRemoteBusy] = useState<'push' | 'fetch' | null>(null);
@@ -423,6 +422,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const [fileDiffLoading, setFileDiffLoading] = useState(false);
   const [resizeHover, setResizeHover] = useState<'left' | 'bottom' | 'left-bottom' | null>(null);
   const [splitResizeHover, setSplitResizeHover] = useState(false);
+  const [hydratedStateKey, setHydratedStateKey] = useState('');
   const fsDebounceRef = useRef<number | null>(null);
   const saveDebounceRef = useRef<number | null>(null);
   const statusRequestRef = useRef(0);
@@ -435,12 +435,17 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const openRef = useRef(open);
   const panelTabRef = useRef(panelTab);
   const activeFilePathRef = useRef(activeFilePath);
-  const hydratedStateKeyRef = useRef('');
-  const runAfterBusyRef = useRef<Map<string, boolean>>(new Map());
-  const runAfterFireRef = useRef(false);
   const runAfterFlashTimerRef = useRef<number | null>(null);
-  const runAfterSuccessTimerRef = useRef<number | null>(null);
   const gitToolbarSuccessTimerRef = useRef<number | null>(null);
+  const consumedRunAfterTaskIdsRef = useRef<Set<string>>(new Set());
+
+  const runAfterProjectKey = useMemo(
+    () => gitRunAfterProjectKey(projectId, projectPath),
+    [projectId, projectPath]
+  );
+  const storedRunAfterTask = useGitRunAfterStore((state) => state.tasks.get(runAfterProjectKey) || null);
+  const armRunAfterTask = useGitRunAfterStore((state) => state.armTask);
+  const clearRunAfterTask = useGitRunAfterStore((state) => state.clearTask);
 
   const selectedCount = selectedPaths.size;
   const allSelected = status?.files.length ? selectedCount === status.files.length : false;
@@ -476,8 +481,13 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     }
     return 'Missing tab';
   });
-  const hydratedForCurrentProject = hydratedStateKeyRef.current === panelStateKey;
+  const hydratedForCurrentProject = hydratedStateKey === panelStateKey;
   const effectiveRepoPath = (hydratedForCurrentProject ? selectedRepoPath : (projectPath || '')) || projectPath || '';
+  const runAfterTask = storedRunAfterTask?.repoPath === effectiveRepoPath ? storedRunAfterTask : null;
+  const runAfterAction = runAfterTask?.phase === 'waiting' ? runAfterTask.action : null;
+  const runAfterTargetTabId = runAfterTask?.phase === 'waiting' ? runAfterTask.triggerTabId : null;
+  const runAfterRunningAction = runAfterTask?.phase === 'running' ? runAfterTask.action : null;
+  const runAfterSuccessAction = runAfterTask?.phase === 'success' ? runAfterTask.action : null;
   const homeRepositories = useMemo(() => makeHomeRepositories(projectPath), [projectPath]);
   const currentRepositories = useMemo(
     () => repositoriesProjectPath === (projectPath || '') ? repositories : homeRepositories,
@@ -512,6 +522,12 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const visibleBranches = branchesReadyForRepo ? branches : [];
   const statusReadyForRepo = Boolean(status?.requestPath) && status.requestPath === effectiveRepoPath;
   const currentRepoDisplay = repositoryByPath.get(effectiveRepoPath) || makeRepository(effectiveRepoPath, projectPath, effectiveRepoPath === projectPath);
+
+  useEffect(() => {
+    if (!hydratedForCurrentProject || !storedRunAfterTask) return;
+    if (storedRunAfterTask.repoPath === effectiveRepoPath) return;
+    clearRunAfterTask(runAfterProjectKey, storedRunAfterTask.id);
+  }, [clearRunAfterTask, effectiveRepoPath, hydratedForCurrentProject, runAfterProjectKey, storedRunAfterTask]);
 
   useEffect(() => {
     openRef.current = open;
@@ -808,7 +824,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   useEffect(() => {
     if (!panelStateKey) return;
     let cancelled = false;
-    hydratedStateKeyRef.current = '';
+    setHydratedStateKey('');
     ipcRenderer.invoke('app:getState', panelStateKey)
       .then((saved: GitPanelPersistedState | null) => {
         if (cancelled) return;
@@ -845,10 +861,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
           setDocsOnlyWhenPresent(loadDocsOnlySetting());
         }
         setGenerationMeta(null);
-        hydratedStateKeyRef.current = panelStateKey;
+        setHydratedStateKey(panelStateKey);
       })
       .catch(() => {
-        if (!cancelled) hydratedStateKeyRef.current = panelStateKey;
+        if (!cancelled) setHydratedStateKey(panelStateKey);
       });
     return () => {
       cancelled = true;
@@ -856,7 +872,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   }, [panelStateKey, projectPath]);
 
   useEffect(() => {
-    if (!panelStateKey || hydratedStateKeyRef.current !== panelStateKey) return;
+    if (!panelStateKey || hydratedStateKey !== panelStateKey) return;
     if (saveDebounceRef.current) window.clearTimeout(saveDebounceRef.current);
     saveDebounceRef.current = window.setTimeout(() => {
       const payload: GitPanelPersistedState = {
@@ -883,7 +899,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     return () => {
       if (saveDebounceRef.current) window.clearTimeout(saveDebounceRef.current);
     };
-  }, [panelStateKey, open, panelTab, summary, description, search, historySearch, activeFilePath, activeCommitHash, activeCommitFilePath, selectedPaths, selectedPathsManual, panelSize, splitLeftWidth, commitDescriptionLines, docsOnlyWhenPresent, selectedRepoPath, repoFavorites]);
+  }, [panelStateKey, hydratedStateKey, open, panelTab, summary, description, search, historySearch, activeFilePath, activeCommitHash, activeCommitFilePath, selectedPaths, selectedPathsManual, panelSize, splitLeftWidth, commitDescriptionLines, docsOnlyWhenPresent, selectedRepoPath, repoFavorites]);
 
   useEffect(() => {
     if (!open) return;
@@ -998,7 +1014,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   }, [loadStatus]);
 
   useEffect(() => {
-    if (!effectiveRepoPath || hydratedStateKeyRef.current !== panelStateKey) return;
+    if (!effectiveRepoPath || hydratedStateKey !== panelStateKey) return;
     const watchedPath = effectiveRepoPath;
     ipcRenderer.invoke('git:watch-status', { projectPath: watchedPath }).catch(() => {});
     const onGitStatusChanged = (_event: any, payload: any) => {
@@ -1013,7 +1029,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       ipcRenderer.invoke('git:unwatch-status', { projectPath: watchedPath }).catch(() => {});
       if (fsDebounceRef.current) window.clearTimeout(fsDebounceRef.current);
     };
-  }, [effectiveRepoPath, panelStateKey, loadStatus, markActiveFileDiffStale]);
+  }, [effectiveRepoPath, hydratedStateKey, panelStateKey, loadStatus, markActiveFileDiffStale]);
 
   useEffect(() => {
     const onFsChange = (_event: any, payload: any) => {
@@ -1077,6 +1093,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     historyRequestRef.current += 1;
     commitDetailsRequestRef.current += 1;
     branchesRequestRef.current += 1;
+    clearRunAfterTask(runAfterProjectKey);
     setSelectedPathsManual(false);
     setSelectedRepoPath(repoPath);
     setStatusLoading(true);
@@ -1331,10 +1348,6 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     }
   }, [flashGitToolbarSuccess]);
 
-  const runGenerate = useCallback(async () => {
-    return Boolean(await generateCommitMessage(false));
-  }, [generateCommitMessage]);
-
   const handleGenerate = useCallback(async () => {
     return runGitToolbarAction('generate', async () => Boolean(await generateCommitMessage(false)));
   }, [generateCommitMessage, runGitToolbarAction]);
@@ -1353,15 +1366,6 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     return runGitToolbarAction('generate-commit', runGenerateAndCommit);
   }, [runGenerateAndCommit, runGitToolbarAction]);
 
-  const flashRunAfterSuccess = useCallback((action: GitRunAfterAction) => {
-    if (runAfterSuccessTimerRef.current) window.clearTimeout(runAfterSuccessTimerRef.current);
-    setRunAfterSuccessAction(action);
-    runAfterSuccessTimerRef.current = window.setTimeout(() => {
-      setRunAfterSuccessAction(null);
-      runAfterSuccessTimerRef.current = null;
-    }, 1200);
-  }, []);
-
   const openGitRunAfterPicker = useCallback((event: React.MouseEvent, action: GitRunAfterAction) => {
     event.preventDefault();
     event.stopPropagation();
@@ -1378,24 +1382,32 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   const setGitRunAfterTab = useCallback((_ownerTabId: string, targetTabId: string | null) => {
     const target = typeof targetTabId === 'string' && targetTabId.trim() ? targetTabId.trim() : null;
     if (!target) {
-      setRunAfterTargetTabId(null);
-      setRunAfterAction(null);
-      setRunAfterRunningAction(null);
+      clearRunAfterTask(runAfterProjectKey);
       showToast('Git run after cleared', 'success', 1200);
       return;
     }
+    if (!runAfterProjectKey || !effectiveRepoPath || !statusReadyForRepo || selectedList.length === 0) {
+      showToast('Git run after: select changed files first', 'warning', 2500);
+      return;
+    }
     const action = runAfterPickerAction;
-    const busySnapshot = getBusyTabsSnapshot();
-    const busy = busySnapshot.get(target) === true;
-    runAfterBusyRef.current.set(target, busy);
-    setRunAfterAction(action);
-    setRunAfterTargetTabId(target);
+    armRunAfterTask({
+      projectKey: runAfterProjectKey,
+      projectId,
+      projectName,
+      repoPath: effectiveRepoPath,
+      selectedPaths: [...selectedList],
+      docsOnlyWhenPresent,
+      contextTabId: activeTabId,
+      contextTabName: activeTabName,
+      triggerTabId: target,
+      action,
+    });
     showToast(`${gitRunAfterActionLabel(action)} after selected tab`, 'success', 1800);
-  }, [runAfterPickerAction, showToast]);
+  }, [activeTabId, activeTabName, armRunAfterTask, clearRunAfterTask, docsOnlyWhenPresent, effectiveRepoPath, projectId, projectName, runAfterPickerAction, runAfterProjectKey, selectedList, showToast, statusReadyForRepo]);
 
   useEffect(() => () => {
     if (runAfterFlashTimerRef.current) window.clearTimeout(runAfterFlashTimerRef.current);
-    if (runAfterSuccessTimerRef.current) window.clearTimeout(runAfterSuccessTimerRef.current);
     if (gitToolbarSuccessTimerRef.current) window.clearTimeout(gitToolbarSuccessTimerRef.current);
   }, []);
 
@@ -1404,55 +1416,27 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   }, [open]);
 
   useEffect(() => {
-    if (!runAfterTargetTabId || !runAfterAction) return;
-    const target = runAfterTargetTabId;
-    const currentSnapshot = getBusyTabsSnapshot();
-    if (!runAfterBusyRef.current.has(target)) {
-      runAfterBusyRef.current.set(target, currentSnapshot.get(target) === true);
+    if (!hydratedForCurrentProject || !runAfterTask || runAfterTask.phase !== 'success') return;
+    if (consumedRunAfterTaskIdsRef.current.has(runAfterTask.id)) return;
+    consumedRunAfterTaskIdsRef.current.add(runAfterTask.id);
+
+    if (runAfterTask.action === 'generate') {
+      setSummary(runAfterTask.result?.summary || '');
+      setDescription(runAfterTask.result?.description || '');
+    } else {
+      setSummary('');
+      setDescription('');
     }
+    setGenerationMeta(runAfterTask.result?.meta || null);
+    void loadStatus(false);
+    if (open && panelTab === 'history') void loadHistory();
 
-    const applyBusyState = async (tid: string, busy: boolean) => {
-      if (!tid || tid !== target) return;
-      const wasBusy = runAfterBusyRef.current.get(tid) === true;
-      runAfterBusyRef.current.set(tid, busy);
-      if (!wasBusy || busy || runAfterFireRef.current) return;
-
-      const action = runAfterAction;
-      runAfterFireRef.current = true;
-      setRunAfterTargetTabId(null);
-      setRunAfterAction(null);
-      setRunAfterRunningAction(action);
-      let succeeded = false;
-      try {
-        succeeded = action === 'generate-commit'
-          ? await runGenerateAndCommit()
-          : await runGenerate();
-      } finally {
-        setRunAfterRunningAction(null);
-        runAfterFireRef.current = false;
-      }
-      if (succeeded) flashRunAfterSuccess(action);
-    };
-
-    const handleClaudeBusy = (_: unknown, payload: { tabId: string; busy: boolean }) => {
-      void applyBusyState(payload?.tabId, payload?.busy === true);
-    };
-    const handleGeminiBusy = (_: unknown, payload: { tabId: string; busy: boolean }) => {
-      void applyBusyState(payload?.tabId, payload?.busy === true);
-    };
-    const handleCodexBusy = (_: unknown, payload: { tabId: string; busy: boolean }) => {
-      void applyBusyState(payload?.tabId, payload?.busy === true);
-    };
-
-    ipcRenderer.on('claude:busy-state', handleClaudeBusy);
-    ipcRenderer.on('gemini:busy-state', handleGeminiBusy);
-    ipcRenderer.on('codex:busy-state', handleCodexBusy);
-    return () => {
-      ipcRenderer.removeListener('claude:busy-state', handleClaudeBusy);
-      ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
-      ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
-    };
-  }, [flashRunAfterSuccess, runAfterAction, runAfterTargetTabId, runGenerate, runGenerateAndCommit]);
+    const completedProjectKey = runAfterTask.projectKey;
+    const completedTaskId = runAfterTask.id;
+    window.setTimeout(() => {
+      clearRunAfterTask(completedProjectKey, completedTaskId);
+    }, 1200);
+  }, [clearRunAfterTask, hydratedForCurrentProject, loadHistory, loadStatus, open, panelTab, runAfterTask]);
 
   const handleUndoCommit = async (commit: GitCommit) => {
     if (!effectiveRepoPath || !commit?.hash) return;
@@ -1534,7 +1518,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
   };
 
   if (!status?.isRepo) {
-    if (projectPath && (statusLoading || hydratedStateKeyRef.current !== panelStateKey)) {
+    if (projectPath && (statusLoading || hydratedStateKey !== panelStateKey)) {
       return (
         <button
           disabled
@@ -1611,9 +1595,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
       : activeCommitHash
         ? 'Commit preview'
         : 'Select a commit';
-  const generateDisabled = generating || committing || selectedCount === 0 || status.changedCount === 0;
-  const commitDisabled = committing || selectedCount === 0 || !summary.trim();
-  const gitRunAfterOwnerTabId = `git-panel:${projectId || projectPath || effectiveRepoPath || 'repo'}`;
+  const runAfterOperationRunning = runAfterTask?.phase === 'running';
+  const generateDisabled = generating || committing || runAfterOperationRunning || selectedCount === 0 || status.changedCount === 0;
+  const commitDisabled = committing || runAfterOperationRunning || selectedCount === 0 || !summary.trim();
+  const gitRunAfterOwnerTabId = `git-panel:${runAfterProjectKey || 'repo'}`;
   const gitRunAfterStatusAction = runAfterAction || runAfterRunningAction || runAfterSuccessAction;
   const gitRunAfterLabel = gitRunAfterStatusAction ? gitRunAfterActionLabel(gitRunAfterStatusAction) : '';
   const gitRunAfterStatusPhase: GitRunAfterStatusPhase = runAfterRunningAction

@@ -1,0 +1,21 @@
+{
+  "name": "@noted/file-explorer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./styles.css": "./src/styles.css",
+    "./sidebar-layout": "./src/sidebarLayout.js",
+    "./main/shared-layout-store": "./main/shared-layout-store.cjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.*"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "react-dom": ">=18",
+    "@atlaskit/pragmatic-drag-and-drop": ">=1.7.0",
+    "@atlaskit/pragmatic-drag-and-drop-hitbox": ">=1.1.0"
+  }
+}

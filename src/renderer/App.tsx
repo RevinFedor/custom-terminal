@@ -21,6 +21,7 @@ import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 // Initialize debug logger (exposes `debug` helper in console)
 import './utils/logger';
 import { usePromptQueueRunner } from './hooks/usePromptQueueRunner';
+import { useGitRunAfterRunner } from './hooks/useGitRunAfterRunner';
 import { markPendingResume } from './utils/pendingResume';
 import {
   getClaudePtyPresence,
@@ -774,6 +775,10 @@ function App() {
   // and kill the runner). See hooks/usePromptQueueRunner.ts comment for the bug
   // it fixes (auto-run silently breaking the moment user goes to another tab).
   usePromptQueueRunner();
+
+  // Git Run-after is project-scoped but must keep listening while the user is
+  // viewing another project or Dashboard. The App-root runner owns that lifetime.
+  useGitRunAfterRunner();
 
   // Broadcast per-tab queue deltas to any connected phone (queue-update SSE).
   // Pure mirror — fires only when a connected mobile cares; no-op otherwise.

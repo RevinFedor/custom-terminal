@@ -5,8 +5,10 @@ import { usePromptsStore, AIPrompt } from '../../store/usePromptsStore';
 const { ipcRenderer } = window.require('electron');
 
 interface Prompt {
+  id?: string;
   title: string;
   content: string;
+  visual_parent_id?: string | null;
 }
 
 export default function PromptsPanel() {
@@ -51,7 +53,7 @@ export default function PromptsPanel() {
   };
 
   const addPrompt = () => {
-    const newPrompts = [...prompts, { title: `Prompt ${prompts.length + 1}`, content: '' }];
+    const newPrompts = [...prompts, { id: `prompt-${Date.now().toString(36)}`, title: `Prompt ${prompts.length + 1}`, content: '' }];
     savePrompts(newPrompts);
     setEditingPrompt(newPrompts.length - 1);
   };

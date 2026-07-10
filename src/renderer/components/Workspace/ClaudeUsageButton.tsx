@@ -175,6 +175,11 @@ interface CodexUsageAccount {
   timestamp?: string | null;
   source?: string | null;
   sourceThreadId?: string | null;
+  isCurrent?: boolean;
+  stale?: boolean;
+  lastError?: string | null;
+  warning?: string | null;
+  lastAttemptAt?: number | null;
   usage: CodexUsageData;
 }
 interface CodexUsageResponse {
@@ -183,11 +188,14 @@ interface CodexUsageResponse {
   data?: CodexUsageData | null;
   accounts?: CodexUsageAccount[];
   selectedAccountKey?: string | null;
+  currentAccountKey?: string | null;
   source?: string | null;
   refreshing?: boolean;
   stale?: boolean;
   cacheAgeMs?: number | null;
   lastAttemptAt?: number | null;
+  lastSuccessAt?: string | null;
+  warning?: string | null;
 }
 
 const CODEX_USAGE_ACCOUNT_STORAGE_KEY = 'noted.codexUsage.accountKey';
@@ -207,6 +215,53 @@ function storeCodexUsageAccountKey(value: string | null) {
   } catch {
     // localStorage is a convenience for this view, not the source of truth.
   }
+}
+
+const CODEX_USAGE_IPC_DEADLINE_MS = 12_000;
+
+function invokeCodexUsage(payload: Record<string, unknown>): Promise<CodexUsageResponse> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error('Codex usage refresh timed out'));
+    }, CODEX_USAGE_IPC_DEADLINE_MS);
+
+    ipcRenderer.invoke('codex:get-usage', payload).then(
+      (value: CodexUsageResponse) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (reason: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(reason);
+      }
+    );
+  });
+}
+
+function codexUsageSourceLabel(source: string | null | undefined): string {
+  if (source === 'openai-usage-api') return 'OpenAI';
+  if (source === 'active-session-rollout') return 'Codex session';
+  if (source === 'codex-log' || source === 'account-log') return 'Local Codex cache';
+  if (source === 'latest-rollout-unverified') return 'Unverified local cache';
+  return 'Unknown source';
+}
+
+function formatSnapshotAge(timestamp: string | null | undefined): string {
+  if (!timestamp) return 'unknown time';
+  const ms = Date.parse(timestamp);
+  if (!Number.isFinite(ms)) return 'unknown time';
+  const ageMs = Math.max(0, Date.now() - ms);
+  if (ageMs < 60_000) return 'just now';
+  if (ageMs < 60 * 60_000) return `${Math.floor(ageMs / 60_000)}m ago`;
+  if (ageMs < 24 * 60 * 60_000) return `${Math.floor(ageMs / (60 * 60_000))}h ago`;
+  return formatResetDateTime(timestamp);
 }
 
 function formatUsd(amount: number | null | undefined): string {
@@ -1683,14 +1738,18 @@ function CodexUsageChip() {
   const [accounts, setAccounts] = useState<CodexUsageAccount[]>([]);
   const [selectedAccountKey, setSelectedAccountKey] = useState<string | null>(() => loadStoredCodexUsageAccountKey());
   const [error, setError] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [backgroundRefreshing, setBackgroundRefreshing] = useState(false);
+  const [source, setSource] = useState<string | null>(null);
+  const [stale, setStale] = useState(false);
+  const [lastSuccessAt, setLastSuccessAt] = useState<string | null>(null);
+  const [currentAccountKey, setCurrentAccountKey] = useState<string | null>(null);
   const [activity, setActivity] = useState<ActivityResponse | null>(null);
   const [activityLoading, setActivityLoading] = useState(false);
   const [activityExpanded, setActivityExpanded] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
-  const refreshRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const refreshSeqRef = useRef(0);
+  const refreshContextRef = useRef('');
 
   const activeTabId = useWorkspaceStore((s) => s.getEffectiveTabId());
   const activeCodexSessionId = useWorkspaceStore((s) => {
@@ -1710,32 +1769,31 @@ function CodexUsageChip() {
     return null;
   });
 
+  const refreshContext = `${selectedAccountKey || ''}|${activeCodexSessionId || ''}|${activeCodexCwd || ''}`;
+  refreshContextRef.current = refreshContext;
+
   const refresh = useCallback(async (force = false) => {
     const seq = ++refreshSeqRef.current;
+    const requestedContext = `${selectedAccountKey || ''}|${activeCodexSessionId || ''}|${activeCodexCwd || ''}`;
     setLoading(true);
     try {
-      const res: CodexUsageResponse = await ipcRenderer.invoke('codex:get-usage', {
+      const res = await invokeCodexUsage({
         accountKey: selectedAccountKey,
         force,
         sessionId: activeCodexSessionId || undefined,
         cwd: activeCodexCwd || undefined,
       });
-      if (seq !== refreshSeqRef.current) return;
+      if (seq !== refreshSeqRef.current || requestedContext !== refreshContextRef.current) return;
       if (res?.success) {
         const nextAccounts = Array.isArray(res.accounts) ? res.accounts : [];
-        const isRefreshing = !!res.refreshing;
-        setBackgroundRefreshing(isRefreshing);
-        if (nextAccounts.length > 0 || !isRefreshing) {
-          setAccounts(nextAccounts);
-        }
-        if (res.data || !isRefreshing) {
-          setData(res.data || null);
-        }
-        if (res.error && !res.data && nextAccounts.length === 0) {
-          setError(res.error);
-        } else {
-          setError(null);
-        }
+        setAccounts(nextAccounts);
+        setData(res.data || null);
+        setError(res.error || null);
+        setWarning(res.warning || null);
+        setSource(res.source || null);
+        setStale(!!res.stale);
+        setLastSuccessAt(res.lastSuccessAt || res.data?.timestamp || null);
+        setCurrentAccountKey(res.currentAccountKey || null);
         const nextKey = res.selectedAccountKey || nextAccounts[0]?.accountKey || null;
         if (nextAccounts.length > 0 && nextKey !== selectedAccountKey) {
           setSelectedAccountKey(nextKey);
@@ -1743,31 +1801,22 @@ function CodexUsageChip() {
         }
         const selected = nextAccounts.find((account) => account.accountKey === nextKey);
         const usage = selected?.usage || res.data || null;
-        const weeklyPct = usage?.seven_day?.utilization ?? usage?.secondary?.utilization ?? null;
-        const fiveHourPct = usage?.five_hour?.utilization ?? usage?.primary?.utilization ?? null;
+        const weeklyPct = usage?.seven_day?.utilization ?? null;
+        const fiveHourPct = usage?.five_hour?.utilization ?? null;
         console.log(
-          `[CodexUsage] refresh ok source=${res.source || 'unknown'} account=${selected?.label || 'latest'} accounts=${nextAccounts.length} weekly=${weeklyPct ?? 'null'} fiveHour=${fiveHourPct ?? 'null'} refreshing=${isRefreshing ? 1 : 0} stale=${res.stale ? 1 : 0} force=${force} session=${activeCodexSessionId ? activeCodexSessionId.slice(0, 8) : 'none'}`
+          `[CodexUsage] refresh ok source=${res.source || 'unknown'} account=${selected?.label || 'latest'} accounts=${nextAccounts.length} weekly=${weeklyPct ?? 'null'} fiveHour=${fiveHourPct ?? 'null'} refreshing=0 stale=${res.stale ? 1 : 0} force=${force} session=${activeCodexSessionId ? activeCodexSessionId.slice(0, 8) : 'none'}`
         );
-        if (!isRefreshing && refreshRetryRef.current) {
-          clearTimeout(refreshRetryRef.current);
-          refreshRetryRef.current = null;
-        }
-        if (isRefreshing && !refreshRetryRef.current) {
-          refreshRetryRef.current = setTimeout(() => {
-            refreshRetryRef.current = null;
-            if (document.visibilityState === 'visible') {
-              refresh(false);
-            }
-          }, 1500);
-        }
       } else {
-        setBackgroundRefreshing(false);
         setError(res?.error || 'Failed to read Codex usage');
+        setWarning(null);
+        setStale(true);
         console.warn(`[CodexUsage] refresh failed error=${res?.error || 'unknown'} force=${force}`);
       }
     } catch (e: any) {
-      setBackgroundRefreshing(false);
+      if (seq !== refreshSeqRef.current || requestedContext !== refreshContextRef.current) return;
       setError(e?.message || String(e));
+      setWarning(null);
+      setStale(true);
       console.warn(`[CodexUsage] refresh exception error=${e?.message || String(e)} force=${force}`);
     } finally {
       if (seq === refreshSeqRef.current) {
@@ -1778,10 +1827,7 @@ function CodexUsageChip() {
 
   useEffect(() => {
     return () => {
-      if (refreshRetryRef.current) {
-        clearTimeout(refreshRetryRef.current);
-        refreshRetryRef.current = null;
-      }
+      refreshSeqRef.current += 1;
     };
   }, []);
 
@@ -1879,8 +1925,8 @@ function CodexUsageChip() {
 
   const selectedAccount = accounts.find((account) => account.accountKey === selectedAccountKey) || accounts[0] || null;
   const usageData = selectedAccount?.usage || data;
-  const weekly = usageData?.seven_day || usageData?.secondary || null;
-  const fiveHour = usageData?.five_hour || usageData?.primary || null;
+  const weekly = usageData?.seven_day || null;
+  const fiveHour = usageData?.five_hour || null;
   const weeklyUsedPct = weekly?.utilization ?? null;
   const fiveHourUsedPct = fiveHour?.utilization ?? null;
   const weeklyLeftPct = pctRemaining(weeklyUsedPct);
@@ -1891,16 +1937,37 @@ function CodexUsageChip() {
   const fiveHourResetShort = formatResetShort(fiveHour?.resets_at);
   const resetTextColor = '#bbb';
   const accountLabel = selectedAccount?.label || null;
-  const refreshVisualLoading = loading || backgroundRefreshing;
+  const selectedSource = selectedAccount?.source || source;
+  const selectedStale = selectedAccount?.stale ?? stale;
+  const selectedIsCurrent = !!selectedAccount?.accountKey
+    && (selectedAccount.isCurrent || selectedAccount.accountKey === currentAccountKey);
+  const hasCurrentAccount = !!currentAccountKey
+    && accounts.some((account) => account.accountKey === currentAccountKey);
+  const canRetryMissingCurrentAccount = !!currentAccountKey && !hasCurrentAccount;
+  const refreshDisabled = loading
+    || (!!selectedAccount && !selectedIsCurrent && !canRetryMissingCurrentAccount);
+  const snapshotTimestamp = selectedAccount?.timestamp || lastSuccessAt || usageData?.timestamp || null;
+  const refreshVisualLoading = loading;
 
   const selectAccount = (account: CodexUsageAccount) => {
     if (!account?.accountKey) return;
+    refreshSeqRef.current += 1;
+    refreshContextRef.current = `${account.accountKey}|${activeCodexSessionId || ''}|${activeCodexCwd || ''}`;
+    setLoading(false);
     setSelectedAccountKey(account.accountKey);
     storeCodexUsageAccountKey(account.accountKey);
     setData(account.usage || null);
-    setError(null);
-    const accountWeekly = account.usage?.seven_day?.utilization ?? account.usage?.secondary?.utilization ?? null;
-    const accountFiveHour = account.usage?.five_hour?.utilization ?? account.usage?.primary?.utilization ?? null;
+    setError(account.lastError || null);
+    setSource(account.source || null);
+    setStale(!!account.stale);
+    setLastSuccessAt(account.timestamp || account.usage?.timestamp || null);
+    const accountIsCurrent = !!account.accountKey
+      && (account.isCurrent || account.accountKey === currentAccountKey);
+    setWarning(!accountIsCurrent && account.stale
+      ? 'Selected account is not the current Codex login. Showing its last known value.'
+      : (accountIsCurrent ? (account.warning || null) : null));
+    const accountWeekly = account.usage?.seven_day?.utilization ?? null;
+    const accountFiveHour = account.usage?.five_hour?.utilization ?? null;
     console.log(
       `[CodexUsage] account selected account=${account.label} weekly=${accountWeekly ?? 'null'} fiveHour=${accountFiveHour ?? 'null'}`
     );
@@ -1912,9 +1979,9 @@ function CodexUsageChip() {
         onClick={() => setClicked(v => !v)}
         onMouseEnter={() => setTriggerHover(true)}
         onMouseLeave={() => setTriggerHover(false)}
-        title={weeklyUsedPct != null
-          ? `Codex${accountLabel ? ` ${accountLabel}` : ''} weekly left: ${formatPct(weeklyLeftPct)} (used ${formatPct(weeklyUsedPct)}) • 5-hour left: ${formatPct(fiveHourLeftPct)} (used ${formatPct(fiveHourUsedPct)})${resetShort ? ` • weekly resets in ${resetShort}` : ''}${fiveHourResetShort ? ` • 5-hour resets in ${fiveHourResetShort}` : ''}${backgroundRefreshing ? ' • updating' : ''}`
-          : (backgroundRefreshing ? 'Codex usage is updating' : (error || 'Codex usage appears after Codex writes a token_count record'))}
+        title={weeklyUsedPct != null || fiveHourUsedPct != null
+          ? `Codex${accountLabel ? ` ${accountLabel}` : ''} weekly left: ${formatPct(weeklyLeftPct)} (used ${formatPct(weeklyUsedPct)}) • 5-hour left: ${formatPct(fiveHourLeftPct)} (used ${formatPct(fiveHourUsedPct)})${resetShort ? ` • weekly resets in ${resetShort}` : ''}${fiveHourResetShort ? ` • 5-hour resets in ${fiveHourResetShort}` : ''}${loading ? ' • updating' : ''}${selectedStale ? ' • stale' : ''}`
+          : (loading ? 'Codex usage is updating' : (error || 'Codex usage is unavailable'))}
         style={{
           display: 'inline-flex',
           alignItems: 'center',
@@ -1967,7 +2034,8 @@ function CodexUsageChip() {
             position: 'absolute',
             top: 'calc(100% + 4px)',
             right: 0,
-            width: 320,
+            width: 360,
+            maxWidth: 'calc(100vw - 16px)',
             background: '#161616',
             border: '1px solid rgba(255,255,255,0.12)',
             borderRadius: 6,
@@ -1996,16 +2064,18 @@ function CodexUsageChip() {
               }}>
                 {accounts.map((account, idx) => {
                   const active = account.accountKey === (selectedAccount?.accountKey || selectedAccountKey);
-                  const accountWeeklyUsed = account.usage?.seven_day?.utilization ?? account.usage?.secondary?.utilization ?? null;
-                  const accountFiveHourUsed = account.usage?.five_hour?.utilization ?? account.usage?.primary?.utilization ?? null;
+                  const accountWeeklyUsed = account.usage?.seven_day?.utilization ?? null;
+                  const accountFiveHourUsed = account.usage?.five_hour?.utilization ?? null;
                   const accountWeeklyLeft = pctRemaining(accountWeeklyUsed);
                   const accountFiveHourLeft = pctRemaining(accountFiveHourUsed);
-                  const color = colorForPct(accountWeeklyUsed);
+                  const accountIsCurrent = !!account.accountKey
+                    && (account.isCurrent || account.accountKey === currentAccountKey);
+                  const color = accountIsCurrent ? '#4ade80' : '#555';
                   return (
                     <button
                       key={account.accountKey || idx}
                       onClick={(e) => { e.stopPropagation(); selectAccount(account); }}
-                      title={`${account.label} • weekly left ${formatPct(accountWeeklyLeft)} (used ${formatPct(accountWeeklyUsed)}) • 5-hour left ${formatPct(accountFiveHourLeft)} (used ${formatPct(accountFiveHourUsed)})${account.plan_type ? ` • ${account.plan_type}` : ''}`}
+                      title={`${account.label} • weekly left ${formatPct(accountWeeklyLeft)} (used ${formatPct(accountWeeklyUsed)}) • 5-hour left ${formatPct(accountFiveHourLeft)} (used ${formatPct(accountFiveHourUsed)})${account.plan_type ? ` • ${account.plan_type}` : ''}${account.isCurrent || account.accountKey === currentAccountKey ? ' • current Codex login' : ''}${account.stale ? ' • stale' : ''}`}
                       style={{
                         height: 20,
                         maxWidth: 132,
@@ -2029,7 +2099,7 @@ function CodexUsageChip() {
                         height: 6,
                         borderRadius: 999,
                         background: color,
-                        boxShadow: active ? `0 0 8px ${color}66` : 'none',
+                        boxShadow: accountIsCurrent ? `0 0 8px ${color}66` : 'none',
                         flexShrink: 0,
                       }} />
                       <span style={{
@@ -2074,31 +2144,32 @@ function CodexUsageChip() {
             </span>
             <button
               onClick={(e) => { e.stopPropagation(); refresh(true); }}
-              disabled={loading}
+              disabled={refreshDisabled}
               style={{
                 background: 'transparent',
                 border: 'none',
-                color: loading ? '#555' : (backgroundRefreshing ? '#aaa' : '#888'),
-                cursor: loading ? 'default' : 'pointer',
+                color: refreshDisabled ? '#555' : '#888',
+                cursor: refreshDisabled ? 'default' : 'pointer',
                 padding: 2,
                 display: 'inline-flex',
                 alignItems: 'center',
                 gap: 4,
                 fontSize: 10,
               }}
-              title="Refresh Codex usage"
+              title={selectedAccount && !selectedIsCurrent
+                ? (canRetryMissingCurrentAccount
+                  ? 'Retry current Codex login usage'
+                  : 'Sign in to this Codex account to refresh it')
+                : 'Refresh Codex usage'}
             >
               <RefreshCw size={11} style={{ animation: refreshVisualLoading ? 'spin 1s linear infinite' : 'none' }} />
-              {backgroundRefreshing && !loading ? 'updating' : 'refresh'}
+              {loading ? 'updating' : 'refresh'}
             </button>
           </div>
 
-          {error && !usageData && (
-            <div style={{ padding: '12px', fontSize: 11, color: '#f87171' }}>
-              {error}
-              <div style={{ marginTop: 6, color: '#666' }}>
-                Run Codex until it writes a token count, then refresh.
-              </div>
+          {(error || warning) && (
+            <div style={{ padding: '8px 12px', fontSize: 11, color: error ? '#f87171' : '#d6a34a' }}>
+              {error || warning}
             </div>
           )}
 
@@ -2106,19 +2177,19 @@ function CodexUsageChip() {
             <>
               <ProgressRow
                 label="Weekly left (Codex)"
-                pct={weeklyUsedPct}
+                pct={weeklyLeftPct}
                 displayPct={weeklyLeftPct}
                 colorPct={weeklyUsedPct}
                 resetsAt={weekly?.resets_at}
               />
               <ProgressRow
                 label="5-hour left"
-                pct={fiveHourUsedPct}
+                pct={fiveHourLeftPct}
                 displayPct={fiveHourLeftPct}
                 colorPct={fiveHourUsedPct}
                 resetsAt={fiveHour?.resets_at}
               />
-              {(usageData.plan_type || usageData.limit_id || usageData.timestamp) && (
+              {(usageData.plan_type || usageData.limit_id) && (
                 <div style={{
                   padding: '6px 12px',
                   borderTop: '1px solid rgba(255,255,255,0.07)',
@@ -2130,10 +2201,32 @@ function CodexUsageChip() {
                 }}>
                   <span>Plan</span>
                   <span style={{ color: '#aaa', fontFamily: 'ui-monospace, monospace' }}>
-                    {[usageData.plan_type, usageData.limit_id, usageData.timestamp ? formatResetDateTime(usageData.timestamp) : null].filter(Boolean).join(' · ')}
+                    {[usageData.plan_type, usageData.limit_id].filter(Boolean).join(' · ')}
                   </span>
                 </div>
               )}
+              <div style={{
+                padding: '6px 12px',
+                borderTop: '1px solid rgba(255,255,255,0.07)',
+                fontSize: 10,
+                color: '#777',
+                display: 'flex',
+                justifyContent: 'space-between',
+                gap: 8,
+              }}>
+                <span>Source</span>
+                <span style={{
+                  color: selectedStale ? '#d6a34a' : '#aaa',
+                  fontFamily: 'ui-monospace, monospace',
+                  minWidth: 0,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  textAlign: 'right',
+                }}>
+                  {codexUsageSourceLabel(selectedSource)} · {formatSnapshotAge(snapshotTimestamp)}{selectedStale ? ' · stale' : ''}{selectedIsCurrent ? ' · current' : ''}
+                </span>
+              </div>
             </>
           ) : !error ? (
             <div style={{ padding: '12px', fontSize: 11, color: '#666' }}>

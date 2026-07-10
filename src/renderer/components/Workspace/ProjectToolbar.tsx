@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
-import { Home, Minimize2, RotateCcw, Globe, PanelLeft, FileEdit, RefreshCw, Sparkles, Settings2, Check } from 'lucide-react';
+import { Home, Minimize2, RotateCcw, Globe, PanelLeft, FileEdit, RefreshCw, Sparkles, Settings2, Check, ListTree } from 'lucide-react';
 import { VscVscode } from 'react-icons/vsc';
 import { useUIStore } from '../../store/useUIStore';
 import Tooltip from '../UI/Tooltip';
@@ -14,6 +14,12 @@ import ClaudeUsageButton from './ClaudeUsageButton';
 import GitStatusButton from './GitStatusButton';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
+import {
+  timelineOutlineKey,
+  timelineOutlineNewCount,
+  useTimelineOutlineStore,
+  type TimelineOutlineTarget,
+} from '../../store/useTimelineOutlineStore';
 import { isInboxProjectId } from '../../constants/systemProjects';
 
 const { ipcRenderer } = window.require('electron');
@@ -172,6 +178,64 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
   const summaryRunning = summaryProgress?.running === true;
   const summaryAutoEffective = summaryGlobalAuto || summaryTabAuto;
 
+  const outlineTargetKey = useWorkspaceStore((state) => {
+    const projectId = state.activeProjectId;
+    if (!projectId) return '';
+    const workspace = state.openProjects.get(projectId);
+    if (!workspace) return '';
+    const effectiveId = state.getEffectiveTabId();
+    const tab = effectiveId ? workspace.tabs.get(effectiveId) : null;
+    if (!tab || tab.tabType === 'browser') return '';
+    let toolType: TimelineSummaryTool | null = null;
+    let sessionId = '';
+    if (tab.commandType === 'codex' && tab.codexSessionId) {
+      toolType = 'codex';
+      sessionId = tab.codexSessionId;
+    } else if (tab.commandType === 'claude' && tab.claudeSessionId) {
+      toolType = 'claude';
+      sessionId = tab.claudeSessionId;
+    } else if (tab.codexSessionId) {
+      toolType = 'codex';
+      sessionId = tab.codexSessionId;
+    } else if (tab.claudeSessionId) {
+      toolType = 'claude';
+      sessionId = tab.claudeSessionId;
+    }
+    if (!toolType || !sessionId || !effectiveId) return '';
+    return JSON.stringify({
+      tabId: effectiveId,
+      tabName: tab.name || null,
+      toolType,
+      sessionId,
+      cwd: tab.cwd || workspace.projectPath || '',
+      projectId,
+    });
+  });
+  const outlineTarget = useMemo<TimelineOutlineTarget | null>(() => {
+    if (!outlineTargetKey) return null;
+    try {
+      const parsed = JSON.parse(outlineTargetKey) as TimelineOutlineTarget;
+      return parsed.tabId && parsed.toolType && parsed.sessionId ? parsed : null;
+    } catch {
+      return null;
+    }
+  }, [outlineTargetKey]);
+  const outlineKey = outlineTarget
+    ? timelineOutlineKey(outlineTarget.toolType, outlineTarget.sessionId)
+    : '';
+  const outline = useTimelineOutlineStore((state) => outlineKey ? state.outlines[outlineKey] : undefined);
+  const outlineEligibleUuids = useTimelineOutlineStore((state) => outlineKey ? state.eligibleUuidsByKey[outlineKey] : undefined);
+  const outlineGenerating = useTimelineOutlineStore((state) => outlineKey ? state.generatingKeys.has(outlineKey) : false);
+  const outlineError = useTimelineOutlineStore((state) => outlineKey ? state.errorsByKey[outlineKey] : '');
+  const loadTimelineOutline = useTimelineOutlineStore((state) => state.loadOutline);
+  const generateTimelineOutline = useTimelineOutlineStore((state) => state.generateOutline);
+  const outlineNewCount = timelineOutlineNewCount(outline, outlineEligibleUuids);
+
+  useEffect(() => {
+    if (!outlineTarget) return;
+    void loadTimelineOutline(outlineTarget.toolType, outlineTarget.sessionId);
+  }, [outlineTarget?.toolType, outlineTarget?.sessionId, loadTimelineOutline]);
+
   const summaryChipStyle = (active: boolean, disabled = false): React.CSSProperties => ({
     height: 22,
     minWidth: 32,
@@ -189,6 +253,15 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
     cursor: disabled ? 'default' : 'pointer',
     opacity: disabled ? 0.62 : 1,
     fontVariantNumeric: 'tabular-nums',
+  });
+
+  const outlineChipStyle = (disabled = false): React.CSSProperties => ({
+    ...summaryChipStyle(!!outline, disabled),
+    minWidth: 56,
+    gap: 5,
+    border: `1px solid ${outline ? 'rgba(192,132,252,0.65)' : 'rgba(255,255,255,0.12)'}`,
+    background: outline ? 'rgba(168,85,247,0.15)' : 'rgba(255,255,255,0.04)',
+    color: outline ? '#e9d5ff' : '#a1a1aa',
   });
 
   useEffect(() => {
@@ -257,6 +330,27 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
       detail: { tabId: summaryTarget.tabId },
     }));
   }, [summaryTarget, summaryRunning]);
+
+  const handleGenerateTimelineOutline = useCallback(async () => {
+    if (!outlineTarget || outlineGenerating) return;
+    const record = await generateTimelineOutline({
+      ...outlineTarget,
+      projectName: currentProjectName || null,
+    });
+    if (!record) {
+      const message = useTimelineOutlineStore.getState().errorsByKey[
+        timelineOutlineKey(outlineTarget.toolType, outlineTarget.sessionId)
+      ] || outlineError || 'Не удалось сгруппировать Timeline';
+      showToast(message, 'error');
+      return;
+    }
+    const count = record.outline.groups.length;
+    const tokens = Number(record.promptTokens || 0);
+    showToast(
+      `${count} ${count === 1 ? 'группа' : count < 5 ? 'группы' : 'групп'}${tokens > 0 ? ` · ${tokens.toLocaleString('ru-RU')} входных токенов` : ''}`,
+      'success'
+    );
+  }, [outlineTarget, outlineGenerating, generateTimelineOutline, currentProjectName, outlineError, showToast]);
 
   // Get interrupted tabs for CURRENT project only
   const interruptedTabs = useMemo(() => {
@@ -743,6 +837,21 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
           (same source as Blimp-Labs claude-usage-bar). Sits left of Dictation
           history; popover opens DOWN with full 5h/7d/extra-credits breakdown. */}
       <div className="flex items-center gap-1 pr-2">
+        <Tooltip content={outline
+          ? `Пересобрать группы всей текущей сессии${outlineNewCount > 0 ? ` · новых ходов: ${outlineNewCount}` : ''}`
+          : 'Сгруппировать весь Timeline текущей сессии'}>
+          <button
+            onClick={handleGenerateTimelineOutline}
+            disabled={!outlineTarget || outlineGenerating}
+            style={outlineChipStyle(!outlineTarget || outlineGenerating)}
+          >
+            <ListTree size={12} className={outlineGenerating ? 'animate-pulse text-purple-300' : ''} />
+            <span>{outlineGenerating ? 'groups…' : 'groups'}</span>
+            {!outlineGenerating && outlineNewCount > 0 && (
+              <span style={{ color: '#f0abfc', fontVariantNumeric: 'tabular-nums' }}>+{outlineNewCount}</span>
+            )}
+          </button>
+        </Tooltip>
         <Tooltip content="Обновить пересказы user prompts в текущей сессии">
           <button
             onClick={handleRefreshPromptSummaries}

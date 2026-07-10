@@ -1,8 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
-import { CheckSquare, ChevronLeft, History, PanelRightClose, PanelRightOpen, Plus, RefreshCw, Square, Trash2 } from 'lucide-react';
-import { buildQueuedPromptPayload, countEnabledQueuedPrompts, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, usePromptQueueStore, type QueuedPrompt } from '../../store/usePromptQueueStore';
+import { CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Plus, RefreshCw, Square, Trash2, TriangleAlert } from 'lucide-react';
+import { buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedPromptAttachmentState, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, usePromptQueueStore, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -877,7 +877,6 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       console.log('[PromptQueue] replay ignored inflight tab=' + tabId.slice(-8) + ' item=' + id.slice(-8));
       return;
     }
-    const payload = buildQueuedPromptPayload(item);
     replayingIdsRef.current.add(id);
     setReplayingIds((prev) => {
       if (prev.has(id)) return prev;
@@ -886,6 +885,13 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       return next;
     });
     try {
+      const validation = await ensureQueuedPromptImagesReady(tabId, id);
+      if (!validation.ready || !validation.item) {
+        showToast('Replay failed: image file is unavailable', 'error');
+        console.warn('[PromptQueue] replay blocked by attachment validation tab=' + tabId.slice(-8) + ' item=' + id.slice(-8));
+        return;
+      }
+      const payload = buildQueuedPromptPayload(validation.item);
       const submitNow = opts?.submit === true;
       console.log('[PromptQueue] replay start tab=' + tabId.slice(-8) + ' item=' + id.slice(-8) + ' agent=' + sessionType + ' submit=' + submitNow);
       focusActiveTerminal(submitNow ? 'replay-submit-before-ipc' : 'replay-before-ipc');
@@ -1512,6 +1518,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
             const isRemoving = removingIds.has(it.id);
             const isReplayHovered = replayHoverId === it.id;
             const isReplaySubmitMode = isReplayHovered && cmdPressed && !replayingIds.has(it.id);
+            const attachmentState = getQueuedPromptAttachmentState(it);
             const chipClass = [
               'pq-chip',
               appearingIds.has(it.id) ? 'pq-chip-enter' : '',
@@ -1558,7 +1565,9 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                   margin: '2px 5px',
                   border: isRemoveHovered
                     ? `1px solid ${DELETE_RED}`
-                    : (isEditing && editorPinned ? '1px solid rgba(190,190,190,0.34)' : `1px solid ${BORDER}`),
+                    : (attachmentState === 'missing'
+                      ? `1px solid ${DELETE_RED}99`
+                      : (isEditing && editorPinned ? '1px solid rgba(190,190,190,0.34)' : `1px solid ${BORDER}`)),
                   borderRadius: 7,
                   background: isRemoveHovered
                     ? `${DELETE_RED}18`
@@ -1678,7 +1687,30 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                 ) : (
                   <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: promptQueueChipFontSize, lineHeight: `${chipTextLineHeight}px`, color: isEnabled ? '#ddd' : DISABLED_PROMPT_TEXT }}>{title}</span>
                 )}
-                {it.images > 0 && <span style={{ color: TINT, fontSize: 9 }}>📎{it.images}</span>}
+                {it.images > 0 && (
+                  <span
+                    title={attachmentState === 'missing'
+                      ? 'Image file is unavailable'
+                      : (attachmentState === 'materializing' ? 'Saving image…' : `${it.images} image${it.images === 1 ? '' : 's'}`)}
+                    style={{
+                      color: attachmentState === 'missing' ? DELETE_RED : (attachmentState === 'materializing' ? '#eab308' : TINT),
+                      fontSize: 9,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 2,
+                      flexShrink: 0,
+                      minWidth: 18,
+                      height: 12,
+                    }}
+                  >
+                    {attachmentState === 'missing'
+                      ? <TriangleAlert size={10} strokeWidth={2} />
+                      : (attachmentState === 'materializing'
+                        ? <LoaderCircle size={10} strokeWidth={2} className="pq-spin-icon" />
+                        : <Paperclip size={10} strokeWidth={2} />)}
+                    <span>{it.images}</span>
+                  </span>
+                )}
                 <button
                   data-chip-action="remove"
                   onMouseEnter={() => setRemoveHoverId(it.id)}
@@ -2067,6 +2099,9 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
           border-right-color: transparent;
           animation: pq-spin 1.35s linear infinite;
           display: inline-block;
+        }
+        .pq-spin-icon {
+          animation: pq-spin 1.35s linear infinite;
         }
         .pq-panel-opening {
           transform-origin: right top;

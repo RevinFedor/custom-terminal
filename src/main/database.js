@@ -28,6 +28,7 @@ class DatabaseManager {
     this.ensureTabTitlePrompt();
     this.ensureRunAfterTitlePrompt();
     this.ensurePromptSummaryPrompt();
+    this.ensureTimelineGroupingPrompt();
     this.ensureGitCommitPrompt();
   }
 
@@ -87,6 +88,14 @@ class DatabaseManager {
 
     // Migration: add file_paths to prompts (JSON array of absolute file paths)
     try { this.db.exec(`ALTER TABLE prompts ADD COLUMN file_paths TEXT DEFAULT NULL`); } catch (e) {}
+
+    // Durable identity is separate from the legacy AUTOINCREMENT row id because
+    // savePrompts rewrites the table. DnD must keep following the same prompt
+    // while array positions change during a preview.
+    try { this.db.exec(`ALTER TABLE prompts ADD COLUMN stable_id TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`UPDATE prompts SET stable_id = 'prompt-' || id WHERE stable_id IS NULL OR stable_id = ''`); } catch (e) {}
+    try { this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_prompts_stable_id ON prompts(stable_id) WHERE stable_id IS NOT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE prompts ADD COLUMN visual_parent_id TEXT DEFAULT NULL`); } catch (e) {}
 
     // Quick actions table
     this.db.exec(`
@@ -423,6 +432,36 @@ class DatabaseManager {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_timeline_prompt_summaries_updated
       ON timeline_prompt_summaries(updated_at DESC)
+    `);
+
+    // Generated semantic projection for the expanded Timeline. The canonical
+    // transcript remains JSONL; this row is disposable metadata keyed by the
+    // owning tool/session and can be rebuilt explicitly from the toolbar.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS timeline_outlines (
+        tool_type TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        source_hash TEXT NOT NULL,
+        source_uuids_json TEXT NOT NULL DEFAULT '[]',
+        source_entry_count INTEGER NOT NULL DEFAULT 0,
+        source_last_uuid TEXT DEFAULT NULL,
+        outline_json TEXT NOT NULL,
+        model TEXT DEFAULT NULL,
+        prompt_id TEXT DEFAULT NULL,
+        thinking_level TEXT DEFAULT NULL,
+        prompt_tokens INTEGER DEFAULT 0,
+        candidate_tokens INTEGER DEFAULT 0,
+        thought_tokens INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        source_chars INTEGER DEFAULT 0,
+        updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+        PRIMARY KEY (tool_type, session_id)
+      )
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_timeline_outlines_updated
+      ON timeline_outlines(updated_at DESC)
     `);
 
     this.db.exec(`
@@ -1208,6 +1247,7 @@ class DatabaseManager {
   getPrompts() {
     return this.db.prepare('SELECT * FROM prompts ORDER BY group_id NULLS LAST, position').all().map(row => ({
       ...row,
+      id: row.stable_id || `prompt-${row.id}`,
       file_paths: row.file_paths ? JSON.parse(row.file_paths) : []
     }));
   }
@@ -1220,8 +1260,21 @@ class DatabaseManager {
     }
     const transaction = this.db.transaction((list) => {
       this.db.prepare('DELETE FROM prompts').run();
-      const insert = this.db.prepare('INSERT INTO prompts (title, content, position, group_id, file_paths) VALUES (?, ?, ?, ?, ?)');
-      list.forEach((p, index) => insert.run(p.title, p.content, p.position != null ? p.position : index, p.group_id ?? null, p.file_paths && p.file_paths.length > 0 ? JSON.stringify(p.file_paths) : null));
+      const stableIds = new Set(list.map(p => String(p.id || '')).filter(Boolean));
+      const byStableId = new Map(list.map(p => [String(p.id || ''), p]));
+      const insert = this.db.prepare('INSERT INTO prompts (stable_id, title, content, position, group_id, file_paths, visual_parent_id) VALUES (?, ?, ?, ?, ?, ?, ?)');
+      list.forEach((p, index) => insert.run(
+        p.id || `prompt-${Date.now().toString(36)}-${index}`,
+        p.title,
+        p.content,
+        p.position != null ? p.position : index,
+        p.group_id ?? null,
+        p.file_paths && p.file_paths.length > 0 ? JSON.stringify(p.file_paths) : null,
+        p.visual_parent_id && stableIds.has(String(p.visual_parent_id))
+          && (byStableId.get(String(p.visual_parent_id))?.group_id ?? null) === (p.group_id ?? null)
+          ? String(p.visual_parent_id)
+          : null
+      ));
     });
     transaction(prompts);
   }
@@ -1356,6 +1409,88 @@ class DatabaseManager {
       Number(summary.candidateTokens || 0),
       Number(summary.thoughtTokens || 0),
       Number(summary.totalTokens || 0)
+    );
+    return true;
+  }
+
+  getTimelineOutline(toolType, sessionId) {
+    if (!toolType || !sessionId) return null;
+    const row = this.db.prepare(`
+      SELECT * FROM timeline_outlines
+      WHERE tool_type = ? AND session_id = ?
+      LIMIT 1
+    `).get(toolType, sessionId);
+    if (!row) return null;
+    try {
+      return {
+        toolType: row.tool_type,
+        sessionId: row.session_id,
+        schemaVersion: Number(row.schema_version || 1),
+        sourceHash: row.source_hash,
+        sourceUuids: JSON.parse(row.source_uuids_json || '[]'),
+        sourceEntryCount: Number(row.source_entry_count || 0),
+        sourceLastUuid: row.source_last_uuid || null,
+        outline: JSON.parse(row.outline_json),
+        model: row.model || null,
+        promptId: row.prompt_id || null,
+        thinkingLevel: row.thinking_level || null,
+        promptTokens: Number(row.prompt_tokens || 0),
+        candidateTokens: Number(row.candidate_tokens || 0),
+        thoughtTokens: Number(row.thought_tokens || 0),
+        totalTokens: Number(row.total_tokens || 0),
+        sourceChars: Number(row.source_chars || 0),
+        updatedAt: Number(row.updated_at || 0),
+      };
+    } catch (error) {
+      console.warn('[DB] Ignoring malformed Timeline outline:', error?.message || String(error));
+      return null;
+    }
+  }
+
+  saveTimelineOutline(row) {
+    if (!row?.toolType || !row?.sessionId || !row?.sourceHash || !row?.outline) return false;
+    const sourceUuids = Array.isArray(row.sourceUuids) ? row.sourceUuids.map(String) : [];
+    this.db.prepare(`
+      INSERT INTO timeline_outlines (
+        tool_type, session_id, schema_version, source_hash, source_uuids_json,
+        source_entry_count, source_last_uuid, outline_json, model, prompt_id,
+        thinking_level, prompt_tokens, candidate_tokens, thought_tokens,
+        total_tokens, source_chars, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+      ON CONFLICT(tool_type, session_id) DO UPDATE SET
+        schema_version = excluded.schema_version,
+        source_hash = excluded.source_hash,
+        source_uuids_json = excluded.source_uuids_json,
+        source_entry_count = excluded.source_entry_count,
+        source_last_uuid = excluded.source_last_uuid,
+        outline_json = excluded.outline_json,
+        model = excluded.model,
+        prompt_id = excluded.prompt_id,
+        thinking_level = excluded.thinking_level,
+        prompt_tokens = excluded.prompt_tokens,
+        candidate_tokens = excluded.candidate_tokens,
+        thought_tokens = excluded.thought_tokens,
+        total_tokens = excluded.total_tokens,
+        source_chars = excluded.source_chars,
+        updated_at = strftime('%s', 'now')
+    `).run(
+      row.toolType,
+      row.sessionId,
+      Number(row.schemaVersion || 1),
+      row.sourceHash,
+      JSON.stringify(sourceUuids),
+      Number(row.sourceEntryCount ?? sourceUuids.length),
+      row.sourceLastUuid || sourceUuids[sourceUuids.length - 1] || null,
+      JSON.stringify(row.outline),
+      row.model || null,
+      row.promptId || null,
+      row.thinkingLevel || null,
+      Number(row.promptTokens || row.countedInputTokens || 0),
+      Number(row.candidateTokens || 0),
+      Number(row.thoughtTokens || 0),
+      Number(row.totalTokens || 0),
+      Number(row.sourceChars || 0)
     );
     return true;
   }
@@ -1559,6 +1694,17 @@ class DatabaseManager {
         position: 7
       },
       {
+        id: 'timeline-grouping',
+        name: 'Timeline Grouping',
+        content: 'Group a chronological list of user turns into a compact semantic outline.\nA group is one concrete work phase with at least two contiguous turns.\nKeep the hierarchy flat, preserve chronological order, and leave uncertain or isolated turns ungrouped.\nNever cross an item marked boundaryBefore.\nUse short titles and descriptions in the predominant language of the supplied turns.\nMeta-prompt markers describe workflow actions; do not infer their omitted template body.',
+        model: 'gemini-3.1-flash-lite',
+        thinking_level: 'LOW',
+        color: '#c084fc',
+        is_built_in: 1,
+        show_in_context_menu: 0,
+        position: 8
+      },
+      {
         id: 'git-commit',
         name: 'Git Commit',
         content: 'You write concise Git commit messages for local commits.\nReturn only JSON with keys "summary" and "description".\n\nRules:\n- The summary must be one line, imperative mood when possible, no trailing period, under 72 characters.\n- The description may be empty. If non-empty, use 1-4 short lines with concrete facts.\n- Do not mention files that are not present in the provided changes.\n- If docs/ changed, base the commit message on changed docs files only when the prompt data says docs-only context was applied.\n- If docs/ did not change, use all included changes.',
@@ -1567,7 +1713,7 @@ class DatabaseManager {
         color: '#facc15',
         is_built_in: 1,
         show_in_context_menu: 0,
-        position: 8
+        position: 9
       }
     ];
 
@@ -1698,6 +1844,40 @@ class DatabaseManager {
     }
   }
 
+  // Ensure the user-owned AI configuration used by manual Timeline grouping.
+  // Only a missing row is inserted; Settings edits are never overwritten.
+  ensureTimelineGroupingPrompt() {
+    const exists = this.db.prepare('SELECT id FROM ai_prompts WHERE id = ?').get('timeline-grouping');
+    if (exists) return;
+    const nextPosition = Math.max(
+      8,
+      Number(this.db.prepare('SELECT MAX(position) AS max_position FROM ai_prompts').get()?.max_position ?? -1) + 1
+    );
+    const content = [
+      'Group a chronological list of user turns into a compact semantic outline.',
+      'A group is one concrete work phase with at least two contiguous turns.',
+      'Keep the hierarchy flat, preserve chronological order, and leave uncertain or isolated turns ungrouped.',
+      'Never cross an item marked boundaryBefore.',
+      'Use short titles and descriptions in the predominant language of the supplied turns.',
+      'Meta-prompt markers describe workflow actions; do not infer their omitted template body.',
+    ].join('\n');
+    this.db.prepare(`
+      INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'timeline-grouping',
+      'Timeline Grouping',
+      content,
+      'gemini-3.1-flash-lite',
+      'LOW',
+      '#c084fc',
+      1,
+      0,
+      nextPosition
+    );
+    console.log('[DB] Migrated: added timeline-grouping prompt');
+  }
+
   // Ensure built-in prompt for Git commit summary generation exists.
   // User edits are preserved; only missing row is inserted.
   ensureGitCommitPrompt() {
@@ -1716,7 +1896,7 @@ class DatabaseManager {
         '#facc15',
         1,
         0,
-        8
+        9
       );
       console.log('[DB] Migrated: added git-commit prompt');
     }

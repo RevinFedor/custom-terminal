@@ -20,6 +20,12 @@ try {
 const isInboxProjectId = (projectId) => projectId === '__noted_inbox__';
 let gitIpcModule = null;
 
+const sharedFileLayoutModulePath = app.isPackaged
+  ? path.join(process.resourcesPath, 'shared-packages', 'file-explorer', 'shared-layout-store.cjs')
+  : path.join(process.cwd(), 'packages', 'file-explorer', 'main', 'shared-layout-store.cjs');
+const { registerSharedFileLayoutIpc } = require(sharedFileLayoutModulePath);
+registerSharedFileLayoutIpc({ ipcMain, Database: require('better-sqlite3') });
+
 // Load .env file (works in both dev and packaged builds).
 // Production: prefer ~/.noted-terminal/.env (survives reinstall) and fall back
 // to the .env next to execPath if present. Dev: project cwd.
@@ -98,6 +104,13 @@ const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCa
 const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, getSessionMaterialization, deleteEffortEntries, trimTrailingEffortEntries, repairJsonlChainBreaks, _api: claudeDataApi } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
 const codexDataModule = require(path.join(srcMainDir, 'ipc', 'codex-data'));
 const { createSessionTranscriptService } = require(path.join(srcMainDir, 'session-transcript-service'));
+const { PromptQueueAssetStore, collectReferencedAssetIds } = require(path.join(srcMainDir, 'prompt-queue-assets'));
+const { CodexImageBindingRegistry } = require(path.join(srcMainDir, 'codex-image-bindings'));
+
+const promptQueueAssetStore = new PromptQueueAssetStore({
+  rootDir: path.join(app.getPath('userData'), 'prompt-queue-assets'),
+});
+const codexImageBindings = new CodexImageBindingRegistry();
 
 // SDK session registry — declared early so the mobile-web server can receive
 // the same Map by reference at startup (web-server.start({sdkSessions})).
@@ -3747,42 +3760,10 @@ let claudeHookServer = null;
 // the live CLI pid before firing Ctrl+G because there is no Claude SessionBridge.
 const grabInputPending = new Map(); // tabId → { resolve, timer }
 const grabInputPidToTab = new Map(); // cliPid → tabId, used by non-Claude external-editor grabs
-const codexSavedClipboardImagesByTab = new Map(); // tabId → [{ path, at }]
-const CODEX_STAGED_IMAGE_RETENTION_MS = 12 * 60 * 60 * 1000;
-const CODEX_STAGED_IMAGE_LIMIT = 96;
 
-function pruneCodexClipboardImagePaths(tabId, now = Date.now()) {
-  if (!tabId) return [];
-  const prev = codexSavedClipboardImagesByTab.get(tabId) || [];
-  const next = prev
-    .filter((entry) => entry && typeof entry.path === 'string' && now - Number(entry.at || 0) < CODEX_STAGED_IMAGE_RETENTION_MS)
-    .slice(-CODEX_STAGED_IMAGE_LIMIT);
-  if (next.length > 0) codexSavedClipboardImagesByTab.set(tabId, next);
-  else codexSavedClipboardImagesByTab.delete(tabId);
-  return next;
-}
-
-function rememberCodexClipboardImagePath(tabId, filePath) {
-  if (!tabId || !filePath) return;
-  const now = Date.now();
-  const next = pruneCodexClipboardImagePaths(tabId, now)
-    .concat({ path: filePath, at: now })
-    .slice(-CODEX_STAGED_IMAGE_LIMIT);
-  codexSavedClipboardImagesByTab.set(tabId, next);
-}
-
-function peekRecentCodexClipboardImagePaths(tabId, count) {
-  if (!tabId || count <= 0) return [];
-  return pruneCodexClipboardImagePaths(tabId).slice(-count);
-}
-
-function describeCodexClipboardImagePaths(tabId) {
-  const now = Date.now();
-  const entries = pruneCodexClipboardImagePaths(tabId, now);
-  if (entries.length === 0) return 'stored=0';
-  const oldestAgeSec = Math.round((now - Number(entries[0]?.at || now)) / 1000);
-  const newestAgeSec = Math.round((now - Number(entries[entries.length - 1]?.at || now)) / 1000);
-  return 'stored=' + entries.length + ' oldestAgeSec=' + oldestAgeSec + ' newestAgeSec=' + newestAgeSec;
+function stageCodexImageRefs(tabId, refs) {
+  const token = codexImageBindings.stage(tabId, refs);
+  return token ? { token, refs } : { token: null, refs: [] };
 }
 
 function findTabIdBySession(sessionId) {
@@ -4333,39 +4314,50 @@ function startClaudeHookServer() {
             if (Array.isArray(pending.pids)) pending.pids.forEach(pid => grabInputPidToTab.delete(pid));
             else if (pending.pid) grabInputPidToTab.delete(pending.pid);
             const images = (text.match(/\[Image(?:\s+#?\d+)?\]/g) || []).length;
-            let resolvedText = text;
-            let imageCountForQueue = images;
-            // Resolve [Image #N] placeholders → real files under
-            // ~/.claude/image-cache/<sessionId>/. Logged regardless of UI use so a
-            // missing file surfaces here (helps when Claude was restarted between
-            // paste and grab — image-cache for the OLD sessionId is left on disk
-            // but won't be touched by cleanupOldImageCaches until next boot).
-            let imagePaths = [];
-            if (images > 0) {
-              if (agent === 'codex') {
-                let replaced = 0;
-                let pathResolved = 0;
-                const recentImagePaths = peekRecentCodexClipboardImagePaths(tabId, images);
-                resolvedText = text.replace(/\[Image(?:\s+#?(\d+))?\]/g, (_match, id) => {
-                  const staged = recentImagePaths[replaced];
-                  replaced += 1;
-                  if (staged?.path) {
-                    pathResolved += 1;
-                    return '[imagePath: ' + staged.path + ']';
-                  }
-                  return '[imageError: codex_image_path_unavailable' + (id ? ' #' + id : '') + ']';
-                });
-                imageCountForQueue = 0;
-                console.warn('[GrabImages:Codex] tab=' + tabId.slice(-12) + ' refs=' + images + ' replaced=' + replaced + ' pathResolved=' + pathResolved + ' reason=external-editor-returned-placeholder ' + describeCodexClipboardImagePaths(tabId));
-              } else {
+            void (async () => {
+              let resolvedText = text;
+              let sourceRefs = [];
+              if (images > 0 && agent === 'codex') {
+                const exact = codexImageBindings.resolveGrab(tabId, text);
+                resolvedText = exact.text;
+                sourceRefs = exact.refs;
+                console.warn('[GrabImages:Codex] tab=' + tabId.slice(-12)
+                  + ' refs=' + images + ' pathResolved=' + exact.resolved + ' missing=' + exact.missing
+                  + ' mode=slot-binding');
+              } else if (agent === 'codex') {
+                codexImageBindings.resetComposer(tabId);
+              } else if (images > 0) {
                 const sid = bridgeKnownSessions.get(tabId) || null;
                 const resolved = resolveGrabbedImagePaths(sid, text);
-                imagePaths = resolved.filter(r => !r.missing).map(r => ({ id: r.id, path: r.path, mediaType: r.mediaType, size: r.size }));
-                const summary = resolved.map(r => r.missing ? ('#' + r.id + ':MISSING') : ('#' + r.id + ':' + (r.size / 1024).toFixed(1) + 'KB')).join(',');
+                sourceRefs = resolved.filter((ref) => !ref.missing);
+                const summary = resolved.map((ref) => ref.missing
+                  ? ('#' + ref.id + ':MISSING')
+                  : ('#' + ref.id + ':' + (ref.size / 1024).toFixed(1) + 'KB')).join(',');
                 console.log('[GrabImages] tab=' + tabId.slice(-12) + ' sessionId=' + (sid ? sid.slice(0, 8) : 'none') + ' refs=' + images + ' resolved=[' + summary + ']');
               }
-            }
-            pending.resolve({ success: true, text: resolvedText, images: imageCountForQueue, imagePaths, mode });
+
+              const durableRefs = sourceRefs.length > 0
+                ? await promptQueueAssetStore.materializeRefs(sourceRefs)
+                : [];
+              const availableById = new Map(durableRefs
+                .filter((ref) => ref.availability === 'available')
+                .map((ref) => [Number(ref.id), ref]));
+              if (images > 0) {
+                resolvedText = resolvedText.replace(/\[Image\s+#?(\d+)\]/g, (marker, rawId) => {
+                  const id = Number(rawId);
+                  if (availableById.has(id)) return marker;
+                  const prefix = agent === 'codex' ? 'codex' : 'claude';
+                  return '[imageError: ' + prefix + '_image_path_unavailable #' + rawId + ']';
+                });
+              }
+              const imagePaths = Array.from(availableById.values());
+              console.log('[PromptQueueAssets] grab tab=' + tabId.slice(-12)
+                + ' agent=' + agent + ' requested=' + images + ' durable=' + imagePaths.length);
+              pending.resolve({ success: true, text: resolvedText, images, imagePaths, mode });
+            })().catch((error) => {
+              console.error('[PromptQueueAssets] grab materialization failed tab=' + tabId.slice(-12) + ':', error);
+              pending.resolve({ success: false, error: 'image_materialization_failed', mode });
+            });
           }
           continue;
         }
@@ -5693,6 +5685,35 @@ function _extractUserText(entry) {
   return null;
 }
 
+function shortKnowledgeDocsPath(filePath) {
+  if (!filePath || typeof filePath !== 'string') return null;
+  const normalized = filePath.replace(/\\/g, '/').trim();
+  if (!normalized) return null;
+  const segs = normalized.split('/').filter(Boolean);
+  const baseName = segs[segs.length - 1] || '';
+  const docsIndex = segs.findIndex((seg) => seg.toLowerCase() === 'docs');
+  const lower = normalized.toLowerCase();
+  const semanticIndexSibling = (() => {
+    if (docsIndex < 0 || !path.isAbsolute(normalized)) return false;
+    try {
+      const parent = path.join('/', ...segs.slice(0, docsIndex));
+      return fs.existsSync(path.join(parent, '.semantic-index.json'));
+    } catch {
+      return false;
+    }
+  })();
+  const isDocsPath = docsIndex >= 0 && (
+    !path.isAbsolute(normalized) ||
+    semanticIndexSibling ||
+    lower === 'docs' ||
+    lower.startsWith('docs/') ||
+    lower.includes('/docs/')
+  );
+  const isClaudeMd = baseName === 'CLAUDE.md';
+  if (!isDocsPath && !isClaudeMd) return null;
+  return segs.length >= 2 ? segs.slice(-2).join('/') : segs[0];
+}
+
 // Group the active branch into turns. A turn starts at a user prompt (or a
 // compact_boundary) and includes all subsequent assistant records until the
 // next user prompt / boundary. Tool_result records are attached to the
@@ -5784,10 +5805,9 @@ function _groupIntoTurns(branch) {
           // doc-update turns from coding turns without inspecting tool args.
           if ((block.name === 'Edit' || block.name === 'Write')) {
             const fp = block.input?.file_path || '';
-            if (fp.includes('/docs/') || fp.endsWith('/CLAUDE.md') || fp === 'CLAUDE.md') {
+            const shortName = shortKnowledgeDocsPath(fp);
+            if (shortName) {
               if (!current.docsEdited) current.docsEdited = new Set();
-              const segs = fp.split('/');
-              const shortName = segs.length >= 2 ? segs.slice(-2).join('/') : segs[segs.length - 1];
               current.docsEdited.add(shortName);
             }
           }
@@ -7968,6 +7988,11 @@ app.whenReady().then(() => {
     console.warn('[Startup] providerStates hydration failed:', e.message);
   }
 
+  void garbageCollectPromptQueueAssets(
+    projectManager.db.getAppState('promptQueueByTab'),
+    'app-start',
+  );
+
   // Initialize session manager with database from project manager
   console.log('[Startup] Initializing SessionManager...');
   try {
@@ -8396,23 +8421,12 @@ app.on('will-quit', () => {
 });
 
 app.on('window-all-closed', () => {
-  // Cleanup MCP HTTP server
-  stopMcpHttpServer();
-
-  // Kill all terminals. By this point before-quit has already sent Ctrl+C to
-  // every live claude and waited up to 1.2s for graceful exit, so most claudes
-  // are already dead and term.kill() here just reaps the shell. If a claude
-  // still ignored Ctrl+C — term.kill() delivers SIGHUP as a last resort and
-  // this trace will flag it for post-mortem.
-  for (const [tabId, term] of terminals) {
-    const sid = bridgeKnownSessions.get(tabId) || null;
-    const busy = claudeTurnBusy.get(tabId) === true || claudeSpinnerBusy.get(tabId) === true;
-    console.error('[JsonlChainDiag:WindowAllClosed] tabId=' + tabId + ' shellPid=' + term.pid + ' sessionId=' + (sid ? sid.substring(0, 8) : 'none') + ' busy=' + busy + ' — calling term.kill() (Ctrl+C in before-quit already attempted; SIGHUP here only matters if claude ignored it)');
-    term.kill();
-  }
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
+  // A plain window close does not emit before-quit. Route it through the same
+  // shutdown path as Cmd+Q so live AI sessions are marked before PTYs exit.
+  console.log('[Shutdown:window-all-closed] routing through graceful app quit' +
+    ' terminals=' + terminals.size +
+    ' ai=' + getInterruptedAiSessionEntries().size);
+  app.quit();
 });
 
 app.on('activate', () => {
@@ -9319,6 +9333,12 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       // Keep an authoritative xterm buffer in main. Background/API flows must
       // not depend on a mounted renderer terminal to prove the current TUI row.
       writeHeadlessTerminalMirror(tabId, data);
+      const boundCodexImages = codexImageBindings.observe(tabId, data);
+      if (boundCodexImages.length > 0) {
+        console.log('[CodexImageBinding] tab=' + String(tabId).slice(-12)
+          + ' bound=' + boundCodexImages.map((ref) => '#' + ref.id + ':' + String(ref.assetId || path.basename(ref.path || '')).slice(0, 12)).join(',')
+          + ' ' + codexImageBindings.describe(tabId));
+      }
 
       // Send data to renderer - xterm.js handles OSC sequences itself
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -9860,6 +9880,25 @@ function hasStashedMarker(tabId) {
   return STASH_MARKER_RE.test(stripped);
 }
 
+async function validatePromptQueueImageMarkers(text) {
+  const input = String(text || '');
+  const paths = [];
+  input.replace(/\[imagePath:\s*([^\]\r\n]+?)\s*\]/gi, (_match, rawPath) => {
+    paths.push(String(rawPath || '').trim());
+    return _match;
+  });
+  const missing = [];
+  for (const imagePath of paths) {
+    if (!imagePath || !path.isAbsolute(imagePath)) {
+      missing.push({ path: imagePath, error: 'invalid_image_path' });
+      continue;
+    }
+    const stat = await fs.promises.stat(imagePath).catch(() => null);
+    if (!stat?.isFile()) missing.push({ path: imagePath, error: 'image_path_missing' });
+  }
+  return { success: missing.length === 0, paths, missing };
+}
+
 // Main helper: chunked paste + sync marker verification + optional submit.
 // Wraps the actual work in a per-term promise chain so two concurrent callers
 // can't interleave bytes on the same PTY. See pasteInflight comment above.
@@ -9926,6 +9965,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   const broadcastTabId = findTabIdForTerm(term);
   const isCodexPasteSource = !!(source && String(source).startsWith('codex-'));
   let codexPromptInFlightState = null;
+  let stagedCodexImageRefs = [];
   const emitBusy = (busy) => {
     if (!broadcastTabId) {
       console.warn(logPrefix + ' [PasteBusy] no-tab busy=' + busy + ' termPid=' + (term && term.pid ? term.pid : 'unknown'));
@@ -9938,6 +9978,18 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   };
   emitBusy(true);
   try {
+  if (typeof source === 'string' && source.includes('prompt-queue')) {
+    const queueImages = await validatePromptQueueImageMarkers(content);
+    if (!queueImages.success) {
+      console.warn(logPrefix + ' [PromptQueueAssets] refusing transfer missing=' + queueImages.missing.length);
+      return {
+        success: false,
+        error: 'queue_image_path_unavailable',
+        submitted: false,
+        imagePathErrors: queueImages.missing,
+      };
+    }
+  }
   if (isCodexPasteSource) {
     const prepared = prepareCodexImagePathMarkersForPaste(broadcastTabId, content, source || 'codex-paste');
     if (prepared.replaced > 0 || prepared.missing.length > 0) {
@@ -9955,6 +10007,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       };
     }
     content = prepared.text;
+    stagedCodexImageRefs = prepared.staged;
   }
 
   // Chunking strategy:
@@ -10103,6 +10156,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   //     chunk gets PASTE_START, last gets PASTE_END. No waits between chunks.
   // Verified against fact-claude-tui-mechanics.md §4.
 
+  if (isCodexPasteSource && broadcastTabId && stagedCodexImageRefs.length > 0) {
+    codexImageBindings.beginDirect(broadcastTabId, stagedCodexImageRefs);
+  }
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
     let payload = chunk;
@@ -10292,6 +10348,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       await drainPtyData(term, 50, 600);
     }
     term.write(submitSequence);
+    if (isCodexPasteSource && broadcastTabId && submitSequence !== '\t') {
+      codexImageBindings.resetComposer(broadcastTabId);
+    }
     if (codexPromptInFlightState && broadcastTabId) {
       markCodexPromptSubmitted(broadcastTabId, codexPromptInFlightState, resolvedSubmitLabel);
     }
@@ -10647,7 +10706,18 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
   // chunked the bytes. If DEC 2004 is OFF on Claude's side at the moment of
   // paste, that's a Claude TUI quirk we don't paper over here — it's the same
   // behavior the user would see in iTerm2 / Terminal.app.
+  const codexImageStageToken = meta && typeof meta.codexImageStageToken === 'string'
+    ? meta.codexImageStageToken
+    : null;
+  if (codexImageStageToken) {
+    const began = codexImageBindings.begin(tabId, codexImageStageToken);
+    console.log('[CodexImageBinding] tab=' + String(tabId).slice(-12)
+      + ' begin=' + began + ' token=' + codexImageStageToken.slice(-12));
+  }
   term.write(data);
+  if (data === '\r' || data === '\x03') {
+    codexImageBindings.resetComposer(tabId);
+  }
 });
 
 // Programmatic paste (used for automated tools like Update Docs)
@@ -10680,6 +10750,16 @@ ipcMain.handle('terminal:paste', async (event, { tabId, content, submit = true, 
   }
 });
 
+function mediaTypeFromImagePath(filePath) {
+  const lower = String(filePath || '').toLowerCase();
+  if (/\.jpe?g$/.test(lower)) return 'image/jpeg';
+  if (/\.gif$/.test(lower)) return 'image/gif';
+  if (/\.webp$/.test(lower)) return 'image/webp';
+  if (/\.bmp$/.test(lower)) return 'image/bmp';
+  if (/\.tiff?$/.test(lower)) return 'image/tiff';
+  return 'image/png';
+}
+
 ipcMain.handle('codex:save-clipboard-image', async (_event, { tabId } = {}) => {
   try {
     const image = clipboard.readImage();
@@ -10691,15 +10771,18 @@ ipcMain.handle('codex:save-clipboard-image', async (_event, { tabId } = {}) => {
       return { success: false, error: 'clipboard_png_empty' };
     }
 
-    const safeTabId = String(tabId || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80) || 'unknown';
-    const dir = path.join(os.tmpdir(), 'noted-terminal', 'codex-images', safeTabId);
-    await fs.promises.mkdir(dir, { recursive: true });
-    const hash = crypto.createHash('sha256').update(png).digest('hex').slice(0, 16);
-    const filePath = path.join(dir, Date.now() + '-' + hash + '.png');
-    await fs.promises.writeFile(filePath, png, { mode: 0o600 });
-    rememberCodexClipboardImagePath(tabId, filePath);
-    console.log('[codex:save-clipboard-image] tab=' + safeTabId.slice(-12) + ' path=' + filePath + ' bytes=' + png.length);
-    return { success: true, path: filePath, size: png.length };
+    const ref = await promptQueueAssetStore.materializeBuffer(png, {
+      id: 0,
+      mediaType: 'image/png',
+      size: png.length,
+    });
+    if (ref.availability !== 'available') {
+      return { success: false, error: ref.error || 'save_failed' };
+    }
+    const staged = stageCodexImageRefs(tabId, [ref]);
+    console.log('[codex:save-clipboard-image] tab=' + String(tabId || 'unknown').slice(-12)
+      + ' asset=' + ref.assetId + ' bytes=' + ref.size + ' token=' + String(staged.token || '-').slice(-12));
+    return { success: true, ...ref, stageToken: staged.token };
   } catch (error) {
     console.warn('[codex:save-clipboard-image] failed:', error?.message || error);
     return { success: false, error: error?.code || 'save_failed' };
@@ -10714,12 +10797,17 @@ async function stageCodexImagePathForTab(tabId, filePath) {
   if (!/\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(candidate)) {
     return { success: false, error: 'unsupported_image_path', path: candidate };
   }
-  const st = await fs.promises.stat(candidate).catch(() => null);
-  if (!st || !st.isFile()) {
-    return { success: false, error: 'image_path_missing', path: candidate };
+  const ref = await promptQueueAssetStore.materializeRef({
+    id: 0,
+    path: candidate,
+    mediaType: mediaTypeFromImagePath(candidate),
+    size: 0,
+  });
+  if (ref.availability !== 'available') {
+    return { success: false, error: ref.error || 'image_path_missing', path: candidate };
   }
-  rememberCodexClipboardImagePath(tabId, candidate);
-  return { success: true, path: candidate, size: st.size };
+  const staged = stageCodexImageRefs(tabId, [ref]);
+  return { success: true, ...ref, stageToken: staged.token };
 }
 
 function stageCodexImagePathForPasteSync(tabId, filePath) {
@@ -10735,8 +10823,14 @@ function stageCodexImagePathForPasteSync(tabId, filePath) {
   if (!st || !st.isFile()) {
     return { success: false, error: 'image_path_missing', path: candidate };
   }
-  rememberCodexClipboardImagePath(tabId, candidate);
-  return { success: true, path: candidate, size: st.size };
+  return {
+    success: true,
+    path: candidate,
+    size: st.size,
+    mediaType: mediaTypeFromImagePath(candidate),
+    assetId: path.basename(candidate).match(/^[a-f0-9]{64}\./i) ? path.basename(candidate) : undefined,
+    availability: 'available',
+  };
 }
 
 function prepareCodexImagePathMarkersForPaste(tabId, text, source = 'codex-paste') {
@@ -10747,7 +10841,14 @@ function prepareCodexImagePathMarkersForPaste(tabId, text, source = 'codex-paste
     replaced += 1;
     const result = stageCodexImagePathForPasteSync(tabId, rawPath);
     if (result.success) {
-      staged.push({ path: result.path, size: result.size });
+      staged.push({
+        id: 0,
+        path: result.path,
+        size: result.size,
+        mediaType: result.mediaType,
+        assetId: result.assetId,
+        availability: 'available',
+      });
       return result.path;
     }
     missing.push({ path: result.path || String(rawPath || '').trim(), error: result.error || 'stage_failed' });
@@ -10782,17 +10883,24 @@ ipcMain.handle('codex:stage-image-paths', async (_event, { tabId, filePaths } = 
     if (candidates.length === 0) {
       return { success: false, error: 'no_paths', paths: [], results: [] };
     }
-    const results = [];
-    for (const filePath of candidates) {
-      results.push(await stageCodexImagePathForTab(tabId, filePath));
-    }
+    const refs = await promptQueueAssetStore.materializeRefs(candidates.map((filePath) => ({
+      id: 0,
+      path: filePath,
+      mediaType: mediaTypeFromImagePath(filePath),
+      size: 0,
+    })));
+    const available = refs.filter((ref) => ref.availability === 'available');
+    const staged = stageCodexImageRefs(tabId, available);
+    const results = refs.map((ref) => ref.availability === 'available'
+      ? { success: true, ...ref, stageToken: staged.token }
+      : { success: false, ...ref, error: ref.error || 'stage_failed' });
     const paths = results.filter((result) => result?.success && result.path);
     const success = paths.length === results.length;
     const error = paths.length === 0
       ? (results.find((result) => result?.error)?.error || 'stage_failed')
       : undefined;
     console.log('[codex:stage-image-paths] tab=' + String(tabId || 'unknown').slice(-12) + ' requested=' + candidates.length + ' staged=' + paths.length + (error ? ' error=' + error : ''));
-    return { success, error, paths, results };
+    return { success, error, paths, results, stageToken: staged.token };
   } catch (error) {
     console.warn('[codex:stage-image-paths] failed:', error?.message || error);
     return { success: false, error: error?.code || 'stage_failed', paths: [], results: [] };
@@ -11569,6 +11677,17 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
       mainWindow.webContents.send('claude:ctrlc-danger-zone', { tabId, active: false });
     }
   }
+  if (source.includes('prompt-queue')) {
+    const queueImages = await validatePromptQueueImageMarkers(command);
+    if (!queueImages.success) {
+      return {
+        success: false,
+        error: 'queue_image_path_unavailable',
+        submitted: false,
+        imagePathErrors: queueImages.missing,
+      };
+    }
+  }
   startClaudeLocalCommandWatcher(tabId, command, 'send-command');
   return await safePasteAndSubmit(term, command, {
     submit: true,
@@ -11578,6 +11697,7 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
     awaitClaudeUserMessageAudit,
     claudeAuditTimeoutMs: CLAUDE_PASTE_AUDIT_TIMEOUT_MS,
     dismissAutocomplete: shouldDismissAutocomplete,
+    source,
     logPrefix: '[send-command:' + tabId + (source !== 'send-command' ? ':' + source : '') + ']'
   });
 });
@@ -14078,6 +14198,7 @@ ipcMain.on('terminal:kill', async (event, tabId) => {
   clearCodexLaunchPayload(tabId, 'terminal-kill');
   clearCodexKnownSession(tabId, 'terminal-kill');
   clearCodexTuiReady(tabId, 'terminal-kill');
+  codexImageBindings.clear(tabId);
   geminiActiveTabs.delete(tabId);
   geminiInputCharCount.delete(tabId);
   closeCodexWatcher(tabId, 'terminal-kill');
@@ -14546,8 +14667,47 @@ ipcMain.handle('app:getState', (event, key) => {
   return projectManager.db.getAppState(key);
 });
 
+let promptQueueAssetGcTimer = null;
+async function garbageCollectPromptQueueAssets(queueState, reason = 'state-save') {
+  try {
+    const referenced = collectReferencedAssetIds(queueState);
+    const result = await promptQueueAssetStore.garbageCollect(referenced);
+    if (result.removed.length > 0) {
+      console.log('[PromptQueueAssets] gc reason=' + reason
+        + ' referenced=' + referenced.size + ' removed=' + result.removed.length);
+    }
+  } catch (error) {
+    console.warn('[PromptQueueAssets] gc failed reason=' + reason + ':', error?.message || error);
+  }
+}
+
+function schedulePromptQueueAssetGc(queueState, reason = 'state-save') {
+  if (promptQueueAssetGcTimer) clearTimeout(promptQueueAssetGcTimer);
+  promptQueueAssetGcTimer = setTimeout(() => {
+    promptQueueAssetGcTimer = null;
+    void garbageCollectPromptQueueAssets(queueState, reason);
+  }, 1000);
+}
+
+ipcMain.handle('prompt-queue:materialize-image-refs', async (_event, { refs } = {}) => {
+  try {
+    const materialized = await promptQueueAssetStore.materializeRefs(refs);
+    const available = materialized.filter((ref) => ref.availability === 'available').length;
+    return {
+      success: available === materialized.length,
+      refs: materialized,
+      available,
+      missing: materialized.length - available,
+    };
+  } catch (error) {
+    console.warn('[PromptQueueAssets] materialize IPC failed:', error?.message || error);
+    return { success: false, refs: [], available: 0, missing: Array.isArray(refs) ? refs.length : 0, error: error?.message || 'materialize_failed' };
+  }
+});
+
 ipcMain.handle('app:setState', (event, { key, value }) => {
   projectManager.db.setAppState(key, value);
+  if (key === 'promptQueueByTab') schedulePromptQueueAssetGc(value, 'queue-save');
   return { success: true };
 });
 
@@ -17178,8 +17338,9 @@ require(path.join(srcMainDir, 'ipc', 'claude-data')).register({
   getClaudeEditableLastPromptState: (tabId, reason) =>
     getClaudeEditableLastPromptState(tabId, reason || 'claude-full-history-editable-last-prompt'),
 });
-codexDataModule.register();
+codexDataModule.register({ projectManager });
 transcriptService.registerIpc();
+require(path.join(srcMainDir, 'timeline-outline-service')).register({ projectManager, transcriptService });
 
 // semantic-index:watch, semantic-index:rebuild, semantic-index:status → ipc/semantic-index-status.js
 require(path.join(srcMainDir, 'ipc', 'semantic-index-status')).register({ getMainWindow: () => mainWindow });
@@ -21107,7 +21268,7 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
   });
   console.log('[Codex Runner] Command:', normalizedCommand, 'tab:', tabId, 'session:', sessionId || 'new', 'cwd:', termCwd, 'model:', effectiveModel || 'default', 'effort:', effectiveEffort || 'default', 'developerInstructionsChars:', developerInstructions ? String(developerInstructions).length : 0, 'restartReason:', restartReason, 'mcpStartupRestarts:', mcpStartupRestartAttempts, 'launchId:', launchId);
 
-  codexSavedClipboardImagesByTab.delete(tabId);
+  codexImageBindings.clear(tabId);
   invalidateAiProcessLookupCache(tabId, 'codex');
   const commandState = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
   commandState.isRunning = true;

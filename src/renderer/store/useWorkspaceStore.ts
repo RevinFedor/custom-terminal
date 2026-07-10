@@ -2223,6 +2223,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
 
     workspace.tabs.delete(tabId);
+    for (const remainingTab of workspace.tabs.values()) {
+      if (remainingTab.visualParentTabId === tabId) remainingTab.visualParentTabId = undefined;
+    }
     usePromptQueueStore.getState().cleanupClosedTab(tabId);
     // Remove closed tab from history
     workspace.tabHistory = workspace.tabHistory.filter(id => id !== tabId);
@@ -3002,6 +3005,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (toUtility) {
       tab.groupId = undefined;
       tab.visualParentTabId = undefined;
+      for (const candidate of workspace.tabs.values()) {
+        if (candidate.visualParentTabId === tabId) candidate.visualParentTabId = undefined;
+      }
     }
 
     // Get tabs of target zone (after flag change)
@@ -3051,6 +3057,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     // Remove from source project
     sourceWorkspace.tabs.delete(tabId);
+    for (const candidate of sourceWorkspace.tabs.values()) {
+      if (candidate.visualParentTabId === tabId) candidate.visualParentTabId = undefined;
+    }
 
     // If this was the active tab in source, switch to another
     if (sourceWorkspace.activeTabId === tabId) {
@@ -3095,6 +3104,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       tab.visualParentTabId = undefined;
       tgt.tabs.set(tabId, tab);
       lastId = tabId;
+    }
+    for (const candidate of src.tabs.values()) {
+      if (candidate.visualParentTabId && !src.tabs.has(candidate.visualParentTabId)) {
+        candidate.visualParentTabId = undefined;
+      }
     }
 
     // Fix active tab in source
@@ -3316,6 +3330,25 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
 
     workspace.tabs = nextTabs;
+    for (const tab of workspace.tabs.values()) {
+      const parentId = tab.visualParentTabId;
+      if (!parentId) continue;
+      const parent = workspace.tabs.get(parentId);
+      if (!parent || parent === tab || parent.parentTabId || parent.isUtility || parent.groupId !== tab.groupId) {
+        tab.visualParentTabId = undefined;
+        continue;
+      }
+      const seen = new Set<string>([tab.id]);
+      let cursor: Tab | undefined = parent;
+      while (cursor?.visualParentTabId) {
+        if (seen.has(cursor.id)) {
+          tab.visualParentTabId = undefined;
+          break;
+        }
+        seen.add(cursor.id);
+        cursor = workspace.tabs.get(cursor.visualParentTabId);
+      }
+    }
     const nextMembersByGroup = new Map<string, string[]>();
     for (const tab of workspace.tabs.values()) {
       if (tab.parentTabId || tab.isUtility || !tab.groupId) continue;

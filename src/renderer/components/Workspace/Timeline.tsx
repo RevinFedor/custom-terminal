@@ -8,6 +8,11 @@ import { useWorkspaceStore, type PendingAutoTabTitle } from '../../store/useWork
 import { TAB_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { generateTabTitleFromPrompt, isEligibleTabTitleEntry, trimTabTitlePrompt } from '../../utils/generateTabTitle';
 import { timelineSummaryKey, useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
+import {
+  timelineOutlineKey,
+  useTimelineOutlineStore,
+  type TimelineSemanticGroup,
+} from '../../store/useTimelineOutlineStore';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { getHistoryAgentRuntime, type AgentHistoryTool, type AgentPtyStatus } from '../../utils/historyAgentRuntimes';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from '../../utils/claudeStartupDefaultsReady';
@@ -103,6 +108,16 @@ const DOCS_TIMELINE_COLORS = {
     hoverClass: 'hover:bg-lime-500/5',
   },
 } as const;
+
+const SEMANTIC_ROLE_LABELS: Record<string, string> = {
+  implementation: 'реализация',
+  clarification: 'уточнение',
+  verification: 'проверка',
+  fix: 'исправление',
+  documentation: 'документация',
+  meta: 'мета-действие',
+  other: 'этап',
+};
 
 // Portal for tooltip to escape overflow:hidden
 const TooltipPortal: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -512,6 +527,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     ].filter((n) => Number.isFinite(n) && n > 0);
     return candidates.length ? Math.min(...candidates) : 0;
   })();
+  const outlineSessionKey = summaryToolType && sessionId
+    ? timelineOutlineKey(summaryToolType, sessionId)
+    : '';
+  const timelineOutlineRecord = useTimelineOutlineStore((state) => (
+    outlineSessionKey ? state.outlines[outlineSessionKey] : undefined
+  ));
+  const loadTimelineOutline = useTimelineOutlineStore((state) => state.loadOutline);
+  const syncTimelineOutlineUuids = useTimelineOutlineStore((state) => state.syncEligibleUuids);
 
   // Slide animation (matches HistoryPanel pattern)
   const [slideIn, setSlideIn] = useState(isOpen);
@@ -526,7 +549,18 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   }, [isOpen]);
 
-  const [entries, setEntries] = useState<TimelineEntry[]>([]);
+  const timelineOwnerKey = useMemo(() => JSON.stringify({ tabId, toolType, sessionId: sessionId || '', cwd: cwd || '' }), [tabId, toolType, sessionId, cwd]);
+  const timelineOwnerKeyRef = useRef(timelineOwnerKey);
+  timelineOwnerKeyRef.current = timelineOwnerKey;
+  const timelineLoadGenerationRef = useRef(0);
+  const [entriesSnapshot, setEntriesSnapshot] = useState<{ ownerKey: string; entries: TimelineEntry[] }>({
+    ownerKey: timelineOwnerKey,
+    entries: [],
+  });
+  // A prop switch immediately makes the previous array invisible. This is the
+  // ownership boundary that prevents new session IDs from being paired with
+  // stale prompts while the next async JSONL read is still in flight.
+  const entries = entriesSnapshot.ownerKey === timelineOwnerKey ? entriesSnapshot.entries : [];
   const entriesCountRef = useRef(0);
   entriesCountRef.current = entries.length;
   const [compactSummaryCache, setCompactSummaryCache] = useState<Record<string, string | null>>({});
@@ -1080,6 +1114,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   // Phase 2: Collapsible groups
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  // Semantic groups are a separate, persisted projection. Unlike the legacy
+  // sub-agent clusters they own no raw entry and never replace UUID/index data.
+  const [expandedSemanticGroups, setExpandedSemanticGroups] = useState<Set<string>>(new Set());
+  const [hoveredSemanticGroupId, setHoveredSemanticGroupId] = useState<string | null>(null);
+  const [activeSemanticGroupId, setActiveSemanticGroupId] = useState<string | null>(null);
+  const activeSemanticGroupIdRef = useRef<string | null>(null);
+  const semanticGroupHeaderRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   // Phase 3: Tree view (per-tab, persisted in UIStore)
   const treeMode = useUIStore(state => state.timelineTreeModeTabs[tabId] ?? false);
   const setTimelineTreeMode = useUIStore(state => state.setTimelineTreeMode);
@@ -1279,6 +1320,76 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Compute group map for sub-agent entries (Phase 2)
   const groupMap = useMemo(() => computeGroups(entries), [entries]);
 
+  const outlineEligibleUuids = useMemo(() => entries
+    .filter((entry) => entry.uuid && !entry.isSubAgent && !entry.isSubAgentTimeout && isEligibleTabTitleEntry(entry))
+    .map((entry) => entry.uuid), [entries]);
+
+  const semanticGroups = useMemo<TimelineSemanticGroup[]>(() => {
+    const rawGroups = timelineOutlineRecord?.outline?.groups || [];
+    if (rawGroups.length === 0 || outlineEligibleUuids.length === 0) return [];
+    const eligibleIndex = new Map(outlineEligibleUuids.map((uuid, index) => [uuid, index]));
+    return rawGroups.filter((group) => {
+      const members = Array.isArray(group.memberUuids) ? group.memberUuids : [];
+      if (members.length < 2) return false;
+      const first = eligibleIndex.get(members[0]);
+      if (first == null) return false;
+      return members.every((uuid, offset) => eligibleIndex.get(uuid) === first + offset);
+    });
+  }, [timelineOutlineRecord, outlineEligibleUuids]);
+
+  const semanticGroupByUuid = useMemo(() => {
+    const map = new Map<string, { group: TimelineSemanticGroup; memberIndex: number; role?: string; detail?: string }>();
+    for (const group of semanticGroups) {
+      const memberMeta = new Map((group.members || []).map((member) => [member.uuid, member]));
+      group.memberUuids.forEach((uuid, memberIndex) => {
+        const meta = memberMeta.get(uuid);
+        map.set(uuid, { group, memberIndex, role: meta?.role, detail: meta?.description || meta?.detail });
+      });
+    }
+    return map;
+  }, [semanticGroups]);
+
+  const semanticMetaPromptByUuid = useMemo(() => new Map(
+    (timelineOutlineRecord?.outline?.metaPrompts || []).map((meta) => [meta.uuid, meta])
+  ), [timelineOutlineRecord]);
+
+  const codexCompactClusters = useMemo(() => {
+    const map = new Map<number, { headIndex: number; count: number; isHead: boolean; isNoise?: boolean }>();
+    if (!isCodex) return map;
+    let index = 0;
+    while (index < entries.length) {
+      if (entries[index].type !== 'compact') { index += 1; continue; }
+      const headIndex = index;
+      const memberIndices: Array<{ index: number; isNoise: boolean }> = [];
+      let count = 0;
+      while (index < entries.length) {
+        const candidate = entries[index];
+        if (candidate.type === 'compact') {
+          memberIndices.push({ index, isNoise: false });
+          count += 1;
+          index += 1;
+          continue;
+        }
+        const isEmptyContinuation = candidate.type === 'user' && !String(candidate.content || '').trim() && !candidate.hasImage;
+        if (isEmptyContinuation) {
+          memberIndices.push({ index, isNoise: true });
+          index += 1;
+          continue;
+        }
+        break;
+      }
+      for (const member of memberIndices) {
+        map.set(member.index, {
+          headIndex,
+          count,
+          isHead: member.index === headIndex,
+          isNoise: member.isNoise,
+        });
+      }
+    }
+    return map;
+  }, [entries, isCodex]);
+
   // Index of the chain-break boundary (= youngest entry of pre-orphan tail).
   // Resolved here from uuid → index for downstream useMemos.
   const claudeMemoryBoundaryIndex = useMemo(() => {
@@ -1431,18 +1542,18 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setCompactSummaryCache({});
   }, [sessionId]);
 
-  // Compact summaries are intentionally not carried by get-timeline: Codex
-  // replacement_history can be 100k+ chars and Timeline polls every 2s. Fetch
-  // the full-history payload only when the compact entry tooltip is actually opened.
+  // Claude has a real compact summary and keeps the existing lazy tooltip path.
+  // Codex's original compact body is server-encrypted; do not fetch or present
+  // replacement_history as if it were that body — Codex shows count-only ×N.
   useEffect(() => {
-    if (!sessionId || isGemini || activeTooltipIndex === null) return;
+    if (!sessionId || isGemini || isCodex || activeTooltipIndex === null) return;
     const entry = entries[activeTooltipIndex];
     if (!entry || entry.type !== 'compact') return;
     if (entry.compactSummary) return;
     if (Object.prototype.hasOwnProperty.call(compactSummaryCache, entry.uuid)) return;
 
     let cancelled = false;
-    const channel = isCodex ? 'codex:get-full-history' : 'claude:get-full-history';
+    const channel = 'claude:get-full-history';
     (async () => {
       try {
         const result = await ipcRenderer.invoke(channel, { sessionId, cwd, tabId });
@@ -1536,6 +1647,17 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   }, [isCmdHeld, hoveredIndex, isExpanded, freezeCmdPopups, isLockedTooltip]);
 
+  useEffect(() => {
+    if (isCmdHeld && hoveredSemanticGroupId) {
+      setActiveSemanticGroupId(hoveredSemanticGroupId);
+      setActiveTooltipIndex(null);
+      setActiveNoteIndex(null);
+      setActiveForkMarkerIndex(null);
+    } else if (!freezeCmdPopups && !isLockedTooltip && !isCmdHeld) {
+      setActiveSemanticGroupId(null);
+    }
+  }, [isCmdHeld, hoveredSemanticGroupId, freezeCmdPopups, isLockedTooltip]);
+
   // effect: isCmdHeld/hoveredNoteIndex/isNoteEditing/activeNoteIndex → setActiveNoteIndex (CMD+hover opens note tooltip + hides entry tooltip; release closes unless editing/cursor-in-tooltip/frozen)
   useEffect(() => {
     if (isCmdHeld && hoveredNoteIndex !== null) {
@@ -1562,6 +1684,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // effect: зеркалим индексы в refs — нужны для синхронного чтения в keydown/mousedown listener'ах.
   useEffect(() => { hoveredIndexRef.current = hoveredIndex; }, [hoveredIndex]);
   useEffect(() => { activeTooltipIndexRef.current = activeTooltipIndex; }, [activeTooltipIndex]);
+  useEffect(() => {
+    activeSemanticGroupIdRef.current = activeSemanticGroupId;
+  }, [activeSemanticGroupId]);
   useEffect(() => { activeNoteIndexRef.current = activeNoteIndex; }, [activeNoteIndex]);
   useEffect(() => { activeForkMarkerIndexRef.current = activeForkMarkerIndex; }, [activeForkMarkerIndex]);
 
@@ -1602,6 +1727,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       if (e.key === 'Shift' && e.metaKey) {
         const hasActive = isLockedTooltipRef.current
           || activeTooltipIndexRef.current !== null
+          || activeSemanticGroupIdRef.current !== null
           || activeNoteIndexRef.current !== null
           || activeForkMarkerIndexRef.current !== null
           || hoveredIndexRef.current !== null;
@@ -1628,8 +1754,31 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // SECTION: TIMELINE DATA LOAD — loadTimeline IPC, 2s poll, session-switch cleanup, _savedEditRangeMap save/restore
   // ════════════════════════════════════════════════════════════
 
+  useLayoutEffect(() => {
+    // Invalidate every older request before the browser can paint the new tab.
+    // The next load owns a fresh generation and may commit only to this key.
+    timelineLoadGenerationRef.current += 1;
+    setEntriesSnapshot({ ownerKey: timelineOwnerKey, entries: [] });
+    setSessionBoundaries([]);
+    setForkMarkers([]);
+    setCodexSessionMeta(null);
+    setClaudeMemoryBoundaryUuid(null);
+    setNotes({});
+    setNotePositions({});
+    setRewindMarkers(new Set());
+  }, [timelineOwnerKey]);
+
   // Load timeline and fork markers when sessionId changes
   const loadTimeline = useCallback(async (reason = 'unknown') => {
+    const ownerKeyAtStart = timelineOwnerKey;
+    // A listener holding the previous callback may fire during a prop switch.
+    // It must not invalidate the fresh owner's in-flight generation.
+    if (timelineOwnerKeyRef.current !== ownerKeyAtStart) return;
+    const loadGeneration = ++timelineLoadGenerationRef.current;
+    const ownsLoad = () => (
+      timelineOwnerKeyRef.current === ownerKeyAtStart &&
+      timelineLoadGenerationRef.current === loadGeneration
+    );
     const loadStartedAt = performance.now();
     const loadStartAbs = performance.timeOrigin + loadStartedAt;
     const shortSession = sessionId ? sessionId.substring(0, 8) : 'none';
@@ -1649,7 +1798,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       );
     }
     if (!sessionId) {
-      setEntries([]);
+      if (!ownsLoad()) return;
+      setEntriesSnapshot({ ownerKey: ownerKeyAtStart, entries: [] });
       setForkMarkers([]);
       setCodexSessionMeta(null);
       setExpandedGroups(new Set());
@@ -1686,8 +1836,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       if (isGemini) {
         // Gemini: single IPC call, no fork markers or session chains
         const timelineResult = await ipcRenderer.invoke('gemini:get-timeline', { sessionId, cwd, ...callerContext });
+        if (!ownsLoad()) return;
         if (timelineResult.success) {
-          setEntries(timelineResult.entries);
+          setEntriesSnapshot({ ownerKey: ownerKeyAtStart, entries: timelineResult.entries || [] });
           setSessionBoundaries([]);
           setForkMarkers([]);
           setCodexSessionMeta(null);
@@ -1695,8 +1846,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         }
       } else if (isCodex) {
         const timelineResult = await ipcRenderer.invoke('agent-transcript:get-timeline', { toolType: 'codex', sessionId, cwd, tabId, ...callerContext });
+        if (!ownsLoad()) return;
         if (timelineResult.success) {
-          setEntries(timelineResult.entries);
+          setEntriesSnapshot({ ownerKey: ownerKeyAtStart, entries: timelineResult.entries || [] });
           setSessionBoundaries([]);
           setForkMarkers([]);
           setCodexSessionMeta(timelineResult.sessionMeta || null);
@@ -1713,8 +1865,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           ipcRenderer.invoke('claude:get-fork-markers', { sessionId, ...callerContext })
         ]);
 
+        if (!ownsLoad()) return;
+
         if (timelineResult.success) {
-          setEntries(timelineResult.entries);
+          setEntriesSnapshot({ ownerKey: ownerKeyAtStart, entries: timelineResult.entries || [] });
           setSessionBoundaries(timelineResult.sessionBoundaries || []);
           setCodexSessionMeta(null);
           setClaudeMemoryBoundaryUuid(timelineResult.claudeMemoryBoundaryUuid || null);
@@ -1794,19 +1948,21 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       }
       // Load notes for this session (works for both Claude and Gemini)
       const notesResult = await ipcRenderer.invoke('timeline:get-notes', { sessionId, ...callerContext });
+      if (!ownsLoad()) return;
       if (notesResult.success) {
         setNotes(notesResult.notes || {});
         setNotePositions(notesResult.positions || {});
       }
       // Load rewind markers (pink dots)
       const markersResult = await ipcRenderer.invoke('timeline:get-rewind-markers', { sessionId, ...callerContext });
-      if (markersResult.success && markersResult.markers?.length) {
-        setRewindMarkers(new Set(markersResult.markers));
+      if (!ownsLoad()) return;
+      if (markersResult.success) {
+        setRewindMarkers(new Set(markersResult.markers || []));
       }
     } catch (error) {
       console.error('[Timeline] Error loading timeline:', error);
     } finally {
-      setIsLoading(false);
+      if (ownsLoad()) setIsLoading(false);
       if (import.meta.env.DEV) {
         console.warn(
           `[Perf:TimelineLoad] done reason=${reason}` +
@@ -1822,7 +1978,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         );
       }
     }
-  }, [sessionId, cwd, tabId, isGemini, isCodex]);
+  }, [sessionId, cwd, tabId, isGemini, isCodex, timelineOwnerKey]);
 
   // effect: loadTimeline callback identity changes (sessionId/cwd/tabId/isGemini) → trigger initial timeline load
   useEffect(() => {
@@ -1833,6 +1989,54 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     if (!summaryToolType || !sessionId) return;
     void loadPromptSummaries(summaryToolType, sessionId);
   }, [summaryToolType, sessionId, loadPromptSummaries]);
+
+  useEffect(() => {
+    if (!summaryToolType || !sessionId) return;
+    void loadTimelineOutline(summaryToolType, sessionId);
+  }, [summaryToolType, sessionId, loadTimelineOutline]);
+
+  useEffect(() => {
+    if (!summaryToolType || !sessionId) return;
+    syncTimelineOutlineUuids(summaryToolType, sessionId, outlineEligibleUuids);
+  }, [summaryToolType, sessionId, outlineEligibleUuids, syncTimelineOutlineUuids]);
+
+  useEffect(() => {
+    if (!outlineSessionKey) {
+      setExpandedSemanticGroups(new Set());
+      return;
+    }
+    const validIds = new Set(semanticGroups.map((group) => group.id));
+    let restored = new Set<string>();
+    try {
+      const raw = localStorage.getItem(`timeline-semantic-groups:${outlineSessionKey}`);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          restored = new Set(parsed.filter((id) => validIds.has(String(id))).map(String));
+          if (parsed.length > 0 && restored.size === 0 && semanticGroups.length > 0) {
+            restored.add(semanticGroups[semanticGroups.length - 1].id);
+          }
+        }
+      } else if (semanticGroups.length > 0) {
+        restored.add(semanticGroups[semanticGroups.length - 1].id);
+      }
+    } catch {
+      if (semanticGroups.length > 0) restored.add(semanticGroups[semanticGroups.length - 1].id);
+    }
+    setExpandedSemanticGroups(restored);
+    setHoveredSemanticGroupId(null);
+    setActiveSemanticGroupId(null);
+  }, [outlineSessionKey, semanticGroups]);
+
+  useEffect(() => {
+    if (!outlineSessionKey || semanticGroups.length === 0) return;
+    try {
+      localStorage.setItem(
+        `timeline-semantic-groups:${outlineSessionKey}`,
+        JSON.stringify([...expandedSemanticGroups])
+      );
+    } catch { /* localStorage is optional */ }
+  }, [outlineSessionKey, semanticGroups.length, expandedSemanticGroups]);
 
   useEffect(() => {
     const handler = (event: Event) => {
@@ -2737,6 +2941,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setHoveredIndex(index);
     // Tooltip only appears when CMD is held (synced via useEffect)
     if (isCmdHeldRef.current) {
+      setActiveSemanticGroupId(null);
       setActiveTooltipIndex(index);
     }
   };
@@ -4566,6 +4771,90 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     return { clampedTop, wTop, wH: wBottom - wTop, offset: clampedTop - wTop };
   })() : null;
 
+  const activeSemanticGroup = activeSemanticGroupId
+    ? semanticGroups.find((group) => group.id === activeSemanticGroupId) || null
+    : null;
+  const semanticGroupTooltipPos = activeSemanticGroup ? (() => {
+    const element = semanticGroupHeaderRefs.current.get(activeSemanticGroup.id);
+    if (!element) return null;
+    const rect = element.getBoundingClientRect();
+    const height = 112;
+    return {
+      top: Math.max(40, Math.min(rect.top + rect.height / 2 - height / 2, window.innerHeight - height - 10)),
+    };
+  })() : null;
+
+  const renderSemanticGroupHeader = (group: TimelineSemanticGroup, expanded: boolean) => (
+    <div
+      key={`semantic-header:${group.id}`}
+      ref={(element) => {
+        if (element) semanticGroupHeaderRefs.current.set(group.id, element);
+        else semanticGroupHeaderRefs.current.delete(group.id);
+      }}
+      className="relative w-full flex items-center select-none"
+      style={{
+        flex: '0 0 auto',
+        minHeight: 30,
+        padding: '5px 8px 5px 7px',
+        gap: 6,
+        cursor: 'pointer',
+        borderTop: '1px solid rgba(192,132,252,0.18)',
+        borderBottom: '1px solid rgba(192,132,252,0.12)',
+        background: hoveredSemanticGroupId === group.id
+          ? 'linear-gradient(90deg, rgba(217,70,239,0.18), rgba(139,92,246,0.11))'
+          : 'linear-gradient(90deg, rgba(217,70,239,0.11), rgba(139,92,246,0.07))',
+      }}
+      title={isCmdHeld ? undefined : '⌘ + hover — описание группы'}
+      onClick={(event) => {
+        event.stopPropagation();
+        setExpandedSemanticGroups((previous) => {
+          const next = new Set(previous);
+          if (next.has(group.id)) next.delete(group.id);
+          else next.add(group.id);
+          return next;
+        });
+      }}
+      onMouseEnter={() => {
+        setHoveredSemanticGroupId(group.id);
+        if (isCmdHeldRef.current) {
+          setActiveSemanticGroupId(group.id);
+          setActiveTooltipIndex(null);
+        }
+      }}
+      onMouseLeave={() => {
+        setHoveredSemanticGroupId(null);
+        if (!isCmdHeldRef.current && !isLockedTooltipRef.current) setActiveSemanticGroupId(null);
+      }}
+    >
+      <ChevronDown
+        size={12}
+        style={{
+          color: '#d8b4fe',
+          flexShrink: 0,
+          transform: expanded ? 'rotate(0deg)' : 'rotate(-90deg)',
+          transition: 'transform 120ms ease-out',
+        }}
+      />
+      <div style={{ width: 7, height: 7, transform: 'rotate(45deg)', borderRadius: 1, backgroundColor: '#c084fc', flexShrink: 0 }} />
+      <span
+        className="min-w-0 flex-1"
+        style={{
+          color: '#f5d0fe',
+          fontSize: 11,
+          fontWeight: 700,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {group.title}
+      </span>
+      <span style={{ color: 'rgba(216,180,254,0.7)', fontSize: 9, fontFamily: 'monospace', flexShrink: 0 }}>
+        ×{group.memberUuids.length}
+      </span>
+    </div>
+  );
+
   const contextMenuTop = contextMenu ? (() => {
     const estimatedH = selectionStartId ? 44 : 220;
     const h = contextMenuMeasuredH > 0 ? contextMenuMeasuredH : estimatedH;
@@ -4730,10 +5019,47 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           {/* ──── SEGMENT LOOP (entries.map → per-entry dot, note strips, fork stripes, plan-mode boundaries) ──── */}
           {entries.map((entry, index) => {
             const groupInfo = groupMap.get(index);
+            const semanticMembership = semanticGroupByUuid.get(entry.uuid);
+            const semanticGroup = semanticMembership?.group;
+            const codexCompactCluster = codexCompactClusters.get(index);
+            const isSemanticGroupStart = semanticMembership?.memberIndex === 0;
+            const semanticGroupForcedOpen = !!semanticGroup && (
+              semanticGroup.memberUuids.some((uuid) => {
+                if (!!notes[uuid] || rewindMarkers.has(uuid)) return true;
+                const rawIndex = entries.findIndex((candidate) => candidate.uuid === uuid);
+                if (rawIndex < 0) return false;
+                if (rawIndex === lastBoundaryIndex || forkMarkerLastSnapIndex.includes(rawIndex)) return true;
+                const next = entries[rawIndex + 1];
+                return !!(next && entries[rawIndex].sessionId && next.sessionId && entries[rawIndex].sessionId !== next.sessionId);
+              }) ||
+              selectionStartId !== null ||
+              rangeActionMenu !== null ||
+              copyingRange !== null ||
+              deletingRange !== null ||
+              rewindState !== null ||
+              editRangeState !== null
+            );
+            const isSemanticGroupExpanded = !!semanticGroup && (
+              expandedSemanticGroups.has(semanticGroup.id) || semanticGroupForcedOpen
+            );
+
+            // Collapsed semantic groups own a synthetic header, never a raw
+            // prompt. Keep invisible raw refs so index/UUID addressing remains
+            // canonical while no prompt masquerades as the group toggle.
+            if (isExpandedLayout && semanticGroup && !isSemanticGroupExpanded) {
+              const hiddenEntry = <div key={`semantic-hidden:${entry.uuid}`} ref={el => segmentRefs.current[index] = el} style={{ display: 'none' }} />;
+              return isSemanticGroupStart
+                ? <React.Fragment key={entry.uuid}>{renderSemanticGroupHeader(semanticGroup, false)}{hiddenEntry}</React.Fragment>
+                : <React.Fragment key={entry.uuid}>{hiddenEntry}</React.Fragment>;
+            }
 
             // Phase 2: Hide collapsed group children (but NOT the header)
             if (groupInfo?.isGroupChild && !groupInfo?.isGroupHeader && !expandedGroups.has(groupInfo.groupId)) {
               // Still need ref for visibility system — render invisible placeholder
+              return <div key={entry.uuid} ref={el => segmentRefs.current[index] = el} style={{ display: 'none' }} />;
+            }
+
+            if (codexCompactCluster && !codexCompactCluster.isHead) {
               return <div key={entry.uuid} ref={el => segmentRefs.current[index] = el} style={{ display: 'none' }} />;
             }
 
@@ -4892,6 +5218,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
             return (
               <React.Fragment key={entry.uuid}>
+                {isExpandedLayout && semanticGroup && isSemanticGroupStart && renderSemanticGroupHeader(semanticGroup, true)}
                 {/* Phase 2: Expanded group toggle bar (collapse control) */}
                 {isExpandedHeader && (
                   <div
@@ -4965,7 +5292,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   data-segment
                   {...(isUnreachable ? { 'data-unreachable': '' } : {})}
                   className="relative w-full flex items-center"
-                  onMouseEnter={() => handleMouseEnterSegment(index)}
+                  onMouseEnter={() => {
+                    // Codex compact bodies are not available to the client; the
+                    // count marker intentionally has no misleading Cmd tooltip.
+                    if (!(isCodex && isCompacted)) handleMouseEnterSegment(index);
+                  }}
                   onMouseLeave={(e) => handleMouseLeaveSegment(e)}
                   onClick={(e) => {
                     // Phase 2: Click on collapsed group header toggles expansion
@@ -4994,7 +5325,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     alignItems: isExpandedLayout ? 'flex-start' : undefined,
                     justifyContent: isExpandedLayout ? 'flex-start' : (treeMode ? 'flex-start' : 'center'),
                     paddingLeft: isExpandedLayout
-                      ? '6px'
+                      ? (semanticMembership ? '18px' : '6px')
                       : (treeMode
                           ? (showAsChild ? '20px' : entryIsSubAgent ? '10px' : '4px')
                           : (showAsChild ? '4px' : undefined)),
@@ -5002,6 +5333,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     paddingTop: isExpandedLayout ? '6px' : undefined,
                     paddingBottom: isExpandedLayout ? '6px' : undefined,
                     gap: isExpandedLayout ? '6px' : undefined,
+                    boxShadow: isExpandedLayout && semanticMembership
+                      ? 'inset 9px 0 0 -8px rgba(192,132,252,0.28)'
+                      : undefined,
                     overflow: isExpandedLayout ? 'hidden' : undefined,
                     // Perf: skip rendering off-screen entries; refs/hit-boxes still attach.
                     // intrinsic-size hint ≈ lineHeight(1.3) * lines * fontSize + vertical padding 12.
@@ -5085,11 +5419,18 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   {isExpandedLayout && !isExpandedHeader && (() => {
                     const rawEntryContent = entry.content || '';
                     const previewLimit = expandedPreviewCharLimit(timelineLineClamp);
-                    let previewText = displaysAsCompact ? 'Conversation compacted' : rawEntryContent;
+                    const metaPrompt = semanticMetaPromptByUuid.get(entry.uuid);
+                    let previewText = displaysAsCompact
+                      ? (isCodex ? `×${codexCompactCluster?.count || 1}` : 'Conversation compacted')
+                      : metaPrompt
+                        ? `META · ${metaPrompt.title}`
+                        : rawEntryContent;
                     let previewColor = 'rgba(255, 255, 255, 0.85)';
                     let previewStyle: React.CSSProperties = {};
                     let isSummaryPreview = false;
-                    if (!displaysAsCompact && summaryToolType && sessionId && isEligibleTabTitleEntry(entry)) {
+                    if (metaPrompt) {
+                      previewColor = 'rgba(232, 180, 254, 0.92)';
+                    } else if (!displaysAsCompact && summaryToolType && sessionId && isEligibleTabTitleEntry(entry)) {
                       const key = timelineSummaryKey(summaryToolType, sessionId, entry.uuid);
                       const row = promptSummaries[key];
                       if (row?.summary) {
@@ -5914,6 +6255,39 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           return panelEl;
         })()}
 
+        {isVisible && activeSemanticGroup && semanticGroupTooltipPos && (
+          <TooltipPortal>
+            <div
+              data-cmd-hover-popover
+              className="fixed flex flex-col gap-2"
+              style={{
+                top: semanticGroupTooltipPos.top,
+                right: popupRightPx,
+                width: Math.min(Math.max(timelineTooltipWidth, 260), 420),
+                zIndex: 9999,
+                padding: '10px 12px',
+                borderRadius: '8px 0 0 8px',
+                border: '1px solid rgba(192,132,252,0.24)',
+                background: 'rgba(22,18,28,0.98)',
+                boxShadow: '0 12px 34px rgba(0,0,0,0.48)',
+              }}
+              onMouseEnter={() => setActiveSemanticGroupId(activeSemanticGroup.id)}
+              onMouseLeave={() => {
+                if (!isCmdHeldRef.current && !isLockedTooltipRef.current) setActiveSemanticGroupId(null);
+              }}
+            >
+              <div className="flex items-center gap-2">
+                <div style={{ width: 8, height: 8, transform: 'rotate(45deg)', borderRadius: 1, backgroundColor: '#c084fc', flexShrink: 0 }} />
+                <span className="text-[11px] font-semibold" style={{ color: '#f5d0fe' }}>{activeSemanticGroup.title}</span>
+                <span className="ml-auto text-[9px] font-mono" style={{ color: 'rgba(216,180,254,0.62)' }}>×{activeSemanticGroup.memberUuids.length}</span>
+              </div>
+              <div className="text-[11px] leading-snug" style={{ color: 'rgba(255,255,255,0.72)', whiteSpace: 'pre-wrap' }}>
+                {activeSemanticGroup.description}
+              </div>
+            </div>
+          </TooltipPortal>
+        )}
+
         {/* ──── TOOLTIP PORTAL (entry tooltip + CSS hover-bridge to Timeline strip) ──── */}
         {/* Tooltip Portal with CSS Bridge */}
         {isVisible && activeTooltipIndex !== null && currentActiveEntry && tooltipPos && (
@@ -6227,6 +6601,23 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   </>
                 ) : (
                   <>
+                    {(() => {
+                      const membership = semanticGroupByUuid.get(currentActiveEntry.uuid);
+                      if (!membership) return null;
+                      const roleKey = String(membership.role || 'other');
+                      const role = SEMANTIC_ROLE_LABELS[roleKey] || roleKey.replace(/_/g, ' ');
+                      return (
+                        <div className="pb-1.5 mb-1.5 border-b border-fuchsia-400/15 shrink-0">
+                          <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide" style={{ color: '#e879f9' }}>
+                            <span>{role}</span>
+                            <span style={{ color: 'rgba(216,180,254,0.4)' }}>·</span>
+                            <span className="normal-case tracking-normal truncate" style={{ color: 'rgba(233,213,255,0.72)' }}>
+                              {membership.detail || membership.group.title}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })()}
                     {/* Inline note preview when note is on dot */}
                     {notes[currentActiveEntry.uuid] && (notePositions[currentActiveEntry.uuid] || 'before') === 'dot' && (
                       <div className="flex items-start gap-1.5 pb-1.5 mb-1.5 border-b border-purple-500/15 shrink-0">

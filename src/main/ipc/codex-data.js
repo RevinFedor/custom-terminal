@@ -9,9 +9,25 @@ const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const CODEX_SESSIONS_DIR = path.join(CODEX_HOME, 'sessions');
 const CODEX_LOGS_DB = path.join(CODEX_HOME, 'logs_2.sqlite');
 const CODEX_AUTH_JSON = path.join(CODEX_HOME, 'auth.json');
+const CODEX_USAGE_API_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
-const USAGE_ACCOUNTS_CACHE_TTL_MS = 60 * 1000;
+const USAGE_ACCOUNTS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const USAGE_ACCOUNTS_FOREGROUND_BUDGET_MS = 1200;
+const USAGE_ACCOUNTS_ERROR_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+const CODEX_REMOTE_USAGE_CACHE_TTL_MS = 55 * 1000;
+const CODEX_REMOTE_USAGE_STALE_MS = 6 * 60 * 1000;
+const CODEX_REMOTE_USAGE_ERROR_COOLDOWN_MS = 60 * 1000;
+const CODEX_REMOTE_USAGE_TIMEOUT_MS = 8 * 1000;
+const CODEX_USAGE_PERSISTENCE_KEY = 'codexUsageAccounts.v1';
+const CODEX_USAGE_PENDING_CONFIRM_MS = 30 * 1000;
+const CODEX_USAGE_BRANCH_RESET_TOLERANCE_SECONDS = 2 * 60;
+const CODEX_USAGE_REGRESSION_POINTS = 10;
+const CODEX_USAGE_INITIAL_CONFIRM_TIMEOUT_MS = 3 * 1000;
+const CODEX_USAGE_INCONSISTENT_WARNING = 'OpenAI returned inconsistent usage. Showing the last verified value.';
+const CODEX_USAGE_TAIL_CHUNK_BYTES = 1024 * 1024;
+const CODEX_USAGE_TAIL_MAX_BYTES = 16 * 1024 * 1024;
+const CODEX_LATEST_USAGE_FILE_LIMIT = 24;
+const CODEX_LATEST_USAGE_TAIL_BYTES = 2 * 1024 * 1024;
 const CODEX_RESET_DRIFT_TOLERANCE_SECONDS = 10 * 60;
 const CODEX_ACTIVE_USAGE_OVERRIDE_TTL_MS = 30 * 60 * 1000;
 const CODEX_USAGE_SCAN_DAYS = 10;
@@ -22,6 +38,11 @@ let usageAccountsCache = null;
 let usageAccountsRefreshInFlight = null;
 let usageAccountsLastAttemptAt = null;
 let usageAccountsLastError = null;
+let usageAccountsLastErrorAt = 0;
+let codexUsageStateStore = null;
+let codexUsageStateHydrated = false;
+const codexRemoteUsageByAccount = new Map();
+const codexRemoteUsageInflight = new Map();
 const codexActiveUsageOverrides = new Map();
 const loggedRollbackKeys = new Set();
 const _codexJsonlCache = new Map();
@@ -82,14 +103,32 @@ function decodeBase64UrlJson(value) {
   }
 }
 
-function shortDocsPath(filePath) {
+function shortKnowledgeDocsPath(filePath) {
   if (!filePath || typeof filePath !== 'string') return null;
   const normalized = filePath.replace(/\\/g, '/').trim();
   if (!normalized) return null;
-  const isDocsPath = normalized.includes('/docs/') || normalized.startsWith('docs/');
-  const isClaudeMd = normalized === 'CLAUDE.md' || normalized.endsWith('/CLAUDE.md');
-  if (!isDocsPath && !isClaudeMd) return null;
   const segs = normalized.split('/').filter(Boolean);
+  const baseName = segs[segs.length - 1] || '';
+  const docsIndex = segs.findIndex((seg) => seg.toLowerCase() === 'docs');
+  const lower = normalized.toLowerCase();
+  const semanticIndexSibling = (() => {
+    if (docsIndex < 0 || !path.isAbsolute(normalized)) return false;
+    try {
+      const parent = path.join('/', ...segs.slice(0, docsIndex));
+      return fs.existsSync(path.join(parent, '.semantic-index.json'));
+    } catch {
+      return false;
+    }
+  })();
+  const isDocsPath = docsIndex >= 0 && (
+    !path.isAbsolute(normalized) ||
+    semanticIndexSibling ||
+    lower === 'docs' ||
+    lower.startsWith('docs/') ||
+    lower.includes('/docs/')
+  );
+  const isClaudeMd = baseName === 'CLAUDE.md';
+  if (!isDocsPath && !isClaudeMd) return null;
   return segs.length >= 2 ? segs.slice(-2).join('/') : segs[0];
 }
 
@@ -102,7 +141,7 @@ function addUniqueAttr(entry, key, value) {
 }
 
 function addDocsEdited(entry, filePath) {
-  const shortName = shortDocsPath(filePath);
+  const shortName = shortKnowledgeDocsPath(filePath);
   if (shortName) addUniqueAttr(entry, 'docsEdited', shortName);
 }
 
@@ -224,6 +263,35 @@ function isCompactPayload(payload) {
     t === 'compact_started' ||
     t === 'compact_completed' ||
     t.includes('compact');
+}
+
+// A single Codex compaction is written twice: the authoritative top-level
+// `compacted` snapshot and a later event_msg telemetry companion. The number
+// of technical records between them is not stable, so line-distance heuristics
+// turn one compaction into two markers. Pair by semantic order instead: keep a
+// pending top-level event through token/context bookkeeping and consume the
+// next compact-like event before the next real user turn.
+function codexCompactCompanionLines(records) {
+  const companions = new Set();
+  let pendingTopLevelCount = 0;
+  for (const record of Array.isArray(records) ? records : []) {
+    const payload = record?.payload || {};
+    if (record?.type === 'compacted') {
+      pendingTopLevelCount += 1;
+      continue;
+    }
+    if (record?.type === 'event_msg' && isCompactPayload(payload)) {
+      if (pendingTopLevelCount > 0) {
+        companions.add(record.__line);
+        pendingTopLevelCount -= 1;
+      }
+      continue;
+    }
+    if (record?.type === 'event_msg' && payload.type === 'user_message') {
+      pendingTopLevelCount = 0;
+    }
+  }
+  return companions;
 }
 
 async function walkJsonlFiles(rootDir, maxFiles = 4000) {
@@ -479,12 +547,13 @@ function logCodexSessionCandidateSkip(meta, filePath, reason, { sourceSessionId 
     ' source=' + (sourceSessionId || 'n/a'));
 }
 
-async function findCodexSessionFile(sessionId, cwd) {
+async function findCodexSessionFile(sessionId, cwd, { allowContentScan = true } = {}) {
   if (!sessionId || !fs.existsSync(CODEX_SESSIONS_DIR)) return null;
 
   const files = await walkJsonlFiles(CODEX_SESSIONS_DIR);
   const suffixHit = files.find((file) => path.basename(file).includes(sessionId) && path.basename(file).endsWith('.jsonl'));
   if (suffixHit) return { filePath: suffixHit };
+  if (!allowContentScan) return null;
 
   const normalizedCwd = cwd ? path.resolve(cwd) : null;
   for (const filePath of files) {
@@ -676,12 +745,12 @@ function lastCodexTimelineUser(entries) {
 
 function buildCodexTimeline(records, sessionId) {
   const entries = [];
+  const compactCompanionLines = codexCompactCompanionLines(records);
   let currentUser = null;
   let currentTurnIndex = -1;
   let latestModel = null;
   let latestEffort = null;
   let latestTokenCountInfo = null;
-  let lastTopLevelCompactLine = -Infinity;
 
   for (const record of records) {
     const payload = record.payload || {};
@@ -698,7 +767,6 @@ function buildCodexTimeline(records, sessionId) {
         sessionId,
         turnIndex: currentTurnIndex,
       });
-      lastTopLevelCompactLine = record.__line;
       continue;
     }
 
@@ -778,7 +846,7 @@ function buildCodexTimeline(records, sessionId) {
           }
         }
       } else if (isCompactPayload(payload)) {
-        if (record.__line <= lastTopLevelCompactLine + 3) {
+        if (compactCompanionLines.has(record.__line)) {
           continue;
         }
         const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};
@@ -813,13 +881,13 @@ function buildCodexTimeline(records, sessionId) {
 
 function buildCodexFullHistory(records, sessionId) {
   const entries = [];
+  const compactCompanionLines = codexCompactCompanionLines(records);
   const pendingCalls = new Map();
   let currentTurnIndex = -1;
   let pendingThinking = '';
   let latestTokenCountInfo = null;
   let lastDisplayedModel = null;
   let lastDisplayedEffort = null;
-  let lastTopLevelCompactLine = -Infinity;
 
   for (const record of records) {
     const payload = record.payload || {};
@@ -865,7 +933,6 @@ function buildCodexFullHistory(records, sessionId) {
         sessionId,
         turnIndex: currentTurnIndex,
       });
-      lastTopLevelCompactLine = record.__line;
       continue;
     }
 
@@ -887,7 +954,7 @@ function buildCodexFullHistory(records, sessionId) {
       } else if (payload.type === 'token_count') {
         latestTokenCountInfo = payload.info || {};
       } else if (isCompactPayload(payload)) {
-        if (record.__line <= lastTopLevelCompactLine + 3) {
+        if (compactCompanionLines.has(record.__line)) {
           continue;
         }
         const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};
@@ -1206,9 +1273,9 @@ function pushCodexVisibleWrapper(wrappers, record, turnIndex, extra = {}) {
 
 function buildCodexVisibleRecordWrappers(records, sessionId) {
   const wrappers = [];
+  const compactCompanionLines = codexCompactCompanionLines(records);
   const pending = [];
   let currentTurnIndex = -1;
-  let lastTopLevelCompactLine = -Infinity;
 
   const flushPending = (turnIndex) => {
     while (pending.length > 0) {
@@ -1262,12 +1329,11 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
         sourceUuid: stableUuid(sessionId, record.__line, 'codex-compact'),
         kind: 'compact',
       });
-      lastTopLevelCompactLine = record.__line;
       continue;
     }
 
     if (record?.type === 'event_msg' && isCompactPayload(payload)) {
-      const isTopLevelCompanion = record.__line <= lastTopLevelCompactLine + 3;
+      const isTopLevelCompanion = compactCompanionLines.has(record.__line);
       pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
         sourceUuid: isTopLevelCompanion ? null : stableUuid(sessionId, record.__line, 'codex-compact'),
         kind: isTopLevelCompanion ? undefined : 'compact',
@@ -1510,10 +1576,10 @@ function codexCopyOptions(params = {}) {
 
 function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), options = {}) {
   const entries = [];
+  const compactCompanionLines = codexCompactCompanionLines(records);
   const pendingCalls = new Map();
   let currentTurnIndex = -1;
   let pendingThinking = '';
-  let lastTopLevelCompactLine = -Infinity;
   const expandedCompactUuids = options.expandedCompactUuids instanceof Set
     ? options.expandedCompactUuids
     : new Set();
@@ -1538,7 +1604,6 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), o
         text: compactText(payload, sourceUuid),
         sourceUuid,
       });
-      lastTopLevelCompactLine = record.__line;
       continue;
     }
 
@@ -1561,7 +1626,7 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions(), o
         removeLastCodexTurns(entries, Number(payload.num_turns || payload.turns || 1));
         currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
       } else if (isCompactPayload(payload)) {
-        if (record.__line > lastTopLevelCompactLine + 3) {
+        if (!compactCompanionLines.has(record.__line)) {
           const sourceUuid = stableUuid(sessionId, record.__line, 'codex-compact');
           push({
             kind: 'compact',
@@ -1713,32 +1778,41 @@ function buildCodexRangeExport(records, sessionId, cwd, opts, startUuid, endUuid
   };
 }
 
+function parseCodexNumber(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function normalizeCodexReset(value) {
   if (value == null) return null;
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return new Date(value * 1000).toISOString();
-  }
+  let timestampMs = null;
+  if (typeof value === 'number' && Number.isFinite(value)) timestampMs = value * 1000;
   if (typeof value === 'string') {
     const trimmed = value.trim();
-    if (/^\d+$/.test(trimmed)) {
-      return new Date(Number(trimmed) * 1000).toISOString();
-    }
-    const parsed = Date.parse(trimmed);
-    if (!Number.isNaN(parsed)) return new Date(parsed).toISOString();
+    timestampMs = /^\d+$/.test(trimmed) ? Number(trimmed) * 1000 : Date.parse(trimmed);
   }
-  return null;
+  if (!Number.isFinite(timestampMs)) return null;
+  const date = new Date(timestampMs);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
 }
 
 function normalizeCodexLimitBucket(bucket) {
   if (!bucket || typeof bucket !== 'object') return null;
-  const used = Number(bucket.used_percent ?? bucket.utilization ?? bucket.usedPercent);
+  const used = parseCodexNumber(bucket.used_percent ?? bucket.utilization ?? bucket.usedPercent);
+  const windowMinutes = parseCodexNumber(bucket.window_minutes ?? bucket.windowMinutes);
   return {
-    utilization: Number.isFinite(used) ? used : null,
+    utilization: used != null && used >= 0 && used <= 100 ? used : null,
     resets_at: normalizeCodexReset(bucket.resets_at ?? bucket.resetsAt ?? bucket.reset_at ?? bucket.resetAt),
-    window_minutes: Number.isFinite(Number(bucket.window_minutes ?? bucket.windowMinutes))
-      ? Number(bucket.window_minutes ?? bucket.windowMinutes)
-      : null,
+    window_minutes: windowMinutes,
   };
+}
+
+function codexWindowMatchesMinutes(bucket, expectedMinutes) {
+  const minutes = Number(bucket?.window_minutes);
+  if (!Number.isFinite(minutes) || minutes <= 0) return false;
+  return Math.abs(minutes - expectedMinutes) <= expectedMinutes * 0.05;
 }
 
 function buildCodexUsageFromRateLimits(rateLimits, timestamp = null, filePath = null) {
@@ -1746,11 +1820,14 @@ function buildCodexUsageFromRateLimits(rateLimits, timestamp = null, filePath = 
   const primary = normalizeCodexLimitBucket(rateLimits.primary);
   const secondary = normalizeCodexLimitBucket(rateLimits.secondary);
   if (!primary && !secondary) return null;
+  const buckets = [primary, secondary].filter(Boolean);
+  const fiveHour = buckets.find((bucket) => codexWindowMatchesMinutes(bucket, 5 * 60)) || null;
+  const sevenDay = buckets.find((bucket) => codexWindowMatchesMinutes(bucket, 7 * 24 * 60)) || null;
   return {
     primary,
     secondary,
-    five_hour: primary,
-    seven_day: secondary,
+    five_hour: fiveHour,
+    seven_day: sevenDay,
     limit_id: rateLimits.limit_id || null,
     limit_name: rateLimits.limit_name || null,
     plan_type: rateLimits.plan_type || null,
@@ -1784,14 +1861,80 @@ async function findLatestCodexUsage() {
     } catch {}
   }
   candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  for (const candidate of candidates.slice(0, 120)) {
+  for (const candidate of candidates.slice(0, CODEX_LATEST_USAGE_FILE_LIMIT)) {
     try {
-      const records = await parseJsonlFile(candidate.filePath);
-      const usage = latestCodexUsageInRecords(records, candidate.filePath);
+      const usage = await findLatestCodexUsageInFile(candidate.filePath, {
+        maxBytes: CODEX_LATEST_USAGE_TAIL_BYTES,
+      });
       if (usage) return usage;
     } catch {}
   }
   return null;
+}
+
+function latestCodexUsageInJsonlBuffer(buffer, filePath) {
+  const lines = buffer.toString('utf8').split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    try {
+      const record = JSON.parse(line);
+      const payload = record?.payload || {};
+      if (record?.type !== 'event_msg' || payload.type !== 'token_count') continue;
+      const usage = buildCodexUsageFromRateLimits(payload.rate_limits, recordTimestamp(record), filePath);
+      if (usage) return usage;
+    } catch {}
+  }
+  return null;
+}
+
+async function findLatestCodexUsageInFile(filePath, {
+  maxBytes = CODEX_USAGE_TAIL_MAX_BYTES,
+  chunkBytes = CODEX_USAGE_TAIL_CHUNK_BYTES,
+} = {}) {
+  const stat = await fs.promises.stat(filePath);
+  if (!stat.isFile() || stat.size <= 0) return null;
+
+  const byteBudget = Math.max(1, Math.min(stat.size, Number(maxBytes) || CODEX_USAGE_TAIL_MAX_BYTES));
+  const readChunkSize = Math.max(1, Math.min(byteBudget, Number(chunkBytes) || CODEX_USAGE_TAIL_CHUNK_BYTES));
+  const fd = await fs.promises.open(filePath, 'r');
+  let position = stat.size;
+  let scanned = 0;
+  let carry = Buffer.alloc(0);
+  try {
+    while (position > 0 && scanned < byteBudget) {
+      const length = Math.min(readChunkSize, position, byteBudget - scanned);
+      const start = position - length;
+      const chunk = Buffer.allocUnsafe(length);
+      const { bytesRead } = await fd.read(chunk, 0, length, start);
+      if (bytesRead <= 0) break;
+      const combined = Buffer.concat([chunk.subarray(0, bytesRead), carry]);
+      scanned += bytesRead;
+      position = start;
+
+      if (start === 0) {
+        return latestCodexUsageInJsonlBuffer(combined, filePath);
+      }
+      const firstNewline = combined.indexOf(0x0a);
+      if (firstNewline < 0) {
+        carry = combined;
+        continue;
+      }
+      const usage = latestCodexUsageInJsonlBuffer(combined.subarray(firstNewline + 1), filePath);
+      if (usage) return usage;
+      carry = combined.subarray(0, firstNewline);
+    }
+    return null;
+  } finally {
+    await fd.close();
+  }
+}
+
+async function loadLatestCodexUsageForSession(sessionId, cwd) {
+  const found = await findCodexSessionFile(sessionId, cwd, { allowContentScan: false });
+  if (!found) return { success: false, error: 'Session not found' };
+  const usage = await findLatestCodexUsageInFile(found.filePath);
+  return { success: true, usage, filePath: found.filePath };
 }
 
 function runSqliteJson(dbPath, sql) {
@@ -1902,8 +2045,21 @@ function codexLogTimeMs(row) {
   return (Number(row?.ts) || 0) * 1000 + (Number(row?.ts_nanos) || 0) / 1_000_000;
 }
 
-function codexRateResetEpoch(rateLimits, bucketName) {
-  const bucket = rateLimits?.[bucketName];
+function codexRateBucketForWindow(rateLimits, semanticKey, expectedMinutes, legacyKey) {
+  const explicit = rateLimits?.[semanticKey];
+  if (explicit && typeof explicit === 'object') return explicit;
+  const candidates = [rateLimits?.primary, rateLimits?.secondary]
+    .filter((bucket) => bucket && typeof bucket === 'object');
+  const matched = candidates.find((bucket) => {
+    const directMinutes = parseCodexNumber(bucket.window_minutes ?? bucket.windowMinutes);
+    const seconds = parseCodexNumber(bucket.limit_window_seconds ?? bucket.window_seconds ?? bucket.limitWindowSeconds);
+    const minutes = directMinutes ?? (seconds != null ? seconds / 60 : null);
+    return minutes != null && Math.abs(minutes - expectedMinutes) <= expectedMinutes * 0.05;
+  });
+  return matched || rateLimits?.[legacyKey] || null;
+}
+
+function codexRateResetEpoch(bucket) {
   if (!bucket || typeof bucket !== 'object') return 0;
   const raw = bucket.reset_at ?? bucket.resets_at ?? bucket.resetAt ?? bucket.resetsAt;
   if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
@@ -1916,9 +2072,9 @@ function codexRateResetEpoch(rateLimits, bucketName) {
   return 0;
 }
 
-function compareCodexResetGeneration(next, prev, bucketName) {
-  const nextReset = codexRateResetEpoch(next.rateLimits, bucketName);
-  const prevReset = codexRateResetEpoch(prev.rateLimits, bucketName);
+function compareCodexResetGeneration(next, prev, semanticKey, expectedMinutes, legacyKey) {
+  const nextReset = codexRateResetEpoch(codexRateBucketForWindow(next.rateLimits, semanticKey, expectedMinutes, legacyKey));
+  const prevReset = codexRateResetEpoch(codexRateBucketForWindow(prev.rateLimits, semanticKey, expectedMinutes, legacyKey));
   const diff = nextReset - prevReset;
   if (Math.abs(diff) <= CODEX_RESET_DRIFT_TOLERANCE_SECONDS) return 0;
   return diff;
@@ -1928,10 +2084,10 @@ function compareCodexRateSnapshotFreshness(next, prev) {
   if (!prev) return 1;
   if (!next) return -1;
 
-  const weeklyGeneration = compareCodexResetGeneration(next, prev, 'secondary');
+  const weeklyGeneration = compareCodexResetGeneration(next, prev, 'seven_day', 7 * 24 * 60, 'secondary');
   if (weeklyGeneration !== 0) return weeklyGeneration;
 
-  const fiveHourGeneration = compareCodexResetGeneration(next, prev, 'primary');
+  const fiveHourGeneration = compareCodexResetGeneration(next, prev, 'five_hour', 5 * 60, 'primary');
   if (fiveHourGeneration !== 0) return fiveHourGeneration;
 
   const nextTs = Number(next.ts) || 0;
@@ -1954,8 +2110,10 @@ function codexUsageFreshnessCandidate(usage) {
   const { ts, tsNanos } = codexUsageTimestampParts(usage);
   return {
     rateLimits: {
-      primary: usage.primary || usage.five_hour || null,
-      secondary: usage.secondary || usage.seven_day || null,
+      primary: usage.primary || null,
+      secondary: usage.secondary || null,
+      five_hour: usage.five_hour || null,
+      seven_day: usage.seven_day || null,
     },
     ts,
     tsNanos,
@@ -1969,11 +2127,12 @@ function compareCodexUsageFreshness(nextUsage, prevUsage) {
   );
 }
 
-function readCurrentCodexAuthIdentity() {
+function readCurrentCodexAuthSession() {
   if (!fs.existsSync(CODEX_AUTH_JSON)) return null;
   const raw = safeJsonParse(fs.readFileSync(CODEX_AUTH_JSON, 'utf8'), null);
   const tokens = raw?.tokens || {};
-  const accessPayload = decodeBase64UrlJson(String(tokens.access_token || '').split('.')[1]);
+  const accessToken = typeof tokens.access_token === 'string' ? tokens.access_token.trim() : '';
+  const accessPayload = decodeBase64UrlJson(accessToken.split('.')[1]);
   const idPayload = decodeBase64UrlJson(String(tokens.id_token || '').split('.')[1]);
   const authClaims = accessPayload?.['https://api.openai.com/auth']
     || idPayload?.['https://api.openai.com/auth']
@@ -1982,26 +2141,22 @@ function readCurrentCodexAuthIdentity() {
     || idPayload?.['https://api.openai.com/profile']
     || {};
   const accountId = tokens.account_id || authClaims.chatgpt_account_id || null;
+  const userId = authClaims.user_id || null;
   const email = profileClaims.email || idPayload?.email || accessPayload?.email || null;
-  if (!accountId && !email) return null;
+  if (!accountId && !email && !accessToken) return null;
   return {
     accountId,
+    userId,
     email,
+    accessToken,
+    authMode: raw?.auth_mode || null,
+    tokenFingerprint: accessToken ? hashCodexAccountKey(accessToken) : null,
+    accountKey: codexAccountKeyFromIdentity({ accountId, email }),
+    accessExpiresAtMs: Number.isFinite(Number(accessPayload?.exp))
+      ? Number(accessPayload.exp) * 1000
+      : null,
     refreshedAtMs: parseTimestampMs(raw?.last_refresh),
   };
-}
-
-function currentCodexAuthIdentityForUsage(usage) {
-  const identity = readCurrentCodexAuthIdentity();
-  if (!identity) return null;
-  const refreshedAtMs = identity.refreshedAtMs;
-  const usageMs = parseTimestampMs(usage?.timestamp);
-  // Auth.json is global state. Only use it for active rollouts newer than the
-  // current auth snapshot; older resurrected sessions must rely on log identity.
-  if (Number.isFinite(refreshedAtMs) && Number.isFinite(usageMs) && usageMs + 30 * 1000 < refreshedAtMs) {
-    return null;
-  }
-  return identity;
 }
 
 function closestCodexIdentity(rate, identities) {
@@ -2059,6 +2214,674 @@ function buildCodexActiveUsageAccount(identity, usage, threadId) {
   };
 }
 
+class CodexUsageFetchError extends Error {
+  constructor(code, message, status = null) {
+    super(message);
+    this.name = 'CodexUsageFetchError';
+    this.code = code;
+    this.status = status;
+  }
+}
+
+function normalizeCodexWhamWindow(raw, receivedAtMs) {
+  if (!raw || typeof raw !== 'object') return null;
+  const usedPercent = parseCodexNumber(raw.used_percent ?? raw.utilization ?? raw.usedPercent);
+  if (usedPercent == null || usedPercent < 0 || usedPercent > 100) return null;
+
+  let resetAt = parseCodexNumber(raw.reset_at ?? raw.resets_at ?? raw.resetAt ?? raw.resetsAt);
+  if (resetAt == null || resetAt <= 0) {
+    const resetAfter = parseCodexNumber(raw.reset_after_seconds ?? raw.resetAfterSeconds);
+    resetAt = resetAfter != null && resetAfter >= 0
+      ? Math.floor(receivedAtMs / 1000 + resetAfter)
+      : null;
+  }
+
+  const windowSeconds = parseCodexNumber(raw.limit_window_seconds ?? raw.window_seconds ?? raw.limitWindowSeconds);
+  const directWindowMinutes = parseCodexNumber(raw.window_minutes ?? raw.windowMinutes);
+  const windowMinutes = windowSeconds != null && windowSeconds > 0
+    ? windowSeconds / 60
+    : directWindowMinutes;
+
+  return {
+    used_percent: usedPercent,
+    window_minutes: windowMinutes != null && windowMinutes > 0 ? windowMinutes : null,
+    reset_at: resetAt,
+  };
+}
+
+function buildCodexUsageFromWhamResponse(payload, receivedAtMs = Date.now()) {
+  const rateLimit = payload?.rate_limit;
+  if (!rateLimit || typeof rateLimit !== 'object') {
+    throw new CodexUsageFetchError('invalid_response', 'OpenAI usage response has no rate limit');
+  }
+
+  const primary = normalizeCodexWhamWindow(rateLimit.primary_window ?? rateLimit.primary, receivedAtMs);
+  const secondary = normalizeCodexWhamWindow(rateLimit.secondary_window ?? rateLimit.secondary, receivedAtMs);
+  if (!primary && !secondary) {
+    throw new CodexUsageFetchError('invalid_response', 'OpenAI usage response has no valid windows');
+  }
+
+  return buildCodexUsageFromRateLimits({
+    limit_id: 'codex',
+    limit_name: null,
+    primary,
+    secondary,
+    credits: payload?.credits || rateLimit.credits || null,
+    individual_limit: rateLimit.individual_limit || payload?.spend_control?.individual_limit || null,
+    plan_type: payload?.plan_type || rateLimit.plan_type || null,
+    rate_limit_reached_type: payload?.rate_limit_reached_type || rateLimit.rate_limit_reached_type || null,
+  }, new Date(receivedAtMs).toISOString(), null);
+}
+
+function codexUsageErrorMessage(error) {
+  const code = error?.code;
+  if (code === 'auth_missing') return 'Codex is not signed in with a ChatGPT account.';
+  if (code === 'unauthorized') return 'Codex login expired. Sign in to Codex again.';
+  if (code === 'account_mismatch') return 'OpenAI returned usage for a different Codex account.';
+  if (code === 'account_changed') return 'Codex account changed while usage was updating.';
+  if (code === 'timeout') return 'OpenAI usage request timed out.';
+  if (code === 'rate_limited') return 'OpenAI usage is temporarily rate limited.';
+  if (code === 'invalid_response') return 'OpenAI returned an invalid usage response.';
+  if (code === 'inconsistent_response') return 'OpenAI returned inconsistent usage. Try refreshing again.';
+  if (code === 'server_error') return `OpenAI usage request failed (${error?.status || 'server error'}).`;
+  return 'Could not refresh OpenAI usage.';
+}
+
+function canonicalizeCodexUsage(usage, previousUsage = null) {
+  if (!usage || typeof usage !== 'object') return null;
+  const fiveHour = usage.five_hour || previousUsage?.five_hour || null;
+  const sevenDay = usage.seven_day || previousUsage?.seven_day || null;
+  if (!fiveHour && !sevenDay) return null;
+  return {
+    ...usage,
+    primary: fiveHour ? { ...fiveHour, window_minutes: 5 * 60 } : null,
+    secondary: sevenDay ? { ...sevenDay, window_minutes: 7 * 24 * 60 } : null,
+    five_hour: fiveHour,
+    seven_day: sevenDay,
+  };
+}
+
+function codexUsageWindowSnapshot(usage, key) {
+  const bucket = usage?.[key];
+  if (!bucket || typeof bucket !== 'object') return null;
+  const utilization = parseCodexNumber(bucket.utilization);
+  if (utilization == null || utilization < 0 || utilization > 100) return null;
+  const resetMs = parseTimestampMs(bucket.resets_at);
+  return {
+    utilization,
+    resetMs: Number.isFinite(resetMs) ? resetMs : null,
+  };
+}
+
+function codexUsageSnapshotsMatch(leftUsage, rightUsage) {
+  for (const key of ['five_hour', 'seven_day']) {
+    const left = codexUsageWindowSnapshot(leftUsage, key);
+    const right = codexUsageWindowSnapshot(rightUsage, key);
+    if (!left && !right) continue;
+    if (!left || !right) return false;
+    if (Math.abs(left.utilization - right.utilization) > 12) return false;
+    if (left.resetMs == null || right.resetMs == null) {
+      if (left.resetMs !== right.resetMs) return false;
+    } else if (Math.abs(left.resetMs - right.resetMs) > CODEX_USAGE_BRANCH_RESET_TOLERANCE_SECONDS * 1000) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function classifyCodexUsageSnapshot(previousUsage, candidateUsage, nowMs = Date.now()) {
+  let suspicious = false;
+  let olderWindows = 0;
+
+  for (const key of ['five_hour', 'seven_day']) {
+    const previous = codexUsageWindowSnapshot(previousUsage, key);
+    const candidate = codexUsageWindowSnapshot(candidateUsage, key);
+    if (!previous || !candidate) continue;
+
+    const previousResetElapsed = previous.resetMs != null && previous.resetMs <= nowMs;
+    if (previous.resetMs != null && candidate.resetMs != null) {
+      const resetDeltaMs = candidate.resetMs - previous.resetMs;
+      if (resetDeltaMs < -CODEX_USAGE_BRANCH_RESET_TOLERANCE_SECONDS * 1000) olderWindows += 1;
+      if (!previousResetElapsed && Math.abs(resetDeltaMs) > CODEX_USAGE_BRANCH_RESET_TOLERANCE_SECONDS * 1000) {
+        suspicious = true;
+      }
+    }
+
+    if (!previousResetElapsed
+      && previous.utilization - candidate.utilization >= CODEX_USAGE_REGRESSION_POINTS) {
+      suspicious = true;
+    }
+  }
+
+  if (olderWindows > 0) return 'obsolete';
+  return suspicious ? 'suspicious' : 'accept';
+}
+
+function reconcileCodexUsageSnapshot(previousEntry, candidateResult, nowMs = Date.now()) {
+  const previousAccount = previousEntry?.account || null;
+  const candidateAccount = candidateResult?.account || null;
+  const candidateUsage = canonicalizeCodexUsage(candidateAccount?.usage, previousAccount?.usage);
+  if (!candidateAccount || !candidateUsage) {
+    return { entry: previousEntry || null, status: 'invalid', accepted: false };
+  }
+
+  const normalizedCandidate = {
+    ...candidateResult,
+    account: { ...candidateAccount, usage: candidateUsage, timestamp: candidateUsage.timestamp || candidateAccount.timestamp || null },
+  };
+  if (!previousAccount?.usage) {
+    return {
+      entry: {
+        account: normalizedCandidate.account,
+        fetchedAt: normalizedCandidate.fetchedAt || nowMs,
+        pending: null,
+        warning: null,
+      },
+      status: 'accepted',
+      accepted: true,
+    };
+  }
+
+  const classification = classifyCodexUsageSnapshot(previousAccount.usage, candidateUsage, nowMs);
+  if (classification === 'accept') {
+    return {
+      entry: {
+        ...previousEntry,
+        account: normalizedCandidate.account,
+        fetchedAt: normalizedCandidate.fetchedAt || nowMs,
+        pending: null,
+        warning: null,
+      },
+      status: 'accepted',
+      accepted: true,
+    };
+  }
+
+  if (classification === 'obsolete') {
+    return {
+      entry: {
+        ...previousEntry,
+        pending: null,
+        warning: CODEX_USAGE_INCONSISTENT_WARNING,
+      },
+      status: 'obsolete',
+      accepted: false,
+    };
+  }
+
+  const pending = previousEntry?.pending || null;
+  const pendingMatches = pending?.account?.usage
+    && codexUsageSnapshotsMatch(pending.account.usage, candidateUsage);
+  if (pendingMatches && nowMs - Number(pending.firstSeenAt || nowMs) >= CODEX_USAGE_PENDING_CONFIRM_MS) {
+    return {
+      entry: {
+        ...previousEntry,
+        account: normalizedCandidate.account,
+        fetchedAt: normalizedCandidate.fetchedAt || nowMs,
+        pending: null,
+        warning: null,
+      },
+      status: 'confirmed',
+      accepted: true,
+    };
+  }
+
+  return {
+    entry: {
+      ...previousEntry,
+      pending: {
+        account: normalizedCandidate.account,
+        fetchedAt: normalizedCandidate.fetchedAt || nowMs,
+        firstSeenAt: pendingMatches ? pending.firstSeenAt : nowMs,
+        lastSeenAt: nowMs,
+      },
+      warning: CODEX_USAGE_INCONSISTENT_WARNING,
+    },
+    status: 'pending',
+    accepted: false,
+  };
+}
+
+function selectCodexInitialUsageConsensus(results) {
+  const candidates = (Array.isArray(results) ? results : [])
+    .filter((result) => result?.account?.usage);
+  let bestGroup = [];
+  for (const candidate of candidates) {
+    const group = candidates.filter((other) => (
+      candidate.account.accountKey === other.account.accountKey
+      && codexUsageSnapshotsMatch(candidate.account.usage, other.account.usage)
+    ));
+    if (group.length > bestGroup.length) bestGroup = group;
+  }
+  if (bestGroup.length < 2) return null;
+  return bestGroup.reduce((latest, candidate) => (
+    Number(candidate.fetchedAt || 0) >= Number(latest.fetchedAt || 0) ? candidate : latest
+  ));
+}
+
+function sanitizeCodexPersistedAccount(raw) {
+  const accountKey = typeof raw?.accountKey === 'string' ? raw.accountKey.trim().slice(0, 160) : '';
+  if (!accountKey) return null;
+  const rawLabel = typeof raw?.label === 'string' ? raw.label.trim().slice(0, 80) : '';
+  const rawHint = typeof raw?.accountHint === 'string' ? raw.accountHint.trim().slice(0, 80) : '';
+  const label = rawLabel.includes('@') ? maskCodexEmail(rawLabel) : rawLabel;
+  const accountHint = rawHint.includes('@') ? maskCodexEmail(rawHint) : rawHint;
+  const usage = canonicalizeCodexUsage(buildCodexUsageFromRateLimits({
+    primary: raw?.usage?.five_hour || raw?.usage?.primary || null,
+    secondary: raw?.usage?.seven_day || raw?.usage?.secondary || null,
+    limit_id: 'codex',
+    plan_type: typeof raw?.usage?.plan_type === 'string' ? raw.usage.plan_type.slice(0, 80) : null,
+  }, normalizeCodexReset(raw?.usage?.timestamp || raw?.timestamp), null));
+  if (!usage || !['five_hour', 'seven_day'].some((key) => codexUsageWindowSnapshot(usage, key))) return null;
+  return {
+    accountKey,
+    label: label || 'Codex account',
+    accountHint: accountHint || null,
+    accountIdHint: null,
+    plan_type: usage.plan_type,
+    timestamp: usage.timestamp,
+    sourceThreadId: null,
+    source: 'openai-usage-api',
+    usage,
+  };
+}
+
+function serializeCodexUsageState(entries = codexRemoteUsageByAccount) {
+  const accounts = [...entries.entries()]
+    .map(([accountKey, entry]) => {
+      const account = sanitizeCodexPersistedAccount({ ...entry?.account, accountKey });
+      if (!account) return null;
+      return {
+        account,
+        fetchedAt: Number(entry?.fetchedAt || 0) || 0,
+        lastAttemptAt: Number(entry?.lastAttemptAt || 0) || null,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.fetchedAt - a.fetchedAt)
+    .slice(0, 8);
+  return { version: 1, accounts };
+}
+
+function parseCodexUsageState(raw) {
+  const parsed = typeof raw === 'string' ? safeJsonParse(raw, null) : raw;
+  if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.accounts)) return [];
+  return parsed.accounts.slice(0, 8).map((item) => {
+    const account = sanitizeCodexPersistedAccount(item?.account);
+    if (!account) return null;
+    return {
+      account,
+      tokenFingerprint: null,
+      fetchedAt: Number(item?.fetchedAt || 0) || 0,
+      lastAttemptAt: Number(item?.lastAttemptAt || 0) || null,
+      error: null,
+      errorAt: 0,
+      pending: null,
+      warning: null,
+    };
+  }).filter(Boolean);
+}
+
+function hydrateCodexUsageState() {
+  if (codexUsageStateHydrated) return;
+  codexUsageStateHydrated = true;
+  if (!codexUsageStateStore?.getAppState) return;
+  try {
+    for (const entry of parseCodexUsageState(codexUsageStateStore.getAppState(CODEX_USAGE_PERSISTENCE_KEY))) {
+      codexRemoteUsageByAccount.set(entry.account.accountKey, entry);
+    }
+    pruneCodexRemoteUsageAccounts(null);
+  } catch (error) {
+    console.warn('[CodexData] could not restore usage accounts:', error?.message || String(error));
+  }
+}
+
+function persistCodexUsageState() {
+  if (!codexUsageStateStore?.setAppState) return;
+  try {
+    codexUsageStateStore.setAppState(CODEX_USAGE_PERSISTENCE_KEY, serializeCodexUsageState());
+  } catch (error) {
+    console.warn('[CodexData] could not persist usage accounts:', error?.message || String(error));
+  }
+}
+
+async function fetchCodexUsageFromOpenAI(auth, {
+  fetchImpl = global.fetch,
+  timeoutMs = CODEX_REMOTE_USAGE_TIMEOUT_MS,
+  now = Date.now,
+} = {}) {
+  if (!auth?.accessToken || !auth?.accountId || !auth?.accountKey) {
+    throw new CodexUsageFetchError('auth_missing', 'Missing Codex ChatGPT OAuth credentials');
+  }
+  if (typeof fetchImpl !== 'function') {
+    throw new CodexUsageFetchError('network_error', 'Fetch is unavailable');
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = now();
+  try {
+    const response = await fetchImpl(CODEX_USAGE_API_URL, {
+      method: 'GET',
+      cache: 'no-store',
+      redirect: 'error',
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${auth.accessToken}`,
+        'ChatGPT-Account-Id': auth.accountId,
+        Accept: 'application/json',
+        'User-Agent': 'Noted Terminal',
+      },
+    });
+
+    if (response.status === 401 || response.status === 403) {
+      throw new CodexUsageFetchError('unauthorized', 'Codex OAuth token is invalid', response.status);
+    }
+    if (response.status === 429) {
+      throw new CodexUsageFetchError('rate_limited', 'OpenAI usage endpoint is rate limited', response.status);
+    }
+    if (!response.ok) {
+      throw new CodexUsageFetchError('server_error', 'OpenAI usage endpoint failed', response.status);
+    }
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new CodexUsageFetchError('invalid_response', 'OpenAI usage response is not JSON');
+    }
+
+    const expectedEmail = String(auth.email || '').trim().toLowerCase();
+    const responseEmail = String(payload?.email || '').trim().toLowerCase();
+    if (expectedEmail && responseEmail && expectedEmail !== responseEmail) {
+      throw new CodexUsageFetchError('account_mismatch', 'OpenAI usage email does not match Codex auth');
+    }
+    const expectedUserId = String(auth.userId || '').trim();
+    const responseUserId = String(payload?.user_id || payload?.account_id || '').trim();
+    if (expectedUserId && responseUserId && expectedUserId !== responseUserId) {
+      throw new CodexUsageFetchError('account_mismatch', 'OpenAI usage user does not match Codex auth');
+    }
+    const responseDateMs = Date.parse(response.headers?.get?.('date') || '');
+    const receivedAtMs = Number.isFinite(responseDateMs) ? responseDateMs : now();
+    const usage = buildCodexUsageFromWhamResponse(payload, receivedAtMs);
+    const account = buildCodexActiveUsageAccount(auth, usage, null);
+    if (!account) {
+      throw new CodexUsageFetchError('invalid_response', 'OpenAI usage account is invalid');
+    }
+    return {
+      account: {
+        ...account,
+        accountKey: auth.accountKey,
+        source: 'openai-usage-api',
+        isCurrent: true,
+      },
+      fetchedAt: now(),
+      durationMs: Math.max(0, now() - startedAt),
+    };
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new CodexUsageFetchError('timeout', 'OpenAI usage request timed out');
+    }
+    if (error instanceof CodexUsageFetchError) throw error;
+    throw new CodexUsageFetchError('network_error', error?.message || String(error));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function pruneCodexRemoteUsageAccounts(currentAccountKey = null) {
+  if (codexRemoteUsageByAccount.size <= 8) return;
+  const removable = [...codexRemoteUsageByAccount.entries()]
+    .filter(([accountKey]) => accountKey !== currentAccountKey)
+    .sort((a, b) => Number(a[1]?.fetchedAt || 0) - Number(b[1]?.fetchedAt || 0));
+  while (codexRemoteUsageByAccount.size > 8 && removable.length > 0) {
+    codexRemoteUsageByAccount.delete(removable.shift()[0]);
+  }
+}
+
+function listCodexRemoteUsageAccounts(currentAccountKey = null) {
+  const now = Date.now();
+  return [...codexRemoteUsageByAccount.entries()]
+    .map(([accountKey, entry]) => {
+      if (!entry?.account) return null;
+      const isCurrent = accountKey === currentAccountKey;
+      return {
+        ...entry.account,
+        isCurrent,
+        stale: !isCurrent || !!entry.error || !!entry.warning
+          || now - Number(entry.fetchedAt || 0) > CODEX_REMOTE_USAGE_STALE_MS,
+        lastError: entry.error || null,
+        warning: entry.warning || null,
+        lastAttemptAt: entry.lastAttemptAt || null,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      if (!!a.isCurrent !== !!b.isCurrent) return a.isCurrent ? -1 : 1;
+      return codexAccountTimestampMs(b) - codexAccountTimestampMs(a);
+    });
+}
+
+async function getCodexRemoteUsage({
+  force = false,
+  verifyInitial = false,
+  fetchImpl = global.fetch,
+  authReader = readCurrentCodexAuthSession,
+  authRetryCount = 0,
+} = {}) {
+  hydrateCodexUsageState();
+  let auth = authReader();
+  if (!auth?.accessToken || !auth?.accountId || !auth?.accountKey) {
+    return {
+      accounts: listCodexRemoteUsageAccounts(null),
+      currentAccountKey: null,
+      error: codexUsageErrorMessage(new CodexUsageFetchError('auth_missing', 'Missing Codex auth')),
+      warning: null,
+      lastAttemptAt: null,
+    };
+  }
+
+  const now = Date.now();
+  const cached = codexRemoteUsageByAccount.get(auth.accountKey) || null;
+  if (auth.accessExpiresAtMs && auth.accessExpiresAtMs <= now + 30_000) {
+    const message = codexUsageErrorMessage(new CodexUsageFetchError('unauthorized', 'Codex access token expired'));
+    codexRemoteUsageByAccount.set(auth.accountKey, {
+      ...cached,
+      tokenFingerprint: auth.tokenFingerprint,
+      lastAttemptAt: now,
+      error: message,
+      errorAt: now,
+    });
+    return {
+      accounts: listCodexRemoteUsageAccounts(auth.accountKey),
+      currentAccountKey: auth.accountKey,
+      error: message,
+      warning: cached?.warning || null,
+      lastAttemptAt: now,
+    };
+  }
+  if (!force && cached?.account
+    && now - cached.fetchedAt < CODEX_REMOTE_USAGE_CACHE_TTL_MS
+    && cached.tokenFingerprint === auth.tokenFingerprint) {
+    return {
+      accounts: listCodexRemoteUsageAccounts(auth.accountKey),
+      currentAccountKey: auth.accountKey,
+      error: cached.error || null,
+      warning: cached.warning || null,
+      lastAttemptAt: cached.lastAttemptAt || cached.fetchedAt,
+    };
+  }
+  if (!force && cached?.errorAt
+    && cached.tokenFingerprint === auth.tokenFingerprint
+    && now - cached.errorAt < CODEX_REMOTE_USAGE_ERROR_COOLDOWN_MS) {
+    return {
+      accounts: listCodexRemoteUsageAccounts(auth.accountKey),
+      currentAccountKey: auth.accountKey,
+      error: cached.error || null,
+      warning: cached.warning || null,
+      lastAttemptAt: cached.lastAttemptAt || cached.errorAt,
+    };
+  }
+
+  const inflightKey = `${auth.accountKey}:${auth.tokenFingerprint || 'token'}`;
+  let request = codexRemoteUsageInflight.get(inflightKey);
+  if (!request) {
+    request = (async () => {
+      const attemptAuth = auth;
+      let result;
+      try {
+        result = await fetchCodexUsageFromOpenAI(attemptAuth, { fetchImpl });
+        const acceptedEntry = codexRemoteUsageByAccount.get(attemptAuth.accountKey);
+        if (verifyInitial && !acceptedEntry?.account?.usage) {
+          const confirmations = await Promise.allSettled([
+            fetchCodexUsageFromOpenAI(attemptAuth, {
+              fetchImpl,
+              timeoutMs: CODEX_USAGE_INITIAL_CONFIRM_TIMEOUT_MS,
+            }),
+            fetchCodexUsageFromOpenAI(attemptAuth, {
+              fetchImpl,
+              timeoutMs: CODEX_USAGE_INITIAL_CONFIRM_TIMEOUT_MS,
+            }),
+          ]);
+          const consensus = selectCodexInitialUsageConsensus([
+            result,
+            ...confirmations
+              .filter((confirmation) => confirmation.status === 'fulfilled')
+              .map((confirmation) => confirmation.value),
+          ]);
+          if (!consensus) {
+            throw new CodexUsageFetchError('inconsistent_response', 'Initial OpenAI usage responses did not agree');
+          }
+          result = consensus;
+        }
+      } catch (error) {
+        error.authSnapshot = attemptAuth;
+        throw error;
+      }
+      const currentAuth = authReader();
+      const authStayedCurrent = currentAuth?.accountKey === attemptAuth.accountKey
+        && currentAuth?.tokenFingerprint === attemptAuth.tokenFingerprint;
+      if (authStayedCurrent) return { ...result, auth: currentAuth };
+      const error = new CodexUsageFetchError('account_changed', 'Codex auth changed during usage request');
+      error.authSnapshot = attemptAuth;
+      throw error;
+    })();
+    codexRemoteUsageInflight.set(inflightKey, request);
+    request.finally(() => {
+      if (codexRemoteUsageInflight.get(inflightKey) === request) {
+        codexRemoteUsageInflight.delete(inflightKey);
+      }
+    }).catch(() => {});
+  }
+
+  const lastAttemptAt = Date.now();
+  try {
+    const result = await request;
+    auth = result.auth || authReader() || auth;
+    const previous = codexRemoteUsageByAccount.get(result.account.accountKey) || null;
+    const reconciled = reconcileCodexUsageSnapshot(previous, result, lastAttemptAt);
+    const nextEntry = {
+      ...(reconciled.entry || previous || {}),
+      tokenFingerprint: auth.tokenFingerprint,
+      lastAttemptAt,
+      error: null,
+      errorAt: 0,
+    };
+    codexRemoteUsageByAccount.set(result.account.accountKey, nextEntry);
+    pruneCodexRemoteUsageAccounts(auth.accountKey);
+    if (reconciled.accepted) persistCodexUsageState();
+    console.log('[CodexData] remote usage ' + reconciled.status + ' account=' + result.account.label +
+      ' candidate=' + codexUsagePercentSummary(result.account.usage) +
+      ' shown=' + codexUsagePercentSummary(nextEntry.account?.usage) +
+      ' durMs=' + result.durationMs);
+    return {
+      accounts: listCodexRemoteUsageAccounts(auth.accountKey),
+      currentAccountKey: auth.accountKey,
+      error: null,
+      warning: nextEntry.warning || null,
+      lastAttemptAt,
+    };
+  } catch (error) {
+    const latestAuth = authReader();
+    const failedAuth = error?.authSnapshot || auth;
+    const latestAuthIsUsable = !!(latestAuth?.accessToken && latestAuth?.accountId && latestAuth?.accountKey);
+    const authChanged = !latestAuthIsUsable
+      || latestAuth.accountKey !== failedAuth.accountKey
+      || latestAuth.tokenFingerprint !== failedAuth.tokenFingerprint;
+    if (authChanged) {
+      if (latestAuthIsUsable && authRetryCount < 1) {
+        return getCodexRemoteUsage({
+          force: false,
+          verifyInitial,
+          fetchImpl,
+          authReader,
+          authRetryCount: authRetryCount + 1,
+        });
+      }
+      const changedError = latestAuthIsUsable
+        ? new CodexUsageFetchError('account_changed', 'Codex auth changed during usage request')
+        : new CodexUsageFetchError('auth_missing', 'Missing Codex auth');
+      return {
+        accounts: listCodexRemoteUsageAccounts(latestAuthIsUsable ? latestAuth.accountKey : null),
+        currentAccountKey: latestAuthIsUsable ? latestAuth.accountKey : null,
+        error: codexUsageErrorMessage(changedError),
+        warning: null,
+        lastAttemptAt,
+      };
+    }
+    const message = codexUsageErrorMessage(error);
+    const errorAccountKey = latestAuth?.accountKey || failedAuth.accountKey;
+    const previous = codexRemoteUsageByAccount.get(errorAccountKey)
+      || (cached?.account?.accountKey === errorAccountKey ? cached : null);
+    codexRemoteUsageByAccount.set(errorAccountKey, {
+      ...previous,
+      tokenFingerprint: latestAuth?.tokenFingerprint || failedAuth.tokenFingerprint,
+      lastAttemptAt,
+      error: message,
+      errorAt: Date.now(),
+    });
+    pruneCodexRemoteUsageAccounts(errorAccountKey);
+    console.warn('[CodexData] remote usage failed account=' +
+      (maskCodexEmail(latestAuth?.email || failedAuth.email) || shortCodexId(latestAuth?.accountId || failedAuth.accountId) || 'unknown') +
+      ' code=' + (error?.code || 'network_error') +
+      ' status=' + (error?.status || 'none'));
+    return {
+      accounts: listCodexRemoteUsageAccounts(errorAccountKey),
+      currentAccountKey: errorAccountKey,
+      error: message,
+      warning: previous?.warning || null,
+      lastAttemptAt,
+    };
+  }
+}
+
+function mergeCodexPreferredAccounts(accounts, preferredAccounts) {
+  const byKey = new Map();
+  for (const account of Array.isArray(accounts) ? accounts : []) {
+    if (account?.accountKey) byKey.set(account.accountKey, account);
+  }
+  for (const account of Array.isArray(preferredAccounts) ? preferredAccounts : []) {
+    if (account?.accountKey) byKey.set(account.accountKey, account);
+  }
+  return [...byKey.values()].sort((a, b) => {
+    if (!!a.isCurrent !== !!b.isCurrent) return a.isCurrent ? -1 : 1;
+    return codexAccountTimestampMs(b) - codexAccountTimestampMs(a);
+  });
+}
+
+function resetCodexUsageStateForTests() {
+  codexRemoteUsageByAccount.clear();
+  codexRemoteUsageInflight.clear();
+  codexUsageStateStore = null;
+  codexUsageStateHydrated = false;
+}
+
+function setCodexUsageStateStoreForTests(store) {
+  codexUsageStateStore = store || null;
+  codexUsageStateHydrated = false;
+  hydrateCodexUsageState();
+}
+
 function mergeCodexActiveUsageIntoAccounts(accounts, selectedAccountKey, activeUsage, sessionId) {
   if (!Array.isArray(accounts) || !selectedAccountKey || !activeUsage) return accounts;
   let changed = false;
@@ -2072,14 +2895,16 @@ function mergeCodexActiveUsageIntoAccounts(accounts, selectedAccountKey, activeU
       plan_type: activeUsage.plan_type || account.plan_type,
       source: 'active-session-rollout',
       sourceThreadId: sessionId || account.sourceThreadId || null,
+      stale: codexUsageAccountIsStale({ usage: activeUsage, timestamp: activeUsage.timestamp }),
+      lastError: null,
     };
   });
   return changed ? merged : accounts;
 }
 
 function codexUsagePercentSummary(usage) {
-  const weekly = usage?.seven_day || usage?.secondary || null;
-  const fiveHour = usage?.five_hour || usage?.primary || null;
+  const weekly = usage?.seven_day || null;
+  const fiveHour = usage?.five_hour || null;
   return 'weekly=' + (weekly?.utilization ?? 'null') +
     ' fiveHour=' + (fiveHour?.utilization ?? 'null');
 }
@@ -2087,6 +2912,27 @@ function codexUsagePercentSummary(usage) {
 function codexAccountTimestampMs(account) {
   const ms = parseTimestampMs(account?.timestamp);
   return Number.isFinite(ms) ? ms : 0;
+}
+
+function codexUsageAccountIsStale(account, now = Date.now()) {
+  if (!account?.usage) return true;
+  if (typeof account.stale === 'boolean') return account.stale;
+  const timestampMs = codexAccountTimestampMs(account);
+  if (!timestampMs) return true;
+  return now - timestampMs > 6 * 60 * 1000;
+}
+
+function codexActiveUsageMatchesSelected({
+  activeUsage,
+  activeAccountKey,
+  selectedAccountKey,
+  sessionId,
+  selectedSourceThreadId,
+}) {
+  if (!activeUsage) return false;
+  if (!selectedAccountKey) return !!activeAccountKey;
+  if (activeAccountKey) return activeAccountKey === selectedAccountKey;
+  return !!sessionId && selectedSourceThreadId === sessionId;
 }
 
 function pruneCodexActiveUsageOverrides(now = Date.now()) {
@@ -2136,6 +2982,8 @@ function mergeCodexActiveOverridesIntoAccounts(accounts, { includeMissing = true
           plan_type: activeAccount.plan_type || prev.plan_type,
           source: 'active-session-rollout',
           sourceThreadId: activeAccount.sourceThreadId || prev.sourceThreadId || null,
+          stale: codexUsageAccountIsStale(activeAccount),
+          lastError: null,
         };
         changed = true;
         console.log('[CodexData] usage active override apply reason=' + reason +
@@ -2278,8 +3126,8 @@ async function scanLatestCodexUsageAccounts() {
 
   console.log('[CodexData] usage accounts scanned count=' + accounts.length +
     ' labels=' + accounts.map((a) => {
-      const weekly = a.usage?.seven_day || a.usage?.secondary || null;
-      const fiveHour = a.usage?.five_hour || a.usage?.primary || null;
+      const weekly = a.usage?.seven_day || null;
+      const fiveHour = a.usage?.five_hour || null;
       return a.label + ':' + (a.plan_type || 'unknown') +
         ':w=' + (weekly?.utilization ?? 'null') +
         ':5h=' + (fiveHour?.utilization ?? 'null') +
@@ -2368,17 +3216,24 @@ function startCodexUsageAccountsRefresh({ force = false, reason = 'refresh' } = 
       const mergedAccounts = mergeCodexActiveOverridesIntoAccounts(accounts, { reason });
       usageAccountsCache = { ts: Date.now(), accounts: mergedAccounts };
       usageAccountsLastError = null;
+      usageAccountsLastErrorAt = 0;
       console.log('[CodexData] usage accounts refresh done count=' + mergedAccounts.length +
         ' durMs=' + (Date.now() - startedAt));
       return mergedAccounts;
     })
     .catch((error) => {
-      usageAccountsLastError = error?.message || String(error);
-      if (!usageAccountsCache) {
-        usageAccountsCache = { ts: Date.now(), accounts: [] };
-      }
+      const rawError = error?.message || String(error);
+      const durationMs = Date.now() - startedAt;
+      usageAccountsLastError = durationMs >= 14_500
+        ? 'Local Codex usage cache refresh timed out.'
+        : 'Local Codex usage cache could not be refreshed.';
+      usageAccountsLastErrorAt = Date.now();
+      usageAccountsCache = {
+        ts: Date.now(),
+        accounts: usageAccountsCache?.accounts || [],
+      };
       console.warn('[CodexData] usage accounts refresh failed durMs=' + (Date.now() - startedAt) +
-        ' error=' + usageAccountsLastError);
+        ' error=' + compactPreview(rawError, 240));
       return usageAccountsCache.accounts;
     })
     .finally(() => {
@@ -2398,8 +3253,20 @@ async function getCodexUsageAccountsFast({ force = false, reason = 'ipc' } = {})
     if (accounts !== cache.accounts) usageAccountsCache = { ...cache, accounts };
     return {
       accounts,
-      stale: false,
+      stale: !!usageAccountsLastError,
       refreshing: !!usageAccountsRefreshInFlight,
+      cacheAgeMs,
+      lastAttemptAt: usageAccountsLastAttemptAt,
+      error: usageAccountsLastError,
+    };
+  }
+
+  if (!force && usageAccountsLastErrorAt && now - usageAccountsLastErrorAt < USAGE_ACCOUNTS_ERROR_COOLDOWN_MS) {
+    const accounts = mergeCodexActiveOverridesIntoAccounts(cache?.accounts || [], { reason: 'error-cooldown' });
+    return {
+      accounts,
+      stale: true,
+      refreshing: false,
       cacheAgeMs,
       lastAttemptAt: usageAccountsLastAttemptAt,
       error: usageAccountsLastError,
@@ -2444,6 +3311,33 @@ async function getCodexUsageAccountsFast({ force = false, reason = 'ipc' } = {})
     lastAttemptAt: usageAccountsLastAttemptAt,
     error: usageAccountsLastError,
   };
+}
+
+function getCodexUsageAccountsSnapshot(reason = 'snapshot') {
+  const now = Date.now();
+  const cache = usageAccountsCache;
+  const accounts = mergeCodexActiveOverridesIntoAccounts(cache?.accounts || [], { reason });
+  if (cache && accounts !== cache.accounts) usageAccountsCache = { ...cache, accounts };
+  return {
+    accounts,
+    stale: !!usageAccountsLastError || !cache,
+    refreshing: !!usageAccountsRefreshInFlight,
+    cacheAgeMs: cache ? now - cache.ts : null,
+    lastAttemptAt: usageAccountsLastAttemptAt,
+    error: usageAccountsLastError,
+  };
+}
+
+function shouldLoadCodexFallbackUsage(remoteResult, requestedAccountKey = null) {
+  const remoteAccounts = Array.isArray(remoteResult?.accounts) ? remoteResult.accounts : [];
+  if (requestedAccountKey) {
+    const requested = remoteAccounts.find((account) => account?.accountKey === requestedAccountKey);
+    if (requested?.source === 'openai-usage-api' && requested?.usage) return false;
+    if (!requested) return true;
+    return !requested.isCurrent || !!requested.stale;
+  }
+  if (remoteAccounts.some((account) => account?.isCurrent && account?.usage)) return false;
+  return !!remoteResult?.error || remoteAccounts.length === 0;
 }
 
 async function findLatestCodexUsageAccounts({ force = false } = {}) {
@@ -2529,7 +3423,10 @@ async function loadSessionRecords(sessionId, cwd) {
   return { success: true, records, filePath: found.filePath };
 }
 
-function register() {
+function register({ projectManager } = {}) {
+  codexUsageStateStore = projectManager?.db || null;
+  codexUsageStateHydrated = false;
+  hydrateCodexUsageState();
   ipcMain.handle('codex:get-timeline', async (_event, { sessionId, cwd }) => {
     try {
       const loaded = await loadSessionRecords(sessionId, cwd);
@@ -2617,33 +3514,38 @@ function register() {
 
   ipcMain.handle('codex:get-usage', async (_event, opts = {}) => {
     try {
-      const accountResult = await getCodexUsageAccountsFast({
+      const remoteResult = await getCodexRemoteUsage({
         force: !!opts?.force,
-        reason: opts?.force ? 'ipc-force' : 'ipc',
+        verifyInitial: true,
       });
-      let accountUsages = accountResult.accounts || [];
+      // The local log is discovery/fallback only. A healthy OpenAI response
+      // must not start or wait for a multi-gigabyte log scan.
+      const needsFallback = shouldLoadCodexFallbackUsage(remoteResult, opts?.accountKey);
+      const accountResult = needsFallback
+        ? await getCodexUsageAccountsFast({ force: false, reason: 'ipc-fallback' })
+        : getCodexUsageAccountsSnapshot('ipc-server-primary');
+      let accountUsages = mergeCodexPreferredAccounts(
+        accountResult.accounts || [],
+        remoteResult.accounts || []
+      );
 
       let activeUsage = null;
       let activeIdentity = null;
       let activeAccountKey = null;
-      if (opts?.sessionId) {
+      if (needsFallback && opts?.sessionId) {
         try {
           const [identity, loaded] = await Promise.all([
-            findCodexAccountIdentityForThread(opts.sessionId).catch(() => null),
-            loadSessionRecords(opts.sessionId, opts.cwd).catch((error) => ({ success: false, error: error?.message || String(error) })),
+            resolveAfterBudget(
+              findCodexAccountIdentityForThread(opts.sessionId).catch(() => null),
+              1000,
+              null
+            ),
+            loadLatestCodexUsageForSession(opts.sessionId, opts.cwd)
+              .catch((error) => ({ success: false, error: error?.message || String(error) })),
           ]);
           activeIdentity = identity;
           if (loaded?.success) {
-            activeUsage = latestCodexUsageInRecords(loaded.records, loaded.filePath);
-          }
-          if (!activeIdentity && activeUsage) {
-            activeIdentity = currentCodexAuthIdentityForUsage(activeUsage);
-            if (activeIdentity) {
-              console.log('[CodexData] usage active identity from auth account=' +
-                (maskCodexEmail(activeIdentity.email) || shortCodexId(activeIdentity.accountId) || 'unknown') +
-                ' session=' + (shortCodexId(opts.sessionId) || 'none') +
-                ' sample=' + (activeUsage.timestamp || 'null'));
-            }
+            activeUsage = loaded.usage || null;
           }
           activeAccountKey = codexAccountKeyFromIdentity(activeIdentity);
         } catch {}
@@ -2658,6 +3560,15 @@ function register() {
           }
         }
       }
+      accountUsages = mergeCodexPreferredAccounts(
+        accountUsages,
+        (remoteResult.accounts || []).filter((account) => account.isCurrent && !account.stale)
+      );
+      accountUsages = accountUsages.map((account) => ({
+        ...account,
+        isCurrent: account.accountKey === remoteResult.currentAccountKey,
+        stale: codexUsageAccountIsStale(account),
+      }));
 
       let selectedAccount = opts?.accountKey
         ? accountUsages.find((account) => account.accountKey === opts.accountKey)
@@ -2673,11 +3584,13 @@ function register() {
         ? 'active-session-rollout'
         : (usage ? 'account-log' : 'none');
 
-      const activeMatchesSelected = !!activeUsage && (
-        !selectedAccountKey ||
-        (activeAccountKey && activeAccountKey === selectedAccountKey) ||
-        (!!opts?.sessionId && selectedAccount?.sourceThreadId === opts.sessionId)
-      );
+      const activeMatchesSelected = codexActiveUsageMatchesSelected({
+        activeUsage,
+        activeAccountKey,
+        selectedAccountKey,
+        sessionId: opts?.sessionId,
+        selectedSourceThreadId: selectedAccount?.sourceThreadId,
+      });
       if (activeMatchesSelected && (!usage || compareCodexUsageFreshness(activeUsage, usage) > 0)) {
         if (!selectedAccountKey && activeAccountKey) {
           const activeAccount = buildCodexActiveUsageAccount(activeIdentity, activeUsage, opts.sessionId);
@@ -2693,39 +3606,54 @@ function register() {
         usage = activeUsage;
         source = 'active-session-rollout';
       }
-      if (!usage && !accountResult.refreshing) {
+      if (!usage && !accountResult.refreshing && !opts?.accountKey && accountUsages.length === 0) {
         usage = await findLatestCodexUsage();
-        source = usage ? 'latest-rollout' : source;
-      }
-      if (!usage && accountResult.refreshing) {
-        source = 'account-refreshing';
+        source = usage ? 'latest-rollout-unverified' : source;
       }
 
-      const weekly = usage?.seven_day?.utilization ?? usage?.secondary?.utilization ?? null;
-      const fiveHour = usage?.five_hour?.utilization ?? usage?.primary?.utilization ?? null;
+      if (selectedAccount?.source) source = selectedAccount.source;
+      const selectedIsCurrent = !!selectedAccountKey
+        && selectedAccountKey === remoteResult.currentAccountKey;
+      const stale = selectedAccount
+        ? codexUsageAccountIsStale(selectedAccount)
+        : !!usage;
+      const warning = selectedAccount && !selectedIsCurrent && stale
+        ? 'Selected account is not the current Codex login. Showing its last known value.'
+        : (selectedIsCurrent ? (remoteResult.warning || selectedAccount?.warning || null) : null);
+      const relevantError = selectedIsCurrent
+        ? remoteResult.error
+        : (!usage ? (accountResult.error || remoteResult.error) : null);
+
+      const weekly = usage?.seven_day?.utilization ?? null;
+      const fiveHour = usage?.five_hour?.utilization ?? null;
       const accountLabel = selectedAccount?.label || accountUsages[0]?.label || 'none';
       console.log('[CodexData] get-usage source=' + source +
         ' accounts=' + accountUsages.length +
         ' selected=' + accountLabel +
         ' weekly=' + (weekly ?? 'null') +
         ' fiveHour=' + (fiveHour ?? 'null') +
-        ' refreshing=' + (accountResult.refreshing ? '1' : '0') +
-        ' stale=' + (accountResult.stale ? '1' : '0') +
+        ' refreshing=0' +
+        ' stale=' + (stale ? '1' : '0') +
         ' cacheAgeMs=' + (accountResult.cacheAgeMs ?? 'none') +
         ' session=' + (opts?.sessionId ? String(opts.sessionId).slice(0, 8) : 'none') +
-        ' error=' + (accountResult.error ? compactPreview(accountResult.error, 120) : 'none'));
+        ' error=' + (relevantError ? compactPreview(relevantError, 120) : 'none'));
 
       return {
         success: true,
         data: usage,
         accounts: accountUsages,
         selectedAccountKey,
+        currentAccountKey: remoteResult.currentAccountKey,
         source,
-        refreshing: accountResult.refreshing,
-        stale: accountResult.stale,
+        refreshing: false,
+        stale,
         cacheAgeMs: accountResult.cacheAgeMs,
-        lastAttemptAt: accountResult.lastAttemptAt,
-        error: !usage && accountResult.error ? accountResult.error : null,
+        lastAttemptAt: selectedIsCurrent
+          ? remoteResult.lastAttemptAt
+          : accountResult.lastAttemptAt,
+        lastSuccessAt: usage?.timestamp || null,
+        warning,
+        error: relevantError,
       };
     } catch (error) {
       console.error('[CodexData] get-usage error:', error);
@@ -2751,6 +3679,7 @@ module.exports = {
     findCodexSessionFile,
     findLatestCodexSession,
     parseJsonlFile,
+    codexCompactCompanionLines,
     invalidateJsonlCache: invalidateCodexJsonlCache,
     buildCodexCleanEntries,
     buildCodexCleanExport,
@@ -2767,9 +3696,28 @@ module.exports = {
     getCodexUsageAccountsFast,
     compareCodexRateSnapshotFreshness,
     compareCodexUsageFreshness,
+    normalizeCodexWhamWindow,
+    buildCodexUsageFromWhamResponse,
+    buildCodexUsageFromRateLimits,
+    canonicalizeCodexUsage,
+    codexUsageSnapshotsMatch,
+    classifyCodexUsageSnapshot,
+    reconcileCodexUsageSnapshot,
+    selectCodexInitialUsageConsensus,
+    serializeCodexUsageState,
+    parseCodexUsageState,
+    fetchCodexUsageFromOpenAI,
+    getCodexRemoteUsage,
+    readCurrentCodexAuthSession,
+    mergeCodexPreferredAccounts,
+    codexUsageAccountIsStale,
+    codexActiveUsageMatchesSelected,
+    shouldLoadCodexFallbackUsage,
+    findLatestCodexUsageInFile,
+    resetCodexUsageStateForTests,
+    setCodexUsageStateStoreForTests,
     findCodexAccountIdentityForThread,
     codexAccountKeyFromIdentity,
-    currentCodexAuthIdentityForUsage,
     rememberCodexActiveUsageOverride,
     mergeCodexActiveOverridesIntoAccounts,
   },

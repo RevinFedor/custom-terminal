@@ -41,6 +41,12 @@
       "package.json",
       "!logs/**"
     ],
+    "extraResources": [
+      {
+        "from": "packages/file-explorer/main",
+        "to": "shared-packages/file-explorer"
+      }
+    ],
     "asarUnpack": [
       "node_modules/@anthropic-ai/claude-agent-sdk-darwin-arm64/**",
       "node_modules/@anthropic-ai/claude-agent-sdk-darwin-x64/**",

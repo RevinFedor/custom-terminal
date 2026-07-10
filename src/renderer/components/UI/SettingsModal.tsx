@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef, useCallback } from 'react';
+import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { useUIStore } from '../../store/useUIStore';
 import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel, PROMPT_SUMMARY_PROMPT_ID } from '../../store/usePromptsStore';
 import { GEMINI_MODEL_OPTIONS } from '../../constants/geminiModels';
@@ -11,6 +11,17 @@ import { HexColorPicker } from 'react-colorful';
 import { Trash2, Plus } from 'lucide-react';
 import { DEFAULT_CLAUDE_CODE_SETTINGS } from '../../constants/claudeLevels';
 import { DEFAULT_CODEX_SETTINGS } from '../../constants/codexSettings';
+import {
+  autoScrollNearEdge,
+  captureGroupedListGeometry,
+  buildVisualHierarchyDepthMap,
+  moveStructuredEntity,
+  orderVisualHierarchyItems,
+  resolveGroupedListTarget,
+  resolveVisualHierarchyStep,
+  startPointerDragSession,
+  visualHierarchyAncestorIds,
+} from '@noted/structured-dnd';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -32,9 +43,11 @@ interface PromptGroup {
 }
 
 interface Prompt {
+  id: string;
   title: string;
   content: string;
   group_id?: number | null;
+  visual_parent_id?: string | null;
   position?: number;
   file_paths?: string[];
 }
@@ -42,7 +55,7 @@ interface Prompt {
 type FlatPromptItem = { type: 'prompt'; origIdx: number; prompt: Prompt };
 type FlatGroupItem = { type: 'group'; group: PromptGroup };
 type FlatItem = FlatPromptItem | FlatGroupItem;
-type DragItem = { type: 'group'; id: number } | { type: 'prompt'; index: number };
+type DragItem = { type: 'group'; id: number } | { type: 'prompt'; id: string };
 type PromptDragState = { prompts: Prompt[]; promptGroups: PromptGroup[] };
 type RectSnap = { left: number; right: number; top: number; bottom: number; height: number; midY: number };
 type DragFlatZone = { idx: number; item: DragItem; rect: RectSnap; header: RectSnap };
@@ -65,15 +78,44 @@ type PointerDragSession = {
   base: PromptDragState;
   geometry: DragGeometry | null;
   lastKey: string | null;
+  pendingNext?: PromptDragState | null;
+  horizontalBaseX?: number;
   click: () => void;
   prevCursor: string;
   prevUserSelect: string;
 };
 
-const snapRect = (el: Element): RectSnap => {
-  const r = el.getBoundingClientRect();
-  return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, height: r.height, midY: r.top + r.height / 2 };
-};
+function toStructuredPromptModel(state: PromptDragState) {
+  return {
+    containers: state.promptGroups.map(group => ({ id: String(group.id), position: group.position })),
+    items: state.prompts.map((prompt, index) => ({
+      id: prompt.id,
+      containerId: prompt.group_id == null ? null : String(prompt.group_id),
+      parentId: prompt.visual_parent_id || null,
+      position: Number.isFinite(Number(prompt.position)) ? Number(prompt.position) : index,
+    })),
+  };
+}
+
+function applyStructuredPromptModel(state: PromptDragState, model: any): PromptDragState {
+  const groups = new Map(model.containers.map((item: any) => [String(item.id), item]));
+  const prompts = new Map(model.items.map((item: any) => [String(item.id), item]));
+  return {
+    promptGroups: state.promptGroups.map(group => ({
+      ...group,
+      position: Number((groups.get(String(group.id)) as any)?.position ?? group.position),
+    })),
+    prompts: state.prompts.map(prompt => {
+      const next = prompts.get(prompt.id) as any;
+      return next ? {
+        ...prompt,
+        group_id: next.containerId == null ? null : Number(next.containerId),
+        visual_parent_id: next.parentId || null,
+        position: Number(next.position),
+      } : prompt;
+    }),
+  };
+}
 
 const fmtY = (r: RectSnap) => `${Math.round(r.top)}-${Math.round(r.midY)}-${Math.round(r.bottom)}`;
 
@@ -88,6 +130,8 @@ const VR_BORDER = '#2c2c30';
 const VR_TEXT = '#e8e8ea';
 const VR_DIM = '#8a8a8d';
 const VR_VIOLET = '#7c3aed';
+let promptIdSequence = 0;
+const newTextPromptId = () => `prompt-${Date.now().toString(36)}-${(promptIdSequence++).toString(36)}`;
 const VR_GREEN = '#22c55e';
 const VR_RED = '#ef4444';
 
@@ -1344,10 +1388,16 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [savedGroupFlash, setSavedGroupFlash] = useState<'name' | 'description' | null>(null);
   const savedGroupTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [draggingItem, setDraggingItem] = useState<DragItem | null>(null);
+  const [dragTargetKey, setDragTargetKey] = useState<string | null>(null);
+  const [horizontalIntent, setHorizontalIntent] = useState<{ sourceId: string; direction: 'left' | 'right'; progress: number; disabled: boolean } | null>(null);
   const textListRef = useRef<HTMLDivElement>(null);
   const pointerDragRef = useRef<PointerDragSession | null>(null);
   const dragVisualStateRef = useRef<PromptDragState>({ prompts: [], promptGroups: [] });
   const latestPromptStateRef = useRef<PromptDragState>({ prompts: [], promptGroups: [] });
+  const promptVisualDepthById = useMemo(
+    () => buildVisualHierarchyDepthMap(prompts, { parentKey: 'visual_parent_id' }),
+    [prompts],
+  );
 
   // Editing states
   const [editingClaude, setEditingClaude] = useState(false);
@@ -1421,7 +1471,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       // Load user prompts (text insertion snippets) and groups
       ipcRenderer.invoke('prompts:get').then((result: { success: boolean; data?: Prompt[] }) => {
         if (result.success && result.data) {
-          setPrompts(result.data);
+          setPrompts(result.data.map((prompt, index) => ({ ...prompt, id: prompt.id || `legacy-prompt-${index}` })));
         }
       });
       ipcRenderer.invoke('prompt-groups:get').then((result: { success: boolean; data?: PromptGroup[] }) => {
@@ -1608,14 +1658,35 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
 
   // Build flat items: groups and ungrouped prompts interleaved by position
   const flatItemsFor = (state: PromptDragState): FlatItem[] => {
-    const items: FlatItem[] = [];
-    state.promptGroups.forEach(g => items.push({ type: 'group', group: g }));
-    state.prompts.forEach((p, i) => { if (!p.group_id) items.push({ type: 'prompt', origIdx: i, prompt: p }); });
-    return items.sort((a, b) => {
+    const ungrouped = orderVisualHierarchyItems(
+      state.prompts
+        .map((prompt, origIdx) => ({ ...prompt, origIdx }))
+        .filter(prompt => !prompt.group_id)
+        .sort((a, b) => promptPos(a, a.origIdx) - promptPos(b, b.origIdx)),
+      { parentKey: 'visual_parent_id' },
+    );
+    const depth = buildVisualHierarchyDepthMap(ungrouped, { parentKey: 'visual_parent_id' });
+    const roots: FlatItem[] = [
+      ...state.promptGroups.map(group => ({ type: 'group' as const, group })),
+      ...ungrouped.filter(prompt => (depth.get(prompt.id) || 0) === 0)
+        .map(prompt => ({ type: 'prompt' as const, origIdx: prompt.origIdx, prompt })),
+    ].sort((a, b) => {
       const posA = a.type === 'group' ? a.group.position : promptPos(a.prompt, a.origIdx);
       const posB = b.type === 'group' ? b.group.position : promptPos(b.prompt, b.origIdx);
       return posA - posB;
     });
+    const result: FlatItem[] = [];
+    for (const root of roots) {
+      result.push(root);
+      if (root.type !== 'prompt') continue;
+      const rootIndex = ungrouped.findIndex(prompt => prompt.id === root.prompt.id);
+      for (let index = rootIndex + 1; index < ungrouped.length; index += 1) {
+        if ((depth.get(ungrouped[index].id) || 0) === 0) break;
+        const prompt = ungrouped[index];
+        result.push({ type: 'prompt', origIdx: prompt.origIdx, prompt });
+      }
+    }
+    return result;
   };
 
   const buildFlatItems = () => flatItemsFor({ prompts, promptGroups });
@@ -1717,10 +1788,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   };
 
   const sameDragItem = (a: DragItem, b: DragItem) =>
-    a.type === b.type && (a.type === 'group' ? a.id === (b as { type: 'group'; id: number }).id : a.index === (b as { type: 'prompt'; index: number }).index);
+    a.type === b.type && a.id === b.id;
 
   const flatItemToDrag = (item: FlatItem): DragItem =>
-    item.type === 'group' ? { type: 'group', id: item.group.id } : { type: 'prompt', index: item.origIdx };
+    item.type === 'group' ? { type: 'group', id: item.group.id } : { type: 'prompt', id: item.prompt.id };
 
   const reindexFlatState = (state: PromptDragState, flat: FlatItem[]): PromptDragState => {
     const nextGroups = state.promptGroups.map(g => ({ ...g }));
@@ -1730,50 +1801,24 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
         const gi = nextGroups.findIndex(g => g.id === item.group.id);
         if (gi >= 0) nextGroups[gi] = { ...nextGroups[gi], position: pos };
       } else {
-        nextPrompts[item.origIdx] = { ...nextPrompts[item.origIdx], group_id: null, position: pos };
+        const promptIndex = nextPrompts.findIndex(prompt => prompt.id === item.prompt.id);
+        if (promptIndex >= 0) nextPrompts[promptIndex] = { ...nextPrompts[promptIndex], group_id: null, position: pos };
       }
     });
     return { prompts: nextPrompts, promptGroups: nextGroups };
   };
 
   const moveFlatItem = (state: PromptDragState, drag: DragItem, targetIdx: number): PromptDragState => {
-    const flat = flatItemsFor(state);
-    const existingIdx = flat.findIndex(item => sameDragItem(flatItemToDrag(item), drag));
-    const moving: FlatItem | null = drag.type === 'group'
-      ? (() => {
-          const group = state.promptGroups.find(g => g.id === drag.id);
-          return group ? { type: 'group' as const, group } : null;
-        })()
-      : (() => {
-          const prompt = state.prompts[drag.index];
-          return prompt ? { type: 'prompt' as const, origIdx: drag.index, prompt } : null;
-        })();
-    if (!moving) return state;
-    const without = flat.filter(item => !sameDragItem(flatItemToDrag(item), drag));
-    const insertAt = Math.max(0, Math.min(existingIdx >= 0 && existingIdx < targetIdx ? targetIdx - 1 : targetIdx, without.length));
-    return reindexFlatState(state, [...without.slice(0, insertAt), moving, ...without.slice(insertAt)]);
+    return applyStructuredPromptModel(state, moveStructuredEntity(toStructuredPromptModel(state), {
+      type: drag.type === 'group' ? 'container' : 'item', id: String(drag.id),
+    }, { kind: 'flat', index: targetIdx }));
   };
 
   const movePromptIntoGroupAt = (state: PromptDragState, drag: DragItem, groupId: number, targetIdxRaw: number): PromptDragState => {
     if (drag.type !== 'prompt' || !state.promptGroups.some(g => g.id === groupId)) return state;
-    const moving = state.prompts[drag.index];
-    if (!moving) return state;
-    const groupPrompts = state.prompts
-      .map((p, i) => ({ prompt: p, index: i }))
-      .filter(item => item.prompt.group_id === groupId && item.index !== drag.index)
-      .sort((a, b) => promptPos(a.prompt, a.index) - promptPos(b.prompt, b.index));
-    const targetIdx = Math.max(0, Math.min(targetIdxRaw, groupPrompts.length));
-    const ordered = [
-      ...groupPrompts.slice(0, targetIdx),
-      { prompt: moving, index: drag.index },
-      ...groupPrompts.slice(targetIdx),
-    ];
-    const promptsNext = state.prompts.map((p, i) => {
-      const pos = ordered.findIndex(item => item.index === i);
-      return pos >= 0 ? { ...p, group_id: groupId, position: pos } : p;
-    });
-    const next = { prompts: promptsNext, promptGroups: state.promptGroups };
-    return reindexFlatState(next, flatItemsFor(next));
+    return applyStructuredPromptModel(state, moveStructuredEntity(toStructuredPromptModel(state), {
+      type: 'item', id: drag.id,
+    }, { kind: 'container', containerId: String(groupId), index: targetIdxRaw }));
   };
 
   const applyPromptDragState = (state: PromptDragState, save: boolean) => {
@@ -1788,161 +1833,68 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   };
 
   const autoScrollDragList = (clientY: number) => {
-    const el = textListRef.current;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    const edge = 34;
-    if (clientY < r.top + edge) el.scrollTop -= Math.ceil((r.top + edge - clientY) / 3) + 6;
-    else if (clientY > r.bottom - edge) el.scrollTop += Math.ceil((clientY - (r.bottom - edge)) / 3) + 6;
+    return autoScrollNearEdge(textListRef.current, clientY);
   };
 
   const captureDragGeometry = (base: PromptDragState): DragGeometry | null => {
     const list = textListRef.current;
     if (!list) return null;
-    const flat = flatItemsFor(base);
-    const flatZones: DragFlatZone[] = [];
-    for (const c of Array.from(list.querySelectorAll<HTMLElement>('[data-dnd-flat-container]'))) {
-      const type = c.dataset.dndType as DragItem['type'] | undefined;
-      const idRaw = c.dataset.dndId;
-      if (!type || idRaw == null) continue;
-      const item: DragItem = type === 'group' ? { type, id: Number(idRaw) } : { type, index: Number(idRaw) };
-      const idx = flat.findIndex(row => sameDragItem(flatItemToDrag(row), item));
-      if (idx < 0) continue;
-      const headerEl = type === 'group' ? c.querySelector<HTMLElement>('[data-dnd-kind="flat"]') || c : c;
-      flatZones.push({ idx, item, rect: snapRect(c), header: snapRect(headerEl) });
-    }
-
-    const groupZones: DragGroupZone[] = [];
-    for (const body of Array.from(list.querySelectorAll<HTMLElement>('[data-dnd-kind="group-body"]'))) {
-      const groupId = Number(body.dataset.groupId);
-      if (!Number.isFinite(groupId)) continue;
-      const container = body.closest<HTMLElement>('[data-dnd-flat-container]');
-      const header = container?.querySelector<HTMLElement>('[data-dnd-kind="flat"]') || null;
-      const rows = Array.from(body.querySelectorAll<HTMLElement>('[data-dnd-kind="group-prompt"]'))
-        .map(row => ({ promptIndex: Number(row.dataset.promptIndex), rect: snapRect(row) }))
-        .filter(row => Number.isFinite(row.promptIndex));
-      const empty = body.querySelector<HTMLElement>('[data-dnd-kind="group-empty"]');
-      groupZones.push({
-        groupId,
-        header: header ? snapRect(header) : null,
-        body: snapRect(body),
-        rows,
-        empty: empty ? snapRect(empty) : null,
-        rowLeft: rows.length ? Math.min(...rows.map(row => row.rect.left)) : null,
-        rowRight: rows.length ? Math.max(...rows.map(row => row.rect.right)) : null,
-      });
-    }
-
-    flatZones.sort((a, b) => a.idx - b.idx);
-    return { list: snapRect(list), flat: flatZones, groups: groupZones };
+    return captureGroupedListGeometry(
+      list,
+      flatItemsFor(base).map(item => ({
+        type: item.type === 'group' ? 'container' : 'item',
+        id: item.type === 'group' ? String(item.group.id) : item.prompt.id,
+      })),
+    ) as DragGeometry;
   };
 
   const summarizeDragGeometry = (g: DragGeometry | null) => {
     if (!g) return 'geom=null';
-    const flat = g.flat.map(z => `${z.idx}:${z.item.type[0]}:${z.item.type === 'group' ? z.item.id : z.item.index}@${fmtY(z.rect)} h@${fmtY(z.header)}`).join(' ');
-    const groups = g.groups.map(z => `g:${z.groupId} rows=${z.rows.length} body@${fmtY(z.body)}`).join(' ');
+    const flat = (g.flat as any[]).map(z => `${z.index}:${z.type[0]}:${z.id}@${fmtY(z.rect)} h@${fmtY(z.header)}`).join(' ');
+    const groups = (g.groups as any[]).map(z => `g:${z.containerId} rows=${z.rows.length} body@${fmtY(z.body)}`).join(' ');
     return `flat=[${flat}] groups=[${groups}]`;
   };
 
   const resolveDragTarget = (item: DragItem, clientX: number, clientY: number): DragTarget | null => {
     const session = pointerDragRef.current;
-    const base = session?.base || dragVisualStateRef.current;
+    const base = session?.pendingNext || session?.base || dragVisualStateRef.current;
     let geometry = session?.geometry || null;
     if (!geometry) {
       geometry = captureDragGeometry(base);
       if (session) session.geometry = geometry;
     }
     if (!geometry) return null;
-    const listRect = geometry.list;
-    if (clientX < listRect.left - 28 || clientX > listRect.right + 28 || clientY < listRect.top - 80 || clientY > listRect.bottom + 80) {
-      return null;
-    }
+    const target = resolveGroupedListTarget({
+      geometry,
+      drag: { type: item.type === 'group' ? 'container' : 'item', id: String(item.id) },
+      clientX,
+      clientY,
+    });
+    if (!target) return null;
+    const next = target.kind === 'container'
+      ? movePromptIntoGroupAt(base, item, Number(target.containerId), target.index)
+      : moveFlatItem(base, item, target.index);
+    return { key: target.key, label: target.key, reason: target.reason, next };
+  };
 
-    if (item.type === 'prompt') {
-      for (const group of geometry.groups) {
-        const flatGroup = geometry.flat.find(z => z.item.type === 'group' && z.item.id === group.groupId);
-        if (flatGroup && group.header && clientX >= group.header.left && clientX <= group.header.right && clientY >= group.header.top && clientY <= group.header.bottom) {
-          if (clientY >= group.header.midY) {
-            return {
-              key: `group:${group.groupId}:0`,
-              label: `group:${group.groupId}:0`,
-              reason: `group-header-lower y=${Math.round(clientY)} mid=${Math.round(group.header.midY)}`,
-              next: movePromptIntoGroupAt(base, item, group.groupId, 0),
-            };
-          }
-          return {
-            key: `flat:${flatGroup.idx}`,
-            label: `flat:${flatGroup.idx}`,
-            reason: `group-header-upper y=${Math.round(clientY)} mid=${Math.round(group.header.midY)}`,
-            next: moveFlatItem(base, item, flatGroup.idx),
-          };
-        }
-
-        if (group.rows.length === 0) {
-          const er = group.empty;
-          if (er && clientY >= er.top && clientY <= er.bottom && clientX >= er.left - 18 && clientX <= er.right + 18) {
-            return {
-              key: `group:${group.groupId}:0`,
-              label: `group:${group.groupId}:0`,
-              reason: 'group-empty',
-              next: movePromptIntoGroupAt(base, item, group.groupId, 0),
-            };
-          }
-          continue;
-        }
-
-        const first = group.rows[0].rect;
-        const last = group.rows[group.rows.length - 1].rect;
-        const rowLeft = group.rowLeft ?? group.body.left;
-        const rowRight = group.rowRight ?? group.body.right;
-        if (clientY < Math.min(group.body.top, first.top - 8) || clientY > last.bottom) continue;
-        if (clientX < rowLeft - 12 || clientX > rowRight + 18) continue;
-
-        let targetIdx = 0;
-        for (const row of group.rows) {
-          if (row.promptIndex === item.index) continue;
-          if (clientY < row.rect.midY) break;
-          targetIdx += 1;
-        }
-        return {
-          key: `group:${group.groupId}:${targetIdx}`,
-          label: `group:${group.groupId}:${targetIdx}`,
-          reason: `group-rows y=${Math.round(clientY)} rows=${group.rows.map(r => `${r.promptIndex}@${Math.round(r.rect.midY)}`).join(',')}`,
-          next: movePromptIntoGroupAt(base, item, group.groupId, targetIdx),
-        };
-      }
-    }
-
-    let targetIdx = geometry.flat.length;
-    for (const row of geometry.flat) {
-      if (clientY < row.rect.midY) { targetIdx = row.idx; break; }
-      targetIdx = row.idx + 1;
-    }
+  const resolveHierarchyTarget = (base: PromptDragState, item: DragItem, direction: 'left' | 'right') => {
+    if (item.type !== 'prompt') return null;
+    const model = toStructuredPromptModel(base);
+    const result = resolveVisualHierarchyStep({
+      items: model.items,
+      sourceId: item.id,
+      direction,
+      parentKey: 'parentId',
+      containerKey: 'containerId',
+      maxDepth: 4,
+    });
     return {
-      key: `flat:${targetIdx}`,
-      label: `flat:${targetIdx}`,
-      reason: `flat-block y=${Math.round(clientY)} mids=${geometry.flat.map(z => `${z.idx}:${z.item.type[0]}:${Math.round(z.rect.midY)}`).join(',')}`,
-      next: moveFlatItem(base, item, targetIdx),
+      ...result,
+      next: result.ok ? applyStructuredPromptModel(base, { ...model, items: result.items }) : base,
     };
   };
 
-  const previewPointerDrag = (item: DragItem, clientX: number, clientY: number) => {
-    const session = pointerDragRef.current;
-    if (!session || !session.active) return;
-    const target = resolveDragTarget(item, clientX, clientY);
-    if (!target || target.key === session.lastKey) return;
-    session.lastKey = target.key;
-    applyPromptDragState(target.next, false);
-    console.warn('[PromptDnD] preview', item, '->', target.label, 'via', target.reason, 'at', Math.round(clientX), Math.round(clientY));
-  };
-
   const startPointerDrag = (item: DragItem, click: () => void) => (e: React.PointerEvent<HTMLElement>) => {
-    if (e.button !== 0) return;
-    const target = e.target as HTMLElement | null;
-    if (target?.closest('[data-no-card-drag],button,input,textarea,select,a')) return;
-    e.preventDefault();
-    e.stopPropagation();
-
     const base = promptStateWithLocalDrafts();
     saveCurrentGroup();
     saveCurrentInsertion();
@@ -1952,82 +1904,77 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     setEditingPromptId(null);
     applyPromptDragState(base, false);
 
-    const session: PointerDragSession = {
+    const controller = startPointerDragSession(e, {
       item,
-      startX: e.clientX,
-      startY: e.clientY,
-      active: false,
-      base,
-      geometry: null,
-      lastKey: null,
-      click,
-      prevCursor: document.body.style.cursor,
-      prevUserSelect: document.body.style.userSelect,
-    };
-    pointerDragRef.current = session;
-
-    let onMove: (ev: PointerEvent) => void = () => {};
-    let onUp: () => void = () => {};
-    let onCancel: () => void = () => {};
-    let onKeyDown: (ev: KeyboardEvent) => void = () => {};
-    let onBlur: () => void = () => {};
-
-    const finish = (commit: boolean) => {
-      if (pointerDragRef.current !== session) return;
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-      window.removeEventListener('pointercancel', onCancel);
-      window.removeEventListener('keydown', onKeyDown);
-      window.removeEventListener('blur', onBlur);
-      document.body.style.cursor = session.prevCursor;
-      document.body.style.userSelect = session.prevUserSelect;
-
-      if (session.active) {
-        if (commit) {
-          applyPromptDragState(dragVisualStateRef.current, true);
-          console.warn('[PromptDnD] drop', item, '->', session.lastKey || 'same');
-        } else {
-          applyPromptDragState(session.base, false);
-          console.warn('[PromptDnD] cancel', item);
+      onClick: click,
+      getBase: () => base,
+      captureGeometry: (snapshot: PromptDragState) => captureDragGeometry(snapshot),
+      autoScroll: (clientY: number) => autoScrollDragList(clientY),
+      onStart: (session: PointerDragSession) => {
+        pointerDragRef.current = session;
+        session.horizontalBaseX = session.startX;
+        setDraggingItem(item);
+        setDragTargetKey(null);
+        setHorizontalIntent(null);
+        console.warn('[PromptDnD] start', item, summarizeDragGeometry(session.geometry));
+      },
+      onPreview: ({ session, clientX, clientY }: any) => {
+        pointerDragRef.current = session;
+        if (item.type === 'prompt') {
+          const baseX = Number.isFinite(session.horizontalBaseX) ? session.horizontalBaseX : session.startX;
+          const deltaX = clientX - baseX;
+          if (Math.abs(deltaX) > 2) {
+            const direction: 'left' | 'right' = deltaX < 0 ? 'left' : 'right';
+            const hierarchy = resolveHierarchyTarget(session.pendingNext || session.base, item, direction);
+            const progress = Math.min(1, Math.abs(deltaX) / 28);
+            setHorizontalIntent({ sourceId: item.id, direction, progress, disabled: !hierarchy?.ok });
+            if (Math.abs(deltaX) >= 28) {
+              const key = `hierarchy:${direction}:${hierarchy?.reason || 'invalid'}`;
+              if (!hierarchy?.ok) {
+                session.lastKey = key;
+                setDragTargetKey(key);
+                return { key, changed: false };
+              }
+              session.pendingNext = hierarchy.next;
+              session.horizontalBaseX = clientX;
+              applyPromptDragState(hierarchy.next, false);
+              setDragTargetKey(key);
+              console.warn('[PromptDnD] hierarchy', item, direction, '->', hierarchy.parentId || 'root');
+              return { key, changed: true };
+            }
+          } else {
+            setHorizontalIntent(null);
+          }
         }
-      } else if (commit) {
-        session.click();
-      }
-      pointerDragRef.current = null;
-      setDraggingItem(null);
-    };
-
-    const beginIfNeeded = (ev: PointerEvent) => {
-      if (session.active) return true;
-      const dx = ev.clientX - session.startX;
-      const dy = ev.clientY - session.startY;
-      if (Math.hypot(dx, dy) < 4) return false;
-      session.geometry = captureDragGeometry(session.base);
-      session.active = true;
-      setDraggingItem(item);
-      document.body.style.cursor = 'grabbing';
-      document.body.style.userSelect = 'none';
-      console.warn('[PromptDnD] start', item, summarizeDragGeometry(session.geometry));
-      return true;
-    };
-
-    onMove = (ev: PointerEvent) => {
-      if (pointerDragRef.current !== session) return;
-      ev.preventDefault();
-      if (!beginIfNeeded(ev)) return;
-      autoScrollDragList(ev.clientY);
-      previewPointerDrag(item, ev.clientX, ev.clientY);
-    };
-    onUp = () => finish(true);
-    onCancel = () => finish(false);
-    onKeyDown = (ev: KeyboardEvent) => { if (ev.key === 'Escape') finish(false); };
-    onBlur = () => finish(false);
-
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
-    window.addEventListener('pointercancel', onCancel);
-    window.addEventListener('keydown', onKeyDown);
-    window.addEventListener('blur', onBlur);
+        const target = resolveDragTarget(item, clientX, clientY);
+        if (!target) {
+          session.pendingNext = null;
+          session.lastKey = null;
+          setDragTargetKey(null);
+          return null;
+        }
+        if (target.key === session.lastKey) return null;
+        session.pendingNext = target.next;
+        setDragTargetKey(target.key);
+        console.warn('[PromptDnD] preview', item, '->', target.label, 'via', target.reason);
+        return { key: target.key, changed: false };
+      },
+      onCommit: (session: PointerDragSession) => {
+        applyPromptDragState((session as any).pendingNext || session.base, true);
+        console.warn('[PromptDnD] drop', item, '->', session.lastKey || 'same');
+      },
+      onCancel: (session: PointerDragSession) => {
+        applyPromptDragState(session.base, false);
+        console.warn('[PromptDnD] cancel', item);
+      },
+      onFinish: () => {
+        pointerDragRef.current = null;
+        setDraggingItem(null);
+        setDragTargetKey(null);
+        setHorizontalIntent(null);
+      },
+    });
+    if (controller) pointerDragRef.current = controller.session;
   };
 
   const closeInsertionEditor = () => {
@@ -2098,7 +2045,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     const pos = groupId
       ? Math.max(-1, ...prompts.filter(p => p.group_id === groupId).map((p, i) => promptPos(p, i))) + 1
       : getNextFlatPosition();
-    const newPrompts = [...prompts, { title: `Prompt ${prompts.length + 1}`, content: '', group_id: groupId ?? null, position: pos }];
+    const newPrompts = [...prompts, { id: newTextPromptId(), title: `Prompt ${prompts.length + 1}`, content: '', group_id: groupId ?? null, visual_parent_id: null, position: pos }];
     setPrompts(newPrompts);
     savePromptsImmediate(newPrompts);
     const idx = newPrompts.length - 1;
@@ -2138,7 +2085,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   };
 
   const deletePrompt = async (index: number) => {
-    const newPrompts = prompts.filter((_, i) => i !== index);
+    const deletedId = prompts[index]?.id;
+    const newPrompts = prompts
+      .filter((_, i) => i !== index)
+      .map(prompt => prompt.visual_parent_id === deletedId ? { ...prompt, visual_parent_id: null } : prompt);
     setPrompts(newPrompts);
     await savePromptsImmediate(newPrompts);
     showToast('Deleted', 'success');
@@ -2166,42 +2116,77 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     setAiSubTab(next);
   };
 
-  const renderTextPromptCard = (prompt: Prompt, index: number, dndKind: 'flat' | 'group-prompt', groupId?: number) => {
+  const renderTextPromptCard = (prompt: Prompt, index: number, dndKind: 'flat' | 'group-prompt', groupId?: number, flatIndex?: number, nextPrompt?: Prompt | null) => {
     const isSelected = editingInsertionIndex === index;
-    const isDragged = draggingItem?.type === 'prompt' && draggingItem.index === index;
+    const isDragged = draggingItem?.type === 'prompt' && draggingItem.id === prompt.id;
+    const isFlatTarget = flatIndex != null && dragTargetKey === `flat:${flatIndex}`;
+    const visualDepth = promptVisualDepthById.get(prompt.id) || 0;
+    const ancestors = visualHierarchyAncestorIds(prompts, prompt.id, { parentKey: 'visual_parent_id' });
+    const nextAncestors = nextPrompt
+      ? visualHierarchyAncestorIds(prompts, nextPrompt.id, { parentKey: 'visual_parent_id' })
+      : [];
+    const hasNextSibling = !!prompt.visual_parent_id && nextPrompt?.visual_parent_id === prompt.visual_parent_id;
+    const intent = horizontalIntent?.sourceId === prompt.id ? horizontalIntent : null;
+    const intentColor = intent?.disabled ? '#73737a' : '#a78bfa';
+    const hierarchyStep = 12;
+    const connectorColor = 'rgba(139,92,246,0.58)';
     return (
       <div
-        key={`${dndKind}-${index}`}
+        key={`${dndKind}-${prompt.id}`}
         data-dnd-kind={dndKind}
         data-dnd-flat-container={dndKind === 'flat' ? 'true' : undefined}
         data-dnd-type={dndKind === 'flat' ? 'prompt' : undefined}
-        data-dnd-id={dndKind === 'flat' ? String(index) : undefined}
+        data-dnd-id={prompt.id}
         data-group-id={groupId != null ? String(groupId) : undefined}
         data-prompt-index={String(index)}
-        onPointerDown={startPointerDrag({ type: 'prompt', index }, () => startEditingInsertion(index))}
+        data-prompt-id={prompt.id}
+        data-visual-parent-id={prompt.visual_parent_id || undefined}
+        data-visual-depth={visualDepth || undefined}
+        data-dnd-target-preview={isFlatTarget ? 'flat' : undefined}
+        onPointerDown={startPointerDrag({ type: 'prompt', id: prompt.id }, () => startEditingInsertion(index))}
         style={{
           display: 'flex',
           alignItems: 'center',
           gap: 8,
           marginBottom: 6,
+          marginLeft: visualDepth * hierarchyStep,
+          width: visualDepth ? `calc(100% - ${visualDepth * hierarchyStep}px)` : '100%',
           padding: '8px 9px',
           borderRadius: 8,
           background: isDragged ? 'rgba(124,58,237,0.18)' : (isSelected ? '#24242a' : VR_CARD),
-          border: `1px solid ${isDragged ? VR_VIOLET : (isSelected ? VR_ACCENT : VR_BORDER)}`,
-          boxShadow: isDragged ? '0 0 0 1px rgba(124,58,237,0.28) inset, 0 0 18px rgba(124,58,237,0.16)' : 'none',
+          border: `1px ${intent ? 'dashed' : 'solid'} ${intent ? intentColor : (isDragged ? VR_VIOLET : (isSelected ? VR_ACCENT : VR_BORDER))}`,
+          boxShadow: isDragged
+            ? '0 0 0 1px rgba(124,58,237,0.28) inset, 0 0 18px rgba(124,58,237,0.16)'
+            : (isFlatTarget ? '0 2px 0 #60a5fa inset' : 'none'),
           cursor: isDragged ? 'grabbing' : 'pointer',
           minWidth: 0,
           userSelect: 'none',
           touchAction: 'none',
+          position: 'relative',
+          boxSizing: 'border-box',
           transition: 'background 110ms ease, border-color 110ms ease, box-shadow 110ms ease',
         }}
       >
+        {visualDepth > 0 && (
+          <>
+            {ancestors.slice(1).map((ancestorId, ancestorIndex) => nextAncestors.includes(ancestorId) && (
+              <span key={ancestorId} aria-hidden style={{ position: 'absolute', left: -7 - ((ancestorIndex + 1) * hierarchyStep), top: -6, bottom: -6, width: 1, background: connectorColor, pointerEvents: 'none' }} />
+            ))}
+            <span aria-hidden style={{ position: 'absolute', left: -7, top: -6, bottom: '50%', width: 1, background: connectorColor, pointerEvents: 'none' }} />
+            {hasNextSibling && <span aria-hidden style={{ position: 'absolute', left: -7, top: '50%', bottom: -6, width: 1, background: connectorColor, pointerEvents: 'none' }} />}
+            <span aria-hidden style={{ position: 'absolute', left: -7, top: '50%', width: 8, height: 1, background: connectorColor, pointerEvents: 'none' }} />
+          </>
+        )}
         <VRDocIcon />
         <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: isSelected ? '#bfdbfe' : VR_TEXT, fontWeight: 620, fontSize: 13 }}>
           {prompt.title || 'Untitled'}
         </div>
         {(prompt.file_paths?.length || 0) > 0 && <VRTag accent>{prompt.file_paths?.length} файл.</VRTag>}
-        <VRGrip />
+        {intent && (
+          <span aria-hidden data-horizontal-intent={intent.direction} data-horizontal-intent-disabled={intent.disabled ? 'true' : undefined} style={{ color: intentColor, opacity: 0.25 + intent.progress * 0.75, fontSize: 15, fontWeight: 800, lineHeight: 1 }}>
+            {intent.direction === 'left' ? '←' : '→'}{intent.disabled ? '×' : ''}
+          </span>
+        )}
       </div>
     );
   };
@@ -2328,23 +2313,33 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               <VREmpty text="Нет промптов. Добавь первый." />
             ) : (
               <>
-                {flatItems.map((item) => {
+                {flatItems.map((item, flatIndex) => {
                   if (item.type === 'group') {
                     const group = item.group;
-                    const groupPrompts = prompts
-                      .map((p, i) => ({ ...p, _idx: i }))
-                      .filter(p => p.group_id === group.id)
-                      .sort((a, b) => promptPos(a, a._idx) - promptPos(b, b._idx));
+                    const groupPrompts = orderVisualHierarchyItems(
+                      prompts
+                        .map((p, i) => ({ ...p, _idx: i }))
+                        .filter(p => p.group_id === group.id)
+                        .sort((a, b) => promptPos(a, a._idx) - promptPos(b, b._idx)),
+                      { parentKey: 'visual_parent_id' },
+                    );
                     const isSelected = editingGroupId === group.id;
                     const isDragging = draggingItem?.type === 'group' && draggingItem.id === group.id;
+                    const isFlatTarget = dragTargetKey === `flat:${flatIndex}`;
+                    const isGroupTarget = dragTargetKey?.startsWith(`container:${group.id}:`) === true;
                     return (
-                      <div key={`g-${group.id}`}>
-                        <div data-dnd-flat-container="true" data-dnd-type="group" data-dnd-id={String(group.id)} style={{ border: '1px solid transparent', borderRadius: 9, marginBottom: 7 }}>
+                      <div key={`g-${group.id}`} data-dnd-target-preview={isFlatTarget ? 'flat' : (isGroupTarget ? 'container' : undefined)} style={{ boxShadow: isFlatTarget ? '0 2px 0 #60a5fa inset' : 'none' }}>
+                        <div data-dnd-flat-container="true" data-dnd-type="group" data-dnd-id={String(group.id)} style={{ border: `1px solid ${isGroupTarget ? '#60a5fa' : 'transparent'}`, background: isGroupTarget ? 'rgba(96,165,250,0.08)' : 'transparent', borderRadius: 9, marginBottom: 7 }}>
                           <div
                             data-dnd-kind="flat"
                             data-dnd-type="group"
                             data-dnd-id={String(group.id)}
-                            onPointerDown={startPointerDrag({ type: 'group', id: group.id }, () => startEditingGroup(group.id))}
+                            onPointerDown={startPointerDrag({ type: 'group', id: group.id }, () => toggleGroupCollapsed(group.id))}
+                            onContextMenu={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              startEditingGroup(group.id);
+                            }}
                             style={{
                               display: 'flex',
                               alignItems: 'center',
@@ -2374,28 +2369,20 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                               {group.name || 'Группа'}
                             </div>
                             <VRTag>{groupPrompts.length}</VRTag>
-                            <VRGrip />
                           </div>
                           {!group.is_collapsed && (
-                            <div data-dnd-kind="group-body" data-group-id={String(group.id)} style={{ padding: '6px 0 0 26px' }}>
-                              {groupPrompts.length === 0 && (
-                                <div data-dnd-kind="group-empty" style={{ padding: '8px', marginBottom: 5, borderRadius: 8, border: '1px dashed #3a2f55', color: '#6f638a', fontSize: 11, textAlign: 'center' }}>
-                                  Перетащи промпт сюда
-                                </div>
-                              )}
-                              {groupPrompts.map((prompt) => renderTextPromptCard(prompt, prompt._idx, 'group-prompt', group.id))}
-                              <button data-no-card-drag onClick={() => addPrompt(group.id)} style={{ width: '100%', margin: '2px 0 7px', padding: '6px 8px', borderRadius: 8, border: '1px dashed #3a3a42', background: 'transparent', color: VR_DIM, fontSize: 11, cursor: 'pointer' }}>
-                                + промпт в группу
-                              </button>
+                            <div data-dnd-kind="group-body" data-group-id={String(group.id)} style={{ padding: '6px 0 0 26px', minHeight: groupPrompts.length === 0 ? 8 : undefined }}>
+                              {groupPrompts.map((prompt, promptIndex) => renderTextPromptCard(prompt, prompt._idx, 'group-prompt', group.id, undefined, groupPrompts[promptIndex + 1] || null))}
                             </div>
                           )}
                         </div>
                       </div>
                     );
                   }
-                  return renderTextPromptCard(item.prompt, item.origIdx, 'flat');
+                  const nextPrompt = flatItems[flatIndex + 1]?.type === 'prompt' ? flatItems[flatIndex + 1].prompt : null;
+                  return renderTextPromptCard(item.prompt, item.origIdx, 'flat', undefined, flatIndex, nextPrompt);
                 })}
-                <div style={{ height: 10 }} />
+                <div data-dnd-target-preview={dragTargetKey === `flat:${flatItems.length}` ? 'flat' : undefined} style={{ height: 10, boxShadow: dragTargetKey === `flat:${flatItems.length}` ? '0 2px 0 #60a5fa inset' : 'none' }} />
               </>
             )}
           </div>
@@ -3660,19 +3647,6 @@ function VRTag({ children, accent }: { children: React.ReactNode; accent?: boole
     }}>
       {children}
     </span>
-  );
-}
-
-function VRGrip() {
-  return (
-    <div
-      title="Перетащить"
-      style={{ display: 'grid', gridTemplateColumns: '3px 3px', gap: 2, padding: '4px 2px', cursor: 'grab', flexShrink: 0 }}
-    >
-      {[...Array(6)].map((_, i) => (
-        <span key={i} style={{ width: 3, height: 3, borderRadius: '50%', background: '#666' }} />
-      ))}
-    </div>
   );
 }
 

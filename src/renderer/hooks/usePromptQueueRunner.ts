@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { buildQueuedPromptPayload, countEnabledQueuedPrompts, isQueuedPromptEnabled, queueSendTransferredOwnership, usePromptQueueStore, type TabQueue } from '../store/usePromptQueueStore';
+import { buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, isQueuedPromptEnabled, queueSendTransferredOwnership, usePromptQueueStore, type QueuedPrompt, type TabQueue } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { terminalRegistry } from '../utils/terminalRegistry';
@@ -205,6 +205,81 @@ const queueSendInflight = new Set<string>();
 const queueAwaitingBusyStart = new Set<string>();
 const codexTriggerCheckInflight = new Set<string>();
 
+function beginValidatedQueueSend(
+  ownerTabId: string,
+  triggerTabId: string,
+  head: QueuedPrompt,
+  label: 'turn-end' | 'cold-start',
+): boolean {
+  if (queueSendInflight.has(ownerTabId)) return false;
+  queueSendInflight.add(ownerTabId);
+  const arrow = ownerTabId === triggerTabId ? '↩' : '⇒';
+  console.log('[PromptQueueRunner] ' + label + ' validate owner=' + ownerTabId.slice(-8)
+    + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8) + ' item=' + head.id.slice(-8));
+
+  void (async () => {
+    const validation = await ensureQueuedPromptImagesReady(ownerTabId, head.id);
+    if (!validation.ready || !validation.item) {
+      const store = usePromptQueueStore.getState();
+      store.setAutoRun(ownerTabId, false);
+      store.setStopAfter(ownerTabId, false);
+      useUIStore.getState().showToast(
+        'Run after остановлен: файл изображения недоступен',
+        'error',
+        5000,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        ownerTabId,
+      );
+      console.warn('[PromptQueueRunner] ' + label + ' attachment validation refused owner=' + ownerTabId.slice(-8)
+        + ' item=' + head.id.slice(-8) + ' state=' + validation.state);
+      return;
+    }
+
+    const latestQueue = usePromptQueueStore.getState().getQueue(ownerTabId);
+    const latestHead = latestQueue.items.find(isQueuedPromptEnabled);
+    if (!latestQueue.autoRun || latestHead?.id !== head.id || prevBusyRef.get(ownerTabId) === true) {
+      console.log('[PromptQueueRunner] ' + label + ' validation became stale owner=' + ownerTabId.slice(-8)
+        + ' expected=' + head.id.slice(-8) + ' actual=' + (latestHead?.id.slice(-8) || '-'));
+      return;
+    }
+
+    queueAwaitingBusyStart.add(ownerTabId);
+    const payload = withPostPrompt(ownerTabId, buildQueuedPromptPayload(validation.item));
+    const beforeCount = countEnabledQueuedPrompts(latestQueue.items);
+    console.log('[PromptQueueRunner] ' + label + ' fire owner=' + ownerTabId.slice(-8)
+      + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8) + ' remaining=' + Math.max(0, beforeCount - 1));
+    const res: any = await sendQueueCommand(ownerTabId, payload);
+    if (!queueSendTransferredOwnership(res)) {
+      queueAwaitingBusyStart.delete(ownerTabId);
+      const store = usePromptQueueStore.getState();
+      store.setAutoRun(ownerTabId, false);
+      store.setStopAfter(ownerTabId, false);
+      console.error('[PromptQueueRunner] ' + label + ' send refused owner=' + ownerTabId, res?.error);
+      return;
+    }
+    if (res && res.success === false && res.submitted === true) {
+      console.warn('[PromptQueueRunner] ' + label + ' submitted but audit unverified owner=' + ownerTabId.slice(-8)
+        + ' trigger=' + triggerTabId.slice(-8) + ' error=' + (res.error || 'unknown'));
+    }
+    const committed = usePromptQueueStore.getState().commitSentHead(ownerTabId, head.id, triggerTabId);
+    console.log('[PromptQueueRunner] ' + label + ' commit owner=' + ownerTabId.slice(-8)
+      + ' trigger=' + triggerTabId.slice(-8) + ' removed=' + committed.removed
+      + ' targetCleared=' + committed.targetCleared + ' before=' + committed.beforeCount);
+  })().catch((error: unknown) => {
+    queueAwaitingBusyStart.delete(ownerTabId);
+    const store = usePromptQueueStore.getState();
+    store.setAutoRun(ownerTabId, false);
+    store.setStopAfter(ownerTabId, false);
+    console.error('[PromptQueueRunner] ' + label + ' validated send failed owner=' + ownerTabId, error);
+  }).finally(() => {
+    queueSendInflight.delete(ownerTabId);
+  });
+  return true;
+}
+
 type BusyStatePayload = {
   tabId: string;
   busy: boolean;
@@ -275,7 +350,6 @@ export function usePromptQueueRunner() {
     // trigger tab). triggerTabId is only used for diagnostics in logs.
     const fireQueueOwner = (ownerTabId: string, triggerTabId: string): boolean => {
       const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
-      const { commitSentHead, setAutoRun, setStopAfter } = usePromptQueueStore.getState();
       const beforePop = countEnabledQueuedPrompts(queue.items);
       if (!queue.autoRun || beforePop === 0) return false;
       if (queueSendInflight.has(ownerTabId)) return false;
@@ -286,34 +360,7 @@ export function usePromptQueueRunner() {
 
       const head = queue.items.find(isQueuedPromptEnabled);
       if (!head) return false;
-      queueSendInflight.add(ownerTabId);
-      queueAwaitingBusyStart.add(ownerTabId);
-
-      const payload = withPostPrompt(ownerTabId, buildQueuedPromptPayload(head));
-      const arrow = ownerTabId === triggerTabId ? '↩' : '⇒';
-      console.log('[PromptQueueRunner] fire owner=' + ownerTabId.slice(-8) + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8) + ' remaining=' + (beforePop - 1));
-      sendQueueCommand(ownerTabId, payload).then((res: any) => {
-        if (!queueSendTransferredOwnership(res)) {
-          queueAwaitingBusyStart.delete(ownerTabId);
-          console.error('[PromptQueueRunner] send refused for owner tab', ownerTabId, res.error);
-          setAutoRun(ownerTabId, false);
-          setStopAfter(ownerTabId, false);
-          return;
-        }
-        if (res && res.success === false && res.submitted === true) {
-          console.warn('[PromptQueueRunner] submitted but audit unverified; committing transfer owner=' + ownerTabId.slice(-8) + ' trigger=' + triggerTabId.slice(-8) + ' error=' + (res.error || 'unknown'));
-        }
-        const committed = commitSentHead(ownerTabId, head.id, triggerTabId);
-        console.log('[PromptQueueRunner] commit transfer owner=' + ownerTabId.slice(-8) + ' trigger=' + triggerTabId.slice(-8) + ' removed=' + committed.removed + ' targetCleared=' + committed.targetCleared + ' before=' + committed.beforeCount);
-      }).catch((e: unknown) => {
-        queueAwaitingBusyStart.delete(ownerTabId);
-        console.error('[PromptQueueRunner] send failed for owner tab', ownerTabId, e);
-        setAutoRun(ownerTabId, false);
-        setStopAfter(ownerTabId, false);
-      }).finally(() => {
-        queueSendInflight.delete(ownerTabId);
-      });
-      return true;
+      return beginValidatedQueueSend(ownerTabId, triggerTabId, head, 'turn-end');
     };
 
     const getReadyTriggerForOwner = (ownerTabId: string): string | null => {
@@ -559,33 +606,7 @@ export function usePromptQueueRunner() {
         if (prevBusyRef.get(ownerTabId) === true) return false;
         const head = q.items.find(isQueuedPromptEnabled);
         if (head) {
-          queueSendInflight.add(ownerTabId);
-          queueAwaitingBusyStart.add(ownerTabId);
-          const payload = withPostPrompt(ownerTabId, buildQueuedPromptPayload(head));
-          const arrow = ownerTabId === triggerTabId ? '↩' : '⇒';
-          console.log('[PromptQueueRunner] cold-start owner=' + ownerTabId.slice(-8) + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8));
-          sendQueueCommand(ownerTabId, payload).then((res: any) => {
-            if (!queueSendTransferredOwnership(res)) {
-              queueAwaitingBusyStart.delete(ownerTabId);
-              console.error('[PromptQueueRunner] cold-start send refused for tab', ownerTabId, res.error);
-              usePromptQueueStore.getState().setAutoRun(ownerTabId, false);
-              usePromptQueueStore.getState().setStopAfter(ownerTabId, false);
-              return;
-            }
-            if (res && res.success === false && res.submitted === true) {
-              console.warn('[PromptQueueRunner] cold-start submitted but audit unverified; committing transfer owner=' + ownerTabId.slice(-8) + ' trigger=' + triggerTabId.slice(-8) + ' error=' + (res.error || 'unknown'));
-            }
-            const committed = usePromptQueueStore.getState().commitSentHead(ownerTabId, head.id, triggerTabId);
-            console.log('[PromptQueueRunner] cold-start commit transfer owner=' + ownerTabId.slice(-8) + ' trigger=' + triggerTabId.slice(-8) + ' removed=' + committed.removed + ' targetCleared=' + committed.targetCleared + ' before=' + committed.beforeCount);
-          }).catch((e: unknown) => {
-            queueAwaitingBusyStart.delete(ownerTabId);
-            console.error('[PromptQueueRunner] cold-start send failed for tab', ownerTabId, e);
-            usePromptQueueStore.getState().setAutoRun(ownerTabId, false);
-            usePromptQueueStore.getState().setStopAfter(ownerTabId, false);
-          }).finally(() => {
-            queueSendInflight.delete(ownerTabId);
-          });
-          return true;
+          return beginValidatedQueueSend(ownerTabId, triggerTabId, head, 'cold-start');
         }
         return false;
       } finally {

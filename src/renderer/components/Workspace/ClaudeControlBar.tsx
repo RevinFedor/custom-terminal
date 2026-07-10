@@ -941,11 +941,6 @@ export default function ClaudeControlBar({
     console.warn('[CodexControlBar] live picker rejected tab=' + tabId.slice(-12) + ' reason=' + reason + ' requestedState=' + JSON.stringify(state) + ' currentState=' + JSON.stringify({ codexModel, codexEffort }) + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
     focusTerminal();
   };
-  const ignoreCodexPickerDuringTurn = (kind: 'effort', value: string) => {
-    console.warn('[CodexControlBar] picker disabled during active turn tab=' + tabId.slice(-12) + ' kind=' + kind + ' value=' + value + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
-    focusTerminal();
-  };
-
   const codexRunPayload = (base: { tabId: string; command: string; sessionId?: string; cwd?: string }) => {
     const payload: { tabId: string; command: string; sessionId?: string; cwd?: string; model?: string; effort?: string } = { ...base };
     return buildCodexRunPayload(payload);
@@ -961,10 +956,10 @@ export default function ClaudeControlBar({
   const supportsKnobs = isSDKTab || isAnthropicPTY || isDeepSeekPTY || isCodex;
   // Codex permits `/model` while it streams. The native picker changes the
   // session setting for subsequent work; the response already in flight keeps
-  // its original model. A standalone effort control stays unavailable during a
-  // turn because model selection applies a compatible effort atomically.
+  // its original params. Effort uses the same native picker path, so it follows
+  // the same availability contract as Model.
   const codexModelDisabled = isCodex && !isCommandRunning;
-  const codexEffortDisabled = isCodex && (codexTurnBusy || !isCommandRunning);
+  const codexEffortDisabled = isCodex && !isCommandRunning;
   const codexFastDisabled = isCodex && !isCommandRunning;
 
   // Cache cooldown chip: Claude only (Anthropic PTY or SDK). DeepSeek/Zen have
@@ -1316,18 +1311,10 @@ export default function ClaudeControlBar({
 
   const pickEffort = async (level: string) => {
     setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null);
-    if (isCodex && codexTurnBusy) {
-      ignoreCodexPickerDuringTurn('effort', level);
-      return;
-    }
     const actionReason = 'effort:' + level;
     if (!beginControlAction(actionReason)) return;
     try {
     if (isCodex) {
-      if (codexTurnBusy) {
-        ignoreCodexPickerDuringTurn('effort', level);
-        return;
-      }
       if (isCommandRunning) {
         setLocalBusy(true, 'codex-effort:' + level);
         try {

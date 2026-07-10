@@ -1365,27 +1365,32 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
   const pasteCodexClipboardImageFromClipboard = useCallback(async () => {
     let payload = '';
     let source = 'unknown';
+    let stageToken: string | null = null;
     try {
       const textPaths = normalizeLocalImagePathTexts(clipboard.readText() || '');
       if (textPaths.length > 0) {
         const staged = textPaths.length === 1
           ? await ipcRenderer.invoke('codex:stage-image-path', { tabId, filePath: textPaths[0] })
           : await ipcRenderer.invoke('codex:stage-image-paths', { tabId, filePaths: textPaths });
-        const stagedPaths = textPaths.length === 1
-          ? (staged?.success && typeof staged.path === 'string' ? [staged.path] : [])
-          : (Array.isArray(staged?.paths)
-            ? staged.paths
-                .map((entry: { path?: unknown }) => typeof entry?.path === 'string' ? entry.path : '')
-                .filter((path: string) => path.length > 0)
-            : []);
-        payload = stagedPaths.length === 0
-          ? `[imageError: ${formatCodexImagePasteError(staged?.error || 'stage_failed')}]`
-          : stagedPaths.join(textPaths.length > 1 ? '\n' : '');
+        const stagedPayloads = textPaths.length === 1
+          ? [staged?.success && typeof staged.path === 'string'
+              ? staged.path
+              : `[imageError: ${formatCodexImagePasteError(staged?.error || 'stage_failed')}]`]
+          : (Array.isArray(staged?.results)
+            ? staged.results.map((entry: { success?: unknown; path?: unknown; error?: unknown }) => (
+                entry?.success && typeof entry.path === 'string'
+                  ? entry.path
+                  : `[imageError: ${formatCodexImagePasteError(entry?.error || 'stage_failed')}]`
+              ))
+            : [`[imageError: ${formatCodexImagePasteError(staged?.error || 'stage_failed')}]`]);
+        payload = stagedPayloads.join(textPaths.length > 1 ? '\n' : '');
+        stageToken = typeof staged?.stageToken === 'string' ? staged.stageToken : null;
         source = textPaths.length > 1 ? 'text-paths' : 'text-path';
       } else {
         const saved = await ipcRenderer.invoke('codex:save-clipboard-image', { tabId });
         if (saved?.success && typeof saved.path === 'string' && saved.path.length > 0) {
           payload = saved.path;
+          stageToken = typeof saved.stageToken === 'string' ? saved.stageToken : null;
           source = 'saved-bitmap';
         } else {
           payload = `[imageError: ${formatCodexImagePasteError(saved?.error || 'save_failed')}]`;
@@ -1401,7 +1406,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     // [Image #N] composer chip. We stage the path in main so +grab/Run after can
     // still recover the real file later if external-editor returns only the chip.
     console.warn('[CodexImagePaste:inject] tab=' + tabId.slice(-12) + ' source=' + source + ' len=' + payload.length + ' payload=' + payload);
-    ipcRenderer.send('terminal:input', tabId, payload);
+    ipcRenderer.send('terminal:input', tabId, payload, stageToken ? { codexImageStageToken: stageToken } : null);
   }, [tabId]);
 
   // Check if terminal is scrolled up (not at bottom)

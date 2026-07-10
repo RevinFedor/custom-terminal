@@ -43,7 +43,11 @@ prebuilds/
 /src/pty-proxy
 
 # Packages (leaked source code, forks)
-/packages/
+/packages/*
+!/packages/structured-dnd/
+!/packages/structured-dnd/**
+!/packages/file-explorer/
+!/packages/file-explorer/**
 
 # Private infra (VPS IP, root SSH, tunnel topology)
 docs/knowledge/fact-remote-access.md

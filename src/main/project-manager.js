@@ -122,6 +122,10 @@ class ProjectManager {
     return this.db.getAIPrompts();
   }
 
+  getAIPromptById(id) {
+    return this.db.getAIPrompts().find((prompt) => prompt.id === id) || null;
+  }
+
   saveAIPrompt(prompt) {
     this.db.saveAIPrompt(prompt);
   }
@@ -136,6 +140,22 @@ class ProjectManager {
 
   saveTimelinePromptSummary(summary) {
     return this.db.saveTimelinePromptSummary(summary);
+  }
+
+  getTimelineOutline(toolType, sessionId) {
+    return this.db.getTimelineOutline(toolType, sessionId);
+  }
+
+  saveTimelineOutline(outline) {
+    return this.db.saveTimelineOutline(outline);
+  }
+
+  getTimelineGroupingBarriers(sessionId) {
+    return {
+      notes: this.db.getTimelineNotes(sessionId),
+      rewindMarkers: this.db.getRewindMarkers(sessionId),
+      forkMarkers: this.db.getForkMarkers(sessionId),
+    };
   }
 
   logAIPromptCall(call) {

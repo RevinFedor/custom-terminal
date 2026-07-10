@@ -29,6 +29,35 @@ function _endPerfOp(id) {
   if (ops && typeof ops.delete === 'function') ops.delete(id);
 }
 
+function shortKnowledgeDocsPath(filePath) {
+  if (!filePath || typeof filePath !== 'string') return null;
+  const normalized = filePath.replace(/\\/g, '/').trim();
+  if (!normalized) return null;
+  const segs = normalized.split('/').filter(Boolean);
+  const baseName = segs[segs.length - 1] || '';
+  const docsIndex = segs.findIndex((seg) => seg.toLowerCase() === 'docs');
+  const lower = normalized.toLowerCase();
+  const semanticIndexSibling = (() => {
+    if (docsIndex < 0 || !path.isAbsolute(normalized)) return false;
+    try {
+      const parent = path.join('/', ...segs.slice(0, docsIndex));
+      return fs.existsSync(path.join(parent, '.semantic-index.json'));
+    } catch {
+      return false;
+    }
+  })();
+  const isDocsPath = docsIndex >= 0 && (
+    !path.isAbsolute(normalized) ||
+    semanticIndexSibling ||
+    lower === 'docs' ||
+    lower.startsWith('docs/') ||
+    lower.includes('/docs/')
+  );
+  const isClaudeMd = baseName === 'CLAUDE.md';
+  if (!isDocsPath && !isClaudeMd) return null;
+  return segs.length >= 2 ? segs.slice(-2).join('/') : segs[0];
+}
+
 // ========== JSONL INCREMENTAL CACHE ==========
 // JSONL is append-only — when file grows we only parse NEW bytes, not the whole file.
 // For a 159MB session file: first read ~3.5s, all subsequent reads ~0ms (if no new entries)
@@ -3033,9 +3062,8 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
                   if (block.type !== 'tool_use') continue;
                   if ((block.name === 'Edit' || block.name === 'Write')) {
                     const fp = block.input?.file_path || '';
-                    if (fp.includes('/docs/') || fp.endsWith('/CLAUDE.md') || fp === 'CLAUDE.md') {
-                      const segs = fp.split('/');
-                      const shortName = segs.length >= 2 ? segs.slice(-2).join('/') : segs[segs.length - 1];
+                    const shortName = shortKnowledgeDocsPath(fp);
+                    if (shortName) {
                       docsEditedSet.add(shortName);
                     }
                   }

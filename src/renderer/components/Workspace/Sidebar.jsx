@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect } from 'react'
-import PragmaticFileTree from './PragmaticFileTree/PragmaticFileTree'
+import { FileExplorer as PragmaticFileTree, emptySidebarLayout, hasSidebarLayoutEntries, normalizeSidebarLayout, sameSidebarLayout } from '@noted/file-explorer'
+import '@noted/file-explorer/styles.css'
 import { flattenTree } from './PragmaticFileTree/utils'
 import Tooltip from '../UI/Tooltip'
 import IconCropper from './IconCropper'
@@ -425,6 +426,66 @@ function Sidebar({
   const undoStackRef = useRef([]) // Undo stack for delete operations
   const openStateRef = useRef(initialExpandedDirs || {}) // Store expanded state
   const [expandedSnapshot, setExpandedSnapshot] = useState({}) // Triggers PragmaticFileTree update
+  const [sidebarLayout, setSidebarLayout] = useState(() => emptySidebarLayout())
+  const sidebarLayoutRevisionRef = useRef(0)
+
+  const updateSidebarLayout = useCallback((updater, options = {}) => {
+    setSidebarLayout(previous => {
+      const base = normalizeSidebarLayout(previous)
+      const next = normalizeSidebarLayout(typeof updater === 'function' ? updater(base) : updater)
+      if (sameSidebarLayout(base, next)) return previous
+      window.require('electron').ipcRenderer
+        .invoke('shared-file-layout:put', folderPath, next, sidebarLayoutRevisionRef.current)
+        .then(result => {
+          if (!result) return
+          sidebarLayoutRevisionRef.current = Number(result.revision) || 0
+          if (result.conflict) setSidebarLayout(normalizeSidebarLayout(result.layout))
+        })
+        .catch(error => console.error('[SidebarLayout] shared persist failed:', error))
+      return next
+    })
+    if (options.activateManualOrder && sortModeRef.current !== 'manual') {
+      sortModeRef.current = 'manual'
+      setSortMode('manual')
+    }
+  }, [folderPath])
+
+  useEffect(() => {
+    if (!folderPath) {
+      sidebarLayoutRevisionRef.current = 0
+      setSidebarLayout(emptySidebarLayout())
+      return
+    }
+    let cancelled = false
+    const ipc = window.require('electron').ipcRenderer
+    const refresh = async () => {
+      try {
+        const result = await ipc.invoke('shared-file-layout:get', folderPath)
+        if (cancelled || !result) return
+        const revision = Number(result.revision) || 0
+        if (revision === sidebarLayoutRevisionRef.current) return
+        sidebarLayoutRevisionRef.current = revision
+        const next = normalizeSidebarLayout(result.layout)
+        setSidebarLayout(previous => sameSidebarLayout(previous, next) ? previous : next)
+        if (hasSidebarLayoutEntries(next) && sortModeRef.current !== 'manual') {
+          sortModeRef.current = 'manual'
+          setSortMode('manual')
+        }
+      } catch (error) {
+        console.error('[SidebarLayout] shared load failed:', error)
+      }
+    }
+    refresh()
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') refresh()
+    }, 1200)
+    window.addEventListener('focus', refresh)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+      window.removeEventListener('focus', refresh)
+    }
+  }, [folderPath])
 
   // macOS Finder style: Enter on selected file → rename mode
   useEffect(() => {
@@ -1190,6 +1251,9 @@ function Sidebar({
              sidebarFocused={sidebarFocused}
              focusedId={focusedId}
              multiSelected={multiSelected}
+             sidebarLayout={sidebarLayout}
+             onApplySidebarLayout={updateSidebarLayout}
+             sortMode={sortMode}
           />
         )}
       </div>

@@ -91,6 +91,8 @@ renderer: {
         // ПЕРЕД '@' ради приоритета. React внутри пакета резолвится через
         // alias ниже → единый инстанс.
         { find: '@noted/claude-blocks', replacement: resolve(__dirname, 'packages/claude-blocks/src') },
+        { find: '@noted/structured-dnd', replacement: resolve(__dirname, 'packages/structured-dnd/src') },
+        { find: '@noted/file-explorer', replacement: resolve(__dirname, 'packages/file-explorer/src') },
         { find: '@', replacement: resolve(__dirname, 'src/renderer') },
         { find: 'react', replacement: resolve(__dirname, 'node_modules/react') },
         { find: 'react-dom', replacement: resolve(__dirname, 'node_modules/react-dom') }

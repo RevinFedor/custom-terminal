@@ -343,7 +343,19 @@ export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) =
 
     const key = timelineSummaryKey(toolType, sessionId, entry.uuid);
     const contextMessages = previousUserMessages.map((msg) => String(msg || '').trim()).filter(Boolean);
-    const sourceHash = timelineSummarySourceHash([content, ...contextMessages].join('\n\n'));
+    const promptConfig = usePromptsStore.getState().getPromptById(PROMPT_SUMMARY_PROMPT_ID);
+    // Cached text belongs to both the immutable source snapshot and the user's
+    // current AI configuration. Editing Prompt Summary/model/thinking must not
+    // silently reuse output generated under the previous configuration.
+    const sourceHash = timelineSummarySourceHash(JSON.stringify({
+      version: 2,
+      content,
+      contextMessages,
+      promptId: promptConfig?.id || PROMPT_SUMMARY_PROMPT_ID,
+      promptContent: promptConfig?.content || '',
+      model: promptConfig?.model || 'gemini-3.1-flash-lite',
+      thinkingLevel: promptConfig?.thinkingLevel || 'NONE',
+    }));
     const existing = get().summaries[key];
     if (!force && existing?.summary && existing.sourceHash === sourceHash) return existing;
     if (get().loadingKeys.has(key)) return null;
@@ -355,7 +367,6 @@ export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) =
     });
 
     try {
-      const promptConfig = usePromptsStore.getState().getPromptById(PROMPT_SUMMARY_PROMPT_ID);
       const source = trimTimelinePromptSummarySource(content);
       const generated = await generateTimelinePromptSummaryFromPrompt(source, promptConfig, {
         previousUserMessages: contextMessages,

@@ -55,8 +55,8 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
 
 function scheduleSave(snapshot: Map<string, TabQueue>) {
   const out = serializePromptQueueSnapshot(snapshot);
-  if (!hasHydratedPromptQueueStore && Object.keys(out).length === 0) {
-    console.warn('[PromptQueue] skip pre-hydrate empty save');
+  if (!hasHydratedPromptQueueStore) {
+    console.warn('[PromptQueue] defer pre-hydrate save entries=' + Object.keys(out).length);
     return;
   }
   const serialized = JSON.stringify(out);
@@ -75,8 +75,8 @@ export function flushPromptQueueStoreSync(): void {
   }
   try {
     const out = serializePromptQueueSnapshot(usePromptQueueStore.getState().queues);
-    if (!hasHydratedPromptQueueStore && Object.keys(out).length === 0) {
-      console.warn('[PromptQueue] skip pre-hydrate empty sync save');
+    if (!hasHydratedPromptQueueStore) {
+      console.warn('[PromptQueue] skip pre-hydrate sync save entries=' + Object.keys(out).length);
       return;
     }
     ipcRenderer.sendSync('app:setStateSync', { key: APP_STATE_KEY_QUEUE, value: JSON.stringify(out) });
@@ -85,20 +85,20 @@ export function flushPromptQueueStoreSync(): void {
   }
 }
 
-// One queued prompt — a draft the user wants to send to Claude after the current turn ends.
-// `text` is the raw prompt as the user typed it. `images` is a count of image placeholders
-// the user had referenced (e.g. "[Image #1]") — we can't carry the actual image bytes through
-// the editor extraction path so we surface a stub marker instead. `id` is monotonic per session.
-// Resolved on-disk location of one [Image #N] placeholder. Populated by main
-// process when grabbing input: ~/.claude/image-cache/<sessionId>/<id>.<ext>.
-// Path may become stale if Claude is restarted in this tab (cleanupOldImageCaches
-// wipes non-current sessionIds on boot) — UI treats `path` as best-effort.
+// One queued prompt plus durable image references owned by Noted Terminal.
+// Main materializes Claude/Codex cache paths into userData/prompt-queue-assets
+// before the item becomes transferable; legacy paths are migrated on hydrate.
 export type QueuedImageRef = {
   id: number;        // pasteId Claude assigned (matches the [Image #N] placeholder)
-  path: string;      // absolute path on disk while sessionId is alive
+  path: string;      // stable absolute path in Noted Terminal's queue asset store
+  assetId?: string;  // content-addressed filename; survives userData path changes
   mediaType: string; // image/png|jpeg|...
   size: number;      // bytes at grab time (purely informational)
+  availability?: 'available' | 'missing';
+  error?: string;
 };
+
+export type QueuedPromptAttachmentState = 'ready' | 'materializing' | 'missing';
 
 export type QueuedPrompt = {
   id: string;
@@ -118,12 +118,13 @@ export type QueuedPrompt = {
   // as [GrabImages] ... :MISSING). Undefined for legacy chips loaded from
   // pre-imagePaths persisted state — UI should treat that as "unknown" not "zero".
   imagePaths?: QueuedImageRef[];
+  attachmentState?: QueuedPromptAttachmentState;
   createdAt: number;
 };
 
 function collectClaudeImageRefIds(text: string): Set<number> {
   const ids = new Set<number>();
-  const re = /\[Image\s+#?(\d+)\]/g;
+  const re = /\[Image\s+#?(\d+)\]/gi;
   let match: RegExpExecArray | null;
   while ((match = re.exec(text)) !== null) {
     const id = Number(match[1]);
@@ -183,16 +184,33 @@ function normalizeImagePathMarkersForQueue(text: string, imagePaths?: QueuedImag
 
 export function buildQueuedPromptPayload(item: Pick<QueuedPrompt, 'text' | 'imagePaths'>): string {
   const imagePaths = item.imagePaths || [];
-  if (imagePaths.length === 0) return item.text;
   const byId = new Map<number, QueuedImageRef>();
   for (const ref of imagePaths) byId.set(ref.id, ref);
 
-  return item.text.replace(/\[Image\s+#?(\d+)\]/g, (_match, rawId) => {
+  return item.text.replace(/\[Image\s+#?(\d+)\]/gi, (_match, rawId) => {
     const id = Number(rawId);
     const resolved = byId.get(id);
-    if (!resolved?.path) return `[imageError: queued_image_path_unavailable #${rawId}]`;
+    if (!resolved?.path || resolved.availability === 'missing') {
+      return `[imageError: queued_image_path_unavailable #${rawId}]`;
+    }
     return `[imagePath: ${resolved.path}]`;
   });
+}
+
+export function getQueuedPromptAttachmentState(
+  item: Pick<QueuedPrompt, 'text' | 'images' | 'imagePaths' | 'attachmentState'>,
+): QueuedPromptAttachmentState {
+  if (item.attachmentState === 'materializing') return 'materializing';
+  if (item.attachmentState === 'missing') return 'missing';
+  if (item.images > 0 && /\[imageError:\s*[^\]\r\n]+\]/i.test(item.text)) return 'missing';
+  const ids = collectClaudeImageRefIds(item.text);
+  if (ids.size === 0) return 'ready';
+  const byId = new Map((item.imagePaths || []).map((ref) => [Number(ref.id), ref]));
+  for (const id of ids) {
+    const ref = byId.get(id);
+    if (!ref?.path || ref.availability === 'missing') return 'missing';
+  }
+  return item.attachmentState === 'missing' ? 'missing' : 'ready';
 }
 
 export type TabQueue = {
@@ -303,6 +321,13 @@ interface PromptQueueStore {
   removePrompt: (tabId: string, id: string) => void;
   updatePrompt: (tabId: string, id: string, patch: { text?: string; title?: string; titleManual?: boolean; enabled?: boolean }) => void;
   updatePromptText: (tabId: string, id: string, text: string) => void;
+  setPromptImageRefs: (
+    tabId: string,
+    id: string,
+    imagePaths: QueuedImageRef[] | undefined,
+    attachmentState: QueuedPromptAttachmentState,
+    expectedText?: string,
+  ) => void;
   reorderPrompt: (tabId: string, fromIndex: number, toIndex: number) => void;
   clearQueue: (tabId: string) => void;
 
@@ -409,11 +434,10 @@ export function serializePromptQueueCore(q: TabQueue): PromptQueueCore {
 // the same short token when entering the queue. Pasted-text-chips like
 // "[Pasted text #N +M lines]" are NOT counted here — those are full-text
 // expansions the editor view exposes verbatim.
-const IMAGE_RE = /\[Image(?:\s+#?\d+)?\]/g;
+const IMAGE_RE = /\[Image(?:\s+#?\d+)?\]/gi;
 const IMAGE_PATH_RE = /\[imagePath:\s*([^\]\r\n]+?)\s*\]/gi;
 function countImages(text: string): number {
-  const m = text.match(IMAGE_RE);
-  return m ? m.length : 0;
+  return (text.match(IMAGE_RE) || []).length;
 }
 
 export function countPromptCharacters(text: string): number {
@@ -441,14 +465,36 @@ export function queueSendTransferredOwnership(result: unknown): boolean {
   return sendResult.success !== false || sendResult.submitted === true;
 }
 
+function getInitialQueuedPromptAttachmentState(
+  text: string,
+  imagePaths?: QueuedImageRef[],
+  imagesHint = 0,
+): QueuedPromptAttachmentState {
+  if (imagesHint > 0 && /\[imageError:\s*[^\]\r\n]+\]/i.test(text)) return 'missing';
+  const ids = collectClaudeImageRefIds(text);
+  if (ids.size === 0) return 'ready';
+  const byId = new Map((imagePaths || []).map((ref) => [Number(ref.id), ref]));
+  let needsMaterialization = false;
+  for (const id of ids) {
+    const ref = byId.get(id);
+    if (!ref?.path || ref.availability === 'missing') return 'missing';
+    if (!ref.assetId || ref.availability !== 'available') needsMaterialization = true;
+  }
+  return needsMaterialization ? 'materializing' : 'ready';
+}
+
 function normalizeQueuedPrompt(item: QueuedPrompt): QueuedPrompt {
   const normalized = normalizeImagePathMarkersForQueue(item.text, item.imagePaths);
-  return {
+  const next = {
     ...item,
     enabled: item.enabled !== false,
     text: normalized.text,
     images: Math.max(item.images || 0, countImages(normalized.text), normalized.imagePaths?.length ?? 0),
     imagePaths: normalized.imagePaths,
+  };
+  return {
+    ...next,
+    attachmentState: getInitialQueuedPromptAttachmentState(next.text, next.imagePaths, next.images),
   };
 }
 
@@ -484,6 +530,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           text: normalized.text,
           images: detectedImages,
           imagePaths: normalized.imagePaths,
+          attachmentState: getInitialQueuedPromptAttachmentState(normalized.text, normalized.imagePaths, detectedImages),
           createdAt: Date.now(),
         }];
         // First-chip armed hint: only when transitioning empty → 1 AND auto-run
@@ -494,6 +541,10 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         next.set(tabId, { ...cur, items, firstChipHintActive: shouldArmHint ? true : cur.firstChipHintActive });
         return { queues: next };
       });
+      const added = get().getQueue(tabId).items.find((item) => item.id === id);
+      if (added?.attachmentState === 'materializing') {
+        void ensureQueuedPromptImagesReady(tabId, id);
+      }
       return id;
     },
 
@@ -548,7 +599,11 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
             : { text: p.text, imagePaths: p.imagePaths };
           const text = normalized.text;
           const images = typeof patch.text === 'string'
-            ? Math.max(countImages(text), normalized.imagePaths?.length ?? 0)
+            ? Math.max(
+                countImages(text),
+                normalized.imagePaths?.length ?? 0,
+                p.attachmentState === 'missing' && /\[imageError:\s*[^\]\r\n]+\]/i.test(text) ? p.images : 0,
+              )
             : p.images;
           const imagePaths = normalized.imagePaths;
           const defaultTitle = makeDefaultPromptTitle(text);
@@ -566,7 +621,18 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
             if (!titleManual) title = defaultTitle;
           }
           const enabled = typeof patch.enabled === 'boolean' ? patch.enabled : p.enabled;
-          return { ...p, enabled, text, images, imagePaths, title, titleManual };
+          return {
+            ...p,
+            enabled,
+            text,
+            images,
+            imagePaths,
+            attachmentState: typeof patch.text === 'string'
+              ? getInitialQueuedPromptAttachmentState(text, imagePaths, images)
+              : p.attachmentState,
+            title,
+            titleManual,
+          };
         });
         const next = new Map(state.queues);
         const queueEmptied = activeBefore > 0 && countEnabledQueuedPrompts(items) === 0;
@@ -582,6 +648,12 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         });
         return { queues: next };
       });
+      if (typeof patch.text === 'string') {
+        const updated = get().getQueue(tabId).items.find((item) => item.id === id);
+        if (updated?.attachmentState === 'materializing') {
+          void ensureQueuedPromptImagesReady(tabId, id);
+        }
+      }
     },
 
     updatePromptText: (tabId, id, text) => {
@@ -591,14 +663,50 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         const items = cur.items.map((p) => {
           if (p.id !== id) return p;
           const normalized = normalizeImagePathMarkersForQueue(text, p.imagePaths);
+          const images = Math.max(
+            countImages(normalized.text),
+            normalized.imagePaths?.length ?? 0,
+            p.attachmentState === 'missing' && /\[imageError:\s*[^\]\r\n]+\]/i.test(normalized.text) ? p.images : 0,
+          );
           return {
             ...p,
             text: normalized.text,
-            images: Math.max(countImages(normalized.text), normalized.imagePaths?.length ?? 0),
+            images,
             imagePaths: normalized.imagePaths,
+            attachmentState: getInitialQueuedPromptAttachmentState(normalized.text, normalized.imagePaths, images),
             title: p.titleManual ? p.title : makeDefaultPromptTitle(normalized.text),
           };
         });
+        const next = new Map(state.queues);
+        next.set(tabId, { ...cur, items });
+        return { queues: next };
+      });
+      const updated = get().getQueue(tabId).items.find((item) => item.id === id);
+      if (updated?.attachmentState === 'materializing') {
+        void ensureQueuedPromptImagesReady(tabId, id);
+      }
+    },
+
+    setPromptImageRefs: (tabId, id, imagePaths, attachmentState, expectedText) => {
+      setAndPersist((state) => {
+        const cur = state.queues.get(tabId);
+        if (!cur) return state;
+        let changed = false;
+        const items = cur.items.map((item) => {
+          if (item.id !== id || (expectedText !== undefined && item.text !== expectedText)) return item;
+          changed = true;
+          return {
+            ...item,
+            imagePaths: retainImagePathsForText(item.text, imagePaths),
+            images: Math.max(
+              countImages(item.text),
+              imagePaths?.length ?? 0,
+              attachmentState === 'missing' && /\[imageError:\s*[^\]\r\n]+\]/i.test(item.text) ? item.images : 0,
+            ),
+            attachmentState,
+          };
+        });
+        if (!changed) return state;
         const next = new Map(state.queues);
         next.set(tabId, { ...cur, items });
         return { queues: next };
@@ -911,6 +1019,106 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
   };
 });
 
+const promptImageMaterializationInflight = new Map<string, Promise<{
+  ready: boolean;
+  state: QueuedPromptAttachmentState;
+  item: QueuedPrompt | null;
+}>>();
+
+async function materializeQueuedPromptRecord(item: QueuedPrompt): Promise<QueuedPrompt> {
+  const normalized = normalizeQueuedPrompt(item);
+  if (getQueuedPromptAttachmentState(normalized) === 'missing'
+    && normalized.images > 0
+    && /\[imageError:\s*[^\]\r\n]+\]/i.test(normalized.text)) {
+    return { ...normalized, attachmentState: 'missing' };
+  }
+  const ids = collectClaudeImageRefIds(normalized.text);
+  if (ids.size === 0) return { ...normalized, attachmentState: 'ready' };
+  if (!normalized.imagePaths || normalized.imagePaths.length === 0) {
+    return { ...normalized, attachmentState: 'missing' };
+  }
+
+  try {
+    const result = await ipcRenderer.invoke('prompt-queue:materialize-image-refs', {
+      refs: normalized.imagePaths,
+    });
+    const refs = Array.isArray(result?.refs)
+      ? result.refs as QueuedImageRef[]
+      : normalized.imagePaths.map((ref) => ({ ...ref, availability: 'missing' as const, error: 'materialize_failed' }));
+    const byId = new Map(refs.map((ref) => [Number(ref.id), ref]));
+    const ready = Array.from(ids).every((id) => {
+      const ref = byId.get(id);
+      return !!(ref?.path && ref.assetId && ref.availability === 'available');
+    });
+    return {
+      ...normalized,
+      imagePaths: retainImagePathsForText(normalized.text, refs),
+      attachmentState: ready ? 'ready' : 'missing',
+    };
+  } catch (error) {
+    console.warn('[PromptQueueAssets] renderer materialize failed item=' + item.id + ':', error);
+    return {
+      ...normalized,
+      imagePaths: normalized.imagePaths.map((ref) => ({ ...ref, availability: 'missing', error: 'materialize_ipc_failed' })),
+      attachmentState: 'missing',
+    };
+  }
+}
+
+export function ensureQueuedPromptImagesReady(
+  tabId: string,
+  itemId: string,
+): Promise<{ ready: boolean; state: QueuedPromptAttachmentState; item: QueuedPrompt | null }> {
+  const key = tabId + ':' + itemId;
+  const existing = promptImageMaterializationInflight.get(key);
+  if (existing) return existing;
+
+  const work = (async () => {
+    const before = usePromptQueueStore.getState().getQueue(tabId).items.find((item) => item.id === itemId) || null;
+    if (!before) return { ready: false, state: 'missing' as const, item: null };
+    if (collectClaudeImageRefIds(before.text).size === 0
+      && !(before.images > 0 && /\[imageError:\s*[^\]\r\n]+\]/i.test(before.text))) {
+      return { ready: true, state: 'ready' as const, item: before };
+    }
+    const immediateState = getQueuedPromptAttachmentState(before);
+    if (immediateState === 'ready' && before.imagePaths?.every((ref) => ref.assetId && ref.availability === 'available')) {
+      // Still revalidate managed paths before every transfer. materializeRef is
+      // idempotent and resolves assetId inside the current userData directory.
+    } else if (immediateState === 'missing' && (!before.imagePaths || before.imagePaths.length === 0)) {
+      return { ready: false, state: 'missing' as const, item: before };
+    }
+
+    usePromptQueueStore.getState().setPromptImageRefs(
+      tabId,
+      itemId,
+      before.imagePaths,
+      'materializing',
+      before.text,
+    );
+    const materialized = await materializeQueuedPromptRecord(before);
+    usePromptQueueStore.getState().setPromptImageRefs(
+      tabId,
+      itemId,
+      materialized.imagePaths,
+      materialized.attachmentState || 'missing',
+      before.text,
+    );
+    const current = usePromptQueueStore.getState().getQueue(tabId).items.find((item) => item.id === itemId) || null;
+    if (current && current.text !== before.text) {
+      promptImageMaterializationInflight.delete(key);
+      return ensureQueuedPromptImagesReady(tabId, itemId);
+    }
+    const state = current ? getQueuedPromptAttachmentState(current) : 'missing';
+    return { ready: state === 'ready', state, item: current };
+  })().finally(() => {
+    if (promptImageMaterializationInflight.get(key) === work) {
+      promptImageMaterializationInflight.delete(key);
+    }
+  });
+  promptImageMaterializationInflight.set(key, work);
+  return work;
+}
+
 // Hydrate from SQLite on app boot. Called by App.tsx once at mount. Idempotent —
 // safe to call multiple times but only the first one with non-empty data wins
 // (we merge, not replace, in case a tab already added entries before hydrate
@@ -920,6 +1128,7 @@ export async function hydratePromptQueueStore(): Promise<void> {
     const raw = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_QUEUE);
     if (!raw) {
       hasHydratedPromptQueueStore = true;
+      scheduleSave(usePromptQueueStore.getState().queues);
       return;
     }
     // database.getAppState() already JSON.parses the stored string and returns
@@ -942,13 +1151,22 @@ export async function hydratePromptQueueStore(): Promise<void> {
     }>;
     if (!parsed || typeof parsed !== 'object') {
       hasHydratedPromptQueueStore = true;
+      scheduleSave(usePromptQueueStore.getState().queues);
       return;
     }
+    const hydratedItemsByTab = new Map<string, QueuedPrompt[]>();
+    await Promise.all(Object.entries(parsed).map(async ([tabId, entry]) => {
+      const items = Array.isArray(entry.items) ? entry.items : [];
+      hydratedItemsByTab.set(
+        tabId,
+        await Promise.all(items.map((item) => materializeQueuedPromptRecord(item))),
+      );
+    }));
     usePromptQueueStore.setState((state) => {
       const next = new Map(state.queues);
       for (const [tabId, entry] of Object.entries(parsed)) {
         if (next.has(tabId)) continue; // don't clobber an in-memory entry
-        const items = Array.isArray(entry.items) ? entry.items.map(normalizeQueuedPrompt) : [];
+        const items = hydratedItemsByTab.get(tabId) || [];
         const fd = typeof entry.firstDelaySeconds === 'number'
           ? Math.max(0, Math.min(3600, Math.floor(entry.firstDelaySeconds)))
           : 0;
@@ -974,6 +1192,7 @@ export async function hydratePromptQueueStore(): Promise<void> {
       return { queues: next };
     });
     hasHydratedPromptQueueStore = true;
+    scheduleSave(usePromptQueueStore.getState().queues);
   } catch (e) {
     // Surface the real message — an Error serializes to `{}` through the
     // renderer→file log forwarder (JSON.stringify drops non-enumerable props),
