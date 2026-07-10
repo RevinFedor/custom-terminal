@@ -124,6 +124,8 @@ PTY-табы получают `isCommandRunning` от Workspace через OSC 1
 
 PTY-режим: правый кластер (Provider/Model/Effort/Think) затемнён когда `!isCommandRunning` — без живого TUI slash-команды улетят в мёртвый shell и потеряются. SDK-режим: параметры применяются **аргументом** при следующем `query()` вызове (см. `fact-claude-sdk-tab.md::Effort: gating отменён, ultracode через settings`), не slash-командой в живой TUI. Юзер может выбрать модель/effort/think **до** первого сообщения, настройки персистятся в `Tab.sdk*` полях, в первый же submit пойдут.
 
+Codex - узкое исключение внутри PTY: при `task_started` Model остаётся доступен, потому что native `/model` явно разрешён во время task и меняет параметры будущей работы сессии. Отдельные effort-pills в этот момент disabled; Model picker выбирает совместимый effort одной подтверждаемой операцией. UI меняет `tab.codexModel/codexEffort` только по success-result native picker, не по самому клику.
+
 Гард в коде — `const canControl = isSDKTab ? true : isCommandRunning;`. Без этого SDK таб без session_id показывал кластер с `opacity: 0.4` + `pointer-events: none`, юзер видел disabled кнопки и не мог поменять модель до отправки первого prompt'а.
 
 ## Visibility guards для clipboard-fork chips

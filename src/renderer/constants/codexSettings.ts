@@ -17,7 +17,9 @@ export interface CodexSettings {
 export const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 export const DEFAULT_CODEX_EFFORT = 'xhigh';
 
-export const CODEX_EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const;
+// The live `codex debug models` catalog remains authoritative. These values
+// cover offline and manual configuration, including model-specific max/ultra.
+export const CODEX_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 export type CodexEffortLevel = typeof CODEX_EFFORT_LEVELS[number];
 
 export const CODEX_EFFORT_LABELS: Record<CodexEffortLevel, string> = {
@@ -26,15 +28,23 @@ export const CODEX_EFFORT_LABELS: Record<CodexEffortLevel, string> = {
   medium: 'med',
   high: 'high',
   xhigh: 'xhi',
+  max: 'max',
+  ultra: 'ultra',
 };
 
 export const DEFAULT_CODEX_MODEL_OPTIONS: CodexModelOption[] = [
   {
     id: DEFAULT_CODEX_MODEL,
     label: DEFAULT_CODEX_MODEL,
-    defaultEffort: DEFAULT_CODEX_EFFORT,
-    efforts: [...CODEX_EFFORT_LEVELS],
+    defaultEffort: 'medium',
+    efforts: ['low', 'medium', 'high', 'xhigh'],
   },
+  { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', defaultEffort: 'low', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+  { id: 'gpt-5.6-terra', label: 'GPT-5.6-Terra', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+  { id: 'gpt-5.6-luna', label: 'GPT-5.6-Luna', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  { id: 'gpt-5.4', label: 'GPT-5.4', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'] },
+  { id: 'gpt-5.4-mini', label: 'GPT-5.4-Mini', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'] },
+  { id: 'gpt-5.3-codex-spark', label: 'GPT-5.3-Codex-Spark', defaultEffort: 'high', efforts: ['low', 'medium', 'high', 'xhigh'] },
 ];
 
 export const DEFAULT_CODEX_SETTINGS: CodexSettings = {
@@ -52,7 +62,10 @@ export const codexEffortLabel = (level: string): string => {
   return (CODEX_EFFORT_LABELS as Record<string, string>)[level] || level;
 };
 
-export const normalizeCodexModelOptions = (raw: unknown): CodexModelOption[] => {
+export const normalizeCodexModelOptions = (
+  raw: unknown,
+  includeFallback = true,
+): CodexModelOption[] => {
   const list = Array.isArray(raw) ? raw : [];
   const normalized = list
     .map((m) => {
@@ -68,10 +81,10 @@ export const normalizeCodexModelOptions = (raw: unknown): CodexModelOption[] => 
     })
     .filter(Boolean) as CodexModelOption[];
 
-  if (!normalized.some((m) => m.id === DEFAULT_CODEX_MODEL)) {
+  if (includeFallback && !normalized.some((m) => m.id === DEFAULT_CODEX_MODEL)) {
     normalized.unshift(...DEFAULT_CODEX_MODEL_OPTIONS);
   }
-  return normalized.length > 0 ? normalized : DEFAULT_CODEX_MODEL_OPTIONS;
+  return normalized.length > 0 ? normalized : (includeFallback ? DEFAULT_CODEX_MODEL_OPTIONS : []);
 };
 
 export const normalizeCodexEfforts = (raw: unknown): string[] => {
@@ -79,4 +92,48 @@ export const normalizeCodexEfforts = (raw: unknown): string[] => {
     ? raw.map((v) => String(v || '').trim()).filter((v, index, arr) => v && arr.indexOf(v) === index)
     : [];
   return efforts.length > 0 ? efforts : [...CODEX_EFFORT_LEVELS];
+};
+
+// The account-scoped catalog remains the source of truth for which model and
+// effort Codex will accept. Saved settings may rename/reorder models and hide
+// unwanted effort choices, but cannot manufacture an unsupported runtime pair.
+export const mergeCodexModelOptions = (
+  liveRaw: unknown,
+  configuredRaw: unknown,
+): CodexModelOption[] => {
+  const live = normalizeCodexModelOptions(liveRaw, false);
+  const configured = normalizeCodexModelOptions(configuredRaw);
+  const liveById = new Map(live.map((model) => [model.id, model]));
+  const result: CodexModelOption[] = [];
+  const seen = new Set<string>();
+
+  for (const configuredModel of configured) {
+    const liveModel = liveById.get(configuredModel.id);
+    if (!liveModel) {
+      // Keep a manually added model visible. Native picker confirmation still
+      // decides whether the current Codex account can actually use it.
+      result.push(configuredModel);
+      seen.add(configuredModel.id);
+      continue;
+    }
+    const requestedEfforts = configuredModel.efforts || [];
+    const efforts = liveModel.efforts?.filter((effort) => requestedEfforts.includes(effort)) || [];
+    const effectiveEfforts = efforts.length > 0 ? efforts : (liveModel.efforts || []);
+    result.push({
+      ...liveModel,
+      label: configuredModel.label || liveModel.label,
+      efforts: effectiveEfforts,
+      defaultEffort: effectiveEfforts.includes(configuredModel.defaultEffort || '')
+        ? configuredModel.defaultEffort
+        : (effectiveEfforts.includes(liveModel.defaultEffort || '')
+          ? liveModel.defaultEffort
+          : effectiveEfforts[0]),
+    });
+    seen.add(configuredModel.id);
+  }
+
+  for (const liveModel of live) {
+    if (!seen.has(liveModel.id)) result.push(liveModel);
+  }
+  return result;
 };

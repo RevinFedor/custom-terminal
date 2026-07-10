@@ -8,7 +8,7 @@ import {
   CODEX_EFFORT_LEVELS,
   DEFAULT_CODEX_EFFORT,
   DEFAULT_CODEX_MODEL_OPTIONS,
-  normalizeCodexModelOptions,
+  mergeCodexModelOptions,
 } from '../constants/codexSettings';
 import { usePromptsStore } from '../store/usePromptsStore';
 import { useCmdKey } from '../hooks/useCmdHoverPopover';
@@ -48,18 +48,19 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
   const setDefaultCodexModel = useUIStore((s) => s.setDefaultCodexModel);
   const defaultCodexEffort = useUIStore((s) => s.defaultCodexEffort);
   const setDefaultCodexEffort = useUIStore((s) => s.setDefaultCodexEffort);
+  const codexSettings = useUIStore((s) => s.codexSettings);
   const [codexModels, setCodexModels] = useState<CodexModelOption[]>(DEFAULT_CODEX_MODEL_OPTIONS);
 
   useEffect(() => {
     let cancelled = false;
     ipcRenderer.invoke('codex:list-models').then((res: any) => {
       if (cancelled) return;
-      setCodexModels(normalizeCodexModelOptions(res?.models));
+      setCodexModels(mergeCodexModelOptions(res?.models, codexSettings.models));
     }).catch(() => {
-      if (!cancelled) setCodexModels(DEFAULT_CODEX_MODEL_OPTIONS);
+      if (!cancelled) setCodexModels(mergeCodexModelOptions(DEFAULT_CODEX_MODEL_OPTIONS, codexSettings.models));
     });
     return () => { cancelled = true; };
-  }, []);
+  }, [codexSettings.models]);
 
   const activeCodexModel = codexModels.find((m) => m.id === defaultCodexModel) || codexModels[0];
   const codexEfforts = activeCodexModel?.efforts?.length ? activeCodexModel.efforts : [...CODEX_EFFORT_LEVELS];

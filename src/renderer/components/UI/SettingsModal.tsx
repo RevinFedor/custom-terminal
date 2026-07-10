@@ -10,6 +10,7 @@ import ProjectIconsSettings from './ProjectIconsSettings';
 import { HexColorPicker } from 'react-colorful';
 import { Trash2, Plus } from 'lucide-react';
 import { DEFAULT_CLAUDE_CODE_SETTINGS } from '../../constants/claudeLevels';
+import { DEFAULT_CODEX_SETTINGS } from '../../constants/codexSettings';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -1310,6 +1311,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setSemanticAutoIndexIterations = useUIStore((s) => s.setSemanticAutoIndexIterations);
   const claudeCodeSettings = useUIStore((s) => s.claudeCodeSettings);
   const setClaudeCodeSettings = useUIStore((s) => s.setClaudeCodeSettings);
+  const codexSettings = useUIStore((s) => s.codexSettings);
+  const setCodexSettings = useUIStore((s) => s.setCodexSettings);
   const claudeMdMirrorEnabled = useUIStore((s) => s.claudeMdMirrorEnabled);
   const setClaudeMdMirrorEnabled = useUIStore((s) => s.setClaudeMdMirrorEnabled);
   const tabCompletionNotificationSound = useUIStore((s) => s.tabCompletionNotificationSound);
@@ -3103,6 +3106,19 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     setClaudeCodeSettings({ ...claudeCodeSettings, efforts });
   };
 
+  const commitCodexModel = (index: number, patch: { id?: string; label?: string; efforts?: string }) => {
+    const models = codexSettings.models.map((model, i) => {
+      if (i !== index) return model;
+      if (patch.efforts === undefined) return { ...model, ...patch };
+      const efforts = patch.efforts.split(',').map((value) => value.trim()).filter(Boolean);
+      const defaultEffort = efforts.includes(model.defaultEffort || '')
+        ? model.defaultEffort
+        : (efforts[0] || model.defaultEffort);
+      return { ...model, efforts, defaultEffort };
+    });
+    setCodexSettings({ ...codexSettings, models });
+  };
+
   const commitInputOnEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
   };
@@ -3423,48 +3439,91 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               <div style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: '10px' }}>
                   <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', textTransform: 'uppercase' }}>
-                    Claude Code команды
+                    Настройки моделей
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setClaudeCodeSettings(DEFAULT_CLAUDE_CODE_SETTINGS)}
-                    style={{ ...vrSmallBtnStyle('neutral'), height: 24, padding: '0 8px' }}
-                  >
-                    reset
-                  </button>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button
+                      type="button"
+                      onClick={() => setClaudeCodeSettings(DEFAULT_CLAUDE_CODE_SETTINGS)}
+                      style={{ ...vrSmallBtnStyle('neutral'), height: 24, padding: '0 8px' }}
+                    >
+                      reset Claude
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCodexSettings(DEFAULT_CODEX_SETTINGS)}
+                      style={{ ...vrSmallBtnStyle('neutral'), height: 24, padding: '0 8px' }}
+                    >
+                      reset Codex
+                    </button>
+                  </div>
                 </div>
 
-                <SettingsSubSectionHeader title="Модели" />
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 6 }}>
-                  {claudeCodeSettings.models.map((model, index) => (
-                    <div key={`${index}-${model.id}`} style={{ display: 'grid', gridTemplateColumns: '70px 1fr', gap: 6, alignItems: 'center' }}>
-                      <input
-                        defaultValue={model.label}
-                        onBlur={(e) => commitClaudeCodeModel(index, { label: e.currentTarget.value })}
-                        onKeyDown={commitInputOnEnter}
-                        style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px' }}
-                      />
-                      <input
-                        defaultValue={model.id}
-                        onBlur={(e) => commitClaudeCodeModel(index, { id: e.currentTarget.value })}
-                        onKeyDown={commitInputOnEnter}
-                        style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
-                      />
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(420px, 1fr))', gap: 14, alignItems: 'start' }}>
+                  <div style={{ minWidth: 0 }}>
+                    <SettingsSubSectionHeader title="Claude Code" />
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 6 }}>
+                      {claudeCodeSettings.models.map((model, index) => (
+                        <div key={`${index}-${model.id}`} style={{ display: 'grid', gridTemplateColumns: '70px 1fr', gap: 6, alignItems: 'center' }}>
+                          <input
+                            defaultValue={model.label}
+                            onBlur={(e) => commitClaudeCodeModel(index, { label: e.currentTarget.value })}
+                            onKeyDown={commitInputOnEnter}
+                            style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px' }}
+                          />
+                          <input
+                            defaultValue={model.id}
+                            onBlur={(e) => commitClaudeCodeModel(index, { id: e.currentTarget.value })}
+                            onKeyDown={commitInputOnEnter}
+                            style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
+                          />
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
+                    <SettingsSubSectionHeader title="Effort" />
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(86px, 1fr))', gap: 6 }}>
+                      {claudeCodeSettings.efforts.map((level, index) => (
+                        <input
+                          key={`${index}-${level}`}
+                          defaultValue={level}
+                          onBlur={(e) => commitClaudeCodeEffort(index, e.currentTarget.value)}
+                          onKeyDown={commitInputOnEnter}
+                          style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
+                        />
+                      ))}
+                    </div>
+                  </div>
 
-                <SettingsSubSectionHeader title="Effort" />
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(86px, 1fr))', gap: 6 }}>
-                  {claudeCodeSettings.efforts.map((level, index) => (
-                    <input
-                      key={`${index}-${level}`}
-                      defaultValue={level}
-                      onBlur={(e) => commitClaudeCodeEffort(index, e.currentTarget.value)}
-                      onKeyDown={commitInputOnEnter}
-                      style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
-                    />
-                  ))}
+                  <div style={{ minWidth: 0 }}>
+                    <SettingsSubSectionHeader title="Codex" />
+                    <div style={{ display: 'grid', gap: 6 }}>
+                      {codexSettings.models.map((model, index) => (
+                        <div key={`${index}-${model.id}`} style={{ display: 'grid', gridTemplateColumns: 'minmax(70px, 0.65fr) minmax(125px, 1fr) minmax(150px, 1.35fr)', gap: 6, alignItems: 'center' }}>
+                          <input
+                            defaultValue={model.label}
+                            onBlur={(e) => commitCodexModel(index, { label: e.currentTarget.value })}
+                            onKeyDown={commitInputOnEnter}
+                            style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px' }}
+                            title="Название в интерфейсе"
+                          />
+                          <input
+                            defaultValue={model.id}
+                            onBlur={(e) => commitCodexModel(index, { id: e.currentTarget.value })}
+                            onKeyDown={commitInputOnEnter}
+                            style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
+                            title="Model ID"
+                          />
+                          <input
+                            defaultValue={(model.efforts || []).join(', ')}
+                            onBlur={(e) => commitCodexModel(index, { efforts: e.currentTarget.value })}
+                            onKeyDown={commitInputOnEnter}
+                            style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '5px 7px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
+                            title="Допустимые effort для этой модели"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 </div>
               </div>
 

@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { buildQueuedPromptPayload, countEnabledQueuedPrompts, isQueuedPromptEnabled, usePromptQueueStore, type TabQueue } from '../store/usePromptQueueStore';
+import { buildQueuedPromptPayload, countEnabledQueuedPrompts, isQueuedPromptEnabled, queueSendTransferredOwnership, usePromptQueueStore, type TabQueue } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { terminalRegistry } from '../utils/terminalRegistry';
@@ -61,6 +61,21 @@ function seedBusySnapshotFromWorkspace(tabId: string): void {
 }
 
 type QueueAgent = 'claude' | 'codex';
+
+const NON_NATURAL_QUEUE_END_REASONS = new Set([
+  'manual-stop',
+  'error',
+  'interrupt',
+  'watchdog',
+  'turn_aborted',
+  'send-command-failed',
+  'send-command-error',
+  'command-finished',
+  'pty-exit',
+  'terminal-kill',
+  'replace',
+  'close',
+]);
 
 function getPromptQueueAgent(tabId: string): QueueAgent {
   const state = useWorkspaceStore.getState();
@@ -212,14 +227,6 @@ function isSuccessfulCompactLocalCommandEnd(data: BusyStatePayload): boolean {
     SUCCESSFUL_COMPACT_LOCAL_COMMAND_REASONS.has(data.localCommandReason || '');
 }
 
-function clearRunAfterTargetAfterPivotFire(ownerTabId: string, triggerTabId: string): void {
-  if (ownerTabId === triggerTabId) return;
-  const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
-  if (queue.runAfterTabId !== triggerTabId) return;
-  usePromptQueueStore.getState().setRunAfterTab(ownerTabId, null);
-  console.log('[PromptQueueRunner] clear runAfter target after pivot fire owner=' + ownerTabId.slice(-8) + ' trigger=' + triggerTabId.slice(-8));
-}
-
 // Public accessor — the overlay reads this to render the "target tab is busy
 // now" spinner inside the Run-after dropdown. Not used by the runner itself.
 export function isTabBusyNow(tabId: string): boolean {
@@ -286,16 +293,18 @@ export function usePromptQueueRunner() {
       const arrow = ownerTabId === triggerTabId ? '↩' : '⇒';
       console.log('[PromptQueueRunner] fire owner=' + ownerTabId.slice(-8) + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8) + ' remaining=' + (beforePop - 1));
       sendQueueCommand(ownerTabId, payload).then((res: any) => {
-        if (res && res.success === false) {
+        if (!queueSendTransferredOwnership(res)) {
           queueAwaitingBusyStart.delete(ownerTabId);
           console.error('[PromptQueueRunner] send refused for owner tab', ownerTabId, res.error);
           setAutoRun(ownerTabId, false);
           setStopAfter(ownerTabId, false);
           return;
         }
-        const committed = commitSentHead(ownerTabId, head.id);
-        if (committed.removed) clearRunAfterTargetAfterPivotFire(ownerTabId, triggerTabId);
-        if (committed.removed && committed.beforeCount === 1) setAutoRun(ownerTabId, false);
+        if (res && res.success === false && res.submitted === true) {
+          console.warn('[PromptQueueRunner] submitted but audit unverified; committing transfer owner=' + ownerTabId.slice(-8) + ' trigger=' + triggerTabId.slice(-8) + ' error=' + (res.error || 'unknown'));
+        }
+        const committed = commitSentHead(ownerTabId, head.id, triggerTabId);
+        console.log('[PromptQueueRunner] commit transfer owner=' + ownerTabId.slice(-8) + ' trigger=' + triggerTabId.slice(-8) + ' removed=' + committed.removed + ' targetCleared=' + committed.targetCleared + ' before=' + committed.beforeCount);
       }).catch((e: unknown) => {
         queueAwaitingBusyStart.delete(ownerTabId);
         console.error('[PromptQueueRunner] send failed for owner tab', ownerTabId, e);
@@ -364,6 +373,16 @@ export function usePromptQueueRunner() {
             return;
           }
         }
+
+        // Spinner frames are presentation-only heuristics. Do not let them
+        // overwrite the workflow edge snapshot: a spinner-idle can precede the
+        // authoritative Stop/StopFailure/InterruptStop and would otherwise make
+        // that real outcome look like a duplicate busy:false event.
+        if (reason === 'spinner') {
+          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=spinner → IGNORE presentation signal');
+          return;
+        }
+
         const wasBusy = prevBusyRef.get(tabId) ?? false;
         prevBusyRef.set(tabId, busy);
 
@@ -372,6 +391,24 @@ export function usePromptQueueRunner() {
           const { clearFirstDelayCountdown } = usePromptQueueStore.getState();
           const q = usePromptQueueStore.getState().getQueue(tabId);
           if (q.firstDelayCountdownAt !== null) clearFirstDelayCountdown(tabId);
+        }
+
+        // An explicit abnormal outcome is authoritative on its own and remains
+        // actionable even if an idempotent busy:false reached the renderer first.
+        // Cancel both the tab's own workflow and every cross-project queue that
+        // selected this tab as its trigger, while preserving queued prompt text.
+        if (!busy && reason && NON_NATURAL_QUEUE_END_REASONS.has(reason)) {
+          if (!canValidateQueueTabs()) {
+            console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + ' → SKIP disarm while workspace restores');
+            return;
+          }
+          const queueState = usePromptQueueStore.getState();
+          for (const ownerTabId of queueState.queues.keys()) {
+            if (!tabExists(ownerTabId)) queueState.cleanupClosedTab(ownerTabId);
+          }
+          const disarmedOwners = usePromptQueueStore.getState().disarmQueuesForTrigger(tabId);
+          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + ' → DISARM trigger workflow owners=' + (disarmedOwners.length ? disarmedOwners.map(shortQueueTabId).join(',') : 'none'));
+          return;
         }
 
         // Only care about turn-end transition (busy true → false). Turn-start
@@ -387,42 +424,14 @@ export function usePromptQueueRunner() {
             + ' queues=' + describeQueuesForTriggerLog(tabId));
         }
 
-        // Own-tab Run-after / Stop-after still skip any NON-NATURAL turn-end.
-        // Только чистый успешный Stop (reason === undefined) должен запускать
-        // следующий промпт той же очереди. Все остальные исходы для owner-tab —
-        // это не «Claude закончил ход», а обрыв, и заливать следующий промпт в
-        // сломанный/прерванный turn нельзя:
-        //   - 'manual-stop' — юзер нажал Stop chip / context-menu Stop / двойной Esc
-        //     (main.js::terminal:stop-ai-process). Auto-run создал бы петлю
-        //     «выключил → процесс снова запустился из очереди».
-        //   - 'error'       — turn упал на API/inference-ошибке, напр. "API Error:
-        //     500" (main.js Stop-hook, event==='StopFailure'). Следующий промпт
-        //     ушёл бы в уже сломанный turn.
-        //   - 'interrupt'   — Esc/Ctrl+C (main.js JSONL-marker watcher и idle-probe,
-        //     event==='InterruptStop'). Юзер прервал намеренно.
-        //   - 'watchdog'    — Stop так и не пришёл за 60 мин, turn завис/мёртв
-        //     (main.js CLAUDE_TURN_WATCHDOG_MS). Состояние неизвестно.
-        // Stop-after тоже пропускаем во всех этих случаях — terminal уже мёртв
-        // либо в неопределённом состоянии, повторный SIGTERM вернёт ошибку.
-        //
-        // Pivot is different: if another owner tab explicitly waits on this
-        // trigger, manual Stop / Escape / error is still the observed completion
-        // event. That owner is allowed to fire below; only the stopped tab's own
-        // queue is disarmed here.
-        //
-        // Additive: busy:false уже записан в prevBusyRef выше (loader гасится у
-        // всех консьюмеров, которые читают только {tabId,busy}); reason — это
-        // только метаданные исхода. Натуральные reason-less пути проходят гард и
-        // стреляют как раньше.
-        //
         // These reasons are NOT normal turn-end signals. They exist for UI
         // liveness only, so never fire or disarm prompt queues from this edge:
-        // - 'spinner' — PTY glyph heuristic that can flap between thinking phases.
+        // - 'spinner' — filtered before it can mutate the workflow snapshot.
         // - 'local-command' — slash-command bracket. Successful /compact is the
         //   one exception: it is a durable boundary and Run-after should continue
         //   with the next queued prompt after compact finishes.
         const compactLocalCommandDone = isSuccessfulCompactLocalCommandEnd(data);
-        if (reason === 'spinner' || (reason === 'local-command' && !compactLocalCommandDone)) {
+        if (reason === 'local-command' && !compactLocalCommandDone) {
           const localSuffix = reason === 'local-command'
             ? ' command=' + (data.localCommand || '-') + ' localReason=' + (data.localCommandReason || '-')
             : '';
@@ -431,72 +440,6 @@ export function usePromptQueueRunner() {
         }
         if (compactLocalCommandDone) {
           console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' command=/compact localReason=' + data.localCommandReason + ' → CONTINUE queue after compact');
-        }
-
-        // Natural reason-less paths still fire: authoritative Stop hook,
-        // SDK-forward claude-sdk:busy-state, Gemini spinner idle, PTY-exit
-        // cleanup. Non-natural reasoned paths below disarm the trigger tab's
-        // own queue, but a DIFFERENT owner waiting on this tab is still allowed
-        // to fire: for pivot mode, "the watched tab stopped/errored/was
-        // interrupted" is still the completion event the owner subscribed to.
-        // DISARM (не просто skip) on any non-natural turn-end. Юзер: «если я
-        // нажал Escape чтобы вмешаться, run-after должен ВЫКЛЮЧИТЬСЯ, а не молча
-        // продолжить на следующем штатном ответе». Skip-once было недостаточно:
-        // autoRun оставался true → следующий natural Stop (reason-less) стрелял
-        // очередью в контекст, куда юзер уже вмешался. Поэтому здесь снимаем
-        // тумблеры, а не пропускаем один запуск.
-        //
-        // Почему НЕ перехватываем Escape/Ctrl+C/Ctrl+] по-клавишно: main уже
-        // классифицирует ПРИЧИНУ остановки (reason на claude:busy-state) —
-        // 'interrupt' (Esc/Ctrl+C через JSONL-marker watcher + idle-probe),
-        // 'manual-stop' (кнопка Stop), 'error' (StopFailure / API 500),
-        // 'watchdog' (зависание). Слушаем reason, не keystroke — единый сигнал
-        // вместо ручного парсинга каждой клавиши. Per user: «любой ненормальный
-        // конец → тумблер off».
-        const SKIP_REASONS = [
-          'manual-stop',
-          'error',
-          'interrupt',
-          'watchdog',
-          'turn_aborted',
-          'send-command-failed',
-          'send-command-error',
-          'command-finished',
-          'pty-exit',
-          'terminal-kill',
-          'replace',
-          'close',
-        ];
-        if (reason && SKIP_REASONS.includes(reason)) {
-          if (!canValidateQueueTabs()) {
-            console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + ' → SKIP disarm while workspace restores');
-            return;
-          }
-          // Disarm only the trigger tab's OWN queue. Pivoted owners waiting on
-          // this tab are not disarmed here; they continue into the firing path
-          // below so external "Run after tab X" works even when X is stopped by
-          // Escape, Stop, Codex turn_aborted, or an error.
-          const { setAutoRun, setStopAfter, clearFirstDelayCountdown } = usePromptQueueStore.getState();
-          const queues = usePromptQueueStore.getState().queues;
-          let pivotOwnersKept = 0;
-          for (const [ownerTabId, q] of queues) {
-            if (!tabExists(ownerTabId)) {
-              usePromptQueueStore.getState().cleanupClosedTab(ownerTabId);
-              continue;
-            }
-            if (!q.autoRun && !q.stopAfter && q.firstDelayCountdownAt === null) continue;
-            const effectiveTrigger = getEffectiveQueueTrigger(ownerTabId, q, { clearStaleTarget: true });
-            if (ownerTabId !== tabId && effectiveTrigger === tabId) {
-              if (q.autoRun && countEnabledQueuedPrompts(q.items) > 0) pivotOwnersKept += 1;
-              continue;
-            }
-            if (ownerTabId !== tabId) continue;
-            if (q.autoRun) setAutoRun(ownerTabId, false);
-            if (q.stopAfter) setStopAfter(ownerTabId, false); // cascades closeAfter→false (closeAfter⟹stopAfter, so this always runs when closeAfter was set)
-            if (q.firstDelayCountdownAt !== null) clearFirstDelayCountdown(ownerTabId); // freeze the "секундомер" (first-delay countdown)
-          }
-          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + ' → DISARM own auto-run/stop-after; pivotOwnersKept=' + pivotOwnersKept);
-          if (pivotOwnersKept === 0) return;
         }
 
         // Step 1: target tab's OWN continuation wins over external owners.
@@ -622,16 +565,18 @@ export function usePromptQueueRunner() {
           const arrow = ownerTabId === triggerTabId ? '↩' : '⇒';
           console.log('[PromptQueueRunner] cold-start owner=' + ownerTabId.slice(-8) + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8));
           sendQueueCommand(ownerTabId, payload).then((res: any) => {
-            if (res && res.success === false) {
+            if (!queueSendTransferredOwnership(res)) {
               queueAwaitingBusyStart.delete(ownerTabId);
               console.error('[PromptQueueRunner] cold-start send refused for tab', ownerTabId, res.error);
               usePromptQueueStore.getState().setAutoRun(ownerTabId, false);
               usePromptQueueStore.getState().setStopAfter(ownerTabId, false);
               return;
             }
-            const committed = usePromptQueueStore.getState().commitSentHead(ownerTabId, head.id);
-            if (committed.removed) clearRunAfterTargetAfterPivotFire(ownerTabId, triggerTabId);
-            if (committed.removed && committed.beforeCount === 1) usePromptQueueStore.getState().setAutoRun(ownerTabId, false);
+            if (res && res.success === false && res.submitted === true) {
+              console.warn('[PromptQueueRunner] cold-start submitted but audit unverified; committing transfer owner=' + ownerTabId.slice(-8) + ' trigger=' + triggerTabId.slice(-8) + ' error=' + (res.error || 'unknown'));
+            }
+            const committed = usePromptQueueStore.getState().commitSentHead(ownerTabId, head.id, triggerTabId);
+            console.log('[PromptQueueRunner] cold-start commit transfer owner=' + ownerTabId.slice(-8) + ' trigger=' + triggerTabId.slice(-8) + ' removed=' + committed.removed + ' targetCleared=' + committed.targetCleared + ' before=' + committed.beforeCount);
           }).catch((e: unknown) => {
             queueAwaitingBusyStart.delete(ownerTabId);
             console.error('[PromptQueueRunner] cold-start send failed for tab', ownerTabId, e);

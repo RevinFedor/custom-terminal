@@ -12,6 +12,7 @@
 //   POST /api/projects/:projectId/agent-tabs       → create Claude/Codex terminal tab
 //   POST /api/terminal-tabs/:tabId/send            → send prompt through scenario layer
 //   POST /api/terminal-tabs/:tabId/stop            → stop terminal runtime
+//   POST /api/terminal-tabs/:tabId/fork            → fork Claude/Codex into a neighbour tab
 //   GET  /api/terminal-tabs/:tabId/history         → load JSONL/rollout session history
 //   POST /api/terminal-tabs/:tabId/edit-range      → Claude JSONL / Codex rollout middle compact
 //   POST /api/terminal-tabs/:tabId/delete-range    → Claude JSONL middle delete
@@ -2068,7 +2069,16 @@ async function handleApi(req, res, parsed, sdkSessions) {
           console.warn('[WebServer] /api/agent-models codex list failed:', e.message);
         }
       }
-      return sendJson(res, 200, { success: true, codex: codexModels, claude: CLAUDE_MODELS_FOR_CLIENTS });
+      return sendJson(res, 200, {
+        success: true,
+        codex: codexModels,
+        claude: CLAUDE_MODELS_FOR_CLIENTS,
+        controlCapabilities: {
+          // v2 reads every numbered effort row from the live TUI instead of a
+          // closed name whitelist, so clients may safely expose future levels.
+          codexEffortPicker: 'tui-numbered-v2',
+        },
+      });
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });
     }
@@ -3005,6 +3015,20 @@ async function handleApi(req, res, parsed, sdkSessions) {
         tabId,
         aiBusyOverride: body.aiBusy === true || body.streaming === true
       });
+      return sendJson(res, 200, data);
+    } catch (e) {
+      return sendJson(res, 409, { error: String(e.message) });
+    }
+  }
+
+  // Fork a materialized Claude/Codex session into a neighbouring PTY tab.
+  // The renderer owns tab creation and pendingAction semantics; HTTP remains a
+  // scenario boundary and never writes PTY commands itself.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/fork$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]);
+    try {
+      const data = await bridgeRequest('forkToTab', { tabId });
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 409, { error: String(e.message) });

@@ -38,7 +38,8 @@ export type { ClaudeCodeModelOption, ClaudeCodeSettings, DefaultClaudeEffort, De
 import type { ClaudeCodeSettings, DefaultClaudeEffort, DefaultClaudeModel } from '../constants/claudeLevels';
 import { DEFAULT_CLAUDE_CODE_SETTINGS } from '../constants/claudeLevels';
 export type { DefaultCodexEffort, DefaultCodexModel } from '../constants/codexSettings';
-import type { DefaultCodexEffort, DefaultCodexModel } from '../constants/codexSettings';
+import type { CodexSettings, DefaultCodexEffort, DefaultCodexModel } from '../constants/codexSettings';
+import { DEFAULT_CODEX_SETTINGS, normalizeCodexEfforts, normalizeCodexModelOptions } from '../constants/codexSettings';
 
 export const HISTORY_PANEL_DEFAULT_WIDTH = 580;
 export const HISTORY_PANEL_MIN_WIDTH = 280;
@@ -610,6 +611,10 @@ interface UIStore {
   setDefaultCodexModel: (v: DefaultCodexModel) => void;
   defaultCodexEffort: DefaultCodexEffort;
   setDefaultCodexEffort: (v: DefaultCodexEffort) => void;
+  // Manual display/order settings. Actual availability is still reconciled
+  // with the account-scoped `codex debug models` catalog at use sites.
+  codexSettings: CodexSettings;
+  setCodexSettings: (settings: CodexSettings) => void;
 
   // Notes Panel — per-tab slide-in. `notesPanelOpenTabs` holds tab IDs for
   // which the panel is currently expanded. Size is shared across tabs and
@@ -1586,6 +1591,43 @@ const initialDefaultCodexEffort = loadDefaultCodexEffort();
   } catch {}
 })();
 
+const APP_STATE_KEY_CODEX_SETTINGS = 'codexSettings';
+const LOCAL_KEY_CODEX_SETTINGS = 'noted-terminal-codex-settings';
+const normalizeCodexSettings = (raw: unknown): CodexSettings => {
+  const obj = raw && typeof raw === 'object' ? raw as Partial<CodexSettings> : {};
+  return {
+    models: normalizeCodexModelOptions(obj.models),
+    efforts: normalizeCodexEfforts(obj.efforts),
+  };
+};
+const loadCodexSettings = (): CodexSettings => {
+  try {
+    const raw = localStorage.getItem(LOCAL_KEY_CODEX_SETTINGS);
+    if (raw) return normalizeCodexSettings(JSON.parse(raw));
+  } catch {}
+  return normalizeCodexSettings(DEFAULT_CODEX_SETTINGS);
+};
+const saveCodexSettings = (settings: CodexSettings) => {
+  const normalized = normalizeCodexSettings(settings);
+  try { localStorage.setItem(LOCAL_KEY_CODEX_SETTINGS, JSON.stringify(normalized)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_CODEX_SETTINGS, value: normalized }).catch(() => {});
+  } catch {}
+};
+const initialCodexSettings = loadCodexSettings();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_CODEX_SETTINGS);
+    if (v !== null && v !== undefined) {
+      const normalized = normalizeCodexSettings(v);
+      useUIStore.setState({ codexSettings: normalized });
+      try { localStorage.setItem(LOCAL_KEY_CODEX_SETTINGS, JSON.stringify(normalized)); } catch {}
+    }
+  } catch {}
+})();
+
 const APP_STATE_KEY_CLAUDE_CODE_SETTINGS = 'claudeCodeSettings';
 const LOCAL_KEY_CLAUDE_CODE_SETTINGS = 'noted-terminal-claude-code-settings';
 
@@ -2503,6 +2545,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setDefaultCodexModel: (v) => { set({ defaultCodexModel: v }); saveDefaultCodexModel(v); },
   defaultCodexEffort: initialDefaultCodexEffort,
   setDefaultCodexEffort: (v) => { set({ defaultCodexEffort: v }); saveDefaultCodexEffort(v); },
+  codexSettings: initialCodexSettings,
+  setCodexSettings: (settings) => {
+    const normalized = normalizeCodexSettings(settings);
+    set({ codexSettings: normalized });
+    saveCodexSettings(normalized);
+  },
   claudeCodeSettings: initialClaudeCodeSettings,
   setClaudeCodeSettings: (settings) => {
     const normalized = normalizeClaudeCodeSettings(settings);

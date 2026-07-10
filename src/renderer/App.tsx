@@ -2352,8 +2352,11 @@ function App() {
             const hasLiveCodexProcess = processInfo?.hasProcess === true && /(\bcodex\b|@openai\/codex)/i.test(processText);
             const hasLiveWatcher = turnState?.hasWatcher === true || hasLiveCodexProcess;
 
-            if (turnState?.busy === true) {
-              return reply(false, null, 'codex is busy');
+            // Codex permits `/model` while a turn is streaming. The picker still
+            // waits for its terminal-confirmed result; an effort-only change is
+            // intentionally kept for the idle state.
+            if (turnState?.busy === true && model === undefined) {
+              return reply(false, null, 'codex effort cannot change while a turn is streaming');
             }
             if (hasLiveWatcher) {
               const draftState = await ipcRenderer.invoke('codex:get-draft-state', tabId, {
@@ -2563,6 +2566,52 @@ function App() {
             sessionId: sid, cwd: tabCwd, targetUuid,
           });
           return reply(!!result?.success, result, result?.error);
+        }
+        if (action === 'forkToTab') {
+          const { tabId: srcTabId } = payload || {};
+          if (!srcTabId) return reply(false, null, 'tabId required');
+          let srcTab: any = null;
+          let projectId: string | null = null;
+          for (const [pid, ws] of state.openProjects) {
+            const t = ws.tabs.get(srcTabId);
+            if (t) { srcTab = t; projectId = pid; break; }
+          }
+          if (!srcTab || !projectId) return reply(false, null, 'source tab not open');
+
+          const declaredType = String(srcTab.commandType || srcTab.toolType || '').toLowerCase();
+          const sessionType = declaredType.includes('codex') || (!!srcTab.codexSessionId && !declaredType.includes('claude'))
+            ? 'codex'
+            : declaredType.includes('claude') || srcTab.tabType === 'claude-sdk' || !!srcTab.claudeSessionId
+              ? 'claude'
+              : null;
+          const sessionId = sessionType === 'codex' ? srcTab.codexSessionId : srcTab.claudeSessionId;
+          if (!sessionType || !sessionId) return reply(false, null, 'source tab has no forkable Claude/Codex session');
+
+          if (sessionType === 'claude' && srcTab.tabType !== 'claude-sdk') {
+            const materialization = await ipcRenderer.invoke('claude:session-materialization', {
+              sessionId,
+              cwd: srcTab.cwd,
+            }).catch(() => null);
+            if (materialization?.materialized !== true && materialization?.conversationMaterialized !== true) {
+              return reply(false, null, 'source tab has no saved Claude conversation');
+            }
+          }
+
+          const forkName = srcTab.name ? `${srcTab.name}_fork` : undefined;
+          const newTabId = await state.createTabAfterCurrent(projectId, forkName, srcTab.cwd || '', {
+            pendingAction: { type: sessionType === 'claude' ? 'claude-fork' : 'codex-fork', sessionId },
+            nameSetManually: false,
+            afterTabId: srcTab.id,
+            visualParentTabId: srcTab.id,
+          });
+          return reply(true, {
+            tabId: newTabId,
+            sourceTabId: srcTabId,
+            sessionId,
+            projectId,
+            name: forkName || null,
+            sessionType,
+          });
         }
         if (action === 'forkToSDK') {
           const { tabId: srcTabId } = payload || {};

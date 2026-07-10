@@ -4593,12 +4593,11 @@ function startClaudeHookServer() {
         claudeSpinnerIdleTimer.delete(tabId);
         const prevSpinner = claudeSpinnerBusy.get(tabId);
         claudeSpinnerBusy.set(tabId, busy);
-        if (prevSpinner !== busy && mainWindow && !mainWindow.isDestroyed()) {
-          // StopFailure = turn ended on an API/inference error (e.g. "API Error:
-          // 500"). Tag the busy:false edge with reason:'error' so the prompt-queue
-          // auto-runner SKIPS firing the next prompt into a broken turn (same skip
-          // class as manual-stop). Natural Stop and the busy:true turn-start stay
-          // reason-less = "natural". See usePromptQueueRunner.ts handleBusyState.
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          // Hook events are the authoritative turn bracket and must always reach
+          // workflow consumers. A spinner heuristic may already have written the
+          // same boolean into claudeSpinnerBusy; suppressing this event by value
+          // would hide the real Stop/StopFailure outcome from PromptQueueRunner.
           const reason = (!busy && event === 'StopFailure') ? 'error' : undefined;
           mainWindow.webContents.send('claude:busy-state', { tabId, busy, reason });
         }
@@ -17483,10 +17482,6 @@ const CODEX_MCP_STARTUP_MAX_RESTARTS = 1;
 const CODEX_STARTUP_NO_STATE_TIMEOUT_MS = 60 * 1000;
 const CODEX_STARTUP_LIFECYCLE_TTL_MS = 90 * 1000;
 const CODEX_PROMPT_IN_FLIGHT_TTL_MS = 120 * 1000;
-// Parser order matters: `xhigh` renders as "Extra high", so it must be matched
-// before plain `high` or the effort picker selects the wrong row.
-const CODEX_PICKER_EFFORT_CANDIDATES = ['minimal', 'low', 'medium', 'xhigh', 'high'];
-
 function clearCodexTuiReady(tabId, reason = 'clear') {
   if (!tabId) return;
   clearCodexManualActionRequired(tabId, reason);
@@ -20142,6 +20137,30 @@ function parseCodexNumberedPicker(cleanText, candidates = null) {
   };
 }
 
+function parseCodexEffortPicker(cleanText) {
+  const text = String(cleanText || '');
+  const headerMatches = Array.from(text.matchAll(/Select Reasoning Level[^\r\n]*/gi));
+  if (headerMatches.length === 0) return { items: [], selectedIndex: -1 };
+
+  // A captured TUI frame can still contain the model menu above the effort
+  // menu. Slice from the latest effort header so model rows cannot be mistaken
+  // for reasoning levels.
+  const section = text.slice(headerMatches[headerMatches.length - 1].index || 0);
+  const parsed = parseCodexNumberedPicker(section);
+  const items = parsed.items.map((item) => {
+    const label = normalizeCodexPickerValue(item.label || item.value);
+    let value = normalizeCodexPickerValue(item.value);
+    if (/(^|\s)extra\s+high($|\s)/.test(label) || value === 'extra') value = 'xhigh';
+    if (value === 'med') value = 'medium';
+    if (value === 'minimum') value = 'minimal';
+    return { ...item, value };
+  });
+  return {
+    items,
+    selectedIndex: items.findIndex(item => item.selected),
+  };
+}
+
 function captureCodexFrame(term, { timeoutMs = 3000, predicate = null, logPrefix = '[Codex:Picker]', settleMs = 0 } = {}) {
   return new Promise((resolve) => {
     let raw = '';
@@ -20323,12 +20342,15 @@ async function selectCodexPickerItem(term, {
   kind,
   target,
   candidates = null,
+  parseState = null,
   initialFrame,
   timeoutMs = 3000,
   confirmPredicate = null,
   logPrefix = '[Codex:Picker]',
 }) {
-  const state = parseCodexNumberedPicker(initialFrame.clean, candidates);
+  const state = typeof parseState === 'function'
+    ? parseState(initialFrame.clean)
+    : parseCodexNumberedPicker(initialFrame.clean, candidates);
   console.log(logPrefix + ' ' + kind + ' items=' + state.items.map(item => (item.selected ? '>' : '') + item.value).join(', ') + ' selected=' + state.selectedIndex + ' target=' + target);
 
   if (state.items.length === 0) {
@@ -20488,10 +20510,8 @@ async function selectCodexModelEffort(term, {
       return outcome;
     }
 
-    // xhigh must be checked before high: Codex renders it as "Extra high".
-    const effortCandidates = CODEX_PICKER_EFFORT_CANDIDATES;
     const effortPredicate = effort
-      ? (clean) => parseCodexNumberedPicker(clean, effortCandidates).items.length > 0
+      ? (clean) => parseCodexEffortPicker(clean).items.length > 0
       : null;
     const modelResult = await selectCodexPickerItem(term, {
       kind: 'model',
@@ -20510,14 +20530,14 @@ async function selectCodexModelEffort(term, {
     let parsedEffortOptions = [];
     if (effort) {
       let effortFrame = modelResult.frame;
-      let effortState = parseCodexNumberedPicker(effortFrame.clean, effortCandidates);
+      let effortState = parseCodexEffortPicker(effortFrame.clean);
       if (effortState.items.length === 0) {
         const lateFrame = await captureCodexFrame(term, {
           timeoutMs: 2500,
           logPrefix: logPrefix + ':effort-late',
           predicate: effortPredicate,
         });
-        const lateState = parseCodexNumberedPicker(lateFrame.clean, effortCandidates);
+        const lateState = parseCodexEffortPicker(lateFrame.clean);
         if (lateState.items.length > 0) {
           effortFrame = lateFrame;
           effortState = lateState;
@@ -20528,7 +20548,7 @@ async function selectCodexModelEffort(term, {
         effortResult = await selectCodexPickerItem(term, {
           kind: 'effort',
           target: effort,
-          candidates: effortCandidates,
+          parseState: parseCodexEffortPicker,
           initialFrame: effortFrame,
           timeoutMs: 5000,
           logPrefix,

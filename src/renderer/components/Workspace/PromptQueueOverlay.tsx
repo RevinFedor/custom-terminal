@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } fr
 import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
 import { CheckSquare, ChevronLeft, History, PanelRightClose, PanelRightOpen, Plus, RefreshCw, Square, Trash2 } from 'lucide-react';
-import { buildQueuedPromptPayload, countEnabledQueuedPrompts, isQueuedPromptEnabled, makeDefaultPromptTitle, usePromptQueueStore, type QueuedPrompt } from '../../store/usePromptQueueStore';
+import { buildQueuedPromptPayload, countEnabledQueuedPrompts, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, usePromptQueueStore, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -893,16 +893,17 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
         submit: submitNow,
         source: 'prompt-queue-replay',
       });
-      if (!res || !res.success) {
+      const replayTransferred = submitNow
+        ? res?.submitted === true && queueSendTransferredOwnership(res)
+        : res?.success === true;
+      if (!replayTransferred) {
         const err = res?.error || 'unknown';
         showToast('Replay failed: ' + err, 'error');
         console.warn('[PromptQueue] replay failed:', err);
         return;
       }
-      if (submitNow && res.submitted !== true) {
-        showToast('Replay send was not confirmed', 'error');
-        console.warn('[PromptQueue] replay submit not confirmed tab=' + tabId.slice(-8) + ' item=' + id.slice(-8) + ' agent=' + sessionType);
-        return;
+      if (submitNow && res.success === false) {
+        console.warn('[PromptQueue] replay submitted but audit unverified; committing transfer tab=' + tabId.slice(-8) + ' item=' + id.slice(-8) + ' agent=' + sessionType + ' error=' + (res.error || 'unknown'));
       }
       // Paste succeeded — chip has effectively moved into agent input, drop
       // it from the queue so it cannot be double-fired by Run after later.

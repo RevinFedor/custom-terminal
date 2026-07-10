@@ -11,7 +11,7 @@ import {
   CODEX_EFFORT_LEVELS,
   DEFAULT_CODEX_EFFORT,
   DEFAULT_CODEX_MODEL,
-  normalizeCodexModelOptions,
+  mergeCodexModelOptions,
 } from '../../constants/codexSettings';
 import { PROVIDER_CATALOG } from './providerCatalog';
 import SessionActionChip from './SessionActionChip';
@@ -448,6 +448,7 @@ export default function ClaudeControlBar({
   const [contextPct, setContextPct] = useState<number>(0);
   const [codexModels, setCodexModels] = useState<Array<{ id: string; label: string; defaultEffort?: string; efforts?: string[] }>>([]);
   const claudeCodeSettings = useUIStore((s) => s.claudeCodeSettings);
+  const codexSettings = useUIStore((s) => s.codexSettings);
   // Cache cooldown chip data: split + the timestamp this turn touched the cache.
   // Anthropic's prompt cache uses a 1h TTL that REFRESHES on every use, so `ts`
   // is the cooldown anchor — countdown = 60min − (now − ts). PTY arrives via
@@ -472,7 +473,7 @@ export default function ClaudeControlBar({
     let cancelled = false;
     ipcRenderer.invoke('codex:list-models').then((res: any) => {
       if (cancelled) return;
-      const models = normalizeCodexModelOptions(res?.models);
+      const models = mergeCodexModelOptions(res?.models, codexSettings.models);
       if (models.length === 0) return;
       setCodexModels(models);
 
@@ -503,7 +504,7 @@ export default function ClaudeControlBar({
       }
     }).catch((e: any) => console.warn('[CodexControlBar] model list failed:', e));
     return () => { cancelled = true; };
-  }, [sessionType, tabId, defaultCodexModel, defaultCodexEffort]);
+  }, [sessionType, tabId, defaultCodexModel, defaultCodexEffort, codexSettings.models]);
 
   // Seed the meter from the last value persisted for THIS tab, so it shows the
   // last-known context fill even when no Claude process is running (CLI exited
@@ -940,7 +941,7 @@ export default function ClaudeControlBar({
     console.warn('[CodexControlBar] live picker rejected tab=' + tabId.slice(-12) + ' reason=' + reason + ' requestedState=' + JSON.stringify(state) + ' currentState=' + JSON.stringify({ codexModel, codexEffort }) + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
     focusTerminal();
   };
-  const ignoreCodexPickerDuringTurn = (kind: 'model' | 'effort', value: string) => {
+  const ignoreCodexPickerDuringTurn = (kind: 'effort', value: string) => {
     console.warn('[CodexControlBar] picker disabled during active turn tab=' + tabId.slice(-12) + ' kind=' + kind + ' value=' + value + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
     focusTerminal();
   };
@@ -958,7 +959,12 @@ export default function ClaudeControlBar({
   const isAnthropicPTY = !isSDKTab && providerState.type === 'anthropic';
   const isDeepSeekPTY = !isSDKTab && providerState.type === 'deepseek';
   const supportsKnobs = isSDKTab || isAnthropicPTY || isDeepSeekPTY || isCodex;
-  const codexKnobsDisabled = isCodex && codexTurnBusy;
+  // Codex permits `/model` while it streams. The native picker changes the
+  // session setting for subsequent work; the response already in flight keeps
+  // its original model. A standalone effort control stays unavailable during a
+  // turn because model selection applies a compatible effort atomically.
+  const codexModelDisabled = isCodex && !isCommandRunning;
+  const codexEffortDisabled = isCodex && (codexTurnBusy || !isCommandRunning);
   const codexFastDisabled = isCodex && !isCommandRunning;
 
   // Cache cooldown chip: Claude only (Anthropic PTY or SDK). DeepSeek/Zen have
@@ -1060,11 +1066,11 @@ export default function ClaudeControlBar({
   const showSessionIdTooltip = isCmdPressed && sessionCopyHover && hasArtifactSession && !!sessionCopyRect;
 
   useEffect(() => {
-    if (!codexKnobsDisabled) return;
+    if (!codexModelDisabled) return;
     setPinnedPopup(null);
     setHoveredTrigger(null);
     setHoveredPopup(null);
-  }, [codexKnobsDisabled]);
+  }, [codexModelDisabled]);
 
   // Derived: какой popup сейчас визуально открыт.
   const openPopup: PopupKey | null =
@@ -1151,15 +1157,22 @@ export default function ClaudeControlBar({
   const syncCodexPickerOptions = (result: any) => {
     const options = Array.isArray(result?.modelOptions) ? result.modelOptions.filter(Boolean) : [];
     if (options.length === 0) return;
+    const selectedModel = typeof result?.model === 'string' ? result.model : null;
+    const selectedEfforts = Array.isArray(result?.effortOptions) && result.effortOptions.length > 0
+      ? result.effortOptions
+      : null;
     setCodexModels((prev) => options.map((id: string) => {
       const known = prev.find((m) => m.id === id);
-      return known || {
+      if (known) {
+        return id === selectedModel && selectedEfforts
+          ? { ...known, efforts: selectedEfforts }
+          : known;
+      }
+      return {
         id,
         label: id,
         defaultEffort: DEFAULT_CODEX_EFFORT,
-        efforts: Array.isArray(result?.effortOptions) && result.effortOptions.length > 0
-          ? result.effortOptions
-          : [...CODEX_EFFORT_LEVELS],
+        efforts: id === selectedModel && selectedEfforts ? selectedEfforts : [...CODEX_EFFORT_LEVELS],
       };
     }));
   };
@@ -1219,10 +1232,6 @@ export default function ClaudeControlBar({
 
   const pickModel = async (mid: string) => {
     setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null);
-    if (isCodex && codexTurnBusy) {
-      ignoreCodexPickerDuringTurn('model', mid);
-      return;
-    }
     const actionReason = 'model:' + mid;
     if (!beginControlAction(actionReason)) return;
     try {
@@ -1233,10 +1242,6 @@ export default function ClaudeControlBar({
         ? codexEffort
         : (efforts.includes(DEFAULT_CODEX_EFFORT) ? DEFAULT_CODEX_EFFORT : (nextModel?.defaultEffort || efforts[0] || DEFAULT_CODEX_EFFORT));
       const fallbackState = { codexModel: mid, codexEffort: nextEffort };
-      if (codexTurnBusy) {
-        ignoreCodexPickerDuringTurn('model', mid);
-        return;
-      }
       if (isCommandRunning) {
         setLocalBusy(true, 'codex-model:' + mid + '/effort:' + nextEffort);
         try {
@@ -2588,12 +2593,12 @@ export default function ClaudeControlBar({
             session_id всё равно должен позволять выбрать модель — иначе
             юзер видит disabled кнопки и видит хвостовой «Start» на чипе,
             хотя SDK уже готов принять prompt.
-          • Codex: во время active turn Model/Effort disabled целиком. Это
-            не preset-flow и не warning-flow: Codex TUI занят streaming'ом,
-            поэтому никакого `/model`, state-save или toast быть не должно.
-            `/fast` — отдельная live-команда и остаётся доступной при streaming. */}
+          • Codex: `/model` нативно разрешён во время streaming и меняет
+            настройку сессии для следующей работы. Отдельный Effort остаётся
+            disabled: модельный picker выбирает совместимый effort атомарно.
+            `/fast` — отдельная live-команда. */}
       {showRightCluster && (() => {
-        const canControl = isSDKTab ? true : isCodex ? (!codexKnobsDisabled || !codexFastDisabled) : isCommandRunning;
+        const canControl = isSDKTab ? true : isCommandRunning;
         const modelOptions = isCodex ? codexModels : isAnthropicPTY ? claudeCodeModels : activeProvider.models;
         return (
         <div
@@ -2670,21 +2675,25 @@ export default function ClaudeControlBar({
           <div style={{ position: 'relative' }}>
             <button
               {...triggerProps('model')}
-              disabled={codexKnobsDisabled}
+              disabled={codexModelDisabled}
               style={{
                 ...triggerStyle,
-                ...(codexKnobsDisabled ? {
+                ...(codexModelDisabled ? {
                   color: '#555',
                   borderColor: 'rgba(255,255,255,0.08)',
                   backgroundColor: '#222',
                   cursor: 'not-allowed',
                 } : {}),
               }}
-              title={codexKnobsDisabled ? 'Model недоступен во время streaming' : 'Model (клик закрепит, ⌘+наведение откроет временно)'}
+              title={codexModelDisabled
+                ? 'Model доступен только при живом Codex'
+                : codexTurnBusy
+                  ? 'Model можно сменить во время streaming; выбор применяется к следующей работе сессии'
+                  : 'Model (клик закрепит, ⌘+наведение откроет временно)'}
             >
-              <span style={{ color: codexKnobsDisabled ? '#555' : '#777', fontSize: 10 }}>Model</span>
-              <span style={{ color: codexKnobsDisabled ? '#666' : '#fff' }}>{modelLabel}</span>
-              <span style={{ opacity: codexKnobsDisabled ? 0.25 : 0.6 }}>▴</span>
+              <span style={{ color: codexModelDisabled ? '#555' : '#777', fontSize: 10 }}>Model</span>
+              <span style={{ color: codexModelDisabled ? '#666' : '#fff' }}>{modelLabel}</span>
+              <span style={{ opacity: codexModelDisabled ? 0.25 : 0.6 }}>▴</span>
             </button>
             {openPopup === 'model' && renderControlPopup('model',
               modelOptions.map(m => {
@@ -2692,8 +2701,8 @@ export default function ClaudeControlBar({
                     return (
                       <button
                         key={m.id}
-                        disabled={codexKnobsDisabled}
-                        style={pillStyle(active, codexKnobsDisabled)}
+                        disabled={codexModelDisabled}
+                        style={pillStyle(active, codexModelDisabled)}
                         onClick={() => pickModel(m.id)}
                       >{m.label}</button>
                     );
@@ -2727,13 +2736,15 @@ export default function ClaudeControlBar({
             <span style={{ color: '#777', fontSize: 10, marginRight: 4 }}>Effort</span>
             {effortLevels.map(level => {
               const active = effortActive === level;
-              const isUltra = level === 'ultracode';
+              const isUltra = level === 'ultracode' || (isCodex && level === 'ultra');
               const label = isUltra ? 'ultra'
                 : level === 'medium' ? 'med'
                 : level === 'xhigh' ? 'xhi'
                 : level;
               const title = isUltra
-                ? 'ultracode — xhigh + авто dynamic-workflows на всю сессию (Claude сам решает когда запускать workflow). Дорого по токенам; сбрасывается в начале новой сессии.'
+                ? isCodex
+                  ? 'ultra — максимальное размышление и проактивная работа с несколькими агентами; расход может быстро вырасти.'
+                  : 'ultracode — xhigh + авто dynamic-workflows на всю сессию (Claude сам решает когда запускать workflow). Дорого по токенам; сбрасывается в начале новой сессии.'
                 : level;
               // ultracode pill: purple accent (matches workflow chip), separated
               // from the plain levels by a thin divider so it reads as a mode.
@@ -2747,13 +2758,13 @@ export default function ClaudeControlBar({
                 <React.Fragment key={level}>
                   {isUltra && <span aria-hidden style={{ width: 1, alignSelf: 'stretch', background: 'rgba(255,255,255,0.12)', margin: '2px 2px' }} />}
                   <button
-                    disabled={codexKnobsDisabled}
+                    disabled={codexEffortDisabled}
                     style={isUltra ? {
                       ...ultraStyle,
-                      ...(codexKnobsDisabled ? { color: '#555', backgroundColor: '#222', borderColor: 'rgba(255,255,255,0.08)', cursor: 'not-allowed' } : {}),
+                      ...(codexEffortDisabled ? { color: '#555', backgroundColor: '#222', borderColor: 'rgba(255,255,255,0.08)', cursor: 'not-allowed' } : {}),
                     } : {
-                      ...pillStyle(active, codexKnobsDisabled),
-                      ...(codexKnobsDisabled ? { color: '#555', backgroundColor: '#222', cursor: 'not-allowed' } : {}),
+                      ...pillStyle(active, codexEffortDisabled),
+                      ...(codexEffortDisabled ? { color: '#555', backgroundColor: '#222', cursor: 'not-allowed' } : {}),
                     }}
                     title={title}
                     onClick={() => pickEffort(level)}

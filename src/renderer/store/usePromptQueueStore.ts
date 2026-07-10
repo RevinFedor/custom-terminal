@@ -340,7 +340,15 @@ interface PromptQueueStore {
 
   // Pops the head item — used by the auto-runner when Stop hook fires. Returns null if empty.
   popNext: (tabId: string) => QueuedPrompt | null;
-  commitSentHead: (tabId: string, id: string) => { removed: boolean; beforeCount: number };
+  commitSentHead: (tabId: string, id: string, triggerTabId: string) => {
+    removed: boolean;
+    beforeCount: number;
+    targetCleared: boolean;
+  };
+
+  // Cancel every active workflow whose owner or selected pivot is the trigger.
+  // Queued items stay available for a deliberate retry.
+  disarmQueuesForTrigger: (triggerTabId: string) => string[];
 
   // Drop queue state owned by a closed tab and clear run-after pivots that
   // pointed at it. Called from workspace closeTab.
@@ -422,6 +430,15 @@ export function isQueuedPromptEnabled(item: Pick<QueuedPrompt, 'enabled'>): bool
 
 export function countEnabledQueuedPrompts(items: QueuedPrompt[]): number {
   return items.reduce((acc, item) => acc + (isQueuedPromptEnabled(item) ? 1 : 0), 0);
+}
+
+// Once Enter was written, the queue no longer owns this prompt. A late
+// history/JSONL audit can time out after the agent has already started; keeping
+// the item in that case would make a retry duplicate the submission.
+export function queueSendTransferredOwnership(result: unknown): boolean {
+  if (!result || typeof result !== 'object') return true;
+  const sendResult = result as { success?: boolean; submitted?: boolean };
+  return sendResult.success !== false || sendResult.submitted === true;
 }
 
 function normalizeQueuedPrompt(item: QueuedPrompt): QueuedPrompt {
@@ -812,25 +829,64 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       return head;
     },
 
-    commitSentHead: (tabId, id) => {
+    commitSentHead: (tabId, id, triggerTabId) => {
       let removed = false;
       let beforeCount = 0;
+      let targetCleared = false;
       setAndPersist((state) => {
         const cur = state.queues.get(tabId);
-        if (!cur || cur.items.length === 0) return state;
+        if (!cur) return state;
+        const consumesCurrentTarget = tabId !== triggerTabId && cur.runAfterTabId === triggerTabId;
         beforeCount = countEnabledQueuedPrompts(cur.items);
         const index = cur.items.findIndex((item) => item.id === id);
-        if (index < 0) return state;
+        if (index < 0) {
+          if (!consumesCurrentTarget) return state;
+          const next = new Map(state.queues);
+          next.set(tabId, { ...cur, runAfterTabId: null });
+          targetCleared = true;
+          return { queues: next };
+        }
+        const items = cur.items.filter((_, itemIndex) => itemIndex !== index);
+        targetCleared = consumesCurrentTarget;
         const next = new Map(state.queues);
         next.set(tabId, {
           ...cur,
-          items: cur.items.filter((_, itemIndex) => itemIndex !== index),
+          items,
+          autoRun: beforeCount === 1 ? false : cur.autoRun,
+          runAfterTabId: targetCleared ? null : cur.runAfterTabId,
           previewId: cur.previewId === id ? null : cur.previewId,
         });
         removed = true;
         return { queues: next };
       });
-      return { removed, beforeCount };
+      return { removed, beforeCount, targetCleared };
+    },
+
+    disarmQueuesForTrigger: (triggerTabId) => {
+      const disarmed: string[] = [];
+      setAndPersist((state) => {
+        let changed = false;
+        const next = new Map(state.queues);
+        for (const [ownerTabId, cur] of state.queues) {
+          const ownsTrigger = ownerTabId === triggerTabId;
+          const waitsOnTrigger = cur.runAfterTabId === triggerTabId;
+          const hasActivePromise = cur.autoRun || cur.stopAfter || cur.closeAfter || cur.firstDelayCountdownAt !== null;
+          if ((!ownsTrigger && !waitsOnTrigger) || !hasActivePromise) continue;
+          next.set(ownerTabId, {
+            ...cur,
+            autoRun: false,
+            stopAfter: false,
+            closeAfter: false,
+            stopBeforeCloseArm: false,
+            firstDelayCountdownAt: null,
+            runAfterTabId: null,
+          });
+          disarmed.push(ownerTabId);
+          changed = true;
+        }
+        return changed ? { queues: next } : state;
+      });
+      return disarmed;
     },
 
     cleanupClosedTab: (closedTabId) => {
