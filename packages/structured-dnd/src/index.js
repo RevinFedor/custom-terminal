@@ -138,6 +138,227 @@ export function visualHierarchyAncestorIds(rawItems = [], itemId, options = {}) 
   return result;
 }
 
+function visualHierarchySubtreeIdSet(rawItems, sourceId, parentKey) {
+  const sourceKey = String(sourceId ?? '');
+  const children = new Map();
+  let hasSource = false;
+
+  for (const item of rawItems) {
+    const itemId = String(item.id);
+    if (itemId === sourceKey) hasSource = true;
+    const parentId = hierarchyParentId(item, parentKey);
+    if (!parentId) continue;
+    const list = children.get(parentId) || [];
+    list.push(itemId);
+    children.set(parentId, list);
+  }
+  if (!hasSource) return new Set();
+
+  const result = new Set([sourceKey]);
+  const pending = [sourceKey];
+  while (pending.length) {
+    const parentId = pending.pop();
+    for (const childId of children.get(parentId) || []) {
+      if (result.has(childId)) continue;
+      result.add(childId);
+      pending.push(childId);
+    }
+  }
+  return result;
+}
+
+export function visualHierarchySubtreeItems(rawItems = [], sourceId, options = {}) {
+  const parentKey = options.parentKey || 'parentId';
+  const ordered = orderVisualHierarchyItems(rawItems, { parentKey });
+  const subtreeIds = visualHierarchySubtreeIdSet(ordered, sourceId, parentKey);
+  return ordered.filter((item) => subtreeIds.has(item.id));
+}
+
+export function normalizeSelectedVisualRootIds(rawItems = [], selectedIds = [], options = {}) {
+  const parentKey = options.parentKey || 'parentId';
+  const ordered = orderVisualHierarchyItems(rawItems, { parentKey });
+  const existingIds = new Set(ordered.map((item) => item.id));
+  const selected = new Set(Array.from(selectedIds || [], (id) => String(id)).filter((id) => existingIds.has(id)));
+  const covered = new Set();
+  const roots = [];
+
+  for (const item of ordered) {
+    if (!selected.has(item.id) || covered.has(item.id)) continue;
+    roots.push(item.id);
+    const subtreeIds = visualHierarchySubtreeIdSet(ordered, item.id, parentKey);
+    for (const id of subtreeIds) covered.add(id);
+  }
+  return roots;
+}
+
+export function resolveVisualBlockMove({
+  items: rawItems = [],
+  sourceId,
+  selectedIds = [],
+  targetId,
+  placement = 'before',
+  parentKey = 'parentId',
+  containerKey = 'containerId',
+} = {}) {
+  const items = rawItems.map((item, index) => ({
+    ...item,
+    id: String(item.id),
+    position: Number.isFinite(Number(item.position)) ? Number(item.position) : index,
+  }));
+  const sourceKey = String(sourceId ?? '');
+  const targetKey = String(targetId ?? '');
+  const byId = new Map(items.map((item) => [item.id, item]));
+  if (!byId.has(sourceKey) || !byId.has(targetKey) || (placement !== 'before' && placement !== 'after')) {
+    return { ok: false, disabled: true, reason: 'invalid-source-or-target', items };
+  }
+
+  const requestedIds = Array.from(selectedIds || [], (id) => String(id));
+  const effectiveSelection = requestedIds.includes(sourceKey) ? requestedIds : [sourceKey];
+  const sourceRootIds = normalizeSelectedVisualRootIds(items, effectiveSelection, { parentKey });
+  if (sourceRootIds.length === 0) {
+    return { ok: false, disabled: true, reason: 'empty-source', items };
+  }
+
+  const sourceParentIds = new Set(sourceRootIds.map((id) => hierarchyParentId(byId.get(id), parentKey)));
+  if (sourceParentIds.size !== 1) {
+    return {
+      ok: false,
+      disabled: true,
+      reason: 'mixed-parent-context',
+      sourceRootIds,
+      items,
+    };
+  }
+  const sourceParentId = sourceParentIds.values().next().value || null;
+
+  const sourceIds = [];
+  const sourceSet = new Set();
+  for (const rootId of sourceRootIds) {
+    for (const item of visualHierarchySubtreeItems(items, rootId, { parentKey })) {
+      if (sourceSet.has(item.id)) continue;
+      sourceSet.add(item.id);
+      sourceIds.push(item.id);
+    }
+  }
+
+  let targetRootId = targetKey;
+  const targetTrail = new Set();
+  while (targetRootId && !targetTrail.has(targetRootId)) {
+    targetTrail.add(targetRootId);
+    const targetParentId = hierarchyParentId(byId.get(targetRootId), parentKey);
+    if (targetParentId === sourceParentId) break;
+    if (!targetParentId || !byId.has(targetParentId)) {
+      targetRootId = '';
+      break;
+    }
+    targetRootId = targetParentId;
+  }
+  if (!targetRootId) {
+    return {
+      ok: false,
+      disabled: true,
+      reason: 'different-parent-context',
+      sourceRootIds,
+      sourceIds,
+      items,
+    };
+  }
+
+  const targetItems = visualHierarchySubtreeItems(items, targetRootId, { parentKey });
+  const targetIds = targetItems.map((item) => item.id);
+  if (targetIds.some((id) => sourceSet.has(id))) {
+    return {
+      ok: false,
+      disabled: true,
+      reason: 'target-inside-source',
+      sourceRootIds,
+      sourceIds,
+      targetRootId,
+      targetIds,
+      items,
+    };
+  }
+
+  const targetContainerId = hierarchyContainerId(byId.get(targetRootId), containerKey);
+  if (sourceParentId) {
+    const parentContainerId = hierarchyContainerId(byId.get(sourceParentId), containerKey);
+    if (parentContainerId !== targetContainerId) {
+      return {
+        ok: false,
+        disabled: true,
+        reason: 'different-container-context',
+        sourceRootIds,
+        sourceIds,
+        targetRootId,
+        targetIds,
+        items,
+      };
+    }
+  }
+
+  const orderedIds = orderVisualHierarchyItems(items, { parentKey }).map((item) => item.id);
+  const sourceBlock = orderedIds.filter((id) => sourceSet.has(id));
+  const withoutSource = orderedIds.filter((id) => !sourceSet.has(id));
+  const targetIndexes = targetIds
+    .map((id) => withoutSource.indexOf(id))
+    .filter((index) => index >= 0);
+  if (targetIndexes.length === 0) {
+    return { ok: false, disabled: true, reason: 'missing-target-block', sourceRootIds, sourceIds, items };
+  }
+  const insertionIndex = placement === 'before'
+    ? Math.min(...targetIndexes)
+    : Math.max(...targetIndexes) + 1;
+  const nextOrder = [...withoutSource];
+  nextOrder.splice(insertionIndex, 0, ...sourceBlock);
+  const targetSiblingRootIds = orderVisualHierarchyItems(items, { parentKey })
+    .filter((item) => (
+      !sourceSet.has(item.id)
+      && hierarchyParentId(item, parentKey) === sourceParentId
+      && hierarchyContainerId(item, containerKey) === targetContainerId
+    ))
+    .map((item) => item.id);
+  const targetSiblingIndex = targetSiblingRootIds.indexOf(targetRootId);
+  if (targetSiblingIndex < 0) {
+    return { ok: false, disabled: true, reason: 'missing-target-sibling', sourceRootIds, sourceIds, items };
+  }
+  targetSiblingRootIds.splice(
+    targetSiblingIndex + (placement === 'after' ? 1 : 0),
+    0,
+    ...sourceRootIds,
+  );
+  const siblingPositionById = new Map(targetSiblingRootIds.map((id, index) => [id, index]));
+  const containerAssignments = Object.fromEntries(sourceIds.map((id) => [id, targetContainerId]));
+  const nextItems = items.map((item) => {
+    const nextPosition = siblingPositionById.get(item.id);
+    if (sourceSet.has(item.id)) {
+      return {
+        ...item,
+        [containerKey]: targetContainerId,
+        position: nextPosition ?? item.position,
+      };
+    }
+    return nextPosition == null ? item : { ...item, position: nextPosition };
+  });
+
+  return {
+    ok: true,
+    disabled: false,
+    reason: 'move-sibling-block',
+    placement,
+    sourceParentId,
+    sourceRootIds,
+    sourceIds,
+    targetRootId,
+    targetIds,
+    containerId: targetContainerId,
+    containerAssignments,
+    // Render adapters need the cross-context projection, while persisted
+    // positions remain scoped to their sibling/container namespace.
+    orderedIds: nextOrder,
+    items: nextItems,
+  };
+}
+
 export function resolveVisualHierarchyStep({
   items: rawItems = [],
   sourceId,
@@ -154,11 +375,46 @@ export function resolveVisualHierarchyStep({
     return { ok: false, disabled: true, direction, reason: 'invalid-source', items };
   }
 
-  const depthById = buildVisualHierarchyDepthMap(items, { parentKey, maxDepth });
+  const depthById = buildVisualHierarchyDepthMap(items, { parentKey, maxDepth: Number.MAX_SAFE_INTEGER });
   const sourceDepth = depthById.get(sourceKey) || 0;
+  const sourceSubtreeItems = visualHierarchySubtreeItems(items, sourceKey, { parentKey });
+  const sourceSubtreeMaxDepth = sourceSubtreeItems.reduce(
+    (deepest, item) => Math.max(deepest, depthById.get(item.id) || 0),
+    sourceDepth,
+  );
   const currentParentId = hierarchyParentId(source, parentKey);
   if (direction === 'left') {
     if (!currentParentId || !byId.has(currentParentId)) {
+      const currentContainerId = hierarchyContainerId(source, containerKey);
+      if (currentContainerId) {
+        const subtree = visualHierarchySubtreeItems(items, sourceKey, { parentKey });
+        const subtreeIds = new Set(subtree.map((item) => item.id));
+        const parentAssignments = Object.fromEntries(subtree.map((item) => [
+          item.id,
+          item.id === sourceKey ? null : hierarchyParentId(item, parentKey),
+        ]));
+        const containerAssignments = Object.fromEntries(subtree.map((item) => [item.id, null]));
+        const next = items.map((item) => subtreeIds.has(item.id)
+          ? {
+              ...item,
+              [parentKey]: item.id === sourceKey ? null : item[parentKey],
+              [containerKey]: null,
+            }
+          : item);
+        return {
+          ok: true,
+          disabled: false,
+          direction,
+          reason: 'detach-from-container',
+          parentId: null,
+          containerId: null,
+          sourceDepth,
+          nextDepth: 0,
+          parentAssignments,
+          containerAssignments,
+          items: next,
+        };
+      }
       return { ok: false, disabled: true, direction, reason: 'already-root', sourceDepth, items };
     }
     const promotedParentId = hierarchyParentId(byId.get(currentParentId), parentKey);
@@ -178,8 +434,16 @@ export function resolveVisualHierarchyStep({
     };
   }
 
-  if (sourceDepth >= maxDepth) {
-    return { ok: false, disabled: true, direction, reason: 'max-depth', sourceDepth, items };
+  if (sourceSubtreeMaxDepth >= maxDepth) {
+    return {
+      ok: false,
+      disabled: true,
+      direction,
+      reason: 'max-depth',
+      sourceDepth,
+      sourceSubtreeMaxDepth,
+      items,
+    };
   }
   const ordered = orderVisualHierarchyItems(items, { parentKey });
   const sourceIndex = ordered.findIndex((item) => item.id === sourceKey);
@@ -227,22 +491,6 @@ export function flatStructuredEntities(raw) {
   ].sort(byPosition);
 }
 
-function visualSubtreeIds(items, sourceId) {
-  const sourceKey = String(sourceId);
-  const ids = new Set([sourceKey]);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const item of items) {
-      const parentId = hierarchyParentId(item);
-      if (!parentId || ids.has(item.id) || !ids.has(parentId)) continue;
-      ids.add(item.id);
-      changed = true;
-    }
-  }
-  return ids;
-}
-
 function reindexFlat(model, flat) {
   const containers = model.containers.map((item) => ({ ...item }));
   const items = model.items.map((item) => ({ ...item }));
@@ -275,10 +523,8 @@ export function moveStructuredEntity(raw, drag, target) {
     const containerId = String(target.containerId);
     if (!model.containers.some((item) => item.id === containerId)) return model;
     const moving = model.items.find((item) => item.id === normalizedDrag.id);
-    const movingIds = visualSubtreeIds(model.items, normalizedDrag.id);
-    const movingBlock = orderVisualHierarchyItems(
-      model.items.filter((item) => movingIds.has(item.id)).sort(byPosition),
-    );
+    const movingBlock = visualHierarchySubtreeItems(model.items, normalizedDrag.id);
+    const movingIds = new Set(movingBlock.map((item) => item.id));
     const siblings = model.items
       .filter((item) => item.containerId === containerId && !movingIds.has(item.id))
       .sort(byPosition);
@@ -319,7 +565,285 @@ export function moveStructuredEntity(raw, drag, target) {
   const rawIndex = Math.max(0, Math.min(Number(target.index) || 0, flat.length));
   const index = Math.max(0, Math.min(existingIndex >= 0 && existingIndex < rawIndex ? rawIndex - 1 : rawIndex, without.length));
   without.splice(index, 0, entity);
-  return reindexFlat(model, without);
+  if (normalizedDrag.type !== 'item') return reindexFlat(model, without);
+
+  const movingBlock = visualHierarchySubtreeItems(model.items, normalizedDrag.id);
+  const movingIds = new Set(movingBlock.map((item) => item.id));
+  const detached = {
+    containers: model.containers,
+    items: model.items.map((item) => movingIds.has(item.id)
+      ? {
+          ...item,
+          containerId: null,
+          parentId: item.id === normalizedDrag.id ? null : item.parentId,
+        }
+      : item),
+  };
+  return reindexFlat(detached, without);
+}
+
+function rectDistanceY(rect, clientY) {
+  if (!rect) return Number.POSITIVE_INFINITY;
+  if (clientY < rect.top) return rect.top - clientY;
+  if (clientY > rect.bottom) return clientY - rect.bottom;
+  return 0;
+}
+
+function unionRects(rects) {
+  const existing = rects.filter(Boolean);
+  if (existing.length === 0) return null;
+  const top = Math.min(...existing.map((rect) => rect.top));
+  const bottom = Math.max(...existing.map((rect) => rect.bottom));
+  const left = Math.min(...existing.map((rect) => rect.left));
+  const right = Math.max(...existing.map((rect) => rect.right));
+  return {
+    top,
+    bottom,
+    left,
+    right,
+    width: right - left,
+    height: bottom - top,
+    midX: (left + right) / 2,
+    midY: (top + bottom) / 2,
+  };
+}
+
+function geometryItemRects(geometry) {
+  const result = new Map();
+  const append = (id, rect) => {
+    const key = String(id ?? '');
+    if (!key || !rect) return;
+    result.set(key, [...(result.get(key) || []), rect]);
+  };
+  for (const row of geometry?.flat || []) {
+    if (row.type === 'item') append(row.id, row.rect);
+  }
+  for (const group of geometry?.groups || []) {
+    for (const row of group.rows || []) append(row.id, row.rect);
+  }
+  return result;
+}
+
+function nearestVerticalCandidate(candidates, clientY) {
+  let nearest = null;
+  for (const candidate of candidates) {
+    const distance = rectDistanceY(candidate.rect, clientY);
+    if (!nearest || distance < nearest.distance) nearest = { ...candidate, distance };
+  }
+  return nearest;
+}
+
+function sameIdOrder(a, b) {
+  return a.length === b.length && a.every((id, index) => id === b[index]);
+}
+
+function reorderTopLevelEntity(model, drag, target, placement) {
+  const sourceKey = entityKey(drag);
+  const targetKey = entityKey(target);
+  const flat = flatStructuredEntities(model);
+  const sourceIndex = flat.findIndex((entity) => entityKey(entity) === sourceKey);
+  const targetIndex = flat.findIndex((entity) => entityKey(entity) === targetKey);
+  if (sourceIndex < 0 || targetIndex < 0 || sourceKey === targetKey) {
+    return { ok: false, disabled: true, reason: 'invalid-top-level-target', model };
+  }
+
+  const withoutSource = flat.filter((entity) => entityKey(entity) !== sourceKey);
+  const targetIndexWithoutSource = withoutSource.findIndex((entity) => entityKey(entity) === targetKey);
+  const insertionIndex = targetIndexWithoutSource + (placement === 'after' ? 1 : 0);
+  withoutSource.splice(insertionIndex, 0, flat[sourceIndex]);
+  const beforeKeys = flat.map(entityKey);
+  const afterKeys = withoutSource.map(entityKey);
+  const positionByKey = new Map(withoutSource.map((entity, position) => [entityKey(entity), position]));
+  const containers = model.containers.map((container) => ({
+    ...container,
+    position: positionByKey.get(entityKey({ type: 'container', id: container.id })) ?? container.position,
+  }));
+  const items = model.items.map((item) => {
+    if (hierarchyContainerId(item) || hierarchyParentId(item)) return item;
+    return {
+      ...item,
+      position: positionByKey.get(entityKey({ type: 'item', id: item.id })) ?? item.position,
+    };
+  });
+  return {
+    ok: true,
+    disabled: false,
+    changed: !sameIdOrder(beforeKeys, afterKeys),
+    reason: 'move-top-level-block',
+    orderedEntities: withoutSource,
+    model: { containers, items },
+  };
+}
+
+/**
+ * Resolves the vertical part of a structured drag. Vertical movement changes
+ * order only; container and parent assignments are deliberately untouched.
+ */
+export function resolveStructuredVerticalMove({
+  model: rawModel,
+  geometry,
+  drag,
+  clientX,
+  clientY,
+  parentKey = 'parentId',
+  containerKey = 'containerId',
+} = {}) {
+  const model = normalizeStructuredModel(rawModel);
+  if (!geometry || !drag) return { ok: false, disabled: true, reason: 'missing-geometry', model };
+  const list = geometry.list;
+  if (!list || clientX < list.left || clientX > list.right || clientY < list.top || clientY > list.bottom) {
+    return { ok: false, disabled: true, outside: true, reason: 'outside-list', model };
+  }
+
+  const itemById = new Map(model.items.map((item) => [item.id, item]));
+  const sourceItem = drag.type === 'item' ? itemById.get(String(drag.id)) : null;
+  const sourceIsTopLevel = drag.type === 'container'
+    || !!sourceItem && !hierarchyParentId(sourceItem, parentKey) && !hierarchyContainerId(sourceItem, containerKey);
+  const itemRects = geometryItemRects(geometry);
+
+  if (sourceIsTopLevel) {
+    const sourceEntity = { type: drag.type, id: String(drag.id) };
+    const candidates = [];
+    for (const entity of flatStructuredEntities(model)) {
+      if (entityKey(entity) === entityKey(sourceEntity)) continue;
+      if (entity.type === 'container') {
+        const flatRow = (geometry.flat || []).find((row) => row.type === 'container' && String(row.id) === entity.id);
+        if (flatRow?.rect) {
+          const memberIds = orderVisualHierarchyItems(
+            model.items.filter((item) => hierarchyContainerId(item, containerKey) === entity.id),
+            { parentKey },
+          ).map((item) => item.id);
+          candidates.push({
+            entity,
+            rect: flatRow.rect,
+            targetIds: [`container:${entity.id}`, ...memberIds],
+          });
+        }
+        continue;
+      }
+      const targetItems = visualHierarchySubtreeItems(model.items, entity.id, { parentKey });
+      const rect = unionRects(targetItems.flatMap((item) => itemRects.get(item.id) || []));
+      if (rect) candidates.push({ entity, rect, targetIds: targetItems.map((item) => item.id) });
+    }
+    const target = nearestVerticalCandidate(candidates, clientY);
+    if (!target) return { ok: false, disabled: true, reason: 'no-target-block', model };
+    const placement = clientY < target.rect.midY ? 'before' : 'after';
+    const moved = reorderTopLevelEntity(model, sourceEntity, target.entity, placement);
+    return {
+      ...moved,
+      key: `block:${entityKey(target.entity)}:${placement}`,
+      placement,
+      targetEntity: target.entity,
+      targetIds: target.targetIds,
+      targetRect: target.rect,
+    };
+  }
+
+  if (!sourceItem) return { ok: false, disabled: true, reason: 'invalid-source', model };
+  const sourceParentId = hierarchyParentId(sourceItem, parentKey);
+  const sourceContainerId = hierarchyContainerId(sourceItem, containerKey);
+  const sourceIds = new Set(visualHierarchySubtreeItems(model.items, sourceItem.id, { parentKey }).map((item) => item.id));
+  const siblingRoots = model.items.filter((item) => (
+    item.id !== sourceItem.id
+    && hierarchyParentId(item, parentKey) === sourceParentId
+    && hierarchyContainerId(item, containerKey) === sourceContainerId
+  ));
+  const candidates = siblingRoots.map((item) => {
+    const targetItems = visualHierarchySubtreeItems(model.items, item.id, { parentKey });
+    return {
+      item,
+      targetItems,
+      rect: unionRects(targetItems.flatMap((targetItem) => itemRects.get(targetItem.id) || [])),
+    };
+  }).filter((candidate) => candidate.rect && !candidate.targetItems.some((item) => sourceIds.has(item.id)));
+  const target = nearestVerticalCandidate(candidates, clientY);
+  if (!target) return { ok: false, disabled: true, reason: 'no-sibling-target', model };
+  const placement = clientY < target.rect.midY ? 'before' : 'after';
+  const moved = resolveVisualBlockMove({
+    items: model.items,
+    sourceId: sourceItem.id,
+    targetId: target.item.id,
+    placement,
+    parentKey,
+    containerKey,
+  });
+  if (!moved.ok) return { ...moved, model };
+  return {
+    ...moved,
+    changed: !sameIdOrder(
+      orderVisualHierarchyItems(model.items, { parentKey }).map((item) => item.id),
+      moved.orderedIds,
+    ),
+    key: `block:item:${moved.targetRootId}:${placement}`,
+    placement,
+    targetEntity: { type: 'item', id: moved.targetRootId },
+    targetIds: moved.targetIds,
+    targetRect: target.rect,
+    model: { containers: model.containers, items: moved.items },
+  };
+}
+
+/** Horizontal hierarchy step, including an explicit step into the preceding group. */
+export function resolveStructuredHierarchyStep({
+  model: rawModel,
+  sourceId,
+  direction,
+  parentKey = 'parentId',
+  containerKey = 'containerId',
+  maxDepth = 4,
+} = {}) {
+  const model = normalizeStructuredModel(rawModel);
+  const source = model.items.find((item) => item.id === String(sourceId));
+  const flat = direction === 'right' && source && !hierarchyParentId(source, parentKey) && !hierarchyContainerId(source, containerKey)
+    ? flatStructuredEntities(model)
+    : [];
+  const sourceIndex = flat.findIndex((entity) => entity.type === 'item' && entity.id === source?.id);
+  const previous = sourceIndex > 0 ? flat[sourceIndex - 1] : null;
+
+  if (!previous || previous.type !== 'container') {
+    const result = resolveVisualHierarchyStep({
+      items: model.items,
+      sourceId,
+      direction,
+      parentKey,
+      containerKey,
+      maxDepth,
+    });
+    return { ...result, model: result.ok ? { containers: model.containers, items: result.items } : model };
+  }
+
+  const subtree = visualHierarchySubtreeItems(model.items, source.id, { parentKey });
+  const sourceIds = new Set(subtree.map((item) => item.id));
+  const existing = orderVisualHierarchyItems(
+    model.items.filter((item) => hierarchyContainerId(item, containerKey) === previous.id && !sourceIds.has(item.id)),
+    { parentKey },
+  );
+  const nextOrder = [...existing, ...subtree];
+  const positionById = new Map(nextOrder.map((item, position) => [item.id, position]));
+  const nextItems = model.items.map((item) => sourceIds.has(item.id)
+    ? {
+        ...item,
+        [containerKey]: previous.id,
+        [parentKey]: item.id === source.id ? null : item[parentKey],
+        position: positionById.get(item.id),
+      }
+    : positionById.has(item.id) ? { ...item, position: positionById.get(item.id) } : item);
+  const parentAssignments = Object.fromEntries(subtree.map((item) => [item.id, item.id === source.id ? null : hierarchyParentId(item, parentKey)]));
+  const containerAssignments = Object.fromEntries(subtree.map((item) => [item.id, previous.id]));
+  return {
+    ok: true,
+    disabled: false,
+    direction,
+    reason: 'enter-previous-container',
+    parentId: null,
+    containerId: previous.id,
+    sourceDepth: 0,
+    nextDepth: 1,
+    parentAssignments,
+    containerAssignments,
+    items: nextItems,
+    model: { containers: model.containers, items: nextItems },
+  };
 }
 
 export function captureGroupedListGeometry(root, flatEntities, options = {}) {
@@ -365,48 +889,25 @@ export function captureGroupedListGeometry(root, flatEntities, options = {}) {
 
 export function resolveGroupedListTarget({ geometry, drag, clientX, clientY }) {
   if (!geometry) return null;
-  const dragId = String(drag.id);
   const list = geometry.list;
-  if (clientX < list.left - 28 || clientX > list.right + 28 || clientY < list.top - 80 || clientY > list.bottom + 80) return null;
-
-  if (drag.type === 'item') {
-    for (const group of geometry.groups) {
-      const flatGroup = geometry.flat.find((row) => row.type === 'container' && row.id === group.containerId);
-      if (flatGroup && group.header && clientX >= group.header.left && clientX <= group.header.right && clientY >= group.header.top && clientY <= group.header.bottom) {
-        return clientY >= group.header.midY
-          ? { key: `container:${group.containerId}:0`, kind: 'container', containerId: group.containerId, index: 0, reason: 'container-header-lower' }
-          : { key: `flat:${flatGroup.index}`, kind: 'flat', index: flatGroup.index, reason: 'container-header-upper' };
-      }
-      if (group.rows.length === 0) {
-        const empty = group.empty;
-        if (empty && clientY >= empty.top && clientY <= empty.bottom && clientX >= empty.left - 18 && clientX <= empty.right + 18) {
-          return { key: `container:${group.containerId}:0`, kind: 'container', containerId: group.containerId, index: 0, reason: 'container-empty' };
-        }
-        continue;
-      }
-      const first = group.rows[0].rect;
-      const last = group.rows[group.rows.length - 1].rect;
-      if (clientY < Math.min(group.body.top, first.top - 8) || clientY > last.bottom) continue;
-      if (clientX < (group.rowLeft ?? group.body.left) - 12 || clientX > (group.rowRight ?? group.body.right) + 18) continue;
-      let index = 0;
-      for (const row of group.rows) {
-        if (row.id === dragId) continue;
-        if (clientY < row.rect.midY) break;
-        index += 1;
-      }
-      return { key: `container:${group.containerId}:${index}`, kind: 'container', containerId: group.containerId, index, reason: 'container-rows' };
-    }
-  }
-
-  let index = geometry.flat.length;
-  for (const row of geometry.flat) {
-    if (clientY < row.rect.midY) {
-      index = row.index;
-      break;
-    }
-    index = row.index + 1;
-  }
-  return { key: `flat:${index}`, kind: 'flat', index, reason: 'flat-block' };
+  if (clientX < list.left || clientX > list.right || clientY < list.top || clientY > list.bottom) return null;
+  const dragKey = entityKey({ type: drag.type, id: String(drag.id) });
+  const target = nearestVerticalCandidate(
+    (geometry.flat || [])
+      .filter((row) => entityKey({ type: row.type, id: String(row.id) }) !== dragKey)
+      .map((row) => ({ row, rect: row.rect })),
+    clientY,
+  );
+  if (!target) return null;
+  const placement = clientY < target.rect.midY ? 'before' : 'after';
+  return {
+    key: `block:${target.row.type}:${target.row.id}:${placement}`,
+    kind: 'block',
+    targetType: target.row.type,
+    targetId: String(target.row.id),
+    placement,
+    reason: 'atomic-flat-block',
+  };
 }
 
 export function autoScrollNearEdge(element, clientY, { edge = 34, minStep = 6, divisor = 3 } = {}) {
@@ -436,21 +937,43 @@ export function startPointerDragSession(pointerEvent, options) {
     geometry: null,
     geometryRevision: 0,
     refreshing: false,
+    pointerRevision: 0,
+    processedPointerRevision: -1,
+    lastClientX: pointerEvent.clientX,
+    lastClientY: pointerEvent.clientY,
+    processedClientX: null,
+    processedClientY: null,
     lastKey: null,
     prevCursor: document.body.style.cursor,
     prevUserSelect: document.body.style.userSelect,
   };
   let finished = false;
 
+  const runPreview = (clientX, clientY) => {
+    if (finished || session.refreshing) return;
+    const processedRevision = session.pointerRevision;
+    const result = options.onPreview({ session, clientX, clientY });
+    session.processedPointerRevision = processedRevision;
+    session.processedClientX = clientX;
+    session.processedClientY = clientY;
+    if (result?.key) session.lastKey = result.key;
+    if (result?.changed) refreshGeometry('preview');
+  };
+
   const refreshGeometry = async (reason) => {
     if (finished || session.refreshing) return;
     session.refreshing = true;
     const expectedRevision = ++session.geometryRevision;
+    const pointerRevision = session.pointerRevision;
     await nextFrame();
     await nextFrame();
     if (!finished && expectedRevision === session.geometryRevision) {
-      session.geometry = options.captureGeometry(session.base, reason);
+      const snapshot = options.getGeometrySnapshot?.(session) ?? session.pendingNext ?? session.base;
+      session.geometry = options.captureGeometry(snapshot, reason);
       session.refreshing = false;
+      if (session.pointerRevision !== pointerRevision) {
+        runPreview(session.lastClientX, session.lastClientY);
+      }
     }
   };
 
@@ -493,13 +1016,27 @@ export function startPointerDragSession(pointerEvent, options) {
     if (finished) return;
     event.preventDefault();
     if (!beginIfNeeded(event)) return;
+    session.lastClientX = event.clientX;
+    session.lastClientY = event.clientY;
+    session.pointerRevision += 1;
     const scrolled = options.autoScroll?.(event.clientY, session) === true;
     if (session.refreshing) return;
-    const result = options.onPreview({ session, clientX: event.clientX, clientY: event.clientY });
-    if (result?.key) session.lastKey = result.key;
-    if (scrolled || result?.changed) refreshGeometry(scrolled ? 'scroll' : 'preview');
+    runPreview(event.clientX, event.clientY);
+    if (scrolled) refreshGeometry('scroll');
   };
-  const onUp = () => finish(true);
+  const onUp = (event) => {
+    if (!session.active) {
+      finish(true);
+      return;
+    }
+    const sameProcessedPointer = !session.refreshing
+      && session.processedPointerRevision === session.pointerRevision
+      && Number.isFinite(session.processedClientX)
+      && Number.isFinite(session.processedClientY)
+      && Math.abs(event.clientX - session.processedClientX) <= 0.5
+      && Math.abs(event.clientY - session.processedClientY) <= 0.5;
+    finish(sameProcessedPointer);
+  };
   const onCancel = () => finish(false);
   const onKeyDown = (event) => { if (event.key === 'Escape') finish(false); };
   const onBlur = () => finish(false);

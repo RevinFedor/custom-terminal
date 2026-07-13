@@ -20,7 +20,7 @@
 1. **mtime/size Cache:** Перед чтением проверяются метаданные файла. Если `mtime` и `size` не изменились — данные берутся из памяти мгновенно.
 2. **Incremental Parsing:** Если файл вырос, система не читает его целиком. Она считывает только новые байты, начиная с последнего известного смещения (`offset`).
 3. **`leftover` Buffer:** Для обработки ситуации, когда файл обрывается на середине JSON-строки, используется буфер остатков. Неполная строка склеивается с началом следующего чанка.
-4. **Async I/O:** Использование `fs.promises.readFile` (или аналогов) гарантирует, что даже первое чтение большого файла не фризит основной поток.
+4. **Async + chunked I/O:** Async API не блокирует event loop на самом disk-read, но `fs.promises.readFile(file, 'utf8')` всё ещё создаёт одну огромную V8-строку. На live Codex rollout 582+ MB холодный путь падал с `RangeError: Invalid string length`. Первое чтение и rewrite для таких файлов должны идти chunked line-reader'ом; подробнее — [`fact-transcript-сервис.md::Codex incremental cache`](fact-transcript-сервис.md).
 
 ## 1b. Freeze при закрытии Claude-вкладки: archive-path читал JSONL целиком
 
@@ -169,7 +169,7 @@ const ids = useStore(useShallow(s => s.items.filter(i => i.active).map(i => i.id
 ## 4. Проблема: UI Freeze при загрузке тяжелых списков истории
 
 ### Суть
-При открытии полной панели истории (History Panel) в сессиях с 200+ записями React выполняет рендер всех entries одновременно. Это блокирует Main Thread на 1-2+ секунды, что замораживает анимации (спиннер, лоадеры) и делает UI неотзывчивым.
+Эта секция фиксирует **исторический renderer-слой**: до виртуализации History Panel рендер 200+ entries мог блокировать renderer Main Thread на 1–2+ секунды. Сейчас History использует Virtuoso, поэтому для длинной Codex-сессии симптом «пустая Timeline, Electron вырос до гигабайтов» нельзя снова объяснять количеством DOM-rows. Текущая граница — eager parser/projection, IPC structured clone и retained snapshots; см. [`fact-transcript-сервис.md::Ресурсная модель большой сессии`](fact-transcript-сервис.md).
 
 ### Решение: React 19 `startTransition`
 Использование встроенной функции `startTransition` из React 19 для разбиения (квантования) рендера:
@@ -186,6 +186,8 @@ startTransition(() => {
 - **Поведение:** React теперь разбивает рендер на **несколько кадров** вместо одного. После каждого кадра браузер получает контроль обратно, позволяя обработать события и выполнить анимации.
 - **GPU Layer:** При использовании `will-change: transform` и `transform`-анимаций спиннеры продолжают вращаться на **уровне композитора** (GPU layer), даже когда Main Thread занят reconciliation тяжелого DOM-дерева.
 - **UX:** Пользователь видит **плавные анимации** вместо застывшего спиннера, что создает ощущение плавности и отзывчивости даже при загрузке сотен элементов.
+
+`startTransition`, Virtuoso и GPU-layer оптимизируют presentation budget, но не уменьшают уже разобранный JSONL, full History payload и его копии. Тихое truncation тяжёлых tool-results не является допустимым memory-fix: оно отнимает inspect/copy capability. Полное решение должно начинать progressive disclosure на data boundary: lightweight row с identity, full detail по expand/Copy.
 
 ### GPU-ускорение для лоадеров
 Лоадеры (спиннеры) используют трансформацию вместо анимации CSS:

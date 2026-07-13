@@ -218,6 +218,25 @@ function register({ projectManager }) {
     }
   });
 
+  ipcMain.handle('timeline-turn-action-overrides:get', async (event, { toolType, sessionId }) => {
+    try {
+      return { success: true, data: projectManager.getTimelineTurnActionOverrides(toolType, sessionId) };
+    } catch (error) {
+      console.error('[main] Error getting Timeline action overrides:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('timeline-turn-action-overrides:save', async (event, payload) => {
+    try {
+      const saved = projectManager.saveTimelineTurnActionOverride(payload);
+      return saved ? { success: true } : { success: false, error: 'Invalid Timeline action override' };
+    } catch (error) {
+      console.error('[main] Error saving Timeline action override:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
   // ── AI Prompt File Attachments ──
 
   ipcMain.handle('ai-prompts:select-file', async () => {

@@ -6,7 +6,7 @@
 дифф, thinking-блок, markdown-проза с code-блоками). Потребляется **пятью**
 местами: десктопным SDK-табом (`ClaudeSDK/ClaudeSDKTab.tsx`), мобилкой
 (`mobile-web/src/App.tsx`), **JSONL-history окном** (`Workspace/HistoryPanel.tsx`,
-по Cmd+\), и — из **соседнего проекта voice-record** — его десктоп-оверлеем
+по Cmd+]), и — из **соседнего проекта voice-record** — его десктоп-оверлеем
 (`voice-record/src/renderer/prompt.tsx`) и его mobile-web (`voice-record/mobile-web`).
 Source-alias работает кросс-проектно: voice-record указывает на
 `../custom-terminal/packages/claude-blocks/src`. Поэтому правка в пакете задевает
@@ -17,7 +17,7 @@ Source-alias работает кросс-проектно: voice-record указ
 bash обрезанный до 60 char, naive old/new дифф) — теперь все три рендерят один
 канон (десктопный SDK).
 
-### HistoryPanel (Cmd+\) — потребитель №3
+### HistoryPanel (Cmd+]) — потребитель №3
 JSONL-парсер в main (`src/main/ipc/claude-data.js`, `claude:get-full-history`)
 **пре-форматировал** tool-calls в строки/типизированные объекты (терял команду
 Bash после 60 символов, не тянул результаты для не-Task тулзов). Чтобы пакет мог
@@ -33,6 +33,14 @@ Bash после 60 символов, не тянул результаты для
 hot-reload'ится — нужен рестарт Electron (dev: рестарт `npm run dev`-таба; prod:
 `build:install`), иначе `rawTool` не появится и HistoryPanel молча уйдёт в legacy-
 фоллбэк.
+
+Codex History использует тот же `ToolCallPart`, поэтому верхнеуровневый `exec` нельзя
+«чинить визуально» внутри пакета: это transport-envelope нового rollout, а не новый
+вид пользовательского действия. Codex adapter обязан до пакета развернуть вложенные
+`tools.*(...)` в канонические Bash/Read/Edit/Write/MultiEdit/MCP shape'ы и связать
+отложенный `wait(cell_id)` с исходными карточками. Пакет получает уже смысл действия;
+если в History снова виден `EXEC const ...`, проверять нужно parser boundary, не
+`ToolCard`/CSS. Конкретный rollout-контракт — `fact-codex.md::Timeline и History`.
 
 ## Копирование выделения сохраняет markdown-структуру
 react-markdown рендерит markdown в семантический HTML (`<li>`, `<strong>`,

@@ -39,7 +39,12 @@ import type { ClaudeCodeSettings, DefaultClaudeEffort, DefaultClaudeModel } from
 import { DEFAULT_CLAUDE_CODE_SETTINGS } from '../constants/claudeLevels';
 export type { DefaultCodexEffort, DefaultCodexModel } from '../constants/codexSettings';
 import type { CodexSettings, DefaultCodexEffort, DefaultCodexModel } from '../constants/codexSettings';
-import { DEFAULT_CODEX_SETTINGS, normalizeCodexEfforts, normalizeCodexModelOptions } from '../constants/codexSettings';
+import {
+  DEFAULT_CODEX_SETTINGS,
+  normalizeCodexEfforts,
+  normalizeCodexModelOptions,
+  resolveCodexEffortForModel,
+} from '../constants/codexSettings';
 
 export const HISTORY_PANEL_DEFAULT_WIDTH = 580;
 export const HISTORY_PANEL_MIN_WIDTH = 280;
@@ -1328,7 +1333,7 @@ const initialTimelinePinned = loadTimelinePinned();
   } catch {}
 })();
 
-// historyPinned — global layout mode for Cmd+\ HistoryPanel. Defaults to the
+// historyPinned — global layout mode for Cmd+] / Option+] HistoryPanel. Defaults to the
 // legacy combined timelinePinned value so users keep their previous layout.
 const APP_STATE_KEY_HISTORY_PINNED = 'historyPinned';
 const loadHistoryPinned = (): boolean => {
@@ -1595,9 +1600,39 @@ const APP_STATE_KEY_CODEX_SETTINGS = 'codexSettings';
 const LOCAL_KEY_CODEX_SETTINGS = 'noted-terminal-codex-settings';
 const normalizeCodexSettings = (raw: unknown): CodexSettings => {
   const obj = raw && typeof raw === 'object' ? raw as Partial<CodexSettings> : {};
+  const rawModels = Array.isArray(obj.models) ? obj.models : [];
+  const legacyDefaultOrder = [
+    'gpt-5.5',
+    'gpt-5.6-sol',
+    'gpt-5.6-terra',
+    'gpt-5.6-luna',
+    'gpt-5.4',
+    'gpt-5.4-mini',
+    'gpt-5.3-codex-spark',
+  ];
+  const canonicalOrder = DEFAULT_CODEX_SETTINGS.models.map((model) => model.id);
+  let models = normalizeCodexModelOptions(rawModels);
+  // The original built-in order put 5.5 first. Move untouched legacy settings
+  // to the current catalog order without disturbing a user-made custom order.
+  if (
+    rawModels.length === legacyDefaultOrder.length
+    && rawModels.every((model: any, index) => String(model?.id || '').trim() === legacyDefaultOrder[index])
+  ) {
+    const rank = new Map(canonicalOrder.map((id, index) => [id, index]));
+    models = [...models].sort((a, b) => (rank.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (rank.get(b.id) ?? Number.MAX_SAFE_INTEGER));
+  }
+  const requestedQuickModel = typeof obj.quickModel === 'string' ? obj.quickModel.trim() : '';
+  const quickModel = requestedQuickModel && models.some((model) => model.id === requestedQuickModel)
+    ? requestedQuickModel
+    : null;
+  const quickEffort = quickModel
+    ? resolveCodexEffortForModel(models.find((model) => model.id === quickModel), obj.quickEffort)
+    : null;
   return {
-    models: normalizeCodexModelOptions(obj.models),
+    models,
     efforts: normalizeCodexEfforts(obj.efforts),
+    quickModel,
+    quickEffort,
   };
 };
 const loadCodexSettings = (): CodexSettings => {

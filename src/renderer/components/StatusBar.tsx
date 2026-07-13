@@ -13,6 +13,7 @@ import {
 import { usePromptsStore } from '../store/usePromptsStore';
 import { useCmdKey } from '../hooks/useCmdHoverPopover';
 import { CUSTOM_ICONS } from '../assets/icons/registry';
+import CenteredUpwardPopover from './UI/CenteredUpwardPopover';
 
 const { ipcRenderer } = window.require('electron');
 const CODEX_ICON_URL = new URL('../assets/icons/codex-color.svg', import.meta.url).href;
@@ -63,6 +64,10 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
   }, [codexSettings.models]);
 
   const activeCodexModel = codexModels.find((m) => m.id === defaultCodexModel) || codexModels[0];
+  const visibleCodexModels = codexModels.filter((model) => model.visible !== false);
+  const codexModelsForSelector = visibleCodexModels.length > 0
+    ? visibleCodexModels
+    : codexModels.filter((model) => model.id === defaultCodexModel);
   const codexEfforts = activeCodexModel?.efforts?.length ? activeCodexModel.efforts : [...CODEX_EFFORT_LEVELS];
   const setDefaultCodexModelWithEffort = (model: string) => {
     setDefaultCodexModel(model);
@@ -116,7 +121,7 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
           accent="#7A9DFF"
           icon={<img src={CODEX_ICON_URL} alt="" style={{ width: '100%', height: '100%', display: 'block' }} />}
           modelValue={defaultCodexModel}
-          modelOptions={codexModels}
+          modelOptions={codexModelsForSelector}
           effortValue={defaultCodexEffort}
           effortOptions={codexEfforts}
           onModelChange={setDefaultCodexModelWithEffort}
@@ -641,7 +646,6 @@ function EngineDefaultsSelector({
         <span style={{ width: 14, height: 14, color: accent, display: 'inline-flex', flexShrink: 0 }}>
           {icon}
         </span>
-        <span style={{ color: '#ddd', fontWeight: 700, fontSize: 11 }}>{engine}</span>
         <span
           style={{
             display: 'inline-flex',
@@ -668,11 +672,10 @@ function EngineDefaultsSelector({
             {shortEffort}
           </span>
         </span>
-        <Settings size={11} strokeWidth={1.8} style={{ color: '#777', flexShrink: 0 }} />
       </button>
       {open && chipRef.current && createPortal(
         <EngineDefaultsPopup
-          chipRect={chipRef.current.getBoundingClientRect()}
+          chipRef={chipRef}
           popupRef={popupRef}
           engine={engine}
           accent={accent}
@@ -693,7 +696,7 @@ function EngineDefaultsSelector({
 }
 
 function EngineDefaultsPopup({
-  chipRect,
+  chipRef,
   popupRef,
   engine,
   accent,
@@ -707,7 +710,7 @@ function EngineDefaultsPopup({
   onPopupEnter,
   onPopupLeave,
 }: {
-  chipRect: DOMRect;
+  chipRef: React.RefObject<HTMLButtonElement | null>;
   popupRef: React.RefObject<HTMLDivElement | null>;
   engine: string;
   accent: string;
@@ -723,26 +726,21 @@ function EngineDefaultsPopup({
 }) {
   const models = useMemo(() => withNoneOption(modelValue, modelOptions), [modelValue, modelOptions]);
   const levels = useMemo(() => withNoneLevel(effortValue, effortOptions), [effortValue, effortOptions]);
-  const maxWidth = Math.max(300, Math.min(560, window.innerWidth - 12));
+  const maxWidth = Math.max(300, Math.min(560, window.innerWidth - 16));
 
   return (
-    <div
+    <CenteredUpwardPopover
       ref={popupRef}
       onMouseEnter={onPopupEnter}
       onMouseLeave={onPopupLeave}
-      style={{
-        position: 'fixed',
-        right: Math.max(6, window.innerWidth - chipRect.right),
-        bottom: window.innerHeight - chipRect.top + 4,
-        paddingBottom: 4,
-        zIndex: 10010,
-      }}
+      getAnchorRect={() => chipRef.current?.getBoundingClientRect() || null}
+      zIndex={10010}
     >
       <div
         className="bg-[#1a1a1a] border border-[#444] rounded shadow-2xl"
         style={{
           width: 'max-content',
-          maxWidth,
+          maxWidth: `min(${maxWidth}px, 100%)`,
           padding: 8,
           boxShadow: '0 -8px 24px rgba(0,0,0,0.5)',
         }}
@@ -776,7 +774,7 @@ function EngineDefaultsPopup({
           onSelect={(level) => onEffortSelect(level === effortValue ? 'none' : level)}
         />
       </div>
-    </div>
+    </CenteredUpwardPopover>
   );
 }
 
@@ -804,7 +802,7 @@ function EngineOptionRow<T>({
         className="flex gap-1"
         style={{
           flexWrap: 'wrap',
-          maxWidth: 492,
+          maxWidth: '100%',
           maxHeight: label === 'Model' ? 132 : 72,
           overflowY: 'auto',
           paddingRight: 1,
@@ -971,7 +969,7 @@ function HistoryTimelinePinToggle({
       style={{ height: 20, border: '1px solid rgba(255,255,255,0.08)' }}
     >
       <SplitIconButton
-        title="History pin (Cmd+\\): когда история открыта, держать её обычной колонкой, а не overlay поверх терминала."
+        title="History pin (Cmd+] / Opt+]): когда история открыта, держать её обычной колонкой, а не overlay поверх терминала."
         active={historyPinned}
         activeColor="#a78bfa"
         side="left"
@@ -980,7 +978,7 @@ function HistoryTimelinePinToggle({
         <History size={13} strokeWidth={1.9} />
       </SplitIconButton>
       <SplitIconButton
-        title="Timeline pin (Cmd+]): когда таймлайн раскрыт, держать его обычной колонкой, а не overlay поверх терминала."
+        title="Timeline pin (Cmd+\\ / Opt+\\): когда таймлайн раскрыт, держать его обычной колонкой, а не overlay поверх терминала."
         active={timelinePinned}
         activeColor="#38bdf8"
         side="right"

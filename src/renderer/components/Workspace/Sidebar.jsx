@@ -1,11 +1,29 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect } from 'react'
-import { FileExplorer as PragmaticFileTree, emptySidebarLayout, hasSidebarLayoutEntries, normalizeSidebarLayout, sameSidebarLayout } from '@noted/file-explorer'
+import { flushSync } from 'react-dom'
+import {
+  applySidebarLayout,
+  DEFAULT_FILE_ICON_PROFILE,
+  FileExplorer as PragmaticFileTree,
+  emptySidebarLayout,
+  hasSidebarLayoutEntries,
+  mutateSharedFileIconProfile,
+  normalizeFileIconProfile,
+  normalizeSidebarLayout,
+  rewriteSidebarLayoutPath,
+  sameFileIconProfile,
+  sameSidebarLayout,
+  shouldImportLegacyFileIconOverrides,
+} from '@noted/file-explorer'
 import '@noted/file-explorer/styles.css'
 import { flattenTree } from './PragmaticFileTree/utils'
 import Tooltip from '../UI/Tooltip'
 import IconCropper from './IconCropper'
 import { RunAfterTabPicker } from './RunAfterTabPicker'
 import { getValue, setValue } from '../../utils/storage'
+
+const CUSTOM_TERMINAL_ICON_IMPORT_KEY = import.meta.env.DEV
+  ? 'customTerminalDevelopment'
+  : 'customTerminalProduction'
 
 // --- Sort Comparator ---
 
@@ -74,11 +92,63 @@ const removeNodeFromTree = (nodes, nodeId) => {
     })
 }
 
+const rewriteNodePath = (node, oldBase, newBase) => {
+  const nextId = node.id === oldBase || node.id.startsWith(oldBase + '/')
+    ? newBase + node.id.slice(oldBase.length)
+    : node.id
+  return {
+    ...node,
+    id: nextId,
+    children: node.children
+      ? node.children.map(child => rewriteNodePath(child, oldBase, newBase))
+      : node.children
+  }
+}
+
+const findTreeNodeById = (nodes, id) => {
+  if (!id) return null
+  for (const node of nodes || []) {
+    if (node.id === id) return node
+    const found = findTreeNodeById(node.children, id)
+    if (found) return found
+  }
+  return null
+}
+
+const rewritePathWithMap = (value, pathMap) => {
+  if (!value || !pathMap || pathMap.size === 0) return value
+  let bestOldPath = null
+  for (const oldPath of pathMap.keys()) {
+    if (value === oldPath || value.startsWith(oldPath + '/')) {
+      if (!bestOldPath || oldPath.length > bestOldPath.length) bestOldPath = oldPath
+    }
+  }
+  if (!bestOldPath) return value
+  return pathMap.get(bestOldPath) + value.slice(bestOldPath.length)
+}
+
+const rewriteExpandedStatePaths = (state, pathMap) => {
+  const next = {}
+  for (const [path, expanded] of Object.entries(state || {})) {
+    const nextPath = rewritePathWithMap(path, pathMap)
+    next[nextPath] = !!(next[nextPath] || expanded)
+  }
+  return next
+}
+
+const rewriteSidebarLayoutPaths = (layout, pathMap) => {
+  let next = normalizeSidebarLayout(layout)
+  for (const [oldPath, newPath] of pathMap) {
+    next = rewriteSidebarLayoutPath(next, oldPath, newPath)
+  }
+  return next
+}
+
 // Переименовать узел в дереве (для Rename)
 const renameNodeInTree = (nodes, nodeId, newName, newId) => {
   return nodes.map(node => {
     if (node.id === nodeId) {
-      return { ...node, id: newId, name: newName }
+      return { ...rewriteNodePath(node, nodeId, newId), name: newName }
     }
     if (node.children) {
       return { ...node, children: renameNodeInTree(node.children, nodeId, newName, newId) }
@@ -97,11 +167,9 @@ const moveNodeInTree = (nodes, nodeId, newParentId, rootPath, sortComparator) =>
   const extractNode = (nodes) => {
     return nodes.filter(node => {
       if (node.id === nodeId) {
-        movedNode = { ...node }
-        // Обновляем id узла на новый путь
         const nodeName = node.name
         const newPath = newParentId ? `${newParentId}/${nodeName}` : `${rootPath}/${nodeName}`
-        movedNode.id = newPath
+        movedNode = rewriteNodePath(node, nodeId, newPath)
         console.log('[dnd]','Extracted node:', { oldId: nodeId, newId: newPath })
         return false // Удаляем из текущего места
       }
@@ -124,10 +192,12 @@ const moveNodeInTree = (nodes, nodeId, newParentId, rootPath, sortComparator) =>
 
   // 2. Вставить узел в новое место
   const cmp = sortComparator || getSortComparator('name-asc')
+  let inserted = false
   if (!newParentId) {
     // Перемещение в корень
     console.log('[dnd]','Moving to root')
     newTree = [...newTree, movedNode].sort(cmp)
+    inserted = true
   } else {
     // Перемещение в папку
     console.log('[dnd]','Moving to folder:', newParentId)
@@ -137,6 +207,7 @@ const moveNodeInTree = (nodes, nodeId, newParentId, rootPath, sortComparator) =>
           const children = node.children ? [...node.children, movedNode] : [movedNode]
           children.sort(cmp)
           console.log('[dnd]','Inserted into parent, new children count:', children.length)
+          inserted = true
           return { ...node, children }
         }
         if (node.children) {
@@ -148,15 +219,15 @@ const moveNodeInTree = (nodes, nodeId, newParentId, rootPath, sortComparator) =>
     newTree = insertIntoParent(newTree)
   }
 
+  if (!inserted) {
+    console.log('[dnd]','ERROR: Move parent not found, restoring original tree')
+    return nodes
+  }
+
   return newTree
 }
 
 // --- Main Component ---
-
-// Save custom icons to storage (async)
-async function saveCustomIcons(icons) {
-  await setValue('gt-file-icons', icons)
-}
 
 function IconPicker({ item, onSelect, onClose, onReset, onResetToVsc, existingIcons }) {
   const pickerRef = useRef(null)
@@ -412,7 +483,22 @@ function Sidebar({
 }) {
   const [treeData, setTreeData] = useState([])
   const [contextMenu, setContextMenu] = useState(null)
-  const [customIcons, setCustomIcons] = useState({}) // Loaded async from storage
+  const [fileIconProfile, setFileIconProfile] = useState(() => (
+    normalizeFileIconProfile({
+      ...DEFAULT_FILE_ICON_PROFILE,
+      iconTheme,
+      customIconRules: settings?.customIconRules,
+    })
+  ))
+  const fileIconProfileRef = useRef(fileIconProfile)
+  const fileIconRevisionRef = useRef(0)
+  const fileIconWriteQueueRef = useRef(Promise.resolve())
+  const customIcons = fileIconProfile.nameOverrides
+  const effectiveIconTheme = fileIconProfile.iconTheme
+  const effectiveIconSettings = useMemo(() => ({
+    ...(settings || {}),
+    customIconRules: fileIconProfile.customIconRules,
+  }), [fileIconProfile.customIconRules, settings])
   const [iconPickerNode, setIconPickerNode] = useState(null)
   const [editingId, setEditingId] = useState(null) // ID of node being edited
   const [dirDropdownOpen, setDirDropdownOpen] = useState(false)
@@ -428,6 +514,43 @@ function Sidebar({
   const [expandedSnapshot, setExpandedSnapshot] = useState({}) // Triggers PragmaticFileTree update
   const [sidebarLayout, setSidebarLayout] = useState(() => emptySidebarLayout())
   const sidebarLayoutRevisionRef = useRef(0)
+  const treeDataRef = useRef([])
+
+  const adoptFileIconResult = useCallback((result) => {
+    if (!result) return
+    const profile = normalizeFileIconProfile(result.profile)
+    fileIconRevisionRef.current = Number(result.revision) || 0
+    fileIconProfileRef.current = profile
+    setFileIconProfile(previous => sameFileIconProfile(previous, profile) ? previous : profile)
+  }, [])
+
+  const commitFileIconMutation = useCallback((mutation) => {
+    const run = async () => {
+      const ipc = window.require('electron').ipcRenderer
+      const result = await mutateSharedFileIconProfile({
+        get: () => ipc.invoke('shared-file-icons:get', 'default'),
+        put: (profile, expectedRevision) => (
+          ipc.invoke('shared-file-icons:put', profile, expectedRevision, 'default')
+        ),
+      }, mutation, {
+        revision: fileIconRevisionRef.current,
+        profile: fileIconProfileRef.current,
+      })
+      adoptFileIconResult(result)
+      return result
+    }
+    const queued = fileIconWriteQueueRef.current.then(run, run)
+    fileIconWriteQueueRef.current = queued.catch(() => null)
+    return queued
+  }, [adoptFileIconResult])
+
+  const commitCustomIcons = useCallback((nameOverrides) => (
+    commitFileIconMutation(profile => ({ ...profile, nameOverrides }))
+  ), [commitFileIconMutation])
+
+  useEffect(() => {
+    treeDataRef.current = treeData
+  }, [treeData])
 
   const updateSidebarLayout = useCallback((updater, options = {}) => {
     setSidebarLayout(previous => {
@@ -511,22 +634,74 @@ function Sidebar({
     }
   }, [sidebarFocused, editingId, activeFilePath])
 
-  // 0. Load custom icons from storage
+  // Shared icon profile. Only the installed app may import its old exact-name
+  // overrides; disposable dev state must never seed cross-application data.
   useEffect(() => {
-    async function loadIcons() {
-      const saved = await getValue('gt-file-icons', {})
-      setCustomIcons(saved)
+    let cancelled = false
+    const ipc = window.require('electron').ipcRenderer
+    const api = {
+      get: () => ipc.invoke('shared-file-icons:get', 'default'),
+      put: (profile, expectedRevision) => (
+        ipc.invoke('shared-file-icons:put', profile, expectedRevision, 'default')
+      ),
     }
-    loadIcons()
-  }, [])
+    const refresh = async () => {
+      try {
+        let result = await api.get()
+        const current = normalizeFileIconProfile(result?.profile)
+        const shouldImportLegacyIcons = shouldImportLegacyFileIconOverrides(
+          current,
+          CUSTOM_TERMINAL_ICON_IMPORT_KEY,
+        )
+        if (shouldImportLegacyIcons) {
+          const legacyNameOverrides = await getValue('gt-file-icons', {})
+          result = await mutateSharedFileIconProfile(api, profile => ({
+            ...profile,
+            nameOverrides: {
+              ...(legacyNameOverrides || {}),
+              ...profile.nameOverrides,
+            },
+            legacyImports: {
+              ...profile.legacyImports,
+              [CUSTOM_TERMINAL_ICON_IMPORT_KEY]: true,
+            },
+          }), result)
+        }
+        if (cancelled || !result) return
+        if (
+          (Number(result.revision) || 0) === fileIconRevisionRef.current
+          && sameFileIconProfile(result.profile, fileIconProfileRef.current)
+        ) return
+        adoptFileIconResult(result)
+      } catch (error) {
+        console.error('[SharedFileIcons] load failed:', error)
+      }
+    }
+    refresh()
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') refresh()
+    }, 1200)
+    window.addEventListener('focus', refresh)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+      window.removeEventListener('focus', refresh)
+    }
+  }, [adoptFileIconResult])
 
   // 0.3. Load per-directory settings (sort, autoReveal) when folderPath changes
   useEffect(() => {
     if (!folderPath) return
     async function loadDirSettings() {
-      const allSettings = await getValue('gt-dir-settings', {})
+      const ipc = window.require('electron').ipcRenderer
+      const [allSettings, sharedLayoutResult] = await Promise.all([
+        getValue('gt-dir-settings', {}),
+        ipc.invoke('shared-file-layout:get', folderPath).catch(() => null),
+      ])
       const s = allSettings[folderPath] || {}
-      const mode = s.sortMode || 'name-asc'
+      const mode = hasSidebarLayoutEntries(sharedLayoutResult?.layout)
+        ? 'manual'
+        : (s.sortMode || 'name-asc')
       setSortMode(mode)
       sortModeRef.current = mode
       setAutoReveal(s.autoReveal !== false)
@@ -740,13 +915,13 @@ function Sidebar({
 
     if (!node || !node.isDirectory) {
       console.log('[tree]','Toggle skipped: not a directory or not found')
-      return
+      return { ok: false, reason: 'not-directory' }
     }
 
     // Если дети уже загружены, не грузим заново
     if (node.children && node.children.length > 0) {
       console.log('[tree]','Children already loaded, count:', node.children.length)
-      return
+      return { ok: true, childCount: node.children.length }
     }
 
     console.log('[tree]','Loading children for:', id)
@@ -772,10 +947,180 @@ function Sidebar({
         }
         return updateNode(prevData)
       })
+      return { ok: true, childCount: children.length }
     } catch (e) {
       console.log('[tree]','Error loading children:', e)
+      return { ok: false, reason: 'read-failed', error: e?.message || String(e) }
     }
   }, [treeData])
+
+  const handleMoveItems = useCallback(async (sourcePaths, destinationDir, meta = {}) => {
+    if (!folderPath || !destinationDir || !Array.isArray(sourcePaths)) return []
+    if (destinationDir !== folderPath && !destinationDir.startsWith(folderPath + '/')) {
+      console.log('[SidebarDnd]', 'Move rejected: destination is outside the sidebar root', destinationDir)
+      return []
+    }
+
+    const requested = [...new Set(sourcePaths.filter(Boolean))]
+    const uniquePaths = requested.filter(sourcePath => (
+      !requested.some(otherPath => otherPath !== sourcePath && sourcePath.startsWith(otherPath + '/'))
+    ))
+    const moveCandidates = uniquePaths.map(sourcePath => {
+      const slash = sourcePath.lastIndexOf('/')
+      const sourceParent = slash > 0 ? sourcePath.slice(0, slash) : folderPath
+      const fileName = slash >= 0 ? sourcePath.slice(slash + 1) : sourcePath
+      return { sourcePath, sourceParent, fileName, newPath: `${destinationDir}/${fileName}` }
+    })
+    const destinationOwners = new Map()
+    const duplicateDestinations = new Set()
+    for (const { sourcePath, newPath } of moveCandidates) {
+      if (destinationOwners.has(newPath)) {
+        duplicateDestinations.add(newPath)
+      } else {
+        destinationOwners.set(newPath, sourcePath)
+      }
+    }
+    if (duplicateDestinations.size > 0) {
+      console.log('[SidebarDnd]', 'Move rejected: duplicate destination in batch', {
+        destinationDir,
+        duplicateDestinations: [...duplicateDestinations],
+      })
+      return moveCandidates.map(({ sourcePath, newPath }) => ({
+        sourcePath,
+        newPath,
+        skipped: true,
+        success: false,
+        reason: 'duplicate-destination',
+      }))
+    }
+
+    const results = []
+    const entries = []
+
+    for (const { sourcePath, sourceParent, fileName, newPath } of moveCandidates) {
+      if (!fileName || sourceParent === destinationDir || sourcePath === newPath) {
+        results.push({ sourcePath, newPath, skipped: true, success: true, reason: 'same-parent' })
+        continue
+      }
+      if (!sourcePath.startsWith(folderPath + '/') || destinationDir === sourcePath || destinationDir.startsWith(sourcePath + '/')) {
+        results.push({ sourcePath, newPath, skipped: true, success: false, reason: 'invalid-destination' })
+        continue
+      }
+      if (!findTreeNodeById(treeDataRef.current, sourcePath)) {
+        results.push({ sourcePath, newPath, skipped: true, success: false, reason: 'source-not-in-tree' })
+        continue
+      }
+
+      let sourceExists = null
+      let destinationExists = null
+      let targetExists = null
+      try {
+        const exists = await window.electronAPI.pathsExist([sourcePath, destinationDir, newPath])
+        sourceExists = !!exists?.[sourcePath]
+        destinationExists = !!exists?.[destinationDir]
+        targetExists = !!exists?.[newPath]
+      } catch (error) {
+        console.log('[SidebarDnd]', 'Path preflight unavailable:', error)
+      }
+      const rejectReason = sourceExists === false
+        ? 'source-missing'
+        : (destinationExists === false ? 'destination-missing' : (targetExists === true ? 'target-exists' : null))
+      if (rejectReason) {
+        console.log('[SidebarDnd]', `Move rejected: ${rejectReason}`, { sourcePath, destinationDir, newPath })
+        results.push({ sourcePath, newPath, skipped: true, success: false, reason: rejectReason })
+        continue
+      }
+
+      entries.push({ sourcePath, sourceParent, newPath })
+    }
+
+    if (entries.length === 0) return results
+
+    const pathMap = new Map(entries.map(entry => [entry.sourcePath, entry.newPath]))
+    const newParentId = destinationDir === folderPath ? null : destinationDir
+    const nextExpandedState = rewriteExpandedStatePaths(openStateRef.current, pathMap)
+    let optimisticTree = treeDataRef.current
+
+    for (const entry of entries) {
+      registerPendingOperation(entry.sourcePath)
+      registerPendingOperation(entry.sourceParent)
+      registerPendingOperation(destinationDir)
+      registerPendingOperation(entry.newPath)
+      optimisticTree = moveNodeInTree(
+        optimisticTree,
+        entry.sourcePath,
+        newParentId,
+        folderPath,
+        getSortComparator(sortModeRef.current)
+      )
+    }
+
+    flushSync(() => {
+      treeDataRef.current = optimisticTree
+      setTreeData(optimisticTree)
+      setFocusedId(previous => rewritePathWithMap(previous, pathMap))
+      setMultiSelected(previous => {
+        const next = new Set()
+        for (const id of previous || []) next.add(rewritePathWithMap(id, pathMap))
+        return next
+      })
+      openStateRef.current = nextExpandedState
+      openStatesMapRef.current[folderPath] = { ...nextExpandedState }
+      setExpandedSnapshot({ ...nextExpandedState })
+      updateSidebarLayout(previous => rewriteSidebarLayoutPaths(previous, pathMap))
+    })
+    saveExpandedDirs(nextExpandedState)
+
+    if (typeof meta.onOptimisticMove === 'function') {
+      meta.onOptimisticMove(entries.map(entry => entry.newPath))
+    }
+
+    const failedEntries = []
+    for (const entry of entries) {
+      let success = false
+      try {
+        success = !!(await window.electronAPI.moveItem(entry.sourcePath, destinationDir))
+      } catch (error) {
+        console.log('[SidebarDnd]', 'Physical move failed:', entry.sourcePath, error)
+      }
+
+      if (success) {
+        onRename?.(entry.sourcePath, entry.newPath)
+      } else {
+        failedEntries.push(entry)
+      }
+      results.push({ sourcePath: entry.sourcePath, newPath: entry.newPath, success })
+    }
+
+    if (failedEntries.length > 0) {
+      const rollbackMap = new Map(failedEntries.map(entry => [entry.newPath, entry.sourcePath]))
+      const rollbackExpandedState = rewriteExpandedStatePaths(openStateRef.current, rollbackMap)
+      openStateRef.current = rollbackExpandedState
+      openStatesMapRef.current[folderPath] = { ...rollbackExpandedState }
+      setFocusedId(previous => rewritePathWithMap(previous, rollbackMap))
+      setMultiSelected(previous => {
+        const next = new Set()
+        for (const id of previous || []) next.add(rewritePathWithMap(id, rollbackMap))
+        return next
+      })
+      setExpandedSnapshot({ ...rollbackExpandedState })
+      updateSidebarLayout(previous => rewriteSidebarLayoutPaths(previous, rollbackMap))
+      saveExpandedDirs(rollbackExpandedState)
+
+      const nodes = await loadTreeRecursive(folderPath, rollbackExpandedState)
+      treeDataRef.current = nodes
+      setTreeData(nodes)
+    } else {
+      // A collapsed destination can have an unloaded children array. The optimistic
+      // insert only knows about moved nodes, so reconcile from disk before a later
+      // expand mistakes that partial array for a complete directory listing.
+      const nodes = await loadTreeRecursive(folderPath, openStateRef.current)
+      treeDataRef.current = nodes
+      setTreeData(nodes)
+    }
+
+    return results
+  }, [folderPath, loadTreeRecursive, onRename, registerPendingOperation, saveExpandedDirs, updateSidebarLayout])
 
   // 4. Handle Rename (or Create for new items)
   const handleCommitRename = useCallback(async (node, newName) => {
@@ -863,13 +1208,26 @@ function Sidebar({
       console.log('[sidebar]','Rename result:', success)
 
       if (success) {
-        if (onRename) onRename(id, newPath)
+        const pathMap = new Map([[id, newPath]])
+        const nextExpandedState = rewriteExpandedStatePaths(openStateRef.current, pathMap)
+        onRename?.(id, newPath)
         setTreeData(prev => renameNodeInTree(prev, id, trimmedName, newPath))
+        setFocusedId(previous => rewritePathWithMap(previous, pathMap))
+        setMultiSelected(previous => {
+          const next = new Set()
+          for (const selectedId of previous || []) next.add(rewritePathWithMap(selectedId, pathMap))
+          return next
+        })
+        openStateRef.current = nextExpandedState
+        openStatesMapRef.current[folderPath] = { ...nextExpandedState }
+        setExpandedSnapshot({ ...nextExpandedState })
+        updateSidebarLayout(previous => rewriteSidebarLayoutPaths(previous, pathMap))
+        saveExpandedDirs(nextExpandedState)
       } else {
         console.log('[sidebar]','ERROR: Rename failed!')
       }
     }
-  }, [onRename, registerPendingOperation, folderPath])
+  }, [onRename, registerPendingOperation, folderPath, saveExpandedDirs, updateSidebarLayout])
 
   const handleCancelRename = useCallback((node) => {
       setEditingId(null);
@@ -1066,7 +1424,8 @@ function Sidebar({
     if (shiftKey && lastClickedRef.current) {
       console.warn('[SidebarFileTree] select-shift-range', { path, anchor: lastClickedRef.current })
       // Shift+Click: range select in visible order
-      const visible = flattenTree(treeData, openStateRef.current)
+      const visibleTree = applySidebarLayout(treeData, sidebarLayout, folderPath, sortMode)
+      const visible = flattenTree(visibleTree, openStateRef.current)
       const anchorIdx = visible.findIndex(n => n.id === lastClickedRef.current)
       const targetIdx = visible.findIndex(n => n.id === path)
       if (anchorIdx !== -1 && targetIdx !== -1) {
@@ -1090,7 +1449,7 @@ function Sidebar({
     } else {
       console.warn('[SidebarFileTree] directory-selected-no-open', { path })
     }
-  }, [onFileSelect, treeData, multiSelected.size])
+  }, [folderPath, multiSelected.size, onFileSelect, sidebarLayout, sortMode, treeData])
 
   const handleContextMenu = useCallback((e, node) => {
     setFocusedId(node?.id || null)
@@ -1104,8 +1463,7 @@ function Sidebar({
   const handleIconSelect = async (icon) => {
     if (iconPickerNode) {
       const newIcons = { ...customIcons, [iconPickerNode.data.name]: icon }
-      setCustomIcons(newIcons)
-      await saveCustomIcons(newIcons)
+      await commitCustomIcons(newIcons)
       setIconPickerNode(null)
     }
   }
@@ -1226,7 +1584,14 @@ function Sidebar({
 
       <div
         className="file-tree"
-        onPointerDown={(e) => { onFocus(e); setFocusedId(null); setMultiSelected(new Set()); setDirDropdownOpen(false) }}
+        onPointerDown={(e) => {
+          onFocus(e)
+          if (!e.target.closest('.arborist-node')) {
+            setFocusedId(null)
+            setMultiSelected(new Set())
+          }
+          setDirDropdownOpen(false)
+        }}
         onContextMenu={(e) => { e.preventDefault(); setFocusedId(null); setMultiSelected(new Set()); setContextMenu({ x: e.clientX, y: e.clientY, node: null }) }}
       >
         {treeData.length > 0 && (
@@ -1236,10 +1601,11 @@ function Sidebar({
              onFileSelect={handleFileSelect}
              activeFilePath={activeFilePath}
              customIcons={customIcons}
-             iconTheme={iconTheme}
-             settings={settings}
+             iconTheme={effectiveIconTheme}
+             settings={effectiveIconSettings}
              onContextMenu={handleContextMenu}
              onRename={onRename} // For moves
+             onMoveItems={handleMoveItems}
              onToggle={handleToggle}
              onExpandChange={handleExpandChange}
              initialExpanded={expandedSnapshot}
@@ -1289,19 +1655,17 @@ function Sidebar({
           onReset={async () => {
               const newIcons = { ...customIcons };
               delete newIcons[iconPickerNode.name];
-              setCustomIcons(newIcons);
-              await saveCustomIcons(newIcons);
+              await commitCustomIcons(newIcons);
               setIconPickerNode(null);
           }}
           onResetToVsc={async () => {
               const newIcons = { ...customIcons, [iconPickerNode.name]: 'vscode' };
-              setCustomIcons(newIcons);
-              await saveCustomIcons(newIcons);
+              await commitCustomIcons(newIcons);
               setIconPickerNode(null);
           }}
           existingIcons={[
             ...Object.values(customIcons || {}).filter(v => v?.startsWith?.('data:')),
-            ...(settings?.customIconRules || []).map(r => r.image).filter(Boolean)
+            ...(fileIconProfile.customIconRules || []).map(r => r.image).filter(Boolean)
           ]}
         />
       )}

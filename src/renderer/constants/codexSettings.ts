@@ -7,11 +7,16 @@ export interface CodexModelOption {
   label: string;
   defaultEffort?: string;
   efforts?: string[];
+  /** Hidden models stay configured but are omitted from ordinary pickers. */
+  visible?: boolean;
 }
 
 export interface CodexSettings {
   models: CodexModelOption[];
   efforts: string[];
+  /** One globally configured pair for the ControlBar quick-switch button. */
+  quickModel?: string | null;
+  quickEffort?: string | null;
 }
 
 export const DEFAULT_CODEX_MODEL = 'gpt-5.5';
@@ -33,15 +38,15 @@ export const CODEX_EFFORT_LABELS: Record<CodexEffortLevel, string> = {
 };
 
 export const DEFAULT_CODEX_MODEL_OPTIONS: CodexModelOption[] = [
+  { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', defaultEffort: 'low', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+  { id: 'gpt-5.6-terra', label: 'GPT-5.6-Terra', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+  { id: 'gpt-5.6-luna', label: 'GPT-5.6-Luna', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
   {
     id: DEFAULT_CODEX_MODEL,
     label: DEFAULT_CODEX_MODEL,
     defaultEffort: 'medium',
     efforts: ['low', 'medium', 'high', 'xhigh'],
   },
-  { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', defaultEffort: 'low', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
-  { id: 'gpt-5.6-terra', label: 'GPT-5.6-Terra', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
-  { id: 'gpt-5.6-luna', label: 'GPT-5.6-Luna', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
   { id: 'gpt-5.4', label: 'GPT-5.4', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'] },
   { id: 'gpt-5.4-mini', label: 'GPT-5.4-Mini', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'] },
   { id: 'gpt-5.3-codex-spark', label: 'GPT-5.3-Codex-Spark', defaultEffort: 'high', efforts: ['low', 'medium', 'high', 'xhigh'] },
@@ -50,6 +55,8 @@ export const DEFAULT_CODEX_MODEL_OPTIONS: CodexModelOption[] = [
 export const DEFAULT_CODEX_SETTINGS: CodexSettings = {
   models: DEFAULT_CODEX_MODEL_OPTIONS,
   efforts: [...CODEX_EFFORT_LEVELS],
+  quickModel: null,
+  quickEffort: null,
 };
 
 // 'none' is our app-level sentinel for "do not add a Codex launch override".
@@ -77,7 +84,7 @@ export const normalizeCodexModelOptions = (
         ? (m as any).efforts.map((v: unknown) => String(v || '').trim()).filter(Boolean)
         : [...CODEX_EFFORT_LEVELS];
       const defaultEffort = String((m as any).defaultEffort || DEFAULT_CODEX_EFFORT).trim() || DEFAULT_CODEX_EFFORT;
-      return { id, label, defaultEffort, efforts };
+      return { id, label, defaultEffort, efforts, visible: (m as any).visible !== false };
     })
     .filter(Boolean) as CodexModelOption[];
 
@@ -92,6 +99,19 @@ export const normalizeCodexEfforts = (raw: unknown): string[] => {
     ? raw.map((v) => String(v || '').trim()).filter((v, index, arr) => v && arr.indexOf(v) === index)
     : [];
   return efforts.length > 0 ? efforts : [...CODEX_EFFORT_LEVELS];
+};
+
+export const resolveCodexEffortForModel = (
+  model: Pick<CodexModelOption, 'efforts' | 'defaultEffort'> | undefined,
+  requested: unknown,
+): string | null => {
+  const efforts = model?.efforts?.filter(Boolean) || [...CODEX_EFFORT_LEVELS];
+  if (efforts.length === 0) return null;
+  const target = typeof requested === 'string' ? requested.trim() : '';
+  if (target && efforts.includes(target)) return target;
+  if (model?.defaultEffort && efforts.includes(model.defaultEffort)) return model.defaultEffort;
+  if (efforts.includes(DEFAULT_CODEX_EFFORT)) return DEFAULT_CODEX_EFFORT;
+  return efforts[0] || null;
 };
 
 // The account-scoped catalog remains the source of truth for which model and
@@ -122,6 +142,7 @@ export const mergeCodexModelOptions = (
     result.push({
       ...liveModel,
       label: configuredModel.label || liveModel.label,
+      visible: configuredModel.visible !== false,
       efforts: effectiveEfforts,
       defaultEffort: effectiveEfforts.includes(configuredModel.defaultEffort || '')
         ? configuredModel.defaultEffort

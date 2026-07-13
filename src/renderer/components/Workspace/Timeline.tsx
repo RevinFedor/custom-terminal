@@ -1,13 +1,13 @@
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap } from 'lucide-react';
+import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap, RefreshCw, ArrowUpToLine } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { useUIStore, type HistoryPromptDraftImageRef } from '../../store/useUIStore';
 import { useWorkspaceStore, type PendingAutoTabTitle } from '../../store/useWorkspaceStore';
-import { TAB_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
-import { generateTabTitleFromPrompt, isEligibleTabTitleEntry, trimTabTitlePrompt } from '../../utils/generateTabTitle';
-import { timelineSummaryKey, useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
+import { TAB_TITLE_PROMPT_ID, TIMELINE_GROUPING_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
+import { generateTabTitleFromPrompt, generateTimelineActionLabelFromPrompt, isEligibleTabTitleEntry, trimTabTitlePrompt } from '../../utils/generateTabTitle';
+import { timelineSummaryKey, timelineSummarySourceHash, useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
 import {
   timelineOutlineKey,
   useTimelineOutlineStore,
@@ -109,16 +109,6 @@ const DOCS_TIMELINE_COLORS = {
   },
 } as const;
 
-const SEMANTIC_ROLE_LABELS: Record<string, string> = {
-  implementation: 'реализация',
-  clarification: 'уточнение',
-  verification: 'проверка',
-  fix: 'исправление',
-  documentation: 'документация',
-  meta: 'мета-действие',
-  other: 'этап',
-};
-
 // Portal for tooltip to escape overflow:hidden
 const TooltipPortal: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   return createPortal(children, document.body);
@@ -197,6 +187,8 @@ interface TimelineEntry {
   };
 }
 
+type DeleteScope = 'selection' | 'through-start';
+
 type RewindMode = 'native' | 'ai';
 
 interface GroupInfo {
@@ -220,7 +212,7 @@ interface TimelineProps {
   cwd: string;
   isActive?: boolean; // Claude/Gemini is currently running
   isVisible?: boolean; // New prop to control visibility from parent
-  isOpen?: boolean; // CMD+] toggle — controls slide in/out
+  isOpen?: boolean; // CMD+\ toggle — controls slide in/out
   toolType?: 'claude' | 'gemini' | 'codex'; // Which AI tool this timeline is for
   pinned?: boolean; // When true, expanded Timeline reserves layout width instead of overlaying terminal
   readOnly?: boolean; // Home preview: Timeline only navigates HistoryPanel
@@ -261,7 +253,8 @@ function renderSingleStarHighlights(text: string): React.ReactNode[] {
         {text.slice(open + 1, close)}
       </span>
     );
-    cursor = close + 1;
+    nodes.push(text.slice(close + 1).replace(/\*/g, ''));
+    break;
   }
   return nodes;
 }
@@ -507,6 +500,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const usesTextSearchAnchors = isGemini || isCodex;
   const supportsClaudeTimelineActions = !readOnly && !isGemini && !isCodex;
   const supportsEditRangeActions = !readOnly && (supportsClaudeTimelineActions || isCodex);
+  const supportsDeleteRangeActions = !readOnly && (supportsClaudeTimelineActions || isCodex);
   const summaryToolType: TimelineSummaryTool | null = isGemini ? null : (isCodex ? 'codex' : 'claude');
   const promptSummaries = useTimelineSummaryStore(state => state.summaries);
   const promptSummaryLoadingKeys = useTimelineSummaryStore(state => state.loadingKeys);
@@ -533,7 +527,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const timelineOutlineRecord = useTimelineOutlineStore((state) => (
     outlineSessionKey ? state.outlines[outlineSessionKey] : undefined
   ));
+  const timelineActionOverrides = useTimelineOutlineStore((state) => (
+    outlineSessionKey ? state.actionOverridesBySession[outlineSessionKey] : undefined
+  ));
   const loadTimelineOutline = useTimelineOutlineStore((state) => state.loadOutline);
+  const loadTimelineActionOverrides = useTimelineOutlineStore((state) => state.loadActionOverrides);
+  const saveTimelineActionOverride = useTimelineOutlineStore((state) => state.saveActionOverride);
   const syncTimelineOutlineUuids = useTimelineOutlineStore((state) => state.syncEligibleUuids);
 
   // Slide animation (matches HistoryPanel pattern)
@@ -553,6 +552,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const timelineOwnerKeyRef = useRef(timelineOwnerKey);
   timelineOwnerKeyRef.current = timelineOwnerKey;
   const timelineLoadGenerationRef = useRef(0);
+  const timelineLoadFlightRef = useRef<{
+    ownerKey: string;
+    promise: Promise<void> | null;
+    trailingReason: string | null;
+  }>({
+    ownerKey: timelineOwnerKey,
+    promise: null,
+    trailingReason: null,
+  });
   const [entriesSnapshot, setEntriesSnapshot] = useState<{ ownerKey: string; entries: TimelineEntry[] }>({
     ownerKey: timelineOwnerKey,
     entries: [],
@@ -561,6 +569,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // ownership boundary that prevents new session IDs from being paired with
   // stale prompts while the next async JSONL read is still in flight.
   const entries = entriesSnapshot.ownerKey === timelineOwnerKey ? entriesSnapshot.entries : [];
+  const [loadingOwnerKey, setLoadingOwnerKey] = useState<string | null>(
+    sessionId ? timelineOwnerKey : null
+  );
+  const isLoading = loadingOwnerKey === timelineOwnerKey;
   const entriesCountRef = useRef(0);
   entriesCountRef.current = entries.length;
   const [compactSummaryCache, setCompactSummaryCache] = useState<Record<string, string | null>>({});
@@ -579,8 +591,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const [expandedDocsSearch, setExpandedDocsSearch] = useState<Set<string>>(new Set());
   const [selectionStartId, setSelectionStartId] = useState<string | null>(null);
   const selectionStartIdRef = useRef<string | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, entry: TimelineEntry, source?: 'dot' | 'segment', anchorY?: number } | null>(null);
+  const [refreshingActionUuid, setRefreshingActionUuid] = useState<string | null>(null);
   const [sessionBoundaries, setSessionBoundaries] = useState<SessionBoundary[]>([]);
   // Boundary uuid from backend (= youngest entry of pre-orphan tail, set when
   // Generic CHAIN BREAK recovery fired). Used ONLY to detect post-compact
@@ -754,17 +766,25 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const postPromptRef = useRef<HTMLTextAreaElement>(null);
   // Inline confirm for "Удалить историю" inside rangeActionMenu (no side panel)
   const [deleteConfirmMode, setDeleteConfirmMode] = useState(false);
+  const [deleteRangeScope, setDeleteRangeScope] = useState<DeleteScope>('selection');
   // Animation state while delete IPC is running (red overlay over the range)
   const [deletingRange, setDeletingRange] = useState<{ startIndex: number; endIndex: number } | null>(null);
   // Inline confirm for "Удалить запрос" inside contextMenu (single user-entry delete)
   const [deleteEntryConfirmMode, setDeleteEntryConfirmMode] = useState(false);
+  const [deleteEntryScope, setDeleteEntryScope] = useState<DeleteScope>('selection');
   // effect: contextMenu closes → reset entry-delete confirm (prevents reopening in confirm state)
   useEffect(() => {
-    if (!contextMenu) setDeleteEntryConfirmMode(false);
+    if (!contextMenu) {
+      setDeleteEntryConfirmMode(false);
+      setDeleteEntryScope('selection');
+    }
   }, [contextMenu]);
   // effect: rangeActionMenu closes → reset deleteConfirmMode (prevents next popup opening in confirm state)
   useEffect(() => {
-    if (!rangeActionMenu) setDeleteConfirmMode(false);
+    if (!rangeActionMenu) {
+      setDeleteConfirmMode(false);
+      setDeleteRangeScope('selection');
+    }
   }, [rangeActionMenu]);
 
   // Ref to context-menu root so we can measure its rect for the hover-bridge test.
@@ -1120,6 +1140,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const [hoveredSemanticGroupId, setHoveredSemanticGroupId] = useState<string | null>(null);
   const [activeSemanticGroupId, setActiveSemanticGroupId] = useState<string | null>(null);
   const activeSemanticGroupIdRef = useRef<string | null>(null);
+  const hydratedSemanticSessionKeyRef = useRef<string | null>(null);
   const semanticGroupHeaderRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   // Phase 3: Tree view (per-tab, persisted in UIStore)
   const treeMode = useUIStore(state => state.timelineTreeModeTabs[tabId] ?? false);
@@ -1319,6 +1340,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   // Compute group map for sub-agent entries (Phase 2)
   const groupMap = useMemo(() => computeGroups(entries), [entries]);
+  const entryIndexByUuid = useMemo(() => {
+    const indexByUuid = new Map<string, number>();
+    entries.forEach((entry, index) => {
+      if (entry.uuid) indexByUuid.set(entry.uuid, index);
+    });
+    return indexByUuid;
+  }, [entries]);
 
   const outlineEligibleUuids = useMemo(() => entries
     .filter((entry) => entry.uuid && !entry.isSubAgent && !entry.isSubAgentTimeout && isEligibleTabTitleEntry(entry))
@@ -1336,18 +1364,63 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       return members.every((uuid, offset) => eligibleIndex.get(uuid) === first + offset);
     });
   }, [timelineOutlineRecord, outlineEligibleUuids]);
+  const semanticGroupIdsKey = semanticGroups.map((group) => group.id).join('\u001f');
+
+  const semanticActionByUuid = useMemo(() => {
+    const map = new Map<string, { description: string; role?: string; manual?: boolean }>();
+    const schemaVersion = Number(
+      timelineOutlineRecord?.schemaVersion || timelineOutlineRecord?.outline?.schemaVersion || 1
+    );
+    if (schemaVersion >= 2) {
+      for (const turn of timelineOutlineRecord?.outline?.turns || []) {
+        const uuid = String(turn?.uuid || '');
+        const description = String(turn?.description || turn?.detail || '').trim().replace(/[.。]+$/, '');
+        if (uuid && description) map.set(uuid, { description, role: turn.role });
+      }
+    }
+    for (const override of Object.values(timelineActionOverrides || {})) {
+      const uuid = String(override?.entryUuid || '');
+      const description = String(override?.actionLabel || '').trim().replace(/[.。]+$/, '');
+      if (uuid && description) map.set(uuid, { description, manual: true });
+    }
+    return map;
+  }, [timelineOutlineRecord, timelineActionOverrides]);
 
   const semanticGroupByUuid = useMemo(() => {
     const map = new Map<string, { group: TimelineSemanticGroup; memberIndex: number; role?: string; detail?: string }>();
+    const bounds: Array<{ group: TimelineSemanticGroup; startIndex: number; endIndex: number }> = [];
     for (const group of semanticGroups) {
       const memberMeta = new Map((group.members || []).map((member) => [member.uuid, member]));
       group.memberUuids.forEach((uuid, memberIndex) => {
         const meta = memberMeta.get(uuid);
         map.set(uuid, { group, memberIndex, role: meta?.role, detail: meta?.description || meta?.detail });
       });
+      const startIndex = entryIndexByUuid.get(group.memberUuids[0]);
+      const endIndex = entryIndexByUuid.get(group.memberUuids[group.memberUuids.length - 1]);
+      if (startIndex == null || endIndex == null || endIndex < startIndex) continue;
+      bounds.push({ group, startIndex, endIndex });
     }
+
+    bounds.forEach((bound, boundIndex) => {
+      // A compact describes context accumulated before it, so a compact
+      // between semantic groups belongs to the preceding group. Leading
+      // compacts attach to the first group and trailing ones to the last.
+      const ownershipStartIndex = boundIndex === 0 ? 0 : bound.startIndex;
+      const ownershipEndIndex = boundIndex + 1 < bounds.length
+        ? bounds[boundIndex + 1].startIndex - 1
+        : entries.length - 1;
+      for (let index = ownershipStartIndex; index <= ownershipEndIndex; index += 1) {
+        const entry = entries[index];
+        if (!entry?.uuid || map.has(entry.uuid)) continue;
+        const isEmptyCodexContinuation = isCodex && entry.type === 'user' &&
+          !String(entry.content || '').trim() && !entry.hasImage;
+        if (entry.type === 'compact' || entry.isCompactSummary || isEmptyCodexContinuation) {
+          map.set(entry.uuid, { group: bound.group, memberIndex: -1 });
+        }
+      }
+    });
     return map;
-  }, [semanticGroups]);
+  }, [semanticGroups, entries, entryIndexByUuid, isCodex]);
 
   const semanticMetaPromptByUuid = useMemo(() => new Map(
     (timelineOutlineRecord?.outline?.metaPrompts || []).map((meta) => [meta.uuid, meta])
@@ -1394,8 +1467,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // Resolved here from uuid → index for downstream useMemos.
   const claudeMemoryBoundaryIndex = useMemo(() => {
     if (!claudeMemoryBoundaryUuid) return -1;
-    return entries.findIndex(e => e.uuid === claudeMemoryBoundaryUuid);
-  }, [entries, claudeMemoryBoundaryUuid]);
+    return entryIndexByUuid.get(claudeMemoryBoundaryUuid) ?? -1;
+  }, [entryIndexByUuid, claudeMemoryBoundaryUuid]);
   // Precompute fork snapshot UUID Sets for suppressing inherited plan mode boundaries
   const forkSnapshotSets = useMemo(() =>
     forkMarkers.filter(m => m.entry_uuids && m.entry_uuids.length > 0).map(m => new Set(m.entry_uuids)),
@@ -1411,15 +1484,74 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     for (const m of forkMarkers) {
       const snap = m.entry_uuids;
       if (!snap || snap.length === 0) { arr.push(-1); continue; }
-      const set = new Set(snap);
       let lastIdx = -1;
-      for (let i = 0; i < entries.length; i++) {
-        if (set.has(entries[i].uuid)) lastIdx = i;
+      for (const uuid of snap) {
+        const index = entryIndexByUuid.get(uuid);
+        if (index != null && index > lastIdx) lastIdx = index;
       }
       arr.push(lastIdx);
     }
     return arr;
-  }, [forkMarkers, entries]);
+  }, [forkMarkers, entryIndexByUuid]);
+  const forkMarkerIndexByLastSnapIndex = useMemo(() => {
+    const markerIndexByEntryIndex = new Map<number, number>();
+    forkMarkerLastSnapIndex.forEach((entryIndex, markerIndex) => {
+      if (entryIndex >= 0 && !markerIndexByEntryIndex.has(entryIndex)) {
+        markerIndexByEntryIndex.set(entryIndex, markerIndex);
+      }
+    });
+    return markerIndexByEntryIndex;
+  }, [forkMarkerLastSnapIndex]);
+  const semanticGroupForcedOpenIds = useMemo(() => {
+    const forcedOpenIds = new Set<string>();
+    const hasActiveRangeAction = selectionStartId !== null ||
+      rangeActionMenu !== null ||
+      copyingRange !== null ||
+      deletingRange !== null ||
+      rewindState !== null ||
+      editRangeState !== null;
+
+    if (hasActiveRangeAction) {
+      semanticGroups.forEach((group) => forcedOpenIds.add(group.id));
+      return forcedOpenIds;
+    }
+
+    for (const group of semanticGroups) {
+      for (const uuid of group.memberUuids) {
+        if (notes[uuid] || rewindMarkers.has(uuid)) {
+          forcedOpenIds.add(group.id);
+          break;
+        }
+        const rawIndex = entryIndexByUuid.get(uuid);
+        if (rawIndex == null) continue;
+        if (rawIndex === lastBoundaryIndex || forkMarkerIndexByLastSnapIndex.has(rawIndex)) {
+          forcedOpenIds.add(group.id);
+          break;
+        }
+        const current = entries[rawIndex];
+        const next = entries[rawIndex + 1];
+        if (next && current.sessionId && next.sessionId && current.sessionId !== next.sessionId) {
+          forcedOpenIds.add(group.id);
+          break;
+        }
+      }
+    }
+    return forcedOpenIds;
+  }, [
+    semanticGroups,
+    notes,
+    rewindMarkers,
+    entryIndexByUuid,
+    lastBoundaryIndex,
+    forkMarkerIndexByLastSnapIndex,
+    entries,
+    selectionStartId,
+    rangeActionMenu,
+    copyingRange,
+    deletingRange,
+    rewindState,
+    editRangeState,
+  ]);
   // Count visible nodes (entries minus hidden group children)
   const hasSubAgentGroups = useMemo(() => {
     for (const [, g] of groupMap) {
@@ -1758,6 +1890,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     // Invalidate every older request before the browser can paint the new tab.
     // The next load owns a fresh generation and may commit only to this key.
     timelineLoadGenerationRef.current += 1;
+    timelineLoadFlightRef.current = {
+      ownerKey: timelineOwnerKey,
+      promise: null,
+      trailingReason: null,
+    };
+    // Initial loading belongs to the new owner as well. Setting it in the same
+    // layout effect that clears the old rows prevents a blank paint between a
+    // tab/session switch and the first IPC request.
+    setLoadingOwnerKey(sessionId ? timelineOwnerKey : null);
     setEntriesSnapshot({ ownerKey: timelineOwnerKey, entries: [] });
     setSessionBoundaries([]);
     setForkMarkers([]);
@@ -1766,10 +1907,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setNotes({});
     setNotePositions({});
     setRewindMarkers(new Set());
-  }, [timelineOwnerKey]);
+  }, [timelineOwnerKey, sessionId]);
 
   // Load timeline and fork markers when sessionId changes
-  const loadTimeline = useCallback(async (reason = 'unknown') => {
+  const runTimelineLoad = useCallback(async (reason = 'unknown') => {
     const ownerKeyAtStart = timelineOwnerKey;
     // A listener holding the previous callback may fire during a prop switch.
     // It must not invalidate the fresh owner's in-flight generation.
@@ -1820,7 +1961,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       return;
     }
 
-    setIsLoading(true);
     try {
       // Caller attribution rides into main's perfOp registry via the universal
       // IPC wrapper (it lifts source/reason/tabId/visible from the first arg) —
@@ -1962,7 +2102,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     } catch (error) {
       console.error('[Timeline] Error loading timeline:', error);
     } finally {
-      if (ownsLoad()) setIsLoading(false);
       if (import.meta.env.DEV) {
         console.warn(
           `[Perf:TimelineLoad] done reason=${reason}` +
@@ -1979,6 +2118,56 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       }
     }
   }, [sessionId, cwd, tabId, isGemini, isCodex, timelineOwnerKey]);
+
+  // Transcript changes can arrive in bursts (one event per JSONL append). A
+  // full Timeline read is expensive for long sessions, so keep one IPC load in
+  // flight per owner and collapse every event that arrives meanwhile into one
+  // trailing read. The single trailing slot can be updated while that read is
+  // running, but requests never overlap.
+  const loadTimeline = useCallback((reason = 'unknown'): Promise<void> => {
+    const ownerKeyAtRequest = timelineOwnerKey;
+    if (timelineOwnerKeyRef.current !== ownerKeyAtRequest) return Promise.resolve();
+
+    let flight = timelineLoadFlightRef.current;
+    if (flight.ownerKey !== ownerKeyAtRequest) {
+      flight = {
+        ownerKey: ownerKeyAtRequest,
+        promise: null,
+        trailingReason: null,
+      };
+      timelineLoadFlightRef.current = flight;
+    }
+
+    if (flight.promise) {
+      flight.trailingReason = reason;
+      return flight.promise;
+    }
+
+    setLoadingOwnerKey(sessionId ? ownerKeyAtRequest : null);
+    const runBurst = async () => {
+      let nextReason: string | null = reason;
+      while (
+        nextReason &&
+        timelineOwnerKeyRef.current === ownerKeyAtRequest &&
+        timelineLoadFlightRef.current === flight
+      ) {
+        flight.trailingReason = null;
+        await runTimelineLoad(nextReason);
+        nextReason = flight.trailingReason;
+      }
+    };
+
+    const promise = runBurst().finally(() => {
+      if (timelineLoadFlightRef.current !== flight) return;
+      flight.promise = null;
+      flight.trailingReason = null;
+      setLoadingOwnerKey((currentOwnerKey) => (
+        currentOwnerKey === ownerKeyAtRequest ? null : currentOwnerKey
+      ));
+    });
+    flight.promise = promise;
+    return promise;
+  }, [timelineOwnerKey, sessionId, runTimelineLoad]);
 
   // effect: loadTimeline callback identity changes (sessionId/cwd/tabId/isGemini) → trigger initial timeline load
   useEffect(() => {
@@ -1997,15 +2186,25 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
   useEffect(() => {
     if (!summaryToolType || !sessionId) return;
+    void loadTimelineActionOverrides(summaryToolType, sessionId);
+  }, [summaryToolType, sessionId, loadTimelineActionOverrides]);
+
+  useEffect(() => {
+    if (!summaryToolType || !sessionId) return;
     syncTimelineOutlineUuids(summaryToolType, sessionId, outlineEligibleUuids);
   }, [summaryToolType, sessionId, outlineEligibleUuids, syncTimelineOutlineUuids]);
 
   useEffect(() => {
     if (!outlineSessionKey) {
       setExpandedSemanticGroups(new Set());
+      setHoveredSemanticGroupId(null);
+      setActiveSemanticGroupId(null);
+      hydratedSemanticSessionKeyRef.current = null;
       return;
     }
-    const validIds = new Set(semanticGroups.map((group) => group.id));
+    const groupIds = semanticGroupIdsKey ? semanticGroupIdsKey.split('\u001f') : [];
+    const validIds = new Set(groupIds);
+    const sessionChanged = hydratedSemanticSessionKeyRef.current !== outlineSessionKey;
     let restored = new Set<string>();
     try {
       const raw = localStorage.getItem(`timeline-semantic-groups:${outlineSessionKey}`);
@@ -2013,20 +2212,25 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed)) {
           restored = new Set(parsed.filter((id) => validIds.has(String(id))).map(String));
-          if (parsed.length > 0 && restored.size === 0 && semanticGroups.length > 0) {
-            restored.add(semanticGroups[semanticGroups.length - 1].id);
+          if (parsed.length > 0 && restored.size === 0 && groupIds.length > 0) {
+            restored.add(groupIds[groupIds.length - 1]);
           }
         }
-      } else if (semanticGroups.length > 0) {
-        restored.add(semanticGroups[semanticGroups.length - 1].id);
+      } else if (groupIds.length > 0) {
+        restored.add(groupIds[groupIds.length - 1]);
       }
     } catch {
-      if (semanticGroups.length > 0) restored.add(semanticGroups[semanticGroups.length - 1].id);
+      if (groupIds.length > 0) restored.add(groupIds[groupIds.length - 1]);
     }
     setExpandedSemanticGroups(restored);
-    setHoveredSemanticGroupId(null);
-    setActiveSemanticGroupId(null);
-  }, [outlineSessionKey, semanticGroups]);
+    setHoveredSemanticGroupId((current) => (
+      sessionChanged || (current && !validIds.has(current)) ? null : current
+    ));
+    setActiveSemanticGroupId((current) => (
+      sessionChanged || (current && !validIds.has(current)) ? null : current
+    ));
+    hydratedSemanticSessionKeyRef.current = outlineSessionKey;
+  }, [outlineSessionKey, semanticGroupIdsKey]);
 
   useEffect(() => {
     if (!outlineSessionKey || semanticGroups.length === 0) return;
@@ -2061,23 +2265,32 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     if (!promptSummaryAutoEnabled || !summaryToolType || !sessionId) return;
     if (!promptSummaryLoadedSessionKeys.has(`${summaryToolType}:${sessionId}`)) return;
     const eligibleEntries = entries.filter((entry) => entry.uuid && isEligibleTabTitleEntry(entry));
-    for (let i = 0; i < eligibleEntries.length; i++) {
-      const entry = eligibleEntries[i];
-      if (!entry.uuid || !isEligibleTabTitleEntry(entry)) continue;
-      const entryAt = Date.parse(entry.timestamp || '');
-      if (promptSummaryAutoSince > 0 && (!Number.isFinite(entryAt) || entryAt < promptSummaryAutoSince - 1000)) continue;
-      const previousUserMessages = promptSummaryPreviousUserCount > 0
-        ? eligibleEntries.slice(Math.max(0, i - promptSummaryPreviousUserCount), i).map((candidate) => String(candidate.content || ''))
-        : [];
-      void generatePromptSummary({
-        tabId,
-        toolType: summaryToolType,
-        sessionId,
-        entry,
-        previousUserMessages,
-        iterationIndex: i + 1,
-      });
-    }
+    let cancelled = false;
+    // Long sessions can contain hundreds of eligible prompts. Launching every
+    // AI request in the same render creates a network/state-update storm; the
+    // automatic path is intentionally serialized. Manual full refresh already
+    // follows the same bounded pattern in the store.
+    void (async () => {
+      for (let i = 0; i < eligibleEntries.length; i++) {
+        if (cancelled) return;
+        const entry = eligibleEntries[i];
+        if (!entry.uuid || !isEligibleTabTitleEntry(entry)) continue;
+        const entryAt = Date.parse(entry.timestamp || '');
+        if (promptSummaryAutoSince > 0 && (!Number.isFinite(entryAt) || entryAt < promptSummaryAutoSince - 1000)) continue;
+        const previousUserMessages = promptSummaryPreviousUserCount > 0
+          ? eligibleEntries.slice(Math.max(0, i - promptSummaryPreviousUserCount), i).map((candidate) => String(candidate.content || ''))
+          : [];
+        await generatePromptSummary({
+          tabId,
+          toolType: summaryToolType,
+          sessionId,
+          entry,
+          previousUserMessages,
+          iterationIndex: i + 1,
+        });
+      }
+    })();
+    return () => { cancelled = true; };
   }, [entries, promptSummaryAutoEnabled, promptSummaryAutoSince, promptSummaryLoadedSessionKeys, promptSummaryPreviousUserCount, summaryToolType, sessionId, tabId, generatePromptSummary]);
 
   // Tab switch: save editRangeState (ready/done only), reset everything else.
@@ -2194,6 +2407,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         setClickedState(null);
         setActiveTooltipIndex(null);
         setHoveredIndex(null);
+        setHoveredSemanticGroupId(null);
+        setActiveSemanticGroupId(null);
         setPostPromptMode(false);
         setUnreachableIndices(new Set());
         setVisibleEntryIndices(new Set());
@@ -2261,7 +2476,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   }, [tabId, sessionId, entries.length, jumpTimelineToBottomAfterLayout]);
 
-  // Cmd+] changes the Timeline from dot rail to expanded preview layout. The
+  // Cmd+\ changes the Timeline from dot rail to expanded preview layout. The
   // browser may keep/reset the old scrollTop while entry heights are being
   // recomputed, so opening the expanded Timeline has its own bottom-jump trigger.
   const expandedLayoutScrollKeyRef = useRef<string | null>(null);
@@ -3450,6 +3665,49 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   };
 
+  const stopCodexForHistoryMutation = async (operation: 'Edit Range' | 'Delete Range') => {
+    const caller = operation === 'Edit Range'
+      ? 'Timeline.codexEditRange'
+      : 'Timeline.codexDeleteRange';
+    const cmdState = await ipcRenderer.invoke('terminal:getCommandState', {
+      tabId,
+      caller,
+      expectedProcess: 'codex',
+      allowProcessTreeLookup: true,
+    });
+    console.warn(`[Codex${operation.replace(/\s/g, '')}] commandState:`, JSON.stringify(cmdState));
+
+    if (!cmdState?.isRunning) return;
+
+    const turnState = await ipcRenderer.invoke('codex:get-turn-state', tabId).catch((err: any) => {
+      console.warn(`[Codex${operation.replace(/\s/g, '')}] turn-state lookup failed:`, err?.message || err);
+      return null;
+    });
+    if (turnState?.busy === true) {
+      throw new Error(`Codex сейчас выполняет turn — дождитесь завершения перед ${operation}`);
+    }
+
+    const stopResult = await ipcRenderer.invoke('terminal:stop-ai-process', tabId);
+    if (!stopResult?.success) {
+      throw new Error(stopResult?.error || 'Failed to stop Codex');
+    }
+  };
+
+  const adoptAndRestartCodexHistory = (newSessionId: string, reason: 'editRange' | 'deleteRange') => {
+    useWorkspaceStore.getState().setCodexSessionId(tabId, newSessionId, reason);
+    ipcRenderer.send('codex:run-command', buildCodexRunPayload({
+      tabId,
+      command: 'codex-c',
+      sessionId: newSessionId,
+      cwd,
+    }));
+    ipcRenderer.send('terminal:force-command-started', {
+      tabId,
+      commandType: 'codex',
+      sessionId: newSessionId,
+    });
+  };
+
   const executeRangeAction = async (mode: 'copy' | 'edit', range: { startIndex: number; endIndex: number }, startUuid: string, endUuid: string, additionalPrompt?: string) => {
     if (!sessionId) return;
 
@@ -3533,23 +3791,28 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   };
 
-  // Удаление диапазона без вставки compact-entry. Используется кнопкой "Удалить историю".
-  // Если выделение пересекало границу (compact / Clear Context), range.startIndex = 0.
-  // При пустом файле бэкенд удалит JSONL полностью и вернёт fileDeleted=true → таб
-  // освобождается (claudeSessionId сбрасывается).
+  // Удаление диапазона без вставки compact-entry. Claude переписывает текущий
+  // JSONL, Codex создаёт новую локальную версию rollout и продолжает её.
   const executeDeleteRange = async (range: { startIndex: number; endIndex: number }, startUuid: string, endUuid: string) => {
     if (!sessionId) return;
-    if (!supportsClaudeTimelineActions) return; // Gemini/Codex не поддерживаются этим путём — JSON-формат другой
+    if (!supportsDeleteRangeActions) return;
 
     // Очистка selection и popup
     selectionStartIdRef.current = null;
     setSelectionStartId(null);
+    setContextMenu(null);
     setRangeActionMenu(null);
     setDeleteConfirmMode(false);
+    setDeleteEntryConfirmMode(false);
     setDeletingRange(range);
 
     try {
-      const result = await ipcRenderer.invoke('claude:delete-range', {
+      if (isCodex) {
+        await stopCodexForHistoryMutation('Delete Range');
+      }
+
+      const deleteChannel = isCodex ? 'codex:delete-range' : 'claude:delete-range';
+      const result = await ipcRenderer.invoke(deleteChannel, {
         sessionId,
         cwd,
         startUuid,
@@ -3568,12 +3831,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
       const removedTotal = result.removedCount || 0;
       const removedHuman = result.removedUsers || 0;
-      useUIStore.getState().showToast(
-        `Удалено ${removedHuman} сообщений (${removedTotal} записей)`,
-        'success', 2500
-      );
 
-      if (result.fileDeleted) {
+      if (isCodex) {
+        if (!result.newSessionId) {
+          throw new Error('Codex delete-range did not return a new session');
+        }
+        adoptAndRestartCodexHistory(result.newSessionId, 'deleteRange');
+      } else if (result.fileDeleted) {
         // Файл стёрт — освобождаем таб от сессии. Кнопка "Продолжить" запустит claude
         // как новую сессию (без --resume), а Timeline опустеет на следующем рефреше.
         const ws = useWorkspaceStore.getState();
@@ -3581,6 +3845,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       } else {
         loadTimeline('delete-range');
       }
+
+      useUIStore.getState().showToast(
+        isCodex
+          ? `Удалено ${removedHuman} ходов (${removedTotal} записей). Создана новая версия истории`
+          : `Удалено ${removedHuman} сообщений (${removedTotal} записей)`,
+        'success', 2500
+      );
     } catch (err: any) {
       console.error('[Timeline] Delete range failed:', err);
       setDeletingRange(null);
@@ -4218,23 +4489,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   };
 
-  const handleAddNote = (entry: TimelineEntry) => {
-    setContextMenu(null);
-    setNoteEditText(notes[entry.uuid] || '');
-    setNoteEditPosition(notePositions[entry.uuid] || 'before');
-    setIsNoteEditing(true);
-    const idx = entries.findIndex(e => e.uuid === entry.uuid);
-    setActiveNoteIndex(idx);
-    // Deactivate entry tooltip
-    setActiveTooltipIndex(null);
-    setTimeout(() => noteTextareaRef.current?.focus(), 50);
-  };
-
-  // Delete a single user-prompt entry (irreversible). Keeps assistant response.
-  // Disabled for Gemini (JSON format), for non-user entries, and for the very first
-  // entry of the session (no parentUuid → would orphan its children).
-  const handleDeleteUserEntry = async (entry: TimelineEntry) => {
-    if (!sessionId || isGemini) return;
+  // Claude has a narrower legacy action than range deletion: remove only the
+  // human prompt while preserving the assistant response. Keep that capability
+  // on the primary half of the single-entry delete control.
+  const handleDeleteClaudeUserEntry = async (entry: TimelineEntry) => {
+    if (!sessionId || isGemini || isCodex) return;
     setContextMenu(null);
     setDeleteEntryConfirmMode(false);
     try {
@@ -4250,15 +4509,106 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         );
         return;
       }
-      useUIStore.getState().showToast('Запрос удалён', 'success', 1800);
+      useUIStore.getState().showToast('Запрос удалён, ответ Claude сохранён', 'success', 1800);
       loadTimeline('delete-user-entry');
     } catch (err: any) {
-      console.error('[Timeline] Delete user entry failed:', err);
+      console.error('[Timeline] Delete Claude user entry failed:', err);
       useUIStore.getState().showToast(
         'Ошибка удаления: ' + (err?.message || String(err)),
         'error', 4000
       );
     }
+  };
+
+  const handleRefreshTimelineAction = async (entry: TimelineEntry) => {
+    if (!summaryToolType || !sessionId || !isEligibleTabTitleEntry(entry) || refreshingActionUuid) return;
+    const eligibleEntries = entries.filter((candidate) => candidate.uuid && isEligibleTabTitleEntry(candidate));
+    const targetIndex = eligibleEntries.findIndex((candidate) => candidate.uuid === entry.uuid);
+    if (targetIndex < 0) return;
+    if (isTabAiBusy && targetIndex === eligibleEntries.length - 1) {
+      showToast('Ответ ещё не завершён', 'warning');
+      return;
+    }
+
+    setContextMenu(null);
+    setRefreshingActionUuid(entry.uuid);
+    try {
+      const channel = isCodex ? 'codex:copy-range' : 'claude:copy-range';
+      const response = await ipcRenderer.invoke(channel, {
+        sessionId,
+        cwd,
+        startUuid: entry.uuid,
+        endUuid: entry.uuid,
+        assistantOnly: true,
+        maxChars: 8000,
+      });
+      if (!response?.success || !response.assistantText) {
+        showToast(response?.error || 'Для этой итерации нет завершённого ответа', 'warning');
+        return;
+      }
+
+      const previousUserMessages = eligibleEntries
+        .slice(Math.max(0, targetIndex - Math.max(1, promptSummaryPreviousUserCount)), targetIndex)
+        .map((candidate) => String(candidate.content || ''));
+      const promptConfig = usePromptsStore.getState().getPromptById(TIMELINE_GROUPING_PROMPT_ID);
+      const actionLabel = await generateTimelineActionLabelFromPrompt(
+        String(entry.content || ''),
+        String(response.assistantText),
+        promptConfig,
+        {
+          previousUserMessages,
+          usageMetadata: {
+            tabId,
+            toolType: summaryToolType,
+            sessionId,
+            entryUuid: entry.uuid,
+            iterationIndex: targetIndex + 1,
+          },
+        }
+      );
+      if (!actionLabel) {
+        showToast('Не удалось обновить действие', 'error');
+        return;
+      }
+
+      const sourceHash = timelineSummarySourceHash(JSON.stringify({
+        version: 1,
+        content: String(entry.content || ''),
+        previousUserMessages,
+        promptId: promptConfig?.id || TIMELINE_GROUPING_PROMPT_ID,
+        promptContent: promptConfig?.content || '',
+        model: promptConfig?.model || 'gemini-3.1-flash-lite',
+        thinkingLevel: promptConfig?.thinkingLevel || 'LOW',
+      }));
+      const saved = await saveTimelineActionOverride({
+        toolType: summaryToolType,
+        sessionId,
+        entryUuid: entry.uuid,
+        actionLabel,
+        sourceHash,
+        model: promptConfig?.model || 'gemini-3.1-flash-lite',
+        promptId: promptConfig?.id || TIMELINE_GROUPING_PROMPT_ID,
+        thinkingLevel: promptConfig?.thinkingLevel || 'LOW',
+      });
+      showToast(saved ? 'Действие обновлено' : 'Не удалось сохранить действие', saved ? 'success' : 'error');
+    } catch (error: any) {
+      console.error('[TimelineActionRefresh] failed:', error);
+      showToast('Не удалось обновить действие', 'error');
+    } finally {
+      setRefreshingActionUuid(null);
+    }
+  };
+
+  const handleAddNote = (entry: TimelineEntry) => {
+    setContextMenu(null);
+    setNoteEditText(notes[entry.uuid] || '');
+    setNoteEditPosition(notePositions[entry.uuid] || 'before');
+    setIsNoteEditing(true);
+    const idx = entries.findIndex(e => e.uuid === entry.uuid);
+    setActiveNoteIndex(idx);
+    // Deactivate entry tooltip
+    setActiveTooltipIndex(null);
+    setTimeout(() => noteTextareaRef.current?.focus(), 50);
   };
 
   const handleEditNote = (entry: TimelineEntry) => {
@@ -4778,7 +5128,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     const element = semanticGroupHeaderRefs.current.get(activeSemanticGroup.id);
     if (!element) return null;
     const rect = element.getBoundingClientRect();
-    const height = 112;
+    const height = 72;
     return {
       top: Math.max(40, Math.min(rect.top + rect.height / 2 - height / 2, window.innerHeight - height - 10)),
     };
@@ -4793,16 +5143,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       }}
       className="relative w-full flex items-center select-none"
       style={{
+        position: 'sticky',
+        top: 0,
+        zIndex: 6,
         flex: '0 0 auto',
         minHeight: 30,
-        padding: '5px 8px 5px 7px',
-        gap: 6,
+        padding: '5px 6px 5px 2px',
+        gap: 4,
+        alignItems: 'flex-start',
         cursor: 'pointer',
         borderTop: '1px solid rgba(192,132,252,0.18)',
         borderBottom: '1px solid rgba(192,132,252,0.12)',
         background: hoveredSemanticGroupId === group.id
-          ? 'linear-gradient(90deg, rgba(217,70,239,0.18), rgba(139,92,246,0.11))'
-          : 'linear-gradient(90deg, rgba(217,70,239,0.11), rgba(139,92,246,0.07))',
+          ? 'linear-gradient(90deg, rgba(217,70,239,0.18), rgba(139,92,246,0.11)), #18131d'
+          : 'linear-gradient(90deg, rgba(217,70,239,0.11), rgba(139,92,246,0.07)), #18131d',
       }}
       title={isCmdHeld ? undefined : '⌘ + hover — описание группы'}
       onClick={(event) => {
@@ -4831,32 +5185,33 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         style={{
           color: '#d8b4fe',
           flexShrink: 0,
+          marginTop: 1,
           transform: expanded ? 'rotate(0deg)' : 'rotate(-90deg)',
           transition: 'transform 120ms ease-out',
         }}
       />
-      <div style={{ width: 7, height: 7, transform: 'rotate(45deg)', borderRadius: 1, backgroundColor: '#c084fc', flexShrink: 0 }} />
       <span
         className="min-w-0 flex-1"
         style={{
           color: '#f5d0fe',
           fontSize: 11,
           fontWeight: 700,
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
+          lineHeight: 1.25,
+          overflow: 'visible',
+          whiteSpace: 'normal',
+          overflowWrap: 'anywhere',
         }}
       >
         {group.title}
       </span>
-      <span style={{ color: 'rgba(216,180,254,0.7)', fontSize: 9, fontFamily: 'monospace', flexShrink: 0 }}>
+      <span style={{ color: 'rgba(216,180,254,0.7)', fontSize: 9, fontFamily: 'monospace', flexShrink: 0, marginTop: 2 }}>
         ×{group.memberUuids.length}
       </span>
     </div>
   );
 
   const contextMenuTop = contextMenu ? (() => {
-    const estimatedH = selectionStartId ? 44 : 220;
+    const estimatedH = selectionStartId ? 44 : 260;
     const h = contextMenuMeasuredH > 0 ? contextMenuMeasuredH : estimatedH;
     const index = entries.findIndex(e => e.uuid === contextMenu.entry.uuid);
     return getEntryAnchoredPopupTop(index, h, estimatedH, contextMenu.anchorY ?? contextMenu.y + estimatedH / 2);
@@ -5023,22 +5378,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             const semanticGroup = semanticMembership?.group;
             const codexCompactCluster = codexCompactClusters.get(index);
             const isSemanticGroupStart = semanticMembership?.memberIndex === 0;
-            const semanticGroupForcedOpen = !!semanticGroup && (
-              semanticGroup.memberUuids.some((uuid) => {
-                if (!!notes[uuid] || rewindMarkers.has(uuid)) return true;
-                const rawIndex = entries.findIndex((candidate) => candidate.uuid === uuid);
-                if (rawIndex < 0) return false;
-                if (rawIndex === lastBoundaryIndex || forkMarkerLastSnapIndex.includes(rawIndex)) return true;
-                const next = entries[rawIndex + 1];
-                return !!(next && entries[rawIndex].sessionId && next.sessionId && entries[rawIndex].sessionId !== next.sessionId);
-              }) ||
-              selectionStartId !== null ||
-              rangeActionMenu !== null ||
-              copyingRange !== null ||
-              deletingRange !== null ||
-              rewindState !== null ||
-              editRangeState !== null
-            );
+            const semanticGroupForcedOpen = !!semanticGroup && semanticGroupForcedOpenIds.has(semanticGroup.id);
             const isSemanticGroupExpanded = !!semanticGroup && (
               expandedSemanticGroups.has(semanticGroup.id) || semanticGroupForcedOpen
             );
@@ -5077,7 +5417,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             // detection (entry ∈ snap, next ∉ snap), which fired on every gap when the
             // parent's active branch was modified after the fork (rewind / edit-range /
             // delete-range punch holes through the snapshot) → many false stripes.
-            const markerHitIdx = forkMarkerLastSnapIndex.findIndex(idx => idx === index);
+            const markerHitIdx = forkMarkerIndexByLastSnapIndex.get(index) ?? -1;
             const forkMarkerAny = markerHitIdx >= 0 ? forkMarkers[markerHitIdx] : null;
             // Only non-hidden markers render the blue stripe
             const forkMarker = forkMarkerAny && !forkMarkerAny.hidden ? forkMarkerAny : null;
@@ -5141,8 +5481,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               index <= claudeMemoryBoundaryIndex;
 
             if (displaysAsCompact) {
-              dotColor = isHovered ? '#fbbf24' : '#a67c1a';
-              dotGlow = isHovered ? '0 0 10px rgba(251, 191, 36, 0.5)' : 'none';
+              dotColor = isHovered ? '#f59e0b' : '#a67c1a';
+              dotGlow = isHovered ? '0 0 10px rgba(245, 158, 11, 0.5)' : 'none';
             } else if (isContinued) {
               dotColor = isHovered ? '#f59e0b' : '#a67c1a';
               dotGlow = isHovered ? '0 0 10px rgba(245, 158, 11, 0.5)' : 'none';
@@ -5290,6 +5630,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 <div
                   ref={el => segmentRefs.current[index] = el}
                   data-segment
+                  data-timeline-entry-uuid={entry.uuid}
                   {...(isUnreachable ? { 'data-unreachable': '' } : {})}
                   className="relative w-full flex items-center"
                   onMouseEnter={() => {
@@ -5325,7 +5666,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     alignItems: isExpandedLayout ? 'flex-start' : undefined,
                     justifyContent: isExpandedLayout ? 'flex-start' : (treeMode ? 'flex-start' : 'center'),
                     paddingLeft: isExpandedLayout
-                      ? (semanticMembership ? '18px' : '6px')
+                      ? '6px'
                       : (treeMode
                           ? (showAsChild ? '20px' : entryIsSubAgent ? '10px' : '4px')
                           : (showAsChild ? '4px' : undefined)),
@@ -5420,8 +5761,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     const rawEntryContent = entry.content || '';
                     const previewLimit = expandedPreviewCharLimit(timelineLineClamp);
                     const metaPrompt = semanticMetaPromptByUuid.get(entry.uuid);
+                    const semanticActionMeta = semanticActionByUuid.get(entry.uuid);
+                    const semanticAction = semanticActionMeta?.description;
+                    const promptSummary = summaryToolType && sessionId && isEligibleTabTitleEntry(entry)
+                      ? promptSummaries[timelineSummaryKey(summaryToolType, sessionId, entry.uuid)]?.summary?.trim()
+                      : '';
+                    const compactCount = codexCompactCluster?.count || 1;
                     let previewText = displaysAsCompact
-                      ? (isCodex ? `×${codexCompactCluster?.count || 1}` : 'Conversation compacted')
+                      ? (isCodex
+                          ? `compact${compactCount > 1 ? ` ×${compactCount}` : ''}`
+                          : 'Conversation compacted')
                       : metaPrompt
                         ? `META · ${metaPrompt.title}`
                         : rawEntryContent;
@@ -5430,6 +5779,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     let isSummaryPreview = false;
                     if (metaPrompt) {
                       previewColor = 'rgba(232, 180, 254, 0.92)';
+                    } else if (!displaysAsCompact && semanticActionMeta?.manual && semanticAction) {
+                      previewText = semanticAction;
+                      isSummaryPreview = true;
+                    } else if (!displaysAsCompact && promptSummary) {
+                      previewText = promptSummary;
+                      isSummaryPreview = true;
+                    } else if (!displaysAsCompact && semanticAction) {
+                      previewText = semanticAction;
+                      isSummaryPreview = true;
                     } else if (!displaysAsCompact && summaryToolType && sessionId && isEligibleTabTitleEntry(entry)) {
                       const key = timelineSummaryKey(summaryToolType, sessionId, entry.uuid);
                       const row = promptSummaries[key];
@@ -5679,13 +6037,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         </div>
 
         {/* ──── INNER-WRAPPER OVERLAYS (rangeActionMenu indicator, selection preview, copy/delete/rewind/edit-range pulses with StatusLabelPortal) ──── */}
-        {/* Selected Range Indicator (static, when action menu is open).
-            In deleteConfirmMode + crossesBoundary the overlay extends to index 0 to
-            visualise what will actually be deleted — the popup text says «N записей до
-            самого начала», the highlight must match. Copy/Edit modes keep the visual
-            range the user actually selected. */}
+        {/* Selected Range Indicator (static, when action menu is open). During
+            delete confirmation it expands to the beginning only for the explicit
+            prefix action or Claude's cross-boundary safety rule. */}
         {isVisible && rangeActionMenu && (() => {
-          const effStart = (deleteConfirmMode && rangeActionMenu.crossesBoundary)
+          const deleteExtendsToStart = deleteConfirmMode && (
+            deleteRangeScope === 'through-start' ||
+            (!isCodex && rangeActionMenu.crossesBoundary)
+          );
+          const effStart = deleteExtendsToStart
             ? 0
             : rangeActionMenu.range.startIndex;
           const rect = getOverlayRect(effStart, rangeActionMenu.range.endIndex);
@@ -5996,28 +6356,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 const endUuid = entries[range.endIndex].uuid;
 
                 if (isCodex) {
-                  const cmdState = await ipcRenderer.invoke('terminal:getCommandState', {
-                    tabId,
-                    caller: 'Timeline.codexEditRange',
-                    expectedProcess: 'codex',
-                    allowProcessTreeLookup: true,
-                  });
-                  console.warn('[CodexEditRange] commandState:', JSON.stringify(cmdState));
-
-                  if (cmdState?.isRunning) {
-                    const turnState = await ipcRenderer.invoke('codex:get-turn-state', tabId).catch((err: any) => {
-                      console.warn('[CodexEditRange] turn-state lookup failed:', err?.message || err);
-                      return null;
-                    });
-                    if (turnState?.busy === true) {
-                      throw new Error('Codex сейчас выполняет turn — дождитесь завершения перед Edit Range');
-                    }
-                    console.warn('[CodexEditRange] Stopping Codex before local rollout rewrite...');
-                    const stopResult = await ipcRenderer.invoke('terminal:stop-ai-process', tabId);
-                    if (!stopResult?.success) {
-                      throw new Error(stopResult?.error || 'Failed to stop Codex');
-                    }
-                  }
+                  await stopCodexForHistoryMutation('Edit Range');
 
                   onProgress?.('editing');
                   console.warn('[CodexEditRange] Creating edited local rollout fork...');
@@ -6043,14 +6382,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
                   if (result.newSessionId) {
                     onProgress?.('restarting');
-                    useWorkspaceStore.getState().setCodexSessionId(tabId, result.newSessionId, 'editRange');
-                    ipcRenderer.send('codex:run-command', buildCodexRunPayload({
-                      tabId,
-                      command: 'codex-c',
-                      sessionId: result.newSessionId,
-                      cwd,
-                    }));
-                    ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'codex', sessionId: result.newSessionId });
+                    adoptAndRestartCodexHistory(result.newSessionId, 'editRange');
                   }
 
                   setEditRangeState(doneState);
@@ -6276,11 +6608,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 if (!isCmdHeldRef.current && !isLockedTooltipRef.current) setActiveSemanticGroupId(null);
               }}
             >
-              <div className="flex items-center gap-2">
-                <div style={{ width: 8, height: 8, transform: 'rotate(45deg)', borderRadius: 1, backgroundColor: '#c084fc', flexShrink: 0 }} />
-                <span className="text-[11px] font-semibold" style={{ color: '#f5d0fe' }}>{activeSemanticGroup.title}</span>
-                <span className="ml-auto text-[9px] font-mono" style={{ color: 'rgba(216,180,254,0.62)' }}>×{activeSemanticGroup.memberUuids.length}</span>
-              </div>
               <div className="text-[11px] leading-snug" style={{ color: 'rgba(255,255,255,0.72)', whiteSpace: 'pre-wrap' }}>
                 {activeSemanticGroup.description}
               </div>
@@ -6601,23 +6928,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   </>
                 ) : (
                   <>
-                    {(() => {
-                      const membership = semanticGroupByUuid.get(currentActiveEntry.uuid);
-                      if (!membership) return null;
-                      const roleKey = String(membership.role || 'other');
-                      const role = SEMANTIC_ROLE_LABELS[roleKey] || roleKey.replace(/_/g, ' ');
-                      return (
-                        <div className="pb-1.5 mb-1.5 border-b border-fuchsia-400/15 shrink-0">
-                          <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide" style={{ color: '#e879f9' }}>
-                            <span>{role}</span>
-                            <span style={{ color: 'rgba(216,180,254,0.4)' }}>·</span>
-                            <span className="normal-case tracking-normal truncate" style={{ color: 'rgba(233,213,255,0.72)' }}>
-                              {membership.detail || membership.group.title}
-                            </span>
-                          </div>
-                        </div>
-                      );
-                    })()}
                     {/* Inline note preview when note is on dot */}
                     {notes[currentActiveEntry.uuid] && (notePositions[currentActiveEntry.uuid] || 'before') === 'dot' && (
                       <div className="flex items-start gap-1.5 pb-1.5 mb-1.5 border-b border-purple-500/15 shrink-0">
@@ -6894,6 +7204,21 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       <div className="border-t border-white/10 my-1" />
                     </>
                   )}
+                  {summaryToolType && contextMenu.entry.type === 'user' && !contextMenu.entry.isCompactSummary && isEligibleTabTitleEntry(contextMenu.entry) && (
+                    <>
+                      <button
+                        className="w-full text-left px-3 py-2 text-xs text-sky-300 hover:bg-sky-600/20 rounded transition-colors cursor-pointer flex items-center gap-2"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void handleRefreshTimelineAction(contextMenu.entry);
+                        }}
+                      >
+                        <RefreshCw size={12} className={refreshingActionUuid === contextMenu.entry.uuid ? 'animate-spin' : ''} />
+                        Обновить название
+                      </button>
+                      <div className="border-t border-white/10 my-1" />
+                    </>
+                  )}
                   <button
                     className="w-full text-left px-3 py-2 text-xs text-purple-400 hover:bg-purple-600/20 rounded transition-colors cursor-pointer flex items-center gap-2"
                     onClick={(e) => {
@@ -6904,36 +7229,100 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     <StickyNote size={12} />
                     {notes[contextMenu.entry.uuid] ? 'Редактировать заметку' : 'Добавить заметку'}
                   </button>
-                  {/* Удалить запрос — только для Claude user-entries (не compact/continued).
-                      Двухшаговый inline-confirm: первый клик переключает кнопку в красное
-                      «Точно удалить?», второй — вызывает claude:delete-user-entry. */}
-                  {supportsClaudeTimelineActions && contextMenu.entry.type === 'user' && !contextMenu.entry.isCompactSummary && (
+                  {supportsDeleteRangeActions && (contextMenu.entry.type === 'user' || contextMenu.entry.type === 'compact') && (
                     <>
                       <div className="border-t border-white/10 my-1" />
                       {!deleteEntryConfirmMode ? (
-                        <button
-                          className="w-full text-left px-3 py-2 text-xs text-red-400 hover:bg-red-600/20 rounded transition-colors cursor-pointer flex items-center gap-2"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setDeleteEntryConfirmMode(true);
-                          }}
-                        >
-                          <Trash2 size={12} />
-                          Удалить user-mess
-                        </button>
-                      ) : (
-                        <button
-                          className="w-full text-left px-3 py-2 text-xs text-white rounded transition-colors cursor-pointer flex items-center gap-2"
-                          style={{ backgroundColor: 'rgba(239, 68, 68, 0.8)' }}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDeleteUserEntry(contextMenu.entry);
-                          }}
-                        >
-                          <Trash2 size={12} />
-                          Точно удалить?
-                        </button>
-                      )}
+                        <div className="flex rounded overflow-hidden" data-testid="timeline-delete-split-single">
+                          <button
+                            className="flex-1 text-left px-3 py-2 text-xs text-red-400 hover:bg-red-600/20 transition-colors cursor-pointer flex items-center gap-2"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setDeleteEntryScope('selection');
+                              setDeleteEntryConfirmMode(true);
+                            }}
+                          >
+                            <Trash2 size={12} />
+                            {!isCodex && contextMenu.entry.type === 'user' && !contextMenu.entry.isCompactSummary
+                              ? 'Удалить запрос'
+                              : 'Удалить запись'}
+                          </button>
+                          <Tooltip content="Удалить всё выше, включая выбранное">
+                            <button
+                              type="button"
+                              aria-label="Удалить всё выше, включая выбранное"
+                              data-testid="timeline-delete-through-start-single"
+                              className="px-2 py-2 text-red-400/70 hover:bg-red-600/30 hover:text-red-300 transition-colors cursor-pointer border-l border-white/10 flex items-center justify-center"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setDeleteEntryScope('through-start');
+                                setDeleteEntryConfirmMode(true);
+                              }}
+                            >
+                              <ArrowUpToLine size={12} />
+                            </button>
+                          </Tooltip>
+                        </div>
+                      ) : (() => {
+                        const entryIndex = entries.findIndex((entry) => entry.uuid === contextMenu.entry.uuid);
+                        if (entryIndex < 0) return null;
+                        const crossesClaudeBoundary = !isCodex && (
+                          contextMenu.entry.type === 'compact' ||
+                          contextMenu.entry.type === 'continued' ||
+                          !!contextMenu.entry.isCompactSummary
+                        );
+                        const deleteSingleClaudePrompt = !isCodex &&
+                          contextMenu.entry.type === 'user' &&
+                          !contextMenu.entry.isCompactSummary &&
+                          deleteEntryScope === 'selection';
+                        const deleteThroughStart = deleteEntryScope === 'through-start' || crossesClaudeBoundary;
+                        const deleteRange = {
+                          startIndex: deleteThroughStart ? 0 : entryIndex,
+                          endIndex: entryIndex,
+                        };
+                        const startUuid = entries[deleteRange.startIndex]?.uuid;
+                        const count = deleteRange.endIndex - deleteRange.startIndex + 1;
+                        return (
+                          <div className="p-2 flex flex-col gap-2" data-testid="timeline-delete-confirm-single">
+                            <div className="text-[11px] text-red-300 leading-snug">
+                              {deleteSingleClaudePrompt
+                                ? <>Удалить только выбранный запрос? <span className="text-red-400/70">Ответ Claude сохранится.</span></>
+                                : crossesClaudeBoundary && deleteEntryScope === 'selection'
+                                ? <>Это граница истории Claude. Удалить <span className="font-semibold">{count}</span> записей от начала до неё?</>
+                                : deleteThroughStart
+                                  ? <>Удалить <span className="font-semibold">{count}</span> записей от начала до выбранной?</>
+                                  : <>Удалить выбранную запись?</>}
+                              {!deleteSingleClaudePrompt && <>{' '}<span className="text-red-400/70">Действие необратимо.</span></>}
+                            </div>
+                            <div className="flex gap-1.5">
+                              <button
+                                className="flex-1 px-3 py-1.5 text-xs text-white/70 hover:text-white hover:bg-white/5 rounded transition-colors cursor-pointer"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setDeleteEntryConfirmMode(false);
+                                }}
+                              >
+                                Отмена
+                              </button>
+                              <button
+                                data-testid="timeline-delete-confirm-submit-single"
+                                className="flex-1 px-3 py-1.5 text-xs text-white bg-red-600/80 hover:bg-red-600 rounded transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (deleteSingleClaudePrompt) {
+                                    void handleDeleteClaudeUserEntry(contextMenu.entry);
+                                  } else if (startUuid) {
+                                    void executeDeleteRange(deleteRange, startUuid, contextMenu.entry.uuid);
+                                  }
+                                }}
+                              >
+                                <Trash2 size={12} />
+                                Удалить
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })()}
                     </>
                   )}
                   {/* Rewind — left side native, right side Gemini compact + native rewind. */}
@@ -7056,27 +7445,24 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
               }}
             >
               {deleteConfirmMode ? (() => {
-                // For Delete: extend range to 0 when it crosses a boundary (compact / Plan
-                // Mode / Clear Context). Splicing across JSONL boundary would corrupt the
-                // parentUuid chain — for delete we always cut a contiguous prefix.
-                // For Copy/Edit this extension is NOT applied — the user keeps the visual
-                // range they actually selected.
-                const effRange = rangeActionMenu.crossesBoundary
+                const crossesClaudeBoundary = !isCodex && rangeActionMenu.crossesBoundary;
+                const deleteThroughStart = deleteRangeScope === 'through-start' || crossesClaudeBoundary;
+                const effRange = deleteThroughStart
                   ? { startIndex: 0, endIndex: rangeActionMenu.range.endIndex }
                   : rangeActionMenu.range;
-                const effStartUuid = rangeActionMenu.crossesBoundary
+                const effStartUuid = deleteThroughStart
                   ? entries[0].uuid
                   : rangeActionMenu.startUuid;
                 const effCount = effRange.endIndex - effRange.startIndex + 1;
                 return (
-                <div className="p-2 flex flex-col gap-2">
+                <div className="p-2 flex flex-col gap-2" data-testid="timeline-delete-confirm-range">
                   <div className="text-[11px] text-red-300 leading-snug">
-                    {rangeActionMenu.crossesBoundary ? (
-                      <>В выделении мост между файлами (compact / Context Overflow).<br/>
-                      Удалить <span className="font-semibold">{effCount}</span> записей до самого начала? <span className="text-red-400/70">Действие необратимо.</span></>
-                    ) : (
-                      <>Удалить <span className="font-semibold">{effCount}</span> записей? <span className="text-red-400/70">Действие необратимо.</span></>
-                    )}
+                    {crossesClaudeBoundary && deleteRangeScope === 'selection'
+                      ? <>В выделении граница истории Claude.<br/>Удалить <span className="font-semibold">{effCount}</span> записей от начала до выбранной?</>
+                      : deleteThroughStart
+                        ? <>Удалить <span className="font-semibold">{effCount}</span> записей от начала до выбранной?</>
+                        : <>Удалить <span className="font-semibold">{effCount}</span> выбранных записей?</>}
+                    {' '}<span className="text-red-400/70">Действие необратимо.</span>
                   </div>
                   <div className="flex gap-1.5">
                     <button
@@ -7089,10 +7475,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       Отмена
                     </button>
                     <button
+                      data-testid="timeline-delete-confirm-submit-range"
                       className="flex-1 px-3 py-1.5 text-xs text-white bg-red-600/80 hover:bg-red-600 rounded transition-colors cursor-pointer flex items-center justify-center gap-1.5"
                       onClick={(e) => {
                         e.stopPropagation();
-                        executeDeleteRange(effRange, effStartUuid, rangeActionMenu.endUuid);
+                        void executeDeleteRange(effRange, effStartUuid, rangeActionMenu.endUuid);
                       }}
                     >
                       <Trash2 size={12} />
@@ -7214,17 +7601,35 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       </Tooltip>
                     </div>
                   )}
-                  {supportsClaudeTimelineActions && (
-                    <button
-                      className="w-full text-left px-3 py-2 text-xs text-red-400 hover:bg-red-600/20 rounded transition-colors cursor-pointer flex items-center gap-2"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setDeleteConfirmMode(true);
-                      }}
-                    >
-                      <Trash2 size={12} />
-                      Удалить историю ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
-                    </button>
+                  {supportsDeleteRangeActions && (
+                    <div className="flex rounded overflow-hidden" data-testid="timeline-delete-split-range">
+                      <button
+                        className="flex-1 text-left px-3 py-2 text-xs text-red-400 hover:bg-red-600/20 transition-colors cursor-pointer flex items-center gap-2"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setDeleteRangeScope('selection');
+                          setDeleteConfirmMode(true);
+                        }}
+                      >
+                        <Trash2 size={12} />
+                        Удалить выбранное ({rangeActionMenu.range.endIndex - rangeActionMenu.range.startIndex + 1})
+                      </button>
+                      <Tooltip content="Удалить всё выше, включая выбранное">
+                        <button
+                          type="button"
+                          aria-label="Удалить всё выше, включая выбранное"
+                          data-testid="timeline-delete-through-start-range"
+                          className="px-2 py-2 text-red-400/70 hover:bg-red-600/30 hover:text-red-300 transition-colors cursor-pointer border-l border-white/10 flex items-center justify-center"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setDeleteRangeScope('through-start');
+                            setDeleteConfirmMode(true);
+                          }}
+                        >
+                          <ArrowUpToLine size={12} />
+                        </button>
+                      </Tooltip>
+                    </div>
                   )}
                 </>
               ) : (
@@ -7744,11 +8149,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           </TooltipPortal>
         )}
 
-        {/* ──── LOADING PLACEHOLDER (centred ping while initial load empty) ──── */}
-        {/* Loading */}
+        {/* ──── INITIAL LOAD (background refreshes keep the existing rows visible) ──── */}
         {isVisible && isLoading && entries.length === 0 && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/20">
-            <div className="w-1 h-1 bg-white animate-ping rounded-full" />
+          <div
+            className="absolute inset-0 z-[70] flex items-center justify-center bg-[#1a1a1a]/90 pointer-events-none"
+            role="status"
+            aria-live="polite"
+            aria-label="Loading timeline"
+          >
+            <div className={`flex items-center justify-center text-white/65 ${isExpandedLayout ? 'gap-2 px-3 py-2' : ''}`}>
+              <RefreshCw size={isExpandedLayout ? 16 : 14} className="animate-spin shrink-0" />
+              {isExpandedLayout && (
+                <span className="text-[11px] font-medium whitespace-nowrap">Loading timeline…</span>
+              )}
+            </div>
           </div>
         )}
 

@@ -23,8 +23,9 @@ let gitIpcModule = null;
 const sharedFileLayoutModulePath = app.isPackaged
   ? path.join(process.resourcesPath, 'shared-packages', 'file-explorer', 'shared-layout-store.cjs')
   : path.join(process.cwd(), 'packages', 'file-explorer', 'main', 'shared-layout-store.cjs');
-const { registerSharedFileLayoutIpc } = require(sharedFileLayoutModulePath);
+const { registerSharedFileIconIpc, registerSharedFileLayoutIpc } = require(sharedFileLayoutModulePath);
 registerSharedFileLayoutIpc({ ipcMain, Database: require('better-sqlite3') });
+registerSharedFileIconIpc({ ipcMain, Database: require('better-sqlite3') });
 
 // Load .env file (works in both dev and packaged builds).
 // Production: prefer ~/.noted-terminal/.env (survives reinstall) and fall back
@@ -106,11 +107,20 @@ const codexDataModule = require(path.join(srcMainDir, 'ipc', 'codex-data'));
 const { createSessionTranscriptService } = require(path.join(srcMainDir, 'session-transcript-service'));
 const { PromptQueueAssetStore, collectReferencedAssetIds } = require(path.join(srcMainDir, 'prompt-queue-assets'));
 const { CodexImageBindingRegistry } = require(path.join(srcMainDir, 'codex-image-bindings'));
+const { CodexImageTransport, buildCodexImagePastePlan } = require(path.join(srcMainDir, 'codex-image-transport'));
 
 const promptQueueAssetStore = new PromptQueueAssetStore({
   rootDir: path.join(app.getPath('userData'), 'prompt-queue-assets'),
 });
 const codexImageBindings = new CodexImageBindingRegistry();
+const codexImageTransport = new CodexImageTransport({
+  // Codex recognizes a pasted local image path as an attachment, but its TUI
+  // path detector does not accept the whitespace in macOS "Application Support".
+  // This directory contains symlinks only; durable bytes stay in userData.
+  rootDir: process.platform === 'win32'
+    ? path.join(os.tmpdir(), 'noted-terminal-codex-image-input')
+    : '/tmp/noted-terminal-codex-image-input',
+});
 
 // SDK session registry — declared early so the mobile-web server can receive
 // the same Map by reference at startup (web-server.start({sdkSessions})).
@@ -140,28 +150,145 @@ let mainLogPath = null; // absolute path to dev.log/production.log — perf-watc
   try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch {}
   const LOG_PATH = path.join(LOG_DIR, isDev ? 'dev.log' : 'production.log');
   mainLogPath = LOG_PATH;
-  // No size limit — logs can grow large during active sessions. Rotate only by age (7 days).
+  const LOG_MAX_AGE_DAYS = 7;
+  const LOG_MAX_STARTUP_BYTES = 64 * 1024 * 1024;
+  const LOG_STREAM_HIGH_WATER_MARK_BYTES = 64 * 1024;
+  const LOG_MAX_QUEUE_LINES = 256;
+  const LOG_MAX_QUEUE_BYTES = 512 * 1024;
   const TAG_RE = /^\[/; // Only log messages starting with [Tag]
 
   let _lastLine = '';
   let _lastCount = 0;
   let _logStream = null;
+  let _logBackpressured = false;
+  let _logQueue = [];
+  let _logQueueBytes = 0;
+  let _logDroppedLines = 0;
+  let _logDroppedBytes = 0;
   let _logSeq = 0;
   const _logBootId = Date.now().toString(36) + '-' + crypto.randomBytes(3).toString('hex');
 
+  function formatTimestampedLogLine(line) {
+    const iso = new Date().toISOString();
+    const mainAbs = nodePerformance.timeOrigin + nodePerformance.now();
+    const ts = iso.slice(11, 23); // HH:MM:SS.mmm, kept for existing grep workflows
+    _logSeq++;
+    return (
+      ts +
+      ' date=' + iso.slice(0, 10) +
+      ' seq=' + _logSeq +
+      ' boot=' + _logBootId +
+      ' mainAbs=' + mainAbs.toFixed(1) +
+      ' ' + line + '\n'
+    );
+  }
+
+  function resetLogQueue() {
+    _logQueue = [];
+    _logQueueBytes = 0;
+    _logBackpressured = false;
+  }
+
+  function enqueueLogRecord(record) {
+    const bytes = Buffer.byteLength(record, 'utf8');
+    if (
+      _logQueue.length >= LOG_MAX_QUEUE_LINES ||
+      _logQueueBytes + bytes > LOG_MAX_QUEUE_BYTES
+    ) {
+      _logDroppedLines++;
+      _logDroppedBytes += bytes;
+      return;
+    }
+    _logQueue.push({ record, bytes });
+    _logQueueBytes += bytes;
+  }
+
+  function writeLogRecord(record) {
+    if (!_logStream) return;
+    // Writable.write(false) means Node has already accepted this record but its
+    // internal buffer is full. Stop feeding it until `drain`; otherwise a noisy
+    // renderer can make the stream retain an effectively unbounded backlog.
+    if (_logBackpressured) {
+      enqueueLogRecord(record);
+      return;
+    }
+    try {
+      if (!_logStream.write(record)) _logBackpressured = true;
+    } catch {
+      _logStream = null;
+      resetLogQueue();
+    }
+  }
+
+  function takeDroppedLogDiagnostic() {
+    if (_logDroppedLines === 0) return '';
+    const droppedLines = _logDroppedLines;
+    const droppedBytes = _logDroppedBytes;
+    _logDroppedLines = 0;
+    _logDroppedBytes = 0;
+    return formatTimestampedLogLine(
+      '[LogBackpressure] droppedLines=' + droppedLines +
+      ' droppedBytes=' + droppedBytes +
+      ' queueLimitLines=' + LOG_MAX_QUEUE_LINES +
+      ' queueLimitBytes=' + LOG_MAX_QUEUE_BYTES
+    );
+  }
+
+  function flushLogQueue() {
+    if (!_logStream) return;
+    _logBackpressured = false;
+    while (_logQueue.length > 0) {
+      const item = _logQueue.shift();
+      _logQueueBytes -= item.bytes;
+      try {
+        if (!_logStream.write(item.record)) {
+          _logBackpressured = true;
+          return;
+        }
+      } catch {
+        _logStream = null;
+        resetLogQueue();
+        return;
+      }
+    }
+    _logQueueBytes = 0;
+    const diagnostic = takeDroppedLogDiagnostic();
+    if (diagnostic) writeLogRecord(diagnostic);
+  }
+
   function initLogStream() {
     try {
-      // Rotate only if older than 7 days — no size limit
+      let rotation = null;
       if (fs.existsSync(LOG_PATH)) {
         const stat = fs.statSync(LOG_PATH);
         const ageDays = (Date.now() - stat.mtimeMs) / (1000 * 60 * 60 * 24);
-        if (ageDays > 7) {
+        // Rotate only at startup so an active perf/log investigation keeps one
+        // stable file descriptor and one grep-able log file for the whole run.
+        const rotationReasons = [];
+        if (ageDays > LOG_MAX_AGE_DAYS) rotationReasons.push('age');
+        if (stat.size >= LOG_MAX_STARTUP_BYTES) rotationReasons.push('size');
+        if (rotationReasons.length > 0) {
           const oldPath = LOG_PATH + '.old';
-          try { fs.renameSync(LOG_PATH, oldPath); } catch {}
+          try {
+            fs.rmSync(oldPath, { force: true });
+            fs.renameSync(LOG_PATH, oldPath);
+            rotation = {
+              reason: rotationReasons.join('+'),
+              previousBytes: stat.size,
+              previousAgeDays: ageDays,
+            };
+          } catch {}
         }
       }
-      _logStream = fs.createWriteStream(LOG_PATH, { flags: 'a' });
-      _logStream.on('error', () => { _logStream = null; });
+      _logStream = fs.createWriteStream(LOG_PATH, {
+        flags: 'a',
+        highWaterMark: LOG_STREAM_HIGH_WATER_MARK_BYTES,
+      });
+      _logStream.on('drain', flushLogQueue);
+      _logStream.on('error', () => {
+        _logStream = null;
+        resetLogQueue();
+      });
       _logStream.write(
         '\n--- Session ' + new Date().toISOString() +
         ' (PID ' + process.pid +
@@ -169,6 +296,14 @@ let mainLogPath = null; // absolute path to dev.log/production.log — perf-watc
         ', timeOriginAbs ' + nodePerformance.timeOrigin.toFixed(1) +
         ') ---\n'
       );
+      if (rotation) {
+        writeLogRecord(formatTimestampedLogLine(
+          '[LogRotate] reason=' + rotation.reason +
+          ' previousBytes=' + rotation.previousBytes +
+          ' previousAgeDays=' + rotation.previousAgeDays.toFixed(2) +
+          ' maxStartupBytes=' + LOG_MAX_STARTUP_BYTES
+        ));
+      }
     } catch {}
   }
   if (process.env.NOTED_E2E_TEST !== 'true') initLogStream();
@@ -182,22 +317,11 @@ let mainLogPath = null; // absolute path to dev.log/production.log — perf-watc
     }
     // Flush dedup counter for previous line
     if (_lastCount > 0) {
-      _logStream.write('  ×' + (_lastCount + 1) + '\n');
+      writeLogRecord('  ×' + (_lastCount + 1) + '\n');
       _lastCount = 0;
     }
     _lastLine = line;
-    const iso = new Date().toISOString();
-    const mainAbs = nodePerformance.timeOrigin + nodePerformance.now();
-    const ts = iso.slice(11, 23); // HH:MM:SS.mmm, kept for existing grep workflows
-    _logSeq++;
-    _logStream.write(
-      ts +
-      ' date=' + iso.slice(0, 10) +
-      ' seq=' + _logSeq +
-      ' boot=' + _logBootId +
-      ' mainAbs=' + mainAbs.toFixed(1) +
-      ' ' + line + '\n'
-    );
+    writeLogRecord(formatTimestampedLogLine(line));
   }
 
   const _origLog = console.log;
@@ -241,8 +365,12 @@ let mainLogPath = null; // absolute path to dev.log/production.log — perf-watc
 
   // Flush dedup on exit
   process.on('exit', () => {
-    if (_lastCount > 0 && _logStream) _logStream.write('  ×' + (_lastCount + 1) + '\n');
-    if (_logStream) _logStream.end();
+    if (_lastCount > 0 && _logStream) writeLogRecord('  ×' + (_lastCount + 1) + '\n');
+    if (_logStream) {
+      const pending = _logQueue.map(item => item.record).join('') + takeDroppedLogDiagnostic();
+      resetLogQueue();
+      try { _logStream.end(pending); } catch {}
+    }
   });
 }
 // ========== END PRODUCTION FILE LOGGER ==========
@@ -1684,6 +1812,7 @@ const codexTuiReadyBuffers = new Map();  // tabId -> recent startup output for d
 const codexTuiReadyQuietTimers = new Map(); // tabId -> debounce timer; ready only after TUI output settles
 const codexTuiReadyRejectKeys = new Map(); // tabId -> last logged not-ready reason/preview
 const codexTuiReadyLastNotReady = new Map(); // tabId -> last deterministic not-ready diagnosis
+const codexForkComposerSeenTabs = new Set(); // fork composer can arrive just before rollout session discovery
 const codexLastRunCommandPayload = new Map(); // tabId -> last Codex launch payload, used by MCP startup watchdog retry
 const codexPromptInFlight = new Map(); // tabId -> prompt submit window before rollout task_started
 const codexManualActionRequired = new Map(); // tabId -> auth/update state that must be handled by the user
@@ -4343,7 +4472,11 @@ function startClaudeHookServer() {
                 .filter((ref) => ref.availability === 'available')
                 .map((ref) => [Number(ref.id), ref]));
               if (images > 0) {
-                resolvedText = resolvedText.replace(/\[Image\s+#?(\d+)\]/g, (marker, rawId) => {
+                resolvedText = resolvedText.replace(/\[Image(?:\s+#?(\d+))?\]/g, (marker, rawId) => {
+                  if (!rawId) {
+                    const prefix = agent === 'codex' ? 'codex' : 'claude';
+                    return '[imageError: ' + prefix + '_image_path_unavailable #unknown]';
+                  }
                   const id = Number(rawId);
                   if (availableById.has(id)) return marker;
                   const prefix = agent === 'codex' ? 'codex' : 'claude';
@@ -9966,6 +10099,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   const isCodexPasteSource = !!(source && String(source).startsWith('codex-'));
   let codexPromptInFlightState = null;
   let stagedCodexImageRefs = [];
+  let codexImagePasteSegments = null;
   const emitBusy = (busy) => {
     if (!broadcastTabId) {
       console.warn(logPrefix + ' [PasteBusy] no-tab busy=' + busy + ' termPid=' + (term && term.pid ? term.pid : 'unknown'));
@@ -10008,12 +10142,14 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     }
     content = prepared.text;
     stagedCodexImageRefs = prepared.staged;
+    codexImagePasteSegments = prepared.replaced > 0 ? prepared.segments : null;
   }
 
   // Chunking strategy:
   //   fast=true  (Gemini/bash) — split by CHUNK_MAX, write back-to-back, no waits.
   //   fast=false (Claude Ink)  — single write of the whole payload wrapped in one
-  //                              bracket pair. No per-chunk render waits.
+  //                              bracket pair. Codex image plans are the exception:
+  //                              every image/text segment is a separate paste event.
   //
   // Why slow-mode no longer chunks:
   //   Earlier implementation split the payload into 900-byte chunks and called
@@ -10032,11 +10168,25 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   //   Fact reference: docs/knowledge/fact-claude-tui-mechanics.md §4 (single
   //   bracket pair) + §9 (alt-screen DEC ?2004 loss). See also fix-claude-
   //   paste-stuck-queue.md for the 57s repro.
+  // Codex recognizes an image only when one explicit paste event contains the
+  // image path and nothing else. Queue payloads can interleave attachments and
+  // editable text, so each planned segment becomes its own bracketed paste.
+  // A normal prompt remains one paste group and keeps the existing behavior.
+  const pasteGroups = codexImagePasteSegments?.length
+    ? codexImagePasteSegments.map(segment => ({ kind: segment.kind, text: segment.text }))
+    : [{ kind: 'text', text: content }];
   const chunks = [];
-  if (fast) {
-    chunks.push(...splitUtf8Chunks(content, CHUNK_MAX));
-  } else {
-    chunks.push(content); // Slow-mode = single chunk = single bracket pair = single write.
+  for (let groupIndex = 0; groupIndex < pasteGroups.length; groupIndex++) {
+    const group = pasteGroups[groupIndex];
+    const groupChunks = fast ? splitUtf8Chunks(group.text, CHUNK_MAX) : [group.text];
+    for (let chunkIndex = 0; chunkIndex < groupChunks.length; chunkIndex++) {
+      chunks.push({
+        text: groupChunks[chunkIndex],
+        kind: group.kind,
+        startsPaste: chunkIndex === 0,
+        endsPaste: chunkIndex === groupChunks.length - 1,
+      });
+    }
   }
 
   const t0 = Date.now();
@@ -10047,7 +10197,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   codexPromptInFlightState = submit && isCodexPasteSource && broadcastTabId && submitSequence !== '\t'
     ? beginCodexPromptInFlight(broadcastTabId, 'safe-paste-submit', { source, handoffId })
     : null;
-  console.log(logPrefix + ' 🚀 Start: "' + content.substring(0, 40) + '" (' + content.length + ' chars → ' + chunks.length + ' chunk(s), fast=' + fast + ', ctrlCFirst=' + ctrlCFirst + ', stashFirst=' + stashFirst + ', submit=' + resolvedSubmitLabel + ', handoff=' + (handoffId || '-') + ', source=' + (source || '-') + ', skipRenderWait=' + skipRenderWait + ', codexVisibleDraftGuard=' + shouldVerifyCodexVisibleDraft + ')');
+  console.log(logPrefix + ' 🚀 Start: "' + content.substring(0, 40) + '" (' + content.length + ' chars → ' + pasteGroups.length + ' paste group(s), ' + chunks.length + ' chunk(s), fast=' + fast + ', ctrlCFirst=' + ctrlCFirst + ', stashFirst=' + stashFirst + ', submit=' + resolvedSubmitLabel + ', handoff=' + (handoffId || '-') + ', source=' + (source || '-') + ', skipRenderWait=' + skipRenderWait + ', codexVisibleDraftGuard=' + shouldVerifyCodexVisibleDraft + ')');
 
   if (shouldVerifyCodexVisibleDraft && mainWindow && !mainWindow.isDestroyed() && !ctrlCFirst && !stashFirst) {
     const beforeDraft = await requestTerminalCodexDraftState(
@@ -10147,13 +10297,11 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   let pasteRenderAck = null;
 
   // Bracketed Paste wrapping strategy:
-  //   slow-mode (Claude Ink): chunks.length === 1 by construction → one write,
-  //     one PASTE_START + payload + PASTE_END pair → Ink sees one atomic paste,
-  //     emits one [Pasted text #N] chip. waitForRender is called once AFTER the
-  //     write (not per-chunk) so we still confirm Ink ingested the bytes before
-  //     pressing Enter.
-  //   fast-mode (Gemini/bash): chunks > 1 possible, write back-to-back. First
-  //     chunk gets PASTE_START, last gets PASTE_END. No waits between chunks.
+  //   Claude slow-mode has one paste group, so Ink still sees one atomic paste
+  //   and emits one [Pasted text #N] chip. Codex image plans deliberately have
+  //   multiple groups so its TUI receives every image path as a standalone
+  //   paste event. Fast-mode can chunk within a group, but the brackets remain
+  //   around the complete group rather than around every transport chunk.
   // Verified against fact-claude-tui-mechanics.md §4.
 
   if (isCodexPasteSource && broadcastTabId && stagedCodexImageRefs.length > 0) {
@@ -10161,9 +10309,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   }
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
-    let payload = chunk;
-    if (i === 0) payload = PASTE_START + payload;
-    if (i === chunks.length - 1) payload = payload + PASTE_END;
+    let payload = chunk.text;
+    if (chunk.startsPaste) payload = PASTE_START + payload;
+    if (chunk.endsPaste) payload = payload + PASTE_END;
 
     const startTime = Date.now();
 
@@ -10509,6 +10657,21 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
     return;
   }
 
+  // The desktop stopping status is intentionally non-modal so scroll,
+  // selection, and terminal inspection remain available. Raw keyboard input
+  // must still stop at the authoritative process lifecycle boundary: otherwise
+  // bytes typed while the agent exits can land in the shell that appears next.
+  const stoppingState = aiStoppingTabs.get(tabId);
+  if (stoppingState) {
+    if (!stoppingState.inputBlockedLogged) {
+      stoppingState.inputBlockedLogged = true;
+      console.warn('[terminal:input] BLOCKED while agent stopping tab=' + String(tabId).slice(-12)
+        + ' tool=' + (stoppingState.toolType || 'unknown')
+        + ' reason=' + (stoppingState.reason || '-'));
+    }
+    return;
+  }
+
   // Anti-arrow-mash guard. Catches the failure mode where xterm.js emits a
   // huge run of identical arrow escape codes (e.g. user's keyboard auto-repeat
   // got stuck holding Left Arrow, a Magic Mouse fingerprint glitch, an OS
@@ -10715,9 +10878,7 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
       + ' begin=' + began + ' token=' + codexImageStageToken.slice(-12));
   }
   term.write(data);
-  if (data === '\r' || data === '\x03') {
-    codexImageBindings.resetComposer(tabId);
-  }
+  codexImageBindings.handleTerminalInput(tabId, data);
 });
 
 // Programmatic paste (used for automated tools like Update Docs)
@@ -10726,6 +10887,13 @@ ipcMain.handle('terminal:paste', async (event, { tabId, content, submit = true, 
   const term = terminals.get(tabId);
   if (!term) {
     return { success: false, error: 'terminal not found' };
+  }
+  const stoppingState = aiStoppingTabs.get(tabId);
+  if (stoppingState) {
+    console.warn('[terminal:paste] BLOCKED while agent stopping tab=' + String(tabId).slice(-12)
+      + ' tool=' + (stoppingState.toolType || 'unknown')
+      + ' source=' + (source || '-'));
+    return { success: false, error: 'agent_stopping' };
   }
 
   console.log('[terminal:paste] Pasting ' + content.length + ' chars to tab ' + tabId + ' (submit=' + submit + ', fast=' + fast + ', handoff=' + (handoffId || '-') + ', source=' + (source || '-') + ')');
@@ -10779,10 +10947,14 @@ ipcMain.handle('codex:save-clipboard-image', async (_event, { tabId } = {}) => {
     if (ref.availability !== 'available') {
       return { success: false, error: ref.error || 'save_failed' };
     }
+    const transport = codexImageTransport.stageSync(ref);
+    if (!transport.success) {
+      return { success: false, error: transport.error || 'image_alias_failed' };
+    }
     const staged = stageCodexImageRefs(tabId, [ref]);
     console.log('[codex:save-clipboard-image] tab=' + String(tabId || 'unknown').slice(-12)
       + ' asset=' + ref.assetId + ' bytes=' + ref.size + ' token=' + String(staged.token || '-').slice(-12));
-    return { success: true, ...ref, stageToken: staged.token };
+    return { success: true, ...ref, inputPath: transport.path, stageToken: staged.token };
   } catch (error) {
     console.warn('[codex:save-clipboard-image] failed:', error?.message || error);
     return { success: false, error: error?.code || 'save_failed' };
@@ -10806,8 +10978,12 @@ async function stageCodexImagePathForTab(tabId, filePath) {
   if (ref.availability !== 'available') {
     return { success: false, error: ref.error || 'image_path_missing', path: candidate };
   }
+  const transport = codexImageTransport.stageSync(ref);
+  if (!transport.success) {
+    return { success: false, error: transport.error || 'image_alias_failed', path: candidate };
+  }
   const staged = stageCodexImageRefs(tabId, [ref]);
-  return { success: true, ...ref, stageToken: staged.token };
+  return { success: true, ...ref, inputPath: transport.path, stageToken: staged.token };
 }
 
 function stageCodexImagePathForPasteSync(tabId, filePath) {
@@ -10823,7 +10999,7 @@ function stageCodexImagePathForPasteSync(tabId, filePath) {
   if (!st || !st.isFile()) {
     return { success: false, error: 'image_path_missing', path: candidate };
   }
-  return {
+  const ref = {
     success: true,
     path: candidate,
     size: st.size,
@@ -10831,29 +11007,24 @@ function stageCodexImagePathForPasteSync(tabId, filePath) {
     assetId: path.basename(candidate).match(/^[a-f0-9]{64}\./i) ? path.basename(candidate) : undefined,
     availability: 'available',
   };
+  const transport = codexImageTransport.stageSync(ref);
+  if (!transport.success) {
+    return { success: false, error: transport.error || 'image_alias_failed', path: candidate };
+  }
+  return { ...ref, inputPath: transport.path };
 }
 
 function prepareCodexImagePathMarkersForPaste(tabId, text, source = 'codex-paste') {
-  const staged = [];
-  const missing = [];
-  let replaced = 0;
-  const prepared = String(text || '').replace(/\[imagePath:\s*([^\]\r\n]+?)\s*\]/gi, (match, rawPath) => {
-    replaced += 1;
-    const result = stageCodexImagePathForPasteSync(tabId, rawPath);
-    if (result.success) {
-      staged.push({
-        id: 0,
-        path: result.path,
-        size: result.size,
-        mediaType: result.mediaType,
-        assetId: result.assetId,
-        availability: 'available',
-      });
-      return result.path;
-    }
-    missing.push({ path: result.path || String(rawPath || '').trim(), error: result.error || 'stage_failed' });
-    return match;
-  });
+  const plan = buildCodexImagePastePlan(text, rawPath => stageCodexImagePathForPasteSync(tabId, rawPath));
+  const staged = plan.staged.map(result => ({
+    id: 0,
+    path: result.path,
+    size: result.size,
+    mediaType: result.mediaType,
+    assetId: result.assetId,
+    availability: 'available',
+  }));
+  const { replaced, missing } = plan;
   if (replaced > 0) {
     console.log('[codex:image-path-paste] tab=' + String(tabId || 'unknown').slice(-12)
       + ' source=' + source
@@ -10861,7 +11032,7 @@ function prepareCodexImagePathMarkersForPaste(tabId, text, source = 'codex-paste
       + ' staged=' + staged.length
       + ' missing=' + missing.length);
   }
-  return { text: prepared, replaced, staged, missing };
+  return { text: plan.text, segments: plan.segments, replaced, staged, missing };
 }
 
 ipcMain.handle('codex:stage-image-path', async (_event, { tabId, filePath } = {}) => {
@@ -10889,11 +11060,21 @@ ipcMain.handle('codex:stage-image-paths', async (_event, { tabId, filePaths } = 
       mediaType: mediaTypeFromImagePath(filePath),
       size: 0,
     })));
-    const available = refs.filter((ref) => ref.availability === 'available');
+    const transported = refs.map((ref) => ({
+      ref,
+      transport: ref.availability === 'available'
+        ? codexImageTransport.stageSync(ref)
+        : { success: false, error: ref.error || 'stage_failed' },
+    }));
+    const available = transported
+      .filter((entry) => entry.ref.availability === 'available' && entry.transport.success)
+      .map((entry) => entry.ref);
     const staged = stageCodexImageRefs(tabId, available);
-    const results = refs.map((ref) => ref.availability === 'available'
-      ? { success: true, ...ref, stageToken: staged.token }
-      : { success: false, ...ref, error: ref.error || 'stage_failed' });
+    const results = transported.map(({ ref, transport }) => (
+      ref.availability === 'available' && transport.success
+        ? { success: true, ...ref, inputPath: transport.path, stageToken: staged.token }
+        : { success: false, ...ref, error: transport.error || ref.error || 'stage_failed' }
+    ));
     const paths = results.filter((result) => result?.success && result.path);
     const success = paths.length === results.length;
     const error = paths.length === 0
@@ -17228,12 +17409,27 @@ ipcMain.handle('file:delete', async (event, targetPath) => {
 
 ipcMain.handle('file:move-item', async (event, srcPath, destDir) => {
   try {
+    if (typeof srcPath !== 'string' || typeof destDir !== 'string') return false;
+    if (!fs.existsSync(srcPath) || !fs.existsSync(destDir) || !fs.lstatSync(destDir).isDirectory()) return false;
+    const resolvedSource = path.resolve(srcPath);
+    const resolvedDestination = path.resolve(destDir);
+    if (resolvedDestination === resolvedSource || resolvedDestination.startsWith(resolvedSource + path.sep)) return false;
     const name = path.basename(srcPath);
     const dest = path.join(destDir, name);
+    if (path.resolve(dest) === resolvedSource) return true;
+    if (fs.existsSync(dest)) return false;
     fs.renameSync(srcPath, dest);
     console.log('[FileOps] Moved:', srcPath, '→', dest);
     return true;
   } catch (err) { console.error('[FileOps] Move error:', err); return false; }
+});
+
+ipcMain.handle('file:paths-exist', async (event, targetPaths) => {
+  const result = {};
+  for (const targetPath of Array.isArray(targetPaths) ? targetPaths : []) {
+    result[targetPath] = typeof targetPath === 'string' && targetPath.length > 0 && fs.existsSync(targetPath);
+  }
+  return result;
 });
 
 ipcMain.handle('file:read-for-undo', async (event, targetPath) => {
@@ -17645,6 +17841,7 @@ const CODEX_STARTUP_LIFECYCLE_TTL_MS = 90 * 1000;
 const CODEX_PROMPT_IN_FLIGHT_TTL_MS = 120 * 1000;
 function clearCodexTuiReady(tabId, reason = 'clear') {
   if (!tabId) return;
+  codexForkComposerSeenTabs.delete(tabId);
   clearCodexManualActionRequired(tabId, reason);
   const hadReady = codexTuiReadyTabs.delete(tabId);
   const quietTimer = codexTuiReadyQuietTimers.get(tabId);
@@ -17667,6 +17864,7 @@ function clearCodexTuiReady(tabId, reason = 'clear') {
 
 function resetCodexTuiReadyDetection(tabId, reason = 'reset') {
   if (!tabId) return;
+  codexForkComposerSeenTabs.delete(tabId);
   clearCodexManualActionRequired(tabId, reason);
   const quietTimer = codexTuiReadyQuietTimers.get(tabId);
   if (quietTimer) clearTimeout(quietTimer);
@@ -18227,6 +18425,15 @@ function clearCodexMcpStartupWatchdog(tabId, reason = 'clear') {
 
 function finishCodexStartupLifecycle(tabId, reason = 'ready') {
   if (!tabId) return;
+  // A Codex fork creates its rollout by copying the source transcript into the
+  // new file. Keep that copied history outside the live turn stream, then move
+  // the watcher boundary to the current EOF once the real composer is ready.
+  if (codexTuiReadyTabs.has(tabId)) {
+    if (codexLastRunCommandPayload.get(tabId)?.command === 'codex-f') {
+      codexForkComposerSeenTabs.add(tabId);
+    }
+    activateDeferredCodexTurnWatcher(tabId, 'startup-ready:' + reason);
+  }
   const hadStartupPrompt = codexStartupAutoEnter.has(tabId);
   const hadLaunchPayload = codexLastRunCommandPayload.has(tabId);
   const hadWatchdog = codexMcpStartupWatchdogs.has(tabId);
@@ -18512,6 +18719,19 @@ async function tryEmitCodexTuiReady(tabId, data) {
   codexTuiReadyBuffers.set(tabId, raw);
   const clean = cleanCodexTuiFrame(raw);
   const inspected = normalizeCodexMcpStartupInspection(tabId, inspectCodexInputReadyFrame(clean, raw), 'stream');
+  // Arm the live JSONL watcher on the first real composer frame, before the
+  // renderer can display it and accept a manual prompt. The later quiet/process
+  // checks still own the public input-ready state.
+  if (inspected.ready) {
+    if (codexLastRunCommandPayload.get(tabId)?.command === 'codex-f') {
+      const firstComposerFrame = !codexForkComposerSeenTabs.has(tabId);
+      codexForkComposerSeenTabs.add(tabId);
+      if (firstComposerFrame) {
+        console.log('[CodexTurn] fork composer frame seen tab=' + String(tabId).slice(-12));
+      }
+    }
+    activateDeferredCodexTurnWatcher(tabId, 'stream-composer-frame');
+  }
   if (codexTuiReadyTabs.has(tabId)) {
     if (!inspected.ready && Array.isArray(inspected.blockers) && inspected.blockers.length > 0) {
       if (hasCodexPromptOrTurnInFlight(tabId)) {
@@ -18662,6 +18882,7 @@ ipcMain.handle('codex:get-turn-state', async (_event, tabId) => {
     lastEventType: state.lastEventType || null,
     lastEventTs: state.lastEventTs || null,
     liveTurnEvents: state.liveTurnEvents || 0,
+    deferredUntilComposer: state.deferredUntilComposer === true,
   };
 });
 
@@ -19147,9 +19368,9 @@ function extractCodexLiveReasoning(summary) {
 }
 
 function parseCodexLiveArgs(payload) {
-  const raw = payload?.arguments != null ? payload.arguments : payload?.input;
-  if (raw == null) return {};
-  if (typeof raw === 'string') {
+  if (payload?.arguments != null) {
+    const raw = payload.arguments;
+    if (typeof raw !== 'string') return raw && typeof raw === 'object' ? raw : { value: raw };
     try {
       const parsed = JSON.parse(raw);
       return parsed && typeof parsed === 'object' ? parsed : { value: parsed };
@@ -19157,7 +19378,56 @@ function parseCodexLiveArgs(payload) {
       return { raw };
     }
   }
-  return raw && typeof raw === 'object' ? raw : { value: raw };
+  if (typeof payload?.input === 'string') return { input: payload.input };
+  return payload?.input && typeof payload.input === 'object' ? payload.input : {};
+}
+
+function codexLiveProjectionState(state) {
+  if (!state.liveToolCalls) state.liveToolCalls = new Map();
+  if (!state.liveToolCells) state.liveToolCells = new Map();
+  return { calls: state.liveToolCalls, cells: state.liveToolCells };
+}
+
+function decodeCodexLiveToolActions(call, output, isError) {
+  const decode = codexDataModule?._api?.codexHistoryActionsForCall;
+  if (typeof decode !== 'function') return { actions: [], cellId: null };
+  const decoded = decode(call, output, isError) || {};
+  const actions = (decoded.actions || []).map((action) => {
+    const raw = action?.tool === '__raw__' ? action.rawTool : action;
+    return {
+      toolName: raw?.toolName || raw?.name || raw?.tool || 'Tool',
+      args: raw?.args && typeof raw.args === 'object' ? raw.args : {},
+      result: raw?.result,
+      isError: !!raw?.isError,
+    };
+  });
+  return { actions, cellId: decoded.cellId || null };
+}
+
+function codexLiveToolResultText(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  try { return JSON.stringify(value, null, 2); } catch { return String(value); }
+}
+
+function buildCodexLiveCanonicalResultMessage(state, record, pending, decoded, sessionId) {
+  const content = pending.projected.map((projected, index) => {
+    const result = decoded.actions[index] || {};
+    return {
+      type: 'tool_result',
+      tool_use_id: projected.id,
+      content: codexLiveToolResultText(result.result),
+      is_error: !!result.isError,
+    };
+  });
+  if (content.length === 0) return null;
+  const uuid = codexLiveUuid(state, record, 'tool-result');
+  return {
+    type: 'user',
+    uuid,
+    sessionId,
+    message: { role: 'user', content },
+  };
 }
 
 function buildCodexLiveRawMessage(state, record) {
@@ -19213,7 +19483,42 @@ function buildCodexLiveRawMessage(state, record) {
 
   if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
     const callId = payload.call_id || payload.id || codexLiveUuid(state, record, 'tool');
+    const call = {
+      toolName: payload.name || payload.tool_name || payload.type || 'tool',
+      namespace: payload.namespace || '',
+      args: parseCodexLiveArgs(payload),
+    };
+    const projection = codexLiveProjectionState(state);
+    const waitCellId = call.toolName === 'wait' ? String(call.args?.cell_id || '') : '';
+    if (waitCellId && projection.cells.has(waitCellId)) {
+      projection.calls.set(callId, { kind: 'wait', cellId: waitCellId });
+      console.log('[CodexTurn:ToolProjection]' +
+        ' tab=' + String(state.tabId).slice(-12) +
+        ' raw=wait action=join-cell cell=' + waitCellId);
+      return null;
+    }
+
+    const decoded = decodeCodexLiveToolActions(call, undefined, false);
+    const projected = decoded.actions.map((action, index) => ({
+      id: `${callId}:canonical:${index}`,
+      toolName: action.toolName,
+      args: action.args,
+    }));
+    if (projected.length === 0) {
+      console.warn('[CodexTurn:ToolProjection]' +
+        ' tab=' + String(state.tabId).slice(-12) +
+        ' raw=' + call.toolName +
+        ' action=decode-empty source=canonical-history');
+      return null;
+    }
+    projection.calls.set(callId, { kind: 'call', call, projected });
     const uuid = codexLiveUuid(state, record, 'tool');
+    console.log('[CodexTurn:ToolProjection]' +
+      ' tab=' + String(state.tabId).slice(-12) +
+      ' raw=' + call.toolName +
+      ' action=emit-live' +
+      ' projected=' + projected.map((item) => item.toolName).join(',') +
+      ' source=canonical-history');
     return {
       type: 'assistant',
       uuid,
@@ -19221,12 +19526,12 @@ function buildCodexLiveRawMessage(state, record) {
       message: {
         id: uuid,
         role: 'assistant',
-        content: [{
+        content: projected.map((item) => ({
           type: 'tool_use',
-          id: callId,
-          name: payload.name || payload.tool_name || payload.type || 'tool',
-          input: parseCodexLiveArgs(payload),
-        }],
+          id: item.id,
+          name: item.toolName,
+          input: item.args,
+        })),
       },
     };
   }
@@ -19234,24 +19539,41 @@ function buildCodexLiveRawMessage(state, record) {
   if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
     const callId = payload.call_id || payload.id;
     if (!callId) return null;
-    const output = typeof payload.output === 'string'
-      ? payload.output
-      : payload.output != null ? JSON.stringify(payload.output, null, 2) : '';
-    const uuid = codexLiveUuid(state, record, 'tool-result');
-    return {
-      type: 'user',
-      uuid,
-      sessionId,
-      message: {
-        role: 'user',
-        content: [{
-          type: 'tool_result',
-          tool_use_id: callId,
-          content: output,
-          is_error: !!payload.is_error,
-        }],
-      },
-    };
+    const projection = codexLiveProjectionState(state);
+    const pending = projection.calls.get(callId);
+    projection.calls.delete(callId);
+    if (!pending) {
+      console.warn('[CodexTurn:ToolProjection]' +
+        ' tab=' + String(state.tabId).slice(-12) +
+        ' action=result-missing-call call=' + String(callId).slice(-18));
+      return null;
+    }
+
+    const original = pending.kind === 'wait'
+      ? projection.cells.get(pending.cellId)
+      : pending;
+    if (!original?.call || !Array.isArray(original.projected)) return null;
+    const decoded = decodeCodexLiveToolActions(original.call, payload.output, !!payload.is_error);
+    if (decoded.cellId) {
+      if (pending.kind === 'wait' && pending.cellId !== decoded.cellId) {
+        projection.cells.delete(pending.cellId);
+      }
+      projection.cells.set(decoded.cellId, original);
+      console.log('[CodexTurn:ToolProjection]' +
+        ' tab=' + String(state.tabId).slice(-12) +
+        ' raw=' + original.call.toolName +
+        ' action=background cell=' + decoded.cellId +
+        ' projected=' + original.projected.map((item) => item.toolName).join(','));
+      return null;
+    }
+    if (pending.kind === 'wait') projection.cells.delete(pending.cellId);
+    console.log('[CodexTurn:ToolProjection]' +
+      ' tab=' + String(state.tabId).slice(-12) +
+      ' raw=' + original.call.toolName +
+      ' action=complete-live' +
+      ' projected=' + original.projected.map((item) => item.toolName).join(',') +
+      ' source=canonical-history');
+    return buildCodexLiveCanonicalResultMessage(state, record, original, decoded, sessionId);
   }
 
   return null;
@@ -19570,6 +19892,10 @@ function processCodexTurnText(state, text) {
 async function scanCodexTurnAppend(tabId, reason = 'scan') {
   const state = codexTurnWatchers.get(tabId);
   if (!state) return;
+  // During `codex fork`, file growth is the source transcript being copied,
+  // not live activity in this tab. Activation moves offset to the then-current
+  // EOF as soon as the PTY shows the real composer.
+  if (state.deferredUntilComposer) return;
   if (state.scanning) {
     state.needsScan = true;
     return;
@@ -19620,7 +19946,15 @@ async function scanCodexTurnAppend(tabId, reason = 'scan') {
   }
 }
 
-function startCodexTurnWatcher({ tabId, sessionId, filePath, catchUpPendingAudit = false, suppressBusyCatchUp = false, catchUpReason = 'start' }) {
+function startCodexTurnWatcher({
+  tabId,
+  sessionId,
+  filePath,
+  catchUpPendingAudit = false,
+  suppressBusyCatchUp = false,
+  catchUpReason = 'start',
+  deferUntilComposer = false,
+}) {
   if (!tabId || !sessionId || !filePath) return false;
   const existing = codexTurnWatchers.get(tabId);
   if (existing?.sessionId === sessionId && existing?.filePath === filePath) return true;
@@ -19650,6 +19984,9 @@ function startCodexTurnWatcher({ tabId, sessionId, filePath, catchUpPendingAudit
     needsScan: false,
     watcher: null,
     interval: null,
+    deferredUntilComposer: !!deferUntilComposer,
+    deferredAt: deferUntilComposer ? Date.now() : null,
+    deferredInitialOffset: deferUntilComposer ? fileSize : null,
   };
   codexTurnWatchers.set(tabId, state);
   try {
@@ -19658,8 +19995,12 @@ function startCodexTurnWatcher({ tabId, sessionId, filePath, catchUpPendingAudit
     console.warn('[CodexTurn] fs.watch failed tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' error=' + e.message);
   }
   state.interval = setInterval(() => scanCodexTurnAppend(tabId, 'scan'), CODEX_WATCHER_SCAN_MS);
-  console.log('[CodexTurn] watcher started tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' file=' + filePath + ' offset=' + offset + ' fileSize=' + fileSize + ' catchUpPendingAudit=' + !!catchUpPendingAudit + ' suppressBusyCatchUp=' + !!suppressBusyCatchUp);
-  if (offset === 0 && fileSize > 0 && catchUpPendingAudit && pendingCodexPasteAudit.has(tabId)) {
+  console.log('[CodexTurn] watcher started tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' file=' + filePath + ' offset=' + offset + ' fileSize=' + fileSize + ' catchUpPendingAudit=' + !!catchUpPendingAudit + ' suppressBusyCatchUp=' + !!suppressBusyCatchUp + ' deferredUntilComposer=' + !!deferUntilComposer);
+  if (deferUntilComposer) {
+    console.log('[CodexTurn] fork history barrier armed tab=' + String(tabId).slice(-12)
+      + ' session=' + sessionId
+      + ' initialOffset=' + fileSize);
+  } else if (offset === 0 && fileSize > 0 && catchUpPendingAudit && pendingCodexPasteAudit.has(tabId)) {
     setImmediate(() => scanCodexTurnAppend(tabId, 'pending-audit-catchup'));
   } else {
     catchUpCodexTurnState(tabId, filePath, offset, {
@@ -19667,6 +20008,42 @@ function startCodexTurnWatcher({ tabId, sessionId, filePath, catchUpPendingAudit
       reason: catchUpReason,
     });
   }
+  return true;
+}
+
+function activateDeferredCodexTurnWatcher(tabId, reason = 'composer-ready') {
+  const state = codexTurnWatchers.get(tabId);
+  if (!state?.deferredUntilComposer) return false;
+
+  let fileSize;
+  try {
+    fileSize = fs.statSync(state.filePath).size;
+  } catch (e) {
+    console.warn('[CodexTurn] fork history barrier activation failed tab=' + String(tabId).slice(-12)
+      + ' session=' + (state.sessionId || 'unknown')
+      + ' reason=' + reason
+      + ' error=' + (e?.message || String(e)));
+    return false;
+  }
+
+  const initialOffset = Number.isFinite(state.deferredInitialOffset)
+    ? state.deferredInitialOffset
+    : state.offset;
+  const deferredAt = state.deferredAt;
+  state.offset = fileSize;
+  state.partial = '';
+  state.needsScan = false;
+  state.deferredUntilComposer = false;
+  state.deferredAt = null;
+  state.deferredInitialOffset = null;
+  console.log('[CodexTurn] fork history barrier released tab=' + String(tabId).slice(-12)
+    + ' session=' + (state.sessionId || 'unknown')
+    + ' reason=' + reason
+    + ' liveOffset=' + fileSize
+    + ' copiedBytesIgnored=' + Math.max(0, fileSize - initialOffset)
+    + ' deferredMs=' + (deferredAt ? Date.now() - deferredAt : 0));
+  codexForkComposerSeenTabs.delete(tabId);
+  void scanCodexTurnAppend(tabId, 'fork-barrier-release');
   return true;
 }
 
@@ -19797,7 +20174,22 @@ function startCodexSessionWatcher(sender, { tabId, cwd, startedAt, sourceSession
         found = true;
         console.log('[Codex Watcher] session detected:', hit.sessionId, 'tab:', tabId, 'reason:', reason, 'file:', hit.filePath, 'cwd:', hit.cwd || 'n/a', 'cwdMatched:', !!hit.cwdMatched, 'sourceMatched:', !!hit.sourceMatched, 'source:', sourceSessionId || 'n/a', 'threadSource:', hit.threadSource || 'n/a', 'parent:', hit.parentThreadId || 'n/a', 'forkedFrom:', hit.forkedFromId || 'n/a', 'originator:', hit.originator || 'n/a', 'excludeCount:', excludeSessionIds.length);
         setCodexKnownSession(tabId, hit.sessionId, sourceSessionId ? 'watcher-detected-linked' : 'watcher-detected');
-        startCodexTurnWatcher({ tabId, sessionId: hit.sessionId, filePath: hit.filePath, catchUpPendingAudit: true });
+        const forkComposerAlreadySeen = !!sourceSessionId && (
+          codexForkComposerSeenTabs.has(tabId)
+          || codexTuiReadyTabs.has(tabId)
+        );
+        const deferCopiedForkHistory = !!sourceSessionId
+          && !pendingCodexPasteAudit.has(tabId);
+        startCodexTurnWatcher({
+          tabId,
+          sessionId: hit.sessionId,
+          filePath: hit.filePath,
+          catchUpPendingAudit: true,
+          deferUntilComposer: deferCopiedForkHistory,
+        });
+        if (deferCopiedForkHistory && forkComposerAlreadySeen) {
+          activateDeferredCodexTurnWatcher(tabId, 'session-detected-after-composer');
+        }
         sender.send('codex:session-detected', { tabId, sessionId: hit.sessionId, cwd: hit.cwd || null });
         closeCodexWatcher(tabId, 'detected');
       } else if (detectCount <= 3 || detectCount % 10 === 0) {

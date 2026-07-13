@@ -20,20 +20,18 @@ VSCode-style полоса по всей нижней границе окна (п
 
 | Элемент | Назначение | Persistence |
 |---|---|---|
-| `Model: <value>` chip + popup | Default Claude model для будущих Claude PTY-сессий (`none / default / sonnet / opus / haiku` + модели из настроек) | SQLite `app:setState(defaultClaudeModel)` + localStorage boot mirror |
-| `Effort: <value>` chip + popup | Default Claude effort для будущих сессий (`none / low / med / high / xhi / max / ultra`) | SQLite `app:setState(defaultClaudeEffort)` + localStorage boot mirror |
-| `Codex: <value>` chip + popup | Default Codex model для будущих Codex CLI-запусков (`none` + live список из `codex debug models`) | SQLite `app:setState(defaultCodexModel)` + localStorage boot mirror |
-| `Effort: <value>` chip + popup | Default Codex reasoning effort для будущих Codex CLI-запусков (`none / low / med / high / xhi` с учётом выбранной модели) | SQLite `app:setState(defaultCodexEffort)` + localStorage boot mirror |
+| Компактный Claude chip + popup | Default Claude model и effort для будущих Claude PTY-сессий (`none / default / sonnet / opus / haiku`, `none / low / med / high / xhi / max / ultra`) | SQLite `app:setState(defaultClaudeModel/defaultClaudeEffort)` + localStorage boot mirror |
+| Компактный Codex chip + popup | Default Codex model и reasoning effort для будущих Codex CLI-запусков (`none` + live список из `codex debug models`, effort с учётом выбранной модели) | SQLite `app:setState(defaultCodexModel/defaultCodexEffort)` + localStorage boot mirror |
 | `● kill dev-ports` toggle | Перед каждым запуском npm-скрипта убивать занятые порты проекта | SQLite `app:setState(freePortsBeforeStart)` + localStorage boot mirror |
 | `● bridges` toggle | Подсвечивать невидимые hover-мосты красным (через `HoverBridgeDebug`) | SQLite `app:setState(debugHoverBridges)` + localStorage boot mirror |
 | `! N` оранжевый chip | Счётчик невалидных файловых путей в AI-промптах (рендерится только если N > 0) | derived, не persist |
-| `H` / `T` pin split | `History pin` (`Cmd+\`) и `Timeline pin` (`Cmd+]`) независимо выбирают overlay vs reserved layout для двух разных правых поверхностей | SQLite `app:setState(historyPinned/timelinePinned)` + localStorage boot mirror |
+| `H` / `T` pin split | `History pin` (`Cmd+]` / `Option+]`) и `Timeline pin` (`Cmd+\` / `Option+\`) независимо выбирают overlay vs reserved layout для двух разных правых поверхностей | SQLite `app:setState(historyPinned/timelinePinned)` + localStorage boot mirror |
 | `● freeze tooltips` toggle | Cmd-popup'ы Timeline (tooltip / note / fork) не закрываются по Cmd-release / mouseleave — для инспекции DOM в DevTools | SQLite `app:setState(freezeCmdPopups)` + localStorage boot mirror |
 | `⚙` Settings button | Открывает `SettingsModal` | — |
 
 **Чип лимитов Claude — не здесь.** Weekly% Anthropic подписки и per-tab token-cost живут в [`ProjectToolbar`](../../src/renderer/components/Workspace/ProjectToolbar.tsx), не в StatusBar. Причина: chip session-aware (читает `getEffectiveTabId` и активный проект), а status bar — глобальные toggle'ы без привязки к табу. См. [`fact-claude-usage-chip.md`](fact-claude-usage-chip.md).
 
-**History/Timeline pin split.** Раньше один pin смешивал две разные поверхности: HistoryPanel (`Cmd+\`) и expanded Timeline (`Cmd+]`). Это разные жесты и разные layout-риски: пользователь может хотеть держать History обычной колонкой, но Timeline оставлять overlay поверх терминала для быстрого скана, или наоборот. Поэтому StatusBar показывает две соседние половины с независимым active state. Legacy migration для `historyPinned` читает старое combined `timelinePinned`, чтобы существующим пользователям не сломать привычную pinned-историю после обновления; дальше значения живут отдельно.
+**History/Timeline pin split.** Раньше один pin смешивал две разные поверхности: HistoryPanel (`Cmd+]` / `Option+]`) и expanded Timeline (`Cmd+\` / `Option+\`). Это разные жесты и разные layout-риски: пользователь может хотеть держать History обычной колонкой, но Timeline оставлять overlay поверх терминала для быстрого скана, или наоборот. Поэтому StatusBar показывает две соседние половины с независимым active state. Legacy migration для `historyPinned` читает старое combined `timelinePinned`, чтобы существующим пользователям не сломать привычную pinned-историю после обновления; дальше значения живут отдельно.
 
 Для Timeline pin есть отдельный event-boundary: wrapper `H/T` имеет `data-history-timeline-pin-toggle`, и Workspace outside-click handler expanded Timeline его пропускает. Иначе клик по `T` сначала свернул бы unpinned overlay на `mousedown`, а `click` уже закреплял бы пустое состояние; пользователь не мог бы превратить «просто открыт» в pinned layout одним жестом. См. [`fact-timeline.md::Expanded mode`](fact-timeline.md).
 
@@ -45,7 +43,7 @@ VSCode-style полоса по всей нижней границе окна (п
 
 ## Model/Effort selector: tri-mode trigger
 
-Chip-trigger в status bar открывает popup тремя путями. Model и Effort используют один interaction pattern: StatusBar хранит **global default для будущих запусков**, а не пытается быть per-tab индикатором текущей живой сессии. Для Claude это future TUI startup chain, для Codex - future CLI launch args.
+Chip-trigger в status bar открывает popup тремя путями. В свёрнутом chip остаются иконка движка, модель и effort: текст `Claude`/`Codex` и дублирующая шестерёнка намеренно убраны, но полные подписи остаются внутри раскрытия. Model и Effort используют один interaction pattern: StatusBar хранит **global default для будущих запусков**, а не пытается быть per-tab индикатором текущей живой сессии. Для Claude это future TUI startup chain, для Codex - future CLI launch args.
 
 | Trigger | Состояние | Закрытие |
 |---|---|---|
@@ -56,9 +54,9 @@ Chip-trigger в status bar открывает popup тремя путями. Mod
 Реализовано через `useCmdKey` + три hover-флага (`chipHover`, `popupHover`, `clicked`). Внешний клик закрывает только pinned-state. Внутри `useEffect` с document-`mousemove` пересчитывает hover-флаги по координатам — это нужно для CSS-bridge'а между chip и popup'ом (4px gap снизу popup'а до верха chip'а, см. ниже).
 
 **Геометрия popup'а.**
-- Раскрывается **вверх** (status bar внизу, popup растёт от него к экрану): `bottom: window.innerHeight - chipRect.top`.
-- **Right-anchor**: `right: window.innerWidth - chipRect.right`. Не left-anchor — иначе popup уходит вправо за Timeline-strip и обрезается. См. [`methodology/сценарии-багов-design.md::1.1 Popup уезжает за правый/нижний край`](../methodology/сценарии-багов-design.md).
-- CSS-bridge через `paddingBottom: 4` ВНУТРИ popup-wrapper'а — gap от popup до chip покрыт hit-area'ой popup'а, курсор может ехать через эти 4px не теряя hover. Wrapper вплотную к chip'у (`bottom: window.innerHeight - chipRect.top`, **без** offset'а).
+- Раскрывается **вверх** от верхней границы chip.
+- Ширина берётся из фактической карточки, затем popup центрируется над chip и clamp'ится к доступной части окна. Timeline ограничивает правую границу только когда реально расположен справа от конкретного chip; фиксированный right-anchor нельзя возвращать — он создавал заметный сдвиг влево.
+- CSS-bridge через `paddingBottom: 4` ВНУТРИ popup-wrapper'а — gap от popup до chip покрыт hit-area'ой popup'а, курсор может ехать через эти 4px не теряя hover. Wrapper вплотную к chip'у.
 
 **Claude runtime defaults применяются через ранний `tui-ready`.** Селектор сохраняет global default, а при запуске Claude `Terminal.tsx` ждёт детерминированный prompt-сигнал. Если `defaultClaudeModel !== 'none'`, сначала отправляется `/model <model>`; только после `claude:bridge-update`, где bridge-модель совпала с целью, цепочка продолжает `/effort <level>`. Bridge/process-started остаётся fallback'ом, но не главным trigger'ом: bridge может прийти на 3-6 секунд позже prompt'а и создать дубль. Полная таблица resume/fresh поведения — `fact-claude-tui-control.md::Startup defaults /model + /effort при запуске Claude`.
 

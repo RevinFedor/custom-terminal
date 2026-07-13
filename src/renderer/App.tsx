@@ -4405,7 +4405,7 @@ function App() {
         {/* Workspace — ALWAYS mounted, hidden via CSS to preserve xterm.js instances */}
         {/* visibility:hidden keeps container dimensions (prevents xterm 0x0 collapse) */}
         <div
-          className="flex-1 flex flex-col"
+          className="flex-1 flex flex-col min-h-0"
           style={{
             visibility: view === 'workspace' ? 'visible' : 'hidden',
             position: view === 'workspace' ? 'relative' : 'absolute',

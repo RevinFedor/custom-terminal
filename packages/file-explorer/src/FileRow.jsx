@@ -5,12 +5,17 @@ import { preventUnhandled } from '@atlaskit/pragmatic-drag-and-drop/prevent-unha
 import { attachClosestEdge, extractClosestEdge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
 import FileIcon from './FileIcon';
 
-const DRAG_FOLDER_AUTO_EXPAND_MS = 500;
 const VISUAL_PARENT_STEP_PX = 28;
 const VISUAL_ICON_CENTER_OFFSET_PX = 26;
 const VISUAL_ICON_HALF_PX = 8;
 const VISUAL_CONNECTOR_ICON_GAP_PX = 4;
 const VISUAL_ELBOW_END_OFFSET_PX = VISUAL_ICON_CENTER_OFFSET_PX - VISUAL_ICON_HALF_PX - VISUAL_CONNECTOR_ICON_GAP_PX;
+const NESTED_CONTROL_SELECTOR = '[data-no-card-drag],button,input,textarea,select,a';
+let treeDragTokenSequence = 0;
+
+const nextTreeDragToken = () => `${Date.now().toString(36)}-${(treeDragTokenSequence += 1).toString(36)}`;
+
+const isNestedRowControl = (target) => !!target?.closest?.(NESTED_CONTROL_SELECTOR);
 
 const FileRow = memo(({
   node,
@@ -21,6 +26,7 @@ const FileRow = memo(({
   isSelected,
   isEditing,
   isOverFolder,
+  springOpenState,
   isInsideOverFolder,
   onCommitRename,
   onCancelRename,
@@ -49,6 +55,7 @@ const FileRow = memo(({
   dragSourceMeta = null,
   verticalLimitHint = null,
   isGlobalDragging = false,
+  suppressDropTargets = false,
   isDropConfirmed = false,
   IndexButtonComponent = null,
   onOpenProjectFile
@@ -58,7 +65,6 @@ const FileRow = memo(({
   const [isDragging, setIsDragging] = useState(false);
   const [isOver, setIsOver] = useState(false);
   const [closestEdge, setClosestEdge] = useState(null);
-  const autoExpandTimerRef = useRef(null);
 
   useEffect(() => {
     if (isEditing && inputRef.current) {
@@ -84,11 +90,7 @@ const FileRow = memo(({
     setIsOver(false);
     setClosestEdge(null);
     if (!isGlobalDragging) setIsDragging(false);
-    if (autoExpandTimerRef.current) {
-      clearTimeout(autoExpandTimerRef.current);
-      autoExpandTimerRef.current = null;
-    }
-  }, [isGlobalDragging]);
+  }, [isGlobalDragging, suppressDropTargets]);
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter') {
@@ -121,9 +123,15 @@ const FileRow = memo(({
     // tree monitor.
     const cleanupDraggable = draggable({
       element: el,
-      canDrag: () => !isEditing,
+      canDrag: ({ input }) => {
+        if (isEditing) return false;
+        // Pragmatic exposes the initial pointer coordinates, but not the DOM target.
+        const inputTarget = document.elementFromPoint(input.clientX, input.clientY);
+        return !isNestedRowControl(inputTarget);
+      },
       getInitialData: () => ({
         type: 'TREE_NODE',
+        dragToken: nextTreeDragToken(),
         fileId: node.id,
         isDirectory: node.isDirectory,
         isLink: !!node.isLink,
@@ -154,63 +162,39 @@ const FileRow = memo(({
         return source.data.type === 'TREE_NODE';
       },
       onDragEnter: ({ source, self }) => {
-        if (source.data.type === 'TREE_NODE' && isGlobalDragging) return;
+        if (source.data.type === 'TREE_NODE' && (isGlobalDragging || suppressDropTargets)) return;
         setIsOver(true);
         const edge = extractClosestEdge(self.data);
         console.log('[dnd]',`[Enter] ${node.name} | isDirectory: ${node.isDirectory} | edge: ${edge || 'center'}`);
         
-        // Auto-expand folder logic
-        if (node.isDirectory && !isExpanded && source.data.type === 'TREE_NODE') {
-            console.log('[dnd]',`[AutoExpand] Timer started for ${node.name} delay=${DRAG_FOLDER_AUTO_EXPAND_MS}ms`);
-            autoExpandTimerRef.current = setTimeout(() => {
-                console.log('[dnd]',`[AutoExpand] Triggering expand for ${node.name}`);
-                onToggle(node.id);
-            }, DRAG_FOLDER_AUTO_EXPAND_MS);
-        }
       },
       onDrag: ({ source, self }) => {
-        if (source.data.type === 'TREE_NODE' && isGlobalDragging) return;
+        if (source.data.type === 'TREE_NODE' && (isGlobalDragging || suppressDropTargets)) return;
         const edge = extractClosestEdge(self.data);
         if (edge !== closestEdge) {
             setClosestEdge(edge);
         }
       },
       onDragLeave: () => {
-        if (isGlobalDragging) {
+        if (isGlobalDragging || suppressDropTargets) {
           setIsOver(false);
           setClosestEdge(null);
-          if (autoExpandTimerRef.current) {
-              clearTimeout(autoExpandTimerRef.current);
-              autoExpandTimerRef.current = null;
-          }
           return;
         }
         console.log('[dnd]',`[Leave] ${node.name}`);
         setIsOver(false);
         setClosestEdge(null);
-        if (autoExpandTimerRef.current) {
-            clearTimeout(autoExpandTimerRef.current);
-            autoExpandTimerRef.current = null;
-        }
       },
       onDrop: ({ self, source }) => {
-        if (source.data.type === 'TREE_NODE' && isGlobalDragging) {
+        if (source.data.type === 'TREE_NODE' && (isGlobalDragging || suppressDropTargets)) {
           setIsOver(false);
           setClosestEdge(null);
-          if (autoExpandTimerRef.current) {
-              clearTimeout(autoExpandTimerRef.current);
-              autoExpandTimerRef.current = null;
-          }
           return;
         }
         const edge = extractClosestEdge(self.data);
         console.log('[dnd]',`[Drop] ON ${node.name} | FROM ${source.data.fileId} | EDGE: ${edge || 'center'}`);
         setIsOver(false);
         setClosestEdge(null);
-        if (autoExpandTimerRef.current) {
-            clearTimeout(autoExpandTimerRef.current);
-            autoExpandTimerRef.current = null;
-        }
       },
       // Disable stickiness to ensure precise "dead zone" detection
       // Sticky edges cause the line to persist even when we are in the middle "Drop Into" zone
@@ -239,10 +223,9 @@ const FileRow = memo(({
     return () => {
       cleanupDraggable();
       cleanupDropTarget();
-      if (autoExpandTimerRef.current) clearTimeout(autoExpandTimerRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [node.id, node.isDirectory, node.parentId, node.isLink, isExpanded, onToggle, isOverFolder, multiSelected, isEditing, isGlobalDragging]);
+  }, [node.id, node.isDirectory, node.parentId, node.isLink, isExpanded, onToggle, isOverFolder, multiSelected, isEditing, isGlobalDragging, suppressDropTargets]);
 
   const handleToggle = (e) => {
     if (e.button !== 0) return; // Only left click
@@ -254,6 +237,10 @@ const FileRow = memo(({
 
   const handleClick = (e) => {
     if (e.button !== 0) return; // Only left click
+    if (isNestedRowControl(e.target)) {
+      e.stopPropagation();
+      return;
+    }
     e.stopPropagation();
     // Stale link → original is gone. Don't try to open it (would 404); the
     // user removes & re-adds. Row stays selectable for the RMB Delete though.
@@ -270,6 +257,7 @@ const FileRow = memo(({
 
   const handleDoubleClick = (e) => {
     e.stopPropagation();
+    if (isNestedRowControl(e.target)) return;
     // Finder-style: double-click on a row → start rename (works for files AND folders).
     if (onStartRename) onStartRename(node);
   };
@@ -443,8 +431,16 @@ const FileRow = memo(({
         />
       ))}
 
-      <span className="arborist-chevron" onPointerDown={handleToggle}>
-         {node.isDirectory && (
+      {node.isDirectory ? (
+        <button
+          type="button"
+          className="arborist-chevron"
+          data-no-card-drag
+          aria-label={`${isExpanded ? 'Collapse' : 'Expand'} ${node.name}`}
+          aria-expanded={isExpanded}
+          onClick={handleToggle}
+          onDoubleClick={(event) => event.stopPropagation()}
+        >
           <svg 
             width="12" 
             height="12" 
@@ -457,8 +453,10 @@ const FileRow = memo(({
           >
             <path d="M6 12.796V3.204L11.481 8 6 12.796zm.659.753 5.48-4.796a1 1 0 0 0 0-1.506L6.66 2.451C6.011 1.885 5 2.345 5 3.204v9.592a1 1 0 0 0 1.659.753z"/>
           </svg>
-        )}
-      </span>
+        </button>
+      ) : (
+        <span className="arborist-chevron" aria-hidden="true" />
+      )}
       
       <span className="arborist-icon">
         <FileIcon
@@ -470,6 +468,18 @@ const FileRow = memo(({
           settings={settings}
         />
       </span>
+      {node.isDirectory && (
+        <span
+          className={`file-row-spring-open is-${springOpenState?.phase || 'idle'}`}
+          data-spring-open-phase={springOpenState?.phase || undefined}
+          aria-hidden="true"
+        >
+          <svg viewBox="0 0 16 16" focusable="false">
+            <circle className="file-row-spring-open-track" cx="8" cy="8" r="5.5" />
+            <circle className="file-row-spring-open-progress" cx="8" cy="8" r="5.5" />
+          </svg>
+        </span>
+      )}
       
       {isEditing ? (
           <input

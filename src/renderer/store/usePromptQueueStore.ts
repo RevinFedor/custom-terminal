@@ -17,6 +17,7 @@ const APP_STATE_KEY_QUEUE = 'promptQueueByTab';
 // drag-reorder without losing the last value on unmount.
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let hasHydratedPromptQueueStore = false;
+let hydratePromptQueuePromise: Promise<void> | null = null;
 
 function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText' | 'runAfterTabId' | 'panelCollapsed' | 'previewId'>> {
   const out: Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText' | 'runAfterTabId' | 'panelCollapsed' | 'previewId'>> = {};
@@ -122,9 +123,15 @@ export type QueuedPrompt = {
   createdAt: number;
 };
 
+const VALID_IMAGE_MARKER_SOURCE = String.raw`(?<!\\)\[Image\s+#?(\d+)\]`;
+
+function createValidImageMarkerRegex(): RegExp {
+  return new RegExp(VALID_IMAGE_MARKER_SOURCE, 'gi');
+}
+
 function collectClaudeImageRefIds(text: string): Set<number> {
   const ids = new Set<number>();
-  const re = /\[Image\s+#?(\d+)\]/gi;
+  const re = createValidImageMarkerRegex();
   let match: RegExpExecArray | null;
   while ((match = re.exec(text)) !== null) {
     const id = Number(match[1]);
@@ -133,8 +140,50 @@ function collectClaudeImageRefIds(text: string): Set<number> {
   return ids;
 }
 
+export type QueuedImageMarkerRange = {
+  start: number;
+  end: number;
+  id: number;
+};
+
+export function getQueuedImageMarkerHighlightRanges(
+  text: string,
+  imagePaths?: QueuedImageRef[],
+): QueuedImageMarkerRange[] {
+  const refsById = new Map((imagePaths || []).map((ref) => [Number(ref.id), ref]));
+  const ranges: QueuedImageMarkerRange[] = [];
+  const re = createValidImageMarkerRegex();
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const id = Number(match[1]);
+    const ref = refsById.get(id);
+    if (!ref?.path || ref.availability === 'missing') continue;
+    ranges.push({ start: match.index, end: match.index + match[0].length, id });
+  }
+  return ranges;
+}
+
+export function hasMalformedQueuedImageMarker(
+  text: string,
+  imagePaths?: QueuedImageRef[],
+): boolean {
+  const refs = imagePaths || [];
+  const knownIds = new Set(refs.map((ref) => Number(ref.id)));
+  const validIds = collectClaudeImageRefIds(text);
+  if (Array.from(validIds).some((id) => !knownIds.has(id))) return true;
+
+  const withoutValidMarkers = text.replace(createValidImageMarkerRegex(), '');
+  if (/\[\s*Image\b/i.test(withoutValidMarkers)) return true;
+  if (/(?:^|[^\[])\bImage\s+#?\d+\s*\]/i.test(withoutValidMarkers)) return true;
+  return refs.some((ref) => {
+    if (validIds.has(Number(ref.id))) return false;
+    return new RegExp(String.raw`\bImage\s+#?${Number(ref.id)}\b`, 'i').test(withoutValidMarkers);
+  });
+}
+
 function retainImagePathsForText(text: string, imagePaths?: QueuedImageRef[]): QueuedImageRef[] | undefined {
   if (!imagePaths || imagePaths.length === 0) return undefined;
+  if (hasMalformedQueuedImageMarker(text, imagePaths)) return imagePaths;
   const ids = collectClaudeImageRefIds(text);
   if (ids.size === 0) return undefined;
   const retained = imagePaths.filter((ref) => ids.has(ref.id));
@@ -194,7 +243,7 @@ export function buildQueuedPromptPayload(item: Pick<QueuedPrompt, 'text' | 'imag
       return `[imageError: queued_image_path_unavailable #${rawId}]`;
     }
     return `[imagePath: ${resolved.path}]`;
-  });
+  }).replace(/\[Image\s*\]/gi, '[imageError: queued_image_path_unavailable #unknown]');
 }
 
 export function getQueuedPromptAttachmentState(
@@ -203,6 +252,8 @@ export function getQueuedPromptAttachmentState(
   if (item.attachmentState === 'materializing') return 'materializing';
   if (item.attachmentState === 'missing') return 'missing';
   if (item.images > 0 && /\[imageError:\s*[^\]\r\n]+\]/i.test(item.text)) return 'missing';
+  if (hasMalformedQueuedImageMarker(item.text, item.imagePaths)) return 'missing';
+  if (/\[Image\s*\]/i.test(item.text)) return 'missing';
   const ids = collectClaudeImageRefIds(item.text);
   if (ids.size === 0) return 'ready';
   const byId = new Map((item.imagePaths || []).map((ref) => [Number(ref.id), ref]));
@@ -398,6 +449,96 @@ const EMPTY: TabQueue = {
   runAfterTabId: null,
 };
 
+type PreHydrateQueueField =
+  | 'items'
+  | 'autoRun'
+  | 'stopAfter'
+  | 'closeAfter'
+  | 'firstDelaySeconds'
+  | 'postPromptEnabled'
+  | 'postPromptText'
+  | 'runAfterTabId'
+  | 'panelCollapsed'
+  | 'previewId'
+  | 'deleted';
+
+const preHydrateQueueChanges = new Map<string, Set<PreHydrateQueueField>>();
+
+function trackPreHydrateQueueChanges(before: Map<string, TabQueue>, after: Map<string, TabQueue>): void {
+  if (hasHydratedPromptQueueStore) return;
+  const tabIds = new Set([...before.keys(), ...after.keys()]);
+  for (const tabId of tabIds) {
+    const previous = before.get(tabId);
+    const current = after.get(tabId);
+    if (previous === current) continue;
+
+    let changed = preHydrateQueueChanges.get(tabId);
+    if (!changed) {
+      changed = new Set<PreHydrateQueueField>();
+      preHydrateQueueChanges.set(tabId, changed);
+    }
+    if (!current) {
+      if (previous) {
+        changed.clear();
+        changed.add('deleted');
+      }
+      continue;
+    }
+
+    changed.delete('deleted');
+    const baseline = previous ?? EMPTY;
+    if (baseline.items !== current.items) changed.add('items');
+    if (baseline.autoRun !== current.autoRun) changed.add('autoRun');
+    if (baseline.stopAfter !== current.stopAfter) changed.add('stopAfter');
+    if (baseline.closeAfter !== current.closeAfter) changed.add('closeAfter');
+    if (baseline.firstDelaySeconds !== current.firstDelaySeconds) changed.add('firstDelaySeconds');
+    if (baseline.postPromptEnabled !== current.postPromptEnabled) changed.add('postPromptEnabled');
+    if (baseline.postPromptText !== current.postPromptText) changed.add('postPromptText');
+    if (baseline.runAfterTabId !== current.runAfterTabId) changed.add('runAfterTabId');
+    if (baseline.panelCollapsed !== current.panelCollapsed) changed.add('panelCollapsed');
+    if (baseline.previewId !== current.previewId) changed.add('previewId');
+    if (changed.size === 0) preHydrateQueueChanges.delete(tabId);
+  }
+}
+
+function mergeHydratedItems(persisted: QueuedPrompt[], current: QueuedPrompt[]): QueuedPrompt[] {
+  const currentById = new Map(current.map((item) => [item.id, item]));
+  const merged = persisted.map((item) => currentById.get(item.id) ?? item);
+  const persistedIds = new Set(persisted.map((item) => item.id));
+  for (const item of current) {
+    if (!persistedIds.has(item.id)) merged.push(item);
+  }
+  return merged;
+}
+
+function mergeHydratedQueue(
+  persisted: TabQueue,
+  current: TabQueue | undefined,
+  changed: Set<PreHydrateQueueField> | undefined,
+): TabQueue | null {
+  if (changed?.has('deleted') && !current) return null;
+  if (!current) return persisted;
+
+  const merged: TabQueue = {
+    ...persisted,
+    firstDelayCountdownAt: current.firstDelayCountdownAt,
+    firstChipHintActive: current.firstChipHintActive,
+    stopBeforeCloseArm: current.stopBeforeCloseArm,
+  };
+  if (changed?.has('items')) merged.items = mergeHydratedItems(persisted.items, current.items);
+  if (changed?.has('autoRun')) merged.autoRun = current.autoRun;
+  if (changed?.has('stopAfter')) merged.stopAfter = current.stopAfter;
+  if (changed?.has('closeAfter')) merged.closeAfter = current.closeAfter;
+  if (changed?.has('firstDelaySeconds')) merged.firstDelaySeconds = current.firstDelaySeconds;
+  if (changed?.has('postPromptEnabled')) merged.postPromptEnabled = current.postPromptEnabled;
+  if (changed?.has('postPromptText')) merged.postPromptText = current.postPromptText;
+  if (changed?.has('runAfterTabId')) merged.runAfterTabId = current.runAfterTabId;
+  if (changed?.has('panelCollapsed')) merged.panelCollapsed = current.panelCollapsed;
+  if (changed?.has('previewId')) merged.previewId = current.previewId;
+  if (merged.autoRun) merged.firstChipHintActive = false;
+  return merged;
+}
+
 let idCounter = 0;
 const nextId = () => `pq-${Date.now().toString(36)}-${(idCounter++).toString(36)}`;
 
@@ -434,7 +575,7 @@ export function serializePromptQueueCore(q: TabQueue): PromptQueueCore {
 // the same short token when entering the queue. Pasted-text-chips like
 // "[Pasted text #N +M lines]" are NOT counted here — those are full-text
 // expansions the editor view exposes verbatim.
-const IMAGE_RE = /\[Image(?:\s+#?\d+)?\]/gi;
+const IMAGE_RE = /(?<!\\)\[Image(?:\s+#?\d+)?\]/gi;
 const IMAGE_PATH_RE = /\[imagePath:\s*([^\]\r\n]+?)\s*\]/gi;
 function countImages(text: string): number {
   return (text.match(IMAGE_RE) || []).length;
@@ -442,6 +583,16 @@ function countImages(text: string): number {
 
 export function countPromptCharacters(text: string): number {
   return Array.from(text).length;
+}
+
+export const SHORT_GRAB_TITLE_CHARACTER_LIMIT = 25;
+
+export function getShortGrabPromptTitle(text: string): string | null {
+  const normalized = text.trim();
+  if (!normalized || countPromptCharacters(normalized) >= SHORT_GRAB_TITLE_CHARACTER_LIMIT) {
+    return null;
+  }
+  return normalized.replace(/\s+/g, ' ');
 }
 
 export function makeDefaultPromptTitle(text: string): string {
@@ -471,6 +622,8 @@ function getInitialQueuedPromptAttachmentState(
   imagesHint = 0,
 ): QueuedPromptAttachmentState {
   if (imagesHint > 0 && /\[imageError:\s*[^\]\r\n]+\]/i.test(text)) return 'missing';
+  if (hasMalformedQueuedImageMarker(text, imagePaths)) return 'missing';
+  if (/\[Image\s*\]/i.test(text)) return 'missing';
   const ids = collectClaudeImageRefIds(text);
   if (ids.size === 0) return 'ready';
   const byId = new Map((imagePaths || []).map((ref) => [Number(ref.id), ref]));
@@ -504,6 +657,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
   const setAndPersist = (updater: (state: { queues: Map<string, TabQueue> }) => { queues: Map<string, TabQueue> }, opts?: { skipSave?: boolean }) => {
     set((state) => {
       const next = updater(state);
+      trackPreHydrateQueueChanges(state.queues, next.queues);
       if (!opts?.skipSave) scheduleSave(next.queues);
       return next;
     });
@@ -518,7 +672,12 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         const next = new Map(state.queues);
         const cur = next.get(tabId) ?? EMPTY;
         const normalized = normalizeImagePathMarkersForQueue(text, imagePaths);
-        const detectedImages = Math.max(images ?? 0, countImages(normalized.text), normalized.imagePaths?.length ?? 0);
+        const detectedImages = Math.max(
+          images ?? 0,
+          countImages(normalized.text),
+          normalized.imagePaths?.length ?? 0,
+          hasMalformedQueuedImageMarker(normalized.text, normalized.imagePaths) ? 1 : 0,
+        );
         const defaultTitle = makeDefaultPromptTitle(normalized.text);
         const normalizedTitle = typeof title === 'string' ? title.trim() : '';
         const titleManual = normalizedTitle.length > 0 && normalizedTitle !== defaultTitle;
@@ -602,6 +761,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
             ? Math.max(
                 countImages(text),
                 normalized.imagePaths?.length ?? 0,
+                hasMalformedQueuedImageMarker(text, normalized.imagePaths) ? p.images : 0,
                 p.attachmentState === 'missing' && /\[imageError:\s*[^\]\r\n]+\]/i.test(text) ? p.images : 0,
               )
             : p.images;
@@ -666,6 +826,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           const images = Math.max(
             countImages(normalized.text),
             normalized.imagePaths?.length ?? 0,
+            hasMalformedQueuedImageMarker(normalized.text, normalized.imagePaths) ? p.images : 0,
             p.attachmentState === 'missing' && /\[imageError:\s*[^\]\r\n]+\]/i.test(normalized.text) ? p.images : 0,
           );
           return {
@@ -1076,6 +1237,9 @@ export function ensureQueuedPromptImagesReady(
   const work = (async () => {
     const before = usePromptQueueStore.getState().getQueue(tabId).items.find((item) => item.id === itemId) || null;
     if (!before) return { ready: false, state: 'missing' as const, item: null };
+    if (hasMalformedQueuedImageMarker(before.text, before.imagePaths)) {
+      return { ready: false, state: 'missing' as const, item: before };
+    }
     if (collectClaudeImageRefIds(before.text).size === 0
       && !(before.images > 0 && /\[imageError:\s*[^\]\r\n]+\]/i.test(before.text))) {
       return { ready: true, state: 'ready' as const, item: before };
@@ -1119,84 +1283,141 @@ export function ensureQueuedPromptImagesReady(
   return work;
 }
 
-// Hydrate from SQLite on app boot. Called by App.tsx once at mount. Idempotent —
-// safe to call multiple times but only the first one with non-empty data wins
-// (we merge, not replace, in case a tab already added entries before hydrate
-// completed — unlikely but harmless).
-export async function hydratePromptQueueStore(): Promise<void> {
-  try {
-    const raw = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_QUEUE);
-    if (!raw) {
-      hasHydratedPromptQueueStore = true;
-      scheduleSave(usePromptQueueStore.getState().queues);
-      return;
-    }
-    // database.getAppState() already JSON.parses the stored string and returns
-    // an OBJECT (it only returns the raw string when the parse fails). So `raw`
-    // is normally an object here, not a string. Blindly JSON.parse-ing it again
-    // coerces the object to "[object Object]" and throws — which is exactly the
-    // `[PromptQueue] hydrate failed: {}` that fired on every boot, silently
-    // dropping a queue that WAS saved correctly. Accept either shape.
-    const parsed = (typeof raw === 'string' ? JSON.parse(raw) : raw) as Record<string, {
-      items?: QueuedPrompt[];
-      autoRun?: boolean;
-      stopAfter?: boolean;
-      closeAfter?: boolean;
-      firstDelaySeconds?: number;
-      postPromptEnabled?: boolean;
-      postPromptText?: string;
-      runAfterTabId?: string | null;
-      panelCollapsed?: boolean;
-      previewId?: string | null;
-    }>;
-    if (!parsed || typeof parsed !== 'object') {
-      hasHydratedPromptQueueStore = true;
-      scheduleSave(usePromptQueueStore.getState().queues);
-      return;
-    }
-    const hydratedItemsByTab = new Map<string, QueuedPrompt[]>();
-    await Promise.all(Object.entries(parsed).map(async ([tabId, entry]) => {
-      const items = Array.isArray(entry.items) ? entry.items : [];
-      hydratedItemsByTab.set(
-        tabId,
-        await Promise.all(items.map((item) => materializeQueuedPromptRecord(item))),
-      );
-    }));
-    usePromptQueueStore.setState((state) => {
-      const next = new Map(state.queues);
-      for (const [tabId, entry] of Object.entries(parsed)) {
-        if (next.has(tabId)) continue; // don't clobber an in-memory entry
-        const items = hydratedItemsByTab.get(tabId) || [];
-        const fd = typeof entry.firstDelaySeconds === 'number'
-          ? Math.max(0, Math.min(3600, Math.floor(entry.firstDelaySeconds)))
-          : 0;
-        const previewId = typeof entry.previewId === 'string' && items.some((item) => item.id === entry.previewId)
-          ? entry.previewId
-          : null;
-        next.set(tabId, {
-          items,
-          autoRun: !!entry.autoRun,
-          stopAfter: !!entry.stopAfter,
-          closeAfter: !!entry.closeAfter,
-          firstDelaySeconds: fd,
-          firstDelayCountdownAt: null, // never restore an in-flight countdown across restart
-          postPromptEnabled: !!entry.postPromptEnabled,
-          postPromptText: typeof entry.postPromptText === 'string' ? entry.postPromptText : '',
-          panelCollapsed: !!entry.panelCollapsed,
-          firstChipHintActive: false, // UI-only, never restored
-          stopBeforeCloseArm: false, // UI-only memory, never restored
-          runAfterTabId: typeof entry.runAfterTabId === 'string' ? entry.runAfterTabId : null,
-          previewId,
-        });
-      }
-      return { queues: next };
-    });
-    hasHydratedPromptQueueStore = true;
-    scheduleSave(usePromptQueueStore.getState().queues);
-  } catch (e) {
-    // Surface the real message — an Error serializes to `{}` through the
-    // renderer→file log forwarder (JSON.stringify drops non-enumerable props),
-    // which once hid this exact bug for days.
-    console.warn('[PromptQueue] hydrate failed:', e instanceof Error ? e.message : String(e));
+type PersistedTabQueue = {
+  items?: unknown[];
+  autoRun?: boolean;
+  stopAfter?: boolean;
+  closeAfter?: boolean;
+  firstDelaySeconds?: number;
+  postPromptEnabled?: boolean;
+  postPromptText?: string;
+  runAfterTabId?: string | null;
+  panelCollapsed?: boolean;
+  previewId?: string | null;
+};
+
+function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
+  if (!value || typeof value !== 'object') return null;
+  const item = value as Partial<QueuedPrompt>;
+  if (typeof item.text !== 'string') return null;
+  const imagePaths = Array.isArray(item.imagePaths)
+    ? item.imagePaths.flatMap((rawRef) => {
+        if (!rawRef || typeof rawRef !== 'object') return [];
+        const ref = rawRef as Partial<QueuedImageRef>;
+        const id = Number(ref.id);
+        if (!Number.isFinite(id) || id <= 0 || typeof ref.path !== 'string') return [];
+        const availability = ref.availability === 'missing' ? 'missing' : ref.availability === 'available' ? 'available' : undefined;
+        return [{
+          id,
+          path: ref.path,
+          assetId: typeof ref.assetId === 'string' ? ref.assetId : undefined,
+          mediaType: typeof ref.mediaType === 'string' ? ref.mediaType : mediaTypeFromPath(ref.path),
+          size: Number.isFinite(Number(ref.size)) ? Math.max(0, Number(ref.size)) : 0,
+          availability,
+          error: typeof ref.error === 'string' ? ref.error : undefined,
+        } satisfies QueuedImageRef];
+      })
+    : undefined;
+  const attachmentState = item.attachmentState === 'materializing' || item.attachmentState === 'missing' || item.attachmentState === 'ready'
+    ? item.attachmentState
+    : undefined;
+  const normalized = normalizeQueuedPrompt({
+    id: typeof item.id === 'string' && item.id ? item.id : nextId(),
+    enabled: item.enabled !== false,
+    title: typeof item.title === 'string' ? item.title : undefined,
+    titleManual: item.titleManual === true,
+    text: item.text,
+    images: Number.isFinite(Number(item.images)) ? Math.max(0, Number(item.images)) : 0,
+    imagePaths,
+    attachmentState,
+    createdAt: Number.isFinite(Number(item.createdAt)) ? Number(item.createdAt) : Date.now(),
+  });
+  if (collectClaudeImageRefIds(normalized.text).size > 0 && normalized.attachmentState !== 'missing') {
+    return { ...normalized, attachmentState: 'materializing' };
   }
+  return normalized;
+}
+
+function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
+  const items = Array.isArray(entry.items)
+    ? entry.items.map(normalizePersistedQueuedPrompt).filter((item): item is QueuedPrompt => item !== null)
+    : [];
+  const firstDelaySeconds = typeof entry.firstDelaySeconds === 'number'
+    ? Math.max(0, Math.min(3600, Math.floor(entry.firstDelaySeconds)))
+    : 0;
+  const previewId = typeof entry.previewId === 'string' && items.some((item) => item.id === entry.previewId)
+    ? entry.previewId
+    : null;
+  return {
+    items,
+    autoRun: !!entry.autoRun,
+    stopAfter: !!entry.stopAfter,
+    closeAfter: !!entry.closeAfter,
+    firstDelaySeconds,
+    firstDelayCountdownAt: null,
+    postPromptEnabled: !!entry.postPromptEnabled,
+    postPromptText: typeof entry.postPromptText === 'string' ? entry.postPromptText : '',
+    panelCollapsed: !!entry.panelCollapsed,
+    firstChipHintActive: false,
+    stopBeforeCloseArm: false,
+    runAfterTabId: typeof entry.runAfterTabId === 'string' ? entry.runAfterTabId : null,
+    previewId,
+  };
+}
+
+// Restore metadata immediately, then validate/copy image bytes in the background.
+// This keeps persisted items visible during migration and lets pre-hydrate user
+// actions merge into the saved queue instead of replacing the whole tab entry.
+export function hydratePromptQueueStore(): Promise<void> {
+  if (hasHydratedPromptQueueStore) return Promise.resolve();
+  if (hydratePromptQueuePromise) return hydratePromptQueuePromise;
+
+  hydratePromptQueuePromise = (async () => {
+    try {
+      const raw = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_QUEUE);
+      const parsedValue = !raw ? {} : (typeof raw === 'string' ? JSON.parse(raw) : raw);
+      const parsed = parsedValue && typeof parsedValue === 'object' && !Array.isArray(parsedValue)
+        ? parsedValue as Record<string, PersistedTabQueue>
+        : {};
+      const persistedQueues = new Map<string, TabQueue>();
+      for (const [tabId, entry] of Object.entries(parsed)) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+        persistedQueues.set(tabId, makeHydratedTabQueue(entry));
+      }
+
+      usePromptQueueStore.setState((state) => {
+        const next = new Map(state.queues);
+        for (const [tabId, persisted] of persistedQueues) {
+          const merged = mergeHydratedQueue(persisted, next.get(tabId), preHydrateQueueChanges.get(tabId));
+          if (merged) next.set(tabId, merged);
+          else next.delete(tabId);
+        }
+        return { queues: next };
+      });
+      hasHydratedPromptQueueStore = true;
+      preHydrateQueueChanges.clear();
+      scheduleSave(usePromptQueueStore.getState().queues);
+
+      const validationTasks: Promise<unknown>[] = [];
+      for (const [tabId, queue] of usePromptQueueStore.getState().queues) {
+        for (const item of queue.items) {
+          if (collectClaudeImageRefIds(item.text).size === 0) continue;
+          validationTasks.push(ensureQueuedPromptImagesReady(tabId, item.id));
+        }
+      }
+      await Promise.allSettled(validationTasks);
+    } catch (e) {
+      // Do not leave the store permanently read-only after one bad row or IPC
+      // failure. Existing in-memory actions remain saveable on the next mutation.
+      hasHydratedPromptQueueStore = true;
+      preHydrateQueueChanges.clear();
+      if (usePromptQueueStore.getState().queues.size > 0) {
+        scheduleSave(usePromptQueueStore.getState().queues);
+      }
+      console.warn('[PromptQueue] hydrate failed:', e instanceof Error ? e.message : String(e));
+    }
+  })().finally(() => {
+    hydratePromptQueuePromise = null;
+  });
+  return hydratePromptQueuePromise;
 }

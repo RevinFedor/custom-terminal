@@ -464,6 +464,27 @@ class DatabaseManager {
       ON timeline_outlines(updated_at DESC)
     `);
 
+    // User-requested per-turn action labels. Kept outside generated outlines so
+    // a manual correction survives regrouping and also covers singleton/new turns.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS timeline_turn_action_overrides (
+        tool_type TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        entry_uuid TEXT NOT NULL,
+        action_label TEXT NOT NULL,
+        source_hash TEXT DEFAULT NULL,
+        model TEXT DEFAULT NULL,
+        prompt_id TEXT DEFAULT NULL,
+        thinking_level TEXT DEFAULT NULL,
+        updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+        PRIMARY KEY (tool_type, session_id, entry_uuid)
+      )
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_timeline_turn_action_overrides_session
+      ON timeline_turn_action_overrides(tool_type, session_id)
+    `);
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS ai_prompt_call_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1495,6 +1516,54 @@ class DatabaseManager {
     return true;
   }
 
+  getTimelineTurnActionOverrides(toolType, sessionId) {
+    if (!toolType || !sessionId) return [];
+    return this.db.prepare(`
+      SELECT * FROM timeline_turn_action_overrides
+      WHERE tool_type = ? AND session_id = ?
+      ORDER BY updated_at DESC
+    `).all(toolType, sessionId).map(row => ({
+      toolType: row.tool_type,
+      sessionId: row.session_id,
+      entryUuid: row.entry_uuid,
+      actionLabel: row.action_label,
+      sourceHash: row.source_hash || null,
+      model: row.model || null,
+      promptId: row.prompt_id || null,
+      thinkingLevel: row.thinking_level || null,
+      updatedAt: Number(row.updated_at || 0),
+    }));
+  }
+
+  saveTimelineTurnActionOverride(override) {
+    if (!override?.toolType || !override?.sessionId || !override?.entryUuid || !override?.actionLabel) {
+      return false;
+    }
+    this.db.prepare(`
+      INSERT INTO timeline_turn_action_overrides (
+        tool_type, session_id, entry_uuid, action_label, source_hash,
+        model, prompt_id, thinking_level, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+      ON CONFLICT(tool_type, session_id, entry_uuid) DO UPDATE SET
+        action_label = excluded.action_label,
+        source_hash = excluded.source_hash,
+        model = excluded.model,
+        prompt_id = excluded.prompt_id,
+        thinking_level = excluded.thinking_level,
+        updated_at = strftime('%s', 'now')
+    `).run(
+      override.toolType,
+      override.sessionId,
+      override.entryUuid,
+      override.actionLabel,
+      override.sourceHash || null,
+      override.model || null,
+      override.promptId || null,
+      override.thinkingLevel || null
+    );
+    return true;
+  }
+
   logAIPromptCall(call) {
     if (!call) return false;
     this.db.prepare(`
@@ -1685,7 +1754,7 @@ class DatabaseManager {
       {
         id: 'prompt-summary',
         name: 'Prompt Summary',
-        content: 'Перескажи пользовательское сообщение для строки таймлайна. Верни только краткий пересказ до 70 символов: без кавычек, без точки в конце, без пояснений. Сохрани язык исходного сообщения. Оберни одинарными звездочками 1-2 главных смысловых акцента, за которые цепляется взгляд: объект или тему действия, например смена *названий системных промптов* или *обновление документации*. Не выделяй всю строку и не используй другой markdown.',
+        content: 'Кратко передай смысл пользовательского сообщения для таймлайна, до 70 символов. Верни только пересказ: без кавычек, точки в конце и пояснений. Сохрани язык исходного сообщения. Формулируй действие или вопрос прямо; не добавляй слова «запрос», «просьба» или «диалог», если без них смысл ясен. Ровно один непрерывный смысловой акцент оберни одной парой одинарных звездочек; внутри может быть одно или несколько соседних слов. Вторую пару звездочек не используй. Примеры: проверить *конфликт инструментов с WebODM*; что такое *мультиселектор*. Не выделяй всю строку и не используй другой markdown.',
         model: 'gemini-3.1-flash-lite',
         thinking_level: 'NONE',
         color: '#38bdf8',
@@ -1818,9 +1887,10 @@ class DatabaseManager {
   ensurePromptSummaryPrompt() {
     const oldDefaults = [
       'Перескажи пользовательское сообщение для строки таймлайна. Верни только краткий пересказ до 70 символов: без кавычек, без markdown, без точки в конце, без пояснений. Сохрани язык исходного сообщения.',
-      'Перескажи пользовательское сообщение для строки таймлайна. Верни только краткий пересказ до 70 символов: без кавычек, без точки в конце, без пояснений. Сохрани язык исходного сообщения. Одно главное ключевое слово или короткую ключевую фразу оберни одинарными звездочками, например *fork*.'
+      'Перескажи пользовательское сообщение для строки таймлайна. Верни только краткий пересказ до 70 символов: без кавычек, без точки в конце, без пояснений. Сохрани язык исходного сообщения. Одно главное ключевое слово или короткую ключевую фразу оберни одинарными звездочками, например *fork*.',
+      'Перескажи пользовательское сообщение для строки таймлайна. Верни только краткий пересказ до 70 символов: без кавычек, без точки в конце, без пояснений. Сохрани язык исходного сообщения. Оберни одинарными звездочками 1-2 главных смысловых акцента, за которые цепляется взгляд: объект или тему действия, например смена *названий системных промптов* или *обновление документации*. Не выделяй всю строку и не используй другой markdown.'
     ];
-    const nextDefault = 'Перескажи пользовательское сообщение для строки таймлайна. Верни только краткий пересказ до 70 символов: без кавычек, без точки в конце, без пояснений. Сохрани язык исходного сообщения. Оберни одинарными звездочками 1-2 главных смысловых акцента, за которые цепляется взгляд: объект или тему действия, например смена *названий системных промптов* или *обновление документации*. Не выделяй всю строку и не используй другой markdown.';
+    const nextDefault = 'Кратко передай смысл пользовательского сообщения для таймлайна, до 70 символов. Верни только пересказ: без кавычек, точки в конце и пояснений. Сохрани язык исходного сообщения. Формулируй действие или вопрос прямо; не добавляй слова «запрос», «просьба» или «диалог», если без них смысл ясен. Ровно один непрерывный смысловой акцент оберни одной парой одинарных звездочек; внутри может быть одно или несколько соседних слов. Вторую пару звездочек не используй. Примеры: проверить *конфликт инструментов с WebODM*; что такое *мультиселектор*. Не выделяй всю строку и не используй другой markdown.';
     const exists = this.db.prepare('SELECT id, content FROM ai_prompts WHERE id = ?').get('prompt-summary');
     if (!exists) {
       this.db.prepare(`

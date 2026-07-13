@@ -1,7 +1,7 @@
 # Feature: ProjectToolbar (per-project top bar)
 
 ## Intro
-30px-полоса в самом верху workspace'а активного проекта (`src/renderer/components/Workspace/ProjectToolbar.tsx`). Содержит per-project actions, которые не относятся к конкретному табу. Порядок слева направо фиксирован — пользовательский muscle memory строится на нём.
+30px-полоса в самом верху workspace'а активного проекта (`src/renderer/components/Workspace/ProjectToolbar.tsx`). Левая часть содержит per-project actions; правый кластер может показывать явно session-owned действия активной AI-вкладки. Порядок слева направо фиксирован — пользовательский muscle memory строится на нём.
 
 ## Layout
 
@@ -18,7 +18,10 @@
 | External run settings | `Settings` (lucide) | Появляется только на активной Inbox-вкладке, созданной внешним Codex run. Управляет видимостью бейджа, auto-stop процесса и auto-close вкладки. |
 | Docs | `BookOpen` (lucide) | Popover с `ActionsPanel embedded` (Update Docs / Update API → Haiku pipeline). Раньше жил в InfoPanel-сайдбаре `КОМАНДЫ`-блоком — после удаления правой колонки переехал сюда. |
 | Git | `GitBranch` (lucide) | Появляется только в Git-репозитории, показывает `branch + changed count`; клик открывает project-level панель commit/history/branches/push. Детали: [`fact-git-коммиты.md`](fact-git-коммиты.md). |
+| Timeline AI cluster | `groups` / `AI` / `tab` / `all` | `groups` вручную пересобирает outline всей текущей Claude/Codex-сессии; `+N` показывает новые несгруппированные ходы. `AI` перегенерирует per-turn labels, `tab`/`all` задают auto-policy только для новых prompt'ов. |
 | Copy session + chips | `Copy` + 9-chip row | `CopySessionButton` + ряд чипов выбора секций (👤/✦/answer/thinking/read/edit/bash/mcp/⑂fork/sub-pill) в **две** строки чтобы не растягивать toolbar по высоте. Рендерится ТОЛЬКО когда у активной вкладки есть Claude/Gemini-сессия — toolbar collapses gracefully на Home / browser-табах. |
+
+Timeline-кластер стоит в project toolbar только как постоянная точка входа; owner всегда явно вычисляется из активной вкладки. Loader, error и `+N` привязаны к `toolType + sessionId`, а не к `activeProjectId`: переключение вкладки во время AI-запроса не должно применить поздний результ к новой сессии. Полная семантика — [`fact-группировка-таймлайна.md`](fact-группировка-таймлайна.md).
 
 **Pair-aligned popover'ы.** Оба popover'а (Docs и Copy-session) открываются downward-right-aligned относительно триггера: `top: bRect.bottom + 6, right: window.innerWidth - bRect.right`. Это сохраняет одну нижнюю горизонталь между двумя popover'ами, и убирает зависимость от viewport-left-edge (раньше Copy popover открывался центр-влево от триггера — на правом краю окна он мог вылетать за viewport). Статичное правило, а не runtime-расчёт «куда умещается»: проще для предсказуемого muscle memory, минус один источник позиционных багов.
 

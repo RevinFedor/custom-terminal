@@ -10,6 +10,11 @@ const {
   sourceSha256,
   prepareGroupingInput,
   validateOutline,
+  buildOutlineResponseSchema,
+  buildProtocolInstruction,
+  buildAiPromptReferences,
+  remapOutlinePromptReferences,
+  buildCountTokensRequest,
 } = require('./timeline-outline-service');
 
 test('normalizes BOM, CRLF, and leading whitespace for anchored preset matching', () => {
@@ -104,6 +109,64 @@ test('source hashes are stable across object key order and change with semantic 
   assert.equal(sourceSha256({ b: 2, a: 1 }), sourceSha256({ a: 1, b: 2 }));
   assert.notEqual(sourceSha256({ text: 'one' }), sourceSha256({ text: 'two' }));
   assert.match(sourceSha256({ a: 1 }), /^[a-f0-9]{64}$/);
+});
+
+test('counts system instructions as content without sending unsupported countTokens config', () => {
+  const request = buildCountTokensRequest('gemini-3.1-flash-lite', 'SYSTEM RULES', '{"prompts":[]}');
+
+  assert.deepEqual(Object.keys(request), ['model', 'contents']);
+  assert.equal('config' in request, false);
+  assert.equal(request.contents[0].parts[0].text, 'SYSTEM RULES\n\n{"prompts":[]}');
+});
+
+test('keeps Gemini response schema free of unsupported large maxItems bounds', () => {
+  const schema = buildOutlineResponseSchema(67);
+  const groups = schema.properties.groups;
+  const members = groups.items.properties.members;
+
+  assert.equal('maxItems' in groups, false);
+  assert.equal('maxItems' in members, false);
+  assert.equal(groups.minItems, 1);
+  assert.equal(members.minItems, 1);
+});
+
+test('defines member descriptions as concrete user-intent action labels', () => {
+  const instruction = buildProtocolInstruction();
+  assert.match(instruction, /visible Timeline action label/);
+  assert.match(instruction, /Describe the user intent, not an assumed agent result/);
+  assert.match(instruction, /two to five words/);
+  assert.match(instruction, /Что такое мультиселектор/);
+  assert.match(instruction, /Never return a generic standalone label/);
+  assert.match(instruction, /Preserve distinctive product/);
+  assert.match(instruction, /Продолжить работу.*generic and forbidden/);
+  assert.match(instruction, /Продолжить исправление 7 пунктов/);
+});
+
+test('uses short AI references and maps them back to canonical Timeline UUIDs', () => {
+  const original = [
+    { uuid: 'codex-user-session-with-a-very-long-id-7747', order: 0, kind: 'prompt', text: 'one' },
+    { uuid: 'codex-user-session-with-a-very-long-id-8294', order: 1, kind: 'prompt', text: 'two' },
+  ];
+  const projected = buildAiPromptReferences(original);
+  assert.deepEqual(projected.prompts.map((entry) => entry.uuid), ['p0001', 'p0002']);
+  assert.equal(JSON.stringify(projected.prompts).includes('7747'), false);
+
+  const remapped = remapOutlinePromptReferences({
+    groups: [{
+      title: 'Work',
+      description: 'Did the work.',
+      members: [
+        { uuid: 'p0001', description: 'First', role: 'implementation' },
+        { uuid: 'p0002', description: 'Second', role: 'verification' },
+      ],
+    }],
+  }, projected.refToUuid);
+  assert.deepEqual(remapped.groups[0].members.map((member) => member.uuid), original.map((entry) => entry.uuid));
+  assert.doesNotThrow(() => validateOutline(remapped, original));
+  assert.throws(
+    () => remapOutlinePromptReferences({ groups: [{ members: [{ uuid: 'p9999' }] }] }, projected.refToUuid),
+    { code: 'unknown_outline_ref' }
+  );
 });
 
 function validOutline() {

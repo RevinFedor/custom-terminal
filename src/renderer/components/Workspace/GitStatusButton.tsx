@@ -470,6 +470,13 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     if (!q) return historyItems;
     return historyItems.filter((commit) => `${commit.hash} ${commit.subject} ${commit.date}`.toLowerCase().includes(q));
   }, [historyItems, historySearch]);
+  const hydratedForCurrentProject = hydratedStateKey === panelStateKey;
+  const effectiveRepoPath = (hydratedForCurrentProject ? selectedRepoPath : (projectPath || '')) || projectPath || '';
+  const runAfterTask = storedRunAfterTask?.repoPath === effectiveRepoPath ? storedRunAfterTask : null;
+  const runAfterAction = runAfterTask?.phase === 'waiting' ? runAfterTask.action : null;
+  const runAfterTargetTabId = runAfterTask?.phase === 'waiting' ? runAfterTask.triggerTabId : null;
+  const runAfterRunningAction = runAfterTask?.phase === 'running' ? runAfterTask.action : null;
+  const runAfterSuccessAction = runAfterTask?.phase === 'success' ? runAfterTask.action : null;
   const runAfterTargetLabel = useWorkspaceStore((state) => {
     if (!runAfterTargetTabId) return '';
     for (const [pid, ws] of state.openProjects) {
@@ -481,13 +488,6 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
     }
     return 'Missing tab';
   });
-  const hydratedForCurrentProject = hydratedStateKey === panelStateKey;
-  const effectiveRepoPath = (hydratedForCurrentProject ? selectedRepoPath : (projectPath || '')) || projectPath || '';
-  const runAfterTask = storedRunAfterTask?.repoPath === effectiveRepoPath ? storedRunAfterTask : null;
-  const runAfterAction = runAfterTask?.phase === 'waiting' ? runAfterTask.action : null;
-  const runAfterTargetTabId = runAfterTask?.phase === 'waiting' ? runAfterTask.triggerTabId : null;
-  const runAfterRunningAction = runAfterTask?.phase === 'running' ? runAfterTask.action : null;
-  const runAfterSuccessAction = runAfterTask?.phase === 'success' ? runAfterTask.action : null;
   const homeRepositories = useMemo(() => makeHomeRepositories(projectPath), [projectPath]);
   const currentRepositories = useMemo(
     () => repositoriesProjectPath === (projectPath || '') ? repositories : homeRepositories,

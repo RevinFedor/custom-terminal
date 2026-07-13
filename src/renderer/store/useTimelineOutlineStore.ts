@@ -30,6 +30,7 @@ export interface TimelineMetaPrompt {
 export interface TimelineOutlinePayload {
   schemaVersion: number;
   groups: TimelineSemanticGroup[];
+  turns?: TimelineOutlineMember[];
   ungrouped: string[];
   metaPrompts?: TimelineMetaPrompt[];
   compactCount?: number;
@@ -65,15 +66,31 @@ export interface TimelineOutlineTarget {
   tabName?: string | null;
 }
 
+export interface TimelineActionOverride {
+  toolType: TimelineOutlineTool;
+  sessionId: string;
+  entryUuid: string;
+  actionLabel: string;
+  sourceHash?: string | null;
+  model?: string | null;
+  promptId?: string | null;
+  thinkingLevel?: string | null;
+  updatedAt?: number;
+}
+
 interface TimelineOutlineStore {
   outlines: Record<string, TimelineOutlineRecord>;
   loadedKeys: Set<string>;
   loadingKeys: Set<string>;
   generatingKeys: Set<string>;
   eligibleUuidsByKey: Record<string, string[]>;
+  actionOverridesBySession: Record<string, Record<string, TimelineActionOverride>>;
+  actionOverrideLoadingKeys: Set<string>;
   errorsByKey: Record<string, string>;
   loadOutline: (toolType: TimelineOutlineTool, sessionId: string) => Promise<TimelineOutlineRecord | null>;
   generateOutline: (target: TimelineOutlineTarget) => Promise<TimelineOutlineRecord | null>;
+  loadActionOverrides: (toolType: TimelineOutlineTool, sessionId: string) => Promise<Record<string, TimelineActionOverride>>;
+  saveActionOverride: (override: TimelineActionOverride) => Promise<boolean>;
   syncEligibleUuids: (toolType: TimelineOutlineTool, sessionId: string, uuids: string[]) => void;
 }
 
@@ -89,6 +106,7 @@ function errorMessage(error: unknown): string {
 function normalizeRecord(value: any): TimelineOutlineRecord | null {
   if (!value || !value.toolType || !value.sessionId || !value.outline) return null;
   const groups = Array.isArray(value.outline.groups) ? value.outline.groups : [];
+  const turns = Array.isArray(value.outline.turns) ? value.outline.turns : [];
   const ungrouped = Array.isArray(value.outline.ungrouped) ? value.outline.ungrouped : [];
   return {
     ...value,
@@ -99,6 +117,7 @@ function normalizeRecord(value: any): TimelineOutlineRecord | null {
       ...value.outline,
       schemaVersion: Number(value.outline.schemaVersion || value.schemaVersion || 1),
       groups,
+      turns,
       ungrouped,
       metaPrompts: Array.isArray(value.outline.metaPrompts) ? value.outline.metaPrompts : [],
     },
@@ -120,6 +139,8 @@ export const useTimelineOutlineStore = create<TimelineOutlineStore>((set, get) =
   loadingKeys: new Set(),
   generatingKeys: new Set(),
   eligibleUuidsByKey: {},
+  actionOverridesBySession: {},
+  actionOverrideLoadingKeys: new Set(),
   errorsByKey: {},
 
   loadOutline: async (toolType, sessionId) => {
@@ -197,6 +218,59 @@ export const useTimelineOutlineStore = create<TimelineOutlineStore>((set, get) =
         generatingKeys.delete(key);
         return { generatingKeys };
       });
+    }
+  },
+
+  loadActionOverrides: async (toolType, sessionId) => {
+    if (!toolType || !sessionId) return {};
+    const key = timelineOutlineKey(toolType, sessionId);
+    if (get().actionOverrideLoadingKeys.has(key)) {
+      return get().actionOverridesBySession[key] || {};
+    }
+    set((state) => ({
+      actionOverrideLoadingKeys: new Set(state.actionOverrideLoadingKeys).add(key),
+    }));
+    try {
+      const result = await ipcRenderer.invoke('timeline-turn-action-overrides:get', { toolType, sessionId });
+      if (!result?.success) throw new Error(result?.error || 'Could not load Timeline action overrides');
+      const rows = Array.isArray(result.data) ? result.data : [];
+      const byUuid: Record<string, TimelineActionOverride> = {};
+      for (const row of rows) {
+        if (row?.entryUuid && row?.actionLabel) byUuid[String(row.entryUuid)] = row as TimelineActionOverride;
+      }
+      set((state) => ({
+        actionOverridesBySession: { ...state.actionOverridesBySession, [key]: byUuid },
+      }));
+      return byUuid;
+    } catch (error) {
+      console.warn('[TimelineOutline] action override load failed:', errorMessage(error));
+      return get().actionOverridesBySession[key] || {};
+    } finally {
+      set((state) => {
+        const loading = new Set(state.actionOverrideLoadingKeys);
+        loading.delete(key);
+        return { actionOverrideLoadingKeys: loading };
+      });
+    }
+  },
+
+  saveActionOverride: async (override) => {
+    if (!override?.toolType || !override?.sessionId || !override?.entryUuid || !override?.actionLabel) return false;
+    try {
+      const result = await ipcRenderer.invoke('timeline-turn-action-overrides:save', override);
+      if (!result?.success) throw new Error(result?.error || 'Could not save Timeline action override');
+      const key = timelineOutlineKey(override.toolType, override.sessionId);
+      const saved = { ...override, updatedAt: Math.floor(Date.now() / 1000) };
+      set((state) => ({
+        actionOverridesBySession: {
+          ...state.actionOverridesBySession,
+          [key]: { ...(state.actionOverridesBySession[key] || {}), [override.entryUuid]: saved },
+        },
+      }));
+      return true;
+    } catch (error) {
+      console.warn('[TimelineOutline] action override save failed:', errorMessage(error));
+      return false;
     }
   },
 

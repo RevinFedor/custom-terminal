@@ -57,7 +57,11 @@ export default function Workspace() {
   const getSidebarState = useWorkspaceStore((s) => s.getSidebarState);
   const setSidebarOpen = useWorkspaceStore((s) => s.setSidebarOpen);
   const setSidebarExpandedDirs = useWorkspaceStore((s) => s.setSidebarExpandedDirs);
+  const handleSidebarExpandedDirsChange = useCallback((expandedDirs: Record<string, boolean>) => {
+    if (activeProjectId) setSidebarExpandedDirs(activeProjectId, expandedDirs);
+  }, [activeProjectId, setSidebarExpandedDirs]);
   const setOpenFilePath = useWorkspaceStore((s) => s.setOpenFilePath);
+  const rewriteFilePathReferences = useWorkspaceStore((s) => s.rewriteFilePathReferences);
   const createTabAfterCurrent = useWorkspaceStore((s) => s.createTabAfterCurrent);
   // Subscribe to sidebarOpen so Workspace re-renders when sidebar toggles
   const sidebarOpenForRender = useWorkspaceStore((s) => {
@@ -175,6 +179,16 @@ export default function Workspace() {
     } as any);
     useUIStore.getState().showToast(`Linked ${fileName}`, 'success');
   }, [createTabAfterCurrent]);
+
+  const handleSidebarPathChanged = useCallback((oldPath: string, newPath: string) => {
+    rewriteFilePathReferences(oldPath, newPath);
+    const preview = useUIStore.getState().filePreview;
+    if (!preview?.path || (preview.path !== oldPath && !preview.path.startsWith(oldPath + '/'))) return;
+    useUIStore.getState().openFilePreview({
+      ...preview,
+      path: newPath + preview.path.slice(oldPath.length),
+    });
+  }, [rewriteFilePathReferences]);
 
   // Get active tab early for process checking
   const activeTab = activeProject?.activeTabId
@@ -527,20 +541,20 @@ export default function Workspace() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [activeTabId, workspaceView]);
 
-  // CMD+\ hotkey to toggle history panel
+  // CMD+] / Option+] hotkeys to toggle history panel
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (workspaceView !== 'workspace') return;
-      const isBackslash = e.code === 'Backslash' || e.key === '\\' || e.code === 'IntlBackslash';
-      if (e.metaKey && isBackslash) {
+      if ((e.metaKey || e.altKey) && e.code === 'BracketRight') {
+        const shortcut = e.metaKey ? 'CMD+]' : 'OPT+]';
         const hasSession = effectiveClaudeSessionId || effectiveGeminiSessionId || effectiveCodexSessionId;
         if (!effectiveTab?.id || !hasSession) {
-          console.warn('[Workspace:Hotkey] CMD+\\ BLOCKED: effectiveTab=' + (effectiveTab?.id || 'null') + ' cmdType=' + effectiveCommandType + ' claudeSession=' + (effectiveClaudeSessionId ? effectiveClaudeSessionId.substring(0, 8) : 'null') + ' geminiSession=' + (effectiveGeminiSessionId ? effectiveGeminiSessionId.substring(0, 8) : 'null') + ' codexSession=' + (effectiveCodexSessionId ? effectiveCodexSessionId.substring(0, 8) : 'null'));
+          console.warn('[Workspace:Hotkey] ' + shortcut + ' BLOCKED: effectiveTab=' + (effectiveTab?.id || 'null') + ' cmdType=' + effectiveCommandType + ' claudeSession=' + (effectiveClaudeSessionId ? effectiveClaudeSessionId.substring(0, 8) : 'null') + ' geminiSession=' + (effectiveGeminiSessionId ? effectiveGeminiSessionId.substring(0, 8) : 'null') + ' codexSession=' + (effectiveCodexSessionId ? effectiveCodexSessionId.substring(0, 8) : 'null'));
           return;
         }
         e.preventDefault();
         const currentOpen = useUIStore.getState().historyPanelOpenTabs[effectiveTab.id] ?? false;
-        console.warn('[Workspace:Hotkey] CMD+\\ toggle history: tabId=' + effectiveTab.id.substring(effectiveTab.id.length - 8) + ' ' + currentOpen + ' → ' + !currentOpen);
+        console.warn('[Workspace:Hotkey] ' + shortcut + ' toggle history: tabId=' + effectiveTab.id.substring(effectiveTab.id.length - 8) + ' ' + currentOpen + ' → ' + !currentOpen);
         if (!currentOpen && !timelinePinned) setTimelineTreeMode(effectiveTab.id, false); // unpinned Timeline conflicts with History
         setHistoryPanelOpen(effectiveTab.id, !currentOpen);
       }
@@ -549,20 +563,22 @@ export default function Workspace() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCommandType, setHistoryPanelOpen, setTimelineTreeMode, timelinePinned]);
 
-  // CMD+] hotkey to toggle timeline tree mode
+  // CMD+\ / Option+\ hotkeys to toggle timeline tree mode
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (workspaceView !== 'workspace') return;
-      if (e.metaKey && e.code === 'BracketRight') {
+      const isBackslash = e.code === 'Backslash' || e.key === '\\' || e.code === 'IntlBackslash';
+      if ((e.metaKey || e.altKey) && isBackslash) {
+        const shortcut = e.metaKey ? 'CMD+\\' : 'OPT+\\';
         const hasSession =
           effectiveClaudeSessionId || effectiveGeminiSessionId || effectiveCodexSessionId;
         if (!effectiveTab?.id || !hasSession) {
-          console.warn('[Workspace:Hotkey] CMD+] BLOCKED: effectiveTab=' + (effectiveTab?.id || 'null') + ' cmdType=' + effectiveCommandType + ' claudeSession=' + (effectiveClaudeSessionId ? effectiveClaudeSessionId.substring(0, 8) : 'null') + ' geminiSession=' + (effectiveGeminiSessionId ? effectiveGeminiSessionId.substring(0, 8) : 'null') + ' codexSession=' + (effectiveCodexSessionId ? effectiveCodexSessionId.substring(0, 8) : 'null'));
+          console.warn('[Workspace:Hotkey] ' + shortcut + ' BLOCKED: effectiveTab=' + (effectiveTab?.id || 'null') + ' cmdType=' + effectiveCommandType + ' claudeSession=' + (effectiveClaudeSessionId ? effectiveClaudeSessionId.substring(0, 8) : 'null') + ' geminiSession=' + (effectiveGeminiSessionId ? effectiveGeminiSessionId.substring(0, 8) : 'null') + ' codexSession=' + (effectiveCodexSessionId ? effectiveCodexSessionId.substring(0, 8) : 'null'));
           return;
         }
         e.preventDefault();
         const current = useUIStore.getState().timelineTreeModeTabs[effectiveTab.id] ?? false;
-        console.warn('[Workspace:Hotkey] CMD+] toggle tree: tabId=' + effectiveTab.id.substring(effectiveTab.id.length - 8) + ' ' + current + ' → ' + !current);
+        console.warn('[Workspace:Hotkey] ' + shortcut + ' toggle tree: tabId=' + effectiveTab.id.substring(effectiveTab.id.length - 8) + ' ' + current + ' → ' + !current);
         if (!current && !historyPinned) setHistoryPanelOpen(effectiveTab.id, false); // unpinned History conflicts with Timeline
         setTimelineTreeMode(effectiveTab.id, !current);
       }
@@ -726,7 +742,7 @@ export default function Workspace() {
   }
 
   return (
-    <div className="flex-1 flex flex-col h-full overflow-hidden relative">
+    <div className="flex-1 flex flex-col h-full min-h-0 overflow-hidden relative">
       {/* TOP ROW: ProjectToolbar — full width across all columns.
           Divider под тулбаром НЕ здесь — он рендерится внутри TabSidebar, чтобы линия
           обрывалась на границе сайдбара и не уходила в область терминала. */}
@@ -902,8 +918,9 @@ export default function Workspace() {
               onFocus={() => {}}
               onCollapse={() => setSidebarOpen(activeProjectId, false)}
               activeFilePath={filePreview?.path || null}
+              onRename={handleSidebarPathChanged}
               initialExpandedDirs={sidebarExpandedDirs}
-              onExpandedDirsChange={(expandedDirs: Record<string, boolean>) => setSidebarExpandedDirs(activeProjectId, expandedDirs)}
+              onExpandedDirsChange={handleSidebarExpandedDirsChange}
               linkOwnerProjectId={activeProjectId}
               onLinkFile={handleLinkFileToTab}
               onFileSelect={(filePath: string, isDir: boolean) => {

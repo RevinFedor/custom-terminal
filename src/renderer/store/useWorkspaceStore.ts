@@ -55,6 +55,7 @@ export type CodexSessionWriteReason =
   | 'detected'
   | 'userIntercept'
   | 'editRange'
+  | 'deleteRange'
   | 'unknown';
 
 export interface SessionHistoryEntry {
@@ -275,7 +276,9 @@ const shouldAttemptAutoTabTitleArmForSessionWrite = (reason: string): boolean =>
     'restoredFromDb',
     'userRevert',
     'editRange',
+    'deleteRange',
     'api-edit-range',
+    'api-delete-range',
   ].includes(reason);
 };
 
@@ -962,6 +965,7 @@ interface WorkspaceStore {
   // Sidebar state (per-project)
   setSidebarOpen: (projectId: string, open: boolean) => void;
   setOpenFilePath: (projectId: string, filePath: string | null) => void;
+  rewriteFilePathReferences: (oldPath: string, newPath: string) => void;
   setSidebarExpandedDirs: (projectId: string, expandedDirs: Record<string, boolean>) => void;
   getSidebarState: (projectId: string) => { sidebarOpen: boolean; openFilePath: string | null; sidebarExpandedDirs: Record<string, boolean> | null };
 }
@@ -3428,6 +3432,50 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         saveTabs(workspace.projectId, workspace.tabs);
       }
     }
+  },
+
+  rewriteFilePathReferences: (oldPath, newPath) => {
+    if (!oldPath || !newPath || oldPath === newPath) return;
+    const rewrite = (value?: string | null) => {
+      if (!value || (value !== oldPath && !value.startsWith(oldPath + '/'))) return value;
+      return newPath + value.slice(oldPath.length);
+    };
+    const { openProjects } = get();
+    const nextOpenProjects = new Map(openProjects);
+    let changed = false;
+
+    for (const [projectId, workspace] of openProjects) {
+      let tabsChanged = false;
+      const nextTabs = new Map(workspace.tabs);
+      for (const [tabId, tab] of workspace.tabs) {
+        if (tab.tabType !== 'file') continue;
+        const nextFilePath = rewrite(tab.filePath);
+        if (nextFilePath === tab.filePath) continue;
+        nextTabs.set(tabId, { ...tab, filePath: nextFilePath || undefined });
+        tabsChanged = true;
+      }
+
+      const nextOpenFilePath = rewrite(workspace.openFilePath) || null;
+      const sidebarPathChanged = nextOpenFilePath !== workspace.openFilePath;
+      if (!tabsChanged && !sidebarPathChanged) continue;
+
+      nextOpenProjects.set(projectId, {
+        ...workspace,
+        tabs: tabsChanged ? nextTabs : workspace.tabs,
+        openFilePath: nextOpenFilePath,
+      });
+      if (tabsChanged) saveTabs(workspace.projectId, nextTabs);
+      if (sidebarPathChanged) {
+        ipcRenderer.invoke('project:save-sidebar-state', {
+          projectId,
+          sidebarOpen: workspace.sidebarOpen,
+          openFilePath: nextOpenFilePath,
+        });
+      }
+      changed = true;
+    }
+
+    if (changed) set({ openProjects: nextOpenProjects });
   },
 
   syncAllTabsCwd: async (projectId) => {

@@ -2,7 +2,7 @@ import React, { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallba
 import { flushSync } from 'react-dom';
 import { monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
-import { snapRect } from '@noted/structured-dnd';
+import { normalizeSelectedVisualRootIds, snapRect } from '@noted/structured-dnd';
 import { flattenTree } from './treeUtils';
 import FileIcon from './FileIcon';
 import FileRow from './FileRow';
@@ -29,6 +29,7 @@ const DRAG_MOVE_SCROLL_BUCKET_PX = 8;
 const DRAG_VISUAL_ATTACH_THRESHOLD_PX = 32;
 const DRAG_VISUAL_DETACH_THRESHOLD_PX = 32;
 const DRAG_HORIZONTAL_REPEAT_THRESHOLD_PX = 56;
+const MAX_VISUAL_HIERARCHY_DEPTH = 4;
 const FLIP_MIN_TRANSLATE_LIMIT_PX = 240;
 const DND_LOG_PREFIX = '[SidebarDnd]';
 const SCROLL_LOG_PREFIX = '[SidebarScroll]';
@@ -243,6 +244,7 @@ const PragmaticFileTree = ({
   const [isRootOver, setIsRootOver] = useState(false);
   const [overFolderId, setOverFolderId] = useState(null);
   const [isDraggingGlobal, setIsDraggingGlobal] = useState(false);
+  const [suppressTreeDropTargets, setSuppressTreeDropTargets] = useState(false);
   const [dragPreviewLayout, setDragPreviewLayout] = useState(null);
   const [dragPinnedSource, setDragPinnedSource] = useState(null);
   const [dragHorizontalIntent, setDragHorizontalIntent] = useState(null);
@@ -250,6 +252,7 @@ const PragmaticFileTree = ({
   const [dragVerticalLimitHint, setDragVerticalLimitHint] = useState(null);
   const [dragSourceBlock, setDragSourceBlock] = useState(null);
   const [dragFolderModeActive, setDragFolderModeActive] = useState(false);
+  const [dragFolderSpringState, setDragFolderSpringState] = useState(null);
   const [scrollHintEdge, setScrollHintEdge] = useState(null);
   const [dropConfirmedIds, setDropConfirmedIds] = useState(() => new Set());
   const dragPreviewLayoutRef = useRef(null);
@@ -339,6 +342,14 @@ const PragmaticFileTree = ({
       rawBottom: rect.bottom,
     };
   };
+
+  const isPointInsideDragSurface = useCallback((clientX, clientY) => {
+    if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return false;
+    const scroller = containerRef.current?.closest('.file-tree');
+    if (!scroller) return false;
+    const rect = getVisibleScrollerRect(scroller);
+    return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
+  }, []);
 
   const currentDragSessionId = useCallback(() => dragSessionRef.current?.id || '-', []);
 
@@ -893,10 +904,13 @@ const PragmaticFileTree = ({
 
   const cancelGlobalAutoExpand = useCallback((reason = 'unknown') => {
     const current = globalAutoExpandRef.current;
-    if (!current) return;
-    if (current.timer) clearTimeout(current.timer);
-    console.log(DND_LOG_PREFIX, `autoexpand cancel folder=${shortPath(current.folderId)} reason=${reason}`);
+    if (current) {
+      current.cancelled = true;
+      if (current.timer) clearTimeout(current.timer);
+      console.log(DND_LOG_PREFIX, `autoexpand cancel folder=${shortPath(current.folderId)} reason=${reason}`);
+    }
     globalAutoExpandRef.current = null;
+    if (reason !== 'unmount') setDragFolderSpringState(null);
   }, []);
 
   const logDragVisualDomState = useCallback((reason, phase) => {
@@ -1012,12 +1026,12 @@ const PragmaticFileTree = ({
   const updateHorizontalDragIntent = useCallback((sourceData, action, metaKey) => {
     const sourceId = sourceData?.fileId || action?.sourceIds?.[0] || null;
     const selectedCount = Array.isArray(sourceData?.selectedIds) ? sourceData.selectedIds.length : 1;
-    const isSingleFileLayout =
+    const isSingleOutlineLayout =
       !!sourceId &&
       !metaKey &&
       action?.kind === 'layout' &&
       action?.mode === 'flat-reorder' &&
-      action?.sourceKind === 'file' &&
+      ['file', 'dir', 'link'].includes(action?.sourceKind) &&
       selectedCount === 1 &&
       Array.isArray(action.sourceIds) &&
       action.sourceIds.includes(sourceId);
@@ -1028,7 +1042,7 @@ const PragmaticFileTree = ({
     let phase = 'off';
     let disabled = false;
 
-    if (isSingleFileLayout && !horizontalCommitted && Math.abs(deltaX) > 2) {
+    if (isSingleOutlineLayout && !horizontalCommitted && Math.abs(deltaX) > 2) {
       direction = deltaX < 0 ? 'left' : 'right';
       const canMoveDirection = direction === 'left'
         ? action?.visualCanLeft !== false
@@ -1042,7 +1056,7 @@ const PragmaticFileTree = ({
         Math.abs(deltaX) / Math.max(1, threshold)
       );
       phase = 'prethreshold';
-    } else if (isSingleFileLayout && horizontalCommitted) {
+    } else if (isSingleOutlineLayout && horizontalCommitted) {
       phase = 'committed';
     }
 
@@ -1305,11 +1319,51 @@ const PragmaticFileTree = ({
     window.setTimeout(() => logPostDropFrameState(reason, 't150', details), 150);
   }, [logPostDropFrameState]);
 
+  const finalizeTemporaryDragExpansions = useCallback((session, commitExpansion, reason) => {
+    const temporaryIds = session?.temporaryExpandedIds;
+    if (!(temporaryIds instanceof Set) || temporaryIds.size === 0) return;
+    if (commitExpansion) {
+      console.log(
+        DND_LOG_PREFIX,
+        `session=${session.id || '-'} spring-open commit reason=${reason} folders=${formatIdList([...temporaryIds])}`
+      );
+      return;
+    }
+
+    const baseline = session.expandedBeforeDrag || {};
+    setExpandedIds(prev => {
+      const next = { ...prev };
+      let changed = false;
+      for (const folderId of temporaryIds) {
+        if (baseline[folderId]) {
+          if (!next[folderId]) {
+            next[folderId] = true;
+            changed = true;
+          }
+        } else if (Object.prototype.hasOwnProperty.call(next, folderId)) {
+          delete next[folderId];
+          changed = true;
+        }
+      }
+      if (!changed) return prev;
+      expandedIdsRef.current = next;
+      onExpandChange?.(next);
+      return next;
+    });
+    console.log(
+      DND_LOG_PREFIX,
+      `session=${session.id || '-'} spring-open restore reason=${reason} folders=${formatIdList([...temporaryIds])}`
+    );
+  }, [onExpandChange]);
+
   const clearDragVisualState = useCallback((reason = 'cleanup', options = {}) => {
     const {
       clearPreview = true,
       clearSession = false,
+      commitExpansion = false,
+      finalizeExpansion = true,
     } = options;
+    const session = dragSessionRef.current;
     const sessionId = currentDragSessionId();
 
     isDraggingGlobalRef.current = false;
@@ -1360,6 +1414,7 @@ const PragmaticFileTree = ({
     dragGeometryRefreshReasonRef.current = null;
 
     if (clearSession) {
+      if (finalizeExpansion) finalizeTemporaryDragExpansions(session, commitExpansion, reason);
       dragSessionRef.current = null;
       dragPhysicalEndRef.current = null;
       dragPhysicalEndLogKeyRef.current = '';
@@ -1373,10 +1428,12 @@ const PragmaticFileTree = ({
       `session=${sessionId} cleanup reason=${reason}` +
       ` clearPreview=${clearPreview ? 1 : 0}` +
       ` clearSession=${clearSession ? 1 : 0}` +
+      ` commitExpansion=${commitExpansion ? 1 : 0}` +
+      ` finalizeExpansion=${finalizeExpansion ? 1 : 0}` +
       ` wall=${Date.now()}`
     );
     scheduleDragVisualAudit(reason);
-  }, [cancelGlobalAutoExpand, currentDragSessionId, resetScrollHintEdge, scheduleDragVisualAudit, setDragFolderMode, setPreviewLayout]);
+  }, [cancelGlobalAutoExpand, currentDragSessionId, finalizeTemporaryDragExpansions, resetScrollHintEdge, scheduleDragVisualAudit, setDragFolderMode, setPreviewLayout]);
 
   const requestDragGeometryRefresh = useCallback((reason, folderId) => {
     if (!isDraggingGlobalRef.current) return;
@@ -1404,26 +1461,70 @@ const PragmaticFileTree = ({
     }
     if (globalAutoExpandRef.current?.folderId === folderId) return;
     cancelGlobalAutoExpand('target-changed');
+    const sessionId = dragSessionRef.current?.id || null;
+    if (!sessionId) return;
     console.log(DND_LOG_PREFIX, `autoexpand schedule folder=${shortPath(folderId)} delay=${DRAG_FOLDER_AUTO_EXPAND_MS}ms`);
-    const timer = setTimeout(() => {
-      if (globalAutoExpandRef.current?.folderId !== folderId) return;
-      globalAutoExpandRef.current = null;
+    const entry = {
+      folderId,
+      sessionId,
+      timer: null,
+      cancelled: false,
+    };
+    setDragFolderSpringState({ folderId, phase: 'waiting' });
+    entry.timer = setTimeout(async () => {
+      if (
+        entry.cancelled ||
+        globalAutoExpandRef.current !== entry ||
+        dragSessionRef.current?.id !== sessionId ||
+        !isDraggingGlobalRef.current
+      ) return;
       if (expandedIdsRef.current[folderId]) {
         console.log(DND_LOG_PREFIX, `autoexpand skip-expanded folder=${shortPath(folderId)}`);
+        globalAutoExpandRef.current = null;
+        setDragFolderSpringState(null);
         return;
       }
-      console.log(DND_LOG_PREFIX, `autoexpand fire folder=${shortPath(folderId)} delay=${DRAG_FOLDER_AUTO_EXPAND_MS}ms`);
-      requestDragGeometryRefresh('autoexpand', folderId);
+      setDragFolderSpringState({ folderId, phase: 'loading' });
+      console.log(DND_LOG_PREFIX, `autoexpand load folder=${shortPath(folderId)} delay=${DRAG_FOLDER_AUTO_EXPAND_MS}ms`);
+      try {
+        const loadResult = await Promise.resolve(onToggle?.(folderId));
+        if (!loadResult || loadResult.ok !== true) {
+          console.log(
+            DND_LOG_PREFIX,
+            `autoexpand load-rejected folder=${shortPath(folderId)}` +
+            ` reason=${loadResult?.reason || 'missing-success-result'}`
+          );
+          if (globalAutoExpandRef.current === entry) globalAutoExpandRef.current = null;
+          if (!entry.cancelled) setDragFolderSpringState(null);
+          return;
+        }
+      } catch (error) {
+        console.log(DND_LOG_PREFIX, `autoexpand load-error folder=${shortPath(folderId)} message=${error?.message || String(error)}`);
+        if (globalAutoExpandRef.current === entry) globalAutoExpandRef.current = null;
+        if (!entry.cancelled) setDragFolderSpringState(null);
+        return;
+      }
+      if (
+        entry.cancelled ||
+        globalAutoExpandRef.current !== entry ||
+        dragSessionRef.current?.id !== sessionId ||
+        !isDraggingGlobalRef.current
+      ) return;
+
+      dragSessionRef.current.temporaryExpandedIds?.add(folderId);
       setExpandedIds(prev => {
         if (prev[folderId]) return prev;
         const next = { ...prev, [folderId]: true };
         expandedIdsRef.current = next;
-        if (onExpandChange) onExpandChange(next);
+        onExpandChange?.(next);
         return next;
       });
-      if (onToggle) onToggle(folderId);
+      requestDragGeometryRefresh('spring-open-loaded', folderId);
+      globalAutoExpandRef.current = null;
+      setDragFolderSpringState(null);
+      console.log(DND_LOG_PREFIX, `autoexpand opened folder=${shortPath(folderId)} session=${sessionId}`);
     }, DRAG_FOLDER_AUTO_EXPAND_MS);
-    globalAutoExpandRef.current = { folderId, timer };
+    globalAutoExpandRef.current = entry;
   }, [cancelGlobalAutoExpand, onExpandChange, onToggle, requestDragGeometryRefresh]);
 
   useEffect(() => {
@@ -1747,6 +1848,27 @@ const PragmaticFileTree = ({
     return result;
   }, []);
 
+  const normalizeDragSelection = useCallback((sourceData, nodeById, orderedIds) => {
+    const rawSelectedIds = Array.isArray(sourceData?.selectedIds) && sourceData.selectedIds.includes(sourceData.fileId)
+      ? sourceData.selectedIds.filter(id => nodeById.has(id))
+      : [sourceData.fileId];
+    const hierarchyItems = orderedIds
+      .filter(id => nodeById.has(id))
+      .map((id, position) => ({
+        id,
+        parentId: nodeById.get(id)?.visualParentId || null,
+        position,
+      }));
+    const selectedRootIds = normalizeSelectedVisualRootIds(hierarchyItems, rawSelectedIds, {
+      parentKey: 'parentId',
+    });
+    return {
+      rawSelectedIds,
+      selectedRootIds: selectedRootIds.length > 0 ? selectedRootIds : [sourceData.fileId],
+      isMultiSelection: rawSelectedIds.length > 1,
+    };
+  }, []);
+
   const resolveSidebarDrag = useCallback((sourceData, effectiveY, rawY = effectiveY, modifiers = {}) => {
     const initialGeometry = dragGeometryRef.current;
     const scroll = getScrollSnapshot();
@@ -1818,11 +1940,13 @@ const PragmaticFileTree = ({
       return null;
     }
 
-    const selectedIds = Array.isArray(sourceData.selectedIds) && sourceData.selectedIds.includes(sourceData.fileId)
-      ? sourceData.selectedIds.filter(id => nodeById.has(id))
-      : [sourceData.fileId];
+    const {
+      rawSelectedIds,
+      selectedRootIds: selectedIds,
+      isMultiSelection,
+    } = normalizeDragSelection(sourceData, nodeById, rows.map(row => row.id));
     const sourceBlockIds = (() => {
-      if (selectedIds.length === 1) {
+      if (!isMultiSelection) {
         return [sourceData.fileId, ...collectVisualChildren(sourceData.fileId, nodeById)];
       }
       const expanded = new Set();
@@ -1971,6 +2095,20 @@ const PragmaticFileTree = ({
         );
         return null;
       }
+      const targetIsExpanded = !!expandedIdsRef.current[targetNode.id];
+      const targetHasChildren = Array.isArray(targetNode.children) && targetNode.children.length > 0;
+      if (!targetIsExpanded || targetHasChildren) {
+        return {
+          kind: 'move',
+          destinationFolder: null,
+          isRoot: false,
+          overFolderId: targetNode.id,
+          detail: 'spring-open-folder',
+          springOpenOnly: true,
+          ...commonDetail(),
+          edge: 'center',
+        };
+      }
       return {
         kind: 'move',
         destinationFolder: targetNode.id,
@@ -2030,7 +2168,7 @@ const PragmaticFileTree = ({
       nextOrder.splice(boundedInsertIndex, 0, ...sourceBlockIds);
 
       const orderChanged = !sameOrder(sourceParentOrder, nextOrder);
-      const singleFileDrag = selectedIds.length === 1 && !sourceNode.isDirectory;
+      const singleFileDrag = rawSelectedIds.length === 1 && !sourceNode.isDirectory;
       const visualParentForId = (id) => {
         if (hasOwn(dragVisualParentOverrides, id)) return dragVisualParentOverrides[id] || null;
         return (
@@ -2051,6 +2189,19 @@ const PragmaticFileTree = ({
         return depth;
       };
       const sourceVisualDepth = visualDepthForId(sourceData.fileId);
+      const folderHorizontalIntentMeta = sourceNode.isDirectory && rawSelectedIds.length === 1
+        ? {
+            visualCanLeft: false,
+            visualCanRight: false,
+            sourceVisualDepth,
+            visualLeftThresholdPx: DRAG_VISUAL_DETACH_THRESHOLD_PX,
+            visualRightThresholdPx: DRAG_VISUAL_ATTACH_THRESHOLD_PX,
+            visualIntentThresholdPx: deltaX < 0
+              ? DRAG_VISUAL_DETACH_THRESHOLD_PX
+              : DRAG_VISUAL_ATTACH_THRESHOLD_PX,
+            visualBlockedDirection: deltaX < -2 ? 'left' : (deltaX > 2 ? 'right' : null),
+          }
+        : {};
       const visualRows = rows.filter(row => !row.isRootEnd && nodeById.has(row.id));
       const visualAncestorAtDepth = (id, targetDepth) => {
         if (!id || targetDepth < 0 || !nodeById.has(id)) return null;
@@ -2087,6 +2238,29 @@ const PragmaticFileTree = ({
           ids.push(id);
         }
         return ids;
+      };
+      const collectRenderBlockIds = (rootId) => {
+        const rootNode = nodeById.get(rootId);
+        if (!rootNode) return [];
+        if (rootNode.isDirectory) {
+          const prefix = `${rootId}/`;
+          return visualRows
+            .map(row => row.id)
+            .filter(id => id === rootId || id.startsWith(prefix));
+        }
+        return collectVisualBlockIds(rootId);
+      };
+      const physicalRootAtSourceParent = (id) => {
+        let cursor = id;
+        const seen = new Set();
+        while (cursor && !seen.has(cursor) && nodeById.has(cursor)) {
+          seen.add(cursor);
+          if (pathParentKey(cursor, folderPath) === sourceParentKey) return cursor;
+          const parentId = pathParentKey(cursor, folderPath);
+          if (!parentId || parentId === ROOT_PARENT || parentId === cursor) return null;
+          cursor = parentId;
+        }
+        return null;
       };
       const collectVisualAncestorChainIds = (id) => {
         if (!id || !nodeById.has(id)) return [];
@@ -2192,11 +2366,11 @@ const PragmaticFileTree = ({
 	        if (isFolderDropMode || !sourceNode.isDirectory || selectedIds.length !== 1) return null;
 	        if (sourceBlockCurrentTop == null || sourceBlockCurrentBottom == null) return null;
 
-	        const sourceOrderIds = sourceBlockIds.filter(id => currentSourceParentOrder.includes(id));
+	        const sourceOrderIds = sourceBlockIds.filter(id => sourceParentOrder.includes(id));
 	        if (sourceOrderIds.length === 0) return null;
 	        const sourceOrderSet = new Set(sourceOrderIds);
 	        const sourceIndices = sourceOrderIds
-	          .map(id => currentSourceParentOrder.indexOf(id))
+	          .map(id => sourceParentOrder.indexOf(id))
 	          .filter(index => index >= 0)
 	          .sort((a, b) => a - b);
 	        if (sourceIndices.length !== sourceOrderIds.length) return null;
@@ -2206,56 +2380,40 @@ const PragmaticFileTree = ({
 	        const sourceIsContiguous = sourceIndices.every((index, offset) => index === sourceFirstIndex + offset);
 	        if (!sourceIsContiguous) return null;
 
-	        const renderIdsForRoot = (rootId) => {
-	          const rootNode = nodeById.get(rootId);
-	          if (!rootNode) return [];
-	          if (rootNode.isDirectory) {
-	            const prefix = `${rootId}/`;
-	            return visualRows
-	              .map(row => row.id)
-	              .filter(id => (id === rootId || id.startsWith(prefix)) && !sourceRenderSet.has(id));
-	          }
-	          return collectVisualBlockIds(rootId).filter(id => !sourceRenderSet.has(id));
-	        };
 	        const sideForRoot = (rootId) => {
-	          const rootIndex = currentSourceParentOrder.indexOf(rootId);
+	          const rootIndex = sourceParentOrder.indexOf(rootId);
 	          if (rootIndex < 0) return null;
 	          if (sourceLastIndex < rootIndex) return 'before';
 	          if (sourceFirstIndex > rootIndex) return 'after';
 	          return null;
 	        };
 	        const buildHold = (detail = 'reorder-folder-block-hold', limitDirection = null) => (
-	          buildLayout(detail, sourceParentKey, currentSourceParentOrder, {
-	            insertIndex: currentSourceParentOrder.indexOf(sourceData.fileId),
-	            orderChanged: !sameOrder(sourceParentOrder, currentSourceParentOrder),
+	          buildLayout(detail, sourceParentKey, sourceParentOrder, {
+	            insertIndex: sourceParentOrder.indexOf(sourceData.fileId),
+	            orderChanged: false,
 	            sourceParentSize: sourceParentOrder.length,
 	            folderRenderBlock: true,
 	            verticalLimitDirection: limitDirection,
 	            verticalLimitReason: limitDirection ? 'folder-boundary' : null,
 	            verticalLimitTargetId: limitDirection ? sourceData.fileId : null,
+	            ...folderHorizontalIntentMeta,
 	          })
 	        );
 
-	        const activeBoundary = dragSessionRef.current?.activeBlockBoundary || null;
-	        const activeMatches =
-	          activeBoundary?.kind === 'physical-folder' &&
-	          activeBoundary.sourceId === sourceData.fileId &&
-	          activeBoundary.sourceParentKey === sourceParentKey &&
-	          currentSourceParentOrder.includes(activeBoundary.rootId) &&
-	          !sourceOrderSet.has(activeBoundary.rootId);
-	        const activeSide = activeMatches ? sideForRoot(activeBoundary.rootId) : null;
-	        const pointerKeepsActive = activeSide === 'before'
-	          ? effectiveY >= sourceBlockCurrentTop
-	          : (activeSide === 'after' ? effectiveY <= sourceBlockCurrentBottom : false);
+	        if (effectiveY >= sourceBlockCurrentTop && effectiveY <= sourceBlockCurrentBottom) {
+	          return buildHold();
+	        }
 
-	        let rootId = activeMatches && pointerKeepsActive ? activeBoundary.rootId : null;
-	        if (!rootId) {
-	          if (effectiveY < sourceBlockCurrentTop) {
-	            rootId = currentSourceParentOrder[sourceFirstIndex - 1] || null;
-	          } else if (effectiveY > sourceBlockCurrentBottom) {
-	            rootId = currentSourceParentOrder[sourceLastIndex + 1] || null;
-	          } else {
-	            return buildHold();
+	        let rootId = null;
+	        if (targetRow.isRootEnd) {
+	          rootId = sourceParentOrder.findLast(id => !sourceOrderSet.has(id)) || null;
+	        } else if (targetRow.id) {
+	          const physicalRootId = physicalRootAtSourceParent(targetRow.id);
+	          if (physicalRootId) {
+	            const targetDepth = visualDepthForId(physicalRootId);
+	            rootId = targetDepth > 0
+	              ? visualAncestorAtDepth(physicalRootId, 0)
+	              : physicalRootId;
 	          }
 	        }
 
@@ -2267,7 +2425,7 @@ const PragmaticFileTree = ({
 	        }
 
 	        const side = sideForRoot(rootId);
-	        const targetRenderIds = renderIdsForRoot(rootId);
+	        const targetRenderIds = collectRenderBlockIds(rootId).filter(id => !sourceRenderSet.has(id));
 	        const rootRow = rowById.get(rootId);
 	        const lastTargetRow = rowById.get(targetRenderIds[targetRenderIds.length - 1]);
 	        if (
@@ -2291,9 +2449,9 @@ const PragmaticFileTree = ({
 	            : effectiveY <= thresholdY
 	        );
 	        const direction = side === 'before' ? 'down' : 'up';
-	        const withoutSource = currentSourceParentOrder.filter(id => !sourceOrderSet.has(id));
+	        const withoutSource = sourceParentOrder.filter(id => !sourceOrderSet.has(id));
 	        const targetIndex = withoutSource.indexOf(rootId);
-	        const nextOrder = crossed ? [...withoutSource] : [...currentSourceParentOrder];
+	        const nextOrder = crossed ? [...withoutSource] : [...sourceParentOrder];
 	        if (crossed) {
 	          const insertIndex = side === 'before' ? targetIndex + 1 : targetIndex;
 	          nextOrder.splice(
@@ -2323,6 +2481,7 @@ const PragmaticFileTree = ({
 	          verticalBlockHintRootId: rootId,
 	          verticalBlockHintTargetId: rootId,
 	          verticalBlockSourceHeight: sourceBlockHeight,
+	          ...folderHorizontalIntentMeta,
 	        });
 	      };
 	      const folderRenderBlockBoundary = getFolderRenderBlockBoundary();
@@ -2371,22 +2530,26 @@ const PragmaticFileTree = ({
           );
         }
         if (targetIsSourceBlock && !activeBoundaryMatches) return null;
-        const targetDepth = targetIsSourceBlock
-          ? sourceVisualDepth
-          : visualDepthForId(targetRow.id);
+	        const physicalTargetRootId = targetIsSourceBlock
+	          ? null
+	          : physicalRootAtSourceParent(targetRow.id);
+	        const targetProbeId = physicalTargetRootId || targetRow.id;
+	        const targetDepth = targetIsSourceBlock
+	          ? sourceVisualDepth
+	          : visualDepthForId(targetProbeId);
         if (!activeBoundaryMatches && targetDepth < sourceVisualDepth) return null;
 
         const rootId = activeBoundaryMatches
           ? activeBoundary.rootId
           : (
-              targetDepth === sourceVisualDepth
-                ? targetRow.id
-                : visualAncestorAtDepth(targetRow.id, sourceVisualDepth)
-            );
-        if (!rootId || rootId === sourceData.fileId || sourceSet.has(rootId)) return null;
-        const ids = activeBoundaryMatches
-          ? activeBoundary.ids.filter(id => !sourceSet.has(id) && nodeById.has(id))
-          : collectVisualBlockIds(rootId).filter(id => !sourceSet.has(id));
+	              targetDepth === sourceVisualDepth
+	                ? targetProbeId
+	                : visualAncestorAtDepth(targetProbeId, sourceVisualDepth)
+	            );
+	        if (!rootId || rootId === sourceData.fileId || sourceSet.has(rootId)) return null;
+	        const ids = activeBoundaryMatches
+	          ? activeBoundary.ids.filter(id => !sourceSet.has(id) && nodeById.has(id))
+	          : collectRenderBlockIds(rootId).filter(id => !sourceSet.has(id));
         if (ids.length <= 1) return null;
 
         const allNodes = visualRows;
@@ -2960,6 +3123,15 @@ const PragmaticFileTree = ({
         return null;
       };
       const visualAttachParentId = singleFileDrag ? findPreviousFileAtSourceDepth() : null;
+      const sourceVisualBlockIds = singleFileDrag ? collectVisualBlockIds(sourceData.fileId) : [];
+      const sourceMaxRelativeDepth = sourceVisualBlockIds.reduce((maxDepth, id) => (
+        Math.max(maxDepth, Math.max(0, visualDepthForId(id) - sourceVisualDepth))
+      ), 0);
+      const visualAttachDepth = visualAttachParentId
+        ? visualDepthForId(visualAttachParentId) + 1
+        : sourceVisualDepth;
+      const visualAttachExceedsMaxDepth = !!visualAttachParentId
+        && visualAttachDepth + sourceMaxRelativeDepth > MAX_VISUAL_HIERARCHY_DEPTH;
       const leftRepeatPending = isHorizontalRepeatPending('left');
       const rightRepeatPending = isHorizontalRepeatPending('right');
       const leftThreshold = leftRepeatPending
@@ -2969,7 +3141,7 @@ const PragmaticFileTree = ({
         ? DRAG_HORIZONTAL_REPEAT_THRESHOLD_PX
         : DRAG_VISUAL_ATTACH_THRESHOLD_PX;
       const visualCanLeft = !!sourceVisualParentId;
-      const visualCanRight = !!visualAttachParentId;
+      const visualCanRight = !!visualAttachParentId && !visualAttachExceedsMaxDepth;
       const repeatPendingDirection =
         (deltaX < 0 && leftRepeatPending) ? 'left' :
         (deltaX > 0 && rightRepeatPending) ? 'right' :
@@ -2978,11 +3150,15 @@ const PragmaticFileTree = ({
         visualCanLeft,
         visualCanRight,
         visualAttachParentId: visualAttachParentId || null,
+        visualAttachDepth,
+        sourceMaxRelativeDepth,
+        visualMaxDepth: MAX_VISUAL_HIERARCHY_DEPTH,
         sourceVisualDepth,
         visualLeftThresholdPx: leftThreshold,
         visualRightThresholdPx: rightThreshold,
         visualIntentThresholdPx: deltaX < 0 ? leftThreshold : rightThreshold,
         visualRepeatPendingDirection: repeatPendingDirection,
+        visualBlockedReason: visualAttachExceedsMaxDepth ? 'max-depth' : null,
       };
       const buildVisualLayout = (detail, mutateVisualParents, meta = {}) => {
         const next = cloneLayout(normalizedSidebarLayout);
@@ -3057,6 +3233,26 @@ const PragmaticFileTree = ({
           ...verticalBlockHintMeta,
           ...visualIntentMeta,
           visualBlockedDirection: 'right',
+	          });
+	        }
+
+	        if (visualAttachExceedsMaxDepth) {
+	          logResolveReject(
+	            'visual-attach-max-depth',
+	            `source=${shortPath(sourceData.fileId)} parent=${shortPath(visualParentId)}` +
+	            ` attachDepth=${visualAttachDepth} subtreeRelativeDepth=${sourceMaxRelativeDepth}` +
+	            ` maxDepth=${MAX_VISUAL_HIERARCHY_DEPTH}`
+	          );
+	          return buildLayoutWithVisualRepair('reorder', sourceParentKey, nextOrder, {
+	            boundaryClamp,
+	            insertIndex: boundedInsertIndex,
+	            orderChanged,
+	            sourceParentSize: sourceParentOrder.length,
+	            ...resolverDebugMeta,
+	            ...verticalBlockHintMeta,
+	            ...visualIntentMeta,
+	            visualBlockedDirection: 'right',
+	            visualBlockedReason: 'max-depth',
 	          });
 	        }
 
@@ -3291,7 +3487,7 @@ const PragmaticFileTree = ({
       ` rawY=${Math.round(rawY)} effectiveY=${Math.round(effectiveY)}`
     );
     return null;
-	  }, [captureDragGeometry, collectVisualChildren, currentDragSessionId, folderPath, getScrollSnapshot, sidebarLayout, logResolveReject]);
+	  }, [captureDragGeometry, collectVisualChildren, currentDragSessionId, folderPath, getScrollSnapshot, sidebarLayout, logResolveReject, normalizeDragSelection]);
 
   const resolveAndApplyDragPreview = useCallback((sourceData, rawY, metaKey, reason = 'drag', clientX = null) => {
     if (!sourceData?.fileId) return null;
@@ -3485,7 +3681,7 @@ const PragmaticFileTree = ({
     const preservedPreview = !!dragPreviewLayoutRef.current;
     setOverFolderId(action.overFolderId || null);
     setIsRootOver(!!action.isRoot);
-    if (action.detail === 'move-into-folder' && action.overFolderId) {
+    if ((action.detail === 'move-into-folder' || action.detail === 'spring-open-folder') && action.overFolderId) {
       scheduleGlobalAutoExpand(action.overFolderId);
     } else {
       cancelGlobalAutoExpand(action.detail || 'move');
@@ -3775,6 +3971,18 @@ const PragmaticFileTree = ({
     if (!isDraggingGlobalRef.current) return false;
     if (event?.buttons !== 0) return false;
 
+    const pointerX = Number.isFinite(event?.clientX) ? event.clientX : lastDragClientXRef.current;
+    const pointerY = Number.isFinite(event?.clientY) ? event.clientY : lastDragClientYRef.current;
+    if (!isPointInsideDragSurface(pointerX, pointerY)) {
+      console.log(
+        DND_LOG_PREFIX,
+        `session=${currentDragSessionId()} early-release skip reason=outside` +
+        ` source=${eventSource} x=${pointerX == null ? '-' : Math.round(pointerX)}` +
+        ` y=${pointerY == null ? '-' : Math.round(pointerY)}`
+      );
+      return false;
+    }
+
     const sessionId = currentDragSessionId();
     if (dragEarlyCommitRef.current?.sessionId === sessionId) return true;
 
@@ -3824,16 +4032,23 @@ const PragmaticFileTree = ({
       return `${action.destinationFolder}/${fileName}`;
     });
     const expectedIds = expectedMoveIds.length > 0 ? expectedMoveIds : [sourceId];
-    const pointerY = lastDragClientYRef.current ?? event?.clientY;
     const actionLog = formatActionLog(action);
-    dragEarlyCommitRef.current = {
+    const earlyRecord = {
       sessionId,
+      session,
+      transportToken: session?.transportToken || String(sourceData.dragToken || ''),
       sourceId,
       expectedIds,
       actionLog,
       consumedByDrop: false,
+      succeeded: false,
+      finished: false,
+      completion: null,
+      layoutCommitted: false,
+      expansionFinalized: false,
       startedAtWall: Date.now(),
     };
+    dragEarlyCommitRef.current = earlyRecord;
 
     console.log(
       DND_LOG_PREFIX,
@@ -3849,19 +4064,37 @@ const PragmaticFileTree = ({
       ` ${actionLog}`
     );
 
-    commitPendingPreviewLayoutForMove(sessionId, 'early-release-cmd-move');
+    const previewLayoutCommitted = commitPendingPreviewLayoutForMove(sessionId, 'early-release-cmd-move');
+    earlyRecord.layoutCommitted = previewLayoutCommitted;
 
     flushSync(() => {
+      setSuppressTreeDropTargets(true);
       clearDragVisualState('early-release-begin', { clearPreview: true, clearSession: false });
     });
 
-    const finishEarlyCommit = (reason) => {
-      const early = dragEarlyCommitRef.current;
-      if (!early || early.sessionId !== sessionId || early.consumedByDrop) return;
+    const finishEarlyCommit = (reason, commitExpansion = false) => {
+      earlyRecord.succeeded = commitExpansion;
+      earlyRecord.finished = true;
+      if (earlyRecord.consumedByDrop) return;
       console.log(DND_LOG_PREFIX, `session=${sessionId} early-release finish reason=${reason}`);
-      flushSync(() => {
-        clearDragVisualState(`early-release-${reason}`, { clearPreview: true, clearSession: true });
-      });
+      const currentSession = dragSessionRef.current;
+      const stillCurrent = currentSession?.id === sessionId
+        && currentSession?.transportToken === earlyRecord.transportToken;
+      if (stillCurrent) {
+        flushSync(() => {
+          setSuppressTreeDropTargets(false);
+          clearDragVisualState(`early-release-${reason}`, {
+            clearPreview: true,
+            clearSession: true,
+            finalizeExpansion: false,
+          });
+        });
+      }
+      if (!earlyRecord.expansionFinalized) {
+        earlyRecord.expansionFinalized = true;
+        finalizeTemporaryDragExpansions(earlyRecord.session, commitExpansion, `early-release-${reason}`);
+      }
+      if (dragEarlyCommitRef.current === earlyRecord) dragEarlyCommitRef.current = null;
     };
 
     if (moveIds.length > 0 && onMoveItems) {
@@ -3885,7 +4118,7 @@ const PragmaticFileTree = ({
         expectedIds,
         pointerY,
       });
-      Promise.resolve(movePromise)
+      const completion = Promise.resolve(movePromise)
         .then(results => {
           const successTargets = successfulMoveTargets(results);
           console.log(
@@ -3905,7 +4138,9 @@ const PragmaticFileTree = ({
               ` results=${formatMoveResults(results)}`
             );
           }
-          finishEarlyCommit('done');
+          const succeeded = successTargets.length > 0 || previewLayoutCommitted;
+          finishEarlyCommit(succeeded ? 'done' : 'no-success', succeeded);
+          return succeeded;
         })
         .catch(error => {
           console.log(
@@ -3914,10 +4149,12 @@ const PragmaticFileTree = ({
             ` elapsed=${Math.round(performance.now() - t0)}ms` +
             ` message=${error?.message || String(error)}`
           );
-          finishEarlyCommit('error');
+          finishEarlyCommit('error', false);
+          return false;
         });
+      earlyRecord.completion = completion;
     } else if (moveIds.length > 0) {
-      (async () => {
+      const completion = (async () => {
         const fallbackSuccessTargets = [];
         for (const sid of moveIds) {
           const fileName = sid.split('/').pop();
@@ -3934,14 +4171,18 @@ const PragmaticFileTree = ({
           schedulePostDropReveal(fallbackSuccessTargets[0], sessionId, 'early-release-fallback-success');
           markDropConfirmed(fallbackSuccessTargets, sessionId, 'early-release-fallback-success');
         }
-        finishEarlyCommit('done');
+        const succeeded = fallbackSuccessTargets.length > 0 || previewLayoutCommitted;
+        finishEarlyCommit(succeeded ? 'done' : 'no-success', succeeded);
+        return succeeded;
       })().catch(error => {
         console.log(
           DND_LOG_PREFIX,
           `session=${sessionId} early-release fallback error message=${error?.message || String(error)}`
         );
-        finishEarlyCommit('error');
+        finishEarlyCommit('error', false);
+        return false;
       });
+      earlyRecord.completion = completion;
       schedulePostDropFrameAudit('early-release-fallback', {
         sessionId,
         sourceId,
@@ -3955,16 +4196,27 @@ const PragmaticFileTree = ({
         expectedIds,
         pointerY,
       });
-      finishEarlyCommit('noop');
+      earlyRecord.completion = Promise.resolve(false);
+      finishEarlyCommit(previewLayoutCommitted ? 'done' : 'noop', previewLayoutCommitted);
     }
 
     return true;
-  }, [clearDragVisualState, commitPendingPreviewLayoutForMove, currentDragSessionId, markDropConfirmed, onMoveItems, onRename, schedulePostDropFrameAudit, schedulePostDropReveal]);
+  }, [clearDragVisualState, commitPendingPreviewLayoutForMove, currentDragSessionId, finalizeTemporaryDragExpansions, isPointInsideDragSurface, markDropConfirmed, onMoveItems, onRename, schedulePostDropFrameAudit, schedulePostDropReveal]);
 
   useEffect(() => {
     if (!isDraggingGlobal) return undefined;
 
     const syncModifierMode = (event) => {
+      if (event?.type === 'keydown' && event?.key === 'Escape') {
+        event.preventDefault?.();
+        if (dragEarlyCommitRef.current) dragEarlyCommitRef.current.expansionFinalized = true;
+        dragEarlyCommitRef.current = null;
+        flushSync(() => {
+          setSuppressTreeDropTargets(false);
+          clearDragVisualState('escape-cancel', { clearPreview: true, clearSession: true });
+        });
+        return;
+      }
       const isMetaKeyEvent =
         event?.key === 'Meta' ||
         event?.code === 'MetaLeft' ||
@@ -3993,7 +4245,7 @@ const PragmaticFileTree = ({
       window.removeEventListener('keydown', syncModifierMode, true);
       window.removeEventListener('keyup', syncModifierMode, true);
     };
-  }, [isDraggingGlobal, resolveAndApplyDragPreview, setDragFolderMode]);
+  }, [clearDragVisualState, isDraggingGlobal, resolveAndApplyDragPreview, setDragFolderMode]);
 
   useEffect(() => {
     if (!isDraggingGlobal) return undefined;
@@ -4055,6 +4307,8 @@ const PragmaticFileTree = ({
       const reason = `end-fallback-${eventType}`;
       const now = performance.now();
       const session = dragSessionRef.current;
+      const fallbackSessionId = session?.id || null;
+      const fallbackTransportToken = session?.transportToken || null;
       const lastResolve = dragLastResolveSnapshotRef.current;
       const isFirstPhysicalEnd = !dragPhysicalEndRef.current;
       if (isFirstPhysicalEnd) {
@@ -4095,7 +4349,13 @@ const PragmaticFileTree = ({
       }
 
       window.setTimeout(() => {
-        if (!isDraggingGlobalRef.current) return;
+        const currentSession = dragSessionRef.current;
+        if (
+          !isDraggingGlobalRef.current
+          || !fallbackSessionId
+          || currentSession?.id !== fallbackSessionId
+          || currentSession?.transportToken !== fallbackTransportToken
+        ) return;
         console.log(DND_LOG_PREFIX, `session=${currentDragSessionId()} end-fallback reason=${reason}`);
         clearDragVisualState(reason, { clearPreview: true, clearSession: true });
       }, DRAG_END_FALLBACK_DELAY_MS);
@@ -4109,6 +4369,8 @@ const PragmaticFileTree = ({
     const nativeDragTypes = ['dragenter', 'dragover', 'dragleave'];
     const handleNativeDragEvent = (event, eventSource) => {
       logNativeDragEvent(event, eventSource);
+      const earlyCommit = dragEarlyCommitRef.current;
+      if (earlyCommit || !isDraggingGlobalRef.current) return;
       const metaKey = !!event?.metaKey;
       dragLastModifiersRef.current = { metaKey };
       setDragFolderMode(metaKey, `native-${event?.type || 'event'}`);
@@ -4157,11 +4419,16 @@ const PragmaticFileTree = ({
         const nodeById = new Map(visibleNodesRef.current.map(node => [node.id, node]));
         const sourceNode = nodeById.get(args.source.data.fileId);
         const geometry = captureDragGeometry(y, args.source.data.fileId);
-        const selectedIds = Array.isArray(args.source.data.selectedIds) && args.source.data.selectedIds.includes(args.source.data.fileId)
-          ? args.source.data.selectedIds.filter(id => nodeById.has(id))
-          : [args.source.data.fileId];
+        const {
+          selectedRootIds: selectedIds,
+          isMultiSelection,
+        } = normalizeDragSelection(
+          args.source.data,
+          nodeById,
+          (geometry?.rows || []).map(row => row.id)
+        );
         const sourceBlockIds = (() => {
-          if (selectedIds.length === 1) {
+          if (!isMultiSelection) {
             return [args.source.data.fileId, ...collectVisualChildren(args.source.data.fileId, nodeById)];
           }
           const expanded = new Set();
@@ -4189,6 +4456,7 @@ const PragmaticFileTree = ({
         })();
         dragSessionRef.current = {
           id: sessionId,
+          transportToken: String(args.source.data.dragToken || ''),
           sourceId: args.source.data.fileId,
           startAt: performance.now(),
           startX: initialInput.clientX,
@@ -4202,6 +4470,8 @@ const PragmaticFileTree = ({
 	          geometryRevision: 0,
 	          geometryRefreshPendingSeq: null,
 	          activeBlockBoundary: null,
+	          expandedBeforeDrag: { ...expandedIdsRef.current },
+	          temporaryExpandedIds: new Set(),
 	          startY: y,
           startScrollTop: scroll.scrollTop,
           lastScrollTop: scroll.scrollTop,
@@ -4234,6 +4504,7 @@ const PragmaticFileTree = ({
         dragPhysicalEndLogKeyRef.current = '';
         dragEarlyCommitRef.current = null;
         dragDropStartedRef.current = false;
+        setSuppressTreeDropTargets(false);
         setDragSourceBlock({ ids: sourceRenderBlockIds, rootIds: selectedIds });
         setPreviewLayout(null);
         setDragVerticalBlockHint(null);
@@ -4264,6 +4535,24 @@ const PragmaticFileTree = ({
       onDrag: ({ location, source }) => {
         // Only react to sidebar drags — ignore tab/directory-bar sources
         if (source.data.type !== 'TREE_NODE') return;
+        const activeSession = dragSessionRef.current;
+        if (
+          !activeSession
+          || activeSession.sourceId !== source.data.fileId
+          || activeSession.transportToken !== String(source.data.dragToken || '')
+        ) {
+          console.log(
+            DND_LOG_PREFIX,
+            `session=${activeSession?.id || '-'} drag-skip stale-transport` +
+            ` source=${shortPath(source.data.fileId)}` +
+            ` token=${source.data.dragToken || '-'} activeToken=${activeSession?.transportToken || '-'}`
+          );
+          return;
+        }
+        // Electron can emit one more dragover after the early-release path has
+        // already committed and cleared the gesture. Treat the early-commit ref
+        // as a tombstone so that stale events cannot recreate a one-frame target.
+        if (dragEarlyCommitRef.current || !isDraggingGlobalRef.current) return;
         const input = location.current.input;
         const metaKey = !!input.metaKey;
         dragLastModifiersRef.current = { metaKey };
@@ -4289,6 +4578,10 @@ const PragmaticFileTree = ({
         dragLastModifiersRef.current = { metaKey: false };
         dragLastLayoutPreviewRef.current = null;
         dragLastVisualParentPreviewRef.current = null;
+        dragLastResolvedActionRef.current = null;
+        dragLastBoundaryPreviewRef.current = null;
+        dragLastResolveSnapshotRef.current = null;
+        if (dragSessionRef.current) dragSessionRef.current.activeBlockBoundary = null;
         lastDragClientXRef.current = null;
         lastDragClientYRef.current = null;
         updatePinnedDragSource(null, 'drag-leave');
@@ -4300,47 +4593,119 @@ const PragmaticFileTree = ({
         // Только для drag из sidebar
         if (source.data.type !== 'TREE_NODE') return;
 
-        const sessionId = currentDragSessionId();
+        const sourceId = source.data.fileId;
+        const sourceTransportToken = String(source.data.dragToken || '');
+        const activeSessionAtDrop = dragSessionRef.current;
+        const earlyRecordAtDrop = dragEarlyCommitRef.current;
+        const activeTransportMatches = !!activeSessionAtDrop
+          && activeSessionAtDrop.sourceId === sourceId
+          && activeSessionAtDrop.transportToken === sourceTransportToken;
+        const earlyTransportMatches = !!earlyRecordAtDrop
+          && earlyRecordAtDrop.sourceId === sourceId
+          && earlyRecordAtDrop.transportToken === sourceTransportToken;
+        if (!activeTransportMatches && !earlyTransportMatches) {
+          console.log(
+            DND_LOG_PREFIX,
+            `session=${activeSessionAtDrop?.id || '-'} drop-skip stale-transport` +
+            ` source=${shortPath(sourceId)} token=${sourceTransportToken || '-'}` +
+            ` activeToken=${activeSessionAtDrop?.transportToken || '-'}`
+          );
+          return;
+        }
+        // A late Atlaskit drop from an early-committed gesture must not touch a
+        // newer gesture that has already replaced the active session.
+        if (!activeTransportMatches && earlyTransportMatches) return;
+
+        const sessionId = activeSessionAtDrop.id;
         const dropAt = performance.now();
         const physicalEnd = dragPhysicalEndRef.current;
         const physicalDelay = physicalEnd?.at == null ? null : dropAt - physicalEnd.at;
         const sinceStart = dragSessionRef.current?.startAt == null ? null : dropAt - dragSessionRef.current.startAt;
         dragDropStartedRef.current = true;
         const input = location.current.input;
-        const sourceId = source.data.fileId;
+        const dropClientX = input.clientX;
+        const dropClientY = input.clientY;
+        const currentDropTargets = Array.isArray(location.current.dropTargets)
+          ? location.current.dropTargets
+          : [];
+        const treeRoot = containerRef.current;
+        const hasCurrentTreeTarget = currentDropTargets.some(target => (
+          target?.element === treeRoot || treeRoot?.contains?.(target?.element)
+        ));
+        const isInsideSurface = isPointInsideDragSurface(dropClientX, dropClientY);
+        if ((!isInsideSurface || !hasCurrentTreeTarget) && !earlyTransportMatches) {
+          const cancelReason = isInsideSurface ? 'no-current-target' : 'outside';
+          console.log(
+            DND_LOG_PREFIX,
+            `session=${sessionId} drop cancelled reason=${cancelReason} source=${shortPath(sourceId)}` +
+            ` x=${Math.round(dropClientX)} y=${Math.round(dropClientY)}` +
+            ` targets=${currentDropTargets.length}`
+          );
+          dragEarlyCommitRef.current = null;
+          flushSync(() => {
+            clearDragVisualState(`drop-${cancelReason}`, { clearPreview: true, clearSession: true });
+          });
+          schedulePostDropFrameAudit(`drop-${cancelReason}`, {
+            sessionId,
+            sourceId,
+            pointerY: dropClientY,
+          });
+          return;
+        }
         const earlyCommit = dragEarlyCommitRef.current;
         if (
           sourceId &&
           earlyCommit &&
           !earlyCommit.consumedByDrop &&
-          earlyCommit.sourceId === sourceId
+          earlyCommit.sourceId === sourceId &&
+          earlyCommit.transportToken === sourceTransportToken
         ) {
           const earlySessionId = earlyCommit.sessionId || sessionId;
           earlyCommit.consumedByDrop = true;
+          const earlySucceeded = earlyCommit.completion
+            ? await Promise.resolve(earlyCommit.completion).catch(() => false)
+            : !!earlyCommit.succeeded;
           console.log(
             DND_LOG_PREFIX,
             `session=${earlySessionId} drop-skip early-commit` +
             ` wall=${Date.now()}` +
             ` source=${shortPath(sourceId)}` +
             ` expected=${formatIdList(earlyCommit.expectedIds)}` +
+            ` succeeded=${earlySucceeded ? 1 : 0}` +
             ` sinceEarly=${earlyCommit.startedAtWall ? `${Date.now() - earlyCommit.startedAtWall}ms` : '-'}` +
             ` ${earlyCommit.actionLog || ''}`
           );
-          flushSync(() => {
-            clearDragVisualState('drop-skip-early-commit', { clearPreview: true, clearSession: true });
-          });
+          const currentSession = dragSessionRef.current;
+          const stillCurrent = currentSession?.id === earlySessionId
+            && currentSession?.transportToken === earlyCommit.transportToken;
+          if (stillCurrent) {
+            flushSync(() => {
+              setSuppressTreeDropTargets(false);
+              clearDragVisualState('drop-skip-early-commit', {
+                clearPreview: true,
+                clearSession: true,
+                finalizeExpansion: false,
+              });
+            });
+          }
+          if (!earlyCommit.expansionFinalized) {
+            earlyCommit.expansionFinalized = true;
+            finalizeTemporaryDragExpansions(
+              earlyCommit.session,
+              earlySucceeded,
+              'drop-skip-early-commit'
+            );
+          }
           schedulePostDropFrameAudit('drop-skip-early-commit', {
             sessionId: earlySessionId,
             sourceId,
             expectedIds: earlyCommit.expectedIds,
             pointerY: input.clientY,
           });
-          dragEarlyCommitRef.current = null;
+          if (dragEarlyCommitRef.current === earlyCommit) dragEarlyCommitRef.current = null;
           return;
         }
 
-        const dropClientX = input.clientX;
-        const dropClientY = input.clientY;
         const dropMetaKey = !!input.metaKey;
         const lastMetaKey = !!dragLastModifiersRef.current?.metaKey;
         const metaKey = dropMetaKey || lastMetaKey;
@@ -4383,6 +4748,13 @@ const PragmaticFileTree = ({
               );
             }
           }
+        }
+        if (
+          dragSessionRef.current?.id !== sessionId
+          || dragSessionRef.current?.transportToken !== sourceTransportToken
+        ) {
+          console.log(DND_LOG_PREFIX, `session=${sessionId} drop-skip session-replaced-during-rebase`);
+          return;
         }
         const resolvedAction = geometryRebasePending
           ? null
@@ -4452,10 +4824,6 @@ const PragmaticFileTree = ({
           ` lastVisualParentDetail=${lastVisualParentPreviewAction?.detail || 'none'}` +
           ` ${formatActionLog(action)} ${formatScrollSnapshot(getScrollSnapshot())}`
         );
-        flushSync(() => {
-          clearDragVisualState('drop-begin', { clearPreview: false, clearSession: false });
-        });
-
         if (!sourceId) {
           flushSync(() => {
             clearDragVisualState('drop-no-source', { clearPreview: true, clearSession: true });
@@ -4494,8 +4862,29 @@ const PragmaticFileTree = ({
           return;
         }
 
+        if (action.kind === 'layout' && action.visualBlockedReason && !action.orderChanged) {
+          console.log(
+            DND_LOG_PREFIX,
+            `session=${sessionId} drop cancelled reason=${action.visualBlockedReason}` +
+            ` source=${shortPath(sourceId)} ${formatActionLog(action)}`
+          );
+          flushSync(() => {
+            clearDragVisualState('drop-horizontal-blocked', { clearPreview: true, clearSession: true });
+          });
+          return;
+        }
+
+        const capturedDropSession = dragSessionRef.current;
+        flushSync(() => {
+          clearDragVisualState('drop-begin', {
+            clearPreview: true,
+            clearSession: true,
+            finalizeExpansion: false,
+          });
+        });
         let finishReason = action.kind === 'layout' ? 'drop-layout' : 'drop-move';
         let finishExpectedIds = [sourceId];
+        let dropSucceeded = false;
 
         try {
           if (action.kind === 'layout') {
@@ -4506,12 +4895,14 @@ const PragmaticFileTree = ({
             console.log(DND_LOG_PREFIX, `session=${sessionId} drop layout source=${shortPath(sourceId)} ${formatActionLog(action)}`);
             schedulePostDropReveal(sourceId, sessionId, 'drop-layout');
             markDropConfirmed(sourceId, sessionId, 'drop-layout');
+            dropSucceeded = true;
             return;
           }
 
           const destinationFolder = action.destinationFolder;
           console.log(DND_LOG_PREFIX, `session=${sessionId} drop move source=${shortPath(sourceId)} ${formatActionLog(action)}`);
-          commitPendingPreviewLayoutForMove(sessionId, 'drop-cmd-move');
+          const previewLayoutCommitted = commitPendingPreviewLayoutForMove(sessionId, 'drop-cmd-move');
+          dropSucceeded = previewLayoutCommitted;
 
           // 2. Execute Move (multi-select: move all selected items)
           if (destinationFolder) {
@@ -4568,6 +4959,7 @@ const PragmaticFileTree = ({
               const successTargets = successfulMoveTargets(results);
               if (successTargets.length > 0) {
                 finishExpectedIds = successTargets;
+                dropSucceeded = true;
                 schedulePostDropReveal(successTargets[0], sessionId, 'drop-move-success');
                 markDropConfirmed(successTargets, sessionId, 'drop-move-success');
               } else {
@@ -4592,6 +4984,7 @@ const PragmaticFileTree = ({
                 console.log(DND_LOG_PREFIX, `moveItem ${shortPath(sid)} -> ${shortPath(destinationFolder)}`);
                 const success = await fileApi?.moveItem?.(sid, destinationFolder);
                 if (success) {
+                    dropSucceeded = true;
                     console.log(DND_LOG_PREFIX, `move success ${shortPath(nPath)}`);
                     if (onRename) onRename(sid, nPath);
                     schedulePostDropReveal(nPath, sessionId, 'drop-move-fallback');
@@ -4602,12 +4995,7 @@ const PragmaticFileTree = ({
             }
           }
         } finally {
-          flushSync(() => {
-            clearDragVisualState(finishReason, {
-              clearPreview: true,
-              clearSession: true,
-            });
-          });
+          finalizeTemporaryDragExpansions(capturedDropSession, dropSucceeded, finishReason);
           schedulePostDropFrameAudit(finishReason, {
             sessionId,
             sourceId,
@@ -4617,7 +5005,7 @@ const PragmaticFileTree = ({
         }
       }
     });
-  }, [folderPath, onRename, onApplySidebarLayout, onMoveItems, sidebarLayout, captureDragGeometry, collectVisualChildren, resolveSidebarDrag, resolveAndApplyDragPreview, clearDragVisualState, cancelGlobalAutoExpand, scheduleGlobalAutoExpand, schedulePostDropReveal, schedulePostDropFrameAudit, updatePinnedDragSource, updateScrollHintEdge, resetScrollHintEdge, getScrollSnapshot, formatScrollSnapshot, sourceRectDiagnostics, currentDragSessionId, setPreviewLayout, commitPendingPreviewLayoutForMove, markDropConfirmed, setDragFolderMode, fileApi]);
+  }, [folderPath, onRename, onApplySidebarLayout, onMoveItems, sidebarLayout, captureDragGeometry, collectVisualChildren, normalizeDragSelection, resolveSidebarDrag, resolveAndApplyDragPreview, clearDragVisualState, cancelGlobalAutoExpand, scheduleGlobalAutoExpand, schedulePostDropReveal, schedulePostDropFrameAudit, updatePinnedDragSource, updateScrollHintEdge, resetScrollHintEdge, getScrollSnapshot, formatScrollSnapshot, sourceRectDiagnostics, currentDragSessionId, finalizeTemporaryDragExpansions, isPointInsideDragSurface, setPreviewLayout, commitPendingPreviewLayoutForMove, markDropConfirmed, setDragFolderMode, fileApi]);
 
   // Root Drop Target (The empty area)
   useEffect(() => {
@@ -4835,6 +5223,7 @@ const PragmaticFileTree = ({
             isSelected={activeFilePath === node.id}
             isEditing={editingId === node.id}
             isOverFolder={overFolderId === node.id}
+            springOpenState={dragFolderSpringState?.folderId === node.id ? dragFolderSpringState : null}
             isInsideOverFolder={overFolderId && node.id.startsWith(overFolderId + '/')}
             isDropConfirmed={dropConfirmedIds.has(node.id)}
             onToggle={handleToggle}
@@ -4859,6 +5248,7 @@ const PragmaticFileTree = ({
             rawNode={nodeMap.get(node.id)}
             fileProjects={!node.isDirectory ? projects.filter(p => (p.files || []).includes(node.id)) : null}
             isGlobalDragging={isDraggingGlobal}
+            suppressDropTargets={suppressTreeDropTargets}
             IndexButtonComponent={IndexButtonComponent}
             onOpenProjectFile={onOpenProjectFile}
           />

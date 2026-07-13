@@ -1039,6 +1039,25 @@ function _normalizePromptStatusText(text) {
     .trim();
 }
 
+function _boundClaudeAssistantContext(blocks, maxChars = 8000) {
+  const values = (Array.isArray(blocks) ? blocks : [])
+    .map((value) => String(value || '').replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim())
+    .filter(Boolean);
+  if (values.length === 0) return '';
+  const limit = Math.max(500, Math.min(16000, Number(maxChars) || 8000));
+  const joined = values.join('\n\n');
+  if (joined.length <= limit) return joined;
+  const first = values[0];
+  const last = values[values.length - 1];
+  if (values.length === 1) {
+    const head = Math.floor(limit * 0.4);
+    return first.slice(0, head).trimEnd() + '\n…\n' + first.slice(-(limit - head - 3)).trimStart();
+  }
+  const firstLimit = Math.min(Math.floor(limit * 0.35), first.length);
+  const lastLimit = Math.max(0, limit - firstLimit - 3);
+  return first.slice(0, firstLimit).trimEnd() + '\n…\n' + last.slice(-lastLimit).trimStart();
+}
+
 function _applyEditableLastPromptStatus(entries, promptState) {
   if (!Array.isArray(entries) || promptState?.status !== 'editable-last-prompt') return null;
   const targetUuid = String(promptState.targetUuid || '');
@@ -1070,6 +1089,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
     includeText = true, includeThinking = true,
     includeBash = false, includeTools = false,
     includeWebSearch = false, includeToolSearch = false, includeOtherTools = includeTools,
+    assistantOnly = false, maxChars = 8000,
   }) => {
     console.log('[Claude Export] Exporting range from', startUuid, 'to', endUuid);
 
@@ -1232,6 +1252,29 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       }
 
       const range = activeHistory.slice(minIdx, maxIdx + 1);
+
+      if (assistantOnly) {
+        const assistantBlocks = [];
+        for (const entry of range) {
+          if (entry?.type !== 'assistant' || entry.isSidechain || entry.type === 'summary') continue;
+          const content = entry.message?.content;
+          if (typeof content === 'string') {
+            if (content.trim()) assistantBlocks.push(content);
+            continue;
+          }
+          if (!Array.isArray(content)) continue;
+          const text = content
+            .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+            .map((block) => block.text)
+            .join('\n\n')
+            .trim();
+          if (text) assistantBlocks.push(text);
+        }
+        const assistantText = _boundClaudeAssistantContext(assistantBlocks, maxChars);
+        return assistantText
+          ? { success: true, assistantText, assistantMessageCount: assistantBlocks.length }
+          : { success: false, error: 'No completed assistant response found' };
+      }
 
       // Group-based filtering flags forwarded to formatToolAction.
       // reading/editing keep their legacy meaning, bash/tools are new.

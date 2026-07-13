@@ -239,6 +239,10 @@ Drag-семантика разделена по осям. Горизонталь
 
 Parent-вкладка переносит всё visual-subtree атомарным блоком, а перенос отдельного child сохраняет его descendants. Это исключает промежуточный порядок `parent, чужая строка, child` и не разрушает ветку после обычного reorder. Тот же контракт действует для terminal- и linked Markdown-вкладок: тип содержимого не меняет механику hierarchy. Несколько consecutive visual-children рисуют непрерывные ancestor-connectors; линия не должна обрываться между sibling-ветками или смещаться из центра parent glyph. Fork из текущей Claude/Codex/Gemini/SDK-вкладки создаётся visual-child исходной вкладки, а clipboard-fork по произвольному UUID остаётся плоским, потому что известного source-tab нет.
 
+После валидного drop список раскрывает место результата только до полезного контекста: корень перенесённого блока и до трёх первых помещающихся descendants с небольшим отступом от края viewport. Попытка показать весь длинный раскрытый контейнер уводила viewport к хвосту, а один заголовок не подтверждал сохранённое раскрытие. Новый drag отменяет незавершённую reveal-анимацию; cancel/outside её не запускают.
+
+Конкретные причины прежнего расщепления parent-блоков, отмены drop при размонтировании source и stale commit после `Escape`/outside сохранены в `knowledge/fix-иерархия-перетаскивания.md`.
+
 ### Файловые вкладки как visual-child
 
 Файл, прикреплённый из file explorer через `Link File`, становится обычной видимой вкладкой `tabType='file'`, но не AI/terminal-сессией. Он создаётся рядом с выбранной Claude/Codex/SDK-вкладкой, наследует её `groupId` и получает `visualParentTabId=<targetTabId>`, чтобы читаться как рабочий артефакт этой сессии. Мотивация UX: пользователь хочет открыть нужный файл прямо из области вкладок и не возвращаться в дерево через `Cmd+B` только ради просмотра.
@@ -259,6 +263,13 @@ File-tab не архивируется в `tab_history` при закрытии 
 ### Vertical DnD через snapshot геометрии
 
 Вертикальный DnD использует `@atlaskit/pragmatic-drag-and-drop` как транспорт событий, но preview/drop решаются своей моделью: на drag-start фиксируется static geometry (`captureVerticalDragGeometry`), а каждый pointer-move пересчитывает layout от base-order через `resolveStaticVerticalPreview`. Не считать от live DOM: inline-preview сам меняет порядок строк, высоту групп и границы body/header, поэтому следующий hit-test видит уже мутировавшую карту и начинает дёргаться на верхней границе элемента или группы.
+
+В TabSidebar этот pickup-snapshot намеренно живёт до конца всего жеста: после inline-preview
+или FLIP его нельзя переснимать из переставленного DOM. Автоскролл не требует recapture —
+к координате добавляется разница между текущим `scrollTop` и `scrollTop` в момент pickup,
+а drop считается в той же системе координат. Попытка обновлять геометрию после каждого
+preview возвращала цикл «preview сдвинул строки → новый snapshot сменил target → строки
+дёрнулись обратно», хотя курсор двигался монотонно.
 
 Atlaskit hitbox `list-item` instruction используется как нормализованный язык `reorder-before` / `reorder-after` / `combine`, но не как источник живой геометрии. Drop targets отдают instruction для индикатора и логов, а static resolver пересчитывает эквивалентную instruction от snapshot-rect'ов и `effectiveY`. Это важно для групп: `combine` на group header означает «положить внутрь контейнера», но footer/empty-zone ниже списка остаётся append вне группы.
 

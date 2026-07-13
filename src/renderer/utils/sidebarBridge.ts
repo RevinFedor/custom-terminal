@@ -14,6 +14,7 @@ if (!window.electronAPI) {
     createFolder: (folderPath: string) => ipcRenderer.invoke('file:create-folder', folderPath),
     deletePath: (targetPath: string) => ipcRenderer.invoke('file:delete', targetPath),
     moveItem: (srcPath: string, destDir: string) => ipcRenderer.invoke('file:move-item', srcPath, destDir),
+    pathsExist: (paths: string[]) => ipcRenderer.invoke('file:paths-exist', paths),
     readFileForUndo: (targetPath: string) => ipcRenderer.invoke('file:read-for-undo', targetPath),
     restoreFromUndo: (data: any) => ipcRenderer.invoke('file:restore-from-undo', data),
 

@@ -85,7 +85,7 @@ const effectiveClaudeSessionId = useWorkspaceStore((s) => {
 
 ## Ловушка: selector возвращает свежий пустой массив
 
-Обратная сторона стабильных селекторов: fallback-значения тоже должны иметь стабильную ссылку. Production-шрам 2026-07-04: `Cmd+\` открывал HistoryPanel и renderer падал с React `#185` / `Maximum update depth exceeded`; ErrorBoundary stack показывал `forceStoreRerender -> updateStoreInstance`, component stack `AgentHistoryControls -> HistoryPanel -> Workspace`. Причина была в selector-е вида `historyPromptDraftImages[tabId] || []`: когда картинок нет, каждый snapshot возвращал новый `[]`, и React/Zustand видел бесконечно меняющийся store snapshot даже без реального изменения данных.
+Обратная сторона стабильных селекторов: fallback-значения тоже должны иметь стабильную ссылку. Production-шрам 2026-07-04: `Cmd+]` открывал HistoryPanel и renderer падал с React `#185` / `Maximum update depth exceeded`; ErrorBoundary stack показывал `forceStoreRerender -> updateStoreInstance`, component stack `AgentHistoryControls -> HistoryPanel -> Workspace`. Причина была в selector-е вида `historyPromptDraftImages[tabId] || []`: когда картинок нет, каждый snapshot возвращал новый `[]`, и React/Zustand видел бесконечно меняющийся store snapshot даже без реального изменения данных.
 
 Правило: fallback для array/object selector-а выносить в module-level константу (`EMPTY_IMAGES`, `EMPTY_ENTRIES`) или возвращать primitive/null. Не писать `|| []`, `?? {}` и inline `new Map()` внутри `useStore(selector)`. Это не оптимизация: такой selector может уронить production build при mount controls, даже если store вообще не обновлялся.
 

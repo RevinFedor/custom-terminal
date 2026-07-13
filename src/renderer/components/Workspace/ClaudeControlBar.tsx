@@ -12,7 +12,10 @@ import {
   DEFAULT_CODEX_EFFORT,
   DEFAULT_CODEX_MODEL,
   mergeCodexModelOptions,
+  resolveCodexEffortForModel,
+  type CodexModelOption,
 } from '../../constants/codexSettings';
+import CenteredUpwardPopover from '../UI/CenteredUpwardPopover';
 import { PROVIDER_CATALOG } from './providerCatalog';
 import SessionActionChip from './SessionActionChip';
 import MicButton from './MicButton';
@@ -446,9 +449,14 @@ export default function ClaudeControlBar({
   // Live bridge data (PTY only): model name + context %.
   const [claudeModel, setClaudeModel] = useState<string | null>(null);
   const [contextPct, setContextPct] = useState<number>(0);
-  const [codexModels, setCodexModels] = useState<Array<{ id: string; label: string; defaultEffort?: string; efforts?: string[] }>>([]);
+  const [codexModels, setCodexModels] = useState<CodexModelOption[]>([]);
   const claudeCodeSettings = useUIStore((s) => s.claudeCodeSettings);
   const codexSettings = useUIStore((s) => s.codexSettings);
+  const quickCodexReturnRef = useRef<{ model: string; effort: string } | null>(null);
+  const [quickCodexApplied, setQuickCodexApplied] = useState(false);
+  const [quickCodexHover, setQuickCodexHover] = useState(false);
+  const [quickCodexRect, setQuickCodexRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  const quickCodexButtonRef = useRef<HTMLButtonElement | null>(null);
   // Cache cooldown chip data: split + the timestamp this turn touched the cache.
   // Anthropic's prompt cache uses a 1h TTL that REFRESHES on every use, so `ts`
   // is the cooldown anchor — countdown = 60min − (now − ts). PTY arrives via
@@ -997,6 +1005,21 @@ export default function ClaudeControlBar({
   }, [tabId]);
 
   const activeCodexModel = codexModels.find(m => m.id === codexModel) || codexModels[0];
+  const visibleCodexModels = useMemo(() => {
+    const visible = codexModels.filter((model) => model.visible !== false);
+    // Keep the control usable if every row was unchecked in Settings. The
+    // currently active model remains as the only escape route back to Settings.
+    return visible.length > 0 ? visible : codexModels.filter((model) => model.id === codexModel);
+  }, [codexModel, codexModels]);
+  const quickCodexModel = codexModels.find((model) => model.id === codexSettings.quickModel)
+    || codexSettings.models.find((model) => model.id === codexSettings.quickModel);
+  const quickCodexEffort = quickCodexModel
+    ? resolveCodexEffortForModel(quickCodexModel, codexSettings.quickEffort)
+    : null;
+  const hasQuickCodexPreset = !!quickCodexModel && !!quickCodexEffort;
+  const quickCodexMatchesCurrent = hasQuickCodexPreset
+    && codexModel === quickCodexModel!.id
+    && codexEffort === quickCodexEffort;
   const claudeCodeModels = claudeCodeSettings.models;
   const claudeCodeEfforts = claudeCodeSettings.efforts;
   const effortLevels = isCodex
@@ -1046,37 +1069,60 @@ export default function ClaudeControlBar({
     return thinkLocal ?? true;
   })();
 
-  // ===== popup state — tri-mode trigger =====
-  // Popup может открыться тремя путями (см. `EffortSelector` в StatusBar.tsx,
-  // тот же паттерн):
-  //   • Click по chip → pinnedPopup, закрывается click-outside.
-  //   • CMD + hover на chip → tempPopup, закрывается отпусканием CMD + увод курсора.
-  //   • Курсор на popup'е → popupHover, держит открытым после отпускания CMD.
-  // Один popup за раз: переход CMD-hover с одного триггера на другой переключает.
+  const clearQuickCodexToggle = () => {
+    quickCodexReturnRef.current = null;
+    setQuickCodexApplied(false);
+  };
+
+  useEffect(() => {
+    clearQuickCodexToggle();
+  }, [tabId, codexSettings.quickModel, quickCodexEffort]);
+
+  useEffect(() => {
+    if (quickCodexApplied && (!hasQuickCodexPreset || !quickCodexMatchesCurrent)) {
+      clearQuickCodexToggle();
+    }
+  }, [hasQuickCodexPreset, quickCodexApplied, quickCodexMatchesCurrent]);
+
+  // ===== popup state =====
+  // Hover opens a temporary menu. Click upgrades it to a pinned state with an
+  // explicit white frame; click-outside and Escape are the dismissal paths.
   type PopupKey = 'provider' | 'model' | 'effort';
   const [pinnedPopup, setPinnedPopup] = useState<PopupKey | null>(null);
   const [hoveredTrigger, setHoveredTrigger] = useState<PopupKey | null>(null);
   const [hoveredPopup, setHoveredPopup] = useState<PopupKey | null>(null);
+  const [hoveredCodexMenuModel, setHoveredCodexMenuModel] = useState<string | null>(null);
+  const [hoveredCodexMenuAnchor, setHoveredCodexMenuAnchor] = useState<HTMLButtonElement | null>(null);
   const isCmdPressed = useCmdKey();
   const showSessionIdTooltip = isCmdPressed && sessionCopyHover && hasArtifactSession && !!sessionCopyRect;
+  const showQuickCodexTooltip = isCodex && isCmdPressed && quickCodexHover && hasQuickCodexPreset && !!quickCodexRect;
 
   useEffect(() => {
     if (!codexModelDisabled) return;
     setPinnedPopup(null);
     setHoveredTrigger(null);
     setHoveredPopup(null);
+    setHoveredCodexMenuModel(null);
+    setHoveredCodexMenuAnchor(null);
   }, [codexModelDisabled]);
 
   // Derived: какой popup сейчас визуально открыт.
   const openPopup: PopupKey | null =
     pinnedPopup
-    ?? (isCmdPressed && hoveredTrigger ? hoveredTrigger : null)
+    ?? hoveredTrigger
     ?? hoveredPopup;
 
   const rootRef = useRef<HTMLDivElement>(null);
   // Refs на каждый trigger + popup для geometric bridge (mousemove hit-test).
   const triggerRefs = useRef<Record<PopupKey, HTMLButtonElement | null>>({ provider: null, model: null, effort: null });
   const popupRefs = useRef<Record<PopupKey, HTMLDivElement | null>>({ provider: null, model: null, effort: null });
+  const modelEffortPopupRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (openPopup === 'model') return;
+    setHoveredCodexMenuModel(null);
+    setHoveredCodexMenuAnchor(null);
+  }, [openPopup]);
 
   // Click-outside закрывает только pinned popup (CMD-hover закрывается по
   // отпусканию CMD сам).
@@ -1086,10 +1132,20 @@ export default function ClaudeControlBar({
       const target = e.target as Node;
       const inRoot = !!rootRef.current?.contains(target);
       const inPopup = !!popupRefs.current[pinnedPopup]?.contains(target);
-      if (!inRoot && !inPopup) setPinnedPopup(null);
+      const inModelEffortPopup = pinnedPopup === 'model' && !!modelEffortPopupRef.current?.contains(target);
+      if (!inRoot && !inPopup && !inModelEffortPopup) setPinnedPopup(null);
     };
     document.addEventListener('mousedown', onDown);
     return () => document.removeEventListener('mousedown', onDown);
+  }, [pinnedPopup]);
+
+  useEffect(() => {
+    if (!pinnedPopup) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setPinnedPopup(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
   }, [pinnedPopup]);
 
   // Geometric bridge: пока popup открыт, mousemove пересчитывает hoveredTrigger
@@ -1105,10 +1161,14 @@ export default function ClaudeControlBar({
       (['provider', 'model', 'effort'] as PopupKey[]).forEach((key) => {
         const t = triggerRefs.current[key]?.getBoundingClientRect();
         const p = popupRefs.current[key]?.getBoundingClientRect();
+        const secondary = key === 'model' ? modelEffortPopupRef.current?.getBoundingClientRect() : null;
         if (t && x >= t.left && x <= t.right && y >= t.top && y <= t.bottom) {
           newTrigger = key;
         }
         if (p && x >= p.left && x <= p.right && y >= p.top && y <= p.bottom) {
+          newPopup = key;
+        }
+        if (secondary && x >= secondary.left && x <= secondary.right && y >= secondary.top && y <= secondary.bottom) {
           newPopup = key;
         }
         // Bridge corridor: popup is ABOVE trigger, корридор между нижним краем
@@ -1129,11 +1189,10 @@ export default function ClaudeControlBar({
     return () => document.removeEventListener('mousemove', onMove);
   }, [openPopup]);
 
-  // Click на trigger toggle'ит pinned-state. Если popup был открыт через
-  // CMD-hover — клик его «закрепляет» (становится pinned, остаётся открытым
-  // после отпускания CMD). Если был уже pinned тот же — закрывает.
+  // A click pins the menu. Repeating it leaves the pin intact; click-outside is
+  // the single mouse gesture for dismissing a pinned menu.
   const togglePinned = (key: PopupKey) => {
-    setPinnedPopup((cur) => (cur === key ? null : key));
+    setPinnedPopup(key);
   };
 
   const triggerProps = (key: PopupKey) => ({
@@ -1146,7 +1205,22 @@ export default function ClaudeControlBar({
   const popupHoverProps = (key: PopupKey) => ({
     ref: (el: HTMLDivElement | null) => { popupRefs.current[key] = el; },
     onMouseEnter: () => setHoveredPopup(key),
-    onMouseLeave: () => setHoveredPopup((cur) => (cur === key ? null : cur)),
+    onMouseLeave: (event: React.MouseEvent<HTMLDivElement>) => {
+      const related = event.relatedTarget;
+      if (
+        key === 'model'
+        && related instanceof Node
+        && modelEffortPopupRef.current?.contains(related)
+      ) {
+        setHoveredPopup('model');
+        return;
+      }
+      setHoveredPopup((cur) => (cur === key ? null : cur));
+      if (key === 'model') {
+        setHoveredCodexMenuModel(null);
+        setHoveredCodexMenuAnchor(null);
+      }
+    },
   });
 
   const syncCodexPickerOptions = (result: any) => {
@@ -1225,61 +1299,65 @@ export default function ClaudeControlBar({
     } finally { setLocalBusy(false, 'deepseek-effort:' + level + ':finally'); focusTerminal(); }
   };
 
+  const applyCodexModelAndEffort = async (
+    model: string,
+    effort: string,
+    source: 'model' | 'effort' | 'quick',
+  ) => {
+    const requestedState = { codexModel: model, codexEffort: effort };
+    if (!isCommandRunning) {
+      updateCodexState(requestedState);
+      focusTerminal();
+      return { success: true, model, effort };
+    }
+
+    const busyReason = `codex-${source}:${model}/${effort}`;
+    setLocalBusy(true, busyReason);
+    try {
+      const draftState = await getCodexDraftStateForPicker();
+      if (!canOpenCodexPicker(draftState, source)) {
+        rejectCodexLivePickerWithoutStateChange(requestedState, `unsafe-input:${source}:${draftState.source}`);
+        return { success: false, model, effort: null };
+      }
+      const result = await ipcRenderer.invoke('codex:select-model-effort', {
+        tabId,
+        model,
+        effort,
+        hasDraft: draftState.hasDraft,
+        draftSource: draftState.source,
+        draftPreview: draftState.preview,
+        visualHasDraft: draftState.visualHasDraft,
+        visualSource: draftState.visualSource,
+        visualPreview: draftState.visualPreview,
+      });
+      console.log('[ControlBarLoader] codex-' + source + '-result tab=' + tabId.slice(-12) + ' model=' + model + ' effort=' + effort + ' result=' + JSON.stringify(result || null));
+      if (!result?.success) {
+        rejectCodexLivePickerWithoutStateChange(requestedState, `picker-failed:${source}:${result?.error || 'unknown'}`);
+        return { success: false, model, effort: null };
+      }
+      syncCodexPickerOptions(result);
+      const appliedModel = result.model || model;
+      const appliedEffort = result.effortSkipped ? null : (result.effort || effort);
+      const patch: { codexModel: string; codexEffort?: string } = { codexModel: appliedModel };
+      if (appliedEffort) patch.codexEffort = appliedEffort;
+      updateCodexState(patch);
+      return { success: true, model: appliedModel, effort: appliedEffort };
+    } finally {
+      setLocalBusy(false, busyReason + ':finally');
+      focusTerminal();
+    }
+  };
+
   const pickModel = async (mid: string) => {
-    setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null);
+    setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null); setHoveredCodexMenuModel(null);
     const actionReason = 'model:' + mid;
     if (!beginControlAction(actionReason)) return;
     try {
     if (isCodex) {
-      const nextModel = codexModels.find(m => m.id === mid);
-      const efforts = nextModel?.efforts || [...CODEX_EFFORT_LEVELS];
-      const nextEffort = efforts.includes(codexEffort)
-        ? codexEffort
-        : (efforts.includes(DEFAULT_CODEX_EFFORT) ? DEFAULT_CODEX_EFFORT : (nextModel?.defaultEffort || efforts[0] || DEFAULT_CODEX_EFFORT));
-      const fallbackState = { codexModel: mid, codexEffort: nextEffort };
-      if (isCommandRunning) {
-        setLocalBusy(true, 'codex-model:' + mid + '/effort:' + nextEffort);
-        try {
-          const draftState = await getCodexDraftStateForPicker();
-          if (!canOpenCodexPicker(draftState)) {
-            rejectCodexLivePickerWithoutStateChange(
-              fallbackState,
-              'unsafe-input:model:' + draftState.source,
-            );
-            return;
-          }
-          const result = await ipcRenderer.invoke('codex:select-model-effort', {
-            tabId,
-            model: mid,
-            effort: nextEffort,
-            hasDraft: draftState.hasDraft,
-            draftSource: draftState.source,
-            draftPreview: draftState.preview,
-            visualHasDraft: draftState.visualHasDraft,
-            visualSource: draftState.visualSource,
-            visualPreview: draftState.visualPreview,
-          });
-          console.log('[ControlBarLoader] codex-model-result tab=' + tabId.slice(-12) + ' model=' + mid + ' effort=' + nextEffort + ' result=' + JSON.stringify(result || null));
-          if (result?.success) {
-            syncCodexPickerOptions(result);
-            const patch: { codexModel: string; codexEffort?: string } = { codexModel: result.model || mid };
-            if (!result.effortSkipped) {
-              patch.codexEffort = result.effort || nextEffort;
-              updateCodexState(patch);
-            } else {
-              updateCodexState(patch);
-            }
-          } else {
-            rejectCodexLivePickerWithoutStateChange(
-              fallbackState,
-              'picker-failed:model:' + (result?.error || 'unknown'),
-            );
-          }
-        } finally { setLocalBusy(false, 'codex-model:' + mid + ':finally'); focusTerminal(); }
-      } else {
-        updateCodexState(fallbackState);
-        focusTerminal();
-      }
+      const nextModel = codexModels.find((model) => model.id === mid);
+      const nextEffort = resolveCodexEffortForModel(nextModel, codexEffort) || DEFAULT_CODEX_EFFORT;
+      const result = await applyCodexModelAndEffort(mid, nextEffort, 'model');
+      if (result.success) clearQuickCodexToggle();
       return;
     }
     if (isSDKTab) {
@@ -1310,51 +1388,13 @@ export default function ClaudeControlBar({
   };
 
   const pickEffort = async (level: string) => {
-    setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null);
+    setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null); setHoveredCodexMenuModel(null);
     const actionReason = 'effort:' + level;
     if (!beginControlAction(actionReason)) return;
     try {
     if (isCodex) {
-      if (isCommandRunning) {
-        setLocalBusy(true, 'codex-effort:' + level);
-        try {
-          const draftState = await getCodexDraftStateForPicker();
-          if (!canOpenCodexPicker(draftState)) {
-            rejectCodexLivePickerWithoutStateChange(
-              { codexEffort: level },
-              'unsafe-input:effort:' + draftState.source,
-            );
-            return;
-          }
-          const result = await ipcRenderer.invoke('codex:select-model-effort', {
-            tabId,
-            model: codexModel,
-            effort: level,
-            hasDraft: draftState.hasDraft,
-            draftSource: draftState.source,
-            draftPreview: draftState.preview,
-            visualHasDraft: draftState.visualHasDraft,
-            visualSource: draftState.visualSource,
-            visualPreview: draftState.visualPreview,
-          });
-          console.log('[ControlBarLoader] codex-effort-result tab=' + tabId.slice(-12) + ' model=' + codexModel + ' effort=' + level + ' result=' + JSON.stringify(result || null));
-          if (result?.success && !result.effortSkipped) {
-            syncCodexPickerOptions(result);
-            updateCodexState({ codexModel: result.model || codexModel, codexEffort: result.effort || level });
-          } else if (result?.success) {
-            syncCodexPickerOptions(result);
-            updateCodexState({ codexModel: result.model || codexModel });
-          } else {
-            rejectCodexLivePickerWithoutStateChange(
-              { codexEffort: level },
-              'picker-failed:effort:' + (result?.error || 'unknown'),
-            );
-          }
-        } finally { setLocalBusy(false, 'codex-effort:' + level + ':finally'); focusTerminal(); }
-      } else {
-        updateCodexState({ codexEffort: level });
-        focusTerminal();
-      }
+      const result = await applyCodexModelAndEffort(codexModel, level, 'effort');
+      if (result.success) clearQuickCodexToggle();
     } else if (isSDKTab) {
       useWorkspaceStore.getState().updateSDKState(tabId, { sdkEffort: level });
       focusTerminal();
@@ -1363,6 +1403,52 @@ export default function ClaudeControlBar({
     } else {
       await setEffortOnPTY(level);
     }
+    } finally {
+      endControlAction(actionReason);
+    }
+  };
+
+  const pickCodexModelEffort = async (model: string, effort: string) => {
+    setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null); setHoveredCodexMenuModel(null);
+    const actionReason = `model-effort:${model}/${effort}`;
+    if (!beginControlAction(actionReason)) return;
+    try {
+      const result = await applyCodexModelAndEffort(model, effort, 'model');
+      if (result.success) clearQuickCodexToggle();
+    } finally {
+      endControlAction(actionReason);
+    }
+  };
+
+  const toggleQuickCodexPreset = async () => {
+    if (!isCodex || !quickCodexModel || !quickCodexEffort) return;
+
+    const restore = quickCodexApplied && quickCodexMatchesCurrent
+      ? quickCodexReturnRef.current
+      : null;
+    if (!restore && quickCodexMatchesCurrent) {
+      clearQuickCodexToggle();
+      return;
+    }
+
+    const target = restore || { model: quickCodexModel.id, effort: quickCodexEffort };
+    const actionReason = restore ? 'codex-quick-restore' : 'codex-quick-apply';
+    if (!beginControlAction(actionReason)) return;
+    try {
+      const result = await applyCodexModelAndEffort(target.model, target.effort, 'quick');
+      if (!result.success) return;
+
+      if (restore) {
+        clearQuickCodexToggle();
+        return;
+      }
+
+      if (result.model === quickCodexModel.id && result.effort === quickCodexEffort) {
+        quickCodexReturnRef.current = { model: codexModel, effort: codexEffort };
+        setQuickCodexApplied(true);
+      } else {
+        clearQuickCodexToggle();
+      }
     } finally {
       endControlAction(actionReason);
     }
@@ -1977,21 +2063,9 @@ export default function ClaudeControlBar({
     whiteSpace: 'nowrap',
   };
 
-  // Right-anchored: pills grow leftwards from the trigger's right edge so they
-  // stay inside the viewport. Provider/Model/Effort all live in the right
-  // cluster of the control bar — left-anchored popups (left: 0) clipped off
-  // the right edge of the window for Effort which sits closest to the corner.
-  //
-  // Outer wrapper: position:absolute (без визуала), его paddingBottom:4 +
-  // прижатый к trigger'у bottom:100% играют роль CSS-bridge (hit-area
-  // покрывает gap). Inner div — собственно карточка с боксом и тенью.
-  const popupWrapperStyle: React.CSSProperties = {
-    position: 'absolute',
-    right: 0,
-    bottom: '100%',
-    paddingBottom: 4,
-    zIndex: 100,
-  };
+  // The portal wrapper is flush with the trigger and owns the 4px invisible
+  // bridge. Its horizontal position is measured after mount, so the card stays
+  // centered over the trigger yet clamps before the Timeline/window edge.
   const popupCardStyle: React.CSSProperties = {
     display: 'flex',
     gap: 4,
@@ -2001,27 +2075,19 @@ export default function ClaudeControlBar({
     borderRadius: 4,
     boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
     whiteSpace: 'nowrap',
-  };
-  const getPortalPopupWrapperStyle = (key: PopupKey): React.CSSProperties | null => {
-    const rect = triggerRefs.current[key]?.getBoundingClientRect();
-    if (!rect) return null;
-    return {
-      ...popupWrapperStyle,
-      position: 'fixed',
-      right: Math.max(8, window.innerWidth - rect.right),
-      top: rect.top,
-      bottom: 'auto',
-      transform: 'translateY(-100%)',
-      zIndex: 10050,
-    };
+    flexWrap: 'wrap',
+    maxWidth: '100%',
   };
   const renderControlPopup = (key: PopupKey, children: React.ReactNode) => {
-    const style = getPortalPopupWrapperStyle(key);
-    if (!style) return null;
+    if (!triggerRefs.current[key]) return null;
     return createPortal(
-      <div {...popupHoverProps(key)} style={style}>
+      <CenteredUpwardPopover
+        {...popupHoverProps(key)}
+        getAnchorRect={() => triggerRefs.current[key]?.getBoundingClientRect() || null}
+        zIndex={10050}
+      >
         <div style={popupCardStyle}>{children}</div>
-      </div>,
+      </CenteredUpwardPopover>,
       document.body,
     );
   };
@@ -2586,7 +2652,7 @@ export default function ClaudeControlBar({
             `/fast` — отдельная live-команда. */}
       {showRightCluster && (() => {
         const canControl = isSDKTab ? true : isCommandRunning;
-        const modelOptions = isCodex ? codexModels : isAnthropicPTY ? claudeCodeModels : activeProvider.models;
+        const modelOptions = isCodex ? visibleCodexModels : isAnthropicPTY ? claudeCodeModels : activeProvider.models;
         return (
         <div
           className={isBusy ? 'control-bar-busy-overlay' : undefined}
@@ -2658,6 +2724,64 @@ export default function ClaudeControlBar({
             </div>
           )}
 
+          {isCodex && (
+            <div style={{ position: 'relative', display: 'inline-flex' }}>
+              <button
+                ref={quickCodexButtonRef}
+                type="button"
+                disabled={codexModelDisabled || !hasQuickCodexPreset}
+                onClick={toggleQuickCodexPreset}
+                onMouseEnter={(event) => {
+                  setQuickCodexHover(true);
+                  const rect = event.currentTarget.getBoundingClientRect();
+                  setQuickCodexRect({ left: rect.left, top: rect.top, width: rect.width, height: rect.height });
+                }}
+                onMouseLeave={() => {
+                  setQuickCodexHover(false);
+                  setQuickCodexRect(null);
+                }}
+                aria-label="Быстро переключить модель Codex"
+                title={codexModelDisabled
+                  ? 'Быстрое переключение доступно только при живом Codex'
+                  : !hasQuickCodexPreset
+                    ? 'Задайте модель и effort для быстрого переключения в Настройках'
+                    : quickCodexApplied && quickCodexMatchesCurrent
+                      ? 'Вернуть прежнюю модель и effort'
+                      : `Переключить на ${quickCodexModel?.label} / ${quickCodexEffort}`}
+                style={{
+                  ...triggerStyle,
+                  width: 22,
+                  padding: 0,
+                  justifyContent: 'center',
+                  color: codexModelDisabled || !hasQuickCodexPreset ? '#555' : quickCodexApplied && quickCodexMatchesCurrent ? '#fff' : '#b9c9ff',
+                  borderColor: quickCodexApplied && quickCodexMatchesCurrent ? '#fff' : 'rgba(122,157,255,0.46)',
+                  backgroundColor: quickCodexApplied && quickCodexMatchesCurrent ? 'rgba(122,157,255,0.24)' : 'transparent',
+                  cursor: codexModelDisabled || !hasQuickCodexPreset ? 'not-allowed' : 'pointer',
+                }}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                  <path d="M17 3l4 4-4 4" />
+                  <path d="M3 7h18" />
+                  <path d="M7 21l-4-4 4-4" />
+                  <path d="M21 17H3" />
+                </svg>
+              </button>
+              {showQuickCodexTooltip && quickCodexButtonRef.current && createPortal(
+                <CenteredUpwardPopover
+                  getAnchorRect={() => quickCodexButtonRef.current?.getBoundingClientRect() || null}
+                  zIndex={10060}
+                  style={{ pointerEvents: 'none' }}
+                >
+                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 8px', borderRadius: 5, border: '1px solid rgba(122,157,255,0.36)', background: '#101010', color: '#dce5ff', boxShadow: '0 8px 24px rgba(0,0,0,0.45)', fontSize: 11, whiteSpace: 'nowrap' }}>
+                    <span>{quickCodexModel?.label}</span>
+                    <span style={{ color: '#7A9DFF', fontWeight: 700 }}>{quickCodexEffort === 'medium' ? 'med' : quickCodexEffort === 'xhigh' ? 'xhi' : quickCodexEffort}</span>
+                  </div>
+                </CenteredUpwardPopover>,
+                document.body,
+              )}
+            </div>
+          )}
+
           {/* Model */}
           <div style={{ position: 'relative' }}>
             <button
@@ -2665,6 +2789,10 @@ export default function ClaudeControlBar({
               disabled={codexModelDisabled}
               style={{
                 ...triggerStyle,
+                ...(pinnedPopup === 'model' && !codexModelDisabled ? {
+                  borderColor: '#fff',
+                  boxShadow: '0 0 0 1px rgba(255,255,255,0.14)',
+                } : {}),
                 ...(codexModelDisabled ? {
                   color: '#555',
                   borderColor: 'rgba(255,255,255,0.08)',
@@ -2676,25 +2804,102 @@ export default function ClaudeControlBar({
                 ? 'Model доступен только при живом Codex'
                 : codexTurnBusy
                   ? 'Model можно сменить во время streaming; выбор применяется к следующей работе сессии'
-                  : 'Model (клик закрепит, ⌘+наведение откроет временно)'}
+                  : 'Наведите для выбора; клик закрепит меню'}
             >
-              <span style={{ color: codexModelDisabled ? '#555' : '#777', fontSize: 10 }}>Model</span>
               <span style={{ color: codexModelDisabled ? '#666' : '#fff' }}>{modelLabel}</span>
               <span style={{ opacity: codexModelDisabled ? 0.25 : 0.6 }}>▴</span>
             </button>
             {openPopup === 'model' && renderControlPopup('model',
-              modelOptions.map(m => {
-                    const active = m.id === modelActiveId;
+              isCodex ? (
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                  {modelOptions.map((model) => {
+                    const active = model.id === modelActiveId;
                     return (
                       <button
-                        key={m.id}
+                        key={model.id}
                         disabled={codexModelDisabled}
                         style={pillStyle(active, codexModelDisabled)}
-                        onClick={() => pickModel(m.id)}
-                      >{m.label}</button>
+                        onMouseEnter={(event) => {
+                          setHoveredCodexMenuModel(model.id);
+                          setHoveredCodexMenuAnchor(event.currentTarget);
+                        }}
+                        onClick={() => pickModel(model.id)}
+                      >{model.label}</button>
                     );
-                  })
+                  })}
+                </div>
+              ) : modelOptions.map((model) => {
+                const active = model.id === modelActiveId;
+                return (
+                  <button
+                    key={model.id}
+                    disabled={codexModelDisabled}
+                    style={pillStyle(active, codexModelDisabled)}
+                    onClick={() => pickModel(model.id)}
+                  >{model.label}</button>
+                );
+              })
             )}
+            {isCodex && openPopup === 'model' && hoveredCodexMenuAnchor && (() => {
+              const hoveredModel = codexModels.find((model) => model.id === hoveredCodexMenuModel);
+              const hoveredEfforts = hoveredModel?.efforts || [];
+              if (!hoveredModel || hoveredEfforts.length === 0) return null;
+              return createPortal(
+                <CenteredUpwardPopover
+                  ref={(node) => { modelEffortPopupRef.current = node; }}
+                  getAnchorRect={() => hoveredCodexMenuAnchor.getBoundingClientRect()}
+                  horizontalAlign="end"
+                  gap={4}
+                  zIndex={10055}
+                  style={{ width: 'max-content' }}
+                  onMouseEnter={() => setHoveredPopup('model')}
+                  onMouseLeave={(event) => {
+                    const related = event.relatedTarget;
+                    if (
+                      related instanceof Node
+                      && popupRefs.current.model?.contains(related)
+                    ) {
+                      setHoveredPopup('model');
+                      return;
+                    }
+                    setHoveredPopup((current) => (current === 'model' ? null : current));
+                    setHoveredCodexMenuModel(null);
+                    setHoveredCodexMenuAnchor(null);
+                  }}
+                >
+                  <div
+                    aria-label={`Effort для ${hoveredModel.label}`}
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 4,
+                      width: 'max-content',
+                      maxWidth: '100%',
+                      padding: 4,
+                      backgroundColor: '#1f1f1f',
+                      border: '1px solid rgba(255,255,255,0.1)',
+                      borderRadius: 4,
+                      boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {hoveredEfforts.map((effort) => (
+                      <button
+                        key={effort}
+                        type="button"
+                        disabled={codexEffortDisabled}
+                        onClick={() => pickCodexModelEffort(hoveredModel.id, effort)}
+                        style={pillStyle(hoveredModel.id === codexModel && effort === codexEffort, codexEffortDisabled)}
+                        title={`Выбрать ${hoveredModel.label} / ${effort}`}
+                      >
+                        {effort === 'medium' ? 'med' : effort === 'xhigh' ? 'xhi' : effort}
+                      </button>
+                    ))}
+                  </div>
+                </CenteredUpwardPopover>,
+                document.body,
+              );
+            })()}
           </div>
 
           {/* Effort. Dimmed (but still clickable) when Think is OFF — effort
@@ -2720,7 +2925,6 @@ export default function ClaudeControlBar({
               ? 'Effort применяется только когда Think включён'
               : 'Effort level'}
           >
-            <span style={{ color: '#777', fontSize: 10, marginRight: 4 }}>Effort</span>
             {effortLevels.map(level => {
               const active = effortActive === level;
               const isUltra = level === 'ultracode' || (isCodex && level === 'ultra');

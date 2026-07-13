@@ -61,6 +61,14 @@
 
 **Что НЕ трогаем.** Range-версия popover/menu (4858) использует тот же 4181-style guard, но работает (нет flip-up, нет re-measure на toggle) — оставлена как есть; латентный §2.7-шрам, если range-menu когда-нибудь начнёт флипаться. Fork tooltip (5272), note tooltip, resize (4231), lock/freeze, mousedown click-outside (1734) — не затронуты.
 
+### 7. Reactive refresh не равен исчезновению hover-сущности
+
+**Симптом.** Cmd-hover на semantic group header открывал popup, обычный transcript refresh скрывал его без движения курсора, а повторный Cmd не открывал окно до mouseleave/re-enter Timeline.
+
+**Причина.** Collapse-state hydration зависел от identity `semanticGroups[]`. Каждый refresh создавал новый array при тех же group IDs и безусловно чистил hovered/active group. Физический курсор оставался внутри header, поэтому новый `mouseenter` не приходил и восстановить state было нечем.
+
+**Решение.** Hydration зависит от stable group-ID signature, сохраняет hovered/active ID, пока он входит в новый valid set, и чистит его только при реальной смене owner или исчезновении самой группы. Array/reference equality не является lifecycle пользовательской сущности.
+
 ## Related Files
 - `src/renderer/components/Workspace/Timeline.tsx` — tooltop logic (parent onMouseLeave ~4177, nested keep-alive ~670, single-entry popover ~5251).
 - `knowledge/fact-timeline.md` — general timeline behavior (см. `Right-anchor через измеренный DOM (popupRightPx)`).

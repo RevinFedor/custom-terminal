@@ -70,3 +70,29 @@ test('fast grab reconciles pending refs when slot and pending counts are exact',
     [5, '/stable/b.png'],
   ]);
 });
+
+test('Ctrl+C during an active turn keeps image bindings for the queued draft', () => {
+  const registry = new CodexImageBindingRegistry();
+  const token = registry.stage('tab', [ref('a'), ref('b')]);
+  registry.begin('tab', token);
+  registry.observe('tab', '\u001b[2J\u203a [Image #1] text [Image #2]');
+
+  assert.equal(registry.handleTerminalInput('tab', '\x03'), false);
+  const result = registry.resolveGrab('tab', '[Image #1] text [Image #2]');
+
+  assert.equal(result.missing, 0);
+  assert.deepEqual(result.refs.map((item) => item.path), ['/stable/a.png', '/stable/b.png']);
+});
+
+test('Enter transfers composer ownership and clears old image bindings', () => {
+  const registry = new CodexImageBindingRegistry();
+  const token = registry.stage('tab', [ref('a')]);
+  registry.begin('tab', token);
+  registry.observe('tab', '\u001b[2J\u203a [Image #1]');
+
+  assert.equal(registry.handleTerminalInput('tab', '\r'), true);
+  const result = registry.resolveGrab('tab', '[Image #1]');
+
+  assert.equal(result.missing, 1);
+  assert.equal(result.refs.length, 0);
+});

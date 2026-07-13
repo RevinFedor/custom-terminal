@@ -1,7 +1,7 @@
 const crypto = require('node:crypto');
 
 const TIMELINE_GROUPING_PROMPT_ID = 'timeline-grouping';
-const OUTLINE_SCHEMA_VERSION = 1;
+const OUTLINE_SCHEMA_VERSION = 2;
 const DEFAULT_TOTAL_EXCERPT_CHARS = 120_000;
 const DEFAULT_MAX_EXCERPT_CHARS = 2_400;
 const MAX_INPUT_TOKENS = 180_000;
@@ -414,8 +414,7 @@ function validateOutline(rawOutline, eligibleEntries) {
   return { groups };
 }
 
-function buildOutlineResponseSchema(eligibleCount) {
-  const count = Math.max(1, Number(eligibleCount) || 1);
+function buildOutlineResponseSchema() {
   return {
     type: 'object',
     additionalProperties: false,
@@ -425,7 +424,6 @@ function buildOutlineResponseSchema(eligibleCount) {
       groups: {
         type: 'array',
         minItems: 1,
-        maxItems: count,
         items: {
           type: 'object',
           additionalProperties: false,
@@ -437,7 +435,6 @@ function buildOutlineResponseSchema(eligibleCount) {
             members: {
               type: 'array',
               minItems: 1,
-              maxItems: count,
               items: {
                 type: 'object',
                 additionalProperties: false,
@@ -445,7 +442,10 @@ function buildOutlineResponseSchema(eligibleCount) {
                 propertyOrdering: ['uuid', 'description', 'role'],
                 properties: {
                   uuid: { type: 'string' },
-                  description: { type: 'string', description: 'The function of this prompt inside its group.' },
+                  description: {
+                    type: 'string',
+                    description: 'Standalone action label for what the user wants to do, learn, verify, cancel, report, or continue in this turn.',
+                  },
                   role: { type: 'string', enum: MEMBER_ROLES },
                 },
               },
@@ -461,13 +461,72 @@ function buildProtocolInstruction() {
   return [
     'Return a semantic outline for the ordered Timeline prompts in the supplied JSON.',
     'The JSON response must match the provided response schema exactly.',
-    'Every input UUID must occur exactly once. Never invent, omit, or duplicate a UUID.',
+    'Every input prompt reference from the uuid field must occur exactly once. Never invent, omit, or duplicate a reference.',
     'Groups are flat, ordered, contiguous slices of the input. Do not nest groups or reorder prompts.',
     'A one-prompt group is allowed when that prompt does not belong to a neighboring topic.',
     'Use the language of the prompts for titles and descriptions. Do not use Markdown.',
     'A meta_prompt is an intentionally content-free procedural template; classify it from its title only.',
+    'Use a compact group title of two to five words. It must name the work phase rather than repeat a member action.',
+    'Each member description is the visible Timeline action label. In two to twelve words, state what the user wants to do, learn, check, change, cancel, report, or continue.',
+    'Write a concrete standalone action plus its object. Resolve references such as continue, do it, this, and the plan above from neighboring turns.',
+    'Preserve distinctive product, project, feature, protocol, file, and technology names from the source whenever they disambiguate the object, such as WebODM, Potree, SSH, Timeline, or History. Never replace a named entity with only a generic category such as frontend, tool, or feature.',
+    'Labels such as Continue work, Do it, Check functionality, Продолжить работу, Сделать это, Проверить функционал, or Уточнить вопрос are generic and forbidden. For a short continuation prompt, borrow the concrete unfinished action and object from the immediately preceding turn, for example Продолжить исправление 7 пунктов.',
+    'Prefer direct wording such as Проверить конфликт инструментов с WebODM or Что такое мультиселектор. Avoid boilerplate such as запрос на, вопрос про, диалог о, or просьба сделать.',
+    'Never return a generic standalone label such as implementation, continuation, execution, testing, clarification, planning, UI fix, Реализация, Продолжение, Выполнение, Тестирование, Уточнение, Планирование, or Исправление UI.',
+    'Describe the user intent, not an assumed agent result. Claim completion only when the source turn itself explicitly reports completion.',
+    'Do not repeat the member role in the member description. Do not end titles or member descriptions with a period.',
     'Keep group titles under 80 characters, group descriptions under 360 characters, and member descriptions under 200 characters.',
   ].join('\n');
+}
+
+function buildAiPromptReferences(entries) {
+  const refToUuid = new Map();
+  const prompts = (Array.isArray(entries) ? entries : []).map((entry, index) => {
+    const ref = 'p' + String(index + 1).padStart(4, '0');
+    refToUuid.set(ref, String(entry.uuid));
+    return { ...entry, uuid: ref };
+  });
+  return { prompts, refToUuid };
+}
+
+function remapOutlinePromptReferences(rawOutline, refToUuid) {
+  if (!rawOutline || typeof rawOutline !== 'object' || !Array.isArray(rawOutline.groups)) {
+    return rawOutline;
+  }
+  return {
+    ...rawOutline,
+    groups: rawOutline.groups.map((group) => {
+      if (!group || typeof group !== 'object' || !Array.isArray(group.members)) return group;
+      return {
+        ...group,
+        members: group.members.map((member) => {
+          if (!member || typeof member !== 'object' || Array.isArray(member)) return member;
+          const ref = String(member.uuid || '');
+          const uuid = refToUuid.get(ref);
+          if (!uuid) {
+            throw new TimelineOutlineError(
+              'unknown_outline_ref',
+              'Unknown Timeline prompt reference: ' + ref
+            );
+          }
+          return { ...member, uuid };
+        }),
+      };
+    }),
+  };
+}
+
+function buildCountTokensRequest(model, systemInstruction, requestText) {
+  // Gemini Developer API does not accept systemInstruction in countTokens,
+  // even though generateContent supports it. Count the exact combined text as
+  // ordinary user content so the safety ceiling still includes both parts.
+  return {
+    model: String(model),
+    contents: [{
+      role: 'user',
+      parts: [{ text: String(systemInstruction) + '\n\n' + String(requestText) }],
+    }],
+  };
 }
 
 function cleanErrorMessage(error) {
@@ -588,11 +647,12 @@ async function generateTimelineOutline(payload, { projectManager, transcriptServ
   const model = String(promptConfig.model);
   const thinkingLevel = String(promptConfig.thinkingLevel || 'NONE').toUpperCase();
   const systemInstruction = promptConfig.content.trim() + '\n\n' + buildProtocolInstruction();
+  const aiPromptReferences = buildAiPromptReferences(prepared.entries);
   const requestDocument = {
     schemaVersion: OUTLINE_SCHEMA_VERSION,
     session: { toolType, sessionId },
     compactCount: prepared.compactCount,
-    prompts: prepared.entries,
+    prompts: aiPromptReferences.prompts,
   };
   const requestText = JSON.stringify(requestDocument);
   const aiPayload = { ...payload, toolType, sessionId, model, thinkingLevel };
@@ -604,11 +664,9 @@ async function generateTimelineOutline(payload, { projectManager, transcriptServ
     const { GoogleGenAI } = require('@google/genai');
     const ai = new GoogleGenAI({ apiKey });
     const contents = [{ role: 'user', parts: [{ text: requestText }] }];
-    const count = await ai.models.countTokens({
-      model,
-      contents,
-      config: { systemInstruction },
-    });
+    const count = await ai.models.countTokens(
+      buildCountTokensRequest(model, systemInstruction, requestText)
+    );
     const countedInputTokens = Number(count?.totalTokens || 0);
     if (countedInputTokens > MAX_INPUT_TOKENS) {
       throw new TimelineOutlineError(
@@ -638,9 +696,11 @@ async function generateTimelineOutline(payload, { projectManager, transcriptServ
     } catch {
       throw new TimelineOutlineError('invalid_json', 'Timeline grouping returned invalid JSON');
     }
-    const validated = validateOutline(rawOutline, prepared.entries);
+    const remappedOutline = remapOutlinePromptReferences(rawOutline, aiPromptReferences.refToUuid);
+    const validated = validateOutline(remappedOutline, prepared.entries);
     const usage = response?.usageMetadata || {};
     const multiTurnGroups = validated.groups.filter((group) => group.memberUuids.length >= 2);
+    const turns = validated.groups.flatMap((group) => group.members);
     const ungrouped = validated.groups
       .filter((group) => group.memberUuids.length === 1)
       .map((group) => group.memberUuids[0]);
@@ -661,6 +721,7 @@ async function generateTimelineOutline(payload, { projectManager, transcriptServ
         compactCount: prepared.compactCount,
         metaPrompts,
         groups: multiTurnGroups,
+        turns,
         ungrouped,
       },
       model,
@@ -777,6 +838,10 @@ module.exports = {
   prepareGroupingInput,
   validateOutline,
   buildOutlineResponseSchema,
+  buildProtocolInstruction,
+  buildAiPromptReferences,
+  remapOutlinePromptReferences,
+  buildCountTokensRequest,
   generateTimelineOutline,
   register,
 };

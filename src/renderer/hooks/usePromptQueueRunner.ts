@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, isQueuedPromptEnabled, queueSendTransferredOwnership, usePromptQueueStore, type QueuedPrompt, type TabQueue } from '../store/usePromptQueueStore';
+import { buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, hasMalformedQueuedImageMarker, isQueuedPromptEnabled, queueSendTransferredOwnership, usePromptQueueStore, type QueuedPrompt, type TabQueue } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { terminalRegistry } from '../utils/terminalRegistry';
@@ -223,8 +223,13 @@ function beginValidatedQueueSend(
       const store = usePromptQueueStore.getState();
       store.setAutoRun(ownerTabId, false);
       store.setStopAfter(ownerTabId, false);
+      const malformedMarker = validation.item
+        ? hasMalformedQueuedImageMarker(validation.item.text, validation.item.imagePaths)
+        : false;
       useUIStore.getState().showToast(
-        'Run after остановлен: файл изображения недоступен',
+        malformedMarker
+          ? 'Run after остановлен: метка изображения повреждена'
+          : 'Run after остановлен: файл изображения недоступен',
         'error',
         5000,
         false,

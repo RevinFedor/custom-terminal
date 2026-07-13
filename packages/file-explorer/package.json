@@ -7,6 +7,7 @@
     ".": "./src/index.js",
     "./styles.css": "./src/styles.css",
     "./sidebar-layout": "./src/sidebarLayout.js",
+    "./icon-profile": "./src/iconProfile.js",
     "./main/shared-layout-store": "./main/shared-layout-store.cjs"
   },
   "scripts": {

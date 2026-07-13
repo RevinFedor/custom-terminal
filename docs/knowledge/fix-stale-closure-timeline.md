@@ -33,4 +33,10 @@ if (valueRef.current === expectedSessionId) { ... }
 
 `Timeline.tsx::sessionIdRef` — `sessionIdRef.current` сравнивается с `expectedSessionId` после `await fetch()` к Gemini API в Edit-Range flow. Если за время запроса (5-30 секунд) юзер переключил таб, ref содержит **новую** сессию; сохраняем результат в `_savedEditRangeMap.set(expectedSessionId, ...)` для отложенного применения, а не пишем в чужую сессию. Без ref'а здесь был бы stale-замыкание на исходный `sessionId` и тихая запись compact summary в неправильный JSONL.
 
+### Prompt Summary: новый session id + старые entries
+
+Прод-аудит 2026-07 доказал не гипотетический, а массовый owner-race: 3 321 из 5 172 Codex summary rows были сохранены под session-key, в canonical UUID set которого их entry UUID не входил; затронуто 43 session keys. После tab-switch React уже видел новый `sessionId`, но локальный `entries` ещё был массивом предыдущей вкладки, и auto-generation закрепляла уже невалидную пару.
+
+Исправление не отключает background generation. Timeline хранит entries в immutable owner-snapshot по `tab/tool/session/cwd`; при смене owner старый массив немедленно перестаёт быть видимым, а late result проверяет generation + canonical UUID set. Нельзя заменять эту проверку условием `entry.sessionId === currentSessionId`: один resume-файл легитимно содержит несколько session IDs, хотя parent chain цела.
+
 Похожий шрам в `Terminal.tsx` (`Only fit if active (use ref to get current value, not stale closure)`), `TabBar.tsx` (`Get fresh tabs from workspace (avoid stale closure)`), `ClaudeSDK/ClaudeSDKTab.tsx` (`Refs to break stale-closure in handleComposerKeyDown`). Везде один паттерн.

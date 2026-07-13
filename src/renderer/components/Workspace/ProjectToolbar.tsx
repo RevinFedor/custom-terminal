@@ -69,8 +69,6 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
     if (!projectId || isInboxProjectId(projectId)) return false;
     return state.openProjects.get(projectId)?.sidebarOpen ?? false;
   });
-  const sidebarWidth = useUIStore((state) => state.sidebarWidth);
-  const effectiveSidebarWidth = sidebarWidth || 280;
   const currentProjectMetaPath = useProjectsStore((state) => (
     activeProjectId ? state.projects[activeProjectId]?.path : undefined
   ));
@@ -571,7 +569,6 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
           }}
           className="h-full flex items-center px-3 text-[#666] hover:text-white hover:bg-[rgba(255,255,255,0.05)] transition-all duration-150"
           style={{
-            marginLeft: sidebarOpenForRender ? effectiveSidebarWidth : 0,
             color: sidebarOpenForRender ? '#fff' : undefined,
             backgroundColor: sidebarOpenForRender ? 'rgba(255,255,255,0.08)' : undefined,
           }}

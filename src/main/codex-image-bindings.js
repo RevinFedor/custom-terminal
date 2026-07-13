@@ -175,6 +175,14 @@ class CodexImageBindingRegistry {
     return result;
   }
 
+  handleTerminalInput(tabId, data) {
+    // Ctrl+C can stop the active turn while Codex keeps a queued draft, including
+    // its image chips. Only Enter proves that the current composer was submitted.
+    if (data !== '\r') return false;
+    this.resetComposer(tabId);
+    return true;
+  }
+
   resetComposer(tabId) {
     const state = this.tabs.get(tabId);
     if (!state) return;

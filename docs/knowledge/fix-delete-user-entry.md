@@ -6,7 +6,7 @@
 - `Delete Range` стирает заодно весь ответ Claude — не то что нужно.
 
 ### Жест и UI
-ПКМ по точке user-prompt → пункт `Удалить user-mess` (красный, иконка Trash2) в той же группе что Copy/Note/Rewind. Двухшаговый inline-confirm — см. `methodology/переносимый-дизайн.md::Two-step inline confirm для destructive в context menu`.
+ПКМ по точке user-prompt → левая основная зона split-кнопки `Удалить запрос` (красная, иконка Trash2) в той же группе что Copy/Note/Rewind. Подтверждение остаётся в том же popup и явно говорит, что ответ Claude сохранится. Правая зона `ArrowUpToLine` — другая операция: удаляет весь диапазон от начала до выбранной точки через `claude:delete-range`. Разделение сохраняет узкую capability этой записи и не маскирует более широкий destructive scope тем же лейблом. См. `methodology/переносимый-дизайн.md::Two-step inline confirm для destructive в context menu`.
 
 Пункт скрыт для:
 - Gemini табов (JSON-формат, отдельный пайплайн)

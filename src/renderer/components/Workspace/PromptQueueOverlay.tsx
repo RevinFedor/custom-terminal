@@ -1,8 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
-import type { CSSProperties } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Plus, RefreshCw, Square, Trash2, TriangleAlert } from 'lucide-react';
-import { buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedPromptAttachmentState, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, usePromptQueueStore, type QueuedPrompt } from '../../store/usePromptQueueStore';
+import { buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedImageMarkerHighlightRanges, getQueuedPromptAttachmentState, getShortGrabPromptTitle, hasMalformedQueuedImageMarker, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, usePromptQueueStore, type QueuedImageMarkerRange, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -54,6 +54,7 @@ const TEXT_MUTED = '#888';
 const TEXT_DIM = '#555';
 const SAVE_GREEN = '#22c55e';
 const DELETE_RED = '#ef4444';
+const IMAGE_TAG_BLUE = '#60a5fa';
 const DISABLED_PROMPT_BG = 'rgba(82, 18, 48, 0.48)';
 const DISABLED_PROMPT_BG_HOVER = 'rgba(104, 24, 60, 0.56)';
 const DISABLED_PROMPT_TEXT = '#d8c5cf';
@@ -103,6 +104,32 @@ function takeLeadingChars(value: string, count: number): string {
 
 function shouldPreservePinnedEditorOnOutsideClick(target: Element | null): boolean {
   return !!target?.closest('[data-tab-item], [data-workspace-navigation]');
+}
+
+function renderEditorHighlight(text: string, ranges: QueuedImageMarkerRange[]): ReactNode {
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  for (const range of ranges) {
+    if (range.start > cursor) parts.push(text.slice(cursor, range.start));
+    parts.push(
+      <span
+        key={`${range.start}:${range.end}:${range.id}`}
+        style={{
+          color: IMAGE_TAG_BLUE,
+          background: 'rgba(59,130,246,0.16)',
+          borderRadius: 2,
+          boxShadow: 'inset 0 0 0 1px rgba(96,165,250,0.18)',
+        }}
+      >
+        {text.slice(range.start, range.end)}
+      </span>,
+    );
+    cursor = range.end;
+  }
+  if (cursor < text.length) parts.push(text.slice(cursor));
+  // A zero-width tail keeps the mirror's final empty line equal to textarea.
+  parts.push(<span key="tail">&#8203;</span>);
+  return parts;
 }
 
 type StoredInsertPrompt = { title?: unknown; content?: unknown };
@@ -234,6 +261,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   const editorRef = useRef<HTMLDivElement>(null);
   const editorTitleInputRef = useRef<HTMLInputElement>(null);
   const editorTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const editorHighlightRef = useRef<HTMLDivElement>(null);
   const replayButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const committingRef = useRef(false);
   const removingIdsRef = useRef<Set<string>>(new Set());
@@ -249,6 +277,16 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   const chipContextItem = useMemo(
     () => chipContextMenu ? items.find((item) => item.id === chipContextMenu.id) ?? null : null,
     [chipContextMenu, items]
+  );
+  const editingItem = useMemo(
+    () => editingId ? items.find((item) => item.id === editingId) ?? null : null,
+    [editingId, items],
+  );
+  const editorImageMarkerRanges = useMemo(
+    () => isPostPromptMode
+      ? []
+      : getQueuedImageMarkerHighlightRanges(editorText, editingItem?.imagePaths),
+    [editingItem?.imagePaths, editorText, isPostPromptMode],
   );
 
   // ─── fixed width + drag-resize ─────────────────────────────────────────────
@@ -815,6 +853,13 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     );
     textarea.style.height = `${nextHeight}px`;
     textarea.style.overflowY = textarea.scrollHeight > maxTextareaHeight ? 'auto' : 'hidden';
+    const highlight = editorHighlightRef.current;
+    if (highlight) {
+      highlight.style.width = `${textarea.clientWidth}px`;
+      highlight.style.height = `${nextHeight}px`;
+      highlight.scrollTop = textarea.scrollTop;
+      highlight.scrollLeft = textarea.scrollLeft;
+    }
   }, [editorAnchor, editorOpen, editorSize.width, editorText, editorTextareaMinHeight, editorTitleHeight, isPostPromptMode]);
 
   useEffect(() => {
@@ -887,7 +932,15 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     try {
       const validation = await ensureQueuedPromptImagesReady(tabId, id);
       if (!validation.ready || !validation.item) {
-        showToast('Replay failed: image file is unavailable', 'error');
+        const malformedMarker = validation.item
+          ? hasMalformedQueuedImageMarker(validation.item.text, validation.item.imagePaths)
+          : false;
+        showToast(
+          malformedMarker
+            ? 'Replay failed: image marker is damaged'
+            : 'Replay failed: image file is unavailable',
+          'error',
+        );
         console.warn('[PromptQueue] replay blocked by attachment validation tab=' + tabId.slice(-8) + ' item=' + id.slice(-8));
         return;
       }
@@ -965,15 +1018,17 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
           focusActiveTerminal('grab-before-read');
           return;
         }
-        const insertPromptTitle = await findSavedInsertPromptTitle(t);
+        const shortGrabTitle = getShortGrabPromptTitle(t);
+        const insertPromptTitle = shortGrabTitle ? null : await findSavedInsertPromptTitle(t);
+        const initialTitle = shortGrabTitle || insertPromptTitle;
         const id = addPrompt(
           tabId,
           t,
           res.images || 0,
           Array.isArray(res.imagePaths) ? res.imagePaths : undefined,
-          insertPromptTitle || undefined,
+          initialTitle || undefined,
         );
-        const titleWillGenerate = insertPromptTitle ? false : generateRunAfterTitle(id, t);
+        const titleWillGenerate = initialTitle ? false : generateRunAfterTitle(id, t);
         if (!titleWillGenerate) markAppearing(id);
         // No success toast on queue-add — the new chip appearing in the overlay
         // is its own confirmation; the toast was redundant noise (user request).
@@ -1519,6 +1574,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
             const isReplayHovered = replayHoverId === it.id;
             const isReplaySubmitMode = isReplayHovered && cmdPressed && !replayingIds.has(it.id);
             const attachmentState = getQueuedPromptAttachmentState(it);
+            const malformedImageMarker = hasMalformedQueuedImageMarker(it.text, it.imagePaths);
             const chipClass = [
               'pq-chip',
               appearingIds.has(it.id) ? 'pq-chip-enter' : '',
@@ -1690,7 +1746,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                 {it.images > 0 && (
                   <span
                     title={attachmentState === 'missing'
-                      ? 'Image file is unavailable'
+                      ? (malformedImageMarker ? 'Image marker is damaged' : 'Image file is unavailable')
                       : (attachmentState === 'materializing' ? 'Saving image…' : `${it.images} image${it.images === 1 ? '' : 's'}`)}
                     style={{
                       color: attachmentState === 'missing' ? DELETE_RED : (attachmentState === 'materializing' ? '#eab308' : TINT),
@@ -1783,7 +1839,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
             <button
               className={`pq-rail-button pq-rail-meta${timelineTreeMode ? ' pq-rail-active' : ''}`}
               onClick={toggleTimelineTree}
-              title="Timeline (Cmd+])"
+              title="Timeline (Cmd+\\ / Opt+\\)"
               aria-label="Toggle Timeline"
             >
               {timelineTreeMode
@@ -1793,7 +1849,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
             <button
               className={`pq-rail-button pq-rail-meta${historyPanelOpen ? ' pq-rail-active' : ''}`}
               onClick={toggleHistoryPanel}
-              title="History (Cmd+\\)"
+              title="History (Cmd+] / Opt+])"
               aria-label="Toggle History"
             >
               <History size={17} strokeWidth={2.1} />
@@ -2005,29 +2061,80 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
               <div style={{ height: 1, flexShrink: 0, background: BORDER }} />
             </>
           )}
-          <textarea
-            ref={editorTextareaRef}
-            autoFocus={editorAutoFocus && isPostPromptMode}
-            value={editorText}
-            onChange={(e) => setEditorText(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') resetEditor();
-              if (e.key === 'Enter' && e.metaKey) commitEditor();
-            }}
+          <div
             style={{
+              position: 'relative',
               flex: '0 0 auto',
+              width: '100%',
               minHeight: editorTextareaMinHeight,
               maxHeight: editorAnchor.maxHeight - (isPostPromptMode ? 0 : editorTitleHeight + 1),
-              background: '#0e0e0e', color: '#ddd',
-              border: 'none', padding: '6px 8px',
-              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-              fontSize: promptQueueEditorFontSize,
-              lineHeight: 1.35,
-              resize: 'none', outline: 'none',
-              overflowY: 'hidden',
-              boxSizing: 'border-box',
+              background: '#0e0e0e',
+              overflow: 'hidden',
             }}
-          />
+          >
+            <div
+              ref={editorHighlightRef}
+              aria-hidden="true"
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                width: '100%',
+                minHeight: editorTextareaMinHeight,
+                overflow: 'hidden',
+                color: '#ddd',
+                padding: '6px 8px',
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                fontSize: promptQueueEditorFontSize,
+                lineHeight: 1.35,
+                whiteSpace: 'pre-wrap',
+                overflowWrap: 'break-word',
+                wordBreak: 'break-word',
+                boxSizing: 'border-box',
+                pointerEvents: 'none',
+              }}
+            >
+              {renderEditorHighlight(editorText, editorImageMarkerRanges)}
+            </div>
+            <textarea
+              ref={editorTextareaRef}
+              className="pq-image-marker-textarea"
+              autoFocus={editorAutoFocus && isPostPromptMode}
+              value={editorText}
+              onChange={(e) => setEditorText(e.target.value)}
+              onScroll={(e) => {
+                const highlight = editorHighlightRef.current;
+                if (!highlight) return;
+                highlight.scrollTop = e.currentTarget.scrollTop;
+                highlight.scrollLeft = e.currentTarget.scrollLeft;
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') resetEditor();
+                if (e.key === 'Enter' && e.metaKey) commitEditor();
+              }}
+              style={{
+                position: 'relative',
+                zIndex: 1,
+                display: 'block',
+                width: '100%',
+                minHeight: editorTextareaMinHeight,
+                maxHeight: editorAnchor.maxHeight - (isPostPromptMode ? 0 : editorTitleHeight + 1),
+                background: 'transparent',
+                color: 'transparent',
+                WebkitTextFillColor: 'transparent',
+                caretColor: '#ddd',
+                border: 'none', padding: '6px 8px',
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                fontSize: promptQueueEditorFontSize,
+                lineHeight: 1.35,
+                resize: 'none', outline: 'none',
+                overflowY: 'hidden',
+                overflowWrap: 'break-word',
+                wordBreak: 'break-word',
+                boxSizing: 'border-box',
+              }}
+            />
+          </div>
           <div
             className="pq-editor-resize-handle"
             data-cmd-hover-popover
@@ -2085,6 +2192,9 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
         .pq-no-spin {
           -moz-appearance: textfield;
           appearance: textfield;
+        }
+        .pq-image-marker-textarea::selection {
+          background: rgba(96, 165, 250, 0.30);
         }
         /* Replay button spinner — rotating ring shown while claude:append-input
            IPC roundtrip is in flight (~400-800ms). Plain CSS rotation, no GPU

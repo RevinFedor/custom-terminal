@@ -19,22 +19,10 @@ import { ToolCallPart as CBToolCallPart, ThinkBlock as CBThinkBlock, Markdown as
 
 const { ipcRenderer } = window.require('electron');
 
-let historyRendererLogSeq = 0;
-const historyRendererBoot = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
 const historyDiag = (msg: string) => {
-  const line = '[HistoryHandoff] ' + msg;
-  console.warn(line);
-  try {
-    ipcRenderer.send('log:renderer', {
-      msg: line,
-      seq: ++historyRendererLogSeq,
-      boot: historyRendererBoot,
-      emitAbs: performance.timeOrigin + performance.now(),
-      emitIso: new Date().toISOString(),
-    });
-  } catch {
-    // best-effort diagnostics only
-  }
+  // main.tsx already forwards every tagged console line to `log:renderer`.
+  // Sending the same line explicitly doubled high-frequency History diagnostics.
+  console.warn('[HistoryHandoff] ' + msg);
 };
 
 interface FileAction {
@@ -1544,6 +1532,14 @@ function AgentHistoryControls({
   const interruptRecoveryInFlightRef = useRef(false);
   const interruptAwaitRef = useRef<{ tabId: string; seq: number; at: number } | null>(null);
   const emptyDraftNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const presenceOwnerKey = tabId + ':' + toolType;
+  const presenceOwnerKeyRef = useRef(presenceOwnerKey);
+  presenceOwnerKeyRef.current = presenceOwnerKey;
+  const presenceFlightRef = useRef<{
+    ownerKey: string;
+    trailing: boolean;
+    promise: Promise<void>;
+  } | null>(null);
 
   const clearEmptyDraftNoticeTimer = useCallback(() => {
     if (emptyDraftNoticeTimerRef.current) {
@@ -1600,32 +1596,57 @@ function AgentHistoryControls({
     }
   }, [runtime, setPendingQuestionFrom, tabId]);
 
-  const refreshPresence = useCallback(async () => {
-    if (!tabId) return;
-    const requestTabId = tabId;
-    try {
-      const presence = await runtime.getPresence(tabId);
-      if (tabIdRef.current !== requestTabId) return;
-      setStatusFrom(presence.status, 'presence');
-      if (runtime.toolType === 'claude') {
-        const materialized = presence.conversationMaterialized === true || presence.canResume === true;
-        setResumeMaterialized(materialized);
-        setResumeUnavailableReason(materialized ? null : (presence.materializationReason || 'session_not_materialized'));
-      } else {
-        setResumeMaterialized(true);
-        setResumeUnavailableReason(null);
-      }
-      if (presence.awaiting) {
-        refreshPendingQuestion('presence-awaiting');
-      } else if (pendingQuestionRef.current) {
-        setPendingQuestionFrom(null, 'presence-not-awaiting');
-      }
-    } catch (e: any) {
-      if (tabIdRef.current !== requestTabId) return;
-      console.warn('[' + runtime.logPrefix + '] presence failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
-      setStatusFrom('inactive', 'presence-error');
+  const refreshPresence = useCallback((): Promise<void> => {
+    if (!tabId) return Promise.resolve();
+    const ownerKey = presenceOwnerKey;
+    const active = presenceFlightRef.current;
+    if (active?.ownerKey === ownerKey) {
+      active.trailing = true;
+      return active.promise;
     }
-  }, [refreshPendingQuestion, runtime, setPendingQuestionFrom, setStatusFrom, tabId]);
+
+    const flight: {
+      ownerKey: string;
+      trailing: boolean;
+      promise: Promise<void>;
+    } = {
+      ownerKey,
+      trailing: false,
+      promise: Promise.resolve(),
+    };
+
+    flight.promise = (async () => {
+      do {
+        flight.trailing = false;
+        try {
+          const presence = await runtime.getPresence(tabId);
+          if (presenceOwnerKeyRef.current !== ownerKey) return;
+          setStatusFrom(presence.status, 'presence');
+          if (runtime.toolType === 'claude') {
+            const materialized = presence.conversationMaterialized === true || presence.canResume === true;
+            setResumeMaterialized(materialized);
+            setResumeUnavailableReason(materialized ? null : (presence.materializationReason || 'session_not_materialized'));
+          } else {
+            setResumeMaterialized(true);
+            setResumeUnavailableReason(null);
+          }
+          if (presence.awaiting) {
+            void refreshPendingQuestion('presence-awaiting');
+          } else if (pendingQuestionRef.current) {
+            setPendingQuestionFrom(null, 'presence-not-awaiting');
+          }
+        } catch (e: any) {
+          if (presenceOwnerKeyRef.current !== ownerKey) return;
+          console.warn('[' + runtime.logPrefix + '] presence failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
+          setStatusFrom('inactive', 'presence-error');
+        }
+      } while (flight.trailing && presenceOwnerKeyRef.current === ownerKey);
+    })().finally(() => {
+      if (presenceFlightRef.current === flight) presenceFlightRef.current = null;
+    });
+    presenceFlightRef.current = flight;
+    return flight.promise;
+  }, [presenceOwnerKey, refreshPendingQuestion, runtime, setPendingQuestionFrom, setStatusFrom, tabId]);
 
   const refreshHistoryWithUpdating = useCallback((reason: string) => {
     const seq = ++historyUpdateSeqRef.current;
@@ -2545,7 +2566,20 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   const rewindPreview = storedRewindPreview && (!storedRewindPreview.sessionId || storedRewindPreview.sessionId === sessionId)
     ? storedRewindPreview
     : null;
-  const lastServerEntriesRef = useRef<FullHistoryEntry[]>([]);
+  // Rewind convergence only needs membership, not a second retained copy of the
+  // full History payload (which can contain hundreds of MB of tool output).
+  const lastServerEntryUuidsRef = useRef<Set<string>>(new Set());
+  const historyOwnerKey = useMemo(
+    () => JSON.stringify({ tabId, toolType, sessionId: sessionId || '', cwd: cwd || '' }),
+    [cwd, sessionId, tabId, toolType],
+  );
+  const historyOwnerKeyRef = useRef(historyOwnerKey);
+  historyOwnerKeyRef.current = historyOwnerKey;
+  const historyLoadFlightRef = useRef<{
+    ownerKey: string;
+    trailingRefresh: boolean;
+    promise: Promise<boolean>;
+  } | null>(null);
   const previewSessionKeyRef = useRef(tabId + ':' + sessionId);
 
   // Save scroll position + clean up CSS highlights on unmount.
@@ -3036,11 +3070,13 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
   }, [tabId, setHistoryRewindPreview]);
 
   // Load full history
-  const loadHistory = useCallback(async (isRefresh = false) => {
+  const runHistoryLoad = useCallback(async (isRefresh = false) => {
     if (!sessionId) return false;
+    const ownerKeyAtStart = historyOwnerKey;
     try {
       const ipcChannel = toolType === 'gemini' ? 'gemini:get-full-history' : toolType === 'codex' ? 'agent-transcript:get-history' : 'claude:get-full-history';
       const result = await ipcRenderer.invoke(ipcChannel, { toolType, sessionId, cwd, tabId });
+      if (historyOwnerKeyRef.current !== ownerKeyAtStart) return false;
       if (result.success) {
         const now = Date.now();
         for (const [handoffId, suppressed] of suppressedPromptsRef.current) {
@@ -3055,7 +3091,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
         const rawServerEntries: FullHistoryEntry[] = result.entries || [];
         const suppressedResult = filterSuppressedPromptEntries(rawServerEntries, suppressedPromptsRef.current.values());
         const serverEntries = suppressedResult.entries;
-        lastServerEntriesRef.current = serverEntries;
+        lastServerEntryUuidsRef.current = new Set(serverEntries.map((entry) => entry.uuid));
         if (suppressedResult.hidden > 0) {
           historyDiag('SUPPRESS_FILTERED tab=' + tabId.slice(-12) +
             ' hidden=' + suppressedResult.hidden +
@@ -3119,11 +3155,49 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
       }
       return false;
     } catch (e) {
+      if (historyOwnerKeyRef.current !== ownerKeyAtStart) return false;
       console.warn('[HistoryPanel] Load error:', e);
       if (!isRefresh) setLoading(false);
       return false;
     }
-  }, [sessionId, cwd, scrollToBottom, setHistoryRewindPreview, tabId, toolType]);
+  }, [sessionId, cwd, historyOwnerKey, scrollToBottom, setHistoryRewindPreview, tabId, toolType]);
+
+  // One heavyweight History IPC may be active per owner. Events that arrive
+  // while it is running collapse into one trailing reconciliation instead of
+  // cloning the same large snapshot through Electron in parallel.
+  const loadHistory = useCallback((isRefresh = false): Promise<boolean> => {
+    if (!sessionId) return Promise.resolve(false);
+    const ownerKey = historyOwnerKey;
+    const active = historyLoadFlightRef.current;
+    if (active?.ownerKey === ownerKey) {
+      if (isRefresh) active.trailingRefresh = true;
+      return active.promise;
+    }
+
+    const flight: {
+      ownerKey: string;
+      trailingRefresh: boolean;
+      promise: Promise<boolean>;
+    } = {
+      ownerKey,
+      trailingRefresh: false,
+      promise: Promise.resolve(false),
+    };
+    flight.promise = (async () => {
+      let nextIsRefresh = isRefresh;
+      let ok = false;
+      do {
+        flight.trailingRefresh = false;
+        ok = await runHistoryLoad(nextIsRefresh);
+        nextIsRefresh = true;
+      } while (flight.trailingRefresh && historyOwnerKeyRef.current === ownerKey);
+      return ok;
+    })().finally(() => {
+      if (historyLoadFlightRef.current === flight) historyLoadFlightRef.current = null;
+    });
+    historyLoadFlightRef.current = flight;
+    return flight.promise;
+  }, [historyOwnerKey, runHistoryLoad, sessionId]);
 
   const waitForDurableRewindHistory = useCallback(async (detail: {
     targetUuid?: string;
@@ -3133,14 +3207,14 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     const targetUuid = detail.targetUuid || '';
     for (let attempt = 0; attempt < 6; attempt++) {
       const ok = await loadHistory(true);
-      const serverEntries = lastServerEntriesRef.current || [];
-      const targetStillVisible = !!targetUuid && serverEntries.some((entry) => entry.uuid === targetUuid);
+      const serverEntryUuids = lastServerEntryUuidsRef.current;
+      const targetStillVisible = !!targetUuid && serverEntryUuids.has(targetUuid);
       historyDiag('REWIND_REFRESH tab=' + tabId.slice(-12) +
         ' op=' + (detail.opId || '-') +
         ' attempt=' + (attempt + 1) +
         ' ok=' + ok +
         ' targetStillVisible=' + targetStillVisible +
-        ' server=' + serverEntries.length);
+        ' server=' + serverEntryUuids.size);
       if (!targetStillVisible) return true;
       await new Promise((resolve) => setTimeout(resolve, attempt < 2 ? 140 : 320));
     }
@@ -3204,6 +3278,7 @@ function HistoryPanel({ tabId, sessionId, cwd, width, notesPanelWidth, isOpen, t
     initialLoadDoneRef.current = false;
     setLoading(true);
     setEntries([]);
+    lastServerEntryUuidsRef.current = new Set();
     const currentPreview = useUIStore.getState().historyRewindPreviews[tabId] || null;
     if (currentPreview?.sessionId && currentPreview.sessionId !== sessionId) {
       setHistoryRewindPreview(tabId, null);

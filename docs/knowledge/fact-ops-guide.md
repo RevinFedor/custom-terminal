@@ -23,6 +23,12 @@
 - `debug-60s.js` — мониторинг производительности.
 - `debug-claude-cli.js` — отладка интеграции с Claude Code.
 
+### File logger — часть resource budget
+
+Поток `dev.log` / `production.log` не имеет права удерживать неограниченную очередь в RAM. `Writable.write(false)` означает «запись принята, внутренний буфер заполнен»; до `drain` новые records идут в свою bounded очередь: максимум 256 строк / 512 KiB. При переполнении отдельные noisy diagnostics теряются, но после `drain` пишется агрегат `[LogBackpressure] droppedLines/droppedBytes`. Это осознанный выбор: потерять часть шума, но не превратить logger в memory leak.
+
+Ротация идёт на startup по возрасту или размеру; порог размера — 64 MiB. Инцидентные файлы до этого контракта вырастали примерно до 1.7 GB в production и 125 MB в dev. Их вклад в наблюдавшийся 19-GB пик не был измерен, поэтому logger — доказанный риск-множитель, но не единолично доказанный root cause. Renderer `main.tsx` уже форвардит каждую tagged console-line в `log:renderer`; component не должен посылать ту же строку вторым explicit IPC. History до фикса дублировал каждую diagnostic обоими путями.
+
 **Категории логов (localStorage.debug):**
 - `app:gemini` — детальная отладка Sniper Watcher, True Fork и Time Machine.
 - `app:claude` — сессии Клода.

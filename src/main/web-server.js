@@ -15,7 +15,7 @@
 //   POST /api/terminal-tabs/:tabId/fork            → fork Claude/Codex into a neighbour tab
 //   GET  /api/terminal-tabs/:tabId/history         → load JSONL/rollout session history
 //   POST /api/terminal-tabs/:tabId/edit-range      → Claude JSONL / Codex rollout middle compact
-//   POST /api/terminal-tabs/:tabId/delete-range    → Claude JSONL middle delete
+//   POST /api/terminal-tabs/:tabId/delete-range    → Claude JSONL / Codex rollout middle delete
 //   GET  /api/events?token=...&tabId=...           → live terminal event stream
 //
 // WS protocol — server → client:
@@ -508,64 +508,8 @@ async function waitForAgentReady(tabId, timeoutMs = 20_000) {
 	  });
 	}
 
-async function resolveClaudeHistoryMutationTarget(tabId, body = {}) {
-  if (!claudeDataApi || !claudeDataApi.editRange || !claudeDataApi.deleteRange) {
-    const err = new Error('claude history mutation API is not initialised');
-    err.statusCode = 500;
-    throw err;
-  }
-
-  let status = null;
-  try {
-    status = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
-  } catch (e) {
-    const err = new Error('tab is not open or status is unavailable: ' + String(e.message || e));
-    err.statusCode = 409;
-    throw err;
-  }
-
-  const toolType = status?.toolType || status?.commandType;
-  if (toolType !== 'claude' && status?.commandType !== 'claude') {
-    const err = new Error('history range mutation is Claude-only for terminal-tabs API');
-    err.statusCode = 400;
-    err.details = { commandType: status?.commandType || null, toolType: status?.toolType || null };
-    throw err;
-  }
-  if (status?.status === 'stopping' || status?.stopping === true) {
-    const err = new Error('tab is stopping; history range mutation is not allowed');
-    err.statusCode = 409;
-    err.details = { status: status?.status || null };
-    throw err;
-  }
-
-  const statusSessionId = cleanOptionalString(status?.sessionId || status?.claudeSessionId, '');
-  const requestedSessionId = cleanOptionalString(body.sessionId, '');
-  const sessionId = requestedSessionId || statusSessionId;
-  if (!sessionId) {
-    const err = new Error('Claude session id is required');
-    err.statusCode = 400;
-    throw err;
-  }
-  if (requestedSessionId && statusSessionId && requestedSessionId !== statusSessionId) {
-    const err = new Error('body.sessionId does not match tab sessionId');
-    err.statusCode = 409;
-    err.details = { requestedSessionId, tabSessionId: statusSessionId };
-    throw err;
-  }
-
-  const cwd = cleanOptionalString(body.cwd, '') || cleanOptionalString(status?.cwd, '');
-  const startUuid = cleanOptionalString(body.startUuid || body.targetUuid, '');
-  const endUuid = cleanOptionalString(body.endUuid, '');
-  if (!startUuid || !endUuid) {
-    const err = new Error('startUuid and endUuid required');
-    err.statusCode = 400;
-    throw err;
-  }
-
-  return { status, sessionId, cwd, startUuid, endUuid };
-}
-
-async function resolveEditRangeMutationTarget(tabId, body = {}) {
+async function resolveEditRangeMutationTarget(tabId, body = {}, operation = 'edit') {
+  const operationName = operation === 'delete' ? 'delete-range' : 'edit-range';
   let status = null;
   try {
     status = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
@@ -577,7 +521,7 @@ async function resolveEditRangeMutationTarget(tabId, body = {}) {
 
   const toolType = status?.toolType || status?.commandType;
   if (toolType !== 'claude' && toolType !== 'codex') {
-    const err = new Error('history edit-range is supported only for Claude/Codex terminal tabs');
+    const err = new Error('history ' + operationName + ' is supported only for Claude/Codex terminal tabs');
     err.statusCode = 400;
     err.details = { commandType: status?.commandType || null, toolType: status?.toolType || null };
     throw err;
@@ -589,17 +533,19 @@ async function resolveEditRangeMutationTarget(tabId, body = {}) {
     throw err;
   }
   if (toolType === 'codex' && status?.status !== 'inactive') {
-    const err = new Error('Codex edit-range requires an inactive tab; stop Codex before mutating rollout history');
+    const err = new Error('Codex ' + operationName + ' requires an inactive tab; stop Codex before mutating rollout history');
     err.statusCode = 409;
     err.details = { status: status?.status || null, toolType };
     throw err;
   }
-  if (toolType === 'claude' && (!claudeDataApi || !claudeDataApi.editRange)) {
+  const claudeMutation = operation === 'delete' ? claudeDataApi?.deleteRange : claudeDataApi?.editRange;
+  const codexMutation = operation === 'delete' ? codexDataApi?.deleteCodexRange : codexDataApi?.editCodexRange;
+  if (toolType === 'claude' && !claudeMutation) {
     const err = new Error('claude history mutation API is not initialised');
     err.statusCode = 500;
     throw err;
   }
-  if (toolType === 'codex' && !codexDataApi?.editCodexRange) {
+  if (toolType === 'codex' && !codexMutation) {
     const err = new Error('codex history mutation API is not initialised');
     err.statusCode = 500;
     throw err;
@@ -2931,8 +2877,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
-  // Middle history deletion for Claude JSONL. Unlike /truncate, this removes an
-  // arbitrary active-branch range and relinks entryAfter to entryBefore.
+  // Middle history deletion for Claude JSONL / Codex rollout. Unlike /truncate,
+  // this removes the selected range without inserting a compact replacement.
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/delete-range$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
@@ -2942,28 +2888,57 @@ async function handleApi(req, res, parsed, sdkSessions) {
     console.log(prefix + ' START');
     try {
       const body = await readBody(req);
-      const target = await resolveClaudeHistoryMutationTarget(tabId, body);
-      console.log(prefix + ' BODY sid=' + shortId(target.sessionId) +
+      const target = await resolveEditRangeMutationTarget(tabId, body, 'delete');
+      console.log(prefix + ' BODY tool=' + target.toolType +
+        ' sid=' + shortId(target.sessionId) +
         ' start=' + shortId(target.startUuid) +
         ' end=' + shortId(target.endUuid) +
         ' status=' + (target.status?.status || '-'));
-      const result = await claudeDataApi.deleteRange({
-        sessionId: target.sessionId,
-        cwd: target.cwd,
-        startUuid: target.startUuid,
-        endUuid: target.endUuid,
-      });
+      const result = target.toolType === 'codex'
+        ? await codexDataApi.deleteCodexRange({
+          sessionId: target.sessionId,
+          cwd: target.cwd,
+          startUuid: target.startUuid,
+          endUuid: target.endUuid,
+        })
+        : await claudeDataApi.deleteRange({
+          sessionId: target.sessionId,
+          cwd: target.cwd,
+          startUuid: target.startUuid,
+          endUuid: target.endUuid,
+        });
+      let adoptedSessionId = null;
+      let adoptionError = null;
+      if (target.toolType === 'codex' && result?.success !== false && result?.newSessionId) {
+        try {
+          await bridgeRequest('setCodexSessionId', {
+            tabId,
+            sessionId: result.newSessionId,
+            reason: 'api-delete-range',
+          }, 3000);
+          adoptedSessionId = result.newSessionId;
+        } catch (adoptErr) {
+          adoptionError = String(adoptErr.message || adoptErr);
+          console.warn(prefix + ' ADOPT_FAILED newSid=' + shortId(result.newSessionId) + ' error=' + adoptionError);
+        }
+      }
       clearPending();
-      console.log(prefix + ' DONE success=' + (result?.success === true) +
+      console.log(prefix + ' DONE tool=' + target.toolType +
+        ' success=' + (result?.success === true) +
         ' removed=' + (result?.removedCount == null ? '-' : result.removedCount) +
         ' fileDeleted=' + (result?.fileDeleted === true) +
+        ' newSid=' + shortId(result?.newSessionId) +
+        ' adopted=' + shortId(adoptedSessionId) +
         ' ms=' + (Date.now() - started));
       const statusCode = result?.success === false ? 409 : 200;
       return sendJson(res, statusCode, {
         ok: result?.success !== false,
         mode: 'delete',
+        toolType: target.toolType,
         tabId,
         sessionId: target.sessionId,
+        adoptedSessionId,
+        adoptionError,
         startUuid: target.startUuid,
         endUuid: target.endUuid,
         ...result,

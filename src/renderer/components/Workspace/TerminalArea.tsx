@@ -167,192 +167,233 @@ const RestoredTerminalError = memo(({ tabId, ownerProjectId, cwd, error, visible
   );
 });
 
-const SessionStartingOverlay = memo(({ state, onDismiss }: { state: SessionStartingState; onDismiss: () => void }) => {
-  const ref = useRef<HTMLDivElement>(null);
-  const flashTimerRef = useRef<number | null>(null);
-  const [closeFlash, setCloseFlash] = useState(false);
+const getSessionStartingPresentation = (state: SessionStartingState) => {
   const engineLabel = state.engine === 'codex' ? 'CODEX' : 'CLAUDE';
   const sessionLabel = state.sessionId ? state.sessionId.slice(0, 8) : null;
-  const blocker = state.lastNotReady?.reason || '';
-  const isError = state.startupFailed === true || state.lastNotReady?.phase === 'startup-timeout' || String(blocker || '').includes('startup-timeout');
-  const actionLabel = state.sessionId ? 'RESUMING' : 'STARTING';
-  const title = isError ? `ERROR ${actionLabel} ${engineLabel}` : `${actionLabel} ${engineLabel}...`;
-  const subtitle = isError ? 'Startup did not reach prompt' : `Waiting for prompt${sessionLabel ? ` · ${sessionLabel}` : ''}`;
-  const detail = state.startupError || blocker;
+  const reason = String(state.lastNotReady?.reason || '');
+  const blockers = new Set<string>(Array.isArray(state.lastNotReady?.blockers)
+    ? state.lastNotReady.blockers
+    : []);
+  const hasBlocker = (name: string) => blockers.has(name) || reason.includes(name);
+  const isError = state.startupFailed === true
+    || state.lastNotReady?.phase === 'startup-timeout'
+    || reason.includes('startup-timeout');
 
-  useEffect(() => {
-    ref.current?.focus();
-  }, [state.tabId, state.since]);
+  if (isError) {
+    return {
+      isError: true,
+      title: `${engineLabel} START FAILED`,
+      subtitle: 'Terminal input did not become ready',
+      detail: state.startupError || 'Close this status or stop the process and try again',
+    };
+  }
 
-  useEffect(() => () => {
-    if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
-  }, []);
+  if (state.startupPending) {
+    return {
+      isError: false,
+      title: `CONFIGURING ${engineLabel}...`,
+      subtitle: 'Applying startup settings',
+      detail: sessionLabel ? `Session ${sessionLabel}` : null,
+    };
+  }
 
-  const block = (event: React.SyntheticEvent) => {
+  if (hasBlocker('auth-required')) {
+    return {
+      isError: false,
+      title: `${engineLabel} NEEDS SIGN-IN`,
+      subtitle: 'The terminal is waiting for your sign-in choice',
+      detail: 'Choose a sign-in method in the terminal',
+    };
+  }
+
+  if (hasBlocker('update-prompt')) {
+    return {
+      isError: false,
+      title: `LOADING ${engineLabel} SESSION...`,
+      subtitle: 'The terminal is still loading behind the startup menu',
+      detail: 'Codex is not ready for prompts yet',
+    };
+  }
+
+  if (hasBlocker('trust-directory') || hasBlocker('cwd-chooser')) {
+    return {
+      isError: false,
+      title: `WAITING FOR ${engineLabel}...`,
+      subtitle: 'The terminal is waiting for a confirmation',
+      detail: `${engineLabel} is not ready for prompts yet`,
+    };
+  }
+
+  if (hasBlocker('mcp-startup')) {
+    return {
+      isError: false,
+      title: `STARTING ${engineLabel} TOOLS...`,
+      subtitle: 'Loading terminal integrations',
+      detail: sessionLabel ? `Session ${sessionLabel}` : null,
+    };
+  }
+
+  const isPreparingTerminal = reason === 'empty'
+    || reason === 'no-sync-marker'
+    || reason === 'no-codex-ui-text'
+    || reason === 'no-composer-frame';
+  return {
+    isError: false,
+    title: state.sessionId ? `LOADING ${engineLabel} SESSION...` : `STARTING ${engineLabel}...`,
+    subtitle: isPreparingTerminal
+      ? 'Restoring history and preparing terminal input'
+      : 'Waiting for terminal input to become ready',
+    detail: sessionLabel ? `Session ${sessionLabel}` : null,
+  };
+};
+
+type AgentLifecycleTone = 'starting' | 'stopping' | 'error';
+
+const AgentLifecycleStatusCard = memo(({
+  title,
+  subtitle,
+  detail,
+  tone,
+  topOffset = 12,
+  onDismiss,
+  dismissLabel = 'Dismiss agent status',
+}: {
+  title: string;
+  subtitle: string;
+  detail?: string | null;
+  tone: AgentLifecycleTone;
+  topOffset?: number;
+  onDismiss?: () => void;
+  dismissLabel?: string;
+}) => {
+  const isError = tone === 'error';
+  const isStopping = tone === 'stopping';
+  const accent = isError ? '#ef4444' : (isStopping ? '#d97706' : '#60a5fa');
+  const borderColor = isError
+    ? 'rgba(239,68,68,0.48)'
+    : (isStopping ? 'rgba(217,119,6,0.38)' : 'rgba(255,255,255,0.14)');
+  const background = isError
+    ? 'rgba(45,16,20,0.96)'
+    : (isStopping ? 'rgba(31,24,16,0.96)' : 'rgba(17,17,22,0.94)');
+
+  const keepTerminalFocus = (event: React.MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
     event.stopPropagation();
   };
 
-  const flashCloseButton = (event: React.SyntheticEvent) => {
-    block(event);
-    if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
-    setCloseFlash(false);
-    window.requestAnimationFrame(() => {
-      setCloseFlash(true);
-      flashTimerRef.current = window.setTimeout(() => setCloseFlash(false), 420);
-    });
-  };
-
-  const handleClose = (event: React.SyntheticEvent) => {
-    block(event);
-    onDismiss();
+  const handleDismiss = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    onDismiss?.();
   };
 
   return (
     <div
-      ref={ref}
-      tabIndex={-1}
-      className="absolute inset-0 z-40 flex items-center justify-center outline-none"
-      onMouseDown={flashCloseButton}
-      onMouseUp={block}
-      onClick={block}
-      onDoubleClick={flashCloseButton}
-      onContextMenu={block}
-      onKeyDown={block}
-      onKeyUp={block}
-      onPaste={block}
-      style={{ pointerEvents: 'auto' }}
+      className="absolute left-3 right-3 z-40 pointer-events-none"
+      style={{ top: topOffset }}
+      role={isError ? 'alert' : 'status'}
+      aria-live={isError ? 'assertive' : 'polite'}
     >
       <div
-        className="absolute inset-0"
+        className="relative flex items-center gap-3 rounded-lg border px-3 py-2.5 shadow-2xl"
         style={{
-          background: 'rgba(0,0,0,0.14)',
-          backdropFilter: 'blur(1px)',
+          width: 400,
+          maxWidth: '100%',
+          borderColor,
+          background,
+          boxShadow: isError
+            ? '0 12px 28px rgba(0,0,0,0.42), 0 0 20px rgba(239,68,68,0.12)'
+            : isStopping
+              ? '0 12px 28px rgba(0,0,0,0.42), 0 0 18px rgba(217,119,6,0.10)'
+              : '0 12px 28px rgba(0,0,0,0.42)',
         }}
-      />
-      <div
-        className="relative z-10 flex flex-col items-center gap-4 rounded-xl border border-white/10 bg-[#111116]/88 px-8 py-7 shadow-2xl"
-        style={{
-          minWidth: 320,
-          maxWidth: 'min(420px, calc(100% - 32px))',
-          backdropFilter: 'blur(6px)',
-        }}
-        onMouseDown={block}
-        onDoubleClick={block}
       >
-        <button
-          type="button"
-          aria-label="Close starting overlay"
-          className="absolute top-3 right-3 flex h-7 w-7 items-center justify-center rounded-md border text-lg leading-none transition-colors"
-          onMouseDown={handleClose}
-          onClick={block}
-          style={{
-            color: closeFlash ? '#fecaca' : '#9ca3af',
-            borderColor: closeFlash ? 'rgba(239,68,68,0.78)' : 'rgba(255,255,255,0.12)',
-            background: closeFlash ? 'rgba(239,68,68,0.32)' : 'rgba(255,255,255,0.06)',
-            boxShadow: closeFlash ? '0 0 0 3px rgba(239,68,68,0.18), 0 0 22px rgba(239,68,68,0.38)' : 'none',
-          }}
-        >
-          ×
-        </button>
         {isError ? (
           <div
-            className="flex h-9 w-9 items-center justify-center rounded-full border-2 text-lg font-black"
+            className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border text-xs font-black"
             style={{ borderColor: 'rgba(239,68,68,0.9)', color: '#fecaca', background: 'rgba(239,68,68,0.16)' }}
           >
             !
           </div>
         ) : (
-          <div className="w-9 h-9 border-2 border-white/20 border-t-[#60a5fa] rounded-full animate-spin" />
-        )}
-        <div className="flex flex-col items-center gap-1 text-center">
           <div
-            className="text-sm font-bold tracking-widest"
+            className="h-5 w-5 shrink-0 rounded-full border-2 border-white/20 animate-spin"
+            style={{ borderTopColor: accent }}
+          />
+        )}
+
+        <div className="min-w-0 flex-1 text-left" style={{ paddingRight: onDismiss ? 28 : 0 }}>
+          <div
+            className="truncate text-[11px] font-bold tracking-[0.12em]"
             style={{ color: isError ? '#fecaca' : '#ffffff' }}
           >
             {title}
           </div>
-          <div className="text-xs" style={{ color: isError ? '#fca5a5' : '#8b8b91' }}>
+          <div className="mt-0.5 truncate text-[11px]" style={{ color: isError ? '#fca5a5' : '#a1a1aa' }}>
             {subtitle}
           </div>
           {detail ? (
-            <div
-              className="mt-1 text-[10px]"
-              style={{ color: isError ? '#ef4444' : '#666' }}
-            >
+            <div className="mt-0.5 truncate text-[10px]" style={{ color: isError ? '#ef4444' : '#6b7280' }}>
               {detail}
             </div>
           ) : null}
         </div>
+
+        {onDismiss ? (
+          <button
+            type="button"
+            aria-label={dismissLabel}
+            className="pointer-events-auto absolute right-2 top-2 flex h-6 w-6 cursor-pointer items-center justify-center rounded-md border border-white/10 bg-white/[0.04] text-base leading-none text-[#8b8b91] hover:border-white/20 hover:bg-white/[0.08] hover:text-white"
+            onMouseDown={keepTerminalFocus}
+            onClick={handleDismiss}
+          >
+            ×
+          </button>
+        ) : null}
       </div>
     </div>
   );
 });
 
-const AgentStoppingOverlay = memo(({ state }: { state: AgentStoppingState }) => {
-  const ref = useRef<HTMLDivElement>(null);
-  const engineLabel = state.engine === 'codex' ? 'CODEX' : 'CLAUDE';
-
-  useEffect(() => {
-    ref.current?.focus();
-  }, [state.tabId, state.since]);
-
-  const block = (event: React.SyntheticEvent) => {
-    event.preventDefault();
-    event.stopPropagation();
-  };
-
+const SessionStartingOverlay = memo(({
+  state,
+  onDismiss,
+  topOffset = 12,
+}: {
+  state: SessionStartingState;
+  onDismiss: () => void;
+  topOffset?: number;
+}) => {
+  const presentation = getSessionStartingPresentation(state);
   return (
-    <div
-      ref={ref}
-      tabIndex={-1}
-      className="absolute inset-0 z-50 flex items-center justify-center outline-none"
-      onMouseDown={block}
-      onMouseUp={block}
-      onClick={block}
-      onDoubleClick={block}
-      onContextMenu={block}
-      onKeyDown={block}
-      onKeyUp={block}
-      onPaste={block}
-      style={{ pointerEvents: 'auto' }}
-    >
-      <div
-        className="absolute inset-0"
-        style={{
-          background: 'rgba(0,0,0,0.16)',
-          backdropFilter: 'blur(1px)',
-        }}
-      />
-      <div
-        className="relative z-10 flex flex-col items-center gap-4 rounded-xl border border-amber-500/25 bg-[#111116]/90 px-8 py-7 shadow-2xl"
-        style={{
-          minWidth: 320,
-          maxWidth: 'min(420px, calc(100% - 32px))',
-          backdropFilter: 'blur(6px)',
-        }}
-        onMouseDown={block}
-        onDoubleClick={block}
-      >
-        <div
-          className="w-9 h-9 border-2 border-white/20 border-t-[#d97706] rounded-full animate-spin"
-          style={{ boxShadow: '0 0 18px rgba(217,119,6,0.22)' }}
-        />
-        <div className="flex flex-col items-center gap-1 text-center">
-          <div className="text-sm font-bold tracking-widest" style={{ color: '#ffffff' }}>
-            STOPPING {engineLabel}...
-          </div>
-          <div className="text-xs" style={{ color: '#9ca3af' }}>
-            Waiting for process to exit
-          </div>
-          {state.reason ? (
-            <div className="mt-1 text-[10px]" style={{ color: '#6b7280' }}>
-              {state.reason}
-            </div>
-          ) : null}
-        </div>
-      </div>
-    </div>
+    <AgentLifecycleStatusCard
+      title={presentation.title}
+      subtitle={presentation.subtitle}
+      detail={presentation.detail}
+      tone={presentation.isError ? 'error' : 'starting'}
+      topOffset={topOffset}
+      onDismiss={onDismiss}
+      dismissLabel="Dismiss starting status"
+    />
+  );
+});
+
+const AgentStoppingOverlay = memo(({
+  state,
+  topOffset = 12,
+}: {
+  state: AgentStoppingState;
+  topOffset?: number;
+}) => {
+  const engineLabel = state.engine === 'codex' ? 'CODEX' : 'CLAUDE';
+  return (
+    <AgentLifecycleStatusCard
+      title={`STOPPING ${engineLabel}...`}
+      subtitle="Waiting for the process to exit safely"
+      detail={state.reason || null}
+      tone="stopping"
+      topOffset={topOffset}
+    />
   );
 });
 
@@ -1089,13 +1130,14 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
         />
       )}
 
-      {/* Local per-tab resume/start overlay: terminal keeps running underneath,
-          but user mouse/keyboard input is blocked until the agent prompt is ready. */}
+      {/* Local per-tab resume/start status. It deliberately does not own focus or
+          a full-screen hit area: startup menus remain directly interactive. */}
       <AnimatePresence>
         {showAgentStoppingOverlay && agentStopping && (
           <AgentStoppingOverlay
             key={`${agentStopping.tabId}:${agentStopping.since}`}
             state={agentStopping}
+            topOffset={activeExternalRun ? 44 : 12}
           />
         )}
       </AnimatePresence>
@@ -1106,6 +1148,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
             key={`${sessionStarting.tabId}:${sessionStarting.since}`}
             state={sessionStarting}
             onDismiss={handleDismissSessionStarting}
+            topOffset={activeExternalRun ? 44 : 12}
           />
         )}
       </AnimatePresence>

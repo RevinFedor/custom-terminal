@@ -150,6 +150,14 @@ class ProjectManager {
     return this.db.saveTimelineOutline(outline);
   }
 
+  getTimelineTurnActionOverrides(toolType, sessionId) {
+    return this.db.getTimelineTurnActionOverrides(toolType, sessionId);
+  }
+
+  saveTimelineTurnActionOverride(override) {
+    return this.db.saveTimelineTurnActionOverride(override);
+  }
+
   getTimelineGroupingBarriers(sessionId) {
     return {
       notes: this.db.getTimelineNotes(sessionId),

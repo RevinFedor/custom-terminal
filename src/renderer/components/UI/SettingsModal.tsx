@@ -10,17 +10,22 @@ import ProjectIconsSettings from './ProjectIconsSettings';
 import { HexColorPicker } from 'react-colorful';
 import { Trash2, Plus } from 'lucide-react';
 import { DEFAULT_CLAUDE_CODE_SETTINGS } from '../../constants/claudeLevels';
-import { DEFAULT_CODEX_SETTINGS } from '../../constants/codexSettings';
+import {
+  DEFAULT_CODEX_SETTINGS,
+  mergeCodexModelOptions,
+  resolveCodexEffortForModel,
+  type CodexModelOption,
+} from '../../constants/codexSettings';
 import {
   autoScrollNearEdge,
   captureGroupedListGeometry,
   buildVisualHierarchyDepthMap,
-  moveStructuredEntity,
   orderVisualHierarchyItems,
-  resolveGroupedListTarget,
-  resolveVisualHierarchyStep,
+  resolveStructuredHierarchyStep,
+  resolveStructuredVerticalMove,
   startPointerDragSession,
   visualHierarchyAncestorIds,
+  visualHierarchySubtreeItems,
 } from '@noted/structured-dnd';
 
 const { ipcRenderer, clipboard } = window.require('electron');
@@ -69,7 +74,14 @@ type DragGroupZone = {
   rowRight: number | null;
 };
 type DragGeometry = { list: RectSnap; flat: DragFlatZone[]; groups: DragGroupZone[] };
-type DragTarget = { key: string; label: string; reason: string; next: PromptDragState };
+type DragTarget = {
+  key: string;
+  label: string;
+  reason: string;
+  next: PromptDragState;
+  targetIds: string[];
+  changed: boolean;
+};
 type PointerDragSession = {
   item: DragItem;
   startX: number;
@@ -1357,6 +1369,13 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setClaudeCodeSettings = useUIStore((s) => s.setClaudeCodeSettings);
   const codexSettings = useUIStore((s) => s.codexSettings);
   const setCodexSettings = useUIStore((s) => s.setCodexSettings);
+  const [liveCodexModels, setLiveCodexModels] = useState<CodexModelOption[]>([]);
+  const codexModelsForSettings = useMemo(
+    () => mergeCodexModelOptions(liveCodexModels, codexSettings.models),
+    [liveCodexModels, codexSettings.models],
+  );
+  const quickCodexModel = codexModelsForSettings.find((model) => model.id === codexSettings.quickModel);
+  const quickCodexEfforts = quickCodexModel?.efforts || [];
   const claudeMdMirrorEnabled = useUIStore((s) => s.claudeMdMirrorEnabled);
   const setClaudeMdMirrorEnabled = useUIStore((s) => s.setClaudeMdMirrorEnabled);
   const tabCompletionNotificationSound = useUIStore((s) => s.tabCompletionNotificationSound);
@@ -1375,6 +1394,17 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   // Claude Default Prompt
   const [claudeDefaultPrompt, setClaudeDefaultPrompt] = useState('');
 
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    ipcRenderer.invoke('codex:list-models').then((result: any) => {
+      if (!cancelled && Array.isArray(result?.models)) setLiveCodexModels(result.models);
+    }).catch(() => {
+      if (!cancelled) setLiveCodexModels([]);
+    });
+    return () => { cancelled = true; };
+  }, [isOpen]);
+
   // Doc prompt local state
   const [localDocFilePath, setLocalDocFilePath] = useState('');
   const [localDocInlineContent, setLocalDocInlineContent] = useState('');
@@ -1389,15 +1419,25 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const savedGroupTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [draggingItem, setDraggingItem] = useState<DragItem | null>(null);
   const [dragTargetKey, setDragTargetKey] = useState<string | null>(null);
+  const [dragTargetIds, setDragTargetIds] = useState<string[]>([]);
   const [horizontalIntent, setHorizontalIntent] = useState<{ sourceId: string; direction: 'left' | 'right'; progress: number; disabled: boolean } | null>(null);
   const textListRef = useRef<HTMLDivElement>(null);
   const pointerDragRef = useRef<PointerDragSession | null>(null);
+  const pointerDragControllerRef = useRef<{ session: PointerDragSession; cancel: () => void } | null>(null);
   const dragVisualStateRef = useRef<PromptDragState>({ prompts: [], promptGroups: [] });
   const latestPromptStateRef = useRef<PromptDragState>({ prompts: [], promptGroups: [] });
   const promptVisualDepthById = useMemo(
     () => buildVisualHierarchyDepthMap(prompts, { parentKey: 'visual_parent_id' }),
     [prompts],
   );
+  const draggingPromptIds = useMemo(() => {
+    if (draggingItem?.type !== 'prompt') return new Set<string>();
+    return new Set(
+      visualHierarchySubtreeItems(prompts, draggingItem.id, { parentKey: 'visual_parent_id' })
+        .map(prompt => prompt.id),
+    );
+  }, [draggingItem, prompts]);
+  const dragTargetIdSet = useMemo(() => new Set(dragTargetIds), [dragTargetIds]);
 
   // Editing states
   const [editingClaude, setEditingClaude] = useState(false);
@@ -1419,6 +1459,22 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   if (!pointerDragRef.current?.active) {
     latestPromptStateRef.current = { prompts, promptGroups };
   }
+
+  const cancelPromptPointerDrag = useCallback(() => {
+    const controller = pointerDragControllerRef.current;
+    pointerDragControllerRef.current = null;
+    if (controller) controller.cancel();
+  }, []);
+
+  const closeSettings = useCallback(() => {
+    cancelPromptPointerDrag();
+    onClose();
+  }, [cancelPromptPointerDrag, onClose]);
+
+  useEffect(() => {
+    if (!isOpen) cancelPromptPointerDrag();
+    return () => cancelPromptPointerDrag();
+  }, [cancelPromptPointerDrag, isOpen]);
 
   // Local copies of AI prompt fields for editing
   const [localPromptContent, setLocalPromptContent] = useState('');
@@ -1802,23 +1858,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
         if (gi >= 0) nextGroups[gi] = { ...nextGroups[gi], position: pos };
       } else {
         const promptIndex = nextPrompts.findIndex(prompt => prompt.id === item.prompt.id);
-        if (promptIndex >= 0) nextPrompts[promptIndex] = { ...nextPrompts[promptIndex], group_id: null, position: pos };
+        if (promptIndex >= 0) nextPrompts[promptIndex] = { ...nextPrompts[promptIndex], position: pos };
       }
     });
     return { prompts: nextPrompts, promptGroups: nextGroups };
-  };
-
-  const moveFlatItem = (state: PromptDragState, drag: DragItem, targetIdx: number): PromptDragState => {
-    return applyStructuredPromptModel(state, moveStructuredEntity(toStructuredPromptModel(state), {
-      type: drag.type === 'group' ? 'container' : 'item', id: String(drag.id),
-    }, { kind: 'flat', index: targetIdx }));
-  };
-
-  const movePromptIntoGroupAt = (state: PromptDragState, drag: DragItem, groupId: number, targetIdxRaw: number): PromptDragState => {
-    if (drag.type !== 'prompt' || !state.promptGroups.some(g => g.id === groupId)) return state;
-    return applyStructuredPromptModel(state, moveStructuredEntity(toStructuredPromptModel(state), {
-      type: 'item', id: drag.id,
-    }, { kind: 'container', containerId: String(groupId), index: targetIdxRaw }));
   };
 
   const applyPromptDragState = (state: PromptDragState, save: boolean) => {
@@ -1864,33 +1907,58 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       if (session) session.geometry = geometry;
     }
     if (!geometry) return null;
-    const target = resolveGroupedListTarget({
+    const result = resolveStructuredVerticalMove({
+      model: toStructuredPromptModel(base),
       geometry,
       drag: { type: item.type === 'group' ? 'container' : 'item', id: String(item.id) },
       clientX,
       clientY,
+      parentKey: 'parentId',
+      containerKey: 'containerId',
     });
-    if (!target) return null;
-    const next = target.kind === 'container'
-      ? movePromptIntoGroupAt(base, item, Number(target.containerId), target.index)
-      : moveFlatItem(base, item, target.index);
-    return { key: target.key, label: target.key, reason: target.reason, next };
+    if (!result?.ok) return null;
+    const next = applyStructuredPromptModel(base, result.model);
+    return {
+      key: result.key,
+      label: result.key,
+      reason: result.reason,
+      next,
+      targetIds: Array.isArray(result.targetIds) ? result.targetIds : [],
+      changed: !!result.changed,
+    };
   };
 
   const resolveHierarchyTarget = (base: PromptDragState, item: DragItem, direction: 'left' | 'right') => {
     if (item.type !== 'prompt') return null;
     const model = toStructuredPromptModel(base);
-    const result = resolveVisualHierarchyStep({
-      items: model.items,
+    const result = resolveStructuredHierarchyStep({
+      model,
       sourceId: item.id,
       direction,
       parentKey: 'parentId',
       containerKey: 'containerId',
       maxDepth: 4,
     });
+    let next = result.ok ? applyStructuredPromptModel(base, result.model) : base;
+    if (result.ok && result.reason === 'detach-from-container') {
+      const source = model.items.find(prompt => prompt.id === item.id);
+      const oldGroupId = source?.containerId == null ? null : Number(source.containerId);
+      const sourceIds = new Set(
+        visualHierarchySubtreeItems(model.items, item.id, { parentKey: 'parentId' })
+          .map(prompt => prompt.id)
+      );
+      const flat = flatItemsFor(next);
+      const sourceBlock = flat.filter(candidate => candidate.type === 'prompt' && sourceIds.has(candidate.prompt.id));
+      const withoutSource = flat.filter(candidate => candidate.type !== 'prompt' || !sourceIds.has(candidate.prompt.id));
+      const groupIndex = withoutSource.findIndex(candidate => candidate.type === 'group' && candidate.group.id === oldGroupId);
+      if (groupIndex >= 0 && sourceBlock.length > 0) {
+        withoutSource.splice(groupIndex + 1, 0, ...sourceBlock);
+        next = reindexFlatState(next, withoutSource);
+      }
+    }
     return {
       ...result,
-      next: result.ok ? applyStructuredPromptModel(base, { ...model, items: result.items }) : base,
+      next,
     };
   };
 
@@ -1915,25 +1983,50 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
         session.horizontalBaseX = session.startX;
         setDraggingItem(item);
         setDragTargetKey(null);
+        setDragTargetIds([]);
         setHorizontalIntent(null);
         console.warn('[PromptDnD] start', item, summarizeDragGeometry(session.geometry));
       },
       onPreview: ({ session, clientX, clientY }: any) => {
         pointerDragRef.current = session;
+        const geometry = session.geometry || captureDragGeometry(session.pendingNext || session.base);
+        if (geometry && !session.geometry) session.geometry = geometry;
+        const list = geometry?.list;
+        const insideList = !!list
+          && clientX >= list.left
+          && clientX <= list.right
+          && clientY >= list.top
+          && clientY <= list.bottom;
+        if (!insideList) {
+          session.pendingNext = null;
+          session.lastKey = null;
+          applyPromptDragState(session.base, false);
+          setDragTargetKey(null);
+          setDragTargetIds([]);
+          setHorizontalIntent(null);
+          return null;
+        }
+
+        const target = resolveDragTarget(item, clientX, clientY);
+        let preview = target?.next || session.pendingNext || session.base;
+        let previewChanged = !!target?.changed;
+        setDragTargetIds(target?.targetIds || []);
         if (item.type === 'prompt') {
           const baseX = Number.isFinite(session.horizontalBaseX) ? session.horizontalBaseX : session.startX;
           const deltaX = clientX - baseX;
           if (Math.abs(deltaX) > 2) {
             const direction: 'left' | 'right' = deltaX < 0 ? 'left' : 'right';
-            const hierarchy = resolveHierarchyTarget(session.pendingNext || session.base, item, direction);
+            const hierarchy = resolveHierarchyTarget(preview, item, direction);
             const progress = Math.min(1, Math.abs(deltaX) / 28);
             setHorizontalIntent({ sourceId: item.id, direction, progress, disabled: !hierarchy?.ok });
             if (Math.abs(deltaX) >= 28) {
               const key = `hierarchy:${direction}:${hierarchy?.reason || 'invalid'}`;
               if (!hierarchy?.ok) {
+                session.pendingNext = preview;
+                if (previewChanged) applyPromptDragState(preview, false);
                 session.lastKey = key;
                 setDragTargetKey(key);
-                return { key, changed: false };
+                return { key, changed: previewChanged };
               }
               session.pendingNext = hierarchy.next;
               session.horizontalBaseX = clientX;
@@ -1946,35 +2039,45 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             setHorizontalIntent(null);
           }
         }
-        const target = resolveDragTarget(item, clientX, clientY);
         if (!target) {
-          session.pendingNext = null;
-          session.lastKey = null;
-          setDragTargetKey(null);
+          setDragTargetKey(session.lastKey);
           return null;
         }
-        if (target.key === session.lastKey) return null;
-        session.pendingNext = target.next;
+        if (target.key === session.lastKey && !previewChanged) return null;
+        session.pendingNext = preview;
+        if (previewChanged) applyPromptDragState(preview, false);
         setDragTargetKey(target.key);
         console.warn('[PromptDnD] preview', item, '->', target.label, 'via', target.reason);
-        return { key: target.key, changed: false };
+        return { key: target.key, changed: previewChanged };
       },
       onCommit: (session: PointerDragSession) => {
-        applyPromptDragState((session as any).pendingNext || session.base, true);
-        console.warn('[PromptDnD] drop', item, '->', session.lastKey || 'same');
+        if (!(session as any).pendingNext || !session.lastKey) {
+          applyPromptDragState(session.base, false);
+          console.warn('[PromptDnD] cancel-outside', item);
+          return;
+        }
+        applyPromptDragState((session as any).pendingNext, true);
+        console.warn('[PromptDnD] drop', item, '->', session.lastKey);
       },
       onCancel: (session: PointerDragSession) => {
         applyPromptDragState(session.base, false);
         console.warn('[PromptDnD] cancel', item);
       },
-      onFinish: () => {
+      onFinish: (session: PointerDragSession) => {
+        if (pointerDragControllerRef.current?.session === session) {
+          pointerDragControllerRef.current = null;
+        }
         pointerDragRef.current = null;
         setDraggingItem(null);
         setDragTargetKey(null);
+        setDragTargetIds([]);
         setHorizontalIntent(null);
       },
     });
-    if (controller) pointerDragRef.current = controller.session;
+    if (controller) {
+      pointerDragRef.current = controller.session;
+      pointerDragControllerRef.current = controller;
+    }
   };
 
   const closeInsertionEditor = () => {
@@ -2119,7 +2222,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const renderTextPromptCard = (prompt: Prompt, index: number, dndKind: 'flat' | 'group-prompt', groupId?: number, flatIndex?: number, nextPrompt?: Prompt | null) => {
     const isSelected = editingInsertionIndex === index;
     const isDragged = draggingItem?.type === 'prompt' && draggingItem.id === prompt.id;
-    const isFlatTarget = flatIndex != null && dragTargetKey === `flat:${flatIndex}`;
+    const isDraggedBlock = draggingPromptIds.has(prompt.id);
+    const isBlockTarget = dragTargetIdSet.has(prompt.id);
     const visualDepth = promptVisualDepthById.get(prompt.id) || 0;
     const ancestors = visualHierarchyAncestorIds(prompts, prompt.id, { parentKey: 'visual_parent_id' });
     const nextAncestors = nextPrompt
@@ -2142,7 +2246,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
         data-prompt-id={prompt.id}
         data-visual-parent-id={prompt.visual_parent_id || undefined}
         data-visual-depth={visualDepth || undefined}
-        data-dnd-target-preview={isFlatTarget ? 'flat' : undefined}
+        data-dnd-target-preview={isBlockTarget ? 'block' : undefined}
         onPointerDown={startPointerDrag({ type: 'prompt', id: prompt.id }, () => startEditingInsertion(index))}
         style={{
           display: 'flex',
@@ -2153,11 +2257,17 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
           width: visualDepth ? `calc(100% - ${visualDepth * hierarchyStep}px)` : '100%',
           padding: '8px 9px',
           borderRadius: 8,
-          background: isDragged ? 'rgba(124,58,237,0.18)' : (isSelected ? '#24242a' : VR_CARD),
-          border: `1px ${intent ? 'dashed' : 'solid'} ${intent ? intentColor : (isDragged ? VR_VIOLET : (isSelected ? VR_ACCENT : VR_BORDER))}`,
+          background: isDragged
+            ? 'rgba(124,58,237,0.22)'
+            : isDraggedBlock
+              ? 'rgba(124,58,237,0.10)'
+              : isBlockTarget
+                ? 'rgba(96,165,250,0.12)'
+                : (isSelected ? '#24242a' : VR_CARD),
+          border: `1px ${intent ? 'dashed' : 'solid'} ${intent ? intentColor : (isDraggedBlock ? VR_VIOLET : (isBlockTarget ? '#60a5fa' : (isSelected ? VR_ACCENT : VR_BORDER)))}`,
           boxShadow: isDragged
             ? '0 0 0 1px rgba(124,58,237,0.28) inset, 0 0 18px rgba(124,58,237,0.16)'
-            : (isFlatTarget ? '0 2px 0 #60a5fa inset' : 'none'),
+            : (isBlockTarget ? '0 0 0 1px rgba(96,165,250,0.20) inset' : 'none'),
           cursor: isDragged ? 'grabbing' : 'pointer',
           minWidth: 0,
           userSelect: 'none',
@@ -2325,11 +2435,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                     );
                     const isSelected = editingGroupId === group.id;
                     const isDragging = draggingItem?.type === 'group' && draggingItem.id === group.id;
-                    const isFlatTarget = dragTargetKey === `flat:${flatIndex}`;
-                    const isGroupTarget = dragTargetKey?.startsWith(`container:${group.id}:`) === true;
+                    const isGroupTarget = dragTargetIdSet.has(`container:${group.id}`);
                     return (
-                      <div key={`g-${group.id}`} data-dnd-target-preview={isFlatTarget ? 'flat' : (isGroupTarget ? 'container' : undefined)} style={{ boxShadow: isFlatTarget ? '0 2px 0 #60a5fa inset' : 'none' }}>
-                        <div data-dnd-flat-container="true" data-dnd-type="group" data-dnd-id={String(group.id)} style={{ border: `1px solid ${isGroupTarget ? '#60a5fa' : 'transparent'}`, background: isGroupTarget ? 'rgba(96,165,250,0.08)' : 'transparent', borderRadius: 9, marginBottom: 7 }}>
+                      <div key={`g-${group.id}`} data-dnd-target-preview={isGroupTarget ? 'block' : undefined}>
+                        <div data-dnd-flat-container="true" data-dnd-type="group" data-dnd-id={String(group.id)} style={{ border: `1px solid ${isGroupTarget ? '#60a5fa' : (isDragging ? VR_VIOLET : 'transparent')}`, background: isGroupTarget ? 'rgba(96,165,250,0.10)' : (isDragging ? 'rgba(124,58,237,0.08)' : 'transparent'), borderRadius: 9, marginBottom: 7 }}>
                           <div
                             data-dnd-kind="flat"
                             data-dnd-type="group"
@@ -2382,7 +2491,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   const nextPrompt = flatItems[flatIndex + 1]?.type === 'prompt' ? flatItems[flatIndex + 1].prompt : null;
                   return renderTextPromptCard(item.prompt, item.origIdx, 'flat', undefined, flatIndex, nextPrompt);
                 })}
-                <div data-dnd-target-preview={dragTargetKey === `flat:${flatItems.length}` ? 'flat' : undefined} style={{ height: 10, boxShadow: dragTargetKey === `flat:${flatItems.length}` ? '0 2px 0 #60a5fa inset' : 'none' }} />
+                <div style={{ height: 10 }} />
               </>
             )}
           </div>
@@ -3076,12 +3185,12 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       if (!isOpen) return;
       if (e.key === 'Escape' || (e.metaKey && e.code === 'Comma')) {
         e.preventDefault();
-        onClose();
+        closeSettings();
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, onClose]);
+  }, [closeSettings, isOpen]);
 
   const commitClaudeCodeModel = (index: number, patch: { id?: string; label?: string }) => {
     const models = claudeCodeSettings.models.map((m, i) => (i === index ? { ...m, ...patch } : m));
@@ -3093,9 +3202,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     setClaudeCodeSettings({ ...claudeCodeSettings, efforts });
   };
 
-  const commitCodexModel = (index: number, patch: { id?: string; label?: string; efforts?: string }) => {
-    const models = codexSettings.models.map((model, i) => {
-      if (i !== index) return model;
+  const commitCodexModel = (modelId: string, patch: { id?: string; label?: string; efforts?: string; visible?: boolean }) => {
+    const models = codexModelsForSettings.map((model) => {
+      if (model.id !== modelId) return model;
       if (patch.efforts === undefined) return { ...model, ...patch };
       const efforts = patch.efforts.split(',').map((value) => value.trim()).filter(Boolean);
       const defaultEffort = efforts.includes(model.defaultEffort || '')
@@ -3103,7 +3212,27 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
         : (efforts[0] || model.defaultEffort);
       return { ...model, efforts, defaultEffort };
     });
-    setCodexSettings({ ...codexSettings, models });
+    const quickModel = models.some((model) => model.id === codexSettings.quickModel)
+      ? codexSettings.quickModel
+      : null;
+    const quickEffort = quickModel
+      ? resolveCodexEffortForModel(models.find((model) => model.id === quickModel), codexSettings.quickEffort)
+      : null;
+    setCodexSettings({ ...codexSettings, models, quickModel, quickEffort });
+  };
+
+  const setCodexQuickModel = (modelId: string) => {
+    const quickModel = modelId || null;
+    const quickEffort = quickModel
+      ? resolveCodexEffortForModel(codexModelsForSettings.find((model) => model.id === quickModel), codexSettings.quickEffort)
+      : null;
+    setCodexSettings({ ...codexSettings, models: codexModelsForSettings, quickModel, quickEffort });
+  };
+
+  const setCodexQuickEffort = (effort: string) => {
+    if (!quickCodexModel) return;
+    const quickEffort = resolveCodexEffortForModel(quickCodexModel, effort);
+    setCodexSettings({ ...codexSettings, models: codexModelsForSettings, quickEffort });
   };
 
   const commitInputOnEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -3129,7 +3258,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
         zIndex: 20000
       }}
       onMouseDown={(e) => { if (e.target === e.currentTarget) (e.currentTarget as HTMLElement).dataset.mouseDownOnOverlay = 'true'; }}
-      onClick={(e) => { if (e.target === e.currentTarget && (e.currentTarget as HTMLElement).dataset.mouseDownOnOverlay === 'true') onClose(); (e.currentTarget as HTMLElement).dataset.mouseDownOnOverlay = ''; }}
+      onClick={(e) => { if (e.target === e.currentTarget && (e.currentTarget as HTMLElement).dataset.mouseDownOnOverlay === 'true') closeSettings(); (e.currentTarget as HTMLElement).dataset.mouseDownOnOverlay = ''; }}
     >
       <div
         style={{
@@ -3160,7 +3289,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             Настройки
           </h2>
           <button
-            onClick={onClose}
+            onClick={closeSettings}
             style={{
               background: 'none',
               border: 'none',
@@ -3484,31 +3613,69 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   <div style={{ minWidth: 0 }}>
                     <SettingsSubSectionHeader title="Codex" />
                     <div style={{ display: 'grid', gap: 6 }}>
-                      {codexSettings.models.map((model, index) => (
-                        <div key={`${index}-${model.id}`} style={{ display: 'grid', gridTemplateColumns: 'minmax(70px, 0.65fr) minmax(125px, 1fr) minmax(150px, 1.35fr)', gap: 6, alignItems: 'center' }}>
+                      {codexModelsForSettings.map((model) => (
+                        <div key={model.id} style={{ display: 'grid', gridTemplateColumns: '20px minmax(70px, 0.65fr) minmax(125px, 1fr) minmax(150px, 1.35fr)', gap: 6, alignItems: 'center' }}>
+                          <input
+                            type="checkbox"
+                            checked={model.visible !== false}
+                            onChange={(e) => commitCodexModel(model.id, { visible: e.currentTarget.checked })}
+                            aria-label={`Показывать ${model.label} в выборе модели`}
+                            title="Показывать модель в выборе модели"
+                            style={{ width: 14, height: 14, margin: '0 auto', accentColor: '#7A9DFF', cursor: 'pointer' }}
+                          />
                           <input
                             defaultValue={model.label}
-                            onBlur={(e) => commitCodexModel(index, { label: e.currentTarget.value })}
+                            onBlur={(e) => commitCodexModel(model.id, { label: e.currentTarget.value })}
                             onKeyDown={commitInputOnEnter}
                             style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px' }}
                             title="Название в интерфейсе"
                           />
                           <input
                             defaultValue={model.id}
-                            onBlur={(e) => commitCodexModel(index, { id: e.currentTarget.value })}
+                            onBlur={(e) => commitCodexModel(model.id, { id: e.currentTarget.value })}
                             onKeyDown={commitInputOnEnter}
                             style={{ ...vrFieldStyle, height: 28, fontSize: 11.5, padding: '5px 7px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
                             title="Model ID"
                           />
                           <input
                             defaultValue={(model.efforts || []).join(', ')}
-                            onBlur={(e) => commitCodexModel(index, { efforts: e.currentTarget.value })}
+                            onBlur={(e) => commitCodexModel(model.id, { efforts: e.currentTarget.value })}
                             onKeyDown={commitInputOnEnter}
                             style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '5px 7px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
                             title="Допустимые effort для этой модели"
                           />
                         </div>
                       ))}
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'auto minmax(130px, 1fr) minmax(82px, 0.55fr)', alignItems: 'center', gap: 6, marginTop: 10 }}>
+                      <span
+                        style={{ color: '#777', fontSize: 10, whiteSpace: 'nowrap' }}
+                        title="Маленькая кнопка слева от Model в живом Codex переключает на эту пару и повторным кликом возвращает прежнюю."
+                      >
+                        Быстрый переход
+                      </span>
+                      <select
+                        value={codexSettings.quickModel || ''}
+                        onChange={(e) => setCodexQuickModel(e.currentTarget.value)}
+                        style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: 'pointer' }}
+                        title="Модель для маленькой кнопки быстрого переключения"
+                      >
+                        <option value="">не настроен</option>
+                        {codexModelsForSettings.map((model) => (
+                          <option key={model.id} value={model.id}>{model.label}</option>
+                        ))}
+                      </select>
+                      <select
+                        value={codexSettings.quickEffort || ''}
+                        disabled={!quickCodexModel}
+                        onChange={(e) => setCodexQuickEffort(e.currentTarget.value)}
+                        style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: quickCodexModel ? 'pointer' : 'not-allowed', opacity: quickCodexModel ? 1 : 0.45 }}
+                        title="Уровень усилий для быстрого переключения"
+                      >
+                        {quickCodexEfforts.map((effort) => (
+                          <option key={effort} value={effort}>{effort === 'medium' ? 'med' : effort === 'xhigh' ? 'xhi' : effort}</option>
+                        ))}
+                      </select>
                     </div>
                   </div>
                 </div>

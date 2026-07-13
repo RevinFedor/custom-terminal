@@ -1373,13 +1373,13 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           ? await ipcRenderer.invoke('codex:stage-image-path', { tabId, filePath: textPaths[0] })
           : await ipcRenderer.invoke('codex:stage-image-paths', { tabId, filePaths: textPaths });
         const stagedPayloads = textPaths.length === 1
-          ? [staged?.success && typeof staged.path === 'string'
-              ? staged.path
+          ? [staged?.success && typeof staged.inputPath === 'string'
+              ? staged.inputPath
               : `[imageError: ${formatCodexImagePasteError(staged?.error || 'stage_failed')}]`]
           : (Array.isArray(staged?.results)
-            ? staged.results.map((entry: { success?: unknown; path?: unknown; error?: unknown }) => (
-                entry?.success && typeof entry.path === 'string'
-                  ? entry.path
+            ? staged.results.map((entry: { success?: unknown; inputPath?: unknown; error?: unknown }) => (
+                entry?.success && typeof entry.inputPath === 'string'
+                  ? entry.inputPath
                   : `[imageError: ${formatCodexImagePasteError(entry?.error || 'stage_failed')}]`
               ))
             : [`[imageError: ${formatCodexImagePasteError(staged?.error || 'stage_failed')}]`]);
@@ -1388,8 +1388,8 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         source = textPaths.length > 1 ? 'text-paths' : 'text-path';
       } else {
         const saved = await ipcRenderer.invoke('codex:save-clipboard-image', { tabId });
-        if (saved?.success && typeof saved.path === 'string' && saved.path.length > 0) {
-          payload = saved.path;
+        if (saved?.success && typeof saved.inputPath === 'string' && saved.inputPath.length > 0) {
+          payload = saved.inputPath;
           stageToken = typeof saved.stageToken === 'string' ? saved.stageToken : null;
           source = 'saved-bitmap';
         } else {
