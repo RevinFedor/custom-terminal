@@ -18,9 +18,45 @@ const APP_STATE_KEY_QUEUE = 'promptQueueByTab';
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let hasHydratedPromptQueueStore = false;
 let hydratePromptQueuePromise: Promise<void> | null = null;
+const promptQueueHydrationListeners = new Set<() => void>();
+const runtimeWorkflowArmTabs = new Set<string>();
+const automaticRunAfterTargetClearTabs = new Set<string>();
 
-function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText' | 'runAfterTabId' | 'panelCollapsed' | 'previewId'>> {
-  const out: Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText' | 'runAfterTabId' | 'panelCollapsed' | 'previewId'>> = {};
+export function isPromptQueueStoreHydrated(): boolean {
+  return hasHydratedPromptQueueStore;
+}
+
+export function subscribePromptQueueHydration(listener: () => void): () => void {
+  promptQueueHydrationListeners.add(listener);
+  return () => promptQueueHydrationListeners.delete(listener);
+}
+
+export function hasRuntimeWorkflowArm(tabId: string): boolean {
+  return runtimeWorkflowArmTabs.has(tabId);
+}
+
+export function consumeAutomaticRunAfterTargetClear(tabId: string): boolean {
+  return automaticRunAfterTargetClearTabs.delete(tabId);
+}
+
+function markRuntimeWorkflowArm(tabId: string): void {
+  // Persisted rows never pass through setters, so membership proves an actual
+  // user action in this renderer even when it races hydration. Its timestamp
+  // is still reconciled against abnormal outcomes before cold-start can run.
+  runtimeWorkflowArmTabs.add(tabId);
+}
+
+function markPromptQueueStoreHydrated(): void {
+  if (hasHydratedPromptQueueStore) return;
+  hasHydratedPromptQueueStore = true;
+  for (const listener of promptQueueHydrationListeners) {
+    try { listener(); }
+    catch (error) { console.warn('[PromptQueue] hydration listener failed:', error); }
+  }
+}
+
+function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText' | 'runAfterTabId' | 'workflowArmedAt' | 'panelCollapsed' | 'previewId'>> {
+  const out: Record<string, Pick<TabQueue, 'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds' | 'postPromptEnabled' | 'postPromptText' | 'runAfterTabId' | 'workflowArmedAt' | 'panelCollapsed' | 'previewId'>> = {};
   for (const [tabId, q] of snapshot) {
     // Skip cold tabs with no persistable state — saves space + avoids polluting
     // the kv store with thousands of empty rows over time. Non-default delay
@@ -47,6 +83,7 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
       postPromptEnabled: q.postPromptEnabled,
       postPromptText: q.postPromptText,
       runAfterTabId: q.runAfterTabId,
+      workflowArmedAt: q.workflowArmedAt,
       panelCollapsed: q.panelCollapsed,
       previewId: q.previewId,
     };
@@ -362,6 +399,10 @@ export type TabQueue = {
   // standard own-tab behaviour. Don't validate in the store (would create a
   // dependency cycle with useWorkspaceStore).
   runAfterTabId: string | null;
+  // Time of the latest explicit workflow arm. It correlates restored Run-after
+  // promises with classified turn outcomes so an old failure cannot cancel a
+  // newer manual retry. Null is the fail-closed legacy migration value.
+  workflowArmedAt: number | null;
 };
 
 interface PromptQueueStore {
@@ -388,6 +429,9 @@ interface PromptQueueStore {
   // Set the target tab whose busy→idle transition should trigger the auto-run.
   // null = clear (fall back to own-tab autoRun behaviour).
   setRunAfterTab: (tabId: string, targetTabId: string | null) => void;
+  // Automatic stale-target repair. Unlike the public user action above, this
+  // must not refresh the workflow arm timestamp or create a runtime arm.
+  clearStaleRunAfterTab: (tabId: string, expectedTargetTabId: string) => void;
   setFirstDelaySeconds: (tabId: string, value: number) => void;
   // Start the first-delay countdown for this tab. Caller must already have
   // ensured firstDelaySeconds > 0 and autoRun === true.
@@ -424,7 +468,7 @@ interface PromptQueueStore {
 
   // Cancel every active workflow whose owner or selected pivot is the trigger.
   // Queued items stay available for a deliberate retry.
-  disarmQueuesForTrigger: (triggerTabId: string) => string[];
+  disarmQueuesForTrigger: (triggerTabId: string, outcomeTs?: number | null) => string[];
 
   // Drop queue state owned by a closed tab and clear run-after pivots that
   // pointed at it. Called from workspace closeTab.
@@ -447,7 +491,21 @@ const EMPTY: TabQueue = {
   firstChipHintActive: false,
   stopBeforeCloseArm: false,
   runAfterTabId: null,
+  workflowArmedAt: null,
 };
+
+function hasActiveQueueWorkflow(queue: Pick<TabQueue, 'autoRun' | 'stopAfter' | 'closeAfter'>): boolean {
+  return queue.autoRun || queue.stopAfter || queue.closeAfter;
+}
+
+function retainedWorkflowArmedAt(
+  current: TabQueue,
+  next: Pick<TabQueue, 'autoRun' | 'stopAfter' | 'closeAfter'>,
+  explicitArm = false,
+): number | null {
+  if (!hasActiveQueueWorkflow(next)) return null;
+  return explicitArm ? Date.now() : current.workflowArmedAt;
+}
 
 type PreHydrateQueueField =
   | 'items'
@@ -458,6 +516,7 @@ type PreHydrateQueueField =
   | 'postPromptEnabled'
   | 'postPromptText'
   | 'runAfterTabId'
+  | 'workflowArmedAt'
   | 'panelCollapsed'
   | 'previewId'
   | 'deleted';
@@ -495,6 +554,7 @@ function trackPreHydrateQueueChanges(before: Map<string, TabQueue>, after: Map<s
     if (baseline.postPromptEnabled !== current.postPromptEnabled) changed.add('postPromptEnabled');
     if (baseline.postPromptText !== current.postPromptText) changed.add('postPromptText');
     if (baseline.runAfterTabId !== current.runAfterTabId) changed.add('runAfterTabId');
+    if (baseline.workflowArmedAt !== current.workflowArmedAt) changed.add('workflowArmedAt');
     if (baseline.panelCollapsed !== current.panelCollapsed) changed.add('panelCollapsed');
     if (baseline.previewId !== current.previewId) changed.add('previewId');
     if (changed.size === 0) preHydrateQueueChanges.delete(tabId);
@@ -533,6 +593,7 @@ function mergeHydratedQueue(
   if (changed?.has('postPromptEnabled')) merged.postPromptEnabled = current.postPromptEnabled;
   if (changed?.has('postPromptText')) merged.postPromptText = current.postPromptText;
   if (changed?.has('runAfterTabId')) merged.runAfterTabId = current.runAfterTabId;
+  if (changed?.has('workflowArmedAt')) merged.workflowArmedAt = current.workflowArmedAt;
   if (changed?.has('panelCollapsed')) merged.panelCollapsed = current.panelCollapsed;
   if (changed?.has('previewId')) merged.previewId = current.previewId;
   if (merged.autoRun) merged.firstChipHintActive = false;
@@ -697,7 +758,13 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         // an already-armed queue don't re-trigger the nudge.
         const wasEmpty = countEnabledQueuedPrompts(cur.items) === 0;
         const shouldArmHint = wasEmpty && !cur.autoRun;
-        next.set(tabId, { ...cur, items, firstChipHintActive: shouldArmHint ? true : cur.firstChipHintActive });
+        if (wasEmpty && cur.autoRun) markRuntimeWorkflowArm(tabId);
+        next.set(tabId, {
+          ...cur,
+          items,
+          firstChipHintActive: shouldArmHint ? true : cur.firstChipHintActive,
+          workflowArmedAt: wasEmpty && cur.autoRun ? Date.now() : cur.workflowArmedAt,
+        });
         return { queues: next };
       });
       const added = get().getQueue(tabId).items.find((item) => item.id === id);
@@ -726,6 +793,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         // runner stops the agent after that prompt's turn finishes. popNext is
         // the autoRun-drain path; this hook only covers manual user removals.
         const queueEmptied = activeBefore > 0 && countEnabledQueuedPrompts(items) === 0;
+        if (queueEmptied) runtimeWorkflowArmTabs.delete(tabId);
         const autoRun = queueEmptied ? false : cur.autoRun;
         const stopAfter = queueEmptied ? false : cur.stopAfter;
         const closeAfter = queueEmptied ? false : cur.closeAfter;
@@ -740,6 +808,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           stopBeforeCloseArm,
           firstDelayCountdownAt,
           firstChipHintActive: queueEmptied ? false : cur.firstChipHintActive,
+          workflowArmedAt: queueEmptied ? null : cur.workflowArmedAt,
           previewId: cur.previewId === id ? null : cur.previewId,
         });
         return { queues: next };
@@ -795,7 +864,11 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           };
         });
         const next = new Map(state.queues);
-        const queueEmptied = activeBefore > 0 && countEnabledQueuedPrompts(items) === 0;
+        const activeAfter = countEnabledQueuedPrompts(items);
+        const queueEmptied = activeBefore > 0 && activeAfter === 0;
+        const queueBecameRunnable = activeBefore === 0 && activeAfter > 0 && cur.autoRun;
+        if (queueEmptied) runtimeWorkflowArmTabs.delete(tabId);
+        else if (queueBecameRunnable) markRuntimeWorkflowArm(tabId);
         next.set(tabId, {
           ...cur,
           items,
@@ -805,6 +878,9 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           stopBeforeCloseArm: queueEmptied ? false : cur.stopBeforeCloseArm,
           firstDelayCountdownAt: queueEmptied ? null : cur.firstDelayCountdownAt,
           firstChipHintActive: queueEmptied ? false : cur.firstChipHintActive,
+          workflowArmedAt: queueEmptied
+            ? null
+            : (queueBecameRunnable ? Date.now() : cur.workflowArmedAt),
         });
         return { queues: next };
       });
@@ -890,6 +966,8 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
     },
 
     clearQueue: (tabId) => {
+      runtimeWorkflowArmTabs.delete(tabId);
+      automaticRunAfterTargetClearTabs.delete(tabId);
       setAndPersist((state) => {
         const next = new Map(state.queues);
         next.delete(tabId);
@@ -903,12 +981,19 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         const cur = next.get(tabId) ?? EMPTY;
         // Any user interaction with Run after acknowledges the hint — clear it
         // unconditionally. Re-arming only happens on the next 0→1 chip edge.
-        next.set(tabId, {
+        const updated = {
           ...cur,
           autoRun: value,
           firstChipHintActive: false,
           firstDelayCountdownAt: value ? cur.firstDelayCountdownAt : null,
+        };
+        const explicitArm = value && !cur.autoRun;
+        if (explicitArm) markRuntimeWorkflowArm(tabId);
+        next.set(tabId, {
+          ...updated,
+          workflowArmedAt: retainedWorkflowArmedAt(cur, updated, explicitArm),
         });
+        if (!hasActiveQueueWorkflow(updated)) runtimeWorkflowArmTabs.delete(tabId);
         return { queues: next };
       });
     },
@@ -925,7 +1010,14 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         // was holding is now stale (the new baseline is whatever stop=value
         // means), so wipe it. Otherwise the next close-arm/disarm cycle
         // would restore stop=true based on data from BEFORE this click.
-        next.set(tabId, { ...cur, stopAfter: value, closeAfter, stopBeforeCloseArm: false });
+        const updated = { ...cur, stopAfter: value, closeAfter, stopBeforeCloseArm: false };
+        const explicitArm = value && !hasActiveQueueWorkflow(cur);
+        if (explicitArm) markRuntimeWorkflowArm(tabId);
+        next.set(tabId, {
+          ...updated,
+          workflowArmedAt: retainedWorkflowArmedAt(cur, updated, explicitArm),
+        });
+        if (!hasActiveQueueWorkflow(updated)) runtimeWorkflowArmTabs.delete(tabId);
         return { queues: next };
       });
     },
@@ -938,11 +1030,17 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           // Arming closeAfter forces stopAfter ON (can't close a tab whose
           // process never gets stopped). Remember whether stopAfter was ALREADY
           // on, so the inverse click can restore it accurately.
-          next.set(tabId, {
+          const updated = {
             ...cur,
             closeAfter: true,
             stopAfter: true,
             stopBeforeCloseArm: cur.stopAfter,
+          };
+          const explicitArm = !hasActiveQueueWorkflow(cur);
+          if (explicitArm) markRuntimeWorkflowArm(tabId);
+          next.set(tabId, {
+            ...updated,
+            workflowArmedAt: retainedWorkflowArmedAt(cur, updated, explicitArm),
           });
         } else {
           // Disarming closeAfter: restore stopAfter to what it was BEFORE this
@@ -950,18 +1048,24 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           // it stays on. If user clicked ⏻ from the all-off baseline, both
           // toggles return to off — matching user expectation:
           //   "click ⏻ once → both on; click ⏻ again → both off."
-          next.set(tabId, {
+          const updated = {
             ...cur,
             closeAfter: false,
             stopAfter: cur.stopBeforeCloseArm,
             stopBeforeCloseArm: false,
+          };
+          next.set(tabId, {
+            ...updated,
+            workflowArmedAt: retainedWorkflowArmedAt(cur, updated),
           });
+          if (!hasActiveQueueWorkflow(updated)) runtimeWorkflowArmTabs.delete(tabId);
         }
         return { queues: next };
       });
     },
 
     setRunAfterTab: (tabId, targetTabId) => {
+      automaticRunAfterTargetClearTabs.delete(tabId);
       setAndPersist((state) => {
         const next = new Map(state.queues);
         const cur = next.get(tabId) ?? EMPTY;
@@ -971,12 +1075,30 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         // Picking a target tab is an explicit Run-after intent. Auto-arm on
         // non-null selection so "on tab" cannot sit as a passive label while
         // the queue is actually off.
-        next.set(tabId, {
+        const updated = {
           ...cur,
           runAfterTabId: value,
           autoRun: value ? true : cur.autoRun,
           firstChipHintActive: value ? false : cur.firstChipHintActive,
+        };
+        const targetChanged = value !== cur.runAfterTabId;
+        const explicitArm = targetChanged && (value !== null || hasActiveQueueWorkflow(updated));
+        if (explicitArm) markRuntimeWorkflowArm(tabId);
+        next.set(tabId, {
+          ...updated,
+          workflowArmedAt: retainedWorkflowArmedAt(cur, updated, explicitArm),
         });
+        return { queues: next };
+      });
+    },
+
+    clearStaleRunAfterTab: (tabId, expectedTargetTabId) => {
+      setAndPersist((state) => {
+        const cur = state.queues.get(tabId);
+        if (!cur || cur.runAfterTabId !== expectedTargetTabId) return state;
+        automaticRunAfterTargetClearTabs.add(tabId);
+        const next = new Map(state.queues);
+        next.set(tabId, { ...cur, runAfterTabId: null });
         return { queues: next };
       });
     },
@@ -1110,6 +1232,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         const index = cur.items.findIndex((item) => item.id === id);
         if (index < 0) {
           if (!consumesCurrentTarget) return state;
+          automaticRunAfterTargetClearTabs.add(tabId);
           const next = new Map(state.queues);
           next.set(tabId, { ...cur, runAfterTabId: null });
           targetCleared = true;
@@ -1117,22 +1240,29 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         }
         const items = cur.items.filter((_, itemIndex) => itemIndex !== index);
         targetCleared = consumesCurrentTarget;
+        if (targetCleared) automaticRunAfterTargetClearTabs.add(tabId);
         const next = new Map(state.queues);
-        next.set(tabId, {
+        const updated = {
           ...cur,
           items,
           autoRun: beforeCount === 1 ? false : cur.autoRun,
           runAfterTabId: targetCleared ? null : cur.runAfterTabId,
           previewId: cur.previewId === id ? null : cur.previewId,
+        };
+        next.set(tabId, {
+          ...updated,
+          workflowArmedAt: retainedWorkflowArmedAt(cur, updated),
         });
+        if (!hasActiveQueueWorkflow(updated)) runtimeWorkflowArmTabs.delete(tabId);
         removed = true;
         return { queues: next };
       });
       return { removed, beforeCount, targetCleared };
     },
 
-    disarmQueuesForTrigger: (triggerTabId) => {
+    disarmQueuesForTrigger: (triggerTabId, outcomeTs = null) => {
       const disarmed: string[] = [];
+      const classifiedOutcomeTs = Number.isFinite(outcomeTs) ? Number(outcomeTs) : null;
       setAndPersist((state) => {
         let changed = false;
         const next = new Map(state.queues);
@@ -1141,6 +1271,11 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           const waitsOnTrigger = cur.runAfterTabId === triggerTabId;
           const hasActivePromise = cur.autoRun || cur.stopAfter || cur.closeAfter || cur.firstDelayCountdownAt !== null;
           if ((!ownsTrigger && !waitsOnTrigger) || !hasActivePromise) continue;
+          // A user can deliberately re-arm after an old failure while restore is
+          // still hydrating. Never let that stale outcome cancel the newer arm;
+          // legacy queues without a timestamp remain fail-closed.
+          if (cur.workflowArmedAt !== null
+            && (classifiedOutcomeTs === null || cur.workflowArmedAt > classifiedOutcomeTs)) continue;
           next.set(ownerTabId, {
             ...cur,
             autoRun: false,
@@ -1149,8 +1284,11 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
             stopBeforeCloseArm: false,
             firstDelayCountdownAt: null,
             runAfterTabId: null,
+            workflowArmedAt: null,
           });
           disarmed.push(ownerTabId);
+          runtimeWorkflowArmTabs.delete(ownerTabId);
+          automaticRunAfterTargetClearTabs.delete(ownerTabId);
           changed = true;
         }
         return changed ? { queues: next } : state;
@@ -1159,6 +1297,8 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
     },
 
     cleanupClosedTab: (closedTabId) => {
+      runtimeWorkflowArmTabs.delete(closedTabId);
+      automaticRunAfterTargetClearTabs.delete(closedTabId);
       setAndPersist((state) => {
         let changed = false;
         const next = new Map(state.queues);
@@ -1167,6 +1307,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
 
         for (const [ownerTabId, queue] of next) {
           if (queue.runAfterTabId !== closedTabId) continue;
+          automaticRunAfterTargetClearTabs.add(ownerTabId);
           next.set(ownerTabId, { ...queue, runAfterTabId: null });
           changed = true;
         }
@@ -1292,6 +1433,7 @@ type PersistedTabQueue = {
   postPromptEnabled?: boolean;
   postPromptText?: string;
   runAfterTabId?: string | null;
+  workflowArmedAt?: number | null;
   panelCollapsed?: boolean;
   previewId?: string | null;
 };
@@ -1361,6 +1503,9 @@ function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
     firstChipHintActive: false,
     stopBeforeCloseArm: false,
     runAfterTabId: typeof entry.runAfterTabId === 'string' ? entry.runAfterTabId : null,
+    workflowArmedAt: typeof entry.workflowArmedAt === 'number' && Number.isFinite(entry.workflowArmedAt)
+      ? Number(entry.workflowArmedAt)
+      : null,
     previewId,
   };
 }
@@ -1394,7 +1539,7 @@ export function hydratePromptQueueStore(): Promise<void> {
         }
         return { queues: next };
       });
-      hasHydratedPromptQueueStore = true;
+      markPromptQueueStoreHydrated();
       preHydrateQueueChanges.clear();
       scheduleSave(usePromptQueueStore.getState().queues);
 
@@ -1409,7 +1554,7 @@ export function hydratePromptQueueStore(): Promise<void> {
     } catch (e) {
       // Do not leave the store permanently read-only after one bad row or IPC
       // failure. Existing in-memory actions remain saveable on the next mutation.
-      hasHydratedPromptQueueStore = true;
+      markPromptQueueStoreHydrated();
       preHydrateQueueChanges.clear();
       if (usePromptQueueStore.getState().queues.size > 0) {
         scheduleSave(usePromptQueueStore.getState().queues);

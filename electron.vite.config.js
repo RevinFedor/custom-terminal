@@ -4,9 +4,19 @@ import tailwindcss from '@tailwindcss/vite';
 import { codeInspectorPlugin } from 'code-inspector-plugin';
 import { resolve } from 'path';
 import { config } from 'dotenv';
+import { assertNotedShared } from '../noted-shared/build/assert-packages.mjs';
 
 // Load .env so renderer can access env vars at build time
 const env = config({ path: resolve(__dirname, '.env') }).parsed || {};
+const SHARED_ROOT = resolve(__dirname, '../noted-shared');
+
+assertNotedShared({
+  sharedRoot: SHARED_ROOT,
+  consumerRoot: __dirname,
+  consumer: 'custom-terminal',
+  packages: ['structured-dnd', 'file-explorer'],
+  expectedVersion: '0.2.0',
+});
 
 export default defineConfig({
   main: {
@@ -36,7 +46,8 @@ renderer: {
     // Renderer process (React app)
     root: '.',
     server: {
-      port: 5182
+      port: 5182,
+      fs: { allow: ['.', SHARED_ROOT] }
     },
     build: {
       outDir: 'dist/renderer',
@@ -91,13 +102,15 @@ renderer: {
         // ПЕРЕД '@' ради приоритета. React внутри пакета резолвится через
         // alias ниже → единый инстанс.
         { find: '@noted/claude-blocks', replacement: resolve(__dirname, 'packages/claude-blocks/src') },
-        { find: '@noted/structured-dnd', replacement: resolve(__dirname, 'packages/structured-dnd/src') },
-        { find: '@noted/file-explorer', replacement: resolve(__dirname, 'packages/file-explorer/src') },
+        { find: '@noted/structured-dnd', replacement: resolve(SHARED_ROOT, 'packages/structured-dnd/src') },
+        { find: '@noted/file-explorer', replacement: resolve(SHARED_ROOT, 'packages/file-explorer/src') },
         { find: '@', replacement: resolve(__dirname, 'src/renderer') },
         { find: 'react', replacement: resolve(__dirname, 'node_modules/react') },
-        { find: 'react-dom', replacement: resolve(__dirname, 'node_modules/react-dom') }
+        { find: 'react-dom', replacement: resolve(__dirname, 'node_modules/react-dom') },
+        { find: 'lucide-react', replacement: resolve(__dirname, 'node_modules/lucide-react') },
+        { find: 'react-icons', replacement: resolve(__dirname, 'node_modules/react-icons') }
       ],
-      dedupe: ['react', 'react-dom']
+      dedupe: ['react', 'react-dom', 'lucide-react', 'react-icons']
     },
     optimizeDeps: {
       include: ['react', 'react-dom']

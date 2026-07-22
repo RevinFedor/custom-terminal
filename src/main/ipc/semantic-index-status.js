@@ -19,6 +19,7 @@ const { spawn } = require('child_process');
 
 const INDEX_FILE_NAME = '.semantic-index.json';
 const DOCS_SUBDIR = 'docs';
+const EXCLUDED_DOC_DIRS = new Set(['tmp', 'prompts']);
 const REINDEX_PROGRESS_MARKER = '__KNOWLEDGE_REINDEX_PROGRESS__';
 
 // projectId → {
@@ -52,7 +53,7 @@ function listDocsFiles(projectPath) {
     for (const item of items) {
       const full = path.join(dir, item.name);
       if (item.isDirectory()) {
-        if (item.name === 'tmp' || item.name.startsWith('.')) continue;
+        if (EXCLUDED_DOC_DIRS.has(item.name) || item.name.startsWith('.')) continue;
         walk(full);
       } else if (item.isFile() && item.name.endsWith('.md') && item.name !== '_intro.md') {
         out.push(full);
@@ -67,7 +68,7 @@ function isManagedDocIndexPath(relPath) {
   if (typeof relPath !== 'string') return false;
   if (!relPath.startsWith(`${DOCS_SUBDIR}/`)) return false;
   if (!relPath.endsWith('.md')) return false;
-  if (relPath.split('/').includes('tmp')) return false;
+  if (relPath.split('/').some((part) => EXCLUDED_DOC_DIRS.has(part))) return false;
   return path.basename(relPath) !== '_intro.md';
 }
 
@@ -184,7 +185,7 @@ function startWatching(projectId, projectPath, mainWindow) {
       });
       state.watchers.push(w);
       for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (item.isDirectory() && !item.name.startsWith('.') && item.name !== 'tmp') {
+        if (item.isDirectory() && !item.name.startsWith('.') && !EXCLUDED_DOC_DIRS.has(item.name)) {
           attachDocsWatcher(path.join(dir, item.name));
         }
       }

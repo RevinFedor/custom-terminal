@@ -76,67 +76,15 @@
 
 ---
 
-## Custom Drag-and-Drop (Pointer Events)
+## Structured DnD промптов
 
-### Motivation (Invisible Intent)
-Почему отказались от нативного HTML5 Drag-and-Drop API:
-1. **Неуправляемый Ghost:** Браузер сам решает, как выглядит «призрак» элемента, что часто приводит к мерцанию или низкому качеству изображения на Retina-экранах.
-2. **Snap-back анимация:** Нативный API принудительно проигрывает анимацию возврата элемента на исходное место при неудачном дропе, что визуально конфликтует с реактивным обновлением стейта в React.
-3. **Layout Race:** При использовании анимированных gap-слотов нативный DnD часто ошибочно считает, что элемент «вышел» из зоны дропа из-за смещения координат под курсором.
+Редактор текстовых вставок использует тот же `@noted/structured-dnd/react`, что TabSidebar и GT Editor. Host строит outline из `prompt_groups`, `prompts`, `group_id`, `visual_parent_id` и persisted `position`; пакет отвечает за единственный in-tree source, безопасные Y-slots, preferred depth, X-шаги, Cmd-навигацию и release/cancel. Floating clone, отдельный grip и атомарный preview только на `pointerup` больше не являются действующим контрактом: пользователь видит будущий порядок и parent прямо во время удержания.
 
-### Техническая реализация
-Для полной управляемости DnD переведен на **Pointer Events** (`onPointerDown` -> `window.onPointerMove` -> `window.onPointerUp`).
-Для Prompt editor используется общий кросс-проектный паттерн
-`~/Global-Templates/🧩 Code-Patterns/docs-projects/ux-паттерны/drag-and-drop.md`:
-base-state + snapshot геометрии на старте drag, resolver считает цель по статичным
-зонам. Общая нормализованная модель, resolver и pointer-session живут в
-`packages/structured-dnd`; UI и SQLite остаются адаптерами приложения. Legacy rows
-получают persistent `stable_id` (`prompt-<legacy id>`), поэтому reorder меняет position,
-но не identity сущности.
+Legacy prompt получает стабильный `stable_id` (`prompt-<legacy id>`), поэтому reorder меняет позицию, но не identity. `visual_parent_id` задаёт prompt→prompt иерархию внутри того же `group_id`; группа остаётся отдельным collapsible root-контейнером. Source переносится вместе с descendants, переход между группами меняет container только у корня и сохраняет внутренние parent-связи поддерева. Перед построением outline host сортирует элементы по persisted `position`, а после preview сериализует полный результат обратно в shared flat/intra-group namespaces.
 
-`visual_parent_id` задаёт отдельную visual-иерархию prompt→prompt внутри одного
-`group_id`; она не заменяет физическую группу. Вправо — один attach к предыдущему
-peer той же глубины, влево — один outdent, вертикальный reorder сохраняет parent и
-переносит descendants source как поддерево. При переходе между группами несовместимая
-parent-связь очищается только у корня, descendants остаются вместе. Перед построением
-дерева элементы обязательно сортируются по persisted `position`: после вертикальной
-перестановки backing array может остаться в старом порядке, и чтение массива делало
-следующий шаг вправо disabled либо выбирало не того предыдущего peer.
+Вертикаль следует за курсором и автоматически выбирает минимально совместимую глубину; чистый X меняет один уровень только после собственного deadzone. Пустая раскрытая группа предоставляет first-child slot своим body без instructional placeholder. Закрытая группа остаётся атомарной до `Cmd`: modifier замораживает порядок, локальный progress циклически раскрывает/закрывает допустимый group header, а собственный ancestor source показывает серый blocker без loader. Промпт может быть visual-parent, но не получает disclosure и не становится Cmd-target.
 
-#### 1. Floating Clone Pattern (только не для grouped prompt editor)
-При зажатии grip-иконки (6 точек):
-- В `document.body` через Portal или прямой append создается физический клон ноды (`cloneNode(true)`).
-- Клон получает `position: fixed` и следует за курсором через `top/left` или `transform`.
-- Оригинальный элемент в списке скрывается (`display: none`), но сохраняет свое место в массиве.
-
-Этот подход оставлен как исторический вариант для простых flat-list DnD, но в grouped
-prompt editor он ретайрнут: пользователь видел две сущности одновременно — карточку
-рядом с курсором и inline preview в списке. Для текстовых вставок должен жить только
-inline preview внутри списка; сама перетаскиваемая карточка подсвечивается на месте.
-
-#### 2. Static Midpoints (Фикс джиттера)
-Ключевой «шрам» разработки: расчет целевой позиции ломался, так как preview переставлял
-карточки прямо под курсором, вызывая циклическое переключение flat/group target.
-Решение: snapshot всех зон (`midY`, header/body/nested rows) фиксируется один раз на
-старте drag, а все последующие расчёты индекса используют эти статические координаты,
-игнорируя реальное движение элементов в DOM.
-
-#### 3. Атомарный Drop (Sync State Batching)
-Live preview оказался неверным именно для пустой группы: после первого target группа
-раскрывалась, физически уезжала из-под неподвижного курсора, и следующий move менял
-решение обратно на flat-list. Поэтому prompt editor держит base geometry и последний
-semantic target неизменными на протяжении жеста и применяет pending-state один раз на
-`pointerup`. Это не отсутствие preview, а запрет использовать собственную layout mutation
-как новый input; визуальная подсветка source/target не должна переставлять target DOM.
-Выход за валидную геометрию одновременно снимает подсветку и очищает pending-state,
-поэтому mouseup снаружи не применяет последнюю виденную цель.
-
-Проверка валидной геометрии выполняется до horizontal intent: большой X-сдвиг уже за
-границей списка не может назначить prompt-parent. Плоский preview после принятого шага
-вправо сохраняет текущего parent, а шаг влево из группы ставит всё source-поддерево
-непосредственно после бывшего group-block. Пустой `group-body` сам является drop-зоной,
-даже если instructional placeholder удалён. Конкретные провальные последовательности —
-`knowledge/fix-иерархия-перетаскивания.md`.
+Live preview остаётся локальным renderer-state и не пишет SQLite на `pointermove`; `savePrompts`/`savePromptGroups` получают один принятый semantic result после release. Settings явно использует тот же асимметричный pointer-коридор, что TabSidebar: боковой выход при Y внутри списка продолжает X и разрешает release, а выход выше/ниже, `Escape` или `pointercancel` отменяет жест без сохранения последнего target. Host-приёмка 2026-07-16 подтвердила первое движение без геометрического скачка, Y вверх→назад в одном удержании, X вход/выход, пустую группу, Cmd dwell/protected target и тот же order/parent/depth после переоткрытия Settings и полного renderer reload; подключённый 2026-07-17 внешний коридор промптов отдельно не прогонялся. Исторические failure modes сохранены в `knowledge/fix-иерархия-перетаскивания.md`, общая модель — в `docs-global/ux-паттерны/drag-and-drop/`.
 
 ## Prompt Groups (Группировка текстовых вставок)
 
@@ -183,10 +131,12 @@ floating clone не рисуется. Иначе длинная группа п�
 
 Sidebar — fixed overlay, который начинается ниже ProjectToolbar и не резервирует место в его flex-layout. При открытии toggle и Home обязаны оставаться на тех же координатах; компенсировать ширину overlay через `margin-left: sidebarWidth` нельзя — это возвращает старое поведение, при котором весь toolbar уезжал вправо.
 
-Renderer дерева общий с GT Editor и живёт в `packages/file-explorer`, но физический
-filesystem move остаётся обязанностью host-адаптера. Перед Cmd-drop Custom Terminal
-проверяет существование всех source/target paths и запрещает duplicate, self/descendant
-move; затем одной prefix-map оптимистично переписывает дерево, focus/selection,
+Renderer дерева общий с GT Editor и живёт в нейтральном `../noted-shared/packages/file-explorer`,
+но физический filesystem move остаётся обязанностью host-адаптера. Обычный hierarchy-drag одинаково
+перемещает файлы и папки: вертикаль выбирает slot, горизонталь меняет parent, а закрытая
+папка сначала раскрывается через замороженный Cmd-navigation loader. Перед физическим
+commit Custom Terminal проверяет существование всех source/target paths и запрещает
+duplicate и self/descendant move; затем одной prefix-map оптимистично переписывает дерево, focus/selection,
 раскрытые пути, ручной layout, открытый preview и пути связанных file-tabs. Только после
 этого выполняется move на диске, а ошибка возвращает весь связанный state через rollback.
 Та же prefix-map нужна при переименовании папки. Встраивать app-specific IPC или store
@@ -197,6 +147,9 @@ Shared `FileRow` делит completed-click по владельцам: наст�
 перехватывает жест. Toggle нельзя выполнять на `pointerdown`: ререндер может заменить
 узел под курсором, после чего завершившийся `click` попадёт в body и повторит действие.
 Context menu, rename и nested controls остаются отдельными от row drag.
+Оболочка меню и базовые команды общие с GT Editor; Custom Terminal передаёт свои callbacks
+и добавляет `Link File` extension. Поэтому общий внешний вид не делает package владельцем
+clipboard, Finder, tab inventory или filesystem IPC.
 
 ### Общий профиль иконок
 

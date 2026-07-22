@@ -1,11 +1,15 @@
-# Feature: Session Status (configurable tab markers)
+# Feature: статусы вкладок и задач
 
 ## Intro
-Маркер 8px (default круг, опционально квадрат) слева во вкладке в vertical layout. Назначается через ПКМ → Status. Сам список статусов — полный CRUD в Settings → Системные: label, hex, удаление, добавление. Дефолт-seed три статуса (dev/bugfix/knowledge), но юзер может полностью перекроить.
+В Settings → Системные секция разделена на две равные колонки: «Статусы вкладок» и «Статусы задач». Это две независимые палитры с собственными названиями, цветами, описаниями, формой и размером маркера.
+
+Статус вкладки показывается слева во вкладке и назначается через её контекстное меню. Статус задачи показывается слева от корневой задачи в плане вкладки и назначается через контекстное меню строки задачи. Подзадачи статусов не имеют.
 
 ## Data model
 
-`SessionStatusDef = { id: string, label: string, color: string }` в `useUIStore.sessionStatuses`. Tab.sessionStatus хранит **id**, не label и не color — переименование статуса в Settings не теряет ассоциацию у вкладок, цвет обновляется автоматически. `id` стабилен: дефолтные `dev`/`bugfix`/`knowledge`, custom = `status-<timestamp>-<rand>`.
+`SessionStatusDef = { id: string, label: string, color: string, description?: string }`. `useUIStore.sessionStatuses` обслуживает вкладки, `useUIStore.taskStatuses` — задачи. Оба потребителя хранят **id**, не label и не color: переименование или перекраска не теряют ассоциацию.
+
+На первом запуске палитра задач клонируется из текущей пользовательской палитры вкладок, но получает отдельные id с префиксом `task-`. После этого обе палитры изменяются независимо.
 
 Tab.sessionStatus в типах поднят до `string` (раньше был union из трёх литералов). Расширение для custom-id'ов. Backward compat: старые БД с `'dev'`/`'bugfix'`/`'knowledge'` ID'ами продолжают работать — те же id в дефолт-seed.
 
@@ -19,13 +23,15 @@ Tab.sessionStatus в типах поднят до `string` (раньше был 
 
 ## Marker shape + size
 
-`statusMarker = { shape: 'dot' | 'square', sizePx: 4..16 }` — отдельная глобальная настройка, не per-статус. Юзер выбирает один раз и все маркеры рисуются одинаковой формой.
+`statusMarker = { shape: 'dot' | 'square', sizePx: 4..16 }` задаёт геометрию маркеров вкладок. `taskStatusMarker` имеет ту же форму данных, но независимо управляет маркерами задач. Геометрия едина внутри одной палитры, а не настраивается для каждого статуса отдельно.
 
 Centering геометрии: `left: 5px` (после 3px полоски процесса + 2px зазор), `top: calc(50% + 1px)` — `+1px` компенсирует оптический baseline-shift строчных букв (`claude-03` без descender'ов кажется ниже геометрического центра).
 
 ## CRUD UI (Settings → Системные)
 
-Левая колонка 2-column grid. Сверху compact-row с shape toggle (визуальные dot/square превью кнопок) и `<input type="number">` для size. Дальше список SessionStatusDef-строк: цветной круг 20px (наследует выбранную shape) → text input для label → 7-char hex input → корзина.
+Две равные колонки используют один и тот же редактор. Сверху каждой колонки: добавление статуса, переключатель круг/квадрат и размер. Дальше идут строки: цветной маркер → название → hex → стрелка описания → удаление.
+
+Стрелка раскрывает многострочное описание статуса. Для вкладок это пояснение пользователю; для задач то же описание дополнительно возвращается через Terminal MCP, чтобы нейронка не угадывала назначение статуса по цвету или короткому названию. Описание не является разрешением: отдельного флага «нейронка может назначить этот статус» нет.
 
 Hex normalizer (`normalizeHexValue`) принимает `'fff'` / `'#fff'` / `'ffffff'` / `'#ffffff'`, всё что не парсится — null, caller оставляет старый цвет (защита от «промежуточный `#ab` ломает марк прямо в инпуте»). Локальный `hexDrafts` буфер позволяет печатать промежуточные значения без записи мусора в стор; blur → откат к каноническому из стора.
 
@@ -41,7 +47,9 @@ Hex normalizer (`normalizeHexValue`) принимает `'fff'` / `'#fff'` / `'f
 
 ## Persistence
 
-localStorage ключ `noted-terminal-session-statuses` (массив JSON). `statusMarker` отдельным ключом `noted-terminal-status-marker`. Tab.sessionStatus идёт через стандартный saveTabs → SQLite; TabGroup.sessionStatus идёт через saveTabGroups → JSON `tab_groups`. **Не зеркалится в SQLite через `app:mirrorLocalStorageSync`** — это локальная UI-настройка, синк между Electron-инстансами на разных машинах для конфигурации статусов не нужен (одна машина = одна палитра).
+Палитра вкладок живёт в `noted-terminal-session-statuses`, палитра задач — в `noted-terminal-task-statuses`. Геометрия хранится отдельно в `noted-terminal-status-marker` и `noted-terminal-task-status-marker`. Универсальное зеркало `noted-terminal-*` переносит эти значения в app state, поэтому main process и Terminal MCP видят тот же каталог задач, что renderer.
+
+`Tab.sessionStatus` идёт через стандартный saveTabs → SQLite; `TabGroup.sessionStatus` — через `tab_groups`. Id статуса корневой задачи хранится внутри документа плана вкладки. Удаление определения статуса не переписывает уже сохранённые id: маркер временно исчезает и возвращается, если определение с тем же id появится снова.
 
 ## Survival across close/restore
 
@@ -51,6 +59,7 @@ localStorage ключ `noted-terminal-session-statuses` (массив JSON). `st
 
 ## Связи
 
+- [`fact-tab-task-plan.md`](fact-tab-task-plan.md) — где используются статусы задач.
 - `knowledge/fact-tabs.md::Vertical mode (TabSidebar)` — где рендерится маркер.
 - `knowledge/fact-process-bar.md` — process-bar с position toggle живёт в той же конфигурации.
 - `methodology/переносимый-дизайн.md::Активность через насыщенность фона` — почему маркер не использует tint самой вкладки.

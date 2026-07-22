@@ -154,9 +154,15 @@ async function getCodexPtyPresence(tabId: string): Promise<AgentPtyPresence> {
   const inputReady = isRunning && !!tuiReady?.inputReady;
   const startupFailed = tuiReady?.startupFailed === true;
   const manualActionRequired = tuiReady?.manualActionRequired === true;
-  const isBusy = turnState?.hasWatcher ? !!turnState.busy : !!tab?.aiBusy;
+  const turnStateResolved = turnState?.hasWatcher && turnState?.catchUpPending !== true;
+  const isBusy = turnStateResolved ? !!turnState.busy : !!tab?.aiBusy;
   if (tab && tab.aiBusy !== isBusy) {
-    useWorkspaceStore.getState().setAiBusy(tabId, isBusy);
+    const reason = isBusy
+      ? 'task_started'
+      : (turnState?.outcomeKnown && turnState?.lastOutcomeReason
+        ? turnState.lastOutcomeReason
+        : 'codex-outcome-unknown');
+    useWorkspaceStore.getState().setAiBusy(tabId, isBusy, reason);
   }
   const status: AgentPtyStatus = stopping?.stopping
     ? 'stopping'

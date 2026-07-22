@@ -83,6 +83,7 @@ export interface SessionStatusDef {
   id: string;
   label: string;
   color: string;
+  description?: string;
 }
 
 const DEFAULT_SESSION_STATUSES: SessionStatusDef[] = [
@@ -99,12 +100,40 @@ function loadSessionStatuses(): SessionStatusDef[] {
     if (!Array.isArray(parsed)) return DEFAULT_SESSION_STATUSES;
     return parsed
       .filter((s) => s && typeof s.id === 'string' && typeof s.label === 'string' && typeof s.color === 'string')
-      .map((s) => ({ id: s.id, label: s.label, color: s.color }));
+      .map((s) => ({ id: s.id, label: s.label, color: s.color, description: typeof s.description === 'string' ? s.description : '' }));
   } catch { return DEFAULT_SESSION_STATUSES; }
 }
 
 function saveSessionStatuses(list: SessionStatusDef[]) {
   try { localStorage.setItem('noted-terminal-session-statuses', JSON.stringify(list)); } catch {}
+}
+
+function loadTaskStatuses(): SessionStatusDef[] {
+  try {
+    const raw = localStorage.getItem('noted-terminal-task-statuses');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .filter((s) => s && typeof s.id === 'string' && typeof s.label === 'string' && typeof s.color === 'string')
+          .map((s) => ({ id: s.id, label: s.label, color: s.color, description: typeof s.description === 'string' ? s.description : '' }));
+      }
+    }
+  } catch {}
+
+  // First launch of task plans: clone the user's current tab palette so the
+  // new column is useful immediately, then let both palettes evolve separately.
+  const seeded = loadSessionStatuses().map((status) => ({
+    ...status,
+    id: `task-${status.id}`,
+    description: status.description || '',
+  }));
+  try { localStorage.setItem('noted-terminal-task-statuses', JSON.stringify(seeded)); } catch {}
+  return seeded;
+}
+
+function saveTaskStatuses(list: SessionStatusDef[]) {
+  try { localStorage.setItem('noted-terminal-task-statuses', JSON.stringify(list)); } catch {}
 }
 
 export interface ProcessBarSettings {
@@ -287,6 +316,12 @@ interface UIStore {
   updateSessionStatus: (id: string, patch: Partial<Omit<SessionStatusDef, 'id'>>) => void;
   removeSessionStatus: (id: string) => void;
 
+  taskStatuses: SessionStatusDef[];
+  setTaskStatuses: (next: SessionStatusDef[]) => void;
+  addTaskStatus: () => string;
+  updateTaskStatus: (id: string, patch: Partial<Omit<SessionStatusDef, 'id'>>) => void;
+  removeTaskStatus: (id: string) => void;
+
   /* Process bar — полоска слева/справа во вкладке когда процесс жив.
      Полоса всегда видима при живом процессе; настройка НЕ содержит выключателя.
      AI-busy рисуется отдельным shimmer-оверлеем с цветом/расстоянием/плотностью из настроек.
@@ -299,6 +334,8 @@ interface UIStore {
      sizePx — длина стороны (для круга = диаметр). Clamp 4..16. */
   statusMarker: StatusMarkerSettings;
   setStatusMarker: (patch: Partial<StatusMarkerSettings>) => void;
+  taskStatusMarker: StatusMarkerSettings;
+  setTaskStatusMarker: (patch: Partial<StatusMarkerSettings>) => void;
 
   /* Tab geometry — табы терминала в TabSidebar (vertical mode). Все поля px.
      Раньше — три константы TAB_VERTICAL_PADDING_* в TabBar.tsx, юзер не мог менять
@@ -1905,6 +1942,29 @@ export const useUIStore = create<UIStore>((set, get) => ({
     saveSessionStatuses(next);
   },
 
+  taskStatuses: loadTaskStatuses(),
+  setTaskStatuses: (next) => {
+    set({ taskStatuses: next });
+    saveTaskStatuses(next);
+  },
+  addTaskStatus: () => {
+    const id = `task-status-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const next = [...get().taskStatuses, { id, label: 'Новый статус', color: '#7C7C7C', description: '' }];
+    set({ taskStatuses: next });
+    saveTaskStatuses(next);
+    return id;
+  },
+  updateTaskStatus: (id, patch) => {
+    const next = get().taskStatuses.map((s) => (s.id === id ? { ...s, ...patch } : s));
+    set({ taskStatuses: next });
+    saveTaskStatuses(next);
+  },
+  removeTaskStatus: (id) => {
+    const next = get().taskStatuses.filter((s) => s.id !== id);
+    set({ taskStatuses: next });
+    saveTaskStatuses(next);
+  },
+
   processBar: loadProcessBar(),
   setProcessBar: (patch) => {
     const cur = get().processBar;
@@ -1935,6 +1995,33 @@ export const useUIStore = create<UIStore>((set, get) => ({
     };
     set({ statusMarker: next });
     saveStatusMarker(next);
+  },
+
+  taskStatusMarker: (() => {
+    try {
+      const raw = localStorage.getItem('noted-terminal-task-status-marker');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        return {
+          shape: parsed?.shape === 'square' ? 'square' : 'dot',
+          sizePx: typeof parsed?.sizePx === 'number'
+            ? Math.max(4, Math.min(16, Math.round(parsed.sizePx)))
+            : DEFAULT_STATUS_MARKER.sizePx,
+        } as StatusMarkerSettings;
+      }
+    } catch {}
+    return loadStatusMarker();
+  })(),
+  setTaskStatusMarker: (patch) => {
+    const cur = get().taskStatusMarker;
+    const next: StatusMarkerSettings = {
+      shape: patch.shape === 'square' || patch.shape === 'dot' ? patch.shape : cur.shape,
+      sizePx: typeof patch.sizePx === 'number'
+        ? Math.max(4, Math.min(16, Math.round(patch.sizePx)))
+        : cur.sizePx,
+    };
+    set({ taskStatusMarker: next });
+    try { localStorage.setItem('noted-terminal-task-status-marker', JSON.stringify(next)); } catch {}
   },
 
   tabGeometry: loadTabGeometry(),

@@ -121,6 +121,35 @@ const TERMINAL_THEME = {
   brightWhite: '#e5e5e5'
 };
 
+type XtermInputOrigin = 'user' | 'terminal-response' | 'unknown';
+
+// xterm's public onData event mixes actual user input with terminal-protocol
+// replies (focus reports, cursor position, colors, device attributes, etc.).
+// Internally xterm fires onUserInput immediately before onData only for the
+// former. Preserve that provenance across IPC so main-process automation does
+// not mistake a terminal reply for the user taking control of a startup menu.
+// If xterm changes its internal shape, return `unknown`: main treats that as
+// user-owned (fail-safe) instead of granting an automatic Enter.
+function createXtermInputOriginTracker(term: XTerminal): () => XtermInputOrigin {
+  let nextDataWasUserInput = false;
+  try {
+    const coreService = (term as any)._core?.coreService;
+    if (typeof coreService?.onUserInput !== 'function') {
+      return () => 'unknown';
+    }
+    coreService.onUserInput(() => {
+      nextDataWasUserInput = true;
+    });
+    return () => {
+      const origin: XtermInputOrigin = nextDataWasUserInput ? 'user' : 'terminal-response';
+      nextDataWasUserInput = false;
+      return origin;
+    };
+  } catch {
+    return () => 'unknown';
+  }
+}
+
 // ============================================================================
 // EffortInject TUI-readiness diagnostic instrumentation (temporary, May 2026)
 // ============================================================================
@@ -160,6 +189,11 @@ const _modelSentForTab = new Map<string, { at: number; via: string; model: strin
 
 const _claudeBridgeModelByTab = new Map<string, { model: string; at: number }>();
 const _claudeStartupDefaultsInflight = new Map<string, Promise<void>>();
+const _claudeStartupDefaultsAttemptMeta = new Map<string, {
+  work: Promise<void>;
+  readyTs: number;
+  startedAt: number;
+}>();
 const _claudeStartupDefaultsRecoveryInflight = new Map<string, Promise<void>>();
 const _claudeVisibleSettingsDialogConfirmCooldown = new Map<string, number>();
 
@@ -1215,6 +1249,13 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         _effortSentForTab.delete(tabId);
         _modelSentForTab.delete(tabId);
         _claudeBridgeModelByTab.delete(tabId);
+        const inflightAttempt = _claudeStartupDefaultsAttemptMeta.get(tabId);
+        if (inflightAttempt) {
+          console.warn('[ClaudeStartupDefaultsAttempt] command-finished tab=' + tabId.slice(-12)
+            + ' ownerReadyTs=' + inflightAttempt.readyTs
+            + ' ageMs=' + (Date.now() - inflightAttempt.startedAt)
+            + ' inflight=true');
+        }
         clearClaudeStartupDefaultsGate(tabId);
         finalizeAiLaunchSnapshot(tabId);
       }
@@ -1897,9 +1938,16 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     // The sentinels make the later Bridge:Fresh path a no-op once this fires.
     const handleTuiReady = async (_: any, data: { tabId: string; ts: number }) => {
       if (data.tabId !== tabId) return;
+      const incomingReadyTs = Number(data.ts) || Date.now();
       const existingStartup = _claudeStartupDefaultsInflight.get(tabId);
       if (existingStartup) {
-        console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' startup defaults already running — join');
+        const owner = _claudeStartupDefaultsAttemptMeta.get(tabId);
+        console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12)
+          + ' startup defaults already running — join'
+          + ' incomingReadyTs=' + incomingReadyTs
+          + ' ownerReadyTs=' + (owner?.readyTs || 0)
+          + ' sameReadyEvent=' + (owner?.readyTs === incomingReadyTs)
+          + ' ownerAgeMs=' + (owner ? Date.now() - owner.startedAt : -1));
         await existingStartup.catch(() => {});
         return;
       }
@@ -1994,15 +2042,37 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         }
       })();
       _claudeStartupDefaultsInflight.set(tabId, startupWork);
+      _claudeStartupDefaultsAttemptMeta.set(tabId, {
+        work: startupWork,
+        readyTs: incomingReadyTs,
+        startedAt: Date.now(),
+      });
       try {
         await startupWork;
+        const owner = _claudeStartupDefaultsAttemptMeta.get(tabId);
+        console.warn('[ClaudeStartupDefaultsAttempt] completion tab=' + tabId.slice(-12)
+          + ' result=ready'
+          + ' readyTs=' + incomingReadyTs
+          + ' ownerReadyTs=' + (owner?.readyTs || 0)
+          + ' ownsCurrent=' + (owner?.work === startupWork)
+          + ' ageMs=' + (owner?.work === startupWork ? Date.now() - owner.startedAt : -1));
         markClaudeStartupDefaultsReady(tabId, 'tui-ready');
       } catch (e: unknown) {
+        const owner = _claudeStartupDefaultsAttemptMeta.get(tabId);
+        console.warn('[ClaudeStartupDefaultsAttempt] completion tab=' + tabId.slice(-12)
+          + ' result=failed'
+          + ' readyTs=' + incomingReadyTs
+          + ' ownerReadyTs=' + (owner?.readyTs || 0)
+          + ' ownsCurrent=' + (owner?.work === startupWork)
+          + ' ageMs=' + (owner?.work === startupWork ? Date.now() - owner.startedAt : -1));
         markClaudeStartupDefaultsFailed(tabId, 'tui-ready', e);
         console.error('[Terminal:TuiReady] startup defaults failed', e);
       } finally {
         if (_claudeStartupDefaultsInflight.get(tabId) === startupWork) {
           _claudeStartupDefaultsInflight.delete(tabId);
+        }
+        if (_claudeStartupDefaultsAttemptMeta.get(tabId)?.work === startupWork) {
+          _claudeStartupDefaultsAttemptMeta.delete(tabId);
         }
       }
     };
@@ -2222,6 +2292,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
       // IPC: Send input to PTY. xterm's built-in `scrollOnUserInput: true`
       // (дефолт) сам прижимает viewport к низу при keystroke.
+      const takeXtermInputOrigin = createXtermInputOriginTracker(term);
       term.onData((data) => {
         // Paste diagnostics — large input only. Reads xterm's internal
         // bracketedPasteMode flag so we know whether xterm.js itself wrapped
@@ -2246,7 +2317,9 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             + ' head=' + JSON.stringify(data.substring(0, 30))
             + ' tail=' + JSON.stringify(data.substring(Math.max(0, data.length - 30))));
         }
-        ipcRenderer.send('terminal:input', tabId, data);
+        ipcRenderer.send('terminal:input', tabId, data, {
+          xtermInputOrigin: takeXtermInputOrigin(),
+        });
       });
 
       // Track selection changes and update global state
@@ -2700,9 +2773,10 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       ipcRenderer.removeListener('claude:bridge-update', handleBridgeUpdate);
       ipcRenderer.removeListener('gemini:session-detected', handleGeminiSessionDetected);
       ipcRenderer.removeListener('codex:session-detected', handleCodexSessionDetected);
-      // Close AI file watchers if active for this tab
+      // Gemini watcher is renderer-owned. Codex session/turn watchers are
+      // main-process runtime state and must survive an xterm component unmount;
+      // terminal kill/process exit owns their cleanup.
       ipcRenderer.send('gemini:close-watcher', { tabId });
-      ipcRenderer.send('codex:close-watcher', { tabId });
 
       // Serialize terminal buffer before unmount (for restoration after remount)
       const term = xtermInstance.current;
@@ -2852,8 +2926,11 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         }
 
         // Setup handlers
+        const takeXtermInputOrigin = createXtermInputOriginTracker(term);
         term.onData((data) => {
-          ipcRenderer.send('terminal:input', tabId, data);
+          ipcRenderer.send('terminal:input', tabId, data, {
+            xtermInputOrigin: takeXtermInputOrigin(),
+          });
         });
         term.onSelectionChange(() => {
           const selection = term.getSelection() || '';

@@ -9,6 +9,13 @@ import { terminalRegistry } from '../../utils/terminalRegistry';
 import { markPendingResume } from '../../utils/pendingResume';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
+import {
+  applyClaudeStartupDefaultsGate,
+  hideSessionStartingFromLifecycle,
+  invalidateSessionStartingProbeSequence,
+  isSessionStartingProbeCurrent,
+  syncSessionStartingWithPresence,
+} from '../../utils/sessionStartingState.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -24,6 +31,7 @@ type SessionStartingState = {
   startupPending?: boolean;
   startupFailed?: boolean;
   startupError?: string | null;
+  stickySource?: 'claude-startup-defaults';
 };
 
 type AgentStoppingState = {
@@ -175,9 +183,7 @@ const getSessionStartingPresentation = (state: SessionStartingState) => {
     ? state.lastNotReady.blockers
     : []);
   const hasBlocker = (name: string) => blockers.has(name) || reason.includes(name);
-  const isError = state.startupFailed === true
-    || state.lastNotReady?.phase === 'startup-timeout'
-    || reason.includes('startup-timeout');
+  const isError = state.startupFailed === true;
 
   if (isError) {
     return {
@@ -573,6 +579,14 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     `${info.tabId}|${info.engine}|${info.sessionId || ''}`
   ), []);
 
+  const invalidateStartingProbeForTab = useCallback((tabId: string) => {
+    startingProbeSeqRef.current = invalidateSessionStartingProbeSequence(
+      startingProbeSeqRef.current,
+      activeAgentStartingInfoRef.current,
+      tabId,
+    );
+  }, []);
+
   useEffect(() => {
     activeAgentStartingInfoRef.current = activeAgentStartingInfo;
   }, [activeAgentStartingInfo]);
@@ -619,47 +633,21 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     }
     try {
       const presence = await getHistoryAgentRuntime(info.engine).getPresence(info.tabId);
-      if (seq !== startingProbeSeqRef.current) return;
       const latest = activeAgentStartingInfoRef.current;
-      if (!latest || latest.tabId !== info.tabId || latest.engine !== info.engine) return;
-      if (presence.status === 'starting') {
-        if (dismissedStartingKeysRef.current.has(startingDismissKey(info))) return;
-        setSessionStarting((prev) => {
-          if (prev?.tabId === info.tabId && prev.engine === info.engine) {
-            return {
-              ...prev,
-              sessionId: info.sessionId,
-              lastNotReady: presence.lastNotReady,
-              holdUntilReady: prev.holdUntilReady,
-              startupPending: prev.startupPending,
-              startupFailed: prev.startupFailed || presence.startupFailed,
-              startupError: prev.startupError || presence.startupError,
-            };
-          }
-          console.warn('[SessionStartingOverlay] show tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason);
-          return {
-            tabId: info.tabId,
-            engine: info.engine,
-            sessionId: info.sessionId,
-            since: Date.now(),
-            lastNotReady: presence.lastNotReady,
-            startupFailed: presence.startupFailed,
-            startupError: presence.startupError,
-          };
-        });
-      } else {
+      if (!isSessionStartingProbeCurrent(seq, startingProbeSeqRef.current, info, latest)) return;
+      if (presence.status === 'starting' && dismissedStartingKeysRef.current.has(startingDismissKey(info))) return;
+      if (presence.status !== 'starting') {
         dismissedStartingKeysRef.current.delete(startingDismissKey(info));
-        setSessionStarting((prev) => {
-          const keepHoldingForCommandStartRace = prev?.holdUntilReady
-            && presence.status === 'inactive'
-            && !presence.manualActionRequired;
-          if (prev?.tabId === info.tabId && (prev.startupFailed || prev.startupPending || keepHoldingForCommandStartRace)) return prev;
-          if (prev?.tabId === info.tabId) {
-            console.warn('[SessionStartingOverlay] hide tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason + ' status=' + presence.status);
-          }
-          return prev?.tabId === info.tabId ? null : prev;
-        });
       }
+      setSessionStarting((prev) => {
+        const next = syncSessionStartingWithPresence(prev, info, presence);
+        if (!prev && next) {
+          console.warn('[SessionStartingOverlay] show tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason);
+        } else if (prev?.tabId === info.tabId && !next) {
+          console.warn('[SessionStartingOverlay] hide tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason + ' status=' + presence.status);
+        }
+        return next;
+      });
     } catch (e: any) {
       if (seq !== startingProbeSeqRef.current) return;
       console.warn('[SessionStartingOverlay] presence failed tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason + ' error=' + (e?.message || String(e)));
@@ -695,13 +683,13 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     };
     const hideFromEvent = (tabId: string, reason: string, force = false) => {
       const info = activeAgentStartingInfoRef.current;
+      invalidateStartingProbeForTab(tabId);
       if (info?.tabId === tabId) dismissedStartingKeysRef.current.delete(startingDismissKey(info));
       setSessionStarting((prev) => {
         if (prev?.tabId !== tabId) return prev;
-        if (prev.startupFailed) return prev;
-        if (prev?.tabId === tabId && (prev.startupPending || (!force && prev.holdUntilReady))) return prev;
-        console.warn('[SessionStartingOverlay] event-hide tab=' + tabId.slice(-12) + ' reason=' + reason + ' engine=' + prev.engine);
-        return null;
+        const next = hideSessionStartingFromLifecycle(prev, tabId, { force });
+        if (!next) console.warn('[SessionStartingOverlay] event-hide tab=' + tabId.slice(-12) + ' reason=' + reason + ' engine=' + prev.engine);
+        return next;
       });
     };
     const onCommandStarted = (_: any, data: { tabId: string; commandType?: string | null }) => {
@@ -736,6 +724,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       const engine: InterruptedEngine = data.toolType === 'codex' ? 'codex' : 'claude';
       if (data.stopping) {
         if (eventTabId !== activeTabId || currentView !== 'terminal') return;
+        invalidateStartingProbeForTab(eventTabId);
         setSessionStarting(null);
         setAgentStopping((prev) => {
           if (prev?.tabId === eventTabId && prev.engine === engine) {
@@ -769,26 +758,17 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       const gateTabId = detail.tabId || '';
       const info = activeAgentStartingInfoRef.current;
       if (!gateTabId || !info || info.tabId !== gateTabId || info.engine !== 'claude' || currentView !== 'terminal') return;
-      if (detail.status === 'ready') {
-        setSessionStarting((prev) => {
-          if (prev?.tabId === gateTabId) console.warn('[SessionStartingOverlay] gate-ready tab=' + gateTabId.slice(-12) + ' reason=' + (detail.reason || '-'));
-          return prev?.tabId === gateTabId ? null : prev;
-        });
-        return;
-      }
       if (detail.status === 'pending' || detail.status === 'failed') {
         dismissedStartingKeysRef.current.delete(startingDismissKey(info));
+      }
+      if (detail.status === 'ready' || detail.status === 'cleared') {
+        invalidateStartingProbeForTab(gateTabId);
+      }
+      if (detail.status === 'ready' || detail.status === 'cleared' || detail.status === 'pending' || detail.status === 'failed') {
         setSessionStarting((prev) => {
+          const next = applyClaudeStartupDefaultsGate(prev, info, { ...detail, tabId: gateTabId });
           console.warn('[SessionStartingOverlay] gate-' + detail.status + ' tab=' + gateTabId.slice(-12) + ' reason=' + (detail.reason || '-') + ' error=' + (detail.error || '-'));
-          return {
-            tabId: gateTabId,
-            engine: 'claude',
-            sessionId: info.sessionId,
-            since: prev?.tabId === gateTabId ? prev.since : Date.now(),
-            startupPending: detail.status === 'pending',
-            startupFailed: detail.status === 'failed',
-            startupError: detail.status === 'failed' ? (detail.error || detail.reason || 'Claude startup defaults failed') : null,
-          };
+          return next;
         });
       }
     };
@@ -811,7 +791,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       ipcRenderer.removeListener('agent:stopping-state', onAgentStopping);
       window.removeEventListener('claude-startup-defaults-gate', onClaudeStartupGate);
     };
-  }, [activeTabId, currentView, refreshSessionStarting, startingDismissKey]);
+  }, [activeTabId, currentView, invalidateStartingProbeForTab, refreshSessionStarting, startingDismissKey]);
 
   const handleDismissSessionStarting = useCallback(() => {
     const current = sessionStarting;

@@ -1,10 +1,12 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect } from 'react'
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { flushSync } from 'react-dom'
 import {
   applySidebarLayout,
   DEFAULT_FILE_ICON_PROFILE,
-  FileExplorer as PragmaticFileTree,
   emptySidebarLayout,
+  FileExplorerContextMenu,
+  FileOutlineExplorer,
+  flattenTree,
   hasSidebarLayoutEntries,
   mutateSharedFileIconProfile,
   normalizeFileIconProfile,
@@ -15,7 +17,7 @@ import {
   shouldImportLegacyFileIconOverrides,
 } from '@noted/file-explorer'
 import '@noted/file-explorer/styles.css'
-import { flattenTree } from './PragmaticFileTree/utils'
+import '@noted/file-explorer/context-menu.css'
 import Tooltip from '../UI/Tooltip'
 import IconCropper from './IconCropper'
 import { RunAfterTabPicker } from './RunAfterTabPicker'
@@ -336,120 +338,6 @@ function IconPicker({ item, onSelect, onClose, onReset, onResetToVsc, existingIc
   )
 }
 
-function ContextMenu({ x, y, node, onClose, onCopyPath, onOpenInFinder, onCopyContent, onRename, onChooseIcon, onNewFile, onNewFolder, onDelete, onLinkFile, linkOwnerProjectId = null, multiSelectCount = 0 }) {
-  const menuRef = useRef(null)
-  const [position, setPosition] = useState({ left: x, top: y })
-
-  useEffect(() => {
-    const handleClickOutside = (e) => {
-      if (isRunAfterPickerEvent(e)) return
-      if (menuRef.current && !menuRef.current.contains(e.target)) {
-        onClose()
-      }
-    }
-    document.addEventListener('mousedown', handleClickOutside)
-    return () => document.removeEventListener('mousedown', handleClickOutside)
-  }, [onClose])
-
-  const handleRenameClick = () => {
-    console.log('[sidebar]','ContextMenu: Rename clicked for node:', node ? { id: node.id, name: node.name } : null)
-    onRename(node)
-    onClose()
-  }
-
-  const handleNewFileClick = (targetNode) => {
-    console.log('[sidebar]','ContextMenu: New File clicked, targetNode:', targetNode ? { id: targetNode.id } : 'ROOT')
-    onNewFile(targetNode)
-    onClose()
-  }
-
-  const handleNewFolderClick = (targetNode) => {
-    console.log('[sidebar]','ContextMenu: New Folder clicked, targetNode:', targetNode ? { id: targetNode.id } : 'ROOT')
-    onNewFolder(targetNode)
-    onClose()
-  }
-
-  useLayoutEffect(() => {
-    const el = menuRef.current
-    if (!el) return
-    const rect = el.getBoundingClientRect()
-    const pad = 8
-    const maxLeft = Math.max(pad, window.innerWidth - rect.width - pad)
-    const maxTop = Math.max(pad, window.innerHeight - rect.height - pad)
-    const next = {
-      left: Math.min(Math.max(x, pad), maxLeft),
-      top: Math.min(Math.max(y, pad), maxTop),
-    }
-    if (next.left !== position.left || next.top !== position.top) {
-      setPosition(next)
-    }
-  }, [x, y, node, multiSelectCount, position.left, position.top])
-
-  return (
-    <div ref={menuRef} className="context-menu" style={{ left: position.left, top: position.top }}>
-      {node && (
-        <>
-          <div className="context-menu-item" onClick={() => { onCopyPath(node.id); onClose() }}>Copy Path</div>
-          <div className="context-menu-item" onClick={() => { onOpenInFinder(node.id); onClose() }}>Open in Finder</div>
-          {!node.isDirectory && (
-            <div className="context-menu-item" onClick={() => { onCopyContent(node.id); onClose() }}>Copy Content</div>
-          )}
-          {!node.isDirectory && multiSelectCount <= 1 && onLinkFile && (
-            <RunAfterTabPicker
-              tabId={node.id}
-              ownerProjectId={linkOwnerProjectId}
-              autoRun={false}
-              runAfterTabId={null}
-              setRunAfterTab={(_ownerId, targetTabId) => {
-                if (!targetTabId) return
-                onLinkFile(node.id, targetTabId)
-                onClose()
-              }}
-              panelRef={menuRef}
-              title="Link file - pick a tab"
-              emptyLabel=""
-              showAllTabsOnOpen
-              triggerVariant="context-row"
-              triggerLabel="Link File"
-              menuWidth={252}
-              zIndex={2147482101}
-              side="right"
-              accentColor="#8b5cf6"
-              accentTextColor="#ddd6fe"
-              showRuntimeDot={false}
-              showTargetSummary={false}
-              openOnHover
-            />
-          )}
-          {multiSelectCount <= 1 && (
-            <div className="context-menu-item" onClick={handleRenameClick}>Rename</div>
-          )}
-          {multiSelectCount <= 1 && !node.isDirectory && (
-            <div className="context-menu-item" onClick={() => { onChooseIcon(node); onClose() }}>Choose Icon</div>
-          )}
-          {multiSelectCount <= 1 && node.isDirectory && (
-            <>
-              <div className="context-menu-divider" />
-              <div className="context-menu-item" onClick={() => handleNewFileClick(node)}>New File</div>
-              <div className="context-menu-item" onClick={() => handleNewFolderClick(node)}>New Folder</div>
-            </>
-          )}
-          <div className="context-menu-divider" />
-          <div className="context-menu-item context-menu-item-delete" onClick={() => { onDelete(node.id); onClose() }}>
-            {multiSelectCount > 1 ? `Delete ${multiSelectCount} items` : 'Delete'}
-          </div>
-        </>
-      )}
-      {!node && (
-        <>
-          <div className="context-menu-item" onClick={() => handleNewFileClick(null)}>New File</div>
-          <div className="context-menu-item" onClick={() => handleNewFolderClick(null)}>New Folder</div>
-        </>
-      )}
-    </div>
-  )
-}
-
 function Sidebar({
   folderPath,
   directories = [],
@@ -511,8 +399,9 @@ function Sidebar({
   const lastClickedRef = useRef(null) // Anchor for Shift+Click range selection
   const undoStackRef = useRef([]) // Undo stack for delete operations
   const openStateRef = useRef(initialExpandedDirs || {}) // Store expanded state
-  const [expandedSnapshot, setExpandedSnapshot] = useState({}) // Triggers PragmaticFileTree update
+  const [expandedSnapshot, setExpandedSnapshot] = useState({}) // Triggers FileOutlineExplorer update
   const [sidebarLayout, setSidebarLayout] = useState(() => emptySidebarLayout())
+  const sidebarLayoutRef = useRef(sidebarLayout)
   const sidebarLayoutRevisionRef = useRef(0)
   const treeDataRef = useRef([])
 
@@ -551,6 +440,10 @@ function Sidebar({
   useEffect(() => {
     treeDataRef.current = treeData
   }, [treeData])
+
+  useEffect(() => {
+    sidebarLayoutRef.current = sidebarLayout
+  }, [sidebarLayout])
 
   const updateSidebarLayout = useCallback((updater, options = {}) => {
     setSidebarLayout(previous => {
@@ -854,7 +747,7 @@ function Sidebar({
     return () => { cancelled = true }
   }, [folderPath, externalRefreshTrigger, loadTreeRecursive, saveExpandedDirs])
 
-  // Sync expansion state from PragmaticFileTree
+  // Sync expansion state from the shared outline explorer.
   const handleExpandChange = useCallback((newExpandedState) => {
       openStateRef.current = newExpandedState;
       saveExpandedDirs(newExpandedState);
@@ -888,7 +781,7 @@ function Sidebar({
     // Загружаем дерево с раскрытыми папками (все дети загружены ДО setState)
     loadTreeRecursive(folderPath, openStateRef.current).then(nodes => {
       setTreeData(nodes)
-      setExpandedSnapshot({ ...openStateRef.current }) // Новая ссылка → PragmaticFileTree обновит expandedIds
+      setExpandedSnapshot({ ...openStateRef.current }) // Новая ссылка обновляет controlled expansion state.
       saveExpandedDirs(openStateRef.current)
     }).catch(err => {
       console.log('[sidebar]','Error revealing file in tree:', err)
@@ -1036,18 +929,103 @@ function Sidebar({
 
     if (entries.length === 0) return results
 
+    if (results.some(result => result.success === false)) {
+      for (const entry of entries) {
+        results.push({
+          sourcePath: entry.sourcePath,
+          newPath: entry.newPath,
+          skipped: true,
+          success: false,
+          reason: 'batch-preflight-failed',
+        })
+      }
+      return results
+    }
+
     const pathMap = new Map(entries.map(entry => [entry.sourcePath, entry.newPath]))
-    const newParentId = destinationDir === folderPath ? null : destinationDir
-    const nextExpandedState = rewriteExpandedStatePaths(openStateRef.current, pathMap)
-    let optimisticTree = treeDataRef.current
 
     for (const entry of entries) {
       registerPendingOperation(entry.sourcePath)
       registerPendingOperation(entry.sourceParent)
       registerPendingOperation(destinationDir)
       registerPendingOperation(entry.newPath)
-      optimisticTree = moveNodeInTree(
-        optimisticTree,
+    }
+
+    const previewLayout = normalizeSidebarLayout(meta?.action?.layout || sidebarLayoutRef.current)
+    const finalLayout = rewriteSidebarLayoutPaths(previewLayout, pathMap)
+    let batchResult = null
+    try {
+      batchResult = await window.electronAPI.moveItemsAtomic({
+        rootPath: folderPath,
+        moves: entries.map(entry => ({
+          sourcePath: entry.sourcePath,
+          destinationPath: entry.newPath,
+        })),
+        finalLayout,
+        expectedRevision: sidebarLayoutRevisionRef.current,
+      })
+    } catch (error) {
+      batchResult = {
+        committed: false,
+        reason: 'ipc-failed',
+        failure: { message: error?.message || String(error) },
+        moves: [],
+      }
+    }
+
+    console.log('[SidebarDnd]', 'Atomic move result:', {
+      count: entries.length,
+      committed: !!batchResult?.committed,
+      rolledBack: !!batchResult?.rolledBack,
+      partial: !!batchResult?.partial,
+      reason: batchResult?.reason || 'unknown',
+    })
+
+    if (!batchResult?.committed) {
+      if (batchResult?.conflict && batchResult?.layoutResult?.layout) {
+        const serverLayout = normalizeSidebarLayout(batchResult.layoutResult.layout)
+        sidebarLayoutRevisionRef.current = Number(batchResult.layoutResult.revision) || 0
+        sidebarLayoutRef.current = serverLayout
+        setSidebarLayout(serverLayout)
+      }
+
+      if (batchResult?.partial) {
+        const actualPathMap = new Map()
+        for (const move of batchResult.moves || []) {
+          if (move?.actualPath === move?.destinationPath) {
+            actualPathMap.set(move.sourcePath, move.destinationPath)
+          }
+        }
+        if (actualPathMap.size > 0) {
+          for (const [sourcePath, newPath] of actualPathMap) onRename?.(sourcePath, newPath)
+          const recoveredExpandedState = rewriteExpandedStatePaths(openStateRef.current, actualPathMap)
+          openStateRef.current = recoveredExpandedState
+          openStatesMapRef.current[folderPath] = { ...recoveredExpandedState }
+          setExpandedSnapshot({ ...recoveredExpandedState })
+          updateSidebarLayout(previous => rewriteSidebarLayoutPaths(previous, actualPathMap))
+          saveExpandedDirs(recoveredExpandedState)
+        }
+        const nodes = await loadTreeRecursive(folderPath, openStateRef.current)
+        treeDataRef.current = nodes
+        setTreeData(nodes)
+      }
+
+      const reason = batchResult?.preflightErrors?.[0]?.code || batchResult?.reason || 'move-failed'
+      for (const entry of entries) {
+        results.push({ sourcePath: entry.sourcePath, newPath: entry.newPath, success: false, reason })
+      }
+      return results
+    }
+
+    const committedLayout = normalizeSidebarLayout(batchResult.layoutResult?.layout || finalLayout)
+    sidebarLayoutRevisionRef.current = Number(batchResult.layoutResult?.revision) || sidebarLayoutRevisionRef.current
+    sidebarLayoutRef.current = committedLayout
+    const newParentId = destinationDir === folderPath ? null : destinationDir
+    const nextExpandedState = rewriteExpandedStatePaths(openStateRef.current, pathMap)
+    let committedTree = treeDataRef.current
+    for (const entry of entries) {
+      committedTree = moveNodeInTree(
+        committedTree,
         entry.sourcePath,
         newParentId,
         folderPath,
@@ -1056,68 +1034,36 @@ function Sidebar({
     }
 
     flushSync(() => {
-      treeDataRef.current = optimisticTree
-      setTreeData(optimisticTree)
+      treeDataRef.current = committedTree
+      setTreeData(committedTree)
       setFocusedId(previous => rewritePathWithMap(previous, pathMap))
-      setMultiSelected(previous => {
-        const next = new Set()
-        for (const id of previous || []) next.add(rewritePathWithMap(id, pathMap))
-        return next
-      })
+      setMultiSelected(previous => new Set(
+        [...(previous || [])].map(id => rewritePathWithMap(id, pathMap))
+      ))
       openStateRef.current = nextExpandedState
       openStatesMapRef.current[folderPath] = { ...nextExpandedState }
       setExpandedSnapshot({ ...nextExpandedState })
-      updateSidebarLayout(previous => rewriteSidebarLayoutPaths(previous, pathMap))
+      setSidebarLayout(committedLayout)
+      for (const entry of entries) onRename?.(entry.sourcePath, entry.newPath)
     })
     saveExpandedDirs(nextExpandedState)
+
+    if (sortModeRef.current !== 'manual') {
+      sortModeRef.current = 'manual'
+      setSortMode('manual')
+    }
 
     if (typeof meta.onOptimisticMove === 'function') {
       meta.onOptimisticMove(entries.map(entry => entry.newPath))
     }
 
-    const failedEntries = []
     for (const entry of entries) {
-      let success = false
-      try {
-        success = !!(await window.electronAPI.moveItem(entry.sourcePath, destinationDir))
-      } catch (error) {
-        console.log('[SidebarDnd]', 'Physical move failed:', entry.sourcePath, error)
-      }
-
-      if (success) {
-        onRename?.(entry.sourcePath, entry.newPath)
-      } else {
-        failedEntries.push(entry)
-      }
-      results.push({ sourcePath: entry.sourcePath, newPath: entry.newPath, success })
+      results.push({ sourcePath: entry.sourcePath, newPath: entry.newPath, success: true })
     }
 
-    if (failedEntries.length > 0) {
-      const rollbackMap = new Map(failedEntries.map(entry => [entry.newPath, entry.sourcePath]))
-      const rollbackExpandedState = rewriteExpandedStatePaths(openStateRef.current, rollbackMap)
-      openStateRef.current = rollbackExpandedState
-      openStatesMapRef.current[folderPath] = { ...rollbackExpandedState }
-      setFocusedId(previous => rewritePathWithMap(previous, rollbackMap))
-      setMultiSelected(previous => {
-        const next = new Set()
-        for (const id of previous || []) next.add(rewritePathWithMap(id, rollbackMap))
-        return next
-      })
-      setExpandedSnapshot({ ...rollbackExpandedState })
-      updateSidebarLayout(previous => rewriteSidebarLayoutPaths(previous, rollbackMap))
-      saveExpandedDirs(rollbackExpandedState)
-
-      const nodes = await loadTreeRecursive(folderPath, rollbackExpandedState)
-      treeDataRef.current = nodes
-      setTreeData(nodes)
-    } else {
-      // A collapsed destination can have an unloaded children array. The optimistic
-      // insert only knows about moved nodes, so reconcile from disk before a later
-      // expand mistakes that partial array for a complete directory listing.
-      const nodes = await loadTreeRecursive(folderPath, openStateRef.current)
-      treeDataRef.current = nodes
-      setTreeData(nodes)
-    }
+    const nodes = await loadTreeRecursive(folderPath, openStateRef.current)
+    treeDataRef.current = nodes
+    setTreeData(nodes)
 
     return results
   }, [folderPath, loadTreeRecursive, onRename, registerPendingOperation, saveExpandedDirs, updateSidebarLayout])
@@ -1462,7 +1408,7 @@ function Sidebar({
 
   const handleIconSelect = async (icon) => {
     if (iconPickerNode) {
-      const newIcons = { ...customIcons, [iconPickerNode.data.name]: icon }
+      const newIcons = { ...customIcons, [iconPickerNode.name]: icon }
       await commitCustomIcons(newIcons)
       setIconPickerNode(null)
     }
@@ -1595,7 +1541,7 @@ function Sidebar({
         onContextMenu={(e) => { e.preventDefault(); setFocusedId(null); setMultiSelected(new Set()); setContextMenu({ x: e.clientX, y: e.clientY, node: null }) }}
       >
         {treeData.length > 0 && (
-          <PragmaticFileTree
+          <FileOutlineExplorer
              treeData={treeData}
              folderPath={folderPath}
              onFileSelect={handleFileSelect}
@@ -1625,25 +1571,73 @@ function Sidebar({
       </div>
 
       {contextMenu && (
-        <ContextMenu
+        <FileExplorerContextMenu
           x={contextMenu.x}
           y={contextMenu.y}
           node={contextMenu.node}
+          rootPath={folderPath}
+          selectedIds={multiSelected}
           onClose={() => setContextMenu(null)}
-          onCopyPath={(p) => window.require('electron').clipboard.writeText(p)}
-          onOpenInFinder={(p) => window.require('electron').shell.showItemInFolder(p)}
-          onCopyContent={async (p) => {
-            const content = await window.electronAPI.readFile(p)
-            if (content !== null) window.require('electron').clipboard.writeText(content)
+          isExternalInteraction={isRunAfterPickerEvent}
+          actions={{
+            copyPath: node => window.require('electron').clipboard.writeText(node.id),
+            copyContent: async node => {
+              const content = await window.electronAPI.readFile(node.id)
+              if (content !== null) window.require('electron').clipboard.writeText(content)
+            },
+            copyMultiPaths: paths => {
+              const sorted = [...paths].sort()
+              if (sorted.length > 0) window.require('electron').clipboard.writeText(sorted.join('\n'))
+            },
+            copyMultiContent: async paths => {
+              const parts = []
+              for (const path of [...paths].sort()) {
+                if (findTreeNodeById(treeDataRef.current, path)?.isDirectory) continue
+                const content = await window.electronAPI.readFile(path)
+                if (content !== null) parts.push(`${path}\n\n${content}`)
+              }
+              if (parts.length > 0) {
+                window.require('electron').clipboard.writeText(parts.join('\n\n---\n\n'))
+              }
+            },
+            rename: node => setEditingId(node.id),
+            chooseIcon: setIconPickerNode,
+            createFile: handleNewFile,
+            createFolder: handleNewFolder,
+            deleteItems: (_paths, node) => handleDelete(node?.id),
+            revealInFinder: node => window.require('electron').shell.showItemInFolder(node.id),
           }}
-          onRename={(node) => setEditingId(node.id)}
-          onChooseIcon={setIconPickerNode}
-          onNewFile={handleNewFile}
-          onNewFolder={handleNewFolder}
-          onDelete={handleDelete}
-          onLinkFile={onLinkFile}
-          linkOwnerProjectId={linkOwnerProjectId}
-          multiSelectCount={multiSelected.size}
+          extensions={{
+            afterCopy: ({ node, close, menuRef }) => (
+              !node.isDirectory && onLinkFile ? (
+                <RunAfterTabPicker
+                  tabId={node.id}
+                  ownerProjectId={linkOwnerProjectId}
+                  autoRun={false}
+                  runAfterTabId={null}
+                  setRunAfterTab={(_ownerId, targetTabId) => {
+                    if (!targetTabId) return
+                    onLinkFile(node.id, targetTabId)
+                    close()
+                  }}
+                  panelRef={menuRef}
+                  title="Link file - pick a tab"
+                  emptyLabel=""
+                  showAllTabsOnOpen
+                  triggerVariant="context-row"
+                  triggerLabel="Link File"
+                  menuWidth={252}
+                  zIndex={2147482101}
+                  side="right"
+                  accentColor="#8b5cf6"
+                  accentTextColor="#ddd6fe"
+                  showRuntimeDot={false}
+                  showTargetSummary={false}
+                  openOnHover
+                />
+              ) : null
+            ),
+          }}
         />
       )}
 

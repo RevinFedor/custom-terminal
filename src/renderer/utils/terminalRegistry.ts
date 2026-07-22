@@ -1,5 +1,9 @@
 import { Terminal as XTerminal, IMarker } from '@xterm/xterm';
 import { SearchAddon, ISearchOptions } from '@xterm/addon-search';
+import {
+  findLastCodexComposerPromptIndex,
+  hasCodexComposerPromptGlyph,
+} from './codexComposerGlyphs.mjs';
 
 // Global registry to access terminal instances from anywhere
 interface TerminalRegistryStore {
@@ -152,7 +156,7 @@ function extractCodexDraftFromLine(snapshotOrLine: LogicalLineSnapshot | string)
   const normalizedClean = normalized.replace(/[▌█]/g, '');
   if (!normalizedClean.trim()) return { hasDraft: false, preview: '' };
 
-  const promptIdx = Math.max(normalized.lastIndexOf('›'), normalized.lastIndexOf('❯'));
+  const promptIdx = findLastCodexComposerPromptIndex(normalized);
   if (promptIdx >= 0) {
     const afterPrompt = normalized.slice(promptIdx + 1).replace(/[▌█]/g, '').trim();
     if (!afterPrompt) return { hasDraft: false, preview: '' };
@@ -224,7 +228,7 @@ function describeCodexDraftProbeRow(buf: any, row: number): string {
   const snapshot = getLogicalLineSnapshotAt(buf, row);
   const parsed = extractCodexDraftFromLine(snapshot);
   const text = snapshot.text.replace(/\s+/g, ' ').slice(0, 180);
-  const hasPrompt = /[›❯]/.test(snapshot.text);
+  const hasPrompt = hasCodexComposerPromptGlyph(snapshot.text);
   return `row=${row}:prompt=${hasPrompt}:parsed=${parsed.hasDraft}:suffix=${parsed.sourceSuffix || ''}:raw=${JSON.stringify(raw)}:logical=${JSON.stringify(text)}`;
 }
 
@@ -385,7 +389,7 @@ export const terminalRegistry = {
       const line = buf.getLine(i);
       if (!line) continue;
       const text = line.translateToString(true);
-      const isPromptLine = /[›❯]/.test(text);
+      const isPromptLine = hasCodexComposerPromptGlyph(text);
       lines.push({
         row: i,
         text,
@@ -456,7 +460,7 @@ export const terminalRegistry = {
       rows.push({
         row: i,
         wrapped: !!line.isWrapped,
-        marker: /[›❯]/.test(text),
+        marker: hasCodexComposerPromptGlyph(text),
         text: compactText.slice(0, 180),
         firstTextStyle: summary.firstTextStyle,
         styles: summary.styles,
@@ -533,7 +537,7 @@ export const terminalRegistry = {
 
     for (let row = visibleEnd - 1; row >= visibleStart; row--) {
       const snapshot = getLogicalLineSnapshotAt(buf, row);
-      if (!/[›❯]/.test(snapshot.text)) continue;
+      if (!hasCodexComposerPromptGlyph(snapshot.text)) continue;
       const parsed = extractCodexDraftFromLine(snapshot);
       if (parsed.hasDraft !== null) {
         const multilineDraft = parsed.hasDraft === false && !parsed.preview
@@ -558,7 +562,7 @@ export const terminalRegistry = {
       if (row >= visibleStart && row < visibleEnd) continue;
       if (cursorRows.includes(row)) continue;
       const snapshot = getLogicalLineSnapshotAt(buf, row);
-      if (!/[›❯]/.test(snapshot.text)) continue;
+      if (!hasCodexComposerPromptGlyph(snapshot.text)) continue;
       const parsed = extractCodexDraftFromLine(snapshot);
       if (parsed.hasDraft !== null) {
         const multilineDraft = parsed.hasDraft === false && !parsed.preview

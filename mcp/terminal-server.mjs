@@ -4,7 +4,8 @@
 // Standalone process. Communicates with Noted Terminal via HTTP on localhost.
 // Implements MCP JSON-RPC 2.0 over stdio (zero SDK dependencies).
 //
-// Tools: list_tabs, restart_process, run_command, start_ai, send_prompt,
+// Tools: list_tabs, get_tab_plan, apply_tab_plan_changes,
+//        restart_process, run_command, start_ai, send_prompt,
 //        read_output, create_tab, kill_process, stop_ai, interrupt_ai,
 //        read_draft, draft_state, rewind_ai, get_pending_question,
 //        answer_question, run_chain
@@ -438,6 +439,49 @@ const TOOLS = [
     },
   },
   {
+    name: 'get_tab_plan',
+    description: 'Read the structured task plan of one Noted Terminal tab together with the current task-status catalog and descriptions. Inside Noted Terminal, omit tabId to use the parent tab that owns this agent. Call this before proposing any plan creation or update.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'Optional tab ID from list_tabs. Defaults to the parent tab of this agent.' },
+        projectId: { type: 'string', description: 'Optional Noted Terminal project id. Use in external mode.' },
+      },
+    },
+  },
+  {
+    name: 'apply_tab_plan_changes',
+    description: 'Atomically apply an already user-approved set of changes to a tab task plan. The whole call is one undo step. NEVER call this before showing the exact proposed changes to the user and receiving explicit approval. Inside Noted Terminal, omit tabId to update the parent tab.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'Optional tab ID from list_tabs. Defaults to the parent tab of this agent.' },
+        projectId: { type: 'string', description: 'Optional Noted Terminal project id. Use in external mode.' },
+        operations: {
+          type: 'array',
+          minItems: 1,
+          description: 'Approved delta. Supported types: replace_plan, add_task, update_task, remove_task, add_subtask, update_subtask, remove_subtask.',
+          items: {
+            type: 'object',
+            properties: {
+              type: { type: 'string', enum: ['replace_plan', 'add_task', 'update_task', 'remove_task', 'add_subtask', 'update_subtask', 'remove_subtask'] },
+              taskId: { type: 'string' },
+              subtaskId: { type: 'string' },
+              title: { type: 'string' },
+              statusId: { type: ['string', 'null'] },
+              afterTaskId: { type: 'string' },
+              afterSubtaskId: { type: 'string' },
+              subtasks: { type: 'array', items: { type: 'object' } },
+              tasks: { type: 'array', items: { type: 'object' } },
+            },
+            required: ['type'],
+          },
+        },
+      },
+      required: ['operations'],
+    },
+  },
+  {
     name: 'restart_process',
     description: 'Restart a terminal process. Sends Ctrl+C to stop the current command, waits for it to finish, then re-runs the command. The shell stays alive — only the running process is restarted. Use this after changing code that requires a full process restart (e.g. main.js changes in Electron, backend server changes).',
     inputSchema: {
@@ -829,6 +873,41 @@ async function callTool(name, args) {
         text += '\n';
       }
       return text;
+    }
+
+    case 'get_tab_plan': {
+      const tabId = args.tabId || PARENT_TAB_ID;
+      if (!tabId) throw new Error('tabId is required outside a parent Noted Terminal tab');
+      const target = projectHint(args, tabId);
+      const projectParam = target.projectId
+        ? '&parentProjectId=' + encodeURIComponent(target.projectId)
+        : '';
+      const endpoint = '/terminal/tab-plan?tabId=' + encodeURIComponent(tabId) + projectParam;
+      const result = target.port
+        ? await httpGetOnPort(target.port, endpoint)
+        : await httpGet(endpoint, target.cwd);
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'apply_tab_plan_changes': {
+      const tabId = args.tabId || PARENT_TAB_ID;
+      if (!tabId) throw new Error('tabId is required outside a parent Noted Terminal tab');
+      const target = projectHint(args, tabId);
+      const body = {
+        tabId,
+        operations: args.operations,
+        parentProjectId: target.projectId || undefined,
+        sourceMeta: buildSourceMeta(),
+      };
+      const result = target.port
+        ? await httpPostOnPort(target.port, '/terminal/tab-plan/apply', body)
+        : await httpPost('/terminal/tab-plan/apply', body, target.cwd);
+      return JSON.stringify({
+        success: result.success === true,
+        changed: result.changed === true,
+        tabId,
+        plan: result.document,
+      }, null, 2);
     }
 
     case 'restart_process': {

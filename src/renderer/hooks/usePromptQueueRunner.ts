@@ -1,8 +1,10 @@
 import { useEffect } from 'react';
-import { buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, hasMalformedQueuedImageMarker, isQueuedPromptEnabled, queueSendTransferredOwnership, usePromptQueueStore, type QueuedPrompt, type TabQueue } from '../store/usePromptQueueStore';
+import { buildQueuedPromptPayload, consumeAutomaticRunAfterTargetClear, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, hasMalformedQueuedImageMarker, hasRuntimeWorkflowArm, isPromptQueueStoreHydrated, isQueuedPromptEnabled, queueSendTransferredOwnership, subscribePromptQueueHydration, usePromptQueueStore, type QueuedPrompt, type TabQueue } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { terminalRegistry } from '../utils/terminalRegistry';
+import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
+import { isWorkflowOutcomeAtOrAfterArm, planWorkflowReconciliation } from '../utils/promptQueueReconciliation.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -30,7 +32,7 @@ function tabExists(tabId: string): boolean {
 
 function canValidateQueueTabs(): boolean {
   const state = useWorkspaceStore.getState();
-  return !state.isRestoring && state.openProjects.size > 0;
+  return isPromptQueueStoreHydrated() && !state.isRestoring && state.openProjects.size > 0;
 }
 
 function tabCanTriggerQueue(ownerTabId: string, targetTabId: string): boolean {
@@ -61,21 +63,6 @@ function seedBusySnapshotFromWorkspace(tabId: string): void {
 }
 
 type QueueAgent = 'claude' | 'codex';
-
-const NON_NATURAL_QUEUE_END_REASONS = new Set([
-  'manual-stop',
-  'error',
-  'interrupt',
-  'watchdog',
-  'turn_aborted',
-  'send-command-failed',
-  'send-command-error',
-  'command-finished',
-  'pty-exit',
-  'terminal-kill',
-  'replace',
-  'close',
-]);
 
 function getPromptQueueAgent(tabId: string): QueueAgent {
   const state = useWorkspaceStore.getState();
@@ -135,7 +122,7 @@ function getEffectiveQueueTrigger(ownerTabId: string, queue: TabQueue, options: 
   }
   if (queue.runAfterTabId && options.clearStaleTarget) {
     console.warn('[PromptQueueRunner] runAfterTabId ' + queue.runAfterTabId.slice(-8) + ' is no longer a valid target, clearing → owner=' + ownerTabId.slice(-8));
-    usePromptQueueStore.getState().setRunAfterTab(ownerTabId, null);
+    usePromptQueueStore.getState().clearStaleRunAfterTab(ownerTabId, queue.runAfterTabId);
   }
   return ownerTabId;
 }
@@ -291,7 +278,76 @@ type BusyStatePayload = {
   reason?: string;
   localCommand?: string;
   localCommandReason?: string;
+  outcomeKnown?: boolean;
+  catchUpPending?: boolean;
+  outcomeTs?: number | null;
+  turnId?: string | null;
+  lastOutcomeReason?: string | null;
+  lastOutcomeTs?: number | null;
+  lastOutcomeTurnId?: string | null;
+  lastAbnormalOutcomeReason?: string | null;
+  lastAbnormalOutcomeTs?: number | null;
+  lastAbnormalOutcomeTurnId?: string | null;
 };
+
+type DeferredWorkflowOutcome = BusyStatePayload & { receivedAt: number };
+type DeferredWorkflowOutcomeSet = {
+  latest: DeferredWorkflowOutcome | null;
+  abnormal: DeferredWorkflowOutcome | null;
+};
+const deferredWorkflowOutcomes = new Map<string, DeferredWorkflowOutcomeSet>();
+const processedNaturalOutcomes = new Map<string, { latestTs: number; keys: Set<string> }>();
+const workflowRestoreReconciliationListeners = new Set<() => void>();
+let workflowRestoreReconciled = false;
+let workflowRestoreReconcilePromise: Promise<void> | null = null;
+
+function explicitOutcomeTimestamp(data: BusyStatePayload): number | null {
+  if (Number.isFinite(data.outcomeTs)) return Number(data.outcomeTs);
+  if (Number.isFinite(data.lastOutcomeTs)) return Number(data.lastOutcomeTs);
+  return null;
+}
+
+function liveOutcomeTimestamp(data: BusyStatePayload): number {
+  return explicitOutcomeTimestamp(data) ?? Date.now();
+}
+
+function isAbnormalWorkflowOutcome(data: BusyStatePayload): boolean {
+  return !isNaturalAgentTurnEndReason(data.reason) && !isSuccessfulCompactLocalCommandEnd(data);
+}
+
+function rememberDeferredWorkflowOutcome(data: BusyStatePayload): void {
+  const receivedAt = liveOutcomeTimestamp(data);
+  const deferred = { ...data, outcomeTs: receivedAt, receivedAt };
+  const current = deferredWorkflowOutcomes.get(data.tabId) ?? { latest: null, abnormal: null };
+  if (!current.latest || receivedAt >= current.latest.receivedAt) current.latest = deferred;
+  if (isAbnormalWorkflowOutcome(data)
+    && (!current.abnormal || receivedAt >= current.abnormal.receivedAt)) {
+    current.abnormal = deferred;
+  }
+  deferredWorkflowOutcomes.set(data.tabId, current);
+  console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
+    + ' reason=' + (data.reason || '-')
+    + ' outcomeTs=' + receivedAt
+    + ' → DEFER workflow outcome until workspace+queue hydration');
+}
+
+function applyAbnormalQueueOutcome(
+  data: BusyStatePayload,
+  source: string,
+  outcomeTs: number | null = explicitOutcomeTimestamp(data),
+): string[] {
+  const queueState = usePromptQueueStore.getState();
+  for (const ownerTabId of queueState.queues.keys()) {
+    if (!tabExists(ownerTabId)) queueState.cleanupClosedTab(ownerTabId);
+  }
+  const disarmedOwners = usePromptQueueStore.getState().disarmQueuesForTrigger(data.tabId, outcomeTs);
+  console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
+    + ' reason=' + (data.reason || '-')
+    + ' outcomeTs=' + outcomeTs
+    + ' source=' + source
+    + ' → DISARM trigger workflow owners=' + (disarmedOwners.length ? disarmedOwners.map(shortQueueTabId).join(',') : 'none/newer-arm'));
+  return disarmedOwners;
+}
 
 const SUCCESSFUL_COMPACT_LOCAL_COMMAND_REASONS = new Set([
   'compact_boundary',
@@ -305,6 +361,36 @@ function isSuccessfulCompactLocalCommandEnd(data: BusyStatePayload): boolean {
     data.busy === false &&
     data.localCommand === '/compact' &&
     SUCCESSFUL_COMPACT_LOCAL_COMMAND_REASONS.has(data.localCommandReason || '');
+}
+
+function hasActiveQueueWorkflow(queue: TabQueue): boolean {
+  return queue.autoRun
+    || queue.stopAfter
+    || queue.closeAfter
+    || queue.firstDelayCountdownAt !== null;
+}
+
+function workflowAcceptsNaturalOutcome(queue: TabQueue, outcomeTs: number | null): boolean {
+  return isWorkflowOutcomeAtOrAfterArm(queue.workflowArmedAt, outcomeTs);
+}
+
+function naturalOutcomeKey(data: BusyStatePayload, outcomeTs: number): string {
+  return data.tabId + ':' + outcomeTs + ':' + (data.turnId || data.lastOutcomeTurnId || data.reason || 'natural');
+}
+
+function markWorkflowRestoreReconciled(): void {
+  if (workflowRestoreReconciled) return;
+  workflowRestoreReconciled = true;
+  for (const listener of workflowRestoreReconciliationListeners) listener();
+}
+
+function subscribeWorkflowRestoreReconciliation(listener: () => void): () => void {
+  workflowRestoreReconciliationListeners.add(listener);
+  return () => workflowRestoreReconciliationListeners.delete(listener);
+}
+
+function canProcessWorkflowOutcomes(): boolean {
+  return workflowRestoreReconciled && canValidateQueueTabs();
 }
 
 // Public accessor — the overlay reads this to render the "target tab is busy
@@ -396,7 +482,7 @@ export function usePromptQueueRunner() {
     // For default (runAfterTabId === null) the owner IS the trigger. For
     // pivoted (runAfterTabId !== null) the owner is some OTHER tab whose queue
     // wants this tab's transition.
-    const findOwnersWaitingOn = (triggerTabId: string): string[] => {
+    const findOwnersWaitingOn = (triggerTabId: string, outcomeTs: number | null = null): string[] => {
       if (!canValidateQueueTabs()) return [];
       const owners: string[] = [];
       const queues = usePromptQueueStore.getState().queues;
@@ -406,6 +492,7 @@ export function usePromptQueueRunner() {
           continue;
         }
         if (!q.autoRun || countEnabledQueuedPrompts(q.items) === 0) continue;
+        if (outcomeTs !== null && !workflowAcceptsNaturalOutcome(q, outcomeTs)) continue;
         // Validate stale target before pivoting — if the picked tab was closed,
         // self-clear and fall through to default own-tab behaviour. This is
         // the lazy validation promised in the store schema comment.
@@ -413,6 +500,95 @@ export function usePromptQueueRunner() {
         if (effectiveTrigger === triggerTabId) owners.push(ownerTabId);
       }
       return owners;
+    };
+
+    const processSuccessfulWorkflowOutcome = (
+      data: BusyStatePayload,
+      source: string,
+      explicitTs: number | null = explicitOutcomeTimestamp(data),
+    ): void => {
+      if (!Number.isFinite(explicitTs)) {
+        console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
+          + ' reason=' + (data.reason || 'natural')
+          + ' source=' + source + ' → WAIT natural outcome without timestamp');
+        return;
+      }
+      const outcomeTs = Number(explicitTs);
+      if (prevBusyRef.get(data.tabId) === true) {
+        console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
+          + ' source=' + source + ' has a newer busy turn → WAIT');
+        return;
+      }
+      const key = naturalOutcomeKey(data, outcomeTs);
+      const processed = processedNaturalOutcomes.get(data.tabId);
+      if (processed && outcomeTs < processed.latestTs) return;
+      if (processed?.latestTs === outcomeTs && processed.keys.has(key)) return;
+      if (!processed || outcomeTs > processed.latestTs) {
+        processedNaturalOutcomes.set(data.tabId, { latestTs: outcomeTs, keys: new Set([key]) });
+      } else {
+        processed.keys.add(key);
+      }
+
+      const tabId = data.tabId;
+      const ownersAtOutcome = findOwnersWaitingOn(tabId, outcomeTs);
+      if (getPromptQueueAgent(tabId) === 'codex') {
+        console.log('[PromptQueueRunner] codex successful outcome tab=' + tabId.slice(-12)
+          + ' reason=' + (data.reason || 'natural')
+          + ' ts=' + outcomeTs
+          + ' source=' + source
+          + ' owners=' + (ownersAtOutcome.length ? ownersAtOutcome.map(shortQueueTabId).join(',') : 'none')
+          + ' queues=' + describeQueuesForTriggerLog(tabId));
+      }
+
+      if (queueSendInflight.has(tabId) || queueAwaitingBusyStart.has(tabId)) {
+        console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' has queued turn starting → defer pivoted owners');
+        return;
+      }
+
+      const ownQueueBefore = usePromptQueueStore.getState().getQueue(tabId);
+      if (workflowAcceptsNaturalOutcome(ownQueueBefore, outcomeTs)) {
+        const ownContinuationTrigger = getReadyTriggerForOwner(tabId);
+        if (ownContinuationTrigger) {
+          const fired = fireQueueOwner(tabId, ownContinuationTrigger);
+          if (fired || queueSendInflight.has(tabId) || queueAwaitingBusyStart.has(tabId)) return;
+        }
+      }
+
+      for (const ownerTabId of ownersAtOutcome) {
+        if (ownerTabId !== tabId) fireQueueOwner(ownerTabId, tabId);
+      }
+
+      const ownQueue = usePromptQueueStore.getState().getQueue(tabId);
+      if ((!ownQueue.stopAfter && !ownQueue.closeAfter)
+        || !workflowAcceptsNaturalOutcome(ownQueue, outcomeTs)) return;
+
+      const shouldCloseTab = ownQueue.closeAfter;
+      const agentLabel = getPromptQueueAgentLabel(tabId);
+      const showToast = useUIStore.getState().showToast;
+      ipcRenderer.invoke('terminal:stop-ai-process', tabId)
+        .then(async (res: { success?: boolean; error?: string }) => {
+          if (res?.success) {
+            showToast(shouldCloseTab ? agentLabel + ' stopped, closing tab' : agentLabel + ' stopped', 'success', 1500);
+          } else if (res?.error) {
+            console.warn('[PromptQueueRunner] stop failed:', res.error);
+          }
+          if (!shouldCloseTab) return;
+          const projectId = findProjectIdForTab(tabId);
+          if (!projectId) {
+            console.warn('[PromptQueueRunner] closeAfter: no project found for tab', tabId);
+            return;
+          }
+          try {
+            await useWorkspaceStore.getState().closeTab(projectId, tabId, {
+              skipProcessCheck: true,
+              forceCleanup: true,
+            });
+          } catch (error) {
+            console.error('[PromptQueueRunner] closeAfter failed:', error);
+          }
+        })
+        .catch((error: unknown) => console.error('[PromptQueueRunner] stop error', error));
+      usePromptQueueStore.getState().setStopAfter(tabId, false);
     };
 
     const handleBusyState = (channel: 'claude' | 'gemini' | 'codex') =>
@@ -445,120 +621,223 @@ export function usePromptQueueRunner() {
           if (q.firstDelayCountdownAt !== null) clearFirstDelayCountdown(tabId);
         }
 
-        // An explicit abnormal outcome is authoritative on its own and remains
-        // actionable even if an idempotent busy:false reached the renderer first.
-        // Cancel both the tab's own workflow and every cross-project queue that
-        // selected this tab as its trigger, while preserving queued prompt text.
-        if (!busy && reason && NON_NATURAL_QUEUE_END_REASONS.has(reason)) {
-          if (!canValidateQueueTabs()) {
-            console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + ' → SKIP disarm while workspace restores');
-            return;
-          }
-          const queueState = usePromptQueueStore.getState();
-          for (const ownerTabId of queueState.queues.keys()) {
-            if (!tabExists(ownerTabId)) queueState.cleanupClosedTab(ownerTabId);
-          }
-          const disarmedOwners = usePromptQueueStore.getState().disarmQueuesForTrigger(tabId);
-          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + ' → DISARM trigger workflow owners=' + (disarmedOwners.length ? disarmedOwners.map(shortQueueTabId).join(',') : 'none'));
-          return;
-        }
-
-        // Only care about turn-end transition (busy true → false). Turn-start
-        // (false → true) doesn't trigger queue actions — user submitted manually
-        // or our send-command IPC kicked it off.
-        if (!(wasBusy && !busy)) return;
-
-        if (channel === 'codex') {
-          const ownersAtEdge = findOwnersWaitingOn(tabId);
-          console.log('[PromptQueueRunner] codex idle edge tab=' + tabId.slice(-12)
-            + ' reason=' + (reason || 'natural')
-            + ' owners=' + (ownersAtEdge.length ? ownersAtEdge.map(shortQueueTabId).join(',') : 'none')
-            + ' queues=' + describeQueuesForTriggerLog(tabId));
-        }
-
-        // These reasons are NOT normal turn-end signals. They exist for UI
-        // liveness only, so never fire or disarm prompt queues from this edge:
-        // - 'spinner' — filtered before it can mutate the workflow snapshot.
-        // - 'local-command' — slash-command bracket. Successful /compact is the
-        //   one exception: it is a durable boundary and Run-after should continue
-        //   with the next queued prompt after compact finishes.
         const compactLocalCommandDone = isSuccessfulCompactLocalCommandEnd(data);
-        if (reason === 'local-command' && !compactLocalCommandDone) {
-          const localSuffix = reason === 'local-command'
-            ? ' command=' + (data.localCommand || '-') + ' localReason=' + (data.localCommandReason || '-')
-            : '';
+        if (!busy && reason === 'local-command' && !compactLocalCommandDone) {
+          const localSuffix = ' command=' + (data.localCommand || '-')
+            + ' localReason=' + (data.localCommandReason || '-');
           console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' reason=' + reason + localSuffix + ' → IGNORE non-turn busy edge');
           return;
         }
+
+        const classifiedData = !busy
+          ? { ...data, outcomeTs: liveOutcomeTimestamp(data) }
+          : data;
+
+        // Restore is a barrier for every workflow outcome, including success:
+        // an idle edge arriving before either store is hydrated must not send a
+        // prompt or Stop a process against a partial workspace.
+        if (!busy && !canProcessWorkflowOutcomes()) {
+          rememberDeferredWorkflowOutcome(classifiedData);
+          return;
+        }
+
+        // Only an authoritative success may advance a workflow. Every explicit
+        // non-success reason disarms the correlated workflow but preserves its
+        // queued items for deliberate retry.
+        if (!busy && !isNaturalAgentTurnEndReason(reason) && !compactLocalCommandDone) {
+          applyAbnormalQueueOutcome(classifiedData, channel + '-live');
+          return;
+        }
+
+        // A normal live completion still requires the real busy→idle edge.
+        // Replayed restore outcomes bypass this edge check in reconciliation,
+        // where their persisted timestamps are the correlation proof.
+        if (!(wasBusy && !busy)) return;
         if (compactLocalCommandDone) {
           console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' command=/compact localReason=' + data.localCommandReason + ' → CONTINUE queue after compact');
         }
-
-        // Step 1: target tab's OWN continuation wins over external owners.
-        // If tab A waits on tab B, and tab B has Run-after ready to send its
-        // own next prompt, A must wait for B's whole chain to drain — not just
-        // for B's first busy→idle edge. Otherwise both tabs start from the same
-        // turn-end and A observes half-complete work from B.
-        if (queueSendInflight.has(tabId) || queueAwaitingBusyStart.has(tabId)) {
-          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' has queued turn starting → defer pivoted owners');
-          return;
-        }
-        const ownContinuationTrigger = getReadyTriggerForOwner(tabId);
-        if (ownContinuationTrigger) {
-          const fired = fireQueueOwner(tabId, ownContinuationTrigger);
-          if (fired || queueSendInflight.has(tabId) || queueAwaitingBusyStart.has(tabId)) return; // wait for THIS continuation before pivot fan-out / stopAfter
-        }
-
-        // Step 2: pivoted queues — any OWNER tab whose runAfterTabId === tabId.
-        // Their head goes to the OWNER (not this trigger tab). This now runs
-        // only after the trigger tab has no runnable continuation of its own.
-        const owners = findOwnersWaitingOn(tabId);
-        for (const ownerTabId of owners) {
-          if (ownerTabId !== tabId) fireQueueOwner(ownerTabId, tabId);
-        }
-
-        // Step 3: stopAfter for the trigger tab itself. If own Run-after fired
-        // above we returned before this block, preserving the existing contract:
-        // stopAfter runs only after the queue is empty / no continuation fired.
-        const ownQueue = usePromptQueueStore.getState().getQueue(tabId);
-        const { setStopAfter } = usePromptQueueStore.getState();
-        const showToast = useUIStore.getState().showToast;
-
-        // stopAfter: queue empty (or autoRun off / pivoted away), turn finished
-        // → kill claude. closeAfter (chained on top): after the stop fires,
-        // also close the whole tab via useWorkspaceStore.closeTab with
-        // skipProcessCheck so no confirm dialog appears (we just killed the
-        // process — there's nothing to ask).
-        if (ownQueue.stopAfter) {
-          const shouldCloseTab = ownQueue.closeAfter;
-          const agentLabel = getPromptQueueAgentLabel(tabId);
-          ipcRenderer.invoke('terminal:stop-ai-process', tabId)
-            .then(async (res: { success?: boolean; error?: string }) => {
-              if (res?.success) {
-                showToast(shouldCloseTab ? agentLabel + ' stopped, closing tab' : agentLabel + ' stopped', 'success', 1500);
-              } else if (res?.error) {
-                console.warn('[PromptQueueRunner] stop failed:', res.error);
-              }
-              if (shouldCloseTab) {
-                const projectId = findProjectIdForTab(tabId);
-                if (!projectId) {
-                  console.warn('[PromptQueueRunner] closeAfter: no project found for tab', tabId);
-                  return;
-                }
-                try {
-                  await useWorkspaceStore.getState().closeTab(projectId, tabId, {
-                    skipProcessCheck: true,
-                    forceCleanup: true,
-                  });
-                } catch (e) {
-                  console.error('[PromptQueueRunner] closeAfter failed:', e);
-                }
-              }
-            })
-            .catch((e: unknown) => console.error('[PromptQueueRunner] stop error', e));
-          setStopAfter(tabId, false);
-        }
+        processSuccessfulWorkflowOutcome(classifiedData, channel + '-live');
       };
+
+    const applyCodexTurnStateSnapshot = (tabId: string, state: any, source: string): void => {
+      if (!state || state.catchUpPending) {
+        console.log('[PromptQueueRunner] codex snapshot tab=' + shortQueueTabId(tabId)
+          + ' source=' + source + ' → WAIT pending/unknown catch-up');
+        return;
+      }
+      if (state.hasWatcher) prevBusyRef.set(tabId, state.busy === true);
+
+      if (state.lastAbnormalOutcomeReason) {
+        applyAbnormalQueueOutcome({
+          tabId,
+          busy: false,
+          reason: state.lastAbnormalOutcomeReason,
+          outcomeTs: Number.isFinite(state.lastAbnormalOutcomeTs)
+            ? Number(state.lastAbnormalOutcomeTs)
+            : null,
+          turnId: state.lastAbnormalOutcomeTurnId || null,
+        }, source + '-abnormal', Number.isFinite(state.lastAbnormalOutcomeTs)
+          ? Number(state.lastAbnormalOutcomeTs)
+          : null);
+      }
+
+      if (state.busy) return;
+
+      if (!state.outcomeKnown || !state.lastOutcomeReason) return;
+      const latest: BusyStatePayload = {
+        tabId,
+        busy: false,
+        reason: state.lastOutcomeReason,
+        outcomeTs: Number.isFinite(state.lastOutcomeTs) ? Number(state.lastOutcomeTs) : null,
+        turnId: state.lastOutcomeTurnId || null,
+      };
+      if (isNaturalAgentTurnEndReason(latest.reason)) {
+        processSuccessfulWorkflowOutcome(latest, source + '-latest');
+      } else if (!state.lastAbnormalOutcomeReason) {
+        applyAbnormalQueueOutcome(latest, source + '-latest', explicitOutcomeTimestamp(latest));
+      }
+    };
+
+    const takeDeferredWorkflowOutcomes = (): Map<string, DeferredWorkflowOutcomeSet> => {
+      const snapshot = new Map(deferredWorkflowOutcomes);
+      deferredWorkflowOutcomes.clear();
+      return snapshot;
+    };
+
+    const reconcileRestoredWorkflows = (): Promise<void> | null => {
+      if (workflowRestoreReconciled || workflowRestoreReconcilePromise || !canValidateQueueTabs()) {
+        return workflowRestoreReconcilePromise;
+      }
+      workflowRestoreReconcilePromise = (async () => {
+        const triggers = new Set<string>();
+        const queues = usePromptQueueStore.getState().queues;
+        for (const [ownerTabId, queue] of queues) {
+          if (!hasActiveQueueWorkflow(queue)) continue;
+          if (!tabExists(ownerTabId)) {
+            usePromptQueueStore.getState().cleanupClosedTab(ownerTabId);
+            continue;
+          }
+          if (queue.stopAfter || queue.closeAfter || queue.runAfterTabId === null) {
+            triggers.add(ownerTabId);
+          }
+          if (queue.autoRun && queue.runAfterTabId) {
+            triggers.add(getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true }));
+          }
+        }
+
+        const codexSnapshots = await Promise.all(Array.from(triggers, async (triggerTabId) => {
+          seedBusySnapshotFromWorkspace(triggerTabId);
+          if (getWorkspaceCommandType(triggerTabId) !== 'codex') return null;
+          try {
+            const state = await ipcRenderer.invoke('codex:get-turn-state', triggerTabId);
+            return { tabId: triggerTabId, state };
+          } catch (error) {
+            console.warn('[PromptQueueRunner] restore codex state failed trigger=' + shortQueueTabId(triggerTabId), error);
+            return null;
+          }
+        }));
+
+        // From this point through markWorkflowRestoreReconciled everything is
+        // synchronous, so no incoming IPC can slip between the final deferred
+        // snapshot and the abnormal→natural ordering below.
+        const deferred = takeDeferredWorkflowOutcomes();
+        const abnormalEvidence: Array<{ data: BusyStatePayload; source: string; timestamp: number | null }> = [];
+        const naturalEvidence: Array<{ data: BusyStatePayload; source: string; timestamp: number }> = [];
+        const rememberNatural = (data: BusyStatePayload, source: string, timestamp: number | null) => {
+          if (!Number.isFinite(timestamp)) return;
+          naturalEvidence.push({ data, source, timestamp: Number(timestamp) });
+        };
+
+        for (const outcomes of deferred.values()) {
+          if (outcomes.abnormal) {
+            abnormalEvidence.push({
+              data: outcomes.abnormal,
+              source: 'hydration-buffer-abnormal',
+              timestamp: outcomes.abnormal.receivedAt,
+            });
+          }
+          if (outcomes.latest && !isAbnormalWorkflowOutcome(outcomes.latest)) {
+            rememberNatural(outcomes.latest, 'hydration-buffer-latest', outcomes.latest.receivedAt);
+          }
+        }
+
+        for (const snapshot of codexSnapshots) {
+          if (!snapshot?.state || snapshot.state.catchUpPending) continue;
+          const { tabId, state } = snapshot;
+          if (state.hasWatcher) prevBusyRef.set(tabId, state.busy === true);
+          if (state.lastAbnormalOutcomeReason) {
+            const timestamp = Number.isFinite(state.lastAbnormalOutcomeTs)
+              ? Number(state.lastAbnormalOutcomeTs)
+              : null;
+            abnormalEvidence.push({
+              data: {
+                tabId,
+                busy: false,
+                reason: state.lastAbnormalOutcomeReason,
+                outcomeTs: timestamp,
+                turnId: state.lastAbnormalOutcomeTurnId || null,
+              },
+              source: 'hydration-codex-abnormal',
+              timestamp,
+            });
+          }
+          if (state.busy || !state.outcomeKnown || !state.lastOutcomeReason) continue;
+          const timestamp = Number.isFinite(state.lastOutcomeTs) ? Number(state.lastOutcomeTs) : null;
+          const latest: BusyStatePayload = {
+            tabId,
+            busy: false,
+            reason: state.lastOutcomeReason,
+            outcomeTs: timestamp,
+            turnId: state.lastOutcomeTurnId || null,
+          };
+          if (isNaturalAgentTurnEndReason(latest.reason)) {
+            rememberNatural(latest, 'hydration-codex-latest', timestamp);
+          } else if (!state.lastAbnormalOutcomeReason) {
+            abnormalEvidence.push({
+              data: latest,
+              source: 'hydration-codex-latest-abnormal',
+              timestamp,
+            });
+          }
+        }
+
+        // Failure evidence is always applied before success. A workflow armed
+        // before a failure is removed even if a later success exists; one
+        // re-armed after that failure can consume the later successful outcome.
+        const plan = planWorkflowReconciliation([
+          ...abnormalEvidence.map((evidence) => ({
+            ...evidence,
+            kind: 'abnormal',
+            tabId: evidence.data.tabId,
+          })),
+          ...naturalEvidence.map((evidence) => ({
+            ...evidence,
+            kind: 'natural',
+            tabId: evidence.data.tabId,
+          })),
+        ]);
+        for (const evidence of plan.abnormal) {
+          applyAbnormalQueueOutcome(evidence.data, evidence.source, evidence.timestamp);
+        }
+        for (const evidence of plan.natural) {
+          processSuccessfulWorkflowOutcome(evidence.data, evidence.source, evidence.timestamp);
+        }
+        markWorkflowRestoreReconciled();
+        console.log('[PromptQueueRunner] workflow restore reconciliation complete triggers=' + triggers.size);
+      })().finally(() => {
+        workflowRestoreReconcilePromise = null;
+      });
+      return workflowRestoreReconcilePromise;
+    };
+
+    const maybeReconcileRestoredWorkflows = () => {
+      void reconcileRestoredWorkflows();
+    };
+
+    const codexTurnStateResolvedHandler = (_: unknown, state: any) => {
+      if (!state?.tabId || !canProcessWorkflowOutcomes()) return;
+      applyCodexTurnStateSnapshot(state.tabId, state, 'codex-state-resolved');
+    };
 
     const claudeHandler = handleBusyState('claude');
     const geminiHandler = handleBusyState('gemini');
@@ -566,10 +845,17 @@ export function usePromptQueueRunner() {
     ipcRenderer.on('claude:busy-state', claudeHandler);
     ipcRenderer.on('gemini:busy-state', geminiHandler);
     ipcRenderer.on('codex:busy-state', codexHandler);
+    ipcRenderer.on('codex:turn-state-resolved', codexTurnStateResolvedHandler);
+    const unsubscribeQueueHydration = subscribePromptQueueHydration(maybeReconcileRestoredWorkflows);
+    const unsubscribeWorkspaceHydration = useWorkspaceStore.subscribe(maybeReconcileRestoredWorkflows);
+    maybeReconcileRestoredWorkflows();
     return () => {
       ipcRenderer.removeListener('claude:busy-state', claudeHandler);
       ipcRenderer.removeListener('gemini:busy-state', geminiHandler);
       ipcRenderer.removeListener('codex:busy-state', codexHandler);
+      ipcRenderer.removeListener('codex:turn-state-resolved', codexTurnStateResolvedHandler);
+      unsubscribeQueueHydration();
+      unsubscribeWorkspaceHydration();
     };
   }, []);
 
@@ -636,13 +922,40 @@ export function usePromptQueueRunner() {
       if (codexTriggerCheckInflight.has(key)) return true;
       codexTriggerCheckInflight.add(key);
       ipcRenderer.invoke('codex:get-turn-state', triggerTabId).then((res: any) => {
+        if (res?.catchUpPending) {
+          console.log('[PromptQueueRunner] codex-turn-state trigger=' + triggerTabId.slice(-8) + ' catch-up pending → wait');
+          return;
+        }
+        if (res?.lastAbnormalOutcomeReason) {
+          applyAbnormalQueueOutcome({
+            tabId: triggerTabId,
+            busy: false,
+            reason: res.lastAbnormalOutcomeReason,
+            outcomeTs: Number.isFinite(res.lastAbnormalOutcomeTs)
+              ? Number(res.lastAbnormalOutcomeTs)
+              : null,
+            turnId: res.lastAbnormalOutcomeTurnId || null,
+          }, 'cold-start-codex-state', Number.isFinite(res.lastAbnormalOutcomeTs)
+            ? Number(res.lastAbnormalOutcomeTs)
+            : null);
+        }
         if (res?.hasWatcher) {
           prevBusyRef.set(triggerTabId, !!res.busy);
           if (res.busy) {
-            useWorkspaceStore.getState().setAiBusy(triggerTabId, true, 'codex-turn-state');
+            useWorkspaceStore.getState().setAiBusy(triggerTabId, true, 'task_started');
             console.log('[PromptQueueRunner] codex-turn-state trigger=' + triggerTabId.slice(-8) + ' busy=true → wait');
             return;
           }
+        }
+
+        // Unknown idle is sufficient only for an explicit post-restore arm on
+        // the same tab. A restored queue or a pivot target waits for classified
+        // evidence instead of treating a default false boolean as completion.
+        const explicitOwnTabArm = ownerTabId === triggerTabId && hasRuntimeWorkflowArm(ownerTabId);
+        if ((!res?.hasWatcher || res?.outcomeKnown !== true) && !explicitOwnTabArm) {
+          console.log('[PromptQueueRunner] codex-turn-state owner=' + ownerTabId.slice(-8)
+            + ' trigger=' + triggerTabId.slice(-8) + ' outcome unknown → wait');
+          return;
         }
 
         const q2 = usePromptQueueStore.getState().getQueue(ownerTabId);
@@ -685,14 +998,20 @@ export function usePromptQueueRunner() {
       return true;
     };
 
-    const evaluateQueues = (state: QueueStateSnapshot, prevState: QueueStateSnapshot) => {
-      if (!canValidateQueueTabs()) return;
+    const evaluateQueues = (
+      state: QueueStateSnapshot,
+      prevState: QueueStateSnapshot,
+      options: { forceRuntimeArms?: boolean } = {},
+    ) => {
+      if (!canProcessWorkflowOutcomes()) return;
       for (const [tabId, q] of state.queues) {
         if (!tabExists(tabId)) {
           usePromptQueueStore.getState().cleanupClosedTab(tabId);
           continue;
         }
         const prevQ = prevState.queues.get(tabId);
+        const runtimeArm = hasRuntimeWorkflowArm(tabId);
+        if (!prevQ && !runtimeArm) continue;
 
         // Disarm-while-counting: if autoRun went false OR claude turned busy
         // while a countdown was running, cancel the pending timer.
@@ -709,6 +1028,7 @@ export function usePromptQueueRunner() {
         // target-changed-while-armed. Handled via explicit check below.)
         const prevTarget = prevQ?.runAfterTabId ?? null;
         const targetChanged = (prevTarget ?? null) !== (q.runAfterTabId ?? null);
+        const automaticTargetClear = targetChanged && consumeAutomaticRunAfterTargetClear(tabId);
         if (targetChanged && prevQ?.autoRun) {
           clearTimer(tabId);
           if (q.firstDelayCountdownAt !== null) {
@@ -726,7 +1046,10 @@ export function usePromptQueueRunner() {
         // Treat "target swapped while armed" as an arm-edge too — the user
         // explicitly changed who we're waiting on, evaluate cold-start fit
         // against the new target.
-        const armEdge = itemsArrived || autoRunArmed || (targetChanged && q.autoRun);
+        const armEdge = itemsArrived
+          || autoRunArmed
+          || (targetChanged && q.autoRun && !automaticTargetClear)
+          || (options.forceRuntimeArms === true && runtimeArm);
         if (!armEdge) continue;
 
         // Validate the picked target — stale id behaves as null (fall back to
@@ -789,15 +1112,20 @@ export function usePromptQueueRunner() {
     const unsubscribeQueue = usePromptQueueStore.subscribe((state, prevState) => {
       evaluateQueues(state, prevState);
     });
-    const unsubscribeWorkspace = useWorkspaceStore.subscribe((state, prevState) => {
-      const wasReady = !prevState.isRestoring && prevState.openProjects.size > 0;
-      const isReady = !state.isRestoring && state.openProjects.size > 0;
-      if (wasReady || !isReady) return;
-      evaluateQueues(usePromptQueueStore.getState(), { queues: new Map() });
+    const unsubscribeReconciliation = subscribeWorkflowRestoreReconciliation(() => {
+      const current = usePromptQueueStore.getState();
+      // Revisit only workflows explicitly armed in this renderer. Persisted
+      // queues were already correlated against main-process outcomes above and
+      // must never be synthesized as fresh 0→N / false→true edges.
+      evaluateQueues(current, current, { forceRuntimeArms: true });
     });
+    if (workflowRestoreReconciled) {
+      const current = usePromptQueueStore.getState();
+      evaluateQueues(current, current, { forceRuntimeArms: true });
+    }
     return () => {
       unsubscribeQueue();
-      unsubscribeWorkspace();
+      unsubscribeReconciliation();
       for (const t of pendingTimers.values()) clearTimeout(t);
       pendingTimers.clear();
     };

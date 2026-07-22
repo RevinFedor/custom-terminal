@@ -1355,8 +1355,14 @@ function App() {
       await Promise.all(codexTabIds.map(async (tabId) => {
         const res = await ipcRenderer.invoke('codex:get-turn-state', tabId).catch(() => null);
         if (disposed || !res?.hasWatcher) return;
+        if (res.catchUpPending) return;
         const busy = res.busy === true;
-        useWorkspaceStore.getState().setAiBusy(tabId, busy, 'codex-turn-state');
+        const reason = busy
+          ? 'task_started'
+          : (res.outcomeKnown && res.lastOutcomeReason
+            ? res.lastOutcomeReason
+            : 'codex-outcome-unknown');
+        useWorkspaceStore.getState().setAiBusy(tabId, busy, reason);
         setBusyTabs(prev => {
           const next = new Map(prev);
           if (busy) next.set(tabId, true);
@@ -3919,8 +3925,7 @@ function App() {
       if (e.metaKey && e.code === 'Comma') {
         e.preventDefault();
         setSettingsOpen(prev => {
-          // Broadcast open transitions so listeners (e.g. TabNotesSlideout) can
-          // dismiss themselves — the modal would otherwise overlap them.
+          // Broadcast open transitions so floating surfaces can dismiss themselves.
           if (!prev) window.dispatchEvent(new CustomEvent('settings:opened'));
           return !prev;
         });

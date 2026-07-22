@@ -4,6 +4,7 @@ import { log } from '../utils/logger';
 import { setPrefetched } from '../utils/sdkHistoryPrefetch';
 import { usePromptQueueStore } from './usePromptQueueStore';
 import { getInboxProjectPath, isInboxProjectId } from '../constants/systemProjects';
+import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
 
 const { ipcRenderer } = window.require('electron');
 let tabGroupSaveSeq = 0;
@@ -25,6 +26,45 @@ export type TabColor = 'default' | 'red' | 'yellow' | 'green' | 'blue' | 'purple
 export type CommandType = 'generic' | 'devServer' | 'claude' | 'gemini' | 'codex';
 
 export type TabType = 'terminal' | 'browser' | 'claude-sdk' | 'file';
+
+export interface TabTaskPlanSubtask {
+  id: string;
+  title: string;
+}
+
+export interface TabTaskPlanItem {
+  id: string;
+  title: string;
+  statusId?: string;
+  subtasks: TabTaskPlanSubtask[];
+}
+
+export interface TabTaskPlanHistoryEntry {
+  items: TabTaskPlanItem[];
+  at: number;
+  source: string;
+}
+
+export interface TabTaskPlanDocument {
+  version: 1;
+  revision: number;
+  items: TabTaskPlanItem[];
+  history: {
+    past: TabTaskPlanHistoryEntry[];
+    future: TabTaskPlanHistoryEntry[];
+  };
+  updatedAt: number | null;
+  updatedBy: string | null;
+}
+
+export type TabTaskPlanOperation =
+  | { type: 'replace_plan'; tasks: Array<Partial<TabTaskPlanItem> & { title: string }> }
+  | { type: 'add_task'; id?: string; title: string; statusId?: string | null; subtasks?: Array<Partial<TabTaskPlanSubtask> & { title: string }>; afterTaskId?: string }
+  | { type: 'update_task'; taskId: string; title?: string; statusId?: string | null }
+  | { type: 'remove_task'; taskId: string }
+  | { type: 'add_subtask'; taskId: string; id?: string; title: string; afterSubtaskId?: string }
+  | { type: 'update_subtask'; taskId: string; subtaskId: string; title: string }
+  | { type: 'remove_subtask'; taskId: string; subtaskId: string };
 
 /**
  * Tag for the source that wrote `tab.claudeSessionId`. Used for diagnostics
@@ -426,6 +466,7 @@ interface Tab {
   wasInterrupted?: boolean; // True if tab was closed with active AI session (show resume overlay)
   overlayDismissed?: boolean; // True if user dismissed the interrupted overlay (don't show again)
   notes?: string; // Tab-specific notes
+  taskPlan?: TabTaskPlanDocument; // Structured two-level plan shown above the terminal
   restoreError?: {
     type: 'working_directory_missing' | 'terminal_create_failed';
     message: string;
@@ -663,6 +704,7 @@ const restoreTabOptions = (savedTab: any) => ({
   wasInterrupted: savedTab.wasInterrupted,
   overlayDismissed: savedTab.overlayDismissed,
   notes: savedTab.notes,
+  taskPlan: savedTab.taskPlan,
   tabType: savedTab.tabType,
   url: savedTab.url,
   filePath: savedTab.filePath,
@@ -728,6 +770,7 @@ const createBrokenRestoredTab = (workspace: ProjectWorkspace, savedTab: any, err
     wasInterrupted: savedTab.wasInterrupted,
     overlayDismissed: savedTab.overlayDismissed,
     notes: savedTab.notes,
+    taskPlan: savedTab.taskPlan,
     tabType: savedTab.tabType || 'terminal',
     url: savedTab.url,
     filePath: savedTab.filePath,
@@ -777,6 +820,9 @@ const makeDefaultSavedTab = (workspace: ProjectWorkspace, cwd?: string | null, t
 
 const emitTabCompletionNotification = (detail: { projectId: string; tabId: string; tabName: string; fired?: boolean; firedAt?: number; persistent?: boolean }) => {
   try {
+    ipcRenderer.send('tab-notification:completed', detail);
+  } catch {}
+  try {
     if (detail.fired) ipcRenderer.send('tab-notification:fired', detail);
   } catch {}
   try {
@@ -788,14 +834,6 @@ const emitTabCompletionNotificationCleared = (detail: { projectId: string; tabId
   try {
     ipcRenderer.send('tab-notification:cleared', detail);
   } catch {}
-};
-
-const isNaturalCompletionNotificationEnd = (reason?: string): boolean => {
-  // Mirrors PromptQueueRunner's outcome contract: reason-less Claude/Gemini/SDK
-  // false edges are natural completions, Codex uses task_complete explicitly.
-  // manual-stop / interrupt / turn_aborted / error / watchdog are user-visible
-  // liveness cleanup only and must not ring the completion bell.
-  return !reason || reason === 'task_complete';
 };
 
 const isAiForegroundProcess = (info?: { hasProcess?: boolean; processName?: string; command?: string } | null): boolean => {
@@ -838,8 +876,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; tabType?: TabType; url?: string; filePath?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean }) => Promise<boolean>;
   reopenLastClosedTab: (projectId: string) => Promise<{ tabId: string | null; reason?: 'empty' | 'error' }>;
   switchTab: (projectId: string, tabId: string) => void;
@@ -880,7 +918,7 @@ interface WorkspaceStore {
 
   // Advanced drag & drop
   reorderInZone: (projectId: string, zone: 'main' | 'utility', orderedIds: string[]) => void;
-  moveTabToZone: (projectId: string, tabId: string, toUtility: boolean, atIndex: number) => void;
+  moveTabToZone: (projectId: string, tabId: string, toUtility: boolean, atIndex: number, sourceIds?: string[]) => void;
   moveTabToProject: (sourceProjectId: string, tabId: string, targetProjectId: string) => void;
   moveTabsToProject: (sourceProjectId: string, tabIds: string[], targetProjectId: string) => void;
   createTabGroup: (projectId: string, name?: string) => string;
@@ -929,6 +967,13 @@ interface WorkspaceStore {
   // Tab notes
   setTabNotes: (tabId: string, notes: string) => void;
   getTabNotes: (tabId: string) => string;
+
+  // Structured per-tab task plan. Main process owns validation + history so
+  // renderer edits and Terminal MCP edits share the same undo/redo chain.
+  applyTabTaskPlanOperations: (tabId: string, operations: TabTaskPlanOperation[]) => Promise<TabTaskPlanDocument | null>;
+  undoTabTaskPlan: (tabId: string) => Promise<TabTaskPlanDocument | null>;
+  redoTabTaskPlan: (tabId: string) => Promise<TabTaskPlanDocument | null>;
+  receiveTabTaskPlan: (tabId: string, document: TabTaskPlanDocument) => void;
 
   // Interrupted session handling
   clearInterruptedState: (tabId: string) => void;
@@ -1034,6 +1079,7 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     wasInterrupted: tab.wasInterrupted,
     overlayDismissed: tab.overlayDismissed,
     notes: tab.notes,
+    taskPlan: tab.taskPlan,
     tabType: tab.tabType,
     url: tab.url,
     filePath: tab.filePath,
@@ -1811,6 +1857,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       wasInterrupted: options?.wasInterrupted,
       overlayDismissed: options?.overlayDismissed,
       notes: options?.notes,
+      taskPlan: options?.taskPlan,
       tabType: options?.tabType || 'terminal',
       url: options?.url,
       filePath: (options as any)?.filePath,
@@ -1957,6 +2004,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       wasInterrupted: options?.wasInterrupted,
       overlayDismissed: options?.overlayDismissed,
       notes: options?.notes,
+      taskPlan: options?.taskPlan,
       tabType: options?.tabType || 'terminal',
       url: options?.url,
       filePath: (options as any)?.filePath,
@@ -2200,6 +2248,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           cwd: tab.cwd,
           color: tab.color,
           notes: tab.notes,
+          taskPlan: tab.taskPlan,
           commandType: tab.commandType,
           tabType: tab.tabType,
           url: tab.url,
@@ -2327,6 +2376,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const newTabId = await createTab(projectId, entry.name, entry.cwd, {
       color: (entry.color || undefined) as TabColor | undefined,
       notes: entry.notes || undefined,
+      taskPlan: (() => {
+        if (!entry.task_plan) return undefined;
+        try { return JSON.parse(entry.task_plan); }
+        catch { return undefined; }
+      })(),
       commandType: (entry.command_type || undefined) as CommandType | undefined,
       tabType: (entry.tab_type || 'terminal') as TabType,
       url: entry.url || undefined,
@@ -2732,6 +2786,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   consumeRestartAfterTriggerIdle: (triggerTabId, naturalEnd) => {
+    // Abnormal idle (error, abort, manual stop, unknown catch-up) is only a
+    // liveness update. Keep the persistent subscription armed for the next
+    // successful turn instead of consuming it on the failure.
+    if (!naturalEnd) return [];
     const { openProjects } = get();
     const restartTargets: Array<{ tabId: string; command?: string }> = [];
     let changed = false;
@@ -2740,7 +2798,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       for (const tab of workspace.tabs.values()) {
         if (!getRestartAfterTriggerIds(tab).includes(triggerTabId)) continue;
         if (tab.restartAfterPaused) continue;
-        if (naturalEnd) restartTargets.push({ tabId: tab.id, command: tab.restartAfterCommand });
+        restartTargets.push({ tabId: tab.id, command: tab.restartAfterCommand });
         if (tab.restartAfterArmed || tab.restartAfterPersistent) {
           delete tab.restartAfterArmed;
           delete tab.restartAfterPersistent;
@@ -2756,7 +2814,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         if (workspace) saveTabs(workspace.projectId, workspace.tabs);
       }
     }
-    return naturalEnd ? restartTargets : [];
+    return restartTargets;
   },
 
   setTabCommandType: (tabId, commandType) => {
@@ -2995,7 +3053,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     saveTabs(workspace.projectId, workspace.tabs);
   },
 
-  moveTabToZone: (projectId, tabId, toUtility, atIndex) => {
+  moveTabToZone: (projectId, tabId, toUtility, atIndex, sourceIds) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
 
@@ -3004,30 +3062,33 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const tab = workspace.tabs.get(tabId);
     if (!tab) return;
 
-    // Change utility flag
-    tab.isUtility = toUtility;
-    if (toUtility) {
-      tab.groupId = undefined;
-      tab.visualParentTabId = undefined;
+    const requestedIds = sourceIds?.length ? sourceIds : [tabId];
+    const movingIds = new Set(requestedIds.filter(id => workspace.tabs.has(id)));
+    const queue = [...movingIds];
+    while (queue.length > 0) {
+      const parentId = queue.shift()!;
       for (const candidate of workspace.tabs.values()) {
-        if (candidate.visualParentTabId === tabId) candidate.visualParentTabId = undefined;
+        if (candidate.visualParentTabId !== parentId || movingIds.has(candidate.id)) continue;
+        movingIds.add(candidate.id);
+        queue.push(candidate.id);
       }
     }
+    if (!movingIds.has(tabId)) movingIds.add(tabId);
 
-    // Get tabs of target zone (after flag change)
     const allTabs = Array.from(workspace.tabs.entries());
-    const targetZoneTabs = allTabs.filter(([_, t]) => !!t.isUtility === toUtility);
-    const otherZoneTabs = allTabs.filter(([_, t]) => !!t.isUtility !== toUtility);
-
-    // Remove tab from its current position in target zone list
-    const tabIndex = targetZoneTabs.findIndex(([id]) => id === tabId);
-    if (tabIndex !== -1) {
-      targetZoneTabs.splice(tabIndex, 1);
+    const movingTabs = allTabs.filter(([id]) => movingIds.has(id));
+    for (const [id, movingTab] of movingTabs) {
+      movingTab.isUtility = toUtility;
+      movingTab.groupId = undefined;
+      if (!movingTab.visualParentTabId || movingIds.has(movingTab.visualParentTabId)) continue;
+      movingTab.visualParentTabId = undefined;
     }
 
-    // Insert at new position
-    const insertIndex = Math.min(atIndex, targetZoneTabs.length);
-    targetZoneTabs.splice(insertIndex, 0, [tabId, tab]);
+    const stationaryTabs = allTabs.filter(([id]) => !movingIds.has(id));
+    const targetZoneTabs = stationaryTabs.filter(([_, candidate]) => !!candidate.isUtility === toUtility);
+    const otherZoneTabs = stationaryTabs.filter(([_, candidate]) => !!candidate.isUtility !== toUtility);
+    const insertIndex = Math.max(0, Math.min(atIndex, targetZoneTabs.length));
+    targetZoneTabs.splice(insertIndex, 0, ...movingTabs);
 
     // Rebuild Map
     const newTabs = new Map<string, any>();
@@ -3043,6 +3104,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
 
     workspace.tabs = newTabs;
+    console.log(
+      `[TabDnd:zone-apply] project=${dndShortId(projectId)}` +
+      ` source=${dndShortId(tabId)} zone=${toUtility ? 'utility' : 'main'}` +
+      ` insertIndex=${insertIndex} ids=${summarizeDndIds(movingTabs.map(([id]) => id))}`
+    );
     set({ openProjects: new Map(openProjects) });
     saveTabs(workspace.projectId, workspace.tabs);
   },
@@ -3783,7 +3849,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           delete tab.completionNotificationArmed;
           delete tab.completionNotificationFired;
           delete tab.completionNotificationFiredAt;
-          if (isNaturalCompletionNotificationEnd(reason)) {
+          if (isNaturalAgentTurnEndReason(reason)) {
             const firedAt = Date.now();
             notificationDetail = {
               projectId: workspace.projectId,
@@ -3846,6 +3912,59 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
     }
     return '';
+  },
+
+  receiveTabTaskPlan: (tabId, document) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (!tab) continue;
+      const currentRevision = tab.taskPlan?.revision ?? -1;
+      if (currentRevision > document.revision) return;
+      tab.taskPlan = document;
+      set({ openProjects: new Map(openProjects) });
+      return;
+    }
+  },
+
+  applyTabTaskPlanOperations: async (tabId, operations) => {
+    try {
+      const result = await ipcRenderer.invoke('tab-task-plan:apply', {
+        tabId,
+        operations,
+        source: 'user',
+      });
+      if (!result?.success || !result.document) throw new Error(result?.error || 'task_plan_apply_failed');
+      get().receiveTabTaskPlan(tabId, result.document);
+      return result.document;
+    } catch (error: any) {
+      console.warn('[TaskPlan] apply failed tab=' + restoreShortId(tabId) + ': ' + (error?.message || error));
+      return null;
+    }
+  },
+
+  undoTabTaskPlan: async (tabId) => {
+    try {
+      const result = await ipcRenderer.invoke('tab-task-plan:undo', { tabId, source: 'user' });
+      if (!result?.success || !result.document) throw new Error(result?.error || 'task_plan_undo_failed');
+      get().receiveTabTaskPlan(tabId, result.document);
+      return result.document;
+    } catch (error: any) {
+      console.warn('[TaskPlan] undo failed tab=' + restoreShortId(tabId) + ': ' + (error?.message || error));
+      return null;
+    }
+  },
+
+  redoTabTaskPlan: async (tabId) => {
+    try {
+      const result = await ipcRenderer.invoke('tab-task-plan:redo', { tabId, source: 'user' });
+      if (!result?.success || !result.document) throw new Error(result?.error || 'task_plan_redo_failed');
+      get().receiveTabTaskPlan(tabId, result.document);
+      return result.document;
+    } catch (error: any) {
+      console.warn('[TaskPlan] redo failed tab=' + restoreShortId(tabId) + ': ' + (error?.message || error));
+      return null;
+    }
   },
 
   // Reorder projects (drag-and-drop)
@@ -4124,7 +4243,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           commandType: tab.commandType, claudeSessionId: tab.claudeSessionId,
           geminiSessionId: tab.geminiSessionId, codexSessionId: tab.codexSessionId,
           codexModel: tab.codexModel, codexEffort: tab.codexEffort, externalRun: tab.externalRun, sessionStatus: tab.sessionStatus, wasInterrupted: tab.wasInterrupted,
-          overlayDismissed: tab.overlayDismissed, notes: tab.notes, tabType: tab.tabType,
+          overlayDismissed: tab.overlayDismissed, notes: tab.notes, taskPlan: tab.taskPlan, tabType: tab.tabType,
           url: tab.url, filePath: tab.filePath, terminalId: tab.terminalId, terminalName: tab.terminalName,
           activeView: tab.activeView, createdAt: tab.createdAt, isCollapsed: tab.isCollapsed,
           groupId: tab.groupId, visualParentTabId: tab.visualParentTabId,
@@ -4253,6 +4372,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   }
 }));
 
+const taskPlanUpdatedListener = (_event: unknown, payload: { tabId?: string; document?: TabTaskPlanDocument }) => {
+  if (!payload?.tabId || !payload.document) return;
+  useWorkspaceStore.getState().receiveTabTaskPlan(payload.tabId, payload.document);
+};
+
 if (typeof window !== 'undefined') {
+  const listenerKey = '__notedTaskPlanUpdatedListener';
+  const previousListener = (window as any)[listenerKey];
+  if (previousListener) ipcRenderer.removeListener('tab-task-plan:updated', previousListener);
+  (window as any)[listenerKey] = taskPlanUpdatedListener;
+  ipcRenderer.on('tab-task-plan:updated', taskPlanUpdatedListener);
   (window as any).useWorkspaceStore = useWorkspaceStore;
 }

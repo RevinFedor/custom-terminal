@@ -8,7 +8,7 @@ import { useTimelineSummaryStore } from '../../store/useTimelineSummaryStore';
 import Tooltip from './Tooltip';
 import ProjectIconsSettings from './ProjectIconsSettings';
 import { HexColorPicker } from 'react-colorful';
-import { Trash2, Plus } from 'lucide-react';
+import { ChevronDown, ChevronRight, CircleX, Loader2, Trash2, Plus } from 'lucide-react';
 import { DEFAULT_CLAUDE_CODE_SETTINGS } from '../../constants/claudeLevels';
 import {
   DEFAULT_CODEX_SETTINGS,
@@ -17,16 +17,16 @@ import {
   type CodexModelOption,
 } from '../../constants/codexSettings';
 import {
-  autoScrollNearEdge,
-  captureGroupedListGeometry,
   buildVisualHierarchyDepthMap,
   orderVisualHierarchyItems,
-  resolveStructuredHierarchyStep,
-  resolveStructuredVerticalMove,
-  startPointerDragSession,
-  visualHierarchyAncestorIds,
-  visualHierarchySubtreeItems,
 } from '@noted/structured-dnd';
+import { useOutlineDnd } from '@noted/structured-dnd/react';
+import {
+  applyPromptOutline,
+  buildPromptOutline,
+  promptOutlineHorizontalPolicy,
+  promptOutlineVerticalSlotPolicy,
+} from './promptOutlineModel.mjs';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -57,79 +57,10 @@ interface Prompt {
   file_paths?: string[];
 }
 
+type PromptDragState = { prompts: Prompt[]; promptGroups: PromptGroup[] };
 type FlatPromptItem = { type: 'prompt'; origIdx: number; prompt: Prompt };
 type FlatGroupItem = { type: 'group'; group: PromptGroup };
 type FlatItem = FlatPromptItem | FlatGroupItem;
-type DragItem = { type: 'group'; id: number } | { type: 'prompt'; id: string };
-type PromptDragState = { prompts: Prompt[]; promptGroups: PromptGroup[] };
-type RectSnap = { left: number; right: number; top: number; bottom: number; height: number; midY: number };
-type DragFlatZone = { idx: number; item: DragItem; rect: RectSnap; header: RectSnap };
-type DragGroupZone = {
-  groupId: number;
-  header: RectSnap | null;
-  body: RectSnap;
-  rows: { promptIndex: number; rect: RectSnap }[];
-  empty: RectSnap | null;
-  rowLeft: number | null;
-  rowRight: number | null;
-};
-type DragGeometry = { list: RectSnap; flat: DragFlatZone[]; groups: DragGroupZone[] };
-type DragTarget = {
-  key: string;
-  label: string;
-  reason: string;
-  next: PromptDragState;
-  targetIds: string[];
-  changed: boolean;
-};
-type PointerDragSession = {
-  item: DragItem;
-  startX: number;
-  startY: number;
-  active: boolean;
-  base: PromptDragState;
-  geometry: DragGeometry | null;
-  lastKey: string | null;
-  pendingNext?: PromptDragState | null;
-  horizontalBaseX?: number;
-  click: () => void;
-  prevCursor: string;
-  prevUserSelect: string;
-};
-
-function toStructuredPromptModel(state: PromptDragState) {
-  return {
-    containers: state.promptGroups.map(group => ({ id: String(group.id), position: group.position })),
-    items: state.prompts.map((prompt, index) => ({
-      id: prompt.id,
-      containerId: prompt.group_id == null ? null : String(prompt.group_id),
-      parentId: prompt.visual_parent_id || null,
-      position: Number.isFinite(Number(prompt.position)) ? Number(prompt.position) : index,
-    })),
-  };
-}
-
-function applyStructuredPromptModel(state: PromptDragState, model: any): PromptDragState {
-  const groups = new Map(model.containers.map((item: any) => [String(item.id), item]));
-  const prompts = new Map(model.items.map((item: any) => [String(item.id), item]));
-  return {
-    promptGroups: state.promptGroups.map(group => ({
-      ...group,
-      position: Number((groups.get(String(group.id)) as any)?.position ?? group.position),
-    })),
-    prompts: state.prompts.map(prompt => {
-      const next = prompts.get(prompt.id) as any;
-      return next ? {
-        ...prompt,
-        group_id: next.containerId == null ? null : Number(next.containerId),
-        visual_parent_id: next.parentId || null,
-        position: Number(next.position),
-      } : prompt;
-    }),
-  };
-}
-
-const fmtY = (r: RectSnap) => `${Math.round(r.top)}-${Math.round(r.midY)}-${Math.round(r.bottom)}`;
 
 type SettingsTab = 'shortcuts' | 'fonts' | 'colors' | 'ai' | 'projects';
 type AISubTab = 'text' | 'system' | 'usage';
@@ -158,9 +89,7 @@ const SHORTCUTS = [
   { keys: '⌘ + T', description: 'Новый таб' },
   { keys: '⌘ + B', description: 'Показать/скрыть боковую панель' },
   { keys: '⌘ + ,', description: 'Открыть настройки' },
-  { keys: '⌘ + E', description: 'Заметки вкладки (slide-out)' },
   { keys: '⌥ + V', description: 'Prompt picker (вставка промпта)' },
-  { keys: '⌘ + S', description: 'Сохранить заметки (в редакторе)' },
   { keys: '⌘ + ⇧ + R', description: 'Перезагрузить приложение' },
 ];
 
@@ -506,10 +435,7 @@ function SidebarBehaviorToggles() {
   );
 }
 
-// Один toggle-ряд для «показывать номера строк». Визуал зеркалит
-// SidebarBehaviorToggles (та же green-pill геометрия), но это standalone-строка —
-// используется отдельно в секции «Заметки» (редактор) и в подсекции
-// «Превью CMD+hover» (превью), у каждой поверхности свой независимый toggle.
+// Унифицированный toggle-ряд для самостоятельных булевых настроек.
 function LineNumbersToggle({
   checked,
   onChange,
@@ -861,208 +787,170 @@ function ClaudeMdMirrorBlock({
   );
 }
 
-// SessionStatusesEditor — компактный CRUD над sessionStatuses + shape/size маркера.
-// Одна колонка из 2-колоночного layout «Системные».
-function SessionStatusesEditor() {
-  const sessionStatuses = useUIStore((s) => s.sessionStatuses);
-  const updateSessionStatus = useUIStore((s) => s.updateSessionStatus);
-  const addSessionStatus = useUIStore((s) => s.addSessionStatus);
-  const removeSessionStatus = useUIStore((s) => s.removeSessionStatus);
-  const statusMarker = useUIStore((s) => s.statusMarker);
-  const setStatusMarker = useUIStore((s) => s.setStatusMarker);
+type StatusColumnProps = {
+  title: string;
+  statuses: Array<{ id: string; label: string; color: string; description?: string }>;
+  marker: { shape: 'dot' | 'square'; sizePx: number };
+  addStatus: () => string;
+  updateStatus: (id: string, patch: { label?: string; color?: string; description?: string }) => void;
+  removeStatus: (id: string) => void;
+  setMarker: (patch: { shape?: 'dot' | 'square'; sizePx?: number }) => void;
+};
 
+function StatusColumnEditor({ title, statuses, marker, addStatus, updateStatus, removeStatus, setMarker }: StatusColumnProps) {
   const [pickerOpenId, setPickerOpenId] = useState<string | null>(null);
+  const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({});
   const [hexDrafts, setHexDrafts] = useState<Record<string, string>>({});
-
   const containerRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     if (!pickerOpenId) return;
-    const onDown = (e: MouseEvent) => {
-      const target = e.target as Node | null;
-      if (containerRef.current && target && !containerRef.current.contains(target)) {
-        setPickerOpenId(null);
-      }
+    const onDown = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (containerRef.current && target && !containerRef.current.contains(target)) setPickerOpenId(null);
     };
     window.addEventListener('mousedown', onDown);
     return () => window.removeEventListener('mousedown', onDown);
   }, [pickerOpenId]);
 
   return (
-    <div
-      ref={containerRef}
-      style={{ paddingLeft: '12px' }}
-    >
-      {/* Compact row: «+ новый» слева + shape toggle + size input. */}
+    <div ref={containerRef} style={{ minWidth: 0 }}>
+      <div style={{ marginBottom: 7, color: '#8a8a8a', fontSize: 11, fontWeight: 650, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+        {title}
+      </div>
       <div style={{
-        display: 'flex', alignItems: 'center', gap: '10px',
-        padding: '6px 8px', marginBottom: '10px',
-        backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: '8px',
+        display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', marginBottom: 8,
+        backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: 8,
       }}>
         <button
-          onClick={addSessionStatus}
-          style={{
-            display: 'inline-flex', alignItems: 'center', gap: '4px',
-            padding: '3px 8px', fontSize: '11px', color: '#ccc',
-            backgroundColor: '#2a2a2a', border: '1px solid #444', borderRadius: '6px',
-            cursor: 'pointer', flexShrink: 0,
-          }}
+          onClick={addStatus}
           title="Добавить статус"
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 8px', fontSize: 11, color: '#ccc', backgroundColor: '#2a2a2a', border: '1px solid #444', borderRadius: 6, cursor: 'pointer', flexShrink: 0 }}
         >
           <Plus size={11} /> новый
         </button>
-        <span style={{ fontSize: '11px', color: '#888', marginLeft: '6px' }}>Маркер:</span>
-        <div style={{ display: 'inline-flex', backgroundColor: '#1a1a1a', borderRadius: '6px', border: '1px solid #333' }}>
-          {(['dot', 'square'] as const).map((shp) => (
+        <span style={{ fontSize: 11, color: '#777' }}>Маркер</span>
+        <div style={{ display: 'inline-flex', backgroundColor: '#1a1a1a', borderRadius: 6, border: '1px solid #333' }}>
+          {(['dot', 'square'] as const).map((shape) => (
             <button
-              key={shp}
-              onClick={() => setStatusMarker({ shape: shp })}
-              style={{
-                padding: '4px 8px', fontSize: '11px',
-                color: statusMarker.shape === shp ? '#fff' : '#888',
-                background: statusMarker.shape === shp ? '#333' : 'transparent',
-                border: 'none', cursor: 'pointer',
-                borderTopLeftRadius: shp === 'dot' ? 6 : 0,
-                borderBottomLeftRadius: shp === 'dot' ? 6 : 0,
-                borderTopRightRadius: shp === 'square' ? 6 : 0,
-                borderBottomRightRadius: shp === 'square' ? 6 : 0,
-              }}
-              title={shp === 'dot' ? 'Круглый' : 'Квадратный'}
+              key={shape}
+              onClick={() => setMarker({ shape })}
+              title={shape === 'dot' ? 'Круглый' : 'Квадратный'}
+              style={{ padding: '4px 8px', color: marker.shape === shape ? '#fff' : '#777', background: marker.shape === shape ? '#333' : 'transparent', border: 0, cursor: 'pointer', borderRadius: 5 }}
             >
-              <span style={{
-                display: 'inline-block', width: 8, height: 8,
-                backgroundColor: '#ccc',
-                borderRadius: shp === 'dot' ? '50%' : '2px',
-                verticalAlign: 'middle',
-              }} />
+              <span style={{ display: 'block', width: 8, height: 8, backgroundColor: '#ccc', borderRadius: shape === 'dot' ? '50%' : 2 }} />
             </button>
           ))}
         </div>
-        <span style={{ fontSize: '11px', color: '#888', marginLeft: 'auto' }}>Размер:</span>
         <input
           type="number"
           min={4}
           max={16}
-          value={statusMarker.sizePx}
-          onChange={(e) => setStatusMarker({ sizePx: Number(e.target.value) })}
-          style={{
-            width: '52px', padding: '4px 6px',
-            backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: '6px',
-            color: '#ccc', fontSize: '12px', fontFamily: 'monospace', outline: 'none',
-          }}
+          value={marker.sizePx}
+          onChange={(event) => setMarker({ sizePx: Number(event.target.value) })}
+          title="Размер маркера"
+          style={{ width: 44, marginLeft: 'auto', padding: '4px 5px', backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: 6, color: '#ccc', fontSize: 11, fontFamily: 'monospace', outline: 'none' }}
         />
-        <span style={{ fontSize: '10px', color: '#555' }}>px</span>
       </div>
 
-      {sessionStatuses.length === 0 && (
-        <div style={{ fontSize: '12px', color: '#666', fontStyle: 'italic', padding: '8px 0' }}>
-          Пусто. Нажми «новый», чтобы создать первый статус.
-        </div>
+      {statuses.length === 0 && (
+        <div style={{ fontSize: 12, color: '#666', fontStyle: 'italic', padding: '8px 2px' }}>Пусто. Добавьте первый статус.</div>
       )}
 
-      <div style={{
-        display: 'grid',
-        gridTemplateColumns: 'repeat(auto-fill, minmax(360px, 1fr))',
-        gap: '6px',
-      }}>
-        {sessionStatuses.map((s) => {
-          const isPickerOpen = pickerOpenId === s.id;
-          const hexDraft = hexDrafts[s.id] ?? s.color;
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {statuses.map((status) => {
+          const pickerOpen = pickerOpenId === status.id;
+          const expanded = !!expandedIds[status.id];
+          const hexDraft = hexDrafts[status.id] ?? status.color;
           return (
-            <div
-              key={s.id}
-              style={{
-                position: 'relative',
-                display: 'flex', alignItems: 'center', gap: '6px',
-                padding: '6px 8px',
-                backgroundColor: '#1e1e1e',
-                border: '1px solid #333',
-                borderRadius: '8px',
-              }}
-            >
-              <button
-                onClick={() => setPickerOpenId(isPickerOpen ? null : s.id)}
-                style={{
-                  width: 20, height: 20,
-                  borderRadius: statusMarker.shape === 'square' ? '4px' : '50%',
-                  backgroundColor: s.color,
-                  border: '2px solid rgba(255,255,255,0.15)',
-                  cursor: 'pointer', flexShrink: 0, padding: 0,
-                }}
-                title="Открыть палитру"
-              />
-
-              <input
-                type="text"
-                value={s.label}
-                onChange={(e) => updateSessionStatus(s.id, { label: e.target.value })}
-                placeholder="Название"
-                style={{
-                  flex: 1, minWidth: 0,
-                  padding: '4px 6px',
-                  backgroundColor: '#1a1a1a',
-                  border: '1px solid #333', borderRadius: '6px',
-                  color: '#ccc', fontSize: '12px', outline: 'none',
-                }}
-              />
-
-              <input
-                type="text"
-                value={hexDraft.replace(/^#/, '')}
-                onChange={(e) => {
-                  const next = `#${e.target.value}`;
-                  setHexDrafts((d) => ({ ...d, [s.id]: next }));
-                  const norm = normalizeHexValue(next);
-                  if (norm) updateSessionStatus(s.id, { color: norm });
-                }}
-                onBlur={() => {
-                  setHexDrafts((d) => { const cp = { ...d }; delete cp[s.id]; return cp; });
-                }}
-                maxLength={7}
-                style={{
-                  width: '64px', padding: '4px 6px',
-                  backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: '6px',
-                  color: '#ccc', fontSize: '11px', fontFamily: 'monospace',
-                  outline: 'none', textTransform: 'uppercase',
-                }}
-              />
-
-              <button
-                onClick={() => removeSessionStatus(s.id)}
-                style={{
-                  display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-                  width: 24, height: 24, borderRadius: '6px',
-                  background: 'transparent', border: 'none',
-                  color: '#666', cursor: 'pointer', flexShrink: 0,
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.color = '#f87171'; e.currentTarget.style.backgroundColor = 'rgba(248,113,113,0.1)'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.color = '#666'; e.currentTarget.style.backgroundColor = 'transparent'; }}
-                title="Удалить статус"
-              >
-                <Trash2 size={12} />
-              </button>
-
-              {isPickerOpen && (
-                <div
-                  style={{
-                    position: 'absolute', top: '100%', left: 0,
-                    marginTop: '6px', zIndex: 50,
-                    padding: '12px',
-                    backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '10px',
-                    boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
+            <div key={status.id} style={{ position: 'relative', padding: '6px 8px', backgroundColor: '#1e1e1e', border: '1px solid #333', borderRadius: 8 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <button
+                  onClick={() => setPickerOpenId(pickerOpen ? null : status.id)}
+                  title="Открыть палитру"
+                  style={{ width: 20, height: 20, borderRadius: marker.shape === 'square' ? 4 : '50%', backgroundColor: status.color, border: '2px solid rgba(255,255,255,0.15)', cursor: 'pointer', flexShrink: 0, padding: 0 }}
+                />
+                <input
+                  value={status.label}
+                  onChange={(event) => updateStatus(status.id, { label: event.target.value })}
+                  placeholder="Название"
+                  style={{ flex: 1, minWidth: 0, padding: '4px 6px', backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: 6, color: '#ccc', fontSize: 12, outline: 'none' }}
+                />
+                <input
+                  value={hexDraft.replace(/^#/, '')}
+                  onChange={(event) => {
+                    const next = `#${event.target.value}`;
+                    setHexDrafts((current) => ({ ...current, [status.id]: next }));
+                    const normalized = normalizeHexValue(next);
+                    if (normalized) updateStatus(status.id, { color: normalized });
                   }}
-                  onMouseDown={(e) => e.stopPropagation()}
-                  onClick={(e) => e.stopPropagation()}
+                  onBlur={() => setHexDrafts((current) => { const next = { ...current }; delete next[status.id]; return next; })}
+                  maxLength={7}
+                  style={{ width: 62, padding: '4px 6px', backgroundColor: '#1a1a1a', border: '1px solid #333', borderRadius: 6, color: '#ccc', fontSize: 11, fontFamily: 'monospace', outline: 'none', textTransform: 'uppercase' }}
+                />
+                <button
+                  onClick={() => setExpandedIds((current) => ({ ...current, [status.id]: !expanded }))}
+                  title={expanded ? 'Скрыть описание' : 'Показать описание'}
+                  style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 24, height: 24, borderRadius: 6, background: expanded ? 'rgba(255,255,255,0.07)' : 'transparent', border: 0, color: '#777', cursor: 'pointer' }}
                 >
-                  <HexColorPicker
-                    color={s.color}
-                    onChange={(c) => updateSessionStatus(s.id, { color: c.toUpperCase() })}
-                  />
+                  {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                </button>
+                <button
+                  onClick={() => removeStatus(status.id)}
+                  title="Удалить статус"
+                  style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 24, height: 24, borderRadius: 6, background: 'transparent', border: 0, color: '#666', cursor: 'pointer' }}
+                  onMouseEnter={(event) => { event.currentTarget.style.color = '#f87171'; event.currentTarget.style.backgroundColor = 'rgba(248,113,113,0.1)'; }}
+                  onMouseLeave={(event) => { event.currentTarget.style.color = '#666'; event.currentTarget.style.backgroundColor = 'transparent'; }}
+                >
+                  <Trash2 size={12} />
+                </button>
+              </div>
+
+              {expanded && (
+                <textarea
+                  value={status.description || ''}
+                  onChange={(event) => updateStatus(status.id, { description: event.target.value })}
+                  placeholder="Когда использовать этот статус и что он означает"
+                  rows={3}
+                  style={{ width: '100%', marginTop: 7, padding: '7px 8px', resize: 'vertical', backgroundColor: '#171717', border: '1px solid #333', borderRadius: 6, color: '#bbb', fontSize: 11, lineHeight: 1.45, outline: 'none' }}
+                />
+              )}
+
+              {pickerOpen && (
+                <div
+                  onMouseDown={(event) => event.stopPropagation()}
+                  onClick={(event) => event.stopPropagation()}
+                  style={{ position: 'absolute', top: '100%', left: 0, marginTop: 6, zIndex: 50, padding: 12, backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: 10, boxShadow: '0 10px 30px rgba(0,0,0,0.5)' }}
+                >
+                  <HexColorPicker color={status.color} onChange={(color) => updateStatus(status.id, { color: color.toUpperCase() })} />
                 </div>
               )}
             </div>
           );
         })}
       </div>
+    </div>
+  );
+}
+
+function SessionStatusesEditor() {
+  const sessionStatuses = useUIStore((state) => state.sessionStatuses);
+  const taskStatuses = useUIStore((state) => state.taskStatuses);
+  const statusMarker = useUIStore((state) => state.statusMarker);
+  const taskStatusMarker = useUIStore((state) => state.taskStatusMarker);
+  const updateSessionStatus = useUIStore((state) => state.updateSessionStatus);
+  const updateTaskStatus = useUIStore((state) => state.updateTaskStatus);
+  const addSessionStatus = useUIStore((state) => state.addSessionStatus);
+  const addTaskStatus = useUIStore((state) => state.addTaskStatus);
+  const removeSessionStatus = useUIStore((state) => state.removeSessionStatus);
+  const removeTaskStatus = useUIStore((state) => state.removeTaskStatus);
+  const setStatusMarker = useUIStore((state) => state.setStatusMarker);
+  const setTaskStatusMarker = useUIStore((state) => state.setTaskStatusMarker);
+
+  return (
+    <div style={{ paddingLeft: 12, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 12, alignItems: 'start' }}>
+      <StatusColumnEditor title="Статусы вкладок" statuses={sessionStatuses} marker={statusMarker} addStatus={addSessionStatus} updateStatus={updateSessionStatus} removeStatus={removeSessionStatus} setMarker={setStatusMarker} />
+      <StatusColumnEditor title="Статусы задач" statuses={taskStatuses} marker={taskStatusMarker} addStatus={addTaskStatus} updateStatus={updateTaskStatus} removeStatus={removeTaskStatus} setMarker={setTaskStatusMarker} />
     </div>
   );
 }
@@ -1340,26 +1228,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setFilePreviewFontSize = useUIStore((s) => s.setFilePreviewFontSize);
   const setTimelineFontSize = useUIStore((s) => s.setTimelineFontSize);
   const setTimelineSummaryFontSize = useUIStore((s) => s.setTimelineSummaryFontSize);
-  // Заметки вкладки — три независимых шрифта (сайдбар / раскрытый / превью)
-  // + общие padding'и + cap'ы превью (max width/height попавапа CMD+hover).
-  const notesSidebarFontSize = useUIStore((s) => s.notesSidebarFontSize);
-  const setNotesSidebarFontSize = useUIStore((s) => s.setNotesSidebarFontSize);
-  const notesExpandedFontSize = useUIStore((s) => s.notesExpandedFontSize);
-  const setNotesExpandedFontSize = useUIStore((s) => s.setNotesExpandedFontSize);
-  const notesTooltipFontSize = useUIStore((s) => s.notesTooltipFontSize);
-  const setNotesTooltipFontSize = useUIStore((s) => s.setNotesTooltipFontSize);
-  const notesEditorPaddingX = useUIStore((s) => s.notesEditorPaddingX);
-  const setNotesEditorPaddingX = useUIStore((s) => s.setNotesEditorPaddingX);
-  const notesEditorPaddingY = useUIStore((s) => s.notesEditorPaddingY);
-  const setNotesEditorPaddingY = useUIStore((s) => s.setNotesEditorPaddingY);
-  const notesEditorShowLineNumbers = useUIStore((s) => s.notesEditorShowLineNumbers);
-  const setNotesEditorShowLineNumbers = useUIStore((s) => s.setNotesEditorShowLineNumbers);
-  const notesPreviewShowLineNumbers = useUIStore((s) => s.notesPreviewShowLineNumbers);
-  const setNotesPreviewShowLineNumbers = useUIStore((s) => s.setNotesPreviewShowLineNumbers);
-  const tabPreviewMaxWidth = useUIStore((s) => s.tabPreviewMaxWidth);
-  const setTabPreviewMaxWidth = useUIStore((s) => s.setTabPreviewMaxWidth);
-  const tabPreviewMaxHeight = useUIStore((s) => s.tabPreviewMaxHeight);
-  const setTabPreviewMaxHeight = useUIStore((s) => s.setTabPreviewMaxHeight);
   const semanticIndexParallelism = useUIStore((s) => s.semanticIndexParallelism);
   const semanticAutoIndexTitles = useUIStore((s) => s.semanticAutoIndexTitles);
   const setSemanticAutoIndexTitles = useUIStore((s) => s.setSemanticAutoIndexTitles);
@@ -1417,27 +1285,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [localGroupDescription, setLocalGroupDescription] = useState('');
   const [savedGroupFlash, setSavedGroupFlash] = useState<'name' | 'description' | null>(null);
   const savedGroupTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [draggingItem, setDraggingItem] = useState<DragItem | null>(null);
-  const [dragTargetKey, setDragTargetKey] = useState<string | null>(null);
-  const [dragTargetIds, setDragTargetIds] = useState<string[]>([]);
-  const [horizontalIntent, setHorizontalIntent] = useState<{ sourceId: string; direction: 'left' | 'right'; progress: number; disabled: boolean } | null>(null);
   const textListRef = useRef<HTMLDivElement>(null);
-  const pointerDragRef = useRef<PointerDragSession | null>(null);
-  const pointerDragControllerRef = useRef<{ session: PointerDragSession; cancel: () => void } | null>(null);
-  const dragVisualStateRef = useRef<PromptDragState>({ prompts: [], promptGroups: [] });
-  const latestPromptStateRef = useRef<PromptDragState>({ prompts: [], promptGroups: [] });
-  const promptVisualDepthById = useMemo(
-    () => buildVisualHierarchyDepthMap(prompts, { parentKey: 'visual_parent_id' }),
-    [prompts],
-  );
-  const draggingPromptIds = useMemo(() => {
-    if (draggingItem?.type !== 'prompt') return new Set<string>();
-    return new Set(
-      visualHierarchySubtreeItems(prompts, draggingItem.id, { parentKey: 'visual_parent_id' })
-        .map(prompt => prompt.id),
-    );
-  }, [draggingItem, prompts]);
-  const dragTargetIdSet = useMemo(() => new Set(dragTargetIds), [dragTargetIds]);
 
   // Editing states
   const [editingClaude, setEditingClaude] = useState(false);
@@ -1455,26 +1303,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [textInsertCopied, setTextInsertCopied] = useState(false);
   const [textInsertCopying, setTextInsertCopying] = useState(false);
   const textInsertCopiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  dragVisualStateRef.current = { prompts, promptGroups };
-  if (!pointerDragRef.current?.active) {
-    latestPromptStateRef.current = { prompts, promptGroups };
-  }
-
-  const cancelPromptPointerDrag = useCallback(() => {
-    const controller = pointerDragControllerRef.current;
-    pointerDragControllerRef.current = null;
-    if (controller) controller.cancel();
-  }, []);
-
-  const closeSettings = useCallback(() => {
-    cancelPromptPointerDrag();
-    onClose();
-  }, [cancelPromptPointerDrag, onClose]);
-
-  useEffect(() => {
-    if (!isOpen) cancelPromptPointerDrag();
-    return () => cancelPromptPointerDrag();
-  }, [cancelPromptPointerDrag, isOpen]);
+  const closeSettings = useCallback(() => onClose(), [onClose]);
 
   // Local copies of AI prompt fields for editing
   const [localPromptContent, setLocalPromptContent] = useState('');
@@ -1683,7 +1512,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     setEditingGroupId(null);
   };
 
-  const promptStateWithLocalDrafts = (): PromptDragState => {
+  const promptStateWithLocalDrafts = useCallback((): PromptDragState => {
     const nextPrompts = prompts.map(p => ({ ...p }));
     const nextGroups = promptGroups.map(g => ({ ...g }));
     if (editingInsertionIndex !== null && nextPrompts[editingInsertionIndex]) {
@@ -1701,7 +1530,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       }
     }
     return { prompts: nextPrompts, promptGroups: nextGroups };
-  };
+  }, [editingGroupId, editingInsertionIndex, localGroupDescription, localGroupName, localInsertionContent, localInsertionFilePaths, localInsertionTitle, promptGroups, prompts]);
 
   const promptPos = (p: Prompt, fallback: number) => Number.isFinite(Number(p.position)) ? Number(p.position) : fallback;
 
@@ -1745,7 +1574,75 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     return result;
   };
 
-  const buildFlatItems = () => flatItemsFor({ prompts, promptGroups });
+  const promptOutlineSignature = JSON.stringify({
+    prompts: prompts.map((prompt) => [
+      prompt.id,
+      prompt.group_id ?? null,
+      prompt.visual_parent_id ?? null,
+      Number(prompt.position || 0),
+    ]),
+    groups: promptGroups.map((group) => [
+      group.id,
+      Number(group.position || 0),
+      !!group.is_collapsed,
+    ]),
+  });
+  const promptOutline = useMemo(
+    () => buildPromptOutline(prompts, promptGroups),
+    [promptOutlineSignature],
+  );
+
+  const commitPromptOutline = useCallback(async ({ previewOutline }: { previewOutline: any[] }) => {
+    const next = applyPromptOutline(promptStateWithLocalDrafts(), previewOutline);
+    if (!next.ok) return next;
+    await Promise.all([
+      savePromptsImmediate(next.prompts),
+      ipcRenderer.invoke('prompt-groups:save', next.promptGroups),
+    ]);
+    setPrompts(next.prompts);
+    setPromptGroups(next.promptGroups);
+    return { ok: true };
+  }, [promptStateWithLocalDrafts, savePromptsImmediate]);
+
+  const handlePromptExpansion = useCallback(async ({ nodeId, expanded }: { nodeId: string; expanded: boolean }) => {
+    const value = String(nodeId || '');
+    if (!value.startsWith('prompt-group:')) return { ok: false, reason: 'group-must-stay-root' };
+    const groupId = Number(value.slice('prompt-group:'.length));
+    const nextGroups = promptGroups.map(group => group.id === groupId
+      ? { ...group, is_collapsed: !expanded }
+      : group);
+    if (nextGroups.every((group, index) => group === promptGroups[index])) return { ok: true };
+    setPromptGroups(nextGroups);
+    await ipcRenderer.invoke('prompt-groups:save', nextGroups);
+    return { ok: true };
+  }, [promptGroups]);
+
+  const promptDnd = useOutlineDnd({
+    outline: promptOutline,
+    onCommit: commitPromptOutline,
+    onExpansionRequest: handlePromptExpansion,
+    canHorizontalMove: promptOutlineHorizontalPolicy,
+    canUseVerticalSlot: promptOutlineVerticalSlotPolicy,
+    outsidePointerPolicy: 'horizontal-corridor',
+    layoutAnimation: {
+      duration: 120,
+      easing: 'cubic-bezier(0.2, 0, 0, 1)',
+      respectReducedMotion: false,
+      maxAnimatedRows: 14,
+      minRetargetInterval: 72,
+      animateDuringScroll: false,
+    },
+  });
+
+  const promptOutlineNodeById = useMemo(() => {
+    const nodes = new Map<string, any>();
+    const visit = (items: any[]) => items.forEach((node) => {
+      nodes.set(String(node.id), node);
+      visit(Array.isArray(node.children) ? node.children : []);
+    });
+    visit(promptDnd.previewOutline);
+    return nodes;
+  }, [promptDnd.previewOutline]);
 
   const buildPromptExportText = async (state: PromptDragState) => {
     const filePaths = Array.from(new Set(
@@ -1843,248 +1740,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     }
   };
 
-  const sameDragItem = (a: DragItem, b: DragItem) =>
-    a.type === b.type && a.id === b.id;
-
-  const flatItemToDrag = (item: FlatItem): DragItem =>
-    item.type === 'group' ? { type: 'group', id: item.group.id } : { type: 'prompt', id: item.prompt.id };
-
-  const reindexFlatState = (state: PromptDragState, flat: FlatItem[]): PromptDragState => {
-    const nextGroups = state.promptGroups.map(g => ({ ...g }));
-    const nextPrompts = state.prompts.map(p => ({ ...p }));
-    flat.forEach((item, pos) => {
-      if (item.type === 'group') {
-        const gi = nextGroups.findIndex(g => g.id === item.group.id);
-        if (gi >= 0) nextGroups[gi] = { ...nextGroups[gi], position: pos };
-      } else {
-        const promptIndex = nextPrompts.findIndex(prompt => prompt.id === item.prompt.id);
-        if (promptIndex >= 0) nextPrompts[promptIndex] = { ...nextPrompts[promptIndex], position: pos };
-      }
-    });
-    return { prompts: nextPrompts, promptGroups: nextGroups };
-  };
-
-  const applyPromptDragState = (state: PromptDragState, save: boolean) => {
-    dragVisualStateRef.current = state;
-    if (save) latestPromptStateRef.current = state;
-    setPrompts(state.prompts);
-    setPromptGroups(state.promptGroups);
-    if (save) {
-      savePromptsImmediate(state.prompts);
-      ipcRenderer.invoke('prompt-groups:save', state.promptGroups);
-    }
-  };
-
-  const autoScrollDragList = (clientY: number) => {
-    return autoScrollNearEdge(textListRef.current, clientY);
-  };
-
-  const captureDragGeometry = (base: PromptDragState): DragGeometry | null => {
-    const list = textListRef.current;
-    if (!list) return null;
-    return captureGroupedListGeometry(
-      list,
-      flatItemsFor(base).map(item => ({
-        type: item.type === 'group' ? 'container' : 'item',
-        id: item.type === 'group' ? String(item.group.id) : item.prompt.id,
-      })),
-    ) as DragGeometry;
-  };
-
-  const summarizeDragGeometry = (g: DragGeometry | null) => {
-    if (!g) return 'geom=null';
-    const flat = (g.flat as any[]).map(z => `${z.index}:${z.type[0]}:${z.id}@${fmtY(z.rect)} h@${fmtY(z.header)}`).join(' ');
-    const groups = (g.groups as any[]).map(z => `g:${z.containerId} rows=${z.rows.length} body@${fmtY(z.body)}`).join(' ');
-    return `flat=[${flat}] groups=[${groups}]`;
-  };
-
-  const resolveDragTarget = (item: DragItem, clientX: number, clientY: number): DragTarget | null => {
-    const session = pointerDragRef.current;
-    const base = session?.pendingNext || session?.base || dragVisualStateRef.current;
-    let geometry = session?.geometry || null;
-    if (!geometry) {
-      geometry = captureDragGeometry(base);
-      if (session) session.geometry = geometry;
-    }
-    if (!geometry) return null;
-    const result = resolveStructuredVerticalMove({
-      model: toStructuredPromptModel(base),
-      geometry,
-      drag: { type: item.type === 'group' ? 'container' : 'item', id: String(item.id) },
-      clientX,
-      clientY,
-      parentKey: 'parentId',
-      containerKey: 'containerId',
-    });
-    if (!result?.ok) return null;
-    const next = applyStructuredPromptModel(base, result.model);
-    return {
-      key: result.key,
-      label: result.key,
-      reason: result.reason,
-      next,
-      targetIds: Array.isArray(result.targetIds) ? result.targetIds : [],
-      changed: !!result.changed,
-    };
-  };
-
-  const resolveHierarchyTarget = (base: PromptDragState, item: DragItem, direction: 'left' | 'right') => {
-    if (item.type !== 'prompt') return null;
-    const model = toStructuredPromptModel(base);
-    const result = resolveStructuredHierarchyStep({
-      model,
-      sourceId: item.id,
-      direction,
-      parentKey: 'parentId',
-      containerKey: 'containerId',
-      maxDepth: 4,
-    });
-    let next = result.ok ? applyStructuredPromptModel(base, result.model) : base;
-    if (result.ok && result.reason === 'detach-from-container') {
-      const source = model.items.find(prompt => prompt.id === item.id);
-      const oldGroupId = source?.containerId == null ? null : Number(source.containerId);
-      const sourceIds = new Set(
-        visualHierarchySubtreeItems(model.items, item.id, { parentKey: 'parentId' })
-          .map(prompt => prompt.id)
-      );
-      const flat = flatItemsFor(next);
-      const sourceBlock = flat.filter(candidate => candidate.type === 'prompt' && sourceIds.has(candidate.prompt.id));
-      const withoutSource = flat.filter(candidate => candidate.type !== 'prompt' || !sourceIds.has(candidate.prompt.id));
-      const groupIndex = withoutSource.findIndex(candidate => candidate.type === 'group' && candidate.group.id === oldGroupId);
-      if (groupIndex >= 0 && sourceBlock.length > 0) {
-        withoutSource.splice(groupIndex + 1, 0, ...sourceBlock);
-        next = reindexFlatState(next, withoutSource);
-      }
-    }
-    return {
-      ...result,
-      next,
-    };
-  };
-
-  const startPointerDrag = (item: DragItem, click: () => void) => (e: React.PointerEvent<HTMLElement>) => {
-    const base = promptStateWithLocalDrafts();
-    saveCurrentGroup();
-    saveCurrentInsertion();
-    saveCurrentAIPrompt();
-    setEditingGroupId(null);
-    setEditingInsertionIndex(null);
-    setEditingPromptId(null);
-    applyPromptDragState(base, false);
-
-    const controller = startPointerDragSession(e, {
-      item,
-      onClick: click,
-      getBase: () => base,
-      captureGeometry: (snapshot: PromptDragState) => captureDragGeometry(snapshot),
-      autoScroll: (clientY: number) => autoScrollDragList(clientY),
-      onStart: (session: PointerDragSession) => {
-        pointerDragRef.current = session;
-        session.horizontalBaseX = session.startX;
-        setDraggingItem(item);
-        setDragTargetKey(null);
-        setDragTargetIds([]);
-        setHorizontalIntent(null);
-        console.warn('[PromptDnD] start', item, summarizeDragGeometry(session.geometry));
-      },
-      onPreview: ({ session, clientX, clientY }: any) => {
-        pointerDragRef.current = session;
-        const geometry = session.geometry || captureDragGeometry(session.pendingNext || session.base);
-        if (geometry && !session.geometry) session.geometry = geometry;
-        const list = geometry?.list;
-        const insideList = !!list
-          && clientX >= list.left
-          && clientX <= list.right
-          && clientY >= list.top
-          && clientY <= list.bottom;
-        if (!insideList) {
-          session.pendingNext = null;
-          session.lastKey = null;
-          applyPromptDragState(session.base, false);
-          setDragTargetKey(null);
-          setDragTargetIds([]);
-          setHorizontalIntent(null);
-          return null;
-        }
-
-        const target = resolveDragTarget(item, clientX, clientY);
-        let preview = target?.next || session.pendingNext || session.base;
-        let previewChanged = !!target?.changed;
-        setDragTargetIds(target?.targetIds || []);
-        if (item.type === 'prompt') {
-          const baseX = Number.isFinite(session.horizontalBaseX) ? session.horizontalBaseX : session.startX;
-          const deltaX = clientX - baseX;
-          if (Math.abs(deltaX) > 2) {
-            const direction: 'left' | 'right' = deltaX < 0 ? 'left' : 'right';
-            const hierarchy = resolveHierarchyTarget(preview, item, direction);
-            const progress = Math.min(1, Math.abs(deltaX) / 28);
-            setHorizontalIntent({ sourceId: item.id, direction, progress, disabled: !hierarchy?.ok });
-            if (Math.abs(deltaX) >= 28) {
-              const key = `hierarchy:${direction}:${hierarchy?.reason || 'invalid'}`;
-              if (!hierarchy?.ok) {
-                session.pendingNext = preview;
-                if (previewChanged) applyPromptDragState(preview, false);
-                session.lastKey = key;
-                setDragTargetKey(key);
-                return { key, changed: previewChanged };
-              }
-              session.pendingNext = hierarchy.next;
-              session.horizontalBaseX = clientX;
-              applyPromptDragState(hierarchy.next, false);
-              setDragTargetKey(key);
-              console.warn('[PromptDnD] hierarchy', item, direction, '->', hierarchy.parentId || 'root');
-              return { key, changed: true };
-            }
-          } else {
-            setHorizontalIntent(null);
-          }
-        }
-        if (!target) {
-          setDragTargetKey(session.lastKey);
-          return null;
-        }
-        if (target.key === session.lastKey && !previewChanged) return null;
-        session.pendingNext = preview;
-        if (previewChanged) applyPromptDragState(preview, false);
-        setDragTargetKey(target.key);
-        console.warn('[PromptDnD] preview', item, '->', target.label, 'via', target.reason);
-        return { key: target.key, changed: previewChanged };
-      },
-      onCommit: (session: PointerDragSession) => {
-        if (!(session as any).pendingNext || !session.lastKey) {
-          applyPromptDragState(session.base, false);
-          console.warn('[PromptDnD] cancel-outside', item);
-          return;
-        }
-        applyPromptDragState((session as any).pendingNext, true);
-        console.warn('[PromptDnD] drop', item, '->', session.lastKey);
-      },
-      onCancel: (session: PointerDragSession) => {
-        applyPromptDragState(session.base, false);
-        console.warn('[PromptDnD] cancel', item);
-      },
-      onFinish: (session: PointerDragSession) => {
-        if (pointerDragControllerRef.current?.session === session) {
-          pointerDragControllerRef.current = null;
-        }
-        pointerDragRef.current = null;
-        setDraggingItem(null);
-        setDragTargetKey(null);
-        setDragTargetIds([]);
-        setHorizontalIntent(null);
-      },
-    });
-    if (controller) {
-      pointerDragRef.current = controller.session;
-      pointerDragControllerRef.current = controller;
-    }
-  };
-
-  const closeInsertionEditor = () => {
-    saveCurrentInsertion();
-    setEditingInsertionIndex(null);
-  };
-
   const handleDocBlur = (e: React.FocusEvent) => {
     if (isBlurInsideContainer(e, docEditRef)) return;
     if (docPrompt.useFile) {
@@ -2094,7 +1749,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     }
     setEditingDocPrompt(false);
   };
-
 
 
   // Start editing an AI prompt (auto-saves current before switching)
@@ -2181,12 +1835,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     showToast('Group deleted', 'success');
   };
 
-  const toggleGroupCollapsed = (groupId: number) => {
-    const newGroups = promptGroups.map(g => g.id === groupId ? { ...g, is_collapsed: !g.is_collapsed } : g);
-    setPromptGroups(newGroups);
-    ipcRenderer.invoke('prompt-groups:save', newGroups);
-  };
-
   const deletePrompt = async (index: number) => {
     const deletedId = prompts[index]?.id;
     const newPrompts = prompts
@@ -2219,83 +1867,145 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     setAiSubTab(next);
   };
 
-  const renderTextPromptCard = (prompt: Prompt, index: number, dndKind: 'flat' | 'group-prompt', groupId?: number, flatIndex?: number, nextPrompt?: Prompt | null) => {
-    const isSelected = editingInsertionIndex === index;
-    const isDragged = draggingItem?.type === 'prompt' && draggingItem.id === prompt.id;
-    const isDraggedBlock = draggingPromptIds.has(prompt.id);
-    const isBlockTarget = dragTargetIdSet.has(prompt.id);
-    const visualDepth = promptVisualDepthById.get(prompt.id) || 0;
-    const ancestors = visualHierarchyAncestorIds(prompts, prompt.id, { parentKey: 'visual_parent_id' });
-    const nextAncestors = nextPrompt
-      ? visualHierarchyAncestorIds(prompts, nextPrompt.id, { parentKey: 'visual_parent_id' })
+  const renderPromptOutlineRow = (row: any) => {
+    const node = promptOutlineNodeById.get(String(row.id));
+    if (!node) return null;
+    const isGroup = node.entityType === 'group';
+    const prompt = !isGroup
+      ? prompts.find((candidate) => candidate.id === node.promptId) || node.rawPrompt as Prompt
+      : null;
+    const liveGroup = isGroup
+      ? promptGroups.find((candidate) => candidate.id === node.groupId) || node.rawGroup
+      : null;
+    const promptIndex = prompt ? prompts.findIndex(candidate => candidate.id === prompt.id) : -1;
+    const rowProps = promptDnd.getRowProps(row);
+    const dragState = promptDnd.dragState;
+    const isSource = dragState?.sourceIds?.includes(row.id) || dragState?.sourceId === row.id;
+    const dwell = dragState?.navigationDwell;
+    const isNavigationTarget = dwell?.targetId === row.id;
+    const navigationBlocked = isNavigationTarget && dwell?.blocked;
+    const inGroup = !isGroup && (row.path || []).some((id: string) => promptOutlineNodeById.get(String(id))?.entityType === 'group');
+    const visualDepth = isGroup ? 0 : Math.max(0, row.depth - (inGroup ? 1 : 0));
+    const promptAncestors = !isGroup
+      ? (row.path || []).slice(0, -1).filter((id: string) => promptOutlineNodeById.get(String(id))?.entityType === 'prompt')
       : [];
-    const hasNextSibling = !!prompt.visual_parent_id && nextPrompt?.visual_parent_id === prompt.visual_parent_id;
-    const intent = horizontalIntent?.sourceId === prompt.id ? horizontalIntent : null;
-    const intentColor = intent?.disabled ? '#73737a' : '#a78bfa';
-    const hierarchyStep = 12;
+    const containingGroup = !isGroup
+      ? (row.path || []).map((id: string) => promptOutlineNodeById.get(String(id))).find((candidate: any) => candidate?.entityType === 'group')
+      : null;
+    const continuationPromptDepths = !isGroup
+      ? (row.ancestorContinuationDepths || []).flatMap((pathIndex: number) => {
+          const continuationNode = promptOutlineNodeById.get(String(row.path?.[pathIndex]));
+          if (continuationNode?.entityType !== 'prompt') return [];
+          const lineDepth = (row.path || [])
+            .slice(0, pathIndex + 1)
+            .filter((id: string) => promptOutlineNodeById.get(String(id))?.entityType === 'prompt')
+            .length;
+          return lineDepth > 0 ? [lineDepth] : [];
+        })
+      : [];
+    const intent = isSource ? dragState?.feedback : null;
     const connectorColor = 'rgba(139,92,246,0.58)';
+    const hierarchyStep = 12;
+    const marginLeft = isGroup ? 0 : (inGroup ? 18 : 0) + visualDepth * hierarchyStep;
+    const selected = isGroup ? editingGroupId === node.groupId : promptIndex >= 0 && editingInsertionIndex === promptIndex;
+    const dndId = isGroup ? String(node.groupId) : prompt?.id;
     return (
       <div
-        key={`${dndKind}-${prompt.id}`}
-        data-dnd-kind={dndKind}
-        data-dnd-flat-container={dndKind === 'flat' ? 'true' : undefined}
-        data-dnd-type={dndKind === 'flat' ? 'prompt' : undefined}
-        data-dnd-id={prompt.id}
-        data-group-id={groupId != null ? String(groupId) : undefined}
-        data-prompt-index={String(index)}
-        data-prompt-id={prompt.id}
-        data-visual-parent-id={prompt.visual_parent_id || undefined}
-        data-visual-depth={visualDepth || undefined}
-        data-dnd-target-preview={isBlockTarget ? 'block' : undefined}
-        onPointerDown={startPointerDrag({ type: 'prompt', id: prompt.id }, () => startEditingInsertion(index))}
+        key={String(row.id)}
+        {...rowProps}
+        data-prompt-outline-row="true"
+        data-prompt-outline-kind={isGroup ? 'group' : 'prompt'}
+        data-dnd-kind={isGroup ? 'group' : inGroup ? 'group-prompt' : 'flat'}
+        data-dnd-flat-container={isGroup || !inGroup ? 'true' : undefined}
+        data-dnd-type={isGroup ? 'group' : 'prompt'}
+        data-dnd-id={dndId}
+        data-group-id={isGroup ? String(node.groupId) : containingGroup ? String(containingGroup.groupId) : undefined}
+        data-prompt-id={prompt?.id}
+        data-prompt-index={promptIndex >= 0 ? String(promptIndex) : undefined}
+        data-visual-parent-id={promptAncestors.length > 0 ? String(promptAncestors[promptAncestors.length - 1]).replace(/^prompt:/, '') : undefined}
+        data-visual-depth={isGroup ? undefined : String(visualDepth)}
+        data-dnd-navigation-protected={navigationBlocked ? 'true' : undefined}
+        onClick={isGroup ? undefined : (event) => {
+          if (!event.defaultPrevented && promptIndex >= 0) startEditingInsertion(promptIndex);
+        }}
+        onContextMenu={isGroup ? (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          startEditingGroup(node.groupId);
+        } : undefined}
         style={{
           display: 'flex',
           alignItems: 'center',
           gap: 8,
           marginBottom: 6,
-          marginLeft: visualDepth * hierarchyStep,
-          width: visualDepth ? `calc(100% - ${visualDepth * hierarchyStep}px)` : '100%',
+          marginLeft,
+          width: marginLeft ? `calc(100% - ${marginLeft}px)` : '100%',
           padding: '8px 9px',
           borderRadius: 8,
-          background: isDragged
-            ? 'rgba(124,58,237,0.22)'
-            : isDraggedBlock
-              ? 'rgba(124,58,237,0.10)'
-              : isBlockTarget
-                ? 'rgba(96,165,250,0.12)'
-                : (isSelected ? '#24242a' : VR_CARD),
-          border: `1px ${intent ? 'dashed' : 'solid'} ${intent ? intentColor : (isDraggedBlock ? VR_VIOLET : (isBlockTarget ? '#60a5fa' : (isSelected ? VR_ACCENT : VR_BORDER)))}`,
-          boxShadow: isDragged
-            ? '0 0 0 1px rgba(124,58,237,0.28) inset, 0 0 18px rgba(124,58,237,0.16)'
-            : (isBlockTarget ? '0 0 0 1px rgba(96,165,250,0.20) inset' : 'none'),
-          cursor: isDragged ? 'grabbing' : 'pointer',
+          background: navigationBlocked
+            ? 'rgba(113,113,122,0.12)'
+            : isSource
+              ? 'rgba(124,58,237,0.18)'
+              : (selected ? '#24242a' : VR_CARD),
+          border: `1px ${intent?.blocked || navigationBlocked ? 'dashed' : 'solid'} ${navigationBlocked ? '#73737a' : intent?.blocked ? '#73737a' : isSource ? VR_VIOLET : selected ? VR_ACCENT : VR_BORDER}`,
+          boxShadow: isSource ? '0 0 0 1px rgba(124,58,237,0.22) inset' : 'none',
+          cursor: isSource ? 'grabbing' : 'pointer',
           minWidth: 0,
+          opacity: dragState?.navigationMode && isSource ? 0.62 : 1,
           userSelect: 'none',
           touchAction: 'none',
           position: 'relative',
           boxSizing: 'border-box',
-          transition: 'background 110ms ease, border-color 110ms ease, box-shadow 110ms ease',
         }}
       >
-        {visualDepth > 0 && (
+        {!isGroup && promptAncestors.length > 0 && (
           <>
-            {ancestors.slice(1).map((ancestorId, ancestorIndex) => nextAncestors.includes(ancestorId) && (
-              <span key={ancestorId} aria-hidden style={{ position: 'absolute', left: -7 - ((ancestorIndex + 1) * hierarchyStep), top: -6, bottom: -6, width: 1, background: connectorColor, pointerEvents: 'none' }} />
+            {continuationPromptDepths.map((lineDepth: number) => (
+              <span key={lineDepth} aria-hidden data-prompt-connector="continuation" style={{ position: 'absolute', left: -7 - ((visualDepth - lineDepth) * hierarchyStep), top: -6, bottom: -6, width: 1, background: connectorColor, pointerEvents: 'none' }} />
             ))}
-            <span aria-hidden style={{ position: 'absolute', left: -7, top: -6, bottom: '50%', width: 1, background: connectorColor, pointerEvents: 'none' }} />
-            {hasNextSibling && <span aria-hidden style={{ position: 'absolute', left: -7, top: '50%', bottom: -6, width: 1, background: connectorColor, pointerEvents: 'none' }} />}
-            <span aria-hidden style={{ position: 'absolute', left: -7, top: '50%', width: 8, height: 1, background: connectorColor, pointerEvents: 'none' }} />
+            <span aria-hidden data-prompt-connector="top" style={{ position: 'absolute', left: -7, top: -6, bottom: '50%', width: 1, background: connectorColor, pointerEvents: 'none' }} />
+            {row.hasNextSibling && (
+              <span aria-hidden data-prompt-connector="bottom" style={{ position: 'absolute', left: -7, top: '50%', bottom: -6, width: 1, background: connectorColor, pointerEvents: 'none' }} />
+            )}
+            <span aria-hidden data-prompt-connector="elbow" style={{ position: 'absolute', left: -7, top: '50%', width: 8, height: 1, background: connectorColor, pointerEvents: 'none' }} />
           </>
         )}
-        <VRDocIcon />
-        <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: isSelected ? '#bfdbfe' : VR_TEXT, fontWeight: 620, fontSize: 13 }}>
-          {prompt.title || 'Untitled'}
-        </div>
-        {(prompt.file_paths?.length || 0) > 0 && <VRTag accent>{prompt.file_paths?.length} файл.</VRTag>}
-        {intent && (
-          <span aria-hidden data-horizontal-intent={intent.direction} data-horizontal-intent-disabled={intent.disabled ? 'true' : undefined} style={{ color: intentColor, opacity: 0.25 + intent.progress * 0.75, fontSize: 15, fontWeight: 800, lineHeight: 1 }}>
-            {intent.direction === 'left' ? '←' : '→'}{intent.disabled ? '×' : ''}
-          </span>
+        {isGroup ? (
+          <>
+            <button
+              data-outline-dnd-ignore
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation();
+                void promptDnd.requestExpansion(row.id, row.expanded === false, 'pointer-toggle');
+              }}
+              style={{ border: 'none', background: 'transparent', color: VR_DIM, cursor: 'pointer', padding: 0, width: 18, display: 'flex' }}
+            >
+              {navigationBlocked ? (
+                <CircleX data-outline-dnd-navigation-blocked="true" size={14} style={{ color: '#a1a1aa' }} />
+              ) : isNavigationTarget ? (
+                <Loader2
+                  data-dnd-navigation-loader
+                  data-dnd-navigation-phase={dwell?.pending ? 'loading' : 'waiting'}
+                  size={14}
+                  className="animate-spin"
+                  style={{ color: '#c4b5fd' }}
+                />
+              ) : (
+                <VRChevronIcon open={row.expanded} />
+              )}
+            </button>
+            <VRFolderIcon />
+            <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: selected ? '#ddd6fe' : VR_TEXT, fontWeight: 650, fontSize: 13 }}>{liveGroup?.name || 'Группа'}</div>
+            <VRTag>{node.children?.length || 0}</VRTag>
+          </>
+        ) : (
+          <>
+            <VRDocIcon />
+            <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: selected ? '#bfdbfe' : VR_TEXT, fontWeight: 620, fontSize: 13 }}>{prompt?.title || 'Untitled'}</div>
+            {(prompt?.file_paths?.length || 0) > 0 && <VRTag accent>{prompt?.file_paths?.length} файл.</VRTag>}
+            {intent && <span aria-hidden data-horizontal-intent={intent.direction} data-horizontal-intent-disabled={intent.blocked ? 'true' : undefined} style={{ color: intent.blocked ? '#73737a' : '#a78bfa', fontSize: 15, fontWeight: 800, lineHeight: 1 }}>{intent.direction === 'left' ? '←' : '→'}{intent.blocked ? '×' : ''}</span>}
+          </>
         )}
       </div>
     );
@@ -2388,8 +2098,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const renderTextInsertEditor = () => {
     const selectedGroup = editingGroupId !== null ? promptGroups.find(g => g.id === editingGroupId) : null;
     const selectedPrompt = editingInsertionIndex !== null ? prompts[editingInsertionIndex] : null;
-    const flatItems = buildFlatItems();
-
     return (
       <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 34%) minmax(360px, 1fr)', gap: 12, height: '100%', minHeight: 0 }}>
         <div style={{ minHeight: 0, display: 'flex', flexDirection: 'column', background: '#17171a', border: `1px solid ${VR_BORDER}`, borderRadius: 10, overflow: 'hidden' }}>
@@ -2418,80 +2126,23 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             <button onClick={() => addPrompt()} style={vrSmallBtnStyle('accent')}><VRPlusIcon small /> Промпт</button>
           </div>
 
-          <div ref={textListRef} onDragStart={(e) => e.preventDefault()} style={{ padding: 8, overflowY: 'auto', minHeight: 0, flex: 1 }}>
-            {flatItems.length === 0 ? (
+          <div
+            ref={(element) => {
+              textListRef.current = element;
+              promptDnd.scrollerRef.current = element;
+            }}
+            onDragStart={(e) => e.preventDefault()}
+            data-prompt-outline="true"
+            data-prompt-outline-phase={promptDnd.dragState?.phase || 'idle'}
+            data-prompt-outline-navigation={promptDnd.dragState?.navigationMode ? 'true' : undefined}
+            style={{ padding: 8, overflowY: 'auto', minHeight: 0, flex: 1 }}
+          >
+            {promptDnd.rows.length === 0 ? (
               <VREmpty text="Нет промптов. Добавь первый." />
             ) : (
               <>
-                {flatItems.map((item, flatIndex) => {
-                  if (item.type === 'group') {
-                    const group = item.group;
-                    const groupPrompts = orderVisualHierarchyItems(
-                      prompts
-                        .map((p, i) => ({ ...p, _idx: i }))
-                        .filter(p => p.group_id === group.id)
-                        .sort((a, b) => promptPos(a, a._idx) - promptPos(b, b._idx)),
-                      { parentKey: 'visual_parent_id' },
-                    );
-                    const isSelected = editingGroupId === group.id;
-                    const isDragging = draggingItem?.type === 'group' && draggingItem.id === group.id;
-                    const isGroupTarget = dragTargetIdSet.has(`container:${group.id}`);
-                    return (
-                      <div key={`g-${group.id}`} data-dnd-target-preview={isGroupTarget ? 'block' : undefined}>
-                        <div data-dnd-flat-container="true" data-dnd-type="group" data-dnd-id={String(group.id)} style={{ border: `1px solid ${isGroupTarget ? '#60a5fa' : (isDragging ? VR_VIOLET : 'transparent')}`, background: isGroupTarget ? 'rgba(96,165,250,0.10)' : (isDragging ? 'rgba(124,58,237,0.08)' : 'transparent'), borderRadius: 9, marginBottom: 7 }}>
-                          <div
-                            data-dnd-kind="flat"
-                            data-dnd-type="group"
-                            data-dnd-id={String(group.id)}
-                            onPointerDown={startPointerDrag({ type: 'group', id: group.id }, () => toggleGroupCollapsed(group.id))}
-                            onContextMenu={(e) => {
-                              e.preventDefault();
-                              e.stopPropagation();
-                              startEditingGroup(group.id);
-                            }}
-                            style={{
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: 8,
-                              padding: '8px 9px',
-                              borderRadius: 8,
-                              background: isDragging ? 'rgba(124,58,237,0.18)' : (isSelected ? '#24242a' : VR_CARD),
-                              border: `1px solid ${isDragging ? VR_VIOLET : (isSelected ? VR_VIOLET : VR_BORDER)}`,
-                              boxShadow: isDragging ? '0 0 0 1px rgba(124,58,237,0.18) inset' : 'none',
-                              cursor: isDragging ? 'grabbing' : 'pointer',
-                              userSelect: 'none',
-                              touchAction: 'none',
-                              transition: 'background 110ms ease, border-color 110ms ease, box-shadow 110ms ease',
-                            }}
-                          >
-                            <button
-                              data-no-card-drag
-                              onPointerDown={(e) => e.stopPropagation()}
-                              onMouseDown={(e) => e.stopPropagation()}
-                              onClick={(e) => { e.stopPropagation(); toggleGroupCollapsed(group.id); }}
-                              style={{ border: 'none', background: 'transparent', color: VR_DIM, cursor: 'pointer', padding: 0, width: 18, display: 'flex' }}
-                            >
-                              <VRChevronIcon open={!group.is_collapsed} />
-                            </button>
-                            <VRFolderIcon />
-                            <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: isSelected ? '#ddd6fe' : VR_TEXT, fontWeight: 650, fontSize: 13 }}>
-                              {group.name || 'Группа'}
-                            </div>
-                            <VRTag>{groupPrompts.length}</VRTag>
-                          </div>
-                          {!group.is_collapsed && (
-                            <div data-dnd-kind="group-body" data-group-id={String(group.id)} style={{ padding: '6px 0 0 26px', minHeight: groupPrompts.length === 0 ? 8 : undefined }}>
-                              {groupPrompts.map((prompt, promptIndex) => renderTextPromptCard(prompt, prompt._idx, 'group-prompt', group.id, undefined, groupPrompts[promptIndex + 1] || null))}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  }
-                  const nextPrompt = flatItems[flatIndex + 1]?.type === 'prompt' ? flatItems[flatIndex + 1].prompt : null;
-                  return renderTextPromptCard(item.prompt, item.origIdx, 'flat', undefined, flatIndex, nextPrompt);
-                })}
-                <div style={{ height: 10 }} />
+                {promptDnd.rows.map(renderPromptOutlineRow)}
+                <div {...promptDnd.scrollSpacerProps} />
               </>
             )}
           </div>
@@ -3398,7 +3049,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
           {activeTab === 'fonts' && (
             <>
               {/* SettingsTree pattern:
-                  - Главные uppercase-заголовки (Табы / Шрифты / Заметки) идут плоско.
+                  - Главные uppercase-заголовки идут плоско.
                   - Sub-секции через padding-left 16px + border-left + ╰ префикс.
                   - Все строки настроек — единый FontSizeSlider компонент в 4-col grid.
                   Цель — одна стилистика на весь tab, юзер не различает «у этого блока
@@ -3406,7 +3057,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   блока) убраны для всех секций. */}
 
               {/* SettingsTree pattern: главные секции (Табы / Терминал / Сайдбар /
-                  Prompt picker / Заметки) — каждая отдельная область интерфейса.
+                  Prompt picker) — каждая отдельная область интерфейса.
                   Внутри каждой секции собраны ВСЕ её настройки: padding/радиус/шрифт/
                   поведение. Глобальный пункт «Шрифты интерфейса» убран — он сводил
                   все шрифты в одну кучу без привязки к области, юзер не мог понять
@@ -3499,42 +3150,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 <FontSizeSlider label="Отступ справа" description="0 — центр или прижатие к левому. >0 — приоритет: прижатие к правому краю" value={promptPickerRightOffsetPx} onChange={setPromptPickerRightOffsetPx} min={0} max={2000} suffix="px" />
               </SettingsGrid4>
 
-              {/* 5. ЗАМЕТКИ + подсекция Превью CMD+hover */}
-              <SettingsSectionHeader title="Заметки" />
-              <SettingsGrid4>
-                <FontSizeSlider label="Шрифт в сайдбаре" value={notesSidebarFontSize} onChange={setNotesSidebarFontSize} min={10} max={28} />
-                <FontSizeSlider label="Шрифт раскрытый" value={notesExpandedFontSize} onChange={setNotesExpandedFontSize} min={10} max={28} />
-              </SettingsGrid4>
-              <div style={{ marginTop: '10px' }}>
-                <LineNumbersToggle
-                  checked={notesEditorShowLineNumbers}
-                  onChange={setNotesEditorShowLineNumbers}
-                  label="Номера строк"
-                  description="Показывать колонку с номерами строк в редакторе заметки"
-                  tooltip="Колонка с номерами строк слева в раскрытом редакторе заметок (slide-out)."
-                />
-              </div>
-
-              <SettingsSubSectionHeader title="Превью CMD+hover" />
-              <SettingsGrid4>
-                <FontSizeSlider label="Шрифт" value={notesTooltipFontSize} onChange={setNotesTooltipFontSize} min={10} max={28} />
-                <PaddingRow
-                  valueX={notesEditorPaddingX} onChangeX={setNotesEditorPaddingX}
-                  valueY={notesEditorPaddingY} onChangeY={setNotesEditorPaddingY}
-                  maxX={48} maxY={48}
-                />
-                <FontSizeSlider label="Макс. ширина [resize]" description="Задаётся перетаскиванием правого края превью" value={Math.round(tabPreviewMaxWidth)} onChange={setTabPreviewMaxWidth} min={120} max={900} disabled />
-                <FontSizeSlider label="Макс. высота" description="До неё растёт высота, дальше скролл" value={Math.round(tabPreviewMaxHeight)} onChange={setTabPreviewMaxHeight} min={80} max={900} />
-              </SettingsGrid4>
-              <div style={{ marginTop: '10px' }}>
-                <LineNumbersToggle
-                  checked={notesPreviewShowLineNumbers}
-                  onChange={setNotesPreviewShowLineNumbers}
-                  label="Номера строк"
-                  description="Показывать колонку с номерами строк в превью (CMD+hover)"
-                  tooltip="Колонка с номерами строк слева в CMD+hover превью заметки."
-                />
-              </div>
             </>
           )}
 

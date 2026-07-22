@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect, startTransition } from 'react';
-import { useWorkspaceStore, TabColor, TabType, PendingAction } from '../../store/useWorkspaceStore';
+import { useWorkspaceStore, TabColor, TabType, PendingAction, type TabTaskPlanDocument } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Tooltip from '../UI/Tooltip';
 // Fixed card widths so the wrap-grid stays uniform regardless of name length.
@@ -61,6 +61,7 @@ interface TabHistoryEntry {
   cwd: string;
   color: string | null;
   notes: string | null;
+  task_plan?: string | null;
   command_type: string | null;
   tab_type: string;
   url: string | null;
@@ -427,7 +428,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       tab.codexSessionId || '',
       tab.wasInterrupted ? '1' : '0',
       tab.overlayDismissed ? '1' : '0',
-      tab.notes ? 'notes' : '',
+      tab.taskPlan?.revision ?? 0,
       tab.sessionStatus || '',
     ].join(':')).join('|');
 
@@ -451,7 +452,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const sessionStatuses = useUIStore((s) => s.sessionStatuses);
   const statusMarkerShape = useUIStore((s) => s.statusMarker.shape);
   const statusMarkerSize = useUIStore((s) => s.statusMarker.sizePx);
-  // tabNotes* font / padding теперь читаются внутри TabPreviewPopover.
   const [syncName, setSyncName] = useState<string | null>(null);
   const [history, setHistory] = useState<TabHistoryEntry[]>([]);
   const [favorites, setFavorites] = useState<FavoriteEntry[]>([]);
@@ -875,7 +875,11 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
       const restoreCwd = await resolveHistoryRestoreCwd(entry);
       const tabId = await createTab(projectId, entry.name, restoreCwd.cwd, {
         color: (entry.color || undefined) as TabColor | undefined,
-        notes: entry.notes || undefined,
+        taskPlan: (() => {
+          if (!entry.task_plan) return undefined;
+          try { return JSON.parse(entry.task_plan) as TabTaskPlanDocument; }
+          catch { return undefined; }
+        })(),
         commandType: entry.command_type as any || undefined,
         tabType: (entry.tab_type || 'terminal') as TabType,
         url: entry.url || undefined,
@@ -956,7 +960,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     setProjectView(projectId, 'terminal');
     await createTab(projectId, entry.name || 'tab', entry.cwd || project?.path || '/', {
       color: (entry.color || undefined) as TabColor | undefined,
-      notes: entry.notes || undefined,
       commandType: entry.command_type as any || undefined,
       tabType: (entry.tab_type || 'terminal') as TabType,
       url: entry.url || undefined,
@@ -1042,18 +1045,9 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     }
   };
 
-  const [showKeepNotes, setShowKeepNotes] = useState(false);
-
   const handleClearHistory = async () => {
     await ipcRenderer.invoke('project:clear-tab-history', { projectId });
     setHistory([]);
-    setSelectedPreview(null);
-  };
-
-  const handleClearExceptNotes = async () => {
-    await ipcRenderer.invoke('project:clear-tab-history-except-notes', { projectId });
-    const data = await ipcRenderer.invoke('project:get-tab-history', { projectId });
-    setHistory(data || []);
     setSelectedPreview(null);
   };
 
@@ -1075,7 +1069,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         name: tab.name,
         cwd: tab.cwd,
         color: tab.color || null,
-        notes: tab.notes || null,
         commandType: tab.commandType || null,
         tabType: tab.tabType || 'terminal',
         url: tab.url || null,
@@ -1097,7 +1090,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         name: entry.name,
         cwd: entry.cwd,
         color: entry.color || null,
-        notes: entry.notes || null,
         commandType: entry.command_type || null,
         tabType: entry.tab_type || 'terminal',
         url: entry.url || null,
@@ -2203,19 +2195,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                               )}
                               <span>{date}<span style={{ color: '#555', margin: '0 2px' }}>|</span>{time}</span>
                             </div>
-                            {isCmdPressed && entry.notes && (
-                              <span
-                                style={{
-                                  position: 'absolute',
-                                  top: 5,
-                                  right: 5,
-                                  width: 5,
-                                  height: 5,
-                                  borderRadius: '50%',
-                                  backgroundColor: '#DA7756',
-                                }}
-                              />
-                            )}
                             {cmdHover && (
                               <div className="absolute right-2 top-1/2 -translate-y-1/2 rounded border border-[#10A37F]/45 bg-[#05231c] px-2 py-0.5 text-[10px] text-[#9be6cf] shadow-lg">
                                 Resume
@@ -2501,7 +2480,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
             rect={historyPopover.hoveredItem!.rect}
             popoverProps={historyPopover.popoverProps}
             metaRows={metaRows}
-            notes={entry.notes}
             split
             pointerThrough
             isLocked={historyPopover.isLocked}

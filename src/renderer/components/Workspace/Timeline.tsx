@@ -5412,6 +5412,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             }
             const isCompactSummaryMarker = !!entry.isCompactSummary;
             const displaysAsCompact = isCompacted || isCompactSummaryMarker;
+            const compactClusterCount = codexCompactCluster?.count || 1;
             // Fork marker at this position — only the SINGLE last snapshot UUID renders
             // the blue stripe (forkMarkerLastSnapIndex). Previously this used edge
             // detection (entry ∈ snap, next ∉ snap), which fired on every gap when the
@@ -5740,20 +5741,42 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                       );
                     })()
                   ) : (
-                    <div
-                      className="pointer-events-none shrink-0"
-                      style={{
-                        width: dotWidth,
-                        height: dotHeight,
-                        borderRadius: dotRadius,
-                        backgroundColor: isUnreachable && !isHovered && !displaysAsCompact ? 'transparent' : dotColor,
-                        border: isUnreachable && !isHovered && !displaysAsCompact ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#9333ea' : dotColor}` : 'none',
-                        boxShadow: dotGlow,
-                        boxSizing: 'border-box',
-                        pointerEvents: 'auto',
-                        transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
-                      }}
-                    />
+                    <>
+                      <div
+                        className="pointer-events-none shrink-0"
+                        style={{
+                          width: dotWidth,
+                          height: dotHeight,
+                          borderRadius: dotRadius,
+                          backgroundColor: isUnreachable && !isHovered && !displaysAsCompact ? 'transparent' : dotColor,
+                          border: isUnreachable && !isHovered && !displaysAsCompact ? `1px solid ${rewindMarkers.has(entry.uuid) ? '#ec4899' : hasNote && notePos === 'dot' ? '#9333ea' : dotColor}` : 'none',
+                          boxShadow: dotGlow,
+                          boxSizing: 'border-box',
+                          pointerEvents: 'auto',
+                          transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
+                        }}
+                      />
+                      {displaysAsCompact && compactClusterCount > 1 && !treeMode && (
+                        <span
+                          className="absolute pointer-events-none select-none"
+                          aria-label={`${compactClusterCount} compacts`}
+                          style={{
+                            left: 'calc(50% + 6px)',
+                            top: 'calc(50% - 7px)',
+                            zIndex: 1,
+                            color: '#f2bf58',
+                            fontFamily: 'monospace',
+                            fontSize: `${Math.max(8, Math.min(9, Math.round(timelineFontSize * 0.7)))}px`,
+                            fontWeight: 700,
+                            fontVariantNumeric: 'tabular-nums',
+                            lineHeight: 1,
+                            textShadow: '0 1px 2px rgba(0, 0, 0, 0.85)',
+                          }}
+                        >
+                          {compactClusterCount}
+                        </span>
+                      )}
+                    </>
                   )}
 
                   {/* Expanded layout: N-line preview text only (type is conveyed by dot color) */}
@@ -5766,10 +5789,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                     const promptSummary = summaryToolType && sessionId && isEligibleTabTitleEntry(entry)
                       ? promptSummaries[timelineSummaryKey(summaryToolType, sessionId, entry.uuid)]?.summary?.trim()
                       : '';
-                    const compactCount = codexCompactCluster?.count || 1;
                     let previewText = displaysAsCompact
                       ? (isCodex
-                          ? `compact${compactCount > 1 ? ` ×${compactCount}` : ''}`
+                          ? `compact${compactClusterCount > 1 ? ` ×${compactClusterCount}` : ''}`
                           : 'Conversation compacted')
                       : metaPrompt
                         ? `META · ${metaPrompt.title}`

@@ -3,6 +3,14 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { app } = require('electron');
+const {
+  emptyTaskPlan,
+  normalizeTaskPlan,
+  applyTaskPlanOperations,
+  undoTaskPlan,
+  redoTaskPlan,
+  chooseNewestTaskPlan,
+} = require('./tab-task-plan');
 const INBOX_PROJECT_ID = '__noted_inbox__';
 const INBOX_PROJECT_NAME = 'Inbox';
 const INBOX_PROJECT_DESCRIPTION = 'System workspace for API-created and unassigned agent tabs.';
@@ -121,6 +129,7 @@ class DatabaseManager {
         visual_snapshot TEXT DEFAULT NULL,
         color TEXT DEFAULT NULL,
         is_utility INTEGER DEFAULT 0,
+        task_plan TEXT DEFAULT NULL,
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
       )
     `);
@@ -146,6 +155,9 @@ class DatabaseManager {
     } catch (e) { /* column already exists */ }
     try {
       this.db.exec(`ALTER TABLE tabs ADD COLUMN notes TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE tabs ADD COLUMN task_plan TEXT DEFAULT NULL`);
     } catch (e) { /* column already exists */ }
     try {
       this.db.exec(`ALTER TABLE tabs ADD COLUMN command_type TEXT DEFAULT NULL`);
@@ -269,6 +281,7 @@ class DatabaseManager {
         cwd TEXT NOT NULL,
         color TEXT DEFAULT NULL,
         notes TEXT DEFAULT NULL,
+        task_plan TEXT DEFAULT NULL,
         command_type TEXT DEFAULT NULL,
         tab_type TEXT DEFAULT 'terminal',
         url TEXT DEFAULT NULL,
@@ -375,6 +388,7 @@ class DatabaseManager {
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN group_id TEXT DEFAULT NULL`); } catch (e) {}
     // Migration: linked file tabs preserve the absolute path across restart and Shift+Cmd+T restore.
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN file_path TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN task_plan TEXT DEFAULT NULL`); } catch (e) {}
 
     // Migration: add position to timeline_notes
     try { this.db.exec(`ALTER TABLE timeline_notes ADD COLUMN position TEXT DEFAULT 'before'`); } catch (e) {}
@@ -762,6 +776,7 @@ class DatabaseManager {
         wasInterrupted: t.was_interrupted === 1,
         overlayDismissed: t.overlay_dismissed === 1,
         notes: t.notes || '',
+        taskPlan: normalizeTaskPlan(t.task_plan),
         tabType: t.tab_type || 'terminal',
         url: t.url || undefined,
         filePath: t.file_path || undefined,
@@ -853,6 +868,40 @@ class DatabaseManager {
       console.error('[DB] getTabCacheStats error:', e.message);
       return null;
     }
+  }
+
+  getTabTaskPlan(tabId) {
+    if (!tabId) return emptyTaskPlan();
+    const row = this.db.prepare('SELECT task_plan FROM tabs WHERE tab_id = ? LIMIT 1').get(tabId);
+    return normalizeTaskPlan(row?.task_plan);
+  }
+
+  setTabTaskPlan(tabId, rawDocument) {
+    if (!tabId) throw new Error('tab_id_required');
+    const document = normalizeTaskPlan(rawDocument);
+    const info = this.db.prepare('UPDATE tabs SET task_plan = ? WHERE tab_id = ?')
+      .run(JSON.stringify(document), tabId);
+    if (info.changes === 0) throw new Error('tab_not_found');
+    return document;
+  }
+
+  applyTabTaskPlanOperations(tabId, operations, source = 'unknown') {
+    const current = this.getTabTaskPlan(tabId);
+    const result = applyTaskPlanOperations(current, operations, source);
+    if (result.changed) this.setTabTaskPlan(tabId, result.document);
+    return result;
+  }
+
+  undoTabTaskPlan(tabId, source = 'user') {
+    const result = undoTaskPlan(this.getTabTaskPlan(tabId), source);
+    if (result.changed) this.setTabTaskPlan(tabId, result.document);
+    return result;
+  }
+
+  redoTabTaskPlan(tabId, source = 'user') {
+    const result = redoTaskPlan(this.getTabTaskPlan(tabId), source);
+    if (result.changed) this.setTabTaskPlan(tabId, result.document);
+    return result;
   }
 
   // Direct one-tab update used by main.js's provider:switch / provider:set-options
@@ -1031,10 +1080,19 @@ class DatabaseManager {
       for (const r of rows) cacheStatsSnapshot.set(r.tab_id, r.cache_stats);
     }
 
+    // Task-plan writes can arrive directly from Terminal MCP while the renderer
+    // still holds an older tab snapshot. Keep the document with the highest
+    // revision so an unrelated rename/save cannot roll an MCP edit back.
+    const taskPlanSnapshot = new Map();
+    {
+      const rows = this.db.prepare('SELECT tab_id, task_plan FROM tabs WHERE project_id = ? AND tab_id IS NOT NULL').all(projectId);
+      for (const r of rows) taskPlanSnapshot.set(r.tab_id, r.task_plan);
+    }
+
     const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, external_run, was_interrupted, overlay_dismissed, notes, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, restart_after_tab_id, restart_after_tab_ids, restart_after_command, restart_after_paused, restart_after_armed, restart_after_persistent, claude_session_history, provider_state, context_pct, cache_stats)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, external_run, was_interrupted, overlay_dismissed, notes, task_plan, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, restart_after_tab_id, restart_after_tab_ids, restart_after_command, restart_after_paused, restart_after_armed, restart_after_persistent, claude_session_history, provider_state, context_pct, cache_stats)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
@@ -1083,7 +1141,14 @@ class DatabaseManager {
           ? Array.from(new Set(tab.restartAfterTabIds.filter((id) => typeof id === 'string' && id.trim())))
           : (tab.restartAfterTabId ? [tab.restartAfterTabId] : []);
         const restartAfterIdsJson = restartAfterIds.length > 0 ? JSON.stringify(restartAfterIds) : null;
-        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.codexSessionId || null, tab.codexModel || null, tab.codexEffort || null, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson);
+        const taskPlanDocument = chooseNewestTaskPlan(tab.taskPlan, taskPlanSnapshot.get(tab.tabId));
+        const taskPlanJson = taskPlanDocument.revision > 0
+          || taskPlanDocument.items.length > 0
+          || taskPlanDocument.history.past.length > 0
+          || taskPlanDocument.history.future.length > 0
+          ? JSON.stringify(taskPlanDocument)
+          : null;
+        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.codexSessionId || null, tab.codexModel || null, tab.codexEffort || null, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', taskPlanJson, tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set
@@ -1115,8 +1180,8 @@ class DatabaseManager {
     }
     const now = Math.floor(Date.now() / 1000);
     const info = this.db.prepare(`
-      INSERT INTO tab_history (project_id, name, name_set_manually, cwd, color, notes, command_type, tab_type, url, file_path, created_at, closed_at, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, message_count, position, process_was_running, session_status, group_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tab_history (project_id, name, name_set_manually, cwd, color, notes, task_plan, command_type, tab_type, url, file_path, created_at, closed_at, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, message_count, position, process_was_running, session_status, group_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       projectId,
       tab.name,
@@ -1124,6 +1189,7 @@ class DatabaseManager {
       tab.cwd,
       tab.color || null,
       tab.notes || null,
+      tab.taskPlan ? JSON.stringify(normalizeTaskPlan(tab.taskPlan)) : null,
       tab.commandType || null,
       tabType,
       tab.url || null,

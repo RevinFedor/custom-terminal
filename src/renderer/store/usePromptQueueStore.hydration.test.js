@@ -50,12 +50,26 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   t.after(() => { delete global.window; });
 
   const queueModule = require(outfile);
+  assert.equal(queueModule.isPromptQueueStoreHydrated(), false);
+  let hydrationNotifications = 0;
+  const unsubscribeHydration = queueModule.subscribePromptQueueHydration(() => {
+    hydrationNotifications += 1;
+  });
   assert.equal(queueModule.getShortGrabPromptTitle('  коротко  '), 'коротко');
   assert.equal(queueModule.getShortGrabPromptTitle('первая\nстрока'), 'первая строка');
   assert.equal(queueModule.getShortGrabPromptTitle('a'.repeat(24)), 'a'.repeat(24));
   assert.equal(queueModule.getShortGrabPromptTitle('a'.repeat(25)), null);
   const hydration = queueModule.hydratePromptQueueStore();
   const newId = queueModule.usePromptQueueStore.getState().addPrompt('tab-1', 'new prompt');
+  const originalDateNowBeforeHydration = Date.now;
+  let mergedRuntimeId;
+  try {
+    Date.now = () => 5_000;
+    mergedRuntimeId = queueModule.usePromptQueueStore.getState().addPrompt('tab-merge-arm', 'runtime prompt');
+    queueModule.usePromptQueueStore.getState().setAutoRun('tab-merge-arm', true);
+  } finally {
+    Date.now = originalDateNowBeforeHydration;
+  }
   const firstAssetId = 'a'.repeat(64) + '.png';
   const secondAssetId = 'b'.repeat(64) + '.png';
   rawState.resolve({
@@ -80,18 +94,111 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
       panelCollapsed: false,
       previewId: null,
     },
+    'tab-persisted-arm': {
+      items: [{ id: 'persisted-armed-item', text: 'persisted armed', createdAt: 2 }],
+      autoRun: true,
+      workflowArmedAt: 777,
+    },
+    'tab-stale-target': {
+      items: [{ id: 'persisted-stale-item', text: 'wait on missing tab', createdAt: 4 }],
+      autoRun: true,
+      runAfterTabId: 'closed-target',
+      workflowArmedAt: 888,
+    },
+    'tab-merge-arm': {
+      items: [{ id: 'persisted-merge-item', text: 'persisted merge', createdAt: 3 }],
+      autoRun: false,
+      workflowArmedAt: 111,
+    },
   });
   await hydration;
+  unsubscribeHydration();
+  assert.equal(queueModule.isPromptQueueStoreHydrated(), true);
+  assert.equal(hydrationNotifications, 1);
 
   const queue = queueModule.usePromptQueueStore.getState().getQueue('tab-1');
   assert.deepEqual(queue.items.map((item) => item.id), ['persisted-item', newId]);
   assert.equal(queue.autoRun, true);
   assert.equal(queue.firstChipHintActive, false);
+  assert.equal(queue.workflowArmedAt, null, 'legacy persisted workflow remains fail-closed');
+  assert.equal(queueModule.hasRuntimeWorkflowArm('tab-1'), false);
+  assert.equal(queueModule.usePromptQueueStore.getState().getQueue('tab-persisted-arm').workflowArmedAt, 777);
+  assert.equal(queueModule.hasRuntimeWorkflowArm('tab-persisted-arm'), false);
+  queueModule.usePromptQueueStore.getState().clearStaleRunAfterTab('tab-stale-target', 'different-target');
+  assert.equal(queueModule.usePromptQueueStore.getState().getQueue('tab-stale-target').runAfterTabId, 'closed-target');
+  queueModule.usePromptQueueStore.getState().clearStaleRunAfterTab('tab-stale-target', 'closed-target');
+  const repairedStaleTarget = queueModule.usePromptQueueStore.getState().getQueue('tab-stale-target');
+  assert.equal(repairedStaleTarget.runAfterTabId, null);
+  assert.equal(repairedStaleTarget.workflowArmedAt, 888);
+  assert.equal(queueModule.hasRuntimeWorkflowArm('tab-stale-target'), false);
+  assert.equal(queueModule.consumeAutomaticRunAfterTargetClear('tab-stale-target'), true);
+  assert.equal(queueModule.consumeAutomaticRunAfterTargetClear('tab-stale-target'), false);
+  const mergedRuntimeQueue = queueModule.usePromptQueueStore.getState().getQueue('tab-merge-arm');
+  assert.deepEqual(mergedRuntimeQueue.items.map((item) => item.id), ['persisted-merge-item', mergedRuntimeId]);
+  assert.equal(mergedRuntimeQueue.autoRun, true);
+  assert.equal(mergedRuntimeQueue.workflowArmedAt, 5_000);
+  assert.equal(queueModule.hasRuntimeWorkflowArm('tab-merge-arm'), true);
   assert.equal(queueModule.getQueuedPromptAttachmentState(queue.items[0]), 'ready');
   assert.equal(
     queueModule.buildQueuedPromptPayload({ text: '[Image]', imagePaths: [] }),
     '[imageError: queued_image_path_unavailable #unknown]',
   );
+
+  const legacyDisarmed = queueModule.usePromptQueueStore.getState().disarmQueuesForTrigger('tab-1', null);
+  assert.deepEqual(legacyDisarmed, ['tab-1']);
+  assert.equal(queueModule.usePromptQueueStore.getState().getQueue('tab-1').autoRun, false);
+  assert.equal(queueModule.usePromptQueueStore.getState().getQueue('tab-1').items.length, 2);
+
+  const realDateNow = Date.now;
+  let fakeNow = 10_000;
+  Date.now = () => fakeNow;
+  try {
+    const store = queueModule.usePromptQueueStore.getState();
+    store.addPrompt('tab-arm', 'keep me');
+    store.setAutoRun('tab-arm', true);
+    assert.equal(store.getQueue('tab-arm').workflowArmedAt, 10_000);
+    assert.equal(queueModule.hasRuntimeWorkflowArm('tab-arm'), true);
+
+    fakeNow = 20_000;
+    store.setStopAfter('tab-arm', true);
+    assert.equal(
+      store.getQueue('tab-arm').workflowArmedAt,
+      10_000,
+      'adding Stop-after to active Run-after must not bless the older workflow',
+    );
+
+    store.setRunAfterTab('tab-arm', 'tab-target');
+    assert.equal(store.getQueue('tab-arm').workflowArmedAt, 20_000);
+    fakeNow = 30_000;
+    store.setRunAfterTab('tab-arm', null);
+    assert.equal(store.getQueue('tab-arm').workflowArmedAt, 30_000);
+
+    assert.deepEqual(store.disarmQueuesForTrigger('tab-arm', null), []);
+    assert.deepEqual(store.disarmQueuesForTrigger('tab-arm', 29_999), []);
+    assert.equal(store.getQueue('tab-arm').autoRun, true);
+    assert.deepEqual(store.disarmQueuesForTrigger('tab-arm', 30_000), ['tab-arm']);
+    assert.equal(store.getQueue('tab-arm').autoRun, false);
+    assert.equal(store.getQueue('tab-arm').workflowArmedAt, null);
+    assert.equal(store.getQueue('tab-arm').items.length, 1, 'abnormal outcome preserves queued work');
+
+    fakeNow = 40_000;
+    const enableId = store.addPrompt('tab-enable-edge', 'disabled then enabled');
+    store.updatePrompt('tab-enable-edge', enableId, { enabled: false });
+    store.setAutoRun('tab-enable-edge', true);
+    assert.equal(store.getQueue('tab-enable-edge').workflowArmedAt, 40_000);
+    fakeNow = 50_000;
+    store.updatePrompt('tab-enable-edge', enableId, { enabled: true });
+    assert.equal(store.getQueue('tab-enable-edge').workflowArmedAt, 50_000);
+
+    fakeNow = 60_000;
+    store.setAutoRun('tab-add-edge', true);
+    assert.equal(store.getQueue('tab-add-edge').workflowArmedAt, 60_000);
+    fakeNow = 70_000;
+    store.addPrompt('tab-add-edge', 'arrived while armed');
+    assert.equal(store.getQueue('tab-add-edge').workflowArmedAt, 70_000);
+  } finally {
+    Date.now = realDateNow;
+  }
 
   queueModule.flushPromptQueueStoreSync();
   assert.equal(syncWrites.length, 1);
@@ -101,6 +208,14 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
     saved['tab-1'].items[0].imagePaths.map((ref) => ref.assetId),
     [firstAssetId, secondAssetId],
   );
+  assert.equal(saved['tab-persisted-arm'].workflowArmedAt, 777);
+  assert.equal(saved['tab-merge-arm'].workflowArmedAt, 5_000);
+  assert.equal(saved['tab-enable-edge'].workflowArmedAt, 50_000);
+  assert.equal(saved['tab-add-edge'].workflowArmedAt, 70_000);
+  queueModule.usePromptQueueStore.getState().cleanupClosedTab('tab-add-edge');
+  assert.equal(queueModule.hasRuntimeWorkflowArm('tab-add-edge'), false);
+  queueModule.usePromptQueueStore.getState().clearQueue('tab-enable-edge');
+  assert.equal(queueModule.hasRuntimeWorkflowArm('tab-enable-edge'), false);
 
   assert.deepEqual(
     queueModule.getQueuedImageMarkerHighlightRanges(queue.items[0].text, queue.items[0].imagePaths)

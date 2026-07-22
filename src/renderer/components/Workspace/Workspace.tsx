@@ -10,14 +10,10 @@ import ProjectToolbar from './ProjectToolbar';
 import ProjectHome from './ProjectHome';
 import TerminalArea from './TerminalArea';
 import Timeline from './Timeline';
-// NotesPanel deleted — заметки переехали в TabNotesSlideout (Cmd+E).
-// import NotesPanel from './NotesPanel';
 import '../../utils/sidebarBridge'; // Init window.electronAPI bridge
 import Sidebar from './Sidebar';
 import FilePreview from './FilePreview';
-// Resizer was used only by the deleted right-side NotesPanel column.
-// import Resizer from './Resizer';
-import TabNotesSlideout from './TabNotesSlideout';
+import TabTaskPlanPanel from './TabTaskPlanPanel';
 import HistoryPanel from './HistoryPanel';
 import ClaudeControlBar from './ClaudeControlBar';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from '../../constants/systemProjects';
@@ -520,27 +516,6 @@ export default function Workspace() {
     // Terminal will auto-refit via ResizeObserver
   }, []);
 
-  // CMD+E toggles the per-tab notes slide-out (the "Open" button next to
-  // "ЗАМЕТКИ ВКЛАДКИ"). File-explorer sidebar is handled by Cmd+B separately.
-  // Layout-agnostic via e.code='KeyE' (см. methodology/design.md::Layout-agnostic
-  // shortcuts) — иначе на Cyrillic шорткат молча отвалится.
-  // Раньше слот занимал Cmd+J; перенесён на Cmd+E по запросу юзера (16.05.2026).
-  // Cmd+E одновременно перестал быть alias'ом на Opt+V prompt picker — picker
-  // остался только на Opt+V.
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (workspaceView !== 'workspace') return;
-      if (e.metaKey && !e.altKey && !e.ctrlKey && !e.shiftKey && e.code === 'KeyE' && activeTabId) {
-        e.preventDefault();
-        const cur = useUIStore.getState().notesPanelOpenTabs[activeTabId] ?? false;
-        useUIStore.getState().setNotesPanelOpen(activeTabId, !cur);
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeTabId, workspaceView]);
-
   // CMD+] / Option+] hotkeys to toggle history panel
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -750,8 +725,7 @@ export default function Workspace() {
         <ProjectToolbar isSystemProject={isInboxProject} />
       </div>
 
-      {/* MAIN ROW: two columns now — TabSidebar | Terminal. Right NotesPanel
-          column was removed (заметки переехали в TabNotesSlideout). */}
+      {/* MAIN ROW: TabSidebar | Terminal. */}
       <div className="flex-1 flex min-h-0 relative">
       {/* LEFT COLUMN: vertical tab sidebar */}
       <TabSidebar projectId={activeProjectId} />
@@ -769,6 +743,13 @@ export default function Workspace() {
           {/* Terminal content — overflow hidden clips HistoryPanel slide animation */}
           <div className="flex-1 relative min-w-0 overflow-hidden">
             <TerminalArea projectId={activeProjectId} />
+
+            {effectiveTab && currentView === 'terminal' && (
+              <TabTaskPlanPanel
+                tabId={effectiveTab.id}
+                projectPath={currentProject.path}
+              />
+            )}
 
             {/* Search Bar (Cmd+F) - only in terminal view */}
             {currentView === 'terminal' && showSearch && (
@@ -895,11 +876,6 @@ export default function Workspace() {
         )}
       </div>
 
-      {/* Right NotesPanel column removed — заметки переехали в TabNotesSlideout
-          (открывается по Cmd+E или по клику кнопки в активной вкладке TabSidebar).
-          InfoPanel (project Info содержимое) тоже больше не рендерится постоянно —
-          его прежний правый сайдбар удалён вместе с NotesPanel'ом. */}
-
       </div>{/* /MAIN ROW */}
 
       {/* Global Overlays */}
@@ -983,11 +959,6 @@ export default function Workspace() {
           document.body
         );
       })()}
-
-      {/* Per-tab Notes slide-out — binds to whichever tab is flagged in
-          useUIStore.notesPanelOpenTabs (one-at-a-time). Doesn't need activeTabId
-          prop since opening on a non-active tab is now a supported gesture. */}
-      <TabNotesSlideout />
 
     </div>
   );

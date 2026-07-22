@@ -35,6 +35,7 @@
     "files": [
       "dist/**/*",
       "src/main/**/*",
+      "src/shared/**/*",
       "build-resources/icon.png",
       "build-resources/icon-dev.png",
       "mobile-web/dist/**/*",
@@ -43,7 +44,7 @@
     ],
     "extraResources": [
       {
-        "from": "packages/file-explorer/main",
+        "from": "../noted-shared/packages/file-explorer/main",
         "to": "shared-packages/file-explorer"
       }
     ],

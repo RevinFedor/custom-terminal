@@ -3,6 +3,7 @@ import { getBusyTabsSnapshot } from './usePromptQueueRunner';
 import { useGitRunAfterStore, type GitRunAfterTask } from '../store/useGitRunAfterStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
+import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -11,21 +12,6 @@ type BusyStatePayload = {
   busy: boolean;
   reason?: string;
 };
-
-const NON_NATURAL_END_REASONS = new Set([
-  'manual-stop',
-  'error',
-  'interrupt',
-  'watchdog',
-  'turn_aborted',
-  'send-command-failed',
-  'send-command-error',
-  'command-finished',
-  'pty-exit',
-  'terminal-kill',
-  'replace',
-  'close',
-]);
 
 const previousBusy = new Map<string, boolean>();
 const inflightTasks = new Set<string>();
@@ -108,7 +94,13 @@ export function useGitRunAfterRunner(): void {
           .filter((task) => task.phase === 'waiting' && task.triggerTabId === tabId);
         if (!waiting.length) return;
 
-        if (!busy && payload?.reason && NON_NATURAL_END_REASONS.has(payload.reason)) {
+        // local-command is a non-turn UI bracket, not success or failure.
+        if (payload?.reason === 'local-command') return;
+
+        // Fail closed for every explicit, non-success outcome. A blacklist made
+        // new reasons (for example codex-descendants-exited) look successful and
+        // could run Git work after a false lifecycle edge.
+        if (!busy && !isNaturalAgentTurnEndReason(payload?.reason)) {
           for (const task of waiting) {
             useGitRunAfterStore.getState().clearTask(task.projectKey, task.id);
           }
@@ -117,7 +109,7 @@ export function useGitRunAfterRunner(): void {
           return;
         }
 
-        if (payload?.reason === 'local-command' || !wasBusy || busy) return;
+        if (!wasBusy || busy) return;
         for (const task of waiting) void executeTask(task);
       };
 
