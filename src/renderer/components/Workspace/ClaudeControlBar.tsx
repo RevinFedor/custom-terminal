@@ -16,6 +16,7 @@ import {
   type CodexModelOption,
 } from '../../constants/codexSettings';
 import CenteredUpwardPopover from '../UI/CenteredUpwardPopover';
+import ControlHint from '../UI/ControlHint';
 import { PROVIDER_CATALOG } from './providerCatalog';
 import SessionActionChip from './SessionActionChip';
 import MicButton from './MicButton';
@@ -27,11 +28,13 @@ import {
 import { useCmdKey } from '../../hooks/useCmdHoverPopover';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { getHistoryAgentRuntime, type AgentPtyStatus } from '../../utils/historyAgentRuntimes';
+import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 
 const { ipcRenderer } = window.require('electron');
 
 interface Props {
   tabId: string;
+  projectId: string;
   // Session info — supplied by Workspace.tsx via effective* selectors.
   claudeSessionId: string | null;
   geminiSessionId: string | null;
@@ -180,6 +183,7 @@ function CacheCooldownChip({
 // and closes. Click-outside closes without a pick.
 export default function ClaudeControlBar({
   tabId,
+  projectId,
   claudeSessionId,
   geminiSessionId,
   codexSessionId,
@@ -430,15 +434,35 @@ export default function ClaudeControlBar({
     return false;
   };
 
+  const requireCodexActionSessionId = async (
+    operation: string,
+    requireMutationSafe = false,
+  ): Promise<string | null> => {
+    try {
+      return await requireCodexSurfaceSessionId({
+        tabId,
+        historicalSessionId: codexSessionId,
+        operation,
+        requireMutationSafe,
+      });
+    } catch (error: any) {
+      showToast(error?.message || `Не удалось проверить Codex-сессию перед действием «${operation}»`, 'warning');
+      return null;
+    }
+  };
+
   const copySessionId = async () => {
-    if (!sessionId) return;
+    const actionSessionId = sessionType === 'codex'
+      ? await requireCodexActionSessionId('скопировать ID сессии')
+      : sessionId;
+    if (!actionSessionId) return;
     if (!(await ensureClaudeArtifactSession('copy-session-id'))) return;
     // Electron clipboard, не navigator.clipboard — последний в renderer тихо
     // отваливается без HTTPS/permissions, юзер видит как «даже логов нет».
     // См. CLAUDE.md anti-pattern «Не используй navigator.clipboard в renderer».
     try {
       const { clipboard } = window.require('electron');
-      clipboard.writeText(sessionId);
+      clipboard.writeText(actionSessionId);
       setSessionCopied(true);
       setTimeout(() => setSessionCopied(false), 1000);
     } catch (e) {
@@ -710,7 +734,7 @@ export default function ClaudeControlBar({
       return;
     }
     try {
-      const presence = await getHistoryAgentRuntime(engine).getPresence(tabId);
+      const presence = await getHistoryAgentRuntime(engine).getPresence(tabId, projectId);
       if (seq !== sessionActionProbeSeqRef.current) return;
       const next: SessionActionBlockedStatus =
         presence.status === 'starting' || presence.status === 'stopping'
@@ -721,7 +745,7 @@ export default function ClaudeControlBar({
       if (seq !== sessionActionProbeSeqRef.current) return;
       console.warn('[SessionActionChip] presence failed tab=' + tabId.slice(-12) + ' type=' + (engine || '-') + ' reason=' + reason + ' error=' + String(e?.message || e));
     }
-  }, [ptyTransitionEngine, setSessionActionBlockedStatusIfChanged, tabId]);
+  }, [projectId, ptyTransitionEngine, setSessionActionBlockedStatusIfChanged, tabId]);
   const setLocalBusy = (busy: boolean, reason: string) => {
     console.log('[ControlBarLoader] local-set tab=' + tabId.slice(-12) + ' type=' + sessionType + ' reason=' + reason + ' busy=' + busy + ' paste=' + isPasteBusy + ' local=' + isLocalBusy + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
     localBusyReasonRef.current = busy ? reason : null;
@@ -759,10 +783,6 @@ export default function ClaudeControlBar({
       return;
     }
     void refreshSessionActionBlockedStatus('bind');
-    const interval = window.setInterval(() => {
-      void refreshSessionActionBlockedStatus('poll');
-    }, 1000);
-    return () => window.clearInterval(interval);
   }, [ptyTransitionEngine, refreshSessionActionBlockedStatus, setSessionActionBlockedStatusIfChanged]);
 
   useEffect(() => {
@@ -790,6 +810,18 @@ export default function ClaudeControlBar({
       setSessionActionBlockedStatusIfChanged(null, 'codex-ready');
       void refreshSessionActionBlockedStatus('codex-ready');
     };
+    const onAgentBusy = (_: any, data: { tabId?: string; busy?: boolean }) => {
+      if (data?.tabId !== tabId || data?.busy !== true) return;
+      setSessionActionBlockedStatusIfChanged(null, ptyTransitionEngine + '-busy');
+    };
+    const onCodexNotReady = (_: any, data: { tabId?: string; reason?: string | null }) => {
+      if (ptyTransitionEngine !== 'codex' || data?.tabId !== tabId) return;
+      void refreshSessionActionBlockedStatus('codex-not-ready:' + (data.reason || '-'));
+    };
+    const onCodexManualAction = (_: any, data: { tabId?: string }) => {
+      if (ptyTransitionEngine !== 'codex' || data?.tabId !== tabId) return;
+      void refreshSessionActionBlockedStatus('codex-manual-action');
+    };
     const onAgentStopping = (_: any, data: { tabId?: string; toolType?: string | null; stopping?: boolean }) => {
       if (!eventBelongsHere(data?.tabId, data?.toolType || null)) return;
       if (data?.stopping) {
@@ -802,12 +834,20 @@ export default function ClaudeControlBar({
     ipcRenderer.on('terminal:command-finished', onCommandFinished);
     ipcRenderer.on('claude:tui-ready', onClaudeReady);
     ipcRenderer.on('codex:tui-ready', onCodexReady);
+    ipcRenderer.on('claude:busy-state', onAgentBusy);
+    ipcRenderer.on('codex:busy-state', onAgentBusy);
+    ipcRenderer.on('codex:tui-not-ready', onCodexNotReady);
+    ipcRenderer.on('codex:tui-manual-action-required', onCodexManualAction);
     ipcRenderer.on('agent:stopping-state', onAgentStopping);
     return () => {
       ipcRenderer.removeListener('terminal:command-started', onCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', onCommandFinished);
       ipcRenderer.removeListener('claude:tui-ready', onClaudeReady);
       ipcRenderer.removeListener('codex:tui-ready', onCodexReady);
+      ipcRenderer.removeListener('claude:busy-state', onAgentBusy);
+      ipcRenderer.removeListener('codex:busy-state', onAgentBusy);
+      ipcRenderer.removeListener('codex:tui-not-ready', onCodexNotReady);
+      ipcRenderer.removeListener('codex:tui-manual-action-required', onCodexManualAction);
       ipcRenderer.removeListener('agent:stopping-state', onAgentStopping);
     };
   }, [ptyTransitionEngine, refreshSessionActionBlockedStatus, setSessionActionBlockedStatusIfChanged, tabId]);
@@ -1581,6 +1621,10 @@ export default function ClaudeControlBar({
       window.dispatchEvent(new CustomEvent('claude-sdk:focus-composer', { detail: { tabId } }));
       return;
     }
+    const codexContinueSessionId = sessionType === 'codex'
+      ? await requireCodexActionSessionId('продолжить Codex-сессию')
+      : null;
+    if (sessionType === 'codex' && !codexContinueSessionId) return;
     const actionReason = 'session-continue:' + sessionType;
     if (!beginSessionLifecycleAction(actionReason)) return;
     const store = useWorkspaceStore.getState();
@@ -1612,7 +1656,7 @@ export default function ClaudeControlBar({
         terminalRegistry.get(tabId)?.scrollToBottom();
         focusTerminal();
         window.dispatchEvent(new CustomEvent('timeline:scroll-to-bottom', { detail: { tabId } }));
-        ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex-c', sessionId: codexSessionId || undefined, cwd: launchCwd }));
+        ipcRenderer.send('codex:run-command', codexRunPayload({ tabId, command: 'codex-c', sessionId: codexContinueSessionId || undefined, cwd: launchCwd }));
       }
     } catch (e) {
       clearSessionLifecycleAction(actionReason + ':clear');
@@ -1767,7 +1811,11 @@ export default function ClaudeControlBar({
   // never a launch target. Always create a neighbour tab; in-place reuse is only
   // valid for clipboard `*-F` chips on a pristine PTY tab.
   const forkToTab = async () => {
-    if (!sessionId || !tabId || !sessionType) return;
+    if (!tabId || !sessionType) return;
+    const actionSessionId = sessionType === 'codex'
+      ? await requireCodexActionSessionId('создать fork Codex-сессии', true)
+      : sessionId;
+    if (!actionSessionId) return;
     if (!(await ensureClaudeArtifactSession('fork-to-tab'))) return;
     const state = useWorkspaceStore.getState();
     for (const [projectId, workspace] of state.openProjects) {
@@ -1776,7 +1824,7 @@ export default function ClaudeControlBar({
       const currentCwd = tab.cwd || projectPath || '';
       const forkName = tab.name ? `${tab.name}_fork` : undefined;
       await state.createTabAfterCurrent(projectId, forkName, currentCwd, {
-        pendingAction: { type: sessionType === 'claude' ? 'claude-fork' : sessionType === 'codex' ? 'codex-fork' : 'gemini-fork', sessionId },
+        pendingAction: { type: sessionType === 'claude' ? 'claude-fork' : sessionType === 'codex' ? 'codex-fork' : 'gemini-fork', sessionId: actionSessionId },
         nameSetManually: sessionType === 'gemini' ? !!forkName : false,
         afterTabId: tab.id,
         visualParentTabId: tab.id,
@@ -2266,6 +2314,7 @@ export default function ClaudeControlBar({
                 : alive ? 'Процесс активен — нажмите, чтобы полностью остановить'
                 : 'Процесс остановлен — нажмите, чтобы запустить';
               return (
+                <ControlHint label={sdkStopping ? 'Останавливаю SDK-процесс…' : alive ? 'Полностью остановить SDK-процесс' : 'Запустить SDK-процесс'}>
                 <span
                   onClick={onClick}
                   title={title}
@@ -2289,6 +2338,7 @@ export default function ClaudeControlBar({
                   />
                   {label}
                 </span>
+                </ControlHint>
               );
             })()
           ) : (
@@ -2305,6 +2355,7 @@ export default function ClaudeControlBar({
             />
           )}
           {hasArtifactSession && (
+            <ControlHint label="Обновить Timeline">
             <button
               className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer transition-colors"
               style={{
@@ -2331,6 +2382,7 @@ export default function ClaudeControlBar({
               onClick={refreshTimeline}
               title="Refresh timeline"
             >↻</button>
+            </ControlHint>
           )}
         </div>
         {showSessionIdTooltip && sessionCopyRect && sessionId && (
@@ -2495,6 +2547,7 @@ export default function ClaudeControlBar({
               flexShrink: 0,
             }}
           >
+            <ControlHint label="Скопировать текущий prompt" shortcut="Текст останется в поле">
             <button
               onClick={() => handleCopyPrompt(false)}
               className="inline-flex items-center gap-1 cursor-pointer hover:bg-[rgba(255,255,255,0.06)] hover:text-white transition-colors"
@@ -2504,7 +2557,9 @@ export default function ClaudeControlBar({
               <span style={{ fontSize: 12, lineHeight: 1 }}>⎘</span>
               <span>prompt</span>
             </button>
+            </ControlHint>
             <span style={{ width: 1, alignSelf: 'center', height: '70%', backgroundColor: 'rgba(255,255,255,0.12)' }} />
+            <ControlHint label="Скопировать и очистить prompt">
             <button
               onClick={() => handleCopyPrompt(true)}
               className="inline-flex items-center gap-0.5 cursor-pointer hover:bg-[rgba(255,255,255,0.06)] hover:text-white transition-colors"
@@ -2514,6 +2569,7 @@ export default function ClaudeControlBar({
               <span>+</span>
               <span>clear</span>
             </button>
+            </ControlHint>
           </div>
         )}
 
@@ -2527,6 +2583,7 @@ export default function ClaudeControlBar({
         {showLivePtyInputActions && (
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
             <MicButton tabId={tabId} sessionType={sessionType} />
+            <ControlHint label={enterPending ? 'Жду доставку диктовки…' : 'Отправить текущий ввод'}>
             <button
               onMouseDown={(e) => e.preventDefault()}
               onClick={sendEnterToPty}
@@ -2558,6 +2615,8 @@ export default function ClaudeControlBar({
                 </svg>
               ) : 'Enter'}
             </button>
+            </ControlHint>
+            <ControlHint label="Отправить Ctrl+C в живой CLI" shortcut="Результат зависит от текущего экрана">
             <button
               onMouseDown={(e) => e.preventDefault()}
               onClick={sendCtrlCToPty}
@@ -2603,6 +2662,7 @@ export default function ClaudeControlBar({
               />
               <span>^C</span>
             </button>
+            </ControlHint>
           </div>
         )}
 

@@ -33,6 +33,7 @@ import {
   useDictationSnapshot,
 } from '../../utils/dictationManager';
 import { DictationHistoryPopover } from './DictationHistoryButton';
+import ControlHint from '../UI/ControlHint';
 
 export {
   DICTATION_DELIVERED_EVENT,
@@ -129,6 +130,11 @@ export default function MicButton({ tabId }: Props) {
 
   return (
     <>
+      <ControlHint
+        label="Начать голосовую диктовку"
+        modifiedAction="⌘ клик — открыть историю диктовок"
+        disabled={recording || stopping || disabledByOtherTab || historyOpen}
+      >
       <button
         ref={btnRef}
         onClick={onClick}
@@ -188,6 +194,7 @@ export default function MicButton({ tabId }: Props) {
           />
         )}
       </button>
+      </ControlHint>
 
       {recording && (
         <FloatingTranscript

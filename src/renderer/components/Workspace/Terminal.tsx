@@ -603,7 +603,7 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
     case 'codex-continue':
       if (pendingAction.sessionId) {
         getSetTabCommandType()(tabId, 'codex');
-        getSetCodexSessionId()(tabId, pendingAction.sessionId, 'userIntercept');
+        // pendingAction.sessionId is a resume target, not active-writer proof.
         console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex-c" }');
         ipcRenderer.send('codex:run-command', buildCodexRunPayload({
           tabId,
@@ -1144,7 +1144,7 @@ async function finalizeAiLaunchSnapshot(tabId: string) {
       return;
     }
     console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=' + snapshot.sessionType + ' result=no-session-id → discard session artifact');
-    store.discardUnmaterializedAiLaunchSession(tabId, 'no-session-id-after-finish');
+    await store.discardUnmaterializedAiLaunchSession(tabId, 'no-session-id-after-finish');
     return;
   }
 
@@ -1162,7 +1162,7 @@ async function finalizeAiLaunchSnapshot(tabId: string) {
     console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=' + snapshot.sessionType + ' sid=' + tabInfo.sessionId.slice(0, 8) + ' success=' + !!result?.success + ' entries=' + entries + (result?.error ? ' error=' + result.error : ''));
     if (result?.success && entries === 0) {
       console.warn('[AiLaunchFinalize] tab=' + tabId.slice(-8) + ' type=' + snapshot.sessionType + ' result=empty-timeline → discard session artifact');
-      store.discardUnmaterializedAiLaunchSession(tabId, 'empty-timeline-after-finish');
+      await store.discardUnmaterializedAiLaunchSession(tabId, 'empty-timeline-after-finish');
     } else {
       store.clearAiLaunchSnapshot(tabId, 'timeline-entries=' + entries);
     }
@@ -2173,10 +2173,14 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       getSetTabCommandType()(tabId, 'gemini');
     };
 
-    const handleCodexSessionDetected = (_: any, data: { tabId: string; sessionId: string }) => {
+    const handleCodexSessionDetected = (_: any, data: { tabId: string; sessionId: string; writerProven?: boolean; writerProof?: string }) => {
       if (data.tabId !== tabId) return;
+      if (data.writerProven !== true) {
+        console.warn('[Terminal] Ignoring unproven Codex session detection:', data.sessionId, 'proof:', data.writerProof || 'none');
+        return;
+      }
       console.log('[Terminal] Codex session detected:', data.sessionId);
-      getSetCodexSessionId()(tabId, data.sessionId);
+      getSetCodexSessionId()(tabId, data.sessionId, 'detected');
       getSetTabCommandType()(tabId, 'codex');
       // Same reason as Claude bridge/session detection: Codex can be restored or
       // launched through a path where the OSC command-started marker was missed.
@@ -2670,7 +2674,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             return false;
           }
           ipcRenderer.send('terminal:input', tabId, '\x15');
-          getSetCodexSessionId()(tabId, resumeId, 'userIntercept');
+          // The typed ID remains launch intent until main proves the open rollout.
           ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: resumeId, cwd }));
           return false;
         }
@@ -3141,7 +3145,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
               return false;
             }
             ipcRenderer.send('terminal:input', tabId, '\x15');
-            getSetCodexSessionId()(tabId, resumeId, 'userIntercept');
+            // The typed ID remains launch intent until main proves the open rollout.
             const cwd2 = getTabCwd(tabId);
             ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: resumeId, cwd: cwd2 }));
             return false;

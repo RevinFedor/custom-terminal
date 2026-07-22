@@ -67,6 +67,16 @@ Restore обязан различать два случая. Если project ro
 ### Safe saveTabs — targeted DELETE + INSERT
 Метод `saveTabs` использует **точечный DELETE по `tab_id`** вместо `DELETE ALL + re-INSERT`. Защита от потери данных если in-memory Map неполный (race conditions, параллельные IPC). Для batch-операций (перенос 3+ табов, массовое закрытие) флаг `forceCleanup` обходит safety guard. Детали: [`fix-save-tabs-data-loss.md`](fix-save-tabs-data-loss.md).
 
+Ответ сохранения является durability-контрактом, а не best effort: consumer принимает только явный строгий ACK. Отсутствующий project row, исключение или неявный/пустой ответ не разрешают удалять history-запись либо публиковать межпроектный перенос как завершённый.
+
+### Main-owned Codex identity и ownership вкладки
+
+Текущая живая Codex-сессия определяется в main по process-to-writable-rollout proof и сохраняется там же точечной записью. Общий renderer snapshot может ещё содержать Resume source, поэтому `saveTabs` сохраняет уже лежащий в SQLite `codex_session_id` для существующей строки, а не перезаписывает его менее свежей копией интерфейса. После остановки это поле снова является durable точкой Resume; во время живого процесса оно не заменяет writer proof.
+
+`tabs.tab_id` теперь непустой и глобально уникальный на уровне SQLite. Это закрывает production-класс, где один `new_project_…-tab-60` существовал в двух проектах и unscoped UPDATE менял обе строки. Legacy-дубли мигрируются детерминированно: одна каноническая строка сохраняет ID, остальные получают новые ID, а project-scoped ссылки переписываются вместе с ними. Несмотря на unique constraint, point-операции продолжают передавать `project_id + tab_id`: уникальность защищает целостность, project scope остаётся границей владения.
+
+Межпроектный DnD сначала делает исходную вкладку durable, затем одной main-транзакцией переносит tab row, связанные ссылки и PTY owner. Renderer меняет обе рабочие области только после ACK; любая ошибка оставляет вкладку в исходном проекте без половинчатого SQLite/PTY-переноса. Generic `saveTabs` при этом сохраняет main-owned Codex writer поверх устаревшей renderer-копии, поэтому поздний full snapshot не откатывает живую привязку.
+
 ### Transaction safety для global commands & prompts
 Методы `saveGlobalCommands()` и `savePrompts()` обёрнуты в `db.transaction()` с **empty-array guard**: если передан пустой массив при наличии данных в БД, удаление блокируется и логируется. Защита от потери пользовательских данных из-за багов рендерера (например, racy initial state до hydration).
 

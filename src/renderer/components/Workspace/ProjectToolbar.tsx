@@ -2,6 +2,7 @@ import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import { Home, Minimize2, RotateCcw, Globe, PanelLeft, FileEdit, RefreshCw, Sparkles, Settings2, Check, ListTree } from 'lucide-react';
 import { VscVscode } from 'react-icons/vsc';
 import { useUIStore } from '../../store/useUIStore';
+import ControlHint from '../UI/ControlHint';
 import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
@@ -400,7 +401,6 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
           sessionId: tab.codexSessionId,
           cwd: tab.cwd,
         }));
-        ipcRenderer.send('terminal:force-command-started', { tabId: tab.id, commandType: 'codex', sessionId: tab.codexSessionId });
       } else if (tab.claudeSessionId) {
         setTabCommandType(tab.id, 'claude');
         // Arm the per-tab stale-bridge guard before each resume write. Bulk-resume
@@ -423,7 +423,6 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
           sessionId: tab.codexSessionId,
           cwd: tab.cwd,
         }));
-        ipcRenderer.send('terminal:force-command-started', { tabId: tab.id, commandType: 'codex', sessionId: tab.codexSessionId });
       }
     });
 
@@ -559,7 +558,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
       className="h-[30px] w-full bg-panel flex items-stretch"
     >
       {!isSystemProject && (
-        <Tooltip content="Toggle file explorer">
+        <ControlHint label={sidebarOpenForRender ? 'Скрыть файлы проекта' : 'Показать файлы проекта'} shortcut="⌘B">
         <button
           data-sidebar-toggle-trigger
           aria-pressed={sidebarOpenForRender}
@@ -575,11 +574,11 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
         >
           <PanelLeft size={14} />
         </button>
-        </Tooltip>
+        </ControlHint>
       )}
 
       {/* Home Button */}
-      <Tooltip content="Project Home">
+      <ControlHint label={isHomeActive ? 'Вернуться в терминал' : 'Открыть Home проекта'}>
       <button
         data-workspace-navigation
         onClick={() => activeProjectId && setProjectView(activeProjectId, isHomeActive ? 'terminal' : 'home')}
@@ -590,10 +589,10 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
         <Home size={14} />
         <span>Home</span>
       </button>
-      </Tooltip>
+      </ControlHint>
 
       {/* Compress Logs Button */}
-      <Tooltip content="Сжать логи из буфера обмена">
+      <ControlHint label="Сжать логи в буфере обмена">
       <button
         onClick={handleCompressLogs}
         style={buttonStyle(false)}
@@ -603,11 +602,11 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
       >
         <Minimize2 size={14} className={isCompressing ? 'text-indigo-400 animate-glow-indigo' : ''} />
       </button>
-      </Tooltip>
+      </ControlHint>
 
       {!isSystemProject && (
         <>
-          <Tooltip content="Open browser tab">
+          <ControlHint label="Открыть browser-вкладку">
           <button
             onClick={() => {
               if (activeProjectId) {
@@ -621,9 +620,9 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
           >
             <Globe size={14} />
           </button>
-          </Tooltip>
+          </ControlHint>
 
-          <Tooltip content="Открыть проект в VS Code">
+          <ControlHint label="Открыть проект в VS Code">
           <button
             onClick={handleOpenVSCode}
             style={buttonStyle(false)}
@@ -632,9 +631,9 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
           >
             <VscVscode size={14} />
           </button>
-          </Tooltip>
+          </ControlHint>
 
-          <Tooltip content="Открыть проект в GT Editor (⌘G)">
+          <ControlHint label="Открыть проект в GT Editor" shortcut="⌘G">
           <button
             onClick={handleOpenGTEditor}
             style={buttonStyle(false)}
@@ -643,7 +642,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
           >
             <FileEdit size={14} />
           </button>
-          </Tooltip>
+          </ControlHint>
 
           <SemanticIndexButton
             onOpenSettings={() => {
@@ -656,7 +655,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
 
       {/* Resume All Interrupted Sessions Button - only shows when there are interrupted tabs */}
       {interruptedTabs.length > 0 && (
-        <Tooltip content={`Resume all ${interruptedTabs.length} interrupted session(s)`}>
+        <ControlHint label={`Возобновить ${interruptedTabs.length} прерванных сессий`}>
         <button
           onClick={handleResumeAll}
           style={buttonStyle(false)}
@@ -676,7 +675,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
             {interruptedTabs.length}
           </span>
         </button>
-        </Tooltip>
+        </ControlHint>
       )}
 
       {activeExternalRun && (
@@ -689,7 +688,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
             padding: '0 6px',
           }}
         >
-          <Tooltip content="Настройки external Codex">
+          <ControlHint label="Настройки external Codex">
             <button
               onClick={() => setExternalSettingsOpen((value) => !value)}
               style={{
@@ -711,7 +710,7 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
               <Settings2 size={12} />
               <span>Настройки</span>
             </button>
-          </Tooltip>
+          </ControlHint>
 
           {externalSettingsOpen && (
             <div

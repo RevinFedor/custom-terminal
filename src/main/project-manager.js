@@ -19,6 +19,10 @@ class ProjectManager {
         }
       }
 
+      // JSON migration historically inserted rows without tab_id. Re-run the
+      // invariant after that optional import as well as during DB bootstrap.
+      this.db.ensureGlobalTabIdInvariant();
+
       // Migrate quick_actions to global_commands
       const migrationResult = this.db.migrateQuickActionsToGlobal();
       if (migrationResult.migrated) {
@@ -53,7 +57,11 @@ class ProjectManager {
   }
 
   saveProjectTabs(projectId, tabs, forceCleanup = false, preserveInterrupted = false) {
-    this.db.saveTabs(projectId, tabs, forceCleanup, preserveInterrupted);
+    return this.db.saveTabs(projectId, tabs, forceCleanup, preserveInterrupted);
+  }
+
+  transferProjectTabs(sourceProjectId, targetProjectId, tabIds) {
+    return this.db.transferTabsToProject(sourceProjectId, targetProjectId, tabIds);
   }
 
   saveProjectTabGroups(projectId, groups) {
@@ -175,8 +183,8 @@ class ProjectManager {
   }
 
   // Tab history methods
-  archiveTab(projectId, tab) {
-    this.db.archiveTab(projectId, tab);
+  archiveTab(projectId, tab, options) {
+    return this.db.archiveTab(projectId, tab, options);
   }
 
   getTabHistory(projectId, limit) {

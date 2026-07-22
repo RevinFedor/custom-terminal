@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect, useLayoutEffect, memo, useCallback,
 import { flushSync } from 'react-dom';
 import { useWorkspaceStore, TabColor, TabGroup, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
+import ControlHint from '../UI/ControlHint';
 import Tooltip from '../UI/Tooltip';
 import { useUIStore } from '../../store/useUIStore';
 import { useCmdKey } from '../../hooks/useCmdHoverPopover';
@@ -9,6 +10,7 @@ import { RunAfterTabPicker } from './RunAfterTabPicker';
 import { refreshGeneratedTabTitle, type RefreshTabTitleReason } from '../../utils/generateTabTitle';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { isNaturalAgentTurnEndReason } from '../../utils/agentCompletionOutcome.mjs';
+import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -398,6 +400,14 @@ const shortDndId = (id?: string | null) => {
 
 const getTabSessionUuid = (tab?: { claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string } | null) =>
   tab?.claudeSessionId || tab?.geminiSessionId || tab?.codexSessionId || null;
+
+const isCodexSessionTab = (tab?: {
+  commandType?: string | null;
+  claudeSessionId?: string;
+  geminiSessionId?: string;
+  codexSessionId?: string;
+} | null) => tab?.commandType === 'codex'
+  || (!tab?.claudeSessionId && !tab?.geminiSessionId && !!tab?.codexSessionId);
 
 const shortVerticalRowKey = (key?: string | null) => {
   if (!key) return '-';
@@ -2132,6 +2142,7 @@ const TabItem = memo(({
                     </span>
                   )}
                   {restartAfterCommandDisplayLabel && (
+                    <ControlHint label="Открыть историю запусков" shortcut={restartAfterCommandDisplayLabel} side="right">
                     <button
                       className="ml-auto flex-shrink-0 truncate max-w-[132px]"
                       title={restartAfterCommandDisplayLabel}
@@ -2154,6 +2165,7 @@ const TabItem = memo(({
                     >
                       {restartAfterCommandDisplayLabel}
                     </button>
+                    </ControlHint>
                   )}
                 </>
               )}
@@ -2166,6 +2178,7 @@ const TabItem = memo(({
               style={{ gap: 1 }}
             >
               {showVerticalLastCommandPlay && (
+                <ControlHint label="Запустить последнюю shell-команду в этой папке" side="right">
                 <button
                   data-no-tab-drag
                   data-tab-id={tab.id}
@@ -2204,6 +2217,7 @@ const TabItem = memo(({
                 >
                   <Play size={11} strokeWidth={2.2} />
                 </button>
+                </ControlHint>
               )}
 
           {restartAfterConfigured && !showVerticalLastCommandPlay && (
@@ -2220,6 +2234,7 @@ const TabItem = memo(({
           )}
 
           {restartAfterConfigured && (
+            <ControlHint label={restartAfterPaused ? 'Возобновить Run after' : 'Поставить Run after на паузу'} side="right">
             <button
               type="button"
               data-no-tab-drag
@@ -2263,6 +2278,7 @@ const TabItem = memo(({
                 />
               )}
             </button>
+            </ControlHint>
           )}
 
           {/* Restart button — right-anchored in vertical mode. For restart-after tabs
@@ -2270,6 +2286,22 @@ const TabItem = memo(({
                 to its left so modifier modes do not shove it sideways. Cmd-hover on
                 restart-after shows Clear; Cmd-hover on plain devServer shows Stop. */}
           {canShowVerticalRestartButton && (
+            <ControlHint
+              label={isStopping
+                ? 'Останавливаю процесс…'
+                : verticalRestartClearMode
+                  ? 'Убрать Run after'
+                  : verticalRestartStopMode
+                    ? 'Остановить процесс без перезапуска'
+                    : restartAfterConfigured
+                      ? 'Запустить Run after сейчас'
+                      : 'Перезапустить процесс'}
+              modifiedAction={!isStopping && !cmdPeekMode
+                ? (restartAfterConfigured ? '⌘ клик — убрать Run after' : '⌘ клик — остановить без перезапуска')
+                : undefined}
+              side="right"
+              disabled={isAnyDragging}
+            >
             <button
               type="button"
               data-no-tab-drag
@@ -2345,6 +2377,7 @@ const TabItem = memo(({
                 />
               )}
             </button>
+            </ControlHint>
           )}
             </div>
           )}
@@ -9675,20 +9708,16 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             const targetTabs = (isMultiSelect ? selectedTabIds : [contextMenu.tabId])
               .map(tabId => workspace.tabs.get(tabId))
               .filter((tab): tab is NonNullable<typeof tab> => !!tab);
-            const uuidRows: Array<{ tab: (typeof targetTabs)[number]; uuid: string }> = [];
-            targetTabs.forEach(tab => {
-              const uuid = getTabSessionUuid(tab);
-              if (uuid) uuidRows.push({ tab, uuid });
-            });
+            const uuidCandidateTabs = targetTabs.filter(tab => getTabSessionUuid(tab) || isCodexSessionTab(tab));
             const hasTabIds = targetTabs.length > 0;
-            const hasUuid = uuidRows.length > 0;
-            const missingCount = targetTabs.length - uuidRows.length;
+            const hasUuid = uuidCandidateTabs.length > 0;
+            const missingCount = targetTabs.length - uuidCandidateTabs.length;
             const tabIdTitle = isMultiSelect
               ? `ID-Tab: ${targetTabs.length}`
               : 'ID-Tab';
             const disabledTitle = 'У вкладки нет UUID сессии';
             const uuidPathTitle = isMultiSelect
-              ? `UUID + пути: ${uuidRows.length}${missingCount > 0 ? `, без UUID: ${missingCount}` : ''}`
+              ? `UUID + пути: ${uuidCandidateTabs.length}${missingCount > 0 ? `, без UUID: ${missingCount}` : ''}`
               : 'UUID сессии + путь';
             const copyButtonClass = (enabled: boolean, withDivider = false) =>
               [
@@ -9703,16 +9732,31 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               showToast(isMultiSelect ? `Скопировано ID-Tab: ${targetTabs.length}` : 'ID-Tab скопирован', 'success');
               setContextMenu(null);
             };
-            const copyUuidWithPath = (e: React.MouseEvent) => {
+            const copyUuidWithPath = async (e: React.MouseEvent) => {
               e.stopPropagation();
               if (!hasUuid) return;
-              const lines = uuidRows.map(({ tab, uuid }) => {
-                const path = tab.cwd || project?.path || '/';
-                return `${uuid}\ncwd: ${path}`;
-              });
-              window.require('electron').clipboard.writeText(lines.join('\n\n'));
-              showToast(isMultiSelect ? `Скопировано UUID + путей: ${uuidRows.length}` : 'UUID + путь скопированы', 'success');
-              setContextMenu(null);
+              try {
+                const resolvedRows: Array<{ tab: (typeof targetTabs)[number]; uuid: string }> = [];
+                for (const tab of targetTabs) {
+                  const uuid = isCodexSessionTab(tab)
+                    ? await requireCodexSurfaceSessionId({
+                        tabId: tab.id,
+                        historicalSessionId: tab.codexSessionId,
+                        operation: 'скопировать UUID сессии',
+                      })
+                    : getTabSessionUuid(tab);
+                  if (uuid) resolvedRows.push({ tab, uuid });
+                }
+                const lines = resolvedRows.map(({ tab, uuid }) => {
+                  const path = tab.cwd || project?.path || '/';
+                  return `${uuid}\ncwd: ${path}`;
+                });
+                window.require('electron').clipboard.writeText(lines.join('\n\n'));
+                showToast(isMultiSelect ? `Скопировано UUID + путей: ${resolvedRows.length}` : 'UUID + путь скопированы', 'success');
+                setContextMenu(null);
+              } catch (error: any) {
+                showToast(error?.message || 'Не удалось проверить Codex-сессию перед копированием UUID', 'warning');
+              }
             };
             return (
               <div className="flex items-stretch w-full">
@@ -9835,6 +9879,20 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     // Add to favorites
                     const tab = workspace.tabs.get(contextMenu.tabId);
                     if (tab) {
+                      let codexSessionId = tab.codexSessionId || null;
+                      if (isCodexSessionTab(tab)) {
+                        try {
+                          codexSessionId = await requireCodexSurfaceSessionId({
+                            tabId: tab.id,
+                            historicalSessionId: tab.codexSessionId,
+                            operation: 'добавить Codex-сессию в избранное',
+                            requireMutationSafe: true,
+                          });
+                        } catch (error: any) {
+                          showToast(error?.message || 'Не удалось проверить Codex-сессию перед добавлением в избранное', 'warning');
+                          return;
+                        }
+                      }
                       await ipcRenderer.invoke('project:add-favorite', {
                         projectId,
                         tab: {
@@ -9846,7 +9904,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                           url: tab.url || null,
                           claudeSessionId: tab.claudeSessionId || null,
                           geminiSessionId: tab.geminiSessionId || null,
-                          codexSessionId: tab.codexSessionId || null,
+                          codexSessionId,
                         }
                       });
                       showToast(`"${tab.name}" added to favorites`, 'success');

@@ -390,8 +390,8 @@ export type TabQueue = {
   // Selecting a tab that is NOT currently active in its project is allowed:
   // runner stays in "waiting" state until that tab's busy-state becomes true
   // (user activates it and sends a prompt → loader starts) and then false.
-  // The UI surfaces this with a "!" icon (waiting for activation) vs spinner
-  // (already busy, waiting for finish).
+  // The UI surfaces this with a static hourglass (waiting for activation or a
+  // queued dependency) vs spinner (already busy, waiting for finish).
   //
   // Persistent so the choice survives restarts. Stale ids (target tab was
   // closed) are validated lazily in the runner — if the tab no longer exists
@@ -428,7 +428,7 @@ interface PromptQueueStore {
   setCloseAfter: (tabId: string, value: boolean) => void;
   // Set the target tab whose busy→idle transition should trigger the auto-run.
   // null = clear (fall back to own-tab autoRun behaviour).
-  setRunAfterTab: (tabId: string, targetTabId: string | null) => void;
+  setRunAfterTab: (tabId: string, targetTabId: string | null) => boolean;
   // Automatic stale-target repair. Unlike the public user action above, this
   // must not refresh the workflow arm timestamp or create a runtime arm.
   clearStaleRunAfterTab: (tabId: string, expectedTargetTabId: string) => void;
@@ -666,6 +666,29 @@ export function isQueuedPromptEnabled(item: Pick<QueuedPrompt, 'enabled'>): bool
 
 export function countEnabledQueuedPrompts(items: QueuedPrompt[]): number {
   return items.reduce((acc, item) => acc + (isQueuedPromptEnabled(item) ? 1 : 0), 0);
+}
+
+export function hasPendingPromptQueueContinuation(
+  queue: Pick<TabQueue, 'autoRun' | 'items'>,
+): boolean {
+  return queue.autoRun && countEnabledQueuedPrompts(queue.items) > 0;
+}
+
+function wouldCreateRunAfterCycle(
+  queues: Map<string, TabQueue>,
+  ownerTabId: string,
+  targetTabId: string,
+): boolean {
+  const visited = new Set<string>();
+  let currentTabId: string | null = targetTabId;
+
+  while (currentTabId) {
+    if (currentTabId === ownerTabId || visited.has(currentTabId)) return true;
+    visited.add(currentTabId);
+    currentTabId = queues.get(currentTabId)?.runAfterTabId ?? null;
+  }
+
+  return false;
 }
 
 // Once Enter was written, the queue no longer owns this prompt. A late
@@ -1066,12 +1089,19 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
 
     setRunAfterTab: (tabId, targetTabId) => {
       automaticRunAfterTargetClearTabs.delete(tabId);
+      let accepted = true;
       setAndPersist((state) => {
         const next = new Map(state.queues);
         const cur = next.get(tabId) ?? EMPTY;
         // Self-target makes no semantic sense (waiting on yourself = waiting
         // forever, since the same Stop hook would fire). Coerce to null.
         const value = targetTabId === tabId ? null : targetTabId;
+        if (value && wouldCreateRunAfterCycle(next, tabId, value)) {
+          accepted = false;
+          console.warn('[PromptQueue] refused cyclic Run after dependency owner=' + tabId.slice(-8)
+            + ' target=' + value.slice(-8));
+          return state;
+        }
         // Picking a target tab is an explicit Run-after intent. Auto-arm on
         // non-null selection so "on tab" cannot sit as a passive label while
         // the queue is actually off.
@@ -1090,6 +1120,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         });
         return { queues: next };
       });
+      return accepted;
     },
 
     clearStaleRunAfterTab: (tabId, expectedTargetTabId) => {

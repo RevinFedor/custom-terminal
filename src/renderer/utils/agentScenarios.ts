@@ -2,6 +2,7 @@ import type { AgentHistoryTool, AgentPtyStatus, HistoryAgentRuntime } from './hi
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './claudeStartupDefaultsReady';
 import { terminalRegistry } from './terminalRegistry';
 import { useUIStore, type HistoryPromptDraftImageRef } from '../store/useUIStore';
+import { requireConfirmedCodexWriter } from './codexWriterIdentity';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -22,7 +23,7 @@ export interface SendAgentPromptScenarioArgs {
 }
 
 const normalizeStatus = (value: unknown): AgentPtyStatus | undefined => {
-  return value === 'active' || value === 'busy' || value === 'inactive' || value === 'starting' || value === 'stopping'
+  return value === 'active' || value === 'busy' || value === 'inactive' || value === 'starting' || value === 'stopping' || value === 'unknown'
     ? value
     : undefined;
 };
@@ -220,7 +221,7 @@ function createAgentReadyWait(tabId: string, runtime: HistoryAgentRuntime, timeo
 }
 
 function isAgentRewindBlockedStatus(status?: AgentPtyStatus | null): boolean {
-  return status === 'busy' || status === 'starting' || status === 'stopping';
+  return status === 'busy' || status === 'starting' || status === 'stopping' || status === 'unknown';
 }
 
 function getAgentRewindBlockedMessage(runtime: HistoryAgentRuntime, status?: AgentPtyStatus | null): string {
@@ -230,7 +231,162 @@ function getAgentRewindBlockedMessage(runtime: HistoryAgentRuntime, status?: Age
   if (status === 'stopping') {
     return runtime.label + ' is stopping; wait until the current loader finishes before rewind';
   }
+  if (status === 'unknown') {
+    return runtime.label + ' status could not be verified; retry before rewind';
+  }
   return runtime.label + ' is busy; wait for the current turn before rewind';
+}
+
+interface AgentReadyForRewindResult {
+  status: 'active';
+  resumed: boolean;
+  resumeSourceSessionId: string | null;
+}
+
+export interface PreparedCodexRewindRuntime {
+  sourceSessionId: string;
+  writerSessionId: string;
+  writerRelation: 'same-session' | 'current-resume-child';
+  writerAuthorization: 'confirmed-writer' | 'provisional-resume-source';
+  writerLaunchId?: string | null;
+  targetUuid: string;
+  endUuid?: string;
+  lineageDepth: number;
+}
+
+interface CodexTimelineEntry {
+  uuid?: string;
+  type?: string;
+  content?: string;
+}
+
+interface CodexTimelineSnapshot {
+  success?: boolean;
+  error?: string;
+  entries?: CodexTimelineEntry[];
+  sessionMeta?: {
+    id?: string | null;
+    forked_from_id?: string | null;
+  } | null;
+}
+
+const canonicalTranscriptText = (value: unknown): string => String(value || '')
+  .replace(/\r\n/g, '\n')
+  .trim();
+
+async function loadCodexTimelineSnapshot(sessionId: string, cwd?: string): Promise<CodexTimelineSnapshot> {
+  const result = await ipcRenderer.invoke('agent-transcript:get-timeline', {
+    toolType: 'codex',
+    sessionId,
+    cwd,
+    consumerId: 'agent-scenario-rewind-proof',
+  }).catch((error: any) => ({ success: false, error: String(error?.message || error) }));
+  if (result?.success === false) {
+    throw new Error('Cannot prove Codex resume lineage: ' + (result.error || 'timeline unavailable'));
+  }
+  if (String(result?.sessionMeta?.id || '') !== sessionId) {
+    throw new Error('Cannot prove Codex resume lineage: rollout metadata does not match its session ID');
+  }
+  return result as CodexTimelineSnapshot;
+}
+
+async function proveCodexRewindTargetMapping({
+  sourceSessionId,
+  writerSessionId,
+  cwd,
+  targetIndex,
+  targetUuid,
+  endUuid,
+  targetFullText,
+  rewindableCount,
+}: {
+  sourceSessionId: string;
+  writerSessionId: string;
+  cwd?: string;
+  targetIndex?: number;
+  targetUuid?: string | null;
+  endUuid?: string | null;
+  targetFullText?: string;
+  rewindableCount?: number;
+}): Promise<{ targetUuid: string; endUuid?: string; lineageDepth: number }> {
+  const source = await loadCodexTimelineSnapshot(sourceSessionId, cwd);
+  const writer = writerSessionId === sourceSessionId
+    ? source
+    : await loadCodexTimelineSnapshot(writerSessionId, cwd);
+
+  // Ready/resume events prove only that a TUI exists. The durable source→child
+  // relation lives in rollout metadata, so walk that chain with a hard cap.
+  let lineageDepth = 0;
+  let cursorId = writerSessionId;
+  let cursor = writer;
+  const visited = new Set<string>();
+  while (cursorId !== sourceSessionId) {
+    if (visited.has(cursorId) || lineageDepth >= 16) {
+      throw new Error('Cannot prove Codex resume lineage: parent chain is cyclic or too deep');
+    }
+    visited.add(cursorId);
+    const parentId = String(cursor.sessionMeta?.forked_from_id || '').trim();
+    if (!parentId) {
+      throw new Error('Cannot prove Codex resume lineage: active rollout is unrelated to the selected history');
+    }
+    lineageDepth += 1;
+    if (parentId === sourceSessionId) break;
+    cursorId = parentId;
+    cursor = await loadCodexTimelineSnapshot(cursorId, cwd);
+  }
+
+  const sourceUsers = (source.entries || []).filter((entry) => entry?.type === 'user');
+  const writerUsers = (writer.entries || []).filter((entry) => entry?.type === 'user');
+  const sourceEntries = source.entries || [];
+  const writerEntries = writer.entries || [];
+  const expectedCount = Number(rewindableCount);
+  const index = Number(targetIndex);
+  if (!Number.isInteger(expectedCount)
+    || expectedCount !== sourceUsers.length
+    || expectedCount !== writerUsers.length
+    || !Number.isInteger(index)
+    || index < 0
+    || index >= expectedCount) {
+    throw new Error('Codex history changed during Resume; reload Timeline and repeat Rewind');
+  }
+
+  const sourceTarget = sourceUsers[index];
+  const writerTarget = writerUsers[index];
+  if (!targetUuid
+    || sourceTarget?.uuid !== targetUuid
+    || !writerTarget?.uuid
+    || canonicalTranscriptText(sourceTarget.content) !== canonicalTranscriptText(targetFullText)) {
+    throw new Error('Codex Rewind target no longer matches the selected source history; reload Timeline and repeat');
+  }
+  for (let i = 0; i < sourceUsers.length; i += 1) {
+    if (canonicalTranscriptText(sourceUsers[i]?.content) !== canonicalTranscriptText(writerUsers[i]?.content)) {
+      throw new Error('Codex child rollout diverged from the selected source history; reload Timeline and repeat');
+    }
+  }
+
+  // AI compact is built from the complete timeline range, not only user turns.
+  // Require equivalent marker structure, then translate both range endpoints
+  // to writer-owned UUIDs so copy-range reads the same live rollout as Rewind.
+  if (sourceEntries.length !== writerEntries.length) {
+    throw new Error('Codex child timeline structure differs from the selected source; reload Timeline and repeat');
+  }
+  for (let i = 0; i < sourceEntries.length; i += 1) {
+    if (sourceEntries[i]?.type !== writerEntries[i]?.type
+      || canonicalTranscriptText(sourceEntries[i]?.content) !== canonicalTranscriptText(writerEntries[i]?.content)) {
+      throw new Error('Codex child timeline range differs from the selected source; reload Timeline and repeat');
+    }
+  }
+
+  let mappedEndUuid: string | undefined;
+  if (endUuid) {
+    const endIndex = sourceEntries.findIndex((entry) => entry?.uuid === endUuid);
+    mappedEndUuid = endIndex >= 0 ? writerEntries[endIndex]?.uuid : undefined;
+    if (!mappedEndUuid) {
+      throw new Error('Codex AI Rewind range end no longer exists in the active writer; reload Timeline and repeat');
+    }
+  }
+
+  return { targetUuid: writerTarget.uuid, endUuid: mappedEndUuid, lineageDepth };
 }
 
 async function ensureAgentReadyForRewind({
@@ -245,7 +401,7 @@ async function ensureAgentReadyForRewind({
   runtime: HistoryAgentRuntime;
   sessionId: string;
   cwd?: string;
-}): Promise<AgentPtyStatus | undefined> {
+}): Promise<AgentReadyForRewindResult> {
   const waitStartupDefaultsIfNeeded = async () => {
     if (toolType === 'claude') await waitForClaudeStartupDefaultsReadyWithVisibleFallback(tabId, 15000, 'agent-rewind');
   };
@@ -258,18 +414,22 @@ async function ensureAgentReadyForRewind({
     + ' status=' + (presence?.status || 'unknown')
     + ' inputReady=' + !!presence?.inputReady
     + ' busy=' + !!presence?.isBusy);
-  if (isAgentRewindBlockedStatus(presence?.status)) {
+  const isCodexProvisionalComposerReady = () => toolType === 'codex'
+    && presence?.status === 'starting'
+    && presence?.inputReady === true;
+  if (isAgentRewindBlockedStatus(presence?.status) && !isCodexProvisionalComposerReady()) {
     throw new Error(getAgentRewindBlockedMessage(runtime, presence?.status));
   }
-  if (presence?.status === 'active' && presence?.inputReady) {
+  if ((presence?.status === 'active' && presence?.inputReady) || isCodexProvisionalComposerReady()) {
     await waitStartupDefaultsIfNeeded();
-    return;
+    return { status: 'active', resumed: false, resumeSourceSessionId: null };
   }
 
   const readyWait = createAgentReadyWait(tabId, runtime, 30000, 'rewind');
+  let resumedForRewind = false;
   try {
-    const resumedForRewind = !presence || presence.status === 'inactive';
     if (!presence || presence.status === 'inactive') {
+      resumedForRewind = true;
       console.log('[AgentScenario:rewind] resume before rewind tool=' + toolType + ' tab=' + String(tabId).slice(-12));
       const resumeResult = await runtime.resume({ tabId, sessionId, cwd });
       if (resumeResult?.success === false) {
@@ -281,10 +441,14 @@ async function ensureAgentReadyForRewind({
     if (presence?.status === 'stopping' || presence?.status === 'busy' || (presence?.status === 'starting' && !resumedForRewind)) {
       throw new Error(getAgentRewindBlockedMessage(runtime, presence?.status));
     }
-    if (presence?.status === 'active' && presence?.inputReady) {
+    if ((presence?.status === 'active' && presence?.inputReady) || isCodexProvisionalComposerReady()) {
       readyWait.cancel();
       await waitStartupDefaultsIfNeeded();
-      return;
+      return {
+        status: 'active',
+        resumed: resumedForRewind,
+        resumeSourceSessionId: resumedForRewind ? sessionId : null,
+      };
     }
 
     await readyWait.promise;
@@ -294,17 +458,148 @@ async function ensureAgentReadyForRewind({
       + ' status=' + (presence?.status || 'unknown')
       + ' inputReady=' + !!presence?.inputReady
       + ' busy=' + !!presence?.isBusy);
-    if (isAgentRewindBlockedStatus(presence?.status)) {
+    if (isAgentRewindBlockedStatus(presence?.status) && !isCodexProvisionalComposerReady()) {
       throw new Error(getAgentRewindBlockedMessage(runtime, presence?.status));
     }
-    if (presence?.status !== 'active' || !presence?.inputReady) {
+    if (!((presence?.status === 'active' && presence?.inputReady) || isCodexProvisionalComposerReady())) {
       throw new Error(runtime.label + ' session is not ready for rewind');
     }
     await waitStartupDefaultsIfNeeded();
+    return {
+      status: 'active',
+      resumed: resumedForRewind,
+      resumeSourceSessionId: resumedForRewind ? sessionId : null,
+    };
   } catch (err) {
     readyWait.cancel();
     throw err;
   }
+}
+
+export async function prepareCodexRewindRuntime({
+  tabId,
+  runtime,
+  sourceSessionId,
+  cwd,
+  targetIndex,
+  targetUuid,
+  endUuid,
+  targetFullText,
+  rewindableCount,
+}: {
+  tabId: string;
+  runtime: HistoryAgentRuntime;
+  sourceSessionId: string;
+  cwd?: string;
+  targetIndex?: number;
+  targetUuid?: string | null;
+  endUuid?: string | null;
+  targetFullText?: string;
+  rewindableCount?: number;
+}): Promise<PreparedCodexRewindRuntime> {
+  const readiness = await ensureAgentReadyForRewind({
+    tabId,
+    toolType: 'codex',
+    runtime,
+    sessionId: sourceSessionId,
+    cwd,
+  });
+  const authorization = await ipcRenderer.invoke('codex:get-rewind-writer-authorization', {
+    tabId,
+    sourceSessionId,
+  }).catch((error: any) => ({ success: false, error: String(error?.message || error) }));
+  if (authorization?.success !== true || !authorization.writerSessionId) {
+    throw new Error(authorization?.error || 'Codex writer is not ready for Rewind');
+  }
+  const writerSessionId = String(authorization.writerSessionId);
+  const mapped = await proveCodexRewindTargetMapping({
+    sourceSessionId,
+    writerSessionId,
+    cwd,
+    targetIndex,
+    targetUuid,
+    endUuid,
+    targetFullText,
+    rewindableCount,
+  });
+  return {
+    sourceSessionId,
+    writerSessionId,
+    writerRelation: writerSessionId === sourceSessionId ? 'same-session' : 'current-resume-child',
+    writerAuthorization: authorization.authorization,
+    writerLaunchId: authorization.launchId || null,
+    targetUuid: mapped.targetUuid,
+    endUuid: mapped.endUuid,
+    lineageDepth: mapped.lineageDepth,
+  };
+}
+
+export async function revalidatePreparedCodexRewindRuntime({
+  tabId,
+  prepared,
+  cwd,
+  targetIndex,
+  sourceTargetUuid,
+  sourceEndUuid,
+  targetFullText,
+  rewindableCount,
+}: {
+  tabId: string;
+  prepared: PreparedCodexRewindRuntime;
+  cwd?: string;
+  targetIndex?: number;
+  sourceTargetUuid?: string | null;
+  sourceEndUuid?: string | null;
+  targetFullText?: string;
+  rewindableCount?: number;
+}): Promise<PreparedCodexRewindRuntime> {
+  const mapped = await proveCodexRewindTargetMapping({
+    sourceSessionId: prepared.sourceSessionId,
+    writerSessionId: prepared.writerSessionId,
+    cwd,
+    targetIndex,
+    targetUuid: sourceTargetUuid,
+    endUuid: sourceEndUuid,
+    targetFullText,
+    rewindableCount,
+  });
+  if (mapped.targetUuid !== prepared.targetUuid
+    || (prepared.endUuid && mapped.endUuid !== prepared.endUuid)) {
+    throw new Error('Codex Rewind target changed while the operation was being prepared; reload Timeline and repeat');
+  }
+  // Keep a fresh main-owned process proof adjacent to the destructive IPC. A
+  // resume source may still be provisional because Codex can create its child
+  // only on the first user action; that narrow authorization is launch-scoped.
+  const authorization = await ipcRenderer.invoke('codex:get-rewind-writer-authorization', {
+    tabId,
+    sourceSessionId: prepared.sourceSessionId,
+  }).catch((error: any) => ({ success: false, error: String(error?.message || error) }));
+  if (authorization?.success !== true
+    || authorization.writerSessionId !== prepared.writerSessionId
+    || authorization.authorization !== prepared.writerAuthorization
+    || (prepared.writerAuthorization === 'provisional-resume-source'
+      && authorization.launchId !== prepared.writerLaunchId)) {
+    throw new Error(authorization?.error || 'Codex writer changed while Rewind was being prepared; reload Timeline and repeat');
+  }
+  if (prepared.writerAuthorization === 'confirmed-writer') {
+    await requireConfirmedCodexWriter({
+      tabId,
+      expectedSessionId: prepared.writerSessionId,
+      operation: 'Rewind',
+    });
+  }
+  const turnState = await ipcRenderer.invoke('codex:get-turn-state', tabId).catch(() => null);
+  const turnIdentityReady = prepared.writerAuthorization === 'provisional-resume-source'
+    ? turnState?.provisional === true && !turnState?.sessionId
+    : turnState?.sessionId === prepared.writerSessionId;
+  if (!turnState
+    || turnState.hasWatcher !== true
+    || !turnIdentityReady
+    || turnState.catchUpPending === true
+    || turnState.busy !== false) {
+    throw new Error('Codex turn state is not confirmed idle; wait and repeat Rewind');
+  }
+  return { ...prepared, lineageDepth: mapped.lineageDepth };
 }
 
 async function ensureAgentReadyForSend({
@@ -332,11 +627,13 @@ async function ensureAgentReadyForSend({
     + ' status=' + (presence?.status || 'unknown')
     + ' inputReady=' + !!presence?.inputReady
     + ' busy=' + !!presence?.isBusy);
+  const isReadyComposer = () => !!presence?.inputReady
+    && (presence.status === 'active' || (toolType === 'codex' && presence.status === 'starting'));
   if (presence?.status === 'stopping') {
     throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
   }
   if (presence?.status === 'busy') return 'busy';
-  if (presence?.status === 'active' && presence?.inputReady) {
+  if (isReadyComposer()) {
     await waitStartupDefaultsIfNeeded();
     return 'active';
   }
@@ -372,7 +669,7 @@ async function ensureAgentReadyForSend({
       throw new Error(runtime.label + ' is stopping; wait until the current loader finishes before send');
     }
     if (presence?.status === 'busy') return 'busy';
-    if (presence?.status === 'active' && presence?.inputReady) {
+    if (isReadyComposer()) {
       readyWait.cancel();
       await waitStartupDefaultsIfNeeded();
       return 'active';
@@ -386,7 +683,7 @@ async function ensureAgentReadyForSend({
       + ' inputReady=' + !!presence?.inputReady
       + ' busy=' + !!presence?.isBusy);
     if (presence?.status === 'busy') return 'busy';
-    if (presence?.status !== 'active' || !presence?.inputReady) {
+    if (!isReadyComposer()) {
       throw new Error(runtime.label + ' session is not ready for send');
     }
     await waitStartupDefaultsIfNeeded();
@@ -439,33 +736,81 @@ export async function rewindAgentTimelineScenario({
 }): Promise<any> {
   const rewindMode = mode === 'ai' ? 'ai' : 'native';
   const channel = toolType === 'codex' ? 'codex:open-history-menu' : 'claude:open-history-menu';
+  let preparedCodex: PreparedCodexRewindRuntime | null = null;
+  let runtimeTargetUuid = startUuid || undefined;
+  let runtimeEndUuid = endUuid || undefined;
+
+  // Starting a stopped Codex session can materialize a linked child. Establish
+  // the live writer first; the source ID passed to resume is launch intent only.
+  if (toolType === 'codex') {
+    preparedCodex = await prepareCodexRewindRuntime({
+      tabId,
+      runtime,
+      sourceSessionId: sessionId,
+      cwd: tab?.cwd,
+      targetIndex,
+      targetUuid: startUuid,
+      endUuid: rewindMode === 'ai' ? endUuid : null,
+      targetFullText,
+      rewindableCount,
+    });
+    runtimeTargetUuid = preparedCodex.targetUuid;
+    runtimeEndUuid = preparedCodex.endUuid || runtimeEndUuid;
+    if (preparedCodex.writerRelation === 'current-resume-child') {
+      console.log('[AgentScenario:rewind] proven Codex resume child tab=' + String(tabId).slice(-12)
+        + ' source=' + sessionId.slice(0, 8)
+        + ' writer=' + preparedCodex.writerSessionId.slice(0, 8)
+        + ' lineageDepth=' + preparedCodex.lineageDepth);
+    }
+  }
+
   let pasteAfter: string | undefined;
   if (rewindMode === 'ai') {
     if (!buildAiRewindText) throw new Error('AI Rewind builder not provided');
     console.log('[MobRewind:Scenario] AI compact begin tool=' + toolType + ' tab=' + String(tabId).slice(-12));
     pasteAfter = await buildAiRewindText({
       toolType,
-      sessionId,
+      sessionId: toolType === 'codex' ? preparedCodex!.writerSessionId : sessionId,
       cwd: tab?.cwd,
-      startUuid: typeof startUuid === 'string' ? startUuid : undefined,
-      endUuid: typeof endUuid === 'string' ? endUuid : undefined,
+      startUuid: toolType === 'codex'
+        ? runtimeTargetUuid
+        : (typeof startUuid === 'string' ? startUuid : undefined),
+      endUuid: toolType === 'codex'
+        ? runtimeEndUuid
+        : (typeof endUuid === 'string' ? endUuid : undefined),
       additionalPrompt: typeof additionalPrompt === 'string' ? additionalPrompt : undefined,
     });
     console.log('[MobRewind:Scenario] AI compact ready tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' len=' + pasteAfter.length);
   }
-  await ensureAgentReadyForRewind({
-    tabId,
-    toolType,
-    runtime,
-    sessionId,
-    cwd: tab?.cwd,
-  });
+  if (toolType !== 'codex') {
+    await ensureAgentReadyForRewind({
+      tabId,
+      toolType,
+      runtime,
+      sessionId,
+      cwd: tab?.cwd,
+    });
+  } else {
+    preparedCodex = await revalidatePreparedCodexRewindRuntime({
+      tabId,
+      prepared: preparedCodex!,
+      cwd: tab?.cwd,
+      targetIndex,
+      sourceTargetUuid: startUuid,
+      sourceEndUuid: rewindMode === 'ai' ? endUuid : null,
+      targetFullText,
+      rewindableCount,
+    });
+  }
   const result = await ipcRenderer.invoke(channel, {
     tabId,
     targetIndex,
     targetText,
     targetFullText,
-    targetUuid: startUuid,
+    targetUuid: runtimeTargetUuid,
+    writerSessionId: preparedCodex?.writerSessionId || null,
+    writerAuthorization: preparedCodex?.writerAuthorization || null,
+    writerLaunchId: preparedCodex?.writerLaunchId || null,
     rewindableCount,
     skipDuplicates,
     pasteAfter,
@@ -512,6 +857,9 @@ export async function rewindAgentTimelineScenario({
     mode: rewindMode,
     compactPasted: !!pasteAfter,
     compactLength: pasteAfter?.length || 0,
+    runtimeSessionId: preparedCodex?.writerSessionId,
+    writerRelation: preparedCodex?.writerRelation,
+    writerLineageDepth: preparedCodex?.lineageDepth || undefined,
     ...(result || {}),
   };
 }

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode, RefObject, WheelEvent } from 'react';
 import { createPortal } from 'react-dom';
-import { ChevronDown, Folder, X } from 'lucide-react';
+import { ChevronDown, Folder, Hourglass, LoaderCircle, X } from 'lucide-react';
 import { useWorkspaceStore, type TabColor, type TabGroup } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
@@ -77,11 +77,14 @@ type PickerAnchor = {
   maxHeight: number;
 };
 
+type TabRuntimeStatus = 'busy' | 'waiting' | 'idle';
+
 export type RunAfterTabPickerProps = {
   tabId: string;
   autoRun: boolean;
   runAfterTabId: string | null;
   runAfterTabIds?: string[];
+  waitingTabIds?: ReadonlySet<string>;
   setRunAfterTab: (tabId: string, target: string | null) => void;
   panelRef: RefObject<HTMLDivElement | null>;
   ownerProjectId?: string | null;
@@ -266,6 +269,7 @@ export function RunAfterTabPicker({
   autoRun,
   runAfterTabId,
   runAfterTabIds,
+  waitingTabIds,
   setRunAfterTab,
   panelRef,
   ownerProjectId: ownerProjectIdProp = null,
@@ -557,19 +561,27 @@ export function RunAfterTabPicker({
     if (el.scrollLeft !== before) e.preventDefault();
   }, []);
 
-  type Status = 'busy' | 'idle';
-  const statusFor = (id: string): Status => (busyMap.get(id) === true ? 'busy' : 'idle');
+  const selectedIdSet = useMemo(() => new Set(selectedInputIds), [selectedInputKey]);
+  const statusFor = (id: string): TabRuntimeStatus => {
+    if (busyMap.get(id) === true) return 'busy';
+    if (waitingTabIds?.has(id)) return 'waiting';
+    if (waitingTabIds && selectedIdSet.has(id) && !busyMap.has(id)) return 'waiting';
+    return 'idle';
+  };
 
   const allAiTabs = useMemo(() => inventory.groups.flatMap((g) => g.tabs), [inventory.groups]);
-  const selectedIdSet = useMemo(() => new Set(selectedInputIds), [selectedInputKey]);
   const selectedTabs = useMemo(() => selectedInputIds
     .map((id) => allAiTabs.find((t) => t.id === id) ?? null)
     .filter((t): t is AiTab => !!t), [allAiTabs, selectedInputKey]);
   const selectedTab = selectedTabs[0] ?? null;
-  const selectedStatus = selectedTabs.some((t) => statusFor(t.id) === 'busy') ? 'busy' : (selectedTab ? 'idle' : null);
+  const selectedStatus: TabRuntimeStatus | null = selectedTabs.some((t) => statusFor(t.id) === 'busy')
+    ? 'busy'
+    : selectedTabs.some((t) => statusFor(t.id) === 'waiting')
+      ? 'waiting'
+      : (selectedTab ? 'idle' : null);
   const selectedProject = inventory.groups.find((g) => g.projectId === selectedProjectId) ?? inventory.groups[0] ?? null;
   const targetTabs = selectedProject ? selectedProject.tabs.filter((t) => t.id !== tabId) : [];
-  const loaderCount = targetTabs.filter((t) => statusFor(t.id) === 'busy').length;
+  const activeCount = targetTabs.filter((t) => statusFor(t.id) !== 'idle').length;
 
   useEffect(() => {
     if (!open || !selectedProject?.projectId) return;
@@ -588,8 +600,8 @@ export function RunAfterTabPicker({
 
   const isVisibleTab = useCallback((t: AiTab) => {
     if (t.id === tabId) return false;
-    return showAllTabs || statusFor(t.id) === 'busy' || selectedIdSet.has(t.id);
-  }, [showAllTabs, tabId, busyMap, selectedIdSet]);
+    return showAllTabs || statusFor(t.id) !== 'idle' || selectedIdSet.has(t.id);
+  }, [showAllTabs, tabId, busyMap, selectedIdSet, waitingTabIds]);
   const visibleRows = useMemo(() => {
     if (!selectedProject) return [];
     const rows: PickerRow[] = [];
@@ -638,7 +650,11 @@ export function RunAfterTabPicker({
             autoRun
               ? `Run after ${selectedSummaryText} finishes`
               : `Run after target saved: ${selectedSummaryText} (off)`
-          ) + (selectedStatus === 'busy' ? ' (busy now)' : '')
+          ) + (selectedStatus === 'busy'
+            ? ' (busy now)'
+            : selectedStatus === 'waiting'
+              ? ' (waiting for its Run after trigger)'
+              : '')
           : 'Pick a tab to wait on'
       }
       style={{
@@ -870,7 +886,7 @@ export function RunAfterTabPicker({
                   onClick={() => setShowAllTabs((v) => !v)}
                   onMouseEnter={() => setCountHover(true)}
                   onMouseLeave={() => setCountHover(false)}
-                  title={showAllTabs ? 'Show only tabs with loader' : 'Show all AI tabs'}
+                  title={showAllTabs ? 'Show only active or waiting tabs' : 'Show all AI tabs'}
                   style={{
                     flexShrink: 0,
                     padding: '1px 5px',
@@ -883,7 +899,7 @@ export function RunAfterTabPicker({
                     lineHeight: 1.35,
                   }}
                 >
-                  {loaderCount}/{targetTabs.length}
+                  {activeCount}/{targetTabs.length}
                 </button>
               </div>
 
@@ -906,7 +922,7 @@ export function RunAfterTabPicker({
                     label={g.name}
                     selected={g.projectId === selectedProject?.projectId}
                     isOwner={g.isOwnerProject}
-                    count={g.tabs.filter((t) => t.id !== tabId && statusFor(t.id) === 'busy').length}
+                    count={g.tabs.filter((t) => t.id !== tabId && statusFor(t.id) !== 'idle').length}
                     total={g.tabs.filter((t) => t.id !== tabId).length}
                     onClick={() => setSelectedProjectId(g.projectId)}
                   />
@@ -928,8 +944,8 @@ export function RunAfterTabPicker({
               )}
               {selectedProject && targetTabs.length > 0 && visibleRows.length === 0 && (
                 <div style={{ padding: '12px 8px', fontSize: 9, color: TEXT_DIM, textAlign: 'center', lineHeight: 1.4 }}>
-                  no loader tabs<br />
-                  <span style={{ color: '#555' }}>click {loaderCount}/{targetTabs.length} to show all</span>
+                  no active or waiting tabs<br />
+                  <span style={{ color: '#555' }}>click {activeCount}/{targetTabs.length} to show all</span>
                 </div>
               )}
               {selectedProject && visibleRows.map((row) => {
@@ -941,7 +957,7 @@ export function RunAfterTabPicker({
                       tab={row.tab}
                       selected={isSelected}
                       active={autoRun}
-                      busy={statusFor(row.tab.id) === 'busy'}
+                      status={statusFor(row.tab.id)}
                       sessionStatuses={sessionStatuses}
                       statusMarkerShape={statusMarkerShape}
                       statusMarkerSize={statusMarkerSize}
@@ -1067,7 +1083,7 @@ function PickerGroupRow({
   active: boolean;
   selectedTabId: string | null;
   selectedTabIds?: Set<string>;
-  statusFor: (id: string) => 'busy' | 'idle';
+  statusFor: (id: string) => TabRuntimeStatus;
   sessionStatuses: SessionStatusLike[];
   statusMarkerShape: MarkerShape;
   statusMarkerSize: number;
@@ -1187,7 +1203,7 @@ function PickerGroupRow({
                 tab={tab}
                 selected={isSelected}
                 active={active}
-                busy={statusFor(tab.id) === 'busy'}
+                status={statusFor(tab.id)}
                 sessionStatuses={sessionStatuses}
                 statusMarkerShape={statusMarkerShape}
                 statusMarkerSize={statusMarkerSize}
@@ -1208,7 +1224,7 @@ function PickerTabRow({
   tab,
   selected,
   active,
-  busy,
+  status,
   sessionStatuses,
   statusMarkerShape,
   statusMarkerSize,
@@ -1220,7 +1236,7 @@ function PickerTabRow({
   tab: AiTab;
   selected: boolean;
   active: boolean;
-  busy: boolean;
+  status: TabRuntimeStatus;
   sessionStatuses: SessionStatusLike[];
   statusMarkerShape: MarkerShape;
   statusMarkerSize: number;
@@ -1261,9 +1277,9 @@ function PickerTabRow({
         boxSizing: 'border-box',
         boxShadow: selectedActive ? 'inset 0 0 0 1px rgba(139,92,246,0.16)' : undefined,
       }}
-      title={tab.name}
+      title={status === 'waiting' ? `${tab.name} - waiting for its Run after trigger` : tab.name}
     >
-      {busy && (
+      {status === 'busy' && (
         <span
           className="tab-process-bar-static"
           style={{
@@ -1304,34 +1320,29 @@ function PickerTabRow({
       <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {tab.name}
       </span>
+      {status === 'waiting' && <StatusIcon status="waiting" color={PULSE} />}
     </button>
   );
 }
 
-function StatusIcon({ status, color }: { status: 'busy' | 'idle'; color: string }) {
-  if (status !== 'busy') return null;
+function StatusIcon({ status, color }: { status: TabRuntimeStatus; color: string }) {
+  if (status === 'idle') return null;
   return (
-    <span style={{ flexShrink: 0, display: 'inline-flex' }}>
-      <svg
-        width="9"
-        height="9"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke={color}
-        strokeWidth="3"
-        strokeLinecap="round"
-        aria-hidden="true"
-        style={{ animation: 'run-after-picker-spin 1.35s linear infinite' }}
-      >
-        <path d="M12 2v4" />
-        <path d="M12 18v4" />
-        <path d="M4.93 4.93l2.83 2.83" />
-        <path d="M16.24 16.24l2.83 2.83" />
-        <path d="M2 12h4" />
-        <path d="M18 12h4" />
-        <path d="M4.93 19.07l2.83-2.83" />
-        <path d="M16.24 7.76l2.83-2.83" />
-      </svg>
+    <span
+      title={status === 'busy' ? 'Agent is running' : 'Waiting for its Run after trigger'}
+      style={{ width: 11, height: 11, flexShrink: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}
+    >
+      {status === 'busy' ? (
+        <LoaderCircle
+          size={9}
+          strokeWidth={3}
+          color={color}
+          aria-hidden="true"
+          style={{ animation: 'run-after-picker-spin 1.35s linear infinite' }}
+        />
+      ) : (
+        <Hourglass size={10} strokeWidth={2.2} color={color} aria-hidden="true" />
+      )}
     </span>
   );
 }

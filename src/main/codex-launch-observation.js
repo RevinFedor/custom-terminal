@@ -38,7 +38,6 @@ async function executeCodexLaunchObservation(input, adapters) {
   let sourceAttached = null;
 
   if (plan.attachSource) {
-    adapters.setProvisionalSession?.(plan.sourceSessionId, plan);
     sourceAttached = await adapters.attachSource?.(plan.sourceSessionId, plan);
   }
 

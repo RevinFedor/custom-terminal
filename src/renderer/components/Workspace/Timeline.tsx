@@ -14,6 +14,12 @@ import {
   type TimelineSemanticGroup,
 } from '../../store/useTimelineOutlineStore';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
+import { requireConfirmedCodexWriter } from '../../utils/codexWriterIdentity';
+import {
+  prepareCodexRewindRuntime,
+  revalidatePreparedCodexRewindRuntime,
+  type PreparedCodexRewindRuntime,
+} from '../../utils/agentScenarios';
 import { getHistoryAgentRuntime, type AgentHistoryTool, type AgentPtyStatus } from '../../utils/historyAgentRuntimes';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from '../../utils/claudeStartupDefaultsReady';
 import EditRangePanel from './EditRangePanel';
@@ -3665,7 +3671,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     }
   };
 
-  const stopCodexForHistoryMutation = async (operation: 'Edit Range' | 'Delete Range') => {
+  const stopCodexForHistoryMutation = async (operation: 'Edit Range' | 'Delete Range'): Promise<string> => {
     const caller = operation === 'Edit Range'
       ? 'Timeline.codexEditRange'
       : 'Timeline.codexDeleteRange';
@@ -3676,8 +3682,26 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       allowProcessTreeLookup: true,
     });
     console.warn(`[Codex${operation.replace(/\s/g, '')}] commandState:`, JSON.stringify(cmdState));
+    if (cmdState?.processLookupUnknown && !cmdState?.isRunning) {
+      throw new Error(`Не удалось проверить процесс Codex перед ${operation}; история не изменена`);
+    }
 
-    if (!cmdState?.isRunning) return;
+    // A stopped tab has no live writer to prove. Its persisted session is the
+    // historical mutation target; do not auto-resume here because that would
+    // silently choose launch settings (model/effort) inside a history action.
+    if (!cmdState?.isRunning) {
+      const historicalSessionId = sessionIdRef.current;
+      if (!historicalSessionId) {
+        throw new Error(`Нет Codex-сессии для ${operation}`);
+      }
+      return historicalSessionId;
+    }
+
+    const writerSessionId = await requireConfirmedCodexWriter({
+      tabId,
+      expectedSessionId: sessionIdRef.current,
+      operation: operation === 'Edit Range' ? 'Редактировать историю' : 'Удалить историю',
+    });
 
     const turnState = await ipcRenderer.invoke('codex:get-turn-state', tabId).catch((err: any) => {
       console.warn(`[Codex${operation.replace(/\s/g, '')}] turn-state lookup failed:`, err?.message || err);
@@ -3691,21 +3715,21 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     if (!stopResult?.success) {
       throw new Error(stopResult?.error || 'Failed to stop Codex');
     }
+    return writerSessionId;
   };
 
-  const adoptAndRestartCodexHistory = (newSessionId: string, reason: 'editRange' | 'deleteRange') => {
-    useWorkspaceStore.getState().setCodexSessionId(tabId, newSessionId, reason);
-    ipcRenderer.send('codex:run-command', buildCodexRunPayload({
+  const adoptAndRestartCodexHistory = async (newSessionId: string, reason: 'editRange' | 'deleteRange') => {
+    const committed = await useWorkspaceStore.getState().setCodexSessionId(tabId, newSessionId, reason);
+    if (!committed) throw new Error('Codex session binding could not be committed');
+    const launchResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
       tabId,
       command: 'codex-c',
       sessionId: newSessionId,
       cwd,
     }));
-    ipcRenderer.send('terminal:force-command-started', {
-      tabId,
-      commandType: 'codex',
-      sessionId: newSessionId,
-    });
+    if (launchResult?.success === false) {
+      throw new Error(launchResult.error || launchResult.reason || 'Codex restart failed');
+    }
   };
 
   const executeRangeAction = async (mode: 'copy' | 'edit', range: { startIndex: number; endIndex: number }, startUuid: string, endUuid: string, additionalPrompt?: string) => {
@@ -3807,13 +3831,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setDeletingRange(range);
 
     try {
+      let mutationSessionId = sessionId;
       if (isCodex) {
-        await stopCodexForHistoryMutation('Delete Range');
+        mutationSessionId = await stopCodexForHistoryMutation('Delete Range');
       }
 
       const deleteChannel = isCodex ? 'codex:delete-range' : 'claude:delete-range';
       const result = await ipcRenderer.invoke(deleteChannel, {
-        sessionId,
+        sessionId: mutationSessionId,
         cwd,
         startUuid,
         endUuid,
@@ -3836,7 +3861,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         if (!result.newSessionId) {
           throw new Error('Codex delete-range did not return a new session');
         }
-        adoptAndRestartCodexHistory(result.newSessionId, 'deleteRange');
+        await adoptAndRestartCodexHistory(result.newSessionId, 'deleteRange');
       } else if (result.fileDeleted) {
         // Файл стёрт — освобождаем таб от сессии. Кнопка "Продолжить" запустит claude
         // как новую сессию (без --resume), а Timeline опустеет на следующем рефреше.
@@ -4133,6 +4158,30 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     // IPC channel names based on tool type
     const copyRangeChannel = isCodex ? 'codex:copy-range' : isGemini ? 'gemini:copy-range' : 'claude:copy-range';
     const historyMenuChannel = isCodex ? 'codex:open-history-menu' : isGemini ? 'gemini:open-history-menu' : 'claude:open-history-menu';
+    const sourceEndUuid = entries[entries.length - 1].uuid;
+    let preparedCodex: PreparedCodexRewindRuntime | null = null;
+    if (isCodex) {
+      try {
+        preparedCodex = await prepareCodexRewindRuntime({
+          tabId,
+          runtime: getHistoryAgentRuntime('codex'),
+          sourceSessionId: sessionId,
+          cwd,
+          targetIndex,
+          targetUuid: entry.uuid,
+          endUuid: mode === 'ai' ? sourceEndUuid : null,
+          targetFullText: entry.content.trim(),
+          rewindableCount: rewindableEntries.length,
+        });
+      } catch (error: any) {
+        const message = String(error?.message || error || 'Codex Rewind preparation failed');
+        emitHistoryRewindLog('failed', message);
+        showRewindFailureFeedback(message);
+        setRewindState(null);
+        activeRewindRef.current = null;
+        return;
+      }
+    }
 
     // Phase 1: Optional AI compact of entries being lost (from clicked entry to end).
     // Native rewind intentionally skips this for the fast `/rewind` → arrows → Enter path.
@@ -4144,10 +4193,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       try {
         emitHistoryRewindLog('start', undefined, 'Gemini Rewind: copying range...');
         const rangeResult = await ipcRenderer.invoke(copyRangeChannel, {
-          sessionId,
+          sessionId: preparedCodex?.writerSessionId || sessionId,
           cwd,
-          startUuid: entry.uuid,
-          endUuid: entries[entries.length - 1].uuid,
+          startUuid: preparedCodex?.targetUuid || entry.uuid,
+          endUuid: preparedCodex?.endUuid || sourceEndUuid,
           ...copyFlags,
         });
 
@@ -4256,10 +4305,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       }
     }
 
-    const ensureAgentReadyForRewind = async () => {
+    const ensureNonCodexAgentReadyForRewind = async () => {
       if (isGemini) return;
-      if (toolType !== 'claude' && toolType !== 'codex') return;
-      const runtime = getHistoryAgentRuntime(toolType as AgentHistoryTool);
+      if (toolType !== 'claude') return;
+      const runtime = getHistoryAgentRuntime('claude');
       const describePresence = (presence: any) =>
         'status=' + (presence?.status || 'unknown') +
         ' inputReady=' + !!presence?.inputReady +
@@ -4342,7 +4391,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     setRewindState({ index: entryIndex, phase: 'rewinding' });
 
     try {
-      await ensureAgentReadyForRewind();
+      if (isCodex) {
+        preparedCodex = await revalidatePreparedCodexRewindRuntime({
+          tabId,
+          prepared: preparedCodex!,
+          cwd,
+          targetIndex,
+          sourceTargetUuid: entry.uuid,
+          sourceEndUuid: mode === 'ai' ? sourceEndUuid : null,
+          targetFullText: entry.content.trim(),
+          rewindableCount: rewindableEntries.length,
+        });
+      } else {
+        await ensureNonCodexAgentReadyForRewind();
+      }
       if (rewindCancelledRef.current) {
         finishCancelled();
         return;
@@ -4352,7 +4414,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         targetIndex,
         targetText: targetPrefix,
         targetFullText: entry.content.trim(),
-        targetUuid: entry.uuid,
+        targetUuid: preparedCodex?.targetUuid || entry.uuid,
+        writerSessionId: preparedCodex?.writerSessionId || null,
+        writerAuthorization: preparedCodex?.writerAuthorization || null,
+        writerLaunchId: preparedCodex?.writerLaunchId || null,
         rewindableCount: rewindableEntries.length,
         skipDuplicates,
         pasteAfter: compactText || undefined
@@ -6378,12 +6443,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                 const endUuid = entries[range.endIndex].uuid;
 
                 if (isCodex) {
-                  await stopCodexForHistoryMutation('Edit Range');
+                  const mutationSessionId = await stopCodexForHistoryMutation('Edit Range');
 
                   onProgress?.('editing');
                   console.warn('[CodexEditRange] Creating edited local rollout fork...');
                   const result = await ipcRenderer.invoke('codex:edit-range', {
-                    sessionId, cwd, startUuid, endUuid, compactText,
+                    sessionId: mutationSessionId, cwd, startUuid, endUuid, compactText,
                   });
 
                   if (!result.success) {
@@ -6404,7 +6469,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
                   if (result.newSessionId) {
                     onProgress?.('restarting');
-                    adoptAndRestartCodexHistory(result.newSessionId, 'editRange');
+                    await adoptAndRestartCodexHistory(result.newSessionId, 'editRange');
                   }
 
                   setEditRangeState(doneState);

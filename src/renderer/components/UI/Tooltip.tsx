@@ -15,6 +15,9 @@ interface TooltipProps {
   // the tooltip only appears when Cmd is held — most UI is self-explanatory and
   // tooltip-spam is noise. Reserve `always` for genuinely opaque controls.
   always?: boolean;
+  // Simple labels should not expose the selectable body and Copy action bar.
+  // Interactive mode remains the default for existing long-form tooltips.
+  interactive?: boolean;
 }
 
 // ─── Global Cmd-key state ────────────────────────────────────
@@ -74,6 +77,7 @@ export default function Tooltip({
   delay = 0,
   disabled = false,
   always = false,
+  interactive = true,
 }: TooltipProps) {
   const [hovering, setHovering] = useState(false);
   const [visible, setVisible] = useState(false);
@@ -104,8 +108,14 @@ export default function Tooltip({
   // selection / Copy click possible — without it the leave-trigger event would
   // hide before pointer-enter on the tip can fire.
   useEffect(() => {
-    if (isInactive) { setVisible(false); return; }
-    const wantOpen = (hovering || inTip) && allowedToShow;
+    if (isInactive) {
+      setVisible(false);
+      setHovering(false);
+      setInTip(false);
+      return;
+    }
+    const triggerIsHovered = interactive || triggerRef.current?.matches(':hover') === true;
+    const wantOpen = ((hovering && triggerIsHovered) || (interactive && inTip)) && allowedToShow;
     if (wantOpen) {
       if (delay <= 0) setVisible(true);
       else {
@@ -116,7 +126,7 @@ export default function Tooltip({
       if (showTimerRef.current) { clearTimeout(showTimerRef.current); showTimerRef.current = null; }
       setVisible(false);
     }
-  }, [hovering, inTip, allowedToShow, isInactive, delay]);
+  }, [hovering, inTip, allowedToShow, isInactive, delay, interactive]);
 
   // Reset Copy feedback whenever the tooltip closes — otherwise reopening on a
   // different element would briefly show the stale ✓ from the previous instance.
@@ -136,12 +146,18 @@ export default function Tooltip({
   // while still feeling instant on leave. Higher values produced a "lingering"
   // tooltip after the cursor was already far from the trigger.
   const hide = useCallback(() => {
+    if (!interactive) {
+      if (hideTimerRef.current) { clearTimeout(hideTimerRef.current); hideTimerRef.current = null; }
+      setHovering(false);
+      setInTip(false);
+      return;
+    }
     if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
     hideTimerRef.current = setTimeout(() => {
       setHovering(false);
       hideTimerRef.current = null;
     }, 60);
-  }, []);
+  }, [interactive]);
 
   // Extract a plain-text representation of `content` for the Copy button.
   // String content is trivial; for ReactNode trees we read the rendered text
@@ -285,10 +301,10 @@ export default function Tooltip({
         <div
           ref={tipRef}
           role="tooltip"
-          onPointerEnter={() => {
+          onPointerEnter={interactive ? () => {
             if (hideTimerRef.current) { clearTimeout(hideTimerRef.current); hideTimerRef.current = null; }
             setInTip(true);
-          }}
+          } : undefined}
           // When the cursor leaves the tooltip body, force-close. Previously
           // only `inTip` was reset — but `hovering` could still be `true` from
           // a trigger→tip transition that cancelled the hide-timer (the timer
@@ -297,21 +313,21 @@ export default function Tooltip({
           // both elements. Resetting both here makes leave-from-tip terminal;
           // if the cursor lands back on the trigger, its onPointerEnter will
           // flip `hovering` back to true and reopen.
-          onPointerLeave={() => {
+          onPointerLeave={interactive ? () => {
             if (hideTimerRef.current) { clearTimeout(hideTimerRef.current); hideTimerRef.current = null; }
             setInTip(false);
             setHovering(false);
-          }}
+          } : undefined}
           // Prevent the trigger's onPointerDown from firing while clicks land
           // inside the tooltip body (e.g. clicking the Copy button shouldn't
           // submit the button under the tooltip).
-          onPointerDown={(e) => { e.stopPropagation(); }}
+          onPointerDown={interactive ? (e) => { e.stopPropagation(); } : undefined}
           style={{
             position: 'fixed',
             left: pos?.left ?? -9999,
             top: pos?.top ?? -9999,
             zIndex: 100000,
-            pointerEvents: 'auto',
+            pointerEvents: interactive ? 'auto' : 'none',
             background: '#1a1a1a',
             color: '#e5e5e5',
             border: '1px solid #333',
@@ -328,7 +344,7 @@ export default function Tooltip({
             // can click in here now" — too loud and it competes with the
             // surrounding UI; too subtle and the user doesn't realise the
             // affordance changed.
-            outline: inTip ? '1px solid rgba(255,255,255,0.08)' : 'none',
+            outline: interactive && inTip ? '1px solid rgba(255,255,255,0.08)' : 'none',
             outlineOffset: 0,
           }}
         >
@@ -336,7 +352,7 @@ export default function Tooltip({
               (not hidden until hover) so the layout stays stable and the user
               can mouse to it without the box shifting. The body sits below;
               text inside it is selectable. */}
-          <div
+          {interactive && <div
             data-tooltip-actions
             style={{
               display: 'flex',
@@ -390,14 +406,14 @@ export default function Tooltip({
             >
               {copied ? '✓ Скопировано' : 'Копировать'}
             </button>
-          </div>
+          </div>}
           <div
             data-tooltip-body
             style={{
               padding: '6px 8px',
               whiteSpace: 'pre-wrap',
-              userSelect: 'text',
-              cursor: 'text',
+              userSelect: interactive ? 'text' : 'none',
+              cursor: interactive ? 'text' : 'default',
             }}
           >
             {content}

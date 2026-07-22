@@ -565,7 +565,7 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
       return Math.max(width, child.offsetWidth + extra);
     }, 0);
     setAutoWidth(clampContentWidth(Math.ceil(widestTitle)));
-  }, [draftTitles, plan.items]);
+  }, [draftTitles, expanded, marker.sizePx, plan.items]);
 
   const statusById = useMemo(() => new Map(taskStatuses.map((status) => [status.id, status])), [taskStatuses]);
 
@@ -742,7 +742,7 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
           backdropFilter: 'blur(8px)',
           overflow: 'hidden',
           pointerEvents: 'auto',
-          transition: animateExpansion ? 'box-shadow 160ms ease' : 'none',
+          transition: animateExpansion ? 'width 180ms cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 160ms ease' : 'none',
         }}
       >
       <div
@@ -897,10 +897,10 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
 
       <div ref={titleMeasureRef} aria-hidden style={{ position: 'absolute', left: -10000, top: 0, visibility: 'hidden', pointerEvents: 'none', display: 'flex', flexDirection: 'column', alignItems: 'flex-start', whiteSpace: 'nowrap', fontSize: 12 }}>
         {plan.items.flatMap((task) => [
-          <span key={task.id} data-width-extra="70" style={{ padding: '3px 5px' }}>{renderTitle(draftTitles[task.id] ?? task.title)}</span>,
-          ...task.subtasks.map((subtask) => (
-            <span key={subtask.id} data-width-extra="82" style={{ padding: '3px 5px' }}>{renderTitle(draftTitles[subtask.id] ?? subtask.title)}</span>
-          )),
+          <span key={task.id} data-width-extra={marker.sizePx + (expanded ? 62 : 24)} style={{ padding: '3px 5px' }}>{renderTitle(draftTitles[task.id] ?? task.title)}</span>,
+          ...(expanded ? task.subtasks.map((subtask) => (
+            <span key={subtask.id} data-width-extra={marker.sizePx + 74} style={{ padding: '3px 5px' }}>{renderTitle(draftTitles[subtask.id] ?? subtask.title)}</span>
+          )) : []),
         ])}
       </div>
 

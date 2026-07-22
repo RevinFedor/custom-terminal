@@ -127,8 +127,38 @@ const {
 const {
   executeCodexLaunchObservation,
 } = require(path.join(srcMainDir, 'codex-launch-observation'));
+const {
+  createCodexLaunchPendingResult,
+  createCodexPtySubmitAdmission,
+  liveLifecycleFromCodexWriterStatus,
+  projectCodexPublicRuntimeProjection,
+  projectCodexRuntimeStatus,
+  shouldClearCodexLaunchPending,
+  shouldHoldCodexStartingOnAbsent,
+  shouldSurfaceCodexStartupTimeout,
+  validateCodexPtySubmitAdmission,
+} = require(path.join(srcMainDir, 'codex-runtime-contract'));
+const {
+  classifyManualCodexSubmitAfterWriteQueue,
+  classifyCodexWriterAdoption,
+  classifyCodexProvisionalActionAuthorization,
+  classifyCodexWriterHandoffSettlement,
+  claimExclusiveActionReservation,
+  claimCodexResumeSourceLease: claimCodexResumeSourceLeaseInRegistry,
+  releaseExclusiveActionReservation,
+  releaseCodexResumeSourceLeases: releaseCodexResumeSourceLeasesInRegistry,
+  resolveCompleteCodexWriterProof,
+  resolveCodexUserWriterProof,
+  isCodexWriterProofOwnershipQuarantined,
+  runKeyedExclusive,
+  runKeyedSingleFlight,
+} = require(path.join(srcMainDir, 'codex-writer-ownership'));
 const { validateTerminalCwdCandidate } = require(path.join(srcMainDir, 'terminal-cwd-proof'));
 const { TabHistoryRestoreLeases } = require(path.join(srcMainDir, 'tab-history-restore-leases'));
+const { runSaveTabsWithAck } = require(path.join(srcMainDir, 'save-tabs-ack'));
+const { commitTabProjectTransfer } = require(path.join(srcMainDir, 'tab-project-ownership'));
+const { persistCodexWriterBinding } = require(path.join(srcMainDir, 'codex-writer-binding'));
+const { finalizeCodexArchiveSnapshot } = require(path.join(srcMainDir, 'codex-archive-snapshot'));
 const {
   AI_PROCESS_LOOKUP_STATUS,
   AiProcessLookupError,
@@ -1901,6 +1931,7 @@ const claudeConfirmDialogCooldown = new Map(); // `${tabId}:${dialogType}` -> la
 const codexStartupAutoEnter = new Map(); // tabId -> one-shot state for Codex startup confirmation prompts
 const codexMcpStartupWatchdogs = new Map(); // tabId -> MCP startup restart watchdog state, independent of prompt TTL
 const codexStartupNoStateTimeoutTabs = new Set(); // tabIds that already surfaced generic startup timeout
+const codexStartupNoStateTimeoutTimers = new Map(); // tabId -> { timer, launchId, startedAt }
 const codexTuiReadyTabs = new Set();     // tabIds whose current Codex TUI process rendered an input-ready frame
 const codexTuiReadyMeta = new Map();     // tabId -> { at, source, reason, preview } for Rewind/readiness forensics
 const codexTuiReadyBuffers = new Map();  // tabId -> recent startup output for deterministic ready detection
@@ -3003,7 +3034,26 @@ startProxyOnPort(4001);
 // bridge.ppid (Claude PID) → parent PID (shell) → ptyProcess.pid (our tab)
 const bridgeDir = path.join(os.homedir(), '.claude', 'bridge');
 const bridgeKnownSessions = new Map(); // tabId → sessionId
-const codexKnownSessions = new Map(); // tabId → sessionId; Codex TUI alive in this PTY
+// Proven writer only. Resume arguments and persisted fallback IDs live in the
+// launch intent / SQLite respectively and must never enter this map until the
+// PTY descendant is proven to hold that rollout open for writing.
+const codexKnownSessions = new Map(); // tabId → active writer sessionId
+const codexWriterProofs = new Map(); // tabId → last process-open rollout proof + validity
+const codexWriterProcessProofInflight = new Map(); // tabId → shared ps/lsof proof promise
+const codexWriterReconcileInflight = new Map(); // tab/observer key → shared adoption promise
+const codexWriterSessionInflight = new Map(); // rollout sessionId → cross-tab ownership transaction
+const codexRewindReservations = new Map(); // tabId → the one destructive native Rewind currently authorized
+let codexRewindReservationSeq = 0;
+const codexLaunchObservationPending = new Map(); // tabId → launchId while observer is being attached
+// tabId → launchId from PTY write until authoritative TUI/rollout/lifecycle
+// settlement (or the one-shot startup watchdog). This is not process proof.
+const codexLaunchAcceptancePending = new Map();
+const codexLaunchInflight = new Map(); // tabId → serialized launch/resume admission
+// A resume source is launch intent, not writer identity, but two live resumes
+// of the same source cannot be attributed reliably if both processes keep that
+// rollout writable. Lease the source for the process lifetime; fork remains
+// multi-owner because it must create an independent child rollout.
+const codexResumeSourceLeases = new Map(); // sourceSessionId → { tabId, launchId, at }
 const aiStoppingTabs = new Map(); // tabId → { toolType, reason, since, sessionId }
 const claudeStartupIntents = new Map(); // tabId → { sessionId, at, reason }
 const claudeStartupDefaultsGateByTab = new Map(); // tabId → { status, reason, error, at }
@@ -3513,52 +3563,150 @@ function publishClaudePromptReady(tabId, reason = 'prompt-ready') {
   return true;
 }
 
-function setCodexKnownSession(tabId, sessionId, reason = 'detected') {
-  if (!tabId || !sessionId) return;
+function persistCodexKnownSessionBinding(tabId, sessionId) {
+  const projectId = resolveAuthoritativeTabProjectId(tabId);
+  return persistCodexWriterBinding({
+    projectId,
+    tabId,
+    sessionId,
+    readBinding: (scopedProjectId, scopedTabId) => (
+      projectManager?.db?.getTabCodexSessionId?.(scopedProjectId, scopedTabId)
+    ),
+    writeBinding: (scopedProjectId, scopedTabId, nextSessionId) => (
+      projectManager?.db?.updateTabCodexSessionId?.(scopedProjectId, scopedTabId, nextSessionId)
+    ),
+  });
+}
+
+function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = null, durableBinding = null) {
+  if (!tabId || !sessionId) {
+    return { success: false, error: 'codex_writer_identity_invalid', retryable: false };
+  }
+  const persisted = durableBinding?.success === true
+    ? durableBinding
+    : persistCodexKnownSessionBinding(tabId, sessionId);
+  if (persisted?.success !== true) {
+    console.warn('[Codex:Known] persist pending tab=' + String(tabId).slice(-12)
+      + ' session=' + String(sessionId).slice(0, 8)
+      + ' reason=' + reason
+      + ' error=' + (persisted?.error || 'codex_writer_binding_not_committed'));
+    return {
+      success: false,
+      error: persisted?.error || 'codex_writer_binding_not_committed',
+      retryable: persisted?.retryable !== false,
+    };
+  }
   const prev = codexKnownSessions.get(tabId) || null;
+  const prevProof = codexWriterProofs.get(tabId) || null;
   codexKnownSessions.set(tabId, sessionId);
-  // Runtime identity belongs to main, where the rollout writer is observed.
-  // Persist it here as part of the same adoption commit; relying only on the
-  // renderer event lets a reload/crash leave SQLite bound to the resume source
-  // while main is already following its new Codex 0.145 child rollout.
-  if (prev !== sessionId) {
-    try {
-      projectManager?.db?.db?.prepare(
-        'UPDATE tabs SET codex_session_id = ? WHERE tab_id = ?'
-      ).run(sessionId, tabId);
-    } catch (e) {
-      console.warn('[Codex:Known] persist failed tab=' + String(tabId).slice(-12)
-        + ' session=' + String(sessionId).slice(0, 8)
-        + ' reason=' + reason
-        + ' error=' + (e?.message || String(e)));
-    }
+  const proofRecord = {
+    sessionId,
+    kind: proof?.kind || 'event-proof',
+    filePath: proof?.filePath || null,
+    pids: Array.isArray(proof?.pids) ? proof.pids : [],
+    at: Date.now(),
+    launchId: proof?.launchId || null,
+    sourceMatch: proof?.sourceMatch || null,
+    forkedFromId: proof?.forkedFromId || null,
+    sourceSessionId: proof?.sourceSessionId || null,
+    valid: true,
+    invalidatedAt: null,
+    invalidatedReason: null,
+  };
+  codexWriterProofs.set(tabId, proofRecord);
+  const proofChanged = prev !== sessionId
+    || prevProof?.kind !== proofRecord.kind
+    || prevProof?.filePath !== proofRecord.filePath
+    || prevProof?.valid !== true;
+  if (proofChanged && mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('terminal:mcp-ai-tab', {
+      tabId,
+      engine: 'codex',
+      sessionId,
+      reason,
+      writerProven: true,
+      writerProof: proofRecord.kind,
+    });
   }
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('terminal:mcp-ai-tab', { tabId, engine: 'codex', sessionId, reason });
-  }
-  if (prev !== sessionId) {
+  if (proofChanged) {
     console.log('[Codex:Known] set tab=' + String(tabId).slice(-12) +
       ' session=' + String(sessionId).slice(0, 8) +
       ' reason=' + reason +
       ' prev=' + (prev ? String(prev).slice(0, 8) : 'none') +
+      ' revalidated=' + (prev === sessionId) +
       ' total=' + codexKnownSessions.size);
-    const turn = codexTurnWatchers.get(tabId);
-    const isBusy = turn?.busy === true;
-    const inputReady = !isBusy && codexTuiReadyTabs.has(tabId);
+    const runtimeProjection = getCodexPublicRuntimeProjection(tabId);
     _webBroadcast(tabId, {
       type: 'snapshot',
       sessionId,
-      busy: isBusy,
-      sessionStatus: isBusy ? 'busy' : (inputReady ? 'active' : 'starting'),
+      busy: runtimeProjection.busy,
+      sessionStatus: runtimeProjection.sessionStatus,
+      starting: runtimeProjection.sessionStatus === 'starting',
       toolType: 'codex',
       commandType: 'codex',
-      inputReady,
+      inputReady: runtimeProjection.inputReady,
+      ...getCodexPublicWriterFields(tabId),
     });
   }
+  return { success: true, persisted, proofChanged };
+}
+
+function getCodexWriterProofSnapshot(tabId) {
+  if (!tabId) return null;
+  const sessionId = codexKnownSessions.get(tabId) || null;
+  const proof = codexWriterProofs.get(tabId) || null;
+  if (!sessionId || !proof || proof.sessionId !== sessionId || proof.valid !== true) return null;
+  return { ...proof, sessionId };
+}
+
+function isCodexWriterUsableForMutation(tabId) {
+  if (!getCodexWriterProofSnapshot(tabId)) return false;
+  const discovery = codexWatchers.get(tabId) || null;
+  return !(discovery?.sourceMode === 'writer-handoff' && discovery.handoffPending === true);
+}
+
+function hasCodexEstablishedWriterUiLifecycle(tabId) {
+  if (isCodexWriterUsableForMutation(tabId)) return true;
+  const proof = codexWriterProofs.get(tabId) || null;
+  const payload = codexLastRunCommandPayload.get(tabId) || null;
+  const discovery = codexWatchers.get(tabId) || null;
+  if (!proof?.sessionId || codexKnownSessions.get(tabId) !== proof.sessionId) return false;
+  if (payload?.launchId && proof.launchId !== payload.launchId) return false;
+  if (discovery?.sourceMode === 'writer-handoff' && discovery.handoffPending === true) return false;
+  // Preserve only the visual lifecycle across a fallible process-inspection
+  // outage. The current session ID and all mutations remain revoked. Other
+  // invalidation reasons (new launch, rewind handoff, absence) must show
+  // starting/unresolved rather than reusing an old active state.
+  const reason = String(proof.invalidatedReason || '');
+  return proof.valid !== true && (
+    reason.includes('process-unknown')
+    || reason.includes('writer-unknown')
+    || reason.includes('revalidation-unknown')
+  );
+}
+
+function invalidateCodexWriterProof(tabId, reason = 'unproven') {
+  const proof = codexWriterProofs.get(tabId) || null;
+  if (!proof) return false;
+  const changed = proof.valid === true || proof.invalidatedReason !== reason;
+  codexWriterProofs.set(tabId, {
+    ...proof,
+    valid: false,
+    invalidatedAt: Date.now(),
+    invalidatedReason: reason,
+  });
+  if (changed) {
+    console.warn('[CodexWriterProof] invalidate tab=' + String(tabId).slice(-12)
+      + ' session=' + String(proof.sessionId || 'none').slice(0, 8)
+      + ' reason=' + reason);
+  }
+  return changed;
 }
 
 function clearCodexKnownSession(tabId, reason = 'clear') {
   const sid = codexKnownSessions.get(tabId) || null;
+  codexWriterProofs.delete(tabId);
+  releaseCodexResumeSourceLeaseForTab(tabId, reason);
   if (!sid) return;
   codexKnownSessions.delete(tabId);
   console.log('[Codex:Known] clear tab=' + String(tabId).slice(-12) +
@@ -3567,15 +3715,110 @@ function clearCodexKnownSession(tabId, reason = 'clear') {
     ' remaining=' + codexKnownSessions.size);
 }
 
-function clearCodexLaunchPayload(tabId, reason = 'clear') {
-  if (!tabId || !codexLastRunCommandPayload.has(tabId)) return;
-  const payload = codexLastRunCommandPayload.get(tabId);
+function claimCodexResumeSourceLease(sourceSessionId, tabId, launchId) {
+  const provenOwner = getCodexSessionOwner(sourceSessionId, tabId);
+  return claimCodexResumeSourceLeaseInRegistry(codexResumeSourceLeases, {
+    sourceSessionId,
+    tabId,
+    launchId,
+    provenOwner,
+  });
+}
+
+function releaseCodexResumeSourceLeaseForTab(
+  tabId,
+  reason = 'clear',
+  sourceSessionId = null,
+  launchId = null,
+) {
+  const released = releaseCodexResumeSourceLeasesInRegistry(codexResumeSourceLeases, {
+    tabId,
+    sourceSessionId,
+    launchId,
+  });
+  for (const source of released) {
+    console.log('[CodexResumeLease] release tab=' + String(tabId).slice(-12)
+      + ' source=' + String(source).slice(0, 8)
+      + ' reason=' + reason);
+  }
+}
+
+function getCodexResumeSourceLeaseForTab(tabId) {
+  for (const [sourceSessionId, lease] of codexResumeSourceLeases) {
+    if (lease?.tabId === tabId) return { sourceSessionId, ...lease };
+  }
+  return null;
+}
+
+function markCodexLaunchAcceptancePending(tabId, launchId) {
+  if (!tabId || !launchId) return;
+  const previousLaunchId = codexLaunchAcceptancePending.get(tabId) || null;
+  codexLaunchAcceptancePending.set(tabId, launchId);
+  console.log('[CodexLaunchAcceptance] pending tab=' + String(tabId).slice(-12)
+    + ' launch=' + launchId
+    + ' replaced=' + (previousLaunchId || '-'));
+}
+
+function clearCodexLaunchAcceptancePending(tabId, reason = 'clear', expectedLaunchId = null) {
+  if (!tabId) return false;
+  const currentLaunchId = codexLaunchAcceptancePending.get(tabId) || null;
+  if (!shouldClearCodexLaunchPending(currentLaunchId, expectedLaunchId)) {
+    if (currentLaunchId && expectedLaunchId) {
+      console.log('[CodexLaunchAcceptance] stale clear ignored tab=' + String(tabId).slice(-12)
+        + ' reason=' + reason
+        + ' expected=' + expectedLaunchId
+        + ' current=' + currentLaunchId);
+    }
+    return false;
+  }
+  codexLaunchAcceptancePending.delete(tabId);
+  console.log('[CodexLaunchAcceptance] clear tab=' + String(tabId).slice(-12)
+    + ' reason=' + reason
+    + ' launch=' + currentLaunchId);
+  return true;
+}
+
+function clearCodexStartupNoStateTimeoutTimer(tabId, reason = 'clear', expectedLaunchId = null) {
+  if (!tabId) return false;
+  const state = codexStartupNoStateTimeoutTimers.get(tabId);
+  if (!state) return false;
+  if (expectedLaunchId && state.launchId !== expectedLaunchId) {
+    console.log('[CodexStartupTimeout] stale timer clear ignored tab=' + String(tabId).slice(-12)
+      + ' reason=' + reason
+      + ' expected=' + expectedLaunchId
+      + ' current=' + (state.launchId || '-'));
+    return false;
+  }
+  if (state.timer) clearTimeout(state.timer);
+  codexStartupNoStateTimeoutTimers.delete(tabId);
+  console.log('[CodexStartupTimeout] timer clear tab=' + String(tabId).slice(-12)
+    + ' reason=' + reason
+    + ' launch=' + (state.launchId || '-')
+    + ' startedAt=' + (state.startedAt || 0));
+  return true;
+}
+
+function clearCodexLaunchPayload(tabId, reason = 'clear', expectedLaunchId = null) {
+  if (!tabId) return false;
+  const payload = codexLastRunCommandPayload.get(tabId) || null;
+  if (payload && expectedLaunchId && payload.launchId !== expectedLaunchId) {
+    console.log('[Codex Runner] stale launch payload clear ignored tab=' + String(tabId).slice(-12)
+      + ' reason=' + reason
+      + ' expected=' + expectedLaunchId
+      + ' current=' + (payload.launchId || '-'));
+    return false;
+  }
+  const scopedLaunchId = expectedLaunchId || payload?.launchId || null;
+  clearCodexStartupNoStateTimeoutTimer(tabId, 'launch-payload:' + reason, scopedLaunchId);
+  clearCodexLaunchAcceptancePending(tabId, reason, scopedLaunchId);
+  if (!payload) return false;
   codexLastRunCommandPayload.delete(tabId);
   console.log('[Codex Runner] launch payload clear tab=' + String(tabId).slice(-12)
     + ' reason=' + reason
     + ' launch=' + (payload?.launchId || '-')
     + ' command=' + (payload?.command || '-')
     + ' session=' + (payload?.sessionId ? String(payload.sessionId).slice(0, 8) : 'new'));
+  return true;
 }
 
 function clearCodexManualActionRequired(tabId, reason = 'clear') {
@@ -3690,12 +3933,90 @@ function markCodexManualActionRequired(tabId, type, inspected = {}, clean = '', 
 
 function getCodexRuntimeSessionId(tabId) {
   if (!tabId) return null;
-  const turn = codexTurnWatchers.get(tabId);
-  return turn?.sessionId
-    || codexKnownSessions.get(tabId)
-    || codexLastRunCommandPayload.get(tabId)?.sessionId
-    || codexSessionIdFromDb(tabId)
-    || null;
+  // While a Codex process is live, an old durable binding is display/history
+  // state only. It must never masquerade as the current writer in APIs, loader
+  // snapshots, Copy ID, or destructive Timeline actions.
+  if (hasEstablishedCodexLifecycleIndicators(tabId)) {
+    return getCodexWriterProofSnapshot(tabId)?.sessionId || null;
+  }
+  return codexSessionIdFromDb(tabId) || codexKnownSessions.get(tabId) || null;
+}
+
+function hasEstablishedCodexLifecycleIndicators(tabId) {
+  if (!tabId) return false;
+  return terminalCommandState.get(tabId)?.isRunning === true
+    || !!getCodexWriterProofSnapshot(tabId)
+    || codexWatchers.has(tabId)
+    || codexTurnWatchers.has(tabId)
+    || codexTuiReadyTabs.has(tabId)
+    || codexLastRunCommandPayload.has(tabId)
+    || codexSessionDiscoveryIntents.has(tabId)
+    || codexPromptInFlight.has(tabId)
+    || aiStoppingTabs.get(tabId)?.toolType === 'codex'
+    || activityOpenIntervals.get(tabId)?.engine === 'codex';
+}
+
+function codexHasLivePtySubmitEvidence(tabId) {
+  return codexTuiReadyTabs.has(tabId)
+    || codexWatchers.has(tabId)
+    || codexTurnWatchers.has(tabId)
+    || !!getCodexWriterProofSnapshot(tabId)
+    || codexPromptInFlight.has(tabId);
+}
+
+function captureCodexPtySubmitAdmission(tabId, term) {
+  const state = terminalCommandState.get(tabId) || null;
+  return {
+    ...createCodexPtySubmitAdmission({
+      processRunning: state?.isRunning === true,
+      hasLiveCodexEvidence: codexHasLivePtySubmitEvidence(tabId),
+      runSeq: state?.runSeq || 0,
+    }),
+    tabId,
+    term,
+  };
+}
+
+function revalidateCodexPtySubmitAdmission(token) {
+  if (!token?.tabId || terminals.get(token.tabId) !== token.term) {
+    return { valid: false, reason: 'codex_terminal_generation_changed' };
+  }
+  const state = terminalCommandState.get(token.tabId) || null;
+  return validateCodexPtySubmitAdmission(token, {
+    processRunning: state?.isRunning === true,
+    hasLiveCodexEvidence: codexHasLivePtySubmitEvidence(token.tabId),
+    runSeq: state?.runSeq || 0,
+  });
+}
+
+function getCodexSavedSessionId(tabId) {
+  return codexSessionIdFromDb(tabId) || codexKnownSessions.get(tabId) || null;
+}
+
+function getCodexPublicWriterFields(tabId) {
+  const proof = getCodexWriterProofSnapshot(tabId);
+  return {
+    writerConfirmed: !!proof,
+    writerUsableForMutation: !!proof && isCodexWriterUsableForMutation(tabId),
+    canCopySessionId: !!proof && isCodexWriterUsableForMutation(tabId),
+    provenWriterSessionId: proof?.sessionId || null,
+    savedSessionId: getCodexSavedSessionId(tabId),
+    resumeSourceSessionId: codexLastRunCommandPayload.get(tabId)?.sessionId || null,
+  };
+}
+
+function getCodexPublicRuntimeProjection(tabId) {
+  const turnBusy = codexTurnWatchers.get(tabId)?.busy === true;
+  const stopping = aiStoppingTabs.get(tabId)?.toolType === 'codex';
+  return projectCodexPublicRuntimeProjection({
+    liveLifecycle: null,
+    stopping,
+    turnBusy,
+    tuiInputReady: codexTuiReadyTabs.has(tabId),
+    writerUsableForMutation: isCodexWriterUsableForMutation(tabId),
+    writerUiLifecycleEstablished: hasCodexEstablishedWriterUiLifecycle(tabId),
+    hasEstablishedLifecycle: true,
+  });
 }
 
 function resolveAiToolTypeForTab(tabId, fallback = null) {
@@ -3717,10 +4038,14 @@ function getAiRuntimeSessionId(tabId, toolType) {
   return null;
 }
 
-function broadcastAiRuntimeStatus(tabId, toolType, sessionStatus, reason) {
+function broadcastAiRuntimeStatus(tabId, toolType, sessionStatus, reason, runtimeProjection = null) {
   if (!tabId || (toolType !== 'claude' && toolType !== 'codex')) return;
-  const busy = sessionStatus === 'busy' || sessionStatus === 'stopping';
-  const inputReady = sessionStatus === 'active';
+  const busy = typeof runtimeProjection?.busy === 'boolean'
+    ? runtimeProjection.busy
+    : sessionStatus === 'busy' || sessionStatus === 'stopping';
+  const inputReady = typeof runtimeProjection?.inputReady === 'boolean'
+    ? runtimeProjection.inputReady
+    : sessionStatus === 'active';
   let sessionId = sessionStatus === 'inactive' ? null : getAiRuntimeSessionId(tabId, toolType);
   let transcriptState = {};
   if (toolType === 'claude') {
@@ -3758,17 +4083,29 @@ function broadcastAiRuntimeStatus(tabId, toolType, sessionStatus, reason) {
         'SELECT project_id, codex_session_id, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
       ).get(tabId) || null;
     } catch {}
-    const materializationSessionId = getCodexRuntimeSessionId(tabId)
-      || persisted?.codex_session_id
-      || null;
-    if (!sessionId && materializationSessionId) sessionId = materializationSessionId;
+    const writerProof = getCodexWriterProofSnapshot(tabId);
+    const writerSessionId = writerProof?.sessionId || null;
+    const writerUsableForMutation = !!writerSessionId && isCodexWriterUsableForMutation(tabId);
+    const savedSessionId = persisted?.codex_session_id || null;
+    const materializationSessionId = writerSessionId || savedSessionId || null;
+    if (sessionStatus === 'inactive') {
+      sessionId = savedSessionId || writerSessionId || null;
+    } else {
+      sessionId = writerSessionId;
+    }
     const conversationMaterialized = !!materializationSessionId;
     transcriptState = {
       conversationMaterialized,
       canResume: sessionStatus === 'inactive' && conversationMaterialized,
-      canCopySessionId: conversationMaterialized,
+      canCopySessionId: sessionStatus === 'inactive'
+        ? !!savedSessionId
+        : writerUsableForMutation,
       timelineCount: null,
       materializationReason: conversationMaterialized ? 'codex-session-id' : 'no-session-id',
+      writerConfirmed: sessionStatus !== 'inactive' && !!writerSessionId,
+      writerUsableForMutation: sessionStatus !== 'inactive' && writerUsableForMutation,
+      savedSessionId,
+      resumeSourceSessionId: codexLastRunCommandPayload.get(tabId)?.sessionId || null,
     };
     if (sessionStatus === 'inactive' && persisted?.project_id) {
       scheduleProjectLayoutBroadcast(persisted.project_id, 'codex-runtime-inactive');
@@ -3792,9 +4129,8 @@ function broadcastAiRuntimeStatus(tabId, toolType, sessionStatus, reason) {
 function restoreAiRuntimeStatusAfterFailedStop(tabId, toolType, reason = 'stop-failed') {
   if (!tabId || (toolType !== 'claude' && toolType !== 'codex')) return;
   if (toolType === 'codex') {
-    const turnBusy = codexTurnWatchers.get(tabId)?.busy === true;
-    const inputReady = !turnBusy && codexTuiReadyTabs.has(tabId);
-    broadcastAiRuntimeStatus(tabId, toolType, turnBusy ? 'busy' : (inputReady ? 'active' : 'starting'), reason);
+    const runtimeProjection = getCodexPublicRuntimeProjection(tabId);
+    broadcastAiRuntimeStatus(tabId, toolType, runtimeProjection.sessionStatus, reason, runtimeProjection);
     return;
   }
 
@@ -5251,10 +5587,16 @@ async function keepCodexRuntimeAliveFromProcessProof(tabId, matches, reason, { e
     matches,
   });
 
-  const sessionId = getCodexRuntimeSessionId(tabId) || codexSessionIdFromDb(tabId);
-  if (sessionId && !codexKnownSessions.has(tabId)) {
-    setCodexKnownSession(tabId, sessionId, reason);
-  }
+  // Process existence proves lifecycle only. Resolve the rollout held open by
+  // that descendant before repairing session identity; DB/launch IDs are merely
+  // resume intent and may be stale after native Codex rewind.
+  const writer = await reconcileCodexWriterFromProcess(tabId, {
+    reason: reason + '-writer-proof',
+    sender: mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+  });
+  const sessionId = writer?.status === 'adopted'
+    ? (getCodexWriterProofSnapshot(tabId)?.sessionId || null)
+    : null;
   if (sessionId && !codexTurnWatchers.has(tabId)) {
     try {
       await ensureCodexTurnWatcher(tabId, sessionId, terminalProjects.get(tabId), {
@@ -6369,9 +6711,11 @@ function _markTerminalAsAiTab(tabId, engine, sessionId = null) {
   if (!tabId || !engine) return;
   const color = engine === 'codex' ? 'codex' : engine === 'gemini' ? 'gemini' : 'claude';
   try {
-    const setSessionSql = engine === 'codex'
-      ? 'codex_session_id = COALESCE(?, codex_session_id), '
-      : engine === 'claude'
+    // Codex resume/fork arguments name the requested source, not necessarily
+    // the rollout that this process will write. Main adopts and persists Codex
+    // identity only after process→writable-rollout proof. Claude/Gemini keep
+    // their existing eager session contracts.
+    const setSessionSql = engine === 'claude'
         ? 'claude_session_id = COALESCE(?, claude_session_id), '
         : engine === 'gemini'
           ? 'gemini_session_id = COALESCE(?, gemini_session_id), '
@@ -6396,7 +6740,12 @@ function _markTerminalAsAiTab(tabId, engine, sessionId = null) {
     console.warn('[MCP:Terminal] mark-ai-tab DB update failed tab=' + tabId + ' engine=' + engine + ': ' + e.message);
   }
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('terminal:mcp-ai-tab', { tabId, engine, sessionId: sessionId || undefined });
+    mainWindow.webContents.send('terminal:mcp-ai-tab', {
+      tabId,
+      engine,
+      sessionId: engine === 'codex' ? undefined : (sessionId || undefined),
+      writerProven: false,
+    });
   }
 }
 
@@ -6509,11 +6858,16 @@ async function handleOverseerRequest(rawUrl) {
     for (const r of rows) {
       const tabId = r.tab_id;
       const isCodex = r.command_type === 'codex' || !!r.codex_session_id || codexKnownSessions.has(tabId);
+      const codexRuntime = isCodex
+        ? await getCodexRuntimeSessionSnapshot(tabId, { reason: 'overseer-sessions-query' })
+        : null;
+      const provenCodexWriter = codexRuntime?.provenWriterSessionId || null;
+      const codexWriterUsable = codexRuntime?.writerUsableForMutation === true;
       const sessionId = isCodex
-        ? (getCodexRuntimeSessionId(tabId) || r.codex_session_id || null)
+        ? (codexRuntime?.sessionId || null)
         : (bridgeKnownSessions.get(tabId) || r.claude_session_id || null);
-      if (!sessionId) continue;
-      const isLive = terminals.has(tabId);
+      if (!sessionId && !isCodex) continue;
+      const isLive = isCodex ? codexRuntime?.liveLifecycle === true : terminals.has(tabId);
       const bridgeMeta = !isCodex ? (bridgeMetadata.get(tabId) || null) : null;
       const bridgeContextPct = bridgeMeta && typeof bridgeMeta.contextPct === 'number'
         ? bridgeMeta.contextPct
@@ -6543,10 +6897,10 @@ async function handleOverseerRequest(rawUrl) {
       if (claudeLocal) busySources.push('claude-local-command');
       if (codexTurn) busySources.push('codex-turn');
       if (sdkTurn) busySources.push('claude-sdk');
-      const isBusy = busySources.length > 0;
-      const sessionStatus = isBusy
-        ? 'busy'
-        : (isLive ? 'active' : 'closed');
+      const isBusy = isCodex ? codexRuntime?.busy === true : busySources.length > 0;
+      const sessionStatus = isCodex
+        ? (codexRuntime?.sessionStatus === 'inactive' ? 'closed' : (codexRuntime?.sessionStatus || 'unknown'))
+        : (isBusy ? 'busy' : (isLive ? 'active' : 'closed'));
       let claudeLastEventTs = null;
       if (!isCodex && claudeLastEvent?.ts) {
         const d = new Date(claudeLastEvent.ts);
@@ -6556,6 +6910,11 @@ async function handleOverseerRequest(rawUrl) {
         tabId,
         tabName: r.name,
         sessionId,
+        savedSessionId: isCodex ? (r.codex_session_id || null) : (r.claude_session_id || null),
+        writerConfirmed: isCodex ? !!provenCodexWriter : !!bridgeKnownSessions.get(tabId),
+        writerUsableForMutation: isCodex ? codexWriterUsable : !!bridgeKnownSessions.get(tabId),
+        writerStatus: isCodex ? (codexRuntime?.writerStatus || null) : null,
+        liveLifecycle: isCodex ? (codexRuntime?.liveLifecycle ?? null) : isLive,
         engine: isCodex ? 'codex' : 'claude',
         status: sessionStatus,
         busy: isBusy,
@@ -7113,35 +7472,49 @@ function startMcpHttpServer() {
     // Used by /terminal/* handlers below to validate cross-project tabId access.
     // MUST live at callback-scope, not inside an else-if branch, so every handler
     // can see it (else: ReferenceError on /terminal/output etc. when caller pins parentProjectId).
-    const resolveProjectForTab = (tabId) => {
+    const resolveProjectForTab = (tabId, projectIdHint = null) => {
       if (typeof tabId !== 'string' || !tabId) return null;
       const live = terminalProjectIds.get(tabId);
       if (live) return live;
       try {
-        const row = projectManager.db.db.prepare(
-          'SELECT project_id FROM tabs WHERE tab_id = ? LIMIT 1'
-        ).get(tabId);
-        if (row && row.project_id) return row.project_id;
+        if (projectIdHint) {
+          const row = projectManager.db.db.prepare(
+            'SELECT project_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+          ).get(projectIdHint, tabId);
+          return row?.project_id || null;
+        }
+        const rows = projectManager.db.db.prepare(
+          'SELECT DISTINCT project_id FROM tabs WHERE tab_id = ? ORDER BY project_id'
+        ).all(tabId);
+        if (rows.length === 1) return rows[0].project_id || null;
       } catch {}
       return null;
     };
 
     const routeRejectsPinnedProject = (tabId, parentProjectId, routeName) => {
       if (!parentProjectId) return null;
+      const scopedOwner = resolveProjectForTab(tabId, parentProjectId);
+      if (scopedOwner === parentProjectId) return null;
       const owner = resolveProjectForTab(tabId);
-      if (owner && owner !== parentProjectId) {
-        console.warn('[MCP:Terminal] ' + routeName + ' rejected: tab ' + tabId + ' belongs to project ' + owner + ', caller pinned ' + parentProjectId);
-        return { error: 'tab does not belong to the requested project', owner, requested: parentProjectId };
-      }
-      return null;
+      console.warn('[MCP:Terminal] ' + routeName + ' rejected: tab ' + tabId
+        + ' does not exist in pinned project ' + parentProjectId
+        + ' owner=' + (owner || 'unknown-or-ambiguous'));
+      return {
+        error: 'tab does not belong to the requested project',
+        owner: owner || null,
+        requested: parentProjectId,
+      };
     };
 
-    const detectAiEngineForTab = async (tabId) => {
+    const detectAiEngineForTab = async (tabId, projectIdHint = null) => {
       let row = null;
       try {
-        row = projectManager.db.db.prepare(
-          'SELECT command_type, claude_session_id, gemini_session_id, codex_session_id FROM tabs WHERE tab_id = ? LIMIT 1'
-        ).get(tabId);
+        const projectId = resolveProjectForTab(tabId, projectIdHint);
+        if (projectId) {
+          row = projectManager.db.db.prepare(
+            'SELECT command_type, claude_session_id, gemini_session_id, codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+          ).get(projectId, tabId);
+        }
       } catch {}
       if (row?.command_type === 'codex' || codexKnownSessions.has(tabId) || row?.codex_session_id) return 'codex';
       if (row?.command_type === 'claude' || row?.command_type === 'claude-sdk' || hasLiveClaudeInTab(tabId) || row?.claude_session_id) return 'claude';
@@ -7209,7 +7582,11 @@ function startMcpHttpServer() {
             const cmdState = terminalCommandState.get(tabId);
             const commandType = t.command_type || 'generic';
             const claudeSessionId = bridgeKnownSessions.get(tabId) || t.claude_session_id || null;
-            const codexSessionId = getCodexRuntimeSessionId(tabId) || t.codex_session_id || null;
+            const codexRuntime = commandType === 'codex'
+              ? await getCodexRuntimeSessionSnapshot(tabId, { reason: 'terminal-tabs-query' })
+              : null;
+            const codexWriterSessionId = codexRuntime?.provenWriterSessionId || null;
+            const codexSessionId = codexRuntime?.sessionId || null;
             const geminiSessionId = t.gemini_session_id || null;
             const sessionId = commandType === 'codex'
               ? codexSessionId
@@ -7228,11 +7605,22 @@ function startMcpHttpServer() {
               claudeSessionId,
               geminiSessionId,
               codexSessionId,
+              codexSavedSessionId: t.codex_session_id || null,
+              codexWriterConfirmed: codexRuntime?.writerConfirmed === true,
+              codexWriterUsableForMutation: codexRuntime?.writerUsableForMutation === true,
+              codexWriterStatus: codexRuntime?.writerStatus || null,
+              codexLiveLifecycle: codexRuntime?.liveLifecycle ?? null,
+              sessionStatus: codexRuntime?.sessionStatus || null,
               aiBusy: t.ai_busy === 1 || t.ai_busy === true,
               cwd: terminalProjects.get(tabId) || t.cwd,
               isAlive: !!pty,
               pid: pty ? pty.pid : null,
-              isRunning: cmdState ? cmdState.isRunning : false,
+              isRunning: commandType === 'codex'
+                ? codexRuntime?.liveLifecycle === true
+                : (cmdState ? cmdState.isRunning : false),
+              processLookupUnknown: commandType === 'codex'
+                ? codexRuntime?.liveLifecycle === null
+                : false,
               initialCommand: terminalInitialCommand.get(tabId) || null,
             });
           }
@@ -7515,6 +7903,7 @@ function startMcpHttpServer() {
       req.on('data', chunk => { body += chunk; });
       req.on('end', async () => {
         let activityId = null;
+        const requestReceivedAt = nodePerformance.now();
         try {
           const { tabId, prompt, submit = true, parentProjectId, sourceMeta } = JSON.parse(body);
           if (!tabId || typeof prompt !== 'string') {
@@ -7537,7 +7926,7 @@ function startMcpHttpServer() {
             return;
           }
 
-          const engine = await detectAiEngineForTab(tabId);
+          const engine = await detectAiEngineForTab(tabId, parentProjectId);
           if (!engine) {
             res.writeHead(409);
             res.end(JSON.stringify({ error: 'No live AI session detected in tab ' + tabId }));
@@ -7545,24 +7934,6 @@ function startMcpHttpServer() {
           }
 
           if (engine === 'codex') {
-            const candidates = await findAiDescendantProcessesByTab(tabId, 'codex');
-            if (candidates.length === 0) {
-              res.writeHead(409);
-              res.end(JSON.stringify({ error: 'no_codex_session' }));
-              return;
-            }
-            if (submit !== false) {
-              const submitWatcher = await ensureCodexSubmissionWatcher(
-                tabId,
-                terminalProjects.get(tabId),
-                'mcp-ai-prompt'
-              );
-              if (!submitWatcher.available) {
-                res.writeHead(409);
-                res.end(JSON.stringify({ error: 'codex_turn_watcher_unavailable' }));
-                return;
-              }
-            }
             if (submit !== false) {
               const ready = await ensureCodexInputReadyForExternalPrompt(tabId, {
                 reason: 'mcp-ai-prompt',
@@ -7652,6 +8023,7 @@ function startMcpHttpServer() {
             awaitCodexUserMessageAudit: engine === 'codex' && submit !== false,
             codexAuditTimeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
             verifyCodexVisibleDraftBeforeSubmit: engine === 'codex' && submit !== false,
+            requestReceivedAt: engine === 'codex' ? requestReceivedAt : null,
             logPrefix: '[MCP:Terminal:ai-prompt:' + engine + ':' + tabId + ']',
           });
           const success = result?.success !== false;
@@ -7773,7 +8145,6 @@ function startMcpHttpServer() {
               res.end(JSON.stringify({ error: 'Codex fork requires sessionId' }));
               return;
             }
-            const startedAt = Date.now();
             const command = mode === 'fork'
               ? 'codex-f'
               : mode === 'new'
@@ -7781,63 +8152,58 @@ function startMcpHttpServer() {
                 : sessionId
                 ? 'codex-c'
                 : 'codex';
-            const boundSessionId = getCodexBoundSessionId(tabId);
-            if (command === 'codex' && !sessionId && boundSessionId) {
-              console.warn('[MCP:Terminal] /terminal/ai-start blocked plain Codex start over bound session tab=' + String(tabId).slice(-12)
-                + ' oldSession=' + String(boundSessionId).slice(0, 8)
-                + ' mode=' + (mode || '-')
-                + ' cwd=' + (termCwd || 'n/a'));
-              res.writeHead(409);
-              res.end(JSON.stringify({
-                error: 'tab_has_resumable_session',
-                reason: 'plain_codex_start_blocked_by_bound_session',
-                tabId,
-                engine: 'codex',
-                sessionId: boundSessionId,
-                canResume: true,
-              }));
-              return;
-            }
             _markTerminalAsAiTab(tabId, engine, mode === 'new' ? null : (sessionId || null));
-            const effectiveModel = model || readDefaultCodexSetting('defaultCodexModel');
-            const effectiveEffort = effort || readDefaultCodexSetting('defaultCodexEffort');
-            const launchId = 'codex-terminal-mcp-' + Date.now() + '-' + (++codexLaunchSeq);
-            codexLastRunCommandPayload.set(tabId, {
-              launchId,
+            activityId = emitTerminalMcpActivity('start_ai', {
+              status: 'running',
               tabId,
-              command,
-              sessionId: sessionId || null,
-              cwd: termCwd,
-              model: effectiveModel,
-              effort: effectiveEffort,
-              developerInstructions: null,
-              mcpStartupRestartAttempts: 0,
-              startedAt,
+              targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+              engine,
+              mode: mode || (sessionId ? 'continue' : 'new'),
+              resumeSourceSessionId: command === 'codex' ? null : (sessionId || null),
+              sourceMeta: sourceMeta || null,
             });
-            codexImageBindings.clear(tabId);
-            invalidateAiProcessLookupCache(tabId, 'codex');
-            await beginCodexLaunchObservation(mainWindow?.webContents || { send: () => {} }, {
+            const runResult = await runCodexCommandFromPayload(
+              mainWindow?.webContents || { send: () => {} },
+              {
+                tabId,
+                command,
+                sessionId: command === 'codex' ? null : (sessionId || null),
+                cwd: termCwd,
+                model,
+                effort,
+              },
+            );
+            const launchStatus = runResult?.success === false
+              ? 'error'
+              : (runResult?.acceptancePending === true ? 'starting' : 'started');
+            emitTerminalMcpActivity('start_ai', {
+              id: activityId,
+              status: launchStatus,
               tabId,
-              command,
-              sessionId: sessionId || null,
-              cwd: termCwd,
-              startedAt,
-              launchId,
+              targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+              engine,
+              mode: mode || (sessionId ? 'continue' : 'new'),
+              sessionId: runResult?.sessionId || null,
+              resumeSourceSessionId: runResult?.resumeSourceSessionId || null,
+              writerConfirmed: runResult?.writerConfirmed === true,
+              sourceMeta: sourceMeta || null,
+              error: runResult?.success === false ? (runResult.error || 'codex_start_failed') : undefined,
             });
-            commandText = buildCodexCommand({
-              command,
-              sessionId,
-              cwd: termCwd,
-              model: effectiveModel,
-              effort: effectiveEffort,
-            });
-            // Terminal MCP starts must use the same startup-prompt guard as
-            // renderer-owned codex:run-command launches. Otherwise the TUI
-            // detector sees update/trust menus but has no one-shot permission
-            // to select their safe default and the session remains blocked.
-            clearCodexTuiReady(tabId, 'terminal-mcp-ai-start');
-            armCodexStartupAutoEnter(tabId, { command, sessionId, cwd: termCwd });
-            broadcastCodexStartingSnapshot(tabId, 'terminal-mcp-ai-start');
+            console.log('[MCP:Terminal] POST /terminal/ai-start tabId=' + tabId
+              + ' engine=codex mode=' + (mode || (sessionId ? 'continue' : 'new'))
+              + ' success=' + (runResult?.success !== false)
+              + ' writer=' + (runResult?.sessionId ? String(runResult.sessionId).slice(0, 8) : 'pending'));
+            res.writeHead(runResult?.success === false ? 409 : 200);
+            res.end(JSON.stringify({
+              status: runResult?.success === false
+                ? 'not_started'
+                : (runResult?.acceptancePending === true ? 'starting' : 'started'),
+              tabId,
+              agent: engine,
+              mode: mode || (sessionId ? 'continue' : 'new'),
+              ...runResult,
+            }));
+            return;
           } else if (engine === 'claude') {
             if (mode === 'fork') {
               res.writeHead(400);
@@ -8501,6 +8867,11 @@ app.whenReady().then(() => {
       answerClaudeQuestion: answerClaudeQuestionUnified,
       getClaudePendingQuestion,
       transcriptService,
+      resolveCodexRuntimeSessionInfo: (tabId, reason, projectId = null) => getCodexRuntimeSessionSnapshot(tabId, {
+        reason: reason || 'web-runtime-session-query',
+        projectId,
+        refreshTuiReady: true,
+      }),
     });
     console.log('[Startup] Mobile WebServer OK');
 
@@ -9093,6 +9464,15 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     // Guard: if PTY already exists (e.g. respawned by MCP continue_claude), reuse it
     const existingPty = terminals.get(tabId);
     if (existingPty) {
+      const existingProjectId = terminalProjectIds.get(tabId) || null;
+      if (existingProjectId && projectId && existingProjectId !== projectId) {
+        const error = new Error('tab_id_runtime_collision:' + tabId);
+        error.code = 'TAB_ID_RUNTIME_COLLISION';
+        console.error('[terminal:create] refusing cross-project PTY reuse tab=' + tabId
+          + ' existingProject=' + existingProjectId
+          + ' requestedProject=' + projectId);
+        throw error;
+      }
       console.log('[terminal:create] PTY already exists for ' + tabId + ' (pid=' + existingPty.pid + '), reusing');
       if (!getHeadlessTerminalMirror(tabId)) {
         createHeadlessTerminalMirror(tabId, cols || 80, rows || 24);
@@ -9859,16 +10239,39 @@ const PASTE_END = '\x1b[201~';
 // for the same term on a single promise; second caller waits until first
 // returns. WeakMap key on term (no manual cleanup needed when PTY dies).
 const pasteInflight = new WeakMap();
+const ptyActiveWriteOperation = new WeakMap();
+const ptyLastQueuedWriteOperation = new WeakMap();
 
-function withPtyWriteLock(term, work) {
+function withPtyWriteLock(term, work, operation = null) {
   const prev = pasteInflight.get(term) || Promise.resolve();
-  const next = prev.catch(() => {}).then(work);
+  if (operation) ptyLastQueuedWriteOperation.set(term, operation);
+  const next = prev.catch(() => {}).then(async () => {
+    if (operation) ptyActiveWriteOperation.set(term, operation);
+    try {
+      return await work();
+    } finally {
+      if (operation && ptyActiveWriteOperation.get(term) === operation) {
+        ptyActiveWriteOperation.delete(term);
+      }
+    }
+  });
   pasteInflight.set(term, next);
   return next.finally(() => {
     if (pasteInflight.get(term) === next) {
       pasteInflight.delete(term);
     }
+    if (operation && ptyLastQueuedWriteOperation.get(term) === operation) {
+      ptyLastQueuedWriteOperation.delete(term);
+    }
   });
+}
+
+function markActivePtySubmit(term, { identityPending = false } = {}) {
+  const operation = ptyActiveWriteOperation.get(term) || null;
+  if (!operation) return;
+  operation.submitted = true;
+  operation.identityPending = operation.identityPending === true || identityPending === true;
+  operation.submittedAt = Date.now();
 }
 
 // Per-tab paste audit slot. Filled by safePasteAndSubmit right before Enter is
@@ -10339,7 +10742,18 @@ async function safePasteAndSubmit(term, content, options = {}) {
     console.log(logPrefix + ' ❌ Terminal not available');
     return { success: false, error: 'terminal not available' };
   }
-  return await withPtyWriteLock(term, () => _safePasteAndSubmitInner(term, content, options));
+  const operation = {
+    kind: 'safe-paste',
+    source: options.source || null,
+    submitted: false,
+    identityPending: false,
+    queuedAt: Date.now(),
+  };
+  return await withPtyWriteLock(
+    term,
+    () => _safePasteAndSubmitInner(term, content, options),
+    operation,
+  );
 }
 
 async function _safePasteAndSubmitInner(term, content, options = {}) {
@@ -10360,9 +10774,11 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     skipRenderWait = false,
     awaitClaudeUserMessageAudit = false,
     claudeAuditTimeoutMs = CLAUDE_PASTE_AUDIT_TIMEOUT_MS,
-    awaitCodexUserMessageAudit = false,
+    awaitCodexUserMessageAudit: requestedCodexUserMessageAudit = false,
     codexAuditTimeoutMs = CODEX_PASTE_AUDIT_TIMEOUT_MS,
-    verifyCodexVisibleDraftBeforeSubmit = false
+    verifyCodexVisibleDraftBeforeSubmit = false,
+    codexSubmissionPreflight = true,
+    requestReceivedAt = null,
   } = options;
 
   // TTYHOG on macOS = 1024 bytes. Paste brackets = 12 bytes. Leave margin.
@@ -10395,9 +10811,15 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   // will happen mid-stream.
   const broadcastTabId = findTabIdForTerm(term);
   const isCodexPasteSource = !!(source && String(source).startsWith('codex-'));
+  let awaitCodexUserMessageAudit = requestedCodexUserMessageAudit;
   let codexPromptInFlightState = null;
+  let codexSubmissionWatcher = null;
+  let codexPtyAdmission = null;
   let stagedCodexImageRefs = [];
   let codexImagePasteSegments = null;
+  // The Codex rollout audit is cleaned up from `finally`, so its reference
+  // must live in the function scope rather than inside the `try` block.
+  let stagedCodexAudit = null;
   const emitBusy = (busy) => {
     if (!broadcastTabId) {
       console.warn(logPrefix + ' [PasteBusy] no-tab busy=' + busy + ' termPid=' + (term && term.pid ? term.pid : 'unknown'));
@@ -10410,6 +10832,47 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   };
   emitBusy(true);
   try {
+  if (
+    isCodexPasteSource
+    && broadcastTabId
+    && codexSubmissionPreflight !== false
+  ) {
+    codexPtyAdmission = captureCodexPtySubmitAdmission(broadcastTabId, term);
+    if (!codexPtyAdmission.available) {
+      console.warn(logPrefix + ' [CodexSubmissionAdmission] refusing before paste reason='
+        + (codexPtyAdmission.reason || 'unknown'));
+      return {
+        success: false,
+        error: codexPtyAdmission.reason || 'codex_submit_not_admitted',
+        submitted: false,
+      };
+    }
+    if (submit && submitSequence !== '\t') {
+      codexSubmissionWatcher = armCodexSubmissionObservationWithoutProof(
+        broadcastTabId,
+        terminalProjects.get(broadcastTabId),
+        'safe-paste-final:' + (source || 'codex-submit'),
+        { reserveProvisional: true },
+      );
+      if (!codexSubmissionWatcher?.available) {
+        console.warn(logPrefix + ' [CodexSubmissionObservation] refusing before paste status='
+          + (codexSubmissionWatcher?.writerStatus || 'unknown')
+          + ' error=' + (codexSubmissionWatcher?.error || '-'));
+        return {
+          success: false,
+          error: codexSubmissionWatcher?.error || 'codex_turn_watcher_unavailable',
+          writerStatus: codexSubmissionWatcher?.writerStatus || 'unknown',
+          submitted: false,
+        };
+      }
+      if (codexSubmissionWatcher.kind === 'provisional-source') {
+        // This Enter is what can materialize the linked child. It is allowed only
+        // once for the exact launch generation and must wait for rollout
+        // `user_message` before callers may treat delivery/identity as confirmed.
+        awaitCodexUserMessageAudit = true;
+      }
+    }
+  }
   if (typeof source === 'string' && source.includes('prompt-queue')) {
     const queueImages = await validatePromptQueueImageMarkers(content);
     if (!queueImages.success) {
@@ -10490,7 +10953,6 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   const t0 = Date.now();
   const resolvedSubmitLabel = submitLabel || (submitSequence === '\t' ? 'Tab' : (submitSequence === '\r' ? 'Enter' : JSON.stringify(submitSequence)));
   let stagedClaudeAudit = null;
-  let stagedCodexAudit = null;
   const shouldVerifyCodexVisibleDraft = !!(verifyCodexVisibleDraftBeforeSubmit && submit && isCodexPasteSource && !fast && broadcastTabId);
   codexPromptInFlightState = submit && isCodexPasteSource && broadcastTabId && submitSequence !== '\t'
     ? beginCodexPromptInFlight(broadcastTabId, 'safe-paste-submit', { source, handoffId })
@@ -10605,6 +11067,19 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   if (isCodexPasteSource && broadcastTabId && stagedCodexImageRefs.length > 0) {
     codexImageBindings.beginDirect(broadcastTabId, stagedCodexImageRefs);
   }
+  if (codexPtyAdmission) {
+    const currentAdmission = revalidateCodexPtySubmitAdmission(codexPtyAdmission);
+    if (!currentAdmission.valid) {
+      console.warn(logPrefix + ' [CodexSubmissionAdmission] cancelled before paste reason='
+        + currentAdmission.reason);
+      return {
+        success: false,
+        error: currentAdmission.reason,
+        submitted: false,
+        chunksTotal: chunks.length,
+      };
+    }
+  }
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
     let payload = chunk.text;
@@ -10691,6 +11166,21 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   }
 
   if (submit) {
+    if (codexPtyAdmission) {
+      const currentAdmission = revalidateCodexPtySubmitAdmission(codexPtyAdmission);
+      if (!currentAdmission.valid) {
+        console.warn(logPrefix + ' [CodexSubmissionAdmission] cancelled before Enter reason='
+          + currentAdmission.reason);
+        return {
+          success: false,
+          error: currentAdmission.reason,
+          submitted: false,
+          chunksTotal: chunks.length,
+          renderTimeMs: renderTimes,
+          submitKey: null,
+        };
+      }
+    }
     // Optional: Esc to dismiss Claude's slash-cmd autocomplete dropdown.
     // Without this, the next Enter hits an early-return in PromptInput.onSubmit
     // (suggestions.length > 0 guard) — user has to press any key to break the
@@ -10793,17 +11283,59 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] Draining PTY before ' + resolvedSubmitLabel + ' (slow mode)...');
       await drainPtyData(term, 50, 600);
     }
+    if (codexPtyAdmission) {
+      const finalAdmission = revalidateCodexPtySubmitAdmission(codexPtyAdmission);
+      if (!finalAdmission.valid) {
+        console.warn(logPrefix + ' [CodexSubmissionAdmission] cancelled at Enter boundary reason='
+          + finalAdmission.reason);
+        return {
+          success: false,
+          error: finalAdmission.reason,
+          submitted: false,
+          chunksTotal: chunks.length,
+          renderTimeMs: renderTimes,
+          submitKey: null,
+        };
+      }
+    }
     term.write(submitSequence);
+    markActivePtySubmit(term, {
+      identityPending: isCodexPasteSource
+        && !!codexSubmissionWatcher
+        && codexSubmissionWatcher.kind !== 'turn',
+    });
     if (isCodexPasteSource && broadcastTabId && submitSequence !== '\t') {
       codexImageBindings.resetComposer(broadcastTabId);
     }
     if (codexPromptInFlightState && broadcastTabId) {
       markCodexPromptSubmitted(broadcastTabId, codexPromptInFlightState, resolvedSubmitLabel);
     }
+    if (codexSubmissionWatcher?.reservation) {
+      codexSubmissionWatcher.reservation.submitted = true;
+      codexSubmissionWatcher.reservation.submittedAt = Date.now();
+    }
     if (armPromptBoundaryOnSubmit && broadcastTabId) {
       armPromptBoundaryForSubmittedCommand(broadcastTabId, promptBoundaryReason || logPrefix);
     }
     console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] ✅ Sent ' + resolvedSubmitLabel + ' handoff=' + (handoffId || '-') + ' (total: ' + (Date.now() - t0) + 'ms)');
+    if (isCodexPasteSource && broadcastTabId) {
+      const receiveToEnterMs = Number.isFinite(requestReceivedAt)
+        ? Math.max(0, nodePerformance.now() - requestReceivedAt)
+        : null;
+      console.warn('[CodexSubmitTiming] source=' + (source || 'safe-paste')
+        + ' tab=' + String(broadcastTabId).slice(-12)
+        + ' receiveToPtyEnterMs=' + (receiveToEnterMs === null ? 'na' : receiveToEnterMs.toFixed(1))
+        + ' safePasteMs=' + (Date.now() - t0)
+        + ' observer=' + (codexSubmissionWatcher?.kind || 'none'));
+      void reconcileCodexWriterFromProcess(broadcastTabId, {
+        reason: 'post-submit-observation:' + (source || 'safe-paste'),
+        sender: mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+      }).catch((error) => {
+        console.warn('[CodexSubmissionObservation] post-Enter reconcile failed tab='
+          + String(broadcastTabId).slice(-12)
+          + ' error=' + (error?.message || String(error)));
+      });
+    }
 
     if (stagedClaudeAudit && awaitClaudeUserMessageAudit && broadcastTabId) {
       console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] waiting for Claude UserPromptSubmit audit timeout=' + claudeAuditTimeoutMs + 'ms hash=' + stagedClaudeAudit.expectedHash);
@@ -10865,8 +11397,25 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   return { success: true, chunksTotal: chunks.length, renderTimeMs: renderTimes, submitKey: submit ? resolvedSubmitLabel : null };
 
   } finally {
+    if (stagedCodexAudit
+      && pendingCodexPasteAudit.get(broadcastTabId) === stagedCodexAudit
+      && (!codexPromptInFlightState || codexPromptInFlightState.submitted !== true)) {
+      finishCodexPasteAudit(broadcastTabId, stagedCodexAudit, {
+        success: false,
+        error: 'codex_submit_not_sent',
+        expectedLen: stagedCodexAudit.expectedLen,
+        expectedHash: stagedCodexAudit.expectedHash,
+      });
+    }
     if (codexPromptInFlightState && broadcastTabId && !codexPromptInFlightState.submitted) {
       clearCodexPromptInFlight(broadcastTabId, 'submit-not-sent');
+    }
+    if (codexSubmissionWatcher?.reservation && !codexSubmissionWatcher.reservation.submitted) {
+      releaseCodexProvisionalSubmitReservation(
+        broadcastTabId,
+        codexSubmissionWatcher.reservation,
+        'safe-paste-submit-not-sent',
+      );
     }
     emitBusy(false);
   }
@@ -10906,9 +11455,12 @@ ipcMain.on('terminal:force-command-started', (event, payload) => {
     mainWindow.webContents.send('terminal:command-started', { tabId, commandType: commandType || null });
   }
   if (commandType === 'claude' || commandType === 'codex') {
-    const sessionId = request.sessionId
-      || (commandType === 'codex' ? codexKnownSessions.get(tabId) : bridgeKnownSessions.get(tabId))
-      || null;
+    // Renderer knows the requested Resume target, not the rollout currently
+    // opened by Codex. Accept that ID for Claude's established contract only;
+    // Codex live identity comes exclusively from main's process/file proof.
+    const sessionId = commandType === 'codex'
+      ? getCodexRuntimeSessionId(tabId)
+      : (request.sessionId || bridgeKnownSessions.get(tabId) || null);
     if (commandType === 'claude') {
       claudeStartupIntents.set(tabId, { sessionId, at: Date.now(), reason: 'force-command-started' });
       if (sessionId) {
@@ -10924,6 +11476,7 @@ ipcMain.on('terminal:force-command-started', (event, payload) => {
       inputReady: false,
       toolType: commandType,
       commandType,
+      ...(commandType === 'codex' ? getCodexPublicWriterFields(tabId) : {}),
     });
   }
 });
@@ -10950,6 +11503,7 @@ ipcMain.on('log:renderer', (event, payload) => {
 });
 
 ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
+  const inputReceivedAt = nodePerformance.now();
   const term = terminals.get(tabId);
   if (!term) {
     console.error('[main] Terminal not found for tabId:', tabId);
@@ -11025,7 +11579,7 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
   // Multi-byte ESC sequences (стрелки `\x1b[A`, F-keys, `\x1bO...`) пропускаем —
   // они не означают interrupt. См. armInterruptIdleProbe выше для подробностей.
   if (data === '\x1b' || data === '\x03') {
-    const codexSid = codexKnownSessions.get(tabId) || null;
+    const codexSid = getCodexRuntimeSessionId(tabId);
     if (codexSid) {
       const codexTurnState = codexTurnWatchers.get(tabId) || null;
       const commandState = terminalCommandState.get(tabId) || null;
@@ -11039,6 +11593,9 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
         ' lastEventTs=' + (codexTurnState?.lastEventTs || 'none') +
         ' commandRunning=' + (commandState?.isRunning === true)
       );
+      if (data === '\x1b' && codexTurnState?.busy !== true && commandState?.isRunning === true) {
+        armCodexWriterHandoffObservation(tabId, 'manual-idle-escape');
+      }
     }
     const claudeSid = bridgeKnownSessions.get(tabId) || null;
     if (claudeSid || findClaudePidByTab(tabId)) {
@@ -11075,6 +11632,95 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
       inputPreview += cc < 32 || cc === 127 ? '\\x' + cc.toString(16).padStart(2, '0') : data[ci];
     }
     console.log(`[terminal:input] tabId=${tabId} len=${data.length} endsWithR=${endsWithR} endsWithN=${endsWithN} hasNewline=${hasNewline} content="${inputPreview}"${data.length > 60 ? '...' : ''}`);
+  }
+
+  const isManualCodexSubmit = (data === '\r' || data === '\n')
+    && terminalCommandState.get(tabId)?.isRunning === true
+    && (
+      codexTuiReadyTabs.has(tabId)
+      || codexWatchers.has(tabId)
+      || codexTurnWatchers.has(tabId)
+      || codexKnownSessions.has(tabId)
+      || codexLastRunCommandPayload.has(tabId)
+  );
+  if (isManualCodexSubmit) {
+    const precedingOperation = ptyLastQueuedWriteOperation.get(term) || null;
+    const manualOperation = {
+      kind: 'manual-codex-enter',
+      source: 'manual-terminal-enter',
+      submitted: false,
+      identityPending: !getCodexWriterProofSnapshot(tabId)
+        || codexWatchers.has(tabId)
+        || codexLastRunCommandPayload.has(tabId),
+      queuedAt: Date.now(),
+    };
+    await withPtyWriteLock(term, async () => {
+      // The PTY write boundary is the only synchronous admission gate for a
+      // physical user key. Process/lsof/session reconciliation is observation,
+      // not permission to press Enter, and may take seconds on a loaded Mac.
+      // It is armed after the byte is written and can only affect attribution,
+      // never delivery of this user action.
+      const boundaryArbitration = classifyManualCodexSubmitAfterWriteQueue({
+        precedingOperation,
+        competingReservation: codexWatchers.get(tabId)?.provisionalSubmitReservation || null,
+      });
+      if (boundaryArbitration.suppress) {
+        console.warn('[CodexSubmitArbitration] manual Enter suppressed tab=' + String(tabId).slice(-12)
+          + ' reason=' + boundaryArbitration.reason
+          + ' priorSource=' + (precedingOperation?.source || '-')
+          + ' receiveToDecisionMs=' + (nodePerformance.now() - inputReceivedAt).toFixed(1));
+        return;
+      }
+
+      const promptInFlight = beginCodexPromptInFlight(tabId, 'manual-terminal-enter', {
+        source: 'manual-terminal-enter',
+      });
+
+      queueTerminalCommandMeta(tabId, meta);
+      captureTerminalInputForLastCommand(tabId, data);
+      const codexImageStageToken = meta && typeof meta.codexImageStageToken === 'string'
+        ? meta.codexImageStageToken
+        : null;
+      if (codexImageStageToken) {
+        const began = codexImageBindings.begin(tabId, codexImageStageToken);
+        console.log('[CodexImageBinding] tab=' + String(tabId).slice(-12)
+          + ' begin=' + began + ' token=' + codexImageStageToken.slice(-12));
+      }
+      try {
+        term.write(data);
+        markActivePtySubmit(term, { identityPending: manualOperation.identityPending });
+        markCodexPromptSubmitted(tabId, promptInFlight, 'manual-enter-written');
+      } catch (error) {
+        clearCodexPromptInFlight(tabId, 'manual-write-failed');
+        throw error;
+      }
+      codexImageBindings.handleTerminalInput(tabId, data);
+      console.warn('[CodexSubmitTiming] source=manual-terminal-enter tab=' + String(tabId).slice(-12)
+        + ' receiveToPtyWriteMs=' + (nodePerformance.now() - inputReceivedAt).toFixed(1)
+        + ' writeQueueMs=' + Math.max(0, Date.now() - manualOperation.queuedAt)
+        + ' preceding=' + (precedingOperation?.source || precedingOperation?.kind || 'none')
+        + ' identityPending=' + manualOperation.identityPending);
+
+      // Observation deliberately starts after term.write. Launch-time
+      // discovery/turn watchers normally already exist; this background call
+      // only heals an expired observer and adopts the post-Enter writer.
+      void ensureCodexSubmissionWatcher(
+        tabId,
+        terminalProjects.get(tabId),
+        'manual-terminal-enter-post-write',
+      ).then((observer) => {
+        if (!observer?.available) {
+          console.warn('[Codex Watcher] manual Enter delivered; post-write observer unresolved tab='
+            + String(tabId).slice(-12)
+            + ' status=' + (observer?.writerStatus || 'unknown'));
+        }
+      }).catch((error) => {
+        console.warn('[Codex Watcher] manual Enter delivered; post-write observer failed tab='
+          + String(tabId).slice(-12)
+          + ' error=' + (error?.message || String(error)));
+      });
+    }, manualOperation);
+    return;
   }
 
   // Last-line defense for direct renderer/manual resume paths. Some surfaces
@@ -11195,28 +11841,6 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
   // chunked the bytes. If DEC 2004 is OFF on Claude's side at the moment of
   // paste, that's a Claude TUI quirk we don't paper over here — it's the same
   // behavior the user would see in iTerm2 / Terminal.app.
-  const isManualCodexSubmit = (data === '\r' || data === '\n')
-    && terminalCommandState.get(tabId)?.isRunning === true
-    && (
-      codexTuiReadyTabs.has(tabId)
-      || codexWatchers.has(tabId)
-      || codexTurnWatchers.has(tabId)
-      || codexKnownSessions.has(tabId)
-      || codexLastRunCommandPayload.has(tabId)
-    );
-  if (isManualCodexSubmit) {
-    const submitWatcher = await ensureCodexSubmissionWatcher(
-      tabId,
-      terminalProjects.get(tabId),
-      'manual-terminal-enter'
-    );
-    if (!submitWatcher.available) {
-      // Raw terminal input remains user-owned: never swallow Enter because the
-      // history observer is unhealthy. The forensic log makes the degraded
-      // session/history state explicit while preserving the visible TUI action.
-      console.warn('[Codex Watcher] manual Enter continuing without observer tab=' + String(tabId).slice(-12));
-    }
-  }
   const codexImageStageToken = meta && typeof meta.codexImageStageToken === 'string'
     ? meta.codexImageStageToken
     : null;
@@ -11257,7 +11881,7 @@ ipcMain.handle('terminal:paste', async (event, { tabId, content, submit = true, 
       fast // Enable fast mode by default for general paste
     });
     if (result && typeof result === 'object') {
-      result.submitted = !!submit;
+      if (typeof result.submitted !== 'boolean') result.submitted = !!submit;
       result.handoffId = handoffId || null;
     }
     return result;
@@ -12351,6 +12975,7 @@ ipcMain.handle('claude:append-input', async (event, tabId, text, options = {}) =
 // refusal when there is no live Codex descendant under this PTY, otherwise a
 // queued chip could become a shell command.
 ipcMain.handle('codex:append-input', async (_event, tabId, text, options = {}) => {
+  const requestReceivedAt = nodePerformance.now();
   const shouldSubmit = !!(options && options.submit === true);
   const rawSource = options && typeof options.source === 'string' && options.source.trim()
     ? options.source.trim()
@@ -12365,23 +12990,6 @@ ipcMain.handle('codex:append-input', async (_event, tabId, text, options = {}) =
   if (!text || typeof text !== 'string') {
     return { success: false, error: 'empty_text' };
   }
-  const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
-  if (lookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
-    console.warn('[codex:append-input] ❌ Codex process lookup unavailable tab=' + tabId);
-    return aiProcessLookupFailureResult(lookup);
-  }
-  const candidates = lookup.matches;
-  if (candidates.length === 0) {
-    console.log('[codex:append-input] ❌ No live Codex process under shell pid=' + term.pid + ' tab=' + tabId);
-    return { success: false, error: 'no_codex_session' };
-  }
-  const submitWatcher = shouldSubmit
-    ? await ensureCodexSubmissionWatcher(tabId, terminalProjects.get(tabId), codexSource)
-    : { available: true };
-  if (shouldSubmit && !submitWatcher.available) {
-    console.warn('[codex:append-input] ❌ No Codex turn watcher for tab=' + String(tabId).slice(-12) + ' — refusing unverified replay submit');
-    return { success: false, error: 'codex_turn_watcher_unavailable' };
-  }
   const result = await safePasteAndSubmit(term, text, {
     submit: shouldSubmit,
     stashFirst: false,
@@ -12392,9 +13000,12 @@ ipcMain.handle('codex:append-input', async (_event, tabId, text, options = {}) =
     awaitCodexUserMessageAudit: shouldSubmit,
     codexAuditTimeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
     verifyCodexVisibleDraftBeforeSubmit: shouldSubmit,
+    requestReceivedAt,
     logPrefix: '[codex:append-input:' + tabId + ']',
   });
-  if (result && typeof result === 'object') result.submitted = shouldSubmit;
+  if (result && typeof result === 'object' && typeof result.submitted !== 'boolean') {
+    result.submitted = shouldSubmit;
+  }
   return result;
 });
 
@@ -13565,6 +14176,9 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
   targetText,
   targetFullText,
   targetUuid,
+  writerSessionId,
+  writerAuthorization,
+  writerLaunchId,
   rewindableCount,
   skipDuplicates = 0,
   pasteAfter,
@@ -13577,35 +14191,98 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     + ' skipDuplicates=' + skipDuplicates
     + ' pasteAfter=' + (typeof pasteAfter === 'string' ? pasteAfter.length : 0));
   if (!term) return { success: false, error: 'no_terminal' };
+  if (codexRewindReservations.has(tabId)) {
+    console.warn('[Codex:Rewind] refusing concurrent request tab=' + String(tabId).slice(-12));
+    return { success: false, error: 'codex_rewind_already_in_progress' };
+  }
   rewindCancelTabs.delete(tabId);
 
-  const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
-  if (lookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
-    console.warn('[Codex:Rewind] ❌ Codex process lookup unavailable tab=' + tabId);
-    return aiProcessLookupFailureResult(lookup);
-  }
-  const candidates = lookup.matches;
-  if (candidates.length === 0) {
-    console.log('[Codex:Rewind] ❌ No live Codex process under shell pid=' + term.pid + ' tab=' + tabId);
-    return { success: false, error: 'no_codex_session' };
-  }
-  if (!codexTuiReadyTabs.has(tabId)) {
-    console.log('[Codex:Rewind] ❌ Codex process exists but TUI input-ready marker is missing tab=' + String(tabId).slice(-12));
-    return { success: false, error: 'codex_not_input_ready' };
-  }
-  const readyMeta = codexTuiReadyMeta.get(tabId) || null;
-  console.log('[Codex:Rewind] readiness before prime tab=' + String(tabId).slice(-12)
-    + ' readyAgeMs=' + (readyMeta?.at ? Date.now() - readyMeta.at : 'unknown')
-    + ' readySource=' + (readyMeta?.source || '-')
-    + ' readyReason=' + (readyMeta?.reason || '-')
-    + ' readyPreview=' + JSON.stringify(String(readyMeta?.preview || '').slice(0, 180))
-    + ' pids=' + candidates.map(p => p.pid).join(','));
+  let writer = null;
+  let provisionalResumeRewind = false;
 
-  await ensureCodexTurnWatcher(tabId, null, terminalProjects.get(tabId));
-  const turnState = codexTurnWatchers.get(tabId);
-  if (turnState?.busy === true) {
-    console.log('[Codex:Rewind] Refusing while turn is busy tab=' + String(tabId).slice(-12));
-    return { success: false, error: 'codex_busy' };
+  async function authorizeCodexRewindAtWriteBoundary(stage) {
+    if (terminals.get(tabId) !== term) {
+      return { success: false, error: 'codex_terminal_changed_before_rewind' };
+    }
+    if (aiStoppingTabs.get(tabId)?.toolType === 'codex') {
+      return { success: false, error: 'codex_stopping' };
+    }
+    const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
+    if (lookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
+      console.warn('[Codex:Rewind] process lookup unavailable stage=' + stage + ' tab=' + tabId);
+      return aiProcessLookupFailureResult(lookup);
+    }
+    const candidates = lookup.matches;
+    if (candidates.length === 0) {
+      console.log('[Codex:Rewind] no live Codex process stage=' + stage + ' shellPid=' + term.pid + ' tab=' + tabId);
+      return { success: false, error: 'no_codex_session' };
+    }
+    if (!codexTuiReadyTabs.has(tabId)) {
+      console.log('[Codex:Rewind] TUI input-ready missing stage=' + stage + ' tab=' + String(tabId).slice(-12));
+      return { success: false, error: 'codex_not_input_ready' };
+    }
+    const readyMeta = codexTuiReadyMeta.get(tabId) || null;
+    console.log('[Codex:Rewind] authorization stage=' + stage + ' tab=' + String(tabId).slice(-12)
+      + ' readyAgeMs=' + (readyMeta?.at ? Date.now() - readyMeta.at : 'unknown')
+      + ' readySource=' + (readyMeta?.source || '-')
+      + ' readyReason=' + (readyMeta?.reason || '-')
+      + ' readyPreview=' + JSON.stringify(String(readyMeta?.preview || '').slice(0, 180))
+      + ' pids=' + candidates.map(p => p.pid).join(','));
+
+    const authorizedWriter = await reconcileCodexWriterFromProcess(tabId, {
+      reason: 'codex-rewind-' + stage,
+      sender: mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    });
+    let provisional = false;
+    if (authorizedWriter?.status === 'provisional-source') {
+      const authorization = await ensureCodexSubmissionWatcher(
+        tabId,
+        terminalProjects.get(tabId),
+        'rewind-main-' + stage,
+      );
+      provisional = authorization?.available === true
+        && authorization.kind === 'provisional-source'
+        && authorization.sessionId === authorizedWriter.sessionId
+        && writerAuthorization === 'provisional-resume-source'
+        && writerSessionId === authorizedWriter.sessionId
+        && writerLaunchId === authorization.launchId;
+    }
+    if (authorizedWriter?.status === 'adopted') {
+      const proof = getCodexWriterProofSnapshot(tabId);
+      if (writerAuthorization !== 'confirmed-writer'
+        || writerSessionId !== authorizedWriter.sessionId
+        || proof?.sessionId !== authorizedWriter.sessionId
+        || !isCodexWriterUsableForMutation(tabId)) {
+        return { success: false, error: 'codex_writer_changed_before_rewind' };
+      }
+    } else if (!provisional) {
+      console.warn('[Codex:Rewind] writer proof unavailable stage=' + stage
+        + ' tab=' + String(tabId).slice(-12)
+        + ' status=' + (authorizedWriter?.status || 'unknown')
+        + ' error=' + (authorizedWriter?.error || '-'));
+      return {
+        success: false,
+        error: 'codex_writer_unproven',
+        writerStatus: authorizedWriter?.status || 'unknown',
+        writerError: authorizedWriter?.error || null,
+      };
+    }
+    if (!provisional) {
+      await ensureCodexTurnWatcher(tabId, authorizedWriter.sessionId, terminalProjects.get(tabId));
+    }
+    const turnState = codexTurnWatchers.get(tabId);
+    if (aiStoppingTabs.get(tabId)?.toolType === 'codex') {
+      return { success: false, error: 'codex_stopping' };
+    }
+    if (turnState?.busy === true || hasCodexPromptOrTurnInFlight(tabId)) {
+      console.log('[Codex:Rewind] refusing busy turn stage=' + stage + ' tab=' + String(tabId).slice(-12));
+      return { success: false, error: 'codex_busy' };
+    }
+    return {
+      success: true,
+      writer: authorizedWriter,
+      provisionalResumeRewind: provisional,
+    };
   }
 
   function normalizeCandidate(text) {
@@ -13617,7 +14294,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
   }
 
   async function loadCodexRewindTargetPayload() {
-    const resolvedSessionId = getCodexRuntimeSessionId(tabId) || codexSessionIdFromDb(tabId);
+    const resolvedSessionId = writer.sessionId;
     if (!resolvedSessionId || !targetUuid) return null;
     const cwd = terminalProjects.get(tabId);
     try {
@@ -14212,9 +14889,28 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
   }
 
   let codexRewindOverlayOpen = false;
+  let handoffObservationArmed = false;
+  let codexRewindOperationResult = null;
+  // PTY serialization alone is insufficient for destructive intents: a
+  // second click queued behind the first would otherwise execute later with
+  // the writer/target proof captured before the first rollback. Reject it
+  // instead of turning two concurrent clicks into two sequential rollbacks.
+  const rewindRequestId = 'codex-rewind-' + Date.now() + '-' + (++codexRewindReservationSeq);
+  const rewindReservationClaim = claimExclusiveActionReservation(codexRewindReservations, {
+    key: tabId,
+    requestId: rewindRequestId,
+    action: 'codex-rewind',
+  });
+  if (!rewindReservationClaim.success) {
+    console.warn('[Codex:Rewind] reservation lost tab=' + String(tabId).slice(-12)
+      + ' request=' + rewindRequestId
+      + ' active=' + (rewindReservationClaim.active?.requestId || '-'));
+    return { success: false, error: 'codex_rewind_already_in_progress' };
+  }
+  const rewindReservation = rewindReservationClaim.reservation;
 
   try {
-    return await withPtyWriteLock(term, async () => {
+    codexRewindOperationResult = await withPtyWriteLock(term, async () => {
       const count = Number(rewindableCount);
       const idx = Number(targetIndex);
       if (!Number.isFinite(count) || !Number.isFinite(idx) || count <= 0 || idx < 0 || idx >= count) {
@@ -14224,8 +14920,43 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       const targetInputText = String(targetFullText || targetText || '').trim();
       if (!targetInputText) return { success: false, error: 'empty_target' };
       const hasPasteAfter = typeof pasteAfter === 'string' && pasteAfter.length > 0;
+      // This is the mutation boundary. The request may have waited behind a
+      // paste/model action, so renderer preflight is stale by definition here.
+      // Re-prove process, writer/provisional launch, readiness and idle state
+      // while holding the same lock that guards the first Escape.
+      const targetAuthorization = await authorizeCodexRewindAtWriteBoundary('locked-before-target-load');
+      if (!targetAuthorization.success) return targetAuthorization;
+      writer = targetAuthorization.writer;
+      provisionalResumeRewind = targetAuthorization.provisionalResumeRewind;
       const targetPayloadContext = await loadCodexRewindTargetPayload();
       const targetPayload = targetPayloadContext?.payload || null;
+      if (targetUuid && !targetPayloadContext) {
+        return {
+          success: false,
+          error: 'codex_rewind_target_not_in_current_writer',
+          writerSessionId: writer.sessionId,
+          targetUuid,
+        };
+      }
+      const writeAuthorization = await authorizeCodexRewindAtWriteBoundary('locked-before-first-write');
+      if (!writeAuthorization.success) return writeAuthorization;
+      if (writeAuthorization.writer?.sessionId !== writer?.sessionId
+        || writeAuthorization.provisionalResumeRewind !== provisionalResumeRewind) {
+        return {
+          success: false,
+          error: 'codex_writer_changed_before_rewind',
+          writerSessionId: writeAuthorization.writer?.sessionId || null,
+        };
+      }
+      writer = writeAuthorization.writer;
+      provisionalResumeRewind = writeAuthorization.provisionalResumeRewind;
+      handoffObservationArmed = provisionalResumeRewind
+        ? false
+        : armCodexWriterHandoffObservation(
+          tabId,
+          'programmatic-rewind',
+          { blockMutations: true },
+        );
 
       async function pasteCodexRewindAiCompact(reason) {
         console.log('[Codex:Rewind] Pasting AI compact text (' + pasteAfter.length + ' chars, reason=' + reason + ', preview=' + JSON.stringify(String(pasteAfter).slice(0, 120)) + ')');
@@ -14241,6 +14972,9 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           submitSequence: '\r',
           submitLabel: 'Enter',
           source: 'codex-rewind-ai',
+          codexSubmissionPreflight: provisionalResumeRewind,
+          awaitCodexUserMessageAudit: true,
+          codexAuditTimeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
           logPrefix: '[Codex:Rewind:paste]',
         });
         if (!pasteResult || pasteResult.success === false) {
@@ -14672,16 +15406,28 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         restoredMatchMode: grabResult.matchMode || '',
       };
     });
+    return codexRewindOperationResult;
   } catch (err) {
     if (err?.code === 'rewind_cancelled') {
       try { term.write(codexRewindOverlayOpen ? 'q' : '\x1b'); } catch {}
-      return { success: false, cancelled: true, error: 'rewind_cancelled', stage: err.stage, rollbackMayHaveApplied: false };
+      codexRewindOperationResult = { success: false, cancelled: true, error: 'rewind_cancelled', stage: err.stage, rollbackMayHaveApplied: false };
+      return codexRewindOperationResult;
     }
     console.log('[Codex:Rewind] Error:', err?.message || String(err));
     try { term.write(codexRewindOverlayOpen ? 'q' : '\x1b'); } catch {}
-    return { success: false, error: err?.message || String(err) };
+    codexRewindOperationResult = { success: false, error: err?.message || String(err) };
+    return codexRewindOperationResult;
   } finally {
-    rewindCancelTabs.delete(tabId);
+    try {
+      if (handoffObservationArmed) {
+        await settleCodexWriterHandoffObservation(tabId, 'programmatic-rewind', {
+          allowStableWriter: codexRewindOperationResult?.success === true,
+        });
+      }
+    } finally {
+      releaseExclusiveActionReservation(codexRewindReservations, rewindReservation);
+      rewindCancelTabs.delete(tabId);
+    }
   }
 });
 
@@ -15438,13 +16184,101 @@ ipcMain.handle('project:save-actions', (event, { projectId, actions }) => {
   return { success: true };
 });
 
+// Codex session identity has a point-write ownership path. Renderer calls this
+// before its generic workspace save so the latter can safely preserve the
+// already-committed DB value instead of treating a cached snapshot as truth.
+ipcMain.handle('tab:set-codex-session-id', async (_event, {
+  projectId,
+  tabId,
+  sessionId,
+  expectedSessionId = null,
+  reason = 'unknown',
+} = {}) => {
+  if (!tabId) return { success: false, error: 'tab_id_required' };
+  if (sessionId != null && typeof sessionId !== 'string') {
+    return { success: false, error: 'invalid_codex_session_id' };
+  }
+  const historicalMutation = ['editRange', 'deleteRange', 'api-edit-range', 'api-delete-range'].includes(reason);
+  const unmaterializedDiscard = reason === 'discard-unmaterialized';
+  if (!historicalMutation && !unmaterializedDiscard) {
+    return { success: false, error: 'codex_session_identity_owned_by_main' };
+  }
+  if (!projectId) return { success: false, error: 'project_id_required' };
+
+  // Historical edits and launch/resume share one lifecycle mutex. Otherwise a
+  // slow "process absent" probe can finish after a new launch has started and
+  // overwrite the binding that launch is about to materialize.
+  return runKeyedExclusive(codexLaunchInflight, tabId, async () => {
+    const resolvedProjectId = resolveAuthoritativeTabProjectId(tabId, projectId);
+    if (resolvedProjectId !== projectId) {
+      return { success: false, error: 'codex_tab_project_mismatch' };
+    }
+    const generationBefore = codexLastRunCommandPayload.get(tabId)?.launchId || null;
+    const runtime = await getCodexRuntimeSessionSnapshot(tabId, {
+      reason: 'codex-binding-point-write:' + reason,
+      projectId,
+    });
+    const generationAfter = codexLastRunCommandPayload.get(tabId)?.launchId || null;
+    if (generationAfter !== generationBefore) {
+      return {
+        success: false,
+        error: 'codex_launch_generation_changed_during_historical_write',
+      };
+    }
+    if (runtime.liveLifecycle !== false) {
+      return {
+        success: false,
+        error: 'codex_historical_binding_requires_proven_stopped_runtime',
+        liveLifecycle: runtime.liveLifecycle,
+        sessionStatus: runtime.sessionStatus,
+        writerStatus: runtime.writerStatus,
+      };
+    }
+    try {
+      const current = projectManager.db.getTabCodexSessionId(projectId, tabId);
+      if (current === undefined) {
+        return { success: false, error: 'codex_tab_row_missing' };
+      }
+      if ((expectedSessionId || null) !== (current || null)) {
+        return {
+          success: false,
+          error: 'codex_session_compare_and_set_conflict',
+          currentSessionId: current,
+        };
+      }
+      const updated = projectManager.db.compareAndSetTabCodexSessionId(
+        projectId,
+        tabId,
+        expectedSessionId ?? null,
+        sessionId ?? null,
+      );
+      if (!updated) {
+        return {
+          success: false,
+          error: 'codex_session_compare_and_set_conflict',
+          currentSessionId: projectManager.db.getTabCodexSessionId(projectId, tabId),
+        };
+      }
+      return { success: true, updated: true };
+    } catch (error) {
+      console.warn('[Codex:Persist] point-write failed tab=' + String(tabId).slice(-12)
+        + ' project=' + String(projectId).slice(-12)
+        + ' session=' + (sessionId ? String(sessionId).slice(0, 8) : 'none')
+        + ' error=' + (error?.message || String(error)));
+      return { success: false, error: error?.message || String(error) };
+    }
+  });
+});
+
 ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup }) => {
   // During shutdown the renderer is still alive through the proxy-drain stall;
   // any save here would reinsert rows with was_interrupted=0 from the in-memory
   // tab and clobber before-quit's EARLY-MARK. preserveInterrupted=true makes
   // db.saveTabs never downgrade an on-disk 1 → 0. See fix-interrupted-session-lifecycle.md.
   const started = Date.now();
-  projectManager.saveProjectTabs(projectId, tabs, forceCleanup, _gracefulShutdownInProgress);
+  const result = runSaveTabsWithAck(() => (
+    projectManager.saveProjectTabs(projectId, tabs, forceCleanup, _gracefulShutdownInProgress)
+  ));
   const durMs = Date.now() - started;
   if (durMs > 50 || forceCleanup) {
     console.log('[SaveTabs:Perf] project=' + String(projectId).slice(-12) +
@@ -15453,7 +16287,12 @@ ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup }) =
       ' shutdown=' + !!_gracefulShutdownInProgress +
       ' durMs=' + durMs);
   }
-  return { success: true };
+  if (result.success !== true) {
+    console.warn('[SaveTabs] not committed project=' + String(projectId || '').slice(-12) +
+      ' error=' + result.error +
+      ' durMs=' + durMs);
+  }
+  return result;
 });
 
 ipcMain.handle('tab-task-plan:get', (_event, { tabId } = {}) => {
@@ -15539,7 +16378,9 @@ ipcMain.handle('tab:get-cache-stats', (event, { tabId }) => {
 // Synchronous version for beforeunload (pkill-safe)
 ipcMain.on('project:save-tabs-sync', (event, { projectId, tabs, forceCleanup }) => {
   const started = Date.now();
-  projectManager.saveProjectTabs(projectId, tabs, forceCleanup, _gracefulShutdownInProgress);
+  const result = runSaveTabsWithAck(() => (
+    projectManager.saveProjectTabs(projectId, tabs, forceCleanup, _gracefulShutdownInProgress)
+  ));
   const durMs = Date.now() - started;
   if (durMs > 50 || forceCleanup) {
     console.log('[SaveTabs:Perf] sync project=' + String(projectId).slice(-12) +
@@ -15548,7 +16389,46 @@ ipcMain.on('project:save-tabs-sync', (event, { projectId, tabs, forceCleanup }) 
       ' shutdown=' + !!_gracefulShutdownInProgress +
       ' durMs=' + durMs);
   }
-  event.returnValue = { success: true };
+  if (result.success !== true) {
+    console.warn('[SaveTabs] sync not committed project=' + String(projectId || '').slice(-12) +
+      ' error=' + result.error +
+      ' durMs=' + durMs);
+  }
+  event.returnValue = result;
+});
+
+// Cross-project DnD changes three representations of one identity: the scoped
+// SQLite row, main's live PTY owner, and renderer Zustand. Commit the first two
+// synchronously and acknowledge only then; renderer applies its local move
+// after this returns, so no writer reconciliation can target a missing row in
+// the destination project.
+ipcMain.on('terminal:transfer-project-ownership-sync', (event, {
+  sourceProjectId,
+  targetProjectId,
+  tabIds,
+} = {}) => {
+  const result = commitTabProjectTransfer({
+    terminals,
+    terminalProjectIds,
+    tabIds,
+    sourceProjectId,
+    targetProjectId,
+    transferRows: ({ sourceProjectId: source, targetProjectId: target, tabIds: ids }) => (
+      projectManager.transferProjectTabs(source, target, ids)
+    ),
+  });
+  if (result.success !== true) {
+    console.warn('[TabProjectTransfer] rejected source=' + String(sourceProjectId || '').slice(-12)
+      + ' target=' + String(targetProjectId || '').slice(-12)
+      + ' tabs=' + (Array.isArray(tabIds) ? tabIds.length : 0)
+      + ' error=' + (result.error || 'unknown'));
+  } else {
+    console.log('[TabProjectTransfer] committed source=' + String(sourceProjectId).slice(-12)
+      + ' target=' + String(targetProjectId).slice(-12)
+      + ' tabs=' + result.transferred.length
+      + ' live=' + result.liveTabIds.length);
+  }
+  event.returnValue = result;
 });
 
 ipcMain.on('tab-notification:play-sound', () => {
@@ -16006,7 +16886,23 @@ function scheduleArchiveSideEffects(projectId, tab, historyId) {
   }, ARCHIVE_AUTO_INDEX_DELAY_MS);
 }
 
-ipcMain.handle('project:archive-tab', (event, { projectId, tab }) => {
+function getCodexArchiveGeneration(tabId) {
+  const terminal = terminals.get(tabId) || null;
+  const commandState = terminalCommandState.get(tabId) || null;
+  const launch = codexLastRunCommandPayload.get(tabId) || null;
+  return [
+    terminal?.pid || 'no-pty',
+    Number(commandState?.runSeq || 0),
+    commandState?.isRunning === true ? 'running' : 'idle',
+    launch?.launchId || 'no-launch',
+    terminalProjectIds.get(tabId) || 'no-project',
+  ].join(':');
+}
+
+function commitTabArchive(projectId, tab, {
+  sourceTabId = null,
+  codexWriterSessionId = null,
+} = {}) {
   const started = Date.now();
   const tabType = tab?.tabType || tab?.tab_type || 'terminal';
   if (tabType === 'file') {
@@ -16015,7 +16911,13 @@ ipcMain.handle('project:archive-tab', (event, { projectId, tab }) => {
       ' durMs=' + (Date.now() - started));
     return { success: true, skipped: true, historyId: null };
   }
-  const historyId = projectManager.db.archiveTab(projectId, tab);
+  const historyId = projectManager.db.archiveTab(projectId, tab, {
+    sourceTabId,
+    codexWriterSessionId,
+  });
+  if (historyId === null || historyId === undefined) {
+    return { success: false, error: 'archive_not_committed', historyId: null };
+  }
   const durMs = Date.now() - started;
   const sessionId = tab?.claudeSessionId || tab?.geminiSessionId || tab?.codexSessionId || null;
   console.log('[Archive:Close] archived historyId=' + historyId +
@@ -16025,8 +16927,112 @@ ipcMain.handle('project:archive-tab', (event, { projectId, tab }) => {
     ' sid=' + (sessionId ? sessionId.slice(0, 8) : 'none') +
     ' processWasRunning=' + !!tab?.processWasRunning +
     ' durMs=' + durMs);
-  scheduleArchiveSideEffects(projectId, tab, historyId);
-  return { success: true, historyId };
+  // Search/count indexing is secondary to the durable History insert. A
+  // side-effect setup failure must not turn a committed archive into a false
+  // negative response and make renderer keep/retry the same live tab.
+  try {
+    scheduleArchiveSideEffects(projectId, tab, historyId);
+  } catch (error) {
+    console.warn('[Archive:Close] post-commit side-effects failed historyId=' + historyId +
+      ' error=' + (error?.message || String(error)));
+  }
+  return {
+    success: true,
+    historyId,
+    codexSessionId: tab?.codexSessionId || null,
+    processWasRunning: !!tab?.processWasRunning,
+  };
+}
+
+ipcMain.handle('project:archive-tab', async (event, { projectId, tab }) => {
+  if (tab?.commandType !== 'codex') {
+    return commitTabArchive(projectId, tab);
+  }
+
+  const sourceTabId = tab?.tabId || null;
+  if (!sourceTabId || !projectId) {
+    return { success: false, error: 'codex_archive_identity_required', historyId: null };
+  }
+
+  return runKeyedExclusive(codexLaunchInflight, sourceTabId, async () => {
+    let rowState;
+    try {
+      const sessionId = projectManager.db.getTabCodexSessionId(projectId, sourceTabId);
+      rowState = sessionId === undefined
+        ? { status: 'missing' }
+        : { status: 'found', sessionId };
+    } catch (error) {
+      rowState = { status: 'error', error: error?.message || String(error) };
+    }
+
+    const generationBefore = getCodexArchiveGeneration(sourceTabId);
+    let runtime;
+    try {
+      runtime = await getCodexRuntimeSessionSnapshot(sourceTabId, {
+        reason: 'archive-close',
+        projectId,
+        refreshTuiReady: true,
+      });
+    } catch (error) {
+      runtime = {
+        projectId,
+        liveLifecycle: null,
+        provenWriterSessionId: null,
+        writerError: error?.message || String(error),
+      };
+    }
+    const generationAfter = getCodexArchiveGeneration(sourceTabId);
+    const snapshot = finalizeCodexArchiveSnapshot({
+      projectId,
+      rowState,
+      runtime,
+      generationBefore,
+      generationAfter,
+    });
+    if (snapshot.success !== true) {
+      console.warn('[Archive:Close] Codex snapshot rejected tab=' + String(sourceTabId).slice(-12)
+        + ' project=' + String(projectId).slice(-12)
+        + ' error=' + snapshot.error
+        + ' row=' + rowState.status
+        + ' live=' + String(runtime?.liveLifecycle)
+        + ' writer=' + (runtime?.provenWriterSessionId ? String(runtime.provenWriterSessionId).slice(0, 8) : 'none')
+        + ' generationBefore=' + generationBefore
+        + ' generationAfter=' + generationAfter);
+      return { success: false, error: snapshot.error, historyId: null };
+    }
+    if (snapshot.processWasRunning && !tab?.processWasRunning) {
+      // The renderer made its confirmation decision from an earlier read. Do
+      // not commit History and then kill a process the user was never asked
+      // about; keep the tab intact so the next close attempt re-reads state and
+      // shows the normal running-process confirmation.
+      return {
+        success: false,
+        error: 'codex_process_state_changed_retry_close',
+        historyId: null,
+      };
+    }
+
+    const archiveTab = {
+      ...tab,
+      codexSessionId: snapshot.codexSessionId,
+      // Renderer checks are useful for confirmation UX, but the durable close
+      // record must not combine that earlier read with a later writer proof.
+      processWasRunning: snapshot.processWasRunning,
+    };
+    if ((tab?.codexSessionId || null) !== snapshot.codexSessionId
+      || !!tab?.processWasRunning !== snapshot.processWasRunning) {
+      console.warn('[Archive:Close] replaced renderer Codex snapshot tab=' + String(sourceTabId).slice(-12)
+        + ' rendererSession=' + String(tab?.codexSessionId || 'none').slice(0, 8)
+        + ' archiveSession=' + String(snapshot.codexSessionId || 'none').slice(0, 8)
+        + ' rendererRunning=' + !!tab?.processWasRunning
+        + ' archiveRunning=' + snapshot.processWasRunning
+        + ' source=' + snapshot.source);
+    }
+    return commitTabArchive(projectId, archiveTab, {
+      sourceTabId,
+      codexWriterSessionId: snapshot.source === 'writer-proof' ? snapshot.codexSessionId : null,
+    });
+  });
 });
 
 ipcMain.handle('project:get-tab-history', (event, { projectId }) => {
@@ -18181,6 +19187,13 @@ ipcMain.handle('file:unwatch-folder', async () => {
 // research:*, commands:*, prompts:*, ai-prompts:* → ipc/settings.js
 require(path.join(srcMainDir, 'ipc', 'settings')).register({ projectManager });
 
+// diagnostics:export-log → bounded, sanitized TXT from the active runtime log
+require(path.join(srcMainDir, 'ipc', 'diagnostic-export')).register({
+  getMainWindow: () => mainWindow,
+  getMainLogPath: () => mainLogPath,
+  isDev,
+});
+
 // ========== DOCS UPDATE FEATURE ==========
 
 // docs:save-temp, docs:read-prompt-file, docs:api-request → ipc/docs.js
@@ -18625,7 +19638,8 @@ function invalidateCodexTuiReadyForStartupBlocker(tabId, source, preview, blocke
   const hadReady = codexTuiReadyTabs.delete(tabId);
   codexTuiReadyMeta.delete(tabId);
   const previewTail = String(preview || '').replace(/\s+/g, ' ').trim().slice(-260);
-  codexTuiReadyLastNotReady.set(tabId, {
+  const previousNotReady = codexTuiReadyLastNotReady.get(tabId) || null;
+  const nextNotReady = {
     ts: Date.now(),
     phase: source || 'startup-blocker',
     source: source || '-',
@@ -18636,18 +19650,21 @@ function invalidateCodexTuiReadyForStartupBlocker(tabId, source, preview, blocke
     totalBytes: previewTail.length,
     startupArmed: codexStartupAutoEnter.has(tabId),
     previewTail,
-  });
+  };
+  codexTuiReadyLastNotReady.set(tabId, nextNotReady);
+  const semanticChanged = previousNotReady?.reason !== nextNotReady.reason
+    || JSON.stringify(previousNotReady?.blockers || []) !== JSON.stringify(nextNotReady.blockers);
+  if (hadReady || semanticChanged) {
+    emitCodexTuiNotReadyState(tabId, {
+      reason: 'startup-blocker:' + blockers.join('+'),
+      lastNotReady: nextNotReady,
+    });
+  }
   if (hadReady) {
     console.warn('[CodexTuiReady] invalidated ready tab=' + String(tabId).slice(-12)
       + ' source=' + (source || '-')
       + ' blockers=' + blockers.join('+')
       + ' preview=' + JSON.stringify(previewTail));
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('codex:tui-not-ready', {
-        tabId,
-        reason: 'startup-blocker:' + blockers.join('+'),
-      });
-    }
     _webBroadcast(tabId, {
       type: 'snapshot',
       sessionId: getCodexRuntimeSessionId(tabId),
@@ -18821,6 +19838,14 @@ function clearCodexPromptInFlight(tabId, reason = 'clear') {
     + ' source=' + (state.source || '-')
     + ' submitted=' + !!state.submitted
     + ' ageMs=' + (Date.now() - (state.startedAt || Date.now())));
+  const launch = codexLastRunCommandPayload.get(tabId) || null;
+  if (launch?.launchId && launch?.startedAt) {
+    const expectedLaunchId = launch.launchId;
+    const expectedStartedAt = launch.startedAt;
+    queueMicrotask(() => {
+      surfaceCodexStartupTimeoutIfDue(tabId, expectedLaunchId, expectedStartedAt, 'prompt-window-cleared');
+    });
+  }
 }
 
 function isCodexStartupLifecycleFresh(tabId) {
@@ -18887,12 +19912,21 @@ function getCodexStartupNoStateTimeout(tabId) {
   const payload = codexLastRunCommandPayload.get(tabId) || null;
   const startedAt = Number(payload?.startedAt || 0);
   if (!tabId || !payload || !startedAt) return null;
-  if (codexTuiReadyTabs.has(tabId)) return null;
-  if (hasCodexPromptOrTurnInFlight(tabId)) return null;
-  const ageMs = Date.now() - startedAt;
-  if (ageMs < CODEX_STARTUP_NO_STATE_TIMEOUT_MS) return null;
   const blockerState = codexTuiReadyLastNotReady.get(tabId) || getCodexMcpStartupStatus(tabId) || null;
-  if (Array.isArray(blockerState?.blockers) && blockerState.blockers.length > 0) return null;
+  const now = Date.now();
+  if (!shouldSurfaceCodexStartupTimeout({
+    expectedLaunchId: payload.launchId,
+    currentLaunchId: payload.launchId,
+    expectedStartedAt: startedAt,
+    currentStartedAt: startedAt,
+    now,
+    timeoutMs: CODEX_STARTUP_NO_STATE_TIMEOUT_MS,
+    inputReady: codexTuiReadyTabs.has(tabId),
+    promptOrTurnInFlight: hasCodexPromptOrTurnInFlight(tabId),
+    manualActionRequired: codexManualActionRequired.has(tabId),
+    blockers: blockerState?.blockers,
+  })) return null;
+  const ageMs = now - startedAt;
   const previewTail = blockerState?.previewTail || '';
   return {
     ts: Date.now(),
@@ -18908,16 +19942,77 @@ function getCodexStartupNoStateTimeout(tabId) {
     firstSeenAgeMs: ageMs,
     lastSeenAgeMs: ageMs,
     timeoutMs: CODEX_STARTUP_NO_STATE_TIMEOUT_MS,
+    launchId: payload.launchId,
     command: payload.command || 'codex',
     sessionId: payload.sessionId || null,
   };
 }
 
+function emitCodexTuiNotReadyState(tabId, payload = {}) {
+  if (!tabId || !mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send('codex:tui-not-ready', {
+    tabId,
+    ...payload,
+  });
+}
+
+function surfaceCodexStartupTimeoutIfDue(
+  tabId,
+  expectedLaunchId,
+  expectedStartedAt,
+  reason = 'deadline',
+) {
+  const payload = codexLastRunCommandPayload.get(tabId) || null;
+  if (!shouldSurfaceCodexStartupTimeout({
+    expectedLaunchId,
+    currentLaunchId: payload?.launchId || null,
+    expectedStartedAt,
+    currentStartedAt: Number(payload?.startedAt || 0),
+    now: Date.now(),
+    timeoutMs: CODEX_STARTUP_NO_STATE_TIMEOUT_MS,
+    inputReady: codexTuiReadyTabs.has(tabId),
+    promptOrTurnInFlight: hasCodexPromptOrTurnInFlight(tabId),
+    manualActionRequired: codexManualActionRequired.has(tabId),
+    blockers: (codexTuiReadyLastNotReady.get(tabId) || getCodexMcpStartupStatus(tabId) || null)?.blockers,
+  })) return false;
+  const status = getCodexStartupNoStateTimeout(tabId);
+  if (!status) return false;
+  maybeSurfaceCodexStartupNoStateTimeout(tabId, status);
+  console.log('[CodexStartupTimeout] deadline evaluated tab=' + String(tabId).slice(-12)
+    + ' reason=' + reason
+    + ' launch=' + expectedLaunchId
+    + ' startedAt=' + expectedStartedAt);
+  return true;
+}
+
+function armCodexStartupNoStateTimeout(tabId, launchId, startedAt) {
+  if (!tabId || !launchId || !startedAt) return;
+  clearCodexStartupNoStateTimeoutTimer(tabId, 'rearm');
+  const state = { timer: null, launchId, startedAt };
+  const delayMs = Math.max(0, startedAt + CODEX_STARTUP_NO_STATE_TIMEOUT_MS - Date.now()) + 5;
+  state.timer = setTimeout(() => {
+    if (codexStartupNoStateTimeoutTimers.get(tabId) !== state) return;
+    codexStartupNoStateTimeoutTimers.delete(tabId);
+    surfaceCodexStartupTimeoutIfDue(tabId, launchId, startedAt, 'main-one-shot');
+  }, delayMs);
+  codexStartupNoStateTimeoutTimers.set(tabId, state);
+  console.log('[CodexStartupTimeout] timer arm tab=' + String(tabId).slice(-12)
+    + ' launch=' + launchId
+    + ' startedAt=' + startedAt
+    + ' delayMs=' + delayMs);
+}
+
 function maybeSurfaceCodexStartupNoStateTimeout(tabId, status) {
   if (!tabId || !status) return;
   codexTuiReadyLastNotReady.set(tabId, status);
-  if (codexStartupNoStateTimeoutTabs.has(tabId)) return;
+  const launchId = status.launchId || codexLastRunCommandPayload.get(tabId)?.launchId || null;
+  if (codexStartupNoStateTimeoutTabs.has(tabId)) {
+    clearCodexLaunchAcceptancePending(tabId, 'startup-timeout-already-surfaced', launchId);
+    return;
+  }
+  clearCodexStartupNoStateTimeoutTimer(tabId, 'surfaced');
   codexStartupNoStateTimeoutTabs.add(tabId);
+  clearCodexLaunchAcceptancePending(tabId, 'startup-timeout', launchId);
   console.warn('[CodexStartupTimeout] tab=' + String(tabId).slice(-12)
     + ' reason=' + status.reason
     + ' ageMs=' + status.firstSeenAgeMs
@@ -18933,8 +20028,16 @@ function maybeSurfaceCodexStartupNoStateTimeout(tabId, status) {
     toolType: 'codex',
     commandType: 'codex',
     lastNotReady: status,
+    startupFailed: true,
     startupError: status.reason,
     reason: 'codex-startup-timeout',
+    ...getCodexPublicWriterFields(tabId),
+  });
+  emitCodexTuiNotReadyState(tabId, {
+    reason: status.reason,
+    lastNotReady: status,
+    startupFailed: true,
+    startupError: status.reason,
   });
 }
 
@@ -18952,23 +20055,24 @@ function broadcastCodexStartingSnapshot(tabId, reason = 'starting') {
     commandType: 'codex',
     lastNotReady: getCodexMcpStartupStatus(tabId),
     reason,
+    ...getCodexPublicWriterFields(tabId),
   });
 }
 
 function broadcastCodexReadySnapshot(tabId, reason = 'tui-ready') {
   if (!tabId || aiStoppingTabs.has(tabId)) return;
-  const turn = codexTurnWatchers.get(tabId);
-  const busy = turn?.busy === true;
+  const runtimeProjection = getCodexPublicRuntimeProjection(tabId);
   _webBroadcast(tabId, {
     type: 'snapshot',
     sessionId: getCodexRuntimeSessionId(tabId),
-    busy,
-    sessionStatus: busy ? 'busy' : 'active',
-    starting: false,
-    inputReady: !busy && codexTuiReadyTabs.has(tabId),
+    busy: runtimeProjection.busy,
+    sessionStatus: runtimeProjection.sessionStatus,
+    starting: runtimeProjection.sessionStatus === 'starting',
+    inputReady: runtimeProjection.inputReady,
     toolType: 'codex',
     commandType: 'codex',
     reason,
+    ...getCodexPublicWriterFields(tabId),
   });
 }
 
@@ -19117,7 +20221,7 @@ async function restartCodexAfterMcpStartupWatchdog(tabId, state) {
   if (!payload.launchId) {
     payload.launchId = 'legacy-' + Date.now() + '-' + (++codexLaunchSeq);
   }
-  const detectedSessionId = codexKnownSessions.get(tabId) || null;
+  const detectedSessionId = getCodexWriterProofSnapshot(tabId)?.sessionId || null;
   if (payload.command === 'codex-f' && detectedSessionId && detectedSessionId !== payload.sessionId) {
     console.warn('[CodexMcpStartupWatchdog] normalize retry tab=' + String(tabId).slice(-12)
       + ' from=fork source=' + (payload.sessionId ? String(payload.sessionId).slice(0, 8) : 'none')
@@ -19387,7 +20491,8 @@ function logCodexTuiReadyNotReady(tabId, inspected, raw, clean, phase) {
   if (!tabId || !inspected || inspected.ready) return;
   const compact = String(clean || '').replace(/\s+/g, ' ').trim();
   const previewTail = compact.slice(-260);
-  codexTuiReadyLastNotReady.set(tabId, {
+  const previousNotReady = codexTuiReadyLastNotReady.get(tabId) || null;
+  const nextNotReady = {
     ts: Date.now(),
     phase: phase || '-',
     source: inspected.source || '-',
@@ -19398,7 +20503,28 @@ function logCodexTuiReadyNotReady(tabId, inspected, raw, clean, phase) {
     totalBytes: inspected.totalBytes || String(raw || '').length,
     startupArmed: codexStartupAutoEnter.has(tabId),
     previewTail,
-  });
+  };
+  codexTuiReadyLastNotReady.set(tabId, nextNotReady);
+  const semanticChanged = previousNotReady?.reason !== nextNotReady.reason
+    || JSON.stringify(previousNotReady?.blockers || []) !== JSON.stringify(nextNotReady.blockers);
+  const launch = codexLastRunCommandPayload.get(tabId) || null;
+  const timedOut = launch?.launchId && launch?.startedAt
+    ? surfaceCodexStartupTimeoutIfDue(
+      tabId,
+      launch.launchId,
+      launch.startedAt,
+      'not-ready-transition',
+    )
+    : false;
+  if (semanticChanged
+    && !timedOut
+    && isCodexStartupLifecycleFresh(tabId)
+    && !hasCodexPromptOrTurnInFlight(tabId)) {
+    emitCodexTuiNotReadyState(tabId, {
+      reason: nextNotReady.reason,
+      lastNotReady: nextNotReady,
+    });
+  }
   const key = [
     phase || '-',
     inspected.source || '-',
@@ -19561,6 +20687,19 @@ async function tryEmitCodexTuiReady(tabId, data) {
 
 function closeCodexWatcher(tabId, reason = 'close') {
   const state = codexWatchers.get(tabId);
+  if ((reason === 'ttl' || reason === 'ttl-no-watch')
+    && state?.provisionalSubmitReservation?.submitted === true) {
+    // Delivery was attempted but the post-Enter rollout audit has not yet
+    // resolved. Dropping this observer would also drop the one-submit latch and
+    // permit a blind duplicate after rearm. Keep the launch-scoped uncertainty
+    // alive until audit/adoption/explicit lifecycle cleanup resolves it.
+    state.timeout = setTimeout(() => {
+      if (codexWatchers.get(tabId) === state) closeCodexWatcher(tabId, reason);
+    }, CODEX_WATCHER_TTL_MS);
+    console.warn('[Codex Watcher] ttl deferred for submitted provisional action tab=' + String(tabId).slice(-12)
+      + ' launch=' + (state.provisionalSubmitReservation.launchId || '-'));
+    return;
+  }
   if (state) {
     try { state.watcher?.close?.(); } catch {}
     if (state.interval) clearInterval(state.interval);
@@ -19625,6 +20764,29 @@ function codexTurnStateSnapshot(state) {
       hasWatcher: false,
       busy: false,
       catchUpPending: false,
+      outcomeKnown: false,
+      lastOutcomeReason: null,
+      lastOutcomeTs: null,
+      lastOutcomeHasFinalResult: null,
+      hasFinalResult: null,
+      lastOutcomeTurnId: null,
+      lastAbnormalOutcomeReason: null,
+      lastAbnormalOutcomeTs: null,
+      lastAbnormalOutcomeTurnId: null,
+    };
+  }
+  if (state.publicTurnStateSuppressed === true) {
+    return {
+      success: true,
+      hasWatcher: true,
+      provisional: true,
+      busy: false,
+      sessionId: null,
+      lastEventType: null,
+      lastEventTs: null,
+      liveTurnEvents: 0,
+      deferredUntilComposer: false,
+      catchUpPending: state.catchUpPending === true,
       outcomeKnown: false,
       lastOutcomeReason: null,
       lastOutcomeTs: null,
@@ -19711,7 +20873,7 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
           : null),
     });
   }
-  const inputReady = !busy && codexTuiReadyTabs.has(tabId);
+  const runtimeProjection = getCodexPublicRuntimeProjection(tabId);
   const sessionId = getCodexRuntimeSessionId(tabId);
   _webBroadcast(tabId, {
     type: 'busy',
@@ -19720,8 +20882,9 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
     toolType: 'codex',
     commandType: 'codex',
     sessionId,
-    sessionStatus: busy ? 'busy' : (inputReady ? 'active' : 'starting'),
-    inputReady,
+    sessionStatus: runtimeProjection.sessionStatus,
+    inputReady: runtimeProjection.inputReady,
+    ...getCodexPublicWriterFields(tabId),
   });
   if (!busy) {
     _webBroadcast(tabId, {
@@ -19755,8 +20918,11 @@ function emitCodexContextPct(tabId, info) {
   const windowSize = Number(info.model_context_window || 0);
   if (windowSize <= 0 || used <= 0) return;
   const pct = Math.min(100, Math.max(0, (used / windowSize) * 100));
-  const state = codexTurnWatchers.get(tabId);
-  const sessionId = state?.sessionId || codexKnownSessions.get(tabId) || null;
+  // A turn watcher can initially follow the resume source before Codex proves
+  // whether it will append there or hand off to a linked child. Context % is
+  // still useful in that window, but the provisional source must not escape as
+  // the current public session identity.
+  const sessionId = getCodexRuntimeSessionId(tabId);
   console.log('[CodexContext] tab=' + String(tabId).slice(-12) + ' session=' + (sessionId || 'unknown') + ' used=' + used + ' window=' + windowSize + ' pct=' + pct.toFixed(1));
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('codex:context-update', { tabId, sessionId, contextPct: pct });
@@ -19824,19 +20990,58 @@ ipcMain.handle('codex:get-turn-state', async (_event, tabId) => {
   return codexTurnStateSnapshot(state);
 });
 
-ipcMain.handle('codex:get-runtime-session', async (_event, tabId) => {
-  const turn = codexTurnWatchers.get(tabId);
-  const payload = codexLastRunCommandPayload.get(tabId) || null;
-  const dbSessionId = codexSessionIdFromDb(tabId);
-  const sessionId = getCodexRuntimeSessionId(tabId);
+ipcMain.handle('codex:get-runtime-session', async (_event, request) => {
+  const { tabId, projectId = null } = request && typeof request === 'object'
+    ? request
+    : { tabId: request, projectId: null };
+  return getCodexRuntimeSessionSnapshot(tabId, {
+    reason: 'runtime-session-query',
+    projectId,
+    refreshTuiReady: true,
+  });
+});
+
+ipcMain.handle('codex:get-rewind-writer-authorization', async (_event, {
+  tabId,
+  sourceSessionId,
+} = {}) => {
+  if (!tabId || !sourceSessionId) {
+    return { success: false, error: 'tabId and sourceSessionId are required' };
+  }
+  const watcher = await ensureCodexSubmissionWatcher(
+    tabId,
+    terminalProjects.get(tabId),
+    'rewind-writer-authorization',
+  );
+  if (!watcher?.available || !watcher.sessionId) {
+    return {
+      success: false,
+      error: 'Codex writer is not ready for Rewind',
+      writerStatus: watcher?.writerStatus || 'unknown',
+    };
+  }
+  if (watcher.kind === 'provisional-source') {
+    if (watcher.sessionId !== sourceSessionId) {
+      return { success: false, error: 'Codex resume source changed before Rewind' };
+    }
+    return {
+      success: true,
+      writerSessionId: watcher.sessionId,
+      authorization: 'provisional-resume-source',
+      launchId: watcher.launchId || null,
+    };
+  }
+  const proof = getCodexWriterProofSnapshot(tabId);
+  if (!proof
+    || proof.sessionId !== watcher.sessionId
+    || !isCodexWriterUsableForMutation(tabId)) {
+    return { success: false, error: 'Codex writer proof is not mutation-safe for Rewind' };
+  }
   return {
     success: true,
-    sessionId,
-    turnSessionId: turn?.sessionId || null,
-    knownSessionId: codexKnownSessions.get(tabId) || null,
-    launchSessionId: payload?.sessionId || null,
-    dbSessionId,
-    hasLaunchPayload: !!payload,
+    writerSessionId: proof.sessionId,
+    authorization: 'confirmed-writer',
+    launchId: proof.launchId || null,
   };
 });
 
@@ -20559,6 +21764,74 @@ function summarizeCodexTurnChunk(text) {
   };
 }
 
+function releaseCodexSourceObservationAfterWriterProof(tabId, sessionId, reason) {
+  const state = codexTurnWatchers.get(tabId);
+  if (!state || state.sessionId !== sessionId || !state.sourceObservationLaunchId) return false;
+  const launchId = state.sourceObservationLaunchId;
+  const replayOffset = Number.isFinite(state.sourceWriterReplayOffset)
+    ? state.sourceWriterReplayOffset
+    : null;
+  const replayPartial = typeof state.sourceWriterReplayPartial === 'string'
+    ? state.sourceWriterReplayPartial
+    : '';
+  state.sourceObservationLaunchId = null;
+  state.publicTurnStateSuppressed = false;
+  state.sourceWriterProofPending = false;
+  state.sourceWriterReplayOffset = null;
+  state.sourceWriterReplayPartial = null;
+  if (replayOffset != null) {
+    state.offset = Math.min(state.offset, replayOffset);
+    state.partial = replayPartial;
+    state.needsScan = true;
+  }
+  console.log('[CodexLaunchObservation] source writer confirmed tab=' + String(tabId).slice(-12)
+    + ' session=' + String(sessionId).slice(0, 8)
+    + ' proof=process-open-rollout'
+    + ' launch=' + launchId
+    + ' replayOffset=' + (replayOffset == null ? 'none' : replayOffset)
+    + ' reason=' + reason);
+  const discovery = codexWatchers.get(tabId) || null;
+  if (discovery?.sourceMode !== 'writer-handoff') {
+    closeCodexWatcher(tabId, 'source-writer-confirmed');
+  }
+  if (replayOffset != null) {
+    setImmediate(() => {
+      const current = codexTurnWatchers.get(tabId);
+      if (current !== state || codexKnownSessions.get(tabId) !== sessionId) return;
+      void scanCodexTurnAppend(tabId, 'source-proof-replay');
+    });
+  }
+  return true;
+}
+
+function requestCodexSourceWriterProof(state) {
+  if (!state?.sourceObservationLaunchId) return false;
+  if (state.sourceWriterProofPending !== true) {
+    state.sourceWriterProofPending = true;
+    const discovery = codexWatchers.get(state.tabId) || null;
+    void reconcileCodexWriterFromProcess(state.tabId, {
+      reason: 'source-rollout-appended',
+      sender: mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+      expectedObserver: discovery,
+    }).then((result) => {
+      if (result?.status !== 'adopted') {
+        console.warn('[CodexLaunchObservation] source append held pending tab=' + String(state.tabId).slice(-12)
+          + ' session=' + String(state.sessionId).slice(0, 8)
+          + ' proofStatus=' + (result?.status || 'none')
+          + ' error=' + (result?.error || '-'));
+      }
+    }).catch((error) => {
+      console.warn('[CodexLaunchObservation] source writer proof failed tab=' + String(state.tabId).slice(-12)
+        + ' error=' + (error?.message || String(error)));
+    }).finally(() => {
+      if (codexTurnWatchers.get(state.tabId) === state && state.sourceObservationLaunchId) {
+        state.sourceWriterProofPending = false;
+      }
+    });
+  }
+  return true;
+}
+
 function processCodexTurnLine(state, line) {
   const text = String(line || '').trim();
   if (!text) return;
@@ -20666,23 +21939,6 @@ function processCodexTurnLine(state, line) {
     state.lastEventTs = record.timestamp || null;
     state.liveTurnEvents = (state.liveTurnEvents || 0) + 1;
     state.busy = true;
-    const sourceObservationLaunchId = state.sourceObservationLaunchId || null;
-    if (sourceObservationLaunchId) {
-      state.sourceObservationLaunchId = null;
-      const discovery = codexWatchers.get(state.tabId);
-      if (
-        discovery?.launchId === sourceObservationLaunchId
-        && discovery?.sourceMode === 'resume'
-        && discovery?.sourceSessionId === state.sessionId
-      ) {
-        console.log('[CodexLaunchObservation] source writer confirmed tab=' + String(state.tabId).slice(-12)
-          + ' session=' + String(state.sessionId).slice(0, 8)
-          + ' event=task_started'
-          + ' launch=' + sourceObservationLaunchId
-          + ' action=close-linked-discovery');
-        closeCodexWatcher(state.tabId, 'source-live-confirmed');
-      }
-    }
     console.log('[CodexTurn] event tab=' + String(state.tabId).slice(-12) + ' session=' + state.sessionId + ' event=task_started ts=' + (record.timestamp || 'n/a'));
     clearCodexPromptInFlight(state.tabId, 'task_started');
     finishCodexStartupLifecycle(state.tabId, 'task_started');
@@ -20768,7 +22024,11 @@ function inferCodexBusyFromText(text) {
   };
 }
 
-async function catchUpCodexTurnState(tabId, filePath, fileSize, { suppressBusy = false, reason = 'catch-up' } = {}) {
+async function catchUpCodexTurnState(tabId, filePath, fileSize, {
+  suppressBusy = false,
+  suppressPublic = false,
+  reason = 'catch-up',
+} = {}) {
   const readSize = Math.min(fileSize, CODEX_TURN_CATCHUP_BYTES);
   if (readSize <= 0) {
     const state = codexTurnWatchers.get(tabId);
@@ -20793,6 +22053,20 @@ async function catchUpCodexTurnState(tabId, filePath, fileSize, { suppressBusy =
     const { inferred, lastAbnormal, lastTokenInfo } = inferCodexBusyFromText(text);
     const state = codexTurnWatchers.get(tabId);
     if (!state || state.filePath !== filePath) return;
+
+    // A resume-source watcher is ownership-neutral until append-in-place or a
+    // linked child is process-proven. Historical tail data may seed its private
+    // observer bookkeeping, but must not publish context, done, busy or the
+    // source ID as if it were the current writer.
+    if (suppressPublic) {
+      state.busy = false;
+      console.log('[CodexTurn] catch-up public suppressed tab=' + String(tabId).slice(-12)
+        + ' event=' + (inferred?.event || 'none')
+        + ' reason=' + reason
+        + ' bytes=' + bytesRead
+        + ' start=' + start);
+      return;
+    }
 
     // Seed the context meter from the tail's freshest token_count, independent of
     // turn-lifecycle events: a resumed/re-armed watcher should show the current
@@ -20932,6 +22206,18 @@ async function scanCodexTurnAppend(tabId, reason = 'scan') {
         ' other=' + chunkSummary.other +
         ' lastEvent=' + chunkSummary.lastEvent +
         ' lastResponseItem=' + chunkSummary.lastResponseItem);
+      if (state.sourceObservationLaunchId) {
+        // Keep ownership-neutral source appends on disk, not in a bounded RAM
+        // queue. The scan offset advances so fs.watch remains cheap; once lsof
+        // proves this tab owns the source, releaseCodexSourceObservation... rolls
+        // the offset back and replays the exact byte range losslessly.
+        if (!Number.isFinite(state.sourceWriterReplayOffset)) {
+          state.sourceWriterReplayOffset = start;
+          state.sourceWriterReplayPartial = state.partial || '';
+        }
+        requestCodexSourceWriterProof(state);
+        continue;
+      }
       processCodexTurnText(state, chunk);
     } while (state.needsScan);
   } finally {
@@ -20961,6 +22247,7 @@ function startCodexTurnWatcher({
   filePath,
   catchUpPendingAudit = false,
   suppressBusyCatchUp = false,
+  suppressPublicCatchUp = false,
   catchUpReason = 'start',
   deferUntilComposer = false,
   initialOffset = null,
@@ -21027,6 +22314,7 @@ function startCodexTurnWatcher({
     deferredAt: deferUntilComposer ? Date.now() : null,
     deferredInitialOffset: deferUntilComposer ? fileSize : null,
     sourceObservationLaunchId: sourceObservationLaunchId || null,
+    publicTurnStateSuppressed: !!suppressPublicCatchUp,
   };
   codexTurnWatchers.set(tabId, state);
   try {
@@ -21035,7 +22323,7 @@ function startCodexTurnWatcher({
     console.warn('[CodexTurn] fs.watch failed tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' error=' + e.message);
   }
   state.interval = setInterval(() => scanCodexTurnAppend(tabId, 'scan'), CODEX_WATCHER_SCAN_MS);
-  console.log('[CodexTurn] watcher started tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' file=' + filePath + ' offset=' + offset + ' fileSize=' + fileSize + ' catchUpPendingAudit=' + !!catchUpPendingAudit + ' suppressBusyCatchUp=' + !!suppressBusyCatchUp + ' deferredUntilComposer=' + !!deferUntilComposer + ' linkedHandoff=' + !!linkedHandoff + ' inheritedBusy=' + inheritedBusy + ' catchUpFromInitialOffset=' + !!catchUpFromInitialOffset);
+  console.log('[CodexTurn] watcher started tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' file=' + filePath + ' offset=' + offset + ' fileSize=' + fileSize + ' catchUpPendingAudit=' + !!catchUpPendingAudit + ' suppressBusyCatchUp=' + !!suppressBusyCatchUp + ' suppressPublicCatchUp=' + !!suppressPublicCatchUp + ' deferredUntilComposer=' + !!deferUntilComposer + ' linkedHandoff=' + !!linkedHandoff + ' inheritedBusy=' + inheritedBusy + ' catchUpFromInitialOffset=' + !!catchUpFromInitialOffset);
   if (deferUntilComposer) {
     console.log('[CodexTurn] fork history barrier armed tab=' + String(tabId).slice(-12)
       + ' session=' + sessionId
@@ -21059,6 +22347,7 @@ function startCodexTurnWatcher({
   } else {
     const catchUpPromise = catchUpCodexTurnState(tabId, filePath, offset, {
       suppressBusy: !!suppressBusyCatchUp,
+      suppressPublic: !!suppressPublicCatchUp,
       reason: catchUpReason,
     });
     state.catchUpPromise = catchUpPromise;
@@ -21107,11 +22396,45 @@ function activateDeferredCodexTurnWatcher(tabId, reason = 'composer-ready') {
   return true;
 }
 
-function codexSessionIdFromDb(tabId) {
+const ambiguousTabProjectLookupsLogged = new Set();
+
+function resolveAuthoritativeTabProjectId(tabId, projectIdHint = null) {
   if (!tabId || !projectManager?.db?.db) return null;
+  const liveProjectId = terminalProjectIds.get(tabId) || null;
+  if (projectIdHint) {
+    if (liveProjectId && liveProjectId !== projectIdHint) return null;
+    try {
+      const row = projectManager.db.db.prepare(
+        'SELECT 1 AS ok FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+      ).get(projectIdHint, tabId);
+      // A brand-new live tab may not have reached its first workspace save yet;
+      // the PTY's project mapping is still authoritative in that narrow window.
+      if (row?.ok || liveProjectId === projectIdHint) return projectIdHint;
+      return null;
+    } catch {
+      return liveProjectId === projectIdHint ? projectIdHint : null;
+    }
+  }
+  if (liveProjectId) return liveProjectId;
   try {
-    const row = projectManager.db.db.prepare('SELECT codex_session_id FROM tabs WHERE tab_id = ? LIMIT 1').get(tabId);
-    return row?.codex_session_id || null;
+    const rows = projectManager.db.db.prepare(
+      'SELECT project_id FROM tabs WHERE tab_id = ? ORDER BY project_id'
+    ).all(tabId);
+    if (rows.length === 1) return rows[0].project_id || null;
+    if (rows.length > 1 && !ambiguousTabProjectLookupsLogged.has(tabId)) {
+      ambiguousTabProjectLookupsLogged.add(tabId);
+      console.warn('[Codex:Persist] ambiguous tabId requires projectId tab=' + String(tabId).slice(-12)
+        + ' projects=' + rows.map((row) => row.project_id).join(','));
+    }
+  } catch {}
+  return null;
+}
+
+function codexSessionIdFromDb(tabId, projectIdHint = null) {
+  const projectId = resolveAuthoritativeTabProjectId(tabId, projectIdHint);
+  if (!projectId) return null;
+  try {
+    return projectManager.db.getTabCodexSessionId(projectId, tabId) ?? null;
   } catch {
     return null;
   }
@@ -21119,25 +22442,566 @@ function codexSessionIdFromDb(tabId) {
 
 function getCodexBoundSessionId(tabId) {
   if (!tabId) return null;
-  return codexTurnWatchers.get(tabId)?.sessionId
-    || codexKnownSessions.get(tabId)
+  return codexKnownSessions.get(tabId)
     || codexSessionIdFromDb(tabId)
     || null;
 }
 
-function getCodexSessionOwner(sessionId, exceptTabId = null) {
-  if (!sessionId) return null;
-  for (const [knownTabId, knownSessionId] of codexKnownSessions) {
-    if (knownTabId !== exceptTabId && knownSessionId === sessionId) {
-      return { tabId: knownTabId, source: 'memory' };
+function codexSessionsDir() {
+  return path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions');
+}
+
+async function inspectCodexWriterProcessProofInner(tabId) {
+  const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
+  if (lookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
+    return {
+      status: 'unknown',
+      error: lookup.error?.message || 'process_lookup_failed',
+      candidates: [],
+    };
+  }
+  if (lookup.status === AI_PROCESS_LOOKUP_STATUS.ABSENT) {
+    return { status: 'absent', candidates: [] };
+  }
+
+  const reports = [];
+  const failures = [];
+  let checked = 0;
+  for (const match of lookup.matches) {
+    try {
+      const lsofBinary = fs.existsSync('/usr/sbin/lsof') ? '/usr/sbin/lsof' : 'lsof';
+      const result = await execFileAsync(lsofBinary, [
+        '-a',
+        '-p', String(match.pid),
+        '-Fpfan',
+      ], {
+        timeout: 1500,
+        maxBuffer: 1024 * 1024,
+      });
+      checked += 1;
+      reports.push({ pid: match.pid, output: result.stdout || '' });
+    } catch (error) {
+      if (error?.stdout) reports.push({ pid: match.pid, output: error.stdout });
+      // lsof exits 1 when the process has no matching/open descriptors. That
+      // is a known "not ready yet", not an observer failure.
+      if (Number(error?.code) === 1) {
+        checked += 1;
+        continue;
+      }
+      failures.push({ pid: match.pid, error: error?.message || String(error) });
     }
   }
+
+  const descriptorProof = resolveCompleteCodexWriterProof(reports, failures, codexSessionsDir());
+  if (descriptorProof.status === 'unknown') {
+    // A single visible rollout is not authoritative when another matching
+    // process could not be inspected. The missing process may hold a different
+    // child rollout, so the whole snapshot is unknown rather than partially
+    // successful.
+    return {
+      status: 'unknown',
+      error: descriptorProof.error,
+      candidates: descriptorProof.candidates || [],
+      partialProofStatus: descriptorProof.partialProofStatus,
+      processMatches: lookup.matches,
+      failures,
+    };
+  }
+  const proof = await resolveCodexUserWriterProof(descriptorProof, {
+    readMetadata: (filePath) => codexDataModule._api.readCodexSessionMetadata(filePath),
+    isUserSession: (meta) => codexDataModule._api.isCodexUserTuiSession(meta),
+  });
+  if (proof.status === 'unknown') {
+    return {
+      ...proof,
+      processMatches: lookup.matches,
+      failures,
+    };
+  }
+  if (proof.status === 'owned' || proof.status === 'ambiguous') {
+    return { ...proof, processMatches: lookup.matches };
+  }
+  return {
+    status: 'pending',
+    candidates: [],
+    processMatches: lookup.matches,
+    failures,
+  };
+}
+
+async function inspectCodexWriterProcessProof(tabId) {
+  // Runtime UI, API listings and launch watchers often ask for the same proof
+  // in one render tick. Share that ps/lsof pass; queueing N complete passes made
+  // the Nth read wait seconds and, before the manual-input repair, delayed Enter.
+  return runKeyedSingleFlight(
+    codexWriterProcessProofInflight,
+    tabId,
+    () => inspectCodexWriterProcessProofInner(tabId),
+  );
+}
+
+async function inspectCodexOwnedWriter(tabId, intentOverride = undefined) {
+  const processProof = await inspectCodexWriterProcessProof(tabId);
+  if (processProof.status !== 'owned') return processProof;
+
+  let metadata = processProof.metadata || null;
+  if (!metadata) {
+    try {
+      metadata = await codexDataModule._api.readCodexSessionMetadata(processProof.filePath);
+    } catch (error) {
+      return {
+        status: 'unknown',
+        error: 'writer_metadata_read_failed:' + (error?.message || String(error)),
+        processProof,
+      };
+    }
+  }
+  const meta = metadata?.meta || {};
+  if (!meta.id) {
+    return { status: 'unknown', error: 'writer_metadata_missing_id', processProof };
+  }
+  if (!path.basename(processProof.filePath).includes(String(meta.id))) {
+    return {
+      status: 'unknown',
+      error: 'writer_filename_metadata_mismatch',
+      processProof,
+      metadataSessionId: meta.id,
+    };
+  }
+  if (!codexDataModule._api.isCodexUserTuiSession(meta)) {
+    return {
+      status: 'ambiguous',
+      error: 'writer_points_to_non_user_rollout',
+      processProof,
+      metadataSessionId: meta.id,
+    };
+  }
+
+  const intent = intentOverride === undefined
+    ? (codexSessionDiscoveryIntents.get(tabId) || null)
+    : intentOverride;
+  const sourceSessionId = intent?.sourceSessionId || null;
+  const sourceMatch = sourceSessionId
+    ? (meta.id === sourceSessionId
+      ? 'source-in-place'
+      : meta.forked_from_id === sourceSessionId
+        ? 'direct-fork'
+        : 'process-owned-descendant')
+    : 'process-owned-fresh';
+  return {
+    status: 'owned',
+    sessionId: meta.id,
+    filePath: processProof.filePath,
+    cwd: meta.cwd || null,
+    forkedFromId: meta.forked_from_id || null,
+    sourceSessionId,
+    sourceMatch,
+    pids: processProof.pids || [],
+    processProof,
+    metadata,
+  };
+}
+
+async function reconcileCodexWriterFromProcessInner(tabId, {
+  reason = 'process-open-rollout',
+  sender = null,
+  expectedObserver = null,
+} = {}) {
+  const intentAtStart = codexSessionDiscoveryIntents.get(tabId) || null;
+  const intentGeneration = intentAtStart?.launchId || null;
+  let owned = await inspectCodexOwnedWriter(tabId, intentAtStart);
+  if (expectedObserver && codexWatchers.get(tabId) !== expectedObserver) {
+    return { status: 'stale-observer', sessionId: owned?.sessionId || null };
+  }
+  if (owned.status !== 'owned') {
+    invalidateCodexWriterProof(tabId, 'process-proof-' + (owned.status || 'unknown'));
+    return owned;
+  }
+
+  // Ownership is a cross-tab transaction, not merely a per-tab lookup. Keep
+  // one rollout locked across every async metadata/read/revalidation step so a
+  // second tab cannot also observe owner=null and commit the same writer while
+  // the first tab is awaiting disk I/O.
+  return runKeyedExclusive(codexWriterSessionInflight, owned.sessionId, async () => {
+  const owner = getCodexSessionOwner(owned.sessionId, tabId);
+  if (owner) {
+    invalidateCodexWriterProof(tabId, 'process-proof-owned-by-other-tab');
+    console.warn('[CodexWriterProof] duplicate writer rejected tab=' + String(tabId).slice(-12)
+      + ' session=' + String(owned.sessionId).slice(0, 8)
+      + ' ownerTab=' + String(owner.tabId || '').slice(-12)
+      + ' ownerSource=' + (owner.source || '-')
+      + ' proof=process-open-rollout');
+    return { ...owned, status: 'owned-by-other-tab', owner };
+  }
+
+  const intent = intentAtStart;
+  let linkedBoundary = null;
+  if (intent?.startedAt) {
+    linkedBoundary = await codexDataModule._api.findCodexLinkedLiveBoundary(owned.filePath, {
+      startedAtMs: intent.startedAt,
+    });
+  }
+  if (expectedObserver && codexWatchers.get(tabId) !== expectedObserver) {
+    return { status: 'stale-observer', sessionId: owned.sessionId };
+  }
+
+  const currentIntentGeneration = codexSessionDiscoveryIntents.get(tabId)?.launchId || null;
+  if (currentIntentGeneration !== intentGeneration) {
+    return {
+      status: 'stale-generation',
+      sessionId: owned.sessionId,
+      expectedLaunchId: intentGeneration,
+      currentLaunchId: currentIntentGeneration,
+    };
+  }
+
+  const revalidated = await inspectCodexOwnedWriter(tabId, intentAtStart);
+  if (expectedObserver && codexWatchers.get(tabId) !== expectedObserver) {
+    return { status: 'stale-observer', sessionId: revalidated?.sessionId || null };
+  }
+  if (revalidated.status !== 'owned') {
+    invalidateCodexWriterProof(tabId, 'process-proof-revalidation-' + (revalidated.status || 'unknown'));
+    return { ...revalidated, status: 'revalidation-' + (revalidated.status || 'unknown') };
+  }
+  if (revalidated.sessionId !== owned.sessionId || revalidated.filePath !== owned.filePath) {
+    invalidateCodexWriterProof(tabId, 'writer-changed-during-proof');
+    return {
+      status: 'writer-changed-during-proof',
+      previousCandidateSessionId: owned.sessionId,
+      sessionId: revalidated.sessionId,
+      filePath: revalidated.filePath,
+    };
+  }
+  owned = revalidated;
+  const finalIntentGeneration = codexSessionDiscoveryIntents.get(tabId)?.launchId || null;
+  if (finalIntentGeneration !== intentGeneration) {
+    return {
+      status: 'stale-generation',
+      sessionId: owned.sessionId,
+      expectedLaunchId: intentGeneration,
+      currentLaunchId: finalIntentGeneration,
+    };
+  }
+
+  const finalOwner = getCodexSessionOwner(owned.sessionId, tabId);
+  if (finalOwner) {
+    invalidateCodexWriterProof(tabId, 'process-proof-owned-by-other-tab-final');
+    return { ...owned, status: 'owned-by-other-tab', owner: finalOwner };
+  }
+
+  const adoptionDecision = classifyCodexWriterAdoption({
+    sourceMode: intent?.sourceMode || null,
+    sourceMatch: owned.sourceMatch,
+    linkedBoundaryFound: linkedBoundary?.found === true,
+    sourceAppendObserved: reason === 'source-rollout-appended',
+  });
+  const sourceAppendLiveProven = adoptionDecision.sourceSettled;
+  if (adoptionDecision.status === 'provisional-source') {
+    // During Resume the CLI may open the source rollout writable while it is
+    // still preparing a linked child. That is a candidate, not yet the durable
+    // writer. Persisting it here recreates the stale-source binding after an app
+    // restart. A ready composer proves only that input is available; Codex may
+    // still create a linked child on the first Enter. Commit source-in-place
+    // only after a post-launch append, or adopt the child once lsof proves it.
+    invalidateCodexWriterProof(tabId, 'resume-source-provisional');
+    console.log('[CodexLaunchObservation] provisional source writer tab=' + String(tabId).slice(-12)
+      + ' session=' + String(owned.sessionId).slice(0, 8)
+      + ' action=keep-source-and-child-observers'
+      + ' reason=' + reason);
+    return {
+      ...owned,
+      status: 'provisional-source',
+      linkedBoundary,
+    };
+  }
+
+  // A process proof is not an adopted public writer until the scoped SQLite
+  // binding is durable. In particular, a cross-project move used to leave a
+  // window where the live PTY had changed owner but the target row did not yet
+  // exist; publishing here made the UI correct only until the next restart.
+  const durableBinding = persistCodexKnownSessionBinding(tabId, owned.sessionId);
+  if (durableBinding?.success !== true) {
+    invalidateCodexWriterProof(tabId, 'writer-persistence-pending');
+    console.warn('[CodexWriterProof] adoption held for persistence tab=' + String(tabId).slice(-12)
+      + ' session=' + String(owned.sessionId).slice(0, 8)
+      + ' error=' + (durableBinding?.error || 'codex_writer_binding_not_committed'));
+    return {
+      ...owned,
+      status: 'persistence-pending',
+      error: durableBinding?.error || 'codex_writer_binding_not_committed',
+      retryable: durableBinding?.retryable !== false,
+      linkedBoundary,
+    };
+  }
+
+  const currentTurn = codexTurnWatchers.get(tabId) || null;
+  if (currentTurn?.sessionId !== owned.sessionId || currentTurn?.filePath !== owned.filePath) {
+    const watcherStarted = startCodexTurnWatcher({
+      tabId,
+      sessionId: owned.sessionId,
+      filePath: owned.filePath,
+      catchUpPendingAudit: true,
+      initialOffset: linkedBoundary?.offset,
+      catchUpFromInitialOffset: !!linkedBoundary,
+      linkedHandoff: !!currentTurn,
+    });
+    if (!watcherStarted) {
+      invalidateCodexWriterProof(tabId, 'writer-turn-watcher-start-failed');
+      return { ...owned, status: 'watcher-start-failed' };
+    }
+  }
+
+  const previous = codexKnownSessions.get(tabId) || null;
+  const adoption = setCodexKnownSession(tabId, owned.sessionId, reason, {
+    kind: 'process-open-rollout',
+    filePath: owned.filePath,
+    pids: owned.pids,
+    launchId: intent?.launchId || null,
+    sourceMatch: owned.sourceMatch,
+    forkedFromId: owned.forkedFromId,
+    sourceSessionId: owned.sourceSessionId,
+  }, durableBinding);
+  if (adoption?.success !== true) {
+    invalidateCodexWriterProof(tabId, 'writer-persistence-pending-after-watcher');
+    return {
+      ...owned,
+      status: 'persistence-pending',
+      error: adoption?.error || 'codex_writer_binding_not_committed',
+      retryable: adoption?.retryable !== false,
+      linkedBoundary,
+    };
+  }
+  if (sourceAppendLiveProven) {
+    releaseCodexSourceObservationAfterWriterProof(tabId, owned.sessionId, reason);
+  }
+  const resumeLease = getCodexResumeSourceLeaseForTab(tabId);
+  if (resumeLease && owned.sessionId !== resumeLease.sourceSessionId) {
+    releaseCodexResumeSourceLeaseForTab(
+      tabId,
+      'resume-adopted-independent-writer',
+      resumeLease.sourceSessionId,
+      resumeLease.launchId,
+    );
+  }
+  if (previous !== owned.sessionId && sender && typeof sender.send === 'function') {
+    sender.send('codex:session-detected', {
+      tabId,
+      sessionId: owned.sessionId,
+      cwd: owned.cwd,
+      writerProven: true,
+      writerProof: 'process-open-rollout',
+    });
+  }
+  return {
+    ...owned,
+    status: 'adopted',
+    previousSessionId: previous,
+    linkedBoundary,
+  };
+  });
+}
+
+async function reconcileCodexWriterFromProcess(tabId, options = {}) {
+  // Coalesce equivalent observations instead of serializing them. Public
+  // status readers share one key per tab; a watcher keeps its own object key so
+  // stale-observer validation is never borrowed from another generation.
+  const key = options.expectedObserver || ('public:' + tabId);
+  return runKeyedSingleFlight(
+    codexWriterReconcileInflight,
+    key,
+    () => reconcileCodexWriterFromProcessInner(tabId, options),
+  );
+}
+
+/**
+ * Resolve Codex lifecycle and identity from one authoritative model.
+ *
+ * `liveLifecycle` is deliberately tri-state:
+ *   true  — a Codex descendant exists;
+ *   false — a successful process-tree snapshot proved it absent;
+ *   null  — the lookup failed, so neither live identity nor stopped history may
+ *           be claimed as the current process.
+ *
+ * SQLite is exposed as `sessionId` only in the explicit stopped state. While a
+ * process exists, only a freshly process-proven writable rollout is current.
+ */
+async function getCodexRuntimeSessionSnapshot(tabId, {
+  reason = 'runtime-session-query',
+  sender = null,
+  projectId = null,
+  refreshTuiReady = false,
+} = {}) {
+  // Presence callers refresh the existing visible/raw-buffer fallback here,
+  // before process/writer proof. Identity-only callers keep this a projection.
+  // Either way the renderer receives one final main-owned generation rather
+  // than combining five independent IPC responses.
+  if (refreshTuiReady) await getCodexTuiReadyState(tabId);
+  const payload = codexLastRunCommandPayload.get(tabId) || null;
+  const hasEstablishedLifecycle = hasEstablishedCodexLifecycleIndicators(tabId);
+  const handoffObserver = codexWatchers.get(tabId) || null;
+  const launchObserverPending = !!payload?.launchId
+    && codexLaunchObservationPending.get(tabId) === payload.launchId;
+  // Only a current launch-generation attachment or a live observer may turn a
+  // fresh empty process snapshot into "still starting". Cached isRunning,
+  // payloads and retained discovery intent are not process evidence and must
+  // not keep a missed exit unresolved forever.
+  const launchAcceptancePending = !!payload?.launchId
+    && codexLaunchAcceptancePending.get(tabId) === payload.launchId;
+  const startupFailureLatched = !!payload?.launchId
+    && codexStartupNoStateTimeoutTabs.has(tabId);
+  const startupOrHandoffPending = shouldHoldCodexStartingOnAbsent({
+    launchObservationPending: launchObserverPending,
+    launchAcceptancePending,
+    startupFailureLatched,
+  });
+  // Reconciliation already starts with a complete process/writable-rollout
+  // proof and revalidates an adoptable writer before committing it. Calling a
+  // separate inspection first made one status request perform up to three
+  // consecutive ps/lsof passes. Use the single reconciliation result as both
+  // lifecycle and identity evidence.
+  let writerInspection;
   try {
-    const row = projectManager?.db?.db?.prepare(
-      'SELECT tab_id FROM tabs WHERE codex_session_id = ? AND tab_id != ? LIMIT 1'
-    ).get(sessionId, exceptTabId || '');
-    if (row?.tab_id) return { tabId: row.tab_id, source: 'db' };
-  } catch {}
+    writerInspection = await reconcileCodexWriterFromProcess(tabId, {
+      reason,
+      sender: sender || (mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null),
+    });
+  } catch (error) {
+    writerInspection = { status: 'unknown', error: error?.message || String(error) };
+  }
+  const processInspection = writerInspection;
+  const liveLifecycle = liveLifecycleFromCodexWriterStatus(writerInspection?.status, {
+    holdStartingOnAbsent: startupOrHandoffPending,
+  });
+  if (liveLifecycle === false) {
+    invalidateCodexWriterProof(tabId, reason + '-process-absent');
+  } else if (liveLifecycle === null) {
+    // Unknown is not absence. Preserve observers/readiness for a later retry,
+    // but revoke mutation/publication until a fresh complete proof succeeds.
+    invalidateCodexWriterProof(tabId, reason + '-process-unknown');
+  } else {
+    if (handoffObserver) handoffObserver.processObserved = true;
+    const state = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
+    state.isRunning = true;
+    terminalCommandState.set(tabId, state);
+    if (Array.isArray(writerInspection?.processMatches) && writerInspection.processMatches.length > 0) {
+      aiProcessLookupCache.set(aiProcessLookupCacheKey(tabId, 'codex'), {
+        at: nodePerformance.now(),
+        matches: writerInspection.processMatches,
+      });
+    }
+  }
+
+  const turn = codexTurnWatchers.get(tabId) || null;
+  const turnState = codexTurnStateSnapshot(turn);
+  const proof = liveLifecycle === true && writerInspection?.status === 'adopted'
+    ? getCodexWriterProofSnapshot(tabId)
+    : null;
+  const provenWriterSessionId = proof?.sessionId || null;
+  const writerConfirmed = liveLifecycle === true && !!provenWriterSessionId;
+  const writerUsableForMutation = writerConfirmed && isCodexWriterUsableForMutation(tabId);
+  const writerUiLifecycleEstablished = writerUsableForMutation
+    || hasCodexEstablishedWriterUiLifecycle(tabId);
+  const lifecycleNotStopped = liveLifecycle !== false;
+  const stopping = lifecycleNotStopped && aiStoppingTabs.get(tabId)?.toolType === 'codex';
+  const busy = lifecycleNotStopped && turnState.busy === true;
+  const inputReady = lifecycleNotStopped
+    && !busy
+    && !stopping
+    && codexTuiReadyTabs.has(tabId);
+  // Process lookup and writer identity are a separate axis from the TUI/turn
+  // lifecycle. A transient lookup failure must revoke the current session ID,
+  // but must not hide an already-ready loader/status or end an active turn.
+  const sessionStatus = projectCodexRuntimeStatus({
+    liveLifecycle,
+    stopping,
+    busy,
+    inputReady,
+    writerUsableForMutation,
+    writerUiLifecycleEstablished,
+    hasEstablishedLifecycle,
+  });
+  // Resolve the durable binding after the async process/writer proof. A tab can
+  // move or be replaced while lsof is in flight; a pre-proof DB read could then
+  // combine stopped history from one project with another lifecycle generation.
+  const scopedProjectId = resolveAuthoritativeTabProjectId(tabId, projectId);
+  const dbSessionId = codexSessionIdFromDb(tabId, scopedProjectId);
+  const knownSessionId = codexKnownSessions.get(tabId) || null;
+  const savedSessionId = dbSessionId || knownSessionId || null;
+  const sessionId = liveLifecycle === false ? savedSessionId : provenWriterSessionId;
+  const manualAction = codexManualActionRequired.get(tabId) || null;
+  const textReady = codexTuiReadyTabs.has(tabId);
+  const startupTimeout = !textReady && !manualAction
+    ? getCodexStartupNoStateTimeout(tabId)
+    : null;
+  if (startupTimeout) maybeSurfaceCodexStartupNoStateTimeout(tabId, startupTimeout);
+  const lastNotReady = codexTuiReadyLastNotReady.get(tabId)
+    || (!textReady ? getCodexMcpStartupStatus(tabId) : null)
+    || null;
+
+  return {
+    success: true,
+    tabId,
+    projectId: scopedProjectId,
+    sessionId,
+    displaySessionId: sessionId,
+    sessionStatus,
+    busy,
+    inputReady,
+    hasTerm: terminals.has(tabId),
+    lastNotReady,
+    startupFailed: !!startupTimeout,
+    startupError: startupTimeout?.reason || null,
+    manualActionRequired: !!manualAction,
+    manualActionType: manualAction?.type || null,
+    hasWatcher: turnState.hasWatcher === true,
+    catchUpPending: turnState.catchUpPending === true,
+    outcomeKnown: turnState.outcomeKnown === true,
+    lastOutcomeReason: turnState.lastOutcomeReason || null,
+    turnSessionId: turn?.sessionId || null,
+    knownSessionId,
+    provenWriterSessionId,
+    writerConfirmed,
+    writerUsableForMutation,
+    canCopySessionId: liveLifecycle === false ? !!savedSessionId : writerUsableForMutation,
+    writerProof: writerConfirmed ? proof.kind : null,
+    writerFilePath: writerConfirmed ? proof.filePath : null,
+    writerPids: writerConfirmed ? proof.pids : [],
+    writerStatus: writerInspection?.status || processInspection?.status || 'unknown',
+    writerError: writerInspection?.error || processInspection?.error || null,
+    launchSessionId: payload?.sessionId || null,
+    resumeSourceSessionId: payload?.sessionId || null,
+    dbSessionId,
+    savedSessionId,
+    writerSourceMatch: writerConfirmed ? proof.sourceMatch : null,
+    writerSourceSessionId: writerConfirmed ? proof.sourceSessionId : null,
+    writerForkedFromId: writerConfirmed ? proof.forkedFromId : null,
+    writerLaunchId: writerConfirmed ? proof.launchId : null,
+    liveLifecycle,
+    hasLaunchPayload: !!payload,
+  };
+}
+
+function getCodexSessionOwner(sessionId, exceptTabId = null) {
+  if (!sessionId) return null;
+  for (const [knownTabId] of codexKnownSessions) {
+    const proof = codexWriterProofs.get(knownTabId) || null;
+    if (
+      knownTabId !== exceptTabId
+      && proof?.sessionId === sessionId
+      && isCodexWriterProofOwnershipQuarantined(proof)
+    ) {
+      return {
+        tabId: knownTabId,
+        source: proof.valid === true ? 'memory' : 'memory-unknown-quarantine',
+        uncertain: proof.valid !== true,
+      };
+    }
+  }
+  // A persisted row is not a live lease. It can be stale precisely because an
+  // older renderer snapshot overwrote the writer adopted by main, or because
+  // a closed tab previously owned the conversation. Reject only another tab's
+  // process-proven in-memory owner. Concurrent candidates are serialized by
+  // codexWriterSessionInflight across the complete async proof transaction.
   return null;
 }
 
@@ -21167,6 +23031,16 @@ async function ensureCodexTurnWatcher(tabId, sessionId, cwd, options = {}) {
     // linked-child discovery remains armed and can adopt a later unrelated fork.
     if (options.sourceObservationLaunchId) {
       existing.sourceObservationLaunchId = options.sourceObservationLaunchId;
+      existing.publicTurnStateSuppressed = options.suppressPublicCatchUp === true;
+      existing.busy = false;
+      existing.lastEventType = null;
+      existing.lastEventTs = null;
+      existing.liveTurnEvents = 0;
+      existing.outcomeKnown = false;
+      existing.lastOutcomeReason = null;
+      existing.lastOutcomeTs = null;
+      existing.lastOutcomeHasFinalResult = null;
+      existing.lastOutcomeTurnId = null;
     }
     return true;
   }
@@ -21186,6 +23060,7 @@ async function ensureCodexTurnWatcher(tabId, sessionId, cwd, options = {}) {
       sessionId: resolvedSessionId,
       filePath: found.filePath,
       suppressBusyCatchUp: !!options.suppressBusyCatchUp,
+      suppressPublicCatchUp: !!options.suppressPublicCatchUp,
       catchUpReason: options.catchUpReason || 'ensure',
       sourceObservationLaunchId: options.sourceObservationLaunchId || null,
     });
@@ -21195,6 +23070,104 @@ async function ensureCodexTurnWatcher(tabId, sessionId, cwd, options = {}) {
   }
 }
 
+function getCodexSubmissionObservationContext(tabId, cwd) {
+  const intent = codexSessionDiscoveryIntents.get(tabId) || null;
+  const launch = codexLastRunCommandPayload.get(tabId) || null;
+  const sourceSessionId = intent?.sourceSessionId
+    || ((launch?.command === 'codex-f' || launch?.command === 'codex-c') ? (launch.sessionId || null) : null);
+  const sourceMode = intent?.sourceMode
+    || (launch?.command === 'codex-f' ? 'fork' : launch?.command === 'codex-c' ? 'resume' : null);
+  return {
+    intent,
+    launch,
+    sourceSessionId,
+    sourceMode,
+    startedAt: intent?.startedAt || launch?.startedAt || Date.now(),
+    launchId: intent?.launchId || launch?.launchId || null,
+    cwd: cwd || terminalProjects.get(tabId),
+    sender: mainWindow && !mainWindow.isDestroyed()
+      ? mainWindow.webContents
+      : { send: () => {} },
+  };
+}
+
+// Physical delivery and observation are separate contracts. This arms every
+// observer synchronously but never waits for ps/lsof before paste or Enter.
+// Delivery is proven afterwards by the rollout user_message audit.
+function armCodexSubmissionObservationWithoutProof(tabId, cwd, reason = 'submit', {
+  reserveProvisional = false,
+} = {}) {
+  const context = getCodexSubmissionObservationContext(tabId, cwd);
+  const proof = getCodexWriterProofSnapshot(tabId);
+  let discovery = codexWatchers.get(tabId) || null;
+  const turn = codexTurnWatchers.get(tabId) || null;
+
+  if (!discovery && (!proof || context.sourceMode === 'resume')) {
+    startCodexSessionWatcher(context.sender, {
+      tabId,
+      cwd: context.cwd,
+      startedAt: context.startedAt,
+      sourceSessionId: context.sourceSessionId || proof?.sessionId || null,
+      sourceMode: context.sourceMode,
+      launchId: context.launchId,
+    });
+    discovery = codexWatchers.get(tabId) || null;
+  }
+  if (proof && !turn) {
+    void ensureCodexTurnWatcher(tabId, proof.sessionId, context.cwd, {
+      catchUpReason: 'pre-submit-observation:' + reason,
+    });
+  }
+
+  let reservation = null;
+  const provisionalResume = !proof
+    && context.sourceMode === 'resume'
+    && !!context.sourceSessionId
+    && !!context.launchId;
+  if (reserveProvisional && provisionalResume) {
+    const lease = getCodexResumeSourceLeaseForTab(tabId);
+    const exactLease = lease
+      && lease.tabId === tabId
+      && lease.sourceSessionId === context.sourceSessionId
+      && lease.launchId === context.launchId;
+    const existingReservation = discovery?.provisionalSubmitReservation || null;
+    if (!discovery || !exactLease) {
+      return {
+        available: false,
+        kind: 'none',
+        writerStatus: 'provisional-source-unleased',
+        error: 'codex_resume_source_not_reserved',
+      };
+    }
+    if (existingReservation?.submitted === true || hasCodexPromptOrTurnInFlight(tabId)) {
+      return {
+        available: false,
+        kind: 'none',
+        writerStatus: 'provisional-source-pending',
+        error: 'codex_writer_identity_pending',
+      };
+    }
+    reservation = existingReservation || {
+      launchId: context.launchId,
+      sourceSessionId: context.sourceSessionId,
+      reason,
+      at: Date.now(),
+      submitted: false,
+    };
+    discovery.provisionalSubmitReservation = reservation;
+  }
+
+  return {
+    available: true,
+    kind: proof ? 'turn' : (provisionalResume ? 'provisional-source' : 'session'),
+    rearmed: !!discovery,
+    sessionId: proof?.sessionId || context.sourceSessionId || null,
+    writerStatus: proof ? 'previously-proven' : 'observation-armed',
+    launchId: context.launchId,
+    reservation,
+  };
+}
+
 // A fresh Codex rollout does not exist until the first real prompt is submitted.
 // The launch-time discovery watcher has a bounded TTL, so an idle composer can
 // legitimately outlive it. Every submit boundary must therefore re-arm session
@@ -21202,20 +23175,126 @@ async function ensureCodexTurnWatcher(tabId, sessionId, cwd, options = {}) {
 // the live Codex process is unusable. Once session_meta appears, the existing
 // pending-audit/catch-up path promotes this observer to the authoritative turn
 // watcher and recovers task_started even when JSONL was written immediately.
-async function ensureCodexSubmissionWatcher(tabId, cwd, reason = 'submit') {
-  const intent = codexSessionDiscoveryIntents.get(tabId) || null;
-  const launch = codexLastRunCommandPayload.get(tabId) || null;
-  const sourceSessionId = intent?.sourceSessionId
-    || ((launch?.command === 'codex-f' || launch?.command === 'codex-c') ? (launch.sessionId || null) : null);
-  const sourceMode = intent?.sourceMode
-    || (launch?.command === 'codex-f' ? 'fork' : launch?.command === 'codex-c' ? 'resume' : null);
-  const startedAt = intent?.startedAt || launch?.startedAt || Date.now();
-  const launchId = intent?.launchId || launch?.launchId || null;
-  const sender = mainWindow && !mainWindow.isDestroyed()
-    ? mainWindow.webContents
-    : { send: () => {} };
+async function ensureCodexSubmissionWatcher(tabId, cwd, reason = 'submit', {
+  reserveProvisional = false,
+} = {}) {
+  const context = getCodexSubmissionObservationContext(tabId, cwd);
+  const {
+    intent,
+    launch,
+    sourceSessionId,
+    sourceMode,
+    startedAt,
+    launchId,
+    sender,
+  } = context;
+  let discovery = codexWatchers.get(tabId) || null;
+  const sourceTurnBeforeRearm = codexTurnWatchers.get(tabId) || null;
+  const resumeLeaseBeforeRearm = getCodexResumeSourceLeaseForTab(tabId);
+  if (!discovery
+    && sourceMode === 'resume'
+    && sourceSessionId
+    && launchId
+    && sourceTurnBeforeRearm?.sessionId === sourceSessionId
+    && sourceTurnBeforeRearm?.sourceObservationLaunchId === launchId
+    && resumeLeaseBeforeRearm?.sourceSessionId === sourceSessionId
+    && resumeLeaseBeforeRearm?.tabId === tabId
+    && resumeLeaseBeforeRearm?.launchId === launchId
+    && codexTuiReadyTabs.has(tabId)
+    && !hasCodexPromptOrTurnInFlight(tabId)) {
+    startCodexSessionWatcher(sender, {
+      tabId,
+      cwd: cwd || terminalProjects.get(tabId),
+      startedAt,
+      sourceSessionId,
+      sourceMode,
+      launchId,
+    });
+    discovery = codexWatchers.get(tabId) || null;
+    console.log('[Codex Watcher] provisional resume rearmed before submit tab=' + String(tabId).slice(-12)
+      + ' source=' + String(sourceSessionId).slice(0, 8)
+      + ' launch=' + launchId
+      + ' available=' + !!discovery);
+  }
+  let writerInspection = null;
+  try {
+    writerInspection = await reconcileCodexWriterFromProcess(tabId, {
+      reason: 'submission-preflight:' + reason,
+      sender,
+    });
+  } catch (error) {
+    writerInspection = { status: 'unknown', error: error?.message || String(error) };
+  }
+  const freshWriterProof = writerInspection?.status === 'adopted'
+    ? getCodexWriterProofSnapshot(tabId)
+    : null;
+  const freshLaunchWithoutRollout = !sourceSessionId
+    && writerInspection?.status === 'pending'
+    && codexTuiReadyTabs.has(tabId)
+    && terminalCommandState.get(tabId)?.isRunning === true;
+  discovery = codexWatchers.get(tabId) || discovery;
+  const sourceTurn = codexTurnWatchers.get(tabId) || null;
+  const resumeLease = getCodexResumeSourceLeaseForTab(tabId);
+  const provisionalAuthorization = classifyCodexProvisionalActionAuthorization({
+    sourceMode,
+    writerStatus: writerInspection?.status || null,
+    writerSessionId: writerInspection?.sessionId || null,
+    sourceSessionId,
+    launchId,
+    discovery,
+    sourceTurn,
+    lease: resumeLease,
+    tabId,
+    tuiReady: codexTuiReadyTabs.has(tabId),
+    processRunning: terminalCommandState.get(tabId)?.isRunning === true,
+    processPids: writerInspection?.pids || [],
+    hasInflight: hasCodexPromptOrTurnInFlight(tabId),
+  });
+  if (provisionalAuthorization.authorized) {
+    let reservation = null;
+    if (reserveProvisional) {
+      reservation = {
+        launchId,
+        sourceSessionId,
+        reason,
+        at: Date.now(),
+        submitted: false,
+      };
+      discovery.provisionalSubmitReservation = reservation;
+      console.log('[CodexLaunchObservation] provisional first submit reserved tab=' + String(tabId).slice(-12)
+        + ' source=' + String(sourceSessionId).slice(0, 8)
+        + ' launch=' + launchId
+        + ' reason=' + reason);
+    }
+    return {
+      available: true,
+      kind: 'provisional-source',
+      rearmed: false,
+      sessionId: sourceSessionId,
+      writerStatus: writerInspection.status,
+      launchId,
+      reservation,
+      authorizationReason: provisionalAuthorization.reason,
+    };
+  }
+  if (!freshWriterProof && !freshLaunchWithoutRollout) {
+    console.warn('[Codex Watcher] submission writer rejected tab=' + String(tabId).slice(-12)
+      + ' reason=' + reason
+      + ' status=' + (writerInspection?.status || 'unknown')
+      + ' provisionalReason=' + (provisionalAuthorization.reason || '-')
+      + ' candidates=' + (writerInspection?.candidates?.length || 0));
+    return {
+      available: false,
+      kind: 'none',
+      rearmed: false,
+      sessionId: null,
+      writerStatus: writerInspection?.status || 'unknown',
+      provisionalReason: provisionalAuthorization.reason || null,
+    };
+  }
+  const provenWriterSessionId = freshWriterProof?.sessionId || null;
   const existingTurn = codexTurnWatchers.get(tabId);
-  if (existingTurn) {
+  if (existingTurn && provenWriterSessionId && existingTurn.sessionId === provenWriterSessionId) {
     let rearmed = false;
     if (
       sourceSessionId
@@ -21232,13 +23311,28 @@ async function ensureCodexSubmissionWatcher(tabId, cwd, reason = 'submit') {
       });
       rearmed = codexWatchers.has(tabId);
     }
-    return { available: true, kind: 'turn', rearmed, sessionId: existingTurn.sessionId || null };
+    return {
+      available: true,
+      kind: 'turn',
+      rearmed,
+      sessionId: existingTurn.sessionId || null,
+      writerStatus: writerInspection?.status || 'previously-proven',
+    };
   }
-  if (codexWatchers.has(tabId)) {
-    return { available: true, kind: 'session', rearmed: false, sessionId: null };
+  if (codexWatchers.has(tabId) && freshLaunchWithoutRollout) {
+    return {
+      available: true,
+      kind: 'session',
+      rearmed: false,
+      sessionId: provenWriterSessionId,
+      writerStatus: writerInspection?.status || 'pending',
+    };
   }
 
-  const boundSessionId = getCodexBoundSessionId(tabId);
+  // Only process-proven live identity may attach a turn watcher here. SQLite
+  // is still valid as a stopped conversation to resume, but not as evidence
+  // for where the currently running process will append the next user_message.
+  const boundSessionId = provenWriterSessionId;
   if (boundSessionId) {
     const attached = await ensureCodexTurnWatcher(tabId, boundSessionId, cwd);
     if (attached) {
@@ -21281,6 +23375,129 @@ async function ensureCodexSubmissionWatcher(tabId, cwd, reason = 'submit') {
   return { available, kind: available ? 'session' : 'none', rearmed: available, sessionId: null };
 }
 
+function releaseCodexProvisionalSubmitReservation(tabId, reservation, reason = 'not-submitted') {
+  if (!tabId || !reservation) return false;
+  const discovery = codexWatchers.get(tabId) || null;
+  if (discovery?.provisionalSubmitReservation !== reservation || reservation.submitted === true) return false;
+  discovery.provisionalSubmitReservation = null;
+  console.log('[CodexLaunchObservation] provisional first submit released tab=' + String(tabId).slice(-12)
+    + ' source=' + String(reservation.sourceSessionId || '').slice(0, 8)
+    + ' launch=' + (reservation.launchId || '-')
+    + ' reason=' + reason);
+  return true;
+}
+
+function armCodexWriterHandoffObservation(tabId, reason = 'native-rewind', {
+  blockMutations = false,
+} = {}) {
+  if (!tabId) return false;
+  const existing = codexWatchers.get(tabId) || null;
+  if (existing?.sourceMode === 'writer-handoff') {
+    if (blockMutations) existing.handoffPending = true;
+    console.log('[CodexWriterHandoff] keep tab=' + String(tabId).slice(-12)
+      + ' reason=' + reason
+      + ' baseline=' + String(existing.handoffBaselineSessionId || existing.sourceSessionId || 'none').slice(0, 8));
+    return true;
+  }
+  const sourceSessionId = codexKnownSessions.get(tabId)
+    || codexSessionIdFromDb(tabId)
+    || null;
+  const startedAt = Date.now();
+  const launchId = 'codex-writer-handoff-' + startedAt + '-' + (++codexLaunchSeq);
+  startCodexSessionWatcher(
+    mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : { send: () => {} },
+    {
+      tabId,
+      cwd: terminalProjects.get(tabId),
+      startedAt,
+      sourceSessionId,
+      sourceMode: 'writer-handoff',
+      launchId,
+      handoffPending: !!blockMutations,
+    },
+  );
+  const armed = codexWatchers.has(tabId);
+  console.log('[CodexWriterHandoff] arm tab=' + String(tabId).slice(-12)
+    + ' reason=' + reason
+    + ' source=' + (sourceSessionId ? String(sourceSessionId).slice(0, 8) : 'unknown')
+    + ' armed=' + armed);
+  return armed;
+}
+
+async function settleCodexWriterHandoffObservation(tabId, reason = 'rewind-finished', {
+  allowStableWriter = false,
+} = {}) {
+  const observer = codexWatchers.get(tabId) || null;
+  if (observer?.sourceMode !== 'writer-handoff') return null;
+  const baselineSessionId = observer.handoffBaselineSessionId
+    || observer.sourceSessionId
+    || null;
+  let adoption;
+  try {
+    adoption = await reconcileCodexWriterFromProcess(tabId, {
+      reason: 'writer-handoff-settle:' + reason,
+      sender: mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+      expectedObserver: observer,
+    });
+  } catch (error) {
+    invalidateCodexWriterProof(tabId, 'writer-handoff-settle-error');
+    adoption = {
+      status: 'unknown',
+      error: error?.message || String(error),
+    };
+  }
+  if (codexWatchers.get(tabId) !== observer) {
+    return { ...adoption, status: adoption?.status || 'stale-observer' };
+  }
+
+  const processRunning = terminalCommandState.get(tabId)?.isRunning === true;
+  const writerChanged = adoption?.status === 'adopted'
+    && !!adoption.sessionId
+    && adoption.sessionId !== baselineSessionId;
+  const stableWriterProven = adoption?.status === 'adopted'
+    && !!adoption.sessionId
+    && adoption.sessionId === baselineSessionId
+    && allowStableWriter === true;
+  const settlement = classifyCodexWriterHandoffSettlement({
+    adoptionStatus: adoption?.status || 'unknown',
+    processRunning,
+    turnBusy: codexTurnWatchers.get(tabId)?.busy === true,
+    tuiReady: codexTuiReadyTabs.has(tabId),
+    writerChanged,
+    stableWriterProven,
+  });
+  if (adoption?.status === 'adopted' && settlement.settled) {
+    observer.handoffBaselineSessionId = adoption.sessionId;
+    observer.handoffPending = false;
+  } else {
+    // Unknown/ambiguous inspection is not evidence that the handoff settled.
+    // Keep the loader and mutation guard armed. Only a successful empty process
+    // snapshot combined with an already-stopped PTY may become `inactive`.
+    if (adoption?.status !== 'adopted') {
+      invalidateCodexWriterProof(tabId, 'writer-handoff-unresolved-' + (adoption?.status || 'unknown'));
+    }
+    observer.handoffPending = !settlement.absent;
+  }
+  const runtimeProjection = settlement.absent
+    ? { sessionStatus: 'inactive', busy: false, inputReady: false }
+    : getCodexPublicRuntimeProjection(tabId);
+  _webBroadcast(tabId, {
+    type: 'snapshot',
+    sessionId: getCodexRuntimeSessionId(tabId),
+    busy: runtimeProjection.busy,
+    sessionStatus: runtimeProjection.sessionStatus,
+    starting: runtimeProjection.sessionStatus === 'starting',
+    inputReady: runtimeProjection.inputReady,
+    toolType: 'codex',
+    commandType: 'codex',
+    reason: settlement.settled
+      ? 'writer-handoff-settled:' + reason
+      : 'writer-handoff-unresolved:' + reason,
+    ...getCodexPublicWriterFields(tabId),
+  });
+  return adoption;
+}
+
 function startCodexSessionWatcher(sender, {
   tabId,
   cwd,
@@ -21288,9 +23505,10 @@ function startCodexSessionWatcher(sender, {
   sourceSessionId = null,
   sourceMode = null,
   launchId = null,
+  handoffPending = false,
 }) {
   closeCodexWatcher(tabId, 'restart');
-  const sessionsDir = path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions');
+  const sessionsDir = codexSessionsDir();
   let found = false;
   let detecting = false;
   let detectCount = 0;
@@ -21305,6 +23523,9 @@ function startCodexSessionWatcher(sender, {
     sourceSessionId: sourceSessionId || null,
     sourceMode: sourceMode || null,
     launchId: launchId || null,
+    handoffBaselineSessionId: sourceMode === 'writer-handoff' ? (sourceSessionId || null) : null,
+    handoffPending: sourceMode === 'writer-handoff' && !!handoffPending,
+    processObserved: false,
   };
   codexSessionDiscoveryIntents.set(tabId, {
     cwd: normalizedCwd,
@@ -21321,75 +23542,69 @@ function startCodexSessionWatcher(sender, {
     detecting = true;
     detectCount += 1;
     try {
-      const excludeSessionIds = getCodexWatcherExcludedSessionIds(tabId, sourceSessionId);
-      const hit = await codexDataModule._api.findLatestCodexSession({
-        cwd: normalizedCwd,
-        sinceMs: launchStartedAt,
-        sourceSessionId,
-        excludeSessionIds,
+      const adoption = await reconcileCodexWriterFromProcess(tabId, {
+        reason: sourceSessionId ? 'writer-proof-linked' : 'writer-proof-fresh',
+        sender,
+        expectedObserver: observerState,
       });
-      if (hit?.sessionId && !found) {
-        const owner = getCodexSessionOwner(hit.sessionId, tabId);
-        if (owner) {
-          console.warn('[Codex Watcher] duplicate session skipped:', hit.sessionId, 'candidateTab:', tabId, 'ownerTab:', owner.tabId, 'ownerSource:', owner.source, 'reason:', reason);
+      if (adoption?.status === 'adopted'
+        || adoption?.status === 'provisional-source'
+        || adoption?.status === 'pending') {
+        observerState.processObserved = true;
+      }
+      if (adoption?.status === 'adopted' && !found) {
+        if (sourceMode === 'writer-handoff') {
+          const previousBaseline = observerState.handoffBaselineSessionId || null;
+          observerState.handoffBaselineSessionId = adoption.sessionId;
+          if (previousBaseline !== adoption.sessionId) {
+            console.warn('[CodexWriterHandoff] writer changed tab=' + String(tabId).slice(-12)
+              + ' from=' + (previousBaseline ? String(previousBaseline).slice(0, 8) : 'unknown')
+              + ' to=' + String(adoption.sessionId).slice(0, 8)
+              + ' proof=process-open-rollout'
+              + ' reason=' + reason);
+            observerState.handoffPending = false;
+          }
+          // Native rewind may change writers only after the user confirms the
+          // selected history point. Keep observing through the whole overlay
+          // interaction instead of closing on the currently-open source.
           return;
         }
-        const boundSessionId = getCodexBoundSessionId(tabId);
-        const strictLink = !!sourceSessionId && (
-          hit.sourceMatched === true
-          || hit.parentThreadId === sourceSessionId
-          || hit.forkedFromId === sourceSessionId
-        );
-        if (boundSessionId && boundSessionId !== hit.sessionId && !strictLink) {
-          console.warn('[Codex Watcher] adoption rejected: tab=' + String(tabId).slice(-12)
-            + ' oldSession=' + String(boundSessionId).slice(0, 8)
-            + ' newSession=' + String(hit.sessionId).slice(0, 8)
+        if (
+          sourceMode === 'resume'
+          && adoption.sourceMatch === 'source-in-place'
+          && adoption.linkedBoundary?.found !== true
+        ) {
+          console.log('[Codex Watcher] source open, awaiting live append or child handoff:'
+            + ' session=' + adoption.sessionId
+            + ' tab=' + tabId
             + ' reason=' + reason
-            + ' cwdMatched=' + !!hit.cwdMatched
-            + ' sourceMatched=' + !!hit.sourceMatched
-            + ' source=' + (sourceSessionId || 'n/a')
-            + ' parent=' + (hit.parentThreadId || 'n/a')
-            + ' forkedFrom=' + (hit.forkedFromId || 'n/a')
-            + ' originator=' + (hit.originator || 'n/a')
-            + ' threadSource=' + (hit.threadSource || 'n/a'));
-          return;
-        }
-        const linkedBoundary = sourceSessionId
-          ? await codexDataModule._api.findCodexLinkedLiveBoundary(hit.filePath, {
-            startedAtMs: launchStartedAt,
-          })
-          : null;
-        if (!isCurrentObserver()) {
-          console.warn('[Codex Watcher] stale detection ignored tab=' + String(tabId).slice(-12)
-            + ' session=' + String(hit.sessionId).slice(0, 8)
-            + ' launch=' + (launchId || '-')
-            + ' reason=' + reason);
-          return;
-        }
-        const watcherStarted = startCodexTurnWatcher({
-          tabId,
-          sessionId: hit.sessionId,
-          filePath: hit.filePath,
-          catchUpPendingAudit: true,
-          initialOffset: linkedBoundary?.offset,
-          catchUpFromInitialOffset: !!linkedBoundary,
-          linkedHandoff: !!sourceSessionId,
-        });
-        if (!watcherStarted) {
-          console.warn('[Codex Watcher] adoption watcher failed tab=' + String(tabId).slice(-12)
-            + ' session=' + String(hit.sessionId).slice(0, 8)
-            + ' reason=' + reason);
+            + ' proof=process-open-rollout'
+            + ' launch=' + (launchId || 'n/a'));
           return;
         }
         found = true;
-        console.log('[Codex Watcher] session detected:', hit.sessionId, 'tab:', tabId, 'reason:', reason, 'file:', hit.filePath, 'cwd:', hit.cwd || 'n/a', 'cwdMatched:', !!hit.cwdMatched, 'sourceMatched:', !!hit.sourceMatched, 'source:', sourceSessionId || 'n/a', 'sourceMode:', sourceMode || 'n/a', 'threadSource:', hit.threadSource || 'n/a', 'parent:', hit.parentThreadId || 'n/a', 'forkedFrom:', hit.forkedFromId || 'n/a', 'originator:', hit.originator || 'n/a', 'excludeCount:', excludeSessionIds.length, 'liveBoundary:', linkedBoundary ? JSON.stringify({ found: linkedBoundary.found, offset: linkedBoundary.offset, scannedBytes: linkedBoundary.scannedBytes, turnId: linkedBoundary.turnId, startedAtMs: linkedBoundary.startedAtMs }) : 'n/a', 'launch:', launchId || 'n/a');
-        setCodexKnownSession(tabId, hit.sessionId, sourceSessionId ? 'watcher-detected-linked' : 'watcher-detected');
-        if (sender && typeof sender.send === 'function') {
-          sender.send('codex:session-detected', { tabId, sessionId: hit.sessionId, cwd: hit.cwd || null });
-        }
+        console.log('[Codex Watcher] writer detected:'
+          + ' session=' + adoption.sessionId
+          + ' tab=' + tabId
+          + ' reason=' + reason
+          + ' proof=process-open-rollout'
+          + ' pids=' + (adoption.pids || []).join(',')
+          + ' source=' + (sourceSessionId || 'n/a')
+          + ' sourceMatch=' + (adoption.sourceMatch || 'n/a')
+          + ' sourceMode=' + (sourceMode || 'n/a')
+          + ' forkedFrom=' + (adoption.forkedFromId || 'n/a')
+          + ' liveProof=' + (adoption.linkedBoundary
+            ? JSON.stringify({
+              found: adoption.linkedBoundary.found,
+              offset: adoption.linkedBoundary.offset,
+              turnId: adoption.linkedBoundary.turnId,
+              startedAtMs: adoption.linkedBoundary.startedAtMs,
+            })
+            : 'n/a')
+          + ' launch=' + (launchId || 'n/a'));
         closeCodexWatcher(tabId, 'detected');
       } else if (detectCount <= 3 || detectCount % 10 === 0) {
-        console.log('[Codex Watcher] miss tab:', tabId, 'reason:', reason, 'attempt:', detectCount, 'cwd:', normalizedCwd, 'since:', launchStartedAt, 'source:', sourceSessionId || 'n/a');
+        console.log('[Codex Watcher] miss tab:', tabId, 'reason:', reason, 'attempt:', detectCount, 'cwd:', normalizedCwd, 'since:', launchStartedAt, 'source:', sourceSessionId || 'n/a', 'proofStatus:', adoption?.status || 'none', 'proofError:', adoption?.error || 'n/a');
       }
     } catch (e) {
       console.warn('[Codex Watcher] detect failed:', e.message);
@@ -21432,16 +23647,11 @@ async function beginCodexLaunchObservation(sender, {
     ? sender
     : (mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : { send: () => {} });
   const result = await executeCodexLaunchObservation({ command, sessionId }, {
-    setProvisionalSession: (sourceSessionId) => {
-      // This is the requested resume source, not yet proof of the writer used by
-      // the new CLI process. It remains a compatibility fallback for Codex
-      // versions that append in-place; linked discovery promotes the real child.
-      setCodexKnownSession(tabId, sourceSessionId, 'resume-source-provisional');
-    },
     attachSource: async (sourceSessionId) => {
       try {
         return await ensureCodexTurnWatcher(tabId, sourceSessionId, cwd, {
           suppressBusyCatchUp: true,
+          suppressPublicCatchUp: true,
           catchUpReason: 'codex-c-resume-source',
           sourceObservationLaunchId: launchId,
         });
@@ -22975,11 +25185,50 @@ ipcMain.on('gemini:send-command', (event, tabId, command) => {
 // ========== CODEX INPUT INTERCEPTION ==========
 
 async function runCodexCommandFromPayload(sender, payload = {}) {
+  const tabId = payload?.tabId;
+  if (!tabId) return { success: false, accepted: false, error: 'tabId required' };
+  return await runKeyedExclusive(codexLaunchInflight, tabId, async () => {
+    return await runCodexCommandFromPayloadInner(sender, payload);
+  });
+}
+
+async function runCodexCommandFromPayloadInner(sender, payload = {}) {
   const { tabId, command, sessionId, cwd, model, effort, developerInstructions } = payload;
   const term = terminals.get(tabId);
   if (!term) {
     console.error('[Codex Runner] Terminal not found:', tabId);
     return { success: false, error: 'terminal_not_found' };
+  }
+
+  // Launch/resume is admitted only from a fresh, successful empty process
+  // snapshot. Renderer/web checks are UX; this main boundary prevents a stale
+  // client or two concurrent calls from typing a second launch command into an
+  // already-live Codex composer. Lookup failure is unknown, never absence.
+  invalidateAiProcessLookupCache(tabId, 'codex');
+  const preLaunchLookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
+  if (preLaunchLookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
+    console.warn('[Codex Runner] launch admission unknown tab=' + String(tabId).slice(-12)
+      + ' error=' + (preLaunchLookup.error?.message || preLaunchLookup.error || 'process_lookup_failed'));
+    return {
+      success: false,
+      accepted: false,
+      error: 'process_lookup_failed',
+      lookupUnknown: true,
+      reason: preLaunchLookup.error?.message || 'codex_process_lookup_unknown',
+      tabId,
+    };
+  }
+  if (preLaunchLookup.status === AI_PROCESS_LOOKUP_STATUS.FOUND) {
+    console.warn('[Codex Runner] launch blocked: live Codex already exists tab=' + String(tabId).slice(-12)
+      + ' pids=' + preLaunchLookup.matches.map((match) => match.pid).join(','));
+    return {
+      success: false,
+      accepted: false,
+      error: 'codex_already_running',
+      reason: 'fresh_process_snapshot_found_existing_codex',
+      tabId,
+      pids: preLaunchLookup.matches.map((match) => match.pid),
+    };
   }
 
   const termCwd = cwd || terminalProjects.get(tabId);
@@ -22997,7 +25246,8 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
       reason: 'plain_codex_start_blocked_by_bound_session',
       tabId,
       command: normalizedCommand,
-      sessionId: boundSessionId,
+      sessionId: null,
+      savedSessionId: boundSessionId,
       conversationMaterialized: true,
       canResume: true,
       canCopySessionId: true,
@@ -23010,6 +25260,31 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
   const restartReason = payload.restartReason || 'direct';
   const mcpStartupRestartAttempts = Number(payload.mcpStartupRestartAttempts) || 0;
   const launchId = payload.launchId || ('codex-' + Date.now() + '-' + (++codexLaunchSeq));
+  if (normalizedCommand === 'codex-c' && sessionId) {
+    const lease = claimCodexResumeSourceLease(sessionId, tabId, launchId);
+    if (!lease.success) {
+      console.warn('[CodexResumeLease] blocked tab=' + String(tabId).slice(-12)
+        + ' source=' + String(sessionId).slice(0, 8)
+        + ' ownerTab=' + String(lease.owner?.tabId || '').slice(-12)
+        + ' ownerSource=' + (lease.owner?.source || 'launch-lease'));
+      return {
+        success: false,
+        accepted: false,
+        error: 'codex_resume_source_in_use',
+        reason: 'resume_source_owned_by_other_live_tab',
+        tabId,
+        command: normalizedCommand,
+        sessionId: null,
+        resumeSourceSessionId: sessionId,
+        writerConfirmed: false,
+        ownerTabId: lease.owner?.tabId || null,
+      };
+    }
+    console.log('[CodexResumeLease] claim tab=' + String(tabId).slice(-12)
+      + ' source=' + String(sessionId).slice(0, 8)
+      + ' launch=' + launchId);
+  }
+  invalidateCodexWriterProof(tabId, 'launch-started:' + launchId);
   codexLastRunCommandPayload.set(tabId, {
     launchId,
     tabId,
@@ -23029,6 +25304,7 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
   const commandState = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
   commandState.isRunning = true;
   commandState.runSeq = Number(commandState.runSeq || 0) + 1;
+  const launchRunSeq = commandState.runSeq;
   clearTerminalCommandOrigin(tabId, commandState, 'codex-run-command');
   terminalCommandState.set(tabId, commandState);
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -23036,78 +25312,31 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
   }
   clearCodexTuiReady(tabId, 'run-command');
   armCodexStartupAutoEnter(tabId, { command: normalizedCommand, sessionId, cwd: termCwd });
+  armCodexStartupNoStateTimeout(tabId, launchId, startedAt);
   broadcastCodexStartingSnapshot(tabId, 'codex-run-command');
 
-  await beginCodexLaunchObservation(sender, {
-    tabId,
-    command: normalizedCommand,
-    sessionId: sessionId || null,
-    cwd: termCwd,
-    startedAt,
-    launchId,
-  });
-
-  let profile = null;
-  try {
-    profile = await writeCodexDeveloperInstructionsProfile(tabId, developerInstructions);
-  } catch (err) {
-    console.warn('[Codex Runner] failed to write developer profile tab=' + String(tabId).slice(-12) + ' ' + (err?.message || String(err)));
-  }
-
-  const cmdLine = buildCodexCommand({
-    command: normalizedCommand,
-    sessionId,
-    cwd: termCwd,
-    model: effectiveModel,
-    effort: effectiveEffort,
-    developerInstructions: profile ? '' : developerInstructions,
-    profile,
-  });
-  term.write(cmdLine + '\r');
-  const accepted = await waitForAiLaunchAccepted(tabId, 'codex', {
-    timeoutMs: payload.acceptTimeoutMs || 5000,
-    intervalMs: 120,
-    reason: 'codex:run-command',
-  });
-  if (!accepted.accepted) {
-    if (accepted.lookupUnknown) {
-      // The command was submitted, but the observer that confirms its child
-      // process is unavailable. Keep the launch lifecycle intact: reporting a
-      // pending acceptance is safer than tearing down a process that may already
-      // be running (and lets later TUI/JSONL/process proof complete recovery).
-      console.warn(
-        '[Codex Runner] launch acceptance unknown tab=' + String(tabId).slice(-12) +
-        ' command=' + normalizedCommand +
-        ' action=preserve-starting-lifecycle' +
-        ' reason=' + (accepted.reason || accepted.error || 'process_lookup_failed')
-      );
-      return {
-        success: true,
-        accepted: null,
-        acceptancePending: true,
-        processLookupUnknown: true,
-        lifecyclePreserved: true,
-        error: accepted.error || 'process_lookup_failed',
-        reason: accepted.reason || null,
-        tabId,
-        command: normalizedCommand,
-        sessionId: sessionId || null,
-      };
+  codexLaunchObservationPending.set(tabId, launchId);
+  markCodexLaunchAcceptancePending(tabId, launchId);
+  const rollbackLaunchSetup = (reason, error) => {
+    if (codexLastRunCommandPayload.get(tabId)?.launchId !== launchId) {
+      console.warn('[Codex Runner] stale launch rollback ignored tab=' + String(tabId).slice(-12)
+        + ' launch=' + launchId
+        + ' reason=' + reason);
+      return;
     }
-    console.error(
-      '[Codex Runner] launch not accepted tab=' + String(tabId).slice(-12) +
-      ' command=' + normalizedCommand +
-      ' reason=' + (accepted.reason || accepted.error || 'unknown')
-    );
-    clearCodexLaunchPayload(tabId, 'launch-not-accepted');
-    clearCodexKnownSession(tabId, 'launch-not-accepted');
-    closeCodexWatcher(tabId, 'launch-not-accepted');
-    clearCodexTuiReady(tabId, 'launch-not-accepted');
+    clearCodexLaunchPayload(tabId, reason, launchId);
+    releaseCodexResumeSourceLeaseForTab(tabId, reason, sessionId || null, launchId);
+    invalidateCodexWriterProof(tabId, reason + ':' + launchId);
+    closeCodexWatcher(tabId, reason);
+    closeCodexTurnWatcher(tabId, reason);
+    clearCodexTuiReady(tabId, reason);
     invalidateAiProcessLookupCache(tabId, 'codex');
-    const failedState = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 1 };
-    failedState.isRunning = false;
-    failedState.lastExitCode = 1;
-    terminalCommandState.set(tabId, failedState);
+    const failedState = terminalCommandState.get(tabId);
+    if (failedState && Number(failedState.runSeq || 0) === launchRunSeq) {
+      failedState.isRunning = false;
+      failedState.lastExitCode = 1;
+      terminalCommandState.set(tabId, failedState);
+    }
     _webBroadcast(tabId, {
       type: 'snapshot',
       sessionId: null,
@@ -23118,27 +25347,64 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
       toolType: 'codex',
       commandType: 'codex',
       startupFailed: true,
-      startupError: accepted.reason || accepted.error || 'codex_launch_not_accepted',
+      startupError: error?.message || reason,
+      reason,
     });
-    return {
-      success: false,
-      accepted: false,
-      error: accepted.error || 'codex_launch_not_accepted',
-      reason: accepted.reason || null,
+  };
+  try {
+    await beginCodexLaunchObservation(sender, {
       tabId,
       command: normalizedCommand,
       sessionId: sessionId || null,
-    };
+      cwd: termCwd,
+      startedAt,
+      launchId,
+    });
+  } catch (error) {
+    rollbackLaunchSetup('launch-observation-error', error);
+    throw error;
+  } finally {
+    if (codexLaunchObservationPending.get(tabId) === launchId) {
+      codexLaunchObservationPending.delete(tabId);
+    }
   }
-  return {
-    success: true,
-    accepted: true,
+
+  let profile = null;
+  try {
+    profile = await writeCodexDeveloperInstructionsProfile(tabId, developerInstructions);
+  } catch (err) {
+    console.warn('[Codex Runner] failed to write developer profile tab=' + String(tabId).slice(-12) + ' ' + (err?.message || String(err)));
+  }
+
+  try {
+    const cmdLine = buildCodexCommand({
+      command: normalizedCommand,
+      sessionId,
+      cwd: termCwd,
+      model: effectiveModel,
+      effort: effectiveEffort,
+      developerInstructions: profile ? '' : developerInstructions,
+      profile,
+    });
+    term.write(cmdLine + '\r');
+  } catch (error) {
+    rollbackLaunchSetup('launch-write-error', error);
+    throw error;
+  }
+  // The PTY write is the only synchronous admission point. Codex has no
+  // pre-Enter ACK, and a process-tree snapshot taken immediately afterwards is
+  // both racy and expensive. Keep this launch generation pending until a real
+  // TUI/rollout/lifecycle event settles it (or the one-shot startup watchdog
+  // surfaces a diagnostic failure).
+  const writerProof = getCodexWriterProofSnapshot(tabId);
+  return createCodexLaunchPendingResult({
     launchId,
-    pid: accepted.pid || null,
     tabId,
     command: normalizedCommand,
-    sessionId: sessionId || null,
-  };
+    sessionId: writerProof?.sessionId || null,
+    resumeSourceSessionId: sessionId || null,
+    writerConfirmed: !!writerProof,
+  });
 }
 
 ipcMain.on('codex:run-command', async (event, payload) => {
@@ -23150,6 +25416,7 @@ ipcMain.handle('codex:run-command', async (event, payload) => {
 });
 
 ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}) => {
+  const requestReceivedAt = nodePerformance.now();
   const statusAtSend = options && typeof options.statusAtSend === 'string' ? options.statusAtSend : null;
   // `shouldQueue` is a UI/API handoff state: the prompt was submitted while
   // Codex was busy, so clients keep the local row marked queued until rollout
@@ -23164,25 +25431,6 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
   console.log('[codex:send-command] Received: tabId=' + tabId + ' queue=' + shouldQueue + ' statusAtSend=' + (statusAtSend || '-') + ' handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' resolvedSource=' + codexSource + ' skipVisibleDraftGuard=' + skipVisibleDraftGuard + ' command="' + command + '"');
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no_terminal' };
-  const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
-  if (lookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
-    console.warn('[codex:send-command] ❌ Codex process lookup unavailable tab=' + tabId);
-    return aiProcessLookupFailureResult(lookup);
-  }
-  const candidates = lookup.matches;
-  if (candidates.length === 0) {
-    console.log('[codex:send-command] ❌ No live Codex process under shell pid=' + term.pid + ' tab=' + tabId);
-    return { success: false, error: 'no_codex_session' };
-  }
-  const submitWatcher = await ensureCodexSubmissionWatcher(
-    tabId,
-    terminalProjects.get(tabId),
-    codexSource
-  );
-  if (!submitWatcher.available) {
-    console.warn('[codex:send-command] ❌ No Codex turn watcher for tab=' + String(tabId).slice(-12) + ' — refusing unverified Enter send');
-    return { success: false, error: 'codex_turn_watcher_unavailable' };
-  }
   try {
     const result = await safePasteAndSubmit(term, command, {
       submit: true,
@@ -23196,21 +25444,17 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
       awaitCodexUserMessageAudit: true,
       codexAuditTimeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
       verifyCodexVisibleDraftBeforeSubmit: !skipVisibleDraftGuard,
+      requestReceivedAt,
       logPrefix: '[codex:send-command:' + tabId + ']',
     });
     if (result && typeof result === 'object') {
       result.queued = shouldQueue;
     }
-    if (submitWatcher.kind === 'turn' && result && result.success === false) {
-      if (result.submitted === true) {
-        console.warn('[codex:send-command] send returned failure after submit tab=' + String(tabId).slice(-12) + ' error=' + (result.error || 'unknown') + ' — preserving Codex busy-state');
-      } else {
-        emitCodexBusy(tabId, false, 'send-command-failed');
-      }
+    if (result && result.success === false && result.submitted === true) {
+      console.warn('[codex:send-command] send returned failure after submit tab=' + String(tabId).slice(-12) + ' error=' + (result.error || 'unknown') + ' — preserving Codex busy-state');
     }
     return result;
   } catch (error) {
-    if (submitWatcher.kind === 'turn') emitCodexBusy(tabId, false, 'send-command-error');
     console.error('[codex:send-command] Error:', error);
     return { success: false, error: error.message };
   }

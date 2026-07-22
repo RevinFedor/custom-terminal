@@ -64,11 +64,10 @@ test('findCodexSessionFile content scan matches the exact metadata id', async (t
   assert.equal(found?.filePath, targetPath);
 });
 
-test('findLatestCodexSession preserves source-chain matching from metadata records', async (t) => {
+test('findLatestCodexSession rejects a source found only in copied metadata ancestry', async (t) => {
   const sessionsDir = await makeSessionsDir(t);
   const cwd = path.join(sessionsDir, 'project');
   const matchingPath = path.join(sessionsDir, 'matching.jsonl');
-  const unrelatedPath = path.join(sessionsDir, 'newer-unrelated.jsonl');
   const sourceId = 'source-session';
   await fs.promises.writeFile(matchingPath, [
     sessionMeta({
@@ -84,26 +83,155 @@ test('findLatestCodexSession preserves source-chain matching from metadata recor
       timestamp: '2026-07-11T09:00:00.000Z',
       forked_from_id: sourceId,
     }),
-    JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } }),
-  ].join('\n') + '\n', 'utf8');
-  await fs.promises.writeFile(unrelatedPath, [
-    sessionMeta({
-      id: 'newer-unrelated',
-      cwd,
-      timestamp: '2026-07-11T11:00:00.000Z',
-      thread_source: 'user',
-    }),
-    JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } }),
+    JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', started_at: Date.now() / 1000 } }),
   ].join('\n') + '\n', 'utf8');
   const now = Date.now();
-  await fs.promises.utimes(matchingPath, new Date(now - 2000), new Date(now - 2000));
-  await fs.promises.utimes(unrelatedPath, new Date(now - 1000), new Date(now - 1000));
+  await fs.promises.utimes(matchingPath, new Date(now - 1000), new Date(now - 1000));
+
+  const found = await _api.findLatestCodexSession({ cwd, sourceSessionId: sourceId, sessionsDir });
+
+  assert.equal(found, null);
+});
+
+test('findLatestCodexSession accepts only the root metadata direct fork edge', async (t) => {
+  const sessionsDir = await makeSessionsDir(t);
+  const cwd = path.join(sessionsDir, 'project');
+  const matchingPath = path.join(sessionsDir, 'matching.jsonl');
+  const sourceId = 'source-session';
+  await fs.promises.writeFile(matchingPath, [
+    sessionMeta({
+      id: 'matching-current',
+      cwd,
+      timestamp: new Date().toISOString(),
+      thread_source: 'user',
+      forked_from_id: sourceId,
+    }),
+    sessionMeta({
+      id: sourceId,
+      cwd,
+      timestamp: '2026-07-11T09:00:00.000Z',
+      forked_from_id: 'older-ancestor',
+    }),
+  ].join('\n') + '\n', 'utf8');
+  const now = Date.now();
+  await fs.promises.utimes(matchingPath, new Date(now - 1000), new Date(now - 1000));
 
   const found = await _api.findLatestCodexSession({ cwd, sourceSessionId: sourceId, sessionsDir });
 
   assert.equal(found?.sessionId, 'matching-current');
   assert.equal(found?.filePath, matchingPath);
   assert.equal(found?.sourceMatched, true);
+  assert.equal(found?.sourceMatchMode, 'direct-fork');
+  assert.equal(found?.reopenedExisting, false);
+});
+
+test('findLatestCodexSession accepts a fresh direct child before its first turn', async (t) => {
+  const sessionsDir = await makeSessionsDir(t);
+  const cwd = path.join(sessionsDir, 'project');
+  const filePath = path.join(sessionsDir, 'fresh-child.jsonl');
+  const launchAt = Date.now();
+  await fs.promises.writeFile(filePath, sessionMeta({
+    id: 'fresh-child',
+    cwd,
+    timestamp: new Date(launchAt + 100).toISOString(),
+    thread_source: 'user',
+    forked_from_id: 'source-session',
+  }) + '\n', 'utf8');
+
+  const found = await _api.findLatestCodexSession({
+    cwd,
+    sinceMs: launchAt,
+    sourceSessionId: 'source-session',
+    sessionsDir,
+  });
+
+  assert.equal(found?.sessionId, 'fresh-child');
+  assert.equal(found?.metadataFreshForLaunch, true);
+  assert.equal(found?.reopenedExisting, false);
+});
+
+test('findLatestCodexSession reopens an old direct child only after a post-launch task starts', async (t) => {
+  const sessionsDir = await makeSessionsDir(t);
+  const cwd = path.join(sessionsDir, 'project');
+  const filePath = path.join(sessionsDir, 'old-child.jsonl');
+  const launchAt = Date.parse('2026-07-22T12:00:00.000Z');
+  const prefix = [
+    sessionMeta({
+      id: 'old-child',
+      cwd,
+      timestamp: '2026-07-22T10:00:00.000Z',
+      thread_source: 'user',
+      forked_from_id: 'source-session',
+    }),
+    JSON.stringify({
+      timestamp: '2026-07-22T10:05:00.000Z',
+      type: 'event_msg',
+      payload: { type: 'task_started', turn_id: 'old-turn', started_at: launchAt / 1000 - 6900 },
+    }),
+    JSON.stringify({
+      timestamp: '2026-07-22T12:01:00.000Z',
+      type: 'response_item',
+      payload: { type: 'message', role: 'assistant', content: [] },
+    }),
+  ].join('\n') + '\n';
+  await fs.promises.writeFile(filePath, prefix, 'utf8');
+  await fs.promises.utimes(filePath, new Date(launchAt + 60_000), new Date(launchAt + 60_000));
+
+  const beforeLive = await _api.findLatestCodexSession({
+    cwd,
+    sinceMs: launchAt,
+    sourceSessionId: 'source-session',
+    sessionsDir,
+  });
+  assert.equal(beforeLive, null);
+
+  const liveLine = JSON.stringify({
+    timestamp: '2026-07-22T12:02:00.000Z',
+    type: 'event_msg',
+    payload: { type: 'task_started', turn_id: 'current-turn', started_at: launchAt / 1000 + 120 },
+  });
+  await fs.promises.appendFile(filePath, liveLine + '\n');
+  await fs.promises.utimes(filePath, new Date(launchAt + 120_000), new Date(launchAt + 120_000));
+
+  const afterLive = await _api.findLatestCodexSession({
+    cwd,
+    sinceMs: launchAt,
+    sourceSessionId: 'source-session',
+    sessionsDir,
+  });
+  assert.equal(afterLive?.sessionId, 'old-child');
+  assert.equal(afterLive?.reopenedExisting, true);
+  assert.equal(afterLive?.linkedLiveBoundary?.found, true);
+  assert.equal(afterLive?.linkedLiveBoundary?.turnId, 'current-turn');
+  assert.equal(afterLive?.linkedLiveBoundary?.offset, Buffer.byteLength(prefix));
+});
+
+test('findLatestCodexSession leaves append-in-place source ownership to the source watcher', async (t) => {
+  const sessionsDir = await makeSessionsDir(t);
+  const cwd = path.join(sessionsDir, 'project');
+  const filePath = path.join(sessionsDir, 'source.jsonl');
+  const launchAt = Date.now();
+  await fs.promises.writeFile(filePath, [
+    sessionMeta({
+      id: 'source-session',
+      cwd,
+      timestamp: '2026-07-11T10:00:00.000Z',
+      thread_source: 'user',
+    }),
+    JSON.stringify({
+      timestamp: new Date(launchAt + 100).toISOString(),
+      type: 'event_msg',
+      payload: { type: 'task_started', started_at: launchAt / 1000 + 0.1 },
+    }),
+  ].join('\n') + '\n', 'utf8');
+
+  const found = await _api.findLatestCodexSession({
+    cwd,
+    sinceMs: launchAt,
+    sourceSessionId: 'source-session',
+    sessionsDir,
+  });
+  assert.equal(found, null);
 });
 
 test('linked live boundary ignores copied history timestamps and keeps a late large live turn', async (t) => {

@@ -14,7 +14,6 @@ test('resume observes the source and a linked child in that order', async () => 
     command: 'codex-c',
     sessionId: 'source-session',
   }, {
-    setProvisionalSession: (sessionId) => calls.push(['provisional', sessionId]),
     attachSource: async (sessionId) => {
       calls.push(['attach-source', sessionId]);
       return true;
@@ -23,7 +22,6 @@ test('resume observes the source and a linked child in that order', async () => 
   });
 
   assert.deepEqual(calls, [
-    ['provisional', 'source-session'],
     ['attach-source', 'source-session'],
     ['discover', 'source-session', 'resume'],
   ]);
@@ -36,7 +34,6 @@ test('fork discovers a linked child without treating the source as live', async 
     command: 'codex-f',
     sessionId: 'source-session',
   }, {
-    setProvisionalSession: () => calls.push(['provisional']),
     attachSource: async () => calls.push(['attach-source']),
     startDiscovery: (options) => calls.push(['discover', options.sourceSessionId, options.sourceMode]),
   });

@@ -651,6 +651,259 @@ class DatabaseManager {
       CREATE INDEX IF NOT EXISTS idx_activity_start ON agent_activity_intervals(start_ts DESC);
     `);
 
+    // Runtime state in main is keyed by tab_id alone. Repair legacy collisions
+    // before enforcing the same identity contract in SQLite; otherwise a PTY,
+    // loader or Codex writer can be silently attached to a row from another
+    // project after restart.
+    this.ensureGlobalTabIdInvariant();
+  }
+
+  _tableColumns(tableName) {
+    try {
+      return new Set(this.db.prepare(`PRAGMA table_info(${tableName})`).all().map((row) => row.name));
+    } catch {
+      return new Set();
+    }
+  }
+
+  _allocateGlobalTabId(projectId, usedTabIds, nextByProject) {
+    const prefix = `${projectId}-tab-`;
+    let next = nextByProject.get(projectId);
+    if (!Number.isFinite(next)) {
+      next = 0;
+      for (const id of usedTabIds) {
+        if (!id.startsWith(prefix)) continue;
+        const suffix = id.slice(prefix.length);
+        if (/^\d+$/.test(suffix)) next = Math.max(next, Number(suffix) + 1);
+      }
+    }
+    let candidate = `${prefix}${next}`;
+    while (usedTabIds.has(candidate)) {
+      next += 1;
+      candidate = `${prefix}${next}`;
+    }
+    nextByProject.set(projectId, next + 1);
+    usedTabIds.add(candidate);
+    return candidate;
+  }
+
+  _rewriteProjectScopedTabReferences(projectId, oldTabId, newTabId, tabRow) {
+    const updateTabsColumn = (column) => {
+      if (!this._tableColumns('tabs').has(column)) return;
+      this.db.prepare(`UPDATE tabs SET ${column} = ? WHERE project_id = ? AND ${column} = ?`)
+        .run(newTabId, projectId, oldTabId);
+    };
+    updateTabsColumn('parent_tab_id');
+    updateTabsColumn('visual_parent_tab_id');
+    updateTabsColumn('restart_after_tab_id');
+
+    if (this._tableColumns('tabs').has('restart_after_tab_ids')) {
+      const rows = this.db.prepare(
+        'SELECT id, restart_after_tab_ids FROM tabs WHERE project_id = ? AND restart_after_tab_ids IS NOT NULL'
+      ).all(projectId);
+      const update = this.db.prepare('UPDATE tabs SET restart_after_tab_ids = ? WHERE id = ?');
+      for (const row of rows) {
+        try {
+          const ids = JSON.parse(row.restart_after_tab_ids);
+          if (!Array.isArray(ids) || !ids.includes(oldTabId)) continue;
+          update.run(JSON.stringify(ids.map((id) => id === oldTabId ? newTabId : id)), row.id);
+        } catch { /* preserve malformed legacy JSON */ }
+      }
+    }
+
+    const projectRow = this.db.prepare('SELECT tab_groups FROM projects WHERE id = ?').get(projectId);
+    if (projectRow?.tab_groups) {
+      try {
+        const groups = JSON.parse(projectRow.tab_groups);
+        if (Array.isArray(groups)) {
+          let changed = false;
+          const next = groups.map((group) => {
+            if (!group || group.anchorTabId !== oldTabId) return group;
+            changed = true;
+            return { ...group, anchorTabId: newTabId };
+          });
+          if (changed) {
+            this.db.prepare('UPDATE projects SET tab_groups = ? WHERE id = ?')
+              .run(JSON.stringify(next), projectId);
+          }
+        }
+      } catch { /* preserve malformed legacy JSON */ }
+    }
+
+    const scopedTables = [
+      ['ai_prompt_call_logs', 'tab_id'],
+      ['agent_activity_intervals', 'tab_id'],
+    ];
+    for (const [table, column] of scopedTables) {
+      const columns = this._tableColumns(table);
+      if (!columns.has('project_id') || !columns.has(column)) continue;
+      this.db.prepare(`UPDATE ${table} SET ${column} = ? WHERE project_id = ? AND ${column} = ?`)
+        .run(newTabId, projectId, oldTabId);
+    }
+
+    // api_call_log is created by the API subsystem, not by this manager, so it
+    // is optional in older databases.
+    const apiColumns = this._tableColumns('api_call_log');
+    if (apiColumns.has('project_id')) {
+      for (const column of ['source_tab_id', 'target_tab_id']) {
+        if (!apiColumns.has(column)) continue;
+        this.db.prepare(`UPDATE api_call_log SET ${column} = ? WHERE project_id = ? AND ${column} = ?`)
+          .run(newTabId, projectId, oldTabId);
+      }
+    }
+
+    // timeline_notes predates project_id. Session identity is the only safe
+    // discriminator; never rewrite notes merely because the ambiguous tab ID
+    // matches.
+    const sessionIds = [
+      tabRow?.claude_session_id,
+      tabRow?.gemini_session_id,
+      tabRow?.codex_session_id,
+    ].filter((id) => typeof id === 'string' && id.trim());
+    if (sessionIds.length > 0 && this._tableColumns('timeline_notes').has('tab_id')) {
+      const placeholders = sessionIds.map(() => '?').join(',');
+      this.db.prepare(
+        `UPDATE timeline_notes SET tab_id = ? WHERE tab_id = ? AND session_id IN (${placeholders})`
+      ).run(newTabId, oldTabId, ...sessionIds);
+    }
+
+    // Command history rows carry projectId even though the outer map is keyed
+    // only by tabId, so the colliding project's entries can be split without
+    // guessing. Other unscoped tab-keyed app_state values intentionally remain
+    // on the canonical ID: cloning queued actions could execute them twice.
+    const historyKey = 'terminal:command-run-history';
+    const history = this.getAppState(historyKey);
+    if (history && typeof history === 'object' && !Array.isArray(history)) {
+      const oldRows = Array.isArray(history[oldTabId]) ? history[oldTabId] : [];
+      const moving = oldRows.filter((row) => row?.projectId === projectId);
+      if (moving.length > 0) {
+        const staying = oldRows.filter((row) => row?.projectId !== projectId);
+        const existingNew = Array.isArray(history[newTabId]) ? history[newTabId] : [];
+        const rewritten = moving.map((row) => ({
+          ...row,
+          id: `${row?.at || 0}:${newTabId}`,
+          tabId: newTabId,
+        }));
+        if (staying.length > 0) history[oldTabId] = staying;
+        else delete history[oldTabId];
+        history[newTabId] = [...rewritten, ...existingNew];
+        this.setAppState(historyKey, history);
+      }
+    }
+
+    const lastByCwdKey = 'terminal:last-command-by-cwd';
+    const lastByCwd = this.getAppState(lastByCwdKey);
+    if (lastByCwd && typeof lastByCwd === 'object' && !Array.isArray(lastByCwd)) {
+      let changed = false;
+      for (const [cwd, row] of Object.entries(lastByCwd)) {
+        if (!row || row.projectId !== projectId || row.tabId !== oldTabId) continue;
+        lastByCwd[cwd] = { ...row, tabId: newTabId };
+        changed = true;
+      }
+      if (changed) this.setAppState(lastByCwdKey, lastByCwd);
+    }
+
+    for (const key of [
+      'promptQueueByTab',
+      'timelineSummaryAutoTabs',
+      'timelineSummaryAutoSinceTabs',
+      'noted-terminal-timeline-summary-auto-tabs',
+      'noted-terminal-timeline-summary-auto-since-tabs',
+      'noted-terminal-task-plan-expanded-tabs',
+    ]) {
+      const value = this.getAppState(key);
+      if (!value || typeof value !== 'object' || Array.isArray(value)
+        || !Object.prototype.hasOwnProperty.call(value, oldTabId)) continue;
+      console.warn('[DB:TabIdInvariant] unscoped app-state kept on canonical tab'
+        + ' key=' + key
+        + ' old=' + oldTabId
+        + ' renamedProject=' + projectId
+        + ' new=' + newTabId);
+    }
+  }
+
+  ensureGlobalTabIdInvariant() {
+    const usedTabIds = new Set(
+      this.db.prepare("SELECT tab_id FROM tabs WHERE tab_id IS NOT NULL AND trim(tab_id) != ''")
+        .all()
+        .map((row) => row.tab_id)
+    );
+    const nextByProject = new Map();
+    const repairs = [];
+
+    const repair = this.db.transaction(() => {
+      // First materialize every legacy NULL/empty identity. These rows cannot
+      // own any reliable tab-keyed references, so only the row itself changes.
+      const missing = this.db.prepare(
+        "SELECT * FROM tabs WHERE tab_id IS NULL OR trim(tab_id) = '' ORDER BY id"
+      ).all();
+      for (const row of missing) {
+        const newTabId = this._allocateGlobalTabId(row.project_id, usedTabIds, nextByProject);
+        this.db.prepare('UPDATE tabs SET tab_id = ? WHERE id = ?').run(newTabId, row.id);
+        repairs.push({ rowId: row.id, projectId: row.project_id, oldTabId: null, newTabId, reason: 'missing' });
+      }
+
+      const duplicateIds = this.db.prepare(`
+        SELECT tab_id
+        FROM tabs
+        WHERE tab_id IS NOT NULL AND trim(tab_id) != ''
+        GROUP BY tab_id
+        HAVING COUNT(*) > 1
+        ORDER BY tab_id
+      `).all();
+      for (const duplicate of duplicateIds) {
+        const oldTabId = duplicate.tab_id;
+        const rows = this.db.prepare('SELECT * FROM tabs WHERE tab_id = ? ORDER BY id').all(oldTabId);
+        const canonical = rows
+          .slice()
+          .sort((a, b) => {
+            const aOwn = oldTabId.startsWith(`${a.project_id}-tab-`) ? 1 : 0;
+            const bOwn = oldTabId.startsWith(`${b.project_id}-tab-`) ? 1 : 0;
+            return bOwn - aOwn || a.id - b.id;
+          })[0];
+        const countByProject = new Map();
+        for (const row of rows) countByProject.set(row.project_id, (countByProject.get(row.project_id) || 0) + 1);
+
+        for (const row of rows) {
+          if (row.id === canonical.id) continue;
+          const newTabId = this._allocateGlobalTabId(row.project_id, usedTabIds, nextByProject);
+          this.db.prepare('UPDATE tabs SET tab_id = ? WHERE id = ?').run(newTabId, row.id);
+          // References are safely attributable only when this project had one
+          // row with the collided ID. Duplicate rows inside one project are
+          // already ambiguous, so keep their references on the canonical row.
+          if (countByProject.get(row.project_id) === 1) {
+            this._rewriteProjectScopedTabReferences(row.project_id, oldTabId, newTabId, row);
+          }
+          repairs.push({
+            rowId: row.id,
+            projectId: row.project_id,
+            oldTabId,
+            newTabId,
+            canonicalRowId: canonical.id,
+            referencesRewritten: countByProject.get(row.project_id) === 1,
+            reason: 'duplicate',
+          });
+        }
+      }
+
+      // The old non-unique lookup index remains useful, while this partial
+      // unique index makes every future nonempty runtime identity global.
+      this.db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tabs_tab_id_unique
+        ON tabs(tab_id)
+        WHERE tab_id IS NOT NULL AND trim(tab_id) != ''
+      `);
+    });
+    repair();
+
+    for (const item of repairs) {
+      console.warn('[DB:TabIdInvariant] repaired project=' + item.projectId
+        + ' old=' + (item.oldTabId || '<missing>')
+        + ' new=' + item.newTabId
+        + ' reason=' + item.reason
+        + ' refs=' + (item.referencesRewritten === true ? 'rewritten' : 'none'));
+    }
+    return repairs;
   }
 
   // ========== APP STATE ==========
@@ -836,6 +1089,49 @@ class DatabaseManager {
     if (!tabId || typeof cwd !== 'string' || !path.isAbsolute(cwd)) return false;
     const info = this.db.prepare('UPDATE tabs SET cwd = ? WHERE tab_id = ?').run(cwd, tabId);
     return info.changes > 0;
+  }
+
+  // Codex writer identity is committed point-wise by main after runtime proof.
+  // tab_id is globally unique after ensureGlobalTabIdInvariant, while the
+  // project scope is still mandatory here: it proves that a row has not moved
+  // to another workspace between async process inspection and this write. A
+  // renderer workspace snapshot is only a cache and may still carry the resume
+  // source (or a previously active writer), so it must not own this column for
+  // an existing row. New rows are seeded by saveTabs below.
+  getTabCodexSessionId(projectId, tabId) {
+    if (arguments.length < 2 || !projectId || !tabId) return undefined;
+    const row = this.db.prepare(
+      'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+    ).get(projectId, tabId);
+    if (!row) return undefined;
+    return row.codex_session_id || null;
+  }
+
+  updateTabCodexSessionId(projectId, tabId, sessionId) {
+    // The arity guard deliberately rejects the legacy (tabId, sessionId) call:
+    // reinterpreting those two strings could target an unrelated compound row.
+    if (arguments.length < 3 || !projectId || !tabId) return false;
+    const normalizedSessionId = typeof sessionId === 'string' && sessionId.trim()
+      ? sessionId.trim()
+      : null;
+    const info = this.db.prepare(
+      'UPDATE tabs SET codex_session_id = ? WHERE project_id = ? AND tab_id = ?'
+    ).run(normalizedSessionId, projectId, tabId);
+    return info.changes > 0;
+  }
+
+  compareAndSetTabCodexSessionId(projectId, tabId, expectedSessionId, nextSessionId) {
+    if (arguments.length < 4 || !projectId || !tabId) return false;
+    const expected = typeof expectedSessionId === 'string' && expectedSessionId.trim()
+      ? expectedSessionId.trim()
+      : null;
+    const next = typeof nextSessionId === 'string' && nextSessionId.trim()
+      ? nextSessionId.trim()
+      : null;
+    const info = this.db.prepare(
+      'UPDATE tabs SET codex_session_id = ? WHERE project_id = ? AND tab_id = ? AND codex_session_id IS ?'
+    ).run(next, projectId, tabId, expected);
+    return info.changes === 1;
   }
 
   // Point-wise context% write (no renderer round-trip, no full-reinsert).
@@ -1036,7 +1332,19 @@ class DatabaseManager {
     const projectExists = this.db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId);
     if (!projectExists) {
       console.warn('[DB] saveTabs: project not found, skipping:', projectId);
-      return;
+      return { success: false, error: 'project_not_found' };
+    }
+    if (!Array.isArray(tabs)) {
+      return { success: false, error: 'tabs_payload_invalid' };
+    }
+    const rawIncomingTabIds = tabs.map((tab) => typeof tab?.tabId === 'string' ? tab.tabId : '');
+    const incomingTabIds = rawIncomingTabIds.map((tabId) => tabId.trim());
+    if (incomingTabIds.some((tabId) => !tabId)
+      || rawIncomingTabIds.some((tabId, index) => tabId !== incomingTabIds[index])) {
+      return { success: false, error: 'tab_id_required' };
+    }
+    if (new Set(incomingTabIds).size !== incomingTabIds.length) {
+      return { success: false, error: 'duplicate_tab_id_in_project_snapshot' };
     }
 
     // Safety: count existing tabs to detect accidental mass deletion
@@ -1113,6 +1421,16 @@ class DatabaseManager {
       for (const r of rows) taskPlanSnapshot.set(r.tab_id, r.task_plan);
     }
 
+    // Codex session identity has a main-owned point-write path. Preserve the
+    // current value for every existing row so a delayed full renderer save
+    // cannot replace a proven writer with its stale resume/source snapshot.
+    // A tab absent from this snapshot is new and may seed its incoming ID.
+    const codexSessionSnapshot = new Map();
+    {
+      const rows = this.db.prepare('SELECT tab_id, codex_session_id FROM tabs WHERE project_id = ? AND tab_id IS NOT NULL').all(projectId);
+      for (const r of rows) codexSessionSnapshot.set(r.tab_id, r.codex_session_id);
+    }
+
     const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
       INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, external_run, was_interrupted, overlay_dismissed, notes, task_plan, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, restart_after_tab_id, restart_after_tab_ids, restart_after_command, restart_after_paused, restart_after_armed, restart_after_persistent, claude_session_history, provider_state, context_pct, cache_stats)
@@ -1172,7 +1490,10 @@ class DatabaseManager {
           || taskPlanDocument.history.future.length > 0
           ? JSON.stringify(taskPlanDocument)
           : null;
-        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, tab.codexSessionId || null, tab.codexModel || null, tab.codexEffort || null, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', taskPlanJson, tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson);
+        const codexSessionId = codexSessionSnapshot.has(tab.tabId)
+          ? codexSessionSnapshot.get(tab.tabId)
+          : (tab.codexSessionId || null);
+        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, codexSessionId, tab.codexModel || null, tab.codexEffort || null, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', taskPlanJson, tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set
@@ -1193,14 +1514,128 @@ class DatabaseManager {
     });
     transaction(tabs);
     this.db.prepare('UPDATE projects SET updated_at = strftime(\'%s\', \'now\') WHERE id = ?').run(projectId);
+    return { success: true };
+  }
+
+  transferTabsToProject(sourceProjectId, targetProjectId, tabIds) {
+    const ids = Array.from(new Set(
+      (Array.isArray(tabIds) ? tabIds : [])
+        .filter((id) => typeof id === 'string' && id.trim())
+        .map((id) => id.trim())
+    ));
+    if (!sourceProjectId || !targetProjectId || sourceProjectId === targetProjectId || ids.length === 0) {
+      return { success: false, error: 'invalid_tab_project_transfer' };
+    }
+
+    const transfer = this.db.transaction(() => {
+      const sourceExists = this.db.prepare('SELECT 1 AS ok FROM projects WHERE id = ?').get(sourceProjectId);
+      const targetExists = this.db.prepare('SELECT 1 AS ok FROM projects WHERE id = ?').get(targetProjectId);
+      if (!sourceExists?.ok || !targetExists?.ok) {
+        return { success: false, error: 'tab_project_not_found' };
+      }
+
+      const placeholders = ids.map(() => '?').join(',');
+      const sourceRows = this.db.prepare(
+        `SELECT id, tab_id FROM tabs WHERE project_id = ? AND tab_id IN (${placeholders}) ORDER BY position, id`
+      ).all(sourceProjectId, ...ids);
+      const foundIds = new Set(sourceRows.map((row) => row.tab_id));
+      const missing = ids.filter((id) => !foundIds.has(id));
+      if (missing.length > 0 || sourceRows.length !== ids.length) {
+        return { success: false, error: 'tab_project_source_rows_missing', missing };
+      }
+
+      const collisions = this.db.prepare(
+        `SELECT tab_id FROM tabs WHERE project_id = ? AND tab_id IN (${placeholders})`
+      ).all(targetProjectId, ...ids);
+      if (collisions.length > 0) {
+        return {
+          success: false,
+          error: 'tab_project_target_collision',
+          collisions: collisions.map((row) => row.tab_id),
+        };
+      }
+
+      const targetMax = Number(this.db.prepare(
+        'SELECT COALESCE(MAX(position), -1) AS max_position FROM tabs WHERE project_id = ?'
+      ).get(targetProjectId)?.max_position ?? -1);
+      const update = this.db.prepare(`
+        UPDATE tabs
+        SET project_id = ?, position = ?, is_utility = 0,
+            tab_group_id = NULL, visual_parent_tab_id = NULL
+        WHERE project_id = ? AND tab_id = ?
+      `);
+      sourceRows.forEach((row, index) => {
+        const info = update.run(targetProjectId, targetMax + index + 1, sourceProjectId, row.tab_id);
+        if (info.changes !== 1) throw new Error('tab_project_transfer_lost_source_row:' + row.tab_id);
+      });
+
+      // Tabs left behind cannot keep a visual-parent pointer to a tab that now
+      // belongs to another workspace. The renderer performs the same repair in
+      // memory after this durable commit.
+      this.db.prepare(
+        `UPDATE tabs SET visual_parent_tab_id = NULL
+         WHERE project_id = ? AND visual_parent_tab_id IN (${placeholders})`
+      ).run(sourceProjectId, ...ids);
+      const sourceProject = this.db.prepare('SELECT tab_groups FROM projects WHERE id = ?').get(sourceProjectId);
+      if (sourceProject?.tab_groups) {
+        try {
+          const groups = JSON.parse(sourceProject.tab_groups);
+          if (Array.isArray(groups)) {
+            const movedSet = new Set(ids);
+            let changed = false;
+            const nextGroups = groups.map((group) => {
+              if (!group?.anchorTabId || !movedSet.has(group.anchorTabId)) return group;
+              changed = true;
+              const { anchorTabId, ...rest } = group;
+              return rest;
+            });
+            if (changed) {
+              this.db.prepare('UPDATE projects SET tab_groups = ? WHERE id = ?')
+                .run(JSON.stringify(nextGroups), sourceProjectId);
+            }
+          }
+        } catch { /* preserve malformed legacy JSON */ }
+      }
+      this.db.prepare("UPDATE projects SET updated_at = strftime('%s', 'now') WHERE id IN (?, ?)")
+        .run(sourceProjectId, targetProjectId);
+      return { success: true, transferred: ids };
+    });
+
+    try {
+      return transfer();
+    } catch (error) {
+      return { success: false, error: error?.message || String(error) };
+    }
   }
 
   // ========== TAB HISTORY (CLOSED TABS ARCHIVE) ==========
 
-  archiveTab(projectId, tab) {
+  archiveTab(projectId, tab, {
+    sourceTabId = null,
+    codexWriterSessionId = null,
+  } = {}) {
     const tabType = tab?.tabType || tab?.tab_type || 'terminal';
     if (tabType === 'file') {
       return null;
+    }
+    let archivedTab = tab;
+    if (tab?.commandType === 'codex' && sourceTabId) {
+      // Close/restore is a durable identity boundary. Resolve the binding from
+      // main-owned state while the original row still exists; an incoming
+      // renderer snapshot may still carry the resume source after main has
+      // already point-written a linked writer. A real NULL is authoritative
+      // too and must not fall back to that stale renderer value.
+      const persistedSessionId = this.getTabCodexSessionId(projectId, sourceTabId);
+      if (persistedSessionId === undefined) {
+        return null;
+      }
+      const provenWriter = typeof codexWriterSessionId === 'string' && codexWriterSessionId.trim()
+        ? codexWriterSessionId.trim()
+        : null;
+      archivedTab = {
+        ...tab,
+        codexSessionId: provenWriter || persistedSessionId || null,
+      };
     }
     const now = Math.floor(Date.now() / 1000);
     const info = this.db.prepare(`
@@ -1208,28 +1643,28 @@ class DatabaseManager {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       projectId,
-      tab.name,
-      tab.nameSetManually ? 1 : 0,
-      tab.cwd,
-      tab.color || null,
-      tab.notes || null,
-      tab.taskPlan ? JSON.stringify(normalizeTaskPlan(tab.taskPlan)) : null,
-      tab.commandType || null,
+      archivedTab.name,
+      archivedTab.nameSetManually ? 1 : 0,
+      archivedTab.cwd,
+      archivedTab.color || null,
+      archivedTab.notes || null,
+      archivedTab.taskPlan ? JSON.stringify(normalizeTaskPlan(archivedTab.taskPlan)) : null,
+      archivedTab.commandType || null,
       tabType,
-      tab.url || null,
-      tab.filePath || null,
-      tab.createdAt || now,
+      archivedTab.url || null,
+      archivedTab.filePath || null,
+      archivedTab.createdAt || now,
       now,
-      tab.claudeSessionId || null,
-      tab.geminiSessionId || null,
-      tab.codexSessionId || null,
-      tab.codexModel || null,
-      tab.codexEffort || null,
-      tab.messageCount ?? null,
-      tab.position ?? null,
-      tab.processWasRunning ? 1 : 0,
-      tab.sessionStatus || null,
-      tab.groupId || null
+      archivedTab.claudeSessionId || null,
+      archivedTab.geminiSessionId || null,
+      archivedTab.codexSessionId || null,
+      archivedTab.codexModel || null,
+      archivedTab.codexEffort || null,
+      archivedTab.messageCount ?? null,
+      archivedTab.position ?? null,
+      archivedTab.processWasRunning ? 1 : 0,
+      archivedTab.sessionStatus || null,
+      archivedTab.groupId || null
     );
     return info.lastInsertRowid;
   }

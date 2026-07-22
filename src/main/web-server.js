@@ -47,6 +47,10 @@ const fs = require('fs');
 const crypto = require('crypto');
 const zlib = require('zlib');
 const { app, BrowserWindow, ipcMain } = require('electron');
+const {
+  codexSessionIdFromAuthoritativeStatus,
+  isCodexComposerReadyForGuardedSend,
+} = require('./codex-runtime-contract');
 const INBOX_PROJECT_ID = '__noted_inbox__';
 const isInboxProjectId = (projectId) => projectId === INBOX_PROJECT_ID;
 // Lazy-require the helpers (loaded fresh each call so missing module just
@@ -137,6 +141,10 @@ let computeProjectActivity = null;
 let answerClaudeQuestion = null;
 let getClaudePendingQuestion = null;
 let transcriptService = null;
+// Main-owned Codex process/writer resolver. Renderer state and SQLite are not
+// authoritative for a live rollout, so web routes fall back to this callback
+// when the bridge is unavailable instead of publishing the saved resume ID.
+let resolveCodexRuntimeSessionInfo = null;
 // tabId → Set<Sink>. A Sink is the common interface for both transports:
 //   { kind:'ws'|'sse', send(str):void, isAlive():bool, close():void }
 // WebSocket and SSE both register here so webBroadcast() fans out to either
@@ -454,7 +462,15 @@ async function waitForAgentReady(tabId, timeoutMs = 20_000) {
         err.status = last;
         throw err;
       }
-      if (last && (last.status === 'active' || last.status === 'busy') && last.inputReady === true) {
+      // Codex resume can have a fully-ready composer before the CLI proves
+      // whether it will append to the source rollout or create a linked child.
+      // That is ready for one guarded submit, but it is not a current-session
+      // identity. Main revalidates the exact launch/source proof under the PTY
+      // write lock and audits the post-Enter user_message.
+      const codexProvisionalComposerReady = isCodexComposerReadyForGuardedSend(last)
+        && last?.status === 'starting';
+      if (last && ((last.status === 'active' || last.status === 'busy') && last.inputReady === true
+        || codexProvisionalComposerReady)) {
         return last;
       }
     } catch (e) {
@@ -1355,15 +1371,19 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
     return;
   }
   try {
-    const status = await bridgeRequest('getClaudeTabStatus', { tabId }, 1500);
+    // Resolve through the DB-aware helper so a renderer that has not hydrated
+    // this tab cannot answer a live Codex process with a fabricated inactive
+    // state. Codex is overlaid with main's process/writer snapshot below.
+    const status = await resolveAgentSessionInfo(tabId, 1500);
+    const sessionStatus = status?.status || status?.sessionStatus || 'unknown';
     sink.send(JSON.stringify({
       type: 'snapshot',
       tabId,
       sessionId: status?.sessionId || null,
-      busy: status?.status === 'busy',
-      sessionStatus: status?.status || 'inactive',
-      starting: status?.status === 'starting',
-      stopping: status?.status === 'stopping',
+      busy: sessionStatus === 'busy',
+      sessionStatus,
+      starting: sessionStatus === 'starting',
+      stopping: sessionStatus === 'stopping',
       commandType: status?.commandType || null,
       toolType: status?.toolType || null,
       inputReady: status?.inputReady === true,
@@ -1387,7 +1407,7 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       tabId,
       sessionId: null,
       busy: false,
-      sessionStatus: 'inactive',
+      sessionStatus: 'unknown',
       starting: false,
       stopping: false,
       inputReady: false,
@@ -1470,7 +1490,41 @@ async function resolveAgentSessionInfo(tabId, timeoutMs = 1500) {
   try {
     info = await bridgeRequest('getTabSessionInfo', { tabId }, timeoutMs);
   } catch {}
-  if (info?.sessionId && info?.toolType) return info;
+  const overlayMainCodexRuntime = async (base = {}, historicalSessionId = null) => {
+    let runtime = null;
+    try {
+      runtime = typeof resolveCodexRuntimeSessionInfo === 'function'
+        ? await resolveCodexRuntimeSessionInfo(tabId, 'web-resolve-agent-session')
+        : null;
+    } catch {}
+    const sessionStatus = runtime?.sessionStatus || 'unknown';
+    const sessionId = runtime?.sessionId || null;
+    return {
+      ...base,
+      tabId,
+      toolType: 'codex',
+      commandType: 'codex',
+      status: sessionStatus,
+      sessionStatus,
+      sessionId,
+      codexSessionId: sessionId,
+      savedSessionId: runtime?.savedSessionId || historicalSessionId || base?.savedSessionId || null,
+      liveLifecycle: runtime ? (runtime.liveLifecycle ?? null) : null,
+      inputReady: runtime?.inputReady === true,
+      writerConfirmed: runtime?.writerConfirmed === true,
+      writerUsableForMutation: runtime?.writerUsableForMutation === true,
+      canCopySessionId: runtime?.canCopySessionId === true,
+      canResume: sessionStatus === 'inactive' && !!sessionId,
+    };
+  };
+
+  // Renderer owns UI-only fields, but main owns Codex process/writer truth.
+  // Even a non-null renderer answer can be stale across hydration or a process
+  // transition, so every Codex result is overlaid with one main snapshot.
+  if (info?.toolType === 'codex') {
+    return await overlayMainCodexRuntime(info, info?.savedSessionId || null);
+  }
+  if (info?.toolType) return info;
 
   try {
     const projectManager = require('./project-manager');
@@ -1480,7 +1534,18 @@ async function resolveAgentSessionInfo(tabId, timeoutMs = 1500) {
       const isCodex = t.commandType === 'codex' && (t.tabType || 'terminal') !== 'claude-sdk';
       const isClaude = t.commandType === 'claude' && (t.tabType || 'terminal') !== 'claude-sdk';
       const toolType = isCodex ? 'codex' : isClaude ? 'claude' : null;
-      const sessionId = isCodex ? (t.codexSessionId || null) : isClaude ? (t.claudeSessionId || null) : null;
+      if (isCodex) {
+        return await overlayMainCodexRuntime({
+          tabId,
+          toolType: 'codex',
+          commandType: t.commandType || 'codex',
+          claudeSessionId: null,
+          savedSessionId: t.codexSessionId || null,
+          geminiSessionId: t.geminiSessionId || null,
+          cwd: t.cwd || null,
+        }, t.codexSessionId || null);
+      }
+      const sessionId = isClaude ? (t.claudeSessionId || null) : null;
       return {
         tabId,
         toolType,
@@ -2059,6 +2124,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
     let lastNotReadyMap = new Map();
     let awaitingMap = new Map();
     let runtimeSessionMap = new Map();
+    let codexWriterConfirmedMap = new Map();
+    let codexWriterUsableMap = new Map();
+    let canCopySessionIdMap = new Map();
+    let canResumeMap = new Map();
     let startupFailedMap = new Map();
     let startupErrorMap = new Map();
     let startupDefaultsPendingMap = new Map();
@@ -2079,12 +2148,16 @@ async function handleApi(req, res, parsed, sdkSessions) {
       .map(t => t.tabId);
     if (ptyAgentIds.length > 0) {
       try {
-        const data = await bridgeRequest('getClaudeTabStatusBatch', { tabIds: ptyAgentIds }, 1500);
+        const data = await bridgeRequest('getClaudeTabStatusBatch', { tabIds: ptyAgentIds, projectId }, 1500);
         if (data?.statuses) for (const [id, st] of Object.entries(data.statuses)) statusMap.set(id, st);
         if (data?.inputReady) for (const [id, ready] of Object.entries(data.inputReady)) inputReadyMap.set(id, !!ready);
         if (data?.lastNotReady) for (const [id, value] of Object.entries(data.lastNotReady)) lastNotReadyMap.set(id, value);
         if (data?.awaiting) for (const [id, aw] of Object.entries(data.awaiting)) if (aw) awaitingMap.set(id, true);
         if (data?.sessions) for (const [id, sid] of Object.entries(data.sessions)) if (sid) runtimeSessionMap.set(id, sid);
+        if (data?.codexWriterConfirmed) for (const [id, value] of Object.entries(data.codexWriterConfirmed)) codexWriterConfirmedMap.set(id, value === true);
+        if (data?.codexWriterUsableForMutation) for (const [id, value] of Object.entries(data.codexWriterUsableForMutation)) codexWriterUsableMap.set(id, value === true);
+        if (data?.canCopySessionId) for (const [id, value] of Object.entries(data.canCopySessionId)) canCopySessionIdMap.set(id, value === true);
+        if (data?.canResume) for (const [id, value] of Object.entries(data.canResume)) canResumeMap.set(id, value === true);
         if (data?.startupFailed) for (const [id, value] of Object.entries(data.startupFailed)) if (value) startupFailedMap.set(id, true);
         if (data?.startupError) for (const [id, value] of Object.entries(data.startupError)) if (value) startupErrorMap.set(id, value);
         if (data?.startupDefaultsPending) for (const [id, value] of Object.entries(data.startupDefaultsPending)) if (value) startupDefaultsPendingMap.set(id, true);
@@ -2094,6 +2167,35 @@ async function handleApi(req, res, parsed, sdkSessions) {
         // Bridge unavailable — every PTY agent tab will show no badge until
         // user opens it (per-tab GET /status still works on demand).
       }
+    }
+    // Resolve every Codex row from main, even when renderer returned a status.
+    // A closed/not-yet-hydrated renderer tab otherwise answers `inactive` and
+    // would expose SQLite while a live or unresolved Codex process exists.
+    for (const t of project.tabs || []) {
+      if (t.commandType !== 'codex') continue;
+      let runtime = null;
+      try {
+        runtime = typeof resolveCodexRuntimeSessionInfo === 'function'
+          ? await resolveCodexRuntimeSessionInfo(t.tabId, 'web-project-tabs-authoritative', projectId)
+          : null;
+      } catch {}
+      runtimeSessionMap.delete(t.tabId);
+      if (!runtime) {
+        statusMap.set(t.tabId, 'unknown');
+        inputReadyMap.set(t.tabId, false);
+        codexWriterConfirmedMap.set(t.tabId, false);
+        codexWriterUsableMap.set(t.tabId, false);
+        canCopySessionIdMap.set(t.tabId, false);
+        canResumeMap.set(t.tabId, false);
+        continue;
+      }
+      statusMap.set(t.tabId, runtime.sessionStatus || 'unknown');
+      inputReadyMap.set(t.tabId, runtime.inputReady === true);
+      if (runtime.sessionId) runtimeSessionMap.set(t.tabId, runtime.sessionId);
+      codexWriterConfirmedMap.set(t.tabId, runtime.writerConfirmed === true);
+      codexWriterUsableMap.set(t.tabId, runtime.writerUsableForMutation === true);
+      canCopySessionIdMap.set(t.tabId, runtime.canCopySessionId === true);
+      canResumeMap.set(t.tabId, runtime.sessionStatus === 'inactive' && !!runtime.sessionId);
     }
     // Configurable status-marker palette (assigned-category color + shape/size)
     // AND process-bar config (loader strip position/base/shimmer) live in renderer
@@ -2122,22 +2224,31 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const claudeMaterialization = t.claudeSessionId
         ? claudeMaterializationFor(t.claudeSessionId, t.cwd)
         : null;
+      const runtimeStatus = statusMap.get(t.tabId) || null;
       const runtimeCodexSessionId = runtimeSessionMap.get(t.tabId) || null;
-      const codexSessionId = runtimeCodexSessionId || t.codexSessionId || null;
       const isCodex = t.commandType === 'codex';
       const isClaude = t.commandType === 'claude';
+      const codexWriterConfirmed = codexWriterConfirmedMap.get(t.tabId) === true;
+      const codexWriterUsableForMutation = codexWriterUsableMap.get(t.tabId) === true;
+      const codexHistoricalSessionId = t.codexSessionId || null;
+      const codexSessionId = isCodex
+        ? runtimeStatus === 'inactive'
+          ? (runtimeCodexSessionId || codexHistoricalSessionId)
+          : runtimeStatus && codexWriterConfirmed
+            ? runtimeCodexSessionId
+            : null
+        : null;
       const timelineCount = isClaude && typeof claudeMaterialization?.timelineCount === 'number'
         ? claudeMaterialization.timelineCount
         : null;
       const conversationMaterialized = isClaude
         ? claudeMaterialization?.materialized === true
         : isCodex
-          ? !!codexSessionId
+          ? !!codexHistoricalSessionId
           : false;
       // Assigned-category status (DB column session_status holds the palette id;
       // distinct from runtime sessionStatus which drives the loader/background).
       const statusId = t.sessionStatus || null;
-      const runtimeStatus = statusMap.get(t.tabId) || null;
       const isPtyAgent = (t.commandType === 'claude' || t.commandType === 'codex') && (t.tabType || 'terminal') !== 'claude-sdk';
       const notification = completionNotificationMap.get(t.tabId) || {};
       return {
@@ -2150,12 +2261,24 @@ async function handleApi(req, res, parsed, sdkSessions) {
         filePath: t.filePath || null,
         claudeSessionId: t.claudeSessionId,
         codexSessionId,
+        codexWriterConfirmed,
+        codexWriterUsableForMutation,
         geminiSessionId: t.geminiSessionId,
         timelineCount,
         conversationMaterialized,
-        canResume: (isClaude || isCodex) && runtimeStatus === 'inactive' && conversationMaterialized,
-        canCopySessionId: isClaude ? conversationMaterialized : !!(codexSessionId || t.geminiSessionId),
-        materializationReason: isClaude ? (claudeMaterialization?.reason || null) : (isCodex ? (codexSessionId ? 'codex-session-id' : 'no-session-id') : null),
+        canResume: isCodex
+          ? (canResumeMap.has(t.tabId) ? canResumeMap.get(t.tabId) : runtimeStatus === 'inactive' && !!codexSessionId)
+          : isClaude && runtimeStatus === 'inactive' && conversationMaterialized,
+        canCopySessionId: isCodex
+          ? (canCopySessionIdMap.has(t.tabId)
+            ? canCopySessionIdMap.get(t.tabId)
+            : runtimeStatus === 'inactive'
+              ? !!codexSessionId
+              : !!runtimeStatus && codexWriterUsableForMutation)
+          : isClaude
+            ? conversationMaterialized
+            : !!t.geminiSessionId,
+        materializationReason: isClaude ? (claudeMaterialization?.reason || null) : (isCodex ? (codexHistoricalSessionId ? 'codex-session-id' : 'no-session-id') : null),
         sessionStatus: runtimeStatus,
         starting: runtimeStatus === 'starting',
         stopping: runtimeStatus === 'stopping',
@@ -2398,7 +2521,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
             const prevStatus = await bridgeRequest('getClaudeTabStatus', { tabId: prevRun.tabId }, 2000);
             if (prevStatus?.toolType === 'codex') {
               tabId = prevRun.tabId;
-              sessionId = prevStatus.sessionId || prevStatus.codexSessionId || prevRun.sessionId || null;
+              // A null current ID is intentional while a live resume is
+              // resolving its writer. Never fill it with the previous run's
+              // historical identity.
+              sessionId = codexSessionIdFromAuthoritativeStatus(prevStatus);
               reused = true;
               if (prevStatus.status === 'inactive' && sessionId) {
                 await bridgeRequest('resumeClaudeTab', { tabId }, 5000);
@@ -2453,7 +2579,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         setExternalRunMeta(tabId, { status: 'start_timeout', error: String(e.message || e) });
         return sendJson(res, 504, { ok: false, runId, tabId, error: 'agent did not become ready', status: e.status || null });
       }
-      sessionId = status?.sessionId || status?.codexSessionId || sessionId || null;
+      sessionId = codexSessionIdFromAuthoritativeStatus(status);
       run.status = 'sending';
       run.sessionId = sessionId;
       setExternalRunMeta(tabId, { status: 'sending', sessionId, autoStopAt: null, autoCloseAt: null });
@@ -4041,7 +4167,7 @@ function attachWebSocket(server, sdkSessions) {
 
 // ───────── lifecycle ─────────
 
-function start({ sdkSessions, computeActiveLoaders: computeFn, computeProjectActivity: computeProjectActivityFn, answerClaudeQuestion: answerFn, getClaudePendingQuestion: getQFn, transcriptService: transcriptServiceFn }) {
+function start({ sdkSessions, computeActiveLoaders: computeFn, computeProjectActivity: computeProjectActivityFn, answerClaudeQuestion: answerFn, getClaudePendingQuestion: getQFn, transcriptService: transcriptServiceFn, resolveCodexRuntimeSessionInfo: resolveCodexRuntimeFn }) {
   if (httpServer) {
     console.log('[WebServer] already started');
     return;
@@ -4052,6 +4178,7 @@ function start({ sdkSessions, computeActiveLoaders: computeFn, computeProjectAct
   answerClaudeQuestion = answerFn || null;
   getClaudePendingQuestion = getQFn || null;
   transcriptService = transcriptServiceFn || null;
+  resolveCodexRuntimeSessionInfo = resolveCodexRuntimeFn || null;
   token = loadOrCreateToken();
   registerBridgeReplyHandler();
 
@@ -4124,6 +4251,7 @@ function stop() {
   answerClaudeQuestion = null;
   getClaudePendingQuestion = null;
   transcriptService = null;
+  resolveCodexRuntimeSessionInfo = null;
   subscribers.clear();
 }
 

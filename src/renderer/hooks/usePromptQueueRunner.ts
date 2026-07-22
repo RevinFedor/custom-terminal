@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { buildQueuedPromptPayload, consumeAutomaticRunAfterTargetClear, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, hasMalformedQueuedImageMarker, hasRuntimeWorkflowArm, isPromptQueueStoreHydrated, isQueuedPromptEnabled, queueSendTransferredOwnership, subscribePromptQueueHydration, usePromptQueueStore, type QueuedPrompt, type TabQueue } from '../store/usePromptQueueStore';
+import { buildQueuedPromptPayload, consumeAutomaticRunAfterTargetClear, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, hasRuntimeWorkflowArm, isPromptQueueStoreHydrated, isQueuedPromptEnabled, queueSendTransferredOwnership, subscribePromptQueueHydration, usePromptQueueStore, type QueuedPrompt, type TabQueue } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { terminalRegistry } from '../utils/terminalRegistry';
@@ -191,6 +191,11 @@ const queueSendInflight = new Set<string>();
 // the agent emits busy:true. Keep pivoted owners blocked through that gap.
 const queueAwaitingBusyStart = new Set<string>();
 const codexTriggerCheckInflight = new Set<string>();
+
+function queueOwnerHasPendingContinuation(ownerTabId: string): boolean {
+  if (queueAwaitingBusyStart.has(ownerTabId) || queueSendInflight.has(ownerTabId)) return true;
+  return hasPendingPromptQueueContinuation(usePromptQueueStore.getState().getQueue(ownerTabId));
+}
 
 function beginValidatedQueueSend(
   ownerTabId: string,
@@ -472,12 +477,6 @@ export function usePromptQueueRunner() {
       return effectiveTrigger;
     };
 
-    const ownerHasRunnableContinuation = (ownerTabId: string): boolean => {
-      if (queueAwaitingBusyStart.has(ownerTabId)) return true;
-      if (queueSendInflight.has(ownerTabId)) return true;
-      return getReadyTriggerForOwner(ownerTabId) !== null;
-    };
-
     // Walk all queues, find one(s) waiting on `triggerTabId` for turn-end edge.
     // For default (runAfterTabId === null) the owner IS the trigger. For
     // pivoted (runAfterTabId !== null) the owner is some OTHER tab whose queue
@@ -552,6 +551,14 @@ export function usePromptQueueRunner() {
           const fired = fireQueueOwner(tabId, ownContinuationTrigger);
           if (fired || queueSendInflight.has(tabId) || queueAwaitingBusyStart.has(tabId)) return;
         }
+      }
+
+      // An armed queue is unfinished work even when its own trigger is still
+      // busy or has never started. Downstream owners must wait for this tab to
+      // actually run that continuation and finish its resulting turn.
+      if (queueOwnerHasPendingContinuation(tabId)) {
+        console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' has pending continuation → defer pivoted owners');
+        return;
       }
 
       for (const ownerTabId of ownersAtOutcome) {
@@ -905,17 +912,6 @@ export function usePromptQueueRunner() {
       }
     };
 
-    const ownerHasRunnableContinuationForColdStart = (ownerTabId: string): boolean => {
-      if (queueAwaitingBusyStart.has(ownerTabId) || queueSendInflight.has(ownerTabId)) return true;
-      const q = usePromptQueueStore.getState().getQueue(ownerTabId);
-      if (!q.autoRun || countEnabledQueuedPrompts(q.items) === 0) return false;
-      if (prevBusyRef.get(ownerTabId) === true) return false;
-      const effectiveTrigger = getEffectiveQueueTrigger(ownerTabId, q, { clearStaleTarget: true });
-      if (effectiveTrigger !== ownerTabId) return false;
-      if (!prevBusyRef.has(effectiveTrigger)) return false;
-      return prevBusyRef.get(effectiveTrigger) !== true;
-    };
-
     const verifyCodexTriggerIdleThenFire = (ownerTabId: string, triggerTabId: string): boolean => {
       if (getWorkspaceCommandType(triggerTabId) !== 'codex') return false;
       const key = ownerTabId + '→' + triggerTabId;
@@ -964,8 +960,8 @@ export function usePromptQueueRunner() {
         if (prevBusyRef.get(ownerTabId) === true) return;
 
         if (ownerTabId !== triggerTabId) {
-          if (ownerHasRunnableContinuationForColdStart(triggerTabId)) {
-            console.log('[PromptQueueRunner] codex-turn-state owner=' + ownerTabId.slice(-8) + ' target=' + triggerTabId.slice(-8) + ' has own continuation → wait for chain drain');
+          if (queueOwnerHasPendingContinuation(triggerTabId)) {
+            console.log('[PromptQueueRunner] codex-turn-state owner=' + ownerTabId.slice(-8) + ' target=' + triggerTabId.slice(-8) + ' has pending continuation → wait for chain drain');
             return;
           }
           fireHead(ownerTabId, triggerTabId);
@@ -1071,8 +1067,8 @@ export function usePromptQueueRunner() {
             continue;
           }
           if (verifyCodexTriggerIdleThenFire(tabId, effectiveTrigger)) continue;
-          if (ownerHasRunnableContinuation(effectiveTrigger)) {
-            console.log('[PromptQueueRunner] cold-start owner=' + tabId.slice(-8) + ' target=' + effectiveTrigger.slice(-8) + ' has own continuation → wait for chain drain');
+          if (queueOwnerHasPendingContinuation(effectiveTrigger)) {
+            console.log('[PromptQueueRunner] cold-start owner=' + tabId.slice(-8) + ' target=' + effectiveTrigger.slice(-8) + ' has pending continuation → wait for chain drain');
             continue;
           }
           // Target is idle and was seen busy before. Cold-start fires.

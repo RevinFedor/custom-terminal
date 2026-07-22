@@ -1316,9 +1316,15 @@ async function findCodexLinkedLiveBoundary(filePath, options = {}) {
   const meta = metadata.meta || {};
   const metadataStartedAtMs = parseTimestampMs(meta.timestamp);
   const requestedStartedAtMs = Number(options.startedAtMs);
-  const liveThresholdMs = Number.isFinite(metadataStartedAtMs)
-    ? metadataStartedAtMs - 1000
-    : (Number.isFinite(requestedStartedAtMs) ? requestedStartedAtMs - 1000 : null);
+  // A rollout may have been created by a native Codex rewind long before the
+  // current `resume` launch. In that case metadata time proves only historical
+  // creation; current ownership starts at the newer launch boundary. Taking
+  // the older timestamp used to classify copied/history turns as live proof.
+  const liveThresholdCandidates = [metadataStartedAtMs, requestedStartedAtMs]
+    .filter((value) => Number.isFinite(value));
+  const liveThresholdMs = liveThresholdCandidates.length > 0
+    ? Math.max(...liveThresholdCandidates) - 1000
+    : null;
 
   let pending = Buffer.alloc(0);
   let pendingStart = 0;
@@ -1436,11 +1442,12 @@ function getSessionMetas(records) {
 
 function recordsReferenceSession(records, sessionId) {
   if (!sessionId) return false;
-  return getSessionMetas(records).some((meta) => {
-    if (meta?.id === sessionId) return true;
-    if (meta?.forked_from_id === sessionId) return true;
-    return false;
-  });
+  // Only the rollout's own (first) metadata describes its direct launch edge.
+  // Later session_meta records are copied transcript ancestry. Treating those
+  // as ownership lets an ancestor tab steal a sibling rollout after the real
+  // owner closes (tab-165/tab-194 incident, 2026-07-22).
+  const rootMeta = getSessionMeta(records);
+  return rootMeta?.forked_from_id === sessionId;
 }
 
 function isCodexSubagentSession(meta) {
@@ -1463,6 +1470,12 @@ function isFreshCodexLaunchSession(meta) {
   if (isCodexSubagentSession(meta)) return false;
   if (meta.thread_source && meta.thread_source !== 'user') return false;
   return true;
+}
+
+function isCodexUserTuiSession(meta) {
+  return isCodexTuiSession(meta)
+    && !isCodexSubagentSession(meta)
+    && (!meta?.thread_source || meta.thread_source === 'user');
 }
 
 function codexSessionSkipReason(meta, { sourceSessionId }) {
@@ -1561,8 +1574,6 @@ async function findLatestCodexSession({
     if (!meta?.id) continue;
     if (excludedSessionIds.has(String(meta.id))) continue;
     if (sourceSessionId && meta.id === sourceSessionId) continue;
-    const sessionStartedMs = meta.timestamp ? Date.parse(meta.timestamp) : 0;
-    if (sinceMs && Number.isFinite(sessionStartedMs) && sessionStartedMs > 0 && sessionStartedMs < sinceMs - 5000) continue;
     const metaCwd = meta.cwd ? path.resolve(meta.cwd) : null;
     const cwdMatched = !normalizedCwd || (metaCwd && metaCwd === normalizedCwd);
     const cwdRelated = !normalizedCwd || (metaCwd && pathsAreSameOrNested(metaCwd, normalizedCwd));
@@ -1572,6 +1583,22 @@ async function findLatestCodexSession({
         logCodexSessionCandidateSkip(meta, candidate.filePath, codexSessionSkipReason(meta, { sourceSessionId }), { sourceSessionId });
       }
       continue;
+    }
+    const sessionStartedMs = parseTimestampMs(meta.timestamp);
+    const metadataFreshForLaunch = !sinceMs || (
+      Number.isFinite(sessionStartedMs)
+      && sessionStartedMs >= sinceMs - 5000
+    );
+    let linkedLiveBoundary = null;
+    if (!metadataFreshForLaunch) {
+      // Fresh launches must never adopt an old same-cwd rollout. A linked
+      // resume may reopen an existing direct child, but only a task_started
+      // after this launch proves that the old file is active again.
+      if (!sourceSessionId || !sourceMatched) continue;
+      linkedLiveBoundary = await findCodexLinkedLiveBoundary(candidate.filePath, {
+        startedAtMs: sinceMs,
+      });
+      if (!linkedLiveBoundary?.found) continue;
     }
     if (sourceSessionId && !isFreshCodexLaunchSession(meta)) {
       if (cwdMatched || cwdRelated || sourceMatched) {
@@ -1609,6 +1636,11 @@ async function findLatestCodexSession({
       cwdMatched,
       cwdRelated,
       sourceMatched,
+      sourceMatchMode: sourceMatched ? 'direct-fork' : null,
+      metadataStartedAtMs: Number.isFinite(sessionStartedMs) ? sessionStartedMs : null,
+      metadataFreshForLaunch,
+      reopenedExisting: !metadataFreshForLaunch,
+      linkedLiveBoundary,
       threadSource: meta.thread_source || null,
       parentThreadId: meta.parent_thread_id || null,
       forkedFromId: meta.forked_from_id || null,
@@ -4831,6 +4863,7 @@ module.exports = {
     findLatestCodexSession,
     findCodexLinkedLiveBoundary,
     readCodexSessionMetadata,
+    isCodexUserTuiSession,
     parseJsonlFile,
     readJsonlRange,
     getCodexJsonlCacheStats,

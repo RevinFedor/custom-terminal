@@ -25,10 +25,14 @@ Source: `src/renderer/App.tsx::handleReopenLastClosedCapture`, `src/renderer/sto
 
 Признак сохраняется в `tab_history.process_was_running` (0/1) на закрытии. Источник — `terminal:getCommandState` IPC (OSC 133-based, не PID-scan). Для `claude-sdk` табов аналогом служит `tab.claudeBusy` — тот же флаг, который читает `SessionActionChip` для tri-state Continue/Stop.
 
+Для Codex generic OSC-состояние не является единственным доказательством: закрытие получает `processWasRunning`, текущий writer и durable session одним main-owned snapshot одного runtime-поколения. Иначе shell-edge во время handoff/Stop архивировал бы правильный ID, но помечал его как idle, либо автоматически перезапускал уже завершённую сессию. Отсутствующая/ошибочная DB-строка отличается от авторитетного `NULL`: ни один из этих исходов не разрешает воскресить старый renderer session id как fallback.
+
 Без этой логики reopen приводил бы к одному из двух плохих сценариев: либо всегда auto-resume → Claude запускается даже когда юзер хотел просто заархивировать историю → переплата токенов; либо никогда не resume → юзер закрыл живой Claude нечаянно и теряет процесс. Бинарный сигнал `processWasRunning` снимает оба этих случая.
 
 ### Reserve → create → durable save → commit
 Выбор записи ещё не означает успешное восстановление. Main сначала выдаёт краткоживущую lease на конкретную history-row без удаления; Renderer проверяет CWD, создаёт вкладку, применяет позицию/группу и явно дожидается сохранения финального workspace в SQLite. Только после этого `finish(..., commit=true)` удаляет исходную запись. Ошибка создания или отмена освобождает lease и сохраняет историю; ошибка durable save оставляет уже открытую вкладку и history-row с видимым предупреждением, потому что удалять единственную надёжную копию нельзя.
+
+Тот же инвариант действует на закрытии: архив создаётся до Stop/kill/remove. Если durable archive не прошёл, Close останавливается и сохраняет живую вкладку вместе с процессом; Restore удаляет history-row только после строгого save ACK. Поэтому ошибка persistence оставляет хотя бы одну исходную копию и явный результат пользователю, а не превращает начало операции в успех.
 
 Lease не даёт Home и хоткею одновременно восстановить одну строку, а per-project очередь Shift+Cmd+T превращает быстрые повторные нажатия в последовательный проход назад по истории. Если предыдущая queued-операция не consumed row из-за cancel/create/save/cleanup failure, следующий уже поставленный keypress останавливается: иначе он немедленно создал бы второй live-tab из той же latest-row. Lease ограничена по времени: renderer reload/crash без `finish` не делает строку навсегда занятой. Это исправляет старую ошибочную модель, где начало операции принималось за её успех и запись удалялась до `createTab`.
 
@@ -70,7 +74,7 @@ ALTER TABLE tab_history ADD COLUMN group_id TEXT DEFAULT NULL;
 |---|---|
 | `src/main/database.js` | Колонки `name_set_manually`, `position`, `process_was_running`, `group_id` в `tab_history`; `archiveTab` принимает их. Read-by-id/latest отделён от удаления. |
 | `src/main/main.js` + `tab-history-restore-leases.js` | IPC begin/finish резервирует project-scoped row и удаляет её только при commit после успешного сохранения replacement. |
-| `src/renderer/store/useWorkspaceStore.ts::closeTab` | Перед archive снимает `commandState.isRunning` (OSC 133), position в main-зоне, `nameSetManually` и текущий `groupId`. |
+| `src/renderer/store/useWorkspaceStore.ts::closeTab` | Для Codex получает атомарный archive snapshot из main и архивирует до kill; для остальных runtime сохраняет position, `nameSetManually`, `groupId` и их process-state. Ошибка archive отменяет закрытие. |
 | `src/renderer/store/useWorkspaceStore.ts::restoreTabHistoryEntry` | Общая транзакция Home/hotkey: begin lease → CWD preflight → create/reorder → awaited save → commit. Для Codex auto-fallback в project root разрешён только когда исходный путь равен проекту или был вложен в него. Похожий обрезанный basename и любой generic nearest parent — лишь предположение: UI показывает оба пути и требует подтверждения; fallback в `/` заменяется явным folder picker. |
 | `src/renderer/store/useWorkspaceStore.ts::reopenLastClosedTab` | Сериализует Shift+Cmd+T по проекту и выбирает консервативную политику Continue. |
 | `src/renderer/components/Workspace/ProjectHome.tsx::restoreTab` | Вызывает тот же общий restore-flow с явной Home-политикой Resume; при ошибке карточка остаётся в истории. |

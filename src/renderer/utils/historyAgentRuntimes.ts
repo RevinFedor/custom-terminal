@@ -1,5 +1,6 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { buildCodexRunPayload } from './codexLaunch';
+import { readCodexPtyPresence } from './codexPtyPresence.mjs';
 import { terminalRegistry } from './terminalRegistry';
 import {
   answerClaudeQuestion,
@@ -18,7 +19,7 @@ import {
 const { ipcRenderer } = window.require('electron');
 
 export type AgentHistoryTool = 'claude' | 'codex';
-export type AgentPtyStatus = 'active' | 'busy' | 'inactive' | 'starting' | 'stopping';
+export type AgentPtyStatus = 'active' | 'busy' | 'inactive' | 'starting' | 'stopping' | 'unknown';
 export type AgentDraftGrabResult = ClaudePtyDraftGrabResult;
 export type AgentPendingQuestion = ClaudePendingQuestion;
 export type AgentQuestion = ClaudeQuestion;
@@ -41,6 +42,10 @@ export interface AgentPtyPresence {
   canCopySessionId?: boolean;
   timelineCount?: number | null;
   materializationReason?: string | null;
+  // Codex presence is already derived from this one main-owned snapshot.
+  // Bridge/API callers must reuse it instead of issuing a second identity read
+  // and combining two different process generations.
+  runtimeSnapshot?: any;
 }
 
 export interface AgentResumeResult {
@@ -80,7 +85,7 @@ export interface HistoryAgentRuntime {
   allowSendWhileBusy: boolean;
   optimisticBusyOnSend: boolean;
   optimisticActiveOnInterrupt: boolean;
-  getPresence: (tabId: string) => Promise<AgentPtyPresence>;
+  getPresence: (tabId: string, projectId?: string | null) => Promise<AgentPtyPresence>;
   startFresh?: (args: { tabId: string; cwd?: string }) => Promise<AgentResumeResult>;
   resume: (args: { tabId: string; sessionId: string; cwd?: string }) => Promise<AgentResumeResult>;
   sendPrompt: (tabId: string, prompt: string, options?: AgentSendPromptOptions) => Promise<any>;
@@ -112,14 +117,39 @@ function isSubmittedCodexAuditTimeout(result: any): boolean {
     result?.error === 'codex_user_message_audit_timeout';
 }
 
-const findTabState = (tabId: string): { aiBusy?: boolean; commandType?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string } | null => {
-  const store = useWorkspaceStore.getState();
-  for (const [, workspace] of store.openProjects) {
-    const tab = workspace.tabs.get(tabId);
-    if (tab) return tab;
-  }
-  return null;
+type RuntimeTabState = {
+  aiBusy?: boolean;
+  commandType?: string;
+  codexSessionId?: string;
+  codexModel?: string;
+  codexEffort?: string;
 };
+
+const findTabRuntimeContext = (
+  tabId: string,
+  projectIdHint?: string | null,
+): { tab: RuntimeTabState; projectId: string; uniqueTabId: boolean } | null => {
+  const store = useWorkspaceStore.getState();
+  const matches: Array<{ tab: RuntimeTabState; projectId: string }> = [];
+  for (const [projectId, workspace] of store.openProjects) {
+    const tab = workspace.tabs.get(tabId);
+    if (tab) matches.push({ tab, projectId });
+  }
+  if (matches.length === 0) return null;
+  if (projectIdHint) {
+    const hinted = matches.find((match) => match.projectId === projectIdHint);
+    return hinted ? { ...hinted, uniqueTabId: matches.length === 1 } : null;
+  }
+  if (store.activeProjectId) {
+    const hinted = matches.find((match) => match.projectId === store.activeProjectId);
+    if (hinted) return { ...hinted, uniqueTabId: matches.length === 1 };
+  }
+  return { ...matches[0], uniqueTabId: matches.length === 1 };
+};
+
+const findTabState = (tabId: string): RuntimeTabState | null => (
+  findTabRuntimeContext(tabId)?.tab || null
+);
 
 async function startFreshClaudePtySession({
   tabId,
@@ -137,49 +167,32 @@ async function startFreshClaudePtySession({
   return { success: true, status: 'starting' };
 }
 
-async function getCodexPtyPresence(tabId: string): Promise<AgentPtyPresence> {
-  const tab = findTabState(tabId);
-  const [state, turnState] = await Promise.all([
-    ipcRenderer.invoke('terminal:getCommandState', {
-      tabId,
-      caller: 'HistoryPanel.codexPresence',
-      expectedProcess: 'codex',
-      allowProcessTreeLookup: true,
-    }).catch(() => null),
-    ipcRenderer.invoke('codex:get-turn-state', tabId).catch(() => null),
-  ]);
-  const stopping = await ipcRenderer.invoke('agent:get-stopping-state', tabId).catch(() => null);
-  const tuiReady = await ipcRenderer.invoke('codex:get-tui-ready', tabId).catch(() => null);
-  const isRunning = !!state?.isRunning;
-  const inputReady = isRunning && !!tuiReady?.inputReady;
-  const startupFailed = tuiReady?.startupFailed === true;
-  const manualActionRequired = tuiReady?.manualActionRequired === true;
-  const turnStateResolved = turnState?.hasWatcher && turnState?.catchUpPending !== true;
-  const isBusy = turnStateResolved ? !!turnState.busy : !!tab?.aiBusy;
-  if (tab && tab.aiBusy !== isBusy) {
-    const reason = isBusy
+async function getCodexPtyPresence(
+  tabId: string,
+  projectIdHint?: string | null,
+): Promise<AgentPtyPresence> {
+  const context = findTabRuntimeContext(tabId, projectIdHint);
+  const tab = context?.tab || null;
+  const presence = await readCodexPtyPresence({
+    tabId,
+    projectId: context?.projectId || projectIdHint || null,
+    invoke: ipcRenderer.invoke.bind(ipcRenderer),
+    fallbackBusy: !!tab?.aiBusy,
+  }) as AgentPtyPresence;
+  const runtimeSession = presence.runtimeSnapshot;
+  const turnStateResolved = runtimeSession?.hasWatcher === true
+    && runtimeSession?.catchUpPending !== true;
+  // The legacy store mutator accepts only tabId. Never let a presence read for
+  // one project update another project when restored tabs share the same id.
+  if (tab && context?.uniqueTabId && turnStateResolved && tab.aiBusy !== presence.isBusy) {
+    const reason = presence.isBusy
       ? 'task_started'
-      : (turnState?.outcomeKnown && turnState?.lastOutcomeReason
-        ? turnState.lastOutcomeReason
+      : (runtimeSession?.outcomeKnown && runtimeSession?.lastOutcomeReason
+        ? runtimeSession.lastOutcomeReason
         : 'codex-outcome-unknown');
-    useWorkspaceStore.getState().setAiBusy(tabId, isBusy, reason);
+    useWorkspaceStore.getState().setAiBusy(tabId, presence.isBusy === true, reason);
   }
-  const status: AgentPtyStatus = stopping?.stopping
-    ? 'stopping'
-    : (manualActionRequired ? 'inactive' : (startupFailed ? 'starting' : (isRunning ? (isBusy ? 'busy' : (inputReady ? 'active' : 'starting')) : 'inactive')));
-  return {
-    status,
-    hasBridge: !!tab?.codexSessionId,
-    isBusy,
-    hasTerm: state?.error !== 'tab not found',
-    inputReady: status === 'stopping' ? false : inputReady,
-    awaiting: false,
-    lastNotReady: tuiReady?.lastNotReady || null,
-    startupFailed,
-    startupError: tuiReady?.startupError || null,
-    manualActionRequired,
-    manualActionType: tuiReady?.manualActionType || null,
-  };
+  return presence;
 }
 
 async function resumeCodexSession({
@@ -206,7 +219,6 @@ async function resumeCodexSession({
   if (runResult?.success === false) {
     return { success: false, error: runResult.error || 'Codex resume failed' };
   }
-  ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'codex', sessionId });
   return { success: true, sessionId };
 }
 
@@ -231,7 +243,6 @@ async function startFreshCodexSession({
   if (runResult?.success === false) {
     return { success: false, error: runResult.error || 'Codex start failed' };
   }
-  ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'codex' });
   return { success: true, status: 'starting' };
 }
 

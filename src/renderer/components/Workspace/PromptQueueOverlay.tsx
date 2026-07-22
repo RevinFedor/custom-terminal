@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } fr
 import type { CSSProperties, ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Plus, RefreshCw, Square, Trash2, TriangleAlert } from 'lucide-react';
-import { buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedImageMarkerHighlightRanges, getQueuedPromptAttachmentState, getShortGrabPromptTitle, hasMalformedQueuedImageMarker, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, usePromptQueueStore, type QueuedImageMarkerRange, type QueuedPrompt } from '../../store/usePromptQueueStore';
+import { buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedImageMarkerHighlightRanges, getQueuedPromptAttachmentState, getShortGrabPromptTitle, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, usePromptQueueStore, type QueuedImageMarkerRange, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -186,6 +186,17 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   const promptQueueChipFontSize = useUIStore((s) => s.promptQueueChipFontSize);
   const promptQueueEditorFontSize = useUIStore((s) => s.promptQueueEditorFontSize);
   const queue = usePromptQueueStore((s) => s.queues.get(tabId));
+  const pendingQueueTabIdsKey = usePromptQueueStore((s) => {
+    const ids: string[] = [];
+    for (const [ownerTabId, ownerQueue] of s.queues) {
+      if (hasPendingPromptQueueContinuation(ownerQueue)) ids.push(ownerTabId);
+    }
+    return ids.sort().join('\u001f');
+  });
+  const pendingQueueTabIds = useMemo(
+    () => new Set(pendingQueueTabIdsKey ? pendingQueueTabIdsKey.split('\u001f') : []),
+    [pendingQueueTabIdsKey],
+  );
   const items = queue?.items ?? [];
   const activeItemCount = useMemo(() => countEnabledQueuedPrompts(items), [items]);
   const autoRun = queue?.autoRun ?? false;
@@ -199,7 +210,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   const pinnedPreviewId = queue?.previewId ?? null;
   const {
     addPrompt, removePrompt, updatePrompt, reorderPrompt,
-    setAutoRun, setStopAfter, setCloseAfter, setRunAfterTab,
+    setAutoRun, setStopAfter, setCloseAfter, setRunAfterTab: setRunAfterTabInStore,
     setPostPromptEnabled, setPostPromptText,
     setPanelCollapsed, setPreviewId,
     // popNext is consumed by hooks/usePromptQueueRunner.ts — not referenced here.
@@ -338,6 +349,10 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   // Toast handle — single getState() at top so both grabCurrent and the auto-runner share it
   // without re-declaring (which TS catches as duplicate identifier).
   const showToast = useUIStore.getState().showToast;
+  const handleSetRunAfterTab = useCallback((ownerTabId: string, targetTabId: string | null) => {
+    if (setRunAfterTabInStore(ownerTabId, targetTabId)) return;
+    showToast('Run after не изменён: цепочка замкнётся сама на себя', 'warning', 3500);
+  }, [setRunAfterTabInStore, showToast]);
 
   // ─── first-chip blink ────────────────────────────────────────────────────
   // When firstChipArmedHint flips false → true (user added the first chip
@@ -1272,7 +1287,8 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
               tabId={tabId}
               autoRun={autoRun}
               runAfterTabId={runAfterTabId}
-              setRunAfterTab={setRunAfterTab}
+              setRunAfterTab={handleSetRunAfterTab}
+              waitingTabIds={pendingQueueTabIds}
               panelRef={panelRef}
             />
             <div style={{ display: 'flex', alignItems: 'center', gap: 4, width: '100%' }}>

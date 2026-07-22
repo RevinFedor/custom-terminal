@@ -30,10 +30,52 @@ test('current Codex presence replaces a stale startup failure', () => {
   assert.equal(starting.lastNotReady.reason, 'no-composer-frame');
 });
 
+test('startup timeout event upgrades the existing card without restarting its elapsed time', () => {
+  const held = { ...codexInfo, since: 1, holdUntilReady: true };
+  const failed = syncSessionStartingWithPresence(held, codexInfo, {
+    status: 'starting',
+    startupFailed: true,
+    startupError: 'startup-timeout:no-ready-signal',
+    lastNotReady: { reason: 'startup-timeout:no-ready-signal' },
+  }, 60_001);
+  assert.equal(failed.since, 1);
+  assert.equal(failed.startupFailed, true);
+  assert.equal(failed.startupError, 'startup-timeout:no-ready-signal');
+});
+
 test('active or inactive Codex presence clears its old startup card', () => {
   const failed = { ...codexInfo, since: 1, startupFailed: true };
   assert.equal(syncSessionStartingWithPresence(failed, codexInfo, { status: 'active' }), null);
   assert.equal(syncSessionStartingWithPresence(failed, codexInfo, { status: 'inactive' }), null);
+});
+
+test('ready Codex composer clears startup card even before writer identity exists', () => {
+  const starting = { ...codexInfo, since: 1, holdUntilReady: true };
+  assert.equal(syncSessionStartingWithPresence(starting, codexInfo, {
+    status: 'starting',
+    inputReady: true,
+    sessionId: null,
+  }), null);
+});
+
+test('starting to unknown to starting never hides the Codex startup card', () => {
+  const starting = syncSessionStartingWithPresence(null, codexInfo, {
+    status: 'starting',
+    lastNotReady: { reason: 'writer-pending' },
+  }, 1);
+  const unknown = syncSessionStartingWithPresence(starting, codexInfo, {
+    status: 'unknown',
+    lastNotReady: { reason: 'process-lookup-failed' },
+  }, 2);
+  const recovered = syncSessionStartingWithPresence(unknown, codexInfo, {
+    status: 'starting',
+    lastNotReady: { reason: 'writer-pending' },
+  }, 3);
+  assert.notEqual(unknown, null);
+  assert.equal(unknown.since, starting.since);
+  assert.equal(unknown.lastNotReady.reason, 'process-lookup-failed');
+  assert.notEqual(recovered, null);
+  assert.equal(recovered.since, starting.since);
 });
 
 test('command-start race remains visible until a real lifecycle state arrives', () => {
@@ -43,6 +85,19 @@ test('command-start race remains visible until a real lifecycle state arrives', 
     held,
   );
   assert.equal(syncSessionStartingWithPresence(held, codexInfo, { status: 'active' }), null);
+});
+
+test('manual Codex startup blocker remains visible after lifecycle becomes inactive', () => {
+  const held = { ...codexInfo, since: 1, holdUntilReady: true };
+  const blocked = syncSessionStartingWithPresence(held, codexInfo, {
+    status: 'inactive',
+    manualActionRequired: true,
+    lastNotReady: { reason: 'blocked:auth-required', blockers: ['auth-required'] },
+  }, 2);
+  assert.notEqual(blocked, null);
+  assert.equal(blocked.since, 1);
+  assert.equal(blocked.holdUntilReady, false);
+  assert.equal(blocked.lastNotReady.reason, 'blocked:auth-required');
 });
 
 test('Claude defaults gate owns stickiness until its own ready signal', () => {

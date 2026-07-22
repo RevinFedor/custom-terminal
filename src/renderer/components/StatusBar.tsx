@@ -14,6 +14,7 @@ import { usePromptsStore } from '../store/usePromptsStore';
 import { useCmdKey } from '../hooks/useCmdHoverPopover';
 import { CUSTOM_ICONS } from '../assets/icons/registry';
 import CenteredUpwardPopover from './UI/CenteredUpwardPopover';
+import ControlHint from './UI/ControlHint';
 
 const { ipcRenderer } = window.require('electron');
 const CODEX_ICON_URL = new URL('../assets/icons/codex-color.svg', import.meta.url).href;
@@ -188,7 +189,7 @@ type McpActivityEvent = {
   sourceMeta?: McpActivitySource | null;
 };
 
-const MCP_ACTIVE_STATUSES = new Set(['running', 'creating', 'sending', 'pasting']);
+const MCP_ACTIVE_STATUSES = new Set(['running', 'creating', 'sending', 'pasting', 'starting']);
 
 function McpActivityChip() {
   const [events, setEvents] = useState<McpActivityEvent[]>([]);
@@ -231,6 +232,7 @@ function McpActivityChip() {
 
   return (
     <>
+      <ControlHint label="Открыть журнал внешнего MCP-управления" disabled={open} side="top">
       <button
         ref={chipRef}
         onClick={() => setOpen(v => !v)}
@@ -255,6 +257,7 @@ function McpActivityChip() {
           </span>
         )}
       </button>
+      </ControlHint>
       {open && chipRef.current && createPortal(
         <McpActivityPopup
           chipRect={chipRef.current.getBoundingClientRect()}
@@ -476,6 +479,7 @@ function InvalidPathsChip({ onOpenSettings }: { onOpenSettings?: () => void }) {
   if (missing.length === 0) return null;
 
   return (
+    <ControlHint label={`Открыть настройки: ${missing.length} недоступных путей`} side="top">
     <button
       onClick={onOpenSettings}
       className="inline-flex items-center cursor-pointer rounded"
@@ -496,11 +500,13 @@ function InvalidPathsChip({ onOpenSettings }: { onOpenSettings?: () => void }) {
       <span style={{ fontSize: 13, lineHeight: 1 }}>!</span>
       <span style={{ fontSize: 12 }}>{missing.length}</span>
     </button>
+    </ControlHint>
   );
 }
 
 function SettingsButton({ onClick }: { onClick?: () => void }) {
   return (
+    <ControlHint label="Открыть настройки" shortcut="⌘," side="top">
     <button
       onClick={onClick}
       aria-label="Settings"
@@ -519,6 +525,7 @@ function SettingsButton({ onClick }: { onClick?: () => void }) {
     >
       <Settings size={14} strokeWidth={1.75} />
     </button>
+    </ControlHint>
   );
 }
 
@@ -999,6 +1006,12 @@ function SplitIconButton({ title, active, activeColor, side, onClick, children }
   children: React.ReactNode;
 }) {
   return (
+    <ControlHint
+      label={side === 'left'
+        ? (active ? 'Открепить History и вернуть overlay' : 'Закрепить History колонкой')
+        : (active ? 'Открепить Timeline и вернуть overlay' : 'Закрепить Timeline колонкой')}
+      side="top"
+    >
     <button
       onClick={onClick}
       title={title}
@@ -1026,5 +1039,6 @@ function SplitIconButton({ title, active, activeColor, side, onClick, children }
     >
       {children}
     </button>
+    </ControlHint>
   );
 }

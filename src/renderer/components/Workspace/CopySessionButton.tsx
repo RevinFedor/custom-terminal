@@ -5,6 +5,7 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useCmdKey } from '../../hooks/useCmdHoverPopover';
 import HoverBridgeDebug from '../HoverBridgeDebug';
 import { User as UserIcon } from 'lucide-react';
+import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -209,7 +210,13 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
     if (!activeProject) { showToast('No active project', 'error'); return; }
 
     const tabsToCopy = isMultiSelect ? selectedTabs : (activeTabId ? [activeProject.tabs.get(activeTabId)] : []);
-    const validTabs = tabsToCopy.filter(t => t && (t.claudeSessionId || t.geminiSessionId || t.codexSessionId || overrideInput));
+    const validTabs = tabsToCopy.filter(t => t && (
+      t.claudeSessionId
+      || t.geminiSessionId
+      || t.codexSessionId
+      || t.commandType === 'codex'
+      || overrideInput
+    ));
     if (validTabs.length === 0) { showToast('Нет сессий для копирования', 'warning'); return; }
 
     setIsCopying(true);
@@ -217,6 +224,7 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
       const allResults: string[] = [];
       for (const tab of validTabs) {
         if (!tab) continue;
+        const declaredCodex = tab.commandType === 'codex';
         let targetId = '';
         let parsedCwd = '';
         let kind: 'claude' | 'gemini' | 'codex' = 'claude';
@@ -226,12 +234,24 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
           const cwdMatch = overrideInput.match(/cwd:\s*(\/[^\s\n]+)/i);
           if (uuidMatch) targetId = uuidMatch[0];
           if (cwdMatch) parsedCwd = cwdMatch[1];
-          kind = tab.codexSessionId ? 'codex' : tab.geminiSessionId ? 'gemini' : 'claude';
+          kind = declaredCodex || tab.codexSessionId ? 'codex' : tab.geminiSessionId ? 'gemini' : 'claude';
         }
         if (!targetId) {
-          if (tab.claudeSessionId) { targetId = tab.claudeSessionId; kind = 'claude'; }
+          if (declaredCodex) { targetId = tab.codexSessionId || ''; kind = 'codex'; }
+          else if (tab.claudeSessionId) { targetId = tab.claudeSessionId; kind = 'claude'; }
           else if (tab.geminiSessionId) { targetId = tab.geminiSessionId; kind = 'gemini'; }
           else if (tab.codexSessionId) { targetId = tab.codexSessionId; kind = 'codex'; }
+        }
+        // A manually entered UUID is an explicit historical export target. The
+        // regular tab button instead follows the proven live writer, falling
+        // back to persisted history only when main says the Codex process stopped.
+        if (kind === 'codex' && !overrideInput) {
+          targetId = await requireCodexSurfaceSessionId({
+            tabId: tab.id,
+            historicalSessionId: tab.codexSessionId || null,
+            operation: 'Копировать сессию',
+            requireMutationSafe: true,
+          });
         }
         if (!targetId) continue;
 

@@ -20,6 +20,30 @@ export function syncSessionStartingWithPresence(previous, info, presence, now = 
   if (!info || !presence) return previous;
   const sameTarget = isSameTarget(previous, info);
 
+  // A manual startup blocker ends the process lifecycle but not the user's
+  // need for an explanation. Keep the same non-modal card as an actionable
+  // status until the user dismisses it or a later lifecycle event replaces it.
+  if (info.engine === 'codex' && presence.manualActionRequired === true) {
+    return {
+      tabId: info.tabId,
+      engine: info.engine,
+      sessionId: info.sessionId || null,
+      since: sameTarget ? previous.since : now,
+      lastNotReady: presence.lastNotReady || previous?.lastNotReady || null,
+      holdUntilReady: false,
+      startupPending: false,
+      startupFailed: false,
+      startupError: null,
+    };
+  }
+
+  // The startup card describes terminal readiness, not rollout identity. A
+  // fresh Codex session legitimately has no writer/session id until the first
+  // submitted message, so an authoritative ready composer always clears it.
+  if (info.engine === 'codex' && presence.inputReady === true) {
+    return sameTarget ? null : previous;
+  }
+
   if (presence.status === 'starting') {
     if (sameTarget && isClaudeStartupDefaultsState(previous)) {
       return {
@@ -50,6 +74,17 @@ export function syncSessionStartingWithPresence(previous, info, presence, now = 
       startupError: presence.startupFailed === true
         ? (presence.startupError || null)
         : null,
+    };
+  }
+
+  // A failed process/writer probe is not evidence that startup completed. Keep
+  // the existing card for the same tab so a transient lsof/ps timeout cannot
+  // produce starting → hidden → starting flicker.
+  if (presence.status === 'unknown' && sameTarget) {
+    return {
+      ...previous,
+      sessionId: info.sessionId || previous.sessionId || null,
+      lastNotReady: presence.lastNotReady || previous.lastNotReady || null,
     };
   }
 

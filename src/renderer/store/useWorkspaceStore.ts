@@ -5,6 +5,10 @@ import { setPrefetched } from '../utils/sdkHistoryPrefetch';
 import { usePromptQueueStore } from './usePromptQueueStore';
 import { getInboxProjectPath, isInboxProjectId } from '../constants/systemProjects';
 import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
+import {
+  commitArchiveBeforeClose,
+  isDurableSaveTabsAck,
+} from '../utils/tabPersistenceTransactions.mjs';
 
 const { ipcRenderer } = window.require('electron');
 let tabGroupSaveSeq = 0;
@@ -1109,15 +1113,15 @@ interface WorkspaceStore {
   markAiForkAutoTitle: (tabId: string, toolType: AutoTabTitleTool, sourceSessionId: string) => void;
   getAiLaunchSnapshot: (tabId: string) => AiLaunchSnapshot | null;
   clearAiLaunchSnapshot: (tabId: string, reason?: string) => void;
-  discardUnmaterializedAiLaunchSession: (tabId: string, reason: string) => boolean;
+  discardUnmaterializedAiLaunchSession: (tabId: string, reason: string) => Promise<boolean>;
   toggleTabUtility: (projectId: string, tabId: string) => void;
   toggleTabCollapsed: (projectId: string, tabId: string) => void;
 
   // Advanced drag & drop
   reorderInZone: (projectId: string, zone: 'main' | 'utility', orderedIds: string[]) => void;
   moveTabToZone: (projectId: string, tabId: string, toUtility: boolean, atIndex: number, sourceIds?: string[]) => void;
-  moveTabToProject: (sourceProjectId: string, tabId: string, targetProjectId: string) => void;
-  moveTabsToProject: (sourceProjectId: string, tabIds: string[], targetProjectId: string) => void;
+  moveTabToProject: (sourceProjectId: string, tabId: string, targetProjectId: string) => Promise<boolean>;
+  moveTabsToProject: (sourceProjectId: string, tabIds: string[], targetProjectId: string) => Promise<boolean>;
   createTabGroup: (projectId: string, name?: string) => string;
   renameTabGroup: (projectId: string, groupId: string, name: string) => void;
   toggleTabGroupCollapsed: (projectId: string, groupId: string) => void;
@@ -1148,7 +1152,7 @@ interface WorkspaceStore {
   getGeminiSessionId: (tabId: string) => string | null;
 
   // Codex session tracking
-  setCodexSessionId: (tabId: string, sessionId: string, reason?: CodexSessionWriteReason) => void;
+  setCodexSessionId: (tabId: string, sessionId: string, reason?: CodexSessionWriteReason) => Promise<boolean>;
   getCodexSessionId: (tabId: string) => string | null;
   updateCodexState: (tabId: string, state: Partial<Pick<Tab, 'codexModel' | 'codexEffort'>>) => void;
   updateExternalRunMeta: (tabId: string, meta: Partial<NonNullable<Tab['externalRun']>>) => void;
@@ -1323,6 +1327,28 @@ const saveTabsThenNotifyProjectLayoutChanged = (projectId: string, tabs: Map<str
   saveTabs(projectId, tabs, forceCleanup).then((result: any) => {
     if (result?.success !== false) notifyProjectLayoutChanged(projectId, reason);
   });
+};
+
+const commitCodexSessionId = async (
+  projectId: string,
+  tabId: string,
+  sessionId: string | null,
+  expectedSessionId: string | null,
+  reason: string,
+): Promise<any> => {
+  const result = await ipcRenderer.invoke('tab:set-codex-session-id', {
+    projectId,
+    tabId,
+    sessionId,
+    expectedSessionId,
+    reason,
+  });
+  if (result?.success === false) {
+    const error: any = new Error(result.error || 'codex_session_point_write_failed');
+    error.result = result;
+    throw error;
+  }
+  return result;
 };
 
 const saveTabGroups = (projectId: string, groups: TabGroup[]) => {
@@ -2396,7 +2422,64 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
     }
 
-    if (isAiTab && (aiBusyAtClose || (processWasRunning && (foregroundAiProcess || !runningProcessInfo?.hasProcess)))) {
+    const shouldStopAiProcess = isAiTab
+      && (aiBusyAtClose || (processWasRunning && (foregroundAiProcess || !runningProcessInfo?.hasProcess)));
+
+    // Compute TabBar position at close time (excluding sub-agent / utility
+    // tabs — they don't take a slot in the bar). Used as a placement hint by
+    // reopenLastClosedTab.
+    const orderedMainTabs = Array.from(workspace.tabs.values())
+      .filter(t => !t.parentTabId && !t.isUtility);
+    const closedPosition = orderedMainTabs.findIndex(t => t.id === tabId);
+
+    // File tabs are linked document previews, not restorable terminal/AI sessions.
+    const shouldArchiveToHistory = tab.tabType !== 'file' && options?.archive !== false;
+    const archiveCommit = await commitArchiveBeforeClose({
+      shouldArchive: shouldArchiveToHistory,
+      archive: () => ipcRenderer.invoke('project:archive-tab', {
+        projectId,
+        tab: {
+          tabId,
+          name: tab.name,
+          cwd: tab.cwd,
+          color: tab.color,
+          notes: tab.notes,
+          taskPlan: tab.taskPlan,
+          commandType: tab.commandType,
+          tabType: tab.tabType,
+          url: tab.url,
+          filePath: tab.filePath,
+          createdAt: tab.createdAt,
+          claudeSessionId: tab.claudeSessionId,
+          geminiSessionId: tab.geminiSessionId,
+          codexSessionId: tab.codexSessionId,
+          codexModel: tab.codexModel,
+          codexEffort: tab.codexEffort,
+          sessionStatus: tab.sessionStatus,
+          groupId: tab.groupId,
+          position: closedPosition >= 0 ? closedPosition : null,
+          processWasRunning,
+        }
+      }),
+    });
+    if (!archiveCommit.ok) {
+      console.warn('[CloseTab] archive not committed; keeping tab and process tab=' + tabId.slice(-12)
+        + ' reason=' + (archiveCommit.reason || 'unknown')
+        + ' error=' + (archiveCommit.error instanceof Error ? archiveCommit.error.message : 'none'));
+      return false;
+    }
+    if (!archiveCommit.skipped) {
+      console.log('[CloseTab] archive committed tab=' + tabId.slice(-12) +
+        ' historyId=' + (archiveCommit.result?.historyId ?? 'none') +
+        ' durMs=' + (Date.now() - closeStartedAt));
+    } else if (tab.tabType === 'file') {
+      console.log('[CloseTab] archive skipped file tab=' + tabId.slice(-12));
+    }
+
+    // Nothing below this point may run until a requested History row is
+    // durably committed. On archive failure the live process and tab stay
+    // intact, so the user can retry instead of losing the only copy.
+    if (shouldStopAiProcess) {
       tab.aiClosing = true;
       startTransition(() => {
         set({ openProjects: new Map(openProjects) });
@@ -2418,19 +2501,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
     }
 
-    // Compute TabBar position at close time (excluding sub-agent / utility
-    // tabs — they don't take a slot in the bar). Used as a placement hint by
-    // reopenLastClosedTab.
-    const orderedMainTabs = Array.from(workspace.tabs.values())
-      .filter(t => !t.parentTabId && !t.isUtility);
-    const closedPosition = orderedMainTabs.findIndex(t => t.id === tabId);
-
-    // Stop SDK session if this is a claude-sdk tab + clear busy state.
-    // HARD kill — closing the tab must fully terminate the process and all its
-    // background agents (no orphans). A soft interrupt would leave the parked
-    // session + bg workers alive with no UI to control them.
+    // HARD kill — closing an SDK tab must fully terminate the process and all
+    // background agents (no orphans). A soft interrupt would leave a parked
+    // session with no UI to control it.
     if (tab.tabType === 'claude-sdk') {
-      if (!aiBusyAtClose) {
+      if (!shouldStopAiProcess) {
         ipcRenderer.invoke('claude-sdk:stop', { tabId, hard: true }).catch(() => {});
       }
       ipcRenderer.send('claude-sdk:busy-state', { tabId, busy: false, reason: 'close' });
@@ -2442,43 +2517,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         ' durMs=' + (Date.now() - closeStartedAt));
     }
     clearTerminalBuffer(tabId); // Clean up serialized buffer
-
-    // File tabs are linked document previews, not restorable terminal/AI sessions.
-    const shouldArchiveToHistory = tab.tabType !== 'file' && options?.archive !== false;
-    if (tab && shouldArchiveToHistory) {
-      ipcRenderer.invoke('project:archive-tab', {
-        projectId,
-        tab: {
-          name: tab.name,
-          cwd: tab.cwd,
-          color: tab.color,
-          notes: tab.notes,
-          taskPlan: tab.taskPlan,
-          commandType: tab.commandType,
-          tabType: tab.tabType,
-          url: tab.url,
-          filePath: tab.filePath,
-          createdAt: tab.createdAt,
-          claudeSessionId: tab.claudeSessionId,
-          geminiSessionId: tab.geminiSessionId,
-          codexSessionId: tab.codexSessionId,
-          codexModel: tab.codexModel,
-          codexEffort: tab.codexEffort,
-          sessionStatus: tab.sessionStatus,
-          groupId: tab.groupId,
-          position: closedPosition >= 0 ? closedPosition : null,
-          processWasRunning,
-        }
-      }).then((res: any) => {
-        console.log('[CloseTab] archive resolved tab=' + tabId.slice(-12) +
-          ' historyId=' + (res?.historyId || 'none') +
-          ' durMs=' + (Date.now() - closeStartedAt));
-      }).catch((err: any) => {
-        console.warn('[CloseTab] archive failed tab=' + tabId.slice(-12) + ': ' + (err?.message || err));
-      });
-    } else if (tab.tabType === 'file') {
-      console.log('[CloseTab] archive skipped file tab=' + tabId.slice(-12));
-    }
 
     workspace.tabs.delete(tabId);
     for (const remainingTab of workspace.tabs.values()) {
@@ -2676,7 +2714,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const persisted = finalWorkspace
       ? await saveTabs(projectId, finalWorkspace.tabs)
       : { success: false };
-    if (persisted?.success === false) {
+    if (!isDurableSaveTabsAck(persisted)) {
       await finishLease(false);
       console.warn('[TabHistoryRestore] replacement is live but not durably saved; history retained', {
         projectId,
@@ -2865,7 +2903,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (!cleanName) return false;
 
     const { openProjects } = get();
-    for (const [, workspace] of openProjects) {
+    for (const [projectId, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (!tab) continue;
       if (tab.nameSetManually && !options.overrideManualName) {
@@ -3284,7 +3322,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     console.warn('[Store:AiLaunchSnapshot] clear tab=' + tabId.slice(-8) + ' type=' + snap.sessionType + ' reason=' + reason);
   },
 
-  discardUnmaterializedAiLaunchSession: (tabId, reason) => {
+  discardUnmaterializedAiLaunchSession: async (tabId, reason) => {
     const snap = aiLaunchSnapshots.get(tabId);
     if (!snap) {
       console.warn('[Store:AiLaunchDiscard] skip tab=' + tabId.slice(-8) + ' reason=' + reason + ' no-snapshot');
@@ -3292,7 +3330,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
 
     const { openProjects } = get();
-    for (const [, workspace] of openProjects) {
+    for (const [projectId, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (!tab) continue;
 
@@ -3303,6 +3341,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (snap.sessionType === 'claude') {
         delete tab.claudeSessionId;
       } else if (snap.sessionType === 'codex') {
+        const expectedSessionId = tab.codexSessionId || null;
+        try {
+          await commitCodexSessionId(projectId, tabId, null, expectedSessionId, 'discard-unmaterialized');
+        } catch (error) {
+          console.warn('[Store:AiLaunchDiscard] Codex clear rejected tab=' + tabId.slice(-8)
+            + ' reason=' + reason
+            + ' error=' + (error instanceof Error ? error.message : String(error))
+            + ' action=keep-binding');
+          return false;
+        }
         delete tab.codexSessionId;
       }
 
@@ -3315,7 +3363,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       console.warn('[Store:AiLaunchDiscard] tab=' + tabId.slice(-8) + ' type=' + snap.sessionType + ' reason=' + reason + ' keepCommand=' + (tab.commandType || 'null') + ' clearSessionArtifact=true');
 
       set({ openProjects: new Map(openProjects) });
-      saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'ai-launch-unmaterialized');
+      const saveResult = await saveTabs(workspace.projectId, workspace.tabs);
+      if (saveResult?.success !== false) {
+        notifyProjectLayoutChanged(workspace.projectId, 'ai-launch-unmaterialized');
+      }
       return true;
     }
 
@@ -3451,17 +3502,46 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     saveTabs(workspace.projectId, workspace.tabs);
   },
 
-  moveTabToProject: (sourceProjectId, tabId, targetProjectId) => {
-    if (sourceProjectId === targetProjectId) return;
+  moveTabToProject: async (sourceProjectId, tabId, targetProjectId) => {
+    if (sourceProjectId === targetProjectId) return false;
 
     const { openProjects } = get();
     const sourceWorkspace = openProjects.get(sourceProjectId);
     const targetWorkspace = openProjects.get(targetProjectId);
 
-    if (!sourceWorkspace || !targetWorkspace) return;
+    if (!sourceWorkspace || !targetWorkspace) return false;
 
     const tab = sourceWorkspace.tabs.get(tabId);
-    if (!tab) return;
+    if (!tab || targetWorkspace.tabs.has(tabId)) return false;
+
+    // A newly-created tab becomes visible before its background save promise
+    // necessarily settles.  The main-side transfer deliberately requires an
+    // existing source row, so establish that durable precondition here instead
+    // of relying on IPC ordering between an earlier invoke() and this sendSync.
+    const sourcePersisted = await saveTabs(sourceWorkspace.projectId, sourceWorkspace.tabs);
+    if (!isDurableSaveTabsAck(sourcePersisted)) {
+      console.warn('[moveTabToProject] source snapshot not durable tab=' + dndShortId(tabId)
+        + ' error=' + (sourcePersisted?.error || 'save_failed'));
+      return false;
+    }
+
+    let transfer: any;
+    try {
+      transfer = ipcRenderer.sendSync('terminal:transfer-project-ownership-sync', {
+        sourceProjectId,
+        targetProjectId,
+        tabIds: [tabId],
+      });
+    } catch (error) {
+      console.warn('[moveTabToProject] ownership commit failed tab=' + dndShortId(tabId)
+        + ' error=' + (error instanceof Error ? error.message : String(error)));
+      return false;
+    }
+    if (transfer?.success !== true) {
+      console.warn('[moveTabToProject] ownership commit rejected tab=' + dndShortId(tabId)
+        + ' error=' + (transfer?.error || 'unknown'));
+      return false;
+    }
 
     // Remove from source project
     sourceWorkspace.tabs.delete(tabId);
@@ -3474,6 +3554,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const remainingTabs = Array.from(sourceWorkspace.tabs.keys());
       sourceWorkspace.activeTabId = remainingTabs.length > 0 ? remainingTabs[0] : null;
     }
+    sourceWorkspace.selectedTabIds = sourceWorkspace.selectedTabIds.filter(id => id !== tabId);
+    let sourceGroupsChanged = false;
+    sourceWorkspace.tabGroups = sourceWorkspace.tabGroups.map((group) => {
+      if (group.anchorTabId !== tabId) return group;
+      sourceGroupsChanged = true;
+      return { ...group, anchorTabId: undefined };
+    });
 
     // Add to target project (as main tab, not utility)
     tab.isUtility = false;
@@ -3488,22 +3575,54 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({ openProjects: new Map(openProjects) });
 
     // Save both projects
-    saveTabs(sourceWorkspace.projectId, sourceWorkspace.tabs);
+    saveTabs(sourceWorkspace.projectId, sourceWorkspace.tabs, true);
     saveTabs(targetWorkspace.projectId, targetWorkspace.tabs);
+    if (sourceGroupsChanged) saveTabGroups(sourceWorkspace.projectId, sourceWorkspace.tabGroups);
 
     log.tabs(`[moveTabToProject] Moved tab ${tabId} from ${sourceProjectId} to ${targetProjectId}`);
+    return true;
   },
 
-  moveTabsToProject: (sourceProjectId, tabIds, targetProjectId) => {
-    if (sourceProjectId === targetProjectId || tabIds.length === 0) return;
+  moveTabsToProject: async (sourceProjectId, tabIds, targetProjectId) => {
+    if (sourceProjectId === targetProjectId || tabIds.length === 0) return false;
 
     const { openProjects } = get();
     const src = openProjects.get(sourceProjectId);
     const tgt = openProjects.get(targetProjectId);
-    if (!src || !tgt) return;
+    if (!src || !tgt) return false;
+
+    const movingIds = Array.from(new Set(tabIds.filter((tabId) => src.tabs.has(tabId))));
+    if (movingIds.length === 0 || movingIds.some((tabId) => tgt.tabs.has(tabId))) return false;
+
+    // Same create→immediate-drag edge as the single-tab path: transfer owns
+    // rows, not an optimistic renderer snapshot, so prove every source row is
+    // durable before asking main to move ownership atomically.
+    const sourcePersisted = await saveTabs(src.projectId, src.tabs);
+    if (!isDurableSaveTabsAck(sourcePersisted)) {
+      console.warn('[moveTabsToProject] source snapshot not durable tabs=' + movingIds.length
+        + ' error=' + (sourcePersisted?.error || 'save_failed'));
+      return false;
+    }
+    let transfer: any;
+    try {
+      transfer = ipcRenderer.sendSync('terminal:transfer-project-ownership-sync', {
+        sourceProjectId,
+        targetProjectId,
+        tabIds: movingIds,
+      });
+    } catch (error) {
+      console.warn('[moveTabsToProject] ownership commit failed tabs=' + movingIds.length
+        + ' error=' + (error instanceof Error ? error.message : String(error)));
+      return false;
+    }
+    if (transfer?.success !== true) {
+      console.warn('[moveTabsToProject] ownership commit rejected tabs=' + movingIds.length
+        + ' error=' + (transfer?.error || 'unknown'));
+      return false;
+    }
 
     let lastId: string | null = null;
-    for (const tabId of tabIds) {
+    for (const tabId of movingIds) {
       const tab = src.tabs.get(tabId);
       if (!tab) continue;
       src.tabs.delete(tabId);
@@ -3526,14 +3645,23 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
     // Clear selection in source
     src.selectedTabIds = src.selectedTabIds.filter(id => src.tabs.has(id));
+    const movingSet = new Set(movingIds);
+    let sourceGroupsChanged = false;
+    src.tabGroups = src.tabGroups.map((group) => {
+      if (!group.anchorTabId || !movingSet.has(group.anchorTabId)) return group;
+      sourceGroupsChanged = true;
+      return { ...group, anchorTabId: undefined };
+    });
     // Active in target
     if (lastId) tgt.activeTabId = lastId;
 
     set({ openProjects: new Map(openProjects) });
     saveTabs(src.projectId, src.tabs, true);  // forceCleanup: intentional batch move
     saveTabs(tgt.projectId, tgt.tabs);
+    if (sourceGroupsChanged) saveTabGroups(src.projectId, src.tabGroups);
 
-    log.tabs(`[moveTabsToProject] Moved ${tabIds.length} tabs from ${sourceProjectId} to ${targetProjectId}`);
+    log.tabs(`[moveTabsToProject] Moved ${movingIds.length} tabs from ${sourceProjectId} to ${targetProjectId}`);
+    return true;
   },
 
   createTabGroup: (projectId, name) => {
@@ -4061,14 +4189,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   // Codex session tracking (detected from ~/.codex/sessions JSONL)
-  setCodexSessionId: (tabId, sessionId, reason = 'detected') => {
+  setCodexSessionId: async (tabId, sessionId, reason = 'detected') => {
     const { openProjects } = get();
 
     for (const [projectId, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
-        if (tab.codexSessionId === sessionId) return;
+        if (tab.codexSessionId === sessionId) return true;
         const prev = tab.codexSessionId;
+        const persistentHistoryMutation = ['editRange', 'deleteRange', 'api-edit-range', 'api-delete-range'].includes(reason);
+        if (persistentHistoryMutation) {
+          // CAS is the admission gate, not a best-effort background write. Do
+          // not mutate renderer memory or launch Resume until main confirms the
+          // stopped historical binding still equals the expected source.
+          await commitCodexSessionId(projectId, tabId, sessionId, prev || null, reason);
+        }
         maybeArmPendingAutoTabTitle(tabId, 'codex', prev, sessionId, tab.nameSetManually === true, reason);
         if (!sessionId || (prev && prev !== sessionId)) {
           clearPendingAutoTabTitle(tabId, !sessionId ? 'codex-session-cleared' : 'codex-session-changed');
@@ -4077,11 +4212,20 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         tab.wasInterrupted = false;
         tab.overlayDismissed = false;
         console.log(`[Workspace] Codex session set for tab ${tabId}: ${sessionId} (reason=${reason}, reset overlay flags)`);
-        saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'codex-session-id');
+        if (persistentHistoryMutation) {
+          const saveResult = await saveTabs(workspace.projectId, workspace.tabs);
+          if (saveResult?.success !== false) notifyProjectLayoutChanged(workspace.projectId, reason);
+        } else {
+          // Main already point-wrote a process-proven writer. Renderer adopts it
+          // in memory only; generic saveTabs preserves the DB-owned identity and
+          // cannot race an A→B writer handoff with a late A response.
+          saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'codex-session-memory-adopt');
+        }
         set({});
-        return;
+        return true;
       }
     }
+    return false;
   },
 
   getCodexSessionId: (tabId) => {
