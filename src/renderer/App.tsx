@@ -3989,11 +3989,21 @@ function App() {
       // can take 300-800ms. Without this, the hotkey feels deaf during the gap.
       useUIStore.getState().triggerReopenPulse();
       ws.reopenLastClosedTab(activeProjectId).then((res) => {
-        if (!res.tabId && res.reason === 'empty') {
-          showToast('Нет закрытых вкладок', 'info');
+        if (!res.tabId) {
+          if (res.reason === 'empty') showToast('Нет закрытых вкладок', 'info');
+          else if (res.reason === 'busy' || res.reason === 'cancelled') showToast(res.message || 'Восстановление отменено', 'info');
+          else showToast(res.message || 'Не удалось восстановить вкладку', 'error');
+          return;
+        }
+        if (res.historyDeleteFailed) {
+          showToast(res.message || 'Вкладка открыта, но запись истории сохранена', 'warning');
+        }
+        if (res.fallbackFrom) {
+          showToast(`Оригинальная папка удалена. Открыто в ${res.cwd}`, 'warning');
         }
       }).catch((err) => {
         console.warn('[Reopen] failed:', err);
+        showToast('Не удалось восстановить вкладку', 'error');
       });
     };
     window.addEventListener('keydown', handleReopenLastClosedCapture, true);

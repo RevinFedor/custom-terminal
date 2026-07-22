@@ -651,3 +651,12 @@
 .sdk-chip-flash {
   animation: sdkChipFlash 360ms ease-out;
 }
+
+/* Task titles use a transparent textarea above a colored, wrapping mirror.
+   Keep native selection readable while preserving the mirrored token colors
+   everywhere outside the selected range. */
+.task-plan-title-editor::selection {
+  color: #fff;
+  -webkit-text-fill-color: #fff;
+  background: rgba(99, 102, 241, 0.62);
+}

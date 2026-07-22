@@ -388,15 +388,86 @@ const getSetTabCommandType = () => useWorkspaceStore.getState().setTabCommandTyp
 
 // Get updateTabCwd for OSC 7 handler (shell reports cwd changes)
 const getUpdateTabCwd = () => {
-  return (tabId: string, newCwd: string) => {
+  return async (tabId: string, newCwd: string): Promise<boolean> => {
     const state = useWorkspaceStore.getState();
     for (const [projectId, workspace] of state.openProjects) {
       if (workspace.tabs.has(tabId)) {
-        state.updateTabCwd(projectId, tabId, newCwd);
-        return;
+        return state.updateTabCwd(projectId, tabId, newCwd);
       }
     }
+    return false;
   };
+};
+
+type OscCwdCandidateState = {
+  running: boolean;
+  pending?: string;
+};
+
+const oscCwdCandidateStates = new Map<string, OscCwdCandidateState>();
+
+// OSC 7 is terminal output, not filesystem truth. Codex/TUI output can contain
+// an OSC-looking byte sequence, so renderer state is updated only after main
+// verifies the candidate against the live PTY process cwd. Bursts are
+// coalesced per tab so a noisy TUI cannot build an unbounded IPC queue.
+const submitOscCwdCandidate = (tabId: string, candidate: string): void => {
+  const state = oscCwdCandidateStates.get(tabId) || { running: false };
+  state.pending = candidate;
+  oscCwdCandidateStates.set(tabId, state);
+  if (state.running) return;
+
+  state.running = true;
+  void (async () => {
+    try {
+      while (state.pending !== undefined) {
+        const next = state.pending;
+        delete state.pending;
+        try {
+          const result = await ipcRenderer.invoke('terminal:updateCwd', { tabId, cwd: next });
+          if (result?.accepted && typeof result.cwd === 'string') {
+            const rendererSaved = await getUpdateTabCwd()(tabId, result.cwd);
+            if (!rendererSaved && result.persisted !== true) {
+              console.warn('[Terminal:CwdProof] accepted cwd could not be persisted', {
+                tabId,
+                cwd: result.cwd,
+              });
+            }
+          } else {
+            console.warn('[Terminal:CwdProof] rejected', {
+              tabId,
+              candidate: next,
+              reason: result?.reason || 'unknown',
+              observedCwd: result?.observedCwd || null,
+              retainedCwd: result?.retainedCwd || null,
+            });
+          }
+        } catch (error) {
+          console.warn('[Terminal:CwdProof] IPC failed', { tabId, candidate: next, error });
+        }
+      }
+    } finally {
+      state.running = false;
+      if (state.pending !== undefined) {
+        submitOscCwdCandidate(tabId, state.pending);
+      } else if (oscCwdCandidateStates.get(tabId) === state) {
+        oscCwdCandidateStates.delete(tabId);
+      }
+    }
+  })();
+};
+
+const handleOscCwdCandidate = (tabId: string, data: string): void => {
+  try {
+    const newCwd = data.startsWith('file://')
+      ? decodeURIComponent(new URL(data).pathname)
+      : data;
+    if (newCwd && newCwd.startsWith('/')) {
+      console.log('[Terminal] OSC 7 cwd candidate:', newCwd);
+      submitOscCwdCandidate(tabId, newCwd);
+    }
+  } catch (error) {
+    console.error('[Terminal] OSC 7 parse error:', error);
+  }
 };
 
 // Get pending action for a tab (used for fork, continue, etc.)
@@ -2219,22 +2290,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       // OSC 7 handler - shell reports current working directory
       // Format: file://hostname/path or just /path
       term.parser.registerOscHandler(7, (data: string) => {
-        try {
-          let newCwd: string;
-          if (data.startsWith('file://')) {
-            const url = new URL(data);
-            newCwd = decodeURIComponent(url.pathname);
-          } else {
-            newCwd = data;
-          }
-          if (newCwd && newCwd.startsWith('/')) {
-            console.log('[Terminal] OSC 7 cwd update:', newCwd);
-            getUpdateTabCwd()(tabId, newCwd);
-            ipcRenderer.send('terminal:updateCwd', { tabId, cwd: newCwd });
-          }
-        } catch (e) {
-          console.error('[Terminal] OSC 7 parse error:', e);
-        }
+        handleOscCwdCandidate(tabId, data);
         return true;
       });
 
@@ -2885,22 +2941,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
         // OSC 7 handler - shell reports current working directory
         term.parser.registerOscHandler(7, (data: string) => {
-          try {
-            let newCwd: string;
-            if (data.startsWith('file://')) {
-              const url = new URL(data);
-              newCwd = decodeURIComponent(url.pathname);
-            } else {
-              newCwd = data;
-            }
-            if (newCwd && newCwd.startsWith('/')) {
-              console.log('[Terminal] OSC 7 cwd update:', newCwd);
-              getUpdateTabCwd()(tabId, newCwd);
-              ipcRenderer.send('terminal:updateCwd', { tabId, cwd: newCwd });
-            }
-          } catch (e) {
-            console.error('[Terminal] OSC 7 parse error:', e);
-          }
+          handleOscCwdCandidate(tabId, data);
           return true;
         });
 

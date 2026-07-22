@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { _api } = require('./codex-data');
+const { classifyCodexTurnRecord } = require('../codex-turn-outcome');
 
 function sessionMeta(payload) {
   return JSON.stringify({
@@ -103,4 +104,77 @@ test('findLatestCodexSession preserves source-chain matching from metadata recor
   assert.equal(found?.sessionId, 'matching-current');
   assert.equal(found?.filePath, matchingPath);
   assert.equal(found?.sourceMatched, true);
+});
+
+test('linked live boundary ignores copied history timestamps and keeps a late large live turn', async (t) => {
+  const sessionsDir = await makeSessionsDir(t);
+  const filePath = path.join(sessionsDir, 'resume-child.jsonl');
+  const launchedAt = Date.parse('2026-07-22T16:04:48.959Z');
+  const linesBeforeLive = [
+    sessionMeta({
+      id: 'resume-child',
+      cwd: '/tmp/project',
+      timestamp: '2026-07-22T16:04:48.959Z',
+      forked_from_id: 'resume-source',
+      originator: 'codex-tui',
+    }),
+    JSON.stringify({
+      timestamp: '2026-07-22T16:04:50.200Z',
+      type: 'event_msg',
+      payload: { type: 'task_started', turn_id: 'copied-turn', started_at: 1784730000 },
+    }),
+    JSON.stringify({
+      timestamp: '2026-07-22T16:04:50.210Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'copied-turn', started_at: 1784730000 },
+    }),
+  ];
+  const liveLine = JSON.stringify({
+    timestamp: '2026-07-22T16:20:54.495Z',
+    type: 'event_msg',
+    payload: { type: 'task_started', turn_id: 'live-turn', started_at: 1784737254 },
+  });
+  const prefix = linesBeforeLive.join('\n') + '\n';
+  await fs.promises.writeFile(
+    filePath,
+    prefix + liveLine + '\n' + JSON.stringify({ type: 'response_item', payload: 'x'.repeat(9 * 1024 * 1024) }) + '\n',
+    'utf8',
+  );
+
+  const boundary = await _api.findCodexLinkedLiveBoundary(filePath, { startedAtMs: launchedAt });
+
+  assert.equal(boundary.found, true);
+  assert.equal(boundary.turnId, 'live-turn');
+  assert.equal(boundary.offset, Buffer.byteLength(prefix));
+
+  const stat = await fs.promises.stat(filePath);
+  const liveRange = await _api.readJsonlRange(filePath, boundary.offset, stat.size - 1);
+  const tracker = {};
+  let latest = null;
+  for (const record of liveRange.records) {
+    latest = classifyCodexTurnRecord(tracker, record) || latest;
+  }
+  assert.equal(latest?.turnId, 'live-turn');
+  assert.equal(latest?.busy, true);
+
+  await fs.promises.appendFile(filePath, JSON.stringify({
+    timestamp: '2026-07-22T16:38:00.465Z',
+    type: 'event_msg',
+    payload: {
+      type: 'task_complete',
+      turn_id: 'live-turn',
+      started_at: 1784737254,
+      last_agent_message: 'Done.',
+    },
+  }) + '\n');
+  const completedStat = await fs.promises.stat(filePath);
+  const completedRange = await _api.readJsonlRange(filePath, boundary.offset, completedStat.size - 1);
+  const completedTracker = {};
+  latest = null;
+  for (const record of completedRange.records) {
+    latest = classifyCodexTurnRecord(completedTracker, record) || latest;
+  }
+  assert.equal(latest?.turnId, 'live-turn');
+  assert.equal(latest?.busy, false);
+  assert.equal(latest?.reason, 'task_complete');
 });

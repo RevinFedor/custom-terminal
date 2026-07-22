@@ -1311,6 +1311,109 @@ function getCodexForkLiveStartLine(records, meta) {
   return undefined;
 }
 
+async function findCodexLinkedLiveBoundary(filePath, options = {}) {
+  const metadata = await readCodexSessionMetadata(filePath);
+  const meta = metadata.meta || {};
+  const metadataStartedAtMs = parseTimestampMs(meta.timestamp);
+  const requestedStartedAtMs = Number(options.startedAtMs);
+  const liveThresholdMs = Number.isFinite(metadataStartedAtMs)
+    ? metadataStartedAtMs - 1000
+    : (Number.isFinite(requestedStartedAtMs) ? requestedStartedAtMs - 1000 : null);
+
+  let pending = Buffer.alloc(0);
+  let pendingStart = 0;
+  let nextChunkOffset = 0;
+  let scannedLines = 0;
+
+  const inspectLine = (lineBuffer, byteOffset) => {
+    scannedLines += 1;
+    const line = lineBuffer.toString('utf8').trim();
+    if (!line.includes('"task_started"') || !line.includes('"event_msg"')) return null;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      return null;
+    }
+    if (record?.type !== 'event_msg' || record.payload?.type !== 'task_started') return null;
+
+    const rawStartedAt = Number(record.payload.started_at);
+    const payloadStartedAtMs = Number.isFinite(rawStartedAt)
+      ? (rawStartedAt > 1e12 ? rawStartedAt : rawStartedAt * 1000)
+      : null;
+    const recordStartedAtMs = parseTimestampMs(record.timestamp);
+    const isLive = Number.isFinite(liveThresholdMs)
+      ? (Number.isFinite(payloadStartedAtMs)
+        ? payloadStartedAtMs >= liveThresholdMs
+        : Number.isFinite(recordStartedAtMs) && recordStartedAtMs >= liveThresholdMs + 2000)
+      : true;
+    if (!isLive) return null;
+    return {
+      byteOffset,
+      turnId: record.payload.turn_id || null,
+      startedAtMs: payloadStartedAtMs,
+      recordTimestamp: record.timestamp || null,
+    };
+  };
+
+  const stream = fs.createReadStream(filePath, { highWaterMark: CODEX_JSONL_READ_CHUNK_BYTES });
+  for await (const chunk of stream) {
+    const chunkStart = nextChunkOffset;
+    nextChunkOffset += chunk.length;
+    const data = pending.length > 0 ? Buffer.concat([pending, chunk]) : chunk;
+    const dataStart = pending.length > 0 ? pendingStart : chunkStart;
+    let cursor = 0;
+    let newlineIndex = data.indexOf(0x0a, cursor);
+    while (newlineIndex >= 0) {
+      const hit = inspectLine(data.subarray(cursor, newlineIndex), dataStart + cursor);
+      if (hit) {
+        stream.destroy();
+        return {
+          found: true,
+          offset: hit.byteOffset,
+          scannedBytes: nextChunkOffset,
+          scannedLines,
+          sessionId: meta.id || null,
+          metadataStartedAtMs: Number.isFinite(metadataStartedAtMs) ? metadataStartedAtMs : null,
+          ...hit,
+        };
+      }
+      cursor = newlineIndex + 1;
+      newlineIndex = data.indexOf(0x0a, cursor);
+    }
+    pending = Buffer.from(data.subarray(cursor));
+    pendingStart = dataStart + cursor;
+  }
+
+  if (pending.length > 0) {
+    const hit = inspectLine(pending, pendingStart);
+    if (hit) {
+      return {
+        found: true,
+        offset: hit.byteOffset,
+        scannedBytes: nextChunkOffset,
+        scannedLines,
+        sessionId: meta.id || null,
+        metadataStartedAtMs: Number.isFinite(metadataStartedAtMs) ? metadataStartedAtMs : null,
+        ...hit,
+      };
+    }
+  }
+
+  return {
+    found: false,
+    // Keep an incomplete final JSONL record inside the live watcher boundary.
+    offset: pending.length > 0 ? pendingStart : nextChunkOffset,
+    scannedBytes: nextChunkOffset,
+    scannedLines,
+    sessionId: meta.id || null,
+    metadataStartedAtMs: Number.isFinite(metadataStartedAtMs) ? metadataStartedAtMs : null,
+    turnId: null,
+    startedAtMs: null,
+    recordTimestamp: null,
+  };
+}
+
 function getTimelineSessionMeta(records) {
   const metaRecord = getSessionMetaRecord(records);
   const meta = metaRecord?.payload || {};
@@ -4711,6 +4814,7 @@ module.exports = {
   register,
   findCodexSessionFile,
   findLatestCodexSession,
+  findCodexLinkedLiveBoundary,
   buildCodexTimeline,
   buildCodexFullHistory,
   buildCodexCleanExport,
@@ -4725,6 +4829,7 @@ module.exports = {
     listCodexModels,
     findCodexSessionFile,
     findLatestCodexSession,
+    findCodexLinkedLiveBoundary,
     readCodexSessionMetadata,
     parseJsonlFile,
     readJsonlRange,

@@ -1,9 +1,9 @@
 # Feature: Reopen Last Closed Tab (Shift+Cmd+T)
 
 ## Intro
-VS Code-стиль: `Shift+Cmd+T` возвращает последнюю закрытую вкладку текущего проекта обратно в TabBar. Повторное нажатие восстанавливает предпоследнюю, и так далее, пока история не опустеет. Источник — та же таблица `tab_history`, что и History-секция в `ProjectHome`; реализация переиспользует существующий `restoreTab`-flow (pendingAction → createTab), а не дублирует его.
+VS Code-стиль: `Shift+Cmd+T` возвращает последнюю закрытую вкладку текущего проекта обратно в TabBar. Повторное нажатие восстанавливает предпоследнюю, и так далее, пока история не опустеет. Источник — та же таблица `tab_history`, что и History-секция в `ProjectHome`; Home и хоткей идут через один store-flow с общими CWD-проверками, созданием вкладки, durable save и commit истории.
 
-Source: `src/renderer/App.tsx::handleReopenLastClosedCapture`, `src/renderer/store/useWorkspaceStore.ts::reopenLastClosedTab`, `src/main/main.js::project:reopen-last-closed-tab`, `src/main/database.js::popLatestTabHistory`.
+Source: `src/renderer/App.tsx::handleReopenLastClosedCapture`, `src/renderer/store/useWorkspaceStore.ts::restoreTabHistoryEntry/reopenLastClosedTab`, `src/main/main.js::project:begin-tab-history-restore/project:finish-tab-history-restore`, `src/main/database.js::getLatestTabHistory/getTabHistoryEntry/deleteTabHistoryEntry`.
 
 ## Behavior
 
@@ -17,28 +17,28 @@ Source: `src/renderer/App.tsx::handleReopenLastClosedCapture`, `src/renderer/sto
 
 Мы намеренно сохраняем только id контейнера, не snapshot группы. Если пользователь к моменту restore удалил папку через Delete Group или Close Group, вкладка восстанавливается плоско: история отвечает за рабочую сессию, а не за воскресение удалённой структуры сайдбара. Иначе закрытая вкладка могла бы незаметно вернуть папку, которую пользователь уже убрал.
 
-### Continue Session — авто-decision по live-state
-Для Claude/Gemini-вкладок ключевой вопрос: запускать ли `claude-c --resume <sessionId>` при reopen, или просто открыть таб без процесса. Решение зависит от того, **был ли CLI жив на момент закрытия**:
+### Continue Session — политика зависит от точки входа
+Для Claude/Gemini/Codex-вкладок ключевой вопрос: запускать ли сохранённую AI-сессию при restore, или просто открыть таб без процесса. У двух явных жестов разные ожидания, но они используют один механизм:
 
-- Был жив (OSC 133 говорил «processing») → новая вкладка получает `pendingAction: { type: 'claude-continue', sessionId }`. Это тот же путь, что у `SessionActionChip → Continue` (см. `fact-ai-sessions.md::SessionActionChip`).
-- Был уже остановлен (юзер сам нажал Ctrl+C перед закрытием) → `pendingAction = undefined`. Таб открывается в idle-состоянии, юзер при желании жмёт Continue из InfoPanel.
+- **Shift+Cmd+T** восстанавливает процесс только когда `process_was_running=1`: это жест «верни только что случайно закрытое», но он не должен запускать завершённую работу заново.
+- **Resume в Home** всегда продолжает сохранённую AI-сессию, если её id есть: пользователь явно выбрал действие Resume после preview.
 
 Признак сохраняется в `tab_history.process_was_running` (0/1) на закрытии. Источник — `terminal:getCommandState` IPC (OSC 133-based, не PID-scan). Для `claude-sdk` табов аналогом служит `tab.claudeBusy` — тот же флаг, который читает `SessionActionChip` для tri-state Continue/Stop.
 
 Без этой логики reopen приводил бы к одному из двух плохих сценариев: либо всегда auto-resume → Claude запускается даже когда юзер хотел просто заархивировать историю → переплата токенов; либо никогда не resume → юзер закрыл живой Claude нечаянно и теряет процесс. Бинарный сигнал `processWasRunning` снимает оба этих случая.
 
-### Атомарный pop из истории
-Main-side handler `project:reopen-last-closed-tab` делает `SELECT ... ORDER BY closed_at DESC LIMIT 1` + `DELETE WHERE id = ?` в одной транзакции SQLite (метод `popLatestTabHistory`). Не два отдельных IPC, как при restore из ProjectHome. Иначе при двойном нажатии Shift+Cmd+T в течение 100мс оба бы прочитали одну и ту же top-row и попытались её восстановить.
+### Reserve → create → durable save → commit
+Выбор записи ещё не означает успешное восстановление. Main сначала выдаёт краткоживущую lease на конкретную history-row без удаления; Renderer проверяет CWD, создаёт вкладку, применяет позицию/группу и явно дожидается сохранения финального workspace в SQLite. Только после этого `finish(..., commit=true)` удаляет исходную запись. Ошибка создания или отмена освобождает lease и сохраняет историю; ошибка durable save оставляет уже открытую вкладку и history-row с видимым предупреждением, потому что удалять единственную надёжную копию нельзя.
 
-После delete запись пропадает и из History в ProjectHome — это сознательно, тот же контракт, что у Restore-клика по карточке.
+Lease не даёт Home и хоткею одновременно восстановить одну строку, а per-project очередь Shift+Cmd+T превращает быстрые повторные нажатия в последовательный проход назад по истории. Если предыдущая queued-операция не consumed row из-за cancel/create/save/cleanup failure, следующий уже поставленный keypress останавливается: иначе он немедленно создал бы второй live-tab из той же latest-row. Lease ограничена по времени: renderer reload/crash без `finish` не делает строку навсегда занятой. Это исправляет старую ошибочную модель, где начало операции принималось за её успех и запись удалялась до `createTab`.
 
 ### Layout-agnostic hotkey через `event.code`
 App-level capture listener: `e.metaKey && e.shiftKey && e.code === 'KeyT'` (см. `methodology/переносимый-дизайн.md::Layout-agnostic shortcuts`). На QWERTY/Cyrillic/Dvorak — одна и та же физическая клавиша T. `e.preventDefault + stopPropagation + stopImmediatePropagation` глушит событие до того, как его подхватит xterm `attachCustomKeyEventHandler` или composer textarea в SDK-табах. Double-safety guard в обоих `attachCustomKeyEventHandler` в `Terminal.tsx` — на случай, если capture-flow пропустит событие, xterm всё равно вернёт `false` и литерал `T` не попадёт в Claude TUI.
 
 Принцип — тот же, что у Opt+V picker'а: см. `fact-prompt-picker.md::Capture-phase listener`.
 
-### Поведение при пустой истории
-Если `tab_history` пуста для активного проекта, IPC возвращает `{ entry: null }`, store-action возвращает `{ tabId: null, reason: 'empty' }`, App.tsx показывает toast *«Нет закрытых вкладок»*. Без toast хоткей выглядел бы немым (наживаешь — ничего не происходит — непонятно, услышан ли).
+### Пустая история и ошибки видимы
+Если `tab_history` пуста для активного проекта, App показывает toast *«Нет закрытых вкладок»*. Состояние `busy`, отсутствующая директория, ошибка создания, сохранения или удаления истории тоже возвращаются из общего restore-flow как явный результат: хоткей и Home не должны молча исчезать вместе с записью.
 
 ### Synchronous pulse feedback на TabBar
 Между нажатием Shift+Cmd+T и появлением восстановленной вкладки проходит 300–800мс — это IPC round-trip к main + `terminal:create` + (если был жив процесс) Claude resume handshake через bracketed paste. На быстром железе незаметно, на свежем Claude-старте — хорошо видно. Без обратной связи хоткей кажется глухим: юзер успевает повторно нажать, думая что первое нажатие не дошло.
@@ -62,22 +62,23 @@ ALTER TABLE tab_history ADD COLUMN process_was_running INTEGER DEFAULT 0;
 ALTER TABLE tab_history ADD COLUMN group_id TEXT DEFAULT NULL;
 ```
 
-Старые записи (созданные до миграции) попадают с `position=NULL`, `process_was_running=0`, `group_id=NULL`, `name_set_manually=0`. Поведение для них: вкладка восстанавливается в конец TabBar, без auto-continue и без group assignment. Это совместимо со старым `ProjectHome::restoreTab`, который и сейчас даёт `pendingAction = 'claude-continue'` если есть `claude_session_id` — просто Shift+Cmd+T здесь чуть консервативнее по умолчанию (только живой процесс).
+Старые записи (созданные до миграции) попадают с `position=NULL`, `process_was_running=0`, `group_id=NULL`, `name_set_manually=0`. Они восстанавливаются в конец TabBar и без group assignment. Home по явному Resume продолжает AI-сессию при наличии id; Shift+Cmd+T для такой старой записи открывает её idle, потому что доказательства живого процесса на момент закрытия нет.
 
 ## Path-зависимости
 
 | Файл | Что делает |
 |---|---|
-| `src/main/database.js` | Колонки `name_set_manually`, `position`, `process_was_running`, `group_id` в `tab_history`; `name_set_manually` в `tabs`. `archiveTab` принимает их. Новый метод `popLatestTabHistory(projectId)`. |
-| `src/main/main.js` | IPC `project:reopen-last-closed-tab` (pop + return). |
+| `src/main/database.js` | Колонки `name_set_manually`, `position`, `process_was_running`, `group_id` в `tab_history`; `archiveTab` принимает их. Read-by-id/latest отделён от удаления. |
+| `src/main/main.js` + `tab-history-restore-leases.js` | IPC begin/finish резервирует project-scoped row и удаляет её только при commit после успешного сохранения replacement. |
 | `src/renderer/store/useWorkspaceStore.ts::closeTab` | Перед archive снимает `commandState.isRunning` (OSC 133), position в main-зоне, `nameSetManually` и текущий `groupId`. |
-| `src/renderer/store/useWorkspaceStore.ts::reopenLastClosedTab` | Pop через IPC → validate `group_id` against live `workspace.tabGroups` → createTab с pendingAction (по condition `wasRunning`) и `nameSetManually` → re-order в Map по `position` → switchTab. |
-| `src/renderer/components/Workspace/ProjectHome.tsx::restoreTab` | Restore из Home использует тот же group-id validation, чтобы клик по history-card и Shift+Cmd+T не расходились по поведению. |
+| `src/renderer/store/useWorkspaceStore.ts::restoreTabHistoryEntry` | Общая транзакция Home/hotkey: begin lease → CWD preflight → create/reorder → awaited save → commit. Для Codex auto-fallback в project root разрешён только когда исходный путь равен проекту или был вложен в него. Похожий обрезанный basename и любой generic nearest parent — лишь предположение: UI показывает оба пути и требует подтверждения; fallback в `/` заменяется явным folder picker. |
+| `src/renderer/store/useWorkspaceStore.ts::reopenLastClosedTab` | Сериализует Shift+Cmd+T по проекту и выбирает консервативную политику Continue. |
+| `src/renderer/components/Workspace/ProjectHome.tsx::restoreTab` | Вызывает тот же общий restore-flow с явной Home-политикой Resume; при ошибке карточка остаётся в истории. |
 | `src/renderer/App.tsx::handleReopenLastClosedCapture` | Capture-phase keydown listener (`Shift+Cmd+T`). |
 | `src/renderer/components/Workspace/Terminal.tsx` (оба `attachCustomKeyEventHandler`) | Swallow Shift+Cmd+T чтобы `T` не утёк в PTY. |
 
 ## Связанные системы
-- **History в ProjectHome** (`fact-project-home.md`) — тот же `tab_history`. Restore-клик через карточку и Shift+Cmd+T теперь конкурируют за одни и те же записи: что бы ни сделал юзер первым, запись удаляется атомарно. Конкретно: `restoreTab` в ProjectHome.tsx использует пары `get-tab-history` + `delete-tab-history-entry`, наш hotkey — атомарный pop. Сосуществуют без коллизий, но если делать обе операции одновременно (что нереально для человека), state'ы могут разъехаться на одну запись — это acceptable.
+- **History в ProjectHome** (`fact-project-home.md`) — тот же `tab_history` и тот же reserve/create/save/commit flow. Home и Shift+Cmd+T могут конкурировать за запись, но lease разрешает только одного владельца; проигравшая точка входа получает `busy`, а не дубликат или потерю строки.
 - **SessionActionChip Continue** (`fact-ai-sessions.md`) — тот же `pendingAction: claude-continue`, тот же путь IPC. Shift+Cmd+T здесь — фактически «закрыл живой Claude и сразу хочу его обратно».
 - **InterruptedOverlay** (`fix-interrupted-session-lifecycle.md`) — отдельный механизм для restore Claude-сессий **после краша приложения**. Не путать: Interrupted работает по `wasInterrupted` флагу таба, Shift+Cmd+T — по `tab_history` записи. Юзер закрыл вкладку в живом приложении → tab_history. Приложение упало → wasInterrupted.
 

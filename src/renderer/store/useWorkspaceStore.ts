@@ -8,6 +8,51 @@ import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs
 
 const { ipcRenderer } = window.require('electron');
 let tabGroupSaveSeq = 0;
+const SIDEBAR_SCROLL_SAVE_INTERVAL_MS = 150;
+type SidebarScrollSaveState = {
+  value: number;
+  dirty: boolean;
+  lastSentAt: number;
+  timer: ReturnType<typeof setTimeout> | null;
+};
+const sidebarScrollSaves = new Map<string, SidebarScrollSaveState>();
+
+const flushSidebarScrollSave = (projectId: string) => {
+  const state = sidebarScrollSaves.get(projectId);
+  if (!state?.dirty) return;
+  if (state.timer) clearTimeout(state.timer);
+  state.timer = null;
+  state.dirty = false;
+  state.lastSentAt = Date.now();
+  void ipcRenderer.invoke('project:save-sidebar-scroll-top', {
+    projectId,
+    scrollTop: state.value,
+  }).catch((error: unknown) => {
+    console.error('[Store] Failed to save sidebar scroll:', { projectId, error });
+  });
+};
+
+const scheduleSidebarScrollSave = (projectId: string, scrollTop: number) => {
+  const normalized = Number.isFinite(scrollTop) ? Math.max(0, scrollTop) : 0;
+  const state = sidebarScrollSaves.get(projectId) || {
+    value: normalized,
+    dirty: false,
+    lastSentAt: 0,
+    timer: null,
+  };
+  state.value = normalized;
+  state.dirty = true;
+  sidebarScrollSaves.set(projectId, state);
+
+  const remaining = SIDEBAR_SCROLL_SAVE_INTERVAL_MS - (Date.now() - state.lastSentAt);
+  if (remaining <= 0 && !state.timer) {
+    flushSidebarScrollSave(projectId);
+    return;
+  }
+  if (!state.timer) {
+    state.timer = setTimeout(() => flushSidebarScrollSave(projectId), Math.max(0, remaining));
+  }
+};
 
 const restoreShortId = (id: unknown): string => String(id ?? 'null').slice(-12);
 const restoreTabsSummary = (tabs: any[]): string => {
@@ -425,6 +470,46 @@ export interface PendingAction {
   developerInstructions?: string; // Codex external-run launch config
 }
 
+export interface TabHistoryRestoreEntry {
+  id: number;
+  project_id: string;
+  name: string;
+  name_set_manually?: number | null;
+  cwd: string;
+  color?: string | null;
+  notes?: string | null;
+  task_plan?: string | null;
+  command_type?: string | null;
+  tab_type?: string | null;
+  url?: string | null;
+  file_path?: string | null;
+  claude_session_id?: string | null;
+  gemini_session_id?: string | null;
+  codex_session_id?: string | null;
+  codex_model?: string | null;
+  codex_effort?: string | null;
+  position?: number | null;
+  process_was_running?: number | boolean | null;
+  session_status?: string | null;
+  group_id?: string | null;
+}
+
+export interface TabHistoryRestoreResult {
+  tabId: string | null;
+  historyId?: number;
+  reason?: 'empty' | 'busy' | 'cancelled' | 'error';
+  message?: string;
+  cwd?: string;
+  fallbackFrom?: string;
+  historyDeleteFailed?: boolean;
+}
+
+interface TabHistoryRestoreOptions {
+  background?: boolean;
+  restorePosition?: boolean;
+  resumePolicy?: 'always' | 'if-process-was-running';
+}
+
 interface Tab {
   id: string;
   name: string;
@@ -687,6 +772,7 @@ interface ProjectWorkspace {
   sidebarOpen: boolean;
   openFilePath: string | null;
   sidebarExpandedDirs: Record<string, boolean> | null;
+  sidebarScrollTop: number;
   currentView: 'terminal' | 'home'; // Per-project view state (Home vs Terminal)
   viewingSubAgentTabId: string | null; // When viewing a sub-agent, points to the Claude sub-agent tab
 }
@@ -797,6 +883,116 @@ const resolveExistingTabGroupId = (workspace: ProjectWorkspace | undefined, rawG
   return groupId;
 };
 
+const reopenLastClosedQueues = new Map<string, Promise<TabHistoryRestoreResult>>();
+
+const buildHistoryPendingAction = (
+  entry: TabHistoryRestoreEntry,
+  policy: TabHistoryRestoreOptions['resumePolicy'] = 'always'
+): PendingAction | undefined => {
+  if (policy === 'if-process-was-running' && !entry.process_was_running) return undefined;
+
+  if (entry.command_type === 'claude') {
+    return entry.claude_session_id
+      ? { type: 'claude-continue', sessionId: entry.claude_session_id }
+      : { type: 'claude-new' };
+  }
+  if (entry.command_type === 'gemini') {
+    return entry.gemini_session_id
+      ? { type: 'gemini-continue', sessionId: entry.gemini_session_id }
+      : { type: 'gemini-new' };
+  }
+  if (entry.command_type === 'codex') {
+    return entry.codex_session_id
+      ? { type: 'codex-continue', sessionId: entry.codex_session_id }
+      : { type: 'codex-new' };
+  }
+  return undefined;
+};
+
+const parseHistoryTaskPlan = (raw: string | null | undefined): TabTaskPlanDocument | undefined => {
+  if (!raw) return undefined;
+  try { return JSON.parse(raw) as TabTaskPlanDocument; }
+  catch { return undefined; }
+};
+
+const formatHistoryRestoreError = (entry: TabHistoryRestoreEntry, err: unknown): string => {
+  const raw = String((err as any)?.message || (err as any)?.stack || err || '');
+  const missing = raw.match(/working_directory_missing:([^\n]+)/);
+  if (missing) {
+    return `Папка вкладки больше не существует: ${missing[1].trim() || entry.cwd}`;
+  }
+  return 'Не удалось восстановить вкладку';
+};
+
+const normalizeComparablePath = (value: string | null | undefined): string => {
+  const clean = String(value || '').trim();
+  if (clean === '/') return clean;
+  return clean.replace(/\/+$/, '');
+};
+
+const resolveHistoryRestoreCwd = async (
+  entry: TabHistoryRestoreEntry,
+  projectPath: string
+): Promise<{
+  cwd: string;
+  fallbackFrom?: string;
+  requiresConfirmation?: boolean;
+  confirmationReason?: 'project-name-prefix' | 'nearest-existing-parent';
+}> => {
+  const originalCwd = entry.cwd || projectPath || '/';
+  if (entry.command_type !== 'codex') return { cwd: originalCwd };
+
+  try {
+    const nearest = await ipcRenderer.invoke('app:nearest-existing-directory', originalCwd);
+    if (nearest?.path && nearest.exact !== false) return { cwd: nearest.path };
+
+    const original = normalizeComparablePath(originalCwd);
+    const project = normalizeComparablePath(projectPath);
+    const originalSlash = original.lastIndexOf('/');
+    const projectSlash = project.lastIndexOf('/');
+    const originalParent = originalSlash > 0 ? original.slice(0, originalSlash) : '/';
+    const projectParent = projectSlash > 0 ? project.slice(0, projectSlash) : '/';
+    const originalBase = originalSlash >= 0 ? original.slice(originalSlash + 1) : original;
+    const projectBase = projectSlash >= 0 ? project.slice(projectSlash + 1) : project;
+    const looksLikeTruncatedProjectName = originalParent === projectParent
+      && originalBase.length >= 3
+      && projectBase.startsWith(originalBase);
+    const projectExists = !!project
+      && await ipcRenderer.invoke('app:check-path-exists', projectPath).catch(() => false);
+    const originalWasInsideProject = !!project && !!original && (
+      project === original || original.startsWith(project + '/')
+    );
+    if (projectExists && originalWasInsideProject) {
+      return { cwd: projectPath, fallbackFrom: originalCwd };
+    }
+    if (projectExists && looksLikeTruncatedProjectName) {
+      return {
+        cwd: projectPath,
+        fallbackFrom: originalCwd,
+        requiresConfirmation: true,
+        confirmationReason: 'project-name-prefix',
+      };
+    }
+
+    if (nearest?.path) {
+      return {
+        cwd: nearest.path,
+        fallbackFrom: originalCwd,
+        requiresConfirmation: true,
+        confirmationReason: 'nearest-existing-parent',
+      };
+    }
+    return { cwd: originalCwd };
+  } catch (err: any) {
+    console.warn(
+      '[TabHistoryRestore] cwd preflight failed historyId=' + entry.id +
+      ' cwd=' + originalCwd +
+      ' err=' + (err?.message || String(err))
+    );
+    return { cwd: originalCwd };
+  }
+};
+
 const isAiRuntimeTab = (tab?: Pick<Tab, 'commandType' | 'tabType'> | null): boolean => {
   return !!tab && (tab.tabType === 'claude-sdk' || tab.commandType === 'claude' || tab.commandType === 'gemini' || tab.commandType === 'codex');
 };
@@ -879,7 +1075,8 @@ interface WorkspaceStore {
   createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
   createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean }) => Promise<boolean>;
-  reopenLastClosedTab: (projectId: string) => Promise<{ tabId: string | null; reason?: 'empty' | 'error' }>;
+  restoreTabHistoryEntry: (projectId: string, historyId?: number, options?: TabHistoryRestoreOptions) => Promise<TabHistoryRestoreResult>;
+  reopenLastClosedTab: (projectId: string) => Promise<TabHistoryRestoreResult>;
   switchTab: (projectId: string, tabId: string) => void;
   setActiveTabGroup: (projectId: string, groupId: string | null) => void;
   renameTab: (projectId: string, tabId: string, newName: string) => void;
@@ -937,7 +1134,7 @@ interface WorkspaceStore {
   ) => void;
 
   // Update tab cwd
-  updateTabCwd: (projectId: string, tabId: string, newCwd: string) => void;
+  updateTabCwd: (projectId: string, tabId: string, newCwd: string) => Promise<boolean>;
   syncAllTabsCwd: (projectId: string) => Promise<void>;
 
   // Claude session tracking
@@ -1012,7 +1209,13 @@ interface WorkspaceStore {
   setOpenFilePath: (projectId: string, filePath: string | null) => void;
   rewriteFilePathReferences: (oldPath: string, newPath: string) => void;
   setSidebarExpandedDirs: (projectId: string, expandedDirs: Record<string, boolean>) => void;
-  getSidebarState: (projectId: string) => { sidebarOpen: boolean; openFilePath: string | null; sidebarExpandedDirs: Record<string, boolean> | null };
+  setSidebarScrollTop: (projectId: string, scrollTop: number) => void;
+  getSidebarState: (projectId: string) => {
+    sidebarOpen: boolean;
+    openFilePath: string | null;
+    sidebarExpandedDirs: Record<string, boolean> | null;
+    sidebarScrollTop: number;
+  };
 }
 
 const SESSION_KEY = 'workspace-session';
@@ -1291,6 +1494,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           sidebarOpen: isInbox ? false : (projectData?.sidebarOpen || false),
           openFilePath: isInbox ? null : (projectData?.openFilePath || null),
           sidebarExpandedDirs: isInbox ? null : (projectData?.sidebarExpandedDirs || null),
+          sidebarScrollTop: isInbox ? 0 : Math.max(0, Number(projectData?.sidebarScrollTop) || 0),
           currentView: isInbox && savedTabs.length === 0 ? 'home' : 'terminal',
           viewingSubAgentTabId: null
         };
@@ -1622,6 +1826,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         sidebarOpen: isInbox ? false : (projectData?.sidebarOpen || false),
         openFilePath: isInbox ? null : (projectData?.openFilePath || null),
         sidebarExpandedDirs: isInbox ? null : (projectData?.sidebarExpandedDirs || null),
+        sidebarScrollTop: isInbox ? 0 : Math.max(0, Number(projectData?.sidebarScrollTop) || 0),
         currentView: draft || isInbox ? 'home' : 'terminal',
         viewingSubAgentTabId: null
       };
@@ -2319,106 +2524,239 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     return true;
   },
 
-  // Shift+Cmd+T — pop the latest entry from tab_history for this project and
-  // recreate it. Position is restored as a hint (clamped if surrounding tabs
-  // changed). Claude/Gemini sessions auto-continue iff the underlying CLI was
-  // still alive at close time; if the user had already stopped the process
-  // before closing the tab, the restored tab just opens without firing claude-c.
-  reopenLastClosedTab: async (projectId) => {
-    const { openProjects, createTab, switchTab } = get();
-    const workspace = openProjects.get(projectId);
-    if (!workspace) return { tabId: null, reason: 'error' };
+  restoreTabHistoryEntry: async (projectId, historyId, options = {}) => {
+    const workspace = get().openProjects.get(projectId);
+    if (!workspace) {
+      return { tabId: null, reason: 'error', message: 'Проект не открыт' };
+    }
 
-    let resp: any;
+    let lease: any;
     try {
-      resp = await ipcRenderer.invoke('project:reopen-last-closed-tab', { projectId });
-    } catch (err) {
-      console.warn('[Reopen] IPC failed:', err);
-      return { tabId: null, reason: 'error' };
-    }
-    const entry = resp?.entry;
-    if (!entry) return { tabId: null, reason: 'empty' };
-
-    // Decide pendingAction: only auto-continue when the process was actually
-    // alive at close. Otherwise just open the tab in idle state — user can
-    // press Continue manually from InfoPanel if they want to resume.
-    const wasRunning = !!entry.process_was_running;
-    let pendingAction: PendingAction | undefined;
-    if (wasRunning) {
-      if (entry.command_type === 'claude' && entry.claude_session_id) {
-        pendingAction = { type: 'claude-continue', sessionId: entry.claude_session_id };
-      } else if (entry.command_type === 'gemini' && entry.gemini_session_id) {
-        pendingAction = { type: 'gemini-continue', sessionId: entry.gemini_session_id };
-      } else if (entry.command_type === 'codex' && entry.codex_session_id) {
-        pendingAction = { type: 'codex-continue', sessionId: entry.codex_session_id };
-      } else if (entry.command_type === 'claude') {
-        pendingAction = { type: 'claude-new' };
-      } else if (entry.command_type === 'gemini') {
-        pendingAction = { type: 'gemini-new' };
-      } else if (entry.command_type === 'codex') {
-        pendingAction = { type: 'codex-new' };
-      }
+      lease = await ipcRenderer.invoke('project:begin-tab-history-restore', {
+        projectId,
+        id: historyId,
+      });
+    } catch (error) {
+      console.warn('[TabHistoryRestore] begin IPC failed', { projectId, historyId, error });
+      return { tabId: null, reason: 'error', message: 'Не удалось прочитать историю вкладок' };
     }
 
-    // Compute insertion index using the saved position as a hint. Sub-agent /
-    // utility tabs don't take a TabBar slot, so the index is over main tabs
-    // only — same projection used in closeTab when we recorded the position.
+    if (!lease?.ok) {
+      const reason = lease?.reason === 'busy'
+        ? 'busy'
+        : (lease?.reason === 'not_found' ? 'empty' : 'error');
+      return {
+        tabId: null,
+        reason,
+        historyId: lease?.id ?? historyId,
+        message: reason === 'busy'
+          ? 'Эта вкладка уже восстанавливается'
+          : (reason === 'empty' ? 'Нет закрытых вкладок' : 'Не удалось начать восстановление вкладки'),
+      };
+    }
+
+    const entry = lease.entry as TabHistoryRestoreEntry;
+    const background = options.background === true;
     const mainTabIds = Array.from(workspace.tabs.values())
-      .filter(t => !t.parentTabId && !t.isUtility)
-      .map(t => t.id);
-    const hinted = typeof entry.position === 'number' ? entry.position : mainTabIds.length;
-    const targetIndex = Math.max(0, Math.min(mainTabIds.length, hinted));
+      .filter(tab => !tab.parentTabId && !tab.isUtility)
+      .map(tab => tab.id);
+    const hintedPosition = typeof entry.position === 'number' ? entry.position : mainTabIds.length;
+    const targetIndex = Math.max(0, Math.min(mainTabIds.length, hintedPosition));
     const restoredGroupId = resolveExistingTabGroupId(workspace, entry.group_id);
 
-    // createTab appends at the end of main zone — we then shuffle the new tab
-    // into the saved slot by rebuilding the Map in the right order. This avoids
-    // touching createTab itself, which has many call sites.
-    const newTabId = await createTab(projectId, entry.name, entry.cwd, {
-      color: (entry.color || undefined) as TabColor | undefined,
-      notes: entry.notes || undefined,
-      taskPlan: (() => {
-        if (!entry.task_plan) return undefined;
-        try { return JSON.parse(entry.task_plan); }
-        catch { return undefined; }
-      })(),
-      commandType: (entry.command_type || undefined) as CommandType | undefined,
-      tabType: (entry.tab_type || 'terminal') as TabType,
-      url: entry.url || undefined,
-      filePath: entry.file_path || undefined,
-      pendingAction,
-      claudeSessionId: entry.claude_session_id || undefined,
-      geminiSessionId: entry.gemini_session_id || undefined,
-      codexSessionId: entry.codex_session_id || undefined,
-      codexModel: entry.codex_model || undefined,
-      codexEffort: entry.codex_effort || undefined,
-      sessionStatus: entry.session_status || undefined,
-      nameSetManually: entry.name_set_manually === 1,
-      groupId: restoredGroupId,
-    });
-
-    // Re-order: pull the freshly-created tab out and splice it at targetIndex
-    // inside the main zone (utility tabs always stay after main).
-    const after = openProjects.get(projectId);
-    if (after && newTabId) {
-      const entries = Array.from(after.tabs.entries());
-      const newEntryIdx = entries.findIndex(([id]) => id === newTabId);
-      if (newEntryIdx !== -1) {
-        const newEntry = entries[newEntryIdx];
-        entries.splice(newEntryIdx, 1);
-
-        // Find where the main zone ends (first utility tab) in the
-        // post-removal array to clamp targetIndex inside it.
-        const utilStart = entries.findIndex(([, t]) => t.isUtility);
-        const mainEnd = utilStart === -1 ? entries.length : utilStart;
-        const clamped = Math.min(targetIndex, mainEnd);
-        entries.splice(clamped, 0, newEntry);
-        after.tabs = new Map(entries);
-        set({ openProjects: new Map(openProjects) });
-        saveTabsThenNotifyProjectLayoutChanged(after.projectId, after.tabs, 'tab-reopened');
+    const finishLease = async (commit: boolean) => {
+      try {
+        return await ipcRenderer.invoke('project:finish-tab-history-restore', {
+          projectId,
+          id: entry.id,
+          token: lease.token,
+          commit,
+        });
+      } catch (error) {
+        console.warn('[TabHistoryRestore] finish IPC failed', {
+          projectId,
+          historyId: entry.id,
+          commit,
+          error,
+        });
+        return { ok: false, reason: 'ipc_failed' };
       }
-      switchTab(projectId, newTabId);
+    };
+
+    const restoreCwd = await resolveHistoryRestoreCwd(entry, workspace.projectPath);
+    if (restoreCwd.requiresConfirmation) {
+      let confirmed = false;
+      if (normalizeComparablePath(restoreCwd.cwd) === '/') {
+        const selected = await ipcRenderer.invoke('app:select-directory').catch(() => null);
+        if (typeof selected === 'string' && selected.trim()) {
+          restoreCwd.cwd = selected;
+          confirmed = true;
+        }
+      } else {
+        const explanation = restoreCwd.confirmationReason === 'project-name-prefix'
+          ? 'Путь похож на обрезанное имя проекта, но это нельзя доказать автоматически.'
+          : 'Будет использована ближайшая существующая родительская папка.';
+        confirmed = window.confirm(
+          `Сохранённая папка Codex больше не существует:\n${entry.cwd}\n\n` +
+          `${explanation}\nПродолжить сессию в:\n${restoreCwd.cwd}?`
+        );
+      }
+      if (!confirmed) {
+        await finishLease(false);
+        return {
+          tabId: null,
+          historyId: entry.id,
+          reason: 'cancelled',
+          message: 'Восстановление отменено: запись истории сохранена',
+          cwd: restoreCwd.cwd,
+          fallbackFrom: restoreCwd.fallbackFrom,
+        };
+      }
     }
-    return { tabId: newTabId || null };
+
+    let newTabId = '';
+    try {
+      newTabId = await get().createTab(projectId, entry.name, restoreCwd.cwd, {
+        color: (entry.color || undefined) as TabColor | undefined,
+        notes: entry.notes || undefined,
+        taskPlan: parseHistoryTaskPlan(entry.task_plan),
+        commandType: (entry.command_type || undefined) as CommandType | undefined,
+        tabType: (entry.tab_type || 'terminal') as TabType,
+        url: entry.url || undefined,
+        filePath: entry.file_path || undefined,
+        pendingAction: buildHistoryPendingAction(entry, options.resumePolicy),
+        claudeSessionId: entry.claude_session_id || undefined,
+        geminiSessionId: entry.gemini_session_id || undefined,
+        codexSessionId: entry.codex_session_id || undefined,
+        codexModel: entry.codex_model || undefined,
+        codexEffort: entry.codex_effort || undefined,
+        sessionStatus: entry.session_status || undefined,
+        nameSetManually: entry.name_set_manually === 1,
+        groupId: restoredGroupId,
+        background,
+      });
+      if (!newTabId) throw new Error('create_tab_returned_empty');
+    } catch (error) {
+      await finishLease(false);
+      console.error('[TabHistoryRestore] create failed', {
+        projectId,
+        historyId: entry.id,
+        cwd: restoreCwd.cwd,
+        error,
+      });
+      return {
+        tabId: null,
+        historyId: entry.id,
+        reason: 'error',
+        message: formatHistoryRestoreError(entry, error),
+        cwd: restoreCwd.cwd,
+        fallbackFrom: restoreCwd.fallbackFrom,
+      };
+    }
+
+    const currentState = get();
+    const after = currentState.openProjects.get(projectId);
+    if (after && options.restorePosition) {
+      const entries = Array.from(after.tabs.entries());
+      const newEntryIndex = entries.findIndex(([id]) => id === newTabId);
+      if (newEntryIndex !== -1) {
+        const [newEntry] = entries.splice(newEntryIndex, 1);
+        const utilityStart = entries.findIndex(([, tab]) => tab.isUtility);
+        const mainEnd = utilityStart === -1 ? entries.length : utilityStart;
+        entries.splice(Math.min(targetIndex, mainEnd), 0, newEntry);
+        after.tabs = new Map(entries);
+        set({ openProjects: new Map(currentState.openProjects) });
+      }
+    }
+
+    // createTab schedules its normal persistence asynchronously. Restore needs
+    // a stronger durability boundary: await a save of the final (reordered)
+    // state before consuming the only history record.
+    const finalWorkspace = get().openProjects.get(projectId);
+    const persisted = finalWorkspace
+      ? await saveTabs(projectId, finalWorkspace.tabs)
+      : { success: false };
+    if (persisted?.success === false) {
+      await finishLease(false);
+      console.warn('[TabHistoryRestore] replacement is live but not durably saved; history retained', {
+        projectId,
+        historyId: entry.id,
+        tabId: newTabId,
+      });
+      if (!background) {
+        get().switchTab(projectId, newTabId);
+        get().setProjectView(projectId, 'terminal');
+      }
+      return {
+        tabId: newTabId,
+        historyId: entry.id,
+        cwd: restoreCwd.cwd,
+        fallbackFrom: restoreCwd.fallbackFrom,
+        historyDeleteFailed: true,
+        message: 'Вкладка открыта, но не сохранена в базе. Запись истории оставлена',
+      };
+    }
+    notifyProjectLayoutChanged(projectId, 'tab-reopened');
+
+    const committed = await finishLease(true);
+    const historyDeleteFailed = !committed?.ok || committed?.committed !== true;
+    if (historyDeleteFailed) {
+      console.warn('[TabHistoryRestore] replacement saved but history cleanup failed', {
+        projectId,
+        historyId: entry.id,
+        tabId: newTabId,
+        reason: committed?.reason || 'unknown',
+      });
+    }
+
+    if (!background) {
+      get().switchTab(projectId, newTabId);
+      get().setProjectView(projectId, 'terminal');
+    }
+    return {
+      tabId: newTabId,
+      historyId: entry.id,
+      cwd: restoreCwd.cwd,
+      fallbackFrom: restoreCwd.fallbackFrom,
+      historyDeleteFailed,
+      message: historyDeleteFailed
+        ? 'Вкладка восстановлена, но запись истории не удалось удалить'
+        : undefined,
+    };
+  },
+
+  // Shift+Cmd+T restores the latest row serially per project. Rapid repeated
+  // key presses walk backwards through History instead of racing on one row.
+  reopenLastClosedTab: (projectId) => {
+    const previous = reopenLastClosedQueues.get(projectId)
+      || Promise.resolve<TabHistoryRestoreResult>({ tabId: null });
+    const restore = previous
+      .catch((): TabHistoryRestoreResult => ({ tabId: null }))
+      .then((previousResult): Promise<TabHistoryRestoreResult> => {
+        // If the preceding queued operation did not consume its row, the same
+        // row is still latest. Do not turn a rapid second keypress into a
+        // duplicate live tab; a later deliberate keypress may retry it.
+        if (previousResult.historyId && (!previousResult.tabId || previousResult.historyDeleteFailed)) {
+          return Promise.resolve({
+            tabId: null,
+            historyId: previousResult.historyId,
+            reason: 'busy',
+            message: 'Предыдущее восстановление не завершено; повтор остановлен',
+          });
+        }
+        return get().restoreTabHistoryEntry(projectId, undefined, {
+          restorePosition: true,
+          resumePolicy: 'if-process-was-running',
+        });
+      });
+    reopenLastClosedQueues.set(projectId, restore);
+    const cleanup = () => {
+      if (reopenLastClosedQueues.get(projectId) === restore) {
+        reopenLastClosedQueues.delete(projectId);
+      }
+    };
+    void restore.then(cleanup, cleanup);
+    return restore;
   },
 
   switchTab: (projectId, tabId) => {
@@ -3486,18 +3824,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     notifyProjectLayoutChanged(workspace.projectId, 'tab-layout');
   },
 
-  updateTabCwd: (projectId, tabId, newCwd) => {
+  updateTabCwd: async (projectId, tabId, newCwd) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
 
-    if (workspace) {
-      const tab = workspace.tabs.get(tabId);
-      if (tab && tab.cwd !== newCwd) {
-        tab.cwd = newCwd;
-        set({ openProjects: new Map(openProjects) });
-        saveTabs(workspace.projectId, workspace.tabs);
-      }
+    if (!workspace) return false;
+    const tab = workspace.tabs.get(tabId);
+    if (!tab) return false;
+    if (tab.cwd !== newCwd) {
+      tab.cwd = newCwd;
+      set({ openProjects: new Map(openProjects) });
     }
+    const result = await saveTabs(workspace.projectId, workspace.tabs);
+    return result?.success !== false;
   },
 
   rewriteFilePathReferences: (oldPath, newPath) => {
@@ -4328,6 +4667,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         sidebarOpen: open,
         openFilePath: workspace.openFilePath
       });
+      if (!open) flushSidebarScrollSave(projectId);
     }
   },
 
@@ -4358,6 +4698,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
   },
 
+  setSidebarScrollTop: (projectId, scrollTop) => {
+    const workspace = get().openProjects.get(projectId);
+    if (!workspace) return;
+    const normalized = Number.isFinite(Number(scrollTop)) ? Math.max(0, Number(scrollTop)) : 0;
+    workspace.sidebarScrollTop = normalized;
+    scheduleSidebarScrollSave(projectId, normalized);
+  },
+
   getSidebarState: (projectId) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
@@ -4365,10 +4713,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       return {
         sidebarOpen: workspace.sidebarOpen,
         openFilePath: workspace.openFilePath,
-        sidebarExpandedDirs: workspace.sidebarExpandedDirs
+        sidebarExpandedDirs: workspace.sidebarExpandedDirs,
+        sidebarScrollTop: workspace.sidebarScrollTop
       };
     }
-    return { sidebarOpen: false, openFilePath: null, sidebarExpandedDirs: null };
+    return { sidebarOpen: false, openFilePath: null, sidebarExpandedDirs: null, sidebarScrollTop: 0 };
   }
 }));
 

@@ -366,6 +366,8 @@ function Sidebar({
   onCollapse,
   initialExpandedDirs,
   onExpandedDirsChange,
+  initialScrollTop = 0,
+  onScrollChange,
   linkOwnerProjectId = null,
   onLinkFile,
 }) {
@@ -1542,8 +1544,11 @@ function Sidebar({
       >
         {treeData.length > 0 && (
           <FileOutlineExplorer
+             key={folderPath}
              treeData={treeData}
              folderPath={folderPath}
+             initialScrollTop={initialScrollTop}
+             onScrollChange={onScrollChange}
              onFileSelect={handleFileSelect}
              activeFilePath={activeFilePath}
              customIcons={customIcons}
@@ -1558,6 +1563,7 @@ function Sidebar({
              
              // Editing props
              editingId={editingId}
+             onStartRename={node => setEditingId(node.id)}
              onCommitRename={handleCommitRename}
              onCancelRename={handleCancelRename}
              sidebarFocused={sidebarFocused}

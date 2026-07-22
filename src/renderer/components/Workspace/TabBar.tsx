@@ -863,6 +863,7 @@ interface TabItemProps {
   isEditing: boolean;
   editValue: string;
   onSwitch: (e: React.MouseEvent) => void; // Pass event for modifier checks
+  onRenameRequest: () => void;
   onClose: (e: React.MouseEvent) => void;
   onContextMenu: (e: React.MouseEvent) => void;
   onEditChange: (value: string) => void;
@@ -876,7 +877,7 @@ interface TabItemProps {
   commandType?: string; // Type of command running (devServer, claude, gemini, generic)
   onRestart?: (tabId: string) => void; // Restart process (deterministic stop + !!)
   onStop?: (tabId: string) => void; // Stop process (deterministic stop only)
-  onRunLastProjectCommand?: (tabId: string) => void; // Cmd+peek action → run latest project shell command
+  onRunLastProjectCommand?: (tabId: string) => void; // Persistent Play action → run latest shell command for this tab's cwd
   isStopping?: boolean; // Deterministic-stop is mid-cycle; lock the click + spin icon
   isInterrupted?: boolean; // Tab has an interrupted AI session
   draggingGroupIds?: string[]; // IDs of tabs being dragged as a group
@@ -884,7 +885,7 @@ interface TabItemProps {
   isDragTarget?: boolean; // Part of the atomic block currently used as the drop target
   isDragBlockedTarget?: boolean;
   isAnyDragging?: boolean;
-  cmdPeekMode?: boolean; // CMD held AND cursor in TabBar; exposes the last-command action.
+  cmdPeekMode?: boolean; // CMD held AND cursor in TabBar; enables alternate Restart actions (Stop/Clear).
   isCollapsed?: boolean; // Collapsed tab — icon-only
   hasSession?: boolean; // Whether tab has an active AI session
   isBusy?: boolean; // AI agent is actively thinking/streaming
@@ -928,6 +929,7 @@ const TabItem = memo(({
   isEditing,
   editValue,
   onSwitch,
+  onRenameRequest,
   onClose,
   onContextMenu,
   onEditChange,
@@ -976,6 +978,7 @@ const TabItem = memo(({
   const [isHovered, setIsHovered] = useState(false);
   const [isRestartButtonHovered, setIsRestartButtonHovered] = useState(false);
   const bodyCursorRef = useRef<string | null>(null);
+  const doubleClickRenameRef = useRef(false);
 
   const setDropIndicatorEdge = useCallback((edge: Edge | null) => {
     if (suppressDropIndicator) return;
@@ -1505,8 +1508,6 @@ const TabItem = memo(({
   const canShowVerticalActionSlot = isVerticalMode && tab.tabType !== 'file' && !(tab.color === 'green' && hasProcess);
   const canRunLastCommandHere = verticalActionIsPlainTerminalTab && !verticalActionIsAiRuntimeTab && !hasProcess && !sdkProcessAlive && !isBusy;
   const showVerticalLastCommandPlay = canShowVerticalActionSlot
-    && cmdPeekMode
-    && (isActive || effectiveHovered)
     && !!onRunLastProjectCommand
     && canRunLastCommandHere;
   const hasVerticalRightActionCluster = showVerticalLastCommandPlay || restartAfterConfigured || canShowVerticalRestartButton;
@@ -1788,7 +1789,22 @@ const TabItem = memo(({
         setIsPressing(true);
         setBodyGrabbing();
       }}
-      onClick={(e) => onSwitch(e)}
+      onClick={(e) => {
+        if (e.detail === 1) {
+          doubleClickRenameRef.current = tab.tabType !== 'file'
+            && !e.metaKey
+            && !e.ctrlKey
+            && !e.shiftKey;
+        }
+        onSwitch(e);
+      }}
+      onDoubleClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const shouldRename = doubleClickRenameRef.current;
+        doubleClickRenameRef.current = false;
+        if (shouldRename && !isEditing && !isAnyDragging) onRenameRequest();
+      }}
       onContextMenu={onContextMenu}
       onMouseEnter={() => {
         const lock = isTabbarDragVisualLockActive();
@@ -2250,8 +2266,8 @@ const TabItem = memo(({
           )}
 
           {/* Restart button — right-anchored in vertical mode. For restart-after tabs
-                it stays in the rightmost slot; optional Play and Pause render to
-                its left so Cmd-peek controls do not shove it sideways. Cmd-hover on
+                it stays in the rightmost slot; eligible Play and Pause actions render
+                to its left so modifier modes do not shove it sideways. Cmd-hover on
                 restart-after shows Clear; Cmd-hover on plain devServer shows Stop. */}
           {canShowVerticalRestartButton && (
             <button
@@ -3945,6 +3961,23 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             });
           }
           const tab = workspace?.tabs.get(tabId);
+          if (tab?.commandType === 'codex' || tab?.codexSessionId) {
+            try {
+              const turnState = await ipcRenderer.invoke('codex:get-turn-state', tabId);
+              if (turnState?.hasWatcher && !turnState.catchUpPending) {
+                const busy = turnState.busy === true;
+                setCodexBusyMap(prev => {
+                  if (prev.get(tabId) === busy) return prev;
+                  const next = new Map(prev);
+                  next.set(tabId, busy);
+                  return next;
+                });
+              }
+            } catch (e) {
+              console.warn('[TabBar:CodexBusyHydrate] failed tab=' + tabId.slice(-8)
+                + ' error=' + String((e as any)?.message || e));
+            }
+          }
           setSessionStatus(prev => {
             const val = !!tab?.claudeSessionId;
             if (prev.get(tabId) === val) return prev;
@@ -7101,6 +7134,14 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     setGroupEditValue(group.name);
   };
 
+  const startTabRename = (tab: TabData) => {
+    setEditingGroupId(null);
+    setGroupEditValue('');
+    setEditingTabId(tab.id);
+    setEditValue(tab.name);
+    setEditOriginalValue(tab.name);
+  };
+
   const handleCreateGroupWithRename = () => {
     const groupId = createTabGroup(projectId);
     if (!groupId) return;
@@ -7171,11 +7212,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const handleContextRename = () => {
     if (contextMenu) {
       const tab = workspace.tabs.get(contextMenu.tabId);
-      if (tab) {
-        setEditingTabId(contextMenu.tabId);
-        setEditValue(tab.name);
-        setEditOriginalValue(tab.name);
-      }
+      if (tab) startTabRename(tab);
     }
     setContextMenu(null);
   };
@@ -7931,6 +7968,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                         handleTabClick(event, tab.id);
                         if (!event.defaultPrevented) setProjectView(projectId, 'terminal');
                       }}
+                      onRenameRequest={() => startTabRename(tab)}
                       onClose={(event) => handleCloseTab(event, tab.id)}
                       onContextMenu={(event) => handleContextMenu(event, tab.id)}
                       onEditChange={setEditValue}
@@ -8044,6 +8082,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                       handleTabClick(e, tab.id);
                       if (!e.defaultPrevented) setProjectView(projectId, 'terminal');
                     }}
+                    onRenameRequest={() => startTabRename(tab)}
                     onClose={(e) => handleCloseTab(e, tab.id)}
                     onContextMenu={(e) => handleContextMenu(e, tab.id)}
                     onEditChange={setEditValue}
@@ -8475,6 +8514,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                     handleTabClick(e, tab.id);
                     if (!e.defaultPrevented) setProjectView(projectId, 'terminal');
                   }}
+                  onRenameRequest={() => startTabRename(tab)}
                   onClose={(e) => handleCloseTab(e, tab.id)}
                   onContextMenu={(e) => handleContextMenu(e, tab.id)}
                   onEditChange={setEditValue}
@@ -8677,6 +8717,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                           }
                           if (!e.defaultPrevented) setProjectView(projectId, 'terminal');
                         }}
+                        onRenameRequest={() => startTabRename(tab)}
                         onClose={(e) => handleCloseTab(e, tab.id)} // Close tab, not move to main
                         onContextMenu={(e) => handleContextMenu(e, tab.id)}
                         onEditChange={setEditValue}
@@ -8761,6 +8802,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                       handleTabClick(e, tab.id);
                       if (!e.defaultPrevented) setProjectView(projectId, 'terminal');
                     }}
+                    onRenameRequest={() => startTabRename(tab)}
                     onClose={(e) => handleCloseTab(e, tab.id)}
                     onContextMenu={(e) => handleContextMenu(e, tab.id)}
                     onEditChange={setEditValue}

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect, startTransition } from 'react';
-import { useWorkspaceStore, TabColor, TabType, PendingAction, type TabTaskPlanDocument } from '../../store/useWorkspaceStore';
+import { useWorkspaceStore, TabColor, TabType, PendingAction } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Tooltip from '../UI/Tooltip';
 // Fixed card widths so the wrap-grid stays uniform regardless of name length.
@@ -411,6 +411,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   const createTab = useWorkspaceStore((state) => state.createTab);
   const closeTab = useWorkspaceStore((state) => state.closeTab);
   const setProjectView = useWorkspaceStore((state) => state.setProjectView);
+  const restoreTabHistoryEntry = useWorkspaceStore((state) => state.restoreTabHistoryEntry);
   const workspaceFingerprint = useWorkspaceStore((state) => {
     const workspace = state.openProjects.get(projectId);
     if (!workspace) return 'missing';
@@ -738,13 +739,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     workspace ? Array.from(workspace.tabs.values()) : []
   ), [workspace, workspaceFingerprint]);
   const tabIdsKey = useMemo(() => tabs.map((tab) => tab.id).join('|'), [tabs]);
-  const resolveHistoryGroupId = useCallback((entry: TabHistoryEntry): string | undefined => {
-    const groupId = entry.group_id || undefined;
-    if (!groupId) return undefined;
-    const currentWorkspace = useWorkspaceStore.getState().openProjects.get(projectId);
-    return currentWorkspace?.tabGroups?.some(group => group.id === groupId) ? groupId : undefined;
-  }, [projectId]);
-
   useEffect(() => {
     const mountedAt = performance.now();
     console.warn(
@@ -799,54 +793,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     });
   }, [isLoaded, history, favorites, tabs.length, projectId, collapsedGroups]);
 
-  const buildHistoryPendingAction = (entry: TabHistoryEntry): PendingAction | undefined => {
-    let pendingAction: PendingAction | undefined;
-    if (entry.command_type === 'claude') {
-      if (entry.claude_session_id) {
-        pendingAction = { type: 'claude-continue', sessionId: entry.claude_session_id };
-      } else {
-        pendingAction = { type: 'claude-new' };
-      }
-    } else if (entry.command_type === 'gemini') {
-      if (entry.gemini_session_id) {
-        pendingAction = { type: 'gemini-continue', sessionId: entry.gemini_session_id };
-      } else {
-        pendingAction = { type: 'gemini-new' };
-      }
-    } else if (entry.command_type === 'codex') {
-      if (entry.codex_session_id) {
-        pendingAction = { type: 'codex-continue', sessionId: entry.codex_session_id };
-      } else {
-        pendingAction = { type: 'codex-new' };
-      }
-    }
-    return pendingAction;
-  };
-
-  const restoreErrorText = (entry: TabHistoryEntry, err: any): string => {
-    const raw = String(err?.message || err?.stack || err || '');
-    const missing = raw.match(/working_directory_missing:([^\n]+)/);
-    if (missing) return `Папка вкладки больше не существует: ${missing[1].trim() || entry.cwd}`;
-    return 'Не удалось восстановить вкладку';
-  };
-
-  const resolveHistoryRestoreCwd = async (entry: TabHistoryEntry): Promise<{ cwd: string; fallbackFrom?: string }> => {
-    const originalCwd = entry.cwd || project?.path || '/';
-    if (entry.command_type !== 'codex') return { cwd: originalCwd };
-
-    try {
-      const result = await ipcRenderer.invoke('app:nearest-existing-directory', originalCwd);
-      const resolved = typeof result?.path === 'string' && result.path ? result.path : originalCwd;
-      if (result?.path && result.exact === false) {
-        return { cwd: resolved, fallbackFrom: originalCwd };
-      }
-      return { cwd: resolved };
-    } catch (err: any) {
-      console.warn('[ProjectHome:Restore] cwd preflight failed historyId=' + entry.id + ' cwd=' + originalCwd + ' err=' + (err?.message || String(err)));
-      return { cwd: originalCwd };
-    }
-  };
-
   // Restore a closed tab from history. Foreground restore switches away from Home
   // only after successful PTY creation; otherwise a missing cwd would make Home
   // disappear even though no tab opened.
@@ -858,7 +804,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     restoreInFlightRef.current.add(entry.id);
     const started = performance.now();
     const background = mode === 'background';
-    const pendingAction = buildHistoryPendingAction(entry);
     const sessionId = entry.claude_session_id || entry.gemini_session_id || entry.codex_session_id || '';
     console.warn(
       '[ProjectHome:Restore] start' +
@@ -872,44 +817,34 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     );
 
     try {
-      const restoreCwd = await resolveHistoryRestoreCwd(entry);
-      const tabId = await createTab(projectId, entry.name, restoreCwd.cwd, {
-        color: (entry.color || undefined) as TabColor | undefined,
-        taskPlan: (() => {
-          if (!entry.task_plan) return undefined;
-          try { return JSON.parse(entry.task_plan) as TabTaskPlanDocument; }
-          catch { return undefined; }
-        })(),
-        commandType: entry.command_type as any || undefined,
-        tabType: (entry.tab_type || 'terminal') as TabType,
-        url: entry.url || undefined,
-        filePath: entry.file_path || undefined,
-        pendingAction,
-        claudeSessionId: entry.claude_session_id || undefined,
-        geminiSessionId: entry.gemini_session_id || undefined,
-        codexSessionId: entry.codex_session_id || undefined,
-        codexModel: entry.codex_model || undefined,
-        codexEffort: entry.codex_effort || undefined,
-        sessionStatus: entry.session_status || undefined,
-        nameSetManually: entry.name_set_manually === 1,
-        groupId: resolveHistoryGroupId(entry),
+      const result = await restoreTabHistoryEntry(projectId, entry.id, {
         background,
+        restorePosition: false,
+        resumePolicy: 'always',
       });
+      if (!result.tabId) {
+        const kind = result.reason === 'busy' || result.reason === 'cancelled' ? 'info' : 'error';
+        showToast(result.message || 'Не удалось восстановить вкладку', kind, 4500);
+        return;
+      }
 
-      if (!background) setProjectView(projectId, 'terminal');
-      await ipcRenderer.invoke('project:delete-tab-history-entry', { id: entry.id });
-      setHistory(prev => prev.filter(h => h.id !== entry.id));
-      setSelectedPreview(prev => (prev?.entry.id === entry.id ? null : prev));
-      if (restoreCwd.fallbackFrom) {
-        showToast(`Оригинальная папка удалена. Открыто в ${restoreCwd.cwd}`, 'warning', 6500, false, restoreCwd.fallbackFrom);
+      if (!result.historyDeleteFailed) {
+        setHistory(prev => prev.filter(h => h.id !== entry.id));
+        setSelectedPreview(prev => (prev?.entry.id === entry.id ? null : prev));
+      } else {
+        showToast(result.message || 'Вкладка открыта, но запись истории сохранена', 'warning', 6500);
+      }
+      if (result.fallbackFrom) {
+        showToast(`Оригинальная папка удалена. Открыто в ${result.cwd}`, 'warning', 6500, false, result.fallbackFrom);
       }
       console.warn(
         '[ProjectHome:Restore] success' +
         ' mode=' + mode +
         ' project=' + projectId.slice(-12) +
         ' historyId=' + entry.id +
-        ' tab=' + String(tabId || '').slice(-12) +
-        (restoreCwd.fallbackFrom ? ' cwdFallback=' + restoreCwd.fallbackFrom + '->' + restoreCwd.cwd : '') +
+        ' tab=' + String(result.tabId).slice(-12) +
+        (result.fallbackFrom ? ' cwdFallback=' + result.fallbackFrom + '->' + result.cwd : '') +
+        (result.historyDeleteFailed ? ' historyRetained=1' : '') +
         ' durMs=' + (performance.now() - started).toFixed(1)
       );
     } catch (err: any) {
@@ -923,7 +858,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         ' durMs=' + (performance.now() - started).toFixed(1),
         err?.stack || err?.message || err
       );
-      showToast(restoreErrorText(entry, err), 'error', 4500);
+      showToast('Не удалось восстановить вкладку', 'error', 4500);
     } finally {
       restoreInFlightRef.current.delete(entry.id);
     }

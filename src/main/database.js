@@ -52,6 +52,10 @@ class DatabaseManager {
         gemini_prompt TEXT DEFAULT 'вот моя проблема нужно чтобы ты понял что за проблема и на reddit поискал обсуждения. Не ограничивайся категориями. Проблема: ',
         notes_global TEXT DEFAULT '',
         tab_groups TEXT DEFAULT NULL,
+        sidebar_open INTEGER DEFAULT 0,
+        open_file_path TEXT DEFAULT NULL,
+        sidebar_expanded_dirs TEXT DEFAULT NULL,
+        sidebar_scroll_top REAL DEFAULT 0,
         created_at INTEGER DEFAULT (strftime('%s', 'now')),
         updated_at INTEGER DEFAULT (strftime('%s', 'now'))
       )
@@ -199,6 +203,9 @@ class DatabaseManager {
     } catch (e) { /* column already exists */ }
     try {
       this.db.exec(`ALTER TABLE projects ADD COLUMN sidebar_expanded_dirs TEXT DEFAULT NULL`);
+    } catch (e) { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE projects ADD COLUMN sidebar_scroll_top REAL DEFAULT 0`);
     } catch (e) { /* column already exists */ }
     try {
       this.db.exec(`ALTER TABLE projects ADD COLUMN tab_groups TEXT DEFAULT NULL`);
@@ -748,6 +755,9 @@ class DatabaseManager {
       sidebarOpen: project.sidebar_open === 1,
       openFilePath: project.open_file_path || null,
       sidebarExpandedDirs: project.sidebar_expanded_dirs ? JSON.parse(project.sidebar_expanded_dirs) : null,
+      sidebarScrollTop: Number.isFinite(Number(project.sidebar_scroll_top))
+        ? Math.max(0, Number(project.sidebar_scroll_top))
+        : 0,
       createdAt: project.created_at,
       updatedAt: project.updated_at,
       quickActions: globalCommands.map(gc => ({ name: gc.name, command: gc.command })),
@@ -817,6 +827,15 @@ class DatabaseManager {
         })()
       }))
     };
+  }
+
+  // OSC 7 proof is resolved in main, so persist the accepted value point-wise
+  // before acknowledging it to renderer. A full renderer save still follows,
+  // but this closes the crash window between live-process proof and SQLite.
+  updateTabCwd(tabId, cwd) {
+    if (!tabId || typeof cwd !== 'string' || !path.isAbsolute(cwd)) return false;
+    const info = this.db.prepare('UPDATE tabs SET cwd = ? WHERE tab_id = ?').run(cwd, tabId);
+    return info.changes > 0;
   }
 
   // Point-wise context% write (no renderer round-trip, no full-reinsert).
@@ -993,6 +1012,11 @@ class DatabaseManager {
   updateProjectSidebarExpandedDirs(projectId, expandedDirs) {
     const json = expandedDirs ? JSON.stringify(expandedDirs) : null;
     this.db.prepare('UPDATE projects SET sidebar_expanded_dirs = ? WHERE id = ?').run(json, projectId);
+  }
+
+  updateProjectSidebarScrollTop(projectId, scrollTop) {
+    const normalized = Number.isFinite(Number(scrollTop)) ? Math.max(0, Number(scrollTop)) : 0;
+    this.db.prepare('UPDATE projects SET sidebar_scroll_top = ? WHERE id = ?').run(normalized, projectId);
   }
 
   updateProjectTabGroups(projectId, groups) {
@@ -1210,15 +1234,19 @@ class DatabaseManager {
     return info.lastInsertRowid;
   }
 
-  // Pop the most recent tab_history entry for a project (for Shift+Cmd+T reopen).
-  // Returns the row and deletes it atomically so repeated calls walk backwards.
-  popLatestTabHistory(projectId) {
-    const row = this.db.prepare(
+  // Read the most recent restorable history entry without consuming it.
+  // Restore is a two-phase operation: the caller must create the replacement
+  // tab first and delete this row only after creation succeeds.
+  getLatestTabHistory(projectId) {
+    return this.db.prepare(
       "SELECT * FROM tab_history WHERE project_id = ? AND (tab_type IS NULL OR tab_type != 'file') ORDER BY closed_at DESC, id DESC LIMIT 1"
     ).get(projectId);
-    if (!row) return null;
-    this.db.prepare('DELETE FROM tab_history WHERE id = ?').run(row.id);
-    return row;
+  }
+
+  getTabHistoryEntry(id, projectId) {
+    return this.db.prepare(
+      "SELECT * FROM tab_history WHERE id = ? AND project_id = ? AND (tab_type IS NULL OR tab_type != 'file') LIMIT 1"
+    ).get(id, projectId);
   }
 
   getTabHistory(projectId, limit = 0) {
@@ -1248,7 +1276,8 @@ class DatabaseManager {
   }
 
   deleteTabHistoryEntry(id) {
-    this.db.prepare('DELETE FROM tab_history WHERE id = ?').run(id);
+    const info = this.db.prepare('DELETE FROM tab_history WHERE id = ?').run(id);
+    return info.changes > 0;
   }
 
   updateTabHistoryTitle(id, name, nameSetManually = true) {

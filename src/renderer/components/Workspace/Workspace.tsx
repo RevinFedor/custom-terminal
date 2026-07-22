@@ -53,9 +53,13 @@ export default function Workspace() {
   const getSidebarState = useWorkspaceStore((s) => s.getSidebarState);
   const setSidebarOpen = useWorkspaceStore((s) => s.setSidebarOpen);
   const setSidebarExpandedDirs = useWorkspaceStore((s) => s.setSidebarExpandedDirs);
+  const setSidebarScrollTop = useWorkspaceStore((s) => s.setSidebarScrollTop);
   const handleSidebarExpandedDirsChange = useCallback((expandedDirs: Record<string, boolean>) => {
     if (activeProjectId) setSidebarExpandedDirs(activeProjectId, expandedDirs);
   }, [activeProjectId, setSidebarExpandedDirs]);
+  const handleSidebarScrollChange = useCallback((scrollTop: number) => {
+    if (activeProjectId) setSidebarScrollTop(activeProjectId, scrollTop);
+  }, [activeProjectId, setSidebarScrollTop]);
   const setOpenFilePath = useWorkspaceStore((s) => s.setOpenFilePath);
   const rewriteFilePathReferences = useWorkspaceStore((s) => s.rewriteFilePathReferences);
   const createTabAfterCurrent = useWorkspaceStore((s) => s.createTabAfterCurrent);
@@ -883,11 +887,12 @@ export default function Workspace() {
       {(() => {
         if (isInboxProject) return null;
         if (!sidebarOpenForRender || !explorerPath) return null;
-        const { sidebarExpandedDirs } = getSidebarState(activeProjectId);
+        const { sidebarExpandedDirs, sidebarScrollTop } = getSidebarState(activeProjectId);
         const effectiveSidebarWidth = sidebarWidth || 280;
         return ReactDOM.createPortal(
           <div data-sidebar-portal style={{ position: 'fixed', left: 0, top: 70, bottom: 0, width: effectiveSidebarWidth, zIndex: 2147482000, borderRight: '1px solid #333', boxShadow: '4px 0 20px rgba(0,0,0,0.5)' }}>
             <Sidebar
+              key={activeProjectId}
               folderPath={explorerPath}
               width={effectiveSidebarWidth}
               fontSize={sidebarFontSize || 13}
@@ -897,6 +902,8 @@ export default function Workspace() {
               onRename={handleSidebarPathChanged}
               initialExpandedDirs={sidebarExpandedDirs}
               onExpandedDirsChange={handleSidebarExpandedDirsChange}
+              initialScrollTop={sidebarScrollTop}
+              onScrollChange={handleSidebarScrollChange}
               linkOwnerProjectId={activeProjectId}
               onLinkFile={handleLinkFileToTab}
               onFileSelect={(filePath: string, isDir: boolean) => {
