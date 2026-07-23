@@ -1,0 +1,737 @@
+/* ============================================================
+   @noted/claude-blocks — BLOCKS (правила отображения блоков)
+   ------------------------------------------------------------
+   Чистый CSS, БЕЗ Tailwind. Все цвета/шрифты берутся из токенов
+   theme.css (var(--cb-*)). Имена классов префиксованы `cb-`.
+
+   Это «как правильно рисовать tool-call / bash / diff / thinking /
+   markdown» в переносимом виде. Перенёс theme.css + blocks.css —
+   получил тот же рендер в любом проекте.
+   ============================================================ */
+
+/* ---- Спиннер running-статуса ------------------------------ */
+@keyframes cb-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+.cb-spin { animation: cb-spin 1s linear infinite; }
+
+/* ============================================================
+   MARKDOWN BODY (ответ ассистента)
+   ------------------------------------------------------------
+   `-webkit-font-smoothing: antialiased` — КЛЮЧЕВОЙ фикс «обычный
+   текст жирнее прописи»: на macOS дефолтный subpixel-AA рендерит
+   моно-шрифт на полвеса тяжелее. antialiased возвращает нормальный
+   вес (как в терминале, где .terminal-instance уже так делает).
+   ============================================================ */
+.cb-prose {
+  color: var(--cb-prose);
+  font-family: var(--cb-font-mono);
+  font-size: 1em;
+  line-height: var(--cb-lh-prose);
+  max-width: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+.cb-prose h1, .cb-prose h2, .cb-prose h3,
+.cb-prose h4, .cb-prose h5, .cb-prose h6 {
+  color: inherit;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.cb-prose h1 { font-size: 1.15em; margin: 16px 0 6px; font-weight: 700; }
+.cb-prose h2 { font-size: 1.08em; margin: 16px 0 6px; }
+.cb-prose h3 { font-size: 1em; margin: 12px 0 4px; }
+.cb-prose h4, .cb-prose h5, .cb-prose h6 { font-size: 1em; margin: 12px 0 4px; }
+/* Block spacing: было 2px — читалось как «сплошной текст», особенно в
+   HistoryPanel где парсер склеивает все text-блоки turn'а в один prose через
+   \n\n. 8px даёт видимый воздух между абзацами/списками (как в обычной
+   markdown-прописи), не раздувая плотность. Применяется ко всем потребителям
+   (SDK / HistoryPanel / mobile). */
+.cb-prose p { margin: 8px 0; line-height: 1.5; }
+.cb-prose p:first-child { margin-top: 0; }
+.cb-prose p:last-child { margin-bottom: 0; }
+.cb-prose ul, .cb-prose ol { margin: 8px 0; padding-left: 0; }
+.cb-prose ul { list-style: disc; list-style-position: inside; }
+.cb-prose ol { list-style: decimal; list-style-position: inside; }
+.cb-prose li { margin: 2px 0; line-height: 1.5; padding-left: 0; }
+.cb-prose li > p { margin: 0; display: inline; }
+.cb-prose li > * { margin: 0; }
+.cb-prose ul ul, .cb-prose ol ol,
+.cb-prose ul ol, .cb-prose ol ul { margin: 0; padding-left: 16px; }
+.cb-prose li::marker { color: var(--cb-marker); }
+.cb-prose strong { color: inherit; font-weight: 600; }
+.cb-prose em { font-style: italic; }
+.cb-prose a { color: inherit; text-decoration: underline; }
+.cb-prose blockquote {
+  margin: 8px 0;
+  padding-left: 12px;
+  border-left: 2px solid var(--cb-tool-border);
+  color: var(--cb-muted);
+  font-style: italic;
+}
+.cb-prose hr { border: none; border-top: 1px solid var(--cb-tool-border); margin: 12px 0; }
+/* table-layout: fixed + width:100% → columns split the row evenly instead of
+   auto-layout starving the narrow first column. Cells inherit word-break:break-word
+   from .cb-row-assistant, which collapses min-content to ~1 char and breaks words
+   mid-token ("Форма|т"); reset to normal + overflow-wrap so text wraps only at word
+   boundaries (user: «левая колонка по одному слову на строке — нужно по два, в ущерб
+   правым колонкам»). vertical-align:top keeps short cells aligned with tall ones. */
+.cb-prose table { margin: 12px 0; border-collapse: collapse; width: 100%; table-layout: fixed; }
+.cb-prose th, .cb-prose td { word-break: normal; overflow-wrap: break-word; vertical-align: top; }
+.cb-prose th { padding: 6px 12px; text-align: left; font-weight: 600; border: 1px solid var(--cb-tool-border); }
+.cb-prose td { padding: 6px 12px; border: 1px solid var(--cb-tool-border); }
+.cb-prose pre { background: transparent; padding: 0; margin: 0; border: 0; }
+/* inline `code` — hue-сдвиг как в Claude CLI, без pill/фона */
+.cb-prose :not(pre) > code { color: var(--cb-inline-code); }
+.cb-prose code::before, .cb-prose code::after { content: none; }
+
+/* ============================================================
+   MARKDOWN CODE BLOCK (```lang ... ```)
+   ============================================================ */
+.cb-code-block {
+  margin: 8px 0;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--cb-code-border);
+  background: var(--cb-code-bg);
+}
+.cb-code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 12px;
+  background: var(--cb-code-head-bg);
+  border-bottom: 1px solid var(--cb-code-head-border);
+  font-size: var(--cb-fs-small);
+}
+.cb-code-lang {
+  font-family: var(--cb-font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.025em;
+  color: var(--cb-muted);
+}
+.cb-code-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: var(--cb-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  transition: color 0.15s, background 0.15s;
+}
+.cb-code-copy:hover { color: #fff; background: rgba(255, 255, 255, 0.06); }
+.cb-code-copy[data-copied="true"] { color: var(--cb-done); }
+
+/* ============================================================
+   TOOL CALL — общий каркас (ToolCard)
+   Раскладка строки: [icon] LABEL [badges] (description) preview…
+   ============================================================ */
+.cb-tool { margin: 12px 60px 12px 0; }
+.cb-tool-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 -4px;
+  padding: 4px;
+  border-radius: 4px;
+  overflow: hidden;
+  transition: background 0.15s;
+}
+.cb-tool-head--clickable { cursor: pointer; }
+.cb-tool-head--clickable:hover { background: var(--cb-hover); }
+.cb-tool-ic { flex-shrink: 0; display: inline-flex; }
+.cb-tool-label {
+  flex-shrink: 0;
+  font-size: var(--cb-fs-label);
+  font-weight: 500;
+  color: var(--cb-label);
+  text-transform: uppercase;
+  letter-spacing: 0.025em;
+}
+.cb-tool-badges { flex-shrink: 0; display: inline-flex; align-items: center; gap: 4px; }
+/* description (the LLM's parenthetical, e.g. Bash) must SHRINK with ellipsis, not
+   hold full width and push the command preview off-screen on narrow viewports
+   (mobile). Capped so the command always gets room; the full text is shown in the
+   expanded body. */
+.cb-tool-desc {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 45%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: var(--cb-fs-label);
+  color: var(--cb-muted);
+}
+.cb-tool-preview {
+  min-width: 0;
+  flex: 1 1 0;
+  font-size: var(--cb-fs-content);
+  font-family: var(--cb-font-mono);
+  color: var(--cb-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cb-tool-sub {
+  margin: -2px -4px 0;
+  padding: 0 4px;
+  font-size: var(--cb-fs-label);
+  color: var(--cb-muted);
+  line-height: 1.25;
+  font-family: var(--cb-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+/* раскрытое тело — вертикальная линия слева вместо карточки */
+.cb-tool-body { margin-left: 8px; margin-top: 6px; padding-left: 12px; position: relative; }
+.cb-rail {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 6px;
+  border-left: 1px solid var(--cb-rail);
+}
+
+/* ---- утилиты статусных цветов (иконка/маркер) ------------- */
+.cb-c-running { color: var(--cb-running); }
+.cb-c-done { color: var(--cb-done); }
+.cb-c-error { color: var(--cb-error); }
+.cb-c-waiting { color: var(--cb-waiting); }
+.cb-c-add { color: var(--cb-diff-add); }
+.cb-c-del { color: var(--cb-diff-del); }
+.cb-c-muted { color: var(--cb-muted); }
+.cb-c-dim { color: var(--cb-dim); }
+.cb-italic-dim { font-style: italic; color: var(--cb-dim); }
+
+/* ============================================================
+   BASH
+   ============================================================ */
+.cb-bash-body { padding: 4px 0; }
+/* The LLM's description, shown in FULL (wrapped) at the top of the expanded body
+   — recovers a header that ellipsised on a narrow viewport. */
+.cb-bash-desc {
+  padding: 0 0 4px;
+  font-size: var(--cb-fs-label);
+  color: var(--cb-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.35;
+}
+.cb-bash-cmd {
+  padding: 4px 0;
+  font-size: var(--cb-fs-content);
+  font-family: var(--cb-font-mono);
+  color: var(--cb-text);
+  white-space: pre-wrap;
+  word-break: break-all;
+  line-height: 1.375;
+}
+
+/* ============================================================
+   READ — badge «N lines»
+   ============================================================ */
+.cb-read-badge {
+  font-size: var(--cb-fs-small);
+  color: var(--cb-dim);
+  font-family: var(--cb-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ============================================================
+   GENERIC TOOL — текстовый вывод
+   ============================================================ */
+.cb-generic-out {
+  margin: 0;
+  padding: 4px 0;
+  font-size: var(--cb-fs-content);
+  color: var(--cb-label);
+  font-family: var(--cb-font-mono);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+/* ============================================================
+   DIFF (Edit / Write / MultiEdit)
+   ============================================================ */
+.cb-diff {
+  font-family: var(--cb-font-mono);
+  font-size: var(--cb-fs-content);
+  line-height: var(--cb-lh-diff);
+  max-height: 320px;
+  overflow-y: auto;
+}
+.cb-diff-row { display: flex; align-items: flex-start; }
+/* Фон строк задаётся inline через токены (--cb-diff-add-bg/del-bg), эти
+   классы — семантические хуки для override в потребителе при желании. */
+.cb-diff-row--add {}
+.cb-diff-row--del {}
+.cb-diff-no {
+  user-select: none;
+  flex-shrink: 0;
+  text-align: right;
+  padding: 0 8px;
+  color: var(--cb-line-no);
+  font-variant-numeric: tabular-nums;
+  width: 3.5em;
+}
+.cb-diff-mark { user-select: none; width: 16px; flex-shrink: 0; text-align: center; }
+.cb-diff-code { white-space: pre-wrap; word-break: break-all; flex: 1; padding-right: 12px; }
+.cb-diff-stats { font-family: var(--cb-font-mono); font-variant-numeric: tabular-nums; }
+
+/* ============================================================
+   THINKING / REASONING
+   ============================================================ */
+.cb-think { margin: 12px 60px 12px 0; }
+.cb-think-btn {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  margin: 0 -4px;
+  padding: 4px;
+  font-size: var(--cb-fs-content);
+  color: var(--cb-label);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s, background 0.15s;
+  text-align: left;
+}
+.cb-think-btn:hover { color: #fff; background: var(--cb-hover); }
+.cb-think-ic { flex-shrink: 0; color: var(--cb-think); display: inline-flex; }
+.cb-think-label { font-weight: 500; }
+.cb-think-body {
+  padding: 4px 0;
+  font-size: 1em;
+  font-style: italic;
+  line-height: 1.625;
+  color: var(--cb-think-text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+/* ============================================================
+   Утилита: скрыть нативный скролл-резалт внутри подсветки
+   (SyntaxHighlighter сам ставит inline-стили, тут только хук)
+   ============================================================ */
+.cb-hl-scroll { scrollbar-width: thin; }
+
+/* ============================================================
+   ТРАНСКРИПТ ЧАТА — расположение сообщений, бабблы, бейджи.
+   Owns весь визуал строки чата. Скролл-контейнер/виртуализация —
+   у потребителя (расходится Virtuoso vs virtua), пакет рисует ряд.
+   ============================================================ */
+
+/* ---- ряды (row) с выравниванием по роли ------------------ */
+.cb-row { position: relative; }
+.cb-row-user { display: flex; justify-content: flex-end; padding: 6px 12px; }
+.cb-row-end { display: flex; justify-content: flex-end; padding: 4px 12px; }
+.cb-row-assistant { padding: 8px 14px; position: relative; }
+.cb-row-block { padding: 4px 12px; }
+.cb-row-system { padding: 8px 14px; text-align: center; }
+
+/* ---- user-сообщение -------------------------------------- */
+.cb-user-col { position: relative; display: flex; flex-direction: column; align-items: flex-end; max-width: 85%; }
+.cb-user-bubble {
+  background: var(--cb-user-bubble-bg);
+  border: 1px solid var(--cb-user-bubble-border);
+  border-radius: 14px;
+  border-bottom-right-radius: 4px;
+  padding: 8px 12px;
+  color: var(--cb-msg-text);
+  font-size: var(--cb-fs-base);
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-width: 100%;
+}
+.cb-msg-text { margin: 0; color: var(--cb-msg-text); white-space: pre-wrap; word-break: break-word; }
+.cb-user-parts { display: flex; flex-direction: column; gap: 6px; }
+
+/* ---- assistant ------------------------------------------- */
+.cb-row-assistant { color: var(--cb-assistant-text); font-size: var(--cb-fs-base); line-height: 1.5; word-break: break-word; }
+.cb-empty-dot { color: #555; }
+
+/* ---- queued-бейдж ---------------------------------------- */
+.cb-queued-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  margin-bottom: 4px; padding: 2px 6px; border-radius: 6px;
+  background: var(--cb-queued-bg); color: var(--cb-queued);
+  border: 1px solid var(--cb-queued-border);
+  font-size: 10px; font-weight: 600; letter-spacing: 0.04em; user-select: none;
+}
+.cb-queued-arrow { font-size: 9px; }
+
+/* ---- stopped-бейдж --------------------------------------- */
+.cb-stopped-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  margin-top: 0; padding: 2px 6px; border-radius: 4px;
+  background: var(--cb-stopped-bg); color: var(--cb-stopped);
+  border: 1px solid var(--cb-stopped-border);
+  font-size: 11px; line-height: 1; user-select: none;
+}
+
+/* ---- duration badge ("thought Xs", dim, end of an assistant reply) ---- */
+.cb-duration-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  margin-top: 0; font-size: 11px; line-height: 1;
+  color: var(--cb-muted); opacity: 0.65; user-select: none;
+}
+
+/* ---- слэш-чип -------------------------------------------- */
+.cb-slash-chip {
+  display: inline-flex; align-items: center;
+  padding: 4px 10px; border-radius: 8px;
+  background: var(--cb-slash-bg); color: var(--cb-slash);
+  border: 1px solid var(--cb-slash-border);
+  font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  user-select: none; max-width: 85%; word-break: break-all;
+}
+
+/* ---- pasted_content чип ---------------------------------- */
+.cb-paste-chip {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+  padding: 3px 8px; border-radius: 8px; font-size: 12px;
+  background: var(--cb-paste-chip-bg); color: var(--cb-paste-chip-text);
+  border: 1px solid var(--cb-paste-chip-border); cursor: pointer;
+}
+.cb-paste-chip:hover { filter: brightness(1.15); }
+.cb-paste-chip-preview { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cb-paste-chip-len { font-size: 10px; color: var(--cb-dim); flex-shrink: 0; }
+.cb-paste-chip-body {
+  margin: 6px 0 0; padding: 8px 10px; font-size: 12px; line-height: 1.45;
+  color: #aaa; background: var(--cb-paste-chip-body-bg);
+  border: 1px solid var(--cb-paste-chip-body-border); border-radius: 10px;
+  max-height: 200px; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+}
+
+/* ---- collapse-кнопки (раскрыть/свернуть) ----------------- */
+.cb-collapse-btn {
+  background: transparent; border: none; cursor: pointer; padding: 0;
+  color: var(--cb-paste-chip-text); font-size: 0.85em; user-select: none;
+  display: block; text-align: left;
+}
+.cb-collapse-btn:hover { filter: brightness(1.15); }
+.cb-collapse-top { margin-bottom: 4px; }
+.cb-collapse-bottom { margin-top: 6px; }
+
+/* ---- панель действий над сообщением ---------------------- */
+.cb-msg-actions {
+  position: absolute; top: 6px; z-index: 5;
+  opacity: 0; pointer-events: none; transition: opacity 120ms ease;
+}
+.cb-row-user:hover .cb-msg-actions,
+.group:hover .cb-msg-actions { opacity: 1; pointer-events: auto; }
+.cb-msg-actions-user { right: 100%; margin-right: 6px; }
+.cb-msg-actions-inner {
+  display: flex; align-items: center; gap: 2px;
+  background: var(--cb-action-bg); border: 1px solid var(--cb-action-border);
+  border-radius: 6px; padding: 2px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+}
+.cb-msg-action-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; border-radius: 4px; border: none; background: transparent;
+  color: var(--cb-muted); cursor: pointer; transition: color 120ms ease, background 120ms ease;
+}
+.cb-msg-action-btn:hover { color: #fff; background: var(--cb-action-hover); }
+
+/* ---- assistant footer: copy + duration + stopped --------- */
+.cb-assistant-meta-row {
+  display: flex; align-items: center; gap: 6px;
+  margin-top: 6px; min-height: 18px;
+}
+.cb-copy-btn {
+  font-size: 0.77em; padding: 2px 6px; border-radius: 4px;
+  background: var(--cb-action-bg); border: 1px solid var(--cb-action-border);
+  color: var(--cb-copy-idle); cursor: pointer; transition: background 120ms ease, color 120ms ease;
+}
+.cb-copy-btn:hover { background: #2a2a2a; }
+.cb-copy-btn-done { color: var(--cb-copy-done); }
+
+/* ---- compact summary карточка ---------------------------- */
+.cb-compact-card {
+  position: relative; border-radius: 12px; padding: 10px 12px;
+  background: var(--cb-compact-bg); border: 1px solid var(--cb-compact-border);
+}
+.cb-compact-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.cb-compact-label { font-size: 11px; font-weight: 700; letter-spacing: 0.5px; color: var(--cb-accent); text-transform: uppercase; }
+.cb-compact-metrics { font-size: 10px; color: var(--cb-compact-metrics); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.cb-compact-body { color: #d4d4d4; font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+.cb-compact-toggle { background: transparent; border: none; cursor: pointer; padding: 0; color: var(--cb-accent-soft); font-size: 12px; text-align: left; }
+.cb-compact-toggle-top { margin-bottom: 6px; }
+.cb-compact-toggle-bottom { margin-top: 6px; }
+
+/* ---- system / error -------------------------------------- */
+.cb-system-text { color: var(--cb-system-text); font-size: 0.85em; }
+.cb-error-box { background: var(--cb-error-bg); color: var(--cb-error-text); border-radius: 10px; padding: 8px 12px; font-size: 12px; }
+
+/* ============================================================
+   COMPOSABLE CONVERSATION SHELLS
+   ------------------------------------------------------------
+   Existing `.cb-row-*`, `.cb-user-*`, and `.cb-msg-actions-*` classes remain
+   the compatibility contract for ChatMessage/voice-record. The new semantic
+   classes are additive so runtime-driven hosts can use the same geometry
+   without adopting ChatEntry or package-owned behavior.
+   ============================================================ */
+.cb-message--editable .cb-user-bubble {
+  background: rgba(217, 119, 6, 0.08);
+  border-color: rgba(217, 119, 6, 0.48);
+}
+
+.cb-message-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-bottom: 4px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--cb-message-neutral-bg);
+  color: var(--cb-muted);
+  border: 1px solid var(--cb-message-neutral-border);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  user-select: none;
+}
+.cb-message-status--accent {
+  color: var(--cb-queued);
+  background: var(--cb-queued-bg);
+  border-color: var(--cb-queued-border);
+}
+.cb-message-status--info { color: var(--cb-message-info); }
+.cb-message-status--success { color: var(--cb-message-success); }
+.cb-message-status--warning { color: var(--cb-message-warning); }
+.cb-message-status--danger { color: var(--cb-message-danger); }
+.cb-message-status-meta {
+  color: var(--cb-dim);
+  font-weight: 500;
+  letter-spacing: 0;
+}
+.cb-message-status-spinner,
+.cb-composer-chip-spinner {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border: 1.5px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 999px;
+  animation: cb-spin 0.8s linear infinite;
+}
+
+.cb-message-actions--sticky-end {
+  position: sticky;
+  top: 4px;
+  z-index: 5;
+  float: right;
+  height: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+.cb-row-assistant:hover .cb-message-actions--sticky-end,
+.cb-row-assistant:focus-within .cb-message-actions--sticky-end {
+  opacity: 1;
+  pointer-events: auto;
+}
+.cb-message-actions--footer {
+  display: flex;
+  align-items: center;
+  margin-top: 6px;
+}
+.cb-message-actions--sticky-end .cb-message-actions-inner,
+.cb-message-actions--footer .cb-message-actions-inner {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--cb-action-border);
+  border-radius: 6px;
+  background: var(--cb-action-bg);
+}
+.cb-message-action-button--warning:hover { color: var(--cb-message-warning); }
+.cb-message-action-button--danger:hover { color: var(--cb-message-danger); }
+
+.cb-row-event { padding: 4px 12px; }
+.cb-message-event-card {
+  padding: 8px 12px;
+  border: 1px solid var(--cb-message-neutral-border);
+  border-left-width: 3px;
+  border-radius: 6px;
+  background: var(--cb-message-neutral-bg);
+}
+.cb-message--accent .cb-message-event-card { border-left-color: var(--cb-accent); }
+.cb-message--info .cb-message-event-card { border-left-color: var(--cb-message-info); }
+.cb-message--success .cb-message-event-card { border-left-color: var(--cb-message-success); }
+.cb-message--warning .cb-message-event-card { border-left-color: var(--cb-message-warning); }
+.cb-message--danger .cb-message-event-card {
+  border-left-color: var(--cb-message-danger);
+  background: var(--cb-error-bg);
+}
+.cb-message-event-status { margin-bottom: 0; }
+.cb-message-event-body {
+  margin-top: 5px;
+  color: var(--cb-msg-text);
+  font-size: var(--cb-fs-base);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ============================================================
+   COMPOSER FRAME + CHIPS
+   ------------------------------------------------------------
+   Hosts inject the actual input and callbacks. No positioning is fixed here:
+   an overlay-based History and an in-flow SDK footer can share this frame.
+   ============================================================ */
+.cb-composer-frame {
+  position: relative;
+  min-width: 0;
+  border: 1px solid var(--cb-composer-border);
+  border-radius: 12px;
+  background: var(--cb-composer-bg);
+  color: var(--cb-msg-text);
+}
+.cb-composer-frame--comfortable { padding: 8px; }
+.cb-composer-frame--compact { padding: 5px; border-radius: 8px; }
+.cb-composer-overlay {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  z-index: 10;
+}
+.cb-composer-topbar {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding: 0 2px 6px;
+  border-bottom: 1px solid var(--cb-composer-topbar-border);
+}
+.cb-composer-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 6px 2px 0;
+}
+.cb-composer-main {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  min-width: 0;
+  padding-top: 6px;
+}
+.cb-composer-input-slot { flex: 1 1 auto; min-width: 0; }
+.cb-composer-actions {
+  display: flex;
+  align-items: stretch;
+  flex: 0 0 auto;
+}
+.cb-composer-footer {
+  min-width: 0;
+  padding: 4px 2px 0;
+  color: var(--cb-dim);
+  font-size: var(--cb-fs-small);
+}
+
+.cb-composer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 240px;
+  padding: 3px 7px;
+  border: 1px solid var(--cb-composer-chip-stash-border);
+  border-radius: 7px;
+  background: var(--cb-composer-chip-stash-bg);
+  color: var(--cb-composer-chip-stash);
+  font-size: var(--cb-fs-label);
+  line-height: 1.2;
+  user-select: none;
+}
+.cb-composer-chip--interactive { cursor: pointer; }
+.cb-composer-chip--interactive:hover { filter: brightness(1.15); }
+.cb-composer-chip--interactive:focus-within {
+  outline: 1px solid currentColor;
+  outline-offset: 2px;
+}
+.cb-composer-chip-hit {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+button.cb-composer-chip-hit { cursor: pointer; }
+button.cb-composer-chip-hit:disabled { cursor: default; }
+.cb-composer-chip--prompt {
+  color: var(--cb-composer-chip-prompt);
+  background: var(--cb-composer-chip-prompt-bg);
+  border-color: var(--cb-composer-chip-prompt-border);
+}
+.cb-composer-chip--paste {
+  color: var(--cb-composer-chip-paste);
+  background: var(--cb-composer-chip-paste-bg);
+  border-color: var(--cb-composer-chip-paste-border);
+}
+.cb-composer-chip--image {
+  color: var(--cb-composer-chip-image);
+  background: var(--cb-composer-chip-image-bg);
+  border-color: var(--cb-composer-chip-image-border);
+}
+.cb-composer-chip--queued {
+  color: var(--cb-composer-chip-queued);
+  background: var(--cb-composer-chip-queued-bg);
+  border-color: var(--cb-composer-chip-queued-border);
+}
+.cb-composer-chip--stash {
+  color: var(--cb-composer-chip-stash);
+  background: var(--cb-composer-chip-stash-bg);
+  border-color: var(--cb-composer-chip-stash-border);
+}
+.cb-composer-chip--sent { opacity: 0.72; }
+.cb-composer-chip--error {
+  color: var(--cb-message-danger);
+  background: var(--cb-error-bg);
+  border-color: rgba(248, 113, 113, 0.42);
+}
+.cb-composer-chip--disabled { opacity: 0.45; cursor: default; }
+.cb-composer-chip-leading,
+.cb-composer-chip-trailing {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+.cb-composer-chip-content {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+}
+.cb-composer-chip-label { flex: 0 0 auto; font-weight: 650; }
+.cb-composer-chip-preview {
+  min-width: 0;
+  overflow: hidden;
+  color: color-mix(in srgb, currentColor 72%, var(--cb-msg-text));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cb-composer-chip-meta {
+  flex: 0 0 auto;
+  color: var(--cb-dim);
+  font-size: var(--cb-fs-small);
+  font-variant-numeric: tabular-nums;
+}

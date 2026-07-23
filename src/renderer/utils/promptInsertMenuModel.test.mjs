@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   appendHistoryDraftInsertion,
   buildProjectScriptRows,
+  clampFloatingPanelTop,
   isCurrentPickerGeneration,
   joinPromptInsertionText,
   resolveHistoryScriptCwd,
@@ -52,4 +53,14 @@ test('async picker completion only owns the generation it started in', () => {
   assert.equal(isCurrentPickerGeneration(3, 3), true);
   assert.equal(isCurrentPickerGeneration(3, 4), false);
   assert.equal(isCurrentPickerGeneration(0, 0), false);
+});
+
+test('a tall submenu clamps itself without changing its parent anchor', () => {
+  const rootTop = 700;
+  const childTop = clampFloatingPanelTop(rootTop, 460, 900, 8);
+
+  assert.equal(rootTop, 700);
+  assert.equal(childTop, 432);
+  assert.equal(clampFloatingPanelTop(20, 200, 900, 8), 20);
+  assert.equal(clampFloatingPanelTop(4, 1200, 900, 8), 8);
 });

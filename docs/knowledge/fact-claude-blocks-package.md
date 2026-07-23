@@ -108,6 +108,13 @@ mobile-web **не тянет** `lucide-react`. Встроенный SVG (`src/ic
 `build:claude-blocks`, нет dist, нет rsync, нет чистки `.vite`. Правка в пакете =
 мгновенный HMR в обоих потребителях.
 
+Source-alias создаёт отдельную delivery-ловушку: локальная сборка успешно читает
+даже ignored-файлы, поэтому работающий билд ещё не доказывает, что пакет попадёт
+в следующий checkout. Репозиторий исторически игнорирует `/packages/*`, но для
+`/packages/claude-blocks/` должна оставаться явная отрицательная маска в
+`.gitignore`; после изменений обязательно проверять, что весь пакет виден в
+`git status`, а не только импортирующие его потребители.
+
 ## Зависимости
 Пакет требует (peer): `react-markdown`, `remark-gfm`, `react-syntax-highlighter`,
 `unist-util-visit`. Десктоп их уже имел. **mobile-web доустановлен**
@@ -175,18 +182,41 @@ tools.Fallback с теми же именами.
   preview-раскрытием), `.cb-compact-card`, `.cb-msg-actions`/`.cb-copy-btn`.
   Все цвета — токены `--cb-*` (перекрашивается под бренд).
 - **НЕ owns**: скролл-контейнер/виртуализацию (расходится Virtuoso vs virtua —
-  остаётся у потребителя, пакет рисует ОДИН ряд), composer, выбор модели,
-  lifecycle процесса (SSE/JSONL/kill — дело потребителя).
+  остаётся у потребителя, пакет рисует ОДИН ряд), состояние composer, очередь,
+  выбор модели и lifecycle процесса (SSE/JSONL/kill — дело потребителя).
+  Внешнюю форму composer/message/status package теперь задаёт presentation-only
+  shell'ами, но данные и callbacks всегда приходят от host adapter.
 
-### Почему десктоп SDK НЕ переведён на `ChatMessage`
+### Desktop SDK: общий shell без переписывания runtime
 Десктоп **runtime-driven** (assistant-ui `MessagePrimitive`/`useMessage`): его
 `UserMsg`/`AssistantMsg` тянут роль/текст/части из рантайма, имеют inline edit-
 mode и runtime part-dispatch (`MessagePrimitive.Content` с Text/Reasoning/tools).
 Конвертировать в data-driven = переписать рабочий, тяжело-оттестированный код с
-риском регрессий (edit, repeat, queued, stopped). Десктоп остаётся **визуальным
-каноном**, который `ChatMessage` зеркалит; он уже потребляет блоки пакета
-(Markdown/ThinkBlock/ToolCallPart). Портабельный «весь чат» нужен для НОВЫХ
-потребителей (gt-editor) и мобилы — там `ChatMessage` и применён.
+риском регрессий (edit, repeat, queued, stopped). Поэтому SDK не переводится на
+data-driven `ChatMessage`, но его read-only user/assistant rows обёрнуты в общий
+`ConversationMessage`, а actions/status/events — в соседние presentation-shells.
+History использует те же shell'ы поверх JSONL adapter. Визуал один, источники
+истины остаются разными: SDK runtime не получает PTY queue/rollback, History не
+получает assistant-ui reducer.
+
+`ComposerFrame` задаёт общую геометрию top bar / chip strip / input / actions /
+footer, а `ComposerChip` — prompt/paste/queued/stash states. Host передаёт реальную
+textarea, состояние, submit/restore/delete callbacks и transport. Это сохраняет
+единый дизайн без скрытого «супер-компонента», который одновременно владел бы
+двумя несовместимыми lifecycle. Набор слотов тоже выбирает host: primary History
+намеренно не передаёт actions/footer и держит Mic/Enter/Pull/interrupt в нижней
+workspace control bar, тогда как SDK может иметь собственный внешний footer.
+Возвращать действия внутрь History «для симметрии» нельзя — это снова создаст
+две поверхности для одного send/stop/lifecycle.
+
+Voice Record пока использует из live source-пакета только message renderer, не
+`ComposerFrame`. При его будущей миграции переносится shell, но не runtime:
+там `pending` — глобальный union вложений оверлея, очередь — локальный renderer
+auto-drain, а transport ставит prompt/text/attachments в другом порядке. Эти
+контракты нельзя затянуть в History/SDK ради визуального сходства. Переносимая
+часть — resolved identity сохранённого prompt и правило «prompt всегда chip,
+ручной paste только выше порога»; custom-terminal уже сильнее защищает rollback,
+потому что merge/CAS не затирает draft, созданный после начала операции.
 
 ### Мобила: EntryView стал тонким адаптером
 Все per-kind карточки мобилы (`UserText`/`ThinkingCard`/`ToolCard`/
@@ -221,8 +251,10 @@ mode и runtime part-dispatch (`MessagePrimitive.Content` с Text/Reasoning/tool
 `Sparkles` (другой модуль). Потребитель — `voice-record/mobile-web`.
 
 ## API пакета (`src/index.ts`)
-Компоненты: `ChatMessage` (весь чат), `Markdown`, `MarkdownCodeBlock`,
-`ThinkBlock`, `ToolCard`, `ColoredToolIcon`, `DiffView`, `ToolCallPart`,
+Компоненты: `ChatMessage` (весь data-driven чат), `ConversationMessage`,
+`MessageStatusBadge`, `MessageActionRail`, `MessageActionButton`, `MessageEvent`,
+`ComposerFrame`, `ComposerChip`, `Markdown`, `MarkdownCodeBlock`, `ThinkBlock`,
+`ToolCard`, `ColoredToolIcon`, `DiffView`, `ToolCallPart`,
 `BashCard/ReadCard/EditCard/GenericToolCard`. Иконки: `TerminalIcon/FileEditIcon/
 RefreshCwIcon/PencilIcon/XIcon/SparklesIcon/.../toolIcon`. Хелперы: `detectLanguage, lineDiff,
 countDiffStats, extractRawText, toolStatusFrom, defaultOpenForTool, resultToText,
@@ -233,9 +265,9 @@ ChatRenderContext, DiffEntry, ToolStatus, CollapseInjection, ToolCardProps, ...`
 ChatMessage.tsx` (диспетчер по kind).
 
 ## Что НЕ переносили (специфичное, осталось у потребителя)
-- desktop: `useStableCollapseToggle` (scroll-compensation), `CompactSummaryMsg`,
-  `UserMsg`, slash-overlay, copy-button, эффорт-лейбл thinking — это не «блок
-  рендера сообщения», а обвязка таба.
+- desktop: `useStableCollapseToggle` (scroll-compensation), inline edit,
+  slash-overlay, queue/rollback, tab-scoped draft и эффорт-вычисление — это
+  поведение конкретного runtime, а не визуальная оболочка.
 - mobile: `CompactSummaryCard`, `CollapsibleText`, `ResultPreview`-логика
   (теперь вывод режет сам package через maxHeight+overflow), tab-list, композер.
 - `copyText()` в пакете host-agnostic: пробует Electron-clipboard, фоллбэк на

@@ -7,6 +7,11 @@ import {
   hasMalformedPromptImageMarker,
   retainPromptImageRefsForText,
 } from '../utils/promptImageAttachments.mjs';
+import {
+  haveSameComposerChips,
+  normalizeComposerChips,
+  serializeComposerDraft,
+} from '../utils/composerChips.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -29,6 +34,14 @@ let hydratePromptQueuePromise: Promise<void> | null = null;
 const promptQueueHydrationListeners = new Set<() => void>();
 const runtimeWorkflowArmTabs = new Set<string>();
 const automaticRunAfterTargetClearTabs = new Set<string>();
+type PromptQueueEditorLock = { token: string; itemId: string | null };
+type PromptQueueEditorLockListener = (
+  tabId: string,
+  lock: PromptQueueEditorLock | null,
+  options: { wakeAutoRun: boolean },
+) => void;
+const promptQueueEditorLocks = new Map<string, PromptQueueEditorLock>();
+const promptQueueEditorLockListeners = new Set<PromptQueueEditorLockListener>();
 
 export function isPromptQueueStoreHydrated(): boolean {
   return hasHydratedPromptQueueStore;
@@ -45,6 +58,47 @@ export function hasRuntimeWorkflowArm(tabId: string): boolean {
 
 export function consumeAutomaticRunAfterTargetClear(tabId: string): boolean {
   return automaticRunAfterTargetClearTabs.delete(tabId);
+}
+
+export function acquirePromptQueueEditorLock(
+  tabId: string,
+  token: string,
+  itemId: string | null,
+): boolean {
+  const current = promptQueueEditorLocks.get(tabId);
+  if (current && current.token !== token) return false;
+  if (current?.itemId === itemId) return true;
+  const lock = { token, itemId };
+  promptQueueEditorLocks.set(tabId, lock);
+  for (const listener of promptQueueEditorLockListeners) {
+    listener(tabId, lock, { wakeAutoRun: false });
+  }
+  return true;
+}
+
+export function releasePromptQueueEditorLock(
+  tabId: string,
+  token: string,
+  options: { wakeAutoRun?: boolean } = {},
+): boolean {
+  const current = promptQueueEditorLocks.get(tabId);
+  if (!current || current.token !== token) return false;
+  promptQueueEditorLocks.delete(tabId);
+  for (const listener of promptQueueEditorLockListeners) {
+    listener(tabId, null, { wakeAutoRun: options.wakeAutoRun !== false });
+  }
+  return true;
+}
+
+export function isPromptQueueEditorLocked(tabId: string): boolean {
+  return promptQueueEditorLocks.has(tabId);
+}
+
+export function subscribePromptQueueEditorLocks(
+  listener: PromptQueueEditorLockListener,
+): () => void {
+  promptQueueEditorLockListeners.add(listener);
+  return () => promptQueueEditorLockListeners.delete(listener);
 }
 
 function markRuntimeWorkflowArm(tabId: string): void {
@@ -146,6 +200,15 @@ export type QueuedImageRef = {
 
 export type QueuedPromptAttachmentState = 'ready' | 'materializing' | 'missing';
 
+export type QueuedComposerChip = {
+  id: string;
+  kind: 'prompt' | 'paste';
+  text: string;
+  label?: string;
+  sourceKey?: string;
+  createdAt?: number;
+};
+
 export type QueuedPrompt = {
   id: string;
   // false = keep visible in the list, but skip it when Run-after picks the
@@ -158,6 +221,10 @@ export type QueuedPrompt = {
   // true = user deliberately edited the title; text edits must not overwrite it.
   titleManual?: boolean;
   text: string;
+  // Composer authoring metadata stays separate from editable text so Replay can
+  // restore chips instead of leaking transport wrappers into the textarea.
+  // Undefined is the backward-compatible shape for pre-chip persisted rows.
+  chips?: QueuedComposerChip[];
   images: number; // number of [Image] / [Pasted image] placeholders the original input had
   // Resolved disk paths for each [Image #N] in `text`, in order of appearance.
   // Length may be < `images` if some files were missing at grab time (logged
@@ -166,6 +233,15 @@ export type QueuedPrompt = {
   imagePaths?: QueuedImageRef[];
   attachmentState?: QueuedPromptAttachmentState;
   createdAt: number;
+};
+
+export type QueuedPromptExpectedFields = Partial<Pick<
+  QueuedPrompt,
+  'text' | 'chips' | 'title' | 'titleManual' | 'enabled'
+>>;
+
+export type QueuedPromptMutationOptions = {
+  expected?: QueuedPromptExpectedFields;
 };
 
 function collectClaudeImageRefIds(text: string): Set<number> {
@@ -238,8 +314,15 @@ function normalizeImagePathMarkersForQueue(text: string, imagePaths?: QueuedImag
   };
 }
 
-export function buildQueuedPromptPayload(item: Pick<QueuedPrompt, 'text' | 'imagePaths'>): string {
-  return buildPromptImagePayload(item.text, item.imagePaths || []);
+export function buildQueuedPromptPayload(item: Pick<QueuedPrompt, 'text' | 'chips' | 'imagePaths'>): string {
+  // Image refs belong to the editable queue body, not to opaque prompt/paste
+  // chip bodies. Materialize the body first so a literal "[Image #1]" copied
+  // inside a chip stays literal and cannot consume an unrelated attachment.
+  const materializedText = buildPromptImagePayload(item.text, item.imagePaths || []);
+  return serializeComposerDraft({
+    text: materializedText,
+    chips: item.chips || [],
+  });
 }
 
 export function getQueuedPromptAttachmentState(
@@ -356,9 +439,31 @@ interface PromptQueueStore {
   // Per-tab queues. Outside Claude tabs the overlay is hidden, but state survives tab switching.
   queues: Map<string, TabQueue>;
 
-  addPrompt: (tabId: string, text: string, images?: number, imagePaths?: QueuedImageRef[], title?: string) => string;
-  removePrompt: (tabId: string, id: string) => void;
-  updatePrompt: (tabId: string, id: string, patch: { text?: string; title?: string; titleManual?: boolean; enabled?: boolean }) => void;
+  addPrompt: (
+    tabId: string,
+    text: string,
+    images?: number,
+    imagePaths?: QueuedImageRef[],
+    title?: string,
+    chips?: QueuedComposerChip[],
+  ) => string;
+  removePrompt: (
+    tabId: string,
+    id: string,
+    options?: QueuedPromptMutationOptions,
+  ) => boolean;
+  updatePrompt: (
+    tabId: string,
+    id: string,
+    patch: {
+      text?: string;
+      chips?: QueuedComposerChip[];
+      title?: string;
+      titleManual?: boolean;
+      enabled?: boolean;
+    },
+    options?: QueuedPromptMutationOptions,
+  ) => boolean;
   updatePromptText: (tabId: string, id: string, text: string) => void;
   setPromptImageRefs: (
     tabId: string,
@@ -669,10 +774,12 @@ function getInitialQueuedPromptAttachmentState(
 
 function normalizeQueuedPrompt(item: QueuedPrompt): QueuedPrompt {
   const normalized = normalizeImagePathMarkersForQueue(item.text, item.imagePaths);
+  const chips = normalizeComposerChips(item.chips) as QueuedComposerChip[];
   const next = {
     ...item,
     enabled: item.enabled !== false,
     text: normalized.text,
+    chips: chips.length > 0 ? chips : undefined,
     images: Math.max(item.images || 0, countImages(normalized.text), normalized.imagePaths?.length ?? 0),
     imagePaths: normalized.imagePaths,
   };
@@ -680,6 +787,32 @@ function normalizeQueuedPrompt(item: QueuedPrompt): QueuedPrompt {
     ...next,
     attachmentState: getInitialQueuedPromptAttachmentState(next.text, next.imagePaths, next.images),
   };
+}
+
+function queuedPromptMatchesExpected(
+  item: QueuedPrompt,
+  expected?: QueuedPromptExpectedFields,
+): boolean {
+  if (!expected) return true;
+  if (Object.prototype.hasOwnProperty.call(expected, 'text') && item.text !== expected.text) {
+    return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(expected, 'chips')) {
+    if (!haveSameComposerChips(item.chips, expected.chips)) return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(expected, 'title') && item.title !== expected.title) {
+    return false;
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(expected, 'titleManual')
+    && item.titleManual !== expected.titleManual
+  ) {
+    return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(expected, 'enabled') && item.enabled !== expected.enabled) {
+    return false;
+  }
+  return true;
 }
 
 export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
@@ -697,19 +830,24 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
   return {
     queues: new Map(),
 
-    addPrompt: (tabId, text, images, imagePaths, title) => {
+    addPrompt: (tabId, text, images, imagePaths, title, chips) => {
       const id = nextId();
       setAndPersist((state) => {
         const next = new Map(state.queues);
         const cur = next.get(tabId) ?? EMPTY;
         const normalized = normalizeImagePathMarkersForQueue(text, imagePaths);
+        const normalizedChips = normalizeComposerChips(chips) as QueuedComposerChip[];
+        const serializedDraft = serializeComposerDraft({
+          text: normalized.text,
+          chips: normalizedChips,
+        });
         const detectedImages = Math.max(
           images ?? 0,
           countImages(normalized.text),
           normalized.imagePaths?.length ?? 0,
           hasMalformedQueuedImageMarker(normalized.text, normalized.imagePaths) ? 1 : 0,
         );
-        const defaultTitle = makeDefaultPromptTitle(normalized.text);
+        const defaultTitle = makeDefaultPromptTitle(serializedDraft);
         const normalizedTitle = typeof title === 'string' ? title.trim() : '';
         const titleManual = normalizedTitle.length > 0 && normalizedTitle !== defaultTitle;
         const items = [...cur.items, {
@@ -718,6 +856,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           title: titleManual ? normalizedTitle : defaultTitle,
           titleManual,
           text: normalized.text,
+          chips: normalizedChips.length > 0 ? normalizedChips : undefined,
           images: detectedImages,
           imagePaths: normalized.imagePaths,
           attachmentState: getInitialQueuedPromptAttachmentState(normalized.text, normalized.imagePaths, detectedImages),
@@ -744,10 +883,16 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       return id;
     },
 
-    removePrompt: (tabId, id) => {
+    removePrompt: (tabId, id, options) => {
+      let removed = false;
       setAndPersist((state) => {
         const cur = state.queues.get(tabId);
         if (!cur) return state;
+        const currentItem = cur.items.find((item) => item.id === id);
+        if (!currentItem || !queuedPromptMatchesExpected(currentItem, options?.expected)) {
+          return state;
+        }
+        removed = true;
         const activeBefore = countEnabledQueuedPrompts(cur.items);
         const items = cur.items.filter((p) => p.id !== id);
         const next = new Map(state.queues);
@@ -783,12 +928,19 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         });
         return { queues: next };
       });
+      return removed;
     },
 
-    updatePrompt: (tabId, id, patch) => {
+    updatePrompt: (tabId, id, patch, options) => {
+      let updated = false;
       setAndPersist((state) => {
         const cur = state.queues.get(tabId);
         if (!cur) return state;
+        const currentItem = cur.items.find((item) => item.id === id);
+        if (!currentItem || !queuedPromptMatchesExpected(currentItem, options?.expected)) {
+          return state;
+        }
+        updated = true;
         const activeBefore = countEnabledQueuedPrompts(cur.items);
         const items = cur.items.map((p) => {
           if (p.id !== id) return p;
@@ -805,14 +957,23 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
               )
             : p.images;
           const imagePaths = normalized.imagePaths;
-          const defaultTitle = makeDefaultPromptTitle(text);
+          const chips = Array.isArray(patch.chips)
+            ? normalizeComposerChips(patch.chips) as QueuedComposerChip[]
+            : (p.chips || []);
+          const defaultTitle = makeDefaultPromptTitle(serializeComposerDraft({
+            text,
+            chips,
+          }));
           let titleManual = !!p.titleManual;
           let title = p.title || defaultTitle;
           if (typeof patch.title === 'string') {
             const normalized = patch.title.trim();
             title = normalized || defaultTitle;
             titleManual = normalized.length > 0 && normalized !== defaultTitle;
-          } else if (typeof patch.text === 'string' && !titleManual) {
+          } else if (
+            (typeof patch.text === 'string' || Array.isArray(patch.chips))
+            && !titleManual
+          ) {
             title = defaultTitle;
           }
           if (typeof patch.titleManual === 'boolean') {
@@ -824,6 +985,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
             ...p,
             enabled,
             text,
+            chips,
             images,
             imagePaths,
             attachmentState: typeof patch.text === 'string'
@@ -860,6 +1022,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           void ensureQueuedPromptImagesReady(tabId, id);
         }
       }
+      return updated;
     },
 
     updatePromptText: (tabId, id, text) => {
@@ -881,7 +1044,12 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
             images,
             imagePaths: normalized.imagePaths,
             attachmentState: getInitialQueuedPromptAttachmentState(normalized.text, normalized.imagePaths, images),
-            title: p.titleManual ? p.title : makeDefaultPromptTitle(normalized.text),
+            title: p.titleManual
+              ? p.title
+              : makeDefaultPromptTitle(serializeComposerDraft({
+                  text: normalized.text,
+                  chips: p.chips || [],
+                })),
           };
         });
         const next = new Map(state.queues);
@@ -1277,6 +1445,11 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
     cleanupClosedTab: (closedTabId) => {
       runtimeWorkflowArmTabs.delete(closedTabId);
       automaticRunAfterTargetClearTabs.delete(closedTabId);
+      if (promptQueueEditorLocks.delete(closedTabId)) {
+        for (const listener of promptQueueEditorLockListeners) {
+          listener(closedTabId, null, { wakeAutoRun: false });
+        }
+      }
       setAndPersist((state) => {
         let changed = false;
         const next = new Map(state.queues);
@@ -1450,6 +1623,7 @@ function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
     title: typeof item.title === 'string' ? item.title : undefined,
     titleManual: item.titleManual === true,
     text: item.text,
+    chips: normalizeComposerChips(item.chips) as QueuedComposerChip[],
     images: Number.isFinite(Number(item.images)) ? Math.max(0, Number(item.images)) : 0,
     imagePaths,
     attachmentState,

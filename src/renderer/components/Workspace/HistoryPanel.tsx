@@ -1,8 +1,15 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { flushSync } from 'react-dom';
-import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, Send, Square, RotateCcw, Power, AlertTriangle, SquareTerminal, Copy, Check } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, RotateCcw, AlertTriangle, SquareTerminal, Copy, Check } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
-import { HISTORY_PANEL_DEFAULT_WIDTH, useUIStore, type HistoryPromptDraftImageRef, type HistoryRewindPreview } from '../../store/useUIStore';
+import {
+  HISTORY_PANEL_DEFAULT_WIDTH,
+  useUIStore,
+  type HistoryPromptDraftChip,
+  type HistoryPromptDraftImageRef,
+  type HistoryPromptDraftWriteOptions,
+  type HistoryRewindPreview,
+} from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useRewindOperationStore } from '../../store/useRewindOperationStore';
 import {
@@ -20,6 +27,7 @@ import {
   type AgentPtyStatus,
   type AgentQuestion,
 } from '../../utils/historyAgentRuntimes';
+import { sendAgentPromptScenario } from '../../utils/agentScenarios';
 import {
   historySnapshotCache,
   historyVolatileOverlayCache,
@@ -39,6 +47,17 @@ import {
   retainPromptImageRefsForText,
 } from '../../utils/promptImageAttachments.mjs';
 import {
+  haveSameComposerChips,
+  normalizeComposerChips,
+  parsePastedContentParts,
+  restoreComposerChipToText,
+  serializeComposerDraft,
+  shouldCreatePasteChip,
+  upsertComposerChip,
+} from '../../utils/composerChips.mjs';
+import { mergeFailedHistoryAuthoringSnapshot } from '../../utils/historyDraftOwnership.mjs';
+import { queueSendTransferredOwnership } from '../../store/usePromptQueueStore';
+import {
   deriveCodexEffectiveSettingsFromHistory,
   planCodexHistorySettingsProjection,
   resolveCodexEffectiveSettings,
@@ -48,7 +67,20 @@ import type { AgentLifecycleSummary } from './TerminalArea';
 // window now draws tool-calls / diff / thinking / markdown through this package
 // so its style matches the rest of the app. Subagents (Task) are intentionally
 // left on the legacy SubAgentBlock path ("субагентов пока не трогаем").
-import { ToolCallPart as CBToolCallPart, ThinkBlock as CBThinkBlock, Markdown as CBMarkdown } from '@noted/claude-blocks';
+import {
+  ConversationMessage,
+  Markdown as CBMarkdown,
+  MessageActionButton,
+  MessageActionRail,
+  MessageEvent,
+  MessageStatusBadge,
+  ThinkBlock as CBThinkBlock,
+  ToolCallPart as CBToolCallPart,
+} from '@noted/claude-blocks';
+import {
+  AIComposerSurface,
+  type AIComposerSurfaceChip,
+} from './AIConversation/AIComposerSurface';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -212,6 +244,9 @@ const LOCAL_PROMPT_SENT_TTL_MS = 12000;
 const HISTORY_SCROLL_PIXEL_CAP_WARN_PX = 16_000_000;
 const REWIND_BUSY_GUARD_RE = /\bis (?:busy|starting); wait (?:for the current turn|until the current loader finishes) before rewind\b/i;
 const EMPTY_HISTORY_DRAFT_IMAGES: HistoryPromptDraftImageRef[] = [];
+const EMPTY_HISTORY_DRAFT_CHIPS: HistoryPromptDraftChip[] = [];
+const HISTORY_USER_TEXT_COLLAPSE_THRESHOLD = 600;
+const HISTORY_USER_TEXT_COLLAPSED_CHARS = 400;
 
 const HistoryBottomSpacer = memo(() => (
   <div
@@ -275,6 +310,7 @@ const historyDraftImageWarning = (
 const renderHistoryPromptHighlight = (
   text: string,
   ranges: Array<{ start: number; end: number; id: number }>,
+  preserveCaretMetrics = false,
 ) => {
   const decorated = ranges.map((range) => ({
     start: range.start,
@@ -306,7 +342,10 @@ const renderHistoryPromptHighlight = (
     nodes.push(
       <span
         key={`${range.start}:${range.end}`}
-        style={{ color: range.color, fontWeight: range.fontWeight }}
+        style={{
+          color: range.color,
+          fontWeight: preserveCaretMetrics ? undefined : range.fontWeight,
+        }}
       >
         {text.slice(range.start, range.end)}
       </span>
@@ -333,6 +372,9 @@ const renderSentHistoryPromptHighlight = (text: string) => {
 
 const createPromptHandoffId = () =>
   Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+
+const createComposerChipId = (kind: HistoryPromptDraftChip['kind']) =>
+  kind + '-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
 
 const isRewindBusyGuardMessage = (message: string) =>
   REWIND_BUSY_GUARD_RE.test(message);
@@ -915,16 +957,104 @@ const openHistoryEntryContextMenu = (
   });
 };
 
+const HistoryCollapsiblePrompt = ({
+  text,
+  forceExpanded = false,
+}: {
+  text: string;
+  forceExpanded?: boolean;
+}) => {
+  const [expanded, setExpanded] = useState(false);
+  const needsCollapse = text.length > HISTORY_USER_TEXT_COLLAPSE_THRESHOLD;
+  const open = forceExpanded || expanded;
+  if (!needsCollapse) {
+    return <p className="cb-msg-text">{renderSentHistoryPromptHighlight(text)}</p>;
+  }
+  const preview = text.slice(0, HISTORY_USER_TEXT_COLLAPSED_CHARS).trimEnd();
+  const toggle = (
+    <button
+      type="button"
+      className="cb-collapse-btn"
+      onMouseDown={(event) => event.preventDefault()}
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        setExpanded((value) => !value);
+      }}
+    >
+      {open ? 'Свернуть' : `Раскрыть полностью (${text.split('\n').length.toLocaleString()} строк)`}
+    </button>
+  );
+  return (
+    <div>
+      {open && !forceExpanded && <div className="cb-collapse-top">{toggle}</div>}
+      <p className="cb-msg-text">
+        {renderSentHistoryPromptHighlight(open ? text : preview + '…')}
+      </p>
+      {!forceExpanded && <div className="cb-collapse-bottom">{toggle}</div>}
+    </div>
+  );
+};
+
+const HistoryUserPromptContent = ({
+  text,
+  forceExpanded = false,
+}: {
+  text: string;
+  forceExpanded?: boolean;
+}) => {
+  const [expandedPaste, setExpandedPaste] = useState<number | null>(null);
+  const parts = useMemo(() => parsePastedContentParts(text), [text]);
+  if (!parts.some((part: { kind: string }) => part.kind === 'paste')) {
+    return <HistoryCollapsiblePrompt text={text} forceExpanded={forceExpanded} />;
+  }
+  return (
+    <div className="cb-user-parts">
+      {parts.map((part: { kind: 'text' | 'paste'; text: string }, index: number) => {
+        if (part.kind === 'text') {
+          const content = part.text.trim();
+          return content
+            ? <HistoryCollapsiblePrompt key={'text:' + index} text={content} forceExpanded={forceExpanded} />
+            : null;
+        }
+        const open = forceExpanded || expandedPaste === index;
+        const preview = part.text.slice(0, 60).replace(/\s+/g, ' ')
+          + (part.text.length > 60 ? '…' : '');
+        return (
+          <div key={'paste:' + index}>
+            <button
+              type="button"
+              className="cb-paste-chip"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (!forceExpanded) setExpandedPaste(open ? null : index);
+              }}
+            >
+              <span className="cb-paste-chip-preview">{preview}</span>
+              <span className="cb-paste-chip-len">{part.text.length.toLocaleString()}</span>
+            </button>
+            {open && <pre className="cb-paste-chip-body">{part.text}</pre>}
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
 const HistoryUserEntry = memo(({
   entry,
   tabId,
   allowRewind,
   rewindLocked,
+  forceExpanded,
 }: {
   entry: FullHistoryEntry;
   tabId: string;
   allowRewind: boolean;
   rewindLocked: boolean;
+  forceExpanded?: boolean;
 }) => {
   const [copied, setCopied] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -969,56 +1099,134 @@ const HistoryUserEntry = memo(({
   };
 
   return (
-    <div className="hp-user-entry">
-      <div
-        title={editableLastPrompt ? 'Editable last prompt' : undefined}
-        style={{
-          padding: '8px 12px',
-          backgroundColor: editableLastPrompt ? 'rgba(217, 119, 6, 0.08)' : 'rgba(255, 255, 255, 0.04)',
-          borderRadius: 6,
-          borderLeft: '3px solid ' + (editableLastPrompt ? 'rgba(217, 119, 6, 0.75)' : 'rgba(255, 255, 255, 0.2)'),
-        }}
-      >
-        <div style={{ fontSize: '1em', color: '#e0e0e0', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-          {entry.content}
-        </div>
-      </div>
-      <div className="hp-user-actions" aria-label="Prompt actions">
-        <Tooltip content={copied ? 'Скопировано' : 'Копировать prompt'}>
-          <button
-            type="button"
-            className="hp-user-action-button"
-            aria-label="Copy prompt"
-            onMouseDown={stopActionPropagation}
-            onContextMenu={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-            }}
-            onClick={copyPrompt}
-          >
-            {copied ? <Check size={11} /> : <Copy size={11} />}
-          </button>
-        </Tooltip>
-        {allowRewind && (
-          <Tooltip content={rewindLocked ? 'Rewind уже выполняется' : 'Откатиться к этому prompt'}>
-            <button
-              type="button"
-              className="hp-user-action-button hp-user-action-rewind"
-              aria-label="Rewind to prompt"
-              disabled={!canRewind}
+    <ConversationMessage
+      layout="user"
+      entryUuid={entry.uuid}
+      emphasis={editableLastPrompt ? 'editable' : 'none'}
+      title={editableLastPrompt ? 'Editable last prompt' : undefined}
+      actions={(
+        <MessageActionRail placement="outside-start" aria-label="Prompt actions">
+          <Tooltip content={copied ? 'Скопировано' : 'Копировать prompt'}>
+            <MessageActionButton
+              aria-label="Copy prompt"
               onMouseDown={stopActionPropagation}
               onContextMenu={(event) => {
                 event.preventDefault();
                 event.stopPropagation();
               }}
-              onClick={requestRewind}
+              onClick={copyPrompt}
             >
-              <RotateCcw size={11} />
-            </button>
+              {copied ? <Check size={11} /> : <Copy size={11} />}
+            </MessageActionButton>
           </Tooltip>
-        )}
-      </div>
-    </div>
+          {allowRewind && (
+            <Tooltip content={rewindLocked ? 'Rewind уже выполняется' : 'Откатиться к этому prompt'}>
+              <MessageActionButton
+                tone="warning"
+                aria-label="Rewind to prompt"
+                disabled={!canRewind}
+                onMouseDown={stopActionPropagation}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }}
+                onClick={requestRewind}
+              >
+                <RotateCcw size={11} />
+              </MessageActionButton>
+            </Tooltip>
+          )}
+        </MessageActionRail>
+      )}
+    >
+      <HistoryUserPromptContent text={entry.content} forceExpanded={forceExpanded} />
+    </ConversationMessage>
+  );
+});
+
+const HistoryAssistantEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
+  const [copied, setCopied] = useState(false);
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+  }, []);
+
+  const hasAssistantContent = !!entry.content;
+  const hasAssistantActions = !!entry.actions?.length;
+  const isStandaloneToolRow = !hasAssistantContent && !entry.thinking && hasAssistantActions;
+  const copyAnswer = () => {
+    if (!entry.content) return;
+    clipboard.writeText(entry.content);
+    setCopied(true);
+    if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+    copiedTimerRef.current = setTimeout(() => {
+      copiedTimerRef.current = null;
+      setCopied(false);
+    }, 900);
+  };
+
+  return (
+    <ConversationMessage
+      layout={isStandaloneToolRow ? 'block' : 'assistant'}
+      entryUuid={entry.uuid}
+      actions={hasAssistantContent ? (
+        <MessageActionRail placement="sticky-end" aria-label="Assistant response actions">
+          <Tooltip content={copied ? 'Скопировано' : 'Копировать ответ'}>
+            <MessageActionButton aria-label="Copy assistant response" onClick={copyAnswer}>
+              {copied ? <Check size={11} /> : <Copy size={11} />}
+            </MessageActionButton>
+          </Tooltip>
+        </MessageActionRail>
+      ) : undefined}
+      className={isStandaloneToolRow ? 'hp-assistant-tool-only' : undefined}
+    >
+      {entry.thinking && <HistoryThinkBlock text={entry.thinking} />}
+
+      {entry.content && (
+        <div style={{ fontSize: '1em' }}>
+          <CBMarkdown text={entry.content} />
+        </div>
+      )}
+
+      {entry.actions?.map((action, index) => {
+        if (isRawAction(action)) {
+          const toolName = String(action.rawTool.toolName || '');
+          const toolResult = action.rawTool.result;
+          const historyResult = toolResult == null && toolName.toLowerCase().includes('mcp')
+            ? ''
+            : toolResult;
+          return (
+            <HistoryToolCallPart
+              key={'raw' + index + ':' + toolName}
+              toolName={toolName}
+              args={action.rawTool.args || {}}
+              result={historyResult}
+              isError={action.rawTool.isError}
+            />
+          );
+        }
+        if (isTaskAction(action)) return <SubAgentBlock key={'task' + index} action={action} />;
+        if (isFileAction(action)) {
+          return action.tool === 'Read'
+            ? <ReadActionBlock key={'rd' + index} filePath={action.filePath} />
+            : <FileActionBlock key={'ew' + index} action={action} />;
+        }
+        return (
+          <div key={'s' + index} style={{ marginTop: 6 }}>
+            <span style={{
+              fontSize: '0.85em',
+              color: '#999',
+              backgroundColor: 'rgba(255,255,255,0.04)',
+              padding: '2px 6px',
+              borderRadius: 4,
+              wordBreak: 'break-all',
+            }}>
+              {action as string}
+            </span>
+          </div>
+        );
+      })}
+    </ConversationMessage>
   );
 });
 
@@ -1029,42 +1237,36 @@ const HistoryEntry = memo(({
   toolType,
   allowRewind,
   rewindLocked,
+  forceExpanded,
 }: {
   entry: FullHistoryEntry;
   tabId: string;
   toolType?: 'claude' | 'gemini' | 'codex';
   allowRewind: boolean;
   rewindLocked: boolean;
+  forceExpanded?: boolean;
 }) => {
   if (entry.role === 'compact') {
     return <CompactBlock entry={entry} />;
   }
 
   if (entry.role === 'fork') {
-    return (
-      <div style={{ textAlign: 'center', padding: '8px 0', color: '#5b9cf5', fontSize: '0.85em', letterSpacing: 1 }}>
-        {'FORK'}
-      </div>
-    );
+    return <MessageEvent label="FORK" tone="info" entryUuid={entry.uuid} />;
   }
 
   if (entry.role === 'plan-mode') {
-    return (
-      <div style={{ textAlign: 'center', padding: '8px 0', color: '#4ade80', fontSize: '0.85em', letterSpacing: 1 }}>
-        {'CLEAR CONTEXT'}
-      </div>
-    );
+    return <MessageEvent label="CLEAR CONTEXT" tone="success" entryUuid={entry.uuid} />;
   }
 
   if (entry.role === 'continued') {
     return (
-      <div style={{
-        padding: '8px 12px',
-        backgroundColor: 'rgba(100, 100, 255, 0.06)', borderRadius: 6,
-        fontSize: '0.92em', color: '#8888cc', fontStyle: 'italic',
-      }}>
-        Session continued from previous conversation...
-      </div>
+      <MessageEvent
+        label="CONTINUED"
+        tone="info"
+        entryUuid={entry.uuid}
+      >
+        Session continued from previous conversation…
+      </MessageEvent>
     );
   }
 
@@ -1076,37 +1278,18 @@ const HistoryEntry = memo(({
     const cancelled = status === 'cancelled';
     const failed = status === 'failed';
     const label = sending ? 'SENDING' : queued ? 'QUEUED' : sent ? 'SENT' : cancelled ? 'CANCELLED BEFORE JSONL' : 'SEND FAILED';
-    const accent = failed ? '#ef4444' : '#71717a';
-    const textColor = failed ? '#fca5a5' : '#a1a1aa';
     return (
-      <div style={{
-        padding: '8px 12px',
-        backgroundColor: failed ? 'rgba(239, 68, 68, 0.08)' : 'rgba(113, 113, 122, 0.08)',
-        borderRadius: 6,
-        borderLeft: '3px solid ' + accent,
-      }}>
-        <div style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 6,
-          fontSize: '0.77em',
-          color: textColor,
-          marginBottom: 4,
-          fontWeight: 700,
-          letterSpacing: 0.6,
-        }}>
-          {(sending || queued) && <HistorySpinner size={10} />}
-          <span>{label}</span>
-          {entry.timestamp && (
-            <span style={{ marginLeft: 2, color: '#666', fontWeight: 500, letterSpacing: 0 }}>
-              {new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-            </span>
-          )}
-        </div>
-        <div style={{ fontSize: '1em', color: '#e0e0e0', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-          {renderSentHistoryPromptHighlight(entry.content)}
-        </div>
-      </div>
+      <MessageEvent
+        label={label}
+        tone={failed ? 'danger' : sent ? 'success' : cancelled ? 'warning' : 'muted'}
+        pending={sending || queued}
+        entryUuid={entry.uuid}
+        meta={entry.timestamp
+          ? new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          : undefined}
+      >
+        {renderSentHistoryPromptHighlight(entry.content)}
+      </MessageEvent>
     );
   }
 
@@ -1116,34 +1299,17 @@ const HistoryEntry = memo(({
     const failed = status === 'failed';
     const label = failed ? 'REWIND FAILED' : active ? 'REWINDING' : 'I REWOUND';
     return (
-      <div style={{
-        padding: '8px 12px',
-        backgroundColor: failed ? 'rgba(239, 68, 68, 0.08)' : 'rgba(217, 119, 6, 0.08)',
-        borderRadius: 6,
-        borderLeft: '3px solid ' + (failed ? 'rgba(239, 68, 68, 0.75)' : 'rgba(217, 119, 6, 0.75)'),
-      }}>
-        <div style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 6,
-          fontSize: '0.77em',
-          color: failed ? '#fca5a5' : '#fbbf24',
-          marginBottom: 4,
-          fontWeight: 700,
-          letterSpacing: 0.6,
-        }}>
-          {active && <HistorySpinner size={10} />}
-          <span>{label}</span>
-          {entry.timestamp && (
-            <span style={{ marginLeft: 2, color: '#666', fontWeight: 500, letterSpacing: 0 }}>
-              {new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-            </span>
-          )}
-        </div>
-        <div style={{ fontSize: '1em', color: '#e0e0e0', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-          {renderSentHistoryPromptHighlight(entry.content)}
-        </div>
-      </div>
+      <MessageEvent
+        label={label}
+        tone={failed ? 'danger' : 'warning'}
+        pending={active}
+        entryUuid={entry.uuid}
+        meta={entry.timestamp
+          ? new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          : undefined}
+      >
+        {renderSentHistoryPromptHighlight(entry.content)}
+      </MessageEvent>
     );
   }
 
@@ -1154,74 +1320,12 @@ const HistoryEntry = memo(({
         tabId={tabId}
         allowRewind={allowRewind}
         rewindLocked={rewindLocked}
+        forceExpanded={forceExpanded}
       />
     );
   }
 
-  // Assistant. Tool-only rows do not need the same vertical padding as prose:
-  // the package card already owns its rhythm, and stacking both layers produced
-  // oversized gaps above/below Bash in History.
-  const hasAssistantContent = !!entry.content;
-  const hasAssistantActions = !!entry.actions?.length;
-  const isStandaloneToolRow = !hasAssistantContent && !entry.thinking && hasAssistantActions;
-  return (
-    <div style={{ padding: isStandaloneToolRow ? '0 12px' : '8px 12px' }}>
-      {entry.thinking && <HistoryThinkBlock text={entry.thinking} />}
-
-      {entry.content && (
-        <div style={{ fontSize: '1em' }}>
-          <CBMarkdown text={entry.content} />
-        </div>
-      )}
-
-      {entry.actions && entry.actions.length > 0 && (() => {
-        // Render actions IN ORDER (a turn interleaves Bash → Edit → Task). Raw
-        // tool actions go through the package card; Task keeps SubAgentBlock;
-        // legacy string/FileAction shapes (e.g. Gemini, or older cached data)
-        // fall back to the old inline renderers so nothing regresses.
-        return (
-          <>
-            {entry.actions!.map((a, i) => {
-              if (isRawAction(a)) {
-                const toolName = String(a.rawTool.toolName || '');
-                const toolResult = a.rawTool.result;
-                const historyResult = toolResult == null && toolName.toLowerCase().includes('mcp')
-                  ? ''
-                  : toolResult;
-                return (
-                  <HistoryToolCallPart
-                    key={'raw' + i + ':' + toolName}
-                    toolName={toolName}
-                    args={a.rawTool.args || {}}
-                    result={historyResult}
-                    isError={a.rawTool.isError}
-                  />
-                );
-              }
-              if (isTaskAction(a)) return <SubAgentBlock key={'task' + i} action={a} />;
-              if (isFileAction(a)) {
-                return a.tool === 'Read'
-                  ? <ReadActionBlock key={'rd' + i} filePath={a.filePath} />
-                  : <FileActionBlock key={'ew' + i} action={a} />;
-              }
-              // string fallback (Gemini / legacy)
-              return (
-                <div key={'s' + i} style={{ marginTop: 6 }}>
-                  <span style={{
-                    fontSize: '0.85em', color: '#999',
-                    backgroundColor: 'rgba(255,255,255,0.04)',
-                    padding: '2px 6px', borderRadius: 4, wordBreak: 'break-all',
-                  }}>
-                    {a as string}
-                  </span>
-                </div>
-              );
-            })}
-          </>
-        );
-      })()}
-    </div>
-  );
+  return <HistoryAssistantEntry entry={entry} />;
 });
 
 // Flash/search/component styles. Keep the existing node across HMR, but refresh
@@ -1279,6 +1383,10 @@ const historyPanelStyleText = `@keyframes hp-flash {
   margin-top: 4px;
   margin-bottom: 4px;
 }
+.hp-history-transcript .hp-assistant-tool-only {
+  padding-top: 0;
+  padding-bottom: 0;
+}
 .hp-history-transcript .hp-tool-scroll-scope .cb-tool-body > .cb-rail {
   transition: border-left-color 90ms ease, filter 90ms ease;
 }
@@ -1286,52 +1394,84 @@ const historyPanelStyleText = `@keyframes hp-flash {
   border-left-color: rgba(255, 255, 255, 0.88);
   filter: drop-shadow(0 0 4px rgba(255, 255, 255, 0.22));
 }
-.hp-user-actions {
-  height: 22px;
-  margin: 2px 0 0 12px;
+.hp-history-composer-frame {
+  border-color: #333;
+  background: #0f0f0f;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.38);
+  transition: border-color 120ms ease;
+}
+.hp-history-composer-frame:focus-within {
+  border-color: #FFB382;
+}
+.hp-history-composer-frame .cb-composer-main {
+  padding-top: 0;
+}
+.hp-history-composer-frame .cb-composer-chips {
+  padding: 0 0 6px;
+}
+.hp-history-composer-toolbar {
   display: flex;
   align-items: center;
-  gap: 3px;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 80ms ease;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
 }
-.hp-user-entry:hover .hp-user-actions,
-.hp-user-entry:focus-within .hp-user-actions {
-  opacity: 1;
-  pointer-events: auto;
-}
-.hp-user-action-button {
-  width: 20px;
-  height: 20px;
+.hp-composer-chip-action {
+  width: 18px;
+  height: 18px;
   padding: 0;
-  border-radius: 5px;
-  border: 1px solid #333;
-  background: #1a1a1a;
-  color: #888;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: currentColor;
+  opacity: 0.65;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
 }
-.hp-user-action-button:hover,
-.hp-user-action-button:focus-visible {
+.hp-composer-chip-action:hover,
+.hp-composer-chip-action:focus-visible {
+  opacity: 1;
   color: #fff;
-  background: #2a2a2a;
-  border-color: #4a4a4a;
+  background: rgba(255, 255, 255, 0.09);
   outline: none;
 }
-.hp-user-action-rewind:hover,
-.hp-user-action-rewind:focus-visible {
-  color: #fbbf24;
-  background: rgba(217, 119, 6, 0.14);
-  border-color: rgba(217, 119, 6, 0.45);
+.hp-composer-chip-action-danger:hover,
+.hp-composer-chip-action-danger:focus-visible {
+  color: #f87171;
 }
-.hp-user-action-button:disabled {
-  color: #555;
-  background: #181818;
-  border-color: #2b2b2b;
-  cursor: default;
+.hp-composer-chip-preview {
+  flex: 1 0 100%;
+  min-width: 0;
+  max-height: 210px;
+  overflow: auto;
+  border: 1px solid #333;
+  border-radius: 8px;
+  background: #151515;
+}
+.hp-composer-chip-preview-head {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  color: #888;
+  background: #1a1a1a;
+  border-bottom: 1px solid #2d2d2d;
+  font-size: 10px;
+}
+.hp-composer-chip-preview pre {
+  margin: 0;
+  padding: 8px;
+  color: #bdbdbd;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
 }`;
 let historyPanelStyle = document.getElementById('hp-flash-style') as HTMLStyleElement | null;
 if (!historyPanelStyle) {
@@ -2082,8 +2222,10 @@ function AgentHistoryControls({
   const [status, setStatus] = useState<AgentPtyStatus>('inactive');
   const prompt = useUIStore(useCallback((s) => s.historyPromptDrafts[tabId] || '', [tabId]));
   const historyComposerFontSize = useUIStore((s) => s.historyComposerFontSize);
+  const aiSecondaryFontSize = useUIStore((s) => s.aiSecondaryFontSize);
   const historyComposerMinRows = useUIStore((s) => s.historyComposerMinRows);
   const historyComposerMaxRows = useUIStore((s) => s.historyComposerMaxRows);
+  const aiComposerChipThreshold = useUIStore((s) => s.aiComposerChipThreshold);
   const historyComposerLineHeightPx = historyComposerFontSize * 1.35;
   const historyComposerMinHeight = Math.ceil(historyComposerLineHeightPx * historyComposerMinRows + 16);
   const historyComposerMaxHeight = Math.ceil(historyComposerLineHeightPx * historyComposerMaxRows + 16);
@@ -2091,10 +2233,13 @@ function AgentHistoryControls({
   // here when the tab has no images creates a new snapshot on every read and
   // can crash History with React #185 when AgentHistoryControls mounts.
   const draftImages = useUIStore(useCallback((s) => s.historyPromptDraftImages[tabId] || EMPTY_HISTORY_DRAFT_IMAGES, [tabId]));
+  const draftChips = useUIStore(useCallback((s) => s.historyPromptDraftChips[tabId] || EMPTY_HISTORY_DRAFT_CHIPS, [tabId]));
   const setHistoryPromptDraft = useUIStore((s) => s.setHistoryPromptDraft);
+  const setHistoryComposerAvailability = useUIStore((s) => s.setHistoryComposerAvailability);
+  const removeHistoryPromptDraftChip = useUIStore((s) => s.removeHistoryPromptDraftChip);
   const setPrompt = useCallback((
     next: string | ((prev: string) => string),
-    options: { images?: HistoryPromptDraftImageRef[] | null; preserveImages?: boolean } = { preserveImages: true }
+    options: HistoryPromptDraftWriteOptions = { preserveImages: true, preserveChips: true }
   ) => {
     const current = useUIStore.getState().historyPromptDrafts[tabId] || '';
     const value = typeof next === 'function' ? next(current) : next;
@@ -2112,12 +2257,17 @@ function AgentHistoryControls({
   const [resumeMaterialized, setResumeMaterialized] = useState<boolean | null>(toolType === 'claude' ? null : true);
   const [resumeUnavailableReason, setResumeUnavailableReason] = useState<string | null>(null);
   const [statusCopied, setStatusCopied] = useState(false);
+  const [previewChipId, setPreviewChipId] = useState<string | null>(null);
   const controlsRef = useRef<HTMLDivElement | null>(null);
   const statusCopiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const promptHighlightRef = useRef<HTMLDivElement | null>(null);
+  const promptCaretRef = useRef<{ start: number; end: number }>({ start: 0, end: 0 });
   const tabIdRef = useRef(tabId);
   const statusRef = useRef<AgentPtyStatus>('inactive');
+  const availabilityOwnerRef = useRef(
+    'history-composer-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+  );
   const syncPromptTextareaHeight = useCallback(() => {
     const element = promptTextareaRef.current;
     if (!element) return;
@@ -2134,6 +2284,12 @@ function AgentHistoryControls({
   useLayoutEffect(() => {
     syncPromptTextareaHeight();
   }, [prompt, syncPromptTextareaHeight]);
+
+  useEffect(() => {
+    if (previewChipId && !draftChips.some((chip) => chip.id === previewChipId)) {
+      setPreviewChipId(null);
+    }
+  }, [draftChips, previewChipId]);
 
   useEffect(() => {
     const element = promptTextareaRef.current;
@@ -2165,7 +2321,16 @@ function AgentHistoryControls({
   const pasteBusyRef = useRef(false);
   const pendingQuestionRef = useRef<AgentPendingQuestion | null>(null);
   const answeringQuestionRef = useRef(false);
-  const midstreamPromptRecoveryRef = useRef<{ text: string; at: number; handoffId: string; statusAtSend: AgentPtyStatus } | null>(null);
+  const midstreamPromptRecoveryRef = useRef<{
+    serializedText: string;
+    transportText: string;
+    rawText: string;
+    chips: HistoryPromptDraftChip[];
+    images: HistoryPromptDraftImageRef[];
+    at: number;
+    handoffId: string;
+    statusAtSend: AgentPtyStatus;
+  } | null>(null);
   const interruptRecoveryInFlightRef = useRef(false);
   const interruptAwaitRef = useRef<{ tabId: string; seq: number; at: number } | null>(null);
   const emptyDraftNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2554,13 +2719,14 @@ function AgentHistoryControls({
 
       const requestTabId = tabId;
       interruptRecoveryInFlightRef.current = true;
-      console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery start tab=' + tabId.slice(-12) + ' ageMs=' + ageMs + ' sentChars=' + pending.text.length);
+      console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery start tab=' + tabId.slice(-12) + ' ageMs=' + ageMs + ' sentChars=' + pending.serializedText.length + ' chips=' + pending.chips.length);
       historyDiag('INTERRUPT_RECOVERY_START tab=' + tabId.slice(-12) +
         ' handoff=' + pending.handoffId +
         ' ageMs=' + ageMs +
         ' statusAtSend=' + pending.statusAtSend +
-        ' chars=' + pending.text.length +
-        ' preview="' + promptPreview(pending.text) + '"');
+        ' chars=' + pending.serializedText.length +
+        ' chips=' + pending.chips.length +
+        ' preview="' + promptPreview(pending.serializedText) + '"');
       (async () => {
         const delays = [0, 160, 420, 900];
         for (let attempt = 0; attempt < delays.length; attempt++) {
@@ -2575,15 +2741,55 @@ function AgentHistoryControls({
               console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery empty tab=' + tabId.slice(-12) + ' attempt=' + (attempt + 1));
               continue;
             }
-            const current = useUIStore.getState().historyPromptDrafts[requestTabId] || '';
+            const ui = useUIStore.getState();
+            const current = ui.historyPromptDrafts[requestTabId] || '';
+            const currentChips = ui.historyPromptDraftChips[requestTabId] || [];
+            const currentImages = ui.historyPromptDraftImages[requestTabId] || [];
+            const terminalIdentity = normalizeHistoryPromptIdentityText(draft.text);
+            const authoringProof = terminalIdentity === normalizeHistoryPromptIdentityText(pending.serializedText)
+              || terminalIdentity === normalizeHistoryPromptIdentityText(pending.transportText);
+            const composerStillEmpty = !current.trim()
+              && currentChips.length === 0
+              && currentImages.length === 0;
+
+            if (authoringProof && composerStillEmpty) {
+              setHistoryPromptDraft(requestTabId, pending.rawText, {
+                images: pending.images,
+                chips: pending.chips,
+              });
+              setDraftWarning(runtime.label + ' returned an interrupted prompt; its text and chips were restored.');
+              console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery restored tab=' + tabId.slice(-12)
+                + ' source=authoring-snapshot chars=' + pending.rawText.length
+                + ' chips=' + pending.chips.length
+                + ' images=' + pending.images.length);
+              onPromptStatusChange(pending.handoffId, 'cancelled', 'interrupt-restored-authoring-snapshot');
+              historyDiag('INTERRUPT_RECOVERY_RESTORED tab=' + tabId.slice(-12) +
+                ' handoff=' + pending.handoffId +
+                ' attempt=' + (attempt + 1) +
+                ' source=authoring-snapshot' +
+                ' chars=' + pending.rawText.length +
+                ' chips=' + pending.chips.length +
+                ' images=' + pending.images.length);
+              requestAnimationFrame(() => promptTextareaRef.current?.focus());
+              return;
+            }
+
             const nextText = prependPromptTextOnce(current, draft.text);
             const mergedImages = retainHistoryDraftImages(nextText, [
-              ...(useUIStore.getState().historyPromptDraftImages[requestTabId] || []),
+              ...currentImages,
               ...(Array.isArray(draft.imagePaths) ? draft.imagePaths : []),
             ]);
-            setHistoryPromptDraft(requestTabId, nextText, mergedImages.length > 0 ? { images: mergedImages } : { preserveImages: true });
+            setHistoryPromptDraft(requestTabId, nextText, {
+              ...(mergedImages.length > 0 ? { images: mergedImages } : { preserveImages: true }),
+              preserveChips: true,
+            });
             setDraftWarning(runtime.label + ' returned an interrupted prompt; pulled it back from terminal input.');
-            console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery restored tab=' + tabId.slice(-12) + ' source=terminal attempt=' + (attempt + 1) + ' chars=' + draft.text.length + ' images=' + draft.images);
+            console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery restored tab=' + tabId.slice(-12)
+              + ' source=terminal-raw attempt=' + (attempt + 1)
+              + ' chars=' + draft.text.length
+              + ' images=' + draft.images
+              + ' conflict=' + (!composerStillEmpty)
+              + ' authoringProof=' + authoringProof);
             onPromptStatusChange(pending.handoffId, 'cancelled', 'interrupt-restored-terminal-draft');
             historyDiag('INTERRUPT_RECOVERY_RESTORED tab=' + tabId.slice(-12) +
               ' handoff=' + pending.handoffId +
@@ -2599,11 +2805,11 @@ function AgentHistoryControls({
         if (tabIdRef.current !== requestTabId) return;
         showEmptyDraftNotice(runtime.label + ' cancellation confirmed; prompt was not returned by terminal input.');
         onPromptStatusChange(pending.handoffId, 'cancelled', 'interrupt-no-terminal-draft');
-        console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery not-restored tab=' + tabId.slice(-12) + ' reason=no-terminal-draft probes=' + delays.length + ' sentChars=' + pending.text.length);
+        console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery not-restored tab=' + tabId.slice(-12) + ' reason=no-terminal-draft probes=' + delays.length + ' sentChars=' + pending.serializedText.length);
         historyDiag('INTERRUPT_RECOVERY_NOT_RESTORED tab=' + tabId.slice(-12) +
           ' handoff=' + pending.handoffId +
           ' reason=no-terminal-draft probes=' + delays.length +
-          ' sentChars=' + pending.text.length);
+          ' sentChars=' + pending.serializedText.length);
       })()
         .catch((e: any) => {
           console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
@@ -2682,7 +2888,9 @@ function AgentHistoryControls({
         ...(useUIStore.getState().historyPromptDraftImages[actionTabId] || []),
         ...(Array.isArray(draft.imagePaths) ? draft.imagePaths : []),
       ]);
-      setHistoryPromptDraft(actionTabId, nextText, mergedImages.length > 0 ? { images: mergedImages } : { preserveImages: true });
+      setHistoryPromptDraft(actionTabId, nextText, mergedImages.length > 0
+        ? { images: mergedImages, preserveChips: true }
+        : { preserveImages: true, preserveChips: true });
       if (draft.images > 0) {
         setDraftWarning(
           mergedImages.length > 0
@@ -2793,8 +3001,12 @@ function AgentHistoryControls({
       tabIdRef.current === actionTabId && actionSeqRef.current === actionSeq
     );
     let sendHandoffId: string | null = null;
+    let sendOwnershipTransferred = false;
+    let sendDeliveryUnconfirmed = false;
+    let sendTransferredQueueStatus: 'queued' | 'sent' = 'sent';
     let clearedPromptText: string | null = null;
     let clearedPromptImages: HistoryPromptDraftImageRef[] = [];
+    let clearedPromptChips: HistoryPromptDraftChip[] = [];
     actionInFlightRef.current = true;
     setBusyAction(kind);
     setError(null);
@@ -2823,22 +3035,39 @@ function AgentHistoryControls({
         // composer actions) can update the tab-scoped draft and request Send
         // in the same turn. Read the source of truth now instead of relying on
         // the React render that created this callback.
-        let text = (useUIStore.getState().historyPromptDrafts[actionTabId] || '').trim();
-        if (!text) return;
+        const rawDraftSnapshot = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
+        const sourceDraftChips = normalizeComposerChips(
+          useUIStore.getState().historyPromptDraftChips[actionTabId] || [],
+        ) as HistoryPromptDraftChip[];
+        const presentationText = serializeComposerDraft({
+          text: rawDraftSnapshot,
+          chips: sourceDraftChips,
+        }).trim();
+        if (!presentationText) return;
         if (pendingQuestionRef.current) throw new Error(runtime.label + ' is waiting for a question answer');
         const statusAtSend = statusRef.current;
         const acceptsBusyPrompt = statusAtSend === 'busy' && runtime.allowSendWhileBusy;
-        if (statusAtSend !== 'active' && !acceptsBusyPrompt) throw new Error(runtime.label + ' is not ready (' + statusAtSend + ')');
+        const canLaunchBeforeSend = statusAtSend === 'inactive' && (
+          sessionId
+            ? (runtime.toolType !== 'claude' || resumeMaterialized === true)
+            : !!runtime.startFresh
+        );
+        if (statusAtSend !== 'active' && !acceptsBusyPrompt && !canLaunchBeforeSend) {
+          throw new Error(runtime.label + ' is not ready (' + statusAtSend + ')');
+        }
         if (statusAtSend === 'active') {
           const terminalDraft = await readTerminalDraft('send-preflight');
           if (terminalDraft.stale || !isCurrentAction()) return;
           if (terminalDraft.text) {
-            text = prependPromptText(text, terminalDraft.text);
-            const mergedImages = retainHistoryDraftImages(text, [
+            const nextEditableText = prependPromptText(rawDraftSnapshot, terminalDraft.text);
+            const mergedImages = retainHistoryDraftImages(nextEditableText, [
               ...(useUIStore.getState().historyPromptDraftImages[actionTabId] || []),
               ...(Array.isArray(terminalDraft.imagePaths) ? terminalDraft.imagePaths : []),
             ]);
-            setHistoryPromptDraft(actionTabId, text, mergedImages.length > 0 ? { images: mergedImages } : { preserveImages: true });
+            setHistoryPromptDraft(actionTabId, nextEditableText, {
+              ...(mergedImages.length > 0 ? { images: mergedImages } : { preserveImages: true }),
+              chips: sourceDraftChips,
+            });
             setDraftWarning('Terminal draft found — send stopped, text moved to top.');
             console.log('[' + runtime.logPrefix + ':draft] send-preflight blocked tab=' + tabId.slice(-12) + ' chars=' + terminalDraft.text.length + ' images=' + terminalDraft.images);
             requestAnimationFrame(() => promptTextareaRef.current?.focus());
@@ -2848,13 +3077,19 @@ function AgentHistoryControls({
             return;
           }
         } else {
-          console.log('[' + runtime.logPrefix + ':draft] send-preflight skipped tab=' + tabId.slice(-12) + ' reason=busy-midstream');
+          console.log('[' + runtime.logPrefix + ':draft] send-preflight skipped tab=' + tabId.slice(-12)
+            + ' reason=' + (statusAtSend === 'inactive' ? 'auto-launch' : 'busy-midstream'));
         }
+        // Image identity belongs only to the editable textarea. Chip bodies
+        // may legitimately contain a literal "[Image #1]" copied from logs;
+        // treating that literal as an attachment would consume an unrelated
+        // image ref or turn it into imageError. Materialize textarea markers
+        // first, then serialize prompt/paste chips around that transport text.
         const sourceDraftImages = retainHistoryDraftImages(
-          text,
+          rawDraftSnapshot,
           useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
         );
-        const preparedPrompt = await prepareHistoryPromptForSend(text, sourceDraftImages);
+        const preparedPrompt = await prepareHistoryPromptForSend(rawDraftSnapshot, sourceDraftImages);
         if (!isCurrentAction()) return;
         if (!preparedPrompt.success) {
           const latestText = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
@@ -2862,10 +3097,15 @@ function AgentHistoryControls({
             latestText,
             useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
           );
-          const sourceStillCurrent = latestText === text
-            && haveSamePromptImageRefs(latestImages, sourceDraftImages);
+          const latestChips = useUIStore.getState().historyPromptDraftChips[actionTabId] || [];
+          const sourceStillCurrent = latestText === rawDraftSnapshot
+            && haveSamePromptImageRefs(latestImages, sourceDraftImages)
+            && haveSameComposerChips(latestChips, sourceDraftChips);
           if (sourceStillCurrent) {
-            setHistoryPromptDraft(actionTabId, text, { images: preparedPrompt.images });
+            setHistoryPromptDraft(actionTabId, rawDraftSnapshot, {
+              images: preparedPrompt.images,
+              chips: sourceDraftChips,
+            });
             setDraftWarning(preparedPrompt.warning || 'Image attachment is not ready.');
           } else {
             setDraftWarning('The draft changed while the image was being checked. Review it and press Send again.');
@@ -2875,39 +3115,73 @@ function AgentHistoryControls({
           return;
         }
         const sendDraftImages = preparedPrompt.images;
-        const sendPayload = preparedPrompt.payload;
+        const sendPayload = serializeComposerDraft({
+          text: preparedPrompt.payload,
+          chips: sourceDraftChips,
+        }).trim();
         const handoffId = createPromptHandoffId();
         const submittedAt = Date.now();
         sendHandoffId = handoffId;
+        if (statusAtSend === 'inactive') {
+          // Enter is the user's single submit intent. The scenario layer owns
+          // Start/Resume + readiness; History only projects that lifecycle
+          // immediately so there is never an inert "press Resume first" step.
+          setStatusFrom('starting', sessionId ? 'send-auto-resume' : 'send-auto-start');
+        }
         historyDiag('SEND_CLICK tab=' + tabId.slice(-12) +
           ' handoff=' + handoffId +
           ' statusAtSend=' + statusAtSend +
-          ' chars=' + text.length +
+          ' chars=' + presentationText.length +
+          ' draftChars=' + rawDraftSnapshot.length +
           ' payloadChars=' + sendPayload.length +
+          ' draftHash=' + historyOwnerDigest(rawDraftSnapshot) +
+          ' textHash=' + historyOwnerDigest(presentationText) +
+          ' chips=' + sourceDraftChips.length +
           ' images=' + sendDraftImages.length +
           ' pasteBusy=' + pasteBusyRef.current +
-          ' preview="' + promptPreview(text) + '"');
-        onPromptSubmitted(text, 'sending', { handoffId, statusAtSend, submittedAt });
+          ' preview="' + promptPreview(presentationText) + '"');
+        onPromptSubmitted(presentationText, 'sending', { handoffId, statusAtSend, submittedAt });
         const latestText = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
         const latestImages = retainHistoryDraftImages(
           latestText,
           useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
         );
-        const sourceStillCurrent = latestText === text
-          && haveSamePromptImageRefs(latestImages, sourceDraftImages);
+        const latestChips = useUIStore.getState().historyPromptDraftChips[actionTabId] || [];
+        const sourceStillCurrent = latestText === rawDraftSnapshot
+          && haveSamePromptImageRefs(latestImages, sourceDraftImages)
+          && haveSameComposerChips(latestChips, sourceDraftChips);
         if (sourceStillCurrent) {
           clearedPromptImages = sendDraftImages;
-          setHistoryPromptDraft(actionTabId, '', { images: [] });
-          clearedPromptText = text;
+          clearedPromptChips = sourceDraftChips;
+          setHistoryPromptDraft(actionTabId, '', { images: [], chips: [] });
+          clearedPromptText = rawDraftSnapshot;
         } else {
-          console.log('[' + runtime.logPrefix + ':images] send snapshot handed off; newer draft preserved tab=' + actionTabId.slice(-12));
+          const mismatch = latestText !== rawDraftSnapshot
+            ? 'text'
+            : !haveSamePromptImageRefs(latestImages, sourceDraftImages)
+              ? 'images'
+              : 'chips';
+          console.log('[' + runtime.logPrefix + ':images] send snapshot handed off; newer draft preserved tab='
+            + actionTabId.slice(-12)
+            + ' mismatch=' + mismatch
+            + ' snapshotChars=' + rawDraftSnapshot.length
+            + ' latestChars=' + latestText.length
+            + ' snapshotHash=' + historyOwnerDigest(rawDraftSnapshot)
+            + ' latestHash=' + historyOwnerDigest(latestText));
         }
         setDraftWarning(null);
-        const result = await runtime.sendPrompt(tabId, sendPayload, {
+        const result = await sendAgentPromptScenario({
+          tabId,
+          toolType: runtime.toolType,
+          runtime,
+          sessionId,
+          cwd,
+          prompt: sendPayload,
           handoffId,
           source: 'history-panel',
           statusAtSend,
           queue: statusAtSend === 'busy',
+          returnDraftOnConflict: true,
         });
         historyDiag('SEND_RESULT tab=' + tabId.slice(-12) +
           ' handoff=' + handoffId +
@@ -2916,15 +3190,47 @@ function AgentHistoryControls({
           ' chunks=' + (result?.chunksTotal ?? 'na') +
           ' error=' + (result?.error || '-'));
         if (!isCurrentAction()) return;
-        if (result?.success === false) throw new Error(result?.error || 'Send failed');
-        onPromptStatusChange(handoffId, statusAtSend === 'busy' ? 'queued' : 'sent', 'send-result');
-        midstreamPromptRecoveryRef.current = { text, at: Date.now(), handoffId, statusAtSend };
-        console.log('[' + runtime.logPrefix + ':draft] send tracked tab=' + tabId.slice(-12) + ' handoff=' + handoffId + ' statusAtSend=' + statusAtSend + ' chars=' + text.length);
+        sendOwnershipTransferred = queueSendTransferredOwnership(result);
+        sendDeliveryUnconfirmed = result?.success === false && result?.submitted === true;
+        const effectiveStatusAtSend = result?.effectiveStatusAtSend || statusAtSend;
+        sendTransferredQueueStatus = effectiveStatusAtSend === 'busy' ? 'queued' : 'sent';
+        historyDiag('SEND_OWNERSHIP tab=' + tabId.slice(-12) +
+          ' handoff=' + handoffId +
+          ' transferred=' + sendOwnershipTransferred +
+          ' deliveryUnconfirmed=' + sendDeliveryUnconfirmed +
+          ' submitted=' + !!result?.submitted +
+          ' success=' + (result?.success !== false));
+        if (!sendOwnershipTransferred) throw new Error(result?.error || 'Send failed before submit');
+        onPromptStatusChange(
+          handoffId,
+          sendTransferredQueueStatus,
+          sendDeliveryUnconfirmed ? 'send-submitted-unconfirmed' : 'send-result',
+        );
+        if (sendDeliveryUnconfirmed) {
+          setDraftWarning('Prompt was submitted, but delivery confirmation is delayed. It will not be sent again automatically.');
+          console.warn('[' + runtime.logPrefix + ':draft] send delivery unconfirmed; ownership kept by terminal tab='
+            + actionTabId.slice(-12)
+            + ' handoff=' + handoffId
+            + ' error=' + (result?.error || '-'));
+        }
+        midstreamPromptRecoveryRef.current = {
+          serializedText: presentationText,
+          transportText: sendPayload,
+          rawText: rawDraftSnapshot,
+          chips: sourceDraftChips,
+          images: sendDraftImages,
+          at: Date.now(),
+          handoffId,
+          statusAtSend: (effectiveStatusAtSend === 'active' || effectiveStatusAtSend === 'busy')
+            ? effectiveStatusAtSend
+            : statusAtSend,
+        };
+        console.log('[' + runtime.logPrefix + ':draft] send tracked tab=' + tabId.slice(-12) + ' handoff=' + handoffId + ' statusAtSend=' + statusAtSend + ' chars=' + presentationText.length + ' chips=' + sourceDraftChips.length);
         if (runtime.optimisticBusyOnSend) {
           setStatusFrom('busy', 'send-click');
         } else {
           setStatusFrom('busy', 'send-confirmed');
-          if (statusAtSend !== 'active') refreshPresence();
+          if (effectiveStatusAtSend !== 'active') refreshPresence();
         }
         refreshHistoryWithUpdating('send-result');
       } else if (kind === 'interrupt') {
@@ -2978,12 +3284,60 @@ function AgentHistoryControls({
         return;
       }
       if (kind === 'send' && sendHandoffId) {
-        onPromptStatusChange(sendHandoffId, 'failed', 'send-error');
+        if (sendOwnershipTransferred) {
+          onPromptStatusChange(sendHandoffId, sendTransferredQueueStatus, 'send-post-transfer-error');
+          historyDiag('SEND_POST_TRANSFER_ERROR tab=' + actionTabId.slice(-12) +
+            ' handoff=' + sendHandoffId +
+            ' deliveryUnconfirmed=' + sendDeliveryUnconfirmed +
+            ' error=' + String(e?.message || e));
+        } else {
+          onPromptStatusChange(sendHandoffId, 'failed', 'send-pre-submit-error');
+        }
         const restorePrompt = clearedPromptText;
-        if (restorePrompt) {
+        if (!sendOwnershipTransferred && (restorePrompt !== null || clearedPromptChips.length > 0)) {
           const current = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
-          if (!current.trim()) {
-            setHistoryPromptDraft(actionTabId, restorePrompt, clearedPromptImages.length > 0 ? { images: clearedPromptImages } : undefined);
+          const currentImages = useUIStore.getState().historyPromptDraftImages[actionTabId] || [];
+          const currentChips = useUIStore.getState().historyPromptDraftChips[actionTabId] || [];
+          const hasNewDraft = !!current || currentImages.length > 0 || currentChips.length > 0;
+          if (!hasNewDraft) {
+            setHistoryPromptDraft(actionTabId, restorePrompt || '', {
+              images: clearedPromptImages,
+              chips: clearedPromptChips,
+            });
+            historyDiag('SEND_ROLLBACK_RESTORE tab=' + actionTabId.slice(-12) +
+              ' handoff=' + sendHandoffId +
+              ' mode=exact' +
+              ' chars=' + (restorePrompt || '').length +
+              ' images=' + clearedPromptImages.length +
+              ' chips=' + clearedPromptChips.length);
+          } else {
+            const merged = mergeFailedHistoryAuthoringSnapshot({
+              currentText: current,
+              currentImages,
+              currentChips,
+              snapshotText: restorePrompt || '',
+              snapshotImages: clearedPromptImages,
+              snapshotChips: clearedPromptChips,
+              createChipId: (chip: HistoryPromptDraftChip) => createComposerChipId(chip.kind),
+            });
+            setHistoryPromptDraft(actionTabId, merged.text, {
+              images: merged.images,
+              chips: merged.chips,
+            });
+            setDraftWarning('Send stopped before Enter. The failed prompt was restored before your newer draft.');
+            historyDiag('SEND_ROLLBACK_RESTORE tab=' + actionTabId.slice(-12) +
+              ' handoff=' + sendHandoffId +
+              ' mode=prepend-merge' +
+              ' snapshotChars=' + (restorePrompt || '').length +
+              ' currentChars=' + current.length +
+              ' mergedChars=' + merged.text.length +
+              ' snapshotHash=' + historyOwnerDigest(restorePrompt || '') +
+              ' currentHash=' + historyOwnerDigest(current) +
+              ' mergedHash=' + historyOwnerDigest(merged.text) +
+              ' images=' + clearedPromptImages.length + '->' + merged.images.length +
+              ' remappedImages=' + merged.remappedImageCount +
+              ' missingImageIds=' + merged.missingImageSourceIds.join(',') +
+              ' chips=' + clearedPromptChips.length + '+' + currentChips.length + '->' + merged.chips.length);
           }
         }
       }
@@ -3004,7 +3358,7 @@ function AgentHistoryControls({
         setBusyAction(null);
       }
     }
-  }, [busyAction, cwd, onPromptStatusChange, onPromptSubmitted, prepareHistoryPromptForSend, prompt, readTerminalDraft, refreshHistoryWithUpdating, refreshPresence, runtime, sessionId, setHistoryPromptDraft, setStatusFrom, tabId]);
+  }, [busyAction, cwd, onPromptStatusChange, onPromptSubmitted, prepareHistoryPromptForSend, prompt, readTerminalDraft, refreshHistoryWithUpdating, refreshPresence, resumeMaterialized, runtime, sessionId, setHistoryPromptDraft, setStatusFrom, tabId]);
 
   useEffect(() => {
     const submitComposer = (event: Event) => {
@@ -3015,6 +3369,26 @@ function AgentHistoryControls({
     window.addEventListener('history-panel:submit-composer', submitComposer);
     return () => window.removeEventListener('history-panel:submit-composer', submitComposer);
   }, [runAction, tabId]);
+
+  useEffect(() => {
+    const interruptTurn = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId?: string }>).detail;
+      if (detail?.tabId !== tabId) return;
+      void runAction('interrupt');
+    };
+    window.addEventListener('history-panel:interrupt-turn', interruptTurn);
+    return () => window.removeEventListener('history-panel:interrupt-turn', interruptTurn);
+  }, [runAction, tabId]);
+
+  useEffect(() => {
+    const pullDraft = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId?: string }>).detail;
+      if (detail?.tabId !== tabId) return;
+      void pullTerminalDraft();
+    };
+    window.addEventListener('history-panel:pull-terminal-draft', pullDraft);
+    return () => window.removeEventListener('history-panel:pull-terminal-draft', pullDraft);
+  }, [pullTerminalDraft, tabId]);
 
   const answerPendingQuestion = useCallback(async (answers: Record<string, string>, stop = false) => {
     if (!runtime.answerQuestion) return;
@@ -3134,26 +3508,99 @@ function AgentHistoryControls({
   const hasPromptImageMarkup = promptImageMarkerRanges.length > 0
     || historyImagePastePending
     || /\[(?:imagePath|imageError):/i.test(prompt);
-  const canAcceptPrompt = status === 'active' || (status === 'busy' && runtime.allowSendWhileBusy);
-  const canSend = canAcceptPrompt
-    && prompt.trim().length > 0
+  const canStartFresh = status === 'inactive' && !effectiveStopping && !sessionId && !!runtime.startFresh && !busyAction;
+  const canResume = status === 'inactive' && !effectiveStopping && !!sessionId && (runtime.toolType !== 'claude' || resumeMaterialized === true) && !busyAction;
+  const canStartOrResume = canStartFresh || canResume;
+  const canAcceptPrompt = status === 'active'
+    || (status === 'busy' && runtime.allowSendWhileBusy)
+    || canStartOrResume;
+  const canAcceptSubmitIntent = canAcceptPrompt
     && !pendingQuestion
     && !controlsLocked
     && !historyImagePastePending
     && !derivedDraftWarning;
+  const canSend = canAcceptSubmitIntent
+    && (prompt.trim().length > 0 || draftChips.length > 0);
   const canGrabDraft = (status === 'active' || status === 'busy') && !pendingQuestion && !controlsLocked;
   const canInterruptTurn = isTurnBusy && !controlsLocked;
-  const canStartFresh = status === 'inactive' && !effectiveStopping && !sessionId && !!runtime.startFresh && !busyAction;
-  const canResume = status === 'inactive' && !effectiveStopping && !!sessionId && (runtime.toolType !== 'claude' || resumeMaterialized === true) && !busyAction;
-  const canStartOrResume = canStartFresh || canResume;
   const canStopProcess = (status === 'active' || status === 'busy' || status === 'starting') && !effectiveStopping && !busyAction;
   const visibleDraftWarning = draftWarning || derivedDraftWarning;
   const draftNoticeMeta = visibleDraftWarning ? getDraftNoticeMeta(visibleDraftWarning) : null;
-  const promptIdleBorder = isCancellingTurn || rewindLocked || effectiveStopping ? 'rgba(217, 119, 6, 0.65)' : '#333';
+
+  useLayoutEffect(() => {
+    const ownerId = availabilityOwnerRef.current;
+    if (!overlayComposer) {
+      setHistoryComposerAvailability(tabId, null, ownerId);
+      return;
+    }
+    setHistoryComposerAvailability(tabId, {
+      ownerId,
+      canSend,
+      canAcceptSubmitIntent,
+      canInterruptTurn,
+      canPullDraft: canGrabDraft,
+      status,
+    }, ownerId);
+    historyDiag('COMPOSER_AVAILABILITY tab=' + tabId.slice(-12) +
+      ' status=' + status +
+      ' send=' + (canSend ? '1' : '0') +
+      ' acceptSubmit=' + (canAcceptSubmitIntent ? '1' : '0') +
+      ' interrupt=' + (canInterruptTurn ? '1' : '0') +
+      ' pull=' + (canGrabDraft ? '1' : '0'));
+  }, [
+    canGrabDraft,
+    canAcceptSubmitIntent,
+    canInterruptTurn,
+    canSend,
+    overlayComposer,
+    setHistoryComposerAvailability,
+    status,
+    tabId,
+  ]);
+
+  useEffect(() => {
+    const ownerId = availabilityOwnerRef.current;
+    return () => setHistoryComposerAvailability(tabId, null, ownerId);
+  }, [setHistoryComposerAvailability, tabId]);
+
+  useEffect(() => {
+    if (!overlayComposer || terminalOpen || pendingQuestion || !canInterruptTurn) return;
+    const interruptOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing) return;
+      // Menus/search/modals own Escape first. Their capture handlers normally
+      // stop the event before this bubble listener; the DOM guard also covers
+      // portal menus whose handler is mounted later in the tree.
+      if (document.querySelector([
+        '[data-history-insert-menu-root]',
+        '[data-history-insert-menu-scripts]',
+        '[data-timeline-context-menu]',
+        '[data-run-after-picker-menu]',
+        '[data-task-plan-status-menu]',
+        '[data-task-plan-action-menu]',
+        '[aria-modal="true"]',
+      ].join(','))) return;
+      event.preventDefault();
+      event.stopPropagation();
+      historyDiag('ESCAPE_INTERRUPT tab=' + tabId.slice(-12) + ' source=history-main');
+      void runAction('interrupt');
+    };
+    // Bubble phase is deliberate: search and popup capture handlers get first
+    // refusal. Escape reaches the turn interrupt only when no higher-priority
+    // surface claimed it.
+    window.addEventListener('keydown', interruptOnEscape);
+    return () => window.removeEventListener('keydown', interruptOnEscape);
+  }, [canInterruptTurn, overlayComposer, pendingQuestion, runAction, tabId, terminalOpen]);
 
   useEffect(() => {
     const insertIntoComposer = (event: Event) => {
-      const detail = (event as CustomEvent<{ tabId?: string; text?: string }>).detail;
+      const detail = (event as CustomEvent<{
+        tabId?: string;
+        text?: string;
+        source?: string;
+        kind?: HistoryPromptDraftChip['kind'];
+        label?: string;
+        sourceKey?: string;
+      }>).detail;
       if (detail?.tabId !== tabId) return;
       // A cancelable composer event uses preventDefault as its synchronous
       // handled acknowledgement. Claim it before lock checks so the picker
@@ -3164,6 +3611,27 @@ function AgentHistoryControls({
       if (!text) return;
       if (isCancellingTurn || rewindLocked || effectiveStopping) {
         setDraftWarning('History input is temporarily locked');
+        return;
+      }
+
+      const insertAsPromptChip = detail.kind === 'prompt' || detail.source === 'prompt-picker';
+      if (insertAsPromptChip) {
+        const currentText = useUIStore.getState().historyPromptDrafts[tabId] || '';
+        const currentChips = useUIStore.getState().historyPromptDraftChips[tabId] || [];
+        const chip: HistoryPromptDraftChip = {
+          id: createComposerChipId('prompt'),
+          kind: 'prompt',
+          text,
+          label: detail.label || 'Prompt',
+          sourceKey: detail.sourceKey,
+          createdAt: Date.now(),
+        };
+        const nextChips = upsertComposerChip(currentChips, chip) as HistoryPromptDraftChip[];
+        setHistoryPromptDraft(tabId, currentText, {
+          preserveImages: true,
+          chips: nextChips,
+        });
+        requestAnimationFrame(() => promptTextareaRef.current?.focus());
         return;
       }
 
@@ -3181,6 +3649,7 @@ function AgentHistoryControls({
           next,
           useUIStore.getState().historyPromptDraftImages[tabId] || [],
         ),
+        preserveChips: true,
       });
       const caret = start + text.length;
       requestAnimationFrame(() => {
@@ -3192,12 +3661,49 @@ function AgentHistoryControls({
     };
     window.addEventListener('history-panel:composer-insert', insertIntoComposer);
     return () => window.removeEventListener('history-panel:composer-insert', insertIntoComposer);
-  }, [effectiveStopping, isCancellingTurn, rewindLocked, setPrompt, tabId]);
+  }, [effectiveStopping, isCancellingTurn, rewindLocked, setHistoryPromptDraft, setPrompt, tabId]);
 
   const handleComposerImagePaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const hasImageItem = Array.from(event.clipboardData?.items || [])
       .some((item) => item.kind === 'file' && item.type.toLowerCase().startsWith('image/'));
-    if (!hasImageItem) return;
+    if (!hasImageItem) {
+      const pastedText = event.clipboardData?.getData('text/plain') || '';
+      if (!shouldCreatePasteChip(pastedText, aiComposerChipThreshold)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (isCancellingTurn || rewindLocked || effectiveStopping) {
+        setDraftWarning('History input is temporarily locked');
+        return;
+      }
+      const element = event.currentTarget;
+      const currentText = useUIStore.getState().historyPromptDrafts[tabId] || '';
+      const start = Math.max(0, Math.min(element.selectionStart ?? currentText.length, currentText.length));
+      const end = Math.max(start, Math.min(element.selectionEnd ?? start, currentText.length));
+      const nextText = currentText.slice(0, start) + currentText.slice(end);
+      const currentChips = useUIStore.getState().historyPromptDraftChips[tabId] || [];
+      const chip: HistoryPromptDraftChip = {
+        id: createComposerChipId('paste'),
+        kind: 'paste',
+        text: pastedText,
+        label: 'Вставка',
+        createdAt: Date.now(),
+      };
+      setHistoryPromptDraft(tabId, nextText, {
+        images: retainHistoryDraftImages(
+          nextText,
+          useUIStore.getState().historyPromptDraftImages[tabId] || [],
+        ),
+        chips: [...currentChips, chip],
+      });
+      promptCaretRef.current = { start, end: start };
+      requestAnimationFrame(() => {
+        const textarea = promptTextareaRef.current;
+        if (!textarea) return;
+        textarea.focus();
+        textarea.setSelectionRange(start, start);
+      });
+      return;
+    }
 
     event.preventDefault();
     event.stopPropagation();
@@ -3219,6 +3725,7 @@ function AgentHistoryControls({
     const currentImages = useUIStore.getState().historyPromptDraftImages[actionTabId] || [];
     setHistoryPromptDraft(actionTabId, pendingText, {
       images: retainHistoryDraftImages(pendingText, currentImages),
+      preserveChips: true,
     });
     setDraftWarning('Saving image attachment…');
     const pendingCaret = start + HISTORY_IMAGE_PENDING_MARKER.length;
@@ -3254,6 +3761,7 @@ function AgentHistoryControls({
               failedText,
               useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
             ),
+            preserveChips: true,
           });
           if (tabIdRef.current === actionTabId) {
             setDraftWarning('Could not save the clipboard image. Copy it again and retry.');
@@ -3268,7 +3776,7 @@ function AgentHistoryControls({
           imagePaths: useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
           start: tokenStart,
           end: tokenStart + HISTORY_IMAGE_PENDING_MARKER.length,
-          insertedText: '[Image #0]',
+          insertedText: '[Image #0] ',
           insertedImagePaths: [{ ...saved, id: 0 }],
         });
         if (insertion.missingSourceIds.length > 0) {
@@ -3276,6 +3784,7 @@ function AgentHistoryControls({
         }
         setHistoryPromptDraft(actionTabId, insertion.text, {
           images: insertion.imagePaths,
+          preserveChips: true,
         });
         if (tabIdRef.current === actionTabId) setDraftWarning(null);
         console.log('[' + runtime.logPrefix + ':images] clipboard-save ready tab=' + actionTabId.slice(-12)
@@ -3284,14 +3793,12 @@ function AgentHistoryControls({
           + ' bytes=' + (saved.size || 0));
 
         if (preserveSelection) {
-          const delta = insertion.addedImagePaths.length > 0
-            ? (`[Image #${insertion.addedImagePaths[0].id}]`.length - HISTORY_IMAGE_PENDING_MARKER.length)
-            : 0;
           const tokenEnd = tokenStart + HISTORY_IMAGE_PENDING_MARKER.length;
+          const delta = insertion.caret - tokenEnd;
           const adjust = (position: number) => position >= tokenEnd
             ? position + delta
             : position > tokenStart
-              ? tokenStart + (`[Image #${insertion.addedImagePaths[0]?.id || 0}]`).length
+              ? insertion.caret
               : position;
           requestAnimationFrame(() => {
             const currentTextarea = promptTextareaRef.current;
@@ -3313,6 +3820,7 @@ function AgentHistoryControls({
             failedText,
             useUIStore.getState().historyPromptDraftImages[actionTabId] || [],
           ),
+          preserveChips: true,
         });
         if (tabIdRef.current === actionTabId) {
           setDraftWarning('Could not save the clipboard image. Copy it again and retry.');
@@ -3320,7 +3828,64 @@ function AgentHistoryControls({
         console.warn('[' + runtime.logPrefix + ':images] clipboard-save exception tab=' + actionTabId.slice(-12)
           + ' error=' + String(cause?.message || cause));
       });
-  }, [effectiveStopping, isCancellingTurn, rewindLocked, runtime.logPrefix, setHistoryPromptDraft, tabId]);
+  }, [aiComposerChipThreshold, effectiveStopping, isCancellingTurn, rewindLocked, runtime.logPrefix, setHistoryPromptDraft, tabId]);
+
+  const restoreChipToComposer = useCallback((chip: HistoryPromptDraftChip) => {
+    if (isCancellingTurn || rewindLocked || effectiveStopping) {
+      setDraftWarning('History input is temporarily locked');
+      return;
+    }
+    const currentText = useUIStore.getState().historyPromptDrafts[tabId] || '';
+    const textarea = promptTextareaRef.current;
+    const saved = promptCaretRef.current;
+    const selectionStart = document.activeElement === textarea
+      ? (textarea?.selectionStart ?? saved.start)
+      : saved.start;
+    const selectionEnd = document.activeElement === textarea
+      ? (textarea?.selectionEnd ?? saved.end)
+      : saved.end;
+    const restored = restoreComposerChipToText({
+      text: currentText,
+      chipText: chip.text,
+      selectionStart,
+      selectionEnd,
+    });
+    const remainingChips = (useUIStore.getState().historyPromptDraftChips[tabId] || [])
+      .filter((item) => item.id !== chip.id);
+    setHistoryPromptDraft(tabId, restored.text, {
+      images: retainHistoryDraftImages(
+        restored.text,
+        useUIStore.getState().historyPromptDraftImages[tabId] || [],
+      ),
+      chips: remainingChips,
+    });
+    setPreviewChipId(null);
+    promptCaretRef.current = { start: restored.caret, end: restored.caret };
+    requestAnimationFrame(() => {
+      const currentTextarea = promptTextareaRef.current;
+      if (!currentTextarea) return;
+      currentTextarea.focus();
+      currentTextarea.setSelectionRange(restored.caret, restored.caret);
+    });
+  }, [effectiveStopping, isCancellingTurn, rewindLocked, setHistoryPromptDraft, tabId]);
+
+  const discardComposerChip = useCallback((chipId: string) => {
+    removeHistoryPromptDraftChip(tabId, chipId);
+    setPreviewChipId((current) => current === chipId ? null : current);
+    requestAnimationFrame(() => promptTextareaRef.current?.focus());
+  }, [removeHistoryPromptDraftChip, tabId]);
+
+  const composerSurfaceChips = useMemo<AIComposerSurfaceChip[]>(
+    () => draftChips.map((chip) => ({
+      id: chip.id,
+      kind: chip.kind,
+      label: chip.kind === 'prompt' ? (chip.label || 'PROMPT') : 'ВСТАВКА',
+      text: chip.text,
+      onRestore: () => restoreChipToComposer(chip),
+      onDiscard: () => discardComposerChip(chip.id),
+    })),
+    [discardComposerChip, draftChips, restoreChipToComposer],
+  );
 
   const basicStatusDescription: Record<AgentPtyStatus, string> = {
     active: runtime.label + ' is ready for prompts',
@@ -3369,6 +3934,13 @@ function AgentHistoryControls({
           ? '#60a5fa'
           : meta.color
   );
+  const showStatusText = statusCopied
+    || !!unifiedTransientStatus
+    || !!activeLifecycle
+    || status === 'starting'
+    || status === 'stopping'
+    || status === 'unknown';
+  const showBusyLoader = status === 'busy' && !showStatusText;
   const copyStatusDetails = useCallback(() => {
     const text = [
       statusTitle === 'COPIED' ? (activeLifecycle?.title || meta.label) : statusTitle,
@@ -3393,190 +3965,192 @@ function AgentHistoryControls({
     copyStatusDetails();
   }, [copyStatusDetails, onToggleTerminal]);
 
+  // History owns PTY state, but the top line follows the SDK presentation:
+  // one compact terminal/status affordance plus transient authoring notices.
+  // Start/Resume/Send/Stop stay in the workspace control bar below the surface.
+  const historyComposerTopBar = (
+    <div className="hp-history-composer-toolbar">
+      <Tooltip
+        always
+        interactive={false}
+        side="top"
+        content={[
+          statusDescription,
+          statusDetail,
+          onToggleTerminal
+            ? (terminalOpen ? 'Click to hide terminal' : 'Click to open terminal')
+            : 'Click to copy status details',
+          'Right-click to copy status details',
+        ].filter(Boolean).join('\n')}
+      >
+        <button
+          type="button"
+          data-agent-status-row
+          data-terminal-toggle={onToggleTerminal ? 'status' : undefined}
+          aria-label={onToggleTerminal ? (terminalOpen ? 'Hide terminal' : 'Open terminal') : 'Copy agent status details'}
+          aria-pressed={onToggleTerminal ? !!terminalOpen : undefined}
+          onClick={activateUnifiedStatus}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            copyStatusDetails();
+          }}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: showStatusText ? 6 : 0,
+            minWidth: 24,
+            maxWidth: 'min(36vw, 360px)',
+            height: 24,
+            padding: showStatusText ? '0 6px' : '0 3px',
+            border: `1px solid ${terminalOpen && onToggleTerminal ? '#f5f5f5' : '#343434'}`,
+            borderRadius: 5,
+            background: terminalOpen && onToggleTerminal ? '#242424' : 'transparent',
+            color: statusCopied ? '#86efac' : '#aaa',
+            fontSize: aiSecondaryFontSize,
+            fontWeight: 650,
+            letterSpacing: showStatusText ? '0.04em' : 0,
+            cursor: onToggleTerminal ? 'pointer' : 'copy',
+            flexShrink: 0,
+          }}
+        >
+          <span
+            aria-hidden
+            style={{
+              position: 'relative',
+              width: 16,
+              height: 16,
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: statusAccent,
+              flexShrink: 0,
+            }}
+          >
+            {showBusyLoader && (
+              <span style={{ position: 'absolute', inset: 0 }}>
+                <HistorySpinner size={16} />
+              </span>
+            )}
+            <SquareTerminal
+              size={showBusyLoader ? 9 : 13}
+              style={{
+                position: 'relative',
+                filter: showBusyLoader ? 'drop-shadow(0 0 3px rgba(217, 119, 6, 0.8))' : undefined,
+              }}
+            />
+          </span>
+          {showStatusText && (
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {statusTitle}
+            </span>
+          )}
+        </button>
+      </Tooltip>
+
+      {visibleDraftWarning && !error && draftNoticeMeta && (
+        <Tooltip content={visibleDraftWarning}>
+          <div
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              minWidth: 0,
+              maxWidth: 260,
+              height: 20,
+              padding: '0 7px',
+              borderRadius: 5,
+              border: '1px solid ' + (draftNoticeMeta.tone === 'info' ? 'rgba(113, 113, 122, 0.55)' : 'rgba(251, 191, 36, 0.45)'),
+              backgroundColor: draftNoticeMeta.tone === 'info' ? 'rgba(82, 82, 91, 0.18)' : 'rgba(217, 119, 6, 0.16)',
+              color: draftNoticeMeta.tone === 'info' ? '#d4d4d8' : '#fbbf24',
+              fontSize: aiSecondaryFontSize,
+              fontWeight: 650,
+              letterSpacing: 0,
+              flexShrink: 1,
+            }}
+          >
+            {draftNoticeMeta.tone !== 'info' && <AlertTriangle size={12} style={{ flexShrink: 0 }} />}
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {draftNoticeMeta.label}
+            </span>
+          </div>
+        </Tooltip>
+      )}
+
+      {rewindPreviewActive && !error && (
+        <Tooltip content="Preview after native rewind. JSONL is not changed until you submit the restored prompt. Restarting Claude or reopening History shows the full transcript again.">
+          <div
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 5,
+              minWidth: 0,
+              maxWidth: 260,
+              height: 20,
+              padding: '0 7px',
+              borderRadius: 5,
+              border: '1px solid rgba(217, 119, 6, 0.42)',
+              backgroundColor: 'rgba(217, 119, 6, 0.13)',
+              color: '#fbbf24',
+              fontSize: aiSecondaryFontSize,
+              fontWeight: 750,
+              letterSpacing: 0,
+              flexShrink: 1,
+            }}
+          >
+            <span style={{ whiteSpace: 'nowrap' }}>REWIND PREVIEW</span>
+            <span style={{ color: '#a1a1aa', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {rewindPreviewHiddenCount > 0 ? rewindPreviewHiddenCount + ' hidden' : 'unsaved'}
+            </span>
+          </div>
+        </Tooltip>
+      )}
+    </div>
+  );
+
   return (
     <div
       ref={controlsRef}
       data-history-controls
       style={{
         position: overlayComposer ? 'absolute' : 'relative',
-        left: overlayComposer ? 0 : undefined,
-        right: overlayComposer ? 0 : undefined,
+        left: overlayComposer ? 16 : undefined,
+        right: overlayComposer ? 16 : undefined,
         bottom: overlayComposer ? 0 : undefined,
         zIndex: overlayComposer ? 20 : undefined,
         flexShrink: 0,
-        borderTop: '1px solid #333',
-        backgroundColor: '#151515',
-        padding: '8px 10px 10px 12px',
-        boxShadow: overlayComposer ? '0 -10px 24px rgba(0, 0, 0, 0.28)' : undefined,
+        borderTop: overlayComposer ? 'none' : '1px solid #333',
+        backgroundColor: overlayComposer ? 'transparent' : '#151515',
+        padding: overlayComposer ? '0 0 4px' : '8px 10px 10px 12px',
       }}
       onMouseDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 7 }}>
-        <Tooltip
-          always
-          interactive={false}
-          side="top"
-          content={[
-            statusDescription,
-            statusDetail,
-            onToggleTerminal
-              ? (terminalOpen ? 'Click to hide terminal' : 'Click to open terminal')
-              : 'Click to copy status details',
-            'Right-click to copy status details',
-          ].filter(Boolean).join('\n')}
-        >
-          <button
-            type="button"
-            data-agent-status-row
-            data-terminal-toggle={onToggleTerminal ? 'status' : undefined}
-            aria-label={onToggleTerminal ? (terminalOpen ? 'Hide terminal' : 'Open terminal') : 'Copy agent status details'}
-            aria-pressed={onToggleTerminal ? !!terminalOpen : undefined}
-            onClick={activateUnifiedStatus}
-            onContextMenu={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              copyStatusDetails();
-            }}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 6,
-              minWidth: 0,
-              maxWidth: 'min(52vw, 520px)',
-              height: 22,
-              padding: '0 5px',
-              border: `1px solid ${terminalOpen && onToggleTerminal ? '#f5f5f5' : 'transparent'}`,
-              borderRadius: 5,
-              background: terminalOpen && onToggleTerminal ? '#242424' : 'transparent',
-              color: statusCopied ? '#86efac' : '#aaa',
-              fontSize: 10,
-              fontWeight: 650,
-              letterSpacing: activeLifecycle ? '0.04em' : 0,
-              cursor: onToggleTerminal ? 'pointer' : 'copy',
-            }}
-          >
-            <SquareTerminal
-              size={13}
-              aria-hidden
-              style={{
-                color: statusAccent,
-                filter: status === 'busy' ? 'drop-shadow(0 0 4px rgba(217, 119, 6, 0.85))' : undefined,
-                flexShrink: 0,
-              }}
-            />
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{statusTitle}</span>
-          </button>
-        </Tooltip>
-        {visibleDraftWarning && !error && draftNoticeMeta && (
-          <Tooltip content={visibleDraftWarning}>
-            <div
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 4,
-                minWidth: 0,
-                maxWidth: 260,
-                height: 20,
-                padding: '0 7px',
-                borderRadius: 5,
-                border: '1px solid ' + (draftNoticeMeta.tone === 'info' ? 'rgba(113, 113, 122, 0.55)' : 'rgba(251, 191, 36, 0.45)'),
-                backgroundColor: draftNoticeMeta.tone === 'info' ? 'rgba(82, 82, 91, 0.18)' : 'rgba(217, 119, 6, 0.16)',
-                color: draftNoticeMeta.tone === 'info' ? '#d4d4d8' : '#fbbf24',
-                fontSize: 10,
-                fontWeight: 650,
-                letterSpacing: 0,
-                flexShrink: 1,
-              }}
-            >
-              {draftNoticeMeta.tone !== 'info' && <AlertTriangle size={12} style={{ flexShrink: 0 }} />}
-              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {draftNoticeMeta.label}
-              </span>
-            </div>
-          </Tooltip>
-        )}
-        {rewindPreviewActive && !error && (
-          <Tooltip content="Preview after native rewind. JSONL is not changed until you submit the restored prompt. Restarting Claude or reopening History shows the full transcript again.">
-            <div
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 5,
-                minWidth: 0,
-                maxWidth: 260,
-                height: 20,
-                padding: '0 7px',
-                borderRadius: 5,
-                border: '1px solid rgba(217, 119, 6, 0.42)',
-                backgroundColor: 'rgba(217, 119, 6, 0.13)',
-                color: '#fbbf24',
-                fontSize: 10,
-                fontWeight: 750,
-                letterSpacing: 0,
-                flexShrink: 1,
-              }}
-            >
-              <span style={{ whiteSpace: 'nowrap' }}>REWIND PREVIEW</span>
-              <span style={{ color: '#a1a1aa', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {rewindPreviewHiddenCount > 0 ? rewindPreviewHiddenCount + ' hidden' : 'unsaved'}
-              </span>
-            </div>
-          </Tooltip>
-        )}
-        <div style={{ flex: 1 }} />
-        {status === 'inactive' && !effectiveStopping && (
-          <Tooltip content={canStartFresh ? ('Start ' + runtime.label) : canResume ? ('Resume ' + runtime.label + ' session') : (resumeUnavailableReason ? 'No saved Claude conversation yet' : 'Resume unavailable')}>
-            <button
-              aria-label={(canStartFresh ? 'Start ' : 'Resume ') + runtime.label + (canStartFresh ? '' : ' session')}
-              onClick={() => runAction('resume')}
-              disabled={!canStartOrResume}
-              style={{
-                ...historyControlButtonBase,
-                cursor: canStartOrResume ? 'pointer' : 'default',
-                color: canStartOrResume ? '#1a1a1a' : '#777',
-                backgroundColor: canStartOrResume ? '#DA7756' : '#242424',
-                border: `1px solid ${canStartOrResume ? '#DA7756' : '#343434'}`,
-              }}
-            >
-              <RotateCcw size={13} />
-              {busyAction === 'resume' ? (canStartFresh ? 'STARTING' : 'RESUMING') : (canStartFresh ? 'Start' : 'Resume')}
-            </button>
-          </Tooltip>
-        )}
-        {(status !== 'inactive' || effectiveStopping) && (
-          <ControlHint label={'Остановить процесс ' + runtime.label}>
-            <button
-              aria-label={'Stop ' + runtime.label + ' process'}
-              onClick={() => runAction('stop')}
-              disabled={!canStopProcess}
-              style={{
-                ...historyControlButtonBase,
-                width: 28,
-                padding: 0,
-                cursor: canStopProcess ? 'pointer' : 'default',
-                color: canStopProcess ? '#fca5a5' : '#666',
-              }}
-            >
-              <Power size={13} />
-            </button>
-          </ControlHint>
-        )}
-      </div>
-
       {pendingQuestion ? (
-        <ClaudeHistoryQuestionCard
-          key={(pendingQuestion.source || 'unknown') + ':' + (pendingQuestion.toolUseID || 'none') + ':' + (pendingQuestion.questions?.length || 0)}
-          tabId={tabId}
-          pending={pendingQuestion}
-          answering={answeringQuestion}
-          error={questionError}
-          onAnswer={(answers) => answerPendingQuestion(answers, false)}
-          onStop={() => answerPendingQuestion({}, true)}
-        />
+        <div className="hp-history-composer-frame" style={{ border: '1px solid #333', borderRadius: 12, padding: 8, background: '#0f0f0f' }}>
+          <div className="cb-composer-topbar">
+            {historyComposerTopBar}
+          </div>
+          <ClaudeHistoryQuestionCard
+            key={(pendingQuestion.source || 'unknown') + ':' + (pendingQuestion.toolUseID || 'none') + ':' + (pendingQuestion.questions?.length || 0)}
+            tabId={tabId}
+            pending={pendingQuestion}
+            answering={answeringQuestion}
+            error={questionError}
+            onAnswer={(answers) => answerPendingQuestion(answers, false)}
+            onStop={() => answerPendingQuestion({}, true)}
+          />
+        </div>
       ) : (
-        <>
-          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6 }}>
+        <AIComposerSurface
+          density="comfortable"
+          className="hp-history-composer-frame"
+          topBar={historyComposerTopBar}
+          chips={composerSurfaceChips}
+          expandedChipId={previewChipId}
+          onExpandedChipChange={setPreviewChipId}
+          secondaryFontSize={aiSecondaryFontSize}
+          input={(
             <div
               style={{
                 position: 'relative',
@@ -3610,7 +4184,7 @@ function AgentHistoryControls({
                     wordBreak: 'break-word',
                   }}
                 >
-                  {renderHistoryPromptHighlight(prompt, promptImageMarkerRanges)}
+                  {renderHistoryPromptHighlight(prompt, promptImageMarkerRanges, true)}
                 </div>
               )}
               <textarea
@@ -3622,11 +4196,16 @@ function AgentHistoryControls({
                 onChange={(e) => {
                   if (isCancellingTurn || rewindLocked) return;
                   const nextText = e.target.value;
+                  promptCaretRef.current = {
+                    start: e.target.selectionStart ?? nextText.length,
+                    end: e.target.selectionEnd ?? nextText.length,
+                  };
                   setPrompt(nextText, {
                     images: retainHistoryDraftImages(
                       nextText,
                       useUIStore.getState().historyPromptDraftImages[tabId] || [],
                     ),
+                    preserveChips: true,
                   });
                   if (draftWarning) setDraftWarning(null);
                   if (error) setError(null);
@@ -3643,6 +4222,12 @@ function AgentHistoryControls({
                   e.preventDefault();
                   if (canSend) runAction('send');
                 }}
+                onSelect={(event) => {
+                  promptCaretRef.current = {
+                    start: event.currentTarget.selectionStart ?? 0,
+                    end: event.currentTarget.selectionEnd ?? 0,
+                  };
+                }}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
@@ -3655,9 +4240,9 @@ function AgentHistoryControls({
                     },
                   }));
                 }}
-                placeholder={rewindLocked ? rewindStatusMeta?.placeholder || 'Rewinding... input is locked' : isCancellingTurn || effectiveStopping ? 'Stopping...' : status === 'inactive' ? 'Resume ' + runtime.label + ' to send' : status === 'starting' ? 'Waiting for prompt...' : 'Send a prompt...'}
+                placeholder={rewindLocked ? rewindStatusMeta?.placeholder || 'Rewinding... input is locked' : isCancellingTurn || effectiveStopping ? 'Stopping...' : status === 'inactive' ? 'Enter запускает ' + runtime.label + ' и отправляет' : status === 'starting' ? 'Запускаю терминал…' : 'Send a prompt...'}
                 readOnly={isCancellingTurn || rewindLocked || effectiveStopping}
-                rows={3}
+                rows={1}
                 style={{
                   position: 'relative',
                   zIndex: 1,
@@ -3671,8 +4256,8 @@ function AgentHistoryControls({
                   maxHeight: historyComposerMaxHeight,
                   minHeight: historyComposerMinHeight,
                   backgroundColor: 'transparent',
-                  border: '1px solid ' + promptIdleBorder,
-                  borderRadius: 5,
+                  border: 0,
+                  borderRadius: 8,
                   color: hasPromptImageMarkup
                     ? 'transparent'
                     : (isCancellingTurn || rewindLocked || effectiveStopping ? '#c7c7c7' : '#e5e5e5'),
@@ -3686,94 +4271,22 @@ function AgentHistoryControls({
                   overflowWrap: 'break-word',
                   wordBreak: 'break-word',
                 }}
-                onFocus={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = isCancellingTurn || effectiveStopping ? '#d97706' : '#DA7756'; }}
-                onBlur={(e) => { (e.currentTarget as HTMLTextAreaElement).style.borderColor = promptIdleBorder; }}
+                onFocus={(e) => {
+                  promptCaretRef.current = {
+                    start: e.currentTarget.selectionStart ?? 0,
+                    end: e.currentTarget.selectionEnd ?? 0,
+                  };
+                }}
+                onBlur={(e) => {
+                  promptCaretRef.current = {
+                    start: e.currentTarget.selectionStart ?? 0,
+                    end: e.currentTarget.selectionEnd ?? 0,
+                  };
+                }}
               />
             </div>
-            <div style={{ width: 42, display: 'flex', flexDirection: 'column', gap: 3, flexShrink: 0 }}>
-              <ControlHint label={canGrabDraft ? 'Забрать черновик из терминала' : runtime.label + ' ещё не готов отдать черновик'}>
-                <button
-                  aria-label={'Pull ' + runtime.label + ' terminal draft'}
-                  onClick={pullTerminalDraft}
-                  disabled={!canGrabDraft}
-                  style={{
-                    width: 42,
-                    height: 20,
-                    borderRadius: 5,
-                    border: '1px solid ' + (canGrabDraft ? '#3f3f46' : '#343434'),
-                    backgroundColor: canGrabDraft ? '#202020' : '#242424',
-                    color: canGrabDraft ? '#a78bfa' : '#666',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    cursor: canGrabDraft ? 'pointer' : 'default',
-                    flexShrink: 0,
-                  }}
-                >
-                  {busyAction === 'grab' ? (
-                    <HistorySpinner size={12} />
-                  ) : (
-                    <ArrowDown size={12} />
-                  )}
-                </button>
-              </ControlHint>
-              <ControlHint label={isCancellingTurn ? 'Жду завершения остановки' : isPasteBusy ? 'Идёт вставка в ' + runtime.label : isTurnBusy ? runtime.label + ' занят' : 'Отправить prompt'}>
-                <button
-                  aria-label={'Send ' + runtime.label + ' prompt'}
-                  onClick={() => runAction('send')}
-                  disabled={!canSend}
-                  style={{
-                    width: 42,
-                    height: 20,
-                    borderRadius: 5,
-                    border: '1px solid ' + (canSend ? '#DA7756' : '#343434'),
-                    backgroundColor: canSend ? '#DA7756' : '#242424',
-                    color: canSend ? '#1a1a1a' : '#666',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    cursor: canSend ? 'pointer' : 'default',
-                    flexShrink: 0,
-                  }}
-                >
-                  {busyAction === 'send' ? (
-                    <HistorySpinner size={12} />
-                  ) : (
-                    <Send size={12} />
-                  )}
-                </button>
-              </ControlHint>
-            </div>
-            {isTurnBusy && (
-              <ControlHint label={isCancellingTurn ? 'Жду подтверждения остановки' : 'Остановить текущий turn'}>
-                <button
-                  aria-label={'Stop current ' + runtime.label + ' turn'}
-                  onClick={() => runAction('interrupt')}
-                  disabled={!canInterruptTurn}
-                  style={{
-                    width: 42,
-                    height: 42,
-                    borderRadius: 5,
-                    border: '1px solid ' + (canInterruptTurn ? '#7f1d1d' : '#343434'),
-                    backgroundColor: canInterruptTurn ? '#2a1515' : '#242424',
-                    color: canInterruptTurn ? '#fca5a5' : '#666',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    cursor: canInterruptTurn ? 'pointer' : 'default',
-                    flexShrink: 0,
-                  }}
-                >
-                  {isCancellingTurn ? (
-                    <HistorySpinner size={14} />
-                  ) : (
-                    <Square size={14} fill="currentColor" />
-                  )}
-                </button>
-              </ControlHint>
-            )}
-          </div>
-        </>
+          )}
+        />
       )}
       {error && (
         <div style={{ marginTop: 6, color: '#fca5a5', fontSize: 11, wordBreak: 'break-word' }}>
@@ -3876,6 +4389,11 @@ function HistoryPanel({
     () => (firstRenderSnapshot?.entries as unknown as FullHistoryEntry[] | undefined) || [],
   );
   const [loading, setLoading] = useState(() => !firstRenderSnapshot);
+  const [presentedOwnerKey, setPresentedOwnerKey] = useState(historyOwnerKey);
+  // Props switch before the owner handoff layout effect can replace entries
+  // and loading together. Treat that one render as loading so the previous
+  // owner's empty state can never flash as a blank frame.
+  const surfaceLoading = loading || presentedOwnerKey !== historyOwnerKey;
   const historyOwnerStartedAtRef = useRef(Date.now());
   const historyLoaderReasonRef = useRef(
     firstRenderSnapshot ? 'first-render-cache-hit' : 'first-render-cache-miss',
@@ -3937,10 +4455,19 @@ function HistoryPanel({
     [entries, rewindPreview],
   );
   const displayEntries = rewindPreviewResult.entries;
+  const displayEntryIndexByUuid = useMemo(() => {
+    const index = new Map<string, number>();
+    for (let i = 0; i < displayEntries.length; i += 1) {
+      index.set(displayEntries[i].uuid, i);
+    }
+    return index;
+  }, [displayEntries]);
+  const displayEntryIndexByUuidRef = useRef(displayEntryIndexByUuid);
+  displayEntryIndexByUuidRef.current = displayEntryIndexByUuid;
   const pendingInitialHistoryIndex = useMemo(() => {
     if (!historyScrollToUuid || displayEntries.length === 0) return -1;
-    return displayEntries.findIndex((entry) => entry.uuid === historyScrollToUuid);
-  }, [historyScrollToUuid, displayEntries]);
+    return displayEntryIndexByUuid.get(historyScrollToUuid) ?? -1;
+  }, [displayEntryIndexByUuid, displayEntries.length, historyScrollToUuid]);
   const initialTopMostItemIndex = pendingInitialHistoryIndex >= 0
     ? { index: pendingInitialHistoryIndex, align: 'center' as const, behavior: 'auto' as const }
     : (displayEntries.length > 0 ? displayEntries.length - 1 : 0);
@@ -4023,22 +4550,33 @@ function HistoryPanel({
     if (event.deltaY === 0) return;
     const outerScroller = virtuosoScrollerRef.current;
     if (!outerScroller) return;
+    const activeBody = activeHistoryToolScrollBodyRef.current;
     const body = historyToolScrollBodyFromTarget(event.target, outerScroller);
+
+    // A clicked tool body owns the wheel while the pointer remains inside it.
+    // Reaching its top/bottom is a clamp, not permission to chain-scroll the
+    // History viewport. Ownership ends only after an explicit wheel/click
+    // outside, so extra ticks at the edge cannot unexpectedly move the chat.
+    if (activeBody && body === activeBody && activeBody.contains(event.target as Node)) {
+      const innerScroller = findHistoryToolInnerScroller(activeBody, event.target);
+      if (event.cancelable) event.preventDefault();
+      event.stopPropagation();
+      if (!innerScroller) return;
+      const scale = event.deltaMode === 1
+        ? 16
+        : event.deltaMode === 2
+          ? innerScroller.clientHeight
+          : 1;
+      innerScroller.scrollTop += event.deltaY * scale;
+      return;
+    }
+    if (activeBody) {
+      clearHistoryToolScrollFocus('outside-wheel');
+    }
+
     if (!body) return;
     const innerScroller = findHistoryToolInnerScroller(body, event.target);
     if (!innerScroller) return;
-
-    const activeBody = activeHistoryToolScrollBodyRef.current;
-    if (activeBody === body) {
-      const canScrollUp = event.deltaY < 0 && innerScroller.scrollTop > 0;
-      const canScrollDown = event.deltaY > 0
-        && innerScroller.scrollTop + innerScroller.clientHeight < innerScroller.scrollHeight - 1;
-      if (canScrollUp || canScrollDown) return;
-      clearHistoryToolScrollFocus('inner-scroll-edge');
-    } else if (activeBody) {
-      clearHistoryToolScrollFocus('other-tool-wheel');
-    }
-
     if (event.cancelable) event.preventDefault();
     const scale = event.deltaMode === 1
       ? 16
@@ -4978,7 +5516,7 @@ function HistoryPanel({
   // Broadcast loading state to InfoPanel button
   useEffect(() => {
     const snapshot = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner);
-    historyDiag((loading ? 'LOADER_VISIBLE' : 'LOADER_HIDDEN') +
+    historyDiag((surfaceLoading ? 'LOADER_VISIBLE' : 'LOADER_HIDDEN') +
       ' tab=' + tabId.slice(-12) +
       ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none') +
       ' tool=' + toolType +
@@ -4988,8 +5526,8 @@ function HistoryPanel({
       ' cacheEntries=' + (snapshot?.entries.length || 0) +
       ' visibleEntries=' + presentationEntriesRef.current.length +
       ' ownerAgeMs=' + Math.max(0, Date.now() - historyOwnerStartedAtRef.current));
-    window.dispatchEvent(new CustomEvent('history-panel:loading', { detail: { tabId, loading } }));
-  }, [historyOwnerKey, historySnapshotOwner, loading, sessionId, tabId, toolType]);
+    window.dispatchEvent(new CustomEvent('history-panel:loading', { detail: { tabId, loading: surfaceLoading } }));
+  }, [historyOwnerKey, historySnapshotOwner, sessionId, surfaceLoading, tabId, toolType]);
 
   // Initial load on mount / session change / tool type switch
   const initialLoadDoneRef = useRef(false);
@@ -4999,6 +5537,7 @@ function HistoryPanel({
     historyOwnerStartedAtRef.current = ownerStartedAt;
     historyOwnerGenerationRef.current = generation;
     historyOwnerKeyRef.current = historyOwnerKey;
+    setPresentedOwnerKey(historyOwnerKey);
     initialLoadDoneRef.current = false;
     for (const timer of localPromptCleanupTimersRef.current.values()) clearTimeout(timer);
     localPromptCleanupTimersRef.current.clear();
@@ -5116,7 +5655,7 @@ function HistoryPanel({
   // session/loading flow rebuilds the list, so a write-once useEffect is more
   // robust. Retry once: Virtuoso may re-measure items after first paint.
   useEffect(() => {
-    if (loading || initialLoadDoneRef.current) return;
+    if (surfaceLoading || initialLoadDoneRef.current) return;
     initialLoadDoneRef.current = true;
     const savedPos = useUIStore.getState().historyScrollPositions[tabId];
     if (savedPos && savedPos > 0) {
@@ -5128,7 +5667,7 @@ function HistoryPanel({
         }
       });
     }
-  }, [loading, tabId]);
+  }, [surfaceLoading, tabId]);
 
   // Event-driven transcript refresh. The main process watches JSONL/rollout
   // changes and emits a lightweight invalidation; HistoryPanel keeps its own
@@ -5282,9 +5821,9 @@ function HistoryPanel({
 
   useEffect(() => {
     if (!historyScrollToUuid) return;
-    if (loading || displayEntries.length === 0) return; // wait for entries; uuid stays in store
+    if (surfaceLoading || displayEntries.length === 0) return; // wait for entries; uuid stays in store
     const targetUuid = historyScrollToUuid;
-    const idx = displayEntries.findIndex((e) => e.uuid === targetUuid);
+    const idx = displayEntryIndexByUuid.get(targetUuid) ?? -1;
     // Consume the store key immediately. The convergence loop is driven by the
     // ref-generation guard, NOT by this effect's cleanup, so clearing the key
     // (which re-runs the effect → early-return above) does not abort the loop.
@@ -5370,7 +5909,7 @@ function HistoryPanel({
     let capSuspectLogged = false;
     const step = () => {
       if (!scrollMountedRef.current || scrollGenRef.current !== myGen) return; // superseded / unmounted
-      const currentIdx = entriesRef.current.findIndex((e) => e.uuid === targetUuid);
+      const currentIdx = displayEntryIndexByUuidRef.current.get(targetUuid) ?? -1;
       if (currentIdx < 0) {
         finish(false, 'target-disappeared');
         return;
@@ -5417,7 +5956,7 @@ function HistoryPanel({
       requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
-  }, [historyScrollToUuid, loading, displayEntries, pendingInitialHistoryIndex, tabId, setHistoryScrollToUuid]);
+  }, [displayEntryIndexByUuid, displayEntries, historyScrollToUuid, pendingInitialHistoryIndex, setHistoryScrollToUuid, surfaceLoading, tabId]);
 
   // Native scroll handler — runs on the Virtuoso scroller element via a
   // direct addEventListener (Virtuoso doesn't pass an onScroll prop through
@@ -5498,9 +6037,12 @@ function HistoryPanel({
     const clampedStart = Math.max(0, Math.min(start, all.length - 1));
     const clampedEnd = Math.max(clampedStart, Math.min(end, all.length - 1));
     const visibleSet = new Set<string>();
+    const directlyVisibleUsers: string[] = [];
     for (let i = clampedStart; i <= clampedEnd; i++) {
       const e = all[i];
-      if (e?.uuid) visibleSet.add(e.uuid);
+      if (!e?.uuid) continue;
+      visibleSet.add(e.uuid);
+      if (e.role === 'user') directlyVisibleUsers.push(e.uuid);
     }
     const resolvedSet = new Set<string>();
     for (const uuid of visibleSet) {
@@ -5510,10 +6052,6 @@ function HistoryPanel({
     }
     // Single-turn highlight: if multiple user entries are directly visible,
     // keep only one based on scroll direction (matches the IO impl).
-    const directlyVisibleUsers: string[] = [];
-    for (const e of all) {
-      if (e.role === 'user' && visibleSet.has(e.uuid)) directlyVisibleUsers.push(e.uuid);
-    }
     if (directlyVisibleUsers.length > 1) {
       const keepIdx = scrollDirectionRef.current === 'down'
         ? directlyVisibleUsers.length - 1
@@ -5767,7 +6305,7 @@ function HistoryPanel({
 
       {/* Content */}
       <div data-history-content-stage style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
-        {loading ? (
+        {surfaceLoading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#818cf8', fontSize: 13, gap: 8 }}>
             <HistorySpinner size={16} />
             Loading...
@@ -5852,6 +6390,10 @@ function HistoryPanel({
                     toolType={toolType}
                     allowRewind={!previewMode && toolType !== 'gemini'}
                     rewindLocked={rewindLocked}
+                    forceExpanded={
+                      searchQuery.length >= 2
+                      && entry.content.toLowerCase().includes(searchQuery.toLowerCase())
+                    }
                   />
                 </div>
               );

@@ -46,6 +46,8 @@ const { ipcRenderer } = window.require('electron');
 interface Props {
   tabId: string;
   projectId: string;
+  /** Normal Claude/Codex PTY tab is presented through History, not xterm. */
+  historyIsPrimary?: boolean;
   // Session info — supplied by Workspace.tsx via effective* selectors.
   claudeSessionId: string | null;
   geminiSessionId: string | null;
@@ -249,6 +251,7 @@ function CacheCooldownChip({
 export default function ClaudeControlBar({
   tabId,
   projectId,
+  historyIsPrimary = false,
   claudeSessionId,
   geminiSessionId,
   codexSessionId,
@@ -389,6 +392,18 @@ export default function ClaudeControlBar({
   const isSDKTab = tabType === 'claude-sdk';
   const isCodex = sessionType === 'codex';
   const codexTurnBusy = isCodex && tabAiBusy;
+  const historyCanSend = useUIStore(
+    (s) => s.historyComposerAvailability[tabId]?.canSend === true,
+  );
+  const historyCanAcceptSubmitIntent = useUIStore(
+    (s) => s.historyComposerAvailability[tabId]?.canAcceptSubmitIntent === true,
+  );
+  const historyCanInterruptTurn = useUIStore(
+    (s) => s.historyComposerAvailability[tabId]?.canInterruptTurn === true,
+  );
+  const historyCanPullDraft = useUIStore(
+    (s) => s.historyComposerAvailability[tabId]?.canPullDraft === true,
+  );
   const isClaudePtySession = sessionType === 'claude' && !isSDKTab;
   // Confirmed current-session settings. Unlike StatusBar defaults, these are
   // reconstructed from the active JSONL branch and therefore survive renderer
@@ -1315,13 +1330,28 @@ export default function ClaudeControlBar({
   // needs at least one cache-bearing turn captured this session.
   const showCacheChip = !isCodex && (isSDKTab || isAnthropicPTY) && cacheData != null;
   const showRightCluster = supportsKnobs && (isSDKTab || hasAnySession || isCommandRunning);
-  const showLivePtyInputActions = (sessionType === 'claude' || sessionType === 'codex') && !isSDKTab && isCommandRunning;
+  const isPrimaryHistoryAgent = historyIsPrimary
+    && (sessionType === 'claude' || sessionType === 'codex')
+    && !isSDKTab;
+  const showLivePtyInputActions = (sessionType === 'claude' || sessionType === 'codex')
+    && !isSDKTab
+    && isCommandRunning;
+  // Primary History owns authoring even while its CLI process is stopped. Keep
+  // Mic/Enter visible so the lower bar does not change shape across
+  // Start/Resume; History itself remains the authority for whether a submit is
+  // currently accepted. Legacy terminal tabs retain the old live-PTY guard.
+  const showComposerInputActions = isPrimaryHistoryAgent || showLivePtyInputActions;
   const [enterPending, setEnterPending] = useState(false);
   const cancelPendingEnterRef = useRef(false);
   const dictationSnapshot = useDictationSnapshot();
   const dictationState = dictationSnapshot.owner?.tabId === tabId
     ? { recording: dictationSnapshot.recording, stopping: dictationSnapshot.stopping }
     : { recording: false, stopping: false };
+  const historySubmitButtonEnabled = historyCanSend
+    || (
+      historyCanAcceptSubmitIntent
+      && (dictationState.recording || dictationState.stopping)
+    );
   // Turn-level busy, NOT process-level. `sdkBusy` is fed by claude:busy-state,
   // which main emits for BOTH SDK and PTY Claude (spinner + stop-hook), filtered
   // by tabId — so it goes false between turns on both. Using isCommandRunning
@@ -2211,10 +2241,25 @@ export default function ClaudeControlBar({
     ipcRenderer.send('terminal:input', tabId, '\r');
   };
 
-  const sendCtrlCToPty = () => {
-    if (!showLivePtyInputActions) return;
+  const focusHistoryComposer = () => {
+    const textarea = document.querySelector<HTMLTextAreaElement>(
+      `textarea[data-history-composer-tab-id="${CSS.escape(tabId)}"]`,
+    );
+    textarea?.focus();
+  };
+
+  const sendStopCurrentTurn = () => {
+    if (!showComposerInputActions) return;
+    if (isPrimaryHistoryAgent && !historyCanInterruptTurn) return;
     cancelPendingEnterRef.current = true;
     if (enterPending) setEnterPending(false);
+    if (isPrimaryHistoryAgent) {
+      window.dispatchEvent(new CustomEvent('history-panel:interrupt-turn', {
+        detail: { tabId, source: 'control-bar' },
+      }));
+      focusHistoryComposer();
+      return;
+    }
     focusTerminal();
     ipcRenderer.send('terminal:input', tabId, '\x03');
   };
@@ -2254,16 +2299,25 @@ export default function ClaudeControlBar({
     });
   };
 
-  const sendEnterToPty = async () => {
-    if (!showLivePtyInputActions || enterPending) return;
-    focusTerminal();
+  const sendComposerInput = async () => {
+    if (!showComposerInputActions || enterPending) return;
+    if (
+      isPrimaryHistoryAgent
+      && !historyCanSend
+      && !(
+        historyCanAcceptSubmitIntent
+        && (dictationState.recording || dictationState.stopping)
+      )
+    ) return;
+    if (isPrimaryHistoryAgent) focusHistoryComposer();
+    else focusTerminal();
     if (dictationState.recording || dictationState.stopping) {
       cancelPendingEnterRef.current = false;
       setEnterPending(true);
       try {
         const delivery = await waitForDictationDelivery();
         if (delivery.ok && !cancelPendingEnterRef.current) {
-          if (delivery.mode === 'history') {
+          if (isPrimaryHistoryAgent || delivery.mode === 'history') {
             // Dictation is now delivered into the History composer for normal
             // Claude/Codex tabs. Sending a raw CR here would submit the hidden
             // xterm instead of the text the user can see. Route the intent to
@@ -2280,6 +2334,13 @@ export default function ClaudeControlBar({
         cancelPendingEnterRef.current = false;
         setEnterPending(false);
       }
+      return;
+    }
+    if (isPrimaryHistoryAgent) {
+      window.dispatchEvent(new CustomEvent('history-panel:submit-composer', {
+        detail: { tabId, source: 'control-bar-enter' },
+      }));
+      focusHistoryComposer();
       return;
     }
     sendRawEnterToPty();
@@ -2671,8 +2732,14 @@ export default function ClaudeControlBar({
   // ⑂ Codex-F (from clipboard)   | + 1)    | -           | -           | -       | -           | -
   // ⎘ prompt | + clear (PTY only)| -       | + Claude/   | -           | -       | -           | -
   //                              |         |   Codex     |   Codex     |         |             |
-  // 🎤 mic | Enter | ^C (PTY)    | -       | + Claude/   | -           | -       | -           | -
-  //                              |         |   Codex     |   Codex     |         |             |
+  // 🎤 mic | Enter | ^C          | History | + Claude/   | History     | -       | -           | -
+  //   primary History            | Mic +   |   Codex:    | Mic +       |         |             |
+  //                              | Enter   | Mic/Enter;  | Enter;      |         |             |
+  //                              | follows | ^C follows  | ^C follows  |         |             |
+  //                              | History | canonical   | canonical   |         |             |
+  //                              | canSend | availability| availability|         |             |
+  //   legacy PTY presentation    | -       | raw Mic / Enter / ^C     | -       | -           | -
+  // terminal → History draft     | disabled| + semantic pull+clear    | disabled| -       | -           | -
   // Right cluster Provider/Model | hidden  | enabled     | dimmed      | enabled | shimmer     | enabled
   //   /Effort/Think              |         |             |             |         |             |
   //
@@ -2698,6 +2765,14 @@ export default function ClaudeControlBar({
   //   isCommandRunning — OSC 133 D/B от PTY shell. Для SDK всегда false.
   //
   //   sdkBusy — claude-sdk:busy-state из ClaudeSDKTab (isRunning эффект).
+  //
+  //   historyIsPrimary — normal Claude/Codex tabs author through History.
+  //              Mic/Enter stay mounted in this lower bar even when the PTY
+  //              process is stopped, so Start/Resume does not reflow it.
+  //              Enter dispatches `history-panel:submit-composer`; ^C dispatches
+  //              semantic `history-panel:interrupt-turn` and never writes a raw
+  //              control byte into the hidden xterm. Legacy PTY presentation
+  //              keeps its old live-process-only raw-input behavior.
   //
   // АНТИПАТТЕРН (не повторять):
   //   — Для in-flight control-команд (`/model`, `/effort`, provider switch)
@@ -2837,6 +2912,7 @@ export default function ClaudeControlBar({
             <SessionActionChip
               sessionType={sessionType}
               mode="pty"
+              idleLabel={isPrimaryHistoryAgent ? 'Resume' : 'Continue'}
               isCommandRunning={isCommandRunning}
               hasAnySession={hasAnySession}
               disabled={sessionActionDisabled}
@@ -3120,25 +3196,62 @@ export default function ClaudeControlBar({
             </ControlHint>
           </div>
         )}
+        {isPrimaryHistoryAgent && (
+          <ControlHint
+            label="Перенести черновик из терминала в History input"
+            shortcut="Терминальный ввод очищается атомарно"
+            disabled={!historyCanPullDraft}
+          >
+            <button
+              type="button"
+              aria-label={`Move ${sessionType === 'codex' ? 'Codex' : 'Claude'} terminal draft to History input`}
+              disabled={!historyCanPullDraft}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => {
+                window.dispatchEvent(new CustomEvent('history-panel:pull-terminal-draft', {
+                  detail: { tabId, source: 'control-bar' },
+                }));
+                focusHistoryComposer();
+              }}
+              className={`inline-flex items-center justify-center gap-1 transition-colors ${historyCanPullDraft ? 'cursor-pointer hover:bg-[rgba(255,255,255,0.06)] hover:text-white' : ''}`}
+              style={{
+                height: 22,
+                minWidth: 38,
+                padding: '0 7px',
+                background: 'transparent',
+                border: '1px solid rgba(167,139,250,0.30)',
+                borderRadius: 4,
+                color: historyCanPullDraft ? '#a78bfa' : '#555',
+                cursor: historyCanPullDraft ? 'pointer' : 'default',
+                fontSize: 11,
+                lineHeight: 1,
+                flexShrink: 0,
+              }}
+              title="Move terminal draft → visible History input"
+            >
+              <SquareTerminal size={11} strokeWidth={1.8} aria-hidden />
+              <span aria-hidden>→</span>
+              <span aria-hidden style={{ fontSize: 12 }}>▭</span>
+            </button>
+          </ControlHint>
+        )}
 
         {/* Live AI input actions. Mic delivery follows the tab's visible owner:
             normal Claude/Codex tabs append to the primary History composer,
-            while legacy PTY/SDK modes retain their own delivery paths. Enter
-            normally sends the same raw CR byte as a physical key; during
-            History-owned dictation it waits for delivery and then invokes
-            History's canonical send action instead of submitting hidden xterm.
-            ^C still sends one raw Ctrl+C byte to the TUI and cancels a pending
-            automatic submit. */}
-        {showLivePtyInputActions && (
+            while legacy PTY modes retain their raw-terminal delivery path.
+            In primary History, Enter and ^C are semantic requests handled by
+            HistoryPanel (send visible draft / interrupt current turn); they
+            never submit or cancel the hidden xterm composer. */}
+        {showComposerInputActions && (
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
             <MicButton tabId={tabId} sessionType={sessionType} />
             <ControlHint label={enterPending ? 'Жду доставку диктовки…' : 'Отправить текущий ввод'}>
             <button
               onMouseDown={(e) => e.preventDefault()}
-              onClick={sendEnterToPty}
-              disabled={enterPending}
+              onClick={sendComposerInput}
+              disabled={enterPending || (isPrimaryHistoryAgent && !historySubmitButtonEnabled)}
               aria-busy={enterPending}
-              className={`inline-flex items-center justify-center transition-colors ${enterPending ? '' : 'cursor-pointer hover:bg-[rgba(255,255,255,0.06)] hover:text-white'}`}
+              className={`inline-flex items-center justify-center transition-colors ${enterPending || (isPrimaryHistoryAgent && !historySubmitButtonEnabled) ? '' : 'cursor-pointer hover:bg-[rgba(255,255,255,0.06)] hover:text-white'}`}
               style={{
                 height: 22,
                 minWidth: 50,
@@ -3146,14 +3259,20 @@ export default function ClaudeControlBar({
                 background: enterPending ? 'rgba(218,119,86,0.12)' : 'transparent',
                 border: `1px solid ${enterPending ? 'rgba(218,119,86,0.45)' : 'rgba(255,255,255,0.12)'}`,
                 borderRadius: 4,
-                color: enterPending ? '#FF9466' : '#bbb',
-                cursor: enterPending ? 'default' : 'pointer',
+                color: enterPending
+                  ? '#FF9466'
+                  : isPrimaryHistoryAgent && !historySubmitButtonEnabled ? '#666' : '#bbb',
+                cursor: enterPending || (isPrimaryHistoryAgent && !historySubmitButtonEnabled) ? 'default' : 'pointer',
                 fontSize: 11,
                 fontWeight: 500,
                 lineHeight: 1,
                 flexShrink: 0,
               }}
-              title={enterPending ? 'Waiting for dictation delivery…' : `Send Enter to ${sessionType === 'codex' ? 'Codex' : 'Claude'}`}
+              title={enterPending
+                ? 'Waiting for dictation delivery…'
+                : isPrimaryHistoryAgent
+                  ? `Send visible History input to ${sessionType === 'codex' ? 'Codex' : 'Claude'}`
+                  : `Send Enter to ${sessionType === 'codex' ? 'Codex' : 'Claude'}`}
             >
               {enterPending ? (
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none"
@@ -3165,12 +3284,19 @@ export default function ClaudeControlBar({
               ) : 'Enter'}
             </button>
             </ControlHint>
-            <ControlHint label="Отправить Ctrl+C в живой CLI" shortcut="Результат зависит от текущего экрана">
+            <ControlHint
+              label={isPrimaryHistoryAgent ? 'Остановить текущий ответ' : 'Отправить Ctrl+C в живой CLI'}
+              shortcut={isPrimaryHistoryAgent ? 'Процесс останется запущен' : 'Результат зависит от текущего экрана'}
+              disabled={isPrimaryHistoryAgent && !historyCanInterruptTurn}
+            >
             <button
               onMouseDown={(e) => e.preventDefault()}
-              onClick={sendCtrlCToPty}
-              aria-label={`Send Ctrl+C to ${sessionType === 'codex' ? 'Codex' : 'Claude'}`}
-              className="inline-flex items-center justify-center gap-1 cursor-pointer transition-colors"
+              onClick={sendStopCurrentTurn}
+              disabled={isPrimaryHistoryAgent && !historyCanInterruptTurn}
+              aria-label={isPrimaryHistoryAgent
+                ? `Stop current ${sessionType === 'codex' ? 'Codex' : 'Claude'} response`
+                : `Send Ctrl+C to ${sessionType === 'codex' ? 'Codex' : 'Claude'}`}
+              className={`inline-flex items-center justify-center gap-1 transition-colors ${isPrimaryHistoryAgent && !historyCanInterruptTurn ? '' : 'cursor-pointer'}`}
               style={{
                 height: 22,
                 minWidth: 34,
@@ -3178,26 +3304,30 @@ export default function ClaudeControlBar({
                 background: 'transparent',
                 border: '1px solid rgba(248,113,113,0.30)',
                 borderRadius: 4,
-                color: '#f87171',
-                cursor: 'pointer',
+                color: isPrimaryHistoryAgent && !historyCanInterruptTurn ? '#5f4545' : '#f87171',
+                cursor: isPrimaryHistoryAgent && !historyCanInterruptTurn ? 'default' : 'pointer',
                 fontSize: 11,
                 fontWeight: 650,
                 lineHeight: 1,
                 flexShrink: 0,
               }}
               onMouseEnter={(e) => {
+                if (isPrimaryHistoryAgent && !historyCanInterruptTurn) return;
                 const el = e.currentTarget as HTMLButtonElement;
                 el.style.backgroundColor = 'rgba(248,113,113,0.12)';
                 el.style.borderColor = 'rgba(248,113,113,0.58)';
                 el.style.color = '#fecaca';
               }}
               onMouseLeave={(e) => {
+                if (isPrimaryHistoryAgent && !historyCanInterruptTurn) return;
                 const el = e.currentTarget as HTMLButtonElement;
                 el.style.backgroundColor = 'transparent';
                 el.style.borderColor = 'rgba(248,113,113,0.30)';
                 el.style.color = '#f87171';
               }}
-              title={`Send Ctrl+C to ${sessionType === 'codex' ? 'Codex' : 'Claude'} - clears input first if it is not empty`}
+              title={isPrimaryHistoryAgent
+                ? (historyCanInterruptTurn ? 'Stop the current response' : 'No interruptible response')
+                : `Send Ctrl+C to ${sessionType === 'codex' ? 'Codex' : 'Claude'} - clears input first if it is not empty`}
             >
               <span
                 aria-hidden

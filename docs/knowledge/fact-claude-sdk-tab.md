@@ -96,14 +96,13 @@ Window-level handler (Escape / Ctrl+[ / Ctrl+C) на стороне ClaudeSDKTab
 
 ## Paste-chip: распаковать в композер vs удалить — две affordance
 
-Длинный paste (> `PASTE_THRESHOLD` 500 символов) становится chip'ом над композером вместо инлайна. У chip'а два разных действия в двух местах:
+Ручной paste становится chip'ом над композером только когда длиннее общей настройки `Чип после N символов` (default 800). Выбор сохранённого prompt через Opt+V/контекстное меню всегда становится prompt-чипом независимо от длины: это сохраняет происхождение и label, а повторный выбор той же prompt-вариации обновляет существующий чип по stable source key. Одинаковый ручной paste не дедуплицируется — пользователь мог намеренно вставить его дважды. Ветка `replace` после rewind/edit остаётся обычным текстом для правки.
 
-**Длинный текст из Opt+V picker'а тоже становится chip'ом.** Opt+V — это **не** clipboard-paste, а открытие picker'а сохранённых промптов (`App.tsx` handlePickerOpenCapture); выбор промпта диспатчит `claude-sdk:composer-insert` (append-ветка), который писал текст **прямо в textarea, минуя `handlePaste`** — поэтому длинный picked-промпт вываливался простынёй, а не чипом. Фикс — общий `addChip` helper (единый источник «длинный текст → chip», переиспользован в `handlePaste` и в append-ветке `composer-insert`): если `text.length >= PASTE_THRESHOLD` → чип. Ветка `replace` (откат отменённого промпта на редактирование) НЕ чипуется — там текст обязан лечь в textarea для правки.
+Тело chip'а раскрывает preview, стрелка возвращает полный текст в текущую selection/caret, корзина удаляет его. Возврат в конец с автоматически придуманным `\n` был неверной моделью: чип является свёрнутым участком авторского текста, а не attachment с единственной позицией. При отправке prompt-чипы сериализуются обычным текстом, paste-чипы — как `<pasted_content>`, затем идёт textarea; chip-only draft валиден и по Enter, и во время type-ahead.
 
-- **Свёрнутый chip, иконка справа `↓` (`ArrowDownToLine`)** — `unpackChip`: высыпает полный текст chip'а в конец композера как plain text (через `\n` если уже есть ввод), сам chip уходит из бара, композер получает фокус. Раньше тут был `×` (delete) — юзер: *«вместо крестика должна быть кнопка которая переводит текст в инпут, просто вставляет в конец»*. Тело chip'а (превью-текст) остаётся click-toggle на preview-окно.
-- **Раскрытое preview-окно, иконка слева — корзина (`Trash2`, красная `#b91c1c` → hover `#ef4444`)** — `removeChip`: удаляет chip целиком. Delete переехал из свёрнутого состояния в раскрытое и влево (где глаз ищет destructive-действие первым). Принцип — `methodology/переносимый-дизайн.md::Chip: распаковать ≠ удалить`.
+SDK-вкладки не unmount'ятся при переключении, поэтому composer chips нельзя держать в одном глобальном window-slot. Последний отрендеренный скрытый tab тогда подменяет payload активного, а общий clear-event стирает чипы всех вкладок. Authoring-state адресуется по `tabId` и зеркалится в самой вкладке; тот же реальный composer остаётся смонтированным, когда AskUserQuestion, slash-output или task detail визуально занимает его место. Скрытие — не clear/unmount, но скрытый textarea не имеет права перехватывать global keyboard/focus.
 
-**Submit при пустом тексте + chip'ы.** `ComposerPrimitive.Input` (assistant-ui) гейтит Send по `text.trim() !== ''` — chip-only payload не отправлялся, Enter молча no-op'ил. Симптом: *«если в чипе что-то есть, а в инпуте ничего — не могу нажать Enter»*. Обход в `handleComposerKeyDown`: при `Enter && composerText.trim()==='' && chips.length>0` форсим — idle Claude: `writeComposerValue(' ')` + `composerRuntime.send()` в `setTimeout(0)` (пробел снимает гейт, `onNew` собирает чипы из `__sdkPasteChips` и подставляет `'Analyze this content'` placeholder); busy Claude: enqueue в type-ahead с текстом-пробелом. Принцип — `methodology/переносимый-дизайн.md::Submit валиден при вложениях без текста`.
+На границе отправки SDK хранит две формы отдельно: transport-текст и авторский snapshot `raw text + chips`. Type-ahead recall и ошибка до принятия возвращают именно авторскую форму, поэтому prompt-chip не превращается в плоский сериализованный текст; если пользователь уже начал следующий draft, оба объединяются без overwrite. Consume/clear происходит только после успешного ответа send-boundary и удаляет ровно неизменившийся snapshot отправленных чипов. Поздняя ошибка удаляет оптимистичный user-блок и возвращает draft, но новый чип, добавленный во время ожидания, не стирается. Это tab-scoped authoring bridge, не общий runtime и не durable Run After: очередь History в SDK не переносится.
 
 ## Сворачивание длинных user-сообщений
 
@@ -164,17 +163,19 @@ Cancel-кнопка в composer'е работает в одном из двух 
 - `InMemorySessionStore` + `importSessionToStore()` — in-memory сессии для transient flow.
 - `TodoWrite` tool переименован в `TaskCreate`/`TaskUpdate`/`TaskGet`/`TaskList`. У нас в src/ упоминаний нет — fine.
 
-## Композитор прижат снизу через flex-1 messages, без sticky overlay
+## Общая оболочка composer, отдельный SDK runtime
 
-Composer (`SDKComposer`) — child `ThreadPrimitive.Viewport`, последний flex-элемент. Перед ним messages-div с `flex-1`. При коротком чате `flex-1` растягивает messages → composer прижат к низу. При длинном — composer едет вверх вместе с scroll'ом, **не остаётся overlay'ем над контентом** (принцип — `methodology/переносимый-дизайн.md::Composer внутри scroll-flow`).
+SDK и PTY History используют одну stateless-оболочку `top bar + chips + input slot + overlay`: поэтому status, свёрнутые prompt/paste-чипы, явное раскрытие и настройки размеров выглядят одинаково. Оболочка не знает про SDK queue, AskUserQuestion, streaming, rollback и lifecycle; их по-прежнему держит SDK adapter. Это граница против «универсального composer-store», который сломал бы tab-scoped ownership постоянно смонтированных SDK-вкладок.
+
+Реальный `ComposerPrimitive.Input` остаётся внутри `ThreadPrimitive.Viewport`: это обязательный React-context assistant-ui. Общая оболочка принимает его как slot, а не переносит наружу и не создаёт второй textarea. При коротком чате messages-div с `flex-1` прижимает карточку к низу; размещение внутри scroll-flow остаётся SDK-спецификой, тогда как primary History размещает ту же оболочку своим absolute/footer-spacer layout.
 
 **Graveyard:**
 1. **`sticky bottom-0 border-t shrink-0`** — выглядело правильно, но при scroll up composer оставался прибит к низу окна, **накрывая diff/контент** в верхней части. Юзер не мог прочитать раскрытое содержимое — оно пряталось под input. Удалили `sticky`.
 2. **Вытащить composer наружу `ThreadPrimitive.Viewport`** (`<Viewport>{messages}</Viewport><div>{composer}</div>` в Root) — провалилось runtime'ом: `ComposerPrimitive.Input` читает Thread-контекст через React.Context, hoisting за пределы Viewport → `must be used within ThreadPrimitive.Viewport`. Это **structural constraint** assistant-ui, не наш выбор. Не повторять.
 
-## Footer pill: `[Model] N% context` — захват usage + window-table
+## Model/context идут в общую нижнюю панель, не в footer composer
 
-Под composer'ом — две части: слева `[Opus 4.8 (1M context)] N%`, справа `Session: xxx…` (dim grey). Видно когда есть хоть что-то одно.
+Отдельный `[Model] N% context · Session` под SDK composer удалён: модель и состояние уже видны в общей нижней control bar, а session id доступен в диагностике. Дублирующий footer заставлял читать один контекст дважды и делал SDK визуально отдельным продуктом. Данные не удалены: SDK продолжает публиковать model/context в control bar и показывает их в служебных slash-overlay.
 
 **Источник model'а — две стратегии:**
 1. **`lastResolvedModel`** — real model id из `msg.message.model` (SSE chunk). Captured в `handleMessage` при `msg.type === 'assistant'`. Это truth от Anthropic — может отличаться от UI-alias если был silent downgrade.
@@ -187,20 +188,9 @@ Helper `formatModelLabel(realModel, alias)` → `"Opus 4.8 (1M context)"` / `"So
 - `getModelContextWindow(realModel, alias)` — 1M когда: явный суффикс `[1m]` (в real-model id ИЛИ в alias — alias несёт `[1m]`, real id нет) ИЛИ Opus ≥ 4.8 (1M by-default). Иначе 200K. Смотрит на ОБА (real id + alias), потому что суффикс живёт на alias'е, а версия — на real id. Anthropic не shipping'ит окно в SDK, эвристика по доке.
 - `% remaining = 100 - (used / window) * 100`. Clamp [0, 100].
 
-**Цветовое gating:**
-- `>= 25%` — серый `#7a7a7a` (нейтрально).
-- `< 25%` — янтарный `#f59e0b` (внимание).
-- `< 10%` — красный `#ef4444` (срочно).
+## Общая типографика AI-поверхностей
 
-Только цвет процента, не всего pill'а — model-label остаётся читаемым `#bdbdbd`. Параллельно с pill `Cost` или `Tokens used` не показываем — оставшийся context — главный actionable сигнал для юзера («когда ждать compact'а»).
-
-**Размер шрифта model-label = `useUIStore.terminalFontSize`, не em.** Сам footer на `text-[0.7em]` (масштабируется от SDK-font root'а), но строка `[{modelLabel}]` получает абсолютный `style={{ fontSize: terminalFontSize px }}` — пинится к настройке «Шрифт» из Settings → Размеры → **Терминал** (не SDK-font). Юзер: *«название модели под инпутом должно быть того же размера шрифта как шрифт терминала из настроек»*. Реактивно — смена размера в настройках обновляет label сразу.
-
-## Font-size root + em-потомки
-
-SDK-таб root получает `style={{ fontSize: ${useUIStore.terminalFontSize}px }}`. Все `text-[Npx]` в дереве переведены на `text-[Nem]` (base 13): 9px→0.7em, 10px→0.77em, 11px→0.85em, 12px→0.92em, 13px→1em, 14px→1.08em. SyntaxHighlighter `customStyle.fontSize` тоже em ('0.92em'). Cmd+/− в Terminal-настройке теперь меняет шрифт **во всём** SDK-табе пропорционально.
-
-Подробности — `methodology/переносимый-дизайн.md::UI-тематический font-size наследуется от пользовательской настройки`.
+SDK transcript берёт тот же размер «История», textarea — «Поле ввода», status/chips/preview — меньший размер вторичных элементов, что и PTY History. Переключение транспорта не должно менять визуальный масштаб одного класса сообщений. Terminal font больше не является root-размером SDK-чата; он остаётся настройкой raw xterm и тех контролов, которые действительно принадлежат терминалу.
 
 ## `useStableCollapseToggle`: flushSync + wasAtBottom + findScrollParent
 

@@ -45,6 +45,13 @@ import {
   normalizeCodexModelOptions,
   resolveCodexPersistentEffortForModel,
 } from '../constants/codexSettings';
+import {
+  DEFAULT_AI_COMPOSER_CHIP_THRESHOLD,
+  normalizeComposerChipThreshold,
+  normalizeComposerChips,
+  removeComposerChip,
+  upsertComposerChip,
+} from '../utils/composerChips.mjs';
 
 export const HISTORY_PANEL_DEFAULT_WIDTH = 580;
 export const HISTORY_PANEL_MIN_WIDTH = 280;
@@ -67,9 +74,35 @@ export interface HistoryPromptDraftImageRef {
   error?: string;
 }
 
+export type HistoryPromptDraftChipKind = 'prompt' | 'paste';
+
+export interface HistoryPromptDraftChip {
+  id: string;
+  kind: HistoryPromptDraftChipKind;
+  text: string;
+  label?: string;
+  /**
+   * Stable identity of a saved prompt or its variation. Prompt chips with the
+   * same sourceKey replace one another in place; paste chips are never deduped.
+   */
+  sourceKey?: string;
+  createdAt?: number;
+}
+
 export interface HistoryPromptDraftWriteOptions {
   images?: HistoryPromptDraftImageRef[] | null;
   preserveImages?: boolean;
+  chips?: HistoryPromptDraftChip[] | null;
+  preserveChips?: boolean;
+}
+
+export interface HistoryComposerAvailability {
+  ownerId: string;
+  canSend: boolean;
+  canAcceptSubmitIntent: boolean;
+  canInterruptTurn: boolean;
+  canPullDraft: boolean;
+  status: string;
 }
 
 export interface ApiSettings {
@@ -294,12 +327,6 @@ interface UIStore {
 
   terminalFontSize: number;
 
-  // SDK assistant rendering — отдельно от terminalFontSize, потому что PTY
-  // xterm.js рендерит моноширинный grid (1px шаг ощущается сразу), а SDK-таб
-  // рендерит markdown в потоке Virtuoso, и юзеру обычно комфортнее ставить
-  // SDK-шрифт крупнее без раздувания PTY-табов.
-  sdkFontSize: number;
-
   tabsFontSize: number;        // Main + Utils tabs in TabBar
 
   projectTabsFontSize: number; // Project chips in Title Bar
@@ -361,8 +388,10 @@ interface UIStore {
   timelineLineClamp: number;   // How many lines of preview text show in expanded mode.
   historyFontSize: number; // Primary History transcript font size (messages + tool blocks).
   historyComposerFontSize: number; // Primary History prompt textarea font size.
+  aiSecondaryFontSize: number; // Secondary AI labels, statuses and composer chips.
   historyComposerMinRows: number; // Empty height for the primary History prompt textarea.
   historyComposerMaxRows: number; // Auto-grow ceiling for the primary History prompt textarea.
+  aiComposerChipThreshold: number; // Manual paste becomes a chip only above this many characters.
   promptQueueChipFontSize: number; // Run-after chip title font inside the queue list.
   promptQueueEditorFontSize: number; // Run-after chip editor title/body font in the slideout.
   promptQueueChipLineClamp: number; // How many lines of chip text show inside Run After overlay (1 = single-line ellipsis).
@@ -371,8 +400,6 @@ interface UIStore {
   setSidebarWidth: (width: number) => void;
   setTabSidebarWidth: (width: number) => void;
   setTerminalFontSize: (size: number) => void;
-  setSdkFontSize: (size: number) => void;
-
   setTabsFontSize: (size: number) => void;
 
   setProjectTabsFontSize: (size: number) => void;
@@ -391,8 +418,10 @@ interface UIStore {
   setTimelineLineClamp: (lines: number) => void;
   setHistoryFontSize: (size: number) => void;
   setHistoryComposerFontSize: (size: number) => void;
+  setAiSecondaryFontSize: (size: number) => void;
   setHistoryComposerMinRows: (rows: number) => void;
   setHistoryComposerMaxRows: (rows: number) => void;
+  setAiComposerChipThreshold: (characters: number) => void;
   setPromptQueueChipFontSize: (size: number) => void;
   setPromptQueueEditorFontSize: (size: number) => void;
   setPromptQueueChipLineClamp: (lines: number) => void;
@@ -517,6 +546,8 @@ interface UIStore {
   historyScrollPositions: Record<string, number>;
   historyPromptDrafts: Record<string, string>;
   historyPromptDraftImages: Record<string, HistoryPromptDraftImageRef[]>;
+  historyPromptDraftChips: Record<string, HistoryPromptDraftChip[]>;
+  historyComposerAvailability: Record<string, HistoryComposerAvailability>;
   historyRewindPreviews: Record<string, HistoryRewindPreview>;
   setHistoryPanelOpen: (tabId: string, open: boolean) => void;
   setHistoryPanelWidth: (width: number) => void;
@@ -524,7 +555,15 @@ interface UIStore {
   setHistoryVisibleUuids: (tabId: string, uuids: string[]) => void;
   setHistoryScrollPosition: (tabId: string, scrollTop: number) => void;
   setHistoryPromptDraft: (tabId: string, draft: string, options?: HistoryPromptDraftWriteOptions) => void;
+  setHistoryPromptDraftChips: (tabId: string, chips: HistoryPromptDraftChip[]) => void;
+  addHistoryPromptDraftChip: (tabId: string, chip: HistoryPromptDraftChip) => void;
+  removeHistoryPromptDraftChip: (tabId: string, chipId: string) => void;
   appendHistoryPromptDraft: (tabId: string, text: string) => void;
+  setHistoryComposerAvailability: (
+    tabId: string,
+    availability: HistoryComposerAvailability | null,
+    ownerId: string,
+  ) => void;
   setHistoryRewindPreview: (tabId: string, preview: HistoryRewindPreview | null) => void;
 
   // Timeline panel visibility (per-tab state, default open)
@@ -990,14 +1029,6 @@ const loadFilePreviewFontSize = (): number => {
   return 13;
 };
 
-const loadSdkFontSize = (): number => {
-  try {
-    const v = localStorage.getItem('noted-terminal-sdk-font-size');
-    if (v) return Math.max(8, Math.min(24, Number(v) || 13));
-  } catch {}
-  return 13;
-};
-
 const loadPromptPickerFontSize = (): number => {
   try {
     const v = localStorage.getItem('noted-terminal-prompt-picker-font-size');
@@ -1083,6 +1114,13 @@ const loadHistoryComposerFontSize = (): number => {
   } catch {}
   return 12;
 };
+const loadAiSecondaryFontSize = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-ai-secondary-font-size');
+    if (v) return Math.max(8, Math.min(18, Math.round(Number(v) || 11)));
+  } catch {}
+  return 11;
+};
 const loadHistoryComposerMinRows = (): number => {
   try {
     const v = localStorage.getItem('noted-terminal-history-composer-min-rows');
@@ -1096,6 +1134,13 @@ const loadHistoryComposerMaxRows = (): number => {
     if (v) return Math.max(1, Math.min(40, Math.round(Number(v) || 20)));
   } catch {}
   return 20;
+};
+const loadAiComposerChipThreshold = (): number => {
+  try {
+    const value = localStorage.getItem('noted-terminal-ai-composer-chip-threshold');
+    if (value !== null) return normalizeComposerChipThreshold(value);
+  } catch {}
+  return DEFAULT_AI_COMPOSER_CHIP_THRESHOLD;
 };
 const initialHistoryComposerMinRows = loadHistoryComposerMinRows();
 const initialHistoryComposerMaxRows = Math.max(initialHistoryComposerMinRows, loadHistoryComposerMaxRows());
@@ -1988,7 +2033,6 @@ const initialApiSettings = loadApiSettings();
 export const useUIStore = create<UIStore>((set, get) => ({
   // Font Settings
   terminalFontSize: initialFontSettings.terminalFontSize,
-  sdkFontSize: loadSdkFontSize(),
   tabsFontSize: initialFontSettings.tabsFontSize,
   projectTabsFontSize: initialFontSettings.projectTabsFontSize,
   sidebarFontSize: initialFontSettings.sidebarFontSize,
@@ -2146,8 +2190,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
   timelineLineClamp: loadTimelineLineClamp(),
   historyFontSize: loadHistoryFontSize(),
   historyComposerFontSize: loadHistoryComposerFontSize(),
+  aiSecondaryFontSize: loadAiSecondaryFontSize(),
   historyComposerMinRows: initialHistoryComposerMinRows,
   historyComposerMaxRows: initialHistoryComposerMaxRows,
+  aiComposerChipThreshold: loadAiComposerChipThreshold(),
   promptQueueChipFontSize: loadPromptQueueChipFontSize(),
   promptQueueEditorFontSize: loadPromptQueueEditorFontSize(),
   promptQueueChipLineClamp: loadPromptQueueChipLineClamp(),
@@ -2230,6 +2276,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
     try { localStorage.setItem('noted-terminal-history-composer-font-size', String(clamped)); } catch {}
   },
 
+  setAiSecondaryFontSize: (size: number) => {
+    const clamped = Math.max(8, Math.min(18, Math.round(size)));
+    set({ aiSecondaryFontSize: clamped });
+    try { localStorage.setItem('noted-terminal-ai-secondary-font-size', String(clamped)); } catch {}
+  },
+
   setHistoryComposerMinRows: (rows: number) => {
     const clamped = Math.max(1, Math.min(20, Math.round(rows)));
     const currentMax = get().historyComposerMaxRows;
@@ -2247,6 +2299,14 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(get().historyComposerMinRows, Math.min(40, Math.round(rows)));
     set({ historyComposerMaxRows: clamped });
     try { localStorage.setItem('noted-terminal-history-composer-max-rows', String(clamped)); } catch {}
+  },
+
+  setAiComposerChipThreshold: (characters: number) => {
+    const normalized = normalizeComposerChipThreshold(characters);
+    set({ aiComposerChipThreshold: normalized });
+    try {
+      localStorage.setItem('noted-terminal-ai-composer-chip-threshold', String(normalized));
+    } catch {}
   },
 
   setPromptQueueChipFontSize: (size: number) => {
@@ -2345,11 +2405,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
     set({ terminalFontSize: clamped });
     const { tabsFontSize, projectTabsFontSize, sidebarFontSize } = get();
     saveFontSettings({ terminalFontSize: clamped, tabsFontSize, projectTabsFontSize, sidebarFontSize });
-  },
-  setSdkFontSize: (size) => {
-    const clamped = Math.max(8, Math.min(24, size));
-    set({ sdkFontSize: clamped });
-    try { localStorage.setItem('noted-terminal-sdk-font-size', String(clamped)); } catch {}
   },
   setTabsFontSize: (size) => {
     const clamped = Math.max(10, Math.min(20, size));
@@ -2473,6 +2528,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
   historyScrollPositions: {},
   historyPromptDrafts: {},
   historyPromptDraftImages: {},
+  historyPromptDraftChips: {},
+  historyComposerAvailability: {},
   historyRewindPreviews: {},
   setHistoryPanelOpen: (tabId, open) => set(state => ({
     historyPanelOpenTabs: { ...state.historyPanelOpenTabs, [tabId]: open }
@@ -2485,19 +2542,67 @@ export const useUIStore = create<UIStore>((set, get) => ({
     historyScrollPositions: { ...state.historyScrollPositions, [tabId]: scrollTop }
   })),
   setHistoryPromptDraft: (tabId, draft, options = {}) => set(state => {
-    const next = { ...state.historyPromptDrafts };
-    if (draft) next[tabId] = draft;
-    else delete next[tabId];
-    const shouldTouchImages = !draft || !options.preserveImages || Object.prototype.hasOwnProperty.call(options, 'images');
-    if (!shouldTouchImages) return { historyPromptDrafts: next };
+    const nextDrafts = { ...state.historyPromptDrafts };
+    if (draft) nextDrafts[tabId] = draft;
+    else delete nextDrafts[tabId];
 
-    const nextImages = { ...state.historyPromptDraftImages };
-    const images = Array.isArray(options.images)
-      ? options.images.filter((ref) => ref && Number.isFinite(Number(ref.id)) && typeof ref.path === 'string' && ref.path.trim())
-      : [];
-    if (draft && images.length > 0) nextImages[tabId] = images;
-    else delete nextImages[tabId];
-    return { historyPromptDrafts: next, historyPromptDraftImages: nextImages };
+    const shouldTouchImages = !draft || !options.preserveImages || Object.prototype.hasOwnProperty.call(options, 'images');
+    const hasExplicitChips = Object.prototype.hasOwnProperty.call(options, 'chips');
+    // Full draft replacement clears chip authoring state by default, just as
+    // it clears images. Callers that mutate existing text (typing, dictation,
+    // image-marker resolution, terminal-draft prepend) must opt in with
+    // preserveChips:true. This prevents rewind/rollback/replacement paths from
+    // silently retaining chips that belonged to the previous draft.
+    const shouldTouchChips = hasExplicitChips || options.preserveChips !== true;
+
+    const patch: Partial<UIStore> = { historyPromptDrafts: nextDrafts };
+
+    if (shouldTouchImages) {
+      const nextImages = { ...state.historyPromptDraftImages };
+      const images = Array.isArray(options.images)
+        ? options.images.filter((ref) => ref && Number.isFinite(Number(ref.id)) && typeof ref.path === 'string' && ref.path.trim())
+        : [];
+      if (draft && images.length > 0) nextImages[tabId] = images;
+      else delete nextImages[tabId];
+      patch.historyPromptDraftImages = nextImages;
+    }
+
+    if (shouldTouchChips) {
+      const nextChips = { ...state.historyPromptDraftChips };
+      const chips = hasExplicitChips
+        ? normalizeComposerChips(options.chips) as HistoryPromptDraftChip[]
+        : [];
+      if (chips.length > 0) nextChips[tabId] = chips;
+      else delete nextChips[tabId];
+      patch.historyPromptDraftChips = nextChips;
+    }
+
+    return patch;
+  }),
+  setHistoryPromptDraftChips: (tabId, chips) => set(state => {
+    const next = { ...state.historyPromptDraftChips };
+    const normalized = normalizeComposerChips(chips) as HistoryPromptDraftChip[];
+    if (normalized.length > 0) next[tabId] = normalized;
+    else delete next[tabId];
+    return { historyPromptDraftChips: next };
+  }),
+  addHistoryPromptDraftChip: (tabId, chip) => set(state => {
+    const next = { ...state.historyPromptDraftChips };
+    const current = state.historyPromptDraftChips[tabId] || [];
+    const normalized = upsertComposerChip(current, chip) as HistoryPromptDraftChip[];
+    if (normalized.length > 0) next[tabId] = normalized;
+    else delete next[tabId];
+    return { historyPromptDraftChips: next };
+  }),
+  removeHistoryPromptDraftChip: (tabId, chipId) => set(state => {
+    const next = { ...state.historyPromptDraftChips };
+    const normalized = removeComposerChip(
+      state.historyPromptDraftChips[tabId] || [],
+      chipId,
+    ) as HistoryPromptDraftChip[];
+    if (normalized.length > 0) next[tabId] = normalized;
+    else delete next[tabId];
+    return { historyPromptDraftChips: next };
   }),
   appendHistoryPromptDraft: (tabId, text) => set(state => {
     const addition = String(text || '');
@@ -2514,6 +2619,33 @@ export const useUIStore = create<UIStore>((set, get) => ({
       historyPromptDrafts: {
         ...state.historyPromptDrafts,
         [tabId]: current + separator + addition,
+      },
+    };
+  }),
+  setHistoryComposerAvailability: (tabId, availability, ownerId) => set(state => {
+    const current = state.historyComposerAvailability[tabId];
+    if (!availability) {
+      // A stale unmount must not clear a newer History owner for the same tab.
+      if (!current || current.ownerId !== ownerId) return {};
+      const next = { ...state.historyComposerAvailability };
+      delete next[tabId];
+      return { historyComposerAvailability: next };
+    }
+    if (
+      current
+      && current.ownerId === availability.ownerId
+      && current.canSend === availability.canSend
+      && current.canAcceptSubmitIntent === availability.canAcceptSubmitIntent
+      && current.canInterruptTurn === availability.canInterruptTurn
+      && current.canPullDraft === availability.canPullDraft
+      && current.status === availability.status
+    ) {
+      return {};
+    }
+    return {
+      historyComposerAvailability: {
+        ...state.historyComposerAvailability,
+        [tabId]: availability,
       },
     };
   }),

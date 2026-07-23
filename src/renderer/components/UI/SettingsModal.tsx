@@ -1222,10 +1222,14 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setHistoryFontSize = useUIStore((s) => s.setHistoryFontSize);
   const historyComposerFontSize = useUIStore((s) => s.historyComposerFontSize);
   const setHistoryComposerFontSize = useUIStore((s) => s.setHistoryComposerFontSize);
+  const aiSecondaryFontSize = useUIStore((s) => s.aiSecondaryFontSize);
+  const setAiSecondaryFontSize = useUIStore((s) => s.setAiSecondaryFontSize);
   const historyComposerMinRows = useUIStore((s) => s.historyComposerMinRows);
   const setHistoryComposerMinRows = useUIStore((s) => s.setHistoryComposerMinRows);
   const historyComposerMaxRows = useUIStore((s) => s.historyComposerMaxRows);
   const setHistoryComposerMaxRows = useUIStore((s) => s.setHistoryComposerMaxRows);
+  const aiComposerChipThreshold = useUIStore((s) => s.aiComposerChipThreshold);
+  const setAiComposerChipThreshold = useUIStore((s) => s.setAiComposerChipThreshold);
   const promptQueueChipFontSize = useUIStore((s) => s.promptQueueChipFontSize);
   const setPromptQueueChipFontSize = useUIStore((s) => s.setPromptQueueChipFontSize);
   const promptQueueEditorFontSize = useUIStore((s) => s.promptQueueEditorFontSize);
@@ -3124,6 +3128,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               <SettingsSubSectionHeader title="История" />
               <SettingsGrid4>
                 <FontSizeSlider label="Шрифт сообщений" description="Основной текст и вызовы инструментов в History" value={historyFontSize} onChange={setHistoryFontSize} min={8} max={24} />
+                <FontSizeSlider label="Шрифт вторичных элементов" description="Подписи, статусы и чипы AI-интерфейса" value={aiSecondaryFontSize} onChange={setAiSecondaryFontSize} min={8} max={18} />
               </SettingsGrid4>
 
               <SettingsSubSectionHeader title="Поле ввода" />
@@ -3131,6 +3136,15 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 <FontSizeSlider label="Шрифт" description="Размер набираемого текста" value={historyComposerFontSize} onChange={setHistoryComposerFontSize} min={8} max={24} />
                 <FontSizeSlider label="Строк при пустом поле" description="Начальная высота input без текста" value={historyComposerMinRows} onChange={setHistoryComposerMinRows} min={1} max={historyComposerMaxRows} suffix="" />
                 <FontSizeSlider label="Максимум строк" description="После этого предела текст прокручивается внутри input" value={historyComposerMaxRows} onChange={setHistoryComposerMaxRows} min={historyComposerMinRows} max={40} suffix="" />
+                <FontSizeSlider
+                  label="Чип после N символов"
+                  description="Длинная ручная вставка; сохранённый prompt всегда становится чипом"
+                  value={aiComposerChipThreshold}
+                  onChange={setAiComposerChipThreshold}
+                  min={100}
+                  max={100000}
+                  suffix=""
+                />
               </SettingsGrid4>
 
               <SettingsSubSectionHeader title="Таймлайн" />

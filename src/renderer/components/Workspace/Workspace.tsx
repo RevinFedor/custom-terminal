@@ -934,6 +934,7 @@ export default function Workspace() {
             <ClaudeControlBar
               tabId={effectiveTab.id}
               projectId={activeProjectId}
+              historyIsPrimary={historyIsPrimary}
               claudeSessionId={effectiveClaudeSessionId}
               geminiSessionId={effectiveGeminiSessionId}
               codexSessionId={effectiveCodexSessionId}

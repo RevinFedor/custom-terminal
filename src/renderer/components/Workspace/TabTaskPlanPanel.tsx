@@ -141,7 +141,10 @@ async function replaceTaskPlanInput(
   focus: boolean,
 ): Promise<void> {
   if (target === 'history') {
-    useUIStore.getState().setHistoryPromptDraft(tabId, text, { preserveImages: true });
+    useUIStore.getState().setHistoryPromptDraft(tabId, text, {
+      preserveImages: true,
+      preserveChips: true,
+    });
     if (focus) {
       requestAnimationFrame(() => {
         const textarea = document.querySelector<HTMLTextAreaElement>(

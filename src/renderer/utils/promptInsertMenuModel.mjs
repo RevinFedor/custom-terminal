@@ -57,3 +57,12 @@ export function isCurrentPickerGeneration(startedGeneration, activeGeneration) {
     && startedGeneration > 0
     && startedGeneration === activeGeneration;
 }
+
+export function clampFloatingPanelTop(anchorTop, panelHeight, viewportHeight, margin = 8) {
+  const safeMargin = Math.max(0, Number(margin) || 0);
+  const safeViewportHeight = Math.max(0, Number(viewportHeight) || 0);
+  const safePanelHeight = Math.max(0, Number(panelHeight) || 0);
+  const minTop = safeMargin;
+  const maxTop = Math.max(minTop, safeViewportHeight - safeMargin - safePanelHeight);
+  return Math.min(Math.max(Number(anchorTop) || 0, minTop), maxTop);
+}

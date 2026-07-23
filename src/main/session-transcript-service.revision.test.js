@@ -127,3 +127,79 @@ test('a transcript change received during an active read gets one trailing read'
   assert.equal(state.inflight, false);
   assert.equal(state.trailingReadReason, null);
 });
+
+test('concurrent subscribers share one initialized state and one watcher', async () => {
+  const service = new SessionTranscriptService({
+    getMainWindow: () => null,
+    webBroadcast: null,
+    claudeData: null,
+    codexData: null,
+  });
+  let releaseResolve;
+  const resolveGate = new Promise((resolve) => { releaseResolve = resolve; });
+  let resolveCalls = 0;
+  let refreshCalls = 0;
+  let watcherStarts = 0;
+  let watcherStops = 0;
+
+  service._resolveFilePath = async () => {
+    resolveCalls += 1;
+    await resolveGate;
+    return '/tmp/shared-session.jsonl';
+  };
+  service._refreshFile = async (state) => {
+    refreshCalls += 1;
+    state.size = 42;
+    state.mtimeMs = 7;
+    return true;
+  };
+  service._startWatcher = (state) => {
+    if (state.watcher) return;
+    watcherStarts += 1;
+    state.watcher = {
+      close: () => {
+        watcherStops += 1;
+      },
+    };
+  };
+
+  const base = {
+    tabId: 'tab-shared',
+    toolType: 'codex',
+    sessionId: 'session-shared',
+    cwd: '/tmp/project',
+  };
+  const historySubscription = service.subscribe({
+    ...base,
+    consumerId: 'history:tab-shared',
+  });
+  const timelineSubscription = service.subscribe({
+    ...base,
+    consumerId: 'timeline:tab-shared',
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(resolveCalls, 1);
+  releaseResolve();
+  const [historyResult, timelineResult] = await Promise.all([
+    historySubscription,
+    timelineSubscription,
+  ]);
+
+  assert.equal(historyResult.success, true);
+  assert.equal(timelineResult.success, true);
+  assert.equal(refreshCalls, 1);
+  assert.equal(watcherStarts, 1);
+  assert.equal(service.sessions.size, 1);
+  const state = service.sessions.values().next().value;
+  assert.equal(state.consumers.size, 2);
+  assert.equal(service.sessionInitInflight.size, 0);
+
+  await service.unsubscribe({ consumerId: 'history:tab-shared' });
+  assert.equal(service.sessions.size, 1);
+  assert.equal(watcherStops, 0);
+
+  await service.unsubscribe({ consumerId: 'timeline:tab-shared' });
+  assert.equal(service.sessions.size, 0);
+  assert.equal(watcherStops, 1);
+});

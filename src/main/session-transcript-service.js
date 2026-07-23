@@ -101,6 +101,7 @@ class SessionTranscriptService {
     this.claudeData = claudeData;
     this.codexData = codexData;
     this.sessions = new Map();
+    this.sessionInitInflight = new Map();
     this.consumerToKey = new Map();
   }
 
@@ -262,32 +263,47 @@ class SessionTranscriptService {
   }
 
   async _ensureState({ key, toolType, sessionId, cwd }) {
-    let state = this.sessions.get(key);
-    if (state) return state;
-    const filePath = await this._resolveFilePath(toolType, sessionId, cwd);
-    state = {
-      key,
-      toolType,
-      sessionId,
-      cwd,
-      filePath,
-      consumers: new Map(),
-      watcher: null,
-      timer: null,
-      reconcileTimer: null,
-      inflight: false,
-      trailingReadReason: null,
-      offset: 0,
-      leftover: '',
-      version: 0,
-      size: 0,
-      mtimeMs: 0,
-      lastUuid: null,
-    };
-    await this._refreshFile(state);
-    state.offset = state.size;
-    this.sessions.set(key, state);
-    return state;
+    const existing = this.sessions.get(key);
+    if (existing) return existing;
+
+    const inflight = this.sessionInitInflight.get(key);
+    if (inflight) return inflight;
+
+    const initialization = (async () => {
+      const filePath = await this._resolveFilePath(toolType, sessionId, cwd);
+      const state = {
+        key,
+        toolType,
+        sessionId,
+        cwd,
+        filePath,
+        consumers: new Map(),
+        watcher: null,
+        timer: null,
+        reconcileTimer: null,
+        inflight: false,
+        trailingReadReason: null,
+        offset: 0,
+        leftover: '',
+        version: 0,
+        size: 0,
+        mtimeMs: 0,
+        lastUuid: null,
+      };
+      await this._refreshFile(state);
+      state.offset = state.size;
+      this.sessions.set(key, state);
+      return state;
+    })();
+    this.sessionInitInflight.set(key, initialization);
+
+    try {
+      return await initialization;
+    } finally {
+      if (this.sessionInitInflight.get(key) === initialization) {
+        this.sessionInitInflight.delete(key);
+      }
+    }
   }
 
   async _resolveFilePath(toolType, sessionId, cwd) {

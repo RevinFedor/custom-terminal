@@ -30,6 +30,8 @@
 
 Context-menu захватывает `tabId`, координаты и fallback cwd в момент правого клика. Перед чтением Scripts запрашивается live cwd PTY: пользователь мог сделать `cd` после создания вкладки. Последующий tab switch не перенаправляет вставку, а старое асинхронное чтение prompt-файлов не закрывает и не refocus'ит picker, открытый позже: каждый open имеет своё поколение.
 
+Двухстрочный root `Insert Prompt / Scripts` измеряется и clamp'ится только по собственной геометрии и остаётся у точки правого клика. Group/script и prompt-колонки — независимые absolute-поверхности: каждая якорится к своей parent-row, отдельно сдвигается в доступную высоту viewport и при нехватке места справа вся цепочка раскрывается влево. Высота потомка не участвует в позиции root; общий flex-measure раньше заставлял первый уровень «телепортироваться» вверх при раскрытии длинной группы.
+
 ### Layout reservation: правая панель не сжимает левую
 Правая колонка имеет **слот фиксированной ширины** даже когда содержимое скрыто:
 
@@ -76,11 +78,13 @@ Context-menu захватывает `tabId`, координаты и fallback cw
 
 ## Tab-type routing для вставки
 Picker сам резолвит куда вставлять через `getEffectiveTabId()` (sub-agent aware) + `tab.tabType`:
-- видимый History composer → tab-scoped History draft с вставкой в текущую caret/selection; floating xterm того же tab остаётся нетронутым;
-- `claude-sdk` → `window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', { detail: { tabId, text } }))` — тот же event что использует right-click SDK menu.
+- видимый History composer → prompt-чип в tab-scoped History draft; floating xterm того же tab остаётся нетронутым;
+- `claude-sdk` → prompt-чип в composer конкретного SDK tab через тот же адресованный event, что использует right-click SDK menu;
 - иначе (PTY: claude/gemini/bash) → `ipcRenderer.send('terminal:input', tabId, content)` + `ipcRenderer.invoke('terminal:paste', …)` для file_paths. Идентично существующему `cmd === 'insert-prompt'` handler'у в `App.tsx`.
 
-Target для Opt+V тоже фиксируется один раз при open. Если History был видим в этот момент, завершившееся позже чтение attached prompt-файлов вставляет туда же даже после переключения tab; mounted composer подтверждает доставку синхронно, а при его unmount текст дописывается напрямую в сохранённый History draft.
+Для History/SDK сохранённый prompt всегда остаётся чипом независимо от длины, потому что origin важнее text threshold; приложенные prompt-файлы читаются до доставки и входят в тело того же чипа. Stable source key включает prompt и variation, поэтому повторный выбор обновляет свой чип, но не склеивает разные варианты.
+
+Target для Opt+V тоже фиксируется один раз при open. Если History был видим в этот момент, завершившееся позже чтение attached prompt-файлов доставляет чип туда же даже после переключения tab; mounted composer подтверждает доставку синхронно, а при его unmount чип записывается прямо в сохранённый History draft.
 
 ## Focus restore при закрытии (обязательно)
 
@@ -91,13 +95,16 @@ Target для Opt+V тоже фиксируется один раз при open.
 ## Backdrop отсутствует
 Полупрозрачной подложки нет — только click-outside listener на `mousedown` capture phase (см. `App.tsx::onDown` для других overlay'ев — палитра, контекст-меню). Юзер прямо: *«оверлей быть тоже не должно»* — picker должен открываться поверх UI без визуального dimming.
 
-## Anchor: SDK caret или bottom-center fallback
+## Anchor: History composer, SDK caret или bottom-center fallback
 Якорь решается **один раз** при открытии — picker не следует ни за чем пока висит, иначе arrow-навигация ломает mental model «окно стоит, я в нём двигаюсь стрелочками». Mouse-cursor tracking удалён полностью — раньше picker пытался открыться у мыши с проверкой свежести `mousemove` (≤ 1500мс), но это конфликтовало с типичным сценарием «фокус в input → жму Opt+V» где мышь могла быть где угодно. Новая стратегия — основана исключительно на типе активного таба:
 
 | Случай | Якорь | Координаты |
 |---|---|---|
+| Активная поверхность — видимый History composer | `history-composer` | Нижний край picker фиксируется над верхней рамкой composer; высота контента меняет только `top`, но не точку примыкания |
 | Активный таб — `claude-sdk` И его textarea видима И есть selectionEnd | `sdk-caret` | Справа-вниз от текстового курсора в textarea: `left = caret.x + 6`, `top = caret.y + lineHeight + 4` |
 | Иначе (терминал, нет таргета, скрытый SDK, etc.) | `bottom-center` | `top = vh - height - bottomOffsetPx`, `left` по правилам приоритета `right > left > center` |
+
+В shortcut-режиме внешний двухколонный footprint сохраняется и для группы, и для одиночного prompt. Меняется содержимое зарезервированной правой колонки, а не ширина root: hover «группа → одиночный prompt → группа» не имеет права телепортировать окно вправо-влево.
 
 ### SDK caret measurement
 Координаты текстового курсора в `<textarea>` получаем через mirror-div technique (inlined, без зависимости от `textarea-caret-coordinates` пакета):
@@ -113,8 +120,8 @@ Target для Opt+V тоже фиксируется один раз при open.
 
 `findSDKTextarea()` обязан фильтровать по `style.display !== 'none'` (или `getComputedStyle(root).display`) и defense-in-depth проверяй `width===0 && height===0` на самой textarea. Симптом неправильной фильтрации: «picker всегда в (0,0) на SDK табе независимо от того где я».
 
-### Главный picker — только вниз, без mirror-up
-Главная (левая) колонка picker'а **никогда** не зеркалится вверх от каретки. Если каретка слишком близко к низу viewport'а, picker клампится по нижнему краю (`top = vh - measuredH - margin`) и перекрывает несколько пикселей инпута — это приемлемо. Юзер прямо: *«ее можно просто пережать вниз и всё, в этом ничего страшного нет»*.
+### SDK caret path — только вниз, без mirror-up
+При SDK caret-якоре главная (левая) колонка picker'а **никогда** не зеркалится вверх от каретки. Если каретка слишком близко к низу viewport'а, picker клампится по нижнему краю (`top = vh - measuredH - margin`) и перекрывает несколько пикселей инпута — это приемлемо. History composer использует другой явный контракт: picker всегда примыкает к его верхней рамке и растёт вверх. Юзер прямо: *«ее можно просто пережать вниз и всё, в этом ничего страшного нет»* — это относилось к SDK caret, а не к bottom composer.
 
 Mirror-up зарезервирован **только** для правой (групповой) колонки — см. ниже.
 
@@ -155,7 +162,7 @@ Right выигрывает у left умышленно: юзер часто ис�
 - **Listener в bubble phase на window** — xterm и assistant-ui textarea получают keydown первыми (они подписаны на nested DOM-элементы, по DOM-flow bubble идёт snizu вверх). Capture фaza идёт сверху вниз — window-handler срабатывает раньше.
 - **Backdrop с `background: rgba(0,0,0,0.18)`** — был в первой версии, юзер потребовал убрать («оверлей быть тоже не должно»). Заменён на чистый click-outside.
 - **`top: 50%` (по центру)** — picker конкурировал со statusbar'ом на коротких окнах. Промежуточный fallback `top: 22%` тоже был удалён вместе со всей mouse-tracking веткой — теперь fallback всегда `bottom-center` (см. секцию Anchor).
-- **Anchor у курсора мыши** (вся ветка с `lastMouseRef`, `mousemove` listener, `Date.now() - t <= 1500` свежесть, fallback на `top: 22%`) — конфликтовал с типичным сценарием «фокус в SDK input → Opt+V» где мышь могла быть в произвольной точке экрана. Picker выскакивал далеко от того места где юзер реально работал. Заменено на детерминированный якорь от типа активного таба: SDK caret или bottom-center.
+- **Anchor у курсора мыши** (вся ветка с `lastMouseRef`, `mousemove` listener, `Date.now() - t <= 1500` свежесть, fallback на `top: 22%`) — конфликтовал с типичным сценарием «фокус в input → Opt+V» где мышь могла быть в произвольной точке экрана. Picker выскакивал далеко от того места где юзер реально работал. Заменено на детерминированный якорь от активной поверхности: History composer, SDK caret или bottom-center.
 - **`document.querySelector('textarea')` для SDK caret** — находит первую textarea в DOM включая **скрытые** SDK табы (они переключаются через `display:none|flex`, не unmount'ятся). Их `getBoundingClientRect = {0,0,0,0}` → caret = (0,0) → picker в верхнем-левом углу viewport'а. Симптом «picker появляется в углу независимо от позиции каретки» = `findSDKTextarea` не фильтрует по `display !== 'none'`.
 - **Mirror-up главного picker'а при нехватке места снизу** — изначально при `top + measuredH + margin > vh` picker зеркалился вверх от каретки SDK. Юзер: *«ее можно просто пережать вниз и всё»* — открытие вверх ломало mental model «выбираю промпт под местом где печатаю», даже если перекрытие нескольких пикселей инпута визуально менее красиво. Mirror-up оставлен только для правой групповой панели.
 - **Правая панель условным рендерингом без wrapper'а** — без зарезервированной обёртки левая колонка при `selectedLeftItem.kind === 'prompt'` центрировалась в overlay'е. Решение — обёртка с `flexShrink: 0` + `width: RIGHT_W` всегда в DOM, content внутри условный.

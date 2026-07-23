@@ -60,7 +60,14 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   assert.equal(queueModule.getShortGrabPromptTitle('a'.repeat(24)), 'a'.repeat(24));
   assert.equal(queueModule.getShortGrabPromptTitle('a'.repeat(25)), null);
   const hydration = queueModule.hydratePromptQueueStore();
-  const newId = queueModule.usePromptQueueStore.getState().addPrompt('tab-1', 'new prompt');
+  const newId = queueModule.usePromptQueueStore.getState().addPrompt(
+    'tab-1',
+    'new prompt',
+    undefined,
+    undefined,
+    undefined,
+    [{ id: 'runtime-paste', kind: 'paste', text: 'runtime paste' }],
+  );
   const originalDateNowBeforeHydration = Date.now;
   let mergedRuntimeId;
   try {
@@ -81,6 +88,12 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
         imagePaths: [
           { id: 1, assetId: firstAssetId, path: '/durable/a.png', mediaType: 'image/png', size: 10, availability: 'available' },
           { id: 2, assetId: secondAssetId, path: '/durable/b.png', mediaType: 'image/png', size: 20, availability: 'available' },
+        ],
+        chips: [
+          { id: 'persisted-prompt', kind: 'prompt', text: 'old instruction', sourceKey: 'prompt:docs' },
+          { id: 'replacement-id', kind: 'prompt', text: 'updated instruction', sourceKey: 'prompt:docs' },
+          { id: 'persisted-paste', kind: 'paste', text: 'raw paste' },
+          { id: 'invalid-chip', kind: 'unknown', text: 'drop me' },
         ],
         createdAt: 1,
       }],
@@ -139,9 +152,67 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   assert.equal(mergedRuntimeQueue.workflowArmedAt, 5_000);
   assert.equal(queueModule.hasRuntimeWorkflowArm('tab-merge-arm'), true);
   assert.equal(queueModule.getQueuedPromptAttachmentState(queue.items[0]), 'ready');
+  assert.deepEqual(queue.items[0].chips, [
+    {
+      id: 'persisted-prompt',
+      kind: 'prompt',
+      text: 'updated instruction',
+      sourceKey: 'prompt:docs',
+    },
+    {
+      id: 'persisted-paste',
+      kind: 'paste',
+      text: 'raw paste',
+    },
+  ]);
+  assert.deepEqual(queue.items[1].chips, [
+    {
+      id: 'runtime-paste',
+      kind: 'paste',
+      text: 'runtime paste',
+    },
+  ]);
+  assert.equal(
+    queueModule.buildQueuedPromptPayload(queue.items[0]),
+    [
+      'updated instruction',
+      '<pasted_content>\nraw paste\n</pasted_content>',
+      '[imagePath: /durable/a.png] compare [imagePath: /durable/b.png]',
+    ].join('\n\n'),
+  );
   assert.equal(
     queueModule.buildQueuedPromptPayload({ text: '[Image]', imagePaths: [] }),
     '[imageError: queued_image_path_unavailable #unknown]',
+  );
+  assert.equal(
+    queueModule.buildQueuedPromptPayload({
+      text: '',
+      chips: [{ id: 'literal-image-log', kind: 'paste', text: 'log says [Image #1]' }],
+      imagePaths: [{
+        id: 1,
+        path: '/durable/should-not-be-consumed.png',
+        mediaType: 'image/png',
+        size: 10,
+        availability: 'available',
+      }],
+    }),
+    '<pasted_content>\nlog says [Image #1]\n</pasted_content>',
+    'image-looking text inside an opaque chip stays literal',
+  );
+  assert.equal(
+    queueModule.buildQueuedPromptPayload({
+      text: '[Image #1]',
+      chips: [],
+      imagePaths: [{
+        id: 1,
+        path: '/durable/body-image.png',
+        mediaType: 'image/png',
+        size: 10,
+        availability: 'available',
+      }],
+    }),
+    '[imagePath: /durable/body-image.png]',
+    'real textarea image markers still materialize',
   );
 
   const legacyDisarmed = queueModule.usePromptQueueStore.getState().disarmQueuesForTrigger('tab-1', null);
@@ -207,6 +278,17 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   assert.deepEqual(
     saved['tab-1'].items[0].imagePaths.map((ref) => ref.assetId),
     [firstAssetId, secondAssetId],
+  );
+  assert.deepEqual(
+    saved['tab-1'].items[0].chips.map((chip) => [chip.id, chip.kind, chip.text]),
+    [
+      ['persisted-prompt', 'prompt', 'updated instruction'],
+      ['persisted-paste', 'paste', 'raw paste'],
+    ],
+  );
+  assert.deepEqual(
+    saved['tab-1'].items[1].chips.map((chip) => [chip.id, chip.kind, chip.text]),
+    [['runtime-paste', 'paste', 'runtime paste']],
   );
   assert.equal(saved['tab-persisted-arm'].workflowArmedAt, 777);
   assert.equal(saved['tab-merge-arm'].workflowArmedAt, 5_000);

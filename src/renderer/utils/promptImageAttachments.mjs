@@ -1,5 +1,20 @@
 const VALID_IMAGE_MARKER_SOURCE = String.raw`(?<!\\)\[Image\s+#?(\d+)\]`;
 
+/**
+ * Common structural shape shared by History and Run After. Individual stores
+ * may require more metadata, but the insertion helper only owns identity/path.
+ *
+ * @typedef {{
+ *   id: number,
+ *   path: string,
+ *   assetId?: string,
+ *   mediaType?: string | null,
+ *   size?: number,
+ *   availability?: 'available' | 'missing',
+ *   error?: string,
+ * }} PromptImageAttachmentRef
+ */
+
 function createValidImageMarkerRegex() {
   return new RegExp(VALID_IMAGE_MARKER_SOURCE, 'gi');
 }
@@ -108,6 +123,16 @@ export function getPromptImageAttachmentState({
   return attachmentState === 'missing' ? 'missing' : 'ready';
 }
 
+/**
+ * @param {{
+ *   text?: string,
+ *   imagePaths?: PromptImageAttachmentRef[],
+ *   start?: number,
+ *   end?: number,
+ *   insertedText?: string,
+ *   insertedImagePaths?: PromptImageAttachmentRef[],
+ * }} [options]
+ */
 export function insertPromptImageAttachments({
   text = '',
   imagePaths = [],

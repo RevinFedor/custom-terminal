@@ -78,27 +78,64 @@ test('total entry budget evicts whole least-recent snapshots without truncating 
   });
 });
 
-test('byte budget rejects a single oversized snapshot and invalidates an older replacement', () => {
+test('byte budget retains exactly the latest oversized snapshot without copying its entries', () => {
   const cache = new HistorySnapshotCache({
     maxBytes: 2_000,
     maxEntries: 100,
-    maxSnapshots: 10,
+    maxSnapshots: 2,
   });
   const target = owner('same');
   assert.equal(cache.set(target, snapshot(['small'])).stored, true);
 
+  const hugeEntries = [{ uuid: 'huge', content: 'x'.repeat(20_000) }];
   const result = cache.set(target, {
-    entries: [{ uuid: 'huge', content: 'x'.repeat(20_000) }],
+    entries: hugeEntries,
     revision: 'revision-2',
   });
 
   assert.deepEqual(
     { stored: result.stored, invalidatedExisting: result.invalidatedExisting },
-    { stored: false, invalidatedExisting: true },
+    { stored: true, invalidatedExisting: true },
   );
+  assert.equal(cache.get(target)?.entries, hugeEntries);
+  assert.ok(cache.stats().approxBytes > 2_000);
+
+  const regular = owner('regular');
+  cache.set(regular, snapshot(['regular']));
+  assert.equal(cache.has(target), true);
+  assert.equal(cache.has(regular), true);
+
+  const latestOwner = owner('latest');
+  const latestEntries = [{ uuid: 'latest', content: 'y'.repeat(20_000) }];
+  const replacement = cache.set(latestOwner, {
+    entries: latestEntries,
+    revision: 'revision-3',
+  });
+  assert.deepEqual(replacement.evictedKeys, [makeHistorySnapshotKey(target)]);
   assert.equal(cache.has(target), false);
-  assert.equal(cache.stats().totalEntries, 0);
-  assert.equal(cache.stats().approxBytes, 0);
+  assert.equal(cache.get(latestOwner)?.entries, latestEntries);
+  assert.equal(cache.has(regular), true);
+  assert.equal(cache.stats().snapshots, 2);
+});
+
+test('normal LRU limits remain bounded alongside the protected oversized snapshot', () => {
+  const cache = new HistorySnapshotCache({
+    maxBytes: 2_000,
+    maxEntries: 100,
+    maxSnapshots: 1,
+  });
+  const oversized = owner('oversized');
+  cache.set(oversized, {
+    entries: [{ uuid: 'huge', content: 'x'.repeat(20_000) }],
+  });
+
+  cache.set(owner('regular-a'), snapshot(['regular-a']));
+  cache.set(owner('regular-b'), snapshot(['regular-b']));
+
+  assert.equal(cache.has(oversized), true);
+  assert.equal(cache.has(owner('regular-a')), false);
+  assert.equal(cache.has(owner('regular-b')), true);
+  assert.equal(cache.stats().snapshots, 2);
 });
 
 test('replacement updates byte and entry accounting instead of accumulating both values', () => {

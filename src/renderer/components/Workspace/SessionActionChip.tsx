@@ -10,7 +10,9 @@ import ControlHint from '../UI/ControlHint';
 // === PTY MODE (claude/gemini CLI в живой TUI) ===
 // Три состояния, label morphs on (state, hover):
 //   No session at all          → label "Claude"/"Gemini" (tinted), hover "Start", click → onStart
-//   Session in DB, proc dead   → label "Continue", click → onContinue (claude --resume)
+//   Session in DB, proc dead   → label "Continue" by default, or "Resume" on
+//                                primary History; click → onContinue
+//                                (claude/codex resume)
 //   Session live (proc alive)  → label "Claude"/"Gemini" idle, hover "Stop", click → onStop
 //
 // === SDK MODE (Anthropic Agent SDK, без PTY) ===
@@ -36,6 +38,7 @@ import ControlHint from '../UI/ControlHint';
 export default function SessionActionChip({
   sessionType, isCommandRunning, hasAnySession,
   mode = 'pty',
+  idleLabel = 'Continue',
   disabled = false,
   disabledTitle,
   onStart, onContinue, onStop,
@@ -46,6 +49,8 @@ export default function SessionActionChip({
   /** 'pty' = CLI в живой TUI (Start/Continue/Stop матрица).
    *  'sdk' = Anthropic Agent SDK (только Stop при isRunning, иначе passive). */
   mode?: 'pty' | 'sdk';
+  /** PTY label for a saved session whose process is stopped. */
+  idleLabel?: 'Continue' | 'Resume';
   disabled?: boolean;
   disabledTitle?: string;
   onStart: () => void;
@@ -57,7 +62,9 @@ export default function SessionActionChip({
   const accentBright = sessionType === 'claude' ? '#FF9466' : sessionType === 'codex' ? '#34d399' : '#7BA3FF';
   const defaultLabel = sessionType === 'claude' ? 'Claude' : sessionType === 'codex' ? 'Codex' : 'Gemini';
 
-  // PTY matrix: Continue появляется когда сессия есть, но процесс мёртв.
+  // PTY matrix: Continue/Resume appears when a saved session exists but its
+  // process is dead. The primary History surface says Resume because that is
+  // the user-facing action; legacy terminal presentation keeps Continue.
   // SDK matrix: Continue не существует — нечего возобновлять (нет процесса
   // между turn'ами как концепта). idle всегда показывает defaultLabel.
   const sessionIdle = mode === 'pty' && hasAnySession && !isCommandRunning;
@@ -68,7 +75,7 @@ export default function SessionActionChip({
   const showStartOnHover = !disabled && mode === 'pty' && hover && !hasAnySession;
 
   const label = sessionIdle
-    ? 'Continue'
+    ? idleLabel
     : showStopOnHover ? 'Stop'
     : showStartOnHover ? 'Start'
     : defaultLabel;
@@ -106,7 +113,7 @@ export default function SessionActionChip({
       : isCommandRunning
         ? `Остановить процесс ${defaultLabel}`
         : hasAnySession
-          ? `Продолжить сессию ${defaultLabel}`
+          ? `${idleLabel === 'Resume' ? 'Возобновить' : 'Продолжить'} сессию ${defaultLabel}`
           : `Запустить ${defaultLabel}`;
   return (
     <ControlHint label={helpLabel}>

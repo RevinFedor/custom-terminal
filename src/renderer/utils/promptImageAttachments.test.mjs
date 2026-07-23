@@ -38,6 +38,19 @@ test('insertion remaps attachment ids without colliding with the current draft',
   assert.equal(result.caret, 'before new [Image #2] '.length);
 });
 
+test('clipboard marker leaves one trailing space and places caret after it', () => {
+  const result = insertPromptImageAttachments({
+    text: 'before [Image saving…]after',
+    start: 'before '.length,
+    end: 'before [Image saving…]'.length,
+    insertedText: '[Image #0] ',
+    insertedImagePaths: [ref(0)],
+  });
+
+  assert.equal(result.text, 'before [Image #1] after');
+  assert.equal(result.caret, 'before [Image #1] '.length);
+});
+
 test('removing a complete marker releases only its ref, damaged markers retain refs for repair', () => {
   const refs = [ref(1), ref(2)];
   assert.deepEqual(

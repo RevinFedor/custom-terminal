@@ -92,7 +92,7 @@ async function deliverFinal(text: string, mode: DictationMode, tabId: string): P
     store.setHistoryPromptDraft(
       tabId,
       current + separator + text,
-      { preserveImages: true },
+      { preserveImages: true, preserveChips: true },
     );
     window.dispatchEvent(new CustomEvent('history-panel:focus-composer', {
       detail: { tabId },

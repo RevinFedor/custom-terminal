@@ -1,8 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Plus, RefreshCw, Square, Trash2, TriangleAlert } from 'lucide-react';
-import { buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedImageMarkerHighlightRanges, getQueuedPromptAttachmentState, getShortGrabPromptTitle, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, usePromptQueueStore, type QueuedImageMarkerRange, type QueuedImageRef, type QueuedPrompt } from '../../store/usePromptQueueStore';
+import { ArrowDown, CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Plus, RefreshCw, Square, Trash2, TriangleAlert, X } from 'lucide-react';
+import { ComposerChip } from '@noted/claude-blocks';
+import { acquirePromptQueueEditorLock, buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedImageMarkerHighlightRanges, getQueuedPromptAttachmentState, getShortGrabPromptTitle, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, releasePromptQueueEditorLock, usePromptQueueStore, type QueuedComposerChip, type QueuedImageMarkerRange, type QueuedImageRef, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -12,8 +13,15 @@ import {
   collectPromptImageRefIds,
   getPromptImageAttachmentState,
   hasMalformedPromptImageMarker,
+  haveSamePromptImageRefs,
   insertPromptImageAttachments,
 } from '../../utils/promptImageAttachments.mjs';
+import {
+  haveSameComposerChips,
+  normalizeComposerChips,
+  restoreComposerChipToText,
+  serializeComposerDraft,
+} from '../../utils/composerChips.mjs';
 import { RunAfterTabPicker } from './RunAfterTabPicker';
 import { OrchestrationStatusChip } from './OrchestrationStatusChip';
 import ControlHint from '../UI/ControlHint';
@@ -262,6 +270,8 @@ export function PromptQueueOverlay({
 
   const [editorOpen, setEditorOpen] = useState(false);
   const [editorText, setEditorText] = useState('');
+  const [editorChips, setEditorChips] = useState<QueuedComposerChip[]>([]);
+  const [editorChipPreviewId, setEditorChipPreviewId] = useState<string | null>(null);
   const [editorTitle, setEditorTitle] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
   // When true, the editor edits the per-tab post-prompt body (not a chip).
@@ -293,6 +303,22 @@ export function PromptQueueOverlay({
   const editorHighlightRef = useRef<HTMLDivElement>(null);
   const replayButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const committingRef = useRef(false);
+  const editorLockTokenRef = useRef(
+    `prompt-queue-editor:${tabId}:${Math.random().toString(36).slice(2)}`,
+  );
+  const editorPayloadLockedRef = useRef(false);
+  const editorLastWrittenRef = useRef<{
+    id: string | null;
+    post: boolean;
+    text: string;
+    chips: QueuedComposerChip[];
+  } | null>(null);
+  const editorDirtyFieldsRef = useRef({
+    text: false,
+    chips: false,
+    title: false,
+    post: false,
+  });
   const removingIdsRef = useRef<Set<string>>(new Set());
   const chipCloseSuppressRef = useRef<{ id: string; until: number } | null>(null);
   const titleGeneratingIdsRef = useRef<Set<string>>(new Set());
@@ -300,6 +326,7 @@ export function PromptQueueOverlay({
     id: string | null;
     post: boolean;
     text: string;
+    chips: QueuedComposerChip[];
     title: string;
     titleManual: boolean;
   } | null>(null);
@@ -415,10 +442,33 @@ export function PromptQueueOverlay({
   // agentBusy prop here is still used for the Run pill's pulsing indicator.
 
   // ─── handlers ────────────────────────────────────────────────────────────
-  const resetEditor = useCallback(() => {
+  const acquireEditorPayloadLock = useCallback((itemId: string | null): boolean => {
+    const acquired = acquirePromptQueueEditorLock(
+      tabId,
+      editorLockTokenRef.current,
+      itemId,
+    );
+    editorPayloadLockedRef.current = acquired;
+    if (!acquired) {
+      console.warn('[PromptQueue] editor payload lock refused tab=' + tabId.slice(-8)
+        + ' item=' + (itemId?.slice(-8) || 'post'));
+    }
+    return acquired;
+  }, [tabId]);
+
+  const releaseEditorPayloadLock = useCallback((wakeAutoRun = true) => {
+    if (!editorPayloadLockedRef.current) return;
+    releasePromptQueueEditorLock(tabId, editorLockTokenRef.current, { wakeAutoRun });
+    editorPayloadLockedRef.current = false;
+  }, [tabId]);
+
+  const resetEditor = useCallback((options: { wakeAutoRun?: boolean } = {}) => {
+    releaseEditorPayloadLock(options.wakeAutoRun !== false);
     if (editingId) setPreviewId(tabId, null);
     setEditorOpen(false);
     setEditorText('');
+    setEditorChips([]);
+    setEditorChipPreviewId(null);
     setEditorTitle('');
     setEditingId(null);
     setIsPostPromptMode(false);
@@ -426,7 +476,19 @@ export function PromptQueueOverlay({
     setEditorFocusWithin(false);
     setEditorPinned(false);
     editorInitialRef.current = null;
-  }, [editingId, setPreviewId, tabId]);
+    editorLastWrittenRef.current = null;
+    editorDirtyFieldsRef.current = {
+      text: false,
+      chips: false,
+      title: false,
+      post: false,
+    };
+  }, [editingId, releaseEditorPayloadLock, setPreviewId, tabId]);
+
+  useEffect(() => () => {
+    releasePromptQueueEditorLock(tabId, editorLockTokenRef.current);
+    editorPayloadLockedRef.current = false;
+  }, [tabId]);
 
   const markAppearing = useCallback((id: string) => {
     setAppearingIds((prev) => {
@@ -521,71 +583,204 @@ export function PromptQueueOverlay({
     return true;
   }, [markSaved, setTitleLoading, tabId, updatePrompt]);
 
-  const commitEditor = useCallback((opts?: { close?: boolean }) => {
+  const writeThroughEditorPayload = useCallback((
+    nextText: string,
+    nextChips: QueuedComposerChip[],
+  ): boolean => {
+    const initial = editorInitialRef.current;
+    if (!initial) return false;
+    const normalizedChips = normalizeComposerChips(nextChips) as QueuedComposerChip[];
+
+    if (initial.post) {
+      if (!acquireEditorPayloadLock(null)) return false;
+      setPostPromptText(tabId, nextText);
+      editorLastWrittenRef.current = {
+        id: null,
+        post: true,
+        text: nextText,
+        chips: [],
+      };
+      return true;
+    }
+
+    if (!initial.id) {
+      editorLastWrittenRef.current = {
+        id: null,
+        post: false,
+        text: nextText,
+        chips: normalizedChips,
+      };
+      return true;
+    }
+    if (!acquireEditorPayloadLock(initial.id)) return false;
+
+    const previous = editorLastWrittenRef.current;
+    const patch: { text?: string; chips?: QueuedComposerChip[] } = {};
+    if (!previous || previous.text !== nextText) patch.text = nextText;
+    if (!previous || !haveSameComposerChips(previous.chips, normalizedChips)) {
+      patch.chips = normalizedChips;
+    }
+    if (!Object.prototype.hasOwnProperty.call(patch, 'text')
+      && !Object.prototype.hasOwnProperty.call(patch, 'chips')) {
+      return true;
+    }
+
+    const accepted = updatePrompt(tabId, initial.id, patch);
+    if (accepted) {
+      editorLastWrittenRef.current = {
+        id: initial.id,
+        post: false,
+        text: nextText,
+        chips: normalizedChips,
+      };
+    }
+    return accepted;
+  }, [acquireEditorPayloadLock, setPostPromptText, tabId, updatePrompt]);
+
+  const commitEditor = useCallback((opts?: { close?: boolean; wakeAutoRun?: boolean }) => {
     if (!editorOpen || committingRef.current) return false;
     const initial = editorInitialRef.current;
     if (!initial) {
-      if (opts?.close !== false) resetEditor();
+      if (opts?.close !== false) resetEditor({ wakeAutoRun: opts?.wakeAutoRun });
       return false;
     }
     committingRef.current = true;
     let changed = false;
     try {
       if (initial.post) {
-        if (editorText !== initial.text) {
-          setPostPromptText(tabId, editorText);
-          changed = true;
+        changed = editorDirtyFieldsRef.current.post;
+        if (editorLastWrittenRef.current?.text !== editorText) {
+          writeThroughEditorPayload(editorText, []);
         }
-        if (opts?.close !== false) resetEditor();
+        if (opts?.close !== false) resetEditor({ wakeAutoRun: opts?.wakeAutoRun });
         return changed;
       }
 
       const normalizedTitle = editorTitle.trim();
       const bodyText = editorText.trim();
-      const titleCanStandInForBody = normalizedTitle.length > 0 && (
+      const hasExistingChips = editorChips.length > 0;
+      const initialSerialized = serializeComposerDraft({
+        text: initial.text,
+        chips: initial.chips,
+      });
+      const titleCanStandInForBody = initial.chips.length === 0
+        && normalizedTitle.length > 0 && (
         !initial.id ||
         !!initial.titleManual ||
         normalizedTitle !== initial.title ||
-        normalizedTitle !== makeDefaultPromptTitle(initial.text)
+        normalizedTitle !== makeDefaultPromptTitle(initialSerialized)
       );
-      const text = bodyText || (titleCanStandInForBody ? normalizedTitle : '');
-      if (!text) {
-        if (opts?.close !== false) resetEditor();
-        return false;
-      }
+      // A chip-only queue item has an intentionally empty editable body. Its
+      // generated title is presentation, not substitute payload; opening and
+      // closing the editor must not copy that title into the body and send it
+      // alongside the hidden chip.
+      const text = bodyText || (
+        titleCanStandInForBody
+          ? normalizedTitle
+          : ''
+      );
 
       if (initial.id) {
-        const nextDefaultTitle = makeDefaultPromptTitle(text);
-        const titleEditedInForm = normalizedTitle !== initial.title;
-        const titleManual = titleEditedInForm
-          ? (normalizedTitle.length > 0 && normalizedTitle !== nextDefaultTitle)
-          : initial.titleManual;
-        const nextTitle = titleManual ? normalizedTitle : nextDefaultTitle;
-        changed =
-          text !== initial.text ||
-          nextTitle !== initial.title ||
-          titleManual !== initial.titleManual;
-        if (changed) {
-          updatePrompt(tabId, initial.id, {
-            text,
-            title: nextTitle,
-            titleManual,
-          });
+        if (
+          editorLastWrittenRef.current?.text !== editorText
+          || !haveSameComposerChips(editorLastWrittenRef.current?.chips, editorChips)
+        ) {
+          writeThroughEditorPayload(editorText, editorChips);
+        }
+        const lastWritten = editorLastWrittenRef.current;
+        const localPayloadChanged = editorDirtyFieldsRef.current.text
+          || editorDirtyFieldsRef.current.chips;
+        const titleEditedInForm = editorDirtyFieldsRef.current.title;
+        changed = localPayloadChanged || titleEditedInForm;
+
+        let itemStillExists = !!usePromptQueueStore.getState().getQueue(tabId)
+          .items.find((item) => item.id === initial.id);
+        if (!text && !hasExistingChips) {
+          if (initial.chips.length > 0 && lastWritten) {
+            // Deleting the last chip intentionally removes a chip-only item,
+            // but only while the durable payload is still the exact payload
+            // this editor wrote. A concurrent mobile edit makes this CAS fail.
+            removePrompt(tabId, initial.id, {
+              expected: {
+                text: lastWritten.text,
+                chips: lastWritten.chips,
+              },
+            });
+            itemStillExists = !!usePromptQueueStore.getState().getQueue(tabId)
+              .items.find((item) => item.id === initial.id);
+          } else if (localPayloadChanged && lastWritten) {
+            // Historical behaviour ignores clearing the only plain-text body.
+            // Restore it only if nobody changed that same field after our last
+            // write-through; otherwise the newer remote value wins.
+            updatePrompt(
+              tabId,
+              initial.id,
+              { text: initial.text },
+              { expected: { text: lastWritten.text } },
+            );
+          }
+        } else if (lastWritten && text !== lastWritten.text) {
+          // Final whitespace/title normalization is a conditional write. It
+          // must not replay the open-time snapshot over a later mobile edit.
+          const accepted = updatePrompt(
+            tabId,
+            initial.id,
+            { text },
+            { expected: { text: lastWritten.text } },
+          );
+          if (accepted) {
+            editorLastWrittenRef.current = { ...lastWritten, text };
+          }
+        }
+
+        if (itemStillExists && titleEditedInForm) {
+          const current = usePromptQueueStore.getState().getQueue(tabId)
+            .items.find((item) => item.id === initial.id);
+          if (current) {
+            const nextDefaultTitle = makeDefaultPromptTitle(serializeComposerDraft({
+              text: current.text,
+              chips: current.chips || [],
+            }));
+            const titleManual = normalizedTitle.length > 0
+              && normalizedTitle !== nextDefaultTitle;
+            updatePrompt(tabId, initial.id, {
+              title: titleManual ? normalizedTitle : nextDefaultTitle,
+              titleManual,
+            });
+          }
+        }
+        if (changed && itemStillExists) {
           markSaved(initial.id);
         }
       } else {
-        const id = addPrompt(tabId, text, undefined, undefined, normalizedTitle);
-        const titleWillGenerate = !normalizedTitle && generateRunAfterTitle(id, text);
+        if (!text && !hasExistingChips) {
+          if (opts?.close !== false) resetEditor({ wakeAutoRun: opts?.wakeAutoRun });
+          return false;
+        }
+        const id = addPrompt(tabId, text, undefined, undefined, normalizedTitle, editorChips);
+        const titleWillGenerate = !normalizedTitle && generateRunAfterTitle(
+          id,
+          serializeComposerDraft({ text, chips: editorChips }),
+        );
         if (!titleWillGenerate) markAppearing(id);
         changed = true;
       }
 
-      if (opts?.close !== false) resetEditor();
+      if (opts?.close !== false) resetEditor({ wakeAutoRun: opts?.wakeAutoRun });
       return changed;
     } finally {
+      if (opts?.close === false) {
+        editorDirtyFieldsRef.current = {
+          text: false,
+          chips: false,
+          title: false,
+          post: false,
+        };
+        releaseEditorPayloadLock(opts?.wakeAutoRun !== false);
+      }
       window.setTimeout(() => { committingRef.current = false; }, 0);
     }
-  }, [addPrompt, editorOpen, editorText, editorTitle, generateRunAfterTitle, markAppearing, markSaved, resetEditor, setPostPromptText, tabId, updatePrompt]);
+  }, [addPrompt, editorChips, editorOpen, editorText, editorTitle, generateRunAfterTitle, markAppearing, markSaved, releaseEditorPayloadLock, removePrompt, resetEditor, tabId, updatePrompt, writeThroughEditorPayload]);
 
   const suppressChipReopen = useCallback((id: string) => {
     chipCloseSuppressRef.current = { id, until: performance.now() + 450 };
@@ -633,7 +828,11 @@ export function PromptQueueOverlay({
   const regenerateChipTitle = useCallback((id: string) => {
     const current = usePromptQueueStore.getState().getQueue(tabId).items.find((item) => item.id === id);
     if (!current) return;
-    generateRunAfterTitle(id, current.text, { force: true });
+    generateRunAfterTitle(
+      id,
+      serializeComposerDraft({ text: current.text, chips: current.chips || [] }),
+      { force: true },
+    );
     setChipContextMenu(null);
   }, [generateRunAfterTitle, tabId]);
 
@@ -741,11 +940,19 @@ export function PromptQueueOverlay({
     }
     const anchor = anchorEditor(id);
     if (!anchor) return;
+    editorDirtyFieldsRef.current = {
+      text: false,
+      chips: false,
+      title: false,
+      post: false,
+    };
     if (id) {
       const it = usePromptQueueStore.getState().getQueue(tabId).items.find((i) => i.id === id);
       if (!it) return;
       const title = chipTitle(it);
       setEditorText(it.text);
+      setEditorChips((it.chips || []).map((chip) => ({ ...chip })));
+      setEditorChipPreviewId(null);
       setEditorTitle(title);
       setEditingId(id);
       if (mode === 'pin') setPreviewId(tabId, id);
@@ -753,11 +960,20 @@ export function PromptQueueOverlay({
         id,
         post: false,
         text: it.text,
+        chips: (it.chips || []).map((chip) => ({ ...chip })),
         title,
         titleManual: !!it.titleManual,
       };
+      editorLastWrittenRef.current = {
+        id,
+        post: false,
+        text: it.text,
+        chips: (it.chips || []).map((chip) => ({ ...chip })),
+      };
     } else {
       setEditorText('');
+      setEditorChips([]);
+      setEditorChipPreviewId(null);
       setEditorTitle('');
       setEditingId(null);
       if (mode === 'pin') setPreviewId(tabId, null);
@@ -765,8 +981,15 @@ export function PromptQueueOverlay({
         id: null,
         post: false,
         text: '',
+        chips: [],
         title: '',
         titleManual: false,
+      };
+      editorLastWrittenRef.current = {
+        id: null,
+        post: false,
+        text: '',
+        chips: [],
       };
     }
     setIsPostPromptMode(false);
@@ -788,8 +1011,16 @@ export function PromptQueueOverlay({
     if (editorOpen) commitEditor();
     const anchor = anchorEditor(undefined, 'panel');
     if (!anchor) return;
+    editorDirtyFieldsRef.current = {
+      text: false,
+      chips: false,
+      title: false,
+      post: false,
+    };
     setPreviewId(tabId, null);
     setEditorText(postPromptText);
+    setEditorChips([]);
+    setEditorChipPreviewId(null);
     setEditorTitle('');
     setEditingId(null);
     setIsPostPromptMode(true);
@@ -800,8 +1031,15 @@ export function PromptQueueOverlay({
       id: null,
       post: true,
       text: postPromptText,
+      chips: [],
       title: '',
       titleManual: false,
+    };
+    editorLastWrittenRef.current = {
+      id: null,
+      post: true,
+      text: postPromptText,
+      chips: [],
     };
     setEditorAnchor(anchor);
     setEditorOpen(true);
@@ -989,6 +1227,7 @@ export function PromptQueueOverlay({
         const ui = useUIStore.getState();
         const currentText = ui.historyPromptDrafts[tabId] || '';
         const currentImages = ui.historyPromptDraftImages[tabId] || [];
+        const currentChips = ui.historyPromptDraftChips[tabId] || [];
         const separator = !currentText
           ? ''
           : currentText.endsWith('\n\n')
@@ -996,12 +1235,15 @@ export function PromptQueueOverlay({
             : currentText.endsWith('\n')
               ? '\n'
               : '\n\n';
+        const insertedText = validation.item.text
+          ? separator + validation.item.text
+          : '';
         const insertion = insertPromptImageAttachments({
           text: currentText,
           imagePaths: currentImages,
           start: currentText.length,
           end: currentText.length,
-          insertedText: separator + validation.item.text,
+          insertedText,
           insertedImagePaths: validation.item.imagePaths || [],
         });
         if (insertion.missingSourceIds.length > 0) {
@@ -1013,6 +1255,10 @@ export function PromptQueueOverlay({
         }
         ui.setHistoryPromptDraft(tabId, insertion.text, {
           images: insertion.imagePaths,
+          chips: normalizeComposerChips([
+            ...currentChips,
+            ...(validation.item.chips || []),
+          ]),
         });
         removePrompt(tabId, id);
         focusHistoryComposer('replay-after-history-transfer');
@@ -1087,12 +1333,14 @@ export function PromptQueueOverlay({
     text: string,
     images: number,
     imagePaths?: QueuedImageRef[],
+    chips?: QueuedComposerChip[],
   ) => {
-    const shortGrabTitle = getShortGrabPromptTitle(text);
-    const insertPromptTitle = shortGrabTitle ? null : await findSavedInsertPromptTitle(text);
+    const serializedDraft = serializeComposerDraft({ text, chips: chips || [] });
+    const shortGrabTitle = getShortGrabPromptTitle(serializedDraft);
+    const insertPromptTitle = shortGrabTitle ? null : await findSavedInsertPromptTitle(serializedDraft);
     const initialTitle = shortGrabTitle || insertPromptTitle;
-    const id = addPrompt(tabId, text, images, imagePaths, initialTitle || undefined);
-    const titleWillGenerate = initialTitle ? false : generateRunAfterTitle(id, text);
+    const id = addPrompt(tabId, text, images, imagePaths, initialTitle || undefined, chips);
+    const titleWillGenerate = initialTitle ? false : generateRunAfterTitle(id, serializedDraft);
     if (!titleWillGenerate) markAppearing(id);
   }, [addPrompt, generateRunAfterTitle, markAppearing, tabId]);
 
@@ -1101,12 +1349,16 @@ export function PromptQueueOverlay({
       if (inputSurface === 'history') {
         const ui = useUIStore.getState();
         const raw = ui.historyPromptDrafts[tabId] || '';
-        const text = raw.trim();
-        if (!text) {
+        const chips = normalizeComposerChips(
+          ui.historyPromptDraftChips[tabId] || [],
+        ) as QueuedComposerChip[];
+        const serializedDraft = serializeComposerDraft({ text: raw, chips });
+        if (!serializedDraft.trim()) {
           showToast(agentLabel + ' input is empty', 'warning');
           focusHistoryComposer('grab-empty-history');
           return;
         }
+        const text = raw.trim();
         const historyImages = ui.historyPromptDraftImages[tabId] || [];
         const historyImageIds = collectPromptImageRefIds(raw);
         const historyAttachmentsBlocked = raw.includes('[Image saving…]')
@@ -1131,8 +1383,29 @@ export function PromptQueueOverlay({
           availability: ref.availability,
           error: ref.error,
         }));
-        await enqueueGrabbedPrompt(text, queueImages.length, queueImages);
-        useUIStore.getState().setHistoryPromptDraft(tabId, '', { images: [] });
+        await enqueueGrabbedPrompt(text, queueImages.length, queueImages, chips);
+        const latestUi = useUIStore.getState();
+        const latestRaw = latestUi.historyPromptDrafts[tabId] || '';
+        const latestImages = latestUi.historyPromptDraftImages[tabId] || [];
+        const latestChips = latestUi.historyPromptDraftChips[tabId] || [];
+        const sourceStillCurrent = latestRaw === raw
+          && haveSamePromptImageRefs(latestImages, historyImages)
+          && haveSameComposerChips(latestChips, chips);
+        if (sourceStillCurrent) {
+          latestUi.setHistoryPromptDraft(tabId, '', {
+            images: [],
+            chips: [],
+          });
+        } else {
+          console.log('[PromptQueue] grab snapshot queued; newer History draft preserved tab='
+            + tabId.slice(-8)
+            + ' snapshotChars=' + raw.length
+            + ' latestChars=' + latestRaw.length
+            + ' snapshotChips=' + chips.length
+            + ' latestChips=' + latestChips.length
+            + ' snapshotImages=' + historyImages.length
+            + ' latestImages=' + latestImages.length);
+        }
         focusHistoryComposer('grab-after-history-transfer');
         return;
       }
@@ -1823,7 +2096,14 @@ export function PromptQueueOverlay({
                   }}
                   onClick={(e) => {
                     e.stopPropagation();
-                    const latestItem = usePromptQueueStore.getState().getQueue(tabId).items.find((p) => p.id === it.id) ?? it;
+                    if (editorOpen) commitEditor({ wakeAutoRun: false });
+                    const latestItem = usePromptQueueStore.getState().getQueue(tabId)
+                      .items.find((p) => p.id === it.id);
+                    if (!latestItem) {
+                      console.log('[PromptQueue] replay skipped missing item tab='
+                        + tabId.slice(-8) + ' item=' + it.id.slice(-8));
+                      return;
+                    }
                     const submitNow = e.metaKey;
                     cmdPressedRef.current = submitNow;
                     setCmdPressed(submitNow);
@@ -2222,7 +2502,10 @@ export function PromptQueueOverlay({
                 ref={editorTitleInputRef}
                 autoFocus={editorAutoFocus}
                 value={editorTitle}
-                onChange={(e) => setEditorTitle(e.target.value)}
+                onChange={(e) => {
+                  editorDirtyFieldsRef.current.title = true;
+                  setEditorTitle(e.target.value);
+                }}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
                   if (e.key === 'Escape') resetEditor();
@@ -2241,6 +2524,102 @@ export function PromptQueueOverlay({
                 }}
               />
               <div style={{ height: 1, flexShrink: 0, background: BORDER }} />
+              {editorChips.length > 0 && (
+                <div
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 4,
+                    padding: 6,
+                    background: '#0e0e0e',
+                    borderBottom: `1px solid ${BORDER}`,
+                    flexShrink: 0,
+                  }}
+                >
+                  {editorChips.map((chip) => {
+                    const preview = chip.text.slice(0, 70).replace(/\s+/g, ' ')
+                      + (chip.text.length > 70 ? '…' : '');
+                    return (
+                      <ComposerChip
+                        key={chip.id}
+                        kind={chip.kind}
+                        label={chip.kind === 'prompt' ? (chip.label || 'PROMPT') : 'PASTE'}
+                        preview={preview}
+                        meta={chip.text.length.toLocaleString()}
+                        onClick={() => setEditorChipPreviewId((current) => (
+                          current === chip.id ? null : chip.id
+                        ))}
+                        trailing={(
+                          <>
+                            <button
+                              type="button"
+                              className="hp-composer-chip-action"
+                              aria-label="Вернуть чип в текст"
+                              title="Вернуть в текст"
+                              onMouseDown={(event) => event.preventDefault()}
+                              onClick={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                const textarea = editorTextareaRef.current;
+                                const restored = restoreComposerChipToText({
+                                  text: editorText,
+                                  chipText: chip.text,
+                                  selectionStart: textarea?.selectionStart ?? editorText.length,
+                                  selectionEnd: textarea?.selectionEnd ?? editorText.length,
+                                });
+                                const nextChips = editorChips.filter((item) => item.id !== chip.id);
+                                editorDirtyFieldsRef.current.text = true;
+                                editorDirtyFieldsRef.current.chips = true;
+                                setEditorText(restored.text);
+                                setEditorChips(nextChips);
+                                writeThroughEditorPayload(restored.text, nextChips);
+                                setEditorChipPreviewId((current) => current === chip.id ? null : current);
+                                requestAnimationFrame(() => {
+                                  editorTextareaRef.current?.focus();
+                                  editorTextareaRef.current?.setSelectionRange(restored.caret, restored.caret);
+                                });
+                              }}
+                            >
+                              <ArrowDown size={11} />
+                            </button>
+                            <button
+                              type="button"
+                              className="hp-composer-chip-action hp-composer-chip-action-danger"
+                              aria-label="Удалить чип"
+                              title="Удалить"
+                              onMouseDown={(event) => event.preventDefault()}
+                              onClick={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                const nextChips = editorChips.filter((item) => item.id !== chip.id);
+                                editorDirtyFieldsRef.current.chips = true;
+                                setEditorChips(nextChips);
+                                writeThroughEditorPayload(editorText, nextChips);
+                                setEditorChipPreviewId((current) => current === chip.id ? null : current);
+                              }}
+                            >
+                              <X size={11} />
+                            </button>
+                          </>
+                        )}
+                      />
+                    );
+                  })}
+                  {editorChipPreviewId && (() => {
+                    const chip = editorChips.find((item) => item.id === editorChipPreviewId);
+                    if (!chip) return null;
+                    return (
+                      <div className="hp-composer-chip-preview">
+                        <div className="hp-composer-chip-preview-head">
+                          <span>{chip.kind === 'prompt' ? (chip.label || 'Prompt') : 'Pasted content'}</span>
+                          <span>{chip.text.length.toLocaleString()} symbols</span>
+                        </div>
+                        <pre>{chip.text}</pre>
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
             </>
           )}
           <div
@@ -2283,7 +2662,13 @@ export function PromptQueueOverlay({
               className="pq-image-marker-textarea"
               autoFocus={editorAutoFocus && isPostPromptMode}
               value={editorText}
-              onChange={(e) => setEditorText(e.target.value)}
+              onChange={(e) => {
+                const nextText = e.target.value;
+                if (isPostPromptMode) editorDirtyFieldsRef.current.post = true;
+                else editorDirtyFieldsRef.current.text = true;
+                setEditorText(nextText);
+                writeThroughEditorPayload(nextText, editorChips);
+              }}
               onScroll={(e) => {
                 const highlight = editorHighlightRef.current;
                 if (!highlight) return;

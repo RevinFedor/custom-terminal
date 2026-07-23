@@ -1,0 +1,24 @@
+{
+  "name": "@noted/claude-blocks",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Portable Claude-conversation rendering blocks (tool cards, bash, diff, thinking, code, markdown) + design-token theme. Consumed via Vite source-alias, no build step.",
+  "main": "src/index.ts",
+  "module": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./theme.css": "./src/theme.css",
+    "./blocks.css": "./src/blocks.css",
+    "./styles.css": "./src/styles.css"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "react-dom": ">=18",
+    "react-markdown": ">=9",
+    "remark-gfm": ">=4",
+    "react-syntax-highlighter": ">=15",
+    "unist-util-visit": ">=5"
+  }
+}

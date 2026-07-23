@@ -1,0 +1,7 @@
+/* @noted/claude-blocks — единый импорт стилей.
+   Тянет гамму (theme.css) + правила блоков (blocks.css).
+   Импортируй ЭТОТ файл в потребителе одной строкой:
+     import '@noted/claude-blocks/styles.css';
+   Чтобы перекрасить — переопредели токены --cb-* в своём :root ПОСЛЕ. */
+@import "./theme.css";
+@import "./blocks.css";

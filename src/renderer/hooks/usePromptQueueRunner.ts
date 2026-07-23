@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { buildQueuedPromptPayload, consumeAutomaticRunAfterTargetClear, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, hasRuntimeWorkflowArm, isPromptQueueStoreHydrated, isQueuedPromptEnabled, queueSendTransferredOwnership, subscribePromptQueueHydration, usePromptQueueStore, type QueuedPrompt, type TabQueue } from '../store/usePromptQueueStore';
+import { buildQueuedPromptPayload, consumeAutomaticRunAfterTargetClear, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, hasRuntimeWorkflowArm, isPromptQueueEditorLocked, isPromptQueueStoreHydrated, isQueuedPromptEnabled, queueSendTransferredOwnership, subscribePromptQueueEditorLocks, subscribePromptQueueHydration, usePromptQueueStore, type QueuedPrompt, type TabQueue } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { terminalRegistry } from '../utils/terminalRegistry';
@@ -189,6 +189,10 @@ function withPostPrompt(tabId: string, body: string): string {
 // truth or edges get double-counted / missed.
 const prevBusyRef = new Map<string, boolean>();
 const queueSendInflight = new Set<string>();
+// An unlock is only a retry signal when a concrete send attempt actually hit
+// the editor lock. Merely opening/editing a queue item must not synthesize a
+// cold-start edge or bypass first-delay / pivot readiness.
+const queueEditorBlockedOwners = new Set<string>();
 // After send-command resolves successfully there is a short event gap before
 // the agent emits busy:true. Keep pivoted owners blocked through that gap.
 const queueAwaitingBusyStart = new Set<string>();
@@ -274,6 +278,10 @@ function deferredOwnerAttemptIsCurrent(
   if (deferredOwnerSends.get(ownerTabId) !== attempt) return false;
   const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
   const head = queue.items.find(isQueuedPromptEnabled);
+  if (isPromptQueueEditorLocked(ownerTabId)) {
+    queueEditorBlockedOwners.add(ownerTabId);
+    return false;
+  }
   return queue.autoRun
     && head?.id === attempt.headId
     && queue.workflowArmedAt === attempt.workflowArmedAt
@@ -300,6 +308,10 @@ function retryDeferredOwnerSend(ownerTabId: string, source: string): boolean {
   }
   const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
   const head = queue.items.find(isQueuedPromptEnabled);
+  if (isPromptQueueEditorLocked(ownerTabId)) {
+    queueEditorBlockedOwners.add(ownerTabId);
+    return false;
+  }
   const effectiveTrigger = getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true });
   if (!queue.autoRun
     || !head
@@ -344,6 +356,12 @@ function beginValidatedQueueSend(
   label: 'turn-end' | 'cold-start',
 ): boolean {
   if (queueSendInflight.has(ownerTabId)) return false;
+  if (isPromptQueueEditorLocked(ownerTabId)) {
+    queueEditorBlockedOwners.add(ownerTabId);
+    console.log('[PromptQueueRunner] owner=' + ownerTabId.slice(-8)
+      + ' editor payload locked → wait before firing');
+    return false;
+  }
   const queueAtStart = usePromptQueueStore.getState().getQueue(ownerTabId);
   const headAtStart = queueAtStart.items.find(isQueuedPromptEnabled);
   if (!queueAtStart.autoRun
@@ -681,6 +699,20 @@ export function usePromptQueueRunner() {
       if (prevBusyRef.get(effectiveTrigger) === true) return null;
       return effectiveTrigger;
     };
+
+    const unsubscribeEditorLocks = subscribePromptQueueEditorLocks((ownerTabId, lock, options) => {
+      if (lock) return;
+      if (options.wakeAutoRun === false) {
+        queueEditorBlockedOwners.delete(ownerTabId);
+        return;
+      }
+      if (!queueEditorBlockedOwners.delete(ownerTabId)) return;
+      const triggerTabId = getReadyTriggerForOwner(ownerTabId);
+      if (!triggerTabId) return;
+      console.log('[PromptQueueRunner] editor payload unlocked owner='
+        + ownerTabId.slice(-8) + ' → retry');
+      fireHead(ownerTabId, triggerTabId);
+    });
 
     // Walk all queues, find one(s) waiting on `triggerTabId` for turn-end edge.
     // For default (runAfterTabId === null) the owner IS the trigger. For
@@ -1497,6 +1529,7 @@ export function usePromptQueueRunner() {
       unsubscribeQueue();
       unsubscribeReconciliation();
       unsubscribeOwnerReadiness();
+      unsubscribeEditorLocks();
       for (const t of pendingTimers.values()) clearTimeout(t);
       pendingTimers.clear();
       firstDelayReadinessPending.clear();

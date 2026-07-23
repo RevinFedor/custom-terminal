@@ -1,0 +1,131 @@
+/* ============================================================
+   @noted/claude-blocks — THEME (цветовая гамма + типографика)
+   ------------------------------------------------------------
+   Единственный источник всех цветов/шрифтов для блоков рендера
+   Claude-диалога. Все токены префиксованы `--cb-*`, поэтому НЕ
+   конфликтуют с переменными проекта-потребителя.
+
+   Перенос в другой проект:
+     1. импортировать этот файл (или styles.css, который тянет оба);
+     2. чтобы перекрасить под свой бренд — переопределить нужные
+        токены в своём `:root` ПОСЛЕ импорта (later wins). Компоненты
+        и blocks.css трогать не надо.
+
+   Канон визуала — десктопный SDK-таб (ClaudeSDKTab.tsx). Мобильный
+   клиент наследует ровно эти значения (см. methodology «Зеркальный
+   клиент наследует раскладку источника»).
+   ============================================================ */
+
+:root {
+  /* ---- Брендовый акцент (Claude-оранж) -------------------- */
+  --cb-accent: #DA7756;          /* running-спиннер, бабл юзера, /compact, лоадер */
+  --cb-accent-soft: #FFB382;     /* каретка композера, queued-бейдж */
+
+  /* ---- Семантика статусов tool-call ---------------------- */
+  --cb-running: var(--cb-accent);
+  --cb-done: #4ade80;            /* ✓ done, дифф-плюс */
+  --cb-error: #ef4444;           /* ✗ error, дифф-минус */
+  --cb-waiting: #f5a623;         /* ⚠ awaiting approval (gated tool call) */
+
+  /* ---- Размышление / служебные хью ----------------------- */
+  --cb-think: #a78bfa;           /* иконка мозга */
+  --cb-think-text: #d4d4d4;      /* тело thinking-блока */
+  --cb-slash: #a5b4fc;           /* слэш-команды */
+  --cb-inline-code: #b1b9f9;     /* inline `code` в markdown */
+
+  /* ---- Текст --------------------------------------------- */
+  --cb-text: #e0e0e0;            /* контент tool-call / команды */
+  --cb-prose: #e8e8e8;           /* тело markdown-ответа */
+  --cb-label: #bdbdbd;           /* UPPERCASE-лейбл tool-call */
+  --cb-muted: #888888;           /* описания, метрики */
+  --cb-dim: #666666;             /* язык code-блока, «N lines» */
+  --cb-line-no: #555555;         /* номера строк в диффе */
+  --cb-marker: #666666;          /* маркеры списков markdown */
+
+  /* ---- Дифф редактирования файла ------------------------- */
+  --cb-diff-add: #4ade80;        /* «+» маркер и счётчик */
+  --cb-diff-del: #ef4444;        /* «−» маркер и счётчик */
+  --cb-diff-add-bg: rgba(74, 222, 128, 0.12);
+  --cb-diff-del-bg: rgba(239, 68, 68, 0.14);
+  --cb-diff-del-text: #fafafa;   /* текст удалённой строки (Prism off) */
+
+  /* ---- Поверхности и границы ----------------------------- */
+  --cb-tool-bg: rgba(255, 255, 255, 0.025);   /* лёгкая подложка (редко) */
+  --cb-tool-border: rgba(255, 255, 255, 0.08);/* хайрлайн-разделитель в выводе */
+  --cb-rail: rgba(255, 255, 255, 0.10);       /* вертикальная линия раскрытого тела */
+  --cb-hover: rgba(255, 255, 255, 0.03);      /* hover-tint кликабельной строки */
+  --cb-code-bg: #0d0d0d;                       /* фон markdown code-блока */
+  --cb-code-head-bg: rgba(255, 255, 255, 0.025);
+  --cb-code-border: rgba(255, 255, 255, 0.06);
+  --cb-code-head-border: rgba(255, 255, 255, 0.05);
+  --cb-track: #1a1a1a;                         /* трек лоадер-бара */
+
+  /* ---- Транскрипт чата (расположение сообщений) ---------- */
+  --cb-msg-text: #e0e0e0;                       /* тело user-сообщения */
+  --cb-assistant-text: #cccccc;                 /* тело assistant-ответа (мобила) */
+  --cb-user-bubble-bg: rgba(218, 119, 86, 0.12);/* бабл юзера (Claude-оранж) */
+  --cb-user-bubble-border: rgba(218, 119, 86, 0.20);
+  --cb-slash-bg: rgba(129, 140, 248, 0.10);     /* слэш-чип фон */
+  --cb-slash-border: rgba(129, 140, 248, 0.28);
+  --cb-queued: var(--cb-accent-soft);           /* queued-бейдж */
+  --cb-queued-bg: rgba(255, 178, 130, 0.10);
+  --cb-queued-border: rgba(255, 178, 130, 0.25);
+  --cb-stopped: #d97706;                         /* stopped-бейдж (янтарь) */
+  --cb-stopped-bg: rgba(217, 119, 6, 0.12);
+  --cb-stopped-border: rgba(217, 119, 6, 0.30);
+  --cb-compact-bg: rgba(218, 119, 86, 0.06);     /* compact-карточка */
+  --cb-compact-border: rgba(218, 119, 86, 0.30);
+  --cb-compact-metrics: #a87356;
+  --cb-paste-chip-bg: rgba(107, 138, 255, 0.15); /* pasted_content чип */
+  --cb-paste-chip-text: #8ba4ff;
+  --cb-paste-chip-border: rgba(107, 138, 255, 0.25);
+  --cb-paste-chip-body-bg: #1a1a1a;
+  --cb-paste-chip-body-border: #333333;
+  --cb-action-bg: #1a1a1a;                       /* панель действий сообщения */
+  --cb-action-border: #333333;
+  --cb-action-hover: rgba(255, 255, 255, 0.10);
+  --cb-copy-idle: #555555;
+  --cb-copy-done: #4ade80;
+  --cb-error-bg: #2a1316;                        /* error-сообщение */
+  --cb-error-text: #f38ba8;
+  --cb-system-text: #555555;
+
+  /* ---- Presentation shells: events + composer ------------ */
+  --cb-message-info: #60a5fa;
+  --cb-message-success: #4ade80;
+  --cb-message-warning: #fbbf24;
+  --cb-message-danger: #f87171;
+  --cb-message-neutral-bg: rgba(255, 255, 255, 0.04);
+  --cb-message-neutral-border: rgba(255, 255, 255, 0.12);
+  --cb-composer-bg: #0f0f0f;
+  --cb-composer-border: #333333;
+  --cb-composer-topbar-border: rgba(255, 255, 255, 0.08);
+  --cb-composer-chip-prompt: #c4b5fd;
+  --cb-composer-chip-prompt-bg: rgba(139, 92, 246, 0.13);
+  --cb-composer-chip-prompt-border: rgba(139, 92, 246, 0.30);
+  --cb-composer-chip-paste: #8ba4ff;
+  --cb-composer-chip-paste-bg: rgba(107, 138, 255, 0.15);
+  --cb-composer-chip-paste-border: rgba(107, 138, 255, 0.25);
+  --cb-composer-chip-image: #67e8f9;
+  --cb-composer-chip-image-bg: rgba(34, 211, 238, 0.11);
+  --cb-composer-chip-image-border: rgba(34, 211, 238, 0.26);
+  --cb-composer-chip-queued: var(--cb-accent-soft);
+  --cb-composer-chip-queued-bg: rgba(255, 178, 130, 0.12);
+  --cb-composer-chip-queued-border: rgba(255, 178, 130, 0.30);
+  --cb-composer-chip-stash: #aaaaaa;
+  --cb-composer-chip-stash-bg: rgba(255, 255, 255, 0.05);
+  --cb-composer-chip-stash-border: rgba(255, 255, 255, 0.10);
+
+  /* ---- Типографика --------------------------------------- */
+  --cb-font-mono: "JetBrainsMono Nerd Font", "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  /* Базовый кегль тела сообщения. user-бабл и assistant-ответ берут его, а
+     tool/дифф/код заданы в `em` → масштабируются ОТ него. Потребитель меняет
+     одну эту переменную (напр. на контейнере чата) → пропорционально едет ВЕСЬ
+     транскрипт. Дефолт = прежний хардкод 14px (обратная совместимость). */
+  --cb-fs-base: 14px;
+  --cb-fs-label: 0.85em;     /* лейбл / описание tool-call */
+  --cb-fs-content: 0.92em;   /* команда / путь / дифф / вывод */
+  --cb-fs-small: 0.77em;     /* язык code-блока, «N lines» */
+  --cb-lh-prose: 1.5;
+  --cb-lh-diff: 1.55;
+}

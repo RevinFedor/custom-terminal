@@ -48,6 +48,8 @@ prebuilds/
 !/packages/structured-dnd/**
 !/packages/file-explorer/
 !/packages/file-explorer/**
+!/packages/claude-blocks/
+!/packages/claude-blocks/**
 
 # Private infra (VPS IP, root SSH, tunnel topology)
 docs/knowledge/fact-remote-access.md

@@ -3,6 +3,7 @@ import { startTransition } from 'react';
 import { log } from '../utils/logger';
 import { setPrefetched } from '../utils/sdkHistoryPrefetch';
 import { usePromptQueueStore } from './usePromptQueueStore';
+import type { HistoryPromptDraftChip } from './useUIStore';
 import { getInboxProjectPath, isInboxProjectId } from '../constants/systemProjects';
 import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
 import {
@@ -692,7 +693,19 @@ interface Tab {
    * Each entry: text user pushed + push timestamp + lifecycle state.
    * NOT persisted to SQLite — lives only during a session.
    */
-  sdkMidstreamPending?: Array<{ text: string; ts: number; state: 'queued' | 'sent' }>;
+  sdkMidstreamPending?: Array<{
+    text: string;
+    ts: number;
+    state: 'queued' | 'sent';
+    rawText?: string;
+    chips?: HistoryPromptDraftChip[];
+  }>;
+  /**
+   * Authoring-only prompt/paste chips for the SDK composer. This stays outside
+   * assistant-ui's transport text so temporary footer replacements and project
+   * switches cannot flatten or discard the draft.
+   */
+  sdkComposerChips?: HistoryPromptDraftChip[];
   /**
    * Per-tab provider/model selection for the Claude proxy. Persisted via SQLite
    * (tabs.provider_state JSON). Authoritative writer is main process — it owns
@@ -1271,7 +1284,7 @@ interface WorkspaceStore {
   // Claude SDK tabs
   createSDKTab: (projectId: string, name?: string, options?: { afterTabId?: string; groupId?: string; visualParentTabId?: string; background?: boolean }) => Promise<string>;
   convertToSDKTab: (tabId: string) => void;
-  updateSDKState: (tabId: string, state: Partial<Pick<Tab, 'sdkState' | 'sdkMessages' | 'claudeSessionId' | 'sdkModel' | 'sdkEffort' | 'sdkThinking' | 'sdkMidstreamPending'>>) => void;
+  updateSDKState: (tabId: string, state: Partial<Pick<Tab, 'sdkState' | 'sdkMessages' | 'claudeSessionId' | 'sdkModel' | 'sdkEffort' | 'sdkThinking' | 'sdkMidstreamPending' | 'sdkComposerChips'>>) => void;
   // Merge a partial BgTask patch by taskId. Creates the entry if missing.
   // status terminal transition ('completed'|'failed'|'stopped') also sets endedAt.
   upsertBgTask: (tabId: string, taskId: string, patch: Partial<BgTask>) => void;

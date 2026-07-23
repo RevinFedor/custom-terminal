@@ -5,6 +5,7 @@ import { useUIStore } from '../../store/useUIStore';
 import {
   appendHistoryDraftInsertion,
   buildProjectScriptRows,
+  clampFloatingPanelTop,
   isCurrentPickerGeneration,
   joinPromptInsertionText,
   resolveHistoryScriptCwd,
@@ -66,6 +67,13 @@ function findVisibleHistoryComposer(tabId: string): HTMLElement | null {
   )) as HTMLElement | undefined || null;
 }
 
+function findVisibleHistoryComposerFrame(tabId: string): HTMLElement | null {
+  const composer = findVisibleHistoryComposer(tabId);
+  if (!composer) return null;
+  const frame = composer.closest('.hp-history-composer-frame');
+  return isVisibleElement(frame) ? frame : composer;
+}
+
 async function readPromptFileContents(filePaths: string[] | undefined): Promise<string[]> {
   if (!filePaths || filePaths.length === 0) return [];
   try {
@@ -79,21 +87,42 @@ async function readPromptFileContents(filePaths: string[] | undefined): Promise<
   return [];
 }
 
-function dispatchHistoryComposerInsert(tabId: string, text: string, source: string) {
+function dispatchHistoryComposerInsert(
+  tabId: string,
+  text: string,
+  source: string,
+  chip?: { label?: string; sourceKey?: string },
+) {
   if (!text) return;
   const event = new CustomEvent('history-panel:composer-insert', {
-    detail: { tabId, text, source },
+    detail: {
+      tabId,
+      text,
+      source,
+      ...(chip ? { kind: 'prompt', label: chip.label, sourceKey: chip.sourceKey } : {}),
+    },
     cancelable: true,
   });
   const handledByMountedComposer = !window.dispatchEvent(event);
   if (handledByMountedComposer) return;
 
   const store = useUIStore.getState();
+  if (chip) {
+    store.addHistoryPromptDraftChip(tabId, {
+      id: 'prompt-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+      kind: 'prompt',
+      text,
+      label: chip.label || 'Prompt',
+      sourceKey: chip.sourceKey,
+      createdAt: Date.now(),
+    });
+    return;
+  }
   const current = store.historyPromptDrafts[tabId] || '';
   store.setHistoryPromptDraft(
     tabId,
     appendHistoryDraftInsertion(current, text),
-    { preserveImages: true },
+    { preserveImages: true, preserveChips: true },
   );
 }
 
@@ -106,18 +135,29 @@ async function deliverPrompt(prompt: PromptRow, target: InsertTarget) {
 
   if (target.surface === 'history') {
     const fileContents = await readPromptFileContents(prompt.file_paths);
+    const sourceKey = 'prompt:' + String(prompt.id ?? prompt.title);
     dispatchHistoryComposerInsert(
       target.tabId,
       joinPromptInsertionText(text, fileContents),
       'prompt-picker',
+      { label: prompt.title, sourceKey },
     );
     return;
   }
 
   if (target.surface === 'sdk') {
-    if (text) {
+    const fileContents = await readPromptFileContents(prompt.file_paths);
+    const chipText = joinPromptInsertionText(text, fileContents);
+    if (chipText) {
       window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', {
-        detail: { tabId: target.tabId, text },
+        detail: {
+          tabId: target.tabId,
+          text: chipText,
+          source: 'prompt-picker',
+          kind: 'prompt',
+          label: prompt.title,
+          sourceKey: 'prompt:' + String(prompt.id ?? prompt.title),
+        },
       }));
     }
     return;
@@ -229,8 +269,12 @@ const PromptPickerOverlay: React.FC = () => {
 
   const rootRef = useRef<HTMLDivElement | null>(null);
   const rootPanelRef = useRef<HTMLDivElement | null>(null);
+  const rootPromptRowRef = useRef<HTMLDivElement | null>(null);
+  const rootScriptsRowRef = useRef<HTMLDivElement | null>(null);
   const leftPanelRef = useRef<HTMLDivElement | null>(null);
+  const selectedLeftRowRef = useRef<HTMLDivElement | null>(null);
   const rightPanelRef = useRef<HTMLDivElement | null>(null);
+  const contextGeometryRafRef = useRef<number | null>(null);
   const requestSeqRef = useRef(0);
   const activePickerGenerationRef = useRef(0);
 
@@ -251,6 +295,7 @@ const PromptPickerOverlay: React.FC = () => {
   const [selectedPromptIdx, setSelectedPromptIdx] = useState(0);
   const [selectedRoot, setSelectedRoot] = useState<'prompts' | 'scripts'>('prompts');
   const [selectedScriptIdx, setSelectedScriptIdx] = useState(0);
+  const [contextGeometryRevision, setContextGeometryRevision] = useState(0);
 
   // History owns the right-click coordinates and target. Capturing both here
   // prevents a native/user delay from redirecting insertion after a tab switch.
@@ -299,6 +344,8 @@ const PromptPickerOverlay: React.FC = () => {
   }, [contextRequest, shortcutOpen]);
 
   // Anchor strategies:
+  //   history-composer — History is the active surface; pin the picker bottom
+  //                edge above the composer's top border
   //   sdk-caret  — SDK composer is the active tab; pin to caret pixel position
   //                inside the textarea (mirror-div measurement). User asked for
   //                placement right of the blinking text caret.
@@ -307,6 +354,7 @@ const PromptPickerOverlay: React.FC = () => {
   //                user-controlled offset (Settings → "Picker — отступ снизу").
   type Anchor =
     | { mode: 'sdk-caret'; x: number; y: number; lineH: number }
+    | { mode: 'history-composer'; x: number; y: number }
     | { mode: 'bottom-center' }
     | { mode: 'point'; x: number; y: number };
   const [anchor, setAnchor] = useState<Anchor>({ mode: 'bottom-center' });
@@ -440,16 +488,25 @@ const PromptPickerOverlay: React.FC = () => {
 
   // Decide anchor each time picker opens:
   //   1) History context request → exact pointer coordinates.
-  //   2) SDK tab + textarea DOM reachable + caret measurable → caret-anchor.
-  //   3) Anything else → fixed bottom-center with user-configured offset.
+  //   2) History tab + visible composer → grow upward from its top edge.
+  //   3) SDK tab + textarea DOM reachable + caret measurable → caret-anchor.
+  //   4) Anything else → fixed bottom-center with user-configured offset.
   // Decision is made ONCE on open so arrow-nav doesn't drift the picker.
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) return;
     if (contextRequest) {
       setAnchor({ mode: 'point', x: contextRequest.x, y: contextRequest.y });
       return;
     }
     const target = shortcutTarget || resolveTarget();
+    if (target?.surface === 'history') {
+      const frame = findVisibleHistoryComposerFrame(target.tabId);
+      if (frame) {
+        const rect = frame.getBoundingClientRect();
+        setAnchor({ mode: 'history-composer', x: rect.left, y: rect.top });
+        return;
+      }
+    }
     if (target?.surface === 'sdk') {
       const ta = findSDKTextarea();
       if (ta) {
@@ -731,15 +788,39 @@ const PromptPickerOverlay: React.FC = () => {
   //                 of the left panel instead of downward. Triggered when the
   //                 right panel would clip the viewport bottom — left column
   //                 stays put, only the secondary panel reorients.
-  const [pos, setPos] = useState<{ left: number; top: number; rightFlipUp: boolean } | null>(null);
+  const [pos, setPos] = useState<{
+    left: number;
+    top: number;
+    rightFlipUp: boolean;
+    contextChildTop: number;
+    contextRightTop: number;
+    contextChildLeft: number;
+    contextRightLeft: number;
+    contextRootWidth: number;
+    contextLeftWidth: number;
+    contextRightWidth: number;
+  } | null>(null);
   const estW = contextMode
-    ? ROOT_W + (
-      pickerLevel === 'root'
-        ? 0
-        : GAP + LEFT_W + (selectedRoot === 'prompts' ? GAP + RIGHT_W : 0)
-    ) + PANEL_PAD * 3
+    ? ROOT_W + PANEL_PAD * 2 + 2
     : LEFT_W + GAP + RIGHT_W + PANEL_PAD * 2;
-  const estH = MAX_H;
+  const estH = contextMode
+    ? Math.ceil(fontSize * 1.3 + ROW_PAD_Y * 2) * 2 + PANEL_PAD * 2 + 2
+    : MAX_H;
+
+  const queueContextGeometryRefresh = useCallback(() => {
+    if (!contextMode || contextGeometryRafRef.current !== null) return;
+    contextGeometryRafRef.current = requestAnimationFrame(() => {
+      contextGeometryRafRef.current = null;
+      setContextGeometryRevision((value) => value + 1);
+    });
+  }, [contextMode]);
+
+  useEffect(() => () => {
+    if (contextGeometryRafRef.current !== null) {
+      cancelAnimationFrame(contextGeometryRafRef.current);
+      contextGeometryRafRef.current = null;
+    }
+  }, []);
 
   useLayoutEffect(() => {
     if (!open) { setPos(null); return; }
@@ -749,22 +830,34 @@ const PromptPickerOverlay: React.FC = () => {
     const vw = window.innerWidth;
     const vh = window.innerHeight;
 
-    // Picker root size — for the sdk-caret anchor we want the picker's full
-    // bounding box. For bottom-center the same measurement decides whether
-    // we can fit the offset (we'll clamp into viewport regardless).
-    const measuredW = rootRef.current?.offsetWidth ?? estW;
-    const measuredH = rootRef.current?.offsetHeight ?? estH;
+    // In History context mode the root is the two-row menu at the pointer.
+    // Descendants are independent floating surfaces and must never contribute
+    // to this measurement, otherwise opening a tall submenu teleports the root.
+    const measuredW = contextMode
+      ? (rootPanelRef.current?.offsetWidth ?? estW)
+      : (rootRef.current?.offsetWidth ?? estW);
+    const measuredH = contextMode
+      ? (rootPanelRef.current?.offsetHeight ?? estH)
+      : (rootRef.current?.offsetHeight ?? estH);
 
     // Right panel height is needed for the secondary flip independent of the
     // overall picker height — left panel determines the picker root height
     // when right is absolute-positioned, so we read right's own height here.
     const rightH = rightPanelRef.current?.offsetHeight ?? 0;
     const leftH = leftPanelRef.current?.offsetHeight ?? measuredH;
+    const leftW = leftPanelRef.current?.offsetWidth ?? (LEFT_W + PANEL_PAD * 2 + 2);
+    const rightW = rightPanelRef.current?.offsetWidth ?? (RIGHT_W + PANEL_PAD * 2 + 2);
 
     let left: number;
     let top: number;
 
-    if (anchor.mode === 'sdk-caret') {
+    if (anchor.mode === 'history-composer') {
+      // History is a bottom composer, so the picker grows upward from the
+      // frame's top border. The measured panel height may change once prompt
+      // data arrives, but the edge next to the composer stays fixed.
+      left = anchor.x;
+      top = anchor.y - measuredH - GAP;
+    } else if (anchor.mode === 'sdk-caret') {
       // Always anchor BELOW + right of the caret. If there's not enough space
       // below — let the bottom viewport clamp (further down) push the whole
       // picker up. We deliberately do NOT mirror to above the caret line:
@@ -807,6 +900,7 @@ const PromptPickerOverlay: React.FC = () => {
     // with the BOTTOM of the left panel, expanding above it).
     let rightFlipUp = false;
     if (
+      !contextMode &&
       rightH > 0
       && selectedRoot === 'prompts'
       && selectedLeftItem?.kind === 'group'
@@ -819,10 +913,70 @@ const PromptPickerOverlay: React.FC = () => {
       if (rightH > leftH && top + rightH + margin > vh) rightFlipUp = true;
     }
 
-    setPos({ left, top, rightFlipUp });
+    let contextChildTop = 0;
+    let contextRightTop = 0;
+    let contextChildLeft = 0;
+    let contextRightLeft = 0;
+    if (contextMode && pickerLevel !== 'root') {
+      const rootRow = selectedRoot === 'scripts'
+        ? rootScriptsRowRef.current
+        : rootPromptRowRef.current;
+      const childAnchorTop = top + (rootRow?.offsetTop ?? PANEL_PAD);
+      const childViewportTop = clampFloatingPanelTop(childAnchorTop, leftH, vh, margin);
+      contextChildTop = childViewportTop - top;
+
+      const selectedRowTop = childViewportTop
+        + (selectedLeftRowRef.current?.offsetTop ?? PANEL_PAD)
+        - (leftPanelRef.current?.scrollTop ?? 0);
+      const rightViewportTop = clampFloatingPanelTop(selectedRowTop, rightH, vh, margin);
+      contextRightTop = rightViewportTop - top;
+
+      const descendantWidth = leftW + (
+        selectedRoot === 'prompts' && selectedLeftItem?.kind === 'group' && rightH > 0
+          ? GAP + rightW
+          : 0
+      );
+      const rightEdge = left + measuredW + GAP + descendantWidth;
+      const leftEdge = left - GAP - descendantWidth;
+      const spaceRight = vw - (left + measuredW) - margin;
+      const spaceLeft = left - margin;
+      const contextOpenLeft = rightEdge > vw - margin
+        && (leftEdge >= margin || spaceLeft > spaceRight);
+      const unclampedChildLeft = contextOpenLeft
+        ? left - GAP - leftW
+        : left + measuredW + GAP;
+      const childViewportLeft = Math.min(
+        Math.max(unclampedChildLeft, margin),
+        Math.max(margin, vw - margin - leftW),
+      );
+      contextChildLeft = childViewportLeft - left;
+
+      const unclampedRightLeft = contextOpenLeft
+        ? childViewportLeft - GAP - rightW
+        : childViewportLeft + leftW + GAP;
+      const rightViewportLeft = Math.min(
+        Math.max(unclampedRightLeft, margin),
+        Math.max(margin, vw - margin - rightW),
+      );
+      contextRightLeft = rightViewportLeft - left;
+    }
+
+    setPos({
+      left,
+      top,
+      rightFlipUp,
+      contextChildTop,
+      contextRightTop,
+      contextChildLeft,
+      contextRightLeft,
+      contextRootWidth: measuredW,
+      contextLeftWidth: leftW,
+      contextRightWidth: rightW,
+    });
   }, [
     anchor,
     bottomOffsetPx,
+    contextGeometryRevision,
     estH,
     estW,
     flatLeft.length,
@@ -844,19 +998,19 @@ const PromptPickerOverlay: React.FC = () => {
     left: pos ? pos.left : -9999,
     top: pos ? pos.top : -9999,
     zIndex: 99000,
-    display: 'flex',
+    display: contextMode ? 'block' : 'flex',
     gap: GAP,
     alignItems: 'flex-start', // left panel grows from top; right is absolute
     pointerEvents: 'auto',
     fontSize,
     opacity: pos ? 1 : 0,
     transform: pos ? 'translateY(0) scale(1)' : 'translateY(3px) scale(0.985)',
-    transformOrigin: 'top left',
+    transformOrigin: anchor.mode === 'history-composer' ? 'bottom left' : 'top left',
     transition: 'opacity 90ms ease-out, transform 90ms ease-out',
   };
 
   const panelStyle: React.CSSProperties = {
-    maxHeight: MAX_H,
+    maxHeight: `min(${MAX_H}px, calc(100vh - 16px))`,
     overflowY: 'auto',
     background: '#1f1f1f',
     border: '1px solid #333',
@@ -903,6 +1057,20 @@ const PromptPickerOverlay: React.FC = () => {
   const rightPanelPositionStyle: React.CSSProperties = pos?.rightFlipUp
     ? { position: 'absolute', left: 0, right: 0, bottom: 0 }
     : { position: 'absolute', left: 0, right: 0, top: 0 };
+  const contextFirstPanelPositionStyle: React.CSSProperties = contextMode
+    ? {
+        position: 'absolute',
+        left: pos?.contextChildLeft || 0,
+        top: pos?.contextChildTop || 0,
+      }
+    : {};
+  const contextRightPanelPositionStyle: React.CSSProperties = contextMode
+    ? {
+        position: 'absolute',
+        left: pos?.contextRightLeft || 0,
+        top: pos?.contextRightTop || 0,
+      }
+    : {};
 
   const promptLibraryVisible = !contextMode
     || (selectedRoot === 'prompts' && pickerLevel !== 'root');
@@ -921,6 +1089,7 @@ const PromptPickerOverlay: React.FC = () => {
       {contextMode && (
         <div ref={rootPanelRef} style={{ ...panelStyle, width: ROOT_W }}>
           <div
+            ref={rootPromptRowRef}
             onMouseEnter={() => {
               setSelectedRoot('prompts');
               setPickerLevel('group');
@@ -941,6 +1110,7 @@ const PromptPickerOverlay: React.FC = () => {
             <span style={{ opacity: 0.55, marginLeft: 8 }}>›</span>
           </div>
           <div
+            ref={rootScriptsRowRef}
             onMouseEnter={() => {
               setSelectedRoot('scripts');
               setPickerLevel('scripts');
@@ -964,7 +1134,11 @@ const PromptPickerOverlay: React.FC = () => {
       )}
 
       {promptLibraryVisible && (
-        <div ref={leftPanelRef} style={{ ...panelStyle, width: LEFT_W }}>
+        <div
+          ref={leftPanelRef}
+          style={{ ...panelStyle, width: LEFT_W, ...contextFirstPanelPositionStyle }}
+          onScroll={queueContextGeometryRefresh}
+        >
           {!loaded && (
             <div style={placeholderStyle}>Loading…</div>
           )}
@@ -978,6 +1152,7 @@ const PromptPickerOverlay: React.FC = () => {
               const isSelectedDim = selectedKey === key && pickerLevel === 'prompt';
               return (
                 <div
+                  ref={selectedKey === key ? selectedLeftRowRef : undefined}
                   key={key}
                   onMouseEnter={() => {
                     setSelectedKey(key);
@@ -1007,6 +1182,7 @@ const PromptPickerOverlay: React.FC = () => {
             const isSelected = selectedKey === key;
             return (
               <div
+                ref={selectedKey === key ? selectedLeftRowRef : undefined}
                 key={`p-${item.prompt.id ?? idx}`}
                 onMouseEnter={() => {
                   setSelectedKey(key);
@@ -1026,7 +1202,12 @@ const PromptPickerOverlay: React.FC = () => {
       )}
 
       {scriptsVisible && (
-        <div style={{ ...panelStyle, width: LEFT_W }} data-history-insert-menu-scripts>
+        <div
+          ref={leftPanelRef}
+          style={{ ...panelStyle, width: LEFT_W, ...contextFirstPanelPositionStyle }}
+          onScroll={queueContextGeometryRefresh}
+          data-history-insert-menu-scripts
+        >
           {!scriptsLoaded && (
             <div style={placeholderStyle}>Loading…</div>
           )}
@@ -1052,9 +1233,40 @@ const PromptPickerOverlay: React.FC = () => {
         </div>
       )}
 
-      {/* Prompt children may grow upward independently when the viewport edge
-          would otherwise clip the second column. */}
-      {promptLibraryVisible && (
+      {/* Context descendants are independent floating surfaces. */}
+      {promptLibraryVisible && contextMode && selectedLeftItem?.kind === 'group' && (
+          <div
+            ref={rightPanelRef}
+            style={{ ...panelStyle, width: RIGHT_W, ...contextRightPanelPositionStyle }}
+          >
+            {rightPrompts.length > 0 && rightPrompts.map((p, i) => {
+              const isSelected = pickerLevel === 'prompt' && i === selectedPromptIdx;
+              return (
+                <div
+                  key={`rp-${p.id ?? i}`}
+                  onMouseEnter={() => {
+                    setPickerLevel('prompt');
+                    setSelectedPromptIdx(i);
+                  }}
+                  onClick={() => { void handleSelectPrompt(p); }}
+                  style={rowStyle(isSelected)}
+                >
+                  <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {p.title}
+                  </span>
+                </div>
+              );
+            })}
+            {rightPrompts.length === 0 && (
+              <div style={placeholderStyle}>пусто</div>
+            )}
+          </div>
+      )}
+
+      {/* Shortcut mode always reserves the secondary-column footprint. If the
+          hovered row is ungrouped, only the contents disappear — the root width
+          and its History/composer anchor do not recenter or teleport. */}
+      {promptLibraryVisible && !contextMode && (
         <div style={rightWrapperStyle}>
           {selectedLeftItem?.kind === 'group' && (
             <div ref={rightPanelRef} style={{ ...panelStyle, ...rightPanelPositionStyle }}>
