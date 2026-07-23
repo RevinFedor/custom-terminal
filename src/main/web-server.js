@@ -51,6 +51,7 @@ const {
   codexSessionIdFromAuthoritativeStatus,
   isCodexComposerReadyForGuardedSend,
 } = require('./codex-runtime-contract');
+const { OrchestrationRunStore, isActiveStatus } = require('./orchestration-runs');
 const INBOX_PROJECT_ID = '__noted_inbox__';
 const isInboxProjectId = (projectId) => projectId === INBOX_PROJECT_ID;
 // Lazy-require the helpers (loaded fresh each call so missing module just
@@ -141,6 +142,7 @@ let computeProjectActivity = null;
 let answerClaudeQuestion = null;
 let getClaudePendingQuestion = null;
 let transcriptService = null;
+let getAgentTurnResult = null;
 // Main-owned Codex process/writer resolver. Renderer state and SQLite are not
 // authoritative for a live rollout, so web routes fall back to this callback
 // when the bridge is unavailable instead of publishing the saved resume ID.
@@ -160,6 +162,15 @@ const externalRuns = new Map();      // runId -> run metadata
 const externalRunByTabId = new Map(); // tabId -> runId
 const externalRunByConversationKey = new Map(); // conversationKey -> runId
 const DEFAULT_EXTERNAL_AUTO_CLOSE_MS = 15 * 60 * 1000;
+let orchestrationRunStore = null;
+const orchestrationCompletionInflight = new Set();
+
+function getOrchestrationRunStore() {
+  if (!orchestrationRunStore) {
+    orchestrationRunStore = new OrchestrationRunStore(path.join(app.getPath('userData'), 'orchestration-runs.json'));
+  }
+  return orchestrationRunStore;
+}
 
 function shortId(value, len = 8) {
   const s = value == null ? '' : String(value);
@@ -1234,6 +1245,199 @@ function getAgentPendingQuestionScenario(tabId) {
   return getClaudePendingQuestion ? getClaudePendingQuestion(tabId) : null;
 }
 
+function promptFingerprint(prompt) {
+  const normalized = String(prompt || '').replace(/\r\n/g, '\n').trim();
+  return crypto.createHash('sha256').update(normalized).digest('hex');
+}
+
+function findOrchestrationTabDescriptor(tabId) {
+  if (!tabId) return null;
+  try {
+    const projectManager = require('./project-manager');
+    for (const project of projectManager.db.getAllProjects()) {
+      const tab = (project.tabs || []).find((item) => item.tabId === tabId);
+      if (!tab) continue;
+      const toolType = tab.commandType === 'codex'
+        ? 'codex'
+        : tab.commandType === 'claude' || tab.tabType === 'claude-sdk'
+          ? 'claude'
+          : null;
+      return {
+        tabId,
+        tabName: tab.name || tabId.slice(-12),
+        projectId: project.id,
+        projectName: project.name || path.basename(project.path || '') || project.id,
+        projectPath: project.path || tab.cwd || null,
+        cwd: tab.cwd || project.path || null,
+        toolType,
+        commandType: tab.commandType || null,
+      };
+    }
+  } catch (error) {
+    console.warn('[Orchestration] tab lookup failed tab=' + shortId(tabId, 12) + ' error=' + (error?.message || error));
+  }
+  return null;
+}
+
+function orchestrationUrls(run) {
+  const runId = encodeURIComponent(run.runId);
+  return {
+    statusUrl: '/api/orchestrations/' + runId,
+    resultUrl: '/api/orchestrations/' + runId + '/result',
+    cancelUrl: '/api/orchestrations/' + runId + '/cancel',
+    eventsUrl: '/api/events?tabId=' + encodeURIComponent(run.sourceTabId),
+  };
+}
+
+function withOrchestrationUrls(run) {
+  return run ? { ...run, ...orchestrationUrls(run) } : null;
+}
+
+function emitOrchestrationRun(run, reason = 'changed') {
+  if (!run) return;
+  const payload = { type: 'orchestration-update', reason, run: withOrchestrationUrls(run) };
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.webContents.send('orchestration:changed', payload);
+  }
+  const tabIds = new Set([run.sourceTabId, run.targetTabId].filter(Boolean));
+  for (const tabId of tabIds) webBroadcast(tabId, payload);
+}
+
+async function probeOrchestrationResult(run, { maxChars = 100_000, sessionInfo = null } = {}) {
+  if (!run || typeof getAgentTurnResult !== 'function') {
+    return { found: false, resultAvailable: false, error: 'result reader unavailable' };
+  }
+  const info = sessionInfo || await resolveAgentSessionInfo(run.targetTabId, 2000).catch(() => null);
+  const sessionId = info?.sessionId || run.sessionId || null;
+  const cwd = info?.cwd || run.targetCwd || run.targetProjectPath || null;
+  if (!sessionId) return { found: false, resultAvailable: false, sessionId: null };
+  try {
+    const result = await getAgentTurnResult({
+      sessionId,
+      cwd,
+      promptHash: run.promptHash,
+      requestedAt: run.createdAt,
+      maxChars,
+    });
+    return {
+      ...(result || {}),
+      found: result?.found === true,
+      resultAvailable: typeof result?.assistantText === 'string' && result.assistantText.length > 0,
+      sessionId,
+    };
+  } catch (error) {
+    return { found: false, resultAvailable: false, sessionId, error: String(error?.message || error) };
+  }
+}
+
+async function sendOrchestrationCompletionNotification(run) {
+  const store = getOrchestrationRunStore();
+  const current = await store.getInternal(run.runId);
+  if (!current || current.notifySource === false || current.notificationStatus === 'sent' || current.notificationStatus === 'queued') return;
+  if (!current.sourceTabId || current.sourceTabId === current.targetTabId) return;
+  await store.patch(current.runId, { notificationStatus: 'sending', notificationAttemptedAt: Date.now() });
+  emitOrchestrationRun(await store.get(current.runId), 'notification-sending');
+  try {
+    const status = await resolveAgentSessionInfo(current.sourceTabId, 2000);
+    const baseUrl = 'http://127.0.0.1:' + resolvedPort;
+    const message = [
+      '[Оркестрация] Запрос завершён.',
+      'runId: ' + current.runId,
+      'Исполнитель: ' + (current.targetTabName || current.targetTabId) + ' (' + (current.targetToolType || 'agent') + ').',
+      'Результат не вставлен в сообщение. Получи его одним запросом:',
+      'curl -sS -H "Authorization: Bearer $(cat ~/.noted-terminal/web-token.txt)" "' + baseUrl + '/api/orchestrations/' + encodeURIComponent(current.runId) + '/result"',
+      'Не используй Overseer и не опрашивай статус повторно. После GET продолжи исходную задачу.',
+    ].join('\n');
+    const result = await runAgentSendScenario({
+      tabId: current.sourceTabId,
+      prompt: message,
+      handoffId: 'orchestration-complete:' + current.runId,
+      source: 'orchestration-completion',
+      statusAtSend: status?.status || status?.sessionStatus || 'unknown',
+      queue: true,
+      ownership: 'project',
+      timeoutMs: 60_000,
+    });
+    if (isSendFailure(result)) {
+      await store.patch(current.runId, {
+        notificationStatus: result?.code === 'terminal_draft_conflict' ? 'draft-conflict' : 'failed',
+        notificationError: result?.error || result?.message || 'notification send failed',
+      });
+    } else {
+      await store.patch(current.runId, {
+        notificationStatus: result?.queued ? 'queued' : 'sent',
+        notificationDeliveredAt: Date.now(),
+        notificationError: null,
+      });
+    }
+  } catch (error) {
+    await store.patch(current.runId, {
+      notificationStatus: 'failed',
+      notificationError: String(error?.message || error),
+    });
+  }
+  emitOrchestrationRun(await store.get(current.runId), 'notification-finished');
+}
+
+async function finalizeCompletedOrchestration(run, reason = 'completed') {
+  if (!run || orchestrationCompletionInflight.has(run.runId)) return;
+  orchestrationCompletionInflight.add(run.runId);
+  try {
+    const store = getOrchestrationRunStore();
+    const probe = await probeOrchestrationResult(await store.getInternal(run.runId));
+    await store.patch(run.runId, {
+      resultAvailable: probe.resultAvailable === true,
+      resultTurnIndex: Number.isInteger(probe.turnIndex) ? probe.turnIndex : null,
+      resultUserUuid: probe.userUuid || null,
+      resultError: probe.found ? null : (probe.error || 'matching turn not found'),
+      sessionId: probe.sessionId || run.sessionId || null,
+    });
+    emitOrchestrationRun(await store.get(run.runId), reason);
+    await sendOrchestrationCompletionNotification(await store.get(run.runId));
+  } finally {
+    orchestrationCompletionInflight.delete(run.runId);
+  }
+}
+
+async function processOrchestrationLifecycle(tabId, payload) {
+  if (!tabId || (payload?.type !== 'busy' && payload?.type !== 'done')) return;
+  try {
+    const store = getOrchestrationRunStore();
+    const result = await store.applyLifecycle(tabId, payload);
+    for (const run of result.changed) emitOrchestrationRun(run, 'target-lifecycle');
+    for (const run of result.completed) await finalizeCompletedOrchestration(run, 'target-completed');
+  } catch (error) {
+    console.warn('[Orchestration] lifecycle failed tab=' + shortId(tabId, 12) + ' error=' + (error?.message || error));
+  }
+}
+
+async function reconcileOrchestrationRun(runId, reason = 'reconcile') {
+  const store = getOrchestrationRunStore();
+  const run = await store.getInternal(runId);
+  if (!run || !isActiveStatus(run.status)) return store.get(runId);
+  const sessionInfo = await resolveAgentSessionInfo(run.targetTabId, 2000).catch(() => null);
+  const status = sessionInfo?.status || sessionInfo?.sessionStatus || 'unknown';
+  const probe = await probeOrchestrationResult(run, { sessionInfo });
+  const reconciled = await store.reconcile(runId, {
+    busy: status === 'busy',
+    sessionId: probe.sessionId || sessionInfo?.sessionId || run.sessionId || null,
+    resultFound: probe.found === true,
+    resultAvailable: probe.resultAvailable === true,
+    turnIndex: probe.turnIndex,
+  });
+  if (reconciled.changed) emitOrchestrationRun(reconciled.changed, reason);
+  if (reconciled.completed) await finalizeCompletedOrchestration(reconciled.changed, 'recovered-completion');
+  return store.get(runId);
+}
+
+async function reconcileActiveOrchestrations() {
+  const store = getOrchestrationRunStore();
+  const active = await store.listActive();
+  for (const run of active) {
+    await reconcileOrchestrationRun(run.runId, 'startup-reconcile');
+  }
+}
+
 function mobileTimelineColor(kind) {
   switch (kind) {
     case 'compact': return 'f59e0b';
@@ -1351,6 +1555,14 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       }));
     }
   };
+  const replayOrchestrationRuns = async () => {
+    const runs = await getOrchestrationRunStore().listForTab(tabId);
+    sink.send(JSON.stringify({
+      type: 'orchestration-snapshot',
+      tabId,
+      runs: runs.map(withOrchestrationUrls),
+    }));
+  };
   if (session) {
     sink.send(JSON.stringify({
       type: 'snapshot',
@@ -1368,6 +1580,7 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       questions: pendingQuestion?.questions,
     }));
     replayExternalRunTerminalEvent();
+    await replayOrchestrationRuns();
     return;
   }
   try {
@@ -1401,6 +1614,7 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       questions: pendingQuestion?.questions,
     }));
     replayExternalRunTerminalEvent();
+    await replayOrchestrationRuns();
   } catch {
     sink.send(JSON.stringify({
       type: 'snapshot',
@@ -1418,6 +1632,7 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       questions: pendingQuestion?.questions,
     }));
     replayExternalRunTerminalEvent();
+    await replayOrchestrationRuns();
   }
 }
 
@@ -1845,6 +2060,246 @@ async function handleApi(req, res, parsed, sdkSessions) {
   }
 
   const projectManager = require('./project-manager');
+
+  if (parsed.pathname === '/api/orchestrations' && req.method === 'GET') {
+    const tabId = parsed.query.tabId ? decId(String(parsed.query.tabId)) : null;
+    const runs = tabId
+      ? await getOrchestrationRunStore().listForTab(tabId, { activeOnly: parsed.query.active === '1' })
+      : await getOrchestrationRunStore().listActive();
+    return sendJson(res, 200, { ok: true, runs: runs.map(withOrchestrationUrls) });
+  }
+
+  if (parsed.pathname === '/api/orchestrations' && req.method === 'POST') {
+    let createdRunId = null;
+    try {
+      const body = await readBody(req);
+      const prompt = cleanOptionalString(body.prompt ?? body.text, '');
+      const sourceTabId = cleanOptionalString(body.sourceTabId, '');
+      let targetTabId = cleanOptionalString(body.targetTabId, '');
+      const targetProjectId = cleanOptionalString(body.targetProjectId || body.projectId, '');
+      const targetToolType = body.toolType === 'codex' || body.provider === 'codex' ? 'codex' : 'claude';
+      const notifySource = body.notifySource !== false;
+      if (!prompt) return sendJson(res, 400, { ok: false, error: 'prompt required' });
+      if (!sourceTabId) return sendJson(res, 400, { ok: false, error: 'sourceTabId required' });
+      if (!targetTabId && !targetProjectId) {
+        return sendJson(res, 400, { ok: false, error: 'targetTabId or targetProjectId required' });
+      }
+
+      const requestedRunId = cleanOptionalString(body.runId, '') || crypto.randomUUID();
+      const existing = await getOrchestrationRunStore().get(requestedRunId);
+      if (existing) {
+        return sendJson(res, 200, { ok: true, idempotent: true, run: withOrchestrationUrls(existing) });
+      }
+
+      const source = findOrchestrationTabDescriptor(sourceTabId);
+      if (!source) return sendJson(res, 404, { ok: false, error: 'source tab not found' });
+      if (notifySource && !source.toolType) {
+        return sendJson(res, 409, { ok: false, error: 'source tab is not a Claude/Codex agent' });
+      }
+
+      let target = targetTabId ? findOrchestrationTabDescriptor(targetTabId) : null;
+      let targetCreated = false;
+      if (targetTabId && !target) return sendJson(res, 404, { ok: false, error: 'target tab not found' });
+      if (!targetTabId) {
+        const created = await bridgeRequest('createAgentTab', {
+          projectId: targetProjectId,
+          toolType: targetToolType,
+          name: cleanOptionalString(body.name || body.targetName, ''),
+          startNow: true,
+          background: true,
+          codexModel: cleanOptionalString(body.model || body.codexModel, ''),
+          codexEffort: cleanOptionalString(body.effort || body.codexEffort, ''),
+        }, 12_000);
+        targetTabId = created?.tabId || '';
+        if (!targetTabId) return sendJson(res, 500, { ok: false, error: 'failed to create target tab' });
+        targetCreated = true;
+        target = findOrchestrationTabDescriptor(targetTabId) || {
+          tabId: targetTabId,
+          tabName: created?.name || targetTabId.slice(-12),
+          projectId: created?.projectId || targetProjectId,
+          projectName: created?.projectName || path.basename(created?.cwd || '') || targetProjectId,
+          projectPath: created?.projectPath || created?.cwd || null,
+          cwd: created?.cwd || null,
+          toolType: created?.toolType || targetToolType,
+          commandType: created?.commandType || targetToolType,
+        };
+      }
+      if (targetTabId === sourceTabId) {
+        return sendJson(res, 409, { ok: false, error: 'source and target tabs must be different' });
+      }
+      if (!target?.toolType) {
+        return sendJson(res, 409, { ok: false, error: 'target tab is not a Claude/Codex agent' });
+      }
+
+      const run = await getOrchestrationRunStore().create({
+        runId: requestedRunId,
+        status: targetCreated ? 'starting' : 'sending',
+        label: cleanOptionalString(body.label, ''),
+        sourceTabId,
+        sourceTabName: source.tabName,
+        sourceProjectId: source.projectId,
+        sourceProjectName: source.projectName,
+        sourceProjectPath: source.projectPath,
+        targetTabId,
+        targetTabName: target.tabName,
+        targetProjectId: target.projectId,
+        targetProjectName: target.projectName,
+        targetProjectPath: target.projectPath,
+        targetCwd: target.cwd,
+        targetToolType: target.toolType,
+        targetCreated,
+        notifySource,
+        promptHash: promptFingerprint(prompt),
+        promptChars: prompt.length,
+      });
+      createdRunId = run.runId;
+      emitOrchestrationRun(run, 'created');
+
+      let targetStatus = null;
+      if (targetCreated) {
+        const startupTimeoutMs = Math.max(5_000, Math.min(60_000, Number(body.startupTimeoutMs) || 20_000));
+        targetStatus = await waitForAgentReady(targetTabId, startupTimeoutMs);
+      } else {
+        targetStatus = await resolveAgentSessionInfo(targetTabId, 2000);
+      }
+      const baselineStatus = targetStatus?.status || targetStatus?.sessionStatus || 'unknown';
+      await getOrchestrationRunStore().patch(run.runId, {
+        status: 'sending',
+        sessionId: targetStatus?.sessionId || null,
+      });
+      emitOrchestrationRun(await getOrchestrationRunStore().get(run.runId), 'sending');
+
+      const sendResult = await runAgentSendScenario({
+        tabId: targetTabId,
+        prompt,
+        model: cleanOptionalString(body.model, ''),
+        effort: cleanOptionalString(body.effort, ''),
+        thinking: cleanOptionalString(body.thinking, ''),
+        cwd: target.cwd,
+        handoffId: 'orchestration:' + run.runId,
+        source: 'orchestration:' + sourceTabId,
+        statusAtSend: baselineStatus,
+        queue: body.queue !== false,
+        ownership: 'project',
+        timeoutMs: 60_000,
+      });
+      if (isSendFailure(sendResult)) {
+        const failed = await getOrchestrationRunStore().patch(run.runId, {
+          status: 'failed',
+          completedAt: Date.now(),
+          completionReason: 'send-failed',
+          error: sendResult?.error || sendResult?.message || 'send failed',
+        });
+        emitOrchestrationRun(failed, 'send-failed');
+        return sendSendFailure(res, sendResult, { runId: run.runId, targetTabId });
+      }
+
+      const accepted = await getOrchestrationRunStore().markDelivery(run.runId, {
+        queued: sendResult?.queued === true,
+        baselineBusy: baselineStatus === 'busy',
+        sessionId: sendResult?.sessionId || targetStatus?.sessionId || null,
+      });
+      emitOrchestrationRun(accepted, 'delivery-accepted');
+      // The provider may emit task_started while the send scenario is still
+      // auditing delivery. Reconcile once after acceptance so that event is not
+      // lost; subsequent progress remains fully event-driven.
+      const reconciled = await reconcileOrchestrationRun(run.runId, 'delivery-reconcile');
+      return sendJson(res, 202, {
+        ok: true,
+        accepted: true,
+        run: withOrchestrationUrls(reconciled || accepted),
+      });
+    } catch (error) {
+      if (createdRunId) {
+        const failed = await getOrchestrationRunStore().patch(createdRunId, {
+          status: 'failed',
+          completedAt: Date.now(),
+          completionReason: 'orchestration-error',
+          error: String(error?.message || error),
+        });
+        emitOrchestrationRun(failed, 'orchestration-error');
+      }
+      return sendJson(res, Number(error?.statusCode) || 500, { ok: false, runId: createdRunId, error: String(error?.message || error) });
+    }
+  }
+
+  const orchestrationResultMatch = parsed.pathname.match(/^\/api\/orchestrations\/([^/]+)\/result$/);
+  if (orchestrationResultMatch && req.method === 'GET') {
+    const runId = decId(orchestrationResultMatch[1]);
+    const run = await reconcileOrchestrationRun(runId, 'result-read');
+    if (!run) return sendJson(res, 404, { ok: false, error: 'run not found' });
+    if (isActiveStatus(run.status)) {
+      return sendJson(res, 202, { ok: true, ready: false, status: run.status, run: withOrchestrationUrls(run) });
+    }
+    if (run.status !== 'completed') {
+      return sendJson(res, 409, { ok: false, ready: false, status: run.status, error: run.error || 'run did not complete' });
+    }
+    const internal = await getOrchestrationRunStore().getInternal(runId);
+    const result = await probeOrchestrationResult(internal, {
+      maxChars: Math.max(500, Math.min(250_000, Number(parsed.query.maxChars) || 100_000)),
+    });
+    if (!result.found) {
+      return sendJson(res, 202, {
+        ok: true,
+        ready: false,
+        status: run.status,
+        error: result.error || 'matching transcript turn not materialized',
+        run: withOrchestrationUrls(run),
+      });
+    }
+    return sendJson(res, 200, {
+      ok: true,
+      ready: true,
+      runId,
+      status: run.status,
+      sessionId: result.sessionId || run.sessionId || null,
+      turnIndex: result.turnIndex ?? run.resultTurnIndex ?? null,
+      userUuid: result.userUuid || run.resultUserUuid || null,
+      assistantText: result.assistantText || '',
+      assistantChars: Number(result.assistantChars) || (result.assistantText || '').length,
+      truncated: result.truncated === true,
+    });
+  }
+
+  const orchestrationCancelMatch = parsed.pathname.match(/^\/api\/orchestrations\/([^/]+)\/cancel$/);
+  if (orchestrationCancelMatch && req.method === 'POST') {
+    const runId = decId(orchestrationCancelMatch[1]);
+    const current = await getOrchestrationRunStore().get(runId);
+    if (!current) return sendJson(res, 404, { ok: false, error: 'run not found' });
+    const body = await readBody(req);
+    const cancelled = await getOrchestrationRunStore().patch(runId, {
+      status: 'cancelled',
+      completedAt: Date.now(),
+      completionReason: 'cancelled-by-api',
+      error: null,
+    });
+    emitOrchestrationRun(cancelled, 'cancelled');
+    let interrupt = null;
+    if (body.interrupt === true) {
+      interrupt = await runAgentInterruptScenario(current.targetTabId, 5000).catch((error) => ({ success: false, error: String(error?.message || error) }));
+    }
+    return sendJson(res, 200, { ok: true, run: withOrchestrationUrls(cancelled), interrupt });
+  }
+
+  const orchestrationAckMatch = parsed.pathname.match(/^\/api\/orchestrations\/([^/]+)\/ack$/);
+  if (orchestrationAckMatch && req.method === 'POST') {
+    const runId = decId(orchestrationAckMatch[1]);
+    const body = await readBody(req);
+    const tabId = cleanOptionalString(body.tabId, '');
+    if (!tabId) return sendJson(res, 400, { ok: false, error: 'tabId required' });
+    const acknowledged = await getOrchestrationRunStore().acknowledge(runId, tabId);
+    if (!acknowledged) return sendJson(res, 404, { ok: false, error: 'run not found' });
+    emitOrchestrationRun(acknowledged, 'acknowledged');
+    return sendJson(res, 200, { ok: true, run: withOrchestrationUrls(acknowledged) });
+  }
+
+  const orchestrationStatusMatch = parsed.pathname.match(/^\/api\/orchestrations\/([^/]+)$/);
+  if (orchestrationStatusMatch && req.method === 'GET') {
+    const runId = decId(orchestrationStatusMatch[1]);
+    const run = await getOrchestrationRunStore().get(runId);
+    if (!run) return sendJson(res, 404, { ok: false, error: 'run not found' });
+    return sendJson(res, 200, { ok: true, run: withOrchestrationUrls(run) });
+  }
 
   if (parsed.pathname === '/api/inbox' && req.method === 'GET') {
     const inbox = projectManager.db.getProjectById(INBOX_PROJECT_ID);
@@ -3776,11 +4231,14 @@ function releaseTranscriptSubscriptionsIfOrphan() {
 // actively subscribed, 'message' fan-out is logged with metadata only. That
 // gives a permanent causal trace for "server emitted → SSE wrote → iOS applied"
 // without dumping chat text or spamming desktop-only sessions with message drops.
-const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'bridge-update', 'queue-update', 'ask-question', 'question-cancelled', 'project-activity']);
+const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'bridge-update', 'queue-update', 'ask-question', 'question-cancelled', 'project-activity', 'orchestration-update']);
 function webBroadcast(tabId, payload) {
   payload = withMessageProjection(payload);
   const type = payload && payload.type;
   const loggable = BCAST_LOG_TYPES.has(type);
+  if (type === 'busy' || type === 'done') {
+    void processOrchestrationLifecycle(tabId, payload);
+  }
   const runId = externalRunByTabId.get(tabId);
   const run = runId ? externalRuns.get(runId) : null;
   try {
@@ -4167,7 +4625,7 @@ function attachWebSocket(server, sdkSessions) {
 
 // ───────── lifecycle ─────────
 
-function start({ sdkSessions, computeActiveLoaders: computeFn, computeProjectActivity: computeProjectActivityFn, answerClaudeQuestion: answerFn, getClaudePendingQuestion: getQFn, transcriptService: transcriptServiceFn, resolveCodexRuntimeSessionInfo: resolveCodexRuntimeFn }) {
+function start({ sdkSessions, computeActiveLoaders: computeFn, computeProjectActivity: computeProjectActivityFn, answerClaudeQuestion: answerFn, getClaudePendingQuestion: getQFn, transcriptService: transcriptServiceFn, resolveCodexRuntimeSessionInfo: resolveCodexRuntimeFn, getAgentTurnResult: getAgentTurnResultFn }) {
   if (httpServer) {
     console.log('[WebServer] already started');
     return;
@@ -4179,8 +4637,12 @@ function start({ sdkSessions, computeActiveLoaders: computeFn, computeProjectAct
   getClaudePendingQuestion = getQFn || null;
   transcriptService = transcriptServiceFn || null;
   resolveCodexRuntimeSessionInfo = resolveCodexRuntimeFn || null;
+  getAgentTurnResult = getAgentTurnResultFn || null;
   token = loadOrCreateToken();
   registerBridgeReplyHandler();
+  void getOrchestrationRunStore().initialize()
+    .then(() => reconcileActiveOrchestrations())
+    .catch((error) => console.warn('[Orchestration] startup recovery failed:', error?.message || error));
 
   httpServer = http.createServer((req, res) => {
     const parsed = url.parse(req.url, true);
@@ -4252,6 +4714,7 @@ function stop() {
   getClaudePendingQuestion = null;
   transcriptService = null;
   resolveCodexRuntimeSessionInfo = null;
+  getAgentTurnResult = null;
   subscribers.clear();
 }
 
@@ -4319,4 +4782,25 @@ function updateExternalRunSettings(payload = {}) {
   };
 }
 
-module.exports = { start, stop, webBroadcast, broadcastProjectActivity, getInfo, updateExternalRunSettings, notifyClaudeSessionAvailable, sendTabCompletionPush };
+async function listOrchestrationRunsForTab(tabId) {
+  return (await getOrchestrationRunStore().listForTab(tabId)).map(withOrchestrationUrls);
+}
+
+async function acknowledgeOrchestrationRun(runId, tabId) {
+  const run = await getOrchestrationRunStore().acknowledge(runId, tabId);
+  if (run) emitOrchestrationRun(run, 'acknowledged');
+  return run ? withOrchestrationUrls(run) : null;
+}
+
+module.exports = {
+  start,
+  stop,
+  webBroadcast,
+  broadcastProjectActivity,
+  getInfo,
+  updateExternalRunSettings,
+  listOrchestrationRunsForTab,
+  acknowledgeOrchestrationRun,
+  notifyClaudeSessionAvailable,
+  sendTabCompletionPush,
+};

@@ -56,10 +56,23 @@ Codex rollout читается инкрементально: unchanged `size+mti
 Текущий capability-preserving repair убирает множители:
 
 - discovery и full parsing разделены, full cache bounded;
-- Timeline, History и Codex presence держат один request в полёте и максимум одну trailing reconciliation; trailing нельзя просто убрать, потому что append мог прийти во время first flight;
+- Timeline, History и Codex presence держат один request в полёте и максимум одну trailing reconciliation. Invalidation, пришедшая во время активного чтения, не считается уже покрытой первым snapshot: watcher запоминает её и запускает ровно одно дополнительное чтение после завершения первого. Удалить trailing или молча отбросить такое событие значит иногда оставить последний append невидимым до следующего внешнего изменения;
 - History не держит вторую полную server-entry copy только ради Rewind convergence; для membership достаточен UUID set;
+- повторное открытие History сначала показывает renderer snapshot, а main проверяет durable revision до parse/projection; unchanged-ответ не переносит полный массив через IPC;
 - Timeline показывает owner-keyed initial loader до первого snapshot, а background refresh оставляет уже известные rows видимыми;
 - Prompt Summary генерируется последовательно, а не сотнями параллельных AI-вызовов.
+
+Renderer snapshot ключуется всей identity `tab + tool + session + cwd` и ограничен одновременно 64 MiB, 40 тысячами rows и восемью owners. Вытесняется целый least-recent owner, а не хвост отдельной истории: молчаливое усечение внутри session изменило бы смысл History. Snapshot сохраняет уже построенные сырые server rows без второй глубокой копии.
+
+Streaming projection обязана одновременно замечать содержательные изменения и сохранять identity неизменившихся строк. Сравнение History-row включает tool result/status, thinking, actions и остальные поля presentation: сравнение только по `uuid/type/content` оставляло pending-карточку вечной после прихода результата. Но полностью пересоздавать все объекты на каждом append тоже нельзя — Virtuoso заново рендерит большую ленту. Для Codex pending и completed tool-card получают UUID из исходного call identity; output-line не создаёт новую карточку, иначе раскрытие и локальное состояние теряются в момент завершения.
+
+Нормальный streaming-follow имеет одного владельца — `Virtuoso followOutput`. Параллельный delayed smooth-scroll создаёт второй независимый clock и визуальное подёргивание при частых append. Пользователь, ушедший вверх, прекращает follow; пользователь у хвоста остаётся у нового конца без дополнительного таймера.
+
+Durable revision строится из identity и метаданных реально прочитанных JSONL/rollout sources (`path + size + mtime`). Для Claude в неё также входят topology resume/clear-context chain, discovery-состояние директории и editable-last-prompt presentation state: неизменившийся primary JSONL сам по себе не доказывает, что не появился child или не изменился SQLite link. Проверка переживает restart main process и не зависит от watcher counter в памяти.
+
+Локальные `sending/queued/sent`, rewind marker, handoff metadata и временные suppression не входят в durable snapshot. Они живут в отдельном LRU-overlay с лимитами восемь owners / 512 элементов / 2 MiB и восстанавливаются при переключении вкладки. Смешать их с server rows опасно в обе стороны: локальный prompt пропадёт на remount до записи в transcript, а suppression-filtered server array может навсегда скрыть строку после истечения TTL. Ближайшее истечение suppression запускает одноразовую reconciliation из raw snapshot; постоянный timer polling не нужен.
+
+Каждая committed привязка History к owner получает монотонное поколение. Проверка только по owner-key недостаточна для A → B → A: поздний ответ первого A снова совпадёт по ключу и перетрёт более новый A. Любая state/cache write после async должна подтвердить и key, и generation.
 
 Базовая память одной огромной active History ещё не устранена. Следующая архитектурная граница — один streaming-проход, который строит lightweight rows и detail index (`byteStart/byteLength/sourceLine/hash`), после чего full tool-output/compact читается по явному expand/Copy. Это не молчаливое truncation: preview+identity сохраняют доступ к полному результату. Desktop, Project API и native/web callers общего full endpoint требуют явной compatibility migration; этот слой пока только план, не текущий факт.
 

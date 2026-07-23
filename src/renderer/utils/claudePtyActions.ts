@@ -1,5 +1,5 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
-import { markPendingResume } from './pendingResume';
+import { clearPendingResume, markPendingResume } from './pendingResume';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -78,6 +78,195 @@ const INTERRUPT_DEDUP_MS = 700;
 const shortTab = (tabId: string) => String(tabId || '').slice(-12) || 'unknown';
 const shortSid = (sessionId?: string) => sessionId ? sessionId.slice(0, 8) : 'none';
 const errorText = (e: any) => String(e?.message || e);
+
+export type ClaudePtySettingKind = 'model' | 'effort';
+
+export interface ClaudePtySettingResult {
+  success: true;
+  tabId: string;
+  kind: ClaudePtySettingKind;
+  value: string;
+  command: string;
+  proof: string;
+  sessionId?: string | null;
+  timestamp?: string | null;
+}
+
+type ClaudePtySettingProof = {
+  success?: boolean;
+  reason?: string;
+  timestamp?: string | null;
+  wrapperSeen?: boolean;
+  stdoutSeen?: boolean;
+  sessionId?: string | null;
+  file?: string;
+  error?: string;
+};
+
+const claudeSettingQueueTails = new Map<string, Promise<unknown>>();
+const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+async function waitForClaudePtySettingProof({
+  tabId,
+  kind,
+  command,
+  afterMs,
+  source,
+  timeoutMs,
+}: {
+  tabId: string;
+  kind: ClaudePtySettingKind;
+  command: string;
+  afterMs: number;
+  source: string;
+  timeoutMs: number;
+}) {
+  const deadline = Date.now() + timeoutMs;
+  let last: ClaudePtySettingProof | null = null;
+  while (Date.now() <= deadline) {
+    const proof = await ipcRenderer.invoke('claude:startup-slash-proof', {
+      tabId,
+      command,
+      afterMs,
+      label: source,
+    }).catch((error: any) => ({
+      success: false,
+      reason: 'proof_ipc_error',
+      error: errorText(error),
+    }));
+    last = proof || null;
+    if (proof?.success === true) {
+      return { proof, last };
+    }
+
+    // The PTY stream is only a wake-up signal. Main confirms Enter from the
+    // current headless frame and refuses if another dialog, input revision, or
+    // terminal generation is present.
+    await ipcRenderer.invoke('claude:confirm-settings-dialog', {
+      tabId,
+      kind,
+      reason: source,
+    }).catch(() => null);
+    await wait(180);
+  }
+  return { proof: null, last };
+}
+
+async function applyClaudePtySettingInner({
+  tabId,
+  kind,
+  value,
+  source,
+}: {
+  tabId: string;
+  kind: ClaudePtySettingKind;
+  value: string;
+  source: string;
+}): Promise<ClaudePtySettingResult> {
+  const normalizedValue = String(value || '').trim();
+  if (!tabId) throw new Error('tabId required');
+  if (!normalizedValue) throw new Error(kind + ' value required');
+
+  const command = '/' + kind + ' ' + normalizedValue;
+  const afterMs = Date.now();
+  console.warn('[ClaudePtySetting] start tab=' + shortTab(tabId)
+    + ' command=' + JSON.stringify(command)
+    + ' source=' + source);
+
+  const sent = await ipcRenderer.invoke('claude:send-command', tabId, command, {
+    source,
+    stashFirst: true,
+    armPromptBoundaryOnSubmit: true,
+  });
+  if (sent?.success !== true) {
+    throw new Error(sent?.error || 'Claude setting command was not sent');
+  }
+
+  let observed = await waitForClaudePtySettingProof({
+    tabId,
+    kind,
+    command,
+    afterMs,
+    source,
+    timeoutMs: 6500,
+  });
+
+  if (!observed.proof) {
+    // One bounded retry is allowed only when main atomically copied the current
+    // composer and it still equals this exact command at the Enter boundary.
+    // A changed or unknown draft is never submitted.
+    const retry = await ipcRenderer.invoke('claude:retry-exact-setting-input', {
+      tabId,
+      command,
+      reason: source + ':proof-timeout',
+    }).catch((error: any) => ({
+      success: false,
+      submitted: false,
+      error: errorText(error),
+    }));
+    if (retry?.submitted === true) {
+      observed = await waitForClaudePtySettingProof({
+        tabId,
+        kind,
+        command,
+        afterMs,
+        source: source + ':exact-retry',
+        timeoutMs: 3500,
+      });
+    }
+  }
+
+  if (!observed.proof) {
+    const last = observed.last || {};
+    throw new Error(
+      command + ' was not confirmed by Claude'
+      + '; reason=' + (last.reason || 'timeout')
+      + '; wrapper=' + !!last.wrapperSeen
+      + '; stdout=' + !!last.stdoutSeen
+      + (last.error ? '; error=' + last.error : ''),
+    );
+  }
+
+  console.warn('[ClaudePtySetting] confirmed tab=' + shortTab(tabId)
+    + ' command=' + JSON.stringify(command)
+    + ' session=' + shortSid(observed.proof.sessionId || undefined)
+    + ' timestamp=' + (observed.proof.timestamp || '-'));
+  return {
+    success: true,
+    tabId,
+    kind,
+    value: normalizedValue,
+    command,
+    proof: observed.proof.reason || 'jsonl-stdout',
+    sessionId: observed.proof.sessionId || null,
+    timestamp: observed.proof.timestamp || null,
+  };
+}
+
+export async function applyClaudePtySetting({
+  tabId,
+  kind,
+  value,
+  source = 'claude-pty-setting',
+}: {
+  tabId: string;
+  kind: ClaudePtySettingKind;
+  value: string;
+  source?: string;
+}): Promise<ClaudePtySettingResult> {
+  const previous = claudeSettingQueueTails.get(tabId) || Promise.resolve();
+  const work = previous
+    .catch(() => undefined)
+    .then(() => applyClaudePtySettingInner({ tabId, kind, value, source }));
+  claudeSettingQueueTails.set(tabId, work);
+  try {
+    return await work;
+  } finally {
+    if (claudeSettingQueueTails.get(tabId) === work) {
+      claudeSettingQueueTails.delete(tabId);
+    }
+  }
+}
 
 export async function getClaudePtyPresence(tabId: string): Promise<ClaudePtyPresence> {
   const presence = await ipcRenderer.invoke('claude:get-presence', tabId);
@@ -202,8 +391,6 @@ async function resumeClaudePtySessionInner({
     };
   }
 
-  store.clearInterruptedState(tabId);
-
   let repaired = 0;
   if (repair) {
     try {
@@ -224,8 +411,17 @@ async function resumeClaudePtySessionInner({
   // 15s TTL before JSONL repair can burn the guard window on large sessions.
   markPendingResume(tabId, sessionId);
   console.log('[ClaudePtyActions:resume] pending-marked-and-write tab=' + shortTab(tabId) + ' sid=' + shortSid(sessionId));
-  ipcRenderer.send('terminal:input', tabId, '\x15claude --dangerously-skip-permissions --resume ' + sessionId + '\r');
-  ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude', sessionId });
+  const runResult = await ipcRenderer.invoke('claude:run-command', {
+    tabId,
+    command: 'claude-c',
+    sessionId,
+    ...(cwd ? { cdTo: cwd } : {}),
+  }).catch((e: any) => ({ success: false, error: errorText(e) }));
+  if (runResult?.success === false) {
+    clearPendingResume(tabId);
+    return { success: false, sessionId, repaired, error: runResult.error || runResult.reason || 'Claude resume failed' };
+  }
+  store.clearInterruptedState(tabId);
   return { success: true, sessionId, repaired };
 }
 

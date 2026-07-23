@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo } from 'react';
 import { useWorkspaceStore, isTabInterrupted } from './store/useWorkspaceStore';
 import { useProjectsStore } from './store/useProjectsStore';
-import { useUIStore } from './store/useUIStore';
+import { syncDefaultCodexSettingsMirror, useUIStore } from './store/useUIStore';
 import { usePromptsStore } from './store/usePromptsStore';
 import Dashboard from './components/Dashboard/Dashboard';
 import Workspace from './components/Workspace/Workspace';
@@ -25,8 +25,9 @@ import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import './utils/logger';
 import { usePromptQueueRunner } from './hooks/usePromptQueueRunner';
 import { useGitRunAfterRunner } from './hooks/useGitRunAfterRunner';
-import { markPendingResume } from './utils/pendingResume';
+import { clearPendingResume, markPendingResume } from './utils/pendingResume';
 import {
+  applyClaudePtySetting,
   getClaudePtyPresence,
   interruptClaudePtyTurn,
   resumeClaudePtySession,
@@ -45,6 +46,16 @@ import {
   type CodexRuntimeSessionSnapshot,
 } from './utils/codexWriterIdentity';
 import { getHistoryAgentRuntime, type AgentHistoryTool } from './utils/historyAgentRuntimes';
+import {
+  isCompleteCodexSettingsRequest,
+  planCodexHistorySettings,
+  resolveCodexSettingsRuntimeProof,
+} from './utils/codexHistorySettingsPlan.mjs';
+import { codexSessionAdoptionOptionsFromEvent } from './utils/codexSessionAdoption.mjs';
+import {
+  planCodexPickerStateApplication,
+  resolveCodexEffectiveSettings,
+} from './utils/codexEffectiveSettings.mjs';
 import {
   grabAgentDraftScenario,
   inspectAgentDraftScenario,
@@ -361,6 +372,8 @@ const ProjectDropIndicator = memo(({ edge }: { edge: 'left' | 'right' }) => {
   );
 });
 
+const STRUCTURED_PROJECT_DROP_EVENT = 'structured-tab-project-target';
+
 // Draggable Project Tab
 interface ProjectTabItemProps {
   projectId: string;
@@ -422,6 +435,8 @@ const ProjectTabItem = memo(({
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isTabDropTarget, setIsTabDropTarget] = useState(false); // Highlight when terminal tab is over
+  const [isTabDropBlocked, setIsTabDropBlocked] = useState(false);
+  const [structuredDropState, setStructuredDropState] = useState<'allowed' | 'blocked' | null>(null);
   const hasCompletionNotification = completionNotificationCount > 0;
   const [completionNotificationDismissing, setCompletionNotificationDismissing] = useState(false);
   const completionNotificationWasVisibleRef = useRef(hasCompletionNotification);
@@ -464,6 +479,22 @@ const ProjectTabItem = memo(({
   }, [hasCompletionNotification]);
 
   useEffect(() => {
+    const handleStructuredProjectTarget = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        projectId?: string;
+        state?: 'allowed' | 'blocked';
+      } | null>).detail;
+      setStructuredDropState(
+        detail?.projectId === projectId && detail.state
+          ? detail.state
+          : null
+      );
+    };
+    window.addEventListener(STRUCTURED_PROJECT_DROP_EVENT, handleStructuredProjectTarget);
+    return () => window.removeEventListener(STRUCTURED_PROJECT_DROP_EVENT, handleStructuredProjectTarget);
+  }, [projectId]);
+
+  useEffect(() => {
     const element = ref.current;
     if (!element || isEditing) return;
 
@@ -482,7 +513,9 @@ const ProjectTabItem = memo(({
         },
         onDragEnter: ({ source, self }) => {
           if (source.data.type === 'TAB') {
-            setIsTabDropTarget(true);
+            const blocked = source.data.projectId === projectId;
+            setIsTabDropTarget(!blocked);
+            setIsTabDropBlocked(blocked);
             return;
           }
           if (isPinnedSystem || source.data.id === projectId) return;
@@ -490,7 +523,9 @@ const ProjectTabItem = memo(({
         },
         onDrag: ({ source, self }) => {
           if (source.data.type === 'TAB') {
-            setIsTabDropTarget(true);
+            const blocked = source.data.projectId === projectId;
+            setIsTabDropTarget(!blocked);
+            setIsTabDropBlocked(blocked);
             return;
           }
           if (isPinnedSystem || source.data.id === projectId) {
@@ -502,10 +537,12 @@ const ProjectTabItem = memo(({
         onDragLeave: () => {
           setClosestEdge(null);
           setIsTabDropTarget(false);
+          setIsTabDropBlocked(false);
         },
         onDrop: ({ source }) => {
           setClosestEdge(null);
           setIsTabDropTarget(false);
+          setIsTabDropBlocked(false);
           // Handle terminal tab drop
           if (source.data.type === 'TAB' && onTabDrop) {
             const tabData = source.data as { id: string; projectId?: string; selectedTabIds?: string[] };
@@ -535,11 +572,15 @@ const ProjectTabItem = memo(({
     : activeProcessCount > 0
       ? 'text-white'
       : 'text-gray-400 hover:text-white';
+  const dropState = structuredDropState
+    || (isTabDropBlocked ? 'blocked' : isTabDropTarget ? 'allowed' : null);
 
   return (
     <button
       ref={ref}
       data-workspace-navigation
+      data-structured-project-drop-target
+      data-project-id={projectId}
       className={`relative inline-flex items-center text-sm font-medium cursor-pointer transition-colors rounded-sm overflow-visible ${
         isActive && isAreaActive ? 'ring-1 ring-white/50 shadow-[0_0_10px_rgba(255,255,255,0.1)]' : ''
       } ${textColor}`}
@@ -550,9 +591,13 @@ const ProjectTabItem = memo(({
         lineHeight: '16px',
         height: `${Math.max(20, 16 + projectTabGeometry.paddingY * 2)}px`,
         opacity: isDragging ? 0.5 : 1,
-        outline: isTabDropTarget ? '2px solid #4ade80' : 'none',
+        outline: dropState === 'allowed'
+          ? '2px solid #4ade80'
+          : dropState === 'blocked'
+            ? '2px solid #737373'
+            : 'none',
         outlineOffset: '-2px',
-        borderRadius: isTabDropTarget ? '4px' : '2px', // Consistency with rounded-sm
+        borderRadius: dropState ? '4px' : '2px', // Consistency with rounded-sm
       }}
       onClick={onClick}
       onDoubleClick={isPinnedSystem ? undefined : onDoubleClick}
@@ -1592,15 +1637,31 @@ function App() {
       } as any);
     };
 
-    const handleMcpAiTab = (_: any, data: { tabId: string; engine: 'claude' | 'codex' | 'gemini'; sessionId?: string; reason?: string; writerProven?: boolean; writerProof?: string }) => {
+    const handleMcpAiTab = (_: any, data: { tabId: string; engine: 'claude' | 'codex' | 'gemini'; sessionId?: string; reason?: string; writerProven?: boolean; writerProof?: string; previousSessionId?: string | null; writerGeneration?: string | null; carryCodexSettingsProof?: boolean; requiresExactCodexSettingsProof?: boolean; codexSettingsProof?: { model?: string; effort?: string; proofAt?: number } | null }) => {
       if (!data?.tabId || !data?.engine) return;
       const store = useWorkspaceStore.getState();
       if (data.engine === 'codex') {
         if (data.sessionId && data.writerProven === true) {
           const reason = data.reason || 'unknown';
+          const currentSessionId = store.getCodexSessionId(data.tabId);
+          if (data.previousSessionId
+            && currentSessionId !== data.previousSessionId
+            && currentSessionId !== data.sessionId) {
+            console.warn('[CodexSessionGuard:R] ignore stale writer event tab=' + String(data.tabId).slice(-12)
+              + ' source=' + data.previousSessionId.slice(0, 8)
+              + ' session=' + data.sessionId.slice(0, 8)
+              + ' current=' + String(currentSessionId || 'none').slice(0, 8)
+              + ' generation=' + (data.writerGeneration || '-'));
+            return;
+          }
           // Adopt the proven writer before setTabCommandType triggers its generic
           // full-tab save, so that save cannot carry the renderer's stale source.
-          store.setCodexSessionId(data.tabId, data.sessionId, reason as any);
+          store.setCodexSessionId(
+            data.tabId,
+            data.sessionId,
+            reason as any,
+            codexSessionAdoptionOptionsFromEvent(data),
+          );
         } else if (data.sessionId) {
           console.warn('[CodexSessionGuard:R] ignore unproven session event tab=' + String(data.tabId).slice(-12)
             + ' session=' + data.sessionId.slice(0, 8)
@@ -1617,9 +1678,116 @@ function App() {
       }
     };
 
+    const handleCodexModelMigrationPending = (
+      _: any,
+      data: {
+        tabId?: string;
+        launchId?: string;
+        enteredAt?: number;
+        clearDefaultModel?: boolean;
+        clearDefaultEffort?: boolean;
+        expectedDefaultModel?: string;
+        expectedDefaultEffort?: string;
+        sourceModel?: string;
+        sourceEffort?: string;
+        targetModel?: string;
+        configPath?: string;
+        configFingerprint?: string;
+        configAlreadyTarget?: boolean;
+      },
+    ) => {
+      if (!data?.tabId) return;
+      // The launch pair that triggered the native migration is no longer a
+      // valid description of the live TUI. Keep it unknown until main observes
+      // Codex's exact post-Enter acknowledgement.
+      useWorkspaceStore.getState().updateCodexState(data.tabId, {
+        codexModel: undefined,
+        codexEffort: undefined,
+        codexSettingsProofAt: Number(data.enteredAt) || Date.now(),
+        codexSettingsProofSessionId: undefined,
+        codexModelMigrationPending: true,
+        codexModelMigrationRestoreDefaultModel: data.clearDefaultModel === true,
+        codexModelMigrationRestoreDefaultEffort: data.clearDefaultEffort === true,
+        codexModelMigrationSourceModel: data.sourceModel || undefined,
+        codexModelMigrationSourceEffort: data.sourceEffort || undefined,
+        codexModelMigrationTargetModel: data.targetModel || undefined,
+        codexModelMigrationConfigPath: data.configPath || undefined,
+        codexModelMigrationConfigFingerprint: data.configFingerprint || undefined,
+        codexModelMigrationConfigAlreadyTarget: data.configAlreadyTarget === true,
+      });
+      syncDefaultCodexSettingsMirror({
+        ...(data.clearDefaultModel === true ? { model: 'none' } : {}),
+        ...(data.clearDefaultEffort === true ? { effort: 'none' } : {}),
+        ...(data.clearDefaultModel === true
+          ? { expectedModel: data.expectedDefaultModel }
+          : {}),
+        ...(data.clearDefaultEffort === true
+          ? { expectedEffort: data.expectedDefaultEffort }
+          : {}),
+      });
+      console.warn('[CodexModelMigration:R] settings pending tab='
+        + String(data.tabId).slice(-12)
+        + ' launch=' + (data.launchId || '-'));
+    };
+
+    const handleCodexModelMigrationApplied = (
+      _: any,
+      data: {
+        tabId?: string;
+        launchId?: string;
+        model?: string;
+        effort?: string;
+        proofAt?: number;
+        proofSessionId?: string | null;
+        updateDefaultModel?: boolean;
+        updateDefaultEffort?: boolean;
+        expectedDefaultModel?: string;
+        expectedDefaultEffort?: string;
+      },
+    ) => {
+      if (!data?.tabId || !data.model || !Number.isFinite(Number(data.proofAt))) {
+        return;
+      }
+      useWorkspaceStore.getState().updateCodexState(data.tabId, {
+        codexModel: data.model,
+        ...(data.effort ? { codexEffort: data.effort } : {}),
+        codexSettingsProofAt: Number(data.proofAt),
+        // Explicit undefined is important here: before the first rollout the
+        // saved resume source is not proof-owner for the new live process.
+        codexSettingsProofSessionId: data.proofSessionId || undefined,
+        codexModelMigrationPending: false,
+        codexModelMigrationRestoreDefaultModel: false,
+        codexModelMigrationRestoreDefaultEffort: false,
+        codexModelMigrationSourceModel: undefined,
+        codexModelMigrationSourceEffort: undefined,
+        codexModelMigrationTargetModel: undefined,
+        codexModelMigrationConfigPath: undefined,
+        codexModelMigrationConfigFingerprint: undefined,
+        codexModelMigrationConfigAlreadyTarget: undefined,
+      });
+      syncDefaultCodexSettingsMirror({
+        ...(data.updateDefaultModel === true ? { model: data.model } : {}),
+        ...(data.updateDefaultEffort === true && data.effort ? { effort: data.effort } : {}),
+        ...(data.updateDefaultModel === true
+          ? { expectedModel: data.expectedDefaultModel || 'none' }
+          : {}),
+        ...(data.updateDefaultEffort === true && data.effort
+          ? { expectedEffort: data.expectedDefaultEffort || 'none' }
+          : {}),
+      });
+      console.warn('[CodexModelMigration:R] settings applied tab='
+        + String(data.tabId).slice(-12)
+        + ' launch=' + (data.launchId || '-')
+        + ' model=' + data.model
+        + ' effort=' + (data.effort || 'unchanged')
+        + ' owner=' + (data.proofSessionId ? data.proofSessionId.slice(0, 8) : 'pending-writer'));
+    };
+
     ipcRenderer.on('terminal:mcp-restart', handleMcpRestart);
     ipcRenderer.on('terminal:mcp-create', handleMcpCreate);
     ipcRenderer.on('terminal:mcp-ai-tab', handleMcpAiTab);
+    ipcRenderer.on('codex:model-migration-settings-pending', handleCodexModelMigrationPending);
+    ipcRenderer.on('codex:model-migration-settings-applied', handleCodexModelMigrationApplied);
 
     // Mobile-web bridge: main process asks renderer to perform UI-state actions
     // (create SDK tab, send message via the renderer's selected model/effort,
@@ -2215,31 +2383,40 @@ function App() {
           for (const ws of state.openProjects.values()) {
             const t = ws.tabs.get(tabId);
             if (!t) continue;
-            // PTY+Claude: derive model from bridgeMetadata (live), effort from
-            // the live _effortSentForTab sentinel (see below — single truth for
-            // what /effort this process is actually on).
+            // PTY+Claude: current-session model/effort come from the same
+            // confirmed active JSONL branch as the desktop ControlBar. The
+            // renderer sentinels are only dedupe locks and miss manual terminal
+            // commands; StatusBar defaults describe future launches, not this
+            // conversation.
             // Thinking is always "adaptive" on PTY — controlled by claude:toggle-thinking,
             // not surfaced as a separate param in the mobile UI here.
             if (t.commandType === 'claude' && t.tabType !== 'claude-sdk') {
               let model = 'default';
+              let confirmedEffort: string | null = null;
+              try {
+                const confirmed = await ipcRenderer.invoke('claude:get-confirmed-settings', {
+                  tabId,
+                  sessionId: t.claudeSessionId,
+                  cwd: t.cwd,
+                });
+                if (
+                  confirmed?.success === true
+                  && confirmed.sessionId === t.claudeSessionId
+                ) {
+                  if (confirmed.model) model = confirmed.model;
+                  confirmedEffort = confirmed.effort || null;
+                }
+              } catch {}
               try {
                 const meta = await ipcRenderer.invoke('claude:get-bridge-metadata', tabId);
                 const rawModel = (meta?.model || '').toLowerCase();
-                if (rawModel.includes('1m')) model = 'default';
-                else if (rawModel.includes('opus')) model = 'opus';
-                else if (rawModel.includes('sonnet')) model = 'sonnet';
-                else if (rawModel.includes('haiku')) model = 'haiku';
+                if (!model || model === 'default') {
+                  if (rawModel.includes('1m')) model = 'default';
+                  else if (rawModel.includes('opus')) model = 'opus';
+                  else if (rawModel.includes('sonnet')) model = 'sonnet';
+                  else if (rawModel.includes('haiku')) model = 'haiku';
+                }
               } catch {}
-              // Effort = same "invisible intent" as desktop ControlBar: the only
-              // truth is what `/effort` we actually injected into THIS live Claude
-              // process. That lives in the `_effortSentForTab` sentinel (set on
-              // tui-ready / bridge-fresh / manual-click, cleared when Claude dies).
-              // Absent → process never got an effort inject (e.g. effort=none) or
-              // it died → report '?' so mobile shows a question mark instead of a
-              // confident-but-wrong 'high'. Do NOT seed from defaultClaudeEffort:
-              // that's the app default, not what this process is on.
-              const sentinel = (window as any).__effortSentForTab as Map<string, { level?: string }> | undefined;
-              const liveEffort = sentinel?.get(tabId)?.level;
               // Think state: same invisible-intent model. Tracked in a shared
               // window map written by the desktop ControlBar's toggleThink AND
               // mobile setSDKParams below. Default ON (Claude boots with
@@ -2265,7 +2442,7 @@ function App() {
               return reply(true, {
                 tabId,
                 model,
-                effort: liveEffort || '?',
+                effort: confirmedEffort || '?',
                 thinking: thinkOn ? 'adaptive' : 'disabled',
                 contextPct,
               });
@@ -2281,10 +2458,18 @@ function App() {
               const ui = useUIStore.getState();
               const defaultModel = cleanDefaultSetting(ui.defaultCodexModel) || DEFAULT_CODEX_MODEL;
               const defaultEffort = cleanDefaultSetting(ui.defaultCodexEffort) || DEFAULT_CODEX_EFFORT;
+              const effective = resolveCodexEffectiveSettings({
+                codexSessionId: t.codexSessionId,
+                codexModel: t.codexModel || defaultModel,
+                codexEffort: t.codexEffort || defaultEffort,
+                codexLiveModel: t.codexLiveModel,
+                codexLiveEffort: t.codexLiveEffort,
+                codexLiveSettingsSessionId: t.codexLiveSettingsSessionId,
+              });
               return reply(true, {
                 tabId,
-                model: t.codexModel || defaultModel,
-                effort: t.codexEffort || defaultEffort,
+                model: effective.model || defaultModel,
+                effort: effective.effort || defaultEffort,
                 thinking: 'disabled',
                 contextPct,
               });
@@ -2373,16 +2558,44 @@ function App() {
           if (tab.commandType === 'claude' && tab.tabType !== 'claude-sdk') {
             if (model !== undefined) {
               const modelSentinel = (window as any).__modelSentForTab as Map<string, { at: number; via: string; model: string }> | undefined;
+              const previousModelSentinel = modelSentinel?.get(tabId);
               if (modelSentinel) modelSentinel.set(tabId, { at: Date.now(), via: 'mobile-click', model });
-              try { await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model); } catch {}
+              try {
+                await applyClaudePtySetting({
+                  tabId,
+                  kind: 'model',
+                  value: model,
+                  source: 'mobile:set-model',
+                });
+              } catch (error: any) {
+                if (modelSentinel) {
+                  if (previousModelSentinel) modelSentinel.set(tabId, previousModelSentinel);
+                  else modelSentinel.delete(tabId);
+                }
+                return reply(false, null, 'Claude model was not confirmed: ' + String(error?.message || error));
+              }
             }
             if (effort !== undefined) {
               // Update the cross-client sentinel so a subsequent getParams (desktop
               // ControlBar or another phone) reads the value we just applied —
               // same map the auto-inject paths write. Mirrors desktop manual-click.
               const sentinel = (window as any).__effortSentForTab as Map<string, { at: number; via: string; level: string }> | undefined;
+              const previousEffortSentinel = sentinel?.get(tabId);
               if (sentinel) sentinel.set(tabId, { at: Date.now(), via: 'mobile-click', level: effort });
-              try { await ipcRenderer.invoke('claude:send-command', tabId, '/effort ' + effort); } catch {}
+              try {
+                await applyClaudePtySetting({
+                  tabId,
+                  kind: 'effort',
+                  value: effort,
+                  source: 'mobile:set-effort',
+                });
+              } catch (error: any) {
+                if (sentinel) {
+                  if (previousEffortSentinel) sentinel.set(tabId, previousEffortSentinel);
+                  else sentinel.delete(tabId);
+                }
+                return reply(false, null, 'Claude effort was not confirmed: ' + String(error?.message || error));
+              }
             }
             // Think toggle for PTY: claude:toggle-thinking FLIPS the meta+t
             // picker and returns the new absolute state. We only fire it when the
@@ -2408,27 +2621,68 @@ function App() {
             const ui = useUIStore.getState();
             const defaultModel = cleanDefaultSetting(ui.defaultCodexModel) || DEFAULT_CODEX_MODEL;
             const defaultEffort = cleanDefaultSetting(ui.defaultCodexEffort) || DEFAULT_CODEX_EFFORT;
-            const currentModel = tab.codexModel || defaultModel;
-            const currentEffort = tab.codexEffort || defaultEffort;
-            const requestedModel = model !== undefined ? model : currentModel;
-            const requestedEffort = effort !== undefined ? effort : currentEffort;
-            const futurePatch: any = {};
-            if (model !== undefined) futurePatch.codexModel = requestedModel;
-            if (effort !== undefined) futurePatch.codexEffort = requestedEffort;
 
-            const turnState = await ipcRenderer.invoke('codex:get-turn-state', tabId).catch(() => null);
-            const processInfo = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId).catch(() => null);
-            const processText = `${processInfo?.processName || ''} ${processInfo?.command || ''}`;
-            const hasLiveCodexProcess = processInfo?.hasProcess === true && /(\bcodex\b|@openai\/codex)/i.test(processText);
-            const hasLiveWatcher = turnState?.hasWatcher === true || hasLiveCodexProcess;
-
-            // Codex permits `/model` while a turn is streaming. The picker still
-            // waits for its terminal-confirmed result; an effort-only change is
-            // intentionally kept for the idle state.
-            if (turnState?.busy === true && model === undefined) {
-              return reply(false, null, 'codex effort cannot change while a turn is streaming');
+            const runtimeSnapshot = await ipcRenderer.invoke('codex:get-runtime-session', { tabId })
+              .catch((error: any) => {
+                console.warn('[MobileBridge] codex-set-params runtime owner lookup failed tab='
+                  + String(tabId).slice(-12)
+                  + ': ' + (error?.message || String(error)));
+                return null;
+              });
+            const {
+              runtimeState: codexRuntimeState,
+              activeWriterSessionId,
+            } = resolveCodexSettingsRuntimeProof(runtimeSnapshot);
+            // Unknown process state is not proof that Codex stopped. Keep it on
+            // the live/fail-closed path so a transient lookup failure cannot turn
+            // a partial request into future config for the wrong conversation.
+            const shouldUseLivePicker = codexRuntimeState !== 'stopped';
+            const effectiveSettings = resolveCodexEffectiveSettings({
+              codexSessionId: tab.codexSessionId,
+              codexModel: cleanDefaultSetting(tab.codexModel)
+                || (codexRuntimeState === 'stopped' ? defaultModel : undefined),
+              codexEffort: cleanDefaultSetting(tab.codexEffort)
+                || (codexRuntimeState === 'stopped' ? defaultEffort : undefined),
+              codexLiveModel: tab.codexLiveModel,
+              codexLiveEffort: tab.codexLiveEffort,
+              codexLiveSettingsSessionId: tab.codexLiveSettingsSessionId,
+            });
+            const currentModel = effectiveSettings.model;
+            const currentEffort = effectiveSettings.effort;
+            const settingsPlan = planCodexHistorySettings({
+              requestedModel: model,
+              requestedEffort: effort,
+              currentModel,
+              currentEffort,
+              currentProofSessionId: effectiveSettings.liveOwned
+                ? tab.codexLiveSettingsSessionId
+                : tab.codexSettingsProofSessionId,
+              runtimeSnapshot,
+              statusAtSend: runtimeSnapshot?.busy === true ? 'busy' : 'active',
+              queue: false,
+            });
+            if (settingsPlan.blocked) {
+              const error = settingsPlan.code === 'codex_settings_change_requires_idle'
+                ? 'Codex model/effort cannot change while a turn is busy'
+                : settingsPlan.error;
+              return reply(false, { code: settingsPlan.code }, error);
             }
-            if (hasLiveWatcher) {
+            const requestedModel = settingsPlan.model;
+            const requestedEffort = settingsPlan.effort;
+
+            // `thinking` is not a Codex PTY setting. Do not reopen `/model`
+            // merely because a generic client sent that field alone.
+            if (!settingsPlan.hasRequestedSettings) {
+              return reply(true, {
+                tabId,
+                model: currentModel || '?',
+                effort: currentEffort || '?',
+                thinking: 'disabled',
+                applied: false,
+              });
+            }
+
+            if (shouldUseLivePicker) {
               const draftState = await ipcRenderer.invoke('codex:get-draft-state', tabId, {
                 reason: 'mobile-codex-set-params',
                 timeoutMs: 700,
@@ -2444,6 +2698,13 @@ function App() {
                 tabId,
                 model: requestedModel,
                 effort: requestedEffort,
+                expectedWriterSessionId: isCompleteCodexSettingsRequest({
+                  requestedModel: model,
+                  requestedEffort: effort,
+                })
+                  ? undefined
+                  : activeWriterSessionId,
+                allowTurnBusy: false,
                 hasDraft: draftState.hasDraft,
                 draftSource: 'mobile:' + draftState.source,
                 draftPreview: draftState.preview,
@@ -2452,31 +2713,67 @@ function App() {
                 visualPreview: draftState.preview,
               });
               console.log('[MobileBridge] codex-set-params result tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(result || null));
-              if (!result?.success) {
+              const appliedWithProof = result?.applied === true
+                && !!(result?.applicationProofSource || result?.configProofSource);
+              if (!result?.success && !appliedWithProof) {
                 return reply(false, null, result?.error || 'codex picker failed');
               }
-              const appliedPatch: any = {};
-              if (model !== undefined || result.model) appliedPatch.codexModel = result.model || requestedModel;
-              if (effort !== undefined) {
-                if (!result.effortSkipped) appliedPatch.codexEffort = result.effort || requestedEffort;
-              } else if (model !== undefined && !result.effortSkipped) {
-                appliedPatch.codexEffort = result.effort || requestedEffort;
+              const appliedPlan = planCodexPickerStateApplication({
+                result,
+                requestedModel,
+                requestedEffort,
+                liveSessionId: result?.codexSettingsProofSessionId
+                  || activeWriterSessionId
+                  || tab.codexSessionId,
+                currentPersistentModel: tab.codexModel,
+                currentPersistentEffort: tab.codexEffort,
+              });
+              if (!appliedPlan.allowed) {
+                return reply(false, {
+                  code: appliedPlan.code,
+                }, 'Codex did not prove which live session owns these settings');
               }
-              if (Object.keys(appliedPatch).length > 0) state.updateCodexState(tabId, appliedPatch);
+              if (Object.keys(appliedPlan.persistentPatch || {}).length > 0) {
+                state.updateCodexState(tabId, appliedPlan.persistentPatch);
+              }
+              state.updateCodexLiveState(tabId, appliedPlan.livePatch);
+              if (!result?.success) {
+                return reply(false, {
+                  tabId,
+                  model: appliedPlan.model ?? currentModel,
+                  effort: appliedPlan.effort ?? currentEffort,
+                  thinking: 'disabled',
+                  applied: true,
+                }, result?.error || 'Codex settings changed, but the input text could not be restored');
+              }
               return reply(true, {
                 tabId,
-                model: appliedPatch.codexModel ?? currentModel,
-                effort: appliedPatch.codexEffort ?? currentEffort,
+                model: appliedPlan.model ?? currentModel,
+                effort: appliedPlan.effort ?? currentEffort,
                 thinking: 'disabled',
                 applied: true,
               });
             }
 
-            if (Object.keys(futurePatch).length > 0) state.updateCodexState(tabId, futurePatch);
+            // No live process: persist the complete pair for the next launch.
+            // A later global-default edit must not silently change the inherited
+            // half of this explicit per-tab choice.
+            if (requestedEffort === 'ultra') {
+              return reply(
+                false,
+                { code: 'codex_ultra_requires_live_conversation' },
+                'Codex Ultra can only be applied to a running conversation',
+              );
+            }
+            const futurePatch = {
+              codexModel: requestedModel,
+              codexEffort: requestedEffort,
+            };
+            state.updateCodexState(tabId, futurePatch);
             return reply(true, {
               tabId,
-              model: futurePatch.codexModel ?? currentModel,
-              effort: futurePatch.codexEffort ?? currentEffort,
+              model: futurePatch.codexModel,
+              effort: futurePatch.codexEffort,
               thinking: 'disabled',
               applied: false,
             });
@@ -2770,7 +3067,7 @@ function App() {
           return reply(true, { tabId, name: tab?.name, cwd: tab?.cwd, projectId });
         }
         if (action === 'createAgentTab') {
-          const { projectId, toolType, name, externalRun, codexDeveloperInstructions, codexModel, codexEffort, startNow } = payload || {};
+          const { projectId, toolType, name, externalRun, codexDeveloperInstructions, codexModel, codexEffort, startNow, background } = payload || {};
           if (!projectId) return reply(false, null, 'projectId required');
           const agent: AgentHistoryTool = toolType === 'codex' ? 'codex' : 'claude';
           const ws = await ensureProjectWorkspace(projectId);
@@ -2791,6 +3088,7 @@ function App() {
             codexModel: typeof codexModel === 'string' ? codexModel : undefined,
             codexEffort: typeof codexEffort === 'string' ? codexEffort : undefined,
             externalRun: externalRun && typeof externalRun === 'object' ? externalRun : undefined,
+            background: background === true,
           } as any);
           const tab = ws.tabs.get(tabId);
           let launchAccepted: any = null;
@@ -2810,7 +3108,12 @@ function App() {
               }
               launchAccepted = runResult;
             } else {
-              ipcRenderer.send('claude:run-command', { tabId, command: 'claude' });
+              const runResult = await ipcRenderer.invoke('claude:run-command', { tabId, command: 'claude' })
+                .catch((err: any) => ({ success: false, accepted: false, error: String(err?.message || err) }));
+              if (runResult?.success === false || runResult?.accepted === false) {
+                await state.closeTab(projectId, tabId, { skipProcessCheck: true, forceCleanup: true, archive: false } as any).catch(() => false);
+                return reply(false, null, runResult?.error || runResult?.reason || 'Claude start failed');
+              }
               launchAccepted = await waitForAgentLaunchAccepted(tabId, 'claude');
               if (!launchAccepted?.accepted) {
                 await state.closeTab(projectId, tabId, { skipProcessCheck: true, forceCleanup: true, archive: false } as any).catch(() => false);
@@ -2983,7 +3286,11 @@ function App() {
               }
               launchAccepted = runResult;
             } else {
-              ipcRenderer.send('claude:run-command', { tabId, command: 'claude' });
+              const runResult = await ipcRenderer.invoke('claude:run-command', { tabId, command: 'claude' })
+                .catch((err: any) => ({ success: false, accepted: false, error: String(err?.message || err) }));
+              if (runResult?.success === false || runResult?.accepted === false) {
+                return reply(false, null, runResult?.error || runResult?.reason || 'Claude start failed');
+              }
               launchAccepted = await waitForAgentLaunchAccepted(tabId, 'claude');
               if (!launchAccepted?.accepted) {
                 return reply(false, null, launchAccepted?.error || launchAccepted?.reason || 'Claude start failed');
@@ -3551,6 +3858,8 @@ function App() {
       ipcRenderer.removeListener('terminal:mcp-restart', handleMcpRestart);
       ipcRenderer.removeListener('terminal:mcp-create', handleMcpCreate);
       ipcRenderer.removeListener('terminal:mcp-ai-tab', handleMcpAiTab);
+      ipcRenderer.removeListener('codex:model-migration-settings-pending', handleCodexModelMigrationPending);
+      ipcRenderer.removeListener('codex:model-migration-settings-applied', handleCodexModelMigrationApplied);
       ipcRenderer.removeListener('web:bridge-request', handleWebBridge);
       ipcRenderer.removeListener('terminal:command-started', handleCommandStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleCommandFinished);
@@ -3626,7 +3935,6 @@ function App() {
             const startOne = async (item: { tabId: string; sessionId: string; engine: 'claude' | 'codex'; cwd?: string }) => {
               const { tabId, sessionId, engine, cwd } = item;
               try {
-                s.clearInterruptedState(tabId);
                 s.setTabCommandType(tabId, engine);
                 if (engine === 'codex') {
                   const runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
@@ -3641,6 +3949,7 @@ function App() {
                       + ' error=' + (runResult?.error || runResult?.reason || 'unknown'));
                     return { ok: false, item, error: runResult?.error || runResult?.reason || 'Codex start failed' };
                   }
+                  s.clearInterruptedState(tabId);
                   console.warn('[AutoResume] Resumed codex pending=' + (runResult?.acceptancePending === true), tabId, sessionId.substring(0, 8));
                   return { ok: true, item };
                 }
@@ -3675,11 +3984,21 @@ function App() {
                 // ahead of the real resume would stomp this tab. The flag stops
                 // exactly that race. See utils/pendingResume.ts.
                 markPendingResume(tabId, sessionId);
-                ipcRenderer.send('terminal:input', tabId, 'claude --dangerously-skip-permissions --resume ' + sessionId + '\r');
-                ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude', sessionId });
+                const runResult = await ipcRenderer.invoke('claude:run-command', {
+                  tabId,
+                  command: 'claude-c',
+                  sessionId,
+                  ...(cwd ? { cdTo: cwd } : {}),
+                });
+                if (runResult?.success === false || runResult?.accepted === false) {
+                  clearPendingResume(tabId);
+                  return { ok: false, item, error: runResult.error || runResult.reason || 'Claude start failed' };
+                }
+                s.clearInterruptedState(tabId);
                 console.warn('[AutoResume] Resumed claude', tabId, sessionId.substring(0, 8));
                 return { ok: true, item };
               } catch (e: any) {
+                if (engine === 'claude') clearPendingResume(tabId);
                 console.warn('[AutoResume] start failed tab=' + tabId.slice(-12) + ' engine=' + engine + ' error=' + (e?.message || String(e)));
                 return { ok: false, item, error: e?.message || String(e) };
               }

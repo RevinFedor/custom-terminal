@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { BookOpen } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import ActionsPanel from './panels/ActionsPanel';
+import ControlHint from '../UI/ControlHint';
 
 // 📚 Docs button — lives in the ProjectToolbar, left of the CopySessionButton
 // cluster. Click toggles a popover that contains the full `ActionsPanel embedded`
@@ -44,6 +45,7 @@ export default function DocsButton() {
 
   return (
     <>
+      <ControlHint label="Открыть действия с документацией" disabled={open} side="bottom">
       <button
         ref={triggerRef}
         onClick={() => setOpen(v => !v)}
@@ -61,6 +63,7 @@ export default function DocsButton() {
         <BookOpen size={12} />
         <span>Docs</span>
       </button>
+      </ControlHint>
 
       {open && pos && createPortal(
         <>

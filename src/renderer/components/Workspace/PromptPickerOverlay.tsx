@@ -2,6 +2,13 @@ import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallba
 import { createPortal } from 'react-dom';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
+import {
+  appendHistoryDraftInsertion,
+  buildProjectScriptRows,
+  isCurrentPickerGeneration,
+  joinPromptInsertionText,
+  resolveHistoryScriptCwd,
+} from '../../utils/promptInsertMenuModel.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -24,34 +31,107 @@ type FlatLeftItem =
   | { kind: 'group'; group: PromptGroupRow; position: number }
   | { kind: 'prompt'; prompt: PromptRow; position: number };
 
-// Same insert routing as the legacy Cmd+E menu (which is removed). Routing
-// target depends on tab type:
-//   - claude-sdk → window CustomEvent the SDK composer listens to
-//   - terminal/claude/gemini PTY → terminal:input + terminal:paste for attached files
-async function deliverPrompt(prompt: PromptRow, tabId: string, isSDKTab: boolean) {
+interface ScriptRow {
+  id: string;
+  label: string;
+  text: string;
+}
+
+type InsertTarget =
+  | { surface: 'history'; tabId: string }
+  | { surface: 'sdk'; tabId: string }
+  | { surface: 'terminal'; tabId: string };
+
+interface HistoryInsertMenuRequest {
+  tabId: string;
+  cwd: string;
+  x: number;
+  y: number;
+  requestId: number;
+}
+
+function isVisibleElement(element: Element | null): element is HTMLElement {
+  if (!(element instanceof HTMLElement)) return false;
+  const rect = element.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return false;
+  const style = window.getComputedStyle(element);
+  return style.display !== 'none' && style.visibility !== 'hidden';
+}
+
+function findVisibleHistoryComposer(tabId: string): HTMLElement | null {
+  const candidates = Array.from(document.querySelectorAll('[data-history-composer-tab-id]'));
+  return candidates.find((candidate) => (
+    candidate.getAttribute('data-history-composer-tab-id') === tabId
+    && isVisibleElement(candidate)
+  )) as HTMLElement | undefined || null;
+}
+
+async function readPromptFileContents(filePaths: string[] | undefined): Promise<string[]> {
+  if (!filePaths || filePaths.length === 0) return [];
+  try {
+    const filesResult = await ipcRenderer.invoke('ai-prompts:read-files', filePaths);
+    if (filesResult?.success && Array.isArray(filesResult.data)) {
+      return filesResult.data.map((file: any) => String(file?.content || ''));
+    }
+  } catch (err) {
+    console.warn('[PromptPicker] ai-prompts:read-files failed:', err);
+  }
+  return [];
+}
+
+function dispatchHistoryComposerInsert(tabId: string, text: string, source: string) {
+  if (!text) return;
+  const event = new CustomEvent('history-panel:composer-insert', {
+    detail: { tabId, text, source },
+    cancelable: true,
+  });
+  const handledByMountedComposer = !window.dispatchEvent(event);
+  if (handledByMountedComposer) return;
+
+  const store = useUIStore.getState();
+  const current = store.historyPromptDrafts[tabId] || '';
+  store.setHistoryPromptDraft(
+    tabId,
+    appendHistoryDraftInsertion(current, text),
+    { preserveImages: true },
+  );
+}
+
+// One delivery contract for the shortcut picker and History's context picker.
+// Context-menu requests pass a captured target; normal Opt+V captures its
+// effective target when the picker opens. Selection never re-reads active tab.
+async function deliverPrompt(prompt: PromptRow, target: InsertTarget) {
   const text = prompt.content || '';
   if (!text && (!prompt.file_paths || prompt.file_paths.length === 0)) return;
 
-  if (isSDKTab) {
+  if (target.surface === 'history') {
+    const fileContents = await readPromptFileContents(prompt.file_paths);
+    dispatchHistoryComposerInsert(
+      target.tabId,
+      joinPromptInsertionText(text, fileContents),
+      'prompt-picker',
+    );
+    return;
+  }
+
+  if (target.surface === 'sdk') {
     if (text) {
       window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', {
-        detail: { tabId, text },
+        detail: { tabId: target.tabId, text },
       }));
     }
     return;
   }
 
-  if (text) ipcRenderer.send('terminal:input', tabId, text);
+  if (text) ipcRenderer.send('terminal:input', target.tabId, text);
   if (prompt.file_paths && prompt.file_paths.length > 0) {
-    try {
-      const filesResult = await ipcRenderer.invoke('ai-prompts:read-files', prompt.file_paths);
-      if (filesResult?.success && Array.isArray(filesResult.data)) {
-        for (const f of filesResult.data) {
-          await ipcRenderer.invoke('terminal:paste', { tabId, content: f.content, submit: false });
-        }
-      }
-    } catch (err) {
-      console.warn('[PromptPicker] ai-prompts:read-files failed:', err);
+    const fileContents = await readPromptFileContents(prompt.file_paths);
+    for (const content of fileContents) {
+      await ipcRenderer.invoke('terminal:paste', {
+        tabId: target.tabId,
+        content,
+        submit: false,
+      });
     }
   }
 }
@@ -139,7 +219,7 @@ function getSDKCaretViewportRect(ta: HTMLTextAreaElement): { left: number; top: 
 }
 
 const PromptPickerOverlay: React.FC = () => {
-  const open = useUIStore((s) => s.promptPickerOpen);
+  const shortcutOpen = useUIStore((s) => s.promptPickerOpen);
   const setOpen = useUIStore((s) => s.setPromptPickerOpen);
   const showToast = useUIStore((s) => s.showToast);
   const fontSize = useUIStore((s) => s.promptPickerFontSize);
@@ -148,18 +228,75 @@ const PromptPickerOverlay: React.FC = () => {
   const rightOffsetPx = useUIStore((s) => s.promptPickerRightOffsetPx);
 
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const rootPanelRef = useRef<HTMLDivElement | null>(null);
   const leftPanelRef = useRef<HTMLDivElement | null>(null);
   const rightPanelRef = useRef<HTMLDivElement | null>(null);
+  const requestSeqRef = useRef(0);
+  const activePickerGenerationRef = useRef(0);
 
   const [groups, setGroups] = useState<PromptGroupRow[]>([]);
   const [prompts, setPrompts] = useState<PromptRow[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [contextRequest, setContextRequest] = useState<HistoryInsertMenuRequest | null>(null);
+  const [shortcutTarget, setShortcutTarget] = useState<InsertTarget | null>(null);
+  const [scripts, setScripts] = useState<ScriptRow[]>([]);
+  const [scriptsLoaded, setScriptsLoaded] = useState(false);
+  const open = shortcutOpen || contextRequest !== null;
+  const contextMode = contextRequest !== null;
 
   // selectedKey: 'group:<id>' or 'ungrouped:<idx>'.
-  // pickerLevel='group' — focus on left list; 'prompt' — focus on right list.
+  // Context mode adds one root level in front of the existing prompt library.
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
-  const [pickerLevel, setPickerLevel] = useState<'group' | 'prompt'>('group');
+  const [pickerLevel, setPickerLevel] = useState<'root' | 'group' | 'prompt' | 'scripts'>('group');
   const [selectedPromptIdx, setSelectedPromptIdx] = useState(0);
+  const [selectedRoot, setSelectedRoot] = useState<'prompts' | 'scripts'>('prompts');
+  const [selectedScriptIdx, setSelectedScriptIdx] = useState(0);
+
+  // History owns the right-click coordinates and target. Capturing both here
+  // prevents a native/user delay from redirecting insertion after a tab switch.
+  useEffect(() => {
+    const onOpenHistoryMenu = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        tabId?: string;
+        cwd?: string;
+        x?: number;
+        y?: number;
+      }>).detail || {};
+      if (
+        typeof detail.tabId !== 'string'
+        || !detail.tabId
+        || typeof detail.x !== 'number'
+        || typeof detail.y !== 'number'
+      ) return;
+
+      const requestId = ++requestSeqRef.current;
+      activePickerGenerationRef.current = requestId;
+      setOpen(false);
+      setContextRequest({
+        tabId: detail.tabId,
+        cwd: typeof detail.cwd === 'string' ? detail.cwd : '',
+        x: detail.x,
+        y: detail.y,
+        requestId,
+      });
+      setSelectedKey(null);
+      setSelectedRoot('prompts');
+      setPickerLevel('root');
+      setSelectedPromptIdx(0);
+      setSelectedScriptIdx(0);
+    };
+    window.addEventListener('history-panel:open-insert-menu', onOpenHistoryMenu);
+    return () => window.removeEventListener('history-panel:open-insert-menu', onOpenHistoryMenu);
+  }, [setOpen]);
+
+  // Opt+V replaces an open context picker rather than letting two input
+  // surfaces remain armed at once.
+  useEffect(() => {
+    if (shortcutOpen && contextRequest) {
+      activePickerGenerationRef.current = ++requestSeqRef.current;
+      setContextRequest(null);
+    }
+  }, [contextRequest, shortcutOpen]);
 
   // Anchor strategies:
   //   sdk-caret  — SDK composer is the active tab; pin to caret pixel position
@@ -170,12 +307,14 @@ const PromptPickerOverlay: React.FC = () => {
   //                user-controlled offset (Settings → "Picker — отступ снизу").
   type Anchor =
     | { mode: 'sdk-caret'; x: number; y: number; lineH: number }
-    | { mode: 'bottom-center' };
+    | { mode: 'bottom-center' }
+    | { mode: 'point'; x: number; y: number };
   const [anchor, setAnchor] = useState<Anchor>({ mode: 'bottom-center' });
 
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
+    setLoaded(false);
     (async () => {
       try {
         const [pr, gr] = await Promise.all([
@@ -196,7 +335,41 @@ const PromptPickerOverlay: React.FC = () => {
       }
     })();
     return () => { cancelled = true; };
-  }, [open]);
+  }, [open, contextRequest?.requestId]);
+
+  useEffect(() => {
+    if (!contextRequest) {
+      setScripts([]);
+      setScriptsLoaded(false);
+      return;
+    }
+    let cancelled = false;
+    setScripts([]);
+    setScriptsLoaded(false);
+    (async () => {
+      const liveCwd = await ipcRenderer
+        .invoke('terminal:getCwd', contextRequest.tabId)
+        .catch(() => null);
+      if (cancelled) return;
+      const cwd = resolveHistoryScriptCwd(liveCwd, contextRequest.cwd);
+      if (!cwd) {
+        if (!cancelled) setScriptsLoaded(true);
+        return;
+      }
+      const [packageResult, shellResult] = await Promise.all([
+        ipcRenderer.invoke('file:read', `${cwd.replace(/\/+$/, '')}/package.json`).catch(() => null),
+        ipcRenderer.invoke('file:list-sh-scripts', cwd).catch(() => null),
+      ]);
+      if (cancelled) return;
+      const packageContent = packageResult?.success ? String(packageResult.content || '') : '';
+      const shellFiles = shellResult?.success && Array.isArray(shellResult.files)
+        ? shellResult.files
+        : [];
+      setScripts(buildProjectScriptRows(packageContent, shellFiles));
+      setScriptsLoaded(true);
+    })();
+    return () => { cancelled = true; };
+  }, [contextRequest]);
 
   const flatLeft = useMemo<FlatLeftItem[]>(() => {
     const items: FlatLeftItem[] = [];
@@ -210,35 +383,74 @@ const PromptPickerOverlay: React.FC = () => {
 
   useEffect(() => {
     if (!open || !loaded) return;
-    if (flatLeft.length === 0) return;
-    const first = flatLeft[0];
-    const key = first.kind === 'group' ? `group:${first.group.id}` : `ungrouped:0`;
-    setSelectedKey(key);
-    setPickerLevel('group');
-    setSelectedPromptIdx(0);
+    setSelectedKey((current) => {
+      if (current?.startsWith('group:')) {
+        const groupId = current.slice('group:'.length);
+        if (flatLeft.some((item) => item.kind === 'group' && String(item.group.id) === groupId)) {
+          return current;
+        }
+      } else if (current?.startsWith('ungrouped:')) {
+        const index = Number.parseInt(current.slice('ungrouped:'.length), 10);
+        const ungrouped = flatLeft.filter((item) => item.kind === 'prompt');
+        if (Number.isInteger(index) && index >= 0 && index < ungrouped.length) return current;
+      }
+      const first = flatLeft[0];
+      if (!first) return null;
+      return first.kind === 'group' ? `group:${first.group.id}` : 'ungrouped:0';
+    });
   }, [open, loaded, flatLeft]);
 
-  const resolveTarget = useCallback((): { tabId: string; isSDK: boolean } | null => {
+  const resolveTarget = useCallback((): InsertTarget | null => {
     const state = useWorkspaceStore.getState();
     const effectiveId = state.getEffectiveTabId();
     if (!effectiveId) return null;
+    if (findVisibleHistoryComposer(effectiveId)) {
+      return { tabId: effectiveId, surface: 'history' };
+    }
     for (const [, ws] of state.openProjects) {
       const tab = ws.tabs.get(effectiveId);
       if (tab) {
-        return { tabId: effectiveId, isSDK: tab.tabType === 'claude-sdk' };
+        return {
+          tabId: effectiveId,
+          surface: tab.tabType === 'claude-sdk' ? 'sdk' : 'terminal',
+        };
       }
     }
-    return { tabId: effectiveId, isSDK: false };
+    return { tabId: effectiveId, surface: 'terminal' };
   }, []);
 
-  // Decide anchor each time picker opens. Only two real branches now:
-  //   1) SDK tab + textarea DOM reachable + caret measurable → caret-anchor.
-  //   2) Anything else → fixed bottom-center with user-configured offset.
+  // Capture Opt+V target once per opening. Context mode already captured its
+  // target in the event payload and never calls this resolver.
+  useLayoutEffect(() => {
+    if (!shortcutOpen || contextMode) return;
+    const generation = ++requestSeqRef.current;
+    activePickerGenerationRef.current = generation;
+    setShortcutTarget(resolveTarget());
+    setSelectedKey(null);
+    setSelectedRoot('prompts');
+    setPickerLevel('group');
+    setSelectedPromptIdx(0);
+    setSelectedScriptIdx(0);
+    return () => {
+      if (activePickerGenerationRef.current === generation) {
+        activePickerGenerationRef.current = 0;
+      }
+    };
+  }, [contextMode, resolveTarget, shortcutOpen]);
+
+  // Decide anchor each time picker opens:
+  //   1) History context request → exact pointer coordinates.
+  //   2) SDK tab + textarea DOM reachable + caret measurable → caret-anchor.
+  //   3) Anything else → fixed bottom-center with user-configured offset.
   // Decision is made ONCE on open so arrow-nav doesn't drift the picker.
   useEffect(() => {
     if (!open) return;
-    const target = resolveTarget();
-    if (target?.isSDK) {
+    if (contextRequest) {
+      setAnchor({ mode: 'point', x: contextRequest.x, y: contextRequest.y });
+      return;
+    }
+    const target = shortcutTarget || resolveTarget();
+    if (target?.surface === 'sdk') {
       const ta = findSDKTextarea();
       if (ta) {
         const c = getSDKCaretViewportRect(ta);
@@ -249,24 +461,43 @@ const PromptPickerOverlay: React.FC = () => {
       }
     }
     setAnchor({ mode: 'bottom-center' });
-  }, [open, resolveTarget]);
+  }, [contextRequest, open, resolveTarget, shortcutTarget]);
 
-  const closePicker = useCallback(() => {
-    setOpen(false);
+  const closePicker = useCallback((expectedGeneration?: number) => {
+    if (
+      expectedGeneration !== undefined
+      && !isCurrentPickerGeneration(expectedGeneration, activePickerGenerationRef.current)
+    ) return false;
+
+    const closeSequence = ++requestSeqRef.current;
+    activePickerGenerationRef.current = 0;
+    const target: InsertTarget | null = contextRequest
+      ? { surface: 'history', tabId: contextRequest.tabId }
+      : shortcutTarget;
+    if (contextRequest) setContextRequest(null);
+    else setOpen(false);
     setSelectedKey(null);
     setPickerLevel('group');
     setSelectedPromptIdx(0);
-    // Restore focus to the active terminal / SDK composer. Without this,
-    // DOM focus is left on <body> after the picker closes — a row click blurs
-    // the xterm textarea, and Esc/click-outside never put it back — so the
-    // Claude TUI loses its cursor and the user has to click the terminal again.
-    // Reuse the existing refocus bus (Terminal.tsx + SDKComposer already listen;
-    // see fact-cmd-tab-refocus.md). Fire on the next frame so the portal has
-    // unmounted and any SDK composer-insert has run before we grab focus.
+    setSelectedScriptIdx(0);
+    setShortcutTarget(null);
+    // History and a floating xterm can both exist for one tab. The generic
+    // refocus bus would let the xterm steal focus immediately after History
+    // insertion, so History gets its explicit composer event.
     requestAnimationFrame(() => {
-      try { window.dispatchEvent(new CustomEvent('nt:window-refocus-active')); } catch {}
+      if (requestSeqRef.current !== closeSequence) return;
+      try {
+        if (target?.surface === 'history') {
+          window.dispatchEvent(new CustomEvent('history-panel:focus-composer', {
+            detail: { tabId: target.tabId },
+          }));
+        } else {
+          window.dispatchEvent(new CustomEvent('nt:window-refocus-active'));
+        }
+      } catch {}
     });
-  }, [setOpen]);
+    return true;
+  }, [contextRequest, setOpen, shortcutTarget]);
 
   const selectedLeftItem = useMemo<FlatLeftItem | null>(() => {
     if (!selectedKey) return null;
@@ -288,7 +519,7 @@ const PromptPickerOverlay: React.FC = () => {
     return prompts.filter(p => String(p.group_id) === String(gid));
   }, [selectedLeftItem, prompts]);
 
-  // When a non-group left row is selected, snap the picker level back to 'group'
+  // When a non-group left row is selected, snap the prompt child level back.
   // (prompt-level only makes sense over the right panel).
   useEffect(() => {
     if (selectedLeftItem && selectedLeftItem.kind !== 'group' && pickerLevel === 'prompt') {
@@ -297,15 +528,25 @@ const PromptPickerOverlay: React.FC = () => {
   }, [selectedLeftItem, pickerLevel]);
 
   const handleSelectPrompt = useCallback(async (prompt: PromptRow) => {
-    const target = resolveTarget();
+    const generation = contextRequest?.requestId || activePickerGenerationRef.current;
+    const target: InsertTarget | null = contextRequest
+      ? { surface: 'history', tabId: contextRequest.tabId }
+      : shortcutTarget;
     if (!target) {
       showToast('No active tab', 'error');
       closePicker();
       return;
     }
-    await deliverPrompt(prompt, target.tabId, target.isSDK);
-    closePicker();
-  }, [resolveTarget, showToast, closePicker]);
+    await deliverPrompt(prompt, target);
+    closePicker(generation);
+  }, [closePicker, contextRequest, shortcutTarget, showToast]);
+
+  const handleSelectScript = useCallback((script: ScriptRow) => {
+    if (!contextRequest) return;
+    const generation = contextRequest.requestId;
+    dispatchHistoryComposerInsert(contextRequest.tabId, script.text, 'history-insert-menu-script');
+    closePicker(generation);
+  }, [closePicker, contextRequest]);
 
   // Keyboard nav — capture phase + stopPropagation so xterm/Claude TUI never
   // sees these keys when the picker is open. Layout-agnostic where possible
@@ -325,6 +566,43 @@ const PromptPickerOverlay: React.FC = () => {
       }
 
       if (k === 'Escape') { closePicker(); return; }
+
+      if (contextMode && pickerLevel === 'root') {
+        const moveRoot = (next: 'prompts' | 'scripts') => {
+          setSelectedRoot(next);
+          setSelectedPromptIdx(0);
+          setSelectedScriptIdx(0);
+        };
+        if (k === 'ArrowDown' || k === 'ArrowUp') {
+          moveRoot(selectedRoot === 'prompts' ? 'scripts' : 'prompts');
+          return;
+        }
+        if (k === 'ArrowLeft') { closePicker(); return; }
+        if (k === 'ArrowRight' || k === 'Enter') {
+          setPickerLevel(selectedRoot === 'prompts' ? 'group' : 'scripts');
+          return;
+        }
+      }
+
+      if (pickerLevel === 'scripts') {
+        if (k === 'ArrowDown') {
+          if (scripts.length > 0) setSelectedScriptIdx((idx) => (idx + 1) % scripts.length);
+          return;
+        }
+        if (k === 'ArrowUp') {
+          if (scripts.length > 0) setSelectedScriptIdx((idx) => (idx - 1 + scripts.length) % scripts.length);
+          return;
+        }
+        if (k === 'ArrowLeft') {
+          setPickerLevel('root');
+          return;
+        }
+        if (k === 'ArrowRight' || k === 'Enter') {
+          const script = scripts[selectedScriptIdx];
+          if (script) handleSelectScript(script);
+          return;
+        }
+      }
 
       if (pickerLevel === 'group') {
         const currentIdx = selectedKey
@@ -364,7 +642,11 @@ const PromptPickerOverlay: React.FC = () => {
           }
           return;
         }
-        if (k === 'ArrowLeft') { closePicker(); return; }
+        if (k === 'ArrowLeft') {
+          if (contextMode) setPickerLevel('root');
+          else closePicker();
+          return;
+        }
         if (k === 'Enter') {
           if (selectedLeftItem?.kind === 'prompt') {
             void handleSelectPrompt(selectedLeftItem.prompt);
@@ -374,8 +656,7 @@ const PromptPickerOverlay: React.FC = () => {
           }
           return;
         }
-      } else {
-        // pickerLevel === 'prompt'
+      } else if (pickerLevel === 'prompt') {
         if (k === 'ArrowDown') {
           if (rightPrompts.length === 0) return;
           setSelectedPromptIdx(idx => (idx + 1) % rightPrompts.length);
@@ -397,7 +678,22 @@ const PromptPickerOverlay: React.FC = () => {
 
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [open, pickerLevel, selectedKey, flatLeft, selectedLeftItem, rightPrompts, selectedPromptIdx, closePicker, handleSelectPrompt]);
+  }, [
+    closePicker,
+    contextMode,
+    flatLeft,
+    handleSelectPrompt,
+    handleSelectScript,
+    open,
+    pickerLevel,
+    rightPrompts,
+    scripts,
+    selectedKey,
+    selectedLeftItem,
+    selectedPromptIdx,
+    selectedRoot,
+    selectedScriptIdx,
+  ]);
 
   // Click-outside to close. No visual backdrop — just a listener.
   useEffect(() => {
@@ -417,6 +713,7 @@ const PromptPickerOverlay: React.FC = () => {
   const ROW_PAD_X = Math.max(6, Math.round(fontSize * 0.66));
   const PANEL_PAD = 3;
   const GAP = 6;
+  const ROOT_W = Math.max(120, Math.round(fontSize * 12));
   const LEFT_W = Math.max(140, Math.round(fontSize * 15));
   const RIGHT_W = Math.max(160, Math.round(fontSize * 17));
   const MAX_H = 460;
@@ -435,7 +732,13 @@ const PromptPickerOverlay: React.FC = () => {
   //                 right panel would clip the viewport bottom — left column
   //                 stays put, only the secondary panel reorients.
   const [pos, setPos] = useState<{ left: number; top: number; rightFlipUp: boolean } | null>(null);
-  const estW = LEFT_W + GAP + RIGHT_W + PANEL_PAD * 2;
+  const estW = contextMode
+    ? ROOT_W + (
+      pickerLevel === 'root'
+        ? 0
+        : GAP + LEFT_W + (selectedRoot === 'prompts' ? GAP + RIGHT_W : 0)
+    ) + PANEL_PAD * 3
+    : LEFT_W + GAP + RIGHT_W + PANEL_PAD * 2;
   const estH = MAX_H;
 
   useLayoutEffect(() => {
@@ -471,6 +774,9 @@ const PromptPickerOverlay: React.FC = () => {
       // reversing direction is needed.
       left = anchor.x + 6;
       top = anchor.y + anchor.lineH + 4;
+    } else if (anchor.mode === 'point') {
+      left = anchor.x + 2;
+      top = anchor.y + 2;
     } else {
       // bottom-center fallback. Horizontal placement priority:
       //   rightOffsetPx > 0 → pin to RIGHT edge with that gap
@@ -500,7 +806,11 @@ const PromptPickerOverlay: React.FC = () => {
     // viewport bottom — switch to upward growth (bottom:0 of wrapper, aligned
     // with the BOTTOM of the left panel, expanding above it).
     let rightFlipUp = false;
-    if (rightH > 0 && selectedLeftItem?.kind === 'group') {
+    if (
+      rightH > 0
+      && selectedRoot === 'prompts'
+      && selectedLeftItem?.kind === 'group'
+    ) {
       const rightBottomIfDown = top + rightH;
       if (rightBottomIfDown + margin > vh) rightFlipUp = true;
       // Also flip if the right panel is taller than the left panel by enough
@@ -510,7 +820,22 @@ const PromptPickerOverlay: React.FC = () => {
     }
 
     setPos({ left, top, rightFlipUp });
-  }, [open, anchor, bottomOffsetPx, leftOffsetPx, rightOffsetPx, estW, estH, flatLeft.length, rightPrompts.length, selectedKey, pickerLevel, selectedLeftItem]);
+  }, [
+    anchor,
+    bottomOffsetPx,
+    estH,
+    estW,
+    flatLeft.length,
+    leftOffsetPx,
+    open,
+    pickerLevel,
+    rightOffsetPx,
+    rightPrompts.length,
+    scripts.length,
+    selectedKey,
+    selectedLeftItem,
+    selectedRoot,
+  ]);
 
   if (!open) return null;
 
@@ -524,6 +849,10 @@ const PromptPickerOverlay: React.FC = () => {
     alignItems: 'flex-start', // left panel grows from top; right is absolute
     pointerEvents: 'auto',
     fontSize,
+    opacity: pos ? 1 : 0,
+    transform: pos ? 'translateY(0) scale(1)' : 'translateY(3px) scale(0.985)',
+    transformOrigin: 'top left',
+    transition: 'opacity 90ms ease-out, transform 90ms ease-out',
   };
 
   const panelStyle: React.CSSProperties = {
@@ -575,102 +904,185 @@ const PromptPickerOverlay: React.FC = () => {
     ? { position: 'absolute', left: 0, right: 0, bottom: 0 }
     : { position: 'absolute', left: 0, right: 0, top: 0 };
 
+  const promptLibraryVisible = !contextMode
+    || (selectedRoot === 'prompts' && pickerLevel !== 'root');
+  const scriptsVisible = contextMode
+    && selectedRoot === 'scripts'
+    && pickerLevel !== 'root';
+
   return createPortal(
-    <div ref={rootRef} style={overlayStyle} data-prompt-picker>
-      {/* LEFT panel */}
-      <div ref={leftPanelRef} style={{ ...panelStyle, width: LEFT_W }}>
-        {!loaded && (
-          <div style={placeholderStyle}>Loading…</div>
-        )}
-        {loaded && flatLeft.length === 0 && (
-          <div style={placeholderStyle}>No prompts</div>
-        )}
-        {loaded && flatLeft.map((item) => {
-          if (item.kind === 'group') {
-            const key = `group:${item.group.id}`;
-            const isSelectedActive = selectedKey === key && pickerLevel === 'group';
-            const isSelectedDim = selectedKey === key && pickerLevel === 'prompt';
+    <div
+      ref={rootRef}
+      style={overlayStyle}
+      data-prompt-picker
+      data-prompt-picker-mode={contextMode ? 'history-context' : 'shortcut'}
+      data-prompt-picker-target-tab-id={contextRequest?.tabId || shortcutTarget?.tabId || ''}
+    >
+      {contextMode && (
+        <div ref={rootPanelRef} style={{ ...panelStyle, width: ROOT_W }}>
+          <div
+            onMouseEnter={() => {
+              setSelectedRoot('prompts');
+              setPickerLevel('group');
+              setSelectedPromptIdx(0);
+            }}
+            onClick={() => {
+              setSelectedRoot('prompts');
+              setPickerLevel('group');
+              setSelectedPromptIdx(0);
+            }}
+            style={rowStyle(
+              selectedRoot === 'prompts' && pickerLevel === 'root',
+              selectedRoot === 'prompts' && pickerLevel !== 'root',
+            )}
+            data-history-insert-menu-root="prompts"
+          >
+            <span>Insert Prompt</span>
+            <span style={{ opacity: 0.55, marginLeft: 8 }}>›</span>
+          </div>
+          <div
+            onMouseEnter={() => {
+              setSelectedRoot('scripts');
+              setPickerLevel('scripts');
+              setSelectedScriptIdx(0);
+            }}
+            onClick={() => {
+              setSelectedRoot('scripts');
+              setPickerLevel('scripts');
+              setSelectedScriptIdx(0);
+            }}
+            style={rowStyle(
+              selectedRoot === 'scripts' && pickerLevel === 'root',
+              selectedRoot === 'scripts' && pickerLevel !== 'root',
+            )}
+            data-history-insert-menu-root="scripts"
+          >
+            <span>Scripts</span>
+            <span style={{ opacity: 0.55, marginLeft: 8 }}>›</span>
+          </div>
+        </div>
+      )}
+
+      {promptLibraryVisible && (
+        <div ref={leftPanelRef} style={{ ...panelStyle, width: LEFT_W }}>
+          {!loaded && (
+            <div style={placeholderStyle}>Loading…</div>
+          )}
+          {loaded && flatLeft.length === 0 && (
+            <div style={placeholderStyle}>No prompts</div>
+          )}
+          {loaded && flatLeft.map((item) => {
+            if (item.kind === 'group') {
+              const key = `group:${item.group.id}`;
+              const isSelectedActive = selectedKey === key && pickerLevel === 'group';
+              const isSelectedDim = selectedKey === key && pickerLevel === 'prompt';
+              return (
+                <div
+                  key={key}
+                  onMouseEnter={() => {
+                    setSelectedKey(key);
+                    setPickerLevel('group');
+                    setSelectedPromptIdx(0);
+                  }}
+                  onClick={() => {
+                    setSelectedKey(key);
+                    const groupPrompts = prompts.filter(p => String(p.group_id) === String(item.group.id));
+                    if (groupPrompts.length > 0) {
+                      setPickerLevel('prompt');
+                      setSelectedPromptIdx(0);
+                    }
+                  }}
+                  style={rowStyle(isSelectedActive, isSelectedDim)}
+                >
+                  <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {item.group.name}
+                  </span>
+                  <span style={{ opacity: 0.55, marginLeft: 8 }}>›</span>
+                </div>
+              );
+            }
+            const ungroupedList = flatLeft.filter(x => x.kind === 'prompt');
+            const idx = ungroupedList.indexOf(item);
+            const key = `ungrouped:${idx}`;
+            const isSelected = selectedKey === key;
             return (
               <div
-                key={key}
+                key={`p-${item.prompt.id ?? idx}`}
                 onMouseEnter={() => {
                   setSelectedKey(key);
                   setPickerLevel('group');
                   setSelectedPromptIdx(0);
                 }}
-                onClick={() => {
-                  setSelectedKey(key);
-                  const groupPrompts = prompts.filter(p => String(p.group_id) === String(item.group.id));
-                  if (groupPrompts.length > 0) {
-                    setPickerLevel('prompt');
-                    setSelectedPromptIdx(0);
-                  }
-                }}
-                style={rowStyle(isSelectedActive, isSelectedDim)}
+                onClick={() => { void handleSelectPrompt(item.prompt); }}
+                style={rowStyle(isSelected)}
               >
                 <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {item.group.name}
+                  {item.prompt.title}
                 </span>
-                <span style={{ opacity: 0.55, marginLeft: 8 }}>›</span>
               </div>
             );
-          }
-          const ungroupedList = flatLeft.filter(x => x.kind === 'prompt');
-          const idx = ungroupedList.indexOf(item);
-          const key = `ungrouped:${idx}`;
-          const isSelected = selectedKey === key;
-          return (
+          })}
+        </div>
+      )}
+
+      {scriptsVisible && (
+        <div style={{ ...panelStyle, width: LEFT_W }} data-history-insert-menu-scripts>
+          {!scriptsLoaded && (
+            <div style={placeholderStyle}>Loading…</div>
+          )}
+          {scriptsLoaded && scripts.length === 0 && (
+            <div style={placeholderStyle}>No scripts</div>
+          )}
+          {scriptsLoaded && scripts.map((script, index) => (
             <div
-              key={`p-${item.prompt.id ?? idx}`}
+              key={script.id}
               onMouseEnter={() => {
-                setSelectedKey(key);
-                setPickerLevel('group');
-                setSelectedPromptIdx(0);
+                setPickerLevel('scripts');
+                setSelectedScriptIdx(index);
               }}
-              onClick={() => { void handleSelectPrompt(item.prompt); }}
-              style={rowStyle(isSelected)}
+              onClick={() => handleSelectScript(script)}
+              style={rowStyle(pickerLevel === 'scripts' && selectedScriptIdx === index)}
+              data-history-insert-menu-script={script.id}
             >
               <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                {item.prompt.title}
+                {script.label}
               </span>
             </div>
-          );
-        })}
-      </div>
+          ))}
+        </div>
+      )}
 
-      {/* RIGHT panel — wrapper reserves layout width even when no group is
-          selected (prevents left-column re-center on ↓ navigation). The inner
-          panel is absolute-positioned so it can grow either downward (top:0)
-          or upward (bottom:0) from the picker root WITHOUT forcing the root
-          height up — keeps the left panel anchored. Direction decided by the
-          rightFlipUp flag once we measure heights. */}
-      <div style={rightWrapperStyle}>
-        {selectedLeftItem?.kind === 'group' && (
-          <div ref={rightPanelRef} style={{ ...panelStyle, ...rightPanelPositionStyle }}>
-            {rightPrompts.length > 0 && rightPrompts.map((p, i) => {
-              const isSelected = pickerLevel === 'prompt' && i === selectedPromptIdx;
-              return (
-                <div
-                  key={`rp-${p.id ?? i}`}
-                  onMouseEnter={() => {
-                    setPickerLevel('prompt');
-                    setSelectedPromptIdx(i);
-                  }}
-                  onClick={() => { void handleSelectPrompt(p); }}
-                  style={rowStyle(isSelected)}
-                >
-                  <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    {p.title}
-                  </span>
-                </div>
-              );
-            })}
-            {rightPrompts.length === 0 && (
-              <div style={placeholderStyle}>пусто</div>
-            )}
-          </div>
-        )}
-      </div>
+      {/* Prompt children may grow upward independently when the viewport edge
+          would otherwise clip the second column. */}
+      {promptLibraryVisible && (
+        <div style={rightWrapperStyle}>
+          {selectedLeftItem?.kind === 'group' && (
+            <div ref={rightPanelRef} style={{ ...panelStyle, ...rightPanelPositionStyle }}>
+              {rightPrompts.length > 0 && rightPrompts.map((p, i) => {
+                const isSelected = pickerLevel === 'prompt' && i === selectedPromptIdx;
+                return (
+                  <div
+                    key={`rp-${p.id ?? i}`}
+                    onMouseEnter={() => {
+                      setPickerLevel('prompt');
+                      setSelectedPromptIdx(i);
+                    }}
+                    onClick={() => { void handleSelectPrompt(p); }}
+                    style={rowStyle(isSelected)}
+                  >
+                    <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {p.title}
+                    </span>
+                  </div>
+                );
+              })}
+              {rightPrompts.length === 0 && (
+                <div style={placeholderStyle}>пусто</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </div>,
     document.body
   );

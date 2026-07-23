@@ -3,6 +3,8 @@ import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './claudeSt
 import { terminalRegistry } from './terminalRegistry';
 import { useUIStore, type HistoryPromptDraftImageRef } from '../store/useUIStore';
 import { requireConfirmedCodexWriter } from './codexWriterIdentity';
+import { selectRewindOperation } from '../store/rewindOperationState';
+import { useRewindOperationStore } from '../store/useRewindOperationStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -736,96 +738,288 @@ export async function rewindAgentTimelineScenario({
 }): Promise<any> {
   const rewindMode = mode === 'ai' ? 'ai' : 'native';
   const channel = toolType === 'codex' ? 'codex:open-history-menu' : 'claude:open-history-menu';
+  const normalizedTargetIndex = Number.isFinite(Number(targetIndex)) ? Number(targetIndex) : 0;
+  const normalizedTargetUuid = typeof startUuid === 'string' && startUuid.trim()
+    ? startUuid.trim()
+    : 'timeline-index:' + String(normalizedTargetIndex);
+  const normalizedTargetText = String(targetFullText || targetText || '').trim();
+  const opId = 'scenario-' + Date.now().toString(36)
+    + '-' + normalizedTargetUuid.slice(0, 8)
+    + '-' + Math.random().toString(36).slice(2, 8);
+  const operationStore = useRewindOperationStore.getState();
+  const began = operationStore.begin({
+    tabId,
+    opId,
+    toolType,
+    mode: rewindMode,
+    sourceSessionId: sessionId,
+    targetUuid: normalizedTargetUuid,
+    targetText: normalizedTargetText,
+    targetIndex: normalizedTargetIndex,
+    phase: 'preparing',
+    message: runtime.label + ' Rewind: preparing...',
+  });
+  if (!began) {
+    return {
+      tabId,
+      toolType,
+      mode: rewindMode,
+      opId,
+      success: false,
+      code: 'rewind_already_in_progress',
+      error: 'Rewind is already in progress for this tab',
+    };
+  }
+
+  const getOwnedOperation = () => {
+    const state = useRewindOperationStore.getState();
+    return state.activeOpIdByTab[tabId] === opId
+      ? selectRewindOperation(state, tabId, opId)
+      : null;
+  };
+  const canContinuePreparation = () => {
+    const operation = getOwnedOperation();
+    return !!operation
+      && operation.phase !== 'cancelling'
+      && operation.phase !== 'committing'
+      && operation.phase !== 'done';
+  };
+  const staleResult = (extra: Record<string, unknown> = {}) => ({
+    tabId,
+    toolType,
+    mode: rewindMode,
+    opId,
+    success: false,
+    cancelled: true,
+    stale: true,
+    error: 'rewind_operation_no_longer_active',
+    ...extra,
+  });
+  const emitHistoryRewindLog = (
+    status: 'start' | 'done' | 'failed',
+    options: {
+      error?: string;
+      message?: string;
+      persisted?: boolean;
+      historyInputDraft?: boolean;
+      historyDraftText?: string;
+      historyDraftImages?: HistoryPromptDraftImageRef[];
+      historyDraftWarning?: string;
+    } = {},
+  ) => {
+    window.dispatchEvent(new CustomEvent('history-panel:rewind-log', {
+      detail: {
+        tabId,
+        opId,
+        status,
+        targetUuid: normalizedTargetUuid,
+        targetText: normalizedTargetText,
+        mode: rewindMode,
+        toolType,
+        error: options.error,
+        message: options.message,
+        persisted: options.persisted,
+        historyInputDraft: options.historyInputDraft,
+        historyDraftText: options.historyDraftText,
+        historyDraftImages: options.historyDraftImages,
+        historyDraftWarning: options.historyDraftWarning,
+      },
+    }));
+  };
+  const clearOwnedFailure = (error: unknown): boolean => {
+    const message = String((error as any)?.message || error || 'Rewind failed');
+    const cleared = useRewindOperationStore.getState().clear(tabId, opId);
+    if (cleared) emitHistoryRewindLog('failed', { error: message });
+    return cleared;
+  };
+
+  emitHistoryRewindLog('start', { message: runtime.label + ' Rewind: preparing...' });
+
   let preparedCodex: PreparedCodexRewindRuntime | null = null;
   let runtimeTargetUuid = startUuid || undefined;
   let runtimeEndUuid = endUuid || undefined;
 
-  // Starting a stopped Codex session can materialize a linked child. Establish
-  // the live writer first; the source ID passed to resume is launch intent only.
-  if (toolType === 'codex') {
-    preparedCodex = await prepareCodexRewindRuntime({
-      tabId,
-      runtime,
-      sourceSessionId: sessionId,
-      cwd: tab?.cwd,
-      targetIndex,
-      targetUuid: startUuid,
-      endUuid: rewindMode === 'ai' ? endUuid : null,
-      targetFullText,
-      rewindableCount,
-    });
-    runtimeTargetUuid = preparedCodex.targetUuid;
-    runtimeEndUuid = preparedCodex.endUuid || runtimeEndUuid;
-    if (preparedCodex.writerRelation === 'current-resume-child') {
-      console.log('[AgentScenario:rewind] proven Codex resume child tab=' + String(tabId).slice(-12)
-        + ' source=' + sessionId.slice(0, 8)
-        + ' writer=' + preparedCodex.writerSessionId.slice(0, 8)
-        + ' lineageDepth=' + preparedCodex.lineageDepth);
+  try {
+    // Starting a stopped Codex session can materialize a linked child. Establish
+    // the live writer first; the source ID passed to resume is launch intent only.
+    if (toolType === 'codex') {
+      preparedCodex = await prepareCodexRewindRuntime({
+        tabId,
+        runtime,
+        sourceSessionId: sessionId,
+        cwd: tab?.cwd,
+        targetIndex,
+        targetUuid: startUuid,
+        endUuid: rewindMode === 'ai' ? endUuid : null,
+        targetFullText,
+        rewindableCount,
+      });
+      if (!canContinuePreparation()) return staleResult();
+      runtimeTargetUuid = preparedCodex.targetUuid;
+      runtimeEndUuid = preparedCodex.endUuid || runtimeEndUuid;
+      if (preparedCodex.writerRelation === 'current-resume-child') {
+        console.log('[AgentScenario:rewind] proven Codex resume child tab=' + String(tabId).slice(-12)
+          + ' source=' + sessionId.slice(0, 8)
+          + ' writer=' + preparedCodex.writerSessionId.slice(0, 8)
+          + ' lineageDepth=' + preparedCodex.lineageDepth);
+      }
     }
-  }
 
-  let pasteAfter: string | undefined;
-  if (rewindMode === 'ai') {
-    if (!buildAiRewindText) throw new Error('AI Rewind builder not provided');
-    console.log('[MobRewind:Scenario] AI compact begin tool=' + toolType + ' tab=' + String(tabId).slice(-12));
-    pasteAfter = await buildAiRewindText({
-      toolType,
-      sessionId: toolType === 'codex' ? preparedCodex!.writerSessionId : sessionId,
-      cwd: tab?.cwd,
-      startUuid: toolType === 'codex'
-        ? runtimeTargetUuid
-        : (typeof startUuid === 'string' ? startUuid : undefined),
-      endUuid: toolType === 'codex'
-        ? runtimeEndUuid
-        : (typeof endUuid === 'string' ? endUuid : undefined),
-      additionalPrompt: typeof additionalPrompt === 'string' ? additionalPrompt : undefined,
-    });
-    console.log('[MobRewind:Scenario] AI compact ready tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' len=' + pasteAfter.length);
-  }
-  if (toolType !== 'codex') {
-    await ensureAgentReadyForRewind({
+    let pasteAfter: string | undefined;
+    if (rewindMode === 'ai') {
+      if (!buildAiRewindText) throw new Error('AI Rewind builder not provided');
+      if (!useRewindOperationStore.getState().setPhase(
+        tabId,
+        opId,
+        'compacting',
+        'Building the compact text for Rewind',
+      )) return staleResult();
+      console.log('[MobRewind:Scenario] AI compact begin tool=' + toolType + ' tab=' + String(tabId).slice(-12));
+      pasteAfter = await buildAiRewindText({
+        toolType,
+        sessionId: toolType === 'codex' ? preparedCodex!.writerSessionId : sessionId,
+        cwd: tab?.cwd,
+        startUuid: toolType === 'codex'
+          ? runtimeTargetUuid
+          : (typeof startUuid === 'string' ? startUuid : undefined),
+        endUuid: toolType === 'codex'
+          ? runtimeEndUuid
+          : (typeof endUuid === 'string' ? endUuid : undefined),
+        additionalPrompt: typeof additionalPrompt === 'string' ? additionalPrompt : undefined,
+      });
+      if (!canContinuePreparation()) return staleResult();
+      console.log('[MobRewind:Scenario] AI compact ready tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' len=' + pasteAfter.length);
+    }
+
+    if (!useRewindOperationStore.getState().setPhase(
       tabId,
-      toolType,
-      runtime,
-      sessionId,
-      cwd: tab?.cwd,
-    });
-  } else {
-    preparedCodex = await revalidatePreparedCodexRewindRuntime({
+      opId,
+      'preparing',
+      runtime.label + ' Rewind: verifying the active session...',
+    )) return staleResult();
+    if (toolType !== 'codex') {
+      await ensureAgentReadyForRewind({
+        tabId,
+        toolType,
+        runtime,
+        sessionId,
+        cwd: tab?.cwd,
+      });
+      if (!canContinuePreparation()) return staleResult();
+    } else {
+      preparedCodex = await revalidatePreparedCodexRewindRuntime({
+        tabId,
+        prepared: preparedCodex!,
+        cwd: tab?.cwd,
+        targetIndex,
+        sourceTargetUuid: startUuid,
+        sourceEndUuid: rewindMode === 'ai' ? endUuid : null,
+        targetFullText,
+        rewindableCount,
+      });
+      if (!canContinuePreparation()) return staleResult();
+    }
+
+    if (!canContinuePreparation()) return staleResult();
+    if (!useRewindOperationStore.getState().setPhase(
       tabId,
-      prepared: preparedCodex!,
-      cwd: tab?.cwd,
+      opId,
+      'rewinding',
+      runtime.label + ' Rewind: applying...',
+    )) return staleResult();
+    // There is intentionally no await between this ownership marker and the
+    // destructive IPC. Cancel can distinguish local preparation from a request
+    // that has already crossed into the runtime.
+    if (!useRewindOperationStore.getState().markRuntimeStarted(tabId, opId)) {
+      return staleResult();
+    }
+    const result = await ipcRenderer.invoke(channel, {
+      tabId,
+      opId,
       targetIndex,
-      sourceTargetUuid: startUuid,
-      sourceEndUuid: rewindMode === 'ai' ? endUuid : null,
+      targetText,
       targetFullText,
+      targetUuid: runtimeTargetUuid,
+      writerSessionId: preparedCodex?.writerSessionId || null,
+      writerAuthorization: preparedCodex?.writerAuthorization || null,
+      writerLaunchId: preparedCodex?.writerLaunchId || null,
       rewindableCount,
+      skipDuplicates,
+      pasteAfter,
+      deadlineMs: rewindMode === 'ai' ? 170_000 : 16_000,
     });
-  }
-  const result = await ipcRenderer.invoke(channel, {
-    tabId,
-    targetIndex,
-    targetText,
-    targetFullText,
-    targetUuid: runtimeTargetUuid,
-    writerSessionId: preparedCodex?.writerSessionId || null,
-    writerAuthorization: preparedCodex?.writerAuthorization || null,
-    writerLaunchId: preparedCodex?.writerLaunchId || null,
-    rewindableCount,
-    skipDuplicates,
-    pasteAfter,
-    deadlineMs: rewindMode === 'ai' ? 170_000 : 16_000,
-  });
-  if (result?.success && rewindMode === 'native' && toolType === 'claude' && result.historyInputDraft === true) {
+
+    // The runtime result is authoritative. A locally requested cancellation
+    // does not turn a committed success into a cancellation.
+    if (result?.cancelled === true) {
+      const cleared = useRewindOperationStore.getState().clear(tabId, opId);
+      if (cleared) {
+        emitHistoryRewindLog('failed', {
+          error: String(result.error || 'Rewind cancelled'),
+          message: 'Rewind cancelled',
+        });
+      }
+      return {
+        tabId,
+        toolType,
+        mode: rewindMode,
+        opId,
+        compactPasted: !!pasteAfter,
+        compactLength: pasteAfter?.length || 0,
+        runtimeSessionId: preparedCodex?.writerSessionId,
+        writerRelation: preparedCodex?.writerRelation,
+        writerLineageDepth: preparedCodex?.lineageDepth || undefined,
+        ...(result || {}),
+      };
+    }
+    if (!result || result.success === false) {
+      const failureMessage = String(result?.error || result?.message || 'Rewind failed');
+      clearOwnedFailure(failureMessage);
+      return {
+        tabId,
+        toolType,
+        mode: rewindMode,
+        opId,
+        compactPasted: !!pasteAfter,
+        compactLength: pasteAfter?.length || 0,
+        runtimeSessionId: preparedCodex?.writerSessionId,
+        writerRelation: preparedCodex?.writerRelation,
+        writerLineageDepth: preparedCodex?.lineageDepth || undefined,
+        ...(result || {}),
+        success: false,
+        error: failureMessage,
+      };
+    }
+    if (!getOwnedOperation()) {
+      return staleResult({
+        runtimeSessionId: preparedCodex?.writerSessionId,
+        runtimeSuccess: true,
+      });
+    }
+
+    const activeSessionId = typeof result.activeSessionId === 'string'
+      ? result.activeSessionId
+      : (preparedCodex?.writerSessionId || sessionId);
+    const completed = useRewindOperationStore.getState().complete(tabId, opId, activeSessionId);
+    if (!completed) {
+      return staleResult({
+        runtimeSessionId: preparedCodex?.writerSessionId,
+        runtimeSuccess: true,
+      });
+    }
+
+    const historyDraftImages: HistoryPromptDraftImageRef[] = Array.isArray(result.historyDraftImages)
+      ? result.historyDraftImages
+      : [];
     const targetDraft = String(result.historyDraftText || targetFullText || targetText || '').trim();
-    if (targetDraft) {
+    if (rewindMode === 'native' && toolType === 'claude' && result.historyInputDraft === true && targetDraft) {
       const store = useUIStore.getState();
-      const historyDraftImages: HistoryPromptDraftImageRef[] = Array.isArray(result.historyDraftImages)
-        ? result.historyDraftImages
-        : [];
-      store.setHistoryPromptDraft(tabId, targetDraft, historyDraftImages.length > 0 ? { images: historyDraftImages } : undefined);
+      store.setHistoryPromptDraft(
+        tabId,
+        targetDraft,
+        historyDraftImages.length > 0 ? { images: historyDraftImages } : undefined,
+      );
       if (typeof startUuid === 'string' && startUuid.trim()) {
-        const opId = Date.now().toString(36) + '-' + startUuid.slice(0, 8);
         store.setHistoryRewindPreview(tabId, {
           opId,
           targetUuid: startUuid,
@@ -833,33 +1027,43 @@ export async function rewindAgentTimelineScenario({
           startedAt: Date.now(),
           sessionId,
         });
-        window.dispatchEvent(new CustomEvent('history-panel:rewind-log', {
-          detail: {
-            tabId,
-            opId,
-            status: 'done',
-            targetUuid: startUuid,
-            targetText: targetDraft,
-            mode: rewindMode,
-            toolType,
-            historyInputDraft: true,
-            historyDraftText: targetDraft,
-            historyDraftImages,
-            historyDraftWarning: typeof result.historyDraftWarning === 'string' ? result.historyDraftWarning : undefined,
-          },
-        }));
       }
     }
+
+    emitHistoryRewindLog('done', {
+      persisted: result.persisted === true
+        || result.bindingCommitted === true
+        || rewindMode === 'ai'
+        || toolType === 'codex',
+      historyInputDraft: result.historyInputDraft === true,
+      historyDraftText: targetDraft || undefined,
+      historyDraftImages: historyDraftImages.length > 0 ? historyDraftImages : undefined,
+      historyDraftWarning: typeof result.historyDraftWarning === 'string'
+        ? result.historyDraftWarning
+        : undefined,
+    });
+    setTimeout(() => {
+      useRewindOperationStore.getState().clear(tabId, opId);
+    }, 1200);
+
+    return {
+      tabId,
+      toolType,
+      mode: rewindMode,
+      opId,
+      compactPasted: !!pasteAfter,
+      compactLength: pasteAfter?.length || 0,
+      runtimeSessionId: preparedCodex?.writerSessionId,
+      writerRelation: preparedCodex?.writerRelation,
+      writerLineageDepth: preparedCodex?.lineageDepth || undefined,
+      ...(result || {}),
+    };
+  } catch (error) {
+    if (!clearOwnedFailure(error)) {
+      return staleResult({
+        caughtError: String((error as any)?.message || error),
+      });
+    }
+    throw error;
   }
-  return {
-    tabId,
-    toolType,
-    mode: rewindMode,
-    compactPasted: !!pasteAfter,
-    compactLength: pasteAfter?.length || 0,
-    runtimeSessionId: preparedCodex?.writerSessionId,
-    writerRelation: preparedCodex?.writerRelation,
-    writerLineageDepth: preparedCodex?.lineageDepth || undefined,
-    ...(result || {}),
-  };
 }

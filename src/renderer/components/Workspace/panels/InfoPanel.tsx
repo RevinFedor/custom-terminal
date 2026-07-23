@@ -484,9 +484,9 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       console.warn('[InfoPanel:ManualSet] resolve-session-cwd failed:', e);
     }
 
-    const runResume = () => {
+    const runResume = async () => {
       setTabCommandType(activeTabId, 'claude');
-      ipcRenderer.send('claude:run-command', {
+      return await ipcRenderer.invoke('claude:run-command', {
         tabId: activeTabId,
         command: 'claude-c',
         sessionId: newId,
@@ -515,7 +515,11 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
         // SIGTERM acknowledged; let the shell prompt redraw before sending resume.
         await new Promise((r) => setTimeout(r, 150));
       }
-      runResume();
+      const launchResult = await runResume();
+      if (launchResult?.success === false || launchResult?.accepted === false) {
+        showToast('Resume failed: ' + (launchResult?.error || launchResult?.reason || 'launch rejected'), 'error');
+        return;
+      }
       showToast(`Claude resumed: ${newId.substring(0, 8)}...`, 'success');
     } catch (e: any) {
       console.error('[InfoPanel:ManualSet] restart error:', e);
@@ -612,13 +616,17 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                   <code
                     className="text-xs cursor-pointer hover:underline px-1.5 py-0.5 bg-[#1a1a1a] rounded-l"
                     style={{ color: '#DA7756' }}
-                    onClick={() => {
+                    onClick={async () => {
                       if (!activeTabId) { showToast('Нет активного таба', 'error'); return; }
                       const effectiveDefault = claudeDefaultPromptEnabled ? claudeDefaultPrompt : '';
                       const finalPrompt = [effectiveDefault, claudeExtraPrompt].filter(Boolean).join('\n\n');
                       setTabCommandType(activeTabId, 'claude');
                       useWorkspaceStore.getState().markAiLaunchAutoTitle(activeTabId, 'claude');
-                      ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude', prompt: finalPrompt || undefined });
+                      const launchResult = await ipcRenderer.invoke('claude:run-command', { tabId: activeTabId, command: 'claude', prompt: finalPrompt || undefined })
+                        .catch((error: any) => ({ success: false, accepted: false, error: error?.message || String(error) }));
+                      if (launchResult?.success === false || launchResult?.accepted === false) {
+                        showToast('Claude не запущен: ' + (launchResult?.error || launchResult?.reason || 'launch rejected'), 'error');
+                      }
                     }}
                   >claude</code>
                   {/* `sdk` — spawns a NEW SDK tab named claude-NN (mirrors the
@@ -760,7 +768,10 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
                       if (match) {
                         setTabCommandType(activeTabId, 'claude');
                         useWorkspaceStore.getState().markAiForkAutoTitle(activeTabId, 'claude', match[0]);
-                        ipcRenderer.send('claude:run-command', { tabId: activeTabId, command: 'claude-f', forkSessionId: match[0] });
+                        const launchResult = await ipcRenderer.invoke('claude:run-command', { tabId: activeTabId, command: 'claude-f', forkSessionId: match[0] });
+                        if (launchResult?.success === false || launchResult?.accepted === false) {
+                          showToast('Claude fork не запущен: ' + (launchResult?.error || launchResult?.reason || 'launch rejected'), 'error');
+                        }
                       }
                       else showToast('В буфере нет UUID', 'warning');
                     } catch (err) { showToast('Не удалось прочитать буфер', 'error'); }

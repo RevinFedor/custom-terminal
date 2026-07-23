@@ -1,6 +1,10 @@
 const fs = require('fs');
 const path = require('path');
 const { ipcMain } = require('electron');
+const {
+  buildHistoryRevision,
+  validateHistoryRevision,
+} = require('./history-revision');
 
 function shortId(value, n = 8) {
   return String(value || '').slice(0, n);
@@ -185,13 +189,38 @@ class SessionTranscriptService {
     const cwd = payload.cwd;
     if (!sessionId) return { success: false, error: 'sessionId required', entries: [] };
     if (toolType === 'codex') {
+      if (payload.ifRevision) {
+        const validation = await validateHistoryRevision(
+          payload.ifRevision,
+          { toolType, sessionId, cwd },
+          {
+            resolvePrimaryFile: async () => {
+              const found = await this.codexData?._api?.findCodexSessionFile?.(sessionId, cwd);
+              return found?.filePath || null;
+            },
+          }
+        );
+        if (validation.unchanged) {
+          return {
+            success: true,
+            unchanged: true,
+            revision: payload.ifRevision,
+          };
+        }
+      }
       const loaded = await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
       if (!loaded?.success) return loaded || { success: false, error: 'codex parser unavailable', entries: [] };
+      const revision = buildHistoryRevision(
+        { toolType, sessionId, cwd },
+        loaded.sourceSnapshot ? [loaded.sourceSnapshot] : []
+      );
       return {
         success: true,
+        unchanged: false,
         entries: this.codexData._api.buildCodexFullHistory(loaded.records || [], sessionId),
         claudeMemoryBoundaryUuid: null,
         filePath: loaded.filePath,
+        revision,
       };
     }
     return { success: false, error: 'claude history compatibility path not migrated', entries: [] };
@@ -247,6 +276,7 @@ class SessionTranscriptService {
       timer: null,
       reconcileTimer: null,
       inflight: false,
+      trailingReadReason: null,
       offset: 0,
       leftover: '',
       version: 0,
@@ -316,7 +346,10 @@ class SessionTranscriptService {
   }
 
   async _readChange(state, reason) {
-    if (state.inflight) return;
+    if (state.inflight) {
+      state.trailingReadReason = reason || 'trailing-change';
+      return;
+    }
     state.inflight = true;
     try {
       const oldSize = state.size;
@@ -328,6 +361,11 @@ class SessionTranscriptService {
       this._emitChanged(state, reason);
     } finally {
       state.inflight = false;
+      const trailingReason = state.trailingReadReason;
+      state.trailingReadReason = null;
+      if (trailingReason && state.consumers.size > 0) {
+        await this._readChange(state, 'trailing:' + trailingReason);
+      }
     }
   }
 

@@ -15,6 +15,63 @@ const INBOX_PROJECT_ID = '__noted_inbox__';
 const INBOX_PROJECT_NAME = 'Inbox';
 const INBOX_PROJECT_DESCRIPTION = 'System workspace for API-created and unassigned agent tabs.';
 const getInboxProjectPath = () => process.env.NOTED_INBOX_CWD || process.env.HOME || os.homedir() || '/';
+const CODEX_PENDING_WRITER_HANDOFF_KEY_PREFIX = 'codex.pending-writer-handoff.v1:';
+
+function inspectCodexWriterHandoffValue(journalKey, rawValue) {
+  if (rawValue === undefined || rawValue === null) {
+    return { status: 'absent', journalKey, journal: null };
+  }
+  let journal;
+  try {
+    journal = JSON.parse(rawValue);
+  } catch (error) {
+    return {
+      status: 'invalid',
+      journalKey,
+      journal: null,
+      error: 'codex_handoff_journal_corrupt',
+      reason: error?.message || 'invalid_json',
+      rawValue,
+    };
+  }
+  const baseValid = journal
+    && typeof journal === 'object'
+    && !Array.isArray(journal)
+    && typeof journal.projectId === 'string'
+    && journal.projectId.trim()
+    && typeof journal.tabId === 'string'
+    && journal.tabId.trim()
+    && typeof journal.cwd === 'string'
+    && journal.cwd.trim()
+    && typeof journal.sourceSessionId === 'string'
+    && journal.sourceSessionId.trim()
+    && typeof journal.actionGeneration === 'string'
+    && journal.actionGeneration.trim()
+    && Number.isFinite(Number(journal.actionStartedAtMs));
+  const versionValid = journal?.version === 1 || (
+    journal?.version === 2
+    && typeof journal.targetUuid === 'string'
+    && journal.targetUuid.trim()
+    && Number.isInteger(Number(journal.targetSourceLine))
+    && Number(journal.targetSourceLine) >= 1
+    && typeof journal.targetTextHash === 'string'
+    && /^[a-f0-9]{64}$/i.test(journal.targetTextHash)
+    && Number.isInteger(Number(journal.rollbackTurns))
+    && Number(journal.rollbackTurns) >= 1
+  );
+  const valid = baseValid && versionValid;
+  if (!valid) {
+    return {
+      status: 'invalid',
+      journalKey,
+      journal: null,
+      error: 'codex_handoff_journal_invalid',
+      reason: 'invalid_shape',
+      rawValue,
+    };
+  }
+  return { status: 'present', journalKey, journal, rawValue };
+}
 
 class DatabaseManager {
   constructor() {
@@ -153,6 +210,17 @@ class DatabaseManager {
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_session_id TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_model TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_effort TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_settings_proof_at INTEGER DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_settings_proof_session_id TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_model_migration_pending INTEGER DEFAULT 0`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_model_migration_restore_default_model INTEGER DEFAULT 0`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_model_migration_restore_default_effort INTEGER DEFAULT 0`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_model_migration_source_model TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_model_migration_source_effort TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_model_migration_target_model TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_model_migration_config_path TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_model_migration_config_fingerprint TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tabs ADD COLUMN codex_model_migration_config_already_target INTEGER DEFAULT 0`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tabs ADD COLUMN external_run TEXT DEFAULT NULL`); } catch (e) {}
     try {
       this.db.exec(`ALTER TABLE tabs ADD COLUMN overlay_dismissed INTEGER DEFAULT 0`);
@@ -372,6 +440,17 @@ class DatabaseManager {
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_session_id TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_model TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_effort TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_settings_proof_at INTEGER DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_settings_proof_session_id TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_model_migration_pending INTEGER DEFAULT 0`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_model_migration_restore_default_model INTEGER DEFAULT 0`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_model_migration_restore_default_effort INTEGER DEFAULT 0`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_model_migration_source_model TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_model_migration_source_effort TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_model_migration_target_model TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_model_migration_config_path TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_model_migration_config_fingerprint TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN codex_model_migration_config_already_target INTEGER DEFAULT 0`); } catch (e) {}
 
     // Migration: add message_count to tab_history
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN message_count INTEGER DEFAULT NULL`); } catch (e) {}
@@ -923,6 +1002,22 @@ class DatabaseManager {
     `).run(key, jsonValue);
   }
 
+  compareAndSetAppState(key, expectedValue, nextValue) {
+    if (!key) return false;
+    const expectedJson = typeof expectedValue === 'string'
+      ? expectedValue
+      : JSON.stringify(expectedValue);
+    const nextJson = typeof nextValue === 'string'
+      ? nextValue
+      : JSON.stringify(nextValue);
+    const info = this.db.prepare(`
+      UPDATE app_state
+      SET value = ?, updated_at = strftime('%s', 'now')
+      WHERE key = ? AND value = ?
+    `).run(nextJson, key, expectedJson);
+    return info.changes === 1;
+  }
+
   // Bulk-read all rows whose key starts with prefix (or every row when no prefix).
   // Values are returned verbatim — this is the raw mirror of localStorage strings,
   // so we DON'T re-parse JSON here (the renderer will use the result as plain strings).
@@ -937,6 +1032,76 @@ class DatabaseManager {
 
   deleteAppState(key) {
     this.db.prepare('DELETE FROM app_state WHERE key = ?').run(key);
+  }
+
+  inspectPendingCodexWriterHandoff(journalKey) {
+    if (typeof journalKey !== 'string' || !journalKey.trim()) {
+      return {
+        status: 'invalid',
+        journalKey: journalKey || null,
+        journal: null,
+        error: 'codex_handoff_journal_key_invalid',
+        reason: 'journal_key_required',
+      };
+    }
+    const row = this.db.prepare('SELECT value FROM app_state WHERE key = ?').get(journalKey);
+    return inspectCodexWriterHandoffValue(journalKey, row?.value);
+  }
+
+  _migratePendingCodexWriterHandoffsInTransaction({
+    sourceProjectId,
+    targetProjectId,
+    tabIds,
+  } = {}) {
+    const plans = [];
+    for (const tabId of tabIds) {
+      const journalKey = CODEX_PENDING_WRITER_HANDOFF_KEY_PREFIX + tabId;
+      const row = this.db.prepare('SELECT value FROM app_state WHERE key = ?').get(journalKey);
+      const inspection = inspectCodexWriterHandoffValue(journalKey, row?.value);
+      if (inspection.status === 'absent') continue;
+      if (inspection.status === 'invalid') {
+        return {
+          success: false,
+          error: inspection.error,
+          tabId,
+          journalKey,
+          reason: inspection.reason,
+        };
+      }
+      const journal = inspection.journal;
+      if (journal.tabId !== tabId || journal.projectId !== sourceProjectId) {
+        return {
+          success: false,
+          error: 'codex_handoff_journal_owner_mismatch',
+          tabId,
+          journalKey,
+          journalTabId: journal.tabId,
+          journalProjectId: journal.projectId,
+          expectedProjectId: sourceProjectId,
+        };
+      }
+      plans.push({
+        tabId,
+        journalKey,
+        previousRaw: inspection.rawValue,
+        nextRaw: JSON.stringify({ ...journal, projectId: targetProjectId }),
+      });
+    }
+
+    for (const plan of plans) {
+      const updated = this.db.prepare(`
+        UPDATE app_state
+        SET value = ?, updated_at = strftime('%s', 'now')
+        WHERE key = ? AND value = ?
+      `).run(plan.nextRaw, plan.journalKey, plan.previousRaw);
+      if (updated.changes !== 1) {
+        const error = new Error('codex_handoff_journal_compare_and_set_failed');
+        error.tabId = plan.tabId;
+        error.journalKey = plan.journalKey;
+        throw error;
+      }
+    }
+    return { success: true, migrated: plans.map((plan) => plan.tabId) };
   }
 
   // ========== PROJECTS ========== 
@@ -1031,6 +1196,17 @@ class DatabaseManager {
         codexSessionId: t.codex_session_id || undefined,
         codexModel: t.codex_model || undefined,
         codexEffort: t.codex_effort || undefined,
+        codexSettingsProofAt: Number(t.codex_settings_proof_at) || undefined,
+        codexSettingsProofSessionId: t.codex_settings_proof_session_id || undefined,
+        codexModelMigrationPending: t.codex_model_migration_pending === 1 || undefined,
+        codexModelMigrationRestoreDefaultModel: t.codex_model_migration_restore_default_model === 1 || undefined,
+        codexModelMigrationRestoreDefaultEffort: t.codex_model_migration_restore_default_effort === 1 || undefined,
+        codexModelMigrationSourceModel: t.codex_model_migration_source_model || undefined,
+        codexModelMigrationSourceEffort: t.codex_model_migration_source_effort || undefined,
+        codexModelMigrationTargetModel: t.codex_model_migration_target_model || undefined,
+        codexModelMigrationConfigPath: t.codex_model_migration_config_path || undefined,
+        codexModelMigrationConfigFingerprint: t.codex_model_migration_config_fingerprint || undefined,
+        codexModelMigrationConfigAlreadyTarget: t.codex_model_migration_config_already_target === 1 || undefined,
         externalRun: (() => {
           if (!t.external_run) return undefined;
           try { return JSON.parse(t.external_run); }
@@ -1107,6 +1283,44 @@ class DatabaseManager {
     return row.codex_session_id || null;
   }
 
+  getTabCodexSettingsState(projectId, tabId) {
+    if (arguments.length < 2 || !projectId || !tabId) return undefined;
+    const row = this.db.prepare(`
+      SELECT codex_model,
+             codex_effort,
+             codex_settings_proof_at,
+             codex_settings_proof_session_id,
+             codex_model_migration_pending,
+             codex_model_migration_restore_default_model,
+             codex_model_migration_restore_default_effort,
+             codex_model_migration_source_model,
+             codex_model_migration_source_effort,
+             codex_model_migration_target_model,
+             codex_model_migration_config_path,
+             codex_model_migration_config_fingerprint,
+             codex_model_migration_config_already_target
+      FROM tabs
+      WHERE project_id = ? AND tab_id = ?
+      LIMIT 1
+    `).get(projectId, tabId);
+    if (!row) return undefined;
+    return {
+      model: row.codex_model || null,
+      effort: row.codex_effort || null,
+      proofAt: Number(row.codex_settings_proof_at) || null,
+      proofSessionId: row.codex_settings_proof_session_id || null,
+      modelMigrationPending: row.codex_model_migration_pending === 1,
+      restoreDefaultModel: row.codex_model_migration_restore_default_model === 1,
+      restoreDefaultEffort: row.codex_model_migration_restore_default_effort === 1,
+      sourceModel: row.codex_model_migration_source_model || null,
+      sourceEffort: row.codex_model_migration_source_effort || null,
+      targetModel: row.codex_model_migration_target_model || null,
+      configPath: row.codex_model_migration_config_path || null,
+      configBaselineFingerprint: row.codex_model_migration_config_fingerprint || null,
+      configAlreadyTargetAtArm: row.codex_model_migration_config_already_target === 1,
+    };
+  }
+
   updateTabCodexSessionId(projectId, tabId, sessionId) {
     // The arity guard deliberately rejects the legacy (tabId, sessionId) call:
     // reinterpreting those two strings could target an unrelated compound row.
@@ -1118,6 +1332,66 @@ class DatabaseManager {
       'UPDATE tabs SET codex_session_id = ? WHERE project_id = ? AND tab_id = ?'
     ).run(normalizedSessionId, projectId, tabId);
     return info.changes > 0;
+  }
+
+  // A proven Resume/Fork writer and its non-conversation settings are one
+  // durable fact. Persist them in one statement so a crash cannot leave writer
+  // B paired with writer A's model/effort proof. Ultra is intentionally
+  // rejected here because it belongs only to the live conversation overlay.
+  updateTabCodexSessionAndSettings(projectId, tabId, {
+    sessionId,
+    model,
+    effort,
+    proofAt,
+  } = {}) {
+    if (arguments.length < 3 || !projectId || !tabId) return false;
+    const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+    const normalizedModel = typeof model === 'string' ? model.trim() : '';
+    const normalizedEffort = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
+    const normalizedProofAt = Number(proofAt);
+    const persistentEfforts = new Set([
+      'none',
+      'minimal',
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ]);
+    if (!normalizedSessionId
+      || !normalizedModel
+      || !persistentEfforts.has(normalizedEffort)
+      || !Number.isFinite(normalizedProofAt)
+      || normalizedProofAt <= 0) {
+      return false;
+    }
+    const info = this.db.prepare(`
+      UPDATE tabs
+      SET codex_session_id = ?,
+          codex_model = ?,
+          codex_effort = ?,
+          codex_settings_proof_at = ?,
+          codex_settings_proof_session_id = ?,
+          codex_model_migration_pending = 0,
+          codex_model_migration_restore_default_model = 0,
+          codex_model_migration_restore_default_effort = 0,
+          codex_model_migration_source_model = NULL,
+          codex_model_migration_source_effort = NULL,
+          codex_model_migration_target_model = NULL,
+          codex_model_migration_config_path = NULL,
+          codex_model_migration_config_fingerprint = NULL,
+          codex_model_migration_config_already_target = 0
+      WHERE project_id = ? AND tab_id = ?
+    `).run(
+      normalizedSessionId,
+      normalizedModel,
+      normalizedEffort,
+      normalizedProofAt,
+      normalizedSessionId,
+      projectId,
+      tabId,
+    );
+    return info.changes === 1;
   }
 
   compareAndSetTabCodexSessionId(projectId, tabId, expectedSessionId, nextSessionId) {
@@ -1132,6 +1406,476 @@ class DatabaseManager {
       'UPDATE tabs SET codex_session_id = ? WHERE project_id = ? AND tab_id = ? AND codex_session_id IS ?'
     ).run(next, projectId, tabId, expected);
     return info.changes === 1;
+  }
+
+  // Model migration is proven by main from the exact post-Enter Codex
+  // acknowledgement, before a rollout/writer necessarily exists. Commit that
+  // pair point-wise so a renderer reload or app crash cannot relaunch the stale
+  // CLI override that triggered the migration prompt.
+  updateTabCodexSettings(projectId, tabId, {
+    model,
+    effort,
+    proofAt,
+    proofSessionId = null,
+  } = {}) {
+    if (arguments.length < 3 || !projectId || !tabId) return false;
+    const normalizedModel = typeof model === 'string' ? model.trim() : '';
+    const normalizedEffort = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
+    const normalizedProofAt = Number(proofAt);
+    const normalizedProofSessionId = typeof proofSessionId === 'string' && proofSessionId.trim()
+      ? proofSessionId.trim()
+      : null;
+    if (!normalizedModel || !normalizedEffort || !Number.isFinite(normalizedProofAt) || normalizedProofAt <= 0) {
+      return false;
+    }
+    const info = this.db.prepare(`
+      UPDATE tabs
+      SET codex_model = ?,
+          codex_effort = ?,
+          codex_settings_proof_at = ?,
+          codex_settings_proof_session_id = ?,
+          codex_model_migration_pending = 0,
+          codex_model_migration_restore_default_model = 0,
+          codex_model_migration_restore_default_effort = 0,
+          codex_model_migration_source_model = NULL,
+          codex_model_migration_source_effort = NULL,
+          codex_model_migration_target_model = NULL,
+          codex_model_migration_config_path = NULL,
+          codex_model_migration_config_fingerprint = NULL,
+          codex_model_migration_config_already_target = 0
+      WHERE project_id = ? AND tab_id = ?
+    `).run(
+      normalizedModel,
+      normalizedEffort,
+      normalizedProofAt,
+      normalizedProofSessionId,
+      projectId,
+      tabId,
+    );
+    return info.changes === 1;
+  }
+
+  beginTabCodexModelMigration(projectId, tabId, {
+    proofAt,
+    clearDefaultModel = false,
+    expectedDefaultModel = null,
+    clearDefaultEffort = false,
+    expectedDefaultEffort = null,
+    sourceModel,
+    sourceEffort = null,
+    targetModel,
+    configPath,
+    configBaselineFingerprint,
+    configAlreadyTargetAtArm = false,
+  } = {}) {
+    if (arguments.length < 3 || !projectId || !tabId) {
+      return { success: false, error: 'codex_model_migration_invalid' };
+    }
+    const normalizedProofAt = Number(proofAt);
+    const normalizedSourceModel = typeof sourceModel === 'string' ? sourceModel.trim() : '';
+    const normalizedSourceEffort = typeof sourceEffort === 'string'
+      ? sourceEffort.trim().toLowerCase()
+      : '';
+    const normalizedTargetModel = typeof targetModel === 'string' ? targetModel.trim() : '';
+    const normalizedConfigPath = typeof configPath === 'string' ? configPath.trim() : '';
+    const normalizedConfigBaselineFingerprint = typeof configBaselineFingerprint === 'string'
+      ? configBaselineFingerprint.trim().toLowerCase()
+      : '';
+    if (!Number.isFinite(normalizedProofAt)
+      || normalizedProofAt <= 0
+      || !normalizedSourceModel
+      || !normalizedTargetModel
+      || !normalizedConfigPath
+      || !path.isAbsolute(normalizedConfigPath)
+      || !/^[a-f0-9]{64}$/.test(normalizedConfigBaselineFingerprint)) {
+      return { success: false, error: 'codex_model_migration_proof_invalid' };
+    }
+    const transaction = this.db.transaction(() => {
+      const previousPending = this.db.prepare(`
+        SELECT codex_model_migration_restore_default_model,
+               codex_model_migration_restore_default_effort,
+               codex_model_migration_pending,
+               codex_settings_proof_at,
+               codex_model_migration_source_model,
+               codex_model_migration_source_effort,
+               codex_model_migration_target_model,
+               codex_model_migration_config_path,
+               codex_model_migration_config_fingerprint,
+               codex_model_migration_config_already_target
+        FROM tabs
+        WHERE project_id = ? AND tab_id = ?
+        LIMIT 1
+      `).get(projectId, tabId);
+      if (!previousPending) {
+        return { success: false, error: 'codex_model_migration_tab_missing' };
+      }
+      if (previousPending.codex_model_migration_pending === 1) {
+        const sameJournal = previousPending.codex_model_migration_source_model === normalizedSourceModel
+          && (previousPending.codex_model_migration_source_effort || '') === (normalizedSourceEffort || '')
+          && previousPending.codex_model_migration_target_model === normalizedTargetModel
+          && previousPending.codex_model_migration_config_path === normalizedConfigPath
+          && previousPending.codex_model_migration_config_fingerprint === normalizedConfigBaselineFingerprint
+          && (previousPending.codex_model_migration_config_already_target === 1)
+            === (configAlreadyTargetAtArm === true);
+        if (!sameJournal) {
+          return { success: false, error: 'codex_model_migration_already_pending' };
+        }
+        return {
+          success: true,
+          idempotent: true,
+          pendingProofAt: Number(previousPending.codex_settings_proof_at),
+          defaultModelInvalidated: previousPending.codex_model_migration_restore_default_model === 1,
+          defaultEffortInvalidated: previousPending.codex_model_migration_restore_default_effort === 1,
+        };
+      }
+      const tabUpdate = this.db.prepare(`
+        UPDATE tabs
+        SET codex_model = NULL,
+            codex_effort = NULL,
+            codex_settings_proof_at = ?,
+            codex_settings_proof_session_id = NULL,
+            codex_model_migration_pending = 1,
+            codex_model_migration_source_model = ?,
+            codex_model_migration_source_effort = ?,
+            codex_model_migration_target_model = ?,
+            codex_model_migration_config_path = ?,
+            codex_model_migration_config_fingerprint = ?,
+            codex_model_migration_config_already_target = ?
+        WHERE project_id = ? AND tab_id = ? AND codex_model_migration_pending = 0
+      `).run(
+        normalizedProofAt,
+        normalizedSourceModel,
+        normalizedSourceEffort || null,
+        normalizedTargetModel,
+        normalizedConfigPath,
+        normalizedConfigBaselineFingerprint,
+        configAlreadyTargetAtArm === true ? 1 : 0,
+        projectId,
+        tabId,
+      );
+      if (tabUpdate.changes !== 1) {
+        return { success: false, error: 'codex_model_migration_tab_missing' };
+      }
+
+      const clearDefault = (key, enabled, expectedValue) => {
+        const expected = typeof expectedValue === 'string' ? expectedValue.trim() : '';
+        if (!enabled || !expected) return false;
+        const info = this.db.prepare(`
+          UPDATE app_state
+          SET value = 'none', updated_at = strftime('%s', 'now')
+          WHERE key = ? AND value = ?
+        `).run(key, expected);
+        return info.changes === 1;
+      };
+      const defaultModelInvalidatedNow = clearDefault(
+        'defaultCodexModel',
+        clearDefaultModel,
+        expectedDefaultModel,
+      );
+      const defaultEffortInvalidatedNow = clearDefault(
+        'defaultCodexEffort',
+        clearDefaultEffort,
+        expectedDefaultEffort,
+      );
+      const defaultModelInvalidated = previousPending.codex_model_migration_restore_default_model === 1
+        || defaultModelInvalidatedNow;
+      const defaultEffortInvalidated = previousPending.codex_model_migration_restore_default_effort === 1
+        || defaultEffortInvalidatedNow;
+      this.db.prepare(`
+        UPDATE tabs
+        SET codex_model_migration_restore_default_model = ?,
+            codex_model_migration_restore_default_effort = ?
+        WHERE project_id = ? AND tab_id = ?
+      `).run(
+        defaultModelInvalidated ? 1 : 0,
+        defaultEffortInvalidated ? 1 : 0,
+        projectId,
+        tabId,
+      );
+      return {
+        success: true,
+        defaultModelInvalidated,
+        defaultEffortInvalidated,
+      };
+    });
+    return transaction();
+  }
+
+  commitTabCodexModelMigration(projectId, tabId, {
+    model,
+    effort,
+    proofAt,
+    proofSessionId = null,
+    expectedPendingProofAt,
+  } = {}) {
+    if (arguments.length < 3 || !projectId || !tabId) {
+      return { success: false, error: 'codex_model_migration_invalid' };
+    }
+    const normalizedModel = typeof model === 'string' ? model.trim() : '';
+    const normalizedEffort = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
+    const normalizedProofAt = Number(proofAt);
+    const normalizedPendingProofAt = Number(expectedPendingProofAt);
+    const normalizedProofSessionId = typeof proofSessionId === 'string' && proofSessionId.trim()
+      ? proofSessionId.trim()
+      : null;
+    if (!normalizedModel
+      || !normalizedEffort
+      || !Number.isFinite(normalizedProofAt)
+      || normalizedProofAt <= 0
+      || !Number.isFinite(normalizedPendingProofAt)
+      || normalizedPendingProofAt <= 0) {
+      return { success: false, error: 'codex_model_migration_proof_invalid' };
+    }
+    const transaction = this.db.transaction(() => {
+      const pendingState = this.db.prepare(`
+        SELECT codex_model_migration_restore_default_model,
+               codex_model_migration_restore_default_effort,
+               codex_model_migration_pending,
+               codex_settings_proof_at
+        FROM tabs
+        WHERE project_id = ? AND tab_id = ?
+        LIMIT 1
+      `).get(projectId, tabId);
+      if (!pendingState) {
+        return { success: false, error: 'codex_model_migration_tab_missing' };
+      }
+      if (pendingState.codex_model_migration_pending !== 1
+        || Number(pendingState.codex_settings_proof_at) !== normalizedPendingProofAt) {
+        return { success: false, error: 'codex_model_migration_generation_changed' };
+      }
+      const tabUpdate = this.db.prepare(`
+        UPDATE tabs
+        SET codex_model = ?,
+            codex_effort = ?,
+            codex_settings_proof_at = ?,
+            codex_settings_proof_session_id = ?,
+            codex_model_migration_pending = 0,
+            codex_model_migration_restore_default_model = 0,
+            codex_model_migration_restore_default_effort = 0,
+            codex_model_migration_source_model = NULL,
+            codex_model_migration_source_effort = NULL,
+            codex_model_migration_target_model = NULL,
+            codex_model_migration_config_path = NULL,
+            codex_model_migration_config_fingerprint = NULL,
+            codex_model_migration_config_already_target = 0
+        WHERE project_id = ? AND tab_id = ?
+          AND codex_model_migration_pending = 1
+          AND codex_settings_proof_at = ?
+      `).run(
+        normalizedModel,
+        normalizedEffort,
+        normalizedProofAt,
+        normalizedProofSessionId,
+        projectId,
+        tabId,
+        normalizedPendingProofAt,
+      );
+      if (tabUpdate.changes !== 1) {
+        return { success: false, error: 'codex_model_migration_generation_changed' };
+      }
+
+      const restoreDefault = (key, enabled, value) => {
+        if (!enabled) return false;
+        const info = this.db.prepare(`
+          UPDATE app_state
+          SET value = ?, updated_at = strftime('%s', 'now')
+          WHERE key = ? AND value = 'none'
+        `).run(value, key);
+        return info.changes === 1;
+      };
+      return {
+        success: true,
+        defaultModelUpdated: restoreDefault(
+          'defaultCodexModel',
+          pendingState.codex_model_migration_restore_default_model === 1,
+          normalizedModel,
+        ),
+        defaultEffortUpdated: restoreDefault(
+          'defaultCodexEffort',
+          pendingState.codex_model_migration_restore_default_effort === 1,
+          normalizedEffort,
+        ),
+      };
+    });
+    return transaction();
+  }
+
+  rollbackTabCodexModelMigration(projectId, tabId, {
+    proofAt,
+    expectedPendingProofAt,
+  } = {}) {
+    if (arguments.length < 3 || !projectId || !tabId) {
+      return { success: false, error: 'codex_model_migration_invalid' };
+    }
+    const normalizedProofAt = Number(proofAt);
+    const normalizedPendingProofAt = Number(expectedPendingProofAt);
+    if (!Number.isFinite(normalizedProofAt)
+      || normalizedProofAt <= 0
+      || !Number.isFinite(normalizedPendingProofAt)
+      || normalizedPendingProofAt <= 0) {
+      return { success: false, error: 'codex_model_migration_proof_invalid' };
+    }
+    const transaction = this.db.transaction(() => {
+      const pendingState = this.db.prepare(`
+        SELECT codex_model_migration_pending,
+               codex_settings_proof_at,
+               codex_model_migration_restore_default_model,
+               codex_model_migration_restore_default_effort,
+               codex_model_migration_source_model,
+               codex_model_migration_source_effort
+        FROM tabs
+        WHERE project_id = ? AND tab_id = ?
+        LIMIT 1
+      `).get(projectId, tabId);
+      if (!pendingState) {
+        return { success: false, error: 'codex_model_migration_tab_missing' };
+      }
+      if (pendingState.codex_model_migration_pending !== 1
+        || Number(pendingState.codex_settings_proof_at) !== normalizedPendingProofAt) {
+        return { success: false, error: 'codex_model_migration_generation_changed' };
+      }
+      const sourceModel = typeof pendingState.codex_model_migration_source_model === 'string'
+        ? pendingState.codex_model_migration_source_model.trim()
+        : '';
+      const sourceEffort = typeof pendingState.codex_model_migration_source_effort === 'string'
+        ? pendingState.codex_model_migration_source_effort.trim().toLowerCase()
+        : '';
+      if (!sourceModel
+        || (pendingState.codex_model_migration_restore_default_effort === 1 && !sourceEffort)) {
+        return { success: false, error: 'codex_model_migration_rollback_source_missing' };
+      }
+
+      const tabUpdate = this.db.prepare(`
+        UPDATE tabs
+        SET codex_model = ?,
+            codex_effort = ?,
+            codex_settings_proof_at = ?,
+            codex_settings_proof_session_id = NULL,
+            codex_model_migration_pending = 0,
+            codex_model_migration_restore_default_model = 0,
+            codex_model_migration_restore_default_effort = 0,
+            codex_model_migration_source_model = NULL,
+            codex_model_migration_source_effort = NULL,
+            codex_model_migration_target_model = NULL,
+            codex_model_migration_config_path = NULL,
+            codex_model_migration_config_fingerprint = NULL,
+            codex_model_migration_config_already_target = 0
+        WHERE project_id = ? AND tab_id = ?
+          AND codex_model_migration_pending = 1
+          AND codex_settings_proof_at = ?
+      `).run(
+        sourceModel,
+        sourceEffort || null,
+        normalizedProofAt,
+        projectId,
+        tabId,
+        normalizedPendingProofAt,
+      );
+      if (tabUpdate.changes !== 1) {
+        return { success: false, error: 'codex_model_migration_generation_changed' };
+      }
+
+      const restoreDefault = (key, enabled, value) => {
+        if (!enabled || !value) return false;
+        const info = this.db.prepare(`
+          UPDATE app_state
+          SET value = ?, updated_at = strftime('%s', 'now')
+          WHERE key = ? AND value = 'none'
+        `).run(value, key);
+        return info.changes === 1;
+      };
+      return {
+        success: true,
+        model: sourceModel,
+        effort: sourceEffort || null,
+        defaultModelUpdated: restoreDefault(
+          'defaultCodexModel',
+          pendingState.codex_model_migration_restore_default_model === 1,
+          sourceModel,
+        ),
+        defaultEffortUpdated: restoreDefault(
+          'defaultCodexEffort',
+          pendingState.codex_model_migration_restore_default_effort === 1,
+          sourceEffort,
+        ),
+      };
+    });
+    return transaction();
+  }
+
+  commitPendingCodexWriterHandoff({
+    journalKey,
+    projectId,
+    tabId,
+    sourceSessionId,
+    nextSessionId,
+    actionGeneration,
+  } = {}) {
+    if (!journalKey || !projectId || !tabId || !sourceSessionId || !nextSessionId || !actionGeneration) {
+      return { success: false, error: 'codex_handoff_commit_invalid' };
+    }
+    const transaction = this.db.transaction(() => {
+      const journalInspection = this.inspectPendingCodexWriterHandoff(journalKey);
+      if (journalInspection.status === 'absent') {
+        return { success: false, error: 'codex_handoff_journal_missing', retryable: true };
+      }
+      if (journalInspection.status === 'invalid') {
+        return {
+          success: false,
+          error: journalInspection.error,
+          reason: journalInspection.reason,
+          retryable: false,
+        };
+      }
+      const journal = journalInspection.journal;
+      if (journal?.projectId !== projectId
+        || journal?.tabId !== tabId
+        || journal?.sourceSessionId !== sourceSessionId
+        || journal?.actionGeneration !== actionGeneration) {
+        return { success: false, error: 'codex_handoff_journal_stale', retryable: false };
+      }
+
+      const tabRow = this.db.prepare(
+        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+      ).get(projectId, tabId);
+      if (!tabRow) {
+        return { success: false, error: 'codex_tab_row_missing', retryable: true };
+      }
+      const currentSessionId = tabRow.codex_session_id || null;
+      if (currentSessionId !== sourceSessionId && currentSessionId !== nextSessionId) {
+        return {
+          success: false,
+          error: 'codex_handoff_binding_changed',
+          retryable: false,
+          currentSessionId,
+        };
+      }
+      if (currentSessionId === sourceSessionId) {
+        const updated = this.db.prepare(
+          'UPDATE tabs SET codex_session_id = ? WHERE project_id = ? AND tab_id = ? AND codex_session_id IS ?'
+        ).run(nextSessionId, projectId, tabId, sourceSessionId);
+        if (updated.changes !== 1) {
+          return { success: false, error: 'codex_handoff_compare_and_set_failed', retryable: true };
+        }
+      }
+      this.db.prepare('DELETE FROM app_state WHERE key = ?').run(journalKey);
+      return {
+        success: true,
+        updated: currentSessionId === sourceSessionId,
+        currentSessionId,
+        journalCleared: true,
+      };
+    });
+
+    try {
+      return transaction();
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+        retryable: true,
+      };
+    }
   }
 
   // Point-wise context% write (no renderer round-trip, no full-reinsert).
@@ -1431,10 +2175,54 @@ class DatabaseManager {
       for (const r of rows) codexSessionSnapshot.set(r.tab_id, r.codex_session_id);
     }
 
+    // Main can point-write an exact model/effort proof before renderer receives
+    // the matching IPC event. Preserve whichever side has the newer proof
+    // timestamp so an unrelated stale full save cannot resurrect old launch
+    // arguments. Equal timestamps intentionally allow renderer to attach the
+    // later-proven writer owner without changing the already-proven pair.
+    const codexSettingsSnapshot = new Map();
+    {
+      const rows = this.db.prepare(`
+        SELECT tab_id,
+               codex_model,
+               codex_effort,
+               codex_settings_proof_at,
+               codex_settings_proof_session_id,
+               codex_model_migration_pending,
+               codex_model_migration_restore_default_model,
+               codex_model_migration_restore_default_effort,
+               codex_model_migration_source_model,
+               codex_model_migration_source_effort,
+               codex_model_migration_target_model,
+               codex_model_migration_config_path,
+               codex_model_migration_config_fingerprint,
+               codex_model_migration_config_already_target
+        FROM tabs
+        WHERE project_id = ? AND tab_id IS NOT NULL
+      `).all(projectId);
+      for (const r of rows) {
+        codexSettingsSnapshot.set(r.tab_id, {
+          model: r.codex_model,
+          effort: r.codex_effort,
+          proofAt: Number(r.codex_settings_proof_at) || null,
+          proofSessionId: r.codex_settings_proof_session_id || null,
+          modelMigrationPending: r.codex_model_migration_pending === 1,
+          restoreDefaultModel: r.codex_model_migration_restore_default_model === 1,
+          restoreDefaultEffort: r.codex_model_migration_restore_default_effort === 1,
+          sourceModel: r.codex_model_migration_source_model || null,
+          sourceEffort: r.codex_model_migration_source_effort || null,
+          targetModel: r.codex_model_migration_target_model || null,
+          configPath: r.codex_model_migration_config_path || null,
+          configFingerprint: r.codex_model_migration_config_fingerprint || null,
+          configAlreadyTarget: r.codex_model_migration_config_already_target === 1,
+        });
+      }
+    }
+
     const deleteByTabId = this.db.prepare('DELETE FROM tabs WHERE project_id = ? AND tab_id = ?');
     const insert = this.db.prepare(`
-      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, external_run, was_interrupted, overlay_dismissed, notes, task_plan, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, restart_after_tab_id, restart_after_tab_ids, restart_after_command, restart_after_paused, restart_after_armed, restart_after_persistent, claude_session_history, provider_state, context_pct, cache_stats)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tabs (project_id, name, name_set_manually, cwd, position, color, is_utility, command_type, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, external_run, was_interrupted, overlay_dismissed, notes, task_plan, tab_type, url, file_path, terminal_id, terminal_name, active_view, created_at, is_collapsed, tab_group_id, visual_parent_tab_id, tab_id, session_status, completion_notification_persistent, restart_after_tab_id, restart_after_tab_ids, restart_after_command, restart_after_paused, restart_after_armed, restart_after_persistent, claude_session_history, provider_state, context_pct, cache_stats)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const transaction = this.db.transaction((tabList) => {
@@ -1493,7 +2281,32 @@ class DatabaseManager {
         const codexSessionId = codexSessionSnapshot.has(tab.tabId)
           ? codexSessionSnapshot.get(tab.tabId)
           : (tab.codexSessionId || null);
-        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, codexSessionId, tab.codexModel || null, tab.codexEffort || null, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', taskPlanJson, tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson);
+        const incomingCodexSettings = {
+          model: tab.codexModel || null,
+          effort: tab.codexEffort || null,
+          proofAt: Number(tab.codexSettingsProofAt) || null,
+          proofSessionId: tab.codexSettingsProofSessionId || null,
+          modelMigrationPending: tab.codexModelMigrationPending === true,
+          restoreDefaultModel: tab.codexModelMigrationRestoreDefaultModel === true,
+          restoreDefaultEffort: tab.codexModelMigrationRestoreDefaultEffort === true,
+          sourceModel: tab.codexModelMigrationSourceModel || null,
+          sourceEffort: tab.codexModelMigrationSourceEffort || null,
+          targetModel: tab.codexModelMigrationTargetModel || null,
+          configPath: tab.codexModelMigrationConfigPath || null,
+          configFingerprint: tab.codexModelMigrationConfigFingerprint || null,
+          configAlreadyTarget: tab.codexModelMigrationConfigAlreadyTarget === true,
+        };
+        const persistedCodexSettings = codexSettingsSnapshot.get(tab.tabId) || null;
+        let codexSettings = persistedCodexSettings
+          && (
+            // A renderer snapshot never owns a pending migration journal.
+            // Only the main-process ACK/recovery paths may settle it.
+            persistedCodexSettings.modelMigrationPending === true
+            || Number(persistedCodexSettings.proofAt || 0) > Number(incomingCodexSettings.proofAt || 0)
+          )
+          ? persistedCodexSettings
+          : incomingCodexSettings;
+        insert.run(projectId, tab.name, tab.nameSetManually ? 1 : 0, tab.cwd, index, tab.color || null, tab.isUtility ? 1 : 0, tab.commandType || null, tab.claudeSessionId || null, tab.geminiSessionId || null, codexSessionId, codexSettings.model, codexSettings.effort, codexSettings.proofAt, codexSettings.proofSessionId, codexSettings.modelMigrationPending ? 1 : 0, codexSettings.restoreDefaultModel ? 1 : 0, codexSettings.restoreDefaultEffort ? 1 : 0, codexSettings.sourceModel, codexSettings.sourceEffort, codexSettings.targetModel, codexSettings.configPath, codexSettings.configFingerprint, codexSettings.configAlreadyTarget ? 1 : 0, externalRunJson, interruptedFlag, tab.overlayDismissed ? 1 : 0, tab.notes || '', taskPlanJson, tab.tabType || 'terminal', tab.url || null, tab.filePath || null, tab.terminalId || null, tab.terminalName || null, tab.activeView || null, tab.createdAt || null, tab.isCollapsed ? 1 : 0, tab.groupId || null, tab.visualParentTabId || null, tab.tabId || null, tab.sessionStatus || null, tab.completionNotificationPersistent ? 1 : 0, restartAfterIds[0] || null, restartAfterIdsJson, tab.restartAfterCommand || null, tab.restartAfterPaused ? 1 : 0, tab.restartAfterArmed ? 1 : 0, tab.restartAfterPersistent ? 1 : 0, historyJson, providerStateJson, ctxPct, cacheStatsJson);
       });
 
       // Step 4: Clean up tabs that exist in DB but NOT in the new set
@@ -1536,7 +2349,10 @@ class DatabaseManager {
 
       const placeholders = ids.map(() => '?').join(',');
       const sourceRows = this.db.prepare(
-        `SELECT id, tab_id FROM tabs WHERE project_id = ? AND tab_id IN (${placeholders}) ORDER BY position, id`
+        `SELECT id, tab_id, visual_parent_tab_id
+         FROM tabs
+         WHERE project_id = ? AND tab_id IN (${placeholders})
+         ORDER BY position, id`
       ).all(sourceProjectId, ...ids);
       const foundIds = new Set(sourceRows.map((row) => row.tab_id));
       const missing = ids.filter((id) => !foundIds.has(id));
@@ -1555,17 +2371,34 @@ class DatabaseManager {
         };
       }
 
+      const journalMigration = this._migratePendingCodexWriterHandoffsInTransaction({
+        sourceProjectId,
+        targetProjectId,
+        tabIds: ids,
+      });
+      if (!journalMigration.success) return journalMigration;
+
       const targetMax = Number(this.db.prepare(
         'SELECT COALESCE(MAX(position), -1) AS max_position FROM tabs WHERE project_id = ?'
       ).get(targetProjectId)?.max_position ?? -1);
       const update = this.db.prepare(`
         UPDATE tabs
         SET project_id = ?, position = ?, is_utility = 0,
-            tab_group_id = NULL, visual_parent_tab_id = NULL
+            tab_group_id = NULL, visual_parent_tab_id = ?
         WHERE project_id = ? AND tab_id = ?
       `);
+      const movedSet = new Set(ids);
       sourceRows.forEach((row, index) => {
-        const info = update.run(targetProjectId, targetMax + index + 1, sourceProjectId, row.tab_id);
+        const retainedParent = row.visual_parent_tab_id && movedSet.has(row.visual_parent_tab_id)
+          ? row.visual_parent_tab_id
+          : null;
+        const info = update.run(
+          targetProjectId,
+          targetMax + index + 1,
+          retainedParent,
+          sourceProjectId,
+          row.tab_id
+        );
         if (info.changes !== 1) throw new Error('tab_project_transfer_lost_source_row:' + row.tab_id);
       });
 
@@ -1581,7 +2414,6 @@ class DatabaseManager {
         try {
           const groups = JSON.parse(sourceProject.tab_groups);
           if (Array.isArray(groups)) {
-            const movedSet = new Set(ids);
             let changed = false;
             const nextGroups = groups.map((group) => {
               if (!group?.anchorTabId || !movedSet.has(group.anchorTabId)) return group;
@@ -1608,6 +2440,167 @@ class DatabaseManager {
     }
   }
 
+  transferTabGroupToProject(
+    sourceProjectId,
+    targetProjectId,
+    groupId,
+    targetGroupId,
+    expectedTabIds = null
+  ) {
+    const normalizeIds = (values) => Array.from(new Set(
+      (Array.isArray(values) ? values : [])
+        .filter((id) => typeof id === 'string' && id.trim())
+        .map((id) => id.trim())
+    ));
+    if (
+      !sourceProjectId
+      || !targetProjectId
+      || sourceProjectId === targetProjectId
+      || typeof groupId !== 'string'
+      || !groupId.trim()
+      || typeof targetGroupId !== 'string'
+      || !targetGroupId.trim()
+    ) {
+      return { success: false, error: 'invalid_tab_group_project_transfer' };
+    }
+
+    const transfer = this.db.transaction(() => {
+      const sourceProject = this.db.prepare('SELECT tab_groups FROM projects WHERE id = ?').get(sourceProjectId);
+      const targetProject = this.db.prepare('SELECT tab_groups FROM projects WHERE id = ?').get(targetProjectId);
+      if (!sourceProject || !targetProject) {
+        return { success: false, error: 'tab_group_project_not_found' };
+      }
+
+      const parseGroups = (raw) => {
+        if (!raw) return [];
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) throw new Error('tab_group_state_invalid');
+        return parsed;
+      };
+      let sourceGroups;
+      let targetGroups;
+      try {
+        sourceGroups = parseGroups(sourceProject.tab_groups);
+        targetGroups = parseGroups(targetProject.tab_groups);
+      } catch (error) {
+        return { success: false, error: error?.message || 'tab_group_state_invalid' };
+      }
+
+      const sourceGroupIndex = sourceGroups.findIndex((group) => group?.id === groupId);
+      if (sourceGroupIndex < 0) {
+        return { success: false, error: 'tab_group_source_missing' };
+      }
+      if (targetGroups.some((group) => group?.id === targetGroupId)) {
+        return { success: false, error: 'tab_group_target_collision' };
+      }
+
+      const sourceRows = this.db.prepare(`
+        SELECT id, tab_id, visual_parent_tab_id
+        FROM tabs
+        WHERE project_id = ? AND tab_group_id = ?
+        ORDER BY position, id
+      `).all(sourceProjectId, groupId);
+      const rowTabIds = sourceRows.map((row) => row.tab_id).filter(Boolean);
+      if (rowTabIds.length !== sourceRows.length) {
+        return { success: false, error: 'tab_group_tab_identity_missing' };
+      }
+
+      if (Array.isArray(expectedTabIds)) {
+        const expectedIds = normalizeIds(expectedTabIds);
+        const found = new Set(rowTabIds);
+        const expected = new Set(expectedIds);
+        if (
+          expectedIds.length !== rowTabIds.length
+          || expectedIds.some((id) => !found.has(id))
+          || rowTabIds.some((id) => !expected.has(id))
+        ) {
+          return {
+            success: false,
+            error: 'tab_group_source_rows_changed',
+            expected: expectedIds,
+            found: rowTabIds,
+          };
+        }
+      }
+
+      if (rowTabIds.length > 0) {
+        const placeholders = rowTabIds.map(() => '?').join(',');
+        const collisions = this.db.prepare(
+          `SELECT tab_id FROM tabs WHERE project_id = ? AND tab_id IN (${placeholders})`
+        ).all(targetProjectId, ...rowTabIds);
+        if (collisions.length > 0) {
+          return {
+            success: false,
+            error: 'tab_group_target_tab_collision',
+            collisions: collisions.map((row) => row.tab_id),
+          };
+        }
+
+        const journalMigration = this._migratePendingCodexWriterHandoffsInTransaction({
+          sourceProjectId,
+          targetProjectId,
+          tabIds: rowTabIds,
+        });
+        if (!journalMigration.success) return journalMigration;
+
+        const targetMax = Number(this.db.prepare(
+          'SELECT COALESCE(MAX(position), -1) AS max_position FROM tabs WHERE project_id = ?'
+        ).get(targetProjectId)?.max_position ?? -1);
+        const movedSet = new Set(rowTabIds);
+        const update = this.db.prepare(`
+          UPDATE tabs
+          SET project_id = ?, position = ?, is_utility = 0,
+              tab_group_id = ?, visual_parent_tab_id = ?
+          WHERE project_id = ? AND tab_id = ?
+        `);
+        sourceRows.forEach((row, index) => {
+          const retainedParent = row.visual_parent_tab_id && movedSet.has(row.visual_parent_tab_id)
+            ? row.visual_parent_tab_id
+            : null;
+          const info = update.run(
+            targetProjectId,
+            targetMax + index + 1,
+            targetGroupId,
+            retainedParent,
+            sourceProjectId,
+            row.tab_id
+          );
+          if (info.changes !== 1) {
+            throw new Error('tab_group_project_transfer_lost_source_row:' + row.tab_id);
+          }
+        });
+
+        this.db.prepare(
+          `UPDATE tabs SET visual_parent_tab_id = NULL
+           WHERE project_id = ? AND visual_parent_tab_id IN (${placeholders})`
+        ).run(sourceProjectId, ...rowTabIds);
+      }
+
+      const sourceGroup = sourceGroups[sourceGroupIndex];
+      const { anchorTabId: _sourceAnchor, ...groupWithoutAnchor } = sourceGroup;
+      const targetGroup = { ...groupWithoutAnchor, id: targetGroupId };
+      const nextSourceGroups = sourceGroups.filter((_, index) => index !== sourceGroupIndex);
+      const nextTargetGroups = [...targetGroups, targetGroup];
+      this.db.prepare('UPDATE projects SET tab_groups = ?, updated_at = strftime(\'%s\', \'now\') WHERE id = ?')
+        .run(nextSourceGroups.length > 0 ? JSON.stringify(nextSourceGroups) : null, sourceProjectId);
+      this.db.prepare('UPDATE projects SET tab_groups = ?, updated_at = strftime(\'%s\', \'now\') WHERE id = ?')
+        .run(JSON.stringify(nextTargetGroups), targetProjectId);
+
+      return {
+        success: true,
+        transferred: rowTabIds,
+        sourceGroupId: groupId,
+        targetGroupId,
+      };
+    });
+
+    try {
+      return transfer();
+    } catch (error) {
+      return { success: false, error: error?.message || String(error) };
+    }
+  }
+
   // ========== TAB HISTORY (CLOSED TABS ARCHIVE) ==========
 
   archiveTab(projectId, tab, {
@@ -1623,50 +2616,103 @@ class DatabaseManager {
       // Close/restore is a durable identity boundary. Resolve the binding from
       // main-owned state while the original row still exists; an incoming
       // renderer snapshot may still carry the resume source after main has
-      // already point-written a linked writer. A real NULL is authoritative
-      // too and must not fall back to that stale renderer value.
-      const persistedSessionId = this.getTabCodexSessionId(projectId, sourceTabId);
-      if (persistedSessionId === undefined) {
+      // already point-written a linked writer or a model migration. A real
+      // NULL session is authoritative too and must not fall back to that stale
+      // renderer value.
+      const persisted = this.db.prepare(`
+        SELECT codex_session_id,
+               codex_model,
+               codex_effort,
+               codex_settings_proof_at,
+               codex_settings_proof_session_id,
+               codex_model_migration_pending,
+               codex_model_migration_restore_default_model,
+               codex_model_migration_restore_default_effort,
+               codex_model_migration_source_model,
+               codex_model_migration_source_effort,
+               codex_model_migration_target_model,
+               codex_model_migration_config_path,
+               codex_model_migration_config_fingerprint,
+               codex_model_migration_config_already_target
+        FROM tabs
+        WHERE project_id = ? AND tab_id = ?
+        LIMIT 1
+      `).get(projectId, sourceTabId);
+      if (!persisted) {
         return null;
       }
       const provenWriter = typeof codexWriterSessionId === 'string' && codexWriterSessionId.trim()
         ? codexWriterSessionId.trim()
         : null;
+      const incomingSettingsProofAt = Number(tab.codexSettingsProofAt) || null;
+      const persistedSettingsProofAt = Number(persisted.codex_settings_proof_at) || null;
+      const persistedSettingsAreNewer = Number(persistedSettingsProofAt || 0)
+        > Number(incomingSettingsProofAt || 0);
       archivedTab = {
         ...tab,
-        codexSessionId: provenWriter || persistedSessionId || null,
+        codexSessionId: provenWriter || persisted.codex_session_id || null,
+        ...(persisted.codex_model_migration_pending === 1 || persistedSettingsAreNewer ? {
+          codexModel: persisted.codex_model || null,
+          codexEffort: persisted.codex_effort || null,
+          codexSettingsProofAt: persistedSettingsProofAt,
+          codexSettingsProofSessionId: persisted.codex_settings_proof_session_id || null,
+          codexModelMigrationPending: persisted.codex_model_migration_pending === 1,
+          codexModelMigrationRestoreDefaultModel: persisted.codex_model_migration_restore_default_model === 1,
+          codexModelMigrationRestoreDefaultEffort: persisted.codex_model_migration_restore_default_effort === 1,
+          codexModelMigrationSourceModel: persisted.codex_model_migration_source_model || null,
+          codexModelMigrationSourceEffort: persisted.codex_model_migration_source_effort || null,
+          codexModelMigrationTargetModel: persisted.codex_model_migration_target_model || null,
+          codexModelMigrationConfigPath: persisted.codex_model_migration_config_path || null,
+          codexModelMigrationConfigFingerprint: persisted.codex_model_migration_config_fingerprint || null,
+          codexModelMigrationConfigAlreadyTarget: persisted.codex_model_migration_config_already_target === 1,
+        } : {}),
       };
     }
     const now = Math.floor(Date.now() / 1000);
-    const info = this.db.prepare(`
-      INSERT INTO tab_history (project_id, name, name_set_manually, cwd, color, notes, task_plan, command_type, tab_type, url, file_path, created_at, closed_at, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, message_count, position, process_was_running, session_status, group_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      projectId,
-      archivedTab.name,
-      archivedTab.nameSetManually ? 1 : 0,
-      archivedTab.cwd,
-      archivedTab.color || null,
-      archivedTab.notes || null,
-      archivedTab.taskPlan ? JSON.stringify(normalizeTaskPlan(archivedTab.taskPlan)) : null,
-      archivedTab.commandType || null,
-      tabType,
-      archivedTab.url || null,
-      archivedTab.filePath || null,
-      archivedTab.createdAt || now,
-      now,
-      archivedTab.claudeSessionId || null,
-      archivedTab.geminiSessionId || null,
-      archivedTab.codexSessionId || null,
-      archivedTab.codexModel || null,
-      archivedTab.codexEffort || null,
-      archivedTab.messageCount ?? null,
-      archivedTab.position ?? null,
-      archivedTab.processWasRunning ? 1 : 0,
-      archivedTab.sessionStatus || null,
-      archivedTab.groupId || null
-    );
-    return info.lastInsertRowid;
+    const insert = this.db.prepare(`
+      INSERT INTO tab_history (project_id, name, name_set_manually, cwd, color, notes, task_plan, command_type, tab_type, url, file_path, created_at, closed_at, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, message_count, position, process_was_running, session_status, group_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const archive = this.db.transaction(() => {
+      const info = insert.run(
+        projectId,
+        archivedTab.name,
+        archivedTab.nameSetManually ? 1 : 0,
+        archivedTab.cwd,
+        archivedTab.color || null,
+        archivedTab.notes || null,
+        archivedTab.taskPlan ? JSON.stringify(normalizeTaskPlan(archivedTab.taskPlan)) : null,
+        archivedTab.commandType || null,
+        tabType,
+        archivedTab.url || null,
+        archivedTab.filePath || null,
+        archivedTab.createdAt || now,
+        now,
+        archivedTab.claudeSessionId || null,
+        archivedTab.geminiSessionId || null,
+        archivedTab.codexSessionId || null,
+        archivedTab.codexModel || null,
+        archivedTab.codexEffort || null,
+        Number(archivedTab.codexSettingsProofAt) || null,
+        archivedTab.codexSettingsProofSessionId || null,
+        archivedTab.codexModelMigrationPending ? 1 : 0,
+        archivedTab.codexModelMigrationRestoreDefaultModel ? 1 : 0,
+        archivedTab.codexModelMigrationRestoreDefaultEffort ? 1 : 0,
+        archivedTab.codexModelMigrationSourceModel || null,
+        archivedTab.codexModelMigrationSourceEffort || null,
+        archivedTab.codexModelMigrationTargetModel || null,
+        archivedTab.codexModelMigrationConfigPath || null,
+        archivedTab.codexModelMigrationConfigFingerprint || null,
+        archivedTab.codexModelMigrationConfigAlreadyTarget ? 1 : 0,
+        archivedTab.messageCount ?? null,
+        archivedTab.position ?? null,
+        archivedTab.processWasRunning ? 1 : 0,
+        archivedTab.sessionStatus || null,
+        archivedTab.groupId || null
+      );
+      return info.lastInsertRowid;
+    });
+    return archive();
   }
 
   // Read the most recent restorable history entry without consuming it.
@@ -1793,6 +2839,65 @@ class DatabaseManager {
       cmds.forEach((cmd, index) => insert.run(cmd.name, cmd.command, index));
     });
     transaction(commands);
+  }
+
+  // One-time compatibility bridge for databases created before quick commands
+  // became global. Existing global state always wins: legacy project rows must
+  // never overwrite commands the user has edited in Settings.
+  migrateQuickActionsToGlobal() {
+    const migrate = this.db.transaction(() => {
+      const existingGlobal = Number(
+        this.db.prepare('SELECT COUNT(*) AS count FROM global_commands').get()?.count || 0
+      );
+      if (existingGlobal > 0) {
+        return {
+          migrated: false,
+          count: 0,
+          message: 'Global commands already exist',
+        };
+      }
+
+      const legacyActions = this.db.prepare(`
+        SELECT name, command
+        FROM quick_actions
+        ORDER BY position, id
+      `).all();
+      if (legacyActions.length === 0) {
+        return {
+          migrated: false,
+          count: 0,
+          message: 'No legacy quick actions',
+        };
+      }
+
+      const uniqueCommands = new Map();
+      for (const action of legacyActions) {
+        const identity = JSON.stringify([action.name, action.command]);
+        if (!uniqueCommands.has(identity)) {
+          uniqueCommands.set(identity, {
+            name: action.name,
+            command: action.command,
+          });
+        }
+      }
+
+      const insert = this.db.prepare(`
+        INSERT INTO global_commands (name, command, position)
+        VALUES (?, ?, ?)
+      `);
+      let position = 0;
+      for (const command of uniqueCommands.values()) {
+        insert.run(command.name, command.command, position);
+        position += 1;
+      }
+
+      return {
+        migrated: true,
+        count: uniqueCommands.size,
+      };
+    });
+
+    return migrate();
   }
 
   getPrompts() {

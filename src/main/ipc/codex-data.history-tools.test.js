@@ -140,3 +140,18 @@ test('keeps direct legacy calls but gives them semantic History labels', () => {
   assert.equal(actions[0].args.command, 'pwd');
   assert.equal(actions[1].args.summary, 'knowledge · docs_search — timeline');
 });
+
+test('keeps a tool card uuid stable when its output arrives', () => {
+  const pending = historyFor(execCall('exec-stable', 'text("pending")'));
+  const completed = historyFor(
+    execCall('exec-stable', 'text("pending")'),
+    output('exec-stable', 'done'),
+  );
+  const pendingCard = pending.find((entry) => entry.actions?.length);
+  const completedCard = completed.find((entry) => entry.actions?.length);
+
+  assert.ok(pendingCard);
+  assert.ok(completedCard);
+  assert.equal(completedCard.uuid, pendingCard.uuid);
+  assert.equal(completedCard.actions[0].rawTool.result, 'done');
+});

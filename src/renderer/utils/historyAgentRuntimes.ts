@@ -1,6 +1,17 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { buildCodexRunPayload } from './codexLaunch';
+import {
+  codexSettingsProofMatchesActiveWriter,
+  isCompleteCodexSettingsRequest,
+  planCodexHistorySettings,
+  resolveCodexSettingsRuntimeProof,
+} from './codexHistorySettingsPlan.mjs';
 import { readCodexPtyPresence } from './codexPtyPresence.mjs';
+import { readCodexDraftAuthority } from './codexDraftAuthority.mjs';
+import {
+  planCodexPickerStateApplication,
+  resolveCodexEffectiveSettings,
+} from './codexEffectiveSettings.mjs';
 import { terminalRegistry } from './terminalRegistry';
 import {
   answerClaudeQuestion,
@@ -92,6 +103,7 @@ export interface HistoryAgentRuntime {
   interruptTurn: (tabId: string) => { success: boolean; interrupted?: boolean; error?: string };
   stopProcess: (tabId: string) => Promise<any>;
   grabDraft: (tabId: string) => Promise<AgentDraftGrabResult>;
+  probeDraft?: (tabId: string, reason: string) => Promise<{ hasDraft: boolean | null; preview: string; source: string; [key: string]: any }>;
   inspectDraft?: (tabId: string) => { hasDraft: boolean | null; preview: string; source: string };
   getPendingQuestion?: (tabId: string) => Promise<AgentPendingQuestion | null>;
   answerQuestion?: (args: {
@@ -123,6 +135,10 @@ type RuntimeTabState = {
   codexSessionId?: string;
   codexModel?: string;
   codexEffort?: string;
+  codexLiveModel?: string;
+  codexLiveEffort?: string;
+  codexLiveSettingsSessionId?: string;
+  codexSettingsProofSessionId?: string;
 };
 
 const findTabRuntimeContext = (
@@ -147,9 +163,37 @@ const findTabRuntimeContext = (
   return { ...matches[0], uniqueTabId: matches.length === 1 };
 };
 
-const findTabState = (tabId: string): RuntimeTabState | null => (
-  findTabRuntimeContext(tabId)?.tab || null
-);
+const applyCodexPickerResultForTab = ({
+  tabId,
+  tabState,
+  result,
+  requestedModel,
+  requestedEffort,
+  liveSessionId,
+}: {
+  tabId: string;
+  tabState: RuntimeTabState | null;
+  result: any;
+  requestedModel?: string;
+  requestedEffort?: string;
+  liveSessionId?: string | null;
+}) => {
+  const plan = planCodexPickerStateApplication({
+    result,
+    requestedModel,
+    requestedEffort,
+    liveSessionId,
+    currentPersistentModel: tabState?.codexModel,
+    currentPersistentEffort: tabState?.codexEffort,
+  });
+  if (!plan.allowed) return plan;
+  const state = useWorkspaceStore.getState();
+  if (Object.keys(plan.persistentPatch || {}).length > 0) {
+    state.updateCodexState(tabId, plan.persistentPatch);
+  }
+  state.updateCodexLiveState(tabId, plan.livePatch);
+  return plan;
+};
 
 async function startFreshClaudePtySession({
   tabId,
@@ -161,9 +205,13 @@ async function startFreshClaudePtySession({
   const store = useWorkspaceStore.getState();
   store.setTabCommandType(tabId, 'claude');
   store.markAiLaunchAutoTitle(tabId, 'claude');
-  store.clearInterruptedState?.(tabId);
   console.log('[ClaudePtyActions:startFresh] start tab=' + shortTab(tabId));
-  ipcRenderer.send('claude:run-command', { tabId, command: 'claude' });
+  const runResult = await ipcRenderer.invoke('claude:run-command', { tabId, command: 'claude' })
+    .catch((err: any) => ({ success: false, error: String(err?.message || err) }));
+  if (runResult?.success === false) {
+    return { success: false, error: runResult.error || runResult.reason || 'Claude start failed' };
+  }
+  store.clearInterruptedState?.(tabId);
   return { success: true, status: 'starting' };
 }
 
@@ -208,7 +256,6 @@ async function resumeCodexSession({
   if (!sessionId) return { success: false, error: 'sessionId required' };
   const store = useWorkspaceStore.getState();
   store.setTabCommandType(tabId, 'codex');
-  store.clearInterruptedState?.(tabId);
   console.log('[CodexHistoryActions:resume] start tab=' + shortTab(tabId) + ' sid=' + sessionId.slice(0, 8));
   const runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
     tabId,
@@ -216,9 +263,10 @@ async function resumeCodexSession({
     sessionId,
     cwd,
   })).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
-  if (runResult?.success === false) {
+  if (runResult?.success === false || runResult?.accepted === false) {
     return { success: false, error: runResult.error || 'Codex resume failed' };
   }
+  store.clearInterruptedState?.(tabId);
   return { success: true, sessionId };
 }
 
@@ -233,66 +281,206 @@ async function startFreshCodexSession({
   const store = useWorkspaceStore.getState();
   store.setTabCommandType(tabId, 'codex');
   store.markAiLaunchAutoTitle(tabId, 'codex');
-  store.clearInterruptedState?.(tabId);
   console.log('[CodexHistoryActions:startFresh] start tab=' + shortTab(tabId));
   const runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
     tabId,
     command: 'codex',
     cwd,
   })).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
-  if (runResult?.success === false) {
+  if (runResult?.success === false || runResult?.accepted === false) {
     return { success: false, error: runResult.error || 'Codex start failed' };
   }
+  store.clearInterruptedState?.(tabId);
   return { success: true, status: 'starting' };
 }
 
 async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSendPromptOptions = {}): Promise<any> {
   if (!tabId) return { success: false, error: 'tabId required' };
   if (!prompt.trim()) return { success: false, error: 'prompt required' };
+  const tabContext = findTabRuntimeContext(tabId);
+  const tabState = tabContext?.tab || null;
+  const hasSettingsRequest = [options.model, options.effort].some((value) => (
+    typeof value === 'string'
+    && value.trim().length > 0
+    && value.trim() !== 'none'
+  ));
+  const settingsRuntimeSnapshot = hasSettingsRequest
+    && options.statusAtSend !== 'busy'
+    && options.queue !== true
+    ? await ipcRenderer.invoke('codex:get-runtime-session', {
+      tabId,
+      projectId: tabContext?.projectId || null,
+    }).catch((error: any) => {
+      console.warn('[CodexHistoryActions:send] settings owner lookup failed tab='
+        + shortTab(tabId)
+        + ' error=' + errorText(error));
+      return null;
+    })
+    : null;
+  const { activeWriterSessionId } = resolveCodexSettingsRuntimeProof(settingsRuntimeSnapshot);
+  const effectiveSettings = resolveCodexEffectiveSettings({
+    codexSessionId: tabState?.codexSessionId,
+    codexModel: tabState?.codexModel,
+    codexEffort: tabState?.codexEffort,
+    codexLiveModel: tabState?.codexLiveModel,
+    codexLiveEffort: tabState?.codexLiveEffort,
+    codexLiveSettingsSessionId: tabState?.codexLiveSettingsSessionId,
+  });
+  const settingsPlan = planCodexHistorySettings({
+    requestedModel: options.model,
+    requestedEffort: options.effort,
+    currentModel: effectiveSettings.model,
+    currentEffort: effectiveSettings.effort,
+    currentProofSessionId: effectiveSettings.liveOwned
+      ? tabState?.codexLiveSettingsSessionId
+      : tabState?.codexSettingsProofSessionId,
+    runtimeSnapshot: settingsRuntimeSnapshot,
+    statusAtSend: options.statusAtSend,
+    queue: options.queue,
+  });
+  if (settingsPlan.blocked) {
+    console.warn('[CodexHistoryActions:send] settings refused tab='
+      + shortTab(tabId)
+      + ' statusAtSend=' + (options.statusAtSend || '-')
+      + ' queue=' + (options.queue === true)
+      + ' code=' + settingsPlan.code);
+    return {
+      success: false,
+      ok: false,
+      code: settingsPlan.code,
+      error: settingsPlan.error,
+      promptSent: false,
+    };
+  }
   const existing = codexSendInflight.get(tabId);
   if (existing) {
+    if (settingsPlan.hasRequestedSettings) {
+      console.warn('[CodexHistoryActions:send] settings refused behind inflight send tab='
+        + shortTab(tabId)
+        + ' handoff=' + (options.handoffId || '-'));
+      return {
+        success: false,
+        ok: false,
+        code: 'codex_settings_change_send_inflight',
+        error: 'Another Codex send is already in progress; settings and prompt were not sent',
+        promptSent: false,
+      };
+    }
     console.log('[CodexHistoryActions:send] join-inflight tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-'));
     return existing;
   }
   useWorkspaceStore.getState().clearInterruptedState?.(tabId);
   const queue = options.queue === true || options.statusAtSend === 'busy';
-  const requestedModel = typeof options.model === 'string' ? options.model.trim() : '';
-  const requestedEffort = typeof options.effort === 'string' ? options.effort.trim() : '';
-  const tabState = findTabState(tabId);
-  const modelForPicker = requestedModel && requestedModel !== 'none' ? requestedModel : (tabState?.codexModel || '');
-  const effortForPicker = requestedEffort && requestedEffort !== 'none' ? requestedEffort : '';
-  const draftStateForSend = await ipcRenderer.invoke('codex:get-draft-state', tabId, {
+  const modelForPicker = settingsPlan.model;
+  const effortForPicker = settingsPlan.effort;
+  const visualDraftStateForSend = terminalRegistry.getCodexDraftState(tabId);
+  const draftStateForSend = await readCodexDraftAuthority({
+    invoke: ipcRenderer.invoke.bind(ipcRenderer),
+    tabId,
     reason: 'history-send-preflight',
     timeoutMs: 700,
-  }).catch((error: any) => {
-    console.warn('[CodexHistoryActions:send] main draft probe failed tab=' + shortTab(tabId) + ': ' + errorText(error));
-    return terminalRegistry.getCodexDraftState(tabId);
+    visualState: visualDraftStateForSend,
   });
   console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' model=' + (modelForPicker || '-') + ' effort=' + (effortForPicker || '-') + ' submitIntent=' + (queue ? 'enter-busy' : 'enter') + ' chars=' + prompt.length + ' draftSource=' + (draftStateForSend?.source || '-') + ' skipVisibleDraftGuard=false');
-  if (options.statusAtSend !== 'busy' && modelForPicker) {
-    const currentModel = tabState?.codexModel || '';
-    const currentEffort = tabState?.codexEffort || '';
-    const needsPicker = modelForPicker !== currentModel || (!!effortForPicker && effortForPicker !== currentEffort);
+  if (settingsPlan.hasRequestedSettings) {
+    const currentModel = effectiveSettings.model || '';
+    const currentEffort = effectiveSettings.effort || '';
+    // Equal strings are not enough after a writer handoff: without matching
+    // ownership proof they may describe the resume source, not this process's
+    // active conversation. A complete API pair must still reach the picker.
+    const currentPairProvenForWriter = codexSettingsProofMatchesActiveWriter({
+      currentProofSessionId: effectiveSettings.liveOwned
+        ? tabState?.codexLiveSettingsSessionId
+        : tabState?.codexSettingsProofSessionId,
+      runtimeSnapshot: settingsRuntimeSnapshot,
+    });
+    const needsPicker = modelForPicker !== currentModel
+      || effortForPicker !== currentEffort
+      || !currentPairProvenForWriter;
     if (needsPicker) {
+      const pickerHasDraft =
+        draftStateForSend?.hasDraft === true || draftStateForSend?.hasDraft === false
+        ? draftStateForSend.hasDraft
+        : null;
+      if (pickerHasDraft === null) {
+        console.warn('[CodexHistoryActions:send] picker refused unknown draft state tab='
+          + shortTab(tabId)
+          + ' source=' + (draftStateForSend?.source || '-'));
+        return { success: false, error: 'codex_draft_state_unknown' };
+      }
       const pickerResult = await ipcRenderer.invoke('codex:select-model-effort', {
         tabId,
         model: modelForPicker,
-        effort: effortForPicker || undefined,
-        hasDraft: false,
-        draftSource: 'external-send',
-        draftPreview: '',
-        visualHasDraft: false,
-        visualSource: 'external-send',
-        visualPreview: '',
+        effort: effortForPicker,
+        expectedWriterSessionId: isCompleteCodexSettingsRequest({
+          requestedModel: options.model,
+          requestedEffort: options.effort,
+        })
+          ? undefined
+          : activeWriterSessionId,
+        allowTurnBusy: false,
+        hasDraft: pickerHasDraft,
+        draftSource: draftStateForSend.source || 'history-send-preflight',
+        draftPreview: draftStateForSend.preview || '',
+        visualHasDraft: pickerHasDraft,
+        visualSource: draftStateForSend.source || 'history-send-preflight',
+        visualPreview: draftStateForSend.preview || '',
       });
+      const appliedWithProof = pickerResult?.applied === true
+        && !!(pickerResult?.applicationProofSource || pickerResult?.configProofSource);
       if (pickerResult?.success === false) {
+        if (appliedWithProof) {
+          const appliedPlan = applyCodexPickerResultForTab({
+            tabId,
+            tabState,
+            result: pickerResult,
+            requestedModel: modelForPicker,
+            requestedEffort: effortForPicker,
+            liveSessionId: pickerResult?.codexSettingsProofSessionId
+              || activeWriterSessionId
+              || tabState?.codexSessionId,
+          });
+          if (!appliedPlan.allowed) {
+            return {
+              success: false,
+              error: appliedPlan.code || 'codex picker proof could not be owned',
+            };
+          }
+          console.warn('[CodexHistoryActions:send] picker applied but draft restore failed tab='
+            + shortTab(tabId)
+            + ' model=' + appliedPlan.model
+            + ' effort=' + (appliedPlan.effort || '-')
+            + ' proof=' + (pickerResult?.applicationProofSource || pickerResult?.configProofSource)
+            + ' error=' + (pickerResult?.error || 'unknown'));
+          return {
+            ...pickerResult,
+            success: false,
+            applied: true,
+            model: appliedPlan.model,
+            effort: appliedPlan.effort,
+            error: pickerResult?.error
+              || 'Codex settings changed, but the input text could not be restored',
+          };
+        }
         console.warn('[CodexHistoryActions:send] picker failed tab=' + shortTab(tabId) + ' error=' + (pickerResult?.error || 'unknown'));
         return { success: false, error: pickerResult?.error || 'model effort switch failed' };
       }
-      useWorkspaceStore.getState().updateCodexState(tabId, {
-        codexModel: pickerResult?.model || modelForPicker,
-        ...(effortForPicker ? { codexEffort: pickerResult?.effort || effortForPicker } : {}),
+      const appliedPlan = applyCodexPickerResultForTab({
+        tabId,
+        tabState,
+        result: pickerResult,
+        requestedModel: modelForPicker,
+        requestedEffort: effortForPicker,
+        liveSessionId: pickerResult?.codexSettingsProofSessionId
+          || activeWriterSessionId
+          || tabState?.codexSessionId,
       });
+      if (!appliedPlan.allowed) {
+        return {
+          success: false,
+          error: appliedPlan.code || 'codex picker proof could not be owned',
+        };
+      }
     }
   }
   const work = ipcRenderer.invoke('codex:send-command', tabId, prompt, {
@@ -390,6 +578,25 @@ function inspectCodexDraft(tabId: string): { hasDraft: boolean | null; preview: 
   return state;
 }
 
+async function probeCodexDraft(tabId: string, reason: string) {
+  const visualState = terminalRegistry.getCodexDraftState(tabId);
+  const resolved = await readCodexDraftAuthority({
+    invoke: ipcRenderer.invoke.bind(ipcRenderer),
+    tabId,
+    reason,
+    timeoutMs: 700,
+    visualState,
+  });
+  console.warn('[CodexHistoryActions:draft] authoritative-probe tab=' + shortTab(tabId)
+    + ' reason=' + reason
+    + ' hasDraft=' + resolved.hasDraft
+    + ' authority=' + resolved.authority
+    + ' source=' + resolved.source
+    + ' visual=' + resolved.visualHasDraft + ':' + resolved.visualSource
+    + ' preview=' + JSON.stringify(resolved.preview));
+  return resolved;
+}
+
 const CLAUDE_RUNTIME: HistoryAgentRuntime = {
   toolType: 'claude',
   label: 'Claude',
@@ -438,6 +645,7 @@ const CODEX_RUNTIME: HistoryAgentRuntime = {
   interruptTurn: interruptCodexTurn,
   stopProcess: stopCodexProcess,
   grabDraft: grabCodexDraft,
+  probeDraft: probeCodexDraft,
   inspectDraft: inspectCodexDraft,
 };
 

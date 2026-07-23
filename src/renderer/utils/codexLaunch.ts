@@ -12,6 +12,9 @@ export interface CodexRunPayloadBase {
 export interface CodexRunPayload extends CodexRunPayloadBase {
   model?: string;
   effort?: string;
+  modelSource?: 'tab' | 'global';
+  effortSource?: 'tab' | 'global';
+  modelMigrationPending?: boolean;
 }
 
 const cleanSetting = (value: unknown): string | undefined => {
@@ -21,7 +24,16 @@ const cleanSetting = (value: unknown): string | undefined => {
   return trimmed;
 };
 
-const findCodexTabState = (tabId: string): { codexModel?: string; codexEffort?: string } => {
+const cleanPersistentEffort = (value: unknown): string | undefined => {
+  const effort = cleanSetting(value);
+  return effort === 'ultra' ? undefined : effort;
+};
+
+const findCodexTabState = (tabId: string): {
+  codexModel?: string;
+  codexEffort?: string;
+  codexModelMigrationPending?: boolean;
+} => {
   const state = useWorkspaceStore.getState();
   for (const [, workspace] of state.openProjects) {
     const tab = workspace.tabs.get(tabId);
@@ -29,29 +41,54 @@ const findCodexTabState = (tabId: string): { codexModel?: string; codexEffort?: 
       return {
         codexModel: tab.codexModel,
         codexEffort: tab.codexEffort,
+        codexModelMigrationPending: tab.codexModelMigrationPending,
       };
     }
   }
   return {};
 };
 
-export const getCodexLaunchOptions = (tabId: string): { model?: string; effort?: string } => {
+export const getCodexLaunchOptions = (tabId: string): {
+  model?: string;
+  effort?: string;
+  modelSource?: 'tab' | 'global';
+  effortSource?: 'tab' | 'global';
+  modelMigrationPending?: boolean;
+} => {
   const tab = findCodexTabState(tabId);
+  if (tab.codexModelMigrationPending === true) {
+    return { modelMigrationPending: true };
+  }
   const ui = useUIStore.getState();
-  const model = cleanSetting(tab.codexModel) ?? cleanSetting(ui.defaultCodexModel);
-  const effort = cleanSetting(tab.codexEffort) ?? cleanSetting(ui.defaultCodexEffort);
+  const tabModel = cleanSetting(tab.codexModel);
+  const tabEffort = cleanPersistentEffort(tab.codexEffort);
+  const globalModel = cleanSetting(ui.defaultCodexModel);
+  const globalEffort = cleanPersistentEffort(ui.defaultCodexEffort);
+  const model = tabModel ?? globalModel;
+  const effort = tabEffort ?? globalEffort;
 
   return {
     model,
     effort,
+    ...(model ? { modelSource: tabModel ? 'tab' as const : 'global' as const } : {}),
+    ...(effort ? { effortSource: tabEffort ? 'tab' as const : 'global' as const } : {}),
   };
 };
 
 export const buildCodexRunPayload = (base: CodexRunPayloadBase): CodexRunPayload => {
-  const { model, effort } = getCodexLaunchOptions(base.tabId);
+  const {
+    model,
+    effort,
+    modelSource,
+    effortSource,
+    modelMigrationPending,
+  } = getCodexLaunchOptions(base.tabId);
   return {
     ...base,
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
+    ...(modelSource ? { modelSource } : {}),
+    ...(effortSource ? { effortSource } : {}),
+    ...(modelMigrationPending ? { modelMigrationPending: true } : {}),
   };
 };

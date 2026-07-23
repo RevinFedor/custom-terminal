@@ -6,6 +6,7 @@ import { useCmdKey } from '../../hooks/useCmdHoverPopover';
 import HoverBridgeDebug from '../HoverBridgeDebug';
 import { User as UserIcon } from 'lucide-react';
 import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
+import ControlHint from '../UI/ControlHint';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -318,6 +319,11 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
             триггерит появление: hover-popup мешал пользователю работать рядом, поэтому
             переведено на explicit click. Visual hover-state на самой иконке остаётся для
             affordance — она выглядит кликабельной. */}
+        <ControlHint
+          label="Настройки копирования сессии"
+          disabled={showSettings || showInputPopup}
+          side="bottom"
+        >
         <span
           ref={iconRef}
           data-settings-icon
@@ -341,11 +347,18 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
         >
           📋
         </span>
+        </ControlHint>
         {/* Divider — accent-tinted vertical line between the 📋 (settings) half and the
             "Copy session" half. Fork-toggle indication has moved to a dedicated chip in
             the markers row, so the divider keeps the calm orange tone regardless. */}
         <span style={{ width: 1, height: '70%', backgroundColor: `${accentRgba} 0.25)` }} />
         {/* Copy label half — hovers like a real button so user knows "click here = copy" */}
+        <ControlHint
+          label={isMultiSelect ? `Скопировать ${selectedTabs.length} сессии` : 'Скопировать текущую сессию'}
+          modifiedAction="⌘ наведение — указать другой session ID"
+          disabled={isCopying || showInputPopup}
+          side="bottom"
+        >
         <span
           onMouseEnter={() => setCopyHovered(true)}
           onMouseLeave={() => setCopyHovered(false)}
@@ -369,6 +382,7 @@ export default function CopySessionButton({ activeTabId, sessionType }: CopySess
         >
           {isCopying ? 'Copying...' : isMultiSelect ? `Copy ${selectedTabs.length}× session` : customId.trim() ? 'Copy custom' : 'Copy session'}
         </span>
+        </ControlHint>
       </div>
 
       {/* Settings panel — slides in to the LEFT of the button.

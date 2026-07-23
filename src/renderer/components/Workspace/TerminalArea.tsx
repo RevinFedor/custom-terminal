@@ -6,7 +6,7 @@ import BrowserTab from './BrowserTab';
 import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
 import { motion, AnimatePresence } from 'framer-motion';
 import { terminalRegistry } from '../../utils/terminalRegistry';
-import { markPendingResume } from '../../utils/pendingResume';
+import { clearPendingResume, markPendingResume } from '../../utils/pendingResume';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import {
@@ -212,7 +212,7 @@ const getSessionStartingPresentation = (state: SessionStartingState) => {
     };
   }
 
-  if (hasBlocker('update-prompt')) {
+  if (hasBlocker('update-prompt') || hasBlocker('model-migration')) {
     return {
       isError: false,
       title: `LOADING ${engineLabel} SESSION...`,
@@ -519,11 +519,35 @@ const InterruptedSessionOverlay = memo(({ tabId, sessionId, engine, onContinue, 
   );
 });
 
-interface TerminalAreaProps {
-  projectId: string;
+export interface AgentLifecycleSummary {
+  tabId: string;
+  sessionId?: string | null;
+  kind: 'starting' | 'stopping' | 'interrupted' | 'error';
+  title: string;
+  description: string;
+  detail?: string | null;
+  spinner: boolean;
 }
 
-function TerminalArea({ projectId }: TerminalAreaProps) {
+interface TerminalAreaProps {
+  projectId: string;
+  terminalPresented?: boolean;
+  promptQueuePortalHostId?: string;
+  hidePromptQueueHistoryToggle?: boolean;
+  promptQueueInputSurface?: 'terminal' | 'history';
+  suppressLifecycleOverlays?: boolean;
+  onLifecycleStatusChange?: (status: AgentLifecycleSummary | null) => void;
+}
+
+function TerminalArea({
+  projectId,
+  terminalPresented = true,
+  promptQueuePortalHostId,
+  hidePromptQueueHistoryToggle = false,
+  promptQueueInputSurface = 'terminal',
+  suppressLifecycleOverlays = false,
+  onLifecycleStatusChange,
+}: TerminalAreaProps) {
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.viewingSubAgentTabId ?? null);
 
   // DEBUG: Track TerminalArea mount/unmount lifecycle
@@ -632,11 +656,12 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       return;
     }
     try {
-      const presence = await getHistoryAgentRuntime(info.engine).getPresence(info.tabId);
+      const presence = await getHistoryAgentRuntime(info.engine).getPresence(info.tabId, projectId);
       const latest = activeAgentStartingInfoRef.current;
       if (!isSessionStartingProbeCurrent(seq, startingProbeSeqRef.current, info, latest)) return;
-      if (presence.status === 'starting' && dismissedStartingKeysRef.current.has(startingDismissKey(info))) return;
-      if (presence.status !== 'starting') {
+      const isVisibleStartupState = presence.status === 'starting' || presence.manualActionRequired === true;
+      if (isVisibleStartupState && dismissedStartingKeysRef.current.has(startingDismissKey(info))) return;
+      if (!isVisibleStartupState) {
         dismissedStartingKeysRef.current.delete(startingDismissKey(info));
       }
       setSessionStarting((prev) => {
@@ -652,7 +677,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       if (seq !== startingProbeSeqRef.current) return;
       console.warn('[SessionStartingOverlay] presence failed tab=' + info.tabId.slice(-12) + ' engine=' + info.engine + ' reason=' + reason + ' error=' + (e?.message || String(e)));
     }
-  }, [currentView, startingDismissKey]);
+  }, [currentView, projectId, startingDismissKey]);
 
   useEffect(() => {
     if (!activeAgentStartingInfo || currentView !== 'terminal') {
@@ -661,10 +686,6 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       return;
     }
     void refreshSessionStarting('active-tab');
-    const interval = window.setInterval(() => {
-      void refreshSessionStarting('poll');
-    }, 1000);
-    return () => window.clearInterval(interval);
   }, [activeAgentStartingKey, activeAgentStartingInfo, currentView, refreshSessionStarting]);
 
   useEffect(() => {
@@ -708,9 +729,29 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     const onCodexReady = (_: any, data: { tabId: string }) => hideFromEvent(data.tabId, 'codex-tui-ready', true);
     const onClaudeBusy = (_: any, data: { tabId: string; busy: boolean }) => {
       if (!data.busy) return;
+      hideFromEvent(data.tabId, 'claude-busy', true);
     };
     const onCodexBusy = (_: any, data: { tabId: string; busy: boolean }) => {
       if (!data.busy) return;
+      hideFromEvent(data.tabId, 'codex-busy', true);
+    };
+    const onCodexNotReady = (_: any, data: { tabId?: string; reason?: string | null }) => {
+      const eventTabId = data?.tabId || '';
+      const info = activeAgentStartingInfoRef.current;
+      if (!eventTabId || !info || info.tabId !== eventTabId || info.engine !== 'codex' || currentView !== 'terminal') return;
+      if (data.reason === 'manual-stop') {
+        invalidateStartingProbeForTab(eventTabId);
+        setSessionStarting(null);
+        console.warn('[SessionStartingOverlay] ignore not-ready after manual Stop tab=' + eventTabId.slice(-12));
+        return;
+      }
+      void refreshSessionStarting('codex-tui-not-ready:' + (data.reason || '-'));
+    };
+    const onCodexManualAction = (_: any, data: { tabId?: string; type?: string | null }) => {
+      const eventTabId = data?.tabId || '';
+      const info = activeAgentStartingInfoRef.current;
+      if (!eventTabId || !info || info.tabId !== eventTabId || info.engine !== 'codex' || currentView !== 'terminal') return;
+      void refreshSessionStarting('codex-manual-action:' + (data.type || '-'));
     };
     const onAgentStopping = (_: any, data: {
       tabId?: string;
@@ -777,6 +818,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     ipcRenderer.on('terminal:command-finished', onCommandFinished);
     ipcRenderer.on('claude:tui-ready', onClaudeReady);
     ipcRenderer.on('codex:tui-ready', onCodexReady);
+    ipcRenderer.on('codex:tui-not-ready', onCodexNotReady);
+    ipcRenderer.on('codex:tui-manual-action-required', onCodexManualAction);
     ipcRenderer.on('claude:busy-state', onClaudeBusy);
     ipcRenderer.on('codex:busy-state', onCodexBusy);
     ipcRenderer.on('agent:stopping-state', onAgentStopping);
@@ -786,6 +829,8 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       ipcRenderer.removeListener('terminal:command-finished', onCommandFinished);
       ipcRenderer.removeListener('claude:tui-ready', onClaudeReady);
       ipcRenderer.removeListener('codex:tui-ready', onCodexReady);
+      ipcRenderer.removeListener('codex:tui-not-ready', onCodexNotReady);
+      ipcRenderer.removeListener('codex:tui-manual-action-required', onCodexManualAction);
       ipcRenderer.removeListener('claude:busy-state', onClaudeBusy);
       ipcRenderer.removeListener('codex:busy-state', onCodexBusy);
       ipcRenderer.removeListener('agent:stopping-state', onAgentStopping);
@@ -856,17 +901,69 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     && !showInterruptedOverlay
     && activeTabIdForOverlay === sessionStarting.tabId;
 
+  const lifecycleSummary = useMemo<AgentLifecycleSummary | null>(() => {
+    if (showAgentStoppingOverlay && agentStopping) {
+      const engineLabel = agentStopping.engine === 'codex' ? 'CODEX' : 'CLAUDE';
+      return {
+        tabId: agentStopping.tabId,
+        kind: 'stopping',
+        title: `STOPPING ${engineLabel}...`,
+        description: 'Waiting for the process to exit safely',
+        detail: agentStopping.reason || null,
+        spinner: true,
+      };
+    }
+    if (showInterruptedOverlay && activeTabIdForOverlay && activeTabSessionId) {
+      const engineLabel = activeTabInterruptedEngine === 'codex' ? 'CODEX' : 'CLAUDE';
+      return {
+        tabId: activeTabIdForOverlay,
+        sessionId: activeTabSessionId,
+        kind: 'interrupted',
+        title: `${engineLabel} SESSION INTERRUPTED`,
+        description: 'The saved conversation can be continued from this tab',
+        detail: `Session ${activeTabSessionId}`,
+        spinner: false,
+      };
+    }
+    if (showSessionStartingOverlay && sessionStarting) {
+      const presentation = getSessionStartingPresentation(sessionStarting);
+      return {
+        tabId: sessionStarting.tabId,
+        sessionId: sessionStarting.sessionId || null,
+        kind: presentation.isError ? 'error' : 'starting',
+        title: presentation.title,
+        description: presentation.subtitle,
+        detail: presentation.detail,
+        spinner: !presentation.isError,
+      };
+    }
+    return null;
+  }, [activeTabIdForOverlay, activeTabInterruptedEngine, activeTabSessionId, agentStopping, sessionStarting, showAgentStoppingOverlay, showInterruptedOverlay, showSessionStartingOverlay]);
+
+  useEffect(() => {
+    onLifecycleStatusChange?.(lifecycleSummary);
+  }, [lifecycleSummary, onLifecycleStatusChange]);
+
+  useEffect(() => () => {
+    onLifecycleStatusChange?.(null);
+  }, [onLifecycleStatusChange]);
+
   
   // Handle continuing interrupted AI session (use fresh state from getState)
-  const handleContinueSession = (sessionId?: string, engine?: InterruptedEngine | null) => {
+  const continueSessionInflightRef = useRef<Set<string>>(new Set());
+  const handleContinueSession = async (sessionId?: string, engine?: InterruptedEngine | null) => {
     const tabId = activeTabId;
     const targetSessionId = sessionId || activeTabSessionId;
     const targetEngine = engine || activeTabInterruptedEngine;
     console.log('[TerminalArea] handleContinueSession called, activeTab:', tabId, 'engine:', targetEngine, 'sessionId:', targetSessionId);
 
     if (tabId && targetSessionId && targetEngine) {
-      console.log('[TerminalArea] Clearing interrupted state and sending command');
-      clearInterruptedState(tabId);
+      if (continueSessionInflightRef.current.has(tabId)) {
+        console.warn('[TerminalArea] Continue already in flight for tab:', tabId);
+        return;
+      }
+      continueSessionInflightRef.current.add(tabId);
+      console.log('[TerminalArea] Sending resume; interrupted state stays until launch is accepted');
 
       const setTabCommandType = useWorkspaceStore.getState().setTabCommandType;
       setTabCommandType(tabId, targetEngine);
@@ -875,21 +972,46 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       terminalRegistry.get(tabId)?.focus();
       requestAnimationFrame(() => terminalRegistry.get(tabId)?.focus());
 
-      if (targetEngine === 'codex') {
-        const ws = useWorkspaceStore.getState().openProjects.get(projectId);
-        const cwd = ws?.tabs.get(tabId)?.cwd;
-        console.log('[TerminalArea] Sending codex:run-command codex-c:', targetSessionId);
-        ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: targetSessionId, cwd }));
-        ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'codex', sessionId: targetSessionId });
-      } else {
-        // Arm the 15s stale-bridge guard BEFORE the resume write (см.
-        // fix-bridge-stale-takeover.md layer 4/5) — иначе протухший bridge.json
-        // перезапишет sessionId таба в окне resume.
-        markPendingResume(tabId, targetSessionId);
-        const cmd = `claude --dangerously-skip-permissions --resume ${targetSessionId}\r`;
-        console.log('[TerminalArea] Sending terminal:input:', cmd);
-        ipcRenderer.send('terminal:input', tabId, cmd);
-        ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude', sessionId: targetSessionId });
+      try {
+        let runResult: any;
+        if (targetEngine === 'codex') {
+          const ws = useWorkspaceStore.getState().openProjects.get(projectId);
+          const cwd = ws?.tabs.get(tabId)?.cwd;
+          console.log('[TerminalArea] Invoking codex:run-command codex-c:', targetSessionId);
+          runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
+            tabId,
+            command: 'codex-c',
+            sessionId: targetSessionId,
+            cwd,
+          }));
+        } else {
+          // Arm the 15s stale-bridge guard immediately before the confirmed
+          // launch request; clear it again if main rejects the write.
+          markPendingResume(tabId, targetSessionId);
+          const tabCwd = useWorkspaceStore.getState().openProjects.get(projectId)?.tabs.get(tabId)?.cwd;
+          console.log('[TerminalArea] Invoking claude:run-command resume:', targetSessionId);
+          runResult = await ipcRenderer.invoke('claude:run-command', {
+            tabId,
+            command: 'claude-c',
+            sessionId: targetSessionId,
+            ...(tabCwd ? { cdTo: tabCwd } : {}),
+          });
+        }
+        if (runResult?.success === false || runResult?.accepted === false) {
+          if (targetEngine === 'claude') clearPendingResume(tabId);
+          console.warn('[TerminalArea] Resume rejected tab=' + tabId.slice(-12)
+            + ' engine=' + targetEngine
+            + ' error=' + (runResult?.error || runResult?.reason || 'unknown'));
+          return;
+        }
+        clearInterruptedState(tabId);
+      } catch (error: any) {
+        if (targetEngine === 'claude') clearPendingResume(tabId);
+        console.warn('[TerminalArea] Resume failed tab=' + tabId.slice(-12)
+          + ' engine=' + targetEngine
+          + ' error=' + (error?.message || String(error)));
+      } finally {
+        continueSessionInflightRef.current.delete(tabId);
       }
     } else {
       console.log('[TerminalArea] handleContinueSession: Missing activeTab, engine or sessionId!');
@@ -1027,6 +1149,10 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
               ownerProjectId={projId}
               active={active}
               isActiveProject={isActiveProject}
+              presented={terminalPresented}
+              promptQueuePortalHostId={promptQueuePortalHostId}
+              hidePromptQueueHistoryToggle={hidePromptQueueHistoryToggle}
+              promptQueueInputSurface={promptQueueInputSurface}
             />
           );
         }
@@ -1036,7 +1162,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
     const durMs = Date.now() - t0;
     console.warn(`[TerminalArea:useMemo] RECALCULATING projectId=${projectId.slice(-12)} total=${totalCount} sdk=${sdkCount} durMs=${durMs}`);
     return result;
-  }, [terminalFingerprint, activeLayerKey, projectId]);
+  }, [terminalFingerprint, activeLayerKey, projectId, terminalPresented, promptQueuePortalHostId, hidePromptQueueHistoryToggle, promptQueueInputSurface]);
 
   // Listen for Claude fork completion to create new tab with command
   useEffect(() => {
@@ -1113,7 +1239,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       {/* Local per-tab resume/start status. It deliberately does not own focus or
           a full-screen hit area: startup menus remain directly interactive. */}
       <AnimatePresence>
-        {showAgentStoppingOverlay && agentStopping && (
+        {!suppressLifecycleOverlays && showAgentStoppingOverlay && agentStopping && (
           <AgentStoppingOverlay
             key={`${agentStopping.tabId}:${agentStopping.since}`}
             state={agentStopping}
@@ -1123,7 +1249,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
       </AnimatePresence>
 
       <AnimatePresence>
-        {showSessionStartingOverlay && sessionStarting && (
+        {!suppressLifecycleOverlays && showSessionStartingOverlay && sessionStarting && (
           <SessionStartingOverlay
             key={`${sessionStarting.tabId}:${sessionStarting.since}`}
             state={sessionStarting}
@@ -1135,7 +1261,7 @@ function TerminalArea({ projectId }: TerminalAreaProps) {
 
       {/* Interrupted session overlay */}
       <AnimatePresence>
-        {showInterruptedOverlay && activeTabId && activeTabSessionId && (
+        {!suppressLifecycleOverlays && showInterruptedOverlay && activeTabId && activeTabSessionId && (
           <InterruptedSessionOverlay
             tabId={activeTabId}
             sessionId={activeTabSessionId}

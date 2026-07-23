@@ -11,6 +11,7 @@ import { refreshGeneratedTabTitle, type RefreshTabTitleReason } from '../../util
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { isNaturalAgentTurnEndReason } from '../../utils/agentCompletionOutcome.mjs';
 import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
+import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -23,7 +24,7 @@ import {
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, CircleX, Square, Bell, BellRing, FileText, X, Copy, Info, Loader2, Pencil } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, CircleX, Square, Bell, BellRing, FileText, X, Copy, Info, Loader2, Pencil } from 'lucide-react';
 import {
   normalizeSelectedVisualRootIds,
   orderVisualHierarchyItems,
@@ -67,6 +68,64 @@ const TAB_POST_DROP_REVEAL_PEEK_ROWS = 3;
 const TAB_POST_DROP_REVEAL_MAX_WAIT_FRAMES = 45;
 const TAB_DND_NAVIGATION_DWELL_MS = 500;
 const EMPTY_UTILITY_DROP_HEIGHT = 56;
+const STRUCTURED_PROJECT_DROP_EVENT = 'structured-tab-project-target';
+
+// Маркеры реальных задач под названием вертикальной вкладки. Для ручной
+// визуальной настройки геометрии меняй только эти значения.
+const TASK_MARKER_PRIMARY_SIZE_PX = 9;
+const TASK_MARKER_SECONDARY_SIZE_PX = 8;
+const TASK_MARKER_SECONDARY_GAP_PX = 3;
+const TASK_MARKER_NEXT_TAB_CLEARANCE_PX = 1;
+const TASK_MARKER_HOVER_SCALE = 1.32;
+const TASK_MARKER_LANE_HEIGHT_PX = Math.ceil(TASK_MARKER_SECONDARY_SIZE_PX * TASK_MARKER_HOVER_SCALE);
+const TASK_MARKER_DEFAULT_COLOR = '#73737a';
+const TASK_ARCHIVE_COUNTER_SIZE_PX = 10;
+const TASK_ARCHIVE_RIGHT_INSET_PX = 5;
+
+function TaskLaneMarker({
+  color,
+  shape,
+  title,
+  onClick,
+}: {
+  color: string;
+  shape: 'dot' | 'square';
+  title: string;
+  onClick: (event: React.MouseEvent<HTMLButtonElement>) => void;
+}) {
+  const [hovered, setHovered] = useState(false);
+  return (
+    <button
+      type="button"
+      data-task-plan-tab-marker
+      title={title}
+      onPointerDown={(event) => event.stopPropagation()}
+      onDoubleClick={(event) => event.stopPropagation()}
+      onClick={onClick}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{
+        display: 'block',
+        width: TASK_MARKER_SECONDARY_SIZE_PX,
+        height: TASK_MARKER_SECONDARY_SIZE_PX,
+        flex: `0 0 ${TASK_MARKER_SECONDARY_SIZE_PX}px`,
+        padding: 0,
+        borderRadius: shape === 'square' ? 1 : '50%',
+        backgroundColor: color,
+        border: '1px solid rgba(0,0,0,0.38)',
+        boxSizing: 'border-box',
+        pointerEvents: 'auto',
+        cursor: 'pointer',
+        outline: 'none',
+        transform: `scale(${hovered ? TASK_MARKER_HOVER_SCALE : 1})`,
+        transformOrigin: 'center bottom',
+        transition: 'transform 90ms ease, filter 90ms ease',
+        filter: hovered ? 'brightness(1.18)' : 'none',
+      }}
+    />
+  );
+}
+
 const isAiLaunchCommand = (command: string): boolean => {
   const text = command.trim();
   if (!text) return false;
@@ -219,6 +278,13 @@ type TabOutlineNode = {
   expanded?: boolean;
   hasChildren?: boolean;
   children?: TabOutlineNode[];
+};
+
+type TabProjectExternalTarget = {
+  id: string;
+  zone: 'project';
+  projectId: string;
+  blocked: boolean;
 };
 
 const indexTabOutlineNodes = (nodes: TabOutlineNode[], result = new Map<string, TabOutlineNode>()) => {
@@ -987,6 +1053,7 @@ const TabItem = memo(({
   const [isAdoptTarget, setIsAdoptTarget] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
   const [isRestartButtonHovered, setIsRestartButtonHovered] = useState(false);
+  const [taskArchivePreviewOpen, setTaskArchivePreviewOpen] = useState(false);
   const bodyCursorRef = useRef<string | null>(null);
   const doubleClickRenameRef = useRef(false);
 
@@ -1245,6 +1312,35 @@ const TabItem = memo(({
   // SDK Claude override на 0.30 (выше PTY claude 0.20) → SDK active = 0.55 vs PTY active = 0.45,
   // SDK явно светлее/жёлтее на одинаковом #252526 фоне.
   const isVerticalMode = !isHorizontal;
+  const taskStatusMarkerShape = useUIStore((s) => s.taskStatusMarker.shape);
+  const taskStatuses = useUIStore((s) => s.taskStatuses);
+  const taskStatusById = useMemo(
+    () => new Map(taskStatuses.map((status) => [status.id, status])),
+    [taskStatuses],
+  );
+  const liveTaskPlan = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tab.id)?.taskPlan);
+  const taskPlan = liveTaskPlan || tab.taskPlan;
+  const activeTaskPlanItems = taskPlan?.items || [];
+  const archivedTaskPlanItems = taskPlan?.archivedItems || [];
+  const showTaskMarkerLane = isVerticalMode
+    && zone === 'main'
+    && !isCollapsed
+    && (activeTaskPlanItems.length > 0 || archivedTaskPlanItems.length > 0);
+  const verticalPaddingTop = showTaskMarkerLane ? Math.max(0, tabGeo.paddingY - 2) : tabGeo.paddingY;
+  const verticalPaddingBottom = showTaskMarkerLane ? tabGeo.paddingY + 2 : tabGeo.paddingY;
+  const taskMarkerLaneLeft = tab.tabType === 'browser' ? tabGeo.paddingX : tabGeo.paddingLeft;
+  const taskMarkerLaneRight = archivedTaskPlanItems.length > 0
+    ? TASK_ARCHIVE_RIGHT_INSET_PX + TASK_ARCHIVE_COUNTER_SIZE_PX + TASK_MARKER_SECONDARY_GAP_PX
+    : tabGeo.paddingX;
+  const navigateFromTaskMarker = useCallback((
+    event: React.MouseEvent<HTMLButtonElement>,
+    view: 'active' | 'archive',
+    taskId?: string,
+  ) => {
+    event.stopPropagation();
+    onSwitch(event);
+    requestTaskPlanNavigation({ tabId: tab.id, taskId, view });
+  }, [onSwitch, tab.id]);
   const isVertActive = !isHorizontal && isActive;
   const isDraggedByMonitor = draggingGroupIds.includes(tab.id);
   const isDraggedRoot = draggingRootIds.includes(tab.id);
@@ -1376,12 +1472,12 @@ const TabItem = memo(({
     overflow: 'visible',
     padding: isCollapsed
       ? '0'
-      : (tab.tabType === 'browser'
+        : (tab.tabType === 'browser'
         // Browser tabs: no left gutter at all.
-        ? (isHorizontal ? '0 12px' : `${tabGeo.paddingY}px ${tabGeo.paddingX}px`)
+        ? (isHorizontal ? '0 12px' : `${verticalPaddingTop}px ${tabGeo.paddingX}px ${verticalPaddingBottom}px`)
         // Vertical mode: всё из стора tabGeometry (Settings → Размеры).
         : (isVerticalMode
-          ? `${tabGeo.paddingY}px ${tabGeo.paddingX}px ${tabGeo.paddingY}px ${tabGeo.paddingLeft}px`
+          ? `${verticalPaddingTop}px ${tabGeo.paddingX}px ${verticalPaddingBottom}px ${tabGeo.paddingLeft}px`
           // SDK tabs: left gutter 32px (matches PTY claude — keeps the green dot
           // the same distance from the left edge so adjacent PTY+SDK tabs align
           // perfectly).
@@ -1943,10 +2039,10 @@ const TabItem = memo(({
                   style={{
                     position: 'absolute',
                     left: '5px',
-                    top: 'calc(50% + 1px)',
+                    top: showTaskMarkerLane ? 'calc(50% - 1px)' : 'calc(50% + 1px)',
                     transform: 'translateY(-50%)',
-                    width: `${statusMarkerSize}px`,
-                    height: `${statusMarkerSize}px`,
+                    width: `${showTaskMarkerLane ? TASK_MARKER_PRIMARY_SIZE_PX : statusMarkerSize}px`,
+                    height: `${showTaskMarkerLane ? TASK_MARKER_PRIMARY_SIZE_PX : statusMarkerSize}px`,
                     borderRadius: statusMarkerShape === 'square' ? '2px' : '50%',
                     backgroundColor: statusMeta.color,
                     border: '1px solid rgba(0,0,0,0.4)',
@@ -1954,6 +2050,123 @@ const TabItem = memo(({
                     zIndex: 6,
                   }}
                 />
+              )}
+              {showTaskMarkerLane && activeTaskPlanItems.length > 0 && (
+                <span
+                  data-task-plan-tab-markers
+                  style={{
+                    position: 'absolute',
+                    left: `${taskMarkerLaneLeft}px`,
+                    right: `${taskMarkerLaneRight}px`,
+                    bottom: `${-Math.max(0, tabGeo.gap - TASK_MARKER_NEXT_TAB_CLEARANCE_PX)}px`,
+                    height: `${TASK_MARKER_LANE_HEIGHT_PX}px`,
+                    display: 'flex',
+                    alignItems: 'flex-end',
+                    gap: `${TASK_MARKER_SECONDARY_GAP_PX}px`,
+                    overflow: 'hidden',
+                    pointerEvents: 'none',
+                    zIndex: 7,
+                  }}
+                >
+                  {activeTaskPlanItems.map((task) => {
+                    const status = task.statusId ? taskStatusById.get(task.statusId) : undefined;
+                    return (
+                      <TaskLaneMarker
+                        key={task.id}
+                        color={status?.color || TASK_MARKER_DEFAULT_COLOR}
+                        shape={taskStatusMarkerShape}
+                        title={task.title}
+                        onClick={(event) => navigateFromTaskMarker(event, 'active', task.id)}
+                      />
+                    );
+                  })}
+                </span>
+              )}
+              {showTaskMarkerLane && archivedTaskPlanItems.length > 0 && (
+                <span
+                  data-task-plan-tab-archive
+                  onMouseEnter={() => setTaskArchivePreviewOpen(true)}
+                  onMouseLeave={() => setTaskArchivePreviewOpen(false)}
+                  style={{
+                    position: 'absolute',
+                    right: TASK_ARCHIVE_RIGHT_INSET_PX,
+                    bottom: `${-Math.max(0, tabGeo.gap - TASK_MARKER_NEXT_TAB_CLEARANCE_PX)}px`,
+                    width: TASK_ARCHIVE_COUNTER_SIZE_PX,
+                    height: TASK_ARCHIVE_COUNTER_SIZE_PX,
+                    pointerEvents: 'auto',
+                    zIndex: 10,
+                  }}
+                >
+                  {taskArchivePreviewOpen && (
+                    <span
+                      data-task-plan-tab-archive-preview
+                      style={{
+                        position: 'absolute',
+                        right: '100%',
+                        bottom: 0,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: TASK_MARKER_SECONDARY_GAP_PX,
+                        maxWidth: 176,
+                        minHeight: TASK_ARCHIVE_COUNTER_SIZE_PX,
+                        padding: '1px 4px',
+                        overflow: 'hidden',
+                        borderRadius: '4px 0 0 4px',
+                        background: 'rgba(20,20,23,0.97)',
+                        border: '1px solid rgba(255,255,255,0.12)',
+                        borderRight: 0,
+                        boxShadow: '-6px 4px 14px rgba(0,0,0,0.34)',
+                        boxSizing: 'border-box',
+                        pointerEvents: 'auto',
+                      }}
+                    >
+                      {archivedTaskPlanItems.map((task) => {
+                        const status = task.statusId ? taskStatusById.get(task.statusId) : undefined;
+                        return (
+                          <TaskLaneMarker
+                            key={task.id}
+                            color={status?.color || TASK_MARKER_DEFAULT_COLOR}
+                            shape={taskStatusMarkerShape}
+                            title={task.title}
+                            onClick={(event) => navigateFromTaskMarker(event, 'archive', task.id)}
+                          />
+                        );
+                      })}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    data-task-plan-tab-archive-count
+                    aria-label={`Архив задач: ${archivedTaskPlanItems.length}`}
+                    title={`Архив задач: ${archivedTaskPlanItems.length}`}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onDoubleClick={(event) => event.stopPropagation()}
+                    onClick={(event) => navigateFromTaskMarker(event, 'archive')}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      width: TASK_ARCHIVE_COUNTER_SIZE_PX,
+                      height: TASK_ARCHIVE_COUNTER_SIZE_PX,
+                      padding: 0,
+                      color: '#d4d4d8',
+                      background: '#3f3f46',
+                      border: '1px solid rgba(0,0,0,0.5)',
+                      borderRadius: 2,
+                      boxSizing: 'border-box',
+                      cursor: 'pointer',
+                      outline: 'none',
+                      fontSize: archivedTaskPlanItems.length < 10 ? 7 : archivedTaskPlanItems.length < 100 ? 6 : 5,
+                      fontWeight: 700,
+                      lineHeight: 1,
+                      transform: `scale(${taskArchivePreviewOpen ? TASK_MARKER_HOVER_SCALE : 1})`,
+                      transformOrigin: 'center bottom',
+                      transition: 'transform 90ms ease, background 90ms ease',
+                    }}
+                  >
+                    {archivedTaskPlanItems.length}
+                  </button>
+                </span>
               )}
               {/* В вертикальном режиме middle-click по всей вкладке = close tab (стандартное
                   поведение TabItem root). Stop devServer живёт в правой restart-кнопке:
@@ -3408,12 +3621,15 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
   const toggleTabUtility = useWorkspaceStore((state) => state.toggleTabUtility);
   const reorderInZone = useWorkspaceStore((state) => state.reorderInZone);
   const moveTabToZone = useWorkspaceStore((state) => state.moveTabToZone);
+  const moveTabsToProject = useWorkspaceStore((state) => state.moveTabsToProject);
+  const moveTabGroupToProject = useWorkspaceStore((state) => state.moveTabGroupToProject);
   const createTabGroup = useWorkspaceStore((state) => state.createTabGroup);
   const applyTabLayout = useWorkspaceStore((state) => state.applyTabLayout);
   const setTabVisualParent = useWorkspaceStore((state) => state.setTabVisualParent);
   const toggleTabSelection = useWorkspaceStore((state) => state.toggleTabSelection);
   const selectTabRange = useWorkspaceStore((state) => state.selectTabRange);
   const clearSelection = useWorkspaceStore((state) => state.clearSelection);
+  const showWorkspace = useWorkspaceStore((state) => state.showWorkspace);
   
   const { projects } = useProjectsStore();
   const setProjectView = useWorkspaceStore((state) => state.setProjectView);
@@ -7596,7 +7812,20 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
     startY: number;
     sourceNode: TabOutlineNode;
   }) => {
-    if (sourceNode?.entityType !== 'tab' || typeof document === 'undefined') return null;
+    if (typeof document === 'undefined') return null;
+    const pointed = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
+    const projectTarget = pointed?.closest<HTMLElement>('[data-structured-project-drop-target]');
+    const targetProjectId = projectTarget?.dataset.projectId;
+    if (targetProjectId && openProjects.has(targetProjectId)) {
+      return {
+        id: `project:${targetProjectId}`,
+        zone: 'project',
+        projectId: targetProjectId,
+        blocked: targetProjectId === projectId,
+      } satisfies TabProjectExternalTarget;
+    }
+
+    if (sourceNode?.entityType !== 'tab') return null;
     if (utilityTabs.length === 0) {
       const container = document.querySelector<HTMLElement>('[data-tabbar-vertical]');
       return resolveEmptyUtilityDropTarget({
@@ -7607,7 +7836,6 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         zoneHeight: EMPTY_UTILITY_DROP_HEIGHT,
       });
     }
-    const pointed = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
     const zone = pointed?.closest<HTMLElement>('[data-tab-zone="utility"]');
     if (!zone) return null;
     const utilityRows = Array.from(
@@ -7622,15 +7850,43 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       }
     }
     return { id: 'utility', zone: 'utility', insertIndex };
-  }, [utilityTabs.length]);
+  }, [openProjects, projectId, utilityTabs.length]);
 
-  const handleTabOutlineExternalCommit = useCallback(({
+  const handleTabOutlineExternalCommit = useCallback(async ({
     sourceNode,
     externalTarget,
   }: {
     sourceNode: TabOutlineNode;
-    externalTarget: { zone?: string; insertIndex?: number } | null;
+    externalTarget: {
+      zone?: string;
+      insertIndex?: number;
+      projectId?: string;
+      blocked?: boolean;
+    } | null;
   }) => {
+    if (externalTarget?.zone === 'project') {
+      const targetProjectId = externalTarget.projectId;
+      if (!targetProjectId || externalTarget.blocked || targetProjectId === projectId) return false;
+
+      let moved = false;
+      if (sourceNode?.entityType === 'group' && sourceNode.groupId) {
+        moved = await moveTabGroupToProject(projectId, sourceNode.groupId, targetProjectId);
+      } else if (sourceNode?.entityType === 'tab' && sourceNode.tabId) {
+        const sourceTabIds: string[] = [];
+        const collect = (node: TabOutlineNode) => {
+          if (node.entityType === 'tab' && node.tabId) sourceTabIds.push(node.tabId);
+          (node.children || []).forEach((child) => collect(child as TabOutlineNode));
+        };
+        collect(sourceNode);
+        moved = await moveTabsToProject(projectId, sourceTabIds, targetProjectId);
+      }
+
+      if (moved) {
+        window.setTimeout(() => showWorkspace(targetProjectId), 0);
+      }
+      return moved;
+    }
+
     if (sourceNode?.entityType !== 'tab' || externalTarget?.zone !== 'utility' || !sourceNode.tabId) {
       return false;
     }
@@ -7648,7 +7904,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       sourceTabIds,
     );
     return true;
-  }, [moveTabToZone, projectId]);
+  }, [moveTabGroupToProject, moveTabsToProject, moveTabToZone, projectId, showWorkspace]);
 
   const tabOutlineDnd = useOutlineDnd<TabOutlineNode>({
     outline: controlledTabOutline,
@@ -7685,6 +7941,30 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
       );
     },
   });
+
+  const structuredProjectTarget = tabOutlineDnd.dragState?.externalTarget as TabProjectExternalTarget | null | undefined;
+  const structuredProjectTargetId = structuredProjectTarget?.zone === 'project'
+    ? structuredProjectTarget.projectId
+    : null;
+  const structuredProjectTargetBlocked = structuredProjectTarget?.zone === 'project'
+    ? structuredProjectTarget.blocked
+    : false;
+
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent(STRUCTURED_PROJECT_DROP_EVENT, {
+      detail: structuredProjectTargetId
+        ? {
+          sourceProjectId: projectId,
+          projectId: structuredProjectTargetId,
+          state: structuredProjectTargetBlocked ? 'blocked' : 'allowed',
+        }
+        : null,
+    }));
+  }, [projectId, structuredProjectTargetBlocked, structuredProjectTargetId]);
+
+  useEffect(() => () => {
+    window.dispatchEvent(new CustomEvent(STRUCTURED_PROJECT_DROP_EVENT, { detail: null }));
+  }, []);
 
   const tabOutlineNodeById = useMemo(
     () => indexTabOutlineNodes(tabOutlineDnd.previewOutline),
@@ -8443,7 +8723,6 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
                 </div>
               );
             })}
-            <div {...tabOutlineDnd.scrollSpacerProps} data-outline-scroll-reserve />
           </div>
         )}
         {/* Empty drop zone at end — captures drops after last tab + double-click = new tab */}
@@ -8499,6 +8778,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
             }}
           />
         )}
+        <div {...tabOutlineDnd.scrollSpacerProps} data-outline-scroll-reserve />
       </div>
 
       {/* Utility zone — inline section below main, separated by a divider */}
@@ -8632,7 +8912,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
           />
         )}
         {/* Sidebar toggle */}
-        <Tooltip content="Toggle sidebar">
+        <ControlHint label="Показать или скрыть sidebar">
         <button
           onClick={() => {
             const { sidebarOpen } = getSidebarState(projectId);
@@ -8642,7 +8922,7 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
         >
           <PanelLeft size={16} />
         </button>
-        </Tooltip>
+        </ControlHint>
 
         {/* Utility Zone - Left side */}
         <div
@@ -9949,6 +10229,41 @@ function TabBar({ projectId, layout = 'horizontal' }: TabBarProps) {
               <Pencil size={12} className="text-[#888] flex-shrink-0" />
               Rename
             </button>
+            <div className="relative group/group-project-move">
+              <button
+                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+              >
+                <FolderInput size={12} className="text-[#888] flex-shrink-0" />
+                <span>Move to Project</span>
+                <span className="text-[#666] ml-auto">›</span>
+              </button>
+              <div className="absolute left-full top-0 -ml-2 pl-2 hidden group-hover/group-project-move:block">
+                <div className="bg-[#2a2a2a] border border-[#444] rounded-md shadow-2xl py-1 min-w-[190px]">
+                  {Array.from(openProjects.keys())
+                    .filter((targetProjectId) => targetProjectId !== projectId)
+                    .map((targetProjectId) => (
+                      <button
+                        key={targetProjectId}
+                        className="w-full text-left px-3 py-1.5 text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2 whitespace-nowrap"
+                        onClick={async (event) => {
+                          event.stopPropagation();
+                          setGroupContextMenu(null);
+                          const moved = await moveTabGroupToProject(projectId, group.id, targetProjectId);
+                          if (moved) window.setTimeout(() => showWorkspace(targetProjectId), 0);
+                        }}
+                      >
+                        <Folder size={12} className="text-[#777] flex-shrink-0" />
+                        <span className="truncate max-w-[180px]">
+                          {projects[targetProjectId]?.name || targetProjectId}
+                        </span>
+                      </button>
+                    ))}
+                  {Array.from(openProjects.keys()).every((targetProjectId) => targetProjectId === projectId) && (
+                    <div className="px-3 py-1.5 text-[12px] text-[#666]">No open projects</div>
+                  )}
+                </div>
+              </div>
+            </div>
             <div className="relative group/group-status">
               <button
                 className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between gap-3"

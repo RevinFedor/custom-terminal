@@ -898,12 +898,15 @@ export default function ActionsPanel({ activeTabId, embedded = false }: ActionsP
       const handshakePrompt = autoApplyDocs
         ? '/model haiku\nПодтверждаю.'
         : '/model haiku';
-      ipcRenderer.send('claude:run-command', {
+      const launchResult = await ipcRenderer.invoke('claude:run-command', {
         tabId: newTabId,
         command: 'claude-c',
         sessionId: prefilledResult.sessionId,
         prompt: handshakePrompt
       });
+      if (launchResult?.success === false || launchResult?.accepted === false) {
+        throw new Error(launchResult?.error || launchResult?.reason || 'Claude launch rejected');
+      }
 
       showToast('Claude Haiku tab created (' + Math.round(prefilledResult.totalChars / 1024) + 'KB)', 'success');
 

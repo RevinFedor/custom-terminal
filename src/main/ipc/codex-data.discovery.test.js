@@ -150,6 +150,314 @@ test('findLatestCodexSession accepts a fresh direct child before its first turn'
   assert.equal(found?.reopenedExisting, false);
 });
 
+test('findCodexDirectChildSessions uses the rollout creation boundary and exact direct lineage', async (t) => {
+  const sessionsDir = await makeSessionsDir(t);
+  const cwd = path.join(sessionsDir, 'project');
+  const actionAt = Date.parse('2026-07-23T10:00:00.000Z');
+  const write = async (name, payload) => {
+    const filePath = path.join(sessionsDir, name + '.jsonl');
+    await fs.promises.writeFile(filePath, sessionMeta(payload) + '\n', 'utf8');
+    await fs.promises.utimes(
+      filePath,
+      new Date(actionAt + 30_000),
+      new Date(actionAt + 30_000),
+    );
+    return filePath;
+  };
+
+  const matchingPath = await write('matching-child', {
+    id: 'matching-child',
+    cwd,
+    timestamp: new Date(actionAt + 500).toISOString(),
+    thread_source: 'user',
+    forked_from_id: 'source-session',
+  });
+  await write('old-child-with-new-mtime', {
+    id: 'old-child',
+    cwd,
+    timestamp: new Date(actionAt - 60_000).toISOString(),
+    thread_source: 'user',
+    forked_from_id: 'source-session',
+  });
+  await write('copied-ancestor-only', {
+    id: 'sibling-child',
+    cwd,
+    timestamp: new Date(actionAt + 700).toISOString(),
+    thread_source: 'user',
+    forked_from_id: 'other-source',
+  });
+  await write('wrong-cwd', {
+    id: 'wrong-cwd-child',
+    cwd: path.join(sessionsDir, 'other-project'),
+    timestamp: new Date(actionAt + 900).toISOString(),
+    thread_source: 'user',
+    forked_from_id: 'source-session',
+  });
+  await write('subagent-child', {
+    id: 'subagent-child',
+    cwd,
+    timestamp: new Date(actionAt + 1100).toISOString(),
+    thread_source: 'subagent',
+    parent_thread_id: 'matching-child',
+    forked_from_id: 'source-session',
+  });
+
+  const children = await _api.findCodexDirectChildSessions({
+    sourceSessionId: 'source-session',
+    cwd,
+    sinceMs: actionAt,
+    untilMs: actionAt + 5000,
+    sessionsDir,
+  });
+
+  assert.deepEqual(children.map((child) => child.sessionId), ['matching-child']);
+  assert.equal(children[0].filePath, matchingPath);
+  assert.equal(children[0].forkedFromId, 'source-session');
+});
+
+test('findCodexDirectChildSessions returns every exact candidate so recovery cannot guess', async (t) => {
+  const sessionsDir = await makeSessionsDir(t);
+  const cwd = path.join(sessionsDir, 'project');
+  const actionAt = Date.parse('2026-07-23T11:00:00.000Z');
+  for (const [id, delta] of [['child-a', 100], ['child-b', 200]]) {
+    await fs.promises.writeFile(
+      path.join(sessionsDir, id + '.jsonl'),
+      sessionMeta({
+        id,
+        cwd,
+        timestamp: new Date(actionAt + delta).toISOString(),
+        thread_source: 'user',
+        forked_from_id: 'source-session',
+      }) + '\n',
+      'utf8',
+    );
+  }
+
+  const children = await _api.findCodexDirectChildSessions({
+    sourceSessionId: 'source-session',
+    cwd,
+    sinceMs: actionAt,
+    untilMs: actionAt + 5000,
+    sessionsDir,
+  });
+
+  assert.deepEqual(children.map((child) => child.sessionId), ['child-a', 'child-b']);
+});
+
+test('inspectCodexDescendantSessions proves a complete source to child to grandchild chain', async (t) => {
+  const sessionsDir = await makeSessionsDir(t);
+  const cwd = path.join(sessionsDir, 'project');
+  const actionAt = Date.parse('2026-07-23T11:15:00.000Z');
+  const write = async (id, forkedFromId, delta, extra = {}) => {
+    await fs.promises.writeFile(
+      path.join(sessionsDir, id + '.jsonl'),
+      sessionMeta({
+        id,
+        cwd,
+        timestamp: new Date(actionAt + delta).toISOString(),
+        thread_source: 'user',
+        forked_from_id: forkedFromId,
+        ...extra,
+      }) + '\n',
+      'utf8',
+    );
+  };
+
+  await write('child-session', 'source-session', 100);
+  await write('grandchild-session', 'child-session', 200);
+  await write('other-source', null, -10_000);
+  await write('unrelated-child', 'other-source', 300);
+  await write('subagent-grandchild', 'grandchild-session', 400, {
+    thread_source: 'subagent',
+    parent_thread_id: 'grandchild-session',
+  });
+
+  const inspection = await _api.inspectCodexDescendantSessions({
+    sourceSessionId: 'source-session',
+    cwd,
+    sinceMs: actionAt,
+    untilMs: actionAt + 5000,
+    sessionsDir,
+  });
+
+  assert.equal(inspection.complete, true);
+  assert.deepEqual(
+    inspection.descendants.map(descendant => ({
+      sessionId: descendant.sessionId,
+      parent: descendant.forkedFromId,
+      depth: descendant.lineageDepth,
+      relation: descendant.lineageRelation,
+    })),
+    [
+      {
+        sessionId: 'child-session',
+        parent: 'source-session',
+        depth: 1,
+        relation: 'direct-child',
+      },
+      {
+        sessionId: 'grandchild-session',
+        parent: 'child-session',
+        depth: 2,
+        relation: 'descendant',
+      },
+    ],
+  );
+});
+
+test('recovery candidate selection commits only one exact target-prefix proof', () => {
+  const child = {
+    sessionId: 'child-session',
+    targetProof: { proven: false, reason: 'child-prefix-content-mismatch' },
+  };
+  const grandchild = {
+    sessionId: 'grandchild-session',
+    targetProof: { proven: true, reason: 'exact-target-prefix' },
+  };
+
+  const selected = _api.selectSingleProvenCodexRewindRecoveryCandidate([
+    child,
+    grandchild,
+  ]);
+  assert.equal(selected.status, 'selected');
+  assert.equal(selected.selected.sessionId, 'grandchild-session');
+
+  const none = _api.selectSingleProvenCodexRewindRecoveryCandidate([child]);
+  assert.equal(none.status, 'unresolved');
+  assert.equal(none.reason, 'no-proven-descendant');
+  assert.equal(none.selected, null);
+
+  const ambiguous = _api.selectSingleProvenCodexRewindRecoveryCandidate([
+    { ...child, targetProof: { proven: true, reason: 'exact-target-prefix' } },
+    grandchild,
+  ]);
+  assert.equal(ambiguous.status, 'unresolved');
+  assert.equal(ambiguous.reason, 'multiple-proven-descendants');
+  assert.equal(ambiguous.selected, null);
+});
+
+test('inspectCodexDescendantSessions never converts a missing middle ancestor into proven absence', async () => {
+  const actionAt = Date.parse('2026-07-23T11:20:00.000Z');
+  const inspection = await _api.inspectCodexDescendantSessions({
+    sourceSessionId: 'source-session',
+    cwd: '/project',
+    sinceMs: actionAt,
+    untilMs: actionAt + 5000,
+    sessionsDir: '/sessions',
+  }, {
+    inspectJsonlFiles: async () => ({
+      files: ['/sessions/grandchild.jsonl'],
+      errors: [],
+      truncated: false,
+    }),
+    readCodexSessionMetadata: async () => ({
+      meta: {
+        id: 'grandchild-session',
+        cwd: '/project',
+        timestamp: new Date(actionAt + 200).toISOString(),
+        thread_source: 'user',
+        forked_from_id: 'missing-child-session',
+      },
+    }),
+  });
+
+  assert.equal(inspection.complete, false);
+  assert.deepEqual(inspection.descendants, []);
+  assert.equal(inspection.errors[0].stage, 'lineage-classify');
+  assert.equal(inspection.errors[0].code, 'lineage-metadata-missing');
+  assert.equal(inspection.errors[0].missingSessionId, 'missing-child-session');
+});
+
+test('inspectCodexDirectChildSessions keeps partial results but marks a metadata read failure incomplete', async () => {
+  const actionAt = Date.parse('2026-07-23T11:30:00.000Z');
+  const readablePath = '/sessions/readable.jsonl';
+  const unreadablePath = '/sessions/unreadable.jsonl';
+  const inspection = await _api.inspectCodexDirectChildSessions({
+    sourceSessionId: 'source-session',
+    cwd: '/project',
+    sinceMs: actionAt,
+    untilMs: actionAt + 5000,
+    sessionsDir: '/sessions',
+  }, {
+    inspectJsonlFiles: async () => ({
+      files: [readablePath, unreadablePath],
+      errors: [],
+      truncated: false,
+    }),
+    readCodexSessionMetadata: async (filePath) => {
+      if (filePath === unreadablePath) {
+        const error = new Error('permission denied');
+        error.code = 'EACCES';
+        throw error;
+      }
+      return {
+        meta: {
+          id: 'matching-child',
+          cwd: '/project',
+          timestamp: new Date(actionAt + 100).toISOString(),
+          thread_source: 'user',
+          forked_from_id: 'source-session',
+        },
+      };
+    },
+  });
+
+  assert.equal(inspection.complete, false);
+  assert.deepEqual(inspection.children.map((child) => child.sessionId), ['matching-child']);
+  assert.deepEqual(inspection.errors.map((error) => ({
+    stage: error.stage,
+    path: error.path,
+    code: error.code,
+  })), [{
+    stage: 'metadata-read',
+    path: unreadablePath,
+    code: 'EACCES',
+  }]);
+});
+
+test('inspectCodexDirectChildSessions exposes partial directory walks and never converts them to a proven empty result', async () => {
+  const inspection = await _api.inspectCodexDirectChildSessions({
+    sourceSessionId: 'source-session',
+    sessionsDir: '/sessions',
+  }, {
+    inspectJsonlFiles: async () => ({
+      files: [],
+      errors: [{
+        stage: 'walk',
+        path: '/sessions/2026/07/23',
+        code: 'EACCES',
+        message: 'permission denied',
+      }],
+      truncated: false,
+    }),
+  });
+
+  assert.equal(inspection.complete, false);
+  assert.deepEqual(inspection.children, []);
+  assert.equal(inspection.errors[0].stage, 'walk');
+});
+
+test('legacy direct-child finder throws on incomplete discovery instead of returning an empty proof', async (t) => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-discovery-missing-'));
+  const missingSessionsDir = path.join(root, 'sessions-that-do-not-exist');
+  t.after(() => fs.promises.rm(root, { recursive: true, force: true }));
+
+  await assert.rejects(
+    _api.findCodexDirectChildSessions({
+      sourceSessionId: 'source-session',
+      sessionsDir: missingSessionsDir,
+    }),
+    (error) => {
+      assert.equal(error.code, 'CODEX_SESSION_DISCOVERY_INCOMPLETE');
+      assert.equal(error.inspection.complete, false);
+      assert.deepEqual(error.inspection.children, []);
+      assert.equal(error.inspection.errors[0].stage, 'walk');
+      assert.equal(error.inspection.errors[0].code, 'ENOENT');
+      return true;
+    },
+  );
+});
+
 test('findLatestCodexSession reopens an old direct child only after a post-launch task starts', async (t) => {
   const sessionsDir = await makeSessionsDir(t);
   const cwd = path.join(sessionsDir, 'project');

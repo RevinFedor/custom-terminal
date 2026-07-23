@@ -122,6 +122,8 @@ class PromptQueueAssetStore {
     const existing = await fs.promises.stat(filePath).catch(() => null);
     if (existing?.isFile()) {
       await fs.promises.unlink(tempPath).catch(() => {});
+      const touchedAt = new Date(this.now());
+      await fs.promises.utimes(filePath, touchedAt, touchedAt).catch(() => {});
     } else {
       await fs.promises.rename(tempPath, filePath);
       await fs.promises.chmod(filePath, 0o600).catch(() => {});

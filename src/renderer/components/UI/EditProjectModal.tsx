@@ -4,7 +4,7 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import { Folder, CheckCircle2, AlertCircle, Trash2 } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import SmartPopover from './SmartPopover';
-import Tooltip from './Tooltip';
+import ControlHint from './ControlHint';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -112,20 +112,22 @@ export default function EditProjectModal() {
       >
         {/* Top Right Controls */}
         <div className="absolute top-4 right-4 flex items-center gap-2">
-          <Tooltip content="Delete">
+          <ControlHint label="Удалить проект">
             <button
               className="p-1.5 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded-full transition-all cursor-pointer"
               onClick={handleDelete}
             >
               <Trash2 size={16} />
             </button>
-          </Tooltip>
-          <button
-            className="w-8 h-8 flex items-center justify-center text-gray-500 hover:text-white rounded-full hover:bg-white/5 transition-all text-xl"
-            onClick={closeEditModal}
-          >
-            ×
-          </button>
+          </ControlHint>
+          <ControlHint label="Закрыть">
+            <button
+              className="w-8 h-8 flex items-center justify-center text-gray-500 hover:text-white rounded-full hover:bg-white/5 transition-all text-xl"
+              onClick={closeEditModal}
+            >
+              ×
+            </button>
+          </ControlHint>
         </div>
 
         {/* Header with SmartPopover on Name */}

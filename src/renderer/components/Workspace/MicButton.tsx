@@ -7,8 +7,9 @@
 //   mic button. Live transcript streams into the window line-by-line as
 //   Soniox sends frames. Click again or click STOP in the window → recording
 //   ends, captured text is:
-//     - PTY-Claude tab → typed into the TUI input via terminal:input
+//     - History-primary Claude/Codex tab → appended to its tab-scoped composer
 //     - SDK tab        → injected into the composer textarea
+//     - legacy PTY mode → typed into the TUI input
 //     - terminal/no input → saved to dictation history only
 //   In every mode the transcript is also appended to dictation history so
 //   the project-toolbar dropdown can recopy it later.
@@ -47,24 +48,33 @@ interface Props {
 }
 
 function useTargetMode(tabId: string): DictationMode {
-  const tabType = useWorkspaceStore((s) => {
+  return useWorkspaceStore((s) => {
     for (const [, ws] of s.openProjects) {
       const t = ws.tabs.get(tabId);
-      if (t) return t.tabType || 'terminal';
+      if (!t) continue;
+      if (t.tabType === 'claude-sdk') return 'sdk';
+
+      // Normal Claude/Codex PTY tabs use History as their primary surface,
+      // including the short restore window where commandType and session ID
+      // can arrive on different store updates. Dictation therefore belongs to
+      // the tab-scoped History draft, never to the hidden xterm composer.
+      if (
+        t.tabType !== 'browser'
+        && t.tabType !== 'file'
+        && (
+          t.commandType === 'claude'
+          || t.commandType === 'codex'
+          || (!!t.codexSessionId && !t.claudeSessionId)
+          || !!t.claudeSessionId
+        )
+      ) {
+        return 'history';
+      }
+
+      return 'terminal';
     }
     return 'terminal';
   });
-  const commandType = useWorkspaceStore((s) => {
-    for (const [, ws] of s.openProjects) {
-      const t = ws.tabs.get(tabId);
-      if (t) return t.commandType;
-    }
-    return null;
-  });
-  if (tabType === 'claude-sdk') return 'sdk';
-  if (commandType === 'claude') return 'pty-claude';
-  if (commandType === 'codex') return 'pty-codex';
-  return 'terminal';
 }
 
 export default function MicButton({ tabId }: Props) {

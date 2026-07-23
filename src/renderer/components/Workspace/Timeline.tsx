@@ -2,9 +2,20 @@ import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMe
 import { createPortal } from 'react-dom';
 import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap, RefreshCw, ArrowUpToLine } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
+import ControlHint from '../UI/ControlHint';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { useUIStore, type HistoryPromptDraftImageRef } from '../../store/useUIStore';
 import { useWorkspaceStore, type PendingAutoTabTitle } from '../../store/useWorkspaceStore';
+import { useRewindOperationStore } from '../../store/useRewindOperationStore';
+import {
+  classifyRewindCancelReply,
+  isRewindOperationCancellable,
+  makeRewindOperationKey,
+  selectActiveRewindOperation,
+  selectRewindOperation,
+  type RewindOperation,
+  type RewindOperationMode,
+} from '../../store/rewindOperationState';
 import { TAB_TITLE_PROMPT_ID, TIMELINE_GROUPING_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { generateTabTitleFromPrompt, generateTimelineActionLabelFromPrompt, isEligibleTabTitleEntry, trimTabTitlePrompt } from '../../utils/generateTabTitle';
 import { timelineSummaryKey, timelineSummarySourceHash, useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
@@ -51,6 +62,7 @@ const HISTORY_SCROLL_SAFETY_TIMEOUT_MS = 8000;
 const EXPANDED_PREVIEW_CHARS_PER_LINE = 180;
 const EXPANDED_PREVIEW_MIN_CHARS = 240;
 const EXPANDED_PREVIEW_MAX_CHARS = 1800;
+const rewindGeminiAbortControllers = new Map<string, AbortController>();
 const EXPANDED_PREVIEW_TITLE_MAX_CHARS = 2000;
 
 function isRewindBusyGuardMessage(message: string): boolean {
@@ -195,8 +207,6 @@ interface TimelineEntry {
 
 type DeleteScope = 'selection' | 'through-start';
 
-type RewindMode = 'native' | 'ai';
-
 interface GroupInfo {
   isGroupHeader: boolean;
   isGroupChild: boolean;
@@ -222,6 +232,7 @@ interface TimelineProps {
   toolType?: 'claude' | 'gemini' | 'codex'; // Which AI tool this timeline is for
   pinned?: boolean; // When true, expanded Timeline reserves layout width instead of overlaying terminal
   readOnly?: boolean; // Home preview: Timeline only navigates HistoryPanel
+  historySurfaceVisible?: boolean; // Primary History replaces xterm without opening the legacy side panel
 }
 
 interface CodexTimelineSessionMeta {
@@ -500,7 +511,18 @@ function perfAbsNow(): number {
 // ════════════════════════════════════════════════════════════
 // SECTION: COMPONENT SETUP — props, UIStore subscriptions, state, ref declarations
 // ════════════════════════════════════════════════════════════
-function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, isOpen = true, toolType = 'claude', pinned = false, readOnly = false }: TimelineProps) {
+function Timeline({
+  tabId,
+  sessionId,
+  cwd,
+  isActive = true,
+  isVisible = true,
+  isOpen = true,
+  toolType = 'claude',
+  pinned = false,
+  readOnly = false,
+  historySurfaceVisible = false,
+}: TimelineProps) {
   const isGemini = toolType === 'gemini';
   const isCodex = toolType === 'codex';
   const usesTextSearchAnchors = isGemini || isCodex;
@@ -632,16 +654,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       setFailedStripFlash((cur) => (cur && cur.index === index && cur.kind === kind ? null : cur));
     }, 1200);
   }, []);
-  const [rewindState, setRewindState] = useState<{ index: number; phase: 'compacting' | 'rewinding' | 'pasting' | 'done' } | null>(null);
-  const rewindCancelledRef = useRef(false);
-  const rewindCancelLoggedRef = useRef(false);
-  const rewindGeminiAbortRef = useRef<AbortController | null>(null);
-  const activeRewindRef = useRef<{
-    opId: string;
-    targetUuid: string;
-    targetText: string;
-    mode: RewindMode;
-  } | null>(null);
+  const rewindState = useRewindOperationStore(
+    useCallback((state) => selectActiveRewindOperation(state, tabId), [tabId])
+  );
   const [rewindLoadingMenu, setRewindLoadingMenu] = useState<{ x: number; y: number } | null>(null);
   const [rewindAgentStatus, setRewindAgentStatus] = useState<AgentPtyStatus | null>(null);
 
@@ -846,37 +861,74 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   // weight breakdown; 'api' shows what Anthropic actually billed for this range.
   const [breakdownMode, setBreakdownMode] = useState<'jsonl' | 'api'>('jsonl');
 
-  const emitActiveRewindCancelled = useCallback(() => {
-    const active = activeRewindRef.current;
-    if (!active || rewindCancelLoggedRef.current) return;
-    rewindCancelLoggedRef.current = true;
+  const emitRewindCancelled = useCallback((operation: RewindOperation) => {
     window.dispatchEvent(new CustomEvent('history-panel:rewind-log', {
       detail: {
-        tabId,
-        opId: active.opId,
+        tabId: operation.tabId,
+        opId: operation.opId,
         status: 'failed',
-        targetUuid: active.targetUuid,
-        targetText: active.targetText,
-        mode: active.mode,
-        toolType,
+        targetUuid: operation.targetUuid,
+        targetText: operation.targetText,
+        mode: operation.mode,
+        toolType: operation.toolType,
         error: 'Rewind cancelled',
       }
     }));
-  }, [tabId, toolType]);
+  }, []);
 
   const cancelActiveRewind = useCallback(() => {
-    rewindCancelledRef.current = true;
+    const active = rewindState;
+    if (!active) return;
+    const store = useRewindOperationStore.getState();
+    if (!store.requestCancel(active.tabId, active.opId)) return;
+
     setRewindLoadingMenu(null);
-    if (rewindGeminiAbortRef.current) {
-      rewindGeminiAbortRef.current.abort();
-      rewindGeminiAbortRef.current = null;
+    const operationKey = makeRewindOperationKey(active.tabId, active.opId);
+    const abortController = rewindGeminiAbortControllers.get(operationKey);
+    if (abortController) {
+      abortController.abort();
+      rewindGeminiAbortControllers.delete(operationKey);
     }
-    emitActiveRewindCancelled();
-    setRewindState(null);
-    ipcRenderer.invoke('rewind:cancel', { tabId, toolType }).catch((err: any) => {
+
+    // Before the runtime request starts, renderer ownership is sufficient:
+    // no PTY mutation can race this cancellation.
+    if (!active.runtimeRequestStarted) {
+      if (useRewindOperationStore.getState().resolveCancel(active.tabId, active.opId, 'accepted')) {
+        emitRewindCancelled(active);
+      }
+      return;
+    }
+
+    void ipcRenderer.invoke('rewind:cancel', {
+      tabId: active.tabId,
+      toolType: active.toolType,
+      opId: active.opId,
+    }).then((reply: unknown) => {
+      const resolution = classifyRewindCancelReply(reply);
+      if (resolution === 'accepted') {
+        if (useRewindOperationStore.getState().resolveCancel(active.tabId, active.opId, 'accepted')) {
+          emitRewindCancelled(active);
+        }
+        return;
+      }
+      if (resolution === 'too-late') {
+        useRewindOperationStore.getState().resolveCancel(active.tabId, active.opId, 'too-late');
+        return;
+      }
+      useRewindOperationStore.getState().rejectCancel(
+        active.tabId,
+        active.opId,
+        'Cancellation was not accepted; waiting for the Rewind result',
+      );
+    }).catch((err: any) => {
       console.warn('[Restore:Rewind] cancel IPC failed:', err?.message || err);
+      useRewindOperationStore.getState().rejectCancel(
+        active.tabId,
+        active.opId,
+        'Cancellation check failed; waiting for the Rewind result',
+      );
     });
-  }, [tabId, toolType, emitActiveRewindCancelled]);
+  }, [rewindState, emitRewindCancelled]);
 
   // effect: contextMenu open → mousemove listener closes menu when cursor leaves Timeline+menu+bridge rect (uses geometric hit-test instead of elementFromPoint)
   useEffect(() => {
@@ -1229,6 +1281,12 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
   const setHistoryPromptDraft = useUIStore(state => state.setHistoryPromptDraft);
   const setHistoryRewindPreview = useUIStore(state => state.setHistoryRewindPreview);
   const isHistoryOpen = useUIStore(state => state.historyPanelOpenTabs[tabId] ?? false);
+  const historyTargetVisible = historySurfaceVisible || isHistoryOpen;
+  const historySurfaceKind = historySurfaceVisible
+    ? 'primary'
+    : isHistoryOpen
+      ? 'legacy-panel'
+      : 'closed';
   const setHistoryPanelOpen = useUIStore(state => state.setHistoryPanelOpen);
   const historyVisibleUuids = useUIStore(state => state.historyVisibleUuids[tabId]);
   const rewindPreviewSessionKeyRef = useRef(tabId + ':' + sessionId);
@@ -1742,7 +1800,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     if (document.body) ro.observe(document.body);
     window.addEventListener('resize', measure);
     return () => { ro.disconnect(); window.removeEventListener('resize', measure); };
-  }, [isVisible, isHistoryOpen, treeMode, notesPanelWidth]);
+  }, [isVisible, historyTargetVisible, treeMode, notesPanelWidth]);
 
   // ════════════════════════════════════════════════════════════
   // SECTION: CMD-HOLD SYNC — global keydown/keyup tracks Meta; tooltip/note/fork tooltip visibility derives from isCmdHeld+hover state
@@ -2404,7 +2462,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         }
         // Always reset everything else
         setEditRangeLoadingMenu(null);
-        setRewindState(null);
         setCopyingRange(null);
         setCopiedRange(null);
         setSelectionStartId(null);
@@ -2704,7 +2761,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       return;
     }
 
-    const consumerId = 'timeline:' + tabId;
+    const consumerId = 'timeline:' + tabId + ':' + toolType + ':' + sessionId;
     let disposed = false;
     let refreshQueued = false;
     const queueRefresh = (reason: string) => {
@@ -2754,6 +2811,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       sessionId,
       cwd,
     }).then((result: any) => {
+      if (disposed) {
+        ipcRenderer.invoke('agent-transcript:unsubscribe', { consumerId }).catch(() => {});
+        return;
+      }
       console.warn(
         '[Timeline:TranscriptSubscribe]' +
         ' inst=' + timelineInstanceIdRef.current +
@@ -2865,7 +2926,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     // mark every entry as unreachable. Visibility for SDK falls back to
     // historyVisibleUuids when the SDK chat reports its viewport via the
     // existing `claude-sdk:visible-uuids` channel (same wire as HistoryPanel).
-    if (isHistoryOpen || isSdkTab) {
+    if (historyTargetVisible || isSdkTab) {
       setUnreachableIndices(prev => prev.size === 0 ? prev : new Set());
       setResponseOnlyIndices(prev => prev.size === 0 ? prev : new Set());
       // Pre-compact entries are reachable elsewhere (full history is rendered);
@@ -3114,7 +3175,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       if (reachTimer) clearTimeout(reachTimer);
       terminalRegistry.offViewportChange(tabId);
     };
-  }, [tabId, entries, isVisible, isGemini, isCodex, usesTextSearchAnchors, isHistoryOpen, isSdkTab, historyVisibleUuids, toolType]);
+  }, [tabId, entries, isVisible, isGemini, isCodex, usesTextSearchAnchors, historyTargetVisible, isSdkTab, historyVisibleUuids, toolType]);
 
   // Refs
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -3233,14 +3294,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       const index = entries.findIndex(e => e.uuid === entry.uuid);
       const targetUuid = getHistoryPanelTargetUuid(entry, index);
       if (e) e.stopPropagation();
-      if (!isHistoryOpen) setHistoryPanelOpen(tabId, true);
+      if (!historyTargetVisible) setHistoryPanelOpen(tabId, true);
       setHistoryScrollToUuid(targetUuid);
       console.warn('[Timeline:HistoryScroll] request tab=' + tabId.slice(-12) +
         ' uuid=' + targetUuid.slice(0, 8) +
         ' entryUuid=' + entry.uuid.slice(0, 8) +
         ' index=' + index +
         ' entries=' + entries.length +
-        ' mode=read-only-preview open=' + isHistoryOpen);
+        ' mode=read-only-preview' +
+        ' surface=' + historySurfaceKind);
       setClickedState({ index, status: 'loading' });
       pendingHistoryScrollRef.current = { uuid: targetUuid, index };
       if (historyClickTimeoutRef.current) clearTimeout(historyClickTimeoutRef.current);
@@ -3327,7 +3389,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     // в полной истории». Если панель уже открыта — поведение совпадает с обычным
     // кликом при isHistoryOpen (scroll-in-history), Cmd просто гарантирует открытие.
     if (e && (e.metaKey || e.ctrlKey)) {
-      if (!isHistoryOpen) setHistoryPanelOpen(tabId, true);
+      if (!historyTargetVisible) setHistoryPanelOpen(tabId, true);
       setHistoryScrollToUuid(historyPanelTargetUuid);
       // Spinner on dot — HistoryPanel emits 'history-panel:scrolled-to' when done.
       // Safety: clear in case the panel never mounts (no session).
@@ -3336,7 +3398,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         ' entryUuid=' + entry.uuid.slice(0, 8) +
         ' index=' + index +
         ' entries=' + entries.length +
-        ' mode=cmd-click open=' + isHistoryOpen);
+        ' mode=cmd-click' +
+        ' surface=' + historySurfaceKind);
       setClickedState({ index, status: 'loading' });
       pendingHistoryScrollRef.current = { uuid: historyPanelTargetUuid, index };
       if (historyClickTimeoutRef.current) clearTimeout(historyClickTimeoutRef.current);
@@ -3354,14 +3417,15 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
     // If history panel is open — scroll to entry in history only, skip terminal scroll
     // This includes compact/continued entries which have no terminal position but DO exist in history panel
-    if (isHistoryOpen) {
+    if (historyTargetVisible) {
       setHistoryScrollToUuid(historyPanelTargetUuid);
       console.warn('[Timeline:HistoryScroll] request tab=' + tabId.slice(-12) +
         ' uuid=' + historyPanelTargetUuid.slice(0, 8) +
         ' entryUuid=' + entry.uuid.slice(0, 8) +
         ' index=' + index +
         ' entries=' + entries.length +
-        ' mode=history-open');
+        ' mode=history-open' +
+        ' surface=' + historySurfaceKind);
       setClickedState({ index, status: 'loading' });
       pendingHistoryScrollRef.current = { uuid: historyPanelTargetUuid, index };
       if (historyClickTimeoutRef.current) clearTimeout(historyClickTimeoutRef.current);
@@ -3979,7 +4043,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     return { entryIndex, rewindableEntries, targetIndex, lastBoundaryIdx };
   }, [entries, isGemini, isCodex]);
 
-  const handleRewind = async (entry: TimelineEntry, mode: RewindMode = 'native', additionalPrompt?: string) => {
+  const handleRewind = async (entry: TimelineEntry, mode: RewindOperationMode = 'native', additionalPrompt?: string) => {
     console.warn('[Restore:Rewind] handleRewind called',
       'tool=' + toolType,
       'mode=' + mode,
@@ -3988,8 +4052,16 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       'entry=' + entry.uuid.slice(0, 8));
     setContextMenu(null);
     setRewindLoadingMenu(null);
-    rewindCancelledRef.current = false;
-    rewindCancelLoggedRef.current = false;
+    const rewindStore = useRewindOperationStore.getState();
+    const activeForTab = selectActiveRewindOperation(rewindStore, tabId);
+    if (activeForTab) {
+      console.warn(
+        '[Restore:Rewind] ABORT another rewind is already active',
+        activeForTab.opId,
+        activeForTab.tabId,
+      );
+      return;
+    }
     if (!sessionId) {
       console.warn('[Restore:Rewind] ABORT no sessionId at handler entry');
       return;
@@ -4027,11 +4099,38 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       'tool:', isGemini ? 'gemini' : isCodex ? 'codex' : 'claude', 'mode:', mode);
 
     const rewindOpId = Date.now().toString(36) + '-' + entry.uuid.slice(0, 8);
-    activeRewindRef.current = {
+    const rewindStarted = useRewindOperationStore.getState().begin({
       opId: rewindOpId,
+      tabId,
+      toolType,
+      sourceSessionId: sessionId,
       targetUuid: entry.uuid,
       targetText: entry.content,
+      targetIndex: entryIndex,
       mode,
+      phase: 'preparing',
+      message: mode === 'ai' ? 'Preparing transcript for AI Rewind' : 'Preparing Rewind',
+    });
+    if (!rewindStarted) {
+      console.warn('[Restore:Rewind] ABORT operation ownership was claimed concurrently', rewindOpId, tabId);
+      return;
+    }
+    const rewindOperationKey = makeRewindOperationKey(tabId, rewindOpId);
+    const getThisRewind = () => selectRewindOperation(
+      useRewindOperationStore.getState(),
+      tabId,
+      rewindOpId,
+    );
+    const isThisRewindActive = () => (
+      useRewindOperationStore.getState().activeOpIdByTab[tabId] === rewindOpId
+      && !!getThisRewind()
+    );
+    const setThisRewindPhase = (
+      phase: RewindOperation['phase'],
+      message?: string,
+    ) => useRewindOperationStore.getState().setPhase(tabId, rewindOpId, phase, message);
+    const clearThisRewindState = () => {
+      return useRewindOperationStore.getState().clear(tabId, rewindOpId);
     };
     const emitHistoryRewindLog = (
       status: 'start' | 'done' | 'failed',
@@ -4049,7 +4148,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         const targetDraft = typeof options.historyDraftText === 'string' && options.historyDraftText.trim()
           ? options.historyDraftText.trim()
           : entry.content.trim();
-        const durable = options.persisted === true || mode === 'ai' || isCodex || isGemini;
+        const durable = options.persisted === true || (!isCodex && (mode === 'ai' || isGemini));
         if (durable) {
           setHistoryRewindPreview(tabId, null);
         } else if (mode === 'native' && toolType === 'claude' && options.historyInputDraft === true && targetDraft) {
@@ -4078,7 +4177,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           targetText: entry.content,
           mode,
           toolType,
-          persisted: options.persisted ?? (isCodex && mode === 'native' && status === 'done'),
+          persisted: options.persisted ?? (!isCodex && (mode === 'ai' || isGemini) && status === 'done'),
           historyInputDraft: options.historyInputDraft,
           historyDraftText: options.historyDraftText,
           historyDraftImages: options.historyDraftImages,
@@ -4114,7 +4213,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       })();
       setClickedState({ index: entryIndex, status: 'failed' });
       setTimeout(() => setClickedState((s) => (s?.index === entryIndex ? null : s)), 1600);
-      if (!isHistoryOpen) {
+      if (!historyTargetVisible) {
         if (codexToast) {
           useUIStore.getState().showToast(
             codexToast.title,
@@ -4146,13 +4245,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     );
 
     const finishCancelled = () => {
-      if (!rewindCancelLoggedRef.current) {
-        rewindCancelLoggedRef.current = true;
+      if (clearThisRewindState()) {
         emitHistoryRewindLog('failed', 'Rewind cancelled');
       }
-      setRewindState(null);
       setRewindLoadingMenu(null);
-      activeRewindRef.current = null;
     };
 
     // IPC channel names based on tool type
@@ -4174,21 +4270,22 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           rewindableCount: rewindableEntries.length,
         });
       } catch (error: any) {
+        if (!isThisRewindActive()) return;
         const message = String(error?.message || error || 'Codex Rewind preparation failed');
         emitHistoryRewindLog('failed', message);
         showRewindFailureFeedback(message);
-        setRewindState(null);
-        activeRewindRef.current = null;
+        clearThisRewindState();
         return;
       }
     }
+    if (!isThisRewindActive()) return;
 
     // Phase 1: Optional AI compact of entries being lost (from clicked entry to end).
     // Native rewind intentionally skips this for the fast `/rewind` → arrows → Enter path.
     let compactText = '';
     let compactError = '';
     if (mode === 'ai') {
-      setRewindState({ index: entryIndex, phase: 'compacting' });
+      if (!setThisRewindPhase('compacting', 'Preparing compact context with Gemini')) return;
 
       try {
         emitHistoryRewindLog('start', undefined, 'Gemini Rewind: copying range...');
@@ -4199,6 +4296,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
           endUuid: preparedCodex?.endUuid || sourceEndUuid,
           ...copyFlags,
         });
+        if (!isThisRewindActive()) return;
 
         if (rangeResult.success && rangeResult.content) {
           console.warn('[Restore:Rewind] Range copied, length:', rangeResult.content.length);
@@ -4214,6 +4312,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             const fpaths = promptConfig.filePaths || [];
             if (fpaths.length > 0) {
               const filesResult = await ipcRenderer.invoke('ai-prompts:read-files', fpaths);
+              if (!isThisRewindActive()) return;
               if (filesResult.success && filesResult.data.length > 0) {
                 fileContentsBlock = '\n\n' + filesResult.data.map((f: { path: string; content: string }) =>
                   `--- File: ${f.path} ---\n${f.content}`
@@ -4243,7 +4342,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             try {
               console.warn('[Restore:Rewind] Sending to Gemini for compact, model:', model);
               const abortController = new AbortController();
-              rewindGeminiAbortRef.current = abortController;
+              rewindGeminiAbortControllers.set(rewindOperationKey, abortController);
               const response = await fetch(
                 `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
                 {
@@ -4253,13 +4352,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   signal: abortController.signal,
                 }
               );
-              if (rewindGeminiAbortRef.current === abortController) rewindGeminiAbortRef.current = null;
-              if (rewindCancelledRef.current) {
-                finishCancelled();
-                return;
+              if (rewindGeminiAbortControllers.get(rewindOperationKey) === abortController) {
+                rewindGeminiAbortControllers.delete(rewindOperationKey);
               }
+              if (!isThisRewindActive()) return;
 
               const data = await response.json();
+              if (!isThisRewindActive()) return;
               if (data.candidates?.[0]?.content?.parts?.[0]?.text) {
                 compactText = data.candidates[0].content.parts[0].text;
                 console.warn('[Restore:Rewind] Compact ready, length:', compactText.length);
@@ -4271,9 +4370,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   : 'Gemini returned empty response';
               }
             } catch (geminiErr) {
-              rewindGeminiAbortRef.current = null;
-              if (rewindCancelledRef.current || (geminiErr as any)?.name === 'AbortError') {
-                finishCancelled();
+              rewindGeminiAbortControllers.delete(rewindOperationKey);
+              if (!isThisRewindActive() || (geminiErr as any)?.name === 'AbortError') {
                 return;
               }
               console.error('[Restore:Rewind] Gemini compact failed:', geminiErr);
@@ -4292,14 +4390,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       }
 
       if (!compactText.trim()) {
-        if (rewindCancelledRef.current) {
-          finishCancelled();
-          return;
-        }
+        if (!isThisRewindActive()) return;
         const error = compactError || 'Gemini Rewind produced empty text';
         emitHistoryRewindLog('failed', error);
-        setRewindState(null);
-        activeRewindRef.current = null;
+        clearThisRewindState();
         useUIStore.getState().showToast('Gemini Rewind failed: ' + error, 'error', 4000);
         return;
       }
@@ -4366,7 +4460,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         }
 
         await readyWait.promise;
-        if (rewindCancelledRef.current) throw new Error('rewind_cancelled');
+        if (!isThisRewindActive()) throw new Error('rewind_cancelled');
 
         presence = await runtime.getPresence(tabId).catch(() => null);
         console.warn('[Restore:Rewind] Presence after resume wait:', runtime.label, describePresence(presence));
@@ -4384,11 +4478,8 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
     };
 
     // Phase 2: Execute rewind in TUI + paste compact
-    if (rewindCancelledRef.current) {
-      finishCancelled();
-      return;
-    }
-    setRewindState({ index: entryIndex, phase: 'rewinding' });
+    if (!isThisRewindActive()) return;
+    if (!setThisRewindPhase('rewinding', 'Rewinding terminal history')) return;
 
     try {
       if (isCodex) {
@@ -4405,12 +4496,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       } else {
         await ensureNonCodexAgentReadyForRewind();
       }
-      if (rewindCancelledRef.current) {
-        finishCancelled();
-        return;
-      }
+      if (!isThisRewindActive()) return;
+      if (!useRewindOperationStore.getState().markRuntimeStarted(tabId, rewindOpId)) return;
       const rewindResult = await ipcRenderer.invoke(historyMenuChannel, {
         tabId,
+        opId: rewindOpId,
         targetIndex,
         targetText: targetPrefix,
         targetFullText: entry.content.trim(),
@@ -4422,10 +4512,11 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         skipDuplicates,
         pasteAfter: compactText || undefined
       });
-      if (rewindCancelledRef.current || rewindResult?.cancelled) {
+      if (rewindResult?.cancelled) {
         finishCancelled();
         return;
       }
+      if (!isThisRewindActive()) return;
       console.warn('[Restore:Rewind] Rewind result:', rewindResult.success ? 'OK' : 'FAIL',
         'pressCount:', rewindResult.pressCount,
         'compactPasted:', !!compactText);
@@ -4434,10 +4525,37 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         console.error('[Restore:Rewind] Rewind failed:', rewindFailureMessage);
         emitHistoryRewindLog('failed', rewindFailureMessage);
         showRewindFailureFeedback(rewindFailureMessage);
-        setRewindState(null);
-        activeRewindRef.current = null;
+        clearThisRewindState();
         return;
       }
+      if (!setThisRewindPhase('committing', 'Rewind applied; saving the resulting session')) return;
+      let completedSessionId: string | null | undefined;
+      if (isCodex) {
+        const sourceSessionId = String(rewindResult.sourceSessionId || '');
+        const activeSessionId = String(rewindResult.activeSessionId || '');
+        if (rewindResult.bindingCommitted !== true
+          || rewindResult.handoffStatus !== 'adopted-child'
+          || !sourceSessionId
+          || !activeSessionId) {
+          throw new Error('Codex Rewind применился, но новая ветка сессии не подтверждена');
+        }
+        const currentSessionId = useWorkspaceStore.getState().getCodexSessionId(tabId);
+        if (currentSessionId !== sourceSessionId && currentSessionId !== activeSessionId) {
+          throw new Error('Результат Codex Rewind устарел: вкладка уже перешла на другую ветку');
+        }
+        const adopted = await useWorkspaceStore.getState().setCodexSessionId(
+          tabId,
+          activeSessionId,
+          'detected',
+        );
+        if (!adopted) {
+          throw new Error('Новая ветка Codex сохранена, но вкладка не смогла на неё переключиться');
+        }
+        if (!isThisRewindActive()) return;
+        completedSessionId = activeSessionId;
+      }
+
+      if (!useRewindOperationStore.getState().complete(tabId, rewindOpId, completedSessionId)) return;
 
       // Auto-scroll to bottom after rewind
       const term = terminalRegistry.get(tabId);
@@ -4464,7 +4582,6 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
       }
 
       // Success flash
-      setRewindState({ index: entryIndex, phase: 'done' });
       if (isCodex && mode === 'native') {
         const targetDraft = typeof rewindResult.historyDraftText === 'string' && rewindResult.historyDraftText.trim()
           ? rewindResult.historyDraftText.trim()
@@ -4490,18 +4607,20 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         undefined,
         mode === 'ai' ? 'Gemini Rewind: text inserted and submitted.' : undefined,
         {
-          persisted: mode === 'ai' || isCodex || isGemini,
+          persisted: isCodex
+            ? rewindResult.bindingCommitted === true
+            : mode === 'ai' || isGemini,
           historyInputDraft: mode === 'native' && rewindResult.historyInputDraft === true,
           historyDraftText: typeof rewindResult.historyDraftText === 'string' ? rewindResult.historyDraftText : undefined,
           historyDraftImages: Array.isArray(rewindResult.historyDraftImages) ? rewindResult.historyDraftImages : undefined,
           historyDraftWarning: typeof rewindResult.historyDraftWarning === 'string' ? rewindResult.historyDraftWarning : undefined,
         }
       );
-      setTimeout(() => setRewindState(null), 1200);
-      activeRewindRef.current = null;
+      setTimeout(() => clearThisRewindState(), 1200);
 
     } catch (rewindErr) {
-      if (rewindCancelledRef.current || (rewindErr as any)?.message === 'rewind_cancelled') {
+      if (!isThisRewindActive()) return;
+      if ((rewindErr as any)?.message === 'rewind_cancelled') {
         finishCancelled();
         return;
       }
@@ -4513,13 +4632,92 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         emitHistoryRewindLog('failed', rewindErrorMessage);
       }
       showRewindFailureFeedback(rewindErrorMessage);
-      setRewindState(null);
-      activeRewindRef.current = null;
+      clearThisRewindState();
     } finally {
-      rewindGeminiAbortRef.current = null;
-      if (!rewindCancelledRef.current) activeRewindRef.current = null;
+      rewindGeminiAbortControllers.delete(rewindOperationKey);
     }
   };
+
+  const getRewindRequestState = (entry: TimelineEntry) => {
+    const hasTarget = !!getRewindTargetContext(entry);
+    const starting = rewindAgentStatus === 'starting';
+    const runtimeBlocked = isTabAiBusy || starting;
+    const canStart = !!sessionId && !rewindState && !runtimeBlocked && hasTarget && !readOnly;
+    const reason = !sessionId
+      ? 'Rewind недоступен: у вкладки ещё нет сохранённой сессии'
+      : readOnly
+        ? 'Rewind недоступен в режиме предпросмотра'
+        : rewindState
+          ? 'Rewind уже выполняется'
+          : runtimeBlocked
+            ? 'Дождись завершения текущей загрузки или ответа перед Rewind'
+            : !hasTarget
+              ? 'Этот prompt находится за недоступной границей Rewind'
+              : null;
+    return { canStart, hasTarget, runtimeBlocked, reason };
+  };
+
+  const requestRewind = (
+    entry: TimelineEntry,
+    mode: RewindOperationMode = 'native',
+    source: 'timeline-menu' | 'history-message' = 'timeline-menu',
+  ) => {
+    const availability = getRewindRequestState(entry);
+    console.warn(
+      '[Restore:Rewind] request source=' + source +
+      ' mode=' + mode +
+      ' canStart=' + availability.canStart +
+      ' agentStatus=' + (rewindAgentStatus || 'unknown') +
+      ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none') +
+      ' entry=' + entry.uuid.slice(0, 8),
+    );
+    if (!availability.canStart) {
+      useUIStore.getState().showToast(
+        availability.reason || 'Rewind недоступен',
+        'warning',
+        2600,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        tabId,
+      );
+      return false;
+    }
+    setContextMenu(null);
+    void handleRewind(entry, mode);
+    return true;
+  };
+
+  const requestRewindRef = useRef(requestRewind);
+  requestRewindRef.current = requestRewind;
+  useEffect(() => {
+    const onHistoryRewindRequest = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        tabId?: string;
+        uuid?: string;
+        mode?: RewindOperationMode;
+      }>).detail;
+      if (!detail || detail.tabId !== tabId || !detail.uuid || readOnly) return;
+      const target = entries.find((entry) => entry.uuid === detail.uuid);
+      if (!target) {
+        useUIStore.getState().showToast(
+          'Rewind недоступен: prompt не найден в текущей Timeline',
+          'error',
+          3000,
+          false,
+          undefined,
+          undefined,
+          undefined,
+          tabId,
+        );
+        return;
+      }
+      requestRewindRef.current(target, detail.mode || 'native', 'history-message');
+    };
+    window.addEventListener('history-panel:request-rewind', onHistoryRewindRequest);
+    return () => window.removeEventListener('history-panel:request-rewind', onHistoryRewindRequest);
+  }, [entries, readOnly, tabId]);
 
   // ════════════════════════════════════════════════════════════
   // SECTION: NOTES UI — handleAddNote / handleSaveNote / moveNote / handleEditNote / handleDeleteNote + note strip hover; also handleCopySingleEntry
@@ -5765,10 +5963,10 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                         //   full chat themselves so it'd be redundant).
                         : (isChainBreakZone && !isGroupMeta && !displaysAsCompact)
                           ? 'rgba(239, 68, 68, 0.06)'
-                          : (isOldHistory && !isGroupMeta && !isHistoryOpen && !isSdkTab
+                          : (isOldHistory && !isGroupMeta && !historyTargetVisible && !isSdkTab
                               ? 'rgba(239, 68, 68, 0.06)'
                               : 'transparent'),
-                    cursor: (isContinued || isDocsEdit || isDocsSearch || (isOldHistory && !isHistoryOpen && !isSdkTab)) ? 'default' : 'pointer',
+                    cursor: (isContinued || isDocsEdit || isDocsSearch || (isOldHistory && !historyTargetVisible && !isSdkTab)) ? 'default' : 'pointer',
                   } as React.CSSProperties}
                 >
                   {/* Dot */}
@@ -6267,15 +6465,39 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
         {/* Rewind Progress Indicator */}
         {isVisible && rewindState && entries.length > 0 && (() => {
-          const endIdx = rewindState.phase === 'compacting' ? entries.length - 1 : rewindState.index;
-          const rect = getOverlayRect(rewindState.index, endIdx);
+          const targetUuidIndex = entries.findIndex((candidate) => candidate.uuid === rewindState.targetUuid);
+          const targetIndex = targetUuidIndex >= 0
+            ? targetUuidIndex
+            : Math.min(Math.max(rewindState.targetIndex, 0), entries.length - 1);
+          const endIdx = rewindState.phase === 'compacting' ? entries.length - 1 : targetIndex;
+          const rect = getOverlayRect(targetIndex, endIdx);
           if (!rect || !innerWrapperRef.current) return null;
           const phase = rewindState.phase;
-          const label = phase === 'done' ? 'DONE' : phase === 'compacting' ? 'COMPACTING...' : 'REWINDING...';
-          const blinkClass = phase === 'compacting' ? 'animate-glow-yellow' : phase === 'done' ? '' : 'animate-glow-purple';
+          const label = phase === 'done'
+            ? 'DONE'
+            : phase === 'preparing'
+            ? 'PREPARING...'
+            : phase === 'compacting'
+            ? 'COMPACTING...'
+            : phase === 'cancelling'
+            ? 'CANCELLING...'
+            : phase === 'committing'
+            ? 'FINISHING...'
+            : phase === 'pasting'
+            ? 'PASTING...'
+            : 'REWINDING...';
+          const blinkClass = phase === 'compacting' || phase === 'preparing' || phase === 'cancelling'
+            ? 'animate-glow-yellow'
+            : phase === 'done'
+            ? ''
+            : 'animate-glow-purple';
           const staticBg = phase === 'done' ? 'rgba(34, 197, 94, 0.4)' : '';
-          const color = phase === 'done' ? '#22c55e' : phase === 'compacting' ? '#f59e0b' : '#a855f7';
-          const canCancel = phase === 'compacting' || phase === 'rewinding' || phase === 'pasting';
+          const color = phase === 'done'
+            ? '#22c55e'
+            : phase === 'compacting' || phase === 'preparing' || phase === 'cancelling'
+            ? '#f59e0b'
+            : '#a855f7';
+          const canCancel = isRewindOperationCancellable(rewindState);
           
           const wrapperRect = innerWrapperRef.current.getBoundingClientRect();
           const fixedTop = wrapperRect.top + rect.top + 10;
@@ -6613,11 +6835,14 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
 
                 onProgress?.('restarting');
                 console.warn('[EditRange] Restarting Claude with session:', sessionId?.slice(0, 8));
-                ipcRenderer.send('claude:run-command', {
+                const launchResult = await ipcRenderer.invoke('claude:run-command', {
                   tabId,
                   command: 'claude-c',
                   sessionId,
                 });
+                if (launchResult?.success === false || launchResult?.accepted === false) {
+                  throw new Error(launchResult?.error || launchResult?.reason || 'Claude restart rejected');
+                }
 
                 // Wait for Claude to start (isRunning = true = command running = sidebar green)
                 for (let i = 0; i < 30; i++) {
@@ -7211,7 +7436,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         )}
 
         {/* ──── REWIND LOADING MENU PORTAL (right-click on Rewind overlay → Cancel) ──── */}
-        {rewindLoadingMenu && rewindState && rewindState.phase !== 'done' && (
+        {rewindLoadingMenu && rewindState && isRewindOperationCancellable(rewindState) && (
           <TooltipPortal>
             <div
               ref={rewindLoadingMenuRef}
@@ -7414,13 +7639,9 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                   )}
                   {/* Rewind — left side native, right side Gemini compact + native rewind. */}
                   {(() => {
-                    const hasRewindTarget = !!getRewindTargetContext(contextMenu.entry);
-                    const isRewindStarting = rewindAgentStatus === 'starting';
-                    const isRewindBlocked = isTabAiBusy || isRewindStarting;
-                    const canStartRewind = !!sessionId && !rewindState && !isRewindBlocked && hasRewindTarget;
-                    const rewindBusyTitle = isRewindBlocked
-                      ? 'Wait until the current loader finishes before rewind'
-                      : undefined;
+                    const rewindAvailability = getRewindRequestState(contextMenu.entry);
+                    const canStartRewind = rewindAvailability.canStart;
+                    const rewindBusyTitle = rewindAvailability.reason || undefined;
                     return (
                       <>
                         <div className="border-t border-white/10 my-1" />
@@ -7431,29 +7652,33 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
                             title={rewindBusyTitle}
                             onClick={(e) => {
                               e.stopPropagation();
-                              console.warn('[Restore:Rewind] native button click',
-                                'canStart=' + canStartRewind,
-                                'agentStatus=' + (rewindAgentStatus || 'unknown'),
-                                'session=' + (sessionId ? sessionId.slice(0, 8) : 'none'),
-                                'entry=' + contextMenu.entry.uuid.slice(0, 8));
-                              if (canStartRewind) handleRewind(contextMenu.entry, 'native');
+                              requestRewind(contextMenu.entry, 'native', 'timeline-menu');
                             }}
                           >
-                            {rewindState ? (rewindState.phase === 'compacting' ? 'Gemini...' : rewindState.phase === 'rewinding' ? 'Rewind...' : 'Paste...') : 'Rewind'}
+                            {rewindState
+                              ? (rewindState.phase === 'preparing'
+                                ? 'Preparing...'
+                                : rewindState.phase === 'compacting'
+                                ? 'Gemini...'
+                                : rewindState.phase === 'cancelling'
+                                ? 'Cancelling...'
+                                : rewindState.phase === 'committing'
+                                ? 'Finishing...'
+                                : rewindState.phase === 'rewinding'
+                                ? 'Rewind...'
+                                : rewindState.phase === 'done'
+                                ? 'Done'
+                                : 'Paste...')
+                              : 'Rewind'}
                           </button>
-                          <Tooltip content={isRewindBlocked ? 'Wait until the current loader finishes before rewind' : 'Rewind через AI'}>
+                          <Tooltip content={rewindBusyTitle || 'Rewind через AI'}>
                             <button
                               className={`px-2 py-2 text-[10px] font-bold tracking-wide rounded-r transition-colors border-l border-white/10 ${canStartRewind ? 'text-amber-400/80 hover:bg-amber-600/30 hover:text-amber-300 cursor-pointer' : 'text-white/20 cursor-not-allowed'}`}
                               disabled={!canStartRewind}
                               title={rewindBusyTitle}
                               onClick={(e) => {
                                 e.stopPropagation();
-                                console.warn('[Restore:Rewind] ai button click',
-                                  'canStart=' + canStartRewind,
-                                  'agentStatus=' + (rewindAgentStatus || 'unknown'),
-                                  'session=' + (sessionId ? sessionId.slice(0, 8) : 'none'),
-                                  'entry=' + contextMenu.entry.uuid.slice(0, 8));
-                                if (canStartRewind) handleRewind(contextMenu.entry, 'ai');
+                                requestRewind(contextMenu.entry, 'ai', 'timeline-menu');
                               }}
                             >
                               AI
@@ -8256,13 +8481,13 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
         {/* ──── SCROLL-TO-BOTTOM ARROW (purple chevron; visibility toggled via ref to avoid re-render) ──── */}
         {/* Scroll-to-bottom arrow — always mounted, visibility toggled via ref (no re-render on scroll) */}
         {isVisible && (
-          <Tooltip content="Scroll to bottom">
+          <ControlHint label="Прокрутить Timeline вниз">
             <button
               type="button"
               ref={arrowRef}
               className="absolute cursor-pointer z-50 flex items-center justify-center"
               onClick={() => {
-                if (isHistoryOpen) {
+                if (historyTargetVisible) {
                   // History panel is open — scroll history to bottom instead of timeline
                   window.dispatchEvent(new CustomEvent('history-panel:scroll-to-bottom', { detail: { tabId } }));
                 }
@@ -8287,7 +8512,7 @@ function Timeline({ tabId, sessionId, cwd, isActive = true, isVisible = true, is
             >
               <ChevronDown size={16} color="#a78bfa" strokeWidth={2.5} />
             </button>
-          </Tooltip>
+          </ControlHint>
         )}
 
         {/* ──── CUSTOM SCROLLBAR THUMB (thumbRef — position/height updated via ref by scroll listener) ──── */}

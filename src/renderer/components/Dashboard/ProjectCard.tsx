@@ -4,6 +4,7 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { FolderOpen, Settings, Trash2 } from 'lucide-react';
 import SmartPopover from '../UI/SmartPopover';
+import ControlHint from '../UI/ControlHint';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -90,20 +91,24 @@ export default function ProjectCard({
       onMouseLeave={() => setPathHovered(false)}
     >
       <div className="absolute top-1 right-1 z-20 flex items-center gap-0.5 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity">
-        <button
-          className="p-1 text-[#777] bg-[#141414]/95 hover:text-red-400 hover:bg-red-500/15 rounded transition-colors cursor-pointer"
-          onClick={handleDelete}
-          title="Delete project"
-        >
-          <Trash2 size={12} />
-        </button>
-        <button
-          className="p-1 text-[#777] bg-[#141414]/95 hover:text-white hover:bg-white/10 rounded transition-colors cursor-pointer"
-          onClick={handleEdit}
-          title="Project settings"
-        >
-          <Settings size={12} />
-        </button>
+        <ControlHint label="Удалить проект" side="bottom">
+          <button
+            className="p-1 text-[#777] bg-[#141414]/95 hover:text-red-400 hover:bg-red-500/15 rounded transition-colors cursor-pointer"
+            onClick={handleDelete}
+            title="Delete project"
+          >
+            <Trash2 size={12} />
+          </button>
+        </ControlHint>
+        <ControlHint label="Настройки проекта" side="bottom">
+          <button
+            className="p-1 text-[#777] bg-[#141414]/95 hover:text-white hover:bg-white/10 rounded transition-colors cursor-pointer"
+            onClick={handleEdit}
+            title="Project settings"
+          >
+            <Settings size={12} />
+          </button>
+        </ControlHint>
       </div>
 
       {/* Project Name */}

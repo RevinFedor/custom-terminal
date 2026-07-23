@@ -32,6 +32,62 @@ test('normalization keeps exactly two levels and root-only statuses', () => {
     statusId: 'task-active',
     subtasks: [{ id: 'child-1', title: 'Добавить Chat / Work' }],
   }]);
+  assert.deepEqual(document.archivedItems, []);
+});
+
+test('archiving preserves the task, status, subtasks, and participates in undo/redo', () => {
+  const active = applyTaskPlanOperations(emptyTaskPlan(), [{
+    type: 'add_task',
+    id: 'settings',
+    title: 'Унифицировать настройки',
+    statusId: 'task-active',
+    subtasks: [{ id: 'mode', title: 'Добавить Chat / Work' }],
+  }], 'user').document;
+
+  const archived = applyTaskPlanOperations(active, [
+    { type: 'archive_task', taskId: 'settings' },
+  ], 'user').document;
+
+  assert.deepEqual(archived.items, []);
+  assert.equal(archived.archivedItems.length, 1);
+  assert.equal(archived.archivedItems[0].id, 'settings');
+  assert.equal(archived.archivedItems[0].statusId, 'task-active');
+  assert.deepEqual(archived.archivedItems[0].subtasks, [{ id: 'mode', title: 'Добавить Chat / Work' }]);
+  assert.equal(Number.isFinite(archived.archivedItems[0].archivedAt), true);
+
+  const undone = undoTaskPlan(archived, 'user').document;
+  assert.equal(undone.items[0].id, 'settings');
+  assert.deepEqual(undone.archivedItems, []);
+
+  const redone = redoTaskPlan(undone, 'user').document;
+  assert.deepEqual(redone.items, []);
+  assert.equal(redone.archivedItems[0].id, 'settings');
+});
+
+test('an archived task can be restored without losing its content', () => {
+  const active = applyTaskPlanOperations(emptyTaskPlan(), [{
+    type: 'add_task', id: 'work', title: 'Разобраться с Work', statusId: 'task-dev',
+  }], 'user').document;
+  const archived = applyTaskPlanOperations(active, [{ type: 'archive_task', taskId: 'work' }], 'user').document;
+  const restored = applyTaskPlanOperations(archived, [{ type: 'restore_task', taskId: 'work' }], 'user').document;
+
+  assert.deepEqual(restored.archivedItems, []);
+  assert.deepEqual(restored.items, [{
+    id: 'work', title: 'Разобраться с Work', statusId: 'task-dev', subtasks: [],
+  }]);
+});
+
+test('replacing the active plan does not erase archived tasks', () => {
+  const first = applyTaskPlanOperations(emptyTaskPlan(), [
+    { type: 'add_task', id: 'done', title: 'Завершённая область' },
+    { type: 'archive_task', taskId: 'done' },
+  ], 'user').document;
+  const replaced = applyTaskPlanOperations(first, [{
+    type: 'replace_plan', tasks: [{ id: 'active', title: 'Новая активная область' }],
+  }], 'terminal-mcp').document;
+
+  assert.equal(replaced.items[0].id, 'active');
+  assert.equal(replaced.archivedItems[0].id, 'done');
 });
 
 test('an operation batch is one revision and one undo step', () => {

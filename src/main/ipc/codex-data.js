@@ -3,6 +3,10 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const {
+  buildHistoryRevision,
+  validateHistoryRevision,
+} = require('../history-revision');
 const { execFile } = require('child_process');
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
@@ -108,6 +112,31 @@ function getCodexJsonlCacheStats() {
     rawBytes: _codexJsonlCacheRawBytes,
     filePaths: [..._codexJsonlCache.keys()],
   };
+}
+
+async function getCodexJsonlSourceSnapshot(filePath, sessionId) {
+  const cached = _codexJsonlCache.get(filePath);
+  if (cached) {
+    return {
+      filePath,
+      size: cached.size,
+      mtimeMs: cached.mtimeMs,
+      sessionId: sessionId || path.basename(filePath, '.jsonl'),
+      linkKind: 'end',
+    };
+  }
+  try {
+    const stat = await fs.promises.stat(filePath);
+    return {
+      filePath,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      sessionId: sessionId || path.basename(filePath, '.jsonl'),
+      linkKind: 'end',
+    };
+  } catch {
+    return null;
+  }
 }
 
 function compactPreview(value, max = 120) {
@@ -1034,6 +1063,44 @@ async function walkJsonlFiles(rootDir, maxFiles = 4000) {
   return out;
 }
 
+async function inspectJsonlFiles(rootDir, maxFiles = 4000) {
+  const files = [];
+  const errors = [];
+  let truncated = false;
+
+  async function walk(dir) {
+    if (truncated) return;
+    let entries;
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch (error) {
+      errors.push({
+        stage: 'walk',
+        path: dir,
+        code: error?.code || null,
+        message: error?.message || String(error),
+      });
+      return;
+    }
+    for (const entry of entries) {
+      if (truncated) return;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.isFile() && entry.name.endsWith('.jsonl') && !entry.name.includes('.with-rollbacks-backup')) {
+        if (files.length >= maxFiles) {
+          truncated = true;
+          return;
+        }
+        files.push(full);
+      }
+    }
+  }
+
+  await walk(rootDir);
+  return { files, errors, truncated };
+}
+
 async function parseJsonlFile(filePath) {
   const inflight = _codexJsonlInflight.get(filePath);
   if (inflight) {
@@ -1650,10 +1717,392 @@ async function findLatestCodexSession({
   return relatedFallbacks[0] || null;
 }
 
-function pushAssistantEntry(entries, sessionId, record, turnIndex, content, thinking, actions) {
+async function inspectCodexSessionMetadataIndex(
+  sessionsDir = CODEX_SESSIONS_DIR,
+  dependencies = {},
+) {
+  const walkFiles = dependencies.inspectJsonlFiles || inspectJsonlFiles;
+  const readMetadata = dependencies.readCodexSessionMetadata || readCodexSessionMetadata;
+  let walkResult;
+  try {
+    walkResult = await walkFiles(sessionsDir);
+  } catch (error) {
+    walkResult = {
+      files: [],
+      errors: [{
+        stage: 'walk',
+        path: sessionsDir,
+        code: error?.code || null,
+        message: error?.message || String(error),
+      }],
+      truncated: false,
+    };
+  }
+  const files = Array.isArray(walkResult)
+    ? walkResult
+    : (Array.isArray(walkResult?.files) ? walkResult.files : []);
+  const errors = Array.isArray(walkResult?.errors) ? [...walkResult.errors] : [];
+  const truncated = walkResult?.truncated === true;
+  const entries = [];
+
+  for (const filePath of files) {
+    let metadata;
+    try {
+      metadata = await readMetadata(filePath);
+    } catch (error) {
+      errors.push({
+        stage: 'metadata-read',
+        path: filePath,
+        code: error?.code || null,
+        message: error?.message || String(error),
+      });
+      continue;
+    }
+    const meta = metadata?.meta || {};
+    if (!meta.id) {
+      errors.push({
+        stage: 'metadata-classify',
+        path: filePath,
+        code: 'session_metadata_missing',
+        message: 'Readable JSONL could not be classified because session metadata is missing',
+      });
+      continue;
+    }
+    entries.push({
+      meta,
+      filePath,
+    });
+  }
+
+  return {
+    entries,
+    errors,
+    truncated,
+    filesScanned: files.length,
+  };
+}
+
+async function inspectCodexDirectChildSessions({
+  sourceSessionId,
+  cwd,
+  sinceMs,
+  untilMs,
+  sessionsDir = CODEX_SESSIONS_DIR,
+} = {}, dependencies = {}) {
+  if (!sourceSessionId) {
+    return {
+      complete: false,
+      children: [],
+      errors: [{
+        stage: 'input',
+        path: sessionsDir,
+        code: 'source_session_id_required',
+        message: 'sourceSessionId is required for direct-child discovery',
+      }],
+      truncated: false,
+      filesScanned: 0,
+    };
+  }
+  const normalizedCwd = cwd ? path.resolve(cwd) : null;
+  const lowerBound = Number(sinceMs);
+  const upperBound = Number(untilMs);
+  const hasLowerBound = Number.isFinite(lowerBound) && lowerBound > 0;
+  const hasUpperBound = Number.isFinite(upperBound) && upperBound > 0;
+  const index = await inspectCodexSessionMetadataIndex(sessionsDir, dependencies);
+  const errors = [...index.errors];
+  const children = [];
+
+  for (const { meta, filePath } of index.entries) {
+    if (!meta.id
+      || meta.id === sourceSessionId
+      || meta.forked_from_id !== sourceSessionId
+      || !isCodexUserTuiSession(meta)) {
+      continue;
+    }
+    if (normalizedCwd && (!meta.cwd || path.resolve(meta.cwd) !== normalizedCwd)) {
+      continue;
+    }
+    const createdAtMs = parseTimestampMs(meta.timestamp);
+    if (!Number.isFinite(createdAtMs)) {
+      errors.push({
+        stage: 'metadata-classify',
+        path: filePath,
+        code: 'session_timestamp_invalid',
+        message: 'Direct child metadata has no usable creation timestamp',
+      });
+      continue;
+    }
+    if (hasLowerBound && createdAtMs < lowerBound) continue;
+    if (hasUpperBound && createdAtMs > upperBound) continue;
+    children.push({
+      sessionId: meta.id,
+      filePath,
+      cwd: meta.cwd || null,
+      forkedFromId: meta.forked_from_id,
+      createdAtMs,
+    });
+  }
+
+  children.sort((left, right) => left.createdAtMs - right.createdAtMs);
+  return {
+    complete: errors.length === 0 && !index.truncated,
+    children,
+    errors,
+    truncated: index.truncated,
+    filesScanned: index.filesScanned,
+  };
+}
+
+function resolveCodexDescendantLineage(meta, sourceSessionId, metadataBySessionId, conflicts) {
+  const source = String(sourceSessionId || '');
+  let currentId = String(meta?.id || '');
+  if (!source || !currentId || currentId === source) {
+    return {
+      proven: false,
+      reason: currentId === source ? 'source-is-not-descendant' : 'lineage-id-missing',
+    };
+  }
+
+  const seen = new Set([currentId]);
+  const chain = [currentId];
+  let depth = 0;
+  while (currentId) {
+    if (conflicts.has(currentId)) {
+      return {
+        proven: false,
+        incomplete: true,
+        reason: 'lineage-conflict',
+        conflictSessionId: currentId,
+        chain,
+      };
+    }
+    const current = metadataBySessionId.get(currentId)?.meta || null;
+    if (!current) {
+      return {
+        proven: false,
+        incomplete: true,
+        reason: 'lineage-metadata-missing',
+        missingSessionId: currentId,
+        chain,
+      };
+    }
+    const parentId = current.forked_from_id ? String(current.forked_from_id) : '';
+    if (!parentId) {
+      return {
+        proven: false,
+        incomplete: false,
+        reason: 'different-lineage-root',
+        rootSessionId: currentId,
+        chain,
+      };
+    }
+    depth += 1;
+    if (parentId === source) {
+      return {
+        proven: true,
+        incomplete: false,
+        reason: depth === 1 ? 'direct-child' : 'descendant',
+        depth,
+        relation: depth === 1 ? 'direct-child' : 'descendant',
+        chain: [...chain, source],
+      };
+    }
+    if (seen.has(parentId)) {
+      return {
+        proven: false,
+        incomplete: true,
+        reason: 'lineage-cycle',
+        cycleSessionId: parentId,
+        chain: [...chain, parentId],
+      };
+    }
+    seen.add(parentId);
+    chain.push(parentId);
+    currentId = parentId;
+  }
+  return {
+    proven: false,
+    incomplete: true,
+    reason: 'lineage-metadata-missing',
+    chain,
+  };
+}
+
+async function inspectCodexDescendantSessions({
+  sourceSessionId,
+  cwd,
+  sinceMs,
+  untilMs,
+  sessionsDir = CODEX_SESSIONS_DIR,
+} = {}, dependencies = {}) {
+  if (!sourceSessionId) {
+    return {
+      complete: false,
+      descendants: [],
+      errors: [{
+        stage: 'input',
+        path: sessionsDir,
+        code: 'source_session_id_required',
+        message: 'sourceSessionId is required for descendant discovery',
+      }],
+      truncated: false,
+      filesScanned: 0,
+    };
+  }
+
+  const normalizedCwd = cwd ? path.resolve(cwd) : null;
+  const lowerBound = Number(sinceMs);
+  const upperBound = Number(untilMs);
+  const hasLowerBound = Number.isFinite(lowerBound) && lowerBound > 0;
+  const hasUpperBound = Number.isFinite(upperBound) && upperBound > 0;
+  const index = await inspectCodexSessionMetadataIndex(sessionsDir, dependencies);
+  const errors = [...index.errors];
+  const metadataBySessionId = new Map();
+  const conflicts = new Set();
+
+  for (const entry of index.entries) {
+    const { meta, filePath } = entry;
+    if (!isCodexUserTuiSession(meta)) continue;
+    if (normalizedCwd && (!meta.cwd || path.resolve(meta.cwd) !== normalizedCwd)) continue;
+    const sessionId = String(meta.id);
+    const existing = metadataBySessionId.get(sessionId);
+    if (existing && existing.filePath !== filePath) {
+      conflicts.add(sessionId);
+      errors.push({
+        stage: 'metadata-classify',
+        path: filePath,
+        code: 'duplicate_session_id',
+        message: 'Multiple rollout files claim the same Codex session ID',
+        sessionId,
+        otherPath: existing.filePath,
+      });
+      continue;
+    }
+    metadataBySessionId.set(sessionId, entry);
+  }
+
+  const descendants = [];
+  const reportedLineageErrors = new Set();
+  for (const { meta, filePath } of metadataBySessionId.values()) {
+    if (meta.id === sourceSessionId || !meta.forked_from_id) continue;
+    const createdAtMs = parseTimestampMs(meta.timestamp);
+    const validTimestamp = Number.isFinite(createdAtMs);
+    if (validTimestamp) {
+      if (hasLowerBound && createdAtMs < lowerBound) continue;
+      if (hasUpperBound && createdAtMs > upperBound) continue;
+    }
+
+    const lineage = resolveCodexDescendantLineage(
+      meta,
+      sourceSessionId,
+      metadataBySessionId,
+      conflicts,
+    );
+    if (!lineage.proven) {
+      if (lineage.incomplete) {
+        const errorKey = [
+          meta.id,
+          lineage.reason,
+          lineage.missingSessionId || lineage.conflictSessionId || lineage.cycleSessionId || '',
+        ].join(':');
+        if (!reportedLineageErrors.has(errorKey)) {
+          reportedLineageErrors.add(errorKey);
+          errors.push({
+            stage: 'lineage-classify',
+            path: filePath,
+            code: lineage.reason,
+            message: 'A fresh Codex rollout has an incomplete ancestry chain',
+            sessionId: meta.id,
+            ...lineage,
+          });
+        }
+      }
+      continue;
+    }
+    if (!validTimestamp) {
+      errors.push({
+        stage: 'metadata-classify',
+        path: filePath,
+        code: 'session_timestamp_invalid',
+        message: 'Descendant metadata has no usable creation timestamp',
+        sessionId: meta.id,
+      });
+      continue;
+    }
+    descendants.push({
+      sessionId: meta.id,
+      filePath,
+      cwd: meta.cwd || null,
+      forkedFromId: meta.forked_from_id,
+      createdAtMs,
+      lineageDepth: lineage.depth,
+      lineageRelation: lineage.relation,
+      lineageChain: lineage.chain,
+    });
+  }
+
+  descendants.sort((left, right) => (
+    left.createdAtMs - right.createdAtMs
+    || left.lineageDepth - right.lineageDepth
+    || left.sessionId.localeCompare(right.sessionId)
+  ));
+  return {
+    complete: errors.length === 0 && !index.truncated,
+    descendants,
+    errors,
+    truncated: index.truncated,
+    filesScanned: index.filesScanned,
+  };
+}
+
+function selectSingleProvenCodexRewindRecoveryCandidate(evaluatedCandidates) {
+  const evaluated = Array.isArray(evaluatedCandidates) ? evaluatedCandidates : [];
+  const proven = evaluated.filter(candidate => candidate?.targetProof?.proven === true);
+  if (proven.length === 1) {
+    return {
+      status: 'selected',
+      selected: proven[0],
+      proven,
+      evaluated,
+    };
+  }
+  return {
+    status: 'unresolved',
+    reason: proven.length === 0
+      ? 'no-proven-descendant'
+      : 'multiple-proven-descendants',
+    selected: null,
+    proven,
+    evaluated,
+  };
+}
+
+async function findCodexDirectChildSessions(options = {}) {
+  const inspection = await inspectCodexDirectChildSessions(options);
+  if (!inspection.complete) {
+    const error = new Error('Codex direct-child discovery was incomplete');
+    error.code = 'CODEX_SESSION_DISCOVERY_INCOMPLETE';
+    error.inspection = inspection;
+    throw error;
+  }
+  return inspection.children;
+}
+
+async function findCodexDescendantSessions(options = {}) {
+  const inspection = await inspectCodexDescendantSessions(options);
+  if (!inspection.complete) {
+    const error = new Error('Codex descendant discovery was incomplete');
+    error.code = 'CODEX_SESSION_DISCOVERY_INCOMPLETE';
+    error.inspection = inspection;
+    throw error;
+  }
+  return inspection.descendants;
+}
+
+function pushAssistantEntry(entries, sessionId, record, turnIndex, content, thinking, actions, identityLine = record.__line) {
   if (!content && !thinking && (!actions || actions.length === 0)) return;
   entries.push({
-    uuid: stableUuid(sessionId, record.__line, 'codex-assistant'),
+    uuid: stableUuid(sessionId, identityLine, 'codex-assistant'),
     role: 'assistant',
     timestamp: recordTimestamp(record),
     content: content || '',
@@ -2008,7 +2457,10 @@ function buildCodexFullHistory(records, sessionId) {
         pushAssistantEntry(entries, sessionId, record, currentTurnIndex, '', pendingThinking, null);
       } else {
         const decoded = codexHistoryActionsForCall(call, payload.output, !!payload.is_error);
-        pushAssistantEntry(entries, sessionId, record, currentTurnIndex, '', pendingThinking, decoded.actions);
+        // The call row owns the visible card identity. Completion enriches that
+        // same card instead of replacing it with an output-line row, preserving
+        // collapse state and Virtuoso measurement during streaming.
+        pushAssistantEntry(entries, sessionId, record, currentTurnIndex, '', pendingThinking, decoded.actions, call.line);
         if (decoded.cellId) pendingExecCells.set(decoded.cellId, decoded.actions);
       }
       pendingThinking = '';
@@ -4582,7 +5034,8 @@ async function loadSessionRecords(sessionId, cwd) {
   const found = await findCodexSessionFile(sessionId, cwd);
   if (!found) return { success: false, error: 'Codex session file not found' };
   const records = await parseJsonlFile(found.filePath);
-  return { success: true, records, filePath: found.filePath };
+  const sourceSnapshot = await getCodexJsonlSourceSnapshot(found.filePath, sessionId);
+  return { success: true, records, filePath: found.filePath, sourceSnapshot };
 }
 
 function register({ projectManager } = {}) {
@@ -4607,15 +5060,37 @@ function register({ projectManager } = {}) {
     }
   });
 
-  ipcMain.handle('codex:get-full-history', async (_event, { sessionId, cwd }) => {
+  ipcMain.handle('codex:get-full-history', async (_event, payload = {}) => {
+    const { sessionId, cwd, ifRevision } = payload;
     try {
+      if (ifRevision) {
+        const validation = await validateHistoryRevision(
+          ifRevision,
+          { toolType: 'codex', sessionId, cwd },
+          {
+            resolvePrimaryFile: async () => {
+              const found = await findCodexSessionFile(sessionId, cwd);
+              return found?.filePath || null;
+            },
+          }
+        );
+        if (validation.unchanged) {
+          return { success: true, unchanged: true, revision: ifRevision };
+        }
+      }
       const loaded = await loadSessionRecords(sessionId, cwd);
       if (!loaded.success) return loaded;
+      const revision = buildHistoryRevision(
+        { toolType: 'codex', sessionId, cwd },
+        loaded.sourceSnapshot ? [loaded.sourceSnapshot] : []
+      );
       return {
         success: true,
+        unchanged: false,
         entries: buildCodexFullHistory(loaded.records, sessionId),
         claudeMemoryBoundaryUuid: null,
         filePath: loaded.filePath,
+        revision,
       };
     } catch (error) {
       console.error('[CodexData] get-full-history error:', error);
@@ -4846,6 +5321,10 @@ module.exports = {
   register,
   findCodexSessionFile,
   findLatestCodexSession,
+  findCodexDescendantSessions,
+  inspectCodexDescendantSessions,
+  findCodexDirectChildSessions,
+  inspectCodexDirectChildSessions,
   findCodexLinkedLiveBoundary,
   buildCodexTimeline,
   buildCodexFullHistory,
@@ -4861,6 +5340,11 @@ module.exports = {
     listCodexModels,
     findCodexSessionFile,
     findLatestCodexSession,
+    findCodexDescendantSessions,
+    inspectCodexDescendantSessions,
+    findCodexDirectChildSessions,
+    inspectCodexDirectChildSessions,
+    selectSingleProvenCodexRewindRecoveryCandidate,
     findCodexLinkedLiveBoundary,
     readCodexSessionMetadata,
     isCodexUserTuiSession,
@@ -4870,6 +5354,7 @@ module.exports = {
     codexCompactCompanionLines,
     invalidateJsonlCache: invalidateCodexJsonlCache,
     buildCodexCleanEntries,
+    extractTextContent,
     buildCodexCleanExport,
     buildCodexRangeExport,
     buildCodexTurnAssistantContext,

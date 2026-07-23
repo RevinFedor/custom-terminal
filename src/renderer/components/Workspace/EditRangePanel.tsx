@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Sparkles, ChevronRight, X, Check, Pencil, Copy } from 'lucide-react';
-import Tooltip from '../UI/Tooltip';
+import ControlHint from '../UI/ControlHint';
 import MarkdownRenderer from '../Research/MarkdownRenderer';
 import { usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore, ThinkingLevel, AIModel } from '../../store/useUIStore';
@@ -671,7 +671,7 @@ export default function EditRangePanel({
                 {/* Edit/Copy buttons under Gemini response */}
                 {editingMsgId !== msg.id && (
                   <div style={{ display: 'flex', gap: '4px', justifyContent: 'flex-end', marginTop: '3px' }}>
-                    <Tooltip content="Копировать">
+                    <ControlHint label="Копировать ответ">
                     <button
                       onClick={() => {
                         const { clipboard } = window.require('electron');
@@ -683,8 +683,8 @@ export default function EditRangePanel({
                     >
                       <Copy size={10} />
                     </button>
-                    </Tooltip>
-                    <Tooltip content="Редактировать ответ">
+                    </ControlHint>
+                    <ControlHint label="Редактировать ответ">
                     <button
                       onClick={() => {
                         setEditingMsgId(msg.id);
@@ -696,7 +696,7 @@ export default function EditRangePanel({
                     >
                       <Pencil size={10} />
                     </button>
-                    </Tooltip>
+                    </ControlHint>
                   </div>
                 )}
               </div>

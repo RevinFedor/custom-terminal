@@ -6,6 +6,7 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useMirrorStatusStore } from '../../store/useMirrorStatusStore';
 import { useTimelineSummaryStore } from '../../store/useTimelineSummaryStore';
 import Tooltip from './Tooltip';
+import ControlHint from './ControlHint';
 import ProjectIconsSettings from './ProjectIconsSettings';
 import { HexColorPicker } from 'react-colorful';
 import { ChevronDown, ChevronRight, CircleX, Loader2, Trash2, Plus } from 'lucide-react';
@@ -13,7 +14,7 @@ import { DEFAULT_CLAUDE_CODE_SETTINGS } from '../../constants/claudeLevels';
 import {
   DEFAULT_CODEX_SETTINGS,
   mergeCodexModelOptions,
-  resolveCodexEffortForModel,
+  resolveCodexPersistentEffortForModel,
   type CodexModelOption,
 } from '../../constants/codexSettings';
 import {
@@ -299,9 +300,9 @@ function SettingsGrid4({ children }: { children: React.ReactNode }) {
 }
 
 // PaddingRow — один контрол для пары X/Y. Раньше были два отдельных FontSizeSlider
-// «Padding X» и «Padding Y» — занимали две клетки grid'а, при том что это семантически
+// «Отступ X» и «Отступ Y» — занимали две клетки grid'а, при том что это семантически
 // одна настройка. Юзер: «padding x и padding y должны быть в одной карточке».
-// Реализация: один лейбл «Padding», справа два мини-stepper'а с маленьким префиксом X / Y.
+// Реализация: один лейбл «Отступы», справа два мини-stepper'а с маленьким префиксом X / Y.
 function PaddingRow({
   valueX,
   valueY,
@@ -367,7 +368,7 @@ function PaddingRow({
       gap: '8px',
       minHeight: 0,
     }}>
-      <span style={{ fontSize: '12px', color: '#eaeaea', fontWeight: 500 }}>Padding</span>
+      <span style={{ fontSize: '12px', color: '#eaeaea', fontWeight: 500 }}>Отступы</span>
       <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
         <Stepper value={valueX} onChange={onChangeX} min={minX} max={maxX} axis="X" />
         <Stepper value={valueY} onChange={onChangeY} min={minY} max={maxY} axis="Y" />
@@ -410,7 +411,7 @@ function SidebarBehaviorToggles() {
         </label>
       </Tooltip>
 
-      <Tooltip content="Закрывать сайдбар при клике вне его (по терминалу или другому месту).">
+      <Tooltip content="Закрывать файловый сайдбар при клике вне его рабочей области.">
         <label className="flex items-start gap-3 cursor-pointer select-none">
           <div
             className="relative w-8 h-4 rounded-full transition-colors mt-0.5 shrink-0"
@@ -427,7 +428,7 @@ function SidebarBehaviorToggles() {
           </div>
           <div>
             <div style={{ fontSize: '13px', color: '#ccc' }}>Закрывать кликом вне</div>
-            <div style={{ fontSize: '11px', color: '#666' }}>Сайдбар работает как overlay поверх терминала</div>
+            <div style={{ fontSize: '11px', color: '#666' }}>Файловый сайдбар открывается поверх рабочей области</div>
           </div>
         </label>
       </Tooltip>
@@ -789,6 +790,7 @@ function ClaudeMdMirrorBlock({
 
 type StatusColumnProps = {
   title: string;
+  markerLabel: string;
   statuses: Array<{ id: string; label: string; color: string; description?: string }>;
   marker: { shape: 'dot' | 'square'; sizePx: number };
   addStatus: () => string;
@@ -797,7 +799,7 @@ type StatusColumnProps = {
   setMarker: (patch: { shape?: 'dot' | 'square'; sizePx?: number }) => void;
 };
 
-function StatusColumnEditor({ title, statuses, marker, addStatus, updateStatus, removeStatus, setMarker }: StatusColumnProps) {
+function StatusColumnEditor({ title, markerLabel, statuses, marker, addStatus, updateStatus, removeStatus, setMarker }: StatusColumnProps) {
   const [pickerOpenId, setPickerOpenId] = useState<string | null>(null);
   const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({});
   const [hexDrafts, setHexDrafts] = useState<Record<string, string>>({});
@@ -829,7 +831,7 @@ function StatusColumnEditor({ title, statuses, marker, addStatus, updateStatus, 
         >
           <Plus size={11} /> новый
         </button>
-        <span style={{ fontSize: 11, color: '#777' }}>Маркер</span>
+        <span style={{ fontSize: 11, color: '#777' }}>{markerLabel}</span>
         <div style={{ display: 'inline-flex', backgroundColor: '#1a1a1a', borderRadius: 6, border: '1px solid #333' }}>
           {(['dot', 'square'] as const).map((shape) => (
             <button
@@ -949,8 +951,8 @@ function SessionStatusesEditor() {
 
   return (
     <div style={{ paddingLeft: 12, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 12, alignItems: 'start' }}>
-      <StatusColumnEditor title="Статусы вкладок" statuses={sessionStatuses} marker={statusMarker} addStatus={addSessionStatus} updateStatus={updateSessionStatus} removeStatus={removeSessionStatus} setMarker={setStatusMarker} />
-      <StatusColumnEditor title="Статусы задач" statuses={taskStatuses} marker={taskStatusMarker} addStatus={addTaskStatus} updateStatus={updateTaskStatus} removeStatus={removeTaskStatus} setMarker={setTaskStatusMarker} />
+      <StatusColumnEditor title="Вкладки" markerLabel="Маркер вкладки" statuses={sessionStatuses} marker={statusMarker} addStatus={addSessionStatus} updateStatus={updateSessionStatus} removeStatus={removeSessionStatus} setMarker={setStatusMarker} />
+      <StatusColumnEditor title="Задачи" markerLabel="Маркер задачи" statuses={taskStatuses} marker={taskStatusMarker} addStatus={addTaskStatus} updateStatus={updateTaskStatus} removeStatus={removeTaskStatus} setMarker={setTaskStatusMarker} />
     </div>
   );
 }
@@ -977,11 +979,13 @@ function ProcessBarEditor() {
     return () => window.removeEventListener('mousedown', onDown);
   }, [pickerOpen]);
 
-  // Compact превью полоски — занимает 40px высоты, минимально.
+  // Preview имитирует одну реальную строку TabSidebar, а не всю ширину Settings.
+  // Default TabSidebar width = 200px; полноширинный макет ложно выглядел как
+  // глобальный progress bar приложения.
   const previewPeakAlpha = opacityPctToAlpha(processBar.shimmerOpacityPct);
   const previewBar = (
     <div style={{
-      position: 'relative', width: '100%', height: '32px',
+      position: 'relative', width: '200px', maxWidth: '100%', height: '32px',
       backgroundColor: '#252526', border: '1px solid #333',
       borderRadius: '6px', overflow: 'hidden',
     }}>
@@ -1006,8 +1010,9 @@ function ProcessBarEditor() {
       <div style={{
         position: 'absolute', left: 12, right: 12, top: '50%', transform: 'translateY(-50%)',
         fontSize: '11px', color: '#888', textAlign: 'center',
+        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
       }}>
-        полоса · {processBar.position === 'right' ? 'справа' : 'слева'} · блик {processBar.shimmerSpacingPct}% / {processBar.shimmerOpacityPct}%
+        Пример вкладки
       </div>
     </div>
   );
@@ -1213,6 +1218,14 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const timelineSummaryFontSize = useUIStore((s) => s.timelineSummaryFontSize);
   const timelineLineClamp = useUIStore((s) => s.timelineLineClamp);
   const setTimelineLineClamp = useUIStore((s) => s.setTimelineLineClamp);
+  const historyFontSize = useUIStore((s) => s.historyFontSize);
+  const setHistoryFontSize = useUIStore((s) => s.setHistoryFontSize);
+  const historyComposerFontSize = useUIStore((s) => s.historyComposerFontSize);
+  const setHistoryComposerFontSize = useUIStore((s) => s.setHistoryComposerFontSize);
+  const historyComposerMinRows = useUIStore((s) => s.historyComposerMinRows);
+  const setHistoryComposerMinRows = useUIStore((s) => s.setHistoryComposerMinRows);
+  const historyComposerMaxRows = useUIStore((s) => s.historyComposerMaxRows);
+  const setHistoryComposerMaxRows = useUIStore((s) => s.setHistoryComposerMaxRows);
   const promptQueueChipFontSize = useUIStore((s) => s.promptQueueChipFontSize);
   const setPromptQueueChipFontSize = useUIStore((s) => s.setPromptQueueChipFontSize);
   const promptQueueEditorFontSize = useUIStore((s) => s.promptQueueEditorFontSize);
@@ -1220,8 +1233,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const promptQueueChipLineClamp = useUIStore((s) => s.promptQueueChipLineClamp);
   const setPromptQueueChipLineClamp = useUIStore((s) => s.setPromptQueueChipLineClamp);
   const setTerminalFontSize = useUIStore((s) => s.setTerminalFontSize);
-  const sdkFontSize = useUIStore((s) => s.sdkFontSize);
-  const setSdkFontSize = useUIStore((s) => s.setSdkFontSize);
   const setTabsFontSize = useUIStore((s) => s.setTabsFontSize);
   const setProjectTabsFontSize = useUIStore((s) => s.setProjectTabsFontSize);
   const setSidebarFontSize = useUIStore((s) => s.setSidebarFontSize);
@@ -1243,7 +1254,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     [liveCodexModels, codexSettings.models],
   );
   const quickCodexModel = codexModelsForSettings.find((model) => model.id === codexSettings.quickModel);
-  const quickCodexEfforts = quickCodexModel?.efforts || [];
+  const quickCodexEfforts = (quickCodexModel?.efforts || []).filter((effort) => effort !== 'ultra');
   const claudeMdMirrorEnabled = useUIStore((s) => s.claudeMdMirrorEnabled);
   const setClaudeMdMirrorEnabled = useUIStore((s) => s.setClaudeMdMirrorEnabled);
   const tabCompletionNotificationSound = useUIStore((s) => s.tabCompletionNotificationSound);
@@ -1251,7 +1262,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
   const mirrorStatus = useMirrorStatusStore((s) => (activeProjectId ? s.byProject[activeProjectId] : undefined));
   const setSemanticIndexParallelism = useUIStore((s) => s.setSemanticIndexParallelism);
-  // Геометрия табов — Settings → Размеры → ТАБЫ → Терминал/Проекты.
+  // Геометрия вкладок — Settings → Размеры → Вкладки → Рабочие вкладки/Проекты.
   const tabGeometry = useUIStore((s) => s.tabGeometry);
   const setTabGeometry = useUIStore((s) => s.setTabGeometry);
   const projectTabGeometry = useUIStore((s) => s.projectTabGeometry);
@@ -2867,7 +2878,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       ? codexSettings.quickModel
       : null;
     const quickEffort = quickModel
-      ? resolveCodexEffortForModel(models.find((model) => model.id === quickModel), codexSettings.quickEffort)
+      ? resolveCodexPersistentEffortForModel(models.find((model) => model.id === quickModel), codexSettings.quickEffort)
       : null;
     setCodexSettings({ ...codexSettings, models, quickModel, quickEffort });
   };
@@ -2875,14 +2886,14 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setCodexQuickModel = (modelId: string) => {
     const quickModel = modelId || null;
     const quickEffort = quickModel
-      ? resolveCodexEffortForModel(codexModelsForSettings.find((model) => model.id === quickModel), codexSettings.quickEffort)
+      ? resolveCodexPersistentEffortForModel(codexModelsForSettings.find((model) => model.id === quickModel), codexSettings.quickEffort)
       : null;
     setCodexSettings({ ...codexSettings, models: codexModelsForSettings, quickModel, quickEffort });
   };
 
   const setCodexQuickEffort = (effort: string) => {
     if (!quickCodexModel) return;
-    const quickEffort = resolveCodexEffortForModel(quickCodexModel, effort);
+    const quickEffort = resolveCodexPersistentEffortForModel(quickCodexModel, effort);
     setCodexSettings({ ...codexSettings, models: codexModelsForSettings, quickEffort });
   };
 
@@ -2916,7 +2927,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
           backgroundColor: '#1a1a1a',
           borderRadius: '16px',
           border: '1px solid #333',
-          // Settings → Размеры теперь содержит 5 блоков (ТАБЫ / ШРИФТЫ / ЗАМЕТКИ / СТАТУСЫ / ПОЛОСКА),
+          // Settings → Размеры сгруппированы по видимым областям приложения.
           // 900px тесно. Цель — занять до 1200px, но не вылезать из viewport на маленьких окнах
           // приложения. `min(1200px, 95vw)` даёт +33% на широких экранах, корректно сжимается.
           width: 'min(1200px, 95vw)',
@@ -2939,19 +2950,21 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
           <h2 style={{ margin: 0, fontSize: '16px', fontWeight: '600', color: '#fff' }}>
             Настройки
           </h2>
-          <button
-            onClick={closeSettings}
-            style={{
-              background: 'none',
-              border: 'none',
-              color: '#666',
-              fontSize: '20px',
-              cursor: 'pointer',
-              lineHeight: 1
-            }}
-          >
-            &times;
-          </button>
+          <ControlHint label="Закрыть настройки" side="left">
+            <button
+              onClick={closeSettings}
+              style={{
+                background: 'none',
+                border: 'none',
+                color: '#666',
+                fontSize: '20px',
+                cursor: 'pointer',
+                lineHeight: 1
+              }}
+            >
+              &times;
+            </button>
+          </ControlHint>
         </div>
 
         {/* Tabs */}
@@ -3056,17 +3069,17 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   свой фон, у другого свой». Card-wrapper'ы (свой background+border вокруг
                   блока) убраны для всех секций. */}
 
-              {/* SettingsTree pattern: главные секции (Табы / Терминал / Сайдбар /
-                  Prompt picker) — каждая отдельная область интерфейса.
+              {/* SettingsTree pattern: главные секции (Вкладки / AI-интерфейс /
+                  Терминал / Файловый сайдбар / Меню промптов) — каждая отдельная
+                  видимая область интерфейса.
                   Внутри каждой секции собраны ВСЕ её настройки: padding/радиус/шрифт/
                   поведение. Глобальный пункт «Шрифты интерфейса» убран — он сводил
                   все шрифты в одну кучу без привязки к области, юзер не мог понять
-                  «шрифт «Сайдбар» — это про какой именно сайдбар». Теперь шрифт
-                  каждой области лежит рядом с её другими настройками. */}
+                  к какой поверхности относится настройка. */}
 
-              {/* 1. ТАБЫ */}
-              <SettingsSectionHeader title="Табы" first />
-              <SettingsSubSectionHeader title="Терминал" />
+              {/* 1. ВКЛАДКИ */}
+              <SettingsSectionHeader title="Вкладки" first />
+              <SettingsSubSectionHeader title="Рабочие вкладки" />
               <SettingsGrid4>
                 <PaddingRow
                   valueX={tabGeometry.paddingX} onChangeX={(v) => setTabGeometry({ paddingX: v })}
@@ -3106,11 +3119,18 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 />
               </div>
 
-              {/* 2. ТЕРМИНАЛ — шрифт самого терминала + Таймлайн как часть терминала */}
-              <SettingsSectionHeader title="Терминал" />
+              {/* 2. AI-ИНТЕРФЕЙС — новая primary History surface. */}
+              <SettingsSectionHeader title="AI-интерфейс" />
+              <SettingsSubSectionHeader title="История" />
               <SettingsGrid4>
-                <FontSizeSlider label="Шрифт" value={terminalFontSize} onChange={setTerminalFontSize} min={8} max={24} />
-                <FontSizeSlider label="Шрифт SDK" value={sdkFontSize} onChange={setSdkFontSize} min={8} max={24} />
+                <FontSizeSlider label="Шрифт сообщений" description="Основной текст и вызовы инструментов в History" value={historyFontSize} onChange={setHistoryFontSize} min={8} max={24} />
+              </SettingsGrid4>
+
+              <SettingsSubSectionHeader title="Поле ввода" />
+              <SettingsGrid4>
+                <FontSizeSlider label="Шрифт" description="Размер набираемого текста" value={historyComposerFontSize} onChange={setHistoryComposerFontSize} min={8} max={24} />
+                <FontSizeSlider label="Строк при пустом поле" description="Начальная высота input без текста" value={historyComposerMinRows} onChange={setHistoryComposerMinRows} min={1} max={historyComposerMaxRows} suffix="" />
+                <FontSizeSlider label="Максимум строк" description="После этого предела текст прокручивается внутри input" value={historyComposerMaxRows} onChange={setHistoryComposerMaxRows} min={historyComposerMinRows} max={40} suffix="" />
               </SettingsGrid4>
 
               <SettingsSubSectionHeader title="Таймлайн" />
@@ -3127,8 +3147,15 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 <FontSizeSlider label="Строки в чипе" description="Сколько строк текста промпта показывать в каждом чипе очереди (1 = ellipsis в одну строку)" value={promptQueueChipLineClamp} onChange={setPromptQueueChipLineClamp} min={1} max={10} suffix="" />
               </SettingsGrid4>
 
-              {/* 3. САЙДБАР — файловый (Cmd+/): шрифт + превью файла + поведение */}
-              <SettingsSectionHeader title="Сайдбар" />
+              {/* 3. ТЕРМИНАЛ — только raw xterm; legacy SDK font остаётся
+                  внутренней совместимостью и больше не показывается в Settings. */}
+              <SettingsSectionHeader title="Терминал" />
+              <SettingsGrid4>
+                <FontSizeSlider label="Шрифт терминала" value={terminalFontSize} onChange={setTerminalFontSize} min={8} max={24} />
+              </SettingsGrid4>
+
+              {/* 4. ФАЙЛОВЫЙ САЙДБАР (Cmd+/): шрифт + превью + поведение */}
+              <SettingsSectionHeader title="Файловый сайдбар" />
               <SettingsGrid4>
                 <FontSizeSlider label="Шрифт" value={sidebarFontSize} onChange={setSidebarFontSize} min={10} max={20} />
               </SettingsGrid4>
@@ -3141,8 +3168,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               <SettingsSubSectionHeader title="Поведение" />
               <SidebarBehaviorToggles />
 
-              {/* 4. PROMPT PICKER — отдельная подсистема (overlay с быстрыми промптами) */}
-              <SettingsSectionHeader title="Prompt picker" />
+              {/* 5. МЕНЮ ПРОМПТОВ — Opt+V overlay с быстрыми промптами. */}
+              <SettingsSectionHeader title="Меню промптов" />
               <SettingsGrid4>
                 <FontSizeSlider label="Шрифт" value={promptPickerFontSize} onChange={setPromptPickerFontSize} min={9} max={20} />
                 <FontSizeSlider label="Отступ снизу" description="От низа viewport'а до picker'а" value={promptPickerBottomOffsetPx} onChange={setPromptPickerBottomOffsetPx} min={0} max={400} suffix="px" />
@@ -3436,28 +3463,30 @@ function VRIconBtn({ children, onClick, title, danger, small }: { children: Reac
   const [hovered, setHovered] = useState(false);
   const size = small ? 24 : 28;
   return (
-    <button
-      title={title}
-      onClick={(e) => { e.stopPropagation(); onClick(); }}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      style={{
-        width: size,
-        height: size,
-        borderRadius: 7,
-        border: 'none',
-        cursor: 'pointer',
-        flexShrink: 0,
-        background: hovered ? (danger ? 'rgba(255,107,107,0.14)' : 'rgba(255,255,255,0.08)') : 'transparent',
-        color: danger ? '#ff6b6b' : VR_DIM,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        padding: 0,
-      }}
-    >
-      {children}
-    </button>
+    <ControlHint label={title}>
+      <button
+        title={title}
+        onClick={(e) => { e.stopPropagation(); onClick(); }}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        style={{
+          width: size,
+          height: size,
+          borderRadius: 7,
+          border: 'none',
+          cursor: 'pointer',
+          flexShrink: 0,
+          background: hovered ? (danger ? 'rgba(255,107,107,0.14)' : 'rgba(255,255,255,0.08)') : 'transparent',
+          color: danger ? '#ff6b6b' : VR_DIM,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: 0,
+        }}
+      >
+        {children}
+      </button>
+    </ControlHint>
   );
 }
 

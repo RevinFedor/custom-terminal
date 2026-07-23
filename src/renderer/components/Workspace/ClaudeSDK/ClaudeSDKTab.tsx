@@ -31,6 +31,7 @@ import {
   defaultOpenForTool,
 } from '@noted/claude-blocks';
 import Tooltip from '../../UI/Tooltip';
+import ControlHint from '../../UI/ControlHint';
 import { consumePrefetched } from '../../../utils/sdkHistoryPrefetch';
 import { BackgroundTasksBar } from './BackgroundTasksBar';
 import { TaskDetailPane } from './TaskDetailPane';
@@ -3215,6 +3216,7 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
   return (
     <div
       className="absolute inset-0 flex flex-col"
+      data-claude-sdk-tab-id={tabId}
       style={{ display: isVisible ? 'flex' : 'none', fontSize: `${sdkBaseFontSize}px` }}
       onContextMenu={handleTabContextMenu}
     >
@@ -3393,7 +3395,7 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
 
           {/* Scroll-to-bottom button */}
           {showScrollDown && (
-            <Tooltip content="Scroll to bottom">
+            <ControlHint label="Прокрутить чат вниз">
             <button
               onClick={scrollToBottom}
               onMouseDown={(e) => e.preventDefault()}
@@ -3402,7 +3404,7 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
             </button>
-            </Tooltip>
+            </ControlHint>
           )}
         </ThreadPrimitive.Root>
       </AssistantProviderBase>
@@ -5028,7 +5030,9 @@ function SDKComposer({
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
-      if (!detail?.text) return;
+      if (!detail || typeof detail.text !== 'string') return;
+      if (!detail.text && !detail.replace) return;
+      if (detail.tabId && detail.tabId !== tabId) return;
       // Two flavours of insert:
       //   • default (append): used by right-click Insert-Prompt — keeps any
       //     in-progress text the user typed and pins the new prompt below.
@@ -5061,7 +5065,7 @@ function SDKComposer({
     };
     window.addEventListener('claude-sdk:composer-insert', handler);
     return () => window.removeEventListener('claude-sdk:composer-insert', handler);
-  }, [writeComposerValue, addChip]);
+  }, [writeComposerValue, addChip, tabId]);
 
   return (
     <div className="relative">
@@ -5203,13 +5207,13 @@ function SDKComposer({
               key={chip.id}
               className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[0.85em] bg-[#6B8AFF]/15 text-[#8ba4ff] border border-[#6B8AFF]/20 max-w-[220px]"
             >
-              <Tooltip content="Click to preview">
+              <ControlHint label="Открыть превью вставки">
                 <span
                   className="truncate cursor-pointer"
                   onClick={() => setPreviewChip(previewChip?.id === chip.id ? null : chip)}
                 >{chip.preview}</span>
-              </Tooltip>
-              <Tooltip content="Unpack into composer">
+              </ControlHint>
+              <ControlHint label="Перенести текст в поле ввода">
                 <button
                   type="button"
                   className="ml-0.5 shrink-0 inline-flex items-center justify-center w-4 h-4 rounded text-[#8ba4ff]/60 hover:text-white hover:bg-white/10 cursor-pointer"
@@ -5217,7 +5221,7 @@ function SDKComposer({
                 >
                   <ArrowDownToLine size={12} />
                 </button>
-              </Tooltip>
+              </ControlHint>
             </span>
           ))}
         </div>
@@ -5234,7 +5238,7 @@ function SDKComposer({
       {previewChip && (
         <div className="mx-4 mb-2 bg-[#1a1a1a] border border-[#333] rounded-lg max-h-[200px] overflow-y-auto">
           <div className="flex items-center gap-2 px-3 py-1.5 border-b border-[#333]">
-            <Tooltip content="Delete chip">
+            <ControlHint label="Удалить вставку">
               <button
                 type="button"
                 className="shrink-0 inline-flex items-center justify-center w-5 h-5 rounded text-[#b91c1c] hover:text-[#ef4444] hover:bg-white/[0.06] cursor-pointer transition-colors"
@@ -5242,7 +5246,7 @@ function SDKComposer({
               >
                 <Trash2 size={12} />
               </button>
-            </Tooltip>
+            </ControlHint>
             <span className="text-[0.77em] text-[#888] flex-1">Pasted content ({previewChip.text.length.toLocaleString()} chars)</span>
           </div>
           <pre className="px-3 py-2 text-[0.85em] text-[#aaa] whitespace-pre-wrap">{previewChip.text}</pre>

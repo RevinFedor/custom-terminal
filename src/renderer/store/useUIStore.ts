@@ -43,7 +43,7 @@ import {
   DEFAULT_CODEX_SETTINGS,
   normalizeCodexEfforts,
   normalizeCodexModelOptions,
-  resolveCodexEffortForModel,
+  resolveCodexPersistentEffortForModel,
 } from '../constants/codexSettings';
 
 export const HISTORY_PANEL_DEFAULT_WIDTH = 580;
@@ -60,8 +60,11 @@ export interface HistoryRewindPreview {
 export interface HistoryPromptDraftImageRef {
   id: number;
   path: string;
+  assetId?: string;
   mediaType?: string | null;
   size?: number;
+  availability?: 'available' | 'missing';
+  error?: string;
 }
 
 export interface HistoryPromptDraftWriteOptions {
@@ -337,9 +340,9 @@ interface UIStore {
   taskStatusMarker: StatusMarkerSettings;
   setTaskStatusMarker: (patch: Partial<StatusMarkerSettings>) => void;
 
-  /* Tab geometry — табы терминала в TabSidebar (vertical mode). Все поля px.
+  /* Tab geometry — рабочие вкладки в TabSidebar (vertical mode). Все поля px.
      Раньше — три константы TAB_VERTICAL_PADDING_* в TabBar.tsx, юзер не мог менять
-     не открывая код. Теперь Settings → Размеры → ТАБЫ → Терминал. */
+     не открывая код. Теперь Settings → Размеры → Вкладки → Рабочие вкладки. */
   tabGeometry: TabGeometrySettings;
   setTabGeometry: (patch: Partial<TabGeometrySettings>) => void;
 
@@ -356,6 +359,10 @@ interface UIStore {
   timelineSummaryFontSize: number; // Generated user-prompt summaries in expanded Timeline
   timelineWidth: number;       // Timeline width (px) when expanded (treeMode). Drag-resizable.
   timelineLineClamp: number;   // How many lines of preview text show in expanded mode.
+  historyFontSize: number; // Primary History transcript font size (messages + tool blocks).
+  historyComposerFontSize: number; // Primary History prompt textarea font size.
+  historyComposerMinRows: number; // Empty height for the primary History prompt textarea.
+  historyComposerMaxRows: number; // Auto-grow ceiling for the primary History prompt textarea.
   promptQueueChipFontSize: number; // Run-after chip title font inside the queue list.
   promptQueueEditorFontSize: number; // Run-after chip editor title/body font in the slideout.
   promptQueueChipLineClamp: number; // How many lines of chip text show inside Run After overlay (1 = single-line ellipsis).
@@ -382,6 +389,10 @@ interface UIStore {
   setTimelineSummaryFontSize: (size: number) => void;
   setTimelineWidth: (width: number) => void;
   setTimelineLineClamp: (lines: number) => void;
+  setHistoryFontSize: (size: number) => void;
+  setHistoryComposerFontSize: (size: number) => void;
+  setHistoryComposerMinRows: (rows: number) => void;
+  setHistoryComposerMaxRows: (rows: number) => void;
   setPromptQueueChipFontSize: (size: number) => void;
   setPromptQueueEditorFontSize: (size: number) => void;
   setPromptQueueChipLineClamp: (lines: number) => void;
@@ -513,6 +524,7 @@ interface UIStore {
   setHistoryVisibleUuids: (tabId: string, uuids: string[]) => void;
   setHistoryScrollPosition: (tabId: string, scrollTop: number) => void;
   setHistoryPromptDraft: (tabId: string, draft: string, options?: HistoryPromptDraftWriteOptions) => void;
+  appendHistoryPromptDraft: (tabId: string, text: string) => void;
   setHistoryRewindPreview: (tabId: string, preview: HistoryRewindPreview | null) => void;
 
   // Timeline panel visibility (per-tab state, default open)
@@ -1057,6 +1069,36 @@ const loadTimelineLineClamp = (): number => {
   } catch {}
   return 3;
 };
+const loadHistoryFontSize = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-history-font-size');
+    if (v) return Math.max(8, Math.min(24, Math.round(Number(v) || 13)));
+  } catch {}
+  return 13;
+};
+const loadHistoryComposerFontSize = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-history-composer-font-size');
+    if (v) return Math.max(8, Math.min(24, Number(v) || 12));
+  } catch {}
+  return 12;
+};
+const loadHistoryComposerMinRows = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-history-composer-min-rows');
+    if (v) return Math.max(1, Math.min(20, Math.round(Number(v) || 3)));
+  } catch {}
+  return 3;
+};
+const loadHistoryComposerMaxRows = (): number => {
+  try {
+    const v = localStorage.getItem('noted-terminal-history-composer-max-rows');
+    if (v) return Math.max(1, Math.min(40, Math.round(Number(v) || 20)));
+  } catch {}
+  return 20;
+};
+const initialHistoryComposerMinRows = loadHistoryComposerMinRows();
+const initialHistoryComposerMaxRows = Math.max(initialHistoryComposerMinRows, loadHistoryComposerMaxRows());
 const loadPromptQueueChipLineClamp = (): number => {
   try {
     const v = localStorage.getItem('noted-terminal-prompt-queue-chip-line-clamp');
@@ -1604,18 +1646,23 @@ const initialDefaultCodexModel = loadDefaultCodexModel();
 })();
 
 const APP_STATE_KEY_CODEX_EFFORT = 'defaultCodexEffort';
+const normalizePersistentCodexEffort = (value: unknown): DefaultCodexEffort => {
+  const effort = typeof value === 'string' ? value.trim() : '';
+  return effort && effort !== 'ultra' ? effort : 'none';
+};
 const loadDefaultCodexEffort = (): DefaultCodexEffort => {
   try {
     const saved = localStorage.getItem('noted-terminal-default-codex-effort');
-    if (saved && saved.trim()) return saved.trim();
+    if (saved && saved.trim()) return normalizePersistentCodexEffort(saved);
   } catch {}
   return 'none';
 };
 const saveDefaultCodexEffort = (v: DefaultCodexEffort) => {
-  try { localStorage.setItem('noted-terminal-default-codex-effort', v); } catch {}
+  const persistentEffort = normalizePersistentCodexEffort(v);
+  try { localStorage.setItem('noted-terminal-default-codex-effort', persistentEffort); } catch {}
   try {
     const { ipcRenderer } = window.require('electron');
-    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_CODEX_EFFORT, value: v }).catch(() => {});
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_CODEX_EFFORT, value: persistentEffort }).catch(() => {});
   } catch {}
 };
 const initialDefaultCodexEffort = loadDefaultCodexEffort();
@@ -1624,14 +1671,53 @@ const initialDefaultCodexEffort = loadDefaultCodexEffort();
     const { ipcRenderer } = window.require('electron');
     const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_CODEX_EFFORT);
     if (typeof v === 'string' && v.trim()) {
+      const persistentEffort = normalizePersistentCodexEffort(v);
       const s = useUIStore.getState();
-      if (s.defaultCodexEffort !== v) {
-        useUIStore.setState({ defaultCodexEffort: v.trim() });
-        try { localStorage.setItem('noted-terminal-default-codex-effort', v); } catch {}
+      if (s.defaultCodexEffort !== persistentEffort) {
+        useUIStore.setState({ defaultCodexEffort: persistentEffort });
+        try { localStorage.setItem('noted-terminal-default-codex-effort', persistentEffort); } catch {}
       }
     }
   } catch {}
 })();
+
+// Main owns the durable transaction for native Codex model migration. Renderer
+// only mirrors that committed/pending value into Zustand + localStorage; using
+// the public setters here would issue a second unconditional app:setState and
+// could race a newer main-process commit.
+export const syncDefaultCodexSettingsMirror = ({
+  model,
+  effort,
+  expectedModel,
+  expectedEffort,
+}: {
+  model?: DefaultCodexModel;
+  effort?: DefaultCodexEffort;
+  expectedModel?: DefaultCodexModel;
+  expectedEffort?: DefaultCodexEffort;
+}) => {
+  const current = useUIStore.getState();
+  const modelAccepted = model !== undefined
+    && expectedModel !== undefined
+    && current.defaultCodexModel === expectedModel;
+  const effortAccepted = effort !== undefined
+    && expectedEffort !== undefined
+    && current.defaultCodexEffort === expectedEffort;
+
+  if (modelAccepted) {
+    useUIStore.setState({ defaultCodexModel: model });
+    try { localStorage.setItem('noted-terminal-default-codex-model', model); } catch {}
+  }
+  if (effortAccepted) {
+    const persistentEffort = normalizePersistentCodexEffort(effort);
+    useUIStore.setState({ defaultCodexEffort: persistentEffort });
+    try { localStorage.setItem('noted-terminal-default-codex-effort', persistentEffort); } catch {}
+  }
+  return {
+    modelUpdated: modelAccepted,
+    effortUpdated: effortAccepted,
+  };
+};
 
 const APP_STATE_KEY_CODEX_SETTINGS = 'codexSettings';
 const LOCAL_KEY_CODEX_SETTINGS = 'noted-terminal-codex-settings';
@@ -1663,7 +1749,7 @@ const normalizeCodexSettings = (raw: unknown): CodexSettings => {
     ? requestedQuickModel
     : null;
   const quickEffort = quickModel
-    ? resolveCodexEffortForModel(models.find((model) => model.id === quickModel), obj.quickEffort)
+    ? resolveCodexPersistentEffortForModel(models.find((model) => model.id === quickModel), obj.quickEffort)
     : null;
   return {
     models,
@@ -2058,6 +2144,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
   timelineSummaryFontSize: loadTimelineSummaryFontSize(),
   timelineWidth: loadTimelineWidth(),
   timelineLineClamp: loadTimelineLineClamp(),
+  historyFontSize: loadHistoryFontSize(),
+  historyComposerFontSize: loadHistoryComposerFontSize(),
+  historyComposerMinRows: initialHistoryComposerMinRows,
+  historyComposerMaxRows: initialHistoryComposerMaxRows,
   promptQueueChipFontSize: loadPromptQueueChipFontSize(),
   promptQueueEditorFontSize: loadPromptQueueEditorFontSize(),
   promptQueueChipLineClamp: loadPromptQueueChipLineClamp(),
@@ -2126,6 +2216,37 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(1, Math.min(10, Math.round(lines)));
     set({ timelineLineClamp: clamped });
     try { localStorage.setItem('noted-terminal-timeline-line-clamp', String(clamped)); } catch {}
+  },
+
+  setHistoryFontSize: (size: number) => {
+    const clamped = Math.max(8, Math.min(24, Math.round(size)));
+    set({ historyFontSize: clamped });
+    try { localStorage.setItem('noted-terminal-history-font-size', String(clamped)); } catch {}
+  },
+
+  setHistoryComposerFontSize: (size: number) => {
+    const clamped = Math.max(8, Math.min(24, Math.round(size)));
+    set({ historyComposerFontSize: clamped });
+    try { localStorage.setItem('noted-terminal-history-composer-font-size', String(clamped)); } catch {}
+  },
+
+  setHistoryComposerMinRows: (rows: number) => {
+    const clamped = Math.max(1, Math.min(20, Math.round(rows)));
+    const currentMax = get().historyComposerMaxRows;
+    const nextMax = Math.max(currentMax, clamped);
+    set({ historyComposerMinRows: clamped, historyComposerMaxRows: nextMax });
+    try {
+      localStorage.setItem('noted-terminal-history-composer-min-rows', String(clamped));
+      if (nextMax !== currentMax) {
+        localStorage.setItem('noted-terminal-history-composer-max-rows', String(nextMax));
+      }
+    } catch {}
+  },
+
+  setHistoryComposerMaxRows: (rows: number) => {
+    const clamped = Math.max(get().historyComposerMinRows, Math.min(40, Math.round(rows)));
+    set({ historyComposerMaxRows: clamped });
+    try { localStorage.setItem('noted-terminal-history-composer-max-rows', String(clamped)); } catch {}
   },
 
   setPromptQueueChipFontSize: (size: number) => {
@@ -2377,6 +2498,24 @@ export const useUIStore = create<UIStore>((set, get) => ({
     if (draft && images.length > 0) nextImages[tabId] = images;
     else delete nextImages[tabId];
     return { historyPromptDrafts: next, historyPromptDraftImages: nextImages };
+  }),
+  appendHistoryPromptDraft: (tabId, text) => set(state => {
+    const addition = String(text || '');
+    if (!addition) return {};
+    const current = state.historyPromptDrafts[tabId] || '';
+    const separator = !current
+      ? ''
+      : current.endsWith('\n\n')
+        ? ''
+        : current.endsWith('\n')
+          ? '\n'
+          : '\n\n';
+    return {
+      historyPromptDrafts: {
+        ...state.historyPromptDrafts,
+        [tabId]: current + separator + addition,
+      },
+    };
   }),
   setHistoryRewindPreview: (tabId, preview) => set(state => {
     const next = { ...state.historyRewindPreviews };
@@ -2666,7 +2805,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
   defaultCodexModel: initialDefaultCodexModel,
   setDefaultCodexModel: (v) => { set({ defaultCodexModel: v }); saveDefaultCodexModel(v); },
   defaultCodexEffort: initialDefaultCodexEffort,
-  setDefaultCodexEffort: (v) => { set({ defaultCodexEffort: v }); saveDefaultCodexEffort(v); },
+  setDefaultCodexEffort: (v) => {
+    const persistentEffort = normalizePersistentCodexEffort(v);
+    set({ defaultCodexEffort: persistentEffort });
+    saveDefaultCodexEffort(persistentEffort);
+  },
   codexSettings: initialCodexSettings,
   setCodexSettings: (settings) => {
     const normalized = normalizeCodexSettings(settings);

@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import FileIcon from '../UI/FileIcon';
+import ControlHint from '../UI/ControlHint';
 
 const { ipcRenderer } = window.require('electron');
 const fs = window.require('fs').promises;
@@ -227,12 +228,14 @@ export default function FileExplorer({ projectPath, projectId }: FileExplorerPro
         >
           <div style={{ padding: '8px 12px', borderBottom: '1px solid #333', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <span style={{ fontSize: 11, color: '#888', fontWeight: 'bold', textTransform: 'uppercase' }}>Explorer</span>
-            <button
-              style={{ color: '#888', fontSize: 18, background: 'none', border: 'none', cursor: 'pointer' }}
-              onClick={() => setSidebarOpen(projectId, false)}
-            >
-              ×
-            </button>
+            <ControlHint label="Закрыть Explorer" side="right">
+              <button
+                style={{ color: '#888', fontSize: 18, background: 'none', border: 'none', cursor: 'pointer' }}
+                onClick={() => setSidebarOpen(projectId, false)}
+              >
+                ×
+              </button>
+            </ControlHint>
           </div>
 
           <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden' }}>

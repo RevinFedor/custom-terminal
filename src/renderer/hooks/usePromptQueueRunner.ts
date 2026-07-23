@@ -5,6 +5,8 @@ import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { terminalRegistry } from '../utils/terminalRegistry';
 import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
 import { isWorkflowOutcomeAtOrAfterArm, planWorkflowReconciliation } from '../utils/promptQueueReconciliation.mjs';
+import { getHistoryAgentRuntime } from '../utils/historyAgentRuntimes';
+import { getClaudeStartupDefaultsGateSnapshot } from '../utils/claudeStartupDefaultsGate';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -191,9 +193,147 @@ const queueSendInflight = new Set<string>();
 // the agent emits busy:true. Keep pivoted owners blocked through that gap.
 const queueAwaitingBusyStart = new Set<string>();
 const codexTriggerCheckInflight = new Set<string>();
+type DeferredOwnerSend = {
+  triggerTabId: string;
+  headId: string;
+  label: 'turn-end' | 'cold-start';
+  workflowArmedAt: number | null;
+  attemptId: number;
+};
+// A trigger can be fully satisfied while the queue owner is stopped. Keep that
+// result separate from `queueAwaitingBusyStart` (which means Enter was already
+// accepted) and retry exactly once when the owner's TUI becomes input-ready.
+const deferredOwnerSends = new Map<string, DeferredOwnerSend>();
+const claudeQueueStartupPending = new Set<string>();
+const queueReadinessWakePending = new Map<string, string>();
+const queueOwnerReadinessListeners = new Set<(ownerTabId: string, source: string) => void>();
+let queueSendAttemptSequence = 0;
+
+function signalQueueOwnerReadiness(ownerTabId: string, source: string): void {
+  retryDeferredOwnerSend(ownerTabId, source);
+  for (const listener of queueOwnerReadinessListeners) listener(ownerTabId, source);
+}
+
+function subscribeQueueOwnerReadiness(
+  listener: (ownerTabId: string, source: string) => void,
+): () => void {
+  queueOwnerReadinessListeners.add(listener);
+  return () => queueOwnerReadinessListeners.delete(listener);
+}
+
+async function readQueueOwnerReadiness(ownerTabId: string): Promise<{
+  ready: boolean;
+  status: string;
+  inputReady: boolean;
+  reason: string;
+}> {
+  const agent = getPromptQueueAgent(ownerTabId);
+  if (agent === 'claude') {
+    const gate = getClaudeStartupDefaultsGateSnapshot(ownerTabId);
+    if (claudeQueueStartupPending.has(ownerTabId) || gate?.status === 'pending' || gate?.status === 'failed') {
+      return {
+        ready: false,
+        status: gate?.status || 'starting',
+        inputReady: false,
+        reason: 'claude-startup-defaults-' + (gate?.status || 'pending'),
+      };
+    }
+  }
+
+  try {
+    const presence = await getHistoryAgentRuntime(agent).getPresence(
+      ownerTabId,
+      findProjectIdForTab(ownerTabId),
+    );
+    const ready = presence.status === 'active'
+      && presence.inputReady === true
+      && presence.isBusy !== true;
+    return {
+      ready,
+      status: presence.status,
+      inputReady: presence.inputReady === true,
+      reason: ready ? 'input-ready' : 'runtime-not-ready',
+    };
+  } catch (error: any) {
+    console.warn('[PromptQueueRunner] owner readiness unknown owner=' + ownerTabId.slice(-8)
+      + ' error=' + String(error?.message || error));
+    return { ready: false, status: 'unknown', inputReady: false, reason: 'presence-unknown' };
+  }
+}
+
+function clearDeferredOwnerSend(ownerTabId: string, reason: string): void {
+  queueReadinessWakePending.delete(ownerTabId);
+  if (!deferredOwnerSends.delete(ownerTabId)) return;
+  console.log('[PromptQueueRunner] deferred owner cleared owner=' + ownerTabId.slice(-8) + ' reason=' + reason);
+}
+
+function deferredOwnerAttemptIsCurrent(
+  ownerTabId: string,
+  attempt: DeferredOwnerSend,
+): boolean {
+  if (deferredOwnerSends.get(ownerTabId) !== attempt) return false;
+  const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
+  const head = queue.items.find(isQueuedPromptEnabled);
+  return queue.autoRun
+    && head?.id === attempt.headId
+    && queue.workflowArmedAt === attempt.workflowArmedAt
+    && getEffectiveQueueTrigger(ownerTabId, queue) === attempt.triggerTabId;
+}
+
+function clearDeferredOwnerAttempt(
+  ownerTabId: string,
+  attempt: DeferredOwnerSend,
+  reason: string,
+): void {
+  if (deferredOwnerSends.get(ownerTabId) !== attempt) return;
+  clearDeferredOwnerSend(ownerTabId, reason);
+}
+
+function retryDeferredOwnerSend(ownerTabId: string, source: string): boolean {
+  const deferred = deferredOwnerSends.get(ownerTabId);
+  if (!deferred) return false;
+  if (queueSendInflight.has(ownerTabId)) {
+    queueReadinessWakePending.set(ownerTabId, source);
+    console.log('[PromptQueueRunner] latch readiness wake owner=' + ownerTabId.slice(-8)
+      + ' source=' + source + ' attempt=' + deferred.attemptId);
+    return false;
+  }
+  const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
+  const head = queue.items.find(isQueuedPromptEnabled);
+  const effectiveTrigger = getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true });
+  if (!queue.autoRun
+    || !head
+    || head.id !== deferred.headId
+    || queue.workflowArmedAt !== deferred.workflowArmedAt
+    || effectiveTrigger !== deferred.triggerTabId) {
+    clearDeferredOwnerSend(ownerTabId, 'stale:' + source);
+    return false;
+  }
+  if (prevBusyRef.get(ownerTabId) === true) return false;
+  console.log('[PromptQueueRunner] retry deferred owner=' + ownerTabId.slice(-8)
+    + ' trigger=' + deferred.triggerTabId.slice(-8) + ' source=' + source);
+  return beginValidatedQueueSend(ownerTabId, deferred.triggerTabId, head, deferred.label);
+}
+
+function pruneDeferredOwnerSends(): void {
+  for (const [ownerTabId, deferred] of deferredOwnerSends) {
+    const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
+    const head = queue.items.find(isQueuedPromptEnabled);
+    const effectiveTrigger = getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true });
+    if (!queue.autoRun
+      || !head
+      || head.id !== deferred.headId
+      || queue.workflowArmedAt !== deferred.workflowArmedAt
+      || effectiveTrigger !== deferred.triggerTabId) {
+      clearDeferredOwnerSend(ownerTabId, 'queue-changed');
+    }
+  }
+}
 
 function queueOwnerHasPendingContinuation(ownerTabId: string): boolean {
-  if (queueAwaitingBusyStart.has(ownerTabId) || queueSendInflight.has(ownerTabId)) return true;
+  if (queueAwaitingBusyStart.has(ownerTabId)
+    || queueSendInflight.has(ownerTabId)
+    || deferredOwnerSends.has(ownerTabId)) return true;
   return hasPendingPromptQueueContinuation(usePromptQueueStore.getState().getQueue(ownerTabId));
 }
 
@@ -204,14 +344,48 @@ function beginValidatedQueueSend(
   label: 'turn-end' | 'cold-start',
 ): boolean {
   if (queueSendInflight.has(ownerTabId)) return false;
+  const queueAtStart = usePromptQueueStore.getState().getQueue(ownerTabId);
+  const headAtStart = queueAtStart.items.find(isQueuedPromptEnabled);
+  if (!queueAtStart.autoRun
+    || headAtStart?.id !== head.id
+    || getEffectiveQueueTrigger(ownerTabId, queueAtStart, { clearStaleTarget: true }) !== triggerTabId) {
+    return false;
+  }
   queueSendInflight.add(ownerTabId);
+  const attempt: DeferredOwnerSend = {
+    triggerTabId,
+    headId: head.id,
+    label,
+    workflowArmedAt: queueAtStart.workflowArmedAt,
+    attemptId: ++queueSendAttemptSequence,
+  };
+  deferredOwnerSends.set(ownerTabId, attempt);
   const arrow = ownerTabId === triggerTabId ? '↩' : '⇒';
   console.log('[PromptQueueRunner] ' + label + ' validate owner=' + ownerTabId.slice(-8)
     + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8) + ' item=' + head.id.slice(-8));
 
   void (async () => {
+    const readiness = await readQueueOwnerReadiness(ownerTabId);
+    if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
+      clearDeferredOwnerAttempt(ownerTabId, attempt, 'readiness-became-stale');
+      return;
+    }
+    if (!readiness.ready) {
+      console.log('[PromptQueueRunner] ' + label + ' owner=' + ownerTabId.slice(-8)
+        + ' trigger=' + triggerTabId.slice(-8)
+        + ' → WAIT owner readiness status=' + readiness.status
+        + ' inputReady=' + readiness.inputReady
+        + ' reason=' + readiness.reason);
+      return;
+    }
+
     const validation = await ensureQueuedPromptImagesReady(ownerTabId, head.id);
+    if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
+      clearDeferredOwnerAttempt(ownerTabId, attempt, 'attachment-validation-became-stale');
+      return;
+    }
     if (!validation.ready || !validation.item) {
+      clearDeferredOwnerAttempt(ownerTabId, attempt, 'attachment-validation-refused');
       const store = usePromptQueueStore.getState();
       store.setAutoRun(ownerTabId, false);
       store.setStopAfter(ownerTabId, false);
@@ -235,9 +409,13 @@ function beginValidatedQueueSend(
       return;
     }
 
+    if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
+      clearDeferredOwnerAttempt(ownerTabId, attempt, 'validation-became-stale');
+      return;
+    }
     const latestQueue = usePromptQueueStore.getState().getQueue(ownerTabId);
     const latestHead = latestQueue.items.find(isQueuedPromptEnabled);
-    if (!latestQueue.autoRun || latestHead?.id !== head.id || prevBusyRef.get(ownerTabId) === true) {
+    if (prevBusyRef.get(ownerTabId) === true) {
       console.log('[PromptQueueRunner] ' + label + ' validation became stale owner=' + ownerTabId.slice(-8)
         + ' expected=' + head.id.slice(-8) + ' actual=' + (latestHead?.id.slice(-8) || '-'));
       return;
@@ -246,11 +424,28 @@ function beginValidatedQueueSend(
     queueAwaitingBusyStart.add(ownerTabId);
     const payload = withPostPrompt(ownerTabId, buildQueuedPromptPayload(validation.item));
     const beforeCount = countEnabledQueuedPrompts(latestQueue.items);
+    if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
+      queueAwaitingBusyStart.delete(ownerTabId);
+      clearDeferredOwnerAttempt(ownerTabId, attempt, 'send-boundary-became-stale');
+      return;
+    }
     console.log('[PromptQueueRunner] ' + label + ' fire owner=' + ownerTabId.slice(-8)
       + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8) + ' remaining=' + Math.max(0, beforeCount - 1));
     const res: any = await sendQueueCommand(ownerTabId, payload);
     if (!queueSendTransferredOwnership(res)) {
       queueAwaitingBusyStart.delete(ownerTabId);
+      if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
+        clearDeferredOwnerAttempt(ownerTabId, attempt, 'send-response-became-stale');
+        console.log('[PromptQueueRunner] ' + label + ' ignored stale refused response owner=' + ownerTabId.slice(-8)
+          + ' attempt=' + attempt.attemptId + ' error=' + (res?.error || 'unknown'));
+        return;
+      }
+      if (res?.deferred === true || res?.error === 'codex_input_not_ready') {
+        console.log('[PromptQueueRunner] ' + label + ' owner=' + ownerTabId.slice(-8)
+          + ' → WAIT main readiness admission error=' + (res?.error || 'not-ready'));
+        return;
+      }
+      clearDeferredOwnerSend(ownerTabId, 'send-refused');
       const store = usePromptQueueStore.getState();
       store.setAutoRun(ownerTabId, false);
       store.setStopAfter(ownerTabId, false);
@@ -262,17 +457,27 @@ function beginValidatedQueueSend(
         + ' trigger=' + triggerTabId.slice(-8) + ' error=' + (res.error || 'unknown'));
     }
     const committed = usePromptQueueStore.getState().commitSentHead(ownerTabId, head.id, triggerTabId);
+    clearDeferredOwnerSend(ownerTabId, 'committed');
     console.log('[PromptQueueRunner] ' + label + ' commit owner=' + ownerTabId.slice(-8)
       + ' trigger=' + triggerTabId.slice(-8) + ' removed=' + committed.removed
       + ' targetCleared=' + committed.targetCleared + ' before=' + committed.beforeCount);
   })().catch((error: unknown) => {
     queueAwaitingBusyStart.delete(ownerTabId);
-    const store = usePromptQueueStore.getState();
-    store.setAutoRun(ownerTabId, false);
-    store.setStopAfter(ownerTabId, false);
+    const current = deferredOwnerAttemptIsCurrent(ownerTabId, attempt);
+    clearDeferredOwnerAttempt(ownerTabId, attempt, 'send-error');
+    if (current) {
+      const store = usePromptQueueStore.getState();
+      store.setAutoRun(ownerTabId, false);
+      store.setStopAfter(ownerTabId, false);
+    }
     console.error('[PromptQueueRunner] ' + label + ' validated send failed owner=' + ownerTabId, error);
   }).finally(() => {
     queueSendInflight.delete(ownerTabId);
+    const wakeSource = queueReadinessWakePending.get(ownerTabId) || null;
+    queueReadinessWakePending.delete(ownerTabId);
+    if (wakeSource && deferredOwnerSends.has(ownerTabId)) {
+      retryDeferredOwnerSend(ownerTabId, 'latched:' + wakeSource);
+    }
   });
   return true;
 }
@@ -849,10 +1054,46 @@ export function usePromptQueueRunner() {
     const claudeHandler = handleBusyState('claude');
     const geminiHandler = handleBusyState('gemini');
     const codexHandler = handleBusyState('codex');
+    const commandStartedHandler = (_: unknown, data: { tabId?: string; commandType?: string | null }) => {
+      if (!data?.tabId || data.commandType !== 'claude') return;
+      claudeQueueStartupPending.add(data.tabId);
+    };
+    const commandFinishedHandler = (_: unknown, data: { tabId?: string }) => {
+      if (!data?.tabId) return;
+      claudeQueueStartupPending.delete(data.tabId);
+    };
+    const claudeReadyHandler = (_: unknown, data: { tabId?: string }) => {
+      if (!data?.tabId) return;
+      // Claude's prompt is visible, but /model and /effort startup defaults may
+      // still be applying. The gate event below is the actual send boundary.
+      claudeQueueStartupPending.add(data.tabId);
+    };
+    const codexReadyHandler = (_: unknown, data: { tabId?: string }) => {
+      if (data?.tabId) signalQueueOwnerReadiness(data.tabId, 'codex-tui-ready');
+    };
+    const claudeStartupGateHandler = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId?: string; status?: string }>).detail || {};
+      if (!detail.tabId) return;
+      if (detail.status === 'pending' || detail.status === 'failed') {
+        claudeQueueStartupPending.add(detail.tabId);
+        return;
+      }
+      if (detail.status === 'ready') {
+        claudeQueueStartupPending.delete(detail.tabId);
+        signalQueueOwnerReadiness(detail.tabId, 'claude-startup-defaults-ready');
+      } else if (detail.status === 'cleared') {
+        claudeQueueStartupPending.delete(detail.tabId);
+      }
+    };
     ipcRenderer.on('claude:busy-state', claudeHandler);
     ipcRenderer.on('gemini:busy-state', geminiHandler);
     ipcRenderer.on('codex:busy-state', codexHandler);
     ipcRenderer.on('codex:turn-state-resolved', codexTurnStateResolvedHandler);
+    ipcRenderer.on('terminal:command-started', commandStartedHandler);
+    ipcRenderer.on('terminal:command-finished', commandFinishedHandler);
+    ipcRenderer.on('claude:tui-ready', claudeReadyHandler);
+    ipcRenderer.on('codex:tui-ready', codexReadyHandler);
+    window.addEventListener('claude-startup-defaults-gate', claudeStartupGateHandler);
     const unsubscribeQueueHydration = subscribePromptQueueHydration(maybeReconcileRestoredWorkflows);
     const unsubscribeWorkspaceHydration = useWorkspaceStore.subscribe(maybeReconcileRestoredWorkflows);
     maybeReconcileRestoredWorkflows();
@@ -861,6 +1102,11 @@ export function usePromptQueueRunner() {
       ipcRenderer.removeListener('gemini:busy-state', geminiHandler);
       ipcRenderer.removeListener('codex:busy-state', codexHandler);
       ipcRenderer.removeListener('codex:turn-state-resolved', codexTurnStateResolvedHandler);
+      ipcRenderer.removeListener('terminal:command-started', commandStartedHandler);
+      ipcRenderer.removeListener('terminal:command-finished', commandFinishedHandler);
+      ipcRenderer.removeListener('claude:tui-ready', claudeReadyHandler);
+      ipcRenderer.removeListener('codex:tui-ready', codexReadyHandler);
+      window.removeEventListener('claude-startup-defaults-gate', claudeStartupGateHandler);
       unsubscribeQueueHydration();
       unsubscribeWorkspaceHydration();
     };
@@ -911,6 +1157,156 @@ export function usePromptQueueRunner() {
         firing = false;
       }
     };
+
+    type FirstDelayReadinessRequest = {
+      requestId: number;
+      headId: string;
+      workflowArmedAt: number | null;
+    };
+    const firstDelayReadinessPending = new Map<string, FirstDelayReadinessRequest>();
+    const firstDelayReadinessInflight = new Map<string, FirstDelayReadinessRequest>();
+    const firstDelayReadinessWakePending = new Map<string, string>();
+    let firstDelayReadinessSequence = 0;
+
+    const firstDelayRequestIsCurrent = (
+      ownerTabId: string,
+      request: FirstDelayReadinessRequest,
+    ): boolean => {
+      if (firstDelayReadinessPending.get(ownerTabId) !== request) return false;
+      const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
+      const head = queue.items.find(isQueuedPromptEnabled);
+      return queue.autoRun
+        && head?.id === request.headId
+        && queue.workflowArmedAt === request.workflowArmedAt
+        && queue.firstDelayCountdownAt === null
+        && !queueSendInflight.has(ownerTabId)
+        && !queueAwaitingBusyStart.has(ownerTabId)
+        && !deferredOwnerSends.has(ownerTabId)
+        && getEffectiveQueueTrigger(ownerTabId, queue) === ownerTabId;
+    };
+
+    const clearFirstDelayReadiness = (ownerTabId: string, reason: string): void => {
+      firstDelayReadinessWakePending.delete(ownerTabId);
+      if (!firstDelayReadinessPending.delete(ownerTabId)) return;
+      console.log('[PromptQueueRunner] first-delay readiness cleared owner=' + ownerTabId.slice(-8)
+        + ' reason=' + reason);
+    };
+
+    const startFirstDelayAfterReadiness = (
+      ownerTabId: string,
+      request: FirstDelayReadinessRequest,
+    ): void => {
+      if (!firstDelayRequestIsCurrent(ownerTabId, request)) {
+        clearFirstDelayReadiness(ownerTabId, 'ready-became-stale');
+        return;
+      }
+      const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
+      firstDelayReadinessPending.delete(ownerTabId);
+      firstDelayReadinessWakePending.delete(ownerTabId);
+      if (queue.firstDelaySeconds <= 0) {
+        fireHead(ownerTabId, ownerTabId);
+        return;
+      }
+
+      const delayMs = queue.firstDelaySeconds * 1000;
+      usePromptQueueStore.getState().startFirstDelayCountdown(ownerTabId);
+      clearTimer(ownerTabId);
+      pendingTimers.set(ownerTabId, setTimeout(() => {
+        pendingTimers.delete(ownerTabId);
+        const latestQueue = usePromptQueueStore.getState().getQueue(ownerTabId);
+        if (!latestQueue.autoRun
+          || countEnabledQueuedPrompts(latestQueue.items) === 0
+          || latestQueue.firstDelayCountdownAt === null) {
+          usePromptQueueStore.getState().clearFirstDelayCountdown(ownerTabId);
+          return;
+        }
+        usePromptQueueStore.getState().consumeFirstDelayCountdown(ownerTabId);
+        fireHead(ownerTabId, ownerTabId);
+      }, delayMs));
+      console.log('[PromptQueueRunner] first-delay countdown started after readiness owner='
+        + ownerTabId.slice(-8) + ' seconds=' + queue.firstDelaySeconds
+        + ' request=' + request.requestId);
+    };
+
+    const checkFirstDelayOwnerReadiness = (ownerTabId: string, source: string): boolean => {
+      const request = firstDelayReadinessPending.get(ownerTabId);
+      if (!request) return false;
+      if (firstDelayReadinessInflight.has(ownerTabId)) {
+        firstDelayReadinessWakePending.set(ownerTabId, source);
+        return true;
+      }
+      if (!firstDelayRequestIsCurrent(ownerTabId, request)) {
+        clearFirstDelayReadiness(ownerTabId, 'stale-before-check:' + source);
+        return false;
+      }
+
+      firstDelayReadinessInflight.set(ownerTabId, request);
+      void readQueueOwnerReadiness(ownerTabId).then((readiness) => {
+        if (!firstDelayRequestIsCurrent(ownerTabId, request)) {
+          clearFirstDelayReadiness(ownerTabId, 'stale-after-check:' + source);
+          return;
+        }
+        if (!readiness.ready) {
+          console.log('[PromptQueueRunner] first-delay waits for owner readiness owner='
+            + ownerTabId.slice(-8) + ' status=' + readiness.status
+            + ' inputReady=' + readiness.inputReady + ' source=' + source);
+          return;
+        }
+        startFirstDelayAfterReadiness(ownerTabId, request);
+      }).catch((error: unknown) => {
+        console.warn('[PromptQueueRunner] first-delay readiness check failed owner='
+          + ownerTabId.slice(-8) + ' source=' + source, error);
+      }).finally(() => {
+        if (firstDelayReadinessInflight.get(ownerTabId) === request) {
+          firstDelayReadinessInflight.delete(ownerTabId);
+        }
+        const wakeSource = firstDelayReadinessWakePending.get(ownerTabId) || null;
+        firstDelayReadinessWakePending.delete(ownerTabId);
+        if (wakeSource && firstDelayReadinessPending.has(ownerTabId)) {
+          checkFirstDelayOwnerReadiness(ownerTabId, 'latched:' + wakeSource);
+        }
+      });
+      return true;
+    };
+
+    const waitForFirstDelayOwnerReadiness = (ownerTabId: string, source: string): boolean => {
+      const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
+      const head = queue.items.find(isQueuedPromptEnabled);
+      if (!queue.autoRun
+        || !head
+        || queue.firstDelayCountdownAt !== null
+        || getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true }) !== ownerTabId) {
+        clearFirstDelayReadiness(ownerTabId, 'invalid-request:' + source);
+        return false;
+      }
+
+      const existing = firstDelayReadinessPending.get(ownerTabId);
+      const request = existing
+        && existing.headId === head.id
+        && existing.workflowArmedAt === queue.workflowArmedAt
+        ? existing
+        : {
+            requestId: ++firstDelayReadinessSequence,
+            headId: head.id,
+            workflowArmedAt: queue.workflowArmedAt,
+          };
+      firstDelayReadinessPending.set(ownerTabId, request);
+      return checkFirstDelayOwnerReadiness(ownerTabId, source);
+    };
+
+    const pruneFirstDelayReadiness = (): void => {
+      for (const [ownerTabId, request] of firstDelayReadinessPending) {
+        if (!firstDelayRequestIsCurrent(ownerTabId, request)) {
+          clearFirstDelayReadiness(ownerTabId, 'queue-changed');
+        }
+      }
+    };
+
+    const unsubscribeOwnerReadiness = subscribeQueueOwnerReadiness((ownerTabId, source) => {
+      if (firstDelayReadinessPending.has(ownerTabId)) {
+        checkFirstDelayOwnerReadiness(ownerTabId, source);
+      }
+    });
 
     const verifyCodexTriggerIdleThenFire = (ownerTabId: string, triggerTabId: string): boolean => {
       if (getWorkspaceCommandType(triggerTabId) !== 'codex') return false;
@@ -970,19 +1366,7 @@ export function usePromptQueueRunner() {
 
         if (q2.firstDelayCountdownAt !== null) return;
         if (q2.firstDelaySeconds > 0) {
-          const delayMs = q2.firstDelaySeconds * 1000;
-          usePromptQueueStore.getState().startFirstDelayCountdown(ownerTabId);
-          clearTimer(ownerTabId);
-          pendingTimers.set(ownerTabId, setTimeout(() => {
-            pendingTimers.delete(ownerTabId);
-            const q3 = usePromptQueueStore.getState().getQueue(ownerTabId);
-            if (!q3.autoRun || countEnabledQueuedPrompts(q3.items) === 0 || q3.firstDelayCountdownAt === null) {
-              usePromptQueueStore.getState().clearFirstDelayCountdown(ownerTabId);
-              return;
-            }
-            usePromptQueueStore.getState().consumeFirstDelayCountdown(ownerTabId);
-            fireHead(ownerTabId, ownerTabId);
-          }, delayMs));
+          waitForFirstDelayOwnerReadiness(ownerTabId, 'codex-own-cold-start');
         } else {
           fireHead(ownerTabId, ownerTabId);
         }
@@ -1086,19 +1470,7 @@ export function usePromptQueueRunner() {
         if (q.firstDelayCountdownAt !== null) continue;
 
         if (q.firstDelaySeconds > 0) {
-          const delayMs = q.firstDelaySeconds * 1000;
-          usePromptQueueStore.getState().startFirstDelayCountdown(tabId);
-          clearTimer(tabId);
-          pendingTimers.set(tabId, setTimeout(() => {
-            pendingTimers.delete(tabId);
-            const q2 = usePromptQueueStore.getState().getQueue(tabId);
-            if (!q2.autoRun || countEnabledQueuedPrompts(q2.items) === 0 || q2.firstDelayCountdownAt === null) {
-              usePromptQueueStore.getState().clearFirstDelayCountdown(tabId);
-              return;
-            }
-            usePromptQueueStore.getState().consumeFirstDelayCountdown(tabId);
-            fireHead(tabId, tabId);
-          }, delayMs));
+          waitForFirstDelayOwnerReadiness(tabId, 'own-cold-start');
         } else {
           fireHead(tabId, tabId);
         }
@@ -1106,6 +1478,8 @@ export function usePromptQueueRunner() {
     };
 
     const unsubscribeQueue = usePromptQueueStore.subscribe((state, prevState) => {
+      pruneDeferredOwnerSends();
+      pruneFirstDelayReadiness();
       evaluateQueues(state, prevState);
     });
     const unsubscribeReconciliation = subscribeWorkflowRestoreReconciliation(() => {
@@ -1122,8 +1496,12 @@ export function usePromptQueueRunner() {
     return () => {
       unsubscribeQueue();
       unsubscribeReconciliation();
+      unsubscribeOwnerReadiness();
       for (const t of pendingTimers.values()) clearTimeout(t);
       pendingTimers.clear();
+      firstDelayReadinessPending.clear();
+      firstDelayReadinessInflight.clear();
+      firstDelayReadinessWakePending.clear();
     };
   }, []);
 }

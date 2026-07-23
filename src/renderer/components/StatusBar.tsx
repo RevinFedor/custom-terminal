@@ -69,12 +69,16 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
   const codexModelsForSelector = visibleCodexModels.length > 0
     ? visibleCodexModels
     : codexModels.filter((model) => model.id === defaultCodexModel);
-  const codexEfforts = activeCodexModel?.efforts?.length ? activeCodexModel.efforts : [...CODEX_EFFORT_LEVELS];
+  const codexEfforts = (
+    activeCodexModel?.efforts?.length ? activeCodexModel.efforts : [...CODEX_EFFORT_LEVELS]
+  ).filter((effort) => effort !== 'ultra');
   const setDefaultCodexModelWithEffort = (model: string) => {
     setDefaultCodexModel(model);
     if (model === 'none' || defaultCodexEffort === 'none') return;
     const nextModel = codexModels.find((m) => m.id === model);
-    const efforts = nextModel?.efforts?.length ? nextModel.efforts : [...CODEX_EFFORT_LEVELS];
+    const efforts = (
+      nextModel?.efforts?.length ? nextModel.efforts : [...CODEX_EFFORT_LEVELS]
+    ).filter((effort) => effort !== 'ultra');
     if (efforts.includes(defaultCodexEffort)) return;
     const fallback = (nextModel?.defaultEffort && efforts.includes(nextModel.defaultEffort))
       ? nextModel.defaultEffort
@@ -911,6 +915,11 @@ function WebServerChip({ hidden = false }: { hidden?: boolean }) {
   };
 
   return (
+    <ControlHint
+      label="Открыть mobile control"
+      modifiedAction="ПКМ — скопировать адрес с токеном"
+      side="top"
+    >
     <button
       onClick={handleClick}
       onContextMenu={handleRightClick}
@@ -928,6 +937,7 @@ function WebServerChip({ hidden = false }: { hidden?: boolean }) {
         {copied ? 'copied!' : shortUrl}
       </span>
     </button>
+    </ControlHint>
   );
 }
 
@@ -939,6 +949,11 @@ function StatusToggle({ label, title, active, onClick, activeColor = '#22c55e' }
   activeColor?: string;
 }) {
   return (
+    <ControlHint
+      label={`${active ? 'Выключить' : 'Включить'} ${label}`}
+      shortcut={title}
+      side="top"
+    >
     <button
       onClick={onClick}
       title={title}
@@ -955,6 +970,7 @@ function StatusToggle({ label, title, active, onClick, activeColor = '#22c55e' }
       />
       <span style={{ color: active ? '#ddd' : '#666' }}>{label}</span>
     </button>
+    </ControlHint>
   );
 }
 

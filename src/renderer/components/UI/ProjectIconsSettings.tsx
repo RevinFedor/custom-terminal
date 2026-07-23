@@ -4,6 +4,7 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import IconCropper from '../Workspace/IconCropper.jsx';
 import { isInboxProjectId } from '../../constants/systemProjects';
+import ControlHint from './ControlHint';
 
 type ProjectIconProject = {
   id: string;
@@ -163,15 +164,17 @@ export default function ProjectIconsSettings() {
           <RotateCcw size={13} />
           Обрезать
         </button>
-        <button
-          type="button"
-          title="Сбросить"
-          style={{ ...iconButtonStyle, width: '32px', padding: 0, color: project.icon ? '#f87171' : '#555', opacity: project.icon ? 1 : 0.45, cursor: project.icon ? 'pointer' : 'default' }}
-          disabled={!project.icon}
-          onClick={() => clearIcon(project.id)}
-        >
-          <Trash2 size={13} />
-        </button>
+        <ControlHint label="Сбросить иконку">
+          <button
+            type="button"
+            title="Сбросить"
+            style={{ ...iconButtonStyle, width: '32px', padding: 0, color: project.icon ? '#f87171' : '#555', opacity: project.icon ? 1 : 0.45, cursor: project.icon ? 'pointer' : 'default' }}
+            disabled={!project.icon}
+            onClick={() => clearIcon(project.id)}
+          >
+            <Trash2 size={13} />
+          </button>
+        </ControlHint>
       </div>
     </div>
   );

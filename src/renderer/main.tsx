@@ -8,8 +8,6 @@ import ReactDOM from 'react-dom/client';
 import { bootstrapPersistedStorage } from './utils/persistedStorage';
 bootstrapPersistedStorage();
 
-import App from './App';
-import { installPerfFreezeProbe } from './utils/perfFreezeProbe';
 import './styles/globals.css';
 import './styles/sidebar.css';
 // Portable Claude-conversation blocks (tool cards / bash / diff / thinking /
@@ -170,8 +168,6 @@ console.warn(
   ` href=${window.location.href}`
 );
 
-installPerfFreezeProbe();
-
 // === GLOBAL ERROR BOUNDARY ===
 class ErrorBoundary extends React.Component<
   { children: React.ReactNode },
@@ -256,12 +252,32 @@ class ErrorBoundary extends React.Component<
   }
 }
 
-// Mount React app (no StrictMode - conflicts with xterm.js)
-const root = document.getElementById('react-root');
-if (root) {
-  ReactDOM.createRoot(root).render(
-    <ErrorBoundary>
-      <App />
-    </ErrorBoundary>
-  );
-}
+// Import everything that can reach a Zustand store only after SQLite has been
+// synchronously mirrored into localStorage above. Static ESM imports are
+// evaluated before this module body, regardless of their textual position;
+// keeping App or perfFreezeProbe as static imports would therefore make stores
+// capture defaults before DEV settings are restored.
+void Promise.all([
+  import('./App'),
+  import('./utils/perfFreezeProbe'),
+  import('./store/useRewindOperationStore'),
+]).then(([
+  { default: App },
+  { installPerfFreezeProbe },
+  { installRewindOperationIpcBridge },
+]) => {
+  installPerfFreezeProbe();
+  installRewindOperationIpcBridge(window.require('electron').ipcRenderer);
+
+  // Mount React app (no StrictMode - conflicts with xterm.js)
+  const root = document.getElementById('react-root');
+  if (root) {
+    ReactDOM.createRoot(root).render(
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
+    );
+  }
+}).catch((error) => {
+  console.error('[RendererBootstrap] failed to load application modules', error);
+});

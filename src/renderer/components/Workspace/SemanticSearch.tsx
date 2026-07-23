@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, memo } from 'react';
 import { Search, Database, Loader2, X, ChevronDown, ChevronRight, Settings } from 'lucide-react';
-import Tooltip from '../UI/Tooltip';
+import ControlHint from '../UI/ControlHint';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -168,17 +168,17 @@ export default memo(function SemanticSearchSection({ projectPath }: SemanticSear
         {/* Index controls */}
         <div className="flex items-center gap-1 relative" ref={settingsRef}>
           {/* Settings gear */}
-          <Tooltip content="Index settings">
+          <ControlHint label="Настройки индекса">
           <button
             onClick={(e) => { e.stopPropagation(); setShowIndexSettings(!showIndexSettings); }}
             className="flex items-center p-1 text-[#555] hover:text-[#999] cursor-pointer transition-colors"
           >
             <Settings size={12} />
           </button>
-          </Tooltip>
+          </ControlHint>
 
           {/* Index button */}
-          <Tooltip content={indexStats ? `${indexStats.fileCount} files, ${indexStats.chunkCount} chunks indexed` : 'Build search index'}>
+          <ControlHint label={indexStats ? `Переиндексировать: ${indexStats.fileCount} файлов, ${indexStats.chunkCount} чанков` : 'Создать поисковый индекс'}>
           <button
             onClick={(e) => { e.stopPropagation(); handleIndexAll(sessionLimit); }}
             disabled={indexing}
@@ -194,7 +194,7 @@ export default memo(function SemanticSearchSection({ projectPath }: SemanticSear
               : `Index (${sessionLimit || 'all'})`
             }
           </button>
-          </Tooltip>
+          </ControlHint>
 
           {/* Settings dropdown */}
           {showIndexSettings && (

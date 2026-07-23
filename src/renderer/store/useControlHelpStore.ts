@@ -7,8 +7,7 @@ interface ControlHelpState {
 }
 
 export const useControlHelpStore = create<ControlHelpState>((set) => ({
-  enabled: false,
+  enabled: true,
   setEnabled: (enabled) => set({ enabled }),
   toggle: () => set((state) => ({ enabled: !state.enabled })),
 }));
-

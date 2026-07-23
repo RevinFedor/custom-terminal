@@ -45,35 +45,65 @@ function normalizeSubtasks(raw, used) {
   return result;
 }
 
-function normalizeItems(raw) {
+function normalizeRootTask(value, used) {
+  const title = cleanTitle(value?.title);
+  if (!title) return null;
+  const task = {
+    id: cleanId(value?.id, 'task', used),
+    title,
+    subtasks: normalizeSubtasks(value?.subtasks, used),
+  };
+  if (typeof value?.statusId === 'string' && value.statusId.trim()) {
+    task.statusId = value.statusId.trim().slice(0, 160);
+  }
+  return task;
+}
+
+function normalizeItems(raw, used = new Set()) {
   if (!Array.isArray(raw)) return [];
-  const used = new Set();
   const result = [];
   for (const value of raw.slice(0, TASK_PLAN_MAX_ROOTS)) {
-    const title = cleanTitle(value?.title);
-    if (!title) continue;
-    const task = {
-      id: cleanId(value?.id, 'task', used),
-      title,
-      subtasks: normalizeSubtasks(value?.subtasks, used),
-    };
-    if (typeof value?.statusId === 'string' && value.statusId.trim()) {
-      task.statusId = value.statusId.trim().slice(0, 160);
-    }
-    result.push(task);
+    const task = normalizeRootTask(value, used);
+    if (task) result.push(task);
   }
   return result;
 }
 
+function normalizeArchivedItems(raw, used = new Set()) {
+  if (!Array.isArray(raw)) return [];
+  const result = [];
+  for (const value of raw.slice(-TASK_PLAN_MAX_ROOTS)) {
+    const task = normalizeRootTask(value, used);
+    if (!task) continue;
+    result.push({
+      ...task,
+      archivedAt: Number.isFinite(value?.archivedAt)
+        ? Math.max(0, Math.floor(value.archivedAt))
+        : 0,
+    });
+  }
+  return result;
+}
+
+function normalizePlanLists(rawItems, rawArchivedItems) {
+  const used = new Set();
+  const items = normalizeItems(rawItems, used);
+  const archivedItems = normalizeArchivedItems(rawArchivedItems, used);
+  return { items, archivedItems };
+}
+
 function normalizeHistoryEntries(raw) {
   if (!Array.isArray(raw)) return [];
-  return raw.slice(-TASK_PLAN_HISTORY_LIMIT).map((entry) => ({
-    items: normalizeItems(entry?.items),
-    at: Number.isFinite(entry?.at) ? Math.max(0, Math.floor(entry.at)) : Date.now(),
-    source: typeof entry?.source === 'string' && entry.source.trim()
-      ? entry.source.trim().slice(0, 80)
-      : 'unknown',
-  }));
+  return raw.slice(-TASK_PLAN_HISTORY_LIMIT).map((entry) => {
+    const lists = normalizePlanLists(entry?.items, entry?.archivedItems);
+    return {
+      ...lists,
+      at: Number.isFinite(entry?.at) ? Math.max(0, Math.floor(entry.at)) : Date.now(),
+      source: typeof entry?.source === 'string' && entry.source.trim()
+        ? entry.source.trim().slice(0, 80)
+        : 'unknown',
+    };
+  });
 }
 
 function emptyTaskPlan() {
@@ -81,6 +111,7 @@ function emptyTaskPlan() {
     version: TASK_PLAN_VERSION,
     revision: 0,
     items: [],
+    archivedItems: [],
     history: { past: [], future: [] },
     updatedAt: null,
     updatedBy: null,
@@ -94,10 +125,11 @@ function normalizeTaskPlan(raw) {
     catch { return emptyTaskPlan(); }
   }
   if (!value || typeof value !== 'object') return emptyTaskPlan();
+  const lists = normalizePlanLists(value.items, value.archivedItems);
   return {
     version: TASK_PLAN_VERSION,
     revision: Number.isFinite(value.revision) ? Math.max(0, Math.floor(value.revision)) : 0,
-    items: normalizeItems(value.items),
+    ...lists,
     history: {
       past: normalizeHistoryEntries(value.history?.past),
       future: normalizeHistoryEntries(value.history?.future),
@@ -109,22 +141,23 @@ function normalizeTaskPlan(raw) {
   };
 }
 
-function taskPlanItemsEqual(a, b) {
-  return JSON.stringify(a) === JSON.stringify(b);
+function taskPlanStateEqual(itemsA, archivedA, itemsB, archivedB) {
+  return JSON.stringify([itemsA, archivedA]) === JSON.stringify([itemsB, archivedB]);
 }
 
 function snapshotOf(document) {
   return {
     items: document.items,
+    archivedItems: document.archivedItems,
     at: document.updatedAt || Date.now(),
     source: document.updatedBy || 'unknown',
   };
 }
 
-function commitTaskPlanItems(rawDocument, rawItems, source = 'unknown') {
+function commitTaskPlanState(rawDocument, rawItems, rawArchivedItems, source = 'unknown') {
   const document = normalizeTaskPlan(rawDocument);
-  const items = normalizeItems(rawItems);
-  if (taskPlanItemsEqual(document.items, items)) {
+  const { items, archivedItems } = normalizePlanLists(rawItems, rawArchivedItems);
+  if (taskPlanStateEqual(document.items, document.archivedItems, items, archivedItems)) {
     return { changed: false, document };
   }
   const now = Date.now();
@@ -134,6 +167,7 @@ function commitTaskPlanItems(rawDocument, rawItems, source = 'unknown') {
       version: TASK_PLAN_VERSION,
       revision: document.revision + 1,
       items,
+      archivedItems,
       history: {
         past: [...document.history.past, snapshotOf(document)].slice(-TASK_PLAN_HISTORY_LIMIT),
         future: [],
@@ -142,6 +176,11 @@ function commitTaskPlanItems(rawDocument, rawItems, source = 'unknown') {
       updatedBy: String(source || 'unknown').slice(0, 80),
     },
   };
+}
+
+function commitTaskPlanItems(rawDocument, rawItems, source = 'unknown') {
+  const document = normalizeTaskPlan(rawDocument);
+  return commitTaskPlanState(document, rawItems, document.archivedItems, source);
 }
 
 function getTask(items, taskId) {
@@ -155,32 +194,35 @@ function applyTaskPlanOperations(rawDocument, rawOperations, source = 'unknown')
   if (!Array.isArray(rawOperations) || rawOperations.length === 0) {
     throw new Error('operations_required');
   }
-  let items = normalizeItems(document.items);
+  let { items, archivedItems } = normalizePlanLists(document.items, document.archivedItems);
 
   for (const operation of rawOperations.slice(0, 500)) {
     const type = operation?.type;
     if (type === 'replace_plan') {
-      items = normalizeItems(operation.tasks);
+      const used = new Set(archivedItems.flatMap((item) => [item.id, ...item.subtasks.map((subtask) => subtask.id)]));
+      items = normalizeItems(operation.tasks, used);
       continue;
     }
 
     if (type === 'add_task') {
       const title = cleanTitle(operation.title);
       if (!title) throw new Error('task_title_required');
+      const used = new Set([
+        ...items.flatMap((item) => [item.id, ...item.subtasks.map((subtask) => subtask.id)]),
+        ...archivedItems.flatMap((item) => [item.id, ...item.subtasks.map((subtask) => subtask.id)]),
+      ]);
       const next = normalizeItems([{
         id: operation.id,
         title,
         statusId: operation.statusId,
         subtasks: operation.subtasks,
-      }])[0];
+      }], used)[0];
       if (!next) throw new Error('task_title_required');
-      if (items.some((item) => item.id === next.id)) next.id = makeTaskPlanId('task');
       const afterIndex = typeof operation.afterTaskId === 'string'
         ? items.findIndex((item) => item.id === operation.afterTaskId)
         : -1;
       if (afterIndex >= 0) items.splice(afterIndex + 1, 0, next);
       else items.push(next);
-      items = normalizeItems(items);
       continue;
     }
 
@@ -208,11 +250,31 @@ function applyTaskPlanOperations(rawDocument, rawOperations, source = 'unknown')
       continue;
     }
 
+    if (type === 'archive_task') {
+      const index = items.findIndex((item) => item.id === operation.taskId);
+      if (index < 0) throw new Error(`task_not_found:${operation.taskId}`);
+      const [task] = items.splice(index, 1);
+      archivedItems.push({ ...task, archivedAt: Date.now() });
+      continue;
+    }
+
+    if (type === 'restore_task') {
+      const index = archivedItems.findIndex((item) => item.id === operation.taskId);
+      if (index < 0) throw new Error(`archived_task_not_found:${operation.taskId}`);
+      const [archivedTask] = archivedItems.splice(index, 1);
+      const { archivedAt: _archivedAt, ...task } = archivedTask;
+      items.push(task);
+      continue;
+    }
+
     if (type === 'add_subtask') {
       const task = getTask(items, operation.taskId);
       const title = cleanTitle(operation.title);
       if (!title) throw new Error('subtask_title_required');
-      const used = new Set(items.flatMap((item) => [item.id, ...item.subtasks.map((subtask) => subtask.id)]));
+      const used = new Set([
+        ...items.flatMap((item) => [item.id, ...item.subtasks.map((subtask) => subtask.id)]),
+        ...archivedItems.flatMap((item) => [item.id, ...item.subtasks.map((subtask) => subtask.id)]),
+      ]);
       const subtask = {
         id: cleanId(operation.id, 'subtask', used),
         title,
@@ -246,7 +308,7 @@ function applyTaskPlanOperations(rawDocument, rawOperations, source = 'unknown')
     throw new Error(`unsupported_operation:${String(type || '')}`);
   }
 
-  return commitTaskPlanItems(document, items, source);
+  return commitTaskPlanState(document, items, archivedItems, source);
 }
 
 function undoTaskPlan(rawDocument, source = 'user') {
@@ -259,6 +321,7 @@ function undoTaskPlan(rawDocument, source = 'user') {
       version: TASK_PLAN_VERSION,
       revision: document.revision + 1,
       items: previous.items,
+      archivedItems: previous.archivedItems,
       history: {
         past: document.history.past.slice(0, -1),
         future: [snapshotOf(document), ...document.history.future].slice(0, TASK_PLAN_HISTORY_LIMIT),
@@ -279,6 +342,7 @@ function redoTaskPlan(rawDocument, source = 'user') {
       version: TASK_PLAN_VERSION,
       revision: document.revision + 1,
       items: next.items,
+      archivedItems: next.archivedItems,
       history: {
         past: [...document.history.past, snapshotOf(document)].slice(-TASK_PLAN_HISTORY_LIMIT),
         future: document.history.future.slice(1),
@@ -303,6 +367,7 @@ module.exports = {
   emptyTaskPlan,
   normalizeTaskPlan,
   normalizeItems,
+  normalizeArchivedItems,
   commitTaskPlanItems,
   applyTaskPlanOperations,
   undoTaskPlan,

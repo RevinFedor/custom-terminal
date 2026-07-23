@@ -3,23 +3,17 @@ import {
   Activity,
   CheckCircle2,
   Command,
-  ExternalLink,
   FileText,
   FolderOpen,
-  GitFork,
-  History,
-  Keyboard,
-  ListPlus,
   Loader2,
   MousePointer2,
   Play,
   RotateCcw,
-  Scissors,
   ShieldCheck,
-  Square,
   Workflow,
   X,
 } from 'lucide-react';
+import { useControlHelpStore } from '../../store/useControlHelpStore';
 
 const { ipcRenderer, shell } = window.require('electron');
 
@@ -53,26 +47,6 @@ const COLORS = {
   peach: '#fab387',
 };
 
-const PRODUCT_URL = 'https://f9922.tech/noted-terminal';
-
-function openProductPage() {
-  void shell.openExternal(PRODUCT_URL);
-}
-
-const HOTKEYS = [
-  ['⌘ T', 'Новая вкладка'],
-  ['⌘ W', 'Закрыть текущую вкладку'],
-  ['⇧ ⌘ T', 'Вернуть последнюю закрытую вкладку'],
-  ['⌘ B', 'Показать или скрыть файлы проекта'],
-  ['⌘ ,', 'Открыть настройки'],
-  ['⌘ \\', 'Показать или скрыть Timeline'],
-  ['⌘ ]', 'Показать или скрыть историю'],
-  ['⌘ F', 'Поиск по открытому терминалу'],
-  ['⌥ V', 'Открыть библиотеку промптов'],
-  ['⌘ G', 'Открыть проект в GT Editor'],
-  ['⌘ + / −', 'Изменить общий масштаб текста'],
-];
-
 const RANGE_OPTIONS = [
   { minutes: 15, label: '15 минут' },
   { minutes: 60, label: '1 час' },
@@ -94,92 +68,21 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
   );
 }
 
-function ReferenceRow({
-  icon,
-  title,
-  description,
-  color,
-  onClick,
-}: {
-  icon: React.ReactNode;
-  title: string;
-  description: string;
-  color: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-label={`${title}: открыть описание на сайте`}
-      className="group"
-      style={{
-      display: 'grid',
-      gridTemplateColumns: '28px minmax(0, 1fr)',
-      gap: 10,
-      width: '100%',
-      padding: '11px 0',
-      border: 'none',
-      borderBottom: `1px solid ${COLORS.borderSoft}`,
-      background: 'transparent',
-      textAlign: 'left',
-      cursor: 'pointer',
-    }}>
-      <div style={{ color, paddingTop: 1, display: 'flex', justifyContent: 'center' }}>{icon}</div>
-      <div style={{ minWidth: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: COLORS.text, fontSize: 12.5, lineHeight: 1.35, fontWeight: 600 }}>
-          {title}
-          <ExternalLink size={11} color={COLORS.dim} />
-        </div>
-        <div style={{ color: COLORS.muted, fontSize: 11.5, lineHeight: 1.5, marginTop: 2 }}>{description}</div>
-      </div>
-    </button>
-  );
-}
-
-type HelpPageId = 'overview' | 'projects' | 'agent' | 'history' | 'external' | 'hotkeys';
-
-const HELP_PAGES: Array<{
-  id: HelpPageId;
-  label: string;
-  icon: React.ComponentType<{ size?: number; color?: string }>;
-}> = [
-  { id: 'overview', label: 'Обзор', icon: Activity },
-  { id: 'projects', label: 'Проекты и вкладки', icon: Workflow },
-  { id: 'agent', label: 'AI-сессии', icon: Command },
-  { id: 'history', label: 'Timeline и History', icon: History },
-  { id: 'external', label: 'Внешнее управление', icon: ExternalLink },
-  { id: 'hotkeys', label: 'Горячие клавиши', icon: Keyboard },
-];
-
-function HelpPageHeader({ title, description }: { title: string; description: string }) {
-  return (
-    <header style={{ paddingBottom: 18, borderBottom: `1px solid ${COLORS.borderSoft}` }}>
-      <h2 style={{ margin: 0, color: COLORS.text, fontSize: 18, lineHeight: 1.3, fontWeight: 680 }}>{title}</h2>
-      <p style={{ margin: '7px 0 0', maxWidth: 720, color: COLORS.muted, fontSize: 12.5, lineHeight: 1.55 }}>{description}</p>
-    </header>
-  );
-}
-
-function HelpRule({
-  title,
-  children,
-  accent = COLORS.sapphire,
-}: {
-  title: string;
-  children: React.ReactNode;
-  accent?: string;
-}) {
-  return (
-    <div style={{ display: 'grid', gridTemplateColumns: '3px minmax(0, 1fr)', gap: 12, padding: '13px 0', borderBottom: `1px solid ${COLORS.borderSoft}` }}>
-      <span style={{ width: 3, minHeight: 28, borderRadius: 2, background: accent }} />
-      <div>
-        <div style={{ color: COLORS.text, fontSize: 12.5, lineHeight: 1.4, fontWeight: 650 }}>{title}</div>
-        <div style={{ marginTop: 4, color: COLORS.muted, fontSize: 11.5, lineHeight: 1.55 }}>{children}</div>
-      </div>
-    </div>
-  );
-}
+const COMPLEX_HELP_TOPICS = [
+  {
+    id: 'restart-after',
+    label: 'Restart after',
+    title: 'Перезапуск после работы AI-вкладки',
+    summary: 'Привязывает terminal/dev-server вкладку к штатному завершению работы одной или нескольких AI-вкладок и запускает выбранную команду.',
+    steps: [
+      'Откройте контекстное меню terminal/dev-server вкладки и в Restart after выберите AI-вкладки, окончания которых нужно ждать.',
+      'В Script выберите команду. Если команда не выбрана явно, интерфейс может использовать последнюю подходящую команду этой вкладки.',
+      'После настройки на вкладке появляется фиолетовая кнопка ручного запуска и отдельная кнопка паузы. Пауза сохраняет настройки, но временно отключает автозапуск.',
+    ],
+    note: 'Cmd+click по фиолетовой кнопке удаляет настройку Restart after. У обычной зелёной dev-server вкладки без этой настройки Cmd+click на том же месте останавливает процесс.',
+    videoLabel: 'Restart after',
+  },
+] as const;
 
 function DiagnosticExportDialog({ onClose }: { onClose: () => void }) {
   const [rangeMinutes, setRangeMinutes] = useState(60);
@@ -458,13 +361,15 @@ function DiagnosticExportDialog({ onClose }: { onClose: () => void }) {
 
 export default function HelpModal({ isOpen, onClose }: HelpModalProps) {
   const [diagnosticOpen, setDiagnosticOpen] = useState(false);
-  const [page, setPage] = useState<HelpPageId>('overview');
+  const [activeTopicId, setActiveTopicId] = useState<string>(COMPLEX_HELP_TOPICS[0].id);
+  const hintsEnabled = useControlHelpStore((state) => state.enabled);
+  const setHintsEnabled = useControlHelpStore((state) => state.setEnabled);
   const overlayRef = useRef<HTMLDivElement>(null);
+  const activeTopic = COMPLEX_HELP_TOPICS.find((topic) => topic.id === activeTopicId) || COMPLEX_HELP_TOPICS[0];
 
   useEffect(() => {
     if (!isOpen) {
       setDiagnosticOpen(false);
-      setPage('overview');
     }
   }, [isOpen]);
 
@@ -585,46 +490,8 @@ export default function HelpModal({ isOpen, onClose }: HelpModalProps) {
           </div>
         </div>
 
-        <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-          <nav aria-label="Разделы справки" style={{ width: 184, flexShrink: 0, padding: '14px 10px', overflowY: 'auto', borderRight: `1px solid ${COLORS.borderSoft}`, background: '#15171b' }}>
-            {HELP_PAGES.map((item) => {
-              const active = page === item.id;
-              const Icon = item.icon;
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  aria-current={active ? 'page' : undefined}
-                  onClick={() => setPage(item.id)}
-                  className="hover:bg-white/[0.05]"
-                  style={{
-                    width: '100%',
-                    minHeight: 36,
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 9,
-                    padding: '7px 9px',
-                    border: 'none',
-                    borderRadius: 5,
-                    background: active ? 'rgba(116, 199, 236, 0.12)' : 'transparent',
-                    color: active ? COLORS.sapphire : COLORS.muted,
-                    textAlign: 'left',
-                    fontSize: 11.5,
-                    lineHeight: 1.3,
-                    fontWeight: active ? 650 : 500,
-                    cursor: 'pointer',
-                  }}
-                >
-                  <Icon size={14} color={active ? COLORS.sapphire : COLORS.dim} />
-                  <span>{item.label}</span>
-                </button>
-              );
-            })}
-          </nav>
-
-          <div style={{ flex: 1, overflowY: 'auto', minWidth: 0 }}>
-            <div style={{ width: 'min(740px, calc(100% - 40px))', margin: '0 auto', padding: '26px 0 34px' }}>
-              {page === 'overview' && <>
+        <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
+          <div style={{ width: 'min(800px, calc(100% - 40px))', margin: '0 auto', padding: '26px 0 34px' }}>
               <section>
               <SectionTitle>Модель продукта</SectionTitle>
               <p style={{ margin: '8px 0 0', maxWidth: 780, color: COLORS.muted, fontSize: 12.5, lineHeight: 1.6 }}>
@@ -680,10 +547,42 @@ export default function HelpModal({ isOpen, onClose }: HelpModalProps) {
               <section style={{ marginTop: 28, paddingTop: 24, borderTop: `1px solid ${COLORS.borderSoft}` }}>
               <div className="grid grid-cols-1 min-[760px]:grid-cols-[minmax(0,1fr)_minmax(240px,330px)]" style={{ gap: 30, alignItems: 'center' }}>
                 <div>
-                  <SectionTitle>Подсказки интерфейса</SectionTitle>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 14 }}>
+                    <SectionTitle>Подсказки интерфейса</SectionTitle>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={hintsEnabled}
+                      data-testid="control-hints-toggle"
+                      aria-label={hintsEnabled ? 'Выключить подсказки интерфейса' : 'Включить подсказки интерфейса'}
+                      onClick={() => setHintsEnabled(!hintsEnabled)}
+                      style={{
+                        width: 32,
+                        height: 18,
+                        padding: 2,
+                        display: 'flex',
+                        justifyContent: hintsEnabled ? 'flex-end' : 'flex-start',
+                        flexShrink: 0,
+                        border: 'none',
+                        borderRadius: 9,
+                        background: hintsEnabled ? 'rgba(116, 199, 236, 0.38)' : '#343941',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <span
+                        aria-hidden="true"
+                        style={{
+                          width: 14,
+                          height: 14,
+                          borderRadius: '50%',
+                          background: hintsEnabled ? COLORS.sapphire : '#858d98',
+                        }}
+                      />
+                    </button>
+                  </div>
                   <div style={{ display: 'flex', gap: 10, marginTop: 10, color: COLORS.muted, fontSize: 12, lineHeight: 1.55 }}>
                     <MousePointer2 size={17} color={COLORS.sapphire} style={{ flexShrink: 0, marginTop: 1 }} />
-                    <span>Откройте меню <strong style={{ color: COLORS.text }}>?</strong> и включите «Подсказки интерфейса». После этого наведение на контрол покажет его действие. Escape выключает режим.</span>
+                    <span>Наведите курсор на обычный контрол и удерживайте Cmd. Сложные preview и элементы со своим Cmd-действием продолжают работать в собственном режиме.</span>
                   </div>
                 </div>
                 <div style={{
@@ -701,164 +600,98 @@ export default function HelpModal({ isOpen, onClose }: HelpModalProps) {
                   color: COLORS.dim,
                 }}>
                   <Play size={17} color={COLORS.sapphire} fill="currentColor" />
-                  <div style={{ fontSize: 11.5, fontWeight: 600 }}>Режим подсказок</div>
+                  <div style={{ fontSize: 11.5, fontWeight: 600 }}>Cmd + hover</div>
                   <div style={{ fontSize: 10.5 }}>место для короткого видео</div>
                 </div>
               </div>
             </section>
 
             <section style={{ marginTop: 28, paddingTop: 24, borderTop: `1px solid ${COLORS.borderSoft}` }}>
-              <SectionTitle>Ключевые операции</SectionTitle>
-              <div className="grid grid-cols-1 min-[720px]:grid-cols-2" style={{ columnGap: 30, marginTop: 8 }}>
-                <ReferenceRow
-                  icon={<History size={17} />}
-                  title="Timeline / History"
-                  description="Активная ветка и структурированный transcript вместо сырого terminal scrollback."
-                  color={COLORS.sapphire}
-                  onClick={openProductPage}
-                />
-                <ReferenceRow
-                  icon={<GitFork size={17} />}
-                  title="Fork"
-                  description="Новая вкладка с копией истории; исходная сессия не меняется."
-                  color={COLORS.green}
-                  onClick={openProductPage}
-                />
-                <ReferenceRow
-                  icon={<RotateCcw size={17} />}
-                  title="Rewind"
-                  description="Возврат к выбранной итерации и продолжение с другой точки."
-                  color={COLORS.peach}
-                  onClick={openProductPage}
-                />
-                <ReferenceRow
-                  icon={<Scissors size={17} />}
-                  title="Edit Range"
-                  description="Замена шумного диапазона истории компактным summary."
-                  color="#c4b5fd"
-                  onClick={openProductPage}
-                />
-                <ReferenceRow
-                  icon={<ListPlus size={17} />}
-                  title="Run after"
-                  description="Event-driven очередь prompt'ов, в том числе после завершения другой вкладки."
-                  color="#f5a3bb"
-                  onClick={openProductPage}
-                />
-                <ReferenceRow
-                  icon={<Square size={17} />}
-                  title="Interrupt / Stop process"
-                  description="Остановка текущего turn и завершение процесса остаются разными командами."
-                  color="#f38ba8"
-                  onClick={openProductPage}
-                />
+              <SectionTitle>Сложные сценарии</SectionTitle>
+              <p style={{ margin: '7px 0 0', color: COLORS.muted, fontSize: 11.5, lineHeight: 1.5 }}>
+                Здесь собраны действия, которые состоят из нескольких шагов и не помещаются в короткую подсказку.
+              </p>
+
+              <div
+                role="tablist"
+                aria-label="Сложные сценарии"
+                style={{
+                  display: 'flex',
+                  gap: 18,
+                  marginTop: 15,
+                  overflowX: 'auto',
+                  borderBottom: `1px solid ${COLORS.borderSoft}`,
+                }}
+              >
+                {COMPLEX_HELP_TOPICS.map((topic) => {
+                  const selected = topic.id === activeTopic.id;
+                  return (
+                    <button
+                      key={topic.id}
+                      type="button"
+                      role="tab"
+                      aria-selected={selected}
+                      onClick={() => setActiveTopicId(topic.id)}
+                      style={{
+                        minHeight: 34,
+                        padding: '0 1px',
+                        flexShrink: 0,
+                        border: 'none',
+                        borderBottom: `2px solid ${selected ? COLORS.sapphire : 'transparent'}`,
+                        background: 'transparent',
+                        color: selected ? COLORS.text : COLORS.muted,
+                        fontSize: 12,
+                        fontWeight: selected ? 650 : 500,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {topic.label}
+                    </button>
+                  );
+                })}
               </div>
-              </section>
-              </>}
 
-              {page === 'projects' && (
-                <article>
-                  <HelpPageHeader
-                    title="Проекты и вкладки"
-                    description="Основные жесты для навигации, группировки и управления живыми процессами."
-                  />
-                  <HelpRule title="Проект в верхней строке">
-                    Клик открывает проект, двойной клик переименовывает, средняя кнопка закрывает. Вкладки можно перетаскивать между проектами.
-                  </HelpRule>
-                  <HelpRule title="Выбор вкладок" accent={COLORS.green}>
-                    Обычный клик переключает вкладку. Cmd+click добавляет её в multi-select, Shift+click выбирает диапазон. Двойной клик переименовывает, ПКМ открывает операции вкладки и группы.
-                  </HelpRule>
-                  <HelpRule title="Restart, Stop и Close" accent={COLORS.peach}>
-                    Restart перезапускает команду. На правой кнопке dev-server Cmd+click останавливает процесс без перезапуска. Close удаляет саму вкладку; это другая операция.
-                  </HelpRule>
-                  <HelpRule title="Run after" accent="#f5a3bb">
-                    Очередь может ждать штатного завершения текущей или другой AI-вкладки. Cmd+click на правой process-кнопке в этом режиме удаляет подписку, а не останавливает процесс.
-                  </HelpRule>
-                </article>
-              )}
-
-              {page === 'agent' && (
-                <article>
-                  <HelpPageHeader
-                    title="AI-сессии"
-                    description="Нижняя панель управляет текущим живым Claude/Codex, а не отдельным API-чатом."
-                  />
-                  <HelpRule title="Start / Continue / Stop process">
-                    Start запускает CLI, Continue восстанавливает сессию, Stop process завершает процесс. Последнее не равно прерыванию только текущего ответа.
-                  </HelpRule>
-                  <HelpRule title="Prompt, copy и dictation" accent={COLORS.green}>
-                    Copy оставляет текст в поле; +clear копирует и очищает. Кнопка микрофона запускает и завершает запись; Cmd+click открывает её историю.
-                  </HelpRule>
-                  <HelpRule title="Enter и ^C" accent={COLORS.peach}>
-                    Enter отправляет текущий ввод в TUI. `^C` передаёт управляющую клавишу в сам CLI: результат зависит от текущего экрана и не равен Stop process.
-                  </HelpRule>
-                  <HelpRule title="Model, effort и busy reset" accent="#c4b5fd">
-                    Меню model/provider открываются наведением и закрепляются кликом. Busy reset сбрасывает только локальную блокировку UI; он не доказывает завершение и не отменяет команду.
-                  </HelpRule>
-                </article>
-              )}
-
-              {page === 'history' && (
-                <article>
-                  <HelpPageHeader
-                    title="Timeline и History"
-                    description="Timeline навигирует по активной ветке, History показывает тот же диалог как читаемый документ."
-                  />
-                  <HelpRule title="Запись Timeline">
-                    Клик прокручивает к точке в Terminal или History. Cmd+click гарантированно открывает History. Двойной клик начинает выбор диапазона, ПКМ открывает операции.
-                  </HelpRule>
-                  <HelpRule title="Rich preview" accent={COLORS.green}>
-                    Cmd+hover на записи, заметке или маркере открывает содержимое. Cmd+Shift закрепляет окно. Это отдельный режим, поэтому короткая подсказка `?` на том же триггере не показывается.
-                  </HelpRule>
-                  <HelpRule title="Range, Rewind и Compact" accent={COLORS.peach}>
-                    Range выделяет часть истории для удаления или summary. Rewind возвращает сессию к выбранной точке. Alt+hover на Compact в History временно показывает summary, клик закрепляет.
-                  </HelpRule>
-                </article>
-              )}
-
-              {page === 'external' && (
-                <article>
-                  <HelpPageHeader
-                    title="Внешнее управление"
-                    description="Mobile, MCP и внешние API-клиенты управляют теми же вкладками и процессами, которые открыты на desktop."
-                  />
-                  <HelpRule title="Доставка и завершение">
-                    Факт доставки prompt не означает, что ответ готов. Готовность, busy, interrupt и жизнь процесса отделены и подтверждаются своими событиями.
-                  </HelpRule>
-                  <HelpRule title="MCP" accent={COLORS.green}>
-                    Журнал MCP в status bar показывает внешние запуски и позволяет вернуться к целевой вкладке. Terminal output остаётся fallback-каналом, а не доказательством завершения turn.
-                  </HelpRule>
-                  <HelpRule title="Remote URL и диагностика" accent={COLORS.peach}>
-                    URL открывает mobile surface; ПКМ копирует адрес вместе с токеном. При ошибке откройте `?` → «Открыть справку» → «Создать TXT с логами».
-                  </HelpRule>
-                </article>
-              )}
-
-              {page === 'hotkeys' && (
-                <section>
-                  <HelpPageHeader
-                    title="Горячие клавиши"
-                    description="Глобальная навигация и действия текущего workspace."
-                  />
-                  <div className="grid grid-cols-1 min-[700px]:grid-cols-2" style={{ columnGap: 28, marginTop: 12 }}>
-                    {HOTKEYS.map(([keys, label]) => (
-                      <div key={keys} style={{
-                        minHeight: 38,
-                        display: 'grid',
-                        gridTemplateColumns: '88px minmax(0, 1fr)',
-                        alignItems: 'center',
-                        gap: 10,
-                        borderBottom: `1px solid ${COLORS.borderSoft}`,
-                      }}>
-                        <kbd style={{ color: COLORS.text, fontSize: 11, fontFamily: 'inherit', fontWeight: 650 }}>{keys}</kbd>
-                        <span style={{ color: COLORS.muted, fontSize: 11.5, lineHeight: 1.35 }}>{label}</span>
-                      </div>
-                    ))}
+              <div className="grid grid-cols-1 min-[760px]:grid-cols-[minmax(0,1fr)_minmax(240px,330px)]" style={{ gap: 30, alignItems: 'start', marginTop: 18 }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <RotateCcw size={15} color={COLORS.peach} />
+                    <h3 style={{ margin: 0, color: COLORS.text, fontSize: 13.5, lineHeight: 1.4, fontWeight: 650 }}>
+                      {activeTopic.title}
+                    </h3>
                   </div>
-                </section>
-              )}
+                  <p style={{ margin: '8px 0 0', color: COLORS.muted, fontSize: 11.5, lineHeight: 1.55 }}>
+                    {activeTopic.summary}
+                  </p>
+                  <ol style={{ margin: '12px 0 0', paddingLeft: 19, color: COLORS.muted, fontSize: 11.5, lineHeight: 1.55 }}>
+                    {activeTopic.steps.map((step) => (
+                      <li key={step} style={{ marginTop: 6, paddingLeft: 3 }}>{step}</li>
+                    ))}
+                  </ol>
+                  <p style={{ margin: '13px 0 0', paddingTop: 12, borderTop: `1px solid ${COLORS.borderSoft}`, color: COLORS.peach, fontSize: 11.5, lineHeight: 1.55 }}>
+                    {activeTopic.note}
+                  </p>
+                </div>
 
-            </div>
+                <div style={{
+                  aspectRatio: '16 / 9',
+                  width: '100%',
+                  minHeight: 140,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 9,
+                  border: `1px dashed ${COLORS.border}`,
+                  borderRadius: 7,
+                  background: '#111318',
+                  color: COLORS.dim,
+                }}>
+                  <Play size={17} color={COLORS.peach} fill="currentColor" />
+                  <div style={{ fontSize: 11.5, fontWeight: 600 }}>{activeTopic.videoLabel}</div>
+                  <div style={{ fontSize: 10.5 }}>место для видео</div>
+                </div>
+              </div>
+            </section>
           </div>
         </div>
       </div>

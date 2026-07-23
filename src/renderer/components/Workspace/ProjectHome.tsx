@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect, startTransition } from 'react';
 import { useWorkspaceStore, TabColor, TabType, PendingAction } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
-import Tooltip from '../UI/Tooltip';
+import ControlHint from '../UI/ControlHint';
 // Fixed card widths so the wrap-grid stays uniform regardless of name length.
 // Without this, short labels (`tab-1`) sit next to long labels (`worker-search`)
 // and the column gutters drift — visually ragged. Cards use uniform width and
@@ -1594,7 +1594,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
             <div className="flex items-center gap-2 text-[#666] text-sm mt-1">
               <FolderOpen size={14} />
               <span className="text-[#555] italic">No directory selected</span>
-              <Tooltip content="Select project directory">
+              <ControlHint label="Выбрать директорию проекта">
               <button
                 onMouseDown={(e) => {
                   e.preventDefault(); // Prevent blur on input
@@ -1605,7 +1605,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
               >
                 <FolderOpen size={14} />
               </button>
-              </Tooltip>
+              </ControlHint>
             </div>
           </>
         ) : isEditingName && !isSystemProject ? (
@@ -1650,14 +1650,14 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
             <div className="flex items-center gap-2 text-[#666] text-sm mt-1">
               <FolderOpen size={14} />
               <span>{project.path.startsWith('__unset__') ? 'No path' : project.path}</span>
-              <Tooltip content="Change project directory">
+              <ControlHint label="Изменить директорию проекта">
               <button
                 onClick={handleChangeDirectory}
                 className="text-[#666] hover:text-[#999] cursor-pointer transition-colors p-0.5"
               >
                 <Pencil size={12} />
               </button>
-              </Tooltip>
+              </ControlHint>
             </div>
           </>
         ) : (
@@ -1666,7 +1666,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
             <div className="flex items-center gap-2 mb-1">
               <h1 className="text-xl text-white font-medium">{displayName}</h1>
               {!isSystemProject && (
-                <Tooltip content="Rename project">
+                <ControlHint label="Переименовать проект">
                 <button
                   onClick={() => {
                     setDraftName(project.name);
@@ -1680,21 +1680,21 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
                 >
                   <Pencil size={12} />
                 </button>
-                </Tooltip>
+                </ControlHint>
               )}
             </div>
             {!isSystemProject && (
               <div className="flex items-center gap-2 text-[#666] text-sm">
                 <FolderOpen size={14} />
                 <span>{project.path.startsWith('__unset__') ? 'No path' : project.path}</span>
-                <Tooltip content="Change project directory">
+                <ControlHint label="Изменить директорию проекта">
                 <button
                   onClick={handleChangeDirectory}
                   className="text-[#666] hover:text-[#999] cursor-pointer transition-colors p-0.5"
                 >
                   <Pencil size={12} />
                 </button>
-                </Tooltip>
+                </ControlHint>
               </div>
             )}
           </>

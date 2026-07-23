@@ -4,6 +4,14 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const { performance: nodePerformance } = require('node:perf_hooks');
+const {
+  buildHistoryRevision,
+  validateHistoryRevision,
+} = require('../history-revision');
+const {
+  deriveConfirmedClaudeSettings,
+  traceClaudeActiveBranch,
+} = require('../claude-confirmed-settings');
 
 let _projectManager = null;
 let _getClaudeEditableLastPromptState = null;
@@ -598,15 +606,35 @@ async function loadJsonlRecords(filePath) {
   try {
     stat = fs.statSync(filePath);
   } catch {
-    return { recordMap: new Map(), lastRecord: null, bridgeSessionId: null, progressEntries: [], queueOperations: [] };
+    return {
+      recordMap: new Map(),
+      lastRecord: null,
+      bridgeSessionId: null,
+      progressEntries: [],
+      queueOperations: [],
+      sourceSnapshot: null,
+    };
   }
 
   const cached = _jsonlCache.get(filePath);
   const sessionId = path.basename(filePath, '.jsonl');
+  const sourceSnapshot = {
+    filePath,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    sessionId,
+  };
 
   // ── Case 1: File unchanged → return cached result immediately ──────────────
   if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
-    return { recordMap: cached.recordMap, lastRecord: cached.lastRecord, bridgeSessionId: cached.bridgeSessionId, progressEntries: cached.progressEntries, queueOperations: cached.queueOperations || [] };
+    return {
+      recordMap: cached.recordMap,
+      lastRecord: cached.lastRecord,
+      bridgeSessionId: cached.bridgeSessionId,
+      progressEntries: cached.progressEntries,
+      queueOperations: cached.queueOperations || [],
+      sourceSnapshot,
+    };
   }
 
   // ── Case 2: File grew (normal for active sessions) → read ONLY new bytes ──
@@ -656,7 +684,14 @@ async function loadJsonlRecords(filePath) {
       });
     }
 
-    return { recordMap: cached.recordMap, lastRecord: newLastRecord, bridgeSessionId: newBridgeId, progressEntries: cached.progressEntries, queueOperations };
+    return {
+      recordMap: cached.recordMap,
+      lastRecord: newLastRecord,
+      bridgeSessionId: newBridgeId,
+      progressEntries: cached.progressEntries,
+      queueOperations,
+      sourceSnapshot,
+    };
   }
 
   // ── Case 3: First read or file shrunk (shouldn't happen for JSONL) → full read ──
@@ -677,7 +712,14 @@ async function loadJsonlRecords(filePath) {
     progressEntries, queueOperations, fileIndex, queueIndex
   });
 
-  return { recordMap, lastRecord, bridgeSessionId: bridgeSessionId || null, progressEntries, queueOperations };
+  return {
+    recordMap,
+    lastRecord,
+    bridgeSessionId: bridgeSessionId || null,
+    progressEntries,
+    queueOperations,
+    sourceSnapshot,
+  };
 }
 
 function _injectQueueOperationsIntoBranch(activeBranch, queueOperations) {
@@ -736,6 +778,7 @@ async function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
   const allProgressEntries = [];
   const allQueueOperations = [];
   const sessionBoundaries = [];
+  const historySources = [];
   let currentSessionId = sessionId;
   let lastRecord = null;
   let depth = 0;
@@ -747,7 +790,26 @@ async function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
       break;
     }
 
-    const { recordMap, lastRecord: fileLastRecord, bridgeSessionId, progressEntries, queueOperations } = await loadJsonlRecords(found.filePath);
+    const {
+      recordMap,
+      lastRecord: fileLastRecord,
+      bridgeSessionId,
+      progressEntries,
+      queueOperations,
+      sourceSnapshot,
+    } = await loadJsonlRecords(found.filePath);
+    const historySource = {
+      ...(sourceSnapshot || {
+        filePath: found.filePath,
+        size: 0,
+        mtimeMs: 0,
+        sessionId: currentSessionId,
+      }),
+      sessionId: currentSessionId,
+      parentSessionId: null,
+      linkKind: 'end',
+    };
+    historySources.push(historySource);
     if (progressEntries.length > 0) {
       allProgressEntries.push(...progressEntries);
     }
@@ -770,6 +832,8 @@ async function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
     // SessionChain load logged silently (use [Claude Export] logs for debug)
 
     if (bridgeSessionId) {
+      historySource.parentSessionId = bridgeSessionId;
+      historySource.linkKind = 'jsonl';
       sessionBoundaries.push({
         childSessionId: currentSessionId,
         parentSessionId: bridgeSessionId,
@@ -788,6 +852,8 @@ async function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
           if (!findSessionFile(parentId, cwd)) {
             console.warn('[SessionChain] SQLite link → parent', parentId.substring(0, 8), 'has no JSONL on disk — skipping (dead link)');
           } else {
+            historySource.parentSessionId = parentId;
+            historySource.linkKind = 'sqlite';
             console.log('[SessionChain] SQLite link:', currentSessionId.substring(0, 8) + '...', '→ parent:', parentId.substring(0, 8) + '...');
             sessionBoundaries.push({
               childSessionId: currentSessionId,
@@ -807,7 +873,14 @@ async function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
     depth++;
   }
 
-  return { mergedMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries, queueOperations: allQueueOperations };
+  return {
+    mergedMap,
+    lastRecord,
+    sessionBoundaries,
+    progressEntries: allProgressEntries,
+    queueOperations: allQueueOperations,
+    historySources,
+  };
 }
 
 // Find the latest (tip) session in a chain starting from a given session.
@@ -1029,6 +1102,7 @@ const _api = {
   forkSessionFile: null,   // ({sourceSessionId, cwd, skipChainResolve?}) → {success, newSessionId, forkEntryCount}
   editRange: null,         // ({sessionId, cwd, startUuid, endUuid, compactText}) → {success, removedCount, ...}
   deleteRange: null,       // ({sessionId, cwd, startUuid, endUuid}) → {success, removedCount, fileDeleted}
+  getConfirmedSettings: null, // ({tabId, sessionId?, cwd?}) → active-branch model/effort proof
 };
 
 function _normalizePromptStatusText(text) {
@@ -1072,6 +1146,52 @@ function _applyEditableLastPromptStatus(entries, promptState) {
   matchedEntry.statusReason = 'claude-native-rewind';
   matchedEntry.deliveryStatusSource = promptState.source || 'unknown';
   return matchedEntry;
+}
+
+function _claudeHistoryContext(promptState, discovery) {
+  return JSON.stringify({
+    discovery: discovery || null,
+    editableLastPrompt: promptState?.status === 'editable-last-prompt'
+      ? {
+        status: promptState.status,
+        targetUuid: String(promptState.targetUuid || ''),
+        source: String(promptState.source || ''),
+        targetTextHash: crypto
+          .createHash('sha256')
+          .update(_normalizePromptStatusText(promptState.targetText || ''))
+          .digest('hex'),
+      }
+      : null,
+  });
+}
+
+async function _validateClaudeHistoryTopology(sources, cwd) {
+  for (let index = 0; index < sources.length; index += 1) {
+    const source = sources[index];
+    const next = sources[index + 1] || null;
+
+    if (next) {
+      if (source.linkKind === 'end' ||
+          source.parentSessionId !== next.sessionId) {
+        return false;
+      }
+      const foundParent = findSessionFile(next.sessionId, cwd);
+      if (!foundParent || path.resolve(foundParent.filePath) !== path.resolve(next.filePath)) {
+        return false;
+      }
+    }
+
+    if (source.linkKind === 'sqlite') {
+      const currentParent = _projectManager?.db?.getSessionParent?.(source.sessionId) || null;
+      if (currentParent !== source.parentSessionId) return false;
+    } else if (source.linkKind === 'end') {
+      const currentParent = _projectManager?.db?.getSessionParent?.(source.sessionId) || null;
+      // A dead SQLite link is intentionally ignored by resolveSessionChain. It
+      // becomes topology only once its target JSONL really exists.
+      if (currentParent && findSessionFile(currentParent, cwd)) return false;
+    }
+  }
+  return true;
 }
 
 function register({ projectManager, formatToolAction, getClaudeEditableLastPromptState }) {
@@ -3717,14 +3837,169 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
     }
   });
 
+  _api.getConfirmedSettings = async function ({
+    tabId,
+    sessionId: requestedSessionId,
+    cwd: requestedCwd,
+  } = {}) {
+    const cleanTabId = String(tabId || '').trim();
+    let sessionId = String(requestedSessionId || '').trim() || null;
+    let cwd = String(requestedCwd || '').trim() || null;
+
+    if (cleanTabId) {
+      let row = null;
+      try {
+        row = projectManager?.db?.db?.prepare(
+          'SELECT claude_session_id, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
+        ).get(cleanTabId) || null;
+      } catch (error) {
+        return {
+          success: false,
+          reason: 'tab-lookup-failed',
+          error: error?.message || String(error),
+        };
+      }
+      const boundSessionId = String(row?.claude_session_id || '').trim() || null;
+      if (sessionId && boundSessionId && sessionId !== boundSessionId) {
+        return {
+          success: false,
+          reason: 'stale-session',
+          sessionId: boundSessionId,
+          requestedSessionId: sessionId,
+        };
+      }
+      sessionId = boundSessionId || sessionId;
+      cwd = String(row?.cwd || '').trim() || cwd;
+    }
+
+    if (!sessionId) {
+      return { success: false, reason: 'session-missing', sessionId: null };
+    }
+
+    try {
+      const {
+        mergedMap: recordMap,
+        lastRecord,
+        sessionBoundaries,
+      } = await resolveSessionChain(sessionId, cwd);
+      if (!lastRecord) {
+        return {
+          success: true,
+          sessionId,
+          model: null,
+          effort: null,
+          proof: 'active-jsonl-branch',
+        };
+      }
+      const { activeBranch } = traceClaudeActiveBranch({
+        recordMap,
+        lastRecord,
+        sessionBoundaries,
+        log: (message) => console.log(
+          '[ClaudeConfirmedSettings:Backtrace] tab='
+          + (cleanTabId ? cleanTabId.slice(-12) : '-')
+          + ' '
+          + message
+        ),
+      });
+      const confirmed = deriveConfirmedClaudeSettings(activeBranch);
+      return {
+        success: true,
+        sessionId,
+        latestSessionId: resolveLatestSessionInChain(sessionId, cwd),
+        model: confirmed?.model?.value || null,
+        effort: confirmed?.effort?.value || null,
+        modelProofAt: confirmed?.model?.proofAt || 0,
+        effortProofAt: confirmed?.effort?.proofAt || 0,
+        modelProofSessionId: confirmed?.model?.proofSessionId || null,
+        effortProofSessionId: confirmed?.effort?.proofSessionId || null,
+        proof: 'active-jsonl-branch',
+      };
+    } catch (error) {
+      return {
+        success: false,
+        reason: 'settings-read-failed',
+        sessionId,
+        error: error?.message || String(error),
+      };
+    }
+  };
+
+  ipcMain.handle(
+    'claude:get-confirmed-settings',
+    (_event, payload = {}) => _api.getConfirmedSettings(payload)
+  );
+
   // Get full chat history for History Panel (structured entries, not markdown)
-  ipcMain.handle('claude:get-full-history', async (event, { sessionId, cwd, tabId }) => {
+  ipcMain.handle('claude:get-full-history', async (event, payload = {}) => {
+    const { sessionId, cwd, tabId, ifRevision } = payload;
     if (!sessionId) {
       return { success: false, error: 'No session ID provided' };
     }
 
     try {
-      const { mergedMap: recordMap, lastRecord, sessionBoundaries, progressEntries: allProgressEntries, queueOperations: allQueueOperations } = await resolveSessionChain(sessionId, cwd);
+      let editablePromptState = null;
+      let promptStateLookupFailed = false;
+      if (tabId && _getClaudeEditableLastPromptState) {
+        try {
+          editablePromptState = await _getClaudeEditableLastPromptState(
+            tabId,
+            'claude-get-full-history-revision'
+          );
+        } catch (e) {
+          promptStateLookupFailed = true;
+          console.warn('[FullHistory:Revision] prompt state lookup failed tab=' +
+            String(tabId).slice(-12) + ' error=' + (e?.message || e));
+        }
+      }
+      // A resume/fork child can appear without changing the source JSONL. A new
+      // child changes the project directory metadata, so keep that cheap witness
+      // in the revision instead of rescanning every JSONL head on every tab switch.
+      const primaryFound = findSessionFile(sessionId, cwd);
+      let discovery = null;
+      if (primaryFound?.projectDir) {
+        try {
+          const stat = await fs.promises.stat(primaryFound.projectDir);
+          discovery = {
+            projectDir: path.resolve(primaryFound.projectDir),
+            mtimeMs: stat.mtimeMs,
+          };
+        } catch {}
+      }
+      const revisionContext = _claudeHistoryContext(editablePromptState, discovery);
+
+      if (ifRevision && !promptStateLookupFailed) {
+        const validation = await validateHistoryRevision(
+          ifRevision,
+          { toolType: 'claude', sessionId, cwd },
+          {
+            context: revisionContext,
+            resolvePrimaryFile: async () => primaryFound?.filePath || null,
+            validateTopology: (sources) => _validateClaudeHistoryTopology(sources, cwd),
+          }
+        );
+        if (validation.unchanged) {
+          return {
+            success: true,
+            unchanged: true,
+            revision: ifRevision,
+          };
+        }
+      }
+
+      const {
+        mergedMap: recordMap,
+        lastRecord,
+        sessionBoundaries,
+        progressEntries: allProgressEntries,
+        queueOperations: allQueueOperations,
+        historySources,
+      } = await resolveSessionChain(sessionId, cwd);
+      const revision = buildHistoryRevision(
+        { toolType: 'claude', sessionId, cwd },
+        historySources,
+        { context: revisionContext }
+      );
 
       // Build progress entries index by parentToolUseID
       const progressByToolUseId = new Map();
@@ -3735,154 +4010,27 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       }
 
       if (!lastRecord) {
-        return { success: true, entries: [], latestSessionId: sessionId };
+        return {
+          success: true,
+          entries: [],
+          latestSessionId: sessionId,
+          revision,
+        };
       }
 
-      // BACKTRACE: Walk backwards from the last record following parentUuid
-      const activeBranch = [];
-      let currentUuid = lastRecord.uuid;
-      const seen = new Set();
-      // First-orphan boundary uuid — last entry the live Claude process still
-      // sees via its OWN backtrace. UI greys entries before this point to show
-      // user what Claude actually has in context vs what's just on disk.
-      let _firstOrphanRecoveredFromUuid = null;
-
-      while (currentUuid && !seen.has(currentUuid)) {
-        seen.add(currentUuid);
-        const record = recordMap.get(currentUuid);
-        if (!record) {
-          let recovered = false;
-          if (activeBranch.length > 0) {
-            const lastAdded = activeBranch[0];
-            if (lastAdded.type === 'system' && lastAdded.subtype === 'compact_boundary' &&
-                lastAdded.logicalParentUuid === currentUuid) {
-              if (lastAdded.parentUuid && recordMap.has(lastAdded.parentUuid) && !seen.has(lastAdded.parentUuid)) {
-                currentUuid = lastAdded.parentUuid;
-                recovered = true;
-              } else {
-                let bestPred = null;
-                for (const [uuid, entry] of recordMap) {
-                  if (seen.has(uuid)) continue;
-                  if (entry._fromFile === lastAdded._fromFile &&
-                      entry._fileIndex < lastAdded._fileIndex) {
-                    if (!bestPred || entry._fileIndex > bestPred._fileIndex) {
-                      bestPred = entry;
-                    }
-                  }
-                }
-                if (bestPred) {
-                  currentUuid = bestPred.uuid;
-                  recovered = true;
-                }
-              }
-            }
-            // Generic CHAIN BREAK recovery — same logic as claude:get-timeline.
-            // Slash-command assistant replies + attachment virtual parents are not
-            // written to JSONL; following user-prompt references a phantom uuid.
-            // Without this, history panel and Claude TUI both stop at the orphan
-            // and lose every pre-orphan turn.
-            if (!recovered) {
-              let bestPred = null;
-              for (const [uuid, entry] of recordMap) {
-                if (seen.has(uuid)) continue;
-                if (entry._fromFile === lastAdded._fromFile &&
-                    typeof entry._fileIndex === 'number' &&
-                    typeof lastAdded._fileIndex === 'number' &&
-                    entry._fileIndex < lastAdded._fileIndex) {
-                  if (!bestPred || entry._fileIndex > bestPred._fileIndex) {
-                    bestPred = entry;
-                  }
-                }
-              }
-              if (bestPred) {
-                console.log('[FullHistory:Backtrace] CHAIN BREAK recovery: ' + currentUuid.substring(0, 8) + ' missing, jumping to ' + bestPred.uuid.substring(0, 8) + ' (fileIdx ' + bestPred._fileIndex + ', type=' + bestPred.type + ')');
-
-                // Same post-compact-attachment-init suppression as in
-                // claude:get-timeline above. If the orphan is an attachment
-                // and a compact_boundary sits nearby, this is Claude's own
-                // session init backfill, not data loss — don't surface it
-                // via claudeMemoryBoundaryUuid.
-                let isPostCompactInit = false;
-                if (lastAdded.type === 'attachment') {
-                  const predIdx = bestPred._fileIndex;
-                  for (const [, entry] of recordMap) {
-                    if (entry._fromFile !== bestPred._fromFile) continue;
-                    if (typeof entry._fileIndex !== 'number') continue;
-                    if (entry._fileIndex < predIdx - 10 || entry._fileIndex > lastAdded._fileIndex) continue;
-                    if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
-                      isPostCompactInit = true;
-                      break;
-                    }
-                  }
-                }
-
-                if (!isPostCompactInit && _firstOrphanRecoveredFromUuid === null) {
-                  _firstOrphanRecoveredFromUuid = lastAdded.uuid;
-                }
-                currentUuid = bestPred.uuid;
-                recovered = true;
-              }
-            }
-          }
-          if (recovered) continue;
-          break;
-        }
-
-        activeBranch.unshift(record);
-
-        let nextUuid = record.logicalParentUuid || record.parentUuid;
-
-        // Compact passthrough — see same comment in claude:get-timeline above.
-        // Manual /compact is not a UUID corruption: just jump to physical
-        // predecessor in the same file to keep pre-compact entries visible.
-        if (record.type === 'system' && record.subtype === 'compact_boundary') {
-          const isDeadEnd = !nextUuid || seen.has(nextUuid) || !recordMap.has(nextUuid);
-          if (isDeadEnd) {
-            let bestPred = null;
-            for (const [uuid, entry] of recordMap) {
-              if (seen.has(uuid)) continue;
-              if (entry._fromFile === record._fromFile &&
-                  typeof entry._fileIndex === 'number' &&
-                  typeof record._fileIndex === 'number' &&
-                  entry._fileIndex < record._fileIndex) {
-                if (!bestPred || entry._fileIndex > bestPred._fileIndex) {
-                  bestPred = entry;
-                }
-              }
-            }
-            if (bestPred) {
-              nextUuid = bestPred.uuid;
-              console.log('[FullHistory:Backtrace] Compact passthrough: compact=' + record.uuid.substring(0, 8) + ' fileIdx=' + record._fileIndex + ' → predecessor=' + bestPred.uuid.substring(0, 8) + ' fileIdx=' + bestPred._fileIndex);
-            }
-          }
-        }
-
-        if (!nextUuid && sessionBoundaries.length > 0) {
-          for (const [uuid, entry] of recordMap) {
-            if (seen.has(uuid)) continue;
-            if (entry._isBridge && entry.parentUuid && entry.sessionId !== record.sessionId &&
-                !seen.has(entry.parentUuid)) {
-              nextUuid = entry.parentUuid;
-              break;
-            }
-          }
-          if (!nextUuid && record.sessionId) {
-            const boundary = sessionBoundaries.find(b => b.childSessionId === record.sessionId);
-            if (boundary) {
-              let parentLast = null;
-              for (const [uuid, entry] of recordMap) {
-                if (seen.has(uuid)) continue;
-                if (entry._fromFile === boundary.parentSessionId) {
-                  if (!parentLast || entry._fileIndex > parentLast._fileIndex) parentLast = entry;
-                }
-              }
-              if (parentLast) nextUuid = parentLast.uuid;
-            }
-          }
-        }
-
-        currentUuid = nextUuid;
-      }
+      // Full History and confirmed session settings must walk one identical
+      // logical branch. Rewind leaves abandoned records physically on disk, so
+      // a second "scan the last lines" implementation would eventually disagree
+      // with the conversation shown to the user.
+      const {
+        activeBranch,
+        firstOrphanRecoveredFromUuid: _firstOrphanRecoveredFromUuid,
+      } = traceClaudeActiveBranch({
+        recordMap,
+        lastRecord,
+        sessionBoundaries,
+        log: (message) => console.log('[FullHistory:Backtrace] ' + message),
+      });
 
       // Format tool action label (standalone, no includeCode dependency)
       const mkFileAction = (toolName, input) => {
@@ -4276,10 +4424,9 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       const latestSessionId = resolveLatestSessionInChain(sessionId, cwd);
 
       let editableLastPromptStatus = null;
-      if (tabId && _getClaudeEditableLastPromptState) {
+      if (tabId && editablePromptState) {
         try {
-          const promptState = await _getClaudeEditableLastPromptState(tabId, 'claude-get-full-history');
-          const matched = _applyEditableLastPromptStatus(entries, promptState);
+          const matched = _applyEditableLastPromptStatus(entries, editablePromptState);
           if (matched) {
             editableLastPromptStatus = {
               uuid: matched.uuid,
@@ -4298,7 +4445,15 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         }
       }
 
-      return { success: true, entries, latestSessionId, claudeMemoryBoundaryUuid: _firstOrphanRecoveredFromUuid, editableLastPromptStatus };
+      return {
+        success: true,
+        unchanged: false,
+        entries,
+        latestSessionId,
+        claudeMemoryBoundaryUuid: _firstOrphanRecoveredFromUuid,
+        editableLastPromptStatus,
+        revision,
+      };
     } catch (error) {
       console.error('[Claude FullHistory] Error:', error);
       return { success: false, error: error.message };

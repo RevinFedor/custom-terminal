@@ -1,4 +1,12 @@
 import { create } from 'zustand';
+import {
+  buildPromptImagePayload,
+  collectPromptImageRefIds,
+  getPromptImageAttachmentState,
+  getPromptImageMarkerHighlightRanges,
+  hasMalformedPromptImageMarker,
+  retainPromptImageRefsForText,
+} from '../utils/promptImageAttachments.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -160,21 +168,8 @@ export type QueuedPrompt = {
   createdAt: number;
 };
 
-const VALID_IMAGE_MARKER_SOURCE = String.raw`(?<!\\)\[Image\s+#?(\d+)\]`;
-
-function createValidImageMarkerRegex(): RegExp {
-  return new RegExp(VALID_IMAGE_MARKER_SOURCE, 'gi');
-}
-
 function collectClaudeImageRefIds(text: string): Set<number> {
-  const ids = new Set<number>();
-  const re = createValidImageMarkerRegex();
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text)) !== null) {
-    const id = Number(match[1]);
-    if (Number.isFinite(id)) ids.add(id);
-  }
-  return ids;
+  return collectPromptImageRefIds(text) as Set<number>;
 }
 
 export type QueuedImageMarkerRange = {
@@ -187,43 +182,18 @@ export function getQueuedImageMarkerHighlightRanges(
   text: string,
   imagePaths?: QueuedImageRef[],
 ): QueuedImageMarkerRange[] {
-  const refsById = new Map((imagePaths || []).map((ref) => [Number(ref.id), ref]));
-  const ranges: QueuedImageMarkerRange[] = [];
-  const re = createValidImageMarkerRegex();
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text)) !== null) {
-    const id = Number(match[1]);
-    const ref = refsById.get(id);
-    if (!ref?.path || ref.availability === 'missing') continue;
-    ranges.push({ start: match.index, end: match.index + match[0].length, id });
-  }
-  return ranges;
+  return getPromptImageMarkerHighlightRanges(text, imagePaths || []) as QueuedImageMarkerRange[];
 }
 
 export function hasMalformedQueuedImageMarker(
   text: string,
   imagePaths?: QueuedImageRef[],
 ): boolean {
-  const refs = imagePaths || [];
-  const knownIds = new Set(refs.map((ref) => Number(ref.id)));
-  const validIds = collectClaudeImageRefIds(text);
-  if (Array.from(validIds).some((id) => !knownIds.has(id))) return true;
-
-  const withoutValidMarkers = text.replace(createValidImageMarkerRegex(), '');
-  if (/\[\s*Image\b/i.test(withoutValidMarkers)) return true;
-  if (/(?:^|[^\[])\bImage\s+#?\d+\s*\]/i.test(withoutValidMarkers)) return true;
-  return refs.some((ref) => {
-    if (validIds.has(Number(ref.id))) return false;
-    return new RegExp(String.raw`\bImage\s+#?${Number(ref.id)}\b`, 'i').test(withoutValidMarkers);
-  });
+  return hasMalformedPromptImageMarker(text, imagePaths || []);
 }
 
 function retainImagePathsForText(text: string, imagePaths?: QueuedImageRef[]): QueuedImageRef[] | undefined {
-  if (!imagePaths || imagePaths.length === 0) return undefined;
-  if (hasMalformedQueuedImageMarker(text, imagePaths)) return imagePaths;
-  const ids = collectClaudeImageRefIds(text);
-  if (ids.size === 0) return undefined;
-  const retained = imagePaths.filter((ref) => ids.has(ref.id));
+  const retained = retainPromptImageRefsForText(text, imagePaths || []) as QueuedImageRef[];
   return retained.length > 0 ? retained : undefined;
 }
 
@@ -269,36 +239,13 @@ function normalizeImagePathMarkersForQueue(text: string, imagePaths?: QueuedImag
 }
 
 export function buildQueuedPromptPayload(item: Pick<QueuedPrompt, 'text' | 'imagePaths'>): string {
-  const imagePaths = item.imagePaths || [];
-  const byId = new Map<number, QueuedImageRef>();
-  for (const ref of imagePaths) byId.set(ref.id, ref);
-
-  return item.text.replace(/\[Image\s+#?(\d+)\]/gi, (_match, rawId) => {
-    const id = Number(rawId);
-    const resolved = byId.get(id);
-    if (!resolved?.path || resolved.availability === 'missing') {
-      return `[imageError: queued_image_path_unavailable #${rawId}]`;
-    }
-    return `[imagePath: ${resolved.path}]`;
-  }).replace(/\[Image\s*\]/gi, '[imageError: queued_image_path_unavailable #unknown]');
+  return buildPromptImagePayload(item.text, item.imagePaths || []);
 }
 
 export function getQueuedPromptAttachmentState(
   item: Pick<QueuedPrompt, 'text' | 'images' | 'imagePaths' | 'attachmentState'>,
 ): QueuedPromptAttachmentState {
-  if (item.attachmentState === 'materializing') return 'materializing';
-  if (item.attachmentState === 'missing') return 'missing';
-  if (item.images > 0 && /\[imageError:\s*[^\]\r\n]+\]/i.test(item.text)) return 'missing';
-  if (hasMalformedQueuedImageMarker(item.text, item.imagePaths)) return 'missing';
-  if (/\[Image\s*\]/i.test(item.text)) return 'missing';
-  const ids = collectClaudeImageRefIds(item.text);
-  if (ids.size === 0) return 'ready';
-  const byId = new Map((item.imagePaths || []).map((ref) => [Number(ref.id), ref]));
-  for (const id of ids) {
-    const ref = byId.get(id);
-    if (!ref?.path || ref.availability === 'missing') return 'missing';
-  }
-  return item.attachmentState === 'missing' ? 'missing' : 'ready';
+  return getPromptImageAttachmentState(item) as QueuedPromptAttachmentState;
 }
 
 export type TabQueue = {
@@ -1375,11 +1322,14 @@ async function materializeQueuedPromptRecord(item: QueuedPrompt): Promise<Queued
     const result = await ipcRenderer.invoke('prompt-queue:materialize-image-refs', {
       refs: normalized.imagePaths,
     });
-    const refs = Array.isArray(result?.refs)
+    const returnedRefs = Array.isArray(result?.refs)
       ? result.refs as QueuedImageRef[]
-      : normalized.imagePaths.map((ref) => ({ ...ref, availability: 'missing' as const, error: 'materialize_failed' }));
+      : [];
+    const returnedById = new Map(returnedRefs.map((ref) => [Number(ref.id), ref]));
+    const responseIsComplete = Array.from(ids).every((id) => returnedById.has(id));
+    const refs = responseIsComplete ? returnedRefs : normalized.imagePaths;
     const byId = new Map(refs.map((ref) => [Number(ref.id), ref]));
-    const ready = Array.from(ids).every((id) => {
+    const ready = responseIsComplete && Array.from(ids).every((id) => {
       const ref = byId.get(id);
       return !!(ref?.path && ref.assetId && ref.availability === 'available');
     });

@@ -25,6 +25,9 @@ export const DEFAULT_CODEX_EFFORT = 'xhigh';
 // The live `codex debug models` catalog remains authoritative. These values
 // cover offline and manual configuration, including model-specific max/ultra.
 export const CODEX_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
+export const CODEX_PERSISTENT_EFFORT_LEVELS = CODEX_EFFORT_LEVELS.filter(
+  (level) => level !== 'ultra',
+);
 export type CodexEffortLevel = typeof CODEX_EFFORT_LEVELS[number];
 
 export const CODEX_EFFORT_LABELS: Record<CodexEffortLevel, string> = {
@@ -110,6 +113,24 @@ export const resolveCodexEffortForModel = (
   const target = typeof requested === 'string' ? requested.trim() : '';
   if (target && efforts.includes(target)) return target;
   if (model?.defaultEffort && efforts.includes(model.defaultEffort)) return model.defaultEffort;
+  if (efforts.includes(DEFAULT_CODEX_EFFORT)) return DEFAULT_CODEX_EFFORT;
+  return efforts[0] || null;
+};
+
+export const resolveCodexPersistentEffortForModel = (
+  model: Pick<CodexModelOption, 'efforts' | 'defaultEffort'> | undefined,
+  requested: unknown,
+): string | null => {
+  const efforts = (model?.efforts?.filter(Boolean) || [...CODEX_EFFORT_LEVELS])
+    .filter((effort) => effort !== 'ultra');
+  if (efforts.length === 0) return null;
+  const target = typeof requested === 'string' ? requested.trim() : '';
+  if (target && target !== 'ultra' && efforts.includes(target)) return target;
+  if (model?.defaultEffort
+    && model.defaultEffort !== 'ultra'
+    && efforts.includes(model.defaultEffort)) {
+    return model.defaultEffort;
+  }
   if (efforts.includes(DEFAULT_CODEX_EFFORT)) return DEFAULT_CODEX_EFFORT;
   return efforts[0] || null;
 };

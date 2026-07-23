@@ -64,6 +64,16 @@ class ProjectManager {
     return this.db.transferTabsToProject(sourceProjectId, targetProjectId, tabIds);
   }
 
+  transferProjectTabGroup(sourceProjectId, targetProjectId, groupId, targetGroupId, expectedTabIds) {
+    return this.db.transferTabGroupToProject(
+      sourceProjectId,
+      targetProjectId,
+      groupId,
+      targetGroupId,
+      expectedTabIds
+    );
+  }
+
   saveProjectTabGroups(projectId, groups) {
     this.db.updateProjectTabGroups(projectId, groups);
   }

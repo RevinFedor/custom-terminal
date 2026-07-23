@@ -83,6 +83,11 @@ function migrateFromJSON() {
       }
     }
 
+    // The legacy INSERT above predates durable tab IDs. Materialize globally
+    // unique identities before this standalone migration connection closes;
+    // ProjectManager also rechecks after invoking us, but direct CLI execution
+    // must leave the same invariant behind.
+    db.ensureGlobalTabIdInvariant();
     db.close();
 
 

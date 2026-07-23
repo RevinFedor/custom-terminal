@@ -21,7 +21,9 @@ const CODEX_LEADING_COMPOSER_PROMPT_RE = new RegExp(
   `^[\\t ]*(?:${CODEX_COMPOSER_PROMPT_ALTERNATION})(?=\\s|$)\\s*`,
   'u',
 );
-const CODEX_UI_TEXT_RE = /OpenAI Codex|Use \/skills|Full Access|Find and fix a bug|Explain this codebase|Ask Codex|Context \d+%|directory:\s*|permissions:\s*/i;
+const CODEX_UI_TEXT_RE = /OpenAI Codex|Use \/skills|Full Access|Find and fix a bug|Explain this codebase|Ask Codex|Context \d+%|directory:\s*|permissions:\s*|Choose\s+how\s+you(?:'|’)?d\s+like\s+Codex\s+to\s+proceed|Try\s+new\s+model|Use\s+existing\s+model/i;
+const CODEX_MCP_STARTUP_STATUS_ANCHOR_RE = /Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|MCP\s+servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)|servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)/i;
+const CODEX_LIVE_INTERRUPT_FOOTER_RE = /esc\s+to\s+interrupt/i;
 
 function hasCodexComposerPromptGlyph(text) {
   return CODEX_COMPOSER_PROMPT_GLYPH_RE.test(String(text || ''));
@@ -62,7 +64,65 @@ function selectCodexCurrentInteractiveFrameText(lines, activePromptRow = null) {
       if (hasCodexComposerPromptGlyph(rows[index].text)) startIndex = index;
     }
   }
+  // Codex v0.145 can render a live MCP progress row immediately above the
+  // still-visible composer. Starting at the composer alone would erase the
+  // blocker and publish a false READY state. Include only the contiguous
+  // status band directly above the active prompt; ordinary output between an
+  // old startup line and the composer still keeps that scrollback excluded.
+  if (startIndex > 0) {
+    let candidateStart = startIndex;
+    let sawMcpStatus = false;
+    let sawLiveInterruptFooter = false;
+    for (let index = startIndex - 1; index >= 0 && startIndex - index <= 8; index--) {
+      const text = rows[index].text;
+      if (!String(text || '').trim()) {
+        candidateStart = index;
+        continue;
+      }
+      if (CODEX_LIVE_INTERRUPT_FOOTER_RE.test(text)) {
+        candidateStart = index;
+        sawLiveInterruptFooter = true;
+        continue;
+      }
+      if (CODEX_MCP_STARTUP_STATUS_ANCHOR_RE.test(text)) {
+        candidateStart = index;
+        sawMcpStatus = true;
+        break;
+      }
+      // On a narrow terminal the server-name list wraps into otherwise generic
+      // rows. Only the nearby live `esc to interrupt` footer authorizes walking
+      // through those rows in search of the MCP anchor; without it, ordinary
+      // historical output remains a hard boundary.
+      if (sawLiveInterruptFooter) {
+        candidateStart = index;
+        continue;
+      }
+      break;
+    }
+    if (sawMcpStatus) startIndex = candidateStart;
+  }
   return rows.slice(Math.max(0, startIndex)).map((line) => line.text).join('\n');
+}
+
+function classifyCodexMcpStartupBlockerHandling({
+  authoritativeCurrentFrame = false,
+  promptOrTurnInFlight = false,
+  alreadyReady = false,
+  startupLifecycleFresh = false,
+} = {}) {
+  if (authoritativeCurrentFrame) {
+    return { ignore: false, reason: 'authoritative-current-frame' };
+  }
+  if (promptOrTurnInFlight) {
+    return { ignore: true, reason: 'prompt-or-turn-in-flight' };
+  }
+  if (alreadyReady) {
+    return { ignore: true, reason: 'already-ready' };
+  }
+  if (!startupLifecycleFresh) {
+    return { ignore: true, reason: 'not-startup-lifecycle' };
+  }
+  return { ignore: false, reason: 'startup-lifecycle' };
 }
 
 function inspectCodexInputReadyTextCore(clean, raw, {
@@ -168,6 +228,7 @@ function shouldLaunchCodexMcpReplacement(stopResult) {
 
 module.exports = {
   CODEX_COMPOSER_PROMPT_GLYPHS,
+  classifyCodexMcpStartupBlockerHandling,
   decideCodexMcpStartupDeadline,
   findLastCodexComposerPromptIndex,
   hasCodexComposerPromptGlyph,

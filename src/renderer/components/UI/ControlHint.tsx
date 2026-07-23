@@ -38,7 +38,6 @@ export default function ControlHint({
     <Tooltip
       content={content}
       side={side}
-      always
       interactive={false}
       disabled={disabled || !enabled}
     >

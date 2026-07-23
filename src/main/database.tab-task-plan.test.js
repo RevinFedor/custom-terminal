@@ -52,21 +52,23 @@ test('task plan survives saveTabs, stale renderer payloads, and archive restore 
   const applied = manager.applyTabTaskPlanOperations(tabId, [
     { type: 'add_task', id: 'root', title: 'Унифицировать настройки приложений' },
     { type: 'add_subtask', taskId: 'root', id: 'mode', title: 'Добавить выбор Chat / Work' },
+    { type: 'archive_task', taskId: 'root' },
   ], 'terminal-mcp');
   assert.equal(applied.document.revision, 1);
 
   manager.saveTabs(project.id, [{ ...baseTab, name: 'Переименованный таб', taskPlan: { version: 1, revision: 0, items: [], history: { past: [], future: [] } } }]);
   const afterStaleSave = manager.getTabTaskPlan(tabId);
   assert.equal(afterStaleSave.revision, 1);
-  assert.equal(afterStaleSave.items[0].subtasks[0].id, 'mode');
+  assert.equal(afterStaleSave.items.length, 0);
+  assert.equal(afterStaleSave.archivedItems[0].subtasks[0].id, 'mode');
 
   const restoredProject = manager.getProjectById(project.id);
-  assert.equal(restoredProject.tabs[0].taskPlan.items[0].id, 'root');
+  assert.equal(restoredProject.tabs[0].taskPlan.archivedItems[0].id, 'root');
 
   const historyId = manager.archiveTab(project.id, { ...baseTab, taskPlan: afterStaleSave });
   assert.ok(historyId);
   const history = manager.getTabHistory(project.id);
   const archivedPlan = JSON.parse(history[0].task_plan);
   assert.equal(archivedPlan.revision, 1);
-  assert.equal(archivedPlan.items[0].title, 'Унифицировать настройки приложений');
+  assert.equal(archivedPlan.archivedItems[0].title, 'Унифицировать настройки приложений');
 });

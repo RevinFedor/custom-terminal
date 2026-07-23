@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from 'react';
 import { DictationSession } from './dictation';
 import { appendDictationEntry } from './dictationHistory';
+import { useUIStore } from '../store/useUIStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -8,7 +9,7 @@ export const DICTATION_STATE_EVENT = 'dictation:state';
 export const DICTATION_STOP_AND_DELIVER_EVENT = 'dictation:stop-and-deliver';
 export const DICTATION_DELIVERED_EVENT = 'dictation:delivered';
 
-export type DictationMode = 'sdk' | 'pty-claude' | 'pty-codex' | 'terminal';
+export type DictationMode = 'sdk' | 'history' | 'pty-claude' | 'pty-codex' | 'terminal';
 
 export interface DictationOwner {
   tabId: string;
@@ -78,12 +79,26 @@ function flushSubmitRequests(payload: { success: boolean; delivered: boolean; ha
   if (!owner) return;
   requestIds.forEach((requestId) => {
     window.dispatchEvent(new CustomEvent(DICTATION_DELIVERED_EVENT, {
-      detail: { tabId: owner.tabId, requestId, ...payload },
+      detail: { tabId: owner.tabId, requestId, mode: owner.mode, ...payload },
     }));
   });
 }
 
 async function deliverFinal(text: string, mode: DictationMode, tabId: string): Promise<{ success: boolean; delivered: boolean; error?: string }> {
+  if (mode === 'history') {
+    const store = useUIStore.getState();
+    const current = store.historyPromptDrafts[tabId] || '';
+    const separator = current && !/\s$/.test(current) ? ' ' : '';
+    store.setHistoryPromptDraft(
+      tabId,
+      current + separator + text,
+      { preserveImages: true },
+    );
+    window.dispatchEvent(new CustomEvent('history-panel:focus-composer', {
+      detail: { tabId },
+    }));
+    return { success: true, delivered: true };
+  }
   if (mode === 'pty-claude' || mode === 'pty-codex') {
     const result = await ipcRenderer.invoke('terminal:paste', { tabId, content: text, submit: false });
     if (!result?.success) {

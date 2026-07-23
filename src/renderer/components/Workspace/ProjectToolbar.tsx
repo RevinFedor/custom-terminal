@@ -7,7 +7,7 @@ import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { compressLogs } from '../../utils/compressLogs';
-import { markPendingResume } from '../../utils/pendingResume';
+import { clearPendingResume, markPendingResume } from '../../utils/pendingResume';
 import SemanticIndexButton from './SemanticIndexButton';
 import CopySessionWithChips from './CopySessionWithChips';
 import DocsButton from './DocsButton';
@@ -40,6 +40,7 @@ type ToolbarExternalRunMeta = {
 
 export default function ProjectToolbar({ isSystemProject = false }: { isSystemProject?: boolean }) {
   const showToast = useUIStore((state) => state.showToast);
+  const [isResumingAll, setIsResumingAll] = useState(false);
   const activeProjectId = useWorkspaceStore((state) => state.activeProjectId);
   const currentView = useWorkspaceStore((state) => {
     const projectId = state.activeProjectId;
@@ -385,48 +386,71 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
   }, [interruptedTabsKey, activeProjectId]);
 
   // Resume all interrupted sessions
-  const handleResumeAll = () => {
-    if (interruptedTabs.length === 0) return;
-
-    interruptedTabs.forEach((tab) => {
-      // Clear interrupted state
-      clearInterruptedState(tab.id);
-
-      // Send resume command based on session type
-      if (tab.commandType === 'codex' && tab.codexSessionId) {
-        setTabCommandType(tab.id, 'codex');
-        ipcRenderer.send('codex:run-command', buildCodexRunPayload({
-          tabId: tab.id,
-          command: 'codex-c',
-          sessionId: tab.codexSessionId,
-          cwd: tab.cwd,
-        }));
-      } else if (tab.claudeSessionId) {
-        setTabCommandType(tab.id, 'claude');
-        // Arm the per-tab stale-bridge guard before each resume write. Bulk-resume
-        // has a higher blast radius (N tabs at once), so missing this let any stale
-        // bridge file overwrite a resumed tab's sessionId. См. fix-bridge-stale-takeover.md.
-        markPendingResume(tab.id, tab.claudeSessionId);
-        const cmd = `claude --dangerously-skip-permissions --resume ${tab.claudeSessionId}\r`;
-        ipcRenderer.send('terminal:input', tab.id, cmd);
-        ipcRenderer.send('terminal:force-command-started', { tabId: tab.id, commandType: 'claude', sessionId: tab.claudeSessionId });
-      } else if (tab.geminiSessionId) {
-        setTabCommandType(tab.id, 'gemini');
-        const cmd = `gemini -s ${tab.geminiSessionId}\r`;
-        ipcRenderer.send('terminal:input', tab.id, cmd);
-        ipcRenderer.send('terminal:force-command-started', tab.id);
-      } else if (tab.codexSessionId) {
-        setTabCommandType(tab.id, 'codex');
-        ipcRenderer.send('codex:run-command', buildCodexRunPayload({
-          tabId: tab.id,
-          command: 'codex-c',
-          sessionId: tab.codexSessionId,
-          cwd: tab.cwd,
-        }));
+  const handleResumeAll = async () => {
+    if (interruptedTabs.length === 0 || isResumingAll) return;
+    setIsResumingAll(true);
+    try {
+      const results = await Promise.all(interruptedTabs.map(async (tab) => {
+        try {
+          if (tab.commandType === 'codex' && tab.codexSessionId) {
+            setTabCommandType(tab.id, 'codex');
+            const runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
+              tabId: tab.id,
+              command: 'codex-c',
+              sessionId: tab.codexSessionId,
+              cwd: tab.cwd,
+            }));
+            if (runResult?.success === false || runResult?.accepted === false) return false;
+          } else if (tab.claudeSessionId) {
+            setTabCommandType(tab.id, 'claude');
+            // The interrupted flag remains the rollback UI until main confirms
+            // that the launch bytes were accepted.
+            markPendingResume(tab.id, tab.claudeSessionId);
+            const runResult = await ipcRenderer.invoke('claude:run-command', {
+              tabId: tab.id,
+              command: 'claude-c',
+              sessionId: tab.claudeSessionId,
+              ...(tab.cwd ? { cdTo: tab.cwd } : {}),
+            });
+            if (runResult?.success === false || runResult?.accepted === false) {
+              clearPendingResume(tab.id);
+              return false;
+            }
+          } else if (tab.geminiSessionId) {
+            setTabCommandType(tab.id, 'gemini');
+            const cmd = `gemini -s ${tab.geminiSessionId}\r`;
+            ipcRenderer.send('terminal:input', tab.id, cmd);
+            ipcRenderer.send('terminal:force-command-started', tab.id);
+          } else if (tab.codexSessionId) {
+            setTabCommandType(tab.id, 'codex');
+            const runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
+              tabId: tab.id,
+              command: 'codex-c',
+              sessionId: tab.codexSessionId,
+              cwd: tab.cwd,
+            }));
+            if (runResult?.success === false || runResult?.accepted === false) return false;
+          } else {
+            return false;
+          }
+          clearInterruptedState(tab.id);
+          return true;
+        } catch (error) {
+          if (tab.claudeSessionId) clearPendingResume(tab.id);
+          console.warn('[ProjectToolbar] Resume failed tab=' + tab.id.slice(-12)
+            + ' error=' + (error instanceof Error ? error.message : String(error)));
+          return false;
+        }
+      }));
+      const resumed = results.filter(Boolean).length;
+      if (resumed === interruptedTabs.length) {
+        showToast(`Resumed ${resumed} session(s)`, 'success');
+      } else {
+        showToast(`Resumed ${resumed}/${interruptedTabs.length}; failed sessions stayed paused`, 'warning');
       }
-    });
-
-    showToast(`Resumed ${interruptedTabs.length} session(s)`, 'success');
+    } finally {
+      setIsResumingAll(false);
+    }
   };
 
   const resolveProjectCwd = useCallback(() => {
@@ -658,6 +682,8 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
         <ControlHint label={`Возобновить ${interruptedTabs.length} прерванных сессий`}>
         <button
           onClick={handleResumeAll}
+          disabled={isResumingAll}
+          aria-busy={isResumingAll}
           style={buttonStyle(false)}
           onMouseEnter={(e) => handleMouseEnter(e, false)}
           onMouseLeave={(e) => handleMouseLeave(e, false)}

@@ -4,6 +4,7 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useCmdKey, useCmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import ProjectCard from './ProjectCard';
 import Tooltip from '../UI/Tooltip';
+import ControlHint from '../UI/ControlHint';
 import { ChevronDown, ChevronRight, Square, X } from 'lucide-react';
 import { isInboxProjectId } from '../../constants/systemProjects';
 
@@ -70,7 +71,6 @@ export default function Dashboard() {
   const [isProcessesLoading, setIsProcessesLoading] = useState(true);
   const [stoppingProcesses, setStoppingProcesses] = useState<Set<string>>(() => new Set());
 
-  const [killTooltip, setKillTooltip] = useState<AiProcessSectionKey | null>(null);
   const [historyCounts, setHistoryCounts] = useState<Map<string, number>>(new Map());
   const [autoResume, setAutoResume] = useState(false);
 
@@ -629,23 +629,15 @@ export default function Dashboard() {
                   )}
                   {externalProcesses.length > 0 && (
                     <div className="relative flex items-center gap-1">
-                      <button
-                        className="flex h-6 w-6 items-center justify-center rounded-md text-[#777] transition-colors hover:bg-red-500/10 hover:text-red-400 cursor-pointer"
-                        onClick={() => handleKillAllExternal(externalProcesses)}
-                        onMouseEnter={() => setKillTooltip(section)}
-                        onMouseLeave={() => setKillTooltip(null)}
-                      >
-                        <X size={15} strokeWidth={2.4} />
-                      </button>
-                      <span className="text-[10px] text-[#777] whitespace-nowrap">external only</span>
-                      {killTooltip === section && (
-                        <div
-                          className="absolute left-1/2 -translate-x-1/2 top-7 z-50 px-2 py-1 rounded text-[10px] text-[#aaa] whitespace-nowrap"
-                          style={{ backgroundColor: '#1a1a1a', border: '1px solid #333', boxShadow: '0 2px 8px rgba(0,0,0,0.3)' }}
+                      <ControlHint label={`Остановить внешние ${title}-процессы`}>
+                        <button
+                          className="flex h-6 w-6 items-center justify-center rounded-md text-[#777] transition-colors hover:bg-red-500/10 hover:text-red-400 cursor-pointer"
+                          onClick={() => handleKillAllExternal(externalProcesses)}
                         >
-                          Kill external only; dev/prod protected
-                        </div>
-                      )}
+                          <X size={15} strokeWidth={2.4} />
+                        </button>
+                      </ControlHint>
+                      <span className="text-[10px] text-[#777] whitespace-nowrap">external only</span>
                     </div>
                   )}
                   {hasOverflow && isExpanded && (
@@ -790,14 +782,14 @@ export default function Dashboard() {
                       </span>
                     </button>
                     {mcpOrphans.length > 0 && (
-                      <Tooltip content={`Kill ${mcpOrphans.length} orphan MCP processes`}>
+                      <ControlHint label={`Остановить orphan MCP-процессы: ${mcpOrphans.length}`}>
                         <button
                           className="flex h-7 w-7 items-center justify-center rounded-md text-[#777] transition-colors hover:bg-red-500/10 hover:text-red-400 cursor-pointer"
                           onClick={(e) => { e.stopPropagation(); handleKillAllOrphanMcp(); }}
                         >
                           <X size={16} strokeWidth={2.5} />
                         </button>
-                      </Tooltip>
+                      </ControlHint>
                     )}
                   </div>
                   {mcpExpanded && (

@@ -5,6 +5,7 @@ import { ChevronDown, Folder, Hourglass, LoaderCircle, X } from 'lucide-react';
 import { useWorkspaceStore, type TabColor, type TabGroup } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
+import ControlHint from '../UI/ControlHint';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -232,9 +233,13 @@ function aiKindForTab(tab: {
   geminiSessionId?: string;
 }): AiTabKind | null {
   if (tab.tabType === 'claude-sdk') return 'claude-sdk';
-  if (tab.commandType === 'claude' && !!tab.claudeSessionId) return 'claude-pty';
-  if (tab.commandType === 'codex' && !!tab.codexSessionId) return 'codex';
-  if (tab.commandType === 'gemini' && !!tab.geminiSessionId) return 'gemini';
+  // The picker describes which AI tab should satisfy the condition, not which
+  // tab already has a materialized session. A typed-but-unstarted tab is a
+  // valid target and intentionally stays in the hourglass state until its first
+  // real busy -> idle outcome.
+  if (tab.commandType === 'claude') return 'claude-pty';
+  if (tab.commandType === 'codex') return 'codex';
+  if (tab.commandType === 'gemini') return 'gemini';
   return null;
 }
 
@@ -824,7 +829,17 @@ export function RunAfterTabPicker({
           to { transform: rotate(360deg); }
         }
       `}</style>
-      {!hideTrigger && (triggerVariant === 'context-row' ? renderContextRowTrigger() : renderPillTrigger())}
+      {!hideTrigger && (
+        <ControlHint
+          label={hasSelectedTarget
+            ? `Изменить вкладку ожидания: ${selectedSummaryText}`
+            : 'Выбрать вкладку, после которой продолжить'}
+          disabled={open}
+          side={triggerVariant === 'context-row' ? 'right' : 'left'}
+        >
+          {triggerVariant === 'context-row' ? renderContextRowTrigger() : renderPillTrigger()}
+        </ControlHint>
+      )}
 
       {open && anchor && createPortal(
         (

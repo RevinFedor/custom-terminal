@@ -1,9 +1,10 @@
 import React, { useEffect, useRef, useState, memo, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { Terminal as XTerminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import Tooltip from '../UI/Tooltip';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { WebLinksAddon } from '@xterm/addon-web-links';
+import ControlHint from '../UI/ControlHint';
 
 const { shell } = window.require('electron');
 
@@ -95,6 +96,12 @@ import {
   markClaudeStartupDefaultsReady,
 } from '../../utils/claudeStartupDefaultsGate';
 import { isClaudeStartupPromptReadyByVisiblePrompt } from '../../utils/claudeStartupDefaultsReady';
+import {
+  isCodexSettingsPickerVisible,
+  parseCodexModelChangeAcknowledgement,
+  planCodexPickerStateApplication,
+} from '../../utils/codexEffectiveSettings.mjs';
+import { codexSessionAdoptionOptionsFromEvent } from '../../utils/codexSessionAdoption.mjs';
 
 const TIMELINE_COLLAPSED_SLOT_WIDTH = 32;
 const TERMINAL_THEME = {
@@ -173,11 +180,9 @@ const _effortInjectCalls = new Map<string, number>(); // [EffortDiag2026-05] inv
 // path, Bridge:Fresh fallback path, manual ControlBar click) sets this. Other
 // paths see it set and short-circuit. Cleared when the Claude process exits so
 // the next fresh spawn starts clean. Exposed on window for ControlBar access.
-// `level` carries the effort actually injected (the same value desktop's
-// ControlBar shows in `effortLocal`). It is the single cross-client source of
-// truth for "what effort is this live Claude process on": mobile reads it via
-// the window map in getSDKParams. Absent (process never injected, or died and
-// cleared) → mobile shows `?`, matching the desktop "dimmed/unknown" intent.
+// `level` is diagnostic/dedupe metadata only. The source of truth for the
+// current conversation is the confirmed wrapper→stdout pair on its active
+// JSONL branch; manual terminal commands never touch this map.
 const _effortSentForTab = new Map<string, { at: number; via: string; level: string }>();
 (window as any).__effortSentForTab = _effortSentForTab;
 
@@ -211,18 +216,6 @@ function _bridgeModelMatchesTarget(targetModel: string, bridgeModel: string | nu
   return needles.some((needle) => live.includes(needle));
 }
 
-function getClaudeVisibleStatusModel(tabId: string): string | null {
-  const visible = terminalRegistry.getVisibleText(tabId).replace(/\u00a0/g, ' ');
-  const matches = Array.from(visible.matchAll(/\[([^\]\n]{2,80})\]\s*\d+%/g));
-  const last = matches[matches.length - 1]?.[1];
-  return last ? last.trim() : null;
-}
-
-function visibleClaudeModelMatchesTarget(tabId: string, targetModel: string): string | null {
-  const liveModel = getClaudeVisibleStatusModel(tabId);
-  return liveModel && _bridgeModelMatchesTarget(targetModel, liveModel) ? liveModel : null;
-}
-
 function detectClaudeSettingsDialogFromVisibleText(text: string): 'ModelDialog' | 'EffortDialog' | null {
   const normalized = String(text || '').replace(/\u00a0/g, ' ');
   if (!normalized.trim()) return null;
@@ -241,15 +234,25 @@ function confirmClaudeSettingsDialogFromVisibleText(tabId: string, label: string
   const now = Date.now();
   const key = tabId + ':' + dialogType;
   const last = _claudeVisibleSettingsDialogConfirmCooldown.get(key) || 0;
-  if (now - last < 8000) return true;
+  if (now - last < 150) return true;
 
   _claudeVisibleSettingsDialogConfirmCooldown.set(key, now);
   const preview = text.replace(/\s+/g, ' ').trim().slice(-180);
   console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12)
     + ' visible ' + dialogType
-    + ' confirm label=' + label
+    + ' requesting current-frame confirm label=' + label
     + ' preview=' + preview);
-  ipcRenderer.send('terminal:input', tabId, '\r');
+  // Renderer visibility is only a wake-up hint. Main re-reads the headless
+  // current frame and verifies the PTY/input generation before Enter.
+  void ipcRenderer.invoke('claude:confirm-settings-dialog', {
+    tabId,
+    kind: dialogType === 'ModelDialog' ? 'model' : 'effort',
+    reason: 'startup-defaults:' + label,
+  }).catch((error: any) => {
+    console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12)
+      + ' confirm request failed label=' + label
+      + ' error=' + (error?.message || String(error)));
+  });
   return true;
 }
 
@@ -374,6 +377,81 @@ const getSetTerminalSelection = () => useUIStore.getState().setTerminalSelection
 // Get Claude session setter/getter outside of component
 const getSetClaudeSessionId = () => useWorkspaceStore.getState().setClaudeSessionId;
 const getClaudeSessionId = (tabId: string) => useWorkspaceStore.getState().getClaudeSessionId(tabId);
+
+type ClaudeStartupSettings = {
+  model: string;
+  effort: string;
+  sessionId: string | null;
+  source: 'session-history' | 'app-defaults' | 'session-settings-unknown';
+};
+
+async function resolveClaudeStartupSettings(
+  tabId: string,
+  sessionIdHint?: string | null,
+): Promise<ClaudeStartupSettings> {
+  const defaults = {
+    model: useUIStore.getState().defaultClaudeModel,
+    effort: useUIStore.getState().defaultClaudeEffort,
+  };
+  let sessionId = String(sessionIdHint || getClaudeSessionId(tabId) || '').trim() || null;
+  let cwd: string | null = null;
+  for (const [, workspace] of useWorkspaceStore.getState().openProjects) {
+    const tab = workspace.tabs.get(tabId);
+    if (!tab) continue;
+    sessionId = sessionId || tab.claudeSessionId || null;
+    cwd = tab.cwd || null;
+    break;
+  }
+  if (!sessionId) {
+    return { ...defaults, sessionId: null, source: 'app-defaults' };
+  }
+
+  try {
+    const result = await ipcRenderer.invoke('claude:get-confirmed-settings', {
+      tabId,
+      sessionId,
+      cwd,
+    });
+    if (result?.success === true && result.sessionId === sessionId) {
+      const hasSessionSetting = !!result.model || !!result.effort;
+      const resolved = {
+        model: result.model || defaults.model,
+        effort: result.effort || defaults.effort,
+        sessionId,
+        source: hasSessionSetting ? 'session-history' as const : 'app-defaults' as const,
+      };
+      console.warn(
+        '[Terminal:StartupSettings] tab=' + tabId.slice(-12)
+        + ' sid=' + sessionId.slice(0, 8)
+        + ' source=' + resolved.source
+        + ' model=' + (resolved.model || 'none')
+        + ' effort=' + (resolved.effort || 'none')
+      );
+      return resolved;
+    }
+    console.warn(
+      '[Terminal:StartupSettings] tab=' + tabId.slice(-12)
+      + ' sid=' + sessionId.slice(0, 8)
+      + ' fallback=claude-session-state reason=' + (result?.reason || 'unconfirmed-result')
+    );
+  } catch (error: any) {
+    console.warn(
+      '[Terminal:StartupSettings] tab=' + tabId.slice(-12)
+      + ' sid=' + sessionId.slice(0, 8)
+      + ' fallback=claude-session-state error=' + String(error?.message || error)
+    );
+  }
+  // A failed lookup is `unknown`, not proof that this resumed session has no
+  // settings. Injecting app defaults here could silently overwrite the model
+  // or effort Claude just restored from its own conversation. Skip injection
+  // and let the resumed CLI state stand until JSONL becomes readable again.
+  return {
+    model: 'none',
+    effort: 'none',
+    sessionId,
+    source: 'session-settings-unknown',
+  };
+}
 
 // Get Gemini session setter/getter outside of component
 const getSetGeminiSessionId = () => useWorkspaceStore.getState().setGeminiSessionId;
@@ -511,6 +589,39 @@ const getTabCwd = (tabId: string): string | undefined => {
   return undefined;
 };
 
+const pendingAgentActionLaunches = new Set<string>();
+
+const launchPendingAgentAction = async (
+  tabId: string,
+  actionType: PendingAction['type'],
+  channel: 'claude:run-command' | 'codex:run-command',
+  payload: any,
+  pendingClaudeSessionId?: string | null,
+) => {
+  if (pendingAgentActionLaunches.has(tabId)) {
+    console.warn('[RESTORE] Pending agent action already launching:', { tabId, actionType });
+    return;
+  }
+  pendingAgentActionLaunches.add(tabId);
+  try {
+    const result = await invokePtyAgentLaunch(channel, payload, pendingClaudeSessionId);
+    if (result?.success !== false && result?.accepted !== false) {
+      // A restored one-shot action belongs to the launch transaction. Keep it
+      // persisted when main rejects admission so a transient process-lookup or
+      // non-idle shell cannot silently consume the user's requested restore.
+      clearTabPendingAction(tabId);
+    } else {
+      console.warn('[RESTORE] Pending agent action retained after rejected launch:', {
+        tabId,
+        actionType,
+        reason: result?.reason || result?.error || 'launch rejected',
+      });
+    }
+  } finally {
+    pendingAgentActionLaunches.delete(tabId);
+  }
+};
+
 // Execute pending action after terminal is ready
 const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
   console.log('[RESTORE] 11. executePendingAction:', { tabId, type: pendingAction.type, sessionId: (pendingAction as any).sessionId });
@@ -521,11 +632,13 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
         getSetTabCommandType()(tabId, 'claude');
         useWorkspaceStore.getState().markAiForkAutoTitle(tabId, 'claude', pendingAction.sessionId);
         console.log('[RESTORE] 12. Sending IPC claude:run-command { command: "claude-f", forkSessionId:', pendingAction.sessionId, '}');
-        ipcRenderer.send('claude:run-command', {
+        void launchPendingAgentAction(tabId, pendingAction.type, 'claude:run-command', {
           tabId,
           command: 'claude-f',
           forkSessionId: pendingAction.sessionId
         });
+      } else {
+        clearTabPendingAction(tabId);
       }
       break;
 
@@ -533,11 +646,14 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
       if (pendingAction.sessionId) {
         getSetTabCommandType()(tabId, 'claude');
         console.log('[RESTORE] 12. Sending IPC claude:run-command { command: "claude-c", sessionId:', pendingAction.sessionId, '}');
-        ipcRenderer.send('claude:run-command', {
+        markPendingResume(tabId, pendingAction.sessionId);
+        void launchPendingAgentAction(tabId, pendingAction.type, 'claude:run-command', {
           tabId,
           command: 'claude-c',
           sessionId: pendingAction.sessionId
-        });
+        }, pendingAction.sessionId);
+      } else {
+        clearTabPendingAction(tabId);
       }
       break;
 
@@ -546,7 +662,12 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
       store.setTabCommandType(tabId, 'claude');
       store.markAiLaunchAutoTitle(tabId, 'claude');
       console.log('[RESTORE] 12. Sending IPC claude:run-command { command: "claude", tabId:', tabId, '}');
-      ipcRenderer.send('claude:run-command', { tabId, command: 'claude' });
+      void launchPendingAgentAction(
+        tabId,
+        pendingAction.type,
+        'claude:run-command',
+        { tabId, command: 'claude' },
+      );
       break;
     }
 
@@ -591,12 +712,14 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
         useWorkspaceStore.getState().markAiForkAutoTitle(tabId, 'codex', pendingAction.sessionId);
         const cwd = getTabCwd(tabId);
         console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex-f" }');
-        ipcRenderer.send('codex:run-command', buildCodexRunPayload({
+        void launchPendingAgentAction(tabId, pendingAction.type, 'codex:run-command', buildCodexRunPayload({
           tabId,
           command: 'codex-f',
           sessionId: pendingAction.sessionId,
           cwd
         }));
+      } else {
+        clearTabPendingAction(tabId);
       }
       break;
 
@@ -605,11 +728,13 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
         getSetTabCommandType()(tabId, 'codex');
         // pendingAction.sessionId is a resume target, not active-writer proof.
         console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex-c" }');
-        ipcRenderer.send('codex:run-command', buildCodexRunPayload({
+        void launchPendingAgentAction(tabId, pendingAction.type, 'codex:run-command', buildCodexRunPayload({
           tabId,
           command: 'codex-c',
           sessionId: pendingAction.sessionId
         }));
+      } else {
+        clearTabPendingAction(tabId);
       }
       break;
 
@@ -619,7 +744,7 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
       store.markAiLaunchAutoTitle(tabId, 'codex');
       const codexCwd = getTabCwd(tabId);
       console.log('[RESTORE] 12. Sending IPC codex:run-command { command: "codex" }');
-      ipcRenderer.send('codex:run-command', buildCodexRunPayload({
+      void launchPendingAgentAction(tabId, pendingAction.type, 'codex:run-command', buildCodexRunPayload({
         tabId,
         command: 'codex',
         cwd: codexCwd,
@@ -633,7 +758,9 @@ const executePendingAction = (tabId: string, pendingAction: PendingAction) => {
       break;
   }
 
-  clearTabPendingAction(tabId);
+  if (!pendingAction.type.startsWith('claude-') && !pendingAction.type.startsWith('codex-')) {
+    clearTabPendingAction(tabId);
+  }
 };
 
 // Regex to detect Claude session ID from terminal output
@@ -680,6 +807,61 @@ function getCurrentCommand(term: XTerminal): string {
 }
 
 const { ipcRenderer, clipboard } = window.require('electron');
+
+const invokePtyAgentLaunch = async (
+  channel: 'claude:run-command' | 'codex:run-command',
+  payload: any,
+  pendingClaudeSessionId?: string | null,
+) => {
+  try {
+    const result = await ipcRenderer.invoke(channel, payload);
+    if (result?.success === false || result?.accepted === false) {
+      if (pendingClaudeSessionId) clearPendingResume(payload?.tabId);
+      const message = result?.error || result?.reason || 'launch rejected';
+      console.warn('[Terminal:AgentLaunch] rejected channel=' + channel
+        + ' tab=' + String(payload?.tabId || '').slice(-12)
+        + ' error=' + message);
+      useUIStore.getState().showToast(
+        `${channel.startsWith('codex') ? 'Codex' : 'Claude'} не запущен: ${message}`,
+        'error',
+      );
+    }
+    return result;
+  } catch (error: any) {
+    if (pendingClaudeSessionId) clearPendingResume(payload?.tabId);
+    const message = error?.message || String(error);
+    console.warn('[Terminal:AgentLaunch] invoke failed channel=' + channel
+      + ' tab=' + String(payload?.tabId || '').slice(-12)
+      + ' error=' + message);
+    useUIStore.getState().showToast(
+      `${channel.startsWith('codex') ? 'Codex' : 'Claude'} не запущен: ${message}`,
+      'error',
+    );
+    return { success: false, accepted: false, error: message };
+  }
+};
+
+const invokeTypedClaudeFork = async (
+  tabId: string,
+  sourceSessionId: string,
+  cwd?: string,
+) => {
+  getSetTabCommandType()(tabId, 'claude');
+  useWorkspaceStore.getState().markAiForkAutoTitle(tabId, 'claude', sourceSessionId);
+  const result = await invokePtyAgentLaunch('claude:run-command', {
+    tabId,
+    command: 'claude-f',
+    forkSessionId: sourceSessionId,
+    cwd,
+  });
+  if (result?.success !== false && result?.accepted !== false && result?.sessionId) {
+    // Main creates the fork only inside the proven-idle launch transaction.
+    // The session-detected event normally binds this first; this idempotent
+    // write also covers a renderer listener that mounted one tick late.
+    getSetClaudeSessionId()(tabId, result.sessionId, 'fork');
+  }
+  return result;
+};
 
 let lastVisibleSetInvariantLogAt = 0;
 
@@ -814,41 +996,6 @@ const normalizeLocalImagePathTexts = (text: string): string[] => {
   return paths;
 };
 
-function waitForClaudeStartupModelBridge(tabId: string, model: string, timeoutMs = 6000): Promise<string> {
-  const current = _claudeBridgeModelByTab.get(tabId);
-  if (current && _bridgeModelMatchesTarget(model, current.model)) {
-    return Promise.resolve('already:' + current.model);
-  }
-  const visibleModel = visibleClaudeModelMatchesTarget(tabId, model);
-  if (visibleModel) return Promise.resolve('visible:' + visibleModel);
-
-  return new Promise((resolve) => {
-    let done = false;
-    let timer: number | undefined;
-    let visibleTimer: number | undefined;
-    const finish = (reason: string) => {
-      if (done) return;
-      done = true;
-      if (timer !== undefined) window.clearTimeout(timer);
-      if (visibleTimer !== undefined) window.clearInterval(visibleTimer);
-      ipcRenderer.removeListener('claude:bridge-update', handler);
-      resolve(reason);
-    };
-    const handler = (_: any, data: { tabId?: string; model?: string }) => {
-      if (data?.tabId !== tabId) return;
-      const liveModel = data.model || 'unknown';
-      _claudeBridgeModelByTab.set(tabId, { model: liveModel, at: Date.now() });
-      if (_bridgeModelMatchesTarget(model, liveModel)) finish('matched:' + liveModel);
-    };
-    timer = window.setTimeout(() => finish('timeout'), timeoutMs);
-    visibleTimer = window.setInterval(() => {
-      const liveModel = visibleClaudeModelMatchesTarget(tabId, model);
-      if (liveModel) finish('visible:' + liveModel);
-    }, 250);
-    ipcRenderer.on('claude:bridge-update', handler);
-  });
-}
-
 async function waitForClaudeStartupPromptBoundaryResult(tabId: string, afterSeq: number, label: string, timeoutMs = 3000) {
   const seq = await terminalRegistry.waitForPromptBoundaryAfter(tabId, afterSeq, timeoutMs);
   console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' ' + label + ' promptBoundary=' + (seq === null ? 'timeout' : seq));
@@ -965,12 +1112,12 @@ function maybeRecoverClaudeStartupDefaultsAfterLateModelBridge(tabId: string, li
   const gateText = String(gate.error || gate.reason || '');
   if (!/\/model\s+\S+\s+did not confirm through bridge/i.test(gateText)) return;
 
-  const model = useUIStore.getState().defaultClaudeModel;
-  if (!model || model === 'none' || !_bridgeModelMatchesTarget(model, liveModel)) return;
-
   const work = (async () => {
+    const startupSettings = await resolveClaudeStartupSettings(tabId);
+    const model = startupSettings.model;
+    if (!model || model === 'none' || !_bridgeModelMatchesTarget(model, liveModel)) return;
     _modelSentForTab.set(tabId, { at: Date.now(), via: 'bridge-late', model });
-    const eff = useUIStore.getState().defaultClaudeEffort;
+    const eff = startupSettings.effort;
     if (!eff || eff === 'none' || _effortSentForTab.has(tabId)) {
       console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12)
         + ' late bridge model recovered gate model=' + liveModel
@@ -1046,15 +1193,18 @@ async function copyClaudeStartupInput(tabId: string, label: string) {
 }
 
 async function clearClaudeStartupInputIfStill(tabId: string, command: string, label: string) {
-  const expected = normalizeStartupSlashText(command);
-  const current = await copyClaudeStartupInput(tabId, label + ':before-clear');
-  if (!current.success || current.text !== expected) return false;
   try {
-    const clear = await ipcRenderer.invoke('claude:clear-input', tabId);
+    const clear = await ipcRenderer.invoke('claude:clear-exact-setting-input', {
+      tabId,
+      command,
+      reason: label,
+    });
     console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' clear stuck ' + label +
       ' success=' + (clear?.success === true) +
+      ' cleared=' + (clear?.cleared === true) +
+      ' reason=' + (clear?.reason || '-') +
       ' error=' + (clear?.error || '-'));
-    return clear?.success === true;
+    return clear?.cleared === true;
   } catch (e: any) {
     console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' clear stuck ' + label + ' threw ' + (e?.message || String(e)));
     return false;
@@ -1071,10 +1221,24 @@ async function retryStuckClaudeStartupSlashCommand(
   const current = await copyClaudeStartupInput(tabId, label + ':timeout');
   if (current.success && current.text === expected) {
     console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' retry Enter for stuck ' + label + ' command="' + expected + '"');
-    ipcRenderer.send('terminal:input', tabId, '\r');
-    const retryConfirm = await confirm().catch(() => 'timeout');
-    console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' retry result ' + label + '=' + retryConfirm);
-    if (retryConfirm !== 'timeout') return retryConfirm;
+    const retry = await ipcRenderer.invoke('claude:retry-exact-setting-input', {
+      tabId,
+      command,
+      reason: label,
+    }).catch((error: any) => ({
+      success: false,
+      submitted: false,
+      error: error?.message || String(error),
+    }));
+    if (retry?.submitted === true) {
+      const retryConfirm = await confirm().catch(() => 'timeout');
+      console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12) + ' retry result ' + label + '=' + retryConfirm);
+      if (retryConfirm !== 'timeout') return retryConfirm;
+    } else {
+      console.warn('[Terminal:StartupDefaults] tab=' + tabId.slice(-12)
+        + ' retry skipped ' + label
+        + ' reason=' + (retry?.reason || retry?.error || 'unknown'));
+    }
   }
   await clearClaudeStartupInputIfStill(tabId, command, label);
   return 'timeout';
@@ -1178,9 +1342,24 @@ interface TerminalProps {
   isActiveProject?: boolean; // For lazy init optimization
   ownerProjectId?: string;
   onLinkClick?: (url: string) => void; // Override link handler (used by BrowserTab)
+  presented?: boolean;
+  promptQueuePortalHostId?: string;
+  hidePromptQueueHistoryToggle?: boolean;
+  promptQueueInputSurface?: 'terminal' | 'history';
 }
 
-function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActiveProjectProp, ownerProjectId, onLinkClick }: TerminalProps) {
+function Terminal({
+  tabId,
+  cwd,
+  active: activeProp,
+  isActiveProject: isActiveProjectProp,
+  ownerProjectId,
+  onLinkClick,
+  presented: presentedProp = true,
+  promptQueuePortalHostId,
+  hidePromptQueueHistoryToggle = false,
+  promptQueueInputSurface = 'terminal',
+}: TerminalProps) {
   const activeFromStore = useWorkspaceStore((state) => {
     if (!ownerProjectId) return false;
     const workspace = state.openProjects.get(ownerProjectId);
@@ -1259,9 +1438,10 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     }
     return false;
   });
-  // Only show prompt-queue overlay when there's a real AI session running in the tab.
-  // sessionId alone isn't enough — it persists after Claude exits (we keep it for /resume).
-  // Combine with live process status from OSC 133 command-started/finished events.
+  // Session/process state is diagnostic only. Run After is persistent
+  // configuration for an AI-typed tab, so it must remain available before the
+  // first launch and after Stop. Runtime readiness is enforced by the always-on
+  // queue runner immediately before a queued prompt is sent.
   const hasPromptQueueSession = useWorkspaceStore((state) => {
     for (const [, workspace] of state.openProjects) {
       const tab = workspace.tabs.get(tabId);
@@ -1365,9 +1545,19 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
   // Effective active = tab is active AND we're in terminal view AND workspace is visible (not Dashboard)
   // This prevents focus/fit/repaint when terminals are hidden behind Dashboard or ProjectHome
   const effectiveActive = active && projectCurrentView === 'terminal' && workspaceView === 'workspace';
+  const effectivePresented = effectiveActive && presentedProp;
+  const [promptQueuePortalHost, setPromptQueuePortalHost] = useState<HTMLElement | null>(null);
 
   useEffect(() => {
-    if (!effectiveActive || !isVisible) return;
+    if (!promptQueuePortalHostId) {
+      setPromptQueuePortalHost(null);
+      return;
+    }
+    setPromptQueuePortalHost(document.getElementById(promptQueuePortalHostId));
+  }, [promptQueuePortalHostId]);
+
+  useEffect(() => {
+    if (!effectivePresented || !isVisible) return;
 
     const frameId = requestAnimationFrame(() => {
       const layers = collectTerminalLayerSnapshots();
@@ -1390,19 +1580,19 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     });
 
     return () => cancelAnimationFrame(frameId);
-  }, [effectiveActive, isVisible, ownerProjectId, tabId]);
+  }, [effectivePresented, isVisible, ownerProjectId, tabId]);
 
   // Keep activeRef in sync for ResizeObserver closure
   useEffect(() => {
-    activeRef.current = effectiveActive;
-  }, [effectiveActive]);
+    activeRef.current = effectivePresented;
+  }, [effectivePresented]);
 
   // Cmd+Tab focus restore: when our window becomes frontmost via Cmd+Tab,
   // macOS does NOT restore DOM focus to any element — Chromium's NSEvent
   // monitor sees Cmd+V but routes it to nowhere, so paste from external
   // dictation apps silently drops. Per-tab refocus on this event.
   useEffect(() => {
-    if (!effectiveActive) return;  // only the currently-visible terminal grabs focus
+    if (!effectivePresented) return;  // only the currently-presented terminal grabs focus
     const onRefocus = () => {
       const term = terminalRegistry.get(tabId);
       if (term) {
@@ -1411,11 +1601,12 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     };
     window.addEventListener('nt:window-refocus-active', onRefocus);
     return () => window.removeEventListener('nt:window-refocus-active', onRefocus);
-  }, [tabId, effectiveActive]);
+  }, [tabId, effectivePresented]);
 
   // Diagnostic: log overlay-gate transitions for this prompt-queue tab.
   // Fires ONLY on transitions (not every render) by tracking prev tuple in a ref.
-  // Order: effectiveActive, agent, hasSession, processAlive.
+  // Order: effectiveActive, agent, hasSession, processAlive. Only the first two
+  // are presentation gates; session/alive explain why execution is waiting.
   // When user reports "overlay disappeared" — grep for this tab's last [QueueGate:flip] line
   // to see which of the 4 flags flipped to false.
   const queueGatePrevRef = useRef<string>('');
@@ -1423,7 +1614,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     if (!promptQueueAgent) return;
     const tuple = `act=${effectiveActive} agent=${promptQueueAgent} sess=${hasPromptQueueSession} alive=${claudeProcessAlive}`;
     if (queueGatePrevRef.current === tuple) return;
-    const all = effectiveActive && !!promptQueueAgent && hasPromptQueueSession && claudeProcessAlive;
+    const all = effectiveActive && !!promptQueueAgent;
     console.warn('[QueueGate:flip] tab=' + tabId.slice(-8) + ' ' + tuple + ' → overlay=' + (all ? 'SHOWN' : 'HIDDEN'));
     queueGatePrevRef.current = tuple;
   }, [tabId, effectiveActive, promptQueueAgent, hasPromptQueueSession, claudeProcessAlive]);
@@ -1679,6 +1870,96 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
     console.warn(`[Terminal:MOUNT] tabId=${tabId} active=${active} isActiveProject=${isActiveProject}`);
 
     const containerRef = terminalRef.current;
+    let nativeCodexPickerProof: { expiresAt: number; output: string; sessionId: string } | null = null;
+
+    const armNativeCodexPickerProof = (
+      term: XTerminal,
+      data: string,
+      origin: XtermInputOrigin,
+    ) => {
+      if (origin === 'terminal-response' || !/[\r\n]/.test(data)) return;
+      const currentTab = (() => {
+        for (const [, workspace] of useWorkspaceStore.getState().openProjects) {
+          const candidate = workspace.tabs.get(tabId);
+          if (candidate) return candidate;
+        }
+        return null;
+      })();
+      if (currentTab?.commandType !== 'codex') return;
+      const visible = terminalRegistry.getVisibleText(tabId);
+      if (!isCodexSettingsPickerVisible(visible)) return;
+      if (!currentTab.codexSessionId) return;
+      nativeCodexPickerProof = {
+        expiresAt: Date.now() + 10_000,
+        output: '',
+        sessionId: currentTab.codexSessionId,
+      };
+      console.warn('[CodexEffectiveState] armed native picker proof tab=' + tabId.slice(-12));
+    };
+
+    const reconcileNativeCodexPickerOutput = (data: string) => {
+      const proof = nativeCodexPickerProof;
+      if (!proof) return;
+      if (Date.now() > proof.expiresAt) {
+        nativeCodexPickerProof = null;
+        return;
+      }
+      proof.output = (proof.output + data).slice(-16_000);
+      const applied = parseCodexModelChangeAcknowledgement(proof.output);
+      if (!applied) return;
+
+      const state = useWorkspaceStore.getState();
+      if (state.getCodexSessionId(tabId) !== proof.sessionId) {
+        nativeCodexPickerProof = null;
+        return;
+      }
+      const plan = planCodexPickerStateApplication({
+        result: {
+          ...applied,
+          codexSettingsProofSessionId: proof.sessionId,
+        },
+        requestedModel: applied.model,
+        requestedEffort: applied.effort,
+        liveSessionId: proof.sessionId,
+      });
+      if (!plan.allowed) return;
+      if (Object.keys(plan.persistentPatch || {}).length > 0) {
+        state.updateCodexState(tabId, plan.persistentPatch);
+      }
+      state.updateCodexLiveState(tabId, plan.livePatch);
+      if (applied.applicationMode === 'conversation-only') {
+        const livePatch = plan.livePatch;
+        void ipcRenderer.invoke('codex:get-persistent-model-effort-proof', { tabId })
+          .then((fallback: any) => {
+            const latest = useWorkspaceStore.getState();
+            if (
+              fallback?.success !== true
+              || latest.getCodexSessionId(tabId) !== proof.sessionId
+              || (
+                fallback.codexSettingsProofSessionId
+                && fallback.codexSettingsProofSessionId !== proof.sessionId
+              )
+            ) {
+              return;
+            }
+            latest.updateCodexState(tabId, {
+              codexModel: fallback.model,
+              codexEffort: fallback.effort,
+              codexSettingsProofSessionId: undefined,
+            });
+            latest.updateCodexLiveState(tabId, livePatch);
+          })
+          .catch(() => {});
+      }
+      nativeCodexPickerProof = null;
+      console.warn(
+        '[CodexEffectiveState] native picker applied tab=' + tabId.slice(-12)
+        + ' model=' + applied.model
+        + ' effort=' + (applied.effort || 'unchanged')
+        + ' mode=' + applied.applicationMode
+        + ' proof=' + applied.proof,
+      );
+    };
 
     // IPC: Receive data from PTY (with write buffer to prevent jitter)
     const handleData = (_: any, payload: { tabId: string; data: string }) => {
@@ -1686,6 +1967,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
       // EffortDiag: scan first 5s of PTY output for TUI-readiness markers.
       _effortDiagScan(tabId, payload.data);
+      reconcileNativeCodexPickerOutput(payload.data);
 
       // Execute pendingAction on first PTY output (= shell is ready)
       if (!pendingActionExecuted.current) {
@@ -1855,21 +2137,21 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         if (!prev) console.warn('[QueueGate:proc] tab=' + tabId.slice(-8) + ' process-started → alive=true');
         return true;
       });
-      const eff = useUIStore.getState().defaultClaudeEffort;
+      const defaultEff = useUIStore.getState().defaultClaudeEffort;
       const pending = getPendingResume(tabId);
       const isResume = pending !== null;
 
       // EffortDiag: open 5-second observation window for this tab.
       _effortDiagStart.set(tabId, Date.now());
       _effortDiagSeen.set(tabId, new Set());
-      _effortDiag(tabId, '⚡ PROCESS-STARTED', 'pid=' + data.claudePid + ' effort=' + eff + ' isResume=' + isResume);
+      _effortDiag(tabId, '⚡ PROCESS-STARTED', 'pid=' + data.claudePid + ' defaultEffort=' + defaultEff + ' isResume=' + isResume);
       setTimeout(() => {
         _effortDiag(tabId, '🏁 5s window closed — END OF DIAG');
         _effortDiagStart.delete(tabId);
         _effortDiagSeen.delete(tabId);
       }, 5100);
 
-      console.log('[Terminal:EffortInject] tab=' + tabId.slice(-12) + ' pid=' + data.claudePid + ' default=' + eff + ' isResume=' + isResume);
+      console.log('[Terminal:EffortInject] tab=' + tabId.slice(-12) + ' pid=' + data.claudePid + ' appDefault=' + defaultEff + ' isResume=' + isResume);
 
       // Resume guard for the Bridge:Fresh fallback only. This event can fire
       // during the resume handshake; tui-ready fires after the prompt is drawn
@@ -1880,6 +2162,9 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         return;
       }
 
+      const startupSettings = await resolveClaudeStartupSettings(tabId, data.sessionId);
+      const eff = startupSettings.effort;
+
       const tuiReadyModelOwner = _modelSentForTab.get(tabId);
       if (tuiReadyModelOwner?.via === 'tui-ready' && !_effortSentForTab.has(tabId)) {
         _effortDiag(tabId, '⛔ STARTUP DEFAULTS SKIPPED', 'tui-ready is sequencing /model before /effort');
@@ -1887,7 +2172,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         return;
       }
 
-      const model = useUIStore.getState().defaultClaudeModel;
+      const model = startupSettings.model;
       if (model && model !== 'none') {
         const modelSentinel = _modelSentForTab.get(tabId);
         if (modelSentinel) {
@@ -1898,34 +2183,25 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           _effortDiag(tabId, '🚀 MODEL FIRED', '/model ' + model + ' — sending before /effort');
           console.warn('[Terminal:ModelInject] tab=' + tabId.slice(-12) + ' /model ' + model + ' (Bridge:Fresh fallback)');
           try {
+            const modelProofAfterMs = Date.now();
             const result = await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model, {
               source: 'startup-defaults:bridge-model',
               stashFirst: true,
               armPromptBoundaryOnSubmit: true,
             });
             if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
-            let bridgeWait = await withClaudeVisibleSettingsDialogAutoConfirm(
+            const modelProof = await withClaudeVisibleSettingsDialogAutoConfirm(
               tabId,
               'bridge-model',
-              () => waitForClaudeStartupModelBridge(tabId, model)
-            );
-            if (bridgeWait === 'timeout') {
-              bridgeWait = await retryStuckClaudeStartupSlashCommand(
+              () => waitForClaudeStartupSlashProofWithRecovery(
                 tabId,
                 '/model ' + model,
-                'bridge-model',
-                () => withClaudeVisibleSettingsDialogAutoConfirm(
-                  tabId,
-                  'bridge-model:retry',
-                  () => waitForClaudeStartupModelBridge(tabId, model, 3500)
-                )
-              );
-            }
-            if (bridgeWait === 'timeout') {
-              throw new Error('/model ' + model + ' did not confirm through bridge');
-            }
-            _effortDiag(tabId, '✅ MODEL COMPLETED', '/model ' + model + ' — bridgeWait=' + bridgeWait);
-            console.warn('[Terminal:ModelInject] tab=' + tabId.slice(-12) + ' /model ' + model + ' bridgeWait=' + bridgeWait);
+                modelProofAfterMs,
+                'bridge-model'
+              )
+            );
+            _effortDiag(tabId, '✅ MODEL COMPLETED', '/model ' + model + ' — proof=' + modelProof);
+            console.warn('[Terminal:ModelInject] tab=' + tabId.slice(-12) + ' /model ' + model + ' proof=' + modelProof);
           } catch (e: unknown) {
             _effortDiag(tabId, '❌ MODEL FAILED', String(e));
             console.error('[Terminal:ModelInject] failed', e);
@@ -2024,40 +2300,32 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       }
       markClaudeStartupDefaultsPending(tabId, 'tui-ready');
       const startupWork = (async () => {
-        const model = useUIStore.getState().defaultClaudeModel;
+        const startupSettings = await resolveClaudeStartupSettings(tabId);
+        const model = startupSettings.model;
         if (model && model !== 'none' && !_modelSentForTab.has(tabId)) {
           const promptSeqBeforeModel = terminalRegistry.getLatestPromptBoundarySeq(tabId);
           _modelSentForTab.set(tabId, { at: Date.now(), via: 'tui-ready', model });
           console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /model ' + model + ' (early path, before /effort)');
           try {
+            const modelProofAfterMs = Date.now();
             const result = await ipcRenderer.invoke('claude:send-command', tabId, '/model ' + model, {
               source: 'startup-defaults:tui-model',
               stashFirst: true,
               armPromptBoundaryOnSubmit: true,
             });
             if (result?.success !== true) throw new Error(result?.error || 'send-command failed');
-            let bridgeWait = await withClaudeVisibleSettingsDialogAutoConfirm(
+            const modelProof = await withClaudeVisibleSettingsDialogAutoConfirm(
               tabId,
               'tui-model',
-              () => waitForClaudeStartupModelBridge(tabId, model)
-            );
-            if (bridgeWait === 'timeout') {
-              bridgeWait = await retryStuckClaudeStartupSlashCommand(
+              () => waitForClaudeStartupSlashProofWithRecovery(
                 tabId,
                 '/model ' + model,
-                'tui-model',
-                () => withClaudeVisibleSettingsDialogAutoConfirm(
-                  tabId,
-                  'tui-model:retry',
-                  () => waitForClaudeStartupModelBridge(tabId, model, 3500)
-                )
-              );
-            }
-            if (bridgeWait === 'timeout') {
-              throw new Error('/model ' + model + ' did not confirm through bridge');
-            }
-            console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /model ' + model + ' bridgeWait=' + bridgeWait + ' — continuing to /effort');
-            if (useUIStore.getState().defaultClaudeEffort === 'none') {
+                modelProofAfterMs,
+                'tui-model'
+              )
+            );
+            console.warn('[Terminal:TuiReady] tab=' + tabId.slice(-12) + ' /model ' + model + ' proof=' + modelProof + ' — continuing to /effort');
+            if (startupSettings.effort === 'none') {
               await waitForClaudeStartupPromptBoundary(tabId, promptSeqBeforeModel, 'after /model ' + model);
             }
           } catch (e: unknown) {
@@ -2067,7 +2335,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           }
         }
         if (_effortSentForTab.has(tabId)) return; // already sent (manual click or earlier tui-ready)
-        const eff = useUIStore.getState().defaultClaudeEffort;
+        const eff = startupSettings.effort;
         if (!eff || eff === 'none') return;
         // NO resume guard here — this is the safe path to (re-)inject on --resume.
         // Why resume needs re-inject at all: `claude --resume` is a FRESH process.
@@ -2173,14 +2441,29 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       getSetTabCommandType()(tabId, 'gemini');
     };
 
-    const handleCodexSessionDetected = (_: any, data: { tabId: string; sessionId: string; writerProven?: boolean; writerProof?: string }) => {
+    const handleCodexSessionDetected = (_: any, data: { tabId: string; sessionId: string; writerProven?: boolean; writerProof?: string; previousSessionId?: string | null; writerGeneration?: string | null; carryCodexSettingsProof?: boolean; requiresExactCodexSettingsProof?: boolean; codexSettingsProof?: { model?: string; effort?: string; proofAt?: number } | null }) => {
       if (data.tabId !== tabId) return;
       if (data.writerProven !== true) {
         console.warn('[Terminal] Ignoring unproven Codex session detection:', data.sessionId, 'proof:', data.writerProof || 'none');
         return;
       }
+      const currentSessionId = useWorkspaceStore.getState().getCodexSessionId(tabId);
+      if (data.previousSessionId
+        && currentSessionId !== data.previousSessionId
+        && currentSessionId !== data.sessionId) {
+        console.warn('[Terminal] Ignoring stale Codex writer generation:', data.writerGeneration || '-',
+          'source:', data.previousSessionId,
+          'session:', data.sessionId,
+          'current:', currentSessionId || 'none');
+        return;
+      }
       console.log('[Terminal] Codex session detected:', data.sessionId);
-      getSetCodexSessionId()(tabId, data.sessionId, 'detected');
+      getSetCodexSessionId()(
+        tabId,
+        data.sessionId,
+        'detected',
+        codexSessionAdoptionOptionsFromEvent(data),
+      );
       getSetTabCommandType()(tabId, 'codex');
       // Same reason as Claude bridge/session detection: Codex can be restored or
       // launched through a path where the OSC command-started marker was missed.
@@ -2377,9 +2660,9 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             + ' head=' + JSON.stringify(data.substring(0, 30))
             + ' tail=' + JSON.stringify(data.substring(Math.max(0, data.length - 30))));
         }
-        ipcRenderer.send('terminal:input', tabId, data, {
-          xtermInputOrigin: takeXtermInputOrigin(),
-        });
+        const xtermInputOrigin = takeXtermInputOrigin();
+        armNativeCodexPickerProof(term, data, xtermInputOrigin);
+        ipcRenderer.send('terminal:input', tabId, data, { xtermInputOrigin });
       });
 
       // Track selection changes and update global state
@@ -2511,11 +2794,9 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           }
           useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'claude');
 
-          // Clear line, start watcher, then launch claude
-          ipcRenderer.send('terminal:input', tabId, '\x15');
-          log.claude('Sending claude:spawn-with-watcher IPC (Bridge handles session detection)');
-          // Main process will: 1) start fs.watch 2) write 'claude\r' to PTY
-          ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
+          // Main owns the proven-idle shell clear and the launch write.
+          log.claude('Invoking centralized Claude launch (Bridge handles session detection)');
+          void invokePtyAgentLaunch('claude:run-command', { tabId, command: 'claude', cwd });
           return false;
         }
 
@@ -2528,9 +2809,12 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           if (existingSessionId) {
             event.preventDefault();
             console.log('[Claude-c] Sending command: claude --resume', existingSessionId);
-            ipcRenderer.send('terminal:input', tabId, '\x15claude --dangerously-skip-permissions --resume ' + existingSessionId + '\r');
-            // Signal command started immediately for Timeline visibility (don't wait for OSC 133)
-            ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude', sessionId: existingSessionId });
+            markPendingResume(tabId, existingSessionId);
+            void invokePtyAgentLaunch(
+              'claude:run-command',
+              { tabId, command: 'claude-c', sessionId: existingSessionId },
+              existingSessionId,
+            );
             return false;
           } else {
             event.preventDefault();
@@ -2559,30 +2843,10 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
                               console.log('[Claude Intercept] Fork from session:', sourceSessionId);
 
-                              // Clear line
-                              ipcRenderer.send('terminal:input', tabId, '\x15');
-
-                              // Copy file manually and resume with new ID
-                              // This avoids regex catching wrong ID from Claude output
-                              (async () => {
-                                const result = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId, cwd });
-                                if (result.success) {
-                                  console.log('[Claude Intercept] Forked to new session:', result.newSessionId);
-                                  getSetTabCommandType()(tabId, 'claude'); // Set commandType for Timeline visibility
-                                  useWorkspaceStore.getState().markAiForkAutoTitle(tabId, 'claude', sourceSessionId);
-                                  getSetClaudeSessionId()(tabId, result.newSessionId, 'fork');
-                                  markPendingResume(tabId, result.newSessionId);
-                                  let cmdLine = 'claude --dangerously-skip-permissions --resume ' + result.newSessionId;
-                                  if (typeof result.sessionCwd === 'string' && result.sessionCwd.trim()) {
-                                    const safe = result.sessionCwd.replace(/'/g, "'\\''");
-                                    cmdLine = "cd '" + safe + "' && " + cmdLine;
-                                  }
-                                  ipcRenderer.send('terminal:input', tabId, cmdLine + '\r');
-                                } else {
-                                  console.error('[Claude Intercept] Fork failed:', result.error);
-                                  ipcRenderer.send('terminal:input', tabId, 'echo "❌ Fork failed: ' + result.error + '"\r');
-                                }
-                              })();
+                              // Fork preparation and shell launch are one main-side
+                              // transaction. A rejected final admission must not leave
+                              // an orphan JSONL or bind this tab to an unlaunched fork.
+                              void invokeTypedClaudeFork(tabId, sourceSessionId, cwd);
 
                               return false;
                             }        // claude-f without ID - show error
@@ -2605,9 +2869,8 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           }
 
           useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'claude');
-          ipcRenderer.send('terminal:input', tabId, '\x15');
           console.log('[Claude Intercept] Launching Claude');
-          ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
+          void invokePtyAgentLaunch('claude:run-command', { tabId, command: 'claude', cwd });
           return false;
         }
 
@@ -2658,8 +2921,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           }
 
           useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'codex');
-          ipcRenderer.send('terminal:input', tabId, '\x15');
-          ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex', cwd }));
+          void invokePtyAgentLaunch('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex', cwd }));
           return false;
         }
 
@@ -2673,9 +2935,8 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Codex сессия: ' + existingId + '"\r');
             return false;
           }
-          ipcRenderer.send('terminal:input', tabId, '\x15');
           // The typed ID remains launch intent until main proves the open rollout.
-          ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: resumeId, cwd }));
+          void invokePtyAgentLaunch('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: resumeId, cwd }));
           return false;
         }
 
@@ -2684,8 +2945,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
           event.preventDefault();
           const existingSessionId = getCodexSessionId(tabId);
           if (existingSessionId) {
-            ipcRenderer.send('terminal:input', tabId, '\x15');
-            ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: existingSessionId, cwd }));
+            void invokePtyAgentLaunch('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: existingSessionId, cwd }));
           } else {
             ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ No Codex session saved for this tab"\r');
           }
@@ -2702,9 +2962,8 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Codex сессия: ' + existingId + '. Откройте новый таб для codex-f"\r');
             return false;
           }
-          ipcRenderer.send('terminal:input', tabId, '\x15');
           useWorkspaceStore.getState().markAiForkAutoTitle(tabId, 'codex', sourceSessionId);
-          ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-f', sessionId: sourceSessionId, cwd }));
+          void invokePtyAgentLaunch('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-f', sessionId: sourceSessionId, cwd }));
           return false;
         }
 
@@ -2973,9 +3232,9 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         // Setup handlers
         const takeXtermInputOrigin = createXtermInputOriginTracker(term);
         term.onData((data) => {
-          ipcRenderer.send('terminal:input', tabId, data, {
-            xtermInputOrigin: takeXtermInputOrigin(),
-          });
+          const xtermInputOrigin = takeXtermInputOrigin();
+          armNativeCodexPickerProof(term, data, xtermInputOrigin);
+          ipcRenderer.send('terminal:input', tabId, data, { xtermInputOrigin });
         });
         term.onSelectionChange(() => {
           const selection = term.getSelection() || '';
@@ -3128,9 +3387,8 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
               return false;
             }
             useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'codex');
-            ipcRenderer.send('terminal:input', tabId, '\x15');
             const cwd2 = getTabCwd(tabId);
-            ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex', cwd: cwd2 }));
+            void invokePtyAgentLaunch('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex', cwd: cwd2 }));
             return false;
           }
 
@@ -3144,10 +3402,9 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
               ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Codex сессия: ' + existingId + '"\r');
               return false;
             }
-            ipcRenderer.send('terminal:input', tabId, '\x15');
             // The typed ID remains launch intent until main proves the open rollout.
             const cwd2 = getTabCwd(tabId);
-            ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: resumeId, cwd: cwd2 }));
+            void invokePtyAgentLaunch('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: resumeId, cwd: cwd2 }));
             return false;
           }
 
@@ -3156,9 +3413,8 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             event.preventDefault();
             const existingSessionId = getCodexSessionId(tabId);
             if (existingSessionId) {
-              ipcRenderer.send('terminal:input', tabId, '\x15');
               const cwd2 = getTabCwd(tabId);
-              ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: existingSessionId, cwd: cwd2 }));
+              void invokePtyAgentLaunch('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-c', sessionId: existingSessionId, cwd: cwd2 }));
             } else {
               ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ No Codex session saved for this tab"\r');
             }
@@ -3175,10 +3431,9 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
               ipcRenderer.send('terminal:input', tabId, '\x15echo "❌ Уже есть Codex сессия: ' + existingId + '. Откройте новый таб для codex-f"\r');
               return false;
             }
-            ipcRenderer.send('terminal:input', tabId, '\x15');
             const cwd2 = getTabCwd(tabId);
             useWorkspaceStore.getState().markAiForkAutoTitle(tabId, 'codex', sourceSessionId);
-            ipcRenderer.send('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-f', sessionId: sourceSessionId, cwd: cwd2 }));
+            void invokePtyAgentLaunch('codex:run-command', buildCodexRunPayload({ tabId, command: 'codex-f', sessionId: sourceSessionId, cwd: cwd2 }));
             return false;
           }
 
@@ -3201,9 +3456,8 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             }
 
             useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'claude');
-            ipcRenderer.send('terminal:input', tabId, '\x15');
             console.log('[Claude Intercept] Launching Claude');
-            ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
+            void invokePtyAgentLaunch('claude:run-command', { tabId, command: 'claude', cwd });
             return false;
           }
 
@@ -3215,9 +3469,12 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             if (existingSessionId) {
               event.preventDefault();
               console.log('[Claude-c] Sending command: claude --resume', existingSessionId);
-              ipcRenderer.send('terminal:input', tabId, '\x15claude --dangerously-skip-permissions --resume ' + existingSessionId + '\r');
-              // Signal command started immediately for Timeline visibility
-              ipcRenderer.send('terminal:force-command-started', { tabId, commandType: 'claude', sessionId: existingSessionId });
+              markPendingResume(tabId, existingSessionId);
+              void invokePtyAgentLaunch(
+                'claude:run-command',
+                { tabId, command: 'claude-c', sessionId: existingSessionId },
+                existingSessionId,
+              );
               return false;
             } else {
               event.preventDefault();
@@ -3245,29 +3502,8 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
             console.log('[Claude Intercept] Fork from session:', sourceSessionId);
 
-            // Clear line
-            ipcRenderer.send('terminal:input', tabId, '\x15');
-
-            // Copy file manually and resume with new ID
-            (async () => {
-              const result = await ipcRenderer.invoke('claude:fork-session-file', { sourceSessionId, cwd });
-              if (result.success) {
-                console.log('[Claude Intercept] Forked to new session:', result.newSessionId);
-                getSetTabCommandType()(tabId, 'claude'); // Set commandType for Timeline visibility
-                useWorkspaceStore.getState().markAiForkAutoTitle(tabId, 'claude', sourceSessionId);
-                getSetClaudeSessionId()(tabId, result.newSessionId, 'fork');
-                markPendingResume(tabId, result.newSessionId);
-                let cmdLine = 'claude --dangerously-skip-permissions --resume ' + result.newSessionId;
-                if (typeof result.sessionCwd === 'string' && result.sessionCwd.trim()) {
-                  const safe = result.sessionCwd.replace(/'/g, "'\\''");
-                  cmdLine = "cd '" + safe + "' && " + cmdLine;
-                }
-                ipcRenderer.send('terminal:input', tabId, cmdLine + '\r');
-              } else {
-                console.error('[Claude Intercept] Fork failed:', result.error);
-                ipcRenderer.send('terminal:input', tabId, 'echo "❌ Fork failed: ' + result.error + '"\r');
-              }
-            })();
+            // Main owns both the fork artifact and the proven-idle shell write.
+            void invokeTypedClaudeFork(tabId, sourceSessionId, cwd);
 
             return false;
           }
@@ -3291,9 +3527,8 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
             }
 
             useWorkspaceStore.getState().markAiLaunchAutoTitle(tabId, 'claude');
-            ipcRenderer.send('terminal:input', tabId, '\x15');
             console.log('[Claude Intercept] Launching Claude');
-            ipcRenderer.send('claude:spawn-with-watcher', { tabId, cwd });
+            void invokePtyAgentLaunch('claude:run-command', { tabId, command: 'claude', cwd });
             return false;
           }
 
@@ -3388,7 +3623,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
       }
 
       // Don't steal focus from an open tab-rename input (new-tab auto-edit).
-      if (!isExternalEditableFocused()) {
+      if (presentedProp && !isExternalEditableFocused()) {
         term.focus();
       }
 
@@ -3436,7 +3671,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         wasAtBottom.current = buffer.viewportY >= buffer.baseY;
       }
     };
-  }, [effectiveActive, isActiveProject, tabId]);
+  }, [effectiveActive, isActiveProject, presentedProp, tabId]);
 
   // React to font size changes
   useEffect(() => {
@@ -3520,13 +3755,14 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         data-terminal-layer-tab-id={tabId}
         data-terminal-layer-owner-project={ownerProjectId || ''}
         data-terminal-layer-active={effectiveActive ? '1' : '0'}
+        data-terminal-layer-presented={effectivePresented ? '1' : '0'}
         style={{
           zIndex: effectiveActive ? 1 : 0,
           isolation: 'isolate',
-          visibility: effectiveActive ? 'inherit' : 'hidden',
-          opacity: effectiveActive && isVisible ? 1 : 0,
-          pointerEvents: effectiveActive ? 'auto' : 'none',
-          transition: effectiveActive ? 'opacity 0.05s ease-in' : 'none',
+          visibility: effectivePresented ? 'inherit' : 'hidden',
+          opacity: effectivePresented && isVisible ? 1 : 0,
+          pointerEvents: effectivePresented ? 'auto' : 'none',
+          transition: effectivePresented ? 'opacity 0.05s ease-in' : 'none',
         }}
       >
 
@@ -3545,27 +3781,30 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
 
       {/* Prompt Queue overlay — outside isolation:isolate so it can sit above
           HistoryPanel. `rightInset` only shifts it left for expanded Timeline. */}
-      {effectiveActive && promptQueueAgent && hasPromptQueueSession && claudeProcessAlive && (
-        <PromptQueueOverlay
+      {effectiveActive && promptQueueAgent && (() => {
+        const overlay = <PromptQueueOverlay
           tabId={tabId}
           sessionType={promptQueueAgent}
           agentBusy={agentBusy}
-          rightInset={promptQueueRightInset}
-        />
-      )}
+          rightInset={promptQueueInputSurface === 'history' ? 0 : promptQueueRightInset}
+          hideHistoryToggle={hidePromptQueueHistoryToggle}
+          inputSurface={promptQueueInputSurface}
+        />;
+        return promptQueuePortalHost ? createPortal(overlay, promptQueuePortalHost) : overlay;
+      })()}
 
       {/* Scroll-to-bottom button — OUTSIDE isolation:isolate wrapper so its z-index
           participates in root stacking context (above Timeline tooltip portal z:10000) */}
-      {active && showScrollButton && (
-        <Tooltip content="Scroll to bottom">
+      {active && presentedProp && showScrollButton && (
+        <ControlHint label="Прокрутить терминал вниз">
         <button
           onClick={scrollToBottom}
           className="pointer-events-auto flex items-center justify-center cursor-pointer transition-all duration-200 ease-out hover:scale-105"
 	          style={{
 	            position: 'absolute',
 	            bottom: '16px',
-	            left: historyPanelOpen ? '16px' : undefined,
-	            right: historyPanelOpen ? undefined : '16px',
+	            left: promptQueueInputSurface === 'history' ? undefined : (historyPanelOpen ? '16px' : undefined),
+	            right: promptQueueInputSurface === 'history' ? '16px' : (historyPanelOpen ? undefined : '16px'),
 	            width: '36px',
             height: '36px',
             borderRadius: '8px',
@@ -3590,7 +3829,7 @@ function Terminal({ tabId, cwd, active: activeProp, isActiveProject: isActivePro
         >
           ↓
         </button>
-        </Tooltip>
+        </ControlHint>
       )}
     </>
   );

@@ -1,13 +1,42 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import ReactDOM from 'react-dom';
-import { CornerDownRight, PanelRightDashed, Plus, Redo2, Trash2, Undo2 } from 'lucide-react';
+import {
+  Archive,
+  ArchiveRestore,
+  Check,
+  CheckSquare,
+  CornerDownRight,
+  ListChecks,
+  ListPlus,
+  PanelRightDashed,
+  Plus,
+  Redo2,
+  Square,
+  TextCursorInput,
+  Trash2,
+  Undo2,
+} from 'lucide-react';
 import {
   useWorkspaceStore,
+  type CommandType,
   type TabTaskPlanDocument,
   type TabTaskPlanItem,
   type TabTaskPlanOperation,
 } from '../../store/useWorkspaceStore';
 import { useUIStore, type SessionStatusDef } from '../../store/useUIStore';
+import { terminalRegistry } from '../../utils/terminalRegistry';
+import {
+  consumeTaskPlanNavigation,
+  subscribeTaskPlanNavigation,
+  type TaskPlanNavigationTarget,
+} from '../../utils/taskPlanNavigation';
+import {
+  appendTaskPlanTransfer,
+  buildTaskPlanSelectionExtraction,
+  collectTaskTreeIds,
+  formatTaskPlanTransfer,
+  taskPlanStateFingerprint,
+} from '../../utils/taskPlanSelectionModel.mjs';
 
 const { ipcRenderer } = window.require('electron');
 const path = window.require('path');
@@ -16,6 +45,7 @@ const EMPTY_PLAN: TabTaskPlanDocument = {
   version: 1,
   revision: 0,
   items: [],
+  archivedItems: [],
   history: { past: [], future: [] },
   updatedAt: null,
   updatedBy: null,
@@ -48,6 +78,109 @@ const TASK_PLAN_MIN_WIDTH = 156;
 const TASK_PLAN_CONTENT_MAX_WIDTH = 420;
 const TASK_PLAN_RESERVE_MAX_WIDTH = 640;
 const TASK_PLAN_DEFAULT_RESERVE_WIDTH = 380;
+const TASK_PLAN_NAVIGATION_FLASH_MS = 360;
+const TASK_PLAN_SELECTION_EXTRA_WIDTH = 20;
+
+type TaskPlanInputSurface = 'history' | 'sdk' | 'terminal';
+type TaskPlanInputTarget = 'history' | 'sdk' | 'claude' | 'codex';
+
+type InputTransferTransaction = {
+  beforePlan: string;
+  afterPlan: string;
+  beforeInput: string;
+  afterInput: string;
+  inputTarget: TaskPlanInputTarget;
+  undone: boolean;
+};
+
+const inputTransferTransactions = new Map<string, InputTransferTransaction[]>();
+
+function getInputTransactions(tabId: string): InputTransferTransaction[] {
+  const current = inputTransferTransactions.get(tabId);
+  if (current) return current;
+  const created: InputTransferTransaction[] = [];
+  inputTransferTransactions.set(tabId, created);
+  return created;
+}
+
+function resolveTaskPlanInputTarget(
+  surface: TaskPlanInputSurface,
+  commandType: CommandType | null,
+): TaskPlanInputTarget | null {
+  if (surface === 'history' || surface === 'sdk') return surface;
+  return commandType === 'claude' || commandType === 'codex' ? commandType : null;
+}
+
+function getSdkComposerTextarea(tabId: string): HTMLTextAreaElement | null {
+  const root = document.querySelector<HTMLElement>(
+    `[data-claude-sdk-tab-id="${CSS.escape(tabId)}"]`,
+  );
+  return root?.querySelector('textarea') || null;
+}
+
+async function readTaskPlanInput(tabId: string, target: TaskPlanInputTarget): Promise<string> {
+  if (target === 'history') {
+    return useUIStore.getState().historyPromptDrafts[tabId] || '';
+  }
+  if (target === 'sdk') {
+    const textarea = getSdkComposerTextarea(tabId);
+    if (!textarea) throw new Error('sdk_input_not_available');
+    return textarea.value;
+  }
+  const result = await ipcRenderer.invoke(`${target}:copy-input`, tabId);
+  if (result?.success !== true || typeof result.text !== 'string') {
+    throw new Error(result?.error || `${target}_input_not_available`);
+  }
+  return result.text;
+}
+
+async function replaceTaskPlanInput(
+  tabId: string,
+  target: TaskPlanInputTarget,
+  text: string,
+  focus: boolean,
+): Promise<void> {
+  if (target === 'history') {
+    useUIStore.getState().setHistoryPromptDraft(tabId, text, { preserveImages: true });
+    if (focus) {
+      requestAnimationFrame(() => {
+        const textarea = document.querySelector<HTMLTextAreaElement>(
+          `textarea[data-history-composer-tab-id="${CSS.escape(tabId)}"]`,
+        );
+        textarea?.focus();
+        textarea?.setSelectionRange(textarea.value.length, textarea.value.length);
+      });
+    }
+    return;
+  }
+  if (target === 'sdk') {
+    const textarea = getSdkComposerTextarea(tabId);
+    if (!textarea) throw new Error('sdk_input_not_available');
+    window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', {
+      detail: { tabId, text, replace: true, skipChip: true },
+    }));
+    const updated = getSdkComposerTextarea(tabId);
+    if (!updated || updated.value !== text) throw new Error('sdk_input_replace_failed');
+    if (focus) {
+      updated.focus();
+      updated.setSelectionRange(updated.value.length, updated.value.length);
+    }
+    return;
+  }
+  const result = await ipcRenderer.invoke(`${target}:restore-input`, tabId, text);
+  if (result?.success !== true) throw new Error(result?.error || `${target}_input_replace_failed`);
+  if (focus) {
+    terminalRegistry.get(tabId)?.focus();
+  }
+}
+
+function isTextEditingElement(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return target.tagName === 'INPUT'
+    || target.tagName === 'TEXTAREA'
+    || target.tagName === 'SELECT'
+    || target.isContentEditable;
+}
 
 type TaskPlanLayout = {
   reserveWidth: number;
@@ -187,8 +320,10 @@ function PlanTitleField({
 
   useLayoutEffect(() => {
     if (!editing) return;
-    inputRef.current?.focus();
-    inputRef.current?.select();
+    const editor = inputRef.current;
+    if (!editor) return;
+    editor.focus();
+    editor.setSelectionRange(editor.value.length, editor.value.length);
   }, [editing]);
 
   useLayoutEffect(() => {
@@ -464,7 +599,26 @@ function StatusMarker({ status, size, shape }: { status: SessionStatusDef; size:
   );
 }
 
-export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string; projectPath: string }) {
+type TaskMenuState = {
+  x: number;
+  y: number;
+} & (
+  | { kind: 'task'; taskId: string; archived: boolean; subtaskCount: number }
+  | { kind: 'subtask'; taskId: string; subtaskId: string }
+  | { kind: 'selection' }
+);
+
+export default function TabTaskPlanPanel({
+  tabId,
+  projectPath,
+  inputSurface,
+  commandType,
+}: {
+  tabId: string;
+  projectPath: string;
+  inputSurface: TaskPlanInputSurface;
+  commandType: CommandType | null;
+}) {
   const plan = useWorkspaceStore((state) => {
     for (const workspace of state.openProjects.values()) {
       const tab = workspace.tabs.get(tabId);
@@ -477,12 +631,24 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
   const redo = useWorkspaceStore((state) => state.redoTabTaskPlan);
   const taskStatuses = useUIStore((state) => state.taskStatuses);
   const marker = useUIStore((state) => state.taskStatusMarker);
+  const showToast = useUIStore((state) => state.showToast);
   const [expandedState, setExpandedState] = useState(() => ({ tabId, expanded: loadExpanded(tabId) }));
   const expanded = expandedState.tabId === tabId ? expandedState.expanded : loadExpanded(tabId);
   const [animatedTabId, setAnimatedTabId] = useState<string | null>(null);
   const animateExpansion = animatedTabId === tabId;
+  const [animatedArchiveTabId, setAnimatedArchiveTabId] = useState<string | null>(null);
+  const animateArchive = animatedArchiveTabId === tabId;
+  const [animatedWidthTabId, setAnimatedWidthTabId] = useState<string | null>(null);
+  const animateWidth = animatedWidthTabId === tabId;
   const [autoEditId, setAutoEditId] = useState<string | null>(null);
   const [statusMenu, setStatusMenu] = useState<{ taskId: string; x: number; y: number } | null>(null);
+  const [taskMenu, setTaskMenu] = useState<TaskMenuState | null>(null);
+  const [showArchive, setShowArchive] = useState(false);
+  const [flashTaskId, setFlashTaskId] = useState<string | null>(null);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [hoveredSelectionId, setHoveredSelectionId] = useState<string | null>(null);
+  const [panelFocused, setPanelFocused] = useState(false);
   const [autoWidth, setAutoWidth] = useState(TASK_PLAN_MIN_WIDTH);
   const [draftTitles, setDraftTitles] = useState<Record<string, string>>({});
   const [panelLayout, setPanelLayout] = useState<TaskPlanLayout>(() => loadPanelLayout(tabId));
@@ -490,6 +656,7 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
   const [isResizing, setIsResizing] = useState(false);
   const [resizeHovered, setResizeHovered] = useState(false);
   const statusMenuRef = useRef<HTMLDivElement>(null);
+  const taskMenuRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLElement>(null);
   const titleMeasureRef = useRef<HTMLDivElement>(null);
@@ -498,6 +665,15 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
     setAnimatedTabId(null);
     setAutoEditId(null);
     setStatusMenu(null);
+    setTaskMenu(null);
+    setShowArchive(false);
+    setFlashTaskId(null);
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+    setHoveredSelectionId(null);
+    setPanelFocused(false);
+    setAnimatedArchiveTabId(null);
+    setAnimatedWidthTabId(null);
     setDraftTitles({});
   }, [tabId]);
 
@@ -554,8 +730,89 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
     };
   }, [statusMenu]);
 
+  useEffect(() => {
+    if (!taskMenu) return;
+    const close = (event: MouseEvent) => {
+      if (taskMenuRef.current?.contains(event.target as Node)) return;
+      setTaskMenu(null);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      setTaskMenu(null);
+    };
+    window.addEventListener('mousedown', close);
+    window.addEventListener('keydown', escape, true);
+    return () => {
+      window.removeEventListener('mousedown', close);
+      window.removeEventListener('keydown', escape, true);
+    };
+  }, [taskMenu]);
+
+  useEffect(() => {
+    const clearPanelFocus = (event?: Event) => {
+      if (event?.target instanceof Node && panelRef.current?.contains(event.target)) return;
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && panelRef.current?.contains(active)) active.blur();
+      setPanelFocused(false);
+    };
+    window.addEventListener('mousedown', clearPanelFocus);
+    window.addEventListener('blur', clearPanelFocus);
+    return () => {
+      window.removeEventListener('mousedown', clearPanelFocus);
+      window.removeEventListener('blur', clearPanelFocus);
+    };
+  }, []);
+
+  const archivedItems = plan.archivedItems || EMPTY_PLAN.archivedItems;
+  const visibleItems = useMemo(
+    () => showArchive ? [...archivedItems, ...plan.items] : plan.items,
+    [archivedItems, plan.items, showArchive],
+  );
+
+  useEffect(() => {
+    if (!showArchive || archivedItems.length > 0) return;
+    setAnimatedArchiveTabId(tabId);
+    setAnimatedWidthTabId(tabId);
+    setShowArchive(false);
+  }, [archivedItems.length, showArchive, tabId]);
+
+  useEffect(() => {
+    const available = new Set(
+      plan.items.flatMap((task) => [task.id, ...task.subtasks.map((subtask) => subtask.id)]),
+    );
+    setSelectedIds((current) => {
+      const next = new Set(Array.from(current).filter((id) => available.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [plan.items]);
+
+  const navigateToTask = useCallback((target: TaskPlanNavigationTarget) => {
+    if (target.tabId !== tabId) return;
+    if (target.view === 'archive') setShowArchive(true);
+    setPanelExpanded(true);
+    setFlashTaskId(null);
+    if (target.taskId) {
+      requestAnimationFrame(() => setFlashTaskId(target.taskId || null));
+    }
+  }, [setPanelExpanded, tabId]);
+
+  useEffect(() => {
+    const unsubscribe = subscribeTaskPlanNavigation(tabId, navigateToTask);
+    const pending = consumeTaskPlanNavigation(tabId);
+    if (pending) navigateToTask(pending);
+    return unsubscribe;
+  }, [navigateToTask, tabId]);
+
   useLayoutEffect(() => {
-    if (plan.items.length === 0) {
+    if (!flashTaskId) return;
+    const task = panelRef.current?.querySelector<HTMLElement>(`[data-task-plan-task-id="${CSS.escape(flashTaskId)}"]`);
+    task?.scrollIntoView({ block: 'nearest' });
+  }, [flashTaskId, showArchive, visibleItems]);
+
+  useLayoutEffect(() => {
+    if (visibleItems.length === 0) {
       setAutoWidth(TASK_PLAN_MIN_WIDTH);
       return;
     }
@@ -565,7 +822,7 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
       return Math.max(width, child.offsetWidth + extra);
     }, 0);
     setAutoWidth(clampContentWidth(Math.ceil(widestTitle)));
-  }, [draftTitles, expanded, marker.sizePx, plan.items]);
+  }, [draftTitles, expanded, marker.sizePx, selectionMode, showArchive, visibleItems]);
 
   const statusById = useMemo(() => new Map(taskStatuses.map((status) => [status.id, status])), [taskStatuses]);
 
@@ -574,6 +831,7 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
   }, [applyOperations, tabId]);
 
   const addRoot = useCallback(async () => {
+    setShowArchive(false);
     const document = await apply([{ type: 'add_task', title: 'Новая задача' }]);
     const created = document?.items[document.items.length - 1];
     if (created) {
@@ -588,6 +846,293 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
     const created = updated?.subtasks[updated.subtasks.length - 1];
     if (created) setAutoEditId(created.id);
   }, [apply]);
+
+  const inputTarget = useMemo(
+    () => resolveTaskPlanInputTarget(inputSurface, commandType),
+    [commandType, inputSurface],
+  );
+
+  const selectedNodeCount = selectedIds.size;
+
+  const toggleSelectionMode = useCallback(() => {
+    setAnimatedWidthTabId(tabId);
+    setSelectionMode((current) => {
+      if (current) setSelectedIds(new Set());
+      else setPanelExpanded(true);
+      return !current;
+    });
+    setTaskMenu(null);
+    setStatusMenu(null);
+  }, [setPanelExpanded, tabId]);
+
+  const toggleArchive = useCallback(() => {
+    if (archivedItems.length === 0) return;
+    setAnimatedArchiveTabId(tabId);
+    setAnimatedWidthTabId(tabId);
+    setPanelExpanded(true);
+    setShowArchive((current) => !current);
+    setTaskMenu(null);
+    setStatusMenu(null);
+  }, [archivedItems.length, setPanelExpanded, tabId]);
+
+  const toggleTaskSelection = useCallback((task: TabTaskPlanItem) => {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      const ids = collectTaskTreeIds(task);
+      if (next.has(task.id)) ids.forEach((id: string) => next.delete(id));
+      else ids.forEach((id: string) => next.add(id));
+      return next;
+    });
+  }, []);
+
+  const toggleSubtaskSelection = useCallback((subtaskId: string) => {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(subtaskId)) next.delete(subtaskId);
+      else next.add(subtaskId);
+      return next;
+    });
+  }, []);
+
+  const clearSelectionMode = useCallback(() => {
+    setAnimatedWidthTabId(tabId);
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+    setHoveredSelectionId(null);
+  }, [tabId]);
+
+  const transferIdsToInput = useCallback(async (ids: Set<string>) => {
+    const extraction = buildTaskPlanSelectionExtraction(plan.items, ids);
+    if (!extraction.movedNodeCount || extraction.transferItems.length === 0) return;
+    if (!inputTarget) {
+      showToast('Для этой вкладки нет точного чтения input — задачи оставлены в плане', 'warning', 3500);
+      return;
+    }
+
+    const insertion = formatTaskPlanTransfer(extraction.transferItems);
+    if (!insertion) return;
+
+    let beforeInput: string;
+    try {
+      beforeInput = await readTaskPlanInput(tabId, inputTarget);
+    } catch (error: any) {
+      showToast(`Не удалось прочитать input: ${error?.message || String(error)}`, 'error', 3500);
+      return;
+    }
+    const afterInput = appendTaskPlanTransfer(beforeInput, insertion);
+
+    try {
+      await replaceTaskPlanInput(tabId, inputTarget, afterInput, true);
+    } catch (error: any) {
+      showToast(`Не удалось изменить input: ${error?.message || String(error)}`, 'error', 3500);
+      return;
+    }
+
+    const beforePlan = taskPlanStateFingerprint(plan.items, archivedItems);
+    const resultDocument = await apply([{ type: 'replace_plan', tasks: extraction.nextItems }]);
+    if (!resultDocument) {
+      try { await replaceTaskPlanInput(tabId, inputTarget, beforeInput, false); } catch {}
+      showToast('План не изменился; input возвращён в исходное состояние', 'error', 3500);
+      return;
+    }
+
+    const transactions = getInputTransactions(tabId);
+    transactions.push({
+      beforePlan,
+      afterPlan: taskPlanStateFingerprint(resultDocument.items, resultDocument.archivedItems),
+      beforeInput,
+      afterInput,
+      inputTarget,
+      undone: false,
+    });
+    if (transactions.length > 60) transactions.splice(0, transactions.length - 60);
+
+    setTaskMenu(null);
+    clearSelectionMode();
+  }, [apply, archivedItems, clearSelectionMode, inputTarget, plan.items, showToast, tabId]);
+
+  const deleteIdsFromPlan = useCallback(async (ids: Set<string>) => {
+    const extraction = buildTaskPlanSelectionExtraction(plan.items, ids);
+    if (!extraction.movedNodeCount) return;
+    const result = await apply([{ type: 'replace_plan', tasks: extraction.nextItems }]);
+    if (result) {
+      setTaskMenu(null);
+      clearSelectionMode();
+    }
+  }, [apply, clearSelectionMode, plan.items]);
+
+  const findUndoInputTransaction = useCallback((): InputTransferTransaction | null => {
+    if (plan.history.past.length === 0) return null;
+    const previous = plan.history.past[plan.history.past.length - 1];
+    const currentFingerprint = taskPlanStateFingerprint(plan.items, archivedItems);
+    const previousFingerprint = taskPlanStateFingerprint(previous.items, previous.archivedItems || []);
+    const transactions = getInputTransactions(tabId);
+    for (let index = transactions.length - 1; index >= 0; index -= 1) {
+      const transaction = transactions[index];
+      if (
+        !transaction.undone
+        && transaction.afterPlan === currentFingerprint
+        && transaction.beforePlan === previousFingerprint
+      ) return transaction;
+    }
+    return null;
+  }, [archivedItems, plan.history.past, plan.items, tabId]);
+
+  const findRedoInputTransaction = useCallback((): InputTransferTransaction | null => {
+    if (plan.history.future.length === 0) return null;
+    const next = plan.history.future[0];
+    const currentFingerprint = taskPlanStateFingerprint(plan.items, archivedItems);
+    const nextFingerprint = taskPlanStateFingerprint(next.items, next.archivedItems || []);
+    const transactions = getInputTransactions(tabId);
+    for (let index = transactions.length - 1; index >= 0; index -= 1) {
+      const transaction = transactions[index];
+      if (
+        transaction.undone
+        && transaction.beforePlan === currentFingerprint
+        && transaction.afterPlan === nextFingerprint
+      ) return transaction;
+    }
+    return null;
+  }, [archivedItems, plan.history.future, plan.items, tabId]);
+
+  const runPlanUndo = useCallback(async () => {
+    const transaction = findUndoInputTransaction();
+    let inputBeforeAction: string | null = null;
+    let replacedInput = false;
+    if (transaction) {
+      try {
+        inputBeforeAction = await readTaskPlanInput(tabId, transaction.inputTarget);
+        if (inputBeforeAction === transaction.afterInput) {
+          await replaceTaskPlanInput(tabId, transaction.inputTarget, transaction.beforeInput, false);
+          replacedInput = true;
+        }
+      } catch (error: any) {
+        showToast(`Отмена остановлена: input недоступен (${error?.message || String(error)})`, 'error', 3500);
+        return;
+      }
+    }
+
+    const result = await undo(tabId);
+    if (!result) {
+      if (transaction && replacedInput && inputBeforeAction !== null) {
+        try { await replaceTaskPlanInput(tabId, transaction.inputTarget, inputBeforeAction, false); } catch {}
+      }
+      return;
+    }
+    if (transaction) {
+      transaction.undone = true;
+      if (
+        inputBeforeAction !== transaction.afterInput
+        && inputBeforeAction !== transaction.beforeInput
+      ) {
+        showToast('План отменён; более новый текст в input оставлен без изменений', 'warning', 3000);
+      }
+    }
+  }, [findUndoInputTransaction, showToast, tabId, undo]);
+
+  const runPlanRedo = useCallback(async () => {
+    const transaction = findRedoInputTransaction();
+    let inputBeforeAction: string | null = null;
+    let replacedInput = false;
+    if (transaction) {
+      try {
+        inputBeforeAction = await readTaskPlanInput(tabId, transaction.inputTarget);
+        if (inputBeforeAction === transaction.beforeInput) {
+          await replaceTaskPlanInput(tabId, transaction.inputTarget, transaction.afterInput, false);
+          replacedInput = true;
+        }
+      } catch (error: any) {
+        showToast(`Повтор остановлен: input недоступен (${error?.message || String(error)})`, 'error', 3500);
+        return;
+      }
+    }
+
+    const result = await redo(tabId);
+    if (!result) {
+      if (transaction && replacedInput && inputBeforeAction !== null) {
+        try { await replaceTaskPlanInput(tabId, transaction.inputTarget, inputBeforeAction, false); } catch {}
+      }
+      return;
+    }
+    if (transaction) {
+      transaction.undone = false;
+      if (
+        inputBeforeAction !== transaction.beforeInput
+        && inputBeforeAction !== transaction.afterInput
+      ) {
+        showToast('План повторён; более новый текст в input оставлен без изменений', 'warning', 3000);
+      }
+    }
+  }, [findRedoInputTransaction, redo, showToast, tabId]);
+
+  const focusPlanPanel = useCallback(() => {
+    panelRef.current?.focus({ preventScroll: true });
+  }, []);
+
+  const handlePanelKeyDown = useCallback((event: React.KeyboardEvent<HTMLElement>) => {
+    if (!event.metaKey || event.altKey || isTextEditingElement(event.target)) return;
+    const key = event.key.toLocaleLowerCase();
+    const wantsUndo = key === 'z' && !event.shiftKey;
+    const wantsRedo = key === 'y' || (key === 'z' && event.shiftKey);
+    if (!wantsUndo && !wantsRedo) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (wantsUndo) void runPlanUndo();
+    else void runPlanRedo();
+  }, [runPlanRedo, runPlanUndo]);
+
+  const openTaskMenu = useCallback((
+    event: React.MouseEvent,
+    task: TabTaskPlanItem,
+    archived: boolean,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+    setStatusMenu(null);
+
+    if (selectionMode && !archived) {
+      if (!selectedIds.has(task.id)) {
+        setSelectedIds(new Set(collectTaskTreeIds(task)));
+      }
+      setTaskMenu({ kind: 'selection', x: event.clientX, y: event.clientY });
+      return;
+    }
+
+    setTaskMenu({
+      kind: 'task',
+      taskId: task.id,
+      archived,
+      subtaskCount: task.subtasks.length,
+      x: event.clientX,
+      y: event.clientY,
+    });
+  }, [selectedIds, selectionMode]);
+
+  const openSubtaskMenu = useCallback((
+    event: React.MouseEvent,
+    taskId: string,
+    subtaskId: string,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+    setStatusMenu(null);
+
+    if (selectionMode) {
+      if (!selectedIds.has(subtaskId)) setSelectedIds(new Set([subtaskId]));
+      setTaskMenu({ kind: 'selection', x: event.clientX, y: event.clientY });
+      return;
+    }
+
+    setTaskMenu({
+      kind: 'subtask',
+      taskId,
+      subtaskId,
+      x: event.clientX,
+      y: event.clientY,
+    });
+  }, [selectedIds, selectionMode]);
 
   const beginResize = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0 || !panelLayout.resizeEnabled) return;
@@ -656,6 +1201,7 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
         boxShadow: '0 14px 34px rgba(0,0,0,0.6)',
       }}
       onContextMenu={(event) => event.preventDefault()}
+      onMouseDown={(event) => event.preventDefault()}
     >
       <button
         type="button"
@@ -665,7 +1211,7 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
         onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
       >
         <span style={{ display: 'inline-flex', width: Math.max(12, marker.sizePx), justifyContent: 'center', flexShrink: 0 }}>
-          <span style={{ width: marker.sizePx, height: marker.sizePx, border: '1px solid #555', borderRadius: marker.shape === 'dot' ? '50%' : 2 }} />
+          <span style={{ width: marker.sizePx, height: marker.sizePx, background: '#73737a', border: '1px solid rgba(0,0,0,0.38)', borderRadius: marker.shape === 'dot' ? '50%' : 2, boxSizing: 'border-box' }} />
         </span>
         Без статуса
       </button>
@@ -688,6 +1234,495 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
     </div>,
     document.body,
   ) : null;
+
+  const taskMenuButton = (
+    key: string,
+    icon: React.ReactNode,
+    label: string,
+    action: () => void,
+    danger = false,
+    disabled = false,
+  ) => (
+    <button
+      key={key}
+      type="button"
+      disabled={disabled}
+      onClick={() => {
+        if (disabled) return;
+        action();
+        setTaskMenu(null);
+      }}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        width: '100%',
+        gap: 7,
+        padding: '6px 7px',
+        color: disabled ? '#4d4d52' : danger ? '#e38c8c' : '#ccc',
+        background: 'transparent',
+        border: 0,
+        borderRadius: 5,
+        cursor: disabled ? 'default' : 'pointer',
+        textAlign: 'left',
+        fontSize: 12,
+        outline: 'none',
+      }}
+      onMouseEnter={(event) => {
+        if (!disabled) event.currentTarget.style.background = danger
+          ? 'rgba(239,68,68,0.11)'
+          : 'rgba(255,255,255,0.07)';
+      }}
+      onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
+    >
+      {icon}
+      <span>{label}</span>
+    </button>
+  );
+
+  const taskMenuContent = (() => {
+    if (!taskMenu) return null;
+    if (taskMenu.kind === 'selection') {
+      const selectionSnapshot = new Set(selectedIds);
+      return (
+        <>
+          {taskMenuButton(
+            'selection-input',
+            <TextCursorInput size={13} />,
+            `Переместить в input${selectedNodeCount > 1 ? ` [${selectedNodeCount}]` : ''}`,
+            () => void transferIdsToInput(selectionSnapshot),
+            false,
+            selectedNodeCount === 0,
+          )}
+          {taskMenuButton(
+            'selection-delete',
+            <Trash2 size={13} />,
+            `Удалить выбранное${selectedNodeCount > 0 ? ` [${selectedNodeCount}]` : ''}`,
+            () => void deleteIdsFromPlan(selectionSnapshot),
+            true,
+            selectedNodeCount === 0,
+          )}
+        </>
+      );
+    }
+
+    if (taskMenu.kind === 'subtask') {
+      return (
+        <>
+          {taskMenuButton(
+            'subtask-input',
+            <TextCursorInput size={13} />,
+            'Переместить в input',
+            () => void transferIdsToInput(new Set([taskMenu.subtaskId])),
+          )}
+          {taskMenuButton(
+            'subtask-delete',
+            <Trash2 size={13} />,
+            'Удалить подзадачу',
+            () => void apply([{
+              type: 'remove_subtask',
+              taskId: taskMenu.taskId,
+              subtaskId: taskMenu.subtaskId,
+            }]),
+            true,
+          )}
+        </>
+      );
+    }
+
+    if (taskMenu.archived) {
+      return taskMenuButton(
+        'task-restore',
+        <ArchiveRestore size={13} />,
+        'Вернуть в активное',
+        () => void apply([{ type: 'restore_task', taskId: taskMenu.taskId }]),
+      );
+    }
+
+    const task = plan.items.find((item) => item.id === taskMenu.taskId);
+    return (
+      <>
+        {taskMenuButton(
+          'task-input',
+          <TextCursorInput size={13} />,
+          'Переместить в input',
+          () => {
+            if (task) void transferIdsToInput(new Set(collectTaskTreeIds(task)));
+          },
+          false,
+          !task,
+        )}
+        {taskMenuButton(
+          'task-complete',
+          <Check size={13} color="#73d29a" />,
+          'Отметить выполненной',
+          () => void apply([{ type: 'archive_task', taskId: taskMenu.taskId }]),
+        )}
+        {taskMenuButton(
+          'task-add-subtask',
+          <ListPlus size={13} />,
+          'Добавить подзадачу',
+          () => {
+            if (task) void addSubtask(task);
+          },
+          false,
+          !task,
+        )}
+        {taskMenuButton(
+          'task-delete',
+          <Trash2 size={13} />,
+          `Удалить задачу${taskMenu.subtaskCount > 0 ? ` [${taskMenu.subtaskCount}]` : ''}`,
+          () => void apply([{ type: 'remove_task', taskId: taskMenu.taskId }]),
+          true,
+        )}
+      </>
+    );
+  })();
+
+  const taskMenuNode = taskMenu ? ReactDOM.createPortal(
+    <div
+      ref={taskMenuRef}
+      data-task-plan-action-menu
+      style={{
+        position: 'fixed',
+        left: Math.max(8, Math.min(taskMenu.x, window.innerWidth - 244)),
+        top: Math.max(8, Math.min(taskMenu.y, window.innerHeight - 178)),
+        width: 236,
+        zIndex: 2147482600,
+        padding: 3,
+        borderRadius: 8,
+        background: '#18181b',
+        border: '1px solid #3a3a40',
+        boxShadow: '0 14px 34px rgba(0,0,0,0.6)',
+      }}
+      onContextMenu={(event) => event.preventDefault()}
+      onMouseDown={(event) => event.preventDefault()}
+    >
+      {taskMenuContent}
+    </div>,
+    document.body,
+  ) : null;
+
+  const renderTaskCard = (task: TabTaskPlanItem, archived: boolean) => {
+    const status = task.statusId ? statusById.get(task.statusId) : undefined;
+    const rootSelected = selectedIds.has(task.id);
+    const rootHovered = selectionMode && hoveredSelectionId === task.id;
+    const isFlashing = flashTaskId === task.id;
+    const canSelect = selectionMode && !archived;
+    const markerNode = status
+      ? <StatusMarker status={status} size={marker.sizePx} shape={marker.shape} />
+      : (
+        <span
+          style={{
+            width: marker.sizePx,
+            height: marker.sizePx,
+            background: '#73737a',
+            border: '1px solid rgba(0,0,0,0.38)',
+            borderRadius: marker.shape === 'dot' ? '50%' : 2,
+            boxSizing: 'border-box',
+          }}
+        />
+      );
+
+    return (
+      <div
+        key={task.id}
+        data-task-plan-task-id={task.id}
+        data-task-plan-archived={archived ? 'true' : undefined}
+        onAnimationEnd={(event) => {
+          if (event.target === event.currentTarget && isFlashing) setFlashTaskId(null);
+        }}
+        style={{
+          marginBottom: expanded ? 3 : 1,
+          paddingLeft: archived ? 2 : 0,
+          borderRadius: 5,
+          background: archived ? 'rgba(139,92,246,0.075)' : 'transparent',
+          boxShadow: archived ? 'inset 2px 0 rgba(167,139,250,0.72)' : 'none',
+          animation: isFlashing
+            ? `noted-task-plan-flash ${TASK_PLAN_NAVIGATION_FLASH_MS}ms ease-out`
+            : 'none',
+        }}
+      >
+        <div
+          onClick={() => {
+            if (canSelect) toggleTaskSelection(task);
+          }}
+          onContextMenu={(event) => openTaskMenu(event, task, archived)}
+          onMouseEnter={() => {
+            if (canSelect) setHoveredSelectionId(task.id);
+          }}
+          onMouseLeave={() => {
+            if (canSelect) setHoveredSelectionId((current) => current === task.id ? null : current);
+          }}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            minHeight: 24,
+            gap: 4,
+            padding: '0 1px',
+            borderRadius: 5,
+            background: canSelect
+              ? rootSelected
+                ? 'rgba(139,92,246,0.15)'
+                : rootHovered
+                  ? 'rgba(255,255,255,0.055)'
+                  : 'transparent'
+              : 'transparent',
+            cursor: canSelect ? 'pointer' : 'default',
+            transition: canSelect ? 'background 90ms ease' : 'none',
+          }}
+        >
+          {archived || canSelect ? (
+            <span
+              aria-hidden
+              style={{
+                width: marker.sizePx,
+                height: marker.sizePx + 4,
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                flexShrink: 0,
+              }}
+            >
+              {markerNode}
+            </span>
+          ) : (
+            <button
+              type="button"
+              title={status ? `Изменить статус: ${status.label}` : 'Выбрать статус'}
+              onClick={(event) => {
+                event.stopPropagation();
+                const rect = event.currentTarget.getBoundingClientRect();
+                setTaskMenu(null);
+                setStatusMenu({
+                  taskId: task.id,
+                  x: rect.left - 272,
+                  y: rect.top,
+                });
+              }}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: marker.sizePx,
+                height: marker.sizePx + 4,
+                padding: 0,
+                flexShrink: 0,
+                color: 'inherit',
+                background: 'transparent',
+                border: 0,
+                borderRadius: 3,
+                cursor: 'pointer',
+                outline: 'none',
+                boxSizing: 'border-box',
+              }}
+            >
+              {markerNode}
+            </button>
+          )}
+
+          <div style={{ flex: 1, minWidth: 0 }}>
+            {expanded && !archived && !selectionMode ? (
+              <PlanTitleField
+                fieldId={task.id}
+                value={task.title}
+                projectPath={projectPath}
+                autoFocus={autoEditId === task.id}
+                onDraftChange={handleDraftChange}
+                onAutoFocusConsumed={() => setAutoEditId(null)}
+                onCommit={(title) => apply([{ type: 'update_task', taskId: task.id, title }])}
+              />
+            ) : (
+              <button
+                type="button"
+                tabIndex={canSelect ? -1 : 0}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  if (canSelect) toggleTaskSelection(task);
+                  else if (!expanded) setPanelExpanded(true);
+                }}
+                title={task.title}
+                style={{
+                  display: '-webkit-box',
+                  width: '100%',
+                  minWidth: 0,
+                  padding: '3px 5px',
+                  textAlign: 'left',
+                  color: archived ? '#aaa4b9' : '#c8c8cc',
+                  background: 'transparent',
+                  border: 0,
+                  borderRadius: 5,
+                  cursor: canSelect || !expanded ? 'pointer' : 'default',
+                  overflow: 'hidden',
+                  whiteSpace: 'normal',
+                  WebkitBoxOrient: 'vertical',
+                  WebkitLineClamp: 2,
+                  fontSize: 12,
+                  lineHeight: 1.3,
+                  overflowWrap: 'anywhere',
+                  outline: 'none',
+                }}
+              >
+                {renderTitle(task.title)}
+              </button>
+            )}
+          </div>
+
+          {canSelect && (
+            <button
+              type="button"
+              aria-label={rootSelected ? 'Снять выбор задачи' : 'Выбрать задачу и подзадачи'}
+              onClick={(event) => {
+                event.stopPropagation();
+                toggleTaskSelection(task);
+              }}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: 17,
+                height: 20,
+                padding: 0,
+                color: rootSelected ? '#c4b5fd' : '#66666d',
+                background: 'transparent',
+                border: 0,
+                cursor: 'pointer',
+                outline: 'none',
+                flexShrink: 0,
+              }}
+            >
+              {rootSelected ? <CheckSquare size={13} /> : <Square size={13} />}
+            </button>
+          )}
+        </div>
+
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateRows: expanded && task.subtasks.length > 0 ? '1fr' : '0fr',
+            opacity: expanded ? 1 : 0,
+            transform: expanded ? 'translateY(0)' : 'translateY(-3px)',
+            transition: animateExpansion
+              ? 'grid-template-rows 180ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 130ms ease, transform 180ms ease'
+              : 'none',
+            pointerEvents: expanded ? 'auto' : 'none',
+          }}
+        >
+          <div style={{ minHeight: 0, overflow: 'hidden' }}>
+            {task.subtasks.map((subtask, index) => {
+              const subtaskSelected = selectedIds.has(subtask.id);
+              const subtaskHovered = canSelect && hoveredSelectionId === subtask.id;
+              return (
+                <div
+                  key={subtask.id}
+                  data-task-plan-task-id={subtask.id}
+                  onClick={(event) => {
+                    if (!canSelect) return;
+                    event.stopPropagation();
+                    toggleSubtaskSelection(subtask.id);
+                  }}
+                  onContextMenu={(event) => {
+                    if (archived) openTaskMenu(event, task, true);
+                    else openSubtaskMenu(event, task.id, subtask.id);
+                  }}
+                  onMouseEnter={() => {
+                    if (canSelect) setHoveredSelectionId(subtask.id);
+                  }}
+                  onMouseLeave={() => {
+                    if (canSelect) {
+                      setHoveredSelectionId((current) => current === subtask.id ? null : current);
+                    }
+                  }}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    minHeight: 23,
+                    gap: 4,
+                    marginLeft: marker.sizePx + 6,
+                    borderRadius: 4,
+                    background: canSelect
+                      ? subtaskSelected
+                        ? 'rgba(139,92,246,0.13)'
+                        : subtaskHovered
+                          ? 'rgba(255,255,255,0.045)'
+                          : 'transparent'
+                      : 'transparent',
+                    cursor: canSelect ? 'pointer' : 'default',
+                    transition: canSelect ? 'background 90ms ease' : 'none',
+                  }}
+                >
+                  <CornerDownRight
+                    size={11}
+                    color={archived
+                      ? '#6f6489'
+                      : index === task.subtasks.length - 1
+                        ? '#4f4f55'
+                        : '#3f3f44'}
+                    style={{ flexShrink: 0 }}
+                  />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    {!archived && !selectionMode ? (
+                      <PlanTitleField
+                        fieldId={subtask.id}
+                        value={subtask.title}
+                        projectPath={projectPath}
+                        autoFocus={autoEditId === subtask.id}
+                        onDraftChange={handleDraftChange}
+                        onAutoFocusConsumed={() => setAutoEditId(null)}
+                        onCommit={(title) => apply([{
+                          type: 'update_subtask',
+                          taskId: task.id,
+                          subtaskId: subtask.id,
+                          title,
+                        }])}
+                      />
+                    ) : (
+                      <div
+                        style={{
+                          padding: '3px 5px',
+                          color: archived ? '#938ba5' : '#b9b9be',
+                          fontSize: 12,
+                          lineHeight: 1.3,
+                          overflowWrap: 'anywhere',
+                        }}
+                      >
+                        {renderTitle(subtask.title)}
+                      </div>
+                    )}
+                  </div>
+                  {canSelect && (
+                    <button
+                      type="button"
+                      aria-label={subtaskSelected ? 'Снять выбор подзадачи' : 'Выбрать подзадачу'}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        toggleSubtaskSelection(subtask.id);
+                      }}
+                      style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        width: 17,
+                        height: 20,
+                        padding: 0,
+                        color: subtaskSelected ? '#c4b5fd' : '#66666d',
+                        background: 'transparent',
+                        border: 0,
+                        cursor: 'pointer',
+                        outline: 'none',
+                        flexShrink: 0,
+                      }}
+                    >
+                      {subtaskSelected ? <CheckSquare size={13} /> : <Square size={13} />}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   const reserveDisplayWidth = Math.min(panelLayout.reserveWidth, availableWidth);
   const displayedWidth = Math.min(autoWidth, reserveDisplayWidth);
@@ -729,6 +1764,19 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
         data-tab-task-plan
         data-tab-id={tabId}
         data-expanded={expanded ? 'true' : 'false'}
+        tabIndex={0}
+        onKeyDown={handlePanelKeyDown}
+        onFocusCapture={(event) => setPanelFocused(!isTextEditingElement(event.target))}
+        onBlurCapture={(event) => {
+          const next = event.relatedTarget;
+          if (!(next instanceof Node) || !event.currentTarget.contains(next)) setPanelFocused(false);
+          else setPanelFocused(!isTextEditingElement(next));
+        }}
+        onTransitionEnd={(event) => {
+          if (event.target === event.currentTarget && event.propertyName === 'width') {
+            setAnimatedWidthTabId((current) => current === tabId ? null : current);
+          }
+        }}
         style={{
           position: 'relative',
           zIndex: 1,
@@ -736,174 +1784,325 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
           maxHeight: 'calc(100vh - 112px)',
           color: '#ccc',
           background: 'rgba(23,23,25,0.96)',
-          border: '1px solid #303036',
+          border: `1px solid ${panelFocused ? 'rgba(167,139,250,0.58)' : '#303036'}`,
           borderRadius: 7,
           boxShadow: expanded ? '0 12px 30px rgba(0,0,0,0.48)' : '0 5px 16px rgba(0,0,0,0.34)',
           backdropFilter: 'blur(8px)',
           overflow: 'hidden',
           pointerEvents: 'auto',
-          transition: animateExpansion ? 'width 180ms cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 160ms ease' : 'none',
-        }}
-      >
-      <div
-        data-task-plan-header
-        role="button"
-        tabIndex={0}
-        title={expanded ? 'Свернуть' : 'Раскрыть'}
-        onClick={() => setPanelExpanded(!expanded)}
-        onKeyDown={(event) => {
-          if (event.target !== event.currentTarget) return;
-          if (event.key !== 'Enter' && event.key !== ' ') return;
-          event.preventDefault();
-          setPanelExpanded(!expanded);
-        }}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          minHeight: 23,
-          padding: '1px 3px',
-          borderBottom: '1px solid #28282d',
-          color: '#a7a7ac',
-          cursor: 'pointer',
           outline: 'none',
-          userSelect: 'none',
+          transition: animateExpansion || animateWidth
+            ? 'width 180ms cubic-bezier(0.2, 0.8, 0.2, 1), border-color 110ms ease, box-shadow 160ms ease'
+            : 'border-color 110ms ease',
         }}
       >
-        <button
-          type="button"
-          onClick={(event) => { event.stopPropagation(); void addRoot(); }}
-          title="Новая задача"
-          style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 3, padding: '2px 4px', color: '#9a9aa0', background: 'transparent', border: 0, borderRadius: 3, cursor: 'pointer', outline: 'none', flexShrink: 0, fontSize: 10, lineHeight: 1 }}
-        >
-          <Plus size={11} />
-          <span>New</span>
-        </button>
-        <span aria-hidden style={{ flex: 1, minWidth: 8 }} />
-        <button
-          type="button"
-          aria-pressed={panelLayout.resizeEnabled}
-          onClick={(event) => { event.stopPropagation(); toggleResize(); }}
-          title={panelLayout.resizeEnabled ? 'Скрыть настройку ширины' : 'Настроить предел ширины'}
+        <style>{`
+          @keyframes noted-task-plan-flash {
+            0% { background-color: rgba(167, 139, 250, 0.34); box-shadow: inset 0 0 0 1px rgba(196, 181, 253, 0.62); }
+            100% { background-color: transparent; box-shadow: inset 0 0 0 1px rgba(196, 181, 253, 0); }
+          }
+        `}</style>
+
+        <div
+          data-task-plan-header
+          role="button"
+          tabIndex={0}
+          title={expanded ? 'Свернуть' : 'Раскрыть'}
+          onClick={() => setPanelExpanded(!expanded)}
+          onKeyDown={(event) => {
+            if (event.target !== event.currentTarget) return;
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            event.preventDefault();
+            setPanelExpanded(!expanded);
+          }}
           style={{
-            display: 'inline-flex', alignItems: 'center', justifyContent: 'center', padding: 2,
-            color: panelLayout.resizeEnabled ? '#a78bfa' : '#66666c',
-            background: panelLayout.resizeEnabled ? 'rgba(139,92,246,0.12)' : 'transparent',
-            border: 0, borderRadius: 3, cursor: 'pointer', outline: 'none', flexShrink: 0,
+            display: 'flex',
+            alignItems: 'center',
+            minHeight: 23,
+            padding: '1px 3px',
+            borderBottom: '1px solid #28282d',
+            color: '#a7a7ac',
+            cursor: 'pointer',
+            outline: 'none',
+            userSelect: 'none',
           }}
         >
-          <PanelRightDashed size={13} />
-        </button>
-      </div>
+          <button
+            type="button"
+            disabled={archivedItems.length === 0}
+            aria-pressed={showArchive}
+            onClick={(event) => {
+              event.stopPropagation();
+              toggleArchive();
+            }}
+            title={showArchive ? 'Скрыть архив' : `Архив задач: ${archivedItems.length}`}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 3,
+              minWidth: 25,
+              padding: '2px 4px',
+              color: archivedItems.length
+                ? showArchive
+                  ? '#c4b5fd'
+                  : '#77777d'
+                : '#424247',
+              background: showArchive ? 'rgba(139,92,246,0.16)' : 'transparent',
+              border: 0,
+              borderRadius: 3,
+              cursor: archivedItems.length ? 'pointer' : 'default',
+              outline: 'none',
+              flexShrink: 0,
+              fontSize: 10,
+              lineHeight: 1,
+            }}
+          >
+            <Archive size={11} />
+            <span>{archivedItems.length}</span>
+          </button>
+          <span aria-hidden style={{ flex: 1, minWidth: 8 }} />
+          <button
+            type="button"
+            aria-pressed={selectionMode}
+            onClick={(event) => {
+              event.stopPropagation();
+              toggleSelectionMode();
+            }}
+            title={selectionMode ? 'Закрыть выбор задач' : 'Выбрать несколько задач'}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 2,
+              minWidth: 17,
+              padding: 2,
+              marginRight: 2,
+              color: selectionMode ? '#c4b5fd' : '#66666c',
+              background: selectionMode ? 'rgba(139,92,246,0.14)' : 'transparent',
+              border: 0,
+              borderRadius: 3,
+              cursor: 'pointer',
+              outline: 'none',
+              flexShrink: 0,
+              fontSize: 9,
+              lineHeight: 1,
+            }}
+          >
+            <ListChecks size={13} />
+            {selectionMode && selectedNodeCount > 0 && <span>{selectedNodeCount}</span>}
+          </button>
+          <button
+            type="button"
+            aria-pressed={panelLayout.resizeEnabled}
+            onClick={(event) => {
+              event.stopPropagation();
+              toggleResize();
+            }}
+            title={panelLayout.resizeEnabled ? 'Скрыть настройку ширины' : 'Настроить предел ширины'}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: 2,
+              color: panelLayout.resizeEnabled ? '#a78bfa' : '#66666c',
+              background: panelLayout.resizeEnabled ? 'rgba(139,92,246,0.12)' : 'transparent',
+              border: 0,
+              borderRadius: 3,
+              cursor: 'pointer',
+              outline: 'none',
+              flexShrink: 0,
+            }}
+          >
+            <PanelRightDashed size={13} />
+          </button>
+        </div>
 
-      <div
-        data-task-plan-details={expanded ? '' : undefined}
-        onTransitionEnd={(event) => {
-          if (event.target === event.currentTarget && event.propertyName === 'max-height') finishExpansionAnimation();
-        }}
-        style={{
-          maxHeight: expanded ? 'min(430px, calc(100vh - 150px))' : 'min(260px, calc(100vh - 150px))',
-          overflowY: 'auto',
-          padding: plan.items.length > 0 ? '2px 3px 3px' : 0,
-          transition: animateExpansion ? 'max-height 200ms cubic-bezier(0.2, 0.8, 0.2, 1), padding 160ms ease' : 'none',
-        }}
-      >
-        {plan.items.map((task) => {
-          const status = task.statusId ? statusById.get(task.statusId) : undefined;
-          return (
-            <div key={task.id} style={{ marginBottom: expanded ? 3 : 1 }}>
-              <div
-                onContextMenu={(event) => {
-                  event.preventDefault();
-                  if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
-                  setStatusMenu({ taskId: task.id, x: event.clientX, y: event.clientY });
-                }}
-                style={{ display: 'flex', alignItems: 'center', minHeight: 24, gap: 4, padding: '0 1px', borderRadius: 5 }}
-              >
-                <span style={{ width: marker.sizePx, display: 'inline-flex', justifyContent: 'center', flexShrink: 0 }}>
-                  {status ? <StatusMarker status={status} size={marker.sizePx} shape={marker.shape} /> : <span style={{ width: marker.sizePx, height: marker.sizePx }} />}
-                </span>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  {expanded ? (
-                    <PlanTitleField
-                      fieldId={task.id}
-                      value={task.title}
-                      projectPath={projectPath}
-                      autoFocus={autoEditId === task.id}
-                      onDraftChange={handleDraftChange}
-                      onAutoFocusConsumed={() => setAutoEditId(null)}
-                      onCommit={(title) => apply([{ type: 'update_task', taskId: task.id, title }])}
-                    />
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => setPanelExpanded(true)}
-                      title={task.title}
-                      style={{ display: '-webkit-box', width: '100%', minWidth: 0, padding: '3px 5px', textAlign: 'left', color: '#c8c8cc', background: 'transparent', border: 0, borderRadius: 5, cursor: 'pointer', overflow: 'hidden', whiteSpace: 'normal', WebkitBoxOrient: 'vertical', WebkitLineClamp: 2, fontSize: 12, lineHeight: 1.3, overflowWrap: 'anywhere', outline: 'none' }}
-                    >
-                      {renderTitle(task.title)}
-                    </button>
-                  )}
-                </div>
-                <div style={{ display: 'inline-flex', width: 38, opacity: expanded ? 1 : 0, pointerEvents: expanded ? 'auto' : 'none', overflow: 'hidden', flexShrink: 0, transition: animateExpansion ? 'opacity 120ms ease' : 'none' }}>
-                  <button type="button" tabIndex={expanded ? 0 : -1} onClick={() => void addSubtask(task)} title="Добавить подзадачу" style={{ display: 'inline-flex', padding: 3, color: '#777', background: 'transparent', border: 0, borderRadius: 3, cursor: 'pointer', outline: 'none' }}><Plus size={12} /></button>
-                  <button type="button" tabIndex={expanded ? 0 : -1} onClick={() => void apply([{ type: 'remove_task', taskId: task.id }])} title="Удалить задачу" style={{ display: 'inline-flex', padding: 3, color: '#5f5f64', background: 'transparent', border: 0, borderRadius: 3, cursor: 'pointer', outline: 'none' }}><Trash2 size={11} /></button>
-                </div>
-              </div>
-
+        <div
+          data-task-plan-details={expanded ? '' : undefined}
+          onTransitionEnd={(event) => {
+            if (event.target === event.currentTarget && event.propertyName === 'max-height') {
+              finishExpansionAnimation();
+            }
+          }}
+          style={{
+            maxHeight: expanded ? 'min(430px, calc(100vh - 150px))' : 'min(260px, calc(100vh - 150px))',
+            overflowY: 'auto',
+            padding: visibleItems.length > 0 ? '2px 3px 3px' : 0,
+            transition: animateExpansion
+              ? 'max-height 200ms cubic-bezier(0.2, 0.8, 0.2, 1), padding 160ms ease'
+              : 'none',
+          }}
+        >
+          <div
+            data-task-plan-archive-list
+            onTransitionEnd={(event) => {
+              if (
+                event.target === event.currentTarget
+                && event.propertyName === 'grid-template-rows'
+              ) {
+                setAnimatedArchiveTabId((current) => current === tabId ? null : current);
+              }
+            }}
+            style={{
+              display: 'grid',
+              gridTemplateRows: showArchive ? '1fr' : '0fr',
+              opacity: showArchive ? 1 : 0,
+              transform: showArchive ? 'translateY(0)' : 'translateY(-4px)',
+              transition: animateArchive
+                ? 'grid-template-rows 190ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 130ms ease, transform 190ms ease'
+                : 'none',
+            }}
+          >
+            <div style={{ minHeight: 0, overflow: 'hidden' }}>
               <div
                 style={{
-                  display: 'grid',
-                  gridTemplateRows: expanded && task.subtasks.length > 0 ? '1fr' : '0fr',
-                  opacity: expanded ? 1 : 0,
-                  transform: expanded ? 'translateY(0)' : 'translateY(-3px)',
-                  transition: animateExpansion ? 'grid-template-rows 180ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 130ms ease, transform 180ms ease' : 'none',
-                  pointerEvents: expanded ? 'auto' : 'none',
+                  marginBottom: showArchive && plan.items.length > 0 ? 3 : 0,
+                  paddingBottom: showArchive && plan.items.length > 0 ? 2 : 0,
+                  borderBottom: showArchive && plan.items.length > 0
+                    ? '1px solid rgba(167,139,250,0.13)'
+                    : 'none',
                 }}
               >
-                <div style={{ minHeight: 0, overflow: 'hidden' }}>
-                  {task.subtasks.map((subtask, index) => (
-                    <div key={subtask.id} style={{ display: 'flex', alignItems: 'center', minHeight: 23, gap: 4, marginLeft: marker.sizePx + 6 }}>
-                      <CornerDownRight size={11} color={index === task.subtasks.length - 1 ? '#4f4f55' : '#3f3f44'} style={{ flexShrink: 0 }} />
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <PlanTitleField
-                          fieldId={subtask.id}
-                          value={subtask.title}
-                          projectPath={projectPath}
-                          autoFocus={autoEditId === subtask.id}
-                          onDraftChange={handleDraftChange}
-                          onAutoFocusConsumed={() => setAutoEditId(null)}
-                          onCommit={(title) => apply([{ type: 'update_subtask', taskId: task.id, subtaskId: subtask.id, title }])}
-                        />
-                      </div>
-                      <button type="button" onClick={() => void apply([{ type: 'remove_subtask', taskId: task.id, subtaskId: subtask.id }])} title="Удалить подзадачу" style={{ display: 'inline-flex', padding: 3, color: '#55555a', background: 'transparent', border: 0, borderRadius: 3, cursor: 'pointer', outline: 'none' }}><Trash2 size={11} /></button>
-                    </div>
-                  ))}
-                </div>
+                {archivedItems.map((task) => renderTaskCard(task, true))}
               </div>
             </div>
-          );
-        })}
+          </div>
+          {plan.items.map((task) => renderTaskCard(task, false))}
+        </div>
 
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateRows: expanded ? '1fr' : '0fr', opacity: expanded ? 1 : 0, transition: animateExpansion ? 'grid-template-rows 170ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 110ms ease' : 'none' }}>
-        <div style={{ minHeight: 0, overflow: 'hidden' }}>
-          <div data-task-plan-footer style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', height: 22, padding: '1px 3px', borderTop: '1px solid #28282d' }}>
-            <button type="button" disabled={plan.history.past.length === 0} onClick={() => void undo(tabId)} title="Назад" style={{ display: 'inline-flex', padding: 2, color: plan.history.past.length ? '#aaa' : '#444', background: 'transparent', border: 0, borderRadius: 3, cursor: plan.history.past.length ? 'pointer' : 'default', outline: 'none' }}><Undo2 size={12} /></button>
-            <button type="button" disabled={plan.history.future.length === 0} onClick={() => void redo(tabId)} title="Вперёд" style={{ display: 'inline-flex', padding: 2, color: plan.history.future.length ? '#aaa' : '#444', background: 'transparent', border: 0, borderRadius: 3, cursor: plan.history.future.length ? 'pointer' : 'default', outline: 'none' }}><Redo2 size={12} /></button>
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateRows: expanded ? '1fr' : '0fr',
+            opacity: expanded ? 1 : 0,
+            transition: animateExpansion
+              ? 'grid-template-rows 170ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 110ms ease'
+              : 'none',
+          }}
+        >
+          <div style={{ minHeight: 0, overflow: 'hidden' }}>
+            <div
+              data-task-plan-footer
+              onMouseDown={(event) => {
+                if (event.target === event.currentTarget) focusPlanPanel();
+              }}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                height: 22,
+                padding: '1px 3px',
+                borderTop: '1px solid #28282d',
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => void addRoot()}
+                title="Новая задача"
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 3,
+                  padding: '2px 4px',
+                  color: '#9a9aa0',
+                  background: 'transparent',
+                  border: 0,
+                  borderRadius: 3,
+                  cursor: 'pointer',
+                  outline: 'none',
+                  flexShrink: 0,
+                  fontSize: 10,
+                  lineHeight: 1,
+                }}
+              >
+                <Plus size={11} />
+                <span>New</span>
+              </button>
+              <span aria-hidden style={{ flex: 1, minWidth: 6 }} />
+              <button
+                type="button"
+                disabled={plan.history.past.length === 0}
+                onClick={() => void runPlanUndo()}
+                title="Назад · Cmd+Z"
+                style={{
+                  display: 'inline-flex',
+                  padding: 2,
+                  color: plan.history.past.length ? '#aaa' : '#444',
+                  background: 'transparent',
+                  border: 0,
+                  borderRadius: 3,
+                  cursor: plan.history.past.length ? 'pointer' : 'default',
+                  outline: 'none',
+                }}
+              >
+                <Undo2 size={12} />
+              </button>
+              <button
+                type="button"
+                disabled={plan.history.future.length === 0}
+                onClick={() => void runPlanRedo()}
+                title="Вперёд · Cmd+Y"
+                style={{
+                  display: 'inline-flex',
+                  padding: 2,
+                  color: plan.history.future.length ? '#aaa' : '#444',
+                  background: 'transparent',
+                  border: 0,
+                  borderRadius: 3,
+                  cursor: plan.history.future.length ? 'pointer' : 'default',
+                  outline: 'none',
+                }}
+              >
+                <Redo2 size={12} />
+              </button>
+            </div>
           </div>
         </div>
-      </div>
 
-      <div ref={titleMeasureRef} aria-hidden style={{ position: 'absolute', left: -10000, top: 0, visibility: 'hidden', pointerEvents: 'none', display: 'flex', flexDirection: 'column', alignItems: 'flex-start', whiteSpace: 'nowrap', fontSize: 12 }}>
-        {plan.items.flatMap((task) => [
-          <span key={task.id} data-width-extra={marker.sizePx + (expanded ? 62 : 24)} style={{ padding: '3px 5px' }}>{renderTitle(draftTitles[task.id] ?? task.title)}</span>,
-          ...(expanded ? task.subtasks.map((subtask) => (
-            <span key={subtask.id} data-width-extra={marker.sizePx + 74} style={{ padding: '3px 5px' }}>{renderTitle(draftTitles[subtask.id] ?? subtask.title)}</span>
-          )) : []),
-        ])}
-      </div>
-
+        <div
+          ref={titleMeasureRef}
+          aria-hidden
+          style={{
+            position: 'absolute',
+            left: -10000,
+            top: 0,
+            visibility: 'hidden',
+            pointerEvents: 'none',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'flex-start',
+            whiteSpace: 'nowrap',
+            fontSize: 12,
+          }}
+        >
+          {visibleItems.flatMap((task) => [
+            <span
+              key={task.id}
+              data-width-extra={
+                marker.sizePx
+                + 22
+                + (selectionMode ? TASK_PLAN_SELECTION_EXTRA_WIDTH : 0)
+              }
+              style={{ padding: '3px 5px' }}
+            >
+              {renderTitle(draftTitles[task.id] ?? task.title)}
+            </span>,
+            ...(expanded ? task.subtasks.map((subtask) => (
+              <span
+                key={subtask.id}
+                data-width-extra={
+                  marker.sizePx
+                  + 42
+                  + (selectionMode ? TASK_PLAN_SELECTION_EXTRA_WIDTH : 0)
+                }
+                style={{ padding: '3px 5px' }}
+              >
+                {renderTitle(draftTitles[subtask.id] ?? subtask.title)}
+              </span>
+            )) : []),
+          ])}
+        </div>
       </section>
 
       {panelLayout.resizeEnabled && (
@@ -923,6 +2122,7 @@ export default function TabTaskPlanPanel({ tabId, projectPath }: { tabId: string
         </div>
       )}
       {statusMenuNode}
+      {taskMenuNode}
     </div>
   );
 }

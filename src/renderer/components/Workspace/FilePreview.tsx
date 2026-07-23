@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ExternalLink, Loader2 } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
-import Tooltip from '../UI/Tooltip';
+import ControlHint from '../UI/ControlHint';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
@@ -116,23 +116,23 @@ export default function FilePreview() {
               can adjust font size without leaving the preview; both edit the same
               filePreviewFontSize key in UIStore (persisted to localStorage). */}
           <div className="flex items-center gap-1 mr-1">
-            <Tooltip content="Уменьшить шрифт">
+            <ControlHint label="Уменьшить шрифт">
             <button
               className="w-6 h-6 flex items-center justify-center rounded text-[#888] hover:text-white hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed"
               disabled={filePreviewFontSize <= 10}
               onClick={() => setFilePreviewFontSize(filePreviewFontSize - 1)}
             >−</button>
-            </Tooltip>
+            </ControlHint>
             <span className="text-[10px] text-[#888] font-mono tabular-nums min-w-[26px] text-center">{filePreviewFontSize}px</span>
-            <Tooltip content="Увеличить шрифт">
+            <ControlHint label="Увеличить шрифт">
             <button
               className="w-6 h-6 flex items-center justify-center rounded text-[#888] hover:text-white hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed"
               disabled={filePreviewFontSize >= 24}
               onClick={() => setFilePreviewFontSize(filePreviewFontSize + 1)}
             >+</button>
-            </Tooltip>
+            </ControlHint>
           </div>
-          <Tooltip content="Open in Sublime Text">
+          <ControlHint label="Открыть в Sublime Text">
           <button
             className="h-7 px-2 flex items-center gap-1.5 rounded text-xs text-[#666] hover:text-accent hover:bg-white/5 disabled:opacity-60 disabled:cursor-default transition-colors"
             disabled={openingSublime}
@@ -145,7 +145,7 @@ export default function FilePreview() {
             )}
             <span>Sublime</span>
           </button>
-          </Tooltip>
+          </ControlHint>
           <button
             className={`text-xs px-2 py-1 rounded transition-colors ${
               copied
@@ -156,12 +156,14 @@ export default function FilePreview() {
           >
             {copied ? '✓ Copied' : 'Copy All'}
           </button>
-          <button
-            className="text-[#999] hover:text-white text-2xl leading-none w-8 h-8 flex items-center justify-center rounded hover:bg-white/10"
-            onClick={handleClose}
-          >
-            ×
-          </button>
+          <ControlHint label="Закрыть превью">
+            <button
+              className="text-[#999] hover:text-white text-2xl leading-none w-8 h-8 flex items-center justify-center rounded hover:bg-white/10"
+              onClick={handleClose}
+            >
+              ×
+            </button>
+          </ControlHint>
         </div>
       </div>
 

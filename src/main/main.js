@@ -116,8 +116,26 @@ const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
 const { resolveGeminiProjectDir, findGeminiSessionFile, invalidateProjectsJsonCache, getGeminiProjectsJson, calculateGeminiHash } = require(path.join(srcMainDir, 'gemini-utils'));
 const { findSessionFile, loadJsonlRecords, resolveSessionChain, resolveLatestSessionInChain, parseTimelineUuids, parseTimelineEntries, getSessionMaterialization, deleteEffortEntries, trimTrailingEffortEntries, repairJsonlChainBreaks, _api: claudeDataApi } = require(path.join(srcMainDir, 'ipc', 'claude-data'));
 const codexDataModule = require(path.join(srcMainDir, 'ipc', 'codex-data'));
+const {
+  buildCodexRewindMessageProof,
+  hashCodexRewindTargetText,
+} = require(path.join(srcMainDir, 'codex-rewind-target-proof'));
+const {
+  advanceManualCodexRewindNavigation,
+  assessManualCodexEnterPreflightScreen,
+  classifyManualCodexEnterFrame,
+  decideManualCodexRewindEnterWrite,
+  isPureCodexEscapeBurst,
+  resolveManualCodexRewindBoundary,
+  shouldAwaitManualCodexEnterPreflight,
+} = require(path.join(srcMainDir, 'codex-manual-rewind'));
+const {
+  createCodexSettingsMutationQueue,
+} = require(path.join(srcMainDir, 'codex-settings-mutation-queue'));
+const CODEX_NATIVE_REWIND_HANDOFF_KEY_PREFIX = 'codex.pending-writer-handoff.v1:';
+const CODEX_NATIVE_REWIND_CHILD_WINDOW_MS = 2 * 60 * 1000;
 const { createSessionTranscriptService } = require(path.join(srcMainDir, 'session-transcript-service'));
-const { PromptQueueAssetStore, collectReferencedAssetIds } = require(path.join(srcMainDir, 'prompt-queue-assets'));
+const { PromptQueueAssetStore, collectReferencedAssetIds, normalizeAssetId } = require(path.join(srcMainDir, 'prompt-queue-assets'));
 const { CodexImageBindingRegistry } = require(path.join(srcMainDir, 'codex-image-bindings'));
 const { CodexImageTransport, buildCodexImagePastePlan } = require(path.join(srcMainDir, 'codex-image-transport'));
 const {
@@ -128,21 +146,36 @@ const {
   executeCodexLaunchObservation,
 } = require(path.join(srcMainDir, 'codex-launch-observation'));
 const {
+  resolveCodexSourceSettingsProof,
+} = require(path.join(srcMainDir, 'codex-source-settings'));
+const {
+  attachCodexSettingsProofOwner,
+  consumePendingCodexSettingsProofHandoff,
   createCodexLaunchPendingResult,
+  createPendingCodexSettingsProofHandoff,
   createCodexPtySubmitAdmission,
   liveLifecycleFromCodexWriterStatus,
+  planCodexCommandLaunchSettings,
+  planCodexLaunchSettings,
+  planCodexPickerMovement,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
   shouldClearCodexLaunchPending,
   shouldHoldCodexStartingOnAbsent,
   shouldSurfaceCodexStartupTimeout,
+  validateCodexPickerRuntimeAdmission,
   validateCodexPtySubmitAdmission,
 } = require(path.join(srcMainDir, 'codex-runtime-contract'));
 const {
+  enforceCodexInteractiveSurfaceDraftAuthority,
+  hasDefinitiveDraftState,
+  mergeCodexDraftAuthority,
+} = require(path.join(srcMainDir, 'codex-draft-authority'));
+const {
   classifyManualCodexSubmitAfterWriteQueue,
+  classifyCodexBranchWriterHandoffSettlement,
   classifyCodexWriterAdoption,
   classifyCodexProvisionalActionAuthorization,
-  classifyCodexWriterHandoffSettlement,
   claimExclusiveActionReservation,
   claimCodexResumeSourceLease: claimCodexResumeSourceLeaseInRegistry,
   releaseExclusiveActionReservation,
@@ -156,9 +189,53 @@ const {
 const { validateTerminalCwdCandidate } = require(path.join(srcMainDir, 'terminal-cwd-proof'));
 const { TabHistoryRestoreLeases } = require(path.join(srcMainDir, 'tab-history-restore-leases'));
 const { runSaveTabsWithAck } = require(path.join(srcMainDir, 'save-tabs-ack'));
-const { commitTabProjectTransfer } = require(path.join(srcMainDir, 'tab-project-ownership'));
+const {
+  commitTabGroupProjectTransfer,
+  commitTabProjectTransfer,
+} = require(path.join(srcMainDir, 'tab-project-ownership'));
 const { persistCodexWriterBinding } = require(path.join(srcMainDir, 'codex-writer-binding'));
 const { finalizeCodexArchiveSnapshot } = require(path.join(srcMainDir, 'codex-archive-snapshot'));
+const {
+  classifyCodexModelMigrationRecovery,
+  hashCodexConfigSnapshot,
+} = require(path.join(srcMainDir, 'codex-model-migration-recovery'));
+const {
+  rewriteCodexDeveloperProfile,
+} = require(path.join(srcMainDir, 'codex-profile-config'));
+const {
+  CODEX_ALL_MODELS_VALUE,
+  CODEX_EFFORT_APPLICATION_CONVERSATION,
+  CODEX_MORE_REASONING_VALUE,
+  CODEX_PLAN_SCOPE_ALL_MODES_VALUE,
+  codexEffortApplicationMode,
+  decideCodexModelMigrationAcknowledgement,
+  decideCodexModelMigrationAutoEnter,
+  decideCodexPickerCleanupFrame,
+  inspectCodexModelMigrationPrompt,
+  isCodexActivePickerFrame,
+  isCodexModelEffortConfirmationObserved,
+  isCodexNativeRewindFrameText,
+  parseCodexTopModelPicker,
+  parseCodexAllModelPicker,
+  parseCodexStandardEffortPicker,
+  parseCodexAdvancedEffortPicker,
+  parseCodexPlanReasoningScopePicker,
+  parseCodexModelMigrationsConfig,
+  parseCodexTopLevelConfig,
+  normalizeCodexMigrationModelLabel,
+  verifyCodexTopLevelConfig,
+  verifyCodexModelMigrationConfig,
+  isCodexPickerFrameComposer,
+  planCodexModelSelection,
+  planCodexEffortSelection,
+  unionCodexEffortOptions,
+} = require(path.join(srcMainDir, 'codex-model-picker'));
+const {
+  claimRewindOperation,
+  classifyRewindCancel,
+  finishRewindOperation,
+  markRewindMutationStarted,
+} = require(path.join(srcMainDir, 'rewind-operation-contract'));
 const {
   AI_PROCESS_LOOKUP_STATUS,
   AiProcessLookupError,
@@ -169,6 +246,11 @@ const {
   resolveProcessPresence,
 } = require(path.join(srcMainDir, 'ai-process-liveness'));
 const {
+  buildAgentShellLaunchInput,
+  decideAgentShellLaunchAdmission,
+} = require(path.join(srcMainDir, 'ai-shell-launch'));
+const {
+  classifyCodexMcpStartupBlockerHandling,
   decideCodexMcpStartupDeadline,
   findLastCodexComposerPromptIndex,
   hasCodexComposerPromptGlyph,
@@ -186,6 +268,18 @@ const {
 const promptQueueAssetStore = new PromptQueueAssetStore({
   rootDir: path.join(app.getPath('userData'), 'prompt-queue-assets'),
 });
+// History drafts live in renderer memory rather than the persistent Run After
+// queue. Keep every asset touched by the current app process leased until
+// restart, so queue GC cannot delete a still-visible History attachment.
+const promptQueueAssetSessionLeases = new Set();
+function leasePromptQueueAssetRefs(refs) {
+  for (const ref of Array.isArray(refs) ? refs : []) {
+    const assetId = normalizeAssetId(ref?.assetId) || normalizeAssetId(ref?.path);
+    if (assetId && ref?.availability === 'available') {
+      promptQueueAssetSessionLeases.add(assetId);
+    }
+  }
+}
 const scDesktopNotificationOutbox = createScDesktopNotificationOutbox({
   storagePath: path.join(app.getPath('userData'), 'sc-desktop-terminal-completion-outbox.json'),
 });
@@ -978,6 +1072,7 @@ const terminalInputLineBuffers = new Map(); // tabId -> best-effort shell input 
 const terminalInputEscapeStates = new Map(); // tabId -> pending ANSI input sequence state
 const codexFinishDebounceTimers = new Map(); // tabId -> timeout; suppress shell D→B blips inside Codex TUI
 const codexDescendantExitRecheckTimers = new Map(); // tabId -> timeout; finalize delayed Codex D after child process exits
+const codexExitObserverGenerations = new Map(); // tabId -> generation; manual Stop invalidates older OSC-D observers
 const terminalInitialCommand = new Map(); // tabId -> initialCommand string (for restart)
 const terminalOutputBuffer = new Map();  // tabId -> { lines: string[], maxLines: 500 }
 const TERMINAL_OUTPUT_MAX_LINES = 500;
@@ -1239,6 +1334,134 @@ function captureTerminalInputForLastCommand(tabId, data) {
   else terminalInputLineBuffers.delete(tabId);
   if (escapeState) terminalInputEscapeStates.set(tabId, escapeState);
   else terminalInputEscapeStates.delete(tabId);
+}
+
+function hasClaimedAiLifecycle(tabId) {
+  return claudeCliActive.get(tabId) === true
+    || bridgeKnownSessions.has(tabId)
+    || codexLaunchAcceptancePending.has(tabId)
+    || codexKnownSessions.has(tabId)
+    || codexLastRunCommandPayload.has(tabId)
+    || codexTurnWatchers.has(tabId)
+    || codexTuiReadyTabs.has(tabId);
+}
+
+async function proveIdleShellForAgentLaunch(tabId, toolType, options = {}) {
+  const expectedTerm = options.expectedTerm || terminals.get(tabId);
+  const expectedRunSeq = Number.isFinite(options.expectedRunSeq)
+    ? Number(options.expectedRunSeq)
+    : null;
+  const allowCurrentLaunchClaim = options.allowCurrentLaunchClaim === true;
+
+  const readLocalState = () => {
+    const state = terminalCommandState.get(tabId) || null;
+    const generationChanged = expectedRunSeq !== null
+      && Number(state?.runSeq || 0) !== expectedRunSeq;
+    return {
+      state,
+      generationChanged,
+      commandRunning: state?.isRunning === true
+        && !(allowCurrentLaunchClaim && !generationChanged),
+      lifecycleClaimed: !allowCurrentLaunchClaim && hasClaimedAiLifecycle(tabId),
+      stopping: aiStoppingTabs.has(tabId),
+    };
+  };
+
+  if (!expectedTerm || terminals.get(tabId) !== expectedTerm) {
+    return { allowed: false, reason: 'terminal_generation_changed', lookup: null };
+  }
+  const before = readLocalState();
+  if (before.generationChanged) {
+    return { allowed: false, reason: 'terminal_command_generation_changed', lookup: null };
+  }
+  const localDecision = decideAgentShellLaunchAdmission({
+    processLookupStatus: AI_PROCESS_LOOKUP_STATUS.ABSENT,
+    commandRunning: before.commandRunning,
+    lifecycleClaimed: before.lifecycleClaimed,
+    stopping: before.stopping,
+  });
+  if (!localDecision.allowed) {
+    return { ...localDecision, lookup: null };
+  }
+
+  // Ctrl+C is destructive in a live TUI. Bypass both lookup caches and prove
+  // that this PTY currently has no Claude/Codex/Gemini descendant at the final
+  // write boundary. UNKNOWN is deliberately not treated as absence.
+  invalidateAiProcessLookupCache(tabId);
+  const lookup = await inspectAiDescendantProcessesByTab(tabId, null, { forceFresh: true });
+  if (terminals.get(tabId) !== expectedTerm) {
+    return { allowed: false, reason: 'terminal_generation_changed', lookup };
+  }
+  const after = readLocalState();
+  if (after.generationChanged) {
+    return { allowed: false, reason: 'terminal_command_generation_changed', lookup };
+  }
+  const decision = decideAgentShellLaunchAdmission({
+    processLookupStatus: lookup.status,
+    commandRunning: after.commandRunning,
+    lifecycleClaimed: after.lifecycleClaimed,
+    stopping: after.stopping,
+  });
+  if (!decision.allowed) {
+    console.warn('[AgentShellLaunch] blocked tab=' + String(tabId).slice(-12)
+      + ' tool=' + toolType
+      + ' reason=' + decision.reason
+      + ' lookup=' + lookup.status
+      + ' pids=' + lookup.matches.map((match) => match.pid).join(','));
+  }
+  return { ...decision, lookup };
+}
+
+function writeAgentLaunchCommandToIdleShell(term, { tabId, toolType, command, launchId = null }) {
+  if (!term || terminals.get(tabId) !== term) {
+    throw new Error('terminal_generation_changed');
+  }
+  const trackedDraftChars = String(terminalInputLineBuffers.get(tabId) || '').length;
+  terminalInputLineBuffers.delete(tabId);
+  terminalInputEscapeStates.delete(tabId);
+  const input = buildAgentShellLaunchInput(command);
+  console.log('[AgentShellLaunch] clear-and-write tab=' + String(tabId).slice(-12)
+    + ' tool=' + toolType
+    + ' launch=' + (launchId || '-')
+    + ' lookup=absent'
+    + ' trackedDraftChars=' + trackedDraftChars
+    + ' bytes=' + input.length);
+  term.write(input);
+}
+
+function markClaudeShellLaunchStarted(tabId, sessionId = null, reason = 'claude-run-command') {
+  claudeCliActive.set(tabId, true);
+  clearAiStopping(tabId, reason);
+  const commandState = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
+  commandState.isRunning = true;
+  clearTerminalCommandOrigin(tabId, commandState, reason);
+  terminalCommandState.set(tabId, commandState);
+  claudeStartupIntents.set(tabId, { sessionId: sessionId || null, at: Date.now(), reason });
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('terminal:command-started', { tabId, commandType: 'claude' });
+  }
+  _webBroadcast(tabId, {
+    type: 'snapshot',
+    sessionId: sessionId || null,
+    busy: false,
+    sessionStatus: 'starting',
+    starting: true,
+    inputReady: false,
+    toolType: 'claude',
+    commandType: 'claude',
+  });
+}
+
+function rollbackClaudeShellLaunchClaims(tabId, {
+  sessionId = null,
+  reason = 'claude-shell-launch-write-failed',
+} = {}) {
+  if (claudeState.get(tabId) === 'WAITING_PROMPT') claudeState.delete(tabId);
+  claudePendingPrompt.delete(tabId);
+  if (sessionId) clearClaudePendingJsonlOwner(sessionId, tabId, reason);
+  console.warn('[Claude Runner] launch claims rolled back tab=' + String(tabId).slice(-12)
+    + ' session=' + (sessionId ? String(sessionId).slice(0, 8) : '-')
+    + ' reason=' + reason);
 }
 
 function createHeadlessTerminalMirror(tabId, cols = 80, rows = 24) {
@@ -1596,8 +1819,41 @@ function getHeadlessCodexDraftState(tabId, reason = 'headless-draft') {
       source: 'headless-main:' + source,
     });
 
+    const currentScreen = getHeadlessVisibleBufferSnapshot(
+      tabId,
+      reason + ':draft-surface-proof',
+    );
+    const currentScreenText = Array.isArray(currentScreen?.lines)
+      ? currentScreen.lines.map((line) => String(line?.text || '')).join('\n')
+      : '';
+    const rewindFrame = classifyManualCodexEnterFrame(currentScreen);
+    const surfaceGuard = enforceCodexInteractiveSurfaceDraftAuthority(
+      {
+        success: true,
+        hasDraft: false,
+        preview: currentScreenText.replace(/\s+/g, ' ').trim().slice(0, 160),
+      },
+      {
+        nativeRewindProven: rewindFrame.kind === 'native-rewind-confirm'
+          || isCodexNativeRewindFrameText(currentScreenText),
+        activePicker: isCodexActivePickerFrame(currentScreenText),
+      },
+    );
+    if (surfaceGuard?.hasDraft === null) {
+      return {
+        ...surfaceGuard,
+        debug: 'reason=' + surfaceGuard.source
+          + ' rewind=' + rewindFrame.reason,
+      };
+    }
+
     for (const row of cursorRows) {
-      const parsed = extractCodexDraftFromLine(getLogicalLineSnapshotAt(buf, row));
+      const cursorSnapshot = getLogicalLineSnapshotAt(buf, row);
+      // Cursor position alone is not composer proof. Native Rewind and picker
+      // footers are dim too; treating any dim row as "empty" let History send
+      // Enter into an overlay instead of the composer.
+      if (!hasCodexComposerPromptGlyph(cursorSnapshot.text)) continue;
+      const parsed = extractCodexDraftFromLine(cursorSnapshot);
       if (parsed.hasDraft !== null) {
         const multilineDraft = parsed.hasDraft === false && !parsed.preview
           ? extractCodexDraftAfterEmptyPrompt(buf, row)
@@ -1940,6 +2196,8 @@ const codexTuiReadyRejectKeys = new Map(); // tabId -> last logged not-ready rea
 const codexTuiReadyLastNotReady = new Map(); // tabId -> last deterministic not-ready diagnosis
 const codexForkComposerSeenTabs = new Set(); // fork composer can arrive just before rollout session discovery
 const codexLastRunCommandPayload = new Map(); // tabId -> last Codex launch payload, used by MCP startup watchdog retry
+const codexPendingSettingsProofHandoffs = new Map(); // tabId -> one exact pre-rollout settings proof for this PTY generation
+const codexPendingModelMigrations = new Map(); // tabId -> post-Enter ack capture bound to one PTY/launch/input generation
 const codexPromptInFlight = new Map(); // tabId -> prompt submit window before rollout task_started
 const codexManualActionRequired = new Map(); // tabId -> auth/update state that must be handled by the user
 let codexLaunchSeq = 0;
@@ -1950,6 +2208,110 @@ function clearClaudeConfirmDialogCooldown(tabId) {
   for (const key of claudeConfirmDialogCooldown.keys()) {
     if (key.startsWith(tabId + ':')) claudeConfirmDialogCooldown.delete(key);
   }
+}
+
+function classifyClaudeSettingsDialogText(text) {
+  const normalized = String(text || '').replace(/\u00a0/g, ' ');
+  if (!normalized.trim()) return null;
+  const compact = normalized.replace(/\s+/g, '');
+  if (/Changeeffortlevel\?/i.test(compact)) return 'EffortDialog';
+  if (/Switchmodel\?/i.test(compact)) return 'ModelDialog';
+  if (/(?:❯|>)1\.Yes,?switchto/i.test(compact)) return 'ModelDialog';
+  return null;
+}
+
+function classifyClaudeSettingsDialogSnapshot(snapshot) {
+  if (snapshot?.success !== true || !Array.isArray(snapshot.lines)) return null;
+  return classifyClaudeSettingsDialogText(
+    snapshot.lines.map((line) => String(line?.text || '')).join('\n'),
+  );
+}
+
+async function confirmClaudeSettingsDialogFromCurrentFrame(
+  tabId,
+  expectedDialogType = null,
+  reason = 'settings-dialog',
+) {
+  const expectedTerm = terminals.get(tabId);
+  if (!expectedTerm) return { success: false, confirmed: false, error: 'no_terminal' };
+  const inputRevision = getTerminalInputRevision(tabId);
+
+  const flush = await flushHeadlessTerminalMirror(tabId);
+  if (!flush.success) {
+    return {
+      success: false,
+      confirmed: false,
+      error: flush.error || 'headless_flush_failed',
+    };
+  }
+  if (
+    terminals.get(tabId) !== expectedTerm
+    || getTerminalInputRevision(tabId) !== inputRevision
+  ) {
+    return {
+      success: false,
+      confirmed: false,
+      error: 'terminal_generation_changed',
+    };
+  }
+
+  const snapshot = getHeadlessVisibleBufferSnapshot(tabId, reason);
+  const dialogType = classifyClaudeSettingsDialogSnapshot(snapshot);
+  if (!dialogType) {
+    return {
+      success: true,
+      confirmed: false,
+      reason: 'dialog_not_visible',
+      writeSeq: snapshot?.writeSeq ?? null,
+    };
+  }
+  if (expectedDialogType && dialogType !== expectedDialogType) {
+    return {
+      success: true,
+      confirmed: false,
+      reason: 'different_dialog_visible',
+      dialogType,
+      expectedDialogType,
+    };
+  }
+
+  const now = Date.now();
+  const cooldownKey = tabId + ':' + dialogType;
+  const lastFire = claudeConfirmDialogCooldown.get(cooldownKey) || 0;
+  if (now - lastFire <= 2000) {
+    return {
+      success: true,
+      confirmed: true,
+      alreadyScheduled: true,
+      dialogType,
+    };
+  }
+
+  // Re-check the exact PTY/input generation at the write boundary. A delayed
+  // detector must never submit whatever the user typed after the dialog frame
+  // was observed.
+  if (
+    terminals.get(tabId) !== expectedTerm
+    || getTerminalInputRevision(tabId) !== inputRevision
+  ) {
+    return {
+      success: false,
+      confirmed: false,
+      error: 'terminal_generation_changed',
+    };
+  }
+
+  claudeConfirmDialogCooldown.set(cooldownKey, now);
+  bumpTerminalInputRevision(tabId);
+  console.log('[' + dialogType + '] Tab ' + tabId
+    + ': current-frame proof confirmed, writing Enter reason=' + reason);
+  expectedTerm.write('\r');
+  return {
+    success: true,
+    confirmed: true,
+    alreadyScheduled: false,
+    dialogType,
+  };
 }
 const claudeCliActive = new Map();          // claudeTabId -> true (Claude CLI is running inside PTY, not just shell)
 // "Claude TUI has rendered its prompt at least once" — deterministic ready
@@ -3044,10 +3406,16 @@ const codexWriterReconcileInflight = new Map(); // tab/observer key → shared a
 const codexWriterSessionInflight = new Map(); // rollout sessionId → cross-tab ownership transaction
 const codexRewindReservations = new Map(); // tabId → the one destructive native Rewind currently authorized
 let codexRewindReservationSeq = 0;
+// Rewind UI can outlive a renderer mount and cancellation can race the final
+// Enter. Keep operation ownership in main so a stale component cannot cancel a
+// newer rewind, and so cancellation never types `q` after mutation began.
+const activeRewindOperations = new Map(); // tabId → { opId, toolType, mutationStarted, protocolUiOpen }
+let codexRewindRecoveryScanStatus = 'not-run'; // complete | unknown
 const codexLaunchObservationPending = new Map(); // tabId → launchId while observer is being attached
 // tabId → launchId from PTY write until authoritative TUI/rollout/lifecycle
 // settlement (or the one-shot startup watchdog). This is not process proof.
 const codexLaunchAcceptancePending = new Map();
+const aiShellLaunchInflight = new Map(); // tabId → cross-agent proven-idle shell launch transaction
 const codexLaunchInflight = new Map(); // tabId → serialized launch/resume admission
 // A resume source is launch intent, not writer identity, but two live resumes
 // of the same source cannot be attributed reliably if both processes keep that
@@ -3563,8 +3931,37 @@ function publishClaudePromptReady(tabId, reason = 'prompt-ready') {
   return true;
 }
 
-function persistCodexKnownSessionBinding(tabId, sessionId) {
+function persistCodexKnownSessionBinding(tabId, sessionId, settingsProof = null) {
   const projectId = resolveAuthoritativeTabProjectId(tabId);
+  const normalizedEffort = typeof settingsProof?.effort === 'string'
+    ? settingsProof.effort.trim().toLowerCase()
+    : '';
+  if (settingsProof && normalizedEffort !== 'ultra') {
+    if (!projectId) {
+      return { success: false, error: 'codex_tab_project_unresolved', retryable: true };
+    }
+    try {
+      const updated = projectManager?.db?.updateTabCodexSessionAndSettings?.(
+        projectId,
+        tabId,
+        {
+          sessionId,
+          model: settingsProof.model,
+          effort: normalizedEffort,
+          proofAt: settingsProof.proofAt,
+        },
+      );
+      return updated === true
+        ? { success: true, updated: true, currentSessionId: sessionId }
+        : { success: false, error: 'codex_writer_settings_not_committed', retryable: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+        retryable: true,
+      };
+    }
+  }
   return persistCodexWriterBinding({
     projectId,
     tabId,
@@ -3582,9 +3979,23 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
   if (!tabId || !sessionId) {
     return { success: false, error: 'codex_writer_identity_invalid', retryable: false };
   }
+  const pendingSettingsProof = codexPendingSettingsProofHandoffs.get(tabId) || null;
+  const pendingSettingsCarry = consumePendingCodexSettingsProofHandoff(
+    pendingSettingsProof,
+    {
+      terminalToken: terminals.get(tabId) || null,
+      runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+      launchId: proof?.launchId || null,
+      writerSessionId: sessionId,
+    },
+  );
   const persisted = durableBinding?.success === true
     ? durableBinding
-    : persistCodexKnownSessionBinding(tabId, sessionId);
+    : persistCodexKnownSessionBinding(
+      tabId,
+      sessionId,
+      pendingSettingsCarry.carry ? pendingSettingsCarry.proof : null,
+    );
   if (persisted?.success !== true) {
     console.warn('[Codex:Known] persist pending tab=' + String(tabId).slice(-12)
       + ' session=' + String(sessionId).slice(0, 8)
@@ -3595,6 +4006,15 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
       error: persisted?.error || 'codex_writer_binding_not_committed',
       retryable: persisted?.retryable !== false,
     };
+  }
+  if (pendingSettingsProof) {
+    codexPendingSettingsProofHandoffs.delete(tabId);
+    console.log('[CodexSettingsProof] pre-rollout proof '
+      + (pendingSettingsCarry.carry ? 'adopted' : 'discarded')
+      + ' tab=' + String(tabId).slice(-12)
+      + ' session=' + String(sessionId).slice(0, 8)
+      + ' launch=' + (proof?.launchId || '-')
+      + ' reason=' + pendingSettingsCarry.reason);
   }
   const prev = codexKnownSessions.get(tabId) || null;
   const prevProof = codexWriterProofs.get(tabId) || null;
@@ -3609,6 +4029,9 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
     sourceMatch: proof?.sourceMatch || null,
     forkedFromId: proof?.forkedFromId || null,
     sourceSessionId: proof?.sourceSessionId || null,
+    carryCodexSettingsProof: proof?.carryCodexSettingsProof === true
+      || pendingSettingsCarry.carry === true,
+    codexSettingsProof: pendingSettingsCarry.proof || null,
     valid: true,
     invalidatedAt: null,
     invalidatedReason: null,
@@ -3626,6 +4049,11 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
       reason,
       writerProven: true,
       writerProof: proofRecord.kind,
+      previousSessionId: prev,
+      writerGeneration: proofRecord.launchId,
+      carryCodexSettingsProof: proofRecord.carryCodexSettingsProof,
+      codexSettingsProof: proofRecord.codexSettingsProof,
+      requiresExactCodexSettingsProof: !!pendingSettingsProof,
     });
   }
   if (proofChanged) {
@@ -3648,7 +4076,14 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
       ...getCodexPublicWriterFields(tabId),
     });
   }
-  return { success: true, persisted, proofChanged };
+  return {
+    success: true,
+    persisted,
+    proofChanged,
+    carryCodexSettingsProof: proofRecord.carryCodexSettingsProof,
+    codexSettingsProof: proofRecord.codexSettingsProof,
+    requiresExactCodexSettingsProof: !!pendingSettingsProof,
+  };
 }
 
 function getCodexWriterProofSnapshot(tabId) {
@@ -3705,6 +4140,11 @@ function invalidateCodexWriterProof(tabId, reason = 'unproven') {
 
 function clearCodexKnownSession(tabId, reason = 'clear') {
   const sid = codexKnownSessions.get(tabId) || null;
+  if (codexPendingSettingsProofHandoffs.delete(tabId)) {
+    console.log('[CodexSettingsProof] pre-rollout proof cleared tab='
+      + String(tabId).slice(-12)
+      + ' reason=' + reason);
+  }
   codexWriterProofs.delete(tabId);
   releaseCodexResumeSourceLeaseForTab(tabId, reason);
   if (!sid) return;
@@ -3809,6 +4249,7 @@ function clearCodexLaunchPayload(tabId, reason = 'clear', expectedLaunchId = nul
     return false;
   }
   const scopedLaunchId = expectedLaunchId || payload?.launchId || null;
+  clearCodexPendingModelMigration(tabId, 'launch-payload:' + reason);
   clearCodexStartupNoStateTimeoutTimer(tabId, 'launch-payload:' + reason, scopedLaunchId);
   clearCodexLaunchAcceptancePending(tabId, reason, scopedLaunchId);
   if (!payload) return false;
@@ -3964,13 +4405,29 @@ function codexHasLivePtySubmitEvidence(tabId) {
     || codexPromptInFlight.has(tabId);
 }
 
-function captureCodexPtySubmitAdmission(tabId, term) {
+function captureCodexPtySubmitAdmission(tabId, term, expectedInputRevision = null) {
   const state = terminalCommandState.get(tabId) || null;
+  const currentInputRevision = getTerminalInputRevision(tabId);
+  if (
+    expectedInputRevision !== null
+    && currentInputRevision !== Number(expectedInputRevision)
+  ) {
+    return {
+      available: false,
+      reason: 'codex_input_ownership_changed',
+      runSeq: Number(state?.runSeq || 0),
+      inputRevision: currentInputRevision,
+      tabId,
+      term,
+    };
+  }
   return {
     ...createCodexPtySubmitAdmission({
       processRunning: state?.isRunning === true,
       hasLiveCodexEvidence: codexHasLivePtySubmitEvidence(tabId),
+      stopping: aiStoppingTabs.get(tabId)?.toolType === 'codex',
       runSeq: state?.runSeq || 0,
+      inputRevision: currentInputRevision,
     }),
     tabId,
     term,
@@ -3985,8 +4442,42 @@ function revalidateCodexPtySubmitAdmission(token) {
   return validateCodexPtySubmitAdmission(token, {
     processRunning: state?.isRunning === true,
     hasLiveCodexEvidence: codexHasLivePtySubmitEvidence(token.tabId),
+    stopping: aiStoppingTabs.get(token.tabId)?.toolType === 'codex',
     runSeq: state?.runSeq || 0,
+    inputRevision: getTerminalInputRevision(token.tabId),
   });
+}
+
+function captureClaudePromptQueuePtyAdmission(tabId, term) {
+  const state = terminalCommandState.get(tabId) || null;
+  const runSeq = Number(state?.runSeq || 0);
+  if (!tabId || terminals.get(tabId) !== term) {
+    return { available: false, reason: 'claude_terminal_generation_changed', runSeq, tabId, term };
+  }
+  if (aiStoppingTabs.get(tabId)?.toolType === 'claude') {
+    return { available: false, reason: 'claude_input_not_ready', runSeq, tabId, term };
+  }
+  if (state?.isRunning !== true || !hasLiveClaudeInTab(tabId)) {
+    return { available: false, reason: 'claude_input_not_ready', runSeq, tabId, term };
+  }
+  if (!claudePromptReady.has(tabId)
+    || claudeTurnBusy.get(tabId) === true
+    || claudeLocalCommandWatchers.has(tabId)) {
+    return { available: false, reason: 'claude_input_not_ready', runSeq, tabId, term };
+  }
+  return { available: true, reason: null, runSeq, tabId, term };
+}
+
+function revalidateClaudePromptQueuePtyAdmission(token) {
+  if (!token?.available) {
+    return { valid: false, reason: token?.reason || 'claude_input_not_ready' };
+  }
+  const current = captureClaudePromptQueuePtyAdmission(token.tabId, token.term);
+  if (!current.available) return { valid: false, reason: current.reason };
+  if (current.runSeq !== token.runSeq) {
+    return { valid: false, reason: 'claude_process_generation_changed' };
+  }
+  return { valid: true, reason: null };
 }
 
 function getCodexSavedSessionId(tabId) {
@@ -4167,6 +4658,9 @@ function markAiStopping(tabId, toolType, reason = 'manual-stop', options = {}) {
     publicLifecycle,
   };
   aiStoppingTabs.set(tabId, state);
+  if (resolvedTool === 'codex') {
+    invalidateCodexExitObservers(tabId, 'stop-start:' + reason);
+  }
   console.log('[AgentStopping] start tab=' + String(tabId).slice(-12) +
     ' tool=' + resolvedTool +
     ' reason=' + reason +
@@ -4401,22 +4895,41 @@ function claudeStartupSlashRecordKind(rec, target) {
   const content = rec?.message?.content;
   if (typeof content !== 'string') return null;
   const text = normalizeClaudeLocalCommandText(content);
+  const argsMatch = text.match(/<command-args>([\s\S]*?)<\/command-args>/i);
+  const commandArgs = argsMatch ? normalizeClaudeLocalCommandText(argsMatch[1]).toLowerCase() : '';
   if (target.kind === 'effort') {
-    if (text.startsWith('<command-name>/effort</command-name>')) return 'wrapper';
+    if (text.startsWith('<command-name>/effort</command-name>') && commandArgs === target.value) return 'wrapper';
     if (/^<local-command-stdout>Set effort level to\b/i.test(text)
       && text.toLowerCase().includes('set effort level to ' + target.value)) return 'stdout';
   }
   if (target.kind === 'model') {
-    if (text.startsWith('<command-name>/model</command-name>')) return 'wrapper';
+    if (text.startsWith('<command-name>/model</command-name>') && commandArgs === target.value) return 'wrapper';
     if (/^<local-command-stdout>Set model to\b/i.test(text)) return 'stdout';
   }
   return null;
 }
 
+function resolveClaudeStartupSlashSessionId(tabId) {
+  const bridgeSessionId = bridgeKnownSessions.get(tabId) || null;
+  if (bridgeSessionId) return bridgeSessionId;
+  try {
+    const row = projectManager?.db?.db?.prepare(
+      'SELECT claude_session_id FROM tabs WHERE tab_id = ? LIMIT 1'
+    ).get(tabId);
+    return row?.claude_session_id || null;
+  } catch {
+    return null;
+  }
+}
+
 function scanClaudeStartupSlashProof(tabId, command, afterMs) {
   const target = parseClaudeStartupSlashCommand(command);
   if (!target) return { success: false, reason: 'unsupported-command' };
-  const sessionId = bridgeKnownSessions.get(tabId) || null;
+  // A local slash command can materialize its JSONL before StatusLine bridge
+  // ownership is accepted. The exact tab row is updated by the independent
+  // terminal session-id detector, so it is a valid discovery fallback; the
+  // timestamp + exact command wrapper below prevents stale-session proof.
+  const sessionId = resolveClaudeStartupSlashSessionId(tabId);
   const filePath = resolveClaudeSessionFileForTab(tabId, sessionId);
   if (!filePath) {
     return { success: false, reason: 'session-file-missing', sessionId };
@@ -4454,6 +4967,7 @@ function scanClaudeStartupSlashProof(tabId, command, afterMs) {
       if (kind === 'wrapper') wrapperSeen = true;
       if (kind === 'stdout') {
         stdoutSeen = true;
+        if (!wrapperSeen) continue;
         return {
           success: true,
           reason: 'jsonl-stdout',
@@ -5533,13 +6047,41 @@ function clearCodexDescendantExitRecheck(tabId, reason = 'clear') {
   console.log('[CodexExitRecheck] clear tab=' + String(tabId).slice(-12) + ' reason=' + reason);
 }
 
+function clearCodexFinishDebounce(tabId, reason = 'clear') {
+  if (!tabId || !codexFinishDebounceTimers.has(tabId)) return;
+  clearTimeout(codexFinishDebounceTimers.get(tabId));
+  codexFinishDebounceTimers.delete(tabId);
+  console.log('[CodexFinishDebounce] clear tab=' + String(tabId).slice(-12) + ' reason=' + reason);
+}
+
+function getCodexExitObserverGeneration(tabId) {
+  return Number(codexExitObserverGenerations.get(tabId) || 0);
+}
+
+function invalidateCodexExitObservers(tabId, reason = 'invalidate') {
+  if (!tabId) return 0;
+  const generation = getCodexExitObserverGeneration(tabId) + 1;
+  codexExitObserverGenerations.set(tabId, generation);
+  clearCodexFinishDebounce(tabId, reason);
+  clearCodexDescendantExitRecheck(tabId, reason);
+  console.log('[CodexExitObserver] invalidate tab=' + String(tabId).slice(-12)
+    + ' generation=' + generation + ' reason=' + reason);
+  return generation;
+}
+
+function isCodexExitObserverCurrent(tabId, expectedGeneration, expectedRunSeq = null) {
+  if (aiStoppingTabs.get(tabId)?.toolType === 'codex') return false;
+  if (expectedGeneration !== null
+    && getCodexExitObserverGeneration(tabId) !== Number(expectedGeneration)) return false;
+  if (expectedRunSeq !== null
+    && Number(terminalCommandState.get(tabId)?.runSeq || 0) !== Number(expectedRunSeq)) return false;
+  return true;
+}
+
 function finalizeCodexCommandFinished(tabId, exitCode = 0, reason = 'command-finished') {
   if (!tabId) return;
   clearCodexDescendantExitRecheck(tabId, reason);
-  if (codexFinishDebounceTimers.has(tabId)) {
-    clearTimeout(codexFinishDebounceTimers.get(tabId));
-    codexFinishDebounceTimers.delete(tabId);
-  }
+  clearCodexFinishDebounce(tabId, reason);
 
   const prevState = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: exitCode };
   const wasRunning = prevState.isRunning === true;
@@ -5576,8 +6118,18 @@ function finalizeCodexCommandFinished(tabId, exitCode = 0, reason = 'command-fin
   }
 }
 
-async function keepCodexRuntimeAliveFromProcessProof(tabId, matches, reason, { emitCommandStarted = false } = {}) {
+async function keepCodexRuntimeAliveFromProcessProof(tabId, matches, reason, {
+  emitCommandStarted = false,
+  expectedObserverGeneration = null,
+  expectedRunSeq = null,
+} = {}) {
   if (!tabId || !Array.isArray(matches) || matches.length === 0) return false;
+  if (expectedObserverGeneration !== null
+    && !isCodexExitObserverCurrent(tabId, expectedObserverGeneration, expectedRunSeq)) {
+    console.log('[CodexRuntimeRecovery] stale proof ignored tab=' + String(tabId).slice(-12)
+      + ' reason=' + reason + ' generation=' + expectedObserverGeneration);
+    return false;
+  }
   const state = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
   const wasRunning = state.isRunning === true;
   state.isRunning = true;
@@ -5593,7 +6145,15 @@ async function keepCodexRuntimeAliveFromProcessProof(tabId, matches, reason, { e
   const writer = await reconcileCodexWriterFromProcess(tabId, {
     reason: reason + '-writer-proof',
     sender: mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    expectedExitObserverGeneration: expectedObserverGeneration,
+    expectedExitObserverRunSeq: expectedRunSeq,
   });
+  if (expectedObserverGeneration !== null
+    && !isCodexExitObserverCurrent(tabId, expectedObserverGeneration, expectedRunSeq)) {
+    console.log('[CodexRuntimeRecovery] stale proof discarded after writer lookup tab=' + String(tabId).slice(-12)
+      + ' reason=' + reason + ' generation=' + expectedObserverGeneration);
+    return false;
+  }
   const sessionId = writer?.status === 'adopted'
     ? (getCodexWriterProofSnapshot(tabId)?.sessionId || null)
     : null;
@@ -5617,16 +6177,24 @@ async function keepCodexRuntimeAliveFromProcessProof(tabId, matches, reason, { e
   return true;
 }
 
-function armCodexDescendantExitRecheck(tabId, exitCode = 0, reason = 'codex-descendant-alive', expectedRunSeq = null) {
+function armCodexDescendantExitRecheck(
+  tabId,
+  exitCode = 0,
+  reason = 'codex-descendant-alive',
+  expectedRunSeq = null,
+  expectedObserverGeneration = null,
+) {
   if (!tabId || _gracefulShutdownInProgress) return;
   clearCodexDescendantExitRecheck(tabId, 'replace:' + reason);
   const startedAt = Date.now();
   const runSeq = expectedRunSeq ?? Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  const observerGeneration = expectedObserverGeneration ?? getCodexExitObserverGeneration(tabId);
   let attempt = 0;
   console.warn('[CodexExitRecheck] arm tab=' + String(tabId).slice(-12)
     + ' reason=' + reason
     + ' exitCode=' + (Number.isFinite(Number(exitCode)) ? Number(exitCode) : 0)
-    + ' runSeq=' + runSeq);
+    + ' runSeq=' + runSeq
+    + ' generation=' + observerGeneration);
 
   const schedule = (delayMs) => {
     const timer = setTimeout(async () => {
@@ -5636,18 +6204,20 @@ function armCodexDescendantExitRecheck(tabId, exitCode = 0, reason = 'codex-desc
           + ' reason=' + (_gracefulShutdownInProgress ? 'shutdown' : 'no-terminal'));
         return;
       }
-      if (Number(terminalCommandState.get(tabId)?.runSeq || 0) !== runSeq) {
+      if (!isCodexExitObserverCurrent(tabId, observerGeneration, runSeq)) {
         console.log('[CodexExitRecheck] stop tab=' + String(tabId).slice(-12)
-          + ' reason=new-command runSeq=' + runSeq
+          + ' reason=stale-observer runSeq=' + runSeq
+          + ' generation=' + observerGeneration
           + ' currentRunSeq=' + Number(terminalCommandState.get(tabId)?.runSeq || 0));
         return;
       }
 
       attempt += 1;
-      const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
-      if (Number(terminalCommandState.get(tabId)?.runSeq || 0) !== runSeq) {
+      const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex', { forceFresh: true });
+      if (!isCodexExitObserverCurrent(tabId, observerGeneration, runSeq)) {
         console.log('[CodexExitRecheck] stop tab=' + String(tabId).slice(-12)
-          + ' reason=new-command-after-lookup runSeq=' + runSeq
+          + ' reason=stale-observer-after-lookup runSeq=' + runSeq
+          + ' generation=' + observerGeneration
           + ' currentRunSeq=' + Number(terminalCommandState.get(tabId)?.runSeq || 0));
         return;
       }
@@ -5667,7 +6237,11 @@ function armCodexDescendantExitRecheck(tabId, exitCode = 0, reason = 'codex-desc
       }
 
       const liveCodex = lookup.matches;
-      await keepCodexRuntimeAliveFromProcessProof(tabId, liveCodex, 'codex-exit-recheck-alive');
+      const keptAlive = await keepCodexRuntimeAliveFromProcessProof(tabId, liveCodex, 'codex-exit-recheck-alive', {
+        expectedObserverGeneration: observerGeneration,
+        expectedRunSeq: runSeq,
+      });
+      if (!keptAlive) return;
       const ageMs = Date.now() - startedAt;
       const nextMs = Math.min(5000, 250 * Math.max(1, attempt + 1));
       if (attempt === 1 || attempt % 8 === 0) {
@@ -5775,28 +6349,32 @@ function parseOSC133AndEmit(tabId, data) {
           || codexTuiReadyTabs.has(tabId)
           || activityOpenIntervals.get(tabId)?.engine === 'codex';
         if (isCodexTab && !_gracefulShutdownInProgress) {
-          if (codexFinishDebounceTimers.has(tabId)) {
-            clearTimeout(codexFinishDebounceTimers.get(tabId));
-            codexFinishDebounceTimers.delete(tabId);
+          if (aiStoppingTabs.get(tabId)?.toolType === 'codex') {
+            console.log('[CodexTurn] ignore OSC-D observer during explicit Stop tab=' + tabId.slice(-8));
+            break;
           }
+          clearCodexFinishDebounce(tabId, 'osc-d');
           clearCodexDescendantExitRecheck(tabId, 'osc-d');
           const exitCode = state.lastExitCode;
+          const observerGenerationAtD = getCodexExitObserverGeneration(tabId);
           // Preserve the last confirmed state while the observer is pending.
           // finalizeCodexCommandFinished is the sole destructive transition.
           state.isRunning = wasRunningBeforeD;
           terminalCommandState.set(tabId, state);
           const timer = setTimeout(async () => {
             codexFinishDebounceTimers.delete(tabId);
-            if (Number(terminalCommandState.get(tabId)?.runSeq || 0) !== runSeqAtD) {
+            if (!isCodexExitObserverCurrent(tabId, observerGenerationAtD, runSeqAtD)) {
               console.warn('[CodexTurn] skip delayed command-finished tab=' + tabId.slice(-8)
-                + ' reason=new-command runSeq=' + runSeqAtD
+                + ' reason=stale-observer runSeq=' + runSeqAtD
+                + ' generation=' + observerGenerationAtD
                 + ' currentRunSeq=' + Number(terminalCommandState.get(tabId)?.runSeq || 0));
               return;
             }
-            const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
-            if (Number(terminalCommandState.get(tabId)?.runSeq || 0) !== runSeqAtD) {
+            const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex', { forceFresh: true });
+            if (!isCodexExitObserverCurrent(tabId, observerGenerationAtD, runSeqAtD)) {
               console.warn('[CodexTurn] skip delayed command-finished tab=' + tabId.slice(-8)
-                + ' reason=new-command-after-lookup runSeq=' + runSeqAtD
+                + ' reason=stale-observer-after-lookup runSeq=' + runSeqAtD
+                + ' generation=' + observerGenerationAtD
                 + ' currentRunSeq=' + Number(terminalCommandState.get(tabId)?.runSeq || 0));
               return;
             }
@@ -5805,19 +6383,34 @@ function parseOSC133AndEmit(tabId, data) {
               console.warn('[CodexTurn] preserve delayed command-finished tab=' + tabId.slice(-8)
                 + ' reason=process-lookup-unknown action=retry'
                 + ' error=' + (lookup.error?.message || lookup.error || 'unknown'));
-              armCodexDescendantExitRecheck(tabId, exitCode, 'osc-d-lookup-unknown', runSeqAtD);
+              armCodexDescendantExitRecheck(
+                tabId,
+                exitCode,
+                'osc-d-lookup-unknown',
+                runSeqAtD,
+                observerGenerationAtD,
+              );
               return;
             }
             if (decision === 'keep-alive') {
               const liveCodex = lookup.matches;
-              await keepCodexRuntimeAliveFromProcessProof(tabId, liveCodex, 'codex-descendant-alive', {
+              const keptAlive = await keepCodexRuntimeAliveFromProcessProof(tabId, liveCodex, 'codex-descendant-alive', {
                 emitCommandStarted: true,
+                expectedObserverGeneration: observerGenerationAtD,
+                expectedRunSeq: runSeqAtD,
               });
+              if (!keptAlive) return;
               console.warn(
                 '[CodexTurn] keep delayed command-finished tab=' + tabId.slice(-8) +
                 ' reason=codex-descendant-alive matches=' + liveCodex.length
               );
-              armCodexDescendantExitRecheck(tabId, exitCode, 'codex-descendant-alive', runSeqAtD);
+              armCodexDescendantExitRecheck(
+                tabId,
+                exitCode,
+                'codex-descendant-alive',
+                runSeqAtD,
+                observerGenerationAtD,
+              );
               return;
             }
             finalizeCodexCommandFinished(tabId, exitCode, 'command-finished');
@@ -6082,6 +6675,18 @@ function createWindow() {
 }
 
 // Context Menu IPC
+ipcMain.on('show-history-entry-context-menu', (event, { copyText } = {}) => {
+  if (typeof copyText !== 'string' || !copyText.trim()) return;
+
+  const menu = Menu.buildFromTemplate([
+    {
+      label: 'Copy ID and details',
+      click: () => clipboard.writeText(copyText),
+    },
+  ]);
+  menu.popup({ window: BrowserWindow.fromWebContents(event.sender) });
+});
+
 ipcMain.on('show-terminal-context-menu', async (event, { hasSelection, prompts, tabId, projectId, cwd, focusInsertPrompt }) => {
   // Load dynamic AI prompts from DB
   let aiPrompts = [];
@@ -6829,6 +7434,48 @@ function _sliceText(s, start, end) {
   let b = (end == null) ? len : (end < 0 ? Math.max(0, len + end) : Math.min(len, end));
   if (b < a) b = a;
   return s.slice(a, b);
+}
+
+function _orchestrationPromptHash(value) {
+  const normalized = String(value || '').replace(/\r\n/g, '\n').trim();
+  return crypto.createHash('sha256').update(normalized).digest('hex');
+}
+
+async function _getAgentTurnResultForOrchestration({ sessionId, cwd, promptHash, requestedAt, maxChars = 100_000 }) {
+  if (!sessionId || !promptHash) return { found: false, error: 'sessionId and promptHash required' };
+  const data = await _loadSessionTurns(sessionId, cwd);
+  const lowerBound = Number(requestedAt) > 0 ? Number(requestedAt) - 5 * 60 * 1000 : 0;
+  let match = null;
+  for (let index = data.turns.length - 1; index >= 0; index--) {
+    const turn = data.turns[index];
+    if (turn?.kind !== 'user' || !turn.userUuid) continue;
+    const record = data.recordMap.get(turn.userUuid);
+    const userText = _extractUserText(record);
+    if (!userText || _orchestrationPromptHash(userText) !== promptHash) continue;
+    const timestampMs = Date.parse(turn.userTimestamp || '');
+    if (lowerBound && Number.isFinite(timestampMs) && timestampMs < lowerBound) continue;
+    match = { turn, turnIndex: index };
+    break;
+  }
+  if (!match) return { found: false, error: 'matching user turn not found' };
+  const blocks = _collectAssistantBlocks(match.turn, data.recordMap).text
+    .map((text) => String(text || '').trim())
+    .filter(Boolean);
+  const joined = blocks.join('\n\n');
+  const limit = Math.max(500, Math.min(250_000, Number(maxChars) || 100_000));
+  const truncated = joined.length > limit;
+  const assistantText = joined.length <= limit
+    ? joined
+    : joined.slice(0, Math.floor(limit * 0.4)).trimEnd() + '\n…\n' + joined.slice(-(limit - Math.floor(limit * 0.4) - 3)).trimStart();
+  return {
+    found: true,
+    turnIndex: match.turnIndex,
+    userUuid: match.turn.userUuid,
+    assistantText,
+    assistantChars: joined.length,
+    truncated,
+    assistantBlockCount: blocks.length,
+  };
 }
 
 async function handleOverseerRequest(rawUrl) {
@@ -8152,7 +8799,6 @@ function startMcpHttpServer() {
                 : sessionId
                 ? 'codex-c'
                 : 'codex';
-            _markTerminalAsAiTab(tabId, engine, mode === 'new' ? null : (sessionId || null));
             activityId = emitTerminalMcpActivity('start_ai', {
               status: 'running',
               tabId,
@@ -8176,6 +8822,13 @@ function startMcpHttpServer() {
             const launchStatus = runResult?.success === false
               ? 'error'
               : (runResult?.acceptancePending === true ? 'starting' : 'started');
+            // A rejected shell admission must not turn the saved tab into a
+            // Codex tab. `run-command` is the authority for whether launch
+            // bytes reached a proven-idle shell; persist the UI metadata only
+            // after that boundary accepts it.
+            if (runResult?.success !== false) {
+              _markTerminalAsAiTab(tabId, engine, mode === 'new' ? null : (sessionId || null));
+            }
             emitTerminalMcpActivity('start_ai', {
               id: activityId,
               status: launchStatus,
@@ -8210,20 +8863,51 @@ function startMcpHttpServer() {
               res.end(JSON.stringify({ error: 'Claude fork requires create_tab with command "claude-f <sessionId>" so the existing fork machinery can copy JSONL safely.' }));
               return;
             }
-            _markTerminalAsAiTab(tabId, engine, mode === 'new' ? null : (sessionId || null));
-            claudeState.set(tabId, 'WAITING_PROMPT');
-            commandText = sessionId && mode !== 'new'
-              ? 'claude --dangerously-skip-permissions --resume ' + sessionId
-              : 'claude --dangerously-skip-permissions';
-            if (sessionId && mode !== 'new' && termCwd) {
-              const safe = String(termCwd).replace(/'/g, "'\\''");
-              commandText = "cd '" + safe + "' && " + commandText;
-              if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send('claude:session-detected', { tabId, sessionId });
-              }
-              _notifyClaudeSession(tabId, sessionId);
+            activityId = emitTerminalMcpActivity('start_ai', {
+              status: 'running',
+              tabId,
+              targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+              engine,
+              mode: mode || (sessionId ? 'continue' : 'new'),
+              sessionId: mode === 'new' ? null : (sessionId || null),
+              sourceMeta: sourceMeta || null,
+            });
+            const claudeCommand = sessionId && mode !== 'new' ? 'claude-c' : 'claude';
+            const runResult = await runClaudeCommandSerialized(
+              { sender: mainWindow?.webContents || { send: () => {} } },
+              {
+                tabId,
+                command: claudeCommand,
+                sessionId: claudeCommand === 'claude-c' ? sessionId : null,
+                cdTo: claudeCommand === 'claude-c' ? termCwd : null,
+              },
+            );
+            // Keep an existing interrupted/session binding intact when the
+            // launch is rejected. A fresh binding is saved only after main has
+            // accepted the Ctrl+C + command write at the shell boundary.
+            if (runResult?.success !== false) {
+              _markTerminalAsAiTab(tabId, engine, mode === 'new' ? null : (sessionId || null));
             }
-            claudeCliActive.set(tabId, true);
+            emitTerminalMcpActivity('start_ai', {
+              id: activityId,
+              status: runResult?.success === false ? 'error' : 'started',
+              tabId,
+              targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
+              engine,
+              mode: mode || (sessionId ? 'continue' : 'new'),
+              sessionId: runResult?.sessionId || null,
+              sourceMeta: sourceMeta || null,
+              error: runResult?.success === false ? (runResult.error || 'claude_start_failed') : undefined,
+            });
+            res.writeHead(runResult?.success === false ? 409 : 200);
+            res.end(JSON.stringify({
+              status: runResult?.success === false ? 'not_started' : 'started',
+              tabId,
+              agent: engine,
+              mode: mode || (sessionId ? 'continue' : 'new'),
+              ...runResult,
+            }));
+            return;
           } else {
             _markTerminalAsAiTab(tabId, engine, mode === 'new' ? null : (sessionId || null));
             geminiActiveTabs.add(tabId);
@@ -8725,7 +9409,7 @@ function stopMcpHttpServer() {
   console.log('[McpReconnect] terminal-mcp STOPPED (pid=' + process.pid + ') — on next start active Claude sessions will write attachment[mcp_instructions_delta]');
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // Microphone permission for Soniox dictation (MicButton, mobile-web composer).
   // Without these two handlers Electron's default is "deny" — getUserMedia
   // rejects with AbortError "The user aborted a request" even when macOS itself
@@ -8762,6 +9446,15 @@ app.whenReady().then(() => {
   // Setup shell integration (OSC 7 for cwd reporting)
   console.log('[Startup] Setting up shell integration...');
   setupShellIntegration();
+
+  // A native Codex Rewind creates a child rollout. If Electron died after the
+  // confirming Enter but before the live writer proof committed that child,
+  // repair the exact journaled A→B edge before renderer restore/AutoResume can
+  // observe and relaunch the stale source A.
+  const rewindRecovery = await recoverPendingCodexNativeRewindHandoffs();
+  if (rewindRecovery.recovered || rewindRecovery.unresolved || rewindRecovery.cleared) {
+    console.log('[Startup] Codex rewind recovery:', rewindRecovery);
+  }
 
   // Hydrate per-tab provider state Map from SQLite BEFORE any tab spawns.
   // Without this, first Claude request from a restored tab would hit the
@@ -8872,6 +9565,7 @@ app.whenReady().then(() => {
         projectId,
         refreshTuiReady: true,
       }),
+      getAgentTurnResult: _getAgentTurnResultForOrchestration,
     });
     console.log('[Startup] Mobile WebServer OK');
 
@@ -8889,6 +9583,15 @@ app.whenReady().then(() => {
       } catch (e) {
         return { ok: false, error: String(e.message || e) };
       }
+    });
+    ipcMain.handle('orchestration:list-for-tab', async (_event, tabId) => {
+      if (!tabId) return [];
+      return webServer.listOrchestrationRunsForTab(tabId);
+    });
+    ipcMain.handle('orchestration:acknowledge', async (_event, payload = {}) => {
+      if (!payload.runId || !payload.tabId) return { ok: false, error: 'runId+tabId required' };
+      const run = await webServer.acknowledgeOrchestrationRun(payload.runId, payload.tabId);
+      return run ? { ok: true, run } : { ok: false, error: 'run not found' };
     });
     // Renderer → web relay for prompt-queue deltas. usePromptQueueWebSync (App
     // root) fires this whenever a tab's queue core changes; we fan it out to any
@@ -9657,6 +10360,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       parseOSC133AndEmit(tabId, data);
       const outputToolType = bridgeKnownSessions.has(tabId) ? 'claude' : resolveAiToolTypeForTab(tabId);
       if (outputToolType !== 'claude') {
+        tryCommitCodexModelMigrationAcknowledgement(tabId, data);
         tryHandleCodexStartupAutoEnter(tabId, data);
         void tryEmitCodexTuiReady(tabId, data).catch((err) => {
           console.warn('[CodexTuiReady] probe failed tab=' + String(tabId).slice(-12) + ' ' + (err?.message || String(err)));
@@ -9877,23 +10581,22 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
               ? 'ModelDialog'
               : null;
         if (dialogType) {
-          const now = Date.now();
-          const cooldownKey = tabId + ':' + dialogType;
-          const lastFire = claudeConfirmDialogCooldown.get(cooldownKey) || 0;
-          if (now - lastFire > 2000) {
-            claudeConfirmDialogCooldown.set(cooldownKey, now);
-            console.log('[' + dialogType + '] Tab ' + tabId + ': detected, sending Enter in 120ms');
-            // Delay to let Ink finish rendering the full menu before we press Enter.
-            // 80ms was too short — Ink still painted dialog when Enter arrived and Enter went
-            // into an undefined state (sometimes worked, sometimes ate the prompt).
-            setTimeout(() => {
-              const t = terminals.get(tabId);
-              if (t) {
-                console.log('[' + dialogType + '] Tab ' + tabId + ': writing \\r');
-                t.write('\r');
-              }
-            }, 120);
-          }
+          console.log('[' + dialogType + '] Tab ' + tabId
+            + ': output hint detected; waiting for current-frame proof');
+          // The output stream is only a wake-up hint: Ink can split or repaint
+          // this menu across chunks. Re-read the current headless screen at the
+          // write boundary so a stale chunk cannot submit a later user draft.
+          setTimeout(() => {
+            void confirmClaudeSettingsDialogFromCurrentFrame(
+              tabId,
+              dialogType,
+              'pty-output-hint',
+            ).catch((error) => {
+              console.warn('[' + dialogType + '] Tab ' + tabId
+                + ': current-frame confirmation failed: '
+                + (error?.message || String(error)));
+            });
+          }, 120);
         }
       }
 
@@ -10286,6 +10989,7 @@ const pendingPasteAudit = new Map();
 const pendingCodexPasteAudit = new Map();
 const CLAUDE_PASTE_AUDIT_TIMEOUT_MS = 8000;
 const CODEX_PASTE_AUDIT_TIMEOUT_MS = 8000;
+const CODEX_PASTE_AUDIT_LATE_RECONCILIATION_MS = 2 * 60 * 1000;
 
 function pasteAuditHash(text) {
   return require('crypto').createHash('sha1').update(String(text || '')).digest('hex').slice(0, 16);
@@ -10385,6 +11089,9 @@ function waitForClaudePasteAudit(tabId, audit, timeoutMs = CLAUDE_PASTE_AUDIT_TI
 function finishCodexPasteAudit(tabId, audit, result) {
   if (!audit) return;
   if (audit.timer) clearTimeout(audit.timer);
+  if (audit.lateTimer) clearTimeout(audit.lateTimer);
+  audit.timer = null;
+  audit.lateTimer = null;
   if (pendingCodexPasteAudit.get(tabId) === audit) pendingCodexPasteAudit.delete(tabId);
   if (typeof audit.resolve === 'function') {
     audit.resolve(result);
@@ -10399,6 +11106,7 @@ function waitForCodexPasteAudit(tabId, audit, timeoutMs = CODEX_PASTE_AUDIT_TIME
   return new Promise((resolve) => {
     audit.resolve = resolve;
     audit.timer = setTimeout(() => {
+      audit.timer = null;
       console.warn('[CodexPasteAudit:TIMEOUT] tab=' + String(tabId).slice(-12)
         + ' source=' + (audit.source || '-')
         + ' expectedLen=' + audit.expectedLen
@@ -10407,12 +11115,42 @@ function waitForCodexPasteAudit(tabId, audit, timeoutMs = CODEX_PASTE_AUDIT_TIME
         + ' expectedTail=' + JSON.stringify(audit.tailPreview)
         + ' waited=' + timeoutMs + 'ms'
         + ' sentAgeMs=' + (Date.now() - audit.sentAt));
-      finishCodexPasteAudit(tabId, audit, {
+      const timeoutResult = {
         success: false,
         error: 'codex_user_message_audit_timeout',
         expectedLen: audit.expectedLen,
         expectedHash: audit.expectedHash,
-      });
+        lateReconciliationPending: true,
+      };
+      audit.callerTimedOut = true;
+      audit.callerTimedOutAt = Date.now();
+      if (typeof audit.resolve === 'function') {
+        audit.resolve(timeoutResult);
+        audit.resolve = null;
+      }
+      // The caller gets a bounded timeout, but delivery ownership must survive
+      // a slow Codex startup. A fresh rollout may appear tens of seconds after
+      // Enter; keeping this exact hash lets the newly adopted watcher replay
+      // from byte zero and reconcile task_started/task_complete as well.
+      if (pendingCodexPasteAudit.get(tabId) === audit) {
+        audit.lateTimer = setTimeout(() => {
+          audit.lateTimer = null;
+          if (pendingCodexPasteAudit.get(tabId) !== audit) return;
+          console.warn('[CodexPasteAudit:LATE_TIMEOUT] tab=' + String(tabId).slice(-12)
+            + ' source=' + (audit.source || '-')
+            + ' expectedLen=' + audit.expectedLen
+            + ' expectedHash=' + audit.expectedHash
+            + ' sentAgeMs=' + (Date.now() - audit.sentAt)
+            + ' action=release-late-reconciliation');
+          finishCodexPasteAudit(tabId, audit, {
+            success: false,
+            error: 'codex_user_message_audit_late_timeout',
+            expectedLen: audit.expectedLen,
+            expectedHash: audit.expectedHash,
+          });
+          clearCodexPromptInFlight(tabId, 'paste-audit-late-timeout');
+        }, CODEX_PASTE_AUDIT_LATE_RECONCILIATION_MS);
+      }
     }, timeoutMs);
   });
 }
@@ -10606,19 +11344,32 @@ async function requestTerminalVisibleBufferSnapshot(webContents, tabId, reason, 
 }
 
 async function requestTerminalCodexDraftState(webContents, tabId, reason, timeoutMs = 700, options = {}) {
+  let headlessState = null;
+  const mergeRendererPositive = options.mergeRendererPositive === true;
   const headless = getHeadlessTerminalMirror(tabId);
   if (headless) {
     const expected = typeof options.waitFor === 'boolean' ? options.waitFor : null;
     const waitTimeoutMs = Math.max(100, Math.min(Number(options.waitTimeoutMs) || timeoutMs || 900, 2500));
     const flush = await flushHeadlessTerminalMirror(tabId, Math.min(timeoutMs, HEADLESS_XTERM_FLUSH_TIMEOUT_MS));
     if (flush.success) {
-      const headlessState = expected === null
+      headlessState = expected === null
         ? getHeadlessCodexDraftState(tabId, reason)
         : await waitForHeadlessCodexDraftState(tabId, expected, waitTimeoutMs, reason);
-      if (headlessState?.success && (headlessState.hasDraft !== null || expected === null)) {
-        if (headlessState.hasDraft !== null || !webContents || (typeof webContents.isDestroyed === 'function' && webContents.isDestroyed())) {
+      if (hasDefinitiveDraftState(headlessState)) {
+        const rendererAvailable = !!webContents
+          && !(typeof webContents.isDestroyed === 'function' && webContents.isDestroyed());
+        if (
+          headlessState.hasDraft === true
+          || mergeRendererPositive !== true
+          || !rendererAvailable
+        ) {
           return { requestId: null, tabId, reason, ...headlessState };
         }
+        console.log('[CodexDraftState] headless empty, probing fresh renderer-positive tab='
+          + String(tabId).slice(-12)
+          + ' reason=' + reason
+          + ' source=' + (headlessState.source || '-'));
+      } else if (headlessState?.success && (headlessState.hasDraft !== null || expected === null)) {
         console.warn('[CodexDraftState] headless unknown tab=' + String(tabId).slice(-12)
           + ' reason=' + reason
           + ' source=' + (headlessState.source || '-')
@@ -10641,7 +11392,7 @@ async function requestTerminalCodexDraftState(webContents, tabId, reason, timeou
     }
   }
 
-  return new Promise((resolve) => {
+  const rendererState = await new Promise((resolve) => {
     if (!webContents || (typeof webContents.isDestroyed === 'function' && webContents.isDestroyed())) {
       resolve({ success: false, error: 'no-webcontents', tabId, reason, source: 'renderer' });
       return;
@@ -10676,6 +11427,12 @@ async function requestTerminalCodexDraftState(webContents, tabId, reason, timeou
     } catch (err) {
       finish({ success: false, error: err?.message || String(err), requestId, tabId, reason });
     }
+  });
+  const normalizedHeadlessState = headlessState
+    ? { requestId: null, tabId, reason, ...headlessState }
+    : null;
+  return mergeCodexDraftAuthority(normalizedHeadlessState, rendererState, {
+    mergeRendererPositive,
   });
 }
 
@@ -10749,9 +11506,16 @@ async function safePasteAndSubmit(term, content, options = {}) {
     identityPending: false,
     queuedAt: Date.now(),
   };
+  const operationTabId = findTabIdForTerm(term);
+  const expectedInputRevision = operationTabId
+    ? getTerminalInputRevision(operationTabId)
+    : null;
   return await withPtyWriteLock(
     term,
-    () => _safePasteAndSubmitInner(term, content, options),
+    () => _safePasteAndSubmitInner(term, content, {
+      ...options,
+      expectedInputRevision,
+    }),
     operation,
   );
 }
@@ -10779,6 +11543,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     verifyCodexVisibleDraftBeforeSubmit = false,
     codexSubmissionPreflight = true,
     requestReceivedAt = null,
+    expectedInputRevision = null,
   } = options;
 
   // TTYHOG on macOS = 1024 bytes. Paste brackets = 12 bytes. Leave margin.
@@ -10811,10 +11576,15 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   // will happen mid-stream.
   const broadcastTabId = findTabIdForTerm(term);
   const isCodexPasteSource = !!(source && String(source).startsWith('codex-'));
+  const isPromptQueueSource = typeof source === 'string' && source.includes('prompt-queue');
+  const isHistoryComposerSource = typeof source === 'string'
+    && (source === 'history-panel' || source === 'codex-history-panel');
+  const requiresImagePathValidation = isPromptQueueSource || isHistoryComposerSource;
   let awaitCodexUserMessageAudit = requestedCodexUserMessageAudit;
   let codexPromptInFlightState = null;
   let codexSubmissionWatcher = null;
   let codexPtyAdmission = null;
+  let claudePromptQueuePtyAdmission = null;
   let stagedCodexImageRefs = [];
   let codexImagePasteSegments = null;
   // The Codex rollout audit is cleaned up from `finally`, so its reference
@@ -10837,10 +11607,24 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     && broadcastTabId
     && codexSubmissionPreflight !== false
   ) {
-    codexPtyAdmission = captureCodexPtySubmitAdmission(broadcastTabId, term);
+    codexPtyAdmission = captureCodexPtySubmitAdmission(
+      broadcastTabId,
+      term,
+      expectedInputRevision,
+    );
     if (!codexPtyAdmission.available) {
       console.warn(logPrefix + ' [CodexSubmissionAdmission] refusing before paste reason='
         + (codexPtyAdmission.reason || 'unknown'));
+      if (isPromptQueueSource) {
+        return {
+          success: false,
+          accepted: false,
+          deferred: true,
+          error: 'codex_input_not_ready',
+          detail: codexPtyAdmission.reason || 'codex_submit_not_admitted',
+          submitted: false,
+        };
+      }
       return {
         success: false,
         error: codexPtyAdmission.reason || 'codex_submit_not_admitted',
@@ -10873,10 +11657,27 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       }
     }
   }
-  if (typeof source === 'string' && source.includes('prompt-queue')) {
+  if (isPromptQueueSource && !isCodexPasteSource) {
+    claudePromptQueuePtyAdmission = broadcastTabId
+      ? captureClaudePromptQueuePtyAdmission(broadcastTabId, term)
+      : { available: false, reason: 'claude_input_not_ready' };
+    if (!claudePromptQueuePtyAdmission.available) {
+      console.warn(logPrefix + ' [ClaudeQueueAdmission] waiting before paste reason='
+        + (claudePromptQueuePtyAdmission.reason || 'claude_input_not_ready'));
+      return {
+        success: false,
+        accepted: false,
+        deferred: true,
+        error: 'claude_input_not_ready',
+        submitted: false,
+      };
+    }
+  }
+  if (requiresImagePathValidation) {
     const queueImages = await validatePromptQueueImageMarkers(content);
     if (!queueImages.success) {
-      console.warn(logPrefix + ' [PromptQueueAssets] refusing transfer missing=' + queueImages.missing.length);
+      console.warn(logPrefix + ' [PromptQueueAssets] refusing transfer source=' + (source || '-')
+        + ' missing=' + queueImages.missing.length);
       return {
         success: false,
         error: 'queue_image_path_unavailable',
@@ -10960,12 +11761,41 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   console.log(logPrefix + ' 🚀 Start: "' + content.substring(0, 40) + '" (' + content.length + ' chars → ' + pasteGroups.length + ' paste group(s), ' + chunks.length + ' chunk(s), fast=' + fast + ', ctrlCFirst=' + ctrlCFirst + ', stashFirst=' + stashFirst + ', submit=' + resolvedSubmitLabel + ', handoff=' + (handoffId || '-') + ', source=' + (source || '-') + ', skipRenderWait=' + skipRenderWait + ', codexVisibleDraftGuard=' + shouldVerifyCodexVisibleDraft + ')');
 
   if (shouldVerifyCodexVisibleDraft && mainWindow && !mainWindow.isDestroyed() && !ctrlCFirst && !stashFirst) {
+    if (
+      expectedInputRevision !== null
+      && getTerminalInputRevision(broadcastTabId) !== expectedInputRevision
+    ) {
+      return {
+        success: false,
+        error: 'codex_input_ownership_changed',
+        submitted: false,
+        manualTakeover: true,
+      };
+    }
+    const draftProbeInputRevision = getTerminalInputRevision(broadcastTabId);
     const beforeDraft = await requestTerminalCodexDraftState(
       mainWindow.webContents,
       broadcastTabId,
       'codex-pre-submit-before-paste',
-      700
+      700,
+      { mergeRendererPositive: true },
     );
+    const afterDraftProbeInputRevision = getTerminalInputRevision(broadcastTabId);
+    if (
+      afterDraftProbeInputRevision !== draftProbeInputRevision
+      || (
+        expectedInputRevision !== null
+        && afterDraftProbeInputRevision !== expectedInputRevision
+      )
+    ) {
+      return {
+        success: false,
+        error: 'codex_input_ownership_changed',
+        submitted: false,
+        manualTakeover: true,
+        codexDraftGuard: beforeDraft || null,
+      };
+    }
     console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexDraftGuard] before-paste success=' + !!beforeDraft?.success
       + ' hasDraft=' + beforeDraft?.hasDraft
       + ' source=' + (beforeDraft?.source || '-')
@@ -11072,9 +11902,36 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     if (!currentAdmission.valid) {
       console.warn(logPrefix + ' [CodexSubmissionAdmission] cancelled before paste reason='
         + currentAdmission.reason);
+      if (isPromptQueueSource) {
+        return {
+          success: false,
+          accepted: false,
+          deferred: true,
+          error: 'codex_input_not_ready',
+          detail: currentAdmission.reason,
+          submitted: false,
+          chunksTotal: chunks.length,
+        };
+      }
       return {
         success: false,
         error: currentAdmission.reason,
+        submitted: false,
+        chunksTotal: chunks.length,
+      };
+    }
+  }
+  if (claudePromptQueuePtyAdmission) {
+    const currentAdmission = revalidateClaudePromptQueuePtyAdmission(claudePromptQueuePtyAdmission);
+    if (!currentAdmission.valid) {
+      console.warn(logPrefix + ' [ClaudeQueueAdmission] cancelled before paste reason='
+        + currentAdmission.reason);
+      return {
+        success: false,
+        accepted: false,
+        deferred: true,
+        error: 'claude_input_not_ready',
+        detail: currentAdmission.reason,
         submitted: false,
         chunksTotal: chunks.length,
       };
@@ -11137,7 +11994,11 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         broadcastTabId,
         'codex-pre-submit-after-paste',
         1400,
-        { waitFor: true, waitTimeoutMs: 1200 }
+        {
+          waitFor: true,
+          waitTimeoutMs: 1200,
+          mergeRendererPositive: true,
+        },
       );
       console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexDraftGuard] after-paste success=' + !!afterDraft?.success
         + ' hasDraft=' + afterDraft?.hasDraft
@@ -11171,9 +12032,40 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       if (!currentAdmission.valid) {
         console.warn(logPrefix + ' [CodexSubmissionAdmission] cancelled before Enter reason='
           + currentAdmission.reason);
+        if (isPromptQueueSource) {
+          return {
+            success: false,
+            accepted: false,
+            deferred: true,
+            error: 'codex_input_not_ready',
+            detail: currentAdmission.reason,
+            submitted: false,
+            chunksTotal: chunks.length,
+            renderTimeMs: renderTimes,
+            submitKey: null,
+          };
+        }
         return {
           success: false,
           error: currentAdmission.reason,
+          submitted: false,
+          chunksTotal: chunks.length,
+          renderTimeMs: renderTimes,
+          submitKey: null,
+        };
+      }
+    }
+    if (claudePromptQueuePtyAdmission) {
+      const currentAdmission = revalidateClaudePromptQueuePtyAdmission(claudePromptQueuePtyAdmission);
+      if (!currentAdmission.valid) {
+        console.warn(logPrefix + ' [ClaudeQueueAdmission] cancelled before Enter reason='
+          + currentAdmission.reason);
+        return {
+          success: false,
+          accepted: false,
+          deferred: true,
+          error: 'claude_input_not_ready',
+          detail: currentAdmission.reason,
           submitted: false,
           chunksTotal: chunks.length,
           renderTimeMs: renderTimes,
@@ -11226,6 +12118,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           awaitUserMessage: !!awaitCodexUserMessageAudit,
           resolve: null,
           timer: null,
+          lateTimer: null,
+          callerTimedOut: false,
+          callerTimedOutAt: null,
         };
         pendingCodexPasteAudit.set(broadcastTabId, stagedCodexAudit);
         console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] staged source=' + (source || '-') + ' expectedLen=' + content.length + ' hash=' + expectedHash + ' await=' + !!awaitCodexUserMessageAudit);
@@ -11288,9 +12183,40 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       if (!finalAdmission.valid) {
         console.warn(logPrefix + ' [CodexSubmissionAdmission] cancelled at Enter boundary reason='
           + finalAdmission.reason);
+        if (isPromptQueueSource) {
+          return {
+            success: false,
+            accepted: false,
+            deferred: true,
+            error: 'codex_input_not_ready',
+            detail: finalAdmission.reason,
+            submitted: false,
+            chunksTotal: chunks.length,
+            renderTimeMs: renderTimes,
+            submitKey: null,
+          };
+        }
         return {
           success: false,
           error: finalAdmission.reason,
+          submitted: false,
+          chunksTotal: chunks.length,
+          renderTimeMs: renderTimes,
+          submitKey: null,
+        };
+      }
+    }
+    if (claudePromptQueuePtyAdmission) {
+      const finalAdmission = revalidateClaudePromptQueuePtyAdmission(claudePromptQueuePtyAdmission);
+      if (!finalAdmission.valid) {
+        console.warn(logPrefix + ' [ClaudeQueueAdmission] cancelled at Enter boundary reason='
+          + finalAdmission.reason);
+        return {
+          success: false,
+          accepted: false,
+          deferred: true,
+          error: 'claude_input_not_ready',
+          detail: finalAdmission.reason,
           submitted: false,
           chunksTotal: chunks.length,
           renderTimeMs: renderTimes,
@@ -11535,6 +12461,17 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
   // proof is still in flight, before the one-shot state has been armed.
   const startupPromptProbeActive = codexStartupPromptAdoptionProbeTabs.has(tabId);
   const startupPromptState = codexStartupAutoEnter.get(tabId);
+  if (!isTerminalProtocolResponse && (data === '\r' || data === '\n')) {
+    const migrationEnter = tryHandleManualCodexModelMigrationEnter(tabId, term, data, meta);
+    if (migrationEnter.handled) {
+      if (!migrationEnter.submitted) {
+        console.warn('[CodexModelMigration] manual Enter not sent tab='
+          + String(tabId).slice(-12)
+          + ' error=' + (migrationEnter.error || 'unknown'));
+      }
+      return;
+    }
+  }
   if ((startupPromptProbeActive || startupPromptState) && isTerminalProtocolResponse) {
     console.log('[CodexStartupPrompt] ignored terminal protocol response tab=' + String(tabId).slice(-12)
       + ' phase=' + (startupPromptProbeActive ? 'adoption-probe' : (startupPromptState?.source || 'armed'))
@@ -11578,7 +12515,8 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
   // Pure Esc (one byte `\x1b`) or Ctrl+C (`\x03`) → arm idle-probe safety net.
   // Multi-byte ESC sequences (стрелки `\x1b[A`, F-keys, `\x1bO...`) пропускаем —
   // они не означают interrupt. См. armInterruptIdleProbe выше для подробностей.
-  if (data === '\x1b' || data === '\x03') {
+  const isPureEscapeBurst = isPureCodexEscapeBurst(data);
+  if (isPureEscapeBurst || data === '\x03') {
     const codexSid = getCodexRuntimeSessionId(tabId);
     if (codexSid) {
       const codexTurnState = codexTurnWatchers.get(tabId) || null;
@@ -11586,15 +12524,19 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
       console.warn(
         '[CodexInterruptInput]' +
         ' tab=' + String(tabId).slice(-12) +
-        ' key=' + (data === '\x1b' ? 'Escape' : 'Ctrl+C') +
+        ' key=' + (isPureEscapeBurst ? 'Escape×' + data.length : 'Ctrl+C') +
         ' session=' + String(codexSid).slice(0, 8) +
         ' turnBusy=' + (codexTurnState?.busy === true) +
         ' lastEvent=' + (codexTurnState?.lastEventType || 'none') +
         ' lastEventTs=' + (codexTurnState?.lastEventTs || 'none') +
         ' commandRunning=' + (commandState?.isRunning === true)
       );
-      if (data === '\x1b' && codexTurnState?.busy !== true && commandState?.isRunning === true) {
-        armCodexWriterHandoffObservation(tabId, 'manual-idle-escape');
+      if (isPureEscapeBurst && codexTurnState?.busy !== true && commandState?.isRunning === true) {
+        armCodexWriterHandoffObservation(
+          tabId,
+          'manual-idle-escape',
+          { manualPhysicalRewind: true },
+        );
       }
     }
     const claudeSid = bridgeKnownSessions.get(tabId) || null;
@@ -11603,7 +12545,7 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
       console.warn(
         '[ClaudeInterruptInput]' +
         ' tab=' + String(tabId).slice(-12) +
-        ' key=' + (data === '\x1b' ? 'Escape' : 'Ctrl+C') +
+        ' key=' + (isPureEscapeBurst ? 'Escape×' + data.length : 'Ctrl+C') +
         ' session=' + String(claudeSid || 'none').slice(0, 8) +
         ' turnBusy=' + (claudeTurnBusy.get(tabId) === true) +
         ' spinnerBusy=' + (claudeSpinnerBusy.get(tabId) === true) +
@@ -11618,6 +12560,7 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
     }
   }
 
+  trackManualCodexRewindNavigationInput(tabId, data);
   trackClaudeInputLineForLocalCommands(tabId, data);
 
 // User paste (Cmd+V) — direct passthrough, no chunking needed.
@@ -11644,7 +12587,72 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
       || codexLastRunCommandPayload.has(tabId)
   );
   if (isManualCodexSubmit) {
+    const manualRewind = await handleManualCodexRewindConfirmationEnter(tabId, term, data);
+    if (manualRewind.handled) {
+      if (!manualRewind.submitted) {
+        console.warn('[CodexWriterHandoff] manual Rewind Enter not sent tab='
+          + String(tabId).slice(-12)
+          + ' error=' + (manualRewind.error || 'unknown'));
+      }
+      return;
+    }
     const precedingOperation = ptyLastQueuedWriteOperation.get(term) || null;
+    const activeOperation = ptyActiveWriteOperation.get(term) || null;
+    const immediateArbitration = classifyManualCodexSubmitAfterWriteQueue({
+      precedingOperation,
+      activeOperation,
+      competingReservation: codexWatchers.get(tabId)?.provisionalSubmitReservation || null,
+    });
+    if (immediateArbitration.bypassQueue) {
+      activeOperation.manualTakeover = true;
+      activeOperation.manualTakeoverAt = Date.now();
+      const manualEnterSubmitsPrompt = activeOperation.manualEnterSubmitsPrompt !== false;
+      const composerState = getHeadlessCodexDraftState(
+        tabId,
+        'manual-enter-ui-control-takeover',
+      );
+      const composerKnown = manualEnterSubmitsPrompt
+        && composerState?.success === true
+        && (composerState.hasDraft === true || composerState.hasDraft === false);
+      const promptInFlight = composerKnown
+        ? beginCodexPromptInFlight(tabId, 'manual-terminal-enter', {
+          source: 'manual-terminal-enter-ui-control-takeover',
+        })
+        : null;
+      if (composerKnown) {
+        queueTerminalCommandMeta(tabId, meta);
+        captureTerminalInputForLastCommand(tabId, data);
+      }
+      try {
+        term.write(data);
+        if (promptInFlight) {
+          markCodexPromptSubmitted(tabId, promptInFlight, 'manual-enter-written');
+        }
+      } catch (error) {
+        if (promptInFlight) clearCodexPromptInFlight(tabId, 'manual-write-failed');
+        throw error;
+      }
+      console.warn('[CodexSubmitTiming] source=manual-terminal-enter-ui-control-takeover'
+        + ' tab=' + String(tabId).slice(-12)
+        + ' receiveToPtyWriteMs=' + (nodePerformance.now() - inputReceivedAt).toFixed(1)
+        + ' operation=' + (activeOperation.kind || '-')
+        + ' operationPhase=' + (activeOperation.phase || '-')
+        + ' promptSubmit=' + manualEnterSubmitsPrompt
+        + ' composerKnown=' + composerKnown
+        + ' draftSource=' + (composerState?.source || '-'));
+      if (composerKnown) {
+        void ensureCodexSubmissionWatcher(
+          tabId,
+          terminalProjects.get(tabId),
+          'manual-terminal-enter-ui-control-takeover-post-write',
+        ).catch((error) => {
+          console.warn('[Codex Watcher] immediate manual Enter observer failed tab='
+            + String(tabId).slice(-12)
+            + ' error=' + (error?.message || String(error)));
+        });
+      }
+      return;
+    }
     const manualOperation = {
       kind: 'manual-codex-enter',
       source: 'manual-terminal-enter',
@@ -11662,6 +12670,7 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
       // never delivery of this user action.
       const boundaryArbitration = classifyManualCodexSubmitAfterWriteQueue({
         precedingOperation,
+        activeOperation: ptyActiveWriteOperation.get(term) || null,
         competingReservation: codexWatchers.get(tabId)?.provisionalSubmitReservation || null,
       });
       if (boundaryArbitration.suppress) {
@@ -11901,25 +12910,47 @@ function mediaTypeFromImagePath(filePath) {
   return 'image/png';
 }
 
+async function saveClipboardImageAsset() {
+  const image = clipboard.readImage();
+  if (!image || image.isEmpty()) {
+    return { success: false, error: 'clipboard_image_empty' };
+  }
+  const png = image.toPNG();
+  if (!Buffer.isBuffer(png) || png.length === 0) {
+    return { success: false, error: 'clipboard_png_empty' };
+  }
+
+  const ref = await promptQueueAssetStore.materializeBuffer(png, {
+    id: 0,
+    mediaType: 'image/png',
+    size: png.length,
+  });
+  if (ref.availability !== 'available') {
+    return { success: false, error: ref.error || 'save_failed' };
+  }
+  leasePromptQueueAssetRefs([ref]);
+  return { success: true, ...ref };
+}
+
+ipcMain.handle('prompt-queue:save-clipboard-image', async (_event, { tabId } = {}) => {
+  try {
+    const ref = await saveClipboardImageAsset();
+    console.log('[prompt-queue:save-clipboard-image] tab=' + String(tabId || 'unknown').slice(-12)
+      + ' success=' + ref.success
+      + ' asset=' + (ref.assetId || '-')
+      + ' bytes=' + (ref.size || 0)
+      + ' error=' + (ref.error || '-'));
+    return ref;
+  } catch (error) {
+    console.warn('[prompt-queue:save-clipboard-image] failed:', error?.message || error);
+    return { success: false, error: error?.code || 'save_failed' };
+  }
+});
+
 ipcMain.handle('codex:save-clipboard-image', async (_event, { tabId } = {}) => {
   try {
-    const image = clipboard.readImage();
-    if (!image || image.isEmpty()) {
-      return { success: false, error: 'clipboard_image_empty' };
-    }
-    const png = image.toPNG();
-    if (!Buffer.isBuffer(png) || png.length === 0) {
-      return { success: false, error: 'clipboard_png_empty' };
-    }
-
-    const ref = await promptQueueAssetStore.materializeBuffer(png, {
-      id: 0,
-      mediaType: 'image/png',
-      size: png.length,
-    });
-    if (ref.availability !== 'available') {
-      return { success: false, error: ref.error || 'save_failed' };
-    }
+    const ref = await saveClipboardImageAsset();
+    if (!ref.success) return ref;
     const transport = codexImageTransport.stageSync(ref);
     if (!transport.success) {
       return { success: false, error: transport.error || 'image_alias_failed' };
@@ -12178,6 +13209,24 @@ ipcMain.handle('claude:startup-slash-proof', (event, payload = {}) => {
   return result;
 });
 
+ipcMain.handle('claude:confirm-settings-dialog', async (_event, payload = {}) => {
+  const tabId = String(payload?.tabId || '');
+  const kind = String(payload?.kind || '').toLowerCase();
+  const expectedDialogType = kind === 'model'
+    ? 'ModelDialog'
+    : kind === 'effort'
+      ? 'EffortDialog'
+      : null;
+  if (!tabId || !expectedDialogType) {
+    return { success: false, confirmed: false, error: 'invalid_arguments' };
+  }
+  return confirmClaudeSettingsDialogFromCurrentFrame(
+    tabId,
+    expectedDialogType,
+    String(payload?.reason || 'renderer-setting-transaction'),
+  );
+});
+
 ipcMain.handle('agent:get-stopping-state', async (_event, tabId) => {
   const state = aiStoppingTabs.get(tabId) || null;
   const publicState = state?.publicLifecycle === false ? null : state;
@@ -12376,13 +13425,13 @@ function commandLooksLikeAiProcess(cmd, expectedName) {
   return !!getAiProcessNameFromCommand(text);
 }
 
-async function getProcessTreeSnapshot() {
+async function getProcessTreeSnapshot({ forceFresh = false } = {}) {
   const now = nodePerformance.now();
-  if (processTreeSnapshotCache && (now - processTreeSnapshotCache.createdAt) < PROCESS_TREE_SNAPSHOT_TTL_MS) {
+  if (!forceFresh && processTreeSnapshotCache && (now - processTreeSnapshotCache.createdAt) < PROCESS_TREE_SNAPSHOT_TTL_MS) {
     return { ...processTreeSnapshotCache, source: 'cache', waiters: 0 };
   }
 
-  if (processTreeSnapshotInflight) {
+  if (!forceFresh && processTreeSnapshotInflight) {
     processTreeSnapshotWaiters += 1;
     const waitStartedAt = nodePerformance.now();
     const snapshot = await processTreeSnapshotInflight;
@@ -12394,11 +13443,19 @@ async function getProcessTreeSnapshot() {
     };
   }
 
+  // A destructive launch clear (Ctrl+C) must not be authorized by the shared
+  // 750ms snapshot cache. If a normal snapshot is already being captured,
+  // wait for it to finish and then take one more sample so this proof is newer
+  // than every launch/lifecycle mutation that preceded the call.
+  if (forceFresh && processTreeSnapshotInflight) {
+    try { await processTreeSnapshotInflight; } catch {}
+  }
+
   const opId = beginPerfOp('psSnapshot', {});
   processTreeSnapshotWaiters = 0;
   const startedAt = nodePerformance.now();
   const startAbs = nodePerformance.timeOrigin + startedAt;
-  processTreeSnapshotInflight = (async () => {
+  const snapshotPromise = (async () => {
     const psOut = await execAsync('ps -eo pid,ppid,command', 2000);
     const psMs = nodePerformance.now() - startedAt;
     const parseStartedAt = nodePerformance.now();
@@ -12428,7 +13485,7 @@ async function getProcessTreeSnapshot() {
         '[Perf:ProcessTreeSnapshot]' +
         ' startAbs=' + startAbs.toFixed(1) +
         ' endAbs=' + (nodePerformance.timeOrigin + nodePerformance.now()).toFixed(1) +
-        ' source=spawn' +
+        ' source=' + (forceFresh ? 'force-fresh' : 'spawn') +
         ' lines=' + lines.length +
         ' waiters=' + processTreeSnapshotWaiters +
         ' psMs=' + psMs.toFixed(1) +
@@ -12438,24 +13495,27 @@ async function getProcessTreeSnapshot() {
     }
     return snapshot;
   })();
+  if (!forceFresh) processTreeSnapshotInflight = snapshotPromise;
 
   try {
-    const snapshot = await processTreeSnapshotInflight;
-    return { ...snapshot, source: 'spawn', waiters: processTreeSnapshotWaiters, waitMs: 0 };
+    const snapshot = await snapshotPromise;
+    return { ...snapshot, source: forceFresh ? 'force-fresh' : 'spawn', waiters: processTreeSnapshotWaiters, waitMs: 0 };
   } finally {
-    processTreeSnapshotInflight = null;
+    if (!forceFresh && processTreeSnapshotInflight === snapshotPromise) {
+      processTreeSnapshotInflight = null;
+    }
     endPerfOp(opId);
   }
 }
 
-async function findAiDescendantProcessesByTab(tabId, expectedName) {
+async function findAiDescendantProcessesByTab(tabId, expectedName, options = {}) {
   const term = terminals.get(tabId);
   if (!term) return [];
   const startedAt = nodePerformance.now();
   const startAbs = nodePerformance.timeOrigin + startedAt;
   const opId = beginPerfOp('psLookup', { tabId, expectedName });
   try {
-    const snapshot = await getProcessTreeSnapshot();
+    const snapshot = await getProcessTreeSnapshot(options);
     const parseStartedAt = nodePerformance.now();
     const matches = [];
     const stack = [{ pid: term.pid, depth: 0 }];
@@ -12516,9 +13576,9 @@ async function findAiDescendantProcessesByTab(tabId, expectedName) {
   }
 }
 
-async function inspectAiDescendantProcessesByTab(tabId, expectedName) {
+async function inspectAiDescendantProcessesByTab(tabId, expectedName, options = {}) {
   return inspectProcessLookup(
-    () => findAiDescendantProcessesByTab(tabId, expectedName),
+    () => findAiDescendantProcessesByTab(tabId, expectedName, options),
     { tabId, expectedName },
   );
 }
@@ -12662,6 +13722,49 @@ ipcMain.handle('agent:get-launch-accepted', async (_event, request = {}) => {
   return { success: !!result.accepted, ...result };
 });
 
+async function resolveAgentInputProcess(tabId, agent, logPrefix) {
+  const expectedName = agent === 'claude' ? 'claude' : (agent === 'codex' ? 'codex' : null);
+  if (!expectedName) {
+    return { success: false, error: 'unsupported_agent', candidates: [], cliPid: null, lockPids: [] };
+  }
+
+  // Session bridge identity and process liveness are deliberately separate.
+  // A fresh Claude TUI can already accept a startup slash command before its
+  // first conversation JSONL exists, so bridgePidCache is not guaranteed to
+  // contain the process yet. Resolve the input helper from this tab's PTY tree,
+  // the same authoritative boundary already used by Codex.
+  const lookup = await inspectAiDescendantProcessesByTab(tabId, expectedName);
+  if (lookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
+    console.warn(logPrefix + ' Tab ' + tabId.slice(-12) + ': ' + expectedName + ' process lookup unavailable');
+    return { ...aiProcessLookupFailureResult(lookup), candidates: [], cliPid: null, lockPids: [] };
+  }
+
+  const candidates = lookup.matches;
+  if (candidates.length === 0) {
+    console.log(logPrefix + ' Tab ' + tabId.slice(-12) + ': no active ' + expectedName + ' process under PTY');
+    return {
+      success: false,
+      error: 'no_' + expectedName + '_session',
+      candidates: [],
+      cliPid: null,
+      lockPids: [],
+    };
+  }
+
+  // Matches are deepest-first. The external-editor helper is parented by the
+  // leaf CLI process; writing locks for every matching wrapper also preserves
+  // compatibility with launchers whose final executable shape changes.
+  const cliPid = candidates[0].pid;
+  const lockPids = [...new Set(candidates.map((candidate) => candidate.pid))];
+  console.log(
+    logPrefix + ' Tab ' + tabId.slice(-12) +
+    ': matched ' + expectedName + ' pids=' +
+    candidates.map((candidate) => candidate.pid + '@d' + candidate.depth).join(',') +
+    ' leaf=' + cliPid
+  );
+  return { success: true, candidates, cliPid, lockPids };
+}
+
 // Shared by claude/codex grab/copy/restore input operations. All fire Ctrl+G
 // after writing a lock-file telling noted-code-grab.js which mode to run in.
 async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
@@ -12674,35 +13777,10 @@ async function captureAgentInput(tabId, mode, agent = 'claude', options = {}) {
 
   let cliPid = null;
   let lockPids = [];
-  if (agent === 'claude') {
-    if (!hasLiveClaudeInTab(tabId)) {
-      console.log(logPrefix + ' Tab ' + tabId.slice(-12) + ': no active Claude session (bridge/pid)');
-      return { success: false, error: 'no_claude_session' };
-    }
-    cliPid = findClaudePidByTab(tabId);
-    if (cliPid) lockPids = [cliPid];
-  } else if (agent === 'codex') {
-    const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
-    if (lookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
-      console.warn(logPrefix + ' Tab ' + tabId.slice(-12) + ': Codex process lookup unavailable');
-      return aiProcessLookupFailureResult(lookup);
-    }
-    const candidates = lookup.matches;
-    if (candidates.length === 0) {
-      console.log(logPrefix + ' Tab ' + tabId.slice(-12) + ': no active Codex process under shell pid=' + term.pid);
-      return { success: false, error: 'no_codex_session' };
-    }
-    // Codex has a wrapper chain: shell → `node /opt/homebrew/bin/codex` →
-    // vendor binary `.../bin/codex`. Ctrl+G external-editor is spawned by the
-    // vendor binary, so the helper's ppid is the deepest matching descendant,
-    // not the direct child. Write locks for all matched PIDs; helper consumes
-    // only the one matching its actual ppid.
-    cliPid = candidates[0].pid;
-    lockPids = [...new Set(candidates.map(c => c.pid))];
-    console.log(logPrefix + ' Tab ' + tabId.slice(-12) + ': matched codex pids=' + candidates.map(c => c.pid + '@d' + c.depth).join(',') + ' leaf=' + cliPid + ' shellPid=' + term.pid);
-  } else {
-    return { success: false, error: 'unsupported_agent' };
-  }
+  const processResolution = await resolveAgentInputProcess(tabId, agent, logPrefix);
+  if (!processResolution.success) return processResolution;
+  cliPid = processResolution.cliPid;
+  lockPids = processResolution.lockPids;
 
   if (cliPid) {
     // Verify the cached PID still maps to a live process. If user restarted Claude in shell
@@ -12815,8 +13893,132 @@ async function restoreAgentInput(tabId, text, agent = 'claude') {
 
 ipcMain.handle('claude:grab-input', async (event, tabId) => captureClaudeInput(tabId, 'grab'));
 ipcMain.handle('claude:copy-input', async (event, tabId) => captureClaudeInput(tabId, 'copy'));
+ipcMain.handle('claude:restore-input', async (_event, tabId, text) => restoreAgentInput(tabId, text, 'claude'));
 ipcMain.handle('codex:grab-input', async (event, tabId) => captureAgentInput(tabId, 'grab', 'codex'));
 ipcMain.handle('codex:copy-input', async (event, tabId) => captureAgentInput(tabId, 'copy', 'codex'));
+ipcMain.handle('codex:restore-input', async (_event, tabId, text) => restoreAgentInput(tabId, text, 'codex'));
+
+ipcMain.handle('claude:retry-exact-setting-input', async (_event, payload = {}) => {
+  const tabId = String(payload?.tabId || '');
+  const expected = normalizeClaudeLocalCommandText(payload?.command);
+  if (!tabId || !parseClaudeStartupSlashCommand(expected)) {
+    return { success: false, submitted: false, error: 'invalid_arguments' };
+  }
+  const expectedTerm = terminals.get(tabId);
+  if (!expectedTerm) return { success: false, submitted: false, error: 'no_terminal' };
+  const inputRevision = getTerminalInputRevision(tabId);
+  const captured = await captureClaudeInput(tabId, 'copy');
+  const actual = normalizeClaudeLocalCommandText(captured?.text);
+  if (captured?.success !== true) {
+    return {
+      success: false,
+      submitted: false,
+      error: captured?.error || 'copy_input_failed',
+    };
+  }
+  if (actual !== expected) {
+    return {
+      success: true,
+      submitted: false,
+      reason: 'input_changed',
+      actualPreview: actual.slice(0, 80),
+    };
+  }
+  if (
+    terminals.get(tabId) !== expectedTerm
+    || getTerminalInputRevision(tabId) !== inputRevision
+  ) {
+    return {
+      success: false,
+      submitted: false,
+      error: 'terminal_generation_changed',
+    };
+  }
+  bumpTerminalInputRevision(tabId);
+  console.warn('[ClaudeSettingRetry] tab=' + tabId.slice(-12)
+    + ' exact input still present; writing one Enter command='
+    + JSON.stringify(expected));
+  expectedTerm.write('\r');
+  return { success: true, submitted: true };
+});
+
+ipcMain.handle('claude:clear-exact-setting-input', async (_event, payload = {}) => {
+  const tabId = String(payload?.tabId || '');
+  const expected = normalizeClaudeLocalCommandText(payload?.command);
+  if (!tabId || !parseClaudeStartupSlashCommand(expected)) {
+    return { success: false, cleared: false, error: 'invalid_arguments' };
+  }
+  const expectedTerm = terminals.get(tabId);
+  if (!expectedTerm) return { success: false, cleared: false, error: 'no_terminal' };
+  const inputRevision = getTerminalInputRevision(tabId);
+  const captured = await captureClaudeInput(tabId, 'copy');
+  const actual = normalizeClaudeLocalCommandText(captured?.text);
+  if (captured?.success !== true) {
+    return {
+      success: false,
+      cleared: false,
+      error: captured?.error || 'copy_input_failed',
+    };
+  }
+  if (actual !== expected) {
+    return {
+      success: true,
+      cleared: false,
+      reason: 'input_changed',
+      actualPreview: actual.slice(0, 80),
+    };
+  }
+  if (
+    terminals.get(tabId) !== expectedTerm
+    || getTerminalInputRevision(tabId) !== inputRevision
+  ) {
+    return {
+      success: false,
+      cleared: false,
+      error: 'terminal_generation_changed',
+    };
+  }
+
+  const processResolution = await resolveAgentInputProcess(
+    tabId,
+    'claude',
+    '[clear-exact-setting-input]',
+  );
+  if (!processResolution.success) {
+    return { ...processResolution, cleared: false };
+  }
+  if (
+    terminals.get(tabId) !== expectedTerm
+    || getTerminalInputRevision(tabId) !== inputRevision
+  ) {
+    return {
+      success: false,
+      cleared: false,
+      error: 'terminal_generation_changed',
+    };
+  }
+
+  try {
+    const lockPayload = JSON.stringify({
+      mode: 'clear',
+      agent: 'claude',
+      tabId,
+      ts: Date.now(),
+      sock: CLAUDE_HOOK_SOCK,
+    });
+    for (const pid of processResolution.lockPids) {
+      fs.writeFileSync('/tmp/noted-grab-' + pid + '.json', lockPayload);
+    }
+  } catch {
+    return { success: false, cleared: false, error: 'lock_write_failed' };
+  }
+  bumpTerminalInputRevision(tabId);
+  console.warn('[ClaudeSettingClear] tab=' + tabId.slice(-12)
+    + ' exact failed command still present; clearing command='
+    + JSON.stringify(expected));
+  expectedTerm.write('\x07');
+  return { success: true, cleared: true };
+});
 
 // Clear current Claude input WITHOUT going through the queue. Same external-editor
 // hijack, but helper truncates the tempfile and exits — no socket callback.
@@ -12825,14 +14027,20 @@ ipcMain.handle('codex:copy-input', async (event, tabId) => captureAgentInput(tab
 ipcMain.handle('claude:clear-input', async (event, tabId) => {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no_terminal' };
-  if (!hasLiveClaudeInTab(tabId)) return { success: false, error: 'no_claude_session' };
   // Same policy as captureClaudeInput: only block on hook-confirmed turn busy.
   // Spinner-busy mid-stream still accepts Ctrl+G — see fix-claude-hook-silent-dropouts.md
   if (claudeTurnBusy.get(tabId) === true) return { success: false, error: 'claude_busy' };
-  const claudePid = findClaudePidByTab(tabId);
-  if (!claudePid) return { success: false, error: 'no_claude_pid' };
+  const processResolution = await resolveAgentInputProcess(tabId, 'claude', '[clear-input]');
+  if (!processResolution.success) return processResolution;
+  const claudePid = processResolution.cliPid;
   try {
-    fs.writeFileSync('/tmp/noted-grab-' + claudePid + '.json', JSON.stringify({ mode: 'clear', ts: Date.now(), sock: CLAUDE_HOOK_SOCK }));
+    fs.writeFileSync('/tmp/noted-grab-' + claudePid + '.json', JSON.stringify({
+      mode: 'clear',
+      agent: 'claude',
+      tabId,
+      ts: Date.now(),
+      sock: CLAUDE_HOOK_SOCK,
+    }));
   } catch (e) {
     return { success: false, error: 'lock_write_failed' };
   }
@@ -12846,6 +14054,7 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
   const source = typeof sendOptions.source === 'string' && sendOptions.source.trim()
     ? sendOptions.source.trim()
     : 'send-command';
+  const isPromptQueueSend = source.includes('prompt-queue');
   const stashFirst = sendOptions.stashFirst === false ? false : true;
   const armPromptBoundaryOnSubmit = sendOptions.armPromptBoundaryOnSubmit === true || source.startsWith('startup-defaults:');
   const isSlashCommand = String(command || '').trimStart().startsWith('/');
@@ -12853,16 +14062,28 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
   const awaitClaudeUserMessageAudit = sendOptions.awaitUserMessageAudit === true && !isSlashCommand;
   console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" source=' + source + ' stashFirst=' + stashFirst + ' awaitAudit=' + awaitClaudeUserMessageAudit + ' slash=' + isSlashCommand + ' ts=' + Date.now());
   const term = terminals.get(tabId);
-  if (!term) { console.log('[send-command] ❌ Terminal not found for tabId=' + tabId); return { success: false, error: 'no_terminal' }; }
+  if (!term) {
+    console.log('[send-command] ❌ Terminal not found for tabId=' + tabId);
+    if (isPromptQueueSend) {
+      return { success: false, accepted: false, deferred: true, error: 'claude_input_not_ready', detail: 'no_terminal', submitted: false };
+    }
+    return { success: false, error: 'no_terminal' };
+  }
   if (!hasLiveClaudeInTab(tabId)) {
     const lookup = await inspectAiDescendantProcessesByTab(tabId, 'claude');
     if (lookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
       console.warn('[send-command] ❌ Claude process lookup unavailable in tab ' + tabId);
+      if (isPromptQueueSend) {
+        return { success: false, accepted: false, deferred: true, error: 'claude_input_not_ready', detail: lookup.reason || 'process_lookup_unknown', submitted: false };
+      }
       return aiProcessLookupFailureResult(lookup);
     }
     const candidates = lookup.matches;
     if (candidates.length === 0) {
       console.log('[send-command] ❌ No live Claude session (bridge/pid/descendant) in tab ' + tabId + ' — refusing to paste into non-Claude PTY');
+      if (isPromptQueueSend) {
+        return { success: false, accepted: false, deferred: true, error: 'claude_input_not_ready', detail: 'no_claude_session', submitted: false };
+      }
       return { success: false, error: 'no_claude_session' };
     }
   }
@@ -12883,7 +14104,7 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
       mainWindow.webContents.send('claude:ctrlc-danger-zone', { tabId, active: false });
     }
   }
-  if (source.includes('prompt-queue')) {
+  if (isPromptQueueSend) {
     const queueImages = await validatePromptQueueImageMarkers(command);
     if (!queueImages.success) {
       return {
@@ -12895,7 +14116,8 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
     }
   }
   startClaudeLocalCommandWatcher(tabId, command, 'send-command');
-  return await safePasteAndSubmit(term, command, {
+  bumpTerminalInputRevision(tabId);
+  const result = await safePasteAndSubmit(term, command, {
     submit: true,
     stashFirst,
     armPromptBoundaryOnSubmit,
@@ -12906,6 +14128,10 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
     source,
     logPrefix: '[send-command:' + tabId + (source !== 'send-command' ? ':' + source : '') + ']'
   });
+  if (isPromptQueueSend && result?.deferred === true) {
+    stopClaudeLocalCommandWatcher(tabId, 'prompt-queue-admission-deferred');
+  }
+  return result;
 });
 
 // PromptQueue replay (▶ chip button): paste text into Claude's input WITHOUT
@@ -13204,19 +14430,75 @@ ipcMain.handle('claude:toggle-thinking', async (event, tabId) => {
 // Optional `pasteAfter` keeps the AI-assisted compact path, but it now shares the same rewind selector.
 const rewindCancelTabs = new Set();
 
-ipcMain.handle('rewind:cancel', async (_event, { tabId, toolType } = {}) => {
+function beginActiveRewindOperation(tabId, toolType, opId) {
+  return claimRewindOperation(activeRewindOperations, { tabId, toolType, opId });
+}
+
+function finishActiveRewindOperation(operation) {
+  finishRewindOperation(activeRewindOperations, operation);
+}
+
+function markActiveRewindMutationStarted(operation, sender) {
+  if (!markRewindMutationStarted(activeRewindOperations, operation)) return false;
+  try {
+    if (sender && !sender.isDestroyed?.()) {
+      sender.send('rewind:mutation-started', {
+        tabId: operation.tabId,
+        toolType: operation.toolType,
+        opId: operation.opId,
+      });
+    }
+  } catch (error) {
+    console.warn('[Rewind] mutation-started notification failed tab='
+      + String(operation.tabId).slice(-12)
+      + ' error=' + (error?.message || error));
+  }
+  return true;
+}
+
+ipcMain.handle('rewind:cancel', async (_event, { tabId, toolType, opId } = {}) => {
   if (!tabId) return { success: false, error: 'no_tab_id' };
+  // Gemini compaction is renderer-owned and has its own AbortController. There
+  // is no native terminal mutation to cancel here.
+  if (toolType === 'gemini') {
+    return { success: true, accepted: true, rendererOwned: true };
+  }
+  const cancelDecision = classifyRewindCancel(activeRewindOperations, { tabId, toolType, opId });
+  const operation = cancelDecision.operation;
+  if (cancelDecision.status === 'not-active') {
+    return cancelDecision.response;
+  }
+  if (cancelDecision.status === 'stale') {
+    console.warn('[Rewind:Cancel] stale request tab=' + String(tabId).slice(-12)
+      + ' requestedOp=' + String(opId || '-')
+      + ' activeOp=' + operation.opId);
+    return cancelDecision.response;
+  }
+  if (cancelDecision.status === 'too-late') {
+    console.log('[Rewind:Cancel] too late after mutation boundary tab='
+      + String(tabId).slice(-12) + ' op=' + operation.opId);
+    return cancelDecision.response;
+  }
   rewindCancelTabs.add(tabId);
   const term = terminals.get(tabId);
   if (term) {
     try {
-      term.write(toolType === 'codex' ? 'q' : '\x1b');
+      // `q` in a clean Codex composer is user input, not cancel. Only send it
+      // when the transcript protocol UI is known to be open; otherwise the
+      // operation observes rewindCancelTabs before its next write.
+      if (operation.toolType !== 'codex' || operation.protocolUiOpen) {
+        term.write(operation.toolType === 'codex' ? 'q' : '\x1b');
+      }
     } catch (err) {
       console.warn('[Rewind:Cancel] write failed tab=' + String(tabId).slice(-12) + ' error=' + (err?.message || err));
     }
   }
-  console.log('[Rewind:Cancel] requested tab=' + String(tabId).slice(-12) + ' tool=' + (toolType || 'unknown') + ' hasTerm=' + !!term);
-  return { success: true };
+  console.log('[Rewind:Cancel] accepted tab=' + String(tabId).slice(-12)
+    + ' tool=' + operation.toolType
+    + ' op=' + operation.opId
+    + ' hasTerm=' + !!term
+    + ' protocolUiOpen=' + operation.protocolUiOpen);
+  return cancelDecision.response;
 });
 
 function makeRewindCancelledError(stage) {
@@ -13226,12 +14508,15 @@ function makeRewindCancelledError(stage) {
   return err;
 }
 
-ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, targetText, targetFullText, targetUuid, rewindableCount, skipDuplicates = 0, pasteAfter, deadlineMs }) => {
+ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIndex, targetText, targetFullText, targetUuid, rewindableCount, skipDuplicates = 0, pasteAfter, deadlineMs }) => {
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
-  rewindCancelTabs.delete(tabId);
   if (!hasLiveClaudeInTab(tabId)) return { success: false, error: 'no_claude_session' };
   if (claudeTurnBusy.get(tabId) === true) return { success: false, error: 'claude_busy' };
+  const activeRewindClaim = beginActiveRewindOperation(tabId, 'claude', opId);
+  if (!activeRewindClaim.success) return activeRewindClaim;
+  const activeRewindOperation = activeRewindClaim.operation;
+  rewindCancelTabs.delete(tabId);
   const rewindDeadlineAt = Date.now() + Math.max(3000, Math.min(180000, Number(deadlineMs) || 18000));
   let rewindDeadlineHit = false;
   const selectionMarkerRe = /^[●❯›]\s*/u;
@@ -14077,6 +15362,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
       }
 
       console.log('[Claude:Rewind] Confirming target with Enter');
+      markActiveRewindMutationStarted(activeRewindOperation, event.sender);
       await writeAndWait('\r', /\x1b\[\?2026l|\x1b\]7777;prompt:|[⏵❯╰]/, 6000, '[Claude:Rewind:confirm]');
       await waitForPtyText(term, /\x1b\]7777;prompt:|[⏵❯╰]|\x1b\[\?2026l/, 5000, '[Claude:Rewind:prompt]');
 
@@ -14160,6 +15446,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
     return { success: false, error: err.message };
   } finally {
     rewindCancelTabs.delete(tabId);
+    finishActiveRewindOperation(activeRewindOperation);
   }
 });
 
@@ -14172,6 +15459,7 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, targetIndex, t
 // the existing Ctrl+G grab path so terminal composer stays empty.
 ipcMain.handle('codex:open-history-menu', async (_event, {
   tabId,
+  opId,
   targetIndex,
   targetText,
   targetFullText,
@@ -14287,6 +15575,35 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
 
   function normalizeCandidate(text) {
     return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function findCodexRollbackFailureLine(text) {
+    const failureLine = String(text || '')
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .find(line => /^■\s*(?:Cannot rollback while a turn is in progress\.?|num_turns must be >= 1|thread rollback requires persisted thread history|failed to (?:flush|load) thread persistence for rollback replay)/i.test(line));
+    return failureLine || '';
+  }
+
+  async function inspectCodexRollbackFailureAfterConfirm(confirmClean) {
+    const flushed = await flushHeadlessTerminalMirror(tabId);
+    const snapshot = flushed.success
+      ? getHeadlessVisibleBufferSnapshot(tabId, 'codex-rewind-confirm-result')
+      : { success: false, error: flushed.error || 'headless-flush-failed' };
+    const visibleText = snapshot.success
+      ? (snapshot.lines || []).map(line => String(line?.text || '')).join('\n')
+      : '';
+    // A Codex error cell is rendered with a leading solid square. Searching
+    // arbitrary PTY deltas is unsafe because the user's restored prompt can
+    // itself contain words such as "Cannot rollback".
+    const failureLine = findCodexRollbackFailureLine(visibleText)
+      || (!snapshot.success ? findCodexRollbackFailureLine(confirmClean) : '');
+    return {
+      rejected: !!failureLine,
+      failureLine,
+      proofSource: snapshot.success ? 'headless-current-screen' : 'fresh-confirm-frame',
+      snapshotError: snapshot.success ? '' : (snapshot.error || 'headless-snapshot-unavailable'),
+    };
   }
 
   function codexUserUuidForRecord(sessionId, record) {
@@ -14890,7 +16207,48 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
 
   let codexRewindOverlayOpen = false;
   let handoffObservationArmed = false;
+  let handoffMutationStarted = false;
+  let handoffSettlementResult = null;
   let codexRewindOperationResult = null;
+  const settleAppliedCodexRewindWriter = async (stage) => {
+    if (!handoffObservationArmed || !handoffMutationStarted) {
+      return {
+        success: false,
+        error: 'codex_rewind_writer_handoff_not_armed',
+        rollbackMayHaveApplied: handoffMutationStarted,
+      };
+    }
+    if (!handoffSettlementResult?.bindingCommitted) {
+      handoffSettlementResult = await settleCodexWriterHandoffObservation(
+        tabId,
+        stage,
+        { waitForBranchMs: 8000 },
+      );
+    }
+    if (handoffSettlementResult?.bindingCommitted !== true
+      || handoffSettlementResult?.handoffStatus !== 'adopted-child'
+      || !handoffSettlementResult?.activeSessionId) {
+      return {
+        success: false,
+        error: handoffSettlementResult?.error || 'codex_rewind_writer_handoff_unresolved',
+        writerStatus: handoffSettlementResult?.status || 'unknown',
+        handoffStatus: handoffSettlementResult?.handoffStatus || 'unresolved',
+        sourceSessionId: handoffSettlementResult?.sourceSessionId || writer?.sessionId || null,
+        activeSessionId: null,
+        bindingCommitted: false,
+        handoffGeneration: handoffSettlementResult?.handoffGeneration || null,
+        rollbackMayHaveApplied: true,
+      };
+    }
+    return {
+      success: true,
+      sourceSessionId: handoffSettlementResult.sourceSessionId,
+      activeSessionId: handoffSettlementResult.activeSessionId,
+      bindingCommitted: true,
+      handoffStatus: 'adopted-child',
+      handoffGeneration: handoffSettlementResult.handoffGeneration || null,
+    };
+  };
   // PTY serialization alone is insufficient for destructive intents: a
   // second click queued behind the first would otherwise execute later with
   // the writer/target proof captured before the first rollback. Reject it
@@ -14908,6 +16266,12 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     return { success: false, error: 'codex_rewind_already_in_progress' };
   }
   const rewindReservation = rewindReservationClaim.reservation;
+  const activeRewindClaim = beginActiveRewindOperation(tabId, 'codex', opId);
+  if (!activeRewindClaim.success) {
+    releaseExclusiveActionReservation(codexRewindReservations, rewindReservation);
+    return activeRewindClaim;
+  }
+  const activeRewindOperation = activeRewindClaim.operation;
 
   try {
     codexRewindOperationResult = await withPtyWriteLock(term, async () => {
@@ -14930,7 +16294,9 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       provisionalResumeRewind = targetAuthorization.provisionalResumeRewind;
       const targetPayloadContext = await loadCodexRewindTargetPayload();
       const targetPayload = targetPayloadContext?.payload || null;
-      if (targetUuid && !targetPayloadContext) {
+      if (!targetPayloadContext
+        || !Number.isInteger(targetPayloadContext.sourceLine)
+        || targetPayloadContext.sourceLine < 1) {
         return {
           success: false,
           error: 'codex_rewind_target_not_in_current_writer',
@@ -14950,13 +16316,14 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       }
       writer = writeAuthorization.writer;
       provisionalResumeRewind = writeAuthorization.provisionalResumeRewind;
-      handoffObservationArmed = provisionalResumeRewind
-        ? false
-        : armCodexWriterHandoffObservation(
-          tabId,
-          'programmatic-rewind',
-          { blockMutations: true },
-        );
+      handoffObservationArmed = armCodexWriterHandoffObservation(
+        tabId,
+        'programmatic-rewind',
+        { blockMutations: true },
+      );
+      if (!handoffObservationArmed) {
+        return { success: false, error: 'codex_rewind_writer_handoff_not_armed' };
+      }
 
       async function pasteCodexRewindAiCompact(reason) {
         console.log('[Codex:Rewind] Pasting AI compact text (' + pasteAfter.length + ' chars, reason=' + reason + ', preview=' + JSON.stringify(String(pasteAfter).slice(0, 120)) + ')');
@@ -14972,7 +16339,9 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           submitSequence: '\r',
           submitLabel: 'Enter',
           source: 'codex-rewind-ai',
-          codexSubmissionPreflight: provisionalResumeRewind,
+          // Native Rewind has already adopted and durably bound its child
+          // writer before this follow-up submit.
+          codexSubmissionPreflight: false,
           awaitCodexUserMessageAudit: true,
           codexAuditTimeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
           logPrefix: '[Codex:Rewind:paste]',
@@ -15088,6 +16457,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
 
       const openFrame = openAttempt.openFrame;
       codexRewindOverlayOpen = true;
+      activeRewindOperation.protocolUiOpen = true;
 
       let selectedOlderSteps = null;
       let selectedMatch = await matchCodexRewindSelection(openFrame, targetInputText, 'open');
@@ -15271,18 +16641,44 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
 
       console.log('[Codex:Rewind] Confirming backtrack with Enter');
       throwIfCodexRewindCancelled('before-confirm');
+      const handoffActionStartedAtMs = Date.now();
+      const authoritativeTargetText = String(
+        targetPayload?.message
+        || codexDataModule._api.extractTextContent(targetPayload?.content)
+        || '',
+      ).trim();
+      if (!markCodexWriterHandoffActionBoundary(tabId, handoffActionStartedAtMs, {
+        targetUuid,
+        targetSourceLine: targetPayloadContext?.sourceLine,
+        targetTextHash: hashCodexRewindTargetText(authoritativeTargetText),
+        rollbackTurns,
+      })) {
+        return {
+          success: false,
+          error: 'codex_rewind_writer_handoff_boundary_failed',
+          rollbackMayHaveApplied: false,
+        };
+      }
+      handoffMutationStarted = true;
+      markActiveRewindMutationStarted(activeRewindOperation, _event.sender);
       const targetNeedle = normalizeCandidate(targetInputText).slice(0, 40);
       const confirmFrame = await sendCodexKeyAndCapture(
         term,
         '\r',
         3200,
         '[Codex:Rewind:confirm]',
-        (clean) => /Cannot rollback|ThreadRollbackFailed|rollback.*failed|requires persisted/i.test(clean)
+        (clean) => !!findCodexRollbackFailureLine(clean)
           || (targetNeedle.length > 0 && normalizeCandidate(clean).includes(targetNeedle))
       );
       const confirmClean = confirmFrame.clean || '';
       console.log('[Codex:Rewind] confirm timedOut=' + confirmFrame.timedOut + ' clean=' + JSON.stringify(confirmClean.slice(0, 320)));
       codexRewindOverlayOpen = false;
+      activeRewindOperation.protocolUiOpen = false;
+      const rollbackFailure = await inspectCodexRollbackFailureAfterConfirm(confirmClean);
+      console.log('[Codex:Rewind] rollback rejection proof rejected=' + rollbackFailure.rejected
+        + ' source=' + rollbackFailure.proofSource
+        + ' line=' + JSON.stringify(rollbackFailure.failureLine)
+        + ' snapshotError=' + (rollbackFailure.snapshotError || '-'));
       const confirmStartupBlockers = inspectCodexStartupBlockersText(confirmClean);
       const confirmExposedStartupFrame = confirmStartupBlockers.length > 0;
       const surfaceConfirmStartupFrameIfUnrecovered = (reason = 'codex-rewind-confirm-startup-frame-unrecovered') => {
@@ -15311,9 +16707,16 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           + ' blockers=' + confirmStartupBlockers.join('+')
           + ' preview=' + JSON.stringify(confirmClean.replace(/\s+/g, ' ').trim().slice(0, 220)));
       }
-      if (/Cannot rollback|ThreadRollbackFailed|rollback.*failed|requires persisted/i.test(confirmClean)) {
+      if (rollbackFailure.rejected) {
         surfaceConfirmStartupFrameIfUnrecovered('codex-rewind-confirm-thread-rollback-failed-startup-frame');
-        return { success: false, error: 'codex_thread_rollback_failed', clean: confirmClean.slice(0, 800) };
+        cancelCodexWriterHandoffAfterRejectedAction(tabId, 'codex-thread-rollback-rejected');
+        return {
+          success: false,
+          error: 'codex_thread_rollback_failed',
+          rejectionProof: rollbackFailure.proofSource,
+          rejectionLine: rollbackFailure.failureLine,
+          clean: confirmClean.slice(0, 800),
+        };
       }
       if (confirmFrame.timedOut || (targetNeedle.length > 0 && !normalizeCandidate(confirmClean).includes(targetNeedle))) {
         console.warn('[Codex:Rewind] confirm frame did not include target prefill; verifying composer via grab'
@@ -15367,6 +16770,14 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       }
 
       await markCodexTuiReadyAfterVerifiedComposer(tabId, 'codex-rewind-grab-success');
+      const writerHandoff = await settleAppliedCodexRewindWriter('programmatic-rewind-applied');
+      if (!writerHandoff.success) {
+        return {
+          ...writerHandoff,
+          rollbackTurns,
+          pressCount: escPressCount,
+        };
+      }
 
       if (hasPasteAfter) {
         const pasteResult = await pasteCodexRewindAiCompact('after-grab');
@@ -15388,6 +16799,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           restoredInput: false,
           historyInputDraft: false,
           compactPasted: true,
+          ...writerHandoff,
         };
       }
 
@@ -15404,29 +16816,69 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           : targetInputText,
         historyDraftWarning: grabResult.historyDraftWarning || '',
         restoredMatchMode: grabResult.matchMode || '',
+        ...writerHandoff,
       };
     });
     return codexRewindOperationResult;
   } catch (err) {
     if (err?.code === 'rewind_cancelled') {
-      try { term.write(codexRewindOverlayOpen ? 'q' : '\x1b'); } catch {}
+      if (!codexRewindOverlayOpen) {
+        try { term.write('\x1b'); } catch {}
+      }
       codexRewindOperationResult = { success: false, cancelled: true, error: 'rewind_cancelled', stage: err.stage, rollbackMayHaveApplied: false };
       return codexRewindOperationResult;
     }
     console.log('[Codex:Rewind] Error:', err?.message || String(err));
-    try { term.write(codexRewindOverlayOpen ? 'q' : '\x1b'); } catch {}
+    if (!codexRewindOverlayOpen) {
+      try { term.write('\x1b'); } catch {}
+    }
     codexRewindOperationResult = { success: false, error: err?.message || String(err) };
     return codexRewindOperationResult;
   } finally {
     try {
+      // Any normal return before the confirm Enter (journal failure, target
+      // mismatch, cancellation) must leave the proven-open native protocol UI.
+      // Once Enter may have been written, do not guess with another key.
+      if (codexRewindOverlayOpen && !handoffMutationStarted) {
+        await closeCodexRewindProtocolUi('finally-before-confirm-enter');
+        codexRewindOverlayOpen = false;
+        activeRewindOperation.protocolUiOpen = false;
+      }
       if (handoffObservationArmed) {
-        await settleCodexWriterHandoffObservation(tabId, 'programmatic-rewind', {
-          allowStableWriter: codexRewindOperationResult?.success === true,
-        });
+        if (!handoffMutationStarted) {
+          cancelCodexWriterHandoffBeforeAction(tabId, 'programmatic-rewind-not-applied');
+        } else if (!handoffSettlementResult?.bindingCommitted) {
+          handoffSettlementResult = await settleCodexWriterHandoffObservation(
+            tabId,
+            'programmatic-rewind-finally',
+            // The normal path already performed the full event-driven wait.
+            // `finally` only takes one last point-in-time proof in that case;
+            // failures before settlement still receive the single full wait.
+            { waitForBranchMs: handoffSettlementResult ? 0 : 8000 },
+          );
+        }
+        if (handoffMutationStarted && codexRewindOperationResult && handoffSettlementResult) {
+          Object.assign(codexRewindOperationResult, {
+            sourceSessionId: handoffSettlementResult.sourceSessionId || writer?.sessionId || null,
+            activeSessionId: handoffSettlementResult.activeSessionId || null,
+            bindingCommitted: handoffSettlementResult.bindingCommitted === true,
+            handoffStatus: handoffSettlementResult.handoffStatus || 'unresolved',
+            handoffGeneration: handoffSettlementResult.handoffGeneration || null,
+          });
+          if (codexRewindOperationResult.success === true
+            && handoffSettlementResult.bindingCommitted !== true) {
+            Object.assign(codexRewindOperationResult, {
+              success: false,
+              error: handoffSettlementResult.error || 'codex_rewind_writer_handoff_unresolved',
+              rollbackMayHaveApplied: true,
+            });
+          }
+        }
       }
     } finally {
       releaseExclusiveActionReservation(codexRewindReservations, rewindReservation);
       rewindCancelTabs.delete(tabId);
+      finishActiveRewindOperation(activeRewindOperation);
     }
   }
 });
@@ -16098,6 +17550,7 @@ let promptQueueAssetGcTimer = null;
 async function garbageCollectPromptQueueAssets(queueState, reason = 'state-save') {
   try {
     const referenced = collectReferencedAssetIds(queueState);
+    for (const assetId of promptQueueAssetSessionLeases) referenced.add(assetId);
     const result = await promptQueueAssetStore.garbageCollect(referenced);
     if (result.removed.length > 0) {
       console.log('[PromptQueueAssets] gc reason=' + reason
@@ -16119,6 +17572,7 @@ function schedulePromptQueueAssetGc(queueState, reason = 'state-save') {
 ipcMain.handle('prompt-queue:materialize-image-refs', async (_event, { refs } = {}) => {
   try {
     const materialized = await promptQueueAssetStore.materializeRefs(refs);
+    leasePromptQueueAssetRefs(materialized);
     const available = materialized.filter((ref) => ref.availability === 'available').length;
     return {
       success: available === materialized.length,
@@ -16425,6 +17879,52 @@ ipcMain.on('terminal:transfer-project-ownership-sync', (event, {
   } else {
     console.log('[TabProjectTransfer] committed source=' + String(sourceProjectId).slice(-12)
       + ' target=' + String(targetProjectId).slice(-12)
+      + ' tabs=' + result.transferred.length
+      + ' live=' + result.liveTabIds.length);
+  }
+  event.returnValue = result;
+});
+
+ipcMain.on('terminal:transfer-tab-group-ownership-sync', (event, {
+  sourceProjectId,
+  targetProjectId,
+  groupId,
+  targetGroupId,
+  tabIds,
+} = {}) => {
+  const result = commitTabGroupProjectTransfer({
+    terminals,
+    terminalProjectIds,
+    tabIds,
+    sourceProjectId,
+    targetProjectId,
+    groupId,
+    targetGroupId,
+    transferRows: ({
+      sourceProjectId: source,
+      targetProjectId: target,
+      groupId: sourceGroup,
+      targetGroupId: nextGroup,
+      tabIds: expectedIds,
+    }) => projectManager.transferProjectTabGroup(
+      source,
+      target,
+      sourceGroup,
+      nextGroup,
+      expectedIds
+    ),
+  });
+  if (result.success !== true) {
+    console.warn('[TabGroupProjectTransfer] rejected source=' + String(sourceProjectId || '').slice(-12)
+      + ' target=' + String(targetProjectId || '').slice(-12)
+      + ' group=' + String(groupId || '').slice(-12)
+      + ' tabs=' + (Array.isArray(tabIds) ? tabIds.length : 0)
+      + ' error=' + (result.error || 'unknown'));
+  } else {
+    console.log('[TabGroupProjectTransfer] committed source=' + String(sourceProjectId).slice(-12)
+      + ' target=' + String(targetProjectId).slice(-12)
+      + ' group=' + String(groupId).slice(-12)
+      + ' nextGroup=' + String(targetGroupId).slice(-12)
       + ' tabs=' + result.transferred.length
       + ' live=' + result.liveTabIds.length);
   }
@@ -18560,7 +20060,11 @@ async function stopAiProcessInTab(tabId, options = {}) {
   }
 
   if (!childPid) {
-    codexDescendantLookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
+    // Stop is destructive: a cached ABSENT snapshot is not proof that the
+    // process is gone. Force a current tree before deciding that cleanup alone
+    // is sufficient; otherwise a live nested Codex survives and legitimately
+    // reasserts lifecycle after the UI already reported STOPPED.
+    codexDescendantLookup = await inspectAiDescendantProcessesByTab(tabId, 'codex', { forceFresh: true });
     if (codexDescendantLookup.status === AI_PROCESS_LOOKUP_STATUS.FOUND) {
       const candidate = [...codexDescendantLookup.matches].sort((a, b) => a.depth - b.depth || a.pid - b.pid)[0];
       childPid = Number(candidate.pid);
@@ -18657,7 +20161,9 @@ async function stopAiProcessInTab(tabId, options = {}) {
       }, false);
     }
     if (isCodexRuntime && !preserveCodexLaunchPayload) {
+      invalidateCodexExitObservers(tabId, 'stop-no-process:' + stopReason);
       clearCodexLaunchPayload(tabId, stopReason);
+      closeCodexWatcher(tabId, stopReason);
       clearCodexKnownSession(tabId, stopReason);
       clearCodexTuiReady(tabId, stopReason);
       closeCodexTurnWatcher(tabId, stopReason);
@@ -18729,7 +20235,11 @@ async function stopAiProcessInTab(tabId, options = {}) {
         + ' reason=' + stopReason);
     }
     if (processName === 'codex') {
-      if (!preserveCodexLaunchPayload) clearCodexLaunchPayload(tabId, stopReason);
+      invalidateCodexExitObservers(tabId, 'stop-finalize:' + stopReason);
+      if (!preserveCodexLaunchPayload) {
+        clearCodexLaunchPayload(tabId, stopReason);
+        closeCodexWatcher(tabId, stopReason);
+      }
       clearCodexKnownSession(tabId, stopReason);
       clearCodexTuiReady(tabId, stopReason);
       closeCodexTurnWatcher(tabId, stopReason);
@@ -19464,35 +20974,13 @@ ipcMain.handle('session:validate-id', async (event, { input, mode, tabId }) => {
 // ========== CLAUDE INPUT INTERCEPTION ==========
 
 // Claude launcher: start claude with handshake (session detected via Bridge watcher)
-ipcMain.on('claude:spawn-with-watcher', (event, { tabId, cwd }) => {
+ipcMain.on('claude:spawn-with-watcher', async (event, { tabId }) => {
   console.log('[Claude Launch] Starting Claude for tab:', tabId);
-
-  const term = terminals.get(tabId);
-  if (term) {
-    // Enable thinking mode detection (will send Tab when '>' prompt appears)
-    claudeState.set(tabId, 'WAITING_PROMPT');
-    clearClaudeEditableLastPrompt(tabId, 'claude-spawn-with-watcher');
-    clearAiStopping(tabId, 'claude-spawn-with-watcher');
-    claudeStartupIntents.set(tabId, { sessionId: null, at: Date.now(), reason: 'claude-spawn-with-watcher' });
-    const state = terminalCommandState.get(tabId) || { isRunning: false, lastCommand: null };
-    state.isRunning = true;
-    clearTerminalCommandOrigin(tabId, state, 'claude-spawn-with-watcher');
-    terminalCommandState.set(tabId, state);
-    claudeCliActive.set(tabId, true);
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('terminal:command-started', { tabId, commandType: 'claude' });
-    }
-    _webBroadcast(tabId, {
-      type: 'snapshot',
-      sessionId: null,
-      busy: false,
-      sessionStatus: 'starting',
-      starting: true,
-      inputReady: false,
-      toolType: 'claude',
-      commandType: 'claude',
-    });
-    term.write('claude --dangerously-skip-permissions\r');
+  if (!tabId) return;
+  try {
+    await runClaudeCommandSerialized(event, { tabId, command: 'claude' });
+  } catch (error) {
+    console.error('[Claude Launch] Failed for tab=' + String(tabId).slice(-12) + ':', error);
   }
   // Session ID will be detected by SessionBridge (via StatusLine)
 });
@@ -19513,7 +21001,9 @@ const codexWatchers = new Map();
 const codexSessionDiscoveryIntents = new Map();
 const codexTurnWatchers = new Map();
 const codexPickerQueue = new Map();
+const codexSettingsMutationQueue = createCodexSettingsMutationQueue();
 const codexTuiReadyProcessProbeTabs = new Set();
+const codexTuiReadyCurrentFrameProbeTabs = new Set();
 const codexStartupPromptAdoptionProbeTabs = new Set();
 const codexStartupPromptManualOwnershipTabs = new Set();
 const CODEX_WATCHER_TTL_MS = 10 * 60 * 1000;
@@ -19551,6 +21041,7 @@ function clearCodexTuiReady(tabId, reason = 'clear') {
   codexStartupNoStateTimeoutTabs.delete(tabId);
   clearCodexMcpStartupWatchdog(tabId, reason);
   clearCodexPromptInFlight(tabId, 'tui-ready-clear:' + reason);
+  clearCodexPendingModelMigration(tabId, 'tui-ready-clear:' + reason);
   if (hadReady) {
     console.log('[CodexTuiReady] clear tab=' + String(tabId).slice(-12) + ' reason=' + reason);
   }
@@ -19593,6 +21084,10 @@ function inspectCodexStartupBlockersText(cleanText) {
   if (updatePrompt.interactiveVisible) {
     blockers.push('update-prompt');
   }
+  const modelMigrationPrompt = inspectCodexModelMigrationPrompt(text);
+  if (modelMigrationPrompt.visible) {
+    blockers.push('model-migration');
+  }
   if (has(/Do\s+you\s+trust\s+the\s+contents|Working\s+with\s+untrusted\s+contents|Yes\s*,?\s*continue|No\s*,?\s*quit/i)) {
     blockers.push('trust-directory');
   }
@@ -19605,7 +21100,13 @@ function inspectCodexStartupBlockersText(cleanText) {
   return Array.from(new Set(blockers));
 }
 
-function invalidateCodexTuiReadyForStartupBlocker(tabId, source, preview, blockers) {
+function invalidateCodexTuiReadyForStartupBlocker(
+  tabId,
+  source,
+  preview,
+  blockers,
+  { authoritativeCurrentFrame = false } = {},
+) {
   if (!tabId || !Array.isArray(blockers) || blockers.length === 0) return false;
   if (blockers.includes('auth-required')) {
     markCodexManualActionRequired(tabId, 'auth-required', {
@@ -19617,7 +21118,7 @@ function invalidateCodexTuiReadyForStartupBlocker(tabId, source, preview, blocke
     return true;
   }
   if (isOnlyCodexMcpStartupBlocker(blockers)) {
-    const ignoreReason = codexMcpStartupBlockerIgnoreReason(tabId);
+    const ignoreReason = codexMcpStartupBlockerIgnoreReason(tabId, { authoritativeCurrentFrame });
     if (ignoreReason) {
       logIgnoredCodexMcpStartupBlocker(tabId, {
         blockers,
@@ -19628,7 +21129,7 @@ function invalidateCodexTuiReadyForStartupBlocker(tabId, source, preview, blocke
       return false;
     }
   }
-  if (hasCodexPromptOrTurnInFlight(tabId)) {
+  if (!authoritativeCurrentFrame && hasCodexPromptOrTurnInFlight(tabId)) {
     console.log('[CodexTuiReady] skip startup-blocker invalidation tab=' + String(tabId).slice(-12)
       + ' source=' + (source || '-')
       + ' reason=prompt-or-turn-in-flight'
@@ -19879,18 +21380,26 @@ function logIgnoredCodexMcpStartupBlocker(tabId, inspected, phase, reason) {
     + ' preview=' + JSON.stringify(preview));
 }
 
-function codexMcpStartupBlockerIgnoreReason(tabId) {
-  if (hasCodexPromptOrTurnInFlight(tabId)) return 'prompt-or-turn-in-flight';
-  if (codexTuiReadyTabs.has(tabId)) return 'already-ready';
-  if (!isCodexStartupLifecycleFresh(tabId)) return 'not-startup-lifecycle';
-  return null;
+function codexMcpStartupBlockerIgnoreReason(tabId, { authoritativeCurrentFrame = false } = {}) {
+  const handling = classifyCodexMcpStartupBlockerHandling({
+    authoritativeCurrentFrame,
+    promptOrTurnInFlight: hasCodexPromptOrTurnInFlight(tabId),
+    alreadyReady: codexTuiReadyTabs.has(tabId),
+    startupLifecycleFresh: isCodexStartupLifecycleFresh(tabId),
+  });
+  return handling.ignore ? handling.reason : null;
 }
 
-function normalizeCodexMcpStartupInspection(tabId, inspected, phase) {
+function normalizeCodexMcpStartupInspection(
+  tabId,
+  inspected,
+  phase,
+  { authoritativeCurrentFrame = false } = {},
+) {
   if (!inspected || inspected.ready) return inspected;
   const blockers = Array.isArray(inspected.blockers) ? inspected.blockers : [];
   if (!isOnlyCodexMcpStartupBlocker(blockers)) return inspected;
-  const ignoreReason = codexMcpStartupBlockerIgnoreReason(tabId);
+  const ignoreReason = codexMcpStartupBlockerIgnoreReason(tabId, { authoritativeCurrentFrame });
   if (!ignoreReason) return inspected;
   logIgnoredCodexMcpStartupBlocker(tabId, inspected, phase, ignoreReason);
   const normalized = {
@@ -20096,6 +21605,7 @@ async function inspectCurrentCodexMcpStartupScreen(tabId, reason = 'mcp-watchdog
     tabId,
     inspectCodexInputReadyVisibleText(currentFrameText, source),
     reason,
+    { authoritativeCurrentFrame: true },
   );
   const mcpInfo = getCodexMcpStartupWatchdogState(tabId, inspected, currentFrameText);
   const writeSeq = Number(snapshot.writeSeq);
@@ -20365,6 +21875,12 @@ function finishCodexStartupLifecycle(tabId, reason = 'ready') {
 
 function markCodexTuiReadyFromTurnEnd(tabId, reason = 'turn-end') {
   if (!tabId || aiStoppingTabs.has(tabId)) return false;
+  if (codexPendingModelMigrations.has(tabId)) {
+    console.warn('[CodexTuiReady] turn lifecycle cannot bypass pending model migration proof tab='
+      + String(tabId).slice(-12)
+      + ' reason=' + reason);
+    return false;
+  }
   const hadReady = codexTuiReadyTabs.has(tabId);
   codexTuiReadyTabs.add(tabId);
   codexTuiReadyBuffers.delete(tabId);
@@ -20467,8 +21983,15 @@ function maybeArmCodexMcpStartupWatchdog(tabId, inspected, clean, phase) {
   }, delayMs);
 }
 
-function inspectCodexInputReadyVisibleText(visibleText, source = 'visible-buffer') {
-  const currentFrameText = selectCodexCurrentInteractiveFrameText(visibleText);
+function inspectCodexInputReadyVisibleText(
+  visibleText,
+  source = 'visible-buffer',
+  { lines = null, activePromptRow = null } = {},
+) {
+  const currentFrameText = selectCodexCurrentInteractiveFrameText(
+    Array.isArray(lines) ? lines : visibleText,
+    activePromptRow,
+  );
   const inspected = inspectCodexInputReadyText(currentFrameText, '', { requireSyncMarker: false, source });
   inspected.sampleMode = 'current-interactive-frame';
   inspected.sampleText = currentFrameText;
@@ -20484,7 +22007,7 @@ function isCodexInputReadyFrame(clean, raw) {
 function isCodexTuiReadyRelevantFrame(clean, raw) {
   const text = String(clean || '').replace(/\u00a0/g, ' ');
   return String(raw || '').includes(CODEX_SYNC_MARKER)
-    || /OpenAI Codex|Sign in with ChatGPT|Sign in with Device Code|Provide your own API key|Press enter to continue|Use \/skills|Full Access|Find and fix a bug|Explain this codebase|Ask Codex|Context \d+%|directory:\s*|permissions:\s*|Update available|Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|esc\s+to\s+interrupt|Do you trust the contents|directory to resume this session|directory to fork this session/i.test(text);
+    || /OpenAI Codex|Sign in with ChatGPT|Sign in with Device Code|Provide your own API key|Press enter to continue|Use \/skills|Full Access|Find and fix a bug|Explain this codebase|Ask Codex|Context \d+%|directory:\s*|permissions:\s*|Update available|Choose\s+how\s+you(?:'|’)?d\s+like\s+Codex\s+to\s+proceed|Try\s+new\s+model|Use\s+existing\s+model|Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|esc\s+to\s+interrupt|Do you trust the contents|directory to resume this session|directory to fork this session/i.test(text);
 }
 
 function logCodexTuiReadyNotReady(tabId, inspected, raw, clean, phase) {
@@ -20570,7 +22093,15 @@ async function emitCodexTuiReadyAfterQuiet(tabId) {
         cleanSnapshot: visibleText,
         source: snapshotSource,
       });
-      const visibleInspect = normalizeCodexMcpStartupInspection(tabId, inspectCodexInputReadyVisibleText(visibleText, snapshotSource), 'quiet-visible');
+      const visibleInspect = normalizeCodexMcpStartupInspection(
+        tabId,
+        inspectCodexInputReadyVisibleText(visibleText, snapshotSource, {
+          lines: snapshot.lines,
+          activePromptRow: snapshot.codexActivePrompt?.row,
+        }),
+        'quiet-visible',
+        { authoritativeCurrentFrame: true },
+      );
       reconcileCodexMcpStartupWatchdogFromCurrentScreen(tabId, visibleInspect, visibleText, 'quiet-visible');
       if (!visibleInspect.ready) {
         const visibleBlockers = Array.isArray(visibleInspect.blockers) ? visibleInspect.blockers : [];
@@ -20636,6 +22167,52 @@ async function tryEmitCodexTuiReady(tabId, data) {
   codexTuiReadyBuffers.set(tabId, raw);
   const clean = cleanCodexTuiFrame(raw);
   const inspected = normalizeCodexMcpStartupInspection(tabId, inspectCodexInputReadyFrame(clean, raw), 'stream');
+  const rawMcpCandidate = (
+    Array.isArray(inspected?.blockers) && inspected.blockers.includes('mcp-startup')
+  ) || (
+    Array.isArray(inspected?.ignoredBlockers) && inspected.ignoredBlockers.includes('mcp-startup')
+  );
+  let authoritativeCurrentBlockerFound = false;
+  if (codexTuiReadyTabs.has(tabId)
+    && rawMcpCandidate
+    && !codexTuiReadyCurrentFrameProbeTabs.has(tabId)) {
+    codexTuiReadyCurrentFrameProbeTabs.add(tabId);
+    try {
+      const currentScreen = await inspectCurrentCodexMcpStartupScreen(
+        tabId,
+        'stream-authoritative-current-frame',
+      );
+      const currentBlockers = Array.isArray(currentScreen?.inspected?.blockers)
+        ? currentScreen.inspected.blockers
+        : [];
+      if (currentScreen?.success && currentBlockers.length > 0) {
+        authoritativeCurrentBlockerFound = true;
+        invalidateCodexTuiReadyForStartupBlocker(
+          tabId,
+          'stream-authoritative-current-frame',
+          currentScreen.currentFrameText || currentScreen.visibleText || '',
+          currentBlockers,
+          { authoritativeCurrentFrame: true },
+        );
+        logCodexTuiReadyNotReady(
+          tabId,
+          currentScreen.inspected,
+          raw,
+          currentScreen.currentFrameText || currentScreen.visibleText || '',
+          'stream-authoritative-current-frame',
+        );
+        maybeArmCodexMcpStartupWatchdog(
+          tabId,
+          currentScreen.inspected,
+          currentScreen.currentFrameText || currentScreen.visibleText || '',
+          'stream-authoritative-current-frame',
+        );
+      }
+    } finally {
+      codexTuiReadyCurrentFrameProbeTabs.delete(tabId);
+    }
+  }
+  if (authoritativeCurrentBlockerFound) return;
   // A user can relaunch Codex directly from shell history (Up + Enter), which
   // bypasses codex:run-command and therefore has no launch-time startup guard.
   // Adopt only a complete update picker from the latest synchronized TUI frame
@@ -20701,6 +22278,14 @@ function closeCodexWatcher(tabId, reason = 'close') {
     return;
   }
   if (state) {
+    if (state.sourceMode === 'writer-handoff' && state.handoffWaiters?.size) {
+      for (const resolve of state.handoffWaiters) {
+        try {
+          resolve({ status: 'observer-closed', reason });
+        } catch {}
+      }
+      state.handoffWaiters.clear();
+    }
     try { state.watcher?.close?.(); } catch {}
     if (state.interval) clearInterval(state.interval);
     if (state.timeout) clearTimeout(state.timeout);
@@ -21076,6 +22661,48 @@ async function getCodexTuiReadyState(tabId) {
   let manualAction = codexManualActionRequired.get(tabId) || null;
   let mcpStartup = getCodexMcpStartupStatus(tabId);
   let readyMeta = codexTuiReadyMeta.get(tabId) || null;
+  if (textReady) {
+    const currentScreen = await inspectCurrentCodexMcpStartupScreen(
+      tabId,
+      'get-state-authoritative-current-frame',
+    ).catch((error) => ({
+      success: false,
+      error: error?.message || String(error),
+    }));
+    const currentBlockers = Array.isArray(currentScreen?.inspected?.blockers)
+      ? currentScreen.inspected.blockers
+      : [];
+    if (currentScreen?.success && currentBlockers.length > 0) {
+      invalidateCodexTuiReadyForStartupBlocker(
+        tabId,
+        'get-state-authoritative-current-frame',
+        currentScreen.currentFrameText || currentScreen.visibleText || '',
+        currentBlockers,
+        { authoritativeCurrentFrame: true },
+      );
+      logCodexTuiReadyNotReady(
+        tabId,
+        currentScreen.inspected,
+        '',
+        currentScreen.currentFrameText || currentScreen.visibleText || '',
+        'get-state-authoritative-current-frame',
+      );
+      maybeArmCodexMcpStartupWatchdog(
+        tabId,
+        currentScreen.inspected,
+        currentScreen.currentFrameText || currentScreen.visibleText || '',
+        'get-state-authoritative-current-frame',
+      );
+      textReady = !!codexTuiReadyTabs.has(tabId);
+    } else if (currentScreen?.success) {
+      reconcileCodexMcpStartupWatchdogFromCurrentScreen(
+        tabId,
+        currentScreen.inspected,
+        currentScreen.currentFrameText || currentScreen.visibleText || '',
+        'get-state-authoritative-current-frame',
+      );
+    }
+  }
   if (textReady && readyMeta?.preview) {
     const blockers = inspectCodexStartupBlockersText(readyMeta.preview);
     if (blockers.length > 0) {
@@ -21161,6 +22788,12 @@ async function getCodexTuiReadyState(tabId) {
 
 async function markCodexTuiReadyAfterVerifiedComposer(tabId, reason = 'verified-composer', options = {}) {
   if (!tabId) return false;
+  if (codexPendingModelMigrations.has(tabId)) {
+    console.log('[CodexTuiReady] verified composer waits for model migration proof tab='
+      + String(tabId).slice(-12)
+      + ' reason=' + reason);
+    return false;
+  }
   const expectedLaunchId = options?.expectedLaunchId || null;
   const expectedWatchdog = options?.expectedWatchdog || null;
   if (expectedLaunchId && codexLastRunCommandPayload.get(tabId)?.launchId !== expectedLaunchId) {
@@ -21246,7 +22879,15 @@ async function pokeCodexStartupPromptFromVisibleBuffer(tabId, reason = 'external
     cleanSnapshot: visibleText,
     source: snapshotSource + ':' + reason,
   });
-  const inspected = normalizeCodexMcpStartupInspection(tabId, inspectCodexInputReadyVisibleText(visibleText, snapshotSource), 'startup-visible-' + reason);
+  const inspected = normalizeCodexMcpStartupInspection(
+    tabId,
+    inspectCodexInputReadyVisibleText(visibleText, snapshotSource, {
+      lines: snapshot.lines,
+      activePromptRow: snapshot.codexActivePrompt?.row,
+    }),
+    'startup-visible-' + reason,
+    { authoritativeCurrentFrame: true },
+  );
   reconcileCodexMcpStartupWatchdogFromCurrentScreen(tabId, inspected, visibleText, 'startup-visible-' + reason);
   return {
     success: true,
@@ -21275,7 +22916,15 @@ async function probeCodexReadyFromVisibleBuffer(tabId, reason = 'visible-probe')
     cleanSnapshot: visibleText,
     source: snapshotSource + ':' + reason,
   });
-  const inspected = normalizeCodexMcpStartupInspection(tabId, inspectCodexInputReadyVisibleText(visibleText, snapshotSource), 'visible-probe-' + reason);
+  const inspected = normalizeCodexMcpStartupInspection(
+    tabId,
+    inspectCodexInputReadyVisibleText(visibleText, snapshotSource, {
+      lines: snapshot.lines,
+      activePromptRow: snapshot.codexActivePrompt?.row,
+    }),
+    'visible-probe-' + reason,
+    { authoritativeCurrentFrame: true },
+  );
   reconcileCodexMcpStartupWatchdogFromCurrentScreen(tabId, inspected, visibleText, 'visible-probe-' + reason);
   if (!inspected.ready) {
     logCodexTuiReadyNotReady(tabId, inspected, '', visibleText, 'visible-probe-' + reason);
@@ -21303,7 +22952,15 @@ async function markCodexTuiReadyFromVisibleProbe(tabId, reason = 'visible-probe'
   if (!snapshot?.success || !Array.isArray(snapshot.lines)) return false;
   const snapshotSource = snapshot.source || 'visible-buffer';
   const visibleText = snapshot.lines.map((line) => line?.text || '').join('\n');
-  const inspected = normalizeCodexMcpStartupInspection(tabId, inspectCodexInputReadyVisibleText(visibleText, snapshotSource), 'visible-probe-' + reason);
+  const inspected = normalizeCodexMcpStartupInspection(
+    tabId,
+    inspectCodexInputReadyVisibleText(visibleText, snapshotSource, {
+      lines: snapshot.lines,
+      activePromptRow: snapshot.codexActivePrompt?.row,
+    }),
+    'visible-probe-' + reason,
+    { authoritativeCurrentFrame: true },
+  );
   reconcileCodexMcpStartupWatchdogFromCurrentScreen(tabId, inspected, visibleText, 'visible-mark-' + reason);
   if (!inspected.ready) return false;
   const expectedLaunchId = codexLastRunCommandPayload.get(tabId)?.launchId || null;
@@ -21927,6 +23584,13 @@ function processCodexTurnLine(state, line) {
       }
     }
   }
+  if (event === 'thread_rolled_back') {
+    // Native Rewind is a control event. It does not start a task and must not
+    // inherit a generic Enter's prompt-in-flight loader if an older build or a
+    // raced caller classified the confirmation key before the overlay proof.
+    clearCodexPromptInFlight(state.tabId, 'thread_rolled_back');
+    return;
+  }
   if (event === 'token_count') {
     // Codex emits token_count on every assistant step (and a final one at
     // turn end) — this is the live feed for the context-window meter. Not a
@@ -22447,11 +24111,436 @@ function getCodexBoundSessionId(tabId) {
     || null;
 }
 
+function codexNativeRewindHandoffJournalKey(tabId) {
+  return CODEX_NATIVE_REWIND_HANDOFF_KEY_PREFIX + String(tabId || '');
+}
+
+function readPendingCodexNativeRewindHandoff(tabId) {
+  if (!tabId) return null;
+  try {
+    const inspection = projectManager?.db?.inspectPendingCodexWriterHandoff?.(
+      codexNativeRewindHandoffJournalKey(tabId)
+    );
+    if (!inspection || inspection.status === 'absent') return null;
+    if (inspection.status === 'present') return inspection.journal;
+    return {
+      invalid: true,
+      tabId,
+      error: inspection.error || 'codex_handoff_journal_invalid',
+      reason: inspection.reason || 'invalid_journal',
+    };
+  } catch (error) {
+    return {
+      invalid: true,
+      tabId,
+      error: 'codex_handoff_journal_inspection_failed',
+      reason: error?.message || String(error),
+    };
+  }
+}
+
+function persistPendingCodexNativeRewindHandoff(tabId, {
+  sourceSessionId,
+  actionGeneration,
+  actionStartedAtMs,
+  targetUuid = null,
+  targetSourceLine = null,
+  targetTextHash = null,
+  rollbackTurns = null,
+} = {}) {
+  const projectId = resolveAuthoritativeTabProjectId(tabId);
+  const cwd = terminalProjects.get(tabId) || null;
+  const exactTargetSourceLine = typeof targetSourceLine === 'number'
+    && Number.isInteger(targetSourceLine)
+    && targetSourceLine >= 1;
+  const exactRollbackTurns = typeof rollbackTurns === 'number'
+    && Number.isInteger(rollbackTurns)
+    && rollbackTurns >= 1;
+  const exactTargetTextHash = typeof targetTextHash === 'string'
+    && /^[a-f0-9]{64}$/i.test(targetTextHash);
+  if (!tabId
+    || !projectId
+    || !sourceSessionId
+    || !actionGeneration
+    || !path.isAbsolute(String(cwd || ''))
+    || !Number.isFinite(Number(actionStartedAtMs))
+    || typeof targetUuid !== 'string'
+    || !targetUuid.trim()
+    || !exactTargetSourceLine
+    || !exactTargetTextHash
+    || !exactRollbackTurns) {
+    return { success: false, error: 'codex_handoff_journal_context_invalid' };
+  }
+  const journal = {
+    version: 2,
+    projectId,
+    tabId,
+    cwd: path.resolve(cwd),
+    sourceSessionId,
+    actionGeneration,
+    actionStartedAtMs: Number(actionStartedAtMs),
+    targetUuid: targetUuid.trim(),
+    targetSourceLine,
+    targetTextHash,
+    rollbackTurns,
+    phase: 'confirm-enter-boundary',
+  };
+  const key = codexNativeRewindHandoffJournalKey(tabId);
+  try {
+    projectManager.db.setAppState(key, journal);
+    const confirmed = projectManager.db.getAppState(key);
+    if (!confirmed
+      || confirmed.actionGeneration !== actionGeneration
+      || confirmed.sourceSessionId !== sourceSessionId) {
+      return { success: false, error: 'codex_handoff_journal_not_durable' };
+    }
+    return { success: true, journal, key };
+  } catch (error) {
+    return {
+      success: false,
+      error: error?.message || String(error),
+    };
+  }
+}
+
+function commitPendingCodexNativeRewindHandoff(tabId, {
+  sourceSessionId,
+  nextSessionId,
+  actionGeneration,
+} = {}) {
+  const journal = readPendingCodexNativeRewindHandoff(tabId);
+  if (!journal) {
+    return { success: false, error: 'codex_handoff_journal_missing', retryable: true };
+  }
+  if (journal.invalid) {
+    return {
+      success: false,
+      error: journal.error || 'codex_handoff_journal_invalid',
+      reason: journal.reason || null,
+      retryable: true,
+    };
+  }
+  return projectManager.db.commitPendingCodexWriterHandoff({
+    journalKey: codexNativeRewindHandoffJournalKey(tabId),
+    projectId: journal.projectId,
+    tabId,
+    sourceSessionId,
+    nextSessionId,
+    actionGeneration,
+  });
+}
+
+function clearPendingCodexNativeRewindHandoff(tabId, actionGeneration = null, reason = 'clear') {
+  const journal = readPendingCodexNativeRewindHandoff(tabId);
+  if (!journal) return false;
+  if (journal.invalid) {
+    console.warn('[CodexWriterHandoff] refusing to clear invalid journal tab='
+      + String(tabId).slice(-12)
+      + ' reason=' + (journal.reason || journal.error || 'invalid'));
+    return false;
+  }
+  if (actionGeneration && journal.actionGeneration !== actionGeneration) return false;
+  try {
+    projectManager.db.deleteAppState(codexNativeRewindHandoffJournalKey(tabId));
+    console.log('[CodexWriterHandoff] journal cleared tab=' + String(tabId).slice(-12)
+      + ' generation=' + (journal.actionGeneration || '-')
+      + ' reason=' + reason);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function projectCodexVisibleUserMessagesForRewindProof(records, sessionId = null) {
+  const projected = [];
+  for (const record of records || []) {
+    const payload = record?.payload || {};
+    if (record?.type !== 'event_msg') continue;
+    if (payload.type === 'user_message') {
+      const text = String(
+        payload.message
+        || codexDataModule._api.extractTextContent(payload.content)
+        || '',
+      ).trim();
+      const images = collectCodexPayloadImagePaths(payload).map(String);
+      const proof = buildCodexRewindMessageProof({
+        text,
+        images,
+        textElements: Array.isArray(payload.text_elements) ? payload.text_elements : [],
+      });
+      projected.push({
+        uuid: 'codex-user-' + (sessionId || 'unknown') + '-' + Number(record.__line),
+        sourceLine: Number(record.__line),
+        text,
+        textHash: proof.textHash,
+        signature: proof.signature,
+      });
+      continue;
+    }
+    if (payload.type === 'thread_rolled_back') {
+      const count = Math.max(0, Number(payload.num_turns) || 0);
+      if (count > 0) projected.splice(Math.max(0, projected.length - count), count);
+    }
+  }
+  return projected;
+}
+
+async function proveCodexRecoveredRewindDescendantMatchesTarget(journal, descendantSessionId) {
+  if (!Number.isFinite(Number(journal?.targetSourceLine))
+    || !journal?.targetTextHash
+    || !Number.isFinite(Number(journal?.rollbackTurns))) {
+    return { proven: false, reason: 'legacy-journal-missing-target-proof' };
+  }
+  const [sourceLoaded, childLoaded] = await Promise.all([
+    codexDataModule._api.loadSessionRecords(journal.sourceSessionId, journal.cwd),
+    codexDataModule._api.loadSessionRecords(descendantSessionId, journal.cwd),
+  ]);
+  if (!sourceLoaded?.success || !childLoaded?.success) {
+    return {
+      proven: false,
+      reason: 'target-proof-session-read-failed',
+      sourceError: sourceLoaded?.error || null,
+      childError: childLoaded?.error || null,
+    };
+  }
+  const sourceMessages = projectCodexVisibleUserMessagesForRewindProof(
+    sourceLoaded.records,
+    journal.sourceSessionId,
+  );
+  const childMessages = projectCodexVisibleUserMessagesForRewindProof(
+    childLoaded.records,
+    descendantSessionId,
+  );
+  const targetIndex = sourceMessages.findIndex(
+    message => message.sourceLine === Number(journal.targetSourceLine)
+  );
+  if (targetIndex < 0) {
+    return { proven: false, reason: 'target-line-not-in-source-projection' };
+  }
+  const target = sourceMessages[targetIndex];
+  if (target.uuid !== journal.targetUuid) {
+    return { proven: false, reason: 'target-uuid-mismatch' };
+  }
+  if (target.textHash !== journal.targetTextHash) {
+    return { proven: false, reason: 'target-text-hash-mismatch' };
+  }
+  const expectedRollbackTurns = sourceMessages.length - targetIndex;
+  if (expectedRollbackTurns !== Number(journal.rollbackTurns)) {
+    return {
+      proven: false,
+      reason: 'rollback-depth-mismatch',
+      expectedRollbackTurns,
+      journalRollbackTurns: Number(journal.rollbackTurns),
+    };
+  }
+  const expectedPrefix = sourceMessages.slice(0, targetIndex);
+  if (childMessages.length !== expectedPrefix.length) {
+    return {
+      proven: false,
+      reason: 'child-prefix-length-mismatch',
+      expectedLength: expectedPrefix.length,
+      childLength: childMessages.length,
+    };
+  }
+  const mismatchIndex = expectedPrefix.findIndex(
+    (message, index) => message.signature !== childMessages[index]?.signature
+  );
+  if (mismatchIndex >= 0) {
+    return { proven: false, reason: 'child-prefix-content-mismatch', mismatchIndex };
+  }
+  return {
+    proven: true,
+    reason: 'exact-target-prefix',
+    targetIndex,
+    rollbackTurns: expectedRollbackTurns,
+  };
+}
+
+async function recoverPendingCodexNativeRewindHandoffs() {
+  let rawRows;
+  try {
+    rawRows = projectManager.db.getAllAppStateRaw(CODEX_NATIVE_REWIND_HANDOFF_KEY_PREFIX);
+    codexRewindRecoveryScanStatus = 'complete';
+  } catch (error) {
+    codexRewindRecoveryScanStatus = 'unknown';
+    console.warn('[CodexWriterHandoff:Recovery] journal scan failed: ' + (error?.message || String(error)));
+    return { recovered: 0, unresolved: 0, cleared: 0, scanStatus: 'unknown' };
+  }
+  let recovered = 0;
+  let unresolved = 0;
+  let cleared = 0;
+  for (const [key, raw] of Object.entries(rawRows || {})) {
+    let journal;
+    try {
+      journal = JSON.parse(raw);
+    } catch {
+      console.warn('[CodexWriterHandoff:Recovery] corrupt journal key=' + key);
+      unresolved += 1;
+      continue;
+    }
+    const tabId = journal?.tabId;
+    const sourceSessionId = journal?.sourceSessionId;
+    const actionStartedAtMs = Number(journal?.actionStartedAtMs);
+    if (!tabId
+      || key !== codexNativeRewindHandoffJournalKey(tabId)
+      || !journal?.projectId
+      || !sourceSessionId
+      || !journal?.actionGeneration
+      || !path.isAbsolute(String(journal?.cwd || ''))
+      || !Number.isFinite(actionStartedAtMs)) {
+      console.warn('[CodexWriterHandoff:Recovery] invalid journal key=' + key);
+      unresolved += 1;
+      continue;
+    }
+
+    const currentSessionId = projectManager.db.getTabCodexSessionId(
+      journal.projectId,
+      tabId,
+    );
+    if (currentSessionId === undefined) {
+      projectManager.db.deleteAppState(key);
+      cleared += 1;
+      console.log('[CodexWriterHandoff:Recovery] deleted orphan journal tab=' + String(tabId).slice(-12));
+      continue;
+    }
+    const discovery = await codexDataModule._api.inspectCodexDescendantSessions({
+      sourceSessionId,
+      cwd: journal.cwd,
+      sinceMs: actionStartedAtMs,
+      untilMs: actionStartedAtMs + CODEX_NATIVE_REWIND_CHILD_WINDOW_MS,
+    });
+    if (!discovery?.complete) {
+      unresolved += 1;
+      console.warn('[CodexWriterHandoff:Recovery] descendant discovery incomplete; preserving journal tab='
+        + String(tabId).slice(-12)
+        + ' source=' + String(sourceSessionId).slice(0, 8)
+        + ' errors=' + JSON.stringify(discovery?.errors || []));
+      continue;
+    }
+    const descendants = discovery.descendants || [];
+    const evaluatedDescendants = await Promise.all(descendants.map(async (descendant) => ({
+      ...descendant,
+      targetProof: await proveCodexRecoveredRewindDescendantMatchesTarget(
+        journal,
+        descendant.sessionId,
+      ),
+    })));
+    const recoverySelection = codexDataModule._api
+      .selectSingleProvenCodexRewindRecoveryCandidate(evaluatedDescendants);
+    if (recoverySelection.status !== 'selected') {
+      unresolved += 1;
+      console.warn('[CodexWriterHandoff:Recovery] descendant proof unresolved; preserving journal tab='
+        + String(tabId).slice(-12)
+        + ' source=' + String(sourceSessionId).slice(0, 8)
+        + ' reason=' + recoverySelection.reason
+        + ' candidates=' + JSON.stringify(evaluatedDescendants.map(descendant => ({
+          sessionId: descendant.sessionId,
+          depth: descendant.lineageDepth,
+          proof: descendant.targetProof?.reason || 'unknown',
+          proven: descendant.targetProof?.proven === true,
+        }))));
+      continue;
+    }
+    const descendant = recoverySelection.selected;
+    const targetProof = descendant.targetProof;
+    if (currentSessionId !== sourceSessionId && currentSessionId !== descendant.sessionId) {
+      unresolved += 1;
+      console.warn('[CodexWriterHandoff:Recovery] binding changed; refusing stale recovery tab='
+        + String(tabId).slice(-12)
+        + ' current=' + String(currentSessionId || 'none').slice(0, 8)
+        + ' source=' + String(sourceSessionId).slice(0, 8)
+        + ' descendant=' + String(descendant.sessionId).slice(0, 8));
+      continue;
+    }
+    const committed = projectManager.db.commitPendingCodexWriterHandoff({
+      journalKey: key,
+      projectId: journal.projectId,
+      tabId,
+      sourceSessionId,
+      nextSessionId: descendant.sessionId,
+      actionGeneration: journal.actionGeneration,
+    });
+    if (committed?.success !== true) {
+      unresolved += 1;
+      console.warn('[CodexWriterHandoff:Recovery] commit held tab=' + String(tabId).slice(-12)
+        + ' error=' + (committed?.error || 'unknown'));
+      continue;
+    }
+    recovered += 1;
+    console.log('[CodexWriterHandoff:Recovery] recovered tab=' + String(tabId).slice(-12)
+      + ' source=' + String(sourceSessionId).slice(0, 8)
+      + ' descendant=' + String(descendant.sessionId).slice(0, 8)
+      + ' depth=' + descendant.lineageDepth
+      + ' proof=' + targetProof.reason
+      + ' updated=' + committed.updated);
+  }
+  return {
+    recovered,
+    unresolved,
+    cleared,
+    scanStatus: codexRewindRecoveryScanStatus,
+  };
+}
+
 function codexSessionsDir() {
   return path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions');
 }
 
-async function inspectCodexWriterProcessProofInner(tabId) {
+async function buildCodexNativeRewindProofContext(descriptorProof, intent) {
+  if (intent?.sourceMode !== 'writer-handoff'
+    || !intent?.sourceSessionId
+    || !intent?.launchId
+    || !Number.isFinite(Number(intent?.handoffActionStartedAtMs))) {
+    return null;
+  }
+
+  const actionStartedAtMs = Number(intent.handoffActionStartedAtMs);
+  const liveProofs = [];
+  for (const candidate of descriptorProof?.candidates || []) {
+    let metadata;
+    try {
+      metadata = await codexDataModule._api.readCodexSessionMetadata(candidate.filePath);
+    } catch (error) {
+      return {
+        kind: 'native-rewind',
+        sourceSessionId: intent.sourceSessionId,
+        actionGeneration: intent.launchId,
+        observerGeneration: intent.handoffActionGeneration || intent.launchId,
+        actionStartedAtMs,
+        liveProofs: [],
+        proofError: 'handoff_candidate_metadata_read_failed:' + (error?.message || String(error)),
+      };
+    }
+    const meta = metadata?.meta || {};
+    const createdAtMs = Date.parse(String(meta.timestamp || ''));
+    // The primary session_meta record is Codex's thread-creation marker. It is
+    // materially different from filesystem mtime and from the timestamps of
+    // copied history records that follow it in a forked rollout.
+    if (meta.id
+      && meta.id !== intent.sourceSessionId
+      && Number.isFinite(createdAtMs)
+      && createdAtMs >= actionStartedAtMs) {
+      liveProofs.push({
+        sessionId: meta.id,
+        actionGeneration: intent.launchId,
+        kind: 'rollout-created',
+        observedAtMs: Date.now(),
+        boundaryAtMs: createdAtMs,
+      });
+    }
+  }
+
+  return {
+    kind: 'native-rewind',
+    sourceSessionId: intent.sourceSessionId,
+    actionGeneration: intent.launchId,
+    observerGeneration: intent.handoffActionGeneration || intent.launchId,
+    actionStartedAtMs,
+    liveProofs,
+  };
+}
+
+async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null) {
   const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
   if (lookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
     return {
@@ -22507,9 +24596,20 @@ async function inspectCodexWriterProcessProofInner(tabId) {
       failures,
     };
   }
+  const handoff = await buildCodexNativeRewindProofContext(descriptorProof, intentOverride);
+  if (handoff?.proofError) {
+    return {
+      status: 'unknown',
+      error: handoff.proofError,
+      candidates: descriptorProof.candidates || [],
+      processMatches: lookup.matches,
+      failures,
+    };
+  }
   const proof = await resolveCodexUserWriterProof(descriptorProof, {
     readMetadata: (filePath) => codexDataModule._api.readCodexSessionMetadata(filePath),
     isUserSession: (meta) => codexDataModule._api.isCodexUserTuiSession(meta),
+    handoff,
   });
   if (proof.status === 'unknown') {
     return {
@@ -22529,19 +24629,27 @@ async function inspectCodexWriterProcessProofInner(tabId) {
   };
 }
 
-async function inspectCodexWriterProcessProof(tabId) {
+async function inspectCodexWriterProcessProof(tabId, intentOverride = null) {
   // Runtime UI, API listings and launch watchers often ask for the same proof
   // in one render tick. Share that ps/lsof pass; queueing N complete passes made
   // the Nth read wait seconds and, before the manual-input repair, delayed Enter.
+  const handoffKey = intentOverride?.sourceMode === 'writer-handoff'
+    && intentOverride?.launchId
+    && Number.isFinite(Number(intentOverride?.handoffActionStartedAtMs))
+    ? ':handoff:' + intentOverride.launchId + ':' + Number(intentOverride.handoffActionStartedAtMs)
+    : ':public';
   return runKeyedSingleFlight(
     codexWriterProcessProofInflight,
-    tabId,
-    () => inspectCodexWriterProcessProofInner(tabId),
+    tabId + handoffKey,
+    () => inspectCodexWriterProcessProofInner(tabId, intentOverride),
   );
 }
 
 async function inspectCodexOwnedWriter(tabId, intentOverride = undefined) {
-  const processProof = await inspectCodexWriterProcessProof(tabId);
+  const intent = intentOverride === undefined
+    ? (codexSessionDiscoveryIntents.get(tabId) || null)
+    : intentOverride;
+  const processProof = await inspectCodexWriterProcessProof(tabId, intent);
   if (processProof.status !== 'owned') return processProof;
 
   let metadata = processProof.metadata || null;
@@ -22577,9 +24685,6 @@ async function inspectCodexOwnedWriter(tabId, intentOverride = undefined) {
     };
   }
 
-  const intent = intentOverride === undefined
-    ? (codexSessionDiscoveryIntents.get(tabId) || null)
-    : intentOverride;
   const sourceSessionId = intent?.sourceSessionId || null;
   const sourceMatch = sourceSessionId
     ? (meta.id === sourceSessionId
@@ -22598,6 +24703,7 @@ async function inspectCodexOwnedWriter(tabId, intentOverride = undefined) {
     sourceMatch,
     pids: processProof.pids || [],
     processProof,
+    handoffProof: processProof.handoffProof || null,
     metadata,
   };
 }
@@ -22606,10 +24712,30 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
   reason = 'process-open-rollout',
   sender = null,
   expectedObserver = null,
+  expectedExitObserverGeneration = null,
+  expectedExitObserverRunSeq = null,
 } = {}) {
+  const lifecycleGeneration = expectedExitObserverGeneration === null
+    ? getCodexExitObserverGeneration(tabId)
+    : expectedExitObserverGeneration;
+  const exitObserverCurrent = () => (
+    isCodexExitObserverCurrent(
+      tabId,
+      lifecycleGeneration,
+      expectedExitObserverRunSeq,
+    )
+  );
+  const staleExitObserverResult = (candidate = null) => ({
+    status: 'stale-exit-observer',
+    sessionId: candidate?.sessionId || null,
+    expectedExitObserverGeneration: lifecycleGeneration,
+    currentExitObserverGeneration: getCodexExitObserverGeneration(tabId),
+  });
+  if (!exitObserverCurrent()) return staleExitObserverResult();
   const intentAtStart = codexSessionDiscoveryIntents.get(tabId) || null;
   const intentGeneration = intentAtStart?.launchId || null;
   let owned = await inspectCodexOwnedWriter(tabId, intentAtStart);
+  if (!exitObserverCurrent()) return staleExitObserverResult(owned);
   if (expectedObserver && codexWatchers.get(tabId) !== expectedObserver) {
     return { status: 'stale-observer', sessionId: owned?.sessionId || null };
   }
@@ -22623,6 +24749,7 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
   // second tab cannot also observe owner=null and commit the same writer while
   // the first tab is awaiting disk I/O.
   return runKeyedExclusive(codexWriterSessionInflight, owned.sessionId, async () => {
+  if (!exitObserverCurrent()) return staleExitObserverResult(owned);
   const owner = getCodexSessionOwner(owned.sessionId, tabId);
   if (owner) {
     invalidateCodexWriterProof(tabId, 'process-proof-owned-by-other-tab');
@@ -22641,6 +24768,7 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
       startedAtMs: intent.startedAt,
     });
   }
+  if (!exitObserverCurrent()) return staleExitObserverResult(owned);
   if (expectedObserver && codexWatchers.get(tabId) !== expectedObserver) {
     return { status: 'stale-observer', sessionId: owned.sessionId };
   }
@@ -22656,6 +24784,7 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
   }
 
   const revalidated = await inspectCodexOwnedWriter(tabId, intentAtStart);
+  if (!exitObserverCurrent()) return staleExitObserverResult(revalidated);
   if (expectedObserver && codexWatchers.get(tabId) !== expectedObserver) {
     return { status: 'stale-observer', sessionId: revalidated?.sessionId || null };
   }
@@ -22689,6 +24818,12 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
     return { ...owned, status: 'owned-by-other-tab', owner: finalOwner };
   }
 
+  // This is the final admission boundary before any durable/public mutation.
+  // An OSC-D observer may spend time in process/lsof/metadata reads while an
+  // explicit Stop completes. Once Stop invalidates its generation, the stale
+  // observer must not persist a binding, attach a watcher, or publish a writer.
+  if (!exitObserverCurrent()) return staleExitObserverResult(owned);
+
   const adoptionDecision = classifyCodexWriterAdoption({
     sourceMode: intent?.sourceMode || null,
     sourceMatch: owned.sourceMatch,
@@ -22719,7 +24854,33 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
   // binding is durable. In particular, a cross-project move used to leave a
   // window where the live PTY had changed owner but the target row did not yet
   // exist; publishing here made the UI correct only until the next restart.
-  const durableBinding = persistCodexKnownSessionBinding(tabId, owned.sessionId);
+  const nativeRewindHandoffProven = intent?.sourceMode === 'writer-handoff'
+    && owned?.handoffProof?.status === 'selected'
+    && owned.handoffProof.actionGeneration === intent.launchId
+    && owned.handoffProof.sessionId === owned.sessionId;
+  const pendingSettingsProofAtAdoption = codexPendingSettingsProofHandoffs.get(tabId) || null;
+  const pendingSettingsCarryAtAdoption = consumePendingCodexSettingsProofHandoff(
+    pendingSettingsProofAtAdoption,
+    {
+      terminalToken: terminals.get(tabId) || null,
+      runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+      launchId: intent?.launchId || null,
+      writerSessionId: owned.sessionId,
+    },
+  );
+  const durableBinding = nativeRewindHandoffProven
+    ? commitPendingCodexNativeRewindHandoff(tabId, {
+      sourceSessionId: intent.sourceSessionId,
+      nextSessionId: owned.sessionId,
+      actionGeneration: intent.launchId,
+    })
+    : persistCodexKnownSessionBinding(
+      tabId,
+      owned.sessionId,
+      pendingSettingsCarryAtAdoption.carry
+        ? pendingSettingsCarryAtAdoption.proof
+        : null,
+    );
   if (durableBinding?.success !== true) {
     invalidateCodexWriterProof(tabId, 'writer-persistence-pending');
     console.warn('[CodexWriterProof] adoption held for persistence tab=' + String(tabId).slice(-12)
@@ -22734,6 +24895,37 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
     };
   }
 
+  // The scoped SQLite row is now the definitive writer identity. Publish that
+  // identity before attaching the incremental reader: a watcher failure may
+  // temporarily hide live events, but it must not undo an already committed
+  // A→B ownership transition or resurrect source A after restart.
+  const previous = codexKnownSessions.get(tabId) || null;
+  const adoption = setCodexKnownSession(tabId, owned.sessionId, reason, {
+    kind: 'process-open-rollout',
+    filePath: owned.filePath,
+    pids: owned.pids,
+    launchId: intent?.launchId || null,
+    sourceMatch: owned.sourceMatch,
+    forkedFromId: owned.forkedFromId,
+    sourceSessionId: owned.sourceSessionId,
+    // Native Rewind is the only existing-writer A→B transition allowed to
+    // carry settings proof. A fresh pre-rollout picker selection uses the
+    // separate exact-PTY/launch one-shot path consumed during adoption above.
+    carryCodexSettingsProof: nativeRewindHandoffProven,
+  }, durableBinding);
+  if (adoption?.success !== true) {
+    invalidateCodexWriterProof(tabId, 'writer-persistence-pending-after-commit');
+    return {
+      ...owned,
+      status: 'persistence-pending',
+      error: adoption?.error || 'codex_writer_binding_not_committed',
+      retryable: adoption?.retryable !== false,
+      linkedBoundary,
+    };
+  }
+
+  let watcherAttached = true;
+  let watcherWarning = null;
   const currentTurn = codexTurnWatchers.get(tabId) || null;
   if (currentTurn?.sessionId !== owned.sessionId || currentTurn?.filePath !== owned.filePath) {
     const watcherStarted = startCodexTurnWatcher({
@@ -22746,31 +24938,28 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
       linkedHandoff: !!currentTurn,
     });
     if (!watcherStarted) {
-      invalidateCodexWriterProof(tabId, 'writer-turn-watcher-start-failed');
-      return { ...owned, status: 'watcher-start-failed' };
+      watcherAttached = false;
+      watcherWarning = 'codex_turn_watcher_start_failed';
+      console.warn('[CodexWriterProof] writer committed but turn watcher attach failed tab='
+        + String(tabId).slice(-12)
+        + ' session=' + String(owned.sessionId).slice(0, 8)
+        + ' action=keep-binding-and-retry-watcher');
+      setImmediate(() => {
+        void ensureCodexTurnWatcher(
+          tabId,
+          owned.sessionId,
+          terminalProjects.get(tabId),
+          { catchUpReason: 'writer-commit-watcher-retry' },
+        ).then((started) => {
+          console.log('[CodexTurn] post-commit watcher retry tab='
+            + String(tabId).slice(-12)
+            + ' session=' + String(owned.sessionId).slice(0, 8)
+            + ' started=' + started);
+        });
+      });
     }
   }
 
-  const previous = codexKnownSessions.get(tabId) || null;
-  const adoption = setCodexKnownSession(tabId, owned.sessionId, reason, {
-    kind: 'process-open-rollout',
-    filePath: owned.filePath,
-    pids: owned.pids,
-    launchId: intent?.launchId || null,
-    sourceMatch: owned.sourceMatch,
-    forkedFromId: owned.forkedFromId,
-    sourceSessionId: owned.sourceSessionId,
-  }, durableBinding);
-  if (adoption?.success !== true) {
-    invalidateCodexWriterProof(tabId, 'writer-persistence-pending-after-watcher');
-    return {
-      ...owned,
-      status: 'persistence-pending',
-      error: adoption?.error || 'codex_writer_binding_not_committed',
-      retryable: adoption?.retryable !== false,
-      linkedBoundary,
-    };
-  }
   if (sourceAppendLiveProven) {
     releaseCodexSourceObservationAfterWriterProof(tabId, owned.sessionId, reason);
   }
@@ -22790,6 +24979,11 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
       cwd: owned.cwd,
       writerProven: true,
       writerProof: 'process-open-rollout',
+      previousSessionId: previous,
+      writerGeneration: intent?.launchId || null,
+      carryCodexSettingsProof: adoption.carryCodexSettingsProof,
+      codexSettingsProof: adoption.codexSettingsProof,
+      requiresExactCodexSettingsProof: adoption.requiresExactCodexSettingsProof,
     });
   }
   return {
@@ -22797,6 +24991,8 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
     status: 'adopted',
     previousSessionId: previous,
     linkedBoundary,
+    watcherAttached,
+    watcherWarning,
   };
   });
 }
@@ -22805,7 +25001,11 @@ async function reconcileCodexWriterFromProcess(tabId, options = {}) {
   // Coalesce equivalent observations instead of serializing them. Public
   // status readers share one key per tab; a watcher keeps its own object key so
   // stale-observer validation is never borrowed from another generation.
-  const key = options.expectedObserver || ('public:' + tabId);
+  const key = options.expectedObserver
+    || (options.expectedExitObserverGeneration !== null
+      && options.expectedExitObserverGeneration !== undefined
+      ? ('exit:' + tabId + ':' + options.expectedExitObserverGeneration + ':' + (options.expectedExitObserverRunSeq ?? '-'))
+      : ('public:' + tabId + ':' + getCodexExitObserverGeneration(tabId)));
   return runKeyedSingleFlight(
     codexWriterReconcileInflight,
     key,
@@ -23387,17 +25587,61 @@ function releaseCodexProvisionalSubmitReservation(tabId, reservation, reason = '
   return true;
 }
 
+function prepareManualCodexRewindObserver(tabId, observer) {
+  if (!tabId || observer?.sourceMode !== 'writer-handoff' || !observer.sourceSessionId) return null;
+  const state = {
+    actionGeneration: observer.launchId,
+    sourceSessionId: observer.sourceSessionId,
+    navigationOlderSteps: 0,
+    overlaySeen: false,
+    mutationStarted: false,
+    sourceMessages: null,
+    sourceProjectionError: null,
+    sourceProjectionPromise: null,
+  };
+  state.sourceProjectionPromise = (async () => {
+    const loaded = await codexDataModule._api.loadSessionRecords(
+      state.sourceSessionId,
+      terminalProjects.get(tabId),
+    );
+    if (!loaded?.success) {
+      throw new Error(loaded?.error || 'codex_manual_rewind_source_load_failed');
+    }
+    const messages = projectCodexVisibleUserMessagesForRewindProof(
+      loaded.records,
+      state.sourceSessionId,
+    );
+    state.sourceMessages = messages;
+    return messages;
+  })().catch((error) => {
+    state.sourceProjectionError = error?.message || String(error);
+    console.warn('[CodexWriterHandoff] manual Rewind source projection failed tab='
+      + String(tabId).slice(-12)
+      + ' source=' + String(state.sourceSessionId).slice(0, 8)
+      + ' generation=' + (state.actionGeneration || '-')
+      + ' error=' + state.sourceProjectionError);
+    return null;
+  });
+  observer.manualRewind = state;
+  return state;
+}
+
 function armCodexWriterHandoffObservation(tabId, reason = 'native-rewind', {
   blockMutations = false,
+  manualPhysicalRewind = false,
 } = {}) {
   if (!tabId) return false;
   const existing = codexWatchers.get(tabId) || null;
   if (existing?.sourceMode === 'writer-handoff') {
-    if (blockMutations) existing.handoffPending = true;
-    console.log('[CodexWriterHandoff] keep tab=' + String(tabId).slice(-12)
-      + ' reason=' + reason
-      + ' baseline=' + String(existing.handoffBaselineSessionId || existing.sourceSessionId || 'none').slice(0, 8));
-    return true;
+    if (!blockMutations) {
+      console.log('[CodexWriterHandoff] keep tab=' + String(tabId).slice(-12)
+        + ' reason=' + reason
+        + ' baseline=' + String(existing.handoffBaselineSessionId || existing.sourceSessionId || 'none').slice(0, 8));
+      return true;
+    }
+    // A manual idle Escape observer has no exact action boundary. Never reuse
+    // its generation for a programmatic destructive action.
+    closeCodexWatcher(tabId, 'replace-with-programmatic-handoff');
   }
   const sourceSessionId = codexKnownSessions.get(tabId)
     || codexSessionIdFromDb(tabId)
@@ -23417,21 +25661,409 @@ function armCodexWriterHandoffObservation(tabId, reason = 'native-rewind', {
     },
   );
   const armed = codexWatchers.has(tabId);
+  const observer = codexWatchers.get(tabId) || null;
+  if (armed && manualPhysicalRewind && observer?.sourceMode === 'writer-handoff') {
+    prepareManualCodexRewindObserver(tabId, observer);
+  }
   console.log('[CodexWriterHandoff] arm tab=' + String(tabId).slice(-12)
     + ' reason=' + reason
     + ' source=' + (sourceSessionId ? String(sourceSessionId).slice(0, 8) : 'unknown')
-    + ' armed=' + armed);
+    + ' armed=' + armed
+    + ' manual=' + manualPhysicalRewind);
   return armed;
 }
 
+function trackManualCodexRewindNavigationInput(tabId, data) {
+  const observer = codexWatchers.get(tabId) || null;
+  const state = observer?.sourceMode === 'writer-handoff'
+    ? observer.manualRewind || null
+    : null;
+  if (!state || state.mutationStarted) return;
+  const snapshot = getHeadlessVisibleBufferSnapshot(tabId, 'manual-codex-rewind-navigation');
+  const frame = classifyManualCodexEnterFrame(snapshot);
+  if (frame.kind === 'native-rewind-confirm') {
+    state.overlaySeen = true;
+    const value = String(data || '');
+    const leftCount = isPureCodexEscapeBurst(value)
+      ? value.length
+      : (value.match(/\x1b\[D/g) || []).length;
+    const rightCount = (value.match(/\x1b\[C/g) || []).length;
+    state.navigationOlderSteps = advanceManualCodexRewindNavigation(
+      state.navigationOlderSteps,
+      data,
+      true,
+    );
+    if (leftCount > 0 || rightCount > 0) {
+      console.log('[CodexWriterHandoff] manual Rewind navigation tab='
+        + String(tabId).slice(-12)
+        + ' olderSteps=' + state.navigationOlderSteps
+        + ' key=' + (isPureCodexEscapeBurst(value) ? 'Escape×' + value.length : (leftCount > 0 ? 'Left' : 'Right')));
+    }
+    if (data === 'q' || data === '\x03') {
+      cancelCodexWriterHandoffBeforeAction(tabId, 'manual-rewind-ui-cancelled');
+    }
+    return;
+  }
+  if (data === '\x03'
+    || (!isPureCodexEscapeBurst(data) && data !== '\r' && data !== '\n')) {
+    cancelCodexWriterHandoffBeforeAction(tabId, 'manual-rewind-protocol-left');
+  }
+}
+
+async function handleManualCodexRewindConfirmationEnter(tabId, term, data) {
+  const initialObserver = codexWatchers.get(tabId) || null;
+  const initialState = initialObserver?.sourceMode === 'writer-handoff'
+    ? initialObserver.manualRewind || null
+    : null;
+  // Ordinary Enter must remain a zero-wait passthrough. First inspect the
+  // already-current main-owned screen synchronously; only an exact native
+  // transcript frame is allowed to enter the async proof/journal path.
+  let initialSnapshot = getHeadlessVisibleBufferSnapshot(
+    tabId,
+    'manual-codex-rewind-enter-preflight',
+  );
+  const hasManualRewindCandidate = !!initialState && initialState.mutationStarted !== true;
+  const initialFlushRequired = shouldAwaitManualCodexEnterPreflight(
+    initialSnapshot,
+    hasManualRewindCandidate,
+  );
+  let initialFlushResult = null;
+  // A pending mirror is relevant only after Escape/Left has armed a concrete
+  // native-Rewind candidate. With no candidate, waiting for the mirror would
+  // put an observation barrier back in front of every ordinary user Enter.
+  // We still classify the already-current snapshot below so an exact overlay
+  // that somehow exists without an observer is blocked rather than submitted.
+  if (initialFlushRequired && hasManualRewindCandidate) {
+    initialFlushResult = await flushHeadlessTerminalMirror(tabId);
+    const refreshedSnapshot = getHeadlessVisibleBufferSnapshot(
+      tabId,
+      'manual-codex-rewind-enter-preflight-flushed',
+    );
+    const screenAssessment = assessManualCodexEnterPreflightScreen({
+      candidateObserver: hasManualRewindCandidate,
+      flushRequired: true,
+      flushResult: initialFlushResult,
+      snapshot: refreshedSnapshot,
+    });
+    if (!screenAssessment.ready) {
+      console.warn('[CodexWriterHandoff] BLOCKED manual Rewind candidate before Enter tab='
+        + String(tabId).slice(-12)
+        + ' reason=' + screenAssessment.reason);
+      return {
+        handled: true,
+        submitted: false,
+        error: screenAssessment.reason,
+      };
+    }
+    initialSnapshot = refreshedSnapshot;
+  }
+  const initialFrame = classifyManualCodexEnterFrame(initialSnapshot);
+  const initialDecision = decideManualCodexRewindEnterWrite({
+    frame: initialFrame,
+    observerAvailable: hasManualRewindCandidate,
+    candidateObserver: hasManualRewindCandidate,
+  });
+  if (!initialDecision.handled) {
+    if (initialState && !initialState.mutationStarted) {
+      cancelCodexWriterHandoffBeforeAction(tabId, 'manual-enter-not-rewind-overlay');
+    }
+    return { handled: false };
+  }
+  if (initialFrame.kind !== 'native-rewind-confirm') {
+    console.warn('[CodexWriterHandoff] BLOCKED manual Rewind candidate because screen proof is unavailable tab='
+      + String(tabId).slice(-12)
+      + ' reason=' + initialDecision.reason);
+    return {
+      handled: true,
+      submitted: false,
+      error: initialDecision.reason,
+    };
+  }
+  if (!initialState || initialState.mutationStarted) {
+    console.warn('[CodexWriterHandoff] BLOCKED exact native Rewind overlay without observer tab='
+      + String(tabId).slice(-12)
+      + ' reason=' + initialDecision.reason);
+    return {
+      handled: true,
+      submitted: false,
+      error: initialDecision.reason,
+    };
+  }
+  const operation = {
+    kind: 'manual-codex-rewind-enter',
+    source: 'manual-terminal-native-rewind',
+    submitted: false,
+    identityPending: true,
+    queuedAt: Date.now(),
+  };
+  const result = await withPtyWriteLock(term, async () => {
+    const observer = codexWatchers.get(tabId) || null;
+    const state = observer === initialObserver ? observer.manualRewind || null : null;
+    if (!state
+      || state.actionGeneration !== initialState.actionGeneration
+      || state.mutationStarted) {
+      return { handled: true, submitted: false, error: 'manual_rewind_observer_changed' };
+    }
+
+    const flushed = await flushHeadlessTerminalMirror(tabId);
+    const snapshot = flushed.success
+      ? getHeadlessVisibleBufferSnapshot(tabId, 'manual-codex-rewind-enter-boundary')
+      : { success: false, error: flushed.error || 'headless-flush-failed' };
+    const sourceMessages = state.sourceMessages
+      || await state.sourceProjectionPromise
+      || [];
+    const boundary = resolveManualCodexRewindBoundary({
+      snapshot,
+      sourceMessages,
+      navigationOlderSteps: state.navigationOlderSteps,
+    });
+    const targetDecision = decideManualCodexRewindEnterWrite({
+      frame: boundary.frame,
+      observerAvailable: true,
+      boundaryReady: boundary.boundaryReady === true,
+      journalDurable: false,
+      rewindOwnershipEstablished: true,
+    });
+    if (!targetDecision.handled) {
+      return {
+        handled: true,
+        submitted: false,
+        error: 'manual_rewind_frame_changed',
+      };
+    }
+    if (!boundary.boundaryReady) {
+      console.warn('[CodexWriterHandoff] BLOCKED manual Rewind Enter without exact target proof tab='
+        + String(tabId).slice(-12)
+        + ' generation=' + (state.actionGeneration || '-')
+        + ' reason=' + (boundary.reason || state.sourceProjectionError || 'unknown')
+        + ' olderSteps=' + state.navigationOlderSteps);
+      return {
+        handled: true,
+        submitted: false,
+        error: boundary.reason || state.sourceProjectionError || 'manual_rewind_target_unproven',
+      };
+    }
+
+    const actionStartedAtMs = Date.now();
+    const boundaryPersisted = markCodexWriterHandoffActionBoundary(
+      tabId,
+      actionStartedAtMs,
+      {
+        targetUuid: boundary.targetUuid,
+        targetSourceLine: boundary.targetSourceLine,
+        targetTextHash: boundary.targetTextHash,
+        rollbackTurns: boundary.rollbackTurns,
+      },
+    );
+    if (!boundaryPersisted) {
+      console.warn('[CodexWriterHandoff] BLOCKED manual Rewind Enter because journal is not durable tab='
+        + String(tabId).slice(-12)
+        + ' generation=' + (state.actionGeneration || '-'));
+      return {
+        handled: true,
+        submitted: false,
+        error: 'codex_rewind_writer_handoff_boundary_failed',
+      };
+    }
+    const writeDecision = decideManualCodexRewindEnterWrite({
+      frame: boundary.frame,
+      observerAvailable: true,
+      boundaryReady: true,
+      journalDurable: true,
+    });
+    if (!writeDecision.writeEnter) {
+      return {
+        handled: true,
+        submitted: false,
+        error: writeDecision.reason,
+      };
+    }
+
+    // This Enter confirms a rollback control, not a user prompt. A stale
+    // prompt window from an earlier generic path must not make the loader busy
+    // while Codex is merely restoring the selected text into its composer.
+    clearCodexPromptInFlight(tabId, 'manual-native-rewind-confirm');
+    state.mutationStarted = true;
+    state.confirmedAt = actionStartedAtMs;
+    state.targetUuid = boundary.targetUuid;
+    state.rollbackTurns = boundary.rollbackTurns;
+    try {
+      term.write(data);
+    } catch (error) {
+      state.mutationStarted = false;
+      cancelCodexWriterHandoffAfterRejectedAction(tabId, 'manual-rewind-enter-write-failed');
+      throw error;
+    }
+    markActivePtySubmit(term, { identityPending: true });
+    console.warn('[CodexSubmitTiming] source=manual-terminal-native-rewind'
+      + ' tab=' + String(tabId).slice(-12)
+      + ' writeQueueMs=' + Math.max(0, Date.now() - operation.queuedAt)
+      + ' generation=' + state.actionGeneration
+      + ' targetLine=' + boundary.targetSourceLine
+      + ' rollbackTurns=' + boundary.rollbackTurns
+      + ' journal=durable');
+
+    void settleCodexWriterHandoffObservation(
+      tabId,
+      'manual-native-rewind-enter',
+      { waitForBranchMs: 8000 },
+    ).then((settlement) => {
+      console.log('[CodexWriterHandoff] manual Rewind settlement tab='
+        + String(tabId).slice(-12)
+        + ' status=' + (settlement?.handoffStatus || settlement?.status || 'unknown')
+        + ' active=' + String(settlement?.activeSessionId || 'none').slice(0, 8));
+    }).catch((error) => {
+      console.warn('[CodexWriterHandoff] manual Rewind settlement failed tab='
+        + String(tabId).slice(-12)
+        + ' error=' + (error?.message || String(error)));
+    });
+    return {
+      handled: true,
+      submitted: true,
+      boundary,
+    };
+  }, operation);
+  return result || { handled: true, submitted: false, error: 'manual_rewind_unknown' };
+}
+
+function markCodexWriterHandoffActionBoundary(tabId, actionStartedAtMs = Date.now(), {
+  targetUuid = null,
+  targetSourceLine = null,
+  targetTextHash = null,
+  rollbackTurns = null,
+} = {}) {
+  const observer = codexWatchers.get(tabId) || null;
+  if (observer?.sourceMode !== 'writer-handoff' || !observer.launchId) return false;
+  const boundaryAt = Number(actionStartedAtMs);
+  if (!Number.isFinite(boundaryAt) || boundaryAt <= 0) return false;
+  const intent = codexSessionDiscoveryIntents.get(tabId) || null;
+  if (!intent || intent.launchId !== observer.launchId) return false;
+  const journal = persistPendingCodexNativeRewindHandoff(tabId, {
+    sourceSessionId: observer.sourceSessionId,
+    actionGeneration: observer.launchId,
+    actionStartedAtMs: boundaryAt,
+    targetUuid,
+    targetSourceLine,
+    targetTextHash,
+    rollbackTurns,
+  });
+  if (journal?.success !== true) {
+    console.warn('[CodexWriterHandoff] action boundary journal failed tab='
+      + String(tabId).slice(-12)
+      + ' generation=' + observer.launchId
+      + ' error=' + (journal?.error || 'unknown'));
+    return false;
+  }
+  observer.handoffActionStartedAtMs = boundaryAt;
+  observer.handoffActionGeneration = observer.launchId;
+  observer.handoffPending = true;
+  codexSessionDiscoveryIntents.set(tabId, {
+    ...intent,
+    handoffActionStartedAtMs: boundaryAt,
+    handoffActionGeneration: observer.launchId,
+  });
+  console.log('[CodexWriterHandoff] action boundary tab=' + String(tabId).slice(-12)
+    + ' source=' + String(observer.sourceSessionId || 'none').slice(0, 8)
+    + ' generation=' + observer.launchId
+    + ' at=' + boundaryAt
+    + ' journal=durable');
+  return true;
+}
+
+function notifyCodexWriterHandoffWaiters(observer, result) {
+  if (!observer || observer.sourceMode !== 'writer-handoff') return;
+  observer.handoffLastResult = result || null;
+  if (!observer.handoffWaiters?.size) return;
+  for (const resolve of observer.handoffWaiters) {
+    try {
+      resolve(result || null);
+    } catch {}
+  }
+  observer.handoffWaiters.clear();
+}
+
+function waitForCodexWriterHandoffEvent(observer, timeoutMs = 8000) {
+  if (!observer || observer.sourceMode !== 'writer-handoff') {
+    return Promise.resolve({ status: 'observer-missing' });
+  }
+  if (observer.handoffLastResult) return Promise.resolve(observer.handoffLastResult);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      observer.handoffWaiters?.delete(finish);
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      finish({ status: 'handoff-timeout', error: 'codex_rewind_writer_handoff_timeout' });
+    }, Math.max(250, Number(timeoutMs) || 8000));
+    if (!(observer.handoffWaiters instanceof Set)) observer.handoffWaiters = new Set();
+    observer.handoffWaiters.add(finish);
+    if (observer.handoffLastResult) finish(observer.handoffLastResult);
+  });
+}
+
+function cancelCodexWriterHandoffBeforeAction(tabId, reason = 'cancelled-before-action') {
+  const observer = codexWatchers.get(tabId) || null;
+  if (observer?.sourceMode !== 'writer-handoff') return false;
+  if (Number.isFinite(Number(observer.handoffActionStartedAtMs))) return false;
+  observer.handoffPending = false;
+  clearPendingCodexNativeRewindHandoff(tabId, observer.launchId, reason);
+  closeCodexWatcher(tabId, reason);
+  const runtimeProjection = getCodexPublicRuntimeProjection(tabId);
+  _webBroadcast(tabId, {
+    type: 'snapshot',
+    sessionId: getCodexRuntimeSessionId(tabId),
+    busy: runtimeProjection.busy,
+    sessionStatus: runtimeProjection.sessionStatus,
+    starting: runtimeProjection.sessionStatus === 'starting',
+    inputReady: runtimeProjection.inputReady,
+    toolType: 'codex',
+    commandType: 'codex',
+    reason: 'writer-handoff-cancelled:' + reason,
+    ...getCodexPublicWriterFields(tabId),
+  });
+  return true;
+}
+
+function cancelCodexWriterHandoffAfterRejectedAction(tabId, reason = 'action-rejected') {
+  const observer = codexWatchers.get(tabId) || null;
+  if (observer?.sourceMode !== 'writer-handoff') return false;
+  if (!Number.isFinite(Number(observer.handoffActionStartedAtMs))) return false;
+  clearPendingCodexNativeRewindHandoff(tabId, observer.launchId, reason);
+  observer.handoffPending = false;
+  closeCodexWatcher(tabId, reason);
+  return true;
+}
+
 async function settleCodexWriterHandoffObservation(tabId, reason = 'rewind-finished', {
-  allowStableWriter = false,
+  waitForBranchMs = 8000,
 } = {}) {
   const observer = codexWatchers.get(tabId) || null;
   if (observer?.sourceMode !== 'writer-handoff') return null;
   const baselineSessionId = observer.handoffBaselineSessionId
     || observer.sourceSessionId
     || null;
+  const actionGeneration = observer.launchId || null;
+  const observerGeneration = observer.handoffActionGeneration || null;
+  const actionStartedAtMs = Number(observer.handoffActionStartedAtMs);
+  const classify = (candidate) => {
+    const selection = candidate?.handoffProof
+      || candidate?.processProof?.handoffProof
+      || null;
+    return classifyCodexBranchWriterHandoffSettlement({
+      selection,
+      actionGeneration,
+      observerGeneration,
+      adoptedSessionId: candidate?.sessionId || null,
+      adoptionStatus: candidate?.status || 'unknown',
+      processRunning: terminalCommandState.get(tabId)?.isRunning === true,
+      turnBusy: codexTurnWatchers.get(tabId)?.busy === true,
+      tuiReady: codexTuiReadyTabs.has(tabId),
+    });
+  };
   let adoption;
   try {
     adoption = await reconcileCodexWriterFromProcess(tabId, {
@@ -23450,25 +26082,36 @@ async function settleCodexWriterHandoffObservation(tabId, reason = 'rewind-finis
     return { ...adoption, status: adoption?.status || 'stale-observer' };
   }
 
-  const processRunning = terminalCommandState.get(tabId)?.isRunning === true;
-  const writerChanged = adoption?.status === 'adopted'
-    && !!adoption.sessionId
-    && adoption.sessionId !== baselineSessionId;
-  const stableWriterProven = adoption?.status === 'adopted'
-    && !!adoption.sessionId
-    && adoption.sessionId === baselineSessionId
-    && allowStableWriter === true;
-  const settlement = classifyCodexWriterHandoffSettlement({
-    adoptionStatus: adoption?.status || 'unknown',
-    processRunning,
-    turnBusy: codexTurnWatchers.get(tabId)?.busy === true,
-    tuiReady: codexTuiReadyTabs.has(tabId),
-    writerChanged,
-    stableWriterProven,
-  });
-  if (adoption?.status === 'adopted' && settlement.settled) {
-    observer.handoffBaselineSessionId = adoption.sessionId;
+  let settlement = classify(adoption);
+  if (!settlement.settled
+    && Number.isFinite(actionStartedAtMs)
+    && terminalCommandState.get(tabId)?.isRunning === true
+    && waitForBranchMs > 0) {
+    const observed = await waitForCodexWriterHandoffEvent(observer, waitForBranchMs);
+    if (observed?.status === 'adopted') {
+      adoption = observed;
+      settlement = classify(adoption);
+    } else if (observed?.status === 'handoff-timeout') {
+      // One final event-driven state read closes the race where fs.watch
+      // delivered immediately before the waiter was registered.
+      try {
+        adoption = await reconcileCodexWriterFromProcess(tabId, {
+          reason: 'writer-handoff-final:' + reason,
+          sender: mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+          expectedObserver: observer,
+        });
+        settlement = classify(adoption);
+      } catch (error) {
+        adoption = { status: 'unknown', error: error?.message || String(error) };
+        settlement = classify(adoption);
+      }
+    }
+  }
+
+  if (adoption?.status === 'adopted' && settlement.branchWriterProven) {
+    observer.handoffAdoptedSessionId = adoption.sessionId;
     observer.handoffPending = false;
+    observer.handoffLastResult = adoption;
   } else {
     // Unknown/ambiguous inspection is not evidence that the handoff settled.
     // Keep the loader and mutation guard armed. Only a successful empty process
@@ -23495,7 +26138,25 @@ async function settleCodexWriterHandoffObservation(tabId, reason = 'rewind-finis
       : 'writer-handoff-unresolved:' + reason,
     ...getCodexPublicWriterFields(tabId),
   });
-  return adoption;
+  const result = {
+    ...(adoption || { status: 'unknown' }),
+    sourceSessionId: baselineSessionId,
+    activeSessionId: settlement.branchWriterProven ? adoption?.sessionId || null : null,
+    bindingCommitted: settlement.branchWriterProven === true,
+    handoffStatus: settlement.branchWriterProven
+      ? 'adopted-child'
+      : settlement.absent
+        ? 'process-absent'
+        : 'unresolved',
+    handoffGeneration: actionGeneration,
+    handoffSettlement: settlement,
+  };
+  if (settlement.branchWriterProven && codexWatchers.get(tabId) === observer) {
+    // This observer owns one A→B mutation only. Reusing it would give a later
+    // B→C native Rewind stale lineage and generation.
+    closeCodexWatcher(tabId, 'writer-handoff-committed');
+  }
+  return result;
 }
 
 function startCodexSessionWatcher(sender, {
@@ -23525,6 +26186,11 @@ function startCodexSessionWatcher(sender, {
     launchId: launchId || null,
     handoffBaselineSessionId: sourceMode === 'writer-handoff' ? (sourceSessionId || null) : null,
     handoffPending: sourceMode === 'writer-handoff' && !!handoffPending,
+    handoffActionStartedAtMs: null,
+    handoffActionGeneration: null,
+    handoffAdoptedSessionId: null,
+    handoffLastResult: null,
+    handoffWaiters: new Set(),
     processObserved: false,
   };
   codexSessionDiscoveryIntents.set(tabId, {
@@ -23547,6 +26213,10 @@ function startCodexSessionWatcher(sender, {
         sender,
         expectedObserver: observerState,
       });
+      // Explicit Stop can close this discovery observer while its lsof/metadata
+      // proof is awaiting. The reconcile layer rejects its mutations, and this
+      // owner check also prevents a final misleading post-close "miss" line.
+      if (!isCurrentObserver()) return;
       if (adoption?.status === 'adopted'
         || adoption?.status === 'provisional-source'
         || adoption?.status === 'pending') {
@@ -23555,14 +26225,32 @@ function startCodexSessionWatcher(sender, {
       if (adoption?.status === 'adopted' && !found) {
         if (sourceMode === 'writer-handoff') {
           const previousBaseline = observerState.handoffBaselineSessionId || null;
-          observerState.handoffBaselineSessionId = adoption.sessionId;
-          if (previousBaseline !== adoption.sessionId) {
+          const actionBoundarySet = Number.isFinite(Number(observerState.handoffActionStartedAtMs));
+          const selection = adoption?.handoffProof
+            || adoption?.processProof?.handoffProof
+            || null;
+          const provenBranch = actionBoundarySet
+            && selection?.status === 'selected'
+            && selection.actionGeneration === observerState.handoffActionGeneration
+            && selection.sessionId === adoption.sessionId;
+          const manualWriterChange = !actionBoundarySet
+            && previousBaseline !== adoption.sessionId;
+          if (provenBranch || manualWriterChange) {
             console.warn('[CodexWriterHandoff] writer changed tab=' + String(tabId).slice(-12)
               + ' from=' + (previousBaseline ? String(previousBaseline).slice(0, 8) : 'unknown')
               + ' to=' + String(adoption.sessionId).slice(0, 8)
-              + ' proof=process-open-rollout'
+              + ' proof=' + (provenBranch ? 'native-rewind-descendant' : 'process-open-rollout')
               + ' reason=' + reason);
             observerState.handoffPending = false;
+            observerState.handoffAdoptedSessionId = adoption.sessionId;
+            notifyCodexWriterHandoffWaiters(observerState, adoption);
+          } else if (actionBoundarySet) {
+            console.warn('[CodexWriterHandoff] adopted candidate is not the proven action child tab='
+              + String(tabId).slice(-12)
+              + ' source=' + String(previousBaseline || 'none').slice(0, 8)
+              + ' candidate=' + String(adoption.sessionId || 'none').slice(0, 8)
+              + ' selection=' + (selection?.status || 'none')
+              + ' reason=' + (selection?.reason || reason));
           }
           // Native rewind may change writers only after the user confirms the
           // selected history point. Keep observing through the whole overlay
@@ -23707,6 +26395,172 @@ function codexHomeDir() {
   return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 }
 
+function codexConfigPathForProfile(profile = null) {
+  const normalized = typeof profile === 'string' ? profile.trim() : '';
+  if (!normalized) return path.join(codexHomeDir(), 'config.toml');
+  if (path.basename(normalized) !== normalized || normalized === '.' || normalized === '..') {
+    return null;
+  }
+  return path.join(codexHomeDir(), normalized + '.config.toml');
+}
+
+function isTrustedCodexConfigPath(configPath) {
+  if (typeof configPath !== 'string' || !path.isAbsolute(configPath)) return false;
+  const root = path.resolve(codexHomeDir());
+  const resolved = path.resolve(configPath);
+  if (path.dirname(resolved) !== root) return false;
+  const name = path.basename(resolved);
+  return name === 'config.toml'
+    || (/^[A-Za-z0-9._-]+\.config\.toml$/.test(name) && name !== '.config.toml');
+}
+
+function codexProfileFromProcessCommands(matches) {
+  const profiles = new Set();
+  let sawCodex = false;
+  for (const match of Array.isArray(matches) ? matches : []) {
+    const command = String(match?.cmd || '');
+    if (!commandLooksLikeAiProcess(command, 'codex')) continue;
+    sawCodex = true;
+    const profileMatch = command.match(/(?:^|\s)--profile(?:=|\s+)(?:'([^']+)'|"([^"]+)"|([^\s]+))/);
+    if (profileMatch) {
+      const profile = profileMatch[1] || profileMatch[2] || profileMatch[3] || '';
+      if (profile) profiles.add(profile);
+    }
+  }
+  if (!sawCodex || profiles.size > 1) {
+    return { status: 'unknown', profile: null, configPath: null };
+  }
+  const profile = profiles.size === 1 ? Array.from(profiles)[0] : null;
+  const configPath = codexConfigPathForProfile(profile);
+  return configPath
+    ? { status: 'found', profile, configPath }
+    : { status: 'unknown', profile, configPath: null };
+}
+
+async function resolveActiveCodexConfigForTab(tabId) {
+  const launch = codexLastRunCommandPayload.get(tabId) || null;
+  if (launch?.configPath && path.isAbsolute(launch.configPath)) {
+    return {
+      status: 'found',
+      profile: launch.profile || null,
+      configPath: launch.configPath,
+      source: 'launch',
+    };
+  }
+  const lookup = await inspectAiDescendantProcessesByTabCached(tabId, 'codex');
+  if (lookup.status !== AI_PROCESS_LOOKUP_STATUS.FOUND) {
+    return {
+      status: lookup.status || 'unknown',
+      profile: null,
+      configPath: null,
+      source: 'process',
+      error: lookup.error || null,
+    };
+  }
+  return {
+    ...codexProfileFromProcessCommands(lookup.matches),
+    source: 'process',
+  };
+}
+
+async function recoverDurableCodexModelMigration(projectId, tabId, durableState) {
+  if (!durableState?.modelMigrationPending) {
+    return { success: true, state: durableState, action: 'not-pending' };
+  }
+  const pendingProofAt = Number(durableState.proofAt);
+  if (!Number.isFinite(pendingProofAt)
+    || pendingProofAt <= 0
+    || !durableState.sourceModel) {
+    return {
+      success: false,
+      error: 'codex_model_migration_journal_incomplete',
+      reason: 'durable_migration_metadata_missing',
+    };
+  }
+
+  // The shared config can say that a migration happened, but after restart it
+  // cannot identify which tab's Enter made it happen. Do not read it as a
+  // recovery witness: settle this unfinished journal to its durable source.
+  const recovery = classifyCodexModelMigrationRecovery('', {
+    sourceModel: durableState.sourceModel,
+    sourceEffort: durableState.sourceEffort,
+  });
+  if (recovery.action === 'block') {
+    return {
+      success: false,
+      error: 'codex_model_migration_recovery_ambiguous',
+      reason: recovery.reason,
+      recovery,
+    };
+  }
+
+  const proofAt = Date.now();
+  const commit = recovery.action === 'commit-target'
+    ? projectManager.db.commitTabCodexModelMigration(projectId, tabId, {
+      model: recovery.model,
+      effort: recovery.effort,
+      proofAt,
+      proofSessionId: null,
+      expectedPendingProofAt: pendingProofAt,
+    })
+    : projectManager.db.rollbackTabCodexModelMigration(projectId, tabId, {
+      proofAt,
+      expectedPendingProofAt: pendingProofAt,
+    });
+  if (commit?.success !== true) {
+    return {
+      success: false,
+      error: commit?.error || 'codex_model_migration_recovery_commit_failed',
+      reason: 'durable_recovery_compare_and_set_failed',
+    };
+  }
+
+  let settledState;
+  try {
+    settledState = projectManager.db.getTabCodexSettingsState(projectId, tabId);
+  } catch (error) {
+    return {
+      success: false,
+      error: 'codex_model_migration_recovery_verify_failed',
+      reason: error?.message || String(error),
+    };
+  }
+  if (!settledState || settledState.modelMigrationPending) {
+    return {
+      success: false,
+      error: 'codex_model_migration_recovery_verify_failed',
+      reason: 'settled_row_not_observed',
+    };
+  }
+
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('codex:model-migration-settings-applied', {
+      tabId,
+      launchId: null,
+      model: settledState.model || recovery.model,
+      effort: settledState.effort || recovery.effort || null,
+      proofAt: settledState.proofAt || proofAt,
+      proofSessionId: null,
+      updateDefaultModel: commit.defaultModelUpdated === true,
+      updateDefaultEffort: commit.defaultEffortUpdated === true,
+      expectedDefaultModel: 'none',
+      expectedDefaultEffort: 'none',
+      recoveryAction: recovery.action,
+    });
+  }
+  console.warn('[CodexModelMigration] restart recovery settled tab='
+    + String(tabId).slice(-12)
+    + ' action=' + recovery.action
+    + ' model=' + (settledState.model || '-')
+    + ' effort=' + (settledState.effort || '-')
+    + ' config=' + durableState.configPath);
+  return {
+    success: true,
+    state: settledState,
+    action: recovery.action,
+  };
+}
+
 function codexProfileNameForTab(tabId) {
   const digest = crypto.createHash('sha1').update(String(tabId || 'tab')).digest('hex').slice(0, 12);
   return 'noted-terminal-' + digest;
@@ -23717,14 +26571,24 @@ async function writeCodexDeveloperInstructionsProfile(tabId, developerInstructio
   if (!text) return null;
   const profileName = codexProfileNameForTab(tabId);
   const filePath = path.join(codexHomeDir(), profileName + '.config.toml');
-  const content = [
-    '# Auto-generated by Noted Terminal. Do not edit by hand.',
-    '# This profile is per PTY tab and only carries wrapper developer instructions.',
-    'developer_instructions = ' + tomlString(text),
-    '',
-  ].join('\n');
   await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.promises.writeFile(filePath, content, 'utf8');
+  let existing = '';
+  let existingMode = 0o600;
+  try {
+    existing = await fs.promises.readFile(filePath, 'utf8');
+    existingMode = (await fs.promises.stat(filePath)).mode & 0o777;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  const content = rewriteCodexDeveloperProfile(existing, text);
+  const tempPath = filePath + '.tmp-' + process.pid + '-' + crypto.randomBytes(4).toString('hex');
+  try {
+    await fs.promises.writeFile(tempPath, content, { encoding: 'utf8', mode: existingMode });
+    await fs.promises.rename(tempPath, filePath);
+  } finally {
+    try { await fs.promises.unlink(tempPath); } catch {}
+  }
   return profileName;
 }
 
@@ -23774,6 +26638,8 @@ function armCodexStartupAutoEnter(tabId, {
   cwd,
   allowedPromptTypes: requestedPromptTypes,
   source = 'launch',
+  profile = null,
+  configPath = null,
 } = {}) {
   if (!tabId) return;
   if (source !== 'live-process-adoption') {
@@ -23782,8 +26648,13 @@ function armCodexStartupAutoEnter(tabId, {
   clearCodexStartupAutoEnter(tabId, 'rearm');
   const normalizedCommand = command || 'codex';
   const allowedPromptTypes = Array.isArray(requestedPromptTypes)
-    ? new Set(requestedPromptTypes.filter((type) => ['update-available', 'trust-directory', 'cwd-chooser'].includes(type)))
-    : new Set(['update-available', 'trust-directory']);
+    ? new Set(requestedPromptTypes.filter((type) => [
+      'update-available',
+      'model-migration',
+      'trust-directory',
+      'cwd-chooser',
+    ].includes(type)))
+    : new Set(['update-available', 'model-migration', 'trust-directory']);
   if (!Array.isArray(requestedPromptTypes)
     && (normalizedCommand === 'codex-c' || normalizedCommand === 'codex-f')
     && sessionId) {
@@ -23798,6 +26669,8 @@ function armCodexStartupAutoEnter(tabId, {
     sessionId: sessionId || null,
     cwd: cwd || null,
     source,
+    profile: profile || null,
+    configPath: configPath || null,
     armedAt: Date.now(),
     allowedPromptTypes,
     firedTypes: new Set(),
@@ -23813,6 +26686,447 @@ function armCodexStartupAutoEnter(tabId, {
     ' cwd=' + (state.cwd || 'n/a') +
     ' prompts=' + Array.from(allowedPromptTypes).join(',') +
     ' ttlMs=' + ttlMs);
+}
+
+function clearCodexPendingModelMigration(tabId, reason = 'clear') {
+  const state = codexPendingModelMigrations.get(tabId);
+  if (!state) return false;
+  codexPendingModelMigrations.delete(tabId);
+  console.log('[CodexModelMigration] pending proof cleared tab='
+    + String(tabId).slice(-12)
+    + ' launch=' + (state.launchId || '-')
+    + ' reason=' + reason
+    + ' bytes=' + String(state.output || '').length);
+  return true;
+}
+
+function tryHandleManualCodexModelMigrationEnter(tabId, term, data, meta = null) {
+  if (data !== '\r' && data !== '\n') return { handled: false };
+  const commandState = terminalCommandState.get(tabId) || null;
+  if (commandState?.isRunning !== true) return { handled: false };
+  const startupState = codexStartupAutoEnter.get(tabId) || null;
+  const recentRaw = codexTuiReadyBuffers.get(tabId) || '';
+  // Ordinary user Enter stays a direct PTY write. The synchronous screen proof
+  // is paid only after the stream has already classified this exact chooser
+  // (or its three stable anchors are present in the current raw frame).
+  const possibleMigration = startupState?.modelMigrationPrompt?.visible === true
+    || (
+      (recentRaw.includes("Choose how you'd like Codex to proceed")
+        || recentRaw.includes('Choose how you’d like Codex to proceed'))
+      && recentRaw.includes('Try new model')
+      && recentRaw.includes('Use existing model')
+    );
+  if (!possibleMigration) return { handled: false };
+  const snapshot = getHeadlessVisibleBufferSnapshot(
+    tabId,
+    'manual-codex-model-migration-enter',
+  );
+  if (!snapshot?.success) return { handled: false };
+  const cleanText = (snapshot.lines || []).map(line => String(line?.text || '')).join('\n');
+  const rememberedPrompt = startupState?.modelMigrationPrompt || null;
+  const admission = decideCodexModelMigrationAutoEnter({
+    sameTerminal: terminals.get(tabId) === term,
+    sameRunSeq: Number(commandState.runSeq || 0)
+      === Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    sameInputRevision: true,
+    screenAvailable: true,
+    cleanText,
+    expectedSourceModel: rememberedPrompt?.existingModel || null,
+    expectedTargetModel: rememberedPrompt?.targetModel || null,
+  });
+  const visiblePrompt = inspectCodexModelMigrationPrompt(cleanText);
+  if (!admission.allowed) {
+    if (!visiblePrompt.visible) return { handled: false };
+    if (visiblePrompt.secondOptionSelected) {
+      clearCodexStartupAutoEnter(tabId, 'manual-existing-model-confirmed');
+      term.write(data);
+      resetCodexTuiReadyDetection(tabId, 'manual-existing-model-confirmed');
+      return { handled: true, submitted: true, migrated: false };
+    }
+    if (visiblePrompt.firstOptionSelected && !visiblePrompt.secondOptionSelected) {
+      console.warn('[CodexModelMigration] manual Enter blocked because current chooser lacks durable metadata tab='
+        + String(tabId).slice(-12)
+        + ' reason=' + admission.reason);
+      return { handled: true, submitted: false, error: admission.reason };
+    }
+    return { handled: false };
+  }
+
+  const launch = codexLastRunCommandPayload.get(tabId) || null;
+  const launchId = launch?.launchId
+    || ('codex-startup-adoption-' + (startupState?.armedAt || Date.now()));
+  const configPath = startupState?.configPath || launch?.configPath || null;
+  const pending = armCodexModelMigrationAcknowledgement(tabId, {
+    term,
+    runSeq: Number(commandState.runSeq || 0),
+    launchId,
+    inputRevision: getTerminalInputRevision(tabId),
+    startupState,
+    sourceModel: admission.prompt?.existingModel,
+    targetModel: admission.prompt?.targetModel,
+    configPath,
+  });
+  if (!pending) {
+    console.warn('[CodexModelMigration] manual Enter blocked because pending state was not durable tab='
+      + String(tabId).slice(-12)
+      + ' launch=' + launchId
+      + ' config=' + (configPath || '-'));
+    return {
+      handled: true,
+      submitted: false,
+      error: configPath ? 'migration-pending-not-durable' : 'active-config-path-unknown',
+    };
+  }
+  clearCodexStartupAutoEnter(tabId, 'manual-model-migration-enter');
+  queueTerminalCommandMeta(tabId, meta);
+  term.write(data);
+  resetCodexTuiReadyDetection(tabId, 'manual-model-migration-enter');
+  console.warn('[CodexModelMigration] manual Enter delivered after durable boundary tab='
+    + String(tabId).slice(-12)
+    + ' launch=' + launchId
+    + ' source=' + pending.sourceModel
+    + ' target=' + pending.targetModel);
+  return { handled: true, submitted: true, migrated: true };
+}
+
+function armCodexModelMigrationAcknowledgement(tabId, {
+  term,
+  runSeq,
+  launchId,
+  inputRevision,
+  startupState = null,
+  sourceModel,
+  targetModel,
+  configPath,
+} = {}) {
+  const normalizedSourceModel = normalizeCodexMigrationModelLabel(sourceModel);
+  const normalizedTargetModel = normalizeCodexMigrationModelLabel(targetModel);
+  const activeConfigPath = isTrustedCodexConfigPath(configPath)
+    ? configPath
+    : null;
+  if (!tabId
+    || !term
+    || !launchId
+    || !Number.isInteger(Number(runSeq))
+    || !normalizedSourceModel
+    || !normalizedTargetModel
+    || !activeConfigPath) {
+    return null;
+  }
+  let configBaselineFingerprint = null;
+  let baselineTop = null;
+  let baselineAlreadySettled = false;
+  try {
+    let baselineText = '';
+    try {
+      const stat = fs.statSync(activeConfigPath);
+      if (!stat.isFile() || stat.size > 1024 * 1024) return null;
+      baselineText = fs.readFileSync(activeConfigPath, 'utf8');
+    } catch (error) {
+      // A missing config is a valid empty baseline: Codex may create the
+      // active profile only after the user accepts the migration.
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    const sourceKey = normalizeCodexMigrationModelLabel(normalizedSourceModel);
+    const targetKey = normalizeCodexMigrationModelLabel(normalizedTargetModel);
+    baselineTop = parseCodexTopLevelConfig(baselineText);
+    const baselineMigrations = parseCodexModelMigrationsConfig(baselineText);
+    baselineAlreadySettled = normalizeCodexMigrationModelLabel(baselineTop.model) === targetKey
+      && baselineMigrations[sourceKey] === targetKey;
+    configBaselineFingerprint = hashCodexConfigSnapshot(baselineText);
+  } catch (error) {
+    console.warn('[CodexModelMigration] Enter blocked because active config baseline is unreadable tab='
+      + String(tabId).slice(-12)
+      + ' config=' + activeConfigPath
+      + ' error=' + (error?.message || String(error)));
+    return null;
+  }
+  clearCodexPendingModelMigration(tabId, 'rearm');
+  const projectId = resolveAuthoritativeTabProjectId(tabId);
+  const launch = codexLastRunCommandPayload.get(tabId) || null;
+  const sourceEffort = String(
+    launch?.requestedEffort
+      || baselineTop?.model_reasoning_effort
+      || '',
+  ).trim().toLowerCase() || null;
+  const enteredAt = Date.now();
+  let durableBegin;
+  try {
+    durableBegin = projectId
+      ? projectManager.db.beginTabCodexModelMigration(projectId, tabId, {
+        proofAt: enteredAt,
+        clearDefaultModel: launch?.launchId === launchId && launch.modelSource === 'global',
+        expectedDefaultModel: launch?.requestedModel || null,
+        clearDefaultEffort: launch?.launchId === launchId && launch.effortSource === 'global',
+        expectedDefaultEffort: launch?.requestedEffort || null,
+        sourceModel: normalizedSourceModel,
+        sourceEffort,
+        targetModel: normalizedTargetModel,
+        configPath: activeConfigPath,
+        configBaselineFingerprint,
+        configAlreadyTargetAtArm: baselineAlreadySettled,
+      })
+      : { success: false, error: 'project-not-resolved' };
+  } catch (error) {
+    durableBegin = { success: false, error: error?.message || String(error) };
+  }
+  if (durableBegin?.success !== true) {
+    console.warn('[CodexModelMigration] Enter blocked because pending state was not durable tab='
+      + String(tabId).slice(-12)
+      + ' launch=' + launchId
+      + ' project=' + (projectId || '-')
+      + ' error=' + (durableBegin?.error || 'unknown'));
+    return null;
+  }
+  const state = {
+    term,
+    runSeq: Number(runSeq),
+    launchId,
+    inputRevision: Number(inputRevision),
+    startupState,
+    enteredAt: Number(durableBegin.pendingProofAt) || enteredAt,
+    projectId,
+    sourceModel: normalizedSourceModel,
+    sourceEffort,
+    targetModel: normalizedTargetModel,
+    configPath: activeConfigPath,
+    configBaselineFingerprint,
+    configAlreadyTargetAtArm: baselineAlreadySettled,
+    defaultModelInvalidated: durableBegin.defaultModelInvalidated === true,
+    defaultEffortInvalidated: durableBegin.defaultEffortInvalidated === true,
+    output: '',
+    lastPersistError: null,
+  };
+  codexPendingModelMigrations.set(tabId, state);
+
+  // The old launch pair is no longer authoritative once Codex accepts the
+  // migration. Do not let the startup watchdog reuse it while the exact
+  // post-Enter acknowledgement is still in flight.
+  if (launch?.launchId === launchId) {
+    launch.model = null;
+    launch.effort = null;
+    launch.modelMigrationPending = true;
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('codex:model-migration-settings-pending', {
+      tabId,
+      launchId,
+      enteredAt: state.enteredAt,
+      clearDefaultModel: state.defaultModelInvalidated,
+      clearDefaultEffort: state.defaultEffortInvalidated,
+      expectedDefaultModel: launch?.requestedModel || null,
+      expectedDefaultEffort: launch?.requestedEffort || null,
+      sourceModel: state.sourceModel,
+      sourceEffort: state.sourceEffort,
+      targetModel: state.targetModel,
+      configPath: state.configPath,
+      configFingerprint: state.configBaselineFingerprint,
+      configAlreadyTarget: state.configAlreadyTargetAtArm,
+      configAlreadyTargetAtArm: state.configAlreadyTargetAtArm,
+    });
+  }
+  console.log('[CodexModelMigration] pending proof armed tab='
+    + String(tabId).slice(-12)
+    + ' launch=' + launchId
+    + ' runSeq=' + state.runSeq
+    + ' inputRevision=' + state.inputRevision
+    + ' sourceModel=' + state.sourceModel
+    + ' targetModel=' + state.targetModel
+    + ' config=' + state.configPath
+    + ' defaultModelInvalidated=' + state.defaultModelInvalidated
+    + ' defaultEffortInvalidated=' + state.defaultEffortInvalidated);
+  return state;
+}
+
+function tryCommitCodexModelMigrationAcknowledgement(tabId, data) {
+  const state = codexPendingModelMigrations.get(tabId);
+  if (!state) return false;
+  state.output = (state.output + String(data || '')).slice(-16 * 1024);
+  const launch = codexLastRunCommandPayload.get(tabId) || null;
+  const currentLaunchId = launch?.launchId
+    || (state.startupState && codexStartupAutoEnter.get(tabId) === state.startupState
+      ? state.launchId
+      : (String(state.launchId || '').startsWith('codex-startup-adoption-')
+        ? state.launchId
+        : null));
+  const decision = decideCodexModelMigrationAcknowledgement({
+    sameTerminal: terminals.get(tabId) === state.term,
+    sameRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0) === state.runSeq,
+    sameLaunchId: currentLaunchId === state.launchId,
+    sameInputRevision: getTerminalInputRevision(tabId) === state.inputRevision,
+    expectedTargetModel: state.targetModel,
+    output: state.output,
+  });
+  if (!decision.allowed) {
+    if (decision.settled) {
+      clearCodexPendingModelMigration(tabId, decision.reason);
+    }
+    return false;
+  }
+
+  const { model, effort, proof } = decision.applied;
+  const configProofKey = [
+    state.sourceModel,
+    state.targetModel,
+    model,
+    effort,
+    state.configPath,
+  ].join('\u0000');
+  if (state.configProofKey !== configProofKey || state.configProof?.matches !== true) {
+    if (!state.configProofInflight) {
+      state.configProofInflight = true;
+      void waitForCodexModelEffortConfig({
+        sourceModel: state.sourceModel,
+        targetModel: state.targetModel,
+        effort,
+      }, {
+        timeoutMs: 5000,
+        logPrefix: '[CodexModelMigration:' + String(tabId).slice(-12) + ']',
+        configPath: state.configPath,
+        verifyConfig: verifyCodexModelMigrationConfig,
+      }).then((configProof) => {
+        if (codexPendingModelMigrations.get(tabId) !== state) return;
+        state.configProofInflight = false;
+        const transitioned = state.configAlreadyTargetAtArm === true || (
+          !!configProof.fingerprint
+          && configProof.fingerprint !== state.configBaselineFingerprint
+        );
+        if (!configProof.success || configProof.matches !== true || !transitioned) {
+          const errorKey = (configProof.error || 'config-mismatch')
+            + ':' + transitioned
+            + ':' + JSON.stringify(configProof.mismatches || configProof.verification?.mismatches || []);
+          if (state.lastLoggedConfigProofError !== errorKey) {
+            state.lastLoggedConfigProofError = errorKey;
+            console.warn('[CodexModelMigration] acknowledgement did not gain active-config proof tab='
+              + String(tabId).slice(-12)
+              + ' launch=' + state.launchId
+              + ' config=' + state.configPath
+              + ' error=' + (configProof.error || 'config-mismatch')
+              + ' transitioned=' + transitioned
+              + ' mismatches=' + JSON.stringify(
+                configProof.mismatches || configProof.verification?.mismatches || [],
+              )
+              + ' action=keep-starting');
+          }
+          return;
+        }
+        state.configProofKey = configProofKey;
+        state.configProof = configProof;
+        tryCommitCodexModelMigrationAcknowledgement(tabId, '');
+      }).catch((error) => {
+        if (codexPendingModelMigrations.get(tabId) !== state) return;
+        state.configProofInflight = false;
+        console.warn('[CodexModelMigration] active-config proof failed tab='
+          + String(tabId).slice(-12)
+          + ' config=' + state.configPath
+          + ' error=' + (error?.message || String(error))
+          + ' action=keep-starting');
+      });
+    }
+    return false;
+  }
+
+  const proofAt = Date.now();
+  const writerProof = getCodexWriterProofSnapshot(tabId);
+  const liveProcessAdoption = state.startupState?.source === 'live-process-adoption';
+  const proofSessionId = writerProof && (
+    writerProof.launchId === state.launchId
+    || liveProcessAdoption
+  )
+    ? writerProof.sessionId
+    : null;
+  const projectId = resolveAuthoritativeTabProjectId(tabId) || state.projectId || null;
+  let durableCommit = null;
+  try {
+    durableCommit = projectId
+      ? projectManager.db.commitTabCodexModelMigration(projectId, tabId, {
+        model,
+        effort,
+        proofAt,
+        proofSessionId,
+        expectedPendingProofAt: state.enteredAt,
+      })
+      : { success: false, error: 'project-not-resolved' };
+  } catch (error) {
+    state.lastPersistError = error?.message || String(error);
+  }
+  if (durableCommit?.success !== true) {
+    const persistError = state.lastPersistError
+      || durableCommit?.error
+      || (!projectId ? 'project-not-resolved' : 'tab-row-not-updated');
+    if (state.lastLoggedPersistError !== persistError) {
+      state.lastLoggedPersistError = persistError;
+      console.warn('[CodexModelMigration] exact ack observed but durable tab update failed tab='
+        + String(tabId).slice(-12)
+        + ' launch=' + state.launchId
+        + ' project=' + (projectId || '-')
+        + ' model=' + model
+        + ' effort=' + effort
+        + ' error=' + persistError
+        + ' action=keep-starting');
+    }
+    return false;
+  }
+
+  const updateDefaultModel = durableCommit.defaultModelUpdated === true;
+  const updateDefaultEffort = durableCommit.defaultEffortUpdated === true;
+  if ((state.defaultModelInvalidated && !updateDefaultModel)
+    || (state.defaultEffortInvalidated && !updateDefaultEffort)) {
+    console.log('[CodexModelMigration] global default CAS preserved newer value tab='
+      + String(tabId).slice(-12)
+      + ' modelUpdated=' + updateDefaultModel
+      + ' effortUpdated=' + updateDefaultEffort);
+  }
+
+  if (launch?.launchId === state.launchId) {
+    launch.model = model;
+    launch.effort = effort;
+    launch.modelMigrationPending = false;
+  }
+  if (!proofSessionId) {
+    const pendingProof = createPendingCodexSettingsProofHandoff({
+      result: {
+        success: true,
+        applied: true,
+        model,
+        effort,
+        applicationProofSource: proof,
+        codexSettingsProofSessionId: null,
+      },
+      terminalToken: state.term,
+      runSeq: state.runSeq,
+      launchId: liveProcessAdoption ? null : state.launchId,
+      allowTerminalRunGeneration: liveProcessAdoption,
+      appliedAt: proofAt,
+    });
+    if (pendingProof) {
+      codexPendingSettingsProofHandoffs.set(tabId, pendingProof);
+    }
+  }
+  codexPendingModelMigrations.delete(tabId);
+  codexTuiReadyLastNotReady.delete(tabId);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('codex:model-migration-settings-applied', {
+      tabId,
+      launchId: state.launchId,
+      model,
+      effort,
+      proofAt,
+      proofSessionId: proofSessionId || null,
+      updateDefaultModel,
+      updateDefaultEffort,
+    });
+  }
+  console.log('[CodexModelMigration] exact ack committed tab='
+    + String(tabId).slice(-12)
+    + ' launch=' + state.launchId
+    + ' model=' + model
+    + ' effort=' + effort
+    + ' proofOwner=' + (proofSessionId ? String(proofSessionId).slice(0, 8) : 'pending-writer')
+    + ' defaultModelUpdated=' + updateDefaultModel
+    + ' defaultEffortUpdated=' + updateDefaultEffort
+    + ' proof=' + proof);
+  return true;
 }
 
 function inspectCodexCwdChooser(cleanText) {
@@ -23925,14 +27239,34 @@ async function maybeAdoptCodexStartupAutoEnterFromLivePrompt(tabId, inspected, s
     return false;
   }
   const blockers = Array.isArray(inspected?.blockers) ? inspected.blockers : [];
-  if (!blockers.includes('update-prompt')) return false;
+  const classifyLiveStartupPrompt = (frameText, frameBlockers) => {
+    if (frameBlockers.includes('update-prompt')) {
+      const updatePrompt = inspectCodexUpdatePrompt(frameText);
+      if (updatePrompt.canAutoSkip) {
+        return {
+          promptType: 'update-available',
+          reason: updatePrompt.skipReason,
+        };
+      }
+    }
+    if (frameBlockers.includes('model-migration')) {
+      const migrationPrompt = inspectCodexModelMigrationPrompt(frameText);
+      if (migrationPrompt.canAutoEnter) {
+        return {
+          promptType: 'model-migration',
+          reason: migrationPrompt.skipReason,
+        };
+      }
+    }
+    return null;
+  };
 
   // inspectCodexInputReadyFrame supplies only the latest synchronized screen,
-  // not the whole scrollback. Require the same full, safely navigable picker
-  // shape used by the normal launch guard before doing a process lookup.
+  // not the whole scrollback. Require the same complete, selected action shape
+  // used by the normal launch guard before doing a process lookup.
   let promptText = typeof inspected?.sampleText === 'string' ? inspected.sampleText : '';
-  const updatePrompt = inspectCodexUpdatePrompt(promptText);
-  if (!updatePrompt.canAutoSkip) return false;
+  let detectedPrompt = classifyLiveStartupPrompt(promptText, blockers);
+  if (!detectedPrompt) return false;
 
   codexStartupPromptAdoptionProbeTabs.add(tabId);
   try {
@@ -23961,31 +27295,44 @@ async function maybeAdoptCodexStartupAutoEnterFromLivePrompt(tabId, inspected, s
     const latestPromptText = typeof latestInspected?.sampleText === 'string'
       ? latestInspected.sampleText
       : '';
-    const latestUpdatePrompt = inspectCodexUpdatePrompt(latestPromptText);
-    if (!Array.isArray(latestInspected?.blockers)
-      || !latestInspected.blockers.includes('update-prompt')
-      || !latestUpdatePrompt.canAutoSkip) {
+    const latestBlockers = Array.isArray(latestInspected?.blockers)
+      ? latestInspected.blockers
+      : [];
+    const latestDetectedPrompt = classifyLiveStartupPrompt(latestPromptText, latestBlockers);
+    if (!latestDetectedPrompt
+      || latestDetectedPrompt.promptType !== detectedPrompt.promptType) {
       console.log('[CodexStartupPrompt] live adoption aborted after revalidation tab=' + String(tabId).slice(-12)
         + ' source=' + source
-        + ' reason=' + (latestInspected?.reason || latestUpdatePrompt.skipReason || 'update-picker-changed'));
+        + ' reason=' + (latestInspected?.reason || latestDetectedPrompt?.reason || 'startup-picker-changed'));
       return false;
     }
     promptText = latestPromptText;
+    detectedPrompt = latestDetectedPrompt;
 
     aiProcessLookupCache.set(aiProcessLookupCacheKey(tabId, 'codex'), {
       at: nodePerformance.now(),
       matches,
     });
+    const activeConfig = codexProfileFromProcessCommands(matches);
+    if (detectedPrompt.promptType === 'model-migration'
+      && activeConfig.status !== 'found') {
+      console.warn('[CodexStartupPrompt] live model migration adoption blocked: active config unknown tab='
+        + String(tabId).slice(-12));
+      return false;
+    }
     const sessionId = getCodexRuntimeSessionId(tabId);
     armCodexStartupAutoEnter(tabId, {
       command: 'codex',
       sessionId,
       cwd: terminalProjects.get(tabId) || null,
-      allowedPromptTypes: ['update-available'],
+      allowedPromptTypes: [detectedPrompt.promptType],
       source: 'live-process-adoption',
+      profile: activeConfig.profile,
+      configPath: activeConfig.configPath,
     });
     console.warn('[CodexStartupPrompt] adopted live manual launch tab=' + String(tabId).slice(-12)
       + ' source=' + source
+      + ' prompt=' + detectedPrompt.promptType
       + ' session=' + (sessionId ? String(sessionId).slice(0, 8) : 'none')
       + ' pids=' + matches.map((match) => match.pid).join(','));
     tryHandleCodexStartupAutoEnter(tabId, '', {
@@ -24023,6 +27370,10 @@ function detectCodexStartupAutoEnterPrompt(cleanText, state) {
   const fired = state?.firedTypes || new Set();
   if (allowed.has('update-available') && !fired.has('update-available') && isCodexUpdatePrompt(cleanText)) {
     return 'update-available';
+  }
+  if (allowed.has('model-migration') && !fired.has('model-migration')) {
+    const migrationPrompt = inspectCodexModelMigrationPrompt(cleanText);
+    if (migrationPrompt.canAutoEnter) return 'model-migration';
   }
   if (allowed.has('trust-directory') && !fired.has('trust-directory') && isCodexTrustDirectoryPrompt(cleanText)) {
     return 'trust-directory';
@@ -24107,8 +27458,41 @@ function tryHandleCodexStartupAutoEnter(tabId, data, options = {}) {
       }
     }
   }
+  if (!promptType && state.allowedPromptTypes?.has('model-migration') && !state.firedTypes?.has('model-migration')) {
+    const migrationPrompt = inspectCodexModelMigrationPrompt(clean);
+    if (migrationPrompt.visible) {
+      const rejectKey = [
+        migrationPrompt.firstOptionSelected ? 'first' : 'first0',
+        migrationPrompt.secondOptionSelected ? 'second' : 'second0',
+        migrationPrompt.skipReason || 'unknown',
+      ].join(':');
+      if (state.lastModelMigrationRejectKey !== rejectKey) {
+        state.lastModelMigrationRejectKey = rejectKey;
+        const preview = clean.replace(/\s+/g, ' ').trim().slice(0, 260);
+        console.log('[CodexStartupPrompt] model migration visible but not auto-confirmed tab=' + String(tabId).slice(-12) +
+          ' command=' + (state.command || 'unknown') +
+          ' source=' + source +
+          ' ageMs=' + ageMs +
+          ' firstSelected=' + migrationPrompt.firstOptionSelected +
+          ' secondSelected=' + migrationPrompt.secondOptionSelected +
+          ' target=' + (migrationPrompt.targetModel || 'unknown') +
+          ' existing=' + (migrationPrompt.existingModel || 'unknown') +
+          ' reason=' + (migrationPrompt.skipReason || 'unknown') +
+          ' preview=' + JSON.stringify(preview));
+      }
+    }
+  }
   if (!promptType) return;
+  if (promptType === 'model-migration') {
+    const migrationPrompt = inspectCodexModelMigrationPrompt(clean);
+    if (migrationPrompt.modelMetadataValid) {
+      state.modelMigrationPrompt = migrationPrompt;
+    }
+  }
 
+  const expectedTerm = terminals.get(tabId) || null;
+  const expectedRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  const expectedInputRevision = getTerminalInputRevision(tabId);
   state.firedTypes.add(promptType);
   state.fired = true;
   const preview = clean.replace(/\s+/g, ' ').trim().slice(0, 260);
@@ -24121,10 +27505,10 @@ function tryHandleCodexStartupAutoEnter(tabId, data, options = {}) {
     ' rawBytes=' + rawBytes +
     ' preview=' + JSON.stringify(preview) +
     ' — sending Enter in 120ms');
-  setTimeout(() => {
+  setTimeout(async () => {
     const current = codexStartupAutoEnter.get(tabId);
     if (current !== state) return;
-    const term = terminals.get(tabId);
+    let term = terminals.get(tabId);
     let wroteAction = false;
     if (term) {
       if (promptType === 'update-available') {
@@ -24152,6 +27536,56 @@ function tryHandleCodexStartupAutoEnter(tabId, data, options = {}) {
         const action = updatePrompt.secondOptionSelected ? 'enter-skip' : 'down-enter-skip';
         console.log('[CodexStartupPrompt] writing ' + action + ' tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
         term.write(sequence);
+      } else if (promptType === 'model-migration') {
+        let currentScreen;
+        try {
+          currentScreen = await readCodexAuthoritativeScreen(
+            tabId,
+            'startup-model-migration-action',
+          );
+        } catch (error) {
+          currentScreen = {
+            success: false,
+            error: error?.message || String(error),
+          };
+        }
+        if (codexStartupAutoEnter.get(tabId) !== state) return;
+        term = terminals.get(tabId);
+        const admission = decideCodexModelMigrationAutoEnter({
+          sameTerminal: !!expectedTerm && term === expectedTerm,
+          sameRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0) === expectedRunSeq,
+          sameInputRevision: getTerminalInputRevision(tabId) === expectedInputRevision,
+          screenAvailable: currentScreen?.success === true,
+          cleanText: currentScreen?.clean || '',
+          expectedSourceModel: state.modelMigrationPrompt?.existingModel || null,
+          expectedTargetModel: state.modelMigrationPrompt?.targetModel || null,
+        });
+        if (!admission.allowed) {
+          console.log('[CodexStartupPrompt] model migration action cancelled after final revalidation tab=' + String(tabId).slice(-12)
+            + ' reason=' + admission.reason
+            + (currentScreen?.error ? ' screenError=' + currentScreen.error : ''));
+          clearCodexStartupAutoEnter(tabId, 'model-migration-' + admission.reason);
+          return;
+        }
+        const currentLaunchId = codexLastRunCommandPayload.get(tabId)?.launchId
+          || ('codex-startup-adoption-' + state.armedAt);
+        const currentLaunch = codexLastRunCommandPayload.get(tabId) || null;
+        const pendingMigration = armCodexModelMigrationAcknowledgement(tabId, {
+          term,
+          runSeq: expectedRunSeq,
+          launchId: currentLaunchId,
+          inputRevision: expectedInputRevision,
+          startupState: state,
+          sourceModel: admission.prompt?.existingModel,
+          targetModel: admission.prompt?.targetModel,
+          configPath: state.configPath || currentLaunch?.configPath || null,
+        });
+        if (!pendingMigration) {
+          clearCodexStartupAutoEnter(tabId, 'model-migration-pending-not-durable');
+          return;
+        }
+        console.log('[CodexStartupPrompt] writing Enter tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
+        term.write('\r');
       } else {
         console.log('[CodexStartupPrompt] writing Enter tab=' + String(tabId).slice(-12) + ' prompt=' + promptType);
         term.write('\r');
@@ -24291,32 +27725,106 @@ function parseCodexEffortPicker(cleanText) {
   };
 }
 
-function captureCodexFrame(term, { timeoutMs = 3000, predicate = null, logPrefix = '[Codex:Picker]', settleMs = 0 } = {}) {
+async function readCodexAuthoritativeScreen(tabId, reason = 'picker-frame') {
+  if (!tabId) return { success: false, error: 'tabId-required' };
+  const flushed = await flushHeadlessTerminalMirror(tabId);
+  if (!flushed.success) return flushed;
+  const snapshot = getHeadlessVisibleBufferSnapshot(tabId, reason);
+  if (!snapshot.success) return snapshot;
+  return {
+    success: true,
+    clean: (snapshot.lines || []).map(line => String(line?.text || '')).join('\n'),
+    snapshot,
+  };
+}
+
+function captureCodexFrame(term, {
+  timeoutMs = 3000,
+  predicate = null,
+  logPrefix = '[Codex:Picker]',
+  settleMs = 0,
+  tabId = null,
+  authoritativeScreen = false,
+} = {}) {
   return new Promise((resolve) => {
     let raw = '';
     let resolved = false;
+    let settling = false;
     let sub = null;
     let timer = null;
     let quietTimer = null;
     let firstFrameLogged = false;
     let predicateSeen = false;
+    let screenCheckInflight = false;
+    let screenCheckPending = false;
     const traceRewind = String(logPrefix || '').includes('Codex:Rewind');
-    const finish = (timedOut) => {
-      if (resolved) return;
-      resolved = true;
+    const cleanup = () => {
       if (timer) clearTimeout(timer);
       if (quietTimer) clearTimeout(quietTimer);
       try { sub?.dispose?.(); } catch {}
-      const clean = cleanCodexTuiFrame(raw);
-      if (traceRewind) {
-        console.log(logPrefix + ' capture finish timedOut=' + timedOut
-          + ' raw=' + raw.length + 'B clean=' + JSON.stringify(clean.slice(0, 260)));
-      }
-      resolve({ raw, clean, timedOut });
+    };
+    const finish = (timedOut, projectedClean = null, screenSource = null) => {
+      if (resolved || settling) return;
+      settling = true;
+      cleanup();
+      void (async () => {
+        let clean = projectedClean;
+        let source = screenSource;
+        if (authoritativeScreen && tabId && clean == null) {
+          const projected = await readCodexAuthoritativeScreen(
+            tabId,
+            logPrefix + (timedOut ? ':timeout' : ':finish'),
+          );
+          if (projected.success) {
+            clean = projected.clean;
+            source = 'headless-current-screen';
+          }
+        }
+        if (clean == null) clean = cleanCodexTuiFrame(raw);
+        resolved = true;
+        settling = false;
+        if (traceRewind) {
+          console.log(logPrefix + ' capture finish timedOut=' + timedOut
+            + ' raw=' + raw.length + 'B clean=' + JSON.stringify(clean.slice(0, 260)));
+        }
+        resolve({ raw, clean, timedOut, screenSource: source || 'pty-delta' });
+      })();
     };
     const finishAfterQuiet = () => {
       if (quietTimer) clearTimeout(quietTimer);
       quietTimer = setTimeout(() => finish(false), Math.max(0, Number(settleMs || 0)));
+    };
+    const checkAuthoritativeScreen = () => {
+      if (!authoritativeScreen || !tabId || resolved || settling) return;
+      if (screenCheckInflight) {
+        screenCheckPending = true;
+        return;
+      }
+      screenCheckInflight = true;
+      void (async () => {
+        do {
+          screenCheckPending = false;
+          const projected = await readCodexAuthoritativeScreen(tabId, logPrefix + ':signal');
+          if (resolved || settling) break;
+          if (!projected.success) {
+            console.warn(logPrefix + ' authoritative screen unavailable: '
+              + (projected.error || 'unknown'));
+            continue;
+          }
+          const clean = projected.clean;
+          if (!predicate || predicate(clean, raw)) {
+            predicateSeen = true;
+            if (settleMs > 0) {
+              finishAfterQuiet();
+            } else {
+              finish(false, clean, 'headless-current-screen');
+            }
+            break;
+          }
+        } while (screenCheckPending && !resolved && !settling);
+        screenCheckInflight = false;
+        if (screenCheckPending && !resolved && !settling) checkAuthoritativeScreen();
+      })();
     };
     timer = setTimeout(() => {
       console.log(logPrefix + ' capture timeout (' + timeoutMs + 'ms), raw=' + raw.length + 'B');
@@ -24329,6 +27837,12 @@ function captureCodexFrame(term, { timeoutMs = 3000, predicate = null, logPrefix
         const clean = cleanCodexTuiFrame(raw);
         console.log(logPrefix + ' first frame chunk=' + String(data || '').length
           + 'B raw=' + raw.length + 'B clean=' + JSON.stringify(clean.slice(0, 220)));
+      }
+      if (authoritativeScreen && tabId) {
+        // onData remains synchronous: it only marks/schedules one guarded
+        // screen read. The async flush never runs concurrently for each chunk.
+        checkAuthoritativeScreen();
+        return;
       }
       if (!predicate) {
         if (quietTimer) clearTimeout(quietTimer);
@@ -24355,13 +27869,28 @@ function captureCodexFrame(term, { timeoutMs = 3000, predicate = null, logPrefix
   });
 }
 
-async function sendCodexKeyAndCapture(term, key, timeoutMs = 2500, logPrefix = '[Codex:Picker]', predicate = null) {
+async function sendCodexKeyAndCapture(
+  term,
+  key,
+  timeoutMs = 2500,
+  logPrefix = '[Codex:Picker]',
+  predicate = null,
+  captureOptions = {},
+) {
+  const {
+    writeGuard = null,
+    writePhase = 'key-write',
+    ...frameOptions
+  } = captureOptions || {};
+  const refusal = readCodexPickerWriteRefusal(writeGuard, writePhase, logPrefix);
+  if (refusal) return refusal;
   const traceRewind = String(logPrefix || '').includes('Codex:Rewind');
   const capture = captureCodexFrame(term, {
     timeoutMs,
     logPrefix,
     predicate,
     settleMs: traceRewind && predicate ? 80 : 0,
+    ...frameOptions,
   });
   if (String(logPrefix || '').includes('Codex:Rewind')) {
     const keyLabel = key === '\x1b'
@@ -24379,6 +27908,34 @@ async function sendCodexKeyAndCapture(term, key, timeoutMs = 2500, logPrefix = '
   return await capture;
 }
 
+function readCodexPickerWriteRefusal(writeGuard, phase, logPrefix) {
+  if (typeof writeGuard !== 'function') return null;
+  const admission = writeGuard(phase);
+  if (admission?.allowed === true) return null;
+  const reason = admission?.reason || 'codex_picker_write_not_admitted';
+  console.warn(logPrefix + ' write refused phase=' + phase + ' reason=' + reason);
+  return {
+    raw: '',
+    clean: '',
+    timedOut: false,
+    writeAborted: true,
+    success: false,
+    error: reason,
+    admissionRejected: true,
+    manualTakeover: reason === 'codex_input_ownership_changed',
+    phase,
+  };
+}
+
+function codexModelEffortConfirmationObservedInFrame(clean, raw, model, effort) {
+  return isCodexModelEffortConfirmationObserved(
+    cleanCodexTuiFrame(String(raw || '')),
+    String(clean || ''),
+    model,
+    effort,
+  );
+}
+
 async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]', options = {}) {
   const text = String(command || '').trim();
   if (!text.startsWith('/')) {
@@ -24389,7 +27946,19 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
     waitForSubmitFrame = false,
     submitTimeoutMs = 2500,
     submitPredicate = null,
+    writeGuard = null,
   } = options;
+  const pasteRefusal = readCodexPickerWriteRefusal(
+    writeGuard,
+    'slash-command-paste',
+    logPrefix,
+  );
+  if (pasteRefusal) {
+    return {
+      ...pasteRefusal,
+      submitted: false,
+    };
+  }
   const t0 = Date.now();
   // Codex behaves like other Ink-style TUIs here: if text and Enter arrive in
   // the same raw write, Enter can be interpreted as a newline in the composer.
@@ -24408,6 +27977,18 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
   if (frame.timedOut) {
     console.warn(logPrefix + ' slash input frame timed out for ' + JSON.stringify(text) + ' clean=' + JSON.stringify(frame.clean.slice(0, 500)));
     return { success: false, error: 'Codex slash input frame timed out', submitted: false };
+  }
+  const enterRefusal = readCodexPickerWriteRefusal(
+    writeGuard,
+    'slash-command-enter',
+    logPrefix,
+  );
+  if (enterRefusal) {
+    return {
+      ...enterRefusal,
+      submitted: false,
+      slashInserted: true,
+    };
   }
   const submitFramePromise = waitForSubmitFrame
     ? captureCodexFrame(term, {
@@ -24449,17 +28030,53 @@ function parseCodexServiceTierFeedback(text) {
   };
 }
 
-async function moveCodexPickerTo(term, state, targetIndex, logPrefix) {
-  let selectedIndex = state.selectedIndex;
-  if (selectedIndex < 0) selectedIndex = 0;
-  const delta = targetIndex - selectedIndex;
-  if (delta === 0) return { success: true, pressCount: 0 };
-  const key = delta > 0 ? '\x1b[B' : '\x1b[A';
-  const dir = delta > 0 ? 'DOWN' : 'UP';
-  const pressCount = Math.abs(delta);
+async function moveCodexPickerTo(
+  term,
+  state,
+  targetIndex,
+  logPrefix,
+  tabId = null,
+  writeGuard = null,
+) {
+  const selectedIndex = state.selectedIndex;
+  const movement = planCodexPickerMovement(selectedIndex, targetIndex);
+  if (!movement.allowed) {
+    console.warn(logPrefix + ' navigation refused reason=' + movement.reason
+      + ' selected=' + selectedIndex + ' target=' + targetIndex);
+    return {
+      success: false,
+      error: movement.reason,
+      pressCount: 0,
+    };
+  }
+  if (movement.pressCount === 0) return { success: true, pressCount: 0 };
+  const key = movement.key;
+  const dir = key === '\x1b[B' ? 'DOWN' : 'UP';
+  const pressCount = movement.pressCount;
   console.log(logPrefix + ' navigate ' + dir + ' x' + pressCount + ' from=' + selectedIndex + ' to=' + targetIndex);
   for (let i = 0; i < pressCount; i++) {
-    const frame = await sendCodexKeyAndCapture(term, key, 2500, logPrefix + ':' + dir + '#' + (i + 1));
+    const frame = await sendCodexKeyAndCapture(
+      term,
+      key,
+      2500,
+      logPrefix + ':' + dir + '#' + (i + 1),
+      null,
+      {
+        tabId,
+        authoritativeScreen: !!tabId,
+        writeGuard,
+        writePhase: 'picker-navigation-' + dir.toLowerCase() + '-' + (i + 1),
+      },
+    );
+    if (frame.writeAborted) {
+      return {
+        success: false,
+        error: frame.error,
+        pressCount: i,
+        admissionRejected: true,
+        manualTakeover: frame.manualTakeover,
+      };
+    }
     if (frame.timedOut) {
       console.warn(logPrefix + ' navigation frame timed out at step ' + (i + 1) + '/' + pressCount);
       return { success: false, error: 'Codex picker navigation frame timed out', pressCount: i };
@@ -24469,6 +28086,7 @@ async function moveCodexPickerTo(term, state, targetIndex, logPrefix) {
 }
 
 async function selectCodexPickerItem(term, {
+  tabId = null,
   kind,
   target,
   candidates = null,
@@ -24477,6 +28095,7 @@ async function selectCodexPickerItem(term, {
   timeoutMs = 3000,
   confirmPredicate = null,
   logPrefix = '[Codex:Picker]',
+  writeGuard = null,
 }) {
   const state = typeof parseState === 'function'
     ? parseState(initialFrame.clean)
@@ -24486,10 +28105,11 @@ async function selectCodexPickerItem(term, {
   if (state.items.length === 0) {
     return { success: false, error: 'No Codex ' + kind + ' options found', clean: initialFrame.clean };
   }
-  const targetIndex = state.items.findIndex(item => normalizeCodexPickerValue(item.value) === normalizeCodexPickerValue(target));
-  if (targetIndex < 0) {
+  const targetItem = state.items.find(
+    item => normalizeCodexPickerValue(item.value) === normalizeCodexPickerValue(target)
+  );
+  if (!targetItem) {
     console.warn(logPrefix + ' ' + kind + ' option not found: ' + target + ' clean=' + JSON.stringify(initialFrame.clean.slice(0, 1200)));
-    try { term.write('\x1b'); } catch {}
     return {
       success: false,
       error: 'Codex ' + kind + ' option not found: ' + target,
@@ -24498,7 +28118,14 @@ async function selectCodexPickerItem(term, {
     };
   }
 
-  const moveResult = await moveCodexPickerTo(term, state, targetIndex, logPrefix + ':' + kind);
+  const moveResult = await moveCodexPickerTo(
+    term,
+    state,
+    targetItem.index,
+    logPrefix + ':' + kind,
+    tabId,
+    writeGuard,
+  );
   if (!moveResult.success) {
     return {
       success: false,
@@ -24507,25 +28134,53 @@ async function selectCodexPickerItem(term, {
       clean: initialFrame.clean,
     };
   }
-  const confirmFrame = await sendCodexKeyAndCapture(term, '\r', timeoutMs, logPrefix + ':' + kind + ':confirm', confirmPredicate);
+  const confirmFrame = await sendCodexKeyAndCapture(
+    term,
+    '\r',
+    timeoutMs,
+    logPrefix + ':' + kind + ':confirm',
+    confirmPredicate,
+    {
+      tabId,
+      authoritativeScreen: !!tabId,
+      writeGuard,
+      writePhase: 'picker-confirm-' + kind,
+    },
+  );
+  if (confirmFrame.writeAborted) {
+    return {
+      success: false,
+      error: confirmFrame.error,
+      selected: targetItem.value,
+      frame: confirmFrame,
+      options: state.items.map(item => item.value),
+      admissionRejected: true,
+      manualTakeover: confirmFrame.manualTakeover,
+    };
+  }
   if (confirmFrame.timedOut) {
     return {
       success: false,
       error: 'Codex ' + kind + ' confirm frame timed out',
-      selected: state.items[targetIndex].value,
+      selected: targetItem.value,
       frame: confirmFrame,
       options: state.items.map(item => item.value),
     };
   }
   return {
     success: true,
-    selected: state.items[targetIndex].value,
+    selected: targetItem.value,
     frame: confirmFrame,
     options: state.items.map(item => item.value),
   };
 }
 
-async function stashCodexDraftForPicker(term, { logPrefix, draftPreview = '' } = {}) {
+async function stashCodexDraftForPicker(term, {
+  tabId = null,
+  logPrefix,
+  draftPreview = '',
+  writeGuard = null,
+} = {}) {
   const preview = String(draftPreview || '').slice(0, 80);
   console.log(logPrefix + ' draft-stash start preview=' + JSON.stringify(preview));
   try {
@@ -24540,8 +28195,23 @@ async function stashCodexDraftForPicker(term, { logPrefix, draftPreview = '' } =
         return (hasCodexComposerPromptGlyph(clean)
           && /(Find and fix a bug|Explain this codebase)?/i.test(clean))
           || /Context\s+\d+%/i.test(clean);
-      }
+      },
+      {
+        tabId,
+        authoritativeScreen: !!tabId,
+        writeGuard,
+        writePhase: 'draft-stash',
+      },
     );
+    if (frame.writeAborted) {
+      return {
+        success: false,
+        error: frame.error,
+        admissionRejected: true,
+        manualTakeover: frame.manualTakeover,
+        frame,
+      };
+    }
     console.log(logPrefix + ' draft-stash ' + (frame.timedOut ? 'timeout' : 'frame') + ' clean=' + JSON.stringify(frame.clean.slice(0, 240)));
     return { success: !frame.timedOut, frame };
   } catch (error) {
@@ -24550,7 +28220,14 @@ async function stashCodexDraftForPicker(term, { logPrefix, draftPreview = '' } =
   }
 }
 
-async function restoreCodexDraftAfterPicker(term, { logPrefix, slashSubmitted = false, expectedPreview = '' } = {}) {
+async function restoreCodexDraftAfterPicker(term, {
+  tabId = null,
+  logPrefix,
+  slashSubmitted = false,
+  expectedPreview = '',
+  writeGuard = null,
+  readDraftState = null,
+} = {}) {
   const presses = slashSubmitted ? 2 : 1;
   console.log(logPrefix + ' draft-restore start arrowUp=' + presses + ' slashSubmitted=' + slashSubmitted);
   let lastFrame = null;
@@ -24560,8 +28237,24 @@ async function restoreCodexDraftAfterPicker(term, { logPrefix, slashSubmitted = 
         term,
         '\x1b[A',
         1600,
-        logPrefix + ':draft-restore#' + (i + 1)
+        logPrefix + ':draft-restore#' + (i + 1),
+        null,
+        {
+          tabId,
+          authoritativeScreen: !!tabId,
+          writeGuard,
+          writePhase: 'draft-restore-' + (i + 1),
+        },
       );
+      if (frame.writeAborted) {
+        return {
+          success: false,
+          error: frame.error,
+          admissionRejected: true,
+          manualTakeover: frame.manualTakeover,
+          frame,
+        };
+      }
       lastFrame = frame;
       console.log(logPrefix + ' draft-restore step=' + (i + 1) + '/' + presses + ' timedOut=' + frame.timedOut + ' clean=' + JSON.stringify(frame.clean.slice(0, 240)));
     } catch (error) {
@@ -24571,37 +28264,424 @@ async function restoreCodexDraftAfterPicker(term, { logPrefix, slashSubmitted = 
   }
   const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
   const expected = normalize(expectedPreview);
-  const actual = normalize(lastFrame?.clean || '');
-  const expectedPrefix = expected.slice(0, 32);
-  const matched = !expectedPrefix || actual.includes(expectedPrefix);
-  console.log(logPrefix + ' draft-restore verify expectedPrefix=' + JSON.stringify(expectedPrefix) + ' matched=' + matched + ' actual=' + JSON.stringify(actual.slice(0, 240)));
+  const proofAdmission = readCodexPickerWriteRefusal(
+    writeGuard,
+    'draft-restore-proof',
+    logPrefix,
+  );
+  if (proofAdmission) {
+    return {
+      ...proofAdmission,
+      frame: lastFrame,
+    };
+  }
+  if (typeof readDraftState !== 'function') {
+    return {
+      success: false,
+      error: 'codex_draft_restore_proof_unavailable',
+      frame: lastFrame,
+    };
+  }
+  const restored = await readDraftState();
+  const postProofAdmission = readCodexPickerWriteRefusal(
+    writeGuard,
+    'draft-restore-proof-complete',
+    logPrefix,
+  );
+  if (postProofAdmission) {
+    return {
+      ...postProofAdmission,
+      frame: lastFrame,
+      draftProof: restored,
+    };
+  }
+  const actual = normalize(restored?.preview || '');
+  const expectedPrefix = expected.slice(0, Math.min(80, expected.length));
+  const matched = restored?.success === true
+    && restored?.hasDraft === true
+    && expectedPrefix.length > 0
+    && actual.startsWith(expectedPrefix);
+  console.log(logPrefix + ' draft-restore verify source=' + (restored?.source || '-')
+    + ' expectedPrefix=' + JSON.stringify(expectedPrefix)
+    + ' matched=' + matched
+    + ' actual=' + JSON.stringify(actual.slice(0, 120)));
+  return {
+    success: matched,
+    matched,
+    frame: lastFrame,
+    draftProof: restored,
+    error: matched ? null : 'codex_draft_restore_not_confirmed',
+  };
+}
+
+function latestCodexSynchronizedFrameText(cleanText, rawText = '') {
+  const raw = String(rawText || '');
+  const end = raw.lastIndexOf(CODEX_SYNC_MARKER);
+  if (end >= 0) {
+    const start = raw.lastIndexOf('\x1b[?2026h', end);
+    if (start >= 0) {
+      return cleanCodexTuiFrame(raw.slice(start, end + CODEX_SYNC_MARKER.length));
+    }
+  }
+  return String(cleanText || '');
+}
+
+function currentCodexPickerFrameText(cleanText, rawText = '') {
+  // Picker rows and the composer both use `›`. The generic interactive-frame
+  // slicer starts at the last such glyph and would discard the picker header.
+  if (isCodexActivePickerFrame(String(cleanText || ''))) {
+    return String(cleanText || '');
+  }
+  return latestCodexSynchronizedFrameText(cleanText, rawText);
+}
+
+function codexPickerFrameIsComposer(cleanText, rawText = '') {
+  const current = currentCodexPickerFrameText(cleanText, rawText);
+  return isCodexPickerFrameComposer(current);
+}
+
+function codexGlobalConfigPath() {
+  return codexConfigPathForProfile(null);
+}
+
+async function readCodexModelEffortConfigProof(expected, {
+  configPath = codexGlobalConfigPath(),
+  verifyConfig = verifyCodexTopLevelConfig,
+} = {}) {
+  try {
+    const text = await fs.promises.readFile(configPath, 'utf8');
+    return {
+      success: true,
+      configPath,
+      fingerprint: crypto.createHash('sha256').update(text).digest('hex'),
+      parsed: parseCodexTopLevelConfig(text),
+      verification: verifyConfig(text, expected),
+    };
+  } catch (error) {
+    return {
+      success: false,
+      configPath,
+      error: error?.message || String(error),
+      verification: null,
+    };
+  }
+}
+
+function waitForCodexModelEffortConfig(expected, {
+  timeoutMs = 5000,
+  logPrefix = '[Codex:Picker]',
+  configPath = codexGlobalConfigPath(),
+  verifyConfig = verifyCodexTopLevelConfig,
+} = {}) {
+  if (!configPath) {
+    return Promise.resolve({
+      success: false,
+      error: 'codex_active_config_path_unknown',
+      configPath: null,
+    });
+  }
+  const configDir = path.dirname(configPath);
+  const configName = path.basename(configPath);
+  return new Promise((resolve) => {
+    let settled = false;
+    let watcher = null;
+    let timer = null;
+    let checkInflight = false;
+    let checkPending = false;
+    let lastProof = null;
+    let watchError = null;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      try { watcher?.close?.(); } catch {}
+      resolve(result);
+    };
+    const scheduleCheck = (source) => {
+      if (settled) return;
+      if (checkInflight) {
+        checkPending = true;
+        return;
+      }
+      checkInflight = true;
+      void (async () => {
+        do {
+          checkPending = false;
+          const proof = await readCodexModelEffortConfigProof(expected, {
+            configPath,
+            verifyConfig,
+          });
+          lastProof = proof;
+          if (proof.success && proof.verification?.matches) {
+            console.log(logPrefix + ' config proof matched source=' + source
+              + ' actual=' + JSON.stringify(proof.verification.actual));
+            finish({
+              success: true,
+              source,
+              configPath,
+              fingerprint: proof.fingerprint,
+              ...proof.verification,
+            });
+            break;
+          }
+        } while (checkPending && !settled);
+        checkInflight = false;
+        if (checkPending && !settled) scheduleCheck('pending-fs-event');
+        if (!settled && watchError) {
+          finish({
+            success: false,
+            error: 'codex_config_watch_unavailable',
+            watchError,
+            configPath,
+            verification: lastProof?.verification || null,
+          });
+        }
+      })();
+    };
+
+    try {
+      watcher = fs.watch(configDir, (_eventType, filename) => {
+        if (!filename || String(filename) === configName) {
+          scheduleCheck('fs.watch');
+        }
+      });
+      watcher.on('error', (error) => {
+        watchError = error?.message || String(error);
+        scheduleCheck('watch-error');
+      });
+    } catch (error) {
+      watchError = error?.message || String(error);
+    }
+
+    timer = setTimeout(() => {
+      void readCodexModelEffortConfigProof(expected, {
+        configPath,
+        verifyConfig,
+      }).then((proof) => {
+        if (proof.success && proof.verification?.matches) {
+          finish({
+            success: true,
+            source: 'deadline-final-read',
+            configPath,
+            fingerprint: proof.fingerprint,
+            ...proof.verification,
+          });
+          return;
+        }
+        finish({
+          success: false,
+          error: 'codex_model_effort_config_not_confirmed',
+          configPath,
+          watchError,
+          verification: proof.verification || lastProof?.verification || null,
+          readError: proof.success ? null : proof.error,
+        });
+      });
+    }, timeoutMs);
+    scheduleCheck('initial-read');
+  });
+}
+
+async function closeCodexPickerToComposer(term, {
+  tabId = null,
+  logPrefix,
+  maxBackSteps = 5,
+  writeGuard = null,
+} = {}) {
+  let escapeCount = 0;
+  let lastFrame = null;
+  while (escapeCount <= maxBackSteps) {
+    const current = await readCodexAuthoritativeScreen(
+      tabId,
+      logPrefix + ':close-precheck#' + (escapeCount + 1),
+    );
+    const rewindFrame = current.success
+      ? classifyManualCodexEnterFrame(current.snapshot)
+      : { kind: 'ordinary-enter', proven: false };
+    const nativeRewindProven = current.success && (
+      rewindFrame.kind === 'native-rewind-confirm'
+      || isCodexNativeRewindFrameText(current.clean)
+    );
+    const activePicker = current.success && isCodexActivePickerFrame(current.clean);
+    const composerProven = current.success
+      && !nativeRewindProven
+      && !activePicker
+      && hasCodexComposerPromptGlyph(current.clean)
+      && isCodexPickerFrameComposer(current.clean);
+    const decision = decideCodexPickerCleanupFrame({
+      screenAvailable: current.success,
+      nativeRewindProven,
+      activePicker,
+      composerProven,
+    });
+
+    if (decision.action === 'done') {
+      return {
+        success: true,
+        steps: escapeCount,
+        frame: lastFrame,
+        screen: current,
+        reason: decision.reason,
+      };
+    }
+    if (decision.action !== 'escape-picker' || escapeCount >= maxBackSteps) {
+      console.warn(logPrefix + ' picker cleanup stopped before write'
+        + ' reason=' + decision.reason
+        + ' escapes=' + escapeCount);
+      return {
+        success: false,
+        error: 'Codex picker cleanup stopped safely: ' + decision.reason,
+        reason: decision.reason,
+        steps: escapeCount,
+        frame: lastFrame,
+        screen: current,
+      };
+    }
+
+    escapeCount += 1;
+    const frame = await sendCodexKeyAndCapture(
+      term,
+      '\x1b',
+      2200,
+      logPrefix + ':close#' + escapeCount,
+      (clean, raw) => raw.includes(CODEX_SYNC_MARKER)
+        || codexPickerFrameIsComposer(clean, raw),
+      {
+        settleMs: 120,
+        tabId,
+        authoritativeScreen: !!tabId,
+        writeGuard,
+        writePhase: 'picker-close-' + escapeCount,
+      },
+    );
+    lastFrame = frame;
+    if (frame.writeAborted) {
+      return {
+        success: false,
+        error: frame.error,
+        admissionRejected: true,
+        manualTakeover: frame.manualTakeover,
+        frame,
+      };
+    }
+  }
+  return { success: false, error: 'Codex picker could not return to composer safely' };
+}
+
+async function ensureCodexPickerFrame(term, initialFrame, {
+  tabId = null,
+  parseState,
+  timeoutMs = 3000,
+  logPrefix,
+}) {
+  const initialState = parseState(initialFrame?.clean || '');
+  if (initialState.items.length > 0) {
+    return { frame: initialFrame, state: initialState };
+  }
+  const frame = await captureCodexFrame(term, {
+    timeoutMs,
+    logPrefix,
+    tabId,
+    authoritativeScreen: !!tabId,
+    predicate: (clean) => parseState(clean).items.length > 0,
+  });
+  return { frame, state: parseState(frame.clean) };
 }
 
 async function selectCodexModelEffort(term, {
   tabId,
   model,
   effort,
+  configPath,
   hasDraft = null,
   draftSource = '',
   draftPreview = '',
   visualHasDraft = null,
   visualSource = '',
   visualPreview = '',
+  writeGuard = null,
+  readDraftState = null,
 }) {
   const logPrefix = '[Codex:Picker:' + tabId + ']';
   const t0 = Date.now();
   console.log(logPrefix + ' start model=' + model + ' effort=' + (effort || 'skip') + ' hasDraft=' + hasDraft + ' draftSource=' + (draftSource || 'n/a') + ' draftPreview=' + JSON.stringify(String(draftPreview || '').slice(0, 120)) + ' visualHasDraft=' + visualHasDraft + ' visualSource=' + (visualSource || 'n/a') + ' visualPreview=' + JSON.stringify(String(visualPreview || '').slice(0, 120)));
 
   const shouldRestoreDraft = hasDraft === true;
+  const effortApplicationMode = codexEffortApplicationMode(effort);
+  const conversationOnlyEffort =
+    effortApplicationMode === CODEX_EFFORT_APPLICATION_CONVERSATION;
   let slashSubmitted = false;
   let outcome = null;
+  let pickerMayBeOpen = false;
+  const confirmPersistentSelection = async (planScopeApplied = false) => {
+    const expected = {
+      model,
+      model_reasoning_effort: effort,
+      ...(planScopeApplied ? { plan_mode_reasoning_effort: effort } : {}),
+    };
+    const proof = await waitForCodexModelEffortConfig(expected, {
+      timeoutMs: planScopeApplied ? 7000 : 5000,
+      logPrefix,
+      configPath,
+    });
+    if (!proof.success) {
+      console.warn(logPrefix + ' config proof failed expected=' + JSON.stringify(expected)
+        + ' actual=' + JSON.stringify(proof.verification?.actual || null)
+        + ' error=' + (proof.error || 'unknown'));
+    }
+    return proof;
+  };
+  const confirmConversationFallback = async () => {
+    const proof = await readCodexModelEffortConfigProof({}, { configPath });
+    const persistentModel = typeof proof.parsed?.model === 'string'
+      ? proof.parsed.model.trim()
+      : '';
+    const persistentEffort = typeof proof.parsed?.model_reasoning_effort === 'string'
+      ? proof.parsed.model_reasoning_effort.trim().toLowerCase()
+      : '';
+    const validEffort = [
+      'none',
+      'minimal',
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ].includes(persistentEffort);
+    const success = proof.success
+      && !!persistentModel
+      && normalizeCodexMigrationModelLabel(persistentModel)
+        === normalizeCodexMigrationModelLabel(model)
+      && validEffort;
+    if (!success) {
+      console.warn(logPrefix + ' conversation fallback proof failed config=' + (configPath || '-')
+        + ' model=' + (persistentModel || '-')
+        + ' effort=' + (persistentEffort || '-')
+        + ' readError=' + (proof.error || '-'));
+    }
+    return {
+      success,
+      persistentModel: success ? persistentModel : null,
+      persistentEffort: success ? persistentEffort : null,
+      configProof: proof,
+    };
+  };
 
   if (hasDraft !== false && hasDraft !== true) {
     return { success: false, error: 'Cannot determine Codex input state safely' };
   }
+  if (!String(effort || '').trim()) {
+    return { success: false, error: 'Codex effort is required when changing model' };
+  }
 
   if (shouldRestoreDraft) {
-    const stashResult = await stashCodexDraftForPicker(term, { logPrefix, draftPreview });
+    const stashResult = await stashCodexDraftForPicker(term, {
+      tabId,
+      logPrefix,
+      draftPreview,
+      writeGuard,
+    });
     if (!stashResult.success) {
       return {
         success: false,
@@ -24618,22 +28698,21 @@ async function selectCodexModelEffort(term, {
     const openCapture = captureCodexFrame(term, {
       timeoutMs: 6000,
       logPrefix: logPrefix + ':open',
-      predicate: (clean) => {
-        if (!/Select Model/i.test(clean)) return false;
-        const state = parseCodexNumberedPicker(clean);
-        if (state.items.length < 2) return false;
-        const hasTarget = state.items.some(item => codexLineContainsCandidate(item.label || item.value, model));
-        return hasTarget || state.items.length >= 4;
-      },
+      tabId,
+      authoritativeScreen: true,
+      predicate: (clean) => parseCodexTopModelPicker(clean).items.length > 0
+        || parseCodexAllModelPicker(clean).items.length > 0,
     });
     const slashResult = await sendCodexSlashCommand(term, '/model', logPrefix + ':open-command', {
       clearStrategy: 'line',
+      writeGuard,
     });
     if (!slashResult.success) {
       outcome = slashResult;
       return slashResult;
     }
     slashSubmitted = true;
+    pickerMayBeOpen = true;
     const modelFrame = await openCapture;
     if (modelFrame.timedOut) {
       console.warn(logPrefix + ' model menu capture timed out. clean=' + JSON.stringify(modelFrame.clean.slice(0, 500)));
@@ -24641,82 +28720,621 @@ async function selectCodexModelEffort(term, {
       return outcome;
     }
 
-    const effortPredicate = effort
-      ? (clean) => parseCodexEffortPicker(clean).items.length > 0
-      : null;
-    const modelResult = await selectCodexPickerItem(term, {
-      kind: 'model',
-      target: model,
-      initialFrame: modelFrame,
-      timeoutMs: 5000,
-      confirmPredicate: effortPredicate,
-      logPrefix,
+    let topModelPicker = parseCodexTopModelPicker(modelFrame.clean);
+    let allModelPicker = parseCodexAllModelPicker(modelFrame.clean);
+    let modelPlan = planCodexModelSelection(model, {
+      topPicker: topModelPicker.items.length > 0 ? topModelPicker : null,
+      allModelPicker: allModelPicker.items.length > 0 ? allModelPicker : null,
     });
-    if (!modelResult.success) {
-      outcome = modelResult;
-      return modelResult;
-    }
-
-    let effortResult = null;
-    let parsedEffortOptions = [];
-    if (effort) {
-      let effortFrame = modelResult.frame;
-      let effortState = parseCodexEffortPicker(effortFrame.clean);
-      if (effortState.items.length === 0) {
-        const lateFrame = await captureCodexFrame(term, {
-          timeoutMs: 2500,
-          logPrefix: logPrefix + ':effort-late',
-          predicate: effortPredicate,
-        });
-        const lateState = parseCodexEffortPicker(lateFrame.clean);
-        if (lateState.items.length > 0) {
-          effortFrame = lateFrame;
-          effortState = lateState;
-        }
+    let allModelFrame = modelFrame;
+    const observedModelOptions = [];
+    const appendModelOptions = (picker) => {
+      for (const item of picker?.items || []) {
+        if (!item.value || item.value === CODEX_ALL_MODELS_VALUE) continue;
+        if (!observedModelOptions.includes(item.value)) observedModelOptions.push(item.value);
       }
-      if (effortState.items.length > 0) {
-        parsedEffortOptions = effortState.items.map(item => item.value);
-        effortResult = await selectCodexPickerItem(term, {
-          kind: 'effort',
-          target: effort,
-          parseState: parseCodexEffortPicker,
-          initialFrame: effortFrame,
-          timeoutMs: 5000,
-          logPrefix,
-        });
-        if (!effortResult.success) {
-          outcome = effortResult;
-          return effortResult;
-        }
-      } else {
-        console.log(logPrefix + ' no effort picker after model confirm; clean=' + JSON.stringify(effortFrame.clean.slice(0, 500)));
+    };
+    appendModelOptions(topModelPicker);
+    appendModelOptions(allModelPicker);
+
+    // ListSelectionView keeps the selected row visible and can clip rows above
+    // it. Ctrl+A is Codex 0.145's deterministic "jump to top" key for that
+    // same full-model list (not a separate picker). Re-read the authoritative
+    // screen once before declaring a top-row target missing.
+    if (allModelPicker.items.length > 0
+      && !allModelPicker.items.some(item => normalizeCodexPickerValue(item.value)
+        === normalizeCodexPickerValue(model))
+      && /\[…\s*\d+\s+lines?\]\s*ctrl\s*\+\s*a\s+view all/i.test(modelFrame.clean)) {
+      const topFrame = await sendCodexKeyAndCapture(
+        term,
+        '\x01',
+        3000,
+        logPrefix + ':all-models-jump-top',
+        (clean) => parseCodexAllModelPicker(clean).items.length > 0,
+        {
+          tabId,
+          authoritativeScreen: true,
+          writeGuard,
+          writePhase: 'all-models-jump-top',
+        },
+      );
+      if (topFrame.writeAborted) {
         outcome = {
           success: false,
-          error: 'Codex effort picker did not appear after model selection',
-          model: modelResult.selected,
-          modelOptions: modelResult.options,
-          effortOptions: parsedEffortOptions,
+          error: topFrame.error,
+          admissionRejected: true,
+          manualTakeover: topFrame.manualTakeover,
         };
         return outcome;
       }
+      if (!topFrame.timedOut) {
+        allModelFrame = topFrame;
+        allModelPicker = parseCodexAllModelPicker(topFrame.clean);
+        appendModelOptions(allModelPicker);
+        modelPlan = planCodexModelSelection(model, {
+          topPicker: topModelPicker.items.length > 0 ? topModelPicker : null,
+          allModelPicker: allModelPicker.items.length > 0 ? allModelPicker : null,
+        });
+      }
     }
 
-    console.log(logPrefix + ' done in ' + (Date.now() - t0) + 'ms model=' + modelResult.selected + ' effort=' + (effortResult?.selected || 'skipped'));
+    if (modelPlan.route === 'all-models-nested') {
+      const allModelsResult = await selectCodexPickerItem(term, {
+        tabId,
+        kind: 'model navigation',
+        target: CODEX_ALL_MODELS_VALUE,
+        parseState: parseCodexTopModelPicker,
+        initialFrame: modelFrame,
+        timeoutMs: 5000,
+        confirmPredicate: (clean) => parseCodexAllModelPicker(clean).items.length > 0,
+        logPrefix,
+        writeGuard,
+      });
+      if (!allModelsResult.success) {
+        outcome = allModelsResult;
+        return outcome;
+      }
+      const ensuredAllModels = await ensureCodexPickerFrame(term, allModelsResult.frame, {
+        tabId,
+        parseState: parseCodexAllModelPicker,
+        timeoutMs: 3000,
+        logPrefix: logPrefix + ':all-models-late',
+      });
+      allModelFrame = ensuredAllModels.frame;
+      allModelPicker = ensuredAllModels.state;
+      appendModelOptions(allModelPicker);
+      if (!allModelPicker.items.some(item => normalizeCodexPickerValue(item.value)
+          === normalizeCodexPickerValue(model))
+        && /\[…\s*\d+\s+lines?\]\s*ctrl\s*\+\s*a\s+view all/i.test(allModelFrame.clean)) {
+        const topFrame = await sendCodexKeyAndCapture(
+          term,
+          '\x01',
+          3000,
+          logPrefix + ':nested-all-models-jump-top',
+          (clean) => parseCodexAllModelPicker(clean).items.length > 0,
+          {
+            tabId,
+            authoritativeScreen: true,
+            writeGuard,
+            writePhase: 'nested-all-models-jump-top',
+          },
+        );
+        if (topFrame.writeAborted) {
+          outcome = {
+            success: false,
+            error: topFrame.error,
+            admissionRejected: true,
+            manualTakeover: topFrame.manualTakeover,
+          };
+          return outcome;
+        }
+        if (!topFrame.timedOut) {
+          allModelFrame = topFrame;
+          allModelPicker = parseCodexAllModelPicker(topFrame.clean);
+          appendModelOptions(allModelPicker);
+        }
+      }
+      modelPlan = planCodexModelSelection(model, {
+        topPicker: topModelPicker,
+        allModelPicker,
+      });
+    }
+
+    if (!modelPlan.available || !modelPlan.complete) {
+      outcome = {
+        success: false,
+        error: 'Codex model option not found: ' + model,
+        modelOptions: observedModelOptions,
+      };
+      return outcome;
+    }
+
+    const modelPickerFrame = modelPlan.route === 'top-model-direct'
+      ? modelFrame
+      : allModelFrame;
+    const modelParser = modelPlan.route === 'top-model-direct'
+      ? parseCodexTopModelPicker
+      : parseCodexAllModelPicker;
+    const modelResult = await selectCodexPickerItem(term, {
+      tabId,
+      kind: 'model',
+      target: model,
+      parseState: modelParser,
+      initialFrame: modelPickerFrame,
+      timeoutMs: 5000,
+      confirmPredicate: (clean, raw) => {
+        const current = currentCodexPickerFrameText(clean, raw);
+        return parseCodexStandardEffortPicker(current).items.length > 0
+          || parseCodexPlanReasoningScopePicker(current).items.length > 0
+          || codexModelEffortConfirmationObservedInFrame(
+            clean,
+            raw,
+            model,
+            effort,
+          );
+      },
+      logPrefix,
+      writeGuard,
+    });
+    if (!modelResult.success) {
+      outcome = modelResult;
+      return outcome;
+    }
+
+    const modelSelectionFrame = currentCodexPickerFrameText(
+      modelResult.frame?.clean,
+      modelResult.frame?.raw,
+    );
+    const directPlanScopePicker = parseCodexPlanReasoningScopePicker(modelSelectionFrame);
+    if (directPlanScopePicker.items.length > 0) {
+      const directPlan = planCodexEffortSelection(effort, {
+        standardPicker: null,
+        advancedPicker: null,
+        planScopePicker: directPlanScopePicker,
+      });
+      if (!directPlan.available || !directPlan.complete) {
+        outcome = {
+          success: false,
+          error: 'Codex direct Plan effort could not be proven: ' + (directPlan.reason || 'unknown'),
+          model: modelResult.selected,
+          modelOptions: observedModelOptions,
+          effortOptions: directPlan.options || [],
+        };
+        return outcome;
+      }
+      const directScopeResult = await selectCodexPickerItem(term, {
+        tabId,
+        kind: 'Plan reasoning scope',
+        target: CODEX_PLAN_SCOPE_ALL_MODES_VALUE,
+        parseState: parseCodexPlanReasoningScopePicker,
+        initialFrame: {
+          ...(modelResult.frame || {}),
+          clean: modelSelectionFrame,
+        },
+        timeoutMs: 5000,
+        confirmPredicate: (clean, raw) => {
+          return codexModelEffortConfirmationObservedInFrame(
+            clean,
+            raw,
+            model,
+            effort,
+          );
+        },
+        logPrefix,
+        writeGuard,
+      });
+      if (!directScopeResult.success) {
+        outcome = {
+          ...directScopeResult,
+          model: modelResult.selected,
+          effort,
+          modelOptions: observedModelOptions,
+          effortOptions: directPlan.options || [effort],
+        };
+        return outcome;
+      }
+      pickerMayBeOpen = false;
+      const configProof = await confirmPersistentSelection(true);
+      if (!configProof.success) {
+        outcome = {
+          success: false,
+          appliedMaybe: true,
+          applied: true,
+          applicationProofSource: 'tui-model-ack',
+          applicationMode: effortApplicationMode,
+          persistenceConfirmed: false,
+          error: 'Codex changed the picker selection, but its saved model/effort state was not confirmed',
+          model: modelResult.selected,
+          effort,
+          planScope: 'global-default-and-plan-mode',
+          configProof,
+        };
+        return outcome;
+      }
+      outcome = {
+        success: true,
+        model: modelResult.selected,
+        effort,
+        modelOptions: observedModelOptions,
+        effortOptions: directPlan.options || [effort],
+        // Codex skipped the intermediate effort menu, not the effort itself:
+        // the Plan-scope prompt named and confirmed the requested value.
+        effortSkipped: false,
+        confirmation: 'direct-plan-scope-config-proven',
+        applicationMode: effortApplicationMode,
+        applicationProofSource: 'config:' + configProof.source,
+        planScope: 'global-default-and-plan-mode',
+        configProofSource: configProof.source,
+      };
+      return outcome;
+    }
+    if (codexModelEffortConfirmationObservedInFrame(
+      modelResult.frame?.clean,
+      modelResult.frame?.raw,
+      model,
+      effort,
+    )) {
+      pickerMayBeOpen = false;
+      if (conversationOnlyEffort) {
+        const fallbackProof = await confirmConversationFallback();
+        outcome = {
+          success: fallbackProof.success,
+          applied: !fallbackProof.success || undefined,
+          model: modelResult.selected,
+          effort,
+          persistentModel: fallbackProof.persistentModel,
+          persistentEffort: fallbackProof.persistentEffort,
+          modelOptions: observedModelOptions,
+          effortOptions: [effort],
+          effortSkipped: false,
+          confirmation: 'conversation-only-effort-applied',
+          applicationMode: effortApplicationMode,
+          applicationProofSource: 'tui-conversation-ack',
+          persistenceConfirmed: fallbackProof.success,
+          configProof: fallbackProof.configProof,
+          ...(!fallbackProof.success ? {
+            error: 'Codex enabled Ultra for this conversation, but its persistent fallback was not confirmed',
+          } : {}),
+        };
+        return outcome;
+      }
+      const configProof = await confirmPersistentSelection(false);
+      if (!configProof.success) {
+        outcome = {
+          success: false,
+          appliedMaybe: true,
+          applied: true,
+          applicationProofSource: 'tui-model-ack',
+          applicationMode: effortApplicationMode,
+          persistenceConfirmed: false,
+          error: 'Codex reported the model change, but its saved model/effort state was not confirmed',
+          model: modelResult.selected,
+          effort,
+          configProof,
+        };
+        return outcome;
+      }
+      outcome = {
+        success: true,
+        model: modelResult.selected,
+        effort,
+        modelOptions: observedModelOptions,
+        effortOptions: [effort],
+        effortSkipped: false,
+        confirmation: 'single-effort-applied',
+        applicationMode: effortApplicationMode,
+        applicationProofSource: 'config:' + configProof.source,
+        configProofSource: configProof.source,
+      };
+      return outcome;
+    }
+
+    const ensuredStandard = await ensureCodexPickerFrame(term, modelResult.frame, {
+      tabId,
+      parseState: parseCodexStandardEffortPicker,
+      timeoutMs: 3000,
+      logPrefix: logPrefix + ':effort-late',
+    });
+    let standardEffortPicker = ensuredStandard.state;
+    if (standardEffortPicker.items.length === 0) {
+      outcome = {
+        success: false,
+        error: 'Codex effort picker did not appear after model selection',
+        model: modelResult.selected,
+        modelOptions: observedModelOptions,
+        effortOptions: [],
+      };
+      return outcome;
+    }
+
+    let advancedEffortPicker = null;
+    let effortPlan = planCodexEffortSelection(effort, {
+      standardPicker: standardEffortPicker,
+      advancedPicker: null,
+    });
+    let effortResult = null;
+    if (effortPlan.route === 'advanced-nested') {
+      const moreReasoningResult = await selectCodexPickerItem(term, {
+        tabId,
+        kind: 'advanced reasoning navigation',
+        target: CODEX_MORE_REASONING_VALUE,
+        parseState: parseCodexStandardEffortPicker,
+        initialFrame: ensuredStandard.frame,
+        timeoutMs: 5000,
+        confirmPredicate: (clean) => parseCodexAdvancedEffortPicker(clean).items.length > 0,
+        logPrefix,
+        writeGuard,
+      });
+      if (!moreReasoningResult.success) {
+        outcome = {
+          ...moreReasoningResult,
+          model: modelResult.selected,
+          modelOptions: observedModelOptions,
+          effortOptions: unionCodexEffortOptions(standardEffortPicker),
+        };
+        return outcome;
+      }
+      const ensuredAdvanced = await ensureCodexPickerFrame(term, moreReasoningResult.frame, {
+        tabId,
+        parseState: parseCodexAdvancedEffortPicker,
+        timeoutMs: 3000,
+        logPrefix: logPrefix + ':advanced-effort-late',
+      });
+      advancedEffortPicker = ensuredAdvanced.state;
+      effortPlan = planCodexEffortSelection(effort, {
+        standardPicker: standardEffortPicker,
+        advancedPicker: advancedEffortPicker,
+      });
+      if (!effortPlan.available || !effortPlan.complete) {
+        outcome = {
+          success: false,
+          error: 'Codex effort option not found: ' + effort,
+          model: modelResult.selected,
+          modelOptions: observedModelOptions,
+          effortOptions: unionCodexEffortOptions(standardEffortPicker, advancedEffortPicker),
+        };
+        return outcome;
+      }
+      effortResult = await selectCodexPickerItem(term, {
+        tabId,
+        kind: 'advanced effort',
+        target: effort,
+        parseState: parseCodexAdvancedEffortPicker,
+        initialFrame: ensuredAdvanced.frame,
+        timeoutMs: 5000,
+        confirmPredicate: (clean, raw) => {
+          const current = currentCodexPickerFrameText(clean, raw);
+          if (conversationOnlyEffort) {
+            return codexModelEffortConfirmationObservedInFrame(
+              clean,
+              raw,
+              model,
+              effort,
+            );
+          }
+          return codexModelEffortConfirmationObservedInFrame(
+            clean,
+            raw,
+            model,
+            effort,
+          )
+            || parseCodexPlanReasoningScopePicker(current).items.length > 0;
+        },
+        logPrefix,
+        writeGuard,
+      });
+    } else {
+      if (!effortPlan.available || !effortPlan.complete) {
+        outcome = {
+          success: false,
+          error: 'Codex effort option not found: ' + effort,
+          model: modelResult.selected,
+          modelOptions: observedModelOptions,
+          effortOptions: unionCodexEffortOptions(standardEffortPicker),
+        };
+        return outcome;
+      }
+      effortResult = await selectCodexPickerItem(term, {
+        tabId,
+        kind: 'effort',
+        target: effort,
+        parseState: parseCodexStandardEffortPicker,
+        initialFrame: ensuredStandard.frame,
+        timeoutMs: 5000,
+        confirmPredicate: (clean, raw) => {
+          const current = currentCodexPickerFrameText(clean, raw);
+          return codexModelEffortConfirmationObservedInFrame(
+            clean,
+            raw,
+            model,
+            effort,
+          )
+            || parseCodexPlanReasoningScopePicker(current).items.length > 0;
+        },
+        logPrefix,
+        writeGuard,
+      });
+    }
+    if (!effortResult?.success) {
+      outcome = effortResult || { success: false, error: 'Codex effort selection failed' };
+      return outcome;
+    }
+
+    if (conversationOnlyEffort) {
+      pickerMayBeOpen = false;
+      const fallbackProof = await confirmConversationFallback();
+      const parsedEffortOptions = unionCodexEffortOptions(
+        standardEffortPicker,
+        advancedEffortPicker,
+        effortResult.options,
+      );
+      console.log(logPrefix + ' done in ' + (Date.now() - t0)
+        + 'ms model=' + modelResult.selected
+        + ' effort=' + effortResult.selected
+        + ' application=conversation-only');
+      outcome = {
+        success: fallbackProof.success,
+        applied: !fallbackProof.success || undefined,
+        model: modelResult.selected,
+        effort: effortResult.selected,
+        persistentModel: fallbackProof.persistentModel,
+        persistentEffort: fallbackProof.persistentEffort,
+        modelOptions: observedModelOptions,
+        effortOptions: parsedEffortOptions,
+        effortSkipped: false,
+        confirmation: 'conversation-only-effort-applied',
+        applicationMode: effortApplicationMode,
+        applicationProofSource: 'tui-conversation-ack',
+        persistenceConfirmed: fallbackProof.success,
+        configProof: fallbackProof.configProof,
+        planScope: null,
+        ...(!fallbackProof.success ? {
+          error: 'Codex enabled Ultra for this conversation, but its persistent fallback was not confirmed',
+        } : {}),
+      };
+      return outcome;
+    }
+
+    const planScopeFrame = currentCodexPickerFrameText(
+      effortResult.frame?.clean,
+      effortResult.frame?.raw,
+    );
+    const planScopePicker = parseCodexPlanReasoningScopePicker(planScopeFrame);
+    if (planScopePicker.items.length > 0) {
+      const scopeResult = await selectCodexPickerItem(term, {
+        tabId,
+        kind: 'Plan reasoning scope',
+        target: CODEX_PLAN_SCOPE_ALL_MODES_VALUE,
+        parseState: parseCodexPlanReasoningScopePicker,
+        initialFrame: {
+          ...(effortResult.frame || {}),
+          clean: planScopeFrame,
+        },
+        timeoutMs: 5000,
+        confirmPredicate: (clean, raw) => {
+          return codexModelEffortConfirmationObservedInFrame(
+            clean,
+            raw,
+            model,
+            effort,
+          );
+        },
+        logPrefix,
+        writeGuard,
+      });
+      if (!scopeResult.success) {
+        outcome = {
+          ...scopeResult,
+          model: modelResult.selected,
+          effort: effortResult.selected,
+          modelOptions: observedModelOptions,
+          effortOptions: unionCodexEffortOptions(
+            standardEffortPicker,
+            advancedEffortPicker,
+            effortResult.options,
+          ),
+        };
+        return outcome;
+      }
+      effortResult = {
+        ...effortResult,
+        frame: scopeResult.frame,
+        planScope: 'global-default-and-plan-mode',
+      };
+    }
+    pickerMayBeOpen = false;
+    const configProof = await confirmPersistentSelection(!!effortResult.planScope);
+    if (!configProof.success) {
+      outcome = {
+        success: false,
+        appliedMaybe: true,
+        applied: true,
+        applicationProofSource: 'tui-model-ack',
+        applicationMode: effortApplicationMode,
+        persistenceConfirmed: false,
+        error: 'Codex changed the picker selection, but its saved model/effort state was not confirmed',
+        model: modelResult.selected,
+        effort: effortResult.selected,
+        planScope: effortResult.planScope || null,
+        configProof,
+      };
+      return outcome;
+    }
+
+    const parsedEffortOptions = unionCodexEffortOptions(
+      standardEffortPicker,
+      advancedEffortPicker,
+      effortResult.options,
+    );
+    console.log(logPrefix + ' done in ' + (Date.now() - t0) + 'ms model=' + modelResult.selected + ' effort=' + effortResult.selected);
     outcome = {
       success: true,
       model: modelResult.selected,
-      effort: effortResult?.selected || null,
-      modelOptions: modelResult.options,
-      effortOptions: effortResult?.options || parsedEffortOptions,
-      effortSkipped: !!effort && !effortResult,
+      effort: effortResult.selected,
+      modelOptions: observedModelOptions,
+      effortOptions: parsedEffortOptions,
+      effortSkipped: false,
+      confirmation: effortResult.planScope
+        ? 'plan-scope-applied'
+        : 'model-effort-applied',
+      applicationMode: effortApplicationMode,
+      applicationProofSource: 'config:' + configProof.source,
+      planScope: effortResult.planScope || null,
+      configProofSource: configProof.source,
     };
     return outcome;
   } finally {
-    if (shouldRestoreDraft) {
-      if (slashSubmitted && outcome?.success !== true) {
-        try { term.write('\x1b'); } catch {}
+    let inputOwnershipLost = outcome?.manualTakeover === true
+      || outcome?.error === 'codex_input_ownership_changed';
+    if (slashSubmitted && outcome?.success !== true && pickerMayBeOpen && !inputOwnershipLost) {
+      const closeResult = await closeCodexPickerToComposer(term, {
+        tabId,
+        logPrefix,
+        writeGuard,
+      });
+      inputOwnershipLost = closeResult.manualTakeover === true
+        || closeResult.error === 'codex_input_ownership_changed';
+      pickerMayBeOpen = !closeResult.success;
+      if (inputOwnershipLost && outcome && typeof outcome === 'object') {
+        outcome.manualTakeover = true;
+        outcome.admissionRejected = true;
+        outcome.error = 'codex_input_ownership_changed';
+      } else if (!closeResult.success && outcome && typeof outcome === 'object') {
+        outcome.pickerCloseFailed = true;
+        outcome.error = (outcome.error || 'Codex picker failed')
+          + '; picker did not return to composer safely';
       }
-      await restoreCodexDraftAfterPicker(term, { logPrefix, slashSubmitted, expectedPreview: draftPreview });
+    }
+    if (shouldRestoreDraft) {
+      if (!pickerMayBeOpen && !inputOwnershipLost) {
+        const restoreResult = await restoreCodexDraftAfterPicker(term, {
+          tabId,
+          logPrefix,
+          slashSubmitted,
+          expectedPreview: draftPreview,
+          writeGuard,
+          readDraftState,
+        });
+        inputOwnershipLost = restoreResult.manualTakeover === true
+          || restoreResult.error === 'codex_input_ownership_changed';
+        if (!restoreResult?.success && outcome && typeof outcome === 'object') {
+          outcome.draftRestoreFailed = true;
+          outcome.applied = outcome.applied === true || outcome.success === true;
+          outcome.success = false;
+          outcome.manualTakeover = inputOwnershipLost;
+          outcome.admissionRejected = inputOwnershipLost;
+          outcome.error = inputOwnershipLost
+            ? 'Codex model/effort operation yielded to newer terminal input; the previous input text was not restored'
+            : 'Codex model/effort changed, but the previous input text could not be restored safely';
+        }
+      } else if (inputOwnershipLost && outcome?.success === true) {
+        outcome.draftRestoreFailed = true;
+        outcome.applied = true;
+        outcome.success = false;
+        outcome.manualTakeover = true;
+        outcome.admissionRejected = true;
+        outcome.error = 'Codex model/effort operation yielded to newer terminal input; the previous input text was not restored';
+      }
     }
   }
 }
@@ -24731,6 +29349,8 @@ async function sendCodexLiveSlashCommand(term, {
   visualSource = '',
   visualPreview = '',
   turnBusy = false,
+  writeGuard = null,
+  readDraftState = null,
 }) {
   const logPrefix = '[Codex:Slash:' + tabId + ']';
   const text = String(command || '').trim();
@@ -24758,19 +29378,27 @@ async function sendCodexLiveSlashCommand(term, {
   let slashSubmitted = false;
 
   if (shouldRestoreDraft) {
-    const stashResult = await stashCodexDraftForPicker(term, { logPrefix, draftPreview });
+    const stashResult = await stashCodexDraftForPicker(term, {
+      tabId,
+      logPrefix,
+      draftPreview,
+      writeGuard,
+    });
     if (!stashResult.success) {
       return {
         success: false,
-        error: 'Codex draft stash did not confirm prompt state safely',
+        error: stashResult.error || 'Codex draft stash did not confirm prompt state safely',
         draftSource,
         draftPreview,
+        admissionRejected: stashResult.admissionRejected === true,
+        manualTakeover: stashResult.manualTakeover === true,
       };
     }
   } else {
     console.log(logPrefix + ' skip Ctrl+C draft clear; slash command only runs after empty-composer probe');
   }
 
+  let outcome = null;
   try {
     const isFastCommand = /^\/fast(?:\s|$)/i.test(text);
     const slashResult = await sendCodexSlashCommand(term, text, logPrefix + ':command', {
@@ -24780,20 +29408,46 @@ async function sendCodexLiveSlashCommand(term, {
       submitPredicate: isFastCommand
         ? (clean) => !!parseCodexServiceTierFeedback(clean)
         : null,
+      writeGuard,
     });
     if (slashResult.submitted === true) {
       slashSubmitted = true;
     }
-    if (!slashResult.success) {
-      return slashResult;
+    outcome = slashResult;
+    if (slashResult.success) {
+      console.log(logPrefix + ' done command=' + JSON.stringify(text));
     }
-    console.log(logPrefix + ' done command=' + JSON.stringify(text));
-    return slashResult;
   } finally {
     if (shouldRestoreDraft) {
-      await restoreCodexDraftAfterPicker(term, { logPrefix, slashSubmitted, expectedPreview: draftPreview });
+      const restoreResult = await restoreCodexDraftAfterPicker(term, {
+        tabId,
+        logPrefix,
+        slashSubmitted,
+        expectedPreview: draftPreview,
+        writeGuard,
+        readDraftState,
+      });
+      if (!restoreResult?.success) {
+        const inputOwnershipLost = restoreResult.manualTakeover === true
+          || restoreResult.error === 'codex_input_ownership_changed';
+        outcome = {
+          ...(outcome || {}),
+          success: false,
+          applied: slashSubmitted,
+          draftRestoreFailed: true,
+          admissionRejected: inputOwnershipLost
+            || outcome?.admissionRejected === true,
+          manualTakeover: inputOwnershipLost
+            || outcome?.manualTakeover === true,
+          error: inputOwnershipLost
+            ? 'Codex slash command yielded to newer terminal input; the previous input text was not restored'
+            : 'Codex slash command ran, but the previous input text could not be restored safely',
+          draftProof: restoreResult.draftProof || null,
+        };
+      }
     }
   }
+  return outcome || { success: false, error: 'Codex slash command did not produce a result' };
 }
 
 // Gemini Sniper Watcher: watch for new session file creation when gemini starts
@@ -25188,46 +29842,90 @@ async function runCodexCommandFromPayload(sender, payload = {}) {
   const tabId = payload?.tabId;
   if (!tabId) return { success: false, accepted: false, error: 'tabId required' };
   return await runKeyedExclusive(codexLaunchInflight, tabId, async () => {
-    return await runCodexCommandFromPayloadInner(sender, payload);
+    return await runKeyedExclusive(aiShellLaunchInflight, tabId, async () => {
+      return await runCodexCommandFromPayloadInner(sender, payload);
+    });
   });
 }
 
 async function runCodexCommandFromPayloadInner(sender, payload = {}) {
-  const { tabId, command, sessionId, cwd, model, effort, developerInstructions } = payload;
+  const {
+    tabId,
+    command,
+    sessionId,
+    cwd,
+    model,
+    effort,
+    modelSource,
+    effortSource,
+    modelMigrationPending: rendererModelMigrationPending,
+    developerInstructions,
+  } = payload;
+  if (codexRewindRecoveryScanStatus !== 'complete') {
+    // Retry the startup scan once at the launch boundary. A failed DB scan is
+    // "unknown", never proof that no pending destructive operation exists.
+    await recoverPendingCodexNativeRewindHandoffs();
+  }
+  if (codexRewindRecoveryScanStatus !== 'complete') {
+    console.warn('[Codex Runner] launch blocked because Rewind recovery scan is unknown tab='
+      + String(tabId).slice(-12));
+    return {
+      success: false,
+      accepted: false,
+      error: 'codex_rewind_recovery_unknown',
+      reason: 'native_rewind_journal_scan_failed',
+      tabId,
+    };
+  }
+  const pendingRewindHandoff = readPendingCodexNativeRewindHandoff(tabId);
+  if (pendingRewindHandoff) {
+    console.warn('[Codex Runner] launch blocked by unresolved native Rewind tab='
+      + String(tabId).slice(-12)
+      + ' source=' + String(pendingRewindHandoff.sourceSessionId || 'none').slice(0, 8)
+      + ' generation=' + (pendingRewindHandoff.actionGeneration || '-')
+      + ' invalid=' + !!pendingRewindHandoff.invalid);
+    return {
+      success: false,
+      accepted: false,
+      error: 'codex_rewind_recovery_pending',
+      reason: 'native_rewind_writer_handoff_unresolved',
+      tabId,
+      sourceSessionId: pendingRewindHandoff.sourceSessionId || null,
+      journalInvalid: pendingRewindHandoff.invalid === true,
+      journalError: pendingRewindHandoff.error || null,
+    };
+  }
   const term = terminals.get(tabId);
   if (!term) {
     console.error('[Codex Runner] Terminal not found:', tabId);
     return { success: false, error: 'terminal_not_found' };
   }
 
-  // Launch/resume is admitted only from a fresh, successful empty process
-  // snapshot. Renderer/web checks are UX; this main boundary prevents a stale
-  // client or two concurrent calls from typing a second launch command into an
-  // already-live Codex composer. Lookup failure is unknown, never absence.
-  invalidateAiProcessLookupCache(tabId, 'codex');
-  const preLaunchLookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
-  if (preLaunchLookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
-    console.warn('[Codex Runner] launch admission unknown tab=' + String(tabId).slice(-12)
-      + ' error=' + (preLaunchLookup.error?.message || preLaunchLookup.error || 'process_lookup_failed'));
+  // A launch command now begins with Ctrl+C so it cannot concatenate with a
+  // dirty raw-shell line. That byte is destructive in any live TUI, therefore
+  // the permission boundary is stricter than renderer presence: the shell must
+  // be locally idle and a force-fresh process tree must contain no AI child.
+  const shellRunSeqBeforeLaunch = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  const preLaunchAdmission = await proveIdleShellForAgentLaunch(tabId, 'codex', {
+    expectedTerm: term,
+    expectedRunSeq: shellRunSeqBeforeLaunch,
+  });
+  if (!preLaunchAdmission.allowed) {
+    const lookupUnknown = preLaunchAdmission.lookup?.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN;
+    const processFound = preLaunchAdmission.lookup?.status === AI_PROCESS_LOOKUP_STATUS.FOUND;
+    console.warn('[Codex Runner] launch blocked tab=' + String(tabId).slice(-12)
+      + ' reason=' + preLaunchAdmission.reason
+      + ' lookup=' + (preLaunchAdmission.lookup?.status || 'not-run'));
     return {
       success: false,
       accepted: false,
-      error: 'process_lookup_failed',
-      lookupUnknown: true,
-      reason: preLaunchLookup.error?.message || 'codex_process_lookup_unknown',
+      error: lookupUnknown
+        ? 'process_lookup_failed'
+        : (processFound ? 'codex_already_running' : 'shell_not_idle'),
+      lookupUnknown,
+      reason: preLaunchAdmission.reason,
       tabId,
-    };
-  }
-  if (preLaunchLookup.status === AI_PROCESS_LOOKUP_STATUS.FOUND) {
-    console.warn('[Codex Runner] launch blocked: live Codex already exists tab=' + String(tabId).slice(-12)
-      + ' pids=' + preLaunchLookup.matches.map((match) => match.pid).join(','));
-    return {
-      success: false,
-      accepted: false,
-      error: 'codex_already_running',
-      reason: 'fresh_process_snapshot_found_existing_codex',
-      tabId,
-      pids: preLaunchLookup.matches.map((match) => match.pid),
+      pids: preLaunchAdmission.lookup?.matches?.map((match) => match.pid) || [],
     };
   }
 
@@ -25255,8 +29953,143 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
     };
   }
   const startedAt = Date.now();
-  const effectiveModel = model || readDefaultCodexSetting('defaultCodexModel');
-  const effectiveEffort = effort || readDefaultCodexSetting('defaultCodexEffort');
+  const launchProjectId = resolveAuthoritativeTabProjectId(tabId);
+  let migrationStateLookup = 'unknown';
+  let durableModelMigrationState = null;
+  let durableModelMigrationPending = false;
+  let migrationRecoveredAtLaunch = false;
+  if (launchProjectId) {
+    try {
+      durableModelMigrationState = projectManager.db.getTabCodexSettingsState(
+        launchProjectId,
+        tabId,
+      );
+      migrationStateLookup = durableModelMigrationState ? 'found' : 'absent';
+      durableModelMigrationPending = durableModelMigrationState?.modelMigrationPending === true;
+    } catch (error) {
+      console.warn('[CodexModelMigration] pending-state read failed tab='
+        + String(tabId).slice(-12)
+        + ' project=' + launchProjectId
+        + ' error=' + (error?.message || String(error)));
+    }
+  }
+  if (migrationStateLookup === 'unknown') {
+    console.warn('[CodexModelMigration] launch blocked because pending state is unknown tab='
+      + String(tabId).slice(-12)
+      + ' project=' + (launchProjectId || '-'));
+    return {
+      success: false,
+      accepted: false,
+      error: 'codex_model_migration_state_unknown',
+      reason: launchProjectId
+        ? 'migration_state_read_failed'
+        : 'tab_project_ownership_unresolved',
+      tabId,
+    };
+  }
+  if (durableModelMigrationPending) {
+    const recovery = await recoverDurableCodexModelMigration(
+      launchProjectId,
+      tabId,
+      durableModelMigrationState,
+    );
+    if (!recovery.success) {
+      console.warn('[CodexModelMigration] launch blocked by unresolved restart recovery tab='
+        + String(tabId).slice(-12)
+        + ' project=' + launchProjectId
+        + ' error=' + recovery.error
+        + ' reason=' + (recovery.reason || '-'));
+      return {
+        success: false,
+        accepted: false,
+        error: recovery.error,
+        reason: recovery.reason || 'migration_restart_recovery_unresolved',
+        tabId,
+      };
+    }
+    durableModelMigrationState = recovery.state;
+    durableModelMigrationPending = recovery.state?.modelMigrationPending === true;
+    migrationRecoveredAtLaunch = true;
+  }
+  const modelMigrationPending = durableModelMigrationPending
+    || (rendererModelMigrationPending === true && !migrationRecoveredAtLaunch);
+  const defaultModelAtLaunch = readDefaultCodexSetting('defaultCodexModel');
+  const defaultEffortAtLaunch = readDefaultCodexSetting('defaultCodexEffort');
+  // Renderer may still hold its localStorage mirror while SQLite hydration is
+  // in flight after a crash/restart. A value labelled "global" is advisory:
+  // main re-reads the durable default instead of trusting that stale mirror.
+  const payloadModelIsGlobal = modelSource === 'global';
+  const payloadEffortIsGlobal = effortSource === 'global';
+  const effectiveSettings = planCodexLaunchSettings({
+    requestedModel: model,
+    requestedEffort: effort,
+    modelSource: payloadModelIsGlobal ? 'global' : modelSource,
+    effortSource: payloadEffortIsGlobal ? 'global' : effortSource,
+    durableDefaultModel: defaultModelAtLaunch,
+    durableDefaultEffort: defaultEffortAtLaunch,
+    modelMigrationPending,
+  });
+  let sourceSettingsProof = { status: 'absent', sourceKind: null };
+  if (normalizedCommand === 'codex-c' || normalizedCommand === 'codex-f') {
+    const sourceKind = normalizedCommand === 'codex-c' ? 'resume' : 'fork';
+    if (!sessionId) {
+      return {
+        success: false,
+        accepted: false,
+        error: 'codex_' + sourceKind + '_source_session_missing',
+        tabId,
+      };
+    }
+    try {
+      const loaded = await codexDataModule._api.loadSessionRecords(sessionId, termCwd);
+      sourceSettingsProof = loaded?.success
+        ? resolveCodexSourceSettingsProof(loaded.records, sessionId)
+        : {
+          status: 'absent',
+          sourceKind: null,
+          reason: loaded?.error || 'source-session-load-failed',
+        };
+    } catch (error) {
+      sourceSettingsProof = {
+        status: 'invalid',
+        sourceKind: null,
+        reason: error?.message || String(error),
+      };
+    }
+  }
+  const commandSettings = planCodexCommandLaunchSettings({
+    command: normalizedCommand,
+    model: effectiveSettings.model,
+    effort: effectiveSettings.effort,
+    sourceSettingsStatus: sourceSettingsProof.status,
+    sourceModel: sourceSettingsProof.model || null,
+    sourceEffort: sourceSettingsProof.effort || null,
+  });
+  if (!commandSettings.allowed) {
+    console.warn('[Codex Runner] command settings proof rejected tab='
+      + String(tabId).slice(-12)
+      + ' command=' + normalizedCommand
+      + ' sourceSession=' + String(sessionId || 'none').slice(0, 8)
+      + ' status=' + sourceSettingsProof.status
+      + ' reason=' + (sourceSettingsProof.reason || '-')
+      + ' error=' + commandSettings.error);
+    return {
+      success: false,
+      accepted: false,
+      error: commandSettings.error,
+      reason: sourceSettingsProof.reason || 'source_settings_not_proven',
+      tabId,
+      sourceSessionId: sessionId || null,
+    };
+  }
+  const effectiveModel = commandSettings.model;
+  const effectiveEffort = commandSettings.effort;
+  const effectiveModelSource = normalizedCommand === 'codex'
+    ? effectiveSettings.modelSource
+    : commandSettings.settingsSource;
+  const effectiveEffortSource = normalizedCommand === 'codex'
+    ? effectiveSettings.effortSource
+    : commandSettings.settingsSource;
   const restartReason = payload.restartReason || 'direct';
   const mcpStartupRestartAttempts = Number(payload.mcpStartupRestartAttempts) || 0;
   const launchId = payload.launchId || ('codex-' + Date.now() + '-' + (++codexLaunchSeq));
@@ -25285,6 +30118,11 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       + ' launch=' + launchId);
   }
   invalidateCodexWriterProof(tabId, 'launch-started:' + launchId);
+  if (codexPendingSettingsProofHandoffs.delete(tabId)) {
+    console.log('[CodexSettingsProof] stale pre-rollout proof cleared at launch tab='
+      + String(tabId).slice(-12)
+      + ' launch=' + launchId);
+  }
   codexLastRunCommandPayload.set(tabId, {
     launchId,
     tabId,
@@ -25293,20 +30131,69 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
     cwd: termCwd,
     model: effectiveModel,
     effort: effectiveEffort,
+    requestedModel: effectiveModel,
+    requestedEffort: effectiveEffort,
+    modelSource: effectiveModelSource,
+    effortSource: effectiveEffortSource,
+    defaultModelAtLaunch,
+    defaultEffortAtLaunch,
+    modelMigrationRecoveryPending: modelMigrationPending,
+    modelMigrationStateLookup: migrationStateLookup,
+    rendererModelMigrationPending: rendererModelMigrationPending === true,
     developerInstructions,
     mcpStartupRestartAttempts,
     startedAt,
   });
   console.log('[Codex Runner] Command:', normalizedCommand, 'tab:', tabId, 'session:', sessionId || 'new', 'cwd:', termCwd, 'model:', effectiveModel || 'default', 'effort:', effectiveEffort || 'default', 'developerInstructionsChars:', developerInstructions ? String(developerInstructions).length : 0, 'restartReason:', restartReason, 'mcpStartupRestarts:', mcpStartupRestartAttempts, 'launchId:', launchId);
 
+  const shellStateBeforeClaim = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
+  if (shellStateBeforeClaim.isRunning === true
+    || Number(shellStateBeforeClaim.runSeq || 0) !== shellRunSeqBeforeLaunch) {
+    releaseCodexResumeSourceLeaseForTab(tabId, 'shell-changed-before-launch-claim', sessionId || null, launchId);
+    return {
+      success: false,
+      accepted: false,
+      error: 'shell_not_idle',
+      reason: 'terminal_command_generation_changed',
+      tabId,
+    };
+  }
+
   codexImageBindings.clear(tabId);
   invalidateAiProcessLookupCache(tabId, 'codex');
-  const commandState = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
+  const commandState = shellStateBeforeClaim;
   commandState.isRunning = true;
   commandState.runSeq = Number(commandState.runSeq || 0) + 1;
   const launchRunSeq = commandState.runSeq;
   clearTerminalCommandOrigin(tabId, commandState, 'codex-run-command');
   terminalCommandState.set(tabId, commandState);
+  if ((normalizedCommand === 'codex-c' || normalizedCommand === 'codex-f')
+    && sourceSettingsProof.status === 'found') {
+    const sourceSettingsHandoff = createPendingCodexSettingsProofHandoff({
+      result: {
+        success: true,
+        applied: true,
+        model: effectiveModel,
+        effort: effectiveEffort,
+        proofAt: startedAt,
+        applicationProofSource: commandSettings.settingsSource,
+        codexSettingsProofSessionId: null,
+      },
+      terminalToken: term,
+      runSeq: launchRunSeq,
+      launchId,
+      appliedAt: startedAt,
+    });
+    if (sourceSettingsHandoff) {
+      codexPendingSettingsProofHandoffs.set(tabId, sourceSettingsHandoff);
+      console.log('[CodexSettingsProof] source launch proof armed tab='
+        + String(tabId).slice(-12)
+        + ' command=' + normalizedCommand
+        + ' runSeq=' + launchRunSeq
+        + ' launch=' + launchId
+        + ' source=' + sourceSettingsHandoff.applicationProofSource);
+    }
+  }
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('terminal:command-started', { tabId, commandType: 'codex' });
   }
@@ -25325,17 +30212,28 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       return;
     }
     clearCodexLaunchPayload(tabId, reason, launchId);
+    if (codexPendingSettingsProofHandoffs.get(tabId)?.launchId === launchId) {
+      codexPendingSettingsProofHandoffs.delete(tabId);
+      console.log('[CodexSettingsProof] source launch proof cleared tab='
+        + String(tabId).slice(-12)
+        + ' launch=' + launchId
+        + ' reason=' + reason);
+    }
     releaseCodexResumeSourceLeaseForTab(tabId, reason, sessionId || null, launchId);
     invalidateCodexWriterProof(tabId, reason + ':' + launchId);
     closeCodexWatcher(tabId, reason);
     closeCodexTurnWatcher(tabId, reason);
     clearCodexTuiReady(tabId, reason);
+    clearCodexStartupAutoEnter(tabId, reason);
+    clearCodexMcpStartupWatchdog(tabId, reason);
     invalidateAiProcessLookupCache(tabId, 'codex');
     const failedState = terminalCommandState.get(tabId);
+    let commandStateRolledBack = false;
     if (failedState && Number(failedState.runSeq || 0) === launchRunSeq) {
       failedState.isRunning = false;
       failedState.lastExitCode = 1;
       terminalCommandState.set(tabId, failedState);
+      commandStateRolledBack = true;
     }
     _webBroadcast(tabId, {
       type: 'snapshot',
@@ -25350,6 +30248,15 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       startupError: error?.message || reason,
       reason,
     });
+    if (commandStateRolledBack && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('terminal:command-finished', {
+        tabId,
+        exitCode: 1,
+        reason,
+        commandType: 'codex',
+        launchRejected: true,
+      });
+    }
   };
   try {
     await beginCodexLaunchObservation(sender, {
@@ -25375,6 +30282,17 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
   } catch (err) {
     console.warn('[Codex Runner] failed to write developer profile tab=' + String(tabId).slice(-12) + ' ' + (err?.message || String(err)));
   }
+  const activeConfigPath = codexConfigPathForProfile(profile);
+  const currentLaunch = codexLastRunCommandPayload.get(tabId);
+  if (currentLaunch?.launchId === launchId) {
+    currentLaunch.profile = profile || null;
+    currentLaunch.configPath = activeConfigPath;
+  }
+  const startupPromptState = codexStartupAutoEnter.get(tabId);
+  if (startupPromptState) {
+    startupPromptState.profile = profile || null;
+    startupPromptState.configPath = activeConfigPath;
+  }
 
   try {
     const cmdLine = buildCodexCommand({
@@ -25386,7 +30304,36 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       developerInstructions: profile ? '' : developerInstructions,
       profile,
     });
-    term.write(cmdLine + '\r');
+    const boundary = await withPtyWriteLock(term, async () => {
+      const admission = await proveIdleShellForAgentLaunch(tabId, 'codex', {
+        expectedTerm: term,
+        expectedRunSeq: launchRunSeq,
+        allowCurrentLaunchClaim: true,
+      });
+      if (!admission.allowed) return { written: false, admission };
+      writeAgentLaunchCommandToIdleShell(term, {
+        tabId,
+        toolType: 'codex',
+        command: cmdLine,
+        launchId,
+      });
+      return { written: true, admission };
+    });
+    if (!boundary.written) {
+      const error = new Error(boundary.admission.reason || 'shell_launch_boundary_rejected');
+      rollbackLaunchSetup('shell-launch-boundary-rejected', error);
+      return {
+        success: false,
+        accepted: false,
+        error: boundary.admission.lookup?.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN
+          ? 'process_lookup_failed'
+          : 'shell_not_idle',
+        lookupUnknown: boundary.admission.lookup?.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN,
+        reason: boundary.admission.reason,
+        tabId,
+        pids: boundary.admission.lookup?.matches?.map((match) => match.pid) || [],
+      };
+    }
   } catch (error) {
     rollbackLaunchSetup('launch-write-error', error);
     throw error;
@@ -25424,13 +30371,45 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
   const shouldQueue = !!(options && (options.queue === true || statusAtSend === 'busy'));
   const handoffId = options && typeof options.handoffId === 'string' ? options.handoffId : null;
   const source = options && typeof options.source === 'string' ? options.source : null;
+  const isPromptQueueSend = typeof source === 'string' && source.includes('prompt-queue');
   const codexSource = source
     ? (source.startsWith('codex-') ? source : 'codex-' + source)
     : (shouldQueue ? 'codex-history-queue' : 'codex-history-send');
   const skipVisibleDraftGuard = !!(options && options.skipVisibleDraftGuard === true);
   console.log('[codex:send-command] Received: tabId=' + tabId + ' queue=' + shouldQueue + ' statusAtSend=' + (statusAtSend || '-') + ' handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' resolvedSource=' + codexSource + ' skipVisibleDraftGuard=' + skipVisibleDraftGuard + ' command="' + command + '"');
   const term = terminals.get(tabId);
-  if (!term) return { success: false, error: 'no_terminal' };
+  if (!term) {
+    if (isPromptQueueSend) {
+      return { success: false, accepted: false, deferred: true, error: 'codex_input_not_ready', detail: 'no_terminal', submitted: false };
+    }
+    return { success: false, error: 'no_terminal' };
+  }
+  if (isPromptQueueSend) {
+    let runtimeSnapshot;
+    try {
+      runtimeSnapshot = await getCodexRuntimeSessionSnapshot(tabId, {
+        reason: 'prompt-queue-send-admission',
+        sender: _event.sender,
+        refreshTuiReady: true,
+      });
+    } catch (error) {
+      console.warn('[codex:send-command] prompt queue admission unknown tab=' + String(tabId).slice(-12)
+        + ' error=' + (error?.message || String(error)));
+      return { success: false, accepted: false, deferred: true, error: 'codex_input_not_ready' };
+    }
+    const queueInputReady = runtimeSnapshot?.liveLifecycle === true
+      && runtimeSnapshot?.sessionStatus === 'active'
+      && runtimeSnapshot?.inputReady === true
+      && runtimeSnapshot?.busy !== true;
+    if (!queueInputReady) {
+      console.log('[codex:send-command] prompt queue waits for input readiness tab=' + String(tabId).slice(-12)
+        + ' status=' + (runtimeSnapshot?.sessionStatus || 'unknown')
+        + ' live=' + String(runtimeSnapshot?.liveLifecycle)
+        + ' inputReady=' + !!runtimeSnapshot?.inputReady
+        + ' busy=' + !!runtimeSnapshot?.busy);
+      return { success: false, accepted: false, deferred: true, error: 'codex_input_not_ready' };
+    }
+  }
   try {
     const result = await safePasteAndSubmit(term, command, {
       submit: true,
@@ -25464,6 +30443,8 @@ ipcMain.handle('codex:select-model-effort', async (_event, {
   tabId,
   model,
   effort,
+  expectedWriterSessionId = null,
+  allowTurnBusy = false,
   hasDraft = null,
   draftSource = '',
   draftPreview = '',
@@ -25471,37 +30452,235 @@ ipcMain.handle('codex:select-model-effort', async (_event, {
   visualSource = '',
   visualPreview = '',
 }) => {
-  console.log('[codex:select-model-effort] Received: tabId=' + tabId + ' model=' + model + ' effort=' + (effort || '') + ' hasDraft=' + hasDraft + ' draftSource=' + (draftSource || 'n/a') + ' draftPreview=' + JSON.stringify(String(draftPreview || '').slice(0, 120)) + ' visualHasDraft=' + visualHasDraft + ' visualSource=' + (visualSource || 'n/a') + ' visualPreview=' + JSON.stringify(String(visualPreview || '').slice(0, 120)));
+  const expectedSettingsWriterSessionId = typeof expectedWriterSessionId === 'string'
+    ? (expectedWriterSessionId.trim() || null)
+    : null;
+  console.log('[codex:select-model-effort] Received: tabId=' + tabId + ' model=' + model + ' effort=' + (effort || '') + ' expectedWriter=' + (expectedSettingsWriterSessionId ? expectedSettingsWriterSessionId.slice(0, 8) : '-') + ' allowTurnBusy=' + (allowTurnBusy === true) + ' hasDraft=' + hasDraft + ' draftSource=' + (draftSource || 'n/a') + ' draftPreview=' + JSON.stringify(String(draftPreview || '').slice(0, 120)) + ' visualHasDraft=' + visualHasDraft + ' visualSource=' + (visualSource || 'n/a') + ' visualPreview=' + JSON.stringify(String(visualPreview || '').slice(0, 120)));
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'terminal not found' };
   if (!model) return { success: false, error: 'model is required' };
+  const activeConfig = await resolveActiveCodexConfigForTab(tabId);
+  if (activeConfig.status !== 'found' || !activeConfig.configPath) {
+    console.warn('[codex:select-model-effort] active config path unknown tab='
+      + String(tabId).slice(-12)
+      + ' status=' + (activeConfig.status || 'unknown')
+      + ' source=' + (activeConfig.source || '-'));
+    return {
+      success: false,
+      error: 'codex_active_config_path_unknown',
+      lookupUnknown: activeConfig.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN,
+    };
+  }
+  const expectedRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  const expectedDiscoveryLaunchId = codexSessionDiscoveryIntents.get(tabId)?.launchId
+    || codexLastRunCommandPayload.get(tabId)?.launchId
+    || null;
+  const requestedInputRevision = getTerminalInputRevision(tabId);
+  const sender = _event.sender;
+  const pickerOperation = {
+    kind: 'codex-model-effort-picker',
+    source: 'codex-select-model-effort',
+    tabId,
+    submitted: false,
+    identityPending: false,
+    manualInputYields: true,
+    // While the request is only queued, Enter still belongs to the existing
+    // composer. After our first guarded control write it acts on the native
+    // picker and must not be reported as a submitted user prompt.
+    manualEnterSubmitsPrompt: true,
+    phase: 'queued',
+    queuedAt: Date.now(),
+  };
 
-  const prev = codexPickerQueue.get(tabId) || Promise.resolve();
-  const next = prev.catch(() => {}).then(async () => {
+  const next = codexSettingsMutationQueue.run(async () => {
     try {
-      return await withPtyWriteLock(term, () => selectCodexModelEffort(term, {
-        tabId,
-        model,
-        effort,
-        hasDraft,
-        draftSource,
-        draftPreview,
-        visualHasDraft,
-        visualSource,
-        visualPreview,
-      }));
+      return await withPtyWriteLock(term, async () => {
+        const readAdmission = (freshHasDraft, expectedInputRevision = null) => {
+          const currentState = terminalCommandState.get(tabId) || null;
+          const currentWriterSessionId = getCodexWriterProofSnapshot(tabId)?.sessionId || null;
+          return validateCodexPickerRuntimeAdmission({
+            sameTerminal: terminals.get(tabId) === term,
+            expectedRunSeq,
+            currentRunSeq: Number(currentState?.runSeq || 0),
+            expectedInputRevision,
+            currentInputRevision: getTerminalInputRevision(tabId),
+            expectedWriterSessionId: expectedSettingsWriterSessionId,
+            currentWriterSessionId,
+            processRunning: currentState?.isRunning === true,
+            hasLiveCodexEvidence: codexHasLivePtySubmitEvidence(tabId),
+            tuiReady: codexTuiReadyTabs.has(tabId),
+            stopping: aiStoppingTabs.get(tabId)?.toolType === 'codex',
+            turnBusy: hasCodexPromptOrTurnInFlight(tabId),
+            allowTurnBusy: allowTurnBusy === true,
+            hasDraft: freshHasDraft,
+          });
+        };
+
+        // The request may have waited behind another picker. Prove that it
+        // still belongs to the exact PTY/process generation before asking the
+        // current screen for its draft state.
+        const runtimeAdmission = readAdmission(false, requestedInputRevision);
+        if (!runtimeAdmission.allowed) {
+          return {
+            success: false,
+            error: runtimeAdmission.reason,
+            admissionRejected: true,
+          };
+        }
+
+        const draftProbeInputRevision = getTerminalInputRevision(tabId);
+        const freshDraft = await requestTerminalCodexDraftState(
+          sender,
+          tabId,
+          'model-effort-picker-write-boundary',
+          700,
+          { mergeRendererPositive: true },
+        );
+        const expectedInputRevision = getTerminalInputRevision(tabId);
+        if (
+          draftProbeInputRevision !== requestedInputRevision
+          || expectedInputRevision !== draftProbeInputRevision
+        ) {
+          return {
+            success: false,
+            error: 'codex_input_ownership_changed',
+            admissionRejected: true,
+            manualTakeover: true,
+          };
+        }
+        const freshHasDraft = freshDraft?.success === true
+          && (freshDraft.hasDraft === true || freshDraft.hasDraft === false)
+          ? freshDraft.hasDraft
+          : null;
+        const finalAdmission = readAdmission(freshHasDraft, expectedInputRevision);
+        if (!finalAdmission.allowed) {
+          console.warn('[codex:select-model-effort] admission rejected tab='
+            + String(tabId).slice(-12)
+            + ' reason=' + finalAdmission.reason
+            + ' draftSource=' + (freshDraft?.source || '-')
+            + ' draftPreview=' + JSON.stringify(String(freshDraft?.preview || '').slice(0, 120)));
+          return {
+            success: false,
+            error: finalAdmission.reason,
+            admissionRejected: true,
+            draftSource: freshDraft?.source || null,
+          };
+        }
+
+        const writeGuard = (phase) => {
+          pickerOperation.phase = phase;
+          pickerOperation.manualEnterSubmitsPrompt = false;
+          const admission = readAdmission(freshHasDraft, expectedInputRevision);
+          if (!admission.allowed) {
+            console.warn('[codex:select-model-effort] write boundary rejected tab='
+              + String(tabId).slice(-12)
+              + ' phase=' + phase
+              + ' reason=' + admission.reason
+              + ' expectedInputRevision=' + expectedInputRevision
+              + ' currentInputRevision=' + getTerminalInputRevision(tabId));
+          }
+          return admission;
+        };
+
+        const result = await selectCodexModelEffort(term, {
+          tabId,
+          model,
+          effort,
+          configPath: activeConfig.configPath,
+          hasDraft: freshHasDraft,
+          draftSource: freshDraft?.source || draftSource,
+          draftPreview: freshDraft?.preview || '',
+          visualHasDraft: freshHasDraft,
+          visualSource: freshDraft?.source || visualSource,
+          visualPreview: freshDraft?.preview || '',
+          writeGuard,
+          readDraftState: () => requestTerminalCodexDraftState(
+            sender,
+            tabId,
+            'model-effort-picker-draft-restore-proof',
+            2200,
+            {
+              waitFor: true,
+              waitTimeoutMs: 1800,
+              mergeRendererPositive: true,
+            },
+          ),
+        });
+        const projectedResult = attachCodexSettingsProofOwner(
+          result,
+          getCodexWriterProofSnapshot(tabId)?.sessionId || null,
+        );
+        if (projectedResult.codexSettingsProofSessionId) {
+          codexPendingSettingsProofHandoffs.delete(tabId);
+        } else {
+          const currentDiscoveryLaunchId = codexSessionDiscoveryIntents.get(tabId)?.launchId
+            || codexLastRunCommandPayload.get(tabId)?.launchId
+            || null;
+          const pendingProof = currentDiscoveryLaunchId === expectedDiscoveryLaunchId
+            ? createPendingCodexSettingsProofHandoff({
+              result: projectedResult,
+              terminalToken: term,
+              runSeq: expectedRunSeq,
+              launchId: expectedDiscoveryLaunchId,
+            })
+            : null;
+          if (pendingProof) {
+            codexPendingSettingsProofHandoffs.set(tabId, pendingProof);
+            console.log('[CodexSettingsProof] pre-rollout proof armed tab='
+              + String(tabId).slice(-12)
+              + ' runSeq=' + expectedRunSeq
+              + ' launch=' + expectedDiscoveryLaunchId
+              + ' source=' + pendingProof.applicationProofSource);
+          }
+        }
+        return projectedResult;
+      }, pickerOperation);
     } catch (error) {
       console.error('[codex:select-model-effort] Error:', error);
-      try { term.write('\x1b'); } catch {}
+      // Do not emit a blind Esc here. A thrown operation may have already
+      // yielded ownership to manual input or a new PTY generation.
       return { success: false, error: error.message };
     }
   });
-  codexPickerQueue.set(tabId, next);
-  try {
-    return await next;
-  } finally {
-    if (codexPickerQueue.get(tabId) === next) codexPickerQueue.delete(tabId);
+  return await next;
+});
+
+ipcMain.handle('codex:get-persistent-model-effort-proof', async (_event, { tabId } = {}) => {
+  if (!tabId) return { success: false, error: 'tabId required' };
+  const activeConfig = await resolveActiveCodexConfigForTab(tabId);
+  if (activeConfig.status !== 'found' || !activeConfig.configPath) {
+    return {
+      success: false,
+      error: 'codex_active_config_path_unknown',
+      lookupUnknown: activeConfig.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN,
+    };
   }
+  const proof = await readCodexModelEffortConfigProof({}, {
+    configPath: activeConfig.configPath,
+  });
+  const model = typeof proof.parsed?.model === 'string' ? proof.parsed.model.trim() : '';
+  const effort = typeof proof.parsed?.model_reasoning_effort === 'string'
+    ? proof.parsed.model_reasoning_effort.trim().toLowerCase()
+    : '';
+  if (!proof.success
+    || !model
+    || !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) {
+    return {
+      success: false,
+      error: 'codex_persistent_model_effort_not_proven',
+      model: model || null,
+      effort: effort || null,
+      configPath: activeConfig.configPath,
+    };
+  }
+  return {
+    success: true,
+    model,
+    effort,
+    configPath: activeConfig.configPath,
+    fingerprint: proof.fingerprint,
+    codexSettingsProofSessionId: getCodexWriterProofSnapshot(tabId)?.sessionId || null,
+  };
 });
 
 ipcMain.handle('codex:send-live-slash-command', async (_event, {
@@ -25521,24 +30700,139 @@ ipcMain.handle('codex:send-live-slash-command', async (_event, {
   if (!String(command || '').trim().startsWith('/')) {
     return { success: false, error: 'slash command is required' };
   }
+  const expectedRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  const requestedInputRevision = getTerminalInputRevision(tabId);
+  const sender = _event.sender;
+  const slashOperation = {
+    kind: 'codex-live-slash-command',
+    source: 'codex-send-live-slash-command',
+    tabId,
+    submitted: false,
+    identityPending: false,
+    manualInputYields: true,
+    // Before our first guarded write a physical Enter still belongs to the
+    // user's existing composer. Afterwards it acts on the TUI control that is
+    // currently visible and must not arm a prompt-delivery audit.
+    manualEnterSubmitsPrompt: true,
+    phase: 'queued',
+    queuedAt: Date.now(),
+  };
 
   const prev = codexPickerQueue.get(tabId) || Promise.resolve();
   const next = prev.catch(() => {}).then(async () => {
     try {
-      return await withPtyWriteLock(term, () => sendCodexLiveSlashCommand(term, {
-        tabId,
-        command,
-        hasDraft,
-        draftSource,
-        draftPreview,
-        visualHasDraft,
-        visualSource,
-        visualPreview,
-        turnBusy,
-      }));
+      return await withPtyWriteLock(term, async () => {
+        const readAdmission = (freshHasDraft, expectedInputRevision = null) => {
+          const currentState = terminalCommandState.get(tabId) || null;
+          return validateCodexPickerRuntimeAdmission({
+            sameTerminal: terminals.get(tabId) === term,
+            expectedRunSeq,
+            currentRunSeq: Number(currentState?.runSeq || 0),
+            expectedInputRevision,
+            currentInputRevision: getTerminalInputRevision(tabId),
+            processRunning: currentState?.isRunning === true,
+            hasLiveCodexEvidence: codexHasLivePtySubmitEvidence(tabId),
+            tuiReady: codexTuiReadyTabs.has(tabId),
+            stopping: aiStoppingTabs.get(tabId)?.toolType === 'codex',
+            turnBusy: hasCodexPromptOrTurnInFlight(tabId),
+            hasDraft: freshHasDraft,
+          });
+        };
+
+        // This request may have waited behind another picker or paste. First
+        // prove that it still targets the same live Codex PTY generation.
+        const runtimeAdmission = readAdmission(false, requestedInputRevision);
+        if (!runtimeAdmission.allowed) {
+          return {
+            success: false,
+            error: runtimeAdmission.reason,
+            admissionRejected: true,
+            manualTakeover: runtimeAdmission.reason === 'codex_input_ownership_changed',
+          };
+        }
+
+        // Caller-provided draft state is only a hint from click time. Re-read
+        // the composer at the exact write boundary and reject if the user
+        // typed while that asynchronous probe was in flight.
+        const draftProbeInputRevision = getTerminalInputRevision(tabId);
+        const freshDraft = await requestTerminalCodexDraftState(
+          sender,
+          tabId,
+          'live-slash-command-write-boundary',
+          700,
+          { mergeRendererPositive: true },
+        );
+        const expectedInputRevision = getTerminalInputRevision(tabId);
+        if (draftProbeInputRevision !== requestedInputRevision
+          || expectedInputRevision !== draftProbeInputRevision) {
+          return {
+            success: false,
+            error: 'codex_input_ownership_changed',
+            admissionRejected: true,
+            manualTakeover: true,
+          };
+        }
+        const freshHasDraft = freshDraft?.success === true
+          && (freshDraft.hasDraft === true || freshDraft.hasDraft === false)
+          ? freshDraft.hasDraft
+          : null;
+        const finalAdmission = readAdmission(freshHasDraft, expectedInputRevision);
+        if (!finalAdmission.allowed) {
+          console.warn('[codex:send-live-slash-command] admission rejected tab='
+            + String(tabId).slice(-12)
+            + ' reason=' + finalAdmission.reason
+            + ' draftSource=' + (freshDraft?.source || '-')
+            + ' draftPreview=' + JSON.stringify(String(freshDraft?.preview || '').slice(0, 120)));
+          return {
+            success: false,
+            error: finalAdmission.reason,
+            admissionRejected: true,
+            manualTakeover: finalAdmission.reason === 'codex_input_ownership_changed',
+            draftSource: freshDraft?.source || null,
+          };
+        }
+
+        const writeGuard = (phase) => {
+          slashOperation.phase = phase;
+          slashOperation.manualEnterSubmitsPrompt = false;
+          const admission = readAdmission(freshHasDraft, expectedInputRevision);
+          if (!admission.allowed) {
+            console.warn('[codex:send-live-slash-command] write boundary rejected tab='
+              + String(tabId).slice(-12)
+              + ' phase=' + phase
+              + ' reason=' + admission.reason
+              + ' expectedInputRevision=' + expectedInputRevision
+              + ' currentInputRevision=' + getTerminalInputRevision(tabId));
+          }
+          return admission;
+        };
+
+        return sendCodexLiveSlashCommand(term, {
+          tabId,
+          command,
+          hasDraft: freshHasDraft,
+          draftSource: freshDraft?.source || draftSource,
+          draftPreview: freshDraft?.preview || '',
+          visualHasDraft: freshHasDraft,
+          visualSource: freshDraft?.source || visualSource,
+          visualPreview: freshDraft?.preview || '',
+          turnBusy: hasCodexPromptOrTurnInFlight(tabId),
+          writeGuard,
+          readDraftState: () => requestTerminalCodexDraftState(
+            sender,
+            tabId,
+            'live-slash-command-draft-restore-proof',
+            2200,
+            {
+              waitFor: true,
+              waitTimeoutMs: 1800,
+              mergeRendererPositive: true,
+            },
+          ),
+        });
+      }, slashOperation);
     } catch (error) {
       console.error('[codex:send-live-slash-command] Error:', error);
-      try { term.write('\x1b'); } catch {}
       return { success: false, error: error.message };
     }
   });
@@ -25929,26 +31223,68 @@ function readClaudeSessionCwdFromFile(filePath) {
   return null;
 }
 
-ipcMain.on('claude:run-command', async (event, { tabId, command, sessionId, forkSessionId, prompt, cdTo }) => {
+async function runClaudeCommandFromPayload(event, payload = {}) {
+  const { tabId, command, sessionId, forkSessionId, prompt, cdTo } = payload;
   console.log('[Claude Runner] Command:', command, 'Tab:', tabId, 'Prompt:', prompt ? `${prompt.slice(0, 50)}...` : 'none');
 
   const term = terminals.get(tabId);
   if (!term) {
     console.error('[Claude Runner] Terminal not found for tab:', tabId);
-    return;
+    return { success: false, accepted: false, error: 'terminal_not_found', tabId };
   }
 
   // Get cwd for this terminal
   const cwd = terminalProjects.get(tabId);
   if (!cwd) {
     console.error('[Claude Runner] CWD not found for tab:', tabId);
-    return;
+    return { success: false, accepted: false, error: 'terminal_cwd_not_found', tabId };
   }
+
+  const shellRunSeqBeforeLaunch = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  const preLaunchAdmission = await proveIdleShellForAgentLaunch(tabId, 'claude', {
+    expectedTerm: term,
+    expectedRunSeq: shellRunSeqBeforeLaunch,
+  });
+  if (!preLaunchAdmission.allowed) {
+    console.warn('[Claude Runner] launch blocked tab=' + String(tabId).slice(-12)
+      + ' reason=' + preLaunchAdmission.reason
+      + ' lookup=' + (preLaunchAdmission.lookup?.status || 'not-run'));
+    return {
+      success: false,
+      accepted: false,
+      error: preLaunchAdmission.lookup?.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN
+        ? 'process_lookup_failed'
+        : 'shell_not_idle',
+      lookupUnknown: preLaunchAdmission.lookup?.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN,
+      reason: preLaunchAdmission.reason,
+      tabId,
+      pids: preLaunchAdmission.lookup?.matches?.map((match) => match.pid) || [],
+    };
+  }
+
+  const proveWriteBoundary = () => proveIdleShellForAgentLaunch(tabId, 'claude', {
+    expectedTerm: term,
+    expectedRunSeq: shellRunSeqBeforeLaunch,
+  });
+  let launchResult = {
+    success: false,
+    accepted: false,
+    error: 'claude_launch_not_written',
+    tabId,
+    command,
+  };
 
   switch (command) {
     case 'claude': {
       // New session — session ID will be detected by SessionBridge (via StatusLine)
       console.log('[Claude Runner] Starting new session for tab:', tabId);
+
+      const boundary = await proveWriteBoundary();
+      if (!boundary.allowed) {
+        console.warn('[Claude Runner] fresh launch boundary rejected tab=' + String(tabId).slice(-12)
+          + ' reason=' + boundary.reason);
+        break;
+      }
 
       // Enable thinking mode detection (will send Tab when prompt appears)
       claudeState.set(tabId, 'WAITING_PROMPT');
@@ -25960,26 +31296,18 @@ ipcMain.on('claude:run-command', async (event, { tabId, command, sessionId, fork
       }
 
       // Always launch claude without prompt (prompt will be sent after Tab)
-      term.write('claude --dangerously-skip-permissions\r');
-      claudeCliActive.set(tabId, true);
-      const commandState = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
-      commandState.isRunning = true;
-      clearTerminalCommandOrigin(tabId, commandState, 'claude-run-command');
-      terminalCommandState.set(tabId, commandState);
-      claudeStartupIntents.set(tabId, { sessionId: null, at: Date.now(), reason: 'claude-run-command' });
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('terminal:command-started', { tabId, commandType: 'claude' });
+      try {
+        writeAgentLaunchCommandToIdleShell(term, {
+          tabId,
+          toolType: 'claude',
+          command: 'claude --dangerously-skip-permissions',
+        });
+      } catch (error) {
+        rollbackClaudeShellLaunchClaims(tabId, { reason: 'fresh-shell-write-failed' });
+        throw error;
       }
-      _webBroadcast(tabId, {
-        type: 'snapshot',
-        sessionId: null,
-        busy: false,
-        sessionStatus: 'starting',
-        starting: true,
-        inputReady: false,
-        toolType: 'claude',
-        commandType: 'claude',
-      });
+      markClaudeShellLaunchStarted(tabId, null, 'claude-run-command');
+      launchResult = { success: true, accepted: true, tabId, command, sessionId: null };
       break;
     }
 
@@ -25996,15 +31324,6 @@ ipcMain.on('claude:run-command', async (event, { tabId, command, sessionId, fork
             ' reason=' + liveOwner.reason);
           break;
         }
-        // Enable thinking mode detection (will send Tab when '>' prompt appears)
-        claudeState.set(tabId, 'WAITING_PROMPT');
-
-        // If prompt provided (e.g. Update API: /model haiku + trigger), queue it for handshake
-        if (prompt && prompt.trim()) {
-          claudePendingPrompt.set(tabId, prompt.trim());
-          console.log('[Claude Runner] Resume prompt queued, will send after prompt detected');
-        }
-
         // Trim accumulated trailing startup slash commands from JSONL BEFORE resume. Safe here
         // (and ONLY here): the previous claude process is dead — nobody will append
         // a child to the record we truncate, so the phantom-parentUuid race that
@@ -26031,19 +31350,40 @@ ipcMain.on('claude:run-command', async (event, { tabId, command, sessionId, fork
           const safe = cdTo.replace(/'/g, "'\\''");
           cmdLine = `cd '${safe}' && ${cmdLine}`;
         }
+        const boundary = await proveWriteBoundary();
+        if (!boundary.allowed) {
+          console.warn('[Claude Runner] resume launch boundary rejected tab=' + String(tabId).slice(-12)
+            + ' reason=' + boundary.reason);
+          break;
+        }
         if (!markClaudePendingJsonlOwner(sessionId, tabId, 'claude-c')) {
           console.warn('[Claude Runner] BLOCKED claude-c pending-lock session=' + sessionId.slice(0, 8) +
             ' tab=' + String(tabId).slice(-12));
           break;
         }
-        term.write(cmdLine + '\r');
-        claudeCliActive.set(tabId, true);
-        console.log('[Claude Runner] claudeCliActive SET for tab', tabId, '(claude-c)');
-
-        // Signal that command started (for Timeline visibility)
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('terminal:command-started', { tabId, commandType: 'claude' });
+        // Enable thinking mode detection only after the destructive shell clear
+        // has been authorized. A rejected launch must not leave WAITING_PROMPT.
+        claudeState.set(tabId, 'WAITING_PROMPT');
+        if (prompt && prompt.trim()) {
+          claudePendingPrompt.set(tabId, prompt.trim());
+          console.log('[Claude Runner] Resume prompt queued, will send after prompt detected');
         }
+        try {
+          writeAgentLaunchCommandToIdleShell(term, {
+            tabId,
+            toolType: 'claude',
+            command: cmdLine,
+          });
+        } catch (error) {
+          rollbackClaudeShellLaunchClaims(tabId, {
+            sessionId,
+            reason: 'resume-shell-write-failed',
+          });
+          throw error;
+        }
+        markClaudeShellLaunchStarted(tabId, sessionId, 'claude-run-command-resume');
+        console.log('[Claude Runner] claudeCliActive SET for tab', tabId, '(claude-c)');
+        launchResult = { success: true, accepted: true, tabId, command, sessionId };
       } else {
         console.error('[Claude Runner] No sessionId for claude-c');
       }
@@ -26095,32 +31435,96 @@ ipcMain.on('claude:run-command', async (event, { tabId, command, sessionId, fork
           const newSessionId = crypto.randomUUID();
           // Copy to the session-cwd project directory so `cd <sessionCwd> && claude --resume`
           // uses the same slug Claude stored in the JSONL and does not show the cwd chooser.
+          let createdDestDir = false;
           if (!fs.existsSync(destDir)) {
             fs.mkdirSync(destDir, { recursive: true });
+            createdDestDir = true;
           }
           const destPath = path.join(destDir, `${newSessionId}.jsonl`);
+          let forkFilePrepared = false;
+          const rollbackForkPreparation = (reason) => {
+            // The clone is the only irreversible fork artifact created before
+            // the final shell admission. Fork markers, Timeline metadata and
+            // imported links deliberately commit only after the PTY write.
+            try {
+              if (forkFilePrepared || fs.existsSync(destPath)) {
+                fs.unlinkSync(destPath);
+                console.warn('[Claude Runner] Rolled back unlaunched fork file id='
+                  + newSessionId.slice(0, 8) + ' reason=' + reason);
+              }
+            } catch (rollbackError) {
+              console.error('[Claude Runner] Failed to remove unlaunched fork file id='
+                + newSessionId.slice(0, 8) + ' reason=' + reason + ' error='
+                + (rollbackError?.message || String(rollbackError)));
+            }
+            if (createdDestDir) {
+              try { fs.rmdirSync(destDir); } catch {}
+            }
+          };
 
           // Get Timeline UUIDs snapshot using Backtrace algorithm
           const entryUuids = parseTimelineUuids(sourcePath);
           console.log('[Claude Runner] Timeline entries:', entryUuids.length);
 
-          fs.copyFileSync(sourcePath, destPath);
-          const rawLines = fs.readFileSync(destPath, 'utf-8').split('\n');
-          const rewritten = rawLines.map(line => {
-            if (!line.trim()) return line;
-            try {
-              const rec = JSON.parse(line);
-              if (rec.sessionId) rec.sessionId = newSessionId;
-              return JSON.stringify(rec);
-            } catch { return line; }
-          });
-          fs.writeFileSync(destPath, rewritten.join('\n'));
+          let rewritten;
+          try {
+            fs.copyFileSync(sourcePath, destPath);
+            const rawLines = fs.readFileSync(destPath, 'utf-8').split('\n');
+            rewritten = rawLines.map(line => {
+              if (!line.trim()) return line;
+              try {
+                const rec = JSON.parse(line);
+                if (rec.sessionId) rec.sessionId = newSessionId;
+                return JSON.stringify(rec);
+              } catch { return line; }
+            });
+            fs.writeFileSync(destPath, rewritten.join('\n'));
+            forkFilePrepared = true;
+          } catch (forkPreparationError) {
+            rollbackForkPreparation('fork-file-preparation-failed');
+            throw forkPreparationError;
+          }
           console.log('[Claude Runner] Copied session file, new ID:', newSessionId);
           console.log('[Claude Runner] From:', sourcePath);
           console.log('[Claude Runner] To:', destPath);
           console.log('[Claude Runner] Session cwd:', sessionCwd);
 
-          // Save fork marker with UUIDs snapshot (always save, even if empty — marks fork at beginning)
+          // Run claude --resume in CURRENT terminal (not new tab!)
+          // This is for claude-f <uuid> - resuming external session.
+          let cmdLine = `claude --dangerously-skip-permissions --resume ${newSessionId}`;
+          if (sessionCwd && sessionCwd.trim()) {
+            const safe = sessionCwd.replace(/'/g, "'\\''");
+            cmdLine = `cd '${safe}' && ${cmdLine}`;
+          }
+          const boundary = await proveWriteBoundary();
+          if (!boundary.allowed) {
+            console.warn('[Claude Runner] fork launch boundary rejected tab=' + String(tabId).slice(-12)
+              + ' reason=' + boundary.reason);
+            rollbackForkPreparation('fork-shell-boundary-rejected:' + boundary.reason);
+            break;
+          }
+          // Enable thinking mode detection only after the raw shell is proven idle.
+          claudeState.set(tabId, 'WAITING_PROMPT');
+          try {
+            writeAgentLaunchCommandToIdleShell(term, {
+              tabId,
+              toolType: 'claude',
+              command: cmdLine,
+            });
+          } catch (error) {
+            rollbackForkPreparation('fork-shell-write-failed');
+            rollbackClaudeShellLaunchClaims(tabId, {
+              sessionId: newSessionId,
+              reason: 'fork-shell-write-failed',
+            });
+            throw error;
+          }
+          markClaudeShellLaunchStarted(tabId, newSessionId, 'claude-run-command-fork');
+          console.log('[Claude Runner] claudeCliActive SET for tab', tabId);
+
+          // Commit durable fork metadata only after the launch bytes were
+          // accepted. A rejected final proof/write therefore leaves no fork
+          // marker, copied Timeline rows, imported links, or orphan JSONL.
           try {
             projectManager.db.saveForkMarker(forkSessionId, newSessionId, entryUuids);
             console.log('[Claude Runner] Fork marker saved with', entryUuids.length, 'UUIDs');
@@ -26146,7 +31550,9 @@ ipcMain.on('claude:run-command', async (event, { tabId, command, sessionId, fork
             console.warn('[Claude Runner] Could not copy timeline metadata:', e.message);
           }
 
-          // Import session_links from other DB (prod↔dev) for the source session chain
+          // Import session_links from other DB (prod↔dev) for the source session chain.
+          // This is also post-acceptance: imported links are not attributable to a
+          // failed fork and must never be left behind by one.
           try {
             const imported = projectManager.db.importSessionLinksFromOtherDb(forkSessionId);
             if (imported > 0) {
@@ -26156,37 +31562,65 @@ ipcMain.on('claude:run-command', async (event, { tabId, command, sessionId, fork
             console.warn('[Claude Runner] Could not import session links:', e.message);
           }
 
-          // Run claude --resume in CURRENT terminal (not new tab!)
-          // This is for claude-f <uuid> - resuming external session
-          // Enable thinking mode detection (will send Tab when '>' prompt appears)
-          claudeState.set(tabId, 'WAITING_PROMPT');
-          let cmdLine = `claude --dangerously-skip-permissions --resume ${newSessionId}`;
-          if (sessionCwd && sessionCwd.trim()) {
-            const safe = sessionCwd.replace(/'/g, "'\\''");
-            cmdLine = `cd '${safe}' && ${cmdLine}`;
-          }
-          term.write(cmdLine + '\r');
-          claudeCliActive.set(tabId, true);
-          console.log('[Claude Runner] claudeCliActive SET for tab', tabId);
-
           // Notify renderer about new session ID
           event.sender.send('claude:session-detected', { tabId, sessionId: newSessionId });
           _notifyClaudeSession(tabId, newSessionId);
           console.log('[Claude Runner] Started claude --resume in current terminal');
+          launchResult = { success: true, accepted: true, tabId, command, sessionId: newSessionId };
         } else {
           console.error('[Claude Runner] Source session not found in ANY project');
           console.error('[Claude Runner] Searched for:', forkSessionId);
-          // Just echo error to terminal
-          term.write(`echo "❌ Session not found: ${forkSessionId}"\r`);
+          // Do not echo into PTY here: the intercepted `claude-f <id>` can
+          // still be sitting unsubmitted in zsh. Appending an error command
+          // would recreate the exact dirty-line concatenation this boundary
+          // exists to prevent. Renderer receives the structured rejection.
+          launchResult = {
+            success: false,
+            accepted: false,
+            error: 'session_not_found',
+            tabId,
+            command,
+            sourceSessionId: forkSessionId,
+          };
         }
       } else {
         console.error('[Claude Runner] No forkSessionId for claude-f');
+        launchResult = {
+          success: false,
+          accepted: false,
+          error: 'fork_session_id_required',
+          tabId,
+          command,
+        };
       }
       break;
 
     default:
       console.error('[Claude Runner] Unknown command:', command);
   }
+  return launchResult;
+}
+
+async function runClaudeCommandSerialized(event, payload = {}) {
+  const tabId = payload?.tabId;
+  if (!tabId) return { success: false, accepted: false, error: 'tabId required' };
+  return await runKeyedExclusive(aiShellLaunchInflight, tabId, async () => {
+    return await runClaudeCommandFromPayload(event, payload);
+  });
+}
+
+ipcMain.on('claude:run-command', async (event, payload = {}) => {
+  const tabId = payload?.tabId;
+  if (!tabId) return;
+  try {
+    await runClaudeCommandSerialized(event, payload);
+  } catch (error) {
+    console.error('[Claude Runner] launch failed tab=' + String(tabId).slice(-12) + ':', error);
+  }
+});
+
+ipcMain.handle('claude:run-command', async (event, payload = {}) => {
+  return await runClaudeCommandSerialized(event, payload);
 });
 
 // ====================== CLAUDE SDK ======================

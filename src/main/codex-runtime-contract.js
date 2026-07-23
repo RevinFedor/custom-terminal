@@ -37,6 +37,81 @@ function createCodexLaunchPendingResult({
   };
 }
 
+function planCodexLaunchSettings({
+  requestedModel = null,
+  requestedEffort = null,
+  modelSource = null,
+  effortSource = null,
+  durableDefaultModel = null,
+  durableDefaultEffort = null,
+  modelMigrationPending = false,
+} = {}) {
+  if (modelMigrationPending === true) {
+    return {
+      model: null,
+      effort: null,
+      modelSource: 'migration-recovery',
+      effortSource: 'migration-recovery',
+    };
+  }
+  const modelFromGlobal = modelSource === 'global';
+  const effortFromGlobal = effortSource === 'global';
+  const model = modelFromGlobal
+    ? (durableDefaultModel || null)
+    : (requestedModel || durableDefaultModel || null);
+  const effort = effortFromGlobal
+    ? (durableDefaultEffort || null)
+    : (requestedEffort || durableDefaultEffort || null);
+  return {
+    model,
+    effort,
+    modelSource: modelFromGlobal
+      ? (durableDefaultModel ? 'global' : 'native')
+      : (requestedModel ? 'tab-or-explicit' : (durableDefaultModel ? 'global' : 'native')),
+    effortSource: effortFromGlobal
+      ? (durableDefaultEffort ? 'global' : 'native')
+      : (requestedEffort ? 'tab-or-explicit' : (durableDefaultEffort ? 'global' : 'native')),
+  };
+}
+
+function planCodexCommandLaunchSettings({
+  command = 'codex',
+  model = null,
+  effort = null,
+  sourceSettingsStatus = 'absent',
+  sourceModel = null,
+  sourceEffort = null,
+} = {}) {
+  if (command === 'codex-c' || command === 'codex-f') {
+    const sourceKind = command === 'codex-c' ? 'resume' : 'fork';
+    if (sourceSettingsStatus !== 'found' || !sourceModel || !sourceEffort) {
+      return {
+        allowed: false,
+        error: sourceSettingsStatus === 'invalid'
+          ? 'codex_' + sourceKind + '_source_settings_invalid'
+          : 'codex_' + sourceKind + '_source_settings_unproven',
+        settingsSource: sourceKind + '-source-jsonl',
+      };
+    }
+    return {
+      allowed: true,
+      model: sourceModel,
+      effort: sourceEffort,
+      settingsSource: sourceKind + '-source-jsonl',
+    };
+  }
+  const normalizedEffort = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
+  return {
+    allowed: true,
+    model: model || null,
+    // Ultra is a live conversation mode, never a default for a new thread.
+    effort: normalizedEffort === 'ultra' ? null : (effort || null),
+    settingsSource: normalizedEffort === 'ultra'
+      ? 'new-thread-without-conversation-only-effort'
+      : 'persistent-fallback',
+  };
+}
+
 function shouldSurfaceCodexStartupTimeout({
   expectedLaunchId = null,
   currentLaunchId = null,
@@ -79,14 +154,42 @@ function createCodexPtySubmitAdmission({
   processRunning = false,
   hasLiveCodexEvidence = false,
   runSeq = 0,
+  stopping = false,
+  inputRevision = null,
 } = {}) {
+  const revision = inputRevision === null
+    ? {}
+    : { inputRevision: Number(inputRevision) };
+  if (stopping === true) {
+    return {
+      available: false,
+      reason: 'codex_process_stopping',
+      runSeq: Number(runSeq) || 0,
+      ...revision,
+    };
+  }
   if (processRunning !== true) {
-    return { available: false, reason: 'codex_process_not_running', runSeq: Number(runSeq) || 0 };
+    return {
+      available: false,
+      reason: 'codex_process_not_running',
+      runSeq: Number(runSeq) || 0,
+      ...revision,
+    };
   }
   if (hasLiveCodexEvidence !== true) {
-    return { available: false, reason: 'codex_tui_not_established', runSeq: Number(runSeq) || 0 };
+    return {
+      available: false,
+      reason: 'codex_tui_not_established',
+      runSeq: Number(runSeq) || 0,
+      ...revision,
+    };
   }
-  return { available: true, reason: null, runSeq: Number(runSeq) || 0 };
+  return {
+    available: true,
+    reason: null,
+    runSeq: Number(runSeq) || 0,
+    ...revision,
+  };
 }
 
 function validateCodexPtySubmitAdmission(token, current = {}) {
@@ -94,7 +197,200 @@ function validateCodexPtySubmitAdmission(token, current = {}) {
   const next = createCodexPtySubmitAdmission(current);
   if (!next.available) return { valid: false, reason: next.reason };
   if (next.runSeq !== token.runSeq) return { valid: false, reason: 'codex_process_generation_changed' };
+  if (
+    token.inputRevision !== undefined
+    && Number(next.inputRevision) !== Number(token.inputRevision)
+  ) {
+    return { valid: false, reason: 'codex_input_ownership_changed' };
+  }
   return { valid: true, reason: null };
+}
+
+function planCodexPickerMovement(selectedIndex, targetIndex) {
+  if (!Number.isInteger(selectedIndex) || selectedIndex < 0) {
+    return {
+      allowed: false,
+      reason: 'codex_picker_selection_unknown',
+      pressCount: 0,
+      key: null,
+    };
+  }
+  if (!Number.isInteger(targetIndex) || targetIndex < 0) {
+    return {
+      allowed: false,
+      reason: 'codex_picker_target_unknown',
+      pressCount: 0,
+      key: null,
+    };
+  }
+  const delta = targetIndex - selectedIndex;
+  return {
+    allowed: true,
+    reason: null,
+    pressCount: Math.abs(delta),
+    key: delta > 0 ? '\x1b[B' : delta < 0 ? '\x1b[A' : null,
+  };
+}
+
+function validateCodexPickerRuntimeAdmission({
+  sameTerminal = false,
+  expectedRunSeq = 0,
+  currentRunSeq = 0,
+  expectedInputRevision = null,
+  currentInputRevision = null,
+  expectedWriterSessionId = null,
+  currentWriterSessionId = null,
+  processRunning = false,
+  hasLiveCodexEvidence = false,
+  tuiReady = false,
+  stopping = false,
+  turnBusy = false,
+  allowTurnBusy = false,
+  hasDraft = null,
+} = {}) {
+  if (sameTerminal !== true) {
+    return { allowed: false, reason: 'codex_terminal_generation_changed' };
+  }
+  if (Number(currentRunSeq) !== Number(expectedRunSeq)) {
+    return { allowed: false, reason: 'codex_process_generation_changed' };
+  }
+  if (expectedInputRevision !== null
+    && Number(currentInputRevision) !== Number(expectedInputRevision)) {
+    return { allowed: false, reason: 'codex_input_ownership_changed' };
+  }
+  if (typeof expectedWriterSessionId === 'string'
+    && expectedWriterSessionId.length > 0
+    && currentWriterSessionId !== expectedWriterSessionId) {
+    return { allowed: false, reason: 'codex_settings_writer_changed' };
+  }
+  if (stopping === true) {
+    return { allowed: false, reason: 'codex_process_stopping' };
+  }
+  if (processRunning !== true) {
+    return { allowed: false, reason: 'codex_process_not_running' };
+  }
+  if (hasLiveCodexEvidence !== true) {
+    return { allowed: false, reason: 'codex_process_not_established' };
+  }
+  if (tuiReady !== true) {
+    return { allowed: false, reason: 'codex_tui_not_ready' };
+  }
+  if (hasDraft !== true && hasDraft !== false) {
+    return { allowed: false, reason: 'codex_draft_state_unknown' };
+  }
+  if (turnBusy === true && hasDraft === true) {
+    return { allowed: false, reason: 'codex_busy_with_draft' };
+  }
+  if (turnBusy === true && allowTurnBusy !== true) {
+    return { allowed: false, reason: 'codex_turn_busy' };
+  }
+  return { allowed: true, reason: null };
+}
+
+function attachCodexSettingsProofOwner(result, currentWriterSessionId = null) {
+  const projectedResult = result && typeof result === 'object'
+    ? result
+    : { success: false, error: 'Codex picker returned no result' };
+  const applicationProven = isCodexSettingsApplicationProven(projectedResult);
+  const normalizedWriterSessionId = typeof currentWriterSessionId === 'string'
+    ? (currentWriterSessionId.trim() || null)
+    : null;
+  return {
+    ...projectedResult,
+    codexSettingsProofSessionId: applicationProven
+      ? normalizedWriterSessionId
+      : null,
+  };
+}
+
+function isCodexSettingsApplicationProven(result) {
+  return !!result && typeof result === 'object' && (
+    result.success === true
+    || (result.applied === true
+      && !!(result.applicationProofSource || result.configProofSource))
+  );
+}
+
+/**
+ * A fresh Codex TUI can accept an exact model/effort picker selection before it
+ * creates its first rollout. Keep that proof volatile until process ownership
+ * identifies the first writer, but bind it to the exact PTY/process/discovery
+ * generation so a restart, Resume replacement, or another tab cannot inherit it.
+ */
+function createPendingCodexSettingsProofHandoff({
+  result = null,
+  terminalToken = null,
+  runSeq = 0,
+  launchId = null,
+  allowTerminalRunGeneration = false,
+  appliedAt = Date.now(),
+} = {}) {
+  const normalizedLaunchId = typeof launchId === 'string'
+    ? launchId.trim()
+    : '';
+  const normalizedRunSeq = Number(runSeq);
+  const model = typeof result?.model === 'string' ? result.model.trim() : '';
+  const effort = typeof result?.effort === 'string' ? result.effort.trim().toLowerCase() : '';
+  const proofAt = Number(result?.proofAt) || Number(appliedAt) || Date.now();
+  if (!isCodexSettingsApplicationProven(result)
+    || result?.codexSettingsProofSessionId
+    || !model
+    || !effort
+    || !Number.isFinite(proofAt)
+    || proofAt <= 0
+    || !terminalToken
+    || !Number.isInteger(normalizedRunSeq)
+    || normalizedRunSeq <= 0
+    || (!normalizedLaunchId && allowTerminalRunGeneration !== true)) {
+    return null;
+  }
+  return {
+    terminalToken,
+    runSeq: normalizedRunSeq,
+    launchId: normalizedLaunchId || null,
+    generationMode: normalizedLaunchId ? 'launch' : 'terminal-run',
+    proofAt,
+    model,
+    effort,
+    applicationProofSource: result.applicationProofSource
+      || result.configProofSource
+      || 'exact-picker-success',
+  };
+}
+
+function consumePendingCodexSettingsProofHandoff(pending, {
+  terminalToken = null,
+  runSeq = 0,
+  launchId = null,
+  writerSessionId = null,
+} = {}) {
+  if (!pending) {
+    return { carry: false, reason: 'pending-proof-missing', nextPending: null };
+  }
+  const normalizedLaunchId = typeof launchId === 'string' ? launchId.trim() : '';
+  const normalizedWriterSessionId = typeof writerSessionId === 'string'
+    ? writerSessionId.trim()
+    : '';
+  let reason = null;
+  if (!terminalToken || pending.terminalToken !== terminalToken) {
+    reason = 'terminal-generation-changed';
+  } else if (Number(pending.runSeq) !== Number(runSeq)) {
+    reason = 'process-generation-changed';
+  } else if (pending.generationMode !== 'terminal-run'
+    && (!normalizedLaunchId || pending.launchId !== normalizedLaunchId)) {
+    reason = 'launch-generation-changed';
+  } else if (!normalizedWriterSessionId) {
+    reason = 'writer-session-unproven';
+  }
+  return {
+    carry: reason === null,
+    reason: reason || 'same-live-generation-first-writer',
+    proof: reason === null
+      ? { model: pending.model, effort: pending.effort, proofAt: pending.proofAt }
+      : null,
+    // Every first-writer admission consumes or invalidates the one-shot proof.
+    nextPending: null,
+  };
 }
 
 function projectCodexRuntimeStatus({
@@ -169,15 +465,23 @@ function isCodexComposerReadyForGuardedSend(status) {
 }
 
 module.exports = {
+  attachCodexSettingsProofOwner,
   codexSessionIdFromAuthoritativeStatus,
+  consumePendingCodexSettingsProofHandoff,
   createCodexLaunchPendingResult,
+  createPendingCodexSettingsProofHandoff,
   createCodexPtySubmitAdmission,
+  isCodexSettingsApplicationProven,
   isCodexComposerReadyForGuardedSend,
   liveLifecycleFromCodexWriterStatus,
+  planCodexCommandLaunchSettings,
+  planCodexLaunchSettings,
+  planCodexPickerMovement,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
   shouldClearCodexLaunchPending,
   shouldHoldCodexStartingOnAbsent,
   shouldSurfaceCodexStartupTimeout,
+  validateCodexPickerRuntimeAdmission,
   validateCodexPtySubmitAdmission,
 };

@@ -2,9 +2,13 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const {
   classifyManualCodexSubmitAfterWriteQueue,
+  classifyCodexBranchWriterHandoffSettlement,
   classifyCodexWriterAdoption,
   classifyCodexProvisionalActionAuthorization,
   classifyCodexWriterHandoffSettlement,
@@ -16,6 +20,7 @@ const {
   resolveCompleteCodexWriterProof,
   resolveCodexUserWriterProof,
   resolveCodexWriterProof,
+  selectCodexNativeRewindWriter,
   isCodexWriterProofOwnershipQuarantined,
   runKeyedExclusive,
   runKeyedSingleFlight,
@@ -23,6 +28,24 @@ const {
 } = require('./codex-writer-ownership');
 
 test('manual Codex Enter loses only to a submitted identity-pending operation or foreign reservation', () => {
+  assert.deepEqual(classifyManualCodexSubmitAfterWriteQueue({
+    activeOperation: { kind: 'codex-model-effort-picker' },
+  }), {
+    suppress: false,
+    bypassQueue: true,
+    reason: 'manual-input-takes-picker',
+  });
+  assert.deepEqual(classifyManualCodexSubmitAfterWriteQueue({
+    activeOperation: {
+      kind: 'codex-live-slash-command',
+      manualInputYields: true,
+    },
+  }), {
+    suppress: false,
+    bypassQueue: true,
+    reason: 'manual-input-takes-picker',
+  });
+
   const queuedFirstSubmit = { identityPending: true, submitted: false };
   assert.equal(classifyManualCodexSubmitAfterWriteQueue({
     precedingOperation: queuedFirstSubmit,
@@ -33,6 +56,7 @@ test('manual Codex Enter loses only to a submitted identity-pending operation or
     precedingOperation: queuedFirstSubmit,
   }), {
     suppress: true,
+    bypassQueue: false,
     reason: 'preceding-first-submit-won',
   });
 
@@ -84,6 +108,29 @@ test('one writable rollout is authoritative even when wrapper and child share it
   assert.equal(proof.status, 'owned');
   assert.equal(proof.filePath, filePath);
   assert.deepEqual(proof.pids, [100, 101]);
+});
+
+test('writer ownership treats symlink aliases as the same sessions directory', (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-writer-path-'));
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+
+  const realRoot = path.join(tempRoot, 'real-codex-home');
+  const aliasRoot = path.join(tempRoot, 'alias-codex-home');
+  const realSessionsDir = path.join(realRoot, 'sessions');
+  const realRolloutDir = path.join(realSessionsDir, '2026', '07', '23');
+  fs.mkdirSync(realRolloutDir, { recursive: true });
+  fs.symlinkSync(realRoot, aliasRoot, 'dir');
+  const realRollout = path.join(realRolloutDir, 'current.jsonl');
+  fs.writeFileSync(realRollout, '{"type":"session_meta"}\n');
+
+  const proof = resolveCodexWriterProof([{
+    pid: 83435,
+    output: `p83435\nf24\nau\nn${realRollout}\n`,
+  }], path.join(aliasRoot, 'sessions'));
+
+  assert.equal(proof.status, 'owned');
+  assert.equal(proof.filePath, fs.realpathSync.native(realRollout));
+  assert.deepEqual(proof.pids, [83435]);
 });
 
 test('multiple writable rollouts are ambiguous and cannot become a binding', () => {
@@ -153,6 +200,277 @@ test('two user TUI writable rollouts remain ambiguous after subagent filtering',
   });
   assert.equal(proof.status, 'ambiguous');
   assert.equal(proof.candidates.length, 2);
+});
+
+test('explicit native Rewind selects the one direct child with exact-generation live proof', async () => {
+  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const source = sessionsDir + '/rollout-source.jsonl';
+  const child = sessionsDir + '/rollout-child.jsonl';
+  const descriptorProof = resolveCodexWriterProof([{
+    pid: 100,
+    output: `p100\nf20\nau\nn${source}\nf21\nau\nn${child}\n`,
+  }], sessionsDir);
+  const metadata = new Map([
+    [source, { meta: { id: 'source', source: 'cli' } }],
+    [child, { meta: { id: 'child', forked_from_id: 'source', source: 'cli' } }],
+  ]);
+  const proof = await resolveCodexUserWriterProof(descriptorProof, {
+    readMetadata: async (filePath) => metadata.get(filePath),
+    isUserSession: () => true,
+    handoff: {
+      kind: 'native-rewind',
+      sourceSessionId: 'source',
+      actionGeneration: 'rewind-7',
+      observerGeneration: 'rewind-7',
+      actionStartedAtMs: 7000,
+      liveProofs: [{
+        sessionId: 'child',
+        actionGeneration: 'rewind-7',
+        kind: 'rollout-created',
+        boundaryAtMs: 7001,
+        observedAtMs: 7002,
+      }],
+    },
+  });
+
+  assert.equal(proof.status, 'owned');
+  assert.equal(proof.filePath, child);
+  assert.equal(proof.handoffProof.sessionId, 'child');
+  assert.equal(proof.handoffProof.lineageRelation, 'direct-child');
+  assert.equal(proof.handoffProof.lineageDepth, 1);
+});
+
+test('explicit native Rewind does not accept a sole still-open source rollout', async () => {
+  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const source = sessionsDir + '/rollout-source.jsonl';
+  const descriptorProof = resolveCodexWriterProof([{
+    pid: 100,
+    output: `p100\nf20\nau\nn${source}\n`,
+  }], sessionsDir);
+  const proof = await resolveCodexUserWriterProof(descriptorProof, {
+    readMetadata: async () => ({ meta: { id: 'source', source: 'cli' } }),
+    isUserSession: () => true,
+    handoff: {
+      kind: 'native-rewind',
+      sourceSessionId: 'source',
+      actionGeneration: 'rewind-source-only',
+      observerGeneration: 'rewind-source-only',
+      actionStartedAtMs: 7100,
+      liveProofs: [],
+    },
+  });
+
+  assert.equal(proof.status, 'ambiguous');
+  assert.equal(proof.reason, 'handoff-branch-unresolved');
+  assert.equal(proof.handoffProof.reason, 'no-proven-descendant');
+});
+
+test('explicit native Rewind accepts a sole child only with exact live proof', async () => {
+  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const child = sessionsDir + '/rollout-child.jsonl';
+  const descriptorProof = resolveCodexWriterProof([{
+    pid: 100,
+    output: `p100\nf20\nau\nn${child}\n`,
+  }], sessionsDir);
+  const common = {
+    readMetadata: async () => ({
+      meta: { id: 'child', forked_from_id: 'source', source: 'cli' },
+    }),
+    isUserSession: () => true,
+  };
+  const withoutProof = await resolveCodexUserWriterProof(descriptorProof, {
+    ...common,
+    handoff: {
+      kind: 'native-rewind',
+      sourceSessionId: 'source',
+      actionGeneration: 'rewind-child-only',
+      observerGeneration: 'rewind-child-only',
+      actionStartedAtMs: 7200,
+      liveProofs: [],
+    },
+  });
+  assert.equal(withoutProof.status, 'ambiguous');
+
+  const withProof = await resolveCodexUserWriterProof(descriptorProof, {
+    ...common,
+    handoff: {
+      kind: 'native-rewind',
+      sourceSessionId: 'source',
+      actionGeneration: 'rewind-child-only',
+      observerGeneration: 'rewind-child-only',
+      actionStartedAtMs: 7200,
+      liveProofs: [{
+        sessionId: 'child',
+        actionGeneration: 'rewind-child-only',
+        kind: 'rollout-created',
+        boundaryAtMs: 7201,
+        observedAtMs: 7202,
+      }],
+    },
+  });
+  assert.equal(withProof.status, 'owned');
+  assert.equal(withProof.filePath, child);
+  assert.equal(withProof.handoffProof.sessionId, 'child');
+});
+
+test('native Rewind can select a proven descendant through a supplied lineage chain', () => {
+  const sourceCandidate = {
+    filePath: '/sessions/source.jsonl',
+    meta: { id: 'source' },
+  };
+  const descendantCandidate = {
+    filePath: '/sessions/grandchild.jsonl',
+    meta: { id: 'grandchild', forked_from_id: 'child' },
+  };
+  const selection = selectCodexNativeRewindWriter(
+    [sourceCandidate, descendantCandidate],
+    {
+      kind: 'native-rewind',
+      sourceSessionId: 'source',
+      actionGeneration: 'rewind-8',
+      observerGeneration: 'rewind-8',
+      actionStartedAtMs: 8000,
+      lineage: [{ sessionId: 'child', forkedFromId: 'source' }],
+      liveProofs: [{
+        sessionId: 'grandchild',
+        actionGeneration: 'rewind-8',
+        kind: 'task-started',
+        boundaryAtMs: 8010,
+        observedAtMs: 8011,
+      }],
+    },
+  );
+
+  assert.equal(selection.status, 'selected');
+  assert.equal(selection.sessionId, 'grandchild');
+  assert.equal(selection.lineageRelation, 'descendant');
+  assert.equal(selection.lineageDepth, 2);
+});
+
+test('native Rewind never chooses a child from lineage or recency alone', () => {
+  const candidates = [
+    { filePath: '/sessions/source.jsonl', meta: { id: 'source' } },
+    {
+      filePath: '/sessions/child.jsonl',
+      meta: { id: 'child', forked_from_id: 'source', timestamp: '2099-01-01T00:00:00.000Z' },
+    },
+  ];
+  const base = {
+    kind: 'native-rewind',
+    sourceSessionId: 'source',
+    actionGeneration: 'rewind-9',
+    observerGeneration: 'rewind-9',
+    actionStartedAtMs: 9000,
+  };
+
+  const withoutLiveProof = selectCodexNativeRewindWriter(candidates, base);
+  assert.equal(withoutLiveProof.status, 'unresolved');
+  assert.equal(withoutLiveProof.reason, 'no-proven-descendant');
+  assert.equal(withoutLiveProof.rejected.find((item) => item.sessionId === 'child')?.reason,
+    'post-action-live-proof-missing');
+
+  const copiedPreActionEvent = selectCodexNativeRewindWriter(candidates, {
+    ...base,
+    liveProofs: [{
+      sessionId: 'child',
+      actionGeneration: 'rewind-9',
+      kind: 'task-started',
+      boundaryAtMs: 8999,
+      observedAtMs: 9001,
+    }],
+  });
+  assert.equal(copiedPreActionEvent.status, 'unresolved');
+});
+
+test('native Rewind rejects stale generations, unrelated writers, and multiple proven descendants', () => {
+  const candidates = [
+    { filePath: '/sessions/source.jsonl', meta: { id: 'source' } },
+    { filePath: '/sessions/child-a.jsonl', meta: { id: 'child-a', forked_from_id: 'source' } },
+    { filePath: '/sessions/child-b.jsonl', meta: { id: 'child-b', forked_from_id: 'source' } },
+    { filePath: '/sessions/unrelated.jsonl', meta: { id: 'unrelated', forked_from_id: 'other' } },
+  ];
+  const proofFor = (sessionId) => ({
+    sessionId,
+    actionGeneration: 'rewind-10',
+    kind: 'rollout-live-append',
+    boundaryAtMs: 10001,
+    observedAtMs: 10002,
+  });
+
+  const stale = selectCodexNativeRewindWriter(candidates, {
+    kind: 'native-rewind',
+    sourceSessionId: 'source',
+    actionGeneration: 'rewind-10',
+    observerGeneration: 'rewind-11',
+    actionStartedAtMs: 10000,
+    liveProofs: [proofFor('child-a')],
+  });
+  assert.equal(stale.reason, 'stale-action-generation');
+
+  const unrelatedOnly = selectCodexNativeRewindWriter(candidates, {
+    kind: 'native-rewind',
+    sourceSessionId: 'source',
+    actionGeneration: 'rewind-10',
+    observerGeneration: 'rewind-10',
+    actionStartedAtMs: 10000,
+    liveProofs: [proofFor('unrelated')],
+  });
+  assert.equal(unrelatedOnly.reason, 'no-proven-descendant');
+
+  const multiple = selectCodexNativeRewindWriter(candidates, {
+    kind: 'native-rewind',
+    sourceSessionId: 'source',
+    actionGeneration: 'rewind-10',
+    observerGeneration: 'rewind-10',
+    actionStartedAtMs: 10000,
+    liveProofs: [proofFor('child-a'), proofFor('child-b')],
+  });
+  assert.equal(multiple.reason, 'multiple-proven-descendants');
+});
+
+test('branch handoff settles only when the adopted writer matches the exact proven generation', () => {
+  const selection = {
+    status: 'selected',
+    sessionId: 'child',
+    actionGeneration: 'rewind-12',
+  };
+  const base = {
+    selection,
+    actionGeneration: 'rewind-12',
+    observerGeneration: 'rewind-12',
+    adoptedSessionId: 'child',
+    adoptionStatus: 'adopted',
+    processRunning: true,
+    tuiReady: true,
+  };
+  assert.deepEqual(classifyCodexBranchWriterHandoffSettlement(base), {
+    sessionStatus: 'active',
+    busy: false,
+    inputReady: true,
+    settled: true,
+    absent: false,
+    branchWriterProven: true,
+    handoffReason: 'proven-descendant',
+  });
+  assert.equal(classifyCodexBranchWriterHandoffSettlement({
+    ...base,
+    turnBusy: true,
+  }).sessionStatus, 'busy');
+
+  const stale = classifyCodexBranchWriterHandoffSettlement({
+    ...base,
+    observerGeneration: 'rewind-13',
+  });
+  assert.equal(stale.sessionStatus, 'starting');
+  assert.equal(stale.settled, false);
+  assert.equal(stale.handoffReason, 'stale-action-generation');
+
+  const wrongWriter = classifyCodexBranchWriterHandoffSettlement({
+    ...base,
+    adoptedSessionId: 'source',
+  });
+  assert.equal(wrongWriter.sessionStatus, 'starting');
+  assert.equal(wrongWriter.handoffReason, 'adopted-session-mismatch');
 });
 
 test('unreadable writable candidate makes the complete writer proof unknown', async () => {

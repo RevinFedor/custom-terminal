@@ -38,7 +38,7 @@ ipcRenderer.invoke('claude:send-command', tabId, '/model sonnet');
 // Aliases: default, sonnet, opus, haiku — работают мгновенно, без рестарта
 ```
 
-Текущая модель определяется из bridge-данных (`claude:bridge-update` → `data.model`).
+Bridge остаётся live-каналом resolved model label для уже связанной сессии: он, например, различает `default`/1M и обычный Opus после stale-session guard. Но это не долговечный источник восстановления и не proof применения `/model`. После restart/Rewind ControlBar восстанавливает выбранные Model/Effort из подтверждённых пар slash-wrapper → stdout в активной JSONL-ветке; bridge может уточнить только live-отображение текущей привязанной сессии.
 
 ## Синхронизация с UI: Serialization & Command Guard
 
@@ -118,12 +118,9 @@ History textarea draft привязан к tabId, а не к mount-cycle пан�
 ### Введение
 Effort Level (уровень интенсивности размышлений) контролирует глубину анализа Claude. Поддерживаются уровни: `auto`, `low`, `medium`, `high`, `max`.
 
-### Особенность: Затемненная индикация (Invisible Intent)
-В отличие от модели, Claude **не транслирует текущий уровень Effort** через bridge-скрипт (ограничение текущей версии CLI).
+### Индикация подтверждённого Effort
 
-- **Локальный трекинг:** Приложение запоминает последний выбор пользователя по `tabId`.
-- **Затемненная индикация:** Активная кнопка Effort отображается с приглушенным фоном (`bg-[#DA7756]/20`), в отличие от ярко-оранжевого цвета моделей.
-- **Смысл:** Это визуально сигнализирует: «это предполагаемое состояние, а не подтвержденный статус от Claude». При перезапуске или ручном вводе команды в терминале индикация сбросится или станет неактуальной.
+Bridge не передаёт Effort, но JSONL сохраняет подтверждение native slash-команды. Поэтому активная pill отражает последнее подтверждённое значение активной ветки текущей сессии, а не renderer-догадку; ручной терминальный ввод и app restart проходят тот же источник. Подробный proof-контракт — в одноимённой секции ниже.
 
 ## Шрамы формата данных (Claude CLI)
 
@@ -168,6 +165,8 @@ Background/stopped Rewind не должен зависеть от mounted render
 - **AI compact / prompt-варианты:** используют тот же selection handler, но после выбора запускают дополнительный AI-путь (`pasteAfter`/compact instruction). Поэтому кнопки в Timeline context menu разделены: default action не делает AI-work, AI-иконка и prompt-стрелка делают.
 
 Rewind preview не является сохранённым состоянием JSONL. Если закрыть Claude/терминал до отправки нового prompt'а из History input и открыть сессию заново, полная история возвращается из исходного transcript. Только настоящий subsequent send создаёт новую durable ветку/хвост, который History сможет показывать как факт, а не preview. Статус `editable-last-prompt` живёт только пока Claude-процесс этой вкладки остаётся в том же live Rewind-состоянии; очистка/изменение textarea само по себе историю не переписывает.
+
+После subsequent send preview очищается не по таймеру и не просто по появлению любой новой строки: History требует, чтобы target исчез из активной `parentUuid`-ветки и появился новый durable user-turn. Иначе stale `I REWOUND` может пережить уже созданную ветку или, наоборот, исчезнуть от служебной JSONL-записи.
 
 Legacy Visual Search Strategy в [`fix-rewind-navigation.md`](fix-rewind-navigation.md) остаётся safety/fallback для случаев, когда TUI-меню не удаётся позиционно сопоставить. Не возвращать старую модель «открыть меню Ctrl+C/Esc → найти lavender RGB → Enter → всегда вставить compact»: она смешивала два разных действия (выбор истории и AI-компактацию) и могла перетереть ожидаемый current input.
 
@@ -253,15 +252,12 @@ ipcRenderer.send('claude:send-command', tabId, '/effort medium');
 // Aliases: low, medium, high
 ```
 
-### Особенность: Затемненная индикация (Invisible Intent)
-В отличие от переключения модели или think mode, Claude **не транслирует текущий уровень Effort** через bridge-скрипт. Это означает:
+### Подтверждённое состояние Model/Effort
 
-- **Локальный трекинг:** Приложение помнит, какой уровень был установлен последний раз, но **не может подтвердить** из bridge, что Claude действительно его принял.
-- **Затемненная индикация:** Кнопка/индикатор Effort отображается с приглушенным стилем (dimmed, меньше яркости), в отличие от ярко-подсвеченной кнопки модели.
-- **Мотивация:** Это визуально сигнализирует пользователю: "это локальное состояние, а не подтвержденный статус от Claude". Если пользователь вернется к приложению через час, кнопка Effort может не отражать реальный уровень в Claude (если он был перезапущен).
+Bridge действительно не передаёт Effort, но это больше не делает значение неподтверждённым renderer-флагом. Claude пишет local-command wrapper и его stdout в JSONL; только прямая пара `/<setting> value` → `Set ...` в активной `parentUuid`-ветке считается применённой. Незавершённый/отменённый picker не меняет UI, ручная команда из терминала видна ControlBar после transcript-события, а после Rewind записи отброшенного будущего не участвуют. Model и Effort восстанавливаются независимо: более новая модель не стирает ранее подтверждённый effort.
 
 ### Защита от двойного срабатывания (Command Guard)
-Как и при переключении модели, Effort отправляется через `safePasteAndSubmit`. Во время отправки команды кнопки Effort, Model и Think **блокируются** флагом `isCommandRunning`. Это предотвращает отправку нескольких команд подряд.
+Model/Effort идут через одну сериализованную транзакцию на PTY: отправка команды, current-frame подтверждение возможного native picker'а и JSONL proof. ControlBar меняет выбранное значение только после успеха; временные sentinels предотвращают дубль startup/manual путей, но сами не подтверждают настройку.
 
 ### Auto-confirm settings dialogs: effort и model
 В **новой директории** (нет сохранённого разрешения) после `/effort N` Claude TUI показывает 2-pos меню:
@@ -279,38 +275,38 @@ the full history gets re-read on your next message.
 
 `/model <X>` показывает тот же класс confirmation menu с заголовком `Switch model?` и highlighted option `❯ 1. Yes, switch to <X>`. Симптом: startup default model доходит до меню, курсор стоит на `Yes`, но процесс визуально «зависает» на подтверждении; при повторном запуске model может пройти, а следующий `/effort max` уже не вводится.
 
-**Решение** (`main.js::ptyProcess.onData` после Session ID detection): detector классифицирует `Change effort level` как `EffortDialog`, `Switch model` как `ModelDialog`, а highlighted строку `❯ 1. Yes, switch to ...` как model fallback. Через 120мс шлёт `\r` в PTY. Cooldown 2с защищает от двойного срабатывания при Ink re-render, но ключ cooldown'а — `${tabId}:${dialogType}`: model-dialog и effort-dialog могут легально идти подряд в одной startup-chain, и общий cooldown на tab подавит второе подтверждение. Cleanup при `ptyProcess.onExit`.
+PTY chunk/renderer-текст теперь только будит проверку. Перед `Enter` main flush'ит headless mirror и заново доказывает, что **текущий** кадр того же PTY всё ещё содержит ожидаемый `EffortDialog`/`ModelDialog`, а generation терминала и ревизия пользовательского ввода не изменились. Только после этого отправляется один `\r`. Cooldown 2с защищает от повторного Enter на Ink re-render и ключуется `${tabId}:${dialogType}`: model-dialog и effort-dialog могут легально идти подряд.
 
 **Шрам: текст в Ink-меню рендерится без литеральных пробелов и не всегда приходит заголовком.** Первая версия effort-матча была `'Change effort level' && 'Yes, switch'`. Падала: Ink TUI заменяет пробелы внутри строки меню на `\x1b[1C` (cursor-forward) — после `stripVTControlCharacters` получается `Yes,switchtolow`. Плюс диалог приходит в **3-5 отдельных PTY-чанках** (заголовок жёлтый, описание серое, опции синие — каждый блок отдельным write), поэтому матч из двух подстрок в пределах одного chunk вообще не имеет шансов. Для effort финальный матч — уникальный `Change effort level`; для model дополнительно нужен strict fallback по highlighted `❯ 1. Yes, switch to`, потому что в одном реальном запуске в логах был виден только option chunk. Не матчить generic `Yes, switch` без `❯`: такой текст может появиться в assistant output.
 
-**Шрам 2026-07-04: chunk-detector недостаточен, когда меню уже собрано в видимом кадре.** В production resume iOS получил 504, хотя Mac-side терминальный экран уже содержал `Switch model? ... ❯1.Yes,switchtoHaiku4.5`; `[ModelDialog] detected, sending Enter` пришёл только позже. Причина была не в «маленьком таймере», а в точке наблюдения: нужные слова не совпали в одном текущем PTY chunk, но уже существовали в assembled visible buffer. Для startup defaults текущий xterm/visible buffer является авторитетным proof того же класса, что raw chunk: пока `/model` ждёт bridge-update или `/effort` ждёт prompt-boundary, слой обязан один раз проверить видимый кадр на `ModelDialog`/`EffortDialog` и нажать Enter, если меню доказано.
+**Шрам 2026-07-04: chunk-detector недостаточен, когда меню уже собрано в видимом кадре.** В production resume iOS получил 504, хотя Mac-side терминальный экран уже содержал `Switch model? ... ❯1.Yes,switchtoHaiku4.5`; `[ModelDialog] detected, sending Enter` пришёл только позже. Причина была не в «маленьком таймере», а в точке наблюдения: нужные слова не совпали в одном текущем PTY chunk, но уже существовали в assembled visible buffer. Пока транзакция ждёт JSONL proof, renderer-buffer может разбудить проверку, но перед Enter main всё равно заново читает свой headless current frame и сверяет поколение PTY/input.
 
-**Задержка 120мс перед `\r`:** ранее было 80 — Ink не успевал дорисовать остаток меню до прихода Enter, и Enter иногда попадал в неопределённое состояние (то срабатывал, то «съедал» prompt). 120мс — post-detection settle после конкретного TUI-события, не primary readiness source. Cooldown — duplicate/error guard, не способ упорядочить startup-chain.
+**Задержка 120мс после output-hint:** это settle перед повторным чтением assembled кадра, не разрешение на Enter. Исторический chunk, старый visible tail или timer closure сами по себе больше не могут подтвердить диалог.
 
 **Принцип:** см. `methodology/переносимый-дизайн.md::Ink TUI: пробелы как ANSI-команды, текст разорван по чанкам`. Любой будущий парсер TUI-вывода для Claude должен матчить **минимальные уникальные подстроки** (одно слово или короткая фраза), не комбинацию из двух — Ink почти гарантированно разнесёт их по чанкам.
 
 ### Startup defaults `/model` + `/effort` при запуске Claude
 
-В StatusBar справа — pills `Model: haiku` / `Effort: max` (defaults per-app, не per-tab). При каждом запуске Claude процесса значения шлются как slash-команды в TUI. Сигнал запуска — **самый ранний детерминированный признак готовности TUI к вводу**, не появление bridge-файла:
+В StatusBar справа — app-level defaults для будущей сессии. Для fresh Claude они заполняют стартовые Model/Effort; для Resume сначала читаются последние подтверждённые значения активной ветки возобновляемой сессии, а defaults заполняют только отсутствующие поля. Ошибка чтения существующей сессии означает `unknown`: startup не инжектит defaults поверх неизвестного состояния Claude.
 
 ```
 Claude рисует prompt-символ ⏵ в PTY → main эмитит claude:tui-ready (~0.8с после старта)
-→ Terminal.tsx handler читает useUIStore.getState().defaultClaudeModel/defaultClaudeEffort
-→ если model ≠ 'none': ставит _modelSentForTab и шлёт /model haiku
-→ ждёт claude:bridge-update, где bridge model совпала с target
-→ если effort ≠ 'none': ставит _effortSentForTab и шлёт /effort max
-→ sentinels гасят дубли между tui-ready, Bridge:Fresh и ручными кликами
+→ Terminal получает session settings из активной JSONL-ветки или defaults для fresh/пустых полей
+→ если model ≠ 'none': шлёт /model <value>, при необходимости подтверждает текущий picker
+→ ждёт прямую JSONL-пару wrapper → local-command stdout
+→ затем так же применяет /effort <value>
+→ sentinels только гасят дубли между tui-ready, Bridge:Fresh и ручными кликами
 ```
 
 `claude:tui-ready` эмитится из того же места `main.js`, где Handshake детектит prompt-символ (`stripVTControlCharacters(data).includes('⏵' | '>')` в state `WAITING_PROMPT`). Это момент когда Claude **готов принять ввод**, а не просто «процесс жив». Принцип «liveness ≠ readiness, бери ранний сигнал» — `methodology/переносимый-дизайн.md::Liveness ≠ readiness`.
 
 Start/resume и последовательное применение `/model`/`/effort` показываются той же компактной lifecycle-плашкой, что запуск Codex: без backdrop и без захвата focus у терминала. Видимое TUI-подтверждение остаётся доступным для ручного управления, но сама плашка держится до authoritative ready или явной ошибки — наличие меню под ней не завершает startup gate.
 
-**Bridge:Fresh (`claude:process-started`) — теперь fallback, не главный путь.** Раньше инжект висел на нём, но `Bridge:Fresh` лагает: bridge.json должен *появиться* → *пережить DeadTranscript-guard* (у свежей сессии JSONL ещё не на диске, guard «ignoring forever» отбрасывает первый bridge) → *PID зарезолвиться в таб*. В проде измерено **3-6 секунд** после старта Claude (сессии tab-2933 `3c4712b9`, tab-2986). `handleProcessStarted` остался как fallback на случай если ⏵ не распарсился (новая версия TUI / кастомный шрифт) — он проверяет sentinel и молчит если tui-ready уже отработал.
+**Bridge:Fresh (`claude:process-started`) — fallback готовности, не proof настройки.** Раньше инжект и завершение `/model` зависели от bridge, но свежий Claude TUI готов принять slash-команду раньше появления bridge-файла, а Effort bridge вообще не содержит. `handleProcessStarted` остаётся fallback, если `⏵` не распарсился, но применённость обоих settings доказывает только JSONL stdout своей команды.
 
-**`/model` completion barrier — bridge-update, не return из `safePasteAndSubmit`.** `safePasteAndSubmit` сериализует paste и ждёт sync-marker render'а; это доказывает что `/model haiku` вставлен и Enter отправлен, но не доказывает что Claude TUI завершил локальную смену модели. Реальный лог tab-3234 (`6f26c93d`, 2026-06-07): `/model haiku` send-command вернулся, через ~4мс стартовал `/effort max`, а `ModelDialog` появился только через ~349мс. Итог: effort paste попадает в период model confirmation и может быть проглочен/направлен не туда. Поэтому цепочка ждёт `claude:bridge-update` с matching model; timeout здесь — failure guard, не разрешение идти дальше.
+**`/model` completion barrier — JSONL local-command stdout, не return из paste и не bridge-update.** Return из отправки доказывает только доставку Enter. Следующий `/effort` разрешён после прямого stdout-ребёнка wrapper'а `/model`; поэтому поздний `Switch model?` не проглатывает effort, а изменение модели через терминал и UI получает один и тот же proof.
 
-**`/effort` completion barrier — prompt boundary после submit.** Для `/effort` нет такого же authoritative bridge-state как для model. Return из `safePasteAndSubmit` означает только «slash-command доставлена и Enter отправлен», но не «Claude вернулся в input после применения effort». Поэтому stopped-session Rewind ждёт следующий OSC 7777 `prompt:<seq>` после `/effort`; только после него `waitForClaudeStartupDefaultsReady` разрешает `/rewind`. Пользовательский симптом нарушения: ПКМ → Rewind на закрытой сессии либо disabled, либо «ничего не происходит», либо `/rewind` появляется до `/effort max` / во время model confirmation.
+**`/effort` completion barrier — та же JSONL-пара.** Native stdout `Set effort level to ...` подтверждает выбор; prompt boundary остаётся отдельным readiness-сигналом для следующего TUI-действия, но не источником значения effort.
 
 После шрама 2026-06-21 boundary proof разделён на два слоя: main-side detector по-прежнему инжектит OSC 7777 marker в PTY для terminal/Timeline, но одновременно отправляет direct `claude:prompt-boundary` event в renderer. `waitForPromptBoundaryAfter` должен просыпаться от direct seq, а не зависеть только от того, что xterm parser успел зарегистрировать marker. См. `fix-boundary-bridge-race.md::Дополнение 2026-06-21`.
 
@@ -318,14 +314,14 @@ Start/resume и последовательное применение `/model`/`
 
 Completion chain для Rewind из остановленной сессии:
 1. Timeline поднимает `claude --resume` той же session id.
-2. `/model <default>` отправляется и подтверждается `claude:bridge-update` с matching model.
-3. `/effort <default>` отправляется только после model-confirm.
-4. После `/effort` ждём новый prompt boundary. Timeout = startup defaults failed, а не 3/6-секундный fallback.
+2. Читаются подтверждённые model/effort этой сессии; app defaults используются только для отсутствующих значений.
+3. `/model <value>` и затем `/effort <value>` подтверждаются своими JSONL stdout.
+4. Startup gate ждёт готовый prompt; timeout = startup settings failed, а не разрешение продолжать.
 5. Только после gate-ready Timeline вызывает native `/rewind`.
 
 **Graveyard — Bridge:Fresh как единственный сигнал → двойной `/effort`.** Пока инжект висел только на `Bridge:Fresh`, юзер видел нарисованный prompt без эффекта (3-6с лага), решал что «эффект не выставился», кликал `/effort` руками в ControlBar → улетал **первый** `/effort`, потом запоздавший Bridge:Fresh догонял **вторым**. В JSONL/scrollback копилось два `/effort max` подряд. Детерминированно подтверждено счётчиками `[EffortDiag][HANDLER-ENTRY] callN` / `[INVOKE-FIRE] invokeN` — handler входил один раз, но первая команда уходила за 391мс **до** него (это был ручной клик). Чинится связкой ранний-сигнал + sentinel ниже.
 
-**Once-per-process sentinels `_modelSentForTab` и `_effortSentForTab`.** Maps `tabId → {at, via}` экспонируются на `window.__modelSentForTab` / `window.__effortSentForTab` для доступа из ControlBar. Любой источник slash-setting (ранний `tui-ready`, fallback `Bridge:Fresh`, ручной клик ControlBar/mobile) первым делом ставит метку; остальные видят её и делают early-return. Сброс — НЕ на `process-started`: tui-ready fires раньше Bridge:Fresh, и если сбрасывать на process-started — затрётся метка раннего пути и fallback пошлёт дубль. Это та же ловушка «liveness как reset-триггер», что и в выборе сигнала.
+**Once-per-process sentinels `_modelSentForTab` и `_effortSentForTab` — только дедупликация.** Любой источник slash-setting (ранний `tui-ready`, fallback `Bridge:Fresh`, ручной клик ControlBar/mobile) первым делом ставит метку; остальные видят её и делают early-return. Отображаемое и восстанавливаемое значение из sentinel не читается. Сброс — НЕ на `process-started`: tui-ready fires раньше Bridge:Fresh, и если сбрасывать там — fallback пошлёт дубль.
 
 **Сброс sentinel'а — на смерти Claude (`command-finished`), не только на смерти shell (`terminal:exit`).** Первая версия чистила `_effortSentForTab` **только** в `handleExit` (PTY exit = shell умер). Но `claude-c` (Continue/restart) **переиспользует тот же shell PTY** — shell не выходит, `terminal:exit` не fires, sentinel от **первого** запуска в жизни таба живёт вечно. Каждый последующий рестарт Claude: `tui-ready` fires → `_effortSentForTab.has(tabId)` → `true` → early-return → `/effort` **молча не отправляется**. Эффект: `/effort` инжектится ровно один раз за всю жизнь вкладки, при рестартах — никогда. Юзер: *«сессию я перезапускал, при перезапуске почему-то автоматически /effort не срабатывал, хотя он установлен системой»*.
 
@@ -374,11 +370,11 @@ Completion chain для Rewind из остановленной сессии:
 
 ### EffortInject kill-switch (`effort=none`) + resume-guard
 
-В StatusBar `Effort` chip поддерживает значение `none` — это **полный kill-switch** для EffortInject: `/effort` paste **не отправляется** на `process-started`. Эффект: при `effort=none` наш main process **ничего не пишет в Claude TUI** автоматически. С момента удаления live cleanup (см. Graveyard №4 выше) этот kill-switch стал почти ритуальным — даже при `effort=max` мы пишем только один paste-keystroke, не модифицируем JSONL. Сохранён для юзеров которые хотят 100% «приложение не вмешивается».
+В StatusBar `Effort=none` означает «не задавать effort по умолчанию для fresh/неопределённой сессии». Это больше не глобальный запрет восстановить уже подтверждённый session-scoped effort: Resume обязан вернуть effort своей сессии даже если app default сейчас `none`. Если чтение session settings упало, состояние `unknown` также не вызывает paste — приложение не угадывает.
 
 **Resume-guard — только на process-started/Bridge:Fresh пути, НЕ на tui-ready.**
 
-**Граветярд ложной предпосылки (горело tab-3234 `6f26c93d`, 2026-06-07).** Первая версия guard'а **полностью** skip'ала инжект на `--resume` под предлогом «при resume Claude TUI восстанавливает effort из in-memory state предыдущей сессии». **Это фактически неверно.** `claude --resume` — это **свежий процесс**, у мёртвого предшественника нет «памяти» которая бы пережила. По декомпилированному исходнику Claude Code (`main.tsx`): `effortValue: parseEffortValue(options.effort) ?? getInitialEffortSetting()`. Мы `--effort` флаг не передаём → fallback на `getInitialEffortSetting()` → `toPersistableEffort(settings.effortLevel)`, который **strip'ает `'max'` на чтении** (комментарий в исходнике: *«filters 'max' for non-ants on read»*). Итог: resumed-сессия **молча теряет max** (и любой session-scoped уровень) — падает на то что лежит в settings.json, а туда `max` не сохраняется (CLI downgrade'ит, см. ниже). Юзер: *«в той сессии effort max не подставлялся при перезапуске, хотя по умолчанию выбран max»*. В логах его сессии: fresh start `isResume=false` → `/effort max` инжектнут, дальше **каждый** рестарт → `SKIP — resume in flight` (и `[Terminal:TuiReady] SKIP — resume in flight` тоже).
+**Граветярд ложной предпосылки (горело tab-3234 `6f26c93d`, 2026-06-07).** Первая версия guard'а полностью skip'ала инжект на `--resume` под предлогом «Claude восстановит effort сам». Это неверно: Resume — свежий процесс, и session-scoped `max`/другой уровень может не пережить запуск через Claude settings. Поэтому безопасный `tui-ready` путь повторно применяет не текущий app default, а последнее подтверждённое значение активной ветки возобновляемой сессии.
 
 **Что guard РЕАЛЬНО защищал.** Incident 2026-05-21 15:09:34 был **paste-race**, не «resume preserves effort»: Bridge:Fresh event и `Terminal:EffortInject` сработали в одну и ту же миллисекунду на `--resume`, `safePasteAndSubmit`'s Ctrl+S stash race'нулся с paste — `[PasteAudit:MISMATCH]` поймал что вместо 11 байт `/effort max` в композер влетели 303 байта старого user prompt'а из buffer. Гонка была на **Bridge:Fresh / process-started** пути — он fires **во время** resume-handshake (bridge.json только появился, PTY ещё может дописывать).
 
@@ -390,10 +386,11 @@ Completion chain для Rewind из остановленной сессии:
 
 | Условие | `/effort` paste | Путь | Лог |
 |---|---|---|---|
-| `effort='none'` | NO | — | `SKIP — effort=none` |
-| `effort=max/.../low` + resume + tui-ready | **YES** | tui-ready | `/effort max (early path)` |
-| `effort=max/.../low` + resume + только Bridge:Fresh | NO | process-started | `SKIP — resume in flight` |
-| `effort=max/.../low` + fresh claude | YES | tui-ready | (обычный flow) |
+| fresh/поле отсутствует + app default `none` | NO | — | `SKIP — effort=none` |
+| Resume + подтверждённый session effort + tui-ready | **YES** | tui-ready | `/effort <session value> (early path)` |
+| Resume + только Bridge:Fresh | NO | process-started | `SKIP — resume in flight` |
+| Чтение session settings = `unknown` | NO | — | `fallback=claude-session-state` |
+| fresh Claude + app default `max/.../low` | YES | tui-ready | (обычный flow) |
 
 ### Click-toggle-off на effort кнопке
 

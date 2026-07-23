@@ -31,6 +31,7 @@ import {
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { RunAfterTabPicker } from './RunAfterTabPicker';
+import ControlHint from '../UI/ControlHint';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -1636,6 +1637,12 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
 
   return (
     <>
+      <ControlHint
+        label={`Открыть Git: ${status.branch}`}
+        shortcut={`${status.changedCount} изменённых файлов`}
+        disabled={open}
+        side="bottom"
+      >
       <button
         ref={triggerRef}
         onClick={() => setOpen((value) => !value)}
@@ -1682,6 +1689,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath }:
           {compactText}
         </span>
       </button>
+      </ControlHint>
 
       {open && pos && createPortal(
         <>

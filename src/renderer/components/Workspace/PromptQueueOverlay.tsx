@@ -2,13 +2,21 @@ import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } fr
 import type { CSSProperties, ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { CheckSquare, ChevronLeft, History, LoaderCircle, PanelRightClose, PanelRightOpen, Paperclip, Plus, RefreshCw, Square, Trash2, TriangleAlert } from 'lucide-react';
-import { buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedImageMarkerHighlightRanges, getQueuedPromptAttachmentState, getShortGrabPromptTitle, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, usePromptQueueStore, type QueuedImageMarkerRange, type QueuedPrompt } from '../../store/usePromptQueueStore';
+import { buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedImageMarkerHighlightRanges, getQueuedPromptAttachmentState, getShortGrabPromptTitle, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, usePromptQueueStore, type QueuedImageMarkerRange, type QueuedImageRef, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { generateTitleFromPromptWithConfig, trimTabTitlePrompt } from '../../utils/generateTabTitle';
+import {
+  collectPromptImageRefIds,
+  getPromptImageAttachmentState,
+  hasMalformedPromptImageMarker,
+  insertPromptImageAttachments,
+} from '../../utils/promptImageAttachments.mjs';
 import { RunAfterTabPicker } from './RunAfterTabPicker';
+import { OrchestrationStatusChip } from './OrchestrationStatusChip';
+import ControlHint from '../UI/ControlHint';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -76,7 +84,8 @@ const EDITOR_TEXTAREA_MIN_HEIGHT = 64;
 const EDITOR_MIN_WIDTH = 280;
 const EDITOR_MIN_HEIGHT = 96;
 const EDITOR_MAX_WIDTH = 760;
-const COLLAPSED_RAIL_WIDTH = 68;
+const COLLAPSED_RAIL_FULL_WIDTH = 66;
+const COLLAPSED_RAIL_COMPACT_WIDTH = 32;
 const COLLAPSED_RAIL_GAP = 4;
 const PANEL_SLIDE_MS = 100;
 
@@ -178,9 +187,18 @@ type Props = {
   // Existing per-tab AI busy state from provider busy-state. We hold the loader's truth.
   agentBusy: boolean;
   rightInset?: number;
+  hideHistoryToggle?: boolean;
+  inputSurface?: 'terminal' | 'history';
 };
 
-export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset = 0 }: Props) {
+export function PromptQueueOverlay({
+  tabId,
+  sessionType,
+  agentBusy,
+  rightInset = 0,
+  hideHistoryToggle = false,
+  inputSurface = 'terminal',
+}: Props) {
   const agentLabel = AGENT_LABEL[sessionType];
   const chipLineClamp = useUIStore((s) => s.promptQueueChipLineClamp);
   const promptQueueChipFontSize = useUIStore((s) => s.promptQueueChipFontSize);
@@ -925,6 +943,11 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     });
   }, [tabId]);
 
+  const focusHistoryComposer = useCallback((reason = 'queue') => {
+    console.log('[PromptQueue] focus History composer tab=' + tabId.slice(-8) + ' reason=' + reason);
+    window.dispatchEvent(new CustomEvent('history-panel:focus-composer', { detail: { tabId } }));
+  }, [tabId]);
+
   // Replay handler — paste chip's text into the agent's current input WITHOUT
   // touching stash. Normal click leaves it for review; Cmd+click also submits
   // immediately (same as user pressing Enter after paste). On success the chip
@@ -962,7 +985,43 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       const payload = buildQueuedPromptPayload(validation.item);
       const submitNow = opts?.submit === true;
       console.log('[PromptQueue] replay start tab=' + tabId.slice(-8) + ' item=' + id.slice(-8) + ' agent=' + sessionType + ' submit=' + submitNow);
-      focusActiveTerminal(submitNow ? 'replay-submit-before-ipc' : 'replay-before-ipc');
+      if (!submitNow && inputSurface === 'history') {
+        const ui = useUIStore.getState();
+        const currentText = ui.historyPromptDrafts[tabId] || '';
+        const currentImages = ui.historyPromptDraftImages[tabId] || [];
+        const separator = !currentText
+          ? ''
+          : currentText.endsWith('\n\n')
+            ? ''
+            : currentText.endsWith('\n')
+              ? '\n'
+              : '\n\n';
+        const insertion = insertPromptImageAttachments({
+          text: currentText,
+          imagePaths: currentImages,
+          start: currentText.length,
+          end: currentText.length,
+          insertedText: separator + validation.item.text,
+          insertedImagePaths: validation.item.imagePaths || [],
+        });
+        if (insertion.missingSourceIds.length > 0) {
+          showToast('Replay failed: image attachment identity is incomplete', 'error');
+          console.warn('[PromptQueue] replay History insertion missing refs tab=' + tabId.slice(-8)
+            + ' item=' + id.slice(-8)
+            + ' ids=' + insertion.missingSourceIds.join(','));
+          return;
+        }
+        ui.setHistoryPromptDraft(tabId, insertion.text, {
+          images: insertion.imagePaths,
+        });
+        removePrompt(tabId, id);
+        focusHistoryComposer('replay-after-history-transfer');
+        console.log('[PromptQueue] replay transferred to History composer tab=' + tabId.slice(-8) + ' item=' + id.slice(-8));
+        return;
+      }
+      if (inputSurface === 'terminal') {
+        focusActiveTerminal(submitNow ? 'replay-submit-before-ipc' : 'replay-before-ipc');
+      }
       const res = await ipcRenderer.invoke(sessionType + ':append-input', tabId, payload, {
         submit: submitNow,
         source: 'prompt-queue-replay',
@@ -985,7 +1044,8 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       // Focus terminal so the user sees the appended text immediately + can
       // submit with Enter. Without this, focus might be on the chip button
       // and the user has to click into the terminal first.
-      focusActiveTerminal('replay-after-ipc');
+      if (inputSurface === 'history') focusHistoryComposer('replay-submit-after-ipc');
+      else focusActiveTerminal('replay-after-ipc');
     } catch (e: unknown) {
       const m = (e as { message?: string })?.message || String(e);
       showToast('Replay failed: ' + m, 'error');
@@ -999,7 +1059,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       });
       replayingIdsRef.current.delete(id);
     }
-  }, [tabId, sessionType, showToast, focusActiveTerminal, removePrompt]);
+  }, [tabId, sessionType, showToast, focusActiveTerminal, focusHistoryComposer, inputSurface, removePrompt]);
 
   useEffect(() => {
     const setCmd = (value: boolean) => {
@@ -1023,8 +1083,59 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
     };
   }, []);
 
+  const enqueueGrabbedPrompt = useCallback(async (
+    text: string,
+    images: number,
+    imagePaths?: QueuedImageRef[],
+  ) => {
+    const shortGrabTitle = getShortGrabPromptTitle(text);
+    const insertPromptTitle = shortGrabTitle ? null : await findSavedInsertPromptTitle(text);
+    const initialTitle = shortGrabTitle || insertPromptTitle;
+    const id = addPrompt(tabId, text, images, imagePaths, initialTitle || undefined);
+    const titleWillGenerate = initialTitle ? false : generateRunAfterTitle(id, text);
+    if (!titleWillGenerate) markAppearing(id);
+  }, [addPrompt, generateRunAfterTitle, markAppearing, tabId]);
+
   const grabCurrent = useCallback(async () => {
     try {
+      if (inputSurface === 'history') {
+        const ui = useUIStore.getState();
+        const raw = ui.historyPromptDrafts[tabId] || '';
+        const text = raw.trim();
+        if (!text) {
+          showToast(agentLabel + ' input is empty', 'warning');
+          focusHistoryComposer('grab-empty-history');
+          return;
+        }
+        const historyImages = ui.historyPromptDraftImages[tabId] || [];
+        const historyImageIds = collectPromptImageRefIds(raw);
+        const historyAttachmentsBlocked = raw.includes('[Image saving…]')
+          || /\[imageError:\s*[^\]\r\n]+\]/i.test(raw)
+          || hasMalformedPromptImageMarker(raw, historyImages)
+          || getPromptImageAttachmentState({
+            text: raw,
+            images: historyImageIds.size,
+            imagePaths: historyImages,
+          }) !== 'ready';
+        if (historyAttachmentsBlocked) {
+          showToast('Wait for the image attachment or repair its marker before moving this prompt', 'warning');
+          focusHistoryComposer('grab-history-image-blocked');
+          return;
+        }
+        const queueImages: QueuedImageRef[] = historyImages.map((ref) => ({
+          id: ref.id,
+          path: ref.path,
+          assetId: ref.assetId,
+          mediaType: ref.mediaType || 'image/png',
+          size: Number(ref.size) || 0,
+          availability: ref.availability,
+          error: ref.error,
+        }));
+        await enqueueGrabbedPrompt(text, queueImages.length, queueImages);
+        useUIStore.getState().setHistoryPromptDraft(tabId, '', { images: [] });
+        focusHistoryComposer('grab-after-history-transfer');
+        return;
+      }
       const res = await ipcRenderer.invoke(sessionType + ':grab-input', tabId);
       if (res && res.success && typeof res.text === 'string') {
         const t = res.text.trim();
@@ -1033,18 +1144,11 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
           focusActiveTerminal('grab-before-read');
           return;
         }
-        const shortGrabTitle = getShortGrabPromptTitle(t);
-        const insertPromptTitle = shortGrabTitle ? null : await findSavedInsertPromptTitle(t);
-        const initialTitle = shortGrabTitle || insertPromptTitle;
-        const id = addPrompt(
-          tabId,
+        await enqueueGrabbedPrompt(
           t,
           res.images || 0,
           Array.isArray(res.imagePaths) ? res.imagePaths : undefined,
-          initialTitle || undefined,
         );
-        const titleWillGenerate = initialTitle ? false : generateRunAfterTitle(id, t);
-        if (!titleWillGenerate) markAppearing(id);
         // No success toast on queue-add — the new chip appearing in the overlay
         // is its own confirmation; the toast was redundant noise (user request).
         // Refocus so the agent re-reads the (now empty) tempfile immediately — without
@@ -1061,7 +1165,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
       showToast(`Grab failed: ${m}`, 'error');
       console.error('[PromptQueue] grab-input error', e);
     }
-  }, [tabId, sessionType, agentLabel, addPrompt, generateRunAfterTitle, markAppearing, showToast, focusActiveTerminal]);
+  }, [tabId, sessionType, agentLabel, enqueueGrabbedPrompt, focusActiveTerminal, focusHistoryComposer, inputSurface, showToast]);
 
   // Copy moved to InfoPanel — see Copy prompt button next to Copy Session.
 
@@ -1165,6 +1269,12 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
   // anchor the editor slideout next to the clicked chip.
   const chipRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const panelOpen = !collapsed || panelClosing;
+  // History is now the primary surface, so its rail toggle is hidden there.
+  // Collapse the former two-column top row to the exact width of one 30px
+  // button plus the 1px parent border on each side; no dead inner padding.
+  const collapsedRailWidth = hideHistoryToggle
+    ? COLLAPSED_RAIL_COMPACT_WIDTH
+    : COLLAPSED_RAIL_FULL_WIDTH;
   const arrowExpanded = !collapsed && !panelClosing;
   const addEditorActive = editorOpen && !isPostPromptMode && editingId === null;
   const railRunBg = autoRun
@@ -1199,7 +1309,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
           ...(ANCHOR_SIDE === 'right' ? { right: rightInset } : { left: 0 }),
           // FIXED width (was `fit-content` clamped [min,max] → reflowed on +grab).
           // Drag-resizable via the handle on the free edge below.
-          width: panelOpen ? effectiveWidth + COLLAPSED_RAIL_GAP + COLLAPSED_RAIL_WIDTH : COLLAPSED_RAIL_WIDTH,
+          width: panelOpen ? effectiveWidth + COLLAPSED_RAIL_GAP + collapsedRailWidth : collapsedRailWidth,
           background: 'transparent',
           border: 'none',
           borderRadius: 0,
@@ -1212,10 +1322,15 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
           justifyContent: ANCHOR_SIDE === 'right' ? 'flex-end' : 'flex-start',
           gap: panelOpen ? COLLAPSED_RAIL_GAP : 0,
           overflow: 'visible',
+          pointerEvents: 'auto',
           transition: `width ${PANEL_SLIDE_MS}ms ease-out`,
           boxSizing: 'border-box',
         }}
       >
+        <OrchestrationStatusChip
+          tabId={tabId}
+          rightOffset={panelOpen ? effectiveWidth + COLLAPSED_RAIL_GAP + collapsedRailWidth : collapsedRailWidth}
+        />
         {panelOpen && (
           <div
             className={panelClosing ? 'pq-panel-closing' : (panelOpening ? 'pq-panel-opening' : undefined)}
@@ -1306,6 +1421,11 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
               firstChipArmedHint: red blink + low-red resting state when user
               adds the first chip into an empty queue while Run after is OFF.
               Cleared only by pressing Run after or manually emptying the queue. */}
+          <ControlHint
+            label={autoRun ? 'Выключить автоматический запуск очереди' : 'Запустить очередь после штатного завершения turn'}
+            shortcut={runAfterTabId ? 'Триггер — выбранная соседняя вкладка' : 'Триггер — текущая вкладка'}
+            side="left"
+          >
           <button
             onClick={toggleAutoRun}
             style={{
@@ -1347,6 +1467,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
             />
             Run after
           </button>
+          </ControlHint>
 
           {/* Stop/Close split-button — TWO independent toggles under one frame:
                 Left zone  → stopAfter   (kill the agent after next turn ends).
@@ -1412,6 +1533,10 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
             const rightBg = closeAfter ? `${CLOSE_RED}26` : 'transparent';
             return (
               <div style={{ display: 'flex', width: '100%' }}>
+                <ControlHint
+                  label={stopAfter ? `Не останавливать ${agentLabel} после очереди` : `Остановить ${agentLabel}, когда очередь закончится`}
+                  side="left"
+                >
                 <button
                   onClick={() => setStopAfter(tabId, !stopAfter)}
                   title={'Stop ' + agentLabel + ' after the next turn ends (if queue is empty)'}
@@ -1448,6 +1573,11 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                   <span style={{ gridArea: '1 / 1', visibility: closeAfter ? 'visible' : 'hidden' }}>Close after</span>
                   <span style={{ gridArea: '1 / 1', visibility: closeAfter ? 'hidden' : 'visible' }}>Stop after</span>
                 </button>
+                </ControlHint>
+                <ControlHint
+                  label={closeAfter ? 'Не закрывать вкладку после остановки' : 'Закрыть вкладку после остановки агента'}
+                  side="left"
+                >
                 <button
                   onClick={() => setCloseAfter(tabId, !closeAfter)}
                   title={'Also close this tab after ' + agentLabel + ' stops'}
@@ -1491,6 +1621,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                     <path d="M18.4 6.6a9 9 0 1 1-12.77.04" />
                   </svg>
                 </button>
+                </ControlHint>
               </div>
             );
           })()}
@@ -1509,6 +1640,10 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
               transition: 'border-color 0.15s',
             }}
           >
+            <ControlHint
+              label={postPromptEnabled ? 'Не добавлять post-prompt к сообщениям очереди' : 'Добавлять post-prompt к каждому сообщению очереди'}
+              side="left"
+            >
             <button
               onClick={() => setPostPromptEnabled(tabId, !postPromptEnabled)}
               title={postPromptText ? 'Post-prompt: ' + (postPromptText.length > 60 ? postPromptText.slice(0, 60) + '…' : postPromptText) : 'Post-prompt is empty — click ✏ to add'}
@@ -1527,6 +1662,8 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
               <span style={{ fontSize: 11, lineHeight: 1 }}>▣</span>
               Post
             </button>
+            </ControlHint>
+            <ControlHint label="Изменить post-prompt" side="left">
             <button
               data-editor-trigger="post"
               onClick={openPostPromptEditor}
@@ -1554,6 +1691,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                 <path d="M16.5 3.5a2.12 2.12 0 1 1 3 3L7 19l-4 1 1-4Z" />
               </svg>
             </button>
+            </ControlHint>
           </div>
 
           </div>
@@ -1563,10 +1701,12 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
         {/* Clear-all row — only when queue has items */}
         {items.length > 0 && (
           <div style={{ padding: '2px 8px 4px', borderBottom: `1px solid ${BORDER}`, display: 'flex', justifyContent: 'flex-end' }}>
+            <ControlHint label="Удалить все сообщения из очереди" side="left">
             <button
               onClick={() => items.forEach((i) => animateRemovePrompt(i.id))}
               style={{ background: 'transparent', border: 'none', color: TEXT_DIM, cursor: 'pointer', fontSize: 9, padding: 0 }}
             >clear all</button>
+            </ControlHint>
           </div>
         )}
 
@@ -1783,6 +1923,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                     <span>{it.images}</span>
                   </span>
                 )}
+                <ControlHint label="Удалить сообщение из очереди" side="left">
                 <button
                   data-chip-action="remove"
                   onMouseEnter={() => setRemoveHoverId(it.id)}
@@ -1804,6 +1945,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                     transition: 'background 0.12s, color 0.12s',
                   }}
                 ><Trash2 size={13} strokeWidth={1.9} /></button>
+                </ControlHint>
               </div>
             );
           })}
@@ -1812,10 +1954,13 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
         {/* Footer — grab + add. "Copy prompt" lives in InfoPanel next to Copy Session
             (single canonical location for clipboard ops, avoids duplicate buttons). */}
         <div style={{ display: 'flex', borderTop: `1px solid ${BORDER}` }}>
+          <ControlHint label={`Забрать текущий prompt из ${agentLabel} в очередь`} side="left">
           <button
             onClick={grabCurrent}
             style={{ flex: 1, padding: '6px 4px', background: 'transparent', border: 'none', borderRight: `1px solid ${BORDER}`, color: '#aaa', cursor: 'pointer', fontSize: 10 }}
           >+ grab</button>
+          </ControlHint>
+          <ControlHint label="Добавить новое сообщение в очередь" side="left">
           <button
             data-editor-trigger="add"
             onClick={() => openEditor()}
@@ -1830,20 +1975,21 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
               transition: 'background 0.12s, color 0.12s',
             }}
           >+ add</button>
+          </ControlHint>
         </div>
           </div>
         )}
         <div
           className="pq-collapsed-rail"
           style={{
-            width: COLLAPSED_RAIL_WIDTH,
+            width: collapsedRailWidth,
             position: 'relative',
             zIndex: 2,
-            padding: '4px 2px',
+            padding: 0,
             boxSizing: 'border-box',
             background: '#151515',
             border: '1px solid #303030',
-            borderRadius: 18,
+            borderRadius: 16,
             display: 'flex',
             flexDirection: 'column',
             alignItems: 'center',
@@ -1852,6 +1998,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
           }}
         >
           <div className="pq-rail-top-row">
+            <ControlHint label={timelineTreeMode ? 'Скрыть Timeline' : 'Открыть Timeline'} shortcut="⌘\\" side="left">
             <button
               className={`pq-rail-button pq-rail-meta${timelineTreeMode ? ' pq-rail-active' : ''}`}
               onClick={toggleTimelineTree}
@@ -1862,15 +2009,21 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
                 ? <PanelRightClose size={17} strokeWidth={2.1} />
                 : <PanelRightOpen size={17} strokeWidth={2.1} />}
             </button>
-            <button
-              className={`pq-rail-button pq-rail-meta${historyPanelOpen ? ' pq-rail-active' : ''}`}
-              onClick={toggleHistoryPanel}
-              title="History (Cmd+] / Opt+])"
-              aria-label="Toggle History"
-            >
-              <History size={17} strokeWidth={2.1} />
-            </button>
+            </ControlHint>
+            {!hideHistoryToggle && (
+              <ControlHint label={historyPanelOpen ? 'Скрыть History' : 'Открыть History'} shortcut="⌘]" side="left">
+              <button
+                className={`pq-rail-button pq-rail-meta${historyPanelOpen ? ' pq-rail-active' : ''}`}
+                onClick={toggleHistoryPanel}
+                title="History (Cmd+] / Opt+])"
+                aria-label="Toggle History"
+              >
+                <History size={17} strokeWidth={2.1} />
+              </button>
+              </ControlHint>
+            )}
           </div>
+          <ControlHint label={(collapsed || panelClosing) ? 'Развернуть Run after' : 'Свернуть Run after'} side="left">
           <button
             className="pq-rail-button"
             onClick={() => {
@@ -1890,6 +2043,12 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
               style={{ transform: arrowExpanded ? 'rotate(180deg)' : 'rotate(0deg)' }}
             />
           </button>
+          </ControlHint>
+          <ControlHint
+            label={autoRun ? 'Выключить автоматический запуск очереди' : 'Включить автоматический запуск очереди'}
+            shortcut={`${activeItemCount} сообщений в очереди`}
+            side="left"
+          >
           <button
             className="pq-rail-button"
             onClick={toggleAutoRun}
@@ -1923,6 +2082,8 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
             )}
             {activeItemCount > 0 ? (activeItemCount > 99 ? '99' : activeItemCount) : '•'}
           </button>
+          </ControlHint>
+          <ControlHint label={`Забрать текущий prompt из ${agentLabel} в очередь`} side="left">
           <button
             className="pq-rail-button pq-rail-primary"
             onClick={grabCurrent}
@@ -1931,6 +2092,7 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
           >
             <Plus size={18} strokeWidth={2.2} />
           </button>
+          </ControlHint>
         </div>
       </div>
 
@@ -2033,6 +2195,10 @@ export function PromptQueueOverlay({ tabId, sessionType, agentBusy, rightInset =
             display: 'flex', flexDirection: 'column',
             overflow: 'hidden',
             boxSizing: 'border-box',
+            // The workspace portal host is click-through so it does not cover
+            // History outside Run After. This editor is a sibling of the main
+            // overlay root, so it must opt back into hit testing explicitly.
+            pointerEvents: 'auto',
           }}
           onMouseDown={(e) => e.stopPropagation()}
           onClick={(e) => e.stopPropagation()}
@@ -2445,6 +2611,7 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
   // Counting display — read-only, monochrome to fit the dark panel.
   if (remaining !== null) {
     return (
+      <ControlHint label="Осталось до отправки первого сообщения" shortcut="Выключение Run after отменит таймер" side="left">
       <span
         style={{
           width: '100%',           // matches the trigger above (left column)
@@ -2463,6 +2630,7 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
       >
         {remaining}s
       </span>
+      </ControlHint>
     );
   }
 
@@ -2472,6 +2640,7 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
   // race the runner with a mid-arm edit.
   const disabled = autoRun;
   return (
+    <ControlHint label="Задержка перед первым сообщением очереди" shortcut="0–3600 секунд" side="left">
     <input
       type="number"
       className="pq-no-spin"
@@ -2513,5 +2682,6 @@ function FirstDelayInput({ tabId, autoRun }: FirstDelayInputProps) {
         boxSizing: 'border-box',
       }}
     />
+    </ControlHint>
   );
 }

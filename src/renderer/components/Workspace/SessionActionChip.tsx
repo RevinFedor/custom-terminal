@@ -1,4 +1,5 @@
 import React from 'react';
+import ControlHint from '../UI/ControlHint';
 
 // ============================================================================
 // SessionActionChip — единственная кнопка в ControlBar для управления
@@ -98,7 +99,17 @@ export default function SessionActionChip({
     : sessionIdle ? (hover ? hoverTint : idleTint)
       : showStartOnHover ? hoverTint
       : (hover ? 'rgba(255,255,255,0.08)' : 'transparent');
+  const helpLabel = disabled
+    ? (disabledTitle || 'Действие временно недоступно')
+    : mode === 'sdk'
+      ? (isCommandRunning ? 'Остановить текущий SDK-turn' : 'Перейти к вводу SDK-сессии')
+      : isCommandRunning
+        ? `Остановить процесс ${defaultLabel}`
+        : hasAnySession
+          ? `Продолжить сессию ${defaultLabel}`
+          : `Запустить ${defaultLabel}`;
   return (
+    <ControlHint label={helpLabel}>
     <span
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
@@ -120,5 +131,6 @@ export default function SessionActionChip({
     >
       {label}
     </span>
+    </ControlHint>
   );
 }

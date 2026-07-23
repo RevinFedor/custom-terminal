@@ -1,7 +1,7 @@
 import React, { useRef, useState, useEffect, useCallback, memo } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { RotateCcw, ArrowLeft, ArrowRight, Globe, TerminalSquare, AlertTriangle } from 'lucide-react';
-import Tooltip from '../UI/Tooltip';
+import ControlHint from '../UI/ControlHint';
 import Terminal from './Terminal';
 
 interface BrowserTabProps {
@@ -219,30 +219,30 @@ function BrowserTab({ tabId, url, active: activeProp, isActiveProject: isActiveP
           borderBottom: '1px solid #333',
         }}
       >
-        <Tooltip content="Back">
+        <ControlHint label="Назад">
         <button
           onClick={handleGoBack}
           style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', padding: '2px', display: 'flex', alignItems: 'center' }}
         >
           <ArrowLeft size={14} />
         </button>
-        </Tooltip>
-        <Tooltip content="Forward">
+        </ControlHint>
+        <ControlHint label="Вперёд">
         <button
           onClick={handleGoForward}
           style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', padding: '2px', display: 'flex', alignItems: 'center' }}
         >
           <ArrowRight size={14} />
         </button>
-        </Tooltip>
-        <Tooltip content="Refresh">
+        </ControlHint>
+        <ControlHint label="Обновить страницу">
         <button
           onClick={handleRefresh}
           style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', padding: '2px', display: 'flex', alignItems: 'center' }}
         >
           <RotateCcw size={14} className={isLoading ? 'animate-spin' : ''} />
         </button>
-        </Tooltip>
+        </ControlHint>
 
         <form onSubmit={handleAddressSubmit} style={{ flex: 1 }}>
           <input
@@ -266,7 +266,7 @@ function BrowserTab({ tabId, url, active: activeProp, isActiveProject: isActiveP
         </form>
 
         <div style={{ display: 'flex', gap: '2px', marginLeft: '4px' }}>
-          <Tooltip content="Browser view">
+          <ControlHint label="Показать браузер">
           <button
             onClick={handleSwitchToBrowser}
             style={{
@@ -279,8 +279,8 @@ function BrowserTab({ tabId, url, active: activeProp, isActiveProject: isActiveP
             <Globe size={12} />
             <span>Browser</span>
           </button>
-          </Tooltip>
-          <Tooltip content="Terminal view">
+          </ControlHint>
+          <ControlHint label="Показать терминал">
           <button
             onClick={handleSwitchToTerminal}
             style={{
@@ -306,7 +306,7 @@ function BrowserTab({ tabId, url, active: activeProp, isActiveProject: isActiveP
             <TerminalSquare size={12} />
             <span>Term</span>
           </button>
-          </Tooltip>
+          </ControlHint>
         </div>
       </div>
 

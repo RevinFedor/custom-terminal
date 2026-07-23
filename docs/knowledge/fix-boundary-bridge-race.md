@@ -49,6 +49,12 @@ if (claudeSpinnerBusy.has(tabId)) {   // ← мгновенно
 
 Фикс: в момент той же main-side детекции prompt glyph main теперь шлёт прямой `claude:prompt-boundary { tabId, seq }` в renderer. `terminalRegistry` хранит последний seq отдельно от xterm markers и будит waiters по direct event; xterm marker остаётся для Timeline/scroll anchors, но больше не является единственным source of truth для `/effort` gate. Диагностическая пара в логах: `[BoundaryMarker] ... Injected prompt #N` → `[BoundaryMarkerAck] ... seq=N source=renderer-direct`. Если первая строка есть, а ack нет — проблема доставки IPC/listener; если обе есть, boundary wait не должен падать по timeout из-за xterm parser.
 
+## Дополнение 2026-07-23: readiness не подтверждает применение настройки
+
+После обновления Claude ложный `CLAUDE START FAILED` мог появиться уже на полностью работающей сессии: `/model haiku` был виден в composer или применился, prompt вернулся, но приложение ждало подтверждение через bridge и объявляло `did not confirm through bridge`. Для effort этот контракт принципиально невозможен — bridge вообще не несёт effort; для model поздний status-line кадр доказывает live-состояние сессии, но не причинную связь с конкретной отправленной командой. Ни return из paste, ни prompt-boundary, ни bridge-update по отдельности не отвечают на вопрос «применилась ли именно эта slash-команда».
+
+Настройка теперь коммитится только по долговечной прямой паре активной JSONL-ветки: wrapper `/<setting> value` → его непосредственный `<local-command-stdout>Set ...</local-command-stdout>` ребёнок. Prompt-boundary остаётся readiness-сигналом для следующего действия, bridge — live resolved-label/context каналом, а sentinels — только дедупликацией конкурирующих startup/manual путей. Если чтение существующей сессии вернуло `unknown`, app default не подставляется поверх неё; после Rewind физически более свежая запись отброшенной ветки также не считается текущей. См. `fact-claude-tui-control.md::Startup defaults /model + /effort при запуске Claude` и `fact-claude-control-bar.md::Per-tab state и selectors`.
+
 ## Дополнительные изменения
 
 ### Text-based Fallback (Timeline.tsx, computePositions)

@@ -3,18 +3,105 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+  attachCodexSettingsProofOwner,
   codexSessionIdFromAuthoritativeStatus,
+  consumePendingCodexSettingsProofHandoff,
   createCodexLaunchPendingResult,
+  createPendingCodexSettingsProofHandoff,
   createCodexPtySubmitAdmission,
   isCodexComposerReadyForGuardedSend,
   liveLifecycleFromCodexWriterStatus,
+  planCodexCommandLaunchSettings,
+  planCodexLaunchSettings,
+  planCodexPickerMovement,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
   shouldClearCodexLaunchPending,
   shouldHoldCodexStartingOnAbsent,
   shouldSurfaceCodexStartupTimeout,
+  validateCodexPickerRuntimeAdmission,
   validateCodexPtySubmitAdmission,
 } = require('./codex-runtime-contract');
+
+test('durable migration marker suppresses every explicit model and effort fallback', () => {
+  assert.deepEqual(planCodexLaunchSettings({
+    requestedModel: 'gpt-5.4-mini',
+    requestedEffort: 'max',
+    modelSource: 'tab',
+    effortSource: 'tab',
+    durableDefaultModel: 'gpt-5.6-sol',
+    durableDefaultEffort: 'max',
+    modelMigrationPending: true,
+  }), {
+    model: null,
+    effort: null,
+    modelSource: 'migration-recovery',
+    effortSource: 'migration-recovery',
+  });
+});
+
+test('main-owned global settings outrank a stale renderer localStorage mirror', () => {
+  assert.deepEqual(planCodexLaunchSettings({
+    requestedModel: 'gpt-5.4-mini',
+    requestedEffort: 'max',
+    modelSource: 'global',
+    effortSource: 'global',
+    durableDefaultModel: 'gpt-5.6-luna',
+    durableDefaultEffort: 'medium',
+  }), {
+    model: 'gpt-5.6-luna',
+    effort: 'medium',
+    modelSource: 'global',
+    effortSource: 'global',
+  });
+});
+
+test('command launch settings restore both Resume and Fork from proven source settings', () => {
+  assert.deepEqual(planCodexCommandLaunchSettings({
+    command: 'codex-c',
+    sourceSettingsStatus: 'found',
+    sourceModel: 'gpt-5.6-sol',
+    sourceEffort: 'ultra',
+  }), {
+    allowed: true,
+    model: 'gpt-5.6-sol',
+    effort: 'ultra',
+    settingsSource: 'resume-source-jsonl',
+  });
+  assert.deepEqual(planCodexCommandLaunchSettings({
+    command: 'codex-f',
+    sourceSettingsStatus: 'found',
+    sourceModel: 'gpt-5.6-sol',
+    sourceEffort: 'ultra',
+  }), {
+    allowed: true,
+    model: 'gpt-5.6-sol',
+    effort: 'ultra',
+    settingsSource: 'fork-source-jsonl',
+  });
+  assert.equal(planCodexCommandLaunchSettings({
+    command: 'codex-f',
+    sourceSettingsStatus: 'absent',
+  }).allowed, false);
+  assert.deepEqual(planCodexCommandLaunchSettings({
+    command: 'codex-c',
+    sourceSettingsStatus: 'invalid',
+  }), {
+    allowed: false,
+    error: 'codex_resume_source_settings_invalid',
+    settingsSource: 'resume-source-jsonl',
+  });
+  assert.deepEqual(planCodexCommandLaunchSettings({
+    command: 'codex',
+    model: 'gpt-5.6-sol',
+    effort: 'ultra',
+  }), {
+    allowed: true,
+    model: 'gpt-5.6-sol',
+    effort: null,
+    settingsSource: 'new-thread-without-conversation-only-effort',
+  });
+});
 
 test('fresh absence beats cached runtime state outside exact launch admission', () => {
   assert.equal(shouldHoldCodexStartingOnAbsent({}), false);
@@ -100,9 +187,411 @@ test('PTY submit admission is event-driven and invalidates on process generation
   }).reason, 'codex_process_not_running');
   assert.equal(validateCodexPtySubmitAdmission(token, {
     processRunning: true,
+    hasLiveCodexEvidence: false,
+    runSeq: 7,
+  }).reason, 'codex_tui_not_established');
+  assert.equal(validateCodexPtySubmitAdmission(token, {
+    processRunning: true,
     hasLiveCodexEvidence: true,
     runSeq: 8,
   }).reason, 'codex_process_generation_changed');
+});
+
+test('PTY submit admission invalidates when manual input changes at the write boundary', () => {
+  const admission = createCodexPtySubmitAdmission({
+    processRunning: true,
+    hasLiveCodexEvidence: true,
+    runSeq: 12,
+    inputRevision: 41,
+  });
+
+  assert.deepEqual(validateCodexPtySubmitAdmission(admission, {
+    processRunning: true,
+    hasLiveCodexEvidence: true,
+    runSeq: 12,
+    inputRevision: 42,
+  }), {
+    valid: false,
+    reason: 'codex_input_ownership_changed',
+  });
+});
+
+test('PTY submit admission is unavailable and current admission becomes invalid while stopping', () => {
+  assert.deepEqual(createCodexPtySubmitAdmission({
+    processRunning: true,
+    hasLiveCodexEvidence: true,
+    runSeq: 7,
+    stopping: true,
+  }), {
+    available: false,
+    reason: 'codex_process_stopping',
+    runSeq: 7,
+  });
+
+  const token = createCodexPtySubmitAdmission({
+    processRunning: true,
+    hasLiveCodexEvidence: true,
+    runSeq: 7,
+  });
+  assert.deepEqual(validateCodexPtySubmitAdmission(token, {
+    processRunning: true,
+    hasLiveCodexEvidence: true,
+    runSeq: 7,
+    stopping: true,
+  }), {
+    valid: false,
+    reason: 'codex_process_stopping',
+  });
+  assert.deepEqual(validateCodexPtySubmitAdmission(token, {
+    processRunning: true,
+    hasLiveCodexEvidence: true,
+    runSeq: 7,
+    stopping: false,
+  }), {
+    valid: true,
+    reason: null,
+  });
+});
+
+test('picker movement fails closed without a selected physical row', () => {
+  assert.deepEqual(planCodexPickerMovement(-1, 3), {
+    allowed: false,
+    reason: 'codex_picker_selection_unknown',
+    pressCount: 0,
+    key: null,
+  });
+  assert.deepEqual(planCodexPickerMovement(2, -1), {
+    allowed: false,
+    reason: 'codex_picker_target_unknown',
+    pressCount: 0,
+    key: null,
+  });
+  assert.deepEqual(planCodexPickerMovement(2, 4), {
+    allowed: true,
+    reason: null,
+    pressCount: 2,
+    key: '\x1b[B',
+  });
+  assert.deepEqual(planCodexPickerMovement(2, 0), {
+    allowed: true,
+    reason: null,
+    pressCount: 2,
+    key: '\x1b[A',
+  });
+});
+
+test('picker runtime admission is generation-bound and draft-aware', () => {
+  const base = {
+    sameTerminal: true,
+    expectedRunSeq: 7,
+    currentRunSeq: 7,
+    expectedInputRevision: 11,
+    currentInputRevision: 11,
+    processRunning: true,
+    hasLiveCodexEvidence: true,
+    tuiReady: true,
+    stopping: false,
+    turnBusy: false,
+    hasDraft: false,
+  };
+  assert.deepEqual(validateCodexPickerRuntimeAdmission(base), {
+    allowed: true,
+    reason: null,
+  });
+  assert.equal(validateCodexPickerRuntimeAdmission({
+    ...base,
+    sameTerminal: false,
+  }).reason, 'codex_terminal_generation_changed');
+  assert.equal(validateCodexPickerRuntimeAdmission({
+    ...base,
+    currentRunSeq: 8,
+  }).reason, 'codex_process_generation_changed');
+  assert.equal(validateCodexPickerRuntimeAdmission({
+    ...base,
+    currentInputRevision: 12,
+  }).reason, 'codex_input_ownership_changed');
+  assert.equal(validateCodexPickerRuntimeAdmission({
+    ...base,
+    stopping: true,
+  }).reason, 'codex_process_stopping');
+  assert.equal(validateCodexPickerRuntimeAdmission({
+    ...base,
+    processRunning: false,
+  }).reason, 'codex_process_not_running');
+  assert.equal(validateCodexPickerRuntimeAdmission({
+    ...base,
+    hasLiveCodexEvidence: false,
+  }).reason, 'codex_process_not_established');
+  assert.equal(validateCodexPickerRuntimeAdmission({
+    ...base,
+    tuiReady: false,
+  }).reason, 'codex_tui_not_ready');
+  assert.equal(validateCodexPickerRuntimeAdmission({
+    ...base,
+    hasDraft: null,
+  }).reason, 'codex_draft_state_unknown');
+  assert.equal(validateCodexPickerRuntimeAdmission({
+    ...base,
+    turnBusy: true,
+    hasDraft: true,
+  }).reason, 'codex_busy_with_draft');
+  assert.deepEqual(validateCodexPickerRuntimeAdmission({
+    ...base,
+    turnBusy: true,
+    hasDraft: false,
+    allowTurnBusy: true,
+  }), {
+    allowed: true,
+    reason: null,
+  });
+  assert.equal(validateCodexPickerRuntimeAdmission({
+    ...base,
+    turnBusy: true,
+    hasDraft: false,
+  }).reason, 'codex_turn_busy');
+  assert.deepEqual(validateCodexPickerRuntimeAdmission({
+    ...base,
+    turnBusy: false,
+    hasDraft: true,
+  }), {
+    allowed: true,
+    reason: null,
+  });
+});
+
+test('partial picker admission CAS-checks the active writer while full pairs need no writer precondition', () => {
+  const base = {
+    sameTerminal: true,
+    expectedRunSeq: 7,
+    currentRunSeq: 7,
+    expectedInputRevision: 11,
+    currentInputRevision: 11,
+    processRunning: true,
+    hasLiveCodexEvidence: true,
+    tuiReady: true,
+    stopping: false,
+    turnBusy: false,
+    hasDraft: false,
+  };
+  assert.deepEqual(validateCodexPickerRuntimeAdmission({
+    ...base,
+    expectedWriterSessionId: 'writer-a',
+    currentWriterSessionId: 'writer-a',
+  }), {
+    allowed: true,
+    reason: null,
+  });
+  assert.equal(validateCodexPickerRuntimeAdmission({
+    ...base,
+    expectedWriterSessionId: 'writer-a',
+    currentWriterSessionId: 'writer-b',
+  }).reason, 'codex_settings_writer_changed');
+  assert.equal(validateCodexPickerRuntimeAdmission({
+    ...base,
+    expectedWriterSessionId: 'writer-a',
+    currentWriterSessionId: null,
+  }).reason, 'codex_settings_writer_changed');
+  assert.deepEqual(validateCodexPickerRuntimeAdmission({
+    ...base,
+    expectedWriterSessionId: null,
+    currentWriterSessionId: 'writer-b',
+  }), {
+    allowed: true,
+    reason: null,
+  });
+});
+
+test('picker proof is owned by the writer observed after queued application', () => {
+  assert.deepEqual(attachCodexSettingsProofOwner({
+    success: true,
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+  }, 'writer-b'), {
+    success: true,
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+    codexSettingsProofSessionId: 'writer-b',
+  });
+  assert.equal(attachCodexSettingsProofOwner({
+    success: false,
+    applied: true,
+    applicationProofSource: 'tui-conversation-ack',
+    error: 'draft restore failed',
+  }, 'writer-b').codexSettingsProofSessionId, 'writer-b');
+  assert.equal(attachCodexSettingsProofOwner({
+    success: false,
+    applied: true,
+    error: 'unproven failure',
+  }, 'writer-b').codexSettingsProofSessionId, null);
+  assert.equal(attachCodexSettingsProofOwner({
+    success: true,
+  }, null).codexSettingsProofSessionId, null);
+});
+
+test('fresh picker proof follows only the first writer from the exact PTY generation', () => {
+  const terminalToken = {};
+  const ultraProof = attachCodexSettingsProofOwner({
+    success: true,
+    model: 'gpt-5.6-sol',
+    effort: 'ultra',
+    applicationProofSource: 'tui-conversation-ack',
+  }, null);
+  const pending = createPendingCodexSettingsProofHandoff({
+    result: ultraProof,
+    terminalToken,
+    runSeq: 7,
+    launchId: 'launch-7',
+    appliedAt: 123,
+  });
+  assert.deepEqual(pending, {
+    terminalToken,
+    runSeq: 7,
+    launchId: 'launch-7',
+    generationMode: 'launch',
+    proofAt: 123,
+    model: 'gpt-5.6-sol',
+    effort: 'ultra',
+    applicationProofSource: 'tui-conversation-ack',
+  });
+  assert.deepEqual(consumePendingCodexSettingsProofHandoff(pending, {
+    terminalToken,
+    runSeq: 7,
+    launchId: 'launch-7',
+    writerSessionId: 'writer-first',
+  }), {
+    carry: true,
+    reason: 'same-live-generation-first-writer',
+    proof: { model: 'gpt-5.6-sol', effort: 'ultra', proofAt: 123 },
+    nextPending: null,
+  });
+});
+
+test('Resume/Fork source settings proof transfers only to the first exact launch writer', () => {
+  const terminalToken = {};
+  const pending = createPendingCodexSettingsProofHandoff({
+    result: {
+      success: true,
+      applied: true,
+      model: 'gpt-5.6-sol',
+      effort: 'ultra',
+      applicationProofSource: 'resume-source-jsonl',
+      codexSettingsProofSessionId: null,
+    },
+    terminalToken,
+    runSeq: 13,
+    launchId: 'resume-launch-13',
+  });
+
+  assert.deepEqual(consumePendingCodexSettingsProofHandoff(pending, {
+    terminalToken,
+    runSeq: 13,
+    launchId: 'resume-launch-13',
+    writerSessionId: 'resumed-child-writer',
+  }), {
+    carry: true,
+    reason: 'same-live-generation-first-writer',
+    proof: {
+      model: 'gpt-5.6-sol',
+      effort: 'ultra',
+      proofAt: pending.proofAt,
+    },
+    nextPending: null,
+  });
+  assert.equal(consumePendingCodexSettingsProofHandoff(pending, {
+    terminalToken,
+    runSeq: 13,
+    launchId: 'different-launch',
+    writerSessionId: 'different-child-writer',
+  }).carry, false);
+});
+
+test('fresh picker proof is one-generation only and never comes from an unproven picker result', () => {
+  const terminalToken = {};
+  const pending = createPendingCodexSettingsProofHandoff({
+    result: attachCodexSettingsProofOwner({
+      success: true,
+      model: 'gpt-5.6-sol',
+      effort: 'max',
+      applicationProofSource: 'config:initial-read',
+    }, null),
+    terminalToken,
+    runSeq: 8,
+    launchId: 'launch-8',
+  });
+  assert.equal(consumePendingCodexSettingsProofHandoff(pending, {
+    terminalToken: {},
+    runSeq: 8,
+    launchId: 'launch-8',
+    writerSessionId: 'writer-first',
+  }).reason, 'terminal-generation-changed');
+  assert.equal(consumePendingCodexSettingsProofHandoff(pending, {
+    terminalToken,
+    runSeq: 9,
+    launchId: 'launch-8',
+    writerSessionId: 'writer-first',
+  }).reason, 'process-generation-changed');
+  assert.equal(consumePendingCodexSettingsProofHandoff(pending, {
+    terminalToken,
+    runSeq: 8,
+    launchId: 'launch-9',
+    writerSessionId: 'writer-first',
+  }).reason, 'launch-generation-changed');
+  assert.equal(createPendingCodexSettingsProofHandoff({
+    result: {
+      success: false,
+      applied: true,
+      error: 'unproven failure',
+      codexSettingsProofSessionId: null,
+    },
+    terminalToken,
+    runSeq: 8,
+    launchId: 'launch-8',
+  }), null);
+});
+
+test('pending handoff rejects an otherwise proven result without an exact model and effort pair', () => {
+  assert.equal(createPendingCodexSettingsProofHandoff({
+    result: {
+      success: true,
+      applicationProofSource: 'resume-source-jsonl',
+      model: 'gpt-5.6-sol',
+      codexSettingsProofSessionId: null,
+    },
+    terminalToken: {},
+    runSeq: 8,
+    launchId: 'launch-8',
+  }), null);
+});
+
+test('manually adopted Codex process carries settings proof by terminal and run generation', () => {
+  const terminalToken = {};
+  const pending = createPendingCodexSettingsProofHandoff({
+    result: {
+      success: true,
+      model: 'gpt-5.6-luna',
+      effort: 'medium',
+      applied: true,
+      applicationProofSource: 'startup-model-migration-ack',
+      codexSettingsProofSessionId: null,
+    },
+    terminalToken,
+    runSeq: 12,
+    launchId: null,
+    allowTerminalRunGeneration: true,
+  });
+  assert.equal(pending.generationMode, 'terminal-run');
+  assert.equal(consumePendingCodexSettingsProofHandoff(pending, {
+    terminalToken,
+    runSeq: 12,
+    launchId: null,
+    writerSessionId: 'manual-writer',
+  }).carry, true);
+  assert.equal(consumePendingCodexSettingsProofHandoff(pending, {
+    terminalToken,
+    runSeq: 13,
+    launchId: null,
+    writerSessionId: 'replacement-writer',
+  }).reason, 'process-generation-changed');
 });
 
 test('ready live composer is active before the first rollout identity exists', () => {

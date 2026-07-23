@@ -8,7 +8,8 @@ import TabBar from './TabBar';
 import TabSidebar from './TabSidebar';
 import ProjectToolbar from './ProjectToolbar';
 import ProjectHome from './ProjectHome';
-import TerminalArea from './TerminalArea';
+import TerminalArea, { type AgentLifecycleSummary } from './TerminalArea';
+import FloatingTerminalFrame from './FloatingTerminalFrame';
 import Timeline from './Timeline';
 import '../../utils/sidebarBridge'; // Init window.electronAPI bridge
 import Sidebar from './Sidebar';
@@ -132,6 +133,9 @@ export default function Workspace() {
   const [searchText, setSearchText] = useState('');
   const [searchResults, setSearchResults] = useState({ resultIndex: 0, resultCount: 0 });
   const [isCommandRunning, setIsCommandRunning] = useState(false);
+  const [floatingTerminalOpenTabs, setFloatingTerminalOpenTabs] = useState<Record<string, boolean>>({});
+  const [historyControlsHeight, setHistoryControlsHeight] = useState(0);
+  const [agentLifecycleStatus, setAgentLifecycleStatus] = useState<AgentLifecycleSummary | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   const activeProject = getActiveProject();
@@ -224,6 +228,65 @@ export default function Workspace() {
     }
     return activeTab;
   }, [viewingSubAgentTabId, activeProject, activeTab]);
+  const primaryHistoryTool = effectiveCommandType === 'codex'
+    ? 'codex'
+    : effectiveCommandType === 'claude'
+      ? 'claude'
+      : effectiveCodexSessionId && !effectiveClaudeSessionId
+        ? 'codex'
+        : effectiveClaudeSessionId
+          ? 'claude'
+          : null;
+  const historyIsPrimary = !!effectiveTab
+    && currentView === 'terminal'
+    && effectiveTabType !== 'claude-sdk'
+    && effectiveTabType !== 'browser'
+    && effectiveTabType !== 'file'
+    && !filePreview
+    && !!primaryHistoryTool;
+  const floatingTerminalOpen = !!(effectiveTab?.id && floatingTerminalOpenTabs[effectiveTab.id]);
+  const promptQueuePortalHostId = 'workspace-prompt-queue-host';
+
+  const toggleFloatingTerminal = useCallback(() => {
+    const tabId = effectiveTab?.id;
+    if (!tabId) return;
+    if (floatingTerminalOpen) {
+      setShowSearch(false);
+      setSearchText('');
+      setSearchResults({ resultIndex: 0, resultCount: 0 });
+      terminalRegistry.clearSearch(tabId);
+    }
+    setFloatingTerminalOpenTabs((current) => ({ ...current, [tabId]: !current[tabId] }));
+  }, [effectiveTab?.id, floatingTerminalOpen]);
+
+  const closeFloatingTerminal = useCallback(() => {
+    const tabId = effectiveTab?.id;
+    if (!tabId) return;
+    setFloatingTerminalOpenTabs((current) => current[tabId] ? { ...current, [tabId]: false } : current);
+    setShowSearch(false);
+    setSearchText('');
+    setSearchResults({ resultIndex: 0, resultCount: 0 });
+    terminalRegistry.clearSearch(tabId);
+  }, [effectiveTab?.id]);
+
+  const handleLifecycleStatusChange = useCallback((next: AgentLifecycleSummary | null) => {
+    setAgentLifecycleStatus((current) => {
+      if (!current && !next) return current;
+      if (current && next
+        && current.tabId === next.tabId
+        && current.kind === next.kind
+        && current.title === next.title
+        && current.description === next.description
+        && current.detail === next.detail
+        && current.sessionId === next.sessionId
+        && current.spinner === next.spinner) return current;
+      return next;
+    });
+  }, []);
+
+  const handleHistoryControlsHeight = useCallback((height: number) => {
+    setHistoryControlsHeight((current) => current === height ? current : height);
+  }, []);
   const projectRootPath = useMemo(() => {
     const projectPath = currentProject?.path || '';
     return projectPath && !projectPath.startsWith('__unset__') ? projectPath : '';
@@ -525,6 +588,7 @@ export default function Workspace() {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (workspaceView !== 'workspace') return;
       if ((e.metaKey || e.altKey) && e.code === 'BracketRight') {
+        if (historyIsPrimary) return;
         const shortcut = e.metaKey ? 'CMD+]' : 'OPT+]';
         const hasSession = effectiveClaudeSessionId || effectiveGeminiSessionId || effectiveCodexSessionId;
         if (!effectiveTab?.id || !hasSession) {
@@ -540,7 +604,7 @@ export default function Workspace() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCommandType, setHistoryPanelOpen, setTimelineTreeMode, timelinePinned]);
+  }, [workspaceView, historyIsPrimary, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCommandType, setHistoryPanelOpen, setTimelineTreeMode, timelinePinned]);
 
   // CMD+\ / Option+\ hotkeys to toggle timeline tree mode
   useEffect(() => {
@@ -572,6 +636,7 @@ export default function Workspace() {
       // Guard: don't fire when Workspace is hidden behind Dashboard
       if (workspaceView !== 'workspace') return;
       if (e.metaKey && e.key === 'f') {
+        if (historyIsPrimary && !floatingTerminalOpen) return;
         e.preventDefault();
         setShowSearch(true);
         // Focus input after render
@@ -591,7 +656,7 @@ export default function Workspace() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [showSearch, effectiveTab?.id, workspaceView]);
+  }, [showSearch, effectiveTab?.id, floatingTerminalOpen, historyIsPrimary, workspaceView]);
 
   // Handle search
   const handleSearch = useCallback((text: string) => {
@@ -698,19 +763,79 @@ export default function Workspace() {
     : effectiveGeminiSessionId && effectiveCommandType === 'gemini'
       ? 'gemini'
       : 'claude') as 'claude' | 'gemini' | 'codex';
-  const shouldRenderHistoryPanel = (isHistoryOpen || historyMounted) && !!timelineSessionId && !!effectiveTab && currentView === 'terminal';
+  const historyToolType = historyIsPrimary ? (primaryHistoryTool as 'claude' | 'codex') : timelineToolType;
+  const historySessionId = historyIsPrimary
+    ? (historyToolType === 'codex' ? effectiveCodexSessionId : effectiveClaudeSessionId)
+    : timelineSessionId;
+  const shouldRenderHistoryPanel = !!effectiveTab
+    && currentView === 'terminal'
+    && (historyIsPrimary || ((isHistoryOpen || historyMounted) && !!historySessionId));
   const historyPanelNode = shouldRenderHistoryPanel ? (
     <HistoryPanel
       tabId={effectiveTab.id}
-      sessionId={timelineSessionId}
+      sessionId={historySessionId || ''}
       cwd={effectiveTab.cwd || currentProject.path}
       width={historyPanelWidth}
       notesPanelWidth={notesPanelWidth}
-      isOpen={isHistoryOpen}
-      toolType={timelineToolType}
-      enableClaudePtyControls={(timelineToolType === 'claude' || timelineToolType === 'codex') && effectiveTabType !== 'claude-sdk'}
-      embedded={historyPinned}
+      isOpen={historyIsPrimary || isHistoryOpen}
+      toolType={historyToolType}
+      enableClaudePtyControls={(historyToolType === 'claude' || historyToolType === 'codex') && effectiveTabType !== 'claude-sdk'}
+      embedded={historyIsPrimary || historyPinned}
+      embeddedFill={historyIsPrimary}
+      mainSurface={historyIsPrimary}
+      projectId={activeProjectId}
+      terminalOpen={historyIsPrimary && floatingTerminalOpen}
+      onToggleTerminal={historyIsPrimary ? toggleFloatingTerminal : undefined}
+      lifecycleStatus={historyIsPrimary ? agentLifecycleStatus : null}
+      onControlsHeightChange={historyIsPrimary ? handleHistoryControlsHeight : undefined}
     />
+  ) : null;
+  const terminalSearchNode = currentView === 'terminal' && showSearch ? (
+    <div
+      data-terminal-search-overlay
+      style={{
+        position: 'absolute',
+        top: 8,
+        right: 8,
+        zIndex: 100,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+        backgroundColor: 'rgba(40, 40, 40, 0.96)',
+        backdropFilter: 'blur(8px)',
+        border: '1px solid rgba(255, 255, 255, 0.12)',
+        borderRadius: 7,
+        padding: '6px 8px',
+        boxShadow: '0 4px 12px rgba(0, 0, 0, 0.35)',
+      }}
+    >
+      <input
+        ref={searchInputRef}
+        type="text"
+        value={searchText}
+        onChange={(event) => handleSearch(event.target.value)}
+        onKeyDown={handleSearchKeyDown}
+        placeholder="Search terminal..."
+        style={{ background: 'transparent', border: 0, outline: 0, color: '#fff', fontSize: 12, width: 160 }}
+      />
+      {searchText && (
+        <span style={{ fontSize: 10, color: searchResults.resultCount > 0 ? '#aaa' : '#f87171', minWidth: 44, textAlign: 'center' }}>
+          {searchResults.resultCount > 0 ? `${searchResults.resultIndex}/${searchResults.resultCount}` : 'No results'}
+        </span>
+      )}
+      <button onClick={handleFindPrevious} disabled={searchResults.resultCount === 0} style={{ background: 'none', border: 0, color: searchResults.resultCount ? '#bbb' : '#555', cursor: searchResults.resultCount ? 'pointer' : 'default', padding: 2 }}>▲</button>
+      <button onClick={handleFindNext} disabled={searchResults.resultCount === 0} style={{ background: 'none', border: 0, color: searchResults.resultCount ? '#bbb' : '#555', cursor: searchResults.resultCount ? 'pointer' : 'default', padding: 2 }}>▼</button>
+      <button
+        aria-label="Close terminal search"
+        onClick={() => {
+          setShowSearch(false);
+          setSearchText('');
+          setSearchResults({ resultIndex: 0, resultCount: 0 });
+          if (effectiveTab?.id) terminalRegistry.clearSearch(effectiveTab.id);
+        }}
+        style={{ background: 'none', border: 0, color: '#777', cursor: 'pointer', padding: 2 }}
+      >✕</button>
+    </div>
   ) : null;
 
   // DEBUG: Uncomment to debug Timeline visibility
@@ -746,92 +871,58 @@ export default function Workspace() {
           <div className="flex-1 flex flex-col min-w-0">
           {/* Terminal content — overflow hidden clips HistoryPanel slide animation */}
           <div className="flex-1 relative min-w-0 overflow-hidden">
-            <TerminalArea projectId={activeProjectId} />
+            {historyIsPrimary && historyPanelNode}
+
+            <FloatingTerminalFrame
+              tabId={effectiveTab?.id || null}
+              floating={historyIsPrimary}
+              open={!historyIsPrimary || floatingTerminalOpen}
+              bottomInset={historyIsPrimary ? historyControlsHeight : 0}
+              onClose={closeFloatingTerminal}
+              searchNode={terminalSearchNode}
+            >
+              <TerminalArea
+                projectId={activeProjectId}
+                terminalPresented={!historyIsPrimary || floatingTerminalOpen}
+                promptQueuePortalHostId={historyIsPrimary ? promptQueuePortalHostId : undefined}
+                hidePromptQueueHistoryToggle={historyIsPrimary}
+                promptQueueInputSurface={historyIsPrimary ? 'history' : 'terminal'}
+                suppressLifecycleOverlays={historyIsPrimary}
+                onLifecycleStatusChange={handleLifecycleStatusChange}
+              />
+            </FloatingTerminalFrame>
+
+            {historyIsPrimary && (
+              <div
+                id={promptQueuePortalHostId}
+                data-history-prompt-queue-host
+                data-workspace-prompt-queue-host
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  bottom: Math.max(0, historyControlsHeight),
+                  zIndex: 120,
+                  pointerEvents: 'none',
+                }}
+              />
+            )}
 
             {effectiveTab && currentView === 'terminal' && (
               <TabTaskPlanPanel
                 tabId={effectiveTab.id}
                 projectPath={currentProject.path}
+                inputSurface={historyIsPrimary ? 'history' : effectiveTabType === 'claude-sdk' ? 'sdk' : 'terminal'}
+                commandType={effectiveCommandType}
               />
-            )}
-
-            {/* Search Bar (Cmd+F) - only in terminal view */}
-            {currentView === 'terminal' && showSearch && (
-              <div
-                style={{
-                  position: 'absolute',
-                  top: '8px',
-                  right: '16px',
-                  zIndex: 100,
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '6px',
-                  backgroundColor: 'rgba(40, 40, 40, 0.95)',
-                  backdropFilter: 'blur(8px)',
-                  border: '1px solid rgba(255, 255, 255, 0.1)',
-                  borderRadius: '8px',
-                  padding: '6px 10px',
-                  boxShadow: '0 4px 12px rgba(0, 0, 0, 0.3)'
-                }}
-              >
-                {/* ... search input content ... */}
-                <input
-                  ref={searchInputRef}
-                  type="text"
-                  value={searchText}
-                  onChange={(e) => handleSearch(e.target.value)}
-                  onKeyDown={handleSearchKeyDown}
-                  placeholder="Search..."
-                  style={{
-                    backgroundColor: 'transparent',
-                    border: 'none',
-                    outline: 'none',
-                    color: '#fff',
-                    fontSize: '13px',
-                    width: '160px'
-                  }}
-                />
-                {searchText && (
-                  <span style={{
-                    fontSize: '11px',
-                    color: searchResults.resultCount > 0 ? 'rgba(255, 255, 255, 0.6)' : 'rgba(255, 100, 100, 0.8)',
-                    minWidth: '50px',
-                    textAlign: 'center'
-                  }}>
-                    {searchResults.resultCount > 0
-                      ? `${searchResults.resultIndex}/${searchResults.resultCount}`
-                      : 'No results'}
-                  </span>
-                )}
-                <button
-                  onClick={handleFindPrevious}
-                  disabled={searchResults.resultCount === 0}
-                  style={{ background: 'none', border: 'none', color: searchResults.resultCount > 0 ? 'rgba(255, 255, 255, 0.7)' : 'rgba(255, 255, 255, 0.3)', cursor: searchResults.resultCount > 0 ? 'pointer' : 'default', fontSize: '12px', padding: '2px 4px' }}
-                >▲</button>
-                <button
-                  onClick={handleFindNext}
-                  disabled={searchResults.resultCount === 0}
-                  style={{ background: 'none', border: 'none', color: searchResults.resultCount > 0 ? 'rgba(255, 255, 255, 0.7)' : 'rgba(255, 255, 255, 0.3)', cursor: searchResults.resultCount > 0 ? 'pointer' : 'default', fontSize: '12px', padding: '2px 4px' }}
-                >▼</button>
-                <button
-                  onClick={() => {
-                    setShowSearch(false);
-                    setSearchText('');
-                    setSearchResults({ resultIndex: 0, resultCount: 0 });
-                    if (effectiveTab?.id) {
-                      terminalRegistry.clearSearch(effectiveTab.id);
-                    }
-                  }}
-                  style={{ background: 'none', border: 'none', color: 'rgba(255, 255, 255, 0.5)', cursor: 'pointer', fontSize: '14px', padding: '2px 4px', marginLeft: '4px' }}
-                >✕</button>
-              </div>
             )}
 
             {/* File Preview Overlay */}
             {filePreview && <FilePreview />}
 
             {/* History Panel — overlay unless History pin mode is enabled. */}
-            {!historyPinned && historyPanelNode}
+            {!historyIsPrimary && !historyPinned && historyPanelNode}
           </div>
 
           {/* Claude control bar — Provider/Model/Effort/Think + Ctx meter +
@@ -842,6 +933,7 @@ export default function Workspace() {
           {effectiveTab && currentView === 'terminal' && effectiveTabType !== 'browser' && effectiveTabType !== 'file' && (
             <ClaudeControlBar
               tabId={effectiveTab.id}
+              projectId={activeProjectId}
               claudeSessionId={effectiveClaudeSessionId}
               geminiSessionId={effectiveGeminiSessionId}
               codexSessionId={effectiveCodexSessionId}
@@ -852,7 +944,7 @@ export default function Workspace() {
           )}
           </div>
 
-          {historyPinned && historyPanelNode}
+          {!historyIsPrimary && historyPinned && historyPanelNode}
 
           {/* Timeline — inside terminal row so it only spans terminal height */}
           {showTimeline && (
@@ -865,6 +957,7 @@ export default function Workspace() {
               isOpen={true}
               toolType={timelineToolType}
               pinned={timelinePinned}
+              historySurfaceVisible={historyIsPrimary}
             />
           )}
         </div>

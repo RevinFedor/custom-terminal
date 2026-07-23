@@ -1,6 +1,7 @@
 import React from 'react';
 import { useUIStore, ApiClaudeModel, ApiGeminiModel, ThinkingLevel } from '../../store/useUIStore';
 import { GEMINI_MODEL_OPTIONS } from '../../constants/geminiModels';
+import ControlHint from './ControlHint';
 
 const CLAUDE_MODELS: { id: ApiClaudeModel; label: string }[] = [
   { id: 'claude-sonnet-4.5', label: 'Sonnet 4.5' },
@@ -58,19 +59,21 @@ export default function ApiSettingsModal() {
           <h2 style={{ margin: 0, fontSize: '14px', fontWeight: '600', color: '#fff' }}>
             API Settings
           </h2>
-          <button
-            onClick={closeApiSettings}
-            style={{
-              background: 'none',
-              border: 'none',
-              color: '#666',
-              fontSize: '18px',
-              cursor: 'pointer',
-              lineHeight: 1,
-            }}
-          >
-            &times;
-          </button>
+          <ControlHint label="Закрыть API Settings" side="left">
+            <button
+              onClick={closeApiSettings}
+              style={{
+                background: 'none',
+                border: 'none',
+                color: '#666',
+                fontSize: '18px',
+                cursor: 'pointer',
+                lineHeight: 1,
+              }}
+            >
+              &times;
+            </button>
+          </ControlHint>
         </div>
 
         {/* Content */}

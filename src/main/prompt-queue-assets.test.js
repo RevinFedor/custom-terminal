@@ -54,6 +54,27 @@ test('same bytes deduplicate while preserving queue slot ids', async (t) => {
   assert.equal(refs[1].id, 9);
 });
 
+test('deduplicating old bytes refreshes asset age before garbage collection', async (t) => {
+  const f = await fixture();
+  t.after(f.cleanup);
+  let now = 1_900_000_000_000;
+  const store = new PromptQueueAssetStore({ rootDir: f.rootDir, now: () => now });
+  const first = await store.materializeRef({ id: 1, path: f.sourcePath, mediaType: 'image/png', size: 0 });
+  const oldDate = new Date(now - 40 * 24 * 60 * 60 * 1000);
+  await fs.promises.utimes(first.path, oldDate, oldDate);
+
+  now += 1000;
+  const duplicateSource = path.join(f.dir, 'duplicate.png');
+  await fs.promises.copyFile(f.sourcePath, duplicateSource);
+  const duplicate = await store.materializeRef({ id: 2, path: duplicateSource, mediaType: 'image/png', size: 0 });
+  assert.equal(duplicate.assetId, first.assetId);
+  assert.ok((await fs.promises.stat(first.path)).mtimeMs >= now - 5);
+
+  const result = await store.garbageCollect(new Set());
+  assert.deepEqual(result.removed, []);
+  assert.equal(fs.existsSync(first.path), true);
+});
+
 test('missing source remains explicit and is never reported available', async (t) => {
   const f = await fixture();
   t.after(f.cleanup);

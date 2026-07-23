@@ -460,11 +460,11 @@ const TOOLS = [
         operations: {
           type: 'array',
           minItems: 1,
-          description: 'Approved delta. Supported types: replace_plan, add_task, update_task, remove_task, add_subtask, update_subtask, remove_subtask.',
+          description: 'Approved delta. Supported types: replace_plan, add_task, update_task, remove_task, archive_task, restore_task, add_subtask, update_subtask, remove_subtask.',
           items: {
             type: 'object',
             properties: {
-              type: { type: 'string', enum: ['replace_plan', 'add_task', 'update_task', 'remove_task', 'add_subtask', 'update_subtask', 'remove_subtask'] },
+              type: { type: 'string', enum: ['replace_plan', 'add_task', 'update_task', 'remove_task', 'archive_task', 'restore_task', 'add_subtask', 'update_subtask', 'remove_subtask'] },
               taskId: { type: 'string' },
               subtaskId: { type: 'string' },
               title: { type: 'string' },

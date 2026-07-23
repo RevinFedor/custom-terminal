@@ -1,7 +1,7 @@
 # Feature: Prompt Picker (Opt+V)
 
 ## Intro
-Двухколонный keyboard-first picker для вставки промпта в активный таб. Заменил native macOS `Menu.popup({positioningItem})` который раньше открывался на Cmd+E как нативное контекстное меню с пунктом *Insert Prompt*. Те же данные из SQLite (`prompts` + `prompt_groups`), но рендерится React-portal'ом в `document.body`. Открывается одним хоткеем — **Opt+V**. Раньше существовал alias **Cmd+E**, но 16.05.2026 слот переназначен на toggle Tab Notes Slideout (см. `fact-notes.md`); Opt+V остаётся единственным keyboard-входом в picker.
+Двухколонный keyboard-first picker для вставки промпта в активный таб. Заменил native macOS `Menu.popup({positioningItem})` который раньше открывался на Cmd+E как нативное контекстное меню с пунктом *Insert Prompt*. Те же данные из SQLite (`prompts` + `prompt_groups`), но рендерится React-portal'ом в `document.body`. Keyboard-вход один — **Opt+V**. Раньше существовал alias **Cmd+E**, но 16.05.2026 слот переназначен на toggle Tab Notes Slideout (см. `fact-notes.md`).
 
 ## Why not native menu
 - Native menu **не настраивается визуально** — нельзя поменять шрифт, паддинги, скрыть фон.
@@ -23,6 +23,12 @@
 - **Esc** — закрытие.
 
 При входе фокус автоматически на первой строке, `pickerLevel='group'`. Mouse hover тоже двигает selection (left/right level переключается по hover-зоне).
+
+### History context level
+
+Правый клик по History composer открывает тот же picker на один уровень выше: `Insert Prompt` ведёт в существующие group/prompt колонки, `Scripts` показывает `npm run <name>` из `package.json` и видимые `*.sh` как `./file.sh`. Выбор скрипта вставляет точный текст без newline/`CR`, ничего не исполняет и не меняет lifecycle вкладки.
+
+Context-menu захватывает `tabId`, координаты и fallback cwd в момент правого клика. Перед чтением Scripts запрашивается live cwd PTY: пользователь мог сделать `cd` после создания вкладки. Последующий tab switch не перенаправляет вставку, а старое асинхронное чтение prompt-файлов не закрывает и не refocus'ит picker, открытый позже: каждый open имеет своё поколение.
 
 ### Layout reservation: правая панель не сжимает левую
 Правая колонка имеет **слот фиксированной ширины** даже когда содержимое скрыто:
@@ -51,7 +57,7 @@
 Стрелочки/Enter/Esc — non-printable, `e.key` для них одинаков везде, можно проверять по `key`.
 
 ## Settings: font + scale + geometry
-Шрифт picker'а вынесен в Settings → Шрифты («Prompt picker», default 12, диапазон 9-20). Все размеры панелей и паддингов скейлятся пропорционально:
+Шрифт picker'а вынесен в Settings → Размеры → «Меню промптов» («Шрифт», default 12, диапазон 9-20). Все размеры панелей и паддингов скейлятся пропорционально:
 - `LEFT_W = max(140, fontSize * 15)` ≈ 180px на 12px шрифте
 - `RIGHT_W = max(160, fontSize * 17)` ≈ 204px на 12px
 - `ROW_PAD_Y = max(3, fontSize * 0.33)` ≈ 4px
@@ -70,14 +76,17 @@
 
 ## Tab-type routing для вставки
 Picker сам резолвит куда вставлять через `getEffectiveTabId()` (sub-agent aware) + `tab.tabType`:
+- видимый History composer → tab-scoped History draft с вставкой в текущую caret/selection; floating xterm того же tab остаётся нетронутым;
 - `claude-sdk` → `window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', { detail: { tabId, text } }))` — тот же event что использует right-click SDK menu.
 - иначе (PTY: claude/gemini/bash) → `ipcRenderer.send('terminal:input', tabId, content)` + `ipcRenderer.invoke('terminal:paste', …)` для file_paths. Идентично существующему `cmd === 'insert-prompt'` handler'у в `App.tsx`.
 
+Target для Opt+V тоже фиксируется один раз при open. Если History был видим в этот момент, завершившееся позже чтение attached prompt-файлов вставляет туда же даже после переключения tab; mounted composer подтверждает доставку синхронно, а при его unmount текст дописывается напрямую в сохранённый History draft.
+
 ## Focus restore при закрытии (обязательно)
 
-`closePicker()` после `setOpen(false)` диспатчит `nt:window-refocus-active` через `requestAnimationFrame`. Без этого DOM-focus оставался на `<body>` после закрытия — клик по строке picker'а (это `<div>`, не focusable) блюрит xterm-textarea в `body`, а Esc/click-outside никогда не возвращали фокус назад. Симптом: после Opt+V → выбор промпта (или Esc) курсор пропадает из Claude TUI, юзер вынужден кликать в терминал руками. Юзер: *«мне приходится вручную нажимать лишний клик, чтобы поставить курсор обратно в input терминала»*.
+`closePicker()` после `setOpen(false)` возвращает focus той поверхности, которая была target при открытии: History получает свой tab-scoped focus event, SDK/terminal — общую шину `nt:window-refocus-active`. Без этого DOM-focus оставался на `<body>` после закрытия, а floating xterm мог украсть focus у History composer того же tab.
 
-Все пути закрытия проходят через единственный `closePicker` callback (Esc, ArrowLeft на левой колонке, click-outside, вставка промпта) — фикс в одном месте покрывает все. Переиспользуется существующая шина `nt:window-refocus-active` (Terminal.tsx + SDKComposer уже слушают, см. [`fact-cmd-tab-refocus.md`](fact-cmd-tab-refocus.md)), не изобретается своя focus-логика. `requestAnimationFrame` критичен — portal должен сначала unmount'иться, а SDK composer-insert отработать, прежде чем мы заберём focus; синхронный dispatch внутри того же тика фокуснул бы элемент который picker ещё перекрывает. Подтверждено живьём: до фикса `document.activeElement === body` после реального клика по строке, после фикса — `xterm-helper-textarea`.
+Все пути закрытия проходят через единственный `closePicker` callback (Esc, ArrowLeft, click-outside, вставка). `requestAnimationFrame` критичен — portal должен сначала unmount'иться, а composer-insert отработать, прежде чем возвращать focus. Подтверждено живьём для terminal: до фикса `document.activeElement === body`, после — `xterm-helper-textarea`.
 
 ## Backdrop отсутствует
 Полупрозрачной подложки нет — только click-outside listener на `mousedown` capture phase (см. `App.tsx::onDown` для других overlay'ев — палитра, контекст-меню). Юзер прямо: *«оверлей быть тоже не должно»* — picker должен открываться поверх UI без визуального dimming.
@@ -135,10 +144,10 @@ Right выигрывает у left умышленно: юзер часто ис�
 | `src/renderer/App.tsx::handlePickerOpenCapture` | Window keydown capture для Opt+V. |
 | `src/renderer/store/useUIStore.ts` | `promptPickerOpen`, `promptPickerFontSize`, `promptPickerBottomOffsetPx`, `promptPickerLeftOffsetPx`, `promptPickerRightOffsetPx` + сеттеры. Все persist в localStorage. |
 | `src/renderer/components/Workspace/Terminal.tsx` (оба `attachCustomKeyEventHandler`) | Double-safety guard: блокирует Opt+V и navigation keys, когда picker open. |
-| `src/renderer/components/UI/SettingsModal.tsx` | Четыре слайдера в секции «Шрифты интерфейса»: «Prompt picker» (шрифт), «Picker — отступ снизу/слева/справа». |
+| `src/renderer/components/UI/SettingsModal.tsx` | Четыре слайдера в Settings → Размеры → «Меню промптов»: шрифт и отступы снизу/слева/справа. |
 
 ## Что НЕ удалили (умышленно)
-- **Right-click context menu** на терминале/SDK — open'ится через `ipcMain.on('show-terminal-context-menu')` / `show-sdk-context-menu`. Native menu всё ещё нужен для правого клика, потому что macOS context-menu имеет правильный mouse-pointer-binding и кастомный picker мы туда не привязывали. Removed только клавиатурное открытие native menu (раньше — Cmd+E с `focusInsertPrompt:true`).
+- **Right-click context menu** на terminal/SDK — open'ится через `ipcMain.on('show-terminal-context-menu')` / `show-sdk-context-menu`. Native menu там остаётся. Исключение — History composer: его правый клик намеренно открывает кастомный `Insert Prompt / Scripts`, потому что вставка принадлежит видимому History input, а не hidden xterm.
 - **`focusInsertPrompt` параметр и `_insertPromptAnchor` маркер** в `main.js::show-*-context-menu` handler'ах — пока оставлены на случай, если решим вернуть keyboard-open native menu отдельным хоткеем.
 
 ## Что пробовали и не сработало

@@ -9,6 +9,10 @@ import {
   commitArchiveBeforeClose,
   isDurableSaveTabsAck,
 } from '../utils/tabPersistenceTransactions.mjs';
+import {
+  planCarriedCodexSettingsProofApplication,
+  projectCodexSettingsProofOwner,
+} from '../utils/codexSessionAdoption.mjs';
 
 const { ipcRenderer } = window.require('electron');
 let tabGroupSaveSeq = 0;
@@ -88,8 +92,13 @@ export interface TabTaskPlanItem {
   subtasks: TabTaskPlanSubtask[];
 }
 
+export interface TabTaskPlanArchivedItem extends TabTaskPlanItem {
+  archivedAt: number;
+}
+
 export interface TabTaskPlanHistoryEntry {
   items: TabTaskPlanItem[];
+  archivedItems: TabTaskPlanArchivedItem[];
   at: number;
   source: string;
 }
@@ -98,6 +107,7 @@ export interface TabTaskPlanDocument {
   version: 1;
   revision: number;
   items: TabTaskPlanItem[];
+  archivedItems: TabTaskPlanArchivedItem[];
   history: {
     past: TabTaskPlanHistoryEntry[];
     future: TabTaskPlanHistoryEntry[];
@@ -111,6 +121,8 @@ export type TabTaskPlanOperation =
   | { type: 'add_task'; id?: string; title: string; statusId?: string | null; subtasks?: Array<Partial<TabTaskPlanSubtask> & { title: string }>; afterTaskId?: string }
   | { type: 'update_task'; taskId: string; title?: string; statusId?: string | null }
   | { type: 'remove_task'; taskId: string }
+  | { type: 'archive_task'; taskId: string }
+  | { type: 'restore_task'; taskId: string }
   | { type: 'add_subtask'; taskId: string; id?: string; title: string; afterSubtaskId?: string }
   | { type: 'update_subtask'; taskId: string; subtaskId: string; title: string }
   | { type: 'remove_subtask'; taskId: string; subtaskId: string };
@@ -146,6 +158,16 @@ export type CodexSessionWriteReason =
   | 'editRange'
   | 'deleteRange'
   | 'unknown';
+
+export interface CodexSessionAdoptionOptions {
+  carryCodexSettingsProof?: boolean;
+  codexSettingsProof?: {
+    model: string;
+    effort: string;
+    proofAt: number;
+  } | null;
+  codexSettingsProofInvalid?: boolean;
+}
 
 export interface SessionHistoryEntry {
   sessionId: string;
@@ -492,6 +514,17 @@ export interface TabHistoryRestoreEntry {
   codex_session_id?: string | null;
   codex_model?: string | null;
   codex_effort?: string | null;
+  codex_settings_proof_at?: number | null;
+  codex_settings_proof_session_id?: string | null;
+  codex_model_migration_pending?: number | boolean | null;
+  codex_model_migration_restore_default_model?: number | boolean | null;
+  codex_model_migration_restore_default_effort?: number | boolean | null;
+  codex_model_migration_source_model?: string | null;
+  codex_model_migration_source_effort?: string | null;
+  codex_model_migration_target_model?: string | null;
+  codex_model_migration_config_path?: string | null;
+  codex_model_migration_config_fingerprint?: string | null;
+  codex_model_migration_config_already_target?: number | boolean | null;
   position?: number | null;
   process_was_running?: number | boolean | null;
   session_status?: string | null;
@@ -536,6 +569,20 @@ interface Tab {
   codexSessionId?: string; // Active Codex CLI session ID (detected from ~/.codex/sessions JSONL)
   codexModel?: string; // Per-tab Codex model selection for ControlBar launches
   codexEffort?: string; // Per-tab Codex reasoning effort selection for ControlBar launches
+  codexLiveModel?: string; // Transient current-conversation model; never persisted
+  codexLiveEffort?: string; // Ultra is conversation-only and lives here
+  codexLiveSettingsSessionId?: string; // Exact writer that owns the transient pair
+  codexSettingsProofAt?: number; // Time of latest launch/picker/turn_context proof
+  codexSettingsProofSessionId?: string; // Session that owns the settings proof
+  codexModelMigrationPending?: boolean; // Old launch pair was invalidated before native migration Enter
+  codexModelMigrationRestoreDefaultModel?: boolean; // Durable provenance for crash recovery
+  codexModelMigrationRestoreDefaultEffort?: boolean;
+  codexModelMigrationSourceModel?: string;
+  codexModelMigrationSourceEffort?: string;
+  codexModelMigrationTargetModel?: string;
+  codexModelMigrationConfigPath?: string;
+  codexModelMigrationConfigFingerprint?: string;
+  codexModelMigrationConfigAlreadyTarget?: boolean;
   externalRun?: {
     runId?: string;
     provider?: 'codex' | 'claude' | 'gemini' | string;
@@ -790,6 +837,17 @@ const restoreTabOptions = (savedTab: any) => ({
   codexSessionId: savedTab.codexSessionId,
   codexModel: savedTab.codexModel,
   codexEffort: savedTab.codexEffort,
+  codexSettingsProofAt: savedTab.codexSettingsProofAt,
+  codexSettingsProofSessionId: savedTab.codexSettingsProofSessionId,
+  codexModelMigrationPending: savedTab.codexModelMigrationPending,
+  codexModelMigrationRestoreDefaultModel: savedTab.codexModelMigrationRestoreDefaultModel,
+  codexModelMigrationRestoreDefaultEffort: savedTab.codexModelMigrationRestoreDefaultEffort,
+  codexModelMigrationSourceModel: savedTab.codexModelMigrationSourceModel,
+  codexModelMigrationSourceEffort: savedTab.codexModelMigrationSourceEffort,
+  codexModelMigrationTargetModel: savedTab.codexModelMigrationTargetModel,
+  codexModelMigrationConfigPath: savedTab.codexModelMigrationConfigPath,
+  codexModelMigrationConfigFingerprint: savedTab.codexModelMigrationConfigFingerprint,
+  codexModelMigrationConfigAlreadyTarget: savedTab.codexModelMigrationConfigAlreadyTarget,
   externalRun: savedTab.externalRun,
   wasInterrupted: savedTab.wasInterrupted,
   overlayDismissed: savedTab.overlayDismissed,
@@ -856,6 +914,17 @@ const createBrokenRestoredTab = (workspace: ProjectWorkspace, savedTab: any, err
     codexSessionId: savedTab.codexSessionId,
     codexModel: savedTab.codexModel,
     codexEffort: savedTab.codexEffort,
+    codexSettingsProofAt: savedTab.codexSettingsProofAt,
+    codexSettingsProofSessionId: savedTab.codexSettingsProofSessionId,
+    codexModelMigrationPending: savedTab.codexModelMigrationPending,
+    codexModelMigrationRestoreDefaultModel: savedTab.codexModelMigrationRestoreDefaultModel,
+    codexModelMigrationRestoreDefaultEffort: savedTab.codexModelMigrationRestoreDefaultEffort,
+    codexModelMigrationSourceModel: savedTab.codexModelMigrationSourceModel,
+    codexModelMigrationSourceEffort: savedTab.codexModelMigrationSourceEffort,
+    codexModelMigrationTargetModel: savedTab.codexModelMigrationTargetModel,
+    codexModelMigrationConfigPath: savedTab.codexModelMigrationConfigPath,
+    codexModelMigrationConfigFingerprint: savedTab.codexModelMigrationConfigFingerprint,
+    codexModelMigrationConfigAlreadyTarget: savedTab.codexModelMigrationConfigAlreadyTarget,
     externalRun: savedTab.externalRun,
     wasInterrupted: savedTab.wasInterrupted,
     overlayDismissed: savedTab.overlayDismissed,
@@ -1076,8 +1145,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; isUtility?: boolean; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; url?: string; filePath?: string; afterTabId?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean }) => Promise<boolean>;
   restoreTabHistoryEntry: (projectId: string, historyId?: number, options?: TabHistoryRestoreOptions) => Promise<TabHistoryRestoreResult>;
   reopenLastClosedTab: (projectId: string) => Promise<TabHistoryRestoreResult>;
@@ -1122,6 +1191,7 @@ interface WorkspaceStore {
   moveTabToZone: (projectId: string, tabId: string, toUtility: boolean, atIndex: number, sourceIds?: string[]) => void;
   moveTabToProject: (sourceProjectId: string, tabId: string, targetProjectId: string) => Promise<boolean>;
   moveTabsToProject: (sourceProjectId: string, tabIds: string[], targetProjectId: string) => Promise<boolean>;
+  moveTabGroupToProject: (sourceProjectId: string, groupId: string, targetProjectId: string) => Promise<boolean>;
   createTabGroup: (projectId: string, name?: string) => string;
   renameTabGroup: (projectId: string, groupId: string, name: string) => void;
   toggleTabGroupCollapsed: (projectId: string, groupId: string) => void;
@@ -1152,9 +1222,15 @@ interface WorkspaceStore {
   getGeminiSessionId: (tabId: string) => string | null;
 
   // Codex session tracking
-  setCodexSessionId: (tabId: string, sessionId: string, reason?: CodexSessionWriteReason) => Promise<boolean>;
+  setCodexSessionId: (
+    tabId: string,
+    sessionId: string,
+    reason?: CodexSessionWriteReason,
+    options?: CodexSessionAdoptionOptions,
+  ) => Promise<boolean>;
   getCodexSessionId: (tabId: string) => string | null;
-  updateCodexState: (tabId: string, state: Partial<Pick<Tab, 'codexModel' | 'codexEffort'>>) => void;
+  updateCodexState: (tabId: string, state: Partial<Pick<Tab, 'codexModel' | 'codexEffort' | 'codexSettingsProofAt' | 'codexSettingsProofSessionId' | 'codexModelMigrationPending' | 'codexModelMigrationRestoreDefaultModel' | 'codexModelMigrationRestoreDefaultEffort' | 'codexModelMigrationSourceModel' | 'codexModelMigrationSourceEffort' | 'codexModelMigrationTargetModel' | 'codexModelMigrationConfigPath' | 'codexModelMigrationConfigFingerprint' | 'codexModelMigrationConfigAlreadyTarget'>>) => void;
+  updateCodexLiveState: (tabId: string, state: Pick<Tab, 'codexLiveModel' | 'codexLiveEffort' | 'codexLiveSettingsSessionId'>) => void;
   updateExternalRunMeta: (tabId: string, meta: Partial<NonNullable<Tab['externalRun']>>) => void;
 
   setClaudeActive: (tabId: string, alive: boolean) => void;
@@ -1282,6 +1358,17 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     codexSessionId: tab.codexSessionId,
     codexModel: tab.codexModel,
     codexEffort: tab.codexEffort,
+    codexSettingsProofAt: tab.codexSettingsProofAt,
+    codexSettingsProofSessionId: tab.codexSettingsProofSessionId,
+    codexModelMigrationPending: tab.codexModelMigrationPending,
+    codexModelMigrationRestoreDefaultModel: tab.codexModelMigrationRestoreDefaultModel,
+    codexModelMigrationRestoreDefaultEffort: tab.codexModelMigrationRestoreDefaultEffort,
+    codexModelMigrationSourceModel: tab.codexModelMigrationSourceModel,
+    codexModelMigrationSourceEffort: tab.codexModelMigrationSourceEffort,
+    codexModelMigrationTargetModel: tab.codexModelMigrationTargetModel,
+    codexModelMigrationConfigPath: tab.codexModelMigrationConfigPath,
+    codexModelMigrationConfigFingerprint: tab.codexModelMigrationConfigFingerprint,
+    codexModelMigrationConfigAlreadyTarget: tab.codexModelMigrationConfigAlreadyTarget,
     externalRun: tab.externalRun,
     wasInterrupted: tab.wasInterrupted,
     overlayDismissed: tab.overlayDismissed,
@@ -1362,8 +1449,8 @@ const saveTabGroups = (projectId: string, groups: TabGroup[]) => {
     ` groups=${summarizeDndGroups(groups)}` +
     ` t=${Math.round(start)}`
   );
-  ipcRenderer.invoke('project:save-tab-groups', { projectId, groups })
-    .then(() => {
+  return ipcRenderer.invoke('project:save-tab-groups', { projectId, groups })
+    .then((result: any) => {
       console.warn(
         '[TabGroupCollapse:save]' +
         ' phase=done' +
@@ -1372,7 +1459,8 @@ const saveTabGroups = (projectId: string, groups: TabGroup[]) => {
         ` durMs=${Math.round(performance.now() - start)}` +
         ` groups=${summarizeDndGroups(groups)}`
       );
-      notifyProjectLayoutChanged(projectId, 'tab-groups');
+      if (result?.success !== false) notifyProjectLayoutChanged(projectId, 'tab-groups');
+      return result;
     })
     .catch((error: unknown) => {
       console.warn(
@@ -1383,6 +1471,7 @@ const saveTabGroups = (projectId: string, groups: TabGroup[]) => {
         ` durMs=${Math.round(performance.now() - start)}` +
         ` error=${error instanceof Error ? JSON.stringify(error.message) : JSON.stringify(String(error))}`
       );
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
     });
 };
 
@@ -2084,6 +2173,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       codexSessionId: options?.codexSessionId,
       codexModel: options?.codexModel,
       codexEffort: options?.codexEffort,
+      codexSettingsProofAt: (options as any)?.codexSettingsProofAt,
+      codexSettingsProofSessionId: (options as any)?.codexSettingsProofSessionId,
+      codexModelMigrationPending: (options as any)?.codexModelMigrationPending,
+      codexModelMigrationRestoreDefaultModel: (options as any)?.codexModelMigrationRestoreDefaultModel,
+      codexModelMigrationRestoreDefaultEffort: (options as any)?.codexModelMigrationRestoreDefaultEffort,
+      codexModelMigrationSourceModel: (options as any)?.codexModelMigrationSourceModel,
+      codexModelMigrationSourceEffort: (options as any)?.codexModelMigrationSourceEffort,
+      codexModelMigrationTargetModel: (options as any)?.codexModelMigrationTargetModel,
+      codexModelMigrationConfigPath: (options as any)?.codexModelMigrationConfigPath,
+      codexModelMigrationConfigFingerprint: (options as any)?.codexModelMigrationConfigFingerprint,
+      codexModelMigrationConfigAlreadyTarget: (options as any)?.codexModelMigrationConfigAlreadyTarget,
       externalRun: options?.externalRun,
       wasInterrupted: options?.wasInterrupted,
       overlayDismissed: options?.overlayDismissed,
@@ -2232,6 +2332,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       codexSessionId: options?.codexSessionId,
       codexModel: options?.codexModel,
       codexEffort: options?.codexEffort,
+      codexSettingsProofAt: (options as any)?.codexSettingsProofAt,
+      codexSettingsProofSessionId: (options as any)?.codexSettingsProofSessionId,
+      codexModelMigrationPending: (options as any)?.codexModelMigrationPending,
+      codexModelMigrationRestoreDefaultModel: (options as any)?.codexModelMigrationRestoreDefaultModel,
+      codexModelMigrationRestoreDefaultEffort: (options as any)?.codexModelMigrationRestoreDefaultEffort,
+      codexModelMigrationSourceModel: (options as any)?.codexModelMigrationSourceModel,
+      codexModelMigrationSourceEffort: (options as any)?.codexModelMigrationSourceEffort,
+      codexModelMigrationTargetModel: (options as any)?.codexModelMigrationTargetModel,
+      codexModelMigrationConfigPath: (options as any)?.codexModelMigrationConfigPath,
+      codexModelMigrationConfigFingerprint: (options as any)?.codexModelMigrationConfigFingerprint,
+      codexModelMigrationConfigAlreadyTarget: (options as any)?.codexModelMigrationConfigAlreadyTarget,
       wasInterrupted: options?.wasInterrupted,
       overlayDismissed: options?.overlayDismissed,
       notes: options?.notes,
@@ -2455,6 +2566,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           codexSessionId: tab.codexSessionId,
           codexModel: tab.codexModel,
           codexEffort: tab.codexEffort,
+          codexSettingsProofAt: tab.codexSettingsProofAt,
+          codexSettingsProofSessionId: tab.codexSettingsProofSessionId,
+          codexModelMigrationPending: tab.codexModelMigrationPending,
+          codexModelMigrationRestoreDefaultModel: tab.codexModelMigrationRestoreDefaultModel,
+          codexModelMigrationRestoreDefaultEffort: tab.codexModelMigrationRestoreDefaultEffort,
+          codexModelMigrationSourceModel: tab.codexModelMigrationSourceModel,
+          codexModelMigrationSourceEffort: tab.codexModelMigrationSourceEffort,
+          codexModelMigrationTargetModel: tab.codexModelMigrationTargetModel,
+          codexModelMigrationConfigPath: tab.codexModelMigrationConfigPath,
+          codexModelMigrationConfigFingerprint: tab.codexModelMigrationConfigFingerprint,
+          codexModelMigrationConfigAlreadyTarget: tab.codexModelMigrationConfigAlreadyTarget,
           sessionStatus: tab.sessionStatus,
           groupId: tab.groupId,
           position: closedPosition >= 0 ? closedPosition : null,
@@ -2668,6 +2790,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         codexSessionId: entry.codex_session_id || undefined,
         codexModel: entry.codex_model || undefined,
         codexEffort: entry.codex_effort || undefined,
+        codexSettingsProofAt: Number(entry.codex_settings_proof_at) || undefined,
+        codexSettingsProofSessionId: entry.codex_settings_proof_session_id || undefined,
+        codexModelMigrationPending: entry.codex_model_migration_pending === 1 || entry.codex_model_migration_pending === true || undefined,
+        codexModelMigrationRestoreDefaultModel: entry.codex_model_migration_restore_default_model === 1 || entry.codex_model_migration_restore_default_model === true || undefined,
+        codexModelMigrationRestoreDefaultEffort: entry.codex_model_migration_restore_default_effort === 1 || entry.codex_model_migration_restore_default_effort === true || undefined,
+        codexModelMigrationSourceModel: entry.codex_model_migration_source_model || undefined,
+        codexModelMigrationSourceEffort: entry.codex_model_migration_source_effort || undefined,
+        codexModelMigrationTargetModel: entry.codex_model_migration_target_model || undefined,
+        codexModelMigrationConfigPath: entry.codex_model_migration_config_path || undefined,
+        codexModelMigrationConfigFingerprint: entry.codex_model_migration_config_fingerprint || undefined,
+        codexModelMigrationConfigAlreadyTarget: entry.codex_model_migration_config_already_target === 1 || entry.codex_model_migration_config_already_target === true || undefined,
         sessionStatus: entry.session_status || undefined,
         nameSetManually: entry.name_set_manually === 1,
         groupId: restoredGroupId,
@@ -3621,6 +3754,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       return false;
     }
 
+    const movingSet = new Set(movingIds);
     let lastId: string | null = null;
     for (const tabId of movingIds) {
       const tab = src.tabs.get(tabId);
@@ -3628,7 +3762,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       src.tabs.delete(tabId);
       tab.isUtility = false;
       tab.groupId = undefined;
-      tab.visualParentTabId = undefined;
+      if (!tab.visualParentTabId || !movingSet.has(tab.visualParentTabId)) {
+        tab.visualParentTabId = undefined;
+      }
       tgt.tabs.set(tabId, tab);
       lastId = tabId;
     }
@@ -3645,7 +3781,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
     // Clear selection in source
     src.selectedTabIds = src.selectedTabIds.filter(id => src.tabs.has(id));
-    const movingSet = new Set(movingIds);
     let sourceGroupsChanged = false;
     src.tabGroups = src.tabGroups.map((group) => {
       if (!group.anchorTabId || !movingSet.has(group.anchorTabId)) return group;
@@ -3661,6 +3796,126 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (sourceGroupsChanged) saveTabGroups(src.projectId, src.tabGroups);
 
     log.tabs(`[moveTabsToProject] Moved ${movingIds.length} tabs from ${sourceProjectId} to ${targetProjectId}`);
+    return true;
+  },
+
+  moveTabGroupToProject: async (sourceProjectId, groupId, targetProjectId) => {
+    if (sourceProjectId === targetProjectId) return false;
+
+    const { openProjects } = get();
+    const source = openProjects.get(sourceProjectId);
+    const target = openProjects.get(targetProjectId);
+    if (!source || !target) return false;
+
+    const group = source.tabGroups.find((candidate) => candidate.id === groupId);
+    if (!group) return false;
+    const movingEntries = Array.from(source.tabs.entries()).filter(([, tab]) => tab.groupId === groupId);
+    const movingIds = movingEntries.map(([tabId]) => tabId);
+    if (movingIds.some((tabId) => target.tabs.has(tabId))) return false;
+
+    let targetGroupId = `${targetProjectId}-group-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    while (target.tabGroups.some((candidate) => candidate.id === targetGroupId)) {
+      targetGroupId = `${targetProjectId}-group-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    }
+
+    const sourceTabsAck = await saveTabs(source.projectId, source.tabs);
+    const targetTabsAck = await saveTabs(target.projectId, target.tabs);
+    const sourceGroupsAck = await saveTabGroups(source.projectId, source.tabGroups);
+    const targetGroupsAck = await saveTabGroups(target.projectId, target.tabGroups);
+    if (
+      !isDurableSaveTabsAck(sourceTabsAck)
+      || !isDurableSaveTabsAck(targetTabsAck)
+      || sourceGroupsAck?.success !== true
+      || targetGroupsAck?.success !== true
+    ) {
+      console.warn('[moveTabGroupToProject] durable snapshot failed group=' + dndShortId(groupId));
+      return false;
+    }
+
+    // The durable preflight can itself trigger a project-layout broadcast.
+    // Re-read Zustand after those awaits so a late reload cannot make this
+    // transaction apply to stale workspace objects.
+    const currentOpenProjects = get().openProjects;
+    const currentSource = currentOpenProjects.get(sourceProjectId);
+    const currentTarget = currentOpenProjects.get(targetProjectId);
+    const currentGroup = currentSource?.tabGroups.find((candidate) => candidate.id === groupId);
+    const currentMovingEntries = currentSource
+      ? Array.from(currentSource.tabs.entries()).filter(([, tab]) => tab.groupId === groupId)
+      : [];
+    const currentMovingIds = currentMovingEntries.map(([tabId]) => tabId);
+    const expectedMovingSet = new Set(movingIds);
+    if (
+      !currentSource
+      || !currentTarget
+      || !currentGroup
+      || currentMovingIds.length !== movingIds.length
+      || currentMovingIds.some((tabId) => !expectedMovingSet.has(tabId))
+      || currentMovingIds.some((tabId) => currentTarget.tabs.has(tabId))
+      || currentTarget.tabGroups.some((candidate) => candidate.id === targetGroupId)
+    ) {
+      console.warn('[moveTabGroupToProject] state changed during preflight group=' + dndShortId(groupId));
+      return false;
+    }
+
+    let transfer: any;
+    try {
+      transfer = ipcRenderer.sendSync('terminal:transfer-tab-group-ownership-sync', {
+        sourceProjectId,
+        targetProjectId,
+        groupId,
+        targetGroupId,
+        tabIds: currentMovingIds,
+      });
+    } catch (error) {
+      console.warn('[moveTabGroupToProject] ownership commit failed group=' + dndShortId(groupId)
+        + ' error=' + (error instanceof Error ? error.message : String(error)));
+      return false;
+    }
+    if (transfer?.success !== true) {
+      console.warn('[moveTabGroupToProject] ownership commit rejected group=' + dndShortId(groupId)
+        + ' error=' + (transfer?.error || 'unknown'));
+      return false;
+    }
+
+    const movingSet = new Set(currentMovingIds);
+    for (const [tabId, tab] of currentMovingEntries) {
+      currentSource.tabs.delete(tabId);
+      tab.isUtility = false;
+      tab.groupId = targetGroupId;
+      if (!tab.visualParentTabId || !movingSet.has(tab.visualParentTabId)) {
+        tab.visualParentTabId = undefined;
+      }
+      currentTarget.tabs.set(tabId, tab);
+    }
+    for (const tab of currentSource.tabs.values()) {
+      if (tab.visualParentTabId && movingSet.has(tab.visualParentTabId)) {
+        tab.visualParentTabId = undefined;
+      }
+    }
+
+    currentSource.tabGroups = currentSource.tabGroups.filter((candidate) => candidate.id !== groupId);
+    const { anchorTabId: _sourceAnchor, ...groupWithoutAnchor } = currentGroup;
+    currentTarget.tabGroups = [...currentTarget.tabGroups, { ...groupWithoutAnchor, id: targetGroupId }];
+
+    const movedActiveTabId = currentSource.activeTabId && movingSet.has(currentSource.activeTabId)
+      ? currentSource.activeTabId
+      : null;
+    if (movedActiveTabId) currentSource.activeTabId = Array.from(currentSource.tabs.keys())[0] || null;
+    currentSource.selectedTabIds = currentSource.selectedTabIds.filter((tabId) => !movingSet.has(tabId));
+    if (currentSource.activeGroupId === groupId) currentSource.activeGroupId = null;
+
+    const preferredTargetTab = movedActiveTabId || currentMovingIds[0] || null;
+    if (preferredTargetTab) currentTarget.activeTabId = preferredTargetTab;
+    currentTarget.activeGroupId = targetGroupId;
+    currentTarget.selectedTabIds = [];
+
+    set({ openProjects: new Map(currentOpenProjects) });
+    notifyProjectLayoutChanged(sourceProjectId, 'tab-group-project-transfer');
+    notifyProjectLayoutChanged(targetProjectId, 'tab-group-project-transfer');
+    log.tabs(
+      `[moveTabGroupToProject] Moved group ${groupId} (${currentMovingIds.length} tabs)`
+      + ` from ${sourceProjectId} to ${targetProjectId}`
+    );
     return true;
   },
 
@@ -4189,13 +4444,50 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   // Codex session tracking (detected from ~/.codex/sessions JSONL)
-  setCodexSessionId: async (tabId, sessionId, reason = 'detected') => {
+  setCodexSessionId: async (tabId, sessionId, reason = 'detected', options = {}) => {
     const { openProjects } = get();
 
     for (const [projectId, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (tab) {
-        if (tab.codexSessionId === sessionId) return true;
+        const carriedSettingsPlan = options.codexSettingsProofInvalid === true
+          ? { allowed: false, reason: 'carried-codex-settings-proof-invalid' }
+          : options.codexSettingsProof
+            ? planCarriedCodexSettingsProofApplication({
+              proof: options.codexSettingsProof,
+              nextSessionId: sessionId,
+              currentPersistentEffort: tab.codexEffort,
+            })
+            : null;
+        const applyCarriedSettings = () => {
+          if (!carriedSettingsPlan?.allowed) return false;
+          Object.assign(tab, carriedSettingsPlan.persistentPatch, carriedSettingsPlan.livePatch);
+          return true;
+        };
+        const projectedSettingsProofOwner = projectCodexSettingsProofOwner({
+          currentProofAt: tab.codexSettingsProofAt,
+          currentProofSessionId: tab.codexSettingsProofSessionId,
+          nextSessionId: sessionId,
+          carryCodexSettingsProof: options.carryCodexSettingsProof === true,
+        });
+        const carriesLiveSettings = projectedSettingsProofOwner === sessionId
+          && tab.codexSettingsProofSessionId !== sessionId;
+        if (tab.codexSessionId === sessionId) {
+          const carriedSettingsApplied = applyCarriedSettings();
+          if ((carriesLiveSettings || carriedSettingsApplied)
+            && tab.codexSettingsProofAt) {
+            if (!carriedSettingsApplied) {
+              tab.codexSettingsProofSessionId = projectedSettingsProofOwner;
+            }
+            saveTabsThenNotifyProjectLayoutChanged(
+              workspace.projectId,
+              workspace.tabs,
+              'codex-settings-owner-handoff',
+            );
+            set({});
+          }
+          return true;
+        }
         const prev = tab.codexSessionId;
         const persistentHistoryMutation = ['editRange', 'deleteRange', 'api-edit-range', 'api-delete-range'].includes(reason);
         if (persistentHistoryMutation) {
@@ -4209,9 +4501,28 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           clearPendingAutoTabTitle(tabId, !sessionId ? 'codex-session-cleared' : 'codex-session-changed');
         }
         tab.codexSessionId = sessionId;
+        if (tab.codexLiveSettingsSessionId && tab.codexLiveSettingsSessionId !== sessionId) {
+          if (carriesLiveSettings && tab.codexLiveSettingsSessionId === prev) {
+            tab.codexLiveSettingsSessionId = sessionId;
+          } else {
+            tab.codexLiveModel = undefined;
+            tab.codexLiveEffort = undefined;
+            tab.codexLiveSettingsSessionId = undefined;
+          }
+        }
+        if (carriesLiveSettings && tab.codexSettingsProofAt) {
+          // Native Rewind keeps the same live Codex process/settings while its
+          // rollout writer moves from the source to the proven child.
+          tab.codexSettingsProofSessionId = projectedSettingsProofOwner;
+        }
+        const carriedSettingsApplied = applyCarriedSettings();
+        if (options.codexSettingsProofInvalid === true) {
+          console.warn('[CodexSettingsProof:R] exact carried settings rejected tab=' + String(tabId).slice(-12)
+            + ' writer=' + String(sessionId).slice(0, 8));
+        }
         tab.wasInterrupted = false;
         tab.overlayDismissed = false;
-        console.log(`[Workspace] Codex session set for tab ${tabId}: ${sessionId} (reason=${reason}, reset overlay flags)`);
+        console.log(`[Workspace] Codex session set for tab ${tabId}: ${sessionId} (reason=${reason}, reset overlay flags, carriedSettings=${carriedSettingsApplied})`);
         if (persistentHistoryMutation) {
           const saveResult = await saveTabs(workspace.projectId, workspace.tabs);
           if (saveResult?.success !== false) notifyProjectLayoutChanged(workspace.projectId, reason);
@@ -4245,18 +4556,95 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     for (const [, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (!tab) continue;
+      const changesSettings = 'codexModel' in state || 'codexEffort' in state;
+      const nextState = {
+        ...state,
+        ...(changesSettings
+          ? {
+            codexLiveModel: undefined,
+            codexLiveEffort: undefined,
+            codexLiveSettingsSessionId: undefined,
+          }
+          : {}),
+        ...(changesSettings
+          && !('codexSettingsProofAt' in state)
+          ? { codexSettingsProofAt: Date.now() }
+          : {}),
+        ...(changesSettings
+          && !('codexSettingsProofSessionId' in state)
+          && tab.codexSessionId
+          ? { codexSettingsProofSessionId: tab.codexSessionId }
+          : {}),
+        ...(changesSettings
+          && !('codexModelMigrationPending' in state)
+          ? { codexModelMigrationPending: false }
+          : {}),
+        ...(changesSettings
+          && !('codexModelMigrationRestoreDefaultModel' in state)
+          ? { codexModelMigrationRestoreDefaultModel: false }
+          : {}),
+        ...(changesSettings
+          && !('codexModelMigrationRestoreDefaultEffort' in state)
+          ? { codexModelMigrationRestoreDefaultEffort: false }
+          : {}),
+        ...(changesSettings
+          && !('codexModelMigrationSourceModel' in state)
+          ? { codexModelMigrationSourceModel: undefined }
+          : {}),
+        ...(changesSettings
+          && !('codexModelMigrationSourceEffort' in state)
+          ? { codexModelMigrationSourceEffort: undefined }
+          : {}),
+        ...(changesSettings
+          && !('codexModelMigrationTargetModel' in state)
+          ? { codexModelMigrationTargetModel: undefined }
+          : {}),
+        ...(changesSettings
+          && !('codexModelMigrationConfigPath' in state)
+          ? { codexModelMigrationConfigPath: undefined }
+          : {}),
+        ...(changesSettings
+          && !('codexModelMigrationConfigFingerprint' in state)
+          ? { codexModelMigrationConfigFingerprint: undefined }
+          : {}),
+        ...(changesSettings
+          && !('codexModelMigrationConfigAlreadyTarget' in state)
+          ? { codexModelMigrationConfigAlreadyTarget: undefined }
+          : {}),
+      };
 
       let changed = false;
-      for (const key of Object.keys(state) as (keyof typeof state)[]) {
-        if ((tab as any)[key] !== state[key]) {
+      for (const key of Object.keys(nextState) as (keyof typeof nextState)[]) {
+        if ((tab as any)[key] !== nextState[key]) {
           changed = true;
           break;
         }
       }
       if (!changed) return;
 
-      Object.assign(tab, state);
+      Object.assign(tab, nextState);
       saveTabs(workspace.projectId, workspace.tabs);
+      set({});
+      return;
+    }
+  },
+
+  updateCodexLiveState: (tabId, state) => {
+    const { openProjects } = get();
+    for (const [, workspace] of openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (!tab) continue;
+      if (
+        tab.codexLiveModel === state.codexLiveModel
+        && tab.codexLiveEffort === state.codexLiveEffort
+        && tab.codexLiveSettingsSessionId === state.codexLiveSettingsSessionId
+      ) {
+        return;
+      }
+      tab.codexLiveModel = state.codexLiveModel;
+      tab.codexLiveEffort = state.codexLiveEffort;
+      tab.codexLiveSettingsSessionId = state.codexLiveSettingsSessionId;
+      // Deliberately no saveTabs: this state describes one live writer only.
       set({});
       return;
     }
@@ -4725,7 +5113,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           name: tab.name, cwd: tab.cwd, color: tab.color, isUtility: tab.isUtility,
           commandType: tab.commandType, claudeSessionId: tab.claudeSessionId,
           geminiSessionId: tab.geminiSessionId, codexSessionId: tab.codexSessionId,
-          codexModel: tab.codexModel, codexEffort: tab.codexEffort, externalRun: tab.externalRun, sessionStatus: tab.sessionStatus, wasInterrupted: tab.wasInterrupted,
+          codexModel: tab.codexModel, codexEffort: tab.codexEffort, codexSettingsProofAt: tab.codexSettingsProofAt, codexSettingsProofSessionId: tab.codexSettingsProofSessionId, codexModelMigrationPending: tab.codexModelMigrationPending, codexModelMigrationRestoreDefaultModel: tab.codexModelMigrationRestoreDefaultModel, codexModelMigrationRestoreDefaultEffort: tab.codexModelMigrationRestoreDefaultEffort, codexModelMigrationSourceModel: tab.codexModelMigrationSourceModel, codexModelMigrationSourceEffort: tab.codexModelMigrationSourceEffort, codexModelMigrationTargetModel: tab.codexModelMigrationTargetModel, codexModelMigrationConfigPath: tab.codexModelMigrationConfigPath, codexModelMigrationConfigFingerprint: tab.codexModelMigrationConfigFingerprint, codexModelMigrationConfigAlreadyTarget: tab.codexModelMigrationConfigAlreadyTarget, externalRun: tab.externalRun, sessionStatus: tab.sessionStatus, wasInterrupted: tab.wasInterrupted,
           overlayDismissed: tab.overlayDismissed, notes: tab.notes, taskPlan: tab.taskPlan, tabType: tab.tabType,
           url: tab.url, filePath: tab.filePath, terminalId: tab.terminalId, terminalName: tab.terminalName,
           activeView: tab.activeView, createdAt: tab.createdAt, isCollapsed: tab.isCollapsed,

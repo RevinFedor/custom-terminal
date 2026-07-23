@@ -19,6 +19,7 @@ import {
 import '@noted/file-explorer/styles.css'
 import '@noted/file-explorer/context-menu.css'
 import Tooltip from '../UI/Tooltip'
+import ControlHint from '../UI/ControlHint'
 import IconCropper from './IconCropper'
 import { RunAfterTabPicker } from './RunAfterTabPicker'
 import { getValue, setValue } from '../../utils/storage'
@@ -1485,25 +1486,25 @@ function Sidebar({
           </svg>
         </div>
         {/* New File */}
-        <Tooltip content="New file">
+        <ControlHint label="Создать файл" side="bottom">
         <button className="sidebar-toolbar-btn" onClick={() => handleNewFile(getTargetParentNode())}>
           <svg width="16" height="16" viewBox="0 0 16 16"><path d="M9.5 1H4a1 1 0 00-1 1v12a1 1 0 001 1h8a1 1 0 001-1V4.5L9.5 1z" stroke="currentColor" strokeWidth="1.2" fill="none"/><path d="M9 1v4h4" stroke="currentColor" strokeWidth="1.2" fill="none"/><path d="M8 7v4M6 9h4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
         </button>
-        </Tooltip>
+        </ControlHint>
         {/* New Folder */}
-        <Tooltip content="New folder">
+        <ControlHint label="Создать папку" side="bottom">
         <button className="sidebar-toolbar-btn" onClick={() => handleNewFolder(getTargetParentNode())}>
           <svg width="16" height="16" viewBox="0 0 16 16"><path d="M2 3.5h4.5l1.5 1.5H14v8H2z" stroke="currentColor" strokeWidth="1.2" fill="none" strokeLinejoin="round"/><path d="M8 7.5v3M6.5 9h3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
         </button>
-        </Tooltip>
+        </ControlHint>
         {/* Add directory */}
-        <Tooltip content="Add directory">
+        <ControlHint label="Добавить директорию" side="bottom">
         <button className="sidebar-toolbar-btn" onClick={onAddDirectory}>
           <svg width="16" height="16" viewBox="0 0 16 16">
             <path d="M8 2v12M2 8h12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
           </svg>
         </button>
-        </Tooltip>
+        </ControlHint>
         {dirDropdownOpen && (
           <div className="directory-dropdown">
             {directories.map(dir => (
@@ -1513,7 +1514,7 @@ function Sidebar({
                 onClick={() => { onSwitchDirectory(dir); setDirDropdownOpen(false) }}
               >
                 <span className="directory-item-name">{dir.split('/').pop()}</span>
-                <Tooltip content="Remove">
+                <ControlHint label="Убрать директорию" side="right">
                 <button
                   className="directory-item-remove"
                   onClick={(e) => { e.stopPropagation(); onRemoveDirectory(dir) }}
@@ -1522,7 +1523,7 @@ function Sidebar({
                     <path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
                   </svg>
                 </button>
-                </Tooltip>
+                </ControlHint>
               </div>
           ))}
           </div>

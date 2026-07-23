@@ -48,6 +48,16 @@ Shift-range строится по уже применённому видимом
 
 Диагностически эти классы различаются так: неверный boundary меняет preview-order при стабильной геометрии scroller; host reflow сохраняет order, но одновременно меняет rect строк или размеры scroller. Поэтому при повторении сначала логируются оба набора данных, а не подкручивается threshold вслепую.
 
+## Короткий список терял cursor-anchor и post-drop scroll
+
+Production-жесты 2026-07-23 показали два связанных симптома в Custom Terminal: после X-left вкладка или поддерево падали вниз, но grab-point смещался к верхней границе либо source совсем оставался выше pointer; созданный снизу искусственный scroll-range исчезал сразу после release. Для длинного списка reserve недобирал примерно один межстрочный шаг, а для короткого списка лог показывал reserve `63`, но фактическую компенсацию `0`.
+
+Неверным было предположение `naturalMax = max(0, scrollHeight - clientHeight) - reserve`. DOM всегда зажимает `scrollHeight` минимумом viewport, поэтому у списка, который короче панели на 400 px, underfill исчезает из числа: чтобы получить `scrollTop=63`, нужен spacer `463`, а прежняя формула добавляла только `63`. После неудачной компенсации rebase принимал новое положение source за норму и переписывал grab-offset; commit затем вычислял lease из того же clamped max и сразу снимал физическую опору.
+
+Shared React-слой теперь измеряет raw natural max от отдельного маркера реального конца контента; значение намеренно может быть отрицательным. Reserve учитывает underfill, при браузерном clamp выполняет измеренную correction-pass, а успешный screen-anchor сохраняет pickup-time `grabOffsetY`. В Custom Terminal обнаружился дополнительный host-дефект: spacer стоял перед EmptyDropZone, а не последним child scroller, поэтому маркер не обозначал конец всей поверхности. После переноса маркера reserve и post-drop lease используют одну физическую геометрию. Логи `horizontal-anchor-correction` и `scroll-lease` отделяют недостающий range от прежних resolver/FLIP-багов.
+
+Класс проблемы — `architecture issue` в shared viewport-модели плюс локально неверное размещение маркера Custom Terminal. Исправление пакета автоматически доступно GT Editor как потребителю, но production-логи воспроизводили только проекты внутри Custom Terminal; отдельная GT host-приёмка всё ещё нужна прежде чем объявлять её подтверждённой.
+
 ## Подтверждение
 
 Trusted Electron-прогоны подтвердили атомарное пересечение собственного и чужого subtree, перенос групп с участниками, вход/выход поддерева из пустой группы, многоуровневые indent/outdent, смену X→Y в одном удержании, multi-selection в обратном порядке, autoscroll в обе стороны и persistence после перезапуска/переоткрытия Settings. Отдельная матрица первого X доказала start/middle/end без дополнительного Y (`15:25:32.592`, `15:27:38.171`, `15:29:43.922`): DOM-preview и SQLite после drop совпали, `attach-to-previous-peer` отсутствовал. Outside и системный Escape очистили feedback до mouseup без записи; CDP `electron_press Escape` нативный HTML5 drag не отменяет, поэтому `dragend dropEffect=none` этим каналом не считается доказанным. Ранний release до отрисовки новой проекции также дал ноль commit.
@@ -55,5 +65,7 @@ Trusted Electron-прогоны подтвердили атомарное пер
 Post-drop reveal большой раскрытой группы показывает корень и до трёх первых помещающихся descendants, а не хвост всего блока. Это отдельно проверено после edge-autoscroll вниз и вверх: один физический drop дал один commit, группа сохранила всех участников.
 
 После миграции обеих поверхностей на shared outline отдельный trusted Electron-прогон подтвердил, что первое движение SLOT 2 вверх оставляет scroller `818px`, `scrollTop=1.369` и исходный order; пересечение границы даёт `SLOT 2, SLOT 1`, обратный путь восстанавливает baseline. Тот же путь прошёл для `Prompt 4 ↔ Fix Error`. Реальный main→пустая Utils commit не менял высоту main во время удержания, после reload вкладки, группы и prompt-parent связи сохранились; полный набор pure/host-тестов прошёл `120/120`.
+
+Правка short-list anchor покрыта pure-тестами underfill/reserve и monotonic lease; shared suite прошёл `119/119`. SQLite Electron ABI отдельно подтвердил атомарный перенос обычного visual-subtree и целой группы между проектами, а production renderer/main build прошёл. Реальный pointer-flow на пользовательских вкладках не запускался: сохранение grab-point и постепенное освобождение lease остаются ручной host-приёмкой.
 
 Переносимая модель и полная матрица рисков: `~/Global-Templates/🧩 Code-Patterns/docs-projects/ux-паттерны/drag-and-drop.md`. Текущие продуктовые контракты: `fact-tabs.md::Tab-группы и visual-child вкладки` и `fact-settings.md::Prompt Groups`.
