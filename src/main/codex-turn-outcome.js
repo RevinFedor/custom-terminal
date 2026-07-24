@@ -126,16 +126,152 @@ function projectCodexSuppressedCatchUpPublication(state) {
   };
 }
 
+function configureCodexCatchUpSuppression(state, {
+  suppressBusy = false,
+  suppressPublic = false,
+} = {}) {
+  if (!state) return false;
+  state.publicTurnStateSuppressed = suppressPublic === true;
+  state.catchUpPublicationsSuppressed = suppressBusy === true || suppressPublic === true;
+  state.releasePublicSuppressionAfterCatchUp = false;
+  state.releasePublicSuppressionTargetOffset = null;
+  state.releasePublicSuppressionKind = null;
+  return true;
+}
+
+function armCodexSuppressedCatchUpRelease(state, {
+  targetOffset,
+  kind = 'catch-up',
+} = {}) {
+  const normalizedTarget = Number(targetOffset);
+  if (!state || !Number.isFinite(normalizedTarget) || normalizedTarget < 0) return false;
+  state.publicTurnStateSuppressed = true;
+  state.catchUpPublicationsSuppressed = true;
+  state.releasePublicSuppressionAfterCatchUp = true;
+  state.releasePublicSuppressionTargetOffset = normalizedTarget;
+  state.releasePublicSuppressionKind = kind;
+  state.catchUpPending = true;
+  return true;
+}
+
+function completeCodexSuppressedCatchUpRelease(state, {
+  scanSucceeded = true,
+} = {}) {
+  if (!state
+    || scanSucceeded !== true
+    || state.releasePublicSuppressionAfterCatchUp !== true) {
+    return { released: false, publication: null };
+  }
+  const targetOffset = Number(state.releasePublicSuppressionTargetOffset);
+  const currentOffset = Number(state.offset);
+  if (
+    !Number.isFinite(targetOffset)
+    || !Number.isFinite(currentOffset)
+    || currentOffset < targetOffset
+  ) {
+    return { released: false, publication: null };
+  }
+
+  const publication = projectCodexSuppressedCatchUpPublication(state);
+  const kind = state.releasePublicSuppressionKind || 'catch-up';
+  state.releasePublicSuppressionAfterCatchUp = false;
+  state.releasePublicSuppressionTargetOffset = null;
+  state.releasePublicSuppressionKind = null;
+  state.catchUpPublicationsSuppressed = false;
+  state.publicTurnStateSuppressed = false;
+  state.catchUpPending = false;
+  return {
+    released: true,
+    publication,
+    kind,
+    targetOffset,
+  };
+}
+
+function deferCodexSourceProofRelease(state, request) {
+  if (!state || !request || state.scanning !== true) {
+    return { deferred: false, request };
+  }
+  state.sourceWriterProofReleasePending = { ...request };
+  return {
+    deferred: true,
+    request: state.sourceWriterProofReleasePending,
+  };
+}
+
+function takeCodexSourceProofReleaseAtScanBoundary(state) {
+  if (!state || state.scanning === true) return null;
+  const request = state.sourceWriterProofReleasePending || null;
+  state.sourceWriterProofReleasePending = null;
+  return request;
+}
+
+function prepareCodexSourceProofReplay(state, {
+  kind = 'source-proof-replay',
+} = {}) {
+  if (!state) return { prepared: false, error: 'missing-state' };
+  const targetOffset = Number(state.offset);
+  if (!Number.isFinite(targetOffset) || targetOffset < 0) {
+    return { prepared: false, error: 'invalid-target-offset' };
+  }
+
+  const launchId = state.sourceObservationLaunchId || null;
+  const replayOffset = Number.isFinite(state.sourceWriterReplayOffset)
+    ? Number(state.sourceWriterReplayOffset)
+    : null;
+  const replayPartial = typeof state.sourceWriterReplayPartial === 'string'
+    ? state.sourceWriterReplayPartial
+    : '';
+  const replayPartialStartOffset = Number.isFinite(state.sourceWriterReplayPartialStartOffset)
+    ? Number(state.sourceWriterReplayPartialStartOffset)
+    : replayOffset;
+
+  state.sourceObservationLaunchId = null;
+  state.sourceWriterProofPending = false;
+  state.sourceWriterProofReleasePending = null;
+  state.sourceWriterReplayOffset = null;
+  state.sourceWriterReplayPartial = null;
+  state.sourceWriterReplayPartialStartOffset = null;
+  state.catchUpGeneration = Number(state.catchUpGeneration || 0) + 1;
+  if (replayOffset != null) {
+    state.offset = Math.min(targetOffset, replayOffset);
+    state.partial = replayPartial;
+    state.partialStartOffset = Number.isFinite(replayPartialStartOffset)
+      ? replayPartialStartOffset
+      : state.offset;
+    state.needsScan = true;
+  }
+  const armed = armCodexSuppressedCatchUpRelease(state, {
+    targetOffset,
+    kind,
+  });
+  if (!armed) {
+    return { prepared: false, error: 'release-not-armed' };
+  }
+  return {
+    prepared: true,
+    launchId,
+    replayOffset,
+    targetOffset,
+  };
+}
+
 module.exports = {
+  armCodexSuppressedCatchUpRelease,
   CODEX_NO_FINAL_RESULT_REASON,
   classifyCodexTurnRecord,
   classifyCodexTurnEvent,
+  completeCodexSuppressedCatchUpRelease,
+  configureCodexCatchUpSuppression,
   codexRecordEventType,
   codexRecordTurnId,
   codexRootFinalAnswerText,
+  deferCodexSourceProofRelease,
   hasNonEmptyCodexFinalResult,
   observeCodexTurnRecord,
+  prepareCodexSourceProofReplay,
   projectCodexSuppressedCatchUpPublication,
   reduceCodexTurnOutcomeSummary,
+  takeCodexSourceProofReleaseAtScanBoundary,
   trackerHasFinalResultForEvent,
 };

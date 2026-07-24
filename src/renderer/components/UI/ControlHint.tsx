@@ -22,7 +22,10 @@ export default function ControlHint({
   disabled = false,
 }: ControlHintProps) {
   const enabled = useControlHelpStore((state) => state.enabled);
-  const child = enabled && children.props.title
+  // When the custom tooltip is disabled (commonly because the control itself
+  // is disabled), keep the native title. Otherwise ControlHint would remove
+  // the only explanation for why the action is unavailable.
+  const child = enabled && !disabled && children.props.title
     ? React.cloneElement(children, { title: undefined } as any)
     : children;
 

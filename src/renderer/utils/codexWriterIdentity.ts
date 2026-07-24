@@ -37,6 +37,13 @@ export interface CodexRuntimeSessionSnapshot {
   writerSourceSessionId?: string | null;
   writerForkedFromId?: string | null;
   writerLaunchId?: string | null;
+  codexProvisionalSettingsOwnerId?: string | null;
+  codexProvisionalSettingsLaunchId?: string | null;
+  codexProvisionalModel?: string | null;
+  codexProvisionalEffort?: string | null;
+  codexProvisionalFast?: boolean;
+  codexProvisionalSettingsProofAt?: number | null;
+  codexProvisionalSettingsProofSource?: string | null;
   liveLifecycle?: boolean | null;
   sessionStatus?: 'starting' | 'active' | 'busy' | 'stopping' | 'inactive' | 'unknown' | string;
 }
@@ -193,7 +200,7 @@ export const requireCodexSurfaceSessionId = async (args: {
   }
   throw writerGuardError(
     'codex_surface_session_unresolved',
-    `Активная Codex-сессия ещё не подтверждена. Дождитесь окончания загрузки и повторите действие «${args.operation}».`,
+    `Активная история Codex ещё не подтверждена. Дождитесь её появления и повторите действие «${args.operation}».`,
   );
 };
 

@@ -31,6 +31,19 @@ export function shouldCreatePasteChip(text, threshold) {
   return String(text || '').length > normalizeComposerChipThreshold(threshold);
 }
 
+export function isTerminalOnlyComposerDraft(text) {
+  return String(text || '').trimStart().startsWith('/');
+}
+
+export function isPlainTextPasteShortcut(event = {}) {
+  const key = String(event.key || '').toLowerCase();
+  return event.metaKey === true
+    && event.shiftKey === true
+    && event.altKey !== true
+    && event.ctrlKey !== true
+    && (event.code === 'KeyV' || key === 'v');
+}
+
 function normalizeChip(raw) {
   if (!raw || (raw.kind !== 'prompt' && raw.kind !== 'paste')) return null;
   const id = String(raw.id || '').trim();
@@ -304,14 +317,14 @@ export function parsePastedContentParts(value) {
  *   selectionEnd?: number,
  * }} [options]
  */
-export function restoreComposerChipToText({
+export function insertComposerTextAtSelection({
   text = '',
-  chipText = '',
+  insertedText = '',
   selectionStart,
   selectionEnd,
 } = {}) {
   const current = String(text || '');
-  const insertion = String(chipText || '');
+  const insertion = String(insertedText || '');
   const start = Math.max(
     0,
     Math.min(
@@ -334,4 +347,18 @@ export function restoreComposerChipToText({
     selectionStart: caret,
     selectionEnd: caret,
   };
+}
+
+export function restoreComposerChipToText({
+  text = '',
+  chipText = '',
+  selectionStart,
+  selectionEnd,
+} = {}) {
+  return insertComposerTextAtSelection({
+    text,
+    insertedText: chipText,
+    selectionStart,
+    selectionEnd,
+  });
 }

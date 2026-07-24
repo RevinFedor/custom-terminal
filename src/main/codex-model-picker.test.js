@@ -13,15 +13,18 @@ const {
   codexEffortApplicationMode,
   codexEffortCanUsePlanScope,
   codexModelEffortAppliedMessageCount,
+  classifyCodexManualEnterFrame,
   decideCodexModelMigrationAcknowledgement,
   decideCodexModelMigrationAutoEnter,
   decideCodexPickerCleanupFrame,
   inspectCodexModelMigrationPrompt,
+  inspectCodexModelPickerFrame,
   isCodexModelEffortAppliedMessage,
   isCodexModelEffortConfirmationObserved,
   isCodexNativeRewindFrameText,
   parseCodexAdvancedEffortPicker,
   parseCodexModelMigrationAcknowledgement,
+  parseCodexVerifiedComposerFooter,
   parseCodexModelMigrationsConfig,
   parseCodexPlanReasoningScopePicker,
   parseCodexAllModelPicker,
@@ -33,9 +36,56 @@ const {
   unionCodexEffortOptions,
   isCodexActivePickerFrame,
   isCodexPickerFrameComposer,
+  isCodexPickerStateReady,
   verifyCodexModelMigrationConfig,
   verifyCodexTopLevelConfig,
 } = require('./codex-model-picker');
+
+test('verified composer footer proves exact model, effort, and optional FAST state', () => {
+  assert.deepEqual(parseCodexVerifiedComposerFooter([
+    '› Ask Codex',
+    '',
+    'gpt-5.6-sol max fast · Full Access · Context 0%',
+  ].join('\n')), {
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+    fast: true,
+    proof: 'verified-composer-footer',
+  });
+  assert.deepEqual(parseCodexVerifiedComposerFooter([
+    '› Ask Codex',
+    'gpt-5.6-sol ultra · Full Access · Context 49% used · weekly 83% left',
+  ].join('\n')), {
+    model: 'gpt-5.6-sol',
+    effort: 'ultra',
+    fast: false,
+    proof: 'verified-composer-footer',
+  });
+  assert.deepEqual(parseCodexVerifiedComposerFooter(
+    'gpt-5.6-sol max fast · Full Access · Context 94% used Goal achieved (2h 14m)'
+  ), {
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+    fast: true,
+    proof: 'verified-composer-footer',
+  });
+});
+
+test('verified composer footer rejects defaults, missing effort, and history-like prose', () => {
+  assert.equal(parseCodexVerifiedComposerFooter(
+    '› Ask Codex\ngpt-5.6-sol default · Full Access · Context 0%'
+  ), null);
+  assert.equal(parseCodexVerifiedComposerFooter(
+    '› Ask Codex\ngpt-5.6-sol · Full Access · Context 0%'
+  ), null);
+  assert.equal(parseCodexVerifiedComposerFooter(
+    'assistant: gpt-5.6-sol max fast · Full Access · Context 0%'
+  ), null);
+  assert.equal(parseCodexVerifiedComposerFooter([
+    'gpt-5.6-sol max fast · Full Access · Context 0%',
+    '› quoted status from history',
+  ].join('\n')), null);
+});
 
 test('Codex model migration prompt accepts only the selected Try new model action', () => {
   const frame = [
@@ -310,6 +360,132 @@ test('top model parser uses the latest header and gives All models a semantic va
   ]);
   assert.equal(picker.selectedIndex, 1);
   assert.equal(picker.items.some(item => item.value === 'codex-auto-fast' && item.selected), false);
+});
+
+test('manual Enter on the ordinary model picker is a picker action, not a prompt submit', () => {
+  const pickerFrame = [
+    'Select Model',
+    '› 1. codex-auto-review (current) Balanced review',
+    '  2. All models Choose a specific model',
+    '',
+    'Press enter to confirm or esc to go back',
+  ].join('\n');
+  assert.deepEqual(classifyCodexManualEnterFrame(pickerFrame), {
+    action: 'picker-control',
+    kind: 'top-model',
+    reason: 'active-model-effort-picker',
+  });
+
+  assert.deepEqual(classifyCodexManualEnterFrame([
+    '› write a normal prompt',
+    'Context 97%',
+  ].join('\n')), {
+    action: 'prompt-submit',
+    kind: null,
+    reason: 'active-picker-not-proven',
+  });
+});
+
+test('manual Enter leaves migration and Rewind pickers to their specialized contracts', () => {
+  const migrationFrame = [
+    'Codex now uses GPT-5.6 Luna in place of GPT-5.4 Mini.',
+    'Switch to GPT-5.6 Luna to continue.',
+    '',
+    "Choose how you'd like Codex to proceed.",
+    '› 1. Try new model',
+    '  2. Use existing model',
+    'Use ↑/↓ to move, press enter to confirm',
+  ].join('\n');
+  assert.equal(classifyCodexManualEnterFrame(migrationFrame).kind, 'model-migration');
+
+  const rewindFrame = [
+    '──────── T R A N S C R I P T ────────',
+    '› selected message',
+    'esc / ← to edit prev    enter to edit message',
+  ].join('\n');
+  assert.equal(classifyCodexManualEnterFrame(rewindFrame).kind, 'native-rewind');
+});
+
+test('optional quick-auto gate accepts selected All models without inventing a row from wrapped current model', () => {
+  const frame = [
+    'Select Model',
+    'Pick a quick auto mode or browse all models.',
+    '',
+    '  1. codex-auto-review     Balanced agentic coding model for everyday work.',
+    '› 2. All models (current)  Choose a specific model and reasoning level (current: gpt-',
+    '5.6-sol)',
+    '',
+    'Press enter to confirm or esc to go back',
+  ].join('\n');
+
+  const picker = parseCodexTopModelPicker(frame);
+  assert.deepEqual(
+    picker.items.map(item => item.value),
+    ['codex-auto-review', CODEX_ALL_MODELS_VALUE],
+  );
+  assert.equal(picker.selectedIndex, 1);
+  assert.equal(inspectCodexModelPickerFrame(frame, 'gpt-5.6-sol').ready, true);
+  assert.deepEqual(planCodexModelSelection('gpt-5.6-sol', {
+    topPicker: picker,
+    allModelPicker: null,
+  }), {
+    available: true,
+    complete: false,
+    reason: null,
+    target: 'gpt-5.6-sol',
+    route: 'all-models-nested',
+    steps: [
+      { picker: 'top-model', target: CODEX_ALL_MODELS_VALUE },
+      { picker: 'all-model', target: 'gpt-5.6-sol' },
+    ],
+    missingPicker: 'all-model',
+  });
+});
+
+test('model picker readiness waits for the semantic next row instead of the first partial row', () => {
+  const partialQuickGate = [
+    'Select Model',
+    'Pick a quick auto mode or browse all models.',
+    '› 1. codex-auto-review Balanced agentic coding model.',
+  ].join('\n');
+  const completeQuickGate = [
+    partialQuickGate.replace('› 1.', '  1.'),
+    '› 2. All models (current) Choose a specific model and reasoning level',
+  ].join('\n');
+  const partialDirectList = [
+    'Select Model and Effort',
+    '› 1. gpt-5.6-sol Latest frontier agentic coding model.',
+  ].join('\n');
+  const completeDirectList = [
+    partialDirectList,
+    '  2. gpt-5.6-terra Balanced agentic coding model.',
+  ].join('\n');
+
+  assert.equal(
+    inspectCodexModelPickerFrame(partialQuickGate, 'gpt-5.6-sol').ready,
+    false,
+  );
+  assert.equal(
+    inspectCodexModelPickerFrame(completeQuickGate, 'gpt-5.6-sol').ready,
+    true,
+  );
+  assert.equal(
+    inspectCodexModelPickerFrame(partialQuickGate, 'codex-auto-review').ready,
+    true,
+  );
+  assert.equal(
+    inspectCodexModelPickerFrame(partialDirectList, 'gpt-5.6-terra').ready,
+    false,
+  );
+  const direct = inspectCodexModelPickerFrame(
+    completeDirectList,
+    'gpt-5.6-terra',
+  );
+  assert.equal(direct.ready, true);
+  assert.equal(
+    isCodexPickerStateReady(direct.allModelPicker, 'gpt-5.6-terra'),
+    true,
+  );
 });
 
 test('all-model parser ignores stale numbered rows above its latest header', () => {

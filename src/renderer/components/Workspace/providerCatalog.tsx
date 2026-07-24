@@ -21,7 +21,7 @@ export const PROVIDER_CATALOG: ProviderEntry[] = [
     title: 'Anthropic subscription (direct)',
     tint: '#DA7756',
     Icon: ClaudeSparkle,
-    models: DEFAULT_CLAUDE_CODE_MODELS.filter((m) => !m.id.startsWith('claude-fable-5')),
+    models: DEFAULT_CLAUDE_CODE_MODELS.filter((m) => m.key !== 'fable'),
   },
   {
     id: 'deepseek',

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   CODEX_PRESENCE_SNAPSHOT_FIELDS,
+  isCodexRuntimeForkReady,
   isCodexRuntimeWriterUsable,
   projectCodexPtyPresence,
   readCodexPtyPresence,
@@ -250,4 +251,27 @@ test('renderer cannot turn an incomplete or main-revoked writer into a mutation 
   assert.equal(isCodexRuntimeWriterUsable({ ...base, writerProof: null }), false);
   assert.equal(isCodexRuntimeWriterUsable({ ...base, provenWriterSessionId: null }), false);
   assert.equal(isCodexRuntimeWriterUsable({ ...base, canCopySessionId: false }, { requireCopy: true }), false);
+});
+
+test('fork readiness ignores inactive presentation labels without a safe writer', () => {
+  assert.equal(isCodexRuntimeForkReady({
+    liveLifecycle: true,
+    manualActionRequired: true,
+    sessionStatus: 'inactive',
+    writerConfirmed: false,
+    writerUsableForMutation: false,
+  }), false);
+  assert.equal(isCodexRuntimeForkReady({
+    liveLifecycle: false,
+    writerConfirmed: false,
+    writerUsableForMutation: false,
+  }), true);
+  assert.equal(isCodexRuntimeForkReady({
+    liveLifecycle: true,
+    writerConfirmed: true,
+    writerStatus: 'adopted',
+    writerUsableForMutation: true,
+    writerProof: 'process-open-rollout',
+    provenWriterSessionId: 'writer-session',
+  }), true);
 });

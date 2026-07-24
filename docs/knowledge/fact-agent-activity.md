@@ -23,13 +23,23 @@ recordActivity(tabId, busy, engine)  // busy:true → open, busy:false → close
 
 ## Identity snapshot на OPEN-time, денормализован в строку
 
-`resolveActivityIdentity(tabId, engine)` снимает `{projectId, projectPath, projectName, tabName, sessionId}` в момент **открытия** интервала — пока таб жив. Все поля копируются в строку (денормализация), чтобы запись пережила удаление таба/проекта позже. Резолв best-effort: PTY-табы через `terminalProjectIds` (live) → SQLite `tabs` fallback; SDK-табы через `sdkSessions` (cwd+sessionId, их нет в `terminalProjectIds`); для session id fallback читает `claude_session_id`, `gemini_session_id` или `codex_session_id` из строки таба. Имя проекта — прямой `SELECT name,path FROM projects WHERE id=?` (НЕ `getProjectById` — тот ещё гидрирует все табы + global commands, перебор на каждый turn-start).
+`resolveActivityIdentity(tabId, engine)` снимает `{projectId, projectPath, projectName, tabName, sessionId}` в момент **открытия** интервала — пока таб жив. Все поля копируются в строку (денормализация), чтобы запись пережила удаление таба/проекта позже. Резолв best-effort: PTY-табы через `terminalProjectIds` (live) → SQLite `tabs` fallback; SDK-табы через `sdkSessions` (cwd+sessionId, их нет в `terminalProjectIds`). Session id выбирается строго по engine: Codex-интервал не имеет права взять сохранённый Claude id той же вкладки и наоборот. Имя проекта — прямой `SELECT name,path FROM projects WHERE id=?` (НЕ `getProjectById` — тот ещё гидрирует все табы + global commands, перебор на каждый turn-start).
 
 `engine` может быть известен только на close-time (например forwarder) — рекордер берёт engine с open, fallback на close-time hint.
 
 ## Закрытие на teardown — обязательно для обоих движков
 
 PTY-exit и terminal-kill cleanup вызывают **безусловный** `recordActivity(tabId, false)` (без engine — закроет что было открыто, claude/gemini/codex). Watchdog, interrupt-watcher (JSONL marker), idle-probe, manual-stop и Codex command-finished тоже закрывают — иначе зависший/прерванный turn оставил бы интервал открытым навсегда (до следующего close или quit-flush). Shutdown: `flushOpenActivityIntervals()` в `before-quit` пишет все открытые интервалы, обрезанные на момент quit'а.
+
+## Время конкретного ответа — sidecar поверх activity
+
+Activity отвечает на вопрос «сколько работал агент» и поэтому честно сохраняет interrupted turn, local command и teardown. Время под assistant-ответом — более узкая сущность: оно создаётся только для Claude/Codex и только когда lifecycle доказал естественно завершённый ответ. Для Claude это штатный Stop исходного model-turn, для Codex — `task_complete` с непустым final result. `/compact`, watchdog, принудительная остановка и quit закрывают activity, но не имеют права подписывать предыдущий ответ новой длительностью.
+
+Начало response-интервала вооружается уже на preflight программной отправки, поэтому видимый таймер охватывает раннюю фазу paste/starting до первого авторитетного busy-edge. Пришедший затем `recordActivity(true)` принимает тот же start вместо открытия второго интервала. Это сохраняет пользовательскую модель «таймер идёт ровно столько, сколько непрерывно виден loader», но не превращает renderer mount или локальный секундомер в источник истины.
+
+Завершённая длительность хранится отдельно от JSONL: `history_response_timings` связывает activity interval с вкладкой и, после доказательства, с точной assistant-записью; aliases сохраняют несколько доказанных проекций одной записи. Сначала строка может оставаться tab-owned pending. Transcript reader привязывает её только к новой содержательной assistant-записи с timestamp не раньше start и не позже короткого post-close допуска; запись до начала интервала никогда не кандидат. Если подходящего ответа ещё нет или два кандидата неразличимы, привязка остаётся незавершённой, а не выбирает «последний ответ».
+
+Codex Resume/Rewind требует отдельной дисциплины identity: session id из CLI-аргумента может оказаться source, тогда как реальный writer продолжил source-rollout или создал linked child. Pending timing переносится только после exact child proof; уже привязанный source timing проецируется в child через подтверждённое соответствие содержимого/времени и fail-closed при дублях. History revision учитывает и session, и tab-owned sidecar, поэтому поздняя привязка обновляет UI даже без новой JSONL-строки.
 
 ## Таблица
 

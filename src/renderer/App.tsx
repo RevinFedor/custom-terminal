@@ -64,6 +64,7 @@ import {
   sendAgentPromptScenario,
   stopAgentProcessScenario,
 } from './utils/agentScenarios';
+import { runHistoryPromptHandoff } from './utils/historyPromptHandoffs';
 import { terminalRegistry } from './utils/terminalRegistry';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './utils/claudeStartupDefaultsReady';
 import { getClaudeStartupDefaultsGateSnapshot } from './utils/claudeStartupDefaultsGate';
@@ -1430,12 +1431,24 @@ function App() {
     syncCodexTurnBusy();
 
     // Listen for command start/finish
-    const handleCommandStarted = (_: any, { tabId }: { tabId: string }) => {
+    const handleCommandStarted = (
+      _: any,
+      { tabId, commandType }: { tabId: string; commandType?: string },
+    ) => {
       setProcessStatus(prev => {
         const next = new Map(prev);
         next.set(tabId, true);
         return next;
       });
+      if (commandType === 'codex') {
+        // A launch starts a new PTY/process generation. Any previous live
+        // writer/launch settings are volatile and cannot cross this boundary.
+        useWorkspaceStore.getState().updateCodexLiveState(tabId, {
+          codexLiveModel: undefined,
+          codexLiveEffort: undefined,
+          codexLiveSettingsSessionId: undefined,
+        });
+      }
     };
 
     const handleCommandFinished = (_: any, { tabId }: { tabId: string }) => {
@@ -3447,20 +3460,35 @@ function App() {
           if (!tabId || !prompt) return reply(false, null, 'tabId+prompt required');
           const { tab, toolType, runtime, sessionId } = describeAgentTab(tabId);
           if (runtime && toolType) {
-            const result = await sendAgentPromptScenario({
+            const promptSource = source
+              || (action === 'sendMessageAuto' ? 'mobile-native' : 'project-api');
+            const result = await runHistoryPromptHandoff({
               tabId,
               toolType,
-              runtime,
-              sessionId,
-              cwd: cwd || tab?.cwd,
-              prompt,
+              sessionIdHint: sessionId,
+              text: prompt,
               handoffId,
-              source,
+              source: promptSource,
               statusAtSend,
-              queue,
-              model,
-              effort,
-              returnDraftOnConflict,
+              send: (resolvedHandoffId) => sendAgentPromptScenario({
+                tabId,
+                toolType,
+                runtime,
+                sessionId,
+                cwd: cwd || tab?.cwd,
+                prompt,
+                handoffId: resolvedHandoffId,
+                source: promptSource,
+                statusAtSend,
+                queue,
+                model,
+                effort,
+                returnDraftOnConflict,
+                presentationSnapshot: {
+                  historySessionId: sessionId,
+                  promptChips: [],
+                },
+              }),
             });
             if (result?.success !== false) {
               maybeAutoTitleAfterMobileSend(tabId, toolType, cwd || tab?.cwd);
@@ -3780,6 +3808,21 @@ function App() {
     };
     ipcRenderer.on('codex:busy-state', handleCodexBusy);
 
+    const handleCodexTuiReady = (_: any, data: any) => {
+      const owner = String(data?.codexProvisionalSettingsOwnerId || '').trim();
+      const model = String(data?.codexProvisionalModel || '').trim();
+      const effort = String(data?.codexProvisionalEffort || '').trim().toLowerCase();
+      if (!data?.tabId || !owner.startsWith('launch:') || !model || !effort) return;
+      const state = useWorkspaceStore.getState();
+      if (state.getCodexSessionId(data.tabId)) return;
+      state.updateCodexLiveState(data.tabId, {
+        codexLiveModel: model,
+        codexLiveEffort: effort,
+        codexLiveSettingsSessionId: owner,
+      });
+    };
+    ipcRenderer.on('codex:tui-ready', handleCodexTuiReady);
+
     // safePasteAndSubmit emits a short pre-turn loader before the agent's own
     // busy-state edge. Mirror it at project level whenever a tab strip shows it.
     const handlePasteBusy = (_: any, { tabId, busy }: { tabId: string; busy: boolean }) => {
@@ -3874,6 +3917,7 @@ function App() {
       claudeSpinnerVisualIdleTimersRef.current.forEach((timer) => window.clearTimeout(timer));
       claudeSpinnerVisualIdleTimersRef.current.clear();
       ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
+      ipcRenderer.removeListener('codex:tui-ready', handleCodexTuiReady);
       ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
       ipcRenderer.removeListener('terminal:visible-buffer-request', handleTerminalVisibleBufferRequest);
       ipcRenderer.removeListener('terminal:codex-draft-state-request', handleTerminalCodexDraftStateRequest);

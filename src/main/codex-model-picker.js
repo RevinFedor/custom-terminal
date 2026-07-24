@@ -20,6 +20,7 @@ const CODEX_EFFORT_APPLICATION_PERSISTENT = 'persistent-default';
 const CODEX_EFFORT_APPLICATION_CONVERSATION = 'conversation-only';
 const CODEX_PICKER_FOOTER_RE = /Press enter to confirm or esc to go back/i;
 const CODEX_CLIPPED_HEADER_HINT_RE = /\[…\s*\d+\s+lines?\]\s*ctrl\s*\+\s*a\s+view all/i;
+const CODEX_COMPOSER_STATUS_RE = /^([a-z0-9][a-z0-9_.-]*)\s+(none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?\s+·\s+Full Access(?:\s+·\s+Context\s+\d+%(?:\s+used)?)?(?:\s+·\s+weekly\s+\d+%\s+left)?(?:\s+Goal achieved\s+\([0-9hms ]+\))?$/i;
 
 function normalizeCodexPickerValue(value) {
   return String(value || '')
@@ -36,6 +37,43 @@ function normalizeCodexMigrationModelLabel(value) {
     .replace(/[^a-z0-9_.-]+/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '');
+}
+
+/**
+ * Read the status owned by the current Codex composer, not launch arguments or
+ * scrollback. The footer is the last non-empty row in a verified composer
+ * frame; prose/history rows and incomplete `default` states are rejected.
+ */
+function parseCodexVerifiedComposerFooter(frameText) {
+  const clean = String(frameText || '')
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1bP[\s\S]*?\x1b\\/g, '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b[@-_]/g, '')
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+    .replace(/\u00a0/g, ' ');
+  const lines = clean.split(/\r?\n/);
+  let footer = '';
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const candidate = String(lines[index] || '').trim();
+    if (!candidate) continue;
+    footer = candidate;
+    break;
+  }
+  if (!footer) return null;
+  const match = footer.match(CODEX_COMPOSER_STATUS_RE);
+  if (!match) return null;
+  const model = String(match[1] || '').trim();
+  const effort = String(match[2] || '').trim().toLowerCase();
+  if (!model || model.toLowerCase() === 'default' || !effort || effort === 'default') {
+    return null;
+  }
+  return {
+    model,
+    effort,
+    fast: !!match[3],
+    proof: 'verified-composer-footer',
+  };
 }
 
 function inspectCodexModelMigrationPrompt(cleanText) {
@@ -306,16 +344,21 @@ function parseCodexNumberedPicker(cleanText) {
   const stripSelectionMarker = value => String(value || '')
     .replace(/^[›❯»>]\s*/, '')
     .trim();
-  const isNumberedPickerLine = value => /^\d+\.\s*/.test(stripSelectionMarker(value));
+  // A picker ordinal is either `N.` on its own (the label wrapped to the next
+  // line) or `N. <label>`. Do not accept `N.<text>`: a wrapped model suffix
+  // such as `5.6-sol)` is ordinary continuation text, not picker row 5.
+  const isNumberedPickerLine = value => /^\d+\.(?:\s|$)/.test(
+    stripSelectionMarker(value)
+  );
 
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
     const selected = /^[›❯»>]\s*/.test(line);
     const bare = stripSelectionMarker(line);
-    const match = bare.match(/^(\d+)\.\s*(.*)$/);
+    const match = bare.match(/^(\d+)\.(?:\s+(.*))?$/);
     if (!match) continue;
 
-    let firstLabel = match[2].trim();
+    let firstLabel = String(match[2] || '').trim();
     if (!firstLabel && index + 1 < lines.length && !isNumberedPickerLine(lines[index + 1])) {
       firstLabel = stripSelectionMarker(lines[index + 1]);
     }
@@ -504,6 +547,37 @@ function isCodexActivePickerFrame(cleanText) {
   // requiring two rows would reinterpret `Advanced Reasoning\n› 2. Ultra` as
   // the composer. Headerless screens remain deliberately stricter above.
   return numbered.length >= 1;
+}
+
+function classifyCodexManualEnterFrame(cleanText) {
+  const text = String(cleanText || '');
+  if (inspectCodexModelMigrationPrompt(text).visible) {
+    return {
+      action: 'specialized-control',
+      kind: 'model-migration',
+      reason: 'model-migration-picker',
+    };
+  }
+  if (isCodexNativeRewindFrameText(text)) {
+    return {
+      action: 'specialized-control',
+      kind: 'native-rewind',
+      reason: 'native-rewind-picker',
+    };
+  }
+  const active = latestCodexPickerSection(text);
+  if (active && isCodexActivePickerFrame(text)) {
+    return {
+      action: 'picker-control',
+      kind: active.kind,
+      reason: 'active-model-effort-picker',
+    };
+  }
+  return {
+    action: 'prompt-submit',
+    kind: null,
+    reason: 'active-picker-not-proven',
+  };
 }
 
 function isCodexNativeRewindFrameText(cleanText) {
@@ -731,6 +805,48 @@ function planCodexModelSelection(targetModel, {
     target,
     route: null,
     steps: [],
+  };
+}
+
+function isCodexPickerStateReady(picker, targetValue) {
+  return Number.isInteger(picker?.selectedIndex)
+    && picker.selectedIndex >= 0
+    && !!findPickerItem(picker, targetValue);
+}
+
+function isCodexAllModelPickerFrameReady(cleanText, targetModel) {
+  const picker = parseCodexAllModelPicker(cleanText);
+  return Number.isInteger(picker.selectedIndex)
+    && picker.selectedIndex >= 0
+    && (
+      !!findPickerItem(picker, targetModel)
+      || CODEX_CLIPPED_HEADER_HINT_RE.test(String(cleanText || ''))
+    );
+}
+
+function inspectCodexModelPickerFrame(cleanText, targetModel) {
+  const topPicker = parseCodexTopModelPicker(cleanText);
+  const allModelPicker = parseCodexAllModelPicker(cleanText);
+  const plan = planCodexModelSelection(targetModel, {
+    topPicker: topPicker.items.length > 0 ? topPicker : null,
+    allModelPicker: allModelPicker.items.length > 0 ? allModelPicker : null,
+  });
+  const nextStep = plan.steps?.[0] || null;
+  const activePicker = nextStep?.picker === 'top-model'
+    ? topPicker
+    : nextStep?.picker === 'all-model'
+      ? allModelPicker
+      : null;
+  return {
+    ready: isCodexAllModelPickerFrameReady(cleanText, targetModel)
+      || (
+        plan.available === true
+        && !!nextStep
+        && isCodexPickerStateReady(activePicker, nextStep.target)
+      ),
+    topPicker,
+    allModelPicker,
+    plan,
   };
 }
 
@@ -1027,11 +1143,16 @@ module.exports = {
   isCodexModelEffortConfirmationObserved,
   isCodexModelEffortAppliedMessage,
   isCodexNativeRewindFrameText,
+  isCodexAllModelPickerFrameReady,
   inspectCodexModelMigrationPrompt,
+  inspectCodexModelPickerFrame,
+  classifyCodexManualEnterFrame,
+  isCodexPickerStateReady,
   normalizeCodexPickerValue,
   normalizeCodexMigrationModelLabel,
   parseCodexAdvancedEffortPicker,
   parseCodexModelMigrationAcknowledgement,
+  parseCodexVerifiedComposerFooter,
   parseCodexModelMigrationsConfig,
   parseCodexPlanReasoningScopePicker,
   isCodexPickerFrameComposer,

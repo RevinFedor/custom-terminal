@@ -53,6 +53,8 @@ const EMPTY_PLAN: TabTaskPlanDocument = {
 
 type TmpFile = { name: string; path: string; isDirectory?: boolean };
 
+const TASK_PLAN_COLLAPSED_WIDTH_STORAGE_KEY = 'noted-terminal-task-plan-collapsed-widths';
+
 function loadExpanded(tabId: string): boolean {
   try {
     const value = JSON.parse(localStorage.getItem('noted-terminal-task-plan-expanded-tabs') || '{}');
@@ -72,6 +74,29 @@ function saveExpanded(tabId: string, expanded: boolean) {
   } catch {}
 }
 
+function loadCollapsedWidth(tabId: string): number | null {
+  try {
+    const value = JSON.parse(localStorage.getItem(TASK_PLAN_COLLAPSED_WIDTH_STORAGE_KEY) || '{}');
+    const width = Number(value?.[tabId]);
+    return Number.isFinite(width) && width >= 96 ? width : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveCollapsedWidth(tabId: string, width: number) {
+  try {
+    const value = JSON.parse(localStorage.getItem(TASK_PLAN_COLLAPSED_WIDTH_STORAGE_KEY) || '{}');
+    const next = {
+      ...(value && typeof value === 'object' ? value : {}),
+      [tabId]: Math.round(width),
+    };
+    const entries = Object.entries(next);
+    const capped = entries.length > 200 ? Object.fromEntries(entries.slice(-200)) : next;
+    localStorage.setItem(TASK_PLAN_COLLAPSED_WIDTH_STORAGE_KEY, JSON.stringify(capped));
+  } catch {}
+}
+
 const TASK_PLAN_LAYOUT_STORAGE_KEY = 'noted-terminal-task-plan-layout';
 const TASK_PLAN_LEGACY_WIDTH_STORAGE_KEY = 'noted-terminal-task-plan-widths';
 const TASK_PLAN_MIN_WIDTH = 156;
@@ -79,7 +104,7 @@ const TASK_PLAN_CONTENT_MAX_WIDTH = 420;
 const TASK_PLAN_RESERVE_MAX_WIDTH = 640;
 const TASK_PLAN_DEFAULT_RESERVE_WIDTH = 380;
 const TASK_PLAN_NAVIGATION_FLASH_MS = 360;
-const TASK_PLAN_SELECTION_EXTRA_WIDTH = 20;
+const TASK_PLAN_SELECTION_EXTRA_WIDTH = 21;
 
 type TaskPlanInputSurface = 'history' | 'sdk' | 'terminal';
 type TaskPlanInputTarget = 'history' | 'sdk' | 'claude' | 'codex';
@@ -649,10 +674,12 @@ export default function TabTaskPlanPanel({
   const [showArchive, setShowArchive] = useState(false);
   const [flashTaskId, setFlashTaskId] = useState<string | null>(null);
   const [selectionMode, setSelectionMode] = useState(false);
+  const [selectionControlsVisible, setSelectionControlsVisible] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [hoveredSelectionId, setHoveredSelectionId] = useState<string | null>(null);
   const [panelFocused, setPanelFocused] = useState(false);
   const [autoWidth, setAutoWidth] = useState(TASK_PLAN_MIN_WIDTH);
+  const [collapsedWidth, setCollapsedWidth] = useState<number | null>(() => loadCollapsedWidth(tabId));
   const [draftTitles, setDraftTitles] = useState<Record<string, string>>({});
   const [panelLayout, setPanelLayout] = useState<TaskPlanLayout>(() => loadPanelLayout(tabId));
   const [availableWidth, setAvailableWidth] = useState(TASK_PLAN_RESERVE_MAX_WIDTH);
@@ -672,12 +699,18 @@ export default function TabTaskPlanPanel({
     setShowArchive(false);
     setFlashTaskId(null);
     setSelectionMode(false);
+    setSelectionControlsVisible(false);
     setSelectedIds(new Set());
     setHoveredSelectionId(null);
     setPanelFocused(false);
     setAnimatedArchiveTabId(null);
     setAnimatedWidthTabId(null);
     setDraftTitles({});
+  }, [tabId]);
+
+  useLayoutEffect(() => {
+    setAutoWidth(TASK_PLAN_MIN_WIDTH);
+    setCollapsedWidth(loadCollapsedWidth(tabId));
   }, [tabId]);
 
   useLayoutEffect(() => {
@@ -735,20 +768,14 @@ export default function TabTaskPlanPanel({
 
   useEffect(() => {
     if (!taskMenu) return;
-    const close = (event: MouseEvent) => {
-      if (taskMenuRef.current?.contains(event.target as Node)) return;
-      setTaskMenu(null);
-    };
     const escape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       event.preventDefault();
       event.stopPropagation();
       setTaskMenu(null);
     };
-    window.addEventListener('mousedown', close);
     window.addEventListener('keydown', escape, true);
     return () => {
-      window.removeEventListener('mousedown', close);
       window.removeEventListener('keydown', escape, true);
     };
   }, [taskMenu]);
@@ -815,17 +842,14 @@ export default function TabTaskPlanPanel({
   }, [flashTaskId, showArchive, visibleItems]);
 
   useLayoutEffect(() => {
-    if (visibleItems.length === 0) {
-      setAutoWidth(TASK_PLAN_MIN_WIDTH);
-      return;
-    }
+    if (!expanded) return;
     const children = Array.from(titleMeasureRef.current?.children || []) as HTMLElement[];
     const widestTitle = children.reduce((width, child) => {
       const extra = Number(child.dataset.widthExtra || 0);
       return Math.max(width, child.offsetWidth + extra);
     }, 0);
-    setAutoWidth(clampContentWidth(Math.ceil(widestTitle)));
-  }, [draftTitles, expanded, marker.sizePx, selectionMode, showArchive, visibleItems]);
+    setAutoWidth(clampContentWidth(Math.ceil(widestTitle || TASK_PLAN_MIN_WIDTH)));
+  }, [draftTitles, expanded, marker.sizePx, plan.items, showArchive, visibleItems]);
 
   const statusById = useMemo(() => new Map(taskStatuses.map((status) => [status.id, status])), [taskStatuses]);
 
@@ -857,16 +881,50 @@ export default function TabTaskPlanPanel({
 
   const selectedNodeCount = selectedIds.size;
 
-  const toggleSelectionMode = useCallback(() => {
+  const enterSelectionMode = useCallback((ids?: Set<string>) => {
     setAnimatedWidthTabId(tabId);
-    setSelectionMode((current) => {
-      if (current) setSelectedIds(new Set());
-      else setPanelExpanded(true);
-      return !current;
-    });
+    setSelectionControlsVisible(false);
+    setSelectionMode(true);
+    setSelectedIds(ids ? new Set(ids) : new Set());
+    setHoveredSelectionId(null);
+    setPanelExpanded(true);
     setTaskMenu(null);
     setStatusMenu(null);
   }, [setPanelExpanded, tabId]);
+
+  const clearSelectionMode = useCallback(() => {
+    setSelectionControlsVisible(false);
+    setAnimatedWidthTabId(tabId);
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+    setHoveredSelectionId(null);
+  }, [tabId]);
+
+  const toggleSelectionMode = useCallback(() => {
+    if (selectionMode) clearSelectionMode();
+    else enterSelectionMode();
+  }, [clearSelectionMode, enterSelectionMode, selectionMode]);
+
+  const togglePanelExpanded = useCallback(() => {
+    const next = !expanded;
+    if (!next) {
+      const width = Math.min(
+        availableWidth,
+        panelRef.current?.getBoundingClientRect().width || TASK_PLAN_MIN_WIDTH,
+      );
+      setCollapsedWidth(width);
+      saveCollapsedWidth(tabId, width);
+      if (selectionMode) clearSelectionMode();
+    }
+    setPanelExpanded(next);
+  }, [
+    availableWidth,
+    clearSelectionMode,
+    expanded,
+    selectionMode,
+    setPanelExpanded,
+    tabId,
+  ]);
 
   const toggleArchive = useCallback(() => {
     if (archivedItems.length === 0) return;
@@ -897,12 +955,23 @@ export default function TabTaskPlanPanel({
     });
   }, []);
 
-  const clearSelectionMode = useCallback(() => {
-    setAnimatedWidthTabId(tabId);
-    setSelectionMode(false);
-    setSelectedIds(new Set());
-    setHoveredSelectionId(null);
-  }, [tabId]);
+  useEffect(() => {
+    if (!selectionMode) return;
+    const closeSelectionOutside = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (panelRef.current?.contains(target)) return;
+      if (taskMenuRef.current?.contains(target) || statusMenuRef.current?.contains(target)) return;
+      clearSelectionMode();
+    };
+    const closeSelectionOnWindowBlur = () => clearSelectionMode();
+    window.addEventListener('mousedown', closeSelectionOutside, true);
+    window.addEventListener('blur', closeSelectionOnWindowBlur);
+    return () => {
+      window.removeEventListener('mousedown', closeSelectionOutside, true);
+      window.removeEventListener('blur', closeSelectionOnWindowBlur);
+    };
+  }, [clearSelectionMode, selectionMode]);
 
   const transferIdsToInput = useCallback(async (ids: Set<string>) => {
     const extraction = buildTaskPlanSelectionExtraction(plan.items, ids);
@@ -1312,6 +1381,12 @@ export default function TabTaskPlanPanel({
       return (
         <>
           {taskMenuButton(
+            'subtask-select',
+            <CheckSquare size={13} />,
+            'Выделить',
+            () => enterSelectionMode(new Set([taskMenu.subtaskId])),
+          )}
+          {taskMenuButton(
             'subtask-input',
             <TextCursorInput size={13} />,
             'Переместить в input',
@@ -1345,6 +1420,26 @@ export default function TabTaskPlanPanel({
     return (
       <>
         {taskMenuButton(
+          'task-select',
+          <CheckSquare size={13} />,
+          'Выделить',
+          () => {
+            if (task) enterSelectionMode(new Set(collectTaskTreeIds(task)));
+          },
+          false,
+          !task,
+        )}
+        {taskMenuButton(
+          'task-add-subtask',
+          <ListPlus size={13} />,
+          'Добавить подзадачу',
+          () => {
+            if (task) void addSubtask(task);
+          },
+          false,
+          !task,
+        )}
+        {taskMenuButton(
           'task-input',
           <TextCursorInput size={13} />,
           'Переместить в input',
@@ -1361,16 +1456,6 @@ export default function TabTaskPlanPanel({
           () => void apply([{ type: 'archive_task', taskId: taskMenu.taskId }]),
         )}
         {taskMenuButton(
-          'task-add-subtask',
-          <ListPlus size={13} />,
-          'Добавить подзадачу',
-          () => {
-            if (task) void addSubtask(task);
-          },
-          false,
-          !task,
-        )}
-        {taskMenuButton(
           'task-delete',
           <Trash2 size={13} />,
           `Удалить задачу${taskMenu.subtaskCount > 0 ? ` [${taskMenu.subtaskCount}]` : ''}`,
@@ -1382,28 +1467,70 @@ export default function TabTaskPlanPanel({
   })();
 
   const taskMenuNode = taskMenu ? ReactDOM.createPortal(
-    <div
-      ref={taskMenuRef}
-      data-task-plan-action-menu
-      style={{
-        position: 'fixed',
-        left: Math.max(8, Math.min(taskMenu.x, window.innerWidth - 244)),
-        top: Math.max(8, Math.min(taskMenu.y, window.innerHeight - 178)),
-        width: 236,
-        zIndex: 2147482600,
-        padding: 3,
-        borderRadius: 8,
-        background: '#18181b',
-        border: '1px solid #3a3a40',
-        boxShadow: '0 14px 34px rgba(0,0,0,0.6)',
-      }}
-      onContextMenu={(event) => event.preventDefault()}
-      onMouseDown={(event) => event.preventDefault()}
-    >
-      {taskMenuContent}
-    </div>,
+    <>
+      <div
+        data-task-plan-action-menu-backdrop
+        style={{
+          position: 'fixed',
+          inset: 0,
+          zIndex: 2147482599,
+          background: 'transparent',
+          cursor: 'default',
+        }}
+        onMouseDown={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        }}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setTaskMenu(null);
+        }}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setTaskMenu(null);
+        }}
+      />
+      <div
+        ref={taskMenuRef}
+        data-task-plan-action-menu
+        style={{
+          position: 'fixed',
+          left: Math.max(8, Math.min(taskMenu.x, window.innerWidth - 244)),
+          top: Math.max(8, Math.min(taskMenu.y, window.innerHeight - 246)),
+          width: 236,
+          zIndex: 2147482600,
+          padding: 3,
+          borderRadius: 8,
+          background: '#18181b',
+          border: '1px solid #3a3a40',
+          boxShadow: '0 14px 34px rgba(0,0,0,0.6)',
+        }}
+        onContextMenu={(event) => event.preventDefault()}
+        onMouseDown={(event) => event.preventDefault()}
+      >
+        {taskMenuContent}
+      </div>
+    </>,
     document.body,
   ) : null;
+
+  const reserveDisplayWidth = Math.min(panelLayout.reserveWidth, availableWidth);
+  const contentDisplayedWidth = Math.min(autoWidth, reserveDisplayWidth);
+  const selectionLaneWidth = selectionMode ? TASK_PLAN_SELECTION_EXTRA_WIDTH : 0;
+  const expandedDisplayWidth = Math.min(
+    availableWidth,
+    contentDisplayedWidth + selectionLaneWidth,
+  );
+  const displayedWidth = !expanded && collapsedWidth !== null
+    ? Math.min(availableWidth, collapsedWidth)
+    : expandedDisplayWidth;
+  const hostDisplayWidth = Math.min(
+    availableWidth,
+    Math.max(reserveDisplayWidth, displayedWidth),
+  );
+  const reserveGap = Math.max(0, reserveDisplayWidth - displayedWidth);
 
   const renderTaskCard = (task: TabTaskPlanItem, archived: boolean) => {
     const status = task.statusId ? statusById.get(task.statusId) : undefined;
@@ -1457,11 +1584,14 @@ export default function TabTaskPlanPanel({
             if (canSelect) setHoveredSelectionId((current) => current === task.id ? null : current);
           }}
           style={{
+            position: 'relative',
             display: 'flex',
             alignItems: 'center',
             minHeight: 24,
             gap: 4,
             padding: '0 1px',
+            paddingRight: selectionMode ? 22 : 1,
+            boxSizing: 'border-box',
             borderRadius: 5,
             background: canSelect
               ? rootSelected
@@ -1471,7 +1601,12 @@ export default function TabTaskPlanPanel({
                   : 'transparent'
               : 'transparent',
             cursor: canSelect ? 'pointer' : 'default',
-            transition: canSelect ? 'background 90ms ease' : 'none',
+            transition: [
+              animateWidth
+                ? 'padding-right 180ms cubic-bezier(0.2, 0.8, 0.2, 1)'
+                : '',
+              canSelect ? 'background 90ms ease' : '',
+            ].filter(Boolean).join(', ') || 'none',
           }}
         >
           {archived || canSelect ? (
@@ -1570,7 +1705,7 @@ export default function TabTaskPlanPanel({
             )}
           </div>
 
-          {canSelect && (
+          {canSelect && selectionControlsVisible && (
             <button
               type="button"
               aria-label={rootSelected ? 'Снять выбор задачи' : 'Выбрать задачу и подзадачи'}
@@ -1579,6 +1714,9 @@ export default function TabTaskPlanPanel({
                 toggleTaskSelection(task);
               }}
               style={{
+                position: 'absolute',
+                top: '50%',
+                right: 1,
                 display: 'inline-flex',
                 alignItems: 'center',
                 justifyContent: 'center',
@@ -1590,7 +1728,8 @@ export default function TabTaskPlanPanel({
                 border: 0,
                 cursor: 'pointer',
                 outline: 'none',
-                flexShrink: 0,
+                transform: 'translateY(-50%)',
+                animation: 'noted-task-plan-checkbox-reveal 90ms ease-out',
               }}
             >
               {rootSelected ? <CheckSquare size={13} /> : <Square size={13} />}
@@ -1636,11 +1775,14 @@ export default function TabTaskPlanPanel({
                     }
                   }}
                   style={{
+                    position: 'relative',
                     display: 'flex',
                     alignItems: 'center',
                     minHeight: 23,
                     gap: 4,
                     marginLeft: marker.sizePx + 6,
+                    paddingRight: selectionMode ? TASK_PLAN_SELECTION_EXTRA_WIDTH : 0,
+                    boxSizing: 'border-box',
                     borderRadius: 4,
                     background: canSelect
                       ? subtaskSelected
@@ -1650,7 +1792,12 @@ export default function TabTaskPlanPanel({
                           : 'transparent'
                       : 'transparent',
                     cursor: canSelect ? 'pointer' : 'default',
-                    transition: canSelect ? 'background 90ms ease' : 'none',
+                    transition: [
+                      animateWidth
+                        ? 'padding-right 180ms cubic-bezier(0.2, 0.8, 0.2, 1)'
+                        : '',
+                      canSelect ? 'background 90ms ease' : '',
+                    ].filter(Boolean).join(', ') || 'none',
                   }}
                 >
                   <CornerDownRight
@@ -1692,7 +1839,7 @@ export default function TabTaskPlanPanel({
                       </div>
                     )}
                   </div>
-                  {canSelect && (
+                  {canSelect && selectionControlsVisible && (
                     <button
                       type="button"
                       aria-label={subtaskSelected ? 'Снять выбор подзадачи' : 'Выбрать подзадачу'}
@@ -1701,6 +1848,9 @@ export default function TabTaskPlanPanel({
                         toggleSubtaskSelection(subtask.id);
                       }}
                       style={{
+                        position: 'absolute',
+                        top: '50%',
+                        right: 0,
                         display: 'inline-flex',
                         alignItems: 'center',
                         justifyContent: 'center',
@@ -1712,7 +1862,8 @@ export default function TabTaskPlanPanel({
                         border: 0,
                         cursor: 'pointer',
                         outline: 'none',
-                        flexShrink: 0,
+                        transform: 'translateY(-50%)',
+                        animation: 'noted-task-plan-checkbox-reveal 90ms ease-out',
                       }}
                     >
                       {subtaskSelected ? <CheckSquare size={13} /> : <Square size={13} />}
@@ -1727,10 +1878,6 @@ export default function TabTaskPlanPanel({
     );
   };
 
-  const reserveDisplayWidth = Math.min(panelLayout.reserveWidth, availableWidth);
-  const displayedWidth = Math.min(autoWidth, reserveDisplayWidth);
-  const reserveGap = Math.max(0, reserveDisplayWidth - displayedWidth);
-
   return (
     <div
       ref={hostRef}
@@ -1740,7 +1887,7 @@ export default function TabTaskPlanPanel({
         top: 1,
         left: 1,
         zIndex: 120,
-        width: reserveDisplayWidth,
+        width: hostDisplayWidth,
         maxWidth: 'calc(100% - 2px)',
         maxHeight: 'calc(100% - 2px)',
         pointerEvents: 'none',
@@ -1775,11 +1922,6 @@ export default function TabTaskPlanPanel({
           if (!(next instanceof Node) || !event.currentTarget.contains(next)) setPanelFocused(false);
           else setPanelFocused(!isTextEditingElement(next));
         }}
-        onTransitionEnd={(event) => {
-          if (event.target === event.currentTarget && event.propertyName === 'width') {
-            setAnimatedWidthTabId((current) => current === tabId ? null : current);
-          }
-        }}
         style={{
           position: 'relative',
           zIndex: 1,
@@ -1804,67 +1946,137 @@ export default function TabTaskPlanPanel({
             0% { background-color: rgba(167, 139, 250, 0.34); box-shadow: inset 0 0 0 1px rgba(196, 181, 253, 0.62); }
             100% { background-color: transparent; box-shadow: inset 0 0 0 1px rgba(196, 181, 253, 0); }
           }
+          @keyframes noted-task-plan-selection-reveal {
+            from { opacity: 0.999; }
+            to { opacity: 1; }
+          }
+          @keyframes noted-task-plan-checkbox-reveal {
+            from { opacity: 0; }
+            to { opacity: 1; }
+          }
         `}</style>
+
+        {animateWidth && (
+          <span
+            aria-hidden
+            data-task-plan-selection-reveal
+            onAnimationEnd={() => {
+              setAnimatedWidthTabId((current) => current === tabId ? null : current);
+              if (selectionMode) setSelectionControlsVisible(true);
+            }}
+            style={{
+              position: 'absolute',
+              width: 1,
+              height: 1,
+              pointerEvents: 'none',
+              animation: 'noted-task-plan-selection-reveal 200ms linear',
+            }}
+          />
+        )}
 
         <div
           data-task-plan-header
           role="button"
           tabIndex={0}
           title={expanded ? 'Свернуть' : 'Раскрыть'}
-          onClick={() => setPanelExpanded(!expanded)}
+          onClick={togglePanelExpanded}
           onKeyDown={(event) => {
             if (event.target !== event.currentTarget) return;
             if (event.key !== 'Enter' && event.key !== ' ') return;
             event.preventDefault();
-            setPanelExpanded(!expanded);
+            togglePanelExpanded();
           }}
           style={{
             display: 'flex',
             alignItems: 'center',
+            gap: 3,
             minHeight: 23,
             padding: '1px 3px',
-            borderBottom: '1px solid #28282d',
+            borderBottom: expanded ? '1px solid #28282d' : 0,
             color: '#a7a7ac',
             cursor: 'pointer',
             outline: 'none',
             userSelect: 'none',
+            overflow: 'hidden',
           }}
         >
           <button
             type="button"
-            disabled={archivedItems.length === 0}
-            aria-pressed={showArchive}
             onClick={(event) => {
               event.stopPropagation();
-              toggleArchive();
+              void addRoot();
             }}
-            title={showArchive ? 'Скрыть архив' : `Архив задач: ${archivedItems.length}`}
+            title="Новая задача"
             style={{
               display: 'inline-flex',
               alignItems: 'center',
               justifyContent: 'center',
               gap: 3,
-              minWidth: 25,
               padding: '2px 4px',
-              color: archivedItems.length
-                ? showArchive
-                  ? '#c4b5fd'
-                  : '#77777d'
-                : '#424247',
-              background: showArchive ? 'rgba(139,92,246,0.16)' : 'transparent',
+              color: '#9a9aa0',
+              background: 'transparent',
               border: 0,
               borderRadius: 3,
-              cursor: archivedItems.length ? 'pointer' : 'default',
+              cursor: 'pointer',
               outline: 'none',
               flexShrink: 0,
               fontSize: 10,
               lineHeight: 1,
             }}
           >
-            <Archive size={11} />
-            <span>{archivedItems.length}</span>
+            <Plus size={11} />
+            <span>New</span>
           </button>
-          <span aria-hidden style={{ flex: 1, minWidth: 8 }} />
+          {!expanded && (
+            <span
+              data-task-plan-compact-summary
+              aria-hidden
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                minWidth: 0,
+                overflow: 'hidden',
+                flexShrink: 1,
+                pointerEvents: 'none',
+              }}
+            >
+              {plan.items.map((task) => {
+                const compactStatus = task.statusId ? statusById.get(task.statusId) : undefined;
+                return (
+                  <span
+                    key={task.id}
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 2,
+                      flexShrink: 0,
+                      color: '#77777d',
+                      fontSize: 9,
+                      lineHeight: 1,
+                    }}
+                  >
+                    {compactStatus ? (
+                      <StatusMarker status={compactStatus} size={marker.sizePx} shape={marker.shape} />
+                    ) : (
+                      <span
+                        style={{
+                          width: marker.sizePx,
+                          height: marker.sizePx,
+                          background: '#73737a',
+                          border: '1px solid rgba(0,0,0,0.38)',
+                          borderRadius: marker.shape === 'dot' ? '50%' : 2,
+                          boxSizing: 'border-box',
+                        }}
+                      />
+                    )}
+                    {task.subtasks.length > 0 && <span>×{task.subtasks.length}</span>}
+                  </span>
+                );
+              })}
+            </span>
+          )}
+          <span aria-hidden style={{ flex: 1, minWidth: 4 }} />
           <button
             type="button"
             aria-pressed={selectionMode}
@@ -1929,14 +2141,52 @@ export default function TabTaskPlanPanel({
             }
           }}
           style={{
-            maxHeight: expanded ? 'min(430px, calc(100vh - 150px))' : 'min(260px, calc(100vh - 150px))',
-            overflowY: 'auto',
-            padding: visibleItems.length > 0 ? '2px 3px 3px' : 0,
+            maxHeight: expanded ? 'min(430px, calc(100vh - 150px))' : 0,
+            overflowX: 'hidden',
+            overflowY: expanded ? 'auto' : 'hidden',
+            padding: expanded ? '0 3px 3px' : 0,
+            opacity: expanded ? 1 : 0,
+            pointerEvents: expanded ? 'auto' : 'none',
             transition: animateExpansion
-              ? 'max-height 200ms cubic-bezier(0.2, 0.8, 0.2, 1), padding 160ms ease'
+              ? 'max-height 200ms cubic-bezier(0.2, 0.8, 0.2, 1), padding 160ms ease, opacity 120ms ease'
               : 'none',
           }}
         >
+          <button
+            type="button"
+            data-task-plan-archive-toggle
+            disabled={archivedItems.length === 0}
+            aria-expanded={showArchive}
+            onClick={toggleArchive}
+            title={showArchive ? 'Скрыть архив' : `Архив задач: ${archivedItems.length}`}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              minHeight: 22,
+              gap: 4,
+              width: 'calc(100% + 6px)',
+              marginLeft: -3,
+              marginBottom: showArchive ? 2 : 1,
+              padding: '2px 4px',
+              color: archivedItems.length
+                ? showArchive
+                  ? '#c4b5fd'
+                  : '#77777d'
+                : '#424247',
+              background: showArchive ? 'rgba(139,92,246,0.13)' : 'rgba(255,255,255,0.018)',
+              border: 0,
+              borderRadius: 0,
+              cursor: archivedItems.length ? 'pointer' : 'default',
+              outline: 'none',
+              fontSize: 10,
+              lineHeight: 1,
+            }}
+          >
+            <Archive size={11} />
+            <span>Архив</span>
+            <span>{archivedItems.length}</span>
+          </button>
           <div
             data-task-plan-archive-list
             onTransitionEnd={(event) => {
@@ -1998,30 +2248,6 @@ export default function TabTaskPlanPanel({
                 borderTop: '1px solid #28282d',
               }}
             >
-              <button
-                type="button"
-                onClick={() => void addRoot()}
-                title="Новая задача"
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  gap: 3,
-                  padding: '2px 4px',
-                  color: '#9a9aa0',
-                  background: 'transparent',
-                  border: 0,
-                  borderRadius: 3,
-                  cursor: 'pointer',
-                  outline: 'none',
-                  flexShrink: 0,
-                  fontSize: 10,
-                  lineHeight: 1,
-                }}
-              >
-                <Plus size={11} />
-                <span>New</span>
-              </button>
               <span aria-hidden style={{ flex: 1, minWidth: 6 }} />
               <button
                 type="button"
@@ -2079,31 +2305,48 @@ export default function TabTaskPlanPanel({
             fontSize: 12,
           }}
         >
-          {visibleItems.flatMap((task) => [
+          <span
+            key="header"
+            data-width-extra="0"
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 3,
+              padding: '1px 3px',
+            }}
+          >
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, padding: '2px 4px' }}>
+              <span style={{ width: 11, height: 11 }} />
+              <span>New</span>
+            </span>
+            {!expanded && plan.items.map((task) => (
+              <span
+                key={task.id}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 2, marginRight: 2 }}
+              >
+                <span style={{ width: marker.sizePx, height: marker.sizePx }} />
+                {task.subtasks.length > 0 && <span style={{ fontSize: 9 }}>×{task.subtasks.length}</span>}
+              </span>
+            ))}
+            <span style={{ width: 42, height: 13 }} />
+          </span>
+          {expanded && visibleItems.flatMap((task) => [
             <span
               key={task.id}
-              data-width-extra={
-                marker.sizePx
-                + 22
-                + (selectionMode ? TASK_PLAN_SELECTION_EXTRA_WIDTH : 0)
-              }
+              data-width-extra={marker.sizePx + 22}
               style={{ padding: '3px 5px' }}
             >
               {renderTitle(draftTitles[task.id] ?? task.title)}
             </span>,
-            ...(expanded ? task.subtasks.map((subtask) => (
+            ...task.subtasks.map((subtask) => (
               <span
                 key={subtask.id}
-                data-width-extra={
-                  marker.sizePx
-                  + 42
-                  + (selectionMode ? TASK_PLAN_SELECTION_EXTRA_WIDTH : 0)
-                }
+                data-width-extra={marker.sizePx + 42}
                 style={{ padding: '3px 5px' }}
               >
                 {renderTitle(draftTitles[subtask.id] ?? subtask.title)}
               </span>
-            )) : []),
+            )),
           ])}
         </div>
       </section>
@@ -2114,7 +2357,12 @@ export default function TabTaskPlanPanel({
           onPointerDown={beginResize}
           title="Изменить предел ширины"
           style={{
-            position: 'absolute', top: 0, right: -5, bottom: 0, width: 10, zIndex: 3,
+            position: 'absolute',
+            top: 0,
+            left: Math.min(reserveDisplayWidth, hostDisplayWidth) - 5,
+            bottom: 0,
+            width: 10,
+            zIndex: 3,
             cursor: 'ew-resize', touchAction: 'none', pointerEvents: 'auto', borderRadius: 4,
             background: isResizing || resizeHovered ? 'rgba(139,92,246,0.12)' : 'transparent',
           }}

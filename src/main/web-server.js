@@ -105,7 +105,7 @@ const CLAUDE_MODELS_FOR_CLIENTS = [
   { id: 'sonnet', label: 'sonnet' },
   { id: 'opus', label: 'opus' },
   { id: 'haiku', label: 'haiku' },
-  { id: 'claude-fable-5[1m]', label: 'fable' },
+  { id: 'fable', label: 'fable' },
 ];
 
 let WebSocketServer;

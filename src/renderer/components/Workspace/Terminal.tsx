@@ -4,6 +4,11 @@ import { Terminal as XTerminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { WebLinksAddon } from '@xterm/addon-web-links';
+import {
+  createXtermWritePump,
+  digestTerminalVisibleText,
+  waitForXtermPresentationAfterDrain,
+} from '../../utils/xtermWritePump';
 import ControlHint from '../UI/ControlHint';
 
 const { shell } = window.require('electron');
@@ -82,7 +87,12 @@ const handleLinkActivation = (
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { SearchAddon } from '@xterm/addon-search';
 import { useUIStore } from '../../store/useUIStore';
-import { useWorkspaceStore, type AiLaunchSnapshot, type PendingAction } from '../../store/useWorkspaceStore';
+import {
+  useWorkspaceStore,
+  type AiLaunchSnapshot,
+  type PendingAction,
+  type TerminalBufferCheckpoint,
+} from '../../store/useWorkspaceStore';
 import { PromptQueueOverlay } from './PromptQueueOverlay';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { log } from '../../utils/logger';
@@ -102,6 +112,16 @@ import {
   planCodexPickerStateApplication,
 } from '../../utils/codexEffectiveSettings.mjs';
 import { codexSessionAdoptionOptionsFromEvent } from '../../utils/codexSessionAdoption.mjs';
+import {
+  appendTerminalHydrationChunk,
+  beginTerminalHydration,
+  createTerminalHydrationActivity,
+  createTerminalHydrationBuffer,
+  decideTerminalHydrationGeneration,
+  isTerminalHydrationActive,
+  shouldPreferSavedTerminalCheckpoint,
+  takeTerminalHydrationChunks,
+} from '../../utils/terminalHydrationBuffer';
 
 const TIMELINE_COLLAPSED_SLOT_WIDTH = 32;
 const TERMINAL_THEME = {
@@ -370,6 +390,24 @@ const getBufferActions = () => ({
   get: useWorkspaceStore.getState().getTerminalBuffer,
   clear: useWorkspaceStore.getState().clearTerminalBuffer
 });
+
+const normalizeTerminalBufferCheckpoint = (
+  value: TerminalBufferCheckpoint | string | null,
+): TerminalBufferCheckpoint | null => {
+  if (!value) return null;
+  if (typeof value === 'string') {
+    return {
+      serialized: value,
+      headlessWriteSeq: null,
+      headlessGeneration: null,
+      headlessGenerationOrdinal: null,
+      promptBoundaries: [],
+      cols: 0,
+      rows: 0,
+    };
+  }
+  return value;
+};
 
 // Get setTerminalSelection outside of component to avoid re-renders
 const getSetTerminalSelection = () => useUIStore.getState().setTerminalSelection;
@@ -1380,6 +1418,15 @@ function Terminal({
   });
   const active = activeProp ?? activeFromStore;
   const isActiveProject = isActiveProjectProp ?? isActiveProjectFromStore;
+  const terminalPid = useWorkspaceStore((state): number | null => {
+    for (const [, workspace] of state.openProjects) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) return Number.isFinite(tab.pid) ? Number(tab.pid) : null;
+    }
+    return null;
+  });
+  const terminalPidRef = useRef<number | null>(terminalPid);
+  terminalPidRef.current = terminalPid;
 
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<XTerminal | null>(null);
@@ -1393,7 +1440,13 @@ function Terminal({
   const hasBeenActive = useRef(false); // Track if tab was ever active (for lazy init)
   const isCreatingRef = useRef(false); // Lock to prevent double initialization
   const activeRef = useRef(active); // Track current active state for ResizeObserver closure
-  const pendingBuffer = useRef<string>(''); // Buffer PTY data before xterm init
+  const pendingBuffer = useRef(createTerminalHydrationBuffer()); // Sequence-aware PTY tail while renderer xterm is cold
+  const hydrationActivity = useRef(createTerminalHydrationActivity()); // Nested generation retries share one active lifetime
+  const rendererFlushedHeadlessWriteSeq = useRef<number | null>(null);
+  const rendererFlushedHeadlessGeneration = useRef<string | null>(null);
+  const rendererFlushedHeadlessGenerationOrdinal = useRef<number | null>(null);
+  const rendererBoundPtyPid = useRef<number | null>(terminalPid);
+  const terminalWritePumpRef = useRef<{ term: XTerminal; pump: any } | null>(null);
   const [isVisible, setIsVisible] = useState(false); // Hide until ready
   const [showScrollButton, setShowScrollButton] = useState(false); // Show "scroll to bottom" button
   const savedScrollPosition = useRef<number | null>(null); // Save scroll position when tab becomes inactive
@@ -1403,6 +1456,384 @@ function Terminal({
   const claudeSessionDetected = useRef<string | null>(null); // Track detected Claude session UUID
   const pendingActionExecuted = useRef(false); // Track if pendingAction was executed
   const pinnedTimelineSettleRafRef = useRef<number | null>(null);
+
+  const writeTerminalData = (term: XTerminal, data: string) => new Promise<void>((resolve) => {
+    if (!data) {
+      resolve();
+      return;
+    }
+    term.write(data, resolve);
+  });
+
+  const markRendererHeadlessWriteFlushed = (
+    writeSeq?: number | null,
+    generation?: string | null,
+    generationOrdinal?: number | null,
+  ) => {
+    if (!Number.isFinite(writeSeq)) return;
+    const seq = Number(writeSeq);
+    const ordinal = Number.isFinite(generationOrdinal) ? Number(generationOrdinal) : null;
+    const currentOrdinal = rendererFlushedHeadlessGenerationOrdinal.current;
+
+    if (
+      ordinal !== null
+      && (currentOrdinal === null || ordinal > currentOrdinal)
+    ) {
+      rendererFlushedHeadlessGeneration.current = generation || null;
+      rendererFlushedHeadlessGenerationOrdinal.current = ordinal;
+      rendererFlushedHeadlessWriteSeq.current = seq;
+      return;
+    }
+    if (
+      ordinal !== null
+      && currentOrdinal !== null
+      && ordinal < currentOrdinal
+    ) {
+      return;
+    }
+    if (
+      generation
+      && rendererFlushedHeadlessGeneration.current
+      && generation !== rendererFlushedHeadlessGeneration.current
+    ) {
+      return;
+    }
+    rendererFlushedHeadlessGeneration.current = generation || rendererFlushedHeadlessGeneration.current;
+    rendererFlushedHeadlessGenerationOrdinal.current = ordinal ?? currentOrdinal;
+    rendererFlushedHeadlessWriteSeq.current = Math.max(
+      rendererFlushedHeadlessWriteSeq.current || 0,
+      seq,
+    );
+  };
+
+  const ensureTerminalWritePump = (term: XTerminal) => {
+    if (terminalWritePumpRef.current?.term === term) {
+      return terminalWritePumpRef.current.pump;
+    }
+    try { terminalWritePumpRef.current?.pump?.dispose?.(); } catch {}
+    const pump = createXtermWritePump(
+      (data: string, done: () => void) => term.write(data, done),
+      {
+        beforeWrite: (meta: any) => {
+          const nextGeneration = typeof meta?.generation === 'string'
+            ? meta.generation
+            : null;
+          const nextOrdinal = Number.isFinite(meta?.generationOrdinal)
+            ? Number(meta.generationOrdinal)
+            : null;
+          const currentGeneration = rendererFlushedHeadlessGeneration.current;
+          const currentOrdinal = rendererFlushedHeadlessGenerationOrdinal.current;
+          const generationAdvanced = nextOrdinal !== null
+            && currentOrdinal !== null
+            && nextOrdinal > currentOrdinal;
+          const generationChangedAtSameOrdinal = !!(
+            nextGeneration
+            && currentGeneration
+            && nextGeneration !== currentGeneration
+            && (nextOrdinal === null || currentOrdinal === null || nextOrdinal === currentOrdinal)
+          );
+          if (!generationAdvanced && !generationChangedAtSameOrdinal) return;
+
+          // Reset only when the first batch from the replacement PTY reaches
+          // the head of the physical write queue. An eager reset would let a
+          // late old-generation write repaint over the new TUI.
+          term.reset();
+          terminalRegistry.clearPromptBoundaries(tabId);
+          getBufferActions().clear(tabId);
+          savedScrollPosition.current = null;
+          wasAtBottom.current = true;
+          console.warn('[Terminal:GENERATION_RESET] tab=' + tabId.slice(-12)
+            + ' old=' + (currentGeneration ? currentGeneration.slice(0, 8) : '-')
+            + '/' + (currentOrdinal ?? '-')
+            + ' new=' + (nextGeneration ? nextGeneration.slice(0, 8) : '-')
+            + '/' + (nextOrdinal ?? '-'));
+        },
+        onFlushed: (meta: any) => {
+          markRendererHeadlessWriteFlushed(
+            meta?.writeSeq,
+            meta?.generation,
+            meta?.generationOrdinal,
+          );
+        },
+        onError: (error: Error) => {
+          console.error('[Terminal:WRITE_PUMP] tab=' + tabId.slice(-12)
+            + ' error=' + (error?.message || String(error)));
+        },
+      },
+    );
+    terminalWritePumpRef.current = { term, pump };
+    return pump;
+  };
+
+  const enqueueTerminalChunk = (
+    data: string,
+    metadata: {
+      writeSeq?: number | null;
+      generation?: string | null;
+      generationOrdinal?: number | null;
+    } = {},
+  ) => {
+    if (!data) return;
+    const term = xtermInstance.current;
+    const buffering = !term || isTerminalHydrationActive(hydrationActivity.current);
+    if (buffering) {
+      appendTerminalHydrationChunk(
+        pendingBuffer.current,
+        data,
+        metadata.writeSeq,
+        metadata.generation,
+        metadata.generationOrdinal,
+        isTerminalHydrationActive(hydrationActivity.current)
+          ? Number.POSITIVE_INFINITY
+          : undefined,
+      );
+      return;
+    }
+    ensureTerminalWritePump(term).push(data, metadata);
+  };
+
+  const hydrateTerminalBuffer = async (term: XTerminal): Promise<boolean> => {
+    const endHydration = beginTerminalHydration(hydrationActivity.current);
+    try {
+      let snapshot: any = null;
+      try {
+        snapshot = await ipcRenderer.invoke('terminal:get-headless-buffer-snapshot', { tabId });
+      } catch (error: any) {
+        snapshot = { success: false, error: error?.message || String(error) };
+      }
+
+      if (!isMounted.current) {
+        try { term.dispose(); } catch {}
+        return false;
+      }
+
+      let snapshotWriteSeq: number | null = null;
+      let snapshotGeneration: string | null = null;
+      let snapshotGenerationOrdinal: number | null = null;
+      let source = 'renderer-fallback';
+      let snapshotChars = 0;
+      let restoredPromptBoundaries = 0;
+      const savedCheckpoint = normalizeTerminalBufferCheckpoint(getBufferActions().get(tabId));
+
+      if (snapshot?.success === true && typeof snapshot.serialized === 'string') {
+        const mainCheckpoint = {
+          serialized: snapshot.serialized,
+          headlessWriteSeq: Number.isFinite(snapshot.writeSeq) ? Number(snapshot.writeSeq) : null,
+          headlessGeneration: typeof snapshot.generation === 'string'
+            ? snapshot.generation
+            : null,
+          headlessGenerationOrdinal: Number.isFinite(snapshot.generationOrdinal)
+            ? Number(snapshot.generationOrdinal)
+            : null,
+          cols: Number.isFinite(snapshot.cols) ? Number(snapshot.cols) : null,
+          rows: Number.isFinite(snapshot.rows) ? Number(snapshot.rows) : null,
+        };
+        if (decideTerminalHydrationGeneration(
+          pendingBuffer.current,
+          mainCheckpoint.headlessGenerationOrdinal,
+          true,
+        ) === 'retry-authoritative-snapshot') {
+          console.warn('[Terminal:HYDRATE] newer mirror generation arrived before snapshot replay tab='
+            + tabId.slice(-12)
+            + ' snapshotGeneration=' + (mainCheckpoint.headlessGeneration || '-'));
+          return hydrateTerminalBuffer(term);
+        }
+        const useSavedCheckpoint = shouldPreferSavedTerminalCheckpoint(
+          savedCheckpoint,
+          mainCheckpoint,
+        );
+        const selectedSerialized = useSavedCheckpoint
+          ? savedCheckpoint!.serialized
+          : snapshot.serialized;
+        const selectedBoundaries = useSavedCheckpoint
+          ? savedCheckpoint!.promptBoundaries
+          : snapshot.promptBoundaries;
+        const snapshotCols = Number(useSavedCheckpoint ? savedCheckpoint!.cols : snapshot.cols);
+        const snapshotRows = Number(useSavedCheckpoint ? savedCheckpoint!.rows : snapshot.rows);
+        if (
+          Number.isFinite(snapshotCols)
+          && Number.isFinite(snapshotRows)
+          && snapshotCols >= 2
+          && snapshotRows >= 2
+          && (term.cols !== snapshotCols || term.rows !== snapshotRows)
+        ) {
+          term.resize(snapshotCols, snapshotRows);
+        }
+        snapshotWriteSeq = mainCheckpoint.headlessWriteSeq;
+        snapshotGeneration = mainCheckpoint.headlessGeneration;
+        snapshotGenerationOrdinal = mainCheckpoint.headlessGenerationOrdinal;
+        snapshotChars = selectedSerialized.length;
+        source = useSavedCheckpoint ? 'renderer-saved-current' : 'headless-main';
+        await writeTerminalData(term, selectedSerialized);
+        if (decideTerminalHydrationGeneration(
+          pendingBuffer.current,
+          snapshotGenerationOrdinal,
+          true,
+        ) === 'retry-authoritative-snapshot') {
+          console.warn('[Terminal:HYDRATE] mirror generation changed during snapshot replay tab='
+            + tabId.slice(-12)
+            + ' snapshotGeneration=' + (snapshotGeneration || '-'));
+          term.reset();
+          return hydrateTerminalBuffer(term);
+        }
+        markRendererHeadlessWriteFlushed(
+          snapshotWriteSeq,
+          snapshotGeneration,
+          snapshotGenerationOrdinal,
+        );
+        restoredPromptBoundaries = terminalRegistry.restorePromptBoundaries(
+          tabId,
+          term,
+          selectedBoundaries,
+        );
+        getBufferActions().clear(tabId);
+      } else if (savedCheckpoint) {
+        // Main/headless is the normal authority. The renderer snapshot remains a
+        // compatibility fallback for a missing mirror/addon, not a competing
+        // source that can overwrite a successful main hydration.
+        const savedCols = Number(savedCheckpoint.cols);
+        const savedRows = Number(savedCheckpoint.rows);
+        if (
+          Number.isFinite(savedCols)
+          && Number.isFinite(savedRows)
+          && savedCols >= 2
+          && savedRows >= 2
+          && (term.cols !== savedCols || term.rows !== savedRows)
+        ) {
+          term.resize(savedCols, savedRows);
+        }
+        snapshotWriteSeq = Number.isFinite(savedCheckpoint.headlessWriteSeq)
+          ? Number(savedCheckpoint.headlessWriteSeq)
+          : null;
+        snapshotGeneration = savedCheckpoint.headlessGeneration || null;
+        snapshotGenerationOrdinal = Number.isFinite(savedCheckpoint.headlessGenerationOrdinal)
+          ? Number(savedCheckpoint.headlessGenerationOrdinal)
+          : null;
+        snapshotChars = savedCheckpoint.serialized.length;
+        source = 'renderer-saved';
+        await writeTerminalData(term, savedCheckpoint.serialized);
+        if (decideTerminalHydrationGeneration(
+          pendingBuffer.current,
+          snapshotGenerationOrdinal,
+          false,
+        ) === 'preserve-and-retry-later') {
+          console.error('[Terminal:HYDRATE] authority unavailable for newer mirror generation tab='
+            + tabId.slice(-12)
+            + ' savedGeneration=' + (snapshotGeneration || '-')
+            + ' action=preserve-pending-and-retry-on-next-open');
+          isCreatingRef.current = false;
+          try { term.dispose(); } catch {}
+          return false;
+        }
+        markRendererHeadlessWriteFlushed(
+          snapshotWriteSeq,
+          snapshotGeneration,
+          snapshotGenerationOrdinal,
+        );
+        restoredPromptBoundaries = terminalRegistry.restorePromptBoundaries(
+          tabId,
+          term,
+          savedCheckpoint.promptBoundaries,
+        );
+        getBufferActions().clear(tabId);
+      }
+
+      if (!isMounted.current) {
+        try { term.dispose(); } catch {}
+        return false;
+      }
+
+      // Single-threaded handoff: drain everything newer than the serialized
+      // main boundary, publish the live xterm reference, then enqueue that tail.
+      // Any later terminal:data event sees xtermInstance and is queued after it.
+      const tailChunks = takeTerminalHydrationChunks(
+        pendingBuffer.current,
+        snapshotWriteSeq,
+        snapshotGeneration,
+      );
+      const tailChars = tailChunks.reduce((sum, chunk) => sum + chunk.data.length, 0);
+      const writePump = ensureTerminalWritePump(term);
+      xtermInstance.current = term;
+      for (const chunk of tailChunks) {
+        writePump.push(chunk.data, {
+          writeSeq: chunk.writeSeq,
+          generation: chunk.generation,
+          generationOrdinal: chunk.generationOrdinal,
+        });
+      }
+
+      const snapshotAccepted = source !== 'renderer-fallback';
+      console.warn(
+        '[Terminal:HYDRATE] tab=' + tabId.slice(-12)
+        + ' source=' + source
+        + ' snapshotAccepted=' + snapshotAccepted
+        + ' generation=' + (snapshotGeneration ? snapshotGeneration.slice(0, 8) : '-')
+        + ' snapshotSeq=' + (snapshotWriteSeq ?? '-')
+        + ' snapshotChars=' + snapshotChars
+        + ' tailChars=' + tailChars
+        + ' tailItems=' + tailChunks.length
+        + ' promptBoundaries=' + restoredPromptBoundaries
+        + ' error=' + (snapshotAccepted ? '-' : (snapshot?.error || 'unknown')),
+      );
+      const proofGeneration = snapshotGeneration;
+      const proofWriteSeq = snapshotWriteSeq;
+      const proofPid = rendererBoundPtyPid.current;
+      const proofStartedAt = performance.now();
+      void waitForXtermPresentationAfterDrain({
+        drain: () => writePump.drain(),
+        requestFrame: (callback) => requestAnimationFrame(callback),
+        isCurrent: () => (
+          isMounted.current
+          && xtermInstance.current === term
+          && rendererBoundPtyPid.current === proofPid
+          && (!proofGeneration
+            || rendererFlushedHeadlessGeneration.current === proofGeneration)
+        ),
+      }).then((proof) => {
+        if (!proof.presented) {
+          console.warn('[Terminal:SURFACE_PRESENTED] tab=' + tabId.slice(-12)
+            + ' presented=false'
+            + ' reason=' + proof.reason
+            + ' pid=' + (proofPid ?? '-')
+            + ' generation=' + (proofGeneration ? proofGeneration.slice(0, 8) : '-')
+            + ' snapshotSeq=' + (proofWriteSeq ?? '-')
+            + ' tailChars=' + tailChars
+            + ' tailItems=' + tailChunks.length
+            + ' durMs=' + (performance.now() - proofStartedAt).toFixed(1));
+          return;
+        }
+        const buffer = term.buffer.active;
+        const visibleRows: string[] = [];
+        const firstRow = buffer.viewportY;
+        const lastRow = Math.min(buffer.length, firstRow + term.rows);
+        for (let row = firstRow; row < lastRow; row += 1) {
+          visibleRows.push(buffer.getLine(row)?.translateToString(true) || '');
+        }
+        console.warn('[Terminal:SURFACE_PRESENTED] tab=' + tabId.slice(-12)
+          + ' presented=true'
+          + ' snapshotAccepted=' + snapshotAccepted
+          + ' tailFlushed=true'
+          + ' pid=' + (proofPid ?? '-')
+          + ' generation=' + (proofGeneration ? proofGeneration.slice(0, 8) : '-')
+          + ' snapshotSeq=' + (proofWriteSeq ?? '-')
+          + ' tailChars=' + tailChars
+          + ' tailItems=' + tailChunks.length
+          + ' viewportY=' + buffer.viewportY
+          + ' baseY=' + buffer.baseY
+          + ' cursor=' + buffer.cursorX + ',' + buffer.cursorY
+          + ' rowsDigest=' + digestTerminalVisibleText(visibleRows.join('\n'))
+          + ' durMs=' + (performance.now() - proofStartedAt).toFixed(1));
+      }).catch((error: any) => {
+        console.warn('[Terminal:SURFACE_PRESENTED] tab=' + tabId.slice(-12)
+          + ' presented=false'
+          + ' reason=probe-error'
+          + ' error=' + (error?.message || String(error)));
+      });
+      return true;
+    } finally {
+      endHydration();
+    }
+  };
 
   const terminalFontSize = useUIStore((state) => state.terminalFontSize);
   const historyPanelOpen = useUIStore((state) => state.historyPanelOpenTabs[tabId] ?? false);
@@ -1826,7 +2257,12 @@ function Terminal({
           } catch { return 'ERR'; }
         })();
         console.warn('[FocusDiag2026-05][safeFit-resize] tab=' + tabId.slice(-12) + ' before=' + focusBefore + ' after=' + focusAfter + ' dims=' + colsBefore + 'x' + rowsBefore + '→' + colsAfter + 'x' + rowsAfter + ' ts=' + Date.now());
-        ipcRenderer.send('terminal:resize', tabId, dims.cols, dims.rows);
+        ipcRenderer.send('terminal:resize', {
+          tabId,
+          cols: dims.cols,
+          rows: dims.rows,
+          expectedPid: rendererBoundPtyPid.current ?? terminalPidRef.current,
+        });
       }
     } catch (e) {
       console.warn('[safeFit] ERROR:', e);
@@ -1862,6 +2298,104 @@ function Terminal({
     };
   }, [scrollToBottom, tabId]);
 
+  // Both the eager and lazy xterm initializers feed the same live PTY. Keep
+  // native Codex picker proof at component scope so the first lazy onData
+  // cannot call a function that only exists inside the eager-init effect.
+  const nativeCodexPickerProofRef = useRef<{
+    expiresAt: number;
+    output: string;
+    sessionId: string;
+  } | null>(null);
+
+  const armNativeCodexPickerProof = useCallback((
+    term: XTerminal,
+    data: string,
+    origin: XtermInputOrigin,
+  ) => {
+    if (origin === 'terminal-response' || !/[\r\n]/.test(data)) return;
+    const currentTab = (() => {
+      for (const [, workspace] of useWorkspaceStore.getState().openProjects) {
+        const candidate = workspace.tabs.get(tabId);
+        if (candidate) return candidate;
+      }
+      return null;
+    })();
+    if (currentTab?.commandType !== 'codex') return;
+    const visible = terminalRegistry.getVisibleText(tabId);
+    if (!isCodexSettingsPickerVisible(visible)) return;
+    if (!currentTab.codexSessionId) return;
+    nativeCodexPickerProofRef.current = {
+      expiresAt: Date.now() + 10_000,
+      output: '',
+      sessionId: currentTab.codexSessionId,
+    };
+    console.warn('[CodexEffectiveState] armed native picker proof tab=' + tabId.slice(-12));
+  }, [tabId]);
+
+  const reconcileNativeCodexPickerOutput = useCallback((data: string) => {
+    const proof = nativeCodexPickerProofRef.current;
+    if (!proof) return;
+    if (Date.now() > proof.expiresAt) {
+      nativeCodexPickerProofRef.current = null;
+      return;
+    }
+    proof.output = (proof.output + data).slice(-16_000);
+    const applied = parseCodexModelChangeAcknowledgement(proof.output);
+    if (!applied) return;
+
+    const state = useWorkspaceStore.getState();
+    if (state.getCodexSessionId(tabId) !== proof.sessionId) {
+      nativeCodexPickerProofRef.current = null;
+      return;
+    }
+    const plan = planCodexPickerStateApplication({
+      result: {
+        ...applied,
+        codexSettingsProofSessionId: proof.sessionId,
+      },
+      requestedModel: applied.model,
+      requestedEffort: applied.effort,
+      liveSessionId: proof.sessionId,
+    });
+    if (!plan.allowed) return;
+    if (Object.keys(plan.persistentPatch || {}).length > 0) {
+      state.updateCodexState(tabId, plan.persistentPatch);
+    }
+    state.updateCodexLiveState(tabId, plan.livePatch);
+    if (applied.applicationMode === 'conversation-only') {
+      const livePatch = plan.livePatch;
+      void ipcRenderer.invoke('codex:get-persistent-model-effort-proof', { tabId })
+        .then((fallback: any) => {
+          const latest = useWorkspaceStore.getState();
+          if (
+            fallback?.success !== true
+            || latest.getCodexSessionId(tabId) !== proof.sessionId
+            || (
+              fallback.codexSettingsProofSessionId
+              && fallback.codexSettingsProofSessionId !== proof.sessionId
+            )
+          ) {
+            return;
+          }
+          latest.updateCodexState(tabId, {
+            codexModel: fallback.model,
+            codexEffort: fallback.effort,
+            codexSettingsProofSessionId: undefined,
+          });
+          latest.updateCodexLiveState(tabId, livePatch);
+        })
+        .catch(() => {});
+    }
+    nativeCodexPickerProofRef.current = null;
+    console.warn(
+      '[CodexEffectiveState] native picker applied tab=' + tabId.slice(-12)
+      + ' model=' + applied.model
+      + ' effort=' + (applied.effort || 'unchanged')
+      + ' mode=' + applied.applicationMode
+      + ' proof=' + applied.proof,
+    );
+  }, [tabId]);
+
   useEffect(() => {
     if (isInitialized.current || !terminalRef.current) {
       return;
@@ -1870,138 +2404,64 @@ function Terminal({
     console.warn(`[Terminal:MOUNT] tabId=${tabId} active=${active} isActiveProject=${isActiveProject}`);
 
     const containerRef = terminalRef.current;
-    let nativeCodexPickerProof: { expiresAt: number; output: string; sessionId: string } | null = null;
-
-    const armNativeCodexPickerProof = (
-      term: XTerminal,
-      data: string,
-      origin: XtermInputOrigin,
-    ) => {
-      if (origin === 'terminal-response' || !/[\r\n]/.test(data)) return;
-      const currentTab = (() => {
-        for (const [, workspace] of useWorkspaceStore.getState().openProjects) {
-          const candidate = workspace.tabs.get(tabId);
-          if (candidate) return candidate;
-        }
-        return null;
-      })();
-      if (currentTab?.commandType !== 'codex') return;
-      const visible = terminalRegistry.getVisibleText(tabId);
-      if (!isCodexSettingsPickerVisible(visible)) return;
-      if (!currentTab.codexSessionId) return;
-      nativeCodexPickerProof = {
-        expiresAt: Date.now() + 10_000,
-        output: '',
-        sessionId: currentTab.codexSessionId,
-      };
-      console.warn('[CodexEffectiveState] armed native picker proof tab=' + tabId.slice(-12));
+    const executePendingActionAtShellPrompt = () => {
+      if (pendingActionExecuted.current) return;
+      const pendingAction = getTabPendingAction(tabId);
+      if (!pendingAction) return;
+      pendingActionExecuted.current = true;
+      console.log('[Terminal] OSC 133 A shell prompt ready, executing pendingAction');
+      executePendingAction(tabId, pendingAction);
     };
-
-    const reconcileNativeCodexPickerOutput = (data: string) => {
-      const proof = nativeCodexPickerProof;
-      if (!proof) return;
-      if (Date.now() > proof.expiresAt) {
-        nativeCodexPickerProof = null;
-        return;
-      }
-      proof.output = (proof.output + data).slice(-16_000);
-      const applied = parseCodexModelChangeAcknowledgement(proof.output);
-      if (!applied) return;
-
-      const state = useWorkspaceStore.getState();
-      if (state.getCodexSessionId(tabId) !== proof.sessionId) {
-        nativeCodexPickerProof = null;
-        return;
-      }
-      const plan = planCodexPickerStateApplication({
-        result: {
-          ...applied,
-          codexSettingsProofSessionId: proof.sessionId,
-        },
-        requestedModel: applied.model,
-        requestedEffort: applied.effort,
-        liveSessionId: proof.sessionId,
-      });
-      if (!plan.allowed) return;
-      if (Object.keys(plan.persistentPatch || {}).length > 0) {
-        state.updateCodexState(tabId, plan.persistentPatch);
-      }
-      state.updateCodexLiveState(tabId, plan.livePatch);
-      if (applied.applicationMode === 'conversation-only') {
-        const livePatch = plan.livePatch;
-        void ipcRenderer.invoke('codex:get-persistent-model-effort-proof', { tabId })
-          .then((fallback: any) => {
-            const latest = useWorkspaceStore.getState();
-            if (
-              fallback?.success !== true
-              || latest.getCodexSessionId(tabId) !== proof.sessionId
-              || (
-                fallback.codexSettingsProofSessionId
-                && fallback.codexSettingsProofSessionId !== proof.sessionId
-              )
-            ) {
-              return;
-            }
-            latest.updateCodexState(tabId, {
-              codexModel: fallback.model,
-              codexEffort: fallback.effort,
-              codexSettingsProofSessionId: undefined,
-            });
-            latest.updateCodexLiveState(tabId, livePatch);
-          })
-          .catch(() => {});
-      }
-      nativeCodexPickerProof = null;
-      console.warn(
-        '[CodexEffectiveState] native picker applied tab=' + tabId.slice(-12)
-        + ' model=' + applied.model
-        + ' effort=' + (applied.effort || 'unchanged')
-        + ' mode=' + applied.applicationMode
-        + ' proof=' + applied.proof,
-      );
+    const handleShellPromptReady = (
+      _event: any,
+      readyTabId: string,
+      readiness?: { ready?: boolean },
+    ) => {
+      if (readyTabId !== tabId || readiness?.ready === false) return;
+      executePendingActionAtShellPrompt();
     };
 
     // IPC: Receive data from PTY (with write buffer to prevent jitter)
-    const handleData = (_: any, payload: { tabId: string; data: string }) => {
+    const handleData = (_: any, payload: {
+      pid?: number | null;
+      tabId: string;
+      data: string;
+      headlessWriteSeq?: number | null;
+      headlessGeneration?: string | null;
+      headlessGenerationOrdinal?: number | null;
+    }) => {
       if (payload.tabId !== tabId) return;
+      if (Number.isFinite(payload.pid)) {
+        rendererBoundPtyPid.current = Number(payload.pid);
+      }
 
       // EffortDiag: scan first 5s of PTY output for TUI-readiness markers.
       _effortDiagScan(tabId, payload.data);
       reconcileNativeCodexPickerOutput(payload.data);
 
-      // Execute pendingAction on first PTY output (= shell is ready)
-      if (!pendingActionExecuted.current) {
-        pendingActionExecuted.current = true;
-        const pendingAction = getTabPendingAction(tabId);
-        if (pendingAction) {
-          console.log('[Terminal:handleData] First PTY output, executing pendingAction');
-          executePendingAction(tabId, pendingAction);
-        }
-      }
-
-      // If xterm not yet created, buffer data for later replay
-      if (!xtermInstance.current) {
-        pendingBuffer.current += payload.data;
-        // Limit buffer size to prevent memory issues
-        if (pendingBuffer.current.length > 100000) {
-          pendingBuffer.current = pendingBuffer.current.slice(-50000);
-        }
-        return;
-      }
-
+      // A cold terminal and a presentation barrier both buffer the exact PTY
+      // tail. The latter keeps SIGWINCH/repaint from interleaving with xterm's
+      // already queued writes when a long-running hidden terminal is shown.
       // Direct write — Claude Code v2.1.101+ перестал слать CSI 3J на full
       // resets, ради чего раньше был sync-frame splitter с накоплением. Splitter
       // ломался когда BSU/ESU markers разрезались между PTY-чанками (особенно
       // у субагентов с быстрыми мелкими стримами): хвост от BSU попадал в xterm
       // как normal data, frame data применялся без атомарности → каша символов.
       // Подробности и история: docs/knowledge/fix-terminal-jitter.md::Upstream fix v2.1.101.
-      const term = xtermInstance.current;
-      term.write(payload.data);
+      enqueueTerminalChunk(payload.data, {
+        writeSeq: Number.isFinite(payload.headlessWriteSeq)
+          ? Number(payload.headlessWriteSeq)
+          : null,
+        generation: payload.headlessGeneration || null,
+        generationOrdinal: Number.isFinite(payload.headlessGenerationOrdinal)
+          ? Number(payload.headlessGenerationOrdinal)
+          : null,
+      });
     };
 
     const handleExit = (_: any, exitedTabId: string) => {
-      if (exitedTabId === tabId && xtermInstance.current) {
-        xtermInstance.current.write('\r\n\r\n[Process completed]');
+      if (exitedTabId === tabId) {
+        enqueueTerminalChunk('\r\n\r\n[Process completed]');
       }
       // Reset the /effort once-per-process sentinel on PTY exit so the next
       // fresh Claude spawn in this tab starts clean.
@@ -2485,6 +2945,7 @@ function Terminal({
     };
 
     // Register IPC listeners synchronously
+    ipcRenderer.on('terminal:prompt-ready', handleShellPromptReady);
     ipcRenderer.on('terminal:data', handleData);
     ipcRenderer.on('terminal:exit', handleExit);
     ipcRenderer.on('claude:session-detected', handleSessionDetected);
@@ -2495,6 +2956,15 @@ function Terminal({
     ipcRenderer.on('claude:bridge-update', handleBridgeUpdate);
     ipcRenderer.on('gemini:session-detected', handleGeminiSessionDetected);
     ipcRenderer.on('codex:session-detected', handleCodexSessionDetected);
+    void ipcRenderer.invoke('terminal:get-shell-prompt-readiness', tabId)
+      .then((readiness: { ready?: boolean } | null) => {
+        if (readiness?.ready === true) executePendingActionAtShellPrompt();
+      })
+      .catch((error: unknown) => {
+        console.warn('[Terminal] shell prompt readiness query failed tab='
+          + tabId.slice(-12)
+          + ' error=' + (error instanceof Error ? error.message : String(error)));
+      });
 
     // Resize observer with Guard Clause (prevents WebGL accordion effect)
     const resizeObserver = new ResizeObserver((entries) => {
@@ -2591,13 +3061,14 @@ function Terminal({
         } else if (data.startsWith('prompt:')) {
           const seq = parseInt(data.slice(7), 10);
           if (!isNaN(seq)) {
-            terminalRegistry.registerPromptBoundary(tabId, seq);
+            terminalRegistry.registerPromptBoundaryForTerminal(tabId, term, seq);
           }
         }
         return true;
       });
 
-      xtermInstance.current = term;
+      const hydrated = await hydrateTerminalBuffer(term);
+      if (!hydrated) return;
       hasBeenActive.current = true; // Mark as active AFTER xterm is created to prevent race condition
 
       // Attach scroll listeners (native + xterm events)
@@ -2605,19 +3076,6 @@ function Terminal({
 
       // Register terminal in global registry for selection access and search
       terminalRegistry.register(tabId, term, searchAddon);
-
-      // Restore previously serialized buffer (from before unmount)
-      const savedBuffer = getBufferActions().get(tabId);
-      if (savedBuffer) {
-        term.write(savedBuffer);
-        getBufferActions().clear(tabId); // Clear after restoration
-      }
-
-      // Replay buffered PTY data that arrived before xterm was ready
-      if (pendingBuffer.current) {
-        term.write(pendingBuffer.current);
-        pendingBuffer.current = '';
-      }
 
       // Fit after opening, then reveal terminal
       setTimeout(() => {
@@ -3082,6 +3540,7 @@ function Terminal({
       cancelTerminalWarmInit(tabId);
       isMounted.current = false;
       resizeObserver.disconnect();
+      ipcRenderer.removeListener('terminal:prompt-ready', handleShellPromptReady);
       ipcRenderer.removeListener('terminal:data', handleData);
       ipcRenderer.removeListener('terminal:exit', handleExit);
       ipcRenderer.removeListener('claude:session-detected', handleSessionDetected);
@@ -3104,7 +3563,15 @@ function Terminal({
         try {
           const serialized = serializeAddon.serialize();
           if (serialized) {
-            getBufferActions().save(tabId, serialized);
+            getBufferActions().save(tabId, {
+              serialized,
+              headlessWriteSeq: rendererFlushedHeadlessWriteSeq.current,
+              headlessGeneration: rendererFlushedHeadlessGeneration.current,
+              headlessGenerationOrdinal: rendererFlushedHeadlessGenerationOrdinal.current,
+              promptBoundaries: terminalRegistry.getPromptBoundarySnapshot(tabId),
+              cols: term.cols,
+              rows: term.rows,
+            });
           }
         } catch (e) {
           // Ignore serialization errors
@@ -3115,6 +3582,8 @@ function Terminal({
       terminalRegistry.unregister(tabId);
 
       try { webglAddonRef.current?.dispose(); } catch {}
+      try { terminalWritePumpRef.current?.pump?.dispose?.(); } catch {}
+      terminalWritePumpRef.current = null;
       const termToDispose = xtermInstance.current;
       xtermInstance.current = null;
       fitAddonRef.current = null;
@@ -3128,8 +3597,9 @@ function Terminal({
       } catch (e) {
         // Ignore dispose errors
       }
+      nativeCodexPickerProofRef.current = null;
     };
-  }, [tabId]);
+  }, [armNativeCodexPickerProof, reconcileNativeCodexPickerOutput, tabId]);
 
   // Focus and fit when becoming active (with rAF to let browser paint first)
   // Also handles lazy initialization on first activation
@@ -3208,26 +3678,29 @@ function Terminal({
           return true;
         });
 
-        xtermInstance.current = term;
+        // Keep lazy/cold hydration behavior identical to the primary init.
+        // Snapshot metadata restores historical boundaries; this handler owns
+        // any OSC boundary that arrives in the live tail during handoff.
+        term.parser.registerOscHandler(7777, (data: string) => {
+          if (data.startsWith('entry:')) {
+            terminalRegistry.registerEntryMarker(tabId, data.slice(6));
+          } else if (data.startsWith('prompt:')) {
+            const seq = parseInt(data.slice(7), 10);
+            if (!Number.isNaN(seq)) {
+              terminalRegistry.registerPromptBoundaryForTerminal(tabId, term, seq);
+            }
+          }
+          return true;
+        });
+
+        const hydrated = await hydrateTerminalBuffer(term);
+        if (!hydrated) return;
         hasBeenActive.current = true; // Mark as active AFTER xterm is created
 
         // Attach scroll listeners (native + xterm events)
         attachScrollListeners(term, terminalRef.current);
 
         terminalRegistry.register(tabId, term, searchAddon);
-
-        // Restore previously serialized buffer (from before unmount)
-        const savedBuffer = getBufferActions().get(tabId);
-        if (savedBuffer) {
-          term.write(savedBuffer);
-          getBufferActions().clear(tabId); // Clear after restoration
-        }
-
-        // Replay buffered PTY data
-        if (pendingBuffer.current) {
-          term.write(pendingBuffer.current);
-          pendingBuffer.current = '';
-        }
 
         // Setup handlers
         const takeXtermInputOrigin = createXtermInputOriginTracker(term);
@@ -3572,96 +4045,128 @@ function Terminal({
     if (!xtermInstance.current) {
       return;
     }
+    if (!effectivePresented) {
+      return;
+    }
 
     // Give browser 1 frame to recalculate CSS before calling fit
+    let cancelled = false;
     const frameId = requestAnimationFrame(() => {
-      const term = xtermInstance.current;
-      if (!term) return;
+      void (async () => {
+        const term = xtermInstance.current;
+        if (!term) return;
+        const endPresentationBarrier = beginTerminalHydration(hydrationActivity.current);
+        const writePump = ensureTerminalWritePump(term);
+        const beforeDrain = writePump.getStatus();
+        try {
+          // Stop accepting new physical writes, then wait for the finite xterm
+          // queue that existed at presentation time. This preserves parser,
+          // saved-cursor and private-mode state; a SerializeAddon reset here is
+          // not continuation-safe when an ANSI sequence spans the boundary.
+          await writePump.drain();
+          if (cancelled || !isMounted.current || xtermInstance.current !== term) return;
 
-      const fit = fitAddonRef.current;
-      const colsBefore = term.cols;
-      const rowsBefore = term.rows;
-      const dimsBefore = fit?.proposeDimensions();
-      const container = terminalRef.current;
-      const containerRect = container?.getBoundingClientRect();
+          const fit = fitAddonRef.current;
+          const colsBefore = term.cols;
+          const rowsBefore = term.rows;
+          const dimsBefore = fit?.proposeDimensions();
+          const container = terminalRef.current;
+          const containerRect = container?.getBoundingClientRect();
 
-      console.warn(`[Terminal:activate] tabId=${tabId} BEFORE safeFit:`, {
-        'term.cols': colsBefore,
-        'term.rows': rowsBefore,
-        'proposed': dimsBefore ? `${dimsBefore.cols}x${dimsBefore.rows}` : 'null',
-        'container': containerRect ? `${Math.round(containerRect.width)}x${Math.round(containerRect.height)}` : 'null',
-        'visibility': container?.style.visibility,
-        'cursorHidden': (term as any)._core?.buffer?.isCursorHidden,
-        'cursorX': term.buffer.active.cursorX,
-        'cursorY': term.buffer.active.cursorY,
-      });
+          console.warn(`[Terminal:activate] tabId=${tabId} BEFORE safeFit:`, {
+            'term.cols': colsBefore,
+            'term.rows': rowsBefore,
+            'proposed': dimsBefore ? `${dimsBefore.cols}x${dimsBefore.rows}` : 'null',
+            'container': containerRect ? `${Math.round(containerRect.width)}x${Math.round(containerRect.height)}` : 'null',
+            'visibility': container?.style.visibility,
+            'cursorHidden': (term as any)._core?.buffer?.isCursorHidden,
+            'cursorX': term.buffer.active.cursorX,
+            'cursorY': term.buffer.active.cursorY,
+            'drainedChars': beforeDrain.inFlightChars + beforeDrain.queuedChars,
+            'drainedItems': beforeDrain.inFlightItems + beforeDrain.queuedItems,
+          });
 
-      safeFit();
+          safeFit();
 
-      const colsAfter = term.cols;
-      const rowsAfter = term.rows;
-      console.warn(`[Terminal:activate] AFTER safeFit:`, {
-        'term.cols': colsAfter,
-        'term.rows': rowsAfter,
-        'changed': colsBefore !== colsAfter || rowsBefore !== rowsAfter,
-        'cursorX': term.buffer.active.cursorX,
-        'cursorY': term.buffer.active.cursorY,
-      });
+          const colsAfter = term.cols;
+          const rowsAfter = term.rows;
+          console.warn(`[Terminal:activate] AFTER safeFit:`, {
+            'term.cols': colsAfter,
+            'term.rows': rowsAfter,
+            'changed': colsBefore !== colsAfter || rowsBefore !== rowsAfter,
+            'cursorX': term.buffer.active.cursorX,
+            'cursorY': term.buffer.active.cursorY,
+          });
 
-      // FIX: Force Canvas renderer to repaint after returning from visibility:hidden.
-      // fit.fit() is a no-op if dimensions haven't changed, leaving canvas stale.
-      try {
-        const core = (term as any)._core;
-        if (core?._renderService) {
-          core._renderService.clear();
-          console.warn('[Terminal:activate] _renderService.clear() called');
-          // Force canvas repaint — clear() only marks lines dirty, refresh() triggers actual paint
-          term.refresh(0, term.rows - 1);
+          // Force Canvas renderer to repaint after returning from
+          // visibility:hidden. fit.fit() is a no-op if dimensions did not
+          // change, leaving the old canvas pixels on screen.
+          try {
+            const core = (term as any)._core;
+            if (core?._renderService) {
+              core._renderService.clear();
+              console.warn('[Terminal:activate] _renderService.clear() called');
+              term.refresh(0, term.rows - 1);
+            }
+          } catch (e) {
+            console.warn('[Terminal:activate] _renderService.clear() ERROR:', e);
+          }
+
+          if (!isExternalEditableFocused()) {
+            term.focus();
+          }
+
+          const savedWasAtBottom = wasAtBottom.current;
+          const savedPos = savedScrollPosition.current;
+          const buffer = term.buffer.active;
+
+          console.warn('[Terminal:activate] scroll restore:', {
+            savedWasAtBottom,
+            savedPos,
+            'buffer.baseY': buffer.baseY,
+            'buffer.viewportY': buffer.viewportY,
+          });
+
+          requestAnimationFrame(() => {
+            if (cancelled || xtermInstance.current !== term) return;
+            if (savedWasAtBottom) {
+              term.scrollToBottom();
+            } else if (savedPos !== null) {
+              term.scrollToLine(savedPos);
+            } else {
+              term.scrollToBottom();
+            }
+            savedScrollPosition.current = null;
+            wasAtBottom.current = true;
+
+            console.warn('[Terminal:activate] scroll restored, final:', {
+              'buffer.viewportY': term.buffer.active.viewportY,
+              'buffer.baseY': term.buffer.active.baseY,
+            });
+          });
+
+          const selection = term.getSelection() || '';
+          getSetTerminalSelection()(selection);
+        } finally {
+          // Release all PTY chunks captured while the old xterm queue was
+          // draining. Push each metadata-bearing chunk through the same pump;
+          // it coalesces same-generation tails without crossing PTY ownership.
+          const captured = takeTerminalHydrationChunks(pendingBuffer.current);
+          for (const chunk of captured) {
+            writePump.push(chunk.data, {
+              writeSeq: chunk.writeSeq,
+              generation: chunk.generation,
+              generationOrdinal: chunk.generationOrdinal,
+            });
+          }
+          endPresentationBarrier();
         }
-      } catch (e) {
-        console.warn('[Terminal:activate] _renderService.clear() ERROR:', e);
-      }
-
-      // Don't steal focus from an open tab-rename input (new-tab auto-edit).
-      if (presentedProp && !isExternalEditableFocused()) {
-        term.focus();
-      }
-
-      // Restore saved scroll position (from when tab was deactivated)
-      const savedWasAtBottom = wasAtBottom.current;
-      const savedPos = savedScrollPosition.current;
-      const buffer = term.buffer.active;
-
-      console.warn('[Terminal:activate] scroll restore:', {
-        savedWasAtBottom,
-        savedPos,
-        'buffer.baseY': buffer.baseY,
-        'buffer.viewportY': buffer.viewportY,
-      });
-
-      requestAnimationFrame(() => {
-        if (savedWasAtBottom) {
-          term.scrollToBottom();
-        } else if (savedPos !== null) {
-          term.scrollToLine(savedPos);
-        } else {
-          term.scrollToBottom();
-        }
-        savedScrollPosition.current = null;
-        wasAtBottom.current = true;
-
-        console.warn('[Terminal:activate] scroll restored, final:', {
-          'buffer.viewportY': term.buffer.active.viewportY,
-          'buffer.baseY': term.buffer.active.baseY,
-        });
-      });
-
-      const selection = term.getSelection() || '';
-      getSetTerminalSelection()(selection);
+      })();
     });
 
     // Cleanup: save scroll position when tab becomes inactive
     return () => {
+      cancelled = true;
       cancelAnimationFrame(frameId);
       const term = xtermInstance.current;
       if (term && active) {
@@ -3671,7 +4176,7 @@ function Terminal({
         wasAtBottom.current = buffer.viewportY >= buffer.baseY;
       }
     };
-  }, [effectiveActive, isActiveProject, presentedProp, tabId]);
+  }, [armNativeCodexPickerProof, effectiveActive, isActiveProject, presentedProp, tabId, terminalPid]);
 
   // React to font size changes
   useEffect(() => {

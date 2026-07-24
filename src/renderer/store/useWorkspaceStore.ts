@@ -14,6 +14,9 @@ import {
   planCarriedCodexSettingsProofApplication,
   projectCodexSettingsProofOwner,
 } from '../utils/codexSessionAdoption.mjs';
+import {
+  stopAiBeforeTerminalKill,
+} from '../utils/terminalCloseLifecycle.mjs';
 
 const { ipcRenderer } = window.require('electron');
 let tabGroupSaveSeq = 0;
@@ -1130,6 +1133,16 @@ interface SessionState {
   view: 'dashboard' | 'workspace';
 }
 
+export interface TerminalBufferCheckpoint {
+  serialized: string;
+  headlessWriteSeq: number | null;
+  headlessGeneration: string | null;
+  headlessGenerationOrdinal: number | null;
+  promptBoundaries: Array<{ seq: number; line: number }>;
+  cols: number;
+  rows: number;
+}
+
 interface WorkspaceStore {
   view: 'dashboard' | 'workspace';
   activeProjectId: string | null;
@@ -1140,9 +1153,9 @@ interface WorkspaceStore {
   tabTitleNamingIds: Set<string>; // Transient UI-only loader while Gemini generates a tab title
 
   // Terminal buffer serialization (for preserving history on unmount/remount)
-  terminalBuffers: Map<string, string>;
-  saveTerminalBuffer: (tabId: string, buffer: string) => void;
-  getTerminalBuffer: (tabId: string) => string | null;
+  terminalBuffers: Map<string, TerminalBufferCheckpoint | string>;
+  saveTerminalBuffer: (tabId: string, buffer: TerminalBufferCheckpoint) => void;
+  getTerminalBuffer: (tabId: string) => TerminalBufferCheckpoint | string | null;
   clearTerminalBuffer: (tabId: string) => void;
 
   // Session
@@ -2625,11 +2638,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             ipcRenderer.invoke('claude-sdk:stop', { tabId, hard: true }),
             new Promise(resolve => setTimeout(resolve, 2500)),
           ]);
-        } else {
-          await Promise.race([
-            ipcRenderer.invoke('terminal:stop-ai-process', tabId),
-            new Promise(resolve => setTimeout(resolve, 1800)),
-          ]);
         }
       } catch (err: any) {
         console.warn('[CloseTab] graceful AI stop failed tab=' + tabId.slice(-12) + ': ' + (err?.message || err));
@@ -2647,7 +2655,49 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
 
     if (tab.tabType !== 'claude-sdk' && tab.tabType !== 'file') {
-      ipcRenderer.send('terminal:kill', tabId);
+      const closeRuntime = await stopAiBeforeTerminalKill({
+        shouldStopAiProcess,
+        stopAiProcess: () => ipcRenderer.invoke('terminal:stop-ai-process', {
+          tabId,
+          toolType: tab.commandType,
+          reason: 'close-tab',
+        }),
+        killTerminal: () => ipcRenderer.send('terminal:kill', tabId),
+      });
+      if (closeRuntime.stopError) {
+        const error = closeRuntime.stopError;
+        console.warn('[CloseTab] structured AI stop failed before terminal kill tab='
+          + tabId.slice(-12)
+          + ': ' + (error instanceof Error ? error.message : String(error)));
+      }
+      if (!closeRuntime.terminalKilled) {
+        tab.aiClosing = false;
+        startTransition(() => {
+          set({ openProjects: new Map(openProjects) });
+        });
+        const stopFailure = closeRuntime.stopResult?.error
+          || (closeRuntime.stopError instanceof Error
+            ? closeRuntime.stopError.message
+            : String(closeRuntime.stopError || 'stop_not_confirmed'));
+        const historyId = archiveCommit.result?.historyId;
+        if (historyId !== null && historyId !== undefined) {
+          const rollback = await ipcRenderer.invoke('project:delete-tab-history-entry', {
+            id: historyId,
+          }).catch((error: any) => ({
+            success: false,
+            error: error?.message || String(error),
+          }));
+          console.warn('[CloseTab] archive rolled back after Stop refusal tab='
+            + tabId.slice(-12)
+            + ' historyId=' + historyId
+            + ' success=' + (rollback?.success === true)
+            + ' error=' + (rollback?.error || '-'));
+        }
+        console.warn('[CloseTab] keeping tab and PTY because Stop was not proven tab='
+          + tabId.slice(-12)
+          + ' error=' + stopFailure);
+        return false;
+      }
       console.log('[CloseTab] terminal:kill sent tab=' + tabId.slice(-12) +
         ' durMs=' + (Date.now() - closeStartedAt));
     }

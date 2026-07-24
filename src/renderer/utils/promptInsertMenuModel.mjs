@@ -70,14 +70,66 @@ export function clampFloatingPanelTop(anchorTop, panelHeight, viewportHeight, ma
 export function captureHistoryMenuAnchor({
   pointerX,
   pointerY,
-  composerTop,
 } = {}) {
   const x = Number.isFinite(Number(pointerX)) ? Number(pointerX) : 0;
   const y = Number.isFinite(Number(pointerY)) ? Number(pointerY) : 0;
-  if (typeof composerTop === 'number' && Number.isFinite(composerTop)) {
-    return { mode: 'history-composer', x, y: composerTop };
-  }
   return { mode: 'point', x, y };
+}
+
+/**
+ * Places a menu next to a viewport-relative pointer without ever letting the
+ * pointer land inside the menu. Horizontal direction is chosen by the caller
+ * once for the whole chain. Vertically, the menu keeps either its top or
+ * bottom edge next to the pointer; if neither side fits, the larger side wins
+ * and the caller constrains the panel to `availableHeight`.
+ */
+export function placePointAnchoredMenu({
+  anchorX,
+  anchorY,
+  panelWidth,
+  panelHeight,
+  viewportWidth,
+  viewportHeight,
+  openLeft = false,
+  margin = 8,
+  gap = 2,
+} = {}) {
+  const safeMargin = Math.max(0, Number(margin) || 0);
+  const safeGap = Math.max(0, Number(gap) || 0);
+  const safeViewportWidth = Math.max(0, Number(viewportWidth) || 0);
+  const safeViewportHeight = Math.max(0, Number(viewportHeight) || 0);
+  const safeWidth = Math.max(0, Number(panelWidth) || 0);
+  const safeHeight = Math.max(0, Number(panelHeight) || 0);
+  const x = Number(anchorX) || 0;
+  const y = Number(anchorY) || 0;
+
+  const maxLeft = Math.max(safeMargin, safeViewportWidth - safeMargin - safeWidth);
+  const desiredLeft = openLeft
+    ? x - safeGap - safeWidth
+    : x + safeGap;
+  const left = Math.min(Math.max(desiredLeft, safeMargin), maxLeft);
+
+  const spaceBelow = Math.max(0, safeViewportHeight - safeMargin - y - safeGap);
+  const spaceAbove = Math.max(0, y - safeGap - safeMargin);
+  const openUp = safeHeight > spaceBelow
+    && (safeHeight <= spaceAbove || spaceAbove > spaceBelow);
+  const availableHeight = openUp ? spaceAbove : spaceBelow;
+  const fittedHeight = Math.min(safeHeight, availableHeight);
+  const desiredTop = openUp
+    ? y - safeGap - fittedHeight
+    : y + safeGap;
+  const maxTop = Math.max(
+    safeMargin,
+    safeViewportHeight - safeMargin - fittedHeight,
+  );
+  const top = Math.min(Math.max(desiredTop, safeMargin), maxTop);
+
+  return {
+    left,
+    top,
+    openUp,
+    availableHeight,
+  };
 }
 
 /**

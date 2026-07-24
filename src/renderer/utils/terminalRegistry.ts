@@ -1,5 +1,5 @@
-import { Terminal as XTerminal, IMarker } from '@xterm/xterm';
-import { SearchAddon, ISearchOptions } from '@xterm/addon-search';
+import type { Terminal as XTerminal, IMarker } from '@xterm/xterm';
+import type { SearchAddon, ISearchOptions } from '@xterm/addon-search';
 import {
   findLastCodexComposerPromptIndex,
   hasCodexComposerPromptGlyph,
@@ -941,6 +941,81 @@ export const terminalRegistry = {
 
   // === Prompt Boundary API (OSC 7777 markers from main.js) ===
 
+  // Restore non-visual OSC marker metadata after a cold renderer xterm is
+  // hydrated from a serialized main/headless buffer. SerializeAddon preserves
+  // cells but intentionally omits OSC commands, so their exact lines travel as
+  // snapshot metadata instead.
+  restorePromptBoundaries(
+    tabId: string,
+    terminal: XTerminal,
+    boundaries: Array<{ seq: number; line: number }>,
+  ): number {
+    if (!tabId || !terminal || !Array.isArray(boundaries)) return 0;
+
+    const restored = new Map<number, IMarker>();
+    const buffer = terminal.buffer.active;
+    const currentLine = buffer.baseY + buffer.cursorY;
+    const maxLine = Math.max(0, buffer.length - 1);
+
+    for (const boundary of boundaries) {
+      const seq = Number(boundary?.seq);
+      const line = Number(boundary?.line);
+      if (!Number.isFinite(seq) || !Number.isFinite(line) || line < 0 || line > maxLine) continue;
+      if (restored.has(seq)) continue;
+
+      const marker = terminal.registerMarker(line - currentLine);
+      if (!marker) continue;
+      restored.set(seq, marker);
+      marker.onDispose(() => {
+        if (restored.get(seq) === marker) restored.delete(seq);
+      });
+      promptBoundaryLatestSeq.set(tabId, Math.max(promptBoundaryLatestSeq.get(tabId) || 0, seq));
+    }
+
+    promptBoundaries.set(tabId, restored);
+    return restored.size;
+  },
+
+  clearPromptBoundaries(tabId: string): void {
+    const boundaries = promptBoundaries.get(tabId);
+    if (boundaries) {
+      for (const marker of boundaries.values()) {
+        try { marker.dispose(); } catch {}
+      }
+    }
+    promptBoundaries.delete(tabId);
+    promptBoundaryLatestSeq.delete(tabId);
+  },
+
+  registerPromptBoundaryForTerminal(
+    tabId: string,
+    terminal: XTerminal,
+    seq: number,
+  ): void {
+    if (!tabId || !terminal || !Number.isFinite(seq)) return;
+    const previousLatest = promptBoundaryLatestSeq.get(tabId) || 0;
+    if (seq > previousLatest) {
+      promptBoundaryLatestSeq.set(tabId, seq);
+      const waiters = promptBoundaryWaiters.get(tabId);
+      if (waiters) {
+        for (const resolve of Array.from(waiters)) resolve(seq);
+      }
+    }
+
+    let tabBoundaries = promptBoundaries.get(tabId);
+    if (!tabBoundaries) {
+      tabBoundaries = new Map();
+      promptBoundaries.set(tabId, tabBoundaries);
+    }
+    if (tabBoundaries.has(seq)) return;
+
+    const marker = terminal.registerMarker(0);
+    if (!marker) return;
+    tabBoundaries.set(seq, marker);
+    marker.onDispose(() => tabBoundaries!.delete(seq));
+    console.log('[terminalRegistry] Prompt boundary #' + seq + ' at line ' + marker.line);
+  },
+
   // Register a prompt boundary marker at the current cursor position.
   // Called from the direct main-process event and, separately, from OSC 7777
   // when xterm registers a line marker for timeline navigation.
@@ -957,22 +1032,7 @@ export const terminalRegistry = {
 
     const terminal = terminals.get(tabId);
     if (!terminal) return;
-
-    let tabBoundaries = promptBoundaries.get(tabId);
-    if (!tabBoundaries) {
-      tabBoundaries = new Map();
-      promptBoundaries.set(tabId, tabBoundaries);
-    }
-
-    // Don't re-register same sequence
-    if (tabBoundaries.has(seq)) return;
-
-    const marker = terminal.registerMarker(0);
-    if (marker) {
-      tabBoundaries.set(seq, marker);
-      marker.onDispose(() => tabBoundaries!.delete(seq));
-      console.log('[terminalRegistry] Prompt boundary #' + seq + ' at line ' + marker.line);
-    }
+    this.registerPromptBoundaryForTerminal(tabId, terminal, seq);
   },
 
   getLatestPromptBoundarySeq(tabId: string): number {
@@ -1054,6 +1114,15 @@ export const terminalRegistry = {
     return [...tabBoundaries.entries()]
       .sort((a, b) => a[0] - b[0])
       .map(([_, m]) => m.line);
+  },
+
+  getPromptBoundarySnapshot(tabId: string): Array<{ seq: number; line: number }> {
+    const tabBoundaries = promptBoundaries.get(tabId);
+    if (!tabBoundaries || tabBoundaries.size === 0) return [];
+    return [...tabBoundaries.entries()]
+      .filter(([, marker]) => marker && !marker.isDisposed && marker.line >= 0)
+      .sort((a, b) => a[0] - b[0])
+      .map(([seq, marker]) => ({ seq, line: marker.line }));
   },
 
   // Get buffer row position from an entry's marker (Claude only).

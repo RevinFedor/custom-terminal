@@ -207,6 +207,92 @@ test('live Codex settings overlay is visible only to its exact writer', () => {
   });
 });
 
+test('live-owned effective pair enables inherited controls without persistent tab fields', () => {
+  const effective = resolveCodexEffectiveSettings({
+    codexSessionId: 'session-live',
+    codexModel: 'gpt-5.6-terra',
+    codexEffort: 'high',
+    codexLiveModel: 'gpt-5.6-sol',
+    codexLiveEffort: 'ultra',
+    codexLiveSettingsSessionId: 'session-live',
+  });
+  const effectiveSettingsKnown = effective.liveOwned
+    && !!effective.model
+    && !!effective.effort;
+
+  assert.deepEqual(planCodexSettingsControlAvailability({
+    isCodex: true,
+    isCommandRunning: true,
+    effectiveSettingsKnown,
+  }), {
+    modelMenuDisabled: false,
+    partialSettingDisabled: false,
+    explicitPairDisabled: false,
+    quickDisabled: false,
+  });
+  assert.deepEqual(planCodexPickerWriterPrecondition({
+    source: 'effort',
+    currentProofSessionId: 'session-live',
+  }), {
+    allowed: true,
+    expectedWriterSessionId: 'session-live',
+  });
+});
+
+test('verified launch composer owns transient settings before the first writer exists', () => {
+  const effective = resolveCodexEffectiveSettings({
+    codexSessionId: undefined,
+    codexModel: 'stale-default',
+    codexEffort: 'medium',
+    codexLiveModel: 'gpt-5.6-sol',
+    codexLiveEffort: 'max',
+    codexLiveSettingsSessionId: 'launch:fresh-7',
+  });
+  assert.deepEqual(effective, {
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+    liveOwned: true,
+    source: 'verified-launch-composer',
+  });
+  assert.deepEqual(planCodexPickerWriterPrecondition({
+    source: 'effort',
+    currentProofSessionId: 'launch:fresh-7',
+  }), {
+    allowed: true,
+    expectedWriterSessionId: 'launch:fresh-7',
+  });
+});
+
+test('launch owner remains transient when picker state is applied', () => {
+  assert.deepEqual(planCodexPickerStateApplication({
+    result: {
+      success: true,
+      model: 'gpt-5.6-sol',
+      effort: 'max',
+      applicationMode: 'persistent-default',
+      codexSettingsProofSessionId: null,
+      codexProvisionalSettingsOwnerId: 'launch:fresh-7',
+    },
+    requestedModel: 'gpt-5.6-sol',
+    requestedEffort: 'max',
+  }), {
+    allowed: true,
+    applicationMode: 'persistent-default',
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+    persistentPatch: {
+      codexModel: 'gpt-5.6-sol',
+      codexEffort: 'max',
+      codexSettingsProofSessionId: undefined,
+    },
+    livePatch: {
+      codexLiveModel: 'gpt-5.6-sol',
+      codexLiveEffort: 'max',
+      codexLiveSettingsSessionId: 'launch:fresh-7',
+    },
+  });
+});
+
 test('conversation-only picker keeps Ultra transient and updates only an explicit fallback', () => {
   assert.deepEqual(planCodexPickerStateApplication({
     result: {

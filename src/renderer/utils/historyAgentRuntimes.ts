@@ -643,6 +643,10 @@ const CODEX_RUNTIME: HistoryAgentRuntime = {
   logPrefix: 'CodexHistoryControls',
   busyEvent: 'codex:busy-state',
   readyEvent: 'codex:tui-ready',
+  // safePasteAndSubmit owns one provider-neutral PTY write-busy channel.
+  // Codex must consume it too; otherwise its perimeter loader/timer starts
+  // only after task_started and hides the visible pre-submit phase.
+  pasteBusyEvent: 'claude:paste-busy',
   supportsQuestions: false,
   supportsInterruptRecovery: true,
   interruptRecoveryReasons: ['turn_aborted'],

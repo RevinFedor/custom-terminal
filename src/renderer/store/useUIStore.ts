@@ -36,13 +36,19 @@ export type ApiClaudeModel = 'claude-opus-4.6' | 'claude-sonnet-4.5';
 // of call sites. The list itself lives in constants/claudeLevels.ts.
 export type { ClaudeCodeModelOption, ClaudeCodeSettings, DefaultClaudeEffort, DefaultClaudeModel } from '../constants/claudeLevels';
 import type { ClaudeCodeSettings, DefaultClaudeEffort, DefaultClaudeModel } from '../constants/claudeLevels';
-import { DEFAULT_CLAUDE_CODE_SETTINGS } from '../constants/claudeLevels';
+import {
+  DEFAULT_CLAUDE_CODE_SETTINGS,
+  normalizeClaudeCodeSettings,
+  resolveClaudeEffortForModel,
+} from '../constants/claudeLevels';
 export type { DefaultCodexEffort, DefaultCodexModel } from '../constants/codexSettings';
 import type { CodexSettings, DefaultCodexEffort, DefaultCodexModel } from '../constants/codexSettings';
 import {
+  DEFAULT_CODEX_MODEL,
   DEFAULT_CODEX_SETTINGS,
   normalizeCodexEfforts,
   normalizeCodexModelOptions,
+  normalizeCodexRemovedModelIds,
   resolveCodexPersistentEffortForModel,
 } from '../constants/codexSettings';
 import {
@@ -1769,6 +1775,8 @@ const LOCAL_KEY_CODEX_SETTINGS = 'noted-terminal-codex-settings';
 const normalizeCodexSettings = (raw: unknown): CodexSettings => {
   const obj = raw && typeof raw === 'object' ? raw as Partial<CodexSettings> : {};
   const rawModels = Array.isArray(obj.models) ? obj.models : [];
+  const removedModelIds = normalizeCodexRemovedModelIds(obj.removedModelIds);
+  const removed = new Set(removedModelIds);
   const legacyDefaultOrder = [
     'gpt-5.5',
     'gpt-5.6-sol',
@@ -1779,7 +1787,8 @@ const normalizeCodexSettings = (raw: unknown): CodexSettings => {
     'gpt-5.3-codex-spark',
   ];
   const canonicalOrder = DEFAULT_CODEX_SETTINGS.models.map((model) => model.id);
-  let models = normalizeCodexModelOptions(rawModels);
+  let models = normalizeCodexModelOptions(rawModels, !removed.has(DEFAULT_CODEX_MODEL))
+    .filter((model) => !removed.has(model.id));
   // The original built-in order put 5.5 first. Move untouched legacy settings
   // to the current catalog order without disturbing a user-made custom order.
   if (
@@ -1801,6 +1810,7 @@ const normalizeCodexSettings = (raw: unknown): CodexSettings => {
     efforts: normalizeCodexEfforts(obj.efforts),
     quickModel,
     quickEffort,
+    removedModelIds,
   };
 };
 const loadCodexSettings = (): CodexSettings => {
@@ -1825,7 +1835,7 @@ const initialCodexSettings = loadCodexSettings();
     const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_CODEX_SETTINGS);
     if (v !== null && v !== undefined) {
       const normalized = normalizeCodexSettings(v);
-      useUIStore.setState({ codexSettings: normalized });
+      useUIStore.getState().setCodexSettings(normalized);
       try { localStorage.setItem(LOCAL_KEY_CODEX_SETTINGS, JSON.stringify(normalized)); } catch {}
     }
   } catch {}
@@ -1833,35 +1843,6 @@ const initialCodexSettings = loadCodexSettings();
 
 const APP_STATE_KEY_CLAUDE_CODE_SETTINGS = 'claudeCodeSettings';
 const LOCAL_KEY_CLAUDE_CODE_SETTINGS = 'noted-terminal-claude-code-settings';
-
-const normalizeClaudeCodeSettings = (raw: unknown): ClaudeCodeSettings => {
-  const obj = raw && typeof raw === 'object' ? raw as Partial<ClaudeCodeSettings> : {};
-  const modelsRaw = Array.isArray(obj.models) ? obj.models : [];
-  const models = modelsRaw
-    .map((m) => {
-      if (!m || typeof m !== 'object') return null;
-      let id = String((m as any).id || '').trim();
-      if (!id) return null;
-      if (id === 'claude-fable-5') id = 'claude-fable-5[1m]';
-      const label = String((m as any).label || id).trim() || id;
-      return { id, label, cmd: true };
-    })
-    .filter(Boolean) as ClaudeCodeSettings['models'];
-  const mergedModels = models.length > 0 ? [...models] : [...DEFAULT_CLAUDE_CODE_SETTINGS.models];
-  DEFAULT_CLAUDE_CODE_SETTINGS.models.forEach((m) => {
-    if (!mergedModels.some((existing) => existing.id === m.id)) mergedModels.push(m);
-  });
-
-  const effortsRaw = Array.isArray(obj.efforts) ? obj.efforts : [];
-  const efforts = effortsRaw
-    .map((v) => String(v || '').trim())
-    .filter((v, index, arr) => v && arr.indexOf(v) === index);
-
-  return {
-    models: mergedModels,
-    efforts: efforts.length > 0 ? efforts : [...DEFAULT_CLAUDE_CODE_SETTINGS.efforts],
-  };
-};
 
 const loadClaudeCodeSettings = (): ClaudeCodeSettings => {
   try {
@@ -1887,8 +1868,10 @@ const initialClaudeCodeSettings = loadClaudeCodeSettings();
     const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_CLAUDE_CODE_SETTINGS);
     if (v !== null && v !== undefined) {
       const normalized = normalizeClaudeCodeSettings(v);
-      useUIStore.setState({ claudeCodeSettings: normalized });
-      try { localStorage.setItem(LOCAL_KEY_CLAUDE_CODE_SETTINGS, JSON.stringify(normalized)); } catch {}
+      // Use the public setter so an edited command also keeps the selected
+      // default model/effort coherent. This additionally writes the migrated
+      // shape back to SQLite, removing legacy duplicate Fable rows for good.
+      useUIStore.getState().setClaudeCodeSettings(normalized);
     }
   } catch {}
 })();
@@ -2945,14 +2928,45 @@ export const useUIStore = create<UIStore>((set, get) => ({
   codexSettings: initialCodexSettings,
   setCodexSettings: (settings) => {
     const normalized = normalizeCodexSettings(settings);
-    set({ codexSettings: normalized });
+    const current = get();
+    let defaultModel = current.defaultCodexModel;
+    let defaultEffort = current.defaultCodexEffort;
+    if (defaultModel !== 'none') {
+      const nextModel = normalized.models.find((model) => model.id === defaultModel);
+      defaultModel = nextModel?.id || 'none';
+      if (defaultModel !== 'none' && defaultEffort !== 'none') {
+        defaultEffort = resolveCodexPersistentEffortForModel(nextModel, defaultEffort) || 'none';
+      }
+    }
+    set({ codexSettings: normalized, defaultCodexModel: defaultModel, defaultCodexEffort: defaultEffort });
     saveCodexSettings(normalized);
+    if (defaultModel !== current.defaultCodexModel) saveDefaultCodexModel(defaultModel);
+    if (defaultEffort !== current.defaultCodexEffort) saveDefaultCodexEffort(defaultEffort);
   },
   claudeCodeSettings: initialClaudeCodeSettings,
   setClaudeCodeSettings: (settings) => {
     const normalized = normalizeClaudeCodeSettings(settings);
-    set({ claudeCodeSettings: normalized });
+    const current = get();
+    let defaultModel = current.defaultClaudeModel;
+    let defaultEffort = current.defaultClaudeEffort;
+
+    if (defaultModel !== 'none') {
+      const previousModel = current.claudeCodeSettings.models.find((model) => model.id === defaultModel);
+      const nextModel = normalized.models.find((model) => model.id === defaultModel)
+        || (previousModel?.key
+          ? normalized.models.find((model) => model.key === previousModel.key)
+          : undefined)
+        || normalized.models.find((model) => model.label.toLowerCase() === defaultModel.toLowerCase());
+      defaultModel = nextModel?.id || 'none';
+      if (defaultModel !== 'none' && defaultEffort !== 'none') {
+        defaultEffort = resolveClaudeEffortForModel(nextModel, defaultEffort) || 'none';
+      }
+    }
+
+    set({ claudeCodeSettings: normalized, defaultClaudeModel: defaultModel, defaultClaudeEffort: defaultEffort });
     saveClaudeCodeSettings(normalized);
+    if (defaultModel !== current.defaultClaudeModel) saveDefaultClaudeModel(defaultModel);
+    if (defaultEffort !== current.defaultClaudeEffort) saveDefaultClaudeEffort(defaultEffort);
   },
 
   // Notes Panel — per-tab open state + SQLite-persisted shared size.

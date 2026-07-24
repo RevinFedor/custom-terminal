@@ -1,6 +1,6 @@
 ---
 name: Terminal Scroll Fix (TERM_PROGRAM)
-description: Scroll position resets, viewport jitter, character salad in subagent streams. Single-layer fix — TERM_PROGRAM=vscode triggers Ink's xterm.js-optimized rendering. Claude Code v2.1.101 fixed remaining issues upstream; protectedWrite/sync-frame splitter removed (was causing its own bugs). 40+ failed approaches documented.
+description: Scroll position resets, viewport jitter, character salad in subagent streams, or floating terminal shows a stale shell/launch frame while PTY is already live. TERM_PROGRAM=vscode fixes Ink scroll rendering; cold restore and hidden show preserve one ordered generation.
 type: fix
 ---
 
@@ -234,9 +234,43 @@ if (wasAtBottom.current) {
 ### Критическое правило
 При восстановлении scroll position после переключения табов **нельзя полагаться на текущий `viewportY`** — он может быть сброшен из-за бага xterm.js. Используй сохранённый флаг `wasAtBottom` для решения «scroll to bottom» vs «restore specific line».
 
-### Открытая проблема — потеря PTY-данных при unmount
-Когда юзер переходит на другой экран, компонент Terminal **размонтируется** → буфер сериализуется через `serializeAddon`, listener `terminal:data` удаляется. Но **PTY в Main процессе продолжает работать**. Если Claude в этот момент выдаёт текст — данные **теряются**, при возврате на таб видна «дыра» в истории.
+### Cold renderer после долгой фоновой работы — закрыто 2026-07-24
 
-Концептуальное решение: глобальный listener `terminal:data` на уровне `App.tsx` или Store + аккумуляция в `Map<tabId, string>` для неактивных табов + конкатенация сериализованного буфера и «пропущенных» данных при mount.
+Production-вкладка `tab-1915` доказала более узкую и более опасную версию прежней проблемы. PTY и main-side headless xterm уже показывали полноценный Codex TUI, но renderer xterm впервые создался примерно через 39 минут и остался на shell prompt со строкой запуска. Main cursor был около `1007–1132`, renderer — на `5`; refresh, resize и повторное открытие floating terminal не помогали.
 
-Не реализовано — issue открыт, отложен до следующего цикла рефакторинга.
+Ошибочным было предположение, что сохранённый renderer buffer можно дополнить произвольным хвостом raw PTY-байтов. Ink/Codex рисует экран дифференциально: хвост может начинаться с cursor move, erase или фрагмента synchronized frame и без предшествующего кадра не описывает состояние экрана. Инициализация всех скрытых renderer xterm тоже отвергнута — она возвращает resource/render cost, ради которого renderer был холодным.
+
+Ремонт использует сериализованный main/headless snapshot с точной sequence-границей, затем применяет только более новые чанки того же непрозрачного поколения. Во время переноса live-tail хранится без прежнего лимита; смена поколения требует нового snapshot, а не смешивания процессов с обнулёнными счётчиками. OSC 7777 boundaries переносятся отдельными line-метаданными, потому что SerializeAddon их не сохраняет. Локальный renderer snapshot переиспользуется только при точном совпадении generation и полностью записанной sequence.
+
+Read-only review последовательно закрыл шесть соседних дыр: потерю tail больше `100k`, исчезновение OSC-маркеров, выбор более бедного совпадающего snapshot, reset sequence у нового PTY, преждевременное снятие nested hydration guard и бесконечный retry при отсутствии authority другого поколения. Финальный headless-экран после natural exit сохраняется до явного kill/нового PTY, поэтому позднее открытие завершившейся сессии тоже воспроизводит последний кадр.
+
+Оставшийся риск — стоимость синхронной сериализации очень большого scrollback. Локальные `10 000` строк дали около `55 ms` и `1.13 MB`; этого недостаточно для слепой оптимизации. Production-логи `[HeadlessXterm:SNAPSHOT]` и `[Terminal:HYDRATE]` содержат размер, строки, generation, sequence и время, по ним сначала нужно доказать реальный порог.
+
+### Уже смонтированный hidden renderer и backlog — закрыто 2026-07-24
+
+В другом production-эпизоде той же вкладки renderer уже существовал и до скрытия
+имел полный scrollback. При возврате после пятнадцати минут фонового вывода он
+показал shell-команду запуска, хотя rollout продолжал записываться и `Escape`
+штатно создал `turn_aborted`. Во время показа одновременно сошлись накопленные
+`xterm.write`, очистка canvas, восстановление scroll и `SIGWINCH`; buffer
+схлопнулся с тысяч строк до нескольких. Поэтому этот случай не был повтором cold
+hydration и не доказывал зависание процесса.
+
+Ремонт сериализует физические `xterm.write` и ставит presentation-barrier:
+поставленный вывод дренируется до fit/resize/refresh, а пришедшие во время
+перехода байты проигрываются после него в исходном порядке. Очередь привязана к
+поколению PTY; stale callback не пишет в новый процесс с тем же tabId, resize
+несёт PID владельца, а reset нового поколения выполняется внутри той же очереди.
+Живые сценарии с 3 000 скрытых строк, двумя быстрыми hide/show на 5 000 строках и
+kill/recreate подтвердили этот путь.
+
+Диагностика разделяет принятие данных и увиденную поверхность. `[Terminal:HYDRATE]`
+фиксирует только выбранный snapshot, generation/sequence и поставленный tail;
+это не success отрисовки. Отдельный `[Terminal:SURFACE_PRESENTED]` появляется
+после drain очереди и следующего animation frame, повторно проверяет PID и
+generation и пишет digest видимых строк. Если ветка холодной hydration не
+выполнялась, отсутствие этой пары не маскируется другим «успешным» логом.
+
+`SerializeAddon` всё ещё не переносит незавершённое состояние ANSI parser и saved
+cursor. Это отдельный риск строгого cold checkpoint, а не основание ослаблять уже
+проверенный live presentation-path.

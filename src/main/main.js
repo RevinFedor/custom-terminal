@@ -12,10 +12,16 @@ const readline = require('readline');
 const { performance: nodePerformance, monitorEventLoopDelay } = require('node:perf_hooks');
 const { spawn } = require('child_process');
 let HeadlessXTerminal = null;
+let HeadlessSerializeAddon = null;
 try {
   ({ Terminal: HeadlessXTerminal } = require('@xterm/headless'));
 } catch (err) {
   console.warn('[HeadlessXterm] unavailable: ' + (err?.message || String(err)));
+}
+try {
+  ({ SerializeAddon: HeadlessSerializeAddon } = require('@xterm/addon-serialize'));
+} catch (err) {
+  console.warn('[HeadlessXterm] serialize addon unavailable: ' + (err?.message || String(err)));
 }
 const isInboxProjectId = (projectId) => projectId === '__noted_inbox__';
 let gitIpcModule = null;
@@ -110,6 +116,31 @@ if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
 
 // Load modules from src/main (works for both dev and production)
 const srcMainDir = path.join(__dirname, '..', '..', 'src', 'main');
+const srcSharedDir = path.join(__dirname, '..', '..', 'src', 'shared');
+const { createXtermWritePump } = require(path.join(srcSharedDir, 'xterm-write-pump.cjs'));
+const {
+  deleteTerminalRuntimeIfOwned,
+  ownsTerminalRuntime,
+} = require(path.join(srcMainDir, 'terminal-runtime-identity.cjs'));
+const {
+  createTerminalShellReadinessTracker,
+} = require(path.join(srcMainDir, 'terminal-shell-readiness.cjs'));
+const {
+  codexPromptHasImageMarker,
+  collectCodexPayloadImagePaths,
+  normalizeCodexPromptImageSlots,
+  partitionCodexPendingPromptAuditsForRetention,
+  selectCodexPendingPromptAudit,
+} = require(path.join(srcMainDir, 'codex-prompt-audit'));
+const {
+  captureClaudePromptAuditBoundary,
+  classifyClaudeAuditRecordAfterBoundary,
+  readLastClaudeUserRecord,
+} = require(path.join(srcMainDir, 'claude-prompt-audit'));
+const {
+  classifyManualPtyInputAtBoundary,
+  shouldSerializeManualPtyInput,
+} = require(path.join(srcMainDir, 'pty-input-ownership'));
 const projectManager = require(path.join(srcMainDir, 'project-manager'));
 const SessionManager = require(path.join(srcMainDir, 'session-manager'));
 const ClaudeManager = require(path.join(srcMainDir, 'claude-manager'));
@@ -140,13 +171,24 @@ const {
   normalizePromptPresentationSnapshot,
   saveAuditedPromptPresentation,
 } = require(path.join(srcMainDir, 'history-prompt-presentations'));
+const {
+  buildHistoryResponseEntryCloneMappings,
+  normalizeHistoryResponseToolType,
+  resolveActivitySessionIdForEngine,
+  shouldCreateHistoryResponseTiming,
+} = require(path.join(srcMainDir, 'history-response-timings'));
 const { PromptQueueAssetStore, collectReferencedAssetIds, normalizeAssetId } = require(path.join(srcMainDir, 'prompt-queue-assets'));
 const { CodexImageBindingRegistry } = require(path.join(srcMainDir, 'codex-image-bindings'));
 const { CodexImageTransport, buildCodexImagePastePlan } = require(path.join(srcMainDir, 'codex-image-transport'));
 const {
+  armCodexSuppressedCatchUpRelease,
   classifyCodexTurnRecord,
-  projectCodexSuppressedCatchUpPublication,
+  completeCodexSuppressedCatchUpRelease,
+  configureCodexCatchUpSuppression,
+  deferCodexSourceProofRelease,
+  prepareCodexSourceProofReplay,
   reduceCodexTurnOutcomeSummary,
+  takeCodexSourceProofReleaseAtScanBoundary,
 } = require(path.join(srcMainDir, 'codex-turn-outcome'));
 const {
   executeCodexLaunchObservation,
@@ -157,6 +199,7 @@ const {
 const {
   advanceOscCommandGeneration,
   attachCodexSettingsProofOwner,
+  codexLiveSlashAllowsTurnBusy,
   consumePendingCodexSettingsProofHandoff,
   createCodexLaunchPendingResult,
   createPendingCodexSettingsProofHandoff,
@@ -165,8 +208,10 @@ const {
   planCodexCommandLaunchSettings,
   planCodexLaunchSettings,
   planCodexPickerMovement,
+  projectPendingCodexSettingsProofOwner,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
+  resolveCodexPickerCurrentWriterSessionId,
   shouldClearCodexLaunchPending,
   shouldHoldCodexStartingOnAbsent,
   shouldSurfaceCodexStartupTimeout,
@@ -190,10 +235,14 @@ const {
   resolveCompleteCodexWriterProof,
   resolveCodexUserWriterProof,
   isCommittedCodexNativeRewindReplay,
+  resolveCodexRewindCompletionProof,
+  shouldCloseCodexRewindProtocolUi,
   classifyCodexWriterObservationScope,
   deriveCodexSettledWriterProofScope,
   shouldUseSettledCodexRewindWriterProof,
   isCodexWriterProofOwnershipQuarantined,
+  isRetryableCodexDescriptorProbeTimeout,
+  runCodexDescriptorProbeWithSingleRetry,
   runKeyedExclusive,
   runKeyedSingleFlight,
 } = require(path.join(srcMainDir, 'codex-writer-ownership'));
@@ -218,11 +267,14 @@ const {
   CODEX_EFFORT_APPLICATION_CONVERSATION,
   CODEX_MORE_REASONING_VALUE,
   CODEX_PLAN_SCOPE_ALL_MODES_VALUE,
+  classifyCodexManualEnterFrame,
   codexEffortApplicationMode,
   decideCodexModelMigrationAcknowledgement,
   decideCodexModelMigrationAutoEnter,
   decideCodexPickerCleanupFrame,
   inspectCodexModelMigrationPrompt,
+  inspectCodexModelPickerFrame,
+  isCodexAllModelPickerFrameReady,
   isCodexActivePickerFrame,
   isCodexModelEffortConfirmationObserved,
   isCodexNativeRewindFrameText,
@@ -233,10 +285,12 @@ const {
   parseCodexPlanReasoningScopePicker,
   parseCodexModelMigrationsConfig,
   parseCodexTopLevelConfig,
+  parseCodexVerifiedComposerFooter,
   normalizeCodexMigrationModelLabel,
   verifyCodexTopLevelConfig,
   verifyCodexModelMigrationConfig,
   isCodexPickerFrameComposer,
+  isCodexPickerStateReady,
   planCodexModelSelection,
   planCodexEffortSelection,
   unionCodexEffortOptions,
@@ -1080,6 +1134,7 @@ ipcMain.handle('dock:set-icon-data-url', (_event, payload = {}) => {
 
 ipcMain.handle('dock:reset-icon', () => ({ success: resetDockIcon() }));
 const terminalCommandState = new Map(); // tabId -> { isRunning: boolean, lastExitCode: number, lastCommand?: string, lastCommandAt?: number, lastCommandCwd?: string, activeCommandSource?: string, activeCommand?: string }
+const terminalShellReadiness = createTerminalShellReadinessTracker();
 const terminalPendingCommandMeta = new Map(); // tabId -> metadata for the next OSC 133;B command-start
 const terminalInputLineBuffers = new Map(); // tabId -> best-effort shell input line for "run last project command"
 const terminalInputEscapeStates = new Map(); // tabId -> pending ANSI input sequence state
@@ -1096,10 +1151,11 @@ const COMMAND_RUN_HISTORY_PER_TAB_LIMIT = 25;
 const COMMAND_RUN_HISTORY_TOTAL_LIMIT = 500;
 const TERMINAL_COMMAND_META_TTL_MS = 15000;
 const RESTART_AFTER_COMMAND_SOURCE = 'restart-after';
-const terminalHeadlessMirrors = new Map(); // tabId -> { terminal, pending, writeSeq, flushedSeq, failed }
+const terminalHeadlessMirrors = new Map(); // tabId -> { terminal, writePump, writeSeq, flushedSeq, failed }
 const terminalInputRevisions = new Map(); // tabId -> user/programmatic input generation for destructive-action proof
 const HEADLESS_XTERM_SCROLLBACK = 10000;
 const HEADLESS_XTERM_FLUSH_TIMEOUT_MS = 900;
+let terminalHeadlessGenerationCounter = 0;
 const CODEX_NON_DRAFT_LINE_RE = /(OpenAI Codex|model:|directory:|permissions:|Use \/skills|Full Access|Context \d+%|weekly \d+%|Starting MCP|esc to interrupt|Select Model|Tip:|Model changed|^╭|^╰|^│)/i;
 const CODEX_EMPTY_COMPOSER_HINT_RE = /Use \/skills to list available skills/i;
 
@@ -1477,7 +1533,7 @@ function rollbackClaudeShellLaunchClaims(tabId, {
     + ' reason=' + reason);
 }
 
-function createHeadlessTerminalMirror(tabId, cols = 80, rows = 24) {
+function createHeadlessTerminalMirror(tabId, cols = 80, rows = 24, options = {}) {
   if (!tabId || !HeadlessXTerminal) return null;
   const existing = terminalHeadlessMirrors.get(tabId);
   if (existing && !existing.failed) return existing;
@@ -1490,18 +1546,66 @@ function createHeadlessTerminalMirror(tabId, cols = 80, rows = 24) {
       scrollback: HEADLESS_XTERM_SCROLLBACK,
       allowProposedApi: true,
     });
+    const serializeAddon = HeadlessSerializeAddon ? new HeadlessSerializeAddon() : null;
+    if (serializeAddon) terminal.loadAddon(serializeAddon);
+    const promptBoundaryMarkers = new Map();
+    terminal.parser.registerOscHandler(7777, (payload) => {
+      const match = /^prompt:(\d+)$/.exec(String(payload || ''));
+      if (!match) return true;
+      const seq = Number(match[1]);
+      if (!Number.isFinite(seq) || promptBoundaryMarkers.has(seq)) return true;
+      const marker = terminal.registerMarker(0);
+      if (!marker) return true;
+      promptBoundaryMarkers.set(seq, marker);
+      marker.onDispose(() => {
+        if (promptBoundaryMarkers.get(seq) === marker) {
+          promptBoundaryMarkers.delete(seq);
+        }
+      });
+      return true;
+    });
     const state = {
       terminal,
-      pending: Promise.resolve(),
+      serializeAddon,
+      promptBoundaryMarkers,
+      generation: crypto.randomUUID(),
+      generationOrdinal: ++terminalHeadlessGenerationCounter,
+      writePump: null,
       writeSeq: 0,
       flushedSeq: 0,
       failed: false,
+      disposed: false,
+      complete: options.complete !== false,
+      incompleteReason: options.complete === false
+        ? String(options.incompleteReason || 'unknown-history')
+        : null,
       lastErrorAt: 0,
       cols: safeCols,
       rows: safeRows,
     };
+    state.writePump = createXtermWritePump(
+      (data, done) => state.terminal.write(data, done),
+      {
+        onFlushed: (meta) => {
+          const seq = Number(meta?.seq);
+          if (Number.isFinite(seq)) {
+            state.flushedSeq = Math.max(state.flushedSeq || 0, seq);
+          }
+        },
+        onError: (error) => {
+          state.failed = true;
+          logHeadlessTerminalMirrorError(tabId, state, 'write failed', error);
+        },
+      },
+    );
     terminalHeadlessMirrors.set(tabId, state);
-    console.log('[HeadlessXterm] create tab=' + String(tabId).slice(-12) + ' cols=' + safeCols + ' rows=' + safeRows);
+    console.log('[HeadlessXterm] create tab=' + String(tabId).slice(-12)
+      + ' generation=' + state.generation.slice(0, 8)
+      + '/' + state.generationOrdinal
+      + ' cols=' + safeCols
+      + ' rows=' + safeRows
+      + ' complete=' + state.complete
+      + (state.incompleteReason ? ' incompleteReason=' + state.incompleteReason : ''));
     return state;
   } catch (err) {
     console.warn('[HeadlessXterm] create failed tab=' + String(tabId).slice(-12) + ' ' + (err?.message || String(err)));
@@ -1524,57 +1628,183 @@ function logHeadlessTerminalMirrorError(tabId, state, reason, err) {
 }
 
 function writeHeadlessTerminalMirror(tabId, data) {
-  if (!data) return;
+  if (!data) return null;
   const state = getHeadlessTerminalMirror(tabId);
-  if (!state) return;
+  if (!state) return null;
   const seq = ++state.writeSeq;
   try {
-    state.pending = new Promise((resolve) => {
-      try {
-        state.terminal.write(String(data), () => {
-          state.flushedSeq = Math.max(state.flushedSeq || 0, seq);
-          resolve();
-        });
-      } catch (err) {
-        state.failed = true;
-        logHeadlessTerminalMirrorError(tabId, state, 'write failed', err);
-        resolve();
-      }
+    state.writePump.push(String(data), {
+      seq,
+      generation: state.generation,
+      generationOrdinal: state.generationOrdinal,
     });
   } catch (err) {
     state.failed = true;
     logHeadlessTerminalMirrorError(tabId, state, 'write setup failed', err);
   }
+  return {
+    writeSeq: seq,
+    generation: state.generation,
+    generationOrdinal: state.generationOrdinal,
+  };
 }
 
 async function flushHeadlessTerminalMirror(tabId, timeoutMs = HEADLESS_XTERM_FLUSH_TIMEOUT_MS) {
   const state = getHeadlessTerminalMirror(tabId);
   if (!state) return { success: false, error: 'no-headless-mirror' };
-  const pending = state.pending || Promise.resolve();
-  let timedOut = false;
-  await Promise.race([
-    pending.catch((err) => {
-      state.failed = true;
-      logHeadlessTerminalMirrorError(tabId, state, 'flush failed', err);
-    }),
-    new Promise((resolve) => setTimeout(() => {
-      timedOut = true;
-      resolve();
-    }, timeoutMs)),
-  ]);
-  if (timedOut) {
+  const deadline = Date.now() + Math.max(1, Number(timeoutMs) || HEADLESS_XTERM_FLUSH_TIMEOUT_MS);
+
+  // A PTY chunk can arrive while an earlier write callback is pending. Keep
+  // following the latest sequence until the mirror is fully caught up, then
+  // synchronously serialize it before another onData callback can interleave.
+  while (state.flushedSeq < state.writeSeq) {
+    if (terminalHeadlessMirrors.get(tabId) !== state || state.disposed) {
+      return {
+        success: false,
+        error: 'headless-mirror-generation-changed',
+        writeSeq: state.writeSeq,
+        flushedSeq: state.flushedSeq,
+      };
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      return {
+        success: false,
+        error: 'headless-flush-timeout',
+        writeSeq: state.writeSeq,
+        flushedSeq: state.flushedSeq,
+      };
+    }
+    const pending = state.writePump?.drain?.() || Promise.resolve();
+    let timedOut = false;
+    let timeoutHandle = null;
+    await Promise.race([
+      pending.catch((err) => {
+        state.failed = true;
+        logHeadlessTerminalMirrorError(tabId, state, 'flush failed', err);
+      }),
+      new Promise((resolve) => {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          resolve();
+        }, remainingMs);
+      }),
+    ]);
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    if (terminalHeadlessMirrors.get(tabId) !== state || state.disposed) {
+      return {
+        success: false,
+        error: 'headless-mirror-generation-changed',
+        writeSeq: state.writeSeq,
+        flushedSeq: state.flushedSeq,
+      };
+    }
+    if (timedOut) {
+      return {
+        success: false,
+        error: 'headless-flush-timeout',
+        writeSeq: state.writeSeq,
+        flushedSeq: state.flushedSeq,
+      };
+    }
+    if (state.failed) {
+      return {
+        success: false,
+        error: 'headless-flush-failed',
+        writeSeq: state.writeSeq,
+        flushedSeq: state.flushedSeq,
+      };
+    }
+  }
+  return { success: true, writeSeq: state.writeSeq, flushedSeq: state.flushedSeq };
+}
+
+async function getHeadlessSerializedTerminalSnapshot(tabId, reason = 'renderer-hydration') {
+  const startedAt = nodePerformance.now();
+  const state = getHeadlessTerminalMirror(tabId);
+  if (!state) {
+    return { success: false, error: 'no-headless-mirror', tabId, reason };
+  }
+  if (!state.serializeAddon) {
+    return { success: false, error: 'serialize-addon-unavailable', tabId, reason };
+  }
+  if (state.complete !== true) {
     return {
       success: false,
-      error: 'headless-flush-timeout',
+      error: 'headless-mirror-incomplete',
+      incompleteReason: state.incompleteReason || 'unknown-history',
+      tabId,
+      reason,
+    };
+  }
+  const flush = await flushHeadlessTerminalMirror(tabId);
+  if (!flush.success) {
+    return { ...flush, success: false, tabId, reason };
+  }
+  if (terminalHeadlessMirrors.get(tabId) !== state || state.failed) {
+    return {
+      success: false,
+      error: 'headless-mirror-generation-changed',
+      tabId,
+      reason,
+    };
+  }
+  try {
+    const serializeStartedAt = nodePerformance.now();
+    const serialized = state.serializeAddon.serialize();
+    const serializeMs = nodePerformance.now() - serializeStartedAt;
+    const totalMs = nodePerformance.now() - startedAt;
+    const bufferRows = Number(state.terminal?.buffer?.active?.length || 0);
+    console.log('[HeadlessXterm:SNAPSHOT] tab=' + String(tabId).slice(-12)
+      + ' reason=' + reason
+      + ' generation=' + String(state.generation || '').slice(0, 8)
+      + '/' + state.generationOrdinal
+      + ' seq=' + state.writeSeq
+      + ' chars=' + serialized.length
+      + ' bufferRows=' + bufferRows
+      + ' serializeMs=' + serializeMs.toFixed(1)
+      + ' totalMs=' + totalMs.toFixed(1));
+    return {
+      success: true,
+      tabId,
+      reason,
+      serialized,
+      writeSeq: state.writeSeq,
+      flushedSeq: state.flushedSeq,
+      generation: state.generation,
+      generationOrdinal: state.generationOrdinal,
+      cols: state.cols,
+      rows: state.rows,
+      bufferRows,
+      serializeMs,
+      totalMs,
+      promptBoundaries: Array.from(state.promptBoundaryMarkers || [])
+        .filter(([, marker]) => marker && !marker.isDisposed && marker.line >= 0)
+        .map(([seq, marker]) => ({ seq, line: marker.line })),
+    };
+  } catch (err) {
+    logHeadlessTerminalMirrorError(tabId, state, 'serialize failed', err);
+    return {
+      success: false,
+      error: err?.message || String(err),
+      tabId,
+      reason,
       writeSeq: state.writeSeq,
       flushedSeq: state.flushedSeq,
     };
   }
-  return { success: true };
 }
 
 function resizeHeadlessTerminalMirror(tabId, cols, rows) {
-  const state = getHeadlessTerminalMirror(tabId) || createHeadlessTerminalMirror(tabId, cols, rows);
+  const state = getHeadlessTerminalMirror(tabId) || createHeadlessTerminalMirror(
+    tabId,
+    cols,
+    rows,
+    {
+      complete: false,
+      incompleteReason: 'mirror-created-after-pty-start',
+    },
+  );
   if (!state) return;
   const safeCols = Math.max(2, Number(cols) || state.cols || 80);
   const safeRows = Math.max(2, Number(rows) || state.rows || 24);
@@ -1594,6 +1824,8 @@ function disposeHeadlessTerminalMirror(tabId, reason = 'dispose') {
   terminalInputRevisions.delete(tabId);
   if (!state) return;
   terminalHeadlessMirrors.delete(tabId);
+  state.disposed = true;
+  try { state.writePump?.dispose?.(); } catch {}
   try { state.terminal.dispose?.(); } catch {}
   console.log('[HeadlessXterm] dispose tab=' + String(tabId).slice(-12) + ' reason=' + reason);
 }
@@ -1817,6 +2049,15 @@ function getHeadlessCodexDraftState(tabId, reason = 'headless-draft') {
   if (!state) {
     return { success: false, hasDraft: null, preview: '', source: 'no-headless-mirror', debug: 'reason=no-headless-mirror:' + reason };
   }
+  if (state.complete !== true) {
+    return {
+      success: false,
+      hasDraft: null,
+      preview: '',
+      source: 'headless-mirror-incomplete',
+      debug: 'reason=headless-mirror-incomplete:' + (state.incompleteReason || reason),
+    };
+  }
   try {
     const terminal = state.terminal;
     const buf = terminal.buffer.active;
@@ -1928,6 +2169,15 @@ async function waitForHeadlessCodexDraftState(tabId, expected, timeoutMs = 900, 
   if (!state) {
     return { success: false, hasDraft: null, preview: '', source: 'no-headless-mirror', debug: 'reason=no-headless-mirror:' + reason };
   }
+  if (state.complete !== true) {
+    return {
+      success: false,
+      hasDraft: null,
+      preview: '',
+      source: 'headless-mirror-incomplete',
+      debug: 'reason=headless-mirror-incomplete:' + (state.incompleteReason || reason),
+    };
+  }
   let checks = 0;
   const read = () => {
     checks += 1;
@@ -1964,6 +2214,16 @@ async function waitForHeadlessCodexDraftState(tabId, expected, timeoutMs = 900, 
 function getHeadlessVisibleBufferSnapshot(tabId, reason) {
   const state = getHeadlessTerminalMirror(tabId);
   if (!state) return { success: false, error: 'no-headless-mirror', tabId, reason, source: 'headless-main' };
+  if (state.complete !== true) {
+    return {
+      success: false,
+      error: 'headless-mirror-incomplete',
+      incompleteReason: state.incompleteReason || 'unknown-history',
+      tabId,
+      reason,
+      source: 'headless-main',
+    };
+  }
   try {
     const terminal = state.terminal;
     const buf = terminal.buffer.active;
@@ -2377,6 +2637,12 @@ const geminiActiveTabs = new Set();        // tabs with active Gemini process (f
 // session) is snapshotted at OPEN time, while the tab is still alive, and
 // denormalized into the row so it survives later tab/project deletion.
 const activityOpenIntervals = new Map();   // tabId \u2192 { startTs, engine, projectId, projectPath, projectName, tabName, sessionId }
+// A History/queue send shows the same perimeter loader while bytes are being
+// admitted to the PTY, before the authoritative agent busy edge. Preserve that
+// earlier edge so the eventual durable response duration covers one unbroken
+// visual loader. The safe-paste finally block removes an unconsumed preflight,
+// so a rejected submit cannot contaminate the next turn.
+const responseActivityPreflights = new Map(); // tabId -> { startTs, engine, source }
 let projectActivityBroadcastTimer = null;
 const projectLayoutChangedIds = new Set();
 let projectOrderChanged = false;
@@ -2405,16 +2671,18 @@ function resolveActivityIdentity(tabId, engine) {
     out.projectId = projectId;
     if (row) {
       out.tabName = row.name || null;
-      out.sessionId = bridgeKnownSessions.get(tabId)
-        || codexKnownSessions.get(tabId)
-        || row.claude_session_id || row.gemini_session_id || row.codex_session_id || null;
-    } else {
-      out.sessionId = bridgeKnownSessions.get(tabId) || codexKnownSessions.get(tabId) || null;
     }
     // SDK tabs aren't in terminalProjectIds; pull cwd/session from sdkSessions.
     const sdk = sdkSessions.get(tabId);
+    out.sessionId = resolveActivitySessionIdForEngine(engine, {
+      bridgeSessionId: bridgeKnownSessions.get(tabId) || null,
+      codexRuntimeSessionId: codexKnownSessions.get(tabId) || null,
+      claudeSessionId: row?.claude_session_id || null,
+      geminiSessionId: row?.gemini_session_id || null,
+      codexSessionId: row?.codex_session_id || null,
+      sdkSessionId: sdk?.sessionId || null,
+    });
     if (sdk) {
-      if (!out.sessionId) out.sessionId = sdk.sessionId || null;
       if (!out.projectPath) out.projectPath = sdk.cwd || null;
     }
     if (projectId && projectManager?.db?.db) {
@@ -2928,13 +3196,42 @@ function scheduleProjectOrderBroadcast(reason = 'project-order') {
   scheduleProjectActivityBroadcast(reason);
 }
 
-function recordActivity(tabId, busy, engine) {
+function recordActivity(tabId, busy, engine, options = {}) {
   if (!tabId) return;
   const open = activityOpenIntervals.get(tabId);
   if (busy) {
-    if (open) return; // already open \u2014 no-op (idempotent)
+    if (open) {
+      if (options.responseTimingEligible === true) {
+        open.responseTimingEligible = true;
+      }
+      return; // already open \u2014 no-op (idempotent)
+    }
     const id = resolveActivityIdentity(tabId, engine);
-    activityOpenIntervals.set(tabId, { startTs: Date.now(), ...id });
+    const preflight = responseActivityPreflights.get(tabId);
+    const preflightMatches = preflight && preflight.engine === engine;
+    if (preflightMatches) responseActivityPreflights.delete(tabId);
+    const next = {
+      startTs: preflightMatches ? preflight.startTs : Date.now(),
+      responseTimingEligible: options.responseTimingEligible === true,
+      ...id,
+    };
+    activityOpenIntervals.set(tabId, next);
+    console.log('[ActivityTiming] open'
+      + ' tab=' + String(tabId).slice(-12)
+      + ' engine=' + (next.engine || '-')
+      + ' session=' + String(next.sessionId || '-').slice(0, 12)
+      + ' start=' + next.startTs
+      + ' preflight=' + preflightMatches
+      + ' reason=' + (options.reason || '-'));
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('agent-activity:timing-changed', {
+        tabId,
+        busy: true,
+        engine: next.engine,
+        sessionId: next.sessionId,
+        startTs: next.startTs,
+      });
+    }
     scheduleProjectActivityBroadcast('activity-open');
   } else {
     if (!open) return; // wasn't open \u2014 no-op
@@ -2943,8 +3240,10 @@ function recordActivity(tabId, busy, engine) {
     // Engine may be known only at close-time (e.g. forwarder); prefer the
     // engine captured at open, fall back to the close-time hint.
     if (engine && !open.engine) open.engine = engine;
+    const closeIdentity = resolveActivityIdentity(tabId, open.engine || engine);
+    let saved = null;
     try {
-      projectManager?.db?.saveActivityInterval({
+      saved = projectManager?.db?.saveActivityInterval({
         tabId,
         projectId: open.projectId,
         projectPath: open.projectPath,
@@ -2955,12 +3254,85 @@ function recordActivity(tabId, busy, engine) {
         startTs: open.startTs,
         endTs,
       });
+      const toolType = normalizeHistoryResponseToolType(open.engine || engine);
+      // A close without an explicit completion proof is cleanup, not proof of
+      // an answer. This prevents quit/watchdog/process-exit paths from leaving
+      // a five-minute "waiting for response row" sidecar.
+      const responseTimingEligible = options.responseTimingEligible === true;
+      if (saved?.id && toolType && responseTimingEligible) {
+        projectManager?.db?.savePendingHistoryResponseTiming({
+          intervalId: saved.id,
+          toolType,
+          tabId,
+          sessionId: closeIdentity.sessionId || open.sessionId || null,
+        });
+      }
+      console.log('[ActivityTiming] close'
+        + ' tab=' + String(tabId).slice(-12)
+        + ' engine=' + (open.engine || engine || '-')
+        + ' interval=' + (saved?.id || '-')
+        + ' openSession=' + String(open.sessionId || '-').slice(0, 12)
+        + ' closeSession=' + String(closeIdentity.sessionId || '-').slice(0, 12)
+        + ' response=' + responseTimingEligible
+        + ' reason=' + (options.reason || '-'));
     } catch (e) {
       console.error('[Activity] save failed:', e.message);
+    }
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('agent-activity:timing-changed', {
+        tabId,
+        busy: false,
+        engine: open.engine || engine || null,
+        sessionId: closeIdentity.sessionId || open.sessionId || null,
+        intervalId: saved?.id || null,
+        startTs: open.startTs,
+        endTs,
+        durationMs: saved?.durationMs || Math.max(0, endTs - open.startTs),
+      });
     }
     scheduleProjectActivityBroadcast('activity-close');
   }
 }
+
+ipcMain.handle('agent-activity:get-tab-timing', (_event, payload = {}) => {
+  const tabId = String(payload?.tabId || '').trim();
+  const requestedToolType = normalizeHistoryResponseToolType(payload?.toolType);
+  if (!tabId) return { success: false, error: 'tabId required', timing: null };
+  const open = activityOpenIntervals.get(tabId);
+  if (open) {
+    const toolType = normalizeHistoryResponseToolType(open.engine);
+    if (!requestedToolType || requestedToolType === toolType) {
+      return {
+        success: true,
+        timing: {
+          state: 'running',
+          intervalId: null,
+          toolType,
+          sessionId: open.sessionId || null,
+          startTs: open.startTs,
+          endTs: null,
+          durationMs: null,
+        },
+      };
+    }
+  }
+  const pending = projectManager?.db?.getLatestPendingHistoryResponseTimingForTab(
+    tabId,
+    requestedToolType,
+  ) || null;
+  // Pending is only the short handoff between loader end and exact JSONL row
+  // binding. Keep the durable row for delayed transcript refresh, but never
+  // leave a frozen top-bar timer visible for minutes.
+  const recentPending = pending && Date.now() - Number(pending.endTs || 0) <= 10 * 1000
+    ? pending
+    : null;
+  return {
+    success: true,
+    timing: recentPending
+      ? { ...recentPending, state: 'pending' }
+      : null,
+  };
+});
 
 // Persist every currently-open interval, truncated at now. Called on app quit
 // so in-flight turns aren't lost. Closes each via recordActivity(false) which
@@ -4082,18 +4454,15 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
       ' prev=' + (prev ? String(prev).slice(0, 8) : 'none') +
       ' revalidated=' + (prev === sessionId) +
       ' total=' + codexKnownSessions.size);
-    const runtimeProjection = getCodexPublicRuntimeProjection(tabId);
-    _webBroadcast(tabId, {
-      type: 'snapshot',
-      sessionId,
-      busy: runtimeProjection.busy,
-      sessionStatus: runtimeProjection.sessionStatus,
-      starting: runtimeProjection.sessionStatus === 'starting',
-      toolType: 'codex',
-      commandType: 'codex',
-      inputReady: runtimeProjection.inputReady,
-      ...getCodexPublicWriterFields(tabId),
-    });
+    const turnState = codexTurnWatchers.get(tabId) || null;
+    if (turnState?.publicTurnStateSuppressed === true) {
+      console.log('[CodexTurn] writer snapshot deferred until catch-up tab='
+        + String(tabId).slice(-12)
+        + ' session=' + String(sessionId).slice(0, 8)
+        + ' reason=' + reason);
+    } else {
+      broadcastCodexPublicRuntimeSnapshot(tabId, reason);
+    }
   }
   return {
     success: true,
@@ -4111,6 +4480,26 @@ function getCodexWriterProofSnapshot(tabId) {
   const proof = codexWriterProofs.get(tabId) || null;
   if (!sessionId || !proof || proof.sessionId !== sessionId || proof.valid !== true) return null;
   return { ...proof, sessionId };
+}
+
+function getCodexProvisionalSettingsSnapshot(tabId, expectedOwnerId = null) {
+  if (!tabId || getCodexWriterProofSnapshot(tabId)) return null;
+  const pending = codexPendingSettingsProofHandoffs.get(tabId) || null;
+  const projected = projectPendingCodexSettingsProofOwner(pending, {
+    terminalToken: terminals.get(tabId) || null,
+    runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    expectedOwnerId,
+  });
+  if (!projected) return null;
+  return {
+    codexProvisionalSettingsOwnerId: projected.ownerId,
+    codexProvisionalSettingsLaunchId: projected.launchId,
+    codexProvisionalModel: projected.model,
+    codexProvisionalEffort: projected.effort,
+    codexProvisionalFast: projected.fast,
+    codexProvisionalSettingsProofAt: projected.proofAt,
+    codexProvisionalSettingsProofSource: projected.applicationProofSource,
+  };
 }
 
 function isCodexWriterUsableForMutation(tabId) {
@@ -4540,6 +4929,22 @@ function getCodexPublicRuntimeProjection(tabId) {
     writerUsableForMutation: isCodexWriterUsableForMutation(tabId),
     writerUiLifecycleEstablished: hasCodexEstablishedWriterUiLifecycle(tabId),
     hasEstablishedLifecycle: true,
+  });
+}
+
+function broadcastCodexPublicRuntimeSnapshot(tabId, reason = 'runtime-snapshot') {
+  const runtimeProjection = getCodexPublicRuntimeProjection(tabId);
+  _webBroadcast(tabId, {
+    type: 'snapshot',
+    sessionId: getCodexRuntimeSessionId(tabId),
+    busy: runtimeProjection.busy,
+    sessionStatus: runtimeProjection.sessionStatus,
+    starting: runtimeProjection.sessionStatus === 'starting',
+    toolType: 'codex',
+    commandType: 'codex',
+    inputReady: runtimeProjection.inputReady,
+    reason,
+    ...getCodexPublicWriterFields(tabId),
   });
 }
 
@@ -5036,7 +5441,11 @@ function scanClaudeStartupSlashProof(tabId, command, afterMs) {
 
 function emitClaudeBusyState(tabId, busy, reason, meta = null) {
   claudeSpinnerBusy.set(tabId, busy);
-  recordActivity(tabId, busy, 'claude');
+  const responseTimingEligible = shouldCreateHistoryResponseTiming({
+    toolType: 'claude',
+    reason,
+  });
+  recordActivity(tabId, busy, 'claude', { responseTimingEligible, reason });
   if (mainWindow && !mainWindow.isDestroyed()) {
     const payload = { tabId, busy, reason };
     if (meta && typeof meta === 'object') Object.assign(payload, meta);
@@ -5585,33 +5994,7 @@ function startClaudeHookServer() {
             // Best-effort, never block the hook ack. Read async, log result.
             (async () => {
               try {
-                const fsp = require('fs').promises;
                 const crypto = require('crypto');
-                const readLastUserRecord = async () => {
-                  const raw = await fsp.readFile(transcript_path, 'utf8');
-                  // Walk from the end backwards looking for the last
-                  // {type:"user", message:{role:"user", content:...}} entry.
-                  const lines = raw.split('\n');
-                  for (let li = lines.length - 1; li >= 0; li--) {
-                    const ln = lines[li].trim();
-                    if (!ln) continue;
-                    let rec;
-                    try { rec = JSON.parse(ln); } catch { continue; }
-                    if (rec.type !== 'user') continue;
-                    const m = rec.message;
-                    if (!m || m.role !== 'user') continue;
-                    if (typeof m.content === 'string') {
-                      return { record: rec, text: m.content };
-                    }
-                    if (Array.isArray(m.content)) {
-                      const textPart = m.content.find(c => c && c.type === 'text');
-                      if (textPart && typeof textPart.text === 'string') {
-                        return { record: rec, text: textPart.text };
-                      }
-                    }
-                  }
-                  return null;
-                };
                 const delays = [0, 80, 220, 520, 1000];
                 let finalText = null;
                 let finalRecord = null;
@@ -5620,7 +6003,10 @@ function startClaudeHookServer() {
                 for (let attempt = 0; attempt < delays.length; attempt++) {
                   const delay = delays[attempt];
                   if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-                  const foundUser = await readLastUserRecord();
+                  const foundUser = await readLastClaudeUserRecord(
+                    transcript_path,
+                    audit.preSubmitBoundary,
+                  );
                   if (foundUser === null) {
                     if (attempt === delays.length - 1) {
                       console.warn('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' no user record found in transcript ' + transcript_path + ' attempts=' + delays.length);
@@ -5635,10 +6021,20 @@ function startClaudeHookServer() {
                   finalHash = actualHash;
                   finalLen = actualLen;
                   const match = actualLen === audit.expectedLen && actualHash === audit.expectedHash;
-                  if (match) {
-                    const auditSessionId = audit.historySessionId
-                      || finalRecord?.sessionId
-                      || path.basename(transcript_path, '.jsonl');
+                  // The file tail can still point at the previous identical
+                  // prompt when UserPromptSubmit arrives before JSONL flush.
+                  // Text/hash equality is not causal proof. The exact
+                  // pre-Enter byte/UUID boundary is: the candidate must either
+                  // begin after the captured file size or carry a new UUID in
+                  // a linked child transcript.
+                  const causality = classifyClaudeAuditRecordAfterBoundary(
+                    foundUser,
+                    audit.preSubmitBoundary,
+                  );
+                  if (match && causality.causal) {
+                    const auditSessionId = finalRecord?.sessionId
+                      || path.basename(transcript_path, '.jsonl')
+                      || audit.historySessionId;
                     const auditTimestamp = finalRecord?.timestamp
                       || new Date(audit.sentAt).toISOString();
                     const entryUuid = finalRecord?.uuid || null;
@@ -5664,6 +6060,16 @@ function startClaudeHookServer() {
                       expectedHash: audit.expectedHash,
                     });
                     return;
+                  }
+                  if (match && !causality.causal) {
+                    console.log('[PasteAudit] tab=' + tabId.slice(-12)
+                      + ' handoff=' + (audit.handoffId || '-')
+                      + ' source=' + (audit.source || '-')
+                      + ' stale identical tail attempt=' + (attempt + 1)
+                      + ' causalReason=' + causality.reason
+                      + ' byteOffset=' + (foundUser.byteOffset ?? 'unknown')
+                      + ' boundary=' + (audit.preSubmitBoundary?.fileSize ?? 'unknown')
+                      + ' — waiting for the new JSONL record');
                   }
                   if (attempt < delays.length - 1) {
                     console.log('[PasteAudit] tab=' + tabId.slice(-12) + ' handoff=' + (audit.handoffId || '-') + ' source=' + (audit.source || '-') + ' pending mismatch attempt=' + (attempt + 1) + ' expectedHash=' + audit.expectedHash + ' actualHash=' + actualHash + ' — retrying');
@@ -5782,7 +6188,12 @@ function startClaudeHookServer() {
           if (!busy) _webBroadcast(tabId, { type: 'done', sessionId: session_id });
         }
         // Activity tracking — authoritative turn edges (idempotent recorder).
-        recordActivity(tabId, busy, 'claude');
+        recordActivity(tabId, busy, 'claude', {
+          responseTimingEligible: busy
+            ? event === 'UserPromptSubmit'
+            : shouldCreateHistoryResponseTiming({ toolType: 'claude', event }),
+          reason: event,
+        });
 
         // Watchdog — if Stop never fires (silent tool stop bug #29881, hook script crash, etc.)
         // fall back to busy=false after CLAUDE_TURN_WATCHDOG_MS so the loader doesn't hang forever.
@@ -6328,7 +6739,7 @@ function armCodexDescendantExitRecheck(
 // Parse OSC 133 sequences and emit events
 // OSC 133 format: \x1b]133;X\x07 or \x1b]133;X;param\x07
 // X can be: A (prompt start), B (command start), C (executing), D;exitcode (finished)
-function parseOSC133AndEmit(tabId, data) {
+function parseOSC133AndEmit(tabId, data, terminalToken = null) {
   // Regex to match OSC 133 sequences
   // \x1b] = ESC ]
   // 133; = OSC 133
@@ -6347,8 +6758,14 @@ function parseOSC133AndEmit(tabId, data) {
     switch (type) {
       case 'A': // Prompt start - shell is waiting for input
         console.log(`[OSC 133] Tab ${tabId}: Prompt ready (A)`);
+        terminalShellReadiness.markPromptReady(
+          tabId,
+          terminalToken,
+          terminalToken?.pid,
+        );
+        const promptReadiness = terminalShellReadiness.snapshot(tabId, terminalToken);
         if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('terminal:prompt-ready', tabId);
+          mainWindow.webContents.send('terminal:prompt-ready', tabId, promptReadiness);
         }
         // Internal event for terminal:create initialCommand dispatch — fires on first A,
         // listener self-removes after one match. Decoupled from the renderer-facing IPC.
@@ -6356,6 +6773,7 @@ function parseOSC133AndEmit(tabId, data) {
         break;
 
       case 'B': // Command start - user pressed Enter
+        terminalShellReadiness.markCommandBoundary(tabId, terminalToken);
         console.log(`[OSC 133] Tab ${tabId}: Command STARTED (B)`);
         console.warn(`[RunAfterDiag] B tab=${tabId.slice(-8)} claudeCliActive=${claudeCliActive.has(tabId)} spinnerBusy=${claudeSpinnerBusy.get(tabId) === true}`);
         clearClaudeEditableLastPrompt(tabId, 'osc-command-started');
@@ -6401,6 +6819,7 @@ function parseOSC133AndEmit(tabId, data) {
         break;
 
       case 'C': // Command executing
+        terminalShellReadiness.markCommandBoundary(tabId, terminalToken);
         console.log(`[OSC 133] Tab ${tabId}: Executing (C)`);
         // Already handled by B
         break;
@@ -10259,7 +10678,10 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       }
       console.log('[terminal:create] PTY already exists for ' + tabId + ' (pid=' + existingPty.pid + '), reusing');
       if (!getHeadlessTerminalMirror(tabId)) {
-        createHeadlessTerminalMirror(tabId, cols || 80, rows || 24);
+        createHeadlessTerminalMirror(tabId, cols || 80, rows || 24, {
+          complete: false,
+          incompleteReason: 'existing-pty-mirror-missing',
+        });
       }
       return { pid: existingPty.pid, cwd: terminalProjects.get(tabId) };
     }
@@ -10387,6 +10809,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     console.log(`[PTY:CREATED] tabId=${tabId} pid=${ptyProcess.pid} cwd=${workingDir} shell=${shell} args=${JSON.stringify(shellArgs)} initialCommand=${initialCommand ? JSON.stringify(initialCommand) : 'none'}`);
 
     terminals.set(tabId, ptyProcess);
+    terminalShellReadiness.reset(tabId, ptyProcess, ptyProcess.pid);
     terminalProjects.set(tabId, workingDir);
     if (typeof projectId === 'string' && projectId) {
       terminalProjectIds.set(tabId, projectId);
@@ -10394,6 +10817,10 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     terminalCommandState.set(tabId, { isRunning: false, lastExitCode: 0 });
     if (initialCommand) terminalInitialCommand.set(tabId, initialCommand);
     terminalOutputBuffer.set(tabId, { lines: [], maxLines: TERMINAL_OUTPUT_MAX_LINES });
+    // A naturally exited PTY keeps its final headless frame so a late renderer
+    // can still hydrate the completed screen. A new PTY is the ownership
+    // boundary: dispose that retained frame and start a fresh generation.
+    disposeHeadlessTerminalMirror(tabId, 'pty-recreate');
     createHeadlessTerminalMirror(tabId, cols || 80, rows || 24);
 
     // If initialCommand provided, wait for shell-integration's first OSC 133;A
@@ -10427,6 +10854,15 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     }
 
     ptyProcess.onData((data) => {
+      if (!ownsTerminalRuntime(terminals, tabId, ptyProcess)) {
+        if (ptyProcess.__notedStaleDataReported !== true) {
+          ptyProcess.__notedStaleDataReported = true;
+          console.warn('[PTY:STALE_DATA] ignored tab=' + String(tabId).slice(-12)
+            + ' oldPid=' + ptyProcess.pid
+            + ' currentPid=' + (terminals.get(tabId)?.pid || '-'));
+        }
+        return;
+      }
       // Capture output into ring buffer for MCP read_output
       const buf = terminalOutputBuffer.get(tabId);
       if (buf) {
@@ -10438,7 +10874,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       }
 
       // Parse OSC 133 for command lifecycle events (just spy, don't modify)
-      parseOSC133AndEmit(tabId, data);
+      parseOSC133AndEmit(tabId, data, ptyProcess);
       const outputToolType = bridgeKnownSessions.has(tabId) ? 'claude' : resolveAiToolTypeForTab(tabId);
       if (outputToolType !== 'claude') {
         tryCommitCodexModelMigrationAcknowledgement(tabId, data);
@@ -10927,7 +11363,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
 
       // Keep an authoritative xterm buffer in main. Background/API flows must
       // not depend on a mounted renderer terminal to prove the current TUI row.
-      writeHeadlessTerminalMirror(tabId, data);
+      const headlessWrite = writeHeadlessTerminalMirror(tabId, data);
       const boundCodexImages = codexImageBindings.observe(tabId, data);
       if (boundCodexImages.length > 0) {
         console.log('[CodexImageBinding] tab=' + String(tabId).slice(-12)
@@ -10937,11 +11373,25 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
 
       // Send data to renderer - xterm.js handles OSC sequences itself
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('terminal:data', { pid: ptyProcess.pid, tabId, data });
+        mainWindow.webContents.send('terminal:data', {
+          pid: ptyProcess.pid,
+          tabId,
+          data,
+          headlessWriteSeq: headlessWrite?.writeSeq ?? null,
+          headlessGeneration: headlessWrite?.generation ?? null,
+          headlessGenerationOrdinal: headlessWrite?.generationOrdinal ?? null,
+        });
       }
     });
 
     ptyProcess.onExit((exitCode) => {
+      if (!ownsTerminalRuntime(terminals, tabId, ptyProcess)) {
+        console.warn('[PTY:STALE_EXIT] ignored tab=' + String(tabId).slice(-12)
+          + ' oldPid=' + ptyProcess.pid
+          + ' currentPid=' + (terminals.get(tabId)?.pid || '-')
+          + ' exitCode=' + JSON.stringify(exitCode));
+        return;
+      }
       // [JsonlChainDiag] PTY shell death — if Claude was streaming an assistant turn at
       // this moment, the in-flight assistant JSONL entry is lost. Surface session state
       // so we can correlate later breaks with this exit point.
@@ -10955,7 +11405,8 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('terminal:exit', tabId, exitCode);
       }
-      terminals.delete(tabId);
+      deleteTerminalRuntimeIfOwned(terminals, tabId, ptyProcess);
+      terminalShellReadiness.remove(tabId, ptyProcess);
       terminalProjects.delete(tabId);
       terminalProjectIds.delete(tabId);
       terminalCommandState.delete(tabId);
@@ -10964,7 +11415,9 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       clearCodexDescendantExitRecheck(tabId, 'pty-exit');
       terminalInitialCommand.delete(tabId);
       terminalOutputBuffer.delete(tabId);
-      disposeHeadlessTerminalMirror(tabId, 'pty-exit');
+      console.log('[HeadlessXterm] retain final snapshot tab='
+        + String(tabId).slice(-12)
+        + ' reason=pty-exit');
       invalidateAiProcessLookupCache(tabId);
       clearAiStopping(tabId, 'pty-exit');
       clearCodexLaunchPayload(tabId, 'pty-exit');
@@ -11058,19 +11511,145 @@ function markActivePtySubmit(term, { identityPending = false } = {}) {
   operation.submittedAt = Date.now();
 }
 
-// Per-tab paste audit slot. Filled by safePasteAndSubmit right before Enter is
-// sent. Cleared by the UserPromptSubmit hook handler after comparing the actual
-// last user message in the JSONL transcript against what we sent. Mismatch =>
-// log a [PasteAudit:MISMATCH] line with both lengths/hashes so future paste
-// regressions surface as concrete evidence, not "feels slow/looks wrong".
-// Only the most recent expectation is tracked (Map slot is overwritten per
-// safePasteAndSubmit call) — chained queue items each get their own audit on
-// the next UserPromptSubmit.
+// Per-tab prompt delivery audits. Claude currently owns one synchronous hook
+// expectation; Codex owns an ordered set because compact/queueing can delay A
+// until after B has already been submitted. A later expectation must never
+// replace or fail an earlier one.
 const pendingPasteAudit = new Map();
 const pendingCodexPasteAudit = new Map();
 const CLAUDE_PASTE_AUDIT_TIMEOUT_MS = 8000;
 const CODEX_PASTE_AUDIT_TIMEOUT_MS = 8000;
-const CODEX_PASTE_AUDIT_LATE_RECONCILIATION_MS = 2 * 60 * 1000;
+const CODEX_PASTE_AUDIT_MAX_AGE_MS = 30 * 60 * 1000;
+const CODEX_PASTE_AUDIT_MAX_PENDING_PER_TAB = 32;
+
+function dropCodexPasteAuditUnconfirmed(tabId, audit, reason) {
+  if (!audit || audit.finished === true) return false;
+  const audits = pendingCodexPasteAudit.get(tabId);
+  const index = Array.isArray(audits) ? audits.indexOf(audit) : -1;
+  if (index < 0) return false;
+  audits.splice(index, 1);
+  if (audits.length === 0) pendingCodexPasteAudit.delete(tabId);
+  if (audit.timer) clearTimeout(audit.timer);
+  audit.timer = null;
+  audit.finished = true;
+  audit.result = {
+    success: false,
+    error: 'codex_user_message_audit_unconfirmed_evicted',
+    lateReconciliationPending: true,
+    expectedLen: audit.expectedLen,
+    expectedHash: audit.expectedHash,
+  };
+  if (typeof audit.resolve === 'function') {
+    audit.resolve(audit.result);
+    audit.resolve = null;
+  }
+  // This is a memory/observer bound, not a delivery verdict. Publishing it as
+  // an audit result would turn "we no longer know" into SEND FAILED.
+  console.warn('[CodexPasteAudit:EVICT_UNCONFIRMED] tab=' + String(tabId).slice(-12)
+    + ' handoff=' + (audit.handoffId || '-')
+    + ' reason=' + reason
+    + ' ageMs=' + Math.max(0, Date.now() - Number(audit.sentAt || Date.now()))
+    + ' expectedLen=' + Number(audit.expectedLen || 0));
+  audit.expectedText = '';
+  audit.actualPayload = null;
+  audit.presentationSnapshot = null;
+  return true;
+}
+
+function pruneCodexPasteAudits(tabId, now = Date.now()) {
+  const audits = pendingCodexPasteAudit.get(tabId);
+  if (!Array.isArray(audits) || audits.length === 0) return;
+  const retention = partitionCodexPendingPromptAuditsForRetention(audits, {
+    now,
+    maxAgeMs: CODEX_PASTE_AUDIT_MAX_AGE_MS,
+    maxPending: CODEX_PASTE_AUDIT_MAX_PENDING_PER_TAB,
+  });
+  for (const { audit, reason } of retention.evicted) {
+    dropCodexPasteAuditUnconfirmed(tabId, audit, reason);
+  }
+}
+
+function getPendingCodexPasteAudits(tabId) {
+  pruneCodexPasteAudits(tabId);
+  const audits = pendingCodexPasteAudit.get(tabId);
+  return Array.isArray(audits) ? audits : [];
+}
+
+function hasPendingCodexPasteAudit(tabId, audit = null) {
+  const audits = getPendingCodexPasteAudits(tabId);
+  return audit ? audits.includes(audit) : audits.length > 0;
+}
+
+function enqueueCodexPasteAudit(tabId, audit) {
+  pruneCodexPasteAudits(tabId);
+  const audits = getPendingCodexPasteAudits(tabId);
+  if (audits.length === 0) {
+    pendingCodexPasteAudit.set(tabId, [audit]);
+    return;
+  }
+  audits.push(audit);
+  pruneCodexPasteAudits(tabId);
+}
+
+function removePendingCodexPasteAudit(tabId, audit) {
+  const audits = getPendingCodexPasteAudits(tabId);
+  const index = audits.indexOf(audit);
+  if (index < 0) return false;
+  audits.splice(index, 1);
+  if (audits.length === 0) pendingCodexPasteAudit.delete(tabId);
+  return true;
+}
+
+function captureCodexPromptAuditBoundary(tabId, capturedAt = Date.now()) {
+  const watcher = codexTurnWatchers.get(tabId) || null;
+  if (!watcher?.sessionId || !watcher?.filePath) {
+    return {
+      capturedAt,
+      sessionId: null,
+      filePath: null,
+      fileSize: null,
+    };
+  }
+  let fileSize = null;
+  try {
+    // Metadata only: the rollout itself is never synchronously read here.
+    fileSize = fs.statSync(watcher.filePath).size;
+  } catch (error) {
+    console.warn('[CodexPasteAudit] pre-Enter boundary stat failed tab='
+      + String(tabId).slice(-12)
+      + ' session=' + String(watcher.sessionId).slice(0, 8)
+      + ' error=' + (error?.message || String(error)));
+  }
+  return {
+    capturedAt,
+    sessionId: watcher.sessionId,
+    filePath: watcher.filePath,
+    fileSize: Number.isFinite(fileSize) ? Number(fileSize) : null,
+  };
+}
+
+function resolveCodexPendingAuditCatchUpOffset(tabId, sessionId, filePath, fileSize) {
+  const audits = getPendingCodexPasteAudits(tabId)
+    .filter((audit) => audit?.awaitUserMessage === true);
+  if (audits.length === 0) return fileSize;
+  const boundaries = [];
+  for (const audit of audits) {
+    const boundary = audit?.preSubmitBoundary || null;
+    if (
+      !boundary
+      || String(boundary.sessionId || '') !== String(sessionId || '')
+      || String(boundary.filePath || '') !== String(filePath || '')
+      || !Number.isFinite(boundary.fileSize)
+    ) {
+      // A linked child rollout can contain the awaited record after copied
+      // history, so it must be scanned from its beginning. The causal matcher
+      // rejects copied records by timestamp.
+      return 0;
+    }
+    boundaries.push(Math.max(0, Math.min(fileSize, Number(boundary.fileSize))));
+  }
+  return Math.min(...boundaries);
+}
 
 function pasteAuditHash(text) {
   return require('crypto').createHash('sha1').update(String(text || '')).digest('hex').slice(0, 16);
@@ -11080,61 +11659,35 @@ function pasteAuditPreview(text, start = 0) {
   return String(text || '').substring(start, start + 80).replace(/\s+/g, ' ');
 }
 
-function codexCanonicalUserMessageMatch(audit, actualText) {
-  const expected = String(audit?.expectedText || '');
-  const actual = String(actualText || '');
-  if (!expected) return null;
-  const trimStartExpected = expected.replace(/^\s+/, '');
-  if (trimStartExpected !== expected && actual === trimStartExpected) {
-    return { reason: 'codex_trimmed_leading_whitespace' };
-  }
-  const payload = audit?.actualPayload || null;
-  const imagePaths = collectCodexPayloadImagePaths(payload);
-  if ((imagePaths.length > 0 || codexPromptHasImageMarker(expected) || codexPromptHasImageMarker(actual))
-    && normalizeCodexPromptImageSlots(expected, imagePaths) === normalizeCodexPromptImageSlots(actual, imagePaths)) {
-    return { reason: 'codex_image_placeholder_canonical' };
-  }
-  return null;
-}
-
-function collectCodexPayloadImagePaths(payload) {
-  const paths = [];
-  const add = (value) => {
-    if (typeof value !== 'string') return;
-    const trimmed = value.trim();
-    if (trimmed) paths.push(trimmed);
-  };
-  if (payload && typeof payload === 'object') {
-    if (Array.isArray(payload.local_images)) payload.local_images.forEach(add);
-    if (Array.isArray(payload.images)) payload.images.forEach(add);
-  }
-  return paths;
-}
-
-function codexPromptHasImageMarker(text) {
-  return /\[(?:Image(?:\s+#?\d+)?|imagePath:\s*[^\]\r\n]+?|imageError:\s*[^\]\r\n]+?|image:\s*[^\]\r\n]+?)\]/i.test(String(text || ''));
-}
-
-function normalizeCodexPromptImageSlots(text, imagePaths = []) {
-  let value = String(text || '');
-  const sortedPaths = [...new Set((imagePaths || []).filter(Boolean))]
-    .sort((a, b) => String(b).length - String(a).length);
-  for (const imagePath of sortedPaths) {
-    value = value.split(String(imagePath)).join(' [Image] ');
-  }
-  return value
-    .replace(/\[imagePath:\s*[^\]\r\n]+?\s*\]/gi, ' [Image] ')
-    .replace(/\[imageError:\s*[^\]\r\n]+?\s*\]/gi, ' [Image] ')
-    .replace(/\[image:\s*[^\]\r\n]+?\s*\]/gi, ' [Image] ')
-    .replace(/\[Image(?:\s+#?\d+)?\]/gi, ' [Image] ')
-    .replace(/\s+/g, ' ')
-    .trim();
+function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
+  if (
+    !audit?.handoffId
+    || !mainWindow
+    || mainWindow.isDestroyed()
+  ) return;
+  mainWindow.webContents.send('agent-prompt:audit-result', {
+    tabId,
+    handoffId: audit.handoffId,
+    toolType,
+    source: audit.source || null,
+    success: result?.success === true,
+    error: result?.error || null,
+    late: audit.callerTimedOut === true,
+    auditTimestamp: result?.auditTimestamp || null,
+    actualHash: result?.actualHash || null,
+    actualLen: Number.isFinite(result?.actualLen) ? Number(result.actualLen) : null,
+    sessionId: result?.sessionId || null,
+    sourceIdentity: result?.sourceIdentity || null,
+    canonicalized: result?.canonicalized === true,
+    canonicalReason: result?.canonicalReason || null,
+  });
 }
 
 function finishClaudePasteAudit(tabId, audit, result) {
   if (!audit) return;
   if (audit.timer) clearTimeout(audit.timer);
   if (pendingPasteAudit.get(tabId) === audit) pendingPasteAudit.delete(tabId);
+  publishAgentPromptAuditResult(tabId, audit, result, 'claude');
   if (typeof audit.resolve === 'function') {
     audit.resolve(result);
     audit.resolve = null;
@@ -11168,12 +11721,13 @@ function waitForClaudePasteAudit(tabId, audit, timeoutMs = CLAUDE_PASTE_AUDIT_TI
 }
 
 function finishCodexPasteAudit(tabId, audit, result) {
-  if (!audit) return;
+  if (!audit || audit.finished === true) return;
+  audit.finished = true;
+  audit.result = result;
   if (audit.timer) clearTimeout(audit.timer);
-  if (audit.lateTimer) clearTimeout(audit.lateTimer);
   audit.timer = null;
-  audit.lateTimer = null;
-  if (pendingCodexPasteAudit.get(tabId) === audit) pendingCodexPasteAudit.delete(tabId);
+  removePendingCodexPasteAudit(tabId, audit);
+  publishAgentPromptAuditResult(tabId, audit, result, 'codex');
   if (typeof audit.resolve === 'function') {
     audit.resolve(result);
     audit.resolve = null;
@@ -11183,6 +11737,12 @@ function finishCodexPasteAudit(tabId, audit, result) {
 function waitForCodexPasteAudit(tabId, audit, timeoutMs = CODEX_PASTE_AUDIT_TIMEOUT_MS) {
   if (!audit) {
     return Promise.resolve({ success: false, error: 'codex_audit_missing' });
+  }
+  if (audit.finished === true) {
+    return Promise.resolve(audit.result || {
+      success: false,
+      error: 'codex_audit_finished_without_result',
+    });
   }
   return new Promise((resolve) => {
     audit.resolve = resolve;
@@ -11209,29 +11769,10 @@ function waitForCodexPasteAudit(tabId, audit, timeoutMs = CODEX_PASTE_AUDIT_TIME
         audit.resolve(timeoutResult);
         audit.resolve = null;
       }
-      // The caller gets a bounded timeout, but delivery ownership must survive
-      // a slow Codex startup. A fresh rollout may appear tens of seconds after
-      // Enter; keeping this exact hash lets the newly adopted watcher replay
-      // from byte zero and reconcile task_started/task_complete as well.
-      if (pendingCodexPasteAudit.get(tabId) === audit) {
-        audit.lateTimer = setTimeout(() => {
-          audit.lateTimer = null;
-          if (pendingCodexPasteAudit.get(tabId) !== audit) return;
-          console.warn('[CodexPasteAudit:LATE_TIMEOUT] tab=' + String(tabId).slice(-12)
-            + ' source=' + (audit.source || '-')
-            + ' expectedLen=' + audit.expectedLen
-            + ' expectedHash=' + audit.expectedHash
-            + ' sentAgeMs=' + (Date.now() - audit.sentAt)
-            + ' action=release-late-reconciliation');
-          finishCodexPasteAudit(tabId, audit, {
-            success: false,
-            error: 'codex_user_message_audit_late_timeout',
-            expectedLen: audit.expectedLen,
-            expectedHash: audit.expectedHash,
-          });
-          clearCodexPromptInFlight(tabId, 'paste-audit-late-timeout');
-        }, CODEX_PASTE_AUDIT_LATE_RECONCILIATION_MS);
-      }
+      // A timeout bounds the request, not the delivery truth. Compact/resume
+      // can delay the rollout user_message for minutes, so the exact audit
+      // remains pending until a causal record appears. No elapsed duration is
+      // allowed to turn "unconfirmed" into SEND FAILED.
     }, timeoutMs);
   });
 }
@@ -11662,6 +12203,25 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   const isHistoryComposerSource = typeof source === 'string'
     && (source === 'history-panel' || source === 'codex-history-panel');
   const requiresImagePathValidation = isPromptQueueSource || isHistoryComposerSource;
+  const responsePreflightEngine = isCodexPasteSource ? 'codex' : (!fast ? 'claude' : null);
+  const shouldTrackResponsePreflight = !!(
+    submit
+    && submitSequence !== '\t'
+    && responsePreflightEngine
+    && broadcastTabId
+    && (isPromptQueueSource || isHistoryComposerSource)
+    && !String(content || '').trimStart().startsWith('/')
+  );
+  const responsePreflight = shouldTrackResponsePreflight
+    ? {
+        startTs: Date.now(),
+        engine: responsePreflightEngine,
+        source: source || null,
+      }
+    : null;
+  if (responsePreflight && !activityOpenIntervals.has(broadcastTabId)) {
+    responseActivityPreflights.set(broadcastTabId, responsePreflight);
+  }
   let awaitCodexUserMessageAudit = requestedCodexUserMessageAudit;
   let codexPromptInFlightState = null;
   let codexSubmissionWatcher = null;
@@ -11669,11 +12229,17 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   let claudePromptQueuePtyAdmission = null;
   let stagedCodexImageRefs = [];
   let codexImagePasteSegments = null;
+  let pasteBusyPublished = false;
+  let confirmedClaudeAuditResult = null;
+  let confirmedCodexAuditResult = null;
+  let claudeAuditBoundary = null;
   // The Codex rollout audit is cleaned up from `finally`, so its reference
   // must live in the function scope rather than inside the `try` block.
   let stagedCodexAudit = null;
   const normalizedPresentationSnapshot = normalizePromptPresentationSnapshot(presentationSnapshot);
   const emitBusy = (busy) => {
+    if (pasteBusyPublished === busy) return;
+    pasteBusyPublished = busy;
     if (!broadcastTabId) {
       console.warn(logPrefix + ' [PasteBusy] no-tab busy=' + busy + ' termPid=' + (term && term.pid ? term.pid : 'unknown'));
       return;
@@ -11788,6 +12354,37 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     content = prepared.text;
     stagedCodexImageRefs = prepared.staged;
     codexImagePasteSegments = prepared.replaced > 0 ? prepared.segments : null;
+  }
+  if (submit && !isCodexPasteSource && !fast && broadcastTabId) {
+    const sessionHints = [
+      bridgeKnownSessions.get(broadcastTabId) || null,
+      normalizedPresentationSnapshot?.historySessionId || null,
+    ].filter((value, index, values) => value && values.indexOf(value) === index);
+    let auditTranscriptPath = null;
+    for (const sessionHint of sessionHints) {
+      auditTranscriptPath = resolveClaudeSessionFileForTab(
+        broadcastTabId,
+        sessionHint,
+      );
+      if (auditTranscriptPath) break;
+    }
+    claudeAuditBoundary = await captureClaudePromptAuditBoundary(auditTranscriptPath);
+    if (!claudeAuditBoundary.available) {
+      console.warn(logPrefix + ' [PasteAudit] pre-submit boundary unavailable tab='
+        + String(broadcastTabId).slice(-12)
+        + ' reason=' + (claudeAuditBoundary.reason || 'unknown')
+        + ' sessionHints=' + sessionHints.map(value => String(value).slice(0, 8)).join(','));
+      if (awaitClaudeUserMessageAudit) {
+        return {
+          success: false,
+          accepted: false,
+          deferred: true,
+          error: 'claude_audit_boundary_unavailable',
+          detail: claudeAuditBoundary.reason || 'transcript-unresolved',
+          submitted: false,
+        };
+      }
+    }
   }
 
   // Chunking strategy:
@@ -12178,16 +12775,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     if (broadcastTabId && isCodexPasteSource) {
       try {
         const expectedHash = pasteAuditHash(content);
-        const previousAudit = pendingCodexPasteAudit.get(broadcastTabId);
-        if (previousAudit) {
-          console.warn(logPrefix + ' [CodexPasteAudit] replacing previous pending audit source=' + (previousAudit.source || '-') + ' expectedHash=' + (previousAudit.expectedHash || '-'));
-          finishCodexPasteAudit(broadcastTabId, previousAudit, {
-            success: false,
-            error: 'codex_audit_superseded',
-            expectedLen: previousAudit.expectedLen,
-            expectedHash: previousAudit.expectedHash,
-          });
-        }
+        const sentAt = Date.now();
         stagedCodexAudit = {
           handoffId: handoffId || null,
           source: source || null,
@@ -12196,19 +12784,20 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           expectedText: content,
           headPreview: pasteAuditPreview(content),
           tailPreview: pasteAuditPreview(content, Math.max(0, content.length - 80)),
-          sentAt: Date.now(),
+          sentAt,
           logPrefix,
           awaitUserMessage: !!awaitCodexUserMessageAudit,
           resolve: null,
           timer: null,
-          lateTimer: null,
           callerTimedOut: false,
           callerTimedOutAt: null,
+          finished: false,
           presentationSnapshot: normalizedPresentationSnapshot,
           historySessionId: presentationSnapshot?.historySessionId || null,
+          preSubmitBoundary: captureCodexPromptAuditBoundary(broadcastTabId, sentAt),
         };
-        pendingCodexPasteAudit.set(broadcastTabId, stagedCodexAudit);
-        console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] staged source=' + (source || '-') + ' expectedLen=' + content.length + ' hash=' + expectedHash + ' await=' + !!awaitCodexUserMessageAudit);
+        enqueueCodexPasteAudit(broadcastTabId, stagedCodexAudit);
+        console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] staged source=' + (source || '-') + ' expectedLen=' + content.length + ' hash=' + expectedHash + ' await=' + !!awaitCodexUserMessageAudit + ' pending=' + getPendingCodexPasteAudits(broadcastTabId).length);
       } catch (e) {
         console.warn(logPrefix + ' [CodexPasteAudit] stage failed:', e.message);
       }
@@ -12241,6 +12830,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           timer: null,
           presentationSnapshot: normalizedPresentationSnapshot,
           historySessionId: presentationSnapshot?.historySessionId || null,
+          preSubmitBoundary: claudeAuditBoundary,
         };
         pendingPasteAudit.set(broadcastTabId, stagedClaudeAudit);
         console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] staged handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' expectedLen=' + content.length + ' hash=' + expectedHash + ' await=' + !!awaitClaudeUserMessageAudit);
@@ -12331,6 +12921,10 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       armPromptBoundaryForSubmittedCommand(broadcastTabId, promptBoundaryReason || logPrefix);
     }
     console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] ✅ Sent ' + resolvedSubmitLabel + ' handoff=' + (handoffId || '-') + ' (total: ' + (Date.now() - t0) + 'ms)');
+    // Physical paste ownership ends at Enter. The rollout/JSONL audit that
+    // follows proves delivery identity, but it is not a paste and must not
+    // keep model/effort controls or the terminal activity glyph in write-busy.
+    emitBusy(false);
     if (isCodexPasteSource && broadcastTabId) {
       const receiveToEnterMs = Number.isFinite(requestReceivedAt)
         ? Math.max(0, nodePerformance.now() - requestReceivedAt)
@@ -12365,6 +12959,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           pasteAudit: auditResult || null,
         };
       }
+      confirmedClaudeAuditResult = auditResult;
       console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] ✅ confirmed Claude user message len=' + auditResult.actualLen + ' hash=' + auditResult.actualHash);
     } else if (!isCodexPasteSource && awaitClaudeUserMessageAudit) {
       console.warn(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] await requested but no Claude audit was staged broadcastTab=' + (broadcastTabId || '-'));
@@ -12393,6 +12988,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           codexAudit: auditResult || null,
         };
       }
+      confirmedCodexAuditResult = auditResult;
       console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] ✅ confirmed user_message len=' + auditResult.actualLen + ' hash=' + auditResult.actualHash);
     } else if (source && String(source).startsWith('codex-') && awaitCodexUserMessageAudit) {
       console.warn(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] await requested but no audit was staged broadcastTab=' + (broadcastTabId || '-') + ' hasWatcher=' + (broadcastTabId && typeof codexTurnWatchers !== 'undefined' ? codexTurnWatchers.has(broadcastTabId) : false));
@@ -12407,11 +13003,18 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     }
   }
 
-  return { success: true, chunksTotal: chunks.length, renderTimeMs: renderTimes, submitKey: submit ? resolvedSubmitLabel : null };
+  return {
+    success: true,
+    chunksTotal: chunks.length,
+    renderTimeMs: renderTimes,
+    submitKey: submit ? resolvedSubmitLabel : null,
+    ...(confirmedClaudeAuditResult ? { pasteAudit: confirmedClaudeAuditResult } : {}),
+    ...(confirmedCodexAuditResult ? { codexAudit: confirmedCodexAuditResult } : {}),
+  };
 
   } finally {
     if (stagedCodexAudit
-      && pendingCodexPasteAudit.get(broadcastTabId) === stagedCodexAudit
+      && hasPendingCodexPasteAudit(broadcastTabId, stagedCodexAudit)
       && (!codexPromptInFlightState || codexPromptInFlightState.submitted !== true)) {
       finishCodexPasteAudit(broadcastTabId, stagedCodexAudit, {
         success: false,
@@ -12429,6 +13032,12 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         codexSubmissionWatcher.reservation,
         'safe-paste-submit-not-sent',
       );
+    }
+    if (
+      responsePreflight
+      && responseActivityPreflights.get(broadcastTabId) === responsePreflight
+    ) {
+      responseActivityPreflights.delete(broadcastTabId);
     }
     emitBusy(false);
   }
@@ -12515,7 +13124,13 @@ ipcMain.on('log:renderer', (event, payload) => {
   console.log('[R] [RendererLogMeta] legacy=1 wc=' + event.sender.id + ' ' + String(payload || ''));
 });
 
-ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
+async function handleTerminalInput(
+  event,
+  tabId,
+  data,
+  meta = null,
+  internal = null,
+) {
   const inputReceivedAt = nodePerformance.now();
   const term = terminals.get(tabId);
   if (!term) {
@@ -12526,7 +13141,15 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
     ? meta.xtermInputOrigin
     : null;
   const isTerminalProtocolResponse = xtermInputOrigin === 'terminal-response';
-  if (!isTerminalProtocolResponse) bumpTerminalInputRevision(tabId);
+  const isManualCodexSubmit = (data === '\r' || data === '\n')
+    && terminalCommandState.get(tabId)?.isRunning === true
+    && (
+      codexTuiReadyTabs.has(tabId)
+      || codexWatchers.has(tabId)
+      || codexTurnWatchers.has(tabId)
+      || codexKnownSessions.has(tabId)
+      || codexLastRunCommandPayload.has(tabId)
+    );
 
   // The desktop stopping status is intentionally non-modal so scroll,
   // selection, and terminal inspection remain available. Raw keyboard input
@@ -12543,12 +13166,64 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
     return;
   }
 
+  const precedingWriteOperation = ptyLastQueuedWriteOperation.get(term) || null;
+  const activeWriteOperation = ptyActiveWriteOperation.get(term) || null;
+  if (shouldSerializeManualPtyInput({
+    alreadySerialized: internal?.afterPtyWriteQueue === true,
+    isTerminalProtocolResponse,
+    isManualCodexSubmit,
+    activeOperation: activeWriteOperation,
+    queuedOperation: precedingWriteOperation,
+  })) {
+    const manualOperation = {
+      kind: 'manual-terminal-input',
+      source: 'terminal:input',
+      submitted: false,
+      identityPending: false,
+      queuedAt: Date.now(),
+    };
+    await withPtyWriteLock(term, async () => {
+      const boundary = classifyManualPtyInputAtBoundary({
+        data,
+        precedingOperation: precedingWriteOperation,
+      });
+      if (boundary.action === 'suppress') {
+        console.warn('[PtyInputOwnership] manual input suppressed tab='
+          + String(tabId).slice(-12)
+          + ' reason=' + boundary.reason
+          + ' preceding=' + (precedingWriteOperation?.source
+            || precedingWriteOperation?.kind
+            || 'none'));
+        return;
+      }
+      await handleTerminalInput(event, tabId, data, meta, {
+        afterPtyWriteQueue: true,
+      });
+    }, manualOperation);
+    return;
+  }
+
+  // Revisions describe bytes that actually reached the user's PTY boundary.
+  // A key queued behind safePaste must not invalidate that paste before its
+  // own byte is deliverable; doing so leaves pasted text unsubmitted and makes
+  // Run After retry the same content.
+  const deferManualInputRevision = isManualCodexSubmit
+    && !!precedingWriteOperation
+    && activeWriteOperation?.manualInputYields !== true;
+  if (!isTerminalProtocolResponse && !deferManualInputRevision) {
+    bumpTerminalInputRevision(tabId);
+  }
+
   // A manually adopted startup action must immediately yield ownership back
   // to the user. This also covers input that arrives while the process-tree
   // proof is still in flight, before the one-shot state has been armed.
   const startupPromptProbeActive = codexStartupPromptAdoptionProbeTabs.has(tabId);
   const startupPromptState = codexStartupAutoEnter.get(tabId);
-  if (!isTerminalProtocolResponse && (data === '\r' || data === '\n')) {
+  if (
+    !isTerminalProtocolResponse
+    && !deferManualInputRevision
+    && (data === '\r' || data === '\n')
+  ) {
     const migrationEnter = tryHandleManualCodexModelMigrationEnter(tabId, term, data, meta);
     if (migrationEnter.handled) {
       if (!migrationEnter.submitted) {
@@ -12664,15 +13339,6 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
     console.log(`[terminal:input] tabId=${tabId} len=${data.length} endsWithR=${endsWithR} endsWithN=${endsWithN} hasNewline=${hasNewline} content="${inputPreview}"${data.length > 60 ? '...' : ''}`);
   }
 
-  const isManualCodexSubmit = (data === '\r' || data === '\n')
-    && terminalCommandState.get(tabId)?.isRunning === true
-    && (
-      codexTuiReadyTabs.has(tabId)
-      || codexWatchers.has(tabId)
-      || codexTurnWatchers.has(tabId)
-      || codexKnownSessions.has(tabId)
-      || codexLastRunCommandPayload.has(tabId)
-  );
   if (isManualCodexSubmit) {
     const manualRewind = await handleManualCodexRewindConfirmationEnter(tabId, term, data);
     if (manualRewind.handled) {
@@ -12693,6 +13359,13 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
     if (immediateArbitration.bypassQueue) {
       activeOperation.manualTakeover = true;
       activeOperation.manualTakeoverAt = Date.now();
+      const pickerEnter = tryHandleManualCodexActivePickerEnter(
+        tabId,
+        term,
+        data,
+        'manual-enter-ui-control-takeover',
+      );
+      if (pickerEnter.handled) return;
       const manualEnterSubmitsPrompt = activeOperation.manualEnterSubmitsPrompt !== false;
       const composerState = getHeadlessCodexDraftState(
         tabId,
@@ -12767,6 +13440,25 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
           + ' receiveToDecisionMs=' + (nodePerformance.now() - inputReceivedAt).toFixed(1));
         return;
       }
+      if (deferManualInputRevision) {
+        bumpTerminalInputRevision(tabId);
+      }
+      if (deferManualInputRevision) {
+        const migrationEnter = tryHandleManualCodexModelMigrationEnter(
+          tabId,
+          term,
+          data,
+          meta,
+        );
+        if (migrationEnter.handled) return;
+      }
+      const pickerEnter = tryHandleManualCodexActivePickerEnter(
+        tabId,
+        term,
+        data,
+        'manual-enter-write-boundary',
+      );
+      if (pickerEnter.handled) return;
 
       const promptInFlight = beginCodexPromptInFlight(tabId, 'manual-terminal-enter', {
         source: 'manual-terminal-enter',
@@ -12947,7 +13639,9 @@ ipcMain.on('terminal:input', async (event, tabId, data, meta = null) => {
   }
   term.write(data);
   codexImageBindings.handleTerminalInput(tabId, data);
-});
+}
+
+ipcMain.on('terminal:input', handleTerminalInput);
 
 // Programmatic paste (used for automated tools like Update Docs)
 // Uses safePasteAndSubmit to ensure Bracketed Paste Mode and avoid TTYHOG issues.
@@ -14150,13 +14844,14 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
   const source = typeof sendOptions.source === 'string' && sendOptions.source.trim()
     ? sendOptions.source.trim()
     : 'send-command';
+  const handoffId = typeof sendOptions.handoffId === 'string' ? sendOptions.handoffId : null;
   const isPromptQueueSend = source.includes('prompt-queue');
   const stashFirst = sendOptions.stashFirst === false ? false : true;
   const armPromptBoundaryOnSubmit = sendOptions.armPromptBoundaryOnSubmit === true || source.startsWith('startup-defaults:');
   const isSlashCommand = String(command || '').trimStart().startsWith('/');
   const shouldDismissAutocomplete = sendOptions.dismissAutocomplete === true;
   const awaitClaudeUserMessageAudit = sendOptions.awaitUserMessageAudit === true && !isSlashCommand;
-  console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" source=' + source + ' stashFirst=' + stashFirst + ' awaitAudit=' + awaitClaudeUserMessageAudit + ' slash=' + isSlashCommand + ' ts=' + Date.now());
+  console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" source=' + source + ' handoff=' + (handoffId || '-') + ' stashFirst=' + stashFirst + ' awaitAudit=' + awaitClaudeUserMessageAudit + ' slash=' + isSlashCommand + ' ts=' + Date.now());
   const term = terminals.get(tabId);
   if (!term) {
     console.log('[send-command] ❌ Terminal not found for tabId=' + tabId);
@@ -14221,7 +14916,9 @@ ipcMain.handle('claude:send-command', async (event, tabId, command, rawOptions =
     awaitClaudeUserMessageAudit,
     claudeAuditTimeoutMs: CLAUDE_PASTE_AUDIT_TIMEOUT_MS,
     dismissAutocomplete: shouldDismissAutocomplete,
+    handoffId,
     source,
+    presentationSnapshot: sendOptions.presentationSnapshot || null,
     logPrefix: '[send-command:' + tabId + (source !== 'send-command' ? ':' + source : '') + ']'
   });
   if (isPromptQueueSend && result?.deferred === true) {
@@ -16303,6 +17000,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
 
   let codexRewindOverlayOpen = false;
   let handoffObservationArmed = false;
+  let handoffObserver = null;
   let handoffMutationStarted = false;
   let handoffSettlementResult = null;
   let codexRewindOperationResult = null;
@@ -16322,7 +17020,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       );
     }
     if (handoffSettlementResult?.bindingCommitted !== true
-      || handoffSettlementResult?.handoffStatus !== 'adopted-child'
+      || !['adopted-child', 'stable-source'].includes(handoffSettlementResult?.handoffStatus)
       || !handoffSettlementResult?.activeSessionId) {
       return {
         success: false,
@@ -16341,8 +17039,29 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       sourceSessionId: handoffSettlementResult.sourceSessionId,
       activeSessionId: handoffSettlementResult.activeSessionId,
       bindingCommitted: true,
-      handoffStatus: 'adopted-child',
+      handoffStatus: handoffSettlementResult.handoffStatus,
       handoffGeneration: handoffSettlementResult.handoffGeneration || null,
+    };
+  };
+  const inspectCommittedCodexRewindChild = (actionGeneration) => {
+    const intent = codexSessionDiscoveryIntents.get(tabId) || null;
+    const boundSessionId = codexSessionIdFromDb(tabId);
+    const committed = isCommittedCodexNativeRewindReplay({
+      intent,
+      candidateSessionId: boundSessionId,
+      proof: getCodexWriterProofSnapshot(tabId),
+      boundSessionId,
+      terminalToken: terminals.get(tabId) || null,
+      runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+      currentIntentGeneration: intent?.launchId || null,
+      observerCurrent: !!handoffObserver
+        && codexWatchers.get(tabId) === handoffObserver
+        && handoffObserver.launchId === actionGeneration,
+    });
+    return {
+      committed,
+      sourceSessionId: committed ? intent?.sourceSessionId || null : null,
+      childSessionId: committed ? boundSessionId || null : null,
     };
   };
   // PTY serialization alone is insufficient for destructive intents: a
@@ -16417,7 +17136,8 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         'programmatic-rewind',
         { blockMutations: true },
       );
-      if (!handoffObservationArmed) {
+      handoffObserver = codexWatchers.get(tabId) || null;
+      if (!handoffObservationArmed || handoffObserver?.sourceMode !== 'writer-handoff') {
         return { success: false, error: 'codex_rewind_writer_handoff_not_armed' };
       }
 
@@ -16738,6 +17458,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       console.log('[Codex:Rewind] Confirming backtrack with Enter');
       throwIfCodexRewindCancelled('before-confirm');
       const handoffActionStartedAtMs = Date.now();
+      const handoffActionGeneration = codexWatchers.get(tabId)?.launchId || null;
       const authoritativeTargetText = String(
         targetPayload?.message
         || codexDataModule._api.extractTextContent(targetPayload?.content)
@@ -16866,6 +17587,54 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       }
 
       await markCodexTuiReadyAfterVerifiedComposer(tabId, 'codex-rewind-grab-success');
+      const committedChildBeforeStableProof = inspectCommittedCodexRewindChild(
+        handoffActionGeneration,
+      );
+      let stableSourceProof = null;
+      let committedChildAfterStableProof = {
+        committed: false,
+        sourceSessionId: null,
+        childSessionId: null,
+      };
+      if (!committedChildBeforeStableProof.committed) {
+        stableSourceProof = markCodexWriterHandoffRollbackApplied(tabId, {
+          actionGeneration: handoffActionGeneration,
+          restoredTextHash: hashCodexRewindTargetText(authoritativeTargetText),
+        });
+        if (stableSourceProof?.success !== true) {
+          // The exact child may atomically commit and consume the journal
+          // between the first proof read and the stable-source CAS.
+          committedChildAfterStableProof = inspectCommittedCodexRewindChild(
+            handoffActionGeneration,
+          );
+        }
+      }
+      const completionProof = resolveCodexRewindCompletionProof({
+        committedChildBeforeStableProof: committedChildBeforeStableProof.committed,
+        stableSourceProof,
+        committedChildAfterStableProof: committedChildAfterStableProof.committed,
+      });
+      if (completionProof.success !== true) {
+        return {
+          success: false,
+          error: completionProof.error || 'codex_rewind_completion_proof_missing',
+          rollbackTurns,
+          pressCount: escPressCount,
+          rollbackMayHaveApplied: true,
+        };
+      }
+      const committedChildProof = committedChildBeforeStableProof.committed
+        ? committedChildBeforeStableProof
+        : committedChildAfterStableProof;
+      console.log('[CodexWriterHandoff] post-grab completion proof tab='
+        + String(tabId).slice(-12)
+        + ' mode=' + completionProof.proofMode
+        + ' raced=' + completionProof.racedWithStableSourceProof
+        + ' source=' + String(
+          committedChildProof.sourceSessionId || handoffObserver?.sourceSessionId || 'none',
+        ).slice(0, 8)
+        + ' child=' + String(committedChildProof.childSessionId || 'none').slice(0, 8)
+        + ' generation=' + handoffActionGeneration);
       const writerHandoff = await settleAppliedCodexRewindWriter('programmatic-rewind-applied');
       if (!writerHandoff.success) {
         return {
@@ -16918,16 +17687,10 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     return codexRewindOperationResult;
   } catch (err) {
     if (err?.code === 'rewind_cancelled') {
-      if (!codexRewindOverlayOpen) {
-        try { term.write('\x1b'); } catch {}
-      }
       codexRewindOperationResult = { success: false, cancelled: true, error: 'rewind_cancelled', stage: err.stage, rollbackMayHaveApplied: false };
       return codexRewindOperationResult;
     }
     console.log('[Codex:Rewind] Error:', err?.message || String(err));
-    if (!codexRewindOverlayOpen) {
-      try { term.write('\x1b'); } catch {}
-    }
     codexRewindOperationResult = { success: false, error: err?.message || String(err) };
     return codexRewindOperationResult;
   } finally {
@@ -16935,7 +17698,10 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       // Any normal return before the confirm Enter (journal failure, target
       // mismatch, cancellation) must leave the proven-open native protocol UI.
       // Once Enter may have been written, do not guess with another key.
-      if (codexRewindOverlayOpen && !handoffMutationStarted) {
+      if (shouldCloseCodexRewindProtocolUi({
+        protocolUiOpen: codexRewindOverlayOpen,
+        handoffMutationStarted,
+      })) {
         await closeCodexRewindProtocolUi('finally-before-confirm-enter');
         codexRewindOverlayOpen = false;
         activeRewindOperation.protocolUiOpen = false;
@@ -16987,10 +17753,40 @@ ipcMain.on('claude:prompt-boundary-ack', (_event, data = {}) => {
     + ' source=renderer-direct');
 });
 
-// Resize terminal
-ipcMain.on('terminal:resize', (event, tabId, cols, rows) => {
+ipcMain.handle('terminal:get-headless-buffer-snapshot', async (_event, request = {}) => {
+  const tabId = typeof request === 'string' ? request : request?.tabId;
+  if (!tabId) return { success: false, error: 'missing-tab-id' };
+  return getHeadlessSerializedTerminalSnapshot(tabId, 'renderer-hydration');
+});
+
+// Resize terminal. Renderer includes the PTY identity so a delayed layout
+// callback from an old surface cannot resize a replacement process for the
+// same tabId.
+ipcMain.on('terminal:resize', (event, requestOrTabId, legacyCols, legacyRows) => {
+  const request = requestOrTabId && typeof requestOrTabId === 'object'
+    ? requestOrTabId
+    : {
+        tabId: requestOrTabId,
+        cols: legacyCols,
+        rows: legacyRows,
+        expectedPid: null,
+      };
+  const tabId = request?.tabId;
+  const cols = request?.cols;
+  const rows = request?.rows;
+  const expectedPid = Number.isFinite(request?.expectedPid)
+    ? Number(request.expectedPid)
+    : null;
   const term = terminals.get(tabId);
   if (term) {
+    if (expectedPid !== null && Number(term.pid) !== expectedPid) {
+      console.warn('[terminal:resize] stale renderer ignored tabId=' + tabId
+        + ' expectedPid=' + expectedPid
+        + ' currentPid=' + term.pid
+        + ' cols=' + cols
+        + ' rows=' + rows);
+      return;
+    }
     console.log('[terminal:resize] tabId=' + tabId + ' cols=' + cols + ' rows=' + rows + ' ts=' + Date.now());
     resizeHeadlessTerminalMirror(tabId, cols, rows);
     term.resize(cols, rows);
@@ -17068,8 +17864,15 @@ ipcMain.on('terminal:kill', async (event, tabId) => {
         ' localBusy=' + localBusyAtKill +
         ' — skip 1200ms Ctrl+C wait');
     }
+    if (!ownsTerminalRuntime(terminals, tabId, term)) {
+      console.warn('[TerminalKill] ownership changed while stopping; preserving replacement tab='
+        + String(tabId).slice(-12)
+        + ' oldPid=' + term.pid
+        + ' currentPid=' + (terminals.get(tabId)?.pid || '-'));
+      return;
+    }
     term.kill();
-    terminals.delete(tabId);
+    deleteTerminalRuntimeIfOwned(terminals, tabId, term);
     console.log('[TerminalKill] term.kill sent tab=' + String(tabId).slice(-12) +
       ' durMs=' + (Date.now() - startedAt));
   }
@@ -17272,6 +18075,15 @@ ipcMain.handle('terminal:updateCwd', async (event, { tabId, cwd } = {}) => {
     persisted,
   }));
   return { ...result, persisted };
+});
+
+// Renderer components can mount after the shell already emitted its first
+// OSC 133;A. Return the retained main-owned boundary for the exact live PTY so
+// one-shot restore/fork launches do not depend on replaying renderer bytes.
+ipcMain.handle('terminal:get-shell-prompt-readiness', (_event, request) => {
+  const tabId = typeof request === 'string' ? request : request?.tabId;
+  if (!tabId) return { ready: false, pid: null, readyAt: null };
+  return terminalShellReadiness.snapshot(tabId, terminals.get(tabId) || null);
 });
 
 // Get command state (is command running?) - uses OSC 133 tracking
@@ -20262,7 +21074,7 @@ async function stopAiProcessInTab(tabId, options = {}) {
       closeCodexWatcher(tabId, stopReason);
       clearCodexKnownSession(tabId, stopReason);
       clearCodexTuiReady(tabId, stopReason);
-      closeCodexTurnWatcher(tabId, stopReason);
+      closeCodexTurnWatcher(tabId, stopReason, { suppressBusyClear: true });
       emitCodexBusy(tabId, false, stopReason);
       finalizeStoppedAiCommandState(tabId, stopReason, { processName: 'codex', forceEvent: true });
       return finishStop({ success: true, processName: 'codex', noProcess: true }, true);
@@ -20338,7 +21150,7 @@ async function stopAiProcessInTab(tabId, options = {}) {
       }
       clearCodexKnownSession(tabId, stopReason);
       clearCodexTuiReady(tabId, stopReason);
-      closeCodexTurnWatcher(tabId, stopReason);
+      closeCodexTurnWatcher(tabId, stopReason, { suppressBusyClear: true });
       emitCodexBusy(tabId, false, stopReason);
       return;
     }
@@ -21373,7 +22185,8 @@ function getCodexMcpStartupStatus(tabId) {
 function hasCodexPromptOrTurnInFlight(tabId) {
   if (!tabId) return false;
   const turnState = codexTurnWatchers.get(tabId);
-  const audit = pendingCodexPasteAudit.get(tabId);
+  const hasAwaitingAudit = getPendingCodexPasteAudits(tabId)
+    .some((audit) => audit?.awaitUserMessage === true);
   const prompt = codexPromptInFlight.get(tabId);
   if (prompt) {
     const ageMs = Date.now() - (prompt.startedAt || 0);
@@ -21383,7 +22196,7 @@ function hasCodexPromptOrTurnInFlight(tabId) {
       return true;
     }
   }
-  return turnState?.busy === true || activityOpenIntervals.has(tabId) || audit?.awaitUserMessage === true;
+  return turnState?.busy === true || activityOpenIntervals.has(tabId) || hasAwaitingAudit;
 }
 
 function isOnlyCodexMcpStartupBlocker(blockers) {
@@ -21759,7 +22572,8 @@ async function restartCodexAfterMcpStartupWatchdog(tabId, state) {
   }
   if (hasCodexPromptOrTurnInFlight(tabId)) {
     const turnState = codexTurnWatchers.get(tabId);
-    const audit = pendingCodexPasteAudit.get(tabId);
+    const audit = getPendingCodexPasteAudits(tabId)
+      .find((candidate) => candidate?.awaitUserMessage === true) || null;
     clearCodexMcpStartupWatchdog(tabId, 'prompt-or-turn-in-flight-before-restart');
     console.warn('[CodexMcpStartupWatchdog] skip restart tab=' + String(tabId).slice(-12)
       + ' reason=prompt-or-turn-in-flight'
@@ -21870,18 +22684,19 @@ async function restartCodexAfterMcpStartupWatchdog(tabId, state) {
         const latestState = codexMcpStartupWatchdogs.get(tabId);
         const latestPayload = codexLastRunCommandPayload.get(tabId);
         const mirror = getHeadlessTerminalMirror(tabId);
+        const authoritativeMirror = mirror?.complete === true ? mirror : null;
         return isCodexMcpRestartSignalSafe({
           expectedWatchdog: state,
           currentWatchdog: latestState,
           expectedLaunchId: payload.launchId,
           currentLaunchId: latestPayload?.launchId,
           expectedWriteSeq: currentScreen.writeSeq,
-          currentWriteSeq: mirror?.writeSeq,
+          currentWriteSeq: authoritativeMirror?.writeSeq,
           expectedInputRevision: currentScreen.inputRevision,
           currentInputRevision: getTerminalInputRevision(tabId),
           inputReady: codexTuiReadyTabs.has(tabId),
           promptOrTurnInFlight: hasCodexPromptOrTurnInFlight(tabId),
-          mirrorAvailable: !!mirror,
+          mirrorAvailable: !!authoritativeMirror,
         });
       },
     });
@@ -22539,7 +23354,16 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
   if (busy) {
     clearCodexMcpStartupWatchdog(tabId, 'turn-busy:' + (reason || 'busy'));
   }
-  recordActivity(tabId, busy, 'codex');
+  recordActivity(tabId, busy, 'codex', {
+    responseTimingEligible: busy
+      ? true
+      : shouldCreateHistoryResponseTiming({
+          toolType: 'codex',
+          reason,
+          outcome: outcomeDetails?.outcome || null,
+        }),
+    reason,
+  });
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('codex:busy-state', {
       ...codexTurnStateSnapshot(state),
@@ -22623,22 +23447,37 @@ function emitCodexContextPct(tabId, info) {
 function closeCodexTurnWatcher(tabId, reason = 'close', options = {}) {
   const state = codexTurnWatchers.get(tabId);
   if (!state) return;
+  const audits = getPendingCodexPasteAudits(tabId)
+    .filter((audit) => audit?.awaitUserMessage === true);
+  if (
+    audits.length > 0
+    && options.pendingAuditDrainComplete !== true
+    && options.preservePendingAudit !== true
+    && state.deferredUntilComposer !== true
+  ) {
+    state.closeAfterPendingAuditDrain = {
+      reason,
+      options: { ...options, pendingAuditDrainComplete: true },
+    };
+    console.warn('[CodexPasteAudit:FINAL_SCAN] tab=' + String(tabId).slice(-12)
+      + ' watcher close deferred reason=' + reason
+      + ' pending=' + audits.length
+      + ' offset=' + Number(state.offset || 0));
+    if (state.scanning) {
+      state.needsScan = true;
+    } else {
+      void scanCodexTurnAppend(tabId, 'watcher-close-final-audit');
+    }
+    return;
+  }
+  state.closeAfterPendingAuditDrain = null;
   try { state.watcher?.close?.(); } catch {}
   if (state.interval) clearInterval(state.interval);
-  const audit = pendingCodexPasteAudit.get(tabId);
-  if (audit?.awaitUserMessage && options.preservePendingAudit !== true) {
-    console.warn('[CodexPasteAudit] tab=' + String(tabId).slice(-12)
-      + ' source=' + (audit.source || '-')
+  if (audits.length > 0) {
+    console.warn('[CodexPasteAudit:PRESERVE] tab=' + String(tabId).slice(-12)
       + ' watcher closed reason=' + reason
-      + ' before matching user_message expectedLen=' + audit.expectedLen
-      + ' expectedHash=' + audit.expectedHash);
-    finishCodexPasteAudit(tabId, audit, {
-      success: false,
-      error: 'codex_turn_watcher_closed_before_user_message',
-      reason,
-      expectedLen: audit.expectedLen,
-      expectedHash: audit.expectedHash,
-    });
+      + ' pending=' + audits.length
+      + ' action=wait-for-causal-user-message');
   }
   if (options.preservePromptInFlight !== true) {
     clearCodexPromptInFlight(tabId, 'watcher-closed:' + reason);
@@ -22649,7 +23488,7 @@ function closeCodexTurnWatcher(tabId, reason = 'close', options = {}) {
     + ' session=' + (state.sessionId || 'unknown')
     + ' reason=' + reason
     + ' handoff=' + (options.suppressBusyClear === true ? '1' : '0')
-    + ' preserveAudit=' + (options.preservePendingAudit === true ? '1' : '0'));
+    + ' preserveAudit=' + (audits.length > 0 ? '1' : '0'));
 }
 
 ipcMain.handle('codex:get-turn-state', async (_event, tabId) => {
@@ -22890,8 +23729,12 @@ async function markCodexTuiReadyAfterVerifiedComposer(tabId, reason = 'verified-
       + ' reason=' + reason);
     return false;
   }
-  const expectedLaunchId = options?.expectedLaunchId || null;
+  const expectedLaunchId = options?.expectedLaunchId
+    || codexLastRunCommandPayload.get(tabId)?.launchId
+    || null;
   const expectedWatchdog = options?.expectedWatchdog || null;
+  const expectedTerminal = terminals.get(tabId) || null;
+  const expectedRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
   if (expectedLaunchId && codexLastRunCommandPayload.get(tabId)?.launchId !== expectedLaunchId) {
     console.log('[CodexTuiReady] verified composer ignored tab=' + String(tabId).slice(-12)
       + ' reason=' + reason + ' launch-changed-before-lookup');
@@ -22925,11 +23768,55 @@ async function markCodexTuiReadyAfterVerifiedComposer(tabId, reason = 'verified-
       + ' reason=' + reason + ' watchdog-changed-during-lookup');
     return false;
   }
+  if (terminals.get(tabId) !== expectedTerminal
+    || Number(terminalCommandState.get(tabId)?.runSeq || 0) !== expectedRunSeq
+    || (
+      expectedLaunchId
+      && codexLastRunCommandPayload.get(tabId)?.launchId !== expectedLaunchId
+    )) {
+    console.log('[CodexTuiReady] verified composer ignored tab=' + String(tabId).slice(-12)
+      + ' reason=' + reason + ' generation-changed-during-commit-proof');
+    return false;
+  }
   if (!commitScreen.success || !commitScreen.inspected?.ready) {
     console.log('[CodexTuiReady] verified composer ignored tab=' + String(tabId).slice(-12)
       + ' reason=' + reason
       + ' current-screen=' + (commitScreen.inspected?.reason || commitScreen.error || 'unavailable'));
     return false;
+  }
+  const composerSettings = parseCodexVerifiedComposerFooter(commitScreen.currentFrameText);
+  if (
+    composerSettings
+    && expectedLaunchId
+    && expectedTerminal
+    && Number.isInteger(expectedRunSeq)
+    && expectedRunSeq > 0
+    && !getCodexWriterProofSnapshot(tabId)
+  ) {
+    const pendingProof = createPendingCodexSettingsProofHandoff({
+      result: {
+        success: true,
+        model: composerSettings.model,
+        effort: composerSettings.effort,
+        fast: composerSettings.fast,
+        proofAt: Date.now(),
+        applicationProofSource: composerSettings.proof,
+        codexSettingsProofSessionId: null,
+      },
+      terminalToken: expectedTerminal,
+      runSeq: expectedRunSeq,
+      launchId: expectedLaunchId,
+    });
+    if (pendingProof) {
+      codexPendingSettingsProofHandoffs.set(tabId, pendingProof);
+      console.log('[CodexSettingsProof] verified composer proof armed tab='
+        + String(tabId).slice(-12)
+        + ' launch=' + expectedLaunchId
+        + ' runSeq=' + expectedRunSeq
+        + ' model=' + composerSettings.model
+        + ' effort=' + composerSettings.effort
+        + ' fast=' + composerSettings.fast);
+    }
   }
   aiProcessLookupCache.set(aiProcessLookupCacheKey(tabId, 'codex'), { at: nodePerformance.now(), matches });
   const hadReady = codexTuiReadyTabs.has(tabId);
@@ -22948,8 +23835,14 @@ async function markCodexTuiReadyAfterVerifiedComposer(tabId, reason = 'verified-
     + ' input ready via verified composer reason=' + reason
     + ' hadReady=' + hadReady
     + ' pids=' + matches.map(m => m.pid).join(','));
+  const provisionalSettings = getCodexProvisionalSettingsSnapshot(tabId);
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('codex:tui-ready', { tabId, ts: Date.now(), reason });
+    mainWindow.webContents.send('codex:tui-ready', {
+      tabId,
+      ts: Date.now(),
+      reason,
+      ...(provisionalSettings || {}),
+    });
   }
   ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'codex' });
   broadcastCodexReadySnapshot(tabId, reason);
@@ -23219,6 +24112,33 @@ function codexLiveUuid(state, record, kind) {
   return 'codex-live-' + sid + '-' + ts + '-' + state.liveMessageSeq + '-' + kind;
 }
 
+function codexLiveSourceIdentity(state, record, prefix = 'codex-assistant') {
+  const sid = state.sessionId || codexKnownSessions.get(state.tabId) || 'unknown';
+  const position = Number.isFinite(record?.__byteOffset)
+    ? Number(record.__byteOffset)
+    : String(record?.timestamp || 'unknown');
+  return prefix + '-source-' + sid + '-' + position;
+}
+
+const CODEX_HISTORY_TURN_BOUNDARIES = new Set([
+  'task_started',
+  'task_complete',
+  'turn_aborted',
+]);
+
+function emitCodexHistoryLiveTurnBoundary(state, record, boundary) {
+  if (!CODEX_HISTORY_TURN_BOUNDARIES.has(boundary)) return;
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send('agent-transcript:live-message', {
+    type: 'turn_boundary',
+    boundary,
+    tabId: state.tabId,
+    toolType: 'codex',
+    sessionId: state.sessionId || codexKnownSessions.get(state.tabId) || null,
+    timestamp: record.timestamp || new Date().toISOString(),
+  });
+}
+
 function extractCodexLiveText(content) {
   if (!content) return '';
   if (typeof content === 'string') return content;
@@ -23344,6 +24264,8 @@ function buildCodexLiveRawMessage(state, record) {
     return {
       type: 'assistant',
       uuid,
+      sourceIdentity: codexLiveSourceIdentity(state, record, 'codex-thinking'),
+      livePendingThinking: true,
       sessionId,
       message: {
         id: uuid,
@@ -23360,6 +24282,7 @@ function buildCodexLiveRawMessage(state, record) {
     return {
       type: 'assistant',
       uuid,
+      sourceIdentity: codexLiveSourceIdentity(state, record),
       sessionId,
       message: {
         id: uuid,
@@ -23410,6 +24333,7 @@ function buildCodexLiveRawMessage(state, record) {
     return {
       type: 'assistant',
       uuid,
+      sourceIdentity: codexLiveSourceIdentity(state, record),
       sessionId,
       message: {
         id: uuid,
@@ -23517,31 +24441,105 @@ function summarizeCodexTurnChunk(text) {
   };
 }
 
+function publishCodexSuppressedCatchUpRelease(tabId, state, release, source) {
+  if (!release?.released || codexTurnWatchers.get(tabId) !== state) return false;
+  const publication = release.publication || null;
+  let published = false;
+  if (publication) {
+    const event = publication.outcome?.event;
+    if (publication.busy) {
+      clearCodexPromptInFlight(tabId, release.kind + '-task_started');
+      finishCodexStartupLifecycle(tabId, release.kind + '-task_started');
+    } else {
+      clearCodexPromptInFlight(tabId, release.kind + '-' + (event || 'idle'));
+      if (event === 'task_complete') {
+        markCodexTuiReadyFromTurnEnd(tabId, release.kind + '-task_complete');
+      } else {
+        finishCodexStartupLifecycle(tabId, release.kind + '-' + (event || 'idle'));
+      }
+    }
+    emitCodexBusy(
+      tabId,
+      publication.busy,
+      publication.reason,
+      {
+        outcome: publication.outcome,
+        timestamp: publication.timestamp,
+        turnId: publication.turnId,
+        allowTimestampFallback: false,
+      },
+    );
+    state.handoffBusyInherited = false;
+    published = true;
+  } else if (
+    release.kind === 'linked-live-catchup'
+    && state.handoffBusyInherited === true
+    && state.liveTurnEvents === 0
+    && state.busy === true
+  ) {
+    state.busy = false;
+    state.handoffBusyInherited = false;
+    emitCodexBusy(tabId, false, 'linked-rollout-idle', {
+      allowTimestampFallback: false,
+    });
+    published = true;
+  }
+
+  if (!published) {
+    // Writer identity was withheld while lifecycle catch-up was provisional.
+    // With no task edge to publish, release the authoritative idle snapshot now.
+    broadcastCodexPublicRuntimeSnapshot(tabId, release.kind + '-resolved');
+  }
+  console.log('[CodexTurn] suppressed catch-up resolved tab='
+    + String(tabId).slice(-12)
+    + ' session=' + String(state.sessionId || '').slice(0, 8)
+    + ' kind=' + release.kind
+    + ' source=' + source
+    + ' targetOffset=' + release.targetOffset
+    + ' events=' + Number(state.liveTurnEvents || 0)
+    + ' busy=' + state.busy
+    + ' published=' + published);
+  emitCodexTurnStateResolved(tabId, source);
+  return true;
+}
+
 function releaseCodexSourceObservationAfterWriterProof(tabId, sessionId, reason) {
   const state = codexTurnWatchers.get(tabId);
   if (!state || state.sessionId !== sessionId || !state.sourceObservationLaunchId) return false;
   const launchId = state.sourceObservationLaunchId;
-  const replayOffset = Number.isFinite(state.sourceWriterReplayOffset)
-    ? state.sourceWriterReplayOffset
-    : null;
-  const replayPartial = typeof state.sourceWriterReplayPartial === 'string'
-    ? state.sourceWriterReplayPartial
-    : '';
-  state.sourceObservationLaunchId = null;
-  state.publicTurnStateSuppressed = false;
-  state.sourceWriterProofPending = false;
-  state.sourceWriterReplayOffset = null;
-  state.sourceWriterReplayPartial = null;
-  if (replayOffset != null) {
-    state.offset = Math.min(state.offset, replayOffset);
-    state.partial = replayPartial;
-    state.needsScan = true;
+  const deferred = deferCodexSourceProofRelease(state, {
+    sessionId,
+    reason,
+    launchId,
+  });
+  if (deferred.deferred) {
+    console.log('[CodexLaunchObservation] source writer proof deferred to scan boundary tab='
+      + String(tabId).slice(-12)
+      + ' session=' + String(sessionId).slice(0, 8)
+      + ' launch=' + launchId
+      + ' reason=' + reason);
+    return true;
   }
+
+  const replay = prepareCodexSourceProofReplay(state, {
+    kind: 'source-proof-replay',
+  });
+  if (!replay.prepared) {
+    console.warn('[CodexLaunchObservation] source writer release not prepared tab='
+      + String(tabId).slice(-12)
+      + ' session=' + String(sessionId).slice(0, 8)
+      + ' launch=' + launchId
+      + ' reason=' + reason
+      + ' error=' + replay.error);
+    return false;
+  }
+  const replayOffset = replay.replayOffset;
   console.log('[CodexLaunchObservation] source writer confirmed tab=' + String(tabId).slice(-12)
     + ' session=' + String(sessionId).slice(0, 8)
     + ' proof=process-open-rollout'
     + ' launch=' + launchId
     + ' replayOffset=' + (replayOffset == null ? 'none' : replayOffset)
+    + ' replayTargetOffset=' + replay.targetOffset
     + ' reason=' + reason);
   const discovery = codexWatchers.get(tabId) || null;
   if (discovery?.sourceMode !== 'writer-handoff') {
@@ -23553,6 +24551,16 @@ function releaseCodexSourceObservationAfterWriterProof(tabId, sessionId, reason)
       if (current !== state || codexKnownSessions.get(tabId) !== sessionId) return;
       void scanCodexTurnAppend(tabId, 'source-proof-replay');
     });
+  } else {
+    const release = completeCodexSuppressedCatchUpRelease(state, {
+      scanSucceeded: true,
+    });
+    publishCodexSuppressedCatchUpRelease(
+      tabId,
+      state,
+      release,
+      'source-proof-no-replay',
+    );
   }
   return true;
 }
@@ -23585,7 +24593,7 @@ function requestCodexSourceWriterProof(state) {
   return true;
 }
 
-function processCodexTurnLine(state, line) {
+function processCodexTurnLine(state, line, sourceByteOffset = null) {
   const text = String(line || '').trim();
   if (!text) return;
   let record;
@@ -23594,121 +24602,123 @@ function processCodexTurnLine(state, line) {
   } catch {
     return;
   }
+  if (Number.isFinite(sourceByteOffset)) {
+    record.__byteOffset = Number(sourceByteOffset);
+  }
   const suppressPublications = state.publicTurnStateSuppressed === true
     || state.catchUpPublicationsSuppressed === true;
   const liveMessage = suppressPublications ? null : buildCodexLiveRawMessage(state, record);
   if (liveMessage) {
-    _webBroadcast(state.tabId, {
+    const liveEnvelope = {
       type: 'message',
       sessionId: state.sessionId || codexKnownSessions.get(state.tabId) || null,
       message: liveMessage,
-    });
+    };
+    _webBroadcast(state.tabId, liveEnvelope);
+    // Desktop History deliberately defers the heavyweight full transcript
+    // projection while a turn is busy. Feed it the same incremental owner that
+    // already serves web/SSE so the visible surface stays live without parsing
+    // a multi-hundred-megabyte rollout on every append.
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('agent-transcript:live-message', {
+        tabId: state.tabId,
+        toolType: 'codex',
+        sessionId: liveEnvelope.sessionId,
+        timestamp: record.timestamp || new Date().toISOString(),
+        message: liveMessage,
+      });
+    }
+  }
+  const event = codexEventType(record);
+  if (!suppressPublications && event) {
+    emitCodexHistoryLiveTurnBoundary(state, record, event);
   }
   const turnOutcome = classifyCodexTurnRecord(state, record);
-  const event = codexEventType(record);
   if (!event) return;
   if (event === 'user_message') {
-    const audit = pendingCodexPasteAudit.get(state.tabId);
-    if (audit) {
+    const audits = getPendingCodexPasteAudits(state.tabId);
+    if (audits.length > 0) {
+      let matchedAudit = null;
       try {
         const actualText = record.payload?.message || extractCodexLiveText(record.payload?.content) || '';
         const actualLen = actualText.length;
         const actualHash = pasteAuditHash(actualText);
-        const match = actualLen === audit.expectedLen && actualHash === audit.expectedHash;
-        if (match) {
-          const auditSessionId = audit.historySessionId
-            || state.sessionId
-            || getCodexRuntimeSessionId(state.tabId);
-          const auditTimestamp = record.timestamp || new Date(audit.sentAt).toISOString();
-          const presentationSaved = saveAuditedPromptPresentation(projectManager?.db, {
-            toolType: 'codex',
-            sessionId: auditSessionId,
-            auditTimestamp,
-            actualText,
-            actualHash,
-            snapshot: audit.presentationSnapshot,
-          });
-          console.log('[CodexPasteAudit] tab=' + String(state.tabId).slice(-12)
-            + ' source=' + (audit.source || '-')
-            + ' ✅ match len=' + actualLen
-            + ' hash=' + actualHash
-            + ' (sent ' + (Date.now() - audit.sentAt) + 'ms ago)');
-          finishCodexPasteAudit(state.tabId, audit, {
-            success: true,
-            actualLen,
-            actualHash,
-            sessionId: auditSessionId,
-            auditTimestamp,
-            presentationSaved,
-            expectedLen: audit.expectedLen,
-            expectedHash: audit.expectedHash,
-          });
+        const selection = selectCodexPendingPromptAudit(audits, {
+          actualText,
+          actualHash,
+          actualPayload: record.payload || null,
+          actualIdentity: {
+            sessionId: state.sessionId,
+            filePath: state.filePath,
+            byteOffset: record.__byteOffset,
+            timestamp: record.timestamp,
+          },
+        });
+        if (!selection) {
+          console.warn('[CodexPasteAudit:UNMATCHED] tab=' + String(state.tabId).slice(-12)
+            + ' pending=' + audits.length
+            + ' actualLen=' + actualLen
+            + ' actualHash=' + actualHash
+            + ' actualHead=' + JSON.stringify(pasteAuditPreview(actualText))
+            + ' expected=' + audits.map((audit) =>
+              (audit.handoffId || '-')
+              + ':' + audit.expectedLen
+              + ':' + audit.expectedHash
+            ).join(','));
         } else {
-          const canonicalMatch = codexCanonicalUserMessageMatch({ ...audit, actualPayload: record.payload || null }, actualText);
-          if (canonicalMatch) {
-            const auditSessionId = audit.historySessionId
-              || state.sessionId
-              || getCodexRuntimeSessionId(state.tabId);
-            const auditTimestamp = record.timestamp || new Date(audit.sentAt).toISOString();
-            const presentationSaved = saveAuditedPromptPresentation(projectManager?.db, {
+          matchedAudit = selection.audit;
+          const canonicalMatch = selection.canonicalMatch;
+          const auditSessionId = state.sessionId
+            || getCodexRuntimeSessionId(state.tabId)
+            || matchedAudit.historySessionId;
+          const auditTimestamp = record.timestamp || new Date(matchedAudit.sentAt).toISOString();
+          const sourceIdentity = codexLiveSourceIdentity(state, record, 'codex-user');
+          let presentationSaved = false;
+          try {
+            presentationSaved = saveAuditedPromptPresentation(projectManager?.db, {
               toolType: 'codex',
               sessionId: auditSessionId,
               auditTimestamp,
               actualText,
               actualHash,
-              snapshot: audit.presentationSnapshot,
+              snapshot: matchedAudit.presentationSnapshot,
             });
-            console.warn('[CodexPasteAudit:CANONICAL_MATCH] tab=' + String(state.tabId).slice(-12)
-              + ' source=' + (audit.source || '-')
-              + ' reason=' + canonicalMatch.reason
-              + ' expectedLen=' + audit.expectedLen
-              + ' actualLen=' + actualLen
-              + ' Δ=' + (actualLen - audit.expectedLen)
-              + ' expectedHash=' + audit.expectedHash
-              + ' actualHash=' + actualHash);
-            finishCodexPasteAudit(state.tabId, audit, {
-              success: true,
-              canonicalized: true,
-              canonicalReason: canonicalMatch.reason,
-              actualLen,
-              actualHash,
-              sessionId: auditSessionId,
-              auditTimestamp,
-              presentationSaved,
-              expectedLen: audit.expectedLen,
-              expectedHash: audit.expectedHash,
-            });
-            return;
+          } catch (error) {
+            console.warn('[CodexPasteAudit] presentation save failed tab='
+              + String(state.tabId).slice(-12)
+              + ' handoff=' + (matchedAudit.handoffId || '-')
+              + ' error=' + (error?.message || String(error)));
           }
-          console.warn('[CodexPasteAudit:MISMATCH] tab=' + String(state.tabId).slice(-12)
-            + ' source=' + (audit.source || '-')
-            + ' expectedLen=' + audit.expectedLen
+          const matchLabel = canonicalMatch ? 'CANONICAL_MATCH' : 'MATCH';
+          console.log('[CodexPasteAudit:' + matchLabel + '] tab=' + String(state.tabId).slice(-12)
+            + ' handoff=' + (matchedAudit.handoffId || '-')
+            + ' source=' + (matchedAudit.source || '-')
+            + (canonicalMatch ? ' reason=' + canonicalMatch.reason : '')
+            + ' expectedLen=' + matchedAudit.expectedLen
             + ' actualLen=' + actualLen
-            + ' Δ=' + (actualLen - audit.expectedLen)
-            + ' expectedHash=' + audit.expectedHash
+            + ' expectedHash=' + matchedAudit.expectedHash
             + ' actualHash=' + actualHash
-            + ' expectedHead=' + JSON.stringify(audit.headPreview)
-            + ' actualHead=' + JSON.stringify(pasteAuditPreview(actualText))
-            + ' expectedTail=' + JSON.stringify(audit.tailPreview)
-            + ' actualTail=' + JSON.stringify(pasteAuditPreview(actualText, Math.max(0, actualText.length - 80))));
-          finishCodexPasteAudit(state.tabId, audit, {
-            success: false,
-            error: 'codex_user_message_audit_mismatch',
-            expectedLen: audit.expectedLen,
+            + ' pendingBefore=' + audits.length
+            + ' sentAgeMs=' + (Date.now() - matchedAudit.sentAt));
+          finishCodexPasteAudit(state.tabId, matchedAudit, {
+            success: true,
+            canonicalized: !!canonicalMatch,
+            canonicalReason: canonicalMatch?.reason || null,
             actualLen,
-            expectedHash: audit.expectedHash,
             actualHash,
+            sessionId: auditSessionId,
+            auditTimestamp,
+            sourceIdentity,
+            presentationSaved,
+            expectedLen: matchedAudit.expectedLen,
+            expectedHash: matchedAudit.expectedHash,
           });
         }
       } catch (e) {
         console.warn('[CodexPasteAudit] compare failed tab=' + String(state.tabId).slice(-12) + ': ' + (e?.message || String(e)));
-        finishCodexPasteAudit(state.tabId, audit, {
-          success: false,
-          error: 'codex_user_message_audit_compare_failed',
-          message: e?.message || String(e),
-          expectedLen: audit.expectedLen,
-          expectedHash: audit.expectedHash,
-        });
+        // An internal comparison/storage error is not evidence that the PTY
+        // rejected the prompt. Keep the handoff unconfirmed; never surface it
+        // as a product-level SEND FAILED.
       }
     }
   }
@@ -23760,21 +24770,17 @@ function processCodexTurnLine(state, line) {
     state.liveTurnEvents = (state.liveTurnEvents || 0) + 1;
     state.busy = false;
     console.log('[CodexTurn] event tab=' + String(state.tabId).slice(-12) + ' session=' + state.sessionId + ' event=' + event + ' outcome=' + outcomeReason + ' ts=' + (record.timestamp || 'n/a'));
-    const audit = pendingCodexPasteAudit.get(state.tabId);
-    if (audit?.awaitUserMessage) {
-      console.warn('[CodexPasteAudit] tab=' + String(state.tabId).slice(-12)
-        + ' source=' + (audit.source || '-')
-        + ' ended event=' + event
-        + ' before matching user_message expectedLen=' + audit.expectedLen
-        + ' expectedHash=' + audit.expectedHash);
-      finishCodexPasteAudit(state.tabId, audit, {
-        success: false,
-        error: event === 'turn_aborted'
-          ? 'codex_turn_aborted_before_user_message'
-          : 'codex_turn_completed_without_user_message',
-        expectedLen: audit.expectedLen,
-        expectedHash: audit.expectedHash,
-      });
+    const pendingAudits = getPendingCodexPasteAudits(state.tabId)
+      .filter((audit) => audit?.awaitUserMessage === true);
+    if (pendingAudits.length > 0) {
+      // A task boundary can belong to the response that was already running
+      // when the next prompt was queued. It is not proof that any pending
+      // prompt failed. Only exact user_message identity confirms delivery;
+      // timeout remains unknown and is never promoted to a failure verdict.
+      console.warn('[CodexPasteAudit:PRESERVE] tab=' + String(state.tabId).slice(-12)
+        + ' endedEvent=' + event
+        + ' pending=' + pendingAudits.length
+        + ' handoffs=' + pendingAudits.map((audit) => audit.handoffId || '-').join(','));
     }
     if (suppressPublications) {
       applyCodexWatcherOutcome(
@@ -23796,11 +24802,6 @@ function processCodexTurnLine(state, line) {
       outcome: turnOutcome,
       timestamp: record.timestamp,
       turnId: record.payload?.turn_id || null,
-    });
-    _webBroadcast(state.tabId, {
-      type: 'done',
-      sessionId: state.sessionId || codexKnownSessions.get(state.tabId) || null,
-      reason: outcomeReason,
     });
   }
 }
@@ -23842,11 +24843,15 @@ async function catchUpCodexTurnState(tabId, filePath, fileSize, {
   suppressBusy = false,
   suppressPublic = false,
   reason = 'catch-up',
+  generation = null,
 } = {}) {
   const readSize = Math.min(fileSize, CODEX_TURN_CATCHUP_BYTES);
   if (readSize <= 0) {
     const state = codexTurnWatchers.get(tabId);
-    if (state?.filePath === filePath) {
+    if (
+      state?.filePath === filePath
+      && (generation == null || state.catchUpGeneration === generation)
+    ) {
       state.catchUpPending = false;
       emitCodexTurnStateResolved(tabId, 'catch-up-empty');
     }
@@ -23866,14 +24871,17 @@ async function catchUpCodexTurnState(tabId, filePath, fileSize, {
 
     const { inferred, lastAbnormal, lastTokenInfo } = inferCodexBusyFromText(text);
     const state = codexTurnWatchers.get(tabId);
-    if (!state || state.filePath !== filePath) return;
+    if (
+      !state
+      || state.filePath !== filePath
+      || (generation != null && state.catchUpGeneration !== generation)
+    ) return;
 
     // A resume-source watcher is ownership-neutral until append-in-place or a
     // linked child is process-proven. Historical tail data may seed its private
     // observer bookkeeping, but must not publish context, done, busy or the
     // source ID as if it were the current writer.
     if (suppressPublic) {
-      state.busy = false;
       console.log('[CodexTurn] catch-up public suppressed tab=' + String(tabId).slice(-12)
         + ' event=' + (inferred?.event || 'none')
         + ' reason=' + reason
@@ -23942,7 +24950,10 @@ async function catchUpCodexTurnState(tabId, filePath, fileSize, {
         allowTimestampFallback: false,
       });
     }
-    if (!inferred.busy) {
+    // emitCodexBusy(false) already owns the public busy + done fan-out. Keep a
+    // standalone done only when catch-up confirms idle without changing state,
+    // so reconnecting consumers can still resolve an already-finished turn.
+    if (!inferred.busy && !busyChanged) {
       _webBroadcast(tabId, {
         type: 'done',
         sessionId: state.sessionId || getCodexRuntimeSessionId(tabId),
@@ -23956,18 +24967,37 @@ async function catchUpCodexTurnState(tabId, filePath, fileSize, {
       try { await handle.close(); } catch {}
     }
     const current = codexTurnWatchers.get(tabId);
-    if (current?.filePath === filePath) {
+    if (
+      current?.filePath === filePath
+      && (generation == null || current.catchUpGeneration === generation)
+    ) {
       current.catchUpPending = false;
       emitCodexTurnStateResolved(tabId, 'catch-up');
     }
   }
 }
 
-function processCodexTurnText(state, text) {
-  const combined = (state.partial || '') + String(text || '');
-  const lines = combined.split('\n');
-  state.partial = lines.pop() || '';
-  for (const line of lines) processCodexTurnLine(state, line);
+function processCodexTurnText(state, text, incomingStartOffset) {
+  const incoming = Buffer.from(String(text || ''), 'utf8');
+  const partial = Buffer.from(state.partial || '', 'utf8');
+  const combined = partial.length > 0
+    ? Buffer.concat([partial, incoming])
+    : incoming;
+  const combinedStartOffset = partial.length > 0
+    && Number.isFinite(state.partialStartOffset)
+    ? Number(state.partialStartOffset)
+    : Number(incomingStartOffset) || 0;
+  let lineStart = 0;
+  let newlineIndex = combined.indexOf(0x0a, lineStart);
+  while (newlineIndex >= 0) {
+    const line = combined.subarray(lineStart, newlineIndex).toString('utf8');
+    processCodexTurnLine(state, line, combinedStartOffset + lineStart);
+    lineStart = newlineIndex + 1;
+    newlineIndex = combined.indexOf(0x0a, lineStart);
+  }
+  const remaining = combined.subarray(lineStart);
+  state.partial = remaining.toString('utf8');
+  state.partialStartOffset = combinedStartOffset + lineStart;
 }
 
 async function scanCodexTurnAppend(tabId, reason = 'scan') {
@@ -23982,6 +25012,7 @@ async function scanCodexTurnAppend(tabId, reason = 'scan') {
     return;
   }
   state.scanning = true;
+  let scanSucceeded = false;
   try {
     do {
       state.needsScan = false;
@@ -23992,12 +25023,16 @@ async function scanCodexTurnAppend(tabId, reason = 'scan') {
         console.warn('[CodexTurn] stat failed tab=' + String(tabId).slice(-12) + ' reason=' + reason + ' error=' + e.message);
         return;
       }
-      if (stat.size < state.offset) state.offset = 0;
+      if (codexTurnWatchers.get(tabId) !== state) return;
+      if (stat.size < state.offset) {
+        state.offset = 0;
+        state.partial = '';
+        state.partialStartOffset = 0;
+      }
       if (stat.size === state.offset) continue;
 
       const start = state.offset;
       const end = stat.size - 1;
-      state.offset = stat.size;
       const chunk = await new Promise((resolve, reject) => {
         let out = '';
         const stream = fs.createReadStream(state.filePath, { start, end, encoding: 'utf8' });
@@ -24005,6 +25040,11 @@ async function scanCodexTurnAppend(tabId, reason = 'scan') {
         stream.on('error', reject);
         stream.on('end', () => resolve(out));
       });
+      if (codexTurnWatchers.get(tabId) !== state) return;
+      // Commit the byte offset only after the range was read successfully.
+      // Otherwise a transient read failure would make the retry look caught up
+      // and could release a provisional lifecycle without parsing its events.
+      state.offset = stat.size;
       const chunkSummary = summarizeCodexTurnChunk(chunk);
       console.log('[CodexTurn:Delta]' +
         ' tab=' + String(tabId).slice(-12) +
@@ -24021,6 +25061,14 @@ async function scanCodexTurnAppend(tabId, reason = 'scan') {
         ' lastEvent=' + chunkSummary.lastEvent +
         ' lastResponseItem=' + chunkSummary.lastResponseItem);
       if (state.sourceObservationLaunchId) {
+        if (reason === 'watcher-close-final-audit' || state.closeAfterPendingAuditDrain) {
+          // The source rollout is still ownership-neutral for public runtime
+          // state, but a post-Enter user_message after the exact byte boundary
+          // is sufficient delivery proof. Process this final range under the
+          // existing public-suppression flags before the observer disappears.
+          processCodexTurnText(state, chunk, start);
+          continue;
+        }
         // Keep ownership-neutral source appends on disk, not in a bounded RAM
         // queue. The scan offset advances so fs.watch remains cheap; once lsof
         // proves this tab owns the source, releaseCodexSourceObservation... rolls
@@ -24028,70 +25076,56 @@ async function scanCodexTurnAppend(tabId, reason = 'scan') {
         if (!Number.isFinite(state.sourceWriterReplayOffset)) {
           state.sourceWriterReplayOffset = start;
           state.sourceWriterReplayPartial = state.partial || '';
+          state.sourceWriterReplayPartialStartOffset = state.partialStartOffset;
         }
         requestCodexSourceWriterProof(state);
         continue;
       }
-      processCodexTurnText(state, chunk);
+      processCodexTurnText(state, chunk, start);
     } while (state.needsScan);
+    scanSucceeded = true;
+  } catch (e) {
+    console.warn('[CodexTurn] scan failed tab=' + String(tabId).slice(-12)
+      + ' session=' + String(state.sessionId || '').slice(0, 8)
+      + ' reason=' + reason
+      + ' offset=' + state.offset
+      + ' error=' + (e?.message || String(e)));
   } finally {
     state.scanning = false;
-    if (reason === 'pending-audit-catchup' || reason === 'linked-live-catchup') {
-      const suppressedPublication = reason === 'linked-live-catchup'
-        ? projectCodexSuppressedCatchUpPublication(state)
-        : null;
-      if (reason === 'linked-live-catchup'
-        && state.releasePublicSuppressionAfterCatchUp === true) {
-        state.catchUpPublicationsSuppressed = false;
-        state.publicTurnStateSuppressed = false;
-        state.releasePublicSuppressionAfterCatchUp = false;
-        if (suppressedPublication) {
-          const event = suppressedPublication.outcome?.event;
-          if (suppressedPublication.busy) {
-            clearCodexPromptInFlight(tabId, 'linked-catch-up-task_started');
-            finishCodexStartupLifecycle(tabId, 'linked-catch-up-task_started');
-          } else {
-            clearCodexPromptInFlight(tabId, 'linked-catch-up-' + (event || 'idle'));
-            if (event === 'task_complete') {
-              markCodexTuiReadyFromTurnEnd(tabId, 'linked-catch-up-task_complete');
-            } else {
-              finishCodexStartupLifecycle(tabId, 'linked-catch-up-' + (event || 'idle'));
-            }
-          }
-          emitCodexBusy(
-            tabId,
-            suppressedPublication.busy,
-            suppressedPublication.reason,
-            {
-              outcome: suppressedPublication.outcome,
-              timestamp: suppressedPublication.timestamp,
-              turnId: suppressedPublication.turnId,
-              allowTimestampFallback: false,
-            },
-          );
-          state.handoffBusyInherited = false;
-          console.log('[CodexTurn] linked catch-up published final state tab='
-            + String(tabId).slice(-12)
-            + ' session=' + String(state.sessionId || '').slice(0, 8)
-            + ' events=' + Number(state.liveTurnEvents || 0)
-            + ' busy=' + suppressedPublication.busy
-            + ' reason=' + suppressedPublication.reason);
-        }
-      }
-      if (
-        reason === 'linked-live-catchup'
-        && state.handoffBusyInherited === true
-        && state.liveTurnEvents === 0
-        && state.busy === true
-      ) {
-        state.busy = false;
-        state.handoffBusyInherited = false;
-        emitCodexBusy(tabId, false, 'linked-rollout-idle', {
-          allowTimestampFallback: false,
-        });
-      }
+    const pendingSourceRelease = takeCodexSourceProofReleaseAtScanBoundary(state);
+    if (
+      pendingSourceRelease
+      && codexTurnWatchers.get(tabId) === state
+      && state.sessionId === pendingSourceRelease.sessionId
+      && state.sourceObservationLaunchId === pendingSourceRelease.launchId
+    ) {
+      releaseCodexSourceObservationAfterWriterProof(
+        tabId,
+        pendingSourceRelease.sessionId,
+        pendingSourceRelease.reason + ':scan-boundary',
+      );
+    }
+    const suppressedRelease = completeCodexSuppressedCatchUpRelease(state, {
+      scanSucceeded,
+    });
+    publishCodexSuppressedCatchUpRelease(
+      tabId,
+      state,
+      suppressedRelease,
+      reason,
+    );
+    if (reason === 'pending-audit-catchup') {
       state.catchUpPending = false;
       emitCodexTurnStateResolved(tabId, reason);
+    }
+    const pendingClose = state.closeAfterPendingAuditDrain || null;
+    if (pendingClose && codexTurnWatchers.get(tabId) === state) {
+      state.closeAfterPendingAuditDrain = null;
+      closeCodexTurnWatcher(
+        tabId,
+        pendingClose.reason,
+        pendingClose.options,
+      );
     }
   }
 }
@@ -24122,7 +25156,9 @@ function startCodexTurnWatcher({
     if (Number.isFinite(initialOffset)) {
       offset = Math.max(0, Math.min(fileSize, Number(initialOffset)));
     } else {
-      offset = catchUpPendingAudit && pendingCodexPasteAudit.has(tabId) ? 0 : fileSize;
+      offset = catchUpPendingAudit && pendingCodexPasteAudit.has(tabId)
+        ? resolveCodexPendingAuditCatchUpOffset(tabId, sessionId, filePath, fileSize)
+        : fileSize;
     }
   } catch (e) {
     console.warn('[CodexTurn] cannot start watcher tab=' + String(tabId).slice(-12) + ' session=' + sessionId + ' file=' + filePath + ' error=' + e.message);
@@ -24143,6 +25179,7 @@ function startCodexTurnWatcher({
     filePath,
     offset,
     partial: '',
+    partialStartOffset: offset,
     busy: inheritedBusy,
     handoffBusyInherited: inheritedBusy,
     lastEventType: null,
@@ -24160,6 +25197,7 @@ function startCodexTurnWatcher({
     currentTurnHasFinalResult: false,
     currentTurnFinalResultTurnId: null,
     catchUpPromise: null,
+    catchUpGeneration: 0,
     liveTurnEvents: 0,
     scanning: false,
     needsScan: false,
@@ -24169,11 +25207,29 @@ function startCodexTurnWatcher({
     deferredAt: deferUntilComposer ? Date.now() : null,
     deferredInitialOffset: deferUntilComposer ? fileSize : null,
     sourceObservationLaunchId: sourceObservationLaunchId || null,
-    publicTurnStateSuppressed: !!suppressPublicCatchUp,
-    catchUpPublicationsSuppressed: !!suppressBusyCatchUp || !!suppressPublicCatchUp,
-    releasePublicSuppressionAfterCatchUp: !!catchUpFromInitialOffset
-      && (!!suppressBusyCatchUp || !!suppressPublicCatchUp),
+    sourceWriterProofReleasePending: null,
+    publicTurnStateSuppressed: false,
+    catchUpPublicationsSuppressed: false,
+    releasePublicSuppressionAfterCatchUp: false,
+    releasePublicSuppressionTargetOffset: null,
+    releasePublicSuppressionKind: null,
   };
+  configureCodexCatchUpSuppression(state, {
+    suppressBusy: !!suppressBusyCatchUp,
+    suppressPublic: !!suppressPublicCatchUp,
+  });
+  if (
+    catchUpFromInitialOffset
+    && (!!suppressBusyCatchUp || !!suppressPublicCatchUp)
+  ) {
+    // The linked rollout may already contain live records between the saved
+    // handoff boundary and the current EOF. Keep the replay private until that
+    // exact range has been consumed, then publish only its final lifecycle.
+    armCodexSuppressedCatchUpRelease(state, {
+      targetOffset: fileSize,
+      kind: 'linked-live-catchup',
+    });
+  }
   codexTurnWatchers.set(tabId, state);
   try {
     state.watcher = fs.watch(filePath, () => scanCodexTurnAppend(tabId, 'fs.watch'));
@@ -24194,7 +25250,7 @@ function startCodexTurnWatcher({
     void catchUpPromise.finally(() => {
       if (state.catchUpPromise === catchUpPromise) state.catchUpPromise = null;
     });
-  } else if (offset === 0 && fileSize > 0 && catchUpPendingAudit && pendingCodexPasteAudit.has(tabId)) {
+  } else if (offset < fileSize && catchUpPendingAudit && pendingCodexPasteAudit.has(tabId)) {
     const catchUpPromise = new Promise((resolve) => {
       setImmediate(() => resolve(scanCodexTurnAppend(tabId, 'pending-audit-catchup')));
     });
@@ -24202,11 +25258,23 @@ function startCodexTurnWatcher({
     void catchUpPromise.finally(() => {
       if (state.catchUpPromise === catchUpPromise) state.catchUpPromise = null;
     });
+  } else if (sourceObservationLaunchId && suppressPublicCatchUp) {
+    // A provisional resume source owns no public identity yet, and its
+    // historical tail cannot prove the current turn. Starting a second async
+    // tail read here only creates a stale writer that can race the live replay.
+    state.catchUpPending = false;
+    console.log('[CodexTurn] source historical catch-up skipped tab='
+      + String(tabId).slice(-12)
+      + ' session=' + String(sessionId).slice(0, 8));
+    emitCodexTurnStateResolved(tabId, 'source-observation-ready');
   } else {
+    const catchUpGeneration = Number(state.catchUpGeneration || 0) + 1;
+    state.catchUpGeneration = catchUpGeneration;
     const catchUpPromise = catchUpCodexTurnState(tabId, filePath, offset, {
       suppressBusy: !!suppressBusyCatchUp,
       suppressPublic: !!suppressPublicCatchUp,
       reason: catchUpReason,
+      generation: catchUpGeneration,
     });
     state.catchUpPromise = catchUpPromise;
     void catchUpPromise.finally(() => {
@@ -24237,6 +25305,7 @@ function activateDeferredCodexTurnWatcher(tabId, reason = 'composer-ready') {
   const deferredAt = state.deferredAt;
   state.offset = fileSize;
   state.partial = '';
+  state.partialStartOffset = fileSize;
   state.needsScan = false;
   state.deferredUntilComposer = false;
   state.catchUpPending = false;
@@ -24663,6 +25732,7 @@ async function recoverPendingCodexNativeRewindHandoffs() {
     await cloneCodexPromptPresentationsAfterProvenChild({
       sourceSessionId,
       childSessionId: descendant.sessionId,
+      tabId,
       cwd: journal.cwd,
       reason: 'native-rewind-recovery',
     });
@@ -24689,6 +25759,7 @@ function codexSessionsDir() {
 async function cloneCodexPromptPresentationsAfterProvenChild({
   sourceSessionId,
   childSessionId,
+  tabId = null,
   cwd,
   reason,
 } = {}) {
@@ -24719,6 +25790,19 @@ async function cloneCodexPromptPresentationsAfterProvenChild({
       sourceRecords: sourceLoaded.records,
       childRecords: childLoaded.records,
     });
+    const responseEntryMappings = buildHistoryResponseEntryCloneMappings(
+      codexDataModule._api.buildCodexFullHistory(sourceLoaded.records || [], source),
+      codexDataModule._api.buildCodexFullHistory(childLoaded.records || [], child),
+    );
+    const timingResult = projectManager?.db?.cloneHistoryResponseTimingsForSession
+      ? projectManager.db.cloneHistoryResponseTimingsForSession({
+          toolType: 'codex',
+          sourceSessionId: source,
+          childSessionId: child,
+          tabId,
+          entryMappings: responseEntryMappings,
+        })
+      : { cloned: 0, unchanged: 0, skipped: responseEntryMappings.length };
     console.log('[HistoryPromptPresentation:CodexChild]'
       + ' source=' + source.slice(0, 8)
       + ' child=' + child.slice(0, 8)
@@ -24727,8 +25811,16 @@ async function cloneCodexPromptPresentationsAfterProvenChild({
       + ' cloned=' + Number(result?.cloned || 0)
       + ' unchanged=' + Number(result?.unchanged || 0)
       + ' skipped=' + Number(result?.skipped || 0)
+      + ' timingMatched=' + responseEntryMappings.length
+      + ' timingCloned=' + Number(timingResult?.cloned || 0)
+      + ' timingUnchanged=' + Number(timingResult?.unchanged || 0)
+      + ' timingSkipped=' + Number(timingResult?.skipped || 0)
+      + ' timingPendingMoved=' + Number(timingResult?.pendingReassigned || 0)
       + ' projection=' + (result?.stoppedReason || '-'));
-    return result;
+    return {
+      ...result,
+      responseTimings: timingResult,
+    };
   } catch (error) {
     console.warn('[HistoryPromptPresentation:CodexChild] clone failed'
       + ' source=' + source.slice(0, 8)
@@ -24744,7 +25836,7 @@ async function cloneCodexPromptPresentationsAfterProvenChild({
   }
 }
 
-async function buildCodexNativeRewindProofContext(descriptorProof, intent) {
+async function buildCodexNativeRewindProofContext(tabId, descriptorProof, intent) {
   if (intent?.sourceMode !== 'writer-handoff'
     || !intent?.sourceSessionId
     || !intent?.launchId
@@ -24788,6 +25880,35 @@ async function buildCodexNativeRewindProofContext(descriptorProof, intent) {
     }
   }
 
+  const observer = codexWatchers.get(tabId) || null;
+  const journal = readPendingCodexNativeRewindHandoff(tabId);
+  const terminalToken = terminals.get(tabId) || null;
+  const currentRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  const stableJournalMatches = !!journal
+    && journal.invalid !== true
+    && journal.version === 2
+    && journal.phase === 'rollback-applied'
+    && journal.sourceSessionId === intent.sourceSessionId
+    && journal.actionGeneration === intent.launchId
+    && Number(journal.actionStartedAtMs) === actionStartedAtMs
+    && Number.isFinite(Number(journal.appliedAtMs))
+    && Number(journal.appliedAtMs) >= actionStartedAtMs
+    && journal.restoredTextHash === journal.targetTextHash;
+  const stableSourceProof = stableJournalMatches ? {
+    kind: 'native-rewind-stable-source',
+    sessionId: intent.sourceSessionId,
+    actionGeneration: intent.launchId,
+    journalPhase: journal.phase,
+    rollbackDurable: true,
+    appliedAtMs: Number(journal.appliedAtMs),
+    terminalGenerationMatches: !!terminalToken
+      && observer?.handoffTerminalToken === terminalToken,
+    runSeqMatches: Number.isInteger(currentRunSeq)
+      && currentRunSeq > 0
+      && Number(observer?.handoffRunSeq) === currentRunSeq,
+    boundSessionMatches: codexSessionIdFromDb(tabId) === intent.sourceSessionId,
+  } : null;
+
   return {
     kind: 'native-rewind',
     sourceSessionId: intent.sourceSessionId,
@@ -24795,6 +25916,7 @@ async function buildCodexNativeRewindProofContext(descriptorProof, intent) {
     observerGeneration: intent.handoffActionGeneration || intent.launchId,
     actionStartedAtMs,
     liveProofs,
+    stableSourceProof,
   };
 }
 
@@ -24852,6 +25974,7 @@ async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null)
   const failures = [];
   let checked = 0;
   for (const match of lookup.matches) {
+    const descriptorStartedAtMs = Date.now();
     try {
       const lsofBinary = fs.existsSync('/usr/sbin/lsof') ? '/usr/sbin/lsof' : 'lsof';
       const result = await execFileAsync(lsofBinary, [
@@ -24863,16 +25986,29 @@ async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null)
         maxBuffer: 1024 * 1024,
       });
       checked += 1;
-      reports.push({ pid: match.pid, output: result.stdout || '' });
+      reports.push({
+        pid: match.pid,
+        output: result.stdout || '',
+        elapsedMs: Date.now() - descriptorStartedAtMs,
+      });
     } catch (error) {
-      if (error?.stdout) reports.push({ pid: match.pid, output: error.stdout });
+      const elapsedMs = Date.now() - descriptorStartedAtMs;
+      if (error?.stdout) reports.push({ pid: match.pid, output: error.stdout, elapsedMs });
       // lsof exits 1 when the process has no matching/open descriptors. That
       // is a known "not ready yet", not an observer failure.
       if (Number(error?.code) === 1) {
         checked += 1;
         continue;
       }
-      failures.push({ pid: match.pid, error: error?.message || String(error) });
+      failures.push({
+        pid: match.pid,
+        error: error?.message || String(error),
+        elapsedMs,
+        code: error?.code ?? null,
+        killed: error?.killed === true,
+        signal: error?.signal || null,
+        retryableTimeout: isRetryableCodexDescriptorProbeTimeout(error),
+      });
     }
   }
 
@@ -24891,7 +26027,7 @@ async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null)
       failures,
     };
   }
-  const handoff = await buildCodexNativeRewindProofContext(descriptorProof, intentOverride);
+  const handoff = await buildCodexNativeRewindProofContext(tabId, descriptorProof, intentOverride);
   if (handoff?.proofError) {
     return {
       status: 'unknown',
@@ -24961,7 +26097,53 @@ async function inspectCodexWriterProcessProof(tabId, intentOverride = null) {
   return runKeyedSingleFlight(
     codexWriterProcessProofInflight,
     tabId + handoffKey,
-    () => inspectCodexWriterProcessProofInner(tabId, intentOverride),
+    async () => {
+      const terminalTokenAtStart = terminals.get(tabId) || null;
+      const runSeqAtStart = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+      const launchIdAtStart = intentOverride?.launchId
+        || codexSessionDiscoveryIntents.get(tabId)?.launchId
+        || null;
+      const isGenerationCurrent = () => (
+        !!terminalTokenAtStart
+        && terminals.get(tabId) === terminalTokenAtStart
+        && Number.isInteger(runSeqAtStart)
+        && runSeqAtStart > 0
+        && Number(terminalCommandState.get(tabId)?.runSeq || 0) === runSeqAtStart
+        && (codexSessionDiscoveryIntents.get(tabId)?.launchId || null) === launchIdAtStart
+      );
+
+      const result = await runCodexDescriptorProbeWithSingleRetry(
+        () => inspectCodexWriterProcessProofInner(tabId, intentOverride),
+        {
+          isGenerationCurrent,
+          onRetry: ({ first }) => {
+            console.warn('[CodexWriterProof] transient descriptor timeout; retrying full pass'
+              + ' tab=' + String(tabId).slice(-12)
+              + ' runSeq=' + runSeqAtStart
+              + ' launch=' + (launchIdAtStart || 'none')
+              + ' failures=' + JSON.stringify((first?.failures || []).map((failure) => ({
+                pid: failure?.pid || null,
+                elapsedMs: failure?.elapsedMs ?? null,
+                code: failure?.code ?? null,
+                killed: failure?.killed === true,
+                signal: failure?.signal || null,
+              }))));
+          },
+        },
+      );
+      if (result?.descriptorRetry?.attempted) {
+        console.warn('[CodexWriterProof] descriptor retry completed'
+          + ' tab=' + String(tabId).slice(-12)
+          + ' status=' + (result.status || 'unknown')
+          + ' recovered=' + (result.descriptorRetry.recovered === true)
+          + ' error=' + (result.error || '-'));
+      } else if (result?.descriptorRetry?.skippedReason) {
+        console.warn('[CodexWriterProof] descriptor retry skipped'
+          + ' tab=' + String(tabId).slice(-12)
+          + ' reason=' + result.descriptorRetry.skippedReason);
+      }
+      return result;
+    },
   );
 }
 
@@ -25317,6 +26499,7 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
     await cloneCodexPromptPresentationsAfterProvenChild({
       sourceSessionId: provenSourceSessionId,
       childSessionId: owned.sessionId,
+      tabId,
       cwd: owned.cwd || terminalProjects.get(tabId),
       reason: writerProofKind,
     });
@@ -25537,6 +26720,9 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
   const lastNotReady = codexTuiReadyLastNotReady.get(tabId)
     || (!textReady ? getCodexMcpStartupStatus(tabId) : null)
     || null;
+  const provisionalSettings = liveLifecycle === true
+    ? getCodexProvisionalSettingsSnapshot(tabId)
+    : null;
 
   return {
     success: true,
@@ -25578,6 +26764,7 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
     writerLaunchId: writerConfirmed ? proof.launchId : null,
     liveLifecycle,
     hasLaunchPayload: !!payload,
+    ...(provisionalSettings || {}),
   };
 }
 
@@ -25631,8 +26818,19 @@ async function ensureCodexTurnWatcher(tabId, sessionId, cwd, options = {}) {
     // linked-child discovery remains armed and can adopt a later unrelated fork.
     if (options.sourceObservationLaunchId) {
       existing.sourceObservationLaunchId = options.sourceObservationLaunchId;
-      existing.publicTurnStateSuppressed = options.suppressPublicCatchUp === true;
+      configureCodexCatchUpSuppression(existing, {
+        suppressBusy: options.suppressBusyCatchUp === true,
+        suppressPublic: options.suppressPublicCatchUp === true,
+      });
+      existing.sourceWriterProofPending = false;
+      existing.sourceWriterProofReleasePending = null;
+      existing.sourceWriterReplayOffset = null;
+      existing.sourceWriterReplayPartial = null;
+      existing.sourceWriterReplayPartialStartOffset = null;
+      existing.catchUpGeneration = Number(existing.catchUpGeneration || 0) + 1;
+      existing.catchUpPending = false;
       existing.busy = false;
+      existing.handoffBusyInherited = false;
       existing.lastEventType = null;
       existing.lastEventTs = null;
       existing.liveTurnEvents = 0;
@@ -25659,6 +26857,8 @@ async function ensureCodexTurnWatcher(tabId, sessionId, cwd, options = {}) {
       tabId,
       sessionId: resolvedSessionId,
       filePath: found.filePath,
+      catchUpPendingAudit: getPendingCodexPasteAudits(tabId)
+        .some((audit) => audit?.awaitUserMessage === true),
       suppressBusyCatchUp: !!options.suppressBusyCatchUp,
       suppressPublicCatchUp: !!options.suppressPublicCatchUp,
       catchUpReason: options.catchUpReason || 'ensure',
@@ -26338,6 +27538,9 @@ function markCodexWriterHandoffActionBoundary(tabId, actionStartedAtMs = Date.no
   if (!Number.isFinite(boundaryAt) || boundaryAt <= 0) return false;
   const intent = codexSessionDiscoveryIntents.get(tabId) || null;
   if (!intent || intent.launchId !== observer.launchId) return false;
+  const terminalToken = terminals.get(tabId) || null;
+  const runSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  if (!terminalToken || !Number.isInteger(runSeq) || runSeq <= 0) return false;
   const journal = persistPendingCodexNativeRewindHandoff(tabId, {
     sourceSessionId: observer.sourceSessionId,
     actionGeneration: observer.launchId,
@@ -26356,6 +27559,8 @@ function markCodexWriterHandoffActionBoundary(tabId, actionStartedAtMs = Date.no
   }
   observer.handoffActionStartedAtMs = boundaryAt;
   observer.handoffActionGeneration = observer.launchId;
+  observer.handoffTerminalToken = terminalToken;
+  observer.handoffRunSeq = runSeq;
   observer.handoffPending = true;
   codexSessionDiscoveryIntents.set(tabId, {
     ...intent,
@@ -26368,6 +27573,72 @@ function markCodexWriterHandoffActionBoundary(tabId, actionStartedAtMs = Date.no
     + ' at=' + boundaryAt
     + ' journal=durable');
   return true;
+}
+
+function markCodexWriterHandoffRollbackApplied(tabId, {
+  actionGeneration,
+  restoredTextHash,
+  appliedAtMs = Date.now(),
+} = {}) {
+  const observer = codexWatchers.get(tabId) || null;
+  const journal = readPendingCodexNativeRewindHandoff(tabId);
+  const terminalToken = terminals.get(tabId) || null;
+  const runSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  if (!observer
+    || observer.sourceMode !== 'writer-handoff'
+    || observer.launchId !== actionGeneration
+    || observer.handoffActionGeneration !== actionGeneration
+    || observer.handoffTerminalToken !== terminalToken
+    || Number(observer.handoffRunSeq) !== runSeq
+    || !Number.isInteger(runSeq)
+    || runSeq <= 0
+    || !journal
+    || journal.invalid === true
+    || journal.version !== 2
+    || journal.phase !== 'confirm-enter-boundary'
+    || journal.actionGeneration !== actionGeneration
+    || journal.sourceSessionId !== observer.sourceSessionId
+    || restoredTextHash !== journal.targetTextHash
+    || !Number.isFinite(Number(appliedAtMs))
+    || Number(appliedAtMs) < Number(journal.actionStartedAtMs)) {
+    return { success: false, error: 'codex_rewind_stable_source_proof_invalid' };
+  }
+
+  const nextJournal = {
+    ...journal,
+    phase: 'rollback-applied',
+    appliedAtMs: Number(appliedAtMs),
+    restoredTextHash,
+  };
+  const key = codexNativeRewindHandoffJournalKey(tabId);
+  let persisted = false;
+  try {
+    persisted = projectManager.db.compareAndSetAppState(key, journal, nextJournal);
+  } catch (error) {
+    return {
+      success: false,
+      error: error?.message || String(error),
+    };
+  }
+  if (!persisted) {
+    const current = readPendingCodexNativeRewindHandoff(tabId);
+    const idempotent = current
+      && current.invalid !== true
+      && current.phase === 'rollback-applied'
+      && current.actionGeneration === actionGeneration
+      && current.sourceSessionId === observer.sourceSessionId
+      && current.restoredTextHash === restoredTextHash;
+    if (!idempotent) {
+      return { success: false, error: 'codex_rewind_stable_source_proof_not_durable' };
+    }
+  }
+  observer.handoffRollbackAppliedAtMs = Number(appliedAtMs);
+  console.log('[CodexWriterHandoff] rollback applied tab=' + String(tabId).slice(-12)
+    + ' source=' + String(observer.sourceSessionId || 'none').slice(0, 8)
+    + ' generation=' + actionGeneration
+    + ' runSeq=' + runSeq
+    + ' journal=durable');
+  return { success: true };
 }
 
 function notifyCodexWriterHandoffWaiters(observer, result) {
@@ -26508,7 +27779,7 @@ async function settleCodexWriterHandoffObservation(tabId, reason = 'rewind-finis
     }
   }
 
-  if (adoption?.status === 'adopted' && settlement.branchWriterProven) {
+  if (adoption?.status === 'adopted' && settlement.writerHandoffProven) {
     observer.handoffAdoptedSessionId = adoption.sessionId;
     observer.handoffPending = false;
     observer.handoffLastResult = adoption;
@@ -26541,17 +27812,19 @@ async function settleCodexWriterHandoffObservation(tabId, reason = 'rewind-finis
   const result = {
     ...(adoption || { status: 'unknown' }),
     sourceSessionId: baselineSessionId,
-    activeSessionId: settlement.branchWriterProven ? adoption?.sessionId || null : null,
-    bindingCommitted: settlement.branchWriterProven === true,
-    handoffStatus: settlement.branchWriterProven
-      ? 'adopted-child'
+    activeSessionId: settlement.writerHandoffProven ? adoption?.sessionId || null : null,
+    bindingCommitted: settlement.writerHandoffProven === true,
+    handoffStatus: settlement.stableWriterProven
+      ? 'stable-source'
+      : settlement.branchWriterProven
+        ? 'adopted-child'
       : settlement.absent
         ? 'process-absent'
         : 'unresolved',
     handoffGeneration: actionGeneration,
     handoffSettlement: settlement,
   };
-  if (settlement.branchWriterProven && codexWatchers.get(tabId) === observer) {
+  if (settlement.writerHandoffProven && codexWatchers.get(tabId) === observer) {
     // This observer owns one A→B mutation only. Reusing it would give a later
     // B→C native Rewind stale lineage and generation.
     closeCodexWatcher(tabId, 'writer-handoff-committed');
@@ -26588,6 +27861,9 @@ function startCodexSessionWatcher(sender, {
     handoffPending: sourceMode === 'writer-handoff' && !!handoffPending,
     handoffActionStartedAtMs: null,
     handoffActionGeneration: null,
+    handoffTerminalToken: null,
+    handoffRunSeq: null,
+    handoffRollbackAppliedAtMs: null,
     handoffAdoptedSessionId: null,
     handoffLastResult: null,
     handoffWaiters: new Set(),
@@ -27100,15 +28376,47 @@ function clearCodexPendingModelMigration(tabId, reason = 'clear') {
   return true;
 }
 
+function tryHandleManualCodexActivePickerEnter(
+  tabId,
+  term,
+  data,
+  reason = 'manual-codex-picker-enter',
+) {
+  if (data !== '\r' && data !== '\n') return { handled: false };
+  if (terminalCommandState.get(tabId)?.isRunning !== true) {
+    return { handled: false };
+  }
+  const snapshot = getHeadlessVisibleBufferSnapshot(tabId, reason);
+  if (!snapshot?.success) return { handled: false };
+  const cleanText = (snapshot.lines || [])
+    .map(line => String(line?.text || ''))
+    .join('\n');
+  const frame = classifyCodexManualEnterFrame(cleanText);
+  if (frame.action !== 'picker-control') {
+    return { handled: false, frame };
+  }
+  term.write(data);
+  resetCodexTuiReadyDetection(tabId, reason);
+  console.log('[CodexPickerInput] manual Enter delivered without prompt latch tab='
+    + String(tabId).slice(-12)
+    + ' picker=' + (frame.kind || 'unknown')
+    + ' reason=' + reason);
+  return {
+    handled: true,
+    submitted: true,
+    pickerKind: frame.kind || null,
+  };
+}
+
 function tryHandleManualCodexModelMigrationEnter(tabId, term, data, meta = null) {
   if (data !== '\r' && data !== '\n') return { handled: false };
   const commandState = terminalCommandState.get(tabId) || null;
   if (commandState?.isRunning !== true) return { handled: false };
   const startupState = codexStartupAutoEnter.get(tabId) || null;
   const recentRaw = codexTuiReadyBuffers.get(tabId) || '';
-  // Ordinary user Enter stays a direct PTY write. The synchronous screen proof
-  // is paid only after the stream has already classified this exact chooser
-  // (or its three stable anchors are present in the current raw frame).
+  // Enter is classified from the current main-owned frame. The raw stream
+  // remains a fast hint, but cannot be the only gate: a fully painted chooser
+  // may already be visible after its diagnostic tail was rotated.
   const possibleMigration = startupState?.modelMigrationPrompt?.visible === true
     || (
       (recentRaw.includes("Choose how you'd like Codex to proceed")
@@ -27116,13 +28424,15 @@ function tryHandleManualCodexModelMigrationEnter(tabId, term, data, meta = null)
       && recentRaw.includes('Try new model')
       && recentRaw.includes('Use existing model')
     );
-  if (!possibleMigration) return { handled: false };
   const snapshot = getHeadlessVisibleBufferSnapshot(
     tabId,
     'manual-codex-model-migration-enter',
   );
   if (!snapshot?.success) return { handled: false };
   const cleanText = (snapshot.lines || []).map(line => String(line?.text || '')).join('\n');
+  if (!possibleMigration && !inspectCodexModelMigrationPrompt(cleanText).visible) {
+    return { handled: false };
+  }
   const rememberedPrompt = startupState?.modelMigrationPrompt || null;
   const admission = decideCodexModelMigrationAutoEnter({
     sameTerminal: terminals.get(tabId) === term,
@@ -28972,11 +30282,13 @@ async function closeCodexPickerToComposer(term, {
 async function ensureCodexPickerFrame(term, initialFrame, {
   tabId = null,
   parseState,
+  isReady = (state) => state.items.length > 0,
   timeoutMs = 3000,
   logPrefix,
 }) {
-  const initialState = parseState(initialFrame?.clean || '');
-  if (initialState.items.length > 0) {
+  const initialClean = initialFrame?.clean || '';
+  const initialState = parseState(initialClean);
+  if (isReady(initialState, initialClean)) {
     return { frame: initialFrame, state: initialState };
   }
   const frame = await captureCodexFrame(term, {
@@ -28984,7 +30296,7 @@ async function ensureCodexPickerFrame(term, initialFrame, {
     logPrefix,
     tabId,
     authoritativeScreen: !!tabId,
-    predicate: (clean) => parseState(clean).items.length > 0,
+    predicate: (clean) => isReady(parseState(clean), clean),
   });
   return { frame, state: parseState(frame.clean) };
 }
@@ -29100,8 +30412,7 @@ async function selectCodexModelEffort(term, {
       logPrefix: logPrefix + ':open',
       tabId,
       authoritativeScreen: true,
-      predicate: (clean) => parseCodexTopModelPicker(clean).items.length > 0
-        || parseCodexAllModelPicker(clean).items.length > 0,
+      predicate: (clean) => inspectCodexModelPickerFrame(clean, model).ready,
     });
     const slashResult = await sendCodexSlashCommand(term, '/model', logPrefix + ':open-command', {
       clearStrategy: 'line',
@@ -29150,7 +30461,10 @@ async function selectCodexModelEffort(term, {
         '\x01',
         3000,
         logPrefix + ':all-models-jump-top',
-        (clean) => parseCodexAllModelPicker(clean).items.length > 0,
+        (clean) => isCodexPickerStateReady(
+          parseCodexAllModelPicker(clean),
+          model,
+        ),
         {
           tabId,
           authoritativeScreen: true,
@@ -29186,7 +30500,10 @@ async function selectCodexModelEffort(term, {
         parseState: parseCodexTopModelPicker,
         initialFrame: modelFrame,
         timeoutMs: 5000,
-        confirmPredicate: (clean) => parseCodexAllModelPicker(clean).items.length > 0,
+        confirmPredicate: (clean) => isCodexAllModelPickerFrameReady(
+          clean,
+          model,
+        ),
         logPrefix,
         writeGuard,
       });
@@ -29197,6 +30514,10 @@ async function selectCodexModelEffort(term, {
       const ensuredAllModels = await ensureCodexPickerFrame(term, allModelsResult.frame, {
         tabId,
         parseState: parseCodexAllModelPicker,
+        isReady: (_state, clean) => isCodexAllModelPickerFrameReady(
+          clean,
+          model,
+        ),
         timeoutMs: 3000,
         logPrefix: logPrefix + ':all-models-late',
       });
@@ -29211,7 +30532,10 @@ async function selectCodexModelEffort(term, {
           '\x01',
           3000,
           logPrefix + ':nested-all-models-jump-top',
-          (clean) => parseCodexAllModelPicker(clean).items.length > 0,
+          (clean) => isCodexPickerStateReady(
+            parseCodexAllModelPicker(clean),
+            model,
+          ),
           {
             tabId,
             authoritativeScreen: true,
@@ -29264,8 +30588,19 @@ async function selectCodexModelEffort(term, {
       timeoutMs: 5000,
       confirmPredicate: (clean, raw) => {
         const current = currentCodexPickerFrameText(clean, raw);
-        return parseCodexStandardEffortPicker(current).items.length > 0
-          || parseCodexPlanReasoningScopePicker(current).items.length > 0
+        const standardTarget = ['max', 'ultra'].includes(
+          normalizeCodexPickerValue(effort),
+        )
+          ? CODEX_MORE_REASONING_VALUE
+          : effort;
+        return isCodexPickerStateReady(
+          parseCodexStandardEffortPicker(current),
+          standardTarget,
+        )
+          || isCodexPickerStateReady(
+            parseCodexPlanReasoningScopePicker(current),
+            CODEX_PLAN_SCOPE_ALL_MODES_VALUE,
+          )
           || codexModelEffortConfirmationObservedInFrame(
             clean,
             raw,
@@ -29432,6 +30767,12 @@ async function selectCodexModelEffort(term, {
     const ensuredStandard = await ensureCodexPickerFrame(term, modelResult.frame, {
       tabId,
       parseState: parseCodexStandardEffortPicker,
+      isReady: (state) => isCodexPickerStateReady(
+        state,
+        ['max', 'ultra'].includes(normalizeCodexPickerValue(effort))
+          ? CODEX_MORE_REASONING_VALUE
+          : effort,
+      ),
       timeoutMs: 3000,
       logPrefix: logPrefix + ':effort-late',
     });
@@ -29461,7 +30802,10 @@ async function selectCodexModelEffort(term, {
         parseState: parseCodexStandardEffortPicker,
         initialFrame: ensuredStandard.frame,
         timeoutMs: 5000,
-        confirmPredicate: (clean) => parseCodexAdvancedEffortPicker(clean).items.length > 0,
+        confirmPredicate: (clean) => isCodexPickerStateReady(
+          parseCodexAdvancedEffortPicker(clean),
+          effort,
+        ),
         logPrefix,
         writeGuard,
       });
@@ -29477,6 +30821,7 @@ async function selectCodexModelEffort(term, {
       const ensuredAdvanced = await ensureCodexPickerFrame(term, moreReasoningResult.frame, {
         tabId,
         parseState: parseCodexAdvancedEffortPicker,
+        isReady: (state) => isCodexPickerStateReady(state, effort),
         timeoutMs: 3000,
         logPrefix: logPrefix + ':advanced-effort-late',
       });
@@ -29518,7 +30863,10 @@ async function selectCodexModelEffort(term, {
             model,
             effort,
           )
-            || parseCodexPlanReasoningScopePicker(current).items.length > 0;
+            || isCodexPickerStateReady(
+              parseCodexPlanReasoningScopePicker(current),
+              CODEX_PLAN_SCOPE_ALL_MODES_VALUE,
+            );
         },
         logPrefix,
         writeGuard,
@@ -29549,7 +30897,10 @@ async function selectCodexModelEffort(term, {
             model,
             effort,
           )
-            || parseCodexPlanReasoningScopePicker(current).items.length > 0;
+            || isCodexPickerStateReady(
+              parseCodexPlanReasoningScopePicker(current),
+              CODEX_PLAN_SCOPE_ALL_MODES_VALUE,
+            );
         },
         logPrefix,
         writeGuard,
@@ -30572,9 +31923,15 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
     launchId,
     runSeq: launchRunSeq,
   });
-  if ((normalizedCommand === 'codex-c' || normalizedCommand === 'codex-f')
-    && sourceSettingsProof.status === 'found') {
-    const sourceSettingsHandoff = createPendingCodexSettingsProofHandoff({
+  // Launch arguments/defaults are requested configuration, not proof of the
+  // state the live TUI actually accepted. Continue/Fork may carry an exact
+  // source-rollout proof; a fresh launch waits for its verified composer footer.
+  const canArmLaunchSettingsProof = !!effectiveModel
+    && !!effectiveEffort
+    && (normalizedCommand === 'codex-c' || normalizedCommand === 'codex-f')
+    && sourceSettingsProof.status === 'found';
+  if (canArmLaunchSettingsProof) {
+    const launchSettingsHandoff = createPendingCodexSettingsProofHandoff({
       result: {
         success: true,
         applied: true,
@@ -30589,14 +31946,14 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       launchId,
       appliedAt: startedAt,
     });
-    if (sourceSettingsHandoff) {
-      codexPendingSettingsProofHandoffs.set(tabId, sourceSettingsHandoff);
-      console.log('[CodexSettingsProof] source launch proof armed tab='
+    if (launchSettingsHandoff) {
+      codexPendingSettingsProofHandoffs.set(tabId, launchSettingsHandoff);
+      console.log('[CodexSettingsProof] launch proof armed tab='
         + String(tabId).slice(-12)
         + ' command=' + normalizedCommand
         + ' runSeq=' + launchRunSeq
         + ' launch=' + launchId
-        + ' source=' + sourceSettingsHandoff.applicationProofSource);
+        + ' source=' + launchSettingsHandoff.applicationProofSource);
     }
   }
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -30878,8 +32235,15 @@ ipcMain.handle('codex:select-model-effort', async (_event, {
     };
   }
   const expectedRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  const expectedProvisionalSettings = getCodexProvisionalSettingsSnapshot(
+    tabId,
+    expectedSettingsWriterSessionId?.startsWith('launch:')
+      ? expectedSettingsWriterSessionId
+      : null,
+  );
   const expectedDiscoveryLaunchId = codexSessionDiscoveryIntents.get(tabId)?.launchId
     || codexLastRunCommandPayload.get(tabId)?.launchId
+    || expectedProvisionalSettings?.codexProvisionalSettingsLaunchId
     || null;
   const requestedInputRevision = getTerminalInputRevision(tabId);
   const sender = _event.sender;
@@ -30901,9 +32265,60 @@ ipcMain.handle('codex:select-model-effort', async (_event, {
   const next = codexSettingsMutationQueue.run(async () => {
     try {
       return await withPtyWriteLock(term, async () => {
+        let provisionalWriterToken = null;
+        const writerAuthorization = await ensureCodexSubmissionWatcher(
+          tabId,
+          terminalProjects.get(tabId),
+          'model-effort-picker-writer',
+        );
+        if (writerAuthorization?.available === true
+          && writerAuthorization.kind === 'provisional-source'
+          && (!expectedSettingsWriterSessionId
+            || writerAuthorization.sessionId === expectedSettingsWriterSessionId)
+          && writerAuthorization.launchId) {
+          provisionalWriterToken = {
+            sessionId: writerAuthorization.sessionId,
+            launchId: writerAuthorization.launchId,
+            discovery: codexWatchers.get(tabId) || null,
+          };
+          console.log('[codex:select-model-effort] exact provisional Resume writer authorized tab='
+            + String(tabId).slice(-12)
+            + ' source=' + String(writerAuthorization.sessionId).slice(0, 8)
+            + ' launch=' + writerAuthorization.launchId
+            + ' mode=' + (expectedSettingsWriterSessionId ? 'writer-cas' : 'explicit-pair-owner'));
+        }
+        const readCurrentWriterSessionId = () => {
+          const provenWriterSessionId = getCodexWriterProofSnapshot(tabId)?.sessionId || null;
+          const currentLaunchId = codexSessionDiscoveryIntents.get(tabId)?.launchId
+            || codexLastRunCommandPayload.get(tabId)?.launchId
+            || null;
+          const currentLease = getCodexResumeSourceLeaseForTab(tabId);
+          const writerSessionId = resolveCodexPickerCurrentWriterSessionId({
+            provenWriterSessionId,
+            provisionalWriterSessionId: provisionalWriterToken?.sessionId || null,
+            provisionalAuthorized: !!provisionalWriterToken,
+            sameTerminal: terminals.get(tabId) === term,
+            sameRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0) === expectedRunSeq,
+            sameLaunch: !!provisionalWriterToken
+              && currentLaunchId === provisionalWriterToken.launchId,
+            sameDiscovery: !!provisionalWriterToken?.discovery
+              && codexWatchers.get(tabId) === provisionalWriterToken.discovery,
+            sameLease: !!provisionalWriterToken
+              && currentLease?.tabId === tabId
+              && currentLease?.sourceSessionId === provisionalWriterToken.sessionId
+              && currentLease?.launchId === provisionalWriterToken.launchId,
+            hasInflight: hasCodexPromptOrTurnInFlight(tabId),
+          });
+          if (writerSessionId) return writerSessionId;
+          if (!expectedSettingsWriterSessionId?.startsWith('launch:')) return null;
+          return getCodexProvisionalSettingsSnapshot(
+            tabId,
+            expectedSettingsWriterSessionId,
+          )?.codexProvisionalSettingsOwnerId || null;
+        };
         const readAdmission = (freshHasDraft, expectedInputRevision = null) => {
           const currentState = terminalCommandState.get(tabId) || null;
-          const currentWriterSessionId = getCodexWriterProofSnapshot(tabId)?.sessionId || null;
+          const currentWriterSessionId = readCurrentWriterSessionId();
           return validateCodexPickerRuntimeAdmission({
             sameTerminal: terminals.get(tabId) === term,
             expectedRunSeq,
@@ -31012,19 +32427,34 @@ ipcMain.handle('codex:select-model-effort', async (_event, {
             },
           ),
         });
+        const provenSettingsWriterSessionId = getCodexWriterProofSnapshot(tabId)?.sessionId || null;
+        const provisionalSettingsWriterSessionId = !provenSettingsWriterSessionId
+          && provisionalWriterToken
+          && readCurrentWriterSessionId() === provisionalWriterToken.sessionId
+          ? provisionalWriterToken.sessionId
+          : null;
         const projectedResult = attachCodexSettingsProofOwner(
           result,
-          getCodexWriterProofSnapshot(tabId)?.sessionId || null,
+          provenSettingsWriterSessionId || provisionalSettingsWriterSessionId,
         );
-        if (projectedResult.codexSettingsProofSessionId) {
+        if (provenSettingsWriterSessionId && projectedResult.codexSettingsProofSessionId) {
           codexPendingSettingsProofHandoffs.delete(tabId);
         } else {
           const currentDiscoveryLaunchId = codexSessionDiscoveryIntents.get(tabId)?.launchId
             || codexLastRunCommandPayload.get(tabId)?.launchId
+            || getCodexProvisionalSettingsSnapshot(tabId)
+              ?.codexProvisionalSettingsLaunchId
             || null;
           const pendingProof = currentDiscoveryLaunchId === expectedDiscoveryLaunchId
             ? createPendingCodexSettingsProofHandoff({
-              result: projectedResult,
+              // An exact provisional Resume source is the only safe owner the
+              // renderer can use before the first post-Resume writer proof.
+              // Keep the same result ownerless for the one-shot handoff so a
+              // subsequently proven child adopts the pair instead of leaving
+              // the UI bound to the source identity.
+              result: provisionalSettingsWriterSessionId
+                ? { ...projectedResult, codexSettingsProofSessionId: null }
+                : projectedResult,
               terminalToken: term,
               runSeq: expectedRunSeq,
               launchId: expectedDiscoveryLaunchId,
@@ -31039,7 +32469,25 @@ ipcMain.handle('codex:select-model-effort', async (_event, {
               + ' source=' + pendingProof.applicationProofSource);
           }
         }
-        return projectedResult;
+        if (provisionalSettingsWriterSessionId && projectedResult.codexSettingsProofSessionId) {
+          console.log('[CodexSettingsProof] provisional Resume owner published tab='
+            + String(tabId).slice(-12)
+            + ' source=' + String(provisionalSettingsWriterSessionId).slice(0, 8)
+            + ' launch=' + (expectedDiscoveryLaunchId || '-')
+            + ' handoff=' + (codexPendingSettingsProofHandoffs.has(tabId) ? 'armed' : 'missing'));
+        }
+        const provisionalSettings = !projectedResult.codexSettingsProofSessionId
+          ? getCodexProvisionalSettingsSnapshot(tabId)
+          : null;
+        return {
+          ...projectedResult,
+          ...(provisionalSettings
+            ? {
+              codexProvisionalSettingsOwnerId:
+                provisionalSettings.codexProvisionalSettingsOwnerId,
+            }
+            : {}),
+        };
       }, pickerOperation);
     } catch (error) {
       console.error('[codex:select-model-effort] Error:', error);
@@ -31106,6 +32554,7 @@ ipcMain.handle('codex:send-live-slash-command', async (_event, {
   if (!String(command || '').trim().startsWith('/')) {
     return { success: false, error: 'slash command is required' };
   }
+  const allowTurnBusy = codexLiveSlashAllowsTurnBusy(command);
   const expectedRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
   const requestedInputRevision = getTerminalInputRevision(tabId);
   const sender = _event.sender;
@@ -31141,6 +32590,7 @@ ipcMain.handle('codex:send-live-slash-command', async (_event, {
             tuiReady: codexTuiReadyTabs.has(tabId),
             stopping: aiStoppingTabs.get(tabId)?.toolType === 'codex',
             turnBusy: hasCodexPromptOrTurnInFlight(tabId),
+            allowTurnBusy,
             hasDraft: freshHasDraft,
           });
         };

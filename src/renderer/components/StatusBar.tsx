@@ -10,6 +10,10 @@ import {
   DEFAULT_CODEX_MODEL_OPTIONS,
   mergeCodexModelOptions,
 } from '../constants/codexSettings';
+import {
+  claudeEffortsForModel,
+  resolveClaudeEffortForModel,
+} from '../constants/claudeLevels';
 import { usePromptsStore } from '../store/usePromptsStore';
 import { useCmdKey } from '../hooks/useCmdHoverPopover';
 import { CUSTOM_ICONS } from '../assets/icons/registry';
@@ -57,12 +61,12 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
     let cancelled = false;
     ipcRenderer.invoke('codex:list-models').then((res: any) => {
       if (cancelled) return;
-      setCodexModels(mergeCodexModelOptions(res?.models, codexSettings.models));
+      setCodexModels(mergeCodexModelOptions(res?.models, codexSettings.models, codexSettings.removedModelIds));
     }).catch(() => {
-      if (!cancelled) setCodexModels(mergeCodexModelOptions(DEFAULT_CODEX_MODEL_OPTIONS, codexSettings.models));
+      if (!cancelled) setCodexModels(mergeCodexModelOptions(DEFAULT_CODEX_MODEL_OPTIONS, codexSettings.models, codexSettings.removedModelIds));
     });
     return () => { cancelled = true; };
-  }, [codexSettings.models]);
+  }, [codexSettings.models, codexSettings.removedModelIds]);
 
   const activeCodexModel = codexModels.find((m) => m.id === defaultCodexModel) || codexModels[0];
   const visibleCodexModels = codexModels.filter((model) => model.visible !== false);
@@ -84,6 +88,21 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
       ? nextModel.defaultEffort
       : (efforts.includes(DEFAULT_CODEX_EFFORT) ? DEFAULT_CODEX_EFFORT : efforts[0]);
     if (fallback) setDefaultCodexEffort(fallback);
+  };
+
+  const activeClaudeModel = claudeCodeSettings.models.find((model) => model.id === defaultClaudeModel)
+    || claudeCodeSettings.models[0];
+  const visibleClaudeModels = claudeCodeSettings.models.filter((model) => model.visible !== false);
+  const claudeModelsForSelector = visibleClaudeModels.length > 0
+    ? visibleClaudeModels
+    : claudeCodeSettings.models.filter((model) => model.id === defaultClaudeModel);
+  const claudeEfforts = claudeEffortsForModel(activeClaudeModel);
+  const setDefaultClaudeModelWithEffort = (model: string) => {
+    setDefaultClaudeModel(model);
+    if (model === 'none' || defaultClaudeEffort === 'none') return;
+    const nextModel = claudeCodeSettings.models.find((candidate) => candidate.id === model);
+    const fallback = resolveClaudeEffortForModel(nextModel, defaultClaudeEffort);
+    if (fallback && fallback !== defaultClaudeEffort) setDefaultClaudeEffort(fallback);
   };
 
   return (
@@ -115,15 +134,15 @@ export default function StatusBar({ onOpenSettings }: StatusBarProps) {
           accent="#DA7756"
           icon={CUSTOM_ICONS.claude}
           modelValue={defaultClaudeModel}
-          modelOptions={claudeCodeSettings.models}
+          modelOptions={claudeModelsForSelector}
           effortValue={defaultClaudeEffort}
-          effortOptions={claudeCodeSettings.efforts}
-          onModelChange={setDefaultClaudeModel}
+          effortOptions={claudeEfforts}
+          onModelChange={setDefaultClaudeModelWithEffort}
           onEffortChange={setDefaultClaudeEffort}
         />
         <EngineDefaultsSelector
           engine="Codex"
-          accent="#7A9DFF"
+          accent="#34D399"
           icon={<img src={CODEX_ICON_URL} alt="" style={{ width: '100%', height: '100%', display: 'block' }} />}
           modelValue={defaultCodexModel}
           modelOptions={codexModelsForSelector}

@@ -86,29 +86,15 @@ Startup recovery выполняется до renderer restore и AutoResume. Exa
 
 ---
 
-## Xterm serialization при unmount
+## Xterm checkpoint и cold hydration
 
-`<Workspace />` размонтируется при переходе на Dashboard → инстансы `xterm.js` уничтожаются с компонентами. PTY-процесс остаётся жив, но визуальный буфер пропадает.
+Workspace и открытые terminal layers не размонтируются при обычном переходе на Dashboard/History: presentation меняется через `visibility/opacity/pointer-events`, а PTY и единственный renderer xterm продолжают жить. Checkpoint нужен для действительно холодного renderer, dev-HMR/reconciliation и позднего первого открытия, а не как штатная страничная навигация.
 
-### Сохранение
-В `Terminal.tsx`, в cleanup-функции `useEffect`:
-```ts
-const serialized = serializeAddon.serialize();
-if (serialized) saveTerminalBuffer(tabId, serialized);
-```
-Данные хранятся в `useWorkspaceStore` в `Map<string, string>` (key = `tabId`).
+Renderer хранит не строку и не очередь raw-байтов, а структурированный checkpoint: сериализованный экран, полностью обработанную write-sequence, непрозрачное поколение PTY/headless mirror, геометрию и строки prompt boundaries. Main-side headless xterm получает весь PTY stream независимо от mount/visibility и является авторитетом; renderer checkpoint — только fallback либо более полный scrollback.
 
-### Восстановление
-При mount компонента, сразу после `xterm.js` init:
-1. Если буфер есть → `term.write(savedBuffer)`.
-2. После записи — `clearTerminalBuffer` (не занимать память).
-3. После восстановления — проигрывается `pendingBuffer` (данные от PTY, пока был unmounted).
+При восстановлении сначала фиксируется main/headless snapshot на точной sequence-границе, затем применяются только более новые чанки того же поколения. Более длинный renderer checkpoint может выиграть только при точном совпадении generation и write-sequence: иначе визуально правдоподобный старый экран нельзя смешивать с новым процессом. Новый PTY создаёт новое поколение даже если его sequence снова начинается с нуля.
 
-### Почему не `display:none`/`visibility:hidden`
-1. **xterm.js чувствителен к размерам контейнера**: скрытие через CSS даёт `0×0` → ломаются внутренние индексы строк.
-2. **React lifecycle**: глобальная навигация через смену `view` в стейте — это семантически смена страниц (unmount old, mount new), а не «спрятать».
-
-**Открытая проблема**: между unmount и mount данные от PTY теряются (нет listener'а). См. `fix-terminal-jitter.md::Открытая проблема — потеря PTY-данных при unmount`.
+Произвольный `pendingBuffer` не заменяет snapshot для Ink/Codex: дифференциальный ANSI-tail зависит от предшествовавшего кадра. Финальный headless snapshot после natural exit удерживается до явного kill/закрытия или создания нового PTY, чтобы позднее открытие завершившейся вкладки не потеряло экран. Полный шрам и отброшенная raw-tail модель — `fix-terminal-jitter.md::Cold renderer после долгой фоновой работы`.
 
 ---
 

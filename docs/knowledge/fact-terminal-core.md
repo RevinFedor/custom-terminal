@@ -260,6 +260,8 @@ Main process держит lightweight `@xterm/headless` mirror на tab, кот�
 
 Prompt detector должен считать prompt glyph не только `⏵`/`❯`, но и `›`/`╰` — Claude TUI может менять видимый символ между версиями/темами. Для служебных slash-команд, которые не дают spinner-phase (`/model`, `/effort`), caller обязан перед submit взвести boundary state в `busy`; иначе state machine не увидит BUSY→IDLE и marker не появится.
 
+SerializeAddon сохраняет клетки экрана, но не сам невидимый OSC 7777 event и не identity созданного xterm marker. Поэтому cold renderer получает prompt boundaries отдельным sidecar с точными строками того же generation/sequence snapshot и регистрирует их после восстановления экрана. Маркеры, пришедшие в более новом same-generation live-tail, проходят обычный OSC handler; смешивать sidecar прошлого PTY с новым поколением запрещено. Иначе терминал визуально выглядит правильным, но Timeline-клики молча теряют навигацию.
+
 ---
 
 ## Fix: Terminal Colors and Input (Truecolor & UTF-8)

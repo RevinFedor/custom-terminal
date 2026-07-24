@@ -6,7 +6,10 @@ export interface CodexModelOption {
   id: string;
   label: string;
   defaultEffort?: string;
+  /** Levels selected by the user for this row. */
   efforts?: string[];
+  /** Account/model capability list; separate from the selected checkboxes. */
+  supportedEfforts?: string[];
   /** Hidden models stay configured but are omitted from ordinary pickers. */
   visible?: boolean;
 }
@@ -17,6 +20,8 @@ export interface CodexSettings {
   /** One globally configured pair for the ControlBar quick-switch button. */
   quickModel?: string | null;
   quickEffort?: string | null;
+  /** Rows explicitly removed by the user must not be re-added from the catalog. */
+  removedModelIds?: string[];
 }
 
 export const DEFAULT_CODEX_MODEL = 'gpt-5.5';
@@ -41,18 +46,19 @@ export const CODEX_EFFORT_LABELS: Record<CodexEffortLevel, string> = {
 };
 
 export const DEFAULT_CODEX_MODEL_OPTIONS: CodexModelOption[] = [
-  { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', defaultEffort: 'low', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
-  { id: 'gpt-5.6-terra', label: 'GPT-5.6-Terra', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
-  { id: 'gpt-5.6-luna', label: 'GPT-5.6-Luna', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', defaultEffort: 'low', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+  { id: 'gpt-5.6-terra', label: 'GPT-5.6-Terra', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+  { id: 'gpt-5.6-luna', label: 'GPT-5.6-Luna', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
   {
     id: DEFAULT_CODEX_MODEL,
     label: DEFAULT_CODEX_MODEL,
     defaultEffort: 'medium',
     efforts: ['low', 'medium', 'high', 'xhigh'],
+    supportedEfforts: ['low', 'medium', 'high', 'xhigh'],
   },
-  { id: 'gpt-5.4', label: 'GPT-5.4', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'] },
-  { id: 'gpt-5.4-mini', label: 'GPT-5.4-Mini', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'] },
-  { id: 'gpt-5.3-codex-spark', label: 'GPT-5.3-Codex-Spark', defaultEffort: 'high', efforts: ['low', 'medium', 'high', 'xhigh'] },
+  { id: 'gpt-5.4', label: 'GPT-5.4', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'], supportedEfforts: ['low', 'medium', 'high', 'xhigh'] },
+  { id: 'gpt-5.4-mini', label: 'GPT-5.4-Mini', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'], supportedEfforts: ['low', 'medium', 'high', 'xhigh'] },
+  { id: 'gpt-5.3-codex-spark', label: 'GPT-5.3-Codex-Spark', defaultEffort: 'high', efforts: ['low', 'medium', 'high', 'xhigh'], supportedEfforts: ['low', 'medium', 'high', 'xhigh'] },
 ];
 
 export const DEFAULT_CODEX_SETTINGS: CodexSettings = {
@@ -60,6 +66,7 @@ export const DEFAULT_CODEX_SETTINGS: CodexSettings = {
   efforts: [...CODEX_EFFORT_LEVELS],
   quickModel: null,
   quickEffort: null,
+  removedModelIds: [],
 };
 
 // 'none' is our app-level sentinel for "do not add a Codex launch override".
@@ -72,9 +79,35 @@ export const codexEffortLabel = (level: string): string => {
   return (CODEX_EFFORT_LABELS as Record<string, string>)[level] || level;
 };
 
+const normalizeCodexEffortList = (raw: unknown): string[] => (
+  Array.isArray(raw)
+    ? raw.map((value) => String(value || '').trim()).filter((value, index, values) => value && values.indexOf(value) === index)
+    : []
+);
+
+export const normalizeCodexRemovedModelIds = (raw: unknown): string[] => (
+  Array.isArray(raw)
+    ? raw.map((value) => String(value || '').trim()).filter((value, index, values) => value && values.indexOf(value) === index)
+    : []
+);
+
+/** The full, model-specific checkbox list; `efforts` is only the selection. */
+export const codexSupportedEffortsForModel = (
+  model: Pick<CodexModelOption, 'id' | 'efforts' | 'supportedEfforts'> | undefined,
+): string[] => {
+  const explicit = normalizeCodexEffortList(model?.supportedEfforts);
+  if (explicit.length > 0) return explicit;
+  const bundled = DEFAULT_CODEX_MODEL_OPTIONS.find((candidate) => candidate.id === model?.id);
+  const bundledEfforts = normalizeCodexEffortList(bundled?.supportedEfforts || bundled?.efforts);
+  if (bundledEfforts.length > 0) return bundledEfforts;
+  const selected = normalizeCodexEffortList(model?.efforts);
+  return selected.length > 0 ? selected : [...CODEX_EFFORT_LEVELS];
+};
+
 export const normalizeCodexModelOptions = (
   raw: unknown,
   includeFallback = true,
+  preferRawEffortsAsSupported = false,
 ): CodexModelOption[] => {
   const list = Array.isArray(raw) ? raw : [];
   const normalized = list
@@ -83,16 +116,39 @@ export const normalizeCodexModelOptions = (
       const id = String((m as any).id || '').trim();
       if (!id) return null;
       const label = String((m as any).label || id).trim() || id;
-      const efforts = Array.isArray((m as any).efforts)
-        ? (m as any).efforts.map((v: unknown) => String(v || '').trim()).filter(Boolean)
-        : [...CODEX_EFFORT_LEVELS];
+      const rawEfforts = normalizeCodexEffortList((m as any).efforts);
+      const rawSupportedEfforts = normalizeCodexEffortList((m as any).supportedEfforts);
+      const supportedEfforts = rawSupportedEfforts.length > 0
+        ? rawSupportedEfforts
+        : (preferRawEffortsAsSupported && rawEfforts.length > 0
+          ? rawEfforts
+          : codexSupportedEffortsForModel({ id, efforts: rawEfforts }));
+      const efforts = rawEfforts.length > 0
+        ? rawEfforts.filter((effort) => supportedEfforts.includes(effort))
+        : [...supportedEfforts];
       const defaultEffort = String((m as any).defaultEffort || DEFAULT_CODEX_EFFORT).trim() || DEFAULT_CODEX_EFFORT;
-      return { id, label, defaultEffort, efforts, visible: (m as any).visible !== false };
+      return {
+        id,
+        label,
+        defaultEffort,
+        efforts: efforts.length > 0 ? efforts : [...supportedEfforts],
+        supportedEfforts,
+        visible: (m as any).visible !== false,
+      };
     })
     .filter(Boolean) as CodexModelOption[];
 
   if (includeFallback && !normalized.some((m) => m.id === DEFAULT_CODEX_MODEL)) {
-    normalized.unshift(...DEFAULT_CODEX_MODEL_OPTIONS);
+    const configuredIds = new Set(normalized.map((model) => model.id));
+    normalized.unshift(
+      ...DEFAULT_CODEX_MODEL_OPTIONS
+        .filter((model) => !configuredIds.has(model.id))
+        .map((model) => ({
+          ...model,
+          efforts: [...(model.efforts || [])],
+          supportedEfforts: [...(model.supportedEfforts || model.efforts || [])],
+        })),
+    );
   }
   return normalized.length > 0 ? normalized : (includeFallback ? DEFAULT_CODEX_MODEL_OPTIONS : []);
 };
@@ -141,9 +197,14 @@ export const resolveCodexPersistentEffortForModel = (
 export const mergeCodexModelOptions = (
   liveRaw: unknown,
   configuredRaw: unknown,
+  removedModelIds: unknown = [],
 ): CodexModelOption[] => {
-  const live = normalizeCodexModelOptions(liveRaw, false);
-  const configured = normalizeCodexModelOptions(configuredRaw);
+  const removed = new Set(normalizeCodexRemovedModelIds(removedModelIds));
+  const live = normalizeCodexModelOptions(liveRaw, false, true).filter((model) => !removed.has(model.id));
+  const configured = normalizeCodexModelOptions(
+    configuredRaw,
+    !removed.has(DEFAULT_CODEX_MODEL),
+  ).filter((model) => !removed.has(model.id));
   const liveById = new Map(live.map((model) => [model.id, model]));
   const result: CodexModelOption[] = [];
   const seen = new Set<string>();
@@ -158,13 +219,15 @@ export const mergeCodexModelOptions = (
       continue;
     }
     const requestedEfforts = configuredModel.efforts || [];
-    const efforts = liveModel.efforts?.filter((effort) => requestedEfforts.includes(effort)) || [];
-    const effectiveEfforts = efforts.length > 0 ? efforts : (liveModel.efforts || []);
+    const supportedEfforts = codexSupportedEffortsForModel(liveModel);
+    const efforts = supportedEfforts.filter((effort) => requestedEfforts.includes(effort));
+    const effectiveEfforts = efforts.length > 0 ? efforts : [...supportedEfforts];
     result.push({
       ...liveModel,
       label: configuredModel.label || liveModel.label,
       visible: configuredModel.visible !== false,
       efforts: effectiveEfforts,
+      supportedEfforts,
       defaultEffort: effectiveEfforts.includes(configuredModel.defaultEffort || '')
         ? configuredModel.defaultEffort
         : (effectiveEfforts.includes(liveModel.defaultEffort || '')

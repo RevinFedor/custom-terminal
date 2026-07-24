@@ -753,6 +753,50 @@ class DatabaseManager {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_activity_start ON agent_activity_intervals(start_ts DESC);
     `);
+    // Presentation-only binding between an app-owned activity interval and the
+    // exact durable assistant row that completed inside it. JSONL stays
+    // untouched; duration is read from agent_activity_intervals through JOIN.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS history_response_timings (
+        interval_id INTEGER PRIMARY KEY,
+        tool_type TEXT NOT NULL,
+        tab_id TEXT,
+        session_id TEXT,
+        entry_uuid TEXT,
+        source_identity TEXT,
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+      )
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_history_response_timings_entry
+      ON history_response_timings(tool_type, entry_uuid)
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_history_response_timings_pending
+      ON history_response_timings(tool_type, tab_id, session_id)
+      WHERE entry_uuid IS NULL
+    `);
+    // A Codex source rollout can be projected into a proven child after
+    // resume/rewind. Keep the original binding and add child aliases instead
+    // of moving the single interval row away from its source transcript.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS history_response_timing_aliases (
+        interval_id INTEGER NOT NULL,
+        tool_type TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        entry_uuid TEXT NOT NULL,
+        source_identity TEXT,
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+        PRIMARY KEY (interval_id, tool_type, session_id),
+        UNIQUE (tool_type, session_id, entry_uuid)
+      )
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_history_response_timing_aliases_entry
+      ON history_response_timing_aliases(tool_type, entry_uuid)
+    `);
 
     // Runtime state in main is keyed by tab_id alone. Repair legacy collisions
     // before enforcing the same identity contract in SQLite; otherwise a PTY,
@@ -4338,11 +4382,11 @@ class DatabaseManager {
   // Zero / negative spans are dropped (idempotent recorder may emit a
   // false→false with no real interval).
   saveActivityInterval(iv) {
-    if (!iv || !iv.startTs || !iv.endTs) return;
+    if (!iv || !iv.startTs || !iv.endTs) return null;
     const duration = iv.endTs - iv.startTs;
-    if (duration <= 0) return;
+    if (duration <= 0) return null;
     try {
-      this.db.prepare(`
+      const result = this.db.prepare(`
         INSERT INTO agent_activity_intervals
           (tab_id, project_id, project_path, project_name, tab_name, engine,
            session_id, start_ts, end_ts, duration_ms)
@@ -4359,8 +4403,15 @@ class DatabaseManager {
         iv.endTs,
         duration
       );
+      return {
+        id: Number(result.lastInsertRowid),
+        startTs: iv.startTs,
+        endTs: iv.endTs,
+        durationMs: duration,
+      };
     } catch (e) {
       console.error('[DB] saveActivityInterval failed:', e.message);
+      return null;
     }
   }
 
@@ -4375,6 +4426,341 @@ class DatabaseManager {
       WHERE end_ts >= ? AND start_ts <= ?
       ORDER BY start_ts ASC
     `).all(fromTs, toTs);
+  }
+
+  savePendingHistoryResponseTiming({
+    intervalId,
+    toolType,
+    tabId = null,
+    sessionId = null,
+  } = {}) {
+    const id = Number(intervalId);
+    if (!Number.isInteger(id) || id <= 0 || !toolType) return false;
+    const interval = this.db.prepare(`
+      SELECT id FROM agent_activity_intervals WHERE id = ? LIMIT 1
+    `).get(id);
+    if (!interval) return false;
+    this.db.prepare(`
+      INSERT INTO history_response_timings (
+        interval_id, tool_type, tab_id, session_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now'))
+      ON CONFLICT(interval_id) DO UPDATE SET
+        tool_type = excluded.tool_type,
+        tab_id = COALESCE(excluded.tab_id, history_response_timings.tab_id),
+        session_id = COALESCE(excluded.session_id, history_response_timings.session_id),
+        updated_at = strftime('%s', 'now')
+    `).run(id, toolType, tabId, sessionId);
+    return true;
+  }
+
+  bindHistoryResponseTimingEntry({
+    intervalId,
+    toolType,
+    sessionId = null,
+    entryUuid,
+    sourceIdentity = null,
+  } = {}) {
+    const id = Number(intervalId);
+    if (!Number.isInteger(id) || id <= 0 || !toolType || !entryUuid) return false;
+    const alreadyOwned = this.db.prepare(`
+      SELECT interval_id
+      FROM history_response_timings
+      WHERE tool_type = ?
+        AND session_id IS ?
+        AND entry_uuid = ?
+        AND interval_id <> ?
+      UNION ALL
+      SELECT interval_id
+      FROM history_response_timing_aliases
+      WHERE tool_type = ?
+        AND session_id IS ?
+        AND entry_uuid = ?
+        AND interval_id <> ?
+      LIMIT 1
+    `).get(
+      toolType, sessionId, entryUuid, id,
+      toolType, sessionId, entryUuid, id,
+    );
+    if (alreadyOwned) return false;
+    const result = this.db.prepare(`
+      UPDATE history_response_timings
+      SET session_id = COALESCE(?, session_id),
+          entry_uuid = ?,
+          source_identity = ?,
+          updated_at = strftime('%s', 'now')
+      WHERE interval_id = ?
+        AND tool_type = ?
+        AND (entry_uuid IS NULL OR entry_uuid = ?)
+    `).run(sessionId, entryUuid, sourceIdentity, id, toolType, entryUuid);
+    return result.changes > 0;
+  }
+
+  getPendingHistoryResponseTimings({
+    toolType,
+    sessionIds = [],
+    tabId = null,
+  } = {}) {
+    if (!toolType) return [];
+    const normalizedSessions = Array.from(new Set(
+      (Array.isArray(sessionIds) ? sessionIds : [])
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+    ));
+    const identityClauses = [];
+    const params = [toolType];
+    if (tabId) {
+      identityClauses.push('t.tab_id = ?');
+      params.push(tabId);
+    }
+    if (normalizedSessions.length > 0) {
+      identityClauses.push(`t.session_id IN (${normalizedSessions.map(() => '?').join(',')})`);
+      params.push(...normalizedSessions);
+    }
+    if (identityClauses.length === 0) return [];
+    const rows = this.db.prepare(`
+      SELECT t.*, a.start_ts, a.end_ts, a.duration_ms
+      FROM history_response_timings t
+      JOIN agent_activity_intervals a ON a.id = t.interval_id
+      WHERE t.tool_type = ?
+        AND t.entry_uuid IS NULL
+        AND (${identityClauses.join(' OR ')})
+      ORDER BY a.end_ts DESC
+      LIMIT 100
+    `).all(...params);
+    return rows.map(row => ({
+      intervalId: Number(row.interval_id),
+      toolType: row.tool_type,
+      tabId: row.tab_id || null,
+      sessionId: row.session_id || null,
+      entryUuid: null,
+      sourceIdentity: null,
+      startTs: Number(row.start_ts),
+      endTs: Number(row.end_ts),
+      durationMs: Number(row.duration_ms),
+      updatedAt: Number(row.updated_at || 0),
+    }));
+  }
+
+  getHistoryResponseTimingsForEntries(toolType, entryUuids) {
+    const uuids = Array.from(new Set(
+      (Array.isArray(entryUuids) ? entryUuids : [])
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+    ));
+    if (!toolType || uuids.length === 0) return [];
+    const rows = [];
+    const chunkSize = 800;
+    for (let start = 0; start < uuids.length; start += chunkSize) {
+      const chunk = uuids.slice(start, start + chunkSize);
+      rows.push(...this.db.prepare(`
+        SELECT t.interval_id, t.tool_type, t.tab_id, t.session_id,
+               t.entry_uuid, t.source_identity, t.updated_at,
+               a.start_ts, a.end_ts, a.duration_ms
+        FROM history_response_timings t
+        JOIN agent_activity_intervals a ON a.id = t.interval_id
+        WHERE t.tool_type = ?
+          AND t.entry_uuid IN (${chunk.map(() => '?').join(',')})
+        UNION ALL
+        SELECT x.interval_id, x.tool_type, t.tab_id, x.session_id,
+               x.entry_uuid, x.source_identity, x.updated_at,
+               a.start_ts, a.end_ts, a.duration_ms
+        FROM history_response_timing_aliases x
+        JOIN history_response_timings t ON t.interval_id = x.interval_id
+        JOIN agent_activity_intervals a ON a.id = x.interval_id
+        WHERE x.tool_type = ?
+          AND x.entry_uuid IN (${chunk.map(() => '?').join(',')})
+        ORDER BY end_ts ASC
+      `).all(toolType, ...chunk, toolType, ...chunk));
+    }
+    return rows.map(row => ({
+      intervalId: Number(row.interval_id),
+      toolType: row.tool_type,
+      tabId: row.tab_id || null,
+      sessionId: row.session_id || null,
+      entryUuid: row.entry_uuid || null,
+      sourceIdentity: row.source_identity || null,
+      startTs: Number(row.start_ts),
+      endTs: Number(row.end_ts),
+      durationMs: Number(row.duration_ms),
+      updatedAt: Number(row.updated_at || 0),
+    }));
+  }
+
+  getLatestPendingHistoryResponseTimingForTab(tabId, toolType = null) {
+    if (!tabId) return null;
+    const params = [tabId];
+    const toolFilter = toolType ? 'AND t.tool_type = ?' : '';
+    if (toolType) params.push(toolType);
+    const row = this.db.prepare(`
+      SELECT t.*, a.start_ts, a.end_ts, a.duration_ms
+      FROM history_response_timings t
+      JOIN agent_activity_intervals a ON a.id = t.interval_id
+      WHERE t.tab_id = ?
+        ${toolFilter}
+        AND t.entry_uuid IS NULL
+      ORDER BY a.end_ts DESC
+      LIMIT 1
+    `).get(...params);
+    if (!row) return null;
+    return {
+      intervalId: Number(row.interval_id),
+      toolType: row.tool_type,
+      tabId: row.tab_id || null,
+      sessionId: row.session_id || null,
+      entryUuid: null,
+      startTs: Number(row.start_ts),
+      endTs: Number(row.end_ts),
+      durationMs: Number(row.duration_ms),
+      updatedAt: Number(row.updated_at || 0),
+    };
+  }
+
+  cloneHistoryResponseTimingsForSession({
+    toolType,
+    sourceSessionId,
+    childSessionId,
+    tabId = null,
+    entryMappings = [],
+  } = {}) {
+    const source = String(sourceSessionId || '').trim();
+    const child = String(childSessionId || '').trim();
+    const mappings = Array.isArray(entryMappings) ? entryMappings : [];
+    if (!toolType || !source || !child || source === child) {
+      return { cloned: 0, unchanged: 0, skipped: mappings.length, pendingReassigned: 0 };
+    }
+    const normalizedTabId = String(tabId || '').trim();
+    const findSource = this.db.prepare(`
+      SELECT interval_id
+      FROM history_response_timings
+      WHERE tool_type = ? AND session_id = ? AND entry_uuid = ?
+      UNION ALL
+      SELECT interval_id
+      FROM history_response_timing_aliases
+      WHERE tool_type = ? AND session_id = ? AND entry_uuid = ?
+      LIMIT 1
+    `);
+    const findChild = this.db.prepare(`
+      SELECT entry_uuid, source_identity
+      FROM history_response_timing_aliases
+      WHERE interval_id = ? AND tool_type = ? AND session_id = ?
+      LIMIT 1
+    `);
+    const insertChild = this.db.prepare(`
+      INSERT OR IGNORE INTO history_response_timing_aliases (
+        interval_id, tool_type, session_id, entry_uuid, source_identity,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now'))
+    `);
+    let cloned = 0;
+    let unchanged = 0;
+    let skipped = 0;
+    let pendingReassigned = 0;
+    const run = this.db.transaction(() => {
+      const pendingResult = normalizedTabId
+        ? this.db.prepare(`
+            UPDATE history_response_timings
+            SET session_id = ?, updated_at = strftime('%s', 'now')
+            WHERE tool_type = ?
+              AND session_id = ?
+              AND tab_id = ?
+              AND entry_uuid IS NULL
+          `).run(child, toolType, source, normalizedTabId)
+        : this.db.prepare(`
+            UPDATE history_response_timings
+            SET session_id = ?, updated_at = strftime('%s', 'now')
+            WHERE tool_type = ?
+              AND session_id = ?
+              AND entry_uuid IS NULL
+          `).run(child, toolType, source);
+      pendingReassigned = Number(pendingResult.changes || 0);
+      for (const mapping of mappings) {
+        const sourceEntryUuid = String(mapping?.sourceEntryUuid || '').trim();
+        const childEntryUuid = String(mapping?.childEntryUuid || '').trim();
+        if (!sourceEntryUuid || !childEntryUuid) {
+          skipped += 1;
+          continue;
+        }
+        const sourceRow = findSource.get(
+          toolType, source, sourceEntryUuid,
+          toolType, source, sourceEntryUuid,
+        );
+        if (!sourceRow) {
+          skipped += 1;
+          continue;
+        }
+        const intervalId = Number(sourceRow.interval_id);
+        const existing = findChild.get(intervalId, toolType, child);
+        if (existing) {
+          if (existing.entry_uuid === childEntryUuid) unchanged += 1;
+          else skipped += 1;
+          continue;
+        }
+        const result = insertChild.run(
+          intervalId,
+          toolType,
+          child,
+          childEntryUuid,
+          mapping?.childSourceIdentity || null,
+        );
+        if (result.changes > 0) cloned += 1;
+        else skipped += 1;
+      }
+    });
+    run();
+    return { cloned, unchanged, skipped, pendingReassigned };
+  }
+
+  getHistoryResponseTimingRevision(toolType, sessionId = null, tabId = null) {
+    if (!toolType) return 'none';
+    const normalizedSessionId = String(sessionId || '').trim();
+    const normalizedTabId = String(tabId || '').trim();
+    const identityClauses = [];
+    const params = [toolType];
+    if (normalizedSessionId) {
+      identityClauses.push('t.session_id = ?');
+      params.push(normalizedSessionId);
+    }
+    if (normalizedTabId) {
+      identityClauses.push('t.tab_id = ?');
+      params.push(normalizedTabId);
+    }
+    const identityFilter = identityClauses.length > 0
+      ? `AND (${identityClauses.join(' OR ')})`
+      : '';
+    const aliasIdentityClauses = [];
+    const aliasParams = [toolType];
+    if (normalizedSessionId) {
+      aliasIdentityClauses.push('x.session_id = ?');
+      aliasParams.push(normalizedSessionId);
+    }
+    if (normalizedTabId) {
+      aliasIdentityClauses.push('t.tab_id = ?');
+      aliasParams.push(normalizedTabId);
+    }
+    const aliasIdentityFilter = aliasIdentityClauses.length > 0
+      ? `AND (${aliasIdentityClauses.join(' OR ')})`
+      : '';
+    const rows = this.db.prepare(`
+      SELECT 'primary' AS projection, t.interval_id, t.session_id,
+             t.entry_uuid, t.source_identity, t.updated_at
+      FROM history_response_timings t
+      WHERE t.tool_type = ?
+        ${identityFilter}
+      UNION ALL
+      SELECT 'alias' AS projection, x.interval_id, x.session_id,
+             x.entry_uuid, x.source_identity, x.updated_at
+      FROM history_response_timing_aliases x
+      JOIN history_response_timings t ON t.interval_id = x.interval_id
+      WHERE x.tool_type = ?
+        ${aliasIdentityFilter}
+      ORDER BY interval_id ASC, projection ASC
+    `).all(...params, ...aliasParams);
+    if (rows.length === 0) return 'none';
+    return crypto
+      .createHash('sha256')
+      .update(JSON.stringify(rows))
+      .digest('hex')
+      .slice(0, 24);
   }
 
   close() { this.db.close(); }

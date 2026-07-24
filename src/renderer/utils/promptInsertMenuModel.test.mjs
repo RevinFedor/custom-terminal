@@ -8,6 +8,7 @@ import {
   clampFloatingPanelTop,
   isCurrentPickerGeneration,
   joinPromptInsertionText,
+  placePointAnchoredMenu,
   resolveHistoryScriptCwd,
 } from './promptInsertMenuModel.mjs';
 
@@ -67,7 +68,7 @@ test('a tall submenu clamps itself without changing its parent anchor', () => {
   assert.equal(clampFloatingPanelTop(4, 1200, 900, 8), 8);
 });
 
-test('history context anchor is captured above the composer once', () => {
+test('history context anchor preserves the exact pointer position', () => {
   const anchor = captureHistoryMenuAnchor({
     pointerX: 420,
     pointerY: 780,
@@ -75,14 +76,74 @@ test('history context anchor is captured above the composer once', () => {
   });
 
   assert.deepEqual(anchor, {
-    mode: 'history-composer',
+    mode: 'point',
     x: 420,
-    y: 710,
+    y: 780,
   });
   assert.deepEqual(
     captureHistoryMenuAnchor({ pointerX: 420, pointerY: 780 }),
     { mode: 'point', x: 420, y: 780 },
   );
+});
+
+test('point menu keeps one edge beside the pointer at every viewport edge', () => {
+  assert.deepEqual(placePointAnchoredMenu({
+    anchorX: 100,
+    anchorY: 100,
+    panelWidth: 390,
+    panelHeight: 196,
+    viewportWidth: 1447,
+    viewportHeight: 913,
+  }), {
+    left: 102,
+    top: 102,
+    openUp: false,
+    availableHeight: 803,
+  });
+
+  const bottom = placePointAnchoredMenu({
+    anchorX: 800,
+    anchorY: 800,
+    panelWidth: 390,
+    panelHeight: 196,
+    viewportWidth: 1447,
+    viewportHeight: 913,
+  });
+  assert.deepEqual(bottom, {
+    left: 802,
+    top: 602,
+    openUp: true,
+    availableHeight: 790,
+  });
+  assert.equal(bottom.top + 196, 798);
+
+  const right = placePointAnchoredMenu({
+    anchorX: 1400,
+    anchorY: 200,
+    panelWidth: 390,
+    panelHeight: 196,
+    viewportWidth: 1447,
+    viewportHeight: 913,
+    openLeft: true,
+  });
+  assert.equal(right.left, 1008);
+  assert.equal(right.left + 390, 1398);
+});
+
+test('oversized point menu uses the larger side and reports its height limit', () => {
+  assert.deepEqual(placePointAnchoredMenu({
+    anchorX: 700,
+    anchorY: 800,
+    panelWidth: 300,
+    panelHeight: 1200,
+    viewportWidth: 1447,
+    viewportHeight: 913,
+  }), {
+    left: 702,
+    top: 8,
+    openUp: true,
+    availableHeight: 790,
+  });
 });
 
 test('context menu chooses one side from maximum chain width', () => {

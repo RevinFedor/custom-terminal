@@ -90,12 +90,17 @@ const CenteredUpwardPopover = forwardRef<HTMLDivElement, CenteredUpwardPopoverPr
     useLayoutEffect(() => {
       measure();
       window.addEventListener('resize', measure);
+      // Anchors can live inside nested scroll containers (History/Virtuoso,
+      // popovers, sidebars). Capture-phase scroll keeps the fixed portal tied
+      // to the trigger without assuming which ancestor owns scrolling.
+      window.addEventListener('scroll', measure, true);
       const observer = typeof ResizeObserver === 'undefined'
         ? null
         : new ResizeObserver(measure);
       if (observer && wrapperRef.current) observer.observe(wrapperRef.current);
       return () => {
         window.removeEventListener('resize', measure);
+        window.removeEventListener('scroll', measure, true);
         observer?.disconnect();
       };
     }, [measure]);

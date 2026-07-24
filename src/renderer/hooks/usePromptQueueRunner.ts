@@ -7,6 +7,13 @@ import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs
 import { isWorkflowOutcomeAtOrAfterArm, planWorkflowReconciliation } from '../utils/promptQueueReconciliation.mjs';
 import { getHistoryAgentRuntime } from '../utils/historyAgentRuntimes';
 import { getClaudeStartupDefaultsGateSnapshot } from '../utils/claudeStartupDefaultsGate';
+import { serializeComposerDraft } from '../utils/composerChips.mjs';
+import {
+  beginHistoryPromptHandoff,
+  historyPromptHandoffAuditProofFromSendResult,
+  retractHistoryPromptHandoff,
+  settleHistoryPromptHandoff,
+} from '../utils/historyPromptHandoffs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -91,13 +98,44 @@ function getPromptQueueAgentLabel(tabId: string): string {
   return getPromptQueueAgent(tabId) === 'codex' ? 'Codex' : 'Claude';
 }
 
-function sendQueueCommand(tabId: string, payload: string): Promise<unknown> {
+function getPromptQueueSessionId(tabId: string, agent: QueueAgent): string | null {
+  const state = useWorkspaceStore.getState();
+  for (const ws of state.openProjects.values()) {
+    const tab = ws.tabs.get(tabId);
+    if (!tab) continue;
+    return agent === 'codex'
+      ? (tab.codexSessionId || null)
+      : (tab.claudeSessionId || null);
+  }
+  return null;
+}
+
+function sendQueueCommand(
+  tabId: string,
+  payload: string,
+  handoff: {
+    handoffId: string;
+    presentationSnapshot: {
+      historySessionId: string | null;
+      promptChips: Array<{
+        id?: string;
+        kind: 'prompt';
+        label?: string;
+        text: string;
+        sourceKey?: string;
+      }>;
+    };
+  },
+): Promise<unknown> {
   const agent = getPromptQueueAgent(tabId);
   const channel = agent === 'codex' ? 'codex:send-command' : 'claude:send-command';
   const isSlashCommand = String(payload || '').trimStart().startsWith('/');
   const options = {
     source: 'prompt-queue',
     awaitUserMessageAudit: agent === 'claude' && !isSlashCommand,
+    handoffId: handoff.handoffId,
+    statusAtSend: 'active',
+    presentationSnapshot: handoff.presentationSnapshot,
   };
   const term = terminalRegistry.get(tabId);
   const before = typeof document !== 'undefined' ? document.activeElement?.tagName?.toLowerCase() || '-' : '-';
@@ -441,6 +479,22 @@ function beginValidatedQueueSend(
 
     queueAwaitingBusyStart.add(ownerTabId);
     const payload = withPostPrompt(ownerTabId, buildQueuedPromptPayload(validation.item));
+    const presentationText = withPostPrompt(ownerTabId, serializeComposerDraft({
+      text: validation.item.text,
+      chips: validation.item.chips || [],
+    })).trim();
+    const promptChips = (validation.item.chips || [])
+      .filter((chip) => chip.kind === 'prompt')
+      .map((chip) => ({
+        ...(chip.id ? { id: chip.id } : {}),
+        kind: 'prompt' as const,
+        ...(chip.label ? { label: chip.label } : {}),
+        text: chip.text,
+        ...(chip.sourceKey ? { sourceKey: chip.sourceKey } : {}),
+      }));
+    const agent = getPromptQueueAgent(ownerTabId);
+    const handoffId = 'run-after-' + head.id + '-' + attempt.attemptId;
+    const sessionIdHint = getPromptQueueSessionId(ownerTabId, agent);
     const beforeCount = countEnabledQueuedPrompts(latestQueue.items);
     if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
       queueAwaitingBusyStart.delete(ownerTabId);
@@ -448,21 +502,48 @@ function beginValidatedQueueSend(
       return;
     }
     console.log('[PromptQueueRunner] ' + label + ' fire owner=' + ownerTabId.slice(-8)
-      + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8) + ' remaining=' + Math.max(0, beforeCount - 1));
-    const res: any = await sendQueueCommand(ownerTabId, payload);
+      + ' ' + arrow + ' trigger=' + triggerTabId.slice(-8)
+      + ' handoff=' + handoffId
+      + ' remaining=' + Math.max(0, beforeCount - 1));
+    beginHistoryPromptHandoff({
+      tabId: ownerTabId,
+      handoffId,
+      toolType: agent,
+      sessionIdHint,
+      text: presentationText,
+      promptChips,
+      submittedAt: Date.now(),
+      source: 'prompt-queue',
+      statusAtSend: 'active',
+      requiresAuditIdentity: true,
+    });
+    const res: any = await sendQueueCommand(ownerTabId, payload, {
+      handoffId,
+      presentationSnapshot: {
+        historySessionId: sessionIdHint,
+        promptChips,
+      },
+    });
     if (!queueSendTransferredOwnership(res)) {
       queueAwaitingBusyStart.delete(ownerTabId);
       if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) {
+        retractHistoryPromptHandoff(ownerTabId, handoffId, 'send-response-became-stale');
         clearDeferredOwnerAttempt(ownerTabId, attempt, 'send-response-became-stale');
         console.log('[PromptQueueRunner] ' + label + ' ignored stale refused response owner=' + ownerTabId.slice(-8)
           + ' attempt=' + attempt.attemptId + ' error=' + (res?.error || 'unknown'));
         return;
       }
       if (res?.deferred === true || res?.error === 'codex_input_not_ready') {
+        retractHistoryPromptHandoff(ownerTabId, handoffId, 'send-deferred-before-submit');
         console.log('[PromptQueueRunner] ' + label + ' owner=' + ownerTabId.slice(-8)
           + ' → WAIT main readiness admission error=' + (res?.error || 'not-ready'));
         return;
       }
+      settleHistoryPromptHandoff(ownerTabId, handoffId, {
+        queueStatus: 'failed',
+        reason: 'send-refused-before-submit',
+        requiresAuditIdentity: false,
+      });
       clearDeferredOwnerSend(ownerTabId, 'send-refused');
       const store = usePromptQueueStore.getState();
       store.setAutoRun(ownerTabId, false);
@@ -470,6 +551,29 @@ function beginValidatedQueueSend(
       console.error('[PromptQueueRunner] ' + label + ' send refused owner=' + ownerTabId, res?.error);
       return;
     }
+    const auditProof = historyPromptHandoffAuditProofFromSendResult(res);
+    const lateAuditPending = res?.codexAudit?.lateReconciliationPending === true
+      || res?.pasteAudit?.lateReconciliationPending === true;
+    const finalAuditFailure = res?.success === false
+      && res?.submitted === true
+      && !lateAuditPending;
+    settleHistoryPromptHandoff(ownerTabId, handoffId, {
+      queueStatus: finalAuditFailure
+        ? 'failed'
+        : res?.queued === true
+          ? 'queued'
+          : 'sent',
+      reason: finalAuditFailure
+        ? 'send-submitted-audit-failed'
+        : lateAuditPending
+          ? 'send-submitted-audit-pending'
+        : 'send-result',
+      proof: auditProof,
+      // Enter transfers delivery ownership, so the queue item is committed,
+      // but text/time similarity is never allowed to impersonate audit proof.
+      // A slow Codex rollout settles this same handoff over the late-audit IPC.
+      requiresAuditIdentity: true,
+    });
     if (res && res.success === false && res.submitted === true) {
       console.warn('[PromptQueueRunner] ' + label + ' submitted but audit unverified owner=' + ownerTabId.slice(-8)
         + ' trigger=' + triggerTabId.slice(-8) + ' error=' + (res.error || 'unknown'));
@@ -481,6 +585,12 @@ function beginValidatedQueueSend(
       + ' targetCleared=' + committed.targetCleared + ' before=' + committed.beforeCount);
   })().catch((error: unknown) => {
     queueAwaitingBusyStart.delete(ownerTabId);
+    const failedHandoffId = 'run-after-' + head.id + '-' + attempt.attemptId;
+    settleHistoryPromptHandoff(ownerTabId, failedHandoffId, {
+      queueStatus: 'failed',
+      reason: 'send-error-before-submit',
+      requiresAuditIdentity: false,
+    });
     const current = deferredOwnerAttemptIsCurrent(ownerTabId, attempt);
     clearDeferredOwnerAttempt(ownerTabId, attempt, 'send-error');
     if (current) {
@@ -713,6 +823,39 @@ export function usePromptQueueRunner() {
         + ownerTabId.slice(-8) + ' → retry');
       fireQueueOwner(ownerTabId, triggerTabId);
     });
+    const onPromptAuditResult = (_event: unknown, detail: any) => {
+      const auditTabId = typeof detail?.tabId === 'string' ? detail.tabId : '';
+      const handoffId = typeof detail?.handoffId === 'string' ? detail.handoffId : '';
+      if (!auditTabId || !handoffId) return;
+      if (detail.success === true) {
+        const proof = historyPromptHandoffAuditProofFromSendResult({
+          codexAudit: {
+            success: true,
+            auditTimestamp: detail.auditTimestamp,
+            actualHash: detail.actualHash,
+            actualLen: detail.actualLen,
+            sessionId: detail.sessionId,
+            sourceIdentity: detail.sourceIdentity,
+            canonicalized: detail.canonicalized,
+            canonicalReason: detail.canonicalReason,
+          },
+        });
+        if (!proof) return;
+        settleHistoryPromptHandoff(auditTabId, handoffId, {
+          queueStatus: 'sent',
+          reason: detail.late === true ? 'late-audit-confirmed' : 'audit-confirmed',
+          proof,
+          requiresAuditIdentity: true,
+        });
+        return;
+      }
+      settleHistoryPromptHandoff(auditTabId, handoffId, {
+        queueStatus: 'failed',
+        reason: 'audit-failed:' + (detail.error || 'unknown'),
+        requiresAuditIdentity: true,
+      });
+    };
+    ipcRenderer.on('agent-prompt:audit-result', onPromptAuditResult);
 
     // Walk all queues, find one(s) waiting on `triggerTabId` for turn-end edge.
     // For default (runAfterTabId === null) the owner IS the trigger. For
@@ -1141,6 +1284,7 @@ export function usePromptQueueRunner() {
       window.removeEventListener('claude-startup-defaults-gate', claudeStartupGateHandler);
       unsubscribeQueueHydration();
       unsubscribeWorkspaceHydration();
+      ipcRenderer.removeListener('agent-prompt:audit-result', onPromptAuditResult);
       unsubscribeEditorLocks();
     };
   }, []);

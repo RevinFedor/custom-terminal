@@ -25,6 +25,26 @@ reconciliation наследует lineage из settled proof, а не перез
 source/action. Направленный A→B→C подтвердил два последовательных Rewind без
 `writer not ready`.
 
+Позднее живой прогон обнаружил обратный порядок успешного handoff. Observer успевал
+durably привязать exact child и потребить journal до того, как основной сценарий
+забирал восстановленный prompt из TUI. Откат уже был применён, но post-grab шаг
+ошибочно требовал перевести исчезнувший journal в `rollback-applied` и показывал
+failure после фактического успеха.
+
+После grab допустимы только два взаимоисключающих proof: source остался writer и
+journal durably перешёл в `rollback-applied`, либо exact child уже committed с
+совпадающими source/child, action generation, PTY token, run generation, intent и
+SQLite binding. Само отсутствие journal успеха не доказывает. Два последовательных
+живых перехода `019f949d → 019f94a6 → 019f94a7` подтвердили committed-child путь:
+оба target вернулись в History input, исчезли из откатанной истории и не дали
+ложного error после post-grab.
+
+Ошибка до подтверждающего `Enter` закрывает только доказанно открытый native
+backtrack через `q`. Слепой cleanup через `Escape` запрещён: на idle composer
+эта клавиша сама открывает Rewind и превращает исходный отказ в новый скрытый
+protocol-state. После возможного `Enter` автоматика вообще не посылает
+догадочную клавишу — дальнейший cleanup разрешён только свежим proof кадра.
+
 ## Актуальность после native `/rewind` flow (2026-06)
 
 Этот файл описывает safety/fallback-логику навигации, а не основной путь Timeline Rewind. Текущий default action в Timeline отправляет Claude slash-команду `/rewind`, выбирает target в родном picker'е, затем переносит восстановленный prompt из terminal composer в History textarea через тот же `grab-input` path, которым пользуется `+ clear`; terminal composer после этого должен остаться пустым. AI compact-варианты включаются только отдельными кнопками. Visual Search Strategy ниже остаётся защитой для ситуаций, когда позиционное сопоставление меню не сработало, но не должна снова становиться primary-моделью и не должна автоматически нажимать Enter при не найденной цели.

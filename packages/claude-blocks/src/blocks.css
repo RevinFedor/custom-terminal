@@ -264,6 +264,15 @@
   max-height: 320px;
   overflow-y: auto;
 }
+.cb-diff-hunks {
+  max-height: 320px;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+}
+.cb-diff-hunks .cb-diff {
+  max-height: none;
+  overflow-y: visible;
+}
 .cb-diff-row { display: flex; align-items: flex-start; }
 /* Фон строк задаётся inline через токены (--cb-diff-add-bg/del-bg), эти
    классы — семантические хуки для override в потребителе при желании. */

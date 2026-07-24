@@ -33,6 +33,7 @@ import {
 } from '../../utils/agentScenarios';
 import { getHistoryAgentRuntime, type AgentHistoryTool, type AgentPtyStatus } from '../../utils/historyAgentRuntimes';
 import type { HistoryDurableRevision } from '../../utils/historySnapshotCache';
+import { planTimelineTranscriptRefresh } from '../../utils/timelineTranscriptRefresh.mjs';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from '../../utils/claudeStartupDefaultsReady';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
@@ -664,6 +665,7 @@ function Timeline({
   const isTurnBusyRef = useRef(isTurnBusy);
   isTurnBusyRef.current = isTurnBusy;
   const deferredTranscriptRefreshRef = useRef(false);
+  const deferredTranscriptReasonRef = useRef<'turn-busy' | 'surface-hidden' | null>(null);
   const [isExpanded, setIsExpanded] = useState(false);
   const [tooltipCopied, setTooltipCopied] = useState(false);
   // Per-entry collapsed/expanded state for docs blocks in tooltip. Key = entry uuid.
@@ -2316,18 +2318,29 @@ function Timeline({
   }, [timelineOwnerKey, sessionId, isCodex, runTimelineLoad]);
 
   useEffect(() => {
-    if (isTurnBusy || !deferredTranscriptRefreshRef.current) return;
-    deferredTranscriptRefreshRef.current = false;
+    const plan = planTimelineTranscriptRefresh({
+      pending: deferredTranscriptRefreshRef.current,
+      isTurnBusy,
+      documentVisible: document.visibilityState === 'visible',
+      surfaceVisible: isVisible,
+    });
+    deferredTranscriptRefreshRef.current = plan.pending;
+    if (!plan.refresh) return;
+    const deferredReason = deferredTranscriptReasonRef.current;
+    deferredTranscriptReasonRef.current = null;
+    const refreshReason = deferredReason === 'surface-hidden'
+      ? 'surface-resume'
+      : 'turn-settled';
     console.warn(
       '[Timeline:TranscriptFlush]' +
       ' inst=' + timelineInstanceIdRef.current +
       ' tab=' + tabId.slice(-8) +
       ' session=' + (sessionId ? sessionId.substring(0, 8) : 'none') +
-      ' reason=turn-settled' +
+      ' reason=' + refreshReason +
       ' abs=' + perfAbsNow().toFixed(1)
     );
-    void loadTimeline('turn-settled');
-  }, [isTurnBusy, loadTimeline, sessionId, tabId]);
+    void loadTimeline(refreshReason);
+  }, [isTurnBusy, isVisible, loadTimeline, sessionId, tabId]);
 
   // effect: loadTimeline callback identity changes (sessionId/cwd/tabId/isGemini) → trigger initial timeline load
   useEffect(() => {
@@ -2883,32 +2896,34 @@ function Timeline({
     const onTranscriptChanged = (_event: any, detail: any) => {
       if (detail?.sessionId !== sessionId) return;
       if (detail?.toolType && detail.toolType !== toolType) return;
-      if (isTurnBusyRef.current) {
-        deferredTranscriptRefreshRef.current = true;
+      const busy = isTurnBusyRef.current;
+      const surfaceVisible = isVisibleRef.current;
+      const documentVisible = document.visibilityState === 'visible';
+      const plan = planTimelineTranscriptRefresh({
+        pending: deferredTranscriptRefreshRef.current,
+        invalidation: true,
+        isTurnBusy: busy,
+        documentVisible,
+        surfaceVisible,
+      });
+      deferredTranscriptRefreshRef.current = plan.pending;
+      if (!plan.refresh) {
+        const deferredReason = busy ? 'turn-busy' : 'surface-hidden';
+        deferredTranscriptReasonRef.current = deferredReason;
         console.warn(
           '[Timeline:TranscriptDeferred]' +
           ' inst=' + timelineInstanceIdRef.current +
           ' tab=' + tabId.slice(-8) +
           ' session=' + sessionId.substring(0, 8) +
-          ' reason=turn-busy' +
+          ' reason=' + deferredReason +
           ' source=' + (detail?.reason || 'changed') +
-          ' abs=' + perfAbsNow().toFixed(1)
-        );
-        return;
-      }
-      if (document.visibilityState !== 'visible' || !isVisibleRef.current) {
-        console.warn(
-          '[Timeline:TranscriptDeferred]' +
-          ' inst=' + timelineInstanceIdRef.current +
-          ' tab=' + tabId.slice(-8) +
-          ' session=' + sessionId.substring(0, 8) +
-          ' reason=' + (detail?.reason || 'changed') +
-          ' visible=' + isVisibleRef.current +
+          ' visible=' + surfaceVisible +
           ' doc=' + document.visibilityState +
           ' abs=' + perfAbsNow().toFixed(1)
         );
         return;
       }
+      deferredTranscriptReasonRef.current = null;
       queueRefresh('transcript-change');
     };
 
@@ -2948,7 +2963,24 @@ function Timeline({
           cwd,
           reason: 'visibility-resume',
         }).catch(() => {});
-        queueRefresh('visibility-resume');
+        const plan = planTimelineTranscriptRefresh({
+          pending: deferredTranscriptRefreshRef.current,
+          // Visibility resume is itself a reconciliation boundary: filesystem
+          // invalidations may have been throttled while the document was hidden.
+          invalidation: true,
+          isTurnBusy: isTurnBusyRef.current,
+          documentVisible: true,
+          surfaceVisible: isVisibleRef.current,
+        });
+        deferredTranscriptRefreshRef.current = plan.pending;
+        if (plan.refresh) {
+          deferredTranscriptReasonRef.current = null;
+          queueRefresh('visibility-resume');
+        } else {
+          deferredTranscriptReasonRef.current = isTurnBusyRef.current
+            ? 'turn-busy'
+            : 'surface-hidden';
+        }
       }
     };
     document.addEventListener('visibilitychange', onVis);

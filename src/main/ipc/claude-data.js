@@ -15,6 +15,9 @@ const {
 const {
   decorateHistoryPromptPresentations,
 } = require('../history-prompt-presentations');
+const {
+  decorateHistoryResponseTimings,
+} = require('../history-response-timings');
 
 let _projectManager = null;
 let _getClaudeEditableLastPromptState = null;
@@ -4082,9 +4085,13 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       const presentationRevision = _projectManager?.db?.getHistoryPromptPresentationRevision
         ? _projectManager.db.getHistoryPromptPresentationRevision('claude', sessionId)
         : 'none';
+      const responseTimingRevision = _projectManager?.db?.getHistoryResponseTimingRevision
+        ? _projectManager.db.getHistoryResponseTimingRevision('claude', sessionId, tabId || null)
+        : 'none';
       const revisionContext = JSON.stringify({
         base: baseRevisionContext,
         promptPresentationRevision: presentationRevision,
+        responseTimingRevision,
       });
 
       if (ifRevision && !promptStateLookupFailed) {
@@ -4101,7 +4108,11 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
           !_projectManager?.db?.getHistoryPromptPresentationRevision
           || _projectManager.db.getHistoryPromptPresentationRevision('claude', sessionId)
             === presentationRevision;
-        if (validation.unchanged && presentationStillCurrent) {
+        const responseTimingStillCurrent =
+          !_projectManager?.db?.getHistoryResponseTimingRevision
+          || _projectManager.db.getHistoryResponseTimingRevision('claude', sessionId, tabId || null)
+            === responseTimingRevision;
+        if (validation.unchanged && presentationStillCurrent && responseTimingStillCurrent) {
           return {
             success: true,
             unchanged: true,
@@ -4583,14 +4594,40 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         sessionId,
         entries,
       });
-      // A pending sidecar can become bound to an exact UUID while decorating.
+      let responseTimingBound = false;
+      const timedEntries = decorateHistoryResponseTimings(_projectManager?.db, {
+        toolType: 'claude',
+        sessionId,
+        tabId,
+        entries: presentedEntries,
+        onBound: () => {
+          responseTimingBound = true;
+        },
+      });
+      if (
+        responseTimingBound
+        && tabId
+        && event?.sender
+        && (typeof event.sender.isDestroyed !== 'function' || !event.sender.isDestroyed())
+      ) {
+        event.sender.send('agent-activity:timing-changed', {
+          tabId,
+          busy: false,
+          reason: 'history-response-bound',
+        });
+      }
+      // Pending sidecars can become bound to exact UUIDs while decorating.
       // Return a revision that includes that final metadata state.
       const finalPresentationRevision = _projectManager?.db?.getHistoryPromptPresentationRevision
         ? _projectManager.db.getHistoryPromptPresentationRevision('claude', sessionId)
         : 'none';
+      const finalResponseTimingRevision = _projectManager?.db?.getHistoryResponseTimingRevision
+        ? _projectManager.db.getHistoryResponseTimingRevision('claude', sessionId, tabId || null)
+        : 'none';
       const finalRevisionContext = JSON.stringify({
         base: baseRevisionContext,
         promptPresentationRevision: finalPresentationRevision,
+        responseTimingRevision: finalResponseTimingRevision,
       });
       const revision = buildHistoryRevision(
         { toolType: 'claude', sessionId, cwd },
@@ -4600,7 +4637,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       return {
         success: true,
         unchanged: false,
-        entries: presentedEntries,
+        entries: timedEntries,
         latestSessionId,
         claudeMemoryBoundaryUuid: _firstOrphanRecoveredFromUuid,
         editableLastPromptStatus,

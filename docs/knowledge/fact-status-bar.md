@@ -20,8 +20,8 @@ VSCode-style полоса по всей нижней границе окна (п
 
 | Элемент | Назначение | Persistence |
 |---|---|---|
-| Компактный Claude chip + popup | Default Claude model и effort для будущих Claude PTY-сессий (`none / default / sonnet / opus / haiku`, `none / low / med / high / xhi / max / ultra`) | SQLite `app:setState(defaultClaudeModel/defaultClaudeEffort)` + localStorage boot mirror |
-| Компактный Codex chip + popup | Default Codex model и reasoning effort для будущих Codex CLI-запусков (`none` + live список из `codex debug models`, effort с учётом выбранной модели) | SQLite `app:setState(defaultCodexModel/defaultCodexEffort)` + localStorage boot mirror |
+| Компактный Claude chip + popup | Default Claude model и effort для будущих Claude PTY-сессий: только видимые модели и отмеченные effort выбранной строки | SQLite `app:setState(defaultClaudeModel/defaultClaudeEffort)` + localStorage boot mirror |
+| Компактный Codex chip + popup | Default Codex model и reasoning effort для будущих Codex CLI-запусков: только видимые модели и effort, пережившие merge с live-каталогом | SQLite `app:setState(defaultCodexModel/defaultCodexEffort)` + localStorage boot mirror |
 | `● kill dev-ports` toggle | Перед каждым запуском npm-скрипта убивать занятые порты проекта | SQLite `app:setState(freePortsBeforeStart)` + localStorage boot mirror |
 | `● bridges` toggle | Подсвечивать невидимые hover-мосты красным (через `HoverBridgeDebug`) | SQLite `app:setState(debugHoverBridges)` + localStorage boot mirror |
 | `! N` оранжевый chip | Счётчик невалидных файловых путей в AI-промптах (рендерится только если N > 0) | derived, не persist |
@@ -43,7 +43,7 @@ VSCode-style полоса по всей нижней границе окна (п
 
 ## Model/Effort selector: tri-mode trigger
 
-Chip-trigger в status bar открывает popup тремя путями. В свёрнутом chip остаются иконка движка, модель и effort: текст `Claude`/`Codex` и дублирующая шестерёнка намеренно убраны, но полные подписи остаются внутри раскрытия. Model и Effort используют один interaction pattern: StatusBar хранит **global default для будущих запусков**, а не пытается быть per-tab индикатором текущей живой сессии. Для Claude это future TUI startup chain, для Codex - future CLI launch args.
+Chip-trigger в status bar открывает popup тремя путями. В свёрнутом chip остаются иконка движка, модель и effort: текст `Claude`/`Codex` и дублирующая шестерёнка намеренно убраны, но полные подписи остаются внутри раскрытия. Model и Effort используют один interaction pattern: StatusBar хранит **global default для будущих запусков**, а не пытается быть per-tab индикатором текущей живой сессии. Для Claude это future TUI startup chain, для Codex - future CLI launch args. Списки не дублируют собственный каталог: они берут нормализованные Settings, поэтому удалённая/скрытая модель или отключённый effort не может остаться ложным default после сохранения.
 
 | Trigger | Состояние | Закрытие |
 |---|---|---|

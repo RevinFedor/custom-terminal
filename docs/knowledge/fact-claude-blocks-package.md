@@ -260,6 +260,12 @@ Claude — `toolUseResult.structuredPatch`. Совпадение по одном
 не даёт права присоединить координаты к карточке: лучше потерять номера, чем показать
 их от соседнего edit.
 
+Все `diffHunks` одной action остаются одной смысловой прокручиваемой сущностью:
+вертикальным scroll-owner является общий `.cb-diff-hunks`, а дочерние `.cb-diff`
+показывают полную высоту. Иначе короткий первый hunk и длинный последний получают
+разные wheel-контейнеры, а fallback routing прокручивает не тот фрагмент. Одиночный
+legacy/fallback `.cb-diff` без hunk-wrapper сохраняет собственный scroll.
+
 ## `SparklesIcon` — иконка prompt-чипа
 Добавлена `SparklesIcon` (`icons/index.tsx`, экспорт в `index.ts`) — геометрия sparkles
 из десктопного prompt-чипа voice-record, чтобы prompt-чип выглядел одинаково на десктопе

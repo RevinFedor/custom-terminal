@@ -14,13 +14,17 @@ const {
   classifyCodexWriterHandoffSettlement,
   claimExclusiveActionReservation,
   claimCodexResumeSourceLease,
+  isRetryableCodexDescriptorProbeTimeout,
   parseLsofFieldRecords,
   releaseExclusiveActionReservation,
   releaseCodexResumeSourceLeases,
+  runCodexDescriptorProbeWithSingleRetry,
   resolveCompleteCodexWriterProof,
   resolveCodexUserWriterProof,
   resolveCodexWriterProof,
   isCommittedCodexNativeRewindReplay,
+  resolveCodexRewindCompletionProof,
+  shouldCloseCodexRewindProtocolUi,
   classifyCodexWriterObservationScope,
   deriveCodexSettledWriterProofScope,
   shouldUseSettledCodexRewindWriterProof,
@@ -29,10 +33,26 @@ const {
   isCodexWriterProofOwnershipQuarantined,
   runKeyedExclusive,
   runKeyedSingleFlight,
+  shouldRetryCodexDescriptorProbePass,
   writableCodexRolloutsFromLsof,
 } = require('./codex-writer-ownership');
 
-test('manual Codex Enter loses only to a submitted identity-pending operation or foreign reservation', () => {
+test('Rewind failure cleanup closes only a proven pre-commit protocol UI', () => {
+  assert.equal(shouldCloseCodexRewindProtocolUi({
+    protocolUiOpen: false,
+    handoffMutationStarted: false,
+  }), false, 'idle composer must never receive a blind Escape cleanup');
+  assert.equal(shouldCloseCodexRewindProtocolUi({
+    protocolUiOpen: true,
+    handoffMutationStarted: false,
+  }), true);
+  assert.equal(shouldCloseCodexRewindProtocolUi({
+    protocolUiOpen: true,
+    handoffMutationStarted: true,
+  }), false, 'after Enter no cleanup key may guess the current TUI state');
+});
+
+test('manual Codex Enter loses only to an already-submitted first write or foreign reservation', () => {
   assert.deepEqual(classifyManualCodexSubmitAfterWriteQueue({
     activeOperation: { kind: 'codex-model-effort-picker' },
   }), {
@@ -68,6 +88,13 @@ test('manual Codex Enter loses only to a submitted identity-pending operation or
   assert.equal(classifyManualCodexSubmitAfterWriteQueue({
     precedingOperation: { identityPending: false, submitted: true },
   }).suppress, false);
+  assert.equal(classifyManualCodexSubmitAfterWriteQueue({
+    precedingOperation: {
+      kind: 'safe-paste',
+      identityPending: false,
+      submitted: true,
+    },
+  }).reason, 'preceding-first-submit-won');
 
   const ownReservation = { launchId: 'launch-a' };
   assert.equal(classifyManualCodexSubmitAfterWriteQueue({
@@ -164,6 +191,126 @@ test('one candidate plus one failed process inspection is unknown, not owned', (
   assert.equal(proof.status, 'unknown');
   assert.equal(proof.partialProofStatus, 'owned');
   assert.deepEqual(proof.candidates.map((candidate) => candidate.filePath), [filePath]);
+});
+
+test('descriptor retry classification accepts only timeout-shaped observer failures', () => {
+  assert.equal(isRetryableCodexDescriptorProbeTimeout({
+    killed: true,
+    signal: 'SIGTERM',
+  }), true);
+  assert.equal(isRetryableCodexDescriptorProbeTimeout({
+    killed: true,
+    signal: 'SIGKILL',
+  }), true);
+  assert.equal(isRetryableCodexDescriptorProbeTimeout({ code: 'ETIMEDOUT' }), true);
+  assert.equal(isRetryableCodexDescriptorProbeTimeout({ code: 1 }), false);
+  assert.equal(isRetryableCodexDescriptorProbeTimeout({ code: 'EACCES' }), false);
+
+  assert.equal(shouldRetryCodexDescriptorProbePass({
+    status: 'unknown',
+    failures: [{ retryableTimeout: true }, { retryableTimeout: true }],
+  }), true);
+  assert.equal(shouldRetryCodexDescriptorProbePass({
+    status: 'unknown',
+    failures: [{ retryableTimeout: true }, { retryableTimeout: false }],
+  }), false);
+  assert.equal(shouldRetryCodexDescriptorProbePass({
+    status: 'unknown',
+    failures: [],
+  }), false);
+  assert.equal(shouldRetryCodexDescriptorProbePass({
+    status: 'owned',
+    failures: [{ retryableTimeout: true }],
+  }), false);
+});
+
+test('descriptor proof retries one complete timeout pass and never weakens unknown', async () => {
+  const attempts = [];
+  const recovered = await runCodexDescriptorProbeWithSingleRetry(async (attempt) => {
+    attempts.push(attempt);
+    if (attempt === 1) {
+      return {
+        status: 'unknown',
+        error: '101:lsof timeout',
+        failures: [{ pid: 101, retryableTimeout: true }],
+      };
+    }
+    return { status: 'owned', sessionId: 'writer-a', failures: [] };
+  });
+  assert.deepEqual(attempts, [1, 2]);
+  assert.equal(recovered.status, 'owned');
+  assert.equal(recovered.descriptorRetry.attempted, true);
+  assert.equal(recovered.descriptorRetry.recovered, true);
+
+  let persistentAttempts = 0;
+  const persistent = await runCodexDescriptorProbeWithSingleRetry(async () => {
+    persistentAttempts += 1;
+    return {
+      status: 'unknown',
+      error: '101:lsof timeout',
+      failures: [{ pid: 101, retryableTimeout: true }],
+    };
+  });
+  assert.equal(persistentAttempts, 2);
+  assert.equal(persistent.status, 'unknown');
+  assert.equal(persistent.descriptorRetry.recovered, false);
+
+  let nonTimeoutAttempts = 0;
+  const nonTimeout = await runCodexDescriptorProbeWithSingleRetry(async () => {
+    nonTimeoutAttempts += 1;
+    return {
+      status: 'unknown',
+      error: '101:EACCES',
+      failures: [{ pid: 101, retryableTimeout: false }],
+    };
+  });
+  assert.equal(nonTimeoutAttempts, 1);
+  assert.equal(nonTimeout.status, 'unknown');
+  assert.equal(nonTimeout.descriptorRetry, undefined);
+});
+
+test('descriptor proof retry fails closed when launch generation changes', async () => {
+  let current = true;
+  let attempts = 0;
+  const changedBefore = await runCodexDescriptorProbeWithSingleRetry(async () => {
+    attempts += 1;
+    current = false;
+    return {
+      status: 'unknown',
+      error: '101:lsof timeout',
+      failures: [{ pid: 101, retryableTimeout: true }],
+    };
+  }, {
+    isGenerationCurrent: () => current,
+  });
+  assert.equal(attempts, 1);
+  assert.equal(changedBefore.status, 'unknown');
+  assert.equal(
+    changedBefore.error,
+    'writer_process_generation_changed_before_descriptor_retry',
+  );
+
+  current = true;
+  attempts = 0;
+  const changedAfter = await runCodexDescriptorProbeWithSingleRetry(async (attempt) => {
+    attempts += 1;
+    if (attempt === 2) current = false;
+    return attempt === 1
+      ? {
+        status: 'unknown',
+        error: '101:lsof timeout',
+        failures: [{ pid: 101, retryableTimeout: true }],
+      }
+      : { status: 'owned', sessionId: 'writer-a', failures: [] };
+  }, {
+    isGenerationCurrent: () => current,
+  });
+  assert.equal(attempts, 2);
+  assert.equal(changedAfter.status, 'unknown');
+  assert.equal(
+    changedAfter.error,
+    'writer_process_generation_changed_after_descriptor_retry',
+  );
 });
 
 test('user TUI writer stays authoritative while collaboration subagents are writable', async () => {
@@ -268,6 +415,66 @@ test('explicit native Rewind does not accept a sole still-open source rollout', 
   assert.equal(proof.status, 'ambiguous');
   assert.equal(proof.reason, 'handoff-branch-unresolved');
   assert.equal(proof.handoffProof.reason, 'no-proven-descendant');
+});
+
+test('log fixture: exact durable Rewind may keep the sole source rollout on the same PTY generation', async () => {
+  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sourceSessionId = '019f8f94-993d-7011-ad76-a29419fcd523';
+  const source = sessionsDir + '/2026/07/23/rollout-2026-07-23T18-25-08-'
+    + sourceSessionId + '.jsonl';
+  const actionGeneration = 'codex-writer-handoff-1784896350953-4';
+  const descriptorProof = resolveCodexWriterProof([{
+    pid: 8928,
+    output: `p8928\nf20\nau\nn${source}\n`,
+  }], sessionsDir);
+  const stableSourceProof = {
+    kind: 'native-rewind-stable-source',
+    sessionId: sourceSessionId,
+    actionGeneration,
+    journalPhase: 'rollback-applied',
+    rollbackDurable: true,
+    terminalGenerationMatches: true,
+    runSeqMatches: true,
+    boundSessionMatches: true,
+    appliedAtMs: 1784896352330,
+  };
+  const handoff = {
+    kind: 'native-rewind',
+    sourceSessionId,
+    actionGeneration,
+    observerGeneration: actionGeneration,
+    actionStartedAtMs: 1784896351138,
+    liveProofs: [],
+    stableSourceProof,
+  };
+  const metadata = new Map([
+    [source, { meta: { id: sourceSessionId, source: 'cli' } }],
+  ]);
+
+  const proof = await resolveCodexUserWriterProof(descriptorProof, {
+    readMetadata: async (filePath) => metadata.get(filePath),
+    isUserSession: () => true,
+    handoff,
+  });
+
+  assert.equal(proof.status, 'owned');
+  assert.equal(proof.filePath, source);
+  assert.equal(proof.handoffProof.lineageRelation, 'stable-source');
+  assert.equal(proof.handoffProof.stableSourceProof.rollbackDurable, true);
+
+  const sibling = sessionsDir + '/rollout-unrelated.jsonl';
+  const ambiguousDescriptor = resolveCodexWriterProof([{
+    pid: 8928,
+    output: `p8928\nf20\nau\nn${source}\nf21\nau\nn${sibling}\n`,
+  }], sessionsDir);
+  metadata.set(sibling, { meta: { id: 'unrelated', source: 'cli' } });
+  const ambiguous = await resolveCodexUserWriterProof(ambiguousDescriptor, {
+    readMetadata: async (filePath) => metadata.get(filePath),
+    isUserSession: () => true,
+    handoff,
+  });
+  assert.equal(ambiguous.status, 'ambiguous');
+  assert.equal(ambiguous.handoffProof.reason, 'no-proven-descendant');
 });
 
 test('explicit native Rewind accepts a sole child only with exact live proof', async () => {
@@ -615,6 +822,12 @@ test('a queued observer accepts only the exact already-committed native Rewind t
   }), false);
   assert.equal(isCommittedCodexNativeRewindReplay({
     ...base,
+    candidateSessionId: 'source-a',
+    proof: { ...proof, sessionId: 'source-a' },
+    boundSessionId: 'source-a',
+  }), false, 'stable source cannot impersonate an already-committed child');
+  assert.equal(isCommittedCodexNativeRewindReplay({
+    ...base,
     terminalToken: {},
   }), false);
   assert.equal(isCommittedCodexNativeRewindReplay({
@@ -629,6 +842,44 @@ test('a queued observer accepts only the exact already-committed native Rewind t
     ...base,
     observerCurrent: false,
   }), false, 'a replaced observer cannot replay a completed handoff');
+});
+
+test('Rewind completion accepts either stable source or the exact child commit that consumed its journal', () => {
+  assert.deepEqual(resolveCodexRewindCompletionProof({
+    committedChildBeforeStableProof: true,
+  }), {
+    success: true,
+    proofMode: 'committed-child',
+    racedWithStableSourceProof: false,
+  });
+  assert.deepEqual(resolveCodexRewindCompletionProof({
+    stableSourceProof: { success: true },
+  }), {
+    success: true,
+    proofMode: 'stable-source',
+    racedWithStableSourceProof: false,
+  });
+  assert.deepEqual(resolveCodexRewindCompletionProof({
+    stableSourceProof: {
+      success: false,
+      error: 'codex_rewind_stable_source_proof_invalid',
+    },
+    committedChildAfterStableProof: true,
+  }), {
+    success: true,
+    proofMode: 'committed-child',
+    racedWithStableSourceProof: true,
+  }, 'an exact child commit may win while the stable-source CAS is in flight');
+  assert.deepEqual(resolveCodexRewindCompletionProof({
+    stableSourceProof: {
+      success: false,
+      error: 'codex_rewind_stable_source_proof_invalid',
+    },
+  }), {
+    success: false,
+    proofMode: 'unresolved',
+    error: 'codex_rewind_stable_source_proof_invalid',
+  }, 'missing journal without an exact child proof remains a hard failure');
 });
 
 test('writer observation becomes stale before it may invalidate a newer proof', () => {
@@ -780,6 +1031,8 @@ test('branch handoff settles only when the adopted writer matches the exact prov
     settled: true,
     absent: false,
     branchWriterProven: true,
+    stableWriterProven: false,
+    writerHandoffProven: true,
     handoffReason: 'proven-descendant',
   });
   assert.equal(classifyCodexBranchWriterHandoffSettlement({
@@ -801,6 +1054,42 @@ test('branch handoff settles only when the adopted writer matches the exact prov
   });
   assert.equal(wrongWriter.sessionStatus, 'starting');
   assert.equal(wrongWriter.handoffReason, 'adopted-session-mismatch');
+});
+
+test('stable source settlement requires the exact durable same-generation Rewind proof', () => {
+  const selection = {
+    status: 'selected',
+    sessionId: 'source',
+    actionGeneration: 'rewind-source',
+    lineageRelation: 'stable-source',
+    stableSourceProof: { rollbackDurable: true },
+  };
+  const settled = classifyCodexBranchWriterHandoffSettlement({
+    selection,
+    actionGeneration: 'rewind-source',
+    observerGeneration: 'rewind-source',
+    adoptedSessionId: 'source',
+    adoptionStatus: 'adopted',
+    processRunning: true,
+    tuiReady: true,
+  });
+  assert.equal(settled.settled, true);
+  assert.equal(settled.branchWriterProven, false);
+  assert.equal(settled.stableWriterProven, true);
+  assert.equal(settled.writerHandoffProven, true);
+  assert.equal(settled.handoffReason, 'proven-stable-source');
+
+  const stale = classifyCodexBranchWriterHandoffSettlement({
+    selection,
+    actionGeneration: 'rewind-source',
+    observerGeneration: 'other-generation',
+    adoptedSessionId: 'source',
+    adoptionStatus: 'adopted',
+    processRunning: true,
+    tuiReady: true,
+  });
+  assert.equal(stale.settled, false);
+  assert.equal(stale.stableWriterProven, false);
 });
 
 test('unreadable writable candidate makes the complete writer proof unknown', async () => {

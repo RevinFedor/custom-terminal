@@ -8,6 +8,9 @@ const {
 const {
   decorateHistoryPromptPresentations,
 } = require('./history-prompt-presentations');
+const {
+  decorateHistoryResponseTimings,
+} = require('./history-response-timings');
 
 function shortId(value, n = 8) {
   return String(value || '').slice(0, n);
@@ -242,8 +245,12 @@ class SessionTranscriptService {
       const presentationRevision = this.promptPresentationStore?.getHistoryPromptPresentationRevision
         ? this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
         : 'none';
+      const responseTimingRevision = this.promptPresentationStore?.getHistoryResponseTimingRevision
+        ? this.promptPresentationStore.getHistoryResponseTimingRevision(toolType, sessionId, payload.tabId || null)
+        : 'none';
       const revisionContext = JSON.stringify({
         promptPresentationRevision: presentationRevision,
+        responseTimingRevision,
       });
       if (payload.ifRevision) {
         const validation = await validateHistoryRevision(
@@ -261,7 +268,11 @@ class SessionTranscriptService {
           || !this.promptPresentationStore?.getHistoryPromptPresentationRevision
           || this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
             === presentationRevision;
-        if (validation.unchanged && presentationStillCurrent) {
+        const responseTimingStillCurrent = !validation.unchanged
+          || !this.promptPresentationStore?.getHistoryResponseTimingRevision
+          || this.promptPresentationStore.getHistoryResponseTimingRevision(toolType, sessionId, payload.tabId || null)
+            === responseTimingRevision;
+        if (validation.unchanged && presentationStillCurrent && responseTimingStillCurrent) {
           return {
             success: true,
             unchanged: true,
@@ -277,11 +288,34 @@ class SessionTranscriptService {
         sessionId,
         entries,
       });
-      // Decoration can bind a pending audit row to its exact durable UUID.
-      // Build the returned revision after that mutation so the renderer never
-      // caches a token that predates the presentation it just received.
+      let responseTimingBound = false;
+      const timedEntries = decorateHistoryResponseTimings(this.promptPresentationStore, {
+        toolType,
+        sessionId,
+        tabId: payload.tabId || null,
+        entries: presentedEntries,
+        onBound: () => {
+          responseTimingBound = true;
+        },
+      });
+      if (responseTimingBound && payload.tabId) {
+        const mainWindow = this.getMainWindow?.();
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('agent-activity:timing-changed', {
+            tabId: payload.tabId,
+            busy: false,
+            reason: 'history-response-bound',
+          });
+        }
+      }
+      // Decoration can bind pending prompt/timing rows to exact durable UUIDs.
+      // Build the returned revision after those mutations so the renderer
+      // never caches a token that predates the presentation it just received.
       const finalPresentationRevision = this.promptPresentationStore?.getHistoryPromptPresentationRevision
         ? this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
+        : 'none';
+      const finalResponseTimingRevision = this.promptPresentationStore?.getHistoryResponseTimingRevision
+        ? this.promptPresentationStore.getHistoryResponseTimingRevision(toolType, sessionId, payload.tabId || null)
         : 'none';
       const revision = buildHistoryRevision(
         { toolType, sessionId, cwd },
@@ -289,13 +323,14 @@ class SessionTranscriptService {
         {
           context: JSON.stringify({
             promptPresentationRevision: finalPresentationRevision,
+            responseTimingRevision: finalResponseTimingRevision,
           }),
         }
       );
       return {
         success: true,
         unchanged: false,
-        entries: presentedEntries,
+        entries: timedEntries,
         claudeMemoryBoundaryUuid: null,
         filePath: loaded.filePath,
         revision,

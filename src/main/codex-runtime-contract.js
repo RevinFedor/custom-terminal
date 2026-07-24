@@ -249,6 +249,38 @@ function planCodexPickerMovement(selectedIndex, targetIndex) {
   };
 }
 
+function resolveCodexPickerCurrentWriterSessionId({
+  provenWriterSessionId = null,
+  provisionalWriterSessionId = null,
+  provisionalAuthorized = false,
+  sameTerminal = false,
+  sameRunSeq = false,
+  sameLaunch = false,
+  sameDiscovery = false,
+  sameLease = false,
+  hasInflight = false,
+} = {}) {
+  const proven = typeof provenWriterSessionId === 'string'
+    ? (provenWriterSessionId.trim() || null)
+    : null;
+  if (proven) return proven;
+
+  const provisional = typeof provisionalWriterSessionId === 'string'
+    ? (provisionalWriterSessionId.trim() || null)
+    : null;
+  if (!provisional
+    || provisionalAuthorized !== true
+    || sameTerminal !== true
+    || sameRunSeq !== true
+    || sameLaunch !== true
+    || sameDiscovery !== true
+    || sameLease !== true
+    || hasInflight === true) {
+    return null;
+  }
+  return provisional;
+}
+
 function validateCodexPickerRuntimeAdmission({
   sameTerminal = false,
   expectedRunSeq = 0,
@@ -304,6 +336,10 @@ function validateCodexPickerRuntimeAdmission({
   return { allowed: true, reason: null };
 }
 
+function codexLiveSlashAllowsTurnBusy(command) {
+  return /^\/fast$/i.test(String(command || '').trim());
+}
+
 function attachCodexSettingsProofOwner(result, currentWriterSessionId = null) {
   const projectedResult = result && typeof result === 'object'
     ? result
@@ -349,8 +385,22 @@ function createPendingCodexSettingsProofHandoff({
   const model = typeof result?.model === 'string' ? result.model.trim() : '';
   const effort = typeof result?.effort === 'string' ? result.effort.trim().toLowerCase() : '';
   const proofAt = Number(result?.proofAt) || Number(appliedAt) || Date.now();
+  const proofSource = String(
+    result?.applicationProofSource
+    || result?.configProofSource
+    || 'exact-picker-success',
+  ).trim();
+  const launchRequestOnly = new Set([
+    'fresh-launch-command-line',
+    'persistent-fallback',
+    'new-thread-without-conversation-only-effort',
+    'tab-or-explicit',
+    'global',
+    'native',
+  ]).has(proofSource);
   if (!isCodexSettingsApplicationProven(result)
     || result?.codexSettingsProofSessionId
+    || launchRequestOnly
     || !model
     || !effort
     || !Number.isFinite(proofAt)
@@ -369,9 +419,32 @@ function createPendingCodexSettingsProofHandoff({
     proofAt,
     model,
     effort,
-    applicationProofSource: result.applicationProofSource
-      || result.configProofSource
-      || 'exact-picker-success',
+    ...(result?.fast === true ? { fast: true } : {}),
+    applicationProofSource: proofSource,
+  };
+}
+
+function projectPendingCodexSettingsProofOwner(pending, {
+  terminalToken = null,
+  runSeq = 0,
+  expectedOwnerId = null,
+} = {}) {
+  if (!pending || pending.generationMode !== 'launch' || !pending.launchId) {
+    return null;
+  }
+  const ownerId = 'launch:' + pending.launchId;
+  if (expectedOwnerId && expectedOwnerId !== ownerId) return null;
+  if (!terminalToken || pending.terminalToken !== terminalToken) return null;
+  if (Number(pending.runSeq) !== Number(runSeq)) return null;
+  if (!pending.model || !pending.effort) return null;
+  return {
+    ownerId,
+    launchId: pending.launchId,
+    model: pending.model,
+    effort: pending.effort,
+    fast: pending.fast === true,
+    proofAt: pending.proofAt,
+    applicationProofSource: pending.applicationProofSource,
   };
 }
 
@@ -484,6 +557,7 @@ function isCodexComposerReadyForGuardedSend(status) {
 module.exports = {
   advanceOscCommandGeneration,
   attachCodexSettingsProofOwner,
+  codexLiveSlashAllowsTurnBusy,
   codexSessionIdFromAuthoritativeStatus,
   consumePendingCodexSettingsProofHandoff,
   createCodexLaunchPendingResult,
@@ -495,8 +569,10 @@ module.exports = {
   planCodexCommandLaunchSettings,
   planCodexLaunchSettings,
   planCodexPickerMovement,
+  projectPendingCodexSettingsProofOwner,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
+  resolveCodexPickerCurrentWriterSessionId,
   shouldClearCodexLaunchPending,
   shouldHoldCodexStartingOnAbsent,
   shouldSurfaceCodexStartupTimeout,

@@ -162,12 +162,17 @@ export function resolveCodexEffectiveSettings({
   const liveOwner = typeof codexLiveSettingsSessionId === 'string'
     ? codexLiveSettingsSessionId.trim()
     : '';
-  const liveOwned = !!sessionId && liveOwner === sessionId;
+  const launchOwned = !sessionId && /^launch:.+/.test(liveOwner);
+  const liveOwned = (!!sessionId && liveOwner === sessionId) || launchOwned;
   return {
     model: liveOwned && codexLiveModel ? codexLiveModel : codexModel,
     effort: liveOwned && codexLiveEffort ? codexLiveEffort : codexEffort,
     liveOwned,
-    source: liveOwned ? 'live-conversation' : 'persistent-fallback',
+    source: launchOwned
+      ? 'verified-launch-composer'
+      : liveOwned
+        ? 'live-conversation'
+        : 'persistent-fallback',
   };
 }
 
@@ -190,13 +195,19 @@ export function planCodexPickerStateApplication({
   const effort = result?.effortSkipped
     ? ''
     : String(result?.effort || requestedEffort || '').trim().toLowerCase();
+  const provisionalOwner = String(result?.codexProvisionalSettingsOwnerId || '').trim();
 
   if (!model) {
     return { allowed: false, code: 'codex_picker_model_missing' };
   }
 
   if (applicationMode === 'conversation-only') {
-    const owner = String(result?.codexSettingsProofSessionId || liveSessionId || '').trim();
+    const owner = String(
+      result?.codexSettingsProofSessionId
+      || provisionalOwner
+      || liveSessionId
+      || '',
+    ).trim();
     if (!owner) {
       return { allowed: false, code: 'codex_conversation_settings_owner_missing' };
     }
@@ -230,21 +241,30 @@ export function planCodexPickerStateApplication({
   if (effort === 'ultra') {
     return { allowed: false, code: 'codex_ultra_requires_live_conversation' };
   }
+  const resolvedEffort = effort || currentPersistentEffort || '';
   return {
     allowed: true,
     applicationMode,
     model,
-    effort: effort || currentPersistentEffort || '',
+    effort: resolvedEffort,
     persistentPatch: {
       codexModel: model || currentPersistentModel,
       ...(effort ? { codexEffort: effort } : {}),
-      codexSettingsProofSessionId: result?.codexSettingsProofSessionId || undefined,
+      codexSettingsProofSessionId: provisionalOwner
+        ? undefined
+        : result?.codexSettingsProofSessionId || undefined,
     },
-    livePatch: {
-      codexLiveModel: undefined,
-      codexLiveEffort: undefined,
-      codexLiveSettingsSessionId: undefined,
-    },
+    livePatch: provisionalOwner
+      ? {
+        codexLiveModel: model,
+        codexLiveEffort: resolvedEffort,
+        codexLiveSettingsSessionId: provisionalOwner,
+      }
+      : {
+        codexLiveModel: undefined,
+        codexLiveEffort: undefined,
+        codexLiveSettingsSessionId: undefined,
+      },
   };
 }
 

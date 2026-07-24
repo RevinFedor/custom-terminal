@@ -2,12 +2,18 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  armCodexSuppressedCatchUpRelease,
   CODEX_NO_FINAL_RESULT_REASON,
   classifyCodexTurnRecord,
   classifyCodexTurnEvent,
+  completeCodexSuppressedCatchUpRelease,
+  configureCodexCatchUpSuppression,
+  deferCodexSourceProofRelease,
   observeCodexTurnRecord,
+  prepareCodexSourceProofReplay,
   projectCodexSuppressedCatchUpPublication,
   reduceCodexTurnOutcomeSummary,
+  takeCodexSourceProofReleaseAtScanBoundary,
   trackerHasFinalResultForEvent,
 } = require('./codex-turn-outcome');
 
@@ -204,4 +210,175 @@ test('linked catch-up publishes one final lifecycle outcome instead of every his
     timestamp: '2026-07-23T23:59:50.000Z',
     turnId: 'turn-final',
   });
+});
+
+test('provisional resume source publishes append-in-place lifecycle exactly once after writer proof', () => {
+  const state = {
+    offset: 120,
+    catchUpPending: false,
+    liveTurnEvents: 0,
+    busy: false,
+  };
+  configureCodexCatchUpSuppression(state, {
+    suppressBusy: true,
+    suppressPublic: true,
+  });
+  assert.equal(state.publicTurnStateSuppressed, true);
+  assert.equal(state.catchUpPublicationsSuppressed, true);
+
+  assert.equal(armCodexSuppressedCatchUpRelease(state, {
+    targetOffset: 240,
+    kind: 'source-proof-replay',
+  }), true);
+  state.offset = 240;
+  state.liveTurnEvents = 1;
+  state.busy = true;
+  state.lastEventType = 'task_started';
+  state.lastEventTs = '2026-07-24T09:51:32.520Z';
+  state.lastOutcomeReason = 'task_started';
+  state.lastOutcomeTurnId = 'turn-live';
+
+  const released = completeCodexSuppressedCatchUpRelease(state);
+  assert.deepEqual(released, {
+    released: true,
+    publication: {
+      busy: true,
+      reason: 'task_started',
+      outcome: {
+        event: 'task_started',
+        busy: true,
+        reason: 'task_started',
+        hasFinalResult: null,
+      },
+      timestamp: '2026-07-24T09:51:32.520Z',
+      turnId: 'turn-live',
+    },
+    kind: 'source-proof-replay',
+    targetOffset: 240,
+  });
+  assert.equal(state.publicTurnStateSuppressed, false);
+  assert.equal(state.catchUpPublicationsSuppressed, false);
+  assert.equal(state.catchUpPending, false);
+  assert.deepEqual(completeCodexSuppressedCatchUpRelease(state), {
+    released: false,
+    publication: null,
+  });
+
+  const completed = classifyCodexTurnEvent('task_complete', {
+    turn_id: 'turn-live',
+    last_agent_message: 'Done.',
+  });
+  assert.deepEqual(completed, {
+    event: 'task_complete',
+    busy: false,
+    reason: 'task_complete',
+    hasFinalResult: true,
+  });
+  assert.deepEqual([
+    released.publication.busy,
+    completed.busy,
+  ], [true, false]);
+});
+
+test('suppressed replay stays provisional until the exact held byte range is read successfully', () => {
+  const state = {
+    offset: 120,
+    catchUpPending: false,
+    liveTurnEvents: 1,
+    busy: true,
+    lastEventType: 'task_started',
+  };
+  armCodexSuppressedCatchUpRelease(state, {
+    targetOffset: 240,
+    kind: 'source-proof-replay',
+  });
+
+  assert.deepEqual(completeCodexSuppressedCatchUpRelease(state), {
+    released: false,
+    publication: null,
+  });
+  state.offset = 240;
+  assert.deepEqual(completeCodexSuppressedCatchUpRelease(state, {
+    scanSucceeded: false,
+  }), {
+    released: false,
+    publication: null,
+  });
+  assert.equal(state.publicTurnStateSuppressed, true);
+  assert.equal(state.catchUpPublicationsSuppressed, true);
+});
+
+test('suppressed replay with start and completion publishes only the final idle outcome', () => {
+  const state = {
+    offset: 300,
+    catchUpPending: true,
+    liveTurnEvents: 2,
+    busy: false,
+    lastEventType: 'task_complete',
+    lastEventTs: '2026-07-24T09:53:06.774Z',
+    lastOutcomeReason: 'task_complete',
+    lastOutcomeHasFinalResult: true,
+    lastOutcomeTurnId: 'turn-finished',
+  };
+  armCodexSuppressedCatchUpRelease(state, {
+    targetOffset: 300,
+    kind: 'source-proof-replay',
+  });
+
+  const released = completeCodexSuppressedCatchUpRelease(state);
+  assert.equal(released.released, true);
+  assert.equal(released.publication.busy, false);
+  assert.equal(released.publication.reason, 'task_complete');
+});
+
+test('writer proof waits for an in-flight source scan before rewinding the held range', () => {
+  const state = {
+    scanning: true,
+    offset: 200,
+    partial: '',
+    sourceObservationLaunchId: 'launch-live',
+    sourceWriterProofPending: true,
+    sourceWriterReplayOffset: 100,
+    sourceWriterReplayPartial: 'held-partial',
+    catchUpGeneration: 4,
+  };
+
+  const deferred = deferCodexSourceProofRelease(state, {
+    sessionId: 'session-source',
+    reason: 'process-open-rollout',
+    launchId: 'launch-live',
+  });
+  assert.equal(deferred.deferred, true);
+  assert.equal(state.sourceObservationLaunchId, 'launch-live');
+  assert.equal(state.offset, 200);
+
+  // A later source chunk finishes while ownership is still provisional. It is
+  // held with the first chunk instead of being parsed as a public live delta.
+  state.offset = 300;
+  state.scanning = false;
+  const request = takeCodexSourceProofReleaseAtScanBoundary(state);
+  assert.deepEqual(request, {
+    sessionId: 'session-source',
+    reason: 'process-open-rollout',
+    launchId: 'launch-live',
+  });
+
+  const replay = prepareCodexSourceProofReplay(state);
+  assert.deepEqual(replay, {
+    prepared: true,
+    launchId: 'launch-live',
+    replayOffset: 100,
+    targetOffset: 300,
+  });
+  assert.equal(state.sourceObservationLaunchId, null);
+  assert.equal(state.offset, 100);
+  assert.equal(state.partial, 'held-partial');
+  assert.equal(state.releasePublicSuppressionTargetOffset, 300);
+  assert.equal(state.publicTurnStateSuppressed, true);
+  assert.equal(state.catchUpPublicationsSuppressed, true);
+
+  state.offset = 299;
+  assert.equal(completeCodexSuppressedCatchUpRelease(state).released, false);
+  state.offset = 300;
+  assert.equal(completeCodexSuppressedCatchUpRelease(state).released, true);
 });

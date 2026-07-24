@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import {
   DEFAULT_AI_COMPOSER_CHIP_THRESHOLD,
   haveSameComposerChips,
+  insertComposerTextAtSelection,
+  isPlainTextPasteShortcut,
+  isTerminalOnlyComposerDraft,
   MAX_AI_COMPOSER_CHIP_THRESHOLD,
   mergeComposerAuthoringSnapshot,
   MIN_AI_COMPOSER_CHIP_THRESHOLD,
@@ -75,6 +78,51 @@ test('chip threshold defaults to 800 and clamps to the supported range', () => {
 test('manual paste becomes a chip only after the configured threshold', () => {
   assert.equal(shouldCreatePasteChip('x'.repeat(800), 800), false);
   assert.equal(shouldCreatePasteChip('x'.repeat(801), 800), true);
+});
+
+test('terminal-only slash detection ignores leading whitespace but not ordinary text', () => {
+  assert.equal(isTerminalOnlyComposerDraft('/model'), true);
+  assert.equal(isTerminalOnlyComposerDraft(' \n\t /effort high'), true);
+  assert.equal(isTerminalOnlyComposerDraft('explain /model'), false);
+  assert.equal(isTerminalOnlyComposerDraft('   '), false);
+});
+
+test('plain-text paste shortcut accepts only Shift+Cmd+V', () => {
+  assert.equal(isPlainTextPasteShortcut({
+    code: 'KeyV',
+    metaKey: true,
+    shiftKey: true,
+  }), true);
+  assert.equal(isPlainTextPasteShortcut({
+    key: 'V',
+    metaKey: true,
+    shiftKey: true,
+  }), true);
+  assert.equal(isPlainTextPasteShortcut({
+    code: 'KeyV',
+    metaKey: true,
+    shiftKey: false,
+  }), false);
+  assert.equal(isPlainTextPasteShortcut({
+    code: 'KeyV',
+    metaKey: true,
+    shiftKey: true,
+    altKey: true,
+  }), false);
+});
+
+test('plain-text paste replaces the exact selection and returns the caret after inserted text', () => {
+  assert.deepEqual(insertComposerTextAtSelection({
+    text: 'before SELECT after',
+    insertedText: 'plain paste',
+    selectionStart: 7,
+    selectionEnd: 13,
+  }), {
+    text: 'before plain paste after',
+    caret: 18,
+    selectionStart: 18,
+    selectionEnd: 18,
+  });
 });
 
 test('serialization puts prompt chips first, paste wrappers second, and editable text last', () => {

@@ -7,6 +7,8 @@ import { terminalRegistry } from '../../utils/terminalRegistry';
 import { clearPendingResume, markPendingResume, isStaleAgainstPending } from '../../utils/pendingResume';
 import {
   DEEPSEEK_EFFORT_LEVELS,
+  claudeEffortsForModel,
+  resolveClaudeEffortForModel,
 } from '../../constants/claudeLevels';
 import {
   CODEX_EFFORT_LEVELS,
@@ -32,6 +34,7 @@ import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { getHistoryAgentRuntime, type AgentPtyStatus } from '../../utils/historyAgentRuntimes';
 import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { readCodexDraftAuthority } from '../../utils/codexDraftAuthority.mjs';
+import { isCodexRuntimeForkReady } from '../../utils/codexPtyPresence.mjs';
 import {
   planCodexLaunchSettingsPersistence,
   planCodexPickerStateApplication,
@@ -123,6 +126,23 @@ function InlineActionContent({
           }}
         />
       )}
+    </span>
+  );
+}
+
+function TerminalSourceMark({ size = 10 }: { size?: number }) {
+  return (
+    <span
+      aria-hidden="true"
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 1,
+        flexShrink: 0,
+      }}
+    >
+      <SquareTerminal size={size} strokeWidth={1.8} />
+      <span>→</span>
     </span>
   );
 }
@@ -663,6 +683,11 @@ export default function ClaudeControlBar({
   const [codexModels, setCodexModels] = useState<CodexModelOption[]>([]);
   const claudeCodeSettings = useUIStore((s) => s.claudeCodeSettings);
   const codexSettings = useUIStore((s) => s.codexSettings);
+  const quickClaudeReturnRef = useRef<{ model: string; effort: string } | null>(null);
+  const [quickClaudeApplied, setQuickClaudeApplied] = useState(false);
+  const [quickClaudeHover, setQuickClaudeHover] = useState(false);
+  const [quickClaudeRect, setQuickClaudeRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  const quickClaudeButtonRef = useRef<HTMLButtonElement | null>(null);
   const quickCodexReturnRef = useRef<{ model: string; effort: string } | null>(null);
   const [quickCodexApplied, setQuickCodexApplied] = useState(false);
   const [quickCodexHover, setQuickCodexHover] = useState(false);
@@ -692,7 +717,7 @@ export default function ClaudeControlBar({
     let cancelled = false;
     ipcRenderer.invoke('codex:list-models').then((res: any) => {
       if (cancelled) return;
-      const models = mergeCodexModelOptions(res?.models, codexSettings.models);
+      const models = mergeCodexModelOptions(res?.models, codexSettings.models, codexSettings.removedModelIds);
       if (models.length === 0) return;
       setCodexModels(models);
 
@@ -737,7 +762,39 @@ export default function ClaudeControlBar({
       }
     }).catch((e: any) => console.warn('[CodexControlBar] model list failed:', e));
     return () => { cancelled = true; };
-  }, [sessionType, tabId, defaultCodexModel, defaultCodexEffort, codexSettings.models]);
+  }, [sessionType, tabId, defaultCodexModel, defaultCodexEffort, codexSettings.models, codexSettings.removedModelIds]);
+
+  useEffect(() => {
+    if (sessionType !== 'codex') return;
+    let cancelled = false;
+    ipcRenderer.invoke('codex:get-runtime-session', { tabId, projectId })
+      .then((snapshot: any) => {
+        if (cancelled) return;
+        const owner = String(snapshot?.codexProvisionalSettingsOwnerId || '').trim();
+        const model = String(snapshot?.codexProvisionalModel || '').trim();
+        const effort = String(snapshot?.codexProvisionalEffort || '').trim().toLowerCase();
+        if (
+          snapshot?.liveLifecycle !== true
+          || snapshot?.provenWriterSessionId
+          || !owner.startsWith('launch:')
+          || !model
+          || !effort
+        ) {
+          return;
+        }
+        useWorkspaceStore.getState().updateCodexLiveState(tabId, {
+          codexLiveModel: model,
+          codexLiveEffort: effort,
+          codexLiveSettingsSessionId: owner,
+        });
+      })
+      .catch((error: any) => {
+        console.warn('[CodexControlBar] provisional settings restore failed tab='
+          + tabId.slice(-12)
+          + ' error=' + String(error?.message || error));
+      });
+    return () => { cancelled = true; };
+  }, [sessionType, tabId, projectId]);
 
   // Seed the meter from the last value persisted for THIS tab, so it shows the
   // last-known context fill even when no Claude process is running (CLI exited
@@ -903,10 +960,9 @@ export default function ClaudeControlBar({
     };
   }, [tabId, isSDKTab]);
 
-  // (SDK model-caps fetch removed: we no longer gate effort pills per model —
-  // the CLI itself offers every effort level for every model, so there's no UI
-  // gate to feed. The `claude-sdk:get-model-caps` IPC + supportedModels() probe
-  // still exist in main for any future use, just unused here.)
+  // The settings-owned model rows are the UI contract for available effort
+  // levels. The SDK capability probe remains available to other surfaces, but
+  // this control bar deliberately follows the user's configured list.
 
   // Paste/control busy mirror — disables all writes while another caller mid-paste.
   const [isPasteBusy, setIsPasteBusy] = useState(false);
@@ -973,6 +1029,15 @@ export default function ClaudeControlBar({
     return null;
   }, [claudeSessionId, codexSessionId, commandType, isSDKTab]);
   const [sessionActionBlockedStatus, setSessionActionBlockedStatus] = useState<SessionActionBlockedStatus>(null);
+  const [codexForkProof, setCodexForkProof] = useState<{
+    tabId: string;
+    ready: boolean;
+    probeFailed?: boolean;
+  } | null>(null);
+  const codexForkWriterReady = codexForkProof?.tabId === tabId && codexForkProof.ready;
+  const codexForkProbeFailed = codexForkProof?.tabId === tabId
+    && codexForkProof.probeFailed === true;
+  const codexForkWaitingForHistory = sessionType === 'codex' && !codexForkWriterReady;
   const sessionActionProbeSeqRef = useRef(0);
   const setSessionActionBlockedStatusIfChanged = useCallback((next: SessionActionBlockedStatus, reason: string) => {
     setSessionActionBlockedStatus((prev) => {
@@ -986,11 +1051,22 @@ export default function ClaudeControlBar({
     const seq = ++sessionActionProbeSeqRef.current;
     if (!engine || !tabId) {
       setSessionActionBlockedStatusIfChanged(null, reason + ':no-engine');
+      setCodexForkProof(null);
       return;
     }
     try {
       const presence = await getHistoryAgentRuntime(engine).getPresence(tabId, projectId);
       if (seq !== sessionActionProbeSeqRef.current) return;
+      if (engine === 'codex') {
+        const snapshot = presence.runtimeSnapshot;
+        setCodexForkProof({
+          tabId,
+          ready: isCodexRuntimeForkReady(snapshot),
+          probeFailed: false,
+        });
+      } else {
+        setCodexForkProof(null);
+      }
       const next: SessionActionBlockedStatus =
         presence.status === 'starting' || presence.status === 'stopping'
           ? presence.status
@@ -998,6 +1074,9 @@ export default function ClaudeControlBar({
       setSessionActionBlockedStatusIfChanged(next, reason + ':' + presence.status);
     } catch (e: any) {
       if (seq !== sessionActionProbeSeqRef.current) return;
+      if (engine === 'codex') {
+        setCodexForkProof({ tabId, ready: false, probeFailed: true });
+      }
       console.warn('[SessionActionChip] presence failed tab=' + tabId.slice(-12) + ' type=' + (engine || '-') + ' reason=' + reason + ' error=' + String(e?.message || e));
     }
   }, [projectId, ptyTransitionEngine, setSessionActionBlockedStatusIfChanged, tabId]);
@@ -1035,6 +1114,7 @@ export default function ClaudeControlBar({
     if (!ptyTransitionEngine) {
       sessionActionProbeSeqRef.current += 1;
       setSessionActionBlockedStatusIfChanged(null, 'bind:no-engine');
+      setCodexForkProof(null);
       return;
     }
     void refreshSessionActionBlockedStatus('bind');
@@ -1048,12 +1128,14 @@ export default function ClaudeControlBar({
     };
     const onCommandStarted = (_: any, data: { tabId?: string; commandType?: string | null }) => {
       if (!eventBelongsHere(data?.tabId, data?.commandType || null)) return;
+      if (ptyTransitionEngine === 'codex') setCodexForkProof({ tabId, ready: false });
       setSessionActionBlockedStatusIfChanged('starting', 'command-started');
       void refreshSessionActionBlockedStatus('command-started');
     };
     const onCommandFinished = (_: any, data: { tabId?: string }) => {
       if (data?.tabId !== tabId) return;
       setSessionActionBlockedStatusIfChanged(null, 'command-finished');
+      void refreshSessionActionBlockedStatus('command-finished');
     };
     const onClaudeReady = (_: any, data: { tabId?: string }) => {
       if (ptyTransitionEngine !== 'claude' || data?.tabId !== tabId) return;
@@ -1068,6 +1150,13 @@ export default function ClaudeControlBar({
     const onAgentBusy = (_: any, data: { tabId?: string; busy?: boolean }) => {
       if (data?.tabId !== tabId || data?.busy !== true) return;
       setSessionActionBlockedStatusIfChanged(null, ptyTransitionEngine + '-busy');
+      if (ptyTransitionEngine === 'codex') {
+        void refreshSessionActionBlockedStatus('codex-busy');
+      }
+    };
+    const onCodexSessionDetected = (_: any, data: { tabId?: string }) => {
+      if (ptyTransitionEngine !== 'codex' || data?.tabId !== tabId) return;
+      void refreshSessionActionBlockedStatus('codex-session-detected');
     };
     const onCodexNotReady = (_: any, data: { tabId?: string; reason?: string | null }) => {
       if (ptyTransitionEngine !== 'codex' || data?.tabId !== tabId) return;
@@ -1091,6 +1180,7 @@ export default function ClaudeControlBar({
     ipcRenderer.on('codex:tui-ready', onCodexReady);
     ipcRenderer.on('claude:busy-state', onAgentBusy);
     ipcRenderer.on('codex:busy-state', onAgentBusy);
+    ipcRenderer.on('codex:session-detected', onCodexSessionDetected);
     ipcRenderer.on('codex:tui-not-ready', onCodexNotReady);
     ipcRenderer.on('codex:tui-manual-action-required', onCodexManualAction);
     ipcRenderer.on('agent:stopping-state', onAgentStopping);
@@ -1101,6 +1191,7 @@ export default function ClaudeControlBar({
       ipcRenderer.removeListener('codex:tui-ready', onCodexReady);
       ipcRenderer.removeListener('claude:busy-state', onAgentBusy);
       ipcRenderer.removeListener('codex:busy-state', onAgentBusy);
+      ipcRenderer.removeListener('codex:session-detected', onCodexSessionDetected);
       ipcRenderer.removeListener('codex:tui-not-ready', onCodexNotReady);
       ipcRenderer.removeListener('codex:tui-manual-action-required', onCodexManualAction);
       ipcRenderer.removeListener('agent:stopping-state', onAgentStopping);
@@ -1307,7 +1398,8 @@ export default function ClaudeControlBar({
   const codexEffectiveSettingsKnown = (
     !!codexTabModel
     && !!codexTabEffort
-    && (!codexSessionId || codexSettingsProofSessionId === codexSessionId)
+    && !!codexSessionId
+    && codexSettingsProofSessionId === codexSessionId
   ) || (
       effectiveCodexSettings.liveOwned
       && !!effectiveCodexSettings.model
@@ -1323,6 +1415,7 @@ export default function ClaudeControlBar({
   const codexEffortDisabled = codexControlAvailability.partialSettingDisabled;
   const codexExplicitPairDisabled = codexControlAvailability.explicitPairDisabled;
   const codexQuickDisabled = codexControlAvailability.quickDisabled;
+  const claudeQuickDisabled = !isSDKTab && (!isAnthropicPTY || !isCommandRunning);
   const codexFastDisabled = isCodex && !isCommandRunning;
 
   // Cache cooldown chip: Claude only (Anthropic PTY or SDK). DeepSeek/Zen have
@@ -1391,21 +1484,6 @@ export default function ClaudeControlBar({
     && codexModel === quickCodexModel!.id
     && codexEffort === quickCodexEffort;
   const claudeCodeModels = claudeCodeSettings.models;
-  const claudeCodeEfforts = claudeCodeSettings.efforts;
-  const effortLevels = isCodex
-    ? (activeCodexModel?.efforts && activeCodexModel.efforts.length > 0 ? activeCodexModel.efforts : [...CODEX_EFFORT_LEVELS])
-    : isDeepSeekPTY ? DEEPSEEK_EFFORT_LEVELS : claudeCodeEfforts;
-
-  // NOTE: we deliberately DO NOT gate effort pills per model. Real Claude Code
-  // shows the full effort scale (low…max + ultracode) for EVERY model incl.
-  // Haiku and lets you pick any of them — `supportedModels().supportedEffortLevels`
-  // is NOT a hard availability gate (Haiku returns it empty yet the CLI slider
-  // still offers max/ultracode). Matching CLI behaviour beats inventing a
-  // stricter gate. The ONE real per-model constraint is a transport detail, not
-  // UI: ultracode must reach the SDK via the settings layer, not `--effort`
-  // (the --effort flag's closed enum rejects 'ultracode' → exit 1). That's
-  // handled in main.js sdkStartQuery, not here. See fact-claude-sdk-tab /
-  // fact-claude-control-bar docs.
 
   // Model active id
   const lm = claudeModel?.toLowerCase() || '';
@@ -1426,12 +1504,33 @@ export default function ClaudeControlBar({
     return providerState.model || activeProvider.models[0]?.id || '';
   })();
 
+  const activeClaudeModel = claudeCodeModels.find((model) => model.id === modelActiveId)
+    || claudeCodeModels[0];
+  const visibleClaudeModels = useMemo(() => {
+    const visible = claudeCodeModels.filter((model) => model.visible !== false);
+    // A hidden current model must remain an escape route back to Settings when
+    // every row has been unchecked, mirroring the Codex picker behaviour.
+    return visible.length > 0 ? visible : claudeCodeModels.filter((model) => model.id === modelActiveId);
+  }, [claudeCodeModels, modelActiveId]);
+  const effortLevels = isCodex
+    ? (activeCodexModel?.efforts && activeCodexModel.efforts.length > 0 ? activeCodexModel.efforts : [...CODEX_EFFORT_LEVELS])
+    : isDeepSeekPTY ? DEEPSEEK_EFFORT_LEVELS : claudeEffortsForModel(activeClaudeModel);
+
   const effortActive: string | undefined = (() => {
     if (isCodex) return codexEffort;
     if (isSDKTab) return sdkEffort;
     if (isDeepSeekPTY) return providerState.effort || 'medium';
     return effortLocal;
   })();
+
+  const quickClaudeModel = claudeCodeModels.find((model) => model.id === claudeCodeSettings.quickModel);
+  const quickClaudeEffort = quickClaudeModel
+    ? resolveClaudeEffortForModel(quickClaudeModel, claudeCodeSettings.quickEffort)
+    : null;
+  const hasQuickClaudePreset = !!quickClaudeModel && !!quickClaudeEffort;
+  const quickClaudeMatchesCurrent = hasQuickClaudePreset
+    && modelActiveId === quickClaudeModel!.id
+    && effortActive === quickClaudeEffort;
 
   const thinkActive: boolean = (() => {
     if (isCodex) return true;
@@ -1443,6 +1542,26 @@ export default function ClaudeControlBar({
     quickCodexReturnRef.current = null;
     setQuickCodexApplied(false);
   };
+
+  const clearQuickClaudeToggle = () => {
+    quickClaudeReturnRef.current = null;
+    setQuickClaudeApplied(false);
+  };
+
+  useEffect(() => {
+    clearQuickClaudeToggle();
+  }, [
+    tabId,
+    claudeSessionId,
+    claudeCodeSettings.quickModel,
+    quickClaudeEffort,
+  ]);
+
+  useEffect(() => {
+    if (quickClaudeApplied && (!hasQuickClaudePreset || !quickClaudeMatchesCurrent)) {
+      clearQuickClaudeToggle();
+    }
+  }, [hasQuickClaudePreset, quickClaudeApplied, quickClaudeMatchesCurrent]);
 
   useEffect(() => {
     clearQuickCodexToggle();
@@ -1471,6 +1590,8 @@ export default function ClaudeControlBar({
   const [hoveredCodexMenuAnchor, setHoveredCodexMenuAnchor] = useState<HTMLButtonElement | null>(null);
   const isCmdPressed = useCmdKey();
   const showSessionIdTooltip = isCmdPressed && sessionCopyHover && hasArtifactSession && !!sessionCopyRect;
+  const showQuickClaudeTooltip = !isCodex && (isSDKTab || isAnthropicPTY)
+    && isCmdPressed && quickClaudeHover && hasQuickClaudePreset && !!quickClaudeRect;
   const showQuickCodexTooltip = isCodex && isCmdPressed && quickCodexHover && hasQuickCodexPreset && !!quickCodexRect;
 
   useEffect(() => {
@@ -1619,6 +1740,12 @@ export default function ClaudeControlBar({
           && all.indexOf(value) === index
         ))
       : null;
+    const confirmedSelectedEfforts = selectedEfforts
+      || (
+        typeof result?.effort === 'string' && result.effort.trim()
+          ? [result.effort.trim()]
+          : []
+      );
 
     // A native picker frame is only a window into the account catalog:
     // `/model` initially shows quick auto presets, while specific models live
@@ -1628,11 +1755,18 @@ export default function ClaudeControlBar({
       const merged = [...prev];
       for (const id of options) {
         if (!merged.some((model) => model.id === id)) {
+          // A row in one session's top picker proves only that this session
+          // can see the preset. It does not prove the preset's default or its
+          // complete effort matrix. Add an unknown row only when this exact
+          // model+effort pair was already confirmed by the native picker.
+          if (id !== selectedModel || confirmedSelectedEfforts.length === 0) {
+            continue;
+          }
           merged.push({
             id,
             label: id,
-            defaultEffort: DEFAULT_CODEX_EFFORT,
-            efforts: [...CODEX_EFFORT_LEVELS],
+            defaultEffort: confirmedSelectedEfforts[0],
+            efforts: [...confirmedSelectedEfforts],
           });
         }
       }
@@ -1649,6 +1783,15 @@ export default function ClaudeControlBar({
       merged[selectedIndex] = { ...merged[selectedIndex], efforts: ordered };
       return merged;
     });
+
+    // The native picker is session-local, while `codex debug models` is the
+    // authoritative metadata source for labels/defaults/capabilities. Refresh
+    // after a proven selection so a newly visible preset replaces the narrow
+    // exact-pair placeholder as soon as the live catalog exposes it.
+    void ipcRenderer.invoke('codex:list-models').then((res: any) => {
+      if (!Array.isArray(res?.models) || res.models.length === 0) return;
+      setCodexModels((prev) => mergeCodexModelOptions(res.models, prev, codexSettings.removedModelIds));
+    }).catch(() => {});
   };
 
   const getCodexDraftStateForPicker = async () => {
@@ -1688,14 +1831,18 @@ export default function ClaudeControlBar({
   };
 
   // ===== handlers =====
-  const setEffortOnPTY = async (level: string) => {
+  const setEffortOnPTY = async (
+    level: string,
+    source = 'controlbar:effort',
+    sentinelVia = 'manual-click',
+  ): Promise<boolean> => {
     // Mark this tab as "effort sent" so the tui-ready and Bridge:Fresh auto-inject
     // paths in Terminal.tsx see it and skip. Without this, the user's frustration
     // click while waiting for tui-ready would race the auto-inject and produce
     // two /effort lines (forensic: 2026-05 tab-2933 incident).
     const sentinelMap = (window as any).__effortSentForTab as Map<string, { at: number; via: string; level: string }> | undefined;
     const previousSentinel = sentinelMap?.get(tabId);
-    if (sentinelMap) sentinelMap.set(tabId, { at: Date.now(), via: 'manual-click', level });
+    if (sentinelMap) sentinelMap.set(tabId, { at: Date.now(), via: sentinelVia, level });
     console.warn('[EffortDiag2026-05][CONTROLBAR-CLICK] tab=' + tabId.slice(-12) + ' level=' + level + ' ts=' + Date.now());
     setLocalBusy(true, 'claude-effort:' + level);
     try {
@@ -1703,9 +1850,10 @@ export default function ClaudeControlBar({
         tabId,
         kind: 'effort',
         value: level,
-        source: 'controlbar:effort',
+        source,
       });
       setEffortLocal(level);
+      return true;
     } catch (error: any) {
       if (sentinelMap) {
         if (previousSentinel) sentinelMap.set(tabId, previousSentinel);
@@ -1713,8 +1861,51 @@ export default function ClaudeControlBar({
       }
       console.error('[ClaudeControlBar] effort change failed:', error);
       showToast('Claude не подтвердил effort: ' + String(error?.message || error), 'error');
+      return false;
     } finally {
       setLocalBusy(false, 'claude-effort:' + level + ':finally');
+      focusTerminal();
+    }
+  };
+
+  const applyClaudeQuickPreset = async (model: string, effort: string): Promise<boolean> => {
+    if (isSDKTab) {
+      useWorkspaceStore.getState().updateSDKState(tabId, { sdkModel: model, sdkEffort: effort });
+      focusTerminal();
+      return true;
+    }
+    if (!isAnthropicPTY) return false;
+
+    const actionReason = `claude-quick:${model}/${effort}`;
+    const modelSentinelMap = (window as any).__modelSentForTab as Map<string, { at: number; via: string; model: string }> | undefined;
+    const effortSentinelMap = (window as any).__effortSentForTab as Map<string, { at: number; via: string; level: string }> | undefined;
+    const previousModelSentinel = modelSentinelMap?.get(tabId);
+    const previousEffortSentinel = effortSentinelMap?.get(tabId);
+    if (modelSentinelMap) modelSentinelMap.set(tabId, { at: Date.now(), via: 'quick-preset', model });
+    if (effortSentinelMap) effortSentinelMap.set(tabId, { at: Date.now(), via: 'quick-preset', level: effort });
+    let modelApplied = false;
+    setLocalBusy(true, actionReason);
+    try {
+      await applyClaudePtySetting({ tabId, kind: 'model', value: model, source: 'controlbar:quick-model' });
+      modelApplied = true;
+      setClaudeModel(model);
+      await applyClaudePtySetting({ tabId, kind: 'effort', value: effort, source: 'controlbar:quick-effort' });
+      setEffortLocal(effort);
+      return true;
+    } catch (error: any) {
+      if (!modelApplied && modelSentinelMap) {
+        if (previousModelSentinel) modelSentinelMap.set(tabId, previousModelSentinel);
+        else modelSentinelMap.delete(tabId);
+      }
+      if (effortSentinelMap) {
+        if (previousEffortSentinel) effortSentinelMap.set(tabId, previousEffortSentinel);
+        else effortSentinelMap.delete(tabId);
+      }
+      console.error('[ClaudeControlBar] quick preset failed:', error);
+      showToast('Claude не подтвердил быстрый переход: ' + String(error?.message || error), 'error');
+      return false;
+    } finally {
+      setLocalBusy(false, actionReason + ':finally');
       focusTerminal();
     }
   };
@@ -1758,7 +1949,12 @@ export default function ClaudeControlBar({
       );
       return { success: false, model, effort: null };
     }
-    if (source !== 'pair' && (!codexTabModel || !codexTabEffort)) {
+    // Availability and action execution must use the same effective pair.
+    // A live conversation can own a proven model+effort even when the legacy
+    // persistent tab fields are empty (for example immediately after Resume).
+    // The writer CAS above still prevents inheriting settings from another
+    // rollout/session.
+    if (source !== 'pair' && !codexEffectiveSettingsKnown) {
       rejectCodexLivePickerWithoutStateChange(
         requestedState,
         'effective-settings-unknown',
@@ -1867,14 +2063,23 @@ export default function ClaudeControlBar({
       return;
     }
     if (isSDKTab) {
-      // No effort auto-downgrade on model switch: like the CLI, any effort is
-      // selectable on any model (see effort-gating note above). The user's
-      // chosen effort persists across model changes.
-      useWorkspaceStore.getState().updateSDKState(tabId, { sdkModel: mid });
+      const nextModel = claudeCodeModels.find((model) => model.id === mid);
+      const nextEffort = resolveClaudeEffortForModel(nextModel, sdkEffort);
+      useWorkspaceStore.getState().updateSDKState(tabId, {
+        sdkModel: mid,
+        ...(nextEffort && nextEffort !== sdkEffort ? { sdkEffort: nextEffort } : {}),
+      });
+      if (nextEffort && nextEffort !== sdkEffort) {
+        showToast(`Для ${nextModel?.label || mid} выбран совместимый effort: ${nextEffort}`, 'info');
+      }
       focusTerminal();
       return;
     }
     if (activeProvider.id === 'anthropic') {
+      const nextModel = claudeCodeModels.find((model) => model.id === mid);
+      const nextEffort = effortLocal && !claudeEffortsForModel(nextModel).includes(effortLocal)
+        ? resolveClaudeEffortForModel(nextModel, effortLocal)
+        : null;
       setLocalBusy(true, 'claude-model:' + mid);
       const modelSentinelMap = (window as any).__modelSentForTab as Map<string, { at: number; via: string; model: string }> | undefined;
       const previousSentinel = modelSentinelMap?.get(tabId);
@@ -1887,6 +2092,16 @@ export default function ClaudeControlBar({
           source: 'controlbar:model',
         });
         setClaudeModel(mid);
+        if (nextEffort) {
+          const effortApplied = await setEffortOnPTY(
+            nextEffort,
+            'controlbar:model-compatible-effort',
+            'model-change',
+          );
+          if (effortApplied) {
+            showToast(`Для ${nextModel?.label || mid} выбран совместимый effort: ${nextEffort}`, 'info');
+          }
+        }
       } catch (error: any) {
         if (modelSentinelMap) {
           if (previousSentinel) modelSentinelMap.set(tabId, previousSentinel);
@@ -1939,6 +2154,39 @@ export default function ClaudeControlBar({
     try {
       const result = await applyCodexModelAndEffort(model, effort, 'pair');
       if (result.success) clearQuickCodexToggle();
+    } finally {
+      endControlAction(actionReason);
+    }
+  };
+
+  const toggleQuickClaudePreset = async () => {
+    if ((!isSDKTab && !isAnthropicPTY) || !quickClaudeModel || !quickClaudeEffort) return;
+
+    const restore = quickClaudeApplied && quickClaudeMatchesCurrent
+      ? quickClaudeReturnRef.current
+      : null;
+    if (!restore && quickClaudeMatchesCurrent) {
+      clearQuickClaudeToggle();
+      return;
+    }
+
+    const target = restore || { model: quickClaudeModel.id, effort: quickClaudeEffort };
+    const actionReason = restore ? 'claude-quick-restore' : 'claude-quick-apply';
+    if (!beginControlAction(actionReason)) return;
+    try {
+      const success = await applyClaudeQuickPreset(target.model, target.effort);
+      if (!success) return;
+
+      if (restore) {
+        clearQuickClaudeToggle();
+        return;
+      }
+
+      quickClaudeReturnRef.current = {
+        model: modelActiveId,
+        effort: effortActive || resolveClaudeEffortForModel(activeClaudeModel, 'medium') || quickClaudeEffort,
+      };
+      setQuickClaudeApplied(true);
     } finally {
       endControlAction(actionReason);
     }
@@ -2010,7 +2258,13 @@ export default function ClaudeControlBar({
         turnBusy: codexTurnBusy,
       });
       console.log('[CodexControlBar] /fast result tab=' + tabId.slice(-12) + ' result=' + JSON.stringify(result || null));
-      if (result?.success === false) throw new Error(result?.error || 'Codex /fast failed');
+      if (result?.success === false) {
+        if (result?.error === 'codex_busy_with_draft') {
+          console.warn('[CodexControlBar] /fast skipped tab=' + tabId.slice(-12) + ' reason=busy-draft-at-write-boundary');
+          return;
+        }
+        throw new Error(result?.error || 'Codex /fast failed');
+      }
     } catch (e: any) {
       console.warn('[CodexControlBar] /fast failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
       showToast('Codex /fast failed: ' + String(e?.message || e), 'error');
@@ -2218,20 +2472,15 @@ export default function ClaudeControlBar({
     window.dispatchEvent(new CustomEvent('timeline:force-refresh', { detail: { tabId } }));
   };
 
-  // Manual escape hatch for a STUCK busy indicator. The right cluster's shimmer
-  // is driven by isPasteBusy/isLocalBusy; those are renderer-local mirrors of a
-  // main-side paste that emits busy=true→false. If the false is ever lost (the
-  // user switched tabs mid-/effort so emitBusy(false){tabId:A} arrived while the
-  // listener filtered tabId:B → dropped; or the user manually aborted the turn
-  // so /effort's slash-command never confirmed), the cluster shimmers forever.
-  // Clicking the cluster while busy force-clears the local flags so the controls
-  // come back. This does NOT cancel a genuinely in-flight main-side paste — it
-  // only re-syncs the UI; the per-term mutex in safePasteAndSubmit still
-  // serializes any real concurrent write. Юзер: «сделать эту область кликабельной,
-  // при наведении красное СТОП на весь loader, переклик сбрасывает состояние».
+  // Manual escape hatch for a STUCK local-control indicator. The right cluster's
+  // shimmer is driven only by isLocalBusy; isPasteBusy remains a silent write
+  // lock. If a local command never confirms (for example, /effort was manually
+  // aborted), the cluster would otherwise shimmer forever. Clicking the cluster
+  // clears only the local-control flag; it does not cancel or unlock a genuine
+  // main-side paste. Юзер: «сделать эту область кликабельной, при наведении
+  // красное СТОП на весь loader, переклик сбрасывает состояние».
   const forceResetBusy = () => {
-    console.warn('[ControlBar] manual busy-reset by user — clearing stuck loader for tab ' + tabId.slice(-12));
-    setIsPasteBusy(false);
+    console.warn('[ControlBar] manual local-busy reset by user for tab ' + tabId.slice(-12));
     setLocalBusy(false, 'manual-reset');
     focusTerminal();
   };
@@ -2730,8 +2979,8 @@ export default function ClaudeControlBar({
   // SDK-F (from clipboard)       | + 1)    | -           | -           | -       | -           | -
   // Codex startCodexTab          | + 1)    | -           | -           | -       | -           | -
   // ⑂ Codex-F (from clipboard)   | + 1)    | -           | -           | -       | -           | -
-  // ⎘ prompt | + clear (PTY only)| -       | + Claude/   | -           | -       | -           | -
-  //                              |         |   Codex     |   Codex     |         |             |
+  // terminal→ prompt | + clear   | -       | + Claude/   | -           | -       | -           | -
+  //   (PTY only)                 |         |   Codex     |   Codex     |         |             |
   // 🎤 mic | Enter | ^C          | History | + Claude/   | History     | -       | -           | -
   //   primary History            | Mic +   |   Codex:    | Mic +       |         |             |
   //                              | Enter   | Mic/Enter;  | Enter;      |         |             |
@@ -2980,8 +3229,8 @@ export default function ClaudeControlBar({
           </div>
         )}
 
-        {/* Forks: terminal-origin actions into a new PTY tab
-            ([terminal]→▭) and a new SDK tab ([terminal]→SDK).
+        {/* Forks: session-origin actions into a new PTY tab
+            (⑂→▭) and a new SDK tab (⑂→SDK).
             SDK fork only for Claude sessions — SDK doesn't run Gemini.
             Без активной сессии форкать нечего, поэтому обе fork-кнопки
             скрываются и заменяются на одну `+ SDK` (создать новый SDK таб)
@@ -2989,26 +3238,43 @@ export default function ClaudeControlBar({
             сессии. На SDK-табе вариант «открыть SDK» не показываем — юзер
             уже в SDK. */}
         {hasArtifactSession && (
-          <ControlHint label="Создать fork сессии в новой PTY-вкладке">
+          <ControlHint
+            label={codexForkProbeFailed
+              ? 'Не удалось проверить активную историю Codex — нажмите, чтобы повторить'
+              : codexForkWaitingForHistory
+              ? 'Codex работает, активная история ещё подтверждается'
+              : 'Создать fork сессии в новой PTY-вкладке'}
+          >
           <button
             type="button"
-            aria-busy={isInlineActionLoading('fork-to-pty')}
-            aria-disabled={inlineAction?.tabId === tabId}
+            aria-busy={isInlineActionLoading('fork-to-pty') || codexForkWaitingForHistory}
+            aria-disabled={inlineAction?.tabId === tabId || codexForkWaitingForHistory}
             className="text-[10px] px-1.5 py-0.5 rounded text-[#999] hover:text-white cursor-pointer leading-none flex items-center gap-0.5 transition-colors"
             style={{
               backgroundColor: 'transparent',
               border: '1px solid rgba(255,255,255,0.10)',
               flexShrink: 0,
+              cursor: codexForkWaitingForHistory ? 'not-allowed' : 'pointer',
+              opacity: codexForkWaitingForHistory ? 0.72 : 1,
             }}
             onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'rgba(255,255,255,0.06)'; }}
             onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = 'transparent'; }}
-            onClick={() => void runInlineAction('fork-to-pty', forkToTab)}
-            title="Fork в новую вкладку"
+            onClick={() => {
+              if (codexForkWaitingForHistory) {
+                void refreshSessionActionBlockedStatus('fork-chip-click');
+                return;
+              }
+              void runInlineAction('fork-to-pty', forkToTab);
+            }}
+            title={codexForkProbeFailed
+              ? 'Проверить активную историю Codex ещё раз'
+              : codexForkWaitingForHistory
+              ? 'Активная история Codex ещё подтверждается'
+              : 'Fork в новую вкладку'}
           >
-            <InlineActionContent loading={isInlineActionLoading('fork-to-pty')}>
+            <InlineActionContent loading={isInlineActionLoading('fork-to-pty') || codexForkWaitingForHistory}>
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 1 }}>
-                <SquareTerminal size={10} strokeWidth={1.8} aria-hidden />
-                <span>→</span>
+                <span>⑂→</span>
                 <span style={{ fontSize: '11px' }}>▭</span>
               </span>
             </InlineActionContent>
@@ -3035,9 +3301,7 @@ export default function ClaudeControlBar({
           >
             <InlineActionContent loading={isInlineActionLoading('fork-to-sdk')}>
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 1 }}>
-                <SquareTerminal size={10} strokeWidth={1.8} aria-hidden />
-                <span>→</span>
-                <span>SDK</span>
+                <span>⑂→SDK</span>
               </span>
             </InlineActionContent>
           </button>
@@ -3156,9 +3420,9 @@ export default function ClaudeControlBar({
           </>
         )}
 
-        {/* ⎘ prompt | + clear split-pill — Claude/Codex PTY only. Copies the live TUI
-            input; the SDK composer has no equivalent grab, so hidden for SDK
-            tabs (пока что не отображаем). */}
+        {/* terminal→ prompt | terminal→ + clear — Claude/Codex PTY only.
+            Copies the live TUI input; the SDK composer has no equivalent grab,
+            so these actions stay hidden for SDK tabs. */}
         {showLivePtyInputActions && (
           <div
             className="inline-flex items-stretch rounded select-none overflow-hidden"
@@ -3171,25 +3435,35 @@ export default function ClaudeControlBar({
               flexShrink: 0,
             }}
           >
-            <ControlHint label="Скопировать текущий prompt" shortcut="Текст останется в поле">
+            <ControlHint
+              label="Скопировать ввод из терминала"
+              shortcut="Терминальный ввод останется на месте"
+            >
             <button
               onClick={() => handleCopyPrompt(false)}
               className="inline-flex items-center gap-1 cursor-pointer hover:bg-[rgba(255,255,255,0.06)] hover:text-white transition-colors"
               style={{ padding: '0 8px', background: 'transparent', border: 'none', color: 'inherit' }}
-              title={`Copy current ${sessionType === 'codex' ? 'Codex' : 'Claude'} input`}
+              aria-label={`Copy live ${sessionType === 'codex' ? 'Codex' : 'Claude'} terminal input`}
+              title={`Copy live ${sessionType === 'codex' ? 'Codex' : 'Claude'} terminal input`}
             >
+              <TerminalSourceMark />
               <span style={{ fontSize: 12, lineHeight: 1 }}>⎘</span>
               <span>prompt</span>
             </button>
             </ControlHint>
             <span style={{ width: 1, alignSelf: 'center', height: '70%', backgroundColor: 'rgba(255,255,255,0.12)' }} />
-            <ControlHint label="Скопировать и очистить prompt">
+            <ControlHint
+              label="Скопировать и очистить ввод терминала"
+              shortcut="Копирование и очистка выполняются атомарно"
+            >
             <button
               onClick={() => handleCopyPrompt(true)}
               className="inline-flex items-center gap-0.5 cursor-pointer hover:bg-[rgba(255,255,255,0.06)] hover:text-white transition-colors"
               style={{ padding: '0 8px', background: 'transparent', border: 'none', color: 'inherit' }}
-              title={`Copy + clear ${sessionType === 'codex' ? 'Codex' : 'Claude'} input`}
+              aria-label={`Copy and clear live ${sessionType === 'codex' ? 'Codex' : 'Claude'} terminal input`}
+              title={`Copy and clear live ${sessionType === 'codex' ? 'Codex' : 'Claude'} terminal input`}
             >
+              <TerminalSourceMark />
               <span>+</span>
               <span>clear</span>
             </button>
@@ -3231,7 +3505,7 @@ export default function ClaudeControlBar({
             >
               <SquareTerminal size={11} strokeWidth={1.8} aria-hidden />
               <span aria-hidden>→</span>
-              <span aria-hidden style={{ fontSize: 12 }}>▭</span>
+              <span aria-hidden style={{ fontSize: 10 }}>input</span>
             </button>
           </ControlHint>
         )}
@@ -3370,7 +3644,9 @@ export default function ClaudeControlBar({
       </div>
 
       {/* RIGHT: dropdowns. Два блокирующих состояния:
-          • isBusy → shimmer-overlay через ::after (in-flight command).
+          • isLocalBusy → shimmer-overlay через ::after для локальной операции
+            с настройками/управлением.
+          • isBusy → write lock для локальной операции или prompt paste.
           • PTY new: нет sessionId и нет живого процесса → кластер скрыт целиком,
             чтобы новая вкладка не показывала дефолтные Claude-модели перед выбором
             Claude/Codex.
@@ -3390,13 +3666,14 @@ export default function ClaudeControlBar({
           • Codex: `/model` нативно разрешён во время streaming и меняет
             настройку сессии для следующей работы. Отдельный Effort остаётся
             disabled: модельный picker выбирает совместимый effort атомарно.
-            `/fast` — отдельная live-команда. */}
+            `/fast` — отдельная live-команда, которую Codex не принимает во
+            время streaming, поэтому она disabled до завершения turn. */}
       {showRightCluster && (() => {
         const canControl = isSDKTab ? true : isCommandRunning;
-        const modelOptions = isCodex ? visibleCodexModels : isAnthropicPTY ? claudeCodeModels : activeProvider.models;
+        const modelOptions = isCodex ? visibleCodexModels : isAnthropicPTY ? visibleClaudeModels : activeProvider.models;
         return (
         <div
-          className={isBusy ? 'control-bar-busy-overlay' : undefined}
+          className={isLocalBusy ? 'control-bar-busy-overlay' : undefined}
           style={{
             position: 'relative',
             display: 'flex',
@@ -3406,13 +3683,14 @@ export default function ClaudeControlBar({
             opacity: !canControl ? 0.4 : 1,
             transition: 'opacity 0.15s',
           }}
-          aria-busy={isBusy}
+          aria-busy={isLocalBusy}
         >
-          {/* Click-to-reset escape hatch — covers the WHOLE cluster while busy.
-              Parent sets pointer-events:none; this re-enables itself (CSS) and
-              sits above the shimmer. Hover = red "СБРОС", click force-clears a
-              stuck loader. See forceResetBusy + fact-claude-control-bar.md. */}
-          {isBusy && (
+          {/* Click-to-reset escape hatch — covers the WHOLE cluster only while a
+              local settings/control operation is busy. Parent sets
+              pointer-events:none; this re-enables itself (CSS) and sits above
+              the shimmer. Hover = red "СБРОС", click force-clears a stuck
+              local-control loader. See forceResetBusy + fact-claude-control-bar.md. */}
+          {isLocalBusy && (
             <div
               className="control-bar-busy-reset"
               onClick={forceResetBusy}
@@ -3465,6 +3743,66 @@ export default function ClaudeControlBar({
             </div>
           )}
 
+          {(isSDKTab || isAnthropicPTY) && (
+            <div style={{ position: 'relative', display: 'inline-flex' }}>
+              <button
+                ref={quickClaudeButtonRef}
+                type="button"
+                disabled={claudeQuickDisabled || !hasQuickClaudePreset}
+                onClick={toggleQuickClaudePreset}
+                onMouseEnter={(event) => {
+                  setQuickClaudeHover(true);
+                  const rect = event.currentTarget.getBoundingClientRect();
+                  setQuickClaudeRect({ left: rect.left, top: rect.top, width: rect.width, height: rect.height });
+                }}
+                onMouseLeave={() => {
+                  setQuickClaudeHover(false);
+                  setQuickClaudeRect(null);
+                }}
+                aria-label="Быстро переключить модель Claude"
+                title={claudeQuickDisabled
+                  ? (isCommandRunning
+                    ? 'Быстрое переключение доступно только для Claude'
+                    : 'Быстрое переключение станет доступно после запуска Claude')
+                  : !hasQuickClaudePreset
+                    ? 'Задайте модель и effort для быстрого переключения в Настройках'
+                    : quickClaudeApplied && quickClaudeMatchesCurrent
+                      ? 'Вернуть прежнюю модель и effort'
+                      : `Переключить на ${quickClaudeModel?.label} / ${quickClaudeEffort}`}
+                style={{
+                  ...triggerStyle,
+                  width: 22,
+                  padding: 0,
+                  justifyContent: 'center',
+                  color: claudeQuickDisabled || !hasQuickClaudePreset ? '#555' : quickClaudeApplied && quickClaudeMatchesCurrent ? '#fff' : '#f0b098',
+                  borderColor: quickClaudeApplied && quickClaudeMatchesCurrent ? '#fff' : 'rgba(218,119,86,0.5)',
+                  backgroundColor: quickClaudeApplied && quickClaudeMatchesCurrent ? 'rgba(218,119,86,0.25)' : 'transparent',
+                  cursor: claudeQuickDisabled || !hasQuickClaudePreset ? 'not-allowed' : 'pointer',
+                }}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                  <path d="M17 3l4 4-4 4" />
+                  <path d="M3 7h18" />
+                  <path d="M7 21l-4-4 4-4" />
+                  <path d="M21 17H3" />
+                </svg>
+              </button>
+              {showQuickClaudeTooltip && quickClaudeButtonRef.current && createPortal(
+                <CenteredUpwardPopover
+                  getAnchorRect={() => quickClaudeButtonRef.current?.getBoundingClientRect() || null}
+                  zIndex={10060}
+                  style={{ pointerEvents: 'none' }}
+                >
+                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 8px', borderRadius: 5, border: '1px solid rgba(218,119,86,0.4)', background: '#101010', color: '#ffe3d7', boxShadow: '0 8px 24px rgba(0,0,0,0.45)', fontSize: 11, whiteSpace: 'nowrap' }}>
+                    <span>{quickClaudeModel?.label}</span>
+                    <span style={{ color: '#DA7756', fontWeight: 700 }}>{quickClaudeEffort === 'medium' ? 'med' : quickClaudeEffort === 'xhigh' ? 'xhi' : quickClaudeEffort === 'ultracode' ? 'ultra' : quickClaudeEffort}</span>
+                  </div>
+                </CenteredUpwardPopover>,
+                document.body,
+              )}
+            </div>
+          )}
+
           {isCodex && (
             <div style={{ position: 'relative', display: 'inline-flex' }}>
               <button
@@ -3496,9 +3834,9 @@ export default function ClaudeControlBar({
                   width: 22,
                   padding: 0,
                   justifyContent: 'center',
-                  color: codexQuickDisabled || !hasQuickCodexPreset ? '#555' : quickCodexApplied && quickCodexMatchesCurrent ? '#fff' : '#b9c9ff',
-                  borderColor: quickCodexApplied && quickCodexMatchesCurrent ? '#fff' : 'rgba(122,157,255,0.46)',
-                  backgroundColor: quickCodexApplied && quickCodexMatchesCurrent ? 'rgba(122,157,255,0.24)' : 'transparent',
+                  color: codexQuickDisabled || !hasQuickCodexPreset ? '#555' : quickCodexApplied && quickCodexMatchesCurrent ? '#fff' : '#9ce8c4',
+                  borderColor: quickCodexApplied && quickCodexMatchesCurrent ? '#fff' : 'rgba(52,211,153,0.48)',
+                  backgroundColor: quickCodexApplied && quickCodexMatchesCurrent ? 'rgba(52,211,153,0.24)' : 'transparent',
                   cursor: codexQuickDisabled || !hasQuickCodexPreset ? 'not-allowed' : 'pointer',
                 }}
               >
@@ -3515,9 +3853,9 @@ export default function ClaudeControlBar({
                   zIndex={10060}
                   style={{ pointerEvents: 'none' }}
                 >
-                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 8px', borderRadius: 5, border: '1px solid rgba(122,157,255,0.36)', background: '#101010', color: '#dce5ff', boxShadow: '0 8px 24px rgba(0,0,0,0.45)', fontSize: 11, whiteSpace: 'nowrap' }}>
+                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 8px', borderRadius: 5, border: '1px solid rgba(52,211,153,0.4)', background: '#101010', color: '#dcffe9', boxShadow: '0 8px 24px rgba(0,0,0,0.45)', fontSize: 11, whiteSpace: 'nowrap' }}>
                     <span>{quickCodexModel?.label}</span>
-                    <span style={{ color: '#7A9DFF', fontWeight: 700 }}>{quickCodexEffort === 'medium' ? 'med' : quickCodexEffort === 'xhigh' ? 'xhi' : quickCodexEffort}</span>
+                    <span style={{ color: '#34D399', fontWeight: 700 }}>{quickCodexEffort === 'medium' ? 'med' : quickCodexEffort === 'xhigh' ? 'xhi' : quickCodexEffort}</span>
                   </div>
                 </CenteredUpwardPopover>,
                 document.body,
@@ -3657,13 +3995,9 @@ export default function ClaudeControlBar({
               only takes effect during reasoning, so visually telegraphing that
               the value won't matter right now. Не disabled: юзер может пресет-
               нуть Effort заранее, потом включить Think. */}
-          {/* Effort — inline pill row instead of dropdown. Все уровни видны
-              сразу, один клик переключает. Dimmed когда Think выключен (effort
-              работает только при reasoning, поэтому визуально телеграфируем
-              что значение сейчас не применяется), но не disabled — юзер может
-              пресет-нуть заранее и потом включить Think.
-              Уровни НЕ гейтятся по модели — как в самом Claude Code, любой
-              уровень выбираем для любой модели (вкл. Haiku). */}
+          {/* Effort — inline pill row instead of a dropdown. The configured
+              model decides which levels appear here; changing model chooses a
+              compatible level when the previous one is unavailable. */}
           <ControlHint
             label="Выбрать глубину рассуждения"
             shortcut={!thinkActive ? 'Применяется, когда Think включён' : undefined}
@@ -3727,7 +4061,9 @@ export default function ClaudeControlBar({
             <button
               type="button"
               aria-label="Send /fast to Codex"
-              title={codexFastDisabled ? '/fast доступен только при живом Codex' : 'Send /fast to Codex'}
+              title={!isCommandRunning
+                ? '/fast доступен только при живом Codex'
+                : 'Send /fast to Codex'}
               disabled={codexFastDisabled}
               onClick={sendCodexFast}
               style={{

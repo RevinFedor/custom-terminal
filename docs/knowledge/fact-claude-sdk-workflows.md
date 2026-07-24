@@ -33,6 +33,6 @@ Workflow появляется **однострочным чипом** в `Backgr
 
 ## enableWorkflows / ultracode — через settings-слой, не Options
 
-Чтобы workflow вообще запускался в SDK-табе, и чтобы включить ultracode — нужны флаги `enableWorkflows` / `ultracode`. **Ловушка:** оба — поля **Settings-схемы SDK**, а НЕ `query()` Options. Переданные top-level в options они **молча отбрасываются** (Options-деструктуризация их не видит). Канал — `extraArgs: { settings: JSON.stringify({...}) }` → CLI получает `--settings <json>`, который ложится в **flag-слой** (выше user/project/local, ниже managed) и **не затирает** `~/.claude` юзера. Подробнее про ultracode-транспорт — `fact-claude-sdk-tab.md::Effort: gating отменён, ultracode через settings`.
+Чтобы workflow вообще запускался в SDK-табе, и чтобы включить ultracode — нужны флаги `enableWorkflows` / `ultracode`. **Ловушка:** оба — поля **Settings-схемы SDK**, а НЕ `query()` Options. Переданные top-level в options они **молча отбрасываются** (Options-деструктуризация их не видит). Канал — `extraArgs: { settings: JSON.stringify({...}) }` → CLI получает `--settings <json>`, который ложится в **flag-слой** (выше user/project/local, ниже managed) и **не затирает** `~/.claude` юзера. Подробнее про ultracode-транспорт — `fact-claude-sdk-tab.md::Effort: продуктовая таблица по модели, ultracode через settings`.
 
 (`enableWorkflows` по факту no-op на Max/Team — workflows там on-by-default — но передаём явно.)

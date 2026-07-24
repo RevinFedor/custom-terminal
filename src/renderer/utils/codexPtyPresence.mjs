@@ -55,6 +55,17 @@ export function isCodexRuntimeWriterUsable(runtimeSnapshot, {
 }
 
 /**
+ * Fork can target either a definitely stopped transcript or the exact
+ * mutation-safe writer of a live Codex process. Renderer presence labels such
+ * as "inactive" are intentionally excluded: manual-action states also use
+ * that label while the live writer is still unresolved.
+ */
+export function isCodexRuntimeForkReady(runtimeSnapshot) {
+  return runtimeSnapshot?.liveLifecycle === false
+    || isCodexRuntimeWriterUsable(runtimeSnapshot);
+}
+
+/**
  * Presence must be projected from one main-owned lifecycle generation. Until
  * the runtime snapshot contains every field used by the UI, callers must not
  * fill the gaps with separate IPC reads: that recreates the split-generation

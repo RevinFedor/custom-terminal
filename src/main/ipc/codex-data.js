@@ -151,6 +151,13 @@ function stableUuid(sessionId, index, prefix = 'codex') {
   return `${prefix}-${sessionId || 'unknown'}-${index}`;
 }
 
+function stableSourceIdentity(sessionId, record, prefix = 'codex') {
+  const position = Number.isFinite(record?.__byteOffset)
+    ? Number(record.__byteOffset)
+    : Number(record?.__line ?? -1);
+  return `${prefix}-source-${sessionId || 'unknown'}-${position}`;
+}
+
 function parseTimestampMs(value) {
   const ms = value ? Date.parse(value) : NaN;
   return Number.isFinite(ms) ? ms : NaN;
@@ -1074,6 +1081,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
   const source = call?.toolName === 'exec' && typeof call?.args?.input === 'string'
     ? call.args.input
     : '';
+  const callId = call?.callId == null ? '' : String(call.callId);
   const nested = source ? findCodexExecNestedCalls(source) : [];
   const callGroups = [];
   const usedPatchEventIndexes = new Set();
@@ -1107,9 +1115,10 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
 
   const cellId = call?.toolName === 'exec' ? codexHistoryCellId(rawOutput) : null;
   if (!cellId) assignCodexHistoryResults(callGroups, rawOutput, isError);
-  const actions = callGroups.flat().map((action) => ({
+  const actions = callGroups.flat().map((action, index) => ({
     tool: '__raw__',
     rawTool: {
+      ...(callId ? { toolUseId: `${callId}:canonical:${index}` } : {}),
       toolName: action.toolName,
       args: action.args || {},
       result: action.result,
@@ -1451,12 +1460,18 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
   let leftoverBuffer = Buffer.isBuffer(options.leftoverBuffer)
     ? Buffer.from(options.leftoverBuffer)
     : Buffer.from(String(options.leftover || ''), 'utf8');
+  let nextChunkOffset = Math.max(0, Number(startByte) || 0);
+  let leftoverStartOffset = Math.max(0, nextChunkOffset - leftoverBuffer.length);
 
   const consume = (chunk) => {
     if (!chunk?.length) return;
+    const chunkBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const dataStartOffset = leftoverBuffer.length > 0
+      ? leftoverStartOffset
+      : nextChunkOffset;
     const data = leftoverBuffer.length > 0
-      ? Buffer.concat([leftoverBuffer, chunk])
-      : chunk;
+      ? Buffer.concat([leftoverBuffer, chunkBuffer])
+      : chunkBuffer;
     let lineStart = 0;
     let newlineIndex = data.indexOf(0x0a, lineStart);
     while (newlineIndex >= 0) {
@@ -1464,7 +1479,11 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
       if (line) {
         try {
           const record = JSON.parse(line);
-          records.push({ ...record, __line: lineCount });
+          records.push({
+            ...record,
+            __line: lineCount,
+            __byteOffset: dataStartOffset + lineStart,
+          });
           parsed += 1;
         } catch {
           errors += 1;
@@ -1475,6 +1494,8 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
       newlineIndex = data.indexOf(0x0a, lineStart);
     }
     leftoverBuffer = Buffer.from(data.subarray(lineStart));
+    leftoverStartOffset = dataStartOffset + lineStart;
+    nextChunkOffset += chunkBuffer.length;
   };
 
   if (endByte >= startByte) {
@@ -2329,10 +2350,25 @@ async function findCodexDescendantSessions(options = {}) {
   return inspection.descendants;
 }
 
-function pushAssistantEntry(entries, sessionId, record, turnIndex, content, thinking, actions, identityLine = record.__line) {
+function pushAssistantEntry(
+  entries,
+  sessionId,
+  record,
+  turnIndex,
+  content,
+  thinking,
+  actions,
+  identityLine = record.__line,
+  identityByteOffset = record.__byteOffset,
+) {
   if (!content && !thinking && (!actions || actions.length === 0)) return;
+  const identityRecord = {
+    __line: identityLine,
+    __byteOffset: identityByteOffset,
+  };
   entries.push({
     uuid: stableUuid(sessionId, identityLine, 'codex-assistant'),
+    sourceIdentity: stableSourceIdentity(sessionId, identityRecord, 'codex-assistant'),
     role: 'assistant',
     timestamp: recordTimestamp(record),
     content: content || '',
@@ -2447,6 +2483,7 @@ function buildCodexTimeline(records, sessionId) {
         const text = payload.message || extractTextContent(payload.content) || '';
         const entry = {
           uuid: stableUuid(sessionId, record.__line, 'codex-user'),
+          sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
           type: 'user',
           timestamp: recordTimestamp(record),
           content: text,
@@ -2603,12 +2640,21 @@ function buildCodexFullHistory(records, sessionId) {
     }
 
     if (record.type === 'event_msg') {
+      if (
+        payload.type === 'user_message'
+        || payload.type === 'task_started'
+        || payload.type === 'task_complete'
+        || payload.type === 'turn_aborted'
+      ) {
+        pendingThinking = '';
+      }
       if (payload.type === 'patch_apply_end') {
         attachCodexPatchApplyEvent(pendingCalls, payload, sessionCwd);
       } else if (payload.type === 'user_message') {
         currentTurnIndex += 1;
         entries.push({
           uuid: stableUuid(sessionId, record.__line, 'codex-user'),
+          sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
           role: 'user',
           timestamp: recordTimestamp(record),
           content: payload.message || extractTextContent(payload.content) || '',
@@ -2663,6 +2709,7 @@ function buildCodexFullHistory(records, sessionId) {
           ? { input: payload.input }
           : (payload.input || {}));
       pendingCalls.set(callId, {
+        callId,
         toolName: payload.name || payload.tool_name || payload.type,
         namespace: payload.namespace || '',
         args: args && typeof args === 'object' ? args : { value: args },
@@ -2675,6 +2722,7 @@ function buildCodexFullHistory(records, sessionId) {
         patchApplyEvents: [],
         timestamp: recordTimestamp(record),
         line: record.__line,
+        byteOffset: record.__byteOffset,
         record,
       });
       continue;
@@ -2683,11 +2731,13 @@ function buildCodexFullHistory(records, sessionId) {
     if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
       const callId = payload.call_id || payload.id;
       const call = pendingCalls.get(callId) || {
+        callId,
         toolName: payload.name || payload.type,
         namespace: payload.namespace || '',
         args: {},
         timestamp: recordTimestamp(record),
         line: record.__line,
+        byteOffset: record.__byteOffset,
       };
       const waitCellId = call.toolName === 'wait' ? String(call.args?.cell_id || '') : '';
       const pendingCellActions = waitCellId ? pendingExecCells.get(waitCellId) : null;
@@ -2700,7 +2750,17 @@ function buildCodexFullHistory(records, sessionId) {
         // The call row owns the visible card identity. Completion enriches that
         // same card instead of replacing it with an output-line row, preserving
         // collapse state and Virtuoso measurement during streaming.
-        pushAssistantEntry(entries, sessionId, record, currentTurnIndex, '', pendingThinking, decoded.actions, call.line);
+        pushAssistantEntry(
+          entries,
+          sessionId,
+          record,
+          currentTurnIndex,
+          '',
+          pendingThinking,
+          decoded.actions,
+          call.line,
+          call.byteOffset,
+        );
         if (decoded.cellId) pendingExecCells.set(decoded.cellId, decoded.actions);
       }
       pendingThinking = '';

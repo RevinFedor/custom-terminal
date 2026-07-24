@@ -103,6 +103,72 @@ function resolveCompleteCodexWriterProof(reports, failures, sessionsDir) {
   };
 }
 
+function isRetryableCodexDescriptorProbeTimeout(error) {
+  if (!error) return false;
+  const code = String(error.code || '').toUpperCase();
+  if (code === 'ETIMEDOUT') return true;
+  return error.killed === true
+    && (error.signal === 'SIGTERM' || error.signal === 'SIGKILL');
+}
+
+function shouldRetryCodexDescriptorProbePass(result) {
+  const failures = Array.isArray(result?.failures) ? result.failures : [];
+  return result?.status === 'unknown'
+    && failures.length > 0
+    && failures.every((failure) => failure?.retryableTimeout === true);
+}
+
+async function runCodexDescriptorProbeWithSingleRetry(inspect, {
+  isGenerationCurrent = () => true,
+  onRetry = null,
+} = {}) {
+  if (typeof inspect !== 'function') throw new TypeError('inspect must be a function');
+  if (typeof isGenerationCurrent !== 'function') {
+    throw new TypeError('isGenerationCurrent must be a function');
+  }
+
+  const first = await inspect(1);
+  if (!shouldRetryCodexDescriptorProbePass(first)) return first;
+  if (!isGenerationCurrent()) {
+    return {
+      ...first,
+      status: 'unknown',
+      error: 'writer_process_generation_changed_before_descriptor_retry',
+      descriptorRetry: {
+        attempted: false,
+        skippedReason: 'generation-changed-before-retry',
+        firstError: first?.error || null,
+      },
+    };
+  }
+
+  if (typeof onRetry === 'function') onRetry({ attempt: 2, first });
+  const second = await inspect(2);
+  if (!isGenerationCurrent()) {
+    return {
+      ...second,
+      status: 'unknown',
+      error: 'writer_process_generation_changed_after_descriptor_retry',
+      descriptorRetry: {
+        attempted: true,
+        skippedReason: 'generation-changed-after-retry',
+        firstError: first?.error || null,
+        secondError: second?.error || null,
+      },
+    };
+  }
+
+  return {
+    ...second,
+    descriptorRetry: {
+      attempted: true,
+      firstError: first?.error || null,
+      secondError: second?.error || null,
+      recovered: second?.status !== 'unknown',
+    },
+  };
+}
+
 const CODEX_HANDOFF_LIVE_PROOF_KINDS = new Set([
   'rollout-created',
   'rollout-live-append',
@@ -197,6 +263,7 @@ function selectCodexNativeRewindWriter(candidates, {
   actionStartedAtMs = null,
   liveProofs = [],
   lineage = [],
+  stableSourceProof = null,
 } = {}) {
   const allCandidates = Array.isArray(candidates) ? candidates : [];
   if (kind !== 'native-rewind') {
@@ -214,6 +281,34 @@ function selectCodexNativeRewindWriter(candidates, {
   }
 
   const { parents, conflicts } = buildCodexHandoffParentMap(allCandidates, lineage);
+  if (stableSourceProof) {
+    const soleCandidate = allCandidates.length === 1 ? allCandidates[0] : null;
+    const soleMeta = candidateSessionMeta(soleCandidate);
+    const stableSourceSelected = stableSourceProof.kind === 'native-rewind-stable-source'
+      && stableSourceProof.rollbackDurable === true
+      && stableSourceProof.journalPhase === 'rollback-applied'
+      && stableSourceProof.terminalGenerationMatches === true
+      && stableSourceProof.runSeqMatches === true
+      && stableSourceProof.boundSessionMatches === true
+      && String(stableSourceProof.sessionId || '') === String(sourceSessionId)
+      && String(stableSourceProof.actionGeneration || '') === String(actionGeneration)
+      && Number(stableSourceProof.appliedAtMs) >= startedAt
+      && String(soleMeta.id || '') === String(sourceSessionId);
+    if (stableSourceSelected) {
+      return {
+        status: 'selected',
+        candidate: soleCandidate,
+        sessionId: String(sourceSessionId),
+        sourceSessionId: String(sourceSessionId),
+        actionGeneration,
+        lineageDepth: 0,
+        lineageRelation: 'stable-source',
+        stableSourceProof,
+        candidates: allCandidates,
+        rejected: [],
+      };
+    }
+  }
   const proven = [];
   const rejected = [];
   for (const candidate of allCandidates) {
@@ -467,7 +562,8 @@ function isCommittedCodexNativeRewindReplay({
     || observerCurrent !== true) {
     return false;
   }
-  return String(proof.sessionId || '') === String(candidateSessionId)
+  return String(candidateSessionId) !== String(intent.sourceSessionId)
+    && String(proof.sessionId || '') === String(candidateSessionId)
     && String(proof.sourceSessionId || '') === String(intent.sourceSessionId)
     && String(proof.actionGeneration || proof.launchId || '') === String(intent.launchId)
     && String(currentIntentGeneration || '') === String(intent.launchId)
@@ -477,6 +573,55 @@ function isCommittedCodexNativeRewindReplay({
     && Number.isInteger(Number(runSeq))
     && Number(runSeq) > 0
     && Number(proof.runSeq) === Number(runSeq);
+}
+
+/**
+ * Select the durable completion proof after a native Rewind restored prompt
+ * has been verified and removed from the TUI composer.
+ *
+ * The child may commit before this point and consume the handoff journal. If
+ * it has not, the source-in-place path must durably advance that journal. A
+ * failed source CAS is reclassified only when the exact child commit became
+ * visible during that CAS; journal absence by itself is never sufficient.
+ */
+function resolveCodexRewindCompletionProof({
+  committedChildBeforeStableProof = false,
+  stableSourceProof = null,
+  committedChildAfterStableProof = false,
+} = {}) {
+  if (committedChildBeforeStableProof === true) {
+    return {
+      success: true,
+      proofMode: 'committed-child',
+      racedWithStableSourceProof: false,
+    };
+  }
+  if (stableSourceProof?.success === true) {
+    return {
+      success: true,
+      proofMode: 'stable-source',
+      racedWithStableSourceProof: false,
+    };
+  }
+  if (committedChildAfterStableProof === true) {
+    return {
+      success: true,
+      proofMode: 'committed-child',
+      racedWithStableSourceProof: true,
+    };
+  }
+  return {
+    success: false,
+    proofMode: 'unresolved',
+    error: stableSourceProof?.error || 'codex_rewind_completion_proof_missing',
+  };
+}
+
+function shouldCloseCodexRewindProtocolUi({
+  protocolUiOpen = false,
+  handoffMutationStarted = false,
+} = {}) {
+  return protocolUiOpen === true && handoffMutationStarted !== true;
 }
 
 function classifyCodexWriterObservationScope({
@@ -670,23 +815,32 @@ function classifyCodexBranchWriterHandoffSettlement({
   turnBusy = false,
   tuiReady = false,
 } = {}) {
-  const branchWriterProven = selection?.status === 'selected'
+  const selectionProven = selection?.status === 'selected'
     && !!actionGeneration
     && actionGeneration === observerGeneration
     && selection.actionGeneration === actionGeneration
     && selection.sessionId === adoptedSessionId;
+  const stableWriterProven = selectionProven
+    && selection.lineageRelation === 'stable-source'
+    && selection.stableSourceProof?.rollbackDurable === true;
+  const branchWriterProven = selectionProven && !stableWriterProven;
   const settlement = classifyCodexWriterHandoffSettlement({
     adoptionStatus,
     processRunning,
     turnBusy,
     tuiReady,
     writerChanged: branchWriterProven,
+    stableWriterProven,
   });
   return {
     ...settlement,
     branchWriterProven,
-    handoffReason: branchWriterProven
-      ? 'proven-descendant'
+    stableWriterProven,
+    writerHandoffProven: branchWriterProven || stableWriterProven,
+    handoffReason: stableWriterProven
+      ? 'proven-stable-source'
+      : branchWriterProven
+        ? 'proven-descendant'
       : selection?.status !== 'selected'
         ? (selection?.reason || 'branch-selection-unresolved')
         : actionGeneration !== observerGeneration
@@ -778,7 +932,13 @@ function classifyManualCodexSubmitAfterWriteQueue({
   // in progress must not become a second submit after that operation releases
   // the PTY lock. The operation object is intentionally observed by reference:
   // it is queued first, then marks `submitted` at the exact term.write boundary.
-  if (precedingOperation?.identityPending === true && precedingOperation?.submitted === true) {
+  if (
+    precedingOperation?.submitted === true
+    && (
+      precedingOperation?.identityPending === true
+      || precedingOperation?.kind === 'safe-paste'
+    )
+  ) {
     return { suppress: true, bypassQueue: false, reason: 'preceding-first-submit-won' };
   }
   // Resume has an additional launch-scoped reservation. A reservation owned by
@@ -947,6 +1107,9 @@ module.exports = {
   classifyCodexWriterHandoffSettlement,
   claimExclusiveActionReservation,
   claimCodexResumeSourceLease,
+  isRetryableCodexDescriptorProbeTimeout,
+  runCodexDescriptorProbeWithSingleRetry,
+  shouldRetryCodexDescriptorProbePass,
   parseLsofFieldRecords,
   releaseExclusiveActionReservation,
   releaseCodexResumeSourceLeases,
@@ -954,6 +1117,8 @@ module.exports = {
   resolveCodexUserWriterProof,
   resolveCodexWriterProof,
   isCommittedCodexNativeRewindReplay,
+  resolveCodexRewindCompletionProof,
+  shouldCloseCodexRewindProtocolUi,
   classifyCodexWriterObservationScope,
   deriveCodexSettledWriterProofScope,
   shouldUseSettledCodexRewindWriterProof,

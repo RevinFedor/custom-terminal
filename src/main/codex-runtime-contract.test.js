@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const {
   advanceOscCommandGeneration,
   attachCodexSettingsProofOwner,
+  codexLiveSlashAllowsTurnBusy,
   codexSessionIdFromAuthoritativeStatus,
   consumePendingCodexSettingsProofHandoff,
   createCodexLaunchPendingResult,
@@ -15,14 +16,25 @@ const {
   planCodexCommandLaunchSettings,
   planCodexLaunchSettings,
   planCodexPickerMovement,
+  projectPendingCodexSettingsProofOwner,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
+  resolveCodexPickerCurrentWriterSessionId,
   shouldClearCodexLaunchPending,
   shouldHoldCodexStartingOnAbsent,
   shouldSurfaceCodexStartupTimeout,
   validateCodexPickerRuntimeAdmission,
   validateCodexPtySubmitAdmission,
 } = require('./codex-runtime-contract');
+
+test('only the native FAST service-tier command is admitted during an active turn', () => {
+  assert.equal(codexLiveSlashAllowsTurnBusy('/fast'), true);
+  assert.equal(codexLiveSlashAllowsTurnBusy('  /FAST  '), true);
+  assert.equal(codexLiveSlashAllowsTurnBusy('/fast now'), false);
+  assert.equal(codexLiveSlashAllowsTurnBusy('/model'), false);
+  assert.equal(codexLiveSlashAllowsTurnBusy('/fastest'), false);
+  assert.equal(codexLiveSlashAllowsTurnBusy('fast'), false);
+});
 
 test('first exact OSC command-start confirms the launch-preclaimed generation once', () => {
   assert.deepEqual(advanceOscCommandGeneration({
@@ -437,6 +449,43 @@ test('partial picker admission CAS-checks the active writer while full pairs nee
   });
 });
 
+test('picker writer CAS accepts only the exact idle provisional Resume authorization', () => {
+  const provisional = {
+    provisionalWriterSessionId: 'source-a',
+    provisionalAuthorized: true,
+    sameTerminal: true,
+    sameRunSeq: true,
+    sameLaunch: true,
+    sameDiscovery: true,
+    sameLease: true,
+    hasInflight: false,
+  };
+  assert.equal(resolveCodexPickerCurrentWriterSessionId(provisional), 'source-a');
+  for (const key of [
+    'provisionalAuthorized',
+    'sameTerminal',
+    'sameRunSeq',
+    'sameLaunch',
+    'sameDiscovery',
+    'sameLease',
+  ]) {
+    assert.equal(resolveCodexPickerCurrentWriterSessionId({
+      ...provisional,
+      [key]: false,
+    }), null, key);
+  }
+  assert.equal(resolveCodexPickerCurrentWriterSessionId({
+    ...provisional,
+    hasInflight: true,
+  }), null);
+  assert.equal(resolveCodexPickerCurrentWriterSessionId({
+    ...provisional,
+    provenWriterSessionId: 'child-b',
+    sameLease: false,
+    hasInflight: true,
+  }), 'child-b');
+});
+
 test('picker proof is owned by the writer observed after queued application', () => {
   assert.deepEqual(attachCodexSettingsProofOwner({
     success: true,
@@ -500,6 +549,85 @@ test('fresh picker proof follows only the first writer from the exact PTY genera
     proof: { model: 'gpt-5.6-sol', effort: 'ultra', proofAt: 123 },
     nextPending: null,
   });
+});
+
+test('verified fresh-composer settings become owned by the first writer of that launch', () => {
+  const terminalToken = {};
+  const pending = createPendingCodexSettingsProofHandoff({
+    result: {
+      success: true,
+      model: 'gpt-5.6-sol',
+      effort: 'max',
+      fast: true,
+      applicationProofSource: 'verified-composer-footer',
+    },
+    terminalToken,
+    runSeq: 4,
+    launchId: 'launch-fresh',
+    appliedAt: 1234,
+  });
+  assert.deepEqual(consumePendingCodexSettingsProofHandoff(pending, {
+    terminalToken,
+    runSeq: 4,
+    launchId: 'launch-fresh',
+    writerSessionId: 'writer-fresh',
+  }), {
+    carry: true,
+    reason: 'same-live-generation-first-writer',
+    proof: {
+      model: 'gpt-5.6-sol',
+      effort: 'max',
+      proofAt: 1234,
+    },
+    nextPending: null,
+  });
+  assert.deepEqual(projectPendingCodexSettingsProofOwner(pending, {
+    terminalToken,
+    runSeq: 4,
+  }), {
+    ownerId: 'launch:launch-fresh',
+    launchId: 'launch-fresh',
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+    fast: true,
+    proofAt: 1234,
+    applicationProofSource: 'verified-composer-footer',
+  });
+  assert.equal(projectPendingCodexSettingsProofOwner(pending, {
+    terminalToken,
+    runSeq: 5,
+  }), null);
+  assert.equal(projectPendingCodexSettingsProofOwner(pending, {
+    terminalToken: {},
+    runSeq: 4,
+  }), null);
+  assert.equal(projectPendingCodexSettingsProofOwner(pending, {
+    terminalToken,
+    runSeq: 4,
+    expectedOwnerId: 'launch:another-launch',
+  }), null);
+});
+
+test('fresh launch arguments and defaults are requests, not settings proof', () => {
+  for (const applicationProofSource of [
+    'fresh-launch-command-line',
+    'persistent-fallback',
+    'tab-or-explicit',
+    'global',
+    'native',
+  ]) {
+    assert.equal(createPendingCodexSettingsProofHandoff({
+      result: {
+        success: true,
+        model: 'gpt-5.6-sol',
+        effort: 'max',
+        applicationProofSource,
+      },
+      terminalToken: {},
+      runSeq: 4,
+      launchId: 'launch-unproven',
+    }), null, applicationProofSource);
+  }
 });
 
 test('Resume/Fork source settings proof transfers only to the first exact launch writer', () => {

@@ -41,6 +41,156 @@ function rawActions(history) {
   return history.flatMap((entry) => entry.actions || []).map((action) => action.rawTool);
 }
 
+test('assistant source identity follows the JSONL byte owner, not a transient live UUID', () => {
+  const records = [
+    {
+      __line: 1,
+      __byteOffset: 128,
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'inspect tools' },
+    },
+    {
+      __line: 2,
+      __byteOffset: 512,
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'done' }],
+      },
+    },
+  ];
+  const history = _api.buildCodexFullHistory(records, 'history-tools-session');
+  const assistant = history.find((entry) => entry.role === 'assistant');
+
+  assert.equal(
+    assistant?.sourceIdentity,
+    'codex-assistant-source-history-tools-session-512',
+  );
+});
+
+test('user source identity follows the exact rollout byte owner', () => {
+  const records = [{
+    __line: 7,
+    __byteOffset: 2_048,
+    timestamp: '2026-07-24T16:36:23.583Z',
+    type: 'event_msg',
+    payload: { type: 'user_message', message: 'same prompt' },
+  }];
+  const history = _api.buildCodexFullHistory(records, 'history-user-session');
+  const user = history.find((entry) => entry.role === 'user');
+
+  assert.equal(
+    user?.sourceIdentity,
+    'codex-user-source-history-user-session-2048',
+  );
+});
+
+test('does not carry reasoning from an aborted turn into the next prompt answer', () => {
+  const records = [
+    {
+      __line: 1,
+      __byteOffset: 0,
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'first prompt' },
+    },
+    {
+      __line: 2,
+      __byteOffset: 100,
+      type: 'event_msg',
+      payload: { type: 'task_started', turn_id: 'turn-aborted' },
+    },
+    {
+      __line: 3,
+      __byteOffset: 200,
+      type: 'response_item',
+      payload: {
+        type: 'reasoning',
+        summary: [{ type: 'summary_text', text: 'reasoning from aborted turn' }],
+      },
+    },
+    {
+      __line: 4,
+      __byteOffset: 300,
+      type: 'event_msg',
+      payload: { type: 'turn_aborted', turn_id: 'turn-aborted' },
+    },
+    {
+      __line: 5,
+      __byteOffset: 400,
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'second prompt' },
+    },
+    {
+      __line: 6,
+      __byteOffset: 500,
+      type: 'event_msg',
+      payload: { type: 'task_started', turn_id: 'turn-next' },
+    },
+    {
+      __line: 7,
+      __byteOffset: 600,
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'fresh answer' }],
+      },
+    },
+    {
+      __line: 8,
+      __byteOffset: 700,
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'turn-next' },
+    },
+  ];
+
+  const history = _api.buildCodexFullHistory(records, 'history-tools-session');
+  const answer = history.find((entry) =>
+    entry.role === 'assistant' && entry.content === 'fresh answer'
+  );
+
+  assert.ok(answer);
+  assert.equal(answer.thinking, undefined);
+  assert.equal(
+    history.some((entry) => entry.thinking?.includes('reasoning from aborted turn')),
+    false,
+  );
+});
+
+test('turn abort itself clears pending reasoning before any later assistant record', () => {
+  const records = [
+    {
+      __line: 1,
+      type: 'response_item',
+      payload: {
+        type: 'reasoning',
+        summary: [{ type: 'summary_text', text: 'aborted reasoning' }],
+      },
+    },
+    {
+      __line: 2,
+      type: 'event_msg',
+      payload: { type: 'turn_aborted', turn_id: 'turn-aborted' },
+    },
+    {
+      __line: 3,
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'later answer' }],
+      },
+    },
+  ];
+
+  const history = _api.buildCodexFullHistory(records, 'history-tools-session');
+  const answer = history.find((entry) => entry.content === 'later answer');
+
+  assert.ok(answer);
+  assert.equal(answer.thinking, undefined);
+});
+
 test('renders nested exec_command as a Bash card instead of EXEC source', () => {
   const source = [
     'const result = await tools.exec_command({',
@@ -164,6 +314,29 @@ test('keeps a tool card uuid stable when its output arrives', () => {
   assert.ok(completedCard);
   assert.equal(completedCard.uuid, pendingCard.uuid);
   assert.equal(completedCard.actions[0].rawTool.result, 'done');
+});
+
+test('keeps the live call identity in durable tool results without changing the card uuid', () => {
+  const pending = historyFor(execCall('exec-live-identity', 'text("pending")'));
+  const completed = historyFor(
+    execCall('exec-live-identity', 'text("pending")'),
+    output('exec-live-identity', 'done'),
+  );
+  const pendingCard = pending.find((entry) => entry.actions?.length);
+  const completedCard = completed.find((entry) => entry.actions?.length);
+
+  assert.ok(pendingCard);
+  assert.ok(completedCard);
+  assert.equal(pendingCard.uuid, 'codex-assistant-history-tools-session-2');
+  assert.equal(completedCard.uuid, pendingCard.uuid);
+  assert.equal(
+    pendingCard.actions[0].rawTool.toolUseId,
+    'exec-live-identity:canonical:0',
+  );
+  assert.equal(
+    completedCard.actions[0].rawTool.toolUseId,
+    'exec-live-identity:canonical:0',
+  );
 });
 
 test('uses canonical patch_apply_end diff content and original line numbers', () => {

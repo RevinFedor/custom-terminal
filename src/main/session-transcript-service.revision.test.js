@@ -246,6 +246,111 @@ test('Codex history revision changes when prompt presentation metadata changes',
   assert.notEqual(raced.revision.token, refreshed.revision.token);
 });
 
+test('Codex history revision changes when response timing binds without a JSONL write', async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'transcript-timing-revision-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'session-a.jsonl');
+  await fs.promises.writeFile(filePath, '{"type":"session_meta"}\n');
+
+  let timingRevision = 'timing-pending';
+  let timingBound = false;
+  let loadCalls = 0;
+  const assistantEntry = {
+    uuid: 'codex-assistant-session-a-4',
+    sourceIdentity: 'codex-assistant:session-a:4',
+    role: 'assistant',
+    content: 'done',
+    timestamp: '2026-07-24T00:00:04.000Z',
+    sessionId: 'session-a',
+  };
+  const codexData = {
+    _api: {
+      findCodexSessionFile: async () => ({ filePath }),
+      loadSessionRecords: async () => {
+        loadCalls += 1;
+        const stat = await fs.promises.stat(filePath);
+        return {
+          success: true,
+          records: [{ type: 'record' }],
+          filePath,
+          sourceSnapshot: {
+            filePath,
+            size: stat.size,
+            mtimeMs: stat.mtimeMs,
+            sessionId: 'session-a',
+            linkKind: 'end',
+          },
+        };
+      },
+      buildCodexFullHistory: () => [assistantEntry],
+    },
+  };
+  const timingStore = {
+    getHistoryPromptPresentationRevision: () => 'none',
+    getHistoryPromptPresentations: () => [],
+    getHistoryPromptPresentationsForEntries: () => [],
+    getHistoryResponseTimingRevision: () => timingRevision,
+    getPendingHistoryResponseTimings: () => timingBound ? [] : [{
+      intervalId: 1,
+      tabId: 'tab-a',
+      sessionId: 'session-a',
+      startTs: Date.parse('2026-07-24T00:00:00.000Z'),
+      endTs: Date.parse('2026-07-24T00:00:05.000Z'),
+      durationMs: 5_000,
+    }],
+    bindHistoryResponseTimingEntry: ({ entryUuid }) => {
+      assert.equal(entryUuid, assistantEntry.uuid);
+      timingBound = true;
+      timingRevision = 'timing-bound';
+      return true;
+    },
+    getHistoryResponseTimingsForEntries: () => timingBound ? [{
+      intervalId: 1,
+      entryUuid: assistantEntry.uuid,
+      startTs: Date.parse('2026-07-24T00:00:00.000Z'),
+      endTs: Date.parse('2026-07-24T00:00:05.000Z'),
+      durationMs: 5_000,
+    }] : [],
+  };
+  const service = new SessionTranscriptService({
+    getMainWindow: () => null,
+    webBroadcast: null,
+    claudeData: null,
+    codexData,
+    promptPresentationStore: timingStore,
+  });
+
+  const first = await service.getHistory({
+    toolType: 'codex',
+    sessionId: 'session-a',
+    cwd: dir,
+    tabId: 'tab-a',
+  });
+  assert.equal(first.entries[0].responseTiming.durationMs, 5_000);
+  assert.equal(timingBound, true);
+
+  const unchanged = await service.getHistory({
+    toolType: 'codex',
+    sessionId: 'session-a',
+    cwd: dir,
+    tabId: 'tab-a',
+    ifRevision: first.revision,
+  });
+  assert.equal(unchanged.unchanged, true);
+  assert.equal(loadCalls, 1);
+
+  timingRevision = 'timing-rebound';
+  const refreshed = await service.getHistory({
+    toolType: 'codex',
+    sessionId: 'session-a',
+    cwd: dir,
+    tabId: 'tab-a',
+    ifRevision: first.revision,
+  });
+  assert.equal(refreshed.unchanged, false);
+  assert.equal(loadCalls, 2);
+});
+
 test('a transcript change received during an active read gets one trailing read', async () => {
   const service = new SessionTranscriptService({
     getMainWindow: () => null,

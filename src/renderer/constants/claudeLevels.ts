@@ -16,10 +16,9 @@ export const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'u
 export type ClaudeEffortLevel = typeof CLAUDE_EFFORT_LEVELS[number];
 
 // ultracode gets special UI treatment: purple accent + "this turns on
-// auto-workflows" tooltip. Branch on this, don't hardcode. NOT gated by model
-// (effort gating was reverted — real Claude Code offers every level to every
-// model, incl. Haiku). SDK transport differs: ultracode → effort=xhigh +
-// settings.ultracode (the --effort flag's enum rejects 'ultracode').
+// auto-workflows" tooltip. Branch on this, don't hardcode. SDK transport
+// differs: ultracode → effort=xhigh + settings.ultracode (the --effort flag's
+// enum rejects 'ultracode').
 export const CLAUDE_ULTRACODE: ClaudeEffortLevel = 'ultracode';
 
 // 'none' is our own UI sentinel meaning "don't auto-inject /effort at all".
@@ -49,28 +48,216 @@ export const DEEPSEEK_EFFORT_LEVELS = ['off', 'low', 'medium', 'high'] as const;
 export type DeepSeekEffortLevel = typeof DEEPSEEK_EFFORT_LEVELS[number];
 
 export interface ClaudeCodeModelOption {
+  /**
+   * Stable identity of the configured row. `id` is the command sent to Claude
+   * and users are allowed to edit it, so it cannot safely be used to decide
+   * whether a built-in row has disappeared during migration.
+   */
+  key?: string;
   id: string;
   label: string;
+  /** Levels the user chose to expose for this specific model. */
+  efforts?: string[];
+  /**
+   * Hard capability limit for the row. This is deliberately separate from
+   * `efforts`: turning a checkbox off must not make the level disappear from
+   * settings, while a model such as Haiku must never offer unsupported levels.
+   */
+  supportedEfforts?: string[];
+  /** Hidden models stay configured but are omitted from ordinary pickers. */
+  visible?: boolean;
   cmd?: boolean;
 }
 
 export interface ClaudeCodeSettings {
   models: ClaudeCodeModelOption[];
-  efforts: string[];
+  /** Built-in rows explicitly removed by the user must not be re-added. */
+  deletedModelKeys?: string[];
+  /** One model/effort pair for the Claude ControlBar quick-switch button. */
+  quickModel?: string | null;
+  quickEffort?: string | null;
+  /** Legacy global list, accepted only while migrating older saved settings. */
+  efforts?: string[];
 }
 
+const DEFAULT_CLAUDE_EFFORTS = [...CLAUDE_EFFORT_LEVELS];
+const DEFAULT_HAIKU_EFFORTS = ['low', 'medium', 'high', 'xhigh'];
+
 // Claude model name list — same memoization concern, ships from Anthropic.
+// Haiku deliberately stops at xhigh: the current CLI metadata does not expose
+// max for it, and ultracode is not an available choice for that row.
 export const DEFAULT_CLAUDE_CODE_MODELS: ClaudeCodeModelOption[] = [
-  { id: 'default', label: 'default', cmd: true },
-  { id: 'sonnet', label: 'sonnet', cmd: true },
-  { id: 'opus', label: 'opus', cmd: true },
-  { id: 'haiku', label: 'haiku', cmd: true },
-  { id: 'claude-fable-5[1m]', label: 'fable', cmd: true },
+  { key: 'default', id: 'default', label: 'default', efforts: [...DEFAULT_CLAUDE_EFFORTS], supportedEfforts: [...DEFAULT_CLAUDE_EFFORTS], visible: true, cmd: true },
+  { key: 'sonnet', id: 'sonnet', label: 'sonnet', efforts: [...DEFAULT_CLAUDE_EFFORTS], supportedEfforts: [...DEFAULT_CLAUDE_EFFORTS], visible: true, cmd: true },
+  { key: 'opus', id: 'opus', label: 'opus', efforts: [...DEFAULT_CLAUDE_EFFORTS], supportedEfforts: [...DEFAULT_CLAUDE_EFFORTS], visible: true, cmd: true },
+  { key: 'haiku', id: 'haiku', label: 'haiku', efforts: [...DEFAULT_HAIKU_EFFORTS], supportedEfforts: [...DEFAULT_HAIKU_EFFORTS], visible: true, cmd: true },
+  { key: 'fable', id: 'fable', label: 'fable', efforts: [...DEFAULT_CLAUDE_EFFORTS], supportedEfforts: [...DEFAULT_CLAUDE_EFFORTS], visible: true, cmd: true },
 ];
 
 export const DEFAULT_CLAUDE_CODE_SETTINGS: ClaudeCodeSettings = {
-  models: DEFAULT_CLAUDE_CODE_MODELS,
-  efforts: [...CLAUDE_EFFORT_LEVELS],
+  models: DEFAULT_CLAUDE_CODE_MODELS.map((model) => ({
+    ...model,
+    efforts: [...(model.efforts || [])],
+    supportedEfforts: [...(model.supportedEfforts || [])],
+  })),
+  deletedModelKeys: [],
+  quickModel: null,
+  quickEffort: null,
+};
+
+const normalizeClaudeEffortValues = (raw: unknown): string[] => (
+  Array.isArray(raw)
+    ? raw
+      .map((value) => String(value || '').trim())
+      .filter((value, index, values) => (
+        CLAUDE_EFFORT_LEVELS.includes(value as ClaudeEffortLevel)
+        && values.indexOf(value) === index
+      ))
+    : []
+);
+
+const normalizeClaudeEffortList = (raw: unknown, fallback: string[]): string[] => {
+  const efforts = normalizeClaudeEffortValues(raw);
+  return efforts.length > 0 ? efforts : [...fallback];
+};
+
+const defaultClaudeModelForKey = (key: string | undefined): ClaudeCodeModelOption | undefined => (
+  DEFAULT_CLAUDE_CODE_MODELS.find((model) => model.key === key)
+);
+
+const inferClaudeModelKey = (raw: Record<string, unknown>, index: number): string => {
+  const explicit = typeof raw.key === 'string' ? raw.key.trim() : '';
+  if (explicit) return explicit;
+
+  const id = String(raw.id || '').trim().toLowerCase();
+  const label = String(raw.label || '').trim().toLowerCase();
+  if (id === 'claude-fable-5' || id === 'claude-fable-5[1m]' || id === 'fable' || label === 'fable') return 'fable';
+  for (const model of DEFAULT_CLAUDE_CODE_MODELS) {
+    if (id === model.id || label === model.label) return model.key || model.id;
+  }
+
+  // Older versions had a fixed, non-reorderable list. Preserve the user's
+  // edited command by assigning the row its original stable identity.
+  const positional = DEFAULT_CLAUDE_CODE_MODELS[index]?.key;
+  if (positional && !explicit) return positional;
+  return explicit || `custom:${id || index}`;
+};
+
+const normalizeDeletedClaudeModelKeys = (raw: unknown): string[] => (
+  Array.isArray(raw)
+    ? raw
+      .map((value) => String(value || '').trim())
+      .filter((value, index, values) => value && values.indexOf(value) === index)
+    : []
+);
+
+/** The full model-specific list rendered as checkbox choices in settings. */
+export const claudeSupportedEffortsForModel = (
+  model: Pick<ClaudeCodeModelOption, 'key' | 'supportedEfforts'> | undefined,
+): string[] => {
+  const shipped = defaultClaudeModelForKey(model?.key);
+  const candidate = normalizeClaudeEffortValues(model?.supportedEfforts);
+  if (candidate.length > 0) return candidate;
+  const shippedCandidate = normalizeClaudeEffortValues(shipped?.supportedEfforts || shipped?.efforts);
+  return shippedCandidate.length > 0 ? shippedCandidate : [...DEFAULT_CLAUDE_EFFORTS];
+};
+
+/**
+ * Accept the old global-effort shape and migrate it into per-model rows.
+ * A row's stable `key` prevents a command edit (notably Fable → `fable`) from
+ * being mistaken for deletion and causing the shipped default to be appended.
+ */
+export const normalizeClaudeCodeSettings = (raw: unknown): ClaudeCodeSettings => {
+  const obj = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+  const legacyEfforts = normalizeClaudeEffortList(obj.efforts, DEFAULT_CLAUDE_EFFORTS);
+  const rawModels = Array.isArray(obj.models) ? obj.models : [];
+  const deletedModelKeys = normalizeDeletedClaudeModelKeys(obj.deletedModelKeys);
+  const deleted = new Set(deletedModelKeys);
+  const models: ClaudeCodeModelOption[] = [];
+  const seen = new Set<string>();
+
+  rawModels.forEach((value, index) => {
+    if (!value || typeof value !== 'object') return;
+    const item = value as Record<string, unknown>;
+    const key = inferClaudeModelKey(item, index);
+    if (seen.has(key) || deleted.has(key)) return;
+
+    const fallback = defaultClaudeModelForKey(key);
+    let id = String(item.id || '').trim();
+    if (!id) return;
+    // `claude-fable-5[1m]` was a bad shipped command. Keep the stable Fable
+    // row, but migrate its command to the actual alias the user expects.
+    if (key === 'fable' && (id === 'claude-fable-5' || id === 'claude-fable-5[1m]')) id = 'fable';
+    const label = String(item.label || fallback?.label || id).trim() || id;
+    const supportedEfforts = claudeSupportedEffortsForModel({
+      key,
+      supportedEfforts: normalizeClaudeEffortValues(item.supportedEfforts),
+    });
+    const fallbackEfforts = (fallback?.efforts || DEFAULT_CLAUDE_EFFORTS)
+      .filter((effort) => legacyEfforts.includes(effort) && supportedEfforts.includes(effort));
+    const requestedEfforts = normalizeClaudeEffortList(
+      item.efforts,
+      fallbackEfforts.length > 0 ? fallbackEfforts : supportedEfforts,
+    ).filter((effort) => supportedEfforts.includes(effort));
+    models.push({
+      key,
+      id,
+      label,
+      efforts: requestedEfforts.length > 0 ? requestedEfforts : [...supportedEfforts],
+      supportedEfforts,
+      visible: item.visible !== false,
+      cmd: true,
+    });
+    seen.add(key);
+  });
+
+  for (const fallback of DEFAULT_CLAUDE_CODE_MODELS) {
+    const key = fallback.key || fallback.id;
+    if (seen.has(key) || deleted.has(key)) continue;
+    models.push({
+      ...fallback,
+      efforts: [...(fallback.efforts || DEFAULT_CLAUDE_EFFORTS)],
+      supportedEfforts: [...(fallback.supportedEfforts || fallback.efforts || DEFAULT_CLAUDE_EFFORTS)],
+      visible: fallback.visible !== false,
+    });
+  }
+
+  const resolvedModels = models.length > 0 || Array.isArray(obj.models) || deletedModelKeys.length > 0
+    ? models
+    : DEFAULT_CLAUDE_CODE_SETTINGS.models.map((model) => ({
+      ...model,
+      efforts: [...(model.efforts || [])],
+      supportedEfforts: [...(model.supportedEfforts || [])],
+    }));
+  const requestedQuickModel = typeof obj.quickModel === 'string' ? obj.quickModel.trim() : '';
+  const quickModel = requestedQuickModel && resolvedModels.some((model) => model.id === requestedQuickModel)
+    ? requestedQuickModel
+    : null;
+  const quickEffort = quickModel
+    ? resolveClaudeEffortForModel(resolvedModels.find((model) => model.id === quickModel), obj.quickEffort)
+    : null;
+  return { models: resolvedModels, deletedModelKeys, quickModel, quickEffort };
+};
+
+export const claudeEffortsForModel = (
+  model: Pick<ClaudeCodeModelOption, 'key' | 'efforts' | 'supportedEfforts'> | undefined,
+): string[] => {
+  const supported = claudeSupportedEffortsForModel(model);
+  const efforts = normalizeClaudeEffortList(model?.efforts, supported)
+    .filter((effort) => supported.includes(effort));
+  return efforts.length > 0 ? efforts : [...supported];
+};
+
+export const resolveClaudeEffortForModel = (
+  model: Pick<ClaudeCodeModelOption, 'key' | 'efforts' | 'supportedEfforts'> | undefined,
+  requested: unknown,
+): string | null => {
+  const efforts = claudeEffortsForModel(model);
+  if (efforts.length === 0) return null;
+  const target = typeof requested === 'string' ? requested.trim() : '';
+  if (target && efforts.includes(target)) return target;
+  if (efforts.includes('medium')) return 'medium';
+  return efforts[0] || null;
 };
 
 export const CLAUDE_MODELS = DEFAULT_CLAUDE_CODE_MODELS.map((m) => m.id);
