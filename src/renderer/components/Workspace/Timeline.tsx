@@ -32,6 +32,7 @@ import {
   type PreparedCodexRewindRuntime,
 } from '../../utils/agentScenarios';
 import { getHistoryAgentRuntime, type AgentHistoryTool, type AgentPtyStatus } from '../../utils/historyAgentRuntimes';
+import type { HistoryDurableRevision } from '../../utils/historySnapshotCache';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from '../../utils/claudeStartupDefaultsReady';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
@@ -227,6 +228,7 @@ interface TimelineProps {
   sessionId: string | null;
   cwd: string;
   isActive?: boolean; // Claude/Gemini is currently running
+  isTurnBusy?: boolean; // One agent turn is streaming; durable refresh waits for its outcome
   isVisible?: boolean; // New prop to control visibility from parent
   isOpen?: boolean; // CMD+\ toggle — controls slide in/out
   toolType?: 'claude' | 'gemini' | 'codex'; // Which AI tool this timeline is for
@@ -503,6 +505,53 @@ const _savedEditRangeMap = new Map<string, any>();
 const SAVED_MAP_MAX = 20;
 const _autoTabTitleAttempted = new Set<string>();
 const _autoTabTitleInFlight = new Set<string>();
+const TIMELINE_SNAPSHOT_CACHE_MAX_OWNERS = 8;
+const TIMELINE_SNAPSHOT_CACHE_MAX_ENTRIES = 20_000;
+
+interface TimelineSnapshotCacheRecord {
+  entries: TimelineEntry[];
+  sessionMeta: CodexTimelineSessionMeta | null;
+  revision: HistoryDurableRevision | null;
+}
+
+const _timelineSnapshotCache = new Map<string, TimelineSnapshotCacheRecord>();
+let _timelineSnapshotCacheEntries = 0;
+
+function getTimelineSnapshotCache(key: string): TimelineSnapshotCacheRecord | null {
+  const record = _timelineSnapshotCache.get(key) || null;
+  if (!record) return null;
+  _timelineSnapshotCache.delete(key);
+  _timelineSnapshotCache.set(key, record);
+  return record;
+}
+
+function peekTimelineSnapshotCache(key: string): TimelineSnapshotCacheRecord | null {
+  return _timelineSnapshotCache.get(key) || null;
+}
+
+function setTimelineSnapshotCache(
+  key: string,
+  record: TimelineSnapshotCacheRecord,
+) {
+  const previous = _timelineSnapshotCache.get(key);
+  if (previous) {
+    _timelineSnapshotCache.delete(key);
+    _timelineSnapshotCacheEntries -= previous.entries.length;
+  }
+  _timelineSnapshotCache.set(key, record);
+  _timelineSnapshotCacheEntries += record.entries.length;
+  while (
+    _timelineSnapshotCache.size > TIMELINE_SNAPSHOT_CACHE_MAX_OWNERS ||
+    _timelineSnapshotCacheEntries > TIMELINE_SNAPSHOT_CACHE_MAX_ENTRIES
+  ) {
+    const oldestKey = _timelineSnapshotCache.keys().next().value as string | undefined;
+    if (!oldestKey) break;
+    const oldest = _timelineSnapshotCache.get(oldestKey);
+    _timelineSnapshotCache.delete(oldestKey);
+    _timelineSnapshotCacheEntries -= oldest?.entries.length || 0;
+  }
+  if (_timelineSnapshotCacheEntries < 0) _timelineSnapshotCacheEntries = 0;
+}
 
 function perfAbsNow(): number {
   return performance.timeOrigin + performance.now();
@@ -516,6 +565,7 @@ function Timeline({
   sessionId,
   cwd,
   isActive = true,
+  isTurnBusy = false,
   isVisible = true,
   isOpen = true,
   toolType = 'claude',
@@ -611,6 +661,9 @@ function Timeline({
   const timelineInstanceIdRef = useRef(Math.random().toString(36).slice(2, 8));
   const isVisibleRef = useRef(isVisible);
   isVisibleRef.current = isVisible;
+  const isTurnBusyRef = useRef(isTurnBusy);
+  isTurnBusyRef.current = isTurnBusy;
+  const deferredTranscriptRefreshRef = useRef(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const [tooltipCopied, setTooltipCopied] = useState(false);
   // Per-entry collapsed/expanded state for docs blocks in tooltip. Key = entry uuid.
@@ -1959,19 +2012,25 @@ function Timeline({
       promise: null,
       trailingReason: null,
     };
-    // Initial loading belongs to the new owner as well. Setting it in the same
-    // layout effect that clears the old rows prevents a blank paint between a
-    // tab/session switch and the first IPC request.
-    setLoadingOwnerKey(sessionId ? timelineOwnerKey : null);
-    setEntriesSnapshot({ ownerKey: timelineOwnerKey, entries: [] });
+    const cachedSnapshot = isCodex && sessionId
+      ? getTimelineSnapshotCache(timelineOwnerKey)
+      : null;
+    // A durable cached rail is painted immediately. Its revision is still
+    // validated asynchronously, so A → B → A never flashes an empty Timeline
+    // or rebuilds a 700 MB rollout merely to rediscover unchanged dots.
+    setLoadingOwnerKey(sessionId && !cachedSnapshot ? timelineOwnerKey : null);
+    setEntriesSnapshot({
+      ownerKey: timelineOwnerKey,
+      entries: cachedSnapshot?.entries || [],
+    });
     setSessionBoundaries([]);
     setForkMarkers([]);
-    setCodexSessionMeta(null);
+    setCodexSessionMeta(cachedSnapshot?.sessionMeta || null);
     setClaudeMemoryBoundaryUuid(null);
     setNotes({});
     setNotePositions({});
     setRewindMarkers(new Set());
-  }, [timelineOwnerKey, sessionId]);
+  }, [timelineOwnerKey, sessionId, isCodex]);
 
   // Load timeline and fork markers when sessionId changes
   const runTimelineLoad = useCallback(async (reason = 'unknown') => {
@@ -2049,13 +2108,34 @@ function Timeline({
           setClaudeMemoryBoundaryUuid(null);
         }
       } else if (isCodex) {
-        const timelineResult = await ipcRenderer.invoke('agent-transcript:get-timeline', { toolType: 'codex', sessionId, cwd, tabId, ...callerContext });
+        const cachedSnapshot = getTimelineSnapshotCache(ownerKeyAtStart);
+        const timelineResult = await ipcRenderer.invoke('agent-transcript:get-timeline', {
+          toolType: 'codex',
+          sessionId,
+          cwd,
+          tabId,
+          ifRevision: cachedSnapshot?.revision || null,
+          ...callerContext,
+        });
         if (!ownsLoad()) return;
-        if (timelineResult.success) {
-          setEntriesSnapshot({ ownerKey: ownerKeyAtStart, entries: timelineResult.entries || [] });
+        if (timelineResult.success && timelineResult.unchanged === true && cachedSnapshot) {
+          setEntriesSnapshot({
+            ownerKey: ownerKeyAtStart,
+            entries: cachedSnapshot.entries,
+          });
+          setCodexSessionMeta(cachedSnapshot.sessionMeta || null);
+        } else if (timelineResult.success) {
+          const nextEntries = timelineResult.entries || [];
+          const nextSessionMeta = timelineResult.sessionMeta || null;
+          setTimelineSnapshotCache(ownerKeyAtStart, {
+            entries: nextEntries,
+            sessionMeta: nextSessionMeta,
+            revision: timelineResult.revision || null,
+          });
+          setEntriesSnapshot({ ownerKey: ownerKeyAtStart, entries: nextEntries });
           setSessionBoundaries([]);
           setForkMarkers([]);
-          setCodexSessionMeta(timelineResult.sessionMeta || null);
+          setCodexSessionMeta(nextSessionMeta);
           setClaudeMemoryBoundaryUuid(null);
         }
       } else {
@@ -2207,7 +2287,9 @@ function Timeline({
       return flight.promise;
     }
 
-    setLoadingOwnerKey(sessionId ? ownerKeyAtRequest : null);
+    const hasCachedSnapshot = isCodex &&
+      !!peekTimelineSnapshotCache(ownerKeyAtRequest);
+    setLoadingOwnerKey(sessionId && !hasCachedSnapshot ? ownerKeyAtRequest : null);
     const runBurst = async () => {
       let nextReason: string | null = reason;
       while (
@@ -2231,7 +2313,21 @@ function Timeline({
     });
     flight.promise = promise;
     return promise;
-  }, [timelineOwnerKey, sessionId, runTimelineLoad]);
+  }, [timelineOwnerKey, sessionId, isCodex, runTimelineLoad]);
+
+  useEffect(() => {
+    if (isTurnBusy || !deferredTranscriptRefreshRef.current) return;
+    deferredTranscriptRefreshRef.current = false;
+    console.warn(
+      '[Timeline:TranscriptFlush]' +
+      ' inst=' + timelineInstanceIdRef.current +
+      ' tab=' + tabId.slice(-8) +
+      ' session=' + (sessionId ? sessionId.substring(0, 8) : 'none') +
+      ' reason=turn-settled' +
+      ' abs=' + perfAbsNow().toFixed(1)
+    );
+    void loadTimeline('turn-settled');
+  }, [isTurnBusy, loadTimeline, sessionId, tabId]);
 
   // effect: loadTimeline callback identity changes (sessionId/cwd/tabId/isGemini) → trigger initial timeline load
   useEffect(() => {
@@ -2787,6 +2883,19 @@ function Timeline({
     const onTranscriptChanged = (_event: any, detail: any) => {
       if (detail?.sessionId !== sessionId) return;
       if (detail?.toolType && detail.toolType !== toolType) return;
+      if (isTurnBusyRef.current) {
+        deferredTranscriptRefreshRef.current = true;
+        console.warn(
+          '[Timeline:TranscriptDeferred]' +
+          ' inst=' + timelineInstanceIdRef.current +
+          ' tab=' + tabId.slice(-8) +
+          ' session=' + sessionId.substring(0, 8) +
+          ' reason=turn-busy' +
+          ' source=' + (detail?.reason || 'changed') +
+          ' abs=' + perfAbsNow().toFixed(1)
+        );
+        return;
+      }
       if (document.visibilityState !== 'visible' || !isVisibleRef.current) {
         console.warn(
           '[Timeline:TranscriptDeferred]' +

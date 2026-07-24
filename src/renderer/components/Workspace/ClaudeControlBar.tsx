@@ -2656,7 +2656,7 @@ export default function ClaudeControlBar({
     backgroundColor: 'transparent',
     border: '1px solid rgba(255,255,255,0.08)',
     borderRadius: 4,
-    cursor: isBusy ? 'wait' : 'pointer',
+    cursor: isBusy ? 'default' : 'pointer',
     transition: 'background-color 0.12s, color 0.12s, border-color 0.12s',
     display: 'inline-flex',
     alignItems: 'center',

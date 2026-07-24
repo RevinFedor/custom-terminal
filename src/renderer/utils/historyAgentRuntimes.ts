@@ -79,6 +79,16 @@ export interface AgentSendPromptOptions {
   queue?: boolean;
   model?: string;
   effort?: string;
+  presentationSnapshot?: {
+    historySessionId?: string | null;
+    promptChips?: Array<{
+      id?: string;
+      kind: 'prompt';
+      label?: string;
+      text: string;
+      sourceKey?: string;
+    }>;
+  };
 }
 
 export interface HistoryAgentRuntime {
@@ -489,6 +499,7 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
     source: options.source || null,
     statusAtSend: options.statusAtSend || null,
     skipVisibleDraftGuard: false,
+    presentationSnapshot: options.presentationSnapshot || null,
   })
     .then((result: any) => {
       const auditTimeoutAfterSubmit = isSubmittedCodexAuditTimeout(result);

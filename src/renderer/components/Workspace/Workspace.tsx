@@ -129,6 +129,13 @@ export default function Workspace() {
     const tab = tabId ? p.tabs.get(tabId) : null;
     return tab?.tabType || null;
   });
+  const effectiveAiBusy = useWorkspaceStore((s) => {
+    const p = s.openProjects.get(s.activeProjectId!);
+    if (!p) return false;
+    const tabId = p.viewingSubAgentTabId || p.activeTabId;
+    const tab = tabId ? p.tabs.get(tabId) : null;
+    return tab?.aiBusy === true;
+  });
   const [showSearch, setShowSearch] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [searchResults, setSearchResults] = useState({ resultIndex: 0, resultCount: 0 });
@@ -954,6 +961,7 @@ export default function Workspace() {
               sessionId={timelineSessionId}
               cwd={effectiveTab.cwd || currentProject.path}
               isActive={isCommandRunning}
+              isTurnBusy={effectiveAiBusy}
               isVisible={workspaceView === 'workspace' && currentView === 'terminal'}
               isOpen={true}
               toolType={timelineToolType}

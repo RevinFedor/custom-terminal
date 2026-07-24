@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   appendHistoryDraftInsertion,
   buildProjectScriptRows,
+  captureHistoryMenuAnchor,
+  chooseContextMenuOpenLeft,
   clampFloatingPanelTop,
   isCurrentPickerGeneration,
   joinPromptInsertionText,
@@ -63,4 +65,48 @@ test('a tall submenu clamps itself without changing its parent anchor', () => {
   assert.equal(childTop, 432);
   assert.equal(clampFloatingPanelTop(20, 200, 900, 8), 20);
   assert.equal(clampFloatingPanelTop(4, 1200, 900, 8), 8);
+});
+
+test('history context anchor is captured above the composer once', () => {
+  const anchor = captureHistoryMenuAnchor({
+    pointerX: 420,
+    pointerY: 780,
+    composerTop: 710,
+  });
+
+  assert.deepEqual(anchor, {
+    mode: 'history-composer',
+    x: 420,
+    y: 710,
+  });
+  assert.deepEqual(
+    captureHistoryMenuAnchor({ pointerX: 420, pointerY: 780 }),
+    { mode: 'point', x: 420, y: 780 },
+  );
+});
+
+test('context menu chooses one side from maximum chain width', () => {
+  const nearRightEdge = chooseContextMenuOpenLeft({
+    anchorX: 940,
+    viewportWidth: 1000,
+    rootWidth: 130,
+    descendantWidth: 360,
+  });
+  const nearLeftEdge = chooseContextMenuOpenLeft({
+    anchorX: 20,
+    viewportWidth: 1000,
+    rootWidth: 130,
+    descendantWidth: 360,
+  });
+
+  assert.equal(nearRightEdge, true);
+  assert.equal(nearLeftEdge, false);
+  // The result is intentionally independent of whichever child/group is
+  // currently hovered: callers pass the maximum chain width once on open.
+  assert.equal(chooseContextMenuOpenLeft({
+    anchorX: 500,
+    viewportWidth: 1000,
+    rootWidth: 130,
+    descendantWidth: 360,
+  }), false);
 });

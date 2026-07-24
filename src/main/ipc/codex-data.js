@@ -760,6 +760,225 @@ function parseApplyPatchHistoryActions(patchText) {
   });
 }
 
+function parseHistoryUnifiedDiffHunks(unifiedDiff) {
+  if (typeof unifiedDiff !== 'string' || !unifiedDiff.includes('@@')) return null;
+  const lines = unifiedDiff.split('\n');
+  const hunks = [];
+  let current = null;
+  const flush = () => {
+    if (!current) return true;
+    const oldCount = current.entries.reduce(
+      (count, entry) => count + (entry.tag === 'add' ? 0 : 1),
+      0,
+    );
+    const newCount = current.entries.reduce(
+      (count, entry) => count + (entry.tag === 'del' ? 0 : 1),
+      0,
+    );
+    if (oldCount !== current.oldLines || newCount !== current.newLines) return false;
+    hunks.push({
+      oldStart: current.oldStart,
+      newStart: current.newStart,
+      entries: current.entries,
+    });
+    current = null;
+    return true;
+  };
+
+  for (const line of lines) {
+    const header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)$/.exec(line);
+    if (header) {
+      if (!flush()) return null;
+      current = {
+        oldStart: Number(header[1]),
+        oldLines: header[2] == null ? 1 : Number(header[2]),
+        newStart: Number(header[3]),
+        newLines: header[4] == null ? 1 : Number(header[4]),
+        entries: [],
+      };
+      continue;
+    }
+    if (!current || line === '\\ No newline at end of file' || line === '') continue;
+    const prefix = line[0];
+    if (prefix === ' ') current.entries.push({ tag: 'eq', line: line.slice(1) });
+    else if (prefix === '+') current.entries.push({ tag: 'add', line: line.slice(1) });
+    else if (prefix === '-') current.entries.push({ tag: 'del', line: line.slice(1) });
+    else return null;
+  }
+  if (!flush()) return null;
+  return hunks.length > 0 ? hunks : null;
+}
+
+function historyDiffHunkStrings(hunk) {
+  return {
+    old_string: hunk.entries
+      .filter((entry) => entry.tag !== 'add')
+      .map((entry) => entry.line)
+      .join('\n'),
+    new_string: hunk.entries
+      .filter((entry) => entry.tag !== 'del')
+      .map((entry) => entry.line)
+      .join('\n'),
+  };
+}
+
+function parseCodexPatchApplyChanges(payload) {
+  if (payload?.type !== 'patch_apply_end' || payload.success !== true) return null;
+  const changes = payload.changes;
+  if (!changes || typeof changes !== 'object' || Array.isArray(changes)) return null;
+  const actions = [];
+
+  for (const [filePath, rawChange] of Object.entries(changes)) {
+    const change = rawChange && typeof rawChange === 'object' ? rawChange : null;
+    if (!change) return null;
+    const changeType = String(change.type || '').toLowerCase();
+    if (changeType === 'update') {
+      const diffHunks = parseHistoryUnifiedDiffHunks(change.unified_diff);
+      if (!diffHunks) return null;
+      const edits = diffHunks.map(historyDiffHunkStrings);
+      actions.push(diffHunks.length === 1
+        ? {
+            toolName: 'Edit',
+            args: {
+              file_path: change.move_path || filePath,
+              ...edits[0],
+            },
+            diffHunks,
+          }
+        : {
+            toolName: 'MultiEdit',
+            args: {
+              file_path: change.move_path || filePath,
+              edits,
+            },
+            diffHunks,
+          });
+      continue;
+    }
+    if (changeType === 'add') {
+      const content = typeof change.content === 'string' ? change.content : '';
+      actions.push({
+        toolName: 'Write',
+        args: { file_path: change.move_path || filePath, content },
+        diffHunks: [{
+          oldStart: 0,
+          newStart: 1,
+          entries: content.split('\n').map((line) => ({ tag: 'add', line })),
+        }],
+      });
+      continue;
+    }
+    if (changeType === 'delete') {
+      if (typeof change.content !== 'string') return null;
+      actions.push({
+        toolName: 'Edit',
+        args: {
+          file_path: filePath,
+          old_string: change.content,
+          new_string: '',
+        },
+        diffHunks: [{
+          oldStart: 1,
+          newStart: 0,
+          entries: change.content.split('\n').map((line) => ({ tag: 'del', line })),
+        }],
+      });
+      continue;
+    }
+    return null;
+  }
+  return actions.length > 0 ? actions : null;
+}
+
+function normalizeHistoryPatchPath(filePath, cwd) {
+  const value = String(filePath || '').trim();
+  if (!value) return '';
+  return path.normalize(path.isAbsolute(value) ? value : path.resolve(cwd || process.cwd(), value));
+}
+
+function expectedHistoryPatchPaths(patchText, cwd) {
+  return new Set(
+    extractPatchTouchedFiles(patchText)
+      .map((filePath) => normalizeHistoryPatchPath(filePath, cwd))
+      .filter(Boolean),
+  );
+}
+
+function codexPatchEventPathSet(payload, cwd) {
+  if (!parseCodexPatchApplyChanges(payload)) return null;
+  const changes = payload?.changes;
+  return new Set(
+    Object.keys(changes || {})
+      .map((filePath) => normalizeHistoryPatchPath(filePath, cwd))
+      .filter(Boolean),
+  );
+}
+
+function sameHistoryPatchPaths(left, right) {
+  if (!left || !right || left.size === 0 || left.size !== right.size) return false;
+  for (const filePath of left) {
+    if (!right.has(filePath)) return false;
+  }
+  return true;
+}
+
+function codexNestedApplyPatchTexts(call) {
+  if (call?.toolName !== 'exec' || typeof call?.args?.input !== 'string') return [];
+  const source = call.args.input;
+  const values = [];
+  for (const nestedCall of findCodexExecNestedCalls(source)) {
+    if (nestedCall.toolName !== 'apply_patch') continue;
+    const parsed = resolveSimpleJsCallValue(source, nestedCall);
+    if (typeof parsed === 'string' && parsed.includes('*** Begin Patch')) values.push(parsed);
+  }
+  return values;
+}
+
+function attachCodexPatchApplyEvent(pendingCalls, payload, cwd) {
+  const direct = pendingCalls.get(payload?.call_id);
+  if (direct?.toolName === 'apply_patch') {
+    direct.patchApplyEvents.push(payload);
+    return true;
+  }
+
+  const eventPaths = codexPatchEventPathSet(payload, cwd);
+  if (!eventPaths) return false;
+  const eventTurnId = String(payload?.turn_id || '');
+  const candidates = [];
+  for (const call of pendingCalls.values()) {
+    if (call.toolName !== 'exec') continue;
+    if (eventTurnId && call.turnId && eventTurnId !== call.turnId) continue;
+    const matches = codexNestedApplyPatchTexts(call).some((patchText) => (
+      sameHistoryPatchPaths(expectedHistoryPatchPaths(patchText, cwd), eventPaths)
+    ));
+    if (matches) candidates.push(call);
+  }
+  if (candidates.length !== 1) return false;
+  candidates[0].patchApplyEvents.push(payload);
+  return true;
+}
+
+function takeCanonicalCodexPatchActions(call, patchText, usedEventIndexes) {
+  const expectedPaths = expectedHistoryPatchPaths(patchText, call?.cwd);
+  if (expectedPaths.size === 0) return null;
+  const candidates = [];
+  const events = Array.isArray(call?.patchApplyEvents) ? call.patchApplyEvents : [];
+  for (let index = 0; index < events.length; index += 1) {
+    if (usedEventIndexes.has(index)) continue;
+    const actions = parseCodexPatchApplyChanges(events[index]);
+    if (!actions) continue;
+    const actualPaths = codexPatchEventPathSet(events[index], call?.cwd);
+    if (sameHistoryPatchPaths(expectedPaths, actualPaths)) {
+      candidates.push({ index, actions });
+    }
+  }
+  // Two pending patches touching the same file are ambiguous. Keep the
+  // input-derived card, but do not borrow line metadata from the wrong event.
+  if (candidates.length !== 1) return null;
+  usedEventIndexes.add(candidates[0].index);
+  return candidates[0].actions;
+}
+
 function humanizeCodexToolName(toolName) {
   return String(toolName || 'Tool')
     .split(/__|[_-]+/)
@@ -857,6 +1076,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
     : '';
   const nested = source ? findCodexExecNestedCalls(source) : [];
   const callGroups = [];
+  const usedPatchEventIndexes = new Set();
 
   if (nested.length > 0) {
     for (const nestedCall of nested) {
@@ -864,7 +1084,10 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
       const args = parsed && typeof parsed === 'object'
         ? parsed
         : (typeof parsed === 'string' ? { input: parsed } : { input: compactPreview(nestedCall.argumentsText, 1000) });
-      callGroups.push(normalizeCodexHistoryCall(nestedCall.toolName, args));
+      const canonicalPatchActions = nestedCall.toolName === 'apply_patch' && typeof parsed === 'string'
+        ? takeCanonicalCodexPatchActions(call, parsed, usedPatchEventIndexes)
+        : null;
+      callGroups.push(canonicalPatchActions || normalizeCodexHistoryCall(nestedCall.toolName, args));
     }
   } else if (call?.toolName === 'exec') {
     const lookup = /\bALL_TOOLS\b/.test(source);
@@ -873,7 +1096,13 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
       args: { summary: lookup ? 'Inspect available tools' : compactPreview(source, 240) },
     }]);
   } else {
-    callGroups.push(normalizeCodexHistoryCall(call?.toolName, call?.args || {}, call?.namespace || ''));
+    const patchText = call?.toolName === 'apply_patch' && typeof call?.args?.input === 'string'
+      ? call.args.input
+      : null;
+    const canonicalPatchActions = patchText
+      ? takeCanonicalCodexPatchActions(call, patchText, usedPatchEventIndexes)
+      : null;
+    callGroups.push(canonicalPatchActions || normalizeCodexHistoryCall(call?.toolName, call?.args || {}, call?.namespace || ''));
   }
 
   const cellId = call?.toolName === 'exec' ? codexHistoryCellId(rawOutput) : null;
@@ -885,6 +1114,7 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
       args: action.args || {},
       result: action.result,
       isError: action.isError,
+      diffHunks: action.diffHunks,
     },
   }));
   return { actions, cellId };
@@ -2316,6 +2546,7 @@ function buildCodexTimeline(records, sessionId) {
 function buildCodexFullHistory(records, sessionId) {
   const entries = [];
   const compactCompanionLines = codexCompactCompanionLines(records);
+  const sessionCwd = getSessionMeta(records).cwd || '';
   const pendingCalls = new Map();
   const pendingExecCells = new Map();
   let currentTurnIndex = -1;
@@ -2372,7 +2603,9 @@ function buildCodexFullHistory(records, sessionId) {
     }
 
     if (record.type === 'event_msg') {
-      if (payload.type === 'user_message') {
+      if (payload.type === 'patch_apply_end') {
+        attachCodexPatchApplyEvent(pendingCalls, payload, sessionCwd);
+      } else if (payload.type === 'user_message') {
         currentTurnIndex += 1;
         entries.push({
           uuid: stableUuid(sessionId, record.__line, 'codex-user'),
@@ -2433,6 +2666,13 @@ function buildCodexFullHistory(records, sessionId) {
         toolName: payload.name || payload.tool_name || payload.type,
         namespace: payload.namespace || '',
         args: args && typeof args === 'object' ? args : { value: args },
+        cwd: sessionCwd,
+        turnId: String(
+          payload.turn_id
+          || payload.internal_chat_message_metadata_passthrough?.turn_id
+          || '',
+        ),
+        patchApplyEvents: [],
         timestamp: recordTimestamp(record),
         line: record.__line,
         record,
@@ -5038,7 +5278,7 @@ async function loadSessionRecords(sessionId, cwd) {
   return { success: true, records, filePath: found.filePath, sourceSnapshot };
 }
 
-function register({ projectManager } = {}) {
+function register({ projectManager, transcriptService } = {}) {
   codexUsageStateStore = projectManager?.db || null;
   codexUsageStateHydrated = false;
   hydrateCodexUsageState();
@@ -5061,6 +5301,12 @@ function register({ projectManager } = {}) {
   });
 
   ipcMain.handle('codex:get-full-history', async (_event, payload = {}) => {
+    if (transcriptService?.getHistory) {
+      return transcriptService.getHistory({
+        ...payload,
+        toolType: 'codex',
+      });
+    }
     const { sessionId, cwd, ifRevision } = payload;
     try {
       if (ifRevision) {
@@ -5369,6 +5615,8 @@ module.exports = {
     findCodexExecNestedCalls,
     resolveSimpleJsCallValue,
     parseApplyPatchHistoryActions,
+    parseHistoryUnifiedDiffHunks,
+    parseCodexPatchApplyChanges,
     codexHistoryActionsForCall,
     getTimelineSessionMeta,
     latestCodexUsageInRecords,

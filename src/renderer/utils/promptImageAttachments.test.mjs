@@ -8,6 +8,7 @@ import {
   haveSamePromptImageRefs,
   insertPromptImageAttachments,
   normalizePromptImageIdentity,
+  remapPromptImageSelectionAfterReplacement,
   retainPromptImageRefsForText,
 } from './promptImageAttachments.mjs';
 
@@ -49,6 +50,43 @@ test('clipboard marker leaves one trailing space and places caret after it', () 
 
   assert.equal(result.text, 'before [Image #1] after');
   assert.equal(result.caret, 'before [Image #1] '.length);
+  assert.equal(result.text[result.caret - 2], ']');
+  assert.equal(result.text[result.caret - 1], ' ');
+
+  const pendingEnd = 'before [Image saving…]'.length;
+  assert.deepEqual(
+    remapPromptImageSelectionAfterReplacement({
+      selectionStart: pendingEnd,
+      selectionEnd: pendingEnd,
+      replacedStart: 'before '.length,
+      replacedEnd: pendingEnd,
+      insertionCaret: result.caret,
+    }),
+    { start: result.caret, end: result.caret },
+  );
+});
+
+test('image marker replacement preserves selections around the async marker', () => {
+  assert.deepEqual(
+    remapPromptImageSelectionAfterReplacement({
+      selectionStart: 12,
+      selectionEnd: 15,
+      replacedStart: 6,
+      replacedEnd: 12,
+      insertionCaret: 10,
+    }),
+    { start: 10, end: 13 },
+  );
+  assert.deepEqual(
+    remapPromptImageSelectionAfterReplacement({
+      selectionStart: 8,
+      selectionEnd: 8,
+      replacedStart: 6,
+      replacedEnd: 12,
+      insertionCaret: 10,
+    }),
+    { start: 10, end: 10 },
+  );
 });
 
 test('removing a complete marker releases only its ref, damaged markers retain refs for repair', () => {

@@ -1,12 +1,41 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mergeFailedHistoryAuthoringSnapshot } from './historyDraftOwnership.mjs';
+import {
+  mergeFailedHistoryAuthoringSnapshot,
+  resolveInterruptedPromptOwnership,
+} from './historyDraftOwnership.mjs';
 
 const image = (id, path) => ({
   id,
   path,
   assetId: path.split('/').pop(),
   availability: 'available',
+});
+
+test('interrupt ownership never treats an empty terminal draft as cancellation proof', () => {
+  assert.equal(resolveInterruptedPromptOwnership({
+    durablePromptExists: true,
+    returnedDraftExists: false,
+  }), 'durable');
+  assert.equal(resolveInterruptedPromptOwnership({
+    durablePromptExists: false,
+    returnedDraftExists: true,
+    returnedDraftMatchesHandoff: true,
+  }), 'restore');
+  assert.equal(resolveInterruptedPromptOwnership({
+    durablePromptExists: false,
+    returnedDraftExists: true,
+    returnedDraftMatchesHandoff: false,
+  }), 'unrelated-draft');
+  assert.equal(resolveInterruptedPromptOwnership({
+    durablePromptExists: false,
+    returnedDraftExists: false,
+  }), 'pending');
+  assert.equal(resolveInterruptedPromptOwnership({
+    durablePromptExists: true,
+    returnedDraftExists: true,
+    returnedDraftMatchesHandoff: true,
+  }), 'durable');
 });
 
 test('failed snapshot is prepended without overwriting a newer draft and image ids are remapped', () => {

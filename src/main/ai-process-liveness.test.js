@@ -7,6 +7,7 @@ const {
   inspectProcessLookup,
   inspectProcessLookupCached,
   requireKnownProcessLookup,
+  resolveClaudeRuntimeAfterFailedStop,
   resolveProcessPresence,
 } = require('./ai-process-liveness');
 
@@ -83,4 +84,19 @@ test('observer failure preserves established readiness but cannot invent a new p
   assert.match(preserved.error.message, /ps unavailable/);
   assert.equal(resolveProcessPresence(unknown, { established: false }).present, false);
   assert.equal(resolveProcessPresence(absent, { established: true }).present, false);
+});
+
+test('failed Claude Stop ignores stale spinner when authoritative turn is idle', () => {
+  const runtime = resolveClaudeRuntimeAfterFailedStop({
+    claudeTurnBusy: false,
+    claudeSpinnerBusy: true,
+    claudePromptReady: true,
+    failure: 'process_lookup_failed',
+  });
+
+  assert.deepEqual(runtime, {
+    sessionStatus: 'active',
+    busy: false,
+    inputReady: true,
+  });
 });

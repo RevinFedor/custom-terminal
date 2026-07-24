@@ -6,7 +6,7 @@
 
 ## Контракт
 
-- Ключ подписки — `toolType + sessionId + cwd`, consumer — явный `consumerId` (`timeline:<tabId>`, `history:<tabId>`, web subscriber). Один файл получает один watcher и ref-count по consumers; последний unsubscribe закрывает watcher.
+- Ключ подписки — `toolType + sessionId + cwd`, consumer — явный `consumerId` (`timeline:<tabId>`, `history:<tabId>`, web subscriber). Один файл получает один watcher и ref-count по consumers; последний unsubscribe закрывает watcher. Публикация state в общей Map происходит только после async resolve файла, поэтому сам init тоже дедуплицируется отдельным inflight promise: иначе одновременно смонтированные History и Timeline оба успевают увидеть miss и открыть по watcher до первой записи в Map.
 - Сервис шлёт lightweight invalidation, а не готовый UI-state: renderer получает `agent-transcript:changed`, web/iOS получает SSE/WS событие `transcript-changed`. После этого surface сам запрашивает нужный snapshot (`get-timeline`, `get-history`, `get-messages`) и сохраняет свою локальную логику merge/optimistic rows.
 - Для Codex live-chat `type:'message'` не входит в контракт Transcript Service. Его единственный владелец — CodexTurn watcher в `main.js`, который нормализует `event_msg.user_message` и `response_item` в SSE `message`; Transcript Service для Codex только держит cache/watch и шлёт `transcript-changed`. Если оба слоя параллельно фанят `message`, native iOS получает дубль одного prompt'а с разными uuid.
 - Permanent UI polling запрещён как источник freshness для Claude/Codex Timeline/History. Допустимы manual refresh и visibility-resume reconciliation: они проверяют, не пропустили ли событие, но не являются главным clock'ом системы.
@@ -60,9 +60,12 @@ Codex rollout читается инкрементально: unchanged `size+mti
 - History не держит вторую полную server-entry copy только ради Rewind convergence; для membership достаточен UUID set;
 - повторное открытие History сначала показывает renderer snapshot, а main проверяет durable revision до parse/projection; unchanged-ответ не переносит полный массив через IPC;
 - Timeline показывает owner-keyed initial loader до первого snapshot, а background refresh оставляет уже известные rows видимыми;
+- History публикует новый surface owner только вместе с его rows/loading. Раздельные state-переходы давали один кадр `новый owner + пустые старые rows + loader уже скрыт`, поэтому пользователь видел белую пустоту вместо объяснимого ожидания;
 - Prompt Summary генерируется последовательно, а не сотнями параллельных AI-вызовов.
 
 Renderer snapshot ключуется всей identity `tab + tool + session + cwd` и ограничен одновременно 64 MiB, 40 тысячами rows и восемью owners. Вытесняется целый least-recent owner, а не хвост отдельной истории: молчаливое усечение внутри session изменило бы смысл History. Snapshot сохраняет уже построенные сырые server rows без второй глубокой копии.
+
+Byte-limit не должен создавать cliff на больших сессиях. Обычный LRU остаётся строго ограниченным, а отдельный oversized-pool хранит не больше двух последних exact-snapshot без копирования массивов и имеет собственный общий byte-budget 160 MiB. Два слота нужны именно для A → B → A между двумя реально большими сессиями; третий oversized owner вытесняет least-recent целиком. В подтверждённом инциденте один снимок был всего на 66 442 bytes выше 64 MiB, его отвергли 210 раз, и каждый возврат снова запускал полный History/Timeline read. Повышать обычный budget или оставлять oversized-chain без независимых лимитов означало бы вернуть неограниченное накопление памяти.
 
 Streaming projection обязана одновременно замечать содержательные изменения и сохранять identity неизменившихся строк. Сравнение History-row включает tool result/status, thinking, actions и остальные поля presentation: сравнение только по `uuid/type/content` оставляло pending-карточку вечной после прихода результата. Но полностью пересоздавать все объекты на каждом append тоже нельзя — Virtuoso заново рендерит большую ленту. Для Codex pending и completed tool-card получают UUID из исходного call identity; output-line не создаёт новую карточку, иначе раскрытие и локальное состояние теряются в момент завершения.
 

@@ -711,7 +711,7 @@ export function usePromptQueueRunner() {
       if (!triggerTabId) return;
       console.log('[PromptQueueRunner] editor payload unlocked owner='
         + ownerTabId.slice(-8) + ' → retry');
-      fireHead(ownerTabId, triggerTabId);
+      fireQueueOwner(ownerTabId, triggerTabId);
     });
 
     // Walk all queues, find one(s) waiting on `triggerTabId` for turn-end edge.
@@ -1141,6 +1141,7 @@ export function usePromptQueueRunner() {
       window.removeEventListener('claude-startup-defaults-gate', claudeStartupGateHandler);
       unsubscribeQueueHydration();
       unsubscribeWorkspaceHydration();
+      unsubscribeEditorLocks();
     };
   }, []);
 
@@ -1529,7 +1530,6 @@ export function usePromptQueueRunner() {
       unsubscribeQueue();
       unsubscribeReconciliation();
       unsubscribeOwnerReadiness();
-      unsubscribeEditorLocks();
       for (const t of pendingTimers.values()) clearTimeout(t);
       pendingTimers.clear();
       firstDelayReadinessPending.clear();

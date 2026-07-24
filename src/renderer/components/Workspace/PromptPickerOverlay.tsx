@@ -5,6 +5,8 @@ import { useUIStore } from '../../store/useUIStore';
 import {
   appendHistoryDraftInsertion,
   buildProjectScriptRows,
+  captureHistoryMenuAnchor,
+  chooseContextMenuOpenLeft,
   clampFloatingPanelTop,
   isCurrentPickerGeneration,
   joinPromptInsertionText,
@@ -43,11 +45,23 @@ type InsertTarget =
   | { surface: 'sdk'; tabId: string }
   | { surface: 'terminal'; tabId: string };
 
+type HistoryMenuAnchor =
+  | { mode: 'history-composer'; x: number; y: number }
+  | { mode: 'point'; x: number; y: number };
+
+type PickerAnchor =
+  | HistoryMenuAnchor
+  | { mode: 'sdk-caret'; x: number; y: number; lineH: number }
+  | { mode: 'bottom-center' };
+
+const DEFAULT_PICKER_ANCHOR: PickerAnchor = { mode: 'bottom-center' };
+
 interface HistoryInsertMenuRequest {
   tabId: string;
   cwd: string;
   x: number;
   y: number;
+  anchor: HistoryMenuAnchor;
   requestId: number;
 }
 
@@ -72,6 +86,31 @@ function findVisibleHistoryComposerFrame(tabId: string): HTMLElement | null {
   if (!composer) return null;
   const frame = composer.closest('.hp-history-composer-frame');
   return isVisibleElement(frame) ? frame : composer;
+}
+
+function captureShortcutMenuAnchor(target: InsertTarget | null): PickerAnchor {
+  if (target?.surface === 'history') {
+    const frame = findVisibleHistoryComposerFrame(target.tabId);
+    if (frame) {
+      const rect = frame.getBoundingClientRect();
+      return { mode: 'history-composer', x: rect.left, y: rect.top };
+    }
+  }
+  if (target?.surface === 'sdk') {
+    const textarea = findSDKTextarea();
+    if (textarea) {
+      const caret = getSDKCaretViewportRect(textarea);
+      if (caret) {
+        return {
+          mode: 'sdk-caret',
+          x: caret.left,
+          y: caret.top,
+          lineH: caret.height,
+        };
+      }
+    }
+  }
+  return DEFAULT_PICKER_ANCHOR;
 }
 
 async function readPromptFileContents(filePaths: string[] | undefined): Promise<string[]> {
@@ -275,6 +314,7 @@ const PromptPickerOverlay: React.FC = () => {
   const selectedLeftRowRef = useRef<HTMLDivElement | null>(null);
   const rightPanelRef = useRef<HTMLDivElement | null>(null);
   const contextGeometryRafRef = useRef<number | null>(null);
+  const contextOpenLeftRef = useRef(false);
   const requestSeqRef = useRef(0);
   const activePickerGenerationRef = useRef(0);
 
@@ -283,6 +323,7 @@ const PromptPickerOverlay: React.FC = () => {
   const [loaded, setLoaded] = useState(false);
   const [contextRequest, setContextRequest] = useState<HistoryInsertMenuRequest | null>(null);
   const [shortcutTarget, setShortcutTarget] = useState<InsertTarget | null>(null);
+  const [shortcutAnchor, setShortcutAnchor] = useState<PickerAnchor | null>(null);
   const [scripts, setScripts] = useState<ScriptRow[]>([]);
   const [scriptsLoaded, setScriptsLoaded] = useState(false);
   const open = shortcutOpen || contextRequest !== null;
@@ -306,6 +347,7 @@ const PromptPickerOverlay: React.FC = () => {
         cwd?: string;
         x?: number;
         y?: number;
+        composerTop?: number;
       }>).detail || {};
       if (
         typeof detail.tabId !== 'string'
@@ -316,12 +358,33 @@ const PromptPickerOverlay: React.FC = () => {
 
       const requestId = ++requestSeqRef.current;
       activePickerGenerationRef.current = requestId;
+      const rootWidth = Math.max(120, Math.round(fontSize * 12)) + 8;
+      const leftWidth = Math.max(140, Math.round(fontSize * 15)) + 8;
+      const rightWidth = Math.max(160, Math.round(fontSize * 17)) + 8;
+      contextOpenLeftRef.current = chooseContextMenuOpenLeft({
+        anchorX: detail.x,
+        viewportWidth: window.innerWidth,
+        rootWidth,
+        descendantWidth: leftWidth + 6 + rightWidth,
+        margin: 8,
+      });
+      const composerTop = typeof detail.composerTop === 'number' && Number.isFinite(detail.composerTop)
+        ? detail.composerTop
+        : findVisibleHistoryComposerFrame(detail.tabId)?.getBoundingClientRect().top;
+      const capturedAnchor = captureHistoryMenuAnchor({
+        pointerX: detail.x,
+        pointerY: detail.y,
+        composerTop,
+      }) as HistoryMenuAnchor;
       setOpen(false);
+      setShortcutTarget(null);
+      setShortcutAnchor(null);
       setContextRequest({
         tabId: detail.tabId,
         cwd: typeof detail.cwd === 'string' ? detail.cwd : '',
         x: detail.x,
         y: detail.y,
+        anchor: capturedAnchor,
         requestId,
       });
       setSelectedKey(null);
@@ -332,7 +395,7 @@ const PromptPickerOverlay: React.FC = () => {
     };
     window.addEventListener('history-panel:open-insert-menu', onOpenHistoryMenu);
     return () => window.removeEventListener('history-panel:open-insert-menu', onOpenHistoryMenu);
-  }, [setOpen]);
+  }, [fontSize, setOpen]);
 
   // Opt+V replaces an open context picker rather than letting two input
   // surfaces remain armed at once.
@@ -352,12 +415,7 @@ const PromptPickerOverlay: React.FC = () => {
   //   bottom-center — anything else (PTY terminal, no active tab, missing
   //                composer DOM); fixed center-bottom of viewport with a
   //                user-controlled offset (Settings → "Picker — отступ снизу").
-  type Anchor =
-    | { mode: 'sdk-caret'; x: number; y: number; lineH: number }
-    | { mode: 'history-composer'; x: number; y: number }
-    | { mode: 'bottom-center' }
-    | { mode: 'point'; x: number; y: number };
-  const [anchor, setAnchor] = useState<Anchor>({ mode: 'bottom-center' });
+  const anchor = contextRequest?.anchor || shortcutAnchor || DEFAULT_PICKER_ANCHOR;
 
   useEffect(() => {
     if (!open) return;
@@ -473,7 +531,9 @@ const PromptPickerOverlay: React.FC = () => {
     if (!shortcutOpen || contextMode) return;
     const generation = ++requestSeqRef.current;
     activePickerGenerationRef.current = generation;
-    setShortcutTarget(resolveTarget());
+    const target = resolveTarget();
+    setShortcutTarget(target);
+    setShortcutAnchor(captureShortcutMenuAnchor(target));
     setSelectedKey(null);
     setSelectedRoot('prompts');
     setPickerLevel('group');
@@ -485,40 +545,6 @@ const PromptPickerOverlay: React.FC = () => {
       }
     };
   }, [contextMode, resolveTarget, shortcutOpen]);
-
-  // Decide anchor each time picker opens:
-  //   1) History context request → exact pointer coordinates.
-  //   2) History tab + visible composer → grow upward from its top edge.
-  //   3) SDK tab + textarea DOM reachable + caret measurable → caret-anchor.
-  //   4) Anything else → fixed bottom-center with user-configured offset.
-  // Decision is made ONCE on open so arrow-nav doesn't drift the picker.
-  useLayoutEffect(() => {
-    if (!open) return;
-    if (contextRequest) {
-      setAnchor({ mode: 'point', x: contextRequest.x, y: contextRequest.y });
-      return;
-    }
-    const target = shortcutTarget || resolveTarget();
-    if (target?.surface === 'history') {
-      const frame = findVisibleHistoryComposerFrame(target.tabId);
-      if (frame) {
-        const rect = frame.getBoundingClientRect();
-        setAnchor({ mode: 'history-composer', x: rect.left, y: rect.top });
-        return;
-      }
-    }
-    if (target?.surface === 'sdk') {
-      const ta = findSDKTextarea();
-      if (ta) {
-        const c = getSDKCaretViewportRect(ta);
-        if (c) {
-          setAnchor({ mode: 'sdk-caret', x: c.left, y: c.top, lineH: c.height });
-          return;
-        }
-      }
-    }
-    setAnchor({ mode: 'bottom-center' });
-  }, [contextRequest, open, resolveTarget, shortcutTarget]);
 
   const closePicker = useCallback((expectedGeneration?: number) => {
     if (
@@ -538,6 +564,8 @@ const PromptPickerOverlay: React.FC = () => {
     setSelectedPromptIdx(0);
     setSelectedScriptIdx(0);
     setShortcutTarget(null);
+    setShortcutAnchor(null);
+    contextOpenLeftRef.current = false;
     // History and a floating xterm can both exist for one tab. The generic
     // refocus bus would let the xterm steal focus immediately after History
     // insertion, so History gets its explicit composer event.
@@ -936,12 +964,7 @@ const PromptPickerOverlay: React.FC = () => {
           ? GAP + rightW
           : 0
       );
-      const rightEdge = left + measuredW + GAP + descendantWidth;
-      const leftEdge = left - GAP - descendantWidth;
-      const spaceRight = vw - (left + measuredW) - margin;
-      const spaceLeft = left - margin;
-      const contextOpenLeft = rightEdge > vw - margin
-        && (leftEdge >= margin || spaceLeft > spaceRight);
+      const contextOpenLeft = contextOpenLeftRef.current;
       const unclampedChildLeft = contextOpenLeft
         ? left - GAP - leftW
         : left + measuredW + GAP;

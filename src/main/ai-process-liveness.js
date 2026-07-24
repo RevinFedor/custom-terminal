@@ -105,6 +105,22 @@ function resolveProcessPresence(result, { established = false } = {}) {
   };
 }
 
+function resolveClaudeRuntimeAfterFailedStop({
+  claudeTurnBusy = false,
+  claudePromptReady = false,
+} = {}) {
+  // A failed process lookup preserves the established runtime, but it does
+  // not make the glyph spinner authoritative. Public Claude busy state is
+  // owned exclusively by the Stop-hook turn flag.
+  const busy = claudeTurnBusy === true;
+  const inputReady = !busy && claudePromptReady === true;
+  return {
+    sessionStatus: busy ? 'busy' : (inputReady ? 'active' : 'starting'),
+    busy,
+    inputReady,
+  };
+}
+
 module.exports = {
   AI_PROCESS_LOOKUP_STATUS,
   AiProcessLookupError,
@@ -113,6 +129,7 @@ module.exports = {
   inspectProcessLookupCached,
   knownProcessLookup,
   requireKnownProcessLookup,
+  resolveClaudeRuntimeAfterFailedStop,
   resolveProcessPresence,
   unknownProcessLookup,
 };

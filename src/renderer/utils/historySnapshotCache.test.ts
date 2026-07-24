@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   HistorySnapshotCache,
   HistoryVolatileOverlayCache,
+  estimateHistoryEntriesBytesFast,
   estimateHistoryValueBytes,
   makeHistorySnapshotKey,
   type HistorySnapshotOwner,
@@ -78,11 +79,13 @@ test('total entry budget evicts whole least-recent snapshots without truncating 
   });
 });
 
-test('byte budget retains exactly the latest oversized snapshot without copying its entries', () => {
+test('oversized LRU retains the latest two large owners without copying their entries', () => {
   const cache = new HistorySnapshotCache({
     maxBytes: 2_000,
     maxEntries: 100,
     maxSnapshots: 2,
+    maxOversizedBytes: 150_000,
+    maxOversizedSnapshots: 2,
   });
   const target = owner('same');
   assert.equal(cache.set(target, snapshot(['small'])).stored, true);
@@ -111,11 +114,80 @@ test('byte budget retains exactly the latest oversized snapshot without copying 
     entries: latestEntries,
     revision: 'revision-3',
   });
-  assert.deepEqual(replacement.evictedKeys, [makeHistorySnapshotKey(target)]);
-  assert.equal(cache.has(target), false);
-  assert.equal(cache.get(latestOwner)?.entries, latestEntries);
+  assert.deepEqual(replacement.evictedKeys, []);
+  assert.equal(cache.has(target), true);
+  assert.equal(cache.peek(latestOwner)?.entries, latestEntries);
   assert.equal(cache.has(regular), true);
+  assert.equal(cache.stats().snapshots, 3);
+
+  // Returning to the older large owner promotes it; a third large owner then
+  // evicts the untouched one, not the owner the user just revisited.
+  assert.equal(cache.get(target)?.entries, hugeEntries);
+  const thirdOwner = owner('third');
+  const thirdEntries = [{ uuid: 'third', content: 'z'.repeat(20_000) }];
+  const thirdResult = cache.set(thirdOwner, {
+    entries: thirdEntries,
+    revision: 'revision-4',
+  });
+  assert.deepEqual(thirdResult.evictedKeys, [makeHistorySnapshotKey(latestOwner)]);
+  assert.equal(cache.has(target), true);
+  assert.equal(cache.has(latestOwner), false);
+  assert.equal(cache.get(thirdOwner)?.entries, thirdEntries);
+});
+
+test('A → B → A between two production-sized owners is an oversized cache hit', () => {
+  const cache = new HistorySnapshotCache({
+    maxBytes: 64 * 1024,
+    maxEntries: 100,
+    maxSnapshots: 2,
+    maxOversizedBytes: 160 * 1024,
+    maxOversizedSnapshots: 2,
+  });
+  const ownerA = owner('large-a');
+  const ownerB = owner('large-b');
+  const entriesA = [{ uuid: 'a', content: 'a'.repeat(33 * 1024) }];
+  const entriesB = [{ uuid: 'b', content: 'b'.repeat(33 * 1024) }];
+
+  assert.equal(cache.set(ownerA, { entries: entriesA }).stored, true);
+  assert.equal(cache.set(ownerB, { entries: entriesB }).stored, true);
+
+  assert.equal(cache.get(ownerA)?.entries, entriesA);
+  assert.equal(cache.get(ownerB)?.entries, entriesB);
   assert.equal(cache.stats().snapshots, 2);
+  assert.ok(cache.stats().approxBytes > 128 * 1024);
+  assert.ok(cache.stats().approxBytes <= 160 * 1024);
+});
+
+test('oversized byte pool stays hard bounded and rejects one snapshot beyond it', () => {
+  const cache = new HistorySnapshotCache({
+    maxBytes: 2_000,
+    maxEntries: 100,
+    maxSnapshots: 2,
+    maxOversizedBytes: 25_000,
+    maxOversizedSnapshots: 2,
+  });
+  const target = owner('too-large');
+  cache.set(target, snapshot(['small']));
+
+  const result = cache.set(target, {
+    entries: [{ uuid: 'huge', content: 'x'.repeat(20_000) }],
+    revision: 'revision-2',
+  });
+
+  assert.deepEqual(
+    {
+      stored: result.stored,
+      reason: result.stored ? null : result.reason,
+      invalidatedExisting: result.invalidatedExisting,
+    },
+    {
+      stored: false,
+      reason: 'snapshot-too-large',
+      invalidatedExisting: true,
+    },
+  );
+  assert.equal(cache.has(target), false);
+  assert.equal(cache.stats().approxBytes, 0);
 });
 
 test('normal LRU limits remain bounded alongside the protected oversized snapshot', () => {
@@ -224,6 +296,53 @@ test('iterative estimator handles cycles and deeply nested History payloads', ()
     deep = { next: deep };
   }
   assert.ok(estimateHistoryValueBytes(deep) > 0);
+});
+
+test('fast History estimate samples a bounded number of rows', () => {
+  let inspected = 0;
+  const entries = Array.from({ length: 10_000 }, (_, index) => new Proxy(
+    { uuid: `row-${index}`, content: 'payload' },
+    {
+      ownKeys(target) {
+        inspected += 1;
+        return Reflect.ownKeys(target);
+      },
+    },
+  ));
+
+  const estimate = estimateHistoryEntriesBytesFast(entries);
+
+  assert.ok(estimate > 0);
+  assert.ok(inspected > 0);
+  assert.ok(inspected <= 64);
+});
+
+test('cache insertion trusts a validated byte hint without walking entry payloads', () => {
+  const cache = new HistorySnapshotCache({
+    maxBytes: 1_000_000,
+    maxEntries: 100,
+    maxSnapshots: 2,
+  });
+  const entry = new Proxy(
+    { uuid: 'hostile' },
+    {
+      ownKeys() {
+        throw new Error('entry graph was traversed');
+      },
+    },
+  );
+
+  const result = cache.set(owner('hinted'), {
+    entries: [entry],
+    entriesApproxBytesHint: 1_024,
+  });
+
+  assert.equal(result.stored, true);
+  assert.equal(cache.get(owner('hinted'))?.entries[0], entry);
+  assert.throws(() => cache.set(owner('bad-hint'), {
+    entries: [],
+    entriesApproxBytesHint: -1,
+  }), /non-negative safe integer/);
 });
 
 test('volatile overlay keeps only its small owner-local payload and is LRU bounded', () => {

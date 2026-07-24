@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+  advanceOscCommandGeneration,
   attachCodexSettingsProofOwner,
   codexSessionIdFromAuthoritativeStatus,
   consumePendingCodexSettingsProofHandoff,
@@ -22,6 +23,41 @@ const {
   validateCodexPickerRuntimeAdmission,
   validateCodexPtySubmitAdmission,
 } = require('./codex-runtime-contract');
+
+test('first exact OSC command-start confirms the launch-preclaimed generation once', () => {
+  assert.deepEqual(advanceOscCommandGeneration({
+    runSeq: 13,
+    preclaimedRunSeq: 13,
+    sameTerminal: true,
+    sameLaunch: true,
+  }), {
+    runSeq: 13,
+    consumed: true,
+  });
+
+  assert.deepEqual(advanceOscCommandGeneration({
+    runSeq: 13,
+  }), {
+    runSeq: 14,
+    consumed: false,
+  });
+});
+
+test('stale launch generation cannot suppress a real OSC command generation', () => {
+  for (const mismatch of [
+    { preclaimedRunSeq: 12, sameTerminal: true, sameLaunch: true },
+    { preclaimedRunSeq: 13, sameTerminal: false, sameLaunch: true },
+    { preclaimedRunSeq: 13, sameTerminal: true, sameLaunch: false },
+  ]) {
+    assert.deepEqual(advanceOscCommandGeneration({
+      runSeq: 13,
+      ...mismatch,
+    }), {
+      runSeq: 14,
+      consumed: false,
+    });
+  }
+});
 
 test('durable migration marker suppresses every explicit model and effort fallback', () => {
   assert.deepEqual(planCodexLaunchSettings({

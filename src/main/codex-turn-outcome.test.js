@@ -6,6 +6,7 @@ const {
   classifyCodexTurnRecord,
   classifyCodexTurnEvent,
   observeCodexTurnRecord,
+  projectCodexSuppressedCatchUpPublication,
   reduceCodexTurnOutcomeSummary,
   trackerHasFinalResultForEvent,
 } = require('./codex-turn-outcome');
@@ -168,4 +169,39 @@ test('sequential catch-up summary preserves failure even when a later turn succe
   assert.equal(summary.lastAbnormal.turnId, 'failed-turn');
   assert.equal(summary.latest.reason, 'task_complete');
   assert.equal(summary.latest.turnId, 'successful-turn');
+});
+
+test('linked catch-up publishes one final lifecycle outcome instead of every historical transition', () => {
+  assert.equal(projectCodexSuppressedCatchUpPublication({
+    catchUpPublicationsSuppressed: false,
+    liveTurnEvents: 8,
+    busy: false,
+  }), null);
+  assert.equal(projectCodexSuppressedCatchUpPublication({
+    catchUpPublicationsSuppressed: true,
+    liveTurnEvents: 0,
+    busy: false,
+  }), null);
+
+  assert.deepEqual(projectCodexSuppressedCatchUpPublication({
+    catchUpPublicationsSuppressed: true,
+    liveTurnEvents: 8,
+    busy: false,
+    lastEventType: 'task_complete',
+    lastEventTs: '2026-07-23T23:59:50.000Z',
+    lastOutcomeReason: 'task_complete',
+    lastOutcomeHasFinalResult: true,
+    lastOutcomeTurnId: 'turn-final',
+  }), {
+    busy: false,
+    reason: 'task_complete',
+    outcome: {
+      event: 'task_complete',
+      busy: false,
+      reason: 'task_complete',
+      hasFinalResult: true,
+    },
+    timestamp: '2026-07-23T23:59:50.000Z',
+    turnId: 'turn-final',
+  });
 });

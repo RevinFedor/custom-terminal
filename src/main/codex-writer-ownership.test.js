@@ -20,7 +20,12 @@ const {
   resolveCompleteCodexWriterProof,
   resolveCodexUserWriterProof,
   resolveCodexWriterProof,
+  isCommittedCodexNativeRewindReplay,
+  classifyCodexWriterObservationScope,
+  deriveCodexSettledWriterProofScope,
+  shouldUseSettledCodexRewindWriterProof,
   selectCodexNativeRewindWriter,
+  selectCodexSettledRewindWriter,
   isCodexWriterProofOwnershipQuarantined,
   runKeyedExclusive,
   runKeyedSingleFlight,
@@ -426,6 +431,331 @@ test('native Rewind rejects stale generations, unrelated writers, and multiple p
     liveProofs: [proofFor('child-a'), proofFor('child-b')],
   });
   assert.equal(multiple.reason, 'multiple-proven-descendants');
+});
+
+test('settled native Rewind proof resolves source plus exact child only while every scope still matches', async () => {
+  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const source = sessionsDir + '/rollout-source.jsonl';
+  const child = sessionsDir + '/rollout-child.jsonl';
+  const terminalToken = {};
+  const descriptorProof = resolveCodexWriterProof([{
+    pid: 100,
+    output: `p100\nf20\nau\nn${source}\nf21\nau\nn${child}\n`,
+  }], sessionsDir);
+  const metadata = new Map([
+    [source, { meta: { id: 'source', source: 'cli' } }],
+    [child, { meta: { id: 'child', forked_from_id: 'source', source: 'cli' } }],
+  ]);
+  const settledWriter = {
+    kind: 'native-rewind-settled-writer',
+    valid: true,
+    sessionId: 'child',
+    filePath: child,
+    sourceSessionId: 'source',
+    actionGeneration: 'rewind-settled-1',
+    observerGeneration: 'rewind-settled-1',
+    terminalToken,
+    observerTerminalToken: terminalToken,
+    runSeq: 12,
+    observerRunSeq: 12,
+    boundSessionId: 'child',
+  };
+  const proof = await resolveCodexUserWriterProof(descriptorProof, {
+    readMetadata: async (filePath) => metadata.get(filePath),
+    isUserSession: () => true,
+    settledWriter,
+  });
+
+  assert.equal(proof.status, 'owned');
+  assert.equal(proof.filePath, child);
+  assert.equal(proof.settledWriterProof.sessionId, 'child');
+  assert.deepEqual(proof.settledWriterProof.ancestors, [{
+    sessionId: 'source',
+    lineageDepth: 1,
+  }]);
+});
+
+test('settled Rewind writer remains authoritative only before the next durable handoff boundary', () => {
+  assert.equal(shouldUseSettledCodexRewindWriterProof({
+    sourceMode: 'writer-handoff',
+    handoffActionStartedAtMs: null,
+  }), true);
+  assert.equal(shouldUseSettledCodexRewindWriterProof({
+    sourceMode: 'writer-handoff',
+    handoffActionStartedAtMs: undefined,
+  }), true);
+  assert.equal(shouldUseSettledCodexRewindWriterProof({
+    sourceMode: 'writer-handoff',
+    handoffActionStartedAtMs: '',
+  }), true);
+  assert.equal(shouldUseSettledCodexRewindWriterProof({
+    sourceMode: 'writer-handoff',
+    handoffActionStartedAtMs: 0,
+  }), false);
+  assert.equal(shouldUseSettledCodexRewindWriterProof({
+    sourceMode: 'writer-handoff',
+    handoffActionStartedAtMs: 1_724_000_000_000,
+  }), false);
+  assert.equal(shouldUseSettledCodexRewindWriterProof({
+    sourceMode: 'resume',
+    handoffActionStartedAtMs: 1_724_000_000_000,
+  }), true);
+});
+
+test('settled Rewind proof fails closed for stale scope, wrong identity, or non-ancestor writers', () => {
+  const terminalToken = {};
+  const candidates = [
+    { filePath: '/sessions/source.jsonl', meta: { id: 'source' } },
+    {
+      filePath: '/sessions/child.jsonl',
+      meta: { id: 'child', forked_from_id: 'source' },
+    },
+  ];
+  const base = {
+    kind: 'native-rewind-settled-writer',
+    valid: true,
+    sessionId: 'child',
+    filePath: '/sessions/child.jsonl',
+    sourceSessionId: 'source',
+    actionGeneration: 'rewind-settled-2',
+    observerGeneration: 'rewind-settled-2',
+    terminalToken,
+    observerTerminalToken: terminalToken,
+    runSeq: 22,
+    observerRunSeq: 22,
+    boundSessionId: 'child',
+  };
+  assert.equal(selectCodexSettledRewindWriter(candidates, {
+    ...base,
+    observerGeneration: 'rewind-settled-newer',
+  }).reason, 'stale-settled-writer-generation');
+  assert.equal(selectCodexSettledRewindWriter(candidates, {
+    ...base,
+    observerTerminalToken: {},
+  }).reason, 'stale-settled-writer-terminal');
+  assert.equal(selectCodexSettledRewindWriter(candidates, {
+    ...base,
+    observerRunSeq: 23,
+  }).reason, 'stale-settled-writer-run');
+  assert.equal(selectCodexSettledRewindWriter(candidates, {
+    ...base,
+    boundSessionId: 'source',
+  }).reason, 'settled-writer-binding-mismatch');
+  assert.equal(selectCodexSettledRewindWriter(candidates, {
+    ...base,
+    filePath: '/sessions/not-child.jsonl',
+  }).reason, 'settled-writer-candidate-missing');
+  assert.equal(selectCodexSettledRewindWriter(candidates, {
+    ...base,
+    sessionId: 'other-child',
+    boundSessionId: 'other-child',
+  }).reason, 'settled-writer-candidate-missing');
+
+  const sibling = {
+    filePath: '/sessions/sibling.jsonl',
+    meta: { id: 'sibling', forked_from_id: 'source' },
+  };
+  const withSibling = selectCodexSettledRewindWriter(
+    [...candidates, sibling],
+    base,
+  );
+  assert.equal(withSibling.reason, 'settled-writer-competitor-not-ancestor');
+  assert.equal(withSibling.rejectedSessionId, 'sibling');
+
+  const descendant = {
+    filePath: '/sessions/grandchild.jsonl',
+    meta: { id: 'grandchild', forked_from_id: 'child' },
+  };
+  const withDescendant = selectCodexSettledRewindWriter(
+    [...candidates, descendant],
+    base,
+  );
+  assert.equal(withDescendant.reason, 'settled-writer-competitor-not-ancestor');
+  assert.equal(withDescendant.rejectedSessionId, 'grandchild');
+});
+
+test('a queued observer accepts only the exact already-committed native Rewind transaction', () => {
+  const terminalToken = {};
+  const intent = {
+    sourceMode: 'writer-handoff',
+    sourceSessionId: 'source-a',
+    launchId: 'rewind-a-b',
+  };
+  const proof = {
+    kind: 'native-rewind-settled-writer',
+    valid: true,
+    sessionId: 'child-b',
+    sourceSessionId: 'source-a',
+    actionGeneration: 'rewind-a-b',
+    terminalToken,
+    runSeq: 41,
+  };
+  const base = {
+    intent,
+    candidateSessionId: 'child-b',
+    proof,
+    boundSessionId: 'child-b',
+    terminalToken,
+    runSeq: 41,
+    currentIntentGeneration: 'rewind-a-b',
+    observerCurrent: true,
+  };
+  assert.equal(isCommittedCodexNativeRewindReplay(base), true);
+  assert.equal(isCommittedCodexNativeRewindReplay({
+    ...base,
+    intent: { ...intent, launchId: 'rewind-b-c' },
+  }), false, 'a newer Rewind generation cannot borrow the previous commit');
+  assert.equal(isCommittedCodexNativeRewindReplay({
+    ...base,
+    proof: { ...proof, valid: false },
+  }), false);
+  assert.equal(isCommittedCodexNativeRewindReplay({
+    ...base,
+    boundSessionId: 'source-a',
+  }), false);
+  assert.equal(isCommittedCodexNativeRewindReplay({
+    ...base,
+    terminalToken: {},
+  }), false);
+  assert.equal(isCommittedCodexNativeRewindReplay({
+    ...base,
+    runSeq: 42,
+  }), false);
+  assert.equal(isCommittedCodexNativeRewindReplay({
+    ...base,
+    currentIntentGeneration: 'rewind-b-c',
+  }), false, 'a queued A→B replay cannot finish after B→C is armed');
+  assert.equal(isCommittedCodexNativeRewindReplay({
+    ...base,
+    observerCurrent: false,
+  }), false, 'a replaced observer cannot replay a completed handoff');
+});
+
+test('writer observation becomes stale before it may invalidate a newer proof', () => {
+  const observer = {};
+  assert.deepEqual(classifyCodexWriterObservationScope({
+    capturedIntentGeneration: null,
+    currentIntentGeneration: 'rewind-b-c',
+    expectedObserver: null,
+    currentObserver: null,
+  }), {
+    status: 'stale-generation',
+    expectedLaunchId: null,
+    currentLaunchId: 'rewind-b-c',
+  }, 'a public lookup started before Rewind must not invalidate its proof');
+
+  assert.deepEqual(classifyCodexWriterObservationScope({
+    capturedIntentGeneration: 'rewind-a-b',
+    currentIntentGeneration: 'rewind-b-c',
+    expectedObserver: observer,
+    currentObserver: observer,
+  }), {
+    status: 'stale-generation',
+    expectedLaunchId: 'rewind-a-b',
+    currentLaunchId: 'rewind-b-c',
+  }, 'a queued A→B observer is stale once B→C starts');
+
+  assert.deepEqual(classifyCodexWriterObservationScope({
+    capturedIntentGeneration: 'rewind-b-c',
+    currentIntentGeneration: 'rewind-b-c',
+    expectedObserver: observer,
+    currentObserver: {},
+  }), {
+    status: 'stale-observer',
+  });
+
+  assert.deepEqual(classifyCodexWriterObservationScope({
+    capturedIntentGeneration: 'rewind-b-c',
+    currentIntentGeneration: 'rewind-b-c',
+    expectedObserver: observer,
+    currentObserver: observer,
+  }), {
+    status: 'current',
+  });
+});
+
+test('a public reconciliation preserves the settled Rewind source lineage', () => {
+  assert.deepEqual(deriveCodexSettledWriterProofScope({
+    nativeRewindHandoffProven: true,
+    intent: {
+      launchId: 'rewind-a-b',
+      sourceSessionId: 'source-a',
+    },
+  }), {
+    actionGeneration: 'rewind-a-b',
+    sourceSessionId: 'source-a',
+  });
+
+  assert.deepEqual(deriveCodexSettledWriterProofScope({
+    settledRewindWriterProven: true,
+    settledWriterProof: {
+      actionGeneration: 'rewind-a-b',
+      sourceSessionId: 'source-a',
+      sessionId: 'child-b',
+    },
+  }), {
+    actionGeneration: 'rewind-a-b',
+    sourceSessionId: 'source-a',
+  }, 'revalidating child B without an active intent must not erase source A');
+
+  assert.deepEqual(deriveCodexSettledWriterProofScope({}), {
+    actionGeneration: null,
+    sourceSessionId: null,
+  });
+});
+
+test('active native Rewind B to C ignores settled B and selects exact live child C', async () => {
+  const sessionsDir = '/Users/fedor/.codex/sessions';
+  const sourceA = sessionsDir + '/rollout-a.jsonl';
+  const settledB = sessionsDir + '/rollout-b.jsonl';
+  const childC = sessionsDir + '/rollout-c.jsonl';
+  const terminalToken = {};
+  const descriptorProof = resolveCodexWriterProof([{
+    pid: 100,
+    output: `p100\nf20\nau\nn${sourceA}\nf21\nau\nn${settledB}\nf22\nau\nn${childC}\n`,
+  }], sessionsDir);
+  const metadata = new Map([
+    [sourceA, { meta: { id: 'a', source: 'cli' } }],
+    [settledB, { meta: { id: 'b', forked_from_id: 'a', source: 'cli' } }],
+    [childC, { meta: { id: 'c', forked_from_id: 'b', source: 'cli' } }],
+  ]);
+  const proof = await resolveCodexUserWriterProof(descriptorProof, {
+    readMetadata: async (filePath) => metadata.get(filePath),
+    isUserSession: () => true,
+    settledWriter: {
+      kind: 'native-rewind-settled-writer',
+      valid: true,
+      sessionId: 'b',
+      filePath: settledB,
+      sourceSessionId: 'a',
+      actionGeneration: 'rewind-a-b',
+      observerGeneration: 'rewind-a-b',
+      terminalToken,
+      observerTerminalToken: terminalToken,
+      runSeq: 31,
+      observerRunSeq: 31,
+      boundSessionId: 'b',
+    },
+    handoff: {
+      kind: 'native-rewind',
+      sourceSessionId: 'b',
+      actionGeneration: 'rewind-b-c',
+      observerGeneration: 'rewind-b-c',
+      actionStartedAtMs: 32000,
+      liveProofs: [{
+        sessionId: 'c',
+        actionGeneration: 'rewind-b-c',
+        kind: 'rollout-created',
+        boundaryAtMs: 32001,
+        observedAtMs: 32002,
+      }],
+    },
+  });
+
+  assert.equal(proof.status, 'owned');
+  assert.equal(proof.filePath, childC);
+  assert.equal(proof.handoffProof.sessionId, 'c');
+  assert.equal(proof.settledWriterProof, undefined);
 });
 
 test('branch handoff settles only when the adopted writer matches the exact proven generation', () => {

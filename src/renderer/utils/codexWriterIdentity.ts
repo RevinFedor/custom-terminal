@@ -1,4 +1,5 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
+import { isCodexRuntimeWriterUsable } from './codexPtyPresence.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -132,10 +133,7 @@ export const resolveCodexSurfaceSession = async ({
         : null;
 
   if (liveLifecycle === true) {
-    const usableWriter = snapshot.writerStatus === 'adopted'
-      && snapshot.writerProof === 'process-open-rollout'
-      && snapshot.writerUsableForMutation === true
-      && snapshot.canCopySessionId === true
+    const usableWriter = isCodexRuntimeWriterUsable(snapshot, { requireCopy: true })
       && !!confirmedWriter;
     if (!usableWriter) {
       return {
@@ -220,9 +218,7 @@ export const resolveConfirmedCodexWriter = async ({
 
   const writerSessionId = getConfirmedCodexWriterSessionId(snapshot);
   if (!writerSessionId
-    || snapshot?.writerStatus !== 'adopted'
-    || snapshot?.writerProof !== 'process-open-rollout'
-    || snapshot?.writerUsableForMutation !== true) {
+    || !isCodexRuntimeWriterUsable(snapshot)) {
     throw writerGuardError(
       'codex_writer_unconfirmed',
       `Codex ещё не подтвердил активную сессию. Дождитесь окончания загрузки и повторите действие «${operation}».`,

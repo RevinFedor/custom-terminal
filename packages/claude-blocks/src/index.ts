@@ -61,7 +61,7 @@ export {
 export {
   detectLanguage, lineDiff, countDiffStats, numberDiff, extractRawText,
   toolStatusFrom, defaultOpenForTool, resultToText, copyText, setCopyTextImpl,
-  type DiffEntry, type NumberedDiffEntry, type ToolStatus,
+  type DiffEntry, type DiffHunk, type NumberedDiffEntry, type ToolStatus,
 } from './helpers';
 
 export { rehypeHexHighlight } from './rehypeHexHighlight';

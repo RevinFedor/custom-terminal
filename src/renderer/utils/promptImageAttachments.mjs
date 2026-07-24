@@ -184,6 +184,34 @@ export function insertPromptImageAttachments({
   };
 }
 
+/**
+ * Keeps a textarea selection attached to the same logical text after the
+ * temporary image-saving marker is replaced with the durable image marker.
+ */
+export function remapPromptImageSelectionAfterReplacement({
+  selectionStart = 0,
+  selectionEnd = selectionStart,
+  replacedStart = 0,
+  replacedEnd = replacedStart,
+  insertionCaret = replacedStart,
+} = {}) {
+  const from = Math.max(0, Number(replacedStart) || 0);
+  const to = Math.max(from, Number(replacedEnd) || from);
+  const caret = Math.max(from, Number(insertionCaret) || from);
+  const delta = caret - to;
+  const adjust = (position) => {
+    const value = Math.max(0, Number(position) || 0);
+    if (value >= to) return value + delta;
+    if (value > from) return caret;
+    return value;
+  };
+
+  return {
+    start: adjust(selectionStart),
+    end: adjust(selectionEnd),
+  };
+}
+
 export function normalizePromptImageIdentity(text) {
   return String(text || '')
     .replace(/\[imagePath:\s*[^\]\r\n]+?\s*\]/gi, ' [Image] ')

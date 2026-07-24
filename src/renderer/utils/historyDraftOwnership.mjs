@@ -1,6 +1,26 @@
 import { insertPromptImageAttachments } from './promptImageAttachments.mjs';
 import { normalizeComposerChips } from './composerChips.mjs';
 
+/**
+ * Interrupt recovery has three materially different outcomes:
+ *
+ * - a durable user row already exists: Stop only interrupted execution and
+ *   must not return/suppress the accepted prompt;
+ * - the terminal returned the prompt: ownership goes back to the composer;
+ * - neither proof exists yet: keep the handoff visible as pending instead of
+ *   guessing that the message was cancelled.
+ */
+export function resolveInterruptedPromptOwnership({
+  durablePromptExists = false,
+  returnedDraftExists = false,
+  returnedDraftMatchesHandoff = false,
+} = {}) {
+  if (durablePromptExists) return 'durable';
+  if (returnedDraftExists && returnedDraftMatchesHandoff) return 'restore';
+  if (returnedDraftExists) return 'unrelated-draft';
+  return 'pending';
+}
+
 function separatorBetween(left, right) {
   if (!left || !right) return '';
   const trailingNewlines = left.match(/\n+$/)?.[0].length || 0;

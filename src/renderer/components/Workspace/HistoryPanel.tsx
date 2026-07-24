@@ -27,14 +27,26 @@ import {
   type AgentPtyStatus,
   type AgentQuestion,
 } from '../../utils/historyAgentRuntimes';
-import { sendAgentPromptScenario } from '../../utils/agentScenarios';
+import { sendAgentPromptScenario, stopAgentProcessScenario } from '../../utils/agentScenarios';
 import {
+  beginCoordinatedAgentSend,
+  getCoordinatedAgentAction,
+  requestCoordinatedStopAfterSend,
+  settleCoordinatedAgentSend,
+  subscribeCoordinatedAgentActions,
+} from '../../utils/agentActionCoordinator.mjs';
+import {
+  estimateHistoryEntriesBytesFast,
   historySnapshotCache,
   historyVolatileOverlayCache,
   makeHistorySnapshotKey,
   type HistoryDurableRevision,
   type HistorySnapshotOwner,
 } from '../../utils/historySnapshotCache';
+import {
+  createHistoryViewportPaintProbe,
+  type HistoryViewportPaintOwner,
+} from '../../utils/historyViewportPaintProbe';
 import {
   buildPromptImagePayload,
   collectPromptImageRefIds,
@@ -44,6 +56,7 @@ import {
   haveSamePromptImageRefs,
   insertPromptImageAttachments,
   normalizePromptImageIdentity,
+  remapPromptImageSelectionAfterReplacement,
   retainPromptImageRefsForText,
 } from '../../utils/promptImageAttachments.mjs';
 import {
@@ -53,9 +66,13 @@ import {
   restoreComposerChipToText,
   serializeComposerDraft,
   shouldCreatePasteChip,
+  splitPromptChipPresentation,
   upsertComposerChip,
 } from '../../utils/composerChips.mjs';
-import { mergeFailedHistoryAuthoringSnapshot } from '../../utils/historyDraftOwnership.mjs';
+import {
+  mergeFailedHistoryAuthoringSnapshot,
+  resolveInterruptedPromptOwnership,
+} from '../../utils/historyDraftOwnership.mjs';
 import { queueSendTransferredOwnership } from '../../store/usePromptQueueStore';
 import {
   deriveCodexEffectiveSettingsFromHistory,
@@ -69,6 +86,7 @@ import type { AgentLifecycleSummary } from './TerminalArea';
 // left on the legacy SubAgentBlock path ("субагентов пока не трогаем").
 import {
   ConversationMessage,
+  ComposerChip,
   Markdown as CBMarkdown,
   MessageActionButton,
   MessageActionRail,
@@ -117,7 +135,17 @@ interface TaskAction {
 // tool_use — full name+input+result, rendered via the package ToolCallPart.
 interface RawAction {
   tool: '__raw__';
-  rawTool: { toolName: string; args: Record<string, any>; result?: string; isError?: boolean };
+  rawTool: {
+    toolName: string;
+    args: Record<string, any>;
+    result?: string;
+    isError?: boolean;
+    diffHunks?: Array<{
+      oldStart: number;
+      newStart: number;
+      entries: Array<{ tag: 'eq' | 'add' | 'del'; line: string }>;
+    }>;
+  };
 }
 type Action = string | FileAction | TaskAction | RawAction;
 
@@ -145,6 +173,7 @@ interface FullHistoryEntry {
   sessionId: string;
   compactSummary?: string;
   preTokens?: number;
+  promptChips?: HistoryPromptDraftChip[];
 }
 
 const reconcileCodexEffectiveSettings = (
@@ -240,7 +269,6 @@ interface SuppressedPrompt {
 const LOCAL_PROMPT_PREFIX = 'local-prompt-';
 const LOCAL_REWIND_PREFIX = 'local-rewind-';
 const LOCAL_PROMPT_FAILURE_TTL_MS = 15000;
-const LOCAL_PROMPT_SENT_TTL_MS = 12000;
 const HISTORY_SCROLL_PIXEL_CAP_WARN_PX = 16_000_000;
 const REWIND_BUSY_GUARD_RE = /\bis (?:busy|starting); wait (?:for the current turn|until the current loader finishes) before rewind\b/i;
 const EMPTY_HISTORY_DRAFT_IMAGES: HistoryPromptDraftImageRef[] = [];
@@ -405,10 +433,15 @@ const isLocalPromptEntry = (entry: FullHistoryEntry) =>
 const isLocalRewindEntry = (entry: FullHistoryEntry) =>
   entry.role === 'rewind' && entry.uuid.startsWith(LOCAL_REWIND_PREFIX);
 
-const serverHasPromptEntry = (serverEntries: FullHistoryEntry[], localEntry: FullHistoryEntry) => {
+const findServerPromptEntry = (
+  serverEntries: FullHistoryEntry[],
+  localEntry: FullHistoryEntry,
+  excludedUuids: Set<string> = new Set(),
+) => {
   const normalized = normalizeHistoryPromptIdentityText(localEntry.content);
   const localAt = localEntry.optimisticAt || Date.parse(localEntry.timestamp) || Date.now();
-  return serverEntries.some((entry) => {
+  return serverEntries.find((entry) => {
+    if (excludedUuids.has(entry.uuid)) return false;
     if (entry.role !== 'user' && entry.role !== 'queued') return false;
     if (normalizeHistoryPromptIdentityText(entry.content) !== normalized) return false;
     const entryAt = Date.parse(entry.timestamp || '');
@@ -416,24 +449,64 @@ const serverHasPromptEntry = (serverEntries: FullHistoryEntry[], localEntry: Ful
   });
 };
 
+const serverHasPromptEntry = (serverEntries: FullHistoryEntry[], localEntry: FullHistoryEntry) =>
+  !!findServerPromptEntry(serverEntries, localEntry);
+
 const mergeServerAndLocalEntries = (serverEntries: FullHistoryEntry[], currentEntries: FullHistoryEntry[]) => {
   const now = Date.now();
-  const locals = currentEntries.filter((entry) =>
-    (isLocalPromptEntry(entry) &&
-      !serverHasPromptEntry(serverEntries, entry) &&
-      (() => {
-        const ageMs = now - (entry.statusChangedAt || entry.optimisticAt || Date.parse(entry.timestamp || '') || now);
-        if (entry.queueStatus === 'cancelled' || entry.queueStatus === 'failed') {
-          return ageMs < LOCAL_PROMPT_FAILURE_TTL_MS;
-        }
-        if (entry.queueStatus === 'sent') {
-          return ageMs < LOCAL_PROMPT_SENT_TTL_MS;
-        }
-        return true;
-      })()) ||
-    isLocalRewindEntry(entry)
-  );
-  return locals.length > 0 ? [...serverEntries, ...locals] : serverEntries;
+  const consumedServerUuids = new Set<string>();
+  const promptChipsByServerUuid = new Map<string, HistoryPromptDraftChip[]>();
+  const locals: FullHistoryEntry[] = [];
+  for (const entry of currentEntries) {
+    if (isLocalRewindEntry(entry)) {
+      locals.push(entry);
+      continue;
+    }
+    if (!isLocalPromptEntry(entry)) continue;
+    const matched = findServerPromptEntry(serverEntries, entry, consumedServerUuids);
+    if (matched) {
+      const localAt = entry.optimisticAt || Date.parse(entry.timestamp || '');
+      const serverAt = Date.parse(matched.timestamp || '');
+      historyDiag('PROMPT_ADOPT'
+        + ' local=' + entry.uuid
+        + ' handoff=' + (entry.handoffId || '-')
+        + ' server=' + matched.uuid
+        + ' localAt=' + (Number.isFinite(localAt) ? localAt : -1)
+        + ' serverAt=' + (Number.isFinite(serverAt) ? serverAt : -1)
+        + ' deltaMs=' + (
+          Number.isFinite(localAt) && Number.isFinite(serverAt)
+            ? serverAt - localAt
+            : 'unknown'
+        )
+        + ' matchMode=text-lower-bound'
+        + ' chips=' + (entry.promptChips?.length || 0));
+      consumedServerUuids.add(matched.uuid);
+      if ((entry.promptChips?.length || 0) > 0 && !(matched.promptChips?.length || 0)) {
+        promptChipsByServerUuid.set(matched.uuid, entry.promptChips || []);
+      }
+      continue;
+    }
+    const ageMs = now - (
+      entry.statusChangedAt
+      || entry.optimisticAt
+      || Date.parse(entry.timestamp || '')
+      || now
+    );
+    if (
+      (entry.queueStatus === 'cancelled' || entry.queueStatus === 'failed')
+      && ageMs >= LOCAL_PROMPT_FAILURE_TTL_MS
+    ) {
+      continue;
+    }
+    locals.push(entry);
+  }
+  const decoratedServerEntries = promptChipsByServerUuid.size > 0
+    ? serverEntries.map((entry) => {
+        const chips = promptChipsByServerUuid.get(entry.uuid);
+        return chips ? { ...entry, promptChips: chips } : entry;
+      })
+    : serverEntries;
+  return locals.length > 0 ? [...decoratedServerEntries, ...locals] : decoratedServerEntries;
 };
 
 const historyActionPresentationEqual = (left: Action, right: Action) => {
@@ -444,7 +517,8 @@ const historyActionPresentationEqual = (left: Action, right: Action) => {
     return left.rawTool.toolName === right.rawTool.toolName &&
       left.rawTool.result === right.rawTool.result &&
       left.rawTool.isError === right.rawTool.isError &&
-      JSON.stringify(left.rawTool.args || {}) === JSON.stringify(right.rawTool.args || {});
+      JSON.stringify(left.rawTool.args || {}) === JSON.stringify(right.rawTool.args || {}) &&
+      JSON.stringify(left.rawTool.diffHunks || []) === JSON.stringify(right.rawTool.diffHunks || []);
   }
   if (isTaskAction(left) && isTaskAction(right)) {
     return left.description === right.description &&
@@ -478,7 +552,8 @@ const historyEntryPresentationEqual = (left: FullHistoryEntry, right: FullHistor
     left.thinking !== right.thinking ||
     left.sessionId !== right.sessionId ||
     left.compactSummary !== right.compactSummary ||
-    left.preTokens !== right.preTokens
+    left.preTokens !== right.preTokens ||
+    !haveSameComposerChips(left.promptChips || [], right.promptChips || [])
   ) return false;
   const leftActions = left.actions || [];
   const rightActions = right.actions || [];
@@ -579,6 +654,35 @@ function findHistoryScrollParent(element: HTMLElement | null): HTMLElement | nul
  * After Virtuoso has measured the taller row, scroll only by the part that fell
  * below the viewport. Blocks that already fit do not move the list.
  */
+function applyHistoryRevealUpdate(
+  anchor: HTMLElement | null,
+  opening: boolean,
+  update: () => void,
+) {
+  const scroller = findHistoryScrollParent(anchor);
+  flushSync(update);
+  if (!opening || !anchor || !scroller) return;
+
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      if (!anchor.isConnected || !scroller.isConnected) return;
+      const anchorRect = anchor.getBoundingClientRect();
+      const scrollerRect = scroller.getBoundingClientRect();
+      // In the primary History surface the composer floats over the scroller.
+      // The footer spacer keeps the final row reachable, but the composer's
+      // occupied height is still not part of the currently visible viewport.
+      // Reuse that single geometry source instead of querying a second DOM
+      // element (which could select controls from another mounted tab).
+      const overlayHeight = Number.parseFloat(
+        window.getComputedStyle(scroller).getPropertyValue('--hp-composer-overlay-height'),
+      ) || 0;
+      const visibleBottom = scrollerRect.bottom - overlayHeight - 8;
+      const overflow = anchorRect.bottom - visibleBottom;
+      if (overflow > 0.5) scroller.scrollTop += overflow;
+    });
+  });
+}
+
 function useHistoryRevealToggle(
   anchorRef: React.RefObject<HTMLElement | null>,
   open: boolean,
@@ -587,20 +691,7 @@ function useHistoryRevealToggle(
   return useCallback(() => {
     const opening = !open;
     const anchor = anchorRef.current;
-    const scroller = findHistoryScrollParent(anchor);
-    flushSync(() => setOpen(opening));
-    if (!opening || !anchor || !scroller) return;
-
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        const measuredAnchor = anchorRef.current;
-        if (!measuredAnchor || !measuredAnchor.isConnected || !scroller.isConnected) return;
-        const anchorRect = measuredAnchor.getBoundingClientRect();
-        const scrollerRect = scroller.getBoundingClientRect();
-        const overflow = anchorRect.bottom - (scrollerRect.bottom - 8);
-        if (overflow > 0.5) scroller.scrollTop += overflow;
-      });
-    });
+    applyHistoryRevealUpdate(anchor, opening, () => setOpen(opening));
   }, [anchorRef, open, setOpen]);
 }
 
@@ -827,11 +918,17 @@ const HistoryToolCallPart = memo(({
   args,
   result,
   isError,
+  diffHunks,
 }: {
   toolName: string;
   args: Record<string, any>;
   result?: string;
   isError?: boolean;
+  diffHunks?: Array<{
+    oldStart: number;
+    newStart: number;
+    entries: Array<{ tag: 'eq' | 'add' | 'del'; line: string }>;
+  }>;
 }) => {
   const anchorRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(() => (
@@ -849,6 +946,7 @@ const HistoryToolCallPart = memo(({
         args={args}
         result={result}
         isError={isError}
+        diffHunks={diffHunks}
         collapse={{ open, onToggle, anchorRef }}
       />
     </div>
@@ -965,8 +1063,10 @@ const HistoryCollapsiblePrompt = ({
   forceExpanded?: boolean;
 }) => {
   const [expanded, setExpanded] = useState(false);
+  const anchorRef = useRef<HTMLDivElement>(null);
   const needsCollapse = text.length > HISTORY_USER_TEXT_COLLAPSE_THRESHOLD;
   const open = forceExpanded || expanded;
+  const toggleExpanded = useHistoryRevealToggle(anchorRef, expanded, setExpanded);
   if (!needsCollapse) {
     return <p className="cb-msg-text">{renderSentHistoryPromptHighlight(text)}</p>;
   }
@@ -979,14 +1079,14 @@ const HistoryCollapsiblePrompt = ({
       onClick={(event) => {
         event.preventDefault();
         event.stopPropagation();
-        setExpanded((value) => !value);
+        toggleExpanded();
       }}
     >
       {open ? 'Свернуть' : `Раскрыть полностью (${text.split('\n').length.toLocaleString()} строк)`}
     </button>
   );
   return (
-    <div>
+    <div ref={anchorRef}>
       {open && !forceExpanded && <div className="cb-collapse-top">{toggle}</div>}
       <p className="cb-msg-text">
         {renderSentHistoryPromptHighlight(open ? text : preview + '…')}
@@ -998,18 +1098,75 @@ const HistoryCollapsiblePrompt = ({
 
 const HistoryUserPromptContent = ({
   text,
+  promptChips = [],
   forceExpanded = false,
 }: {
   text: string;
+  promptChips?: HistoryPromptDraftChip[];
   forceExpanded?: boolean;
 }) => {
-  const [expandedPaste, setExpandedPaste] = useState<number | null>(null);
-  const parts = useMemo(() => parsePastedContentParts(text), [text]);
-  if (!parts.some((part: { kind: string }) => part.kind === 'paste')) {
+  const [expandedPart, setExpandedPart] = useState<string | null>(null);
+  const revealAnchorsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const setRevealAnchor = useCallback((partKey: string, node: HTMLDivElement | null) => {
+    if (node) revealAnchorsRef.current.set(partKey, node);
+    else revealAnchorsRef.current.delete(partKey);
+  }, []);
+  const toggleExpandedPart = useCallback((partKey: string, open: boolean) => {
+    if (forceExpanded) return;
+    applyHistoryRevealUpdate(
+      revealAnchorsRef.current.get(partKey) || null,
+      !open,
+      () => setExpandedPart(open ? null : partKey),
+    );
+  }, [forceExpanded]);
+  const promptPresentation = useMemo(
+    () => splitPromptChipPresentation({ text, chips: promptChips }),
+    [promptChips, text],
+  );
+  const parts = useMemo(
+    () => parsePastedContentParts(promptPresentation.text),
+    [promptPresentation.text],
+  );
+  if (
+    promptPresentation.chips.length === 0
+    && !parts.some((part: { kind: string }) => part.kind === 'paste')
+  ) {
     return <HistoryCollapsiblePrompt text={text} forceExpanded={forceExpanded} />;
   }
   return (
     <div className="cb-user-parts">
+      {promptPresentation.chips.length > 0 && (
+        <div
+          data-history-user-prompt-chips
+          style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}
+        >
+          {promptPresentation.chips.map((chip: HistoryPromptDraftChip, index: number) => {
+            const partKey = `prompt:${chip.id || index}`;
+            const open = forceExpanded || expandedPart === partKey;
+            return (
+              <div
+                key={partKey}
+                ref={(node) => setRevealAnchor(partKey, node)}
+                style={{ maxWidth: '100%' }}
+              >
+                <ComposerChip
+                  kind="prompt"
+                  label={chip.label || 'PROMPT'}
+                  onClick={() => toggleExpandedPart(partKey, open)}
+                />
+                {open && (
+                  <div className="cb-paste-chip-body">
+                    <div style={{ marginBottom: 5, color: '#777', fontSize: '0.82em' }}>
+                      {chip.text.length.toLocaleString()} символов
+                    </div>
+                    <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{chip.text}</pre>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
       {parts.map((part: { kind: 'text' | 'paste'; text: string }, index: number) => {
         if (part.kind === 'text') {
           const content = part.text.trim();
@@ -1017,11 +1174,12 @@ const HistoryUserPromptContent = ({
             ? <HistoryCollapsiblePrompt key={'text:' + index} text={content} forceExpanded={forceExpanded} />
             : null;
         }
-        const open = forceExpanded || expandedPaste === index;
+        const partKey = `paste:${index}`;
+        const open = forceExpanded || expandedPart === partKey;
         const preview = part.text.slice(0, 60).replace(/\s+/g, ' ')
           + (part.text.length > 60 ? '…' : '');
         return (
-          <div key={'paste:' + index}>
+          <div key={partKey} ref={(node) => setRevealAnchor(partKey, node)}>
             <button
               type="button"
               className="cb-paste-chip"
@@ -1029,7 +1187,7 @@ const HistoryUserPromptContent = ({
               onClick={(event) => {
                 event.preventDefault();
                 event.stopPropagation();
-                if (!forceExpanded) setExpandedPaste(open ? null : index);
+                toggleExpandedPart(partKey, open);
               }}
             >
               <span className="cb-paste-chip-preview">{preview}</span>
@@ -1060,6 +1218,43 @@ const HistoryUserEntry = memo(({
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editableLastPrompt = entry.deliveryStatus === 'editable-last-prompt';
   const canRewind = allowRewind && !rewindLocked;
+  const queueStatus = entry.queueStatus;
+  const queueStatusPresentation = queueStatus === 'sending'
+    ? {
+        label: 'SENDING',
+        tone: 'info' as const,
+        pending: true,
+        title: 'Сообщение отправляется',
+      }
+    : queueStatus === 'queued'
+      ? {
+          label: 'QUEUED',
+          tone: 'accent' as const,
+          pending: true,
+          title: 'Сообщение ждёт завершения текущего ответа',
+        }
+      : queueStatus === 'sent'
+        ? {
+            label: 'SENT',
+            tone: 'success' as const,
+            pending: false,
+            title: 'Сообщение передано агенту и ожидает появления в сохранённой истории',
+          }
+        : queueStatus === 'cancelled'
+          ? {
+              label: 'CANCELLED',
+              tone: 'warning' as const,
+              pending: false,
+              title: 'Отправка отменена до появления сообщения в сохранённой истории',
+            }
+          : queueStatus === 'failed'
+            ? {
+                label: 'SEND FAILED',
+                tone: 'danger' as const,
+                pending: false,
+                title: 'Сообщение не удалось отправить',
+              }
+            : null;
 
   useEffect(() => () => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
@@ -1104,6 +1299,17 @@ const HistoryUserEntry = memo(({
       entryUuid={entry.uuid}
       emphasis={editableLastPrompt ? 'editable' : 'none'}
       title={editableLastPrompt ? 'Editable last prompt' : undefined}
+      status={queueStatusPresentation ? (
+        <MessageStatusBadge
+          label={queueStatusPresentation.label}
+          tone={queueStatusPresentation.tone}
+          pending={queueStatusPresentation.pending}
+          title={queueStatusPresentation.title}
+          meta={entry.timestamp
+            ? new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+            : undefined}
+        />
+      ) : undefined}
       actions={(
         <MessageActionRail placement="outside-start" aria-label="Prompt actions">
           <Tooltip content={copied ? 'Скопировано' : 'Копировать prompt'}>
@@ -1139,7 +1345,11 @@ const HistoryUserEntry = memo(({
         </MessageActionRail>
       )}
     >
-      <HistoryUserPromptContent text={entry.content} forceExpanded={forceExpanded} />
+      <HistoryUserPromptContent
+        text={entry.content}
+        promptChips={entry.promptChips}
+        forceExpanded={forceExpanded}
+      />
     </ConversationMessage>
   );
 });
@@ -1202,6 +1412,7 @@ const HistoryAssistantEntry = memo(({ entry }: { entry: FullHistoryEntry }) => {
               args={action.rawTool.args || {}}
               result={historyResult}
               isError={action.rawTool.isError}
+              diffHunks={action.rawTool.diffHunks}
             />
           );
         }
@@ -1271,25 +1482,14 @@ const HistoryEntry = memo(({
   }
 
   if (entry.role === 'queued') {
-    const status = entry.queueStatus || 'queued';
-    const sending = status === 'sending';
-    const queued = status === 'queued';
-    const sent = status === 'sent';
-    const cancelled = status === 'cancelled';
-    const failed = status === 'failed';
-    const label = sending ? 'SENDING' : queued ? 'QUEUED' : sent ? 'SENT' : cancelled ? 'CANCELLED BEFORE JSONL' : 'SEND FAILED';
     return (
-      <MessageEvent
-        label={label}
-        tone={failed ? 'danger' : sent ? 'success' : cancelled ? 'warning' : 'muted'}
-        pending={sending || queued}
-        entryUuid={entry.uuid}
-        meta={entry.timestamp
-          ? new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-          : undefined}
-      >
-        {renderSentHistoryPromptHighlight(entry.content)}
-      </MessageEvent>
+      <HistoryUserEntry
+        entry={entry}
+        tabId={tabId}
+        allowRewind={false}
+        rewindLocked={rewindLocked}
+        forceExpanded={forceExpanded}
+      />
     );
   }
 
@@ -2184,6 +2384,7 @@ function AgentHistoryControls({
   onHistoryRefresh,
   onPromptSubmitted,
   onPromptStatusChange,
+  hasDurablePrompt,
   rewindLocked,
   rewindPhase,
   rewindMessage,
@@ -2200,13 +2401,19 @@ function AgentHistoryControls({
   cwd: string;
   projectId?: string;
   toolType: AgentHistoryTool;
-  onHistoryRefresh: () => void | Promise<boolean | void>;
+  onHistoryRefresh: (reason?: string) => void | Promise<boolean | void>;
   onPromptSubmitted: (
     text: string,
     queueStatus: 'sending' | 'queued' | 'sent',
-    meta: { handoffId: string; statusAtSend: AgentPtyStatus; submittedAt: number }
+    meta: {
+      handoffId: string;
+      statusAtSend: AgentPtyStatus;
+      submittedAt: number;
+      promptChips?: HistoryPromptDraftChip[];
+    }
   ) => void;
   onPromptStatusChange: (handoffId: string, queueStatus: 'queued' | 'sent' | 'cancelled' | 'failed', reason: string) => void;
+  hasDurablePrompt: (text: string, submittedAt: number) => boolean;
   rewindLocked: boolean;
   rewindPhase?: RewindOperationPhase;
   rewindMessage?: string;
@@ -2317,6 +2524,7 @@ function AgentHistoryControls({
 
   const actionInFlightRef = useRef(false);
   const actionSeqRef = useRef(0);
+  const activeActionKindRef = useRef<'resume' | 'send' | 'interrupt' | 'stop' | null>(null);
   const historyUpdateSeqRef = useRef(0);
   const pasteBusyRef = useRef(false);
   const pendingQuestionRef = useRef<AgentPendingQuestion | null>(null);
@@ -2328,6 +2536,7 @@ function AgentHistoryControls({
     chips: HistoryPromptDraftChip[];
     images: HistoryPromptDraftImageRef[];
     at: number;
+    submittedAt: number;
     handoffId: string;
     statusAtSend: AgentPtyStatus;
   } | null>(null);
@@ -2487,7 +2696,7 @@ function AgentHistoryControls({
     const seq = ++historyUpdateSeqRef.current;
     setHistoryUpdating(true);
     historyDiag('REFRESH_REQUEST tab=' + tabId.slice(-12) + ' reason=' + reason);
-    Promise.resolve(onHistoryRefresh())
+    Promise.resolve(onHistoryRefresh(reason))
       .catch((e: any) => {
         console.warn('[' + runtime.logPrefix + '] history refresh failed tab=' + tabId.slice(-12) + ' reason=' + reason + ': ' + String(e?.message || e));
       })
@@ -2498,19 +2707,39 @@ function AgentHistoryControls({
       });
   }, [onHistoryRefresh, runtime.logPrefix, tabId]);
 
+  const refreshDurablePromptProof = useCallback(async (
+    text: string,
+    submittedAt: number,
+    reason: string,
+  ) => {
+    if (hasDurablePrompt(text, submittedAt)) return true;
+    try {
+      await onHistoryRefresh(reason);
+    } catch (e: any) {
+      console.warn('[' + runtime.logPrefix + '] durable prompt refresh failed tab='
+        + tabId.slice(-12)
+        + ' reason=' + reason
+        + ' error=' + String(e?.message || e));
+    }
+    return hasDurablePrompt(text, submittedAt);
+  }, [hasDurablePrompt, onHistoryRefresh, runtime.logPrefix, tabId]);
+
   useEffect(() => {
     tabIdRef.current = tabId;
     presenceGenerationRef.current += 1;
-    processStopInFlightRef.current = false;
+    const coordinatedAction = getCoordinatedAgentAction(tabId);
+    processStopInFlightRef.current = coordinatedAction?.stopRequestedAt !== null
+      && coordinatedAction?.stopRequestedAt !== undefined;
     actionSeqRef.current += 1;
-    actionInFlightRef.current = false;
+    actionInFlightRef.current = !!coordinatedAction;
+    activeActionKindRef.current = coordinatedAction ? 'send' : null;
     pasteBusyRef.current = false;
     pendingQuestionRef.current = null;
     answeringQuestionRef.current = false;
     midstreamPromptRecoveryRef.current = null;
     interruptRecoveryInFlightRef.current = false;
     interruptAwaitRef.current = null;
-    setBusyAction(null);
+    setBusyAction(coordinatedAction ? 'send' : null);
     setIsPasteBusy(false);
     setHistoryUpdating(false);
     setError(null);
@@ -2521,12 +2750,50 @@ function AgentHistoryControls({
     setQuestionError(null);
     setResumeMaterialized(toolType === 'claude' ? null : true);
     setResumeUnavailableReason(null);
-    setStatusFrom('inactive', 'tab-bind');
+    setStatusFrom(
+      coordinatedAction?.stopRequestedAt
+        ? 'stopping'
+        : coordinatedAction
+          ? 'starting'
+          : 'inactive',
+      coordinatedAction ? 'tab-bind-coordinated-action' : 'tab-bind',
+    );
     refreshPresence();
     return () => {
       clearEmptyDraftNoticeTimer();
     };
   }, [clearEmptyDraftNoticeTimer, refreshPresence, setStatusFrom, tabId, toolType]);
+
+  useEffect(() => subscribeCoordinatedAgentActions((event: any) => {
+    if (event?.tabId !== tabIdRef.current) return;
+    const coordinatedAction = event.state || getCoordinatedAgentAction(tabIdRef.current);
+    if (coordinatedAction) {
+      actionInFlightRef.current = true;
+      activeActionKindRef.current = 'send';
+      setBusyAction('send');
+      if (coordinatedAction.stopRequestedAt !== null) {
+        processStopInFlightRef.current = true;
+        presenceGenerationRef.current += 1;
+        setStatusFrom('stopping', 'coordinated-stop-after-send');
+      }
+      return;
+    }
+    actionInFlightRef.current = false;
+    activeActionKindRef.current = null;
+    processStopInFlightRef.current = false;
+    setBusyAction(null);
+    if (event.reason === 'queued-stop-complete') {
+      presenceGenerationRef.current += 1;
+      pasteBusyRef.current = false;
+      setIsPasteBusy(false);
+      setStatusFrom('inactive', 'coordinated-stop-complete');
+      return;
+    }
+    if (event.reason === 'queued-stop-failed') {
+      setError(String(event.result?.error || 'Stop failed'));
+    }
+    refreshPresence();
+  }), [refreshPresence, setStatusFrom]);
 
   useEffect(() => {
     const handleAgentError = (event: Event) => {
@@ -2728,87 +2995,149 @@ function AgentHistoryControls({
         ' chips=' + pending.chips.length +
         ' preview="' + promptPreview(pending.serializedText) + '"');
       (async () => {
-        const delays = [0, 160, 420, 900];
-        for (let attempt = 0; attempt < delays.length; attempt++) {
-          const delay = delays[attempt];
-          if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-          if (tabIdRef.current !== requestTabId) return;
-          console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery probe tab=' + tabId.slice(-12) + ' attempt=' + (attempt + 1) + ' delayMs=' + delay);
-          try {
-            const draft = await readTerminalDraft('interrupt-recovery-' + (attempt + 1));
+        const attempt = 1;
+        if (tabIdRef.current !== requestTabId) return;
+        if (hasDurablePrompt(pending.serializedText, pending.submittedAt)) {
+          console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery accepted tab=' + tabId.slice(-12)
+            + ' attempt=' + attempt
+            + ' handoff=' + pending.handoffId
+            + ' disposition=durable');
+          historyDiag('INTERRUPT_RECOVERY_ACCEPTED tab=' + tabId.slice(-12) +
+            ' handoff=' + pending.handoffId +
+            ' attempt=' + attempt +
+            ' disposition=durable');
+          return;
+        }
+        console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery probe tab=' + tabId.slice(-12)
+          + ' attempt=' + attempt
+          + ' source=authoritative-stop-event');
+        try {
+            const draft = await readTerminalDraft('interrupt-recovery');
             if (draft.stale || tabIdRef.current !== requestTabId) return;
             if (!draft.text) {
-              console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery empty tab=' + tabId.slice(-12) + ' attempt=' + (attempt + 1));
-              continue;
-            }
-            const ui = useUIStore.getState();
-            const current = ui.historyPromptDrafts[requestTabId] || '';
-            const currentChips = ui.historyPromptDraftChips[requestTabId] || [];
-            const currentImages = ui.historyPromptDraftImages[requestTabId] || [];
-            const terminalIdentity = normalizeHistoryPromptIdentityText(draft.text);
-            const authoringProof = terminalIdentity === normalizeHistoryPromptIdentityText(pending.serializedText)
-              || terminalIdentity === normalizeHistoryPromptIdentityText(pending.transportText);
-            const composerStillEmpty = !current.trim()
-              && currentChips.length === 0
-              && currentImages.length === 0;
-
-            if (authoringProof && composerStillEmpty) {
-              setHistoryPromptDraft(requestTabId, pending.rawText, {
-                images: pending.images,
-                chips: pending.chips,
+              console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery empty tab=' + tabId.slice(-12) + ' attempt=' + attempt);
+            } else {
+              const ownership = resolveInterruptedPromptOwnership({
+                durablePromptExists: hasDurablePrompt(pending.serializedText, pending.submittedAt),
+                returnedDraftExists: true,
+                returnedDraftMatchesHandoff: false,
               });
-              setDraftWarning(runtime.label + ' returned an interrupted prompt; its text and chips were restored.');
+              if (ownership === 'durable') {
+                console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery accepted tab=' + tabId.slice(-12)
+                  + ' attempt=' + attempt
+                  + ' handoff=' + pending.handoffId
+                  + ' disposition=durable-after-probe');
+                historyDiag('INTERRUPT_RECOVERY_ACCEPTED tab=' + tabId.slice(-12) +
+                  ' handoff=' + pending.handoffId +
+                  ' attempt=' + attempt +
+                  ' disposition=durable-after-probe');
+                return;
+              }
+              const ui = useUIStore.getState();
+              const current = ui.historyPromptDrafts[requestTabId] || '';
+              const currentChips = ui.historyPromptDraftChips[requestTabId] || [];
+              const currentImages = ui.historyPromptDraftImages[requestTabId] || [];
+              const terminalIdentity = normalizeHistoryPromptIdentityText(draft.text);
+              const authoringProof = terminalIdentity === normalizeHistoryPromptIdentityText(pending.serializedText)
+                || terminalIdentity === normalizeHistoryPromptIdentityText(pending.transportText);
+              const confirmedOwnership = resolveInterruptedPromptOwnership({
+                durablePromptExists: authoringProof
+                  ? await refreshDurablePromptProof(
+                      pending.serializedText,
+                      pending.submittedAt,
+                      'interrupt-exact-draft',
+                    )
+                  : hasDurablePrompt(pending.serializedText, pending.submittedAt),
+                returnedDraftExists: true,
+                returnedDraftMatchesHandoff: authoringProof,
+              });
+              if (confirmedOwnership === 'durable') {
+                historyDiag('INTERRUPT_RECOVERY_ACCEPTED tab=' + tabId.slice(-12) +
+                  ' handoff=' + pending.handoffId +
+                  ' attempt=' + attempt +
+                  ' disposition=durable-after-fresh-read');
+                return;
+              }
+              const composerStillEmpty = !current.trim()
+                && currentChips.length === 0
+                && currentImages.length === 0;
+
+              if (authoringProof && composerStillEmpty) {
+                setHistoryPromptDraft(requestTabId, pending.rawText, {
+                  images: pending.images,
+                  chips: pending.chips,
+                });
+                setDraftWarning(runtime.label + ' returned an interrupted prompt; its text and chips were restored.');
+                console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery restored tab=' + tabId.slice(-12)
+                  + ' source=authoring-snapshot chars=' + pending.rawText.length
+                  + ' chips=' + pending.chips.length
+                  + ' images=' + pending.images.length);
+                onPromptStatusChange(pending.handoffId, 'cancelled', 'interrupt-restored-authoring-snapshot');
+                historyDiag('INTERRUPT_RECOVERY_RESTORED tab=' + tabId.slice(-12) +
+                  ' handoff=' + pending.handoffId +
+                  ' attempt=' + attempt +
+                  ' source=authoring-snapshot' +
+                  ' chars=' + pending.rawText.length +
+                  ' chips=' + pending.chips.length +
+                  ' images=' + pending.images.length);
+                requestAnimationFrame(() => promptTextareaRef.current?.focus());
+                return;
+              }
+
+              const nextText = prependPromptTextOnce(current, draft.text);
+              const mergedImages = retainHistoryDraftImages(nextText, [
+                ...currentImages,
+                ...(Array.isArray(draft.imagePaths) ? draft.imagePaths : []),
+              ]);
+              setHistoryPromptDraft(requestTabId, nextText, {
+                ...(mergedImages.length > 0 ? { images: mergedImages } : { preserveImages: true }),
+                preserveChips: true,
+              });
+              setDraftWarning(authoringProof
+                ? runtime.label + ' returned an interrupted prompt; pulled it back from terminal input.'
+                : runtime.label + ' had another terminal draft; it was moved into the input without cancelling the sent message.');
               console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery restored tab=' + tabId.slice(-12)
-                + ' source=authoring-snapshot chars=' + pending.rawText.length
-                + ' chips=' + pending.chips.length
-                + ' images=' + pending.images.length);
-              onPromptStatusChange(pending.handoffId, 'cancelled', 'interrupt-restored-authoring-snapshot');
+                + ' source=terminal-raw attempt=' + attempt
+                + ' chars=' + draft.text.length
+                + ' images=' + draft.images
+                + ' conflict=' + (!composerStillEmpty)
+                + ' authoringProof=' + authoringProof);
+              if (confirmedOwnership === 'restore') {
+                onPromptStatusChange(pending.handoffId, 'cancelled', 'interrupt-restored-terminal-draft');
+              }
               historyDiag('INTERRUPT_RECOVERY_RESTORED tab=' + tabId.slice(-12) +
                 ' handoff=' + pending.handoffId +
-                ' attempt=' + (attempt + 1) +
-                ' source=authoring-snapshot' +
-                ' chars=' + pending.rawText.length +
-                ' chips=' + pending.chips.length +
-                ' images=' + pending.images.length);
+                ' attempt=' + attempt +
+                ' chars=' + draft.text.length +
+                ' images=' + draft.images +
+                ' ownership=' + confirmedOwnership);
               requestAnimationFrame(() => promptTextareaRef.current?.focus());
               return;
             }
-
-            const nextText = prependPromptTextOnce(current, draft.text);
-            const mergedImages = retainHistoryDraftImages(nextText, [
-              ...currentImages,
-              ...(Array.isArray(draft.imagePaths) ? draft.imagePaths : []),
-            ]);
-            setHistoryPromptDraft(requestTabId, nextText, {
-              ...(mergedImages.length > 0 ? { images: mergedImages } : { preserveImages: true }),
-              preserveChips: true,
-            });
-            setDraftWarning(runtime.label + ' returned an interrupted prompt; pulled it back from terminal input.');
-            console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery restored tab=' + tabId.slice(-12)
-              + ' source=terminal-raw attempt=' + (attempt + 1)
-              + ' chars=' + draft.text.length
-              + ' images=' + draft.images
-              + ' conflict=' + (!composerStillEmpty)
-              + ' authoringProof=' + authoringProof);
-            onPromptStatusChange(pending.handoffId, 'cancelled', 'interrupt-restored-terminal-draft');
-            historyDiag('INTERRUPT_RECOVERY_RESTORED tab=' + tabId.slice(-12) +
-              ' handoff=' + pending.handoffId +
-              ' attempt=' + (attempt + 1) +
-              ' chars=' + draft.text.length +
-              ' images=' + draft.images);
-            requestAnimationFrame(() => promptTextareaRef.current?.focus());
-            return;
-          } catch (e: any) {
-            console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery probe-failed tab=' + tabId.slice(-12) + ' attempt=' + (attempt + 1) + ': ' + String(e?.message || e));
-          }
+        } catch (e: any) {
+          console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery probe-failed tab=' + tabId.slice(-12) + ' attempt=' + attempt + ': ' + String(e?.message || e));
         }
         if (tabIdRef.current !== requestTabId) return;
-        showEmptyDraftNotice(runtime.label + ' cancellation confirmed; prompt was not returned by terminal input.');
-        onPromptStatusChange(pending.handoffId, 'cancelled', 'interrupt-no-terminal-draft');
-        console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery not-restored tab=' + tabId.slice(-12) + ' reason=no-terminal-draft probes=' + delays.length + ' sentChars=' + pending.serializedText.length);
-        historyDiag('INTERRUPT_RECOVERY_NOT_RESTORED tab=' + tabId.slice(-12) +
+        const ownership = resolveInterruptedPromptOwnership({
+          durablePromptExists: await refreshDurablePromptProof(
+            pending.serializedText,
+            pending.submittedAt,
+            'interrupt-empty-draft',
+          ),
+          returnedDraftExists: false,
+        });
+        if (ownership === 'durable') {
+          historyDiag('INTERRUPT_RECOVERY_ACCEPTED tab=' + tabId.slice(-12) +
+            ' handoff=' + pending.handoffId +
+            ' attempt=' + attempt +
+            ' disposition=durable');
+          return;
+        }
+        showEmptyDraftNotice(runtime.label + ' stopped; the prompt was not returned, so its delivery remains pending.');
+        console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery pending tab=' + tabId.slice(-12) + ' reason=no-terminal-draft probes=1 sentChars=' + pending.serializedText.length);
+        historyDiag('INTERRUPT_RECOVERY_PENDING tab=' + tabId.slice(-12) +
           ' handoff=' + pending.handoffId +
-          ' reason=no-terminal-draft probes=' + delays.length +
+          ' reason=no-terminal-draft probes=1' +
           ' sentChars=' + pending.serializedText.length);
       })()
         .catch((e: any) => {
@@ -2827,7 +3156,7 @@ function AgentHistoryControls({
     return () => {
       ipcRenderer.removeListener(runtime.busyEvent, handleInterruptRecovery);
     };
-  }, [isNonAuthoritativeBusyEvent, onPromptStatusChange, readTerminalDraft, refreshPresence, runtime, setHistoryPromptDraft, showEmptyDraftNotice, tabId]);
+  }, [hasDurablePrompt, isNonAuthoritativeBusyEvent, onPromptStatusChange, readTerminalDraft, refreshDurablePromptProof, refreshPresence, runtime, setHistoryPromptDraft, showEmptyDraftNotice, tabId]);
 
   useEffect(() => {
     if (!interruptAwaiting || status === 'busy') return;
@@ -2986,9 +3315,38 @@ function AgentHistoryControls({
   }, [runtime.logPrefix, runtime.toolType, tabId]);
 
   const runAction = useCallback(async (kind: 'resume' | 'send' | 'interrupt' | 'stop') => {
+    const coordinatedAtClick = getCoordinatedAgentAction(tabId);
+    if (coordinatedAtClick) {
+      actionInFlightRef.current = true;
+      activeActionKindRef.current = 'send';
+    }
     if (actionInFlightRef.current) {
+      const activeKind = activeActionKindRef.current;
+      if (kind === 'stop' && activeKind === 'send') {
+        const queued = requestCoordinatedStopAfterSend(tabId);
+        if (queued.queued && !queued.deduped) {
+          processStopInFlightRef.current = true;
+          presenceGenerationRef.current += 1;
+          setStatusFrom('stopping', 'stop-queued-after-send');
+          historyDiag('QUEUE_ACTION tab=' + tabId.slice(-12)
+            + ' kind=stop after=send'
+            + ' busyAction=' + (busyAction || activeKind));
+        } else if (queued.queued) {
+          historyDiag('DEDUP_ACTION tab=' + tabId.slice(-12)
+            + ' kind=stop after=send'
+            + ' queuedAgeMs=' + (
+              queued.state?.stopRequestedAt
+                ? Date.now() - queued.state.stopRequestedAt
+                : 0
+            ));
+        } else {
+          historyDiag('DROP_ACTION tab=' + tabId.slice(-12)
+            + ' kind=stop reason=' + (queued.reason || 'coordinator-missing'));
+        }
+        return;
+      }
       console.log('[' + runtime.logPrefix + '] drop-action tab=' + tabId.slice(-12) + ' kind=' + kind + ' reason=inflight');
-      historyDiag('DROP_ACTION tab=' + tabId.slice(-12) + ' kind=' + kind + ' reason=inflight busyAction=' + (busyAction || 'none'));
+      historyDiag('DROP_ACTION tab=' + tabId.slice(-12) + ' kind=' + kind + ' reason=inflight busyAction=' + (busyAction || activeKind || 'none'));
       return;
     }
     if (kind === 'send' && pasteBusyRef.current) {
@@ -2996,6 +3354,16 @@ function AgentHistoryControls({
       return;
     }
     const actionTabId = tabId;
+    let coordinatedSendToken: number | null = null;
+    if (kind === 'send') {
+      const started = beginCoordinatedAgentSend(actionTabId);
+      if (!started.started || !started.token) {
+        historyDiag('DROP_ACTION tab=' + actionTabId.slice(-12)
+          + ' kind=send reason=' + (started.reason || 'coordinator-inflight'));
+        return;
+      }
+      coordinatedSendToken = started.token;
+    }
     const actionSeq = ++actionSeqRef.current;
     const isCurrentAction = () => (
       tabIdRef.current === actionTabId && actionSeqRef.current === actionSeq
@@ -3008,6 +3376,7 @@ function AgentHistoryControls({
     let clearedPromptImages: HistoryPromptDraftImageRef[] = [];
     let clearedPromptChips: HistoryPromptDraftChip[] = [];
     actionInFlightRef.current = true;
+    activeActionKindRef.current = kind;
     setBusyAction(kind);
     setError(null);
     try {
@@ -3140,7 +3509,12 @@ function AgentHistoryControls({
           ' images=' + sendDraftImages.length +
           ' pasteBusy=' + pasteBusyRef.current +
           ' preview="' + promptPreview(presentationText) + '"');
-        onPromptSubmitted(presentationText, 'sending', { handoffId, statusAtSend, submittedAt });
+        onPromptSubmitted(presentationText, 'sending', {
+          handoffId,
+          statusAtSend,
+          submittedAt,
+          promptChips: sourceDraftChips.filter((chip) => chip.kind === 'prompt'),
+        });
         const latestText = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
         const latestImages = retainHistoryDraftImages(
           latestText,
@@ -3182,6 +3556,12 @@ function AgentHistoryControls({
           statusAtSend,
           queue: statusAtSend === 'busy',
           returnDraftOnConflict: true,
+          presentationSnapshot: {
+            historySessionId: sessionId || null,
+            promptChips: sourceDraftChips
+              .filter((chip) => chip.kind === 'prompt')
+              .map((chip) => ({ ...chip, kind: 'prompt' as const })),
+          },
         });
         historyDiag('SEND_RESULT tab=' + tabId.slice(-12) +
           ' handoff=' + handoffId +
@@ -3220,13 +3600,24 @@ function AgentHistoryControls({
           chips: sourceDraftChips,
           images: sendDraftImages,
           at: Date.now(),
+          submittedAt,
           handoffId,
           statusAtSend: (effectiveStatusAtSend === 'active' || effectiveStatusAtSend === 'busy')
             ? effectiveStatusAtSend
             : statusAtSend,
         };
         console.log('[' + runtime.logPrefix + ':draft] send tracked tab=' + tabId.slice(-12) + ' handoff=' + handoffId + ' statusAtSend=' + statusAtSend + ' chars=' + presentationText.length + ' chips=' + sourceDraftChips.length);
-        if (runtime.optimisticBusyOnSend) {
+        const coordinatedAfterSend = getCoordinatedAgentAction(actionTabId);
+        if (
+          coordinatedAfterSend?.token === coordinatedSendToken
+          && coordinatedAfterSend.stopRequestedAt !== null
+        ) {
+          historyDiag('SEND_STOP_QUEUED tab=' + actionTabId.slice(-12)
+            + ' handoff=' + handoffId
+            + ' submitted=' + !!result?.submitted
+            + ' transferred=' + sendOwnershipTransferred
+            + ' queuedAgeMs=' + (Date.now() - coordinatedAfterSend.stopRequestedAt));
+        } else if (runtime.optimisticBusyOnSend) {
           setStatusFrom('busy', 'send-click');
         } else {
           setStatusFrom('busy', 'send-confirmed');
@@ -3354,8 +3745,30 @@ function AgentHistoryControls({
         interruptAwaitRef.current?.seq === actionSeq;
       if (isCurrentAction() && !keepInterruptAwait) {
         actionInFlightRef.current = false;
+        activeActionKindRef.current = null;
         if (kind === 'stop') processStopInFlightRef.current = false;
         setBusyAction(null);
+      }
+      if (kind === 'send' && coordinatedSendToken) {
+        await settleCoordinatedAgentSend({
+          tabId: actionTabId,
+          token: coordinatedSendToken,
+          runQueuedStop: async () => {
+            const queuedStop = getCoordinatedAgentAction(actionTabId);
+            historyDiag('RUN_QUEUED_ACTION tab=' + actionTabId.slice(-12)
+              + ' kind=stop after=send'
+              + ' queuedAgeMs=' + (
+                queuedStop?.stopRequestedAt
+                  ? Date.now() - queuedStop.stopRequestedAt
+                  : 0
+              ));
+            return await stopAgentProcessScenario({
+              tabId: actionTabId,
+              toolType: runtime.toolType,
+              runtime,
+            });
+          },
+        });
       }
     }
   }, [busyAction, cwd, onPromptStatusChange, onPromptSubmitted, prepareHistoryPromptForSend, prompt, readTerminalDraft, refreshHistoryWithUpdating, refreshPresence, resumeMaterialized, runtime, sessionId, setHistoryPromptDraft, setStatusFrom, tabId]);
@@ -3729,6 +4142,7 @@ function AgentHistoryControls({
     });
     setDraftWarning('Saving image attachment…');
     const pendingCaret = start + HISTORY_IMAGE_PENDING_MARKER.length;
+    promptCaretRef.current = { start: pendingCaret, end: pendingCaret };
     requestAnimationFrame(() => {
       const textarea = promptTextareaRef.current;
       if (!textarea || textarea.getAttribute('data-history-composer-tab-id') !== actionTabId) return;
@@ -3794,16 +4208,18 @@ function AgentHistoryControls({
 
         if (preserveSelection) {
           const tokenEnd = tokenStart + HISTORY_IMAGE_PENDING_MARKER.length;
-          const delta = insertion.caret - tokenEnd;
-          const adjust = (position: number) => position >= tokenEnd
-            ? position + delta
-            : position > tokenStart
-              ? insertion.caret
-              : position;
+          const remappedSelection = remapPromptImageSelectionAfterReplacement({
+            selectionStart,
+            selectionEnd,
+            replacedStart: tokenStart,
+            replacedEnd: tokenEnd,
+            insertionCaret: insertion.caret,
+          });
+          promptCaretRef.current = remappedSelection;
           requestAnimationFrame(() => {
             const currentTextarea = promptTextareaRef.current;
             if (!currentTextarea || document.activeElement !== currentTextarea) return;
-            currentTextarea.setSelectionRange(adjust(selectionStart), adjust(selectionEnd));
+            currentTextarea.setSelectionRange(remappedSelection.start, remappedSelection.end);
           });
         }
       })
@@ -4167,7 +4583,7 @@ function AgentHistoryControls({
                   aria-hidden="true"
                   style={{
                     position: 'absolute',
-                    inset: 1,
+                    inset: 0,
                     zIndex: 0,
                     overflowX: 'hidden',
                     overflowY: 'scroll',
@@ -4218,6 +4634,36 @@ function AgentHistoryControls({
                   highlight.scrollLeft = e.currentTarget.scrollLeft;
                 }}
                 onKeyDown={(e) => {
+                  if (e.code === 'KeyC' && e.ctrlKey && !e.metaKey && !e.altKey) {
+                    const selectionStart = e.currentTarget.selectionStart ?? 0;
+                    const selectionEnd = e.currentTarget.selectionEnd ?? selectionStart;
+                    // Preserve the ordinary copy gesture when textarea text is
+                    // selected. With no selection, Ctrl+C is a two-stage
+                    // terminal gesture: clear every authoring surface first;
+                    // only the next press on a truly empty composer may stop.
+                    if (selectionEnd > selectionStart) return;
+                    const state = useUIStore.getState();
+                    const currentText = state.historyPromptDrafts[tabId] || '';
+                    const currentImages = state.historyPromptDraftImages[tabId] || [];
+                    const currentChips = state.historyPromptDraftChips[tabId] || [];
+                    const hasAuthoringState = currentText.length > 0
+                      || currentImages.length > 0
+                      || currentChips.length > 0;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    e.nativeEvent.stopImmediatePropagation();
+                    if (hasAuthoringState) {
+                      setHistoryPromptDraft(tabId, '', { images: [], chips: [] });
+                      setDraftWarning(null);
+                      promptCaretRef.current = { start: 0, end: 0 };
+                      requestAnimationFrame(() => promptTextareaRef.current?.focus());
+                    } else if (canInterruptTurn) {
+                      void runAction('interrupt');
+                    } else if (status !== 'inactive') {
+                      void runAction('stop');
+                    }
+                    return;
+                  }
                   if (e.key !== 'Enter' || e.shiftKey || e.nativeEvent.isComposing) return;
                   e.preventDefault();
                   if (canSend) runAction('send');
@@ -4231,12 +4677,15 @@ function AgentHistoryControls({
                 onContextMenu={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
+                  const composerFrame = e.currentTarget.closest('.hp-history-composer-frame');
+                  const composerTop = composerFrame?.getBoundingClientRect().top;
                   window.dispatchEvent(new CustomEvent('history-panel:open-insert-menu', {
                     detail: {
                       tabId,
                       cwd,
                       x: e.clientX,
                       y: e.clientY,
+                      composerTop,
                     },
                   }));
                 }}
@@ -4326,6 +4775,21 @@ function HistoryPanel({
   const setHistoryPromptDraft = useUIStore((s) => s.setHistoryPromptDraft);
   const setHistoryRewindPreview = useUIStore((s) => s.setHistoryRewindPreview);
   const historyFontSize = useUIStore((s) => s.historyFontSize);
+  const isTurnBusy = useWorkspaceStore(useCallback((state) => {
+    if (projectId) {
+      return state.openProjects.get(projectId)?.tabs.get(tabId)?.aiBusy === true;
+    }
+    const active = state.activeProjectId
+      ? state.openProjects.get(state.activeProjectId)
+      : null;
+    const activeTab = active?.tabs.get(tabId);
+    if (activeTab) return activeTab.aiBusy === true;
+    for (const workspace of state.openProjects.values()) {
+      const tab = workspace.tabs.get(tabId);
+      if (tab) return tab.aiBusy === true;
+    }
+    return false;
+  }, [projectId, tabId]));
   const storedRewindPreview = useUIStore((s) => s.historyRewindPreviews[tabId] || null);
   const activeRewindOperation = useRewindOperationStore(
     useCallback((state) => selectActiveRewindOperation(state, tabId), [tabId])
@@ -4390,19 +4854,51 @@ function HistoryPanel({
   );
   const [loading, setLoading] = useState(() => !firstRenderSnapshot);
   const [presentedOwnerKey, setPresentedOwnerKey] = useState(historyOwnerKey);
-  // Props switch before the owner handoff layout effect can replace entries
-  // and loading together. Treat that one render as loading so the previous
-  // owner's empty state can never flash as a blank frame.
-  const surfaceLoading = loading || presentedOwnerKey !== historyOwnerKey;
+  const [viewportReadyOwnerKey, setViewportReadyOwnerKey] = useState(
+    () => firstRenderSnapshot ? historyOwnerKey : '',
+  );
+  const [viewportProofRequired, setViewportProofRequired] = useState(() => !firstRenderSnapshot);
+  const viewportReadyOwnerKeyRef = useRef(firstRenderSnapshot ? historyOwnerKey : '');
+  const viewportPaintProbeRef = useRef<ReturnType<typeof createHistoryViewportPaintProbe> | null>(null);
+  if (!viewportPaintProbeRef.current) {
+    viewportPaintProbeRef.current = createHistoryViewportPaintProbe();
+  }
+  const surfacePresentedProbeRef = useRef<ReturnType<typeof createHistoryViewportPaintProbe> | null>(null);
+  if (!surfacePresentedProbeRef.current) {
+    surfacePresentedProbeRef.current = createHistoryViewportPaintProbe();
+  }
+  const surfacePresentedOwnerRef = useRef('');
+  const ownerChangedBeforeLayoutHandoff = presentedOwnerKey !== historyOwnerKey;
+  const cachedRenderEntries = firstRenderSnapshot?.entries as unknown as FullHistoryEntry[] | undefined;
+  // A cached owner is already safe to present during the prop-change render.
+  // Keep the authoritative `entries` state untouched until the layout handoff:
+  // the previous owner's cleanup still reads presentationEntriesRef and must
+  // never persist B's rows under A's key. This display-only snapshot removes
+  // the false Loading/blank frame without weakening owner isolation.
+  const renderEntries = ownerChangedBeforeLayoutHandoff && cachedRenderEntries
+    ? cachedRenderEntries
+    : entries;
+  const surfaceLoading = !cachedRenderEntries && (
+    loading || ownerChangedBeforeLayoutHandoff
+  );
   const historyOwnerStartedAtRef = useRef(Date.now());
   const historyLoaderReasonRef = useRef(
     firstRenderSnapshot ? 'first-render-cache-hit' : 'first-render-cache-miss',
   );
   const historyLoadSequenceRef = useRef(0);
   const historyRevisionRef = useRef<HistoryDurableRevision | null>(firstRenderSnapshot?.revision || null);
+  const isTurnBusyRef = useRef(isTurnBusy);
+  isTurnBusyRef.current = isTurnBusy;
+  const deferredTranscriptRefreshRef = useRef(false);
   const promptHandoffMetaRef = useRef<Map<string, PromptHandoffMeta>>(new Map());
+  const rewindDraftPresentationRef = useRef<Map<string, {
+    text: string;
+    chips: HistoryPromptDraftChip[];
+  }>>(new Map());
   const suppressedPromptsRef = useRef<Map<string, SuppressedPrompt>>(new Map());
-  const localPromptCleanupTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const rawServerEntriesRef = useRef<FullHistoryEntry[]>(
+    (firstRenderSnapshot?.entries as unknown as FullHistoryEntry[] | undefined) || [],
+  );
   const presentationEntriesRef = useRef(entries);
   presentationEntriesRef.current = entries;
   const persistVolatileOverlay = useCallback((
@@ -4426,7 +4922,6 @@ function HistoryPanel({
       if (entry.queueStatus === 'cancelled' || entry.queueStatus === 'failed') {
         return ageMs < LOCAL_PROMPT_FAILURE_TTL_MS;
       }
-      if (entry.queueStatus === 'sent') return ageMs < LOCAL_PROMPT_SENT_TTL_MS;
       return true;
     });
     const liveHandoffIds = new Set<string>();
@@ -4451,10 +4946,19 @@ function HistoryPanel({
     }
   }, []);
   const rewindPreviewResult = useMemo(
-    () => buildRewindPreviewEntries(entries, rewindPreview),
-    [entries, rewindPreview],
+    () => buildRewindPreviewEntries(renderEntries, rewindPreview),
+    [renderEntries, rewindPreview],
   );
   const displayEntries = rewindPreviewResult.entries;
+  // A cold owner becomes data-ready before Virtuoso has mounted its first
+  // measured row. Keep the loader over the already-mounted list during that
+  // short gap; otherwise the user sees a blank History surface. A cache hit is
+  // presentation-ready immediately and never takes this cold-only path.
+  const viewportAwaitingFirstRange = !surfaceLoading
+    && viewportProofRequired
+    && displayEntries.length > 0
+    && viewportReadyOwnerKey !== historyOwnerKey;
+  const visibleSurfaceLoading = surfaceLoading || viewportAwaitingFirstRange;
   const displayEntryIndexByUuid = useMemo(() => {
     const index = new Map<string, number>();
     for (let i = 0; i < displayEntries.length; i += 1) {
@@ -4482,10 +4986,13 @@ function HistoryPanel({
   const [claudeMemoryBoundaryUuid, setClaudeMemoryBoundaryUuid] = useState<string | null>(
     firstRenderSnapshot?.claudeMemoryBoundaryUuid || null,
   );
+  const renderClaudeMemoryBoundaryUuid = ownerChangedBeforeLayoutHandoff
+    ? (firstRenderSnapshot?.claudeMemoryBoundaryUuid || null)
+    : claudeMemoryBoundaryUuid;
   const claudeMemoryBoundaryIndex = useMemo(() => {
-    if (!claudeMemoryBoundaryUuid) return -1;
-    return displayEntries.findIndex(e => e.uuid === claudeMemoryBoundaryUuid);
-  }, [displayEntries, claudeMemoryBoundaryUuid]);
+    if (!renderClaudeMemoryBoundaryUuid) return -1;
+    return displayEntries.findIndex(e => e.uuid === renderClaudeMemoryBoundaryUuid);
+  }, [displayEntries, renderClaudeMemoryBoundaryUuid]);
   const scrollArrowRef = useRef<HTMLDivElement>(null);
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   const isResizing = useRef(false);
@@ -4812,43 +5319,15 @@ function HistoryPanel({
     if (mainSurface && shouldKeepTailVisible) scrollToBottom(false);
   }, [mainSurface, onControlsHeightChange, scrollToBottom, tabId]);
 
-  const clearLocalPromptCleanupTimer = useCallback((handoffId: string) => {
-    const timer = localPromptCleanupTimersRef.current.get(handoffId);
-    if (!timer) return;
-    clearTimeout(timer);
-    localPromptCleanupTimersRef.current.delete(handoffId);
-  }, []);
-
-  const armLocalPromptSentCleanup = useCallback((handoffId: string, delayMs = LOCAL_PROMPT_SENT_TTL_MS + 250) => {
-    if (!handoffId) return;
-    clearLocalPromptCleanupTimer(handoffId);
-    const timer = setTimeout(() => {
-      localPromptCleanupTimersRef.current.delete(handoffId);
-      const now = Date.now();
-      setEntries(prev => {
-        const nextEntries = prev.filter(entry => {
-          if (!isLocalPromptEntry(entry) || entry.handoffId !== handoffId || entry.queueStatus !== 'sent') return true;
-          const ageMs = now - (entry.statusChangedAt || entry.optimisticAt || Date.parse(entry.timestamp || '') || now);
-          if (ageMs < LOCAL_PROMPT_SENT_TTL_MS) return true;
-          historyDiag('LOCAL_EXPIRE_SENT tab=' + tabId.slice(-12) +
-            ' handoff=' + handoffId +
-            ' ageMs=' + ageMs +
-            ' preview="' + promptPreview(entry.content) + '"');
-          promptHandoffMetaRef.current.delete(handoffId);
-          return false;
-        });
-        presentationEntriesRef.current = nextEntries;
-        persistVolatileOverlay(historySnapshotOwner, nextEntries);
-        return nextEntries;
-      });
-    }, Math.max(0, delayMs));
-    localPromptCleanupTimersRef.current.set(handoffId, timer);
-  }, [clearLocalPromptCleanupTimer, historySnapshotOwner, persistVolatileOverlay, tabId]);
-
   const appendLocalPromptEntry = useCallback((
     text: string,
     queueStatus: 'sending' | 'queued' | 'sent',
-    meta: { handoffId: string; statusAtSend: AgentPtyStatus; submittedAt: number }
+    meta: {
+      handoffId: string;
+      statusAtSend: AgentPtyStatus;
+      submittedAt: number;
+      promptChips?: HistoryPromptDraftChip[];
+    }
   ) => {
     const cleanContent = normalizeHistoryPromptText(text);
     if (!cleanContent) return;
@@ -4865,6 +5344,8 @@ function HistoryPanel({
       sessionId,
       optimisticAt: now,
       statusChangedAt: now,
+      promptChips: normalizeComposerChips(meta.promptChips || [])
+        .filter((chip) => chip.kind === 'prompt') as HistoryPromptDraftChip[],
     };
     promptHandoffMetaRef.current.set(handoffId, { text: cleanContent, submittedAt: meta.submittedAt });
     historyDiag('LOCAL_APPEND tab=' + tabId.slice(-12) +
@@ -4883,8 +5364,7 @@ function HistoryPanel({
     if (isAtBottomRef.current) {
       setTimeout(() => scrollToBottom(true), 30);
     }
-    if (queueStatus === 'sent') armLocalPromptSentCleanup(handoffId);
-  }, [armLocalPromptSentCleanup, historySnapshotOwner, persistVolatileOverlay, scrollToBottom, sessionId, tabId]);
+  }, [historySnapshotOwner, persistVolatileOverlay, scrollToBottom, sessionId, tabId]);
 
   const updateLocalPromptEntry = useCallback((
     handoffId: string,
@@ -4894,7 +5374,24 @@ function HistoryPanel({
     if (!handoffId) return;
     const changedAt = Date.now();
     const handoffMeta = promptHandoffMetaRef.current.get(handoffId) || null;
-    clearLocalPromptCleanupTimer(handoffId);
+    const durableAlreadyExists = !!handoffMeta && serverHasPromptEntry(
+      rawServerEntriesRef.current,
+      {
+        uuid: LOCAL_PROMPT_PREFIX + handoffId,
+        role: 'queued',
+        content: handoffMeta.text,
+        timestamp: new Date(handoffMeta.submittedAt).toISOString(),
+        optimisticAt: handoffMeta.submittedAt,
+      } as FullHistoryEntry,
+    );
+    if ((queueStatus === 'cancelled' || queueStatus === 'failed') && durableAlreadyExists) {
+      historyDiag('LOCAL_STATUS_IGNORED tab=' + tabId.slice(-12) +
+        ' handoff=' + handoffId +
+        ' queueStatus=' + queueStatus +
+        ' reason=' + reason +
+        ' durable=1');
+      return;
+    }
     let suppression: SuppressedPrompt | null = null;
     if ((queueStatus === 'cancelled' || queueStatus === 'failed') && handoffMeta?.text) {
       suppression = {
@@ -4934,8 +5431,20 @@ function HistoryPanel({
       persistVolatileOverlay(historySnapshotOwner, nextEntries);
       return nextEntries;
     });
-    if (queueStatus === 'sent') armLocalPromptSentCleanup(handoffId);
-  }, [armLocalPromptSentCleanup, clearLocalPromptCleanupTimer, historySnapshotOwner, persistVolatileOverlay, tabId]);
+  }, [historySnapshotOwner, persistVolatileOverlay, tabId]);
+
+  const hasDurablePrompt = useCallback((text: string, submittedAt: number) => (
+    serverHasPromptEntry(
+      rawServerEntriesRef.current,
+      {
+        uuid: LOCAL_PROMPT_PREFIX + 'durable-check',
+        role: 'queued',
+        content: text,
+        timestamp: new Date(submittedAt).toISOString(),
+        optimisticAt: submittedAt,
+      } as FullHistoryEntry,
+    )
+  ), []);
 
   const upsertLocalRewindEntry = useCallback((detail: {
     tabId?: string;
@@ -4945,6 +5454,7 @@ function HistoryPanel({
     targetText?: string;
     historyDraftText?: string;
     historyDraftImages?: HistoryPromptDraftImageRef[];
+    historyDraftChips?: HistoryPromptDraftChip[];
     historyDraftWarning?: string;
     mode?: 'native' | 'ai';
     toolType?: string;
@@ -4959,10 +5469,40 @@ function HistoryPanel({
     const targetText = normalizeHistoryPromptText(detail.targetText || '');
     const historyDraftText = normalizeHistoryPromptText(detail.historyDraftText || targetText);
     const historyDraftImages = Array.isArray(detail.historyDraftImages) ? detail.historyDraftImages : [];
+    const exactTargetEntry = detail.targetUuid
+      ? entriesRef.current.find((entry) => entry.uuid === detail.targetUuid && entry.role === 'user') || null
+      : null;
+    if (status === 'start' && !rewindDraftPresentationRef.current.has(opId)) {
+      const capturedPresentation = splitPromptChipPresentation({
+        text: targetText || exactTargetEntry?.content || '',
+        chips: exactTargetEntry?.promptChips || [],
+      });
+      rewindDraftPresentationRef.current.set(opId, {
+        text: capturedPresentation.text,
+        chips: capturedPresentation.chips,
+      });
+      historyDiag('REWIND_DRAFT_CAPTURE tab=' + tabId.slice(-12)
+        + ' op=' + opId
+        + ' entry=' + String(detail.targetUuid || '-').slice(0, 8)
+        + ' chips=' + capturedPresentation.chips.length
+        + ' chars=' + capturedPresentation.text.length);
+    }
+    const capturedPresentation = rewindDraftPresentationRef.current.get(opId) || null;
+    const restoredPresentation = splitPromptChipPresentation({
+      text: historyDraftText || capturedPresentation?.text || targetText,
+      chips: Array.isArray(detail.historyDraftChips)
+        ? detail.historyDraftChips
+        : capturedPresentation?.chips || exactTargetEntry?.promptChips || [],
+    });
+    const restoredDraftOptions = {
+      images: historyDraftImages,
+      chips: restoredPresentation.chips,
+    };
     const now = Date.now();
     const uuid = LOCAL_REWIND_PREFIX + tabId + '-' + opId;
     const detailMessage = String(detail.error || detail.message || '');
     if (status === 'failed' && isRewindBusyGuardMessage(detailMessage)) {
+      rewindDraftPresentationRef.current.delete(opId);
       setEntries(prev => {
         const nextEntries = prev.filter(entry => entry.uuid !== uuid);
         presentationEntriesRef.current = nextEntries;
@@ -5002,7 +5542,7 @@ function HistoryPanel({
     if (isDurableRewind) {
       setHistoryRewindPreview(tabId, null);
       if (historyDraftText && detail.historyInputDraft === true) {
-        setHistoryPromptDraft(tabId, historyDraftText, historyDraftImages.length > 0 ? { images: historyDraftImages } : undefined);
+        setHistoryPromptDraft(tabId, restoredPresentation.text, restoredDraftOptions);
         if (detail.historyDraftWarning) {
           window.dispatchEvent(new CustomEvent('history-panel:draft-warning', {
             detail: { tabId, message: detail.historyDraftWarning },
@@ -5010,11 +5550,12 @@ function HistoryPanel({
         }
       }
       removeLocalRewindEntry();
+      rewindDraftPresentationRef.current.delete(opId);
       return;
     }
     if (status === 'done' && detail.mode === 'native' && detail.targetUuid && targetText && (detail.toolType || toolType) === 'claude') {
       setHistoryRewindPreview(tabId, { opId, targetUuid: detail.targetUuid, targetText, startedAt: now, sessionId });
-      setHistoryPromptDraft(tabId, historyDraftText || targetText, historyDraftImages.length > 0 ? { images: historyDraftImages } : undefined);
+      setHistoryPromptDraft(tabId, restoredPresentation.text, restoredDraftOptions);
       if (detail.historyDraftWarning) {
         window.dispatchEvent(new CustomEvent('history-panel:draft-warning', {
           detail: { tabId, message: detail.historyDraftWarning },
@@ -5023,8 +5564,10 @@ function HistoryPanel({
     }
     if (status !== 'failed') {
       removeLocalRewindEntry();
+      if (status === 'done') rewindDraftPresentationRef.current.delete(opId);
       return;
     }
+    rewindDraftPresentationRef.current.delete(opId);
     setEntries(prev => {
       const idx = prev.findIndex(entry => entry.uuid === uuid);
       const nextEntry: FullHistoryEntry = {
@@ -5085,6 +5628,7 @@ function HistoryPanel({
         return false;
       }
       lastServerEntryUuidsRef.current = new Set();
+      rawServerEntriesRef.current = [];
       setClaudeMemoryBoundaryUuid(null);
       historyRevisionRef.current = null;
       presentationEntriesRef.current = [];
@@ -5150,6 +5694,7 @@ function HistoryPanel({
         const rawSnapshot = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner);
         if (rawSnapshot) {
           const rawEntries = rawSnapshot.entries as unknown as FullHistoryEntry[];
+          rawServerEntriesRef.current = rawEntries;
           if (toolType === 'codex') {
             reconcileCodexEffectiveSettings(tabId, sessionId, rawEntries);
           }
@@ -5188,6 +5733,7 @@ function HistoryPanel({
           }
         }
         const rawServerEntries: FullHistoryEntry[] = result.entries || [];
+        rawServerEntriesRef.current = rawServerEntries;
         if (toolType === 'codex') {
           reconcileCodexEffectiveSettings(tabId, sessionId, rawServerEntries);
         }
@@ -5204,11 +5750,15 @@ function HistoryPanel({
         const nextRevision = result.revision || null;
         setClaudeMemoryBoundaryUuid(nextBoundaryUuid);
         historyRevisionRef.current = nextRevision;
+        const cacheAccountingStartedAt = performance.now();
+        const entriesApproxBytesHint = estimateHistoryEntriesBytesFast(rawServerEntries);
         const cacheResult = historySnapshotCache.set(historySnapshotOwner, {
           entries: rawServerEntries,
           claudeMemoryBoundaryUuid: nextBoundaryUuid,
           revision: nextRevision,
+          entriesApproxBytesHint,
         });
+        const cacheAccountingMs = performance.now() - cacheAccountingStartedAt;
         if (cacheResult.stored) {
           historyDiag('CACHE_WRITE tab=' + tabId.slice(-12) +
             ' session=' + sessionId.slice(0, 8) +
@@ -5216,6 +5766,7 @@ function HistoryPanel({
             ' seq=' + loadSequence +
             ' entries=' + rawServerEntries.length +
             ' approxBytes=' + cacheResult.approxBytes +
+            ' accountingMs=' + cacheAccountingMs.toFixed(1) +
             ' evicted=' + (
               cacheResult.evictedKeys.length > 0
                 ? cacheResult.evictedKeys.map(historyOwnerDigest).join(',')
@@ -5230,6 +5781,7 @@ function HistoryPanel({
             ' reason=' + cacheResult.reason +
             ' entries=' + rawServerEntries.length +
             ' approxBytes=' + cacheResult.approxBytes +
+            ' accountingMs=' + cacheAccountingMs.toFixed(1) +
             ' invalidated=' + (cacheResult.invalidatedExisting ? '1' : '0'));
           console.warn(
             '[HistoryPanel] snapshot not cached tab=' + tabId.slice(-12)
@@ -5469,6 +6021,7 @@ function HistoryPanel({
         targetText?: string;
         historyDraftText?: string;
         historyDraftImages?: HistoryPromptDraftImageRef[];
+        historyDraftChips?: HistoryPromptDraftChip[];
         historyDraftWarning?: string;
         mode?: 'native' | 'ai';
         toolType?: string;
@@ -5516,31 +6069,45 @@ function HistoryPanel({
   // Broadcast loading state to InfoPanel button
   useEffect(() => {
     const snapshot = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner);
-    historyDiag((surfaceLoading ? 'LOADER_VISIBLE' : 'LOADER_HIDDEN') +
+    historyDiag((visibleSurfaceLoading ? 'LOADER_VISIBLE' : 'LOADER_HIDDEN') +
       ' tab=' + tabId.slice(-12) +
       ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none') +
       ' tool=' + toolType +
       ' owner=' + historyOwnerDigest(historyOwnerKey) +
       ' reason=' + historyLoaderReasonRef.current +
+      ' viewportPending=' + (viewportAwaitingFirstRange ? '1' : '0') +
       ' cache=' + (snapshot ? 'hit' : 'miss') +
       ' cacheEntries=' + (snapshot?.entries.length || 0) +
       ' visibleEntries=' + presentationEntriesRef.current.length +
       ' ownerAgeMs=' + Math.max(0, Date.now() - historyOwnerStartedAtRef.current));
-    window.dispatchEvent(new CustomEvent('history-panel:loading', { detail: { tabId, loading: surfaceLoading } }));
-  }, [historyOwnerKey, historySnapshotOwner, sessionId, surfaceLoading, tabId, toolType]);
+    window.dispatchEvent(new CustomEvent('history-panel:loading', { detail: { tabId, loading: visibleSurfaceLoading } }));
+  }, [
+    historyOwnerKey,
+    historySnapshotOwner,
+    sessionId,
+    tabId,
+    toolType,
+    viewportAwaitingFirstRange,
+    visibleSurfaceLoading,
+  ]);
 
   // Initial load on mount / session change / tool type switch
   const initialLoadDoneRef = useRef(false);
   useLayoutEffect(() => {
     const generation = historyOwnerGenerationRef.current + 1;
+    const viewportPaintOwner: HistoryViewportPaintOwner = {
+      key: historyOwnerKey,
+      generation,
+    };
     const ownerStartedAt = Date.now();
     historyOwnerStartedAtRef.current = ownerStartedAt;
     historyOwnerGenerationRef.current = generation;
     historyOwnerKeyRef.current = historyOwnerKey;
+    viewportPaintProbeRef.current?.cancel();
+    surfacePresentedProbeRef.current?.cancel();
+    surfacePresentedOwnerRef.current = '';
     setPresentedOwnerKey(historyOwnerKey);
     initialLoadDoneRef.current = false;
-    for (const timer of localPromptCleanupTimersRef.current.values()) clearTimeout(timer);
-    localPromptCleanupTimersRef.current.clear();
     const volatileOverlay = sessionId
       ? historyVolatileOverlayCache.get<
           FullHistoryEntry,
@@ -5579,6 +6146,9 @@ function HistoryPanel({
       ' cacheApproxBytes=' + cacheStats.approxBytes +
       ' localEntries=' + restoredLocalEntries.length);
     if (cachedSnapshot) {
+      viewportReadyOwnerKeyRef.current = historyOwnerKey;
+      setViewportReadyOwnerKey(historyOwnerKey);
+      setViewportProofRequired(false);
       const rawCachedEntries = cachedSnapshot.entries as unknown as FullHistoryEntry[];
       const presentedCachedEntries = filterSuppressedPromptEntries(
         rawCachedEntries,
@@ -5593,29 +6163,21 @@ function HistoryPanel({
       setClaudeMemoryBoundaryUuid(cachedSnapshot.claudeMemoryBoundaryUuid);
       historyRevisionRef.current = cachedSnapshot.revision;
       lastServerEntryUuidsRef.current = new Set(rawCachedEntries.map((entry) => entry.uuid));
+      rawServerEntriesRef.current = rawCachedEntries;
       setLoading(false);
       persistVolatileOverlay(historySnapshotOwner, cachedEntries);
     } else {
+      viewportReadyOwnerKeyRef.current = '';
+      setViewportReadyOwnerKey('');
+      setViewportProofRequired(true);
       setLoading(!!sessionId);
       presentationEntriesRef.current = restoredLocalEntries;
       setEntries(restoredLocalEntries);
       setClaudeMemoryBoundaryUuid(null);
       historyRevisionRef.current = null;
       lastServerEntryUuidsRef.current = new Set();
+      rawServerEntriesRef.current = [];
       persistVolatileOverlay(historySnapshotOwner, restoredLocalEntries);
-    }
-    for (const entry of restoredLocalEntries) {
-      if (!isLocalPromptEntry(entry) || entry.queueStatus !== 'sent' || !entry.handoffId) continue;
-      const ageMs = now - (
-        entry.statusChangedAt ||
-        entry.optimisticAt ||
-        Date.parse(entry.timestamp || '') ||
-        now
-      );
-      armLocalPromptSentCleanup(
-        entry.handoffId,
-        Math.max(0, LOCAL_PROMPT_SENT_TTL_MS - ageMs + 250),
-      );
     }
     const currentPreview = useUIStore.getState().historyRewindPreviews[tabId] || null;
     if (currentPreview?.sessionId && currentPreview.sessionId !== sessionId) {
@@ -5623,6 +6185,8 @@ function HistoryPanel({
     }
     void loadHistory(!!cachedSnapshot);
     return () => {
+      viewportPaintProbeRef.current?.cancel(viewportPaintOwner);
+      surfacePresentedProbeRef.current?.cancel(viewportPaintOwner);
       persistVolatileOverlay(
         historySnapshotOwner,
         presentationEntriesRef.current,
@@ -5639,14 +6203,7 @@ function HistoryPanel({
         ' generation=' + generation +
         ' lifetimeMs=' + Math.max(0, Date.now() - ownerStartedAt));
     };
-  }, [armLocalPromptSentCleanup, historyOwnerKey, historySnapshotOwner, loadHistory, persistVolatileOverlay, sessionId, setHistoryRewindPreview, tabId, toolType]);
-
-  useEffect(() => {
-    return () => {
-      for (const timer of localPromptCleanupTimersRef.current.values()) clearTimeout(timer);
-      localPromptCleanupTimersRef.current.clear();
-    };
-  }, []);
+  }, [historyOwnerKey, historySnapshotOwner, loadHistory, persistVolatileOverlay, sessionId, setHistoryRewindPreview, tabId, toolType]);
 
   // Restore saved scroll position after initial load completes.
   // Virtuoso owns the scroller, so we write into `virtuosoScrollerRef.current.scrollTop`
@@ -5693,6 +6250,15 @@ function HistoryPanel({
     const onChanged = (_event: any, detail: any) => {
       if (detail?.sessionId !== sessionId) return;
       if (detail?.toolType && detail.toolType !== toolType) return;
+      if (isTurnBusyRef.current) {
+        deferredTranscriptRefreshRef.current = true;
+        historyDiag('TRANSCRIPT_DEFERRED tab=' + tabId.slice(-12) +
+          ' session=' + sessionId.substring(0, 8) +
+          ' tool=' + toolType +
+          ' reason=turn-busy' +
+          ' source=' + (detail?.reason || 'transcript-change'));
+        return;
+      }
       queueRefresh(detail?.reason || 'transcript-change');
     };
     ipcRenderer.on('agent-transcript:changed', onChanged);
@@ -5724,6 +6290,16 @@ function HistoryPanel({
       ipcRenderer.invoke('agent-transcript:unsubscribe', { consumerId }).catch(() => {});
     };
   }, [sessionId, cwd, tabId, toolType, loadHistory]);
+
+  useEffect(() => {
+    if (isTurnBusy || !deferredTranscriptRefreshRef.current) return;
+    deferredTranscriptRefreshRef.current = false;
+    historyDiag('TRANSCRIPT_FLUSH tab=' + tabId.slice(-12) +
+      ' session=' + (sessionId ? sessionId.substring(0, 8) : 'none') +
+      ' tool=' + toolType +
+      ' reason=turn-settled');
+    void loadHistory(true);
+  }, [isTurnBusy, loadHistory, sessionId, tabId, toolType]);
 
   // Listen for scroll-to-bottom from Timeline arrow button
   useEffect(() => {
@@ -5767,10 +6343,17 @@ function HistoryPanel({
     userIntentLogged: boolean;
     scrollEventLogged: boolean;
   } | null>(null);
-  useEffect(() => () => {
-    scrollMountedRef.current = false;
-    historyScrollInFlightRef.current = null;
-    scrollGenRef.current++;
+  useEffect(() => {
+    // React StrictMode and Fast Refresh both run cleanup before installing the
+    // same effect again while preserving refs. Re-arm the liveness proof in
+    // setup; otherwise every later Timeline click starts a convergence loop
+    // that exits before its first animation frame.
+    scrollMountedRef.current = true;
+    return () => {
+      scrollMountedRef.current = false;
+      historyScrollInFlightRef.current = null;
+      scrollGenRef.current++;
+    };
   }, []);
 
   const cancelHistoryScrollFromUser = useCallback((reason: string) => {
@@ -5950,7 +6533,11 @@ function HistoryPanel({
         if (stable >= 2 && attempts >= 3) { finish(true, 'stable-mounted'); return; }
       }
       if (attempts >= MAX_ATTEMPTS) {
-        finish(sawNode, sawNode ? 'max-attempts-mounted' : 'max-attempts-unmounted');
+        // A row seen on an earlier frame is not proof that the final target is
+        // still mounted or settled. Report failure unless the normal stable
+        // branch above completed; Timeline must not clear its pending jump on
+        // a historical sighting.
+        finish(false, node ? 'max-attempts-unstable-mounted' : 'max-attempts-unmounted');
         return;
       }
       requestAnimationFrame(step);
@@ -6315,6 +6902,7 @@ function HistoryPanel({
             No history entries
           </div>
         ) : (
+          <>
           <Virtuoso
             ref={virtuosoRef}
             data={displayEntries}
@@ -6347,6 +6935,74 @@ function HistoryPanel({
             }}
             rangeChanged={(range) => {
               visibleRangeRef.current = { start: range.startIndex, end: range.endIndex };
+              const viewportPaintOwner: HistoryViewportPaintOwner = {
+                key: historyOwnerKey,
+                generation: historyOwnerGenerationRef.current,
+              };
+              if (
+                viewportReadyOwnerKeyRef.current !== historyOwnerKey
+                && !viewportPaintProbeRef.current?.isActive(viewportPaintOwner)
+              ) {
+                const ownerAtRange = historyOwnerKey;
+                const generationAtRange = historyOwnerGenerationRef.current;
+                viewportPaintProbeRef.current?.start(
+                  viewportPaintOwner,
+                  () => (
+                    historyOwnerKeyRef.current === ownerAtRange
+                    && historyOwnerGenerationRef.current === generationAtRange
+                    && !!virtuosoScrollerRef.current?.querySelector('[data-uuid]')
+                  ),
+                  () => {
+                    if (
+                      historyOwnerKeyRef.current !== ownerAtRange
+                      || historyOwnerGenerationRef.current !== generationAtRange
+                    ) return;
+                    viewportReadyOwnerKeyRef.current = ownerAtRange;
+                    setViewportReadyOwnerKey(ownerAtRange);
+                    setViewportProofRequired(false);
+                    historyDiag('VIEWPORT_READY tab=' + tabId.slice(-12) +
+                      ' owner=' + historyOwnerDigest(ownerAtRange) +
+                      ' range=' + range.startIndex + '-' + range.endIndex +
+                      ' entries=' + displayEntries.length +
+                      ' proof=mounted-painted-row');
+                  },
+                );
+              }
+              const presentedProofKey = historyOwnerKey + ':' + viewportPaintOwner.generation;
+              if (
+                surfacePresentedOwnerRef.current !== presentedProofKey
+                && !surfacePresentedProbeRef.current?.isActive(viewportPaintOwner)
+              ) {
+                const ownerAtRange = historyOwnerKey;
+                const generationAtRange = historyOwnerGenerationRef.current;
+                const cacheAtRange = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner)
+                  ? 'hit'
+                  : 'miss';
+                surfacePresentedProbeRef.current?.start(
+                  viewportPaintOwner,
+                  () => (
+                    historyOwnerKeyRef.current === ownerAtRange
+                    && historyOwnerGenerationRef.current === generationAtRange
+                    && !!virtuosoScrollerRef.current?.querySelector('[data-uuid]')
+                  ),
+                  () => {
+                    if (
+                      historyOwnerKeyRef.current !== ownerAtRange
+                      || historyOwnerGenerationRef.current !== generationAtRange
+                    ) return;
+                    const domRows = virtuosoScrollerRef.current
+                      ?.querySelectorAll('[data-uuid]').length || 0;
+                    surfacePresentedOwnerRef.current = presentedProofKey;
+                    historyDiag('SURFACE_PRESENTED tab=' + tabId.slice(-12)
+                      + ' owner=' + historyOwnerDigest(ownerAtRange)
+                      + ' generation=' + generationAtRange
+                      + ' cache=' + cacheAtRange
+                      + ' domRows=' + domRows
+                      + ' loader=' + (visibleSurfaceLoading ? 'visible' : 'hidden')
+                      + ' proof=mounted-painted-row');
+                  },
+                );
+              }
               recomputeVisibleUuids();
             }}
             // Pre-render a vertical buffer on either side so flash highlights
@@ -6399,6 +7055,28 @@ function HistoryPanel({
               );
             }}
           />
+          {viewportAwaitingFirstRange && (
+            <div
+              data-history-viewport-loader
+              style={{
+                position: 'absolute',
+                inset: 0,
+                zIndex: 5,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: 8,
+                background: '#151515',
+                color: '#818cf8',
+                fontSize: 13,
+                pointerEvents: 'none',
+              }}
+            >
+              <HistorySpinner size={16} />
+              Loading...
+            </div>
+          )}
+          </>
         )}
         {/* Scroll-to-bottom arrow — visibility toggled via ref in handleScroll */}
         <ControlHint label="Прокрутить History вниз">
@@ -6433,9 +7111,19 @@ function HistoryPanel({
           cwd={cwd}
           projectId={projectId}
           toolType={toolType as AgentHistoryTool}
-          onHistoryRefresh={() => loadHistory(true)}
+          onHistoryRefresh={(reason) => {
+            if (reason?.startsWith('busy-false:') || reason === 'command-finished') {
+              deferredTranscriptRefreshRef.current = false;
+              historyDiag('TRANSCRIPT_FLUSH_COVERED tab=' + tabId.slice(-12) +
+                ' session=' + (sessionId ? sessionId.substring(0, 8) : 'none') +
+                ' tool=' + toolType +
+                ' reason=' + reason);
+            }
+            return loadHistory(true);
+          }}
           onPromptSubmitted={appendLocalPromptEntry}
           onPromptStatusChange={updateLocalPromptEntry}
+          hasDurablePrompt={hasDurablePrompt}
           rewindLocked={rewindLocked}
           rewindPhase={activeRewindOperation?.phase}
           rewindMessage={activeRewindOperation?.message}

@@ -51,6 +51,11 @@ const {
   codexSessionIdFromAuthoritativeStatus,
   isCodexComposerReadyForGuardedSend,
 } = require('./codex-runtime-contract');
+const {
+  classifyAgentActionBridgeError,
+  classifyAgentActionResult,
+  validateFreshAgentRuntimeStatus,
+} = require('./project-api-runtime-contract');
 const { OrchestrationRunStore, isActiveStatus } = require('./orchestration-runs');
 const INBOX_PROJECT_ID = '__noted_inbox__';
 const isInboxProjectId = (projectId) => projectId === INBOX_PROJECT_ID;
@@ -534,6 +539,35 @@ async function waitForAgentReady(tabId, timeoutMs = 20_000) {
 	    check();
 	  });
 	}
+
+async function readFreshReadyRuntimeStatus(tabId, label) {
+  let status;
+  try {
+    status = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
+  } catch (error) {
+    const wrapped = new Error('runtime snapshot unavailable after startup defaults: ' + String(error?.message || error));
+    wrapped.code = error?.code === 'bridge_timeout'
+      ? 'runtime_snapshot_timeout'
+      : 'runtime_snapshot_unavailable';
+    wrapped.statusCode = error?.code === 'bridge_timeout' ? 504 : 502;
+    wrapped.status = null;
+    throw wrapped;
+  }
+  const verdict = validateFreshAgentRuntimeStatus(status);
+  if (!verdict.ok) {
+    const error = new Error(verdict.error);
+    error.code = verdict.error;
+    error.statusCode = verdict.statusCode;
+    error.status = status;
+    throw error;
+  }
+  console.log('[WebReadyFresh] tab=' + shortId(tabId, 12)
+    + ' label=' + label
+    + ' status=' + (status?.status || '-')
+    + ' inputReady=' + (status?.inputReady === true)
+    + ' tool=' + (status?.toolType || status?.commandType || '-'));
+  return status;
+}
 
 async function resolveEditRangeMutationTarget(tabId, body = {}, operation = 'edit') {
   const operationName = operation === 'delete' ? 'delete-range' : 'edit-range';
@@ -1686,13 +1720,17 @@ function bridgeRequest(action, payload, timeoutMs = 5000) {
     const label = bridgePayloadLabel(payload);
     if (!win || win.isDestroyed()) {
       console.log('[BridgeDiag] NO_WINDOW action=' + action + label + ' wins=' + wins.length);
-      return reject(new Error('No window'));
+      const error = new Error('No window');
+      error.code = 'bridge_unavailable';
+      return reject(error);
     }
     const requestId = crypto.randomBytes(8).toString('hex');
     const timer = setTimeout(() => {
       pendingBridge.delete(requestId);
       console.log('[BridgeDiag] TIMEOUT action=' + action + label + ' rid=' + requestId + ' afterMs=' + timeoutMs);
-      reject(new Error('Bridge timeout: ' + action));
+      const error = new Error('Bridge timeout: ' + action);
+      error.code = 'bridge_timeout';
+      reject(error);
     }, timeoutMs);
     pendingBridge.set(requestId, { resolve, reject, timer, action, label, sentAt: Date.now() });
     console.log('[BridgeDiag] SEND action=' + action + label + ' rid=' + requestId + ' wins=' + wins.length);
@@ -1797,8 +1835,14 @@ function registerBridgeReplyHandler() {
     console.log('[BridgeDiag] REPLY action=' + pending.action + (pending.label || '') + ' rid=' + requestId + ' ok=' + ok + ' elapsedMs=' + elapsed + ' err=' + (error || '-'));
     clearTimeout(pending.timer);
     pendingBridge.delete(requestId);
-    if (ok) pending.resolve(data);
-    else pending.reject(new Error(error || 'Bridge failed'));
+    if (ok) {
+      pending.resolve(data);
+    } else {
+      const bridgeError = new Error(error || 'Bridge failed');
+      bridgeError.code = 'bridge_failed';
+      bridgeError.bridgeData = data;
+      pending.reject(bridgeError);
+    }
   });
 }
 
@@ -3210,17 +3254,30 @@ async function handleApi(req, res, parsed, sdkSessions) {
             defaultsError = defaults?.error || defaults?.reason || null;
           } catch (defaultsErr) {
             defaultsError = String(defaultsErr.message || defaultsErr);
-            try {
-              liveStatus = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000) || status;
-            } catch {
-              liveStatus = status;
-            }
             console.warn('[MobStart] startup defaults not ready after fresh start tab=' + shortId(tabId, 12)
               + ' runtimeStatus=' + (status?.status || '-')
-              + ' projectedStatus=' + (liveStatus?.status || '-')
               + ' error=' + defaultsError
               + ' continuingWithLiveRuntime=true');
           }
+        }
+        try {
+          liveStatus = await readFreshReadyRuntimeStatus(tabId, 'start-after-defaults');
+        } catch (freshErr) {
+          console.warn('[MobStart] fresh runtime proof failed tab=' + shortId(tabId, 12)
+            + ' error=' + String(freshErr?.message || freshErr)
+            + ' status=' + (freshErr?.status?.status || '-'));
+          return sendJson(res, freshErr?.statusCode || 503, {
+            ...(data || {}),
+            ok: false,
+            success: false,
+            ready: false,
+            error: freshErr?.code || 'runtime_snapshot_unavailable',
+            detail: String(freshErr?.message || freshErr),
+            status: freshErr?.status?.status || null,
+            inputReady: freshErr?.status?.inputReady === true,
+            startupDefaultsReady: defaultsReady,
+            startupDefaultsError: defaultsError,
+          });
         }
         return sendJson(res, 200, {
           ok: true,
@@ -3286,16 +3343,29 @@ async function handleApi(req, res, parsed, sdkSessions) {
           defaultsError = defaults?.error || defaults?.reason || null;
         } catch (defaultsErr) {
           defaultsError = String(defaultsErr.message || defaultsErr);
-          try {
-            liveStatus = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000) || status;
-          } catch {
-            liveStatus = status;
-          }
           console.warn('[MobResume] startup defaults not ready after live resume tab=' + shortId(tabId, 12)
             + ' runtimeStatus=' + (status?.status || '-')
-            + ' projectedStatus=' + (liveStatus?.status || '-')
             + ' error=' + defaultsError
             + ' continuingWithLiveRuntime=true');
+        }
+        try {
+          liveStatus = await readFreshReadyRuntimeStatus(tabId, 'resume-after-defaults');
+        } catch (freshErr) {
+          console.warn('[MobResume] fresh runtime proof failed tab=' + shortId(tabId, 12)
+            + ' error=' + String(freshErr?.message || freshErr)
+            + ' status=' + (freshErr?.status?.status || '-'));
+          return sendJson(res, freshErr?.statusCode || 503, {
+            ...(data || {}),
+            ok: false,
+            success: false,
+            ready: false,
+            error: freshErr?.code || 'runtime_snapshot_unavailable',
+            detail: String(freshErr?.message || freshErr),
+            status: freshErr?.status?.status || null,
+            inputReady: freshErr?.status?.inputReady === true,
+            startupDefaultsReady: defaultsReady,
+            startupDefaultsError: defaultsError,
+          });
         }
         return sendJson(res, 200, {
           ok: true,
@@ -3618,9 +3688,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
     // Normal path: Claude/Codex terminal tab. Try stop via scenario bridge.
     try {
       const data = await runAgentStopScenario(tabId, 2000);
-      return sendJson(res, 200, { stopped: true, ...data });
+      const outcome = classifyAgentActionResult('stop', data);
+      return sendJson(res, outcome.statusCode, outcome.body);
     } catch (e) {
-      return sendJson(res, 200, { stopped: false, reason: 'no active session' });
+      const outcome = classifyAgentActionBridgeError('stop', e);
+      return sendJson(res, outcome.statusCode, outcome.body);
     }
   }
 
@@ -3641,9 +3713,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
     try {
       const data = await runAgentInterruptScenario(tabId, 2000);
-      return sendJson(res, 200, { interrupted: true, kind: 'pty', ...data });
+      const outcome = classifyAgentActionResult('interrupt', { kind: 'pty', ...data });
+      return sendJson(res, outcome.statusCode, outcome.body);
     } catch (e) {
-      return sendJson(res, 200, { interrupted: false, reason: 'no active session' });
+      const outcome = classifyAgentActionBridgeError('interrupt', e);
+      return sendJson(res, outcome.statusCode, outcome.body);
     }
   }
 

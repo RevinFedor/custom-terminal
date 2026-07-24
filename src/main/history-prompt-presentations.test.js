@@ -1,0 +1,234 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const {
+  buildCodexPromptPresentationRemap,
+  cloneCodexPromptPresentationsForProvenChild,
+  decorateHistoryPromptPresentations,
+  promptTransportHash,
+  saveAuditedPromptPresentation,
+} = require('./history-prompt-presentations');
+
+function createStore() {
+  const rows = [];
+  return {
+    rows,
+    saveHistoryPromptPresentation(row) {
+      rows.push({ ...row, chips: row.chips });
+      return true;
+    },
+    getHistoryPromptPresentations(_toolType, sessionId) {
+      return rows.filter(row => row.sessionId === sessionId);
+    },
+    getHistoryPromptPresentationsForEntries(_toolType, entryUuids) {
+      const wanted = new Set(entryUuids);
+      return rows.filter(row => row.entryUuid && wanted.has(row.entryUuid));
+    },
+    bindHistoryPromptPresentationEntry(query) {
+      const row = rows.find(candidate => (
+        candidate.toolType === query.toolType
+        && candidate.sessionId === query.sessionId
+        && candidate.auditTimestamp === query.auditTimestamp
+        && candidate.transportHash === query.transportHash
+      ));
+      if (!row) return false;
+      row.entryUuid = query.entryUuid;
+      return true;
+    },
+  };
+}
+
+test('post-Enter sidecar decorates the exact durable prompt without changing its content', () => {
+  const store = createStore();
+  const content = 'saved prompt\n\nuser note';
+  assert.equal(saveAuditedPromptPresentation(store, {
+    toolType: 'codex',
+    sessionId: 'writer-1',
+    auditTimestamp: '2026-07-24T01:02:03.004Z',
+    actualText: content,
+    snapshot: {
+      promptChips: [{
+        id: 'chip-1',
+        kind: 'prompt',
+        label: 'Review',
+        text: 'saved prompt',
+      }],
+    },
+  }), true);
+
+  const decorated = decorateHistoryPromptPresentations(store, {
+    toolType: 'codex',
+    sessionId: 'writer-1',
+    entries: [{
+      uuid: 'codex-user-writer-1-17',
+      role: 'user',
+      timestamp: '2026-07-24T01:02:03.004Z',
+      content,
+    }],
+  });
+
+  assert.equal(decorated[0].content, content);
+  assert.equal(decorated[0].promptChips[0].label, 'Review');
+  assert.equal(store.rows[0].entryUuid, 'codex-user-writer-1-17');
+});
+
+test('a hash or timestamp mismatch never attaches presentation metadata', () => {
+  const store = createStore();
+  store.rows.push({
+    toolType: 'codex',
+    sessionId: 'writer-1',
+    auditTimestamp: '2026-07-24T01:02:03.004Z',
+    transportHash: promptTransportHash('expected'),
+    entryUuid: null,
+    chips: [{ id: 'chip', kind: 'prompt', label: 'Prompt', text: 'expected' }],
+  });
+
+  const source = [{
+    uuid: 'codex-user-writer-1-18',
+    role: 'user',
+    timestamp: '2026-07-24T01:02:03.004Z',
+    content: 'different',
+  }];
+  assert.equal(decorateHistoryPromptPresentations(store, {
+    toolType: 'codex',
+    sessionId: 'writer-1',
+    entries: source,
+  }), source);
+});
+
+function codexUser(line, timestamp, message) {
+  return {
+    __line: line,
+    type: 'event_msg',
+    timestamp,
+    payload: { type: 'user_message', message },
+  };
+}
+
+test('Codex child remap follows only the copied user-message prefix and preserves duplicate occurrence order', () => {
+  const sourceRecords = [
+    codexUser(4, '2026-07-24T01:00:00.000Z', 'first'),
+    codexUser(9, '2026-07-24T01:01:00.000Z', 'same'),
+    codexUser(15, '2026-07-24T01:01:00.000Z', 'same'),
+    codexUser(21, '2026-07-24T01:02:00.000Z', 'removed source turn'),
+  ];
+  const childRecords = [
+    codexUser(7, '2026-07-24T01:00:00Z', 'first'),
+    codexUser(12, '2026-07-24T01:01:00.000Z', 'same'),
+    codexUser(19, '2026-07-24T01:01:00.000Z', 'same'),
+  ];
+
+  const result = buildCodexPromptPresentationRemap({
+    sourceSessionId: 'source',
+    childSessionId: 'child',
+    sourceRecords,
+    childRecords,
+  });
+
+  assert.equal(result.matchedPrefixLength, 3);
+  assert.equal(result.stoppedReason, 'partial-projection');
+  assert.deepEqual(
+    result.mappings.map(mapping => ({
+      source: mapping.sourceEntryUuid,
+      child: mapping.childEntryUuid,
+      occurrence: mapping.occurrence,
+    })),
+    [
+      { source: 'codex-user-source-4', child: 'codex-user-child-7', occurrence: 1 },
+      { source: 'codex-user-source-9', child: 'codex-user-child-12', occurrence: 1 },
+      { source: 'codex-user-source-15', child: 'codex-user-child-19', occurrence: 2 },
+    ],
+  );
+});
+
+test('Codex child remap preserves surviving messages across a removed middle range', () => {
+  const result = buildCodexPromptPresentationRemap({
+    sourceSessionId: 'source',
+    childSessionId: 'child',
+    sourceRecords: [
+      codexUser(1, '2026-07-24T01:00:00Z', 'copied'),
+      codexUser(2, '2026-07-24T01:01:00Z', 'old branch'),
+      codexUser(3, '2026-07-24T01:02:00Z', 'looks copied later'),
+    ],
+    childRecords: [
+      codexUser(8, '2026-07-24T01:00:00.000Z', 'copied'),
+      codexUser(9, '2026-07-24T01:01:00Z', 'new branch'),
+      codexUser(10, '2026-07-24T01:02:00Z', 'looks copied later'),
+    ],
+  });
+
+  assert.equal(result.stoppedReason, 'partial-projection');
+  assert.deepEqual(result.mappings.map(mapping => mapping.childEntryUuid), [
+    'codex-user-child-8',
+    'codex-user-child-10',
+  ]);
+});
+
+test('Codex child remap skips an ambiguous duplicate group instead of guessing the surviving occurrence', () => {
+  const result = buildCodexPromptPresentationRemap({
+    sourceSessionId: 'source',
+    childSessionId: 'child',
+    sourceRecords: [
+      codexUser(1, '2026-07-24T01:00:00Z', 'unique'),
+      codexUser(2, '2026-07-24T01:01:00Z', 'duplicate'),
+      codexUser(3, '2026-07-24T01:01:00Z', 'duplicate'),
+    ],
+    childRecords: [
+      codexUser(8, '2026-07-24T01:00:00Z', 'unique'),
+      codexUser(9, '2026-07-24T01:01:00Z', 'duplicate'),
+    ],
+  });
+
+  assert.equal(result.stoppedReason, 'duplicate-occurrence-ambiguous');
+  assert.deepEqual(result.mappings.map(mapping => mapping.childEntryUuid), [
+    'codex-user-child-8',
+  ]);
+});
+
+test('Codex child remap fails closed on missing metadata but normalizes newline encoding without mutating records', () => {
+  const sourceText = 'line one\r\nline two';
+  const childText = 'line one\nline two';
+  const sourceRecords = [
+    codexUser(1, '2026-07-24T01:00:00Z', sourceText),
+    codexUser(2, null, 'metadata gap'),
+    codexUser(3, '2026-07-24T01:02:00Z', 'must not map after gap'),
+  ];
+  const childRecords = [
+    codexUser(5, '2026-07-24T01:00:00.000Z', childText),
+    codexUser(6, '2026-07-24T01:01:00Z', 'metadata gap'),
+    codexUser(7, '2026-07-24T01:02:00Z', 'must not map after gap'),
+  ];
+
+  const result = buildCodexPromptPresentationRemap({
+    sourceSessionId: 'source',
+    childSessionId: 'child',
+    sourceRecords,
+    childRecords,
+  });
+
+  assert.equal(result.stoppedReason, 'identity-metadata-missing');
+  assert.equal(result.mappings.length, 1);
+  assert.notEqual(result.mappings[0].sourceTransportHash, result.mappings[0].childTransportHash);
+  assert.equal(sourceRecords[0].payload.message, sourceText);
+  assert.equal(childRecords[0].payload.message, childText);
+});
+
+test('Codex child clone helper passes only proven record mappings to the DB operation', () => {
+  const calls = [];
+  const store = {
+    cloneCodexHistoryPromptPresentations(input) {
+      calls.push(input);
+      return { inserted: 1, updated: 0, unchanged: 0, skipped: 0 };
+    },
+  };
+  const result = cloneCodexPromptPresentationsForProvenChild(store, {
+    sourceSessionId: 'source',
+    childSessionId: 'child',
+    sourceRecords: [codexUser(1, '2026-07-24T01:00:00Z', 'copied')],
+    childRecords: [codexUser(8, '2026-07-24T01:00:00Z', 'copied')],
+  });
+
+  assert.equal(result.cloned, 1);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].entryMappings[0].sourceEntryUuid, 'codex-user-source-1');
+  assert.equal(calls[0].entryMappings[0].childEntryUuid, 'codex-user-child-8');
+});

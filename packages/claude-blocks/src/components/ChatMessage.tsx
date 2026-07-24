@@ -251,7 +251,7 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({ entry, ctx }) => {
       return (
         <ConversationMessage layout="block" entryUuid={entry.entryUuid}>
           <ToolCallPart toolName={entry.tool} args={entry.input || {}} result={entry.result} isError={entry.isError}
-            startLine={entry.startLine} awaitingApproval={entry.awaitingApproval} collapse={{ open, onToggle: toggle, anchorRef }} />
+            startLine={entry.startLine} diffHunks={entry.diffHunks} awaitingApproval={entry.awaitingApproval} collapse={{ open, onToggle: toggle, anchorRef }} />
         </ConversationMessage>
       );
     }

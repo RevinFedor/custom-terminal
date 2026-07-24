@@ -4699,9 +4699,6 @@ function SDKComposer({
   const historyComposerMinRows = useUIStore((s) => s.historyComposerMinRows);
   const historyComposerMaxRows = useUIStore((s) => s.historyComposerMaxRows);
   const aiSecondaryFontSize = useUIStore((s) => s.aiSecondaryFontSize);
-  const composerLineHeightPx = historyComposerFontSize * 1.35;
-  const composerMinHeight = Math.ceil(composerLineHeightPx * historyComposerMinRows + 12);
-  const composerMaxHeight = Math.ceil(composerLineHeightPx * historyComposerMaxRows + 12);
   // "Logical focus" — composer is the keyboard target. Tracks DOM focus PLUS
   // the selection-in-chat case where DOM focus is parked on body but typing
   // still routes here (global keydown router). Drives the orange border that
@@ -5194,12 +5191,10 @@ function SDKComposer({
       writeComposerValue('');
       return;
     }
-    // Ctrl+C: ТОЛЬКО clear input. Stop процесса = отдельный жест (Esc на
-    // window-level handler line ~1862, или кнопка Stop в ControlBar/TabBar).
-    // Юзер: «При Ctrl+C разве у нас просто не должен очищаться input?» — да.
-    // Раньше Ctrl+C на пустом input или двойной Ctrl+C эскалировался в
-    // stop callback, что выглядело как баг (юзер хотел просто очистить ввод,
-    // а ему останавливали turn). Stop остаётся в общей нижней панели.
+    // Ctrl+C is a two-stage gesture. Any authoring state (including whitespace
+    // or a chip-only draft) is cleared and fully consumes the first keypress.
+    // A later Ctrl+C on a truly empty composer bubbles to the window-level
+    // Escape alias, which interrupts the running query.
     // Mac default ⌘C copies; мы требуем Ctrl (не Meta), чтобы highlight-and-
     // copy продолжал работать на macOS. e.code === 'KeyC' — на русской
     // раскладке e.key === 'с' (cyrillic), не 'c'.
@@ -5207,10 +5202,15 @@ function SDKComposer({
       // Не интерсептим если есть выделение — юзер хочет скопировать его.
       const sel = window.getSelection();
       if (sel && sel.toString().length > 0) return;
-      // Пустой композер → ничего не делаем (нечего очищать).
-      if (composerText.length === 0) return;
+      const hasAuthoringState = composerText.length > 0 || chips.length > 0;
+      // Empty → let the window-level interrupt handler own the second press.
+      if (!hasAuthoringState) return;
       e.preventDefault();
+      e.stopPropagation();
+      e.nativeEvent.stopImmediatePropagation();
       writeComposerValue('');
+      setChips([]);
+      setPreviewChip(null);
       return;
     }
   }, [composerText, writeComposerValue, isRunning, commitSlash, tabId, queued, queuedState, chips, composerRuntime]);
@@ -5521,11 +5521,10 @@ function SDKComposer({
                 caretColor: '#FFB382',
                 fontSize: `${historyComposerFontSize}px`,
                 lineHeight: 1.35,
-                minHeight: `${composerMinHeight}px`,
-                maxHeight: `${composerMaxHeight}px`,
               }}
               className="flex-1 text-[#e0e0e0] rounded-lg px-2 py-1.5 resize-none outline-none border-0 placeholder-[#555] bg-transparent"
-              rows={1}
+              minRows={historyComposerMinRows}
+              maxRows={historyComposerMaxRows}
               onPaste={handlePaste}
               onKeyDown={handleComposerKeyDown}
               onInput={() => onUserInteract?.()}

@@ -209,7 +209,7 @@ function decideCodexModelMigrationAcknowledgement({
 }
 
 function latestCodexPickerSection(cleanText) {
-  const text = String(cleanText || '');
+  const text = String(cleanText || '').trimEnd();
   const headerKinds = [
     ['all-model', /Select Model and Effort[^\r\n]*/gi],
     ['top-model', /Select Model(?!\s+and\s+Effort)[^\r\n]*/gi],
@@ -235,12 +235,43 @@ function latestCodexPickerSection(cleanText) {
   const latestHintIndex = hintMatches.length > 0
     ? (hintMatches[hintMatches.length - 1].index || 0)
     : -1;
+  const withoutTrailingBlankLines = beforeFooter.trimEnd();
+  const blankBoundaries = Array.from(
+    withoutTrailingBlankLines.matchAll(/\r?\n[ \t]*\r?\n/g),
+  );
+  const latestBlankBoundary = blankBoundaries[blankBoundaries.length - 1] || null;
+  const modelBlockStart = latestBlankBoundary
+    ? (latestBlankBoundary.index || 0) + latestBlankBoundary[0].length
+    : 0;
+  const modelBlockSection = footer
+    ? text.slice(
+      modelBlockStart,
+      (footer.index || 0) + footer[0].length,
+    )
+    : '';
+  const modelBlockRows = parseCodexNumberedPicker(modelBlockSection);
+  const modelBlockValues = modelBlockRows.map(item => parseModelValue(item));
+  const strongHeaderlessModelBlock = !!footer
+    && modelBlockRows.length >= 2
+    && modelBlockRows.some(item => item.selected)
+    && modelBlockValues.every(isConcreteCodexModelValue);
+  const olderFooterSeparatesHeader = !!latest && footerMatches.some((match) => {
+    const index = match.index || 0;
+    return index > latest.index && index < modelBlockStart;
+  });
+  const clippedHintAfterHeader = latestHintIndex >= 0
+    && (!latest || latestHintIndex > latest.index);
 
   // A narrow terminal can clip the current picker header while an older
-  // picker header remains in the captured scrollback above it. The clipped
-  // `ctrl + a view all` row belongs to the current picker and therefore wins
-  // when it appears after every explicit header.
-  if (latest && latest.index > latestHintIndex) {
+  // picker header remains in the captured scrollback above it. The clipping
+  // hint is one proof. Newer Codex versions can omit that hint too, so a
+  // complete block immediately above the exact footer is also proof when it
+  // contains 2+ concrete model rows and one physical selection. An explicit
+  // header still wins unless an older footer proves that header belongs to a
+  // previous picker.
+  if (latest
+    && !clippedHintAfterHeader
+    && !(strongHeaderlessModelBlock && olderFooterSeparatesHeader)) {
     return {
       kind: latest.kind,
       section: text.slice(latest.index),
@@ -249,14 +280,13 @@ function latestCodexPickerSection(cleanText) {
   }
 
   if (!footer) return null;
-  // Headerless recognition is deliberately narrow. Many unrelated Codex
-  // confirmations use numbered rows plus the same footer; only the
-  // ListSelectionView clipping hint proves that a model picker header scrolled
-  // above the viewport.
-  if (hintMatches.length === 0) return null;
-  const start = hintMatches.length > 0
+  // Headerless recognition is deliberately narrow. Generic confirmations can
+  // share the footer, but they do not contain a selected block of concrete
+  // Codex model identifiers.
+  if (!clippedHintAfterHeader && !strongHeaderlessModelBlock) return null;
+  const start = clippedHintAfterHeader
     ? (hintMatches[hintMatches.length - 1].index || 0)
-    : Math.max(0, beforeFooter.lastIndexOf('\n\n'));
+    : modelBlockStart;
   const section = text.slice(start);
   const numbered = parseCodexNumberedPicker(section);
   if (numbered.length < 2 || !numbered.some(item => item.selected)) return null;

@@ -1,4 +1,5 @@
 const Database = require('better-sqlite3');
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -532,6 +533,29 @@ class DatabaseManager {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_timeline_prompt_summaries_updated
       ON timeline_prompt_summaries(updated_at DESC)
+    `);
+
+    // Presentation-only metadata for reversible composer chips. The canonical
+    // user prompt remains in Claude/Codex JSONL byte-for-byte; labels and chip
+    // boundaries live here and are attached only after a post-Enter audit has
+    // identified the durable user record.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS history_prompt_presentations (
+        tool_type TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        audit_timestamp TEXT NOT NULL,
+        transport_hash TEXT NOT NULL,
+        entry_uuid TEXT DEFAULT NULL,
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        chips_json TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+        PRIMARY KEY (tool_type, session_id, audit_timestamp, transport_hash)
+      )
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_history_prompt_presentations_entry
+      ON history_prompt_presentations(tool_type, session_id, entry_uuid)
     `);
 
     // Generated semantic projection for the expanded Timeline. The canonical
@@ -3197,6 +3221,316 @@ class DatabaseManager {
       override.thinkingLevel || null
     );
     return true;
+  }
+
+  getHistoryPromptPresentations(toolType, sessionId) {
+    if (!toolType || !sessionId) return [];
+    return this.db.prepare(`
+      SELECT *
+      FROM history_prompt_presentations
+      WHERE tool_type = ? AND session_id = ?
+      ORDER BY updated_at ASC
+    `).all(toolType, sessionId).flatMap(row => {
+      try {
+        const chips = JSON.parse(row.chips_json || '[]');
+        if (!Array.isArray(chips) || chips.length === 0) return [];
+        return [{
+          toolType: row.tool_type,
+          sessionId: row.session_id,
+          auditTimestamp: row.audit_timestamp,
+          transportHash: row.transport_hash,
+          entryUuid: row.entry_uuid || null,
+          schemaVersion: Number(row.schema_version || 1),
+          chips,
+          createdAt: Number(row.created_at || 0),
+          updatedAt: Number(row.updated_at || 0),
+        }];
+      } catch {
+        return [];
+      }
+    });
+  }
+
+  getHistoryPromptPresentationsForEntries(toolType, entryUuids) {
+    const uuids = Array.from(new Set(
+      (Array.isArray(entryUuids) ? entryUuids : [])
+        .map(value => String(value || '').trim())
+        .filter(Boolean)
+    ));
+    if (!toolType || uuids.length === 0) return [];
+    const rows = [];
+    const chunkSize = 800;
+    for (let start = 0; start < uuids.length; start += chunkSize) {
+      const chunk = uuids.slice(start, start + chunkSize);
+      const placeholders = chunk.map(() => '?').join(',');
+      rows.push(...this.db.prepare(`
+        SELECT *
+        FROM history_prompt_presentations
+        WHERE tool_type = ? AND entry_uuid IN (${placeholders})
+      `).all(toolType, ...chunk));
+    }
+    return rows.flatMap(row => {
+      try {
+        const chips = JSON.parse(row.chips_json || '[]');
+        if (!Array.isArray(chips) || chips.length === 0) return [];
+        return [{
+          toolType: row.tool_type,
+          sessionId: row.session_id,
+          auditTimestamp: row.audit_timestamp,
+          transportHash: row.transport_hash,
+          entryUuid: row.entry_uuid || null,
+          schemaVersion: Number(row.schema_version || 1),
+          chips,
+          createdAt: Number(row.created_at || 0),
+          updatedAt: Number(row.updated_at || 0),
+        }];
+      } catch {
+        return [];
+      }
+    });
+  }
+
+  getHistoryPromptPresentationRevision(toolType, _sessionId) {
+    if (!toolType) return 'none';
+    // Exact UUID decoration intentionally follows preserved entries across
+    // resume/fork session boundaries. Until sidecars are copied into every
+    // child, the revision must cover all rows for this provider; a token scoped
+    // only to the requested session could declare History unchanged while an
+    // ancestor row gained presentation metadata.
+    const rows = this.db.prepare(`
+      SELECT session_id, audit_timestamp, transport_hash, entry_uuid, schema_version, chips_json
+      FROM history_prompt_presentations
+      WHERE tool_type = ?
+      ORDER BY session_id ASC, audit_timestamp ASC, transport_hash ASC
+    `).all(toolType);
+    if (rows.length === 0) return 'none';
+    return crypto
+      .createHash('sha256')
+      .update(JSON.stringify(rows))
+      .digest('hex')
+      .slice(0, 24);
+  }
+
+  saveHistoryPromptPresentation(presentation) {
+    const toolType = String(presentation?.toolType || '').trim();
+    const sessionId = String(presentation?.sessionId || '').trim();
+    const auditTimestamp = String(presentation?.auditTimestamp || '').trim();
+    const transportHash = String(presentation?.transportHash || '').trim();
+    const chips = Array.isArray(presentation?.chips) ? presentation.chips : [];
+    if (!toolType || !sessionId || !auditTimestamp || !transportHash || chips.length === 0) {
+      return false;
+    }
+    this.db.prepare(`
+      INSERT INTO history_prompt_presentations (
+        tool_type, session_id, audit_timestamp, transport_hash, entry_uuid,
+        schema_version, chips_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now'))
+      ON CONFLICT(tool_type, session_id, audit_timestamp, transport_hash) DO UPDATE SET
+        entry_uuid = COALESCE(excluded.entry_uuid, history_prompt_presentations.entry_uuid),
+        schema_version = excluded.schema_version,
+        chips_json = excluded.chips_json,
+        updated_at = strftime('%s', 'now')
+    `).run(
+      toolType,
+      sessionId,
+      auditTimestamp,
+      transportHash,
+      presentation.entryUuid || null,
+      Number(presentation.schemaVersion || 1),
+      JSON.stringify(chips)
+    );
+    return true;
+  }
+
+  bindHistoryPromptPresentationEntry({
+    toolType,
+    sessionId,
+    auditTimestamp,
+    transportHash,
+    entryUuid,
+  } = {}) {
+    if (!toolType || !sessionId || !auditTimestamp || !transportHash || !entryUuid) return false;
+    const result = this.db.prepare(`
+      UPDATE history_prompt_presentations
+      SET entry_uuid = ?, updated_at = strftime('%s', 'now')
+      WHERE tool_type = ?
+        AND session_id = ?
+        AND audit_timestamp = ?
+        AND transport_hash = ?
+        AND (entry_uuid IS NULL OR entry_uuid = ?)
+    `).run(entryUuid, toolType, sessionId, auditTimestamp, transportHash, entryUuid);
+    return result.changes > 0;
+  }
+
+  cloneCodexHistoryPromptPresentations({
+    sourceSessionId,
+    childSessionId,
+    entryMappings,
+  } = {}) {
+    const source = String(sourceSessionId || '').trim();
+    const child = String(childSessionId || '').trim();
+    const mappings = Array.isArray(entryMappings) ? entryMappings : [];
+    if (!source || !child || source === child || mappings.length === 0) {
+      return { inserted: 0, updated: 0, unchanged: 0, skipped: mappings.length };
+    }
+
+    const sourceByUuid = this.db.prepare(`
+      SELECT *
+      FROM history_prompt_presentations
+      WHERE tool_type = 'codex' AND session_id = ? AND entry_uuid = ?
+    `);
+    const sourceByAudit = this.db.prepare(`
+      SELECT *
+      FROM history_prompt_presentations
+      WHERE tool_type = 'codex'
+        AND session_id = ?
+        AND audit_timestamp = ?
+        AND transport_hash = ?
+    `);
+    const childByPrimaryKey = this.db.prepare(`
+      SELECT *
+      FROM history_prompt_presentations
+      WHERE tool_type = 'codex'
+        AND session_id = ?
+        AND audit_timestamp = ?
+        AND transport_hash = ?
+    `);
+    const childByEntryUuid = this.db.prepare(`
+      SELECT *
+      FROM history_prompt_presentations
+      WHERE tool_type = 'codex' AND session_id = ? AND entry_uuid = ?
+    `);
+    const insertChild = this.db.prepare(`
+      INSERT INTO history_prompt_presentations (
+        tool_type, session_id, audit_timestamp, transport_hash, entry_uuid,
+        schema_version, chips_json, created_at, updated_at
+      ) VALUES (
+        'codex', ?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now')
+      )
+    `);
+    const bindCompatibleChild = this.db.prepare(`
+      UPDATE history_prompt_presentations
+      SET entry_uuid = ?, updated_at = strftime('%s', 'now')
+      WHERE tool_type = 'codex'
+        AND session_id = ?
+        AND audit_timestamp = ?
+        AND transport_hash = ?
+        AND entry_uuid IS NULL
+        AND schema_version = ?
+        AND chips_json = ?
+    `);
+
+    const clone = this.db.transaction(() => {
+      const result = { inserted: 0, updated: 0, unchanged: 0, skipped: 0 };
+      const seenTargets = new Set();
+      for (const mapping of mappings) {
+        const sourceEntryUuid = String(mapping?.sourceEntryUuid || '').trim();
+        const childEntryUuid = String(mapping?.childEntryUuid || '').trim();
+        const sourceAuditTimestamp = String(mapping?.sourceAuditTimestamp || '').trim();
+        const sourceTransportHash = String(mapping?.sourceTransportHash || '').trim();
+        const childAuditTimestamp = String(mapping?.childAuditTimestamp || '').trim();
+        const childTransportHash = String(mapping?.childTransportHash || '').trim();
+        const targetKey = `${childEntryUuid}\u0000${childAuditTimestamp}\u0000${childTransportHash}`;
+        if (
+          !sourceEntryUuid
+          || !childEntryUuid
+          || !sourceAuditTimestamp
+          || !sourceTransportHash
+          || !childAuditTimestamp
+          || !childTransportHash
+          || seenTargets.has(targetKey)
+        ) {
+          result.skipped += 1;
+          continue;
+        }
+        seenTargets.add(targetKey);
+
+        const candidates = new Map();
+        for (const row of sourceByUuid.all(source, sourceEntryUuid)) {
+          candidates.set(`${row.audit_timestamp}\u0000${row.transport_hash}`, row);
+        }
+        for (const row of sourceByAudit.all(
+          source,
+          sourceAuditTimestamp,
+          sourceTransportHash,
+        )) {
+          candidates.set(`${row.audit_timestamp}\u0000${row.transport_hash}`, row);
+        }
+        if (candidates.size !== 1) {
+          result.skipped += 1;
+          continue;
+        }
+        const [sourceRow] = candidates.values();
+        let chips;
+        try {
+          chips = JSON.parse(sourceRow.chips_json || '[]');
+        } catch {
+          chips = null;
+        }
+        if (
+          !Array.isArray(chips)
+          || chips.length === 0
+          || chips.some(chip => (
+            chip?.kind !== 'prompt'
+            || typeof chip.text !== 'string'
+            || !chip.text
+          ))
+        ) {
+          result.skipped += 1;
+          continue;
+        }
+
+        const primaryRow = childByPrimaryKey.get(
+          child,
+          childAuditTimestamp,
+          childTransportHash,
+        );
+        const uuidRows = childByEntryUuid.all(child, childEntryUuid);
+        if (primaryRow) {
+          const compatible = Number(primaryRow.schema_version || 1) === Number(sourceRow.schema_version || 1)
+            && primaryRow.chips_json === sourceRow.chips_json
+            && (!primaryRow.entry_uuid || primaryRow.entry_uuid === childEntryUuid)
+            && uuidRows.every(row => (
+              row.audit_timestamp === primaryRow.audit_timestamp
+              && row.transport_hash === primaryRow.transport_hash
+            ));
+          if (!compatible) {
+            result.skipped += 1;
+            continue;
+          }
+          if (primaryRow.entry_uuid === childEntryUuid) {
+            result.unchanged += 1;
+            continue;
+          }
+          const update = bindCompatibleChild.run(
+            childEntryUuid,
+            child,
+            childAuditTimestamp,
+            childTransportHash,
+            Number(sourceRow.schema_version || 1),
+            sourceRow.chips_json,
+          );
+          if (update.changes === 1) result.updated += 1;
+          else result.skipped += 1;
+          continue;
+        }
+        if (uuidRows.length > 0) {
+          result.skipped += 1;
+          continue;
+        }
+        insertChild.run(
+          child,
+          childAuditTimestamp,
+          childTransportHash,
+          childEntryUuid,
+          Number(sourceRow.schema_version || 1),
+          sourceRow.chips_json,
+        );
+        result.inserted += 1;
+      }
+      return result;
+    });
+    return clone();
   }
 
   logAIPromptCall(call) {

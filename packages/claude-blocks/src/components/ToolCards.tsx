@@ -14,7 +14,7 @@ import { DiffView } from './DiffView';
 import { TerminalIcon, FileTextIcon, FileEditIcon, toolIcon } from '../icons';
 import {
   detectLanguage, lineDiff, countDiffStats, resultToText, toolStatusFrom,
-  type DiffEntry, type ToolStatus,
+  type DiffEntry, type DiffHunk, type ToolStatus,
 } from '../helpers';
 
 /** Collapse-пропы, общие для всех карточек (потребитель внедряет персист). */
@@ -82,14 +82,17 @@ const ReadCard: React.FC<{ args: Record<string, any>; result: any; status: ToolS
 };
 
 // ---- Edit / Write / MultiEdit ----
-// `startLine` (1-based) lets the diff gutter show REAL file line numbers instead
-// of 1..N. Single edit only — for MultiEdit each hunk has its own offset that the
-// caller doesn't pass, so those stay hunk-relative.
-const EditCard: React.FC<{ toolName: string; args: Record<string, any>; status: ToolStatus; startLine?: number } & CollapseInjection> =
-({ toolName, args, status, startLine, ...collapse }) => {
+const EditCard: React.FC<{
+  toolName: string;
+  args: Record<string, any>;
+  status: ToolStatus;
+  startLine?: number;
+  diffHunks?: readonly DiffHunk[];
+} & CollapseInjection> =
+({ toolName, args, status, startLine, diffHunks, ...collapse }) => {
   const path: string = args.file_path || args.path || '';
   const lang = detectLanguage(path);
-  const diff: DiffEntry[] = React.useMemo(() => {
+  const fallbackDiff: DiffEntry[] = React.useMemo(() => {
     if (toolName === 'Write') {
       const content = (args.content || '') as string;
       return content ? content.split('\n').map(line => ({ tag: 'add' as const, line })) : [];
@@ -107,6 +110,12 @@ const EditCard: React.FC<{ toolName: string; args: Record<string, any>; status: 
     }
     return lineDiff(args.old_string || '', args.new_string || '');
   }, [toolName, args]);
+  const canonicalHunks = Array.isArray(diffHunks) && diffHunks.length > 0
+    ? diffHunks
+    : null;
+  const diff = canonicalHunks
+    ? canonicalHunks.flatMap(hunk => hunk.entries)
+    : fallbackDiff;
 
   const { added, removed } = countDiffStats(diff);
   const verb = toolName === 'Write' ? 'Write' : toolName === 'MultiEdit' ? 'MultiEdit' : 'Update';
@@ -118,10 +127,30 @@ const EditCard: React.FC<{ toolName: string; args: Record<string, any>; status: 
     </span>
   ) : null;
   const preview = path ? <span>{path}</span> : <span className="cb-italic-dim">(no path)</span>;
-  // startLine applies to a single Edit hunk only. Write starts at line 1; for
-  // MultiEdit the per-hunk offsets aren't known here, so leave it relative.
-  const diffStart = toolName === 'Edit' ? startLine : (toolName === 'Write' ? 1 : undefined);
-  const body = diff.length > 0 ? <DiffView entries={diff} language={lang} startLine={diffStart} /> : null;
+  const body = canonicalHunks ? (
+    <div className="cb-diff-hunks">
+      {canonicalHunks.map((hunk, index) => (
+        <div key={`${hunk.oldStart}:${hunk.newStart}:${index}`} style={{ marginTop: index > 0 ? 4 : 0 }}>
+          <DiffView
+            entries={hunk.entries}
+            language={lang}
+            oldStart={hunk.oldStart}
+            newStart={hunk.newStart}
+          />
+        </div>
+      ))}
+    </div>
+  ) : fallbackDiff.length > 0 ? (
+    <DiffView
+      entries={fallbackDiff}
+      language={lang}
+      startLine={toolName === 'Edit' ? startLine : (toolName === 'Write' ? 1 : undefined)}
+      unknownLineNumbers={
+        toolName === 'MultiEdit' ||
+        (toolName === 'Edit' && !(typeof startLine === 'number' && startLine > 0))
+      }
+    />
+  ) : null;
   return <ToolCard status={status} icon={<FileEditIcon size={13} />} label={verb} preview={preview} subtitle={subtitle} body={body} defaultOpen={true} {...collapse} />;
 };
 
@@ -155,19 +184,22 @@ export interface ToolCallProps {
    *  line numbers. The host computes it (it knows where old_string matched);
    *  the package can't recover it after the edit. Omit → gutter is 1..N. */
   startLine?: number;
+  /** Canonical unified-diff hunks supplied by the transcript parser. Unlike
+   * `startLine`, each hunk keeps independent old/new coordinates. */
+  diffHunks?: readonly DiffHunk[];
   /** Gated call paused for the user (host shows approve/deny). Renders the amber
    *  triangle instead of the running spinner. */
   awaitingApproval?: boolean;
   collapse?: CollapseInjection;
 }
 
-export const ToolCallPart: React.FC<ToolCallProps> = ({ toolName, args, result, isError, startLine, awaitingApproval, collapse }) => {
+export const ToolCallPart: React.FC<ToolCallProps> = ({ toolName, args, result, isError, startLine, diffHunks, awaitingApproval, collapse }) => {
   const status = toolStatusFrom(result, isError, awaitingApproval);
   const inj = collapse || {};
   if (toolName === 'Bash') return <BashCard args={args} result={result} status={status} {...inj} />;
   if (toolName === 'Read') return <ReadCard args={args} result={result} status={status} {...inj} />;
   if (toolName === 'Edit' || toolName === 'Write' || toolName === 'MultiEdit') {
-    return <EditCard toolName={toolName} args={args} status={status} startLine={startLine} {...inj} />;
+    return <EditCard toolName={toolName} args={args} status={status} startLine={startLine} diffHunks={diffHunks} {...inj} />;
   }
   return <GenericToolCard toolName={toolName} args={args} result={result} status={status} {...inj} />;
 };

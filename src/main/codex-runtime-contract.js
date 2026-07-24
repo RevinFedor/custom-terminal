@@ -15,6 +15,23 @@ function shouldClearCodexLaunchPending(currentLaunchId, expectedLaunchId = null)
   return !expectedLaunchId || currentLaunchId === expectedLaunchId;
 }
 
+function advanceOscCommandGeneration({
+  runSeq = 0,
+  preclaimedRunSeq = null,
+  sameTerminal = false,
+  sameLaunch = false,
+} = {}) {
+  const current = Number(runSeq) || 0;
+  const exactPreclaim = Number.isInteger(Number(preclaimedRunSeq))
+    && Number(preclaimedRunSeq) === current
+    && sameTerminal === true
+    && sameLaunch === true;
+  return {
+    runSeq: exactPreclaim ? current : current + 1,
+    consumed: exactPreclaim,
+  };
+}
+
 function createCodexLaunchPendingResult({
   launchId,
   tabId,
@@ -465,6 +482,7 @@ function isCodexComposerReadyForGuardedSend(status) {
 }
 
 module.exports = {
+  advanceOscCommandGeneration,
   attachCodexSettingsProofOwner,
   codexSessionIdFromAuthoritativeStatus,
   consumePendingCodexSettingsProofHandoff,

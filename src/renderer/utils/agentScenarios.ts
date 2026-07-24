@@ -22,6 +22,16 @@ export interface SendAgentPromptScenarioArgs {
   model?: string;
   effort?: string;
   returnDraftOnConflict?: boolean;
+  presentationSnapshot?: {
+    historySessionId?: string | null;
+    promptChips?: Array<{
+      id?: string;
+      kind: 'prompt';
+      label?: string;
+      text: string;
+      sourceKey?: string;
+    }>;
+  };
 }
 
 const normalizeStatus = (value: unknown): AgentPtyStatus | undefined => {
@@ -44,6 +54,7 @@ export async function sendAgentPromptScenario({
   model,
   effort,
   returnDraftOnConflict,
+  presentationSnapshot,
 }: SendAgentPromptScenarioArgs): Promise<any> {
   const requestedStatusForSend = normalizeStatus(statusAtSend);
   const statusForSend = await ensureAgentReadyForSend({
@@ -119,6 +130,7 @@ export async function sendAgentPromptScenario({
     queue: queue === true,
     model: typeof model === 'string' ? model : undefined,
     effort: typeof effort === 'string' ? effort : undefined,
+    presentationSnapshot,
   });
   return {
     ...(result || {}),

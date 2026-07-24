@@ -102,6 +102,30 @@ function reduceCodexTurnOutcomeSummary(summary, outcome) {
   return summary;
 }
 
+function projectCodexSuppressedCatchUpPublication(state) {
+  if (state?.catchUpPublicationsSuppressed !== true
+    || Number(state?.liveTurnEvents || 0) <= 0) {
+    return null;
+  }
+  const busy = state.busy === true;
+  const event = state.lastEventType || (busy ? 'task_started' : null);
+  const reason = state.lastOutcomeReason || event || (busy ? 'task_started' : 'catch-up-idle');
+  return {
+    busy,
+    reason,
+    outcome: {
+      event,
+      busy,
+      reason,
+      hasFinalResult: typeof state.lastOutcomeHasFinalResult === 'boolean'
+        ? state.lastOutcomeHasFinalResult
+        : null,
+    },
+    timestamp: state.lastEventTs || null,
+    turnId: state.lastOutcomeTurnId || state.currentTurnId || null,
+  };
+}
+
 module.exports = {
   CODEX_NO_FINAL_RESULT_REASON,
   classifyCodexTurnRecord,
@@ -111,6 +135,7 @@ module.exports = {
   codexRootFinalAnswerText,
   hasNonEmptyCodexFinalResult,
   observeCodexTurnRecord,
+  projectCodexSuppressedCatchUpPublication,
   reduceCodexTurnOutcomeSummary,
   trackerHasFinalResultForEvent,
 };

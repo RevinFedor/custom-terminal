@@ -23,6 +23,11 @@ export function detectLanguage(filePath: string | undefined): string {
 }
 
 export type DiffEntry = { tag: 'eq' | 'add' | 'del'; line: string };
+export type DiffHunk = {
+  oldStart: number;
+  newStart: number;
+  entries: DiffEntry[];
+};
 
 /** A DiffEntry with resolved unified-diff gutter numbers. `oldNo` is the line's
  *  number in the OLD file (set on eq/del), `newNo` in the NEW file (set on

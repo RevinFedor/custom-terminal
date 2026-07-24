@@ -66,3 +66,42 @@ export function clampFloatingPanelTop(anchorTop, panelHeight, viewportHeight, ma
   const maxTop = Math.max(minTop, safeViewportHeight - safeMargin - safePanelHeight);
   return Math.min(Math.max(Number(anchorTop) || 0, minTop), maxTop);
 }
+
+export function captureHistoryMenuAnchor({
+  pointerX,
+  pointerY,
+  composerTop,
+} = {}) {
+  const x = Number.isFinite(Number(pointerX)) ? Number(pointerX) : 0;
+  const y = Number.isFinite(Number(pointerY)) ? Number(pointerY) : 0;
+  if (typeof composerTop === 'number' && Number.isFinite(composerTop)) {
+    return { mode: 'history-composer', x, y: composerTop };
+  }
+  return { mode: 'point', x, y };
+}
+
+/**
+ * Chooses the horizontal direction for the entire context-menu chain once,
+ * when the root opens. `descendantWidth` is the maximum width of every panel
+ * after the root, so later hover changes cannot make the chain flip sides.
+ */
+export function chooseContextMenuOpenLeft({
+  anchorX,
+  viewportWidth,
+  rootWidth,
+  descendantWidth,
+  margin = 8,
+} = {}) {
+  const safeMargin = Math.max(0, Number(margin) || 0);
+  const safeViewport = Math.max(0, Number(viewportWidth) || 0);
+  const safeRoot = Math.max(0, Number(rootWidth) || 0);
+  const safeDescendants = Math.max(0, Number(descendantWidth) || 0);
+  const maxRootLeft = Math.max(safeMargin, safeViewport - safeMargin - safeRoot);
+  const rootLeft = Math.min(
+    Math.max((Number(anchorX) || 0) + 2, safeMargin),
+    maxRootLeft,
+  );
+  const spaceRight = safeViewport - (rootLeft + safeRoot) - safeMargin;
+  const spaceLeft = rootLeft - safeMargin;
+  return spaceRight < safeDescendants && spaceLeft > spaceRight;
+}

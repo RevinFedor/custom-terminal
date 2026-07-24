@@ -5,7 +5,8 @@
  * - keeps the original immutable-by-contract arrays (no second full clone);
  * - estimates memory without JSON.stringify;
  * - bounds the normal LRU by bytes, total row count, and owner count;
- * - retains exactly one latest oversized snapshot outside that normal budget;
+ * - retains the two latest practically-sized oversized snapshots in a separate
+ *   byte-bounded LRU, so A → B → A does not reload two large sessions;
  * - keys by every owner dimension that can select a different transcript.
  */
 
@@ -36,19 +37,31 @@ export interface HistorySnapshotInput<TEntry> {
   claudeMemoryBoundaryUuid?: string | null;
   revision?: HistoryDurableRevision | null;
   capturedAt?: number;
+  /**
+   * Approximate retained bytes for `entries`, calculated by the caller with a
+   * bounded-time estimator. Supplying this prevents cache insertion from
+   * walking an already projected multi-megabyte History graph a second time.
+   */
+  entriesApproxBytesHint?: number;
 }
 
 export interface HistorySnapshotCacheLimits {
   maxBytes: number;
   maxEntries: number;
   maxSnapshots: number;
+  /**
+   * Oversized snapshots live outside the normal LRU because one large History
+   * can exceed its whole budget. The separate pool is still hard bounded.
+   */
+  maxOversizedBytes?: number;
+  maxOversizedSnapshots?: number;
 }
 
 export interface HistorySnapshotCacheStats {
   snapshots: number;
   totalEntries: number;
   approxBytes: number;
-  /** Normal LRU first, then the protected oversized owner when present. */
+  /** Normal LRU first, then the oversized LRU; both are least-recent first. */
   keys: readonly string[];
 }
 
@@ -108,6 +121,10 @@ export const DEFAULT_HISTORY_SNAPSHOT_CACHE_LIMITS: Readonly<HistorySnapshotCach
   maxBytes: 64 * 1024 * 1024,
   maxEntries: 40_000,
   maxSnapshots: 8,
+  // Production histories observed around 67 MiB each. This keeps the last two
+  // with headroom while preventing an unbounded chain of large owner graphs.
+  maxOversizedBytes: 160 * 1024 * 1024,
+  maxOversizedSnapshots: 2,
 });
 
 export const DEFAULT_HISTORY_VOLATILE_OVERLAY_CACHE_LIMITS:
@@ -264,6 +281,50 @@ export const estimateHistoryValueBytes = (
   return bytes;
 };
 
+const FAST_HISTORY_SAMPLE_LIMIT = 64;
+const FAST_HISTORY_SAMPLE_BYTES = 256 * 1024;
+
+/**
+ * Bounded-time estimate for a large History entry array.
+ *
+ * Cache entries retain the caller's existing array by reference, so this
+ * number is accounting rather than an allocation measurement. A stratified
+ * sample keeps insertion cost independent of transcript size while still
+ * seeing rows from the beginning, middle and tail instead of assuming every
+ * row looks like the latest one.
+ */
+export const estimateHistoryEntriesBytesFast = (
+  entries: readonly unknown[],
+): number => {
+  const length = entries.length;
+  if (length === 0) return ARRAY_OVERHEAD_BYTES;
+  if (length <= FAST_HISTORY_SAMPLE_LIMIT) {
+    return estimateHistoryValueBytes(entries);
+  }
+
+  let sampledBytes = 0;
+  let sampled = 0;
+  let previousIndex = -1;
+  for (let sample = 0; sample < FAST_HISTORY_SAMPLE_LIMIT; sample += 1) {
+    const index = Math.floor(
+      sample * (length - 1) / (FAST_HISTORY_SAMPLE_LIMIT - 1),
+    );
+    if (index === previousIndex) continue;
+    previousIndex = index;
+    sampledBytes += estimateHistoryValueBytes(
+      entries[index],
+      FAST_HISTORY_SAMPLE_BYTES,
+    );
+    sampled += 1;
+  }
+
+  const averageEntryBytes = sampled > 0 ? sampledBytes / sampled : 0;
+  return Math.max(
+    ARRAY_OVERHEAD_BYTES + length * 8,
+    Math.ceil(ARRAY_OVERHEAD_BYTES + length * 8 + averageEntryBytes * length),
+  );
+};
+
 interface CacheRecord {
   owner: Readonly<HistorySnapshotOwner>;
   snapshot: Readonly<HistorySnapshot<unknown>>;
@@ -276,24 +337,52 @@ const assertPositiveLimit = (name: keyof HistorySnapshotCacheLimits, value: numb
   }
 };
 
+interface ResolvedHistorySnapshotCacheLimits {
+  maxBytes: number;
+  maxEntries: number;
+  maxSnapshots: number;
+  maxOversizedBytes: number;
+  maxOversizedSnapshots: number;
+}
+
 export class HistorySnapshotCache {
-  private readonly limits: Readonly<HistorySnapshotCacheLimits>;
+  private readonly limits: Readonly<ResolvedHistorySnapshotCacheLimits>;
   private readonly records = new Map<string, CacheRecord>();
-  private oversizedRecord: { key: string; record: CacheRecord } | null = null;
+  private readonly oversizedRecords = new Map<string, CacheRecord>();
   private boundedEntries = 0;
   private boundedBytes = 0;
+  private oversizedEntries = 0;
+  private oversizedBytes = 0;
 
   constructor(limits: HistorySnapshotCacheLimits = DEFAULT_HISTORY_SNAPSHOT_CACHE_LIMITS) {
     assertPositiveLimit('maxBytes', limits.maxBytes);
     assertPositiveLimit('maxEntries', limits.maxEntries);
     assertPositiveLimit('maxSnapshots', limits.maxSnapshots);
-    this.limits = Object.freeze({ ...limits });
+    const maxOversizedBytes =
+      limits.maxOversizedBytes
+      ?? DEFAULT_HISTORY_SNAPSHOT_CACHE_LIMITS.maxOversizedBytes!;
+    const maxOversizedSnapshots =
+      limits.maxOversizedSnapshots
+      ?? DEFAULT_HISTORY_SNAPSHOT_CACHE_LIMITS.maxOversizedSnapshots!;
+    assertPositiveLimit('maxOversizedBytes', maxOversizedBytes);
+    assertPositiveLimit('maxOversizedSnapshots', maxOversizedSnapshots);
+    if (maxOversizedBytes < limits.maxBytes) {
+      throw new RangeError('maxOversizedBytes must be greater than or equal to maxBytes');
+    }
+    this.limits = Object.freeze({
+      ...limits,
+      maxOversizedBytes,
+      maxOversizedSnapshots,
+    });
   }
 
   get<TEntry = unknown>(owner: HistorySnapshotOwner): Readonly<HistorySnapshot<TEntry>> | undefined {
     const key = makeHistorySnapshotKey(owner);
-    if (this.oversizedRecord?.key === key) {
-      return this.oversizedRecord.record.snapshot as Readonly<HistorySnapshot<TEntry>>;
+    const oversizedRecord = this.oversizedRecords.get(key);
+    if (oversizedRecord) {
+      this.oversizedRecords.delete(key);
+      this.oversizedRecords.set(key, oversizedRecord);
+      return oversizedRecord.snapshot as Readonly<HistorySnapshot<TEntry>>;
     }
     const record = this.records.get(key);
     if (!record) return undefined;
@@ -306,9 +395,8 @@ export class HistorySnapshotCache {
 
   peek<TEntry = unknown>(owner: HistorySnapshotOwner): Readonly<HistorySnapshot<TEntry>> | undefined {
     const key = makeHistorySnapshotKey(owner);
-    if (this.oversizedRecord?.key === key) {
-      return this.oversizedRecord.record.snapshot as Readonly<HistorySnapshot<TEntry>>;
-    }
+    const oversizedRecord = this.oversizedRecords.get(key);
+    if (oversizedRecord) return oversizedRecord.snapshot as Readonly<HistorySnapshot<TEntry>>;
     return this.records.get(key)?.snapshot as
       | Readonly<HistorySnapshot<TEntry>>
       | undefined;
@@ -323,16 +411,19 @@ export class HistorySnapshotCache {
     revision: HistoryDurableRevision | null,
   ): Readonly<HistorySnapshot<TEntry>> | undefined {
     const key = makeHistorySnapshotKey(owner);
-    const isOversized = this.oversizedRecord?.key === key;
+    const isOversized = this.oversizedRecords.has(key);
     const record = isOversized
-      ? this.oversizedRecord?.record
+      ? this.oversizedRecords.get(key)
       : this.records.get(key);
     if (!record) return undefined;
     if (!revisionsEqual(record.snapshot.revision, revision)) {
       this.deleteKey(key);
       return undefined;
     }
-    if (!isOversized) {
+    if (isOversized) {
+      this.oversizedRecords.delete(key);
+      this.oversizedRecords.set(key, record);
+    } else {
       this.records.delete(key);
       this.records.set(key, record);
     }
@@ -355,9 +446,22 @@ export class HistorySnapshotCache {
       + stringBytes(key)
       + stringBytes(input.claudeMemoryBoundaryUuid || '')
       + estimateHistoryValueBytes(input.revision || '');
+    if (
+      input.entriesApproxBytesHint !== undefined &&
+      (!Number.isSafeInteger(input.entriesApproxBytesHint) ||
+        input.entriesApproxBytesHint < 0)
+    ) {
+      throw new RangeError('entriesApproxBytesHint must be a non-negative safe integer');
+    }
+    const entriesApproxBytes =
+      input.entriesApproxBytesHint ??
+      estimateHistoryValueBytes(
+        input.entries,
+        this.limits.maxOversizedBytes - metadataBytes,
+      );
     const approxBytes =
       metadataBytes
-      + estimateHistoryValueBytes(input.entries, this.limits.maxBytes - metadataBytes);
+      + entriesApproxBytes;
     const snapshot = Object.freeze({
       entries: input.entries as readonly unknown[],
       claudeMemoryBoundaryUuid: input.claudeMemoryBoundaryUuid || null,
@@ -371,18 +475,35 @@ export class HistorySnapshotCache {
       approxBytes > this.limits.maxBytes;
 
     if (isOversized) {
+      if (approxBytes > this.limits.maxOversizedBytes) {
+        const invalidatedExisting = this.deleteKey(key);
+        return {
+          stored: false,
+          reason: 'snapshot-too-large',
+          approxBytes,
+          evictedKeys: [],
+          invalidatedExisting,
+        };
+      }
+
       const evictedKeys: string[] = [];
       if (this.records.has(key)) this.deleteBoundedKey(key);
-      if (this.oversizedRecord) {
-        if (this.oversizedRecord.key !== key) {
-          evictedKeys.push(this.oversizedRecord.key);
-        }
-        this.oversizedRecord = null;
-      }
+      if (this.oversizedRecords.has(key)) this.deleteOversizedKey(key);
       // This is the same immutable-by-contract array received from the caller.
-      // Keeping one pointer avoids a permanent cache miss without cloning an
-      // arbitrarily large History graph or allowing oversized owners to grow.
-      this.oversizedRecord = { key, record };
+      // Keeping pointers avoids clones. The separate count + byte LRU retains
+      // the two most useful recent owners without allowing the pool to grow.
+      this.oversizedRecords.set(key, record);
+      this.oversizedEntries += entryCount;
+      this.oversizedBytes += approxBytes;
+      while (
+        this.oversizedRecords.size > this.limits.maxOversizedSnapshots
+        || this.oversizedBytes > this.limits.maxOversizedBytes
+      ) {
+        const lruKey = this.oversizedRecords.keys().next().value as string | undefined;
+        if (!lruKey) break;
+        this.deleteOversizedKey(lruKey);
+        evictedKeys.push(lruKey);
+      }
       return {
         stored: true,
         approxBytes,
@@ -391,7 +512,7 @@ export class HistorySnapshotCache {
       };
     }
 
-    if (this.oversizedRecord?.key === key) this.oversizedRecord = null;
+    if (this.oversizedRecords.has(key)) this.deleteOversizedKey(key);
     if (this.records.has(key)) this.deleteBoundedKey(key);
 
     this.records.set(key, record);
@@ -446,11 +567,8 @@ export class HistorySnapshotCache {
     for (const [key, record] of this.records) {
       if (predicate(record.owner, record.snapshot)) keys.push(key);
     }
-    if (
-      this.oversizedRecord &&
-      predicate(this.oversizedRecord.record.owner, this.oversizedRecord.record.snapshot)
-    ) {
-      keys.push(this.oversizedRecord.key);
+    for (const [key, record] of this.oversizedRecords) {
+      if (predicate(record.owner, record.snapshot)) keys.push(key);
     }
     for (const key of keys) this.deleteKey(key);
     return keys.length;
@@ -458,35 +576,43 @@ export class HistorySnapshotCache {
 
   clear(): void {
     this.records.clear();
-    this.oversizedRecord = null;
+    this.oversizedRecords.clear();
     this.boundedEntries = 0;
     this.boundedBytes = 0;
+    this.oversizedEntries = 0;
+    this.oversizedBytes = 0;
   }
 
   stats(): Readonly<HistorySnapshotCacheStats> {
-    const oversizedEntries = this.oversizedRecord?.record.snapshot.entries.length || 0;
-    const oversizedBytes = this.oversizedRecord?.record.approxBytes || 0;
     return Object.freeze({
-      snapshots: this.records.size + (this.oversizedRecord ? 1 : 0),
-      totalEntries: this.boundedEntries + oversizedEntries,
-      approxBytes: this.boundedBytes + oversizedBytes,
+      snapshots: this.records.size + this.oversizedRecords.size,
+      totalEntries: this.boundedEntries + this.oversizedEntries,
+      approxBytes: this.boundedBytes + this.oversizedBytes,
       keys: Object.freeze([
         ...this.records.keys(),
-        ...(this.oversizedRecord ? [this.oversizedRecord.key] : []),
+        ...this.oversizedRecords.keys(),
       ]),
     });
   }
 
   private hasKey(key: string): boolean {
-    return this.oversizedRecord?.key === key || this.records.has(key);
+    return this.oversizedRecords.has(key) || this.records.has(key);
   }
 
   private deleteKey(key: string): boolean {
-    if (this.oversizedRecord?.key === key) {
-      this.oversizedRecord = null;
-      return true;
-    }
+    if (this.oversizedRecords.has(key)) return this.deleteOversizedKey(key);
     return this.deleteBoundedKey(key);
+  }
+
+  private deleteOversizedKey(key: string): boolean {
+    const record = this.oversizedRecords.get(key);
+    if (!record) return false;
+    this.oversizedRecords.delete(key);
+    this.oversizedEntries -= record.snapshot.entries.length;
+    this.oversizedBytes -= record.approxBytes;
+    if (this.oversizedEntries < 0) this.oversizedEntries = 0;
+    if (this.oversizedBytes < 0) this.oversizedBytes = 0;
+    return true;
   }
 
   private deleteBoundedKey(key: string): boolean {

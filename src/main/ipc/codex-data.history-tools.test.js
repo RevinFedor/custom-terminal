@@ -3,20 +3,30 @@ const assert = require('node:assert/strict');
 
 const { _api } = require('./codex-data');
 
-function historyFor(...payloads) {
+function historyFor(...items) {
   const records = [
     {
       __line: 1,
       type: 'event_msg',
       payload: { type: 'user_message', message: 'inspect tools' },
     },
-    ...payloads.map((payload, index) => ({
-      __line: index + 2,
-      type: 'response_item',
-      payload,
-    })),
+    ...items.map((item, index) => item?.recordType
+      ? {
+          __line: index + 2,
+          type: item.recordType,
+          payload: item.payload,
+        }
+      : {
+          __line: index + 2,
+          type: 'response_item',
+          payload: item,
+        }),
   ];
   return _api.buildCodexFullHistory(records, 'history-tools-session');
+}
+
+function historyRecord(recordType, payload) {
+  return { recordType, payload };
 }
 
 function execCall(callId, source) {
@@ -154,4 +164,316 @@ test('keeps a tool card uuid stable when its output arrives', () => {
   assert.ok(completedCard);
   assert.equal(completedCard.uuid, pendingCard.uuid);
   assert.equal(completedCard.actions[0].rawTool.result, 'done');
+});
+
+test('uses canonical patch_apply_end diff content and original line numbers', () => {
+  const patchText = [
+    '*** Begin Patch',
+    '*** Update File: /tmp/session-transcript-service.revision.test.js',
+    '@@',
+    "test('Codex history returns unchanged before loading or projecting records', async (t) => {",
+    '@@',
+    '  assert.equal(loadCalls, 2);',
+    '  assert.equal(projectionCalls, 2);',
+    '});',
+    '+',
+    "+test('a transcript change received during an active read gets one trailing read', async () => {",
+    '+});',
+    '*** End Patch',
+  ].join('\n');
+  const turnId = 'turn-direct-patch';
+  const history = historyFor(
+    {
+      type: 'custom_tool_call',
+      name: 'apply_patch',
+      call_id: 'patch-direct',
+      input: patchText,
+      internal_chat_message_metadata_passthrough: { turn_id: turnId },
+    },
+    historyRecord('event_msg', {
+      type: 'patch_apply_end',
+      call_id: 'patch-direct',
+      turn_id: turnId,
+      success: true,
+      changes: {
+        '/tmp/session-transcript-service.revision.test.js': {
+          type: 'update',
+          unified_diff: [
+            '@@ -84 +84,4 @@',
+            ' });',
+            '+',
+            "+test('a transcript change received during an active read gets one trailing read', async () => {",
+            '+});',
+          ].join('\n'),
+          move_path: null,
+        },
+      },
+    }),
+    output('patch-direct', 'Success'),
+  );
+
+  const actions = rawActions(history);
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].toolName, 'Edit');
+  assert.equal(actions[0].args.old_string, '});');
+  assert.equal(
+    actions[0].args.new_string,
+    "});\n\ntest('a transcript change received during an active read gets one trailing read', async () => {\n});",
+  );
+  assert.equal(actions[0].args.new_string.includes('assert.equal(loadCalls'), false);
+  assert.deepEqual(actions[0].diffHunks, [{
+    oldStart: 84,
+    newStart: 84,
+    entries: [
+      { tag: 'eq', line: '});' },
+      { tag: 'add', line: '' },
+      { tag: 'add', line: "test('a transcript change received during an active read gets one trailing read', async () => {" },
+      { tag: 'add', line: '});' },
+    ],
+  }]);
+});
+
+test('associates a nested exec patch event by interval, turn and exact touched path', () => {
+  const patchText = [
+    '*** Begin Patch',
+    '*** Update File: src/main.js',
+    '@@',
+    '-const before = true;',
+    '+const before = false;',
+    '*** End Patch',
+  ].join('\n');
+  const source = [
+    `const patch = ${JSON.stringify(patchText)};`,
+    'const result = await tools.apply_patch(patch);',
+    'text(result);',
+  ].join('\n');
+  const turnId = 'turn-nested-patch';
+  const records = [
+    {
+      __line: 1,
+      type: 'session_meta',
+      payload: { cwd: '/tmp/project' },
+    },
+    {
+      __line: 2,
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'edit' },
+    },
+    {
+      __line: 3,
+      type: 'response_item',
+      payload: {
+        ...execCall('outer-exec', source),
+        internal_chat_message_metadata_passthrough: { turn_id: turnId },
+      },
+    },
+    {
+      __line: 4,
+      type: 'event_msg',
+      payload: {
+        type: 'patch_apply_end',
+        call_id: 'exec-generated-inner-id',
+        turn_id: turnId,
+        success: true,
+        changes: {
+          '/tmp/project/src/main.js': {
+            type: 'update',
+            unified_diff: '@@ -30 +30 @@\n-const before = true;\n+const before = false;',
+            move_path: null,
+          },
+        },
+      },
+    },
+    {
+      __line: 5,
+      type: 'response_item',
+      payload: output('outer-exec', '{}'),
+    },
+  ];
+  const history = _api.buildCodexFullHistory(records, 'history-tools-session');
+
+  const actions = rawActions(history);
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].toolName, 'Edit');
+  assert.equal(actions[0].args.file_path, '/tmp/project/src/main.js');
+  assert.deepEqual(actions[0].diffHunks, [{
+    oldStart: 30,
+    newStart: 30,
+    entries: [
+      { tag: 'del', line: 'const before = true;' },
+      { tag: 'add', line: 'const before = false;' },
+    ],
+  }]);
+});
+
+test('preserves separate old/new starts for every canonical multi-hunk update', () => {
+  const parsed = _api.parseCodexPatchApplyChanges({
+    type: 'patch_apply_end',
+    success: true,
+    changes: {
+      '/tmp/view.swift': {
+        type: 'update',
+        unified_diff: [
+          '@@ -609,2 +609,5 @@',
+          ' line-a',
+          '+insert-a',
+          '+insert-b',
+          '+insert-c',
+          ' line-b',
+          '@@ -613,5 +616,2 @@',
+          ' keep-a',
+          '-remove-a',
+          '-remove-b',
+          '-remove-c',
+          ' keep-b',
+        ].join('\n'),
+        move_path: null,
+      },
+    },
+  });
+
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].toolName, 'MultiEdit');
+  assert.deepEqual(
+    parsed[0].diffHunks.map(({ oldStart, newStart }) => ({ oldStart, newStart })),
+    [
+      { oldStart: 609, newStart: 609 },
+      { oldStart: 613, newStart: 616 },
+    ],
+  );
+});
+
+test('malformed result metadata falls back without inventing diff line numbers', () => {
+  const patchText = [
+    '*** Begin Patch',
+    '*** Update File: /tmp/file.js',
+    '@@',
+    '-old',
+    '+new',
+    '*** End Patch',
+  ].join('\n');
+  const history = historyFor(
+    {
+      type: 'custom_tool_call',
+      name: 'apply_patch',
+      call_id: 'patch-malformed',
+      input: patchText,
+    },
+    historyRecord('event_msg', {
+      type: 'patch_apply_end',
+      call_id: 'patch-malformed',
+      success: true,
+      changes: {
+        '/tmp/file.js': {
+          type: 'update',
+          // Header claims two old rows, but only one is present.
+          unified_diff: '@@ -10,2 +10 @@\n-old\n+new',
+        },
+      },
+    }),
+    output('patch-malformed', 'Success'),
+  );
+
+  const actions = rawActions(history);
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].toolName, 'Edit');
+  assert.equal(actions[0].args.old_string, 'old');
+  assert.equal(actions[0].diffHunks, undefined);
+});
+
+test('patch metadata enriches a pending card without changing its UUID', () => {
+  const patchText = [
+    '*** Begin Patch',
+    '*** Update File: /tmp/file.js',
+    '@@',
+    '-old',
+    '+new',
+    '*** End Patch',
+  ].join('\n');
+  const call = {
+    type: 'custom_tool_call',
+    name: 'apply_patch',
+    call_id: 'patch-live',
+    input: patchText,
+  };
+  const pending = historyFor(call);
+  const enriched = historyFor(
+    call,
+    historyRecord('event_msg', {
+      type: 'patch_apply_end',
+      call_id: 'patch-live',
+      success: true,
+      changes: {
+        '/tmp/file.js': {
+          type: 'update',
+          unified_diff: '@@ -22 +22 @@\n-old\n+new',
+        },
+      },
+    }),
+  );
+
+  const pendingCard = pending.find((entry) => entry.actions?.length);
+  const enrichedCard = enriched.find((entry) => entry.actions?.length);
+  assert.equal(enrichedCard.uuid, pendingCard.uuid);
+  assert.equal(pendingCard.actions[0].rawTool.diffHunks, undefined);
+  assert.equal(enrichedCard.actions[0].rawTool.diffHunks[0].oldStart, 22);
+});
+
+test('nested patch association fails closed when two pending exec calls touch the same path', () => {
+  const patchText = [
+    '*** Begin Patch',
+    '*** Update File: src/same.js',
+    '@@',
+    '-old',
+    '+new',
+    '*** End Patch',
+  ].join('\n');
+  const source = [
+    `const patch = ${JSON.stringify(patchText)};`,
+    'const result = await tools.apply_patch(patch);',
+    'text(result);',
+  ].join('\n');
+  const turnId = 'turn-ambiguous';
+  const records = [
+    { __line: 1, type: 'session_meta', payload: { cwd: '/tmp/project' } },
+    { __line: 2, type: 'event_msg', payload: { type: 'user_message', message: 'edit twice' } },
+    {
+      __line: 3,
+      type: 'response_item',
+      payload: {
+        ...execCall('outer-a', source),
+        internal_chat_message_metadata_passthrough: { turn_id: turnId },
+      },
+    },
+    {
+      __line: 4,
+      type: 'response_item',
+      payload: {
+        ...execCall('outer-b', source),
+        internal_chat_message_metadata_passthrough: { turn_id: turnId },
+      },
+    },
+    {
+      __line: 5,
+      type: 'event_msg',
+      payload: {
+        type: 'patch_apply_end',
+        call_id: 'exec-generated-inner-id',
+        turn_id: turnId,
+        success: true,
+        changes: {
+          '/tmp/project/src/same.js': {
+            type: 'update',
+            unified_diff: '@@ -70 +70 @@\n-old\n+new',
+          },
+        },
+      },
+    },
+    { __line: 6, type: 'response_item', payload: output('outer-a', '{}') },
+    { __line: 7, type: 'response_item', payload: output('outer-b', '{}') },
+  ];
+
+  const actions = rawActions(_api.buildCodexFullHistory(records, 'history-tools-session'));
+  assert.equal(actions.length, 2);
+  assert.equal(actions.every((action) => action.diffHunks === undefined), true);
 });

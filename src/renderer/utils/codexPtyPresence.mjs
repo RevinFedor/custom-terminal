@@ -32,6 +32,29 @@ const CODEX_PTY_STATUSES = new Set([
 const hasOwn = (value, field) => Object.prototype.hasOwnProperty.call(value, field);
 
 /**
+ * Main owns the proof-kind taxonomy. Renderer actions must consume the
+ * mutation-safe verdict from the same atomic runtime snapshot instead of
+ * duplicating a list of proof kinds: a settled native-Rewind writer is just as
+ * authoritative as the initial process-open-rollout proof.
+ */
+export function isCodexRuntimeWriterUsable(runtimeSnapshot, {
+  requireCopy = false,
+} = {}) {
+  const provenWriterSessionId = typeof runtimeSnapshot?.provenWriterSessionId === 'string'
+    ? runtimeSnapshot.provenWriterSessionId.trim()
+    : '';
+  const writerProof = typeof runtimeSnapshot?.writerProof === 'string'
+    ? runtimeSnapshot.writerProof.trim()
+    : '';
+  return runtimeSnapshot?.writerConfirmed === true
+    && runtimeSnapshot?.writerStatus === 'adopted'
+    && runtimeSnapshot?.writerUsableForMutation === true
+    && provenWriterSessionId.length > 0
+    && writerProof.length > 0
+    && (requireCopy !== true || runtimeSnapshot?.canCopySessionId === true);
+}
+
+/**
  * Presence must be projected from one main-owned lifecycle generation. Until
  * the runtime snapshot contains every field used by the UI, callers must not
  * fill the gaps with separate IPC reads: that recreates the split-generation

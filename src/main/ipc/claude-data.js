@@ -12,6 +12,9 @@ const {
   deriveConfirmedClaudeSettings,
   traceClaudeActiveBranch,
 } = require('../claude-confirmed-settings');
+const {
+  decorateHistoryPromptPresentations,
+} = require('../history-prompt-presentations');
 
 let _projectManager = null;
 let _getClaudeEditableLastPromptState = null;
@@ -1094,6 +1097,113 @@ function parseTimelineUuids(sourcePath) {
   }
 }
 
+function parseClaudeStructuredPatchHunks(structuredPatch) {
+  if (!Array.isArray(structuredPatch) || structuredPatch.length === 0) return null;
+  const hunks = [];
+  for (const rawHunk of structuredPatch) {
+    const oldStart = Number(rawHunk?.oldStart);
+    const newStart = Number(rawHunk?.newStart);
+    const oldLines = Number(rawHunk?.oldLines);
+    const newLines = Number(rawHunk?.newLines);
+    if (
+      !Number.isInteger(oldStart) || oldStart < 0
+      || !Number.isInteger(newStart) || newStart < 0
+      || !Number.isInteger(oldLines) || oldLines < 0
+      || !Number.isInteger(newLines) || newLines < 0
+      || !Array.isArray(rawHunk?.lines)
+    ) {
+      return null;
+    }
+    const entries = [];
+    for (const rawLine of rawHunk.lines) {
+      if (typeof rawLine !== 'string') return null;
+      if (rawLine === '\\ No newline at end of file') continue;
+      const prefix = rawLine[0];
+      if (prefix === ' ') entries.push({ tag: 'eq', line: rawLine.slice(1) });
+      else if (prefix === '+') entries.push({ tag: 'add', line: rawLine.slice(1) });
+      else if (prefix === '-') entries.push({ tag: 'del', line: rawLine.slice(1) });
+      else return null;
+    }
+    const actualOldLines = entries.reduce(
+      (count, item) => count + (item.tag === 'add' ? 0 : 1),
+      0,
+    );
+    const actualNewLines = entries.reduce(
+      (count, item) => count + (item.tag === 'del' ? 0 : 1),
+      0,
+    );
+    if (actualOldLines !== oldLines || actualNewLines !== newLines) return null;
+    hunks.push({ oldStart, newStart, entries });
+  }
+  return hunks;
+}
+
+function normalizeClaudeHistoryToolPath(filePath, cwd) {
+  const value = String(filePath || '').trim();
+  if (!value) return '';
+  return path.normalize(path.isAbsolute(value) ? value : path.resolve(cwd || process.cwd(), value));
+}
+
+function extractClaudeToolDiffHunks({
+  assistantEntry,
+  toolBlock,
+  resultEntry,
+  resultBlock,
+}) {
+  if (
+    !assistantEntry?.uuid
+    || !toolBlock?.id
+    || resultBlock?.tool_use_id !== toolBlock.id
+    || resultEntry?.sourceToolAssistantUUID !== assistantEntry.uuid
+  ) {
+    return null;
+  }
+  const resultBlocks = Array.isArray(resultEntry?.message?.content)
+    ? resultEntry.message.content.filter((item) => item?.type === 'tool_result')
+    : [];
+  // `toolUseResult` is top-level and has no per-block key. A batched user
+  // record is therefore ambiguous even when one inner tool_result id matches.
+  if (resultBlocks.length !== 1 || resultBlocks[0] !== resultBlock) return null;
+
+  const metadata = resultEntry.toolUseResult;
+  if (!metadata || typeof metadata !== 'object') return null;
+  const input = toolBlock.input && typeof toolBlock.input === 'object'
+    ? toolBlock.input
+    : {};
+  const expectedPath = normalizeClaudeHistoryToolPath(
+    input.file_path || input.path,
+    assistantEntry.cwd || resultEntry.cwd,
+  );
+  const actualPath = normalizeClaudeHistoryToolPath(
+    metadata.filePath || metadata.file?.filePath,
+    resultEntry.cwd || assistantEntry.cwd,
+  );
+  if (!expectedPath || expectedPath !== actualPath) return null;
+
+  if (
+    typeof metadata.oldString === 'string'
+    && typeof input.old_string === 'string'
+    && metadata.oldString !== input.old_string
+  ) return null;
+  if (
+    typeof metadata.newString === 'string'
+    && typeof input.new_string === 'string'
+    && metadata.newString !== input.new_string
+  ) return null;
+  if (
+    typeof metadata.content === 'string'
+    && typeof input.content === 'string'
+    && metadata.content !== input.content
+  ) return null;
+  if (
+    typeof metadata.replaceAll === 'boolean'
+    && typeof input.replace_all === 'boolean'
+    && metadata.replaceAll !== input.replace_all
+  ) return null;
+
+  return parseClaudeStructuredPatchHunks(metadata.structuredPatch);
+}
+
 // Programmatic API for handlers below. Populated by register() so that other
 // modules (HTTP routes in main.js, overseer MCP endpoints) can call the SAME
 // implementation that IPC uses, without going through ipcMain.
@@ -1103,6 +1213,8 @@ const _api = {
   editRange: null,         // ({sessionId, cwd, startUuid, endUuid, compactText}) → {success, removedCount, ...}
   deleteRange: null,       // ({sessionId, cwd, startUuid, endUuid}) → {success, removedCount, fileDeleted}
   getConfirmedSettings: null, // ({tabId, sessionId?, cwd?}) → active-branch model/effort proof
+  parseClaudeStructuredPatchHunks,
+  extractClaudeToolDiffHunks,
 };
 
 function _normalizePromptStatusText(text) {
@@ -3966,7 +4078,14 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
           };
         } catch {}
       }
-      const revisionContext = _claudeHistoryContext(editablePromptState, discovery);
+      const baseRevisionContext = _claudeHistoryContext(editablePromptState, discovery);
+      const presentationRevision = _projectManager?.db?.getHistoryPromptPresentationRevision
+        ? _projectManager.db.getHistoryPromptPresentationRevision('claude', sessionId)
+        : 'none';
+      const revisionContext = JSON.stringify({
+        base: baseRevisionContext,
+        promptPresentationRevision: presentationRevision,
+      });
 
       if (ifRevision && !promptStateLookupFailed) {
         const validation = await validateHistoryRevision(
@@ -3978,7 +4097,11 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
             validateTopology: (sources) => _validateClaudeHistoryTopology(sources, cwd),
           }
         );
-        if (validation.unchanged) {
+        const presentationStillCurrent =
+          !_projectManager?.db?.getHistoryPromptPresentationRevision
+          || _projectManager.db.getHistoryPromptPresentationRevision('claude', sessionId)
+            === presentationRevision;
+        if (validation.unchanged && presentationStillCurrent) {
           return {
             success: true,
             unchanged: true,
@@ -3995,12 +4118,6 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         queueOperations: allQueueOperations,
         historySources,
       } = await resolveSessionChain(sessionId, cwd);
-      const revision = buildHistoryRevision(
-        { toolType: 'claude', sessionId, cwd },
-        historySources,
-        { context: revisionContext }
-      );
-
       // Build progress entries index by parentToolUseID
       const progressByToolUseId = new Map();
       for (const pe of allProgressEntries) {
@@ -4010,6 +4127,11 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
       }
 
       if (!lastRecord) {
+        const revision = buildHistoryRevision(
+          { toolType: 'claude', sessionId, cwd },
+          historySources,
+          { context: revisionContext }
+        );
         return {
           success: true,
           entries: [],
@@ -4339,7 +4461,17 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
                         const rc = res.content;
                         const text = typeof rc === 'string' ? rc
                           : Array.isArray(rc) ? rc.filter(c => c.type === 'text').map(c => c.text).join('\n') : '';
-                        return { text, isError: !!res.is_error };
+                        const diffHunks = extractClaudeToolDiffHunks({
+                          assistantEntry: entry,
+                          toolBlock: block,
+                          resultEntry: nextEntry,
+                          resultBlock: res,
+                        });
+                        return {
+                          text,
+                          isError: !!res.is_error,
+                          diffHunks: diffHunks || undefined,
+                        };
                       }
                     }
                   }
@@ -4368,6 +4500,7 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
                       args: input,
                       result: rr ? rr.text : undefined,
                       isError: rr ? rr.isError : undefined,
+                      diffHunks: rr ? rr.diffHunks : undefined,
                     },
                   });
                 }
@@ -4445,10 +4578,29 @@ function register({ projectManager, formatToolAction, getClaudeEditableLastPromp
         }
       }
 
+      const presentedEntries = decorateHistoryPromptPresentations(_projectManager?.db, {
+        toolType: 'claude',
+        sessionId,
+        entries,
+      });
+      // A pending sidecar can become bound to an exact UUID while decorating.
+      // Return a revision that includes that final metadata state.
+      const finalPresentationRevision = _projectManager?.db?.getHistoryPromptPresentationRevision
+        ? _projectManager.db.getHistoryPromptPresentationRevision('claude', sessionId)
+        : 'none';
+      const finalRevisionContext = JSON.stringify({
+        base: baseRevisionContext,
+        promptPresentationRevision: finalPresentationRevision,
+      });
+      const revision = buildHistoryRevision(
+        { toolType: 'claude', sessionId, cwd },
+        historySources,
+        { context: finalRevisionContext }
+      );
       return {
         success: true,
         unchanged: false,
-        entries,
+        entries: presentedEntries,
         latestSessionId,
         claudeMemoryBoundaryUuid: _firstOrphanRecoveredFromUuid,
         editableLastPromptStatus,

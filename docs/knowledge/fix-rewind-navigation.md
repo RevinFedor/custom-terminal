@@ -5,6 +5,26 @@
 
 Проблема навигации по меню истории Claude Code (Rewind) и переход к "Visual Search".
 
+## Второй Codex Rewind терял writer после успешного handoff
+
+Пользовательский симптом: первый Rewind A→B проходил, но немедленный второй отвечал
+`Codex writer is not ready for Rewind`, хотя вкладка продолжала работать в B. Первый
+commit правильно менял SQLite binding и потреблял durable handoff journal, однако
+следующая generic-проверка снова видела A и B открытыми writable и требовала уже
+удалённый одноразовый journal. Просто доверять текущему binding опасно: sibling или
+чужой rollout тогда можно принять за продолжение ветки.
+
+Writer после commit доказывается отдельным settled proof только внутри того же
+PTY/run/action generation. Все остальные writable candidates обязаны быть
+доказанными предками выбранного child; новая ветка, append в source, Stop/relaunch
+или смена поколения инвалидируют proof. Ещё одна гонка была между observer и
+public reconciliation одного commit: второй callback приходил после удаления
+journal и отзывал уже доказанного writer. Теперь он принимается только как exact
+replay source+child+generation+terminal+run+SQLite binding; обычная последующая
+reconciliation наследует lineage из settled proof, а не перезаписывает её пустыми
+source/action. Направленный A→B→C подтвердил два последовательных Rewind без
+`writer not ready`.
+
 ## Актуальность после native `/rewind` flow (2026-06)
 
 Этот файл описывает safety/fallback-логику навигации, а не основной путь Timeline Rewind. Текущий default action в Timeline отправляет Claude slash-команду `/rewind`, выбирает target в родном picker'е, затем переносит восстановленный prompt из terminal composer в History textarea через тот же `grab-input` path, которым пользуется `+ clear`; terminal composer после этого должен остаться пустым. AI compact-варианты включаются только отдельными кнопками. Visual Search Strategy ниже остаётся защитой для ситуаций, когда позиционное сопоставление меню не сработало, но не должна снова становиться primary-моделью и не должна автоматически нажимать Enter при не найденной цели.

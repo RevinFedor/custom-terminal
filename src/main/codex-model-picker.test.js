@@ -375,6 +375,58 @@ test('Codex 0.145 headerless concrete-model picker is parsed from the visible cl
   assert.equal(isCodexPickerFrameComposer(frame), false);
 });
 
+test('headerless concrete-model picker needs no clipping hint when the complete footer block is visible', () => {
+  const frame = [
+    '1. gpt-5.6-sol (default) Latest frontier agentic coding model.',
+    '2. gpt-5.6-terra Balanced agentic coding model.',
+    '› 3. gpt-5.6-luna Fast agentic coding model.',
+    '',
+    'Press enter to confirm or esc to go back',
+    '',
+  ].join('\n');
+
+  const picker = parseCodexAllModelPicker(frame);
+  assert.deepEqual(
+    picker.items.map(item => item.value),
+    ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'],
+  );
+  assert.equal(picker.selectedIndex, 2);
+  assert.equal(isCodexActivePickerFrame(frame), true);
+  assert.equal(isCodexPickerFrameComposer(frame), false);
+});
+
+test('a strong headerless model block after a completed stale picker owns the newest footer', () => {
+  const frame = [
+    'Select Reasoning Level for stale-model',
+    '› 1. Medium',
+    '  2. High',
+    '',
+    'Press enter to confirm or esc to go back',
+    '',
+    '› 1. gpt-5.6-sol (default) Latest frontier agentic coding model.',
+    '  2. gpt-5.6-terra Balanced agentic coding model.',
+    '',
+    'Press enter to confirm or esc to go back',
+  ].join('\n');
+
+  assert.deepEqual(
+    parseCodexAllModelPicker(frame).items.map(item => item.value),
+    ['gpt-5.6-sol', 'gpt-5.6-terra'],
+  );
+  assert.equal(parseCodexStandardEffortPicker(frame).items.length, 0);
+});
+
+test('one concrete row cannot turn a generic headerless confirmation into a model picker', () => {
+  const frame = [
+    '› 1. gpt-5.6-sol',
+    '',
+    'Press enter to confirm or esc to go back',
+  ].join('\n');
+
+  assert.equal(parseCodexAllModelPicker(frame).items.length, 0);
+  assert.equal(isCodexActivePickerFrame(frame), false);
+});
+
 test('a clipped current model picker wins over a stale explicit picker header above it', () => {
   const frame = [
     'Select Reasoning Level for stale-model',

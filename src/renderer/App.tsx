@@ -3344,7 +3344,11 @@ function App() {
           try {
             const r = await stopAgentProcessScenario({ tabId, toolType, runtime });
             console.log('[MobStop:Bridge] stopAgentTab done tool=' + toolType + ' tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(r));
-            return reply(!!r?.success, r);
+            // The renderer/main transport succeeded even when process lookup
+            // could not prove FOUND or ABSENT. Preserve that structured domain
+            // result for Project API instead of flattening it into a generic
+            // bridge exception that used to be mislabeled as "no session".
+            return reply(true, r);
           } catch (e: any) {
             console.log('[MobStop:Bridge] stopAgentTab err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
             return reply(false, null, String(e?.message || e));
@@ -3358,7 +3362,7 @@ function App() {
           console.log('[MobInterrupt:Bridge] interruptAgentTurn tool=' + toolType + ' tab=' + String(tabId).slice(-12));
           try {
             const result = interruptAgentTurnScenario({ tabId, toolType, runtime });
-            return reply(!!result.success, result);
+            return reply(true, result);
           } catch (e: any) {
             console.log('[MobInterrupt:Bridge] err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
             return reply(false, null, String(e?.message || e));
@@ -4426,6 +4430,9 @@ function App() {
       if (!isOptV) return;
       e.preventDefault();
       e.stopPropagation();
+      if (typeof (e as any).stopImmediatePropagation === 'function') {
+        (e as any).stopImmediatePropagation();
+      }
       const cur = useUIStore.getState().promptPickerOpen;
       useUIStore.getState().setPromptPickerOpen(!cur);
     };

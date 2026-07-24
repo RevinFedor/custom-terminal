@@ -203,8 +203,9 @@ export function mergeComposerAuthoringSnapshot({
  * 2. manual paste chips wrapped in <pasted_content>;
  * 3. the editable textarea text.
  *
- * Prompt chips are an authoring affordance, not a new PTY protocol. Paste tags
- * already have a durable renderer contract in Claude/History.
+ * Prompt chips are an authoring affordance, not a new PTY protocol. Their
+ * presentation metadata is persisted separately after post-Enter audit, so
+ * the agent still receives the exact plain prompt text.
  */
 export function serializeComposerDraft({ text = '', chips = [] } = {}) {
   const normalized = normalizeComposerChips(chips);
@@ -224,9 +225,36 @@ export function serializeComposerDraft({ text = '', chips = [] } = {}) {
 }
 
 /**
+ * Removes the exact prompt-chip prefix from display text without changing the
+ * canonical transport value kept on the history entry. If the sidecar and
+ * durable prompt disagree, fail closed: show the full text and no chips.
+ */
+export function splitPromptChipPresentation({ text = '', chips = [] } = {}) {
+  const value = String(text || '');
+  const promptChips = normalizeComposerChips(chips)
+    .filter((chip) => chip.kind === 'prompt');
+  if (promptChips.length === 0) {
+    return { matched: false, text: value, chips: [] };
+  }
+  const prefix = promptChips.map((chip) => chip.text).join('\n\n');
+  if (value === prefix) {
+    return { matched: true, text: '', chips: promptChips };
+  }
+  const separator = '\n\n';
+  if (value.startsWith(prefix + separator)) {
+    return {
+      matched: true,
+      text: value.slice(prefix.length + separator.length),
+      chips: promptChips,
+    };
+  }
+  return { matched: false, text: value, chips: [] };
+}
+
+/**
  * Splits durable user text into ordinary text and pasted-content parts.
- * Prompt chips serialize as ordinary text, so they intentionally do not
- * survive as prompt-origin metadata after delivery.
+ * Prompt-chip presentation is attached by durable entry UUID outside the
+ * transport text.
  */
 export function parsePastedContentParts(value) {
   const text = String(value || '');

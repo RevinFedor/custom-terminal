@@ -276,10 +276,271 @@ function selectCodexNativeRewindWriter(candidates, {
   };
 }
 
+/**
+ * Reuse the exact writer established by a completed native Rewind when the
+ * process still has both the source and the child rollout open writable.
+ *
+ * This is not a recency or "last known session" fallback. The caller must
+ * prove that the in-memory settlement belongs to the current PTY command
+ * generation and that SQLite still binds the tab to the same session. Every
+ * other writable user rollout must be an ancestor of the settled writer;
+ * siblings, descendants, unrelated sessions, duplicate IDs, and incomplete
+ * lineage all remain ambiguous.
+ */
+function selectCodexSettledRewindWriter(candidates, {
+  kind = null,
+  valid = false,
+  sessionId = null,
+  filePath = null,
+  sourceSessionId = null,
+  actionGeneration = null,
+  observerGeneration = null,
+  terminalToken = null,
+  observerTerminalToken = null,
+  runSeq = null,
+  observerRunSeq = null,
+  boundSessionId = null,
+  lineage = [],
+} = {}) {
+  const allCandidates = Array.isArray(candidates) ? candidates : [];
+  if (kind !== 'native-rewind-settled-writer' || valid !== true) {
+    return {
+      status: 'unresolved',
+      reason: kind === 'native-rewind-settled-writer'
+        ? 'settled-writer-proof-invalid'
+        : 'not-native-rewind-settled-writer',
+      candidates: allCandidates,
+    };
+  }
+  if (!sessionId
+    || !filePath
+    || !sourceSessionId
+    || !actionGeneration
+    || !observerGeneration
+    || !terminalToken
+    || !observerTerminalToken
+    || !Number.isInteger(runSeq)
+    || runSeq <= 0
+    || !Number.isInteger(observerRunSeq)
+    || observerRunSeq <= 0
+    || !boundSessionId) {
+    return {
+      status: 'unresolved',
+      reason: 'settled-writer-context-missing',
+      candidates: allCandidates,
+    };
+  }
+  if (actionGeneration !== observerGeneration) {
+    return {
+      status: 'unresolved',
+      reason: 'stale-settled-writer-generation',
+      candidates: allCandidates,
+    };
+  }
+  if (terminalToken !== observerTerminalToken) {
+    return {
+      status: 'unresolved',
+      reason: 'stale-settled-writer-terminal',
+      candidates: allCandidates,
+    };
+  }
+  if (runSeq !== observerRunSeq) {
+    return {
+      status: 'unresolved',
+      reason: 'stale-settled-writer-run',
+      candidates: allCandidates,
+    };
+  }
+  if (String(boundSessionId) !== String(sessionId)) {
+    return {
+      status: 'unresolved',
+      reason: 'settled-writer-binding-mismatch',
+      candidates: allCandidates,
+    };
+  }
+
+  const canonicalProofPath = canonicalizeExistingPath(filePath);
+  const exactCandidates = allCandidates.filter((candidate) => {
+    const meta = candidateSessionMeta(candidate);
+    return String(meta.id || '') === String(sessionId)
+      && canonicalizeExistingPath(candidate.filePath) === canonicalProofPath;
+  });
+  if (exactCandidates.length !== 1) {
+    return {
+      status: 'unresolved',
+      reason: exactCandidates.length > 1
+        ? 'duplicate-settled-writer-candidate'
+        : 'settled-writer-candidate-missing',
+      candidates: allCandidates,
+    };
+  }
+
+  const { parents, conflicts } = buildCodexHandoffParentMap(allCandidates, lineage);
+  const sourceAncestry = resolveCodexHandoffLineage(
+    sessionId,
+    sourceSessionId,
+    parents,
+    conflicts,
+  );
+  if (!sourceAncestry.proven) {
+    return {
+      status: 'unresolved',
+      reason: 'settled-writer-source-lineage-' + sourceAncestry.reason,
+      candidates: allCandidates,
+    };
+  }
+
+  const ancestors = [];
+  for (const candidate of allCandidates) {
+    if (candidate === exactCandidates[0]) continue;
+    const meta = candidateSessionMeta(candidate);
+    const competitorSessionId = meta.id ? String(meta.id) : '';
+    if (!competitorSessionId || competitorSessionId === String(sessionId)) {
+      return {
+        status: 'unresolved',
+        reason: competitorSessionId
+          ? 'duplicate-settled-writer-session'
+          : 'settled-writer-competitor-id-missing',
+        candidates: allCandidates,
+      };
+    }
+    const ancestry = resolveCodexHandoffLineage(
+      sessionId,
+      competitorSessionId,
+      parents,
+      conflicts,
+    );
+    if (!ancestry.proven) {
+      return {
+        status: 'unresolved',
+        reason: 'settled-writer-competitor-not-ancestor',
+        rejectedSessionId: competitorSessionId,
+        rejectedReason: ancestry.reason,
+        candidates: allCandidates,
+      };
+    }
+    ancestors.push({
+      sessionId: competitorSessionId,
+      lineageDepth: ancestry.depth,
+    });
+  }
+
+  return {
+    status: 'selected',
+    candidate: exactCandidates[0],
+    sessionId: String(sessionId),
+    sourceSessionId: String(sourceSessionId),
+    actionGeneration,
+    lineageDepth: sourceAncestry.depth,
+    lineageRelation: sourceAncestry.relation,
+    ancestors,
+    candidates: allCandidates,
+  };
+}
+
+/**
+ * Recognize a second reconciliation of the exact native-Rewind commit that
+ * already won the per-writer transaction. The durable handoff journal is
+ * intentionally consumed by the first commit, so absence alone cannot make a
+ * queued observer revoke the writer it just committed.
+ *
+ * This is deliberately narrower than an idempotent "binding already equals
+ * candidate" shortcut: the live PTY token, command run, action generation,
+ * source, child and current SQLite binding must all still match.
+ */
+function isCommittedCodexNativeRewindReplay({
+  intent = null,
+  candidateSessionId = null,
+  proof = null,
+  boundSessionId = null,
+  terminalToken = null,
+  runSeq = null,
+  currentIntentGeneration = null,
+  observerCurrent = false,
+} = {}) {
+  if (intent?.sourceMode !== 'writer-handoff'
+    || !intent?.sourceSessionId
+    || !intent?.launchId
+    || !candidateSessionId
+    || proof?.kind !== 'native-rewind-settled-writer'
+    || proof?.valid !== true
+    || observerCurrent !== true) {
+    return false;
+  }
+  return String(proof.sessionId || '') === String(candidateSessionId)
+    && String(proof.sourceSessionId || '') === String(intent.sourceSessionId)
+    && String(proof.actionGeneration || proof.launchId || '') === String(intent.launchId)
+    && String(currentIntentGeneration || '') === String(intent.launchId)
+    && String(boundSessionId || '') === String(candidateSessionId)
+    && !!terminalToken
+    && proof.terminalToken === terminalToken
+    && Number.isInteger(Number(runSeq))
+    && Number(runSeq) > 0
+    && Number(proof.runSeq) === Number(runSeq);
+}
+
+function classifyCodexWriterObservationScope({
+  capturedIntentGeneration = null,
+  currentIntentGeneration = null,
+  expectedObserver = null,
+  currentObserver = null,
+} = {}) {
+  const captured = capturedIntentGeneration || null;
+  const current = currentIntentGeneration || null;
+  if (captured !== current) {
+    return {
+      status: 'stale-generation',
+      expectedLaunchId: captured,
+      currentLaunchId: current,
+    };
+  }
+  if (expectedObserver && currentObserver !== expectedObserver) {
+    return { status: 'stale-observer' };
+  }
+  return { status: 'current' };
+}
+
+function deriveCodexSettledWriterProofScope({
+  nativeRewindHandoffProven = false,
+  settledRewindWriterProven = false,
+  intent = null,
+  settledWriterProof = null,
+} = {}) {
+  if (nativeRewindHandoffProven) {
+    return {
+      actionGeneration: intent?.launchId || null,
+      sourceSessionId: intent?.sourceSessionId || null,
+    };
+  }
+  if (settledRewindWriterProven) {
+    return {
+      actionGeneration: settledWriterProof?.actionGeneration || null,
+      sourceSessionId: settledWriterProof?.sourceSessionId || null,
+    };
+  }
+  return {
+    actionGeneration: null,
+    sourceSessionId: null,
+  };
+}
+
+function shouldUseSettledCodexRewindWriterProof({
+  sourceMode = null,
+  handoffActionStartedAtMs = null,
+} = {}) {
+  const hasActionBoundary = handoffActionStartedAtMs !== null
+    && handoffActionStartedAtMs !== undefined
+    && handoffActionStartedAtMs !== ''
+    && Number.isFinite(Number(handoffActionStartedAtMs));
+  return sourceMode !== 'writer-handoff'
+    || !hasActionBoundary;
+}
+
 async function resolveCodexUserWriterProof(proof, {
   readMetadata,
   isUserSession,
   handoff = null,
+  settledWriter = null,
 } = {}) {
   if (!proof || proof.status === 'unknown' || proof.status === 'pending') return proof;
   if (typeof readMetadata !== 'function' || typeof isUserSession !== 'function') {
@@ -361,12 +622,33 @@ async function resolveCodexUserWriterProof(proof, {
         handoffProof: handoffSelection,
       };
     }
+    // A currently active handoff always wins over an incumbent settlement.
+    // If the new handoff is unresolved, remain ambiguous instead of falling
+    // back to the writer from the previous Rewind.
+    const settledSelection = !handoff && settledWriter
+      ? selectCodexSettledRewindWriter(userCandidates, settledWriter)
+      : null;
+    if (settledSelection?.status === 'selected') {
+      const selected = settledSelection.candidate;
+      return {
+        status: 'owned',
+        filePath: selected.filePath,
+        pids: selected.pids || [],
+        fds: selected.fds || [],
+        metadata: selected.metadata,
+        candidates: userCandidates,
+        ignoredCandidates,
+        allCandidates: classified,
+        settledWriterProof: settledSelection,
+      };
+    }
     return {
       status: 'ambiguous',
       candidates: userCandidates,
       ignoredCandidates,
       allCandidates: classified,
       ...(handoffSelection ? { handoffProof: handoffSelection } : {}),
+      ...(settledSelection ? { settledWriterProof: settledSelection } : {}),
     };
   }
   return {
@@ -671,7 +953,12 @@ module.exports = {
   resolveCompleteCodexWriterProof,
   resolveCodexUserWriterProof,
   resolveCodexWriterProof,
+  isCommittedCodexNativeRewindReplay,
+  classifyCodexWriterObservationScope,
+  deriveCodexSettledWriterProofScope,
+  shouldUseSettledCodexRewindWriterProof,
   selectCodexNativeRewindWriter,
+  selectCodexSettledRewindWriter,
   runKeyedExclusive,
   runKeyedSingleFlight,
   isCodexWriterProofOwnershipQuarantined,

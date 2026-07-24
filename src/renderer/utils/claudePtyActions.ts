@@ -52,6 +52,16 @@ export interface ClaudePtySendOptions {
   handoffId?: string;
   source?: string;
   statusAtSend?: string;
+  presentationSnapshot?: {
+    historySessionId?: string | null;
+    promptChips?: Array<{
+      id?: string;
+      kind: 'prompt';
+      label?: string;
+      text: string;
+      sourceKey?: string;
+    }>;
+  };
 }
 
 type ClaudePtyResumeResult = {
@@ -448,6 +458,7 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
       fast: false,
       handoffId: options.handoffId || null,
       source: options.source || 'claude-pty-action',
+      presentationSnapshot: options.presentationSnapshot || null,
     })
     .then((result: any) => {
       console.log('[ClaudePtyActions:send] done tab=' + shortTab(tabId) +

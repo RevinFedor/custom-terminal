@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Minus, SquareTerminal } from 'lucide-react';
+import { Minus, Plus, SquareTerminal } from 'lucide-react';
 import ControlHint from '../UI/ControlHint';
+import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import {
   DEFAULT_FLOATING_TERMINAL_GEOMETRY,
@@ -104,6 +105,8 @@ export default function FloatingTerminalFrame({
   } | null>(null);
   const rafRef = useRef<number | null>(null);
   const pendingGeometryRef = useRef<Geometry | null>(null);
+  const incrementTerminalFontSize = useUIStore((state) => state.incrementTerminalFontSize);
+  const decrementTerminalFontSize = useUIStore((state) => state.decrementTerminalFontSize);
 
   const setGeometry = useCallback((next: Geometry) => {
     const normalized = normalizeFloatingTerminalGeometry(next);
@@ -317,6 +320,24 @@ export default function FloatingTerminalFrame({
           <SquareTerminal size={14} />
           <span style={{ fontSize: 11, fontWeight: 650, letterSpacing: '0.04em' }}>TERMINAL</span>
           <div style={{ flex: 1 }} />
+          <ControlHint label="Уменьшить шрифт терминала">
+            <button
+              type="button"
+              aria-label="Decrease terminal font size"
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={decrementTerminalFontSize}
+              style={{ border: 0, background: 'transparent', color: '#8b8b91', padding: 4, cursor: 'pointer', display: 'flex' }}
+            ><Minus size={13} /></button>
+          </ControlHint>
+          <ControlHint label="Увеличить шрифт терминала">
+            <button
+              type="button"
+              aria-label="Increase terminal font size"
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={incrementTerminalFontSize}
+              style={{ border: 0, background: 'transparent', color: '#8b8b91', padding: 4, cursor: 'pointer', display: 'flex' }}
+            ><Plus size={13} /></button>
+          </ControlHint>
           <ControlHint label="Скрыть терминал">
             <button
               type="button"

@@ -12,6 +12,7 @@ import {
   restoreComposerChipToText,
   serializeComposerDraft,
   shouldCreatePasteChip,
+  splitPromptChipPresentation,
   upsertComposerChip,
 } from './composerChips.mjs';
 
@@ -95,6 +96,33 @@ test('serialization puts prompt chips first, paste wrappers second, and editable
       'cover note',
     ].join('\n\n'),
   );
+});
+
+test('prompt presentation sidecar removes only the exact durable prefix', () => {
+  const promptChip = chip('prompt-1', 'prompt', 'saved prompt body', {
+    label: 'Review: UI / UX',
+  });
+  const payload = serializeComposerDraft({
+    text: 'user note',
+    chips: [promptChip],
+  });
+
+  assert.deepEqual(splitPromptChipPresentation({
+    text: payload,
+    chips: [promptChip],
+  }), {
+    matched: true,
+    text: 'user note',
+    chips: [promptChip],
+  });
+  assert.deepEqual(splitPromptChipPresentation({
+    text: 'different bytes',
+    chips: [promptChip],
+  }), {
+    matched: false,
+    text: 'different bytes',
+    chips: [],
+  });
 });
 
 test('pasted-content parser preserves the body and leaves ordinary text as text parts', () => {

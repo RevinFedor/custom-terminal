@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   CODEX_PRESENCE_SNAPSHOT_FIELDS,
+  isCodexRuntimeWriterUsable,
   projectCodexPtyPresence,
   readCodexPtyPresence,
 } from './codexPtyPresence.mjs';
@@ -211,4 +212,42 @@ test('presence reader rejects a snapshot resolved for another project', async ()
     }),
     /project mismatch/,
   );
+});
+
+test('renderer accepts every main-proven mutation-safe writer kind, including a settled Rewind child', () => {
+  const initialWriter = completeSnapshot({
+    writerConfirmed: true,
+    writerStatus: 'adopted',
+    writerUsableForMutation: true,
+    writerProof: 'process-open-rollout',
+    provenWriterSessionId: 'source',
+  });
+  const settledRewindWriter = completeSnapshot({
+    writerConfirmed: true,
+    writerStatus: 'adopted',
+    writerUsableForMutation: true,
+    writerProof: 'native-rewind-settled-writer',
+    provenWriterSessionId: 'child',
+  });
+
+  assert.equal(isCodexRuntimeWriterUsable(initialWriter), true);
+  assert.equal(isCodexRuntimeWriterUsable(settledRewindWriter), true);
+});
+
+test('renderer cannot turn an incomplete or main-revoked writer into a mutation target', () => {
+  const base = {
+    writerConfirmed: true,
+    writerStatus: 'adopted',
+    writerUsableForMutation: true,
+    writerProof: 'native-rewind-settled-writer',
+    provenWriterSessionId: 'child',
+    canCopySessionId: true,
+  };
+
+  assert.equal(isCodexRuntimeWriterUsable({ ...base, writerConfirmed: false }), false);
+  assert.equal(isCodexRuntimeWriterUsable({ ...base, writerStatus: 'starting' }), false);
+  assert.equal(isCodexRuntimeWriterUsable({ ...base, writerUsableForMutation: false }), false);
+  assert.equal(isCodexRuntimeWriterUsable({ ...base, writerProof: null }), false);
+  assert.equal(isCodexRuntimeWriterUsable({ ...base, provenWriterSessionId: null }), false);
+  assert.equal(isCodexRuntimeWriterUsable({ ...base, canCopySessionId: false }, { requireCopy: true }), false);
 });

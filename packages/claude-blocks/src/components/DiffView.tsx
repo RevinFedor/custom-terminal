@@ -29,19 +29,41 @@ function HighlightedLine({ line, language }: { line: string; language: string })
 /**
  * Diff renderer with a real unified-diff gutter.
  *
- * `startLine` — the 1-based file line where this hunk begins (the matched
- * old_string's position). When provided, the gutter shows REAL file line
+ * `oldStart` / `newStart` — the 1-based file lines where this hunk begins.
+ * When provided, the gutter shows REAL file line
  * numbers: a `-` row carries its old-file line, a `+` row its new-file line,
  * an `eq` row its new-file line. del/add counters advance independently, so a
  * mixed hunk (e.g. 2 del + 3 add at line 3) numbers `-3 -4 / +3 +4 +5`, matching
  * what an editor shows — NOT a single counter that would mislabel the adds.
  *
- * When `startLine` is omitted the gutter falls back to per-row index (1..N),
- * preserving the original behaviour for callers that don't have a file offset.
+ * `startLine` remains as a backwards-compatible shorthand for callers where
+ * old/new offsets are equal. When no trustworthy offset exists, callers can
+ * set `unknownLineNumbers`: the gutter keeps its layout but stays blank instead
+ * of presenting hunk-relative `1..N` as original file coordinates.
  */
-export function DiffView({ entries, language, startLine }: { entries: DiffEntry[]; language: string; startLine?: number }) {
-  const hasReal = typeof startLine === 'number' && startLine > 0;
-  const rows = hasReal ? numberDiff(entries, startLine, startLine) : null;
+export function DiffView({
+  entries,
+  language,
+  startLine,
+  oldStart,
+  newStart,
+  unknownLineNumbers = false,
+}: {
+  entries: DiffEntry[];
+  language: string;
+  startLine?: number;
+  oldStart?: number;
+  newStart?: number;
+  unknownLineNumbers?: boolean;
+}) {
+  const resolvedOldStart = oldStart ?? startLine;
+  const resolvedNewStart = newStart ?? startLine;
+  const hasReal =
+    typeof resolvedOldStart === 'number' && resolvedOldStart > 0 &&
+    typeof resolvedNewStart === 'number' && resolvedNewStart > 0;
+  const rows = hasReal
+    ? numberDiff(entries, resolvedOldStart, resolvedNewStart)
+    : null;
   return (
     <div className="cb-diff" data-diff-lang={language}>
       {entries.map((e, idx) => {
@@ -53,9 +75,12 @@ export function DiffView({ entries, language, startLine }: { entries: DiffEntry[
           : 'cb-diff-mark cb-c-dim';
         const sign = e.tag === 'add' ? '+' : e.tag === 'del' ? '-' : ' ';
         const bg = e.tag === 'add' ? 'var(--cb-diff-add-bg)' : e.tag === 'del' ? 'var(--cb-diff-del-bg)' : 'transparent';
-        // del → old-file line; add/eq → new-file line. Fallback: idx+1.
+        // del → old-file line; add/eq → new-file line. Unknown metadata must
+        // not masquerade as original file line 1.
         const r = rows?.[idx];
-        const no = r ? (e.tag === 'del' ? r.oldNo : r.newNo) : idx + 1;
+        const no = r
+          ? (e.tag === 'del' ? r.oldNo : r.newNo)
+          : unknownLineNumbers ? '' : idx + 1;
         return (
           <div key={idx} className={rowClass} style={{ background: bg }}>
             <span className="cb-diff-no">{no}</span>
