@@ -2,6 +2,7 @@ const { ipcMain } = require('electron');
 const { execFile } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const { buildChildProcessEnv } = require('../child-process-env');
 
 // In-memory settings synced from renderer (via docs:sync-settings IPC)
 let docsConfig = {
@@ -176,7 +177,7 @@ async function callGeminiCli(system, prompt, model = 'gemini-3-flash-preview', c
         cwd: cwd || process.cwd(),
         maxBuffer: 50 * 1024 * 1024, // 50MB
         timeout: 5 * 60 * 1000, // 5 min
-        env: { ...process.env },
+        env: buildChildProcessEnv(),
       }, (error, stdout, stderr) => {
         // Cleanup temp file
         try { fs.unlinkSync(tmpFile); } catch (_) {}

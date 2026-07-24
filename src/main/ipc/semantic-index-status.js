@@ -16,6 +16,7 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
+const { buildChildProcessEnv } = require('../child-process-env');
 
 const INDEX_FILE_NAME = '.semantic-index.json';
 const DOCS_SUBDIR = 'docs';
@@ -276,8 +277,7 @@ function callKnowledgeDocsReindex(projectPath, parallelism, onProcess, onProgres
 
     const proc = spawn('node', [serverPath, '--project', projectPath], {
       cwd: projectPath,
-      env: {
-        ...process.env,
+      env: buildChildProcessEnv({
         FORCE_COLOR: '0',
         PATH: buildToolPath(),
         KNOWLEDGE_DISABLE_GEMINI: 'true',
@@ -286,7 +286,7 @@ function callKnowledgeDocsReindex(projectPath, parallelism, onProcess, onProgres
         KNOWLEDGE_INDEX_PROVIDER: 'codex',
         KNOWLEDGE_CODEX_MODEL: process.env.KNOWLEDGE_CODEX_MODEL || 'gpt-5.4-mini',
         KNOWLEDGE_CODEX_EFFORT: process.env.KNOWLEDGE_CODEX_EFFORT || 'low',
-      },
+      }),
     });
     if (typeof onProcess === 'function') onProcess(proc);
 

@@ -1,87 +1,58 @@
 // Claude usage limits IPC.
 //
-// Reads the OAuth access token from the macOS Keychain entry
-// "Claude Code-credentials" (created by claude CLI when the user signs in),
-// then queries https://api.anthropic.com/api/oauth/usage — same endpoint the
-// Blimp-Labs claude-usage-bar app uses. Returns weekly + 5-hour utilization +
-// extra-credits usage. Response is cached in-process for 5 minutes to avoid
-// rate-limiting (server polls every 30m by default).
-//
-// Schema (relevant fields):
-//   five_hour:  { utilization: %, resets_at: ISO }
-//   seven_day:  { utilization: %, resets_at: ISO }
-//   seven_day_opus / seven_day_sonnet: same shape
-//   extra_usage: { is_enabled, utilization, used_credits, monthly_limit, currency }
+// Current Claude identity comes from `claude auth status --json`. Quota data
+// primarily arrives through Claude Code's official statusLine `rate_limits`
+// payload and is recorded by the existing bridge watcher in main.js. Older
+// OAuth credentials may also query /api/oauth/usage. A `/login managed key`
+// is deliberately not treated as OAuth: it is an API-shaped credential and
+// Anthropic rejects it on the OAuth usage endpoint.
 
 const { ipcMain } = require('electron');
 const { execFile } = require('child_process');
 const https = require('https');
 const crypto = require('crypto');
+const {
+  buildChildProcessEnv,
+  getMainProcessEnvValue,
+} = require('../child-process-env');
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const ADMIN_COST_URL = 'https://api.anthropic.com/v1/organizations/cost_report';
 const MODELS_URL = 'https://api.anthropic.com/v1/models?limit=1';
 const KEYCHAIN_API_SERVICE = 'Claude Code';
 const KEYCHAIN_OAUTH_SERVICE = 'Claude Code-credentials';
-// Polling cadence — renderer ticks every 3 min, cache TTL чуть меньше, чтобы
-// каждый плановый poll реально дёргал сеть, а не сидел на кэше. Anthropic
-// `/oauth/usage` rate-limit раздаёт 429 даже при 1 запросе/мин — 3 мин
-// заметно реже триггерит окно. См. fact-claude-usage-chip.md::Polling cadence.
 const CACHE_TTL_MS = 170 * 1000;
-
-// `lastErrorAt` — when the most recent live fetch failed. While the last
-// network attempt is still recent we refuse to make another live request even
-// on cache miss, to avoid hammering Anthropic during a 429 window. Force-
-// refresh from the UI ignores this gate. Cooldown = ~polling interval so
-// ретрай совпадает со следующим плановым тиком.
-let cache = { at: 0, accountKey: null, data: null, error: null, lastErrorAt: 0, lastAttemptAt: 0 };
 const ERROR_COOLDOWN_MS = 180 * 1000;
-let apiBillingCache = { at: 0, accountKey: null, data: null, error: null, lastAttemptAt: 0 };
 const API_BILLING_CACHE_TTL_MS = 10 * 60 * 1000;
+const USAGE_TIMEOUT_MS = 8 * 1000;
+const USAGE_STALE_MS = 6 * 60 * 1000;
+const AUTH_STATUS_TIMEOUT_MS = 5 * 1000;
+const CLAUDE_USAGE_PERSISTENCE_KEY = 'claudeUsageAccounts.v1';
+const CLAUDE_USAGE_PENDING_CONFIRM_MS = 30 * 1000;
+const CLAUDE_USAGE_REGRESSION_POINTS = 10;
+const CLAUDE_USAGE_RESET_TOLERANCE_MS = 2 * 60 * 1000;
+const CLAUDE_USAGE_INCONSISTENT_WARNING = 'Claude returned inconsistent usage. Showing the last verified value.';
 
-// Reconstruct minimal /oauth/usage-shaped object from the last persisted
-// snapshot. Used as fallback when the in-memory cache is empty (cold start)
-// AND the live fetch is unavailable (429, network drop, etc) — without this
-// the chip falls back to '—' even though we have a recent reading on disk.
-// Missing fields (extra_usage, opus / sonnet breakdown) — we only persist the
-// scalars, so the popover's optional rows disappear; this is acceptable
-// degradation vs a completely blank chip.
-function snapshotToUsageData(snap) {
-  if (!snap) return null;
-  const utilOrNull = (v) => (v == null ? null : Number(v));
-  const opus = utilOrNull(snap.weekly_opus_pct);
-  const sonnet = utilOrNull(snap.weekly_sonnet_pct);
-  return {
-    five_hour: snap.five_hour_pct != null
-      ? { utilization: Number(snap.five_hour_pct), resets_at: snap.five_hour_resets_at || null }
-      : null,
-    seven_day: snap.weekly_pct != null
-      ? { utilization: Number(snap.weekly_pct), resets_at: snap.weekly_resets_at || null }
-      : null,
-    seven_day_opus: opus != null
-      ? { utilization: opus, resets_at: snap.weekly_resets_at || null }
-      : null,
-    seven_day_sonnet: sonnet != null
-      ? { utilization: sonnet, resets_at: snap.weekly_resets_at || null }
-      : null,
-  };
-}
+let _projectManager = null;
+let claudeUsageStateStore = null;
+let claudeUsageStateHydrated = false;
+let apiBillingCache = { at: 0, accountKey: null, data: null, error: null, lastAttemptAt: 0 };
+const claudeUsageByAccount = new Map();
+const claudeUsageInflight = new Map();
+const statuslineSessionBindings = new Map();
+const statuslineBindingInflight = new Map();
 
-function loadFallbackFromSnapshot() {
-  if (!_projectManager?.db) return null;
-  try {
-    const snap = _projectManager.db.getLatestClaudeUsageSnapshot?.();
-    if (!snap) return null;
-    return { data: snapshotToUsageData(snap), at: snap.ts * 1000 };
-  } catch (e) {
-    console.error('[ClaudeUsage] snapshot fallback failed:', e.message);
-    return null;
+class ClaudeUsageError extends Error {
+  constructor(code, message, status = null) {
+    super(message);
+    this.name = 'ClaudeUsageError';
+    this.code = code;
+    this.status = status;
   }
 }
-let _projectManager = null;
 
-function shortHash(value) {
-  return crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, 10);
+function shortHash(value, length = 20) {
+  return crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, length);
 }
 
 function maskOrgId(value) {
@@ -90,14 +61,19 @@ function maskOrgId(value) {
 }
 
 function getAdminApiKey() {
-  const value = process.env.ANTHROPIC_ADMIN_API_KEY || process.env.ANTHROPIC_ADMIN_KEY || '';
+  const value = getMainProcessEnvValue('ANTHROPIC_ADMIN_API_KEY')
+    || getMainProcessEnvValue('ANTHROPIC_ADMIN_KEY')
+    || '';
   const trimmed = value.trim();
   return trimmed.startsWith('sk-ant-admin') ? trimmed : null;
 }
 
 function readKeychainService(service) {
-  return new Promise((resolve, reject) => {
-    execFile('security', ['find-generic-password', '-s', service, '-w'], { timeout: 5000 }, (err, stdout) => {
+  return new Promise((resolve) => {
+    execFile('security', ['find-generic-password', '-s', service, '-w'], {
+      timeout: 5000,
+      env: buildChildProcessEnv(),
+    }, (err, stdout) => {
       if (err) return resolve(null);
       resolve(stdout.toString().trim());
     });
@@ -129,10 +105,12 @@ function findNestedString(obj, keyRegex) {
 
 function extractOauthToken(payload) {
   if (!payload || typeof payload !== 'object') return null;
+  // Do not recurse. `Claude Code-credentials` is also an MCP OAuth container;
+  // a nested Figma/other accessToken is not a Claude credential.
   return payload?.claudeAiOauth?.accessToken
     || payload?.oauth?.accessToken
     || payload?.accessToken
-    || findNestedString(payload, /^accessToken$/i);
+    || null;
 }
 
 function extractApiKey(payload) {
@@ -155,23 +133,87 @@ function maskEmail(value) {
   return `${local.slice(0, 2)}***@${domain}`;
 }
 
-function decodeJwtPayload(token) {
-  if (!token || typeof token !== 'string' || token.split('.').length < 3) return null;
-  try {
-    const part = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
-    const padded = part + '='.repeat((4 - (part.length % 4)) % 4);
-    return JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
-  } catch {
-    return null;
-  }
+function readClaudeAuthStatus() {
+  return new Promise((resolve) => {
+    execFile(
+      'claude',
+      ['auth', 'status', '--json'],
+      {
+        timeout: AUTH_STATUS_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024,
+        env: buildChildProcessEnv(),
+      },
+      (error, stdout) => {
+        const raw = String(stdout || '').trim();
+        if (!raw) return resolve(null);
+        try {
+          const parsed = JSON.parse(raw);
+          resolve(parsed && typeof parsed === 'object' ? parsed : null);
+        } catch {
+          if (error) return resolve(null);
+          resolve(null);
+        }
+      },
+    );
+  });
 }
 
-async function readClaudeAuthState() {
-  const [apiRaw, oauthRaw] = await Promise.all([
-    readKeychainService(KEYCHAIN_API_SERVICE),
-    readKeychainService(KEYCHAIN_OAUTH_SERVICE),
+function stableClaudeAccountKey(status, credentialFingerprint = null) {
+  const authMethod = String(status?.authMethod || '').trim().toLowerCase();
+  const orgId = String(status?.orgId || '').trim().toLowerCase();
+  const email = String(status?.email || '').trim().toLowerCase();
+  const stableParts = [authMethod, orgId, email].filter(Boolean);
+  if (stableParts.length > 1) {
+    return `claude:${shortHash(`identity-v1|${stableParts.join('|')}`)}`;
+  }
+  return credentialFingerprint ? `claude:${shortHash(`credential-v1|${credentialFingerprint}`)}` : null;
+}
+
+function classifyClaudeAuth(status, { apiKey, oauthToken }) {
+  if (status && status.loggedIn === false) return null;
+  const method = String(status?.authMethod || '').trim().toLowerCase();
+  const keySource = String(status?.apiKeySource || '').trim().toLowerCase();
+  const isClaudeLogin = method.includes('claude.ai') || keySource.includes('/login managed key');
+  if (isClaudeLogin) {
+    // `/login managed key` is authoritative. A stale Claude OAuth token may
+    // coexist in another Keychain item and must not change the current login.
+    if (!apiKey && !keySource.includes('/login managed key') && oauthToken) {
+      return { kind: 'max-oauth', credentialKind: 'oauth-bearer', usageEndpointEligible: true };
+    }
+    return {
+      kind: 'claude-managed-key',
+      credentialKind: apiKey ? 'managed-api-key' : 'managed-session',
+      usageEndpointEligible: false,
+    };
+  }
+  if (oauthToken) {
+    return {
+      kind: 'max-oauth',
+      credentialKind: 'oauth-bearer',
+      usageEndpointEligible: true,
+    };
+  }
+  if (apiKey) {
+    return {
+      kind: 'api-platform',
+      credentialKind: 'api-key',
+      usageEndpointEligible: false,
+    };
+  }
+  return null;
+}
+
+async function readClaudeAuthState({
+  statusReader = readClaudeAuthStatus,
+  keychainReader = readKeychainService,
+} = {}) {
+  const [statusResult, apiRaw, oauthRaw] = await Promise.all([
+    Promise.resolve().then(() => statusReader()).catch(() => null),
+    Promise.resolve().then(() => keychainReader(KEYCHAIN_API_SERVICE)).catch(() => null),
+    Promise.resolve().then(() => keychainReader(KEYCHAIN_OAUTH_SERVICE)).catch(() => null),
   ]);
 
+  const status = statusResult && typeof statusResult === 'object' ? statusResult : null;
   const apiPayload = parseKeychainPayload(apiRaw);
   const oauthPayload = parseKeychainPayload(oauthRaw);
   const apiKeyFromApiService = extractApiKey(apiPayload);
@@ -180,130 +222,340 @@ async function readClaudeAuthState() {
   const oauthFromOauthService = extractOauthToken(oauthPayload);
   const apiKey = apiKeyFromApiService || apiKeyFromOauthService || null;
   const oauthToken = oauthFromApiService || oauthFromOauthService || null;
-  const oauthClaims = decodeJwtPayload(oauthToken);
-  const email = maskEmail(
-    findNestedString(apiPayload, /email/i)
+  const classification = classifyClaudeAuth(status, { apiKey, oauthToken });
+  if (!classification) return null;
+
+  const activeCredential = classification.credentialKind === 'oauth-bearer' ? oauthToken : apiKey;
+  const tokenFingerprint = activeCredential ? shortHash(activeCredential) : null;
+  const accountKey = stableClaudeAccountKey(status, tokenFingerprint);
+  if (!accountKey) return null;
+
+  const email = String(status?.email || '').trim()
+    || findNestedString(apiPayload, /email/i)
     || findNestedString(oauthPayload, /email/i)
-    || findNestedString(oauthClaims, /email/i)
-  );
+    || null;
+  const label = maskEmail(email)
+    || (classification.kind === 'api-platform'
+      ? 'Anthropic API'
+      : (classification.kind === 'claude-managed-key' ? 'Claude login' : 'Claude Max'));
+  const accountHint = classification.kind === 'api-platform'
+    ? 'Anthropic API Platform'
+    : (classification.kind === 'claude-managed-key' ? 'Claude.ai managed login' : 'Claude subscription');
+  const notice = classification.kind === 'claude-managed-key'
+    ? 'Quota updates after Claude replies through the official status line.'
+    : null;
 
   return {
+    accountKey,
+    tokenFingerprint,
+    label,
+    accountHint,
+    accountIdHint: null,
+    email,
+    orgId: String(status?.orgId || '').trim() || null,
+    orgName: String(status?.orgName || '').trim() || null,
+    authMethod: String(status?.authMethod || '').trim() || null,
+    apiProvider: String(status?.apiProvider || '').trim() || null,
     apiKey,
     apiKeySource: apiKeyFromApiService ? KEYCHAIN_API_SERVICE : (apiKeyFromOauthService ? KEYCHAIN_OAUTH_SERVICE : null),
     oauthToken,
     oauthSource: oauthFromApiService ? KEYCHAIN_API_SERVICE : (oauthFromOauthService ? KEYCHAIN_OAUTH_SERVICE : null),
-    email,
-    currentKind: apiKeyFromApiService ? 'api-platform' : (oauthFromApiService || oauthFromOauthService ? 'max-oauth' : (apiKey ? 'api-platform' : null)),
+    currentKind: classification.kind,
+    credentialKind: classification.credentialKind,
+    usageEndpointEligible: classification.usageEndpointEligible,
+    notice,
   };
 }
 
-function buildClaudeUsageAccounts(authState, usageData = null) {
-  const accounts = [];
-  const oauthKey = authState?.oauthToken ? `oauth:${shortHash(authState.oauthToken)}` : null;
-  const apiKey = authState?.apiKey ? `api:${shortHash(authState.apiKey)}` : null;
-  const apiKeySuffix = authState?.apiKey ? authState.apiKey.slice(-4).toUpperCase() : null;
+function normalizePercent(value, field) {
+  if (typeof value === 'boolean' || value == null || (typeof value === 'string' && !value.trim())) {
+    throw new ClaudeUsageError('invalid_response', `${field} is missing`);
+  }
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0 || number > 100) {
+    throw new ClaudeUsageError('invalid_response', `${field} must be between 0 and 100`);
+  }
+  return number;
+}
 
-  const apiAccount = apiKey ? {
-    accountKey: apiKey,
-    kind: 'api-platform',
-    label: `API ${apiKeySuffix || apiKey.slice(-4).toUpperCase()}`,
-    accountHint: 'Anthropic API Platform',
-    accountIdHint: apiKeySuffix ? `key ${apiKeySuffix}` : null,
-    source: `keychain:${authState.apiKeySource || KEYCHAIN_API_SERVICE}`,
-    isCurrent: authState.currentKind === 'api-platform',
-    usage: null,
-    notice: null,
-    error: null,
-  } : null;
-
-  const oauthAccount = oauthKey ? {
-    accountKey: oauthKey,
-    kind: 'max-oauth',
-    label: authState.email || 'Max OAuth',
-    accountHint: 'Claude Max subscription',
-    accountIdHint: `oauth ${oauthKey.slice(6).toUpperCase()}`,
-    source: `keychain:${authState.oauthSource || KEYCHAIN_OAUTH_SERVICE}`,
-    isCurrent: authState.currentKind === 'max-oauth',
-    usage: usageData || null,
-    error: null,
-  } : null;
-
-  if (authState?.currentKind === 'api-platform') {
-    if (apiAccount) accounts.push(apiAccount);
-    if (oauthAccount) accounts.push(oauthAccount);
+function normalizeResetAt(value, field) {
+  if (value == null || value === '') return null;
+  let ms;
+  if (typeof value === 'number') {
+    ms = value < 1e12 ? value * 1000 : value;
+  } else if (typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim())) {
+    const numeric = Number(value);
+    ms = numeric < 1e12 ? numeric * 1000 : numeric;
   } else {
-    if (oauthAccount) accounts.push(oauthAccount);
-    if (apiAccount) accounts.push(apiAccount);
+    ms = Date.parse(String(value));
   }
-
-  if (!accounts.length && usageData) {
-    accounts.push({
-      accountKey: 'oauth:cached',
-      kind: 'max-oauth',
-      label: 'Max cached',
-      accountHint: 'Last persisted Claude Max snapshot',
-      accountIdHint: null,
-      source: 'sqlite:claude_usage_snapshots',
-      isCurrent: false,
-      usage: usageData,
-      error: null,
-    });
+  if (!Number.isFinite(ms)) {
+    throw new ClaudeUsageError('invalid_response', `${field} is not a valid timestamp`);
   }
-
-  return accounts;
+  return new Date(ms).toISOString();
 }
 
-function pickClaudeAccount(accounts, requestedAccountKey = null) {
-  if (!accounts.length) return null;
-  if (requestedAccountKey) {
-    const requested = accounts.find((account) => account.accountKey === requestedAccountKey);
-    if (requested) return requested;
+function normalizeUsageBucket(raw, field, percentKey = 'utilization') {
+  if (raw == null) return null;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ClaudeUsageError('invalid_response', `${field} must be an object`);
   }
-  return accounts.find((account) => account.isCurrent) || accounts[0];
+  const percent = raw[percentKey] ?? raw.utilization ?? raw.used_percentage ?? raw.used_percent;
+  return {
+    utilization: normalizePercent(percent, `${field}.utilization`),
+    resets_at: normalizeResetAt(raw.resets_at ?? raw.reset_at ?? null, `${field}.resets_at`),
+  };
 }
 
-function readKeychainToken() {
-  return new Promise((resolve, reject) => {
-    execFile('security', ['find-generic-password', '-s', KEYCHAIN_OAUTH_SERVICE, '-w'], (err, stdout) => {
-      if (err) return reject(new Error(`Keychain entry "${KEYCHAIN_OAUTH_SERVICE}" not found. Sign in via claude CLI.`));
-      try {
-        const j = JSON.parse(stdout.toString().trim());
-        const token = extractOauthToken(j);
-        if (!token) return reject(new Error('No accessToken in keychain payload.'));
-        resolve(token);
-      } catch (e) {
-        reject(new Error('Failed to parse keychain payload: ' + e.message));
+function normalizeExtraUsage(raw) {
+  if (raw == null) return null;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ClaudeUsageError('invalid_response', 'extra_usage must be an object');
+  }
+  const result = {
+    is_enabled: raw.is_enabled === true,
+    utilization: raw.utilization == null ? null : normalizePercent(raw.utilization, 'extra_usage.utilization'),
+    used_credits: raw.used_credits == null ? null : Number(raw.used_credits),
+    monthly_limit: raw.monthly_limit == null ? null : Number(raw.monthly_limit),
+    currency: typeof raw.currency === 'string' ? raw.currency.slice(0, 16) : null,
+  };
+  if (result.used_credits != null && (!Number.isFinite(result.used_credits) || result.used_credits < 0)) {
+    throw new ClaudeUsageError('invalid_response', 'extra_usage.used_credits is invalid');
+  }
+  if (result.monthly_limit != null && (!Number.isFinite(result.monthly_limit) || result.monthly_limit < 0)) {
+    throw new ClaudeUsageError('invalid_response', 'extra_usage.monthly_limit is invalid');
+  }
+  return result;
+}
+
+function normalizeClaudeUsageData(raw, { statusline = false } = {}) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ClaudeUsageError('invalid_response', 'Claude usage response must be an object');
+  }
+  const data = {
+    five_hour: normalizeUsageBucket(raw.five_hour, 'five_hour', statusline ? 'used_percentage' : 'utilization'),
+    seven_day: normalizeUsageBucket(raw.seven_day, 'seven_day', statusline ? 'used_percentage' : 'utilization'),
+    seven_day_opus: normalizeUsageBucket(raw.seven_day_opus, 'seven_day_opus'),
+    seven_day_sonnet: normalizeUsageBucket(raw.seven_day_sonnet, 'seven_day_sonnet'),
+    extra_usage: normalizeExtraUsage(raw.extra_usage),
+  };
+  if (!data.five_hour && !data.seven_day) {
+    throw new ClaudeUsageError('invalid_response', 'Claude usage has no five-hour or seven-day window');
+  }
+  return data;
+}
+
+function retryAfterDelayMs(value, nowMs = Date.now()) {
+  if (value == null || value === '') return ERROR_COOLDOWN_MS;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.max(1000, Math.min(60 * 60 * 1000, seconds * 1000));
+  }
+  const dateMs = Date.parse(String(value));
+  if (Number.isFinite(dateMs)) {
+    return Math.max(1000, Math.min(60 * 60 * 1000, dateMs - nowMs));
+  }
+  return ERROR_COOLDOWN_MS;
+}
+
+function usageBucketSnapshot(data, key) {
+  const bucket = data?.[key];
+  const utilization = Number(bucket?.utilization);
+  if (!Number.isFinite(utilization)) return null;
+  const resetMs = Date.parse(bucket?.resets_at || '');
+  return {
+    utilization,
+    resetMs: Number.isFinite(resetMs) ? resetMs : null,
+  };
+}
+
+function mergeClaudeUsageData(previous, candidate) {
+  if (!previous) return candidate;
+  return {
+    ...previous,
+    ...candidate,
+    five_hour: candidate?.five_hour || previous.five_hour || null,
+    seven_day: candidate?.seven_day || previous.seven_day || null,
+    seven_day_opus: candidate?.seven_day_opus || previous.seven_day_opus || null,
+    seven_day_sonnet: candidate?.seven_day_sonnet || previous.seven_day_sonnet || null,
+    extra_usage: candidate?.extra_usage || previous.extra_usage || null,
+  };
+}
+
+function claudeUsageSnapshotsMatch(left, right) {
+  for (const key of ['five_hour', 'seven_day']) {
+    const a = usageBucketSnapshot(left, key);
+    const b = usageBucketSnapshot(right, key);
+    if (!a && !b) continue;
+    if (!a || !b || Math.abs(a.utilization - b.utilization) > 0.01) return false;
+    if (a.resetMs == null && b.resetMs == null) continue;
+    if (a.resetMs == null || b.resetMs == null || Math.abs(a.resetMs - b.resetMs) > 1000) return false;
+  }
+  return true;
+}
+
+function classifyClaudeUsageSnapshot(previous, candidate, nowMs = Date.now()) {
+  let suspicious = false;
+  for (const key of ['five_hour', 'seven_day']) {
+    const oldBucket = usageBucketSnapshot(previous, key);
+    const newBucket = usageBucketSnapshot(candidate, key);
+    if (!oldBucket || !newBucket) continue;
+    const previousResetElapsed = oldBucket.resetMs != null && oldBucket.resetMs <= nowMs;
+    if (oldBucket.resetMs != null && newBucket.resetMs != null) {
+      const resetDelta = newBucket.resetMs - oldBucket.resetMs;
+      if (resetDelta < -CLAUDE_USAGE_RESET_TOLERANCE_MS) return 'obsolete';
+      if (!previousResetElapsed && Math.abs(resetDelta) > CLAUDE_USAGE_RESET_TOLERANCE_MS) {
+        suspicious = true;
       }
-    });
-  });
+    }
+    if (!previousResetElapsed
+      && oldBucket.utilization - newBucket.utilization >= CLAUDE_USAGE_REGRESSION_POINTS) {
+      suspicious = true;
+    }
+  }
+  return suspicious ? 'suspicious' : 'accept';
 }
 
-function fetchUsage(token) {
-  return new Promise((resolve, reject) => {
-    const req = https.request(USAGE_URL, {
+function reconcileClaudeUsageSnapshot(previousEntry, candidate, nowMs = Date.now()) {
+  const previousUsage = previousEntry?.account?.usage || null;
+  const mergedUsage = mergeClaudeUsageData(previousUsage, candidate?.data);
+  if (!mergedUsage) return { entry: previousEntry || null, accepted: false, status: 'invalid' };
+  if (!previousUsage) {
+    return {
+      entry: {
+        ...(previousEntry || {}),
+        account: {
+          ...(previousEntry?.account || {}),
+          usage: mergedUsage,
+          source: candidate.source,
+          timestamp: new Date(candidate.fetchedAt).toISOString(),
+        },
+        fetchedAt: candidate.fetchedAt,
+        pending: null,
+        warning: null,
+      },
+      accepted: true,
+      status: 'accepted',
+    };
+  }
+  const classification = classifyClaudeUsageSnapshot(previousUsage, mergedUsage, nowMs);
+  if (classification === 'accept') {
+    return {
+      entry: {
+        ...previousEntry,
+        account: {
+          ...previousEntry.account,
+          usage: mergedUsage,
+          source: candidate.source,
+          timestamp: new Date(candidate.fetchedAt).toISOString(),
+        },
+        fetchedAt: candidate.fetchedAt,
+        pending: null,
+        warning: null,
+      },
+      accepted: true,
+      status: 'accepted',
+    };
+  }
+  if (classification === 'obsolete') {
+    return {
+      entry: {
+        ...previousEntry,
+        pending: null,
+        warning: CLAUDE_USAGE_INCONSISTENT_WARNING,
+      },
+      accepted: false,
+      status: 'obsolete',
+    };
+  }
+  const pending = previousEntry?.pending || null;
+  const pendingMatches = pending?.data && claudeUsageSnapshotsMatch(pending.data, mergedUsage);
+  if (pendingMatches && nowMs - Number(pending.firstSeenAt || nowMs) >= CLAUDE_USAGE_PENDING_CONFIRM_MS) {
+    return {
+      entry: {
+        ...previousEntry,
+        account: {
+          ...previousEntry.account,
+          usage: mergedUsage,
+          source: candidate.source,
+          timestamp: new Date(candidate.fetchedAt).toISOString(),
+        },
+        fetchedAt: candidate.fetchedAt,
+        pending: null,
+        warning: null,
+      },
+      accepted: true,
+      status: 'confirmed',
+    };
+  }
+  return {
+    entry: {
+      ...previousEntry,
+      pending: {
+        data: mergedUsage,
+        source: candidate.source,
+        fetchedAt: candidate.fetchedAt,
+        firstSeenAt: pendingMatches ? pending.firstSeenAt : nowMs,
+        lastSeenAt: nowMs,
+      },
+      warning: CLAUDE_USAGE_INCONSISTENT_WARNING,
+    },
+    accepted: false,
+    status: 'pending',
+  };
+}
+
+async function fetchUsage(token, {
+  fetchImpl = global.fetch,
+  timeoutMs = USAGE_TIMEOUT_MS,
+  now = Date.now,
+} = {}) {
+  if (!token) throw new ClaudeUsageError('auth_missing', 'Claude OAuth token is unavailable');
+  if (typeof fetchImpl !== 'function') throw new ClaudeUsageError('network_error', 'Fetch is unavailable');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchImpl(USAGE_URL, {
       method: 'GET',
+      cache: 'no-store',
+      redirect: 'error',
+      signal: controller.signal,
       headers: {
         Authorization: `Bearer ${token}`,
         'anthropic-beta': 'oauth-2025-04-20',
         'User-Agent': 'noted-terminal/1.0',
       },
-      timeout: 10000,
-    }, (res) => {
-      let buf = '';
-      res.setEncoding('utf8');
-      res.on('data', (c) => { buf += c; });
-      res.on('end', () => {
-        if (res.statusCode !== 200) {
-          return reject(new Error(`HTTP ${res.statusCode}: ${buf.slice(0, 200)}`));
-        }
-        try { resolve(JSON.parse(buf)); }
-        catch (e) { reject(new Error('Bad JSON: ' + e.message)); }
-      });
     });
-    req.on('timeout', () => { req.destroy(new Error('Request timed out')); });
-    req.on('error', reject);
-    req.end();
-  });
+    if (response.status === 401 || response.status === 403) {
+      throw new ClaudeUsageError('unauthorized', 'Claude OAuth token is invalid', response.status);
+    }
+    if (response.status === 429) {
+      const error = new ClaudeUsageError('rate_limited', 'Anthropic usage endpoint is rate limited', response.status);
+      error.retryAfterMs = retryAfterDelayMs(response.headers?.get?.('retry-after'), now());
+      throw error;
+    }
+    if (!response.ok) {
+      throw new ClaudeUsageError('server_error', 'Anthropic usage endpoint failed', response.status);
+    }
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new ClaudeUsageError('invalid_response', 'Anthropic usage response is not JSON');
+    }
+    return {
+      data: normalizeClaudeUsageData(payload),
+      fetchedAt: now(),
+    };
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new ClaudeUsageError('timeout', 'Anthropic usage request timed out');
+    }
+    if (error instanceof ClaudeUsageError) throw error;
+    throw new ClaudeUsageError('network_error', error?.message || String(error));
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function fetchJson(url, headers, timeoutMs = 15000) {
@@ -489,161 +741,555 @@ async function fetchApiPlatformBilling(apiKey, opts = {}) {
   }
 }
 
-async function getUsage(opts = {}) {
-  const force = !!(typeof opts === 'boolean' ? opts : opts.force);
-  const requestedAccountKey = typeof opts === 'object' && opts ? opts.accountKey || null : null;
-  const now = Date.now();
-  const authState = await readClaudeAuthState();
-  let accounts = buildClaudeUsageAccounts(authState, null);
-  let selectedAccount = pickClaudeAccount(accounts, requestedAccountKey);
+function authMatches(left, right) {
+  return !!left && !!right
+    && left.accountKey === right.accountKey
+    && left.tokenFingerprint === right.tokenFingerprint
+    && left.currentKind === right.currentKind;
+}
 
-  if (!selectedAccount) {
-    return {
-      ok: false,
-      data: null,
-      accounts: [],
-      selectedAccountKey: null,
-      currentAccountKey: null,
-      error: `No Claude OAuth token or API key found in keychain items "${KEYCHAIN_API_SERVICE}" / "${KEYCHAIN_OAUTH_SERVICE}".`,
-      lastAttemptAt: cache.lastAttemptAt,
-    };
-  }
+function accountFromAuth(auth) {
+  if (!auth?.accountKey) return null;
+  return {
+    accountKey: auth.accountKey,
+    kind: auth.currentKind,
+    credentialKind: auth.credentialKind,
+    usageEndpointEligible: auth.usageEndpointEligible === true,
+    label: auth.label || 'Claude account',
+    accountHint: auth.accountHint || null,
+    accountIdHint: null,
+    source: 'claude-auth-status',
+    timestamp: null,
+    usage: null,
+    notice: auth.notice || null,
+  };
+}
 
-  if (selectedAccount.kind === 'api-platform') {
-    const billing = await fetchApiPlatformBilling(authState.apiKey, {
-      force,
-      accountKey: selectedAccount.accountKey,
-    });
-    accounts = accounts.map((account) => (
-      account.accountKey === selectedAccount.accountKey
-        ? { ...account, billing }
-        : account
-    ));
-    selectedAccount = accounts.find((account) => account.accountKey === selectedAccount.accountKey) || selectedAccount;
-    console.log(`[ClaudeUsage] account selected kind=api-platform accounts=${accounts.length} selected=${selectedAccount.label} billing=${billing?.ok ? 'ok' : (billing?.adminKeyConfigured ? 'error' : 'missing-admin-key')}`);
-    return {
-      ok: true,
-      data: null,
-      accounts,
-      selectedAccountKey: selectedAccount.accountKey,
-      currentAccountKey: accounts.find((account) => account.isCurrent)?.accountKey || selectedAccount.accountKey,
-      authKind: selectedAccount.kind,
-      billing,
-      notice: selectedAccount.notice,
-      error: null,
-      lastAttemptAt: billing?.lastAttemptAt || cache.lastAttemptAt,
-    };
-  }
+function sanitizePersistedText(value, max = 120) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().slice(0, max);
+  return trimmed || null;
+}
 
-  const selectedAccountKey = selectedAccount.accountKey;
-  // Cache hit — explicitly clear the previous error in cache so callers know
-  // the world is fine again (previous behaviour left a stale `cache.error`
-  // pointing at a long-passed 429, and the renderer's banner survived even
-  // through successful polling cycles).
-  if (!force && cache.data && cache.accountKey === selectedAccountKey && (now - cache.at) < CACHE_TTL_MS) {
-    accounts = buildClaudeUsageAccounts(authState, cache.data);
-    return {
-      ok: true,
-      data: cache.data,
-      accounts,
-      selectedAccountKey,
-      currentAccountKey: accounts.find((account) => account.isCurrent)?.accountKey || selectedAccountKey,
-      authKind: selectedAccount.kind,
-      cachedMsAgo: now - cache.at,
-      error: null,
-      lastAttemptAt: cache.lastAttemptAt,
-    };
-  }
-  // Background polling honours an error-cooldown to avoid pummeling Anthropic
-  // while a 429 window is active. Force refresh (user pressed the refresh
-  // button) bypasses this — they explicitly want a live attempt.
-  if (!force && cache.accountKey === selectedAccountKey && cache.lastErrorAt && (now - cache.lastErrorAt) < ERROR_COOLDOWN_MS) {
-    // Cold-start case: cooldown active but no in-memory data yet — seed from
-    // last persisted snapshot so the chip isn't blank during the wait.
-    if (!cache.data) {
-      const fb = loadFallbackFromSnapshot();
-      if (fb) { cache.data = fb.data; cache.at = fb.at; cache.accountKey = selectedAccountKey; }
+function sanitizeClaudePersistedAccount(raw) {
+  const accountKey = sanitizePersistedText(raw?.accountKey, 80);
+  if (!accountKey || !/^claude:[a-f0-9]{20}$/.test(accountKey)) return null;
+  const allowedKinds = new Set(['max-oauth', 'api-platform', 'claude-managed-key']);
+  const kind = allowedKinds.has(raw?.kind) ? raw.kind : 'claude-managed-key';
+  let usage = null;
+  if (raw?.usage) {
+    try {
+      usage = normalizeClaudeUsageData(raw.usage);
+    } catch {
+      return null;
     }
-    accounts = buildClaudeUsageAccounts(authState, cache.data);
-    return {
-      ok: !!cache.data && !cache.error,
-      data: cache.data || null,
-      accounts,
-      selectedAccountKey,
-      currentAccountKey: accounts.find((account) => account.isCurrent)?.accountKey || selectedAccountKey,
-      authKind: selectedAccount.kind,
-      error: cache.error || null,
-      cachedMsAgo: cache.at ? now - cache.at : null,
-      cooldownMsLeft: ERROR_COOLDOWN_MS - (now - cache.lastErrorAt),
-      lastAttemptAt: cache.lastAttemptAt,
-    };
   }
-  cache.lastAttemptAt = now;
+  const rawLabel = sanitizePersistedText(raw?.label, 80);
+  const label = rawLabel?.includes('@') ? maskEmail(rawLabel) : rawLabel;
+  const source = ['claude-statusline', 'anthropic-oauth-api', 'claude-auth-status']
+    .includes(raw?.source) ? raw.source : 'claude-auth-status';
+  const timestampMs = Date.parse(raw?.timestamp || '');
+  return {
+    accountKey,
+    kind,
+    credentialKind: ['oauth-bearer', 'api-key', 'managed-api-key', 'managed-session']
+      .includes(raw?.credentialKind) ? raw.credentialKind : null,
+    usageEndpointEligible: raw?.usageEndpointEligible === true,
+    label: label || 'Claude account',
+    accountHint: sanitizePersistedText(raw?.accountHint, 80),
+    accountIdHint: null,
+    source,
+    timestamp: Number.isFinite(timestampMs) ? new Date(timestampMs).toISOString() : null,
+    usage,
+    notice: kind === 'claude-managed-key'
+      ? 'Quota updates after Claude replies through the official status line.'
+      : null,
+  };
+}
+
+function serializeClaudeUsageState(entries = claudeUsageByAccount) {
+  const accounts = [...entries.entries()]
+    .map(([accountKey, entry]) => {
+      const account = sanitizeClaudePersistedAccount({ ...entry?.account, accountKey });
+      if (!account) return null;
+      return {
+        account,
+        fetchedAt: Number(entry?.fetchedAt || 0) || 0,
+        lastAttemptAt: Number(entry?.lastAttemptAt || 0) || null,
+        touchedAt: Number(entry?.touchedAt || entry?.fetchedAt || 0) || 0,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.touchedAt - left.touchedAt)
+    .slice(0, 8);
+  return { version: 1, accounts };
+}
+
+function parseClaudeUsageState(raw) {
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    try { parsed = JSON.parse(raw); } catch { return []; }
+  }
+  if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.accounts)) return [];
+  return parsed.accounts.slice(0, 8).map((item) => {
+    const account = sanitizeClaudePersistedAccount(item?.account);
+    if (!account) return null;
+    return {
+      account,
+      tokenFingerprint: null,
+      fetchedAt: Number(item?.fetchedAt || 0) || 0,
+      lastAttemptAt: Number(item?.lastAttemptAt || 0) || null,
+      touchedAt: Number(item?.touchedAt || item?.fetchedAt || 0) || 0,
+      error: null,
+      errorAt: 0,
+      billing: null,
+      pending: null,
+      warning: null,
+      retryNotBefore: 0,
+    };
+  }).filter(Boolean);
+}
+
+function usageStateStore() {
+  return claudeUsageStateStore || _projectManager?.db || null;
+}
+
+function hydrateClaudeUsageState() {
+  if (claudeUsageStateHydrated) return;
+  const store = usageStateStore();
+  if (!store?.getAppState) return;
+  claudeUsageStateHydrated = true;
   try {
-    const token = authState.oauthToken;
-    if (!token) throw new Error('No Claude OAuth accessToken available for Max usage. Current Claude auth may be API Platform only.');
-    const data = await fetchUsage(token);
-    cache = { at: now, accountKey: selectedAccountKey, data, error: null, lastErrorAt: 0, lastAttemptAt: now };
-    accounts = buildClaudeUsageAccounts(authState, data);
-    console.log('[ClaudeUsage] fetched account=' + (selectedAccount.label || selectedAccount.kind) + ' accounts=' + accounts.length + ' 5h=' + (data?.five_hour?.utilization ?? '?') + '% 7d=' + (data?.seven_day?.utilization ?? '?') + '%');
-    // Persist snapshot for daily-history aggregation. Run on every real
-    // network fetch (not on cache hits) — gives ~1 snapshot/min when chip is
-    // visible. Failed network fetches don't reach here, so we don't store
-    // bogus rows.
-    if (_projectManager?.db) {
-      try {
-        _projectManager.db.saveClaudeUsageSnapshot({
-          ts: Math.floor(now / 1000),
-          weekly_pct: data?.seven_day?.utilization ?? null,
-          five_hour_pct: data?.five_hour?.utilization ?? null,
-          weekly_opus_pct: data?.seven_day_opus?.utilization ?? null,
-          weekly_sonnet_pct: data?.seven_day_sonnet?.utilization ?? null,
-          weekly_resets_at: data?.seven_day?.resets_at ?? null,
-          five_hour_resets_at: data?.five_hour?.resets_at ?? null,
-        });
-      } catch (e) {
-        console.error('[ClaudeUsage] snapshot save failed:', e.message);
+    for (const entry of parseClaudeUsageState(store.getAppState(CLAUDE_USAGE_PERSISTENCE_KEY))) {
+      claudeUsageByAccount.set(entry.account.accountKey, entry);
+    }
+  } catch (error) {
+    console.warn('[ClaudeUsage] persisted accounts restore failed:', error?.message || String(error));
+  }
+}
+
+function persistClaudeUsageState() {
+  const store = usageStateStore();
+  if (!store?.setAppState) return;
+  try {
+    store.setAppState(CLAUDE_USAGE_PERSISTENCE_KEY, serializeClaudeUsageState());
+  } catch (error) {
+    console.warn('[ClaudeUsage] persisted accounts save failed:', error?.message || String(error));
+  }
+}
+
+function pruneClaudeUsageAccounts(currentAccountKey = null) {
+  if (claudeUsageByAccount.size <= 8) return;
+  const removable = [...claudeUsageByAccount.entries()]
+    .filter(([accountKey]) => accountKey !== currentAccountKey)
+    .sort((left, right) => Number(left[1]?.touchedAt || 0) - Number(right[1]?.touchedAt || 0));
+  while (claudeUsageByAccount.size > 8 && removable.length > 0) {
+    claudeUsageByAccount.delete(removable.shift()[0]);
+  }
+}
+
+function ensureCurrentAuthAccount(auth, now = Date.now()) {
+  if (!auth?.accountKey) return null;
+  const descriptor = accountFromAuth(auth);
+  const previous = claudeUsageByAccount.get(auth.accountKey) || null;
+  const next = {
+    ...previous,
+    account: {
+      ...descriptor,
+      ...(previous?.account || {}),
+      ...descriptor,
+      usage: previous?.account?.usage || null,
+      source: previous?.account?.usage ? previous.account.source : descriptor.source,
+      timestamp: previous?.account?.usage ? previous.account.timestamp : null,
+    },
+    tokenFingerprint: auth.tokenFingerprint,
+    touchedAt: now,
+    error: previous?.error || null,
+    errorAt: previous?.errorAt || 0,
+    billing: previous?.billing || null,
+    pending: previous?.pending || null,
+    warning: previous?.warning || null,
+    retryNotBefore: previous?.retryNotBefore || 0,
+  };
+  claudeUsageByAccount.set(auth.accountKey, next);
+  pruneClaudeUsageAccounts(auth.accountKey);
+  persistClaudeUsageState();
+  return next;
+}
+
+function listClaudeUsageAccounts(currentAccountKey = null, now = Date.now()) {
+  return [...claudeUsageByAccount.entries()]
+    .map(([accountKey, entry]) => {
+      const account = entry?.account;
+      if (!account) return null;
+      const isCurrent = accountKey === currentAccountKey;
+      const fetchedAt = Number(entry.fetchedAt || 0);
+      return {
+        ...account,
+        isCurrent,
+        stale: !isCurrent || !account.usage || !!entry.error || !!entry.warning
+          || !fetchedAt || now - fetchedAt > USAGE_STALE_MS,
+        lastError: isCurrent ? (entry.error || null) : null,
+        warning: isCurrent ? (entry.warning || null) : null,
+        lastAttemptAt: entry.lastAttemptAt || null,
+        billing: isCurrent ? (entry.billing || null) : null,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => {
+      if (!!left.isCurrent !== !!right.isCurrent) return left.isCurrent ? -1 : 1;
+      const leftAt = Date.parse(left.timestamp || '') || 0;
+      const rightAt = Date.parse(right.timestamp || '') || 0;
+      return rightAt - leftAt;
+    });
+}
+
+function selectClaudeUsageAccount(accounts, requestedAccountKey, currentAccountKey) {
+  if (requestedAccountKey) {
+    const requested = accounts.find((account) => account.accountKey === requestedAccountKey);
+    if (requested) return requested;
+  }
+  return accounts.find((account) => account.accountKey === currentAccountKey)
+    || accounts[0]
+    || null;
+}
+
+function buildUsageResponse({
+  requestedAccountKey = null,
+  currentAccountKey = null,
+  now = Date.now(),
+  error = undefined,
+} = {}) {
+  const accounts = listClaudeUsageAccounts(currentAccountKey, now);
+  const selected = selectClaudeUsageAccount(accounts, requestedAccountKey, currentAccountKey);
+  const selectedEntry = selected ? claudeUsageByAccount.get(selected.accountKey) : null;
+  const selectedError = error === undefined
+    ? (selected?.isCurrent ? selectedEntry?.error || null : null)
+    : error;
+  const fetchedAt = Number(selectedEntry?.fetchedAt || 0);
+  return {
+    ok: !!selected && !selectedError,
+    data: selected?.usage || null,
+    accounts,
+    selectedAccountKey: selected?.accountKey || null,
+    currentAccountKey,
+    authKind: selected?.kind || null,
+    billing: selected?.billing || null,
+    notice: selected?.notice || null,
+    source: selected?.source || null,
+    stale: selected?.stale ?? true,
+    cachedMsAgo: fetchedAt ? Math.max(0, now - fetchedAt) : null,
+    lastAttemptAt: selected?.lastAttemptAt || null,
+    lastSuccessAt: selected?.timestamp || null,
+    warning: selected?.warning || null,
+    error: selectedError || null,
+  };
+}
+
+function saveUsageSnapshot(accountKey, data, fetchedAt) {
+  if (!_projectManager?.db?.saveClaudeUsageSnapshot || !accountKey || !data) return;
+  try {
+    _projectManager.db.saveClaudeUsageSnapshot({
+      account_key: accountKey,
+      ts: Math.floor(fetchedAt / 1000),
+      weekly_pct: data?.seven_day?.utilization ?? null,
+      five_hour_pct: data?.five_hour?.utilization ?? null,
+      weekly_opus_pct: data?.seven_day_opus?.utilization ?? null,
+      weekly_sonnet_pct: data?.seven_day_sonnet?.utilization ?? null,
+      weekly_resets_at: data?.seven_day?.resets_at ?? null,
+      five_hour_resets_at: data?.five_hour?.resets_at ?? null,
+    });
+  } catch (error) {
+    console.error('[ClaudeUsage] snapshot save failed:', error?.message || String(error));
+  }
+}
+
+async function bindStatuslineSession(bindingKey, authReader) {
+  const existing = statuslineSessionBindings.get(bindingKey);
+  if (existing) return existing;
+  let inflight = statuslineBindingInflight.get(bindingKey);
+  if (!inflight) {
+    inflight = (async () => {
+      const before = await authReader();
+      if (!before?.accountKey) return null;
+      const after = await authReader();
+      if (!authMatches(before, after)) return null;
+      const binding = {
+        accountKey: after.accountKey,
+        tokenFingerprint: after.tokenFingerprint,
+        account: accountFromAuth(after),
+      };
+      statuslineSessionBindings.set(bindingKey, binding);
+      return binding;
+    })();
+    statuslineBindingInflight.set(bindingKey, inflight);
+    inflight.finally(() => {
+      if (statuslineBindingInflight.get(bindingKey) === inflight) {
+        statuslineBindingInflight.delete(bindingKey);
+      }
+    }).catch(() => {});
+  }
+  return inflight;
+}
+
+async function recordStatuslineUsage(data, {
+  authReader = readClaudeAuthState,
+  now = Date.now,
+} = {}) {
+  hydrateClaudeUsageState();
+  const sessionId = sanitizePersistedText(data?.session_id, 160);
+  const processId = Number(data?.ppid);
+  if (!sessionId || !Number.isFinite(processId) || processId <= 0 || !data?.rate_limits) {
+    return { accepted: false, reason: 'missing-rate-limits' };
+  }
+  let usage;
+  try {
+    usage = normalizeClaudeUsageData(data.rate_limits, { statusline: true });
+  } catch (error) {
+    console.warn('[ClaudeUsage] rejected invalid statusline rate_limits:', error?.message || String(error));
+    return { accepted: false, reason: error?.code || 'invalid-response' };
+  }
+  const binding = await bindStatuslineSession(`${sessionId}:${Math.trunc(processId)}`, authReader);
+  if (!binding?.accountKey) return { accepted: false, reason: 'auth-changed' };
+  const nowMs = now();
+  const bridgeAt = Number(data.updated_at);
+  const fetchedAt = Number.isFinite(bridgeAt) && bridgeAt > 0
+    ? Math.min(nowMs, bridgeAt * 1000)
+    : nowMs;
+  const previous = claudeUsageByAccount.get(binding.accountKey) || null;
+  const timestamp = new Date(fetchedAt).toISOString();
+  const reconciled = reconcileClaudeUsageSnapshot(previous, {
+    data: usage,
+    source: 'claude-statusline',
+    fetchedAt,
+  }, nowMs);
+  const next = {
+    ...(reconciled.entry || previous || {}),
+    account: {
+      ...binding.account,
+      ...(reconciled.entry?.account || previous?.account || {}),
+    },
+    tokenFingerprint: binding.tokenFingerprint,
+    lastAttemptAt: fetchedAt,
+    touchedAt: nowMs,
+    error: null,
+    errorAt: 0,
+    billing: previous?.billing || null,
+    retryNotBefore: 0,
+  };
+  claudeUsageByAccount.set(binding.accountKey, next);
+  pruneClaudeUsageAccounts(null);
+  if (reconciled.accepted) {
+    persistClaudeUsageState();
+    saveUsageSnapshot(binding.accountKey, next.account.usage, next.fetchedAt);
+  }
+  return {
+    accepted: reconciled.accepted,
+    reason: reconciled.status,
+    accountKey: binding.accountKey,
+    timestamp: reconciled.accepted ? timestamp : previous?.account?.timestamp || null,
+  };
+}
+
+async function fetchCurrentClaudeUsage(auth, {
+  force,
+  authReader,
+  fetchImpl,
+  now,
+} = {}) {
+  const inflightKey = `${auth.accountKey}:${auth.tokenFingerprint || 'session'}:${auth.currentKind}`;
+  let request = claudeUsageInflight.get(inflightKey);
+  if (!request) {
+    request = (async () => {
+      let result;
+      if (auth.currentKind === 'api-platform') {
+        result = {
+          billing: await fetchApiPlatformBilling(auth.apiKey, {
+            force,
+            accountKey: `${auth.accountKey}:${auth.tokenFingerprint || 'key'}`,
+          }),
+          fetchedAt: now(),
+        };
+      } else {
+        result = await fetchUsage(auth.oauthToken, { fetchImpl, now });
+      }
+      const latestAuth = await authReader();
+      if (!authMatches(auth, latestAuth)) {
+        const changed = new ClaudeUsageError('account_changed', 'Claude login changed during usage refresh');
+        changed.authSnapshot = auth;
+        throw changed;
+      }
+      return { ...result, auth: latestAuth };
+    })();
+    claudeUsageInflight.set(inflightKey, request);
+    request.finally(() => {
+      if (claudeUsageInflight.get(inflightKey) === request) {
+        claudeUsageInflight.delete(inflightKey);
+      }
+    }).catch(() => {});
+  }
+  return request;
+}
+
+async function getUsage(opts = {}) {
+  hydrateClaudeUsageState();
+  const options = typeof opts === 'boolean' ? { force: opts } : (opts || {});
+  const force = !!options.force;
+  const requestedAccountKey = options.accountKey ? String(options.accountKey) : null;
+  const authReader = options.authReader || readClaudeAuthState;
+  const fetchImpl = options.fetchImpl || global.fetch;
+  const now = options.now || Date.now;
+  const authRetryCount = Number(options.authRetryCount || 0);
+  let auth = await authReader();
+  const nowMs = now();
+  if (auth?.accountKey) ensureCurrentAuthAccount(auth, nowMs);
+  const currentAccountKey = auth?.accountKey || null;
+
+  let response = buildUsageResponse({
+    requestedAccountKey,
+    currentAccountKey,
+    now: nowMs,
+  });
+  const selectedIsHistorical = response.selectedAccountKey
+    && response.selectedAccountKey !== currentAccountKey;
+  if (selectedIsHistorical || !auth?.accountKey) {
+    if (!response.selectedAccountKey) {
+      response = {
+        ...response,
+        ok: false,
+        error: 'Claude is not signed in and no saved account snapshot is available.',
+      };
+    }
+    return response;
+  }
+
+  const current = claudeUsageByAccount.get(auth.accountKey) || null;
+  const hasFreshPrimarySnapshot = current?.account?.usage
+    && current.account.source === 'claude-statusline'
+    && nowMs - Number(current.fetchedAt || 0) < CACHE_TTL_MS;
+
+  // Managed /login credentials cannot call /api/oauth/usage. The official
+  // statusLine snapshot is the only quota source; refresh re-reads auth but
+  // never sends the API-shaped key as a bearer token.
+  if (auth.currentKind === 'claude-managed-key') {
+    return buildUsageResponse({
+      requestedAccountKey,
+      currentAccountKey,
+      now: nowMs,
+      error: null,
+    });
+  }
+
+  if (auth.currentKind !== 'api-platform' && hasFreshPrimarySnapshot) {
+    return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
+  }
+  if (current?.retryNotBefore && nowMs < current.retryNotBefore) {
+    return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
+  }
+  if (!force && current?.errorAt
+    && current.tokenFingerprint === auth.tokenFingerprint
+    && nowMs - current.errorAt < ERROR_COOLDOWN_MS) {
+    return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
+  }
+  if (!force && !current?.error && current?.account?.usage
+    && current.tokenFingerprint === auth.tokenFingerprint
+    && nowMs - Number(current.fetchedAt || 0) < CACHE_TTL_MS) {
+    return buildUsageResponse({ requestedAccountKey, currentAccountKey, now: nowMs });
+  }
+
+  const lastAttemptAt = now();
+  try {
+    const result = await fetchCurrentClaudeUsage(auth, {
+      force,
+      authReader,
+      fetchImpl,
+      now,
+    });
+    auth = result.auth || auth;
+    const previous = claudeUsageByAccount.get(auth.accountKey) || null;
+    if (auth.currentKind === 'api-platform') {
+      claudeUsageByAccount.set(auth.accountKey, {
+        ...previous,
+        account: { ...(previous?.account || {}), ...accountFromAuth(auth) },
+        tokenFingerprint: auth.tokenFingerprint,
+        billing: result.billing,
+        lastAttemptAt,
+        touchedAt: lastAttemptAt,
+        error: result.billing?.error || null,
+        errorAt: result.billing?.error ? lastAttemptAt : 0,
+        retryNotBefore: 0,
+      });
+    } else {
+      const reconciled = reconcileClaudeUsageSnapshot(previous, {
+        data: result.data,
+        source: 'anthropic-oauth-api',
+        fetchedAt: result.fetchedAt,
+      }, lastAttemptAt);
+      const next = {
+        ...(reconciled.entry || previous || {}),
+        account: {
+          ...accountFromAuth(auth),
+          ...(reconciled.entry?.account || previous?.account || {}),
+        },
+        tokenFingerprint: auth.tokenFingerprint,
+        lastAttemptAt,
+        touchedAt: lastAttemptAt,
+        error: null,
+        errorAt: 0,
+        retryNotBefore: 0,
+      };
+      claudeUsageByAccount.set(auth.accountKey, next);
+      if (reconciled.accepted) {
+        saveUsageSnapshot(auth.accountKey, next.account.usage, next.fetchedAt);
       }
     }
-    return {
-      ok: true,
-      data,
-      accounts,
-      selectedAccountKey,
-      currentAccountKey: accounts.find((account) => account.isCurrent)?.accountKey || selectedAccountKey,
-      authKind: selectedAccount.kind,
-      cachedMsAgo: 0,
-      error: null,
-      lastAttemptAt: now,
-    };
-  } catch (e) {
-    console.error('[ClaudeUsage] fetch failed:', e.message);
-    if (cache.accountKey !== selectedAccountKey) {
-      cache.data = null;
-      cache.at = 0;
+    pruneClaudeUsageAccounts(auth.accountKey);
+    persistClaudeUsageState();
+    return buildUsageResponse({
+      requestedAccountKey,
+      currentAccountKey: auth.accountKey,
+      now: now(),
+    });
+  } catch (error) {
+    const latestAuth = await authReader();
+    const authChanged = !authMatches(auth, latestAuth);
+    if (authChanged) {
+      if (latestAuth?.accountKey && authRetryCount < 1) {
+        return getUsage({
+          ...options,
+          force: false,
+          authReader,
+          fetchImpl,
+          now,
+          authRetryCount: authRetryCount + 1,
+        });
+      }
+      return buildUsageResponse({
+        requestedAccountKey,
+        currentAccountKey: latestAuth?.accountKey || null,
+        now: now(),
+        error: latestAuth?.accountKey ? 'Claude login changed during usage refresh.' : 'Claude is not signed in.',
+      });
     }
-    cache.error = e.message;
-    cache.lastErrorAt = now;
-    cache.lastAttemptAt = now;
-    cache.accountKey = selectedAccountKey;
-    // Cold-start: live fetch failed AND no in-memory data — seed from
-    // persisted snapshot so renderer still gets real numbers. `error` поле
-    // remains set so banner is visible, but chip shows %, не прочерк.
-    if (!cache.data) {
-      const fb = loadFallbackFromSnapshot();
-      if (fb) { cache.data = fb.data; cache.at = fb.at; cache.accountKey = selectedAccountKey; }
-    }
-    accounts = buildClaudeUsageAccounts(authState, cache.data);
-    return {
-      ok: false,
-      error: e.message,
-      data: cache.data || null,
-      accounts,
-      selectedAccountKey,
-      currentAccountKey: accounts.find((account) => account.isCurrent)?.accountKey || selectedAccountKey,
-      authKind: selectedAccount.kind,
-      lastAttemptAt: now,
-    };
+    const previous = claudeUsageByAccount.get(auth.accountKey) || null;
+    claudeUsageByAccount.set(auth.accountKey, {
+      ...previous,
+      tokenFingerprint: auth.tokenFingerprint,
+      lastAttemptAt,
+      touchedAt: lastAttemptAt,
+      error: error?.message || String(error),
+      errorAt: now(),
+      retryNotBefore: error?.code === 'rate_limited'
+        ? now() + Number(error.retryAfterMs || ERROR_COOLDOWN_MS)
+        : (previous?.retryNotBefore || 0),
+    });
+    pruneClaudeUsageAccounts(auth.accountKey);
+    console.warn('[ClaudeUsage] refresh failed account=' + auth.label + ' code=' + (error?.code || 'network_error'));
+    return buildUsageResponse({
+      requestedAccountKey,
+      currentAccountKey: auth.accountKey,
+      now: now(),
+    });
   }
 }
 
@@ -675,11 +1321,11 @@ function resetsAtDay(s) {
   return String(s).slice(0, 10); // YYYY-MM-DD
 }
 
-function computeDailyHistory(days = 7) {
-  if (!_projectManager?.db) return [];
+function computeDailyHistory(days = 7, accountKey = null) {
+  if (!_projectManager?.db || !accountKey) return [];
   const now = Math.floor(Date.now() / 1000);
   const fromTs = now - (days * 24 * 60 * 60) - (24 * 60 * 60); // +1 day buffer for cross-midnight last sample
-  const rows = _projectManager.db.getClaudeUsageSnapshots(fromTs, now);
+  const rows = _projectManager.db.getClaudeUsageSnapshots(fromTs, now, accountKey);
   if (rows.length === 0) return [];
 
   // Bucket by local date (YYYY-MM-DD)
@@ -938,8 +1584,45 @@ function computeActivityStats(days = 14) {
   return computeActivityStatsFromRows(rows, days, now);
 }
 
+function buildClaudeUsageAccounts(authState, usageData = null) {
+  const account = accountFromAuth(authState);
+  if (!account) return [];
+  return [{
+    ...account,
+    usage: usageData || null,
+    source: usageData ? 'anthropic-oauth-api' : account.source,
+    timestamp: usageData ? new Date().toISOString() : null,
+    isCurrent: true,
+    stale: !usageData,
+  }];
+}
+
+function setClaudeUsageStateStoreForTests(store) {
+  claudeUsageStateStore = store || null;
+  claudeUsageStateHydrated = false;
+}
+
+function setClaudeUsageProjectManagerForTests(projectManager) {
+  _projectManager = projectManager || null;
+  claudeUsageStateHydrated = false;
+}
+
+function resetClaudeUsageStateForTests() {
+  claudeUsageByAccount.clear();
+  claudeUsageInflight.clear();
+  statuslineSessionBindings.clear();
+  statuslineBindingInflight.clear();
+  claudeUsageStateStore = null;
+  claudeUsageStateHydrated = false;
+  apiBillingCache = { at: 0, accountKey: null, data: null, error: null, lastAttemptAt: 0 };
+  _projectManager = null;
+}
+
 function register({ projectManager }) {
   _projectManager = projectManager;
+  claudeUsageStateStore = projectManager?.db || null;
+  claudeUsageStateHydrated = false;
+  hydrateClaudeUsageState();
 
   ipcMain.handle('claude-usage:get', async (_e, opts) => {
     return getUsage({
@@ -961,8 +1644,13 @@ function register({ projectManager }) {
   ipcMain.handle('claude-usage:daily-history', async (_e, opts) => {
     try {
       const days = (opts && Number.isFinite(opts.days)) ? opts.days : 7;
-      const history = computeDailyHistory(days);
-      return { ok: true, history };
+      let accountKey = opts?.accountKey ? String(opts.accountKey) : null;
+      if (!accountKey) {
+        const auth = await readClaudeAuthState();
+        accountKey = auth?.accountKey || null;
+      }
+      const history = computeDailyHistory(days, accountKey);
+      return { ok: true, history, accountKey };
     } catch (e) {
       console.error('[ClaudeUsage] daily-history failed:', e.message);
       return { ok: false, error: e.message };
@@ -972,13 +1660,28 @@ function register({ projectManager }) {
 
 module.exports = {
   register,
+  recordStatuslineUsage,
   _api: {
     buildClaudeUsageAccounts,
+    buildUsageResponse,
+    classifyClaudeAuth,
     computeActivityStatsFromRows,
+    computeDailyHistory,
     computeUnionActivity,
+    fetchUsage,
     fetchApiPlatformBilling,
     getUsage,
+    listClaudeUsageAccounts,
+    normalizeClaudeUsageData,
+    parseClaudeUsageState,
     readClaudeAuthState,
+    recordStatuslineUsage,
+    resetClaudeUsageStateForTests,
+    sanitizeClaudePersistedAccount,
+    serializeClaudeUsageState,
+    setClaudeUsageProjectManagerForTests,
+    setClaudeUsageStateStoreForTests,
+    stableClaudeAccountKey,
     summarizeCostReport,
   },
 };

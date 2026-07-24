@@ -855,9 +855,9 @@ export default function ProjectToolbar({ isSystemProject = false }: { isSystemPr
       {/* Flex spacer — pushes session-copy cluster to the right edge of the toolbar */}
       <div style={{ flex: 1 }} />
 
-      {/* Claude usage chip — weekly utilization % from Anthropic OAuth usage API
-          (same source as Blimp-Labs claude-usage-bar). Sits left of Dictation
-          history; popover opens DOWN with full 5h/7d/extra-credits breakdown. */}
+      {/* One adjoining Codex + Claude usage control. Each half opens the same
+          downward popover on its provider; Claude prefers the official
+          statusline quota payload and Codex uses the account usage endpoint. */}
       <div className="flex items-center gap-1 pr-2">
         <Tooltip content={outline
           ? `Пересобрать группы всей текущей сессии${outlineNewCount > 0 ? ` · новых ходов: ${outlineNewCount}` : ''}`

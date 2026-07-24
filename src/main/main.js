@@ -51,6 +51,9 @@ registerAtomicMoveBatchIpc({
 function loadEnvFile(p) {
   try {
     if (!fs.existsSync(p)) return;
+    // These files contain service credentials used by Electron main. Keep the
+    // values intact, but do not leave them readable by other local users.
+    try { fs.chmodSync(p, 0o600); } catch { /* read-only fallback may still be usable */ }
     for (const line of fs.readFileSync(p, 'utf8').split('\n')) {
       const match = line.match(/^([^#=]+)=(.*)$/);
       if (match) process.env[match[1].trim()] = match[2].trim();
@@ -125,6 +128,11 @@ const {
 const {
   createTerminalShellReadinessTracker,
 } = require(path.join(srcMainDir, 'terminal-shell-readiness.cjs'));
+const {
+  buildChildProcessEnv,
+  isolateMainProcessEnv,
+} = require(path.join(srcMainDir, 'child-process-env'));
+isolateMainProcessEnv();
 const {
   codexPromptHasImageMarker,
   collectCodexPayloadImagePaths,
@@ -965,7 +973,7 @@ if (process.env.NOTED_PERF_WATCHDOG !== '0' && process.env.NOTED_E2E_TEST !== 't
       // ELECTRON_RUN_AS_NODE: fork() from Electron-main spawns the Electron
       // binary; this env makes it behave as plain node (no app instance, no
       // Dock icon). stdio ignored — the watchdog appends to the log file itself.
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      env: buildChildProcessEnv({ ELECTRON_RUN_AS_NODE: '1' }),
       stdio: 'ignore',
       detached: false,
     });
@@ -4096,6 +4104,17 @@ function startSessionBridge() {
         // means subsequent checks still compare against the right project.
         // See docs/knowledge/fix-bridge-stale-takeover.md.
         console.log('[Bridge:CwdGuard] Path drift OK (tab=' + tabCwd + ' bridge=' + data.cwd + ') — accepted for this update, tab cwd preserved');
+      }
+
+      // Commit Claude Code's official statusLine quota snapshot before the
+      // existing bridge-update event reaches renderer. The event can then
+      // trigger an immediate IPC read without racing this write.
+      if (data.rate_limits) {
+        try {
+          await require(path.join(srcMainDir, 'ipc', 'claude-usage')).recordStatuslineUsage(data);
+        } catch (e) {
+          console.warn('[ClaudeUsage] statusline bridge record failed:', e?.message || String(e));
+        }
       }
 
       // Debug: log PID chain resolution for session detection
@@ -10699,8 +10718,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     }
 
     // Build env with shell integration
-    const shellEnv = {
-      ...process.env,
+    const shellEnv = buildChildProcessEnv({
       TERM: 'xterm-256color',
       COLORTERM: 'truecolor',  // Enable 24-bit colors for Ink-based CLIs (gemini, claude)
       CLICOLOR: '1',
@@ -10760,7 +10778,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       // expected hit on fork/--resume where parent and child should share the same
       // prefix bytes. See packages/claude-code-src/constants/system.ts:52.
       CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
-    };
+    });
 
     // Agent launchers can export NO_COLOR=1/FORCE_COLOR=0. Claude/Codex respect
     // those variables and emit no ANSI colors, which makes the whole TUI
@@ -14146,7 +14164,11 @@ function hasLiveClaudeInTab(tabId) {
 async function readProcessEditor(pid) {
   try {
     const { execSync } = require('child_process');
-    const out = execSync('ps -p ' + pid + ' -wwwE -o command=', { timeout: 1000, encoding: 'utf8' });
+    const out = execSync('ps -p ' + pid + ' -wwwE -o command=', {
+      timeout: 1000,
+      encoding: 'utf8',
+      env: buildChildProcessEnv(),
+    });
     const m = out.match(/(?:^|\s)EDITOR=([^\s]+(?:\s+[^=\s][^=]*)?)/);
     return m ? m[1] : null;
   } catch {
@@ -17918,7 +17940,11 @@ ipcMain.on('terminal:kill', async (event, tabId) => {
 const execAsync = (cmd, timeout = 1000) => {
   return new Promise((resolve, reject) => {
     const { exec } = require('child_process');
-    const child = exec(cmd, { encoding: 'utf-8', timeout }, (err, stdout) => {
+    const child = exec(cmd, {
+      encoding: 'utf-8',
+      timeout,
+      env: buildChildProcessEnv(),
+    }, (err, stdout) => {
       if (err) reject(err);
       else resolve(stdout.trim());
     });
@@ -18844,7 +18870,11 @@ ipcMain.on('tab-notification:play-sound', () => {
     if (process.platform === 'darwin') {
       const soundPath = '/System/Library/Sounds/Glass.aiff';
       if (fs.existsSync(soundPath)) {
-        const child = spawn('afplay', [soundPath], { stdio: 'ignore', detached: true });
+        const child = spawn('afplay', [soundPath], {
+          stdio: 'ignore',
+          detached: true,
+          env: buildChildProcessEnv(),
+        });
         child.unref();
         return;
       }
@@ -20596,7 +20626,10 @@ ipcMain.handle('system:dump-claude-state', async () => {
     const pid = pidByTab.get(tabId);
     let pidAlive = null;
     if (pid) {
-      try { execSync('kill -0 ' + pid + ' 2>/dev/null'); pidAlive = true; }
+      try {
+        execSync('kill -0 ' + pid + ' 2>/dev/null', { env: buildChildProcessEnv() });
+        pidAlive = true;
+      }
       catch { pidAlive = false; }
     }
     const last = claudeHookLastEvent.get(tabId);
@@ -21397,7 +21430,10 @@ function buildExternalToolPath() {
 function execFileAsync(command, args, options = {}) {
   const { execFile } = require('child_process');
   return new Promise((resolve, reject) => {
-    execFile(command, args, options, (error, stdout, stderr) => {
+    execFile(command, args, {
+      ...options,
+      env: buildChildProcessEnv({}, options.env || process.env),
+    }, (error, stdout, stderr) => {
       if (error) {
         error.stdout = stdout;
         error.stderr = stderr;
@@ -21420,7 +21456,7 @@ ipcMain.handle('file:open-in-sublime', async (event, filePath) => {
       return { success: false, error: 'Path is not a file' };
     }
 
-    const env = { ...process.env, PATH: buildExternalToolPath() };
+    const env = buildChildProcessEnv({ PATH: buildExternalToolPath() });
     const candidates = [
       process.env.SUBLIME_TEXT_CLI,
       '/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl',
@@ -33527,6 +33563,7 @@ async function loadSdkModelCapabilities() {
       const q = query({ prompt: neverEnding, options: {
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
+        env: buildChildProcessEnv(),
         ...(claudeBin ? { pathToClaudeCodeExecutable: claudeBin } : {}),
       } });
       const models = await q.supportedModels();
@@ -34077,6 +34114,7 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
   const options = {
     abortController,
     cwd: cwd || process.cwd(),
+    env: buildChildProcessEnv(),
     permissionMode: 'bypassPermissions',
     // SDK 0.3.x explicit safety gate — must be true together with
     // bypassPermissions or the CLI rejects the request at handshake.
@@ -34830,6 +34868,7 @@ ipcMain.handle('claude-sdk:probe-commands', async (event, { tabId }) => {
         options: {
           allowDangerouslySkipPermissions: true,
           permissionMode: 'bypassPermissions',
+          env: buildChildProcessEnv(),
           ...(claudeBin ? { pathToClaudeCodeExecutable: claudeBin } : {}),
         },
       });

@@ -3,6 +3,14 @@
 ## Intro
 Встроенный HTTP proxy в main process (порт 4001+) через который проходит **весь** трафик Claude Code к Anthropic API. Запускается при старте приложения, Claude Code получает `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` через env PTY.
 
+## Служебные ключи остаются в main process
+
+`ANTHROPIC_ADMIN_API_KEY` / `ANTHROPIC_ADMIN_KEY` нужны только служебному backend'у статистики расходов. После загрузки `.env` main process сразу переносит их из общего `process.env` в закрытое хранилище модуля (`isolateMainProcessEnv()`); backend читает значение через точечный `getMainProcessEnvValue()`. Поэтому node-enabled renderer и любой будущий OS child не могут унаследовать admin key по умолчанию.
+
+Дополнительная защита на каждой разрешённой границе — `src/main/child-process-env.js::buildChildProcessEnv()`: она копирует пользовательское окружение, применяет нужные конкретному процессу overrides и **после merge** удаляет только два admin-key alias. Поэтому отдельная точка запуска не может случайно вернуть служебный ключ через override. Обычный `ANTHROPIC_API_KEY`, `PATH`, `HOME` и остальные пользовательские переменные сохраняются. PTY shell и Agent SDK получают уже очищенное окружение, поэтому запущенные ими Claude/Codex/Gemini и SDK stdio MCP-процессы также не наследуют admin key.
+
+Загружаемые main process файлы `.env` переводятся в режим `0600` перед чтением. Если файл находится на read-only filesystem и `chmod` недоступен, загрузка не блокируется, но рабочие пользовательские файлы (`~/.noted-terminal/.env` и dev repo `.env`) должны оставаться доступными только владельцу.
+
 ## Режимы работы
 
 ### Anthropic (default)

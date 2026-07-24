@@ -3,6 +3,7 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { callGeminiApi } = require('./docs');
+const { buildChildProcessEnv } = require('../child-process-env');
 
 const GIT_TIMEOUT_MS = 90 * 1000;
 const GIT_MAX_BUFFER = 32 * 1024 * 1024;
@@ -51,7 +52,7 @@ function runGit(cwd, args, options = {}) {
       cwd,
       timeout: options.timeout || GIT_TIMEOUT_MS,
       maxBuffer: options.maxBuffer || GIT_MAX_BUFFER,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      env: buildChildProcessEnv({ GIT_TERMINAL_PROMPT: '0' }),
     }, (error, stdout = '', stderr = '') => {
       if (error) {
         return resolve({
@@ -1140,7 +1141,10 @@ function register({ projectManager }) {
     try {
       const target = projectPath ? safeProjectPath(projectPath) : process.cwd();
       const result = await new Promise((resolve) => {
-        execFile('open', ['-a', 'GitHub Desktop', target], { timeout: 20 * 1000 }, (error, stdout = '', stderr = '') => {
+        execFile('open', ['-a', 'GitHub Desktop', target], {
+          timeout: 20 * 1000,
+          env: buildChildProcessEnv(),
+        }, (error, stdout = '', stderr = '') => {
           if (error) return resolve({ success: false, error: stderr || error.message });
           resolve({ success: true, output: stdout || stderr });
         });

@@ -714,6 +714,7 @@ class DatabaseManager {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS claude_usage_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_key TEXT,
         ts INTEGER NOT NULL,
         weekly_pct REAL,
         five_hour_pct REAL,
@@ -723,8 +724,16 @@ class DatabaseManager {
         five_hour_resets_at TEXT
       )
     `);
+    // Existing rows predate multi-account identity and remain NULL on purpose:
+    // attributing them to whichever account happens to be current would mix
+    // histories. New snapshots are always scoped.
+    try { this.db.exec(`ALTER TABLE claude_usage_snapshots ADD COLUMN account_key TEXT DEFAULT NULL`); } catch (e) {}
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_usage_snapshots_ts ON claude_usage_snapshots(ts DESC);
+    `);
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_usage_snapshots_account_ts
+      ON claude_usage_snapshots(account_key, ts DESC);
     `);
 
     // agent_activity_intervals — one row per "loader was on" span, i.e. an
@@ -4333,10 +4342,11 @@ class DatabaseManager {
     try {
       this.db.prepare(`
         INSERT INTO claude_usage_snapshots
-          (ts, weekly_pct, five_hour_pct, weekly_opus_pct, weekly_sonnet_pct,
+          (account_key, ts, weekly_pct, five_hour_pct, weekly_opus_pct, weekly_sonnet_pct,
            weekly_resets_at, five_hour_resets_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
+        snapshot.account_key ?? null,
         ts,
         snapshot.weekly_pct ?? null,
         snapshot.five_hour_pct ?? null,
@@ -4354,25 +4364,28 @@ class DatabaseManager {
   // is rate-limited and the in-memory cache is empty (e.g. fresh app start
   // hits 429 before any successful fetch). Lets the chip show real numbers
   // instead of a dash even when API is temporarily unavailable.
-  getLatestClaudeUsageSnapshot() {
+  getLatestClaudeUsageSnapshot(accountKey) {
+    if (!accountKey) return undefined;
     return this.db.prepare(`
-      SELECT ts, weekly_pct, five_hour_pct, weekly_opus_pct, weekly_sonnet_pct,
+      SELECT account_key, ts, weekly_pct, five_hour_pct, weekly_opus_pct, weekly_sonnet_pct,
              weekly_resets_at, five_hour_resets_at
       FROM claude_usage_snapshots
+      WHERE account_key = ?
       ORDER BY ts DESC
       LIMIT 1
-    `).get();
+    `).get(accountKey);
   }
 
   // Return raw snapshots between two unix timestamps, ascending order.
-  getClaudeUsageSnapshots(fromTs, toTs) {
+  getClaudeUsageSnapshots(fromTs, toTs, accountKey) {
+    if (!accountKey) return [];
     return this.db.prepare(`
-      SELECT ts, weekly_pct, five_hour_pct, weekly_opus_pct, weekly_sonnet_pct,
+      SELECT account_key, ts, weekly_pct, five_hour_pct, weekly_opus_pct, weekly_sonnet_pct,
              weekly_resets_at, five_hour_resets_at
       FROM claude_usage_snapshots
-      WHERE ts >= ? AND ts <= ?
+      WHERE account_key = ? AND ts >= ? AND ts <= ?
       ORDER BY ts ASC
-    `).all(fromTs, toTs);
+    `).all(accountKey, fromTs, toTs);
   }
 
   // ========== AGENT ACTIVITY INTERVALS ==========

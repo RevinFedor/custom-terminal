@@ -1,8 +1,9 @@
-// Claude usage limits chip for the project toolbar.
+// Unified Codex + Claude usage control for the project toolbar.
 //
-// Compact display: Claude shows weekly utilization %, Codex shows remaining %
-// to match its statusline; both are colored by used-percent severity. Two
-// affordances per project convention (Cmd+Hover, design.md::Closing /
+// Compact display: the adjoining halves show remaining weekly and 5-hour
+// capacity for each provider. Both halves open the same popover shell; its
+// provider toggle swaps the limit details while shared activity stays mounted.
+// Two affordances per project convention (Cmd+Hover, design.md::Closing /
 // Cmd+Shift pin):
 //
 //   • click          → opens popover, pinned to CURRENT tab. Switching tabs
@@ -13,15 +14,13 @@
 //                      to release.
 //
 // Popover contents:
-//   1. Global limits — weekly / 5-hour / per-model split / extra credits.
-//      These don't depend on the active tab; same across the whole app.
-//   2. Expandable "This tab (sessionId…)" section — per-tab token cost from
-//      JSONL on disk. Reads via claude-tokens:summary IPC. Expanded state
-//      persists across tab switches via localStorage.
+//   1. Provider toggle and account history.
+//   2. Current provider limits, source freshness, and provider-specific detail.
+//   3. One shared expandable wall-time activity section.
 //
 // Backend: ipc 'claude-usage:get' (limits) + 'claude-tokens:summary' (per-tab).
 
-import { useEffect, useRef, useState, useCallback, useId } from 'react';
+import { useEffect, useRef, useState, useCallback, useId, type ReactNode } from 'react';
 import { RefreshCw, ChevronRight } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { ClaudeSparkle } from './CopySessionButton';
@@ -70,12 +69,16 @@ interface ApiPlatformBilling {
 }
 interface ClaudeUsageAccount {
   accountKey: string;
-  kind?: 'max-oauth' | 'api-platform' | string;
+  kind?: 'max-oauth' | 'api-platform' | 'claude-managed-key' | string;
   label: string;
   accountHint?: string | null;
   accountIdHint?: string | null;
   source?: string | null;
   isCurrent?: boolean;
+  stale?: boolean;
+  timestamp?: string | null;
+  lastError?: string | null;
+  lastAttemptAt?: number | null;
   usage?: UsageResponse | null;
   billing?: ApiPlatformBilling | null;
   notice?: string | null;
@@ -93,6 +96,9 @@ interface ClaudeUsageIpcResponse {
   billing?: ApiPlatformBilling | null;
   cachedMsAgo?: number | null;
   lastAttemptAt?: number | null;
+  lastSuccessAt?: string | null;
+  source?: string | null;
+  stale?: boolean;
 }
 
 interface ModelBucket {
@@ -199,25 +205,43 @@ interface CodexUsageResponse {
 }
 
 const CODEX_USAGE_ACCOUNT_STORAGE_KEY = 'noted.codexUsage.accountKey';
+const CLAUDE_USAGE_ACCOUNT_STORAGE_KEY = 'noted.claudeUsage.accountKey';
 
-function loadStoredCodexUsageAccountKey(): string | null {
+function loadStoredUsageAccountKey(storageKey: string): string | null {
   try {
-    return window.localStorage.getItem(CODEX_USAGE_ACCOUNT_STORAGE_KEY);
+    return window.localStorage.getItem(storageKey);
   } catch {
     return null;
   }
 }
 
-function storeCodexUsageAccountKey(value: string | null) {
+function storeUsageAccountKey(storageKey: string, value: string | null) {
   try {
-    if (value) window.localStorage.setItem(CODEX_USAGE_ACCOUNT_STORAGE_KEY, value);
-    else window.localStorage.removeItem(CODEX_USAGE_ACCOUNT_STORAGE_KEY);
+    if (value) window.localStorage.setItem(storageKey, value);
+    else window.localStorage.removeItem(storageKey);
   } catch {
-    // localStorage is a convenience for this view, not the source of truth.
+    // localStorage only remembers the selection; main owns the account data.
   }
 }
 
+function loadStoredCodexUsageAccountKey(): string | null {
+  return loadStoredUsageAccountKey(CODEX_USAGE_ACCOUNT_STORAGE_KEY);
+}
+
+function storeCodexUsageAccountKey(value: string | null) {
+  storeUsageAccountKey(CODEX_USAGE_ACCOUNT_STORAGE_KEY, value);
+}
+
+function loadStoredClaudeUsageAccountKey(): string | null {
+  return loadStoredUsageAccountKey(CLAUDE_USAGE_ACCOUNT_STORAGE_KEY);
+}
+
+function storeClaudeUsageAccountKey(value: string | null) {
+  storeUsageAccountKey(CLAUDE_USAGE_ACCOUNT_STORAGE_KEY, value);
+}
+
 const CODEX_USAGE_IPC_DEADLINE_MS = 12_000;
+const CLAUDE_USAGE_IPC_DEADLINE_MS = 12_000;
 
 function invokeCodexUsage(payload: Record<string, unknown>): Promise<CodexUsageResponse> {
   return new Promise((resolve, reject) => {
@@ -230,6 +254,32 @@ function invokeCodexUsage(payload: Record<string, unknown>): Promise<CodexUsageR
 
     ipcRenderer.invoke('codex:get-usage', payload).then(
       (value: CodexUsageResponse) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (reason: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(reason);
+      }
+    );
+  });
+}
+
+function invokeClaudeUsage(payload: Record<string, unknown>): Promise<ClaudeUsageIpcResponse> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error('Claude usage refresh timed out'));
+    }, CLAUDE_USAGE_IPC_DEADLINE_MS);
+
+    ipcRenderer.invoke('claude-usage:get', payload).then(
+      (value: ClaudeUsageIpcResponse) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -336,6 +386,247 @@ function CodexIcon({ size = 12, muted = false }: { size?: number; muted?: boolea
       </defs>
     </svg>
   );
+}
+
+type UsageProvider = 'codex' | 'claude';
+
+interface UsageAccountOption {
+  key: string;
+  label: string;
+  title: string;
+  selected: boolean;
+  current: boolean;
+  onSelect: () => void;
+}
+
+interface UsageProviderChipProps {
+  showPopover: boolean;
+  sticky: boolean;
+  onTriggerClick: () => void;
+  onTriggerEnter: () => void;
+  onTriggerLeave: () => void;
+  onProviderChange: (provider: UsageProvider) => void;
+  onPopoverEnter: () => void;
+  onPopoverLeave: () => void;
+  activitySection: ReactNode;
+}
+
+function UsageProviderToggle({
+  provider,
+  onChange,
+}: {
+  provider: UsageProvider;
+  onChange: (provider: UsageProvider) => void;
+}) {
+  const nextProvider: UsageProvider = provider === 'codex' ? 'claude' : 'codex';
+  return (
+    <button
+      type="button"
+      onClick={(event) => {
+        event.stopPropagation();
+        onChange(nextProvider);
+      }}
+      aria-label={`Show ${nextProvider === 'codex' ? 'Codex' : 'Claude'} usage`}
+      title={`Switch to ${nextProvider === 'codex' ? 'Codex' : 'Claude'}`}
+      style={{
+        position: 'relative',
+        width: 52,
+        height: 24,
+        padding: 2,
+        border: '1px solid rgba(255,255,255,0.11)',
+        borderRadius: 999,
+        background: 'rgba(255,255,255,0.045)',
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr',
+        alignItems: 'center',
+        cursor: 'pointer',
+        flexShrink: 0,
+      }}
+    >
+      <span
+        aria-hidden
+        style={{
+          position: 'absolute',
+          top: 2,
+          bottom: 2,
+          left: provider === 'codex' ? 2 : 26,
+          width: 22,
+          borderRadius: 999,
+          background: 'rgba(255,255,255,0.14)',
+          border: '1px solid rgba(255,255,255,0.18)',
+          transition: 'left 0.14s ease',
+        }}
+      />
+      <span style={{ position: 'relative', zIndex: 1, display: 'grid', placeItems: 'center' }}>
+        <CodexIcon size={14} muted={provider !== 'codex'} />
+      </span>
+      <span style={{ position: 'relative', zIndex: 1, display: 'grid', placeItems: 'center' }}>
+        <ClaudeSparkle size={13} color={provider === 'claude' ? '#DA7756' : '#666'} />
+      </span>
+    </button>
+  );
+}
+
+function UsagePopoverTopRow({
+  provider,
+  onProviderChange,
+  accounts,
+}: {
+  provider: UsageProvider;
+  onProviderChange: (provider: UsageProvider) => void;
+  accounts: UsageAccountOption[];
+}) {
+  return (
+    <div style={{
+      minHeight: 39,
+      padding: '7px 12px',
+      borderBottom: '1px solid rgba(255,255,255,0.07)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 10,
+    }}>
+      <UsageProviderToggle provider={provider} onChange={onProviderChange} />
+      <div style={{
+        minWidth: 0,
+        display: 'flex',
+        justifyContent: 'flex-end',
+        overflowX: 'auto',
+      }}>
+        {accounts.length > 0 && (
+          <div style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 2,
+            padding: 2,
+            background: 'rgba(255,255,255,0.05)',
+            border: '1px solid rgba(255,255,255,0.08)',
+            borderRadius: 999,
+            flexShrink: 0,
+          }}>
+            {accounts.map((account) => (
+              <button
+                key={account.key}
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  account.onSelect();
+                }}
+                title={account.title}
+                style={{
+                  height: 20,
+                  maxWidth: 132,
+                  minWidth: 0,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 5,
+                  padding: '0 8px',
+                  borderRadius: 999,
+                  border: account.selected ? '1px solid rgba(255,255,255,0.28)' : '1px solid transparent',
+                  background: account.selected ? 'rgba(255,255,255,0.12)' : 'transparent',
+                  color: account.selected ? '#f3f4f6' : '#8a8a8a',
+                  fontSize: 10,
+                  fontWeight: account.selected ? 700 : 500,
+                  cursor: 'pointer',
+                  fontVariantNumeric: 'tabular-nums',
+                }}
+              >
+                <span style={{
+                  width: 6,
+                  height: 6,
+                  borderRadius: 999,
+                  background: account.current ? '#4ade80' : '#555',
+                  boxShadow: account.current ? '0 0 8px #4ade8066' : 'none',
+                  flexShrink: 0,
+                }} />
+                <span style={{
+                  minWidth: 0,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}>
+                  {account.label}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function UsageSourceRefreshRow({
+  sourceText,
+  loading,
+  refreshDisabled,
+  refreshTitle,
+  onRefresh,
+}: {
+  sourceText: string;
+  loading: boolean;
+  refreshDisabled: boolean;
+  refreshTitle: string;
+  onRefresh: () => void;
+}) {
+  return (
+    <div style={{
+      minHeight: 36,
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 10,
+      padding: '7px 12px',
+      borderBottom: '1px solid rgba(255,255,255,0.07)',
+      fontSize: 10,
+    }}>
+      <span style={{
+        color: sourceText.includes('stale') ? '#d6a34a' : '#aaa',
+        fontFamily: 'ui-monospace, monospace',
+        minWidth: 0,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+      }}>
+        {sourceText}
+      </span>
+      <button
+        type="button"
+        onClick={(event) => {
+          event.stopPropagation();
+          onRefresh();
+        }}
+        disabled={refreshDisabled}
+        title={refreshTitle}
+        style={{
+          background: 'transparent',
+          border: 'none',
+          color: refreshDisabled ? '#555' : '#888',
+          cursor: refreshDisabled ? 'default' : 'pointer',
+          padding: 2,
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 4,
+          fontSize: 10,
+          flexShrink: 0,
+        }}
+      >
+        <RefreshCw size={11} style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />
+        {loading ? 'updating' : 'refresh'}
+      </button>
+    </div>
+  );
+}
+
+function claudeUsageSourceLabel(source: string | null | undefined, kind?: string | null): string {
+  if (source === 'claude-statusline' || source === 'statusline' || source === 'claude-code-statusline') {
+    return 'Claude Code';
+  }
+  if (source === 'anthropic-usage-api') return 'Anthropic';
+  if (source === 'admin-api') return 'Anthropic Admin';
+  if (source?.startsWith('keychain:')) return kind === 'max-oauth' ? 'Anthropic' : 'Claude Code';
+  if (source === 'persisted') return 'Anthropic';
+  return kind === 'api-platform' || kind === 'claude-managed-key' ? 'Claude Code' : 'Anthropic';
 }
 
 function formatResetDateTime(iso: string | null | undefined): string {
@@ -702,29 +993,34 @@ function ActivityView({ activity }: { activity: ActivityResponse }) {
   );
 }
 
-function ClaudeUsageChip() {
-  // Pin states (3-level):
-  //   clicked  → light pin (current-tab scope, closes on tab switch)
-  //   sticky   → strong pin (Cmd+Shift) — survives tab/project switch
-  const [clicked, setClicked] = useState(false);
-  const [sticky, setSticky] = useState(false);
-
-  // Hover tracking for Cmd+hover transient open
-  const [cmdPressed, setCmdPressed] = useState(false);
-  const [triggerHover, setTriggerHover] = useState(false);
-  const [popoverHover, setPopoverHover] = useState(false);
-
+function ClaudeUsageChip({
+  showPopover,
+  sticky,
+  onTriggerClick,
+  onTriggerEnter,
+  onTriggerLeave,
+  onProviderChange,
+  onPopoverEnter,
+  onPopoverLeave,
+  activitySection,
+}: UsageProviderChipProps) {
   // Global usage limits (independent of tab)
   const [data, setData] = useState<UsageResponse | null>(null);
   const [accounts, setAccounts] = useState<ClaudeUsageAccount[]>([]);
-  const [selectedAccountKey, setSelectedAccountKey] = useState<string | null>(null);
+  const [selectedAccountKey, setSelectedAccountKey] = useState<string | null>(() => loadStoredClaudeUsageAccountKey());
+  const [currentAccountKey, setCurrentAccountKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [source, setSource] = useState<string | null>(null);
+  const [stale, setStale] = useState(false);
+  const [lastSuccessAt, setLastSuccessAt] = useState<string | null>(null);
   // Timestamp последней live-попытки (от backend). Banner показывает «Xs ago»,
   // чтобы юзер видел, что force-refresh реально стрельнул, даже если та же
   // ошибка вернулась.
   const [lastAttemptAt, setLastAttemptAt] = useState<number | null>(null);
+  const refreshSeqRef = useRef(0);
+  const refreshContextRef = useRef('');
 
   // Per-tab tokens
   const [tokens, setTokens] = useState<TokenSummary | null>(null);
@@ -737,18 +1033,11 @@ function ClaudeUsageChip() {
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [historyExpanded, setHistoryExpanded] = useState<boolean>(false);
 
-  // Agent activity (loader-on time) — separate fetch + expand state.
-  const [activity, setActivity] = useState<ActivityResponse | null>(null);
-  const [activityLoading, setActivityLoading] = useState(false);
-  const [activityExpanded, setActivityExpanded] = useState<boolean>(false);
-
   // Expanded "This tab" section — ephemeral. Survives tab switches while the
   // popover stays open (component stays mounted), but resets to collapsed when
   // the popover closes. User must opt-in to per-tab details every time they
   // open the bar.
   const [expanded, setExpanded] = useState<boolean>(false);
-
-  const rootRef = useRef<HTMLDivElement>(null);
 
   // ── Active tab resolution (sub-agent aware) ──
   // We need the Claude sessionId of whatever tab the user is currently looking
@@ -771,24 +1060,18 @@ function ClaudeUsageChip() {
     }
     return null;
   });
-
-  // Remember the tab the popover was OPENED FROM (for non-sticky pin).
-  // When the user switches tabs while pinned non-sticky, the popover closes.
-  // When sticky, the popover stays open AND the "This tab" section
-  // re-fetches for whatever tab is now active.
-  const [pinnedTabId, setPinnedTabId] = useState<string | null>(null);
+  refreshContextRef.current = selectedAccountKey || '';
 
   const refresh = useCallback(async (force = false) => {
+    const seq = ++refreshSeqRef.current;
+    const requestedContext = selectedAccountKey || '';
     setLoading(true);
-    // На force-refresh держим spinner минимум 400ms — backend может вернуться
-    // мгновенно (cache hit / cooldown), без задержки иконка не мигает, юзер
-    // не понимает что клик сработал.
-    const minSpinUntil = force ? Date.now() + 400 : 0;
     try {
-      const res: ClaudeUsageIpcResponse = await ipcRenderer.invoke('claude-usage:get', {
+      const res = await invokeClaudeUsage({
         force,
         accountKey: selectedAccountKey,
       });
+      if (seq !== refreshSeqRef.current || requestedContext !== refreshContextRef.current) return;
       const nextAccounts = Array.isArray(res?.accounts) ? res.accounts : [];
       const nextKey = res?.selectedAccountKey
         || nextAccounts.find((account) => account.isCurrent)?.accountKey
@@ -797,7 +1080,14 @@ function ClaudeUsageChip() {
       const selected = nextAccounts.find((account) => account.accountKey === nextKey) || nextAccounts[0] || null;
       const selectedUsage = selected?.usage || res?.data || null;
       setAccounts(nextAccounts);
-      if (nextKey !== selectedAccountKey) setSelectedAccountKey(nextKey);
+      setCurrentAccountKey(res?.currentAccountKey || null);
+      setSource(selected?.source || res?.source || null);
+      setStale(selected?.stale ?? !!res?.stale);
+      setLastSuccessAt(selected?.timestamp || res?.lastSuccessAt || null);
+      if (nextKey !== selectedAccountKey) {
+        setSelectedAccountKey(nextKey);
+        storeClaudeUsageAccountKey(nextKey);
+      }
       if (res?.ok) {
         setData(selectedUsage);
         setError(null);
@@ -814,15 +1104,18 @@ function ClaudeUsageChip() {
         `[ClaudeUsage] refresh ${res?.ok ? 'ok' : 'failed'} account=${selected?.label || 'unknown'} kind=${selected?.kind || res?.authKind || 'unknown'} accounts=${nextAccounts.length} weekly=${weekly ?? 'null'} fiveHour=${fiveHour ?? 'null'} force=${force}`
       );
     } catch (e: any) {
+      if (seq !== refreshSeqRef.current || requestedContext !== refreshContextRef.current) return;
       setError(e?.message || String(e));
       setNotice(null);
       console.warn(`[ClaudeUsage] refresh exception error=${e?.message || String(e)} force=${force}`);
     } finally {
-      const remain = minSpinUntil - Date.now();
-      if (remain > 0) setTimeout(() => setLoading(false), remain);
-      else setLoading(false);
+      if (seq === refreshSeqRef.current) setLoading(false);
     }
   }, [selectedAccountKey]);
+
+  useEffect(() => () => {
+    refreshSeqRef.current += 1;
+  }, []);
 
   const refreshTokens = useCallback(async () => {
     if (!activeClaudeSessionId) { setTokens(null); return; }
@@ -844,7 +1137,10 @@ function ClaudeUsageChip() {
     setHistoryLoading(true);
     setHistoryError(null);
     try {
-      const res: DailyHistoryResponse = await ipcRenderer.invoke('claude-usage:daily-history', { days: 7 });
+      const res: DailyHistoryResponse = await ipcRenderer.invoke('claude-usage:daily-history', {
+        days: 7,
+        accountKey: selectedAccountKey,
+      });
       if (res?.ok) {
         setHistory(res.history || []);
       } else {
@@ -855,31 +1151,17 @@ function ClaudeUsageChip() {
     } finally {
       setHistoryLoading(false);
     }
-  }, []);
+  }, [selectedAccountKey]);
 
-  const refreshActivity = useCallback(async () => {
-    setActivityLoading(true);
-    try {
-      const res: ActivityResponse = await ipcRenderer.invoke('claude-usage:activity', { days: 14 });
-      setActivity(res);
-    } catch (e: any) {
-      setActivity({ ok: false, error: e?.message || String(e) });
-    } finally {
-      setActivityLoading(false);
-    }
-  }, []);
-
-  // Initial + periodic refresh of GLOBAL limits (3 min interval).
-  // Anthropic `/oauth/usage` 429-ит даже при 1 req/min — 3 мин заметно реже
-  // ловит rate-limit окно. Backend кэширует ~170s server-side. Pause polling
-  // while window is hidden — visibility-change forces immediate refresh on
-  // return.
+  // The existing Claude bridge emits after main has committed the statusline
+  // quota sample, so normal updates are event-driven. A slow fallback catches
+  // auth changes made outside a running session without hammering OAuth.
   useEffect(() => {
     refresh(false);
     let id: ReturnType<typeof setInterval> | null = null;
     const start = () => {
       if (id) return;
-      id = setInterval(() => refresh(false), 180 * 1000);
+      id = setInterval(() => refresh(false), 10 * 60 * 1000);
     };
     const stop = () => {
       if (id) { clearInterval(id); id = null; }
@@ -892,17 +1174,24 @@ function ClaudeUsageChip() {
         stop();
       }
     };
+    const onBridgeUpdate = () => {
+      if (document.visibilityState === 'visible') refresh(false);
+    };
     if (document.visibilityState === 'visible') start();
     document.addEventListener('visibilitychange', onVis);
-    return () => { stop(); document.removeEventListener('visibilitychange', onVis); };
+    ipcRenderer.on('claude:bridge-update', onBridgeUpdate);
+    return () => {
+      stop();
+      document.removeEventListener('visibilitychange', onVis);
+      ipcRenderer.removeListener('claude:bridge-update', onBridgeUpdate);
+    };
   }, [refresh]);
 
   // Re-fetch per-tab tokens whenever active session changes AND popover is open.
   useEffect(() => {
-    const open = clicked || sticky || (cmdPressed && triggerHover) || popoverHover;
-    if (!open || !expanded) return;
+    if (!showPopover || !expanded) return;
     refreshTokens();
-  }, [refreshTokens, expanded, clicked, sticky, cmdPressed, triggerHover, popoverHover]);
+  }, [refreshTokens, expanded, showPopover]);
 
   // Refresh daily history when the "By day" section is opened. Also pick up
   // fresh data after every limit refresh (each fetch writes one snapshot to
@@ -912,95 +1201,14 @@ function ClaudeUsageChip() {
     refreshHistory();
   }, [historyExpanded, refreshHistory, data]);
 
-  // Fetch activity stats when its section opens.
-  useEffect(() => {
-    if (!activityExpanded) return;
-    refreshActivity();
-  }, [activityExpanded, refreshActivity]);
-
-  // ── Modifier tracking ──
-  // Cmd-state: derived visibility (cmd+hover transient open). Window-blur
-  // reset is critical — keyup may not fire after Cmd+Tab.
-  useEffect(() => {
-    const down = (e: KeyboardEvent) => {
-      if (e.metaKey || e.ctrlKey) setCmdPressed(true);
-      // Cmd+Shift toggles sticky pin. !e.repeat guards against rapid toggling
-      // when user holds the chord down. Only triggers when popover is already
-      // open via something else — otherwise Cmd+Shift would arm a popover the
-      // user never asked for.
-      if (e.key === 'Shift' && (e.metaKey || e.ctrlKey) && !e.repeat) {
-        const currentlyOpen = clicked || sticky || (cmdPressed && triggerHover) || popoverHover;
-        if (currentlyOpen) {
-          e.preventDefault();
-          setSticky(prev => !prev);
-          if (!sticky) {
-            // Newly pinned: cement the current tab so re-fetch can fire
-            setPinnedTabId(activeTabId);
-          }
-        }
-      }
-    };
-    const up = (e: KeyboardEvent) => { if (!e.metaKey && !e.ctrlKey) setCmdPressed(false); };
-    const blur = () => setCmdPressed(false);
-    const move = (e: MouseEvent) => { if (cmdPressed && !e.metaKey && !e.ctrlKey) setCmdPressed(false); };
-    window.addEventListener('keydown', down);
-    window.addEventListener('keyup', up);
-    window.addEventListener('blur', blur);
-    window.addEventListener('mousemove', move);
-    return () => {
-      window.removeEventListener('keydown', down);
-      window.removeEventListener('keyup', up);
-      window.removeEventListener('blur', blur);
-      window.removeEventListener('mousemove', move);
-    };
-  }, [cmdPressed, clicked, sticky, triggerHover, popoverHover, activeTabId]);
-
-  // ── Auto-close on tab switch (non-sticky only) ──
-  // When pinned via click (not sticky), switching tabs closes the popover.
-  useEffect(() => {
-    if (!clicked || sticky) return;
-    if (pinnedTabId && activeTabId && pinnedTabId !== activeTabId) {
-      setClicked(false);
-      setPinnedTabId(null);
-    }
-  }, [activeTabId, clicked, sticky, pinnedTabId]);
-
-  // ── Click-outside / Esc to close ──
-  // Sticky pin survives EVERYTHING except an explicit Cmd+Shift toggle.
-  // Clicking another tab, clicking outside, pressing Esc — none of these
-  // release sticky. This is the whole point of sticky: the user wants the
-  // popover to track the active tab as they navigate.
-  // Light pin (clicked, not sticky) releases on outside click and Esc.
-  useEffect(() => {
-    if (!clicked || sticky) return;
-    const onDown = (e: MouseEvent) => {
-      if (!rootRef.current) return;
-      if (rootRef.current.contains(e.target as Node)) return;
-      setClicked(false);
-      setPinnedTabId(null);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { setClicked(false); setPinnedTabId(null); }
-    };
-    window.addEventListener('mousedown', onDown);
-    window.addEventListener('keydown', onKey);
-    return () => {
-      window.removeEventListener('mousedown', onDown);
-      window.removeEventListener('keydown', onKey);
-    };
-  }, [clicked, sticky]);
-
-  const showPopover = clicked || sticky || (cmdPressed && triggerHover) || popoverHover;
-
   // Reset expanded when popover fully closes — user explicitly wants this
   // ephemeral (not persisted across sessions or close/reopen cycles).
   useEffect(() => {
     if (!showPopover) {
       if (expanded) setExpanded(false);
       if (historyExpanded) setHistoryExpanded(false);
-      if (activityExpanded) setActivityExpanded(false);
     }
-  }, [showPopover, expanded, historyExpanded, activityExpanded]);
+  }, [showPopover, expanded, historyExpanded]);
 
   // Tick-state for countdowns. The CHIP now shows a compact reset countdown
   // ("1d 12h") at all times, so this ticks always — not just while the popover
@@ -1012,38 +1220,55 @@ function ClaudeUsageChip() {
     return () => clearInterval(id);
   }, []);
 
-  const handleChipClick = () => {
-    if (sticky) { setSticky(false); setClicked(false); setPinnedTabId(null); return; }
-    setClicked(prev => {
-      const next = !prev;
-      setPinnedTabId(next ? activeTabId : null);
-      return next;
-    });
-  };
-
   const selectedAccount = accounts.find((account) => account.accountKey === selectedAccountKey)
     || accounts.find((account) => account.isCurrent)
     || accounts[0]
     || null;
   const isApiPlatformAccount = selectedAccount?.kind === 'api-platform';
+  const isManagedClaudeLogin = selectedAccount?.kind === 'claude-managed-key';
   const apiBilling = selectedAccount?.billing || null;
   const accountLabel = selectedAccount?.label || null;
-  const accountKindLabel = isApiPlatformAccount ? 'API Platform' : 'Claude Max';
-  const weeklyPct = data?.seven_day?.utilization ?? null;
-  const fiveHourPct = data?.five_hour?.utilization ?? null;
+  const accountKindLabel = selectedAccount?.kind === 'max-oauth'
+    ? 'Claude Max'
+    : (isApiPlatformAccount ? 'Claude API' : 'Claude');
+  const weeklyUsedPct = data?.seven_day?.utilization ?? null;
+  const fiveHourUsedPct = data?.five_hour?.utilization ?? null;
+  const weeklyLeftPct = pctRemaining(weeklyUsedPct);
+  const fiveHourLeftPct = pctRemaining(fiveHourUsedPct);
   const sonnetPct = data?.seven_day_sonnet?.utilization ?? null;
   const opusPct = data?.seven_day_opus?.utilization ?? null;
   const extra = data?.extra_usage;
-  const chipColor = colorForPct(weeklyPct);
+  const chipColor = colorForPct(weeklyUsedPct);
+  const fiveHourColor = colorForPct(fiveHourUsedPct);
   // Compact "time until weekly reset" for the chip face. null → no resets_at.
   const resetShort = formatResetShort(data?.seven_day?.resets_at);
+  const fiveHourResetShort = formatResetShort(data?.five_hour?.resets_at);
+  const resetTextColor = '#bbb';
+  const selectedIsCurrent = !!selectedAccount?.accountKey
+    && (selectedAccount.isCurrent || selectedAccount.accountKey === currentAccountKey);
+  const hasCurrentAccount = !!currentAccountKey
+    && accounts.some((account) => account.accountKey === currentAccountKey);
+  const canRetryMissingCurrentAccount = !!currentAccountKey && !hasCurrentAccount;
+  const selectedStale = selectedAccount?.stale ?? stale;
+  const selectedSource = selectedAccount?.source || source;
+  const snapshotTimestamp = selectedAccount?.timestamp || lastSuccessAt || null;
+  const refreshDisabled = loading
+    || (!!selectedAccount && !selectedIsCurrent && !canRetryMissingCurrentAccount);
+  const claudeSourceText = `${claudeUsageSourceLabel(selectedSource, selectedAccount?.kind)} · ${formatSnapshotAge(snapshotTimestamp)}${selectedStale ? ' · stale' : ''}${selectedIsCurrent ? ' · current' : ''}`;
 
   const selectAccount = (account: ClaudeUsageAccount) => {
     if (!account?.accountKey) return;
+    refreshSeqRef.current += 1;
+    refreshContextRef.current = account.accountKey;
+    setLoading(false);
     setSelectedAccountKey(account.accountKey);
+    storeClaudeUsageAccountKey(account.accountKey);
     setData(account.usage || null);
-    setError(account.error || null);
+    setError(account.lastError || account.error || null);
     setNotice(account.notice || null);
+    setSource(account.source || null);
+    setStale(!!account.stale);
+    setLastSuccessAt(account.timestamp || null);
     const accountWeekly = account.usage?.seven_day?.utilization ?? null;
     const accountFiveHour = account.usage?.five_hour?.utilization ?? null;
     console.log(
@@ -1054,20 +1279,34 @@ function ClaudeUsageChip() {
   // Border style: sticky uses brighter white for "this is pinned long-term"
   const popoverBorder = sticky
     ? '1px solid rgba(255,255,255,0.45)'
-    : clicked
-      ? '1px solid rgba(255,255,255,0.2)'
-      : '1px solid rgba(255,255,255,0.08)';
+    : '1px solid rgba(255,255,255,0.12)';
+  const accountOptions: UsageAccountOption[] = accounts.map((account) => {
+    const accountWeeklyUsed = account.usage?.seven_day?.utilization ?? null;
+    const accountFiveHourUsed = account.usage?.five_hour?.utilization ?? null;
+    const accountCurrent = !!account.accountKey
+      && (account.isCurrent || account.accountKey === currentAccountKey);
+    return {
+      key: account.accountKey,
+      label: account.label,
+      selected: account.accountKey === (selectedAccount?.accountKey || selectedAccountKey),
+      current: accountCurrent,
+      onSelect: () => selectAccount(account),
+      title: `${account.label} • ${account.accountHint || account.kind || 'Claude'}${accountWeeklyUsed != null ? ` • weekly left ${formatPct(pctRemaining(accountWeeklyUsed))} (used ${formatPct(accountWeeklyUsed)}) • 5-hour left ${formatPct(pctRemaining(accountFiveHourUsed))} (used ${formatPct(accountFiveHourUsed)})` : ''}${accountCurrent ? ' • current Claude login' : ''}${account.stale ? ' • stale' : ''}${account.notice ? ` • ${account.notice}` : ''}${account.lastError || account.error ? ` • ${account.lastError || account.error}` : ''}`,
+    };
+  });
 
   return (
-    <div ref={rootRef} style={{ position: 'relative' }}>
+    <div style={{ position: 'static', display: 'inline-flex' }}>
       <button
-        onClick={handleChipClick}
-        onMouseEnter={() => setTriggerHover(true)}
-        onMouseLeave={() => setTriggerHover(false)}
-        title={weeklyPct != null
-          ? `Claude ${accountLabel ? `${accountLabel} ` : ''}weekly: ${formatPct(weeklyPct)}${resetShort ? ` • resets in ${resetShort}` : ''}  •  click → pin to tab  •  ⌘+hover → peek  •  ⌘⇧ → sticky pin`
+        onClick={onTriggerClick}
+        onMouseEnter={onTriggerEnter}
+        onMouseLeave={onTriggerLeave}
+        title={weeklyUsedPct != null || fiveHourUsedPct != null
+          ? `Claude${accountLabel ? ` ${accountLabel}` : ''} weekly left: ${formatPct(weeklyLeftPct)} (used ${formatPct(weeklyUsedPct)}) • 5-hour left: ${formatPct(fiveHourLeftPct)} (used ${formatPct(fiveHourUsedPct)})${resetShort ? ` • weekly resets in ${resetShort}` : ''}${fiveHourResetShort ? ` • 5-hour resets in ${fiveHourResetShort}` : ''}${loading ? ' • updating' : ''}${selectedStale ? ' • stale' : ''}  •  click → pin to tab  •  ⌘+hover → peek  •  ⌘⇧ → sticky pin`
           : (notice || error || `${accountKindLabel}${accountLabel ? ` ${accountLabel}` : ''}` || 'Click to fetch Claude usage')}
         style={{
+          position: 'relative',
+          zIndex: showPopover ? 1 : 0,
           display: 'inline-flex',
           alignItems: 'center',
           gap: 6,
@@ -1075,9 +1314,10 @@ function ClaudeUsageChip() {
           padding: '0 7px',
           minWidth: 76,
           background: showPopover ? `${chipColor}0A` : 'transparent',
-          color: weeklyPct != null ? chipColor : '#888',
+          color: weeklyUsedPct != null ? chipColor : '#888',
           border: `1px solid ${sticky ? 'rgba(255,255,255,0.4)' : (showPopover ? `${chipColor}33` : 'rgba(255,255,255,0.12)')}`,
-          borderRadius: 4,
+          borderRadius: '0 4px 4px 0',
+          marginLeft: -1,
           fontSize: 11,
           fontWeight: 600,
           fontVariantNumeric: 'tabular-nums',
@@ -1086,7 +1326,10 @@ function ClaudeUsageChip() {
         }}
       >
         {loading && !data ? (
-          '…'
+          <>
+            <ClaudeSparkle size={13} color="#777" />
+            <span>…</span>
+          </>
         ) : isApiPlatformAccount && !data && !error ? (
           <>
             <ClaudeSparkle size={12} color="#9ca3af" />
@@ -1099,27 +1342,30 @@ function ClaudeUsageChip() {
           </>
         ) : (
           <>
-            <ClaudeSparkle size={12} color={weeklyPct != null ? '#DA7756' : '#777'} />
-            <span>{formatPct(weeklyPct)}</span>
-            {/* Compact reset countdown. Deliberately muted neutral, NOT the
-                severity color — the % already owns the color signal; a second
-                colored token would fight it for attention in a tiny chip. */}
-            {resetShort && (
-              <span style={{ color: '#6b7280', fontWeight: 500 }}>{resetShort}</span>
-            )}
+            <ClaudeSparkle size={13} color={weeklyUsedPct != null ? '#DA7756' : '#777'} />
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              <span>{formatPct(weeklyLeftPct)}</span>
+              {resetShort && <span style={{ color: resetTextColor, fontWeight: 500 }}>{resetShort}</span>}
+            </span>
+            <span style={{ color: resetTextColor, fontWeight: 500 }}>/</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              <span style={{ color: fiveHourUsedPct != null ? fiveHourColor : '#6b7280' }}>{formatPct(fiveHourLeftPct)}</span>
+              {fiveHourResetShort && <span style={{ color: resetTextColor, fontWeight: 500 }}>{fiveHourResetShort}</span>}
+            </span>
           </>
         )}
       </button>
 
       {showPopover && (
         <div
-          onMouseEnter={() => setPopoverHover(true)}
-          onMouseLeave={() => setPopoverHover(false)}
+          onMouseEnter={onPopoverEnter}
+          onMouseLeave={onPopoverLeave}
           style={{
             position: 'absolute',
             top: 'calc(100% + 4px)',
             right: 0,
-            width: 320,
+            width: 360,
+            maxWidth: 'calc(100vw - 16px)',
             background: '#161616',
             border: popoverBorder,
             borderRadius: 6,
@@ -1129,143 +1375,22 @@ function ClaudeUsageChip() {
             flexDirection: 'column',
           }}
         >
-          {(accounts.length > 1 || isApiPlatformAccount) && (
-            <div style={{
-              padding: '7px 12px',
-              borderBottom: '1px solid rgba(255,255,255,0.07)',
-              display: 'flex',
-              justifyContent: 'center',
-            }}>
-              <div style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 2,
-                padding: 2,
-                background: 'rgba(255,255,255,0.05)',
-                border: '1px solid rgba(255,255,255,0.08)',
-                borderRadius: 999,
-                maxWidth: '100%',
-              }}>
-                {accounts.map((account, idx) => {
-                  const active = account.accountKey === (selectedAccount?.accountKey || selectedAccountKey);
-                  const accountWeekly = account.usage?.seven_day?.utilization ?? null;
-                  const accountFiveHour = account.usage?.five_hour?.utilization ?? null;
-                  const color = account.kind === 'api-platform' && accountWeekly == null
-                    ? '#9ca3af'
-                    : colorForPct(accountWeekly);
-                  return (
-                    <button
-                      key={account.accountKey || idx}
-                      onClick={(e) => { e.stopPropagation(); selectAccount(account); }}
-                      title={`${account.label} • ${account.accountHint || account.kind || 'Claude'}${accountWeekly != null ? ` • weekly ${formatPct(accountWeekly)} • 5-hour ${formatPct(accountFiveHour)}` : ''}${account.notice ? ` • ${account.notice}` : ''}${account.error ? ` • ${account.error}` : ''}`}
-                      style={{
-                        height: 20,
-                        maxWidth: 132,
-                        minWidth: 0,
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        gap: 5,
-                        padding: '0 8px',
-                        borderRadius: 999,
-                        border: active ? '1px solid rgba(255,255,255,0.28)' : '1px solid transparent',
-                        background: active ? 'rgba(255,255,255,0.12)' : 'transparent',
-                        color: active ? '#f3f4f6' : '#8a8a8a',
-                        fontSize: 10,
-                        fontWeight: active ? 700 : 500,
-                        cursor: 'pointer',
-                        fontVariantNumeric: 'tabular-nums',
-                      }}
-                    >
-                      <span style={{
-                        width: 6,
-                        height: 6,
-                        borderRadius: 999,
-                        background: color,
-                        boxShadow: active ? `0 0 8px ${color}66` : 'none',
-                        flexShrink: 0,
-                      }} />
-                      <span style={{
-                        minWidth: 0,
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}>
-                        {account.label}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            padding: '8px 12px',
-            borderBottom: '1px solid rgba(255,255,255,0.07)',
-            fontSize: 11,
-            color: '#aaa',
-          }}>
-            {/* Заголовок «Claude usage» убран по запросу: и так понятно из
-                содержимого popover'а. На его месте — countdown до недельного
-                reset'а (тот же resets_at что в строке "Weekly (all)"). Тикает
-                раз в 30с пока popover открыт. */}
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-              {accountLabel && !isApiPlatformAccount && (
-                <span style={{ color: '#aaa', maxWidth: 116, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {accountLabel}
-                </span>
-              )}
-              {isApiPlatformAccount ? (
-                <>
-                  <span style={{ color: '#666' }}>Claude auth</span>
-                  <span style={{ color: '#ddd' }}>API Platform</span>
-                </>
-              ) : data?.seven_day?.resets_at ? (
-                <>
-                  <span style={{ color: '#666' }}>weekly reset</span>
-                  <span style={{ color: '#ddd' }}>
-                    {formatResetDateTime(data.seven_day.resets_at)}
-                  </span>
-                </>
-              ) : (
-                <span style={{ color: '#666' }}>weekly reset —</span>
-              )}
-              {sticky && (
-                <span style={{
-                  fontSize: 9,
-                  padding: '1px 5px',
-                  borderRadius: 2,
-                  background: 'rgba(255,255,255,0.1)',
-                  color: '#ddd',
-                  letterSpacing: 0.4,
-                }}>PINNED</span>
-              )}
-            </span>
-            <button
-              onClick={(e) => { e.stopPropagation(); refresh(true); }}
-              disabled={loading}
-              style={{
-                background: 'transparent',
-                border: 'none',
-                color: loading ? '#555' : '#888',
-                cursor: loading ? 'default' : 'pointer',
-                padding: 2,
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 4,
-                fontSize: 10,
-              }}
-              title="Refresh limits"
-            >
-              <RefreshCw size={11} style={{
-                animation: loading ? 'spin 1s linear infinite' : 'none',
-              }} />
-              refresh
-            </button>
-          </div>
+          <UsagePopoverTopRow
+            provider="claude"
+            onProviderChange={onProviderChange}
+            accounts={accountOptions}
+          />
+          <UsageSourceRefreshRow
+            sourceText={claudeSourceText}
+            loading={loading}
+            refreshDisabled={refreshDisabled}
+            refreshTitle={selectedAccount && !selectedIsCurrent
+              ? (canRetryMissingCurrentAccount
+                ? 'Retry current Claude login usage'
+                : 'Sign in to this Claude account to refresh it')
+              : 'Refresh Claude usage'}
+            onRefresh={() => refresh(true)}
+          />
 
           {error && !data && (
             <div style={{ padding: '12px', fontSize: 11, color: '#f87171' }}>
@@ -1364,21 +1489,52 @@ function ClaudeUsageChip() {
               lineHeight: 1.35,
             }}>
               {notice}
-              <div style={{ marginTop: 6, color: '#666' }}>
-                Claude Code can run with this key; this panel just has no Max quota meter for it.
-              </div>
+              {isApiPlatformAccount && (
+                <div style={{ marginTop: 6, color: '#666' }}>
+                  Claude Code can run with this key; subscription limits do not apply to API billing.
+                </div>
+              )}
+              {isManagedClaudeLogin && (
+                <div style={{ marginTop: 6, color: '#666' }}>
+                  The meter appears after this Claude login returns its first response with rate limits.
+                </div>
+              )}
             </div>
           )}
 
           {data && (
             <>
-              <ProgressRow label="Weekly (all)" pct={data.seven_day?.utilization} resetsAt={data.seven_day?.resets_at} />
-              <ProgressRow label="5-hour" pct={fiveHourPct} resetsAt={data.five_hour?.resets_at} />
+              <ProgressRow
+                label="Weekly left (Claude)"
+                pct={weeklyLeftPct}
+                displayPct={weeklyLeftPct}
+                colorPct={weeklyUsedPct}
+                resetsAt={data.seven_day?.resets_at}
+              />
+              <ProgressRow
+                label="5-hour left"
+                pct={fiveHourLeftPct}
+                displayPct={fiveHourLeftPct}
+                colorPct={fiveHourUsedPct}
+                resetsAt={data.five_hour?.resets_at}
+              />
               {opusPct != null && opusPct > 0 && (
-                <ProgressRow label="Weekly Opus" pct={opusPct} resetsAt={data.seven_day_opus?.resets_at} />
+                <ProgressRow
+                  label="Weekly Opus left"
+                  pct={pctRemaining(opusPct)}
+                  displayPct={pctRemaining(opusPct)}
+                  colorPct={opusPct}
+                  resetsAt={data.seven_day_opus?.resets_at}
+                />
               )}
               {sonnetPct != null && sonnetPct > 0 && (
-                <ProgressRow label="Weekly Sonnet" pct={sonnetPct} resetsAt={data.seven_day_sonnet?.resets_at} />
+                <ProgressRow
+                  label="Weekly Sonnet left"
+                  pct={pctRemaining(sonnetPct)}
+                  displayPct={pctRemaining(sonnetPct)}
+                  colorPct={sonnetPct}
+                  resetsAt={data.seven_day_sonnet?.resets_at}
+                />
               )}
 
               {extra?.is_enabled && (
@@ -1604,69 +1760,7 @@ function ClaudeUsageChip() {
             )}
           </div>
 
-          {/* Activity — collapsible: how long agents were actively working */}
-          <div style={{ borderTop: '1px solid rgba(255,255,255,0.07)' }}>
-            <button
-              onClick={() => setActivityExpanded(e => !e)}
-              style={{
-                width: '100%',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                padding: '8px 12px',
-                background: 'transparent',
-                border: 'none',
-                color: '#aaa',
-                fontSize: 11,
-                cursor: 'pointer',
-                textAlign: 'left',
-              }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.03)'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; }}
-            >
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                <ChevronRight size={11} style={{
-                  transform: activityExpanded ? 'rotate(90deg)' : 'rotate(0deg)',
-                  transition: 'transform 0.15s',
-                }} />
-                Activity
-                <span style={{ color: '#666', fontSize: 10 }}>(wall time)</span>
-              </span>
-              {activityExpanded && (
-                <span
-                  onClick={(e) => { e.stopPropagation(); refreshActivity(); }}
-                  style={{
-                    fontSize: 10,
-                    color: activityLoading ? '#555' : '#888',
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: 3,
-                    cursor: 'pointer',
-                  }}
-                >
-                  <RefreshCw size={9} style={{
-                    animation: activityLoading ? 'spin 1s linear infinite' : 'none',
-                  }} />
-                </span>
-              )}
-            </button>
-
-            {activityExpanded && (
-              <div style={{ padding: '0 12px 10px' }}>
-                {!activity ? (
-                  <div style={{ fontSize: 10, color: '#666', padding: '4px 0' }}>
-                    {activityLoading ? 'Loading…' : '—'}
-                  </div>
-                ) : !activity.ok ? (
-                  <div style={{ fontSize: 10, color: '#f87171', padding: '4px 0' }}>
-                    {activity.error}
-                  </div>
-                ) : (
-                  <ActivityView activity={activity} />
-                )}
-              </div>
-            )}
-          </div>
+          {activitySection}
 
           {error && data && (() => {
             const ageMs = lastAttemptAt ? Date.now() - lastAttemptAt : null;
@@ -1696,7 +1790,7 @@ function ClaudeUsageChip() {
           })()}
 
           {/* Hint footer for Cmd+Shift */}
-          {!sticky && (clicked || popoverHover) && (
+          {!sticky && showPopover && (
             <div style={{
               padding: '6px 12px',
               fontSize: 9,
@@ -1729,11 +1823,17 @@ function ClaudeUsageChip() {
   );
 }
 
-function CodexUsageChip() {
-  const [clicked, setClicked] = useState(false);
-  const [cmdPressed, setCmdPressed] = useState(false);
-  const [triggerHover, setTriggerHover] = useState(false);
-  const [popoverHover, setPopoverHover] = useState(false);
+function CodexUsageChip({
+  showPopover,
+  sticky,
+  onTriggerClick,
+  onTriggerEnter,
+  onTriggerLeave,
+  onProviderChange,
+  onPopoverEnter,
+  onPopoverLeave,
+  activitySection,
+}: UsageProviderChipProps) {
   const [data, setData] = useState<CodexUsageData | null>(null);
   const [accounts, setAccounts] = useState<CodexUsageAccount[]>([]);
   const [selectedAccountKey, setSelectedAccountKey] = useState<string | null>(() => loadStoredCodexUsageAccountKey());
@@ -1744,10 +1844,6 @@ function CodexUsageChip() {
   const [stale, setStale] = useState(false);
   const [lastSuccessAt, setLastSuccessAt] = useState<string | null>(null);
   const [currentAccountKey, setCurrentAccountKey] = useState<string | null>(null);
-  const [activity, setActivity] = useState<ActivityResponse | null>(null);
-  const [activityLoading, setActivityLoading] = useState(false);
-  const [activityExpanded, setActivityExpanded] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
   const refreshSeqRef = useRef(0);
   const refreshContextRef = useRef('');
 
@@ -1831,18 +1927,6 @@ function CodexUsageChip() {
     };
   }, []);
 
-  const refreshActivity = useCallback(async () => {
-    setActivityLoading(true);
-    try {
-      const res: ActivityResponse = await ipcRenderer.invoke('claude-usage:activity', { days: 14 });
-      setActivity(res);
-    } catch (e: any) {
-      setActivity({ ok: false, error: e?.message || String(e) });
-    } finally {
-      setActivityLoading(false);
-    }
-  }, []);
-
   useEffect(() => {
     refresh();
     let id: ReturnType<typeof setInterval> | null = null;
@@ -1865,57 +1949,6 @@ function CodexUsageChip() {
     document.addEventListener('visibilitychange', onVis);
     return () => { stop(); document.removeEventListener('visibilitychange', onVis); };
   }, [refresh]);
-
-  useEffect(() => {
-    if (!activityExpanded) return;
-    refreshActivity();
-  }, [activityExpanded, refreshActivity]);
-
-  useEffect(() => {
-    const down = (e: KeyboardEvent) => {
-      if (e.metaKey || e.ctrlKey) setCmdPressed(true);
-    };
-    const up = (e: KeyboardEvent) => {
-      if (!e.metaKey && !e.ctrlKey) setCmdPressed(false);
-    };
-    const blur = () => setCmdPressed(false);
-    const move = (e: MouseEvent) => {
-      if (cmdPressed && !e.metaKey && !e.ctrlKey) setCmdPressed(false);
-    };
-    window.addEventListener('keydown', down);
-    window.addEventListener('keyup', up);
-    window.addEventListener('blur', blur);
-    window.addEventListener('mousemove', move);
-    return () => {
-      window.removeEventListener('keydown', down);
-      window.removeEventListener('keyup', up);
-      window.removeEventListener('blur', blur);
-      window.removeEventListener('mousemove', move);
-    };
-  }, [cmdPressed]);
-
-  useEffect(() => {
-    if (!clicked) return;
-    const onDown = (e: MouseEvent) => {
-      if (!rootRef.current) return;
-      if (rootRef.current.contains(e.target as Node)) return;
-      setClicked(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setClicked(false);
-    };
-    window.addEventListener('mousedown', onDown);
-    window.addEventListener('keydown', onKey);
-    return () => {
-      window.removeEventListener('mousedown', onDown);
-      window.removeEventListener('keydown', onKey);
-    };
-  }, [clicked]);
-
-  const showPopover = clicked || (cmdPressed && triggerHover) || popoverHover;
-  useEffect(() => {
-    if (!showPopover && activityExpanded) setActivityExpanded(false);
-  }, [showPopover, activityExpanded]);
 
   const [, setNowTick] = useState(0);
   useEffect(() => {
@@ -1972,17 +2005,34 @@ function CodexUsageChip() {
       `[CodexUsage] account selected account=${account.label} weekly=${accountWeekly ?? 'null'} fiveHour=${accountFiveHour ?? 'null'}`
     );
   };
+  const accountOptions: UsageAccountOption[] = accounts.map((account) => {
+    const accountWeeklyUsed = account.usage?.seven_day?.utilization ?? null;
+    const accountFiveHourUsed = account.usage?.five_hour?.utilization ?? null;
+    const accountCurrent = !!account.accountKey
+      && (account.isCurrent || account.accountKey === currentAccountKey);
+    return {
+      key: account.accountKey,
+      label: account.label,
+      selected: account.accountKey === (selectedAccount?.accountKey || selectedAccountKey),
+      current: accountCurrent,
+      onSelect: () => selectAccount(account),
+      title: `${account.label} • weekly left ${formatPct(pctRemaining(accountWeeklyUsed))} (used ${formatPct(accountWeeklyUsed)}) • 5-hour left ${formatPct(pctRemaining(accountFiveHourUsed))} (used ${formatPct(accountFiveHourUsed)})${account.plan_type ? ` • ${account.plan_type}` : ''}${accountCurrent ? ' • current Codex login' : ''}${account.stale ? ' • stale' : ''}`,
+    };
+  });
+  const codexSourceText = `${codexUsageSourceLabel(selectedSource)} · ${formatSnapshotAge(snapshotTimestamp)}${selectedStale ? ' · stale' : ''}${selectedIsCurrent ? ' · current' : ''}`;
 
   return (
-    <div ref={rootRef} style={{ position: 'relative' }}>
+    <div style={{ position: 'static', display: 'inline-flex' }}>
       <button
-        onClick={() => setClicked(v => !v)}
-        onMouseEnter={() => setTriggerHover(true)}
-        onMouseLeave={() => setTriggerHover(false)}
+        onClick={onTriggerClick}
+        onMouseEnter={onTriggerEnter}
+        onMouseLeave={onTriggerLeave}
         title={weeklyUsedPct != null || fiveHourUsedPct != null
           ? `Codex${accountLabel ? ` ${accountLabel}` : ''} weekly left: ${formatPct(weeklyLeftPct)} (used ${formatPct(weeklyUsedPct)}) • 5-hour left: ${formatPct(fiveHourLeftPct)} (used ${formatPct(fiveHourUsedPct)})${resetShort ? ` • weekly resets in ${resetShort}` : ''}${fiveHourResetShort ? ` • 5-hour resets in ${fiveHourResetShort}` : ''}${loading ? ' • updating' : ''}${selectedStale ? ' • stale' : ''}`
           : (loading ? 'Codex usage is updating' : (error || 'Codex usage is unavailable'))}
         style={{
+          position: 'relative',
+          zIndex: showPopover ? 1 : 0,
           display: 'inline-flex',
           alignItems: 'center',
           gap: 6,
@@ -1991,8 +2041,8 @@ function CodexUsageChip() {
           padding: '0 7px',
           background: showPopover ? `${chipColor}0A` : 'transparent',
           color: weeklyUsedPct != null ? chipColor : '#888',
-          border: `1px solid ${showPopover ? `${chipColor}33` : 'rgba(255,255,255,0.12)'}`,
-          borderRadius: 4,
+          border: `1px solid ${sticky ? 'rgba(255,255,255,0.4)' : (showPopover ? `${chipColor}33` : 'rgba(255,255,255,0.12)')}`,
+          borderRadius: '4px 0 0 4px',
           fontSize: 11,
           fontWeight: 600,
           fontVariantNumeric: 'tabular-nums',
@@ -2028,8 +2078,8 @@ function CodexUsageChip() {
 
       {showPopover && (
         <div
-          onMouseEnter={() => setPopoverHover(true)}
-          onMouseLeave={() => setPopoverHover(false)}
+          onMouseEnter={onPopoverEnter}
+          onMouseLeave={onPopoverLeave}
           style={{
             position: 'absolute',
             top: 'calc(100% + 4px)',
@@ -2045,127 +2095,22 @@ function CodexUsageChip() {
             flexDirection: 'column',
           }}
         >
-          {accounts.length > 1 && (
-            <div style={{
-              padding: '7px 12px',
-              borderBottom: '1px solid rgba(255,255,255,0.07)',
-              display: 'flex',
-              justifyContent: 'center',
-            }}>
-              <div style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 2,
-                padding: 2,
-                background: 'rgba(255,255,255,0.05)',
-                border: '1px solid rgba(255,255,255,0.08)',
-                borderRadius: 999,
-                maxWidth: '100%',
-              }}>
-                {accounts.map((account, idx) => {
-                  const active = account.accountKey === (selectedAccount?.accountKey || selectedAccountKey);
-                  const accountWeeklyUsed = account.usage?.seven_day?.utilization ?? null;
-                  const accountFiveHourUsed = account.usage?.five_hour?.utilization ?? null;
-                  const accountWeeklyLeft = pctRemaining(accountWeeklyUsed);
-                  const accountFiveHourLeft = pctRemaining(accountFiveHourUsed);
-                  const accountIsCurrent = !!account.accountKey
-                    && (account.isCurrent || account.accountKey === currentAccountKey);
-                  const color = accountIsCurrent ? '#4ade80' : '#555';
-                  return (
-                    <button
-                      key={account.accountKey || idx}
-                      onClick={(e) => { e.stopPropagation(); selectAccount(account); }}
-                      title={`${account.label} • weekly left ${formatPct(accountWeeklyLeft)} (used ${formatPct(accountWeeklyUsed)}) • 5-hour left ${formatPct(accountFiveHourLeft)} (used ${formatPct(accountFiveHourUsed)})${account.plan_type ? ` • ${account.plan_type}` : ''}${account.isCurrent || account.accountKey === currentAccountKey ? ' • current Codex login' : ''}${account.stale ? ' • stale' : ''}`}
-                      style={{
-                        height: 20,
-                        maxWidth: 132,
-                        minWidth: 0,
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        gap: 5,
-                        padding: '0 8px',
-                        borderRadius: 999,
-                        border: active ? '1px solid rgba(255,255,255,0.28)' : '1px solid transparent',
-                        background: active ? 'rgba(255,255,255,0.12)' : 'transparent',
-                        color: active ? '#f3f4f6' : '#8a8a8a',
-                        fontSize: 10,
-                        fontWeight: active ? 700 : 500,
-                        cursor: 'pointer',
-                        fontVariantNumeric: 'tabular-nums',
-                      }}
-                    >
-                      <span style={{
-                        width: 6,
-                        height: 6,
-                        borderRadius: 999,
-                        background: color,
-                        boxShadow: accountIsCurrent ? `0 0 8px ${color}66` : 'none',
-                        flexShrink: 0,
-                      }} />
-                      <span style={{
-                        minWidth: 0,
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}>
-                        {account.label}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            padding: '8px 12px',
-            borderBottom: '1px solid rgba(255,255,255,0.07)',
-            fontSize: 11,
-            color: '#aaa',
-          }}>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-              <CodexIcon size={15} />
-              {accountLabel && (
-                <span style={{ color: '#aaa', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {accountLabel}
-                </span>
-              )}
-              {weekly?.resets_at ? (
-                <>
-                  <span style={{ color: '#666' }}>weekly reset</span>
-                  <span style={{ color: '#ddd' }}>{formatResetDateTime(weekly.resets_at)}</span>
-                </>
-              ) : (
-                <span style={{ color: '#666' }}>weekly reset —</span>
-              )}
-            </span>
-            <button
-              onClick={(e) => { e.stopPropagation(); refresh(true); }}
-              disabled={refreshDisabled}
-              style={{
-                background: 'transparent',
-                border: 'none',
-                color: refreshDisabled ? '#555' : '#888',
-                cursor: refreshDisabled ? 'default' : 'pointer',
-                padding: 2,
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 4,
-                fontSize: 10,
-              }}
-              title={selectedAccount && !selectedIsCurrent
-                ? (canRetryMissingCurrentAccount
-                  ? 'Retry current Codex login usage'
-                  : 'Sign in to this Codex account to refresh it')
-                : 'Refresh Codex usage'}
-            >
-              <RefreshCw size={11} style={{ animation: refreshVisualLoading ? 'spin 1s linear infinite' : 'none' }} />
-              {loading ? 'updating' : 'refresh'}
-            </button>
-          </div>
+          <UsagePopoverTopRow
+            provider="codex"
+            onProviderChange={onProviderChange}
+            accounts={accountOptions}
+          />
+          <UsageSourceRefreshRow
+            sourceText={codexSourceText}
+            loading={refreshVisualLoading}
+            refreshDisabled={refreshDisabled}
+            refreshTitle={selectedAccount && !selectedIsCurrent
+              ? (canRetryMissingCurrentAccount
+                ? 'Retry current Codex login usage'
+                : 'Sign in to this Codex account to refresh it')
+              : 'Refresh Codex usage'}
+            onRefresh={() => refresh(true)}
+          />
 
           {(error || warning) && (
             <div style={{ padding: '8px 12px', fontSize: 11, color: error ? '#f87171' : '#d6a34a' }}>
@@ -2189,44 +2134,6 @@ function CodexUsageChip() {
                 colorPct={fiveHourUsedPct}
                 resetsAt={fiveHour?.resets_at}
               />
-              {(usageData.plan_type || usageData.limit_id) && (
-                <div style={{
-                  padding: '6px 12px',
-                  borderTop: '1px solid rgba(255,255,255,0.07)',
-                  fontSize: 10,
-                  color: '#777',
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  gap: 8,
-                }}>
-                  <span>Plan</span>
-                  <span style={{ color: '#aaa', fontFamily: 'ui-monospace, monospace' }}>
-                    {[usageData.plan_type, usageData.limit_id].filter(Boolean).join(' · ')}
-                  </span>
-                </div>
-              )}
-              <div style={{
-                padding: '6px 12px',
-                borderTop: '1px solid rgba(255,255,255,0.07)',
-                fontSize: 10,
-                color: '#777',
-                display: 'flex',
-                justifyContent: 'space-between',
-                gap: 8,
-              }}>
-                <span>Source</span>
-                <span style={{
-                  color: selectedStale ? '#d6a34a' : '#aaa',
-                  fontFamily: 'ui-monospace, monospace',
-                  minWidth: 0,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                  textAlign: 'right',
-                }}>
-                  {codexUsageSourceLabel(selectedSource)} · {formatSnapshotAge(snapshotTimestamp)}{selectedStale ? ' · stale' : ''}{selectedIsCurrent ? ' · current' : ''}
-                </span>
-              </div>
             </>
           ) : !error ? (
             <div style={{ padding: '12px', fontSize: 11, color: '#666' }}>
@@ -2234,66 +2141,98 @@ function CodexUsageChip() {
             </div>
           ) : null}
 
-          <div style={{ borderTop: '1px solid rgba(255,255,255,0.07)' }}>
-            <button
-              onClick={() => setActivityExpanded(e => !e)}
-              style={{
-                width: '100%',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                padding: '8px 12px',
-                background: 'transparent',
-                border: 'none',
-                color: '#aaa',
-                fontSize: 11,
-                cursor: 'pointer',
-                textAlign: 'left',
-              }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.03)'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; }}
-            >
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                <ChevronRight size={11} style={{
-                  transform: activityExpanded ? 'rotate(90deg)' : 'rotate(0deg)',
-                  transition: 'transform 0.15s',
-                }} />
-                Activity
-                <span style={{ color: '#666', fontSize: 10 }}>(wall time)</span>
-              </span>
-              {activityExpanded && (
-                <span
-                  onClick={(e) => { e.stopPropagation(); refreshActivity(); }}
-                  style={{
-                    fontSize: 10,
-                    color: activityLoading ? '#555' : '#888',
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: 3,
-                    cursor: 'pointer',
-                  }}
-                >
-                  <RefreshCw size={9} style={{ animation: activityLoading ? 'spin 1s linear infinite' : 'none' }} />
-                </span>
-              )}
-            </button>
+          {activitySection}
+        </div>
+      )}
+    </div>
+  );
+}
 
-            {activityExpanded && (
-              <div style={{ padding: '0 12px 10px' }}>
-                {!activity ? (
-                  <div style={{ fontSize: 10, color: '#666', padding: '4px 0' }}>
-                    {activityLoading ? 'Loading…' : '—'}
-                  </div>
-                ) : !activity.ok ? (
-                  <div style={{ fontSize: 10, color: '#f87171', padding: '4px 0' }}>
-                    {activity.error}
-                  </div>
-                ) : (
-                  <ActivityView activity={activity} />
-                )}
-              </div>
-            )}
-          </div>
+function SharedActivitySection({
+  expanded,
+  loading,
+  activity,
+  onToggle,
+  onRefresh,
+}: {
+  expanded: boolean;
+  loading: boolean;
+  activity: ActivityResponse | null;
+  onToggle: () => void;
+  onRefresh: () => void;
+}) {
+  return (
+    <div style={{ borderTop: '1px solid rgba(255,255,255,0.07)' }}>
+      <div style={{
+        display: 'flex',
+        alignItems: 'stretch',
+      }}>
+        <button
+          type="button"
+          onClick={onToggle}
+          style={{
+            minWidth: 0,
+            flex: 1,
+            display: 'flex',
+            alignItems: 'center',
+            padding: '8px 12px',
+            background: 'transparent',
+            border: 'none',
+            color: '#aaa',
+            fontSize: 11,
+            cursor: 'pointer',
+            textAlign: 'left',
+          }}
+          onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(255,255,255,0.03)'; }}
+          onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
+        >
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <ChevronRight size={11} style={{
+              transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
+              transition: 'transform 0.15s',
+            }} />
+            Activity
+            <span style={{ color: '#666', fontSize: 10 }}>(wall time)</span>
+          </span>
+        </button>
+        {expanded && (
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onRefresh();
+            }}
+            title="Refresh activity"
+            aria-label="Refresh activity"
+            disabled={loading}
+            style={{
+              width: 34,
+              display: 'grid',
+              placeItems: 'center',
+              background: 'transparent',
+              border: 'none',
+              color: loading ? '#555' : '#888',
+              cursor: loading ? 'default' : 'pointer',
+            }}
+          >
+            <RefreshCw size={10} style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />
+          </button>
+        )}
+      </div>
+
+      {expanded && (
+        <div style={{ padding: '0 12px 10px' }}>
+          {!activity ? (
+            <div style={{ fontSize: 10, color: '#666', padding: '4px 0' }}>
+              {loading ? 'Loading…' : '—'}
+            </div>
+          ) : !activity.ok ? (
+            <div style={{ fontSize: 10, color: '#f87171', padding: '4px 0' }}>
+              {activity.error}
+            </div>
+          ) : (
+            <ActivityView activity={activity} />
+          )}
         </div>
       )}
     </div>
@@ -2301,10 +2240,188 @@ function CodexUsageChip() {
 }
 
 export default function ClaudeUsageButton() {
+  const [activeProvider, setActiveProvider] = useState<UsageProvider>('codex');
+  const [clicked, setClicked] = useState(false);
+  const [sticky, setSticky] = useState(false);
+  const [cmdPressed, setCmdPressed] = useState(false);
+  const [hoveredProvider, setHoveredProvider] = useState<UsageProvider | null>(null);
+  const [popoverHover, setPopoverHover] = useState(false);
+  const [pinnedTabId, setPinnedTabId] = useState<string | null>(null);
+  const [activity, setActivity] = useState<ActivityResponse | null>(null);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityExpanded, setActivityExpanded] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const activeTabId = useWorkspaceStore((state) => state.getEffectiveTabId());
+  const showPopover = clicked || sticky || (cmdPressed && hoveredProvider !== null) || popoverHover;
+
+  const refreshActivity = useCallback(async () => {
+    setActivityLoading(true);
+    try {
+      const response: ActivityResponse = await ipcRenderer.invoke('claude-usage:activity', { days: 14 });
+      setActivity(response);
+    } catch (error: any) {
+      setActivity({ ok: false, error: error?.message || String(error) });
+    } finally {
+      setActivityLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!activityExpanded || !showPopover) return;
+    refreshActivity();
+  }, [activityExpanded, showPopover, refreshActivity]);
+
+  useEffect(() => {
+    if (!showPopover && activityExpanded) setActivityExpanded(false);
+  }, [showPopover, activityExpanded]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey) setCmdPressed(true);
+      if (
+        event.key === 'Shift'
+        && (event.metaKey || event.ctrlKey)
+        && !event.repeat
+        && showPopover
+      ) {
+        event.preventDefault();
+        setSticky((value) => {
+          const next = !value;
+          if (next) setPinnedTabId(activeTabId);
+          return next;
+        });
+      }
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (!event.metaKey && !event.ctrlKey) setCmdPressed(false);
+    };
+    const onBlur = () => {
+      setCmdPressed(false);
+      setHoveredProvider(null);
+    };
+    const onMove = (event: MouseEvent) => {
+      if (cmdPressed && !event.metaKey && !event.ctrlKey) setCmdPressed(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
+    window.addEventListener('mousemove', onMove);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
+      window.removeEventListener('mousemove', onMove);
+    };
+  }, [activeTabId, cmdPressed, showPopover]);
+
+  useEffect(() => {
+    if (!clicked || sticky) return;
+    if (pinnedTabId && activeTabId && pinnedTabId !== activeTabId) {
+      setClicked(false);
+      setPinnedTabId(null);
+    }
+  }, [activeTabId, clicked, pinnedTabId, sticky]);
+
+  useEffect(() => {
+    if (!clicked || sticky) return;
+    const onMouseDown = (event: MouseEvent) => {
+      if (rootRef.current?.contains(event.target as Node)) return;
+      setClicked(false);
+      setPinnedTabId(null);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      setClicked(false);
+      setPinnedTabId(null);
+    };
+    window.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [clicked, sticky]);
+
+  const handleTriggerClick = (provider: UsageProvider) => {
+    if (sticky && provider === activeProvider) {
+      setSticky(false);
+      setClicked(false);
+      setPinnedTabId(null);
+      return;
+    }
+    if (clicked && provider === activeProvider) {
+      setClicked(false);
+      setPinnedTabId(null);
+      return;
+    }
+    setActiveProvider(provider);
+    setClicked(true);
+    setPinnedTabId(activeTabId);
+  };
+
+  const handleTriggerEnter = (provider: UsageProvider) => {
+    setHoveredProvider(provider);
+    if (!clicked && !sticky && cmdPressed) setActiveProvider(provider);
+  };
+
+  const activitySection = (
+    <SharedActivitySection
+      expanded={activityExpanded}
+      loading={activityLoading}
+      activity={activity}
+      onToggle={() => setActivityExpanded((value) => !value)}
+      onRefresh={refreshActivity}
+    />
+  );
+
   return (
-    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-      <ClaudeUsageChip />
-      <CodexUsageChip />
+    <div
+      ref={rootRef}
+      style={{
+        position: 'relative',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 0,
+      }}
+    >
+      <CodexUsageChip
+        showPopover={showPopover && activeProvider === 'codex'}
+        sticky={sticky}
+        onTriggerClick={() => handleTriggerClick('codex')}
+        onTriggerEnter={() => handleTriggerEnter('codex')}
+        onTriggerLeave={() => setHoveredProvider((value) => value === 'codex' ? null : value)}
+        onProviderChange={setActiveProvider}
+        onPopoverEnter={() => setPopoverHover(true)}
+        onPopoverLeave={() => setPopoverHover(false)}
+        activitySection={activitySection}
+      />
+      <ClaudeUsageChip
+        showPopover={showPopover && activeProvider === 'claude'}
+        sticky={sticky}
+        onTriggerClick={() => handleTriggerClick('claude')}
+        onTriggerEnter={() => handleTriggerEnter('claude')}
+        onTriggerLeave={() => setHoveredProvider((value) => value === 'claude' ? null : value)}
+        onProviderChange={setActiveProvider}
+        onPopoverEnter={() => setPopoverHover(true)}
+        onPopoverLeave={() => setPopoverHover(false)}
+        activitySection={activitySection}
+      />
+      {showPopover && (
+        <span
+          aria-hidden
+          onMouseEnter={() => setPopoverHover(true)}
+          onMouseLeave={() => setPopoverHover(false)}
+          style={{
+            position: 'absolute',
+            top: 26,
+            right: 0,
+            width: 360,
+            maxWidth: 'calc(100vw - 16px)',
+            height: 5,
+            zIndex: 999,
+          }}
+        />
+      )}
     </div>
   );
 }

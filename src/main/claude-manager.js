@@ -4,11 +4,17 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const { exec } = require('child_process');
+const { buildChildProcessEnv } = require('./child-process-env');
 
 // Helper: async exec with timeout (increased default for heavy ops)
 const execAsync = (cmd, timeout = 5000) => {
   return new Promise((resolve, reject) => {
-    exec(cmd, { encoding: 'utf-8', timeout, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+    exec(cmd, {
+      encoding: 'utf-8',
+      timeout,
+      maxBuffer: 1024 * 1024,
+      env: buildChildProcessEnv(),
+    }, (err, stdout) => {
       if (err) reject(err);
       else resolve(stdout.trim());
     });

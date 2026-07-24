@@ -280,17 +280,28 @@ export default function ClaudeControlBar({
   projectPath,
 }: Props) {
   const showToast = useUIStore((s) => s.showToast);
-  // sessionType is never null — when there's no session yet we use commandType
-  // (or default 'claude' for SDK / fresh tabs) so the chip can still render
-  // "Start Claude" / "Start Gemini" and spawn the right process on click.
-  const sessionType: 'claude' | 'gemini' | 'codex' = claudeSessionId
+  // The active agent follows the process-promoted command type first. A tab
+  // can retain an older Claude/Codex transcript while a different agent is
+  // already running in its PTY; letting the older id win would route controls
+  // to the wrong TUI and render both quick-switch variants. Session ids are a
+  // fallback only for tabs whose current command has no AI type yet.
+  const savedSessionType: 'claude' | 'gemini' | 'codex' = claudeSessionId
     ? 'claude'
     : geminiSessionId ? 'gemini'
     : codexSessionId ? 'codex'
-    : commandType === 'gemini' ? 'gemini'
-    : commandType === 'codex' ? 'codex'
     : 'claude';
-  const sessionId = claudeSessionId || geminiSessionId || codexSessionId;
+  const sessionType: 'claude' | 'gemini' | 'codex' = commandType === 'gemini'
+    ? 'gemini'
+    : commandType === 'codex'
+      ? 'codex'
+      : commandType === 'claude'
+        ? 'claude'
+        : savedSessionType;
+  const sessionId = sessionType === 'claude'
+    ? claudeSessionId
+    : sessionType === 'gemini'
+      ? geminiSessionId
+      : codexSessionId;
   const [sessionCopied, setSessionCopied] = useState(false);
   const [sessionCopyHover, setSessionCopyHover] = useState(false);
   const [sessionCopyRect, setSessionCopyRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
@@ -685,14 +696,11 @@ export default function ClaudeControlBar({
   const codexSettings = useUIStore((s) => s.codexSettings);
   const quickClaudeReturnRef = useRef<{ model: string; effort: string } | null>(null);
   const [quickClaudeApplied, setQuickClaudeApplied] = useState(false);
-  const [quickClaudeHover, setQuickClaudeHover] = useState(false);
-  const [quickClaudeRect, setQuickClaudeRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
-  const quickClaudeButtonRef = useRef<HTMLButtonElement | null>(null);
   const quickCodexReturnRef = useRef<{ model: string; effort: string } | null>(null);
   const [quickCodexApplied, setQuickCodexApplied] = useState(false);
-  const [quickCodexHover, setQuickCodexHover] = useState(false);
-  const [quickCodexRect, setQuickCodexRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
-  const quickCodexButtonRef = useRef<HTMLButtonElement | null>(null);
+  const [quickPresetHover, setQuickPresetHover] = useState(false);
+  const [quickPresetRect, setQuickPresetRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  const quickPresetButtonRef = useRef<HTMLButtonElement | null>(null);
   // Cache cooldown chip data: split + the timestamp this turn touched the cache.
   // Anthropic's prompt cache uses a 1h TTL that REFRESHES on every use, so `ts`
   // is the cooldown anchor — countdown = 60min − (now − ts). PTY arrives via
@@ -1586,21 +1594,32 @@ export default function ClaudeControlBar({
   const [pinnedPopup, setPinnedPopup] = useState<PopupKey | null>(null);
   const [hoveredTrigger, setHoveredTrigger] = useState<PopupKey | null>(null);
   const [hoveredPopup, setHoveredPopup] = useState<PopupKey | null>(null);
-  const [hoveredCodexMenuModel, setHoveredCodexMenuModel] = useState<string | null>(null);
-  const [hoveredCodexMenuAnchor, setHoveredCodexMenuAnchor] = useState<HTMLButtonElement | null>(null);
+  const [hoveredModelMenuModel, setHoveredModelMenuModel] = useState<string | null>(null);
+  const [hoveredModelMenuAnchor, setHoveredModelMenuAnchor] = useState<HTMLButtonElement | null>(null);
   const isCmdPressed = useCmdKey();
   const showSessionIdTooltip = isCmdPressed && sessionCopyHover && hasArtifactSession && !!sessionCopyRect;
-  const showQuickClaudeTooltip = !isCodex && (isSDKTab || isAnthropicPTY)
-    && isCmdPressed && quickClaudeHover && hasQuickClaudePreset && !!quickClaudeRect;
-  const showQuickCodexTooltip = isCodex && isCmdPressed && quickCodexHover && hasQuickCodexPreset && !!quickCodexRect;
+  // The selected agent type is promoted from the live agent process.  Keep one
+  // quick-switch affordance: an untouched Anthropic provider default must not
+  // create a second Claude button while the same PTY is running Codex.
+  const quickPresetIsCodex = isCodex;
+  const isClaudeQuickSession = isSDKTab || (sessionType === 'claude' && isAnthropicPTY);
+  const showQuickPresetControl = quickPresetIsCodex || isClaudeQuickSession;
+  const quickPresetModel = quickPresetIsCodex ? quickCodexModel : quickClaudeModel;
+  const quickPresetEffort = quickPresetIsCodex ? quickCodexEffort : quickClaudeEffort;
+  const hasQuickPreset = quickPresetIsCodex ? hasQuickCodexPreset : hasQuickClaudePreset;
+  const quickPresetApplied = quickPresetIsCodex ? quickCodexApplied : quickClaudeApplied;
+  const quickPresetMatchesCurrent = quickPresetIsCodex ? quickCodexMatchesCurrent : quickClaudeMatchesCurrent;
+  const quickPresetDisabled = quickPresetIsCodex ? codexQuickDisabled : claudeQuickDisabled;
+  const showQuickPresetTooltip = showQuickPresetControl
+    && isCmdPressed && quickPresetHover && hasQuickPreset && !!quickPresetRect;
 
   useEffect(() => {
     if (!codexModelMenuDisabled) return;
     setPinnedPopup(null);
     setHoveredTrigger(null);
     setHoveredPopup(null);
-    setHoveredCodexMenuModel(null);
-    setHoveredCodexMenuAnchor(null);
+    setHoveredModelMenuModel(null);
+    setHoveredModelMenuAnchor(null);
   }, [codexModelMenuDisabled]);
 
   // Derived: какой popup сейчас визуально открыт.
@@ -1617,8 +1636,8 @@ export default function ClaudeControlBar({
 
   useEffect(() => {
     if (openPopup === 'model') return;
-    setHoveredCodexMenuModel(null);
-    setHoveredCodexMenuAnchor(null);
+    setHoveredModelMenuModel(null);
+    setHoveredModelMenuAnchor(null);
   }, [openPopup]);
 
   // Click-outside закрывает только pinned popup (CMD-hover закрывается по
@@ -1714,8 +1733,8 @@ export default function ClaudeControlBar({
       }
       setHoveredPopup((cur) => (cur === key ? null : cur));
       if (key === 'model') {
-        setHoveredCodexMenuModel(null);
-        setHoveredCodexMenuAnchor(null);
+        setHoveredModelMenuModel(null);
+        setHoveredModelMenuAnchor(null);
       }
     },
   });
@@ -1868,7 +1887,11 @@ export default function ClaudeControlBar({
     }
   };
 
-  const applyClaudeQuickPreset = async (model: string, effort: string): Promise<boolean> => {
+  const applyClaudeModelAndEffort = async (
+    model: string,
+    effort: string,
+    source: 'quick' | 'pair',
+  ): Promise<boolean> => {
     if (isSDKTab) {
       useWorkspaceStore.getState().updateSDKState(tabId, { sdkModel: model, sdkEffort: effort });
       focusTerminal();
@@ -1876,20 +1899,21 @@ export default function ClaudeControlBar({
     }
     if (!isAnthropicPTY) return false;
 
-    const actionReason = `claude-quick:${model}/${effort}`;
+    const actionReason = `claude-${source}:${model}/${effort}`;
+    const sentinelVia = source === 'quick' ? 'quick-preset' : 'model-effort';
     const modelSentinelMap = (window as any).__modelSentForTab as Map<string, { at: number; via: string; model: string }> | undefined;
     const effortSentinelMap = (window as any).__effortSentForTab as Map<string, { at: number; via: string; level: string }> | undefined;
     const previousModelSentinel = modelSentinelMap?.get(tabId);
     const previousEffortSentinel = effortSentinelMap?.get(tabId);
-    if (modelSentinelMap) modelSentinelMap.set(tabId, { at: Date.now(), via: 'quick-preset', model });
-    if (effortSentinelMap) effortSentinelMap.set(tabId, { at: Date.now(), via: 'quick-preset', level: effort });
+    if (modelSentinelMap) modelSentinelMap.set(tabId, { at: Date.now(), via: sentinelVia, model });
+    if (effortSentinelMap) effortSentinelMap.set(tabId, { at: Date.now(), via: sentinelVia, level: effort });
     let modelApplied = false;
     setLocalBusy(true, actionReason);
     try {
-      await applyClaudePtySetting({ tabId, kind: 'model', value: model, source: 'controlbar:quick-model' });
+      await applyClaudePtySetting({ tabId, kind: 'model', value: model, source: `controlbar:${source}-model` });
       modelApplied = true;
       setClaudeModel(model);
-      await applyClaudePtySetting({ tabId, kind: 'effort', value: effort, source: 'controlbar:quick-effort' });
+      await applyClaudePtySetting({ tabId, kind: 'effort', value: effort, source: `controlbar:${source}-effort` });
       setEffortLocal(effort);
       return true;
     } catch (error: any) {
@@ -1901,8 +1925,13 @@ export default function ClaudeControlBar({
         if (previousEffortSentinel) effortSentinelMap.set(tabId, previousEffortSentinel);
         else effortSentinelMap.delete(tabId);
       }
-      console.error('[ClaudeControlBar] quick preset failed:', error);
-      showToast('Claude не подтвердил быстрый переход: ' + String(error?.message || error), 'error');
+      console.error('[ClaudeControlBar] model/effort pair failed:', error);
+      showToast(
+        source === 'quick'
+          ? 'Claude не подтвердил быстрый переход: ' + String(error?.message || error)
+          : 'Claude не подтвердил выбранные model и effort: ' + String(error?.message || error),
+        'error',
+      );
       return false;
     } finally {
       setLocalBusy(false, actionReason + ':finally');
@@ -2038,7 +2067,7 @@ export default function ClaudeControlBar({
   };
 
   const pickModel = async (mid: string) => {
-    setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null); setHoveredCodexMenuModel(null);
+    setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null); setHoveredModelMenuModel(null);
     const actionReason = 'model:' + mid;
     if (!beginControlAction(actionReason)) return;
     try {
@@ -2127,7 +2156,7 @@ export default function ClaudeControlBar({
   };
 
   const pickEffort = async (level: string) => {
-    setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null); setHoveredCodexMenuModel(null);
+    setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null); setHoveredModelMenuModel(null);
     const actionReason = 'effort:' + level;
     if (!beginControlAction(actionReason)) return;
     try {
@@ -2147,8 +2176,20 @@ export default function ClaudeControlBar({
     }
   };
 
+  const pickClaudeModelEffort = async (model: string, effort: string) => {
+    setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null); setHoveredModelMenuModel(null);
+    const actionReason = `model-effort:${model}/${effort}`;
+    if (!beginControlAction(actionReason)) return;
+    try {
+      const success = await applyClaudeModelAndEffort(model, effort, 'pair');
+      if (success) clearQuickClaudeToggle();
+    } finally {
+      endControlAction(actionReason);
+    }
+  };
+
   const pickCodexModelEffort = async (model: string, effort: string) => {
-    setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null); setHoveredCodexMenuModel(null);
+    setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null); setHoveredModelMenuModel(null);
     const actionReason = `model-effort:${model}/${effort}`;
     if (!beginControlAction(actionReason)) return;
     try {
@@ -2174,7 +2215,7 @@ export default function ClaudeControlBar({
     const actionReason = restore ? 'claude-quick-restore' : 'claude-quick-apply';
     if (!beginControlAction(actionReason)) return;
     try {
-      const success = await applyClaudeQuickPreset(target.model, target.effort);
+      const success = await applyClaudeModelAndEffort(target.model, target.effort, 'quick');
       if (!success) return;
 
       if (restore) {
@@ -3670,7 +3711,8 @@ export default function ClaudeControlBar({
             время streaming, поэтому она disabled до завершения turn. */}
       {showRightCluster && (() => {
         const canControl = isSDKTab ? true : isCommandRunning;
-        const modelOptions = isCodex ? visibleCodexModels : isAnthropicPTY ? visibleClaudeModels : activeProvider.models;
+        const modelOptions = isCodex ? visibleCodexModels : (isSDKTab || isAnthropicPTY) ? visibleClaudeModels : activeProvider.models;
+        const supportsModelEffortPair = isCodex || isSDKTab || (sessionType === 'claude' && isAnthropicPTY);
         return (
         <div
           className={isLocalBusy ? 'control-bar-busy-overlay' : undefined}
@@ -3743,41 +3785,45 @@ export default function ClaudeControlBar({
             </div>
           )}
 
-          {(isSDKTab || isAnthropicPTY) && (
+          {showQuickPresetControl && (
             <div style={{ position: 'relative', display: 'inline-flex' }}>
               <button
-                ref={quickClaudeButtonRef}
+                ref={quickPresetButtonRef}
                 type="button"
-                disabled={claudeQuickDisabled || !hasQuickClaudePreset}
-                onClick={toggleQuickClaudePreset}
+                disabled={quickPresetDisabled || !hasQuickPreset}
+                onClick={quickPresetIsCodex ? toggleQuickCodexPreset : toggleQuickClaudePreset}
                 onMouseEnter={(event) => {
-                  setQuickClaudeHover(true);
+                  setQuickPresetHover(true);
                   const rect = event.currentTarget.getBoundingClientRect();
-                  setQuickClaudeRect({ left: rect.left, top: rect.top, width: rect.width, height: rect.height });
+                  setQuickPresetRect({ left: rect.left, top: rect.top, width: rect.width, height: rect.height });
                 }}
                 onMouseLeave={() => {
-                  setQuickClaudeHover(false);
-                  setQuickClaudeRect(null);
+                  setQuickPresetHover(false);
+                  setQuickPresetRect(null);
                 }}
-                aria-label="Быстро переключить модель Claude"
-                title={claudeQuickDisabled
-                  ? (isCommandRunning
-                    ? 'Быстрое переключение доступно только для Claude'
-                    : 'Быстрое переключение станет доступно после запуска Claude')
-                  : !hasQuickClaudePreset
+                aria-label={`Быстро переключить модель ${quickPresetIsCodex ? 'Codex' : 'Claude'}`}
+                title={quickPresetDisabled
+                  ? (quickPresetIsCodex
+                    ? (isCommandRunning
+                      ? 'Быстрое переключение станет доступно после подтверждения текущих model и effort'
+                      : 'Быстрое переключение доступно только при живом Codex')
+                    : (isCommandRunning
+                      ? 'Быстрое переключение доступно только для Claude'
+                      : 'Быстрое переключение станет доступно после запуска Claude'))
+                  : !hasQuickPreset
                     ? 'Задайте модель и effort для быстрого переключения в Настройках'
-                    : quickClaudeApplied && quickClaudeMatchesCurrent
+                    : quickPresetApplied && quickPresetMatchesCurrent
                       ? 'Вернуть прежнюю модель и effort'
-                      : `Переключить на ${quickClaudeModel?.label} / ${quickClaudeEffort}`}
+                      : `Переключить на ${quickPresetModel?.label} / ${quickPresetEffort}`}
                 style={{
                   ...triggerStyle,
                   width: 22,
                   padding: 0,
                   justifyContent: 'center',
-                  color: claudeQuickDisabled || !hasQuickClaudePreset ? '#555' : quickClaudeApplied && quickClaudeMatchesCurrent ? '#fff' : '#f0b098',
-                  borderColor: quickClaudeApplied && quickClaudeMatchesCurrent ? '#fff' : 'rgba(218,119,86,0.5)',
-                  backgroundColor: quickClaudeApplied && quickClaudeMatchesCurrent ? 'rgba(218,119,86,0.25)' : 'transparent',
-                  cursor: claudeQuickDisabled || !hasQuickClaudePreset ? 'not-allowed' : 'pointer',
+                  color: quickPresetDisabled || !hasQuickPreset ? '#555' : quickPresetApplied && quickPresetMatchesCurrent ? '#fff' : quickPresetIsCodex ? '#9ce8c4' : '#f0b098',
+                  borderColor: quickPresetApplied && quickPresetMatchesCurrent ? '#fff' : quickPresetIsCodex ? 'rgba(52,211,153,0.48)' : 'rgba(218,119,86,0.5)',
+                  backgroundColor: quickPresetApplied && quickPresetMatchesCurrent ? (quickPresetIsCodex ? 'rgba(52,211,153,0.24)' : 'rgba(218,119,86,0.25)') : 'transparent',
+                  cursor: quickPresetDisabled || !hasQuickPreset ? 'not-allowed' : 'pointer',
                 }}
               >
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -3787,75 +3833,15 @@ export default function ClaudeControlBar({
                   <path d="M21 17H3" />
                 </svg>
               </button>
-              {showQuickClaudeTooltip && quickClaudeButtonRef.current && createPortal(
+              {showQuickPresetTooltip && quickPresetButtonRef.current && createPortal(
                 <CenteredUpwardPopover
-                  getAnchorRect={() => quickClaudeButtonRef.current?.getBoundingClientRect() || null}
+                  getAnchorRect={() => quickPresetButtonRef.current?.getBoundingClientRect() || null}
                   zIndex={10060}
                   style={{ pointerEvents: 'none' }}
                 >
-                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 8px', borderRadius: 5, border: '1px solid rgba(218,119,86,0.4)', background: '#101010', color: '#ffe3d7', boxShadow: '0 8px 24px rgba(0,0,0,0.45)', fontSize: 11, whiteSpace: 'nowrap' }}>
-                    <span>{quickClaudeModel?.label}</span>
-                    <span style={{ color: '#DA7756', fontWeight: 700 }}>{quickClaudeEffort === 'medium' ? 'med' : quickClaudeEffort === 'xhigh' ? 'xhi' : quickClaudeEffort === 'ultracode' ? 'ultra' : quickClaudeEffort}</span>
-                  </div>
-                </CenteredUpwardPopover>,
-                document.body,
-              )}
-            </div>
-          )}
-
-          {isCodex && (
-            <div style={{ position: 'relative', display: 'inline-flex' }}>
-              <button
-                ref={quickCodexButtonRef}
-                type="button"
-                disabled={codexQuickDisabled || !hasQuickCodexPreset}
-                onClick={toggleQuickCodexPreset}
-                onMouseEnter={(event) => {
-                  setQuickCodexHover(true);
-                  const rect = event.currentTarget.getBoundingClientRect();
-                  setQuickCodexRect({ left: rect.left, top: rect.top, width: rect.width, height: rect.height });
-                }}
-                onMouseLeave={() => {
-                  setQuickCodexHover(false);
-                  setQuickCodexRect(null);
-                }}
-                aria-label="Быстро переключить модель Codex"
-                title={codexQuickDisabled
-                  ? (isCommandRunning
-                    ? 'Быстрое переключение станет доступно после подтверждения текущих model и effort'
-                    : 'Быстрое переключение доступно только при живом Codex')
-                  : !hasQuickCodexPreset
-                    ? 'Задайте модель и effort для быстрого переключения в Настройках'
-                    : quickCodexApplied && quickCodexMatchesCurrent
-                      ? 'Вернуть прежнюю модель и effort'
-                      : `Переключить на ${quickCodexModel?.label} / ${quickCodexEffort}`}
-                style={{
-                  ...triggerStyle,
-                  width: 22,
-                  padding: 0,
-                  justifyContent: 'center',
-                  color: codexQuickDisabled || !hasQuickCodexPreset ? '#555' : quickCodexApplied && quickCodexMatchesCurrent ? '#fff' : '#9ce8c4',
-                  borderColor: quickCodexApplied && quickCodexMatchesCurrent ? '#fff' : 'rgba(52,211,153,0.48)',
-                  backgroundColor: quickCodexApplied && quickCodexMatchesCurrent ? 'rgba(52,211,153,0.24)' : 'transparent',
-                  cursor: codexQuickDisabled || !hasQuickCodexPreset ? 'not-allowed' : 'pointer',
-                }}
-              >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                  <path d="M17 3l4 4-4 4" />
-                  <path d="M3 7h18" />
-                  <path d="M7 21l-4-4 4-4" />
-                  <path d="M21 17H3" />
-                </svg>
-              </button>
-              {showQuickCodexTooltip && quickCodexButtonRef.current && createPortal(
-                <CenteredUpwardPopover
-                  getAnchorRect={() => quickCodexButtonRef.current?.getBoundingClientRect() || null}
-                  zIndex={10060}
-                  style={{ pointerEvents: 'none' }}
-                >
-                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 8px', borderRadius: 5, border: '1px solid rgba(52,211,153,0.4)', background: '#101010', color: '#dcffe9', boxShadow: '0 8px 24px rgba(0,0,0,0.45)', fontSize: 11, whiteSpace: 'nowrap' }}>
-                    <span>{quickCodexModel?.label}</span>
-                    <span style={{ color: '#34D399', fontWeight: 700 }}>{quickCodexEffort === 'medium' ? 'med' : quickCodexEffort === 'xhigh' ? 'xhi' : quickCodexEffort}</span>
+                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '5px 8px', borderRadius: 5, border: `1px solid ${quickPresetIsCodex ? 'rgba(52,211,153,0.4)' : 'rgba(218,119,86,0.4)'}`, background: '#101010', color: quickPresetIsCodex ? '#dcffe9' : '#ffe3d7', boxShadow: '0 8px 24px rgba(0,0,0,0.45)', fontSize: 11, whiteSpace: 'nowrap' }}>
+                    <span>{quickPresetModel?.label}</span>
+                    <span style={{ color: quickPresetIsCodex ? '#34D399' : '#DA7756', fontWeight: 700 }}>{quickPresetEffort === 'medium' ? 'med' : quickPresetEffort === 'xhigh' ? 'xhi' : quickPresetEffort === 'ultracode' ? 'ultra' : quickPresetEffort}</span>
                   </div>
                 </CenteredUpwardPopover>,
                 document.body,
@@ -3893,26 +3879,27 @@ export default function ClaudeControlBar({
               <span style={{ opacity: codexModelMenuDisabled ? 0.25 : 0.6 }}>▴</span>
             </button>
             {openPopup === 'model' && renderControlPopup('model',
-              isCodex ? (
+              supportsModelEffortPair ? (
                 <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
                   {modelOptions.map((model) => {
                     const active = model.id === modelActiveId;
+                    const modelPairDisabled = isCodex && codexModelDisabled;
                     return (
                       <button
                         key={model.id}
-                        disabled={codexModelMenuDisabled}
-                        aria-disabled={codexModelDisabled}
-                        style={pillStyle(active, codexModelDisabled)}
+                        disabled={isCodex && codexModelMenuDisabled}
+                        aria-disabled={modelPairDisabled}
+                        style={pillStyle(active, modelPairDisabled)}
                         onMouseEnter={(event) => {
-                          setHoveredCodexMenuModel(model.id);
-                          setHoveredCodexMenuAnchor(event.currentTarget);
+                          setHoveredModelMenuModel(model.id);
+                          setHoveredModelMenuAnchor(event.currentTarget);
                         }}
                         onClick={() => {
-                          if (!codexModelDisabled) pickModel(model.id);
+                          if (!modelPairDisabled) pickModel(model.id);
                         }}
-                        title={codexModelDisabled
+                        title={modelPairDisabled
                           ? `Наведите и выберите ${model.label} вместе с effort`
-                          : `Выбрать ${model.label} с текущим effort`}
+                          : `Наведите и выберите ${model.label} с effort`}
                       >{model.label}</button>
                     );
                   })}
@@ -3929,14 +3916,19 @@ export default function ClaudeControlBar({
                 );
               })
             )}
-            {isCodex && openPopup === 'model' && hoveredCodexMenuAnchor && (() => {
-              const hoveredModel = codexModels.find((model) => model.id === hoveredCodexMenuModel);
-              const hoveredEfforts = hoveredModel?.efforts || [];
+            {supportsModelEffortPair && openPopup === 'model' && hoveredModelMenuAnchor && (() => {
+              const hoveredCodexModel = codexModels.find((model) => model.id === hoveredModelMenuModel);
+              const hoveredClaudeModel = claudeCodeModels.find((model) => model.id === hoveredModelMenuModel);
+              const hoveredModel = isCodex ? hoveredCodexModel : hoveredClaudeModel;
+              const hoveredEfforts = isCodex
+                ? (hoveredCodexModel?.efforts || [])
+                : claudeEffortsForModel(hoveredClaudeModel);
+              const modelEffortPairDisabled = isCodex && codexExplicitPairDisabled;
               if (!hoveredModel || hoveredEfforts.length === 0) return null;
               return createPortal(
                 <CenteredUpwardPopover
                   ref={(node) => { modelEffortPopupRef.current = node; }}
-                  getAnchorRect={() => hoveredCodexMenuAnchor.getBoundingClientRect()}
+                  getAnchorRect={() => hoveredModelMenuAnchor.getBoundingClientRect()}
                   horizontalAlign="end"
                   gap={4}
                   zIndex={10055}
@@ -3952,8 +3944,8 @@ export default function ClaudeControlBar({
                       return;
                     }
                     setHoveredPopup((current) => (current === 'model' ? null : current));
-                    setHoveredCodexMenuModel(null);
-                    setHoveredCodexMenuAnchor(null);
+                    setHoveredModelMenuModel(null);
+                    setHoveredModelMenuAnchor(null);
                   }}
                 >
                   <div
@@ -3976,9 +3968,11 @@ export default function ClaudeControlBar({
                       <button
                         key={effort}
                         type="button"
-                        disabled={codexExplicitPairDisabled}
-                        onClick={() => pickCodexModelEffort(hoveredModel.id, effort)}
-                        style={pillStyle(hoveredModel.id === codexModel && effort === codexEffort, codexExplicitPairDisabled)}
+                        disabled={modelEffortPairDisabled}
+                        onClick={() => isCodex
+                          ? pickCodexModelEffort(hoveredModel.id, effort)
+                          : pickClaudeModelEffort(hoveredModel.id, effort)}
+                        style={pillStyle(hoveredModel.id === modelActiveId && effort === effortActive, modelEffortPairDisabled)}
                         title={`Выбрать ${hoveredModel.label} / ${effort}`}
                       >
                         {effort === 'medium' ? 'med' : effort === 'xhigh' ? 'xhi' : effort}

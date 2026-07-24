@@ -7,6 +7,7 @@ const {
   buildHistoryRevision,
   validateHistoryRevision,
 } = require('../history-revision');
+const { buildChildProcessEnv } = require('../child-process-env');
 const { execFile } = require('child_process');
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
@@ -3856,6 +3857,7 @@ function runSqliteJson(dbPath, sql) {
     execFile('sqlite3', ['-json', dbPath, sql], {
       timeout: 15_000,
       maxBuffer: 16 * 1024 * 1024,
+      env: buildChildProcessEnv(),
     }, (error, stdout, stderr) => {
       if (error) {
         const message = stderr?.trim() || error.message;
@@ -5310,7 +5312,11 @@ function listCodexModels() {
     // Live catalog matches the current account/config and the interactive
     // `/model` picker. Bundled catalog contains hidden/internal/upgrade-only
     // rows that the TUI will not accept.
-    execFile('codex', ['debug', 'models'], { maxBuffer: 20 * 1024 * 1024, timeout: 15_000 }, (err, stdout) => {
+    execFile('codex', ['debug', 'models'], {
+      maxBuffer: 20 * 1024 * 1024,
+      timeout: 15_000,
+      env: buildChildProcessEnv(),
+    }, (err, stdout) => {
       if (!err) {
         const models = parseCodexModelsCatalog(stdout);
         if (models.length > 0) {
@@ -5319,7 +5325,11 @@ function listCodexModels() {
         }
       }
 
-      execFile('codex', ['debug', 'models', '--bundled'], { maxBuffer: 20 * 1024 * 1024, timeout: 5_000 }, (bundledErr, bundledStdout) => {
+      execFile('codex', ['debug', 'models', '--bundled'], {
+        maxBuffer: 20 * 1024 * 1024,
+        timeout: 5_000,
+        env: buildChildProcessEnv(),
+      }, (bundledErr, bundledStdout) => {
         if (bundledErr) {
           finish(fallback);
           return;
