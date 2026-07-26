@@ -24,8 +24,21 @@ function decideAgentShellLaunchAdmission({
   return { allowed: true, reason: 'proven_idle_shell' };
 }
 
+function isAgentShellLaunchInterruptPrelude({
+  exitCode,
+  expectsInterruptPrelude = false,
+  sawOscCommandStart = false,
+  sameTerminal = false,
+} = {}) {
+  return Number(exitCode) === 130
+    && expectsInterruptPrelude === true
+    && sawOscCommandStart !== true
+    && sameTerminal === true;
+}
+
 module.exports = {
   SHELL_INTERRUPT,
   buildAgentShellLaunchInput,
   decideAgentShellLaunchAdmission,
+  isAgentShellLaunchInterruptPrelude,
 };

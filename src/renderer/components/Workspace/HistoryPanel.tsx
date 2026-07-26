@@ -833,6 +833,95 @@ function applyHistoryRevealUpdate(
   });
 }
 
+/**
+ * Frame-by-frame convergence for a scroll restore, shared by every restore
+ * mode.
+ *
+ * A single `scrollToIndex` is NEVER proof of arrival: Virtuoso jumps using
+ * ESTIMATED row heights, and once the landed rows measure for real the
+ * position silently drifts. Both known symptoms are the same defect — a
+ * mid-list anchor landing ~11 rows off while the log claimed success (E2E),
+ * and a tail restore visibly appearing at the top and then snapping down
+ * (prod 26.07, `mode=tail` was the one branch still doing a bare jump).
+ *
+ * So the jump is re-issued each frame until the measured drift stops moving.
+ * Exit is dual: exact (|drift| <= 2px stable for 2 frames) OR "a re-issued
+ * jump no longer changes anything" (3 stagnant frames) — with fractional row
+ * heights Virtuoso settles 3-4px off, and demanding exactness burned the whole
+ * frame budget at an already-correct position.
+ *
+ * Every exit is reported. A silent `return` cannot be told apart from "the
+ * loop never ran", which is precisely why the tail defect survived testing.
+ */
+interface HistoryConvergenceOutcome {
+  attempts: number;
+  settled: '1' | 'drift' | '0';
+  driftPx: number | null;
+  elapsedMs: number;
+}
+
+function runHistoryScrollConvergence(opts: {
+  /** Signed distance from the intended position; null while unmeasurable. */
+  measureDrift: () => number | null;
+  /** Re-issue the jump. false = target no longer exists, abort. */
+  jump: () => boolean;
+  /** Cancel reason, or null to keep going. Position ownership check. */
+  cancelled: () => string | null;
+  onSettled: (outcome: HistoryConvergenceOutcome) => void;
+  onAborted: (outcome: { attempts: number; reason: string }) => void;
+}) {
+  const startedAt = performance.now();
+  const MAX_ATTEMPTS = 240;
+  let attempts = 0;
+  let stableFrames = 0;
+  let stagnantFrames = 0;
+  let jumpedLastFrame = false;
+  let prevDrift: number | null = null;
+  let lastDrift: number | null = null;
+
+  const step = () => {
+    const cancelReason = opts.cancelled();
+    if (cancelReason) {
+      opts.onAborted({ attempts, reason: cancelReason });
+      return;
+    }
+    attempts += 1;
+    const drift = opts.measureDrift();
+    lastDrift = drift;
+    const atDesired = drift !== null && Math.abs(drift) <= 2;
+    const unchanged = drift !== null && prevDrift !== null
+      && Math.abs(drift - prevDrift) <= 1;
+    if (atDesired && unchanged) stableFrames += 1;
+    else stableFrames = 0;
+    if (!atDesired && unchanged && jumpedLastFrame) stagnantFrames += 1;
+    else if (!unchanged) stagnantFrames = 0;
+    prevDrift = drift;
+
+    const converged = stableFrames >= 2;
+    const acceptedDrift = stagnantFrames >= 3;
+    if (converged || acceptedDrift || attempts >= MAX_ATTEMPTS) {
+      opts.onSettled({
+        attempts,
+        settled: converged ? '1' : acceptedDrift ? 'drift' : '0',
+        driftPx: lastDrift,
+        elapsedMs: performance.now() - startedAt,
+      });
+      return;
+    }
+
+    jumpedLastFrame = false;
+    if (!atDesired) {
+      if (!opts.jump()) {
+        opts.onAborted({ attempts, reason: 'target-lost' });
+        return;
+      }
+      jumpedLastFrame = true;
+    }
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
 function useHistoryRevealToggle(
   anchorRef: React.RefObject<HTMLElement | null>,
   open: boolean,
@@ -7905,6 +7994,19 @@ function HistoryPanel({
       return;
     }
     initialLoadDoneRef.current = true;
+    // Position ownership, identical for every restore mode: the tab we started
+    // for must still be the one on screen, and no newer restore or real user
+    // wheel/touch may have taken over (the gesture always wins).
+    const cancelReasonForRestore = (
+      ownerAtRestore: string,
+      generationAtRestore: number,
+      restoreGenAtStart: number,
+    ): string | null => {
+      if (scrollRestoreGenRef.current !== restoreGenAtStart) return 'superseded-or-user-scroll';
+      if (historyOwnerKeyRef.current !== ownerAtRestore) return 'owner-change';
+      if (historyOwnerGenerationRef.current !== generationAtRestore) return 'owner-change';
+      return null;
+    };
     const anchor = getHistoryReadingAnchor(scrollPositionKeyRef.current);
     if (anchor && !anchor.followBottom) {
       const index = displayEntryIndexByUuidRef.current.get(anchor.uuid);
@@ -7912,103 +8014,90 @@ function HistoryPanel({
         // The restored position is mid-list: Virtuoso followOutput must not
         // treat a live append as "user is at the tail" and yank away.
         isAtBottomRef.current = false;
-        // Convergence loop, not a single shot. On a cold (cache=miss) list
-        // Virtuoso jumps using ESTIMATED heights; rows above the target then
-        // measure taller/shorter and the landed position silently drifts
-        // (E2E-proven: ~11 rows off while the log claimed success). Re-issue
-        // the jump each frame until the target row's DOM rect is stable at
-        // the intended offset — the same stability signal the Timeline-jump
-        // loop relies on. Cancelled by owner change or real user scroll.
         const ownerAtRestore = historyOwnerKey;
         const generationAtRestore = historyOwnerGenerationRef.current;
         const restoreGenAtStart = ++scrollRestoreGenRef.current;
-        const startedAt = performance.now();
-        let attempts = 0;
-        let stableFrames = 0;
-        let stagnantFrames = 0;
-        let jumpedLastFrame = false;
-        let lastTop: number | null = null;
-        let lastDrift: number | null = null;
-        const MAX_ATTEMPTS = 240;
-        const step = () => {
-          if (
-            historyOwnerKeyRef.current !== ownerAtRestore
-            || historyOwnerGenerationRef.current !== generationAtRestore
-            || scrollRestoreGenRef.current !== restoreGenAtStart
-          ) {
-            // Cancellation is part of the acceptance contract (user wheel
-            // must take ownership) — log it, a silent exit is untestable.
-            historyDiag('SCROLL_RESTORE_CANCEL tab=' + tabId.slice(-12)
-              + ' uuid=' + anchor.uuid.slice(0, 8)
-              + ' attempts=' + attempts
-              + ' reason=' + (scrollRestoreGenRef.current !== restoreGenAtStart
-                ? 'superseded-or-user-scroll' : 'owner-change'));
-            return;
-          }
-          const scroller = virtuosoScrollerRef.current;
-          if (!scroller) return;
-          attempts += 1;
-          const node = scroller.querySelector(`[data-uuid="${CSS.escape(anchor.uuid)}"]`) as HTMLElement | null;
-          const scrollerTop = scroller.getBoundingClientRect().top;
-          const nodeTop = node ? node.getBoundingClientRect().top : null;
-          const desiredTop = scrollerTop - anchor.offsetPx;
-          const drift = nodeTop === null ? null : nodeTop - desiredTop;
-          lastDrift = drift;
-          const atDesired = drift !== null && Math.abs(drift) <= 2;
-          const unchanged = nodeTop !== null && lastTop !== null
-            && Math.abs(nodeTop - lastTop) <= 1;
-          if (atDesired && unchanged) stableFrames += 1;
-          else stableFrames = 0;
-          // A re-issued jump that no longer moves the row means Virtuoso has
-          // landed as close as fractional row heights allow (E2E-measured
-          // 3-4px residual drift). Accept that position instead of burning
-          // the whole attempt budget re-jumping at a target the layout
-          // cannot express — settled=0 at a correct position is exactly the
-          // "log disagrees with reality" class this loop exists to close.
-          if (!atDesired && unchanged && jumpedLastFrame) stagnantFrames += 1;
-          else if (!unchanged) stagnantFrames = 0;
-          lastTop = nodeTop;
-          const converged = stableFrames >= 2;
-          const acceptedDrift = stagnantFrames >= 3;
-          if (converged || acceptedDrift || attempts >= MAX_ATTEMPTS) {
-            historyDiag('SCROLL_RESTORE_DONE tab=' + tabId.slice(-12)
-              + ' uuid=' + anchor.uuid.slice(0, 8)
-              + ' attempts=' + attempts
-              + ' settled=' + (converged ? '1' : acceptedDrift ? 'drift' : '0')
-              + ' driftPx=' + (lastDrift === null ? 'na' : Math.round(lastDrift))
-              + ' elapsedMs=' + Math.round(performance.now() - startedAt));
-            return;
-          }
-          jumpedLastFrame = false;
-          if (!atDesired) {
+        const uuidTag = anchor.uuid.slice(0, 8);
+        historyDiag('SCROLL_RESTORE tab=' + tabId.slice(-12)
+          + ' mode=anchor uuid=' + uuidTag
+          + ' idx=' + index + ' offset=' + anchor.offsetPx);
+        runHistoryScrollConvergence({
+          cancelled: () => cancelReasonForRestore(
+            ownerAtRestore, generationAtRestore, restoreGenAtStart,
+          ),
+          measureDrift: () => {
+            const scroller = virtuosoScrollerRef.current;
+            if (!scroller) return null;
+            const node = scroller.querySelector(
+              `[data-uuid="${CSS.escape(anchor.uuid)}"]`,
+            ) as HTMLElement | null;
+            if (!node) return null;
+            const desiredTop = scroller.getBoundingClientRect().top - anchor.offsetPx;
+            return node.getBoundingClientRect().top - desiredTop;
+          },
+          jump: () => {
             const currentIndex = displayEntryIndexByUuidRef.current.get(anchor.uuid);
-            if (currentIndex === undefined) return; // row vanished mid-restore
+            if (currentIndex === undefined) return false; // row vanished mid-restore
             virtuosoRef.current?.scrollToIndex({
               index: currentIndex,
               align: 'start',
               behavior: 'auto',
               offset: anchor.offsetPx,
             });
-            jumpedLastFrame = true;
-          }
-          requestAnimationFrame(step);
-        };
-        historyDiag('SCROLL_RESTORE tab=' + tabId.slice(-12)
-          + ' mode=anchor uuid=' + anchor.uuid.slice(0, 8)
-          + ' idx=' + index + ' offset=' + anchor.offsetPx);
-        requestAnimationFrame(step);
+            return true;
+          },
+          onSettled: (o) => historyDiag('SCROLL_RESTORE_DONE tab=' + tabId.slice(-12)
+            + ' uuid=' + uuidTag + ' attempts=' + o.attempts
+            + ' settled=' + o.settled
+            + ' driftPx=' + (o.driftPx === null ? 'na' : Math.round(o.driftPx))
+            + ' elapsedMs=' + Math.round(o.elapsedMs)),
+          onAborted: (o) => historyDiag('SCROLL_RESTORE_CANCEL tab=' + tabId.slice(-12)
+            + ' uuid=' + uuidTag + ' attempts=' + o.attempts + ' reason=' + o.reason),
+        });
         return;
       }
       // Anchor row vanished (rewind/edit truncated the branch): fall through
       // to the tail rather than showing an unrelated pixel position.
     }
     if (anchor?.followBottom) {
+      // The tail is NOT the trivial case it looks like. "Show the last row" is
+      // still executed against ESTIMATED heights, so a bare jump lands short
+      // and snaps down once the rows measure — visible in prod (26.07) as the
+      // history appearing at the top and then dropping to the bottom. This
+      // branch was the last one left doing a single shot, and it was also the
+      // only one that logged no outcome, which is exactly why no test caught
+      // it: a silent path has nothing to disagree with reality.
+      const ownerAtRestore = historyOwnerKey;
+      const generationAtRestore = historyOwnerGenerationRef.current;
+      const restoreGenAtStart = ++scrollRestoreGenRef.current;
       historyDiag('SCROLL_RESTORE tab=' + tabId.slice(-12) + ' mode=tail');
-      requestAnimationFrame(() => {
-        const count = lengthRef.current;
-        if (count > 0) {
-          virtuosoRef.current?.scrollToIndex({ index: count - 1, align: 'end', behavior: 'auto' });
-        }
+      runHistoryScrollConvergence({
+        cancelled: () => cancelReasonForRestore(
+          ownerAtRestore, generationAtRestore, restoreGenAtStart,
+        ),
+        // Distance from a true bottom, measured on the scroller itself: the
+        // last row has no stable uuid across live appends, and "pinned to the
+        // bottom" is a property of the viewport, not of any one row.
+        measureDrift: () => {
+          const scroller = virtuosoScrollerRef.current;
+          if (!scroller) return null;
+          return scroller.scrollTop - (scroller.scrollHeight - scroller.clientHeight);
+        },
+        jump: () => {
+          const count = lengthRef.current;
+          if (count <= 0) return false;
+          virtuosoRef.current?.scrollToIndex({
+            index: count - 1, align: 'end', behavior: 'auto',
+          });
+          return true;
+        },
+        onSettled: (o) => historyDiag('SCROLL_RESTORE_DONE tab=' + tabId.slice(-12)
+          + ' mode=tail attempts=' + o.attempts
+          + ' settled=' + o.settled
+          + ' driftPx=' + (o.driftPx === null ? 'na' : Math.round(o.driftPx))
+          + ' elapsedMs=' + Math.round(o.elapsedMs)),
+        onAborted: (o) => historyDiag('SCROLL_RESTORE_CANCEL tab=' + tabId.slice(-12)
+          + ' mode=tail attempts=' + o.attempts + ' reason=' + o.reason),
       });
       return;
     }
@@ -8017,13 +8106,41 @@ function HistoryPanel({
       const positions = useUIStore.getState().historyScrollPositions;
       const savedPos = positions[scrollPositionKeyRef.current] ?? positions[tabId];
       if (savedPos && savedPos > 0) {
+        // Same convergence contract as the other two modes. A raw scrollTop
+        // assignment is undone the moment Virtuoso re-measures, and the old
+        // "assign it twice across two frames" trick was a guess at how long
+        // that takes, not a check that it held.
+        const ownerAtRestore = historyOwnerKey;
+        const generationAtRestore = historyOwnerGenerationRef.current;
+        const restoreGenAtStart = ++scrollRestoreGenRef.current;
         historyDiag('SCROLL_RESTORE tab=' + tabId.slice(-12) + ' mode=legacy-px px=' + Math.round(savedPos));
-        requestAnimationFrame(() => {
-          const el = virtuosoScrollerRef.current;
-          if (el) {
-            el.scrollTop = savedPos;
-            requestAnimationFrame(() => { if (el) el.scrollTop = savedPos; });
-          }
+        runHistoryScrollConvergence({
+          cancelled: () => cancelReasonForRestore(
+            ownerAtRestore, generationAtRestore, restoreGenAtStart,
+          ),
+          measureDrift: () => {
+            const el = virtuosoScrollerRef.current;
+            if (!el) return null;
+            // Clamp to the reachable maximum: a pixel position saved against a
+            // longer list can be past the end, and chasing it would never
+            // converge.
+            const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+            return el.scrollTop - Math.min(savedPos, maxTop);
+          },
+          jump: () => {
+            const el = virtuosoScrollerRef.current;
+            if (!el) return false;
+            const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+            el.scrollTop = Math.min(savedPos, maxTop);
+            return true;
+          },
+          onSettled: (o) => historyDiag('SCROLL_RESTORE_DONE tab=' + tabId.slice(-12)
+            + ' mode=legacy-px attempts=' + o.attempts
+            + ' settled=' + o.settled
+            + ' driftPx=' + (o.driftPx === null ? 'na' : Math.round(o.driftPx))
+            + ' elapsedMs=' + Math.round(o.elapsedMs)),
+          onAborted: (o) => historyDiag('SCROLL_RESTORE_CANCEL tab=' + tabId.slice(-12)
+            + ' mode=legacy-px attempts=' + o.attempts + ' reason=' + o.reason),
         });
       }
     }

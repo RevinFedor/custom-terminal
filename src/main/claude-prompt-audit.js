@@ -192,7 +192,7 @@ function selectClaudePendingPromptAudit(
       if (!candidate || claimedByteOffsets.has(candidate.byteOffset)) continue;
       if (candidate.text.length !== Number(audit.expectedLen)) continue;
       if (hashText(candidate.text) !== String(audit.expectedHash || '')) continue;
-      const causality = classify(candidate, audit.preSubmitBoundary);
+      const causality = classify(candidate, audit.preSubmitBoundary, audit);
       if (!causality.causal) continue;
       return { audit, candidate, causality };
     }
@@ -270,8 +270,25 @@ async function captureClaudePromptAuditBoundary(
   }
 }
 
-function classifyClaudeAuditRecordAfterBoundary(candidate, boundary) {
+function classifyClaudeAuditRecordAfterBoundary(candidate, boundary, audit = null) {
   if (!boundary?.available) {
+    // A fresh Claude session has no JSONL path before its first Enter. The
+    // UserPromptSubmit hook supplies that path only after the record exists,
+    // so a byte boundary is impossible for exactly this first prompt. Keep
+    // the fallback narrow: only the unresolved-path case may use the staged
+    // send timestamp. Read failures for a known transcript remain unknown.
+    const isFreshTranscriptPending = boundary?.reason === 'transcript-unresolved'
+      && !boundary?.transcriptPath;
+    const candidateAt = Date.parse(candidate?.record?.timestamp || '');
+    const sentAt = Number(audit?.sentAt);
+    if (
+      isFreshTranscriptPending
+      && Number.isFinite(candidateAt)
+      && Number.isFinite(sentAt)
+      && candidateAt >= sentAt
+    ) {
+      return { causal: true, reason: 'record-after-send-with-unresolved-transcript' };
+    }
     return { causal: false, reason: boundary?.reason || 'boundary-unavailable' };
   }
   if (!candidate?.record) {

@@ -210,3 +210,86 @@ test('a pre-boundary identical record cannot confirm the later audit', async (t)
   const selection = selectClaudePendingPromptAudit([audit], candidates, { hashText: sha16 });
   assert.equal(selection, null, 'stale identical tail is not causal proof');
 });
+
+test('the first prompt of a fresh Claude transcript uses its staged send time as causal proof', () => {
+  const text = 'fresh first prompt';
+  const sentAt = Date.parse('2026-07-26T03:48:08.259Z');
+  const boundary = {
+    available: false,
+    reason: 'transcript-unresolved',
+    transcriptPath: null,
+  };
+  const audit = makeAudit(text, boundary, { handoffId: 'fresh', sentAt });
+  const candidate = {
+    record: userRecord(
+      'fresh-uuid',
+      text,
+      '2026-07-26T03:48:08.321Z',
+    ),
+    text,
+    byteOffset: 0,
+  };
+
+  const selection = selectClaudePendingPromptAudit([audit], [candidate], {
+    hashText: sha16,
+  });
+
+  assert.equal(selection?.audit, audit);
+  assert.equal(selection?.candidate, candidate);
+  assert.equal(
+    selection?.causality?.reason,
+    'record-after-send-with-unresolved-transcript',
+  );
+});
+
+test('an old identical prompt cannot satisfy an unresolved fresh-transcript audit', () => {
+  const text = 'same prompt';
+  const sentAt = Date.parse('2026-07-26T03:48:08.259Z');
+  const boundary = {
+    available: false,
+    reason: 'transcript-unresolved',
+    transcriptPath: null,
+  };
+  const audit = makeAudit(text, boundary, { handoffId: 'fresh', sentAt });
+  const staleCandidate = {
+    record: userRecord(
+      'old-uuid',
+      text,
+      '2026-07-26T03:48:08.258Z',
+    ),
+    text,
+    byteOffset: 0,
+  };
+
+  const selection = selectClaudePendingPromptAudit([audit], [staleCandidate], {
+    hashText: sha16,
+  });
+
+  assert.equal(selection, null);
+});
+
+test('a known-transcript read failure never falls back to timestamp causality', () => {
+  const text = 'same prompt';
+  const sentAt = Date.parse('2026-07-26T03:48:08.259Z');
+  const boundary = {
+    available: false,
+    reason: 'EACCES',
+    transcriptPath: '/tmp/existing-session.jsonl',
+  };
+  const audit = makeAudit(text, boundary, { handoffId: 'read-failed', sentAt });
+  const candidate = {
+    record: userRecord(
+      'new-uuid',
+      text,
+      '2026-07-26T03:48:08.321Z',
+    ),
+    text,
+    byteOffset: 0,
+  };
+
+  const selection = selectClaudePendingPromptAudit([audit], [candidate], {
+    hashText: sha16,
+  });
+
+  assert.equal(selection, null);
+});

@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const {
   buildAgentShellLaunchInput,
   decideAgentShellLaunchAdmission,
+  isAgentShellLaunchInterruptPrelude,
 } = require('./ai-shell-launch');
 
 test('agent shell launch cancels the raw shell draft before the command', () => {
@@ -32,4 +33,32 @@ test('only a proven idle shell admits the destructive Ctrl+C launch byte', () =>
   assert.equal(decideAgentShellLaunchAdmission({ processLookupStatus: 'absent', commandRunning: true }).allowed, false);
   assert.equal(decideAgentShellLaunchAdmission({ processLookupStatus: 'absent', lifecycleClaimed: true }).allowed, false);
   assert.equal(decideAgentShellLaunchAdmission({ processLookupStatus: 'absent', stopping: true }).allowed, false);
+});
+
+test('only the expected Ctrl+C edge before the new OSC command start is launch prelude', () => {
+  assert.equal(isAgentShellLaunchInterruptPrelude({
+    exitCode: 130,
+    expectsInterruptPrelude: true,
+    sawOscCommandStart: false,
+    sameTerminal: true,
+  }), true);
+
+  assert.equal(isAgentShellLaunchInterruptPrelude({
+    exitCode: 0,
+    expectsInterruptPrelude: true,
+    sawOscCommandStart: false,
+    sameTerminal: true,
+  }), false);
+  assert.equal(isAgentShellLaunchInterruptPrelude({
+    exitCode: 130,
+    expectsInterruptPrelude: true,
+    sawOscCommandStart: true,
+    sameTerminal: true,
+  }), false);
+  assert.equal(isAgentShellLaunchInterruptPrelude({
+    exitCode: 130,
+    expectsInterruptPrelude: true,
+    sawOscCommandStart: false,
+    sameTerminal: false,
+  }), false);
 });

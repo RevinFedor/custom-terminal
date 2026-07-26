@@ -65,9 +65,11 @@ Headless test через `claude -p "Read 3 files and summarize"`:
 - В логе ровно **2 события**: UserPromptSubmit + Stop. Никаких промежуточных Stop между tool calls.
 - Latency Stop hook → нашему сокету: < 5ms (Unix socket на localhost).
 
-## Маппинг session_id → tabId
+## Маппинг hook → tabId
 
-Использует существующий `bridgeKnownSessions: Map<tabId, sessionId>` из StatusLine bridge'а. Если сессия не в Map (юзер запустил `claude` напрямую в системном терминале, MCP-агент в другом проекте) — событие тихо игнорится с логом `(no tab match)`. Это корректное поведение: чужие Claude не должны влиять на наш UI.
+Известный `session_id` из `bridgeKnownSessions` остаётся главным доказательством. Но у fresh Claude первый `UserPromptSubmit` и даже короткий `Stop` могут прийти раньше StatusLine/JSONL-привязки. Для этого окна main использует только заранее доказанный Claude PID из process-tree конкретного PTY: PID резервируется после принятого launch и повторно проверяется непосредственно перед внешним Enter. После появления session binding маршрутизация снова идёт по `session_id`; неизвестный PID или уже закрытая вкладка не могут принять hook чужого Claude.
+
+Эта ранняя привязка нужна не только loader'у. Без неё orchestration-run может получить `Stop`, не увидев собственного `UserPromptSubmit`, а первый completion prompt source-вкладки останется временной History-строкой рядом с уже записанной durable user-записью.
 
 ## Известные ограничения (по версии 2.1.x, май 2026)
 
